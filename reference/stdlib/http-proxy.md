@@ -56,14 +56,14 @@ fn origin(text: string<'static>) -> Origin {
   let uri = match Uri.parse(text) {
     Result<Uri, ParseError>.Success { value } => value
     Result<Uri, ParseError>.Failure { error: _ } => {
-      let invalid = 1 / 0
+      Intrinsic.trap("unexpected failure")
       return origin(text)
     }
   }
   return match Origin.fromUri(&uri) {
     Result<Origin, OriginError>.Success { value } => value
     Result<Origin, OriginError>.Failure { error: _ } => {
-      let invalid = 1 / 0
+      Intrinsic.trap("unexpected failure")
       return origin(text)
     }
   }
@@ -1283,4 +1283,4 @@ Returns `true` if the mode, the origin, the proxy, and the two identities are eq
 
 Category: HTTP.
 
-Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.
+Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`.

@@ -376,8 +376,8 @@ directory.
 pub struct DirectoryEntryKind
 ```
 
-The kind of a directory entry: a file or a directory. Compare with [`FileSystem.file`](#FileSystem.impl.file) and
-[`FileSystem.directory`](#FileSystem.impl.directory).
+The kind of a directory entry: a file, a directory, or a symbolic link. Compare with
+[`FileSystem.file`](#FileSystem.impl.file), [`FileSystem.directory`](#FileSystem.impl.directory), and [`FileSystem.symbolicLink`](#FileSystem.impl.symbolicLink).
 
 <a id="DirectoryEntryKind.code"></a>
 
@@ -387,7 +387,7 @@ The kind of a directory entry: a file or a directory. Compare with [`FileSystem.
 pub code: i32
 ```
 
-The kind code: 0 for a file, 1 for a directory.
+The kind code: 0 for a file, 1 for a directory, 2 for a symbolic link.
 
 <a id="DirectoryEntry"></a>
 
@@ -883,7 +883,8 @@ Returns the direct children of the directory at `path`, sorted by path bytes.
 #### Details
 
 The listing does not include children of children. Each entry owns its path, so you can keep
-it after you drop the list.
+it after you drop the list. An entry that is a symbolic link has the kind
+[`FileSystem.symbolicLink`](#FileSystem.impl.symbolicLink), whatever it points to.
 
 #### Errors
 
@@ -915,7 +916,8 @@ Creates the directory `path`. Its parent must exist.
 effect fn removeFile(path: &Path) -> () ! FileError ? &mut FileSystem
 ```
 
-Removes the regular file at `path`.
+Removes the regular file or symbolic link at `path`. A link is removed itself, not what it
+points to.
 
 #### Errors
 
@@ -1031,6 +1033,17 @@ pub fn directory() -> DirectoryEntryKind
 
 Constructs the directory [`DirectoryEntryKind`](#DirectoryEntryKind).
 
+<a id="FileSystem.impl.symbolicLink"></a>
+
+### Associated function `symbolicLink`
+
+```silk
+pub fn symbolicLink() -> DirectoryEntryKind
+```
+
+Constructs the symbolic-link [`DirectoryEntryKind`](#DirectoryEntryKind). A listing reports a link itself, not
+what it points to, so a walk of the tree does not follow it.
+
 <a id="FileSystem.impl.entryKindCode"></a>
 
 ### Associated function `entryKindCode`
@@ -1039,7 +1052,7 @@ Constructs the directory [`DirectoryEntryKind`](#DirectoryEntryKind).
 pub fn entryKindCode(kind: DirectoryEntryKind) -> i32
 ```
 
-Returns the code of `kind`: 0 for a file, 1 for a directory.
+Returns the code of `kind`: 0 for a file, 1 for a directory, 2 for a symbolic link.
 
 <a id="FileSystem.impl.fileInfo"></a>
 
@@ -1444,7 +1457,8 @@ Removes the directory at `path`, all files in it, and all directories in it.
 #### Details
 
 It removes the files first and then the directories, deepest first. It does not recurse, so a
-deep tree uses list memory, not stack.
+deep tree uses list memory, not stack. A symbolic link in the tree is removed itself; what it
+points to stays.
 
 #### Errors
 
@@ -1547,4 +1561,4 @@ The path of the directory.
 
 Category: System.
 
-Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.
+Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`.

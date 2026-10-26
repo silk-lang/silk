@@ -1537,5 +1537,5 @@ runtime names, and generated C functions have been deleted.
 [system-clock source](../stdlib/silk/os_system_clock.silk),
 clock integration tests.
 
-See Integer C variadics for true ellipsis declarations, integer promotions,
-and the fixed versus unnamed parameter boundary on the admitted native targets.
+See [Scalar C variadics](integer-c-variadics.md) for true ellipsis declarations, default argument
+promotions, and the fixed versus unnamed parameter boundary on the admitted native targets.

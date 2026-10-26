@@ -42,7 +42,7 @@ fn field(name: string<'static>, bytes: &'static [u8]) -> Header<'static> {
   return match Header.make(name, bytes, limits()) {
     Result<Header, ValueError>.Success { value } => value
     Result<Header, ValueError>.Failure { error: _ } => {
-      let invalid = 1 / 0
+      Intrinsic.trap("unexpected failure")
       return field(name, bytes)
     }
   }
@@ -580,4 +580,4 @@ Returns the next item, or `None` at the end.
 
 Category: HTTP.
 
-Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.
+Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`.

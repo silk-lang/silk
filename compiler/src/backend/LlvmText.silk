@@ -3,7 +3,7 @@
 import semantic.Types {Types}
 import semantic.ForeignContract {ForeignContract}
 import backend.CAbi
-import backend.CAbi {Extension as CExtension}
+import backend.CAbi {Extension as CExtension, Passing as CPassing, Piece as CPiece}
 import backend.Coroutine {Coroutine, Extent, Facts, FrameSlot, State, requireCancelExits}
 import backend.InstanceKey {HelperRole, InstanceKey}
 import backend.InstanceIdentity {InstanceIdentity}
@@ -473,6 +473,7 @@ pub effect fn declarations(target: &Target) -> Bytes ! OutOfMemoryError ? &mut A
   run defineFatalDispatch(&mut writer, target)
   run append(&mut writer, b"define internal i32 @__silk_foreign_personality(i32 %version, i32 %actions, i64 %class, ptr %exception, ptr %context) noinline nounwind noreturn {\nentry:\ncall void @llvm.trap()\nunreachable\n}\n")
   run append(&mut writer, b"declare void @llvm.memmove.p0.p0.i64(ptr, ptr, i64, i1)\n")
+  run append(&mut writer, b"declare ptr @llvm.frameaddress.p0(i32)\n")
   run declareWidth(&mut writer, 1)
   run declareWidth(&mut writer, 8)
   run declareWidth(&mut writer, 16)
@@ -2709,6 +2710,42 @@ effect fn emitScalarRvalue(
       let owner = InstanceKey.identity(&function.key)
       fail Gap.relative(GapCode.TypedForm, &owner, span)
     }
+    Rvalue.FrameAddress => {
+      let name = run temp(&mut writer.*)
+      run append(&mut writer.*, Bytes.asSlice(&name))
+      run append(&mut writer.*, b" = call ptr @llvm.frameaddress.p0(i32 0)\n")
+      return Value {scalar: pointerRepresentation(target), text: move name}
+    }
+    // A dynamic `alloca` outside the entry block: LLVM releases it when the function returns. The
+    // byte count traps when it does not fit the target word.
+    Rvalue.StackAllocate {count, element} => {
+      let selected = run emitOperand(&mut writer.*, function, target, layouts, &count)
+      let facts = run layoutOf(layouts, &element, function, span)
+      let stride = match move Metrics.stride(&facts) {
+        Option<usize>.Some {value} => value
+        Option<usize>.None => {
+          let owner = InstanceKey.identity(&function.key)
+          fail Gap.relative(GapCode.ScalarLayout, &owner, span)
+        }
+      }
+      let kind = lengthRepresentation(target)
+      let mut strideText = Writer {text: Bytes.make(), next: usize.ZERO, symbol: Bytes.make(), constants: Bytes.make(), trap: Option<TrapReport>.none()}
+      run decimal(&mut strideText, stride)
+      let pair = run overflowPair(&mut writer.*, b"mul", kind, Bytes.asSlice(&selected.text), Bytes.asSlice(&strideText.text))
+      let overflow = run pairField(&mut writer.*, kind, Bytes.asSlice(&pair), usize.ONE)
+      run trapWhen(&mut writer.*, Bytes.asSlice(&overflow), b"arithmetic overflow")
+      let bytes = run pairField(&mut writer.*, kind, Bytes.asSlice(&pair), usize.ZERO)
+      let name = run temp(&mut writer.*)
+      run append(&mut writer.*, Bytes.asSlice(&name))
+      run append(&mut writer.*, b" = alloca i8, ")
+      run typeName(&mut writer.*, kind)
+      run append(&mut writer.*, b" ")
+      run append(&mut writer.*, Bytes.asSlice(&bytes))
+      run append(&mut writer.*, b", align ")
+      run decimal(&mut writer.*, facts.alignment)
+      run append(&mut writer.*, b"\n")
+      return Value {scalar: pointerRepresentation(target), text: move name}
+    }
     // A frame-based instance's step reads its transfer record's package word.
     Rvalue.RunningPackage => Value {scalar: pointerRepresentation(target),
       text: run loadWordAt(&mut writer.*, b"%transfer", Coroutine.transferPackage(wordSize(target)))}
@@ -3151,6 +3188,19 @@ effect fn emitReturn(
 ) -> () ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
   let resultLayout = run layoutOf(layouts, &function.result, function, span)
   let kind = storageRepresentation(&function.result, target, resultLayout)
+  if cExport(function) && kind.aggregate {
+    let lane = run classifiedLane(function, target, layouts, &function.result, span, true)
+    if lane.passing == CPassing.Indirect { run copyBytes(&mut writer.*, b"%out", b"%l0", lane.layout.size) }
+    if lane.passing == CPassing.Coerce {
+      let value = run readCRecord(&mut writer.*, &lane, b"%l0")
+      run append(&mut writer.*, b"ret ")
+      run coercionType(&mut writer.*, &lane)
+      run append(&mut writer.*, b" ")
+      run append(&mut writer.*, Bytes.asSlice(&value))
+      return run append(&mut writer.*, b"\n")
+    }
+    return run append(&mut writer.*, b"ret void\n")
+  }
   let fallible = failureLocal(function) != usize.MAX
   if kind.unit {
     if fallible { run append(&mut writer.*, b"ret i1 0\n") }
@@ -3465,17 +3515,28 @@ effect fn emitVariadicArgument(writer: &mut Writer, function: &MirFunction, targ
       input = run loadAddress(&mut writer.*, &sourceAddress)
     }
     Option<Address>.None => {
-      if let Operand.Integer {ty: sourceType, ..} = &operand.* {
-        if !(run CAbi.validVariadic(argument, &sourceType)) { fail Gap.relative(GapCode.CAbiVariadic, &owner, span) }
-      } else { fail Gap.relative(GapCode.CAbiVariadic, &owner, span) }
+      // Constant tails are integer, floating or null-pointer literals of the tail's exact type.
+      let constant = match &operand.* {
+        Operand.Integer {ty: sourceType, ..} => run CAbi.validVariadic(argument, &sourceType)
+        Operand.Float {ty: sourceType, ..} => run CAbi.validVariadic(argument, &sourceType)
+        Operand.Null {ty: sourceType} => run CAbi.validVariadic(argument, &sourceType)
+        _ => false
+      }
+      if !constant { fail Gap.relative(GapCode.CAbiVariadic, &owner, span) }
       input = run emitOperand(&mut writer.*, function, target, layouts, operand)
     }
   }
   let source = scalar(&argument.sourceType, target)
   let promoted = scalar(&argument.promotedType, target)
-  if input.scalar.aggregate || input.scalar.unit || input.scalar.pointer || input.scalar.floating
+  if input.scalar.aggregate || input.scalar.unit || input.scalar.lanes != usize.ZERO
+    || input.scalar.pointer != source.pointer || input.scalar.floating != source.floating
     || input.scalar.bits != source.bits || input.scalar.signed != source.signed {
     fail Gap.relative(GapCode.CAbiVariadic, &owner, span)
+  }
+  // Pointers and f64 pass unchanged; f32 widens to double.
+  if source.pointer || source.floating {
+    if source.floating && source.bits < promoted.bits { return run emitCast(&mut writer.*, b"fpext", &input, promoted) }
+    return move input
   }
   if source.bits < promoted.bits {
     if source.signed { return run emitCast(&mut writer.*, b"sext", &input, promoted) }
@@ -3492,13 +3553,21 @@ effect fn variadicFunctionType(writer: &mut Writer, signature: &CAbi.Signature, 
 ! Gap | OutOfMemoryError ? &mut Allocator {
   run append(&mut writer.*, b" (")
   let parameters = List<CAbi.Lane>.asSlice(&signature.parameters)
+  let mut emitted = false
+  if signature.result.passing == CPassing.Indirect { run append(&mut writer.*, b"ptr") emitted = true }
   let mut at = usize.ZERO
   while at < parameters.length {
-    if at > usize.ZERO { run append(&mut writer.*, b", ") }
-    run laneType(&mut writer.*, &parameters[at], &signature.declaration, &GapSource.Relative {declaration: Shared<DeclarationId>.clone(&signature.declaration), location: span})
+    let mut part = usize.ZERO
+    while part < cParameterCount(&parameters[at]) {
+      if emitted { run append(&mut writer.*, b", ") }
+      run cParameterType(&mut writer.*, &parameters[at], part, false)
+      emitted = true
+      part = part + usize.ONE
+    }
     at = at + usize.ONE
   }
-  run append(&mut writer.*, b", ...)")
+  if emitted { run append(&mut writer.*, b", ") }
+  run append(&mut writer.*, b"...)")
   return ()
 }
 
@@ -3518,6 +3587,215 @@ fn foreignGuard(function: &MirFunction) -> bool {
   return false
 }
 
+effect fn nativeSignature(function: &MirFunction, target: &Target, layouts: &TypeLayouts,
+  signature: &Shared<Type>, span: Location) -> CAbi.Signature
+! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let owner = InstanceKey.identity(&function.key)
+  let copied = run Type.copy(signature)
+  if let Type.Callable {parameters, result, ..} = move copied {
+    let returned = run classifiedLane(function, target, layouts, &result, span, true)
+    let lanes = run classifiedParameters(function, target, layouts, List<Shared<Type>>.asSlice(&parameters), &returned, span)
+    return CAbi.Signature {importModule: Bytes.make(), importName: Bytes.make(),
+      behavior: ForeignContract.conservative(), noCapture: List<usize>.make(),
+      declaration: Shared<DeclarationId>.clone(&owner), symbol: Bytes.make(),
+      source: GapSource.Relative {declaration: move owner, location: span}, result: move returned,
+      parameters: move lanes, global: false, variadic: false}
+  }
+  fail Gap.relative(GapCode.ForeignAbi, &owner, span)
+}
+
+effect fn cCopyName(block: usize, parameter: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut name = Writer {text: run Bytes.copy(b"%carg"), next: usize.ZERO, symbol: Bytes.make(), constants: Bytes.make(), trap: Option<TrapReport>.none()}
+  run decimal(&mut name, block)
+  run append(&mut name, b".")
+  run decimal(&mut name, parameter)
+  return move name.text
+}
+
+effect fn cCopySlots(writer: &mut Writer, parameters: &[CAbi.Lane], block: usize) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < parameters.length {
+    let lane = &parameters[at]
+    if lane.passing == CPassing.Indirect {
+      let name = run cCopyName(block, at)
+      run append(&mut writer.*, Bytes.asSlice(&name))
+      run append(&mut writer.*, b" = alloca ")
+      run cStorageType(&mut writer.*, lane)
+      let mut alignment = lane.layout.alignment
+      if lane.stackAlignment > alignment { alignment = lane.stackAlignment }
+      run memoryAlignment(&mut writer.*, alignment)
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Caller copies belong to the entry block, so a foreign call in a loop does not grow the stack.
+effect fn emitCCopySlots(writer: &mut Writer, function: &MirFunction, target: &Target,
+  layouts: &TypeLayouts, foreign: &[CAbi.Signature]) -> ()
+! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let mut at = usize.ZERO
+  while at < blocks.length {
+    if let Terminator.Call {callee, origin, ..} = &blocks[at].terminator {
+      if let Callee.Extern {declaration, ..} = &callee {
+        let index = foreignSignatureIndex(foreign, &declaration)
+        if index != usize.MAX { run cCopySlots(&mut writer.*, List<CAbi.Lane>.asSlice(&foreign[index].parameters), at) }
+      }
+      if let Callee.NativeIndirect {signature, ..} = &callee {
+        let native = run nativeSignature(function, target, layouts, &signature, origin.location)
+        run cCopySlots(&mut writer.*, List<CAbi.Lane>.asSlice(&native.parameters), at)
+      }
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn finishInvoke(writer: &mut Writer) -> () ! OutOfMemoryError ? &mut Allocator {
+  let resumed = run temp(&mut writer.*)
+  let unwound = run temp(&mut writer.*)
+  let landing = run temp(&mut writer.*)
+  run append(&mut writer.*, b") to label ")
+  run append(&mut writer.*, Bytes.asSlice(&resumed))
+  run append(&mut writer.*, b" unwind label ")
+  run append(&mut writer.*, Bytes.asSlice(&unwound))
+  run append(&mut writer.*, b"\n")
+  run tempLabel(&mut writer.*, &unwound)
+  run append(&mut writer.*, b":\n")
+  run append(&mut writer.*, Bytes.asSlice(&landing))
+  run append(&mut writer.*, b" = landingpad { ptr, i32 } cleanup\ncall void @llvm.trap()\nunreachable\n")
+  run tempLabel(&mut writer.*, &resumed)
+  return run append(&mut writer.*, b":\n")
+}
+
+effect fn emitCCall(writer: &mut Writer, function: &MirFunction, target: &Target,
+  layouts: &TypeLayouts, signature: &CAbi.Signature, callee: &Callee, arguments: &List<Operand>,
+  providers: &List<Operand>, diagnostics: &Option<Diagnostics>, destination: &Place,
+  normal: usize, failure: &Option<FailureEdge>, span: Location, block: usize) -> ()
+! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let owner = InstanceKey.identity(&function.key)
+  let parameters = List<CAbi.Lane>.asSlice(&signature.parameters)
+  let values = List<Operand>.asSlice(arguments)
+  if signature.global || values.length < parameters.length || (!signature.variadic && values.length != parameters.length)
+    || (signature.variadic && parameters.length == usize.ZERO) {
+    fail Gap.relative(GapCode.CAbiVariadic, &owner, span)
+  }
+  if List<Operand>.length(providers) != usize.ZERO { fail Gap.relative(GapCode.ForeignAbi, &owner, span) }
+  if let Option<Diagnostics>.Some {..} = &diagnostics.* { fail Gap.relative(GapCode.ForeignAbi, &owner, span) }
+  if let Option<FailureEdge>.Some {..} = &failure.* { fail Gap.relative(GapCode.ForeignAbi, &owner, span) }
+  if let Callee.Extern {variadicArguments, ..} = &callee.* {
+    if List<CAbi.VariadicArgument>.length(&variadicArguments) != values.length - parameters.length {
+      fail Gap.relative(GapCode.CAbiVariadic, &owner, span)
+    }
+  }
+  let output = run emitPlace(&mut writer.*, function, target, layouts, destination)
+  if !(run Type.equalsShared(&output.ty, &signature.result.ty)) { fail Gap.relative(GapCode.ForeignAbi, &owner, span) }
+  let mut address = Bytes.make()
+  if let Callee.NativeIndirect {address: operand, ..} = &callee.* {
+    let loaded = run emitOperand(&mut writer.*, function, target, layouts, &operand)
+    address = move loaded.text
+  }
+  let mut prepared = List<List<Bytes>>.make()
+  let mut at = usize.ZERO
+  while at < parameters.length {
+    let lane = &parameters[at]
+    let mut parts = List<Bytes>.make()
+    if lane.layout.abi == Abi.Unit { fail Gap.relative(GapCode.UnitParameter, &owner, span) }
+    if lane.passing == CPassing.Direct {
+      let value = run emitArgument(&mut writer.*, function, target, layouts, &values[at], true)
+      run List<Bytes>.append(&mut parts, move value.text)
+    } else {
+      let selected = match &values[at] {
+        Operand.Copy {place} => run emitPlace(&mut writer.*, function, target, layouts, &place)
+        Operand.Move {place} => run emitPlace(&mut writer.*, function, target, layouts, &place)
+        _ => { fail Gap.relative(GapCode.ForeignAbi, &owner, span) }
+      }
+      if !(run Type.equalsShared(&selected.ty, &lane.ty)) { fail Gap.relative(GapCode.ForeignAbi, &owner, span) }
+      if lane.passing == CPassing.Indirect {
+        let copy = run cCopyName(block, at)
+        run copyBytes(&mut writer.*, Bytes.asSlice(&copy), Bytes.asSlice(&selected.text), lane.layout.size)
+        run List<Bytes>.append(&mut parts, move copy)
+      } else if lane.passing == CPassing.Coerce {
+        if lane.grouped {
+          run List<Bytes>.append(&mut parts, run readCRecord(&mut writer.*, lane, Bytes.asSlice(&selected.text)))
+        } else {
+          let pieces = List<CPiece>.asSlice(&lane.pieces)
+          let mut part = usize.ZERO
+          while part < pieces.length {
+            let value = run loadCPiece(&mut writer.*, lane, pieces[part], Bytes.asSlice(&selected.text))
+            run List<Bytes>.append(&mut parts, move value.text)
+            part = part + usize.ONE
+          }
+        }
+      }
+    }
+    run List<List<Bytes>>.append(&mut prepared, move parts)
+    at = at + usize.ONE
+  }
+  let mut tails = List<Value>.make()
+  if let Callee.Extern {variadicArguments, ..} = &callee.* {
+    let promotions = List<CAbi.VariadicArgument>.asSlice(&variadicArguments)
+    at = usize.ZERO
+    while at < promotions.length {
+      run List<Value>.append(&mut tails, run emitVariadicArgument(&mut writer.*, function, target, layouts,
+        &values[parameters.length + at], &promotions[at], span))
+      at = at + usize.ONE
+    }
+  }
+  let returned = &signature.result
+  let hasResult = returned.passing == CPassing.Coerce || (returned.passing == CPassing.Direct && returned.layout.abi != Abi.Unit)
+  let mut result = Bytes.make()
+  if hasResult {
+    result = run temp(&mut writer.*)
+    run append(&mut writer.*, Bytes.asSlice(&result))
+    run append(&mut writer.*, b" = ")
+  }
+  run append(&mut writer.*, b"invoke ")
+  run extension(&mut writer.*, returned.extension)
+  run laneType(&mut writer.*, returned, &signature.declaration, &signature.source)
+  if signature.variadic { run variadicFunctionType(&mut writer.*, signature, span) }
+  run append(&mut writer.*, b" ")
+  if let Callee.NativeIndirect {..} = &callee.* { run append(&mut writer.*, Bytes.asSlice(&address)) }
+  else { run append(&mut writer.*, b"@") run quoted(&mut writer.*, Bytes.asSlice(&signature.symbol)) }
+  run append(&mut writer.*, b"(")
+  let mut emitted = false
+  if returned.passing == CPassing.Indirect {
+    run cSret(&mut writer.*, returned)
+    run append(&mut writer.*, Bytes.asSlice(&output.text))
+    emitted = true
+  }
+  let inputs = List<List<Bytes>>.asSlice(&prepared)
+  at = usize.ZERO
+  while at < parameters.length {
+    let parts = List<Bytes>.asSlice(&inputs[at])
+    let mut part = usize.ZERO
+    while part < parts.length {
+      if emitted { run append(&mut writer.*, b", ") }
+      run cParameterType(&mut writer.*, &parameters[at], part, true)
+      run append(&mut writer.*, Bytes.asSlice(&parts[part]))
+      emitted = true
+      part = part + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  let trailing = List<Value>.asSlice(&tails)
+  at = usize.ZERO
+  while at < trailing.length {
+    if emitted { run append(&mut writer.*, b", ") }
+    run operandText(&mut writer.*, &trailing[at])
+    emitted = true
+    at = at + usize.ONE
+  }
+  run finishInvoke(&mut writer.*)
+  if returned.passing == CPassing.Coerce { run writeCRecord(&mut writer.*, returned, Bytes.asSlice(&result), Bytes.asSlice(&output.text)) }
+  else if hasResult { run storeValue(&mut writer.*, &output, &Value {scalar: output.representation, text: move result}) }
+  run append(&mut writer.*, b"br label %")
+  run label(&mut writer.*, normal)
+  return run append(&mut writer.*, b"\n")
+}
+
 effect fn emitCall(
   writer: &mut Writer,
   function: &MirFunction,
@@ -3533,37 +3811,23 @@ effect fn emitCall(
   normal: usize,
   failure: &Option<FailureEdge>,
   span: Location,
+  block: usize,
 ) -> () ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
   if let Callee.NativeIndirect {signature, ..} = &callee.* {
-    let owner = InstanceKey.identity(&function.key)
-    let copied = run Type.copy(&signature)
-    if let Type.Callable {parameters, result, ..} = move copied {
-      let mut native = List<CAbi.Signature>.make()
-      let mut lanes = List<CAbi.Lane>.make()
-      let listed = List<Shared<Type>>.asSlice(&parameters)
-      let mut at = usize.ZERO
-      while at < listed.length {
-        let facts = run layoutOf(layouts, &listed[at], function, span)
-        let lane = match move CAbi.classify(&listed[at], facts, target) {
-          Option<CAbi.Lane>.Some {value} => move value
-          _ => { fail Gap.relative(GapCode.ForeignAbi, &owner, span) }
-        }
-        run List<CAbi.Lane>.append(&mut lanes, move lane)
-        at = at + usize.ONE
-      }
-      let resultFacts = run layoutOf(layouts, &result, function, span)
-      let returned = match move CAbi.classify(&result, resultFacts, target) {
-        Option<CAbi.Lane>.Some {value} => move value
-        _ => { fail Gap.relative(GapCode.ForeignAbi, &owner, span) }
-      }
-      run List<CAbi.Signature>.append(&mut native, CAbi.Signature {behavior: ForeignContract.conservative(), noCapture: List<usize>.make(), declaration: Shared<DeclarationId>.clone(&owner), symbol: Bytes.make(),
-        source: GapSource.Relative {declaration: move owner, location: span}, result: move returned, parameters: move lanes, global: false, variadic: false})
-      return run emitCallInner(&mut writer.*, function, target, layouts, List<CAbi.Signature>.asSlice(&native), identities,
-        callee, arguments, providers, diagnostics, destination, normal, failure, span)
-    }
-    fail Gap.relative(GapCode.ForeignAbi, &owner, span)
+    let native = run nativeSignature(function, target, layouts, &signature, span)
+    return run emitCCall(&mut writer.*, function, target, layouts, &native, callee, arguments,
+      providers, diagnostics, destination, normal, failure, span, block)
   }
-  return run emitCallInner(&mut writer.*, function, target, layouts, foreign, identities,
+  if let Callee.Extern {declaration, ..} = &callee.* {
+    let index = foreignSignatureIndex(foreign, &declaration)
+    if index == usize.MAX {
+      let owner = InstanceKey.identity(&function.key)
+      fail Gap.relative(GapCode.ForeignAbi, &owner, span)
+    }
+    return run emitCCall(&mut writer.*, function, target, layouts, &foreign[index], callee, arguments,
+      providers, diagnostics, destination, normal, failure, span, block)
+  }
+  return run emitCallInner(&mut writer.*, function, target, layouts, identities,
     callee, arguments, providers, diagnostics, destination, normal, failure, span)
 }
 
@@ -3572,7 +3836,6 @@ effect fn emitCallInner(
   function: &MirFunction,
   target: &Target,
   layouts: &TypeLayouts,
-  foreign: &[CAbi.Signature],
   identities: &[InstanceIdentity],
   callee: &Callee,
   arguments: &List<Operand>,
@@ -3583,44 +3846,8 @@ effect fn emitCallInner(
   failure: &Option<FailureEdge>,
   span: Location,
 ) -> () ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
-  let mut foreignIndex = usize.MAX
-  if let Callee.Extern {declaration, variadicArguments} = &callee.* {
-    foreignIndex = foreignSignatureIndex(foreign, &declaration)
-    if foreignIndex == usize.MAX {
-      let owner = InstanceKey.identity(&function.key)
-      fail Gap.relative(GapCode.ForeignAbi, &owner, span)
-    }
-    let signature = &foreign[foreignIndex]
-    let fixed = List<CAbi.Lane>.length(&signature.parameters)
-    let actual = List<Operand>.length(arguments)
-    let tails = List<CAbi.VariadicArgument>.length(&variadicArguments)
-    if signature.global || actual < fixed || (!signature.variadic && actual != fixed)
-      || tails != actual - fixed || (signature.variadic && fixed == usize.ZERO) {
-      let owner = InstanceKey.identity(&function.key)
-      fail Gap.relative(GapCode.CAbiVariadic, &owner, span)
-    }
-    if List<Operand>.length(providers) != usize.ZERO {
-      let owner = InstanceKey.identity(&function.key)
-      fail Gap.relative(GapCode.ForeignAbi, &owner, span)
-    }
-    if let Option<Diagnostics>.Some {..} = &diagnostics.* {
-      let owner = InstanceKey.identity(&function.key)
-      fail Gap.relative(GapCode.ForeignAbi, &owner, span)
-    }
-    if let Option<FailureEdge>.Some {..} = &failure.* {
-      let owner = InstanceKey.identity(&function.key)
-      fail Gap.relative(GapCode.ForeignAbi, &owner, span)
-    }
-  }
-  if let Callee.NativeIndirect {..} = &callee.* { foreignIndex = usize.ZERO }
   let output = run emitPlace(&mut writer.*, function, target, layouts, destination)
   let kind = output.representation
-  if foreignIndex != usize.MAX {
-    if kind.aggregate || !(run Type.equalsShared(&output.ty, &foreign[foreignIndex].result.ty)) {
-      let owner = InstanceKey.identity(&function.key)
-      fail Gap.relative(GapCode.ForeignAbi, &owner, span)
-    }
-  }
   // A fallible callee takes success and failure out-addresses after its arguments and returns a
   // status: 0 continues at `normal`, 1 at the failure edge (D3).
   let mut failed = Option<Address>.none()
@@ -3636,9 +3863,6 @@ effect fn emitCallInner(
   }
   let mut indirect = Option<Value>.none()
   if let Callee.Indirect {address} = &callee.* {
-    indirect = Option<Value>.some(run emitOperand(&mut writer.*, function, target, layouts, &address))
-  }
-  if let Callee.NativeIndirect {address, ..} = &callee.* {
     indirect = Option<Value>.some(run emitOperand(&mut writer.*, function, target, layouts, &address))
   }
   let fallible = handler != usize.MAX
@@ -3660,54 +3884,22 @@ effect fn emitCallInner(
   let mut evaluated = List<Value>.make()
   let mut index = usize.ZERO
   while index < values.length {
-    let mut tail = false
-    if foreignIndex != usize.MAX { tail = index >= List<CAbi.Lane>.length(&foreign[foreignIndex].parameters) }
-    let mut value = Value {scalar: pointerRepresentation(target), text: Bytes.make()}
-    if tail {
-      if let Callee.Extern {variadicArguments, ..} = &callee.* {
-        let supplied = List<CAbi.VariadicArgument>.asSlice(&variadicArguments)
-        let fixed = List<CAbi.Lane>.length(&foreign[foreignIndex].parameters)
-        value = run emitVariadicArgument(&mut writer.*, function, target, layouts, &values[index], &supplied[index - fixed], span)
-      } else {
-        let owner = InstanceKey.identity(&function.key)
-        fail Gap.relative(GapCode.CAbiVariadic, &owner, span)
-      }
-    } else {
-      value = run emitArgument(&mut writer.*, function, target, layouts, &values[index], foreignIndex != usize.MAX)
-    }
-    // A unit argument has no lane: an internal callee declares no parameter for it (see `emit`).
-    if value.scalar.unit && foreignIndex != usize.MAX {
-      let owner = InstanceKey.identity(&function.key)
-      fail Gap.relative(GapCode.UnitParameter, &owner, span)
-    }
+    let value = run emitArgument(&mut writer.*, function, target, layouts, &values[index], false)
     if !value.scalar.unit { run List<Value>.append(&mut evaluated, move value) }
     index = index + usize.ONE
   }
   // A wide vector result is written through the caller's address like an aggregate (SIMD-009).
-  let outward = kind.aggregate || (foreignIndex == usize.MAX && passedIndirectly(kind))
+  let outward = kind.aggregate || passedIndirectly(kind)
   let mut returned = Bytes.make()
   if fallible || (!kind.unit && !outward) {
     returned = run temp(&mut writer.*)
     run append(&mut writer.*, Bytes.asSlice(&returned))
     run append(&mut writer.*, b" = ")
   }
-  let guarded = foreignIndex != usize.MAX || InstanceKey.fixedLinkage(&function.key)
+  let guarded = InstanceKey.fixedLinkage(&function.key)
   if guarded { run append(&mut writer.*, b"invoke ") }
   else { run append(&mut writer.*, b"call ") }
-  if foreignIndex != usize.MAX {
-    run extension(&mut writer.*, foreign[foreignIndex].result.extension)
-    run laneType(&mut writer.*, &foreign[foreignIndex].result, &foreign[foreignIndex].declaration, &GapSource.Relative {declaration: Shared<DeclarationId>.clone(&foreign[foreignIndex].declaration), location: span})
-    if foreign[foreignIndex].variadic { run variadicFunctionType(&mut writer.*, &foreign[foreignIndex], span) }
-    if let Callee.NativeIndirect {..} = &callee.* {
-      run append(&mut writer.*, b" ")
-      if let Option<Value>.Some {value: address} = &indirect {
-        run append(&mut writer.*, Bytes.asSlice(&address.text))
-      }
-    } else {
-      run append(&mut writer.*, b" @")
-      run quoted(&mut writer.*, Bytes.asSlice(&foreign[foreignIndex].symbol))
-    }
-  } else if let Callee.Instance {key} = &callee.* {
+  if let Callee.Instance {key} = &callee.* {
     if fallible { run append(&mut writer.*, b"i1") }
     else if outward { run append(&mut writer.*, b"void") }
     else { run typeName(&mut writer.*, kind) }
@@ -3733,20 +3925,8 @@ effect fn emitCallInner(
     if index > usize.ZERO || leadingOutput {
       run append(&mut writer.*, b", ")
     }
-    if foreignIndex != usize.MAX {
-      let parameters = List<CAbi.Lane>.asSlice(&foreign[foreignIndex].parameters)
-      if index >= parameters.length {
-        run typeName(&mut writer.*, prepared[index].scalar)
-        run append(&mut writer.*, b" ")
-      } else {
-        run laneType(&mut writer.*, &parameters[index], &foreign[foreignIndex].declaration, &GapSource.Relative {declaration: Shared<DeclarationId>.clone(&foreign[foreignIndex].declaration), location: span})
-        run append(&mut writer.*, b" ")
-        run extension(&mut writer.*, parameters[index].extension)
-      }
-    } else {
-      run typeName(&mut writer.*, prepared[index].scalar)
-      run append(&mut writer.*, b" ")
-    }
+    run typeName(&mut writer.*, prepared[index].scalar)
+    run append(&mut writer.*, b" ")
     run append(&mut writer.*, Bytes.asSlice(&prepared[index].text))
     index = index + usize.ONE
   }
@@ -3769,22 +3949,8 @@ effect fn emitCallInner(
       run append(&mut writer.*, Bytes.asSlice(&companion))
     }
   }
-  if guarded {
-    let resumed = run temp(&mut writer.*)
-    let unwound = run temp(&mut writer.*)
-    let landing = run temp(&mut writer.*)
-    run append(&mut writer.*, b") to label ")
-    run append(&mut writer.*, Bytes.asSlice(&resumed))
-    run append(&mut writer.*, b" unwind label ")
-    run append(&mut writer.*, Bytes.asSlice(&unwound))
-    run append(&mut writer.*, b"\n")
-    run tempLabel(&mut writer.*, &unwound)
-    run append(&mut writer.*, b":\n")
-    run append(&mut writer.*, Bytes.asSlice(&landing))
-    run append(&mut writer.*, b" = landingpad { ptr, i32 } cleanup\ncall void @llvm.trap()\nunreachable\n")
-    run tempLabel(&mut writer.*, &resumed)
-    run append(&mut writer.*, b":\n")
-  } else { run append(&mut writer.*, b")\n") }
+  if guarded { run finishInvoke(&mut writer.*) }
+  else { run append(&mut writer.*, b")\n") }
   if fallible {
     run append(&mut writer.*, b"br i1 ")
     run append(&mut writer.*, Bytes.asSlice(&returned))
@@ -3985,6 +4151,7 @@ effect fn emitBlock(
           normal,
           &failure,
           origin.location,
+          index,
         )
       }
     }
@@ -4062,10 +4229,17 @@ effect fn emitEntrySlots(
   function: &MirFunction,
   target: &Target,
   layouts: &TypeLayouts,
+  foreign: &[CAbi.Signature],
 ) -> () ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
   run emitSlots(&mut writer.*, function, target, layouts, &Option<Suspended>.none())
+  run emitCCopySlots(&mut writer.*, function, target, layouts, foreign)
   let locals = List<Local>.asSlice(&function.locals)
   let parameters = List<Shared<Type>>.asSlice(&function.parameters)
+  let mut cParameters = List<CAbi.Lane>.make()
+  if cExport(function) {
+    let result = run classifiedLane(function, target, layouts, &function.result, locals[usize.ZERO].origin.location, true)
+    cParameters = run classifiedParameters(function, target, layouts, parameters, &result, locals[usize.ZERO].origin.location)
+  }
   let mut local = usize.ZERO
   while local < parameters.length {
     let parameterLayout = run layoutOf(layouts, &parameters[local], function,
@@ -4077,6 +4251,32 @@ effect fn emitEntrySlots(
     let input = move parameterName.text
     let mut addressName = Writer {text: Bytes.make(), next: usize.ZERO, symbol: Bytes.make(), constants: Bytes.make(), trap: Option<TrapReport>.none()}
     run localName(&mut addressName, local + usize.ONE)
+    if cExport(function) {
+      let classified = List<CAbi.Lane>.asSlice(&cParameters)
+      let lane = &classified[local]
+      if lane.passing == CPassing.Ignore { local = local + usize.ONE continue }
+      if lane.passing == CPassing.Indirect {
+        run copyBytes(&mut writer.*, Bytes.asSlice(&addressName.text), Bytes.asSlice(&input), lane.layout.size)
+        local = local + usize.ONE
+        continue
+      }
+      if lane.passing == CPassing.Coerce {
+        if lane.grouped || cParameterCount(lane) == usize.ONE {
+          run writeCRecord(&mut writer.*, lane, Bytes.asSlice(&input), Bytes.asSlice(&addressName.text))
+        } else {
+          let parts = List<CPiece>.asSlice(&lane.pieces)
+          let mut at = usize.ZERO
+          while at < parts.length {
+            let mut name = Writer {text: Bytes.make(), next: usize.ZERO, symbol: Bytes.make(), constants: Bytes.make(), trap: Option<TrapReport>.none()}
+            run cParameterName(&mut name, lane, local, at)
+            run storeCPiece(&mut writer.*, lane, parts[at], Bytes.asSlice(&name.text), Bytes.asSlice(&addressName.text))
+            at = at + usize.ONE
+          }
+        }
+        local = local + usize.ONE
+        continue
+      }
+    }
     if !cExport(function) && passedIndirectly(kind) {
       run copyBytes(&mut writer.*, Bytes.asSlice(&addressName.text), Bytes.asSlice(&input), parameterLayout.size)
       local = local + usize.ONE
@@ -4221,19 +4421,22 @@ pub effect fn emit(
     InstanceKey.Export {..} => true
     _ => false
   }
-  // Only a C export keeps every written parameter as a lane; elsewhere a unit parameter has none.
-  let mut at = usize.ZERO
-  while at < parameters.length {
-    if exported && scalar(&parameters[at], target).unit {
-      let owner = InstanceKey.identity(&function.key)
-      fail Gap.relative(GapCode.UnitParameter, &owner, locals[at + usize.ONE].origin.location)
-    }
-    at = at + usize.ONE
+  let mut cResult = Option<CAbi.Lane>.none()
+  let mut cParameters = List<CAbi.Lane>.make()
+  if exported {
+    let returned = run classifiedLane(function, target, layouts, &function.result, locals[usize.ZERO].origin.location, true)
+    cParameters = run classifiedParameters(function, target, layouts, parameters, &returned, locals[usize.ZERO].origin.location)
+    cResult = Option<CAbi.Lane>.some(move returned)
   }
+  let mut at = usize.ZERO
   run append(&mut writer, b"define ")
-  if exported { run cExtension(&mut writer, result, target) }
-  let outward = result.aggregate || (!exported && passedIndirectly(result))
-  if fallible { run append(&mut writer, b"i1") }
+  let mut outward = result.aggregate || passedIndirectly(result)
+  if let Option<CAbi.Lane>.Some {value: returned} = &cResult {
+    outward = returned.passing == CPassing.Indirect
+    run extension(&mut writer, returned.extension)
+    run laneType(&mut writer, &returned, &InstanceKey.identity(&function.key), &GapSource.Relative {
+      declaration: InstanceKey.identity(&function.key), location: locals[usize.ZERO].origin.location})
+  } else if fallible { run append(&mut writer, b"i1") }
   else if outward { run append(&mut writer, b"void") }
   else { run typeName(&mut writer, result) }
   run append(&mut writer, b" @")
@@ -4243,26 +4446,37 @@ pub effect fn emit(
   writer.symbol = move symbol
   run append(&mut writer, b"(")
   let leadingOutput = outward && !fallible
-  if leadingOutput { run append(&mut writer, b"ptr %out") }
+  if leadingOutput {
+    if let Option<CAbi.Lane>.Some {value: returned} = &cResult { run cSret(&mut writer, &returned) }
+    else { run append(&mut writer, b"ptr ") }
+    run append(&mut writer, b"%out")
+  }
   let mut lanes = usize.ZERO
   at = usize.ZERO
   while at < parameters.length {
-    let facts = run layoutOf(layouts, &parameters[at], function, locals[at + usize.ONE].origin.location)
-    let lane = storageRepresentation(&parameters[at], target, facts)
-    if lane.unit {
-      at = at + usize.ONE
-      continue
+    if exported {
+      let classified = List<CAbi.Lane>.asSlice(&cParameters)
+      let lane = &classified[at]
+      let mut part = usize.ZERO
+      while part < cParameterCount(lane) {
+        if lanes > usize.ZERO || leadingOutput { run append(&mut writer, b", ") }
+        run cParameterType(&mut writer, lane, part, true)
+        run cParameterName(&mut writer, lane, at, part)
+        lanes = lanes + usize.ONE
+        part = part + usize.ONE
+      }
+    } else {
+      let facts = run layoutOf(layouts, &parameters[at], function, locals[at + usize.ONE].origin.location)
+      let lane = storageRepresentation(&parameters[at], target, facts)
+      if !lane.unit {
+        if lanes > usize.ZERO || leadingOutput { run append(&mut writer, b", ") }
+        lanes = lanes + usize.ONE
+        if facts.abi == Abi.Indirect || passedIndirectly(lane) { run append(&mut writer, b"ptr") }
+        else { run typeName(&mut writer, lane) }
+        run append(&mut writer, b" %p")
+        run decimal(&mut writer, at)
+      }
     }
-    if lanes > usize.ZERO || leadingOutput {
-      run append(&mut writer, b", ")
-    }
-    lanes = lanes + usize.ONE
-    if facts.abi == Abi.Indirect || (!exported && passedIndirectly(lane)) { run append(&mut writer, b"ptr") }
-    else { run typeName(&mut writer, lane) }
-    run append(&mut writer, b" ")
-    if exported { run cExtension(&mut writer, lane, target) }
-    run append(&mut writer, b"%p")
-    run decimal(&mut writer, at)
     at = at + usize.ONE
   }
   // Hidden provider addresses follow the written parameters (D2).
@@ -4329,7 +4543,7 @@ pub effect fn emit(
     run label(&mut writer, at)
     run append(&mut writer, b":\n")
     if at == usize.ZERO {
-      run emitEntrySlots(&mut writer, function, target, layouts)
+      run emitEntrySlots(&mut writer, function, target, layouts, foreign)
     }
     run emitBlock(&mut writer, function, target, layouts, &blocks[at], foreign, identities, &ordinary, at,
       List<BlockMarkers>.asSlice(&lifetimes.blocks))
@@ -4792,6 +5006,7 @@ effect fn emitStep(writer: &mut Writer, function: &MirFunction, target: &Target,
   if foreignGuard(function) { run append(&mut writer.*, b" noinline nounwind personality ptr @__silk_foreign_personality") }
   run append(&mut writer.*, b" {\nentry:\n")
   run emitSlots(&mut writer.*, function, target, layouts, suspended)
+  run emitCCopySlots(&mut writer.*, function, target, layouts, foreign)
   let observed = diagnosticLocal(function, usize.ZERO) != usize.MAX
   let fallible = failureLocal(function) != usize.MAX
   if run takesResult(function, target, layouts) { run loadHidden(&mut writer.*, b"%out", Coroutine.outOffset(word)) }
@@ -5132,17 +5347,6 @@ effect fn emitSuspendingCall(
   return run append(&mut writer.*, b")\nret i32 1\n")
 }
 
-// The extension attribute, with its trailing space, that the target's C ABI requires of a narrow
-// integer lane.
-effect fn cExtension(writer: &mut Writer, lane: Representation, target: &Target) -> () ! OutOfMemoryError ? &mut Allocator {
-  if !CAbi.extendsNarrowIntegers(target) { return () }
-  if lane.aggregate || lane.pointer || lane.floating || lane.unit || lane.bits == usize.ZERO || lane.bits >= 32 {
-    return ()
-  }
-  if lane.signed { return run append(&mut writer.*, b"signext ") }
-  return run append(&mut writer.*, b"zeroext ")
-}
-
 /// One deduplicated declaration candidate owned by an instance answer.
 pub struct Declaration {
   pub contract: Bytes,
@@ -5161,6 +5365,8 @@ effect fn extension(writer: &mut Writer, rule: CExtension) -> () ! OutOfMemoryEr
 effect fn laneType(writer: &mut Writer, lane: &CAbi.Lane, declaration: &Shared<DeclarationId>, source: &GapSource) -> ()
 ! Gap | OutOfMemoryError
 ? &mut Allocator {
+  if lane.passing == CPassing.Ignore || lane.passing == CPassing.Indirect { return run append(&mut writer.*, b"void") }
+  if lane.passing == CPassing.Coerce { return run coercionType(&mut writer.*, lane) }
   match lane.layout.abi {
     Abi.Unit => {
       return run append(&mut writer.*, b"void")
@@ -5196,6 +5402,217 @@ effect fn laneType(writer: &mut Writer, lane: &CAbi.Lane, declaration: &Shared<D
   }
   run append(&mut writer.*, b"i")
   return run decimal(&mut writer.*, lane.layout.size * 8)
+}
+
+fn pieceRepresentation(piece: CPiece) -> Representation {
+  return Representation {aggregate: false, size: usize.ZERO, bits: piece.bits, signed: false,
+    unit: false, pointer: piece.abi == Abi.Pointer, floating: piece.abi == Abi.Floating, lanes: piece.lanes}
+}
+
+effect fn coercionType(writer: &mut Writer, lane: &CAbi.Lane) -> () ! OutOfMemoryError ? &mut Allocator {
+  let parts = List<CPiece>.asSlice(&lane.pieces)
+  if lane.grouped {
+    run append(&mut writer.*, b"[")
+    run decimal(&mut writer.*, parts.length)
+    run append(&mut writer.*, b" x ")
+    run typeName(&mut writer.*, pieceRepresentation(parts[usize.ZERO]))
+    return run append(&mut writer.*, b"]")
+  }
+  if parts.length == usize.ONE { return run typeName(&mut writer.*, pieceRepresentation(parts[usize.ZERO])) }
+  run append(&mut writer.*, b"{ ")
+  let mut at = usize.ZERO
+  while at < parts.length {
+    if at != usize.ZERO { run append(&mut writer.*, b", ") }
+    run typeName(&mut writer.*, pieceRepresentation(parts[at]))
+    at = at + usize.ONE
+  }
+  return run append(&mut writer.*, b" }")
+}
+
+effect fn cStorageType(writer: &mut Writer, lane: &CAbi.Lane) -> () ! OutOfMemoryError ? &mut Allocator {
+  run append(&mut writer.*, b"[")
+  run decimal(&mut writer.*, lane.layout.size)
+  return run append(&mut writer.*, b" x i8]")
+}
+
+effect fn cSret(writer: &mut Writer, lane: &CAbi.Lane) -> () ! OutOfMemoryError ? &mut Allocator {
+  run append(&mut writer.*, b"ptr sret(")
+  run cStorageType(&mut writer.*, lane)
+  run append(&mut writer.*, b") align ")
+  run decimal(&mut writer.*, lane.layout.alignment)
+  return run append(&mut writer.*, b" ")
+}
+
+fn cParameterCount(lane: &CAbi.Lane) -> usize {
+  if lane.passing == CPassing.Ignore { return usize.ZERO }
+  if lane.passing == CPassing.Coerce && !lane.grouped { return List<CPiece>.length(&lane.pieces) }
+  return usize.ONE
+}
+
+effect fn cParameterType(writer: &mut Writer, lane: &CAbi.Lane, part: usize, attributes: bool) -> ()
+! Gap | OutOfMemoryError ? &mut Allocator {
+  if lane.passing == CPassing.Indirect {
+    run append(&mut writer.*, b"ptr")
+    if attributes && lane.byval {
+      run append(&mut writer.*, b" byval(")
+      run cStorageType(&mut writer.*, lane)
+      run append(&mut writer.*, b") align ")
+      run decimal(&mut writer.*, lane.stackAlignment)
+    }
+    if attributes { run append(&mut writer.*, b" ") }
+    return ()
+  }
+  if lane.passing == CPassing.Coerce {
+    if lane.grouped { run coercionType(&mut writer.*, lane) }
+    else { run typeName(&mut writer.*, pieceRepresentation(List<CPiece>.asSlice(&lane.pieces)[part])) }
+    if attributes && lane.grouped && lane.stackAlignment != usize.ZERO {
+      run append(&mut writer.*, b" alignstack(")
+      run decimal(&mut writer.*, lane.stackAlignment)
+      run append(&mut writer.*, b")")
+    }
+    if attributes { run append(&mut writer.*, b" ") }
+    return ()
+  }
+  // Direct lanes need no source position: their scalar admission and layout are already checked.
+  if lane.layout.abi == Abi.Vector {
+    run typeName(&mut writer.*, Representation {aggregate: false, size: usize.ZERO,
+      bits: Shared<Type>.with<usize>(&lane.ty, CAbi.vectorLaneBits), signed: false, unit: false,
+      pointer: false, floating: Shared<Type>.with<bool>(&lane.ty, CAbi.vectorFloating),
+      lanes: Shared<Type>.with<usize>(&lane.ty, CAbi.vectorBits) / Shared<Type>.with<usize>(&lane.ty, CAbi.vectorLaneBits)})
+  } else {
+    run typeName(&mut writer.*, Representation {aggregate: false, size: usize.ZERO,
+      bits: lane.layout.size * 8, signed: false, unit: lane.layout.abi == Abi.Unit,
+      pointer: lane.layout.abi == Abi.Pointer, floating: lane.layout.abi == Abi.Floating, lanes: usize.ZERO})
+  }
+  if attributes {
+    run append(&mut writer.*, b" ")
+    run extension(&mut writer.*, lane.extension)
+  }
+  return ()
+}
+
+// Coercion registers can be wider than the final bytes of a record on AAPCS64. Load only the
+// actual object bytes, then extend the register; never read beyond the source allocation.
+effect fn loadCPiece(writer: &mut Writer, lane: &CAbi.Lane, part: CPiece, source: &[u8]) -> Value
+! OutOfMemoryError ? &mut Allocator {
+  let full = pieceRepresentation(part)
+  let mut stored = full
+  if part.abi == Abi.Integer && part.lanes == usize.ZERO && stored.bits > (lane.layout.size - part.offset) * 8 {
+    stored.bits = (lane.layout.size - part.offset) * 8
+  }
+  let address = run byteOffset(&mut writer.*, source, part.offset)
+  let value = run temp(&mut writer.*)
+  run append(&mut writer.*, Bytes.asSlice(&value))
+  run append(&mut writer.*, b" = load ")
+  run typeName(&mut writer.*, stored)
+  run append(&mut writer.*, b", ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&address))
+  run append(&mut writer.*, b", align 1\n")
+  let loaded = Value {scalar: stored, text: move value}
+  if stored.bits != full.bits { return run emitCast(&mut writer.*, b"zext", &loaded, full) }
+  return move loaded
+}
+
+effect fn storeCPiece(writer: &mut Writer, lane: &CAbi.Lane, part: CPiece, value: &[u8], destination: &[u8]) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let full = pieceRepresentation(part)
+  let mut stored = Value {scalar: full, text: run Bytes.copy(value)}
+  if part.abi == Abi.Integer && part.lanes == usize.ZERO && full.bits > (lane.layout.size - part.offset) * 8 {
+    let mut narrowed = full
+    narrowed.bits = (lane.layout.size - part.offset) * 8
+    stored = run emitCast(&mut writer.*, b"trunc", &stored, narrowed)
+  }
+  let address = run byteOffset(&mut writer.*, destination, part.offset)
+  run append(&mut writer.*, b"store ")
+  run operandText(&mut writer.*, &stored)
+  run append(&mut writer.*, b", ptr ")
+  run append(&mut writer.*, Bytes.asSlice(&address))
+  return run append(&mut writer.*, b", align 1\n")
+}
+
+effect fn readCRecord(writer: &mut Writer, lane: &CAbi.Lane, source: &[u8]) -> Bytes
+! OutOfMemoryError ? &mut Allocator {
+  let parts = List<CPiece>.asSlice(&lane.pieces)
+  let mut combined = run Bytes.copy(b"poison")
+  let mut at = usize.ZERO
+  while at < parts.length {
+    let value = run loadCPiece(&mut writer.*, lane, parts[at], source)
+    if parts.length == usize.ONE && !lane.grouped { return move value.text }
+    let next = run temp(&mut writer.*)
+    run append(&mut writer.*, Bytes.asSlice(&next))
+    run append(&mut writer.*, b" = insertvalue ")
+    run coercionType(&mut writer.*, lane)
+    run append(&mut writer.*, b" ")
+    run append(&mut writer.*, Bytes.asSlice(&combined))
+    run append(&mut writer.*, b", ")
+    run operandText(&mut writer.*, &value)
+    run append(&mut writer.*, b", ")
+    run decimal(&mut writer.*, at)
+    run append(&mut writer.*, b"\n")
+    combined = move next
+    at = at + usize.ONE
+  }
+  return move combined
+}
+
+effect fn writeCRecord(writer: &mut Writer, lane: &CAbi.Lane, value: &[u8], destination: &[u8]) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let parts = List<CPiece>.asSlice(&lane.pieces)
+  let mut at = usize.ZERO
+  while at < parts.length {
+    let mut piece = run Bytes.copy(value)
+    if lane.grouped || parts.length > usize.ONE {
+      piece = run temp(&mut writer.*)
+      run append(&mut writer.*, Bytes.asSlice(&piece))
+      run append(&mut writer.*, b" = extractvalue ")
+      run coercionType(&mut writer.*, lane)
+      run append(&mut writer.*, b" ")
+      run append(&mut writer.*, value)
+      run append(&mut writer.*, b", ")
+      run decimal(&mut writer.*, at)
+      run append(&mut writer.*, b"\n")
+    }
+    run storeCPiece(&mut writer.*, lane, parts[at], Bytes.asSlice(&piece), destination)
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn classifiedLane(function: &MirFunction, target: &Target, layouts: &TypeLayouts,
+  ty: &Shared<Type>, span: Location, result: bool) -> CAbi.Lane
+! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if let Option<CAbi.Lane>.Some {value} = move run CAbi.classify(ty, layouts, target, result) { return move value }
+  let owner = InstanceKey.identity(&function.key)
+  fail Gap.relative(GapCode.ForeignAbi, &owner, span)
+}
+
+effect fn classifiedParameters(function: &MirFunction, target: &Target, layouts: &TypeLayouts,
+  parameters: &[Shared<Type>], result: &CAbi.Lane, span: Location) -> List<CAbi.Lane>
+! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut lanes = List<CAbi.Lane>.make()
+  let mut at = usize.ZERO
+  while at < parameters.length {
+    let lane = run classifiedLane(function, target, layouts, &parameters[at], span, false)
+    if lane.layout.abi == Abi.Unit {
+      let owner = InstanceKey.identity(&function.key)
+      fail Gap.relative(GapCode.UnitParameter, &owner, span)
+    }
+    run List<CAbi.Lane>.append(&mut lanes, move lane)
+    at = at + usize.ONE
+  }
+  CAbi.assignArguments(&mut lanes, result, target)
+  return move lanes
+}
+
+effect fn cParameterName(writer: &mut Writer, lane: &CAbi.Lane, parameter: usize, part: usize) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  run append(&mut writer.*, b"%p")
+  run decimal(&mut writer.*, parameter)
+  if cParameterCount(lane) > usize.ONE {
+    run append(&mut writer.*, b".")
+    run decimal(&mut writer.*, part)
+  }
+  return ()
 }
 
 // Writes `bytes` as one LLVM quoted string, escaping quotes, backslashes and nonprinting bytes.
@@ -5289,18 +5706,34 @@ pub effect fn foreignDeclarations(foreign: &[CAbi.Signature]) -> List<Declaratio
     run quoted(&mut writer, Bytes.asSlice(&signature.symbol))
     run append(&mut writer, b"(")
     let parameters = List<CAbi.Lane>.asSlice(&signature.parameters)
+    let mut emitted = false
+    if signature.result.passing == CPassing.Indirect {
+      run cSret(&mut writer, &signature.result)
+      emitted = true
+    }
     let mut parameter = usize.ZERO
     while parameter < parameters.length {
-      if parameter > usize.ZERO {
-        run append(&mut writer, b", ")
+      let mut part = usize.ZERO
+      while part < cParameterCount(&parameters[parameter]) {
+        if emitted { run append(&mut writer, b", ") }
+        run cParameterType(&mut writer, &parameters[parameter], part, true)
+        emitted = true
+        part = part + usize.ONE
       }
-      run laneType(&mut writer, &parameters[parameter], &signature.declaration, &signature.source)
-      run append(&mut writer, b" ")
-      run extension(&mut writer, parameters[parameter].extension)
       parameter = parameter + usize.ONE
     }
-    if signature.variadic { run append(&mut writer, b", ...") }
-    run append(&mut writer, b")\n")
+    if signature.variadic {
+      if emitted { run append(&mut writer, b", ") }
+      run append(&mut writer, b"...")
+    }
+    run append(&mut writer, b")")
+    if Bytes.length(&signature.importModule) > usize.ZERO {
+      run append(&mut writer, b" \"wasm-import-module\"=")
+      run quoted(&mut writer, Bytes.asSlice(&signature.importModule))
+      run append(&mut writer, b" \"wasm-import-name\"=")
+      run quoted(&mut writer, Bytes.asSlice(&signature.importName))
+    }
+    run append(&mut writer, b"\n")
     run List<Declaration>.append(
       &mut output,
       Declaration {contract: run CAbi.identity(signature), symbol: run Bytes.copy(Bytes.asSlice(&signature.symbol)), text: move writer.text},

@@ -14,6 +14,8 @@ are outside the language.
 - A **source root** is the logical directory from which project module identities are derived.
 - A **module identity** is a case-sensitive, extensionless path such as `model/User`.
 - An **import path** is the dotted source spelling of a module identity, such as `model.User`.
+- A **barrel module** is a directory's `mod.silk` file, such as `model/mod.silk`. Imports name it
+  by the directory's path, `model`.
 - A **namespace binding** is a local name that qualifies members of one imported module.
 - A **selected binding** is one imported declaration available directly under a local name.
 - An **alias** is an explicit local name replacing a namespace or selected binding's default name.
@@ -50,8 +52,9 @@ Source code names the same identities with dotted import paths:
 import model.User
 ```
 
-Every segment is exact. `model.User` identifies `model/User.silk`; it does not find
-`model/user.silk`, `model/User/index.silk`, or another extension.
+Every segment is exact. `model.User` identifies `model/User.silk`, or the barrel module
+`model/User/mod.silk` under MODULE-007; it does not find `model/user.silk`,
+`model/User/index.silk`, or another extension.
 
 **Boundary:** The identity is logical rather than an absolute host path. Absolute paths, source
 extensions, empty segments, `.`, and `..` are not valid module identities. A source supplied from
@@ -118,7 +121,8 @@ may select an explicit source root; a nested entry then keeps its path below tha
 identity.
 
 **Boundary:** Silk has no relative import spelling. An import cannot use `.` or `..` to walk from
-the importing module, and resolution does not probe parent directories or alternate file layouts.
+the importing module, and resolution does not probe parent directories. The only alternate file
+it reads is the directory's barrel module of MODULE-007.
 
 **Diagnostics:** A syntactically valid path with no exact source reports `MOD0001`. A file that
 exists but cannot be read produces an operational source-resolution failure rather than pretending
@@ -243,6 +247,54 @@ receives its ordinary signature, visibility, type, ownership, and control-flow d
 **Evidence:** module cycle facts,
 cycle-safe lookup,
 name-resolution cycle tests.
+
+### MODULE-007 — A directory's `mod.silk` is the module its directory path names
+
+**Status:** Confirmed
+
+An import path names either the module file of that path or the barrel module of the directory of
+that path: `import shapes` names `<source root>/shapes.silk` or `<source root>/shapes/mod.silk`,
+whichever exists. The barrel is an ordinary module whose identity is its file path,
+`shapes/mod`. It usually gathers its directory's modules with selective `pub import` (EXPORT-001),
+so an importer names one module instead of each child:
+
+```text
+<source root>/shapes/mod.silk
+<source root>/shapes/circle.silk
+<source root>/shapes/square.silk
+```
+
+```silk
+// shapes/mod.silk
+pub import shapes.circle { Circle }
+pub import shapes.square { Square }
+```
+
+```silk
+// main.silk
+import shapes { Circle, Square }
+```
+
+Imports inside a barrel keep the source-root rule of MODULE-003, so its children are imported by
+their full paths, as `shapes.circle` above. Children stay importable on their own. The same rule
+applies to a dependency's modules under PACKAGE-002 and to the standard library, and an `exports`
+entry names a barrel the same way (PACKAGE-006).
+
+**Boundary:** A barrel is named only by its directory's path; `import shapes.mod` names nothing.
+A source root's own `mod.silk` is an ordinary module that no import can name. Which file a path
+names depends only on which of the two files exist, so editing either file's text never changes
+it, and adding or removing one of them reaches exactly the imports of that path.
+
+**Diagnostics:** A path for which both `shapes.silk` and `shapes/mod.silk` exist reports `MOD0005`
+at the import path, naming both files. An import whose last segment is `mod` reports `MOD0006` at
+the import path. An import in a barrel of its own directory path is a self-import (`MOD0002`). An
+`exports` entry with either problem is an invalid-manifest error naming the entry.
+
+**Evidence:** [native package graph](../compiler/src/semantic/PackageGraph.silk),
+[native package sources](../compiler/src/driver/ModuleSources.silk),
+[barrel resolution cases](../compiler/src/semantic/SemanticSignatureCases.silk),
+[barrel corpus program](../corpus/native/barrel-module-import/main.silk),
+[native build contract](../compiler/scripts/test-native-build.ts).
 
 ## Import bindings
 
@@ -1060,6 +1112,7 @@ standard-library module.
 does not list exports yet.
 
 `[package].exports` lists the module paths, in import spelling, that other packages may import.
+An entry names a module file or a directory's barrel module, as an import does (MODULE-007).
 Inside the package every module stays importable. A package without `exports` exposes no module to
 other packages.
 

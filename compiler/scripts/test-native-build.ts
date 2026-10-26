@@ -518,6 +518,100 @@ const program = Effect.gen(function* () {
   const crossIr = yield* fs.readFile(join(directory, 'cross.ll'))
   assert.ok(crossIr.length > 0)
   assert.notDeepEqual(crossIr, bytes, 'IR must follow the requested target, not the host')
+  // ARM64 inline assembly shares the machine contract across Linux and Darwin. Exercise
+  // source admission, flags normalization and the actual instruction, not just a successful build.
+  const hintSource = [
+    'unsafe fn hint() -> () {',
+    '  unsafe Intrinsic.assembly<()>("yield", "", "", "write", true, false, ())',
+    '}',
+    'unsafe fn add(left: u64, right: u64) -> u64 {',
+    '  return unsafe Intrinsic.assembly<u64>("adds $0, $1, $2", "={x0},0,{x17}", "flags", "none", false, false, (left, right))',
+    '}',
+    'pub fn main() -> i32 {',
+    '  unsafe hint()',
+    '  let total = unsafe add(40, 2)',
+    '  if total == 42 { return 42 }',
+    '  return 1',
+    '}',
+    '',
+  ].join('\n')
+  yield* fs.writeFileString(join(directory, 'hint.silk'), hintSource)
+  for (const target of ['aarch64-apple-darwin', 'aarch64-unknown-linux-gnu']) {
+    const hintArguments = (output: string) => [
+      'build', 'hint.silk', '-o', output, '--stdlib', standardLibrary, '--target', target,
+    ]
+    const hintIr = yield* invoke(
+      silk,
+      [...hintArguments('hint.ll'), '--emit', 'llvm-ir'],
+      directory,
+      { ...process.env, SILK_CLANG: sentinel },
+    )
+    assert.equal(hintIr.status, 0, hintIr.stderr)
+    const hintText = yield* fs.readFileString(join(directory, 'hint.ll'))
+    assert.match(hintText, /call void asm sideeffect "yield", "~\{memory\}"\(\) memory\(write,/)
+    assert.match(hintText, /call i64 asm "adds \$0, \$1, \$2", "=\{x0\},0,\{x17\},~\{cc\}"/)
+    const hintAssembly = yield* invoke(
+      silk,
+      [...hintArguments('hint.s'), '--emit', 'assembly'],
+      directory,
+      { ...process.env, SILK_CLANG: clang },
+    )
+    assert.equal(hintAssembly.status, 0, hintAssembly.stderr)
+    const machineText = yield* fs.readFileString(join(directory, 'hint.s'))
+    assert.match(machineText, /^\s*yield\s*$/m)
+    assert.match(machineText, /^\s*adds\s+x0,\s*x0,\s*x17\s*$/m)
+    const nativeHost = process.arch === 'arm64' &&
+      ((process.platform === 'darwin' && target === 'aarch64-apple-darwin') ||
+        (process.platform === 'linux' && target === 'aarch64-unknown-linux-gnu'))
+    if (nativeHost) {
+      const hintBuild = yield* invoke(
+        silk,
+        hintArguments('hint'),
+        directory,
+        { ...process.env, SILK_CLANG: clang },
+      )
+      assert.equal(hintBuild.status, 0, hintBuild.stderr)
+      const hinted = yield* invoke(join(directory, 'hint'), [], directory)
+      assert.equal(hinted.status, 42, hinted.stderr)
+    }
+  }
+  // Reserved/ABI registers are invalid as inputs, outputs and clobbers. Unsupported targets,
+  // lane shapes, operand references, overlaps and contradictory effects still fail before Clang.
+  const rejectedAssembly = [
+    ['reserved output', 'u64', 'mov $0, #0', '={x18}', '', 'none', true, '()'],
+    ['reserved input', '()', 'yield', '{x18}', '', 'none', true, '(word,)'],
+    ...['x18', 'x19', 'x29', 'x30', 'sp', 'rax'].map((register) =>
+      [`clobber ${register}`, '()', 'yield', '', register, 'none', true, '()'] as const),
+    ['overlapping clobber', 'u64', 'mov $0, #0', '={x0}', 'x0', 'none', true, '()'],
+    ['invalid operand lane', '()', 'yield', '{x0}', '', 'none', true, '(narrow,)'],
+    ['missing operand', '()', 'yield', '{x0}', '', 'none', true, '()'],
+    ['unknown operand reference', '()', 'mov $0, #0', '', '', 'none', true, '()'],
+    ['unobservable write', '()', 'yield', '', '', 'write', false, '()'],
+  ] as const
+  for (const [name, result, template, constraints, clobbers, memory, sideEffects, inputs] of rejectedAssembly) {
+    yield* fs.writeFileString(
+      join(directory, 'invalid-assembly.silk'),
+      `pub fn main() -> i32 {\n  let word: u64 = 1\n  let narrow: u32 = 1\n  unsafe Intrinsic.assembly<${result}>("${template}", "${constraints}", "${clobbers}", "${memory}", ${sideEffects}, false, ${inputs})\n  return 0\n}\n`,
+    )
+    const rejected = yield* invoke(
+      silk,
+      ['build', 'invalid-assembly.silk', '-o', 'invalid-assembly.ll', '--stdlib', standardLibrary,
+        '--target', 'aarch64-apple-darwin', '--emit', 'llvm-ir'],
+      directory,
+      { ...process.env, SILK_CLANG: sentinel },
+    )
+    assert.notEqual(rejected.status, 0, `accepted ${name}`)
+    assert.match(rejected.stderr, /SEM0214/, `${name}: ${rejected.stderr}`)
+  }
+  const wasmHint = yield* invoke(
+    silk,
+    ['build', 'hint.silk', '-o', 'wasm-hint.ll', '--stdlib', standardLibrary, '--target', 'wasm32-unknown-unknown',
+      '--emit', 'llvm-ir'],
+    directory,
+    { ...process.env, SILK_CLANG: sentinel },
+  )
+  assert.notEqual(wasmHint.status, 0, 'Wasm must not admit native CPU hints')
+  assert.match(wasmHint.stderr, /SEM0214/)
   // wasm32 links freestanding on any host, with the compiler's own C runtime and no host imports.
   const wasm = yield* invoke(
     silk,
@@ -899,6 +993,293 @@ const program = Effect.gen(function* () {
     assert.equal(refused.stderr.match(/error\[SEM0225\] Entry point `main` has a result the selected runtime cannot start/g)?.length, 1, refused.stderr)
     assert.doesNotMatch(refused.stderr, /SEM0210/)
   }
+  // Errors new users meet in the book's later chapters name their subject and the fix, and a
+  // `var` binding adds no unknown-value error at each later use.
+  const fiberRoot = (body: string) =>
+    'import silk.effect { Effect }\nimport silk.fiber { Fiber }\nimport silk.logger { Logger, LogError }\nimport silk.monotonic_clock { MonotonicClock }\nimport silk.allocator { OutOfMemoryError }\nimport silk.scheduler { Scheduler, TaskIdExhaustedError }\nimport silk.string { String }\n\n' +
+    `effect fn root<'text>(title: string<'text>) -> () ! OutOfMemoryError | TaskIdExhaustedError ? &mut Scheduler | &mut MonotonicClock {\n  ${body}\n  drop fiber\n}\n\npub fn main() -> i32 {\n  return 0\n}\n`
+  // A method call that borrows its receiver names the receiver, not the method.
+  const boardRoot = (body: string) =>
+    'struct Board {\n  pub items: [i32; 2],\n  pub count: usize,\n}\n\nimpl Board {\n  fn add(self: &mut Self, value: i32) -> usize {\n    self.items[0] = value\n    return self.count\n  }\n\n  fn first(self: &Self) -> &i32 {\n    return &self.items[0]\n  }\n}\n\n' +
+    `pub fn main() -> i32 {\n  ${body}\n  return 0\n}\n`
+  const testRoot = (body: string) =>
+    `import silk.testing { AssertionError, Testing }\n\n${body}\npub fn main() -> i32 {\n  return 0\n}\n`
+  const subjects: Array<{ name: string; files: Record<string, string>; pattern: RegExp; errors?: number }> = [
+    {
+      name: 'fiberlogger',
+      files: {
+        'main.silk': fiberRoot('let fiber = run Fiber<(), LogError>.forkChild(shout())') +
+          'effect fn shout() -> () ! LogError ? &mut Logger { run Effect.log("reminder!\\n", &()) }\n',
+      },
+      pattern: /error\[SEM0076\] The Effect passed here also requires &mut Logger, but the expected Effect may only require &mut Scheduler \| &mut MonotonicClock/,
+    },
+    {
+      name: 'fiberborrow',
+      files: {
+        'main.silk': fiberRoot('let fiber = run Fiber<usize, never>.forkChild(measure(title))') +
+          'effect fn measure(title: string) -> usize ? &mut Scheduler | &mut MonotonicClock { return String.byteLength(title) }\n',
+      },
+      pattern: /error\[SEM0212\] This value must live for `'static`, but it borrows something/,
+    },
+    {
+      name: 'privatefn',
+      files: {
+        'geo/shapes.silk': 'fn secret() -> i32 { return 0 }\n',
+        'main.silk': 'import geo.shapes { secret }\n\npub fn main() -> i32 {\n  return secret()\n}\n',
+      },
+      pattern: /error\[SEM0015\] `secret` is private to geo\.shapes; mark it `pub`/,
+    },
+    {
+      name: 'twobindings',
+      files: {
+        'geo/shapes.silk': 'pub fn shapes() -> i32 { return 0 }\n',
+        'main.silk': 'import geo.shapes\nimport geo.shapes { shapes }\n\npub fn main() -> i32 {\n  return shapes()\n}\n',
+      },
+      pattern: /error\[SEM0016\] Multiple bindings claim shapes; rename one with `as`/,
+    },
+    {
+      name: 'privatefield',
+      files: {
+        'geo/shapes.silk': 'pub struct P { x: i32, }\n\npub fn make() -> P { return P { x: 1 } }\n',
+        'main.silk': 'import geo.shapes { make }\n\npub fn main() -> i32 {\n  let p = make()\n  return p.x\n}\n',
+      },
+      pattern: /error\[SEM0028\] Field `x` of geo\.shapes\.P is private; mark it `pub x`/,
+    },
+    {
+      name: 'copybound',
+      files: { 'main.silk': 'fn dup<C: Copy>(c: C) -> C {\n  return c\n}\n\npub fn main() -> i32 {\n  return dup(0)\n}\n' },
+      pattern: /error\[SEM0001\] Unknown type Copy; is `import silk\.ownership \{ Copy \}` missing\?/,
+    },
+    {
+      name: 'moduletypo',
+      files: {
+        'geo/shapes.silk': 'pub fn f() -> i32 { return 0 }\n',
+        'main.silk': 'import geo.shape { f }\n\npub fn main() -> i32 {\n  return f()\n}\n',
+      },
+      pattern: /error\[MOD0001\] Unknown module geo\.shape\n  note: did you mean `geo\.shapes`\?\n/,
+    },
+    {
+      name: 'varbinding',
+      files: { 'main.silk': 'pub fn main() -> i32 {\n  var x = 0\n  x = x + 1\n  return x\n}\n' },
+      pattern: /error\[PAR0010\] `var` is not a Silk keyword; declare a binding you reassign with `let mut`/,
+    },
+    {
+      name: 'receivermut',
+      files: { 'main.silk': boardRoot('let board = Board { items: [0, 0], count: 0 }\n  drop board.add(1)') },
+      pattern: /error\[SEM0057\] `board` is not mutable; declare it with `mut`, as in `let mut board`/,
+    },
+    {
+      name: 'receiverloan',
+      files: {
+        'main.silk': boardRoot('let mut board = Board { items: [0, 0], count: 0 }\n  let first = &board.items[0]\n  drop board.add(1)\n  let read = first.*'),
+      },
+      pattern: /error\[OWN0010\] A mutable borrow of `board` conflicts with an earlier shared borrow of it/,
+    },
+    {
+      name: 'receiverreferent',
+      files: {
+        'main.silk': boardRoot('let board = Board { items: [0, 0], count: 0 }\n  let first = board.first()\n  drop board\n  let read = first.*'),
+      },
+      pattern: /error\[OWN0019\] `first` is used after `board`, which it borrows, ended or was replaced/,
+      errors: 2,
+    },
+    // A module that moved into a directory is suggested by name, and modules are spelled dotted.
+    {
+      name: 'movedmodule',
+      files: {
+        'geo/helper.silk': 'pub fn twice(value: i32) -> i32 { return value * 2 }\n',
+        'main.silk': 'import helper { twice }\n\npub fn main() -> i32 {\n  return twice(1)\n}\n',
+      },
+      pattern: /error\[MOD0001\] Unknown module helper\n  note: did you mean `geo\.helper`\?\n/,
+    },
+    {
+      name: 'missingmember',
+      files: {
+        'geo/helper.silk': 'pub fn double(value: i32) -> i32 { return value * 2 }\n',
+        'main.silk': 'import geo.helper { twice }\n\npub fn main() -> i32 {\n  return twice(1)\n}\n',
+      },
+      pattern: /error\[SEM0014\] Module geo\.helper has no member twice/,
+    },
+    // A struct without a C layout is refused at the extern declaration, told how to declare one.
+    {
+      name: 'cplainstruct',
+      files: {
+        'main.silk': 'struct Point { x: f64, y: f64 }\n\nunsafe extern "C" fn lonely(p: Point) -> i32\n\npub fn main() -> i32 {\n  return 0\n}\n',
+      },
+      pattern: /main\.silk:3:32: error\[SEM0187\] main\.Point has no C layout; declare it `extern "C" struct` to pass it to C by value/,
+    },
+    {
+      name: 'cstringlane',
+      files: { 'main.silk': 'unsafe extern "C" fn puts(text: string) -> i32\n\npub fn main() -> i32 {\n  return 0\n}\n' },
+      pattern: /error\[SEM0187\] string is not admitted by the C ABI/,
+    },
+    {
+      name: 'cfieldtype',
+      files: { 'main.silk': 'extern "C" struct Flag { ok: bool }\n\npub fn main() -> i32 {\n  return 0\n}\n' },
+      pattern: /error\[SEM0206\] Field ok of C-layout record main\.Flag has unsupported type bool/,
+    },
+    // SEM0010 names every receiver: a tuple, a type declared inside `static if`, and a dotted
+    // standard-library path.
+    {
+      name: 'tuplemethod',
+      files: { 'main.silk': 'pub fn main() -> i32 {\n  let t = (1, 2)\n  drop t.frob()\n  return 0\n}\n' },
+      pattern: /error\[SEM0010\] \(i32, i32\) has no method `frob`/,
+    },
+    {
+      name: 'loggermethod',
+      files: {
+        'main.silk': 'import silk.os_logger { StdoutLogger }\n\npub fn main() -> i32 {\n  let l = StdoutLogger.make()\n  drop l.info("x")\n  return 0\n}\n',
+      },
+      pattern: /error\[SEM0010\] silk\.os_logger\.StdoutLogger has no method `info`/,
+    },
+    {
+      name: 'optionmethod',
+      files: {
+        'main.silk': 'import silk.option { Option }\n\npub fn main() -> i32 {\n  let o = Option<i32>.some(1)\n  drop o.frob()\n  return 0\n}\n',
+      },
+      pattern: /error\[SEM0010\] silk\.option\.Option<i32> has no method `frob`/,
+    },
+    // `==` on two values whose type implements Equal is told to compare shared borrows.
+    {
+      name: 'borrowedequal',
+      files: {
+        'main.silk': 'import silk.equal { Equal }\n\nstruct Id { value: i32, }\n\nfn same(left: &Id, right: &Id) -> bool { return left.value == right.value }\n\nimpl Equal for Id { equals: same }\n\npub fn main() -> i32 {\n  let a = Id { value: 1 }\n  let b = Id { value: 1 }\n  if a == b { return 1 }\n  return 0\n}\n',
+      },
+      pattern: /error\[SEM0135\] Operator == does not accept \(main\.Id, main\.Id\); compare shared borrows, as in `&a == &b`/,
+    },
+    {
+      name: 'plainequal',
+      files: {
+        'main.silk': 'struct Plain { value: i32, }\n\npub fn main() -> i32 {\n  let a = Plain { value: 1 }\n  let b = Plain { value: 1 }\n  if a == b { return 1 }\n  return 0\n}\n',
+      },
+      pattern: /error\[SEM0135\] Operator == does not accept \(main\.Plain, main\.Plain\)\n/,
+    },
+    // A name a module only imports is told where it is declared, not to be marked `pub`.
+    {
+      name: 'reimportstd',
+      files: { 'main.silk': 'import silk.i64 { ParseError }\n\npub fn main() -> i32 {\n  return 0\n}\n' },
+      pattern: /error\[SEM0015\] `ParseError` is not declared in silk\.i64, which only imports it; import it from silk\.format/,
+    },
+    {
+      name: 'reimportlocal',
+      files: {
+        'base.silk': 'pub struct Err { pub code: i32, }\n',
+        'mid.silk': 'import base { Err }\n\npub fn code(value: &Err) -> i32 { return value.code }\n',
+        'main.silk': 'import mid { Err }\n\npub fn main() -> i32 {\n  return 0\n}\n',
+      },
+      pattern: /error\[SEM0015\] `Err` is not declared in mid, which only imports it; import it from base/,
+    },
+    {
+      name: 'privatemember',
+      files: {
+        'mid.silk': 'fn hidden() -> i32 { return 1 }\n\npub fn shown() -> i32 { return hidden() }\n',
+        'main.silk': 'import mid { hidden }\n\npub fn main() -> i32 {\n  return 0\n}\n',
+      },
+      pattern: /error\[SEM0015\] `hidden` is private to mid; mark it `pub` there to use it here/,
+    },
+    // A template value with Debug but not Display is pointed at `{value:?}`.
+    {
+      name: 'displaydebug',
+      files: {
+        'main.silk': 'import silk.effect { Effect }\nimport silk.logger { LogError }\nimport silk.option { Option }\nimport silk.os_logger { StdoutLogger }\n\npub effect fn main() -> () ! LogError {\n  let mut logger = StdoutLogger.make()\n  let o = Option<i32>.some(3)\n  run Effect.log("v {o}", &.{ o: move o }) |> Effect.provideMut(&mut logger)\n}\n',
+      },
+      pattern: /no implementation of `silk\.format\.Display` exists for `silk\.option\.Option<i32>`; it implements `silk\.format\.Debug`, so a template prints it with `\{value:\?\}`/,
+    },
+    {
+      name: 'displaynodebug',
+      files: {
+        'main.silk': 'import silk.effect { Effect }\nimport silk.logger { LogError }\nimport silk.os_logger { StdoutLogger }\n\nstruct Plain { value: i32, }\n\npub effect fn main() -> () ! LogError {\n  let mut logger = StdoutLogger.make()\n  let p = Plain { value: 1 }\n  run Effect.log("v {p}", &.{ p: move p }) |> Effect.provideMut(&mut logger)\n}\n',
+      },
+      pattern: /no implementation of `silk\.format\.Display` exists for `main\.Plain`\n/,
+    },
+    // Operands read through a reference print with their lifetime elided.
+    {
+      name: 'fieldoperator',
+      files: { 'main.silk': "struct W<'t> { text: string<'t>, }\n\nfn f(l: &W, r: &W) -> bool { return l.text < r.text }\n\npub fn main() -> i32 {\n  return 0\n}\n" },
+      pattern: /error\[SEM0135\] Operator < does not accept \(string, string\)/,
+    },
+    // The arm blocks of a match used as a statement yield nothing.
+    {
+      name: 'blockarmvalue',
+      files: { 'main.silk': 'pub fn main() -> i32 {\n  let n = 1\n  match n {\n    1 => {\n      0\n    }\n    _ => ()\n  }\n  return 0\n}\n' },
+      pattern: /main\.silk:5:7: error\[SEM0087\] This match is a statement, so the last value of its arm block is ignored; use the match as a value, as in `let x = match \.\.\.`, or `drop` this value/,
+    },
+    // An `if` used as a value needs a final `else`.
+    {
+      name: 'ifwithoutelse',
+      files: { 'main.silk': 'pub fn main() -> i32 {\n  let n = 1\n  let v = if n > 0 { 1 }\n  return v\n}\n' },
+      pattern: /main\.silk:3:11: error\[PAR0009\] An `if` used as a value needs a final `else` branch, so that every path produces a value; add `else \{ \.\.\. \}`, or write the `if` as a statement/,
+    },
+    {
+      name: 'blockarmearly',
+      files: { 'main.silk': 'pub fn main() -> i32 {\n  let n = 1\n  match n {\n    1 => {\n      0\n      return 1\n    }\n    _ => ()\n  }\n  return 0\n}\n' },
+      pattern: /error\[SEM0087\] Expression statement produces i32, but only \(\) or never may be ignored/,
+    },
+    // A private field the declaring module reads through a public function points at that function.
+    {
+      name: 'fieldaccessor',
+      files: { 'main.silk': 'import silk.system_clock { Instant }\n\nfn f(now: &Instant) -> i64 { return now.seconds() }\n\npub fn main() -> i32 {\n  return 0\n}\n' },
+      pattern: /error\[SEM0028\] Field `seconds` of silk\.system_clock\.Instant is private; read it with `SystemClock\.seconds\(&value\)` instead/,
+    },
+    // A provision that matches nothing names the provider, the service and what the Effect requires.
+    {
+      name: 'providerselector',
+      files: { 'main.silk': 'import silk.effect { Effect }\n\nservice Doorbell {\n  effect fn ring() -> () ? &mut Doorbell\n}\n\nstruct Counting { rung: i32, }\n\nimpl Doorbell for Counting {\n  effect fn ring(self: &mut Self) -> () {\n    self.rung = self.rung + 1\n  }\n}\n\neffect fn visit() -> () ? &mut Doorbell {\n  run Doorbell.ring()\n}\n\nimport silk.system_clock { SystemClock }\n\npub effect fn main() -> i32 {\n  let mut bell = Counting { rung: 0 }\n  run visit() |> Effect.provideMut<SystemClock>(&mut bell)\n  return bell.rung\n}\n' },
+      pattern: /error\[SEM0123\] The Effect does not require silk\.system_clock\.SystemClock; it requires &mut main\.Doorbell/,
+    },
+    {
+      name: 'providerunimplemented',
+      files: { 'main.silk': 'import silk.effect { Effect }\n\nservice Doorbell {\n  effect fn ring() -> () ? &mut Doorbell\n}\n\nstruct Counting { rung: i32, }\n\nimpl Doorbell for Counting {\n  effect fn ring(self: &mut Self) -> () {\n    self.rung = self.rung + 1\n  }\n}\n\neffect fn visit() -> () ? &mut Doorbell {\n  run Doorbell.ring()\n}\n\npub effect fn main() -> i32 {\n  let mut plain = 3\n  run visit() |> Effect.provideMut<Doorbell>(&mut plain)\n  return plain\n}\n' },
+      pattern: /error\[SEM0123\] i32 does not implement main\.Doorbell, so it cannot provide it/,
+    },
+    {
+      name: 'providernone',
+      files: { 'main.silk': 'import silk.effect { Effect }\n\nservice Doorbell {\n  effect fn ring() -> () ? &mut Doorbell\n}\n\nstruct Counting { rung: i32, }\n\nimpl Doorbell for Counting {\n  effect fn ring(self: &mut Self) -> () {\n    self.rung = self.rung + 1\n  }\n}\n\neffect fn visit() -> () ? &mut Doorbell {\n  run Doorbell.ring()\n}\n\npub effect fn main() -> i32 {\n  let mut plain = 3\n  run visit() |> Effect.provideMut(&mut plain)\n  return plain\n}\n' },
+      pattern: /error\[SEM0123\] i32 implements none of the services the Effect requires: &mut main\.Doorbell/,
+    },
+    // A test cannot declare a requirement row, so SEM0071 there only offers a provider.
+    {
+      name: 'testrequirement',
+      files: { 'main.silk': 'import silk.effect { Effect }\n\nservice Doorbell {\n  effect fn ring() -> () ? &mut Doorbell\n}\n\nstruct Counting { rung: i32, }\n\nimpl Doorbell for Counting {\n  effect fn ring(self: &mut Self) -> () {\n    self.rung = self.rung + 1\n  }\n}\n\neffect fn visit() -> () ? &mut Doorbell {\n  run Doorbell.ring()\n}\n\npub fn main() -> i32 {\n  return 0\n}\n\ntest effect fn rings() -> () {\n  run visit()\n}\n' },
+      pattern: /error\[SEM0071\] This `run` needs `&mut Doorbell`, which a test cannot declare; provide it with `\|> Effect\.provideMut\(&mut value\)`/,
+    },
+    // A conformance member returning another type names both types.
+    {
+      name: 'witnessresult',
+      files: { 'main.silk': 'import silk.system_clock { SystemClock }\n\nstruct Fixed {}\n\nimpl SystemClock for Fixed {\n  effect fn now(self: &mut Self) -> i64 { return 0 }\n  effect fn getResolution(self: &mut Self) -> u64 { return 1 }\n}\n\npub fn main() -> i32 {\n  return 0\n}\n' },
+      pattern: /error\[SEM0083\] Invalid conformance: member `now` does not match the operation of `SystemClock`: it returns `i64`, but the operation returns `silk\.system_clock\.Instant`/,
+    },
+    // A plain `test fn` that runs or declares a failure is told to become a `test effect fn`.
+    {
+      name: 'testrun',
+      files: { 'main.silk': testRoot('test fn adds() {\n  run Testing.expect(1 + 1 == 2, "sum")\n}\n') },
+      pattern: /error\[SEM0066\] This `run` can fail with `AssertionError<'static>`, but only an effect function can declare failures; write `test effect fn`/,
+    },
+    {
+      name: 'testchannel',
+      files: { 'main.silk': testRoot("test fn adds() ! AssertionError<'static> {\n  run Testing.expect(1 + 1 == 2, \"sum\")\n}\n") },
+      pattern: /error\[SEM0062\] Only an effect function can declare failures; write `test effect fn` instead of `test fn`/,
+    },
+    {
+      name: 'testshape',
+      files: { 'main.silk': testRoot('test fn takes(value: i32) {}\n') },
+      pattern: /error\[SEM0218\] Invalid test declaration: a test takes no parameters/,
+    },
+  ]
+  for (const entry of subjects) {
+    yield* fs.makeDirectory(join(directory, entry.name, 'src/geo'), { recursive: true })
+    yield* fs.writeFileString(
+      join(directory, entry.name, 'silk.toml'),
+      `[package]\nname = "${entry.name}"\nversion = "0.1.0"\n`,
+    )
+    for (const [path, text] of Object.entries(entry.files)) {
+      yield* fs.writeFileString(join(directory, entry.name, 'src', path), text)
+    }
+    const refused = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(directory, entry.name))
+    assert.equal(refused.status, 1, refused.stderr)
+    assert.match(refused.stderr, entry.pattern)
+    assert.equal(refused.stderr.match(/error\[/g)?.length, entry.errors ?? 1, refused.stderr)
+  }
   // A workspace member's diagnostics name their files from the workspace root, also when the
   // member is built from its own directory; `--json` keeps the absolute path.
   yield* fs.makeDirectory(join(directory, 'relative/broken/src'), { recursive: true })
@@ -980,6 +1361,150 @@ const program = Effect.gen(function* () {
       /^app\/src\/main\.silk:6:6: error\[SEM0177\] size too big\n {2}note: spec\/sized\.silk:2:21: related location$/m,
     )
   }
+  // Another package's module is named as the importer spells it, and its private field gets no
+  // advice to edit that package.
+  yield* fs.makeDirectory(join(directory, 'privatedep/app/src'), { recursive: true })
+  yield* fs.makeDirectory(join(directory, 'privatedep/core'), { recursive: true })
+  yield* fs.writeFileString(join(directory, 'privatedep/silk.toml'), '[workspace]\nmembers = ["app", "core"]\n')
+  yield* fs.writeFileString(
+    join(directory, 'privatedep/core/silk.toml'),
+    '[package]\nname = "core"\nversion = "0.1.0"\nsource = "."\nexports = ["Store"]\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'privatedep/core/Store.silk'),
+    'pub struct Box { value: i32, }\n\npub fn make() -> Box { return Box { value: 1 } }\n\nfn hidden() -> i32 { return 1 }\n\npub fn shown() -> i32 { return hidden() }\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'privatedep/app/silk.toml'),
+    '[package]\nname = "app"\nversion = "0.1.0"\n\n[dependencies]\ntaskcore = { path = "../core", package = "core" }\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'privatedep/app/src/main.silk'),
+    'import taskcore.Store\nimport taskcore.Store { hidden }\n\npub fn main() -> i32 {\n  return Store.make().value\n}\n',
+  )
+  const privateDependency = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(directory, 'privatedep/app'))
+  assert.equal(privateDependency.status, 1, privateDependency.stderr)
+  assert.match(privateDependency.stderr, /error\[SEM0015\] `hidden` is private to taskcore\.Store; mark it `pub` there to use it here/)
+  assert.match(privateDependency.stderr, /error\[SEM0028\] Field `value` of [A-Za-z.]*Box is private to the module that declares it\n/)
+  // A library's types are named with their package, an impl outside the modules IMPL-004 allows
+  // names the rule, and a refusal of the library's own generic body is reported once, at its site.
+  yield* fs.makeDirectory(join(directory, 'libmsg/geo/src'), { recursive: true })
+  yield* fs.makeDirectory(join(directory, 'libmsg/app/src'), { recursive: true })
+  yield* fs.writeFileString(join(directory, 'libmsg/silk.toml'), '[workspace]\nmembers = ["geo", "app"]\n')
+  yield* fs.writeFileString(
+    join(directory, 'libmsg/geo/silk.toml'),
+    '[package]\nname = "geo"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'libmsg/geo/src/lib.silk'),
+    'pub interface Shape {\n  fn area(shape: &Self) -> i64\n}\n\npub struct Square {\n  side: i64,\n}\n\npub struct Best<T> {\n  value: T,\n  score: i64,\n}\n\npub fn keep<T>(value: T) -> Best<T> {\n  let best = Best<T> { value: move value, score: 1 }\n  return best\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'libmsg/app/silk.toml'),
+    '[package]\nname = "app"\nversion = "0.1.0"\n\n[dependencies]\ngeo = { path = "../geo" }\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'libmsg/app/src/main.silk'),
+    'import geo.lib { Shape, Square, keep }\n\nimpl Shape for i64 {\n  fn area(shape: &Self) -> i64 {\n    return 0\n  }\n}\n\nstruct Circle { radius: i64, }\nstruct Tri { base: i64, }\n\npub fn main() -> i32 {\n  let kept = keep(5)\n  let square = Square { side: 2 }\n  let shapes = [Circle { radius: 1 }, Tri { base: 2 }]\n  return 0\n}\n',
+  )
+  const libraryCheck = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(directory, 'libmsg/app'))
+  assert.equal(libraryCheck.status, 1, libraryCheck.stderr)
+  assert.match(
+    libraryCheck.stderr,
+    /error\[SEM0083\] Invalid conformance: `geo\.lib\.Shape` is declared in `geo\.lib` and `i64` is a builtin type, so this impl must be in `geo\.lib`\n/,
+  )
+  assert.match(libraryCheck.stderr, /error\[SEM0021\] Cannot construct geo\.lib\.Square here/)
+  assert.match(libraryCheck.stderr, /error\[SEM0030\] This element is main\.Tri, but the array holds main\.Circle\n/)
+  assert.equal(libraryCheck.stderr.match(/error\[OWN0003\]/g)?.length, 1, libraryCheck.stderr)
+  assert.match(libraryCheck.stderr, /geo\/src\/lib\.silk:16:10: error\[OWN0003\] Moving best requires an explicit move/)
+  // An unhandled failure of another package is reported with that package's name.
+  yield* fs.writeFileString(
+    join(directory, 'libmsg/geo/src/lib.silk'),
+    'import silk.format { Debug, Format, Formatter }\nimport silk.writer { Writer, WriterError }\n\npub struct BadSide {}\n\nimpl Debug for BadSide {\n  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {\n    return run Format.debugFields(self, "BadSide", &mut formatter)\n  }\n}\n\npub effect fn side(length: i64) -> i64 ! BadSide {\n  if length < 0 { fail BadSide {} }\n  return length\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'libmsg/app/src/main.silk'),
+    'import geo.lib { BadSide, side }\n\npub effect fn main() -> i32 ! BadSide {\n  let length = run side(-1)\n  return 0\n}\n',
+  )
+  const escaped = yield* invoke(
+    silk,
+    ['run', '--stdlib', standardLibrary],
+    join(directory, 'libmsg/app'),
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(escaped.status, 1, escaped.stderr)
+  assert.match(escaped.stderr, /^unhandled error: geo\.lib\.BadSide\n {2}at geo\.lib\.side \(/m)
+  // A member without its root module but with a `lib.silk` is pointed at the library kind.
+  yield* fs.writeFileString(join(directory, 'libmsg/geo/silk.toml'), '[package]\nname = "geo"\nversion = "0.1.0"\n')
+  const kindless = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(directory, 'libmsg'))
+  assert.match(
+    kindless.stderr,
+    /^Skipping geo: its root module \(\[package\]\.main\) is missing\n {2}help: its source root has lib\.silk; a library sets `kind = "library"` and `exports = \["lib"\]` under \[package\]$/m,
+  )
+  // A `mut fn` binding is lent to each call it is passed to, so it stays usable afterwards, and one
+  // call cannot be lent it twice. Callable diagnostics name the binding and the fix.
+  // Match and pattern mistakes are one diagnostic each, naming the fix or the types involved.
+  const patternCases: Array<[string, string, RegExp]> = [
+    ["armreturn", "enum Kind { Fruit, Tool, }\n\nstruct Refused { reason: i32, }\n\nunion Event {\n  Retag {index: usize, kind: Kind},\n  Restock {index: usize, amount: i32},\n  Close,\n}\n\nfn handle(event: Event) -> i32 {\n  return match move event {\n    Event.Retag { index, kind: Kind.Fruit } => 1\n    Event.Retag { index, kind } => 2\n    Event.Restock { index, amount } => amount\n    Event.Close => 0\n  }\n}\n\nfn price(kind: Kind) -> i32 {\n  return match kind {\n    Kind.Fruit => 1\n    Kind.Tool => 2\n  }\n}\n\nfn score(outcome: i32 | Refused | bool) -> i32 {\n  return match move outcome {\n    i32 stock => stock\n    Refused { reason } => reason\n    bool closed => 3\n  }\n}\n\nfn count(n: i32) -> i32 {\n  return match n {\n    0 => return 1\n    i32 other => other\n  }\n}\n\npub fn main() -> i32 {\n  return handle(Event.Close) + price(Kind.Fruit) + score(true) + count(0) - 5\n}\n", /error\[PAR0010\] `return` is a statement, so it cannot be a match arm's value; write the arm as a block, as in `=> \{ return 1 \}`\n/],
+    ["fieldliteral", "enum Kind { Fruit, Tool, }\n\nstruct Refused { reason: i32, }\n\nunion Event {\n  Retag {index: usize, kind: Kind},\n  Restock {index: usize, amount: i32},\n  Close,\n}\n\nfn handle(event: Event) -> i32 {\n  return match move event {\n    Event.Retag { index, kind: 3 } => 1\n    Event.Retag { index, kind } => 2\n    Event.Restock { index, amount } => amount\n    Event.Close => 0\n  }\n}\n\nfn price(kind: Kind) -> i32 {\n  return match kind {\n    Kind.Fruit => 1\n    Kind.Tool => 2\n  }\n}\n\nfn score(outcome: i32 | Refused | bool) -> i32 {\n  return match move outcome {\n    i32 stock => stock\n    Refused { reason } => reason\n    bool closed => 3\n  }\n}\n\nfn count(n: i32) -> i32 {\n  return match n {\n    0 => {\n      return 1\n    }\n    i32 other => other\n  }\n}\n\npub fn main() -> i32 {\n  return handle(Event.Close) + price(Kind.Fruit) + score(true) + count(0) - 5\n}\n", /error\[PAR0010\] A field pattern cannot match a literal; bind the field and compare it in a guard/],
+    ["armcomma", "enum Kind { Fruit, Tool, }\n\nstruct Refused { reason: i32, }\n\nunion Event {\n  Retag {index: usize, kind: Kind},\n  Restock {index: usize, amount: i32},\n  Close,\n}\n\nfn handle(event: Event) -> i32 {\n  return match move event {\n    Event.Retag { index, kind: Kind.Fruit } => 1\n    Event.Retag { index, kind } => 2\n    Event.Restock { index, amount } => amount\n    Event.Close => 0\n  }\n}\n\nfn price(kind: Kind) -> i32 {\n  return match kind {\n    Kind.Fruit => 1,\n    Kind.Tool => 2\n  }\n}\n\nfn score(outcome: i32 | Refused | bool) -> i32 {\n  return match move outcome {\n    i32 stock => stock\n    Refused { reason } => reason\n    bool closed => 3\n  }\n}\n\nfn count(n: i32) -> i32 {\n  return match n {\n    0 => {\n      return 1\n    }\n    i32 other => other\n  }\n}\n\npub fn main() -> i32 {\n  return handle(Event.Close) + price(Kind.Fruit) + score(true) + count(0) - 5\n}\n", /error\[PAR0010\] Match arms are not separated by commas; remove the `,`\n/],
+    ["barepattern", "enum Kind { Fruit, Tool, }\n\nstruct Refused { reason: i32, }\n\nunion Event {\n  Retag {index: usize, kind: Kind},\n  Restock {index: usize, amount: i32},\n  Close,\n}\n\nfn handle(event: Event) -> i32 {\n  return match move event {\n    Event.Retag { index, kind: Kind.Fruit } => 1\n    Event.Retag { index, kind } => 2\n    Event.Restock { index, amount } => amount\n    Event.Close => 0\n  }\n}\n\nfn price(kind: Kind) -> i32 {\n  return match kind {\n    Kind.Fruit => 1\n    Kind.Tool => 2\n  }\n}\n\nfn score(outcome: i32 | Refused | bool) -> i32 {\n  return match move outcome {\n    i32 stock => stock\n    Refused { reason } => reason\n    bool closed => 3\n  }\n}\n\nfn count(n: i32) -> i32 {\n  return match n {\n    0 => {\n      return 1\n    }\n    other => other\n  }\n}\n\npub fn main() -> i32 {\n  return handle(Event.Close) + price(Kind.Fruit) + score(true) + count(0) - 5\n}\n", /error\[PAR0010\] A pattern that takes the whole value names its type, as in `i32 value`, or is `_`\n/],
+    ["missingfield", "enum Kind { Fruit, Tool, }\n\nstruct Refused { reason: i32, }\n\nunion Event {\n  Retag {index: usize, kind: Kind},\n  Restock {index: usize, amount: i32},\n  Close,\n}\n\nfn handle(event: Event) -> i32 {\n  return match move event {\n    Event.Retag { index, kind: Kind.Fruit } => 1\n    Event.Retag { index, kind } => 2\n    Event.Restock { index } => 4\n    Event.Close => 0\n  }\n}\n\nfn price(kind: Kind) -> i32 {\n  return match kind {\n    Kind.Fruit => 1\n    Kind.Tool => 2\n  }\n}\n\nfn score(outcome: i32 | Refused | bool) -> i32 {\n  return match move outcome {\n    i32 stock => stock\n    Refused { reason } => reason\n    bool closed => 3\n  }\n}\n\nfn count(n: i32) -> i32 {\n  return match n {\n    0 => {\n      return 1\n    }\n    i32 other => other\n  }\n}\n\npub fn main() -> i32 {\n  return handle(Event.Close) + price(Kind.Fruit) + score(true) + count(0) - 5\n}\n", /error\[SEM0046\] This pattern leaves out field `amount`; name it, or end the fields with `\.\.` to skip the rest\n/],
+    ["notmember", "enum Kind { Fruit, Tool, }\n\nstruct Refused { reason: i32, }\n\nunion Event {\n  Retag {index: usize, kind: Kind},\n  Restock {index: usize, amount: i32},\n  Close,\n}\n\nfn handle(event: Event) -> i32 {\n  return match move event {\n    Event.Retag { index, kind: Kind.Fruit } => 1\n    Event.Retag { index, kind } => 2\n    Event.Restock { index, amount } => amount\n    Event.Close => 0\n  }\n}\n\nfn price(kind: Kind) -> i32 {\n  return match kind {\n    Kind.Fruit => 1\n    Kind.Tool => 2\n  }\n}\n\nfn score(outcome: i32 | Refused | bool) -> i32 {\n  return match move outcome {\n    i64 stock => 5\n    Refused { reason } => reason\n    bool closed => 3\n  }\n}\n\nfn count(n: i32) -> i32 {\n  return match n {\n    0 => {\n      return 1\n    }\n    i32 other => other\n  }\n}\n\npub fn main() -> i32 {\n  return handle(Event.Close) + price(Kind.Fruit) + score(true) + count(0) - 5\n}\n", /error\[SEM0042\] i64 is not a member of the matched union, whose members are i32, main\.Refused, bool\n/],
+    ["narrowing", "enum Kind { Fruit, Tool, }\n\nstruct Refused { reason: i32, }\n\nunion Event {\n  Retag {index: usize, kind: Kind},\n  Restock {index: usize, amount: i32},\n  Close,\n}\n\nfn handle(event: Event) -> i32 {\n  return match move event {\n    Event.Retag { index, kind: Kind.Fruit } => 1\n    Event.Retag { index, kind } => 2\n    Event.Restock { index, amount } => amount\n    Event.Close => 0\n  }\n}\n\nfn price(kind: Kind) -> i32 {\n  return match kind {\n    Kind.Fruit => 1\n    Kind.Tool => 2\n  }\n}\n\nfn narrow(o: i32 | Refused | bool) -> i32 | bool {\n  return o\n}\n\nfn score(outcome: i32 | Refused | bool) -> i32 {\n  return match move outcome {\n    i32 stock => stock\n    Refused { reason } => reason\n    bool closed => 3\n  }\n}\n\nfn count(n: i32) -> i32 {\n  return match n {\n    0 => {\n      return 1\n    }\n    i32 other => other\n  }\n}\n\npub fn main() -> i32 {\n  return handle(Event.Close) + price(Kind.Fruit) + score(true) + count(0) - 5\n}\n", /error\[SEM0040\] The value can be main\.Refused, which the target type does not hold; match on it to handle that case first\n/],
+    ["unitbraces", "enum Kind { Fruit, Tool, }\n\nstruct Refused { reason: i32, }\n\nunion Event {\n  Retag {index: usize, kind: Kind},\n  Restock {index: usize, amount: i32},\n  Close,\n}\n\nfn handle(event: Event) -> i32 {\n  return match move event {\n    Event.Retag { index, kind: Kind.Fruit } => 1\n    Event.Retag { index, kind } => 2\n    Event.Restock { index, amount } => amount\n    Event.Close {} => 0\n  }\n}\n\nfn price(kind: Kind) -> i32 {\n  return match kind {\n    Kind.Fruit => 1\n    Kind.Tool => 2\n  }\n}\n\nfn score(outcome: i32 | Refused | bool) -> i32 {\n  return match move outcome {\n    i32 stock => stock\n    Refused { reason } => reason\n    bool closed => 3\n  }\n}\n\nfn count(n: i32) -> i32 {\n  return match n {\n    0 => {\n      return 1\n    }\n    i32 other => other\n  }\n}\n\npub fn main() -> i32 {\n  return handle(Event.Close) + price(Kind.Fruit) + score(true) + count(0) - 5\n}\n", /error\[SEM0224\] Event\.Close has no fields, so its pattern takes no braces; write `Event\.Close`\n/],
+    ["unrun", "effect fn tick() -> i32 {\n  return 1\n}\n\npub fn main() -> i32 {\n  tick()\n  return 0\n}\n", /error\[SEM0087\] Expression statement produces an Effect of `i32` that is never run \(write `run` before it to run it, or `drop` it to discard it\), but only \(\) or never may be ignored\n/],
+  ]
+  const lendCases: Array<[string, string, RegExp]> = [
+    ["lendtwice", "fn both(mut f: mut fn(i32) -> i32, mut g: mut fn(i32) -> i32) -> i32 {\n  return f(1) + g(2)\n}\n\npub fn main() -> i32 {\n  let mut total = 0\n  let mut acc = fn(x: i32) -> i32 {\n    total = total + x\n    return total\n  }\n  return both(acc, acc)\n}\n", /src\/main\.silk:11:20: error\[OWN0010\] A mutable borrow of `acc` conflicts with an earlier mutable borrow of it that is still in use/],
+    ["closureescape", "struct Base { value: i32, }\n\nimpl Base {\n  fn peek(self: &Self) -> i32 { return self.value }\n}\n\nfn make() -> fn<'static>(i32) -> i32 {\n  let base = Base { value: 2 }\n  return fn(x: i32) -> i32 { return x + base.peek() }\n}\n\npub fn main() -> i32 {\n  return make()(1)\n}\n", /error\[OWN0018\] The returned callable borrows `base`, a local of this function; move it into the callable instead, which makes the result a `once fn<'static>`\n/],
+    ["callableresult", "fn adder(n: i32) -> fn(i32) -> i32 {\n  return fn(x: i32) -> i32 { return x + n }\n}\n\npub fn main() -> i32 {\n  return adder(1)(2)\n}\n", /error\[SEM0210\] The result is a callable whose captures could borrow, but the function has no borrowed input they could come from; for a callable that captures only owned data, write `fn<'static>\(\.\.\.\)`, as in `fn<'static>\(i32\) -> i32`\n/],
+    ["boundmove", "struct Counter { count: i32, }\n\nimpl Counter {\n  fn peek(self: &Self) -> i32 { return self.count }\n  fn finish(self: Self) -> i32 { return self.count }\n}\n\npub fn main() -> i32 {\n  let counter = Counter { count: 1 }\n  let finish = counter.finish\n  return counter.peek()\n}\n", /error\[OWN0001\] counter was moved and cannot be used again\n/],
+    ["callableassign", "struct Counter { count: i32, }\n\nimpl Counter {\n  fn peek(self: &Self) -> i32 { return self.count }\n  fn total(self: &Self) -> i32 { return self.count }\n}\n\npub fn main() -> i32 {\n  let counter = Counter { count: 1 }\n  let mut get = counter.total\n  get = counter.peek\n  return get()\n}\n", /error\[SEM0037\] Every function and closure has its own type, so a binding that holds one cannot be assigned a different one\n/],
+    ["plainmismatch", "pub fn main() -> i32 {\n  let count: i32 = \"three\"\n  return count\n}\n", /error\[SEM0037\] Assignment expected i32 but received string<'static>\n/],
+    ["ignored", "fn bump(n: i32) -> i32 { return n + 1 }\n\npub fn main() -> i32 {\n  bump(2)\n  return 0\n}\n", /error\[SEM0087\] Expression statement produces i32, but only \(\) or never may be ignored; write `drop` before it to discard the value\n/],
+  ]
+  const staticCases: Array<[string, string, RegExp]> = [
+    ["staticoverflow", "static fn grow(n: u8) -> u8 { return n + 100 }\nconst BIG: u8 = grow(200)\npub fn main() -> i32 { return 0 }\n", /error\[SEM0176\] Static evaluation of `n \+ 100` overflows its integer type\n/],
+    ["staticzero", "static fn fib(n: u64) -> u64 { if n < 2 { return n } return fib(n - 1) + fib(n - 2) }\nconst Q: u64 = fib(20) / (fib(0))\npub fn main() -> i32 { return 0 }\n", /error\[SEM0176\] Static evaluation of `fib\(20\) \/ \(fib\(0\)\)` divides by zero\n/],
+    ["staticbyte", "import silk.static_text { StaticText }\nstatic fn at(text: string<'static>) -> u8 { return StaticText.byteAt(text, 50) }\nconst L: u8 = at(\"loud!!\")\npub fn main() -> i32 { return 0 }\n", /error\[SEM0176\] Static evaluation stops: index 50 is past the end of the 6-byte text\n/],
+    ["staticplain", "fn plain() -> i32 { return 3 }\nstatic fn s() -> i32 { return plain() }\nconst P: i32 = s()\npub fn main() -> i32 { return 0 }\n", /error\[SEM0176\] `plain` is an ordinary fn, so static evaluation cannot call it; mark it `static fn` to call it here\n/],
+    ["phasebinding", "import silk.reflect { Reflect }\npub struct Stats { pub hits: i32, }\npub fn main() -> i32 { let f = Reflect.fields<Stats>() return 0 }\n", /error\[SEM0176\] Phase-only values exist only during static evaluation, so a runtime binding of a phase-only value is not allowed\n/],
+    ["constcycle", "const A: i32 = B\nconst B: i32 = A\npub fn main() -> i32 { return A }\n", /error\[SEM0223\] `A` and `B` depend on each other in a cycle, so none of them can be resolved\n/],
+  ]
+  for (const [name, source, expected] of [...lendCases, ...patternCases, ...staticCases]) {
+    yield* fs.makeDirectory(join(directory, `${name}/src`), { recursive: true })
+    yield* fs.writeFileString(join(directory, `${name}/silk.toml`), `[package]\nname = "${name}"\nversion = "0.1.0"\n`)
+    yield* fs.writeFileString(join(directory, `${name}/src/main.silk`), source)
+    const checked = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(directory, name))
+    assert.equal(checked.status, 1, checked.stderr)
+    assert.match(checked.stderr, expected)
+    assert.equal(checked.stderr.match(/error\[/g)?.length, 1, checked.stderr)
+  }
+  // Parking checks run at build time: each names what parks and the rule it breaks.
+  const parkingCases: Array<[string, string, RegExp]> = [
+    ["parkfinalizer", "import silk.effect { Effect }\nimport silk.fiber { Fiber }\neffect fn finish() -> () {\n  run Fiber<(), ()>.yieldNow()\n  return ()\n}\neffect fn body() -> i32 { return 3 }\npub fn main() -> i32 {\n  return run Effect.ensuringNonParking(body(), finish())\n}\n", /error\[SEM0139\] `finish` must not park, because this call needs an `Intrinsic\.NonParking` value, but running it can park; move work that can suspend, such as `Effect\.sleep`, out of it\n/],
+    ["heldaccess", "import silk.allocator { Allocator, OutOfMemoryError }\nimport silk.effect { Effect }\nimport silk.fiber { Fiber }\nimport silk.shared { Shared }\nstruct Counter { value: i32 }\neffect fn noisy() -> () {\n  run Fiber<(), ()>.yieldNow()\n  return ()\n}\nfn bump(c: &mut Counter) -> i32 {\n  run noisy()\n  c.value = c.value + 1\n  return c.value\n}\neffect fn work() -> i32 ! OutOfMemoryError {\n  let mut allocator = Allocator.systemAllocatorProvider()\n  let shared = run (Shared<Counter>.make(Counter { value: 0 })\n    |> Effect.provideMut<Allocator>(&mut allocator))\n  return Shared<Counter>.withMut<i32>(&shared, bump)\n}\neffect fn recover(error: OutOfMemoryError) -> i32 { return -1 }\npub fn main() -> i32 {\n  return run Effect.catchAll(work(), recover)\n}\n", /error\[OWN0016\] `noisy\(\)` runs an Effect while a local-shared access such as `Shared\.withMut` holds its exclusive borrow; take what you need out of the value, return it, and run the Effect after the access returns\n/],
+  ]
+  for (const [name, source, expected] of parkingCases) {
+    yield* fs.makeDirectory(join(directory, `${name}/src`), { recursive: true })
+    yield* fs.writeFileString(join(directory, `${name}/silk.toml`), `[package]\nname = "${name}"\nversion = "0.1.0"\n`)
+    yield* fs.writeFileString(join(directory, `${name}/src/main.silk`), source)
+    const built = yield* invoke(silk, ['build', '--stdlib', standardLibrary], join(directory, name), { ...process.env, SILK_CLANG: clang })
+    assert.equal(built.status, 1, built.stderr)
+    assert.match(built.stderr, expected)
+  }
+  // A line that starts with `-1 =>` is the next arm, not a subtraction from the arm before it.
+  yield* fs.makeDirectory(join(directory, 'negarm/src'), { recursive: true })
+  yield* fs.writeFileString(join(directory, 'negarm/silk.toml'), '[package]\nname = "negarm"\nversion = "0.1.0"\n')
+  yield* fs.writeFileString(join(directory, 'negarm/src/main.silk'), "fn pick(n: i32) -> i32 {\n  return match n {\n    7 => 1\n    -1 => 2\n    i32 other => other\n  }\n}\n\npub fn main() -> i32 {\n  return pick(-1) + pick(7) + pick(5)\n}\n")
+  const negative = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(directory, 'negarm'), { ...process.env, SILK_CLANG: clang })
+  assert.equal(negative.status, 8, negative.stderr)
+  yield* fs.makeDirectory(join(directory, 'lendok/src'), { recursive: true })
+  yield* fs.writeFileString(join(directory, 'lendok/silk.toml'), '[package]\nname = "lendok"\nversion = "0.1.0"\n')
+  yield* fs.writeFileString(join(directory, 'lendok/src/main.silk'), "fn callMut(mut f: mut fn(i32) -> i32) -> i32 {\n  return f(1)\n}\n\npub fn main() -> i32 {\n  let mut total = 0\n  let mut acc = fn(x: i32) -> i32 {\n    total = total + x\n    return total\n  }\n  let a = callMut(acc)\n  let b = callMut(acc)\n  let c = acc(100)\n  return a + b + c\n}\n")
+  const lent = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(directory, 'lendok'), { ...process.env, SILK_CLANG: clang })
+  assert.equal(lent.status, 105, lent.stderr)
   // A syntax error the parser recovered from fails the check phase of a build, before codegen.
   yield* fs.makeDirectory(join(directory, 'unclosed/src'), { recursive: true })
   yield* fs.writeFileString(
@@ -1047,6 +1572,8 @@ const program = Effect.gen(function* () {
     yield* fs.exists(join(directory, 'tested/build/test/llvm', hostTarget, 'debug/tested')),
     true,
   )
+  const runnerRecord = join(directory, 'tested/build/test/llvm', hostTarget, 'debug/tested.inputs')
+  const firstRecord = yield* fs.readFile(runnerRecord)
   // No test result is stored yet, so a plain `silk test` runs every selected test.
   const failedTests = yield* invoke(
     silk,
@@ -1055,6 +1582,9 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(failedTests.status, 1, failedTests.stderr)
+  // The first build's record already describes the unchanged project, so this run reused its
+  // runner and left the record as it was.
+  assert.deepEqual(yield* fs.readFile(runnerRecord), firstRecord, 'the second test run reuses the runner')
   // A test that traps fails with its report under its name, and the tests after it still run.
   assert.match(
     failedTests.stdout,
@@ -1788,6 +2318,36 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(packaged.status, 42, packaged.stderr)
+  // An export may name a directory whose barrel `mod.silk` re-exports a child module, which
+  // stays internal (MODULE-007).
+  yield* fs.makeDirectory(join(directory, 'packaged/numbers/src/tools'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'packaged/numbers/src/tools/double.silk'),
+    'pub fn double(value: i32) -> i32 {\n  return value * 2\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'packaged/numbers/src/tools/mod.silk'),
+    'pub import tools.double { double }\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'packaged/numbers/silk.toml'),
+    '[package]\nname = "silk-numbers"\nversion = "0.2.0"\nsource = "src"\nexports = ["scale", "tools"]\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'packaged/app/main.silk'),
+    'import numbers.tools { double }\n\npub fn main() -> i32 {\n  return double(21)\n}\n',
+  )
+  const barrelled = yield* invoke(
+    silk,
+    ['run', '--stdlib', standardLibrary],
+    join(directory, 'packaged/app'),
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(barrelled.status, 42, barrelled.stderr)
+  yield* fs.writeFileString(
+    join(directory, 'packaged/app/main.silk'),
+    'import numbers.scale { scale }\nimport util.digits { base }\n\npub fn main() -> i32 {\n  return scale(base()) + 2\n}\n',
+  )
   // A dependency's declarations are checked where they are written, even one the app never calls.
   yield* fs.writeFileString(
     join(directory, 'packaged/numbers/src/scale.silk'),
@@ -2257,7 +2817,44 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(linkedRun.status, 7, linkedRun.stderr)
-  // A source file that cannot be read is named.
+  // An output path may go through symbolic links too: a relative one, an absolute one, and a
+  // chain of them. A link that loops is reported instead of followed forever.
+  yield* fs.symlink(join(throughLinks, 'real'), join(throughLinks, 'absolute'))
+  yield* fs.symlink('via', join(throughLinks, 'chain'))
+  for (const output of ['via/linked', 'absolute/absolute', 'chain/chained']) {
+    const built = yield* invoke(
+      silk,
+      ['build', 'src/main.silk', '-o', join(throughLinks, output), '--stdlib', standardLibrary],
+      join(throughLinks, 'app'),
+      { ...process.env, SILK_CLANG: clang },
+    )
+    assert.equal(built.status, 0, built.stderr)
+    const ran = yield* invoke(join(throughLinks, 'real', basename(output)), [], throughLinks)
+    assert.equal(ran.status, 7, ran.stderr)
+  }
+  yield* fs.symlink('loop', join(throughLinks, 'loop'))
+  const looped = yield* invoke(
+    silk,
+    [
+      'build',
+      'src/main.silk',
+      '-o',
+      join(throughLinks, 'loop/program'),
+      '--stdlib',
+      standardLibrary,
+    ],
+    join(throughLinks, 'app'),
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(looped.status, 1, looped.stderr)
+  assert.match(looped.stderr, /^silk: cannot create temporary directory: /m)
+  // Cleaning removes a link in the build directory itself, never what it points to.
+  yield* fs.symlink('../../real', join(throughLinks, 'app/build/escape'))
+  const cleanedLinks = yield* invoke(silk, ['clean'], join(throughLinks, 'app'))
+  assert.equal(cleanedLinks.status, 0, cleanedLinks.stderr)
+  assert.equal(yield* fs.exists(join(throughLinks, 'app/build')), false)
+  assert.equal(yield* fs.exists(join(throughLinks, 'real/helper.silk')), true)
+  // A link to a missing source file is a missing module, as the file it names is missing.
   yield* fs.symlink('../../real/missing.silk', join(throughLinks, 'app/src/gone.silk'))
   yield* fs.writeFileString(
     join(throughLinks, 'app/src/main.silk'),
@@ -2269,7 +2866,7 @@ const program = Effect.gen(function* () {
     join(throughLinks, 'app'),
   )
   assert.equal(dangling.status, 1, dangling.stderr)
-  assert.match(dangling.stderr, /^silk: cannot read \S+\/app\/src\/gone\.silk$/m)
+  assert.match(dangling.stderr, /error\[MOD0001\] Unknown module gone$/m)
   // Two commands that build one package at once keep their intermediate files apart, and the
   // run finds a whole executable however the other command's link is going.
   const together = join(directory, 'together')
@@ -2584,11 +3181,14 @@ const program = Effect.gen(function* () {
   // An unchanged rebuild links nothing either: the executable stays the file the last link wrote.
   const splitExecutable = join(split, `build/llvm/${hostTarget}/debug/split`)
   const linkedAt = (yield* fs.stat(splitExecutable)).mtime
+  const symbolMap = `${splitExecutable}.symbols`
+  const mappedAt = (yield* fs.stat(symbolMap)).mtime
   yield* splitRun(7)
   assert.deepEqual(yield* objectNames(), coldObjects, 'an unchanged rebuild reuses every object')
   assert.deepEqual((yield* fs.stat(splitExecutable)).mtime, linkedAt, 'an unchanged rebuild leaves the executable as it was')
   assert.deepEqual(yield* packNames(), coldPacks, 'an unchanged rebuild keeps every pack')
   assert.deepEqual((yield* fs.stat(importSummaries)).mtime, summarizedAt, 'an unchanged rebuild keeps the import summaries')
+  assert.deepEqual((yield* fs.stat(symbolMap)).mtime, mappedAt, 'an unchanged rebuild leaves the symbol map as it was')
   yield* fs.writeFileString(join(split, 'src/helper.silk'), helperSource(5))
   yield* splitRun(9)
   const editedObjects = yield* objectNames()
@@ -2621,6 +3221,16 @@ const program = Effect.gen(function* () {
   yield* splitRun(9)
   yield* replayed(helperSource(6), 10, /codegen\s+1 functions?\s/)
   yield* replayed(`fn other() -> i32 {\n  return 2\n}\n\npub fn value() -> i32 {\n  return other() + 1\n}\n`, 7, /codegen\s+[1-9]\d+ functions\s/)
+  // A whole-module link keeps a stamp too, so an unchanged release rebuild links nothing.
+  const releaseBuild = Effect.fnUntraced(function* () {
+    const built = yield* invoke(silk, ['build', '--release', '--stdlib', standardLibrary], split, splitEnvironment)
+    assert.equal(built.status, 0, built.stderr)
+  })
+  yield* releaseBuild()
+  const releaseExecutable = join(split, `build/llvm/${hostTarget}/release/split`)
+  const releasedAt = (yield* fs.stat(releaseExecutable)).mtime
+  yield* releaseBuild()
+  assert.deepEqual((yield* fs.stat(releaseExecutable)).mtime, releasedAt, 'an unchanged release rebuild leaves the executable as it was')
   // A check replays the escape walks the last check left in the cache. A callback's call into
   // another module of the package is walked below the callback, so an edit there that adds a `run`
   // is reported as a cold check reports it, and an edit that keeps what the walk reads reports

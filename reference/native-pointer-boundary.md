@@ -82,6 +82,27 @@ writes for the shared one. A handle that owns storage through a raw pointer pass
 anchor, so `Arc.get` and `MutexGuard.getMut` return references that cannot outlive the handle or
 the lock.
 
+## Stack frames and stack storage
+
+`Intrinsic.frameAddress() -> [*]const u8` is the safe runtime observation of the running function's
+stack frame. On native targets it is the machine frame address; on `wasm32` it is the frame in the
+linear-memory stack, and a function that keeps nothing in linear memory shares its caller's address.
+Every supported stack grows down, so each frame of a still-running caller is at the same or a
+higher address. The result is valid for comparison and for unsafe reads only while that frame is
+live. Inlining can place the call in its caller's frame. `Stack.frameAddress` exposes it.
+
+`Intrinsic.stackAllocate<T>(count: usize) -> [*]mut T` is the unsafe dynamic stack allocation. The
+storage holds `count` uninitialized elements of `T` at its natural alignment and stays valid until
+the running function returns. A frame-based instance releases it at a suspension too, so it must not
+be used across one. A byte count that does not fit `usize` traps with `arithmetic overflow`. The
+caller proves that the storage fits the stack that the running thread has left; storage past the
+end of the stack is undefined behavior, not a stack-overflow trap. Values written to the storage
+are never dropped. Repeated calls in one function keep growing its frame, so a loop should allocate
+through a callee that returns. `Stack.withStorage` is that callee: it passes the storage to a
+callback and releases it when the callback returns.
+
+Both are runtime operations; a static body cannot call them.
+
 ## Native output storage
 
 Ordinary source owns `Uninitialized<T>` and `Initialized<T>` output states for Copy values. Private
@@ -100,9 +121,24 @@ The audited target description supplies primitive size, alignment, pointer facts
 Existing external structs and arrays derive layout from those facts before LLVM lowering. Missing
 or inconsistent facts fail before use; there is no ambient-host layout fallback. C classification carries the required sign/zero-extension attributes for narrow integers on
 Darwin ARM64 and System V x86-64; GNU AAPCS64 leaves those attributes absent. LLVM consumes these
-verified facts on foreign declarations, call sites and exported thunks. The
-scalar/pointer/void C ABI is retained, and slices and aggregate-by-value signatures remain outside
-this initial boundary.
+verified facts on foreign declarations, call sites and exported thunks.
+
+An `extern "C" struct` can pass or return by value in direct calls, native function-pointer
+calls and exported functions. Its fields retain the C object restrictions: C scalars, raw
+pointers, admitted function pointers and vectors, fixed arrays, represented scalar enums and
+nested C-layout structs. Ordinary Silk records, slices and tagged unions are not C values.
+Passing a struct by value gives the callee its own value; writes to its parameter do not change
+the caller's object, including when the machine ABI passes an address of a caller copy.
+
+| Target | Struct arguments and results |
+| --- | --- |
+| System V x86-64 | Up to two eightbytes use INTEGER and SSE registers. An argument that needs more registers than remain passes entirely in memory. Larger records use `byval` arguments and `sret` results. A record containing only one admitted SIMD vector retains that vector's register convention and feature requirement. |
+| GNU and Apple ARM64 | Homogeneous aggregates of one through four floats or short vectors use vector registers. Other records up to 16 bytes use general registers. Larger arguments pass a pointer to a caller copy; indirect results use `sret` in x8. GNU homogeneous arguments retain the AAPCS64 stack alignment; Apple uses its own stack placement. |
+| wasm32 | A record containing a single scalar uses that scalar's lane. Other records use indirect arguments and results. |
+
+Classification follows nested field offsets and array elements from the audited target layout.
+Padding is not a source value, and register coercion does not read or write beyond an object's size.
+Structs are fixed parameters only; variadic tails admit only integers, floats and raw pointers.
 
 Conformance uses separately compiled C and Silk objects with pinned compiler, linker and
 SDK/libc/header supplies. Debug and optimized Darwin ARM64 and GNU x86-64 cases execute; GNU ARM64
@@ -116,11 +152,17 @@ record exact supply checks, object inspection, and execution evidence for each r
 
 ## Direct C calls in LLVM-to-Wasm storage components
 
-The LLVM-to-Wasm path admits direct C functions with scalar lanes, address-space-zero
-data pointers and void results. Narrow integers extend to 32 bits as the WebAssembly C ABI
-requires, and a data address converts exactly to and from the 32-bit `usize`. Variadics,
-callbacks, foreign borrowed arguments, indirect C calls and foreign data are not admitted on this
-target.
+The LLVM-to-Wasm path admits C functions with scalar lanes, address-space-zero data pointers,
+C-layout structs and void results. Direct calls, native function-pointer calls and exported
+functions use the same classification. Narrow scalar integers extend to 32 bits as the WebAssembly
+C ABI requires; single-scalar struct coercions retain the C aggregate rule without scalar extension
+attributes. A data address converts exactly to and from the 32-bit `usize`. Variadics, foreign
+borrowed arguments and foreign data remain outside this target's boundary.
 This does not select an OS API or a JavaScript host import. Final linkage must
 resolve the declared symbols. Pointer reinterpretation has the same explicit
 alignment, initialization and lifetime obligations as on native targets.
+
+The `foreign-struct-values` and `foreign-struct-vectors` native corpus fixtures compile their C
+translation units separately and run debug and optimized Silk builds on all three native lanes.
+`compiler/scripts/test-c-aggregates.ts` separately compiles and executes the shared value fixture
+on wasm32 in both profiles, including callbacks, exported thunks and caller-copy checks.

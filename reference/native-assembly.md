@@ -1,7 +1,8 @@
 # Native assembly and entry fragments
 
-This contract exposes the machine boundary needed by selected Linux source. Syscall numbers,
-wrappers, OS error handling, stack decoding and startup composition remain ordinary library code.
+This contract exposes the machine boundary needed by selected Linux and Darwin ARM64 source.
+Syscall numbers, wrappers, OS error handling, stack decoding and startup composition remain
+ordinary library code.
 
 ## ASSEMBLY-001 — Typed literal assembly contract
 
@@ -11,7 +12,7 @@ wrappers, OS error handling, stack decoding and startup composition remain ordin
 noReturn, inputs)` is unsafe. The first four arguments are literal strings; the next two are literal
 booleans; the last is a tuple of zero through seven runtime operands. Metadata is consumed by the
 compiler. The result is unit or one `i64`, `u64`, `isize`, `usize` or data-pointer value. Each operand
-is one of those non-unit lanes. Linux x86-64 and ARM64 are the only admitted targets.
+is one of those non-unit lanes. Linux x86-64, Linux ARM64 and Darwin ARM64 are admitted targets.
 
 **Example:**
 
@@ -25,9 +26,9 @@ unsafe fn add(left: u64, right: u64) -> u64 {
 This x86-64 fragment ties `left` to the output and takes `right` in rdi. Selected ARM64 source uses
 its own template and registers. Wrappers may hide literal metadata behind ordinary typed functions.
 
-**Boundary:** Static execution, Wasm, Darwin, floats/vectors, aggregate lanes, references and
-narrower/wider integers are unsupported. Metadata must be literal at the intrinsic use; a runtime
-string or tuple cannot become assembly metadata. LTO is not admitted.
+**Boundary:** Static execution, Wasm, floats/vectors, aggregate lanes, references and narrower/wider
+integers are unsupported. Metadata must be literal at the intrinsic use; a runtime string or tuple
+cannot become assembly metadata. LTO is not admitted.
 
 **Diagnostics:** Invalid metadata, lanes and targets diagnose at the call and offending source
 arguments before machine execution.
@@ -41,7 +42,9 @@ arguments before machine execution.
 **Rule:** A non-unit result has one `={register}` or early-clobber `=&{register}` output. Each input
 has one fixed `{register}` constraint or one `0` tie to the output. Tied lanes have compatible LLVM
 kinds. Fixed input/output overlap must be spelled as a tie. x86-64 admits rax/rdi/rsi/rdx/rcx and
-r8–r11; ARM64 admits x0–x17. A comma-separated clobber string admits those registers plus `flags`.
+r8–r11; Linux and Darwin ARM64 admit x0–x17. A comma-separated clobber string admits those registers
+plus `flags` (lowered to LLVM `cc` on both ARM64 targets). Darwin's reserved x18, callee-saved
+registers, frame pointer, link register and stack pointer are not operand/clobber registers.
 Duplicate or conflicting registers, unknown constraints and multiple results are errors.
 
 `memory` is `none`, `read`, `write` or `readwrite`. `sideEffects` declares observable effects beyond
@@ -51,6 +54,11 @@ not module directives. LLVM operand references are `$0`, `$1`, etc.; literal `$`
 
 **Example:** `"{rdi},{rsi}"` with a unit result binds two independent input words. A memory store
 must declare write/readwrite and side effects even if its result is unused.
+
+A CPU spin hint is an observable machine effect, not a scheduler yield. On either ARM64 target,
+`unsafe Intrinsic.assembly<()>("yield", "", "", "none", true, false, ())` emits the genuine
+AArch64 instruction without claiming an operand, register clobber or data-memory access. A caller
+requiring a compiler memory barrier may additionally declare a memory effect.
 
 **Boundary:** The unsafe caller proves bounds, aliasing, access, lifetime and actual machine effects.
 No operand grants initialization or ownership. Returning assembly preserves stack, ABI-preserved
@@ -62,7 +70,10 @@ references/directives and contradictory effects diagnose structurally; the assem
 invalid instruction spellings. No syscall behavior is inferred from instruction text.
 
 **Evidence:** LLVM inline assembly constraints and sideeffect contract; AAPCS64 2025Q1; pinned
-x86-64 psABI and Linux UAPI fixtures.
+x86-64 psABI and Linux UAPI fixtures; Apple's
+[ARM64 ABI](https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms).
+`compiler/scripts/test-native-build.ts` checks Darwin hint/flags emission, native instruction text,
+returning operand behavior on Darwin hosts, and rejection of reserved registers and invalid contracts.
 
 ## ASSEMBLY-003 — Naked entry fragments contain no compiler-generated work
 

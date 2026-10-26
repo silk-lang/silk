@@ -8,7 +8,7 @@ import backend.DropGlue {Child as GlueChild, Children as GlueChildren, Remainder
 import backend.CleanupNeeds {CleanupNeeds}
 import backend.CAbi
 import backend.Gap {Code as GapCode, Gap}
-import backend.InstanceKey {HelperRole, InstanceKey}
+import backend.InstanceKey {HelperRole, InstanceKey, NameOrder}
 import backend.RuntimeType
 import backend.UnionProjection
 import backend.UnionProjection {Injection as UnionInjection}
@@ -34,6 +34,7 @@ import semantic.Anchor {Anchor}
 import semantic.Lifetime {CanonicalizationFailure, Lifetime}
 import semantic.ModuleId {ModuleId}
 import semantic.DeclarationId {DeclarationId}
+import semantic.InternIndex {InternIndex}
 import semantic.Type {Argument, Binding, ArrayShape, CallableFieldInput, Requirement, Row, RowParameter, Type}
 import semantic.Intrinsic as CheckedIntrinsic
 import semantic.SealedCore
@@ -188,6 +189,11 @@ pub union Rvalue {
   /// The erased address of the execution package whose frames the running frame belongs to, or
   /// null outside any package. Only a frame-based instance reads it.
   RunningPackage,
+  /// The address of the running function's native stack frame (`Intrinsic.frameAddress`).
+  FrameAddress,
+  /// Uninitialized stack storage for `count` elements of `element`, naturally aligned, that lives
+  /// until the running function returns (`Intrinsic.stackAllocate`).
+  StackAllocate {pub count: Operand, pub element: Shared<Type>},
   /// One admitted literal machine fragment (ASSEMBLY-001) over its operand lanes. Its result is
   /// `ty`; a unit fragment has no output and a no-return fragment ends its block.
   /// The fragment is boxed so this rare variant does not size every rvalue and statement.
@@ -996,6 +1002,11 @@ struct Builder {
   landing: bool,
   // The published value of each constant this body reads.
   constants: List<ConstantValue>,
+  // The closed runtime type of each distinct written node type `instanceView` has seen, keyed by
+  // the exact written type: most nodes repeat a few types, so each is substituted once.
+  written: List<Shared<Type>>,
+  closed: List<Shared<Type>>,
+  writtenLookup: InternIndex,
 }
 
 // A failure slot held across the calls lowered now. `cleanup` is its type when the slot still owns
@@ -1029,6 +1040,8 @@ struct SiteText {
   name: Bytes,
   path: Bytes,
   lines: List<usize>,
+  // A module of the program's own package; reports lead another package's names with its name.
+  root: Option<ModuleId>,
 }
 
 // Where a failure inside an expansion goes: out of this function, or into a handler's temporary.
@@ -1611,6 +1624,8 @@ fn mayTrap(value: &Rvalue) -> bool {
     Rvalue.Binary {..} => true
     Rvalue.ScalarBinary {..} => true
     Rvalue.Convert {..} => true
+    // The byte count of stack storage traps when it does not fit the target word.
+    Rvalue.StackAllocate {..} => true
     // A checked integer lane sum traps when the total does not fit the lane type.
     Rvalue.Vector {primitive, ..} => primitive == IntrinsicPrimitive.SimdReduceAdd
     _ => false
@@ -3732,7 +3747,7 @@ effect fn expressionPlace(
   hir: &Module,
   id: BodyNodeId,
 ) -> Place ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
-  let selected = run instanceView(&builder.*, body, id)
+  let selected = run instanceView(&mut builder.*, body, id)
   let owner = InstanceKey.identity(&builder.function.key)
   return match move selected {
     View.Local {index, ..} => place(index + usize.ONE)
@@ -4709,7 +4724,7 @@ effect fn readOwner(builder: &Builder, body: &Shared<TypedBody>, read: BodyNodeI
 effect fn consumedOperand(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module, id: BodyNodeId) -> Operand
 ! Gap | CanonicalizationFailure | OutOfMemoryError
 ? &mut Allocator | &mut Types {
-  let selected = run instanceView(&builder.*, body, id)
+  let selected = run instanceView(&mut builder.*, body, id)
   return match move selected {
     View.Local {index, ty, origin} => {
       let output = run temporary(&mut builder.*, &ty, origin)
@@ -4746,7 +4761,7 @@ effect fn infixChain(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
   run List<InfixLink>.append(&mut links, move outer)
   let mut leftmost = left
   while true {
-    let selected = run instanceView(&builder.*, body, leftmost)
+    let selected = run instanceView(&mut builder.*, body, leftmost)
     if let View.Infix {operation, left: inner, right, ty, origin} = move selected {
       if operation == InfixOperator.And || operation == InfixOperator.Or {
         break
@@ -4784,7 +4799,7 @@ effect fn infixChain(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
 effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module, id: BodyNodeId) -> Operand
 ! Gap | CanonicalizationFailure | OutOfMemoryError
 ? &mut Allocator | &mut Types {
-  let selected = run instanceView(&builder.*, body, id)
+  let selected = run instanceView(&mut builder.*, body, id)
   let owner = InstanceKey.identity(&builder.function.key)
   return match move selected {
     View.Integer {ty, literal, origin} => match Module.node(hir, Anchor.hir(&builder.anchor, literal)) {
@@ -5353,6 +5368,7 @@ effect fn primitiveRvalue(
   if primitive == IntrinsicPrimitive.PointerNull {
     return Rvalue.Use {value: Operand.Null {ty: Shared<Type>.clone(ty)}}
   }
+  if primitive == IntrinsicPrimitive.FrameAddress { return Rvalue.FrameAddress }
   if primitive == IntrinsicPrimitive.Assembly {
     return run assembly(&mut builder.*, body, hir, callNode, ty, origin)
   }
@@ -5405,6 +5421,13 @@ effect fn primitiveRvalue(
     IntrinsicPrimitive.PointerAt => run pointerAt(&mut builder.*, body, hir, callNode, move first, ty, origin)
     IntrinsicPrimitive.PointerAtMut => run pointerAt(&mut builder.*, body, hir, callNode, move first, ty, origin)
     IntrinsicPrimitive.SliceView => run sliceView(&mut builder.*, body, hir, callNode, move first, ty, origin)
+    IntrinsicPrimitive.StackAllocate => {
+      let element = match move Shared<Type>.with<Option<Shared<Type>>>(ty, pointeeOf) {
+        Option<Shared<Type>>.Some {value} => move value
+        Option<Shared<Type>>.None => run unsupported(&owner, origin, GapCode.TypedForm)
+      }
+      return Rvalue.StackAllocate {count: move first, element: move element}
+    }
     _ => run unsupported(&owner, origin, GapCode.IntrinsicMember)
   }
 }
@@ -5893,6 +5916,7 @@ fn armView(body: &Shared<TypedBody>, node: BodyNodeId, at: usize) -> Option<ArmV
         if let BodyPattern.Record {member} = &written[at].pattern { pattern = BodyPattern.Record {member: copyMember(&member)} }
         if let BodyPattern.Variant {tag} = &written[at].pattern { pattern = BodyPattern.Variant {tag: tag} }
         if let BodyPattern.Integer {magnitude, negative} = &written[at].pattern { pattern = BodyPattern.Integer {magnitude: magnitude, negative: negative} }
+        if let BodyPattern.Boolean {value: selected} = &written[at].pattern { pattern = BodyPattern.Boolean {value: selected} }
         let mut guard = Option<BodyNodeId>.none()
         if let Option<BodyNodeId>.Some {value: tested} = &written[at].guard { guard = Option<BodyNodeId>.some(tested) }
         return Option<ArmView>.some(ArmView {pattern: move pattern, tests: List<BodyPatternTest>.length(&written[at].tests),
@@ -5982,7 +6006,14 @@ effect fn selectorOf(builder: &Builder, pattern: &BodyPattern, origin: Origin) -
       Option<BodyUnionMember>.None => Selector.Any
     }
     BodyPattern.Integer {magnitude, negative} => Selector.Case {decimal: run decimalBytes(magnitude), negative: negative}
+    BodyPattern.Boolean {value} => Selector.Case {decimal: run Type.extentText(booleanCase(value)), negative: false}
   }
+}
+
+// The switch value of a `bool`: 1 for `true`.
+fn booleanCase(value: bool) -> usize {
+  if value { return usize.ONE }
+  return usize.ZERO
 }
 
 // Ends the current block with one switch over arms `from..`: each case value goes to the first arm
@@ -6273,7 +6304,26 @@ effect fn lowerMatch(
       }
     }
     // A block arm runs as statements; a transfer inside it leaves the arm without reaching the join.
-    if blockNode(body, result) {
+    // A block that yields a value stores it after its statements, before its locals end.
+    let yielded = blockValue(body, result)
+    if let Option<BodyNodeId>.Some {value: produced} = move yielded {
+      run openScope(&mut builder.*)
+      run blockStatements(&mut builder.*, body, hir, result, blockCount(body, result), armOrigin)
+      if builder.live {
+        let armPending = List<Pending>.length(&builder.temporaries)
+        let value = run expression(&mut builder.*, body, hir, produced)
+        if List<Pending>.length(&builder.temporaries) > armPending && Shared<Type>.with<bool>(ty, Type.holdsView) {
+          return run unsupported(&owner, armOrigin, GapCode.Cleanup)
+        }
+        if valued && builder.live {
+          run assign(&mut builder.*, place(output), Rvalue.Use {value: move value}, armOrigin)
+        } else {
+          drop value
+        }
+        run endTemporaries(&mut builder.*, armPending, armOrigin)
+      }
+      run closeScope(&mut builder.*, armOrigin)
+    } else if blockNode(body, result) {
       run statement(&mut builder.*, body, hir, result)
     } else {
       // An arm's temporaries end with the arm, after its value is stored.
@@ -6331,6 +6381,25 @@ fn storedMatchValue(value: &Type) -> bool {
     Type.Union {members} => List<Shared<Type>>.length(&members) != usize.ZERO
     _ => true
   }
+}
+
+// The value block `id` yields, if it is a block that yields one.
+fn blockValue(body: &Shared<TypedBody>, id: BodyNodeId) -> Option<BodyNodeId> {
+  return Shared<TypedBody>.with<Option<BodyNodeId>>(body, fn(value: &TypedBody) -> Option<BodyNodeId> {
+    if let BodyNodeKind.Block {value: Option<BodyNodeId>.Some {value: yielded}, ..} = &TypedBody.nodeSlice(value)[id.index].kind {
+      return Option<BodyNodeId>.some(yielded)
+    }
+    return Option<BodyNodeId>.none()
+  })
+}
+
+fn blockCount(body: &Shared<TypedBody>, id: BodyNodeId) -> usize {
+  return Shared<TypedBody>.with<usize>(body, fn(value: &TypedBody) -> usize {
+    if let BodyNodeKind.Block {statements, ..} = &TypedBody.nodeSlice(value)[id.index].kind {
+      return List<BodyNodeId>.length(&statements)
+    }
+    return usize.ZERO
+  })
 }
 
 fn blockNode(body: &Shared<TypedBody>, id: BodyNodeId) -> bool {
@@ -7153,6 +7222,7 @@ effect fn helperBuilder(creator: &Builder, key: InstanceKey, result: &Shared<Typ
     cancelScopes: List<CancelScope>.make(),
     landing: false,
     constants: run copyConstants(List<ConstantValue>.asSlice(&creator.constants)),
+    written: List<Shared<Type>>.make(), closed: List<Shared<Type>>.make(), writtenLookup: InternIndex.make(),
   }
 }
 
@@ -7854,8 +7924,8 @@ effect fn lowerStorage(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Mo
         left: Operand.Copy {place: place(count)}, right: run wordOperand(plan.size)}, origin)
       let sized = run storageCondition(&mut builder.*, InfixOperator.Equals, Operand.Copy {place: place(expected)},
         Operand.Copy {place: run storagePlace(&first, false, &[SealedCore.ordinal(CoreField.AllocationBytes)])}, origin)
-      let aligned = run storageCondition(&mut builder.*, InfixOperator.Equals,
-        Operand.Copy {place: run storagePlace(&first, false, &[SealedCore.ordinal(CoreField.AllocationAlignment)])}, run wordOperand(plan.alignment), origin)
+      let aligned = run storageCondition(&mut builder.*, InfixOperator.LessOrEqual, run wordOperand(plan.alignment),
+        Operand.Copy {place: run storagePlace(&first, false, &[SealedCore.ordinal(CoreField.AllocationAlignment)])}, origin)
       let valid = run storageCondition(&mut builder.*, InfixOperator.BitAnd, move sized, move aligned, origin)
       run trapUnless(&mut builder.*, move valid, TrapReason.InvalidRawBufferLayout, origin)
       let mut fields = List<AggregateField>.make()
@@ -8073,7 +8143,7 @@ effect fn lowerRun(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module
     run executePlan(&mut builder.*, List<RunPlan>.asSlice(&steps), root, &stored, output, &FailureSink.Propagate, &mut bound, origin)
     return Operand.Copy {place: place(output)}
   }
-  let construction = run instanceView(&builder.*, body, value)
+  let construction = run instanceView(&mut builder.*, body, value)
   // The primitive allocation boundary runs in place, failing with its refusal.
   if let View.Storage {operation, node: storageNode, ..} = &construction {
     if operation == StorageOperation.SystemAllocationAcquire && TypedBody.immediateRun(body, runNode) {
@@ -9128,7 +9198,28 @@ effect fn modulePath(module: &ModuleId) -> Bytes ! OutOfMemoryError ? &mut Alloc
 
 // `module.Owner.name`, naming only named owner steps (anonymous bodies report their owner).
 pub effect fn declarationName(declaration: &DeclarationId) -> Bytes ! OutOfMemoryError ? &mut Allocator {
-  let mut name = run modulePath(DeclarationId.moduleId(declaration))
+  return run reportName(declaration, &Option<ModuleId>.none())
+}
+
+// `declarationName`, led by the package name, `geo.lib.keep`, for a declaration of another package
+// than `root`'s: every library's root module is `lib`. Standard-library names keep their path.
+effect fn reportName(declaration: &DeclarationId, root: &Option<ModuleId>) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let module = DeclarationId.moduleId(declaration)
+  let mut name = Bytes.make()
+  if let Option<ModuleId>.Some {value: own} = &root.* {
+    let foreign = !ModuleId.samePackage(module, &own) && ModuleId.sameOrigin(module, &own)
+    if foreign && !ModuleId.withPath<bool>(module, PackageGraph.isStandard) {
+      let package = run ModuleId.copyPackage(module)
+      let identity = Bytes.asSlice(&package)
+      let mut end = usize.ZERO
+      while end < identity.length && identity[end] != '@' {
+        run Bytes.append(&mut name, &[identity[end]])
+        end = end + usize.ONE
+      }
+      if end > usize.ZERO { run Bytes.append(&mut name, b".") }
+    }
+  }
+  run Bytes.append(&mut name, Bytes.asSlice(&run modulePath(module)))
   let count = DeclarationId.ownerCount(declaration)
   let mut at = usize.ZERO
   while at < count {
@@ -9143,7 +9234,7 @@ pub effect fn declarationName(declaration: &DeclarationId) -> Bytes ! OutOfMemor
   return move name
 }
 
-effect fn siteText(key: &InstanceKey, source: &[u8]) -> SiteText ! OutOfMemoryError ? &mut Allocator {
+effect fn siteText(key: &InstanceKey, source: &[u8], root: Option<ModuleId>) -> SiteText ! OutOfMemoryError ? &mut Allocator {
   let identity = DeclarationId.copyShared(&InstanceKey.identity(key))
   let mut lines = List<usize>.make()
   run List<usize>.append(&mut lines, usize.ZERO)
@@ -9152,8 +9243,8 @@ effect fn siteText(key: &InstanceKey, source: &[u8]) -> SiteText ! OutOfMemoryEr
     if source[at] == 10 { run List<usize>.append(&mut lines, at + usize.ONE) }
     at = at + usize.ONE
   }
-  return SiteText {name: run declarationName(&identity), path: run modulePath(DeclarationId.moduleId(&identity)),
-    lines: move lines}
+  return SiteText {name: run reportName(&identity, &root), path: run modulePath(DeclarationId.moduleId(&identity)),
+    lines: move lines, root: move root}
 }
 
 // `module.function (module:line:column)` for one site, 1-based.
@@ -9178,7 +9269,7 @@ effect fn siteLabel(sites: &SiteText, anchor: &Anchor, origin: Origin) -> Bytes 
 // `'static` has a source spelling after instance selection; any other region is omitted
 // (`&T`, `string`, `Holder`), where the bootstrap prints its inference region (`'_local9`).
 // A requirement row or a compiler-minted aggregate stays a gap rather than printing a guess.
-effect fn identityText(ty: &Shared<Type>, output: &mut Bytes) -> bool ! OutOfMemoryError ? &mut Allocator {
+effect fn identityText(ty: &Shared<Type>, root: &Option<ModuleId>, output: &mut Bytes) -> bool ! OutOfMemoryError ? &mut Allocator {
   let shape = run Type.copy(ty)
   match move shape {
     Type.Primitive {name} => { run Bytes.append(&mut output.*, Bytes.asSlice(&name)) }
@@ -9188,12 +9279,12 @@ effect fn identityText(ty: &Shared<Type>, output: &mut Bytes) -> bool ! OutOfMem
     }
     Type.Reference {referent, access, lifetime} => {
       run borrowPrefix(access, staticLifetime(&lifetime), &mut output.*)
-      return run identityText(&referent, &mut output.*)
+      return run identityText(&referent, root, &mut output.*)
     }
     Type.Slice {element, access, lifetime} => {
       run borrowPrefix(access, staticLifetime(&lifetime), &mut output.*)
       run Bytes.append(&mut output.*, b"[")
-      if !run identityText(&element, &mut output.*) { return false }
+      if !run identityText(&element, root, &mut output.*) { return false }
       run Bytes.append(&mut output.*, b"]")
     }
     Type.Pointer {pointee, access, nullable, multiplicity, alignment} => {
@@ -9205,17 +9296,17 @@ effect fn identityText(ty: &Shared<Type>, output: &mut Bytes) -> bool ! OutOfMem
         run Bytes.append(&mut output.*, Bytes.asSlice(&run decimalBytes(written)))
         run Bytes.append(&mut output.*, b") ")
       }
-      return run identityText(&pointee, &mut output.*)
+      return run identityText(&pointee, root, &mut output.*)
     }
     Type.Array {element, extent} => {
       run Bytes.append(&mut output.*, b"Array<")
-      if !run identityText(&element, &mut output.*) { return false }
+      if !run identityText(&element, root, &mut output.*) { return false }
       run Bytes.append(&mut output.*, b", ")
       run Bytes.append(&mut output.*, Bytes.asSlice(&extent))
       run Bytes.append(&mut output.*, b">")
     }
     Type.Nominal {declaration, arguments, ..} => {
-      run Bytes.append(&mut output.*, Bytes.asSlice(&run declarationName(&declaration)))
+      run Bytes.append(&mut output.*, Bytes.asSlice(&run reportName(&declaration, root)))
       let listed = List<Argument>.asSlice(&arguments)
       let mut written = usize.ZERO
       let mut at = usize.ZERO
@@ -9228,7 +9319,7 @@ effect fn identityText(ty: &Shared<Type>, output: &mut Bytes) -> bool ! OutOfMem
         if spelled {
           if written == usize.ZERO { run Bytes.append(&mut output.*, b"<") } else { run Bytes.append(&mut output.*, b", ") }
           if let Argument.Type {value} = &listed[at] {
-            if !run identityText(&value, &mut output.*) { return false }
+            if !run identityText(&value, root, &mut output.*) { return false }
           } else { run Bytes.append(&mut output.*, b"'static") }
           written = written + usize.ONE
         }
@@ -9280,6 +9371,13 @@ effect fn raise(builder: &mut Builder, origin: Origin) -> () ! Gap | Canonicaliz
     Option<SiteText>.Some {value: sites} => run siteLabel(&sites, &builder.anchor, origin)
     Option<SiteText>.None => { return () }
   }
+  let root = match &builder.sites {
+    Option<SiteText>.Some {value: sites} => match &sites.root {
+      Option<ModuleId>.Some {value} => Option<ModuleId>.some(ModuleId.copy(&value))
+      Option<ModuleId>.None => Option<ModuleId>.none()
+    }
+    Option<SiteText>.None => Option<ModuleId>.none()
+  }
   let owner = InstanceKey.identity(&builder.function.key)
   let slot = builder.failure
   let failed = localType(&builder.*, slot)
@@ -9290,14 +9388,14 @@ effect fn raise(builder: &mut Builder, origin: Origin) -> () ! Gap | Canonicaliz
       let mut at = usize.ZERO
       while at < listed.length {
         let mut identity = Bytes.make()
-        if !run identityText(&listed[at], &mut identity) { return run unsupported(&owner, origin, GapCode.FailureIdentity) }
+        if !run identityText(&listed[at], &root, &mut identity) { return run unsupported(&owner, origin, GapCode.FailureIdentity) }
         run List<Bytes>.append(&mut identities, move identity)
         at = at + usize.ONE
       }
     }
     Option<List<Shared<Type>>>.None => {
       let mut identity = Bytes.make()
-      if !run identityText(&failed, &mut identity) { return run unsupported(&owner, origin, GapCode.FailureIdentity) }
+      if !run identityText(&failed, &root, &mut identity) { return run unsupported(&owner, origin, GapCode.FailureIdentity) }
       run List<Bytes>.append(&mut identities, move identity)
     }
   }
@@ -9693,7 +9791,7 @@ effect fn discard(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module,
 effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module, id: BodyNodeId, pending: usize) -> ()
 ! Gap | CanonicalizationFailure | OutOfMemoryError
 ? &mut Allocator | &mut Types {
-  let selected = run instanceView(&builder.*, body, id)
+  let selected = run instanceView(&mut builder.*, body, id)
   let owner = InstanceKey.identity(&builder.function.key)
   match move selected {
     View.Integer {..} => {
@@ -10005,6 +10103,8 @@ effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &
     View.Block {count, node: blockNode, origin} => {
       run openScope(&mut builder.*)
       run blockStatements(&mut builder.*, body, hir, blockNode, count, origin)
+      // A yielded value whose block runs as a statement is discarded like an expression statement.
+      if let Option<BodyNodeId>.Some {value: yielded} = move blockValue(body, blockNode) { run statement(&mut builder.*, body, hir, yielded) }
       run closeScope(&mut builder.*, origin)
     }
     View.Unsupported {origin} => {
@@ -10143,6 +10243,7 @@ effect fn collectCallNodes(body: &Shared<TypedBody>, id: BodyNodeId, output: &mu
         }
         at = at + usize.ONE
       }
+      if let Option<BodyNodeId>.Some {value: yielded} = move blockValue(body, node) { return run collectCallNodes(body, yielded, &mut output.*) }
     }
     _ => {}
   }
@@ -10177,6 +10278,13 @@ effect fn terminatorSuccessors(terminator: &Terminator) -> List<usize> ! OutOfMe
 }
 
 // Trims each block's statements, then the block list itself.
+// Whether reference `left` sorts before reference `right` by runtime name: by their name digests
+// when every reference has one, else by the names themselves.
+fn referenceBefore(digested: bool, orders: &[NameOrder], names: &[Bytes], left: usize, right: usize) -> bool {
+  if digested { return NameOrder.before(orders[left], orders[right]) }
+  return RuntimeEncoding.less(Bytes.asSlice(&names[left]), Bytes.asSlice(&names[right]))
+}
+
 effect fn compactBlocks(blocks: &mut List<Block>) -> () ! OutOfMemoryError ? &mut Allocator {
   run List<Block>.shrinkToFit(&mut blocks.*)
   let mut listed = List<Block>.asMutSlice(&mut blocks.*)
@@ -10213,13 +10321,26 @@ impl MirFunction {
   /// Orders reached instances by symbol so worklist edges are deterministic.
   pub effect fn sortReferences(references: &mut List<Reference>) -> () ! OutOfMemoryError ? &mut Allocator {
     let listed = List<Reference>.asSlice(&references.*)
-    let mut symbols = List<Bytes>.make()
+    // Without a C export every name is its digest, so the digests order the keys without names.
+    let mut digests = List<NameOrder>.make()
+    run List<NameOrder>.reserveExact(&mut digests, listed.length)
     let mut at = usize.ZERO
     while at < listed.length {
+      match move run InstanceKey.nameOrder(&listed[at].key) {
+        Option<NameOrder>.Some {value} => { run List<NameOrder>.append(&mut digests, value) }
+        Option<NameOrder>.None => { at = listed.length }
+      }
+      at = at + usize.ONE
+    }
+    let digested = List<NameOrder>.length(&digests) == listed.length
+    let mut symbols = List<Bytes>.make()
+    at = usize.ZERO
+    while !digested && at < listed.length {
       run List<Bytes>.append(&mut symbols, run InstanceKey.runtimeName(&listed[at].key))
       at = at + usize.ONE
     }
     let mut order = List<usize>.make()
+    run List<usize>.reserveExact(&mut order, listed.length)
     at = usize.ZERO
     while at < listed.length {
       run List<usize>.append(&mut order, at)
@@ -10227,13 +10348,11 @@ impl MirFunction {
     }
     let sorted = List<usize>.asMutSlice(&mut order)
     let names = List<Bytes>.asSlice(&symbols)
+    let orders = List<NameOrder>.asSlice(&digests)
     at = usize.ONE
     while at < sorted.length {
       let mut next = at
-      while next > usize.ZERO && RuntimeEncoding.less(
-        Bytes.asSlice(&names[sorted[next]]),
-        Bytes.asSlice(&names[sorted[next - usize.ONE]]),
-      ) {
+      while next > usize.ZERO && referenceBefore(digested, orders, names, sorted[next], sorted[next - usize.ONE]) {
         let prior = sorted[next - usize.ONE]
         sorted[next - usize.ONE] = sorted[next]
         sorted[next] = prior
@@ -10338,6 +10457,7 @@ impl MirFunction {
     source: &[u8],
     anchor: &Anchor,
     observing: bool,
+    packageRoot: Option<ModuleId>,
     suspending: Option<List<InstanceKey>>,
     constants: List<ConstantValue>,
   ) -> Lowered ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
@@ -10403,7 +10523,7 @@ impl MirFunction {
       run List<Local>.append(&mut locals, Local {ty: run siteType(), kind: LocalKind.Site, origin: origin})
       diagnostics = Option<DiagnosticPlaces>.some(DiagnosticPlaces {observer: place(observerLocal),
         cause: place(observerLocal + usize.ONE), site: place(observerLocal + 2)})
-      sites = Option<SiteText>.some(run siteText(&key, source))
+      sites = Option<SiteText>.some(run siteText(&key, source, move packageRoot))
     }
     // A function that can fail writes its failure value to a caller-owned out-slot (D3).
     let mut failureLocal = usize.MAX
@@ -10456,6 +10576,9 @@ impl MirFunction {
       cancelScopes: List<CancelScope>.make(),
       landing: false,
       constants: move constants,
+      written: List<Shared<Type>>.make(),
+      closed: List<Shared<Type>>.make(),
+      writtenLookup: InternIndex.make(),
     }
     let first = run block(&mut builder, origin)
     resume(&mut builder, first)
@@ -10490,117 +10613,144 @@ effect fn instanceNodeType(builder: &Builder, body: &Shared<TypedBody>, id: Body
   }
 }
 
-effect fn instanceView(builder: &Builder, body: &Shared<TypedBody>, id: BodyNodeId) -> View
+// The runtime type a written node type closes to in this instance.
+effect fn closedType(builder: &mut Builder, ty: &Shared<Type>) -> Shared<Type>
+! OutOfMemoryError
+? &mut Allocator | &mut Types {
+  if List<Binding>.length(&builder.bindings) == usize.ZERO && List<RuntimeProjection>.length(&builder.projections) == usize.ZERO {
+    return run RuntimeType.applyBindings(ty, List<Binding>.asSlice(&builder.bindings), List<RuntimeProjection>.asSlice(&builder.projections))
+  }
+  let hashed = Type.hash(ty)
+  let known = run writtenTypeAt(&builder.*, ty, hashed)
+  if known != usize.MAX { return Shared<Type>.clone(&List<Shared<Type>>.asSlice(&builder.closed)[known]) }
+  let closed = run RuntimeType.applyBindings(ty, List<Binding>.asSlice(&builder.bindings), List<RuntimeProjection>.asSlice(&builder.projections))
+  run List<Shared<Type>>.append(&mut builder.closed, Shared<Type>.clone(&closed))
+  run List<Shared<Type>>.append(&mut builder.written, Shared<Type>.clone(ty))
+  run InternIndex.record(&mut builder.writtenLookup, hashed)
+  return move closed
+}
+
+effect fn writtenTypeAt(builder: &Builder, ty: &Shared<Type>, hashed: u64) -> usize
+! OutOfMemoryError
+? &mut Allocator | &mut Types {
+  let written = List<Shared<Type>>.asSlice(&builder.written)
+  let mut at = InternIndex.first(&builder.writtenLookup, hashed)
+  while at != usize.MAX {
+    if run Type.equalsShared(&written[at], ty) { return at }
+    at = InternIndex.after(&builder.writtenLookup, at)
+  }
+  return usize.MAX
+}
+
+effect fn instanceView(builder: &mut Builder, body: &Shared<TypedBody>, id: BodyNodeId) -> View
 ! OutOfMemoryError
 ? &mut Allocator | &mut Types {
   let selected = view(body, id, List<ConstantValue>.asSlice(&builder.constants))
-  let bindings = List<Binding>.asSlice(&builder.bindings)
-  let projections = List<RuntimeProjection>.asSlice(&builder.projections)
   return match move selected {
     View.Integer {ty, literal, origin} => View.Integer {
-      ty: run RuntimeType.applyBindings(&ty, bindings, projections),
+      ty: run closedType(&mut builder.*, &ty),
       literal: literal,
       origin: origin,
     }
     View.Float {ty, literal, origin} => View.Float {
-      ty: run RuntimeType.applyBindings(&ty, bindings, projections),
+      ty: run closedType(&mut builder.*, &ty),
       literal: literal,
       origin: origin,
     }
     View.Text {ty, literal, origin} => View.Text {
-      ty: run Type.applyBindings(&ty, bindings, true),
+      ty: run Type.applyBindings(&ty, List<Binding>.asSlice(&builder.bindings), true),
       literal: literal,
       origin: origin,
     }
     View.Local {ty, index, origin} => View.Local {
-      ty: run RuntimeType.applyBindings(&ty, bindings, projections),
+      ty: run closedType(&mut builder.*, &ty),
       index: index,
       origin: origin,
     }
     View.Move {ty, value, release, origin} => View.Move {
-      ty: run RuntimeType.applyBindings(&ty, bindings, projections),
+      ty: run closedType(&mut builder.*, &ty),
       value: value,
       release: move release,
       origin: origin,
     }
     View.Borrow {ty, access, value, origin} => View.Borrow {
-      ty: run RuntimeType.applyBindings(&ty, bindings, projections),
+      ty: run closedType(&mut builder.*, &ty),
       access: access,
       value: value,
       origin: origin,
     }
     View.Dereference {ty, value, origin} => View.Dereference {
-      ty: run RuntimeType.applyBindings(&ty, bindings, projections),
+      ty: run closedType(&mut builder.*, &ty),
       value: value,
       origin: origin,
     }
     View.Field {ty, value, index, origin} => View.Field {
-      ty: run RuntimeType.applyBindings(&ty, bindings, projections),
+      ty: run closedType(&mut builder.*, &ty),
       value: value,
       index: index,
       origin: origin,
     }
     View.Index {ty, value, index, element, origin} => View.Index {
-      ty: run RuntimeType.applyBindings(&ty, bindings, projections),
+      ty: run closedType(&mut builder.*, &ty),
       value: value,
       index: index,
       element: element,
       origin: origin,
     }
     View.ArrayLength {ty, value, count, origin} => View.ArrayLength {
-      ty: run RuntimeType.applyBindings(&ty, bindings, projections),
+      ty: run closedType(&mut builder.*, &ty),
       value: value,
       count: count,
       origin: origin,
     }
     View.ArrayRepeat {ty, value, count, origin} => View.ArrayRepeat {
-      ty: run RuntimeType.applyBindings(&ty, bindings, projections), value: value, count: count, origin: origin,
+      ty: run closedType(&mut builder.*, &ty), value: value, count: count, origin: origin,
     }
     View.ArraySlice {ty, value, count, origin} => View.ArraySlice {
-      ty: run RuntimeType.applyBindings(&ty, bindings, projections), value: value, count: count, origin: origin,
+      ty: run closedType(&mut builder.*, &ty), value: value, count: count, origin: origin,
     }
     View.SliceLength {ty, value, origin} => View.SliceLength {
-      ty: run RuntimeType.applyBindings(&ty, bindings, projections), value: value, origin: origin,
+      ty: run closedType(&mut builder.*, &ty), value: value, origin: origin,
     }
     View.Aggregate {ty, node, count, origin} => View.Aggregate {
-      ty: run RuntimeType.applyBindings(&ty, bindings, projections),
+      ty: run closedType(&mut builder.*, &ty),
       node: node,
       count: count,
       origin: origin,
     }
     View.StagedCallable {ty, node, count, origin} => View.StagedCallable {
-      ty: run RuntimeType.applyBindings(&ty, bindings, projections), node: node, count: count, origin: origin,
+      ty: run closedType(&mut builder.*, &ty), node: node, count: count, origin: origin,
     }
     View.EnumMember {ty, member, origin} => View.EnumMember {
-      ty: run RuntimeType.applyBindings(&ty, bindings, projections), member: member, origin: origin,
+      ty: run closedType(&mut builder.*, &ty), member: member, origin: origin,
     }
     View.EnumValue {ty, value, origin} => View.EnumValue {
-      ty: run RuntimeType.applyBindings(&ty, bindings, projections), value: value, origin: origin,
+      ty: run closedType(&mut builder.*, &ty), value: value, origin: origin,
     }
     View.Match {ty, node, subject, place: placeMatch, consumes, release, tags, count, syntax, origin} => View.Match {
-      ty: run RuntimeType.applyBindings(&ty, bindings, projections), node: node, subject: subject, place: placeMatch, consumes: consumes,
+      ty: run closedType(&mut builder.*, &ty), node: node, subject: subject, place: placeMatch, consumes: consumes,
       release: move release, tags: tags, count: count, syntax: syntax, origin: origin,
     }
     View.VariantConstruct {ty, node, tag, count, origin} => View.VariantConstruct {
-      ty: run RuntimeType.applyBindings(&ty, bindings, projections), node: node, tag: tag, count: count, origin: origin,
+      ty: run closedType(&mut builder.*, &ty), node: node, tag: tag, count: count, origin: origin,
     }
     View.UnionWiden {ty, value, origin} => View.UnionWiden {
-      value: value, ty: run RuntimeType.applyBindings(&ty, bindings, projections), origin: origin,
+      value: value, ty: run closedType(&mut builder.*, &ty), origin: origin,
     }
     View.UnionInject {ty, source, tag, value, origin} => View.UnionInject {
-      ty: run RuntimeType.applyBindings(&ty, bindings, projections), source: move source, tag: tag, value: value, origin: origin,
+      ty: run closedType(&mut builder.*, &ty), source: move source, tag: tag, value: value, origin: origin,
     }
     View.PatternBinding {ty, node, subject, origin} => View.PatternBinding {
-      ty: run RuntimeType.applyBindings(&ty, bindings, projections), node: node, subject: subject, origin: origin,
+      ty: run closedType(&mut builder.*, &ty), node: node, subject: subject, origin: origin,
     }
     View.Prefix {ty, operation, operand, origin} => View.Prefix {
-      ty: run RuntimeType.applyBindings(&ty, bindings, projections),
+      ty: run closedType(&mut builder.*, &ty),
       operation: operation,
       operand: operand,
       origin: origin,
     }
     View.Infix {ty, operation, left, right, origin} => View.Infix {
-      ty: run RuntimeType.applyBindings(&ty, bindings, projections),
+      ty: run closedType(&mut builder.*, &ty),
       operation: operation,
       left: left,
       right: right,
@@ -10608,7 +10758,7 @@ effect fn instanceView(builder: &Builder, body: &Shared<TypedBody>, id: BodyNode
     }
     View.Call {ty, environment, foreign, variadicArguments, count, node, origin} => View.Call {
       environment: environment,
-      ty: run RuntimeType.applyBindings(&ty, bindings, projections),
+      ty: run closedType(&mut builder.*, &ty),
       foreign: move foreign,
       // Tail admission already requires closed primitive types, independent of instance binders.
       variadicArguments: move variadicArguments,
@@ -10617,27 +10767,27 @@ effect fn instanceView(builder: &Builder, body: &Shared<TypedBody>, id: BodyNode
       origin: origin,
     }
     View.Intrinsic {ty, member, node, origin} => View.Intrinsic {
-      ty: run RuntimeType.applyBindings(&ty, bindings, projections),
+      ty: run closedType(&mut builder.*, &ty),
       member: member,
       node: node,
       origin: origin,
     }
     View.Storage {ty, operation, node, origin} => View.Storage {
-      ty: run RuntimeType.applyBindings(&ty, bindings, projections), operation: operation, node: node, origin: origin,
+      ty: run closedType(&mut builder.*, &ty), operation: operation, node: node, origin: origin,
     }
-    View.Run {ty, value, origin} => View.Run {ty: run RuntimeType.applyBindings(&ty, bindings, projections), value: value, origin: origin}
+    View.Run {ty, value, origin} => View.Run {ty: run closedType(&mut builder.*, &ty), value: value, origin: origin}
     View.Fail {value, origin} => View.Fail {value: value, origin: origin}
     View.Boolean {value, origin} => View.Boolean {value: value, origin: origin}
     View.Unit {origin} => View.Unit {origin: origin}
     View.Embedded {value, ty, origin} => View.Embedded {
-      value: move value, ty: run RuntimeType.applyBindings(&ty, bindings, projections), origin: origin,
+      value: move value, ty: run closedType(&mut builder.*, &ty), origin: origin,
     }
     View.ForeignAddress {declaration, symbol, ty, origin} => View.ForeignAddress {
       declaration: Shared<DeclarationId>.clone(&declaration), symbol: Shared<Bytes>.clone(&symbol),
       ty: Shared<Type>.clone(&ty), origin: origin,
     }
     View.ForeignStatic {declaration, ty, origin} => View.ForeignStatic {
-      declaration: move declaration, ty: run RuntimeType.applyBindings(&ty, bindings, projections), origin: origin,
+      declaration: move declaration, ty: run closedType(&mut builder.*, &ty), origin: origin,
     }
     View.PlaceAssignment {target, value, origin} => View.PlaceAssignment {
       target: target,
@@ -10728,8 +10878,7 @@ fn resolvedCallOperand(builder: &Builder, node: BodyNodeId, index: usize) -> Opt
 }
 
 fn absurd<T>() -> T {
-  let boom = 1 / 0
-  return absurd<T>()
+  return Intrinsic.trap("an internal invariant failed")
 }
 
 fn copyOptionalType(value: &Option<Shared<Type>>) -> Option<Shared<Type>> {

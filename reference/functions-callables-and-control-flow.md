@@ -594,11 +594,11 @@ pipeline elaboration tests,
 
 ## Conditionals, loops, and transfers
 
-### IF-001 — `if` selects one statement branch using a boolean condition
+### IF-001 — `if` selects one branch using a boolean condition
 
 **Status:** Confirmed
 
-An `if` statement evaluates its condition exactly once. The condition must have type `bool`; Silk
+An `if` evaluates its condition exactly once. The condition must have type `bool`; Silk
 has no truthiness conversion. A true condition executes the first arm, while a false condition
 executes the `else` arm when present and otherwise continues after the statement.
 
@@ -613,10 +613,9 @@ fn choose(flag: bool) -> i32 {
 
 Only the selected arm executes. Chained `else if` uses the same rule in source order.
 
-**Boundary:** Bootstrap `if` is a statement, not a value-producing expression. A branch communicates
-a value by returning it, binding or mutating an outer place under ordinary ownership rules, or by
-continuing to a later expression. Code needing a value selected from exhaustive alternatives may use
-`match`.
+**Boundary:** An `if` in statement position produces no value; its branches are statement blocks,
+and a value left at the end of one is an ignored result under STMT-001. An `if` whose `else` chain
+ends in a final `else` may also be used as a value, as IF-002 describes.
 
 Pattern-conditioned `if let Pattern = expression { ... }` tests and destructures a value while
 introducing bindings only in the selected body. It remains distinct from ordinary boolean `if` and
@@ -629,12 +628,98 @@ in the right operand of `&&` or `||`. In both forms its failures, requirements, 
 the ordinary enclosing execution contract.
 
 **Diagnostics:** A non-boolean condition reports `SEM0011` at the condition and identifies its actual
-type. Invalid `if` use in expression position receives a parser diagnostic. Each arm retains its own
+type. An `if` without a final `else` in expression position reports `PAR0009` at the `if` keyword,
+as IF-002 describes. Each arm retains its own
 type, ownership, failure, and requirement diagnostics even though only one arm executes at runtime.
 
 **Evidence:** conditional syntax,
 conditional semantic facts,
 short-circuit boundary.
+
+### IF-002 — An `if` with a final `else` is a value
+
+**Status:** Confirmed
+
+An `if` whose `else` chain ends in a final `else { ... }` may appear wherever an expression is
+expected: a binding initializer, a return operand, an argument, a match arm, or an operand of
+another expression. Each branch is a value block under BLOCK-001, and the `if` produces the value
+of the branch that runs. `else if` and `else if let` links chain in source order, so a chain is a
+value only when its last link is a plain `else`.
+
+```silk
+fn sign(n: i32) -> i32 {
+  let result = if n > 0 { 1 } else if n < 0 { -1 } else { 0 }
+  return result
+}
+```
+
+`if let Pattern = expression { ... } else { ... }` is a value in the same way. Its bindings are in
+scope only in the first branch.
+
+```silk
+fn orZero(input: Option<i32>) -> i32 {
+  return if let Option<i32>.Some { value } = move input { value } else { 0 }
+}
+```
+
+The branch results join exactly like the arms of a match under MATCH-005: equal types keep that
+type, views that differ only in region join into one view, distinct nominal types form a
+normalized union, and a branch of type `never` contributes no member. An expected type, such as a
+binding annotation or a parameter type, is supplied to every branch before it is analyzed, so
+`let small: u8 = if flag { 1 } else { 2 }` types both literals as `u8`. Only the selected branch
+runs, and a branch that transfers with `return`, `break`, `continue` or `fail` skips the rest of
+the surrounding expression as a match arm does.
+
+**Boundary:** An `if` without a final `else` is not a value, because the path where every condition
+is false produces nothing. An `if` in statement position remains a statement under IF-001, even
+when it has a final `else`, so the values of its branches are ignored results. Static bodies do
+not evaluate `if` values.
+
+**Diagnostics:** An `if` without a final `else` in expression position reports `PAR0009` at the
+`if` keyword and suggests adding `else { ... }` or writing the `if` as a statement. Branch types
+that cannot join report `SEM0049`, and a branch that does not match an expected type reports the
+ordinary mismatch for that position.
+
+**Evidence:** conditional expression parser, conditional expression checking in the semantic
+pass, native corpus program `if-expression-values`.
+
+### BLOCK-001 — A value block yields its last expression
+
+**Status:** Confirmed
+
+A block whose value is used, which is a match arm block of a match used as a value or a branch of
+an `if` used as a value, runs its statements in order and then produces the value of its last
+expression. The last expression is the value when its type is neither `()` nor `never`; a trailing
+`if` with a final `else` in that place is itself checked as a value. The value is evaluated after
+the block's other statements and before the block's locals are cleaned up, so it may move a block
+local out but may not borrow one.
+
+```silk
+fn scaled(n: i32) -> i32 {
+  return match n {
+    0 => 0
+    _ => {
+      let doubled = n * 2
+      doubled + 1
+    }
+  }
+}
+```
+
+A block without such a last expression produces `()`, or `never` when every path transfers.
+
+**Boundary:** Blocks in statement position, including the arm blocks of a match used as a
+statement and the branches of a statement `if`, do not yield values; a non-unit last expression
+there is an ignored result under STMT-001. A borrow of a block local cannot leave the block, since
+the local ends at the closing brace.
+
+**Diagnostics:** A yielded value that does not match the expected type reports the ordinary
+mismatch for that position. A value left at the end of an arm block of a statement match reports
+`SEM0087` and suggests using the match as a value or dropping the value. A yielded borrow of a
+block local reports `OWN0019` at the use of the borrow.
+
+**Evidence:** value block checking in the semantic pass, block value lowering in MIR, native corpus
+program `if-expression-values`.
 
 ### LOOP-001 — `while` is a boolean pre-test loop
 
@@ -913,9 +998,10 @@ fn preserve(input: Left | Right) -> Left | Right {
 
 The result is the normalized union `Left | Right`, independent of arm order.
 
-Immediately after `=>`, braces introduce an ordinary statement block. Its statements execute in
-source order with the pattern bindings in scope. Reaching its closing brace produces `()`; the last
-statement does not become a result expression. A block whose paths all transfer has type `never`.
+Immediately after `=>`, braces introduce a block. Its statements execute in source order with the
+pattern bindings in scope. When the match is used as a value, the block is a value block under
+BLOCK-001 and produces its last expression. Otherwise reaching its closing brace produces `()`. A
+block whose paths all transfer has type `never`.
 A conditional return with a path to the closing brace still produces `()` on that path, and a
 `break` targeting a loop inside the block does not make the block non-completing.
 
@@ -944,9 +1030,10 @@ earlier temporaries are cleaned once in reverse acquisition order before the enc
 
 A `()` block arm joins another `()` arm; a `never` arm contributes no value to a scalar join.
 If every reachable path transfers, the entire match has type `never`. A completing block and an
-`i32` arm do not form a legal join and report `SEM0049` on the match. `{ 42 }` reports the ordinary
-unused-value diagnostic `SEM0087`; `{ drop 42 }` completes with `()`. Braces in other expression
-positions do not introduce block expressions.
+`i32` arm do not form a legal join and report `SEM0049` on the match. In a match used as a value,
+`{ 42 }` produces `42`. In a match used as a statement it reports the unused-value diagnostic
+`SEM0087`, and `{ drop 42 }` completes with `()`. Braces in other expression positions do not
+introduce block expressions.
 
 **Boundary:** Result joining does not convert any arm result or erase its ownership and lifetime
 properties. If a result type is unavailable or cannot legally be stored in the resulting union, the

@@ -21,6 +21,8 @@ close them.
 `Writer.writeVectored` sends several slices in one `writev` system call, up to eight slices for
 each call.
 
+WASI commands have one thread. Their standard error lock does not need host synchronization.
+
 Standard error has one lock for the whole process: the lock of the C library's `stderr` stream.
 Each `StderrWriter` write takes it for the duration of that write. `StderrWriter.lock` keeps
 it until the `LockedStderr` drops, and collects the writes in a small buffer that the caller
@@ -32,7 +34,7 @@ from several threads controls the order itself.
 `WriterError` if a write fails. Part of the bytes can be written already.
 
 ## Gotchas
-- The providers exist only on Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+- The providers exist on WASI, Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
 - The lock orders only writes that take it. A direct write to descriptor 2, such as one from
   `silk.native_descriptor`, can come between the parts of a locked message.
 

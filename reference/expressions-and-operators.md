@@ -218,20 +218,19 @@ expression remain attached to their original source.
 **Evidence:** [grouped expression parser](../bootstrap/packages/compiler/src/Parser.ts),
 [expression TIR](../bootstrap/packages/compiler/src/Tir.ts).
 
-### EXPR-004 — Assignment and bootstrap `if` are statements, not value expressions
+### EXPR-004 — Assignment is a statement, not a value expression
 
 **Status:** Confirmed
 
 `place = value` replaces storage as a statement. It produces no value that can be bound, returned,
-passed as an argument, or chained into another assignment. Bootstrap `if` likewise selects a
-statement arm rather than producing a value; use an exhaustive `match` when selection must produce
-a value.
+passed as an argument, or chained into another assignment. An `if` produces a value only when its
+`else` chain ends in a final `else`, as IF-002 describes.
 
 ```silk
 pub fn main() -> i32 {
   let mut value = 1
   value = 42
-  return value
+  return if value > 0 { value } else { 0 }
 }
 ```
 
@@ -240,18 +239,19 @@ pub fn main() -> i32 {
 ```silk,ignore
 let assigned = (value = 42)
 left = right = 42
-let selected = if flag { 1 } else { 2 }
+let selected = if flag { 1 }
 ```
 
 Assignment is distinct from equality: `value = 42` replaces a place, while `value == 42` is a
 boolean expression.
 
-**Diagnostics:** Using assignment or `if` where an expression is required receives a parser
-diagnostic at that form. Invalid assignment places and replacements receive the semantic diagnostics
-defined by the assignment rules later on this page.
+**Diagnostics:** Using assignment where an expression is required receives a parser diagnostic at
+that form, and an `if` without a final `else` there reports `PAR0009`. Invalid assignment places
+and replacements receive the semantic diagnostics defined by the assignment rules later on this
+page.
 
 **Evidence:** assignment syntax specification,
-[conditional statement rule](functions-callables-and-control-flow.md#if-001--if-selects-one-statement-branch-using-a-boolean-condition),
+[conditional value rule](functions-callables-and-control-flow.md#if-002--an-if-with-a-final-else-is-a-value),
 [assignment parser](../bootstrap/packages/compiler/src/Parser.ts).
 
 ### EXPR-005 — A non-unit expression result must be used or explicitly discarded
@@ -538,9 +538,32 @@ boundary.
 Bitwise operators do not perform arithmetic overflow, and explicit wrapping or saturating
 functions do not inherit the ordinary operator's trap policy.
 
+An operation that traps every time it runs is a compile-time error instead. In a runtime body,
+integer `/` or `%` whose right operand is the constant zero reports `SEM0248`, whatever the left
+operand is. Integer `+`, `-`, `*`, `/`, `%` or unary `-` whose operands are all constants and whose
+result is outside the type reports `SEM0247`, naming the operation, its exact value when that is
+known, and the type's range:
+
+```silk,ignore
+pub fn main() -> i32 {
+  let next: u8 = 255 + 1
+  return 10 / 0
+}
+```
+
+Here `255 + 1` reports `255 + 1 is 256, outside the u8 range, 0 through 255, so it always traps`,
+and `10 / 0` reports `SEM0248`. A constant operand is an integer literal, a constant declared by
+the toolchain or by another package, such as `i32.MAX`, or such an operation over constant operands.
+A constant declared in the same package stays a runtime read here: checking reads only its type, so
+an edit to its value alone never rechecks the bodies that read it. A local binding is never a
+constant operand, even when its initializer is one, so `let zero = 0` and `1 / zero` traps at run
+time. A `static` body reports the same operations through static evaluation instead. To stop a
+program on purpose, call `Intrinsic.trap("reason")`.
+
 **Diagnostics:** Valid operator types receive no compile-time diagnostic merely because a runtime
 value may trap. A runtime arithmetic trap identifies the source operation and retains its
-provenance consistently across supported targets.
+provenance consistently across supported targets. An operation over constant operands that always
+traps reports `SEM0247` for a result outside the type and `SEM0248` for a zero divisor.
 
 **Evidence:** integer operation specification,
 trapping MIR contract,

@@ -1,13 +1,15 @@
 //! A store that adopts another store's cache image checks unchanged modules without sweeping
-//! them, sweeps a changed module again, and reports what a cold store reports.
+//! them, sweeps a changed module again, and reports what a cold store reports. A changed
+//! package graph reaches the checks whose imports it resolves.
 
 import semantic.CacheImage as CacheImage {Image}
 import semantic.ModuleId {InvalidModulePath, ModuleId}
+import semantic.PackageGraph {PackageGraph}
 import semantic.Query { Cycle }
 import semantic.Rejection { Rejection }
-import semantic.Semantic { Adopted, Request, Semantic, Statistics }
-import semantic.SemanticCaseSupport { makeSemantic, module, present }
-import semantic.SourceIndex { RevisionMismatch }
+import semantic.Semantic { Adopted, Family, Request, Semantic, Statistics }
+import semantic.SemanticCaseSupport { makeSemantic, module, present, starts }
+import semantic.SourceIndex { Event as SourceEvent, EventKind as SourceEventKind, RevisionMismatch }
 import semantic.SourceRevision { Revision }
 import semantic.Types { TypeTable, Types }
 import silk.allocator { Allocator, OutOfMemoryError }
@@ -60,6 +62,17 @@ test effect fn adoptedChecksVerifyInsteadOfSweeping() -> ()
   return run adoptClaims() |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
+// The source queries that started, each of which parses one module.
+fn parses(events: &[SourceEvent]) -> usize {
+  let mut count = usize.ZERO
+  let mut at = usize.ZERO
+  while at < events.length {
+    if events[at].kind == SourceEventKind.QueryStart { count = count + usize.ONE }
+    at = at + usize.ONE
+  }
+  return count
+}
+
 effect fn storeOf(text: string<'static>) -> Semantic
   ! InvalidModulePath | OutOfMemoryError
   ? &mut Allocator {
@@ -94,8 +107,10 @@ effect fn adoptClaims() -> ()
   // The same sources: every check is reused, and nothing reruns.
   let mut warm = run storeOf(application())
   let adopted = run Semantic.adoptCache(&mut warm, &request, &image, true)
-  run Testing.expect(adopted.roots == 4 && adopted.stale == usize.ZERO && adopted.changedLeaves == usize.ZERO,
+  run Testing.expect(adopted.roots > 4 && adopted.stale == usize.ZERO && adopted.changedLeaves == usize.ZERO,
     "every clean check of unchanged sources is reused")
+  // The import's resolution is read from the package graph, so adoption parses no module.
+  run Testing.expect(parses(Semantic.sourceEvents(&warm)) == usize.ZERO, "adopting unchanged sources parses nothing")
   let warmFound = run checkBoth(&mut warm, &mut request)
   run Testing.expect(warmFound == usize.ZERO, "a warm check reports what the cold one did")
   run Testing.expect(Semantic.statistics(&warm).runs == usize.ZERO && coldRuns > usize.ZERO, "a warm check of unchanged sources runs nothing")
@@ -129,8 +144,11 @@ effect fn adoptClaims() -> ()
     "an unlinked store carries every check it reused")
   let onceFound = run checkBoth(&mut lone, &mut request)
   run Testing.expect(onceFound == coldEdited, "an unlinked partly warm check reports what a cold one does")
+  // As the driver writes it: a check written here rests on the carried ones it reused.
   let mut rewritten = run Semantic.cacheImage(&mut lone)
-  run CacheImage.carry(&mut rewritten, &image, Semantic.carried(&lone))
+  let nodes = run CacheImage.carry(&mut rewritten, &image, Semantic.carried(&lone))
+  run Semantic.imageCarriedChecks(&mut lone, &mut rewritten, List<usize>.asSlice(&nodes))
+  run Semantic.imageCarriedFiles(&mut lone, &mut rewritten)
   let mut rereading = run storeOf(edited())
   let reread = run Semantic.adoptCache(&mut rereading, &request, &rewritten, false)
   run Testing.expect(reread.stale == usize.ZERO && reread.roots == List<CacheImage.Root>.length(&rewritten.roots)
@@ -140,5 +158,439 @@ effect fn adoptClaims() -> ()
   drop run Semantic.adoptCache(&mut reverted, &request, &rewritten, false)
   let revertedFound = run checkBoth(&mut reverted, &mut request)
   run Testing.expect(revertedFound == usize.ZERO, "a revert after carrying reports what a cold check does")
+  return ()
+}
+
+fn twoNames() -> string<'static> {
+  return """
+import lb.lib { one }
+import l2.lib { two }
+pub fn main() -> i32 {
+  return one() + two()
+}
+"""
+}
+
+test effect fn adoptedChecksFollowThePackageGraph() -> ()
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut typeTable = TypeTable.make()
+  return run graphClaims() |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// The program that imports package `lb` under the name `lb` and, when `aliased`, also under `l2`;
+// `exported` is whether `lb` exports the module both import.
+effect fn packagedStore(aliased: bool, exported: bool) -> Semantic
+  ! InvalidModulePath | OutOfMemoryError
+  ? &mut Allocator {
+  let app = run ModuleId.make(b"memory", b"app@1.0.0", b"main.silk")
+  let library = run ModuleId.make(b"memory", b"lb@1.0.0", b"lib.silk")
+  let initial = run Revision.publish(&Revision.make(), &app, &run present(twoNames()))
+  let revision = run Revision.publish(&initial, &library,
+    &run present("pub fn one() -> i32 { return 1 }\npub fn two() -> i32 { return 2 }\n"))
+  let mut graph = PackageGraph.make(&app)
+  run PackageGraph.depend(&mut graph, b"app@1.0.0", b"lb", b"lb@1.0.0")
+  if aliased { run PackageGraph.depend(&mut graph, b"app@1.0.0", b"l2", b"lb@1.0.0") }
+  if exported { run PackageGraph.publish(&mut graph, b"lb@1.0.0", b"lib.silk") }
+  let mut store = makeSemantic(move revision)
+  Semantic.selectPackages(&mut store, move graph)
+  return move store
+}
+
+effect fn checkApp(store: &mut Semantic, request: &mut Request) -> usize
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let app = run ModuleId.make(b"memory", b"app@1.0.0", b"main.silk")
+  let checked = run Semantic.checkModule(&mut store.*, &mut request.*, &app, &Option<ModuleId>.none())
+  return List<Shared<Rejection>>.length(&checked.rejections)
+}
+
+// Checks a store of the graph `aliased` and `exported` select after it adopts `image`, and a cold
+// store of it, and gives whether both report the same nonzero count.
+effect fn warmMatchesCold(image: &Image, request: &mut Request, aliased: bool, exported: bool) -> bool
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let mut warm = run packagedStore(aliased, exported)
+  drop run Semantic.adoptCache(&mut warm, &request.*, image, false)
+  let warmFound = run checkApp(&mut warm, &mut request.*)
+  let mut cold = run packagedStore(aliased, exported)
+  let coldFound = run checkApp(&mut cold, &mut request.*)
+  return warmFound == coldFound && coldFound > usize.ZERO
+}
+
+effect fn graphClaims() -> ()
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator | &mut Types {
+  let mut request = Request.make()
+  let mut cold = run packagedStore(true, true)
+  let coldFound = run checkApp(&mut cold, &mut request)
+  run Testing.expect(coldFound == usize.ZERO, "a package imported under two names checks clean")
+  let image = run Semantic.cacheImage(&mut cold)
+
+  let mut same = run packagedStore(true, true)
+  drop run Semantic.adoptCache(&mut same, &request, &image, true)
+  let sameFound = run checkApp(&mut same, &mut request)
+  run Testing.expect(sameFound == usize.ZERO && Semantic.statistics(&same).runs == usize.ZERO,
+    "the same graph reuses every check")
+
+  // The other name of the package still loads it, so only the resolution of the dropped name
+  // tells the import apart.
+  let dropped = run warmMatchesCold(&image, &mut request, false, true)
+  run Testing.expect(dropped, "an import of a dependency name the graph no longer lists is unknown, as a cold check reports")
+  let internal = run warmMatchesCold(&image, &mut request, true, false)
+  run Testing.expect(internal, "a module the dependency no longer exports is internal, as a cold check reports")
+  return ()
+}
+
+test effect fn carriedChecksKeepTheFilesTheyRead() -> ()
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut typeTable = TypeTable.make()
+  return run carryClaims() |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// The two modules beside the program, which import nothing it imports.
+effect fn sideStore(text: string<'static>) -> Semantic
+  ! InvalidModulePath | OutOfMemoryError
+  ? &mut Allocator {
+  let app = run module("app.silk")
+  let shape = run module("shape.silk")
+  let extra = run module("extra.silk")
+  let tool = run module("tool.silk")
+  let first = run Revision.publish(&Revision.make(), &app, &run present(text))
+  let second = run Revision.publish(&first, &shape, &run present(library()))
+  let third = run Revision.publish(&second, &extra,
+    &run present("import tool { one }\npub fn two() -> i32 {\n  return one() + one()\n}\n"))
+  return makeSemantic(run Revision.publish(&third, &tool, &run present("pub fn one() -> i32 {\n  return 1\n}\n")))
+}
+
+effect fn checkAll(store: &mut Semantic, request: &mut Request) -> usize
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let extra = run module("extra.silk")
+  let tool = run module("tool.silk")
+  let found = run checkBoth(&mut store.*, &mut request.*)
+  let first = run Semantic.checkModule(&mut store.*, &mut request.*, &extra, &Option<ModuleId>.none())
+  let second = run Semantic.checkModule(&mut store.*, &mut request.*, &tool, &Option<ModuleId>.none())
+  return found + List<Shared<Rejection>>.length(&first.rejections) + List<Shared<Rejection>>.length(&second.rejections)
+}
+
+effect fn carryClaims() -> ()
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator | &mut Types {
+  let mut request = Request.make()
+  let mut cold = run sideStore(application())
+  let coldFound = run checkAll(&mut cold, &mut request)
+  run Testing.expect(coldFound == usize.ZERO, "the program and its side modules check clean")
+  let image = run Semantic.cacheImage(&mut cold)
+
+  // Only the program's check runs again, so no check here reads `extra`'s import or the
+  // `tool/mod.silk` it might have named, which does not exist.
+  let mut lone = run sideStore(edited())
+  drop run Semantic.adoptCache(&mut lone, &request, &image, false)
+  drop run checkAll(&mut lone, &mut request)
+  let mut rewritten = run Semantic.cacheImage(&mut lone)
+  drop run CacheImage.carry(&mut rewritten, &image, Semantic.carried(&lone))
+  run Semantic.imageCarriedFiles(&mut lone, &mut rewritten)
+  let mut again = run sideStore(edited())
+  let reread = run Semantic.adoptCache(&mut again, &request, &rewritten, false)
+  run Testing.expect(reread.changedLeaves == usize.ZERO && reread.stale == usize.ZERO,
+    "a carried check finds the sources it read unchanged again, a missing import candidate among them")
+  return ()
+}
+
+test effect fn adoptedDeclarationChecksSurviveASiblingEdit() -> ()
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut typeTable = TypeTable.make()
+  return run siblingClaims() |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// The image the driver writes after `store`, which adopted `read`, checked.
+effect fn rewrittenImage(store: &mut Semantic, read: &Image) -> Image
+  ! Cycle | OutOfMemoryError
+  ? &mut Allocator {
+  let mut rewritten = run Semantic.cacheImage(&mut store.*)
+  let mut carried = List<usize>.make()
+  let checks = Semantic.carried(&store.*)
+  let definitions = Semantic.carriedDefinitions(&store.*)
+  let mut at = usize.ZERO
+  while at < checks.length + definitions.length {
+    if at < checks.length { run List<usize>.append(&mut carried, checks[at]) }
+    else { run List<usize>.append(&mut carried, definitions[at - checks.length]) }
+    at = at + usize.ONE
+  }
+  let nodes = run CacheImage.carry(&mut rewritten, read, List<usize>.asSlice(&carried))
+  run Semantic.imageCarriedChecks(&mut store.*, &mut rewritten, List<usize>.asSlice(&nodes))
+  run Semantic.imageReplayedChecks(&store.*, &mut rewritten)
+  run Semantic.imageCarriedFiles(&mut store.*, &mut rewritten)
+  return move rewritten
+}
+
+effect fn pairStore(text: string<'static>) -> Semantic
+  ! InvalidModulePath | OutOfMemoryError
+  ? &mut Allocator {
+  let pair = run module("pair.silk")
+  return makeSemantic(run Revision.publish(&Revision.make(), &pair, &run present(text)))
+}
+
+effect fn checkPair(store: &mut Semantic, request: &mut Request) -> usize
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let pair = run module("pair.silk")
+  let checked = run Semantic.checkModule(&mut store.*, &mut request.*, &pair, &Option<ModuleId>.none())
+  return List<Shared<Rejection>>.length(&checked.rejections)
+}
+
+// A module whose second function is edited: its sweep runs again, but the first function's check
+// is reused, and so is its MIR in the replayed escape check, so the warm check types fewer bodies
+// than a cold one and reports what it reports.
+effect fn siblingClaims() -> ()
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator | &mut Types {
+  let mut request = Request.make()
+  let mut cold = run pairStore("pub fn first() -> i32 {\n  return 1\n}\npub fn second() -> i32 {\n  return 2\n}\n")
+  let coldFound = run checkPair(&mut cold, &mut request)
+  run Testing.expect(coldFound == usize.ZERO, "the pair checks clean")
+  let image = run Semantic.cacheImage(&mut cold)
+  let edited = "pub fn first() -> i32 {\n  return 1\n}\npub fn second() -> i32 {\n  return 2 + 3\n}\n"
+  let mut warm = run pairStore(edited)
+  let adopted = run Semantic.adoptCache(&mut warm, &request, &image, false)
+  let warmFound = run checkPair(&mut warm, &mut request)
+  let mut fresh = run pairStore(edited)
+  let freshFound = run checkPair(&mut fresh, &mut request)
+  run Testing.expect(adopted.stale > usize.ZERO && warmFound == freshFound,
+    "a sibling edit reports what a cold check does")
+  run Testing.expect(starts(Semantic.eventLog(&warm), Family.Body) < starts(Semantic.eventLog(&fresh), Family.Body),
+    "a sibling edit leaves the unchanged function's body unchecked")
+
+  // The sweep that ran again rests on the reused check's carried node, so the image the driver
+  // writes keeps it, and the next check of the same sources runs nothing.
+  let rewritten = run rewrittenImage(&mut warm, &image)
+  let mut again = run pairStore(edited)
+  let reread = run Semantic.adoptCache(&mut again, &request, &rewritten, false)
+  let againFound = run checkPair(&mut again, &mut request)
+  run Testing.expect(reread.stale == usize.ZERO && againFound == freshFound && Semantic.statistics(&again).runs == usize.ZERO,
+    "a sweep that reused a carried check is written on it and reused next")
+  return ()
+}
+
+test effect fn escapeRecordsOutliveABrokenEdit() -> ()
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut typeTable = TypeTable.make()
+  return run brokenClaims() |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// An edit that breaks a body makes the escape check report. It replays the walk up to the broken
+// body, lowering only what the edit reached, and records nothing; the image it writes still holds
+// the walk record it read, which the check replays once the body is fixed, lowering only the
+// fixed body's MIR.
+effect fn brokenClaims() -> ()
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator | &mut Types {
+  let mut request = Request.make()
+  let clean = "pub fn first() -> i32 {\n  return second()\n}\npub fn second() -> i32 {\n  return 2\n}\npub fn third() -> i32 {\n  return 3\n}\n"
+  let mut cold = run pairStore(clean)
+  let coldFound = run checkPair(&mut cold, &mut request)
+  run Testing.expect(coldFound == usize.ZERO, "the pair checks clean")
+  let image = run Semantic.cacheImage(&mut cold)
+  let broken = "pub fn first() -> i32 {\n  return second()\n}\npub fn second() -> i32 {\n  return true\n}\npub fn third() -> i32 {\n  return 3\n}\n"
+  let mut warm = run pairStore(broken)
+  drop run Semantic.adoptCache(&mut warm, &request, &image, false)
+  let warmFound = run checkPair(&mut warm, &mut request)
+  let mut fresh = run pairStore(broken)
+  let freshFound = run checkPair(&mut fresh, &mut request)
+  run Testing.expect(warmFound > usize.ZERO && warmFound == freshFound, "a broken body reports what a cold check does")
+  run Testing.expect(starts(Semantic.eventLog(&warm), Family.Mir) < starts(Semantic.eventLog(&fresh), Family.Mir),
+    "the broken check replays the walk instead of lowering every body again")
+  let rewritten = run rewrittenImage(&mut warm, &image)
+  let mut fixed = run pairStore(clean)
+  drop run Semantic.adoptCache(&mut fixed, &request, &rewritten, false)
+  let fixedFound = run checkPair(&mut fixed, &mut request)
+  let mut fixedCold = run pairStore(clean)
+  drop run checkPair(&mut fixedCold, &mut request)
+  run Testing.expect(fixedFound == usize.ZERO, "the fixed pair checks clean")
+  run Testing.expect(starts(Semantic.eventLog(&fixed), Family.Mir) < starts(Semantic.eventLog(&fixedCold), Family.Mir),
+    "the fix replays the walk the broken check kept instead of lowering every body again")
+  return ()
+}
+
+test effect fn staticEvaluationReadsOnlyItsDeclarations() -> ()
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut typeTable = TypeTable.make()
+  return run evaluationClaims() |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// `size` evaluates `width`, and `first`'s parameter and `third`'s call are checked against its
+// value. An edit to `second`, which neither reads, reuses the constant; an edit to `width`
+// reaches `third`'s check.
+fn evaluated(width: u8, second: u8) -> string<'static> {
+  if width == 5 {
+    return """static fn width() -> usize {
+  return 5
+}
+const size: usize = width()
+pub fn first(bytes: [u8; size]) -> u8 {
+  return bytes[0]
+}
+pub fn second() -> i32 {
+  return 2
+}
+pub fn third() -> u8 {
+  let bytes: [u8; 4] = [1, 2, 3, 4]
+  return first(bytes)
+}
+"""
+  }
+  if second == 3 {
+    return """static fn width() -> usize {
+  return 4
+}
+const size: usize = width()
+pub fn first(bytes: [u8; size]) -> u8 {
+  return bytes[0]
+}
+pub fn second() -> i32 {
+  return 2 + 3
+}
+pub fn third() -> u8 {
+  let bytes: [u8; 4] = [1, 2, 3, 4]
+  return first(bytes)
+}
+"""
+  }
+  return """static fn width() -> usize {
+  return 4
+}
+const size: usize = width()
+pub fn first(bytes: [u8; size]) -> u8 {
+  return bytes[0]
+}
+pub fn second() -> i32 {
+  return 2
+}
+pub fn third() -> u8 {
+  let bytes: [u8; 4] = [1, 2, 3, 4]
+  return first(bytes)
+}
+"""
+}
+
+effect fn evaluationClaims() -> ()
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator | &mut Types {
+  let mut request = Request.make()
+  let mut cold = run pairStore(evaluated(4, 2))
+  let coldFound = run checkPair(&mut cold, &mut request)
+  run Testing.expect(coldFound == usize.ZERO, "the evaluated pair checks clean")
+  let image = run Semantic.cacheImage(&mut cold)
+
+  let mut sibling = run pairStore(evaluated(4, 3))
+  drop run Semantic.adoptCache(&mut sibling, &request, &image, false)
+  let siblingFound = run checkPair(&mut sibling, &mut request)
+  let mut siblingCold = run pairStore(evaluated(4, 3))
+  let siblingColdFound = run checkPair(&mut siblingCold, &mut request)
+  run Testing.expect(siblingFound == usize.ZERO && siblingColdFound == usize.ZERO, "a sibling edit checks clean")
+  run Testing.expect(starts(Semantic.eventLog(&sibling), Family.Initializer) == usize.ZERO
+    && starts(Semantic.eventLog(&siblingCold), Family.Initializer) > usize.ZERO,
+    "a sibling edit reuses the evaluated constant")
+
+  let mut callee = run pairStore(evaluated(5, 2))
+  drop run Semantic.adoptCache(&mut callee, &request, &image, false)
+  let calleeFound = run checkPair(&mut callee, &mut request)
+  let mut calleeCold = run pairStore(evaluated(5, 2))
+  let calleeColdFound = run checkPair(&mut calleeCold, &mut request)
+  run Testing.expect(calleeColdFound > usize.ZERO && calleeFound == calleeColdFound,
+    "an edit to the evaluated function reports what a cold check does")
+  return ()
+}
+
+test effect fn cleanChecksSurviveMovedLines() -> ()
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut typeTable = TypeTable.make()
+  return run movedClaims() |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// The `Printable` head stores where it is written, so a line inserted above it moves what its check
+// rests on. The clean checks hold no position, so they are reused; a type error inserted with the
+// line is still reported where a cold check reports it, and the escape walk the image recorded
+// is replayed rather than walked again.
+effect fn movedClaims() -> ()
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator | &mut Types {
+  let mut request = Request.make()
+  let written = "pub interface Printable { fn print(value: &Self) -> i32 }\npub struct Document {}\nimpl Printable for Document { fn print(value: &Self) -> i32 { return 42 } }\npub fn first(value: &Document) -> i32 {\n  return value.print()\n}\n"
+  let mut cold = run pairStore(written)
+  let coldFound = run checkPair(&mut cold, &mut request)
+  run Testing.expect(coldFound == usize.ZERO, "the moved pair checks clean")
+  let image = run Semantic.cacheImage(&mut cold)
+  let moved = "\npub interface Printable { fn print(value: &Self) -> i32 }\npub struct Document {}\nimpl Printable for Document { fn print(value: &Self) -> i32 { return 42 } }\npub fn first(value: &Document) -> i32 {\n  return value.print()\n}\n"
+  let mut warm = run pairStore(moved)
+  let adopted = run Semantic.adoptCache(&mut warm, &request, &image, false)
+  let warmFound = run checkPair(&mut warm, &mut request)
+  run Testing.expect(adopted.changedLeaves > usize.ZERO && adopted.roots > usize.ZERO && warmFound == usize.ZERO,
+    "a moved line leaves the clean checks reused")
+  run Testing.expect(starts(Semantic.eventLog(&warm), Family.Body) == usize.ZERO, "a moved line checks no body again")
+  let broken = "pub fn second() -> i32 {\n  return true\n}\npub interface Printable { fn print(value: &Self) -> i32 }\npub struct Document {}\nimpl Printable for Document { fn print(value: &Self) -> i32 { return 42 } }\npub fn first(value: &Document) -> i32 {\n  return value.print()\n}\n"
+  let mut warmBroken = run pairStore(broken)
+  drop run Semantic.adoptCache(&mut warmBroken, &request, &image, false)
+  let warmBrokenFound = run checkPair(&mut warmBroken, &mut request)
+  let mut freshBroken = run pairStore(broken)
+  let freshBrokenFound = run checkPair(&mut freshBroken, &mut request)
+  run Testing.expect(freshBrokenFound > usize.ZERO && warmBrokenFound == freshBrokenFound,
+    "an error above the moved checks reports what a cold check does")
+
+  // An error that moves the head: the escape walk the image recorded is replayed, so only the
+  // broken body is lowered again.
+  let calling = "pub fn first(value: &Document) -> i32 {\n  return value.print()\n}\npub fn second() -> i32 {\n  return 2\n}\npub interface Printable { fn print(value: &Self) -> i32 }\npub struct Document {}\nimpl Printable for Document { fn print(value: &Self) -> i32 { return 42 } }\n"
+  let mut callingCold = run pairStore(calling)
+  let callingFound = run checkPair(&mut callingCold, &mut request)
+  run Testing.expect(callingFound == usize.ZERO, "the calling pair checks clean")
+  let callingImage = run Semantic.cacheImage(&mut callingCold)
+  let shifted = "pub fn first(value: &Document) -> i32 {\n  return value.print()\n}\npub fn second() -> i32 {\n  return true\n}\npub interface Printable { fn print(value: &Self) -> i32 }\npub struct Document {}\nimpl Printable for Document { fn print(value: &Self) -> i32 { return 42 } }\n"
+  let mut shiftedWarm = run pairStore(shifted)
+  drop run Semantic.adoptCache(&mut shiftedWarm, &request, &callingImage, false)
+  let shiftedFound = run checkPair(&mut shiftedWarm, &mut request)
+  let mut shiftedFresh = run pairStore(shifted)
+  let shiftedFreshFound = run checkPair(&mut shiftedFresh, &mut request)
+  run Testing.expect(shiftedFreshFound > usize.ZERO && shiftedFound == shiftedFreshFound,
+    "an error that moves a head reports what a cold check does")
+  run Testing.expect(starts(Semantic.eventLog(&shiftedWarm), Family.Mir) < starts(Semantic.eventLog(&shiftedFresh), Family.Mir),
+    "an error that moves a head replays the escape walk instead of lowering every body again")
+  return ()
+}
+
+test effect fn changedCalleeOfABrokenCallerReplays() -> ()
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut typeTable = TypeTable.make()
+  return run brokenCallerClaims() |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// `caller` is walked first and reaches `digest` before `digest` starts a walk of its own. An edit
+// to `digest`'s signature breaks `caller`, so the record names `digest` only below a body that now
+// lowers to nothing. The replay still lowers `digest` as the root it is, finds it summarizes as the
+// record says, and leaves `helper` and `other` alone.
+effect fn brokenCallerClaims() -> ()
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator | &mut Types {
+  let mut request = Request.make()
+  let written = "pub fn digest(left: i32, right: i32) -> bool {\n  return left == right\n}\npub fn helper() -> i32 {\n  return 1\n}\npub fn other() -> i32 {\n  return helper()\n}\npub fn caller() -> bool {\n  return digest(1, 2)\n}\n"
+  let mut cold = run pairStore(written)
+  let coldFound = run checkPair(&mut cold, &mut request)
+  run Testing.expect(coldFound == usize.ZERO, "the calling module checks clean")
+  let image = run Semantic.cacheImage(&mut cold)
+  let edited = "pub fn digest(left: i32, right: bool) -> bool {\n  return right\n}\npub fn helper() -> i32 {\n  return 1\n}\npub fn other() -> i32 {\n  return helper()\n}\npub fn caller() -> bool {\n  return digest(1, 2)\n}\n"
+  let mut warm = run pairStore(edited)
+  drop run Semantic.adoptCache(&mut warm, &request, &image, false)
+  let warmFound = run checkPair(&mut warm, &mut request)
+  let mut fresh = run pairStore(edited)
+  let freshFound = run checkPair(&mut fresh, &mut request)
+  run Testing.expect(freshFound > usize.ZERO && warmFound == freshFound, "a callee edit that breaks its caller reports what a cold check does")
+  run Testing.expect(starts(Semantic.eventLog(&warm), Family.Mir) < starts(Semantic.eventLog(&fresh), Family.Mir),
+    "a callee edit that breaks its caller replays the escape walk instead of lowering every body again")
   return ()
 }

@@ -186,8 +186,9 @@ Use the result as the sequence of a `static for`. Each element has the type
 
 #### Gotchas
 
-The list contains only the fields that are visible from the calling module. A private field of
-a type from another module is not in the list.
+The list contains only the `pub` fields, even when the caller is the module that declares
+`Owner`, because visibility is judged from `silk/reflect`. Call `Intrinsic.reflectFields<Owner>()`
+directly to list the fields that the calling module can see.
 
 <a id="Reflect.impl.typeKind"></a>
 
@@ -264,4 +265,4 @@ a field out of an owned value.
 
 Category: Core.
 
-Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.
+Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`.

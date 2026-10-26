@@ -11,7 +11,8 @@ Provide `OsFileSystem` for `FileSystem` in a native program. Code that uses file
 ## Details
 `OsFileSystem.make` takes a root directory of the host. The path `/` of the provider is that
 root, not the root of the host. A path cannot leave the root: `..` is not valid in a `Path`, and
-the provider does not follow symbolic links below the root.
+the native provider resolves a symbolic link below the root inside the root. An absolute link
+target starts again at the root, and `..` in a target never goes above it.
 
 The write operations are different:
 - `writeFile` creates or truncates the file, then writes. If it fails, a partial file can stay.
@@ -26,6 +27,8 @@ file, so the permissions, owner, extended attributes, and hard links of the old 
 kept. A synchronized atomic write calls `fsync` on the file before the rename, and on the
 directory after it. `syncDirectory` also uses `fsync`. These do not use `F_FULLFSYNC`, and do
 not promise that data survives a power loss.
+
+On WASI, roots name preopened guest directories. The host controls rights, file permissions, and synchronization support.
 
 Directory listings are sorted by the bytes of the paths. A native error becomes a `FileError`
 with a portable reason and the native code.
@@ -42,7 +45,7 @@ with a portable reason and the native code.
   that renames those directories, changes mounts, or changes the temporary files.
 - After `writeFileAtomic` fails with a published error, the new contents are visible. Do not
   write again without a check.
-- The provider exists only on Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+- The provider exists on WASI, Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
 
 ## Examples
 ### Write and read a file in a temporary directory

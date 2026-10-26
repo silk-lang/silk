@@ -327,8 +327,8 @@ It includes:
   formatting, and checked arithmetic for every scalar type.
 - **Systems:** files, child processes, sockets, clocks, randomness, single-threaded fibers and
   schedulers, and WebAssembly start-up.
-- **Data:** JSON and TOML, Base64, URIs, and Zstandard and DEFLATE/gzip decoding.
-- **Network:** an HTTP client and server, a WebSocket server, connection pooling, and TLS with X.509
+- **Data:** JSON and TOML, Base64, URIs, LZMA/LZMA2, XZ, and Zstandard decoding, and DEFLATE/zlib/gzip encoding and decoding.
+- **Network:** HTTP/1.x and HTTP/2 clients and servers, HPACK, a WebSocket server, connection pooling, and TLS with X.509
   certificate path validation.
 - **Crypto:** SHA-1, SHA-2 and SHA-3, HMAC, HKDF, AES-GCM, ChaCha20-Poly1305, X25519, and ECDSA
   P-256 and RSA signature verification.
@@ -337,7 +337,10 @@ It includes:
 
 Native hosts are Apple Silicon macOS (`aarch64-apple-darwin`), x86-64 Linux
 (`x86_64-unknown-linux-gnu`) and ARM64 Linux (`aarch64-unknown-linux-gnu`). WebAssembly
-(`wasm32-unknown-unknown`) is an output target.
+(`wasm32-unknown-unknown`) is a freestanding output target. WASI commands target
+`wasm32-wasip1` (core modules) or `wasm32-wasip2` (components). Preview 2 also supports
+TCP, UDP, DNS, HTTP clients and servers, and custom WIT worlds. See the
+[WASI guide](reference/wasi.md) for build tools, runtime commands, and host services.
 
 ## Status
 

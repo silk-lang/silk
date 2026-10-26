@@ -469,6 +469,26 @@ SystemResources
 
 The system did not have the resources, such as memory, for the lookup.
 
+<a id="ResolverError.Provider"></a>
+
+### `Provider`
+
+```silk
+Provider
+```
+
+A host resolver failed with a provider-specific code, such as a WASI network error ordinal.
+
+<a id="ResolverError.Provider.code"></a>
+
+#### Field `code`
+
+```silk
+pub code: i32
+```
+
+The code reported by the provider. Its provider module defines the domain.
+
 <a id="ResolverError.LimitExceeded"></a>
 
 ### `LimitExceeded`
@@ -855,4 +875,4 @@ most the `maxResults` of the request, and never more than 64.
 
 Category: Networking.
 
-Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.
+Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`.

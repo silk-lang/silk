@@ -656,4 +656,49 @@ sleep 60`,
       })
     }),
   )
+
+  it.effect(
+    'builds a profile-guided output from a training run that never writes the snapshot',
+    () =>
+      fixture(function* ({ root, options }) {
+        // The producer's generation trains on a check and an IR emission, then smokes as usual.
+        executable(
+          options.producer,
+          `test "$1" = build && test "$3" = -o || exit 91
+printf '%s %s\\n' "\${SILK_CLANG##*/}" "\${4##*/}" >> "$0.invocations"
+cat > "$4" <<'N1'
+#!/bin/sh
+if test "$1" = check; then
+  test -f silk.toml && test -n "$LLVM_PROFILE_FILE" || exit 94
+  : > "$LLVM_PROFILE_FILE"; mkdir -p ../build; exit 0
+fi
+test "$1" = build && test "$3" = -o || exit 93
+if test "$6" = llvm-ir; then test -n "$LLVM_PROFILE_FILE" || exit 95; : > "$LLVM_PROFILE_FILE"; printf 'IR' > "$4"; exit 0; fi
+cat > "$4" <<'SMOKE'
+#!/bin/sh
+exit 42
+SMOKE
+chmod +x "$4"
+N1
+chmod +x "$4"`,
+        )
+        executable(
+          join(root, 'llvm-profdata'),
+          'test "$1" = merge && test "$2" = -o && test "$#" = 5 || exit 96\nprintf profile > "$3"',
+        )
+        const result = yield* fixtureBuild({ ...options, profileGuided: true })
+        assert.strictEqual(result.status, 'passed')
+        assert.strictEqual(result.profile.profileGuided, true)
+        assert.match(result.stages[0].command[0], /\/\.github\/scripts\/profile-guided-build\.sh$/)
+        assert.deepStrictEqual(
+          readFileSync(`${options.producer}.invocations`, 'utf8').split('\n').filter(Boolean),
+          ['clang-generate instrumented', 'clang-use N1'],
+        )
+        const work = join(options.outputDirectory, 'profile-guided')
+        assert.strictEqual(readFileSync(join(work, 'compiler.profdata'), 'utf8'), 'profile')
+        assert.match(readFileSync(join(work, 'clang-use'), 'utf8'), /-fprofile-use=/)
+        assert.strictEqual(existsSync(join(work, 'training/build')), true)
+        assert.strictEqual(existsSync(join(options.snapshot, 'build')), false)
+      }),
+  )
 })

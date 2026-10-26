@@ -6,6 +6,7 @@
 
 import semantic.Types {Types}
 import hir.Hir {OwnerKind}
+import semantic.ContentHash {ContentHash}
 import semantic.DeclarationId {DeclarationId}
 import semantic.InternIndex {InternIndex}
 import semantic.Lifetime {Numbering, CanonicalizationFailure}
@@ -17,6 +18,7 @@ import silk.allocator {Allocator, OutOfMemoryError}
 import silk.bytes {Bytes}
 import silk.hash {Hash}
 import silk.option {Option}
+import silk.ownership {Copy}
 import silk.result {Result}
 import silk.pointer {Pointer}
 import silk.shared {Shared}
@@ -50,17 +52,20 @@ pub union InstanceKey {
   Helper {pub creator: Shared<InstanceKey>, pub node: usize, pub ordinal: usize, pub purpose: HelperRole},
 }
 
-/// A key's unbounded identity encodings, each computed on its first comparison and shared by
-/// every copy of the key. The key's content never changes, so neither does an encoding.
+/// The digests of a key's unbounded identity encodings, each computed on its first use and shared
+/// by every copy of the key. The key's content never changes, so neither does a digest. Keeping
+/// digests rather than the encodings keeps a key small however deep its types are.
 struct KeyEncodings {
-  /// [`InstanceKey.encoding`], which [`InstanceKey.sameApplication`] compares.
-  exact: Option<Bytes>,
-  /// The encoding with every region erased, which [`InstanceKey.sameInstance`] compares.
-  code: Option<Bytes>,
+  /// The digest of [`InstanceKey.exactIdentity`], which [`InstanceKey.sameApplication`] compares
+  /// and build records name the key by.
+  exact: Option<ContentHash>,
+  /// The digest of the encoding with every region erased, which [`InstanceKey.sameInstance`]
+  /// compares.
+  code: Option<ContentHash>,
 }
 
 effect fn emptyEncodings() -> Shared<KeyEncodings> ! OutOfMemoryError ? &mut Allocator {
-  return run Shared<KeyEncodings>.make(KeyEncodings {exact: Option<Bytes>.none(), code: Option<Bytes>.none()})
+  return run Shared<KeyEncodings>.make(KeyEncodings {exact: Option<ContentHash>.none(), code: Option<ContentHash>.none()})
 }
 
 /// What an erased helper does.
@@ -233,12 +238,14 @@ impl InstanceKey {
       if !search || !Numbering.next(&mut numbering) { break }
     }
     // The chosen record is the key's exact encoding: the budget only charges bytes, so the record
-    // equals what [`InstanceKey.encoding`] computes. Seeding the cache spares the first exact
+    // equals what [`InstanceKey.encoding`] computes. Seeding the digest spares the first exact
     // comparison of this key from encoding it again.
     if let Option<InstanceKey>.Some {value: chosen} = &best {
       if let Option<Shared<KeyEncodings>>.Some {value: cache} = move encodingsOf(&chosen) {
+        let runtime = run InstanceKey.runtimeEncoding(&chosen)
+        let digest = run identityOf(Bytes.asSlice(&runtime), Bytes.asSlice(&bestRecord))
         Shared<KeyEncodings>.withMut<()>(&cache, fn(encodings: &mut KeyEncodings) -> () {
-          encodings.exact = Option<Bytes>.some(move bestRecord)
+          encodings.exact = Option<ContentHash>.some(digest)
         })
       }
     }
@@ -489,7 +496,7 @@ impl InstanceKey {
     if !InstanceKey.sameRuntimeBase(self, other) { return false }
     // Backend identity is this complete canonical content. Use the same equality at query
     // interning, discovery and references so equivalent keys always name the same definition.
-    return run sameEncoding(self, other, true)
+    return run sameDigest(self, other, true)
   }
   /// The bytes [`sameApplication`] compares: the erased family's bytes, then the exact encoding,
   /// each length-delimited. Two keys have the same bytes exactly when `sameApplication` holds, so
@@ -498,23 +505,16 @@ impl InstanceKey {
     let mut output = Bytes.make()
     let runtime = run InstanceKey.runtimeEncoding(self)
     run RuntimeEncoding.field(&mut output, Bytes.asSlice(&runtime))
-    if let Option<Shared<KeyEncodings>>.Some {value: cache} = move encodingsOf(self) {
-      run fillEncoding(self, &cache, true)
-      // The cached bytes are taken out while they are copied, since copying allocates.
-      let taken = Shared<KeyEncodings>.withMut<Option<Bytes>>(&cache, fn(encodings: &mut KeyEncodings) -> Option<Bytes> {
-        return Intrinsic.replace(encodings.exact, Option<Bytes>.none())
-      })
-      if let Option<Bytes>.Some {value: exact} = move taken {
-        run RuntimeEncoding.field(&mut output, Bytes.asSlice(&exact))
-        Shared<KeyEncodings>.withMut<()>(&cache, fn(encodings: &mut KeyEncodings) -> () {
-          encodings.exact = Option<Bytes>.some(move exact)
-        })
-      }
-      return move output
-    }
     let exact = run InstanceKey.encoding(self)
     run RuntimeEncoding.field(&mut output, Bytes.asSlice(&exact))
     return move output
+  }
+  /// The `ContentHash` of [`exactIdentity`], computed once per key and kept with it.
+  pub effect fn identityDigest(self: &Self) -> ContentHash ! OutOfMemoryError ? &mut Allocator {
+    if let Option<Shared<KeyEncodings>>.Some {value: cache} = move encodingsOf(self) {
+      return run cachedDigest(self, &cache, true)
+    }
+    return ContentHash.of(Bytes.asSlice(&run InstanceKey.exactIdentity(self)))
   }
   /// Backend identity: one definition, body and symbol for every region pattern of an
   /// application. Sealed heads cannot select by region (IMPL-007), so lifetimes never decide
@@ -522,7 +522,7 @@ impl InstanceKey {
   pub effect fn sameInstance(self: &Self, other: &InstanceKey) -> bool
   ! OutOfMemoryError ? &mut Allocator {
     if !InstanceKey.sameRuntimeBase(self, other) { return false }
-    return run sameEncoding(self, other, false)
+    return run sameDigest(self, other, false)
   }
   /// Returns a hash that two keys share whenever [`sameRuntimeBase`], [`sameInstance`] or
   /// [`sameApplication`] reports them equal: the erased family's cached bytes or an export's symbol.
@@ -715,13 +715,53 @@ impl InstanceKey {
   }
   /// Fixed-width digest of canonical content. Interning and equality compare full bytes.
   pub effect fn contentName(bytes: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
-    let first = InternIndex.hashBytes(Hash.mix(&Hash.seed(0), 0), bytes)
-    let second = InternIndex.hashBytes(Hash.mix(&Hash.seed(1), 0), bytes)
     let mut result = run Bytes.copy(b"silk_")
-    run appendHex(&mut result, first)
-    run appendHex(&mut result, second)
+    run appendHex(&mut result, InternIndex.hashBytes(Hash.mix(&Hash.seed(0), 0), bytes))
+    run appendHex(&mut result, secondHalf(bytes))
     return move result
   }
+  /// The digest [`InstanceKey.runtimeName`] spells, for a key that is not a C export: two keys'
+  /// orders compare as their names do. An export is named by its symbol and has none.
+  pub effect fn nameOrder(self: &Self) -> Option<NameOrder> ! OutOfMemoryError ? &mut Allocator {
+    return match &self.* {
+      InstanceKey.Export {..} => Option<NameOrder>.none()
+      InstanceKey.Function {family, runtime, ..} => Option<NameOrder>.some(NameOrder {
+        first: family, second: Shared<Bytes>.with<u64>(&runtime, secondHash),
+      })
+      InstanceKey.DropGlue {family, runtime, ..} => Option<NameOrder>.some(NameOrder {
+        first: family, second: Shared<Bytes>.with<u64>(&runtime, secondHash),
+      })
+      InstanceKey.Helper {..} => {
+        let runtime = run InstanceKey.runtimeEncoding(self)
+        return Option<NameOrder>.some(NameOrder {first: familyHash(&runtime), second: secondHash(&runtime)})
+      }
+    }
+  }
+}
+
+/// The two halves of a key's [`InstanceKey.runtimeName`] digest.
+pub struct NameOrder {
+  pub first: u64,
+  pub second: u64,
+}
+
+impl Copy for NameOrder {}
+
+impl NameOrder {
+  /// Whether the name `left` stands for sorts before the name `right` stands for: names spell
+  /// each half in fixed-width hexadecimal, so they compare as the halves do.
+  pub fn before(left: NameOrder, right: NameOrder) -> bool {
+    if left.first != right.first { return left.first < right.first }
+    return left.second < right.second
+  }
+}
+
+fn secondHalf(bytes: &[u8]) -> u64 {
+  return InternIndex.hashBytes(Hash.mix(&Hash.seed(1), 0), bytes)
+}
+
+fn secondHash(runtime: &Bytes) -> u64 {
+  return secondHalf(Bytes.asSlice(runtime))
 }
 
 // The cached encodings of a function or drop glue key; other keys are cheap to encode.
@@ -733,23 +773,37 @@ fn encodingsOf(key: &InstanceKey) -> Option<Shared<KeyEncodings>> {
   }
 }
 
-// The unbounded encoding `exact` selects, from scratch.
-effect fn freshEncoding(key: &InstanceKey, exact: bool) -> Bytes ! OutOfMemoryError ? &mut Allocator {
-  if exact { return run InstanceKey.encoding(key) }
+// The digest of the unbounded encoding `exact` selects, from scratch: [`InstanceKey.exactIdentity`]
+// when `exact`, otherwise the region-erased code encoding.
+effect fn freshDigest(key: &InstanceKey, exact: bool) -> ContentHash ! OutOfMemoryError ? &mut Allocator {
+  if exact { return ContentHash.of(Bytes.asSlice(&run InstanceKey.exactIdentity(key))) }
   let mut coordinates = RuntimeEncoding.codeCoordinates()
-  return run InstanceKey.encodingAt(key, &mut coordinates)
+  return ContentHash.of(Bytes.asSlice(&run InstanceKey.encodingAt(key, &mut coordinates)))
 }
 
-// Fills the cached encoding `exact` selects, unless an earlier comparison already did.
-effect fn fillEncoding(key: &InstanceKey, cache: &Shared<KeyEncodings>, exact: bool) -> () ! OutOfMemoryError ? &mut Allocator {
-  let present = Shared<KeyEncodings>.with<bool>(cache, fn(encodings: &KeyEncodings) -> bool {
-    return selectedEncoding(encodings, exact).length > usize.ZERO
+// The digest [`InstanceKey.exactIdentity`] has for these two encodings.
+effect fn identityOf(runtime: &[u8], exact: &[u8]) -> ContentHash ! OutOfMemoryError ? &mut Allocator {
+  let mut output = Bytes.make()
+  run RuntimeEncoding.field(&mut output, runtime)
+  run RuntimeEncoding.field(&mut output, exact)
+  return ContentHash.of(Bytes.asSlice(&output))
+}
+
+// The digest `exact` selects, computed into `cache` unless an earlier use already did.
+effect fn cachedDigest(key: &InstanceKey, cache: &Shared<KeyEncodings>, exact: bool) -> ContentHash
+! OutOfMemoryError ? &mut Allocator {
+  let kept = Shared<KeyEncodings>.with<Option<ContentHash>>(cache, fn(encodings: &KeyEncodings) -> Option<ContentHash> {
+    let mut held = &encodings.code
+    if exact { held = &encodings.exact }
+    if let Option<ContentHash>.Some {value} = &held.* { return Option<ContentHash>.some(value) }
+    return Option<ContentHash>.none()
   })
-  if present { return () }
-  let computed = run freshEncoding(key, exact)
+  if let Option<ContentHash>.Some {value} = move kept { return value }
+  let computed = run freshDigest(key, exact)
   Shared<KeyEncodings>.withMut<()>(cache, fn(encodings: &mut KeyEncodings) -> () {
-    if exact { encodings.exact = Option<Bytes>.some(move computed) } else { encodings.code = Option<Bytes>.some(move computed) }
+    if exact { encodings.exact = Option<ContentHash>.some(computed) } else { encodings.code = Option<ContentHash>.some(computed) }
   })
+  return computed
 }
 
 fn cacheAddress(cache: &Shared<KeyEncodings>) -> usize {
@@ -758,40 +812,23 @@ fn cacheAddress(cache: &Shared<KeyEncodings>) -> usize {
   })
 }
 
-// The cached encoding `exact` selects; empty until filled. A filled encoding is never empty: every
-// unbounded encoding starts with its record field.
-fn selectedEncoding(encodings: &KeyEncodings, exact: bool) -> &[u8] {
-  if exact {
-    if let Option<Bytes>.Some {value} = &encodings.exact { return Bytes.asSlice(&value) }
-    return b""
-  }
-  if let Option<Bytes>.Some {value} = &encodings.code { return Bytes.asSlice(&value) }
-  return b""
-}
-
-fn sameCached(left: &Shared<KeyEncodings>, right: &Shared<KeyEncodings>, exact: bool) -> bool {
-  return Shared<KeyEncodings>.with<bool>(left, fn(first: &KeyEncodings) -> bool {
-    return Shared<KeyEncodings>.with<bool>(right, fn(second: &KeyEncodings) -> bool {
-      return RuntimeEncoding.equals(selectedEncoding(first, exact), selectedEncoding(second, exact))
-    })
-  })
-}
-
-// Whether two keys have one unbounded encoding: [`InstanceKey.encoding`] when `exact`, otherwise the
-// region-erased code encoding. Function and drop glue keys encode once and compare their caches.
-effect fn sameEncoding(left: &InstanceKey, right: &InstanceKey, exact: bool) -> bool ! OutOfMemoryError ? &mut Allocator {
+// Whether two keys have one unbounded encoding: [`InstanceKey.exactIdentity`] when `exact`,
+// otherwise the region-erased code encoding. Two encodings are the same when their 128-bit
+// digests are, as for every content the build cache names. Function and drop glue keys digest
+// once and compare their caches.
+effect fn sameDigest(left: &InstanceKey, right: &InstanceKey, exact: bool) -> bool ! OutOfMemoryError ? &mut Allocator {
   if let Option<Shared<KeyEncodings>>.Some {value: first} = move encodingsOf(left) {
     if let Option<Shared<KeyEncodings>>.Some {value: second} = move encodingsOf(right) {
       // Copies of one key share its cache, and two borrows of one cache would trap.
       if cacheAddress(&first) == cacheAddress(&second) { return true }
-      run fillEncoding(left, &first, exact)
-      run fillEncoding(right, &second, exact)
-      return sameCached(&first, &second, exact)
+      let one = run cachedDigest(left, &first, exact)
+      let other = run cachedDigest(right, &second, exact)
+      return one.high == other.high && one.low == other.low
     }
   }
-  let first = run freshEncoding(left, exact)
-  let second = run freshEncoding(right, exact)
-  return RuntimeEncoding.equals(Bytes.asSlice(&first), Bytes.asSlice(&second))
+  let one = run freshDigest(left, exact)
+  let other = run freshDigest(right, exact)
+  return one.high == other.high && one.low == other.low
 }
 
 // Whether two package helpers' creators share one erased family.
@@ -860,8 +897,7 @@ fn sameRuntimeRight(first: &Bytes, right: &Shared<Bytes>) -> bool {
 
 
 fn absurd<T>() -> T {
-  let boom = 1 / 0
-  return absurd<T>()
+  return Intrinsic.trap("an internal invariant failed")
 }
 
 fn failedKey(numbering: &Numbering) -> Result<InstanceKey, CanonicalizationFailure> {

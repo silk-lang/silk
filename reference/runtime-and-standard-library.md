@@ -737,6 +737,9 @@ reachable specialized operations.
 
 Each execution target implements the selected foreign ABI and every reachable intrinsic contract
 through target instructions, compiler-emitted helpers, or a linked support object.
+The C boundary includes by-value `extern "C" struct` arguments and results on GNU x86-64,
+GNU and Apple ARM64, and wasm32. Direct calls, native callbacks and exported thunks follow the
+target's register and memory rules described in the [native pointer boundary](native-pointer-boundary.md#layout-and-verification).
 Those contracts are the supported boundary. The raw symbols, calling conventions, layouts, and
 helper structure beneath them may be compiler-versioned and may change whenever lowering, intrinsic
 contracts, or target support changes.
@@ -1228,7 +1231,7 @@ The following are deliberately outside the first stable model:
 - target-conditional source and module-level availability annotations;
 - compiler-selected or overridable default service providers;
 - optional service requirements, including absence, selection, and entry-closure semantics;
-- a stable by-value aggregate ABI and user-selected runtime implementations;
+- user-selected runtime implementations;
 - runtime suspension, concurrency, scheduler/executor selection, async I/O, richer streams,
   networking, and entropy facilities beyond the currently shipped providers;
 - alternative standard-library profiles or “no-stdlib” project configuration in the official
