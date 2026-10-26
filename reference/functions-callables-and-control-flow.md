@@ -137,6 +137,11 @@ the function into every caller it can, whatever its size. `with Intrinsic.inline
 never to inline the function, which keeps a rarely taken path out of its callers. The clause takes
 no arguments and does not change what the function computes.
 
+A function without a clause that takes a parameter written as a callable type (`fn(A) -> B`) or as
+an `Effect<...>` is treated as if it carried `with Intrinsic.inline()`. Such a function, like
+`Effect.map`, mostly calls its argument, and inlining it lets the optimizer run that argument's code
+in place. Its own `with Intrinsic.inlineNever()` or `with Intrinsic.inlineAlways()` still decides.
+
 **Boundary:** The clause is a request to the optimizer. A debug build compiles each module apart,
 so a call into another module is not inlined there. A recursive call is never inlined into itself.
 A `static fn`, an `extern` or `export` function and an interface or service operation take no
@@ -149,7 +154,8 @@ function is not supported.
 **Current compiler:** Aligned. The function's LLVM definition carries `inlinehint`,
 `alwaysinline` or `noinline`.
 
-**Evidence:** `corpus/native/function-inline-clauses`, `corpus/invalid/function-inline-clauses-invalid`.
+**Evidence:** `corpus/native/function-inline-clauses`, `corpus/invalid/function-inline-clauses-invalid`,
+`failureSlotsEndOnTheirCallsSuccessEdge`.
 
 ### CALL-001 — A call evaluates each argument once from left to right
 
