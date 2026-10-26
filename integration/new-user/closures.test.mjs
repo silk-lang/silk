@@ -52,30 +52,30 @@ test('passing a once bound method without move asks for move', () => {
 const borrowingAdder = 'fn adder(n: i32) -> fn<\'static>(i32) -> i32 {\n  let base = Counter { count: n }\n  return fn(x: i32) -> i32 {\n    return x + base.peek()\n  }\n}'
 const adder = 'fn adder(n: i32) -> fn<\'static>(i32) -> i32 {\n  return fn(x: i32) -> i32 {\n    return x + n\n  }\n}'
 
-test('returning a closure that borrows a local names the local', { todo: 'finding 148' }, () => {
+test('returning a closure that borrows a local names the local', () => {
   const result = check(variant(adder, borrowingAdder))
   assert.match(result.stderr, /error\[OWN0018\]/)
   assert.match(result.stderr, /`base`/)
 })
 
-test('a callable result without a lifetime suggests fn<\'static>', { todo: 'finding 148' }, () => {
+test('a callable result without a lifetime suggests fn<\'static>', () => {
   const result = check(variant("fn adder(n: i32) -> fn<'static>(i32) -> i32 {", 'fn adder(n: i32) -> fn(i32) -> i32 {'))
   assert.match(result.stderr, /error\[SEM0210\]/)
   assert.match(result.stderr, /fn<'static>/)
 })
 
-test('a use after a consuming bound method names the binding', { todo: 'finding 148' }, () => {
+test('a use after a consuming bound method names the binding', () => {
   const result = check(variant('let finish = counter.finish', 'let finish = counter.finish\n  let after = counter.peek()'))
   assert.match(result.stderr, /error\[OWN0001\] counter was moved/)
 })
 
-test('assigning a different function to a callable binding says each function has its own type', { todo: 'finding 148' }, () => {
+test('assigning a different function to a callable binding says each function has its own type', () => {
   const result = check(variant('let finish = counter.finish', 'let mut finish = counter.finish\n  finish = counter.peek'))
   assert.match(result.stderr, /error\[SEM0037\]/)
   assert.doesNotMatch(result.stderr, /An assigned value whose type mismatches its place/)
 })
 
-test('an ignored call result hints drop', { todo: 'finding 149' }, () => {
+test('an ignored call result hints drop', () => {
   const result = check(variant('drop bump(2)', 'bump(2)'))
   assert.match(result.stderr, /error\[SEM0087\].*`drop/)
 })
