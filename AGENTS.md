@@ -34,6 +34,15 @@ behavior, data format, build artifact, or internal representation is a compatibi
   exact failure and whether it predates the change.
 - Open a draft PR as soon as there is a coherent commit, and reuse the task's PR. Run the cheapest
   relevant checks locally; do not rerun the CI-covered suite as handoff ceremony.
+- Changesets (`.changes/<random>.md`, written by `silk change`) become the release notes, one
+  list item each. Write the summary as one line saying what changed for users, such as "Add
+  `List.reserveExact`." Details belong in the reference and guides, not the changeset. Internal
+  work with no visible effect (refactors, caching, speedups users cannot observe) needs no
+  changeset.
+- Add a `## Migration` section only when code or builds written against the previous release
+  must change. Readers are agents upgrading their libraries, so give the concrete edit, such as
+  "Import `List` from `silk.list` instead of `Vector` from `silk.vector`." Leave it out otherwise;
+  no section means no action is needed.
 - Never edit `compiler/borrow-check-gap.txt` by hand: after a corpus run, write it with
   `node .github/scripts/check-borrow-gap.mjs update <corpus log>`, and put the table that
   `check-borrow-gap.mjs diff <old> <new>` prints in the PR description.
