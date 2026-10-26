@@ -39,13 +39,13 @@ test('a join that can be cancelled asks for Cancelled in the row', () => {
   assert.match(result.stderr, /error\[SEM0066\] This `run` can fail with `Cancelled`, which the enclosing function does not declare; add `! Cancelled`/)
 })
 
-test('a callback of Shared.withMut that runs an Effect says what it runs', { todo: 'finding 158' }, () => {
+test('a callback of Shared.withMut that runs an Effect says what it runs', () => {
   const result = silk(h, ['check'], { cwd: variant('fn countFinal(log: &mut Log) -> () {', 'effect fn noisy() -> () {\n}\n\nfn countFinal(log: &mut Log) -> () {\n  run noisy()') })
   assert.match(result.stderr, /error\[OWN0016\]/)
   assert.doesNotMatch(result.stderr, /An access-scoped local-shared borrow escaping or crossing suspension/)
 })
 
-test('a parking finalizer for ensuringNonParking names NonParking and what parks', { todo: 'finding 159' }, () => {
+test('a parking finalizer for ensuringNonParking names NonParking and what parks', () => {
   const result = silk(h, ['build'], { cwd: variant('effect fn finish(log: Shared<Log>) -> () {', 'effect fn finish(log: Shared<Log>) -> () ? &mut MonotonicClock {\n  run Effect.sleep(1)') })
   assert.match(result.stderr, /error\[SEM0139\]/)
   assert.match(result.stderr, /NonParking|park/)
