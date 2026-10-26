@@ -57,7 +57,7 @@ test('silk init makes a package that runs and prints Hello, world!', () => {
 
   const ran = silk(h, ['run'], { cwd: dir })
   assert.equal(ran.status, 0, show(ran))
-  assert.equal(ran.stdout, 'Hello, world!', 'the program output alone is on stdout')
+  assert.equal(ran.stdout, 'Hello, world!\n', 'the program output alone is on stdout')
   assert.match(ran.stderr, /^Compiling .*\n(  \w+ .*\n)+Finished build\/llvm\/[^/]+\/debug\/hello-\d+ in /)
 
   const quiet = silk(h, ['run', '--quiet'], { cwd: dir })
@@ -109,7 +109,7 @@ test('silk check, build, build --release and clean', () => {
   assert.ok(existsSync(exe), 'the executable is where the Finished line says')
   assert.ok(existsSync(`${exe}.symbols`))
   const own = sh(h, `'${exe}'`)
-  assert.equal(own.stdout, 'Hello, world!', 'the executable runs without silk')
+  assert.equal(own.stdout, 'Hello, world!\n', 'the executable runs without silk')
 
   const release = silk(h, ['build', '--release'], { cwd: dir })
   assert.equal(release.status, 0, show(release))

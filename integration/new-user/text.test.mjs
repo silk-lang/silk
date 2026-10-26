@@ -39,7 +39,7 @@ test('a character literal with two scalars counts them', () => {
   assert.match(result.stderr, /LEX0007\] Character literal must hold exactly one Unicode scalar, but holds 2/, show(result))
 })
 
-// Finding 166: escapes and string mistakes that could say what to write.
+// Finding 166, fixed by #2375: escapes and string mistakes say what to write.
 for (const [name, line, wanted] of [
   ['a surrogate escape says it is a surrogate', 'let c = "\\u{D800}"', /surrogate/i],
   ['an escape past U+10FFFF says the limit', "let c = '\\u{110000}'", /10FFFF/i],
@@ -49,7 +49,7 @@ for (const [name, line, wanted] of [
   ['a string method call points at the String function', 'if text.startsWith("c") { return 1 }', /String\.startsWith\(text/],
   ['adding strings points at String.append or a template', 'let s = text + "!"', /String\.append|Format/],
 ]) {
-  test(name, { todo: 'finding 166' }, () => {
+  test(name, () => {
     const result = silk(h, ['check'], { cwd: project(body(line)) })
     assert.notEqual(result.status, 0, show(result))
     assert.match(result.stderr, wanted, show(result))

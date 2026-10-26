@@ -14,8 +14,9 @@ before(() => {
   }
 })
 
+// Since #2384 a new workspace starts with an `app` member.
 test('init inside a workspace registers members', () => {
-  assert.equal(read(join(shop, 'silk.toml')), '[workspace]\nmembers = ["pricing", "store"]\n')
+  assert.equal(read(join(shop, 'silk.toml')), '[workspace]\nmembers = ["app", "pricing", "store"]\n')
   assert.ok(existsSync(join(shop, '.gitignore')))
   assert.ok(!existsSync(join(shop, 'store/.gitignore')), 'members get no .gitignore of their own')
   assert.match(read(join(shop, 'store/silk.toml')), /\[dependencies\]\npricing = \{ path = "\.\.\/pricing" \}/)
@@ -31,7 +32,7 @@ test('build at the root builds every member in dependency order', () => {
 
 test('build at the root ends with a package count', () => {
   const result = silk(h, ['build'], { cwd: shop })
-  assert.match(result.stderr, /Finished 2 packages in \S+\n$/)
+  assert.match(result.stderr, /Finished 3 packages in \S+\n$/)
 })
 
 test('check -p picks one member', () => {
@@ -52,7 +53,7 @@ test('test at the root runs each member and summarizes', () => {
   assert.equal(result.status, 0, show(result))
   assert.match(result.stdout, /Package pricing \(/)
   assert.match(result.stdout, /Package store \(/)
-  assert.match(result.stdout, /Workspace summary: 2 packages succeeded, 0 failed/)
+  assert.match(result.stdout, /Workspace summary: 3 packages succeeded, 0 failed/)
 })
 
 test('a filter that matches in one member succeeds', () => {
@@ -67,7 +68,7 @@ test('a failing member test fails the workspace run', () => {
   try {
     const result = silk(h, ['test', '--no-cache'], { cwd: shop })
     assert.equal(result.status, 1, show(result))
-    assert.match(result.stdout, /Workspace summary: 1 package succeeded, 1 failed/)
+    assert.match(result.stdout, /Workspace summary: 2 packages succeeded, 1 failed/)
   } finally {
     write(lib, original)
   }

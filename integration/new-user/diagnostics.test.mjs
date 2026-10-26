@@ -31,7 +31,7 @@ const cases = [
   ['ended lines with semicolons', 'pub fn main() -> i32 {\n  let x = 1;\n  return x\n}\n', /2:12: error\[PAR0002\] Unexpected `;`/],
   ['left out main', 'fn helper() -> i32 { return 1 }\n', /error\[SEM0225\] Entry point `main` is missing/],
   ['made main private', 'fn main() -> i32 { return 0 }\n', /error\[SEM0225\] Entry point `main` must be `pub`$/],
-  ['added two strings', 'pub fn main() -> i32 {\n  let s = "a" + "b"\n  return 0\n}\n', /error\[SEM0135\] Operator \+ does not accept \(string<'static>, string<'static>\)$/],
+  ['added two strings', 'pub fn main() -> i32 {\n  let s = "a" + "b"\n  return 0\n}\n', /error\[SEM0135\] Operator \+ does not join strings; build an owned `String` with `String\.copy` and `String\.append`, or write the text with a `Format\.format` template$/],
   ['mixed integer types', 'pub fn main() -> i32 {\n  let a: i64 = 1\n  let b: i32 = 2\n  return a + b\n}\n', /error\[SEM0135\] Operator \+ does not accept \(i64, i32\)$/],
   ['used null', 'pub fn main() -> i32 {\n  let x = null\n  return 0\n}\n', /error\[SEM0006\] Unknown value null$/],
   ['logged a string variable (strings copy, no move needed)', `${logging}  let tea = "x"\n  run Effect.log("{t}", &.{ t: tea }) |> Effect.provideMut(&mut logger)\n}\n`, null],
