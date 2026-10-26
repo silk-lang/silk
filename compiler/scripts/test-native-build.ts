@@ -2533,7 +2533,25 @@ const program = Effect.gen(function* () {
   const withClang = { ...process.env, SILK_CLANG: clang }
   const managedRoot = yield* invoke(silk, ['init', '--workspace', 'managed'], directory)
   assert.equal(managedRoot.status, 0, managedRoot.stderr)
-  assert.equal(yield* fs.readFileString(join(managed, 'silk.toml')), '[workspace]\nmembers = []\n')
+  // A new workspace has one starter executable member, so it builds and runs at once.
+  assert.equal(yield* fs.readFileString(join(managed, 'silk.toml')), '[workspace]\nmembers = ["app"]\n')
+  assert.match(managedRoot.stdout, /^Initialized Silk project app at .*\/managed\/app$/m)
+  assert.equal(yield* fs.exists(join(managed, 'app/src/main.silk')), true)
+  assert.equal(yield* fs.exists(join(managed, 'app/.gitignore')), false)
+  const starterRun = yield* invoke(silk, ['run', '--stdlib', standardLibrary], managed, withClang)
+  assert.equal(starterRun.status, 0, starterRun.stderr)
+  assert.match(starterRun.stdout, /Hello, world!/)
+  const namedRoot = yield* invoke(silk, ['init', '--workspace', 'named', '--name', 'store'], directory)
+  assert.equal(namedRoot.status, 0, namedRoot.stderr)
+  assert.equal(
+    yield* fs.readFileString(join(directory, 'named/silk.toml')),
+    '[workspace]\nmembers = ["store"]\n',
+  )
+  assert.match(yield* fs.readFileString(join(directory, 'named/store/silk.toml')), /^name = "store"$/m)
+  // The rest of this test assembles its members by hand.
+  yield* fs.remove(join(managed, 'app'), { recursive: true })
+  yield* fs.remove(join(managed, 'build'), { recursive: true })
+  yield* fs.writeFileString(join(managed, 'silk.toml'), '[workspace]\nmembers = []\n')
   const hello = yield* invoke(silk, ['init', 'apps/hello'], managed)
   assert.equal(hello.status, 0, hello.stderr)
   assert.match(hello.stdout, /Added apps\/hello to the workspace members in /)
