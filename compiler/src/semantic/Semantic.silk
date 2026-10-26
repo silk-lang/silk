@@ -8515,6 +8515,17 @@ pub struct Adopted {
   pub changedLeaves: usize,
 }
 
+// Whether `leaf` records only where a span sits: a location in a declaration, or a source
+// prefix. Such an input guards the spans a value or report holds, never what is checked.
+effect fn positionalLeaf(leaf: &CacheImage.Leaf) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if !leaf.input { return false }
+  let mut reader = StableKey.reader()
+  let module = run StableKey.readModule(Bytes.asSlice(&leaf.key), &mut reader)
+  if let Option<ModuleId>.Some {..} = &module {} else { return false }
+  let tag = StableKey.readWord(Bytes.asSlice(&leaf.key), &mut reader)
+  return !StableKey.failed(&reader) && (tag == 9 || tag == 10)
+}
+
 // Where a unit stands while a cache image is built: not yet reached, reached and not finished,
 // or unfit for the image because it reaches a unit that is not current or a leaf with no stable
 // form. Any other value is the unit's node.
@@ -8879,14 +8890,20 @@ effect fn demandUnit(
     // completed unit is never active, so a hit skips the cycle scan.
     let unit = u64.toUsize(word.value)
     let mut hit = Graph.current(&resolver.graph, unit)
+    let mut answer = move value
     if !hit && run verifyUnit(&mut resolver.*, &mut owner.*, unit) {
       Graph.markVerified(&mut resolver.graph, unit)
       hit = true
+      // Verifying can rerun this very unit: a dependee brought current may demand it back, as
+      // when an edit closes a cycle through it. The memo then holds that rerun's answer.
+      if let Option<Shared<Result<Answer, NoRejection>>>.Some {value: rerun} = move Query.completed(&mut owner.*, word) {
+        answer = move rerun
+      }
     }
     if hit {
       resolver.hits = resolver.hits + usize.ONE
       run emit(&mut resolver.*, EventKind.Hit, word)
-      return move value
+      return move answer
     }
     Query.forget(&mut owner.*, word)
   }
@@ -63724,16 +63741,37 @@ effect fn resolveConstant(
   )
 }
 
+// Loads `module` and observes `declaration`'s written header and body. A declaration the source
+// no longer holds is guarded by the whole file.
+effect fn observedWholeDeclaration(resolver: &mut Resolver, module: &ModuleId, declaration: &DeclarationId)
+-> Shared<Result<SourceResult, NoRejection>> ! Cycle | OutOfMemoryError ? &mut Allocator {
+  let answer = run demandSource(&mut resolver.*, module)
+  if recordingUnit(&resolver.*) == usize.MAX { return move answer }
+  let mut position = Option<usize>.none()
+  if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &answer, module) {
+    position = ModuleIndex.ordinalOf(IndexedSource.moduleIndex(indexed), declaration)
+  }
+  if let Option<usize>.Some {value: ordinal} = move position {
+    let written = run observedDeclarationIn(&mut resolver.*, module, move answer, ordinal, SourceFacet.Written)
+    return run observedDeclarationIn(&mut resolver.*, module, move written, ordinal, SourceFacet.Body)
+  }
+  drop answer
+  return run source(&mut resolver.*, module)
+}
+
 effect fn initializerSyntax(
   resolver: &mut Resolver,
   module: &ModuleId,
   ordinal: usize,
   fallback: Span,
 ) -> WrittenInitializer ! Cycle | OutOfMemoryError ? &mut Allocator {
-  let answer = run source(&mut resolver.*, module)
+  // The initializer is the declaration's body, so an edit elsewhere in the file leaves it alone.
+  let answer = run observedDeclaration(&mut resolver.*, module, ordinal, SourceFacet.Body)
+  let mut lost = true
   if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &answer, module) {
     let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
     if ordinal < declarations.length {
+      lost = false
       let hir = IndexedSource.authored(indexed)
       if let Node.Declaration {body, ..} = Module.node(hir, declarations[ordinal].local) {
         if let Node.InitializerBody {value} = Module.node(hir, body) {
@@ -63747,6 +63785,8 @@ effect fn initializerSyntax(
       }
     }
   }
+  // A missing declaration has no body to observe; the whole file guards its return.
+  if lost { drop run source(&mut resolver.*, module) }
   return WrittenInitializer {expression: Option<HirId>.none(), span: fallback}
 }
 
@@ -64588,11 +64628,49 @@ effect fn checkedStaticRoot(
   binders: &[StaticRootBinder],
   bindings: &[StaticBinding],
 ) -> Answer ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
-  let sourceAnswer = run source(&mut resolver.*, module)
+  let mut sourceAnswer = run demandSource(&mut resolver.*, module)
   let mut writtenCalls = List<CallSyntax>.make()
   let mut rootSpan = Span.make(usize.ZERO, usize.ZERO)
   let mut ordinal = usize.MAX
   let mut extentLiteralTree = false
+  let mut lost = true
+  let mut present = false
+  if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(
+    &resolver.*,
+    &sourceAnswer,
+    module,
+  ) {
+    present = true
+    let hir = IndexedSource.authored(indexed)
+    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+    if let Option<usize>.Some {value} = &declaration {
+      ordinal = value
+    } else {
+      ordinal = nearestEnclosingDeclaration(hir, declarations, root)
+    }
+    lost = ordinal >= declarations.length
+  }
+  // The root and everything the check reads beside it (the declaration's parameters and the
+  // static bindings before the root) sit in its declaration, so the check observes that
+  // declaration's written header and body rather than the whole file.
+  if lost || recordingUnit(&resolver.*) == usize.MAX {
+    sourceAnswer = run source(&mut resolver.*, module)
+  } else {
+    let loaded = move sourceAnswer
+    let written = run observedDeclarationIn(&mut resolver.*, module, move loaded, ordinal, SourceFacet.Written)
+    sourceAnswer = run observedDeclarationIn(&mut resolver.*, module, move written, ordinal, SourceFacet.Body)
+  }
+  if lost && present {
+    return run rejectedBody(
+      run reject(
+        &resolver.*,
+        module,
+        RejectionCode.Unsupported,
+        Span.make(usize.ZERO, usize.ZERO),
+      ),
+      List<Dependency>.make(),
+    )
+  }
   if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(
     &resolver.*,
     &sourceAnswer,
@@ -64601,22 +64679,6 @@ effect fn checkedStaticRoot(
     let hir = IndexedSource.authored(indexed)
     extentLiteralTree = bareExtentTree(hir, root)
     let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
-    if let Option<usize>.Some {value} = &declaration {
-      ordinal = value
-    } else {
-      ordinal = nearestEnclosingDeclaration(hir, declarations, root)
-    }
-    if ordinal >= declarations.length {
-      return run rejectedBody(
-        run reject(
-          &resolver.*,
-          module,
-          RejectionCode.Unsupported,
-          Span.make(usize.ZERO, usize.ZERO),
-        ),
-        List<Dependency>.make(),
-      )
-    }
     let declarationSpan = Module.span(hir, declarations[ordinal].local)
     rootSpan = Module.span(hir, root)
     if rootSpan.start < declarationSpan.start || rootSpan.end > declarationSpan.end {
@@ -83224,6 +83286,15 @@ impl<'source> StaticPort<'source> {
     let answer = run source(&mut self.resolver.*, module)
     return run SourceIndex.authoredCursor(&mut self.resolver.*.source, &answer, module)
   }
+  /// `authoredCursor` for reading one declaration: it observes only that declaration's written
+  /// header and body, so an edit elsewhere in its module leaves the reader alone.
+  pub effect fn declarationCursor(self: &mut Self, declaration: &DeclarationId) -> Option<AuthoredCursor>
+  ! Cycle | OutOfMemoryError
+  ? &mut Allocator {
+    let module = DeclarationId.moduleId(declaration)
+    let answer = run observedWholeDeclaration(&mut self.resolver.*, module, declaration)
+    return run SourceIndex.authoredCursor(&mut self.resolver.*.source, &answer, module)
+  }
   /// The module a standard-library `path`, such as `silk/i32.silk`, names when `module` writes it.
   pub effect fn standardModule(self: &Self, module: &ModuleId, path: &[u8]) -> ModuleId
   ! InvalidModulePath | OutOfMemoryError
@@ -84604,18 +84675,28 @@ impl Semantic {
       at = at + usize.ONE
     }
     let mut units = List<usize>.make()
+    // Whether a node reads the same once positions are set aside: every leaf it reaches reads as
+    // the image recorded, or records only where a span sits (`positionalLeaf`).
+    let mut settled = List<bool>.make()
     let nodes = CacheImage.nodeCount(image)
     at = usize.ZERO
     while at < nodes {
       let edges = CacheImage.edgesOf(image, at)
       let mut green = true
+      let mut still = true
       let mut edge = usize.ZERO
-      while edge < edges.length && green {
+      while edge < edges.length && still {
         let named = CacheImage.target(edges[edge])
-        if CacheImage.namesNode(edges[edge]) { green = List<usize>.get(&units, named) != usize.MAX }
-        else { green = List<usize>.get(&placed, named) != usize.MAX }
+        if CacheImage.namesNode(edges[edge]) {
+          green = green && List<usize>.get(&units, named) != usize.MAX
+          still = List<bool>.get(&settled, named)
+        } else if List<usize>.get(&placed, named) == usize.MAX {
+          green = false
+          still = run positionalLeaf(&leaves[named])
+        }
         edge = edge + usize.ONE
       }
+      run List<bool>.append(&mut settled, still)
       let mut unit = usize.MAX
       if green && !linked {
         // Any value but `usize.MAX` marks the node green.
@@ -84678,8 +84759,11 @@ impl Semantic {
         }
         continue
       }
+      // An escape record and its entries hold no position either: an entry keeps its summary's
+      // digest and the exact keys it reaches, and a replay finds every site from the anchors of
+      // the source it reads now.
       if kind == 3 || kind == 4 {
-        if node != usize.MAX && !linked {
+        if (node != usize.MAX || List<bool>.get(&settled, root.node)) && !linked {
           let named = StableKey.view(Bytes.asSlice(&root.key), exact)
           if kind == 3 {
             run List<EscapeRecordRoot>.append(&mut self.escapeImage.records, EscapeRecordRoot {unit: run Bytes.copy(named),
@@ -84693,9 +84777,13 @@ impl Semantic {
       let key = run readCheckKey(Bytes.asSlice(&root.key))
       let answer = run readCheckAnswer(Bytes.asSlice(&root.answer))
       let mut reused = false
+      // A check root holds no position: it is written only for a check that reported nothing.
+      // So an unlinked store reuses it when only where spans sit moved, as when a line is
+      // inserted above it. A linked store needs each node it rests on current.
+      let positioned = !linked && List<bool>.get(&settled, root.node)
       if let Option<CheckKey>.Some {value: check} = move key {
         if let Option<CheckAnswer>.Some {value: kept} = move answer {
-          if node != usize.MAX {
+          if node != usize.MAX || positioned {
             let mut resting = node
             if !linked { resting = usize.MAX }
             reused = run Semantic.adoptCheck(&mut self.*, resting, Bytes.asSlice(&root.key), move check, move kept)
