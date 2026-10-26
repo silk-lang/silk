@@ -308,7 +308,7 @@ test('a block arm ending in a value says block arms do not yield one', () => {
 })
 
 // Finding 141: a private stdlib field whose accessor lives elsewhere.
-test('reading Instant.seconds as a method points at SystemClock.seconds, not at editing the stdlib', { todo: 'finding 141' }, () => {
+test('reading Instant.seconds as a method points at SystemClock.seconds, not at editing the stdlib', () => {
   const result = check('import silk.system_clock { Instant, SystemClock }\n\npub fn main() -> i32 {\n  let now = SystemClock.make(5, 0)\n  if now.seconds() == 5 {\n    return 0\n  }\n  return 1\n}\n')
   assert.match(result.stderr, /SEM0028\]/, show(result))
   assert.doesNotMatch(result.stderr, /mark it `pub seconds`/, show(result))
@@ -317,11 +317,11 @@ test('reading Instant.seconds as a method points at SystemClock.seconds, not at 
 
 // Finding 142: provider messages.
 const bell = 'import silk.effect { Effect }\nimport silk.system_clock { SystemClock }\nimport silk.testing { AssertionError, Testing }\n\nservice Doorbell {\n  effect fn ring() -> () ? &mut Doorbell\n}\n\nstruct Counting {\n  rings: i32,\n}\n\nimpl Doorbell for Counting {\n  effect fn ring(self: &mut Self) -> () {\n    self.rings = self.rings + 1\n  }\n}\n\neffect fn visit() -> () ? &mut Doorbell {\n  run Doorbell.ring()\n}\n\npub fn main() -> i32 {\n  return 0\n}\n\n'
-test('providing a value for the wrong service names the provider and the service', { todo: 'finding 142' }, () => {
+test('providing a value for the wrong service names the provider and the service', () => {
   const result = check(`${bell}test effect fn rings() ! AssertionError<'static> {\n  let mut b = Counting { rings: 0 }\n  run visit() |> Effect.provideMut<SystemClock>(&mut b)\n  run Testing.expect(b.rings == 1, "one ring")\n}\n`)
   assert.match(result.stderr, /SEM0123\][^\n]*(Counting|SystemClock)/, show(result))
 })
-test('a missing provider inside a test does not suggest a requirement row', { todo: 'finding 142' }, () => {
+test('a missing provider inside a test does not suggest a requirement row', () => {
   const result = check(`${bell}test effect fn rings() ! AssertionError<'static> {\n  run visit()\n  run Testing.expect(true, "ran")\n}\n`)
   assert.match(result.stderr, /SEM0071\]/, show(result))
   assert.doesNotMatch(result.stderr, /add `\? &mut Doorbell` to its signature/, show(result))

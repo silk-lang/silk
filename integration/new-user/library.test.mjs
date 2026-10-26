@@ -102,15 +102,15 @@ pub fn keep<T>(value: T) -> Best<T> {
 }
 `
 
-test('an impl of a library interface for a type of neither package says where impls may live', { todo: 'finding 143' }, () => {
+test('an impl of a library interface for a type of neither package says where impls may live', () => {
   const main = 'import geo.lib { Shape }\n\nimpl Shape for i64 {\n  fn area(shape: &Self) -> i64 {\n    return 0\n  }\n}\n\npub fn main() -> i32 {\n  return 0\n}\n'
   const result = silk(h, ['check', '-p', 'app'], { cwd: workspace(smallLib, main) })
   assert.match(result.stderr, /error\[SEM0083\]/)
   assert.doesNotMatch(result.stderr, /An invalid source-declared capability implementation/)
-  assert.match(result.stderr, /module that declares/)
+  assert.match(result.stderr, /`i64` is a builtin type, so this impl must be in `geo\.lib`/)
 })
 
-test('a mistake in a library generic body is reported once, in the library', { todo: 'finding 144' }, () => {
+test('a mistake in a library generic body is reported once, in the library', () => {
   const main = 'import geo.lib { keep }\n\npub fn main() -> i32 {\n  let kept = keep(5)\n  return 0\n}\n'
   const result = silk(h, ['check', '-p', 'app'], { cwd: workspace(smallLib.replace('return move best', 'return best'), main) })
   assert.equal(result.status, 1, show(result))
@@ -118,19 +118,19 @@ test('a mistake in a library generic body is reported once, in the library', { t
   assert.doesNotMatch(result.stderr, /app\/src\/main\.silk:\d+:\d+: error/)
 })
 
-test('a library type in a message carries its package, not only its module', { todo: 'finding 145' }, () => {
+test('a library type in a message carries its package, not only its module', () => {
   const main = 'import geo.lib { Square }\n\npub fn main() -> i32 {\n  let square = Square { side: 2 }\n  return 0\n}\n'
   const result = silk(h, ['check', '-p', 'app'], { cwd: workspace(smallLib, main) })
   assert.match(result.stderr, /error\[SEM0021\] Cannot construct geo\.lib\.Square here/)
 })
 
-test('a library manifest without kind hints at kind = "library"', { todo: 'finding 146' }, () => {
+test('a library manifest without kind hints at kind = "library"', () => {
   const main = 'import geo.lib { Square }\n\npub fn main() -> i32 {\n  return 0\n}\n'
   const result = silk(h, ['check'], { cwd: workspace(smallLib, main, '[package]\nname = "geo"\nsilk-version = "0.0.0"\n') })
   assert.match(result.stderr, /kind = "library"/)
 })
 
-test('mismatched array elements name both types', { todo: 'finding 146' }, () => {
+test('mismatched array elements name both types', () => {
   const main = 'struct Circle {\n  radius: i64,\n}\n\nstruct Tri {\n  base: i64,\n}\n\npub fn main() -> i32 {\n  let mixed = [Circle { radius: 1 }, Tri { base: 2 }]\n  return 0\n}\n'
   const result = silk(h, ['check', '-p', 'app'], { cwd: workspace(smallLib, main) })
   assert.match(result.stderr, /error\[SEM0030\].*Circle.*Tri|error\[SEM0030\].*Tri.*Circle/)
