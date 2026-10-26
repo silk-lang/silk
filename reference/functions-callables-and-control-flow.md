@@ -111,6 +111,46 @@ reports `SEM0087` under STMT-001.
 **Evidence:** [Effect construction](effects-and-execution.md#eff-001--calling-an-effect-function-constructs-an-effect),
 [eager setup](effects-and-execution.md#eff-005--an-ordinary-function-can-construct-a-deferred-effect).
 
+### FUNC-003 — An inline clause tells the optimizer how to inline a function
+
+**Status:** Confirmed
+
+```silk
+fn isSmall(value: i64) -> bool with Intrinsic.inline() {
+  return value >= -1024 && value < 1024
+}
+
+fn tag(value: i64) -> u8 with Intrinsic.inlineAlways() {
+  if isSmall(value) { return 1 }
+  return slowTag(value)
+}
+
+fn slowTag(value: i64) -> u8 with Intrinsic.inlineNever() {
+  if value < 0 { return 2 }
+  return 3
+}
+```
+
+An ordinary function can carry one inline clause. `with Intrinsic.inline()` asks the optimizer to
+prefer inlining the function into its callers. `with Intrinsic.inlineAlways()` asks it to inline
+the function into every caller it can, whatever its size. `with Intrinsic.inlineNever()` asks it
+never to inline the function, which keeps a rarely taken path out of its callers. The clause takes
+no arguments and does not change what the function computes.
+
+**Boundary:** The clause is a request to the optimizer. A debug build compiles each module apart,
+so a call into another module is not inlined there. A recursive call is never inlined into itself.
+A `static fn`, an `extern` or `export` function and an interface or service operation take no
+inline clause.
+
+**Diagnostics:** An inline clause with arguments reports `SEM0235`. The clause on a `static`,
+`extern` or `export` function or on an operation reports `SEM0236`. A second inline clause on one
+function is not supported.
+
+**Current compiler:** Aligned. The function's LLVM definition carries `inlinehint`,
+`alwaysinline` or `noinline`.
+
+**Evidence:** `corpus/native/function-inline-clauses`, `corpus/invalid/function-inline-clauses-invalid`.
+
 ### CALL-001 — A call evaluates each argument once from left to right
 
 **Status:** Confirmed
