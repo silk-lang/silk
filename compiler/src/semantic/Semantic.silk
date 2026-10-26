@@ -2829,6 +2829,8 @@ pub struct Semantic {
   // The memo of each declaration check unit, by unit.
   declarationSlots: List<usize>,
   pendingImage: Option<PendingImage>,
+  // What `cacheImage` wrote for each replayed escape check that reports, for `imageReplayedChecks`.
+  replayReports: List<ReplayReport>,
   // The module check units an unlinked cache adoption made current, which `cacheImage` leaves to
   // the image they came from, and the index of each one's root in that image.
   carriedUnits: List<usize>,
@@ -2879,6 +2881,9 @@ struct EscapeMemo {
   result: DeclarationCheckResult,
   // The record of the walk that found nothing to report, which `cacheImage` writes.
   captured: Option<CapturedBuild>,
+  // For a replay, the unit that holds what it demanded, which the root of a replay that reports
+  // rests on (`imageReplayedChecks`); `usize.MAX` otherwise.
+  reads: usize,
 }
 
 // One escape walk record an adoption read: its check's stable unit key, its root in the image
@@ -8655,6 +8660,14 @@ struct PendingImage {
   checks: List<PendingCheck>,
 }
 
+// A replayed escape check that reports: its unit, the node of what its replay demanded and the
+// files its reports point into, and its answer.
+struct ReplayReport {
+  unit: usize,
+  node: usize,
+  answer: Bytes,
+}
+
 struct PendingCheck {
   unit: usize,
   answer: Bytes,
@@ -8809,23 +8822,30 @@ effect fn imageRoot(resolver: &Resolver, build: &mut ImageBuild, unit: usize, an
     Option<Bytes>.Some {value} => move value
     Option<Bytes>.None => { return Option<Bytes>.none() }
   }
-  let mut node = run imageUnit(&resolver.*, &mut build.*, unit)
-  if node >= unfit() { return Option<Bytes>.some(move answer) }
-  if sites.length > usize.ZERO {
-    let mut edges = List<usize>.make()
-    run List<usize>.append(&mut edges, CacheImage.nodeEdge(node))
-    let mut at = usize.ZERO
-    while at < sites.length {
-      let module = knownModuleOrdinal(&resolver.*, &sites[at])
-      if module == usize.MAX { return Option<Bytes>.none() }
-      let edge = CacheImage.leafEdge(run imageLeaf(&resolver.*, &mut build.*, Dependee.SourceFile {module: module}))
-      if !holdsUnit(List<usize>.asSlice(&edges), edge) { run List<usize>.append(&mut edges, edge) }
-      at = at + usize.ONE
-    }
-    node = run CacheImage.addNode(&mut build.image, List<usize>.asSlice(&edges))
-  }
+  let unitNode = run imageUnit(&resolver.*, &mut build.*, unit)
+  if unitNode >= unfit() { return Option<Bytes>.some(move answer) }
+  let node = run sitedNode(&resolver.*, &mut build.*, unitNode, sites)
+  if node == usize.MAX { return Option<Bytes>.none() }
   run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {key: move key, node: node, answer: move answer})
   return Option<Bytes>.none()
+}
+
+// `node`, or when `sites` names modules, a node resting on it and on the file of each, which a
+// report's spans point into; `usize.MAX` when one of them is not a module of this store.
+effect fn sitedNode(resolver: &Resolver, build: &mut ImageBuild, node: usize, sites: &[ModuleId]) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  if sites.length == usize.ZERO { return node }
+  let mut edges = List<usize>.make()
+  run List<usize>.append(&mut edges, CacheImage.nodeEdge(node))
+  let mut at = usize.ZERO
+  while at < sites.length {
+    let module = knownModuleOrdinal(&resolver.*, &sites[at])
+    if module == usize.MAX { return usize.MAX }
+    let edge = CacheImage.leafEdge(run imageLeaf(&resolver.*, &mut build.*, Dependee.SourceFile {module: module}))
+    if !holdsUnit(List<usize>.asSlice(&edges), edge) { run List<usize>.append(&mut edges, edge) }
+    at = at + usize.ONE
+  }
+  return run CacheImage.addNode(&mut build.image, List<usize>.asSlice(&edges))
 }
 
 // The digest of one module's source bytes, or zero when the module has no source.
@@ -84593,6 +84613,7 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
     declarationMemos: List<DeclarationMemo>.make(),
     declarationSlots: List<usize>.make(),
     pendingImage: Option<PendingImage>.none(),
+    replayReports: List<ReplayReport>.make(),
     carriedUnits: List<usize>.make(),
     carriedRoots: List<usize>.make(),
     checkRuns: usize.ZERO,
@@ -85428,7 +85449,7 @@ impl Semantic {
     } else if kind == 1 {
       run List<EscapeMemo>.append(&mut self.escapeMemos, EscapeMemo {unit: unit, concrete: move concrete,
         result: DeclarationCheckResult {rejections: move rejections, gaps: List<Shared<BackendGap>>.make(),
-          unchecked: List<UncheckedDeclaration>.make()}, captured: Option<CapturedBuild>.none()})
+          unchecked: List<UncheckedDeclaration>.make()}, captured: Option<CapturedBuild>.none(), reads: usize.MAX})
     } else {
       let mut sweep = Sweep.make()
       sweep.concrete = move concrete
@@ -85509,10 +85530,32 @@ impl Semantic {
       }
     }
     let escapes = List<EscapeMemo>.asSlice(&self.escapeMemos)
+    let mut reports = List<ReplayReport>.make()
     at = usize.ZERO
     while at < escapes.length {
       let memo = &escapes[at]
       at = at + usize.ONE
+      // A replay ran no unit of its own; its root rests on the image's record and entries
+      // (`imageReplayedChecks`), and when it reports, on what it demanded as well.
+      if memo.reads != usize.MAX {
+        if List<Shared<Rejection>>.length(&memo.result.rejections) == usize.ZERO
+          || List<Shared<BackendGap>>.length(&memo.result.gaps) > usize.ZERO
+          || List<UncheckedDeclaration>.length(&memo.result.unchecked) > usize.ZERO {
+          continue
+        }
+        let mut sites = List<ModuleId>.make()
+        let answer = match move run reportingAnswer(1, List<DeclarationId>.asSlice(&memo.concrete),
+          List<Shared<Rejection>>.asSlice(&memo.result.rejections), &mut sites) {
+          Option<Bytes>.Some {value} => move value
+          Option<Bytes>.None => { continue }
+        }
+        let readsNode = run imageUnit(&self.resolver, &mut build, memo.reads)
+        if readsNode >= unfit() { continue }
+        let node = run sitedNode(&self.resolver, &mut build, readsNode, List<ModuleId>.asSlice(&sites))
+        if node == usize.MAX { continue }
+        run List<ReplayReport>.append(&mut reports, ReplayReport {unit: memo.unit, node: node, answer: move answer})
+        continue
+      }
       if List<Shared<BackendGap>>.length(&memo.result.gaps) > usize.ZERO
         || List<UncheckedDeclaration>.length(&memo.result.unchecked) > usize.ZERO
         || holdsUnit(List<usize>.asSlice(&self.carriedUnits), memo.unit) {
@@ -85528,6 +85571,7 @@ impl Semantic {
         run List<PendingCheck>.append(&mut pending, PendingCheck {unit: memo.unit, answer: move value, sites: move sites})
       }
     }
+    self.replayReports = move reports
     // The last build's record and each definition it lowered, on the units it rests on. The
     // definitions a replay took from the image this store read, and a record no build here
     // replaced, stay in that image, which the written one carries them from.
@@ -85671,17 +85715,32 @@ impl Semantic {
   /// Adds to `image`, once `CacheImage.carry` has copied into it what this store reused, the root of
   /// each escape check a replay made current (`replayEscapes`). The root rests on the walk's record
   /// and on the root of every entry the record names, so it stays green while a replay would
-  /// agree again, and the next check takes it without replaying. A check that reports, or whose
-  /// record or entries `image` lacks, is left out, and replays again.
+  /// agree again, and the next check takes it without replaying. The root of a replay that reports
+  /// rests instead on the root of each entry the replay entered or kept, and on what it demanded
+  /// and the files its reports point into, which `cacheImage` wrote: a broken body that lowers to
+  /// nothing has no entry root, but its MIR is among what the replay demanded. A check whose
+  /// record or entries `image` lacks is left out, and replays again.
   pub effect fn imageReplayedChecks(self: &Self, image: &mut CacheImage.Image) -> () ! OutOfMemoryError ? &mut Allocator {
     let memos = List<EscapeMemo>.asSlice(&self.escapeMemos)
+    let reports = List<ReplayReport>.asSlice(&self.replayReports)
     let mut replayed = List<usize>.make()
+    // The report each replayed check rests on, or `usize.MAX` for one that reports nothing.
+    let mut reporting = List<usize>.make()
     let mut at = usize.ZERO
     while at < memos.length {
       let clean = List<Shared<Rejection>>.length(&memos[at].result.rejections) == usize.ZERO
         && List<Shared<BackendGap>>.length(&memos[at].result.gaps) == usize.ZERO
+      let mut report = usize.MAX
+      let mut listed = usize.ZERO
+      while listed < reports.length && report == usize.MAX {
+        if reports[listed].unit == memos[at].unit { report = listed }
+        listed = listed + usize.ONE
+      }
       if let Option<CapturedBuild>.Some {value: captured} = &memos[at].captured {
-        if captured.carriedRecord != usize.MAX && clean { run List<usize>.append(&mut replayed, at) }
+        if captured.carriedRecord != usize.MAX && (clean || report != usize.MAX) {
+          run List<usize>.append(&mut replayed, at)
+          run List<usize>.append(&mut reporting, report)
+        }
       }
       at = at + usize.ONE
     }
@@ -85699,6 +85758,7 @@ impl Semantic {
     at = usize.ZERO
     while at < picked.length {
       let memo = &memos[picked[at]]
+      let report = List<usize>.get(&reporting, at)
       at = at + usize.ONE
       let stable = match move run stableUnit(&self.resolver, memo.unit) {
         Option<Bytes>.Some {value} => move value
@@ -85709,11 +85769,16 @@ impl Semantic {
         let record = ExactSet.find(&keys, Bytes.asSlice(&run escapeRecordKey(Bytes.asSlice(&stable))))
         if record == usize.MAX { continue }
         run List<usize>.append(&mut edges, CacheImage.nodeEdge(List<usize>.get(&nodes, record)))
+        if report != usize.MAX { run List<usize>.append(&mut edges, CacheImage.nodeEdge(reports[report].node)) }
         let entries = List<BuildRecord.Entry>.asSlice(&captured.record.entries)
+        let rested = List<CapturedEntry>.asSlice(&captured.entries)
         let mut whole = true
         let mut entry = usize.ZERO
         while entry < entries.length && whole {
-          if entries[entry].leaf == 0 {
+          // A replay that reports leaves out an entry it neither entered nor kept: one below a
+          // broken body, which what it demanded decides.
+          let used = report == usize.MAX || rested[entry].mirUnit != usize.MAX || rested[entry].carried != usize.MAX
+          if entries[entry].leaf == 0 && used {
             let found = ExactSet.find(&keys, Bytes.asSlice(&run escapeEntryKey(Bytes.asSlice(&entries[entry].exact))))
             if found == usize.MAX { whole = false } else { run List<usize>.append(&mut edges, CacheImage.nodeEdge(List<usize>.get(&nodes, found))) }
           }
@@ -85721,8 +85786,10 @@ impl Semantic {
         }
         if !whole { continue }
         let node = run CacheImage.addNode(&mut image.*, List<usize>.asSlice(&edges))
-        run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: move stable, node: node,
-          answer: run checkAnswer(1, List<DeclarationId>.asSlice(&memo.concrete))})
+        let mut answer = Bytes.make()
+        if report != usize.MAX { answer = run Bytes.copy(Bytes.asSlice(&reports[report].answer)) }
+        else { answer = run checkAnswer(1, List<DeclarationId>.asSlice(&memo.concrete)) }
+        run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: move stable, node: node, answer: move answer})
       }
     }
   }
@@ -86193,11 +86260,25 @@ impl Semantic {
     }
     let mut kept = Option<EscapeRecordRoot>.none()
     if let Option<EscapeRecordRoot>.Some {value: held} = move adopted {
-      let replayed = run Semantic.replayEscapes(&mut self.*, &mut request.*, concrete, Bytes.asSlice(&held.answer), held.root)
+      // What the replay demands goes to a unit of its own: the units that decide what a replay
+      // that reports finds besides the record's entries, as a broken body's MIR.
+      let readsWord = run internKey(&mut self.resolver, Key {family: Family.ModuleCheck, module: module, name: 7,
+        declaration: usize.MAX, member: member, external: false})
+      let reads = u64.toUsize(readsWord.value)
+      run Graph.startRun(&mut self.resolver.graph, reads)
+      let recorder = self.resolver.rootRecorder
+      self.resolver.rootRecorder = reads
+      let attempted = run Effect.result(Semantic.replayEscapes(&mut self.*, &mut request.*, concrete, Bytes.asSlice(&held.answer), held.root))
+      self.resolver.rootRecorder = recorder
+      drop run Graph.finishRun(&mut self.resolver.graph, reads, Option<ContentHash>.none())
+      let replayed = match move attempted {
+        Result<Option<EscapeReplay>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => move value
+        Result<Option<EscapeReplay>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => { fail move error }
+      }
       if let Option<EscapeReplay>.Some {value: replay} = move replayed {
         let EscapeReplay {captured, result} = move replay
         run List<EscapeMemo>.append(&mut self.escapeMemos, EscapeMemo {unit: unit, concrete: run copyDeclarations(concrete),
-          result: run copyCheckResult(&result), captured: Option<CapturedBuild>.some(move captured)})
+          result: run copyCheckResult(&result), captured: Option<CapturedBuild>.some(move captured), reads: reads})
         return move result
       }
       kept = Option<EscapeRecordRoot>.some(move held)
@@ -86244,7 +86325,7 @@ impl Semantic {
       }
     }
     run List<EscapeMemo>.append(&mut self.escapeMemos, EscapeMemo {unit: unit, concrete: run copyDeclarations(concrete),
-      result: run copyCheckResult(&result), captured: move captured})
+      result: run copyCheckResult(&result), captured: move captured, reads: usize.MAX})
     return move result
   }
 
