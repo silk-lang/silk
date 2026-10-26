@@ -1492,7 +1492,17 @@ const program = Effect.gen(function* () {
     ["boolstatic", "export \"C\" static calls: bool = false\n\npub fn main() -> i32 {\n  return 0\n}\n", /error\[SEM0187\] A C static holds one C integer, float, or pointer, so it cannot have type bool\n/],
     ["assignstatic", "export \"C\" static calls: i32 = 0\n\npub fn main() -> i32 {\n  unsafe { calls = 1 }\n  return 0\n}\n", /error\[SEM0036\] `calls` is a C static, which Silk code can read but not assign\n/],
   ]
-  for (const [name, source, expected] of [...lendCases, ...patternCases, ...staticCases, ...interopCases]) {
+  // Template errors say what the placeholder needs, at the call, with no note into the standard library.
+  const templateUse = (call: string) => `import silk.os_writer { StderrWriter }\n\npub fn main() -> i32 {\n  ${call}\n  return 0\n}\n`
+  const templateCases: Array<[string, string, RegExp]> = [
+    ["lonebrace", templateUse('StderrWriter.print("} {name}\\n", &.{ name: "Ada" })'), /error\[SEM0177\] a lone `\}` in a template must be written `\}\}`, which writes one `\}`\n/],
+    ["widthtext", templateUse('StderrWriter.print("{name:>w$}\\n", &.{ name: "Ada", w: "x" })'), /error\[SEM0121\] A width or precision read from a field, as in `\{name:w\$\}`, needs an integer, and this field is `string<'static>`\n/],
+    ["radixtext", templateUse('StderrWriter.print("{:x}\\n", &("Ada",))'), /error\[SEM0121\] A `\{:x\}`, `\{:X\}`, `\{:o\}`, or `\{:b\}` placeholder needs an integer, and this value is `string<'static>`\n/],
+    ["exponentint", templateUse('StderrWriter.print("{:e}\\n", &(5,))'), /error\[SEM0121\] A `\{:e\}` or `\{:E\}` placeholder needs a float, and this value is `i32`\n/],
+    ["unborrowed", templateUse('StderrWriter.print("{}\\n", 5)'), /error\[SEM0012\] This parameter takes a borrow, and this argument is i32; write `&` before it\n/],
+    ["fieldless", templateUse('StderrWriter.print("{}\\n", &5)'), /error\[SEM0177\] a template with placeholders takes its values as fields, such as `&\.\{name: value\}`, `&\(a, b\)`, or `&\(a,\)` for one value; these arguments have no fields\n/],
+  ]
+  for (const [name, source, expected] of [...lendCases, ...patternCases, ...staticCases, ...interopCases, ...templateCases]) {
     yield* fs.makeDirectory(join(directory, `${name}/src`), { recursive: true })
     yield* fs.writeFileString(join(directory, `${name}/silk.toml`), `[package]\nname = "${name}"\nversion = "0.1.0"\n`)
     yield* fs.writeFileString(join(directory, `${name}/src/main.silk`), source)
@@ -1500,6 +1510,7 @@ const program = Effect.gen(function* () {
     assert.equal(checked.status, 1, checked.stderr)
     assert.match(checked.stderr, expected)
     assert.equal(checked.stderr.match(/error\[/g)?.length, 1, checked.stderr)
+    assert.doesNotMatch(checked.stderr, /stdlib\/silk\/format\.silk/, checked.stderr)
   }
   // Parking checks run at build time: each names what parks and the rule it breaks.
   const parkingCases: Array<[string, string, RegExp]> = [
@@ -1520,6 +1531,13 @@ const program = Effect.gen(function* () {
   yield* fs.writeFileString(join(directory, 'callexport/src/main.silk'), "export \"C\" fn twice(v: i32) -> i32 {\n  return v * 2\n}\n\npub fn main() -> i32 {\n  return unsafe twice(21)\n}\n")
   const exportCall = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(directory, 'callexport'), { ...process.env, SILK_CLANG: clang })
   assert.equal(exportCall.status, 42, exportCall.stderr)
+  // A width or precision field can be any integer, so a bare literal needs no `usize` annotation.
+  yield* fs.makeDirectory(join(directory, 'widthint/src'), { recursive: true })
+  yield* fs.writeFileString(join(directory, 'widthint/silk.toml'), '[package]\nname = "widthint"\nversion = "0.1.0"\n')
+  yield* fs.writeFileString(join(directory, 'widthint/src/main.silk'), 'import silk.os_writer { StderrWriter }\n\npub fn main() -> i32 {\n  StderrWriter.print("[{name:>w$}] [{v:.p$}]\\n", &.{ name: "Ada", w: 5, v: 7, p: 3 })\n  return 0\n}\n')
+  const widthInt = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(directory, 'widthint'), { ...process.env, SILK_CLANG: clang })
+  assert.equal(widthInt.status, 0, widthInt.stderr)
+  assert.match(widthInt.stderr, /^\[  Ada\] \[007\]$/m)
   // A line that starts with `-1 =>` is the next arm, not a subtraction from the arm before it.
   yield* fs.makeDirectory(join(directory, 'negarm/src'), { recursive: true })
   yield* fs.writeFileString(join(directory, 'negarm/silk.toml'), '[package]\nname = "negarm"\nversion = "0.1.0"\n')
