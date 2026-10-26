@@ -143,7 +143,8 @@ pub fn main() -> i32 {
 
 ## See also
 - `silk.writer` for the `Writer` effect that receives the output.
-- `silk.output` and `silk.buffered_output` for writers to standard output.
+- `silk.os_writer` for `StdoutWriter` and `StderrWriter`, which write to standard output and
+  standard error.
 
 Import as `Format` with `import silk.format { Format }`.
 
@@ -843,8 +844,10 @@ options are, in this order and each optional:
 - `+` for `Sign.Always`. `-` is the default and changes nothing.
 - `#` for the alternate form.
 - `0` for zero padding.
-- A width in decimal digits, or `1$` or `w$` to take it from the `usize` field `1` or `w`.
-- `.` and a precision in decimal digits, or `.1$` or `.p$` to take it from a `usize` field.
+- A width in decimal digits, or `1$` or `w$` to take it from the integer field `1` or `w`.
+- `.` and a precision in decimal digits, or `.1$` or `.p$` to take it from an integer field.
+  For an integer value the precision is a minimum count of digits, so `{:.3}` of 7 is `007`;
+  Rust ignores it there.
 - A type: `x` lowercase hexadecimal, `X` uppercase hexadecimal, `o` octal, `b` binary. These
   need an integer, and `#` adds the prefix `0x`, `0o`, or `0b`. `e` and `E` write a float in
   scientific notation, such as `1.25e3`; these need a float. `?` writes the [`Debug`](#Debug)
@@ -864,7 +867,8 @@ One template cannot mix tuple fields and record fields: `{}`, `{1}`, and `1$` ne
 and `{name}` and `w$` need a record. A template with tuple fields must use each field at
 least one time, as a value, a width, or a precision. A malformed template, a malformed
 option, a field that does not exist, or a type such as `x` on a value that it does not apply
-to is a compile error. A width or precision field that is not a `usize` is a type error.
+to is a compile error. A width or precision field that is not an integer is a compile error,
+and a negative one traps.
 `Sign.Space` and `color` are available only through [`FormatOptions`](#FormatOptions).
 
 #### Examples
