@@ -1500,6 +1500,7 @@ const program = Effect.gen(function* () {
     ["radixtext", templateUse('StderrWriter.print("{:x}\\n", &("Ada",))'), /error\[SEM0121\] A `\{:x\}`, `\{:X\}`, `\{:o\}`, or `\{:b\}` placeholder needs an integer, and this value is `string<'static>`\n/],
     ["exponentint", templateUse('StderrWriter.print("{:e}\\n", &(5,))'), /error\[SEM0121\] A `\{:e\}` or `\{:E\}` placeholder needs a float, and this value is `i32`\n/],
     ["unborrowed", templateUse('StderrWriter.print("{}\\n", 5)'), /error\[SEM0012\] This parameter takes a borrow, and this argument is i32; write `&` before it\n/],
+    ["reflectimport", "struct P { x: i32 }\n\npub fn main() -> i32 {\n  let mut n = 0\n  static for f in Reflect.fields<P>() { n = n + 1 }\n  return n\n}\n", /error\[SEM0009\] Unknown name Reflect; is `import silk\.reflect \{ Reflect \}` missing\?\n/],
     ["fieldless", templateUse('StderrWriter.print("{}\\n", &5)'), /error\[SEM0177\] a template with placeholders takes its values as fields, such as `&\.\{name: value\}`, `&\(a, b\)`, or `&\(a,\)` for one value; these arguments have no fields\n/],
   ]
   for (const [name, source, expected] of [...lendCases, ...patternCases, ...staticCases, ...interopCases, ...templateCases]) {
