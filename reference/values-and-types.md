@@ -1634,7 +1634,9 @@ backend reload rule,
 `A | B` denotes a finite, unordered, duplicate-free set of canonical ordinary value types. Nested
 unions flatten, member order does not affect identity, duplicate members disappear, `never` is the
 empty union, and a one-member union normalizes to that member. Members need not be nominal: scalars,
-arrays, `string`, and other detached concrete value types use the same union operation. A callable
+arrays, `string`, raw pointers such as `*mut Node` or `?*const u8`, and other detached concrete
+value types use the same union operation. A raw pointer carries no borrow lifetime, so it is an
+ordinary Copy member. A callable
 or Effect member must additionally retain one finite exact, opaque, or composite representation;
 its bare structural contract has no standalone storage layout.
 

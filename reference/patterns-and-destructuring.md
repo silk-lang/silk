@@ -378,8 +378,10 @@ fn normalize(value: i32 | bool) -> i32 {
 ```
 
 Here `i32 number` selects and binds the complete integer member; `bool flag` selects and binds the
-complete boolean member. The same form applies to admitted arrays, strings, finite represented
-callable or Effect values, and other detached ordinary members when their exact type can be written.
+complete boolean member. The same form applies to admitted arrays, strings, raw pointers, finite
+represented callable or Effect values, and other detached ordinary members when their exact type can
+be written. A raw pointer pattern starts with its type, as in `*mut Node node` or
+`?*const u8 bytes`, and a type alias for the member may name it too.
 
 **Boundary:** Field destructuring with `{ ... }` remains nominal-struct behavior. A scalar, array,
 string, or represented executable pattern can bind the complete member but exposes no invented
