@@ -1198,11 +1198,17 @@ const program = Effect.gen(function* () {
       files: { 'main.silk': "struct W<'t> { text: string<'t>, }\n\nfn f(l: &W, r: &W) -> bool { return l.text < r.text }\n\npub fn main() -> i32 {\n  return 0\n}\n" },
       pattern: /error\[SEM0135\] Operator < does not accept \(string, string\)/,
     },
-    // A block arm's last value is not its result.
+    // The arm blocks of a match used as a statement yield nothing.
     {
       name: 'blockarmvalue',
-      files: { 'main.silk': 'pub fn main() -> i32 {\n  let n = 1\n  let v = match n {\n    1 => {\n      0\n    }\n    _ => 2\n  }\n  return v\n}\n' },
-      pattern: /main\.silk:5:7: error\[SEM0087\] A match arm block does not yield its last value, so this value would be ignored; write the value as the arm itself, as in `pattern => value`, or `drop` it/,
+      files: { 'main.silk': 'pub fn main() -> i32 {\n  let n = 1\n  match n {\n    1 => {\n      0\n    }\n    _ => ()\n  }\n  return 0\n}\n' },
+      pattern: /main\.silk:5:7: error\[SEM0087\] This match is a statement, so the last value of its arm block is ignored; use the match as a value, as in `let x = match \.\.\.`, or `drop` this value/,
+    },
+    // An `if` used as a value needs a final `else`.
+    {
+      name: 'ifwithoutelse',
+      files: { 'main.silk': 'pub fn main() -> i32 {\n  let n = 1\n  let v = if n > 0 { 1 }\n  return v\n}\n' },
+      pattern: /main\.silk:3:11: error\[PAR0009\] An `if` used as a value needs a final `else` branch, so that every path produces a value; add `else \{ \.\.\. \}`, or write the `if` as a statement/,
     },
     {
       name: 'blockarmearly',

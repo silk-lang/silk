@@ -218,20 +218,19 @@ expression remain attached to their original source.
 **Evidence:** [grouped expression parser](../bootstrap/packages/compiler/src/Parser.ts),
 [expression TIR](../bootstrap/packages/compiler/src/Tir.ts).
 
-### EXPR-004 — Assignment and bootstrap `if` are statements, not value expressions
+### EXPR-004 — Assignment is a statement, not a value expression
 
 **Status:** Confirmed
 
 `place = value` replaces storage as a statement. It produces no value that can be bound, returned,
-passed as an argument, or chained into another assignment. Bootstrap `if` likewise selects a
-statement arm rather than producing a value; use an exhaustive `match` when selection must produce
-a value.
+passed as an argument, or chained into another assignment. An `if` produces a value only when its
+`else` chain ends in a final `else`, as IF-002 describes.
 
 ```silk
 pub fn main() -> i32 {
   let mut value = 1
   value = 42
-  return value
+  return if value > 0 { value } else { 0 }
 }
 ```
 
@@ -240,18 +239,19 @@ pub fn main() -> i32 {
 ```silk,ignore
 let assigned = (value = 42)
 left = right = 42
-let selected = if flag { 1 } else { 2 }
+let selected = if flag { 1 }
 ```
 
 Assignment is distinct from equality: `value = 42` replaces a place, while `value == 42` is a
 boolean expression.
 
-**Diagnostics:** Using assignment or `if` where an expression is required receives a parser
-diagnostic at that form. Invalid assignment places and replacements receive the semantic diagnostics
-defined by the assignment rules later on this page.
+**Diagnostics:** Using assignment where an expression is required receives a parser diagnostic at
+that form, and an `if` without a final `else` there reports `PAR0009`. Invalid assignment places
+and replacements receive the semantic diagnostics defined by the assignment rules later on this
+page.
 
 **Evidence:** assignment syntax specification,
-[conditional statement rule](functions-callables-and-control-flow.md#if-001--if-selects-one-statement-branch-using-a-boolean-condition),
+[conditional value rule](functions-callables-and-control-flow.md#if-002--an-if-with-a-final-else-is-a-value),
 [assignment parser](../bootstrap/packages/compiler/src/Parser.ts).
 
 ### EXPR-005 — A non-unit expression result must be used or explicitly discarded
