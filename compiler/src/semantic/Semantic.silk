@@ -2820,6 +2820,10 @@ pub struct Semantic {
   // their `ModuleCheck` units.
   moduleMemos: List<ModuleCheckMemo>,
   escapeMemos: List<EscapeMemo>,
+  declarationMemos: List<DeclarationMemo>,
+  // The memo of each declaration check unit, by unit.
+  declarationSlots: List<usize>,
+  pendingImage: Option<PendingImage>,
   // The module check units an unlinked cache adoption made current, which `cacheImage` leaves to
   // the image they came from, and the index of each one's root in that image.
   carriedUnits: List<usize>,
@@ -2849,6 +2853,18 @@ struct ModuleCheckMemo {
   sweep: Sweep,
   deferred: List<DeferredStaticTemplate>,
   unchecked: List<UncheckedBody>,
+}
+
+// The check of one declaration of a module sweep that found nothing to report, kept until its
+// unit is no longer current, so a sweep of its module after an edit elsewhere reuses it.
+struct DeclarationMemo {
+  // `usize.MAX` once the check is outdated.
+  unit: usize,
+  identity: DeclarationId,
+  // Whether the declaration is a concrete body the module's escape check walks.
+  concrete: bool,
+  // Whether an unlinked `adoptCache` reused it, so the image written carries it.
+  carried: bool,
 }
 
 // The escape check of one list of concrete bodies, kept until its unit is no longer current.
@@ -3081,6 +3097,11 @@ effect fn appendUnchecked(into: &mut List<UncheckedBody>, unchecked: &[Unchecked
 }
 
 // The position of `unit`'s memo, or `usize.MAX`.
+fn declarationMemoOf(slots: &[usize], unit: usize) -> usize {
+  if unit < slots.length { return slots[unit] }
+  return usize.MAX
+}
+
 fn memoOf(memos: &[ModuleCheckMemo], unit: usize) -> usize {
   let mut at = usize.ZERO
   while at < memos.length {
@@ -8498,6 +8519,21 @@ struct ImageBuild {
   fileModules: List<usize>,
 }
 
+// What `cacheImage` leaves for `imageCarriedChecks`: what each unit and dependee became, and the
+// checks it could not write, some of which rest on a check an unlinked adoption reused.
+struct PendingImage {
+  nodes: List<usize>,
+  files: List<usize>,
+  inputs: List<usize>,
+  fileModules: List<usize>,
+  checks: List<PendingCheck>,
+}
+
+struct PendingCheck {
+  unit: usize,
+  answer: Bytes,
+}
+
 effect fn slotFor(slots: &mut List<usize>, at: usize) -> () ! OutOfMemoryError ? &mut Allocator {
   while List<usize>.length(&slots.*) <= at { run List<usize>.append(&mut slots.*, unreached()) }
 }
@@ -8617,15 +8653,17 @@ effect fn checkAnswer(kind: u64, concrete: &[DeclarationId]) -> Bytes ! OutOfMem
   return move answer
 }
 
-effect fn imageRoot(resolver: &Resolver, build: &mut ImageBuild, unit: usize, answer: Bytes) -> ()
+// Writes the root of `unit` with `answer`, or gives `answer` back when the unit is unfit.
+effect fn imageRoot(resolver: &Resolver, build: &mut ImageBuild, unit: usize, answer: Bytes) -> Option<Bytes>
 ! OutOfMemoryError ? &mut Allocator {
   let key = match move run stableUnit(&resolver.*, unit) {
     Option<Bytes>.Some {value} => move value
-    Option<Bytes>.None => { return () }
+    Option<Bytes>.None => { return Option<Bytes>.none() }
   }
   let node = run imageUnit(&resolver.*, &mut build.*, unit)
-  if node >= unfit() { return () }
+  if node >= unfit() { return Option<Bytes>.some(move answer) }
   run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {key: move key, node: node, answer: move answer})
+  return Option<Bytes>.none()
 }
 
 // The digest of one module's source bytes, or zero when the module has no source.
@@ -8716,9 +8754,11 @@ effect fn readCheckKey(bytes: &[u8]) -> Option<CheckKey> ! OutOfMemoryError ? &m
   return Option<CheckKey>.some(CheckKey {module: move module, name: u64.toUsize(name), member: u64.toUsize(member)})
 }
 
-// The concrete bodies a module check root's answer names, and whether it is an escape check.
+// The concrete bodies a module check root's answer names, and what it checks: a sweep (0), an
+// escape check (1), or one declaration of a sweep, which names that declaration and is a concrete
+// body (3) or not (2).
 struct CheckAnswer {
-  escapes: bool,
+  kind: u64,
   concrete: List<DeclarationId>,
 }
 
@@ -8726,7 +8766,7 @@ effect fn readCheckAnswer(bytes: &[u8]) -> Option<CheckAnswer> ! OutOfMemoryErro
   let mut reader = StableKey.reader()
   let kind = StableKey.readWord(bytes, &mut reader)
   let count = StableKey.readWord(bytes, &mut reader)
-  if StableKey.failed(&reader) || kind > 1 { return Option<CheckAnswer>.none() }
+  if StableKey.failed(&reader) || kind > 3 || (kind > 1 && count != 1) { return Option<CheckAnswer>.none() }
   let mut concrete = List<DeclarationId>.make()
   let mut at: u64 = 0
   while at < count {
@@ -8737,7 +8777,7 @@ effect fn readCheckAnswer(bytes: &[u8]) -> Option<CheckAnswer> ! OutOfMemoryErro
     at = at + 1
   }
   if !StableKey.finished(bytes, &reader) { return Option<CheckAnswer>.none() }
-  return Option<CheckAnswer>.some(CheckAnswer {escapes: kind == 1, concrete: move concrete})
+  return Option<CheckAnswer>.some(CheckAnswer {kind: kind, concrete: move concrete})
 }
 
 effect fn verifyUnit(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, unit: usize) -> bool
@@ -8793,8 +8833,15 @@ effect fn bringCurrent(resolver: &mut Resolver, owner: &mut Query<Answer, NoReje
   }
   let scoped = List<ScopedKey>.get(&resolver.keys, unit)
   // A module check, or a unit adopted from a cache image, is no provider: it cannot rerun here,
-  // so the unit that consumed it reruns instead.
-  if scoped.key.family == Family.ModuleCheck { return false }
+  // so the unit that consumed it reruns instead, unless what it read is unchanged. Its result lives
+  // in its check's memo, not in the query, so verifying its edges alone brings it current.
+  if scoped.key.family == Family.ModuleCheck {
+    if run verifyUnit(&mut resolver.*, &mut owner.*, unit) {
+      Graph.markVerified(&mut resolver.graph, unit)
+      return true
+    }
+    return false
+  }
   drop run demandUnit(&mut resolver.*, &mut owner.*, scoped.key, word, Span {start: usize.ZERO, end: usize.ZERO})
   return Graph.current(&resolver.graph, unit)
 }
@@ -72745,7 +72792,11 @@ effect fn lowerMir(
     Result<List<MirConstantValue>, Shared<Rejection>>.Failure {error} => { return run mirRejection(&identity, move error, move dependencies) }
   }
   let failureType = run signatureFailure(&signature)
-  let sourceAnswer = run source(&mut resolver.*, &module)
+  // Lowering reads only literals of this declaration's body, through the anchor whose body read
+  // guards them, so an edit elsewhere in the module keeps the MIR. The site labels of an observing
+  // program count lines from the start of the file, which only the whole file guards.
+  let mut sourceAnswer = run demandSource(&mut resolver.*, &module)
+  if observing { sourceAnswer = run source(&mut resolver.*, &module) }
   let lowered = match move sourceOf(&resolver.*, &sourceAnswer, &module) {
     Option<&IndexedSource>.Some {value: indexed} => run Effect.result(
       MirFunction.lower(
@@ -83737,6 +83788,9 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
     uncheckedRoot: List<UncheckedBody>.make(),
     moduleMemos: List<ModuleCheckMemo>.make(),
     escapeMemos: List<EscapeMemo>.make(),
+    declarationMemos: List<DeclarationMemo>.make(),
+    declarationSlots: List<usize>.make(),
+    pendingImage: Option<PendingImage>.none(),
     carriedUnits: List<usize>.make(),
     carriedRoots: List<usize>.make(),
     checkRuns: usize.ZERO,
@@ -84548,8 +84602,11 @@ impl Semantic {
     if node != usize.MAX { run Graph.record(&mut self.resolver.graph, unit, Dependee.UnitResult {unit: node}) }
     else { run List<usize>.append(&mut self.carriedUnits, unit) }
     drop run Graph.finishRun(&mut self.resolver.graph, unit, Option<ContentHash>.none())
-    let CheckAnswer {escapes, concrete} = move kept
-    if escapes {
+    let CheckAnswer {kind, concrete} = move kept
+    if kind > 1 {
+      let mut named = move concrete
+      run Semantic.keepDeclaration(&mut self.*, unit, List<DeclarationId>.remove(&mut named, usize.ZERO), kind == 3, node == usize.MAX)
+    } else if kind == 1 {
       run List<EscapeMemo>.append(&mut self.escapeMemos, EscapeMemo {unit: unit, concrete: move concrete,
         result: DeclarationCheckResult {rejections: List<Shared<Rejection>>.make(), gaps: List<Shared<BackendGap>>.make(),
           unchecked: List<UncheckedDeclaration>.make()}, captured: Option<CapturedBuild>.none()})
@@ -84584,8 +84641,17 @@ impl Semantic {
     run reconcileSources(&mut self.resolver)
     let mut build = ImageBuild {image: CacheImage.make(), nodes: List<usize>.make(), files: List<usize>.make(),
       inputs: List<usize>.make(), fileModules: List<usize>.make()}
-    let sweeps = List<ModuleCheckMemo>.asSlice(&self.moduleMemos)
+    // A reused check rests on nothing here, so a check resting on it waits for its carried node.
+    let reused = List<usize>.asSlice(&self.carriedUnits)
     let mut at = usize.ZERO
+    while at < reused.length {
+      run slotFor(&mut build.nodes, reused[at])
+      List<usize>.set(&mut build.nodes, reused[at], unfit())
+      at = at + usize.ONE
+    }
+    let mut pending = List<PendingCheck>.make()
+    let sweeps = List<ModuleCheckMemo>.asSlice(&self.moduleMemos)
+    at = usize.ZERO
     while at < sweeps.length {
       let memo = &sweeps[at]
       at = at + usize.ONE
@@ -84598,7 +84664,24 @@ impl Semantic {
         continue
       }
       let answer = run checkAnswer(0, List<DeclarationId>.asSlice(&memo.sweep.concrete))
-      run imageRoot(&self.resolver, &mut build, memo.unit, move answer)
+      if let Option<Bytes>.Some {value} = move run imageRoot(&self.resolver, &mut build, memo.unit, move answer) {
+        run List<PendingCheck>.append(&mut pending, PendingCheck {unit: memo.unit, answer: move value})
+      }
+    }
+    let declarations = List<DeclarationMemo>.asSlice(&self.declarationMemos)
+    at = usize.ZERO
+    while at < declarations.length {
+      let memo = &declarations[at]
+      at = at + usize.ONE
+      if memo.unit == usize.MAX || memo.carried { continue }
+      let mut kind: u64 = 2
+      if memo.concrete { kind = 3 }
+      let mut named = List<DeclarationId>.make()
+      run List<DeclarationId>.append(&mut named, DeclarationId.copy(&memo.identity))
+      let answer = run checkAnswer(kind, List<DeclarationId>.asSlice(&named))
+      if let Option<Bytes>.Some {value} = move run imageRoot(&self.resolver, &mut build, memo.unit, move answer) {
+        run List<PendingCheck>.append(&mut pending, PendingCheck {unit: memo.unit, answer: move value})
+      }
     }
     let escapes = List<EscapeMemo>.asSlice(&self.escapeMemos)
     at = usize.ZERO
@@ -84612,7 +84695,9 @@ impl Semantic {
         continue
       }
       let answer = run checkAnswer(1, List<DeclarationId>.asSlice(&memo.concrete))
-      run imageRoot(&self.resolver, &mut build, memo.unit, move answer)
+      if let Option<Bytes>.Some {value} = move run imageRoot(&self.resolver, &mut build, memo.unit, move answer) {
+        run List<PendingCheck>.append(&mut pending, PendingCheck {unit: memo.unit, answer: move value})
+      }
     }
     // The last build's record and each definition it lowered, on the units it rests on. The
     // definitions a replay took from the image this store read, and a record no build here
@@ -84697,9 +84782,17 @@ impl Semantic {
       }
     }
     run Semantic.imageEscapes(&mut self.*, &mut build)
-    // A file leaf's digest is of the bytes its module holds now, read once the walk is done.
+    run Semantic.fileDigests(&mut self.*, &mut build, usize.ZERO)
+    let ImageBuild {image, nodes, files, inputs, fileModules} = move build
+    self.pendingImage = Option<PendingImage>.some(PendingImage {nodes: move nodes, files: move files, inputs: move inputs,
+      fileModules: move fileModules, checks: move pending})
+    return move image
+  }
+  // Fills the digest of each file leaf from the `from`th on with the bytes its module holds now,
+  // read once the walk is done.
+  effect fn fileDigests(self: &mut Self, build: &mut ImageBuild, from: usize) -> () ! Cycle | OutOfMemoryError ? &mut Allocator {
     let files = List<usize>.length(&build.fileModules)
-    let mut file = usize.ZERO
+    let mut file = from
     while file < files {
       let module = resolvedModule(&self.resolver, List<usize>.get(&build.fileModules, file))
       let leaf = List<usize>.get(&build.files, List<usize>.get(&build.fileModules, file))
@@ -84708,7 +84801,43 @@ impl Semantic {
       leaves[leaf].digest = digest
       file = file + usize.ONE
     }
-    return move build.image
+  }
+  /// Adds to `image`, once `CacheImage.carry` has copied into it what this store reused and given
+  /// `nodes`, the node of each check in `carried` order, the checks `cacheImage` could not write
+  /// because they rest on a reused check: such a check rests on that check's carried node, so a
+  /// module swept again after an edit keeps its root although it reused its other declarations.
+  pub effect fn imageCarriedChecks(self: &mut Self, image: &mut CacheImage.Image, nodes: &[usize]) -> ()
+    ! Cycle | OutOfMemoryError ? &mut Allocator {
+    let held = match move Intrinsic.replace(self.pendingImage, Option<PendingImage>.none()) {
+      Option<PendingImage>.Some {value} => move value
+      Option<PendingImage>.None => { return () }
+    }
+    let PendingImage {nodes: built, files, inputs, fileModules, checks} = move held
+    let mut build = ImageBuild {image: Intrinsic.replace(image.*, CacheImage.make()), nodes: move built, files: move files,
+      inputs: move inputs, fileModules: move fileModules}
+    // A unit unfit only for a reused check it reached is looked at again.
+    let mut slots = List<usize>.asMutSlice(&mut build.nodes)
+    let mut at = usize.ZERO
+    while at < slots.length {
+      if slots[at] == unfit() { slots[at] = unreached() }
+      at = at + usize.ONE
+    }
+    let reused = List<usize>.asSlice(&self.carriedUnits)
+    at = usize.ZERO
+    while at < reused.length {
+      run slotFor(&mut build.nodes, reused[at])
+      let mut node = unfit()
+      if at < nodes.length { node = nodes[at] }
+      List<usize>.set(&mut build.nodes, reused[at], node)
+      at = at + usize.ONE
+    }
+    let filled = List<usize>.length(&build.fileModules)
+    let mut waiting = move checks
+    while let Option<PendingCheck>.Some {value: check} = move List<PendingCheck>.pop(&mut waiting) {
+      drop run imageRoot(&self.resolver, &mut build, check.unit, move check.answer)
+    }
+    run Semantic.fileDigests(&mut self.*, &mut build, filled)
+    image.* = move build.image
   }
   /// Adds to `image`, once `CacheImage.carry` has copied into it what this store reused, the root of
   /// each escape check a replay made current (`replayEscapes`). The root rests on the walk's record
@@ -85231,6 +85360,7 @@ impl Semantic {
     if let Option<Bytes>.Some {value: stable} = move run stableUnit(&self.resolver, unit) {
       adopted = EscapeImage.take(&mut self.escapeImage, Bytes.asSlice(&stable))
     }
+    let mut kept = Option<EscapeRecordRoot>.none()
     if let Option<EscapeRecordRoot>.Some {value: held} = move adopted {
       let replayed = run Semantic.replayEscapes(&mut self.*, &mut request.*, concrete, Bytes.asSlice(&held.answer), held.root)
       if let Option<CapturedBuild>.Some {value: captured} = move replayed {
@@ -85240,6 +85370,7 @@ impl Semantic {
           result: run copyCheckResult(&result), captured: Option<CapturedBuild>.some(move captured)})
         return move result
       }
+      kept = Option<EscapeRecordRoot>.some(move held)
     }
     run Graph.startRun(&mut self.resolver.graph, unit)
     self.resolver.runs = self.resolver.runs + usize.ONE
@@ -85275,6 +85406,13 @@ impl Semantic {
       }
     }
     drop run Graph.finishRun(&mut self.resolver.graph, unit, Option<ContentHash>.none())
+    // A walk that records nothing, as one that reports does, leaves the adopted record to the next
+    // check, which replays it once the walk is back to what the record describes, as after a fix.
+    if let Option<CapturedBuild>.None = &captured {
+      if let Option<EscapeRecordRoot>.Some {value: held} = move kept {
+        run List<EscapeRecordRoot>.append(&mut self.escapeImage.records, move held)
+      }
+    }
     run List<EscapeMemo>.append(&mut self.escapeMemos, EscapeMemo {unit: unit, concrete: run copyDeclarations(concrete),
       result: run copyCheckResult(&result), captured: move captured})
     return move result
@@ -85414,10 +85552,90 @@ impl Semantic {
     let written = List<DeclarationCheck>.asSlice(&listed.declarations)
     let mut at = usize.ZERO
     while at < written.length {
-      run Semantic.checkListedDeclaration(&mut self.*, &mut request.*, module, moduleOrdinal, &written[at], &mut sweep.*)
+      run Semantic.sweptDeclaration(&mut self.*, &mut request.*, module, moduleOrdinal, &written[at], &mut sweep.*)
       at = at + usize.ONE
     }
     return ()
+  }
+
+  // Checks one declaration of a sweep that records its reads in a unit of its own, so a later
+  // sweep of the module, after an edit elsewhere in it, reuses a check that found nothing while
+  // what it read stands, as an image the next process adopts does too.
+  effect fn sweptDeclaration(
+    self: &mut Self,
+    request: &mut Request,
+    module: &ModuleId,
+    moduleOrdinal: usize,
+    declaration: &DeclarationCheck,
+    sweep: &mut Sweep
+  ) -> ()
+    ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+    ? &mut Allocator | &mut Types {
+    let recorder = self.resolver.rootRecorder
+    if recorder == usize.MAX || !Graph.recording(&self.resolver.graph) {
+      return run Semantic.checkListedDeclaration(&mut self.*, &mut request.*, module, moduleOrdinal, declaration, &mut sweep.*)
+    }
+    // The identity names the unit, so a declaration written above another keeps both units.
+    let member = u64.toUsize(u64.shiftRight(DeclarationId.hash(&declaration.identity), 1))
+    let word = run internKey(&mut self.resolver, Key {family: Family.ModuleCheck, module: moduleOrdinal, name: 6,
+      declaration: usize.MAX, member: member, external: false})
+    let unit = u64.toUsize(word.value)
+    let found = declarationMemoOf(List<usize>.asSlice(&self.declarationSlots), unit)
+    if found != usize.MAX {
+      let memos = List<DeclarationMemo>.asSlice(&self.declarationMemos)
+      let concrete = memos[found].concrete
+      let same = DeclarationId.equals(&memos[found].identity, &declaration.identity)
+      if same && run Semantic.unitCurrent(&mut self.*, unit) {
+        if concrete { run List<DeclarationId>.append(&mut sweep.concrete, DeclarationId.copy(&declaration.identity)) }
+        run Graph.record(&mut self.resolver.graph, recorder, Dependee.UnitResult {unit: unit})
+        return ()
+      }
+      Semantic.forgetDeclaration(&mut self.*, found)
+    }
+    let rejections = List<Shared<Rejection>>.length(&sweep.rejections)
+    let gaps = List<Shared<BackendGap>>.length(&sweep.gaps)
+    let unchecked = List<UncheckedDeclaration>.length(&sweep.unchecked)
+    let concrete = List<DeclarationId>.length(&sweep.concrete)
+    let deferred = List<DeferredStaticTemplate>.length(&self.deferredTemplates)
+    let uncheckedBodies = List<UncheckedBody>.length(&self.uncheckedRoot)
+    run Graph.startRun(&mut self.resolver.graph, unit)
+    self.resolver.rootRecorder = unit
+    let attempted = run Effect.result(Semantic.checkListedDeclaration(&mut self.*, &mut request.*, module, moduleOrdinal, declaration, &mut sweep.*))
+    self.resolver.rootRecorder = recorder
+    if let Result<(), Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} = move attempted {
+      fail move error
+    }
+    drop run Graph.finishRun(&mut self.resolver.graph, unit, Option<ContentHash>.none())
+    run Graph.record(&mut self.resolver.graph, recorder, Dependee.UnitResult {unit: unit})
+    if List<Shared<Rejection>>.length(&sweep.rejections) == rejections && List<Shared<BackendGap>>.length(&sweep.gaps) == gaps
+      && List<UncheckedDeclaration>.length(&sweep.unchecked) == unchecked
+      && List<DeferredStaticTemplate>.length(&self.deferredTemplates) == deferred
+      && List<UncheckedBody>.length(&self.uncheckedRoot) == uncheckedBodies {
+      run Semantic.keepDeclaration(&mut self.*, unit, DeclarationId.copy(&declaration.identity),
+        List<DeclarationId>.length(&sweep.concrete) > concrete, false)
+    }
+    return ()
+  }
+
+  // Keeps the clean check of one declaration, the unit `unit` names.
+  effect fn keepDeclaration(self: &mut Self, unit: usize, identity: DeclarationId, concrete: bool, carried: bool) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
+    while List<usize>.length(&self.declarationSlots) <= unit { run List<usize>.append(&mut self.declarationSlots, usize.MAX) }
+    List<usize>.set(&mut self.declarationSlots, unit, List<DeclarationMemo>.length(&self.declarationMemos))
+    run List<DeclarationMemo>.append(&mut self.declarationMemos, DeclarationMemo {unit: unit, identity: move identity,
+      concrete: concrete, carried: carried})
+  }
+
+  // Drops the declaration check memo `found`, which no longer describes its declaration.
+  fn forgetDeclaration(self: &mut Self, found: usize) -> () {
+    let held = List<DeclarationMemo>.asSlice(&self.declarationMemos)
+    let unit = held[found].unit
+    let carried = held[found].carried
+    if carried { uncarry(&mut self.carriedUnits, &mut self.carriedRoots, unit) }
+    let mut memos = List<DeclarationMemo>.asMutSlice(&mut self.declarationMemos)
+    memos[found].unit = usize.MAX
+    memos[found].carried = false
+    List<usize>.set(&mut self.declarationSlots, unit, usize.MAX)
   }
 
   // Ends a sweep with the foreign symbol claims of `modules` and the escapes of its concrete bodies.
