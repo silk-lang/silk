@@ -320,11 +320,12 @@ semantic analysis could not close.
 
 **Status:** Confirmed
 
-A recursively reachable call normally reuses its current concrete generic arguments. A concrete
-interface witness may delegate through a bounded helper to another concrete specialization when
-its type arguments do not grow, or when a concrete field or type argument strictly descends while
-other type arguments remain fixed or descend. Hidden Effect identities may differ on a strict
-descent. These routes keep specialization finite.
+A recursively reachable call normally reuses its current concrete generic arguments. Any recursive
+call, direct or through an interface witness, may instead move a type argument into the owned
+structure of the earlier one while other type arguments remain fixed or descend. A concrete
+interface witness may also delegate through a bounded helper to another concrete specialization
+when its type arguments do not grow. Hidden Effect identities may differ on a strict descent. These
+routes keep specialization finite.
 
 ```silk,ignore
 fn walk<T>(value: T, remaining: i32) -> T {
@@ -345,16 +346,38 @@ A `Drop` hook that cleanup selects is such a witness. When dropping a `Box<State
 no larger than before, so the second drop is admitted even though `Node<i32>` is not part of
 `State<i32>`.
 
-A recursive application may also change a type argument to a type that lies within the owned
-structure of the earlier one: a field of it, a field of one of its fields, or a part of such a type.
-`Debug` for `Option<Line>` calls the generic helper `Format.debugField` for a `Line`; when `Line`
-writes its field `weight: Option<i32>`, the same helper runs for `Option<i32>`, which lies inside
-`Line`. The owned structure of a type is finite, because a declaration unfolds beneath itself only
-at a strictly smaller application, and the active path never repeats an exact application, so these
-re-entries stay finite.
+A recursive application may change a type argument to a type that lies within the owned structure
+of the earlier one: a part of it, a field or variant payload of it, a field of one of its fields,
+or a part of such a type. The earlier application is the nearest active application of the same
+function. `Debug` for `Option<Line>` calls the generic helper `Format.debugField` for a `Line`;
+when `Line` writes its field `weight: Option<i32>`, the same helper runs for `Option<i32>`, which
+lies inside `Line`. Ordinary generic calls descend the same way, which lets reflection walk nested
+types:
 
-**Boundary:** Ordinary polymorphic recursion that changes a type argument is outside the stable
-model. Witness delegation that grows a type argument along a recursive call cycle is also invalid:
+```silk,ignore
+fn count<T>() -> i32 {
+  let mut total = 1
+  static for field in Reflect.fields<T>() {
+    total = total + visit(field)
+  }
+  return total
+}
+
+fn visit<Owner, Sub>(static field: Intrinsic.Field<Owner, Option<Sub>>) -> i32 {
+  return count<Sub>()
+}
+```
+
+`count<Root>` reaches `count<Branch>` when `Root` has a field `branch: Option<Branch>`. Static
+arguments may change along such a descent. The owned structure of a type is finite, because a
+declaration unfolds beneath itself only at a strictly smaller application, and a descent may not
+return to an active application whose type arguments it repeats, so these re-entries stay finite.
+A recursive type such as `Node { next: Option<Box<Node>> }` admits `count<Box<Node>>` below
+`count<Node>`, and refuses the step back to `count<Node>`.
+
+**Boundary:** Ordinary polymorphic recursion that changes a type argument to a type outside the
+owned structure of the earlier one is outside the stable model, even when the new type is no larger.
+Witness delegation that grows a type argument along a recursive call cycle is also invalid:
 
 ```silk,ignore
 fn grow<T>(value: T) -> i32 {
