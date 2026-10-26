@@ -1458,7 +1458,15 @@ const program = Effect.gen(function* () {
     ["plainmismatch", "pub fn main() -> i32 {\n  let count: i32 = \"three\"\n  return count\n}\n", /error\[SEM0037\] Assignment expected i32 but received string<'static>\n/],
     ["ignored", "fn bump(n: i32) -> i32 { return n + 1 }\n\npub fn main() -> i32 {\n  bump(2)\n  return 0\n}\n", /error\[SEM0087\] Expression statement produces i32, but only \(\) or never may be ignored; write `drop` before it to discard the value\n/],
   ]
-  for (const [name, source, expected] of [...lendCases, ...patternCases]) {
+  const staticCases: Array<[string, string, RegExp]> = [
+    ["staticoverflow", "static fn grow(n: u8) -> u8 { return n + 100 }\nconst BIG: u8 = grow(200)\npub fn main() -> i32 { return 0 }\n", /error\[SEM0176\] Static evaluation of `n \+ 100` overflows its integer type\n/],
+    ["staticzero", "static fn fib(n: u64) -> u64 { if n < 2 { return n } return fib(n - 1) + fib(n - 2) }\nconst Q: u64 = fib(20) / (fib(0))\npub fn main() -> i32 { return 0 }\n", /error\[SEM0176\] Static evaluation of `fib\(20\) \/ \(fib\(0\)\)` divides by zero\n/],
+    ["staticbyte", "import silk.static_text { StaticText }\nstatic fn at(text: string<'static>) -> u8 { return StaticText.byteAt(text, 50) }\nconst L: u8 = at(\"loud!!\")\npub fn main() -> i32 { return 0 }\n", /error\[SEM0176\] Static evaluation stops: index 50 is past the end of the 6-byte text\n/],
+    ["staticplain", "fn plain() -> i32 { return 3 }\nstatic fn s() -> i32 { return plain() }\nconst P: i32 = s()\npub fn main() -> i32 { return 0 }\n", /error\[SEM0176\] `plain` is an ordinary fn, so static evaluation cannot call it; mark it `static fn` to call it here\n/],
+    ["phasebinding", "import silk.reflect { Reflect }\npub struct Stats { pub hits: i32, }\npub fn main() -> i32 { let f = Reflect.fields<Stats>() return 0 }\n", /error\[SEM0176\] Phase-only values exist only during static evaluation, so a runtime binding of a phase-only value is not allowed\n/],
+    ["constcycle", "const A: i32 = B\nconst B: i32 = A\npub fn main() -> i32 { return A }\n", /error\[SEM0223\] `A` and `B` depend on each other in a cycle, so none of them can be resolved\n/],
+  ]
+  for (const [name, source, expected] of [...lendCases, ...patternCases, ...staticCases]) {
     yield* fs.makeDirectory(join(directory, `${name}/src`), { recursive: true })
     yield* fs.writeFileString(join(directory, `${name}/silk.toml`), `[package]\nname = "${name}"\nversion = "0.1.0"\n`)
     yield* fs.writeFileString(join(directory, `${name}/src/main.silk`), source)
