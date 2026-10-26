@@ -10,7 +10,7 @@ import backend.InstanceIdentity {InstanceIdentity}
 import backend.StackLifetimes
 import backend.StackLifetimes {BlockMarkers, Marker}
 import backend.Layout {Abi, Field, Layout, Metrics, Sequence, Slice as SliceFacts, Tagged as TaggedFacts, TypeLayout}
-import backend.TypeLayouts {TypeLayouts}
+import backend.TypeLayouts {DataSpan, TypeLayouts}
 import backend.Gap {Code as GapCode, Gap, Source as GapSource}
 import backend.Mir
 import backend.Mir {
@@ -857,6 +857,15 @@ effect fn layoutOf(layouts: &TypeLayouts, ty: &Shared<Type>, function: &MirFunct
 // compiled without them, so their address is passed instead (SIMD-009).
 fn passedIndirectly(kind: Representation) -> bool {
   return kind.lanes != usize.ZERO && (kind.lanes > 16 || kind.bits * kind.lanes > 128)
+}
+
+// Whether a Silk definition marks a parameter's address `noalias`. A parameter passed by address
+// names storage the caller holds for this call alone: MIR passes a fresh temporary snapshot of
+// the argument, or a place the call moves out of, so nothing else reads or writes it until the
+// callee returns. Without the mark LLVM must assume a store through another pointer, such as a
+// field written into the callee's destination, can change the argument, and keeps an extra copy.
+fn exclusiveParameter(facts: Metrics, lane: Representation) -> bool {
+  return facts.abi == Abi.Indirect || passedIndirectly(lane)
 }
 
 // Whether `function` is a C export shim, whose lanes follow the C ABI instead (SIMD-010).
@@ -3051,23 +3060,15 @@ effect fn emitScalarRvalue(
   }
 }
 
-effect fn storeValue(writer: &mut Writer, address: &Address, value: &Value) -> ()
-! OutOfMemoryError ? &mut Allocator {
+effect fn storeValue(writer: &mut Writer, layouts: &TypeLayouts, address: &Address, value: &Value) -> ()
+! OutOfMemoryError ? &mut Allocator | &mut Types {
   if address.representation.unit { return () }
   // Source and destination may overlap, as when a member is injected into a slot of its own place.
   if address.representation.aggregate {
     if address.representation.unionAlignment != usize.ZERO && address.representation.size == 16 {
       return run storePackedUnion(&mut writer.*, address, value)
     }
-    run append(&mut writer.*, b"call void @llvm.memmove.p0.p0.i64(ptr align ")
-    run decimal(&mut writer.*, address.alignment)
-    run append(&mut writer.*, b" ")
-    run append(&mut writer.*, Bytes.asSlice(&address.text))
-    run append(&mut writer.*, b", ptr ")
-    run append(&mut writer.*, Bytes.asSlice(&value.text))
-    run append(&mut writer.*, b", i64 ")
-    run decimal(&mut writer.*, address.representation.size)
-    return run append(&mut writer.*, b", i1 false)\n")
+    return run storeData(&mut writer.*, layouts, address, value)
   }
   run append(&mut writer.*, b"store ")
   run typeName(&mut writer.*, address.representation)
@@ -3076,6 +3077,62 @@ effect fn storeValue(writer: &mut Writer, address: &Address, value: &Value) -> (
   run append(&mut writer.*, b", ptr ")
   run append(&mut writer.*, Bytes.asSlice(&address.text))
   return run memoryAlignment(&mut writer.*, address.alignment)
+}
+
+// Copies an aggregate's data bytes and not its padding: one `llvm.memmove` per data span. A
+// whole-size copy of a record built in a temporary also copies the temporary's never-written
+// padding, so LLVM cannot forward a field the temporary received by copy (a moved payload) to the
+// final place and keeps both copies. Two places of one type overlap exactly or not at all, so
+// copying span by span is a correct move when they overlap.
+effect fn storeData(writer: &mut Writer, layouts: &TypeLayouts, address: &Address, value: &Value) -> ()
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let size = address.representation.size
+  let mut spans = match move run TypeLayouts.dataSpans(layouts, &address.ty) {
+    Option<List<DataSpan>>.Some {value: listed} => move listed
+    Option<List<DataSpan>>.None => List<DataSpan>.make()
+  }
+  let listed = List<DataSpan>.asSlice(&spans)
+  let mut covered = usize.ZERO
+  let mut at = usize.ZERO
+  while at < listed.length {
+    covered = covered + listed[at].length
+    at = at + usize.ONE
+  }
+  // A missing layout, a layout of another size (an injected member's slot keeps the union's type)
+  // or a record without padding copies whole.
+  let last = listed.length
+  if last == usize.ZERO || covered == size || listed[last - usize.ONE].offset + listed[last - usize.ONE].length > size {
+    List<DataSpan>.clear(&mut spans)
+    run List<DataSpan>.append(&mut spans, DataSpan {offset: usize.ZERO, length: size})
+  }
+  let copied = List<DataSpan>.asSlice(&spans)
+  at = usize.ZERO
+  while at < copied.length {
+    let offset = copied[at].offset
+    let alignment = offsetAlignment(address.alignment, offset)
+    if offset == usize.ZERO {
+      run moveBytes(&mut writer.*, alignment, Bytes.asSlice(&address.text), Bytes.asSlice(&value.text), copied[at].length)
+    } else {
+      let destination = run byteOffset(&mut writer.*, Bytes.asSlice(&address.text), offset)
+      let source = run byteOffset(&mut writer.*, Bytes.asSlice(&value.text), offset)
+      run moveBytes(&mut writer.*, alignment, Bytes.asSlice(&destination), Bytes.asSlice(&source), copied[at].length)
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn moveBytes(writer: &mut Writer, alignment: usize, destination: &[u8], source: &[u8], length: usize) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  run append(&mut writer.*, b"call void @llvm.memmove.p0.p0.i64(ptr align ")
+  run decimal(&mut writer.*, alignment)
+  run append(&mut writer.*, b" ")
+  run append(&mut writer.*, destination)
+  run append(&mut writer.*, b", ptr ")
+  run append(&mut writer.*, source)
+  run append(&mut writer.*, b", i64 ")
+  run decimal(&mut writer.*, length)
+  return run append(&mut writer.*, b", i1 false)\n")
 }
 
 // A 16-byte union (a tag and a word, like an optional word or an interpreter's value cell) copies
@@ -3140,7 +3197,7 @@ effect fn emitAssign(
       let selectedField = run projectField(&mut writer.*, function, target, layouts,
         &address, operands[fieldAt].index, span)
       let operand = run emitOperand(&mut writer.*, function, target, layouts, &operands[fieldAt].value)
-      run storeValue(&mut writer.*, &selectedField, &operand)
+      run storeValue(&mut writer.*, layouts, &selectedField, &operand)
       fieldAt = fieldAt + usize.ONE
     }
     return ()
@@ -3159,7 +3216,7 @@ effect fn emitAssign(
     let payload = run byteOffset(&mut writer.*, Bytes.asSlice(&address.text), facts.payloadOffset)
     let slot = Address {ty: Shared<Type>.clone(&address.ty), text: move payload,
       alignment: offsetAlignment(address.alignment, facts.payloadOffset), representation: operand.scalar}
-    run storeValue(&mut writer.*, &slot, &operand)
+    run storeValue(&mut writer.*, layouts, &slot, &operand)
     return ()
   }
   if let Rvalue.Variant {tag, fields} = &value.* {
@@ -3180,7 +3237,7 @@ effect fn emitAssign(
       let fieldAddress = run byteOffset(&mut writer.*, Bytes.asSlice(&address.text), selected.offset)
       let slot = Address {ty: move selected.ty, text: move fieldAddress,
         alignment: offsetAlignment(address.alignment, selected.offset), representation: operand.scalar}
-      run storeValue(&mut writer.*, &slot, &operand)
+      run storeValue(&mut writer.*, layouts, &slot, &operand)
       fieldAt = fieldAt + usize.ONE
     }
     return ()
@@ -3228,7 +3285,7 @@ effect fn emitAssign(
     }
   }
   let selected = run emitScalarRvalue(&mut writer.*, function, target, layouts, value, span)
-  run storeValue(&mut writer.*, &address, &selected)
+  run storeValue(&mut writer.*, layouts, &address, &selected)
   return ()
 }
 
@@ -3268,14 +3325,14 @@ effect fn emitReturn(
   if fallible {
     let output = Address {ty: Shared<Type>.clone(&function.result), text: run Bytes.copy(b"%out"),
       alignment: resultLayout.alignment, representation: kind}
-    run storeValue(&mut writer.*, &output, &value)
+    run storeValue(&mut writer.*, layouts, &output, &value)
     run append(&mut writer.*, b"ret i1 0\n")
     return ()
   }
   if kind.aggregate || (!cExport(function) && passedIndirectly(kind)) {
     let output = Address {ty: Shared<Type>.clone(&function.result), text: run Bytes.copy(b"%out"),
       alignment: resultLayout.alignment, representation: kind}
-    run storeValue(&mut writer.*, &output, &value)
+    run storeValue(&mut writer.*, layouts, &output, &value)
     run append(&mut writer.*, b"ret void\n")
     return ()
   }
@@ -3530,7 +3587,7 @@ effect fn emitFail(writer: &mut Writer, function: &MirFunction, target: &Target,
     let value = run emitOperand(&mut writer.*, function, target, layouts, &failed)
     let output = Address {ty: Shared<Type>.clone(&locals[local].ty), text: run Bytes.copy(b"%fail"),
       alignment: failureLayout.alignment, representation: kind}
-    run storeValue(&mut writer.*, &output, &value)
+    run storeValue(&mut writer.*, layouts, &output, &value)
   }
   run append(&mut writer.*, b"ret i1 1\n")
   return ()
@@ -3843,7 +3900,7 @@ effect fn emitCCall(writer: &mut Writer, function: &MirFunction, target: &Target
   }
   run finishInvoke(&mut writer.*)
   if returned.passing == CPassing.Coerce { run writeCRecord(&mut writer.*, returned, Bytes.asSlice(&result), Bytes.asSlice(&output.text)) }
-  else if hasResult { run storeValue(&mut writer.*, &output, &Value {scalar: output.representation, text: move result}) }
+  else if hasResult { run storeValue(&mut writer.*, layouts, &output, &Value {scalar: output.representation, text: move result}) }
   run append(&mut writer.*, b"br label %")
   run label(&mut writer.*, normal)
   return run append(&mut writer.*, b"\n")
@@ -4016,7 +4073,7 @@ effect fn emitCallInner(
   }
   if !kind.unit && !outward {
     let value = Value {scalar: kind, text: move returned}
-    run storeValue(&mut writer.*, &output, &value)
+    run storeValue(&mut writer.*, layouts, &output, &value)
   }
   run append(&mut writer.*, b"br label %")
   run label(&mut writer.*, normal)
@@ -4051,7 +4108,7 @@ effect fn emitForeignStaticRead(
     representation: output.representation,
   }
   let value = run loadAddress(&mut writer.*, &object)
-  return run storeValue(&mut writer.*, &output, &value)
+  return run storeValue(&mut writer.*, layouts, &output, &value)
 }
 
 effect fn emitBlock(
@@ -4339,7 +4396,7 @@ effect fn emitEntrySlots(
     let address = Address {ty: Shared<Type>.clone(&parameters[local]), text: move addressName.text,
       alignment: parameterLayout.alignment, representation: kind}
     let value = Value {scalar: kind, text: move input}
-    run storeValue(&mut writer.*, &address, &value)
+    run storeValue(&mut writer.*, layouts, &address, &value)
     local = local + usize.ONE
   }
   return run emitHiddenStores(&mut writer.*, function)
@@ -4527,6 +4584,7 @@ pub effect fn emit(
         lanes = lanes + usize.ONE
         if facts.abi == Abi.Indirect || passedIndirectly(lane) { run append(&mut writer, b"ptr") }
         else { run typeName(&mut writer, lane) }
+        if exclusiveParameter(facts, lane) { run append(&mut writer, b" noalias") }
         run append(&mut writer, b" %p")
         run decimal(&mut writer, at)
       }
@@ -5024,7 +5082,7 @@ effect fn emitEnter(writer: &mut Writer, function: &MirFunction, target: &Target
       let address = Address {ty: Shared<Type>.clone(&parameters[at]), text: move slot,
         alignment: offsetAlignment(stepping.coroutine.alignment, offset), representation: kind}
       let value = Value {scalar: kind, text: move parameterName.text}
-      run storeValue(&mut writer.*, &address, &value)
+      run storeValue(&mut writer.*, layouts, &address, &value)
     }
     at = at + usize.ONE
   }
@@ -5250,7 +5308,7 @@ effect fn emitStepReturn(writer: &mut Writer, function: &MirFunction, target: &T
     let value = run emitOperand(&mut writer.*, function, target, layouts, &returned)
     let output = Address {ty: Shared<Type>.clone(&function.result), text: run Bytes.copy(b"%out"),
       alignment: resultLayout.alignment, representation: kind}
-    run storeValue(&mut writer.*, &output, &value)
+    run storeValue(&mut writer.*, layouts, &output, &value)
   }
   let mut failed = Option<bool>.none()
   if failureLocal(function) != usize.MAX { failed = Option<bool>.some(false) }
@@ -5273,7 +5331,7 @@ effect fn emitStepFail(writer: &mut Writer, function: &MirFunction, target: &Tar
     let value = run emitOperand(&mut writer.*, function, target, layouts, &failedValue)
     let output = Address {ty: Shared<Type>.clone(&locals[local].ty), text: run Bytes.copy(b"%fail"),
       alignment: failureLayout.alignment, representation: kind}
-    run storeValue(&mut writer.*, &output, &value)
+    run storeValue(&mut writer.*, layouts, &output, &value)
   }
   return run emitPop(&mut writer.*, target, stepping, Option<bool>.some(true))
 }
