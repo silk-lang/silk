@@ -268,7 +268,7 @@ pub fn main() -> i32 {
   assert.match(result.stderr, /Effect\.result/, show(result))
 })
 
-test('an unhandled error prints its fields, not only its type', { todo: 'finding 44' }, () => {
+test('an unhandled error prints its fields, not only its type', () => {
   const dir = initPackage(h, 'unhandledjson')
   write(join(dir, 'src/main.silk'), `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
