@@ -26,7 +26,11 @@
 //! under another entry.
 //!
 //! Every word is big-endian and every byte run is length-delimited, as `StableKey` reads them.
-//! Malformed bytes decode to none.
+//! A record is written denser, since one walk reaches hundreds of thousands of references: after
+//! its format word, its counts and indexes are unsigned LEB128 varints, an index of `usize.MAX`
+//! written as zero and any other one higher; each root, exact key and declaration is written as
+//! the length it shares with the one before it and the rest; and each edge is written once, with
+//! each reference naming it by its place among them. Malformed bytes decode to none.
 
 import backend.InstanceText {InstanceText}
 import backend.LlvmText
@@ -38,11 +42,13 @@ import silk.allocator {Allocator, OutOfMemoryError}
 import silk.bytes {Bytes}
 import silk.list {List}
 import silk.option {Option}
+import silk.slice {Slice}
+import silk.u8
 import silk.u64
 import silk.usize
 
 // Changes whenever the layout below changes.
-const FORMAT: u64 = 4
+const FORMAT: u64 = 5
 
 /// An escape walk's leaf for a foreign declaration, which has no body to walk.
 pub const FOREIGN: u64 = 1
@@ -103,34 +109,42 @@ pub fn make(observing: bool) -> Record {
 pub effect fn encode(record: &Record) -> Bytes ! OutOfMemoryError ? &mut Allocator {
   let mut output = Bytes.make()
   run Encoding.word(&mut output, FORMAT)
-  if record.observing { run Encoding.word(&mut output, 1) } else { run Encoding.word(&mut output, 0) }
+  if record.observing { run varint(&mut output, 1) } else { run varint(&mut output, 0) }
   let roots = List<Bytes>.asSlice(&record.roots)
-  run Encoding.word(&mut output, usize.toU64(roots.length))
+  run varint(&mut output, usize.toU64(roots.length))
   let mut at = usize.ZERO
   while at < roots.length {
-    run Encoding.field(&mut output, Bytes.asSlice(&roots[at]))
+    run front(&mut output, Bytes.asSlice(&roots[at]), previousRoot(record, at))
     at = at + usize.ONE
   }
   let entries = List<Entry>.asSlice(&record.entries)
-  run Encoding.word(&mut output, usize.toU64(entries.length))
+  let edges = run distinctEdges(entries)
+  let listed = List<Bytes>.asSlice(&edges)
+  run varint(&mut output, usize.toU64(listed.length))
+  at = usize.ZERO
+  while at < listed.length {
+    run written(&mut output, Bytes.asSlice(&listed[at]))
+    at = at + usize.ONE
+  }
+  run varint(&mut output, usize.toU64(entries.length))
   at = usize.ZERO
   while at < entries.length {
     let entry = &entries[at]
-    run Encoding.field(&mut output, Bytes.asSlice(&entry.exact))
+    run front(&mut output, Bytes.asSlice(&entry.exact), previousExact(record, at))
     run Encoding.word(&mut output, entry.hash)
-    run Encoding.word(&mut output, entry.family)
-    run Encoding.field(&mut output, Bytes.asSlice(&entry.declaration))
-    run Encoding.word(&mut output, usize.toU64(entry.parent))
-    run Encoding.word(&mut output, usize.toU64(entry.position))
-    if entry.requested { run Encoding.word(&mut output, 1) } else { run Encoding.word(&mut output, 0) }
-    run Encoding.word(&mut output, usize.toU64(entry.alias))
-    run Encoding.word(&mut output, entry.leaf)
+    run varint(&mut output, entry.family)
+    run front(&mut output, Bytes.asSlice(&entry.declaration), previousDeclaration(record, at))
+    run index(&mut output, entry.parent)
+    run index(&mut output, entry.position)
+    if entry.requested { run varint(&mut output, 1) } else { run varint(&mut output, 0) }
+    run index(&mut output, entry.alias)
+    run varint(&mut output, entry.leaf)
     let references = List<Reference>.asSlice(&entry.references)
-    run Encoding.word(&mut output, usize.toU64(references.length))
+    run varint(&mut output, usize.toU64(references.length))
     let mut reference = usize.ZERO
     while reference < references.length {
-      run Encoding.word(&mut output, usize.toU64(references[reference].target))
-      run Encoding.field(&mut output, Bytes.asSlice(&references[reference].edge))
+      run varint(&mut output, usize.toU64(references[reference].target))
+      run varint(&mut output, usize.toU64(edgeIndex(listed, Bytes.asSlice(&references[reference].edge))))
       reference = reference + usize.ONE
     }
     run Encoding.word(&mut output, entry.summary.high)
@@ -140,73 +154,237 @@ pub effect fn encode(record: &Record) -> Bytes ! OutOfMemoryError ? &mut Allocat
   return move output
 }
 
-// A word that must name a position below `limit` or be `usize.MAX`; marks the reader failed
-// otherwise.
-fn readIndex(bytes: &[u8], reader: &mut StableKey.Reader, limit: usize) -> usize {
-  let value = StableKey.readWord(bytes, &mut reader.*)
-  if value == usize.toU64(usize.MAX) { return usize.MAX }
-  if value >= usize.toU64(limit) {
-    // Reading past the end of no bytes marks the reader failed.
-    drop StableKey.readWord(b"", &mut reader.*)
-    return usize.MAX
+// Each distinct edge `entries` reference, in first-reference order. A walk's references carry
+// only a handful of distinct edges.
+effect fn distinctEdges(entries: &[Entry]) -> List<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  let mut edges = List<Bytes>.make()
+  let mut at = usize.ZERO
+  while at < entries.length {
+    let references = List<Reference>.asSlice(&entries[at].references)
+    let mut reference = usize.ZERO
+    while reference < references.length {
+      let edge = Bytes.asSlice(&references[reference].edge)
+      if edgeIndex(List<Bytes>.asSlice(&edges), edge) == usize.MAX { run List<Bytes>.append(&mut edges, run Bytes.copy(edge)) }
+      reference = reference + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return move edges
+}
+
+fn edgeIndex(edges: &[Bytes], edge: &[u8]) -> usize {
+  let mut at = usize.ZERO
+  while at < edges.length {
+    if sameBytes(Bytes.asSlice(&edges[at]), edge) { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+fn sameBytes(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn previousRoot(record: &Record, at: usize) -> &[u8] {
+  if at == usize.ZERO { return b"" }
+  return Bytes.asSlice(&List<Bytes>.asSlice(&record.roots)[at - usize.ONE])
+}
+
+fn previousExact(record: &Record, at: usize) -> &[u8] {
+  if at == usize.ZERO { return b"" }
+  return Bytes.asSlice(&List<Entry>.asSlice(&record.entries)[at - usize.ONE].exact)
+}
+
+fn previousDeclaration(record: &Record, at: usize) -> &[u8] {
+  if at == usize.ZERO { return b"" }
+  return Bytes.asSlice(&List<Entry>.asSlice(&record.entries)[at - usize.ONE].declaration)
+}
+
+effect fn varint(output: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut rest = value
+  let mut buffer: [u8; 10] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let mut length = usize.ZERO
+  while rest >= 128 {
+    buffer[length] = u64.toU8(u64.bitAnd(rest, 127) + 128)
+    rest = u64.shiftRight(rest, 7)
+    length = length + usize.ONE
+  }
+  buffer[length] = u64.toU8(rest)
+  return run Bytes.append(&mut output.*, Slice.view<u8>(&buffer, usize.ZERO, length + usize.ONE))
+}
+
+// An index, with `usize.MAX` written as zero and any other one higher.
+effect fn index(output: &mut Bytes, value: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value == usize.MAX { return run varint(&mut output.*, 0) }
+  return run varint(&mut output.*, usize.toU64(value) + 1)
+}
+
+effect fn written(output: &mut Bytes, value: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run varint(&mut output.*, usize.toU64(value.length))
+  return run Bytes.append(&mut output.*, value)
+}
+
+// `value` as the length it shares with `previous` and the rest.
+effect fn front(output: &mut Bytes, value: &[u8], previous: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut common = usize.ZERO
+  while common < value.length && common < previous.length && value[common] == previous[common] { common = common + usize.ONE }
+  run varint(&mut output.*, usize.toU64(common))
+  return run written(&mut output.*, Slice.view<u8>(value, common, value.length - common))
+}
+
+// A position in the varint part of a record; a failed read leaves it failed.
+struct Cursor {
+  at: usize,
+  failed: bool,
+}
+
+fn readVarint(bytes: &[u8], cursor: &mut Cursor) -> u64 {
+  let mut value: u64 = 0
+  let mut shift: u64 = 0
+  while !cursor.failed {
+    if cursor.at >= bytes.length || shift > 63 {
+      cursor.failed = true
+      return 0
+    }
+    let byte = bytes[cursor.at]
+    cursor.at = cursor.at + usize.ONE
+    value = u64.bitOr(value, u64.shiftLeft(u8.toU64(byte % 128), shift))
+    if byte < 128 { return value }
+    shift = shift + 7
+  }
+  return 0
+}
+
+// A count that cannot exceed the bytes left, since every counted item takes at least one byte.
+fn readCount(bytes: &[u8], cursor: &mut Cursor) -> usize {
+  let value = readVarint(bytes, &mut cursor.*)
+  if cursor.failed || value > usize.toU64(bytes.length - cursor.at) {
+    cursor.failed = true
+    return usize.ZERO
   }
   return u64.toUsize(value)
+}
+
+// An index [`index`] wrote, which must be `usize.MAX` or below `limit`.
+fn readIndexed(bytes: &[u8], cursor: &mut Cursor, limit: usize) -> usize {
+  let value = readVarint(bytes, &mut cursor.*)
+  if value == 0 { return usize.MAX }
+  if value - 1 >= usize.toU64(limit) { cursor.failed = true }
+  if cursor.failed { return usize.MAX }
+  return u64.toUsize(value - 1)
+}
+
+// A plain varint that must be below `limit`.
+fn readBelow(bytes: &[u8], cursor: &mut Cursor, limit: usize) -> usize {
+  let value = readVarint(bytes, &mut cursor.*)
+  if value >= usize.toU64(limit) { cursor.failed = true }
+  if cursor.failed { return usize.ZERO }
+  return u64.toUsize(value)
+}
+
+fn readFixed(bytes: &[u8], cursor: &mut Cursor) -> u64 {
+  if cursor.failed || bytes.length - cursor.at < 8 {
+    cursor.failed = true
+    return 0
+  }
+  let mut value: u64 = 0
+  let mut at = usize.ZERO
+  while at < 8 {
+    value = u64.bitOr(u64.shiftLeft(value, 8), u8.toU64(bytes[cursor.at + at]))
+    at = at + usize.ONE
+  }
+  cursor.at = cursor.at + 8
+  return value
+}
+
+effect fn readWritten(bytes: &[u8], cursor: &mut Cursor) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let length = readCount(bytes, &mut cursor.*)
+  if cursor.failed { return Bytes.make() }
+  let start = cursor.at
+  cursor.at = cursor.at + length
+  return run Bytes.copy(Slice.view<u8>(bytes, start, length))
+}
+
+// Bytes [`front`] wrote after `previous`.
+effect fn readFront(bytes: &[u8], cursor: &mut Cursor, previous: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let common = readVarint(bytes, &mut cursor.*)
+  let length = readCount(bytes, &mut cursor.*)
+  if cursor.failed || common > usize.toU64(previous.length) {
+    cursor.failed = true
+    return Bytes.make()
+  }
+  let shared = u64.toUsize(common)
+  let mut value = run Bytes.copy(Slice.view<u8>(previous, usize.ZERO, shared))
+  run Bytes.append(&mut value, Slice.view<u8>(bytes, cursor.at, length))
+  cursor.at = cursor.at + length
+  return move value
 }
 
 /// Reads a record [`encode`] wrote, or none when the bytes are not one. A parent or alias names
 /// an earlier entry and a reference names any entry, or the record is refused.
 pub effect fn decode(bytes: &[u8]) -> Option<Record> ! OutOfMemoryError ? &mut Allocator {
   let mut reader = StableKey.reader()
-  if StableKey.readWord(bytes, &mut reader) != FORMAT { return Option<Record>.none() }
-  let observing = StableKey.readWord(bytes, &mut reader) == 1
-  let mut record = make(observing)
-  let rootCount = StableKey.readWord(bytes, &mut reader)
-  if StableKey.failed(&reader) || rootCount > usize.toU64(bytes.length) { return Option<Record>.none() }
-  let mut at: u64 = 0
-  while at < rootCount {
-    let root = StableKey.readField(bytes, &mut reader)
-    if StableKey.failed(&reader) { return Option<Record>.none() }
-    run List<Bytes>.append(&mut record.roots, run Bytes.copy(StableKey.view(bytes, root)))
-    at = at + 1
+  if StableKey.readWord(bytes, &mut reader) != FORMAT || StableKey.failed(&reader) { return Option<Record>.none() }
+  let mut cursor = Cursor {at: 8, failed: false}
+  let observed = readVarint(bytes, &mut cursor)
+  let mut record = make(observed == 1)
+  let rootCount = readCount(bytes, &mut cursor)
+  let mut at = usize.ZERO
+  while at < rootCount && !cursor.failed {
+    let root = run readFront(bytes, &mut cursor, previousRoot(&record, at))
+    run List<Bytes>.append(&mut record.roots, move root)
+    at = at + usize.ONE
   }
-  let entryCount = StableKey.readWord(bytes, &mut reader)
-  if StableKey.failed(&reader) || entryCount > usize.toU64(bytes.length) { return Option<Record>.none() }
-  let total = u64.toUsize(entryCount)
+  let edgeCount = readCount(bytes, &mut cursor)
+  let mut edges = List<Bytes>.make()
+  at = usize.ZERO
+  while at < edgeCount && !cursor.failed {
+    run List<Bytes>.append(&mut edges, run readWritten(bytes, &mut cursor))
+    at = at + usize.ONE
+  }
+  let total = readCount(bytes, &mut cursor)
+  if observed > 1 || cursor.failed { return Option<Record>.none() }
+  let listed = List<Bytes>.asSlice(&edges)
   let mut entry = usize.ZERO
   while entry < total {
-    let exact = StableKey.readField(bytes, &mut reader)
-    let hash = StableKey.readWord(bytes, &mut reader)
-    let family = StableKey.readWord(bytes, &mut reader)
-    let declaration = StableKey.readField(bytes, &mut reader)
-    let parent = readIndex(bytes, &mut reader, entry)
-    let position = u64.toUsize(StableKey.readWord(bytes, &mut reader))
-    let requested = StableKey.readWord(bytes, &mut reader)
-    let alias = readIndex(bytes, &mut reader, entry)
-    let leaf = StableKey.readWord(bytes, &mut reader)
-    let referenceCount = StableKey.readWord(bytes, &mut reader)
-    if StableKey.failed(&reader) || referenceCount > usize.toU64(bytes.length) || requested > 1 || (requested == 1 && parent == usize.MAX)
-      || leaf > LEFT {
+    let exact = run readFront(bytes, &mut cursor, previousExact(&record, entry))
+    let hash = readFixed(bytes, &mut cursor)
+    let family = readVarint(bytes, &mut cursor)
+    let declaration = run readFront(bytes, &mut cursor, previousDeclaration(&record, entry))
+    let parent = readIndexed(bytes, &mut cursor, entry)
+    let position = readIndexed(bytes, &mut cursor, usize.MAX)
+    let requested = readVarint(bytes, &mut cursor)
+    let alias = readIndexed(bytes, &mut cursor, entry)
+    let leaf = readVarint(bytes, &mut cursor)
+    let referenceCount = readCount(bytes, &mut cursor)
+    if cursor.failed || requested > 1 || (requested == 1 && parent == usize.MAX) || leaf > LEFT {
       return Option<Record>.none()
     }
     let mut references = List<Reference>.make()
-    let mut reference: u64 = 0
+    let mut reference = usize.ZERO
     while reference < referenceCount {
-      let target = readIndex(bytes, &mut reader, total)
-      let edge = StableKey.readField(bytes, &mut reader)
-      if StableKey.failed(&reader) || target == usize.MAX { return Option<Record>.none() }
-      run List<Reference>.append(&mut references, Reference {target: target, edge: run Bytes.copy(StableKey.view(bytes, edge))})
-      reference = reference + 1
+      let target = readBelow(bytes, &mut cursor, total)
+      let edge = readBelow(bytes, &mut cursor, listed.length)
+      if cursor.failed { return Option<Record>.none() }
+      run List<Reference>.append(&mut references, Reference {target: target, edge: run Bytes.copy(Bytes.asSlice(&listed[edge]))})
+      reference = reference + usize.ONE
     }
-    let high = StableKey.readWord(bytes, &mut reader)
-    let low = StableKey.readWord(bytes, &mut reader)
-    if StableKey.failed(&reader) { return Option<Record>.none() }
-    run List<Entry>.append(&mut record.entries, Entry {exact: run Bytes.copy(StableKey.view(bytes, exact)), hash: hash, family: family,
-      declaration: run Bytes.copy(StableKey.view(bytes, declaration)), parent: parent, position: position,
+    let high = readFixed(bytes, &mut cursor)
+    let low = readFixed(bytes, &mut cursor)
+    if cursor.failed { return Option<Record>.none() }
+    run List<Entry>.append(&mut record.entries, Entry {exact: move exact, hash: hash, family: family,
+      declaration: move declaration, parent: parent, position: position,
       requested: requested == 1, alias: alias, leaf: leaf,
       references: move references, summary: ContentHash {high: high, low: low}})
     entry = entry + usize.ONE
   }
-  if !StableKey.finished(bytes, &reader) { return Option<Record>.none() }
+  if cursor.at != bytes.length { return Option<Record>.none() }
   return Option<Record>.some(move record)
 }
 
