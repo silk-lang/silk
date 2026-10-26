@@ -93,9 +93,16 @@ remains runtime even when its initializer is a literal; preserving the value for
 requires `let static`. Inside a `static fn`, ordinary locals and control flow are already static and
 do not require `let static`.
 
+Only a type-qualified call to a function or inherent method, such as `Leaf.own(&leaf, spec)`,
+supplies static arguments in this release. Method-call syntax (`leaf.own(spec)`) and any call of an
+interface operation that declares a `static` parameter, through the interface or method syntax,
+cannot supply them yet. An implementing type gives the operation's body an inherent function and
+callers name that function.
+
 **Diagnostics:** Passing a runtime value to a static parameter, reading a runtime local from static
 evaluation, or using a runtime operation in a static initializer reports `SEM0176` at the operation
-and identifies the static boundary that required the value.
+and identifies the static boundary that required the value. A call through method syntax or an
+interface operation to a function with `static` parameters reports `SEM0249` at the call.
 
 **Evidence:** explicit static modes,
 static syntax recovery.
