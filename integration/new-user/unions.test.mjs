@@ -50,54 +50,54 @@ test('a negative integer pattern works as the first arm', () => {
   assert.equal(result.status, 0, show(result))
 })
 
-test('a negative integer pattern after an expression arm is a pattern, not a subtraction', { todo: 'finding 150' }, () => {
+test('a negative integer pattern after an expression arm is a pattern, not a subtraction', () => {
   const result = silk(h, ['run'], { cwd: source(pick('    7 => 1\n    -1 => 2\n    i32 other => other')) })
   assert.equal(result.status, 0, show(result))
 })
 
-test('return as an arm body says to write a block', { todo: 'finding 151' }, () => {
+test('return as an arm body says to write a block', () => {
   const result = check(variant('    Maybe<usize>.None => {\n      return 1\n    }', '    Maybe<usize>.None => return 1'))
   assert.equal(errors(result).length, 1, show(result))
   assert.match(result.stderr, /\{ return/)
 })
 
-test('an integer in a field pattern is one error, not a cascade', { todo: 'finding 151' }, () => {
+test('an integer in a field pattern is one error, not a cascade', () => {
   const result = check(variant('    Event.Retag { index, kind: Kind.Book } => false', '    Event.Retag { index, kind: 3 } => false'))
   assert.equal(errors(result).length, 1, show(result))
 })
 
-test('a comma between arms is one error', { todo: 'finding 151' }, () => {
+test('a comma between arms is one error', () => {
   const result = check(variant('    Kind.Fruit => 1', '    Kind.Fruit => 1,'))
   assert.equal(errors(result).length, 1, show(result))
 })
 
-test('a plain identifier pattern says to use a binder or _', { todo: 'finding 151' }, () => {
+test('a plain identifier pattern says to use a binder or _', () => {
   const result = check(variant('    i32 stock => stock', '    stock => stock'))
   assert.doesNotMatch(result.stderr, /Unknown type stock/)
 })
 
-test('a record pattern without a field names the field', { todo: 'finding 152' }, () => {
+test('a record pattern without a field names the field', () => {
   const result = check(variant('Event.Restock { index, amount } => restock', 'Event.Restock { index } => restock'))
   assert.match(result.stderr, /error\[SEM0046\].*`amount`/)
 })
 
-test('a binder of a type the union lacks names the type', { todo: 'finding 152' }, () => {
+test('a binder of a type the union lacks names the type', () => {
   const result = check(variant('    i32 stock => stock', '    i64 stock => 5'))
   assert.match(result.stderr, /error\[SEM0042\].*i64/)
 })
 
-test('narrowing a structural union names the missing member', { todo: 'finding 152' }, () => {
+test('narrowing a structural union names the missing member', () => {
   const result = check(variant('fn score(outcome: i32 | Refused | bool) -> i32 {', 'fn narrow(o: i32 | Refused | bool) -> i32 | bool {\n  return o\n}\n\nfn score(outcome: i32 | Refused | bool) -> i32 {'))
   assert.match(result.stderr, /error\[SEM0040\].*Refused/)
 })
 
-test('braces on a unit variant say to drop them, without a rule id', { todo: 'finding 152' }, () => {
+test('braces on a unit variant say to drop them, without a rule id', () => {
   const result = check(variant('    Event.Close => true', '    Event.Close {} => true'))
   assert.match(result.stderr, /error\[SEM0224\]/)
   assert.doesNotMatch(result.stderr, /PATT-\d+/)
 })
 
-test('an ignored Effect gets the drop hint once', { todo: 'finding 153' }, () => {
+test('an ignored Effect gets the drop hint once', () => {
   const result = check(source('import silk.effect { Effect }\n\neffect fn tick() -> i32 {\n  return 1\n}\n\npub fn main() -> i32 {\n  tick()\n  return 0\n}\n'))
   assert.match(result.stderr, /error\[SEM0087\]/)
   assert.equal(result.stderr.split('drop').length - 1, 1, show(result))
