@@ -717,7 +717,8 @@ not evaluate `if` values.
 
 **Diagnostics:** An `if` without a final `else` in expression position reports `PAR0009` at the
 `if` keyword and suggests adding `else { ... }` or writing the `if` as a statement. Branch types
-that cannot join report `SEM0049`, and a branch that does not match an expected type reports the
+that cannot join report `SEM0049`, which names the branches of the `if` and notes that a block
+ending in a statement such as `let` produces `()`, and a branch that does not match an expected type reports the
 ordinary mismatch for that position.
 
 **Evidence:** conditional expression parser, conditional expression checking in the semantic
@@ -754,8 +755,9 @@ there is an ignored result under STMT-001. A borrow of a block local cannot leav
 the local ends at the closing brace.
 
 **Diagnostics:** A yielded value that does not match the expected type reports the ordinary
-mismatch for that position. A value left at the end of an arm block of a statement match reports
-`SEM0087` and suggests using the match as a value or dropping the value. A yielded borrow of a
+mismatch for that position. A value left at the end of an arm block of a statement match, or of
+a branch block of a statement `if`, reports `SEM0087` and suggests using the match or `if` as a
+value or dropping the value. A yielded borrow of a
 block local reports `OWN0019` at the use of the borrow.
 
 **Evidence:** value block checking in the semantic pass, block value lowering in MIR, native corpus

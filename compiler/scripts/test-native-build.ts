@@ -1210,6 +1210,18 @@ const program = Effect.gen(function* () {
       files: { 'main.silk': 'pub fn main() -> i32 {\n  let n = 1\n  let v = if n > 0 { 1 }\n  return v\n}\n' },
       pattern: /main\.silk:3:11: error\[PAR0009\] An `if` used as a value needs a final `else` branch, so that every path produces a value; add `else \{ \.\.\. \}`, or write the `if` as a statement/,
     },
+    // `if` branches that cannot join are named as branches, not match arms.
+    {
+      name: 'ifbranchjoin',
+      files: { 'main.silk': 'pub fn main() -> i32 {\n  let n = 1\n  let t = if n > 0 { let a = 3 } else { 4 }\n  return 0\n}\n' },
+      pattern: /main\.silk:3:11: error\[SEM0049\] The branches of this `if` have no common result type; a branch whose block ends in a statement, such as `let`, produces `\(\)`/,
+    },
+    // A value left at the end of a statement `if` branch says the `if` is a statement.
+    {
+      name: 'ifstatementvalue',
+      files: { 'main.silk': 'pub fn main() -> i32 {\n  let n = 1\n  if n > 0 { 3 } else { 4 }\n  return 0\n}\n' },
+      pattern: /main\.silk:3:14: error\[SEM0087\] This `if` is a statement, so the last value of its branch block is ignored; with a final `else`, use the `if` as a value, as in `let x = if \.\.\.`, or `drop` this value/,
+    },
     {
       name: 'blockarmearly',
       files: { 'main.silk': 'pub fn main() -> i32 {\n  let n = 1\n  match n {\n    1 => {\n      0\n      return 1\n    }\n    _ => ()\n  }\n  return 0\n}\n' },
