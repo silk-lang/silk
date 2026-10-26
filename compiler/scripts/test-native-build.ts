@@ -1466,7 +1466,15 @@ const program = Effect.gen(function* () {
     ["phasebinding", "import silk.reflect { Reflect }\npub struct Stats { pub hits: i32, }\npub fn main() -> i32 { let f = Reflect.fields<Stats>() return 0 }\n", /error\[SEM0176\] Phase-only values exist only during static evaluation, so a runtime binding of a phase-only value is not allowed\n/],
     ["constcycle", "const A: i32 = B\nconst B: i32 = A\npub fn main() -> i32 { return A }\n", /error\[SEM0223\] `A` and `B` depend on each other in a cycle, so none of them can be resolved\n/],
   ]
-  for (const [name, source, expected] of [...lendCases, ...patternCases, ...staticCases]) {
+  const interopCases: Array<[string, string, RegExp]> = [
+    ["safeexport", "export \"C\" fn twice(v: i32) -> i32 {\n  return v * 2\n}\n\npub fn main() -> i32 {\n  return twice(0)\n}\n", /error\[SEM0082\] `twice\(\.\.\.\)` is unsafe; write `unsafe twice\(\.\.\.\)`, or put it in an `unsafe \{ \}` block\n/],
+    ["staticread", "export \"C\" static calls: i32 = 4\n\npub fn main() -> i32 {\n  return calls\n}\n", /error\[SEM0082\] Reading `calls` is unsafe; put it in an `unsafe \{ \}` block\n/],
+    ["nocallbacks", "unsafe extern \"C\" fn qsort(base: [*]mut u8, count: usize, size: usize, compare: extern \"C\" fn([*]const u8, [*]const u8) -> i32) -> ()\n\nexport \"C\" fn cmp(a: [*]const u8, b: [*]const u8) -> i32 { return 0 }\n\npub fn main() -> i32 {\n  return 0\n}\n", /error\[SEM0187\] A C function-pointer parameter must be named in the declaration's properties; add `with Intrinsic\.foreign\(callbacks: \("compare",\)\)`\n/],
+    ["plaincallback", "import silk.pointer { Pointer }\nunsafe extern \"C\" fn qsort(base: ?[*]mut u8, count: usize, size: usize, compare: extern \"C\" fn([*]const u8, [*]const u8) -> i32) -> () with Intrinsic.foreign(callbacks: (\"compare\",))\n\nfn cmp(a: [*]const u8, b: [*]const u8) -> i32 { return 0 }\n\npub fn main() -> i32 {\n  let mut items: [u8; 4] = [3, 1, 2, 0]\n  unsafe qsort(Pointer.fromMutSlice(&mut items), 4, 1, cmp)\n  return 0\n}\n", /error\[SEM0012\] This parameter takes a C function pointer, and a Silk fn has no C address; pass an `export "C" fn` here\n/],
+    ["boolstatic", "export \"C\" static calls: bool = false\n\npub fn main() -> i32 {\n  return 0\n}\n", /error\[SEM0187\] A C static holds one C integer, float, or pointer, so it cannot have type bool\n/],
+    ["assignstatic", "export \"C\" static calls: i32 = 0\n\npub fn main() -> i32 {\n  unsafe { calls = 1 }\n  return 0\n}\n", /error\[SEM0036\] `calls` is a C static, which Silk code can read but not assign\n/],
+  ]
+  for (const [name, source, expected] of [...lendCases, ...patternCases, ...staticCases, ...interopCases]) {
     yield* fs.makeDirectory(join(directory, `${name}/src`), { recursive: true })
     yield* fs.writeFileString(join(directory, `${name}/silk.toml`), `[package]\nname = "${name}"\nversion = "0.1.0"\n`)
     yield* fs.writeFileString(join(directory, `${name}/src/main.silk`), source)
@@ -1488,6 +1496,12 @@ const program = Effect.gen(function* () {
     assert.equal(built.status, 1, built.stderr)
     assert.match(built.stderr, expected)
   }
+  // Silk code may call an `export "C"` function directly, through its C symbol.
+  yield* fs.makeDirectory(join(directory, 'callexport/src'), { recursive: true })
+  yield* fs.writeFileString(join(directory, 'callexport/silk.toml'), '[package]\nname = "callexport"\nversion = "0.1.0"\n')
+  yield* fs.writeFileString(join(directory, 'callexport/src/main.silk'), "export \"C\" fn twice(v: i32) -> i32 {\n  return v * 2\n}\n\npub fn main() -> i32 {\n  return unsafe twice(21)\n}\n")
+  const exportCall = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(directory, 'callexport'), { ...process.env, SILK_CLANG: clang })
+  assert.equal(exportCall.status, 42, exportCall.stderr)
   // A line that starts with `-1 =>` is the next arm, not a subtraction from the arm before it.
   yield* fs.makeDirectory(join(directory, 'negarm/src'), { recursive: true })
   yield* fs.writeFileString(join(directory, 'negarm/silk.toml'), '[package]\nname = "negarm"\nversion = "0.1.0"\n')
