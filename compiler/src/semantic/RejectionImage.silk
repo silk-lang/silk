@@ -1,0 +1,292 @@
+//! Stable bytes for the rejections a module check reports, so a cache image can hold a check
+//! that reported and a later process can report it again without checking.
+//!
+//! # Details
+//! A rejection is written with its modules and declarations in their stable forms
+//! (`StableKey`), never a process-local ordinal. One that holds a static-phase fault or a
+//! specialization path is not written: its caller leaves the check out of the image, and it
+//! runs again.
+
+import lexer.Span {Span}
+import semantic.DeclarationId {DeclarationId}
+import semantic.ModuleId {ModuleId}
+import semantic.Rejection {GenericKind, MessageArgument, RelatedSite, Rejection, RejectionCode, TerminationStep, WitnessProblem}
+import semantic.RuntimeEncoding as Encoding
+import semantic.Specialization {Application}
+import semantic.StableKey {Reader}
+import semantic.StableKey
+import semantic.StaticExecution {Diagnostic as StaticDiagnostic}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.bytes {Bytes}
+import silk.list {List}
+import silk.option {Option}
+import silk.shared {Shared}
+import silk.u16
+import silk.u64
+import silk.usize
+
+// What a rejection holds besides its byte runs and declarations, read in one access.
+struct Parts {
+  writable: bool,
+  code: u16,
+  module: ModuleId,
+  span: Span,
+  related: Option<RelatedSite>,
+  path: usize,
+  expected: usize,
+  supplied: usize,
+  expectedKind: u64,
+  suppliedKind: u64,
+  witness: u64,
+  operand: usize,
+  termination: u64,
+  arguments: usize,
+}
+
+/// Appends `rejection` to `output`, and the module of each site it names to `modules`; false, with
+/// `output` as it may be partly written, when it holds what this encoding does not carry.
+pub effect fn encode(output: &mut Bytes, rejection: &Shared<Rejection>, modules: &mut List<ModuleId>) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let parts = Shared<Rejection>.with<Parts>(rejection, partsOf)
+  if !parts.writable { return false }
+  run Encoding.word(&mut output.*, u16.toU64(parts.code))
+  run StableKey.module(&mut output.*, &parts.module)
+  run Encoding.word(&mut output.*, usize.toU64(parts.span.start))
+  run Encoding.word(&mut output.*, usize.toU64(parts.span.end))
+  run List<ModuleId>.append(&mut modules.*, ModuleId.copy(&parts.module))
+  if let Option<RelatedSite>.Some {value} = &parts.related {
+    run Encoding.word(&mut output.*, 1)
+    run StableKey.module(&mut output.*, &value.module)
+    run Encoding.word(&mut output.*, usize.toU64(value.span.start))
+    run Encoding.word(&mut output.*, usize.toU64(value.span.end))
+    run List<ModuleId>.append(&mut modules.*, ModuleId.copy(&value.module))
+  } else {
+    run Encoding.word(&mut output.*, 0)
+  }
+  run Encoding.word(&mut output.*, usize.toU64(parts.path))
+  let mut at = usize.ZERO
+  while at < parts.path {
+    let member = Shared<Rejection>.with<DeclarationId>(rejection, fn(held: &Rejection) -> DeclarationId {
+      return DeclarationId.copyShared(&List<Shared<DeclarationId>>.asSlice(&held.path)[at])
+    })
+    run StableKey.declaration(&mut output.*, &member)
+    at = at + usize.ONE
+  }
+  run Encoding.word(&mut output.*, usize.toU64(parts.expected))
+  run Encoding.word(&mut output.*, usize.toU64(parts.supplied))
+  let name = run heldBytes(rejection, usize.MAX)
+  run Encoding.field(&mut output.*, Bytes.asSlice(&name))
+  run Encoding.word(&mut output.*, parts.expectedKind)
+  run Encoding.word(&mut output.*, parts.suppliedKind)
+  run Encoding.word(&mut output.*, parts.witness)
+  run Encoding.word(&mut output.*, usize.toU64(parts.operand))
+  run Encoding.word(&mut output.*, parts.termination)
+  run Encoding.word(&mut output.*, usize.toU64(parts.arguments))
+  at = usize.ZERO
+  while at < parts.arguments * 2 {
+    let held = run heldBytes(rejection, at)
+    run Encoding.field(&mut output.*, Bytes.asSlice(&held))
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// Reads one rejection [`encode`] wrote, or none, with the reader failed, when the bytes are not
+/// one. The rejection is unclaimed: no query unit owns it.
+pub effect fn decode(bytes: &[u8], reader: &mut Reader) -> Option<Rejection> ! OutOfMemoryError ? &mut Allocator {
+  let value = StableKey.readWord(bytes, &mut reader.*)
+  let mut code = Option<RejectionCode>.none()
+  if value <= u16.toU64(u16.MAX) { code = Rejection.codeOf(u64.toU16(value)) }
+  let module = run StableKey.readModule(bytes, &mut reader.*)
+  let span = readSpan(bytes, &mut reader.*)
+  let mut related = Option<RelatedSite>.none()
+  if StableKey.readWord(bytes, &mut reader.*) == 1 {
+    if let Option<ModuleId>.Some {value: site} = move run StableKey.readModule(bytes, &mut reader.*) {
+      related = Option<RelatedSite>.some(RelatedSite {module: move site, span: readSpan(bytes, &mut reader.*)})
+    }
+  }
+  let count = StableKey.readWord(bytes, &mut reader.*)
+  let mut path = List<Shared<DeclarationId>>.make()
+  let mut at: u64 = 0
+  while at < count && !StableKey.failed(&reader.*) {
+    if let Option<DeclarationId>.Some {value: member} = move run StableKey.readDeclaration(bytes, &mut reader.*) {
+      run List<Shared<DeclarationId>>.append(&mut path, run Shared<DeclarationId>.make(move member))
+    }
+    at = at + 1
+  }
+  let expected = u64.toUsize(StableKey.readWord(bytes, &mut reader.*))
+  let supplied = u64.toUsize(StableKey.readWord(bytes, &mut reader.*))
+  let name = StableKey.readField(bytes, &mut reader.*)
+  let expectedKind = kindOf(StableKey.readWord(bytes, &mut reader.*))
+  let suppliedKind = kindOf(StableKey.readWord(bytes, &mut reader.*))
+  let witnessTag = StableKey.readWord(bytes, &mut reader.*)
+  let operand = u64.toUsize(StableKey.readWord(bytes, &mut reader.*))
+  let terminationTag = StableKey.readWord(bytes, &mut reader.*)
+  let arguments = StableKey.readWord(bytes, &mut reader.*)
+  let mut listed = List<MessageArgument>.make()
+  at = 0
+  while at < arguments && !StableKey.failed(&reader.*) {
+    let held = StableKey.readField(bytes, &mut reader.*)
+    let shown = StableKey.readField(bytes, &mut reader.*)
+    run List<MessageArgument>.append(&mut listed, MessageArgument {name: run Bytes.copy(StableKey.view(bytes, held)),
+      value: run Bytes.copy(StableKey.view(bytes, shown))})
+    at = at + 1
+  }
+  let witness = witnessOf(witnessTag, operand)
+  let termination = terminationOf(terminationTag)
+  if StableKey.failed(&reader.*) || witnessTag > 15 || terminationTag > 2 { return failed(&mut reader.*) }
+  let found = match move code {
+    Option<RejectionCode>.Some {value: known} => known
+    Option<RejectionCode>.None => { return failed(&mut reader.*) }
+  }
+  let site = match move module {
+    Option<ModuleId>.Some {value: known} => move known
+    Option<ModuleId>.None => { return failed(&mut reader.*) }
+  }
+  return Option<Rejection>.some(Rejection {code: found, module: move site, span: span, related: move related, path: move path,
+    expected: expected, supplied: supplied, parameterName: run Bytes.copy(StableKey.view(bytes, name)),
+    expectedKind: expectedKind, suppliedKind: suppliedKind, witness: move witness, termination: termination,
+    staticFailure: Option<StaticDiagnostic>.none(), specialization: List<Application>.make(), arguments: move listed,
+    owner: usize.MAX})
+}
+
+// Marks `reader` failed, as a read past its end does.
+fn failed(reader: &mut Reader) -> Option<Rejection> {
+  drop StableKey.readWord(&[], &mut reader.*)
+  return Option<Rejection>.none()
+}
+
+fn readSpan(bytes: &[u8], reader: &mut Reader) -> Span {
+  let start = u64.toUsize(StableKey.readWord(bytes, &mut reader.*))
+  let end = u64.toUsize(StableKey.readWord(bytes, &mut reader.*))
+  if end < start { return Span.make(start, start) }
+  return Span.make(start, end)
+}
+
+fn partsOf(held: &Rejection) -> Parts {
+  let mut writable = List<Application>.length(&held.specialization) == usize.ZERO
+  if let Option<StaticDiagnostic>.Some {..} = &held.staticFailure { writable = false }
+  let code = RejectionCode.value(held.code)
+  // A member the inverse does not give back would read as another code.
+  if let Option<RejectionCode>.Some {value} = Rejection.codeOf(code) {
+    if value != held.code { writable = false }
+  } else { writable = false }
+  let mut related = Option<RelatedSite>.none()
+  if let Option<RelatedSite>.Some {value} = &held.related {
+    related = Option<RelatedSite>.some(RelatedSite {module: ModuleId.copy(&value.module), span: value.span})
+  }
+  let mut witness: u64 = 0
+  let mut operand = usize.ZERO
+  if let Option<WitnessProblem>.Some {value} = &held.witness {
+    witness = witnessTag(value)
+    operand = match value {
+      WitnessProblem.OperandAccess {operand: at} => at
+      WitnessProblem.OperandShape {operand: at} => at
+      WitnessProblem.OperandType {operand: at} => at
+      _ => usize.ZERO
+    }
+  }
+  return Parts {writable: writable, code: code, module: ModuleId.copy(&held.module), span: held.span, related: move related,
+    path: List<Shared<DeclarationId>>.length(&held.path), expected: held.expected, supplied: held.supplied,
+    expectedKind: kindTag(held.expectedKind), suppliedKind: kindTag(held.suppliedKind), witness: witness, operand: operand,
+    termination: terminationTag(held.termination), arguments: List<MessageArgument>.length(&held.arguments)}
+}
+
+// A copy of one byte run of `rejection`: its parameter name for `usize.MAX`, else the name of
+// argument `which / 2` when `which` is even and its value when odd.
+effect fn heldBytes(rejection: &Shared<Rejection>, which: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let length = Shared<Rejection>.with<usize>(rejection, fn(held: &Rejection) -> usize { return runOf(held, which).length })
+  let mut copied = run Bytes.zeroed(length)
+  let target = Bytes.asMutSlice(&mut copied)
+  Shared<Rejection>.with<()>(rejection, fn(held: &Rejection) -> () {
+    let source = runOf(held, which)
+    let mut at = usize.ZERO
+    while at < source.length {
+      target[at] = source[at]
+      at = at + usize.ONE
+    }
+  })
+  return move copied
+}
+
+fn runOf(held: &Rejection, which: usize) -> &[u8] {
+  if which == usize.MAX { return Bytes.asSlice(&held.parameterName) }
+  let argument = &List<MessageArgument>.asSlice(&held.arguments)[which / 2]
+  if which % 2 == usize.ZERO { return Bytes.asSlice(&argument.name) }
+  return Bytes.asSlice(&argument.value)
+}
+
+fn kindTag(kind: GenericKind) -> u64 {
+  return match kind {
+    GenericKind.Type => 0
+    GenericKind.Lifetime => 1
+    GenericKind.Requirement => 2
+    GenericKind.Failure => 3
+  }
+}
+
+fn kindOf(tag: u64) -> GenericKind {
+  return match tag {
+    1 => GenericKind.Lifetime
+    2 => GenericKind.Requirement
+    3 => GenericKind.Failure
+    _ => GenericKind.Type
+  }
+}
+
+fn terminationTag(step: TerminationStep) -> u64 {
+  return match step {
+    TerminationStep.Peer => 0
+    TerminationStep.DuplicatedParameter => 1
+    TerminationStep.ChangedFixedArgument => 2
+  }
+}
+
+fn terminationOf(tag: u64) -> TerminationStep {
+  return match tag {
+    1 => TerminationStep.DuplicatedParameter
+    2 => TerminationStep.ChangedFixedArgument
+    _ => TerminationStep.Peer
+  }
+}
+
+fn witnessTag(problem: WitnessProblem) -> u64 {
+  return match problem {
+    WitnessProblem.Missing => 1
+    WitnessProblem.Unknown => 2
+    WitnessProblem.ScalarMapping => 3
+    WitnessProblem.Kind => 4
+    WitnessProblem.Safety => 5
+    WitnessProblem.OperandCount => 6
+    WitnessProblem.OperandAccess {..} => 7
+    WitnessProblem.OperandShape {..} => 8
+    WitnessProblem.OperandType {..} => 9
+    WitnessProblem.ResultType => 10
+    WitnessProblem.Failure => 11
+    WitnessProblem.Requirement => 12
+    WitnessProblem.RequirementAccess => 13
+    WitnessProblem.RequirementParameter => 14
+    WitnessProblem.Environment => 15
+  }
+}
+
+fn witnessOf(tag: u64, operand: usize) -> Option<WitnessProblem> {
+  return match tag {
+    1 => Option<WitnessProblem>.some(WitnessProblem.Missing)
+    2 => Option<WitnessProblem>.some(WitnessProblem.Unknown)
+    3 => Option<WitnessProblem>.some(WitnessProblem.ScalarMapping)
+    4 => Option<WitnessProblem>.some(WitnessProblem.Kind)
+    5 => Option<WitnessProblem>.some(WitnessProblem.Safety)
+    6 => Option<WitnessProblem>.some(WitnessProblem.OperandCount)
+    7 => Option<WitnessProblem>.some(WitnessProblem.OperandAccess {operand: operand})
+    8 => Option<WitnessProblem>.some(WitnessProblem.OperandShape {operand: operand})
+    9 => Option<WitnessProblem>.some(WitnessProblem.OperandType {operand: operand})
+    10 => Option<WitnessProblem>.some(WitnessProblem.ResultType)
+    11 => Option<WitnessProblem>.some(WitnessProblem.Failure)
+    12 => Option<WitnessProblem>.some(WitnessProblem.Requirement)
+    13 => Option<WitnessProblem>.some(WitnessProblem.RequirementAccess)
+    14 => Option<WitnessProblem>.some(WitnessProblem.RequirementParameter)
+    15 => Option<WitnessProblem>.some(WitnessProblem.Environment)
+    _ => Option<WitnessProblem>.none()
+  }
+}
