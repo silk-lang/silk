@@ -84972,15 +84972,17 @@ impl Semantic {
   /// Adds to `image`, once `CacheImage.carry` has copied into it what this store reused, the root of
   /// each escape check a replay made current (`replayEscapes`). The root rests on the walk's record
   /// and on the root of every entry the record names, so it stays green while a replay would
-  /// agree again, and the next check takes it without replaying. A check whose record or entries
-  /// `image` lacks is left out, and replays again.
+  /// agree again, and the next check takes it without replaying. A check that reports, or whose
+  /// record or entries `image` lacks, is left out, and replays again.
   pub effect fn imageReplayedChecks(self: &Self, image: &mut CacheImage.Image) -> () ! OutOfMemoryError ? &mut Allocator {
     let memos = List<EscapeMemo>.asSlice(&self.escapeMemos)
     let mut replayed = List<usize>.make()
     let mut at = usize.ZERO
     while at < memos.length {
+      let clean = List<Shared<Rejection>>.length(&memos[at].result.rejections) == usize.ZERO
+        && List<Shared<BackendGap>>.length(&memos[at].result.gaps) == usize.ZERO
       if let Option<CapturedBuild>.Some {value: captured} = &memos[at].captured {
-        if captured.carriedRecord != usize.MAX { run List<usize>.append(&mut replayed, at) }
+        if captured.carriedRecord != usize.MAX && clean { run List<usize>.append(&mut replayed, at) }
       }
       at = at + usize.ONE
     }
@@ -85493,9 +85495,8 @@ impl Semantic {
     let mut kept = Option<EscapeRecordRoot>.none()
     if let Option<EscapeRecordRoot>.Some {value: held} = move adopted {
       let replayed = run Semantic.replayEscapes(&mut self.*, &mut request.*, concrete, Bytes.asSlice(&held.answer), held.root)
-      if let Option<CapturedBuild>.Some {value: captured} = move replayed {
-        let result = DeclarationCheckResult {rejections: List<Shared<Rejection>>.make(), gaps: List<Shared<BackendGap>>.make(),
-          unchecked: List<UncheckedDeclaration>.make()}
+      if let Option<EscapeReplay>.Some {value: replay} = move replayed {
+        let EscapeReplay {captured, result} = move replay
         run List<EscapeMemo>.append(&mut self.escapeMemos, EscapeMemo {unit: unit, concrete: run copyDeclarations(concrete),
           result: run copyCheckResult(&result), captured: Option<CapturedBuild>.some(move captured)})
         return move result
@@ -89760,33 +89761,27 @@ impl Semantic {
   // to the references the record names and summarizes as it did, so the walk would reach the
   // same instances, leave the same bodies to other checks and find nothing, as it did. Keys are
   // found again through parents' MIR, as `replayBuild` finds them. None when it does not hold.
+  //
+  // A body that now lowers to nothing, as one an edit broke, is replayed as the walk meets it: what
+  // it reports is the replay's, located as the walk locates it, and nothing below it is entered. So
+  // is a root that no longer starts the walk. Such a replay holds when every entry it still needs
+  // lies outside what those bodies reach: the walk then reaches a part of what the record names,
+  // and its summaries are a part of the ones the record found no escape in, so it finds none
+  // either. Its record is still the one read, and the MIR it lowered is kept for the next check,
+  // but no check root rests on it while the walk reports (`imageReplayedChecks`), and none can
+  // while a pruned body lowers to nothing, which leaves its entry without a root.
   effect fn replayEscapes(self: &mut Self, request: &mut Request, concrete: &[DeclarationId], recorded: &[u8], recordRoot: usize)
-    -> Option<CapturedBuild>
+    -> Option<EscapeReplay>
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
     let record = match move run BuildRecord.decode(recorded) {
       Option<BuildRecord.Record>.Some {value} => move value
-      Option<BuildRecord.Record>.None => { return Option<CapturedBuild>.none() }
+      Option<BuildRecord.Record>.None => { return Option<EscapeReplay>.none() }
     }
-    if record.observing { return Option<CapturedBuild>.none() }
-    // The roots are the concrete bodies that start a walk, in their order; any other one must
-    // still start none.
+    if record.observing { return Option<EscapeReplay>.none() }
+    let mut result = DeclarationCheckResult {rejections: List<Shared<Rejection>>.make(), gaps: List<Shared<BackendGap>>.make(),
+      unchecked: List<UncheckedDeclaration>.make()}
     let recordedRoots = List<Bytes>.asSlice(&record.roots)
-    let mut roots = List<InstanceKey>.make()
-    let mut at = usize.ZERO
-    while at < concrete.length {
-      let identity = run Shared<DeclarationId>.make(DeclarationId.copy(&concrete[at]))
-      let instance = run InstanceKey.named(&identity)
-      let exact = run instanceDigest(&instance)
-      let next = List<InstanceKey>.length(&roots)
-      if next < recordedRoots.length && same(Bytes.asSlice(&exact), Bytes.asSlice(&recordedRoots[next])) {
-        run List<InstanceKey>.append(&mut roots, move instance)
-      } else if run Semantic.startsEscapeWalk(&mut self.*, &mut request.*, &concrete[at]) {
-        return Option<CapturedBuild>.none()
-      }
-      at = at + usize.ONE
-    }
-    if List<InstanceKey>.length(&roots) != recordedRoots.length { return Option<CapturedBuild>.none() }
     let entries = List<BuildRecord.Entry>.asSlice(&record.entries)
     // An entered entry whose MIR is not green is stale; it needs its key, and so does every entry
     // its parent path passes through, and a foreign leaf a stale parent reaches, which must still be
@@ -89795,17 +89790,77 @@ impl Semantic {
     let mut needed = List<bool>.make()
     let mut mirs = List<usize>.make()
     let mut rested = List<CapturedEntry>.make()
+    // Whether the walk no longer enters an entry, because it or an entry its parent path passes
+    // through now lowers to nothing or starts no walk; and where the walk entered each entry found.
+    let mut pruned = List<bool>.make()
+    let mut sites = List<Option<EntrySite>>.make()
+    // The entry of each recorded root: its own, or the one the walk reached it as first, before
+    // the root's turn came.
+    let mut rootSet = ExactSet.make()
+    let mut rootEntries = List<usize>.make()
+    let mut at = usize.ZERO
+    while at < recordedRoots.length {
+      if !run ExactSet.add(&mut rootSet, Bytes.asSlice(&recordedRoots[at])) { return Option<EscapeReplay>.none() }
+      run List<usize>.append(&mut rootEntries, usize.MAX)
+      at = at + usize.ONE
+    }
     at = usize.ZERO
     while at < entries.length {
       let mut held = usize.MAX
-      if entries[at].leaf == 0 { held = EscapeImage.entryRoot(&self.escapeImage, Bytes.asSlice(&entries[at].exact)) }
+      if entries[at].leaf == 0 {
+        held = EscapeImage.entryRoot(&self.escapeImage, Bytes.asSlice(&entries[at].exact))
+        let mut root = ExactSet.find(&rootSet, Bytes.asSlice(&entries[at].exact))
+        if entries[at].parent == usize.MAX { root = entries[at].position }
+        if root < recordedRoots.length && List<usize>.get(&rootEntries, root) == usize.MAX { List<usize>.set(&mut rootEntries, root, at) }
+      }
       let outdated = entries[at].leaf == 0 && held == usize.MAX
       run List<bool>.append(&mut stale, outdated)
       run List<bool>.append(&mut needed, outdated)
       run List<usize>.append(&mut mirs, usize.MAX)
       run List<CapturedEntry>.append(&mut rested, CapturedEntry {value: usize.MAX, mirUnit: usize.MAX, textUnit: usize.MAX, carried: held})
+      run List<bool>.append(&mut pruned, false)
+      run List<Option<EntrySite>>.append(&mut sites, Option<EntrySite>.none())
       at = at + usize.ONE
     }
+    // The roots are the concrete bodies that start a walk, in their order; any other one must
+    // still start none. A stale root is lowered again, as `capturedEscapes` lowers every concrete
+    // body first, and one that no longer starts the walk, or is no longer concrete, is left out. A
+    // stale root the walk reached as an entry first is lowered as a root as well; if it still
+    // starts, that entry must still be entered.
+    let mut roots = List<Option<InstanceKey>>.make()
+    let mut restarted = List<usize>.make()
+    at = usize.ZERO
+    while at < concrete.length {
+      let identity = run Shared<DeclarationId>.make(DeclarationId.copy(&concrete[at]))
+      let instance = run InstanceKey.named(&identity)
+      let exact = run instanceDigest(&instance)
+      let mut matched = List<Option<InstanceKey>>.length(&roots)
+      while matched < recordedRoots.length && !same(Bytes.asSlice(&exact), Bytes.asSlice(&recordedRoots[matched])) {
+        matched = matched + usize.ONE
+      }
+      if matched < recordedRoots.length {
+        let entry = List<usize>.get(&rootEntries, matched)
+        if entry == usize.MAX { return Option<EscapeReplay>.none() }
+        let mut starts = true
+        if List<bool>.get(&stale, entry) {
+          let reported = List<Shared<Rejection>>.length(&result.rejections) + List<Shared<BackendGap>>.length(&result.gaps)
+          starts = run Semantic.replayRoot(&mut self.*, &mut request.*, &concrete[at], &mut result)
+          let reports = List<Shared<Rejection>>.length(&result.rejections) + List<Shared<BackendGap>>.length(&result.gaps) != reported
+          if starts && reports { return Option<EscapeReplay>.none() }
+          if starts && entries[entry].parent != usize.MAX { run List<usize>.append(&mut restarted, entry) }
+        }
+        while List<Option<InstanceKey>>.length(&roots) < matched { run List<Option<InstanceKey>>.append(&mut roots, Option<InstanceKey>.none()) }
+        if starts || entries[entry].parent != usize.MAX {
+          run List<Option<InstanceKey>>.append(&mut roots, Option<InstanceKey>.some(move instance))
+        } else {
+          run List<Option<InstanceKey>>.append(&mut roots, Option<InstanceKey>.none())
+        }
+      } else if run Semantic.replayRoot(&mut self.*, &mut request.*, &concrete[at], &mut result) {
+        return Option<EscapeReplay>.none()
+      }
+      at = at + usize.ONE
+    }
+    while List<Option<InstanceKey>>.length(&roots) < recordedRoots.length { run List<Option<InstanceKey>>.append(&mut roots, Option<InstanceKey>.none()) }
     at = entries.length
     while at > usize.ZERO {
       at = at - usize.ONE
@@ -89820,65 +89875,136 @@ impl Semantic {
       let entry = &entries[at]
       let index = at
       at = at + usize.ONE
+      // An entry is listed after its parent, so a pruned parent is known by now.
+      if entry.parent == usize.MAX {
+        if entry.position >= recordedRoots.length { return Option<EscapeReplay>.none() }
+        if let Option<InstanceKey>.None = &List<Option<InstanceKey>>.asSlice(&roots)[entry.position] {
+          List<bool>.set(&mut pruned, index, true)
+          continue
+        }
+      } else if List<bool>.get(&pruned, entry.parent) {
+        List<bool>.set(&mut pruned, index, true)
+        // A foreign leaf of a pruned body is not reached through it, and the walk may reach any
+        // other entry by another path, which the record does not name.
+        if List<bool>.get(&needed, index) && entry.leaf != BuildRecord.FOREIGN { return Option<EscapeReplay>.none() }
+        continue
+      }
       if !List<bool>.get(&needed, index) { continue }
       let mut found = Option<InstanceKey>.none()
+      let mut parentMir = usize.MAX
       if entry.parent == usize.MAX {
-        let listed = List<InstanceKey>.asSlice(&roots)
-        if entry.position >= listed.length { return Option<CapturedBuild>.none() }
-        found = Option<InstanceKey>.some(InstanceKey.copy(&listed[entry.position]))
+        if let Option<InstanceKey>.Some {value: root} = &List<Option<InstanceKey>>.asSlice(&roots)[entry.position] {
+          found = Option<InstanceKey>.some(InstanceKey.copy(&root))
+        }
       } else {
-        let parentMir = List<usize>.get(&mirs, entry.parent)
-        if parentMir == usize.MAX { return Option<CapturedBuild>.none() }
+        parentMir = List<usize>.get(&mirs, entry.parent)
+        if parentMir == usize.MAX { return Option<EscapeReplay>.none() }
         let functions = List<MirFunction>.asSlice(&self.resolver.mirValues)
         let references = List<MirReference>.asSlice(&functions[parentMir].references)
-        if entry.position >= references.length { return Option<CapturedBuild>.none() }
+        if entry.position >= references.length { return Option<EscapeReplay>.none() }
         found = Option<InstanceKey>.some(InstanceKey.copy(&references[entry.position].key))
       }
       let instance = match move found {
         Option<InstanceKey>.Some {value} => move value
-        Option<InstanceKey>.None => { return Option<CapturedBuild>.none() }
+        Option<InstanceKey>.None => { return Option<EscapeReplay>.none() }
       }
       let exact = run instanceDigest(&instance)
-      if !same(Bytes.asSlice(&exact), Bytes.asSlice(&entry.exact)) { return Option<CapturedBuild>.none() }
+      if !same(Bytes.asSlice(&exact), Bytes.asSlice(&entry.exact)) { return Option<EscapeReplay>.none() }
       let foreign = run foreignDeclaration(&mut self.resolver, &instance)
       if entry.leaf == BuildRecord.FOREIGN {
-        if !foreign { return Option<CapturedBuild>.none() }
+        if !foreign { return Option<EscapeReplay>.none() }
         continue
       }
-      if foreign || entry.leaf != 0 { return Option<CapturedBuild>.none() }
-      // A stale root must still start the walk.
-      if entry.parent == usize.MAX && List<bool>.get(&stale, index) {
-        let declaration = DeclarationId.copyShared(&InstanceKey.identity(&instance))
-        if !run Semantic.startsEscapeWalk(&mut self.*, &mut request.*, &declaration) { return Option<CapturedBuild>.none() }
+      if foreign || entry.leaf != 0 { return Option<EscapeReplay>.none() }
+      let declaration = DeclarationId.copyShared(&InstanceKey.identity(&instance))
+      // A root is entered from its own module with no requester; an entry, from its parent's
+      // body at the reference that names it, as `capturedEscapes` enters it.
+      let module = ModuleId.copy(DeclarationId.moduleId(&declaration))
+      let mut site = EntrySite {module: ModuleId.copy(&module), entered: ModuleId.copy(&module), span: Span.make(usize.ZERO, usize.ZERO),
+        requester: Option<RelatedSite>.none(), anchor: Option<Anchor>.none()}
+      if entry.parent == usize.MAX {
+        site.span = run authoredRequestSpan(&mut self.resolver, &declaration, Span.make(usize.ZERO, usize.ZERO))
+      } else {
+        let mut reached = false
+        if let Option<EntrySite>.Some {value: from} = &List<Option<EntrySite>>.asSlice(&sites)[entry.parent] {
+          let functions = List<MirFunction>.asSlice(&self.resolver.mirValues)
+          let references = List<MirReference>.asSlice(&functions[parentMir].references)
+          site.entered = ModuleId.copy(&from.module)
+          site.span = anchoredSpan(&from.anchor, references[entry.position].origin)
+          site.requester = successorRequester(&from.requester, &from.entered, from.span, &from.module)
+          reached = true
+        }
+        if !reached { return Option<EscapeReplay>.none() }
       }
+      site.anchor = run instanceAnchor(&mut self.resolver, &instance)
       let lowered = match move run Semantic.escapeReplayMir(&mut self.*, &instance) {
         Option<ReplayMir>.Some {value} => value
-        Option<ReplayMir>.None => { return Option<CapturedBuild>.none() }
+        Option<ReplayMir>.None => {
+          if entry.parent == usize.MAX || !run Semantic.replayBroken(&mut self.*, &instance, &site, &mut result) {
+            return Option<EscapeReplay>.none()
+          }
+          List<bool>.set(&mut pruned, index, true)
+          continue
+        }
       }
       List<usize>.set(&mut mirs, index, lowered.mir)
+      List<Option<EntrySite>>.set(&mut sites, index, Option<EntrySite>.some(move site))
       if List<bool>.get(&stale, index) {
         if !run Semantic.replayAgrees(&mut self.*, &instance, lowered.mir, entries, index, Span.make(usize.ZERO, usize.ZERO)) {
-          return Option<CapturedBuild>.none()
+          return Option<EscapeReplay>.none()
         }
         List<CapturedEntry>.set(&mut rested, index, CapturedEntry {value: usize.MAX, mirUnit: lowered.mirUnit, textUnit: usize.MAX,
           carried: usize.MAX})
       }
     }
+    at = usize.ZERO
+    while at < List<usize>.length(&restarted) {
+      if List<bool>.get(&pruned, List<usize>.get(&restarted, at)) { return Option<EscapeReplay>.none() }
+      at = at + usize.ONE
+    }
     // The check this replay makes current has no root in the image read (`imageReplayedChecks`).
     self.freshEscapes = true
-    return Option<CapturedBuild>.some(CapturedBuild {record: move record, entries: move rested, guard: usize.MAX,
-      carriedRecord: recordRoot})
+    return Option<EscapeReplay>.some(EscapeReplay {captured: CapturedBuild {record: move record, entries: move rested, guard: usize.MAX,
+      carriedRecord: recordRoot}, result: move result})
   }
 
-  // Whether an escape walk starts from `declaration`'s plain body (`escapeRootMir`).
-  effect fn startsEscapeWalk(self: &mut Self, request: &mut Request, declaration: &DeclarationId) -> bool
+  // What `capturedEscapes` does with a concrete body that starts no walk the record names: adds
+  // what its root lowering reports to `result`, and whether it starts a walk after all.
+  effect fn replayRoot(self: &mut Self, request: &mut Request, declaration: &DeclarationId, result: &mut DeclarationCheckResult) -> bool
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
-    if let Option<Shared<Result<Answer, NoRejection>>>.Some {value: answer} = move run Semantic.escapeRootMir(&mut self.*, &mut request.*, declaration) {
+    if let Option<Shared<Result<Answer, NoRejection>>>.Some {value: rawAnswer} = move run Semantic.escapeRootMir(&mut self.*, &mut request.*, declaration) {
+      let span = run authoredRequestSpan(&mut self.resolver, declaration, Span.make(usize.ZERO, usize.ZERO))
+      let answer = run anchorCanonicalAnswer(&mut self.resolver, &rawAnswer, declaration, span)
+      run appendCheckedAnswer(&mut result.rejections, &mut result.gaps, &mut self.query, declaration, &answer)
       let index = Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&answer, answerMirIndex)
       if let Option<usize>.Some {..} = move index { return true }
     }
     return false
+  }
+
+  // Adds to `result` what the MIR of `instance` reports, at the sites a walk entering it at `site`
+  // reports it, and whether it lowers to nothing, so the walk enters nothing below it. A body whose
+  // typing failed lowers to nothing and leaves the report to its typing's check.
+  effect fn replayBroken(self: &mut Self, instance: &InstanceKey, site: &EntrySite, result: &mut DeclarationCheckResult) -> bool
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+    let location = match move run locationOfInstance(&mut self.resolver, instance) {
+      Option<InstanceLocation>.Some {value} => value
+      Option<InstanceLocation>.None => { return false }
+    }
+    let lowered = run internBackendInstance(&mut self.resolver, instance, false)
+    let mirKey = run internDeclaration(&mut self.resolver, Key {family: Family.Mir, module: location.module, name: lowered,
+      declaration: location.declaration, member: instanceMember(instance), external: false})
+    let answer = run demandRaw(&mut self.resolver, &mut self.query, mirKey, Span.make(usize.ZERO, usize.ZERO))
+    let index = Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&answer, answerMirIndex)
+    if let Option<usize>.Some {..} = move index { return false }
+    let reportedBefore = List<Shared<Rejection>>.length(&result.rejections)
+    let identity = DeclarationId.copyShared(&InstanceKey.identity(instance))
+    run appendCheckedAnswer(&mut result.rejections, &mut result.gaps, &mut self.query, &identity, &answer)
+    let requested = requestSite(&site.requester, &site.entered, site.span)
+    run relocateRequested(&mut result.rejections, reportedBefore, &requested.module, requested.span)
+    return true
   }
 
   // Lowers the MIR an escape walk lowers for `instance`; none when it reports anything or lowers to
@@ -90922,6 +91048,24 @@ struct CapturedBuild {
   // The root of the image this store read that holds the record, when a replay took it from
   // there; `usize.MAX` otherwise.
   carriedRecord: usize,
+}
+
+// Where an escape walk entered one record entry: its declaration's module, the module and span of
+// the reference that entered it, the requester it inherited (`successorRequester`), and the anchor
+// of its body's spans, which its references are located by.
+struct EntrySite {
+  module: ModuleId,
+  entered: ModuleId,
+  span: Span,
+  requester: Option<RelatedSite>,
+  anchor: Option<Anchor>,
+}
+
+// What an escape replay found: the record it took, with the MIR it lowered, and what the walk
+// reports (`replayEscapes`).
+struct EscapeReplay {
+  captured: CapturedBuild,
+  result: DeclarationCheckResult,
 }
 
 // The MIR a replay lowered for one entry, and where its instance lies.
