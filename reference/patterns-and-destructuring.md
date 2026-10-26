@@ -183,7 +183,8 @@ discarding the result.
 
 `if let Pattern = expression { body }` executes `body` only when the pattern matches. An optional
 `else` executes on mismatch and introduces none of the pattern bindings. `else if let` is ordinary
-nested conditional syntax.
+nested conditional syntax. With a final `else`, `if let` may also be used as a value under
+[IF-002](functions-callables-and-control-flow.md#if-002--an-if-with-a-final-else-is-a-value).
 
 ```silk
 if let Token { kind } = &event {
@@ -201,7 +202,7 @@ body.
 or `=` separator. Pattern and ownership errors retain their ordinary diagnostics.
 
 **Evidence:** shared-pattern semantic requirements,
-[ordinary conditional rules](functions-callables-and-control-flow.md#if-001--if-selects-one-statement-branch-using-a-boolean-condition).
+[ordinary conditional rules](functions-callables-and-control-flow.md#if-001--if-selects-one-branch-using-a-boolean-condition).
 
 ## PATT-008 — A consuming conditional consumes on both outcomes
 
