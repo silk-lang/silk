@@ -59,30 +59,33 @@ for (const [name, line, message] of [
   })
 }
 
-// Finding 165: template messages that could say what to write.
-test('a lone } says to write }}', { todo: 'finding 165' }, () => {
+// Finding 165, fixed by #2372: template messages that say what to write.
+test('a lone } says to write }}', () => {
   const result = check('StderrWriter.print("} {name}\\n", &.{ name: "Ada" })')
   assert.doesNotMatch(result.stderr, /not closed/, show(result))
   assert.match(result.stderr, /\}\}/, show(result))
 })
 
-test('a width field that is not usize names the field', { todo: 'finding 165' }, () => {
-  const result = check('StderrWriter.print("{name:>w$}\\n", &.{ name: "Ada", w: 5 })')
-  assert.match(result.stderr, /\bw\b[^\n]*usize|usize[^\n]*\bw\b/, show(result))
+test('an integer literal works as a w$ width field', () => {
+  const dir = initPackage(h, `format-${++serial}`)
+  write(join(dir, 'src/main.silk'), 'import silk.os_writer { StderrWriter }\n\npub fn main() -> i32 {\n  StderrWriter.print("[{name:>w$}]\\n", &.{ name: "Ada", w: 5 })\n  return 0\n}\n')
+  const result = silk(h, ['run', '--quiet'], { cwd: dir })
+  assert.equal(result.status, 0, show(result))
+  assert.match(result.stderr, /\[  Ada\]/, show(result))
 })
 
-test('a radix type on text says it needs an integer', { todo: 'finding 165' }, () => {
+test('a radix type on text says it needs an integer', () => {
   const result = check('StderrWriter.print("{:x}\\n", &("Ada",))')
   assert.doesNotMatch(result.stderr, /RadixDisplay/, show(result))
   assert.match(result.stderr, /integer/, show(result))
 })
 
-test('template errors do not point into the stdlib', { todo: 'finding 165' }, () => {
+test('template errors do not point into the stdlib', () => {
   const result = check('StderrWriter.print("{nmae}\\n", &.{ name: "Ada" })')
   assert.doesNotMatch(result.stderr, /note: \S*stdlib\/silk\/format\.silk/, show(result))
 })
 
-test('passing the arguments without & says to borrow them', { todo: 'finding 165' }, () => {
+test('passing the arguments without & says to borrow them', () => {
   const result = check('StderrWriter.print("{}\\n", 5)')
   assert.match(result.stderr, /&/, show(result))
   assert.doesNotMatch(result.stderr, /A call argument whose type mismatches its parameter\n/, show(result))

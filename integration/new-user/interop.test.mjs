@@ -31,25 +31,25 @@ test('a bool result of a foreign function is not admitted by the C ABI', () => {
   assert.match(result.stderr, /error\[SEM0187\] bool is not admitted by the C ABI/)
 })
 
-test('calling an export "C" function from Silk inside unsafe builds', { todo: 'finding 160' }, () => {
+test('calling an export "C" function from Silk inside unsafe builds', () => {
   const result = silk(h, ['build'], { cwd: variant('  return order(left, right)', '  return unsafe descending(right, left)') })
   assert.equal(result.status, 0, show(result))
 })
 
-test('a foreign call without unsafe names the call and the fix', { todo: 'finding 161' }, () => {
+test('a foreign call without unsafe names the call and the fix', () => {
   const result = silk(h, ['check'], { cwd: variant('  unsafe qsort(first, 6, 4, ascending)', '  qsort(first, 6, 4, ascending)') })
   assert.match(result.stderr, /error\[SEM0082\]/)
   assert.doesNotMatch(result.stderr, /A raw storage operation outside lexical unsafe authority/)
   assert.match(result.stderr, /qsort/)
 })
 
-test('a callback parameter without the callbacks property gets a coded error with the fix', { todo: 'finding 162' }, () => {
+test('a callback parameter without the callbacks property gets a coded error with the fix', () => {
   const result = silk(h, ['check'], { cwd: variant(') -> () with Intrinsic.foreign(callbacks: ("compare",))', ') -> ()') })
   assert.doesNotMatch(result.stderr, /unsupported\[ForeignCallback\]/)
   assert.match(result.stderr, /callbacks: \("compare",\)/)
 })
 
-test('an ordinary fn passed for a C function pointer says to export it', { todo: 'finding 162' }, () => {
+test('an ordinary fn passed for a C function pointer says to export it', () => {
   const result = silk(h, ['check'], { cwd: variant('  unsafe qsort(first, 6, 4, ascending)', '  unsafe qsort(first, 6, 4, order)') })
   assert.match(result.stderr, /error\[SEM0012\]/)
   assert.match(result.stderr, /export "C"/)
