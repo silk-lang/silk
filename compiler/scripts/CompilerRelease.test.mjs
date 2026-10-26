@@ -17,6 +17,8 @@ import {
   managedMarker,
   plan,
   publish,
+  releaseBody,
+  releaseBodyLimit,
 } from './CompilerRelease.mjs'
 
 const require = createRequire(new URL('../../package.json', import.meta.url))
@@ -453,3 +455,15 @@ it.effect(
       )
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 )
+
+it('release notes over the GitHub body limit keep whole leading lines and link the changes', () => {
+  const short = { commit, notes: 'Short notes.' }
+  assert.strictEqual(releaseBody(repository, short), 'Short notes.')
+  const line = 'A change that every prerelease since the last stable release carries.\n'
+  const notes = line.repeat(Math.ceil((releaseBodyLimit * 1.2) / line.length))
+  const body = releaseBody(repository, { commit, notes })
+  assert.isAtMost(body.length, releaseBodyLimit)
+  const [kept, footer] = body.split('\n\n_Notes truncated.')
+  assert.isTrue(notes.startsWith(`${kept}\n`))
+  assert.include(footer, `https://github.com/${repository}/tree/${commit}/compiler/.changes`)
+})
