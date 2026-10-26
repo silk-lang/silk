@@ -91,6 +91,7 @@ import semantic.Specialization {
 }
 import backend.Mir {
   Lowered,
+  Inlining as MirInlining,
   ConstantValue as MirConstantValue,
   NonParkingRun as MirNonParkingRun,
   AccessEscape as MirAccessEscape,
@@ -7156,6 +7157,8 @@ effect fn signatureSyntax(resolver: &mut Resolver, module: &ModuleId, ordinal: u
     let mut functionName = Bytes.make()
     // A `with Intrinsic.machine(features: ...)` clause of an ordinary function (SIMD-009).
     let mut features = Option<FeaturesProperty>.none()
+    // The first `Intrinsic.inline()`, `inlineAlways()` or `inlineNever()` clause (FUNC-003).
+    let mut inlineSpan = Option<Span>.none()
     if let Node.FunctionHeader {name: spelled, contract, linkage, properties, isPublic: visible, ..} = written {
       callable = Option<HirId>.some(contract)
       isPublic = visible
@@ -7176,6 +7179,9 @@ effect fn signatureSyntax(resolver: &mut Resolver, module: &ModuleId, ordinal: u
       plain = linkage.present || plainProperties(hir, properties)
       unknown = unknownProperty(hir, properties)
       if !linkage.present { misplaced = misplacedProperty(hir, properties, true) }
+      // An inline clause shapes how callers compile a Silk body, which a linked function has none of.
+      if linkage.present { misplaced = inlineClause(hir, properties) }
+      inlineSpan = inlineClause(hir, properties)
       features = featuresProperty(hir, properties)
       if linkage.present {
         if let Option<FeaturesProperty>.Some {value: property} = &features {
@@ -7254,6 +7260,9 @@ effect fn signatureSyntax(resolver: &mut Resolver, module: &ModuleId, ordinal: u
         }
         let mut headerConflict = Option<HeaderConflict>.none()
         let mut featureProblem = Option<HeaderConflict>.none()
+        // A `static` function runs only at compile time, so no caller inlines it.
+        let mut staticInline = Option<Span>.none()
+        if isStatic { staticInline = move inlineSpan }
         if let Option<FeaturesProperty>.Some {value: property} = &features {
           if !foreign {
             featureProblem = run featuresConflict(&resolver.*, hir, &property, isUnsafe, isStatic, Bytes.asSlice(&functionName), declarationSpan)
@@ -7271,6 +7280,8 @@ effect fn signatureSyntax(resolver: &mut Resolver, module: &ModuleId, ordinal: u
           headerConflict = conflictAt(RejectionCode.MisplacedProperty, clause)
         } else if let Option<HeaderConflict>.Some {value: problem} = move featureProblem {
           headerConflict = Option<HeaderConflict>.some(move problem)
+        } else if let Option<Span>.Some {value: clause} = move staticInline {
+          headerConflict = conflictAt(RejectionCode.MisplacedProperty, clause)
         } else if let Option<Span>.Some {value: abiSpan} = move foreignAbi {
           // Only the C ABI exists (SEM0185); the linkage names the ABI it asked for.
           headerConflict = run namedHeaderConflict(RejectionCode.UnsupportedForeignAbi, abiSpan, b"abi", Bytes.asSlice(&abiText))
@@ -54609,7 +54620,8 @@ effect fn checkInvocationOnce<'scope>(
         // A view keeps its argument's exact slice type, including the caller's loan.
         let mut instantiated = move firstArgument
         // An anchored borrow keeps its anchor's loan.
-        if intrinsicIsPrimitive(member, IntrinsicPrimitive.PointerBorrow) || intrinsicIsPrimitive(member, IntrinsicPrimitive.PointerBorrowMut) {
+        if intrinsicIsPrimitive(member, IntrinsicPrimitive.PointerBorrow) || intrinsicIsPrimitive(member, IntrinsicPrimitive.PointerBorrowMut) ||
+          intrinsicIsPrimitive(member, IntrinsicPrimitive.PointerBorrowMany) || intrinsicIsPrimitive(member, IntrinsicPrimitive.PointerBorrowManyMut) {
           let mut anchored = Option<Shared<Type>>.none()
           if let Option<Shared<Type>>.Some {value: anchor} = &instantiated {
             anchored = run CheckedIntrinsic.anchoredResult(member, instantiation, &anchor)
@@ -73510,6 +73522,7 @@ effect fn lowerMir(
   // A function with `features` compiles for them (SIMD-009).
   let listedFeatures = run declarationFeatures(&mut resolver.*, &module, declarationAccess182)
   completed.function.features = run featureAttribute(&resolver.*, List<Bytes>.asSlice(&listedFeatures))
+  completed.function.inlining = run declarationInlining(&mut resolver.*, &module, declarationAccess182)
   return run storeLowered(&mut resolver.*, &mut owner.*, move completed, move dependencies)
 }
 
@@ -74054,7 +74067,8 @@ effect fn modulePropertyRejection(resolver: &mut Resolver, module: &ModuleId, or
 // The span of the first `Intrinsic.foreign(...)` or `Intrinsic.machine(...)` header property
 // clause, which describe an `extern` function only, on a declaration that has no foreign linkage
 // (SEM0236). With `featuresAllowed`, an ordinary function's `Intrinsic.machine(features: ...)`
-// clause is admitted (SIMD-009).
+// clause is admitted (SIMD-009), and so is an inline clause, which only an ordinary function's
+// body can honor; any other declaration's inline clause is misplaced.
 fn misplacedProperty(hir: &Module, properties: Range, featuresAllowed: bool) -> Option<Span> {
   let mut at = usize.ZERO
   while at < properties.length {
@@ -74062,6 +74076,9 @@ fn misplacedProperty(hir: &Module, properties: Range, featuresAllowed: bool) -> 
     if let Node.PropertyClause {namespace, operation, properties: written} = Module.node(hir, clause) {
       let features = featuresAllowed && nameIs(hir, operation, b"machine") && featuresOnly(hir, written)
       if nameIs(hir, namespace, b"Intrinsic") && (nameIs(hir, operation, b"foreign") || nameIs(hir, operation, b"machine")) && !features {
+        return Option<Span>.some(Module.span(hir, clause))
+      }
+      if !featuresAllowed && nameIs(hir, namespace, b"Intrinsic") && inlineOperation(hir, operation) {
         return Option<Span>.some(Module.span(hir, clause))
       }
     }
@@ -74086,11 +74103,13 @@ fn featuresOnly(hir: &Module, written: Range) -> bool {
 }
 
 // Whether an ordinary function's property clauses are all admitted: at most one field-free
-// `Intrinsic.nonParking()` and at most one `Intrinsic.machine(features: ...)` (SIMD-009).
+// `Intrinsic.nonParking()`, at most one `Intrinsic.machine(features: ...)` (SIMD-009) and at most
+// one field-free inline clause.
 fn plainProperties(hir: &Module, properties: Range) -> bool {
   if nonParkingProperties(hir, properties) { return true }
   let mut parking = usize.ZERO
   let mut machine = usize.ZERO
+  let mut inlining = usize.ZERO
   let mut at = usize.ZERO
   while at < properties.length {
     if let Node.PropertyClause {namespace, operation, properties: written} = Module.node(hir, Module.child(hir, properties, at)) {
@@ -74099,6 +74118,8 @@ fn plainProperties(hir: &Module, properties: Range) -> bool {
         parking = parking + usize.ONE
       } else if nameIs(hir, operation, b"machine") && featuresOnly(hir, written) {
         machine = machine + usize.ONE
+      } else if inlineOperation(hir, operation) && written.length == usize.ZERO {
+        inlining = inlining + usize.ONE
       } else {
         return false
       }
@@ -74107,7 +74128,53 @@ fn plainProperties(hir: &Module, properties: Range) -> bool {
     }
     at = at + usize.ONE
   }
-  return parking <= usize.ONE && machine <= usize.ONE
+  return parking <= usize.ONE && machine <= usize.ONE && inlining <= usize.ONE
+}
+
+// Whether a property clause's operation is `inline`, `inlineAlways` or `inlineNever`.
+fn inlineOperation(hir: &Module, operation: HirId) -> bool {
+  return nameIs(hir, operation, b"inline") || nameIs(hir, operation, b"inlineAlways") || nameIs(hir, operation, b"inlineNever")
+}
+
+// The span of the first `Intrinsic` inline clause among `properties`.
+fn inlineClause(hir: &Module, properties: Range) -> Option<Span> {
+  let mut at = usize.ZERO
+  while at < properties.length {
+    let clause = Module.child(hir, properties, at)
+    if let Node.PropertyClause {namespace, operation, ..} = Module.node(hir, clause) {
+      if nameIs(hir, namespace, b"Intrinsic") && inlineOperation(hir, operation) { return Option<Span>.some(Module.span(hir, clause)) }
+    }
+    at = at + usize.ONE
+  }
+  return Option<Span>.none()
+}
+
+// How a declaration's inline clause asks its callers to inline it; `Default` for any other
+// declaration. Reads the header facet only.
+effect fn declarationInlining(resolver: &mut Resolver, module: &ModuleId, ordinal: usize) -> MirInlining
+! Cycle | OutOfMemoryError ? &mut Allocator {
+  let answer = run observedDeclaration(&mut resolver.*, module, ordinal, SourceFacet.Header)
+  let mut inlining = MirInlining.Default
+  if let Option<&IndexedSource>.Some {value} = move sourceOf(&resolver.*, &answer, module) {
+    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(value))
+    if ordinal < declarations.length {
+      let hir = IndexedSource.authored(value)
+      if let Node.FunctionHeader {properties, linkage, ..} = Module.node(hir, declarations[ordinal].header) {
+        let mut at = usize.ZERO
+        while !linkage.present && at < properties.length {
+          if let Node.PropertyClause {namespace, operation, ..} = Module.node(hir, Module.child(hir, properties, at)) {
+            if nameIs(hir, namespace, b"Intrinsic") {
+              if nameIs(hir, operation, b"inline") { inlining = MirInlining.Hint }
+              if nameIs(hir, operation, b"inlineAlways") { inlining = MirInlining.Always }
+              if nameIs(hir, operation, b"inlineNever") { inlining = MirInlining.Never }
+            }
+          }
+          at = at + usize.ONE
+        }
+      }
+    }
+  }
+  return inlining
 }
 
 // The clause and value of the first `features:` entry of an `Intrinsic.machine(...)` clause.
@@ -74285,7 +74352,8 @@ effect fn featureAttribute(resolver: &Resolver, listed: &[Bytes]) -> Bytes ! Out
 // The span of the first header property clause that is, or has an argument, outside the
 // language's property vocabulary (SEM0235): `Intrinsic.foreign(memory:, locality:, noCapture:, callbacks:,
 // threadCallbacks:)`,
-// `Intrinsic.machine(naked:, noReturn:, features:)` and the argument-free `Intrinsic.nonParking()`. Whether
+// `Intrinsic.machine(naked:, noReturn:, features:)` and the argument-free `Intrinsic.nonParking()`,
+// `Intrinsic.inline()`, `Intrinsic.inlineAlways()` and `Intrinsic.inlineNever()`. Whether
 // a known property is admitted where it is written stays the position's own question.
 fn unknownProperty(hir: &Module, properties: Range) -> Option<Span> {
   let mut at = usize.ZERO
@@ -74294,7 +74362,7 @@ fn unknownProperty(hir: &Module, properties: Range) -> Option<Span> {
     if let Node.PropertyClause {namespace, operation, properties: written} = Module.node(hir, clause) {
       let foreign = nameIs(hir, operation, b"foreign")
       let machine = nameIs(hir, operation, b"machine")
-      if !nameIs(hir, namespace, b"Intrinsic") || (!foreign && !machine && !nameIs(hir, operation, b"nonParking")) {
+      if !nameIs(hir, namespace, b"Intrinsic") || (!foreign && !machine && !nameIs(hir, operation, b"nonParking") && !inlineOperation(hir, operation)) {
         return Option<Span>.some(Module.span(hir, clause))
       }
       let mut field = usize.ZERO

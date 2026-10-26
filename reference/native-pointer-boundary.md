@@ -82,6 +82,15 @@ writes for the shared one. A handle that owns storage through a raw pointer pass
 anchor, so `Arc.get` and `MutexGuard.getMut` return references that cannot outlive the handle or
 the lock.
 
+`Intrinsic.pointerBorrowMany<A, T>(anchor: &'a A, pointer: [*]const T, length: usize) -> &'a [T]`
+and `Intrinsic.pointerBorrowManyMut<A, T>(anchor: &'a mut A, pointer: [*]mut T, length: usize) ->
+&'a mut [T]` are the many-element forms. The result is a slice of `length` elements that starts at
+the pointer, with the anchor's lifetime and access, and lowers to the plain pointer and length pair
+with no check. `Pointer.borrowMany` and `Pointer.borrowManyMut` expose them. The caller proves that
+the pointer addresses `length` initialized, contiguous elements in one allocation, that
+`length * size_of(T)` fits in `isize`, and the same validity and access rules as the single-element
+forms for the anchor's loan. A zero length still needs a non-null pointer aligned for `T`.
+
 ## Stack frames and stack storage
 
 `Intrinsic.frameAddress() -> [*]const u8` is the safe runtime observation of the running function's
