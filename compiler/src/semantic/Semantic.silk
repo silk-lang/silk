@@ -128,6 +128,7 @@ import lexer.Span {Span}
 import lexer.Token
 import lexer.Token {TokenKind}
 import semantic.RuntimeEncoding
+import semantic.RejectionImage
 import semantic.Capture
 import semantic.CaptureAvailability
 import semantic.CaptureAvailability {FailureKind as CaptureFailureKind}
@@ -8657,6 +8658,7 @@ struct PendingImage {
 struct PendingCheck {
   unit: usize,
   answer: Bytes,
+  sites: List<ModuleId>,
 }
 
 effect fn slotFor(slots: &mut List<usize>, at: usize) -> () ! OutOfMemoryError ? &mut Allocator {
@@ -8764,9 +8766,15 @@ effect fn imageUnit(resolver: &Resolver, build: &mut ImageBuild, root: usize) ->
   return List<usize>.get(&build.nodes, root)
 }
 
-// The answer of a module check root: whether it is a sweep (0) or an escape check (1), then the
-// concrete bodies it names.
+// The answer of a module check root that reported nothing: whether it is a sweep (0) or an
+// escape check (1), then the concrete bodies it names, then no rejections.
 effect fn checkAnswer(kind: u64, concrete: &[DeclarationId]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut answer = run checkHead(kind, concrete)
+  run RuntimeEncoding.word(&mut answer, 0)
+  return move answer
+}
+
+effect fn checkHead(kind: u64, concrete: &[DeclarationId]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
   let mut answer = Bytes.make()
   run RuntimeEncoding.word(&mut answer, kind)
   run RuntimeEncoding.word(&mut answer, usize.toU64(concrete.length))
@@ -8778,15 +8786,44 @@ effect fn checkAnswer(kind: u64, concrete: &[DeclarationId]) -> Bytes ! OutOfMem
   return move answer
 }
 
-// Writes the root of `unit` with `answer`, or gives `answer` back when the unit is unfit.
-effect fn imageRoot(resolver: &Resolver, build: &mut ImageBuild, unit: usize, answer: Bytes) -> Option<Bytes>
+// The answer of a module check root that reports `rejections`, or none when one of them holds
+// what an image does not carry (`RejectionImage.encode`). `sites` gains the module of each site
+// they name.
+effect fn reportingAnswer(kind: u64, concrete: &[DeclarationId], rejections: &[Shared<Rejection>], sites: &mut List<ModuleId>)
+  -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  let mut answer = run checkHead(kind, concrete)
+  run RuntimeEncoding.word(&mut answer, usize.toU64(rejections.length))
+  let mut at = usize.ZERO
+  while at < rejections.length {
+    if !run RejectionImage.encode(&mut answer, &rejections[at], &mut sites.*) { return Option<Bytes>.none() }
+    at = at + usize.ONE
+  }
+  return Option<Bytes>.some(move answer)
+}
+
+// Writes the root of `unit` with `answer`, or gives `answer` back when the unit is unfit. A root
+// that reports rests on the file of each module in `sites` too: its spans are offsets into them.
+effect fn imageRoot(resolver: &Resolver, build: &mut ImageBuild, unit: usize, answer: Bytes, sites: &[ModuleId]) -> Option<Bytes>
 ! OutOfMemoryError ? &mut Allocator {
   let key = match move run stableUnit(&resolver.*, unit) {
     Option<Bytes>.Some {value} => move value
     Option<Bytes>.None => { return Option<Bytes>.none() }
   }
-  let node = run imageUnit(&resolver.*, &mut build.*, unit)
+  let mut node = run imageUnit(&resolver.*, &mut build.*, unit)
   if node >= unfit() { return Option<Bytes>.some(move answer) }
+  if sites.length > usize.ZERO {
+    let mut edges = List<usize>.make()
+    run List<usize>.append(&mut edges, CacheImage.nodeEdge(node))
+    let mut at = usize.ZERO
+    while at < sites.length {
+      let module = knownModuleOrdinal(&resolver.*, &sites[at])
+      if module == usize.MAX { return Option<Bytes>.none() }
+      let edge = CacheImage.leafEdge(run imageLeaf(&resolver.*, &mut build.*, Dependee.SourceFile {module: module}))
+      if !holdsUnit(List<usize>.asSlice(&edges), edge) { run List<usize>.append(&mut edges, edge) }
+      at = at + usize.ONE
+    }
+    node = run CacheImage.addNode(&mut build.image, List<usize>.asSlice(&edges))
+  }
   run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {key: move key, node: node, answer: move answer})
   return Option<Bytes>.none()
 }
@@ -8885,6 +8922,7 @@ effect fn readCheckKey(bytes: &[u8]) -> Option<CheckKey> ! OutOfMemoryError ? &m
 struct CheckAnswer {
   kind: u64,
   concrete: List<DeclarationId>,
+  rejections: List<Shared<Rejection>>,
 }
 
 effect fn readCheckAnswer(bytes: &[u8]) -> Option<CheckAnswer> ! OutOfMemoryError ? &mut Allocator {
@@ -8901,8 +8939,20 @@ effect fn readCheckAnswer(bytes: &[u8]) -> Option<CheckAnswer> ! OutOfMemoryErro
     }
     at = at + 1
   }
+  // A declaration's answer is written only when it reported nothing.
+  let reported = StableKey.readWord(bytes, &mut reader)
+  if kind > 1 && reported != 0 { return Option<CheckAnswer>.none() }
+  let mut rejections = List<Shared<Rejection>>.make()
+  at = 0
+  while at < reported {
+    match move run RejectionImage.decode(bytes, &mut reader) {
+      Option<Rejection>.Some {value} => { run List<Shared<Rejection>>.append(&mut rejections, run Shared<Rejection>.make(move value)) }
+      Option<Rejection>.None => { return Option<CheckAnswer>.none() }
+    }
+    at = at + 1
+  }
   if !StableKey.finished(bytes, &reader) { return Option<CheckAnswer>.none() }
-  return Option<CheckAnswer>.some(CheckAnswer {kind: kind, concrete: move concrete})
+  return Option<CheckAnswer>.some(CheckAnswer {kind: kind, concrete: move concrete, rejections: move rejections})
 }
 
 effect fn verifyUnit(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, unit: usize) -> bool
@@ -85306,13 +85356,13 @@ impl Semantic {
       let key = run readCheckKey(Bytes.asSlice(&root.key))
       let answer = run readCheckAnswer(Bytes.asSlice(&root.answer))
       let mut reused = false
-      // A check root holds no position: it is written only for a check that reported nothing.
-      // So an unlinked store reuses it when only where spans sit moved, as when a line is
-      // inserted above it. A linked store needs each node it rests on current.
+      // A check root that reported nothing holds no position. So an unlinked store reuses it when
+      // only where spans sit moved, as when a line is inserted above it. One that reports holds
+      // its spans, and a store needs each node it rests on current, as a linked store always does.
       let positioned = !linked && List<bool>.get(&settled, root.node)
       if let Option<CheckKey>.Some {value: check} = move key {
         if let Option<CheckAnswer>.Some {value: kept} = move answer {
-          if node != usize.MAX || positioned {
+          if node != usize.MAX || (positioned && List<Shared<Rejection>>.length(&kept.rejections) == usize.ZERO) {
             let mut resting = node
             if !linked { resting = usize.MAX }
             reused = run Semantic.adoptCheck(&mut self.*, resting, Bytes.asSlice(&root.key), move check, move kept)
@@ -85371,17 +85421,18 @@ impl Semantic {
     if node != usize.MAX { run Graph.record(&mut self.resolver.graph, unit, Dependee.UnitResult {unit: node}) }
     else { run List<usize>.append(&mut self.carriedUnits, unit) }
     drop run Graph.finishRun(&mut self.resolver.graph, unit, Option<ContentHash>.none())
-    let CheckAnswer {kind, concrete} = move kept
+    let CheckAnswer {kind, concrete, rejections} = move kept
     if kind > 1 {
       let mut named = move concrete
       run Semantic.keepDeclaration(&mut self.*, unit, List<DeclarationId>.remove(&mut named, usize.ZERO), kind == 3, node == usize.MAX)
     } else if kind == 1 {
       run List<EscapeMemo>.append(&mut self.escapeMemos, EscapeMemo {unit: unit, concrete: move concrete,
-        result: DeclarationCheckResult {rejections: List<Shared<Rejection>>.make(), gaps: List<Shared<BackendGap>>.make(),
+        result: DeclarationCheckResult {rejections: move rejections, gaps: List<Shared<BackendGap>>.make(),
           unchecked: List<UncheckedDeclaration>.make()}, captured: Option<CapturedBuild>.none()})
     } else {
       let mut sweep = Sweep.make()
       sweep.concrete = move concrete
+      sweep.rejections = move rejections
       run List<ModuleCheckMemo>.append(&mut self.moduleMemos, ModuleCheckMemo {unit: unit, sweep: move sweep,
         deferred: List<DeferredStaticTemplate>.make(), unchecked: List<UncheckedBody>.make()})
     }
@@ -85401,10 +85452,11 @@ impl Semantic {
     return move output
   }
   /// The image of this store's module checks for a cache on disk: each current module sweep and
-  /// escape check that found nothing to report, as a root, with every unit and source read it
-  /// rests on. A check that reported anything is left out and runs again in the next process. So
-  /// is a check an unlinked `adoptCache` reused: it rests on nothing here, and its image carries
-  /// it (`CacheImage.carry` with `Adopted.carried`).
+  /// escape check, as a root, with every unit and source read it rests on and the rejections it
+  /// reports, which also rest on the files their spans point into. A check that left a gap or an
+  /// unchecked body, or reported what an image does not carry (`RejectionImage.encode`), is left
+  /// out and runs again in the next process. So is a check an unlinked `adoptCache` reused: it
+  /// rests on nothing here, and its image carries it (`CacheImage.carry` with `Adopted.carried`).
   pub effect fn cacheImage(self: &mut Self) -> CacheImage.Image ! Cycle | OutOfMemoryError ? &mut Allocator {
     // Input digests and the file digests beside them must describe the same bytes.
     run reconcileSources(&mut self.resolver)
@@ -85424,17 +85476,21 @@ impl Semantic {
     while at < sweeps.length {
       let memo = &sweeps[at]
       at = at + usize.ONE
-      if List<Shared<Rejection>>.length(&memo.sweep.rejections) > usize.ZERO
-        || List<Shared<BackendGap>>.length(&memo.sweep.gaps) > usize.ZERO
+      if List<Shared<BackendGap>>.length(&memo.sweep.gaps) > usize.ZERO
         || List<UncheckedDeclaration>.length(&memo.sweep.unchecked) > usize.ZERO
         || List<DeferredStaticTemplate>.length(&memo.deferred) > usize.ZERO
         || List<UncheckedBody>.length(&memo.unchecked) > usize.ZERO
         || holdsUnit(List<usize>.asSlice(&self.carriedUnits), memo.unit) {
         continue
       }
-      let answer = run checkAnswer(0, List<DeclarationId>.asSlice(&memo.sweep.concrete))
-      if let Option<Bytes>.Some {value} = move run imageRoot(&self.resolver, &mut build, memo.unit, move answer) {
-        run List<PendingCheck>.append(&mut pending, PendingCheck {unit: memo.unit, answer: move value})
+      let mut sites = List<ModuleId>.make()
+      let answer = match move run reportingAnswer(0, List<DeclarationId>.asSlice(&memo.sweep.concrete),
+        List<Shared<Rejection>>.asSlice(&memo.sweep.rejections), &mut sites) {
+        Option<Bytes>.Some {value} => move value
+        Option<Bytes>.None => { continue }
+      }
+      if let Option<Bytes>.Some {value} = move run imageRoot(&self.resolver, &mut build, memo.unit, move answer, List<ModuleId>.asSlice(&sites)) {
+        run List<PendingCheck>.append(&mut pending, PendingCheck {unit: memo.unit, answer: move value, sites: move sites})
       }
     }
     let declarations = List<DeclarationMemo>.asSlice(&self.declarationMemos)
@@ -85448,8 +85504,8 @@ impl Semantic {
       let mut named = List<DeclarationId>.make()
       run List<DeclarationId>.append(&mut named, DeclarationId.copy(&memo.identity))
       let answer = run checkAnswer(kind, List<DeclarationId>.asSlice(&named))
-      if let Option<Bytes>.Some {value} = move run imageRoot(&self.resolver, &mut build, memo.unit, move answer) {
-        run List<PendingCheck>.append(&mut pending, PendingCheck {unit: memo.unit, answer: move value})
+      if let Option<Bytes>.Some {value} = move run imageRoot(&self.resolver, &mut build, memo.unit, move answer, &[]) {
+        run List<PendingCheck>.append(&mut pending, PendingCheck {unit: memo.unit, answer: move value, sites: List<ModuleId>.make()})
       }
     }
     let escapes = List<EscapeMemo>.asSlice(&self.escapeMemos)
@@ -85457,15 +85513,19 @@ impl Semantic {
     while at < escapes.length {
       let memo = &escapes[at]
       at = at + usize.ONE
-      if List<Shared<Rejection>>.length(&memo.result.rejections) > usize.ZERO
-        || List<Shared<BackendGap>>.length(&memo.result.gaps) > usize.ZERO
+      if List<Shared<BackendGap>>.length(&memo.result.gaps) > usize.ZERO
         || List<UncheckedDeclaration>.length(&memo.result.unchecked) > usize.ZERO
         || holdsUnit(List<usize>.asSlice(&self.carriedUnits), memo.unit) {
         continue
       }
-      let answer = run checkAnswer(1, List<DeclarationId>.asSlice(&memo.concrete))
-      if let Option<Bytes>.Some {value} = move run imageRoot(&self.resolver, &mut build, memo.unit, move answer) {
-        run List<PendingCheck>.append(&mut pending, PendingCheck {unit: memo.unit, answer: move value})
+      let mut sites = List<ModuleId>.make()
+      let answer = match move run reportingAnswer(1, List<DeclarationId>.asSlice(&memo.concrete),
+        List<Shared<Rejection>>.asSlice(&memo.result.rejections), &mut sites) {
+        Option<Bytes>.Some {value} => move value
+        Option<Bytes>.None => { continue }
+      }
+      if let Option<Bytes>.Some {value} = move run imageRoot(&self.resolver, &mut build, memo.unit, move answer, List<ModuleId>.asSlice(&sites)) {
+        run List<PendingCheck>.append(&mut pending, PendingCheck {unit: memo.unit, answer: move value, sites: move sites})
       }
     }
     // The last build's record and each definition it lowered, on the units it rests on. The
@@ -85603,7 +85663,7 @@ impl Semantic {
     let filled = List<usize>.length(&build.fileModules)
     let mut waiting = move checks
     while let Option<PendingCheck>.Some {value: check} = move List<PendingCheck>.pop(&mut waiting) {
-      drop run imageRoot(&self.resolver, &mut build, check.unit, move check.answer)
+      drop run imageRoot(&self.resolver, &mut build, check.unit, move check.answer, List<ModuleId>.asSlice(&check.sites))
     }
     run Semantic.fileDigests(&mut self.*, &mut build, filled)
     image.* = move build.image
