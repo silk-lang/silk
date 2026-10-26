@@ -1761,6 +1761,10 @@ effect fn report() -> () ! WriterError ? &mut Writer {
 `JsonError | OutOfMemoryError` is `Debug` because both members are, so `{:?}` prints the active
 member's `Debug` form. A generic bound such as `T: Debug` accepts the union the same way.
 
+`never`, the union with no members, takes every reference-only interface, since no value ever
+reaches an operation. An `effect fn` that cannot fail therefore meets a bound such as `E: Debug`
+on its failure, which the default runtime places on `main`'s errors.
+
 **Boundary:** The union never owns an implementation and no `impl` may name it (IMPL-001). An
 operation that takes `self` by value, returns `Self`, or takes a second `Self` operand cannot pick
 one member, so an interface with such an operation never applies to a union.

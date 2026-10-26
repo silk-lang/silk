@@ -56,9 +56,10 @@ through ordinary specialization. No compiler entry-shape diagnostic or implicit 
 
 **Status:** Confirmed
 
-Hosted startup drops an unhandled owned typed-failure payload before observing its diagnostic
-context. Its bounded source reporter preserves the primary identity and available origin/path/cause
-information. Reporting allocation refusal or write failure does not replace the application failure.
+Hosted startup accepts an Effect `main` only when each of its errors implements `Debug`. It keeps
+the `Debug` form of an unhandled owned typed-failure payload, drops the payload, and then observes
+its diagnostic context. Its bounded source reporter preserves the primary identity and available
+origin/path/cause information, followed by that form. Reporting allocation refusal or write failure does not replace the application failure.
 Unhandled typed failure and startup failure return status one. Unit and Effect success return zero;
 an ordinary integer result is the returned status.
 

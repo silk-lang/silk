@@ -96,12 +96,14 @@ When diagnostic capacity and output permit, the hosted source reporter presents,
 1. an explicit `unhandled error` classification;
 2. the canonical fully qualified type identity of the active error;
 3. the source origin where the failure was created, when valid provenance exists; and
-4. the logical named function and Effect path from that origin outward to `main`.
+4. the logical named function and Effect path from that origin outward to `main`; and
+5. the `Debug` form of the error's value.
 
 ```text
 unhandled error: app.NotFoundError
   at app.load (src/app.silk:12)
   at app.main (src/app.silk:27)
+unhandled value: NotFoundError { resourceId: 7 }
 ```
 
 The exact wording is illustrative; the information and order are the contract.
@@ -116,31 +118,44 @@ must not be disguised as an empty successful report.
 
 **Evidence:** [failure diagnostic context](typed-failures.md#fail-006--typed-failure-applies-ordinary-cleanup-and-preserves-diagnostic-context).
 
-## TERM-005 — Automatic reporting does not inspect error payload fields
+## TERM-005 — Automatic reporting prints the error's `Debug` form
 
 **Status:** Confirmed
 
-The source reporter presents canonical error identity and retained diagnostic context. It does not
-reflect over, serialize, or generically format the payload's fields.
+Hosted startup requires every error of an Effect `main` to implement `Debug`, and the report ends
+with an `unhandled value:` line holding the active error's `Debug` form.
 
 ```silk
+import silk.format { Debug, Format, Formatter }
+import silk.writer { Writer, WriterError }
+
 pub struct NotFoundError {
   resourceId: i32,
 }
+
+impl Debug for NotFoundError {
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return run Format.debugFields(self, "NotFoundError", &mut formatter)
+  }
+}
 ```
 
-An automatic report identifies `NotFoundError`; it does not automatically print `resourceId`.
+An unhandled `NotFoundError` reports `unhandled value: NotFoundError { resourceId: 7 }` after its trace and any `while handling` context. A
+structural union of errors is `Debug` when every member is
+([UNION-003](values-and-types.md#union-003--a-union-takes-a-reference-only-interface-that-every-member-implements)),
+and a `main` that cannot fail needs nothing.
 
-**Boundary:** The reporter cannot expose private fields accidentally, require a display operation,
-or fail because one payload field has no formatter. Source recovery code may inspect and report the
-payload explicitly before it reaches entry. A future opt-in error-formatting interface may customize
-the report, but implementing it must never be required for a value to participate in the typed-error
-channel or reach the automatic entry boundary.
+**Boundary:** The form is written before the error is dropped and is kept to 1024 bytes, cut at a
+character boundary and marked `[value truncated]`. A `Debug` implementation that fails to write
+leaves what it wrote. The start code's own errors are reported without a value. Standalone
+WebAssembly startup reports nothing, so it places no `Debug` requirement. The `Debug` form decides
+what the report shows, so a type that holds secrets can write a redacted form.
 
-**Diagnostics:** No marker interface or formatting diagnostic applies to a valid error type.
+**Diagnostics:** An Effect `main` with an error that does not implement `Debug` reports `SEM0225`,
+which names the `Debug` requirement.
 
 **Evidence:** [ordinary error values](typed-failures.md#fail-001--any-concrete-lifetime-valid-value-may-be-a-typed-failure),
-[removal of Report ceremony](program-entry.md#entry-003--source-policy-handles-unhandled-outcomes).
+[entry failure rule](program-entry.md#entry-003--source-policy-handles-unhandled-outcomes).
 
 ## TERM-006 — Recovery history becomes causal report context
 
