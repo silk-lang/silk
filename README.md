@@ -160,7 +160,8 @@ silk change since 0.1.0 --json
 ```
 
 Each contribution gets its own `.changes/<random>.md`, avoiding shared changelog edits in PRs.
-Migration guidance is optional, but missing guidance is reported as unknown impact. Releases
+Write the summary as one line. Migration guidance is only for changes that consumers must act on;
+no guidance means no action is needed. Releases
 consume pending changes, update the package version, and write authoritative
 `.changes/releases/<version>.toml` records. `CHANGELOG.md` is regenerated from those records
 with a warning that manual edits will be overwritten. An optional `[release].version-file`

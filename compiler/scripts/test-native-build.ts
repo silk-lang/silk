@@ -204,6 +204,8 @@ const program = Effect.gen(function* () {
   const summary = 'Use native release commands'
   const migration =
     'Replace "silk changes" with "silk change".\nKeep release records in version control.'
+  // Notes nest a migration under its change, so its later lines are indented.
+  const renderedMigration = migration.replaceAll('\n', '\n    ')
   const addedChange = yield* invoke(silkTool,
     ['change', 'minor', summary, '--migration', migration],
     releaseNested,
@@ -251,7 +253,7 @@ const program = Effect.gen(function* () {
   assert.equal(beta.tag, 'v1.1.0-beta.1')
   assert.equal(beta.prerelease, true)
   assert.ok(beta.notes.includes(correctedSummary))
-  assert.ok(beta.notes.includes(migration))
+  assert.ok(beta.notes.includes(renderedMigration))
   assert.ok(!beta.notes.includes('Manual notes'))
   const promoted = yield* invoke(silkTool, ['change', 'version'], releaseNested, changesEnvironment)
   assert.equal(promoted.status, 0, promoted.stderr)
@@ -259,7 +261,7 @@ const program = Effect.gen(function* () {
   const changelog = yield* fs.readFileString(join(releaseMember, 'CHANGELOG.md'))
   assert.match(changelog, /## 1\.1\.0\n/)
   assert.ok(changelog.includes(correctedSummary))
-  assert.ok(changelog.includes(migration))
+  assert.ok(changelog.includes(renderedMigration))
   assert.ok(!changelog.includes('Manual notes'))
   const stableArchive = yield* fs.readFileString(
     join(releaseMember, '.changes/releases/1.1.0.toml'),
@@ -277,7 +279,7 @@ const program = Effect.gen(function* () {
   assert.equal(stable.tag, 'v1.1.0')
   assert.equal(stable.prerelease, false)
   assert.ok(stable.notes.includes(correctedSummary))
-  assert.ok(stable.notes.includes(migration))
+  assert.ok(stable.notes.includes(renderedMigration))
   const expectedHistory = {
     package: 'native-release',
     from: '1.0.0',
