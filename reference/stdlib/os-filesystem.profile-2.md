@@ -11,7 +11,8 @@ Provide `OsFileSystem` for `FileSystem` in a native program. Code that uses file
 ## Details
 `OsFileSystem.make` takes a root directory of the host. The path `/` of the provider is that
 root, not the root of the host. A path cannot leave the root: `..` is not valid in a `Path`, and
-the provider does not follow symbolic links below the root.
+the native provider resolves a symbolic link below the root inside the root. An absolute link
+target starts again at the root, and `..` in a target never goes above it.
 
 The write operations are different:
 - `writeFile` creates or truncates the file, then writes. If it fails, a partial file can stay.

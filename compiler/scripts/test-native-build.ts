@@ -2747,7 +2747,44 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(linkedRun.status, 7, linkedRun.stderr)
-  // A source file that cannot be read is named.
+  // An output path may go through symbolic links too: a relative one, an absolute one, and a
+  // chain of them. A link that loops is reported instead of followed forever.
+  yield* fs.symlink(join(throughLinks, 'real'), join(throughLinks, 'absolute'))
+  yield* fs.symlink('via', join(throughLinks, 'chain'))
+  for (const output of ['via/linked', 'absolute/absolute', 'chain/chained']) {
+    const built = yield* invoke(
+      silk,
+      ['build', 'src/main.silk', '-o', join(throughLinks, output), '--stdlib', standardLibrary],
+      join(throughLinks, 'app'),
+      { ...process.env, SILK_CLANG: clang },
+    )
+    assert.equal(built.status, 0, built.stderr)
+    const ran = yield* invoke(join(throughLinks, 'real', basename(output)), [], throughLinks)
+    assert.equal(ran.status, 7, ran.stderr)
+  }
+  yield* fs.symlink('loop', join(throughLinks, 'loop'))
+  const looped = yield* invoke(
+    silk,
+    [
+      'build',
+      'src/main.silk',
+      '-o',
+      join(throughLinks, 'loop/program'),
+      '--stdlib',
+      standardLibrary,
+    ],
+    join(throughLinks, 'app'),
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(looped.status, 1, looped.stderr)
+  assert.match(looped.stderr, /^silk: cannot create temporary directory: /m)
+  // Cleaning removes a link in the build directory itself, never what it points to.
+  yield* fs.symlink('../../real', join(throughLinks, 'app/build/escape'))
+  const cleanedLinks = yield* invoke(silk, ['clean'], join(throughLinks, 'app'))
+  assert.equal(cleanedLinks.status, 0, cleanedLinks.stderr)
+  assert.equal(yield* fs.exists(join(throughLinks, 'app/build')), false)
+  assert.equal(yield* fs.exists(join(throughLinks, 'real/helper.silk')), true)
+  // A link to a missing source file is a missing module, as the file it names is missing.
   yield* fs.symlink('../../real/missing.silk', join(throughLinks, 'app/src/gone.silk'))
   yield* fs.writeFileString(
     join(throughLinks, 'app/src/main.silk'),
@@ -2759,7 +2796,7 @@ const program = Effect.gen(function* () {
     join(throughLinks, 'app'),
   )
   assert.equal(dangling.status, 1, dangling.stderr)
-  assert.match(dangling.stderr, /^silk: cannot read \S+\/app\/src\/gone\.silk$/m)
+  assert.match(dangling.stderr, /error\[MOD0001\] Unknown module gone$/m)
   // Two commands that build one package at once keep their intermediate files apart, and the
   // run finds a whole executable however the other command's link is going.
   const together = join(directory, 'together')

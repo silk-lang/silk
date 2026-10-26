@@ -7,7 +7,7 @@ libc. Other profiles have no native provider member; portable replacements remai
 ## Admitted calls and layout
 
 The complete initial call set is open/openat, close, read/write, fstat/fstatat, ftruncate, mkdirat,
-unlinkat, fdopendir, dirfd, readdir, closedir and the selected thread errno accessor. Open and openat
+readlinkat, unlinkat, fdopendir, dirfd, readdir, closedir and the selected thread errno accessor. Open and openat
 are genuinely variadic; creation supplies target mode_t through the C integer promotions. No
 fixed-signature adapter stands in for them. ftruncate is used only after checking an opened write
 destination is a regular file. No seek or fcntl API is admitted.
@@ -31,8 +31,12 @@ and NUL-free. Portable paths reject embedded NUL, dot/dot-dot and malformed norm
 Path.rawBytes and Path.joinBytes preserve byte identity, including directory names. The underlying
 filesystem can still reject a byte name (for example, APFS rejects invalid UTF-8); that native
 failure is reported. Text path helpers remain available for text callers. Each operation opens the configured root anew and traverses descriptors with
-no-follow directory flags. The configured root and its ancestors are trusted. Symlinks below it
-are rejected. This is not a guarantee against privileged mounts or hostile directory renames
+no-follow directory flags. The configured root and its ancestors are trusted. A symlink below it
+resolves inside the root, as openat2 RESOLVE_IN_ROOT does: its target is read with readlinkat, an
+absolute target restarts at the root, and `..` is clamped at the root. At most 40 links resolve in
+one path, else ELOOP. Opening, reading, writing and inspecting follow a final link; removing a
+file, creating a file, creating a directory and the atomic replace act on the link itself. A
+listing reports a link entry with the symbolic-link kind and does not follow it. This is not a guarantee against privileged mounts or hostile directory renames
 across the root boundary.
 
 ## Resource and error policy

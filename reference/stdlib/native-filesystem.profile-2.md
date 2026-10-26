@@ -10,7 +10,10 @@ from `silk.filesystem` instead.
 
 ## Details
 Each operation starts at the root directory and opens each part of the path relative to its
-parent, without following symbolic links. So a path cannot leave the root.
+parent. A symbolic link below the root resolves inside the root: an absolute target starts
+again at the root, and `..` never goes above it. So a path cannot leave the root. At most 40
+links resolve in one path. Removing a file and replacing a file act on a final link itself,
+not its target, and a listing reports a link as a link.
 
 `FileHandle` and `DirectoryHandle` each own one open descriptor. Close them with
 `NativeFileSystem.closeFile` or `NativeFileSystem.closeDirectory` to get a close error. A
