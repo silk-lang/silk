@@ -1458,7 +1458,15 @@ const program = Effect.gen(function* () {
     ["plainmismatch", "pub fn main() -> i32 {\n  let count: i32 = \"three\"\n  return count\n}\n", /error\[SEM0037\] Assignment expected i32 but received string<'static>\n/],
     ["ignored", "fn bump(n: i32) -> i32 { return n + 1 }\n\npub fn main() -> i32 {\n  bump(2)\n  return 0\n}\n", /error\[SEM0087\] Expression statement produces i32, but only \(\) or never may be ignored; write `drop` before it to discard the value\n/],
   ]
-  for (const [name, source, expected] of [...lendCases, ...patternCases]) {
+  const staticCases: Array<[string, string, RegExp]> = [
+    ["staticoverflow", "static fn grow(n: u8) -> u8 { return n + 100 }\nconst BIG: u8 = grow(200)\npub fn main() -> i32 { return 0 }\n", /error\[SEM0176\] Static evaluation of `n \+ 100` overflows its integer type\n/],
+    ["staticzero", "static fn fib(n: u64) -> u64 { if n < 2 { return n } return fib(n - 1) + fib(n - 2) }\nconst Q: u64 = fib(20) / (fib(0))\npub fn main() -> i32 { return 0 }\n", /error\[SEM0176\] Static evaluation of `fib\(20\) \/ \(fib\(0\)\)` divides by zero\n/],
+    ["staticbyte", "import silk.static_text { StaticText }\nstatic fn at(text: string<'static>) -> u8 { return StaticText.byteAt(text, 50) }\nconst L: u8 = at(\"loud!!\")\npub fn main() -> i32 { return 0 }\n", /error\[SEM0176\] Static evaluation stops: index 50 is past the end of the 6-byte text\n/],
+    ["staticplain", "fn plain() -> i32 { return 3 }\nstatic fn s() -> i32 { return plain() }\nconst P: i32 = s()\npub fn main() -> i32 { return 0 }\n", /error\[SEM0176\] `plain` is an ordinary fn, so static evaluation cannot call it; mark it `static fn` to call it here\n/],
+    ["phasebinding", "import silk.reflect { Reflect }\npub struct Stats { pub hits: i32, }\npub fn main() -> i32 { let f = Reflect.fields<Stats>() return 0 }\n", /error\[SEM0176\] Phase-only values exist only during static evaluation, so a runtime binding of a phase-only value is not allowed\n/],
+    ["constcycle", "const A: i32 = B\nconst B: i32 = A\npub fn main() -> i32 { return A }\n", /error\[SEM0223\] `A` and `B` depend on each other in a cycle, so none of them can be resolved\n/],
+  ]
+  for (const [name, source, expected] of [...lendCases, ...patternCases, ...staticCases]) {
     yield* fs.makeDirectory(join(directory, `${name}/src`), { recursive: true })
     yield* fs.writeFileString(join(directory, `${name}/silk.toml`), `[package]\nname = "${name}"\nversion = "0.1.0"\n`)
     yield* fs.writeFileString(join(directory, `${name}/src/main.silk`), source)
@@ -1466,6 +1474,19 @@ const program = Effect.gen(function* () {
     assert.equal(checked.status, 1, checked.stderr)
     assert.match(checked.stderr, expected)
     assert.equal(checked.stderr.match(/error\[/g)?.length, 1, checked.stderr)
+  }
+  // Parking checks run at build time: each names what parks and the rule it breaks.
+  const parkingCases: Array<[string, string, RegExp]> = [
+    ["parkfinalizer", "import silk.effect { Effect }\nimport silk.fiber { Fiber }\neffect fn finish() -> () {\n  run Fiber<(), ()>.yieldNow()\n  return ()\n}\neffect fn body() -> i32 { return 3 }\npub fn main() -> i32 {\n  return run Effect.ensuringNonParking(body(), finish())\n}\n", /error\[SEM0139\] `finish` must not park, because this call needs an `Intrinsic\.NonParking` value, but running it can park; move work that can suspend, such as `Effect\.sleep`, out of it\n/],
+    ["heldaccess", "import silk.allocator { Allocator, OutOfMemoryError }\nimport silk.effect { Effect }\nimport silk.fiber { Fiber }\nimport silk.shared { Shared }\nstruct Counter { value: i32 }\neffect fn noisy() -> () {\n  run Fiber<(), ()>.yieldNow()\n  return ()\n}\nfn bump(c: &mut Counter) -> i32 {\n  run noisy()\n  c.value = c.value + 1\n  return c.value\n}\neffect fn work() -> i32 ! OutOfMemoryError {\n  let mut allocator = Allocator.systemAllocatorProvider()\n  let shared = run (Shared<Counter>.make(Counter { value: 0 })\n    |> Effect.provideMut<Allocator>(&mut allocator))\n  return Shared<Counter>.withMut<i32>(&shared, bump)\n}\neffect fn recover(error: OutOfMemoryError) -> i32 { return -1 }\npub fn main() -> i32 {\n  return run Effect.catchAll(work(), recover)\n}\n", /error\[OWN0016\] `noisy\(\)` runs an Effect while a local-shared access such as `Shared\.withMut` holds its exclusive borrow; take what you need out of the value, return it, and run the Effect after the access returns\n/],
+  ]
+  for (const [name, source, expected] of parkingCases) {
+    yield* fs.makeDirectory(join(directory, `${name}/src`), { recursive: true })
+    yield* fs.writeFileString(join(directory, `${name}/silk.toml`), `[package]\nname = "${name}"\nversion = "0.1.0"\n`)
+    yield* fs.writeFileString(join(directory, `${name}/src/main.silk`), source)
+    const built = yield* invoke(silk, ['build', '--stdlib', standardLibrary], join(directory, name), { ...process.env, SILK_CLANG: clang })
+    assert.equal(built.status, 1, built.stderr)
+    assert.match(built.stderr, expected)
   }
   // A line that starts with `-1 =>` is the next arm, not a subtraction from the arm before it.
   yield* fs.makeDirectory(join(directory, 'negarm/src'), { recursive: true })
