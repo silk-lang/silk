@@ -14,6 +14,16 @@ export class CompilerReleaseError extends Data.TaggedError('CompilerReleaseError
 const invalid = (message) => Effect.fail(new CompilerReleaseError({ reason: 'Conflict', message }))
 export const managedBranch = 'release/compiler-stable'
 export const managedMarker = '<!-- silk-managed-stable-release -->'
+// GitHub rejects a release body over 125000 characters with HTTP 422. Prerelease notes collect every
+// change since the last stable release, so they can outgrow it; the body then keeps the leading
+// whole lines and links to the full pending changes at the release commit.
+export const releaseBodyLimit = 125000
+export const releaseBody = (repository, metadata) => {
+  if (metadata.notes.length <= releaseBodyLimit) return metadata.notes
+  const footer = `\n\n_Notes truncated. Every change in this release is in [compiler/.changes](https://github.com/${repository}/tree/${metadata.commit}/compiler/.changes)._`
+  const kept = metadata.notes.slice(0, releaseBodyLimit - footer.length)
+  return kept.slice(0, kept.lastIndexOf('\n')).trimEnd() + footer
+}
 const json = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown))
 const command = Effect.fnUntraced(function* (executable, args, options = {}) {
   const result = yield* NativeProcess.execute(executable, args, options)
@@ -304,6 +314,7 @@ export const publish = Effect.fn('CompilerRelease.publish')(function* ({
   )
     return yield* invalid('Invalid native publication metadata')
   const tag = metadata.tag
+  const body = releaseBody(repository, metadata)
   const existingRefs = yield* pages(
     repository,
     `git/matching-refs/tags/${encodeURIComponent(tag)}?per_page=100`,
@@ -320,14 +331,14 @@ export const publish = Effect.fn('CompilerRelease.publish')(function* ({
       tag_name: tag,
       target_commitish: metadata.commit,
       name: `Silk ${metadata.version}`,
-      body: metadata.notes,
+      body,
       draft: true,
       prerelease: metadata.prerelease,
       make_latest: 'false',
     })
   if (
     release.target_commitish !== metadata.commit ||
-    release.body !== metadata.notes ||
+    release.body !== body ||
     release.prerelease !== metadata.prerelease
   )
     return yield* invalid('Existing release metadata differs from reserved publication')
