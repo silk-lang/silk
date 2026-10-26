@@ -2,18 +2,24 @@
 //! them, sweeps a changed module again, and reports what a cold store reports. A changed
 //! package graph reaches the checks whose imports it resolves.
 
+import backend.CodegenUnits { CodegenUnit }
 import lexer.Span { Span }
+import semantic.BuildRecord
 import semantic.CacheImage as CacheImage {Image}
+import semantic.ContentHash { ContentHash }
+import semantic.FinalProfile { FinalProfile }
 import semantic.ModuleId {InvalidModulePath, ModuleId}
 import semantic.PackageGraph {PackageGraph}
 import semantic.Query { Cycle }
 import semantic.Rejection { MessageArgument, Rejection, RejectionCode }
-import semantic.Semantic { Adopted, Family, Request, Semantic, Statistics }
+import semantic.Semantic { Adopted, BackendBuild, Family, Request, Semantic, Statistics, staticClosureNodes }
 import semantic.SemanticCaseSupport { makeSemantic, module, present, starts }
 import semantic.SourceIndex { Event as SourceEvent, EventKind as SourceEventKind, RevisionMismatch }
 import semantic.SourceRevision { Revision }
+import semantic.Target { Id as TargetId, Target as MachineTarget }
 import semantic.Types { TypeTable, Types }
 import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bytes { Bytes }
 import silk.effect { Effect }
 import silk.list { List }
 import silk.option { Option }
@@ -807,5 +813,109 @@ effect fn insertedClaims() -> ()
   drop run Semantic.adoptCache(&mut warm, &request, &rewritten, false)
   let warmFound = run checkBoth(&mut warm, &mut request)
   run Testing.expect(warmFound == freshFound, "a warm check after the insertion reports what a cold one does")
+  return ()
+}
+
+test effect fn movedDefinitionsKeepTheirCode() -> ()
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut typeTable = TypeTable.make()
+  return run movedCodeClaims() |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+fn entryRuntime() -> string<'static> {
+  return "import Intrinsic.application\nexport \"C\" fn enter(count: i32, values: ?[*]const u8) -> i32 as \"main\" { return application.answer(count) }\n"
+}
+
+fn steps() -> string<'static> {
+  return "pub struct Box {pub value: i32}\nimpl Box {\n  pub fn get(self: &Box) -> i32 {\n    return self.value\n  }\n}\npub fn answer(count: i32) -> i32 {\n  let held = Box {value: count}\n  return held.get()\n}\n"
+}
+
+// A store that builds `steps` text into codegen units, as `silk build` does, offered `bodies`.
+effect fn unitStore(text: string<'static>, bodies: List<BuildRecord.PackBody>) -> Semantic
+  ! InvalidModulePath | OutOfMemoryError
+  ? &mut Allocator {
+  let runtime = run module("runtime.silk")
+  let application = run module("steps.silk")
+  let initial = run Revision.publish(&Revision.make(), &runtime, &run present(entryRuntime()))
+  let mut store = Semantic.traced(run Revision.publish(&initial, &application, &run present(text)),
+    MachineTarget.forId(TargetId.X8664UnknownLinuxGnu), Option<FinalProfile>.none())
+  Semantic.selectCodegenUnits(&mut store, true)
+  Semantic.offerPacks(&mut store, move bodies)
+  return move store
+}
+
+effect fn unitBuild(store: &mut Semantic) -> List<CodegenUnit>
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let runtime = run module("runtime.silk")
+  let application = run module("steps.silk")
+  let mut request = Request.forApplication(ModuleId.copy(&application))
+  let roots = [ModuleId.copy(&runtime), ModuleId.copy(&application)]
+  let built = run Semantic.buildArtifact(&mut store.*, &mut request, Option<&ModuleId>.some(&runtime), &roots, &roots, staticClosureNodes)
+  return match move built {
+    BackendBuild.Module {units, ..} => move units
+    _ => List<CodegenUnit>.make()
+  }
+}
+
+// Whether every unit that defines a function was taken from a held pack unread.
+fn allStored(units: &List<CodegenUnit>) -> bool {
+  let listed = List<CodegenUnit>.asSlice(units)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if !listed[at].stored && holds(Bytes.asSlice(&listed[at].body), b"define ") { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn holds(text: &[u8], needle: &[u8]) -> bool {
+  let mut start = usize.ZERO
+  while start + needle.length <= text.length {
+    let mut matched = usize.ZERO
+    while matched < needle.length && text[start + matched] == needle[matched] { matched = matched + usize.ONE }
+    if matched == needle.length { return true }
+    start = start + usize.ONE
+  }
+  return false
+}
+
+// A declaration inserted above both functions moves them without changing them. A build that
+// adopts the image of the build before reuses their code, which is the code a cold build of the
+// moved text emits. The method call matters: the build of `answer` reads where one of its sites
+// sits, which the insertion moves.
+effect fn movedCodeClaims() -> ()
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator | &mut Types {
+  let moved = "const unused: i32 = 0\npub struct Box {pub value: i32}\nimpl Box {\n  pub fn get(self: &Box) -> i32 {\n    return self.value\n  }\n}\npub fn answer(count: i32) -> i32 {\n  let held = Box {value: count}\n  return held.get()\n}\n"
+  let mut cold = run unitStore(steps(), List<BuildRecord.PackBody>.make())
+  let coldUnits = run unitBuild(&mut cold)
+  run Testing.expect(List<CodegenUnit>.length(&coldUnits) > usize.ZERO && !allStored(&coldUnits), "a cold build emits its units")
+  let image = run Semantic.cacheImage(&mut cold)
+  let mut bodies = List<BuildRecord.PackBody>.make()
+  let built = List<CodegenUnit>.asSlice(&coldUnits)
+  let mut at = usize.ZERO
+  while at < built.length {
+    run List<BuildRecord.PackBody>.append(&mut bodies, BuildRecord.PackBody {digest: built[at].digest, bytes: run Bytes.copy(Bytes.asSlice(&built[at].body))})
+    at = at + usize.ONE
+  }
+  let mut warm = run unitStore(moved, move bodies)
+  let request = Request.make()
+  drop run Semantic.adoptCache(&mut warm, &request, &image, false)
+  let warmUnits = run unitBuild(&mut warm)
+  run Testing.expect(List<CodegenUnit>.length(&warmUnits) > usize.ZERO && allStored(&warmUnits),
+    "a build after the insertion emits no function again")
+  let mut fresh = run unitStore(moved, List<BuildRecord.PackBody>.make())
+  let freshUnits = run unitBuild(&mut fresh)
+  let warmListed = List<CodegenUnit>.asSlice(&warmUnits)
+  let freshListed = List<CodegenUnit>.asSlice(&freshUnits)
+  let mut agrees = warmListed.length == freshListed.length
+  at = usize.ZERO
+  while agrees && at < warmListed.length {
+    agrees = ContentHash.equals(warmListed[at].digest, freshListed[at].digest)
+    at = at + usize.ONE
+  }
+  run Testing.expect(agrees, "the reused code is the code a cold build of the moved text emits")
   return ()
 }
