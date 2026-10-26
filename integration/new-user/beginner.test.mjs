@@ -301,10 +301,17 @@ test('< on two string fields read through references names the operator and type
 })
 
 // Finding 140: a block arm that ends in a bare value.
-test('a block arm ending in a value says block arms do not yield one', () => {
-  const result = check('pub fn main() -> i32 {\n  let n = 1\n  let v = match n {\n    1 => {\n      0\n    }\n    _ => 2\n  }\n  return v\n}\n')
-  assert.match(result.stderr, /SEM0087\]/, show(result))
-  assert.match(result.stderr, /block arm|does not yield/, show(result))
+// Since #2354 a block arm of a match used as a value yields its last expression.
+test('a block arm ending in a value yields it when the match is a value', () => {
+  const dir = initPackage(h, `beginner-${++serial}`)
+  write(join(dir, 'src/main.silk'), 'pub fn main() -> i32 {\n  let n = 1\n  let v = match n {\n    1 => {\n      0\n    }\n    _ => 2\n  }\n  return v\n}\n')
+  const result = silk(h, ['check'], { cwd: dir })
+  assert.equal(result.status, 0, show(result))
+})
+
+test('a statement match whose block arm ends in a value says the match is a statement', () => {
+  const result = check('pub fn main() -> i32 {\n  let n = 1\n  match n {\n    1 => {\n      7\n    }\n    _ => {}\n  }\n  return 0\n}\n')
+  assert.match(result.stderr, /SEM0087\] This match is a statement, so the last value of its arm block is ignored/, show(result))
 })
 
 // Finding 141: a private stdlib field whose accessor lives elsewhere.

@@ -288,12 +288,19 @@ pub effect fn main() -> i32
   assert.match(result.stderr, /offset/, show(result))
 })
 
-test('an if used as a value explains that if is a statement', () => {
+// Since #2354 an if with a final else is an expression; without one it is PAR0009.
+test('an if with a final else works as a value', () => {
   const dir = initPackage(h, 'ifvalue')
-  write(join(dir, 'src/main.silk'), 'pub fn main() -> i32 {\n  let found = true\n  let first = if found { 1 } else { 2 }\n  return first\n}\n')
+  write(join(dir, 'src/main.silk'), 'pub fn main() -> i32 {\n  let found = true\n  let first = if found { 0 } else { 2 }\n  return first\n}\n')
+  const result = silk(h, ['run'], { cwd: dir })
+  assert.equal(result.status, 0, show(result))
+})
+
+test('an if used as a value without else asks for a final else', () => {
+  const dir = initPackage(h, 'ifnoelse')
+  write(join(dir, 'src/main.silk'), 'pub fn main() -> i32 {\n  let found = true\n  let first = if found { 1 }\n  return first\n}\n')
   const result = silk(h, ['check'], { cwd: dir })
-  assert.notEqual(result.status, 0, show(result))
-  assert.match(result.stderr, /`?if`? is a statement/i, show(result))
+  assert.match(result.stderr, /error\[PAR0009\] An `if` used as a value needs a final `else` branch/, show(result))
 })
 
 
