@@ -3310,6 +3310,7 @@ const program = Effect.gen(function* () {
   // Workspace members share one output directory, and each keeps a cache of its own there, so
   // building one member never replaces the cache another member's next build reads.
   const pair = join(directory, 'pair')
+  yield* fs.makeDirectory(pair, { recursive: true })
   yield* fs.writeFileString(join(pair, 'silk.toml'), '[workspace]\nmembers = ["first", "second"]\noutput-dir = "build"\n')
   const memberSource = (value: number) => `pub fn main() -> i32 {\n  return ${value}\n}\n`
   for (const member of ['first', 'second']) {
