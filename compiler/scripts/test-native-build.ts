@@ -2190,8 +2190,8 @@ const program = Effect.gen(function* () {
   assert.ok(recorded.includes(x86 ? '+avx2' : '+crc'), recorded.join(' '))
   assert.equal(recorded.includes('-mcmodel=large'), x86, recorded.join(' '))
   assert.equal(recorded.includes('-static'), process.platform !== 'darwin', recorded.join(' '))
-  // The profile keeps the default `pic` relocation, so the executable links as PIE.
-  assert.ok(!recorded.includes('-no-pie'), recorded.join(' '))
+  // A Linux executable's default relocation is static, so it links without PIE.
+  assert.equal(recorded.includes('-no-pie'), process.platform === 'linux', recorded.join(' '))
   const tunedRun = yield* invoke(
     join(tuned, 'build/llvm', hostTarget, 'tuned/tuned'),
     [],
@@ -2208,29 +2208,35 @@ const program = Effect.gen(function* () {
   }
   yield* fs.writeFileString(join(tuned, 'src/main.silk'), tunedMain)
   if (process.platform === 'linux') {
-    // Static relocation links a dynamically linked executable at a fixed address, without PIE.
-    yield* fs.writeFileString(
-      join(tuned, 'silk.toml'),
-      `${tunedHeader}\n[profiles.fixed]\ntarget = "${hostTarget}"\nrelocation = "static"\n`,
-    )
-    yield* fs.writeFileString(argumentLog, '')
-    const fixedBuild = yield* invoke(
-      silk,
-      ['build', '--profile', 'fixed', '--stdlib', standardLibrary],
-      tuned,
-      { ...process.env, SILK_CLANG: recorder },
-    )
-    assert.equal(fixedBuild.status, 0, fixedBuild.stderr)
-    const fixedArguments = (yield* fs.readFileString(argumentLog)).split('\n')
-    assert.ok(
-      fixedArguments.includes('-fno-pic') && fixedArguments.includes('-no-pie') && !fixedArguments.includes('-static'),
-      fixedArguments.join(' '),
-    )
-    const fixedPath = join(tuned, 'build/llvm', hostTarget, 'fixed/tuned')
-    // ELF e_type 2 is an executable loaded at a fixed address; a PIE is 3.
-    assert.equal((yield* fs.readFile(fixedPath))[16], 2)
-    const fixedRun = yield* invoke(fixedPath, [], tuned)
-    assert.equal(fixedRun.status, 0, fixedRun.stderr)
+    // A dynamically linked Linux executable loads at a fixed address by default, and as a PIE when
+    // its profile sets `relocation = "pic"`.
+    const relocations = [
+      ['fixed', '', true],
+      ['movable', 'relocation = "pic"\n', false],
+    ] as const
+    for (const [name, field, fixed] of relocations) {
+      yield* fs.writeFileString(
+        join(tuned, 'silk.toml'),
+        `${tunedHeader}\n[profiles.${name}]\ntarget = "${hostTarget}"\n${field}`,
+      )
+      yield* fs.writeFileString(argumentLog, '')
+      const relocated = yield* invoke(
+        silk,
+        ['build', '--profile', name, '--stdlib', standardLibrary],
+        tuned,
+        { ...process.env, SILK_CLANG: recorder },
+      )
+      assert.equal(relocated.status, 0, relocated.stderr)
+      const relocatedArguments = (yield* fs.readFileString(argumentLog)).split('\n')
+      assert.equal(relocatedArguments.includes('-fno-pic'), fixed, relocatedArguments.join(' '))
+      assert.equal(relocatedArguments.includes('-no-pie'), fixed, relocatedArguments.join(' '))
+      assert.ok(!relocatedArguments.includes('-static'), relocatedArguments.join(' '))
+      const relocatedPath = join(tuned, 'build/llvm', hostTarget, `${name}/tuned`)
+      // ELF e_type 2 is an executable loaded at a fixed address; a PIE is 3.
+      assert.equal((yield* fs.readFile(relocatedPath))[16], fixed ? 2 : 3)
+      const relocatedRun = yield* invoke(relocatedPath, [], tuned)
+      assert.equal(relocatedRun.status, 0, relocatedRun.stderr)
+    }
   }
   // Profile fields the native build cannot honor yet, a profile artifact other than the one
   // [package].kind requests, unknown manifest fields and reserved module names are refused
