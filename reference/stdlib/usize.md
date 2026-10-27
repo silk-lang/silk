@@ -27,6 +27,13 @@ A `to` conversion, such as `toU8`, traps if the value is out of the range of the
 type. A `checkedTo` conversion returns `None` instead. Conversion to `f32` or `f64` rounds to
 the nearest value if the integer has more significant bits than the float.
 
+A `wrappingTo` conversion, such as `wrappingToI16`, never traps. It keeps the low bits of the
+two's complement form of the value, like a cast in C or Rust, so it truncates, sign-extends, or
+reinterprets bits.
+
+[`countOnes`](#countOnes), [`leadingZeros`](#leadingZeros), and [`trailingZeros`](#trailingZeros) count the bits of the value. For
+zero, both zero counts return [`BITS`](#BITS).
+
 [`BITS`](#BITS), [`MIN`](#MIN), and [`MAX`](#MAX) depend on the target: 32 bits on `wasm32` and 64 bits on the
 other targets.
 
@@ -75,7 +82,7 @@ pub fn main() -> i32 {
 
 Import as `usize` with `import silk.usize`.
 
-Public declarations: 58.
+Public declarations: 71.
 
 <a id="MAX"></a>
 
@@ -373,6 +380,125 @@ pub fn toF64(value: usize) -> f64
 Converts `value` to the nearest `f64` value, with ties to even. Only magnitudes below `2^53` are
 exactly representable, so a larger `usize` rounds. Every `usize` is exact on a 32-bit target.
 
+<a id="wrappingToU8"></a>
+
+## `wrappingToU8`
+
+```silk
+pub fn wrappingToU8(value: usize) -> u8
+```
+
+Converts `value` to `u8` modulo 2^8. Keeps the low 8 bits of the two's complement
+form of `value` and reads them as `u8`, so it never traps. Use this function for deliberate
+truncation, sign extension, or bit reinterpretation, such as reading a signed field.
+
+<a id="wrappingToU16"></a>
+
+## `wrappingToU16`
+
+```silk
+pub fn wrappingToU16(value: usize) -> u16
+```
+
+Converts `value` to `u16` modulo 2^16. Keeps the low 16 bits of the two's complement
+form of `value` and reads them as `u16`, so it never traps. Use this function for deliberate
+truncation, sign extension, or bit reinterpretation, such as reading a signed field.
+
+<a id="wrappingToU32"></a>
+
+## `wrappingToU32`
+
+```silk
+pub fn wrappingToU32(value: usize) -> u32
+```
+
+Converts `value` to `u32` modulo 2^32. Keeps the low 32 bits of the two's complement
+form of `value` and reads them as `u32`, so it never traps. Use this function for deliberate
+truncation, sign extension, or bit reinterpretation, such as reading a signed field.
+
+<a id="wrappingToU64"></a>
+
+## `wrappingToU64`
+
+```silk
+pub fn wrappingToU64(value: usize) -> u64
+```
+
+Converts `value` to `u64` modulo 2^64. Keeps the low 64 bits of the two's complement
+form of `value` and reads them as `u64`, so it never traps. Use this function for deliberate
+truncation, sign extension, or bit reinterpretation, such as reading a signed field.
+
+<a id="wrappingToUsize"></a>
+
+## `wrappingToUsize`
+
+```silk
+pub fn wrappingToUsize(value: usize) -> usize
+```
+
+Returns `value` unchanged. Use this function when generic wrapping-conversion code
+can select `usize` as both source and destination.
+
+<a id="wrappingToI8"></a>
+
+## `wrappingToI8`
+
+```silk
+pub fn wrappingToI8(value: usize) -> i8
+```
+
+Converts `value` to `i8` modulo 2^8. Keeps the low 8 bits of the two's complement
+form of `value` and reads them as `i8`, so it never traps. Use this function for deliberate
+truncation, sign extension, or bit reinterpretation, such as reading a signed field.
+
+<a id="wrappingToI16"></a>
+
+## `wrappingToI16`
+
+```silk
+pub fn wrappingToI16(value: usize) -> i16
+```
+
+Converts `value` to `i16` modulo 2^16. Keeps the low 16 bits of the two's complement
+form of `value` and reads them as `i16`, so it never traps. Use this function for deliberate
+truncation, sign extension, or bit reinterpretation, such as reading a signed field.
+
+<a id="wrappingToI32"></a>
+
+## `wrappingToI32`
+
+```silk
+pub fn wrappingToI32(value: usize) -> i32
+```
+
+Converts `value` to `i32` modulo 2^32. Keeps the low 32 bits of the two's complement
+form of `value` and reads them as `i32`, so it never traps. Use this function for deliberate
+truncation, sign extension, or bit reinterpretation, such as reading a signed field.
+
+<a id="wrappingToI64"></a>
+
+## `wrappingToI64`
+
+```silk
+pub fn wrappingToI64(value: usize) -> i64
+```
+
+Converts `value` to `i64` modulo 2^64. Keeps the low 64 bits of the two's complement
+form of `value` and reads them as `i64`, so it never traps. Use this function for deliberate
+truncation, sign extension, or bit reinterpretation, such as reading a signed field.
+
+<a id="wrappingToIsize"></a>
+
+## `wrappingToIsize`
+
+```silk
+pub fn wrappingToIsize(value: usize) -> isize
+```
+
+Converts `value` to `isize` modulo 2^`isize.BITS`. Keeps the low `isize.BITS` bits of the two's
+complement form of `value` and reads them as `isize`, so it never traps. Use this function for
+deliberate truncation, sign extension, or bit reinterpretation, such as reading a signed field.
+
 <a id="add"></a>
 
 ## `add`
@@ -510,6 +636,37 @@ pub fn rotateRight(left: usize, right: usize) -> usize
 
 Rotates the bits of `left` right by `right` positions. The count is reduced modulo [`BITS`](#BITS), so
 each count is valid.
+
+<a id="countOnes"></a>
+
+## `countOnes`
+
+```silk
+pub fn countOnes(value: usize) -> u32
+```
+
+Returns the number of one bits in `value`.
+
+<a id="leadingZeros"></a>
+
+## `leadingZeros`
+
+```silk
+pub fn leadingZeros(value: usize) -> u32
+```
+
+Returns the number of zero bits above the highest one bit of `value`. Returns [`BITS`](#BITS) for
+zero.
+
+<a id="trailingZeros"></a>
+
+## `trailingZeros`
+
+```silk
+pub fn trailingZeros(value: usize) -> u32
+```
+
+Returns the number of zero bits below the lowest one bit of `value`. Returns [`BITS`](#BITS) for zero.
 
 <a id="wrappingAdd"></a>
 
