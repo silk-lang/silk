@@ -374,6 +374,26 @@ uninitialized. Fill it again with [`Pointer.put`](#Pointer.impl.put), or do not 
 The caller must prove that `pointer` points to a live, initialized `T` that no other code will
 take or drop. Otherwise the value is dropped two times.
 
+<a id="Pointer.impl.dropInPlace"></a>
+
+### Associated function `dropInPlace`
+
+```silk
+pub unsafe fn dropInPlace<T>(pointer: *mut T) -> ()
+```
+
+Drops the `T` at `pointer` in place and leaves the storage uninitialized.
+
+#### When to use
+
+Use `dropInPlace` to destroy a value whose storage is released next, such as a heap cell. It
+runs the drop on the pointee directly. `drop Pointer.take(pointer)` copies the value out first.
+
+#### Gotchas
+
+The caller must prove that `pointer` points to a live, initialized `T` that no other code will
+take or drop. Otherwise the value is dropped two times.
+
 <a id="Pointer.impl.put"></a>
 
 ### Associated function `put`
