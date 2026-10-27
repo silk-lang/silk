@@ -826,9 +826,20 @@ with the built-in integer comparison. They are declared in the sealed file, so g
 the same operation as concrete code: `T: Intrinsic.Add<T, T>` at `T = i32` selects
 `Intrinsic.i32Add`, the operation `40 + 2` uses.
 
-**Boundary:** Source cannot declare a conformance of a scalar provider to an operator interface.
-Floating types have no sealed `Order` conformance: their built-in comparison is partial (NaN),
-while `Order.compare` is total.
+`f32` and `f64` have sealed `Intrinsic.Order` conformances that follow the IEEE 754 totalOrder
+predicate (`Intrinsic.f32TotalOrder`, `Intrinsic.f64TotalOrder`), not the built-in comparison:
+negative NaNs, negative infinity, the negative numbers, `-0.0`, `+0.0`, the positive numbers,
+positive infinity, then positive NaNs. `compare` returns `Equal` only for identical bits. Their
+`Intrinsic.Equal` conformances keep the built-in `==`, so `Equal` and `Order` disagree on signed
+zero and NaN. The built-in comparison is partial (NaN), and `Order.compare` must be total.
+
+Borrowed `string` has sealed conformances to `Intrinsic.Equal`, exact UTF-8 byte equality, and to
+`Intrinsic.Order`, byte-wise lexicographic order of the UTF-8 encodings (which equals the order of
+the Unicode scalar values), with a prefix before every longer text.
+
+**Boundary:** Source cannot declare a conformance of a scalar or `string` provider to an operator
+interface. Concrete float operands of `<`, `<=`, `>`, and `>=` keep the built-in IEEE comparison
+(OP-009); only a generic `T: Order` body, or a named `Order.compare`, uses the total order.
 
 **Diagnostics:** A source conformance for a scalar provider reports one `SEM0083` at that declaration,
 because IMPL-004 places it in the interface's module. A misplaced conformance does not participate

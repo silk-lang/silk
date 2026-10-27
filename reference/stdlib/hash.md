@@ -5,9 +5,10 @@
 Deterministic seeded hashing for hash maps, hash sets, and key types that users define.
 
 ## When to use
-Implement [`HashKey`](#HashKey) for a type that is a key of a `HashMap` or an element of a `HashSet`. In
-the `hash` member, use [`Hash.mix`](#Hash.impl.mix) for the first integer field and [`Hash.combine`](#Hash.impl.combine) for each
-other field that `equals` compares. Use [`Word`](#Word) as a ready-made key for one `u64`.
+`string` and every integer type implement [`HashKey`](#HashKey), so `HashMap<string, i32>` and
+`HashSet<u64>` work without more code. Implement [`HashKey`](#HashKey) for your own type that is a key of a
+`HashMap` or an element of a `HashSet`. In the `hash` member, use [`Hash.mix`](#Hash.impl.mix) for the first
+integer field and [`Hash.combine`](#Hash.impl.combine) for each other field that `equals` compares.
 
 ## Details
 A [`HashSeed`](#HashSeed) belongs to a collection, not to a key. The same seed, keys, and operations give
@@ -189,13 +190,14 @@ The interface of a key type for `HashMap` and `HashSet`: an equality test and a 
 
 ### When to use
 
-Implement it for a type that is a key of a `HashMap` or an element of a `HashSet`. In the
-`hash` member, use [`Hash.mix`](#Hash.impl.mix) for the first integer field and [`Hash.combine`](#Hash.impl.combine) for each other
-field that `equals` compares. Use [`Word`](#Word) as a ready-made key for one `u64`.
+`string` and every integer type already implement it. Implement it for your own type that is a
+key of a `HashMap` or an element of a `HashSet`. In the `hash` member, use [`Hash.mix`](#Hash.impl.mix) for the
+first integer field and [`Hash.combine`](#Hash.impl.combine) for each other field that `equals` compares.
 
 ### Details
 
-A conformance gives two members: `equals(left: &Self, right: &Self) -> bool` and `hash(value:
+A `string` key compares its UTF-8 bytes exactly, with no case folding or Unicode
+normalization. An integer key compares its value. A conformance gives two members: `equals(left: &Self, right: &Self) -> bool` and `hash(value:
 &Self, seed: &HashSeed) -> u64`. A collection calls `equals` to compare keys and `hash` with its
 own seed.
 
@@ -282,6 +284,270 @@ equals: Word.wordEquals
 
 ```silk
 hash: Word.wordHash
+```
+
+<a id="string.impl.HashKey"></a>
+
+## Implementation `HashKey for string<'text>`
+
+```silk
+impl<'text> HashKey for string<'text>
+```
+
+<a id="string.impl.HashKey.equals"></a>
+
+### Operation `equals`
+
+```silk
+fn equals(left: &Self, right: &Self) -> bool
+```
+
+<a id="string.impl.HashKey.hash"></a>
+
+### Operation `hash`
+
+```silk
+fn hash(value: &Self, seed: &HashSeed) -> u64
+```
+
+<a id="u64.impl.HashKey"></a>
+
+## Implementation `HashKey for u64`
+
+```silk
+impl HashKey for u64
+```
+
+<a id="u64.impl.HashKey.equals"></a>
+
+### Operation `equals`
+
+```silk
+fn equals(left: &Self, right: &Self) -> bool
+```
+
+<a id="u64.impl.HashKey.hash"></a>
+
+### Operation `hash`
+
+```silk
+fn hash(value: &Self, seed: &HashSeed) -> u64
+```
+
+<a id="u8.impl.HashKey"></a>
+
+## Implementation `HashKey for u8`
+
+```silk
+impl HashKey for u8
+```
+
+<a id="u8.impl.HashKey.equals"></a>
+
+### Operation `equals`
+
+```silk
+fn equals(left: &Self, right: &Self) -> bool
+```
+
+<a id="u8.impl.HashKey.hash"></a>
+
+### Operation `hash`
+
+```silk
+fn hash(value: &Self, seed: &HashSeed) -> u64
+```
+
+<a id="u16.impl.HashKey"></a>
+
+## Implementation `HashKey for u16`
+
+```silk
+impl HashKey for u16
+```
+
+<a id="u16.impl.HashKey.equals"></a>
+
+### Operation `equals`
+
+```silk
+fn equals(left: &Self, right: &Self) -> bool
+```
+
+<a id="u16.impl.HashKey.hash"></a>
+
+### Operation `hash`
+
+```silk
+fn hash(value: &Self, seed: &HashSeed) -> u64
+```
+
+<a id="u32.impl.HashKey"></a>
+
+## Implementation `HashKey for u32`
+
+```silk
+impl HashKey for u32
+```
+
+<a id="u32.impl.HashKey.equals"></a>
+
+### Operation `equals`
+
+```silk
+fn equals(left: &Self, right: &Self) -> bool
+```
+
+<a id="u32.impl.HashKey.hash"></a>
+
+### Operation `hash`
+
+```silk
+fn hash(value: &Self, seed: &HashSeed) -> u64
+```
+
+<a id="usize.impl.HashKey"></a>
+
+## Implementation `HashKey for usize`
+
+```silk
+impl HashKey for usize
+```
+
+<a id="usize.impl.HashKey.equals"></a>
+
+### Operation `equals`
+
+```silk
+fn equals(left: &Self, right: &Self) -> bool
+```
+
+<a id="usize.impl.HashKey.hash"></a>
+
+### Operation `hash`
+
+```silk
+fn hash(value: &Self, seed: &HashSeed) -> u64
+```
+
+<a id="i64.impl.HashKey"></a>
+
+## Implementation `HashKey for i64`
+
+```silk
+impl HashKey for i64
+```
+
+<a id="i64.impl.HashKey.equals"></a>
+
+### Operation `equals`
+
+```silk
+fn equals(left: &Self, right: &Self) -> bool
+```
+
+<a id="i64.impl.HashKey.hash"></a>
+
+### Operation `hash`
+
+```silk
+fn hash(value: &Self, seed: &HashSeed) -> u64
+```
+
+<a id="i8.impl.HashKey"></a>
+
+## Implementation `HashKey for i8`
+
+```silk
+impl HashKey for i8
+```
+
+<a id="i8.impl.HashKey.equals"></a>
+
+### Operation `equals`
+
+```silk
+fn equals(left: &Self, right: &Self) -> bool
+```
+
+<a id="i8.impl.HashKey.hash"></a>
+
+### Operation `hash`
+
+```silk
+fn hash(value: &Self, seed: &HashSeed) -> u64
+```
+
+<a id="i16.impl.HashKey"></a>
+
+## Implementation `HashKey for i16`
+
+```silk
+impl HashKey for i16
+```
+
+<a id="i16.impl.HashKey.equals"></a>
+
+### Operation `equals`
+
+```silk
+fn equals(left: &Self, right: &Self) -> bool
+```
+
+<a id="i16.impl.HashKey.hash"></a>
+
+### Operation `hash`
+
+```silk
+fn hash(value: &Self, seed: &HashSeed) -> u64
+```
+
+<a id="i32.impl.HashKey"></a>
+
+## Implementation `HashKey for i32`
+
+```silk
+impl HashKey for i32
+```
+
+<a id="i32.impl.HashKey.equals"></a>
+
+### Operation `equals`
+
+```silk
+fn equals(left: &Self, right: &Self) -> bool
+```
+
+<a id="i32.impl.HashKey.hash"></a>
+
+### Operation `hash`
+
+```silk
+fn hash(value: &Self, seed: &HashSeed) -> u64
+```
+
+<a id="isize.impl.HashKey"></a>
+
+## Implementation `HashKey for isize`
+
+```silk
+impl HashKey for isize
+```
+
+<a id="isize.impl.HashKey.equals"></a>
+
+### Operation `equals`
+
+```silk
+fn equals(left: &Self, right: &Self) -> bool
+```
+
+<a id="isize.impl.HashKey.hash"></a>
+
+### Operation `hash`
+
+```silk
+fn hash(value: &Self, seed: &HashSeed) -> u64
 ```
 
 
