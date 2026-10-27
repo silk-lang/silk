@@ -34,14 +34,14 @@ test('a written string<\'static> type argument works', () => {
   assert.equal(result.status, 0, show(result))
 })
 
-// Finding 171.
-test('a written string type argument checks', { todo: 'finding 171' }, () => {
+// Finding 171, fixed by #2416.
+test('a written string type argument checks', () => {
   const result = check(variant('if heads.pick("a", "b") != "a"', 'if heads.pick<string>("a", "b") != "a"'))
   assert.equal(result.status, 0, show(result))
   assert.doesNotMatch(result.stderr, /unsupported: this construct/, show(result))
 })
 
-test('too many type arguments for an operation says how many it takes', { todo: 'finding 171' }, () => {
+test('too many type arguments for an operation says how many it takes', () => {
   const result = check(variant(end, '  if Pick.pick<i32, i32>(&heads, 1, 2) != 1 { return 10 }\n' + end))
   assert.match(result.stderr, /SEM0051\]/, show(result))
   assert.doesNotMatch(result.stderr, /An application with the wrong number of type arguments\n/, show(result))
