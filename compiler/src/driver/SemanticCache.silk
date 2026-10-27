@@ -86,12 +86,171 @@ pub effect fn directory(output: &Path, package: &[u8]) -> Option<Path> ! OutOfMe
   }
 }
 
+/// A cache file read and decoded on a thread of its own ([`prefetch`]) while the build loads its
+/// sources, which [`openPrefetched`] takes when it is the file the store names.
+pub struct Prefetch {
+  handle: JoinHandle<Option<Fetched>>,
+}
+
+// What a prefetch read: the file's path, the stamp it was written under, its image, and the pack
+// bodies beside it when the store will build.
+struct Fetched {
+  path: Bytes,
+  stamp: Bytes,
+  image: CacheImage.Image,
+  packs: List<BuildRecord.PackBody>,
+}
+
+/// Starts reading the one cache file in `cache` on a thread of its own, before the store that
+/// names its file exists: the file's name digests the target and profile, which only the loaded
+/// store knows. None when the directory holds no file or several (builds that alternate between
+/// profiles), or no thread can start; `open` then reads the file itself.
+pub effect fn prefetch(cache: &Path, building: bool) -> Option<Prefetch> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let entries = match move run Effect.result(FileSystem.listDirectory(cache)) {
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => {
+        drop failure
+        return Option<Prefetch>.none()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let found = List<DirectoryEntry>.asSlice(&entries)
+  let mut named = Option<Bytes>.none()
+  let mut at = usize.ZERO
+  while at < found.length {
+    let path = Path.rawBytes(&found[at].path)
+    at = at + usize.ONE
+    if !imageName(path) { continue }
+    if let Option<Bytes>.Some {..} = &named { return Option<Prefetch>.none() }
+    named = Option<Bytes>.some(run Bytes.copy(path))
+  }
+  let path = match move named {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => { return Option<Prefetch>.none() }
+  }
+  return match move run Effect.result(NativeThread.spawn(
+    fn() -> Option<Fetched> {
+      return run fetchDetached(move path, building)
+    }
+  )) {
+    Result<JoinHandle<Option<Fetched>>, OutOfMemoryError | SpawnError>.Success {value} => Option<Prefetch>.some(Prefetch {handle: move value})
+    Result<JoinHandle<Option<Fetched>>, OutOfMemoryError | SpawnError>.Failure {error} => match move error {
+      SpawnError unstarted => {
+        drop unstarted
+        return Option<Prefetch>.none()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// Whether `path` names a cache file, `semantic-` and 32 hex digits, rather than its pack directory.
+fn imageName(path: &[u8]) -> bool {
+  let prefix = b"semantic-"
+  let length = prefix.length + 32
+  if path.length < length { return false }
+  let start = path.length - length
+  if start > usize.ZERO && path[start - usize.ONE] != 47 { return false }
+  let mut at = usize.ZERO
+  while at < prefix.length {
+    if path[start + at] != prefix[at] { return false }
+    at = at + usize.ONE
+  }
+  at = start + prefix.length
+  while at < path.length {
+    let byte = path[at]
+    if !(byte >= 48 && byte <= 57) && !(byte >= 97 && byte <= 102) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// `fetch` on a thread of its own, with its own allocator and file system.
+effect fn fetchDetached(path: Bytes, building: bool) -> Option<Fetched> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let fetched = run Effect.result(fetchOpened(&path, building) |> Effect.provideMut<Allocator>(&mut allocator))
+  return match move fetched {
+    Result<Option<Fetched>, OutOfMemoryError>.Success {value} => move value
+    Result<Option<Fetched>, OutOfMemoryError>.Failure {error} => {
+      drop error
+      return Option<Fetched>.none()
+    }
+  }
+}
+
+effect fn fetchOpened(path: &Bytes, building: bool) -> Option<Fetched> ! OutOfMemoryError ? &mut Allocator {
+  let mut files = run OsFileSystem.make("/")
+  return run fetch(path, building) |> Effect.provideMut<FileSystem>(&mut files)
+}
+
+// Reads and decodes the cache file at `path` under the stamp it was written with.
+effect fn fetch(path: &Bytes, building: bool) -> Option<Fetched> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let located = match move run Effect.result(Path.fromBytes(Bytes.asSlice(&path.*))) {
+    Result<Path, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => {
+        drop failure
+        return Option<Fetched>.none()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let bytes = match move run Effect.result(FileSystem.readFile(&located)) {
+    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => {
+        drop failure
+        return Option<Fetched>.none()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let stamp = match move run CacheImage.writtenStamp(Bytes.asSlice(&bytes)) {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => { return Option<Fetched>.none() }
+  }
+  let image = match move run CacheImage.decode(Bytes.asSlice(&bytes), Bytes.asSlice(&stamp)) {
+    Option<CacheImage.Image>.Some {value} => move value
+    Option<CacheImage.Image>.None => { return Option<Fetched>.none() }
+  }
+  drop bytes
+  let mut packs = List<BuildRecord.PackBody>.make()
+  if building {
+    let mut named = run Bytes.copy(Bytes.asSlice(&path.*))
+    run Bytes.append(&mut named, b".packs")
+    if let Result<Path, FileError | OutOfMemoryError>.Success {value: directory} = move run Effect.result(Path.fromBytes(Bytes.asSlice(&named))) {
+      packs = run readPacks(&directory)
+    }
+  }
+  return Option<Fetched>.some(Fetched {path: run Bytes.copy(Bytes.asSlice(&path.*)), stamp: move stamp, image: move image, packs: move packs})
+}
+
 /// Opens the cache file of `store` in the cache directory `cache` ([`directory`]) and adopts what
 /// it still holds. `compiler` is the running compiler's identity, from `CacheStamp.compiler`. `linked` is whether the store
 /// will be revised, as `Semantic.adoptCache` takes it. A store that will build reads the pack
 /// bodies too (`building`), which `Semantic.offerPacks` takes.
 pub effect fn open(store: &mut Semantic, request: &Request, cache: &Path, compiler: &[u8], linked: bool, building: bool)
   -> Option<CacheFile>
+  ! Cycle | OutOfMemoryError ? &mut FileSystem | &mut Allocator | &mut Types {
+  return run openPrefetched(&mut store.*, request, cache, compiler, linked, building, Option<Prefetch>.none())
+}
+
+/// As [`open`], taking what `prefetched` read when it read the file the store names under the
+/// stamp the store expects, and reading the file itself otherwise.
+pub effect fn openPrefetched(store: &mut Semantic, request: &Request, cache: &Path, compiler: &[u8], linked: bool, building: bool,
+  prefetched: Option<Prefetch>) -> Option<CacheFile>
   ! Cycle | OutOfMemoryError ? &mut FileSystem | &mut Allocator | &mut Types {
   let stamp = run CacheStamp.stamp(&store.*, compiler)
   let identity = run Semantic.stampIdentity(&store.*)
@@ -120,9 +279,23 @@ pub effect fn open(store: &mut Semantic, request: &Request, cache: &Path, compil
       OutOfMemoryError exhausted => { fail move exhausted }
     }
   }
-  if building { Semantic.offerPacks(&mut store.*, run readPacks(&packs)) }
   let mut adopted = Adopted {roots: usize.ZERO, stale: usize.ZERO, nodes: usize.ZERO, changedLeaves: usize.ZERO}
   let mut kept = Option<CacheImage.Image>.none()
+  let mut fetched = Option<Fetched>.none()
+  if let Option<Prefetch>.Some {value: started} = move prefetched {
+    let Prefetch {handle} = move started
+    fetched = handle.join()
+  }
+  if let Option<Fetched>.Some {value: read} = move fetched {
+    if same(Bytes.asSlice(&read.path), Path.rawBytes(&path)) && same(Bytes.asSlice(&read.stamp), Bytes.asSlice(&stamp)) {
+      let Fetched {path: _, stamp: _, image, packs: bodies} = move read
+      if building { Semantic.offerPacks(&mut store.*, move bodies) }
+      adopted = run Semantic.adoptCache(&mut store.*, request, &image, linked)
+      return Option<CacheFile>.some(CacheFile {path: move path, packs: move packs, stamp: move stamp, adopted: move adopted,
+        read: Option<CacheImage.Image>.some(move image)})
+    }
+  }
+  if building { Semantic.offerPacks(&mut store.*, run readPacks(&packs)) }
   let attempted = run Effect.result(FileSystem.readFile(&path))
   match move attempted {
     Result<Bytes, FileError | OutOfMemoryError>.Success {value: bytes} => {
