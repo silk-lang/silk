@@ -529,8 +529,8 @@ test('the mismatch says T is a type parameter of g', () => {
 })
 
 // One static for over the fields of a struct: doubling the fields should about double the time.
-// Finding 175: 3,200 fields check in 2.3 to 2.7 s, up from 1.9 s in round 50; near the 3 s limit.
-test('a static for over 3,200 fields checks in a few seconds', { todo: 'finding 175' }, () => {
+// Finding 175: 3,200 fields took up to 3 s in rounds 59 to 61 (1.9 s in round 50); 2.6 s since round 62.
+test('a static for over 3,200 fields checks in a few seconds', () => {
   const dir = initPackage(h, 'wide-reflect')
   const fields = Array.from({ length: 3200 }, (_, i) => `f${i}`)
   write(join(dir, 'src/main.silk'), `import silk.reflect { Reflect }

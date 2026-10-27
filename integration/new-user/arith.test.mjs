@@ -62,30 +62,30 @@ for (const [name, text, make] of rules) {
   })
 }
 
-// Finding 177: arithmetic and tuple mistakes with messages that name nothing, and a shift trap
+// Finding 177, fixed by #2436 and #2440: arithmetic and tuple mistakes with messages that name nothing, and a shift trap
 // reported inside the standard library.
-test('a shift count of 32 traps at the caller line', { todo: 'finding 177' }, () => {
+test('a shift count of 32 traps at the caller line', () => {
   const result = run(variant(end, '  let n: u32 = 32\n  return u32.toI32(u32.shiftLeft(1, n))\n}'))
   assert.ok(trapped(result), show(result))
   assert.match(result.stderr, /fatal trap: [^\n]*shift[^\n]*\n\s+at main\.main/, show(result))
 })
 
-test('.len on a slice suggests .length', { todo: 'finding 177' }, () => {
+test('.len on a slice suggests .length', () => {
   const result = check(variant('bytes.length', 'bytes.len'))
   assert.match(result.stderr, /SEM0027\][^\n]*len[\s\S]*length/, show(result))
 })
 
-test('a tuple ordinal past the end names the tuple and its element count', { todo: 'finding 177' }, () => {
+test('a tuple ordinal past the end names the tuple and its element count', () => {
   const result = check(variant('if width(r) != 7', 'if r.2 != 7'))
   assert.match(result.stderr, /SEM0027\][^\n]*Range[^\n]*2/, show(result))
 })
 
-test('a tuple built with the wrong count says how many elements it takes', { todo: 'finding 177' }, () => {
+test('a tuple built with the wrong count says how many elements it takes', () => {
   const result = check(variant('let r = Range(3, 10)', 'let r = Range(3)'))
   assert.match(result.stderr, /SEM0172\][^\n]*Range[^\n]*2/, show(result))
 })
 
-test('a >> operator points at shiftRight', { todo: 'finding 177' }, () => {
+test('a >> operator points at shiftRight', () => {
   const result = check(variant('if i32.shiftRight(-8, 1) != -4', 'if (-8 >> 1) != -4'))
   assert.notEqual(result.status, 0, show(result))
   assert.match(result.stderr, /shiftRight/, show(result))
