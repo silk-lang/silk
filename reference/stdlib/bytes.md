@@ -10,9 +10,11 @@ Use [`Bytes`](#Bytes) when each byte must stay unchanged and the data is not nec
 `silk.list.List<u8>` when the code appends many single bytes.
 
 ## Details
-[`Bytes.make`](#Bytes.impl.make) does not allocate. [`Bytes.zeroed`](#Bytes.impl.zeroed), [`Bytes.copy`](#Bytes.impl.copy), [`Bytes.append`](#Bytes.impl.append), and
-[`Bytes.reserveExact`](#Bytes.impl.reserveExact) can allocate and need an `Allocator`. [`Bytes.asSlice`](#Bytes.impl.asSlice) and
-[`Bytes.asMutSlice`](#Bytes.impl.asMutSlice) borrow the bytes. Dropping a `Bytes` value releases its storage.
+[`Bytes.make`](#Bytes.impl.make) does not allocate. [`Bytes.makeWithCapacity`](#Bytes.impl.makeWithCapacity), [`Bytes.zeroed`](#Bytes.impl.zeroed), [`Bytes.copy`](#Bytes.impl.copy),
+[`Bytes.append`](#Bytes.impl.append), [`Bytes.reserve`](#Bytes.impl.reserve), and [`Bytes.reserveExact`](#Bytes.impl.reserveExact) can allocate and need an
+`Allocator`. [`Bytes.clear`](#Bytes.impl.clear) and [`Bytes.truncate`](#Bytes.impl.truncate) keep the storage for reuse, and
+[`Bytes.clearAndFree`](#Bytes.impl.clearAndFree) releases it. [`Bytes.asSlice`](#Bytes.impl.asSlice) and [`Bytes.asMutSlice`](#Bytes.impl.asMutSlice) borrow the bytes.
+Dropping a `Bytes` value releases its storage.
 
 ## Examples
 ### Copy, append, and change bytes
@@ -56,7 +58,9 @@ An owned sequence of bytes. Dropping it releases its storage.
 ### Details
 
 The length is the number of bytes in the value. The length grows with [`Bytes.append`](#Bytes.impl.append). The
-capacity of the storage is not part of the public contract.
+capacity is the number of bytes that fit before the next allocation. [`Bytes.clear`](#Bytes.impl.clear) and
+[`Bytes.truncate`](#Bytes.impl.truncate) keep the capacity, so a buffer cleared and filled again in a loop reuses its
+storage. [`Bytes.clearAndFree`](#Bytes.impl.clearAndFree) releases the storage.
 
 <a id="Bytes.impl.Debug"></a>
 
@@ -93,6 +97,29 @@ pub fn make() -> Bytes
 ```
 
 Returns an empty `Bytes` value. This function does not allocate.
+
+<a id="Bytes.impl.makeWithCapacity"></a>
+
+### Associated function `makeWithCapacity`
+
+```silk
+pub effect fn makeWithCapacity(capacity: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator
+```
+
+Returns an empty `Bytes` value with storage for exactly `capacity` bytes.
+
+#### When to use
+
+Use `makeWithCapacity` when the number of bytes is known or can be estimated before the
+appends, so that the value allocates once.
+
+#### Details
+
+The length is 0 and the capacity is `capacity`. A `capacity` of 0 does not allocate.
+
+#### Errors
+
+- `OutOfMemoryError` if the `Allocator` cannot supply the storage.
 
 <a id="Bytes.impl.zeroed"></a>
 
@@ -169,6 +196,54 @@ allocation for exactly `length + additional` bytes.
 - `OutOfMemoryError` if `length + additional` overflows `usize`, or the `Allocator` cannot
   supply the storage. The value does not change.
 
+<a id="Bytes.impl.reserve"></a>
+
+### Method `reserve`
+
+```silk
+pub effect fn reserve(self: &mut Self, additional: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator
+```
+
+Makes sure that at least `additional` more bytes fit without another allocation, with room
+to spare for later appends. The length does not change.
+
+#### When to use
+
+Use `reserve` before a run of appends whose total is not known. Use [`Bytes.reserveExact`](#Bytes.impl.reserveExact)
+when the final length is known.
+
+#### Details
+
+If the capacity is already sufficient, this function does nothing. Otherwise, it grows the
+capacity by doubling until the bytes fit.
+
+#### Errors
+
+- `OutOfMemoryError` if `length + additional` overflows `usize`, or the `Allocator` cannot
+  supply the storage. The value does not change.
+
+<a id="Bytes.impl.shrinkToFit"></a>
+
+### Method `shrinkToFit`
+
+```silk
+pub effect fn shrinkToFit(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Releases the capacity beyond the length.
+
+#### Details
+
+If the capacity equals the length, this function does nothing. If the value is empty, it
+releases the storage. Otherwise, it moves the bytes into storage for exactly the length.
+
+#### Errors
+
+- `OutOfMemoryError` if the `Allocator` cannot supply the new storage. The value does not
+  change. An empty value never fails.
+
 <a id="Bytes.impl.capacity"></a>
 
 ### Method `capacity`
@@ -188,6 +263,26 @@ pub fn clear(self: &mut Self) -> ()
 ```
 
 Removes all bytes. The storage stays allocated for reuse.
+
+#### Details
+
+Later appends up to the old capacity do not allocate. Use [`Bytes.clearAndFree`](#Bytes.impl.clearAndFree) to also
+release the storage.
+
+<a id="Bytes.impl.clearAndFree"></a>
+
+### Method `clearAndFree`
+
+```silk
+pub fn clearAndFree(self: &mut Self) -> ()
+```
+
+Removes all bytes and releases the storage. The length and the capacity become 0.
+
+#### Details
+
+This function does not allocate and does not need an `Allocator`. Use [`Bytes.clear`](#Bytes.impl.clear) to keep
+the storage for reuse.
 
 <a id="Bytes.impl.truncate"></a>
 

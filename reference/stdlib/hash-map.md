@@ -9,12 +9,15 @@ Use [`HashMap`](#HashMap) to find a value by a key. The key type must implement 
 `silk.list.List` when the order of insertion matters, or when the code finds values by position.
 
 ## Details
-[`HashMap.make`](#HashMap.impl.make) does not allocate. The first insert allocates eight buckets. The map rebuilds
-its table before more than three quarters of the buckets are in use. A bucket stays in use after
-a removal, until the next rebuild. The rebuild doubles the number of buckets if the entries fill
-more than half of them. Otherwise it keeps the number and only clears the removed buckets, so a
-map that inserts and removes forever keeps a bucket count in proportion to its largest length. A
-failed growth leaves the entries, the length, and the bucket count unchanged.
+[`HashMap.make`](#HashMap.impl.make) does not allocate. The first insert allocates eight buckets.
+[`HashMap.makeWithCapacity`](#HashMap.impl.makeWithCapacity) and [`HashMap.reserve`](#HashMap.impl.reserve) allocate room for a known number of entries
+in one step. [`HashMap.clear`](#HashMap.impl.clear) drops the entries and keeps the buckets for reuse, and
+[`HashMap.clearAndFree`](#HashMap.impl.clearAndFree) also releases them. The map rebuilds its table before more than three
+quarters of the buckets are in use. A bucket stays in use after a removal, until the next
+rebuild. The rebuild doubles the number of buckets if the entries fill more than half of them.
+Otherwise it keeps the number and only clears the removed buckets, so a map that inserts and
+removes forever keeps a bucket count in proportion to its largest length. A failed growth leaves
+the entries, the length, and the bucket count unchanged.
 
 The same seed and the same operations give the same bucket order on each target. To visit each
 entry, scan the buckets from 0 to [`HashMap.bucketCount`](#HashMap.impl.bucketCount), test [`HashMap.occupiedAt`](#HashMap.impl.occupiedAt), and read
@@ -110,12 +113,15 @@ position.
 
 ### Details
 
-[`HashMap.make`](#HashMap.impl.make) does not allocate. The first insert allocates eight buckets. The map rebuilds
-its table before more than three quarters of the buckets are in use. A bucket stays in use after
-a removal, until the next rebuild. The rebuild doubles the number of buckets if the entries fill
-more than half of them. Otherwise it keeps the number and only clears the removed buckets, so a
-map that inserts and removes forever keeps a bucket count in proportion to its largest length. A
-failed growth leaves the entries, the length, and the bucket count unchanged.
+[`HashMap.make`](#HashMap.impl.make) does not allocate. The first insert allocates eight buckets.
+[`HashMap.makeWithCapacity`](#HashMap.impl.makeWithCapacity) and [`HashMap.reserve`](#HashMap.impl.reserve) allocate room for a known number of entries
+in one step. [`HashMap.clear`](#HashMap.impl.clear) drops the entries and keeps the buckets for reuse, and
+[`HashMap.clearAndFree`](#HashMap.impl.clearAndFree) also releases them. The map rebuilds its table before more than three
+quarters of the buckets are in use. A bucket stays in use after a removal, until the next
+rebuild. The rebuild doubles the number of buckets if the entries fill more than half of them.
+Otherwise it keeps the number and only clears the removed buckets, so a map that inserts and
+removes forever keeps a bucket count in proportion to its largest length. A failed growth leaves
+the entries, the length, and the bucket count unchanged.
 
 To visit each entry, scan the buckets from 0 to [`HashMap.bucketCount`](#HashMap.impl.bucketCount), test
 [`HashMap.occupiedAt`](#HashMap.impl.occupiedAt), and read [`HashMap.keyAt`](#HashMap.impl.keyAt) and [`HashMap.valueAt`](#HashMap.impl.valueAt). This order is the
@@ -153,6 +159,36 @@ Returns an empty map that uses `seed` for each hash. This function does not allo
 #### Details
 
 The seed and the sequence of operations decide the bucket order.
+
+<a id="HashMap.impl.makeWithCapacity"></a>
+
+### Associated function `makeWithCapacity`
+
+```silk
+pub effect fn makeWithCapacity(seed: HashSeed, capacity: usize) -> HashMap<K, V>
+  ! OutOfMemoryError
+  ? &mut Allocator
+```
+
+Returns an empty map that uses `seed` for each hash, with buckets for at least `capacity`
+entries before the first rebuild.
+
+#### When to use
+
+Use `makeWithCapacity` when the number of entries is known or can be estimated before the
+inserts, so that the table allocates once instead of growing step by step.
+
+#### Details
+
+The length is 0. Inserts of up to `capacity` entries do not allocate. The bucket count is the
+smallest of 8, 16, 32, and so on that keeps `capacity` entries under three quarters of the
+buckets. A `capacity` of 0 does not allocate and gives the same map as [`HashMap.make`](#HashMap.impl.make). The
+seed and the sequence of operations decide the bucket order.
+
+#### Errors
+
+- `OutOfMemoryError` if the bucket count overflows `usize`, or the `Allocator` cannot supply
+  the storage.
 
 <a id="HashMap.impl.length"></a>
 
@@ -345,6 +381,74 @@ Use `valueAt` with [`HashMap.occupiedAt`](#HashMap.impl.occupiedAt) to visit eac
 
 The key and value types must be `Copy`. If `index` is out of range or the bucket is empty, the
 program traps.
+
+<a id="HashMap.impl.reserve"></a>
+
+### Method `reserve`
+
+```silk
+pub effect fn reserve(self: &mut Self, additional: usize) -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Makes sure that at least `additional` more entries fit before the next rebuild.
+
+#### When to use
+
+Use `reserve` before a run of inserts whose count is known, so that the table grows at most
+once.
+
+#### Details
+
+If the buckets already hold `additional` more entries under three quarters of the bucket
+count, this function does nothing. Otherwise, it rebuilds the table once, with the smallest
+bucket count, doubling from the current one or from 8, that holds the length plus `additional`
+entries. The rebuild also reclaims the buckets of removed entries. The length does not change.
+An
+`additional` of 0 does nothing.
+
+#### Errors
+
+- `OutOfMemoryError` if the length plus `additional` overflows `usize`, the bucket count
+  overflows `usize`, or the `Allocator` cannot supply the storage. The map does not change.
+
+<a id="HashMap.impl.clear"></a>
+
+### Method `clear`
+
+```silk
+pub fn clear(self: &mut Self) -> ()
+```
+
+Drops every entry and sets the length to 0. The bucket count does not change.
+
+#### When to use
+
+Use `clear` to reuse a map, such as one filled again on each pass of a loop: later inserts up
+to the old size do not allocate. Use [`HashMap.clearAndFree`](#HashMap.impl.clearAndFree) to also release the storage.
+
+#### Details
+
+The buckets of removed entries are reclaimed too. This function does not allocate.
+
+<a id="HashMap.impl.clearAndFree"></a>
+
+### Method `clearAndFree`
+
+```silk
+pub fn clearAndFree(self: &mut Self) -> ()
+```
+
+Drops every entry and releases the storage. The length and the bucket count become 0.
+
+#### When to use
+
+Use `clearAndFree` when the map stays alive but its storage is no longer needed. Use
+[`HashMap.clear`](#HashMap.impl.clear) to keep the buckets for reuse.
+
+#### Details
+
+This function does not allocate and does not need an `Allocator`. The next insert allocates
+eight buckets again, as on a map from [`HashMap.make`](#HashMap.impl.make). The seed does not change.
 
 <a id="HashMap.impl.Drop"></a>
 

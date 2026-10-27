@@ -112,6 +112,10 @@ Get a borrowed `string` view with [`String.view`](#String.impl.view). A `String`
 make an independent copy of a view. A `String` always holds valid UTF-8. A failed
 [`String.append`](#String.impl.append) or [`String.appendOwned`](#String.impl.appendOwned) leaves the string unchanged.
 
+The capacity is the number of UTF-8 bytes that fit before the next allocation. Use
+[`String.makeWithCapacity`](#String.impl.makeWithCapacity) or [`String.reserve`](#String.impl.reserve) to allocate before a run of appends.
+[`String.clear`](#String.impl.clear) keeps the storage for reuse, and [`String.clearAndFree`](#String.impl.clearAndFree) releases it.
+
 ### Gotchas
 
 Traversal with [`String.nextScalar`](#String.impl.nextScalar) gives Unicode scalar values, not grapheme clusters, so one
@@ -192,6 +196,156 @@ pub fn make() -> String
 ```
 
 Returns an empty `String`. This function does not allocate.
+
+<a id="String.impl.makeWithCapacity"></a>
+
+### Associated function `makeWithCapacity`
+
+```silk
+pub effect fn makeWithCapacity(capacity: usize) -> String ! OutOfMemoryError ? &mut Allocator
+```
+
+Returns an empty `String` with storage for exactly `capacity` UTF-8 bytes.
+
+#### When to use
+
+Use `makeWithCapacity` to build text with appends when its byte length is known or can be
+estimated, so that the string allocates once.
+
+#### Details
+
+The capacity counts UTF-8 bytes, not characters. A `capacity` of 0 does not allocate.
+
+#### Errors
+
+- `OutOfMemoryError` if the `Allocator` cannot supply the storage.
+
+#### Examples
+```silk
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.string { String }
+
+pub effect fn main() -> i32
+  ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut text = run String.makeWithCapacity(32) |> Effect.provideMut<Allocator>(&mut allocator)
+  run String.append(&mut text, "hello") |> Effect.provideMut<Allocator>(&mut allocator)
+  String.clear(&mut text)
+  if String.ownedByteLength(&text) != 0 || String.capacity(&text) != 32 {
+    return 1
+  }
+  return 0
+}
+```
+
+<a id="String.impl.capacity"></a>
+
+### Method `capacity`
+
+```silk
+pub fn capacity(self: &Self) -> usize
+```
+
+Returns the number of UTF-8 bytes the storage holds before the next append allocates.
+
+<a id="String.impl.reserve"></a>
+
+### Method `reserve`
+
+```silk
+pub effect fn reserve(self: &mut Self, additional: usize) -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Makes sure that at least `additional` more UTF-8 bytes fit without another allocation, with
+room to spare for later appends. The text does not change.
+
+#### When to use
+
+Use `reserve` before a run of appends whose total is not known. Use [`String.reserveExact`](#String.impl.reserveExact)
+when the final byte length is known.
+
+#### Details
+
+If the capacity is already sufficient, this function does nothing. Otherwise, it grows the
+capacity by doubling until the bytes fit.
+
+#### Errors
+
+- `OutOfMemoryError` if the byte length plus `additional` overflows `usize`, or the
+  `Allocator` cannot supply the storage. The string does not change.
+
+<a id="String.impl.reserveExact"></a>
+
+### Method `reserveExact`
+
+```silk
+pub effect fn reserveExact(self: &mut Self, additional: usize) -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Makes sure that at least `additional` more UTF-8 bytes fit, with no extra capacity. The text
+does not change.
+
+#### Details
+
+If the capacity is already sufficient, this function does nothing and does not shrink the
+storage. Otherwise, it makes one allocation for exactly the byte length plus `additional`.
+
+#### Errors
+
+- `OutOfMemoryError` if the byte length plus `additional` overflows `usize`, or the
+  `Allocator` cannot supply the storage. The string does not change.
+
+<a id="String.impl.shrinkToFit"></a>
+
+### Method `shrinkToFit`
+
+```silk
+pub effect fn shrinkToFit(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Releases the capacity beyond the byte length.
+
+#### Details
+
+If the capacity equals the byte length, this function does nothing. If the string is empty,
+it releases the storage. Otherwise, it moves the text into storage for exactly its byte
+length.
+
+#### Errors
+
+- `OutOfMemoryError` if the `Allocator` cannot supply the new storage. The string does not
+  change. An empty string never fails.
+
+<a id="String.impl.clear"></a>
+
+### Method `clear`
+
+```silk
+pub fn clear(self: &mut Self) -> ()
+```
+
+Removes all text. The storage stays allocated for reuse.
+
+#### Details
+
+Later appends up to the old capacity do not allocate. Use [`String.clearAndFree`](#String.impl.clearAndFree) to also
+release the storage.
+
+<a id="String.impl.clearAndFree"></a>
+
+### Method `clearAndFree`
+
+```silk
+pub fn clearAndFree(self: &mut Self) -> ()
+```
+
+Removes all text and releases the storage. The byte length and the capacity become 0.
+
+#### Details
+
+This function does not allocate and does not need an `Allocator`. Use [`String.clear`](#String.impl.clear) to keep
+the storage for reuse.
 
 <a id="String.impl.fromBytes"></a>
 

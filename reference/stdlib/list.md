@@ -99,11 +99,13 @@ fit before the next growth. Dropping a list drops each element and then releases
 list is affine. Copy it element by element if a second list is necessary.
 
 [`List.make`](#List.impl.make) does not allocate. The first growth allocates space for four elements, and each
-later growth doubles the capacity. Use [`List.reserve`](#List.impl.reserve) or [`List.reserveExact`](#List.impl.reserveExact) to allocate
-before a sequence of appends. Growth copies the elements into new storage before it releases the
-old storage, so a failed [`List.append`](#List.impl.append) or [`List.reserve`](#List.impl.reserve) leaves the list unchanged.
-[`List.remove`](#List.impl.remove), [`List.clear`](#List.impl.clear), and [`List.truncate`](#List.impl.truncate) drop the elements that they remove and
-keep the capacity.
+later growth doubles the capacity. Use [`List.makeWithCapacity`](#List.impl.makeWithCapacity) to create a list with its
+storage in one call, or [`List.reserve`](#List.impl.reserve) and [`List.reserveExact`](#List.impl.reserveExact) to allocate before a sequence
+of appends. Growth copies the elements into new storage before it releases the old storage, so a
+failed [`List.append`](#List.impl.append) or [`List.reserve`](#List.impl.reserve) leaves the list unchanged. [`List.remove`](#List.impl.remove),
+[`List.clear`](#List.impl.clear), and [`List.truncate`](#List.impl.truncate) drop the elements that they remove and keep the capacity,
+so a list cleared in a loop reuses its storage. [`List.clearAndFree`](#List.impl.clearAndFree) also releases the storage,
+and [`List.shrinkToFit`](#List.impl.shrinkToFit) releases only the capacity beyond the length.
 
 [`List.sort`](#List.impl.sort) is stable, works for elements that are not `Copy`, and allocates temporary
 storage. [`List.binarySearch`](#List.impl.binarySearch) needs a sorted list and returns the lowest index of equal
@@ -136,6 +138,49 @@ Returns an empty list. This function does not allocate.
 #### Details
 
 The capacity is 0. The first [`List.append`](#List.impl.append), [`List.insert`](#List.impl.insert), or [`List.reserve`](#List.impl.reserve) allocates.
+
+<a id="List.impl.makeWithCapacity"></a>
+
+### Associated function `makeWithCapacity`
+
+```silk
+pub effect fn makeWithCapacity(capacity: usize) -> List<T> ! OutOfMemoryError ? &mut Allocator
+```
+
+Returns an empty list with storage for exactly `capacity` elements.
+
+#### When to use
+
+Use `makeWithCapacity` when the number of elements is known or can be estimated before the
+appends, so that the list allocates once instead of growing step by step.
+
+#### Details
+
+The length is 0 and the capacity is `capacity`. Appends up to that capacity do not allocate.
+A `capacity` of 0 does not allocate and gives the same list as [`List.make`](#List.impl.make).
+
+#### Errors
+
+- `OutOfMemoryError` if the size of `capacity` elements overflows, or the `Allocator` cannot
+  supply the storage.
+
+#### Examples
+```silk
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.list { List }
+
+pub effect fn main() -> i32
+  ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut values = run List<u32>.makeWithCapacity(16) |> Effect.provideMut<Allocator>(&mut allocator)
+  run List<u32>.append(&mut values, 7) |> Effect.provideMut<Allocator>(&mut allocator)
+  if List<u32>.length(&values) != 1 || List<u32>.capacity(&values) != 16 {
+    return 1
+  }
+  return 0
+}
+```
 
 <a id="List.impl.length"></a>
 
@@ -305,6 +350,33 @@ pub fn clear(self: &mut Self) -> ()
 
 Drops all elements and sets the length to 0. The capacity does not change.
 
+#### When to use
+
+Use `clear` to reuse a list, such as a buffer filled again on each pass of a loop: later
+appends up to the old capacity do not allocate. Use [`List.clearAndFree`](#List.impl.clearAndFree) to also release the
+storage.
+
+<a id="List.impl.clearAndFree"></a>
+
+### Method `clearAndFree`
+
+```silk
+pub fn clearAndFree(self: &mut Self) -> ()
+```
+
+Drops all elements and releases the storage. The length and the capacity become 0.
+
+#### When to use
+
+Use `clearAndFree` when the list stays alive but its storage is no longer needed, such as a
+large buffer that is kept for rare later use. Use [`List.clear`](#List.impl.clear) to keep the storage for
+reuse.
+
+#### Details
+
+This function does not allocate and does not need an `Allocator`. The next append allocates
+again, as on a list from [`List.make`](#List.impl.make).
+
 <a id="List.impl.truncate"></a>
 
 ### Method `truncate`
@@ -405,14 +477,14 @@ left by doubling growth does not stay allocated.
 
 #### Details
 
-If the capacity equals the length, or the list is empty, this function does nothing.
-Otherwise, it moves the elements into storage for exactly the length. The length does not
-change.
+If the capacity equals the length, this function does nothing. If the list is empty, it
+releases the storage, and the capacity becomes 0. Otherwise, it moves the elements into
+storage for exactly the length. The length does not change.
 
 #### Errors
 
 - `OutOfMemoryError` if the `Allocator` cannot supply the new storage. The list does not
-  change.
+  change. An empty list never fails.
 
 <a id="List.impl.sort"></a>
 
