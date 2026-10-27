@@ -22,6 +22,7 @@ node integration/incremental/fuzz.mjs --silk build/silkc --workspace . --package
 | `--seed` | Names one sequence of edits, so a failure can be run again. Default 1. |
 | `--work` | Where the copy and any failures go. Default: a folder in the system temp folder named for the seed. |
 | `--command` | `build` (default) or `check`. A check compares status and diagnostics only. |
+| `--edits` | Picks edits only from these, named as below and separated by commas: `comment`, `blank`, `literal`, `swap`, `rename`, `call`, `uncall`, `duplicate`. Default: all of them. |
 | `--edit-stdlib` | Edits the standard library copy too. |
 | `--keep-going` | Keeps going after a round whose builds disagree. |
 

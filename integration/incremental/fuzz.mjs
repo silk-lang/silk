@@ -4,7 +4,7 @@
 //
 // Usage: node integration/incremental/fuzz.mjs --silk <silkc> --workspace <dir> --package <name>
 //          [--stdlib <dir>] [--iterations <n>] [--seed <n>] [--work <dir>] [--command build|check]
-//          [--edit-stdlib] [--keep-going]
+//          [--edits <name,...>] [--edit-stdlib] [--keep-going]
 //
 // The workspace is copied to `<work>/tree` (its `build` and `.git` folders left out), and the
 // standard library to `<work>/tree/.stdlib`, so both builds read the same paths. After each round
@@ -26,7 +26,7 @@ for (let at = 0; at < argv.length; at += 1) {
   else options[name] = argv[(at += 1)];
 }
 if (!options.silk || !options.workspace || !options.package) {
-  console.error('usage: fuzz.mjs --silk <silkc> --workspace <dir> --package <name> [--stdlib <dir>] [--iterations <n>] [--seed <n>] [--work <dir>] [--command build|check] [--edit-stdlib] [--keep-going]');
+  console.error('usage: fuzz.mjs --silk <silkc> --workspace <dir> --package <name> [--stdlib <dir>] [--iterations <n>] [--seed <n>] [--work <dir>] [--command build|check] [--edits <name,...>] [--edit-stdlib] [--keep-going]');
   process.exit(2);
 }
 const work = options.work ?? join(tmpdir(), `silk-incremental-fuzz-${options.seed}`);
@@ -194,6 +194,15 @@ const edits = {
   },
 };
 
+// The edits a round picks from: every one, or those `--edits` names.
+const kinds = options.edits === undefined ? Object.keys(edits) : options.edits.split(',');
+for (const kind of kinds) {
+  if (!Object.hasOwn(edits, kind)) {
+    console.error(`unknown edit ${kind}; the edits are ${Object.keys(edits).join(', ')}`);
+    process.exit(2);
+  }
+}
+
 function mutate(round) {
   const done = [];
   const count = 1 + Math.floor(random() * 3);
@@ -204,7 +213,7 @@ function mutate(round) {
       done.push({ file: relative(tree, path), edit: 'restore the original text' });
       continue;
     }
-    const name = pick(Object.keys(edits));
+    const name = pick(kinds);
     const lines = readFileSync(path, 'utf8').split('\n');
     const description = edits[name](lines, round);
     if (description === undefined) continue;
