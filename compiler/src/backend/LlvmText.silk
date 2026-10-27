@@ -10,7 +10,7 @@ import backend.InstanceIdentity {InstanceIdentity}
 import backend.StackLifetimes
 import backend.StackLifetimes {BlockMarkers, Marker}
 import backend.Layout {Abi, Field, Layout, Metrics, Sequence, Slice as SliceFacts, Tagged as TaggedFacts, TypeLayout}
-import backend.TypeLayouts {TypeLayouts}
+import backend.TypeLayouts {DataSpan, TypeLayouts}
 import backend.Gap {Code as GapCode, Gap, Source as GapSource}
 import backend.Mir
 import backend.Mir {
@@ -496,7 +496,7 @@ pub effect fn declarations(target: &Target) -> Bytes ! OutOfMemoryError ? &mut A
   run append(&mut writer, b"declare void @llvm.lifetime.start.p0(i64, ptr)\ndeclare void @llvm.lifetime.end.p0(i64, ptr)\n")
   run defineFatalDispatch(&mut writer, target)
   run append(&mut writer, b"define internal i32 @__silk_foreign_personality(i32 %version, i32 %actions, i64 %class, ptr %exception, ptr %context) noinline nounwind noreturn {\nentry:\ncall void @llvm.trap()\nunreachable\n}\n")
-  run append(&mut writer, b"declare void @llvm.memmove.p0.p0.i64(ptr, ptr, i64, i1)\n")
+  run append(&mut writer, b"declare void @llvm.memmove.p0.p0.i64(ptr, ptr, i64, i1)\ndeclare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\n")
   run append(&mut writer, b"declare ptr @llvm.frameaddress.p0(i32)\n")
   run declareWidth(&mut writer, 1)
   run declareWidth(&mut writer, 8)
@@ -857,6 +857,26 @@ effect fn layoutOf(layouts: &TypeLayouts, ty: &Shared<Type>, function: &MirFunct
 // compiled without them, so their address is passed instead (SIMD-009).
 fn passedIndirectly(kind: Representation) -> bool {
   return kind.lanes != usize.ZERO && (kind.lanes > 16 || kind.bits * kind.lanes > 128)
+}
+
+// The parameter index whose caller-provided storage `local` uses as its own slot, so the value is
+// not copied on entry: a parameter of an ordinary Silk definition passed by address. The callee
+// owns that storage for the call (`exclusiveParameter`), so it may also write and drop it there.
+fn ownedParameter(function: &MirFunction, local: &Local, facts: Metrics, kind: Representation) -> Option<usize> {
+  if cExport(function) || !exclusiveParameter(facts, kind) { return Option<usize>.none() }
+  return match &local.kind {
+    LocalKind.Parameter {index} => Option<usize>.some(index)
+    _ => Option<usize>.none()
+  }
+}
+
+// Whether a Silk definition marks a parameter's address `noalias`. A parameter passed by address
+// names storage the caller gives the call: MIR passes a fresh temporary snapshot of the argument,
+// or a place the call moves out of, and never reads it afterwards, so nothing else reads or writes
+// it until the callee returns. Without the mark LLVM must assume a store through another pointer, such as a
+// field written into the callee's destination, can change the argument, and keeps an extra copy.
+fn exclusiveParameter(facts: Metrics, lane: Representation) -> bool {
+  return facts.abi == Abi.Indirect || passedIndirectly(lane)
 }
 
 // Whether `function` is a C export shim, whose lanes follow the C ABI instead (SIMD-010).
@@ -3134,6 +3154,7 @@ effect fn emitAssign(
 ) -> () ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
   let address = run emitPlace(&mut writer.*, function, target, layouts, destination)
   if let Rvalue.Aggregate {fields} = &value.* {
+    run clearPadding(&mut writer.*, layouts, &address)
     let operands = List<AggregateField>.asSlice(&fields)
     let mut fieldAt = usize.ZERO
     while fieldAt < operands.length {
@@ -3229,6 +3250,32 @@ effect fn emitAssign(
   }
   let selected = run emitScalarRvalue(&mut writer.*, function, target, layouts, value, span)
   run storeValue(&mut writer.*, &address, &selected)
+  return ()
+}
+
+// Zeroes the padding between and after a record's fields before the fields are stored. A record
+// built here is usually copied whole to its final place, and a copy of never-written padding bytes
+// keeps LLVM from forwarding a field the record received by copy, such as a moved payload, to that
+// place: both copies stay. Written padding splits off as its own small store instead.
+effect fn clearPadding(writer: &mut Writer, layouts: &TypeLayouts, address: &Address) -> ()
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let gaps = match move run TypeLayouts.padding(layouts, &address.ty) {
+    Option<List<DataSpan>>.Some {value} => move value
+    Option<List<DataSpan>>.None => { return () }
+  }
+  let listed = List<DataSpan>.asSlice(&gaps)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let gap = run byteOffset(&mut writer.*, Bytes.asSlice(&address.text), listed[at].offset)
+    run append(&mut writer.*, b"call void @llvm.memset.p0.i64(ptr align ")
+    run decimal(&mut writer.*, offsetAlignment(address.alignment, listed[at].offset))
+    run append(&mut writer.*, b" ")
+    run append(&mut writer.*, Bytes.asSlice(&gap))
+    run append(&mut writer.*, b", i8 0, i64 ")
+    run decimal(&mut writer.*, listed[at].length)
+    run append(&mut writer.*, b", i1 false)\n")
+    at = at + usize.ONE
+  }
   return ()
 }
 
@@ -4331,8 +4378,7 @@ effect fn emitEntrySlots(
         continue
       }
     }
-    if !cExport(function) && passedIndirectly(kind) {
-      run copyBytes(&mut writer.*, Bytes.asSlice(&addressName.text), Bytes.asSlice(&input), parameterLayout.size)
+    if let Option<usize>.Some {..} = ownedParameter(function, &locals[local + usize.ONE], parameterLayout, kind) {
       local = local + usize.ONE
       continue
     }
@@ -4376,6 +4422,16 @@ effect fn emitSlots(
       locals[local].origin.location,
     )
     let kind = storageRepresentation(&locals[local].ty, target, localLayout)
+    if let Option<Suspended>.None = &suspended.* {
+      if let Option<usize>.Some {value: index} = ownedParameter(function, &locals[local], localLayout, kind) {
+        run localName(&mut writer.*, local)
+        run append(&mut writer.*, b" = getelementptr i8, ptr %p")
+        run decimal(&mut writer.*, index)
+        run append(&mut writer.*, b", i64 0\n")
+        local = local + usize.ONE
+        continue
+      }
+    }
     if !kind.unit {
       run localName(&mut writer.*, local)
       run append(&mut writer.*, b" = alloca ")
@@ -4527,6 +4583,7 @@ pub effect fn emit(
         lanes = lanes + usize.ONE
         if facts.abi == Abi.Indirect || passedIndirectly(lane) { run append(&mut writer, b"ptr") }
         else { run typeName(&mut writer, lane) }
+        if exclusiveParameter(facts, lane) { run append(&mut writer, b" noalias") }
         run append(&mut writer, b" %p")
         run decimal(&mut writer, at)
       }
