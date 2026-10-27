@@ -1,6 +1,7 @@
 // One prebuilt native compiler exercises its private request/build routes together.
 import { strict as assert } from 'node:assert'
 import { spawn, spawnSync, type SpawnSyncReturns } from 'node:child_process'
+import { existsSync, readdirSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -32,6 +33,19 @@ class VerificationError extends Data.TaggedError('NativeBuildVerificationError')
   readonly message: string
   readonly cause: unknown
 }> {}
+// A build hands its cache write to a copy of the compiler that outlives it, holding a `flock` on
+// the file's `.lock` until it is done (compiler/src/driver/DetachedWriter.silk). Waiting for the
+// copies below the build directories of `cwd` and of the packages beside it keeps the next step
+// from reading or removing a cache the copy is still writing.
+const settleCaches = (cwd: string) => {
+  const directories = (path: string) =>
+    existsSync(path) ? readdirSync(path, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => join(path, entry.name)) : []
+  const caches = [cwd, ...directories(cwd)].map((root) => join(root, 'build', 'cache'))
+  const locks = caches.flatMap(directories).flatMap((cache) => readdirSync(cache).filter((name) => name.endsWith('.lock')).map((name) => join(cache, name)))
+  if (locks.length === 0) return
+  const waited = spawnSync('python3', ['-c', 'import fcntl, sys\nfor path in sys.argv[1:]:\n    fcntl.flock(open(path), fcntl.LOCK_SH)', ...locks], { encoding: 'utf8' })
+  assert.equal(waited.status, 0, waited.stderr)
+}
 const invoke = Effect.fnUntraced(function* (
   command: string,
   args: ReadonlyArray<string>,
@@ -40,7 +54,11 @@ const invoke = Effect.fnUntraced(function* (
   timeout = 30_000,
 ): Effect.fn.Return<SpawnSyncReturns<string>, VerificationError> {
   return yield* Effect.try({
-    try: () => spawnSync(command, args, { cwd, env, encoding: 'utf8', timeout }),
+    try: () => {
+      const ran = spawnSync(command, args, { cwd, env, encoding: 'utf8', timeout })
+      settleCaches(cwd)
+      return ran
+    },
     catch: (cause) => new VerificationError({ message: 'Native CLI invocation failed', cause }),
   })
 })
@@ -3023,7 +3041,10 @@ const program = Effect.gen(function* () {
       })
       let stderr = ''
       child.stderr.on('data', (chunk) => (stderr += chunk))
-      child.on('close', (status) => settle({ status, stderr }))
+      child.on('close', (status) => {
+        settleCaches(together)
+        settle({ status, stderr })
+      })
     })
   for (let round = 0; round < 4; round += 1) {
     yield* fs.remove(join(together, 'build'), { recursive: true, force: true })

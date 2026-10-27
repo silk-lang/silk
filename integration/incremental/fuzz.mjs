@@ -239,7 +239,23 @@ function run() {
       if (existsSync(path)) executable = createHash('sha256').update(readFileSync(path)).digest('hex');
     }
   }
-  return { status: ran.status, output, executable, seconds: (Date.now() - started) / 1000 };
+  const seconds = (Date.now() - started) / 1000;
+  settle();
+  return { status: ran.status, output, executable, seconds };
+}
+
+// A build hands its cache write to a copy of the compiler that outlives it, holding a `flock` on
+// the file's `.lock` until it is done. The build folder is moved and removed between builds, so
+// wait for the copies first; the time a build reports leaves the wait out.
+function settle() {
+  const caches = join(tree, 'build', 'cache');
+  if (!existsSync(caches)) return;
+  const locks = readdirSync(caches, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .flatMap((entry) => readdirSync(join(caches, entry.name)).filter((name) => name.endsWith('.lock')).map((name) => join(caches, entry.name, name)));
+  if (locks.length === 0) return;
+  const waited = spawnSync('python3', ['-c', 'import fcntl, sys\nfor path in sys.argv[1:]:\n    fcntl.flock(open(path), fcntl.LOCK_SH)', ...locks], { encoding: 'utf8' });
+  if (waited.status !== 0) throw new Error(`cannot wait for the cache writers: ${waited.stderr}`);
 }
 
 const primed = run();
