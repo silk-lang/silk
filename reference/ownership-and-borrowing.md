@@ -601,6 +601,18 @@ similarly create a mutable hidden owner; mutations are discarded when that owner
 A shared borrow of a zero-length array, such as `&[]` or `&EMPTY` for a `const EMPTY: [Point; 0]`,
 reads no storage, so its owner's end never expires it and it is valid for `&'static [T]`.
 
+A constant has no owner: a shared borrow of a constant, or of a field or element of one, views
+immutable storage that lives for the whole program, so it is valid for `&'static T` and
+`&'static [T]`. A mutable borrow of a constant still borrows a hidden owner holding a copy.
+
+```silk
+const PRIMES: [u16; 3] = [2, 3, 5]
+
+fn primes() -> &'static [u16] {
+  return &PRIMES
+}
+```
+
 Fixed arrays do not decay to slices implicitly. The borrow must be explicit:
 
 ```silk
