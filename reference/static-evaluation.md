@@ -280,15 +280,16 @@ tuples and anonymous positional aggregates expose positions; named structs and a
 expose visible labels. Declaration order, nominal owner identity, generic substitution, aggregate
 kind, and the reflecting declaration's visibility authority are retained.
 
-| Member                             | Result                    | Meaning                                                |
-| ---------------------------------- | ------------------------- | ------------------------------------------------------ |
-| `typeOf<Owner>()`                  | `Intrinsic.Type<Owner>`   | Descriptor for one concrete aggregate owner            |
-| `fields<Owner>()`                  | `Intrinsic.Fields<Owner>` | Ordered heterogeneous field collection                 |
-| `typeKind(descriptor)`             | `u8`                      | Stable named/positional aggregate-kind code            |
-| `fieldKind(field)`                 | `u8`                      | Stable labeled/positional member-kind code             |
-| `fieldLabel(field)`                | `string`                  | Label of a labeled field                               |
-| `fieldOrdinal(field)`              | `usize`                   | Position of a positional field                         |
-| `borrowField(owner, static field)` | `&Value`                  | Shared runtime projection authorized by the descriptor |
+| Member                                | Result                    | Meaning                                                 |
+| ------------------------------------- | ------------------------- | ------------------------------------------------------- |
+| `typeOf<Owner>()`                     | `Intrinsic.Type<Owner>`   | Descriptor for one concrete aggregate owner             |
+| `fields<Owner>()`                     | `Intrinsic.Fields<Owner>` | Ordered heterogeneous field collection                  |
+| `typeKind(descriptor)`                | `u8`                      | Stable named/positional aggregate-kind code             |
+| `fieldKind(field)`                    | `u8`                      | Stable labeled/positional member-kind code              |
+| `fieldLabel(field)`                   | `string`                  | Label of a labeled field                                |
+| `fieldOrdinal(field)`                 | `usize`                   | Position of a positional field                          |
+| `borrowField(owner, static field)`    | `&Value`                  | Shared runtime projection authorized by the descriptor  |
+| `borrowFieldMut(owner, static field)` | `&mut Value`              | Mutable runtime projection authorized by the descriptor |
 
 Descriptors remain nominal: equal field shapes from separate structs do not become assignment-
 compatible or share projection authority. Private fields are absent outside their declaring module
@@ -296,9 +297,10 @@ and their spellings cannot leak through reflection diagnostics.
 
 **Boundary:** `Intrinsic.Type`, `Intrinsic.Fields`, and `Intrinsic.Field` are phase-only nominals
 with no runtime layout, address, ownership, or backend representation. `borrowField` accepts only a
-shared reference to the descriptor's exact owner and consumes its descriptor during specialization.
-It cannot project an owned value, use a descriptor at runtime, or extend the result beyond the
-owner's ordinary borrow lifetime.
+shared reference to the descriptor's exact owner, and `borrowFieldMut` only a mutable one; each
+consumes its descriptor during specialization. Neither can project an owned value, use a descriptor
+at runtime, or extend the result beyond the owner's ordinary borrow lifetime. A mutable projection
+is an ordinary mutable loan of the field, so the owner is unusable while it lives.
 
 **Evidence:** static reflection requirements,
 [reflection source actor](../stdlib/silk/reflect.silk).
