@@ -1544,6 +1544,10 @@ const program = Effect.gen(function* () {
     ["droptwice", "import silk.ownership { Drop }\n\nstruct Tracer { id: i32, log: i32, }\n\nimpl Drop for Tracer {\n  fn drop(self: &mut Tracer) -> () {\n    return ()\n  }\n}\n\nfn tracer(id: i32) -> Tracer { return Tracer { id: id, log: 0 } }\n\nfn consume(t: Tracer) -> () { return () }\n\npub fn main() -> i32 {\n  let first = tracer(1)\n  drop first\n  drop first\n  return 0\n}\n", /error\[OWN0001\] first was moved and cannot be used again\n/],
     ["dropcopy", "import silk.ownership { Copy, Drop }\n\nstruct Tracer { id: i32, log: i32, }\n\nimpl Copy for Tracer {}\n\nimpl Drop for Tracer {\n  fn drop(self: &mut Tracer) -> () {\n    return ()\n  }\n}\n\nfn tracer(id: i32) -> Tracer { return Tracer { id: id, log: 0 } }\n\nfn consume(t: Tracer) -> () { return () }\n\npub fn main() -> i32 { return 0 }\n", /error\[SEM0083\] Invalid conformance: main\.Tracer has a Drop hook, so it cannot be Copy: every copy would run the hook again\n/],
     ["dropmethod", "import silk.ownership { Drop }\n\nstruct Tracer { id: i32, log: i32, }\n\nimpl Drop for Tracer {\n  fn drop(self: &mut Tracer) -> () {\n    return ()\n  }\n}\n\nfn tracer(id: i32) -> Tracer { return Tracer { id: id, log: 0 } }\n\nfn consume(t: Tracer) -> () { return () }\n\npub fn main() -> i32 {\n  let mut c = tracer(1)\n  c.drop()\n  return 0\n}\n", /error\[SEM0010\] `drop` is not a method; write `drop c` to end the value early, which runs its Drop hook, if it has one\n/],
+    ["slicelen", "import silk.usize\n\npub fn main() -> i32 {\n  let bytes: &[u8] = b\"abc\"\n  return usize.toI32(bytes.len)\n}\n", /error\[SEM0027\] &'static \[u8\] has no field `len`; its element count is `\.length`\n/],
+    ["tupleordinal", "tuple Range(i32, i32)\n\npub fn main() -> i32 {\n  let r = Range(3, 10)\n  return r.2\n}\n", /error\[SEM0027\] main\.Range has no element `\.2`; it has 2 elements, `\.0` and `\.1`\n/],
+    ["tuplearity", "tuple Range(i32, i32)\n\npub fn main() -> i32 {\n  let r = Range(3)\n  return 0\n}\n", /error\[SEM0172\] main\.Range expects 2 tuple elements but received 1\n/],
+    ["shiftoperator", "pub fn main() -> i32 {\n  let x = (-8 >> 1)\n  return x\n}\n", /error\[PAR0010\] Silk has no `<<` or `>>`; shift with the functions of the value's type, as in `i32\.shiftLeft\(value, count\)` or `i32\.shiftRight\(value, count\)`\n/],
     ["fieldless", templateUse('StderrWriter.print("{}\\n", &5)'), /error\[SEM0177\] a template with placeholders takes its values as fields, such as `&\.\{name: value\}`, `&\(a, b\)`, or `&\(a,\)` for one value; these arguments have no fields\n/],
   ]
   for (const [name, source, expected] of [...lendCases, ...patternCases, ...staticCases, ...interopCases, ...templateCases]) {
@@ -1575,6 +1579,13 @@ const program = Effect.gen(function* () {
   yield* fs.writeFileString(join(directory, 'callexport/src/main.silk'), "export \"C\" fn twice(v: i32) -> i32 {\n  return v * 2\n}\n\npub fn main() -> i32 {\n  return unsafe twice(21)\n}\n")
   const exportCall = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(directory, 'callexport'), { ...process.env, SILK_CLANG: clang })
   assert.equal(exportCall.status, 42, exportCall.stderr)
+  // A shift count out of range is the caller's mistake, so the trap names the caller's line.
+  yield* fs.makeDirectory(join(directory, 'shiftcount/src'), { recursive: true })
+  yield* fs.writeFileString(join(directory, 'shiftcount/silk.toml'), '[package]\nname = "shiftcount"\nversion = "0.1.0"\n')
+  yield* fs.writeFileString(join(directory, 'shiftcount/src/main.silk'), 'import silk.u32\n\nfn count(n: u32) -> u32 { return n + 31 }\n\npub fn main() -> i32 {\n  let shifted = u32.shiftLeft(1, count(1))\n  return u32.toI32(shifted)\n}\n')
+  const shiftCount = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(directory, 'shiftcount'), { ...process.env, SILK_CLANG: clang })
+  assert.notEqual(shiftCount.status, 0, shiftCount.stderr)
+  assert.match(shiftCount.stderr, /^fatal trap: invalid shift count\n {2}at main\.main \(main:6:17\)$/m)
   // A width or precision field can be any integer, so a bare literal needs no `usize` annotation.
   yield* fs.makeDirectory(join(directory, 'widthint/src'), { recursive: true })
   yield* fs.writeFileString(join(directory, 'widthint/silk.toml'), '[package]\nname = "widthint"\nversion = "0.1.0"\n')
