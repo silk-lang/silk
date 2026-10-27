@@ -8,6 +8,8 @@ A fixed-size output buffer that collects small writes and sends them as larger w
 Use [`BufferedOutput`](#BufferedOutput) when a program makes many small writes to a byte transport and each
 transport write has a cost, such as a system call. Make the buffer with [`BufferedOutput.make`](#BufferedOutput.impl.make),
 write with [`BufferedOutput.writeAll`](#BufferedOutput.impl.writeAll), and end with [`BufferedOutput.finish`](#BufferedOutput.impl.finish).
+To give code that requires `&mut Writer` a buffered destination, wrap that destination, such as
+`silk.os_writer.StdoutWriter`, in a [`BufferedWriter`](#BufferedWriter).
 
 Each operation has two forms. The deadline form, such as `writeAll`, uses a
 `silk.byte_duplex.ByteDuplex` transport and a deadline. The `Writer` form, such as
@@ -80,7 +82,7 @@ pub effect fn main() -> i32
 
 Import as `BufferedOutput` with `import silk.buffered_output { BufferedOutput }`.
 
-Public declarations: 1.
+Public declarations: 2.
 
 <a id="BufferedOutput"></a>
 
@@ -451,6 +453,135 @@ When this function returns, [`BufferedOutput.pending`](#BufferedOutput.impl.pend
 - `BufferError.UnknownExternalTransfer` if `Writer.writeAll` or `Writer.flush` fails. The
   buffer becomes terminal. A `Writer` does not report partial progress. Thus the destination
   can have received some, all, or none of the pending bytes.
+
+<a id="BufferedWriter"></a>
+
+## `BufferedWriter`
+
+```silk
+pub struct BufferedWriter<W>
+```
+
+A `Writer` that owns a destination `Writer` and collects small writes into larger ones.
+
+### When to use
+
+Use `BufferedWriter` when code that requires `&mut Writer` makes many small writes, such as
+field-by-field output, and each write to the destination has a cost, such as a system call.
+Wrap the destination, such as `silk.os_writer.StdoutWriter`, with [`BufferedWriter.make`](#BufferedWriter.impl.make) and
+provide the result as the `Writer`. Use [`BufferedOutput`](#BufferedOutput) when the caller keeps the
+destination itself or writes to a `ByteDuplex`.
+
+### Details
+
+`Writer.writeAll` copies small writes into the buffer and sends them when it is full. A write
+that does not fit goes to the destination after the pending bytes, without a copy.
+`Writer.flush` sends the pending bytes and then flushes the destination. A failed write or
+flush of the destination makes the buffer terminal, as for [`BufferedOutput`](#BufferedOutput). Each later
+write or flush fails with a [`WriterError`](./writer.md#WriterError).
+
+### Gotchas
+
+Dropping a `BufferedWriter` does not flush it. Pending bytes that are not flushed are lost.
+Call `Writer.flush` or [`BufferedWriter.finish`](#BufferedWriter.impl.finish) before the writer goes out of scope.
+
+### Examples
+
+```silk
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.buffered_input { BufferError }
+import silk.buffered_output { BufferedWriter }
+import silk.effect { Effect }
+import silk.os_writer { StdoutWriter }
+import silk.writer { Writer, WriterError }
+
+pub effect fn main() -> i32
+  ! BufferError | OutOfMemoryError | WriterError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut output = run BufferedWriter<StdoutWriter>.make(StdoutWriter.make(), 4096)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Writer.writeString("one ") |> Effect.provideMut<Writer>(&mut output)
+  run Writer.writeString("write\n") |> Effect.provideMut<Writer>(&mut output)
+  let stdout = run BufferedWriter<StdoutWriter>.finish(move output)
+  drop stdout
+  return 0
+}
+```
+
+<a id="BufferedWriter.impl"></a>
+
+## Implementation `BufferedWriter<W>`
+
+```silk
+impl<W> BufferedWriter<W>
+```
+
+<a id="BufferedWriter.impl.make"></a>
+
+### Associated function `make`
+
+```silk
+pub effect fn make<W>(destination: W, capacity: usize) -> BufferedWriter<W>
+  ! BufferError | OutOfMemoryError
+  ? &mut Allocator
+```
+
+Returns a writer that sends its bytes to `destination` through a buffer of `capacity` bytes.
+
+#### Errors
+
+- `BufferError.InvalidCapacity` if `capacity` is zero or more than
+  `silk.buffered_input.MAX_CAPACITY` (1 MiB).
+- `OutOfMemoryError` if the active `Allocator` cannot supply `capacity` bytes.
+
+<a id="BufferedWriter.impl.pending"></a>
+
+### Method `pending`
+
+```silk
+pub fn pending<W>(self: &Self) -> usize
+```
+
+Returns the number of bytes that the buffer holds and the destination has not yet received.
+
+<a id="BufferedWriter.impl.finish"></a>
+
+### Method `finish`
+
+```silk
+pub effect fn finish<W: Writer>(self: Self) -> W ! WriterError
+```
+
+Sends the pending bytes, flushes the destination, and returns it.
+
+#### Errors
+
+- [`WriterError`](./writer.md#WriterError) if an earlier failure made the buffer terminal, or if the destination fails.
+  The destination is dropped.
+
+<a id="BufferedWriter.impl.Writer"></a>
+
+## Implementation `Writer for BufferedWriter<W>`
+
+```silk
+impl<W: Writer> Writer for BufferedWriter<W>
+```
+
+<a id="BufferedWriter.impl.Writer.writeAll"></a>
+
+### Operation `writeAll`
+
+```silk
+effect fn writeAll(self: &mut Self, val: &[u8]) -> () ! WriterError ? &mut Writer
+```
+
+<a id="BufferedWriter.impl.Writer.flush"></a>
+
+### Operation `flush`
+
+```silk
+effect fn flush(self: &mut Self) -> () ! WriterError ? &mut Writer
+```
 
 
 Category: Input and output.
