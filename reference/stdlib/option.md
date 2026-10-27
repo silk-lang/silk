@@ -173,6 +173,16 @@ pub value: T
 
 The owned present value.
 
+<a id="Option.impl.Copy"></a>
+
+## Implementation `Copy for Option<T>`
+
+```silk
+impl<T: Copy> Copy for Option<T>
+```
+
+An `Option` of a `Copy` type is `Copy`, so a struct with an `Option` field can be `Copy` too.
+
 <a id="Option.impl"></a>
 
 ## Implementation `Option<T>`

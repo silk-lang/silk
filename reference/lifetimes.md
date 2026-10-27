@@ -62,8 +62,11 @@ results preserve it.
 
 An invariant position does not stop inference. A body-local region in one, such as the element
 region of `let names = List<Name>.make()`, is held equal to the region it meets, so `return move
-names` checks against a result `List<Name>` whose element borrows a parameter. Two declared
-lifetimes in an invariant position must be equal or bound each other both ways.
+names` checks against a result `List<Name>` whose element borrows a parameter. Two body-local
+regions meet the same way, as when a `Plan<'a>` that holds a `List<Item<'a>>` is appended to `let
+plans = List<Plan>.make()`; the region check then requires each loan to live as long as the other.
+A section's bound regions stay exact. Two declared lifetimes in an invariant position must be equal
+or bound each other both ways.
 
 A body assumes the bounds its header declares and the bounds its parameter and result types imply.
 Inside a generic body, the contents of each type parameter are one opaque region chosen by the
