@@ -1,6 +1,7 @@
 // One prebuilt native compiler exercises its private request/build routes together.
 import { strict as assert } from 'node:assert'
 import { spawn, spawnSync, type SpawnSyncReturns } from 'node:child_process'
+import { existsSync, readdirSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -32,6 +33,20 @@ class VerificationError extends Data.TaggedError('NativeBuildVerificationError')
   readonly message: string
   readonly cause: unknown
 }> {}
+// A build hands its cache write to a copy of the compiler that outlives it, holding a `flock` on
+// the file's `.lock` until it is done (compiler/src/driver/DetachedWriter.silk). Waiting for the
+// copies below `cwd`'s build directory keeps the next step from reading or removing a cache the
+// copy is still writing.
+const settleCaches = (cwd: string) => {
+  const caches = join(cwd, 'build', 'cache')
+  if (!existsSync(caches)) return
+  const locks = readdirSync(caches, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .flatMap((entry) => readdirSync(join(caches, entry.name)).filter((name) => name.endsWith('.lock')).map((name) => join(caches, entry.name, name)))
+  if (locks.length === 0) return
+  const waited = spawnSync('python3', ['-c', 'import fcntl, sys\nfor path in sys.argv[1:]:\n    fcntl.flock(open(path), fcntl.LOCK_SH)', ...locks], { encoding: 'utf8' })
+  assert.equal(waited.status, 0, waited.stderr)
+}
 const invoke = Effect.fnUntraced(function* (
   command: string,
   args: ReadonlyArray<string>,
@@ -40,7 +55,11 @@ const invoke = Effect.fnUntraced(function* (
   timeout = 30_000,
 ): Effect.fn.Return<SpawnSyncReturns<string>, VerificationError> {
   return yield* Effect.try({
-    try: () => spawnSync(command, args, { cwd, env, encoding: 'utf8', timeout }),
+    try: () => {
+      const ran = spawnSync(command, args, { cwd, env, encoding: 'utf8', timeout })
+      settleCaches(cwd)
+      return ran
+    },
     catch: (cause) => new VerificationError({ message: 'Native CLI invocation failed', cause }),
   })
 })

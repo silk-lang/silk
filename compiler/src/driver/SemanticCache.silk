@@ -3,8 +3,8 @@
 //!
 //! # When to use
 //! Call [`open`] once the store's request and profile are selected and before anything is
-//! checked, and [`save`] (or [`saveAside`], which writes on a thread of its own) once the check is
-//! done. Both are best effort: a cache that cannot be read starts the check cold, and one that
+//! checked, and [`save`] (or [`saveDetached`], which writes in a copy of the process) once the
+//! check is done. Both are best effort: a cache that cannot be read starts the check cold, and one that
 //! cannot be written is left as it was.
 //!
 //! # Details
@@ -18,9 +18,13 @@
 //! A build's definitions are kept beside the file rather than in its image: each module's
 //! definitions are one pack body (see `BuildRecord.Pack`), a file of `semantic-<digest>.packs`
 //! named by the hex of its own digest.
+//!
+//! A build's write can outlive the build (see `DetachedWriter`). The copy that writes the file
+//! holds a lock on `semantic-<digest>.lock` until it is done, and a read of the file waits for it.
 
 import backend.CodegenUnits {CodegenUnit}
 import driver.CacheStamp
+import driver.DetachedWriter as DetachedWriter {Handoff}
 import driver.ImportSummaries as Summaries {ImportSummaries}
 import semantic.BuildRecord
 import semantic.CacheImage
@@ -37,6 +41,7 @@ import silk.native_thread {JoinHandle, NativeThread, SpawnError}
 import silk.option {Option}
 import silk.os_filesystem {OsFileSystem}
 import silk.result {Result}
+import silk.slice {Slice}
 import silk.u64
 import silk.u8
 import silk.usize
@@ -47,6 +52,8 @@ pub struct CacheFile {
   path: Path,
   // The directory of the pack bodies beside it.
   packs: Path,
+  // The lock file a write of it holds.
+  lock: Path,
   stamp: Bytes,
   /// What the store reused from the file it read; nothing when it read none.
   pub adopted: Adopted,
@@ -84,6 +91,56 @@ pub effect fn directory(output: &Path, package: &[u8]) -> Option<Path> ! OutOfMe
       OutOfMemoryError exhausted => { fail move exhausted }
     }
   }
+}
+
+/// Waits until no copy of an earlier build is writing a cache file below the output directory
+/// `output`, so the directory can be removed or moved whole.
+pub effect fn settle(output: &Path) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let caches = match move run Effect.result(Path.joinBytes(output, b"cache")) {
+    Result<Path, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => {
+        drop failure
+        return ()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let packages = run entries(&caches)
+  let found = List<DirectoryEntry>.asSlice(&packages)
+  let mut at = usize.ZERO
+  while at < found.length {
+    let files = run entries(&found[at].path)
+    let held = List<DirectoryEntry>.asSlice(&files)
+    let mut file = usize.ZERO
+    while file < held.length {
+      if lockName(Path.rawBytes(&held[file].path)) { run DetachedWriter.waitFor(&held[file].path) }
+      file = file + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+}
+
+// The entries of `directory`; none when it cannot be listed.
+effect fn entries(directory: &Path) -> List<DirectoryEntry> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  return match move run Effect.result(FileSystem.listDirectory(directory)) {
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => {
+        drop failure
+        return List<DirectoryEntry>.make()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// Whether `path` names a cache file's lock file, its name and `.lock`.
+fn lockName(path: &[u8]) -> bool {
+  let suffix = b".lock"
+  if path.length < suffix.length { return false }
+  let stem = path.length - suffix.length
+  return imageName(Slice.view<u8>(path, usize.ZERO, stem)) && same(Slice.view<u8>(path, stem, suffix.length), suffix)
 }
 
 /// A cache file read and decoded on a thread of its own ([`prefetch`]) while the build loads its
@@ -207,6 +264,11 @@ effect fn fetch(path: &Bytes, building: bool) -> Option<Fetched> ! OutOfMemoryEr
       OutOfMemoryError exhausted => { fail move exhausted }
     }
   }
+  let mut lockName = run Bytes.copy(Bytes.asSlice(&path.*))
+  run Bytes.append(&mut lockName, b".lock")
+  if let Result<Path, FileError | OutOfMemoryError>.Success {value: lock} = move run Effect.result(Path.fromBytes(Bytes.asSlice(&lockName))) {
+    run DetachedWriter.waitFor(&lock)
+  }
   let bytes = match move run Effect.result(FileSystem.readFile(&located)) {
     Result<Bytes, FileError | OutOfMemoryError>.Success {value} => move value
     Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
@@ -268,8 +330,20 @@ pub effect fn openPrefetched(store: &mut Semantic, request: &Request, cache: &Pa
       OutOfMemoryError exhausted => { fail move exhausted }
     }
   }
+  let mut lockName = run Bytes.copy(Bytes.asSlice(&name))
   run Bytes.append(&mut name, b".packs")
   let packs = match move run Effect.result(Path.joinBytes(cache, Bytes.asSlice(&name))) {
+    Result<Path, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => {
+        drop failure
+        return Option<CacheFile>.none()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  run Bytes.append(&mut lockName, b".lock")
+  let lock = match move run Effect.result(Path.joinBytes(cache, Bytes.asSlice(&lockName))) {
     Result<Path, FileError | OutOfMemoryError>.Success {value} => move value
     Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
       FileError failure => {
@@ -291,10 +365,11 @@ pub effect fn openPrefetched(store: &mut Semantic, request: &Request, cache: &Pa
       let Fetched {path: _, stamp: _, image, packs: bodies} = move read
       if building { Semantic.offerPacks(&mut store.*, move bodies) }
       adopted = run Semantic.adoptCache(&mut store.*, request, &image, linked)
-      return Option<CacheFile>.some(CacheFile {path: move path, packs: move packs, stamp: move stamp, adopted: move adopted,
-        read: Option<CacheImage.Image>.some(move image)})
+      return Option<CacheFile>.some(CacheFile {path: move path, packs: move packs, lock: move lock, stamp: move stamp,
+        adopted: move adopted, read: Option<CacheImage.Image>.some(move image)})
     }
   }
+  run DetachedWriter.waitFor(&lock)
   if building { Semantic.offerPacks(&mut store.*, run readPacks(&packs)) }
   let attempted = run Effect.result(FileSystem.readFile(&path))
   match move attempted {
@@ -309,7 +384,8 @@ pub effect fn openPrefetched(store: &mut Semantic, request: &Request, cache: &Pa
       OutOfMemoryError exhausted => { fail move exhausted }
     }
   }
-  return Option<CacheFile>.some(CacheFile {path: move path, packs: move packs, stamp: move stamp, adopted: move adopted, read: move kept})
+  return Option<CacheFile>.some(CacheFile {path: move path, packs: move packs, lock: move lock, stamp: move stamp, adopted: move adopted,
+    read: move kept})
 }
 
 /// Writes `store`'s image to its cache file, with the checks and build definitions it reused
@@ -318,35 +394,47 @@ pub effect fn openPrefetched(store: &mut Semantic, request: &Request, cache: &Pa
 /// would write.
 pub effect fn save(store: &mut Semantic, file: &CacheFile) -> ()
   ! Cycle | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  if let Option<Pending>.Some {value} = move run prepare(&mut store.*, file) { run writePending(&value) }
+  return run persist(&mut store.*, file, true)
 }
 
-/// As [`save`], but encodes and writes the image on a thread of its own, so a build compiles and
-/// links its units meanwhile; dropping the handle waits for the write. None when there is nothing
-/// to write.
+/// As [`save`], but in a copy of the process (`DetachedWriter`), so a build links its units and
+/// exits without waiting for the write. Returns at once in the build; the copy writes the file and
+/// exits. Where no copy can start, the write runs here.
 ///
 /// # Gotchas
-/// A thread that cannot start leaves the file as it was, as a failed write does.
-pub effect fn saveAside(store: &mut Semantic, file: &CacheFile) -> Option<JoinHandle<()>>
+/// Call it on the build's only thread. Packs written beside the file before the call are the ones
+/// the file names.
+pub effect fn saveDetached(store: &mut Semantic, file: &CacheFile) -> ()
   ! Cycle | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  let pending = match move run prepare(&mut store.*, file) {
-    Option<Pending>.Some {value} => move value
-    Option<Pending>.None => { return Option<JoinHandle<()>>.none() }
-  }
-  return match move run Effect.result(NativeThread.spawn(
-    fn() -> () {
-      return run writeDetached(move pending)
+  if current(&store.*, file) { return () }
+  match move run DetachedWriter.handOff(&file.lock) {
+    Handoff.Original => {}
+    Handoff.Copy {held} => {
+      // The copy shares the build's call stack, so no failure may return into it.
+      let written = run Effect.result(persist(&mut store.*, file, false))
+      drop written
+      DetachedWriter.finish(move held)
     }
-  )) {
-    Result<JoinHandle<()>, OutOfMemoryError | SpawnError>.Success {value} => Option<JoinHandle<()>>.some(move value)
-    Result<JoinHandle<()>, OutOfMemoryError | SpawnError>.Failure {error} => match move error {
-      SpawnError unstarted => {
-        drop unstarted
-        return Option<JoinHandle<()>>.none()
-      }
-      OutOfMemoryError exhausted => { fail move exhausted }
+    Handoff.Here {held} => {
+      run save(&mut store.*, file)
+      drop held
     }
+    Handoff.Unlocked => { run save(&mut store.*, file) }
   }
+}
+
+// Whether `file` already holds what `save` would write: `store` ran no module check, reused every
+// check in the file, and its last build lowered nothing the file lacks.
+fn current(store: &Semantic, file: &CacheFile) -> bool {
+  return Semantic.moduleCheckRuns(store) == usize.ZERO && file.adopted.stale == usize.ZERO && file.adopted.roots > usize.ZERO
+    && !Semantic.buildChanged(store)
+}
+
+// `save`, making the file's directory first when `creating`. A copy does not: the directory held
+// its lock file when the copy started, and one removed since, as a clean removes it, stays removed.
+effect fn persist(store: &mut Semantic, file: &CacheFile, creating: bool) -> ()
+  ! Cycle | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  if let Option<Pending>.Some {value} = move run prepare(&mut store.*, file) { run writePending(&value, creating) }
 }
 
 // An image `save` writes, with the stamp and the path it is written under.
@@ -359,10 +447,7 @@ struct Pending {
 // The image `save` would write, with the reused checks carried over from the file read.
 effect fn prepare(store: &mut Semantic, file: &CacheFile) -> Option<Pending>
   ! Cycle | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  if Semantic.moduleCheckRuns(&store.*) == usize.ZERO && file.adopted.stale == usize.ZERO && file.adopted.roots > usize.ZERO
-    && !Semantic.buildChanged(&store.*) {
-    return Option<Pending>.none()
-  }
+  if current(&store.*, file) { return Option<Pending>.none() }
   let mut image = run Semantic.cacheImage(&mut store.*)
   if let Option<CacheImage.Image>.Some {value: read} = &file.read {
     let mut carried = List<usize>.make()
@@ -388,9 +473,9 @@ effect fn prepare(store: &mut Semantic, file: &CacheFile) -> Option<Pending>
 }
 
 // Encodes `pending` and writes it over its file; a file that cannot be written is left as it was.
-effect fn writePending(pending: &Pending) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+effect fn writePending(pending: &Pending, creating: bool) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
   let bytes = run CacheImage.encode(&pending.image, Bytes.asSlice(&pending.stamp))
-  let attempted = run Effect.result(writeAt(Bytes.asSlice(&pending.path), Bytes.asSlice(&bytes)))
+  let attempted = run Effect.result(writeAt(Bytes.asSlice(&pending.path), Bytes.asSlice(&bytes), creating))
   match move attempted {
     Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Success {..} => {}
     Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Failure {error} => match move error {
@@ -401,24 +486,10 @@ effect fn writePending(pending: &Pending) -> () ! OutOfMemoryError ? &mut FileSy
   }
 }
 
-effect fn writeAt(path: &[u8], bytes: &[u8]) -> () ! FileError | AtomicWriteError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+effect fn writeAt(path: &[u8], bytes: &[u8], creating: bool) -> () ! FileError | AtomicWriteError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
   let target = run Path.fromBytes(path)
-  return run write(&target, bytes)
-}
-
-// `writePending` on a thread of its own, with its own allocator and file system.
-effect fn writeDetached(pending: Pending) -> () {
-  let mut allocator = Allocator.systemAllocatorProvider()
-  let written = run Effect.result(writeOpened(&pending) |> Effect.provideMut<Allocator>(&mut allocator))
-  match move written {
-    Result<(), OutOfMemoryError>.Success {..} => {}
-    Result<(), OutOfMemoryError>.Failure {error} => { drop error }
-  }
-}
-
-effect fn writeOpened(pending: &Pending) -> () ! OutOfMemoryError ? &mut Allocator {
-  let mut files = run OsFileSystem.make("/")
-  return run writePending(pending) |> Effect.provideMut<FileSystem>(&mut files)
+  if creating { return run write(&target, bytes) }
+  return run FileSystem.writeFileAtomic(&target, bytes, FileSystem.replaceExisting(), FileSystem.buffered())
 }
 
 /// The import summaries kept in the cache directory `cache` for `compiler`, from

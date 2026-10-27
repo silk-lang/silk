@@ -6,7 +6,7 @@ CI does not run it. Run it by hand after a change to the semantic cache, the bui
 
 ## Running
 
-You need Node 22 or newer and Clang (on `PATH` or in `SILK_CLANG`). From the repository root, with a compiler built from this tree:
+You need Node 22 or newer, Python 3 (to wait on the cache writers a build leaves running) and Clang (on `PATH` or in `SILK_CLANG`). From the repository root, with a compiler built from this tree:
 
 ```sh
 node integration/incremental/fuzz.mjs --silk build/silkc --workspace . --package silk-tool --iterations 30 --seed 7
