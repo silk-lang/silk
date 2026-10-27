@@ -282,27 +282,41 @@ tuples and anonymous positional aggregates expose positions; named structs and a
 expose visible labels. Declaration order, nominal owner identity, generic substitution, aggregate
 kind, and the reflecting declaration's visibility authority are retained.
 
-| Member                                | Result                    | Meaning                                                 |
-| ------------------------------------- | ------------------------- | ------------------------------------------------------- |
-| `typeOf<Owner>()`                     | `Intrinsic.Type<Owner>`   | Descriptor for one concrete aggregate owner             |
-| `fields<Owner>()`                     | `Intrinsic.Fields<Owner>` | Ordered heterogeneous field collection                  |
-| `typeKind(descriptor)`                | `u8`                      | Stable named/positional aggregate-kind code             |
-| `fieldKind(field)`                    | `u8`                      | Stable labeled/positional member-kind code              |
-| `fieldLabel(field)`                   | `string`                  | Label of a labeled field                                |
-| `fieldOrdinal(field)`                 | `usize`                   | Position of a positional field                          |
-| `borrowField(owner, static field)`    | `&Value`                  | Shared runtime projection authorized by the descriptor  |
-| `borrowFieldMut(owner, static field)` | `&mut Value`              | Mutable runtime projection authorized by the descriptor |
+| Member                                | Result                      | Meaning                                                 |
+| ------------------------------------- | --------------------------- | ------------------------------------------------------- |
+| `typeOf<Owner>()`                     | `Intrinsic.Type<Owner>`     | Descriptor for one concrete aggregate owner             |
+| `fields<Owner>()`                     | `Intrinsic.Fields<Owner>`   | Ordered heterogeneous field collection                  |
+| `typeKind(descriptor)`                | `u8`                        | Stable named/positional aggregate-kind code             |
+| `fieldKind(field)`                    | `u8`                        | Stable labeled/positional/variant member-kind code      |
+| `fieldLabel(field)`                   | `string`                    | Label of a labeled or variant field                     |
+| `fieldOrdinal(field)`                 | `usize`                     | Position of a positional or variant field               |
+| `borrowField(owner, static field)`    | `&Value`                    | Shared runtime projection authorized by the descriptor  |
+| `borrowFieldMut(owner, static field)` | `&mut Value`                | Mutable runtime projection authorized by the descriptor |
+| `variants<Union>()`                   | `Intrinsic.Variants<Union>` | Ordered variant collection of a nominal union           |
+| `variantLabel(variant)`               | `string`                    | Declared name of a variant                              |
+| `variantFields(variant)`              | `Intrinsic.Fields<Union>`   | Ordered fields of one variant                           |
+| `makeVariant(static variant, fields)` | `Union`                     | The variant built from a tuple of its fields            |
+| `isVariant(owner, static variant)`    | `bool`                      | Whether the union holds that variant                    |
+
+A nominal union reports `unionKind`. `makeVariant` takes a tuple of the variant's fields in
+declaration order, `()` for a unit variant, and is exactly the written construction
+`Union.Variant { ... }` of those values; a tuple whose types differ from the fields reports
+`SEM0012`. `isVariant` is exactly a `match` on a shared view of the owner with one arm for the
+variant. Construction needs every field of the variant to be visible where the variant was
+reflected.
 
 Descriptors remain nominal: equal field shapes from separate structs do not become assignment-
 compatible or share projection authority. Private fields are absent outside their declaring module
 and their spellings cannot leak through reflection diagnostics.
 
-**Boundary:** `Intrinsic.Type`, `Intrinsic.Fields`, and `Intrinsic.Field` are phase-only nominals
+**Boundary:** `Intrinsic.Type`, `Intrinsic.Fields`, `Intrinsic.Field`, `Intrinsic.Variants`, and
+`Intrinsic.Variant` are phase-only nominals
 with no runtime layout, address, ownership, or backend representation. `borrowField` accepts only a
 shared reference to the descriptor's exact owner, and `borrowFieldMut` only a mutable one; each
 consumes its descriptor during specialization. Neither can project an owned value, use a descriptor
 at runtime, or extend the result beyond the owner's ordinary borrow lifetime. A mutable projection
-is an ordinary mutable loan of the field, so the owner is unusable while it lives.
+is an ordinary mutable loan of the field, so the owner is unusable while it lives. A variant's
+field descriptor is not a place of its union, so `borrowField` refuses it (`SEM0012`).
 
 **Evidence:** static reflection requirements,
 [reflection source actor](../stdlib/silk/reflect.silk).
