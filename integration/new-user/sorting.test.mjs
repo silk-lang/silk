@@ -46,8 +46,8 @@ test('comparing structs by value says to compare borrows', () => {
   assert.match(result.stderr, /SEM0135\] Operator < does not accept \(main\.P, main\.P\); compare shared borrows, as in `&a < &b`/, show(result))
 })
 
-// Finding 169: the Order a user imports is silk.order.Order.
-test('a missing Order names silk.order.Order, not the intrinsic path', { todo: 'finding 169' }, () => {
+// Finding 169, fixed by #2403: the Order a user imports is silk.order.Order.
+test('a missing Order names silk.order.Order, not the intrinsic path', () => {
   const result = silk(h, ['check'], { cwd: project(sortOf('P', 'P { x: 1 }')) })
   assert.doesNotMatch(result.stderr, /intrinsic\.operators\.Order/, show(result))
 })
