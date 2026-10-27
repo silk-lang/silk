@@ -598,6 +598,9 @@ fn valid() -> i32 {
 The array temporary remains live through `read` and is cleaned after the call. `&mut [1, 2]` may
 similarly create a mutable hidden owner; mutations are discarded when that owner is cleaned.
 
+A shared borrow of a zero-length array, such as `&[]` or `&EMPTY` for a `const EMPTY: [Point; 0]`,
+reads no storage, so its owner's end never expires it and it is valid for `&'static [T]`.
+
 Fixed arrays do not decay to slices implicitly. The borrow must be explicit:
 
 ```silk
