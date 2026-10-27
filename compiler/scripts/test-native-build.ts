@@ -2190,6 +2190,8 @@ const program = Effect.gen(function* () {
   assert.ok(recorded.includes(x86 ? '+avx2' : '+crc'), recorded.join(' '))
   assert.equal(recorded.includes('-mcmodel=large'), x86, recorded.join(' '))
   assert.equal(recorded.includes('-static'), process.platform !== 'darwin', recorded.join(' '))
+  // The profile keeps the default `pic` relocation, so the executable links as PIE.
+  assert.ok(!recorded.includes('-no-pie'), recorded.join(' '))
   const tunedRun = yield* invoke(
     join(tuned, 'build/llvm', hostTarget, 'tuned/tuned'),
     [],
