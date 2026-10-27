@@ -1050,7 +1050,9 @@ on each other in a cycle. Only `path` dependencies exist; `git`, `url`, `version
 
 **Diagnostics:** An invalid dependency name, a missing or unreadable dependency manifest, a
 `package` name that does not match, a dependency written for another release line, and a package
-cycle are invalid-manifest errors that name the dependency. A path below a dependency with no exact module reports `MOD0001` like any other import.
+cycle are invalid-manifest errors that name the dependency, exit with status 2, and give the
+`silk.toml` line at fault: the dependency's entry or field in the depending manifest, or the line of
+the dependency's own manifest when that is the one at fault. A path below a dependency with no exact module reports `MOD0001` like any other import.
 
 **Evidence:** [native package graph](../compiler/src/semantic/PackageGraph.silk),
 [package dependency loading](../compiler/src/driver/Packages.silk),

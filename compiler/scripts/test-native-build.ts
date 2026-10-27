@@ -935,10 +935,10 @@ const program = Effect.gen(function* () {
     ['check', '--stdlib', standardLibrary],
     join(directory, 'unexported'),
   )
-  assert.equal(unexported.status, 1, unexported.stderr)
+  assert.equal(unexported.status, 2, unexported.stderr)
   assert.match(
     unexported.stderr,
-    /^Checking unexported \([^\n]*\)\n  load     failed: 1 error +[0-9.ms ]+s\nsilk: invalid exports of unexported@0\.1\.0: nope is not a module of the package\nFailed unexported in /,
+    /^Checking unexported \([^\n]*\)\n  load     failed: 1 error +[0-9.ms ]+s\nInvalid Silk project manifest [^\n]*unexported\/silk\.toml:4: exports of unexported@0\.1\.0: nope is not a module of the package\nFailed unexported in /,
   )
   const json = yield* invoke(
     silk,
@@ -2475,9 +2475,27 @@ const program = Effect.gen(function* () {
     join(directory, 'packaged/app'),
     { ...process.env, SILK_CLANG: sentinel },
   )
-  assert.notEqual(shadowed.status, 0, 'a shadowing dependency name was accepted')
-  assert.match(shadowed.stderr, /silk: invalid dependency `util` of app@1\.0\.0: the name is also/)
+  assert.equal(shadowed.status, 2, 'a shadowing dependency name was accepted')
+  assert.match(
+    shadowed.stderr,
+    /Invalid Silk project manifest .*packaged\/app\/silk\.toml:7: dependency `util` of app@1\.0\.0: the name is also/,
+  )
   assert.equal(yield* fs.exists(marker), false)
+  // A dependency whose silk.toml is not TOML is refused at that manifest's line, with the reason.
+  yield* fs.makeDirectory(join(directory, 'packaged/broken'), { recursive: true })
+  yield* fs.writeFileString(join(directory, 'packaged/broken/silk.toml'), '[package]\nname = "broken"\nversion = 1.0\n[x\n')
+  yield* fs.writeFileString(join(directory, 'packaged/app/silk.toml'), packagedManifest('broken = { path = "../broken" }'))
+  const notToml = yield* invoke(
+    silk,
+    ['run', '--stdlib', standardLibrary],
+    join(directory, 'packaged/app'),
+    { ...process.env, SILK_CLANG: sentinel },
+  )
+  assert.equal(notToml.status, 2, 'a dependency that is not TOML was accepted')
+  assert.match(
+    notToml.stderr,
+    /Invalid Silk project manifest .*packaged\/broken\/silk\.toml:4: dependency `broken` of app@1\.0\.0: its silk\.toml is not valid TOML: the line ends before its table header, key or value is complete/,
+  )
   // A workspace member builds against a sibling member by path and shares the workspace's output.
   const workspace = join(directory, 'workspace')
   yield* fs.makeDirectory(join(workspace, 'app'), { recursive: true })
