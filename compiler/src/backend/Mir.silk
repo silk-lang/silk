@@ -4217,31 +4217,90 @@ effect fn aggregateFields(
   return move fields
 }
 
+// Whether `id` is a literal that `constructInto` builds in place: a struct, tuple or array literal,
+// a variant construction or a repetition.
+fn constructs(body: &Shared<TypedBody>, id: BodyNodeId) -> bool {
+  return Shared<TypedBody>.with<bool>(body, fn(bodyValue: &TypedBody) -> bool {
+    let nodes = TypedBody.nodeSlice(bodyValue)
+    if let BodyNodeKind.Expression {form, ..} = &nodes[id.index].kind {
+      return match &form {
+        BodyExpression.Aggregate {..} => true
+        BodyExpression.VariantConstruct {..} => true
+        BodyExpression.ArrayRepeat {..} => true
+        _ => false
+      }
+    }
+    return false
+  })
+}
+
+// Builds the literal `id` directly in local `output`, which holds no value yet, instead of in a
+// temporary that is then copied there (#2438). Every part is evaluated before `output` is written,
+// so a part that fails or exits leaves it untouched. False, with nothing lowered, when `id` is not
+// such a literal or its runtime type is not `output`'s.
+effect fn constructInto(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module, id: BodyNodeId, output: usize) -> bool
+! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if !constructs(body, id) { return false }
+  let selected = run instanceView(&mut builder.*, body, id)
+  let ty = match &selected {
+    View.Aggregate {ty, ..} => Shared<Type>.clone(&ty)
+    View.VariantConstruct {ty, ..} => Shared<Type>.clone(&ty)
+    View.ArrayRepeat {ty, ..} => Shared<Type>.clone(&ty)
+    _ => { return false }
+  }
+  let bindings = List<Binding>.asSlice(&builder.bindings)
+  let projections = List<RuntimeProjection>.asSlice(&builder.projections)
+  let built = run RuntimeType.applyBindings(&ty, bindings, projections)
+  let stored = run RuntimeType.applyBindings(&localType(&builder.*, output), bindings, projections)
+  if !(run Type.runtimeEqualsShared(&built, &stored)) { return false }
+  match move selected {
+    View.Aggregate {node, count, origin, ..} => {
+      let fields = run aggregateFields(&mut builder.*, body, hir, node, count, origin)
+      run assign(&mut builder.*, place(output), Rvalue.Aggregate {fields: move fields}, origin)
+    }
+    View.VariantConstruct {node, tag, count, origin, ..} => {
+      let fields = run aggregateFields(&mut builder.*, body, hir, node, count, origin)
+      run assign(&mut builder.*, place(output), Rvalue.Variant {tag: tag, fields: move fields}, origin)
+    }
+    View.ArrayRepeat {value, count, origin, ..} => run arrayRepeatInto(&mut builder.*, body, hir, value, count, &ty, output, origin)
+    _ => ()
+  }
+  return true
+}
+
 // Repetition has one source evaluation and constant-size control flow. No call or fallible
 // source operation occurs while filling, so ownership transfers directly into the array.
 effect fn arrayRepeat(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module, value: BodyNodeId,
   count: usize, ty: &Shared<Type>, origin: Origin) -> Operand
 ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let output = run temporary(&mut builder.*, ty, origin)
+  run arrayRepeatInto(&mut builder.*, body, hir, value, count, ty, output, origin)
+  if !builder.live { return Operand.Unit }
+  return Operand.Move {place: place(output)}
+}
+
+// Fills local `output`, which holds no value, with the repetition: the source is evaluated once,
+// before any element is stored.
+effect fn arrayRepeatInto(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module, value: BodyNodeId,
+  count: usize, ty: &Shared<Type>, output: usize, origin: Origin) -> ()
+! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
   if count == usize.ZERO {
     run discard(&mut builder.*, body, hir, value)
-    if !builder.live { return Operand.Unit }
-    let output = run temporary(&mut builder.*, ty, origin)
     run assign(&mut builder.*, place(output), Rvalue.Aggregate {fields: List<AggregateField>.make()}, origin)
-    return Operand.Move {place: place(output)}
+    return ()
   }
   let input = run expression(&mut builder.*, body, hir, value)
-  if !builder.live { return Operand.Unit }
-  let output = run temporary(&mut builder.*, ty, origin)
+  if !builder.live { return () }
   if count == usize.ONE {
     let mut destination = place(output)
     run List<Projection>.append(&mut destination.projections, Projection.ConstIndex {index: usize.ZERO})
     run assign(&mut builder.*, move destination, Rvalue.Use {value: move input}, origin)
-    return Operand.Move {place: place(output)}
+    return ()
   }
   let splat = fillByte(&input)
   if splat != usize.MAX {
     run assign(&mut builder.*, place(output), Rvalue.Fill {byte: usize.toU8(splat)}, origin)
-    return Operand.Move {place: place(output)}
+    return ()
   }
   // Expression lowering already snapshots place reads and call results. Reuse that storage
   // rather than copying an aggregate operand again just to enter the fill loop.
@@ -4280,7 +4339,7 @@ effect fn arrayRepeat(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Mod
     left: Operand.Copy {place: place(index)}, right: run wordOperand(usize.ONE)}, origin)
   terminate(&mut builder.*, Terminator.Goto {target: condition, origin: origin})
   resume(&mut builder.*, joined)
-  return Operand.Move {place: place(output)}
+  return ()
 }
 
 // The byte every byte of a constant element repeats, or usize.MAX: `false`, `true`, a zero integer
@@ -10138,9 +10197,12 @@ effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &
       run leaveFunction(&mut builder.*, ExitKind.Fails, origin)
     }
     View.Binding {index, initializer, origin} => {
-      let value = run expression(&mut builder.*, body, hir, initializer)
+      if !(run constructInto(&mut builder.*, body, hir, initializer, index + usize.ONE)) {
+        let value = run expression(&mut builder.*, body, hir, initializer)
+        if !builder.live { return () }
+        run assign(&mut builder.*, place(index + usize.ONE), Rvalue.Use {value: move value}, origin)
+      }
       if !builder.live { return () }
-      run assign(&mut builder.*, place(index + usize.ONE), Rvalue.Use {value: move value}, origin)
       let ty = localType(&builder.*, index + usize.ONE)
       // A borrowing binding keeps its initializer's temporaries alive for its whole scope.
       if Shared<Type>.with<bool>(&ty, Type.holdsView) { run retainTemporaries(&mut builder.*, pending) }
@@ -10161,9 +10223,12 @@ effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &
     View.Return {value, origin} => {
       // The returned value moves out before every scope the return leaves is dropped.
       if let Option<BodyNodeId>.Some {value: returned} = move value {
-        let result = run expression(&mut builder.*, body, hir, returned)
+        if !(run constructInto(&mut builder.*, body, hir, returned, usize.ZERO)) {
+          let result = run expression(&mut builder.*, body, hir, returned)
+          if !builder.live { return () }
+          run assign(&mut builder.*, place(usize.ZERO), Rvalue.Use {value: move result}, origin)
+        }
         if !builder.live { return () }
-        run assign(&mut builder.*, place(usize.ZERO), Rvalue.Use {value: move result}, origin)
       }
       run leaveFunction(&mut builder.*, ExitKind.Returns, origin)
     }
