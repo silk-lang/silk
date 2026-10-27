@@ -111,7 +111,9 @@ initialization.
 name for omitted data.
 
 **Diagnostics:** Missing fields report `SEM0046`, duplicate fields `SEM0047`, and unknown or private
-fields their ordinary field or visibility diagnostic.
+fields their ordinary field or visibility diagnostic. A pattern naming a private field of another
+module's struct or variant reports `SEM0028` naming the field and, for a variant, the variant;
+`Problem.Missing { .. }` still matches without naming it.
 
 **Evidence:** [nominal pattern completeness](functions-callables-and-control-flow.md#match-002--nominal-patterns-are-complete-or-explicitly-omit-fields),
 [module visibility](modules-names-and-visibility.md#vis-002--private-declarations-remain-fully-visible-inside-their-defining-module).

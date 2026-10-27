@@ -409,6 +409,13 @@ handler receives `S` directly. The public `Effect.catch` contract and selection 
 ordinary standard-library Silk; the sealed target-neutral primitive performs only the owned runtime
 partition.
 
+A handler whose parameter is a wider union than the failures it handles, such as
+`onAny(error: Overdrawn | Frozen)` passed to `Effect.catchAll` after `Overdrawn` is already
+handled, would need an argument conversion the native compiler does not build yet. It reports
+`SEM0067` naming both types and the workaround: a closure that takes the narrower type and forwards
+it, as in `effect fn(error: Frozen) -> i32 { return run onAny(move error) }`. A plain callable
+passed where a narrower parameter is expected reports `SEM0076` the same way.
+
 A runtime partition must preserve both possible payloads. For `S` selected from `E`, its result is
 equivalent to:
 
