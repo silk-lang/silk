@@ -755,9 +755,6 @@ a precomputed reciprocal.
 The width is the target word: the high 64 bits of a 128-bit product on a 64-bit target, and
 the high 32 bits of a 64-bit product on a 32-bit target.
 
-An optimized build computes this call and a [`wrappingMultiply`](#wrappingMultiply) of the same operands with
-one widening multiply instruction where the target has one, such as x86-64 `mul`.
-
 <a id="checkedAdd"></a>
 
 ## `checkedAdd`

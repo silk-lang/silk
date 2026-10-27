@@ -769,10 +769,9 @@ a precomputed reciprocal.
 The width is the target word: the high 64 bits of a 128-bit product on a 64-bit target, and
 the high 32 bits of a 64-bit product on a 32-bit target.
 
-The product is signed, so the high half carries its sign: `multiplyHigh(-1, 1)` is `-1`.
-
-An optimized build computes this call and a [`wrappingMultiply`](#wrappingMultiply) of the same operands with
-one widening multiply instruction where the target has one, such as x86-64 `imul`.
+The product is signed, so the high half carries its sign: `multiplyHigh(-1, 1)` is `-1`. The
+full product is the high half times 2 to the power of the word width, plus the low half read
+as unsigned bits.
 
 <a id="checkedAdd"></a>
 
