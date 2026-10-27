@@ -59,28 +59,28 @@ test('a missed match member is named', () => {
   assert.match(result.stderr, /SEM0158\] Match over main\.Light does not cover Yellow|SEM0158\] Match over Light does not cover Yellow/, show(result))
 })
 
-// Finding 174: most scalar enum diagnostics read like rule titles and name nothing.
-test('an unknown member names the enum and the member', { todo: 'finding 174' }, () => {
+// Finding 174, fixed by #2423: scalar enum diagnostics name the enum, member, value and range.
+test('an unknown member names the enum and the member', () => {
   const result = body('let gone = Status.Gone')
   assert.match(result.stderr, /SEM0153\][^\n]*Status[^\n]*Gone|SEM0153\][^\n]*Gone[^\n]*Status/, show(result))
 })
 
-test('a value outside the representation names the value and the range', { todo: 'finding 174' }, () => {
+test('a value outside the representation names the value and the range', () => {
   const result = declare('enum(u8) Big { A = 256 }')
   assert.match(result.stderr, /SEM0150\][^\n]*256[^\n]*255/, show(result))
 })
 
-test('a member of the wrong enum names both enums', { todo: 'finding 174' }, () => {
+test('a member of the wrong enum names both enums', () => {
   const result = body('let wrong = Reply { status: Light.Red, retries: 0 }')
   assert.match(result.stderr, /SEM0154\][^\n]*Light[^\n]*Status|SEM0154\][^\n]*Status[^\n]*Light/, show(result))
 })
 
-test('mixing an enum with an integer points at value()', { todo: 'finding 174' }, () => {
+test('mixing an enum with an integer points at value()', () => {
   const result = body('if Status.Ok == 200 { return 20 }')
   assert.match(result.stderr, /SEM0155\][\s\S]*Status\.value\(/, show(result))
 })
 
-test('the receiver form e.value() points at Name.value(e)', { todo: 'finding 174' }, () => {
+test('the receiver form e.value() points at Name.value(e)', () => {
   const result = body('let code = Status.Ok.value()')
   assert.match(result.stderr, /SEM0010\][\s\S]*Status\.value\(/, show(result))
 })
