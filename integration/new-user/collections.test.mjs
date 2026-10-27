@@ -21,7 +21,7 @@ test('the collections program in programs/ passes all its checks', () => {
   assert.equal(result.status, 0, show(result))
 })
 
-// Finding 167: an elided lifetime in a body type argument is not inferred.
+// Finding 167, fixed by #2387: an elided lifetime in a body type argument is inferred.
 const elided = `import silk.list { List }
 
 struct Name {
@@ -40,7 +40,7 @@ pub fn main() -> i32 {
 }
 `
 
-test('a list of a struct with an elided string lifetime can be returned', { todo: 'finding 167' }, () => {
+test('a list of a struct with an elided string lifetime can be returned', () => {
   const result = silk(h, ['check'], { cwd: project(elided) })
   assert.equal(result.status, 0, show(result))
 })
@@ -50,13 +50,13 @@ test('the elided program written the long way checks', () => {
   assert.equal(result.status, 0, show(result))
 })
 
-test('a return whose lifetimes differ shows both types', { todo: 'finding 167' }, () => {
+test('a return whose lifetimes differ shows both types', () => {
   const result = silk(h, ['check'], { cwd: project(elided) })
   assert.doesNotMatch(result.stderr, /An explicit return whose value violates the declaration result\n/, show(result))
 })
 
-// Finding 168: messages for a first hash map and a C-style dereference.
-test('a string key names HashKey and the key type', { todo: 'finding 168' }, () => {
+// Finding 168, fixed by #2386: messages for a first hash map and a C-style dereference.
+test('a string key names HashKey and the key type', () => {
   const result = silk(h, ['check'], { cwd: project(`import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
 import silk.hash { Hash }
@@ -74,7 +74,7 @@ pub effect fn main() -> i32 ! OutOfMemoryError {
   assert.match(result.stderr, /string/, show(result))
 })
 
-test('a C-style *n points at n.*', { todo: 'finding 168' }, () => {
+test('a C-style *n points at n.*', () => {
   const result = silk(h, ['check'], { cwd: project('fn bump(n: &mut i32) -> () {\n  *n = *n + 1\n}\n\npub fn main() -> i32 {\n  let mut v = 1\n  bump(&mut v)\n  return v - 2\n}\n') })
   assert.notEqual(result.status, 0, show(result))
   assert.match(result.stderr, /n\.\*/, show(result))
