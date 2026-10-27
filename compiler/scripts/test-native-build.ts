@@ -1548,6 +1548,8 @@ const program = Effect.gen(function* () {
     ["tupleordinal", "tuple Range(i32, i32)\n\npub fn main() -> i32 {\n  let r = Range(3, 10)\n  return r.2\n}\n", /error\[SEM0027\] main\.Range has no element `\.2`; it has 2 elements, `\.0` and `\.1`\n/],
     ["tuplearity", "tuple Range(i32, i32)\n\npub fn main() -> i32 {\n  let r = Range(3)\n  return 0\n}\n", /error\[SEM0172\] main\.Range expects 2 tuple elements but received 1\n/],
     ["shiftoperator", "pub fn main() -> i32 {\n  let x = (-8 >> 1)\n  return x\n}\n", /error\[PAR0010\] Silk has no `<<` or `>>`; shift with the functions of the value's type, as in `i32\.shiftLeft\(value, count\)` or `i32\.shiftRight\(value, count\)`\n/],
+    ["ascast", "import silk.u8\n\npub fn main() -> i32 {\n  let x = (u8.MAX as i32)\n  return x\n}\n", /error\[PAR0002\] Silk has no `as` cast; convert with a function of the source type/],
+    ["tuplefields", "tuple Range(i32, i32)\n\npub fn main() -> i32 {\n  let r = Range { 0: 3, 1: 10 }\n  return 0\n}\n", /error\[PAR0010\] A tuple's elements have no field names; build it by position, as in `Pair\(first, second\)`\n/],
     ["fieldless", templateUse('StderrWriter.print("{}\\n", &5)'), /error\[SEM0177\] a template with placeholders takes its values as fields, such as `&\.\{name: value\}`, `&\(a, b\)`, or `&\(a,\)` for one value; these arguments have no fields\n/],
   ]
   for (const [name, source, expected] of [...lendCases, ...patternCases, ...staticCases, ...interopCases, ...templateCases]) {
