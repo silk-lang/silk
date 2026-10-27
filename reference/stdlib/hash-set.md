@@ -9,12 +9,15 @@ Use [`HashSet`](#HashSet) to test membership fast, or to keep one copy of each v
 must implement `silk.hash.HashKey`. Use `silk.list.List` when order or duplicate values matter.
 
 ## Details
-[`HashSet.make`](#HashSet.impl.make) does not allocate. The first insert allocates eight buckets. The set rebuilds
-its table before more than three quarters of the buckets are in use. A bucket stays in use after
-a removal, until the next rebuild. The rebuild doubles the number of buckets if the elements
-fill more than half of them. Otherwise it keeps the number and only clears the removed buckets,
-so a set that inserts and removes forever keeps a bucket count in proportion to its largest
-length. A failed growth leaves the elements, the length, and the bucket count unchanged.
+[`HashSet.make`](#HashSet.impl.make) does not allocate. The first insert allocates eight buckets.
+[`HashSet.makeWithCapacity`](#HashSet.impl.makeWithCapacity) and [`HashSet.reserve`](#HashSet.impl.reserve) allocate room for a known number of
+elements in one step. [`HashSet.clear`](#HashSet.impl.clear) drops the elements and keeps the buckets for reuse, and
+[`HashSet.clearAndFree`](#HashSet.impl.clearAndFree) also releases them. The set rebuilds its table before more than three
+quarters of the buckets are in use. A bucket stays in use after a removal, until the next
+rebuild. The rebuild doubles the number of buckets if the elements fill more than half of them.
+Otherwise it keeps the number and only clears the removed buckets, so a set that inserts and
+removes forever keeps a bucket count in proportion to its largest length. A failed growth leaves
+the elements, the length, and the bucket count unchanged.
 
 The same seed and the same operations give the same bucket order on each target. To visit each
 element, scan the buckets from 0 to [`HashSet.bucketCount`](#HashSet.impl.bucketCount), test [`HashSet.occupiedAt`](#HashSet.impl.occupiedAt), and
@@ -110,12 +113,15 @@ implement `silk.hash.HashKey`. Use `silk.list.List` when order or duplicate valu
 
 ### Details
 
-[`HashSet.make`](#HashSet.impl.make) does not allocate. The first insert allocates eight buckets. The set rebuilds
-its table before more than three quarters of the buckets are in use. A bucket stays in use after
-a removal, until the next rebuild. The rebuild doubles the number of buckets if the elements
-fill more than half of them. Otherwise it keeps the number and only clears the removed buckets,
-so a set that inserts and removes forever keeps a bucket count in proportion to its largest
-length. A failed growth leaves the elements, the length, and the bucket count unchanged.
+[`HashSet.make`](#HashSet.impl.make) does not allocate. The first insert allocates eight buckets.
+[`HashSet.makeWithCapacity`](#HashSet.impl.makeWithCapacity) and [`HashSet.reserve`](#HashSet.impl.reserve) allocate room for a known number of
+elements in one step. [`HashSet.clear`](#HashSet.impl.clear) drops the elements and keeps the buckets for reuse, and
+[`HashSet.clearAndFree`](#HashSet.impl.clearAndFree) also releases them. The set rebuilds its table before more than three
+quarters of the buckets are in use. A bucket stays in use after a removal, until the next
+rebuild. The rebuild doubles the number of buckets if the elements fill more than half of them.
+Otherwise it keeps the number and only clears the removed buckets, so a set that inserts and
+removes forever keeps a bucket count in proportion to its largest length. A failed growth leaves
+the elements, the length, and the bucket count unchanged.
 
 To visit each element, scan the buckets from 0 to [`HashSet.bucketCount`](#HashSet.impl.bucketCount), test
 [`HashSet.occupiedAt`](#HashSet.impl.occupiedAt), and read [`HashSet.elementAt`](#HashSet.impl.elementAt). This order is the bucket order, not the
@@ -152,6 +158,36 @@ Returns an empty set that uses `seed` for each hash. This function does not allo
 #### Details
 
 The seed and the sequence of operations decide the bucket order.
+
+<a id="HashSet.impl.makeWithCapacity"></a>
+
+### Associated function `makeWithCapacity`
+
+```silk
+pub effect fn makeWithCapacity(seed: HashSeed, capacity: usize) -> HashSet<T>
+  ! OutOfMemoryError
+  ? &mut Allocator
+```
+
+Returns an empty set that uses `seed` for each hash, with buckets for at least `capacity`
+elements before the first rebuild.
+
+#### When to use
+
+Use `makeWithCapacity` when the number of elements is known or can be estimated before the
+inserts, so that the table allocates once instead of growing step by step.
+
+#### Details
+
+The length is 0. Inserts of up to `capacity` elements do not allocate. The bucket count is the
+smallest of 8, 16, 32, and so on that keeps `capacity` elements under three quarters of the
+buckets. A `capacity` of 0 does not allocate and gives the same set as [`HashSet.make`](#HashSet.impl.make). The
+seed and the sequence of operations decide the bucket order.
+
+#### Errors
+
+- `OutOfMemoryError` if the bucket count overflows `usize`, or the `Allocator` cannot supply
+  the storage.
 
 <a id="HashSet.impl.length"></a>
 
@@ -276,6 +312,74 @@ Use `elementAt` with [`HashSet.occupiedAt`](#HashSet.impl.occupiedAt) to visit e
 
 The element type must be `Copy`. If `index` is out of range or the bucket is empty, the
 program traps.
+
+<a id="HashSet.impl.reserve"></a>
+
+### Method `reserve`
+
+```silk
+pub effect fn reserve(self: &mut Self, additional: usize) -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Makes sure that at least `additional` more elements fit before the next rebuild.
+
+#### When to use
+
+Use `reserve` before a run of inserts whose count is known, so that the table grows at most
+once.
+
+#### Details
+
+If the buckets already hold `additional` more elements under three quarters of the bucket
+count, this function does nothing. Otherwise, it rebuilds the table once, with the smallest
+bucket count, doubling from the current one or from 8, that holds the length plus `additional`
+elements. The rebuild also reclaims the buckets of removed elements. The length does not
+change. An
+`additional` of 0 does nothing.
+
+#### Errors
+
+- `OutOfMemoryError` if the length plus `additional` overflows `usize`, the bucket count
+  overflows `usize`, or the `Allocator` cannot supply the storage. The set does not change.
+
+<a id="HashSet.impl.clear"></a>
+
+### Method `clear`
+
+```silk
+pub fn clear(self: &mut Self) -> ()
+```
+
+Drops every element and sets the length to 0. The bucket count does not change.
+
+#### When to use
+
+Use `clear` to reuse a set, such as one filled again on each pass of a loop: later inserts up
+to the old size do not allocate. Use [`HashSet.clearAndFree`](#HashSet.impl.clearAndFree) to also release the storage.
+
+#### Details
+
+The buckets of removed elements are reclaimed too. This function does not allocate.
+
+<a id="HashSet.impl.clearAndFree"></a>
+
+### Method `clearAndFree`
+
+```silk
+pub fn clearAndFree(self: &mut Self) -> ()
+```
+
+Drops every element and releases the storage. The length and the bucket count become 0.
+
+#### When to use
+
+Use `clearAndFree` when the set stays alive but its storage is no longer needed. Use
+[`HashSet.clear`](#HashSet.impl.clear) to keep the buckets for reuse.
+
+#### Details
+
+This function does not allocate and does not need an `Allocator`. The next insert allocates
+eight buckets again, as on a set from [`HashSet.make`](#HashSet.impl.make). The seed does not change.
 
 <a id="HashSet.impl.Drop"></a>
 
