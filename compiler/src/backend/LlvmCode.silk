@@ -46,6 +46,8 @@ import semantic.Intrinsic {MemoryOrder, Primitive as IntrinsicPrimitive}
 import semantic.NativeAssembly
 import semantic.NativeAssembly {Memory as AssemblyMemory}
 import semantic.SealedCore
+import semantic.StaticValue
+import semantic.StaticValue {Sign as StaticSign, Value as StaticData}
 import semantic.SealedCore {Lifecycle}
 import semantic.Target {Target}
 import semantic.Type {ArrayShape, Type}
@@ -56,6 +58,7 @@ import silk.bytes {Bytes}
 import silk.ownership {Copy}
 import silk.pointer {Pointer}
 import silk.shared {Shared}
+import silk.slice {Slice}
 import silk.option {Option}
 import silk.f32
 import silk.f64
@@ -659,6 +662,163 @@ effect fn staticString(writer: &mut Writer, bytes: &[u8], bits: usize) -> u64 ! 
   let elements = [data, length]
   let initializer = run Module.aggregate(&mut writer.*.module, ty, &elements)
   return run privateConstant(&mut writer.*, b".string.", ty, initializer)
+}
+
+// One text descriptor inside a constant's storage: its address word at `offset` holds the address
+// of `bytes`, which a byte image cannot spell.
+struct TextAddress {
+  offset: usize,
+  bytes: Bytes,
+}
+
+// Writes the `size` low bytes of `value` at `offset`, least significant first; every target is
+// little-endian.
+fn writeWord(image: &mut Bytes, offset: usize, size: usize, value: u64) -> () {
+  let slots = Bytes.asMutSlice(&mut image.*)
+  let mut rest = value
+  let mut at = usize.ZERO
+  while at < size && at < 8 {
+    slots[offset + at] = u64.wrappingToU8(rest)
+    rest = rest / 256
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// The two's complement bits of a static integer's sign and magnitude.
+fn signedBits(negative: bool, magnitude: u64) -> u64 {
+  if !negative || magnitude == 0 { return magnitude }
+  return u64.MAX - magnitude + 1
+}
+
+// A static value's scalar bits, or its field count when it is an aggregate.
+struct StaticLeaf {
+  supported: bool,
+  scalar: bool,
+  bits: u64,
+  fields: usize,
+}
+
+fn flagBits(flag: bool) -> u64 {
+  if flag { return 1 }
+  return 0
+}
+
+fn staticLeaf(data: &StaticData) -> StaticLeaf {
+  return match & data.* {
+    StaticData.Unit => StaticLeaf {supported: true, scalar: true, bits: 0, fields: usize.ZERO}
+    StaticData.Boolean {value: flag} => StaticLeaf {supported: true, scalar: true, bits: flagBits(flag), fields: usize.ZERO}
+    StaticData.Character {scalar: code} => StaticLeaf {supported: true, scalar: true, bits: u32.toU64(code), fields: usize.ZERO}
+    StaticData.Integer {sign, magnitude, ..} => StaticLeaf {supported: true, scalar: true,
+      bits: signedBits(sign == StaticSign.Negative, magnitude), fields: usize.ZERO}
+    StaticData.Enum {sign, magnitude, ..} => StaticLeaf {supported: true, scalar: true,
+      bits: signedBits(sign == StaticSign.Negative, magnitude), fields: usize.ZERO}
+    StaticData.Float {bits: raw, ..} => StaticLeaf {supported: true, scalar: true, bits: raw, fields: usize.ZERO}
+    StaticData.Aggregate {fields: members, variant, ..} => StaticLeaf {supported: !Option<usize>.isSome(&variant), scalar: false,
+      bits: 0, fields: List<Shared<StaticData>>.length(&members)}
+    _ => StaticLeaf {supported: false, scalar: true, bits: 0, fields: usize.ZERO}
+  }
+}
+
+// Writes constant `value` of type `ty` at `offset` of `image` as its runtime layout stores it, and
+// lists each text descriptor's address word in `texts`. Padding stays zero.
+effect fn writeStatic(layouts: &TypeLayouts, function: &MirFunction, target: &Target, value: &Shared<StaticData>,
+  ty: &Shared<Type>, offset: usize, image: &mut Bytes, texts: &mut List<TextAddress>) -> ()
+! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let span = Location.make(usize.ZERO, usize.ZERO)
+  let text = run StaticValue.textBytes(value)
+  // A text descriptor holds its data address at offset zero and its byte length in a target word.
+  if let Option<Bytes>.Some {value: bytes} = move text {
+    let facts = run sliceFact(layouts, ty, function, span)
+    let word = u32.toUsize(Target.pointerBits(target)) / 8
+    writeWord(&mut image.*, offset + facts.lengthOffset, word, usize.toU64(Bytes.length(&bytes)))
+    run List<TextAddress>.append(&mut texts.*, TextAddress {offset: offset, bytes: move bytes})
+    return ()
+  }
+  let leaf = Shared<StaticData>.with<StaticLeaf>(value, staticLeaf)
+  // An aggregate is a fixed array or a cleanup-free struct, as `Mir.materializeEmbedded` admits.
+  let mut supported = leaf.supported
+  if !leaf.scalar && !Shared<StaticData>.with<bool>(value, StaticValue.isStruct) {
+    if let Option<ArrayShape>.None = move Type.arrayShape(ty) { supported = false }
+  }
+  if !supported {
+    let owner = InstanceKey.identity(&function.key)
+    fail Gap.relative(GapCode.TypedForm, &owner, span)
+  }
+  if leaf.scalar {
+    let facts = run layoutOf(layouts, ty, function, span)
+    writeWord(&mut image.*, offset, facts.size, leaf.bits)
+    return ()
+  }
+  let mut at = usize.ZERO
+  while at < leaf.fields {
+    let field = run fieldFact(layouts, ty, at, function, span)
+    let child = Shared<StaticData>.with<Option<Shared<StaticData>>>(value, fn(data: &StaticData) -> Option<Shared<StaticData>> {
+      return StaticValue.field(data, at)
+    })
+    if let Option<Shared<StaticData>>.Some {value: selected} = move child {
+      run writeStatic(layouts, function, target, &selected, &field.ty, offset + field.offset, &mut image.*, &mut texts.*)
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// A private constant holding `value` of type `ty` at its runtime layout and alignment, which a
+// shared borrow of a constant addresses for the whole program. Without text it is one byte array;
+// each text descriptor's address word splits it into a packed run of bytes and addresses.
+effect fn staticValue(writer: &mut Writer, function: &MirFunction, target: &Target, layouts: &TypeLayouts,
+  value: &Shared<StaticData>, ty: &Shared<Type>) -> u64
+! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let facts = run layoutOf(layouts, ty, function, Location.make(usize.ZERO, usize.ZERO))
+  let mut image = run Bytes.zeroed(facts.size)
+  let mut texts = List<TextAddress>.make()
+  run writeStatic(layouts, function, target, value, ty, usize.ZERO, &mut image, &mut texts)
+  let bytes = Bytes.asSlice(&image)
+  let addresses = List<TextAddress>.asSlice(&texts)
+  let mut initializer: u64 = 0
+  let mut storage: u64 = 0
+  if addresses.length == usize.ZERO {
+    initializer = run Module.string(&mut writer.*.module, bytes)
+    let byte = run integerType(&mut writer.*, 8)
+    storage = run Module.array(&mut writer.*.module, bytes.length, byte)
+  } else {
+    // Fields are listed in declaration order, which a layout may not keep, so runs follow offsets.
+    let word = u32.toUsize(Target.pointerBits(target)) / 8
+    let pointer = run pointerType(&mut writer.*)
+    let byte = run integerType(&mut writer.*, 8)
+    let mut types = List<u64>.make()
+    let mut elements = List<u64>.make()
+    let mut cursor = usize.ZERO
+    while cursor < bytes.length {
+      let mut next = usize.MAX
+      let mut selected = usize.MAX
+      let mut at = usize.ZERO
+      while at < addresses.length {
+        if addresses[at].offset >= cursor && addresses[at].offset < next {
+          next = addresses[at].offset
+          selected = at
+        }
+        at = at + usize.ONE
+      }
+      if next == usize.MAX { next = bytes.length }
+      if next > cursor {
+        run List<u64>.append(&mut types, run Module.array(&mut writer.*.module, next - cursor, byte))
+        run List<u64>.append(&mut elements, run Module.string(&mut writer.*.module, Slice.view<u8>(bytes, cursor, next - cursor)))
+      }
+      if selected != usize.MAX {
+        run List<u64>.append(&mut types, pointer)
+        run List<u64>.append(&mut elements, run staticBytes(&mut writer.*, Bytes.asSlice(&addresses[selected].bytes)))
+        next = next + word
+      }
+      cursor = next
+    }
+    storage = run Module.packed(&mut writer.*.module, List<u64>.asSlice(&types))
+    initializer = run Module.aggregate(&mut writer.*.module, storage, List<u64>.asSlice(&elements))
+  }
+  let global = run privateConstant(&mut writer.*, b".constant.", storage, initializer)
+  Module.setAlignment(&mut writer.*.module, global, usize.toU64(facts.alignment))
+  return global
 }
 
 // The overflow intrinsic result `{ kind, flags }`.
@@ -1375,6 +1535,8 @@ effect fn emitOperand(
       value: run staticString(&mut writer.*, Bytes.asSlice(&bytes), u32.toUsize(Target.pointerBits(target)))}
     Operand.StaticBytes {bytes} => Value {scalar: pointerRepresentation(target),
       value: run staticBytes(&mut writer.*, Bytes.asSlice(&bytes))}
+    Operand.StaticValue {value, ty} => Value {scalar: pointerRepresentation(target),
+      value: run staticValue(&mut writer.*, function, target, layouts, &value, &ty)}
   }
 }
 
