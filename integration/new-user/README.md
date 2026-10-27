@@ -8,7 +8,7 @@ CI does not run these tests. They download a release, need Clang, and take a few
 
 ## Running
 
-You need Node 22 or newer, `curl`, `tar`, and Clang 18 or newer on `PATH` (or `SILK_CLANG`). From the repository root:
+You need Node 22 or newer, `curl`, `tar`, and Clang 22 or newer on `PATH` (or `SILK_CLANG`). From the repository root:
 
 ```sh
 node --test 'integration/new-user/*.test.mjs'

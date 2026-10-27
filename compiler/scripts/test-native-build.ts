@@ -1942,7 +1942,7 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(threaded.status, 0, threaded.stderr)
-  // Clang 18 crashes on a threaded module or writes one the host rejects, so it is refused.
+  // A Clang older than 22 misreads the bitcode Silk writes, so it is refused.
   const eighteen = join(directory, 'clang-18')
   yield* fs.writeFileString(
     eighteen,
@@ -1958,7 +1958,7 @@ const program = Effect.gen(function* () {
   assert.equal(tooOld.status, 2, tooOld.stderr)
   assert.match(
     tooOld.stderr,
-    /^silk: a threaded wasm32 build needs Clang 19 or newer, but \S+clang-18 \(from SILK_CLANG\) is Clang 18; set SILK_CLANG or pass --clang the path of a newer Clang$/m,
+    /^silk: Silk builds need Clang 22 or newer, but \S+clang-18 \(from SILK_CLANG\) is Clang 18; set SILK_CLANG or pass --clang the path of a newer Clang$/m,
   )
   const threadedPath = join(threads, 'build/llvm/wasm32-unknown-unknown/web/threads')
   const threadedModule = new WebAssembly.Module(yield* fs.readFile(threadedPath))
