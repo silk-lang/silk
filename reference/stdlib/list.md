@@ -496,33 +496,95 @@ Adds a copy of each byte of `values` at the end of the list, in order.
 #### When to use
 
 Use `appendBytes` to add many bytes at once. It copies the bytes in one operation, which is
-faster than one [`List.append`](#List.impl.append) for each byte.
+faster than one [`List.append`](#List.impl.append) for each byte. [`List.appendSlice`](#List.impl.appendSlice) does the same for any
+`Copy` element type.
 
 #### Errors
 
 - `OutOfMemoryError` if the `Allocator` cannot supply the new storage. The list does not
   change.
+
+<a id="List.impl.appendSlice"></a>
+
+### Method `appendSlice`
+
+```silk
+pub effect fn appendSlice<T: Copy>(self: &mut Self, values: &[T]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator
+```
+
+Adds a copy of each element of `values` at the end of the list, in order.
+
+#### When to use
+
+Use `appendSlice` to add many elements at once. It grows the list once and copies the elements
+in one operation, which is faster than one [`List.append`](#List.impl.append) for each element.
+
+#### Errors
+
+- `OutOfMemoryError` if the `Allocator` cannot supply the new storage. The list does not
+  change.
+
+#### Examples
+```silk
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.list { List }
+
+pub effect fn main() -> i32
+  ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut values = List<u16>.make()
+  let more: [u16; 2] = [8, 9]
+  run List<u16>.appendSlice(&mut values, &more) |> Effect.provideMut<Allocator>(&mut allocator)
+  if List<u16>.length(&values) != 2 || List<u16>.get(&values, 1) != 9 {
+    return 1
+  }
+  return 0
+}
+```
 
 <a id="List.impl.appendRepeated"></a>
 
 ### Method `appendRepeated`
 
 ```silk
-pub effect fn appendRepeated(self: &mut List<u8>, byte: u8, count: usize) -> ()
+pub effect fn appendRepeated<T: Copy>(self: &mut Self, value: T, count: usize) -> ()
   ! OutOfMemoryError
   ? &mut Allocator
 ```
 
-Adds `count` copies of `byte` at the end of the list.
+Adds `count` copies of `value` at the end of the list.
 
 #### Details
 
-A `count` of 0 does nothing and does not allocate.
+The list grows at most once, and the copies are written in one tight loop with no call or
+capacity check for each element. For `u8` the loop compiles to a `memset`. A `count` of 0 does
+nothing and does not allocate.
 
 #### Errors
 
-- `OutOfMemoryError` if the `Allocator` cannot supply the new storage. The list does not
-  change.
+- `OutOfMemoryError` if `length + count` overflows `usize`, or the `Allocator` cannot supply
+  the new storage. The list does not change.
+
+#### Examples
+```silk
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.list { List }
+
+pub effect fn main() -> i32
+  ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut levels = List<u16>.make()
+  run List<u16>.appendRepeated(&mut levels, 65535, 4) |> Effect.provideMut<Allocator>(&mut allocator)
+  if List<u16>.length(&levels) != 4 || List<u16>.get(&levels, 3) != 65535 {
+    return 1
+  }
+  return 0
+}
+```
 
 
 Category: Collections.

@@ -348,7 +348,7 @@ const program = Effect.gen(function* () {
   assert.equal(ir.status, 0, ir.stderr)
   assert.equal(ir.error, undefined)
   assert.equal(yield* fs.exists(marker), false, 'IR output must not invoke Clang')
-  assert.equal(yield* fs.exists(join(directory, 'module.ll.silk.ll')), false)
+  assert.equal(yield* fs.exists(join(directory, 'module.ll.silk.bc')), false)
   const bytes = yield* fs.readFile(join(directory, 'module.ll'))
   assert.ok(bytes.length > 0)
   const verified = yield* invoke(
@@ -357,11 +357,11 @@ const program = Effect.gen(function* () {
     directory,
   )
   assert.equal(verified.status, 0, verified.stderr)
-  const captured = join(directory, 'completed-backend.ll')
+  const captured = join(directory, 'completed-backend.bc')
   const linker = join(directory, 'clang-capture')
   yield* fs.writeFileString(
     linker,
-    `#!/bin/sh\nfor input in "$@"; do\ncase "$input" in\n*.silk.ll) cp "$input" ${quote(captured)} ;;\nesac\ndone\nexec ${quote(clang)} "$@"\n`,
+    `#!/bin/sh\nfor input in "$@"; do\ncase "$input" in\n*.silk.bc) cp "$input" ${quote(captured)} ;;\nesac\ndone\nexec ${quote(clang)} "$@"\n`,
   )
   yield* fs.chmod(linker, 0o755)
   const linked = yield* invoke(silk, argumentsFor('program'), directory, {
@@ -422,12 +422,24 @@ const program = Effect.gen(function* () {
     shuffled.stderr,
     /shuffle\.silk:3:67: error\[SEM0239\] Intrinsic\.simdShuffle needs 4 static lane indices, one per result lane, each below 8/,
   )
-  assert.deepEqual(
-    yield* fs.readFile(captured),
-    bytes,
-    'IR selector must retain the exact completed bytes passed to executable linking',
+  // The linked bitcode and the printed IR are one module: LLVM reads both back to the same text,
+  // apart from the module's own file name and the local value names the linked bitcode leaves out.
+  const disassembled = Effect.fnUntraced(function* (input: string, output: string) {
+    const read = yield* invoke(join(dirname(clang), 'opt'), ['-S', '-passes=strip', input, '-o', output], directory)
+    assert.equal(read.status, 0, read.stderr)
+    return (yield* fs.readFileString(join(directory, output)))
+      .split('\n')
+      .filter((line) => !line.startsWith('; ModuleID') && !line.startsWith('source_filename'))
+      .join('\n')
+  })
+  const assembled = yield* invoke(join(dirname(clang), 'llvm-as'), ['module.ll', '-o', 'module.bc'], directory)
+  assert.equal(assembled.status, 0, assembled.stderr)
+  assert.equal(
+    yield* disassembled(captured, 'completed-backend.ll'),
+    yield* disassembled('module.bc', 'module-read.ll'),
+    'IR output must print the exact module passed to executable linking',
   )
-  assert.equal(yield* fs.exists(join(directory, 'program.silk.ll')), false)
+  assert.equal(yield* fs.exists(join(directory, 'program.silk.bc')), false)
   const ran = yield* invoke(join(directory, 'program'), [], directory)
   assert.equal(ran.status, 42, ran.stderr)
   const explicit = yield* invoke(
@@ -437,7 +449,7 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(explicit.status, 0, explicit.stderr)
-  assert.equal(yield* fs.exists(join(directory, 'explicit.silk.ll')), false)
+  assert.equal(yield* fs.exists(join(directory, 'explicit.silk.bc')), false)
   // Without SILK_CLANG the compiler runs the first `clang` on PATH, also through a symbolic link
   // as PATH entries usually are, and with none there it refuses before linking.
   const ambient = Object.fromEntries(
@@ -3020,7 +3032,7 @@ const program = Effect.gen(function* () {
     SILK_CLANG: clang,
   })
   assert.equal(object.status, 0, object.stderr)
-  assert.equal(yield* fs.exists(join(library, 'silk.o.silk.ll')), false)
+  assert.equal(yield* fs.exists(join(library, 'silk.o.silk.bc')), false)
   const relocatable = yield* inspect('silk.o')
   assert.match(relocatable.header, /Type: Relocatable|MH_OBJECT/)
   assert.ok(exported(relocatable.symbols, 'silk_answer'), relocatable.symbols.join('\n'))
@@ -3154,7 +3166,7 @@ const program = Effect.gen(function* () {
   const rebuilt = yield* invoke(silk, libraryArguments('libsilk.a'), library, archiveEnvironment)
   assert.equal(rebuilt.status, 0, rebuilt.stderr)
   assert.deepEqual(yield* members('libsilk.a'), ['libsilk.a.silk.o'])
-  for (const intermediate of ['libsilk.a.silk.o', 'libsilk.a.silk.ll'])
+  for (const intermediate of ['libsilk.a.silk.o', 'libsilk.a.silk.bc'])
     assert.equal(yield* fs.exists(join(library, intermediate)), false, intermediate)
   const archived = yield* inspect('libsilk.a')
   assert.ok(exported(archived.symbols, 'silk_answer') && !exported(archived.symbols, 'main'))
@@ -3243,7 +3255,7 @@ const program = Effect.gen(function* () {
   // The cache keeps each module's LLVM text as a file of its own beside the image, named by its
   // digest, so an unchanged rebuild finds every module's text where the last build left it.
   const packNames = Effect.fnUntraced(function* () {
-    const cache = join(split, 'build/cache')
+    const cache = join(split, 'build/cache/split')
     const folders = (yield* fs.readDirectory(cache)).filter((name) => name.endsWith('.packs'))
     assert.equal(folders.length, 1, `expected one pack folder, found ${folders.join(', ')}`)
     return (yield* fs.readDirectory(join(cache, folders[0]))).sort()
@@ -3252,7 +3264,7 @@ const program = Effect.gen(function* () {
   assert.ok(coldPacks.length > 2, `expected a pack per module, found ${coldPacks.join(', ')}`)
   // A load reads an unchanged file's imports from the summaries the last load kept beside the
   // cache instead of parsing the file, so an unchanged rebuild leaves them as they were.
-  const importSummaries = join(split, 'build/cache/imports')
+  const importSummaries = join(split, 'build/cache/split/imports')
   const summarizedAt = (yield* fs.stat(importSummaries)).mtime
   // An unchanged rebuild links nothing either: the executable stays the file the last link wrote.
   const splitExecutable = join(split, `build/llvm/${hostTarget}/debug/split`)
@@ -3307,6 +3319,34 @@ const program = Effect.gen(function* () {
   const releasedAt = (yield* fs.stat(releaseExecutable)).mtime
   yield* releaseBuild()
   assert.deepEqual((yield* fs.stat(releaseExecutable)).mtime, releasedAt, 'an unchanged release rebuild leaves the executable as it was')
+  // Workspace members share one output directory, and each keeps a cache of its own there, so
+  // building one member never replaces the cache another member's next build reads.
+  const pair = join(directory, 'pair')
+  yield* fs.makeDirectory(pair, { recursive: true })
+  yield* fs.writeFileString(join(pair, 'silk.toml'), '[workspace]\nmembers = ["first", "second"]\noutput-dir = "build"\n')
+  const memberSource = (value: number) => `pub fn main() -> i32 {\n  return ${value}\n}\n`
+  for (const member of ['first', 'second']) {
+    yield* fs.makeDirectory(join(pair, member, 'src'), { recursive: true })
+    yield* fs.writeFileString(join(pair, member, 'silk.toml'), `[package]\nname = "${member}"\nversion = "0.1.0"\n`)
+    yield* fs.writeFileString(join(pair, member, 'src/main.silk'), memberSource(1))
+  }
+  const memberBuild = Effect.fnUntraced(function* (member: string) {
+    const built = yield* invoke(silk, ['build', '--package', member, '--stdlib', standardLibrary], pair, splitEnvironment)
+    assert.equal(built.status, 0, built.stderr)
+  })
+  const memberImage = Effect.fnUntraced(function* (member: string) {
+    const names = (yield* fs.readDirectory(join(pair, 'build/cache', member))).filter((name) => /^semantic-[0-9a-f]{32}$/.test(name))
+    assert.equal(names.length, 1, `expected one semantic cache for ${member}, found ${names.join(', ')}`)
+    return join(pair, 'build/cache', member, names[0])
+  })
+  yield* memberBuild('first')
+  const firstImage = yield* memberImage('first')
+  const firstWritten = yield* fs.readFile(firstImage)
+  yield* memberBuild('second')
+  yield* fs.writeFileString(join(pair, 'second/src/main.silk'), memberSource(2))
+  yield* memberBuild('second')
+  assert.deepEqual(yield* fs.readFile(firstImage), firstWritten, "building another member leaves a member's cache as it was")
+  assert.notEqual(yield* memberImage('second'), firstImage)
   // A check replays the escape walks the last check left in the cache. A callback's call into
   // another module of the package is walked below the callback, so an edit there that adds a `run`
   // is reported as a cold check reports it, and an edit that keeps what the walk reads reports

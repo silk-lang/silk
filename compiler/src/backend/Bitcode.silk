@@ -1,0 +1,2746 @@
+//! LLVM modules built as records, their fragments, and their encoding as bitcode.
+//!
+//! # Details
+//! A `Module` holds what the bitcode records hold: interned types and constants, attribute lists,
+//! globals unified by name, and function bodies as a stream of tagged words. The backend builds
+//! one module per instance definition through the instruction emitters here, and stores it as a
+//! fragment: a self-delimiting byte string, so fragments concatenate wherever IR used to. A codegen
+//! unit reads its fragments back, merges them into one module, remapping types, constants,
+//! attribute lists and globals, and encodes that as bitcode.
+//!
+//! A body word's low four bits tag it. A record starts with a header word holding its code from bit
+//! 8 and, in bit 4, whether it defines a value; each operand holds its payload from bit 4: a plain
+//! literal, a value reference written relative, typed, absolute or signed, a type id, an attribute
+//! list or a block. Type ids, attribute lists and value references are remapped when fragments
+//! merge, and blocks are numbered per body.
+//!
+//! A value reference names a local value of the body being built, an interned constant or a global
+//! in its low two bits. Locals are the arguments then each value-producing instruction, in order. A
+//! value used before it is defined, such as a `phi`'s incoming value from a later block, is
+//! `reserve`d and `bind`s to the real value later; a block is a handle from `newBlock` whose
+//! position is the order of `startBlock` calls. Both resolve when the body ends.
+//!
+//! Names only serve the printed text: bitcode carries no value names. A name packs a prefix id with
+//! up to two numbers (`v12`, `carg3.1`), and zero leaves a value unnamed.
+//!
+//! The encoding follows LLVM 22's `BitcodeWriter`, without metadata, value symbol tables or
+//! abbreviations other than the string table's blob: the reader takes names from the string table
+//! and function bodies in the order of their declarations.
+
+import backend.Bitstream
+import backend.Bitstream {Writer}
+import semantic.InternIndex {InternIndex}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.bytes {Bytes}
+import silk.hash {Hash}
+import silk.list {List}
+import silk.ownership {Copy}
+import silk.slice {Slice}
+import silk.u32
+import silk.u64
+import silk.u8
+import silk.usize
+
+// Block ids.
+fn moduleBlock() -> u64 { return 8 }
+fn paramattrBlock() -> u64 { return 9 }
+fn paramattrGroupBlock() -> u64 { return 10 }
+fn constantsBlock() -> u64 { return 11 }
+fn functionBlock() -> u64 { return 12 }
+fn identificationBlock() -> u64 { return 13 }
+fn typeBlock() -> u64 { return 17 }
+fn strtabBlock() -> u64 { return 23 }
+
+/// Type record codes, which also tag each interned type.
+pub fn typeVoid() -> u64 { return 2 }
+pub fn typeFloat() -> u64 { return 3 }
+pub fn typeDouble() -> u64 { return 4 }
+pub fn typeLabel() -> u64 { return 5 }
+pub fn typeInteger() -> u64 { return 7 }
+pub fn typeArray() -> u64 { return 11 }
+pub fn typeVector() -> u64 { return 12 }
+pub fn typeStruct() -> u64 { return 18 }
+pub fn typePackedStruct() -> u64 { return 1018 }
+pub fn typeFunction() -> u64 { return 21 }
+pub fn typeVariadicFunction() -> u64 { return 1021 }
+pub fn typePointer() -> u64 { return 25 }
+
+/// Constant record codes, which also tag each interned constant.
+pub fn constantNull() -> u64 { return 2 }
+pub fn constantUndef() -> u64 { return 3 }
+pub fn constantInteger() -> u64 { return 4 }
+pub fn constantFloat() -> u64 { return 6 }
+pub fn constantAggregate() -> u64 { return 7 }
+pub fn constantString() -> u64 { return 8 }
+pub fn constantCString() -> u64 { return 9 }
+pub fn constantBinary() -> u64 { return 10 }
+pub fn constantCast() -> u64 { return 11 }
+pub fn constantGep() -> u64 { return 12 }
+pub fn constantInboundsGep() -> u64 { return 20 }
+pub fn constantPoison() -> u64 { return 26 }
+pub fn constantInlineAssembly() -> u64 { return 30 }
+
+/// Function body record codes.
+pub fn instructionBinary() -> u64 { return 2 }
+pub fn instructionCast() -> u64 { return 3 }
+pub fn instructionExtractElement() -> u64 { return 6 }
+pub fn instructionInsertElement() -> u64 { return 7 }
+pub fn instructionShuffleVector() -> u64 { return 8 }
+pub fn instructionReturn() -> u64 { return 10 }
+pub fn instructionBranch() -> u64 { return 11 }
+pub fn instructionSwitch() -> u64 { return 12 }
+pub fn instructionInvoke() -> u64 { return 13 }
+pub fn instructionUnreachable() -> u64 { return 15 }
+pub fn instructionPhi() -> u64 { return 16 }
+pub fn instructionAlloca() -> u64 { return 19 }
+pub fn instructionLoad() -> u64 { return 20 }
+pub fn instructionExtractValue() -> u64 { return 26 }
+pub fn instructionInsertValue() -> u64 { return 27 }
+pub fn instructionCompare() -> u64 { return 28 }
+pub fn instructionSelect() -> u64 { return 29 }
+pub fn instructionCall() -> u64 { return 34 }
+pub fn instructionFence() -> u64 { return 36 }
+pub fn instructionResume() -> u64 { return 39 }
+pub fn instructionLoadAtomic() -> u64 { return 41 }
+pub fn instructionGep() -> u64 { return 43 }
+pub fn instructionStore() -> u64 { return 44 }
+pub fn instructionStoreAtomic() -> u64 { return 45 }
+pub fn instructionCompareExchange() -> u64 { return 46 }
+pub fn instructionLandingPad() -> u64 { return 47 }
+pub fn instructionUnary() -> u64 { return 56 }
+pub fn instructionFreeze() -> u64 { return 58 }
+pub fn instructionAtomicRmw() -> u64 { return 59 }
+
+/// Binary opcodes; the floating forms share the integer ones' codes.
+pub fn opAdd() -> u64 { return 0 }
+pub fn opSub() -> u64 { return 1 }
+pub fn opMul() -> u64 { return 2 }
+pub fn opUDiv() -> u64 { return 3 }
+pub fn opSDiv() -> u64 { return 4 }
+pub fn opURem() -> u64 { return 5 }
+pub fn opSRem() -> u64 { return 6 }
+pub fn opShl() -> u64 { return 7 }
+pub fn opLShr() -> u64 { return 8 }
+pub fn opAShr() -> u64 { return 9 }
+pub fn opAnd() -> u64 { return 10 }
+pub fn opOr() -> u64 { return 11 }
+pub fn opXor() -> u64 { return 12 }
+
+/// Cast opcodes.
+pub fn castTrunc() -> u64 { return 0 }
+pub fn castZExt() -> u64 { return 1 }
+pub fn castSExt() -> u64 { return 2 }
+pub fn castFPToUI() -> u64 { return 3 }
+pub fn castFPToSI() -> u64 { return 4 }
+pub fn castUIToFP() -> u64 { return 5 }
+pub fn castSIToFP() -> u64 { return 6 }
+pub fn castFPTrunc() -> u64 { return 7 }
+pub fn castFPExt() -> u64 { return 8 }
+pub fn castPtrToInt() -> u64 { return 9 }
+pub fn castIntToPtr() -> u64 { return 10 }
+pub fn castBitcast() -> u64 { return 11 }
+
+/// Comparison predicates: the floating ones from 0, the integer ones from 32.
+pub fn floatFalse() -> u64 { return 0 }
+pub fn floatOeq() -> u64 { return 1 }
+pub fn floatOgt() -> u64 { return 2 }
+pub fn floatOge() -> u64 { return 3 }
+pub fn floatOlt() -> u64 { return 4 }
+pub fn floatOle() -> u64 { return 5 }
+pub fn floatOne() -> u64 { return 6 }
+pub fn floatOrd() -> u64 { return 7 }
+pub fn floatUno() -> u64 { return 8 }
+pub fn floatUeq() -> u64 { return 9 }
+pub fn floatUgt() -> u64 { return 10 }
+pub fn floatUge() -> u64 { return 11 }
+pub fn floatUlt() -> u64 { return 12 }
+pub fn floatUle() -> u64 { return 13 }
+pub fn floatUne() -> u64 { return 14 }
+pub fn floatTrue() -> u64 { return 15 }
+pub fn intEq() -> u64 { return 32 }
+pub fn intNe() -> u64 { return 33 }
+pub fn intUgt() -> u64 { return 34 }
+pub fn intUge() -> u64 { return 35 }
+pub fn intUlt() -> u64 { return 36 }
+pub fn intUle() -> u64 { return 37 }
+pub fn intSgt() -> u64 { return 38 }
+pub fn intSge() -> u64 { return 39 }
+pub fn intSlt() -> u64 { return 40 }
+pub fn intSle() -> u64 { return 41 }
+
+/// Atomic orderings.
+pub fn orderMonotonic() -> u64 { return 2 }
+pub fn orderAcquire() -> u64 { return 3 }
+pub fn orderRelease() -> u64 { return 4 }
+pub fn orderAcquireRelease() -> u64 { return 5 }
+pub fn orderSequential() -> u64 { return 6 }
+
+/// `atomicrmw` operations.
+pub fn rmwXchg() -> u64 { return 0 }
+pub fn rmwAdd() -> u64 { return 1 }
+pub fn rmwSub() -> u64 { return 2 }
+pub fn rmwAnd() -> u64 { return 3 }
+pub fn rmwNand() -> u64 { return 4 }
+pub fn rmwOr() -> u64 { return 5 }
+pub fn rmwXor() -> u64 { return 6 }
+pub fn rmwMax() -> u64 { return 7 }
+pub fn rmwMin() -> u64 { return 8 }
+pub fn rmwUMax() -> u64 { return 9 }
+pub fn rmwUMin() -> u64 { return 10 }
+
+/// Linkages.
+pub fn linkExternal() -> u64 { return 0 }
+pub fn linkAppending() -> u64 { return 2 }
+pub fn linkInternal() -> u64 { return 3 }
+pub fn linkPrivate() -> u64 { return 9 }
+
+/// The `reassoc` fast-math flag.
+pub fn mathReassociate() -> u64 { return 128 }
+
+/// Attribute kinds.
+pub fn attrAlign() -> u64 { return 1 }
+pub fn attrAlwaysInline() -> u64 { return 2 }
+pub fn attrByVal() -> u64 { return 3 }
+pub fn attrInlineHint() -> u64 { return 4 }
+pub fn attrInReg() -> u64 { return 5 }
+pub fn attrNoAlias() -> u64 { return 9 }
+pub fn attrNoInline() -> u64 { return 14 }
+pub fn attrNoReturn() -> u64 { return 17 }
+pub fn attrNoUnwind() -> u64 { return 18 }
+pub fn attrSignExt() -> u64 { return 24 }
+pub fn attrAlignStack() -> u64 { return 25 }
+pub fn attrStructRet() -> u64 { return 29 }
+pub fn attrZeroExt() -> u64 { return 34 }
+pub fn attrCold() -> u64 { return 36 }
+pub fn attrMemory() -> u64 { return 86 }
+
+/// Attribute positions: the result, the function, and parameter `n` at `n + 1`.
+pub fn positionResult() -> u64 { return 0 }
+pub fn positionFunction() -> u64 { return 4294967295 }
+
+// Operand tags, in the low four bits of each body word.
+fn tagLiteral() -> u64 { return 0 }
+fn tagRelative() -> u64 { return 1 }
+fn tagTyped() -> u64 { return 2 }
+fn tagAbsolute() -> u64 { return 3 }
+fn tagSigned() -> u64 { return 4 }
+fn tagHeader() -> u64 { return 5 }
+fn tagType() -> u64 { return 6 }
+fn tagAttributes() -> u64 { return 7 }
+fn tagBlock() -> u64 { return 8 }
+// A header's bit that says its record defines a value.
+fn headerDefines() -> u64 { return 16 }
+
+// Value kinds, in the low two bits of a value reference.
+fn kindLocal() -> u64 { return 0 }
+fn kindConstant() -> u64 { return 1 }
+fn kindGlobal() -> u64 { return 2 }
+
+// The first local index of a reserved value.
+fn reservedBase() -> u64 { return 1099511627776 }
+
+/// No value, as a `call` of a `void` function answers.
+pub fn none() -> u64 { return u64.MAX }
+
+/// The local value `index` of the body being built.
+pub fn local(index: usize) -> u64 { return u64.bitOr(u64.shiftLeft(usize.toU64(index), 2), kindLocal()) }
+/// The interned constant `index`.
+pub fn constant(index: usize) -> u64 { return u64.bitOr(u64.shiftLeft(usize.toU64(index), 2), kindConstant()) }
+/// The global `index`.
+pub fn global(index: usize) -> u64 { return u64.bitOr(u64.shiftLeft(usize.toU64(index), 2), kindGlobal()) }
+
+fn indexOf(reference: u64) -> usize { return u64.toUsize(u64.shiftRight(reference, 2)) }
+fn kindOf(reference: u64) -> u64 { return u64.bitAnd(reference, 3) }
+
+/// The index within its kind of value `reference`.
+pub fn referenceIndex(reference: u64) -> usize { return indexOf(reference) }
+/// Whether `reference` is a local value.
+pub fn isLocal(reference: u64) -> bool { return reference != u64.MAX && kindOf(reference) == kindLocal() }
+/// Whether `reference` is a constant.
+pub fn isConstant(reference: u64) -> bool { return reference != u64.MAX && kindOf(reference) == kindConstant() }
+/// Whether `reference` is a global.
+pub fn isGlobal(reference: u64) -> bool { return reference != u64.MAX && kindOf(reference) == kindGlobal() }
+
+/// The name `prefix` alone, such as `entry`.
+pub fn plain(prefix: u64) -> u64 { return prefix }
+/// The name `prefix` followed by `first`, such as `v12`.
+pub fn named(prefix: u64, first: usize) -> u64 {
+  return u64.bitOr(prefix, u64.shiftLeft(usize.toU64(first) + 1, 12))
+}
+/// The name `prefix` followed by `first`, a dot and `second`, such as `carg3.1`.
+pub fn named2(prefix: u64, first: usize, second: usize) -> u64 {
+  return u64.bitOr(named(prefix, first), u64.shiftLeft(usize.toU64(second) + 1, 38))
+}
+
+/// The frequent name prefixes.
+pub fn prefixValue() -> u64 { return 1 }
+pub fn prefixLocal() -> u64 { return 2 }
+pub fn prefixBlock() -> u64 { return 3 }
+pub fn prefixParameter() -> u64 { return 4 }
+pub fn prefixHidden() -> u64 { return 5 }
+pub fn prefixCompanion() -> u64 { return 6 }
+pub fn prefixTrap() -> u64 { return 7 }
+pub fn prefixSafe() -> u64 { return 8 }
+pub fn prefixCopy() -> u64 { return 9 }
+
+/// The text of name prefix `id`, or an empty slice for none.
+pub fn prefixText(id: u64) -> &'static [u8] {
+  return match id {
+    1 => b"v"
+    2 => b"l"
+    3 => b"b"
+    4 => b"p"
+    5 => b"q"
+    6 => b"c"
+    7 => b"trap"
+    8 => b"safe"
+    9 => b"carg"
+    10 => b"observer"
+    11 => b"cause"
+    12 => b"site"
+    13 => b"out"
+    14 => b"fail"
+    15 => b"context"
+    16 => b"transfer"
+    17 => b"frame"
+    18 => b"result"
+    19 => b"version"
+    20 => b"actions"
+    21 => b"class"
+    22 => b"exception"
+    23 => b"record"
+    24 => b"held"
+    25 => b"absent"
+    26 => b"callback"
+    27 => b"stateAddress"
+    28 => b"adapterless"
+    29 => b"next"
+    30 => b"state"
+    31 => b"callableAddress"
+    32 => b"callable"
+    33 => b"selected"
+    34 => b"handleAddress"
+    35 => b"handle"
+    36 => b"first"
+    37 => b"answer"
+    38 => b"reason"
+    39 => b"origin"
+    40 => b"entry"
+    41 => b"find"
+    42 => b"report"
+    43 => b"forward"
+    44 => b"deliver"
+    45 => b"selection"
+    46 => b"call"
+    47 => b"done"
+    48 => b"drive"
+    49 => b"step"
+    50 => b"finish"
+    51 => b"exit"
+    52 => b"destroy"
+    53 => b"enter"
+    54 => b"parked"
+    55 => b"create"
+    56 => b"publish"
+    57 => b"ready"
+    58 => b"exhausted"
+    59 => b"start"
+    60 => b"probe"
+    61 => b"dispatch"
+    62 => b"cancelling"
+    63 => b"invalid"
+    64 => b"resume"
+    65 => b"cancel"
+    66 => b"landing"
+    67 => b"unwind"
+    68 => b"normal"
+    69 => b"pad"
+    70 => b"frameAddress"
+    71 => b"status"
+    72 => b"value"
+    73 => b"slot"
+    74 => b"body"
+    75 => b"loop"
+    76 => b"after"
+    _ => b""
+  }
+}
+
+fn prefixCount() -> u64 { return 76 }
+
+/// The prefix id of `text`, which must be one of the prefixes `prefixText` names.
+pub fn prefix(text: &[u8]) -> u64 {
+  let mut id: u64 = 1
+  while id <= prefixCount() {
+    if same(prefixText(id), text) { return id }
+    id = id + 1
+  }
+  return 0
+}
+
+/// The prefix id of a packed name.
+pub fn namePrefix(name: u64) -> u64 { return u64.bitAnd(name, 4095) }
+/// The first number of a packed name, plus one, or zero when it has none.
+pub fn nameFirst(name: u64) -> u64 { return u64.bitAnd(u64.shiftRight(name, 12), 67108863) }
+/// The second number of a packed name, plus one, or zero when it has none.
+pub fn nameSecond(name: u64) -> u64 { return u64.shiftRight(name, 38) }
+
+// Global flags.
+fn flagFunction() -> u64 { return 1 }
+fn flagDefined() -> u64 { return 2 }
+fn flagPlaceholder() -> u64 { return 4 }
+fn flagConstant() -> u64 { return 8 }
+fn flagDsoLocal() -> u64 { return 16 }
+// A merge's slot for a global no fragment has given yet, so that the global sits where its kept
+// entry appears.
+fn flagReserved() -> u64 { return 32 }
+
+/// A global: a function or a variable, its symbol a range of `Module.names`.
+struct Global {
+  flags: u64,
+  nameStart: usize,
+  nameLength: usize,
+  /// The value type of a variable, or the function type of a function.
+  valueType: u64,
+  linkage: u64,
+  /// One more than the attribute list, or zero.
+  attributes: u64,
+  /// The encoded alignment, the log2 plus one, or zero.
+  alignment: u64,
+  /// One more than the section, or zero.
+  section: u64,
+  unnamed: u64,
+  /// A value reference to the initializer or personality, or `u64.MAX` for none.
+  initializer: u64,
+  callingConvention: u64,
+  threadLocal: u64,
+}
+
+impl Copy for Global {}
+
+fn has(flags: u64, flag: u64) -> bool { return u64.bitAnd(flags, flag) != 0 }
+
+// How strongly a global's fields hold against another global of its name: a definition, then a
+// declaration, then a placeholder a use created, then a merge's reserved slot.
+fn rank(flags: u64) -> u64 {
+  if has(flags, flagDefined()) { return 3 }
+  if has(flags, flagReserved()) { return 0 }
+  if has(flags, flagPlaceholder()) { return 1 }
+  return 2
+}
+
+/// A function body: its words are in `Module.code` from `start` to `end`.
+struct Body {
+  global: usize,
+  blocks: usize,
+  start: usize,
+  end: usize,
+  /// Where the body's local value types and names start in `Module.localTypes` and
+  /// `Module.localNames`, how many locals it has, and how many of them are arguments.
+  types: usize,
+  locals: usize,
+  arguments: usize,
+  /// Where the body's block names start in `Module.blockNames`.
+  blockNames: usize,
+}
+
+impl Copy for Body {}
+
+/// A module in record form.
+pub struct Module {
+  /// Each interned type's start in `typeData`, which holds `[code, count, items...]`.
+  types: List<usize>,
+  typeData: List<u64>,
+  typeLookup: InternIndex,
+  /// Each interned constant's start in `constantData`, which holds `[type, code, count,
+  /// items...]`; an item that names another value is a value reference.
+  constants: List<usize>,
+  constantData: List<u64>,
+  constantLookup: InternIndex,
+  /// Attribute groups: each one's start in `groupData`, which holds `[position, count,
+  /// encoding...]`.
+  groups: List<usize>,
+  groupData: List<u64>,
+  groupLookup: InternIndex,
+  /// Attribute lists, each a run of group ids: `[count, groups...]` from its start in `listData`.
+  lists: List<usize>,
+  listData: List<u64>,
+  listLookup: InternIndex,
+  globals: List<Global>,
+  names: Bytes,
+  globalLookup: InternIndex,
+  sections: List<Bytes>,
+  bodies: List<Body>,
+  code: List<u64>,
+  localTypes: List<u64>,
+  localNames: List<u64>,
+  blockNames: List<u64>,
+  /// The body being built: its first local type, its local count, each block handle's position
+  /// (or `u64.MAX` before it starts) and name, how many blocks have started, and what each
+  /// reserved value is bound to.
+  bodyTypes: usize,
+  locals: usize,
+  handles: List<u64>,
+  handleNames: List<u64>,
+  started: usize,
+  forwards: List<u64>,
+  /// The attribute list being built: the groups added so far.
+  pending: List<u64>,
+  /// The next fresh number: every value an instruction defines is named `v<n>` with one until
+  /// `setName` renames it, and builders draw labels and constant names from it too.
+  counter: usize,
+}
+
+fn hashWords(words: &[u64]) -> u64 {
+  let mut hashed: u64 = usize.toU64(words.length)
+  let mut at = usize.ZERO
+  while at < words.length {
+    hashed = Hash.combine(hashed, words[at])
+    at = at + usize.ONE
+  }
+  return hashed
+}
+
+fn sameWords(data: &[u64], start: usize, words: &[u64]) -> bool {
+  if start + words.length > data.length { return false }
+  let mut at = usize.ZERO
+  while at < words.length {
+    if data[start + at] != words[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Interns `words` in a table whose entries start at `starts` in `data`, and answers its index.
+effect fn intern(starts: &mut List<usize>, data: &mut List<u64>, lookup: &mut InternIndex, words: &[u64]) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  let hash = hashWords(words)
+  let mut found = InternIndex.first(&lookup.*, hash)
+  while found != usize.MAX {
+    let start = List<usize>.get(&starts.*, found)
+    let end = entryEnd(&starts.*, &data.*, found)
+    if end - start == words.length && sameWords(List<u64>.asSlice(&data.*), start, words) { return found }
+    found = InternIndex.after(&lookup.*, found)
+  }
+  let index = List<usize>.length(&starts.*)
+  run List<usize>.append(&mut starts.*, List<u64>.length(&data.*))
+  run appendWords(&mut data.*, words)
+  run InternIndex.record(&mut lookup.*, hash)
+  return index
+}
+
+effect fn appendWords(data: &mut List<u64>, words: &[u64]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run List<u64>.reserve(&mut data.*, words.length)
+  let mut at = usize.ZERO
+  while at < words.length {
+    run List<u64>.append(&mut data.*, words[at])
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+fn entryEnd(starts: &List<usize>, data: &List<u64>, index: usize) -> usize {
+  if index + usize.ONE < List<usize>.length(starts) { return List<usize>.get(starts, index + usize.ONE) }
+  return List<u64>.length(data)
+}
+
+/// The encoded alignment of `bytes`: its log2 plus one, or zero for none.
+pub fn alignmentCode(bytes: u64) -> u64 {
+  if bytes == 0 { return 0 }
+  let mut value = bytes
+  let mut exponent: u64 = 1
+  while value > 1 {
+    value = u64.shiftRight(value, 1)
+    exponent = exponent + 1
+  }
+  return exponent
+}
+
+/// The record operand of the signed integer `value`: the magnitude shifted left, with the sign in
+/// the low bit.
+pub fn signedOperand(value: u64) -> u64 {
+  if u64.bitAnd(value, 9223372036854775808) == 0 { return u64.shiftLeft(value, 1) }
+  return u64.bitOr(u64.shiftLeft(u64.wrappingSubtract(0, value), 1), 1)
+}
+
+/// The signed integer a record operand holds.
+pub fn signedValue(operand: u64) -> u64 {
+  if u64.bitAnd(operand, 1) == 0 { return u64.shiftRight(operand, 1) }
+  // `-0` stands for the one magnitude that does not fit: the least 64-bit integer.
+  if operand == 1 { return 9223372036854775808 }
+  return u64.wrappingSubtract(0, u64.shiftRight(operand, 1))
+}
+
+/// `value` sign-extended from its low `bits` bits.
+pub fn signExtend(value: u64, bits: u64) -> u64 {
+  if bits >= 64 || bits == 0 { return value }
+  let mask = u64.shiftLeft(1, bits) - 1
+  let low = u64.bitAnd(value, mask)
+  if u64.bitAnd(low, u64.shiftLeft(1, bits - 1)) == 0 { return low }
+  return u64.bitOr(low, u64.bitXor(mask, u64.MAX))
+}
+
+/// The bits of the `float` nearest the `double` whose bits are `double`, exact for every `float`.
+pub fn singleBits(double: u64) -> u64 {
+  let sign = u64.shiftLeft(u64.shiftRight(double, 63), 31)
+  let exponent = u64.bitAnd(u64.shiftRight(double, 52), 2047)
+  let mantissa = u64.bitAnd(double, 4503599627370495)
+  if exponent == 2047 {
+    let mut kept = u64.shiftRight(mantissa, 29)
+    if mantissa != 0 && kept == 0 { kept = 1 }
+    return u64.bitOr(sign, u64.bitOr(2139095040, kept))
+  }
+  if exponent == 0 { return sign }
+  if exponent > 896 {
+    return u64.bitOr(sign, u64.bitOr(u64.shiftLeft(exponent - 896, 23), u64.shiftRight(mantissa, 29)))
+  }
+  // A subnormal single.
+  let shift = 29 + (897 - exponent)
+  if shift >= 64 { return sign }
+  return u64.bitOr(sign, u64.shiftRight(u64.bitOr(mantissa, 4503599627370496), shift))
+}
+
+/// The bits of the `double` equal to the `float` whose bits are `single`.
+pub fn doubleBits(single: u64) -> u64 {
+  let sign = u64.shiftLeft(u64.shiftRight(single, 31), 63)
+  let exponent = u64.bitAnd(u64.shiftRight(single, 23), 255)
+  let mantissa = u64.bitAnd(single, 8388607)
+  if exponent == 255 { return u64.bitOr(sign, u64.bitOr(9218868437227405312, u64.shiftLeft(mantissa, 29))) }
+  if exponent == 0 {
+    if mantissa == 0 { return sign }
+    // A subnormal single is a normal double.
+    let mut shifted = mantissa
+    let mut power: u64 = 897
+    while u64.bitAnd(shifted, 8388608) == 0 {
+      shifted = u64.shiftLeft(shifted, 1)
+      power = power - 1
+    }
+    return u64.bitOr(sign, u64.bitOr(u64.shiftLeft(power - 1, 52), u64.shiftLeft(u64.bitAnd(shifted, 8388607), 29)))
+  }
+  return u64.bitOr(sign, u64.bitOr(u64.shiftLeft(exponent + 896, 52), u64.shiftLeft(mantissa, 29)))
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn word(payload: u64, tag: u64) -> u64 { return u64.bitOr(u64.shiftLeft(payload, 4), tag) }
+fn tagOf(value: u64) -> u64 { return u64.bitAnd(value, 15) }
+fn payloadOf(value: u64) -> u64 { return u64.shiftRight(value, 4) }
+
+impl Module {
+  /// A module with nothing in it.
+  pub fn make() -> Module {
+    return Module {
+      types: List<usize>.make(),
+      typeData: List<u64>.make(),
+      typeLookup: InternIndex.make(),
+      constants: List<usize>.make(),
+      constantData: List<u64>.make(),
+      constantLookup: InternIndex.make(),
+      groups: List<usize>.make(),
+      groupData: List<u64>.make(),
+      groupLookup: InternIndex.make(),
+      lists: List<usize>.make(),
+      listData: List<u64>.make(),
+      listLookup: InternIndex.make(),
+      globals: List<Global>.make(),
+      names: Bytes.make(),
+      globalLookup: InternIndex.make(),
+      sections: List<Bytes>.make(),
+      bodies: List<Body>.make(),
+      code: List<u64>.make(),
+      localTypes: List<u64>.make(),
+      localNames: List<u64>.make(),
+      blockNames: List<u64>.make(),
+      bodyTypes: usize.ZERO,
+      locals: usize.ZERO,
+      handles: List<u64>.make(),
+      handleNames: List<u64>.make(),
+      started: usize.ZERO,
+      forwards: List<u64>.make(),
+      pending: List<u64>.make(),
+      counter: usize.ZERO,
+    }
+  }
+
+  // Types.
+
+  /// Interns the type `[code, count, items...]`: an integer's item is its width, an array's or a
+  /// vector's its length and element, a structure's its fields, a function's its result then its
+  /// parameters, and a pointer's its address space.
+  pub effect fn intern(self: &mut Self, words: &[u64]) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    return usize.toU64(run intern(&mut self.types, &mut self.typeData, &mut self.typeLookup, words))
+  }
+
+  /// Interns a type with no items, such as `void`.
+  pub effect fn simple(self: &mut Self, code: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let words = [code, 0]
+    return run Module.intern(&mut self.*, &words)
+  }
+
+  /// The `void` type.
+  pub effect fn void(self: &mut Self) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    return run Module.simple(&mut self.*, typeVoid())
+  }
+
+  /// The integer type of `bits` bits.
+  pub effect fn integer(self: &mut Self, bits: usize) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let words = [typeInteger(), 1, usize.toU64(bits)]
+    return run Module.intern(&mut self.*, &words)
+  }
+
+  /// The pointer type of address space 0.
+  pub effect fn pointer(self: &mut Self) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let words = [typePointer(), 1, 0]
+    return run Module.intern(&mut self.*, &words)
+  }
+
+  /// The `float` type, or `double` for 64 bits.
+  pub effect fn floating(self: &mut Self, bits: usize) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    if bits == 32 { return run Module.simple(&mut self.*, typeFloat()) }
+    return run Module.simple(&mut self.*, typeDouble())
+  }
+
+  /// The array type of `length` elements of `element`.
+  pub effect fn array(self: &mut Self, length: usize, element: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let words = [typeArray(), 2, usize.toU64(length), element]
+    return run Module.intern(&mut self.*, &words)
+  }
+
+  /// The vector type of `length` lanes of `element`.
+  pub effect fn vector(self: &mut Self, length: usize, element: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let words = [typeVector(), 2, usize.toU64(length), element]
+    return run Module.intern(&mut self.*, &words)
+  }
+
+  /// The literal structure type of `fields`.
+  pub effect fn structure(self: &mut Self, fields: &[u64]) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    return run Module.composite(&mut self.*, typeStruct(), fields)
+  }
+
+  /// The two-field structure type `{ first, second }`.
+  pub effect fn pair(self: &mut Self, first: u64, second: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let words = [typeStruct(), 2, first, second]
+    return run Module.intern(&mut self.*, &words)
+  }
+
+  /// The function type returning `result` from `parameters`.
+  pub effect fn function(self: &mut Self, result: u64, parameters: &[u64], variadic: bool) -> u64
+  ! OutOfMemoryError ? &mut Allocator {
+    let mut words = List<u64>.make()
+    run List<u64>.reserve(&mut words, parameters.length + 3)
+    if variadic { run List<u64>.append(&mut words, typeVariadicFunction()) } else { run List<u64>.append(&mut words, typeFunction()) }
+    run List<u64>.append(&mut words, usize.toU64(parameters.length) + 1)
+    run List<u64>.append(&mut words, result)
+    run appendWords(&mut words, parameters)
+    return run Module.intern(&mut self.*, List<u64>.asSlice(&words))
+  }
+
+  effect fn composite(self: &mut Self, code: u64, items: &[u64]) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let mut words = List<u64>.make()
+    run List<u64>.reserve(&mut words, items.length + 2)
+    run List<u64>.append(&mut words, code)
+    run List<u64>.append(&mut words, usize.toU64(items.length))
+    run appendWords(&mut words, items)
+    return run Module.intern(&mut self.*, List<u64>.asSlice(&words))
+  }
+
+  /// The number of types.
+  pub fn typeCount(self: &Self) -> usize { return List<usize>.length(&self.types) }
+
+  /// The code of type `index`.
+  pub fn typeCode(self: &Self, index: u64) -> u64 {
+    return List<u64>.get(&self.typeData, List<usize>.get(&self.types, u64.toUsize(index)))
+  }
+
+  /// Item `item` of type `index`.
+  pub fn typeItem(self: &Self, index: u64, item: usize) -> u64 {
+    return List<u64>.get(&self.typeData, List<usize>.get(&self.types, u64.toUsize(index)) + 2 + item)
+  }
+
+  /// The number of items of type `index`.
+  pub fn typeItems(self: &Self, index: u64) -> usize {
+    return u64.toUsize(List<u64>.get(&self.typeData, List<usize>.get(&self.types, u64.toUsize(index)) + usize.ONE))
+  }
+
+  /// Whether type `index` is a vector.
+  pub fn isVector(self: &Self, index: u64) -> bool { return self.typeCode(index) == typeVector() }
+
+  // Constants.
+
+  /// Interns the constant `[type, code, count, items...]` and answers its value reference.
+  pub effect fn constantOf(self: &mut Self, words: &[u64]) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    return constant(run intern(&mut self.constants, &mut self.constantData, &mut self.constantLookup, words))
+  }
+
+  /// A constant of `type` with no items: `null` (also zero and `zeroinitializer`), `undef` or
+  /// `poison`.
+  pub effect fn special(self: &mut Self, ty: u64, code: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let words = [ty, code, 0]
+    return run Module.constantOf(&mut self.*, &words)
+  }
+
+  /// The zero value of `type`: `null`, `0`, `0.0` or `zeroinitializer`.
+  pub effect fn zero(self: &mut Self, ty: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    return run Module.special(&mut self.*, ty, constantNull())
+  }
+
+  /// `poison` of `type`.
+  pub effect fn poison(self: &mut Self, ty: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    return run Module.special(&mut self.*, ty, constantPoison())
+  }
+
+  /// `undef` of `type`.
+  pub effect fn undef(self: &mut Self, ty: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    return run Module.special(&mut self.*, ty, constantUndef())
+  }
+
+  /// The integer constant of `type` whose low bits are `value`; a vector type splats it.
+  pub effect fn int(self: &mut Self, ty: u64, value: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    if self.isVector(ty) {
+      let element = self.typeItem(ty, usize.ONE)
+      let lane = run Module.int(&mut self.*, element, value)
+      return run Module.splat(&mut self.*, ty, lane)
+    }
+    let extended = signExtend(value, self.typeItem(ty, usize.ZERO))
+    if extended == 0 { return run Module.zero(&mut self.*, ty) }
+    let words = [ty, constantInteger(), 1, signedOperand(extended)]
+    return run Module.constantOf(&mut self.*, &words)
+  }
+
+  /// The floating constant of `type` equal to the `double` whose bits are `bits`; a vector type
+  /// splats it.
+  pub effect fn float(self: &mut Self, ty: u64, bits: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    if self.isVector(ty) {
+      let element = self.typeItem(ty, usize.ONE)
+      let lane = run Module.float(&mut self.*, element, bits)
+      return run Module.splat(&mut self.*, ty, lane)
+    }
+    let mut stored = bits
+    if self.typeCode(ty) == typeFloat() { stored = singleBits(bits) }
+    if stored == 0 { return run Module.zero(&mut self.*, ty) }
+    let words = [ty, constantFloat(), 1, stored]
+    return run Module.constantOf(&mut self.*, &words)
+  }
+
+  /// The vector of `type` whose every lane is `element`.
+  pub effect fn splat(self: &mut Self, ty: u64, element: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let lanes = u64.toUsize(self.typeItem(ty, usize.ZERO))
+    if self.constantCode(element) == constantNull() { return run Module.zero(&mut self.*, ty) }
+    let mut words = List<u64>.make()
+    run List<u64>.reserve(&mut words, lanes + 3)
+    run List<u64>.append(&mut words, ty)
+    run List<u64>.append(&mut words, constantAggregate())
+    run List<u64>.append(&mut words, usize.toU64(lanes))
+    let mut at = usize.ZERO
+    while at < lanes {
+      run List<u64>.append(&mut words, element)
+      at = at + usize.ONE
+    }
+    return run Module.constantOf(&mut self.*, List<u64>.asSlice(&words))
+  }
+
+  /// The aggregate constant of `type` (a structure, an array or a vector) of `elements`.
+  pub effect fn aggregate(self: &mut Self, ty: u64, elements: &[u64]) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let mut zero = true
+    let mut at = usize.ZERO
+    while at < elements.length {
+      if self.constantCode(elements[at]) != constantNull() { zero = false }
+      at = at + usize.ONE
+    }
+    if zero { return run Module.zero(&mut self.*, ty) }
+    let mut words = List<u64>.make()
+    run List<u64>.reserve(&mut words, elements.length + 3)
+    run List<u64>.append(&mut words, ty)
+    run List<u64>.append(&mut words, constantAggregate())
+    run List<u64>.append(&mut words, usize.toU64(elements.length))
+    run appendWords(&mut words, elements)
+    return run Module.constantOf(&mut self.*, List<u64>.asSlice(&words))
+  }
+
+  /// The `[N x i8]` constant holding `bytes`.
+  pub effect fn string(self: &mut Self, bytes: &[u8]) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let byte = run Module.integer(&mut self.*, 8)
+    let ty = run Module.array(&mut self.*, bytes.length, byte)
+    let mut zeros = usize.ZERO
+    let mut at = usize.ZERO
+    while at < bytes.length {
+      if bytes[at] == 0 { zeros = zeros + usize.ONE }
+      at = at + usize.ONE
+    }
+    if zeros == bytes.length { return run Module.zero(&mut self.*, ty) }
+    let mut code = constantString()
+    let mut count = bytes.length
+    if zeros == usize.ONE && bytes[bytes.length - usize.ONE] == 0 {
+      code = constantCString()
+      count = count - usize.ONE
+    }
+    let mut words = List<u64>.make()
+    run List<u64>.reserve(&mut words, count + 3)
+    run List<u64>.append(&mut words, ty)
+    run List<u64>.append(&mut words, code)
+    run List<u64>.append(&mut words, usize.toU64(count))
+    at = usize.ZERO
+    while at < count {
+      run List<u64>.append(&mut words, u8.toU64(bytes[at]))
+      at = at + usize.ONE
+    }
+    return run Module.constantOf(&mut self.*, List<u64>.asSlice(&words))
+  }
+
+  /// The constant cast `op` of the constant `value` to `type`.
+  pub effect fn constantCastOf(self: &mut Self, op: u64, value: u64, ty: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let words = [ty, constantCast(), 3, op, self.typeOf(value), value]
+    return run Module.constantOf(&mut self.*, &words)
+  }
+
+  /// The inline assembly `assembly` with `constraints`, of function type `functionType`, as a
+  /// callee: `flags` holds `sideeffect` (1), `alignstack` (2), `inteldialect` (4) and `unwind` (8).
+  pub effect fn inlineAssembly(self: &mut Self, functionType: u64, assembly: &[u8], constraints: &[u8], flags: u64) -> u64
+  ! OutOfMemoryError ? &mut Allocator {
+    let pointer = run Module.pointer(&mut self.*)
+    let mut words = List<u64>.make()
+    run List<u64>.reserve(&mut words, assembly.length + constraints.length + 7)
+    run List<u64>.append(&mut words, pointer)
+    run List<u64>.append(&mut words, constantInlineAssembly())
+    run List<u64>.append(&mut words, usize.toU64(assembly.length + constraints.length + 4))
+    run List<u64>.append(&mut words, functionType)
+    run List<u64>.append(&mut words, flags)
+    run List<u64>.append(&mut words, usize.toU64(assembly.length))
+    let mut at = usize.ZERO
+    while at < assembly.length {
+      run List<u64>.append(&mut words, u8.toU64(assembly[at]))
+      at = at + usize.ONE
+    }
+    run List<u64>.append(&mut words, usize.toU64(constraints.length))
+    at = usize.ZERO
+    while at < constraints.length {
+      run List<u64>.append(&mut words, u8.toU64(constraints[at]))
+      at = at + usize.ONE
+    }
+    return run Module.constantOf(&mut self.*, List<u64>.asSlice(&words))
+  }
+
+  /// The number of constants.
+  pub fn constantCount(self: &Self) -> usize { return List<usize>.length(&self.constants) }
+
+  /// The type of constant `reference`.
+  pub fn constantType(self: &Self, reference: u64) -> u64 {
+    return List<u64>.get(&self.constantData, List<usize>.get(&self.constants, indexOf(reference)))
+  }
+
+  /// The code of `reference` when it is a constant, or `u64.MAX`.
+  pub fn constantCode(self: &Self, reference: u64) -> u64 {
+    if !isConstant(reference) { return u64.MAX }
+    return List<u64>.get(&self.constantData, List<usize>.get(&self.constants, indexOf(reference)) + usize.ONE)
+  }
+
+  /// The number of items of constant `reference`.
+  pub fn constantItems(self: &Self, reference: u64) -> usize {
+    return u64.toUsize(List<u64>.get(&self.constantData, List<usize>.get(&self.constants, indexOf(reference)) + 2))
+  }
+
+  /// Item `item` of constant `reference`.
+  pub fn constantItem(self: &Self, reference: u64, item: usize) -> u64 {
+    return List<u64>.get(&self.constantData, List<usize>.get(&self.constants, indexOf(reference)) + 3 + item)
+  }
+
+  // Attributes.
+
+  /// Starts an attribute list.
+  pub fn beginAttributes(self: &mut Self) -> () {
+    List<u64>.clear(&mut self.pending)
+    return ()
+  }
+
+  /// Adds the attributes `encoding` at `position` to the list being built: position 0 is the
+  /// result, `positionFunction()` the function, and `n` the parameter `n - 1`. The encoding is a
+  /// run of `[0, kind]`, `[1, kind, value]`, `[6, kind, type]`, or `[3, key bytes..., 0]` and `[4,
+  /// key bytes..., 0, value bytes..., 0]` for string attributes.
+  pub effect fn attributeGroup(self: &mut Self, position: u64, encoding: &[u64]) -> () ! OutOfMemoryError ? &mut Allocator {
+    if encoding.length == usize.ZERO { return () }
+    let mut words = List<u64>.make()
+    run List<u64>.reserve(&mut words, encoding.length + 2)
+    run List<u64>.append(&mut words, position)
+    run List<u64>.append(&mut words, usize.toU64(encoding.length))
+    run appendWords(&mut words, encoding)
+    let group = run intern(&mut self.groups, &mut self.groupData, &mut self.groupLookup, List<u64>.asSlice(&words))
+    run List<u64>.append(&mut self.pending, usize.toU64(group))
+    return ()
+  }
+
+  /// Ends the attribute list and answers its record operand: one more than its index, or zero
+  /// when it is empty.
+  pub effect fn endAttributes(self: &mut Self) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    if List<u64>.length(&self.pending) == usize.ZERO { return 0 }
+    let mut words = List<u64>.make()
+    run List<u64>.append(&mut words, usize.toU64(List<u64>.length(&self.pending)))
+    run appendWords(&mut words, List<u64>.asSlice(&self.pending))
+    let list = run intern(&mut self.lists, &mut self.listData, &mut self.listLookup, List<u64>.asSlice(&words))
+    return usize.toU64(list) + 1
+  }
+
+  /// Interns a section name and answers its record operand, one more than its index.
+  pub effect fn section(self: &mut Self, name: &[u8]) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let sections = List<Bytes>.asSlice(&self.sections)
+    let mut at = usize.ZERO
+    while at < sections.length {
+      if same(Bytes.asSlice(&sections[at]), name) { return usize.toU64(at) + 1 }
+      at = at + usize.ONE
+    }
+    run List<Bytes>.append(&mut self.sections, run Bytes.copy(name))
+    return usize.toU64(List<Bytes>.length(&self.sections))
+  }
+
+  // Globals.
+
+  /// The index of the global named `name`, or `usize.MAX`.
+  pub fn find(self: &Self, name: &[u8]) -> usize {
+    let mut found = InternIndex.first(&self.globalLookup, InternIndex.hashBytes(0, name))
+    while found != usize.MAX {
+      let entry = List<Global>.get(&self.globals, found)
+      if same(Slice.view<u8>(Bytes.asSlice(&self.names), entry.nameStart, entry.nameLength), name) { return found }
+      found = InternIndex.after(&self.globalLookup, found)
+    }
+    return usize.MAX
+  }
+
+  effect fn addGlobal(self: &mut Self, name: &[u8], entry: Global) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let mut stored = entry
+    stored.nameStart = Bytes.length(&self.names)
+    stored.nameLength = name.length
+    run Bytes.append(&mut self.names, name)
+    let index = List<Global>.length(&self.globals)
+    run List<Global>.append(&mut self.globals, stored)
+    run InternIndex.record(&mut self.globalLookup, InternIndex.hashBytes(0, name))
+    return index
+  }
+
+  // Adds `entry` as global `name`, or lets it replace the global of that name when it ranks
+  // higher, and answers the global's index.
+  effect fn unify(self: &mut Self, name: &[u8], entry: Global) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let found = self.find(name)
+    if found == usize.MAX { return run Module.addGlobal(&mut self.*, name, entry) }
+    let existing = List<Global>.get(&self.globals, found)
+    if rank(entry.flags) > rank(existing.flags) {
+      let mut replaced = entry
+      replaced.nameStart = existing.nameStart
+      replaced.nameLength = existing.nameLength
+      List<Global>.set(&mut self.globals, found, replaced)
+    }
+    return found
+  }
+
+  /// A use of function `name` of type `functionType`, which declares it unless the module
+  /// declares or defines it otherwise.
+  pub effect fn functionRef(self: &mut Self, name: &[u8], functionType: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let found = self.find(name)
+    if found != usize.MAX { return global(found) }
+    return global(run Module.addGlobal(&mut self.*, name, blank(u64.bitOr(flagFunction(), flagPlaceholder()), functionType, linkExternal())))
+  }
+
+  /// A use of variable `name` of value type `type`, which declares it unless the module declares
+  /// or defines it otherwise.
+  pub effect fn objectRef(self: &mut Self, name: &[u8], ty: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let found = self.find(name)
+    if found != usize.MAX { return global(found) }
+    return global(run Module.addGlobal(&mut self.*, name, blank(flagPlaceholder(), ty, linkExternal())))
+  }
+
+  /// Declares the external function `name` with the attribute list `attributes`.
+  pub effect fn declareFunction(self: &mut Self, name: &[u8], functionType: u64, attributes: u64) -> u64
+  ! OutOfMemoryError ? &mut Allocator {
+    let mut entry = blank(flagFunction(), functionType, linkExternal())
+    entry.attributes = attributes
+    return global(run Module.unify(&mut self.*, name, entry))
+  }
+
+  /// Declares the external variable `name`.
+  pub effect fn declareObject(self: &mut Self, name: &[u8], ty: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    return global(run Module.unify(&mut self.*, name, blank(0, ty, linkExternal())))
+  }
+
+  /// Defines function `name`, whose body follows through `beginBody`.
+  pub effect fn defineFunction(self: &mut Self, name: &[u8], functionType: u64, linkage: u64, attributes: u64) -> u64
+  ! OutOfMemoryError ? &mut Allocator {
+    let mut entry = blank(u64.bitOr(flagFunction(), flagDefined()), functionType, linkage)
+    entry.attributes = attributes
+    return global(run Module.unify(&mut self.*, name, entry))
+  }
+
+  /// Defines variable `name` of `type` with the constant `initializer`.
+  pub effect fn defineObject(self: &mut Self, name: &[u8], ty: u64, linkage: u64, constant: bool, initializer: u64) -> u64
+  ! OutOfMemoryError ? &mut Allocator {
+    let mut flags = flagDefined()
+    if constant { flags = u64.bitOr(flags, flagConstant()) }
+    let mut entry = blank(flags, ty, linkage)
+    entry.initializer = initializer
+    return global(run Module.unify(&mut self.*, name, entry))
+  }
+
+  /// Sets global `reference`'s alignment in bytes.
+  pub fn setAlignment(self: &mut Self, reference: u64, bytes: u64) -> () {
+    let mut entry = List<Global>.get(&self.globals, indexOf(reference))
+    entry.alignment = alignmentCode(bytes)
+    List<Global>.set(&mut self.globals, indexOf(reference), entry)
+    return ()
+  }
+
+  /// Sets global `reference`'s `unnamed_addr` code: 1 for `unnamed_addr`, 2 for
+  /// `local_unnamed_addr`.
+  pub fn setUnnamed(self: &mut Self, reference: u64, code: u64) -> () {
+    let mut entry = List<Global>.get(&self.globals, indexOf(reference))
+    entry.unnamed = code
+    List<Global>.set(&mut self.globals, indexOf(reference), entry)
+    return ()
+  }
+
+  /// Sets global `reference`'s section operand, from `section`.
+  pub fn setSection(self: &mut Self, reference: u64, section: u64) -> () {
+    let mut entry = List<Global>.get(&self.globals, indexOf(reference))
+    entry.section = section
+    List<Global>.set(&mut self.globals, indexOf(reference), entry)
+    return ()
+  }
+
+  /// Marks global `reference` `dso_local`.
+  pub fn setDsoLocal(self: &mut Self, reference: u64) -> () {
+    let mut entry = List<Global>.get(&self.globals, indexOf(reference))
+    entry.flags = u64.bitOr(entry.flags, flagDsoLocal())
+    List<Global>.set(&mut self.globals, indexOf(reference), entry)
+    return ()
+  }
+
+  /// Sets function `reference`'s personality, a value reference.
+  pub fn setPersonality(self: &mut Self, reference: u64, personality: u64) -> () {
+    let mut entry = List<Global>.get(&self.globals, indexOf(reference))
+    entry.initializer = personality
+    List<Global>.set(&mut self.globals, indexOf(reference), entry)
+    return ()
+  }
+
+  /// Sets function `reference`'s calling convention.
+  pub fn setCallingConvention(self: &mut Self, reference: u64, convention: u64) -> () {
+    let mut entry = List<Global>.get(&self.globals, indexOf(reference))
+    entry.callingConvention = convention
+    List<Global>.set(&mut self.globals, indexOf(reference), entry)
+    return ()
+  }
+
+  /// Sets variable `reference`'s thread-local mode, 1 for the general one.
+  pub fn setThreadLocal(self: &mut Self, reference: u64, mode: u64) -> () {
+    let mut entry = List<Global>.get(&self.globals, indexOf(reference))
+    entry.threadLocal = mode
+    List<Global>.set(&mut self.globals, indexOf(reference), entry)
+    return ()
+  }
+
+  /// The number of globals.
+  pub fn globalCount(self: &Self) -> usize { return List<Global>.length(&self.globals) }
+
+  /// The name of global `index`.
+  pub fn globalName(self: &Self, index: usize) -> &[u8] {
+    let entry = List<Global>.get(&self.globals, index)
+    return Slice.view<u8>(Bytes.asSlice(&self.names), entry.nameStart, entry.nameLength)
+  }
+
+  /// The value type of a variable, or the function type of a function.
+  pub fn globalType(self: &Self, index: usize) -> u64 { return List<Global>.get(&self.globals, index).valueType }
+
+  /// Whether global `index` is a function.
+  pub fn isFunction(self: &Self, index: usize) -> bool { return has(List<Global>.get(&self.globals, index).flags, flagFunction()) }
+
+  /// Whether global `index` is defined here.
+  pub fn isDefined(self: &Self, index: usize) -> bool { return has(List<Global>.get(&self.globals, index).flags, flagDefined()) }
+
+  /// Whether global `index` only stands for uses.
+  pub fn isPlaceholder(self: &Self, index: usize) -> bool { return has(List<Global>.get(&self.globals, index).flags, flagPlaceholder()) }
+
+  // Bodies.
+
+  /// Starts the body of function `function`, whose arguments have `arguments` types and `names`
+  /// (zero for none); the arguments are locals 0 on.
+  pub effect fn beginBody(self: &mut Self, function: u64, arguments: &[u64], names: &[u64]) -> () ! OutOfMemoryError ? &mut Allocator {
+    self.bodyTypes = List<u64>.length(&self.localTypes)
+    run List<Body>.append(&mut self.bodies, Body {
+      global: indexOf(function),
+      blocks: usize.ZERO,
+      start: List<u64>.length(&self.code),
+      end: usize.ZERO,
+      types: self.bodyTypes,
+      locals: usize.ZERO,
+      arguments: arguments.length,
+      blockNames: List<u64>.length(&self.blockNames),
+    })
+    run appendWords(&mut self.localTypes, arguments)
+    let mut at = usize.ZERO
+    while at < arguments.length {
+      let mut name: u64 = 0
+      if at < names.length { name = names[at] }
+      run List<u64>.append(&mut self.localNames, name)
+      at = at + usize.ONE
+    }
+    self.locals = arguments.length
+    List<u64>.clear(&mut self.handles)
+    List<u64>.clear(&mut self.handleNames)
+    List<u64>.clear(&mut self.forwards)
+    self.started = usize.ZERO
+    return ()
+  }
+
+  /// A new block of the body being built, named `name`; it takes its place when it starts.
+  pub effect fn newBlock(self: &mut Self, name: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let handle = usize.toU64(List<u64>.length(&self.handles))
+    run List<u64>.append(&mut self.handles, u64.MAX)
+    run List<u64>.append(&mut self.handleNames, name)
+    return handle
+  }
+
+  /// Starts block `handle`: the instructions that follow are its own.
+  pub fn startBlock(self: &mut Self, handle: u64) -> () {
+    List<u64>.set(&mut self.handles, u64.toUsize(handle), usize.toU64(self.started))
+    self.started = self.started + usize.ONE
+    return ()
+  }
+
+  /// Starts a new block named `name` and answers its handle.
+  pub effect fn block(self: &mut Self, name: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let handle = run Module.newBlock(&mut self.*, name)
+    Module.startBlock(&mut self.*, handle)
+    return handle
+  }
+
+  /// A value used before the instruction defining it is built; `bind` names it.
+  pub effect fn reserve(self: &mut Self) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let index = List<u64>.length(&self.forwards)
+    run List<u64>.append(&mut self.forwards, u64.MAX)
+    return u64.shiftLeft(reservedBase() + usize.toU64(index), 2)
+  }
+
+  /// Makes the reserved value `reserved` stand for `value`.
+  pub fn bind(self: &mut Self, reserved: u64, value: u64) -> () {
+    List<u64>.set(&mut self.forwards, u64.toUsize(u64.shiftRight(reserved, 2) - reservedBase()), value)
+    return ()
+  }
+
+  /// Ends the body being built, numbering its blocks and resolving its reserved values.
+  pub effect fn endBody(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let last = List<Body>.length(&self.bodies) - usize.ONE
+    let mut body = List<Body>.get(&self.bodies, last)
+    body.end = List<u64>.length(&self.code)
+    body.blocks = self.started
+    body.locals = self.locals
+    List<Body>.set(&mut self.bodies, last, body)
+    let handles = List<u64>.asSlice(&self.handles)
+    let forwards = List<u64>.asSlice(&self.forwards)
+    let code = List<u64>.asMutSlice(&mut self.code)
+    let mut at = body.start
+    while at < body.end {
+      let value = code[at]
+      let tag = tagOf(value)
+      if tag == tagBlock() {
+        code[at] = word(handles[u64.toUsize(payloadOf(value))], tagBlock())
+      } else if tag >= tagRelative() && tag <= tagSigned() {
+        let reference = payloadOf(value)
+        if kindOf(reference) == kindLocal() && u64.shiftRight(reference, 2) >= reservedBase() {
+          code[at] = word(forwards[u64.toUsize(u64.shiftRight(reference, 2) - reservedBase())], tag)
+        }
+      }
+      at = at + usize.ONE
+    }
+    // The block names, in position order.
+    let start = List<u64>.length(&self.blockNames)
+    let mut filled = usize.ZERO
+    while filled < self.started {
+      run List<u64>.append(&mut self.blockNames, 0)
+      filled = filled + usize.ONE
+    }
+    let names = List<u64>.asSlice(&self.handleNames)
+    let ordered = List<u64>.asMutSlice(&mut self.blockNames)
+    let mut handle = usize.ZERO
+    while handle < handles.length {
+      if handles[handle] != u64.MAX { ordered[start + u64.toUsize(handles[handle])] = names[handle] }
+      handle = handle + usize.ONE
+    }
+    return ()
+  }
+
+  /// Names value `reference` of the body being built, when it is a local.
+  pub fn setName(self: &mut Self, reference: u64, name: u64) -> () {
+    if reference == u64.MAX || kindOf(reference) != kindLocal() { return () }
+    List<u64>.set(&mut self.localNames, self.bodyTypes + indexOf(reference), name)
+    return ()
+  }
+
+  /// The type of value `reference`.
+  pub fn typeOf(self: &Self, reference: u64) -> u64 {
+    let kind = kindOf(reference)
+    if kind == kindLocal() { return List<u64>.get(&self.localTypes, self.bodyTypes + indexOf(reference)) }
+    if kind == kindConstant() { return self.constantType(reference) }
+    return pointerTypeOf(&self.*)
+  }
+
+  // Starts a record of `code`; when it defines a value of `type`, answers that value, and
+  // otherwise, for `u64.MAX`, answers `none()`.
+  effect fn open(self: &mut Self, code: u64, ty: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    if ty == u64.MAX {
+      run List<u64>.append(&mut self.code, word(u64.shiftLeft(code, 4), tagHeader()))
+      return none()
+    }
+    run List<u64>.append(&mut self.code, word(u64.bitOr(u64.shiftLeft(code, 4), 1), tagHeader()))
+    let result = local(self.locals)
+    self.locals = self.locals + usize.ONE
+    run List<u64>.append(&mut self.localTypes, ty)
+    run List<u64>.append(&mut self.localNames, named(prefixValue(), self.counter))
+    self.counter = self.counter + usize.ONE
+    return result
+  }
+
+  /// A number no earlier `fresh` call or unrenamed value has used.
+  pub fn fresh(self: &mut Self) -> usize {
+    let number = self.counter
+    self.counter = self.counter + usize.ONE
+    return number
+  }
+
+  effect fn put(self: &mut Self, payload: u64, tag: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+    return run List<u64>.append(&mut self.code, word(payload, tag))
+  }
+
+  // The type of a non-void function type's result, or `u64.MAX` for `void`.
+  fn resultOf(self: &Self, functionType: u64) -> u64 {
+    let result = self.typeItem(functionType, usize.ZERO)
+    if self.typeCode(result) == typeVoid() { return u64.MAX }
+    return result
+  }
+
+  /// `load` of `type` from `pointer`, aligned to `alignment` bytes (zero for the type's own).
+  pub effect fn load(self: &mut Self, ty: u64, pointer: u64, alignment: u64, volatile: bool) -> u64
+  ! OutOfMemoryError ? &mut Allocator {
+    let result = run Module.open(&mut self.*, instructionLoad(), ty)
+    run Module.put(&mut self.*, pointer, tagTyped())
+    run Module.put(&mut self.*, ty, tagType())
+    run Module.put(&mut self.*, alignmentCode(alignment), tagLiteral())
+    if volatile { run Module.put(&mut self.*, 1, tagLiteral()) } else { run Module.put(&mut self.*, 0, tagLiteral()) }
+    return result
+  }
+
+  /// Atomic `load` of `type` from `pointer` with `ordering`.
+  pub effect fn loadAtomic(self: &mut Self, ty: u64, pointer: u64, alignment: u64, ordering: u64) -> u64
+  ! OutOfMemoryError ? &mut Allocator {
+    let result = run Module.open(&mut self.*, instructionLoadAtomic(), ty)
+    run Module.put(&mut self.*, pointer, tagTyped())
+    run Module.put(&mut self.*, ty, tagType())
+    run Module.put(&mut self.*, alignmentCode(alignment), tagLiteral())
+    run Module.put(&mut self.*, 0, tagLiteral())
+    run Module.put(&mut self.*, ordering, tagLiteral())
+    run Module.put(&mut self.*, 1, tagLiteral())
+    return result
+  }
+
+  /// `store` of `value` to `pointer`.
+  pub effect fn store(self: &mut Self, value: u64, pointer: u64, alignment: u64, volatile: bool) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+    let none = run Module.open(&mut self.*, instructionStore(), u64.MAX)
+    run Module.put(&mut self.*, pointer, tagTyped())
+    run Module.put(&mut self.*, value, tagTyped())
+    run Module.put(&mut self.*, alignmentCode(alignment), tagLiteral())
+    if volatile { run Module.put(&mut self.*, 1, tagLiteral()) } else { run Module.put(&mut self.*, 0, tagLiteral()) }
+    return ()
+  }
+
+  /// Atomic `store` of `value` to `pointer` with `ordering`.
+  pub effect fn storeAtomic(self: &mut Self, value: u64, pointer: u64, alignment: u64, ordering: u64) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+    let none = run Module.open(&mut self.*, instructionStoreAtomic(), u64.MAX)
+    run Module.put(&mut self.*, pointer, tagTyped())
+    run Module.put(&mut self.*, value, tagTyped())
+    run Module.put(&mut self.*, alignmentCode(alignment), tagLiteral())
+    run Module.put(&mut self.*, 0, tagLiteral())
+    run Module.put(&mut self.*, ordering, tagLiteral())
+    run Module.put(&mut self.*, 1, tagLiteral())
+    return ()
+  }
+
+  /// `alloca` of one `type`, aligned to `alignment` bytes.
+  pub effect fn alloca(self: &mut Self, ty: u64, alignment: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let int32 = run Module.integer(&mut self.*, 32)
+    let one = run Module.int(&mut self.*, int32, 1)
+    return run Module.allocaCount(&mut self.*, ty, one, alignment)
+  }
+
+  /// `alloca` of `count` values of `type`, aligned to `alignment` bytes.
+  pub effect fn allocaCount(self: &mut Self, ty: u64, count: u64, alignment: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let countType = self.typeOf(count)
+    let pointer = run Module.pointer(&mut self.*)
+    let result = run Module.open(&mut self.*, instructionAlloca(), pointer)
+    run Module.put(&mut self.*, ty, tagType())
+    run Module.put(&mut self.*, countType, tagType())
+    run Module.put(&mut self.*, count, tagAbsolute())
+    // The alignment's low five bits, the explicit-type flag, and the rest of it from bit 8.
+    let code = alignmentCode(alignment)
+    run Module.put(&mut self.*, u64.bitOr(u64.bitOr(u64.bitAnd(code, 31), 64), u64.shiftLeft(u64.shiftRight(code, 5), 8)), tagLiteral())
+    return result
+  }
+
+  /// `getelementptr` over `source` from `base` by `indices`; `flags` holds `inbounds` (1), `nusw`
+  /// (2) and `nuw` (4).
+  pub effect fn gep(self: &mut Self, flags: u64, source: u64, base: u64, indices: &[u64]) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let resultType = self.typeOf(base)
+    let result = run Module.open(&mut self.*, instructionGep(), resultType)
+    run Module.put(&mut self.*, flags, tagLiteral())
+    run Module.put(&mut self.*, source, tagType())
+    run Module.put(&mut self.*, base, tagTyped())
+    let mut at = usize.ZERO
+    while at < indices.length {
+      run Module.put(&mut self.*, indices[at], tagTyped())
+      at = at + usize.ONE
+    }
+    return result
+  }
+
+  /// The byte address `offset` bytes past `base`: `getelementptr i8, ptr base, i64 offset`.
+  pub effect fn byteGep(self: &mut Self, base: u64, offset: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let byte = run Module.integer(&mut self.*, 8)
+    let int64 = run Module.integer(&mut self.*, 64)
+    let index = run Module.int(&mut self.*, int64, offset)
+    let indices = [index]
+    return run Module.gep(&mut self.*, 0, byte, base, &indices)
+  }
+
+  /// The binary operation `op` of `left` and `right`, with `flags` (`nuw` 1 and `nsw` 2, `exact`
+  /// 1, or fast-math flags).
+  pub effect fn binary(self: &mut Self, op: u64, left: u64, right: u64, flags: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let resultType = self.typeOf(left)
+    let result = run Module.open(&mut self.*, instructionBinary(), resultType)
+    run Module.put(&mut self.*, left, tagTyped())
+    run Module.put(&mut self.*, right, tagRelative())
+    run Module.put(&mut self.*, op, tagLiteral())
+    if flags != 0 { run Module.put(&mut self.*, flags, tagLiteral()) }
+    return result
+  }
+
+  /// The cast `op` of `value` to `type`.
+  pub effect fn cast(self: &mut Self, op: u64, value: u64, ty: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let result = run Module.open(&mut self.*, instructionCast(), ty)
+    run Module.put(&mut self.*, value, tagTyped())
+    run Module.put(&mut self.*, ty, tagType())
+    run Module.put(&mut self.*, op, tagLiteral())
+    return result
+  }
+
+  /// The comparison `predicate` of `left` and `right`, with fast-math `flags`; its result is `i1`,
+  /// or a vector of `i1` for vector operands.
+  pub effect fn compare(self: &mut Self, predicate: u64, left: u64, right: u64, flags: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let operand = self.typeOf(left)
+    let mut ty = run Module.integer(&mut self.*, usize.ONE)
+    if self.isVector(operand) {
+      let lanes = u64.toUsize(self.typeItem(operand, usize.ZERO))
+      ty = run Module.vector(&mut self.*, lanes, ty)
+    }
+    let result = run Module.open(&mut self.*, instructionCompare(), ty)
+    run Module.put(&mut self.*, left, tagTyped())
+    run Module.put(&mut self.*, right, tagRelative())
+    run Module.put(&mut self.*, predicate, tagLiteral())
+    if flags != 0 { run Module.put(&mut self.*, flags, tagLiteral()) }
+    return result
+  }
+
+  /// `select` of `chosen` when `condition` holds and `otherwise` when not.
+  pub effect fn select(self: &mut Self, condition: u64, chosen: u64, otherwise: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let resultType = self.typeOf(chosen)
+    let result = run Module.open(&mut self.*, instructionSelect(), resultType)
+    run Module.put(&mut self.*, chosen, tagTyped())
+    run Module.put(&mut self.*, otherwise, tagRelative())
+    run Module.put(&mut self.*, condition, tagTyped())
+    return result
+  }
+
+  /// `phi` of `type` over `incoming`, pairs of a value and the block it comes from.
+  pub effect fn phi(self: &mut Self, ty: u64, incoming: &[u64]) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let result = run Module.open(&mut self.*, instructionPhi(), ty)
+    run Module.put(&mut self.*, ty, tagType())
+    let mut at = usize.ZERO
+    while at + usize.ONE < incoming.length {
+      run Module.put(&mut self.*, incoming[at], tagSigned())
+      run Module.put(&mut self.*, incoming[at + usize.ONE], tagBlock())
+      at = at + 2
+    }
+    return result
+  }
+
+  /// `extractvalue` of `aggregate` at `index`.
+  pub effect fn extractValue(self: &mut Self, aggregate: u64, index: usize) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let ty = self.typeOf(aggregate)
+    let mut member = self.typeItem(ty, usize.ONE)
+    if self.typeCode(ty) == typeStruct() || self.typeCode(ty) == typePackedStruct() { member = self.typeItem(ty, index) }
+    let result = run Module.open(&mut self.*, instructionExtractValue(), member)
+    run Module.put(&mut self.*, aggregate, tagTyped())
+    run Module.put(&mut self.*, usize.toU64(index), tagLiteral())
+    return result
+  }
+
+  /// `insertvalue` of `element` into `aggregate` at `index`.
+  pub effect fn insertValue(self: &mut Self, aggregate: u64, element: u64, index: usize) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let resultType = self.typeOf(aggregate)
+    let result = run Module.open(&mut self.*, instructionInsertValue(), resultType)
+    run Module.put(&mut self.*, aggregate, tagTyped())
+    run Module.put(&mut self.*, element, tagTyped())
+    run Module.put(&mut self.*, usize.toU64(index), tagLiteral())
+    return result
+  }
+
+  /// `extractelement` of `vector` at `index`.
+  pub effect fn extractElement(self: &mut Self, vector: u64, index: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let resultType = self.typeItem(self.typeOf(vector), usize.ONE)
+    let result = run Module.open(&mut self.*, instructionExtractElement(), resultType)
+    run Module.put(&mut self.*, vector, tagTyped())
+    run Module.put(&mut self.*, index, tagTyped())
+    return result
+  }
+
+  /// `insertelement` of `element` into `vector` at `index`.
+  pub effect fn insertElement(self: &mut Self, vector: u64, element: u64, index: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let resultType = self.typeOf(vector)
+    let result = run Module.open(&mut self.*, instructionInsertElement(), resultType)
+    run Module.put(&mut self.*, vector, tagTyped())
+    run Module.put(&mut self.*, element, tagRelative())
+    run Module.put(&mut self.*, index, tagTyped())
+    return result
+  }
+
+  /// `shufflevector` of `left` and `right` by the constant `mask`.
+  pub effect fn shuffle(self: &mut Self, left: u64, right: u64, mask: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let lanes = u64.toUsize(self.typeItem(self.typeOf(mask), usize.ZERO))
+    let element = self.typeItem(self.typeOf(left), usize.ONE)
+    let ty = run Module.vector(&mut self.*, lanes, element)
+    let result = run Module.open(&mut self.*, instructionShuffleVector(), ty)
+    run Module.put(&mut self.*, left, tagTyped())
+    run Module.put(&mut self.*, right, tagRelative())
+    run Module.put(&mut self.*, mask, tagRelative())
+    return result
+  }
+
+  /// `fneg` of `value`, with fast-math `flags`.
+  pub effect fn fneg(self: &mut Self, value: u64, flags: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let resultType = self.typeOf(value)
+    let result = run Module.open(&mut self.*, instructionUnary(), resultType)
+    run Module.put(&mut self.*, value, tagTyped())
+    run Module.put(&mut self.*, 0, tagLiteral())
+    if flags != 0 { run Module.put(&mut self.*, flags, tagLiteral()) }
+    return result
+  }
+
+  /// `freeze` of `value`.
+  pub effect fn freeze(self: &mut Self, value: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let resultType = self.typeOf(value)
+    let result = run Module.open(&mut self.*, instructionFreeze(), resultType)
+    run Module.put(&mut self.*, value, tagTyped())
+    return result
+  }
+
+  /// `atomicrmw` `op` of `value` at `pointer`.
+  pub effect fn atomicRmw(self: &mut Self, op: u64, pointer: u64, value: u64, ordering: u64, alignment: u64) -> u64
+  ! OutOfMemoryError ? &mut Allocator {
+    let resultType = self.typeOf(value)
+    let result = run Module.open(&mut self.*, instructionAtomicRmw(), resultType)
+    run Module.put(&mut self.*, pointer, tagTyped())
+    run Module.put(&mut self.*, value, tagTyped())
+    run Module.put(&mut self.*, op, tagLiteral())
+    run Module.put(&mut self.*, 0, tagLiteral())
+    run Module.put(&mut self.*, ordering, tagLiteral())
+    run Module.put(&mut self.*, 1, tagLiteral())
+    run Module.put(&mut self.*, alignmentCode(alignment), tagLiteral())
+    return result
+  }
+
+  /// `cmpxchg` at `pointer` of `expected` for `replacement`; its result is `{ T, i1 }`.
+  pub effect fn compareExchange(self: &mut Self, pointer: u64, expected: u64, replacement: u64, success: u64, failure: u64,
+    weak: bool, alignment: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let boolean = run Module.integer(&mut self.*, usize.ONE)
+    let expectedType = self.typeOf(expected)
+    let ty = run Module.pair(&mut self.*, expectedType, boolean)
+    let result = run Module.open(&mut self.*, instructionCompareExchange(), ty)
+    run Module.put(&mut self.*, pointer, tagTyped())
+    run Module.put(&mut self.*, expected, tagTyped())
+    run Module.put(&mut self.*, replacement, tagRelative())
+    run Module.put(&mut self.*, 0, tagLiteral())
+    run Module.put(&mut self.*, success, tagLiteral())
+    run Module.put(&mut self.*, 1, tagLiteral())
+    run Module.put(&mut self.*, failure, tagLiteral())
+    if weak { run Module.put(&mut self.*, 1, tagLiteral()) } else { run Module.put(&mut self.*, 0, tagLiteral()) }
+    run Module.put(&mut self.*, alignmentCode(alignment), tagLiteral())
+    return result
+  }
+
+  /// `fence` with `ordering`.
+  pub effect fn fence(self: &mut Self, ordering: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+    let none = run Module.open(&mut self.*, instructionFence(), u64.MAX)
+    run Module.put(&mut self.*, ordering, tagLiteral())
+    run Module.put(&mut self.*, 1, tagLiteral())
+    return ()
+  }
+
+  /// A cleanup `landingpad` of `type`.
+  pub effect fn landingPad(self: &mut Self, ty: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let result = run Module.open(&mut self.*, instructionLandingPad(), ty)
+    run Module.put(&mut self.*, ty, tagType())
+    run Module.put(&mut self.*, 1, tagLiteral())
+    run Module.put(&mut self.*, 0, tagLiteral())
+    return result
+  }
+
+  /// `resume` of `value`.
+  pub effect fn resume(self: &mut Self, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+    let none = run Module.open(&mut self.*, instructionResume(), u64.MAX)
+    return run Module.put(&mut self.*, value, tagTyped())
+  }
+
+  /// `ret` of `value`.
+  pub effect fn ret(self: &mut Self, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+    let none = run Module.open(&mut self.*, instructionReturn(), u64.MAX)
+    return run Module.put(&mut self.*, value, tagTyped())
+  }
+
+  /// `ret void`.
+  pub effect fn retVoid(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let none = run Module.open(&mut self.*, instructionReturn(), u64.MAX)
+    return ()
+  }
+
+  /// `br` to block `target`.
+  pub effect fn br(self: &mut Self, target: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+    let none = run Module.open(&mut self.*, instructionBranch(), u64.MAX)
+    return run Module.put(&mut self.*, target, tagBlock())
+  }
+
+  /// `br` to `onTrue` when `condition` holds and to `onFalse` when not.
+  pub effect fn condBr(self: &mut Self, condition: u64, onTrue: u64, onFalse: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+    let none = run Module.open(&mut self.*, instructionBranch(), u64.MAX)
+    run Module.put(&mut self.*, onTrue, tagBlock())
+    run Module.put(&mut self.*, onFalse, tagBlock())
+    return run Module.put(&mut self.*, condition, tagRelative())
+  }
+
+  /// `switch` on `condition` to `otherwise`, or the block paired with each constant of `cases`.
+  pub effect fn switch(self: &mut Self, condition: u64, otherwise: u64, cases: &[u64]) -> () ! OutOfMemoryError ? &mut Allocator {
+    let ty = self.typeOf(condition)
+    let none = run Module.open(&mut self.*, instructionSwitch(), u64.MAX)
+    run Module.put(&mut self.*, ty, tagType())
+    run Module.put(&mut self.*, condition, tagRelative())
+    run Module.put(&mut self.*, otherwise, tagBlock())
+    let mut at = usize.ZERO
+    while at + usize.ONE < cases.length {
+      run Module.put(&mut self.*, cases[at], tagAbsolute())
+      run Module.put(&mut self.*, cases[at + usize.ONE], tagBlock())
+      at = at + 2
+    }
+    return ()
+  }
+
+  /// `unreachable`.
+  pub effect fn unreachable(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let none = run Module.open(&mut self.*, instructionUnreachable(), u64.MAX)
+    return ()
+  }
+
+  /// `call` of `callee`, of `functionType`, with `arguments` and the attribute list operand
+  /// `attributes`; `tail` marks it `tail`. Answers its result, or `none()` for `void`.
+  pub effect fn call(self: &mut Self, functionType: u64, callee: u64, arguments: &[u64], attributes: u64, tail: bool) -> u64
+  ! OutOfMemoryError ? &mut Allocator {
+    let resultType = self.resultOf(functionType)
+    let result = run Module.open(&mut self.*, instructionCall(), resultType)
+    run Module.put(&mut self.*, attributes, tagAttributes())
+    let mut flags: u64 = 32768
+    if tail { flags = 32769 }
+    run Module.put(&mut self.*, flags, tagLiteral())
+    run Module.put(&mut self.*, functionType, tagType())
+    run Module.callOperands(&mut self.*, functionType, callee, arguments)
+    return result
+  }
+
+  /// `call` with fast-math `flags`.
+  pub effect fn callMath(self: &mut Self, functionType: u64, callee: u64, arguments: &[u64], flags: u64) -> u64
+  ! OutOfMemoryError ? &mut Allocator {
+    let resultType = self.resultOf(functionType)
+    let result = run Module.open(&mut self.*, instructionCall(), resultType)
+    run Module.put(&mut self.*, 0, tagAttributes())
+    run Module.put(&mut self.*, 163840, tagLiteral())
+    run Module.put(&mut self.*, flags, tagLiteral())
+    run Module.put(&mut self.*, functionType, tagType())
+    run Module.callOperands(&mut self.*, functionType, callee, arguments)
+    return result
+  }
+
+  /// `invoke` of `callee`, continuing at `normal` or unwinding to `unwind`.
+  pub effect fn invoke(self: &mut Self, functionType: u64, callee: u64, arguments: &[u64], attributes: u64, normal: u64,
+    unwind: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let resultType = self.resultOf(functionType)
+    let result = run Module.open(&mut self.*, instructionInvoke(), resultType)
+    run Module.put(&mut self.*, attributes, tagAttributes())
+    run Module.put(&mut self.*, 8192, tagLiteral())
+    run Module.put(&mut self.*, normal, tagBlock())
+    run Module.put(&mut self.*, unwind, tagBlock())
+    run Module.put(&mut self.*, functionType, tagType())
+    run Module.callOperands(&mut self.*, functionType, callee, arguments)
+    return result
+  }
+
+  effect fn callOperands(self: &mut Self, functionType: u64, callee: u64, arguments: &[u64]) -> () ! OutOfMemoryError ? &mut Allocator {
+    run Module.put(&mut self.*, callee, tagTyped())
+    let fixed = self.typeItems(functionType) - usize.ONE
+    let mut at = usize.ZERO
+    while at < arguments.length {
+      if at < fixed { run Module.put(&mut self.*, arguments[at], tagRelative()) } else { run Module.put(&mut self.*, arguments[at], tagTyped()) }
+      at = at + usize.ONE
+    }
+    return ()
+  }
+
+  /// Calls the function `name` of `functionType` with `arguments`, declaring it on first use.
+  pub effect fn callNamed(self: &mut Self, name: &[u8], functionType: u64, arguments: &[u64]) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    let callee = run Module.functionRef(&mut self.*, name, functionType)
+    return run Module.call(&mut self.*, functionType, callee, arguments, 0, false)
+  }
+
+  // Fragments.
+
+  /// Writes the module as a fragment: `SLKF`, the payload's length as four little-endian bytes,
+  /// then the payload.
+  pub effect fn serialize(self: &Self) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+    let mut out = List<u8>.make()
+    run List<u8>.appendBytes(&mut out, b"SLKF")
+    run List<u8>.appendRepeated(&mut out, 0, 4)
+    let globals = List<Global>.asSlice(&self.globals)
+    run putVarint(&mut out, usize.toU64(globals.length))
+    let names = Bytes.asSlice(&self.names)
+    let mut at = usize.ZERO
+    while at < globals.length {
+      let entry = globals[at]
+      run putVarint(&mut out, usize.toU64(entry.nameLength))
+      run List<u8>.appendBytes(&mut out, Slice.view<u8>(names, entry.nameStart, entry.nameLength))
+      run putVarint(&mut out, entry.flags)
+      run putVarint(&mut out, entry.valueType)
+      run putVarint(&mut out, entry.linkage)
+      run putVarint(&mut out, entry.attributes)
+      run putVarint(&mut out, entry.alignment)
+      run putVarint(&mut out, entry.section)
+      run putVarint(&mut out, entry.unnamed)
+      run putVarint(&mut out, u64.wrappingAdd(entry.initializer, 1))
+      run putVarint(&mut out, entry.callingConvention)
+      run putVarint(&mut out, entry.threadLocal)
+      at = at + usize.ONE
+    }
+    run putTable(&mut out, &self.types, &self.typeData)
+    run putTable(&mut out, &self.constants, &self.constantData)
+    run putTable(&mut out, &self.groups, &self.groupData)
+    run putTable(&mut out, &self.lists, &self.listData)
+    let sections = List<Bytes>.asSlice(&self.sections)
+    run putVarint(&mut out, usize.toU64(sections.length))
+    at = usize.ZERO
+    while at < sections.length {
+      run putVarint(&mut out, usize.toU64(Bytes.length(&sections[at])))
+      run List<u8>.appendBytes(&mut out, Bytes.asSlice(&sections[at]))
+      at = at + usize.ONE
+    }
+    let bodies = List<Body>.asSlice(&self.bodies)
+    run putVarint(&mut out, usize.toU64(bodies.length))
+    at = usize.ZERO
+    while at < bodies.length {
+      let body = bodies[at]
+      run putVarint(&mut out, usize.toU64(body.global))
+      run putVarint(&mut out, usize.toU64(body.arguments))
+      run putVarint(&mut out, usize.toU64(body.locals))
+      run putRun(&mut out, Slice.view<u64>(List<u64>.asSlice(&self.localTypes), body.types, body.locals))
+      run putRun(&mut out, Slice.view<u64>(List<u64>.asSlice(&self.localNames), body.types, body.locals))
+      run putVarint(&mut out, usize.toU64(body.blocks))
+      run putRun(&mut out, Slice.view<u64>(List<u64>.asSlice(&self.blockNames), body.blockNames, body.blocks))
+      run putVarint(&mut out, usize.toU64(body.end - body.start))
+      run putRun(&mut out, Slice.view<u64>(List<u64>.asSlice(&self.code), body.start, body.end - body.start))
+      at = at + usize.ONE
+    }
+    let length = usize.toU64(List<u8>.length(&out) - 8)
+    let bytes = List<u8>.asMutSlice(&mut out)
+    bytes[4] = u64.toU8(u64.bitAnd(length, 255))
+    bytes[5] = u64.toU8(u64.bitAnd(u64.shiftRight(length, 8), 255))
+    bytes[6] = u64.toU8(u64.bitAnd(u64.shiftRight(length, 16), 255))
+    bytes[7] = u64.toU8(u64.shiftRight(length, 24))
+    return run Bytes.copy(List<u8>.asSlice(&out))
+  }
+
+  /// Reads the fragment at `at` in `bytes` and moves `at` past it.
+  pub effect fn read(bytes: &[u8], at: &mut usize) -> Module ! OutOfMemoryError ? &mut Allocator {
+    let mut module = Module.make()
+    let end = fragmentEnd(bytes, at.*)
+    let mut cursor = at.* + 8
+    let globals = u64.toUsize(take(bytes, &mut cursor))
+    run List<Global>.reserve(&mut module.globals, globals)
+    let mut index = usize.ZERO
+    while index < globals {
+      let length = u64.toUsize(take(bytes, &mut cursor))
+      let nameStart = Bytes.length(&module.names)
+      run Bytes.append(&mut module.names, Slice.view<u8>(bytes, cursor, length))
+      cursor = cursor + length
+      let flags = take(bytes, &mut cursor)
+      let valueType = take(bytes, &mut cursor)
+      let mut entry = blank(flags, valueType, take(bytes, &mut cursor))
+      entry.nameStart = nameStart
+      entry.nameLength = length
+      entry.attributes = take(bytes, &mut cursor)
+      entry.alignment = take(bytes, &mut cursor)
+      entry.section = take(bytes, &mut cursor)
+      entry.unnamed = take(bytes, &mut cursor)
+      entry.initializer = u64.wrappingSubtract(take(bytes, &mut cursor), 1)
+      entry.callingConvention = take(bytes, &mut cursor)
+      entry.threadLocal = take(bytes, &mut cursor)
+      run List<Global>.append(&mut module.globals, entry)
+      index = index + usize.ONE
+    }
+    run takeTable(bytes, &mut cursor, &mut module.types, &mut module.typeData, 1)
+    run takeTable(bytes, &mut cursor, &mut module.constants, &mut module.constantData, 2)
+    run takeTable(bytes, &mut cursor, &mut module.groups, &mut module.groupData, 1)
+    run takeTable(bytes, &mut cursor, &mut module.lists, &mut module.listData, 0)
+    let sections = u64.toUsize(take(bytes, &mut cursor))
+    index = usize.ZERO
+    while index < sections {
+      let length = u64.toUsize(take(bytes, &mut cursor))
+      run List<Bytes>.append(&mut module.sections, run Bytes.copy(Slice.view<u8>(bytes, cursor, length)))
+      cursor = cursor + length
+      index = index + usize.ONE
+    }
+    let bodies = u64.toUsize(take(bytes, &mut cursor))
+    index = usize.ZERO
+    while index < bodies {
+      let functionIndex = u64.toUsize(take(bytes, &mut cursor))
+      let arguments = u64.toUsize(take(bytes, &mut cursor))
+      let locals = u64.toUsize(take(bytes, &mut cursor))
+      let types = List<u64>.length(&module.localTypes)
+      run takeRun(bytes, &mut cursor, &mut module.localTypes, locals)
+      run takeRun(bytes, &mut cursor, &mut module.localNames, locals)
+      let blocks = u64.toUsize(take(bytes, &mut cursor))
+      let blockNames = List<u64>.length(&module.blockNames)
+      run takeRun(bytes, &mut cursor, &mut module.blockNames, blocks)
+      let words = u64.toUsize(take(bytes, &mut cursor))
+      let start = List<u64>.length(&module.code)
+      run takeRun(bytes, &mut cursor, &mut module.code, words)
+      run List<Body>.append(&mut module.bodies, Body {global: functionIndex, blocks: blocks, start: start, end: start + words,
+        types: types, locals: locals, arguments: arguments, blockNames: blockNames})
+      index = index + usize.ONE
+    }
+    at.* = end
+    return move module
+  }
+
+  /// Merges every fragment of `fragments` into the module.
+  pub effect fn mergeAll(self: &mut Self, fragments: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    run Module.reserveInOrder(&mut self.*, fragments)
+    let mut at = usize.ZERO
+    while at < fragments.length {
+      let source = run Module.read(fragments, &mut at)
+      run Module.merge(&mut self.*, &source)
+    }
+    return ()
+  }
+
+  // Reserves a global for each name in `fragments` at the first fragment entry of its highest
+  // rank, so that definitions keep the order of their fragments (content-symbol order) instead of
+  // the order of first use. Reads only each fragment's global table.
+  effect fn reserveInOrder(self: &mut Self, fragments: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut strongest = Module.make()
+    let none = Module.make()
+    run Module.scanGlobals(&mut strongest, fragments, &none, false)
+    return run Module.scanGlobals(&mut self.*, fragments, &strongest, true)
+  }
+
+  // Unless `reserving`, unifies a bare entry for every global of `fragments` (keeping each name's
+  // highest rank); when reserving, reserves each name of `kept` at its first entry of that rank.
+  effect fn scanGlobals(self: &mut Self, fragments: &[u8], kept: &Module, reserving: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut at = usize.ZERO
+    while at < fragments.length {
+      let end = fragmentEnd(fragments, at)
+      let mut cursor = at + 8
+      let globals = u64.toUsize(take(fragments, &mut cursor))
+      let mut index = usize.ZERO
+      while index < globals {
+        let length = u64.toUsize(take(fragments, &mut cursor))
+        let name = Slice.view<u8>(fragments, cursor, length)
+        cursor = cursor + length
+        let flags = take(fragments, &mut cursor)
+        let mut skip = usize.ZERO
+        while skip < 9 {
+          let ignored = take(fragments, &mut cursor)
+          skip = skip + usize.ONE
+        }
+        if reserving {
+          let best = List<Global>.get(&kept.globals, kept.find(name)).flags
+          if rank(flags) == rank(best) && self.find(name) == usize.MAX {
+            drop run Module.addGlobal(&mut self.*, name, blank(flagReserved(), 0, 0))
+          }
+        } else {
+          drop run Module.unify(&mut self.*, name, blank(flags, 0, 0))
+        }
+        index = index + usize.ONE
+      }
+      at = end
+    }
+    return ()
+  }
+
+  /// Merges `source` into the module: its types, constants and attributes are interned again, and
+  /// each of its globals unifies with the module's global of that name, a definition taking the
+  /// place of a declaration and a declaration that of a use. A body comes along with its function
+  /// when the function's definition is the one kept.
+  pub effect fn merge(self: &mut Self, source: &Module) -> () ! OutOfMemoryError ? &mut Allocator {
+    let pointer = run Module.pointer(&mut self.*)
+    // Types, children before parents.
+    let typeCount = List<usize>.length(&source.types)
+    let mut typeMap = List<u64>.make()
+    run List<u64>.reserve(&mut typeMap, typeCount)
+    let typeData = List<u64>.asSlice(&source.typeData)
+    let mut words = List<u64>.make()
+    let mut index = usize.ZERO
+    while index < typeCount {
+      let start = List<usize>.get(&source.types, index)
+      let code = typeData[start]
+      let items = u64.toUsize(typeData[start + usize.ONE])
+      List<u64>.clear(&mut words)
+      run List<u64>.append(&mut words, code)
+      run List<u64>.append(&mut words, usize.toU64(items))
+      let mut item = usize.ZERO
+      while item < items {
+        let value = typeData[start + 2 + item]
+        let mut remapped = value
+        if code == typeStruct() || code == typePackedStruct() || code == typeFunction() || code == typeVariadicFunction()
+          || ((code == typeArray() || code == typeVector()) && item == usize.ONE) {
+          remapped = List<u64>.get(&typeMap, u64.toUsize(value))
+        }
+        run List<u64>.append(&mut words, remapped)
+        item = item + usize.ONE
+      }
+      run List<u64>.append(&mut typeMap, run Module.intern(&mut self.*, List<u64>.asSlice(&words)))
+      index = index + usize.ONE
+    }
+    let types = List<u64>.asSlice(&typeMap)
+    // Attribute groups and lists.
+    let groupCount = List<usize>.length(&source.groups)
+    let mut groupMap = List<u64>.make()
+    let groupData = List<u64>.asSlice(&source.groupData)
+    index = usize.ZERO
+    while index < groupCount {
+      let start = List<usize>.get(&source.groups, index)
+      let length = u64.toUsize(groupData[start + usize.ONE])
+      List<u64>.clear(&mut words)
+      run List<u64>.append(&mut words, groupData[start])
+      run List<u64>.append(&mut words, usize.toU64(length))
+      let encoding = Slice.view<u64>(groupData, start + 2, length)
+      let mut item = usize.ZERO
+      while item < encoding.length {
+        let kind = encoding[item]
+        run List<u64>.append(&mut words, kind)
+        if kind == 0 {
+          run List<u64>.append(&mut words, encoding[item + usize.ONE])
+          item = item + 2
+        } else if kind == 1 {
+          run List<u64>.append(&mut words, encoding[item + usize.ONE])
+          run List<u64>.append(&mut words, encoding[item + 2])
+          item = item + 3
+        } else if kind == 5 {
+          run List<u64>.append(&mut words, encoding[item + usize.ONE])
+          item = item + 2
+        } else if kind == 6 {
+          run List<u64>.append(&mut words, encoding[item + usize.ONE])
+          run List<u64>.append(&mut words, types[u64.toUsize(encoding[item + 2])])
+          item = item + 3
+        } else {
+          // A string attribute: the key, then for kind 4 the value, each ending in a zero.
+          let mut strings = usize.ONE
+          if kind == 4 { strings = 2 }
+          item = item + usize.ONE
+          while strings > usize.ZERO {
+            while encoding[item] != 0 {
+              run List<u64>.append(&mut words, encoding[item])
+              item = item + usize.ONE
+            }
+            run List<u64>.append(&mut words, 0)
+            item = item + usize.ONE
+            strings = strings - usize.ONE
+          }
+        }
+      }
+      let group = run intern(&mut self.groups, &mut self.groupData, &mut self.groupLookup, List<u64>.asSlice(&words))
+      run List<u64>.append(&mut groupMap, usize.toU64(group))
+      index = index + usize.ONE
+    }
+    let listCount = List<usize>.length(&source.lists)
+    let mut listMap = List<u64>.make()
+    run List<u64>.append(&mut listMap, 0)
+    let listData = List<u64>.asSlice(&source.listData)
+    index = usize.ZERO
+    while index < listCount {
+      let start = List<usize>.get(&source.lists, index)
+      let length = u64.toUsize(listData[start])
+      List<u64>.clear(&mut words)
+      run List<u64>.append(&mut words, usize.toU64(length))
+      let mut item = usize.ZERO
+      while item < length {
+        run List<u64>.append(&mut words, List<u64>.get(&groupMap, u64.toUsize(listData[start + usize.ONE + item])))
+        item = item + usize.ONE
+      }
+      let list = run intern(&mut self.lists, &mut self.listData, &mut self.listLookup, List<u64>.asSlice(&words))
+      run List<u64>.append(&mut listMap, usize.toU64(list) + 1)
+      index = index + usize.ONE
+    }
+    let lists = List<u64>.asSlice(&listMap)
+    // Sections.
+    let mut sectionMap = List<u64>.make()
+    run List<u64>.append(&mut sectionMap, 0)
+    let sections = List<Bytes>.asSlice(&source.sections)
+    index = usize.ZERO
+    while index < sections.length {
+      run List<u64>.append(&mut sectionMap, run Module.section(&mut self.*, Bytes.asSlice(&sections[index])))
+      index = index + usize.ONE
+    }
+    // Globals, without their initializers.
+    let sourceGlobals = List<Global>.asSlice(&source.globals)
+    let mut globalMap = List<u64>.make()
+    run List<u64>.reserve(&mut globalMap, sourceGlobals.length)
+    let mut adopted = List<bool>.make()
+    run List<bool>.reserve(&mut adopted, sourceGlobals.length)
+    let sourceNames = Bytes.asSlice(&source.names)
+    index = usize.ZERO
+    while index < sourceGlobals.length {
+      let entry = sourceGlobals[index]
+      let name = Slice.view<u8>(sourceNames, entry.nameStart, entry.nameLength)
+      let mut remapped = entry
+      remapped.valueType = types[u64.toUsize(entry.valueType)]
+      remapped.attributes = lists[u64.toUsize(entry.attributes)]
+      remapped.section = List<u64>.get(&sectionMap, u64.toUsize(entry.section))
+      remapped.initializer = u64.MAX
+      let found = self.find(name)
+      if found == usize.MAX {
+        run List<u64>.append(&mut globalMap, usize.toU64(run Module.addGlobal(&mut self.*, name, remapped)))
+        run List<bool>.append(&mut adopted, true)
+      } else {
+        let existing = List<Global>.get(&self.globals, found)
+        let wins = rank(entry.flags) > rank(existing.flags)
+        if wins {
+          remapped.nameStart = existing.nameStart
+          remapped.nameLength = existing.nameLength
+          List<Global>.set(&mut self.globals, found, remapped)
+        }
+        run List<u64>.append(&mut globalMap, usize.toU64(found))
+        run List<bool>.append(&mut adopted, wins)
+      }
+      index = index + usize.ONE
+    }
+    // Constants, children before parents.
+    let constantCount = List<usize>.length(&source.constants)
+    let mut constantMap = List<u64>.make()
+    run List<u64>.reserve(&mut constantMap, constantCount)
+    let constantData = List<u64>.asSlice(&source.constantData)
+    index = usize.ZERO
+    while index < constantCount {
+      let start = List<usize>.get(&source.constants, index)
+      let code = constantData[start + usize.ONE]
+      let items = u64.toUsize(constantData[start + 2])
+      List<u64>.clear(&mut words)
+      run List<u64>.append(&mut words, types[u64.toUsize(constantData[start])])
+      run List<u64>.append(&mut words, code)
+      run List<u64>.append(&mut words, usize.toU64(items))
+      let mut item = usize.ZERO
+      while item < items {
+        let value = constantData[start + 3 + item]
+        let mut remapped = value
+        if code == constantAggregate() || (code == constantBinary() && item > usize.ZERO) || (code == constantCast() && item == 2) {
+          remapped = remapValue(List<u64>.asSlice(&constantMap), List<u64>.asSlice(&globalMap), value)
+        } else if code == constantCast() && item == usize.ONE {
+          remapped = types[u64.toUsize(value)]
+        } else if code == constantGep() || code == constantInboundsGep() {
+          if u64.remainder(usize.toU64(item), 2) == 0 {
+            remapped = types[u64.toUsize(value)]
+          } else {
+            remapped = remapValue(List<u64>.asSlice(&constantMap), List<u64>.asSlice(&globalMap), value)
+          }
+        } else if code == constantInlineAssembly() && item == usize.ZERO {
+          remapped = types[u64.toUsize(value)]
+        }
+        run List<u64>.append(&mut words, remapped)
+        item = item + usize.ONE
+      }
+      run List<u64>.append(&mut constantMap, run Module.constantOf(&mut self.*, List<u64>.asSlice(&words)))
+      index = index + usize.ONE
+    }
+    let constants = List<u64>.asSlice(&constantMap)
+    let globalsMapped = List<u64>.asSlice(&globalMap)
+    // Initializers and personalities.
+    index = usize.ZERO
+    while index < sourceGlobals.length {
+      let initializer = sourceGlobals[index].initializer
+      if List<bool>.get(&adopted, index) && initializer != u64.MAX {
+        let target = u64.toUsize(globalsMapped[index])
+        let mut entry = List<Global>.get(&self.globals, target)
+        entry.initializer = remapValue(constants, globalsMapped, initializer)
+        List<Global>.set(&mut self.globals, target, entry)
+      }
+      index = index + usize.ONE
+    }
+    // Bodies of the definitions kept.
+    let bodies = List<Body>.asSlice(&source.bodies)
+    let sourceCode = List<u64>.asSlice(&source.code)
+    index = usize.ZERO
+    while index < bodies.length {
+      let body = bodies[index]
+      if List<bool>.get(&adopted, body.global) {
+        let types0 = List<u64>.length(&self.localTypes)
+        let localTypes = Slice.view<u64>(List<u64>.asSlice(&source.localTypes), body.types, body.locals)
+        run List<u64>.reserve(&mut self.localTypes, body.locals)
+        let mut item = usize.ZERO
+        while item < localTypes.length {
+          run List<u64>.append(&mut self.localTypes, types[u64.toUsize(localTypes[item])])
+          item = item + usize.ONE
+        }
+        run appendWords(&mut self.localNames, Slice.view<u64>(List<u64>.asSlice(&source.localNames), body.types, body.locals))
+        let blockNames = List<u64>.length(&self.blockNames)
+        run appendWords(&mut self.blockNames, Slice.view<u64>(List<u64>.asSlice(&source.blockNames), body.blockNames, body.blocks))
+        let start = List<u64>.length(&self.code)
+        run List<u64>.reserve(&mut self.code, body.end - body.start)
+        let mut at = body.start
+        while at < body.end {
+          let value = sourceCode[at]
+          let tag = tagOf(value)
+          let mut remapped = value
+          if tag == tagType() {
+            remapped = word(types[u64.toUsize(payloadOf(value))], tag)
+          } else if tag == tagAttributes() {
+            remapped = word(lists[u64.toUsize(payloadOf(value))], tag)
+          } else if tag >= tagRelative() && tag <= tagSigned() {
+            remapped = word(remapValue(constants, globalsMapped, payloadOf(value)), tag)
+          }
+          run List<u64>.append(&mut self.code, remapped)
+          at = at + usize.ONE
+        }
+        run List<Body>.append(&mut self.bodies, Body {global: u64.toUsize(globalsMapped[body.global]), blocks: body.blocks, start: start,
+          end: List<u64>.length(&self.code), types: types0, locals: body.locals, arguments: body.arguments, blockNames: blockNames})
+      }
+      index = index + usize.ONE
+    }
+    return ()
+  }
+
+  /// Encodes the module as bitcode.
+  pub effect fn encode(self: &Self) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+    let mut writer = Writer.make()
+    run Writer.bits(&mut writer, 3737142082, 32)
+    run writeIdentification(&mut writer)
+    let module = run Writer.enter(&mut writer, Bitstream.topWidth(), moduleBlock(), 3)
+    let version: [u64; 1] = [2]
+    run Writer.recordOf(&mut writer, module, 1, &version)
+    run writeTypes(&self.*, &mut writer, module)
+    run writeAttributes(&self.*, &mut writer, module)
+    let sections = List<Bytes>.asSlice(&self.sections)
+    let mut at = usize.ZERO
+    while at < sections.length {
+      run Writer.recordOfBytes(&mut writer, module, 5, Bytes.asSlice(&sections[at]))
+      at = at + usize.ONE
+    }
+    run writeGlobals(&self.*, &mut writer, module)
+    run writeConstants(&self.*, &mut writer, module)
+    run writeBodies(&self.*, &mut writer, module)
+    run Writer.exit(&mut writer, module)
+    let strtab = run Writer.enter(&mut writer, Bitstream.topWidth(), strtabBlock(), 3)
+    run Writer.defineBlob(&mut writer, strtab, 1)
+    run Writer.blob(&mut writer, strtab, 4, Bytes.asSlice(&self.names))
+    run Writer.exit(&mut writer, strtab)
+    return run Writer.finish(&mut writer)
+  }
+
+  // Reading back, for the printer.
+
+  /// The number of bodies.
+  pub fn bodyCount(self: &Self) -> usize { return List<Body>.length(&self.bodies) }
+
+  /// The function body `body` defines.
+  pub fn bodyGlobal(self: &Self, body: usize) -> usize { return List<Body>.get(&self.bodies, body).global }
+
+  /// Selects body `body` for `typeOf`, `bodyWords` and the other body queries.
+  pub fn focus(self: &mut Self, body: usize) -> () {
+    self.bodyTypes = List<Body>.get(&self.bodies, body).types
+    return ()
+  }
+
+  /// The words of body `body`.
+  pub fn bodyWords(self: &Self, body: usize) -> &[u64] {
+    let entry = List<Body>.get(&self.bodies, body)
+    return Slice.view<u64>(List<u64>.asSlice(&self.code), entry.start, entry.end - entry.start)
+  }
+
+  /// The argument count, local count and block count of body `body`.
+  pub fn bodyArguments(self: &Self, body: usize) -> usize { return List<Body>.get(&self.bodies, body).arguments }
+  pub fn bodyLocals(self: &Self, body: usize) -> usize { return List<Body>.get(&self.bodies, body).locals }
+  pub fn bodyBlocks(self: &Self, body: usize) -> usize { return List<Body>.get(&self.bodies, body).blocks }
+
+  /// The type of local `index` of body `body`.
+  pub fn bodyLocalType(self: &Self, body: usize, index: usize) -> u64 {
+    return List<u64>.get(&self.localTypes, List<Body>.get(&self.bodies, body).types + index)
+  }
+
+  /// The type of value `reference` within body `body`.
+  pub fn typeIn(self: &Self, body: usize, reference: u64) -> u64 {
+    let kind = kindOf(reference)
+    if kind == kindLocal() { return self.bodyLocalType(body, indexOf(reference)) }
+    if kind == kindConstant() { return self.constantType(reference) }
+    return pointerTypeOf(&self.*)
+  }
+
+  /// The name of local `index` of body `body`.
+  pub fn localName(self: &Self, body: usize, index: usize) -> u64 {
+    return List<u64>.get(&self.localNames, List<Body>.get(&self.bodies, body).types + index)
+  }
+
+  /// The name of block `index` of body `body`.
+  pub fn blockName(self: &Self, body: usize, index: usize) -> u64 {
+    return List<u64>.get(&self.blockNames, List<Body>.get(&self.bodies, body).blockNames + index)
+  }
+
+  /// The linkage, attribute list operand, encoded alignment, section operand, `unnamed_addr` code,
+  /// initializer or personality, calling convention and thread-local mode of global `index`.
+  pub fn globalLinkage(self: &Self, index: usize) -> u64 { return List<Global>.get(&self.globals, index).linkage }
+  pub fn globalAttributes(self: &Self, index: usize) -> u64 { return List<Global>.get(&self.globals, index).attributes }
+  pub fn globalAlignment(self: &Self, index: usize) -> u64 { return List<Global>.get(&self.globals, index).alignment }
+  pub fn globalSection(self: &Self, index: usize) -> u64 { return List<Global>.get(&self.globals, index).section }
+  pub fn globalUnnamed(self: &Self, index: usize) -> u64 { return List<Global>.get(&self.globals, index).unnamed }
+  pub fn globalInitializer(self: &Self, index: usize) -> u64 { return List<Global>.get(&self.globals, index).initializer }
+  pub fn globalConvention(self: &Self, index: usize) -> u64 { return List<Global>.get(&self.globals, index).callingConvention }
+  pub fn globalThreadLocal(self: &Self, index: usize) -> u64 { return List<Global>.get(&self.globals, index).threadLocal }
+  pub fn globalConstant(self: &Self, index: usize) -> bool { return has(List<Global>.get(&self.globals, index).flags, flagConstant()) }
+  pub fn globalDsoLocal(self: &Self, index: usize) -> bool { return has(List<Global>.get(&self.globals, index).flags, flagDsoLocal()) }
+
+  /// The name of section operand `section`.
+  pub fn sectionName(self: &Self, section: u64) -> &[u8] {
+    return Bytes.asSlice(&List<Bytes>.asSlice(&self.sections)[u64.toUsize(section) - usize.ONE])
+  }
+
+  /// The groups of attribute list operand `list`: its group count, then each group's position
+  /// and encoding.
+  pub fn listGroups(self: &Self, list: u64) -> &[u64] {
+    let start = List<usize>.get(&self.lists, u64.toUsize(list) - usize.ONE)
+    let length = u64.toUsize(List<u64>.get(&self.listData, start))
+    return Slice.view<u64>(List<u64>.asSlice(&self.listData), start + usize.ONE, length)
+  }
+
+  /// Group `group`'s position.
+  pub fn groupPosition(self: &Self, group: u64) -> u64 {
+    return List<u64>.get(&self.groupData, List<usize>.get(&self.groups, u64.toUsize(group)))
+  }
+
+  /// Group `group`'s encoding.
+  pub fn groupEncoding(self: &Self, group: u64) -> &[u64] {
+    let start = List<usize>.get(&self.groups, u64.toUsize(group))
+    let length = u64.toUsize(List<u64>.get(&self.groupData, start + usize.ONE))
+    return Slice.view<u64>(List<u64>.asSlice(&self.groupData), start + 2, length)
+  }
+}
+
+/// The tag of body word `value`: 0 literal, 1 relative, 2 typed, 3 absolute, 4 signed value
+/// operands, 5 a record header, 6 a type, 7 an attribute list, 8 a block.
+pub fn wordTag(value: u64) -> u64 { return tagOf(value) }
+/// The payload of body word `value`.
+pub fn wordPayload(value: u64) -> u64 { return payloadOf(value) }
+/// The record code of a header word.
+pub fn headerCode(value: u64) -> u64 { return u64.shiftRight(value, 8) }
+/// Whether a header word's record defines a value.
+pub fn headerDefinesValue(value: u64) -> bool { return u64.bitAnd(value, headerDefines()) != 0 }
+
+fn blank(flags: u64, valueType: u64, linkage: u64) -> Global {
+  return Global {
+    flags: flags,
+    nameStart: usize.ZERO,
+    nameLength: usize.ZERO,
+    valueType: valueType,
+    linkage: linkage,
+    attributes: 0,
+    alignment: 0,
+    section: 0,
+    unnamed: 0,
+    initializer: u64.MAX,
+    callingConvention: 0,
+    threadLocal: 0,
+  }
+}
+
+fn remapValue(constants: &[u64], globals: &[u64], reference: u64) -> u64 {
+  let kind = kindOf(reference)
+  if kind == kindConstant() { return constants[indexOf(reference)] }
+  if kind == kindGlobal() { return global(u64.toUsize(globals[indexOf(reference)])) }
+  return reference
+}
+
+effect fn putVarint(out: &mut List<u8>, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut rest = value
+  while rest >= 128 {
+    run List<u8>.append(&mut out.*, u64.toU8(u64.bitOr(u64.bitAnd(rest, 127), 128)))
+    rest = u64.shiftRight(rest, 7)
+  }
+  return run List<u8>.append(&mut out.*, u64.toU8(rest))
+}
+
+effect fn putRun(out: &mut List<u8>, values: &[u64]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run List<u8>.reserve(&mut out.*, values.length)
+  let mut at = usize.ZERO
+  while at < values.length {
+    run putVarint(&mut out.*, values[at])
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// An interned table: its entry count, then its data's length and words.
+effect fn putTable(out: &mut List<u8>, starts: &List<usize>, data: &List<u64>) -> () ! OutOfMemoryError ? &mut Allocator {
+  run putVarint(&mut out.*, usize.toU64(List<usize>.length(starts)))
+  run putVarint(&mut out.*, usize.toU64(List<u64>.length(data)))
+  return run putRun(&mut out.*, List<u64>.asSlice(data))
+}
+
+fn take(bytes: &[u8], at: &mut usize) -> u64 {
+  let mut value: u64 = 0
+  let mut shift: u64 = 0
+  while true {
+    let byte = u8.toU64(bytes[at.*])
+    at.* = at.* + usize.ONE
+    value = u64.bitOr(value, u64.shiftLeft(u64.bitAnd(byte, 127), shift))
+    if byte < 128 { return value }
+    shift = shift + 7
+  }
+  return value
+}
+
+effect fn takeRun(bytes: &[u8], at: &mut usize, into: &mut List<u64>, count: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  run List<u64>.reserve(&mut into.*, count)
+  let mut index = usize.ZERO
+  while index < count {
+    run List<u64>.append(&mut into.*, take(bytes, &mut at.*))
+    index = index + usize.ONE
+  }
+  return ()
+}
+
+// Reads an interned table and rebuilds its entry starts: an entry's item count is at `count`
+// words in, and the items follow it.
+effect fn takeTable(bytes: &[u8], at: &mut usize, starts: &mut List<usize>, data: &mut List<u64>, count: usize) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let entries = u64.toUsize(take(bytes, &mut at.*))
+  let words = u64.toUsize(take(bytes, &mut at.*))
+  run takeRun(bytes, &mut at.*, &mut data.*, words)
+  run List<usize>.reserve(&mut starts.*, entries)
+  let values = List<u64>.asSlice(&data.*)
+  let mut start = usize.ZERO
+  while start < values.length {
+    run List<usize>.append(&mut starts.*, start)
+    start = start + count + usize.ONE + u64.toUsize(values[start + count])
+  }
+  return ()
+}
+
+/// Where the fragment starting at `at` in `bytes` ends.
+pub fn fragmentEnd(bytes: &[u8], at: usize) -> usize {
+  let length = u64.bitOr(u64.bitOr(u8.toU64(bytes[at + 4]), u64.shiftLeft(u8.toU64(bytes[at + 5]), 8)),
+    u64.bitOr(u64.shiftLeft(u8.toU64(bytes[at + 6]), 16), u64.shiftLeft(u8.toU64(bytes[at + 7]), 24)))
+  return at + 8 + u64.toUsize(length)
+}
+
+/// A global a fragment names: whether it is a function, whether the fragment defines it, and
+/// whether it is only a use.
+pub struct Named {
+  pub name: Bytes,
+  pub function: bool,
+  pub defined: bool,
+  pub placeholder: bool,
+  pub linkage: u64,
+}
+
+/// The globals `fragments` name, in order, without reading their bodies.
+pub effect fn globalsOf(fragments: &[u8]) -> List<Named> ! OutOfMemoryError ? &mut Allocator {
+  let mut named = List<Named>.make()
+  let mut at = usize.ZERO
+  while at < fragments.length {
+    let end = fragmentEnd(fragments, at)
+    let mut cursor = at + 8
+    let globals = u64.toUsize(take(fragments, &mut cursor))
+    let mut index = usize.ZERO
+    while index < globals {
+      let length = u64.toUsize(take(fragments, &mut cursor))
+      let name = run Bytes.copy(Slice.view<u8>(fragments, cursor, length))
+      cursor = cursor + length
+      let flags = take(fragments, &mut cursor)
+      let valueType = take(fragments, &mut cursor)
+      let linkage = take(fragments, &mut cursor)
+      let mut skip = usize.ZERO
+      while skip < 7 {
+        let ignored = take(fragments, &mut cursor)
+        skip = skip + usize.ONE
+      }
+      run List<Named>.append(&mut named, Named {name: move name, function: has(flags, flagFunction()), defined: has(flags, flagDefined()),
+        placeholder: has(flags, flagPlaceholder()), linkage: linkage})
+      index = index + usize.ONE
+    }
+    at = end
+  }
+  return move named
+}
+
+/// The bitcode module `fragments` merge into.
+pub effect fn compile(fragments: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut module = Module.make()
+  run Module.mergeAll(&mut module, fragments)
+  return run Module.encode(&module)
+}
+
+/// Whether `fragments` name `name` as a function, defined or not.
+pub fn namesFunction(fragments: &[u8], name: &[u8]) -> bool {
+  let flags = flagsNamed(fragments, name)
+  return flags != u64.MAX && has(flags, flagFunction())
+}
+
+/// Whether `fragments` define the function `name`.
+pub fn definesFunction(fragments: &[u8], name: &[u8]) -> bool {
+  let mut at = usize.ZERO
+  while at < fragments.length {
+    let end = fragmentEnd(fragments, at)
+    let flags = flagsNamed(Slice.view<u8>(fragments, at, end - at), name)
+    if flags != u64.MAX && has(flags, flagFunction()) && has(flags, flagDefined()) { return true }
+    at = end
+  }
+  return false
+}
+
+/// Whether `fragments` define any function.
+pub fn definesAnyFunction(fragments: &[u8]) -> bool {
+  let mut at = usize.ZERO
+  while at < fragments.length {
+    let end = fragmentEnd(fragments, at)
+    let mut cursor = at + 8
+    let globals = u64.toUsize(take(fragments, &mut cursor))
+    let mut index = usize.ZERO
+    while index < globals {
+      let length = u64.toUsize(take(fragments, &mut cursor))
+      cursor = cursor + length
+      let flags = take(fragments, &mut cursor)
+      if has(flags, flagFunction()) && has(flags, flagDefined()) { return true }
+      let mut skip = usize.ZERO
+      while skip < 9 {
+        let ignored = take(fragments, &mut cursor)
+        skip = skip + usize.ONE
+      }
+      index = index + usize.ONE
+    }
+    at = end
+  }
+  return false
+}
+
+// The flags of the first global named `name` in `fragments`, or `u64.MAX` when none names it.
+fn flagsNamed(fragments: &[u8], name: &[u8]) -> u64 {
+  let mut at = usize.ZERO
+  while at < fragments.length {
+    let end = fragmentEnd(fragments, at)
+    let mut cursor = at + 8
+    let globals = u64.toUsize(take(fragments, &mut cursor))
+    let mut index = usize.ZERO
+    while index < globals {
+      let length = u64.toUsize(take(fragments, &mut cursor))
+      let matches = same(Slice.view<u8>(fragments, cursor, length), name)
+      cursor = cursor + length
+      let flags = take(fragments, &mut cursor)
+      if matches { return flags }
+      let mut skip = usize.ZERO
+      while skip < 9 {
+        let ignored = take(fragments, &mut cursor)
+        skip = skip + usize.ONE
+      }
+      index = index + usize.ONE
+    }
+    at = end
+  }
+  return u64.MAX
+}
+
+effect fn writeIdentification(writer: &mut Writer) -> () ! OutOfMemoryError ? &mut Allocator {
+  let block = run Writer.enter(&mut writer.*, Bitstream.topWidth(), identificationBlock(), 3)
+  run Writer.recordOfBytes(&mut writer.*, block, 1, b"silk")
+  let epoch: [u64; 1] = [0]
+  run Writer.recordOf(&mut writer.*, block, 2, &epoch)
+  return run Writer.exit(&mut writer.*, block)
+}
+
+effect fn writeTypes(module: &Module, writer: &mut Writer, parent: Bitstream.Block) -> () ! OutOfMemoryError ? &mut Allocator {
+  let count = List<usize>.length(&module.types)
+  if count == usize.ZERO { return () }
+  let block = run Writer.enter(&mut writer.*, parent.width, typeBlock(), 3)
+  let entries = [usize.toU64(count)]
+  run Writer.recordOf(&mut writer.*, block, 1, &entries)
+  let data = List<u64>.asSlice(&module.typeData)
+  let mut index = usize.ZERO
+  while index < count {
+    let start = List<usize>.get(&module.types, index)
+    let code = data[start]
+    let items = u64.toUsize(data[start + usize.ONE])
+    let values = Slice.view<u64>(data, start + 2, items)
+    if code == typeStruct() || code == typePackedStruct() {
+      run Writer.record(&mut writer.*, block, 18, items + usize.ONE)
+      if code == typePackedStruct() { run Writer.operand(&mut writer.*, 1) } else { run Writer.operand(&mut writer.*, 0) }
+      run writeAll(&mut writer.*, values)
+    } else if code == typeFunction() || code == typeVariadicFunction() {
+      run Writer.record(&mut writer.*, block, 21, items + usize.ONE)
+      if code == typeVariadicFunction() { run Writer.operand(&mut writer.*, 1) } else { run Writer.operand(&mut writer.*, 0) }
+      run writeAll(&mut writer.*, values)
+    } else {
+      run Writer.recordOf(&mut writer.*, block, code, values)
+    }
+    index = index + usize.ONE
+  }
+  return run Writer.exit(&mut writer.*, block)
+}
+
+effect fn writeAll(writer: &mut Writer, values: &[u64]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < values.length {
+    run Writer.operand(&mut writer.*, values[at])
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn writeAttributes(module: &Module, writer: &mut Writer, parent: Bitstream.Block) -> () ! OutOfMemoryError ? &mut Allocator {
+  let groups = List<usize>.length(&module.groups)
+  if groups == usize.ZERO { return () }
+  let data = List<u64>.asSlice(&module.groupData)
+  let block = run Writer.enter(&mut writer.*, parent.width, paramattrGroupBlock(), 3)
+  let mut index = usize.ZERO
+  while index < groups {
+    let start = List<usize>.get(&module.groups, index)
+    let length = u64.toUsize(data[start + usize.ONE])
+    // PARAMATTR_GRP_CODE_ENTRY: [group id, position, encoding...]
+    run Writer.record(&mut writer.*, block, 3, length + 2)
+    run Writer.operand(&mut writer.*, usize.toU64(index))
+    run Writer.operand(&mut writer.*, data[start])
+    run writeAll(&mut writer.*, Slice.view<u64>(data, start + 2, length))
+    index = index + usize.ONE
+  }
+  run Writer.exit(&mut writer.*, block)
+  let lists = List<usize>.length(&module.lists)
+  let entries = List<u64>.asSlice(&module.listData)
+  let listBlock = run Writer.enter(&mut writer.*, parent.width, paramattrBlock(), 3)
+  index = usize.ZERO
+  while index < lists {
+    let start = List<usize>.get(&module.lists, index)
+    let length = u64.toUsize(entries[start])
+    run Writer.recordOf(&mut writer.*, listBlock, 2, Slice.view<u64>(entries, start + usize.ONE, length))
+    index = index + usize.ONE
+  }
+  return run Writer.exit(&mut writer.*, listBlock)
+}
+
+// The absolute value id of a value reference outside function bodies: globals first, then
+// constants.
+fn moduleValue(module: &Module, reference: u64) -> u64 {
+  let index = u64.shiftRight(reference, 2)
+  if kindOf(reference) == kindGlobal() { return index }
+  return usize.toU64(List<Global>.length(&module.globals)) + index
+}
+
+effect fn writeGlobals(module: &Module, writer: &mut Writer, block: Bitstream.Block) -> () ! OutOfMemoryError ? &mut Allocator {
+  let globals = List<Global>.asSlice(&module.globals)
+  let mut at = usize.ZERO
+  while at < globals.length {
+    let entry = globals[at]
+    let mut reference: u64 = 0
+    if entry.initializer != u64.MAX { reference = moduleValue(module, entry.initializer) + 1 }
+    let mut dso: u64 = 0
+    if has(entry.flags, flagDsoLocal()) { dso = 1 }
+    let defined = has(entry.flags, flagDefined())
+    if has(entry.flags, flagFunction()) {
+      let mut prototype: u64 = 1
+      if defined { prototype = 0 }
+      // MODULE_CODE_FUNCTION: [strtab offset, strtab size, type, callingconv, isproto, linkage,
+      // paramattrs, alignment, section, visibility, gc, unnamed_addr, prologuedata,
+      // dllstorageclass, comdat, prefixdata, personalityfn, preemption, addrspace]
+      let values = [usize.toU64(entry.nameStart), usize.toU64(entry.nameLength), entry.valueType, entry.callingConvention, prototype,
+        entry.linkage, entry.attributes, entry.alignment, entry.section, 0, 0, entry.unnamed, 0, 0, 0, 0, reference, dso, 0]
+      run Writer.recordOf(&mut writer.*, block, 8, &values)
+    } else {
+      let mut flags: u64 = 2
+      if has(entry.flags, flagConstant()) { flags = 3 }
+      let mut initializer: u64 = 0
+      if defined { initializer = reference }
+      // MODULE_CODE_GLOBALVAR: [strtab offset, strtab size, type, flags, initid, linkage,
+      // alignment, section, visibility, threadlocal, unnamed_addr, externally_initialized,
+      // dllstorageclass, comdat, attributes, preemption]
+      let values = [usize.toU64(entry.nameStart), usize.toU64(entry.nameLength), entry.valueType, flags, initializer, entry.linkage,
+        entry.alignment, entry.section, 0, entry.threadLocal, entry.unnamed, 0, 0, 0, 0, dso]
+      run Writer.recordOf(&mut writer.*, block, 7, &values)
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn writeConstants(module: &Module, writer: &mut Writer, parent: Bitstream.Block) -> () ! OutOfMemoryError ? &mut Allocator {
+  let count = List<usize>.length(&module.constants)
+  if count == usize.ZERO { return () }
+  let data = List<u64>.asSlice(&module.constantData)
+  let block = run Writer.enter(&mut writer.*, parent.width, constantsBlock(), 3)
+  let mut current = u64.MAX
+  let mut index = usize.ZERO
+  while index < count {
+    let start = List<usize>.get(&module.constants, index)
+    let ty = data[start]
+    let code = data[start + usize.ONE]
+    let items = u64.toUsize(data[start + 2])
+    let values = Slice.view<u64>(data, start + 3, items)
+    if ty != current {
+      let set = [ty]
+      run Writer.recordOf(&mut writer.*, block, 1, &set)
+      current = ty
+    }
+    if code == constantAggregate() {
+      run Writer.record(&mut writer.*, block, code, items)
+      let mut at = usize.ZERO
+      while at < items {
+        run Writer.operand(&mut writer.*, moduleValue(module, values[at]))
+        at = at + usize.ONE
+      }
+    } else if code == constantCast() {
+      // [opcode, operand type, operand]
+      let operands = [values[0], values[1], moduleValue(module, values[2])]
+      run Writer.recordOf(&mut writer.*, block, code, &operands)
+    } else if code == constantBinary() {
+      let operands = [values[0], moduleValue(module, values[1]), moduleValue(module, values[2])]
+      run Writer.recordOf(&mut writer.*, block, code, &operands)
+    } else if code == constantGep() || code == constantInboundsGep() {
+      // [source type, (operand type, operand)...]
+      run Writer.record(&mut writer.*, block, code, items)
+      run Writer.operand(&mut writer.*, values[0])
+      let mut at = usize.ONE
+      while at < items {
+        run Writer.operand(&mut writer.*, values[at])
+        run Writer.operand(&mut writer.*, moduleValue(module, values[at + usize.ONE]))
+        at = at + 2
+      }
+    } else {
+      run Writer.recordOf(&mut writer.*, block, code, values)
+    }
+    index = index + usize.ONE
+  }
+  return run Writer.exit(&mut writer.*, block)
+}
+
+// The absolute value id of a body's value reference.
+fn bodyValue(module: &Module, base: u64, reference: u64) -> u64 {
+  let index = u64.shiftRight(reference, 2)
+  let kind = kindOf(reference)
+  if kind == kindLocal() { return base + index }
+  if kind == kindGlobal() { return index }
+  return usize.toU64(List<Global>.length(&module.globals)) + index
+}
+
+// The type of a body's value reference.
+fn bodyType(module: &Module, body: Body, reference: u64, pointer: u64) -> u64 {
+  let kind = kindOf(reference)
+  if kind == kindLocal() { return List<u64>.get(&module.localTypes, body.types + indexOf(reference)) }
+  if kind == kindGlobal() { return pointer }
+  return module.constantType(reference)
+}
+
+effect fn writeBodies(module: &Module, writer: &mut Writer, parent: Bitstream.Block) -> () ! OutOfMemoryError ? &mut Allocator {
+  let base = usize.toU64(List<Global>.length(&module.globals) + List<usize>.length(&module.constants))
+  let bodies = List<Body>.asSlice(&module.bodies)
+  let code = List<u64>.asSlice(&module.code)
+  let pointerType = pointerTypeOf(module)
+  // The reader takes bodies in the order of their functions' records.
+  let mut order = List<u64>.make()
+  run List<u64>.reserve(&mut order, bodies.length)
+  let mut at = usize.ZERO
+  while at < bodies.length {
+    run List<u64>.append(&mut order, u64.bitOr(u64.shiftLeft(usize.toU64(bodies[at].global), 32), usize.toU64(at)))
+    at = at + usize.ONE
+  }
+  run List<u64>.sort(&mut order)
+  let sorted = List<u64>.asSlice(&order)
+  at = usize.ZERO
+  while at < sorted.length {
+    let body = bodies[u64.toUsize(u64.bitAnd(sorted[at], 4294967295))]
+    let block = run Writer.enter(&mut writer.*, parent.width, functionBlock(), 4)
+    let declare = [usize.toU64(body.blocks)]
+    run Writer.recordOf(&mut writer.*, block, 1, &declare)
+    let mut next = base + usize.toU64(body.arguments)
+    let mut cursor = body.start
+    while cursor < body.end {
+      let header = code[cursor]
+      let mut end = cursor + usize.ONE
+      while end < body.end && tagOf(code[end]) != tagHeader() { end = end + usize.ONE }
+      cursor = cursor + usize.ONE
+      // Count the operands, with a type after each forward typed one.
+      let mut count = usize.ZERO
+      let mut scan = cursor
+      while scan < end {
+        let operand = code[scan]
+        count = count + usize.ONE
+        if tagOf(operand) == tagTyped() && bodyValue(module, base, payloadOf(operand)) >= next { count = count + usize.ONE }
+        scan = scan + usize.ONE
+      }
+      run Writer.record(&mut writer.*, block, headerCode(header), count)
+      scan = cursor
+      while scan < end {
+        let operand = code[scan]
+        let tag = tagOf(operand)
+        let payload = payloadOf(operand)
+        if tag == tagLiteral() || tag >= tagType() {
+          run Writer.operand(&mut writer.*, payload)
+        } else {
+          let value = bodyValue(module, base, payload)
+          if tag == tagAbsolute() {
+            run Writer.operand(&mut writer.*, value)
+          } else if tag == tagSigned() {
+            if next >= value {
+              run Writer.operand(&mut writer.*, u64.shiftLeft(next - value, 1))
+            } else {
+              run Writer.operand(&mut writer.*, u64.bitOr(u64.shiftLeft(value - next, 1), 1))
+            }
+          } else {
+            run Writer.operand(&mut writer.*, u64.bitAnd(u64.wrappingSubtract(next, value), 4294967295))
+            if tag == tagTyped() && value >= next { run Writer.operand(&mut writer.*, bodyType(module, body, payload, pointerType)) }
+          }
+        }
+        scan = scan + usize.ONE
+      }
+      if headerDefinesValue(header) { next = next + 1 }
+      cursor = end
+    }
+    run Writer.exit(&mut writer.*, block)
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+fn pointerTypeOf(module: &Module) -> u64 {
+  let words = [typePointer(), 1, 0]
+  let mut found = InternIndex.first(&module.typeLookup, hashWords(&words))
+  while found != usize.MAX {
+    if module.typeCode(usize.toU64(found)) == typePointer() { return usize.toU64(found) }
+    found = InternIndex.after(&module.typeLookup, found)
+  }
+  let count = List<usize>.length(&module.types)
+  let mut index = usize.ZERO
+  while index < count {
+    if module.typeCode(usize.toU64(index)) == typePointer() { return usize.toU64(index) }
+    index = index + usize.ONE
+  }
+  return 0
+}

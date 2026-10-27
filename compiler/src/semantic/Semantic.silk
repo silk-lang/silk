@@ -55,8 +55,8 @@ import backend.DropGlue {
 }
 import backend.InstanceKey {HelperRole, InstanceKey, ProviderEntry}
 import backend.UnionDispatch {Arm as DispatchArm, UnionDispatch}
-import backend.CodegenUnits
-import backend.CodegenUnits {CodegenUnit, Defined}
+import backend.CodegenUnits {CodegenUnit}
+import backend.Bitcode
 import backend.Mir
 import backend.MirVerification
 import backend.MirVerification {UseAfterDrop}
@@ -75,8 +75,8 @@ import backend.Layout {
   TypeLayout,
 }
 import backend.TypeLayouts {TypeLayouts}
-import backend.LlvmText
-import backend.LlvmText {ObjectConstant}
+import backend.LlvmCode
+import backend.LlvmCode {ObjectConstant}
 import semantic.CallableWitness
 import semantic.CallableWitness {CallableWitness as WitnessRecipe, OperandLoan as WitnessLoan}
 import semantic.Specialization {
@@ -2548,12 +2548,14 @@ struct Resolver {
   // The C objects the current artifact build defines for its exported statics (FFI-005).
   exportedObjects: List<ExportedObject>,
   // The C declaration each exported function root would print as an import of its own symbol.
-  exportedFunctions: List<LlvmText.Declaration>,
+  exportedFunctions: List<LlvmCode.Declaration>,
   emissionInputs: List<EmissionInputs>,
   llvmInputs: List<LlvmInput>,
   llvmValues: List<InstanceDefinition>,
   // Whether an assembled module is also split into codegen units.
   codegenUnits: bool,
+  // Whether LLVM text is shaped for an unoptimized compile (`LlvmCode.Writer.fastPath`).
+  fastPathIr: bool,
   // Whether an assembled module is split into packs for a cache to store beside its image
   // (`Semantic.offerPacks`), the bodies offered, and the packs of the image an adoption read that
   // claimed one.
@@ -34578,6 +34580,175 @@ effect fn qualifiedInterfaceContract(
     List<Binder>.asSlice(&scoped.binders), &mut elision)
 }
 
+// The bindings an interface operation call's written type arguments fix, resolved in the caller's
+// scope: `Echo.echo<i32>` binds the operation's own `T`. Written lifetimes are not supported here.
+// An interface operation's written type arguments: those that fix a binder, and those with an
+// elided region that fix only the shape the operands' inferred argument must have.
+struct OperationPrefix {
+  bindings: List<Binding>,
+  shapes: List<Binding>,
+}
+
+effect fn operationPrefixBindings(
+  resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  module: &ModuleId, caller: &DeclarationId, contractModule: &ModuleId, operation: &DeclarationId,
+  signature: &Shared<Result<Answer, NoRejection>>, written: HirRef, constraints: &[Constraint], span: Span,
+) -> Result<OperationPrefix, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let callerIdentity = run Shared<DeclarationId>.make(DeclarationId.copy(caller))
+  let callerOrdinal = match move run ordinalOfIdentity(&mut resolver.*, module, &callerIdentity) {
+    Option<usize>.Some {value} => value
+    _ => { return Result<OperationPrefix, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.Unsupported, span)) }
+  }
+  let operationIdentity = run Shared<DeclarationId>.make(DeclarationId.copy(operation))
+  let operationOrdinal = match move run ordinalOfIdentity(&mut resolver.*, contractModule, &operationIdentity) {
+    Option<usize>.Some {value} => value
+    _ => { return Result<OperationPrefix, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.Unsupported, span)) }
+  }
+  let moduleOrdinal = run internModule(&mut resolver.*, module)
+  let scoped = match move run bodyScope(&mut resolver.*, &mut owner.*, &mut dependencies.*, moduleOrdinal, module, callerOrdinal) {
+    Result<BodyScope, Shared<Rejection>>.Success {value} => move value
+    Result<BodyScope, Shared<Rejection>>.Failure {error} => { return Result<OperationPrefix, Shared<Rejection>>.failResult(move error) }
+  }
+  // More written arguments than the operation's own type parameters is an arity error at the call;
+  // the list never reaches the contract's parameters, which its qualifier or provider fixes.
+  let declared = match move run templateBinders(&mut resolver.*, contractModule, operationOrdinal) {
+    Result<List<Binder>, Shared<Rejection>>.Success {value} => binderCountOfKind(List<Binder>.asSlice(&value), false)
+    Result<List<Binder>, Shared<Rejection>>.Failure {error} => { return Result<OperationPrefix, Shared<Rejection>>.failResult(move error) }
+  }
+  if let Option<HeaderSyntax>.Some {value: syntax} = move run typeNode(&mut resolver.*, module, written.id) {
+    if let Node.TypeArguments {arguments: supplied, ..} = syntax.header {
+      if supplied.length > declared {
+        return Result<OperationPrefix, Shared<Rejection>>.failResult(run rejectArity(&resolver.*, module, span, declared, supplied.length))
+      }
+    }
+  }
+  let prefix = run resolveCallPrefix(&mut resolver.*, &mut owner.*, &mut dependencies.*, moduleOrdinal, module, contractModule,
+    operationOrdinal, signature, written, List<Binder>.asSlice(&scoped.binders), constraints, emptyCallPrefix(), span)
+  let resolved = match move prefix {
+    Result<CallPrefix, Shared<Rejection>>.Success {value} => move value
+    Result<CallPrefix, Shared<Rejection>>.Failure {error} => { return Result<OperationPrefix, Shared<Rejection>>.failResult(move error) }
+  }
+  // A written argument with an elided region, as `string` in `pick<string>(...)`, fixes only the
+  // argument's shape: the operands infer it with their regions, and the call checks they agree.
+  let pending = match &resolved.owner {
+    Option<Shared<DeclarationId>>.Some {value} => Option<DeclarationId>.some(DeclarationId.copyShared(&value))
+    Option<Shared<DeclarationId>>.None => Option<DeclarationId>.none()
+  }
+  let slots = List<CallPrefixSlot>.asSlice(&resolved.slots)
+  let values = List<Argument>.asSlice(&resolved.arguments)
+  if slots.length != values.length { fail RevisionMismatch {} }
+  let shared = run Shared<DeclarationId>.make(DeclarationId.copy(operation))
+  let mut bindings = List<Binding>.make()
+  let mut shapes = List<Binding>.make()
+  let mut at = usize.ZERO
+  while at < slots.length {
+    let ordinal = callPrefixSlotOrdinal(&slots[at], operation)
+    let typed = match &values[at] { Argument.Type {..} => true _ => false }
+    if ordinal == usize.MAX || !typed {
+      return Result<OperationPrefix, Shared<Rejection>>.failResult(run genericOperationRejection(module, span, operation))
+    }
+    let elided = match &pending {
+      Option<DeclarationId>.Some {value: template} => run argumentMentionsOwner(&values[at], &template)
+      Option<DeclarationId>.None => false
+    }
+    let binding = Binding {declaration: Shared<DeclarationId>.clone(&shared), ordinal: ordinal, value: Argument.copy(&values[at])}
+    if elided { run List<Binding>.append(&mut shapes, move binding) } else { run List<Binding>.append(&mut bindings, move binding) }
+    at = at + usize.ONE
+  }
+  return Result<OperationPrefix, Shared<Rejection>>.succeed(OperationPrefix {bindings: move bindings, shapes: move shapes})
+}
+
+// An interface operation operand's context. It knows the operation's type arguments fixed so far,
+// so a literal after `value: T` takes the type an earlier operand gave `T`; while the parameter
+// still names an unfixed type argument, the operand has no context.
+effect fn operationOperandContext(source: &SourceIndex, cursor: &AuthoredCursor, expression: HirId,
+  parameter: &Shared<Type>, operation: &DeclarationId, caller: &DeclarationId, inferred: &[Binding], operationTypes: bool,
+) -> Option<Shared<Type>> ! RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if !operationTypes {
+    return run operationArgumentContext(source, cursor, expression, parameter, operation, caller)
+  }
+  let known = run typeBindingsOnly(inferred)
+  let fixed = run Type.applyBindings(parameter, List<Binding>.asSlice(&known), false)
+  if run ownsTypeParameters(&fixed, operation) { return Option<Shared<Type>>.none() }
+  return run operationArgumentContext(source, cursor, expression, &fixed, operation, caller)
+}
+
+// Every type parameter of an interface operation is bound at its call, and the bounds that name
+// them hold for their arguments under the caller's premises. Region bounds stay with the region check.
+effect fn proveOperationTypeBounds(
+  resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  module: &ModuleId, signature: &Shared<Result<Answer, NoRejection>>, operation: &DeclarationId, inferred: &[Binding],
+  constraints: &[Constraint], span: Span,
+) -> Option<Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let binderCount = Shared<Result<Answer, NoRejection>>.with<usize>(signature, signatureBinderCount)
+  let mut at = usize.ZERO
+  while at < binderCount {
+    let binder = Shared<Result<Answer, NoRejection>>.with<Option<InferenceBinder>>(signature,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<InferenceBinder> { return inferenceBinderAt(answer, at) })
+    if let Option<InferenceBinder>.Some {value: InferenceBinder.Type {..}} = move binder {
+      let bound = match move bindingArgumentAt(inferred, at) {
+        Option<Argument>.Some {value} => !run argumentMentionsOwner(&value, operation)
+        Option<Argument>.None => false
+      }
+      if !bound { return Option<Shared<Rejection>>.some(run reject(&resolver.*, module, RejectionCode.TypeArgumentInference, span)) }
+    }
+    at = at + usize.ONE
+  }
+  let mut owed = List<Constraint>.make()
+  let count = Shared<Result<Answer, NoRejection>>.with<usize>(signature, signatureConstraintCount)
+  let mut boundAt = usize.ZERO
+  while boundAt < count {
+    let bound = Shared<Result<Answer, NoRejection>>.with<Option<Constraint>>(signature,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Constraint> { return signatureConstraintAt(answer, boundAt) })
+    if let Option<Constraint>.Some {value} = move bound {
+      if run constraintMentionsOwner(&value, operation) {
+        run List<Constraint>.append(&mut owed, run applyConstraintBindings(&value, inferred))
+      }
+    }
+    boundAt = boundAt + usize.ONE
+  }
+  let premises = run copyConstraints(constraints)
+  return run proveAppliedBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &premises, List<Constraint>.asSlice(&owed),
+    module, span, RegionProof.RegionCheck)
+}
+
+// Whether `bound` is a contents bound whose subject holds no region and names no type parameter,
+// as `i32: 'env` for a generic `effect fn` operation's argument: it holds for every region.
+effect fn regionFreeContents(bound: &Constraint) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if let Constraint.Contents {subject, ..} = &bound.* {
+    if run Type.namesTypeParameter(&subject) { return false }
+    let mut atoms = List<Shared<Lifetime>>.make()
+    run Type.everyRegionAtom(&subject, &mut atoms)
+    return List<Shared<Lifetime>>.length(&atoms) == usize.ZERO
+  }
+  return false
+}
+
+// The type bindings of `bindings`, without its lifetime and row bindings.
+effect fn typeBindingsOnly(bindings: &[Binding]) -> List<Binding> ! OutOfMemoryError ? &mut Allocator {
+  let mut kept = List<Binding>.make()
+  let mut at = usize.ZERO
+  while at < bindings.length {
+    if let Argument.Type {..} = &bindings[at].value {
+      run List<Binding>.append(&mut kept, Binding {declaration: Shared<DeclarationId>.clone(&bindings[at].declaration),
+        ordinal: bindings[at].ordinal, value: Argument.copy(&bindings[at].value)})
+    }
+    at = at + usize.ONE
+  }
+  return move kept
+}
+
+// Whether `value` still names one of `owner`'s type parameters.
+effect fn ownsTypeParameters(value: &Shared<Type>, owner: &DeclarationId) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut types = List<usize>.make()
+  let mut lifetimes = List<usize>.make()
+  let mut rows = List<usize>.make()
+  run Type.collectOwned(value, owner, &mut types, &mut lifetimes, &mut rows)
+  return List<usize>.length(&types) > usize.ZERO
+}
+
 // Missing operation-owned inputs keep the selected operation in diagnostic evidence, so the
 // backend can name this boundary without guessing from qualifier syntax or reading a body.
 effect fn genericOperationRejection(module: &ModuleId, span: Span, operation: &DeclarationId) -> Shared<Rejection>
@@ -35013,9 +35184,30 @@ effect fn checkQualifiedInterfaceCall<'scope>(
   if CallArguments.length(arguments) < parameterCount {
     return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
   }
-  if operationGenerics.present || Shared<Result<Answer, NoRejection>>.with<usize>(&signature, signatureNonLifetimeBinderCount) > usize.ZERO {
-    return Result<BodyNodeId, Shared<Rejection>>.failResult(run genericOperationRejection(module, span, &chosenOperation))
+  // An operation's own type arguments are written after it (`Echo.echo<i32>(...)`) or inferred
+  // from its operands, as at a direct call; the witness is specialized with them.
+  let mut inferred = List<Binding>.make()
+  let mut explicit = List<usize>.make()
+  let mut shapes = List<Binding>.make()
+  if operationGenerics.present {
+    let written = run operationPrefixBindings(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, caller,
+      &contractModule, &chosenOperation, &signature, operationGenerics, constraints, span)
+    let OperationPrefix {bindings, shapes: elided} = match move written {
+      Result<OperationPrefix, Shared<Rejection>>.Success {value} => move value
+      Result<OperationPrefix, Shared<Rejection>>.Failure {error} => {
+        return Result<BodyNodeId, Shared<Rejection>>.failResult(move error)
+      }
+    }
+    shapes = move elided
+    let listed = List<Binding>.asSlice(&bindings)
+    let mut writtenAt = usize.ZERO
+    while writtenAt < listed.length {
+      run List<usize>.append(&mut explicit, listed[writtenAt].ordinal)
+      writtenAt = writtenAt + usize.ONE
+    }
+    inferred = move bindings
   }
+  let operationTypes = Shared<Result<Answer, NoRejection>>.with<usize>(&signature, signatureNonLifetimeBinderCount) > usize.ZERO
   let unsafeCall = Shared<Result<Answer, NoRejection>>.with<bool>(&signature, signatureUnsafe)
   if unsafeCall && !unsafeAllowed && !callAcknowledged {
     return run bodyRejection(&resolver.*, module, RejectionCode.UnsafeAcknowledgement, span)
@@ -35028,7 +35220,6 @@ effect fn checkQualifiedInterfaceCall<'scope>(
     &mut variables,
     run Shared<DeclarationId>.make(DeclarationId.copy(&chosenOperation)),
   )
-  let mut inferred = List<Binding>.make()
   let mut typedArguments = List<BodyNodeId>.make()
   at = usize.ZERO
   while at < CallArguments.length(arguments) {
@@ -35054,8 +35245,8 @@ effect fn checkQualifiedInterfaceCall<'scope>(
     }
     if !already {
       let argumentId = run bodyArgument(&resolver.source, cursor, arguments, at)
-      let context = run operationArgumentContext(&resolver.source, cursor, argumentId, &parameterType,
-        &chosenOperation, caller)
+      let context = run operationOperandContext(&resolver.source, cursor, argumentId, &parameterType,
+        &chosenOperation, caller, List<Binding>.asSlice(&inferred), operationTypes)
       let checked = run checkExpression(
         &mut resolver.*,
         &mut owner.*,
@@ -35104,7 +35295,6 @@ effect fn checkQualifiedInterfaceCall<'scope>(
         return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
       }
     }
-    let explicit = List<usize>.make()
     let pattern = run callArgumentType(
       &parameterType, &signature, &chosenOperation, List<Binding>.asSlice(&inferred),
       caller, expression, false, &run cursorAnchor(cursor),
@@ -35124,8 +35314,8 @@ effect fn checkQualifiedInterfaceCall<'scope>(
   }
   return run finishInterfaceCall(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller, &mut nodes.*,
     &mut signatures.*, expression, span, move contract, move provider, move chosenOperation, move implementation,
-    &signature, move typedArguments, move inferred, Option<BodyReceiverPass>.none(), expected, mismatchCode, constraints, contractBody,
-    staticBody)
+    &signature, move typedArguments, move inferred, move shapes, Option<BodyReceiverPass>.none(), expected, mismatchCode, constraints,
+    contractBody, staticBody)
 }
 
 // An interface operation call once its provider, witness and operands are selected and checked: a
@@ -35136,7 +35326,7 @@ effect fn finishInterfaceCall(resolver: &mut Resolver, owner: &mut Query<Answer,
   dependencies: &mut List<Dependency>, module: &ModuleId, cursor: &AuthoredCursor, caller: &DeclarationId, nodes: &mut List<BodyNode>,
   signatures: &mut List<SignatureDependency>, expression: HirId, span: Span, contract: Shared<Type>,
   provider: Shared<Type>, operation: DeclarationId, implementation: Option<Shared<DeclarationId>>,
-  signature: &Shared<Result<Answer, NoRejection>>, typedArguments: List<BodyNodeId>, matched: List<Binding>,
+  signature: &Shared<Result<Answer, NoRejection>>, typedArguments: List<BodyNodeId>, matched: List<Binding>, shapes: List<Binding>,
   receiverPass: Option<BodyReceiverPass>, expected: &Option<Shared<Type>>, mismatchCode: RejectionCode, constraints: &[Constraint], contractBody: bool,
   staticBody: bool,
 ) -> Result<BodyNodeId, Shared<Rejection>>
@@ -35146,6 +35336,23 @@ effect fn finishInterfaceCall(resolver: &mut Resolver, owner: &mut Query<Answer,
   // for, to the 'longer of a `'longer: 'binder` bound when the use left it 'static, and in a runtime
   // body to its meet with what the operands lend. An interface call writes no operation binder.
   let mut inferred = move matched
+  // A written type argument with an elided region is the shape the operands inferred.
+  let shaped = List<Binding>.asSlice(&shapes)
+  let mut shapeAt = usize.ZERO
+  while shapeAt < shaped.length {
+    let agrees = match move bindingArgumentAt(List<Binding>.asSlice(&inferred), shaped[shapeAt].ordinal) {
+      Option<Argument>.Some {value: Argument.Type {value: found}} => match &shaped[shapeAt].value {
+        Argument.Type {value: wanted} => run Type.runtimeEqualsShared(&found, &wanted)
+        _ => false
+      }
+      Option<Argument>.Some {..} => false
+      Option<Argument>.None => {
+        return Result<BodyNodeId, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.TypeArgumentInference, span))
+      }
+    }
+    if !agrees { return Result<BodyNodeId, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.TypeMismatch, span)) }
+    shapeAt = shapeAt + usize.ONE
+  }
   let written = List<usize>.make()
   let binderCount = Shared<Result<Answer, NoRejection>>.with<usize>(signature, signatureBinderCount)
   let callOwner = run Shared<DeclarationId>.make(DeclarationId.copy(&operation))
@@ -35196,10 +35403,21 @@ effect fn finishInterfaceCall(resolver: &mut Resolver, owner: &mut Query<Answer,
       Option<Constraint>.None => { return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span) }
     }
     let region = match &declared { Constraint.Outlives {..} => true Constraint.Contents {..} => true _ => false }
-    if region && run constraintMentionsOwner(&run applyConstraintBindings(&declared, List<Binding>.asSlice(&inferred)), &operation) {
+    let applied = run applyConstraintBindings(&declared, List<Binding>.asSlice(&inferred))
+    let trivial = run regionFreeContents(&applied)
+    if region && !trivial && run constraintMentionsOwner(&applied, &operation) {
       return run bodyRejection(&resolver.*, module, RejectionCode.UninferredParameter, span)
     }
     boundAt = boundAt + usize.ONE
+  }
+  // An operation's own type parameters take the call's written or inferred arguments, which owe
+  // the operation's bounds on them, as `pick<T: Copy>` owes `Copy` for its argument.
+  if Shared<Result<Answer, NoRejection>>.with<usize>(signature, signatureNonLifetimeBinderCount) > usize.ZERO {
+    let failure = run proveOperationTypeBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, signature,
+      &operation, List<Binding>.asSlice(&inferred), constraints, span)
+    if let Option<Shared<Rejection>>.Some {value} = move failure {
+      return Result<BodyNodeId, Shared<Rejection>>.failResult(move value)
+    }
   }
   let isEffect = Shared<Result<Answer, NoRejection>>.with<bool>(signature, signatureIsEffect)
   let result = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Type>>>(
@@ -36341,12 +36559,26 @@ effect fn checkReceiverCall<'scope>(
   if receiverPositionValue.ordinal != usize.ZERO || parameterCount != CallArguments.length(arguments) + usize.ONE {
     return run bodyRejection(&resolver.*, module, RejectionCode.CallArity, span)
   }
+  // An interface operation's own type arguments are written after it (`provider.echo<i32>(...)`)
+  // or inferred from its operands, as for the qualified spelling.
+  let mut writtenOperation = List<Binding>.make()
+  let mut writtenShapes = List<Binding>.make()
   if let ReceiverCallChoice.Interface {selected} = &choice {
-    if Shared<Result<Answer, NoRejection>>.with<usize>(&signature, signatureNonLifetimeBinderCount) > usize.ZERO {
-      return Result<BodyNodeId, Shared<Rejection>>.failResult(run genericOperationRejection(module, span, &selected.call.operation))
+    if generics.present {
+      let contractModule = ModuleId.copy(DeclarationId.moduleId(&selected.call.operation))
+      let written = run operationPrefixBindings(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, caller,
+        &contractModule, &selected.call.operation, &signature, generics, constraints, span)
+      let OperationPrefix {bindings, shapes} = match move written {
+        Result<OperationPrefix, Shared<Rejection>>.Success {value} => move value
+        Result<OperationPrefix, Shared<Rejection>>.Failure {error} => {
+          return Result<BodyNodeId, Shared<Rejection>>.failResult(move error)
+        }
+      }
+      writtenOperation = move bindings
+      writtenShapes = move shapes
     }
-    if generics.present { return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span) }
   }
+  let operationTypes = Shared<Result<Answer, NoRejection>>.with<usize>(&signature, signatureNonLifetimeBinderCount) > usize.ZERO
   let unsafeCall = Shared<Result<Answer, NoRejection>>.with<bool>(&signature, signatureUnsafe)
   if unsafeCall && !unsafeAllowed && !callAcknowledged {
     return run bodyRejection(&resolver.*, module, RejectionCode.UnsafeAcknowledgement, span)
@@ -36408,7 +36640,7 @@ effect fn checkReceiverCall<'scope>(
     &mut variables,
     run Shared<DeclarationId>.make(DeclarationId.copy(&callDeclaration)),
   )
-  let mut inferred = List<Binding>.make()
+  let mut inferred = move writtenOperation
   let none = List<usize>.make()
   let operand = CallReceiver {node: adaptedReceiver, pass: receiverPass, subject: subject, memberSpan: memberSpan, bound: false,
     open: false}
@@ -36435,8 +36667,8 @@ effect fn checkReceiverCall<'scope>(
       }
     }
     let argumentId = run bodyArgument(&resolver.source, cursor, arguments, at)
-    let context = run operationArgumentContext(&resolver.source, cursor, argumentId, &parameterType,
-      &callDeclaration, caller)
+    let context = run operationOperandContext(&resolver.source, cursor, argumentId, &parameterType,
+      &callDeclaration, caller, List<Binding>.asSlice(&inferred), operationTypes)
     let checked = run checkExpression(
       &mut resolver.*,
       &mut owner.*,
@@ -36510,8 +36742,8 @@ effect fn checkReceiverCall<'scope>(
   drop proof
   return run finishInterfaceCall(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller, &mut nodes.*,
     &mut signatures.*, expression, span, move selected.contract, move provider, move operation, move implementation,
-    &signature, move typedArguments, move inferred, Option<BodyReceiverPass>.some(receiverPass), expected, mismatchCode, constraints,
-    contractBody, staticBody)
+    &signature, move typedArguments, move inferred, move writtenShapes, Option<BodyReceiverPass>.some(receiverPass), expected,
+    mismatchCode, constraints, contractBody, staticBody)
 }
 
 // The enclosing declaration owns expression-local regions independently of demanded signatures.
@@ -38522,6 +38754,10 @@ effect fn callableArgumentFailure(
   }
   // A failing Effect offered for an infallible bound already names its error and the fix.
   if code == RejectionCode.TypeArgumentInference && Shared<Rejection>.with<bool>(failure, failingEffectNamed) {
+    return Shared<Rejection>.clone(failure)
+  }
+  // A callable whose parameter is a wider union already names the forwarding closure (SEM0076).
+  if code == RejectionCode.IncompatibleCallableSignature && Shared<Rejection>.with<bool>(failure, widerParameterNamed) {
     return Shared<Rejection>.clone(failure)
   }
   // A plain callable's signature may match while its retained environment is too short.
@@ -42591,6 +42827,8 @@ effect fn unknownVariantArguments(
 // union's declaring module.
 struct VariantShape {
   braces: bool,
+  /// The variant's written name, for diagnostics.
+  variant: Bytes,
   names: List<Bytes>,
   types: List<Shared<Type>>,
   publics: List<bool>,
@@ -42639,11 +42877,13 @@ effect fn variantShape(
   let mut names = List<Bytes>.make()
   let mut publics = List<bool>.make()
   let mut braces = false
+  let mut variant = Bytes.make()
   let sourceAnswer = run observedMember(&mut resolver.*, &declaredModule, nominal.declaration, tag)
   if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &sourceAnswer, &declaredModule) {
     let hir = IndexedSource.authored(indexed)
-    if let Node.Variant {fields, braces: writtenBraces, ..} = Module.node(hir, Module.child(hir, variants, tag)) {
+    if let Node.Variant {name: variantName, fields, braces: writtenBraces} = Module.node(hir, Module.child(hir, variants, tag)) {
       braces = writtenBraces
+      if let Node.Name {text} = Module.node(hir, variantName) { variant = run Bytes.copy(Module.text(hir, text)) }
       let mut at = usize.ZERO
       while at < fields.length {
         if let Node.Field {name, isPublic, ..} = Module.node(hir, Module.child(hir, fields, at)) {
@@ -42680,7 +42920,7 @@ effect fn variantShape(
     at = at + usize.ONE
   }
   return Result<VariantShape, Shared<Rejection>>.succeed(VariantShape {
-    braces: braces, names: move names, types: move types, publics: move publics, module: nominal.module,
+    braces: braces, variant: move variant, names: move names, types: move types, publics: move publics, module: nominal.module,
   })
 }
 
@@ -43491,7 +43731,14 @@ effect fn checkRecordPatternFields(
           if index == written.length { return Option<Shared<Rejection>>.some(run reject(&resolver.*, module, RejectionCode.UnknownStructField, fieldSpan)) }
           // A pattern names a variant field only where a projection of it would be allowed.
           if !variantFieldVisible(&resolver.*, module, &shape, index) {
-            return Option<Shared<Rejection>>.some(run reject(&resolver.*, module, RejectionCode.InaccessibleProjectedField, fieldSpan))
+            let mut diagnostic = run makeRejection(RejectionCode.InaccessibleProjectedField, module, fieldSpan)
+            run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"field"), value: run Bytes.copy(Bytes.asSlice(&text))})
+            run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"variant"), value: run Bytes.copy(Bytes.asSlice(&shape.variant))})
+            // Another package's variant cannot be edited from here, so only `..` is offered.
+            let mut choice: &'static [u8] = b"3"
+            if !ModuleId.samePackage(module, &resolvedModule(&resolver.*, shape.module)) { choice = b"4" }
+            run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"template"), value: run Bytes.copy(choice)})
+            return Option<Shared<Rejection>>.some(run Shared<Rejection>.make(move diagnostic))
           }
           field = CheckedRecordMember {index: index, count: written.length, ty: Shared<Type>.clone(&listed[index])}
           step = BodyPlaceStep.VariantField {tag: tag, field: index}
@@ -52668,6 +52915,56 @@ effect fn narrowerParameter(module: &ModuleId, offered: &CallableFacts, wanted: 
   return Option<Shared<Rejection>>.none()
 }
 
+// A callable whose parameter is a wider union than the one it would be called with, as in a
+// handler `onAny(error: Overdrawn | Frozen)` passed where only `Frozen` is left to handle. The
+// call would need an argument conversion the native compiler does not build yet, so the
+// diagnostic names the forwarding closure that works today (SEM0067 for a handler, SEM0076).
+effect fn widerParameter(module: &ModuleId, offered: &CallableFacts, wanted: &CallableFacts, span: Span)
+-> Option<Shared<Rejection>> ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let accepted = List<Shared<Type>>.asSlice(&offered.parameters)
+  let passed = List<Shared<Type>>.asSlice(&wanted.parameters)
+  let mut at = usize.ZERO
+  while at < accepted.length && at < passed.length {
+    let acceptedMembers = run Type.failureMembers(&accepted[at])
+    let passedMembers = run Type.failureMembers(&passed[at])
+    let missing = run Type.uncoveredFailures(&accepted[at], &passed[at])
+    if List<Shared<Type>>.length(&acceptedMembers) > List<Shared<Type>>.length(&passedMembers)
+      && List<Shared<Type>>.length(&missing) == usize.ZERO
+      && !Type.hasOpenParameters(&accepted[at]) && !Type.hasOpenParameters(&passed[at]) {
+      let accepts = match move run failureText(module, &accepted[at]) {
+        Option<Bytes>.Some {value} => move value
+        Option<Bytes>.None => { return Option<Shared<Rejection>>.none() }
+      }
+      let given = match move run failureText(module, &passed[at]) {
+        Option<Bytes>.Some {value} => move value
+        Option<Bytes>.None => { return Option<Shared<Rejection>>.none() }
+      }
+      if Shared<Type>.with<bool>(&wanted.result, bareEffect) {
+        let mut detail = run Bytes.copy(b"its parameter type `")
+        run Bytes.append(&mut detail, Bytes.asSlice(&accepts))
+        run Bytes.append(&mut detail, b"` is wider than `")
+        run Bytes.append(&mut detail, Bytes.asSlice(&given))
+        run Bytes.append(&mut detail, b"`, the failures left to handle, and a wider handler parameter is not supported yet; pass a closure that takes `")
+        run Bytes.append(&mut detail, Bytes.asSlice(&given))
+        run Bytes.append(&mut detail, b"` and forwards it, as in `effect fn(error: ")
+        run Bytes.append(&mut detail, Bytes.asSlice(&given))
+        run Bytes.append(&mut detail, b") -> T { return run handler(move error) }`")
+        let mut diagnostic = run makeRejection(RejectionCode.InvalidEffectHandler, module, span)
+        run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"detail"), value: move detail})
+        return Option<Shared<Rejection>>.some(run Shared<Rejection>.make(move diagnostic))
+      }
+      let mut diagnostic = run makeRejection(RejectionCode.IncompatibleCallableSignature, module, span)
+      diagnostic.arguments = List<MessageArgument>.make()
+      run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"accepts"), value: move accepts})
+      run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"passed"), value: move given})
+      run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"template"), value: run Bytes.copy(b"3")})
+      return Option<Shared<Rejection>>.some(run Shared<Rejection>.make(move diagnostic))
+    }
+    at = at + usize.ONE
+  }
+  return Option<Shared<Rejection>>.none()
+}
+
 effect fn proveCallableBound(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
   dependencies: &mut List<Dependency>, module: &ModuleId, declared: &[Constraint],
   parameter: &Shared<Type>, contract: &Shared<Type>, span: Span, deferral: &mut Option<RegionDeferral>, proof: RegionProof,
@@ -52705,6 +53002,9 @@ effect fn proveCallableBound(resolver: &mut Resolver, owner: &mut Query<Answer, 
           }
           if let Option<Shared<Rejection>>.Some {value: plain} = move run plainHandler(module, &offered, &wanted, span) {
             return Option<Shared<Rejection>>.some(move plain)
+          }
+          if let Option<Shared<Rejection>>.Some {value: wider} = move run widerParameter(module, &offered, &wanted, span) {
+            return Option<Shared<Rejection>>.some(move wider)
           }
           let code = match error { CallableFailure.Incompatible => RejectionCode.IncompatibleCallableSignature
             CallableFailure.Unsupported => RejectionCode.Unsupported }
@@ -52878,6 +53178,17 @@ fn failingEffectNamed(rejection: &Rejection) -> bool {
   let mut at = usize.ZERO
   while at < listed.length {
     if same(Bytes.asSlice(&listed[at].name), b"errors") { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Whether `rejection` is the wider-parameter form of SEM0076, which names both parameter types.
+fn widerParameterNamed(rejection: &Rejection) -> bool {
+  let listed = List<MessageArgument>.asSlice(&rejection.arguments)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if same(Bytes.asSlice(&listed[at].name), b"accepts") { return true }
     at = at + usize.ONE
   }
   return false
@@ -75702,13 +76013,14 @@ effect fn resolveLlvmText(resolver: &mut Resolver, key: Key) -> Answer
   let function = &functions[input.mir]
   let dependencies = run copyEmissionDependencies(List<Dependency>.asSlice(&subject.dependencies))
   let emitted = run Effect.result(
-    LlvmText.emit(
+    LlvmCode.emit(
       function,
       &resolver.target,
       List<TypeLayout>.asSlice(&input.layouts),
       List<CAbi.Signature>.asSlice(&input.foreign),
       List<InstanceIdentity>.asSlice(&input.identities),
       &input.suspension,
+      resolver.fastPathIr,
     ),
   )
   let text = match move emitted {
@@ -75730,11 +76042,11 @@ effect fn resolveLlvmText(resolver: &mut Resolver, key: Key) -> Answer
     }
   }
   let foreign = run Effect.result(
-    LlvmText.foreignDeclarations(List<CAbi.Signature>.asSlice(&input.foreign)),
+    LlvmCode.foreignDeclarations(List<CAbi.Signature>.asSlice(&input.foreign)),
   )
   let declarations = match move foreign {
-    Result<List<LlvmText.Declaration>, BackendGap | OutOfMemoryError>.Success {value} => move value
-    Result<List<LlvmText.Declaration>, BackendGap | OutOfMemoryError>.Failure {error} => match move error {
+    Result<List<LlvmCode.Declaration>, BackendGap | OutOfMemoryError>.Success {value} => move value
+    Result<List<LlvmCode.Declaration>, BackendGap | OutOfMemoryError>.Failure {error} => match move error {
       BackendGap {code, owner, source} => {
         let gap = run Shared<BackendGap>.make(
           BackendGap {code: code, owner: move owner, source: move source},
@@ -80182,12 +80494,6 @@ effect fn appendBoundOperationSupplier(
   if let Option<Shared<Rejection>>.Some {value} = move failure {
     return Result<(), Shared<Rejection>>.failResult(move value)
   }
-  if Shared<Result<Answer, NoRejection>>.with<usize>(
-    &signature,
-    signatureTypeParameterCount,
-  ) != usize.ZERO {
-    return Result<(), Shared<Rejection>>.succeed(())
-  }
   let receiver = run receiverPosition(&signature, provider)
   let receiverPositionValue = match move receiver {
     Option<ReceiverPosition>.Some {value} => value
@@ -80908,12 +81214,6 @@ effect fn appendContractSupplier(
   )
   if let Option<Shared<Rejection>>.Some {value: diagnostic} = move failure {
     return Result<(), Shared<Rejection>>.failResult(move diagnostic)
-  }
-  if Shared<Result<Answer, NoRejection>>.with<usize>(
-    &signature,
-    signatureTypeParameterCount,
-  ) != usize.ZERO {
-    return Result<(), Shared<Rejection>>.succeed(())
   }
   let receiver = run receiverPosition(&signature, provider)
   let receiverPositionValue = match move receiver {
@@ -84989,11 +85289,12 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       layoutValues: List<Shared<BackendLayout>>.make(),
       layoutContents: List<Bytes>.make(),
       exportedObjects: List<ExportedObject>.make(),
-      exportedFunctions: List<LlvmText.Declaration>.make(),
+      exportedFunctions: List<LlvmCode.Declaration>.make(),
       emissionInputs: List<EmissionInputs>.make(),
       llvmInputs: List<LlvmInput>.make(),
       llvmValues: List<InstanceDefinition>.make(),
       codegenUnits: false,
+      fastPathIr: false,
       packing: false,
       offeredBodies: List<BuildRecord.PackBody>.make(),
       packs: List<HeldPack>.make(),
@@ -86439,6 +86740,13 @@ impl Semantic {
     self.resolver.codegenUnits = split
   }
 
+  /// Selects whether emitted LLVM text is shaped for Clang's unoptimized `-O0` compile, whose fast
+  /// instruction selector it then stays on. The cache keeps one image per profile, so text emitted
+  /// under one choice is never adopted under the other.
+  pub fn selectFastPathIr(self: &mut Self, unoptimized: bool) -> () {
+    self.resolver.fastPathIr = unoptimized
+  }
+
   /// Offers the pack bodies a cache keeps beside its image, before `adoptCache` reads the image,
   /// and has each assembled module split into packs (`BackendBuild.Module.units`) for the cache to
   /// store. A replay takes the text of a definition the image holds from its pack.
@@ -86496,13 +86804,20 @@ impl Semantic {
       run mergeRejections(&mut result.rejections, List<Shared<Rejection>>.asSlice(&escapes.rejections))
       run mergeGaps(&mut result.gaps, List<Shared<BackendGap>>.asSlice(&escapes.gaps))
     }
+    // The runtime's walk is the runtime module's time; the claims of every module are no one module's.
+    run Progress.endItem(&mut self.resolver.progress)
     let entries = run Semantic.runtimeRoots(&mut self.*, runtime, modules)
     if List<DeclarationId>.length(&entries) > usize.ZERO {
       if let Option<ModuleId>.Some {value: selected} = &runtime.* {
+        if Progress.timing(&self.resolver.progress) {
+          let shown = run ModuleId.copyPath(&selected)
+          run Progress.timeItem(&mut self.resolver.progress, Bytes.asSlice(&shown))
+        }
         let runtimeOrdinal = run internModule(&mut self.resolver, &selected)
         let escapes = run Semantic.keptEscapes(&mut self.*, &mut request.*, runtimeOrdinal, modules, List<DeclarationId>.asSlice(&entries), true)
         run appendOutsideRuntime(&mut result.rejections, List<Shared<Rejection>>.asSlice(&escapes.rejections), runtime)
         run mergeGaps(&mut result.gaps, List<Shared<BackendGap>>.asSlice(&escapes.gaps))
+        run Progress.endItem(&mut self.resolver.progress)
       }
     }
     let mut conflicts = List<Shared<Rejection>>.make()
@@ -86730,13 +87045,16 @@ impl Semantic {
       declaration: usize.MAX, member: member, external: false})
     let unit = u64.toUsize(word.value)
     let found = escapeMemoOf(List<EscapeMemo>.asSlice(&self.escapeMemos), unit)
+    // The record of this check's last walk in this process, which an edit since may leave true.
+    let mut previous = Option<CapturedBuild>.none()
     if found != usize.MAX {
       let memos = List<EscapeMemo>.asSlice(&self.escapeMemos)
       if sameDeclarations(List<DeclarationId>.asSlice(&memos[found].concrete), concrete) && run Semantic.unitCurrent(&mut self.*, unit) {
         let kept = List<EscapeMemo>.asSlice(&self.escapeMemos)
         return run copyCheckResult(&kept[found].result)
       }
-      drop List<EscapeMemo>.remove(&mut self.escapeMemos, found)
+      let EscapeMemo {unit: _, concrete: _, result: _, captured: last, reads: _} = List<EscapeMemo>.remove(&mut self.escapeMemos, found)
+      previous = move last
       uncarry(&mut self.carriedUnits, &mut self.carriedRoots, unit)
     }
     // The walk an adopted image recorded for this check is replayed when it still describes the
@@ -86747,28 +87065,20 @@ impl Semantic {
     }
     let mut kept = Option<EscapeRecordRoot>.none()
     if let Option<EscapeRecordRoot>.Some {value: held} = move adopted {
-      // What the replay demands goes to a unit of its own: the units that decide what a replay
-      // that reports finds besides the record's entries, as a broken body's MIR.
-      let readsWord = run internKey(&mut self.resolver, Key {family: Family.ModuleCheck, module: module, name: 7,
-        declaration: usize.MAX, member: member, external: false})
-      let reads = u64.toUsize(readsWord.value)
-      run Graph.startRun(&mut self.resolver.graph, reads)
-      let recorder = self.resolver.rootRecorder
-      self.resolver.rootRecorder = reads
-      let attempted = run Effect.result(Semantic.replayEscapes(&mut self.*, &mut request.*, concrete, Bytes.asSlice(&held.answer), held.root))
-      self.resolver.rootRecorder = recorder
-      drop run Graph.finishRun(&mut self.resolver.graph, reads, Option<ContentHash>.none())
-      let replayed = match move attempted {
-        Result<Option<EscapeReplay>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => move value
-        Result<Option<EscapeReplay>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => { fail move error }
-      }
-      if let Option<EscapeReplay>.Some {value: replay} = move replayed {
-        let EscapeReplay {captured, result} = move replay
-        run List<EscapeMemo>.append(&mut self.escapeMemos, EscapeMemo {unit: unit, concrete: run copyDeclarations(concrete),
-          result: run copyCheckResult(&result), captured: Option<CapturedBuild>.some(move captured), reads: reads})
-        return move result
-      }
+      let replayed = run Semantic.replayKept(&mut self.*, &mut request.*, module, member, unit, concrete, Bytes.asSlice(&held.answer),
+        held.root, &[], usize.MAX, false)
+      if let Option<DeclarationCheckResult>.Some {value: result} = move replayed { return move result }
       kept = Option<EscapeRecordRoot>.some(move held)
+    } else if let Option<CapturedBuild>.Some {value: last} = move previous {
+      // In one process, as the language server's, the last walk's own record is replayed as an
+      // adopted one is, while the reads of its growth guards hold: an entry is green when its MIR
+      // unit is current.
+      if last.guard == usize.MAX || run Semantic.unitCurrent(&mut self.*, last.guard) {
+        let recorded = run BuildRecord.encode(&last.record)
+        let replayed = run Semantic.replayKept(&mut self.*, &mut request.*, module, member, unit, concrete, Bytes.asSlice(&recorded),
+          last.carriedRecord, List<CapturedEntry>.asSlice(&last.entries), last.guard, true)
+        if let Option<DeclarationCheckResult>.Some {value: result} = move replayed { return move result }
+      }
     }
     run Graph.startRun(&mut self.resolver.graph, unit)
     self.resolver.runs = self.resolver.runs + usize.ONE
@@ -86814,6 +87124,37 @@ impl Semantic {
     run List<EscapeMemo>.append(&mut self.escapeMemos, EscapeMemo {unit: unit, concrete: run copyDeclarations(concrete),
       result: run copyCheckResult(&result), captured: move captured, reads: usize.MAX})
     return move result
+  }
+
+  // Replays the escape walk record `recorded` for the check `unit` of `module` (`replayEscapes`)
+  // and keeps what it found as the check's memo; none when the record no longer describes the walk.
+  effect fn replayKept(self: &mut Self, request: &mut Request, module: usize, member: usize, unit: usize, concrete: &[DeclarationId],
+    recorded: &[u8], recordRoot: usize, previous: &[CapturedEntry], guard: usize, inProcess: bool) -> Option<DeclarationCheckResult>
+    ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+    ? &mut Allocator | &mut Types {
+    // What the replay demands goes to a unit of its own: the units that decide what a replay
+    // that reports finds besides the record's entries, as a broken body's MIR.
+    let readsWord = run internKey(&mut self.resolver, Key {family: Family.ModuleCheck, module: module, name: 7,
+      declaration: usize.MAX, member: member, external: false})
+    let reads = u64.toUsize(readsWord.value)
+    run Graph.startRun(&mut self.resolver.graph, reads)
+    let recorder = self.resolver.rootRecorder
+    self.resolver.rootRecorder = reads
+    let attempted = run Effect.result(Semantic.replayEscapes(&mut self.*, &mut request.*, concrete, recorded, recordRoot, previous,
+      guard, inProcess))
+    self.resolver.rootRecorder = recorder
+    drop run Graph.finishRun(&mut self.resolver.graph, reads, Option<ContentHash>.none())
+    let replayed = match move attempted {
+      Result<Option<EscapeReplay>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => move value
+      Result<Option<EscapeReplay>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => { fail move error }
+    }
+    if let Option<EscapeReplay>.Some {value: replay} = move replayed {
+      let EscapeReplay {captured, result} = move replay
+      run List<EscapeMemo>.append(&mut self.escapeMemos, EscapeMemo {unit: unit, concrete: run copyDeclarations(concrete),
+        result: run copyCheckResult(&result), captured: Option<CapturedBuild>.some(move captured), reads: reads})
+      return Option<DeclarationCheckResult>.some(move result)
+    }
+    return Option<DeclarationCheckResult>.none()
   }
 
   // Whether a kept unit reflects the current revision, verifying it when it is outdated.
@@ -89691,7 +90032,7 @@ impl Semantic {
   ? &mut Allocator | &mut Types {
     run selectRequest(&mut self.resolver, &request.*)
     self.resolver.exportedObjects = List<ExportedObject>.make()
-    self.resolver.exportedFunctions = List<LlvmText.Declaration>.make()
+    self.resolver.exportedFunctions = List<LlvmCode.Declaration>.make()
     let exempt = match move runtime {
       Option<&ModuleId>.Some {value} => Option<ModuleId>.some(ModuleId.copy(value))
       Option<&ModuleId>.None => Option<ModuleId>.none()
@@ -89998,13 +90339,13 @@ impl Semantic {
     }
     let mut signatures = List<CAbi.Signature>.make()
     run List<CAbi.Signature>.append(&mut signatures, move signature)
-    let printed = run Effect.result(LlvmText.foreignDeclarations(List<CAbi.Signature>.asSlice(&signatures)))
+    let printed = run Effect.result(LlvmCode.foreignDeclarations(List<CAbi.Signature>.asSlice(&signatures)))
     match move printed {
-      Result<List<LlvmText.Declaration>, BackendGap | OutOfMemoryError>.Success {value} => {
-        let entries = List<LlvmText.Declaration>.asSlice(&value)
+      Result<List<LlvmCode.Declaration>, BackendGap | OutOfMemoryError>.Success {value} => {
+        let entries = List<LlvmCode.Declaration>.asSlice(&value)
         let mut at = usize.ZERO
         while at < entries.length {
-          run List<LlvmText.Declaration>.append(&mut self.resolver.exportedFunctions, LlvmText.Declaration {
+          run List<LlvmCode.Declaration>.append(&mut self.resolver.exportedFunctions, LlvmCode.Declaration {
             contract: run Bytes.copy(Bytes.asSlice(&entries[at].contract)),
             symbol: run Bytes.copy(Bytes.asSlice(&entries[at].symbol)),
             text: run Bytes.copy(Bytes.asSlice(&entries[at].text)),
@@ -90012,7 +90353,7 @@ impl Semantic {
           at = at + usize.ONE
         }
       }
-      Result<List<LlvmText.Declaration>, BackendGap | OutOfMemoryError>.Failure {error} => match move error {
+      Result<List<LlvmCode.Declaration>, BackendGap | OutOfMemoryError>.Failure {error} => match move error {
         BackendGap {code: _, owner: gapOwner, source: gapSource} => {
           drop gapOwner
           drop gapSource
@@ -90087,7 +90428,7 @@ impl Semantic {
           OutOfMemoryError {} => { fail OutOfMemoryError {} }
         }
       }
-      let defined = run Effect.result(LlvmText.exportedObject(&signature, &constant))
+      let defined = run Effect.result(LlvmCode.exportedObject(&signature, &constant))
       let definition = match move defined {
         Result<Bytes, BackendGap | OutOfMemoryError>.Success {value: objectText} => move objectText
         Result<Bytes, BackendGap | OutOfMemoryError>.Failure {error} => match move error {
@@ -90101,14 +90442,14 @@ impl Semantic {
       let symbol = run Bytes.copy(Bytes.asSlice(&signature.symbol))
       let mut signatures = List<CAbi.Signature>.make()
       run List<CAbi.Signature>.append(&mut signatures, move signature)
-      let printed = run Effect.result(LlvmText.foreignDeclarations(List<CAbi.Signature>.asSlice(&signatures)))
+      let printed = run Effect.result(LlvmCode.foreignDeclarations(List<CAbi.Signature>.asSlice(&signatures)))
       let mut external = Bytes.make()
       match move printed {
-        Result<List<LlvmText.Declaration>, BackendGap | OutOfMemoryError>.Success {value: listed} => {
-          let entries = List<LlvmText.Declaration>.asSlice(&listed)
+        Result<List<LlvmCode.Declaration>, BackendGap | OutOfMemoryError>.Success {value: listed} => {
+          let entries = List<LlvmCode.Declaration>.asSlice(&listed)
           if entries.length > usize.ZERO { external = run Bytes.copy(Bytes.asSlice(&entries[usize.ZERO].text)) }
         }
-        Result<List<LlvmText.Declaration>, BackendGap | OutOfMemoryError>.Failure {error} => match move error {
+        Result<List<LlvmCode.Declaration>, BackendGap | OutOfMemoryError>.Failure {error} => match move error {
           BackendGap {code, owner: gapOwner, source} => {
             run List<Shared<BackendGap>>.append(&mut gaps.*, run Shared<BackendGap>.make(BackendGap {code: code, owner: move gapOwner, source: move source}))
             continue
@@ -90627,6 +90968,7 @@ impl Semantic {
       walking = run requestUnreached(List<SuspensionSummary>.asSlice(&summaries), List<usize>.asSlice(&summarized), &mut requested,
         &mut pending, &mut origins)
     }
+    run Progress.endItem(&mut self.resolver.progress)
     if List<Shared<Rejection>>.length(&refusals) > usize.ZERO {
       let first = List<Shared<Rejection>>.remove(&mut refusals, usize.ZERO)
       return BackendBuild.Rejected {first: move first, further: move refusals, gaps: move gaps}
@@ -90922,11 +91264,11 @@ impl Semantic {
       if let Option<InstanceKey>.None = &key {
         let mut reader = StableKey.reader()
         let declared = Bytes.asSlice(&entry.declaration)
+        // The key's shape may follow the declaration (`appendRecordedShape`).
         let declaration = match move run StableKey.readDeclaration(declared, &mut reader) {
           Option<DeclarationId>.Some {value: read} => move read
           Option<DeclarationId>.None => { return Option<BackendBuild>.none() }
         }
-        if !StableKey.finished(declared, &reader) { return Option<BackendBuild>.none() }
         replayed = Option<Replayed>.some(Replayed {exact: run Bytes.copy(Bytes.asSlice(&entry.exact)), hash: entry.hash,
           declaration: move declaration, family: entry.family})
       }
@@ -91046,8 +91388,30 @@ impl Semantic {
   // either. Its record is still the one read, and the MIR it lowered is kept for the next check,
   // but no check root rests on it while the walk reports (`imageReplayedChecks`), and none can
   // while a pruned body lowers to nothing, which leaves its entry without a root.
-  effect fn replayEscapes(self: &mut Self, request: &mut Request, concrete: &[DeclarationId], recorded: &[u8], recordRoot: usize)
-    -> Option<EscapeReplay>
+  //
+  // A stale entry that names a plain instance is found by its own declaration first, so the bodies
+  // above it are not lowered again; only a report needs where the walk entered it, and then the
+  // replay runs again through parents' MIR.
+  //
+  // When `inProcess`, the record is this store's own last walk, `previous` its entries, and an entry
+  // is green when its MIR unit is current; otherwise green entries are the adopted image's.
+  effect fn replayEscapes(self: &mut Self, request: &mut Request, concrete: &[DeclarationId], recorded: &[u8], recordRoot: usize,
+    previous: &[CapturedEntry], guard: usize, inProcess: bool) -> Option<EscapeReplay>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+    let mut sited = false
+    let plain = run Semantic.replayEscapesWith(&mut self.*, &mut request.*, concrete, recorded, recordRoot, previous, guard, inProcess,
+      true, &mut sited)
+    if !sited { return move plain }
+    drop plain
+    return run Semantic.replayEscapesWith(&mut self.*, &mut request.*, concrete, recorded, recordRoot, previous, guard, inProcess,
+      false, &mut sited)
+  }
+
+  // `replayEscapes`, finding a stale plain entry by its declaration when `plain`; sets `sited` when
+  // that left a report without the site the walk entered its body at.
+  effect fn replayEscapesWith(self: &mut Self, request: &mut Request, concrete: &[DeclarationId], recorded: &[u8], recordRoot: usize,
+    previous: &[CapturedEntry], guard: usize, inProcess: bool, plain: bool, sited: &mut bool) -> Option<EscapeReplay>
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
     let record = match move run BuildRecord.decode(recorded) {
@@ -91061,6 +91425,7 @@ impl Semantic {
       unchecked: List<UncheckedDeclaration>.make()}
     let recordedRoots = List<Bytes>.asSlice(&record.roots)
     let entries = List<BuildRecord.Entry>.asSlice(&record.entries)
+    if inProcess && previous.length != entries.length { return Option<EscapeReplay>.none() }
     // An entered entry whose MIR is not green is stale; it needs its key, and so does every entry
     // its parent path passes through, and a foreign leaf a stale parent reaches, which must still be
     // foreign.
@@ -91072,6 +91437,7 @@ impl Semantic {
     // through now lowers to nothing or starts no walk; and where the walk entered each entry found.
     let mut pruned = List<bool>.make()
     let mut sites = List<Option<EntrySite>>.make()
+    let mut keys = List<Option<InstanceKey>>.make()
     let mut referrers = RecordReferrers {built: false, starts: List<usize>.make(), from: List<usize>.make(),
       positions: List<usize>.make()}
     // The entry of each recorded root: its own, or the one the walk reached it as first, before
@@ -91087,19 +91453,29 @@ impl Semantic {
     at = usize.ZERO
     while at < entries.length {
       let mut held = usize.MAX
+      let mut keptUnit = usize.MAX
+      let mut green = false
       if entries[at].leaf == 0 {
-        held = EscapeImage.entryRoot(&self.escapeImage, Bytes.asSlice(&entries[at].exact))
+        if inProcess {
+          keptUnit = previous[at].mirUnit
+          green = keptUnit != usize.MAX && run Semantic.unitCurrent(&mut self.*, keptUnit)
+          if !green { keptUnit = usize.MAX }
+        } else {
+          held = EscapeImage.entryRoot(&self.escapeImage, Bytes.asSlice(&entries[at].exact))
+          green = held != usize.MAX
+        }
         let mut root = ExactSet.find(&rootSet, Bytes.asSlice(&entries[at].exact))
         if entries[at].parent == usize.MAX { root = entries[at].position }
         if root < recordedRoots.length && List<usize>.get(&rootEntries, root) == usize.MAX { List<usize>.set(&mut rootEntries, root, at) }
       }
-      let outdated = entries[at].leaf == 0 && held == usize.MAX
+      let outdated = entries[at].leaf == 0 && !green
       run List<bool>.append(&mut stale, outdated)
       run List<bool>.append(&mut needed, outdated)
       run List<usize>.append(&mut mirs, usize.MAX)
-      run List<CapturedEntry>.append(&mut rested, CapturedEntry {value: usize.MAX, mirUnit: usize.MAX, textUnit: usize.MAX, carried: held})
+      run List<CapturedEntry>.append(&mut rested, CapturedEntry {value: usize.MAX, mirUnit: keptUnit, textUnit: usize.MAX, carried: held})
       run List<bool>.append(&mut pruned, false)
       run List<Option<EntrySite>>.append(&mut sites, Option<EntrySite>.none())
+      run List<Option<InstanceKey>>.append(&mut keys, Option<InstanceKey>.none())
       at = at + usize.ONE
     }
     // The roots are the concrete bodies that start a walk, in their order; any other one must
@@ -91156,7 +91532,16 @@ impl Semantic {
       if entries[at].leaf == BuildRecord.FOREIGN && parent != usize.MAX && List<bool>.get(&stale, parent) {
         List<bool>.set(&mut needed, at, true)
       }
-      if List<bool>.get(&needed, at) && parent != usize.MAX { List<bool>.set(&mut needed, parent, true) }
+      if List<bool>.get(&needed, at) && parent != usize.MAX {
+        let mut keyed = false
+        if plain && entries[at].leaf == 0 {
+          if let Option<InstanceKey>.Some {value} = move run plainWalkKey(&entries[at]) {
+            List<Option<InstanceKey>>.set(&mut keys, at, Option<InstanceKey>.some(move value))
+            keyed = true
+          }
+        }
+        if !keyed { List<bool>.set(&mut needed, parent, true) }
+      }
     }
     at = usize.ZERO
     while at < entries.length {
@@ -91191,6 +91576,9 @@ impl Semantic {
         if let Option<InstanceKey>.Some {value: root} = &List<Option<InstanceKey>>.asSlice(&roots)[entry.position] {
           found = Option<InstanceKey>.some(InstanceKey.copy(&root))
         }
+      } else if let Option<InstanceKey>.Some {value: own} = &List<Option<InstanceKey>>.asSlice(&keys)[index] {
+        found = Option<InstanceKey>.some(InstanceKey.copy(&own))
+        parentMir = List<usize>.get(&mirs, entry.parent)
       } else {
         parentMir = List<usize>.get(&mirs, entry.parent)
         if parentMir == usize.MAX { return Option<EscapeReplay>.none() }
@@ -91217,8 +91605,13 @@ impl Semantic {
       let module = ModuleId.copy(DeclarationId.moduleId(&declaration))
       let mut site = EntrySite {module: ModuleId.copy(&module), entered: ModuleId.copy(&module), span: Span.make(usize.ZERO, usize.ZERO),
         requester: Option<RelatedSite>.none(), anchor: Option<Anchor>.none()}
+      // An entry found without its parent's MIR, or below one, has no site until a replay through
+      // parents finds it.
+      let mut placed = true
       if entry.parent == usize.MAX {
         site.span = run authoredRequestSpan(&mut self.resolver, &declaration, Span.make(usize.ZERO, usize.ZERO))
+      } else if parentMir == usize.MAX {
+        placed = false
       } else {
         let mut reached = false
         if let Option<EntrySite>.Some {value: from} = &List<Option<EntrySite>>.asSlice(&sites)[entry.parent] {
@@ -91229,12 +91622,19 @@ impl Semantic {
           site.requester = successorRequester(&from.requester, &from.entered, from.span, &from.module)
           reached = true
         }
-        if !reached { return Option<EscapeReplay>.none() }
+        if !reached {
+          if !plain { return Option<EscapeReplay>.none() }
+          placed = false
+        }
       }
       site.anchor = run instanceAnchor(&mut self.resolver, &instance)
       let lowered = match move run Semantic.escapeReplayMir(&mut self.*, &instance) {
         Option<ReplayMir>.Some {value} => value
         Option<ReplayMir>.None => {
+          if !placed {
+            sited.* = true
+            return Option<EscapeReplay>.none()
+          }
           if entry.parent == usize.MAX || !run Semantic.replayBroken(&mut self.*, &instance, &site, &mut result) {
             return Option<EscapeReplay>.none()
           }
@@ -91243,7 +91643,7 @@ impl Semantic {
         }
       }
       List<usize>.set(&mut mirs, index, lowered.mir)
-      List<Option<EntrySite>>.set(&mut sites, index, Option<EntrySite>.some(move site))
+      if placed { List<Option<EntrySite>>.set(&mut sites, index, Option<EntrySite>.some(move site)) }
       if List<bool>.get(&stale, index) {
         if !run Semantic.replayAgrees(&mut self.*, &instance, lowered.mir, entries, index, false, Span.make(usize.ZERO, usize.ZERO)) {
           return Option<EscapeReplay>.none()
@@ -91261,7 +91661,7 @@ impl Semantic {
     }
     // The check this replay makes current has no root in the image read (`imageReplayedChecks`).
     self.freshEscapes = true
-    return Option<EscapeReplay>.some(EscapeReplay {captured: CapturedBuild {record: move record, entries: move rested, guard: usize.MAX,
+    return Option<EscapeReplay>.some(EscapeReplay {captured: CapturedBuild {record: move record, entries: move rested, guard: guard,
       carriedRecord: recordRoot}, result: move result})
   }
 
@@ -91443,7 +91843,14 @@ impl Semantic {
     let lowered = run internBackendInstance(&mut self.resolver, instance, false)
     let mirKey = run internDeclaration(&mut self.resolver, Key {family: Family.Mir, module: location.module, name: lowered,
       declaration: location.declaration, member: member, external: false})
+    // A replay is first to lower a body only when it changed, which is its own module's work.
+    let started = run Progress.clock(&mut self.resolver.progress)
     let answer = run demandRaw(&mut self.resolver, &mut self.query, mirKey, Span.make(usize.ZERO, usize.ZERO))
+    if started != 0 {
+      let owner = resolvedModule(&self.resolver, location.module)
+      let shown = run ModuleId.copyPath(&owner)
+      run Progress.bill(&mut self.resolver.progress, Bytes.asSlice(&shown), started)
+    }
     let mut reported = List<Shared<Rejection>>.make()
     let mut gaps = List<Shared<BackendGap>>.make()
     let identity = DeclarationId.copyShared(&InstanceKey.identity(instance))
@@ -91822,28 +92229,28 @@ effect fn emissionOrder(plan: &EmissionPlan) -> List<usize>
 }
 
 effect fn emissionDeclarations(resolver: &Resolver, reached: &[CollectedText]) -> Option<
-  List<LlvmText.Declaration>,
+  List<LlvmCode.Declaration>,
 > ! BackendGap | OutOfMemoryError ? &mut Allocator {
   let inputs = List<InstanceDefinition>.asSlice(&resolver.llvmValues)
-  let mut declarations = List<LlvmText.Declaration>.make()
+  let mut declarations = List<LlvmCode.Declaration>.make()
   let mut at = usize.ZERO
   while at < reached.length {
-    let entries = List<LlvmText.Declaration>.asSlice(&inputs[reached[at].index].foreign)
+    let entries = List<LlvmCode.Declaration>.asSlice(&inputs[reached[at].index].foreign)
     let mut entry = usize.ZERO
     while entry < entries.length {
       if !run appendDistinctForeignDeclaration(&mut declarations, &entries[entry]) {
-        return Option<List<LlvmText.Declaration>>.none()
+        return Option<List<LlvmCode.Declaration>>.none()
       }
       entry = entry + usize.ONE
     }
     at = at + usize.ONE
   }
-  return Option<List<LlvmText.Declaration>>.some(move declarations)
+  return Option<List<LlvmCode.Declaration>>.some(move declarations)
 }
 
-effect fn appendEmissionDeclarations(text: &mut Bytes, declarations: &List<LlvmText.Declaration>) -> ()
+effect fn appendEmissionDeclarations(text: &mut Bytes, declarations: &List<LlvmCode.Declaration>) -> ()
 ! OutOfMemoryError ? &mut Allocator {
-  let entries = List<LlvmText.Declaration>.asSlice(declarations)
+  let entries = List<LlvmCode.Declaration>.asSlice(declarations)
   let mut symbols = List<Bytes>.make()
   let mut at = usize.ZERO
   while at < entries.length {
@@ -91855,9 +92262,9 @@ effect fn appendEmissionDeclarations(text: &mut Bytes, declarations: &List<LlvmT
   return ()
 }
 
-effect fn appendOrderedDeclarations(text: &mut Bytes, declarations: &List<LlvmText.Declaration>, order: &[usize]) -> ()
+effect fn appendOrderedDeclarations(text: &mut Bytes, declarations: &List<LlvmCode.Declaration>, order: &[usize]) -> ()
 ! OutOfMemoryError ? &mut Allocator {
-  let entries = List<LlvmText.Declaration>.asSlice(declarations)
+  let entries = List<LlvmCode.Declaration>.asSlice(declarations)
   let mut at = usize.ZERO
   while at < order.length {
     run Bytes.append(&mut text.*, Bytes.asSlice(&entries[order[at]].text))
@@ -91886,7 +92293,6 @@ effect fn appendResolvedDefinitions(
     let identity = &identities[order[at]]
     if write {
       run Bytes.append(&mut text.*, collectedBytes(resolver, &reached[identity.representative]))
-      run Bytes.append(&mut text.*, b"\n")
     }
     let reason = uncheckedReason(identity.borrow)
     if reason != usize.MAX {
@@ -91945,25 +92351,25 @@ effect fn assembleEmission(
 // function's definition replaces a declaration of exactly its C signature, and an exported object
 // replaces an import of exactly its C type. Absent when an import claims a definition of another
 // kind, or an object of another C type.
-effect fn boundDeclarations(resolver: &Resolver, plan: &EmissionPlan, foreign: &List<LlvmText.Declaration>)
-  -> Option<List<LlvmText.Declaration>> ! OutOfMemoryError ? &mut Allocator {
-  let entries = List<LlvmText.Declaration>.asSlice(foreign)
+effect fn boundDeclarations(resolver: &Resolver, plan: &EmissionPlan, foreign: &List<LlvmCode.Declaration>)
+  -> Option<List<LlvmCode.Declaration>> ! OutOfMemoryError ? &mut Allocator {
+  let entries = List<LlvmCode.Declaration>.asSlice(foreign)
   let objects = List<ExportedObject>.asSlice(&resolver.exportedObjects)
-  let functions = List<LlvmText.Declaration>.asSlice(&resolver.exportedFunctions)
+  let functions = List<LlvmCode.Declaration>.asSlice(&resolver.exportedFunctions)
   let identities = List<EmissionIdentity>.asSlice(&plan.identities)
-  let mut kept = List<LlvmText.Declaration>.make()
+  let mut kept = List<LlvmCode.Declaration>.make()
   let mut at = usize.ZERO
   while at < entries.length {
     let entry = &entries[at]
     at = at + usize.ONE
     let symbol = Bytes.asSlice(&entry.symbol)
     let text = Bytes.asSlice(&entry.text)
-    let global = text.length > usize.ZERO && text[usize.ZERO] == 64
+    let global = !Bitcode.namesFunction(text, symbol)
     let mut bound = false
     let mut object = usize.ZERO
     while object < objects.length {
       if same(Bytes.asSlice(&objects[object].symbol), symbol) {
-        if !same(Bytes.asSlice(&objects[object].external), text) { return Option<List<LlvmText.Declaration>>.none() }
+        if !same(Bytes.asSlice(&objects[object].external), text) { return Option<List<LlvmCode.Declaration>>.none() }
         bound = true
       }
       object = object + usize.ONE
@@ -91971,7 +92377,7 @@ effect fn boundDeclarations(resolver: &Resolver, plan: &EmissionPlan, foreign: &
     let mut identity = usize.ZERO
     while identity < identities.length {
       if same(Bytes.asSlice(&identities[identity].symbol), symbol) {
-        if global { return Option<List<LlvmText.Declaration>>.none() }
+        if global { return Option<List<LlvmCode.Declaration>>.none() }
         // Only an import of exactly the export's own C signature binds to its definition; any
         // other declaration stays, so the definition and it still refuse together.
         let mut function = usize.ZERO
@@ -91985,13 +92391,13 @@ effect fn boundDeclarations(resolver: &Resolver, plan: &EmissionPlan, foreign: &
       identity = identity + usize.ONE
     }
     if bound { continue }
-    run List<LlvmText.Declaration>.append(&mut kept, LlvmText.Declaration {
+    run List<LlvmCode.Declaration>.append(&mut kept, LlvmCode.Declaration {
       contract: run Bytes.copy(Bytes.asSlice(&entry.contract)),
       symbol: run Bytes.copy(symbol),
       text: run Bytes.copy(text),
     })
   }
-  return Option<List<LlvmText.Declaration>>.some(move kept)
+  return Option<List<LlvmCode.Declaration>>.some(move kept)
 }
 
 effect fn assembleEmissionChecked(
@@ -92018,18 +92424,18 @@ effect fn assembleEmissionChecked(
     return CompilerBug.panic(b"InstanceSymbolConflict")
   }
   let foreign = match move run emissionDeclarations(resolver, reached) {
-    Option<List<LlvmText.Declaration>>.Some {value} => move value
-    Option<List<LlvmText.Declaration>>.None => {
+    Option<List<LlvmCode.Declaration>>.Some {value} => move value
+    Option<List<LlvmCode.Declaration>>.None => {
       return refusedBuild(run reject(resolver, module, RejectionCode.ForeignSymbolConflict, span))
     }
   }
   let bound = match move run boundDeclarations(resolver, &plan, &foreign) {
-    Option<List<LlvmText.Declaration>>.Some {value} => move value
-    Option<List<LlvmText.Declaration>>.None => {
+    Option<List<LlvmCode.Declaration>>.Some {value} => move value
+    Option<List<LlvmCode.Declaration>>.None => {
       return refusedBuild(run reject(resolver, module, RejectionCode.ForeignSymbolConflict, span))
     }
   }
-  let mut text = run LlvmText.declarations(&resolver.target)
+  let mut text = run LlvmCode.declarations(&resolver.target)
   run appendEmissionDeclarations(&mut text, &bound)
   let header = run Bytes.copy(Bytes.asSlice(&text))
   let objects = List<ExportedObject>.asSlice(&resolver.exportedObjects)
@@ -92119,12 +92525,6 @@ effect fn assembleUnits(resolver: &Resolver, reached: &[CollectedText], plan: &E
   let mut unitLookup = InternIndex.make()
   // The unit of each definition in emission order.
   let mut placed = List<usize>.make()
-  // Each definition's functions for other units, in emission order.
-  let mut defines = List<List<BuildRecord.Declared>>.make()
-  let mut symbols = List<Bytes>.make()
-  let mut declarations = List<Bytes>.make()
-  let mut owners = List<usize>.make()
-  let mut symbolLookup = InternIndex.make()
   // Per unit: the pack its definitions so far match, how many, and whether they all do.
   let mut matched = List<usize>.make()
   let mut matching = List<usize>.make()
@@ -92157,40 +92557,6 @@ effect fn assembleUnits(resolver: &Resolver, reached: &[CollectedText], plan: &E
     let next = List<usize>.get(&matching, unit)
     if collected.pack != List<usize>.get(&matched, unit) || collected.member != next { List<bool>.set(&mut intact, unit, false) }
     List<usize>.set(&mut matching, unit, next + usize.ONE)
-    let mut found = List<BuildRecord.Declared>.make()
-    if collected.pack != usize.MAX {
-      let member = &List<BuildRecord.Member>.asSlice(&packs[collected.pack].pack.members)[collected.member]
-      let listed = List<BuildRecord.Declared>.asSlice(&member.defined)
-      let mut entry = usize.ZERO
-      while entry < listed.length {
-        run List<BuildRecord.Declared>.append(&mut found, BuildRecord.Declared {symbol: run Bytes.copy(Bytes.asSlice(&listed[entry].symbol)),
-          declaration: run Bytes.copy(Bytes.asSlice(&listed[entry].declaration))})
-        entry = entry + usize.ONE
-      }
-    } else {
-      let mut scanned = run CodegenUnits.defined(collectedBytes(resolver, collected))
-      while List<Defined>.length(&scanned) > usize.ZERO {
-        let first = List<Defined>.remove(&mut scanned, usize.ZERO)
-        run List<BuildRecord.Declared>.append(&mut found, BuildRecord.Declared {symbol: move first.symbol, declaration: move first.declaration})
-      }
-    }
-    let listed = List<BuildRecord.Declared>.asSlice(&found)
-    let mut entry = usize.ZERO
-    while entry < listed.length {
-      run InternIndex.record(&mut symbolLookup, InternIndex.hashBytes(0, Bytes.asSlice(&listed[entry].symbol)))
-      run List<Bytes>.append(&mut symbols, run Bytes.copy(Bytes.asSlice(&listed[entry].symbol)))
-      run List<Bytes>.append(&mut declarations, run Bytes.copy(Bytes.asSlice(&listed[entry].declaration)))
-      run List<usize>.append(&mut owners, unit)
-      entry = entry + usize.ONE
-    }
-    run List<List<BuildRecord.Declared>>.append(&mut defines, move found)
-    at = at + usize.ONE
-  }
-  let mut externals = Bytes.make()
-  let objects = List<ExportedObject>.asSlice(&resolver.exportedObjects)
-  at = usize.ZERO
-  while at < objects.length {
-    run Bytes.append(&mut externals, Bytes.asSlice(&objects[at].external))
     at = at + usize.ONE
   }
   let unitCount = List<usize>.length(&unitModules)
@@ -92198,7 +92564,6 @@ effect fn assembleUnits(resolver: &Resolver, reached: &[CollectedText], plan: &E
   let mut unit = usize.ZERO
   while unit < unitCount + usize.ONE {
     let mut body = Bytes.make()
-    let mut names = List<Bytes>.make()
     let mut digest = ContentHash {high: 0, low: 0}
     let mut stored = false
     if unit < unitCount {
@@ -92208,12 +92573,6 @@ effect fn assembleUnits(resolver: &Resolver, reached: &[CollectedText], plan: &E
       if stored {
         let held = &packs[pack]
         digest = held.pack.digest
-        let listed = List<Bytes>.asSlice(&held.pack.names)
-        at = usize.ZERO
-        while at < listed.length {
-          run List<Bytes>.append(&mut names, run Bytes.copy(Bytes.asSlice(&listed[at])))
-          at = at + usize.ONE
-        }
         run List<usize>.append(&mut packed.kept, held.root)
       } else {
         let mut members = List<BuildRecord.Member>.make()
@@ -92224,59 +92583,24 @@ effect fn assembleUnits(resolver: &Resolver, reached: &[CollectedText], plan: &E
             let offset = Bytes.length(&body)
             let written = collectedBytes(resolver, &reached[identity.representative])
             run Bytes.append(&mut body, written)
-            run Bytes.append(&mut body, b"\n")
             if resolver.packing {
-              let listed = List<BuildRecord.Declared>.asSlice(&List<List<BuildRecord.Declared>>.asSlice(&defines)[at])
-              let mut defined = List<BuildRecord.Declared>.make()
-              let mut entry = usize.ZERO
-              while entry < listed.length {
-                run List<BuildRecord.Declared>.append(&mut defined, BuildRecord.Declared {symbol: run Bytes.copy(Bytes.asSlice(&listed[entry].symbol)),
-                  declaration: run Bytes.copy(Bytes.asSlice(&listed[entry].declaration))})
-                entry = entry + usize.ONE
-              }
               run List<BuildRecord.Member>.append(&mut members, BuildRecord.Member {symbol: run Bytes.copy(Bytes.asSlice(&identity.symbol)),
-                offset: offset, length: written.length, defined: move defined})
+                offset: offset, length: written.length})
             }
           }
           at = at + usize.ONE
         }
-        names = run CodegenUnits.names(Bytes.asSlice(&body))
         digest = ContentHash.of(Bytes.asSlice(&body))
         if resolver.packing {
-          let mut listed = List<Bytes>.make()
-          let named = List<Bytes>.asSlice(&names)
-          at = usize.ZERO
-          while at < named.length {
-            run List<Bytes>.append(&mut listed, run Bytes.copy(Bytes.asSlice(&named[at])))
-            at = at + usize.ONE
-          }
-          run List<BuildRecord.Pack>.append(&mut packed.fresh, BuildRecord.Pack {digest: digest, members: move members, names: move listed})
+          run List<BuildRecord.Pack>.append(&mut packed.fresh, BuildRecord.Pack {digest: digest, members: move members})
         }
       }
     } else {
       if tail.length == usize.ZERO { break }
       run Bytes.append(&mut body, tail)
-      names = run CodegenUnits.names(Bytes.asSlice(&body))
       digest = ContentHash.of(Bytes.asSlice(&body))
     }
-    let mut head = run Bytes.copy(header)
-    if unit < unitCount { run Bytes.append(&mut head, Bytes.asSlice(&externals)) }
-    let named = List<Bytes>.asSlice(&names)
-    at = usize.ZERO
-    while at < named.length {
-      let name = Bytes.asSlice(&named[at])
-      at = at + usize.ONE
-      let mut symbol = InternIndex.first(&symbolLookup, InternIndex.hashBytes(0, name))
-      while symbol != usize.MAX {
-        if same(Bytes.asSlice(&List<Bytes>.asSlice(&symbols)[symbol]), name) {
-          if List<usize>.get(&owners, symbol) != unit {
-            run Bytes.append(&mut head, Bytes.asSlice(&List<Bytes>.asSlice(&declarations)[symbol]))
-          }
-          break
-        }
-        symbol = InternIndex.after(&symbolLookup, symbol)
-      }
-    }
+    let head = run Bytes.copy(header)
     run List<CodegenUnit>.append(&mut units, CodegenUnit {head: move head, body: move body, digest: digest, stored: stored})
     unit = unit + usize.ONE
   }
@@ -92325,18 +92649,14 @@ effect fn appendRetained(plan: &EmissionPlan, roots: &[BuildRoot], text: &mut By
     previous = least
   }
   let listed = List<usize>.asSlice(&ordered)
-  run Bytes.append(&mut text.*, b"@llvm.used = appending global [")
-  run appendDecimal(&mut text.*, listed.length)
-  run Bytes.append(&mut text.*, b" x ptr] [")
+  let mut symbols = List<Bytes>.make()
   at = usize.ZERO
   while at < listed.length {
-    if at > usize.ZERO { run Bytes.append(&mut text.*, b", ") }
-    run Bytes.append(&mut text.*, b"ptr @")
-    run Bytes.append(&mut text.*, Bytes.asSlice(&identities[listed[at]].symbol))
+    run List<Bytes>.append(&mut symbols, run Bytes.copy(Bytes.asSlice(&identities[listed[at]].symbol)))
     at = at + usize.ONE
   }
-  run Bytes.append(&mut text.*, b"], section \"llvm.metadata\"\n")
-  return ()
+  let used = run LlvmCode.retained(List<Bytes>.asSlice(&symbols))
+  return run Bytes.append(&mut text.*, Bytes.asSlice(&used))
 }
 
 effect fn applicationVisited(visited: &[InstanceKey], lookup: &InternIndex, instance: &InstanceKey) -> bool
@@ -92355,10 +92675,10 @@ effect fn applicationVisited(visited: &[InstanceKey], lookup: &InternIndex, inst
 
 // Returns false when a declaration with the same symbol but different text was already collected.
 effect fn appendDistinctForeignDeclaration(
-  declarations: &mut List<LlvmText.Declaration>,
-  entry: &LlvmText.Declaration,
+  declarations: &mut List<LlvmCode.Declaration>,
+  entry: &LlvmCode.Declaration,
 ) -> bool ! OutOfMemoryError ? &mut Allocator {
-  let prior = List<LlvmText.Declaration>.asSlice(&declarations.*)
+  let prior = List<LlvmCode.Declaration>.asSlice(&declarations.*)
   let mut seen = false
   let mut check = usize.ZERO
   while check < prior.length {
@@ -92372,9 +92692,9 @@ effect fn appendDistinctForeignDeclaration(
     check = check + usize.ONE
   }
   if !seen {
-    run List<LlvmText.Declaration>.append(
+    run List<LlvmCode.Declaration>.append(
       &mut declarations.*,
-      LlvmText.Declaration {
+      LlvmCode.Declaration {
         contract: run Bytes.copy(Bytes.asSlice(&entry.contract)),
         symbol: run Bytes.copy(Bytes.asSlice(&entry.symbol)),
         text: run Bytes.copy(Bytes.asSlice(&entry.text)),
@@ -92478,24 +92798,243 @@ struct BuildCapture {
   patterns: bool,
 }
 
-// The digest of exact identity or edge bytes a walk record names them by.
-// The bytes a record that tells region patterns apart names `instance` by.
-// The key of a build record entry that names a plain instance of its declaration, which takes no
-// arguments, providers or regions; none when the entry's exact digest names another.
-effect fn plainEntryKey(entry: &BuildRecord.Entry) -> Option<InstanceKey> ! OutOfMemoryError ? &mut Allocator {
-  let mut reader = StableKey.reader()
-  let declared = Bytes.asSlice(&entry.declaration)
-  let declaration = match move run StableKey.readDeclaration(declared, &mut reader) {
-    Option<DeclarationId>.Some {value} => move value
-    Option<DeclarationId>.None => { return Option<InstanceKey>.none() }
+// The key of a build record entry that names a plain instance of its declaration, made again
+// from the record (`recordedKey`); none when the entry's exact digest names another.
+effect fn plainEntryKey(entry: &BuildRecord.Entry) -> Option<InstanceKey> ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let instance = match move run recordedKey(Bytes.asSlice(&entry.declaration)) {
+    Option<InstanceKey>.Some {value} => move value
+    Option<InstanceKey>.None => { return Option<InstanceKey>.none() }
   }
-  if !StableKey.finished(declared, &reader) { return Option<InstanceKey>.none() }
-  let identity = run Shared<DeclarationId>.make(move declaration)
-  let instance = run InstanceKey.named(&identity)
   if !same(Bytes.asSlice(&run instanceDigest(&instance)), Bytes.asSlice(&entry.exact)) { return Option<InstanceKey>.none() }
   return Option<InstanceKey>.some(move instance)
 }
 
+// The key of a walk record's entry that names a plain instance, found as `plainEntryKey` finds a
+// build entry's; a walk names it by its definition.
+effect fn plainWalkKey(entry: &BuildRecord.Entry) -> Option<InstanceKey> ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let instance = match move run recordedKey(Bytes.asSlice(&entry.declaration)) {
+    Option<InstanceKey>.Some {value} => move value
+    Option<InstanceKey>.None => { return Option<InstanceKey>.none() }
+  }
+  if !same(Bytes.asSlice(&run definitionDigest(&instance)), Bytes.asSlice(&entry.exact)) { return Option<InstanceKey>.none() }
+  return Option<InstanceKey>.some(move instance)
+}
+
+// The key a record's entry names, made again from its declaration and the shape written after it
+// (`appendRecordedShape`). The caller checks it is the key the entry names.
+effect fn recordedKey(declared: &[u8]) -> Option<InstanceKey> ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut reader = StableKey.reader()
+  let declaration = match move run StableKey.readDeclaration(declared, &mut reader) {
+    Option<DeclarationId>.Some {value} => move value
+    Option<DeclarationId>.None => { return Option<InstanceKey>.none() }
+  }
+  if StableKey.finished(declared, &reader) {
+    let identity = run Shared<DeclarationId>.make(move declaration)
+    return Option<InstanceKey>.some(run InstanceKey.named(&identity))
+  }
+  let mut arguments = List<Argument>.make()
+  let mut ordinals = List<usize>.make()
+  if !run readLifetimeArguments(declared, &mut reader, &mut arguments, &mut ordinals) { return Option<InstanceKey>.none() }
+  let mut scopes = List<ScopeBinding>.make()
+  let scopeCount = StableKey.readWord(declared, &mut reader)
+  let mut at: u64 = 0
+  while at < scopeCount && !StableKey.failed(&reader) {
+    let owner = match move run StableKey.readDeclaration(declared, &mut reader) {
+      Option<DeclarationId>.Some {value} => move value
+      Option<DeclarationId>.None => { return Option<InstanceKey>.none() }
+    }
+    let mut supplied = List<Argument>.make()
+    let mut positions = List<usize>.make()
+    if !run readLifetimeArguments(declared, &mut reader, &mut supplied, &mut positions) { return Option<InstanceKey>.none() }
+    run List<ScopeBinding>.append(&mut scopes, ScopeBinding {owner: run Shared<DeclarationId>.make(move owner), arguments: move supplied,
+      argumentOrdinals: move positions})
+    at = at + 1
+  }
+  let count = StableKey.readWord(declared, &mut reader)
+  let mut served = List<ProviderEntry>.make()
+  at = 0
+  while at < count && !StableKey.failed(&reader) {
+    let capability = match move run readPlainNominal(declared, &mut reader) {
+      Option<Shared<Type>>.Some {value} => move value
+      Option<Shared<Type>>.None => { return Option<InstanceKey>.none() }
+    }
+    let mut roleType = Option<Shared<Type>>.none()
+    if StableKey.readWord(declared, &mut reader) == 1 {
+      match move run readPlainNominal(declared, &mut reader) {
+        Option<Shared<Type>>.Some {value} => { roleType = Option<Shared<Type>>.some(move value) }
+        Option<Shared<Type>>.None => { return Option<InstanceKey>.none() }
+      }
+    }
+    let mut access = Access.Shared
+    if StableKey.readWord(declared, &mut reader) == 1 { access = Access.Mutable }
+    let provider = match move run readPlainNominal(declared, &mut reader) {
+      Option<Shared<Type>>.Some {value} => move value
+      Option<Shared<Type>>.None => { return Option<InstanceKey>.none() }
+    }
+    run List<ProviderEntry>.append(&mut served, ProviderEntry {key: Requirement {capability: move capability, roleType: move roleType,
+      access: access}, provider: move provider})
+    at = at + 1
+  }
+  if !StableKey.finished(declared, &reader) { return Option<InstanceKey>.none() }
+  let application = Application {target: SpecializationTarget.Named {declaration: move declaration}, arguments: move arguments,
+    argumentOrdinals: move ordinals, scopes: move scopes, statics: List<StaticSlot>.make()}
+  return match move run InstanceKey.canonical(move application, move served) {
+    Result<InstanceKey, CanonicalizationFailure>.Success {value} => Option<InstanceKey>.some(move value)
+    Result<InstanceKey, CanonicalizationFailure>.Failure {..} => Option<InstanceKey>.none()
+  }
+}
+
+// Reads the lifetime arguments `writeLifetimeArguments` wrote, with their binder ordinals.
+effect fn readLifetimeArguments(bytes: &[u8], reader: &mut StableKey.Reader, arguments: &mut List<Argument>, ordinals: &mut List<usize>)
+  -> bool ! OutOfMemoryError ? &mut Allocator {
+  let count = StableKey.readWord(bytes, &mut reader.*)
+  let mut at: u64 = 0
+  while at < count && !StableKey.failed(&reader.*) {
+    let ordinal = StableKey.readWord(bytes, &mut reader.*)
+    let kind = StableKey.readWord(bytes, &mut reader.*)
+    let mut lifetime = Lifetime.Static
+    if kind == 1 { lifetime = Lifetime.Supplied {ordinal: u64.toUsize(StableKey.readWord(bytes, &mut reader.*))} }
+    else if kind != 0 { return false }
+    run List<Argument>.append(&mut arguments.*, Argument.Lifetime {value: run Shared<Lifetime>.make(move lifetime)})
+    run List<usize>.append(&mut ordinals.*, u64.toUsize(ordinal))
+    at = at + 1
+  }
+  return !StableKey.failed(&reader.*)
+}
+
+// Writes `arguments` when each is `'static` or a canonical caller atom, with its binder ordinal;
+// false when one is not.
+effect fn writeLifetimeArguments(output: &mut Bytes, arguments: &[Argument], ordinals: &[usize]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if arguments.length != ordinals.length { return false }
+  run RuntimeEncoding.word(&mut output.*, usize.toU64(arguments.length))
+  let mut at = usize.ZERO
+  while at < arguments.length {
+    let atom = match &arguments[at] {
+      Argument.Lifetime {value} => Shared<Lifetime>.with<usize>(&value, fn(held: &Lifetime) -> usize {
+        return match &held.* {
+          Lifetime.Static => usize.MAX - usize.ONE
+          Lifetime.Supplied {ordinal} => ordinal
+          _ => usize.MAX
+        }
+      })
+      _ => usize.MAX
+    }
+    if atom == usize.MAX { return false }
+    run RuntimeEncoding.word(&mut output.*, usize.toU64(ordinals[at]))
+    if atom == usize.MAX - usize.ONE { run RuntimeEncoding.word(&mut output.*, 0) }
+    else {
+      run RuntimeEncoding.word(&mut output.*, 1)
+      run RuntimeEncoding.word(&mut output.*, usize.toU64(atom))
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// A nongeneric nominal type's declaration and whether it is public.
+struct PlainNominal {
+  declaration: DeclarationId,
+  isPublic: bool,
+}
+
+fn plainNominal(ty: &Shared<Type>) -> Option<PlainNominal> {
+  return Shared<Type>.with<Option<PlainNominal>>(ty, fn(held: &Type) -> Option<PlainNominal> {
+    if let Type.Nominal {declaration, isPublic, arguments} = &held.* {
+      if List<Argument>.length(&arguments) == usize.ZERO {
+        return Option<PlainNominal>.some(PlainNominal {declaration: DeclarationId.copy(&declaration), isPublic: isPublic})
+      }
+    }
+    return Option<PlainNominal>.none()
+  })
+}
+
+effect fn writePlainNominal(output: &mut Bytes, nominal: &PlainNominal) -> () ! OutOfMemoryError ? &mut Allocator {
+  run StableKey.declaration(&mut output.*, &nominal.declaration)
+  let mut visible: u64 = 0
+  if nominal.isPublic { visible = 1 }
+  run RuntimeEncoding.word(&mut output.*, visible)
+}
+
+effect fn readPlainNominal(bytes: &[u8], reader: &mut StableKey.Reader) -> Option<Shared<Type>>
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let declaration = match move run StableKey.readDeclaration(bytes, &mut reader.*) {
+    Option<DeclarationId>.Some {value} => move value
+    Option<DeclarationId>.None => { return Option<Shared<Type>>.none() }
+  }
+  let visible = StableKey.readWord(bytes, &mut reader.*)
+  if StableKey.failed(&reader.*) || visible > 1 { return Option<Shared<Type>>.none() }
+  return Option<Shared<Type>>.some(run Types.intern(Type.Nominal {declaration: move declaration, isPublic: visible == 1,
+    arguments: List<Argument>.make()}))
+}
+
+// Writes after a record entry's declaration what else its instance's key holds, when that is
+// lifetimes, an enclosing scope's lifetimes and providers whose capability, role and provider are
+// nongeneric nominal types: then `recordedKey` makes the key again without the entry's parent.
+effect fn appendRecordedShape(output: &mut Bytes, instance: &InstanceKey) -> () ! OutOfMemoryError ? &mut Allocator {
+  let application = match move InstanceKey.application(instance) {
+    Option<Shared<Application>>.Some {value} => run Application.copyShared(&value)
+    Option<Shared<Application>>.None => { return () }
+  }
+  let named = match &application.target { SpecializationTarget.Named {..} => true _ => false }
+  if !named || List<StaticSlot>.length(&application.statics) > usize.ZERO { return () }
+  let providers = match move InstanceKey.providers(instance) {
+    Option<Shared<List<ProviderEntry>>>.Some {value} => move value
+    Option<Shared<List<ProviderEntry>>>.None => { return () }
+  }
+  let count = Shared<List<ProviderEntry>>.with<usize>(&providers, fn(listed: &List<ProviderEntry>) -> usize {
+    return List<ProviderEntry>.length(listed)
+  })
+  let scopes = List<ScopeBinding>.asSlice(&application.scopes)
+  if count == usize.ZERO && scopes.length == usize.ZERO && List<Argument>.length(&application.arguments) == usize.ZERO { return () }
+  let mut written = Bytes.make()
+  if !run writeLifetimeArguments(&mut written, List<Argument>.asSlice(&application.arguments), List<usize>.asSlice(&application.argumentOrdinals)) {
+    return ()
+  }
+  run RuntimeEncoding.word(&mut written, usize.toU64(scopes.length))
+  let mut at = usize.ZERO
+  while at < scopes.length {
+    let owner = Shared<DeclarationId>.with<DeclarationId>(&scopes[at].owner, fn(held: &DeclarationId) -> DeclarationId { return DeclarationId.copy(held) })
+    run StableKey.declaration(&mut written, &owner)
+    if !run writeLifetimeArguments(&mut written, List<Argument>.asSlice(&scopes[at].arguments), List<usize>.asSlice(&scopes[at].argumentOrdinals)) {
+      return ()
+    }
+    at = at + usize.ONE
+  }
+  run RuntimeEncoding.word(&mut written, usize.toU64(count))
+  at = usize.ZERO
+  while at < count {
+    let entry = Shared<List<ProviderEntry>>.with<ProviderEntry>(&providers, fn(listed: &List<ProviderEntry>) -> ProviderEntry {
+      return ProviderEntry.copy(&List<ProviderEntry>.asSlice(listed)[at])
+    })
+    at = at + usize.ONE
+    let capability = match move plainNominal(&entry.key.capability) {
+      Option<PlainNominal>.Some {value} => move value
+      Option<PlainNominal>.None => { return () }
+    }
+    run writePlainNominal(&mut written, &capability)
+    if let Option<Shared<Type>>.Some {value: roleValue} = &entry.key.roleType {
+      let nominal = match move plainNominal(&roleValue) {
+        Option<PlainNominal>.Some {value} => move value
+        Option<PlainNominal>.None => { return () }
+      }
+      run RuntimeEncoding.word(&mut written, 1)
+      run writePlainNominal(&mut written, &nominal)
+    } else { run RuntimeEncoding.word(&mut written, 0) }
+    let mut mutable: u64 = 0
+    if entry.key.access == Access.Mutable { mutable = 1 }
+    run RuntimeEncoding.word(&mut written, mutable)
+    let provider = match move plainNominal(&entry.provider) {
+      Option<PlainNominal>.Some {value} => move value
+      Option<PlainNominal>.None => { return () }
+    }
+    run writePlainNominal(&mut written, &provider)
+  }
+  run Bytes.append(&mut output.*, Bytes.asSlice(&written))
+}
+
+
+// The digest of exact identity or edge bytes a walk record names them by.
+// The bytes a record that tells region patterns apart names `instance` by.
 effect fn instanceDigest(instance: &InstanceKey) -> Bytes ! OutOfMemoryError ? &mut Allocator {
   return run digestBytes(run InstanceKey.identityDigest(instance))
 }
@@ -92806,10 +93345,11 @@ impl BuildCapture {
       guarded: false, declared: true, patterns: true}
   }
 
-  // An escape walk's capture, whose walk appends its roots as it finds them.
+  // An escape walk's capture, whose walk appends its roots as it finds them. Each entry names its
+  // declaration, so a replay finds a changed plain body without lowering the bodies above it.
   fn walk() -> BuildCapture {
     return BuildCapture {observing: false, roots: List<Bytes>.make(), entries: List<CaptureEntry>.make(), lookup: InternIndex.make(),
-      guarded: false, declared: false, patterns: false}
+      guarded: false, declared: true, patterns: false}
   }
 
   // The bytes this record names exact identity or edge bytes `exact` by.
@@ -92822,7 +93362,10 @@ impl BuildCapture {
     let digest = run keyDigest(instance, self.patterns)
     let exact = run digestBytes(digest)
     let mut declaration = Bytes.make()
-    if self.declared { run StableKey.declaration(&mut declaration, &DeclarationId.copyShared(&InstanceKey.identity(instance))) }
+    if self.declared {
+      run StableKey.declaration(&mut declaration, &DeclarationId.copyShared(&InstanceKey.identity(instance)))
+      run appendRecordedShape(&mut declaration, instance)
+    }
     run InternIndex.record(&mut self.lookup, Hash.combine(digest.high, digest.low))
     run List<CaptureEntry>.append(&mut self.entries, CaptureEntry {exact: move exact, digest: digest, hash: InstanceKey.runtimeHash(instance),
       family: EmissionPlan.familyName(instance), declaration: move declaration, parent: origin.parent, position: origin.position,

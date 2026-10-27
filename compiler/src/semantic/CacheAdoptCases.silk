@@ -2,6 +2,7 @@
 //! them, sweeps a changed module again, and reports what a cold store reports. A changed
 //! package graph reaches the checks whose imports it resolves.
 
+import backend.Bitcode
 import backend.CodegenUnits { CodegenUnit }
 import lexer.Span { Span }
 import semantic.BuildRecord
@@ -12,7 +13,7 @@ import semantic.ModuleId {InvalidModulePath, ModuleId}
 import semantic.PackageGraph {PackageGraph}
 import semantic.Query { Cycle }
 import semantic.Rejection { MessageArgument, Rejection, RejectionCode }
-import semantic.Semantic { Adopted, BackendBuild, Family, Request, Semantic, Statistics, staticClosureNodes }
+import semantic.Semantic { Adopted, BackendBuild, Event as SemanticEvent, EventKind, Family, Request, Semantic, Statistics, staticClosureNodes }
 import semantic.SemanticCaseSupport { makeSemantic, module, present, starts }
 import semantic.SourceIndex { Event as SourceEvent, EventKind as SourceEventKind, RevisionMismatch }
 import semantic.SourceRevision { Revision }
@@ -893,21 +894,10 @@ fn allStored(units: &List<CodegenUnit>) -> bool {
   let listed = List<CodegenUnit>.asSlice(units)
   let mut at = usize.ZERO
   while at < listed.length {
-    if !listed[at].stored && holds(Bytes.asSlice(&listed[at].body), b"define ") { return false }
+    if !listed[at].stored && Bitcode.definesAnyFunction(Bytes.asSlice(&listed[at].body)) { return false }
     at = at + usize.ONE
   }
   return true
-}
-
-fn holds(text: &[u8], needle: &[u8]) -> bool {
-  let mut start = usize.ZERO
-  while start + needle.length <= text.length {
-    let mut matched = usize.ZERO
-    while matched < needle.length && text[start + matched] == needle[matched] { matched = matched + usize.ONE }
-    if matched == needle.length { return true }
-    start = start + usize.ONE
-  }
-  return false
 }
 
 // A declaration inserted above both functions moves them without changing them. A build that
@@ -949,6 +939,70 @@ test effect fn editedLeavesLowerAlone() -> ()
   return run leafCodeClaims() |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
+test effect fn editedBorrowingLeafLowersAlone() -> ()
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut typeTable = TypeTable.make()
+  return run borrowingLeafClaims() |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn editedLeafRechecksAlone() -> ()
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut typeTable = TypeTable.make()
+  return run leafRecheckClaims() |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// In one process, as the language server's, a recheck after an edit of a plain function's body
+// lowers that function alone: the escape check replays its own last walk, whose other bodies' MIR
+// is current, instead of walking again. A second recheck lowers nothing.
+effect fn leafRecheckClaims() -> ()
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator | &mut Types {
+  let text = "pub fn leaf(count: i32) -> i32 {\n  return count\n}\npub fn middle(count: i32) -> i32 {\n  return leaf(count)\n}\npub fn answer(count: i32) -> i32 {\n  return middle(count)\n}\n"
+  let edited = "pub fn leaf(count: i32) -> i32 {\n  return count + 1\n}\npub fn middle(count: i32) -> i32 {\n  return leaf(count)\n}\npub fn answer(count: i32) -> i32 {\n  return middle(count)\n}\n"
+  let runtime = run module("runtime.silk")
+  let application = run module("steps.silk")
+  let roots = [ModuleId.copy(&runtime), ModuleId.copy(&application)]
+  let mut store = run unitStore(text, List<BuildRecord.PackBody>.make())
+  let mut first = Request.forApplication(ModuleId.copy(&application))
+  let before = run Semantic.checkDeclarations(&mut store, &mut first, &roots, &Option<ModuleId>.some(ModuleId.copy(&runtime)))
+  run Testing.expect(List<Shared<Rejection>>.length(&before.rejections) == usize.ZERO, "the program checks clean")
+  let initial = run Revision.publish(&Revision.make(), &runtime, &run present(entryRuntime()))
+  run Semantic.update(&mut store, run Revision.publish(&initial, &application, &run present(edited)))
+  Semantic.trace(&mut store, true)
+  let mut second = Request.forApplication(ModuleId.copy(&application))
+  let after = run Semantic.checkDeclarations(&mut store, &mut second, &roots, &Option<ModuleId>.some(ModuleId.copy(&runtime)))
+  run Testing.expect(List<Shared<Rejection>>.length(&after.rejections) == usize.ZERO, "the edited program checks clean")
+  run Testing.expect(starts(Semantic.eventLog(&store), Family.Mir) == usize.ONE, "the recheck lowers the edited function alone")
+  run Testing.expect(demandedKeys(Semantic.eventLog(&store), Family.Mir) == usize.ONE, "the recheck reads no other function's MIR")
+  Semantic.trace(&mut store, true)
+  let mut third = Request.forApplication(ModuleId.copy(&application))
+  drop run Semantic.checkDeclarations(&mut store, &mut third, &roots, &Option<ModuleId>.some(ModuleId.copy(&runtime)))
+  run Testing.expect(starts(Semantic.eventLog(&store), Family.Mir) == usize.ZERO, "a recheck with no edit lowers nothing")
+  return ()
+}
+
+// How many distinct `family` units `events` demanded, lowered or served from memo.
+fn demandedKeys(events: &[SemanticEvent], family: Family) -> usize {
+  let mut count = usize.ZERO
+  let mut at = usize.ZERO
+  while at < events.length {
+    if events[at].family == family && (events[at].kind == EventKind.Start || events[at].kind == EventKind.Hit) {
+      let mut seen = false
+      let mut before = usize.ZERO
+      while before < at && !seen {
+        seen = events[before].family == family && events[before].key == events[at].key
+          && (events[before].kind == EventKind.Start || events[before].kind == EventKind.Hit)
+        before = before + usize.ONE
+      }
+      if !seen { count = count + usize.ONE }
+    }
+    at = at + usize.ONE
+  }
+  return count
+}
+
 // The packs of `units`, as the driver offers them to the next build.
 effect fn packBodies(units: &List<CodegenUnit>) -> List<BuildRecord.PackBody> ! OutOfMemoryError ? &mut Allocator {
   let mut bodies = List<BuildRecord.PackBody>.make()
@@ -961,28 +1015,48 @@ effect fn packBodies(units: &List<CodegenUnit>) -> List<BuildRecord.PackBody> ! 
   return move bodies
 }
 
-// An edit of a plain function's body lowers that function alone in the build: the build finds its
-// key in the record, so the callers on its path from the entry, which still call it, do not lower
-// again. The check runs first, since its escape replay lowers what it reports from.
+// An edit of a plain function's body lowers that function alone, in the check and the build: both
+// replays find its key in their records, so the callers on its path from the entry, which still
+// call it, do not lower again.
 effect fn leafCodeClaims() -> ()
   ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static>
   ? &mut Allocator | &mut Types {
   let text = "pub fn leaf(count: i32) -> i32 {\n  return count\n}\npub fn middle(count: i32) -> i32 {\n  return leaf(count)\n}\npub fn answer(count: i32) -> i32 {\n  return middle(count)\n}\n"
   let edited = "pub fn leaf(count: i32) -> i32 {\n  return count + 1\n}\npub fn middle(count: i32) -> i32 {\n  return leaf(count)\n}\npub fn answer(count: i32) -> i32 {\n  return middle(count)\n}\n"
+  return run editedLeafClaims(text, edited, usize.ONE)
+}
+
+// So does one whose key holds lifetimes: the record keeps them after the declaration. Its root and
+// the region pattern its caller reaches each lower once, as in a cold check.
+effect fn borrowingLeafClaims() -> ()
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator | &mut Types {
+  let text = "pub fn leaf(count: &i32) -> i32 {\n  return count.*\n}\npub fn middle(count: i32) -> i32 {\n  return leaf(&count)\n}\npub fn answer(count: i32) -> i32 {\n  return middle(count)\n}\n"
+  let edited = "pub fn leaf(count: &i32) -> i32 {\n  return count.* + 1\n}\npub fn middle(count: i32) -> i32 {\n  return leaf(&count)\n}\npub fn answer(count: i32) -> i32 {\n  return middle(count)\n}\n"
+  return run editedLeafClaims(text, edited, 2)
+}
+
+// Edits `text` to `edited` after a cold build and expects the warm build to lower `lowered` MIR
+// bodies, all of the edited function, and to emit what a cold build of `edited` emits.
+effect fn editedLeafClaims(text: string<'static>, edited: string<'static>, lowered: usize) -> ()
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator | &mut Types {
+  let runtime = run module("runtime.silk")
+  let application = run module("steps.silk")
+  let roots = [ModuleId.copy(&runtime), ModuleId.copy(&application)]
+  // The cold build checks first, as `silk build` does, so the image holds the escape walks too.
   let mut cold = run unitStore(text, List<BuildRecord.PackBody>.make())
+  let mut first = Request.forApplication(ModuleId.copy(&application))
+  drop run Semantic.checkDeclarations(&mut cold, &mut first, &roots, &Option<ModuleId>.some(ModuleId.copy(&runtime)))
   let coldUnits = run unitBuild(&mut cold)
   let image = run Semantic.cacheImage(&mut cold)
   let mut warm = run unitStore(edited, run packBodies(&coldUnits))
   let request = Request.make()
   drop run Semantic.adoptCache(&mut warm, &request, &image, false)
-  let runtime = run module("runtime.silk")
-  let application = run module("steps.silk")
-  let mut checking = Request.forApplication(ModuleId.copy(&application))
-  let roots = [ModuleId.copy(&runtime), ModuleId.copy(&application)]
-  drop run Semantic.checkDeclarations(&mut warm, &mut checking, &roots, &Option<ModuleId>.some(ModuleId.copy(&runtime)))
+  // The build checks first, so its count holds the check's replay too.
   Semantic.trace(&mut warm, true)
   let warmUnits = run unitBuild(&mut warm)
-  run Testing.expect(starts(Semantic.eventLog(&warm), Family.Mir) == usize.ONE, "the build lowers the edited function alone")
+  run Testing.expect(starts(Semantic.eventLog(&warm), Family.Mir) == lowered, "the check and the build lower the edited function alone")
   let mut fresh = run unitStore(edited, List<BuildRecord.PackBody>.make())
   let freshUnits = run unitBuild(&mut fresh)
   let warmListed = List<CodegenUnit>.asSlice(&warmUnits)

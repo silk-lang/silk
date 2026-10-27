@@ -1,0 +1,1137 @@
+//! LLVM IR text for a module in record form, for `--emit llvm-ir` and the compiler's tests.
+//!
+//! # Details
+//! The text is what LLVM's own printer would write for the module, close enough that `llvm-as`
+//! reads it back to the same module: values keep the names the backend gave them, an unnamed
+//! local prints as `%u<index>` and an unnamed block as `bb<index>`, attributes print inline,
+//! and constants print canonically (signed decimals, `true` and `false`, hexadecimal floats,
+//! `null` and `zeroinitializer`, `splat` for a vector of one repeated lane).
+
+import backend.Bitcode
+import backend.Bitcode {Module}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.bytes {Bytes}
+import silk.list {List}
+import silk.ownership {Copy}
+import silk.slice {Slice}
+import silk.u64
+import silk.u8
+import silk.usize
+
+/// The module `fragments` merge into as LLVM IR text.
+pub effect fn printFragments(fragments: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut module = Module.make()
+  run Module.mergeAll(&mut module, fragments)
+  return run print(&module)
+}
+
+/// The module as LLVM IR text: its variables, then its functions, each in the order of its
+/// globals.
+pub effect fn print(module: &Module) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<u8>.make()
+  let count = module.globalCount()
+  // The body defining each function, or `usize.MAX`.
+  let mut bodies = List<usize>.make()
+  run List<usize>.reserve(&mut bodies, count)
+  let mut index = usize.ZERO
+  while index < count {
+    run List<usize>.append(&mut bodies, usize.MAX)
+    index = index + usize.ONE
+  }
+  index = usize.ZERO
+  while index < module.bodyCount() {
+    List<usize>.set(&mut bodies, module.bodyGlobal(index), index)
+    index = index + usize.ONE
+  }
+  index = usize.ZERO
+  while index < count {
+    if !module.isFunction(index) { run printVariable(&mut out, module, index) }
+    index = index + usize.ONE
+  }
+  index = usize.ZERO
+  while index < count {
+    if module.isFunction(index) { run printFunction(&mut out, module, index, List<usize>.get(&bodies, index)) }
+    index = index + usize.ONE
+  }
+  return run Bytes.copy(List<u8>.asSlice(&out))
+}
+
+effect fn text(out: &mut List<u8>, bytes: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run List<u8>.appendBytes(&mut out.*, bytes)
+}
+
+effect fn number(out: &mut List<u8>, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut digits: [u8; 20] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let mut at: usize = 20
+  let mut rest = value
+  while true {
+    at = at - usize.ONE
+    digits[at] = u64.toU8(48 + u64.remainder(rest, 10))
+    rest = u64.divide(rest, 10)
+    if rest == 0 { break }
+  }
+  return run text(&mut out.*, Slice.view<u8>(&digits, at, 20 - at))
+}
+
+effect fn signed(out: &mut List<u8>, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if u64.bitAnd(value, 9223372036854775808) == 0 { return run number(&mut out.*, value) }
+  run text(&mut out.*, b"-")
+  return run number(&mut out.*, u64.wrappingSubtract(0, value))
+}
+
+fn hexDigit(value: u64) -> u8 {
+  if value < 10 { return u64.toU8(48 + value) }
+  return u64.toU8(55 + value)
+}
+
+effect fn hex(out: &mut List<u8>, value: u64, digits: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut shift = digits * 4
+  while shift > 0 {
+    shift = shift - 4
+    run List<u8>.append(&mut out.*, hexDigit(u64.bitAnd(u64.shiftRight(value, shift), 15)))
+  }
+  return ()
+}
+
+// Whether `name` needs quotes: it is empty, starts with a digit, or holds a byte outside
+// `[-a-zA-Z$._0-9]`.
+fn needsQuotes(name: &[u8]) -> bool {
+  if name.length == usize.ZERO { return true }
+  if name[0] >= 48 && name[0] <= 57 { return true }
+  let mut at = usize.ZERO
+  while at < name.length {
+    let byte = name[at]
+    let plain = (byte >= 97 && byte <= 122) || (byte >= 65 && byte <= 90) || (byte >= 48 && byte <= 57) || byte == 45 || byte == 36
+      || byte == 46 || byte == 95
+    if !plain { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Writes `bytes` between quotes, escaping quotes, backslashes and nonprinting bytes as `\XX`.
+effect fn quoted(out: &mut List<u8>, bytes: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run text(&mut out.*, b"\"")
+  let mut at = usize.ZERO
+  while at < bytes.length {
+    let byte = bytes[at]
+    if byte >= 32 && byte <= 126 && byte != 34 && byte != 92 {
+      run List<u8>.append(&mut out.*, byte)
+    } else {
+      run text(&mut out.*, b"\\")
+      run hex(&mut out.*, u8.toU64(byte), 2)
+    }
+    at = at + usize.ONE
+  }
+  return run text(&mut out.*, b"\"")
+}
+
+effect fn globalText(out: &mut List<u8>, module: &Module, index: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  run text(&mut out.*, b"@")
+  let name = module.globalName(index)
+  if needsQuotes(name) { return run quoted(&mut out.*, name) }
+  return run text(&mut out.*, name)
+}
+
+// Writes the packed name `name`, or `fallback` and `index` when it is zero.
+effect fn nameText(out: &mut List<u8>, name: u64, fallback: &[u8], index: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if name == 0 {
+    run text(&mut out.*, fallback)
+    return run number(&mut out.*, usize.toU64(index))
+  }
+  run text(&mut out.*, Bitcode.prefixText(Bitcode.namePrefix(name)))
+  let first = Bitcode.nameFirst(name)
+  if first != 0 { run number(&mut out.*, first - 1) }
+  let second = Bitcode.nameSecond(name)
+  if second != 0 {
+    run text(&mut out.*, b".")
+    run number(&mut out.*, second - 1)
+  }
+  return ()
+}
+
+effect fn localText(out: &mut List<u8>, module: &Module, body: usize, index: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  run text(&mut out.*, b"%")
+  return run nameText(&mut out.*, module.localName(body, index), b"u", index)
+}
+
+effect fn blockText(out: &mut List<u8>, module: &Module, body: usize, position: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  run text(&mut out.*, b"label %")
+  return run nameText(&mut out.*, module.blockName(body, u64.toUsize(position)), b"bb", u64.toUsize(position))
+}
+
+/// Writes type `ty`.
+pub effect fn typeText(out: &mut List<u8>, module: &Module, ty: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let code = module.typeCode(ty)
+  if code == Bitcode.typeInteger() {
+    run text(&mut out.*, b"i")
+    return run number(&mut out.*, module.typeItem(ty, usize.ZERO))
+  }
+  if code == Bitcode.typePointer() { return run text(&mut out.*, b"ptr") }
+  if code == Bitcode.typeVoid() { return run text(&mut out.*, b"void") }
+  if code == Bitcode.typeFloat() { return run text(&mut out.*, b"float") }
+  if code == Bitcode.typeDouble() { return run text(&mut out.*, b"double") }
+  if code == Bitcode.typeLabel() { return run text(&mut out.*, b"label") }
+  if code == Bitcode.typeArray() || code == Bitcode.typeVector() {
+    if code == Bitcode.typeArray() { run text(&mut out.*, b"[") } else { run text(&mut out.*, b"<") }
+    run number(&mut out.*, module.typeItem(ty, usize.ZERO))
+    run text(&mut out.*, b" x ")
+    run typeText(&mut out.*, module, module.typeItem(ty, usize.ONE))
+    if code == Bitcode.typeArray() { return run text(&mut out.*, b"]") }
+    return run text(&mut out.*, b">")
+  }
+  if code == Bitcode.typeStruct() || code == Bitcode.typePackedStruct() {
+    let items = module.typeItems(ty)
+    if code == Bitcode.typePackedStruct() { run text(&mut out.*, b"<") }
+    if items == usize.ZERO {
+      run text(&mut out.*, b"{}")
+    } else {
+      run text(&mut out.*, b"{ ")
+      let mut at = usize.ZERO
+      while at < items {
+        if at != usize.ZERO { run text(&mut out.*, b", ") }
+        run typeText(&mut out.*, module, module.typeItem(ty, at))
+        at = at + usize.ONE
+      }
+      run text(&mut out.*, b" }")
+    }
+    if code == Bitcode.typePackedStruct() { run text(&mut out.*, b">") }
+    return ()
+  }
+  if code == Bitcode.typeFunction() || code == Bitcode.typeVariadicFunction() {
+    run typeText(&mut out.*, module, module.typeItem(ty, usize.ZERO))
+    run text(&mut out.*, b" (")
+    let items = module.typeItems(ty)
+    let mut at = usize.ONE
+    while at < items {
+      if at != usize.ONE { run text(&mut out.*, b", ") }
+      run typeText(&mut out.*, module, module.typeItem(ty, at))
+      at = at + usize.ONE
+    }
+    if code == Bitcode.typeVariadicFunction() {
+      if items > usize.ONE { run text(&mut out.*, b", ") }
+      run text(&mut out.*, b"...")
+    }
+    return run text(&mut out.*, b")")
+  }
+  run text(&mut out.*, b"type")
+  return run number(&mut out.*, code)
+}
+
+fn isFloating(module: &Module, ty: u64) -> bool {
+  let code = module.typeCode(ty)
+  if code == Bitcode.typeVector() { return isFloating(module, module.typeItem(ty, usize.ONE)) }
+  return code == Bitcode.typeFloat() || code == Bitcode.typeDouble()
+}
+
+/// Writes constant `reference`, without its type.
+pub effect fn constantText(out: &mut List<u8>, module: &Module, reference: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let code = module.constantCode(reference)
+  let ty = module.constantType(reference)
+  let typeCode = module.typeCode(ty)
+  let items = module.constantItems(reference)
+  if code == Bitcode.constantNull() {
+    if typeCode == Bitcode.typePointer() { return run text(&mut out.*, b"null") }
+    if typeCode == Bitcode.typeInteger() {
+      if module.typeItem(ty, usize.ZERO) == 1 { return run text(&mut out.*, b"false") }
+      return run text(&mut out.*, b"0")
+    }
+    if typeCode == Bitcode.typeFloat() || typeCode == Bitcode.typeDouble() { return run text(&mut out.*, b"0.0") }
+    return run text(&mut out.*, b"zeroinitializer")
+  }
+  if code == Bitcode.constantUndef() { return run text(&mut out.*, b"undef") }
+  if code == Bitcode.constantPoison() { return run text(&mut out.*, b"poison") }
+  if code == Bitcode.constantInteger() {
+    let value = Bitcode.signedValue(module.constantItem(reference, usize.ZERO))
+    if module.typeItem(ty, usize.ZERO) == 1 {
+      if value == 0 { return run text(&mut out.*, b"false") }
+      return run text(&mut out.*, b"true")
+    }
+    return run signed(&mut out.*, value)
+  }
+  if code == Bitcode.constantFloat() {
+    let mut bits = module.constantItem(reference, usize.ZERO)
+    if typeCode == Bitcode.typeFloat() { bits = Bitcode.doubleBits(bits) }
+    run text(&mut out.*, b"0x")
+    return run hex(&mut out.*, bits, 16)
+  }
+  if code == Bitcode.constantString() || code == Bitcode.constantCString() {
+    run text(&mut out.*, b"c\"")
+    let mut at = usize.ZERO
+    while at < items {
+      let byte = module.constantItem(reference, at)
+      if byte >= 32 && byte <= 126 && byte != 34 && byte != 92 {
+        run List<u8>.append(&mut out.*, u64.toU8(byte))
+      } else {
+        run text(&mut out.*, b"\\")
+        run hex(&mut out.*, byte, 2)
+      }
+      at = at + usize.ONE
+    }
+    if code == Bitcode.constantCString() { run text(&mut out.*, b"\\00") }
+    return run text(&mut out.*, b"\"")
+  }
+  if code == Bitcode.constantAggregate() {
+    if typeCode == Bitcode.typeVector() {
+      let first = module.constantItem(reference, usize.ZERO)
+      let mut uniform = true
+      let mut at = usize.ONE
+      while at < items {
+        if module.constantItem(reference, at) != first { uniform = false }
+        at = at + usize.ONE
+      }
+      if uniform {
+        run text(&mut out.*, b"splat (")
+        run typedConstant(&mut out.*, module, first)
+        return run text(&mut out.*, b")")
+      }
+      run text(&mut out.*, b"<")
+    } else if typeCode == Bitcode.typeArray() {
+      run text(&mut out.*, b"[")
+    } else {
+      run text(&mut out.*, b"{ ")
+    }
+    let mut at = usize.ZERO
+    while at < items {
+      if at != usize.ZERO { run text(&mut out.*, b", ") }
+      run typedConstant(&mut out.*, module, module.constantItem(reference, at))
+      at = at + usize.ONE
+    }
+    if typeCode == Bitcode.typeVector() { return run text(&mut out.*, b">") }
+    if typeCode == Bitcode.typeArray() { return run text(&mut out.*, b"]") }
+    return run text(&mut out.*, b" }")
+  }
+  if code == Bitcode.constantCast() {
+    run text(&mut out.*, castName(module.constantItem(reference, usize.ZERO)))
+    run text(&mut out.*, b" (")
+    run typedConstant(&mut out.*, module, module.constantItem(reference, 2))
+    run text(&mut out.*, b" to ")
+    run typeText(&mut out.*, module, ty)
+    return run text(&mut out.*, b")")
+  }
+  if code == Bitcode.constantBinary() {
+    let left = module.constantItem(reference, usize.ONE)
+    run text(&mut out.*, binaryName(module.constantItem(reference, usize.ZERO), isFloating(module, module.constantType(left))))
+    run text(&mut out.*, b" (")
+    run typedConstant(&mut out.*, module, left)
+    run text(&mut out.*, b", ")
+    run typedConstant(&mut out.*, module, module.constantItem(reference, 2))
+    return run text(&mut out.*, b")")
+  }
+  if code == Bitcode.constantGep() || code == Bitcode.constantInboundsGep() {
+    run text(&mut out.*, b"getelementptr ")
+    if code == Bitcode.constantInboundsGep() { run text(&mut out.*, b"inbounds ") }
+    run text(&mut out.*, b"(")
+    run typeText(&mut out.*, module, module.constantItem(reference, usize.ZERO))
+    let mut at = usize.ONE
+    while at < items {
+      run text(&mut out.*, b", ")
+      run typedConstant(&mut out.*, module, module.constantItem(reference, at + usize.ONE))
+      at = at + 2
+    }
+    return run text(&mut out.*, b")")
+  }
+  if code == Bitcode.constantInlineAssembly() {
+    run text(&mut out.*, b"asm ")
+    let flags = module.constantItem(reference, usize.ONE)
+    if u64.bitAnd(flags, 1) != 0 { run text(&mut out.*, b"sideeffect ") }
+    if u64.bitAnd(flags, 2) != 0 { run text(&mut out.*, b"alignstack ") }
+    if u64.bitAnd(flags, 4) != 0 { run text(&mut out.*, b"inteldialect ") }
+    if u64.bitAnd(flags, 8) != 0 { run text(&mut out.*, b"unwind ") }
+    let length = u64.toUsize(module.constantItem(reference, 2))
+    run constantBytes(&mut out.*, module, reference, 3, length)
+    run text(&mut out.*, b", ")
+    let constraints = u64.toUsize(module.constantItem(reference, 3 + length))
+    return run constantBytes(&mut out.*, module, reference, 4 + length, constraints)
+  }
+  run text(&mut out.*, b"constant")
+  return run number(&mut out.*, code)
+}
+
+effect fn constantBytes(out: &mut List<u8>, module: &Module, reference: u64, start: usize, length: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut bytes = List<u8>.make()
+  let mut at = usize.ZERO
+  while at < length {
+    run List<u8>.append(&mut bytes, u64.toU8(module.constantItem(reference, start + at)))
+    at = at + usize.ONE
+  }
+  return run quoted(&mut out.*, List<u8>.asSlice(&bytes))
+}
+
+effect fn typedConstant(out: &mut List<u8>, module: &Module, reference: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if Bitcode.isGlobal(reference) {
+    run text(&mut out.*, b"ptr ")
+    return run globalText(&mut out.*, module, Bitcode.referenceIndex(reference))
+  }
+  run typeText(&mut out.*, module, module.constantType(reference))
+  run text(&mut out.*, b" ")
+  return run constantText(&mut out.*, module, reference)
+}
+
+effect fn valueText(out: &mut List<u8>, module: &Module, body: usize, reference: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if Bitcode.isLocal(reference) { return run localText(&mut out.*, module, body, Bitcode.referenceIndex(reference)) }
+  if Bitcode.isGlobal(reference) { return run globalText(&mut out.*, module, Bitcode.referenceIndex(reference)) }
+  return run constantText(&mut out.*, module, reference)
+}
+
+effect fn typedValue(out: &mut List<u8>, module: &Module, body: usize, reference: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  run typeText(&mut out.*, module, module.typeIn(body, reference))
+  run text(&mut out.*, b" ")
+  return run valueText(&mut out.*, module, body, reference)
+}
+
+fn binaryName(op: u64, floating: bool) -> &'static [u8] {
+  if floating {
+    return match op {
+      0 => b"fadd"
+      1 => b"fsub"
+      2 => b"fmul"
+      4 => b"fdiv"
+      6 => b"frem"
+      _ => b"fop"
+    }
+  }
+  return match op {
+    0 => b"add"
+    1 => b"sub"
+    2 => b"mul"
+    3 => b"udiv"
+    4 => b"sdiv"
+    5 => b"urem"
+    6 => b"srem"
+    7 => b"shl"
+    8 => b"lshr"
+    9 => b"ashr"
+    10 => b"and"
+    11 => b"or"
+    12 => b"xor"
+    _ => b"op"
+  }
+}
+
+fn castName(op: u64) -> &'static [u8] {
+  return match op {
+    0 => b"trunc"
+    1 => b"zext"
+    2 => b"sext"
+    3 => b"fptoui"
+    4 => b"fptosi"
+    5 => b"uitofp"
+    6 => b"sitofp"
+    7 => b"fptrunc"
+    8 => b"fpext"
+    9 => b"ptrtoint"
+    10 => b"inttoptr"
+    11 => b"bitcast"
+    _ => b"cast"
+  }
+}
+
+fn predicateName(predicate: u64) -> &'static [u8] {
+  return match predicate {
+    0 => b"false"
+    1 => b"oeq"
+    2 => b"ogt"
+    3 => b"oge"
+    4 => b"olt"
+    5 => b"ole"
+    6 => b"one"
+    7 => b"ord"
+    8 => b"uno"
+    9 => b"ueq"
+    10 => b"ugt"
+    11 => b"uge"
+    12 => b"ult"
+    13 => b"ule"
+    14 => b"une"
+    15 => b"true"
+    32 => b"eq"
+    33 => b"ne"
+    34 => b"ugt"
+    35 => b"uge"
+    36 => b"ult"
+    37 => b"ule"
+    38 => b"sgt"
+    39 => b"sge"
+    40 => b"slt"
+    41 => b"sle"
+    _ => b"predicate"
+  }
+}
+
+fn orderingName(ordering: u64) -> &'static [u8] {
+  return match ordering {
+    1 => b"unordered"
+    2 => b"monotonic"
+    3 => b"acquire"
+    4 => b"release"
+    5 => b"acq_rel"
+    6 => b"seq_cst"
+    _ => b"notatomic"
+  }
+}
+
+fn rmwName(op: u64) -> &'static [u8] {
+  return match op {
+    0 => b"xchg"
+    1 => b"add"
+    2 => b"sub"
+    3 => b"and"
+    4 => b"nand"
+    5 => b"or"
+    6 => b"xor"
+    7 => b"max"
+    8 => b"min"
+    9 => b"umax"
+    10 => b"umin"
+    _ => b"rmw"
+  }
+}
+
+fn linkageName(linkage: u64) -> &'static [u8] {
+  return match linkage {
+    2 => b"appending "
+    3 => b"internal "
+    9 => b"private "
+    _ => b""
+  }
+}
+
+fn attributeName(kind: u64) -> &'static [u8] {
+  return match kind {
+    2 => b"alwaysinline"
+    4 => b"inlinehint"
+    5 => b"inreg"
+    6 => b"minsize"
+    7 => b"naked"
+    8 => b"nest"
+    9 => b"noalias"
+    10 => b"nobuiltin"
+    12 => b"noduplicate"
+    13 => b"noimplicitfloat"
+    14 => b"noinline"
+    15 => b"nonlazybind"
+    16 => b"noredzone"
+    17 => b"noreturn"
+    18 => b"nounwind"
+    19 => b"optsize"
+    22 => b"returned"
+    23 => b"returns_twice"
+    24 => b"signext"
+    26 => b"ssp"
+    27 => b"sspreq"
+    28 => b"sspstrong"
+    33 => b"uwtable"
+    34 => b"zeroext"
+    35 => b"builtin"
+    36 => b"cold"
+    37 => b"optnone"
+    39 => b"nonnull"
+    40 => b"jumptable"
+    _ => b""
+  }
+}
+
+// Writes the accesses of a `memory` attribute: two bits per location (argument memory,
+// inaccessible memory, errno, other memory, then the two target memories), read in bit 0 and
+// write in bit 1, above a marker bit.
+effect fn memoryText(out: &mut List<u8>, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let bits = u64.bitAnd(value, 4095)
+  let other = u64.bitAnd(u64.shiftRight(bits, 6), 3)
+  let mut touched: u64 = 0
+  let mut each: u64 = 0
+  while each < 6 {
+    touched = u64.bitOr(touched, u64.bitAnd(u64.shiftRight(bits, each * 2), 3))
+    each = each + 1
+  }
+  run text(&mut out.*, b"memory(")
+  // Like LLVM, the default access is left out when only some named locations are touched.
+  let mut first = true
+  if other != 0 || touched == other {
+    run text(&mut out.*, accessName(other))
+    first = false
+  }
+  let mut location: u64 = 0
+  while location < 6 {
+    let access = u64.bitAnd(u64.shiftRight(bits, location * 2), 3)
+    if location != 3 && access != other {
+      if !first { run text(&mut out.*, b", ") }
+      first = false
+      run text(&mut out.*, locationName(location))
+      run text(&mut out.*, b": ")
+      run text(&mut out.*, accessName(access))
+    }
+    location = location + 1
+  }
+  return run text(&mut out.*, b")")
+}
+
+fn accessName(access: u64) -> &'static [u8] {
+  return match access {
+    0 => b"none"
+    1 => b"read"
+    2 => b"write"
+    _ => b"readwrite"
+  }
+}
+
+fn locationName(location: u64) -> &'static [u8] {
+  return match location {
+    0 => b"argmem"
+    1 => b"inaccessiblemem"
+    2 => b"errnomem"
+    4 => b"target_mem0"
+    _ => b"target_mem1"
+  }
+}
+
+// Writes the attributes of `encoding`, each after a space.
+effect fn attributeText(out: &mut List<u8>, module: &Module, encoding: &[u64]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < encoding.length {
+    let kind = encoding[at]
+    if kind == 0 || kind == 5 {
+      let name = attributeName(encoding[at + usize.ONE])
+      if name.length > usize.ZERO {
+        run text(&mut out.*, b" ")
+        run text(&mut out.*, name)
+      }
+      at = at + 2
+    } else if kind == 1 {
+      let attribute = encoding[at + usize.ONE]
+      let value = encoding[at + 2]
+      if attribute == Bitcode.attrAlign() {
+        run text(&mut out.*, b" align ")
+        run number(&mut out.*, value)
+      } else if attribute == Bitcode.attrAlignStack() {
+        run text(&mut out.*, b" alignstack(")
+        run number(&mut out.*, value)
+        run text(&mut out.*, b")")
+      } else if attribute == Bitcode.attrMemory() {
+        run text(&mut out.*, b" ")
+        run memoryText(&mut out.*, value)
+      }
+      at = at + 3
+    } else if kind == 6 {
+      let attribute = encoding[at + usize.ONE]
+      run text(&mut out.*, b" ")
+      if attribute == Bitcode.attrByVal() { run text(&mut out.*, b"byval(") } else { run text(&mut out.*, b"sret(") }
+      run typeText(&mut out.*, module, encoding[at + 2])
+      run text(&mut out.*, b")")
+      at = at + 3
+    } else {
+      // A string attribute, with a value for kind 4.
+      run text(&mut out.*, b" ")
+      let mut bytes = List<u8>.make()
+      at = at + usize.ONE
+      while encoding[at] != 0 {
+        run List<u8>.append(&mut bytes, u64.toU8(encoding[at]))
+        at = at + usize.ONE
+      }
+      at = at + usize.ONE
+      run quoted(&mut out.*, List<u8>.asSlice(&bytes))
+      if kind == 4 {
+        List<u8>.clear(&mut bytes)
+        while encoding[at] != 0 {
+          run List<u8>.append(&mut bytes, u64.toU8(encoding[at]))
+          at = at + usize.ONE
+        }
+        at = at + usize.ONE
+        run text(&mut out.*, b"=")
+        run quoted(&mut out.*, List<u8>.asSlice(&bytes))
+      }
+    }
+  }
+  return ()
+}
+
+// Writes the attributes list operand `list` holds at `position`, each after a space.
+effect fn attributesAt(out: &mut List<u8>, module: &Module, list: u64, position: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if list == 0 { return () }
+  let groups = module.listGroups(list)
+  let mut at = usize.ZERO
+  while at < groups.length {
+    if module.groupPosition(groups[at]) == position { run attributeText(&mut out.*, module, module.groupEncoding(groups[at])) }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn printVariable(out: &mut List<u8>, module: &Module, index: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  run globalText(&mut out.*, module, index)
+  run text(&mut out.*, b" = ")
+  if !module.isDefined(index) {
+    run text(&mut out.*, b"external ")
+  } else {
+    run text(&mut out.*, linkageName(module.globalLinkage(index)))
+  }
+  if module.globalDsoLocal(index) { run text(&mut out.*, b"dso_local ") }
+  if module.globalThreadLocal(index) != 0 { run text(&mut out.*, b"thread_local ") }
+  if module.globalUnnamed(index) == 1 { run text(&mut out.*, b"unnamed_addr ") }
+  if module.globalUnnamed(index) == 2 { run text(&mut out.*, b"local_unnamed_addr ") }
+  if module.globalConstant(index) { run text(&mut out.*, b"constant ") } else { run text(&mut out.*, b"global ") }
+  run typeText(&mut out.*, module, module.globalType(index))
+  let initializer = module.globalInitializer(index)
+  if module.isDefined(index) && initializer != u64.MAX {
+    run text(&mut out.*, b" ")
+    run valueText(&mut out.*, module, usize.MAX, initializer)
+  }
+  if module.globalSection(index) != 0 {
+    run text(&mut out.*, b", section ")
+    run quoted(&mut out.*, module.sectionName(module.globalSection(index)))
+  }
+  if module.globalAlignment(index) != 0 {
+    run text(&mut out.*, b", align ")
+    run number(&mut out.*, u64.shiftLeft(1, module.globalAlignment(index) - 1))
+  }
+  return run text(&mut out.*, b"\n")
+}
+
+effect fn printFunction(out: &mut List<u8>, module: &Module, index: usize, body: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let ty = module.globalType(index)
+  let attributes = module.globalAttributes(index)
+  if body == usize.MAX {
+    run text(&mut out.*, b"declare ")
+  } else {
+    run text(&mut out.*, b"define ")
+    run text(&mut out.*, linkageName(module.globalLinkage(index)))
+  }
+  if module.globalDsoLocal(index) { run text(&mut out.*, b"dso_local ") }
+  if module.globalConvention(index) != 0 {
+    run text(&mut out.*, b"cc ")
+    run number(&mut out.*, module.globalConvention(index))
+    run text(&mut out.*, b" ")
+  }
+  run attributesAfter(&mut out.*, module, attributes, Bitcode.positionResult())
+  run typeText(&mut out.*, module, module.typeItem(ty, usize.ZERO))
+  run text(&mut out.*, b" ")
+  run globalText(&mut out.*, module, index)
+  run text(&mut out.*, b"(")
+  let parameters = module.typeItems(ty) - usize.ONE
+  let mut at = usize.ZERO
+  while at < parameters {
+    if at != usize.ZERO { run text(&mut out.*, b", ") }
+    run typeText(&mut out.*, module, module.typeItem(ty, at + usize.ONE))
+    run attributesAt(&mut out.*, module, attributes, usize.toU64(at) + 1)
+    if body != usize.MAX {
+      run text(&mut out.*, b" ")
+      run localText(&mut out.*, module, body, at)
+    }
+    at = at + usize.ONE
+  }
+  if module.typeCode(ty) == Bitcode.typeVariadicFunction() {
+    if parameters > usize.ZERO { run text(&mut out.*, b", ") }
+    run text(&mut out.*, b"...")
+  }
+  run text(&mut out.*, b")")
+  if module.globalUnnamed(index) == 1 { run text(&mut out.*, b" unnamed_addr") }
+  if module.globalUnnamed(index) == 2 { run text(&mut out.*, b" local_unnamed_addr") }
+  run attributesAt(&mut out.*, module, attributes, Bitcode.positionFunction())
+  if module.globalSection(index) != 0 {
+    run text(&mut out.*, b" section ")
+    run quoted(&mut out.*, module.sectionName(module.globalSection(index)))
+  }
+  if module.globalAlignment(index) != 0 {
+    run text(&mut out.*, b" align ")
+    run number(&mut out.*, u64.shiftLeft(1, module.globalAlignment(index) - 1))
+  }
+  if body == usize.MAX { return run text(&mut out.*, b"\n") }
+  let personality = module.globalInitializer(index)
+  if personality != u64.MAX {
+    run text(&mut out.*, b" personality ")
+    run typedConstant(&mut out.*, module, personality)
+  }
+  run text(&mut out.*, b" {\n")
+  run printBody(&mut out.*, module, body)
+  return run text(&mut out.*, b"}\n")
+}
+
+// Writes the attributes list operand `list` holds at `position`, each followed by a space.
+effect fn attributesAfter(out: &mut List<u8>, module: &Module, list: u64, position: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let start = List<u8>.length(&out.*)
+  run attributesAt(&mut out.*, module, list, position)
+  if List<u8>.length(&out.*) == start { return () }
+  // Move the leading space to the end.
+  let bytes = List<u8>.asMutSlice(&mut out.*)
+  let mut at = start
+  while at + usize.ONE < bytes.length {
+    bytes[at] = bytes[at + usize.ONE]
+    at = at + usize.ONE
+  }
+  bytes[bytes.length - usize.ONE] = 32
+  return ()
+}
+
+// A body's record being printed: its words and where its operands are.
+struct Record {
+  start: usize,
+  end: usize,
+}
+
+impl Copy for Record {}
+
+fn operand(words: &[u64], record: Record, item: usize) -> u64 { return Bitcode.wordPayload(words[record.start + item]) }
+
+fn operandCount(record: Record) -> usize { return record.end - record.start }
+
+effect fn printBody(out: &mut List<u8>, module: &Module, body: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let words = module.bodyWords(body)
+  let mut next = module.bodyArguments(body)
+  let mut block: u64 = 0
+  let mut startBlock = true
+  let mut cursor = usize.ZERO
+  while cursor < words.length {
+    let header = words[cursor]
+    let mut end = cursor + usize.ONE
+    while end < words.length && Bitcode.wordTag(words[end]) != 5 { end = end + usize.ONE }
+    let record = Record {start: cursor + usize.ONE, end: end}
+    if startBlock {
+      run nameText(&mut out.*, module.blockName(body, u64.toUsize(block)), b"bb", u64.toUsize(block))
+      run text(&mut out.*, b":\n")
+      startBlock = false
+    }
+    if Bitcode.headerDefinesValue(header) {
+      run localText(&mut out.*, module, body, next)
+      run text(&mut out.*, b" = ")
+    }
+    let code = Bitcode.headerCode(header)
+    run printInstruction(&mut out.*, module, body, words, code, record, next)
+    run text(&mut out.*, b"\n")
+    if Bitcode.headerDefinesValue(header) { next = next + usize.ONE }
+    if code == Bitcode.instructionReturn() || code == Bitcode.instructionBranch() || code == Bitcode.instructionSwitch()
+      || code == Bitcode.instructionInvoke() || code == Bitcode.instructionUnreachable() || code == Bitcode.instructionResume() {
+      block = block + 1
+      startBlock = true
+    }
+    cursor = end
+  }
+  return ()
+}
+
+effect fn alignText(out: &mut List<u8>, code: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if code == 0 { return () }
+  run text(&mut out.*, b", align ")
+  return run number(&mut out.*, u64.shiftLeft(1, code - 1))
+}
+
+effect fn mathFlags(out: &mut List<u8>, flags: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if u64.bitAnd(flags, 2) != 0 { run text(&mut out.*, b"nnan ") }
+  if u64.bitAnd(flags, 4) != 0 { run text(&mut out.*, b"ninf ") }
+  if u64.bitAnd(flags, 8) != 0 { run text(&mut out.*, b"nsz ") }
+  if u64.bitAnd(flags, 16) != 0 { run text(&mut out.*, b"arcp ") }
+  if u64.bitAnd(flags, 32) != 0 { run text(&mut out.*, b"contract ") }
+  if u64.bitAnd(flags, 64) != 0 { run text(&mut out.*, b"afn ") }
+  if u64.bitAnd(flags, 128) != 0 { run text(&mut out.*, b"reassoc ") }
+  return ()
+}
+
+effect fn printInstruction(out: &mut List<u8>, module: &Module, body: usize, words: &[u64], code: u64, record: Record, next: usize) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let count = operandCount(record)
+  if code == Bitcode.instructionLoad() || code == Bitcode.instructionLoadAtomic() {
+    run text(&mut out.*, b"load ")
+    if code == Bitcode.instructionLoadAtomic() { run text(&mut out.*, b"atomic ") }
+    if operand(words, record, 3) != 0 { run text(&mut out.*, b"volatile ") }
+    run typeText(&mut out.*, module, operand(words, record, usize.ONE))
+    run text(&mut out.*, b", ")
+    run typedValue(&mut out.*, module, body, operand(words, record, usize.ZERO))
+    if code == Bitcode.instructionLoadAtomic() {
+      run text(&mut out.*, b" ")
+      run text(&mut out.*, orderingName(operand(words, record, 4)))
+    }
+    return run alignText(&mut out.*, operand(words, record, 2))
+  }
+  if code == Bitcode.instructionStore() || code == Bitcode.instructionStoreAtomic() {
+    run text(&mut out.*, b"store ")
+    if code == Bitcode.instructionStoreAtomic() { run text(&mut out.*, b"atomic ") }
+    if operand(words, record, 3) != 0 { run text(&mut out.*, b"volatile ") }
+    run typedValue(&mut out.*, module, body, operand(words, record, usize.ONE))
+    run text(&mut out.*, b", ")
+    run typedValue(&mut out.*, module, body, operand(words, record, usize.ZERO))
+    if code == Bitcode.instructionStoreAtomic() {
+      run text(&mut out.*, b" ")
+      run text(&mut out.*, orderingName(operand(words, record, 4)))
+    }
+    return run alignText(&mut out.*, operand(words, record, 2))
+  }
+  if code == Bitcode.instructionAlloca() {
+    run text(&mut out.*, b"alloca ")
+    run typeText(&mut out.*, module, operand(words, record, usize.ZERO))
+    // Like LLVM, a count other than the constant one is printed; one is encoded as `2` (signed).
+    let counted = operand(words, record, 2)
+    if !(Bitcode.isConstant(counted) && module.constantCode(counted) == Bitcode.constantInteger()
+      && module.constantItem(counted, usize.ZERO) == 2) {
+      run text(&mut out.*, b", ")
+      run typedValue(&mut out.*, module, body, counted)
+    }
+    let packed = operand(words, record, 3)
+    return run alignText(&mut out.*, u64.bitOr(u64.bitAnd(packed, 31), u64.shiftLeft(u64.shiftRight(packed, 8), 5)))
+  }
+  if code == Bitcode.instructionGep() {
+    run text(&mut out.*, b"getelementptr ")
+    let flags = operand(words, record, usize.ZERO)
+    if u64.bitAnd(flags, 1) != 0 { run text(&mut out.*, b"inbounds ") }
+    if u64.bitAnd(flags, 2) != 0 && u64.bitAnd(flags, 1) == 0 { run text(&mut out.*, b"nusw ") }
+    if u64.bitAnd(flags, 4) != 0 { run text(&mut out.*, b"nuw ") }
+    run typeText(&mut out.*, module, operand(words, record, usize.ONE))
+    let mut at: usize = 2
+    while at < count {
+      run text(&mut out.*, b", ")
+      run typedValue(&mut out.*, module, body, operand(words, record, at))
+      at = at + usize.ONE
+    }
+    return ()
+  }
+  if code == Bitcode.instructionBinary() {
+    let left = operand(words, record, usize.ZERO)
+    let ty = module.typeIn(body, left)
+    let op = operand(words, record, 2)
+    let floating = isFloating(module, ty)
+    run text(&mut out.*, binaryName(op, floating))
+    run text(&mut out.*, b" ")
+    if count > 3 {
+      let flags = operand(words, record, 3)
+      if floating {
+        run mathFlags(&mut out.*, flags)
+      } else if op == Bitcode.opAdd() || op == Bitcode.opSub() || op == Bitcode.opMul() || op == Bitcode.opShl() {
+        if u64.bitAnd(flags, 1) != 0 { run text(&mut out.*, b"nuw ") }
+        if u64.bitAnd(flags, 2) != 0 { run text(&mut out.*, b"nsw ") }
+      } else if op == Bitcode.opOr() {
+        run text(&mut out.*, b"disjoint ")
+      } else {
+        run text(&mut out.*, b"exact ")
+      }
+    }
+    run typedValue(&mut out.*, module, body, left)
+    run text(&mut out.*, b", ")
+    return run valueText(&mut out.*, module, body, operand(words, record, usize.ONE))
+  }
+  if code == Bitcode.instructionCast() {
+    run text(&mut out.*, castName(operand(words, record, 2)))
+    run text(&mut out.*, b" ")
+    run typedValue(&mut out.*, module, body, operand(words, record, usize.ZERO))
+    run text(&mut out.*, b" to ")
+    return run typeText(&mut out.*, module, operand(words, record, usize.ONE))
+  }
+  if code == Bitcode.instructionCompare() {
+    let left = operand(words, record, usize.ZERO)
+    let predicate = operand(words, record, 2)
+    if predicate < 32 { run text(&mut out.*, b"fcmp ") } else { run text(&mut out.*, b"icmp ") }
+    if count > 3 { run mathFlags(&mut out.*, operand(words, record, 3)) }
+    run text(&mut out.*, predicateName(predicate))
+    run text(&mut out.*, b" ")
+    run typedValue(&mut out.*, module, body, left)
+    run text(&mut out.*, b", ")
+    return run valueText(&mut out.*, module, body, operand(words, record, usize.ONE))
+  }
+  if code == Bitcode.instructionSelect() {
+    run text(&mut out.*, b"select ")
+    run typedValue(&mut out.*, module, body, operand(words, record, 2))
+    run text(&mut out.*, b", ")
+    let chosen = operand(words, record, usize.ZERO)
+    run typedValue(&mut out.*, module, body, chosen)
+    run text(&mut out.*, b", ")
+    run typeText(&mut out.*, module, module.typeIn(body, chosen))
+    run text(&mut out.*, b" ")
+    return run valueText(&mut out.*, module, body, operand(words, record, usize.ONE))
+  }
+  if code == Bitcode.instructionPhi() {
+    run text(&mut out.*, b"phi ")
+    run typeText(&mut out.*, module, operand(words, record, usize.ZERO))
+    let mut at = usize.ONE
+    while at + usize.ONE < count {
+      if at != usize.ONE { run text(&mut out.*, b",") }
+      run text(&mut out.*, b" [ ")
+      run valueText(&mut out.*, module, body, operand(words, record, at))
+      run text(&mut out.*, b", %")
+      let position = operand(words, record, at + usize.ONE)
+      run nameText(&mut out.*, module.blockName(body, u64.toUsize(position)), b"bb", u64.toUsize(position))
+      run text(&mut out.*, b" ]")
+      at = at + 2
+    }
+    return ()
+  }
+  if code == Bitcode.instructionExtractValue() || code == Bitcode.instructionInsertValue() {
+    let mut at = usize.ONE
+    if code == Bitcode.instructionExtractValue() {
+      run text(&mut out.*, b"extractvalue ")
+      run typedValue(&mut out.*, module, body, operand(words, record, usize.ZERO))
+    } else {
+      run text(&mut out.*, b"insertvalue ")
+      run typedValue(&mut out.*, module, body, operand(words, record, usize.ZERO))
+      run text(&mut out.*, b", ")
+      run typedValue(&mut out.*, module, body, operand(words, record, usize.ONE))
+      at = 2
+    }
+    while at < count {
+      run text(&mut out.*, b", ")
+      run number(&mut out.*, operand(words, record, at))
+      at = at + usize.ONE
+    }
+    return ()
+  }
+  if code == Bitcode.instructionExtractElement() {
+    run text(&mut out.*, b"extractelement ")
+    run typedValue(&mut out.*, module, body, operand(words, record, usize.ZERO))
+    run text(&mut out.*, b", ")
+    return run typedValue(&mut out.*, module, body, operand(words, record, usize.ONE))
+  }
+  if code == Bitcode.instructionInsertElement() {
+    run text(&mut out.*, b"insertelement ")
+    run typedValue(&mut out.*, module, body, operand(words, record, usize.ZERO))
+    run text(&mut out.*, b", ")
+    run typedValue(&mut out.*, module, body, operand(words, record, usize.ONE))
+    run text(&mut out.*, b", ")
+    return run typedValue(&mut out.*, module, body, operand(words, record, 2))
+  }
+  if code == Bitcode.instructionShuffleVector() {
+    run text(&mut out.*, b"shufflevector ")
+    run typedValue(&mut out.*, module, body, operand(words, record, usize.ZERO))
+    run text(&mut out.*, b", ")
+    run typedValue(&mut out.*, module, body, operand(words, record, usize.ONE))
+    run text(&mut out.*, b", ")
+    return run typedValue(&mut out.*, module, body, operand(words, record, 2))
+  }
+  if code == Bitcode.instructionUnary() {
+    run text(&mut out.*, b"fneg ")
+    if count > 2 { run mathFlags(&mut out.*, operand(words, record, 2)) }
+    return run typedValue(&mut out.*, module, body, operand(words, record, usize.ZERO))
+  }
+  if code == Bitcode.instructionFreeze() {
+    run text(&mut out.*, b"freeze ")
+    return run typedValue(&mut out.*, module, body, operand(words, record, usize.ZERO))
+  }
+  if code == Bitcode.instructionAtomicRmw() {
+    run text(&mut out.*, b"atomicrmw ")
+    if operand(words, record, 3) != 0 { run text(&mut out.*, b"volatile ") }
+    run text(&mut out.*, rmwName(operand(words, record, 2)))
+    run text(&mut out.*, b" ")
+    run typedValue(&mut out.*, module, body, operand(words, record, usize.ZERO))
+    run text(&mut out.*, b", ")
+    run typedValue(&mut out.*, module, body, operand(words, record, usize.ONE))
+    run text(&mut out.*, b" ")
+    run text(&mut out.*, orderingName(operand(words, record, 4)))
+    return run alignText(&mut out.*, operand(words, record, 6))
+  }
+  if code == Bitcode.instructionCompareExchange() {
+    run text(&mut out.*, b"cmpxchg ")
+    if operand(words, record, 7) != 0 { run text(&mut out.*, b"weak ") }
+    if operand(words, record, 3) != 0 { run text(&mut out.*, b"volatile ") }
+    run typedValue(&mut out.*, module, body, operand(words, record, usize.ZERO))
+    run text(&mut out.*, b", ")
+    let expected = operand(words, record, usize.ONE)
+    run typedValue(&mut out.*, module, body, expected)
+    run text(&mut out.*, b", ")
+    run typeText(&mut out.*, module, module.typeIn(body, expected))
+    run text(&mut out.*, b" ")
+    run valueText(&mut out.*, module, body, operand(words, record, 2))
+    run text(&mut out.*, b" ")
+    run text(&mut out.*, orderingName(operand(words, record, 4)))
+    run text(&mut out.*, b" ")
+    run text(&mut out.*, orderingName(operand(words, record, 6)))
+    return run alignText(&mut out.*, operand(words, record, 8))
+  }
+  if code == Bitcode.instructionFence() {
+    run text(&mut out.*, b"fence ")
+    return run text(&mut out.*, orderingName(operand(words, record, usize.ZERO)))
+  }
+  if code == Bitcode.instructionLandingPad() {
+    run text(&mut out.*, b"landingpad ")
+    run typeText(&mut out.*, module, operand(words, record, usize.ZERO))
+    return run text(&mut out.*, b" cleanup")
+  }
+  if code == Bitcode.instructionResume() {
+    run text(&mut out.*, b"resume ")
+    return run typedValue(&mut out.*, module, body, operand(words, record, usize.ZERO))
+  }
+  if code == Bitcode.instructionReturn() {
+    if count == usize.ZERO { return run text(&mut out.*, b"ret void") }
+    run text(&mut out.*, b"ret ")
+    return run typedValue(&mut out.*, module, body, operand(words, record, usize.ZERO))
+  }
+  if code == Bitcode.instructionBranch() {
+    run text(&mut out.*, b"br ")
+    if count == usize.ONE { return run blockText(&mut out.*, module, body, operand(words, record, usize.ZERO)) }
+    run typedValue(&mut out.*, module, body, operand(words, record, 2))
+    run text(&mut out.*, b", ")
+    run blockText(&mut out.*, module, body, operand(words, record, usize.ZERO))
+    run text(&mut out.*, b", ")
+    return run blockText(&mut out.*, module, body, operand(words, record, usize.ONE))
+  }
+  if code == Bitcode.instructionSwitch() {
+    run text(&mut out.*, b"switch ")
+    let ty = operand(words, record, usize.ZERO)
+    run typedValue(&mut out.*, module, body, operand(words, record, usize.ONE))
+    run text(&mut out.*, b", ")
+    run blockText(&mut out.*, module, body, operand(words, record, 2))
+    run text(&mut out.*, b" [")
+    let mut at: usize = 3
+    while at + usize.ONE < count {
+      run text(&mut out.*, b" ")
+      run typeText(&mut out.*, module, ty)
+      run text(&mut out.*, b" ")
+      run valueText(&mut out.*, module, body, operand(words, record, at))
+      run text(&mut out.*, b", ")
+      run blockText(&mut out.*, module, body, operand(words, record, at + usize.ONE))
+      at = at + 2
+    }
+    return run text(&mut out.*, b" ]")
+  }
+  if code == Bitcode.instructionUnreachable() { return run text(&mut out.*, b"unreachable") }
+  if code == Bitcode.instructionCall() || code == Bitcode.instructionInvoke() {
+    let invoke = code == Bitcode.instructionInvoke()
+    let attributes = operand(words, record, usize.ZERO)
+    let flags = operand(words, record, usize.ONE)
+    let mut at: usize = 2
+    if invoke {
+      run text(&mut out.*, b"invoke ")
+      at = 4
+    } else {
+      if u64.bitAnd(flags, 1) != 0 { run text(&mut out.*, b"tail ") }
+      run text(&mut out.*, b"call ")
+      if u64.bitAnd(flags, 131072) != 0 {
+        run mathFlags(&mut out.*, operand(words, record, 2))
+        at = 3
+      }
+    }
+    let functionType = operand(words, record, at)
+    let callee = operand(words, record, at + usize.ONE)
+    run attributesAfter(&mut out.*, module, attributes, Bitcode.positionResult())
+    if module.typeCode(functionType) == Bitcode.typeVariadicFunction() {
+      run typeText(&mut out.*, module, functionType)
+    } else {
+      run typeText(&mut out.*, module, module.typeItem(functionType, usize.ZERO))
+    }
+    run text(&mut out.*, b" ")
+    run valueText(&mut out.*, module, body, callee)
+    run text(&mut out.*, b"(")
+    let fixed = module.typeItems(functionType) - usize.ONE
+    let first = at + 2
+    let mut argument = first
+    while argument < count {
+      let index = argument - first
+      if index != usize.ZERO { run text(&mut out.*, b", ") }
+      let value = operand(words, record, argument)
+      if index < fixed {
+        run typeText(&mut out.*, module, module.typeItem(functionType, index + usize.ONE))
+      } else {
+        run typeText(&mut out.*, module, module.typeIn(body, value))
+      }
+      run attributesAt(&mut out.*, module, attributes, usize.toU64(index) + 1)
+      run text(&mut out.*, b" ")
+      run valueText(&mut out.*, module, body, value)
+      argument = argument + usize.ONE
+    }
+    run text(&mut out.*, b")")
+    run attributesAt(&mut out.*, module, attributes, Bitcode.positionFunction())
+    if invoke {
+      run text(&mut out.*, b" to ")
+      run blockText(&mut out.*, module, body, operand(words, record, 2))
+      run text(&mut out.*, b" unwind ")
+      run blockText(&mut out.*, module, body, operand(words, record, 3))
+    }
+    return ()
+  }
+  run text(&mut out.*, b"; record ")
+  return run number(&mut out.*, code)
+}
