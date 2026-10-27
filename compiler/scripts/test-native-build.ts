@@ -3366,6 +3366,32 @@ const program = Effect.gen(function* () {
   yield* splitRun(9)
   yield* replayed(helperSource(6), 10, /codegen\s+1 functions?\s/)
   yield* replayed(`fn other() -> i32 {\n  return 2\n}\n\npub fn value() -> i32 {\n  return other() + 1\n}\n`, 7, /codegen\s+3 functions\s/)
+  // A new format template reaches new instances of the effect combinators already on the walk's
+  // path, which the rewalk admits through their applications, so an edit to a logged message
+  // lowers the instances it changed rather than the whole program.
+  const logged = join(directory, 'logged')
+  yield* fs.makeDirectory(join(logged, 'src'), { recursive: true })
+  yield* fs.writeFileString(join(logged, 'silk.toml'), '[package]\nname = "logged"\nversion = "0.1.0"\n')
+  const loggedSource = (message: string) => 'import silk.effect { Effect }\nimport silk.logger { LogError }\n'
+    + 'import silk.os_logger { StdoutLogger }\n\npub effect fn main() -> () ! LogError {\n  let mut logger = StdoutLogger.make()\n'
+    + `  run Effect.log("${message}\\n", &()) |> Effect.provideMut(&mut logger)\n}\n`
+  const loggedExecutable = join(logged, `build/llvm/${hostTarget}/debug/logged`)
+  const loggedBuild = Effect.fnUntraced(function* (message: string) {
+    const built = yield* invoke(silk, ['build', '--stdlib', standardLibrary, '--timings'], logged, splitEnvironment)
+    assert.equal(built.status, 0, built.stderr)
+    const ran = yield* invoke(loggedExecutable, [], logged, splitEnvironment)
+    assert.equal(ran.stdout, `${message}\n`, ran.stderr)
+    return built.stdout + built.stderr
+  })
+  yield* fs.writeFileString(join(logged, 'src/main.silk'), loggedSource('Hello, world!'))
+  yield* loggedBuild('Hello, world!')
+  yield* fs.writeFileString(join(logged, 'src/main.silk'), loggedSource('Hello, edit!'))
+  const loweredLog = /^\s+codegen\s+([0-9,]+) functions/m.exec(yield* loggedBuild('Hello, edit!'))
+  assert.ok(loweredLog !== null && Number(loweredLog[1].replace(/,/g, '')) < 50, `a message edit lowered ${loweredLog?.[1]} functions`)
+  const warmLog = yield* fs.readFile(loggedExecutable)
+  yield* fs.remove(join(logged, 'build'), { recursive: true })
+  yield* loggedBuild('Hello, edit!')
+  assert.deepEqual(yield* fs.readFile(loggedExecutable), warmLog, 'a rewalked build links the executable a cold build links')
   // A whole-module link keeps a stamp too, so an unchanged release rebuild links nothing.
   const releaseBuild = Effect.fnUntraced(function* () {
     const built = yield* invoke(silk, ['build', '--release', '--stdlib', standardLibrary], split, splitEnvironment)
