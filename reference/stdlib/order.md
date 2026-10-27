@@ -6,7 +6,9 @@ The interface that gives user types the `<`, `<=`, `>`, and `>=` operators.
 
 ## When to use
 Implement [`Order`](#Order) when values of a type have a total order. Add a `T: Order` bound when a
-generic algorithm compares its type parameter, as sorting and binary search do.
+generic algorithm compares its type parameter, as sorting and binary search do. The integer
+types, `char`, `string`, `f32`, and `f64` already implement it, so `List<string>.sort` and
+`List<f64>.sort` work without more code.
 
 ## Details
 `&left < &right` means `Order.compare(&left, &right) == Ordering.Less` for the conformance of
@@ -20,9 +22,22 @@ The program evaluates each operand one time, in written order. Concrete scalar o
 use the built-in comparison. The compiler selects the conformance during specialization. It
 adds no service requirement and no runtime dispatch.
 
+`string` orders by its UTF-8 bytes, which is the order of the Unicode scalar values. It is
+case-sensitive and does not follow a locale, so `"Zebra"` comes before `"apple"`, and a prefix
+comes before every longer text.
+
+`f32` and `f64` use the IEEE 754 total order: negative NaNs, negative infinity, the negative
+numbers, `-0.0`, `+0.0`, the positive numbers, positive infinity, then positive NaNs.
+
 ## Gotchas
 A conformance must define a total order. The compiler does not check this rule. If the order is
 not total, sorting and binary search give incorrect results.
+
+On concrete floats, `<` and the other operators keep the built-in IEEE comparison, where
+`-0.0 < 0.0` is `false` and every comparison with NaN is `false`. Only generic code with a
+`T: Order` bound and a direct `Order.compare` call use the total order, so a sort puts `-0.0`
+before `0.0`. A NaN that arithmetic produces, such as `0.0 / 0.0`, can have its sign bit set
+and then sorts first.
 
 ## Examples
 ### Order a user type
@@ -98,10 +113,19 @@ A conformance `impl Order for T` gives the member
 `compare(left: &T, right: &T) -> Ordering`. The operators borrow both operands, so a comparison
 does not consume a value.
 
+The integer types, `char`, `string`, `f32`, and `f64` implement it. `string` compares its UTF-8
+bytes, so the order is case-sensitive and a prefix comes first. `f32` and `f64` use the IEEE 754
+total order: negative NaNs first, then negative infinity up to `-0.0`, then `+0.0` up to
+positive infinity, then positive NaNs. `compare` returns `Equal` for two floats only when their
+bits are the same.
+
 ### Gotchas
 
 A conformance must define a total order. For each two values, exactly one result is correct,
 and the results must agree with each other. The compiler does not check this rule.
+
+On concrete floats, `<` and the other operators keep the built-in IEEE comparison. Only generic
+code with a `T: Order` bound and a direct `Order.compare` call use the total order.
 
 
 Category: Core.

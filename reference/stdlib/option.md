@@ -111,9 +111,10 @@ Use `Option` as a return type when "no value" is a normal result and needs no re
 
 ### Details
 
-Create values with [`some`](#Option.impl.some) and [`none`](#Option.impl.none). Use [`map`](#Option.impl.map), [`flatMap`](#Option.impl.flatMap), and [`unwrapOr`](#Option.impl.unwrapOr) for the
-common cases. Use `match` when the two cases need different custom behavior. The option owns its
-value, so dropping a present option also drops the value.
+Create values with [`some`](#Option.impl.some) and [`none`](#Option.impl.none). Test them with [`isSome`](#Option.impl.isSome) and [`isNone`](#Option.impl.isNone). Use [`map`](#Option.impl.map),
+[`flatMap`](#Option.impl.flatMap), and [`unwrapOr`](#Option.impl.unwrapOr) for the common cases. Use `match` when the two cases need
+different custom behavior. The option owns its value, so dropping a present option also drops
+the value.
 
 In a requirement row, `&Option<&S>` is an optional service: the effect runs with or without a
 provider of `S`. Branch on it with [`withSome`](#withSome).
@@ -209,6 +210,76 @@ Returns a present `Option<T>` that owns `value`.
 
 This function moves `value` into the option. The caller can no longer use the original
 binding.
+
+<a id="Option.impl.isSome"></a>
+
+### Method `isSome`
+
+```silk
+pub fn isSome(self: &Self) -> bool
+```
+
+Returns `true` if `self` holds a value.
+
+#### When to use
+
+Use `isSome` when only the presence matters. Use `match` or [`unwrapOr`](#Option.impl.unwrapOr) to read the value.
+
+#### Details
+
+This function borrows `self`, so the option and its value stay available.
+
+#### Examples
+
+##### Test an option and keep it
+
+```silk
+import silk.option { Option }
+
+pub fn main() -> i32 {
+  let found = Option<i32>.some(3)
+  if !Option<i32>.isSome(&found) {
+    return 1
+  }
+  let value = move found |> Option<i32>.unwrapOr(0)
+  return value - 3
+}
+```
+
+<a id="Option.impl.isNone"></a>
+
+### Method `isNone`
+
+```silk
+pub fn isNone(self: &Self) -> bool
+```
+
+Returns `true` if `self` holds no value.
+
+#### When to use
+
+Use `isNone` when only the absence matters, such as to stop a search early. Use `match` or
+[`unwrapOr`](#Option.impl.unwrapOr) to read a present value.
+
+#### Details
+
+This function borrows `self`, so the option and its value stay available.
+
+#### Examples
+
+##### Test an absent option
+
+```silk
+import silk.option { Option }
+
+pub fn main() -> i32 {
+  let missing = Option<i32>.none()
+  if !Option<i32>.isNone(&missing) {
+    return 1
+  }
+  return 0
+}
+```
 
 <a id="Option.impl.map"></a>
 
