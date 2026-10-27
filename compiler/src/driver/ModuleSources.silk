@@ -14,7 +14,7 @@ import semantic.PackageGraph {PackageGraph}
 import semantic.Retention {Root as RetentionRoot}
 import semantic.SealedOperators
 import semantic.Semantic {Semantic}
-import semantic.SourceUnit {SourceUnit}
+import semantic.SourceUnit {Parsed, SourceUnit}
 import semantic.SourceIndex {Event, EventKind}
 import semantic.SourceRevision {Observation, Revision}
 import silk.allocator {Allocator, OutOfMemoryError}
@@ -34,6 +34,7 @@ import silk.toml_value {Toml, TomlChild, Value as TomlValue}
 import silk.usize
 import silk.writer {Writer}
 import silk.list {List}
+import silk.native_thread {JoinHandle, NativeThread, SpawnError}
 
 /// A manifest without a package name or root, a non-text package version, or an entry outside that
 /// root's module directory.
@@ -92,6 +93,26 @@ pub struct ModuleSources {
   // The modules the last load read and found to declare no foreign claim, for a store's
   // `offerClaimFree`.
   claimFree: List<ModuleId>,
+  // The digest of each module the last load read with summaries, for `parsedDigests`.
+  digests: List<LoadedDigest>,
+}
+
+struct LoadedDigest {
+  module: ModuleId,
+  digest: ContentHash,
+}
+
+// A file `preload` parses ahead on a thread of its own: the position of its module among those
+// the load read, and its bytes.
+struct ParseJob {
+  slot: usize,
+  bytes: Bytes,
+}
+
+// What a thread parsed for one `ParseJob`.
+struct ParsedFile {
+  slot: usize,
+  parsed: Parsed,
 }
 
 /// The existing filesystem provider selected for one canonical source request.
@@ -841,6 +862,7 @@ effect fn assemble(source: &Path, located: PackageRoot, standardLibrary: Option<
     attempted: move attempted,
     parsed: List<SourceUnit>.make(),
     summaries: Option<ImportSummaries>.none(),
+    digests: List<LoadedDigest>.make(),
     claimFree: List<ModuleId>.make(),
     listings: List<Listing>.make(),
   }
@@ -1396,20 +1418,40 @@ pub effect fn preload(self: &mut ModuleSources, roots: &[ModuleId]) -> ()
   // program's parse at most.
   List<SourceUnit>.clear(&mut self.parsed)
   List<ModuleId>.clear(&mut self.claimFree)
+  List<LoadedDigest>.clear(&mut self.digests)
+  // A file the last build's store parsed is parsed again ahead, on threads of their own, while
+  // this load reads and parses the rest (see `ImportSummaries.wasParsed`).
+  let mut ahead = List<ParseJob>.make()
+  let mut workers = List<JoinHandle<List<ParsedFile>>>.make()
+  let threads = NativeThread.processorCount() - usize.ONE
+  let number = Revision.revisionNumber(&self.revision)
   let mut scanned = List<ModuleId>.make()
   while List<ModuleId>.length(&pending) > usize.ZERO {
     let module = List<ModuleId>.remove(&mut pending, usize.ZERO)
     if listed(List<ModuleId>.asSlice(&scanned), &module) { continue }
     run List<ModuleId>.append(&mut scanned, ModuleId.copy(&module))
     let content = run publish(&mut self.*, &module, &sealedContent)
-    if let Option<Bytes>.Some {value: bytes} = move content {
+    if let Option<Bytes>.Some {value: read} = move content {
+      let mut bytes = move read
       // A file whose bytes a summary names writes the imports it wrote then, and the store parses
       // it when it first reads it.
       let mut digest = ContentHash {high: 0, low: 0}
       let mut found = Option<ImportSummary>.none()
+      let mut wanted = false
       if let Option<ImportSummaries>.Some {value: summaries} = &mut self.summaries {
         digest = ContentHash.of(Bytes.asSlice(&bytes))
         found = run Summaries.find(&mut summaries, digest)
+        wanted = Summaries.wasParsed(&summaries, digest)
+        run List<LoadedDigest>.append(&mut self.digests, LoadedDigest {module: ModuleId.copy(&module), digest: digest})
+      }
+      let hit = match &found { Option<ImportSummary>.Some {..} => true _ => false }
+      if hit && wanted {
+        let slot = List<ModuleId>.length(&scanned) - usize.ONE
+        run List<ParseJob>.append(&mut ahead, ParseJob {slot: slot, bytes: Intrinsic.replace(bytes, Bytes.make())})
+      }
+      // The jobs found so far parse while this file does.
+      if !hit && List<JoinHandle<List<ParsedFile>>>.length(&workers) < threads {
+        run parseAhead(&mut workers, Intrinsic.replace(ahead, List<ParseJob>.make()))
       }
       let summary = match move found {
         Option<ImportSummary>.Some {value} => move value
@@ -1432,7 +1474,132 @@ pub effect fn preload(self: &mut ModuleSources, roots: &[ModuleId]) -> ()
       }
     }
   }
+  // The rest is split between the threads left and this one.
+  let mut shares = List<List<ParseJob>>.make()
+  let mut share = usize.ZERO
+  let mut live = List<JoinHandle<List<ParsedFile>>>.length(&workers)
+  if live > threads { live = threads }
+  let free = threads - live
+  while share <= free {
+    run List<List<ParseJob>>.append(&mut shares, List<ParseJob>.make())
+    share = share + usize.ONE
+  }
+  let mut loads = List<usize>.make()
+  while List<usize>.length(&loads) < List<List<ParseJob>>.length(&shares) { run List<usize>.append(&mut loads, usize.ZERO) }
+  // Largest first, each to the lightest share.
+  while List<ParseJob>.length(&ahead) > usize.ZERO {
+    let jobs = List<ParseJob>.asSlice(&ahead)
+    let mut largest = usize.ZERO
+    let mut at = usize.ONE
+    while at < jobs.length {
+      if Bytes.length(&jobs[at].bytes) > Bytes.length(&jobs[largest].bytes) { largest = at }
+      at = at + usize.ONE
+    }
+    let job = List<ParseJob>.remove(&mut ahead, largest)
+    let weights = List<usize>.asSlice(&loads)
+    let mut lightest = usize.ZERO
+    at = usize.ONE
+    while at < weights.length {
+      if weights[at] < weights[lightest] { lightest = at }
+      at = at + usize.ONE
+    }
+    let load = List<usize>.get(&loads, lightest) + Bytes.length(&job.bytes)
+    List<usize>.set(&mut loads, lightest, load)
+    let mut writable = List<List<ParseJob>>.asMutSlice(&mut shares)
+    run List<ParseJob>.append(&mut writable[lightest], move job)
+  }
+  let own = List<List<ParseJob>>.remove(&mut shares, usize.ZERO)
+  while List<List<ParseJob>>.length(&shares) > usize.ZERO {
+    run parseAhead(&mut workers, List<List<ParseJob>>.remove(&mut shares, usize.ZERO))
+  }
+  let mut files = run parseEach(move own)
+  while List<JoinHandle<List<ParsedFile>>>.length(&workers) > usize.ZERO {
+    let handle = List<JoinHandle<List<ParsedFile>>>.remove(&mut workers, usize.ZERO)
+    let mut joined = handle.join()
+    while List<ParsedFile>.length(&joined) > usize.ZERO {
+      let last = List<ParsedFile>.length(&joined) - usize.ONE
+      run List<ParsedFile>.append(&mut files, List<ParsedFile>.remove(&mut joined, last))
+    }
+  }
+  // A store takes each unit by its module and bytes, so their order does not matter.
+  while List<ParsedFile>.length(&files) > usize.ZERO {
+    let last = List<ParsedFile>.length(&files) - usize.ONE
+    let ParsedFile {slot, parsed} = List<ParsedFile>.remove(&mut files, last)
+    let unit = run SourceUnit.assemble(&List<ModuleId>.asSlice(&scanned)[slot], number, move parsed)
+    run List<SourceUnit>.append(&mut self.parsed, move unit)
+  }
   return ()
+}
+
+// Starts parsing `jobs` on a thread of its own. When no thread starts, the store parses each file
+// when it first reads it.
+effect fn parseAhead(workers: &mut List<JoinHandle<List<ParsedFile>>>, jobs: List<ParseJob>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  if List<ParseJob>.length(&jobs) == usize.ZERO { return () }
+  match move run Effect.result(NativeThread.spawn(
+    fn() -> List<ParsedFile> {
+      return run parseDetached(move jobs)
+    }
+  )) {
+    Result<JoinHandle<List<ParsedFile>>, OutOfMemoryError | SpawnError>.Success {value} => {
+      run List<JoinHandle<List<ParsedFile>>>.append(&mut workers.*, move value)
+    }
+    Result<JoinHandle<List<ParsedFile>>, OutOfMemoryError | SpawnError>.Failure {error} => match move error {
+      SpawnError unstarted => { drop unstarted }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  return ()
+}
+
+// `parseEach` on a thread of its own, with an allocator of its own. A thread that runs out of
+// memory parses nothing, and the store parses each file when it first reads it.
+effect fn parseDetached(jobs: List<ParseJob>) -> List<ParsedFile> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let parsed = run Effect.result(parseEach(move jobs) |> Effect.provideMut<Allocator>(&mut allocator))
+  return match move parsed {
+    Result<List<ParsedFile>, OutOfMemoryError>.Success {value} => move value
+    Result<List<ParsedFile>, OutOfMemoryError>.Failure {error} => {
+      drop error
+      return List<ParsedFile>.make()
+    }
+  }
+}
+
+effect fn parseEach(jobs: List<ParseJob>) -> List<ParsedFile> ! OutOfMemoryError ? &mut Allocator {
+  let mut pending = move jobs
+  let mut files = List<ParsedFile>.make()
+  while List<ParseJob>.length(&pending) > usize.ZERO {
+    let last = List<ParseJob>.length(&pending) - usize.ONE
+    let ParseJob {slot, bytes} = List<ParseJob>.remove(&mut pending, last)
+    run List<ParsedFile>.append(&mut files, ParsedFile {slot: slot, parsed: run SourceUnit.parseSyntax(move bytes)})
+  }
+  return move files
+}
+
+/// The digests of the modules the last load read that a store reading `events` parsed, for
+/// `SemanticCache.saveParsed`.
+pub effect fn parsedDigests(self: &ModuleSources, events: &[Event]) -> List<ContentHash> ! OutOfMemoryError ? &mut Allocator {
+  let loaded = List<LoadedDigest>.asSlice(&self.digests)
+  let mut taken = List<bool>.make()
+  while List<bool>.length(&taken) < loaded.length { run List<bool>.append(&mut taken, false) }
+  let mut digests = List<ContentHash>.make()
+  let mut at = usize.ZERO
+  while at < events.length {
+    if events[at].kind == EventKind.SourceRead && events[at].present {
+      let mut index = usize.ZERO
+      while index < loaded.length {
+        if !List<bool>.get(&taken, index) && ModuleId.equals(&loaded[index].module, &events[at].module) {
+          List<bool>.set(&mut taken, index, true)
+          run List<ContentHash>.append(&mut digests, loaded[index].digest)
+          break
+        }
+        index = index + usize.ONE
+      }
+    }
+    at = at + usize.ONE
+  }
+  return move digests
 }
 
 // Appends both modules an import of `path` written in `importer` can name (MODULE-007): the module
