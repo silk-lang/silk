@@ -20,6 +20,9 @@ selection is independent of the host. Only an application edge can explicitly su
 when neither a request nor a selected project profile names a target.
 
 The WASI command targets use `libc = "none"`, static linking and relocation, and single threading.
+A Linux executable defaults to `relocation = "static"`: it loads at a fixed address and its code
+is not position independent. `relocation = "pic"` builds it as a PIE. macOS executables are always
+position independent, and objects and libraries default to `"pic"`.
 Preview 2 final executables are components; intermediate artifacts use the WebAssembly core ABI.
 See [WASI targets](wasi.md) for the command runtime and host-tool requirements.
 

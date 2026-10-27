@@ -2190,6 +2190,8 @@ const program = Effect.gen(function* () {
   assert.ok(recorded.includes(x86 ? '+avx2' : '+crc'), recorded.join(' '))
   assert.equal(recorded.includes('-mcmodel=large'), x86, recorded.join(' '))
   assert.equal(recorded.includes('-static'), process.platform !== 'darwin', recorded.join(' '))
+  // A Linux executable's default relocation is static, so it links without PIE.
+  assert.equal(recorded.includes('-no-pie'), process.platform === 'linux', recorded.join(' '))
   const tunedRun = yield* invoke(
     join(tuned, 'build/llvm', hostTarget, 'tuned/tuned'),
     [],
@@ -2205,6 +2207,37 @@ const program = Effect.gen(function* () {
     )
   }
   yield* fs.writeFileString(join(tuned, 'src/main.silk'), tunedMain)
+  if (process.platform === 'linux') {
+    // A dynamically linked Linux executable loads at a fixed address by default, and as a PIE when
+    // its profile sets `relocation = "pic"`.
+    const relocations = [
+      ['fixed', '', true],
+      ['movable', 'relocation = "pic"\n', false],
+    ] as const
+    for (const [name, field, fixed] of relocations) {
+      yield* fs.writeFileString(
+        join(tuned, 'silk.toml'),
+        `${tunedHeader}\n[profiles.${name}]\ntarget = "${hostTarget}"\n${field}`,
+      )
+      yield* fs.writeFileString(argumentLog, '')
+      const relocated = yield* invoke(
+        silk,
+        ['build', '--profile', name, '--stdlib', standardLibrary],
+        tuned,
+        { ...process.env, SILK_CLANG: recorder },
+      )
+      assert.equal(relocated.status, 0, relocated.stderr)
+      const relocatedArguments = (yield* fs.readFileString(argumentLog)).split('\n')
+      assert.equal(relocatedArguments.includes('-fno-pic'), fixed, relocatedArguments.join(' '))
+      assert.equal(relocatedArguments.includes('-no-pie'), fixed, relocatedArguments.join(' '))
+      assert.ok(!relocatedArguments.includes('-static'), relocatedArguments.join(' '))
+      const relocatedPath = join(tuned, 'build/llvm', hostTarget, `${name}/tuned`)
+      // ELF e_type 2 is an executable loaded at a fixed address; a PIE is 3.
+      assert.equal((yield* fs.readFile(relocatedPath))[16], fixed ? 2 : 3)
+      const relocatedRun = yield* invoke(relocatedPath, [], tuned)
+      assert.equal(relocatedRun.status, 0, relocatedRun.stderr)
+    }
+  }
   // Profile fields the native build cannot honor yet, a profile artifact other than the one
   // [package].kind requests, unknown manifest fields and reserved module names are refused
   // before anything is built, naming the manifest line.
