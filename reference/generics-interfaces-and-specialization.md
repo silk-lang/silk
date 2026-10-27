@@ -1290,6 +1290,46 @@ to select it. Arguments never select among supplying applications.
 **Evidence:** [bound receiver resolution](../bootstrap/packages/compiler/src/ExpressionAnalysis.ts),
 method-call specification.
 
+### INTF-008 — A `static fn` operation is answered by a static witness
+
+**Status:** Confirmed
+
+An interface operation may be declared `static fn`. Each conformance supplies it with a `static fn`
+of the same contract, and static evaluation calls it through the usual qualified selection, so
+generic static code can ask a question of its type argument:
+
+```silk
+interface Arg {
+  static fn takesValue() -> bool
+}
+
+struct Flag {}
+
+impl Arg for Flag {
+  static fn takesValue() -> bool { return false }
+}
+
+static fn takes<T: Arg>() -> bool {
+  return Arg.takesValue()
+}
+
+fn width<T: Arg>() -> i32 {
+  static if takes<T>() { return 40 } else { return 2 }
+}
+```
+
+A static root such as the `static if` condition assumes its declaration's bounds, so `takes<T>()`
+there is proved by `T: Arg` and evaluated once `T` is known.
+
+**Boundary:** A static operation has no runtime witness, so runtime code cannot call it, and a
+runtime operation cannot be called during static evaluation. Static and runtime witnesses do not
+substitute for each other in either direction, and each `static` parameter of the operation must
+be `static` in the witness at the same position.
+
+**Diagnostics:** A runtime call of a static operation reports `SEM0176` naming the operation. A
+witness whose phase or `static` parameters differ from the operation reports `SEM0083` at the
+witness.
+
 ## Conformance declarations and implementations
 
 ### IMPL-001 — `impl Interface<Arguments> for Provider` binds `Self` to the provider

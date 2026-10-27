@@ -8,7 +8,8 @@ each field.
 ## When to use
 Use [`Reflect`](#Reflect) to write one generic function that works on the fields of many types, such as a
 serializer or a formatter. Use [`Reflect.fields`](#Reflect.impl.fields) with `static for` to visit each field, and
-[`Reflect.borrowField`](#Reflect.impl.borrowField) to read the value of a field at runtime.
+[`Reflect.borrowField`](#Reflect.impl.borrowField) to read the value of a field at runtime, or [`Reflect.borrowFieldMut`](#Reflect.impl.borrowFieldMut)
+to change it.
 
 ## Details
 Descriptors exist only during static evaluation. They have no runtime value, so reflection adds
@@ -144,8 +145,8 @@ The owner type of the reflection operations. It has no fields and is never const
 
 ### Details
 
-Each operation except [`Reflect.borrowField`](#Reflect.impl.borrowField) is `static`. It runs only during static
-evaluation, such as in a `static for`, a `static if`, or a `static fn`.
+Each operation except [`Reflect.borrowField`](#Reflect.impl.borrowField) and [`Reflect.borrowFieldMut`](#Reflect.impl.borrowFieldMut) is `static`. It
+runs only during static evaluation, such as in a `static for`, a `static if`, or a `static fn`.
 
 <a id="Reflect.impl"></a>
 
@@ -261,6 +262,52 @@ runtime this function is a plain field access. The borrow lives as long as the b
 
 `field` must come from [`Reflect.fields`](#Reflect.impl.fields) for the same `Owner` type. This function cannot move
 a field out of an owned value.
+
+<a id="Reflect.impl.borrowFieldMut"></a>
+
+### Associated function `borrowFieldMut`
+
+```silk
+pub fn borrowFieldMut<Owner, Value>(owner: &mut Owner, static field: Intrinsic.Field<Owner, Value>) -> &mut Value
+```
+
+Returns a mutable borrow of the field of `owner` that `field` describes.
+
+#### Details
+
+`field` is a static argument, so the compiler selects the field during specialization. At
+runtime this function is a plain field access. The borrow lives as long as the mutable borrow
+of `owner`, and `owner` cannot be used while the field borrow is live.
+
+#### Examples
+
+```silk
+import silk.reflect { Reflect }
+
+struct Counters {
+  pub hits: i32,
+  pub misses: i32,
+}
+
+fn reset(counters: &mut Counters) -> () {
+  static for field in Reflect.fields<Counters>() {
+    let place = Reflect.borrowFieldMut<Counters, i32>(&mut counters.*, field)
+    place.* = 0
+  }
+  return ()
+}
+
+pub fn main() -> i32 {
+  let mut counters = Counters { hits: 4, misses: 2 }
+  reset(&mut counters)
+  return counters.hits + counters.misses
+}
+```
+
+#### Gotchas
+
+`field` must come from [`Reflect.fields`](#Reflect.impl.fields) for the same `Owner` type. `owner` must be a mutable
+borrow; a shared borrow is refused.
 
 
 Category: Core.

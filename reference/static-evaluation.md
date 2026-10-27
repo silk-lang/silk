@@ -33,7 +33,8 @@ types admitted as constant results are defined by [values and types](values-and-
 **Status:** Confirmed
 
 A static function is declared as `static fn` or `pub static fn`. It may be private or public and
-may be a top-level module declaration or a method in an inherent `impl Type` block. Every call to
+may be a top-level module declaration, a method in an inherent `impl Type` block, an interface
+operation, or the operation's witness in a conformance (INTF-008). Every call to
 it occurs during static evaluation, every argument must be statically available, and its result is
 one static value or one static diagnostic.
 
@@ -52,15 +53,16 @@ impl Limits {
 A static function has no runtime function item, callable representation, parameter lanes, instance,
 symbol, or backend body.
 
-**Boundary:** `static` cannot combine with `unsafe` or `effect`, and is forbidden on interface
-operations and operations in conformance `impl Contract for Type` blocks. Nested static function
+**Boundary:** `static` cannot combine with `unsafe` or `effect`, and is forbidden on service
+operations. A conformance supplies a static interface operation with a static witness and a runtime
+operation with a runtime one. Nested static function
 declarations within executable bodies are unavailable. Module declaration groups may select static
 functions. A static function cannot be captured or passed as a runtime callable.
 
 **Diagnostics:** An unsupported modifier combination or declaration position reports a syntax
 diagnostic at the conflicting modifier or declaration. A use requiring a runtime callable reports
-a static-phase violation at that use. A static call that selects an interface or conformance
-operation reports `SEM0176` at the call.
+a static-phase violation at that use. A static call that selects a runtime interface operation, or
+a runtime call of a static one, reports `SEM0176` at the call.
 
 **Evidence:** static syntax requirements,
 static function requirements.
@@ -280,15 +282,16 @@ tuples and anonymous positional aggregates expose positions; named structs and a
 expose visible labels. Declaration order, nominal owner identity, generic substitution, aggregate
 kind, and the reflecting declaration's visibility authority are retained.
 
-| Member                             | Result                    | Meaning                                                |
-| ---------------------------------- | ------------------------- | ------------------------------------------------------ |
-| `typeOf<Owner>()`                  | `Intrinsic.Type<Owner>`   | Descriptor for one concrete aggregate owner            |
-| `fields<Owner>()`                  | `Intrinsic.Fields<Owner>` | Ordered heterogeneous field collection                 |
-| `typeKind(descriptor)`             | `u8`                      | Stable named/positional aggregate-kind code            |
-| `fieldKind(field)`                 | `u8`                      | Stable labeled/positional member-kind code             |
-| `fieldLabel(field)`                | `string`                  | Label of a labeled field                               |
-| `fieldOrdinal(field)`              | `usize`                   | Position of a positional field                         |
-| `borrowField(owner, static field)` | `&Value`                  | Shared runtime projection authorized by the descriptor |
+| Member                                | Result                    | Meaning                                                 |
+| ------------------------------------- | ------------------------- | ------------------------------------------------------- |
+| `typeOf<Owner>()`                     | `Intrinsic.Type<Owner>`   | Descriptor for one concrete aggregate owner             |
+| `fields<Owner>()`                     | `Intrinsic.Fields<Owner>` | Ordered heterogeneous field collection                  |
+| `typeKind(descriptor)`                | `u8`                      | Stable named/positional aggregate-kind code             |
+| `fieldKind(field)`                    | `u8`                      | Stable labeled/positional member-kind code              |
+| `fieldLabel(field)`                   | `string`                  | Label of a labeled field                                |
+| `fieldOrdinal(field)`                 | `usize`                   | Position of a positional field                          |
+| `borrowField(owner, static field)`    | `&Value`                  | Shared runtime projection authorized by the descriptor  |
+| `borrowFieldMut(owner, static field)` | `&mut Value`              | Mutable runtime projection authorized by the descriptor |
 
 Descriptors remain nominal: equal field shapes from separate structs do not become assignment-
 compatible or share projection authority. Private fields are absent outside their declaring module
@@ -296,9 +299,10 @@ and their spellings cannot leak through reflection diagnostics.
 
 **Boundary:** `Intrinsic.Type`, `Intrinsic.Fields`, and `Intrinsic.Field` are phase-only nominals
 with no runtime layout, address, ownership, or backend representation. `borrowField` accepts only a
-shared reference to the descriptor's exact owner and consumes its descriptor during specialization.
-It cannot project an owned value, use a descriptor at runtime, or extend the result beyond the
-owner's ordinary borrow lifetime.
+shared reference to the descriptor's exact owner, and `borrowFieldMut` only a mutable one; each
+consumes its descriptor during specialization. Neither can project an owned value, use a descriptor
+at runtime, or extend the result beyond the owner's ordinary borrow lifetime. A mutable projection
+is an ordinary mutable loan of the field, so the owner is unusable while it lives.
 
 **Evidence:** static reflection requirements,
 [reflection source actor](../stdlib/silk/reflect.silk).
