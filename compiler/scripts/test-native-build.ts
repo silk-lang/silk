@@ -3287,9 +3287,11 @@ const program = Effect.gen(function* () {
   assert.equal(editedPacks.filter((name) => !coldPacks.includes(name)).length, 1, 'an edit to one module writes one pack')
   assert.equal(editedPacks.length, coldPacks.length, 'a build removes the packs no unit names')
   // A rebuild replays the record the last build left in the cache: an edit to a body lowers only
-  // the instances it touched, and an edit that changes what the program reaches walks it again.
-  // Either way the executable is the one a cold build links. A string constant holding `@` names
-  // nothing, so the unit still declares the helper it calls.
+  // the instances it touched, and an edit that changes what the program reaches walks it again
+  // from the record, lowering only the bodies it touched and the ones they newly reach (here the
+  // new helper, the body that calls it, and `main`, which resolved a name in the module that gained
+  // a declaration). Either way the executable is the one a cold build links. A string constant
+  // holding `@` names nothing, so the unit still declares the helper it calls.
   const executable = join(split, `build/llvm/${hostTarget}/debug/split`)
   const replayed = Effect.fnUntraced(function* (helper: string, expected: number, lowered: RegExp) {
     yield* fs.writeFileString(join(split, 'src/helper.silk'), helper)
@@ -3308,7 +3310,7 @@ const program = Effect.gen(function* () {
   )
   yield* splitRun(9)
   yield* replayed(helperSource(6), 10, /codegen\s+1 functions?\s/)
-  yield* replayed(`fn other() -> i32 {\n  return 2\n}\n\npub fn value() -> i32 {\n  return other() + 1\n}\n`, 7, /codegen\s+[1-9]\d+ functions\s/)
+  yield* replayed(`fn other() -> i32 {\n  return 2\n}\n\npub fn value() -> i32 {\n  return other() + 1\n}\n`, 7, /codegen\s+3 functions\s/)
   // A whole-module link keeps a stamp too, so an unchanged release rebuild links nothing.
   const releaseBuild = Effect.fnUntraced(function* () {
     const built = yield* invoke(silk, ['build', '--release', '--stdlib', standardLibrary], split, splitEnvironment)
