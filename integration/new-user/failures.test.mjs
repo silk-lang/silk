@@ -31,21 +31,24 @@ test('binding a private variant field from another module is SEM0028', () => {
   assert.match(result.stderr, /error\[SEM0028\]/, show(result))
 })
 
-test('the SEM0028 message for a pattern says variant, as the reference table does', { todo: 'finding 170' }, () => {
+// Finding 170, fixed by #2410.
+test('the SEM0028 message for a pattern names the variant field and the fix', () => {
   const result = silk(h, ['check'], { cwd: privateField() })
-  assert.doesNotMatch(result.stderr, /A field projection naming a private field of another module's struct/, show(result))
-  assert.match(result.stderr, /Missing/, show(result))
+  assert.match(result.stderr, /SEM0028\] Pattern names private field `id` of variant `Missing`; skip it with `\.\.`, or mark it `pub id` to use it outside its module/, show(result))
 })
 
-// Finding 170: a catchAll handler whose parameter accepts more than the remaining failures.
+// Finding 170, fixed by #2410: a catchAll handler whose parameter accepts more than the remaining
+// failures gets SEM0067 naming both types. Accepting it is pending a decision.
 const wider = main.replace('Effect.catchAll(onFrozen)', 'Effect.catchAll(onAny)')
 
-test('a catchAll handler that also accepts an already handled failure is accepted', { todo: 'finding 170' }, () => {
-  const result = silk(h, ['run', '--quiet'], { cwd: project(wider) })
-  assert.equal(result.status, 0, show(result))
+test('a catchAll handler that also accepts an already handled failure gets SEM0067 with both types', () => {
+  const result = silk(h, ['check'], { cwd: project(wider) })
+  assert.notEqual(result.status, 0, show(result))
+  assert.match(result.stderr, /error\[SEM0067\][^\n]*Overdrawn[^\n]*Frozen|error\[SEM0067\][^\n]*Frozen[^\n]*Overdrawn/, show(result))
 })
 
-test('the same handler outside a pipeline gets a coded error, not an unsupported construct', { todo: 'finding 170' }, () => {
+test('the same handler outside a pipeline gets a coded error, not an unsupported construct', () => {
   const result = silk(h, ['check'], { cwd: project(wider.replace('let d = run Effect.catch(twice(50), onShort) |> Effect.catchAll(onAny)', 'let caught = Effect.catch(twice(50), onShort)\n  let d = run Effect.catchAll(move caught, onAny)')) })
   assert.doesNotMatch(result.stderr, /unsupported: this construct is not supported/, show(result))
+  assert.match(result.stderr, /error\[SEM0067\]/, show(result))
 })
