@@ -529,7 +529,9 @@ The result is `-31`: `-7 / 2` is `-3`, and `-7 % 2` is `-1`.
 **Boundary:** A trap is not a typed failure and cannot be caught, returned, or declared in an
 Effect failure channel. When overflow or invalid division is recoverable application data, use a
 named `checked*` operation returning `Option<T>`. When modular or clamped arithmetic is intended,
-use the corresponding named `wrapping*` or `saturating*` operation where supplied.
+use the corresponding named `wrapping*` or `saturating*` operation where supplied. When the full
+product is needed, `multiplyHigh` returns the high half of the exact double-width product, signed
+for a signed type, and `wrappingMultiply` returns the low half; neither traps.
 
 For every signed width, `checkedRemainder(MIN, -1)` returns `Option<T>.None` on every executor exactly where
 ordinary `%` traps. It never reaches a backend remainder instruction whose behavior differs at that
