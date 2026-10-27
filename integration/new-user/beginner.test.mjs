@@ -200,10 +200,10 @@ test('a dependency written as a version string says to write a table', () => {
 
 for (const [name, body, line, reason] of [
   ['an unquoted string', '[package]\nname = p\nversion = "0.1.0"\n', 2, /quote|string|value/i],
-  ['an unclosed table header', '[package\nname = "p"\nversion = "0.1.0"\n', 1, /\]/],
+  ['an unclosed table header', '[package\nname = "p"\nversion = "0.1.0"\n', 1, /\]|table header/],
   ['a duplicate key', '[package]\nname = "p"\nversion = "0.1.0"\nname = "q"\n', 5, /name|duplicate|twice|again/i],
 ]) {
-  test(`${name} in silk.toml gets the TOML line and reason`, { todo: 'finding 125' }, () => {
+  test(`${name} in silk.toml gets the TOML line and reason`, () => {
     const result = manifest(body)
     assert.match(result.stderr, new RegExp(`silk\\.toml:${line}(:\\d+)?: `), show(result))
     assert.match(result.stderr.split('\n').find((l) => l.includes('silk.toml')) ?? '', reason, show(result))
@@ -215,14 +215,14 @@ for (const [name, body, line, value] of [
   ['an uppercase name', '[package]\nname = "MyApp"\nversion = "0.1.0"\n', 2, /MyApp/],
   ['kind = "lib"', '[package]\nname = "p"\nversion = "0.1.0"\nkind = "lib"\n', 5, /"lib"/],
 ]) {
-  test(`${name} is reported at its line with the value`, { todo: 'finding 125' }, () => {
+  test(`${name} is reported at its line with the value`, () => {
     const result = manifest(body)
     assert.match(result.stderr, new RegExp(`silk\\.toml:${line}: `), show(result))
     assert.match(result.stderr, value, show(result))
   })
 }
 
-test('a missing package name says it is missing', { todo: 'finding 125' }, () => {
+test('a missing package name says it is missing', () => {
   const result = manifest('[package]\nversion = "0.1.0"\n')
   assert.match(result.stderr, /package\.name is missing|missing package\.name|needs a name/, show(result))
 })

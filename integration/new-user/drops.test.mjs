@@ -54,42 +54,42 @@ for (const [name, code, text, make] of rules) {
   })
 }
 
-// Finding 176: ownership and drop mistakes whose messages read like rule titles or describe
-// something else.
-test('a bare block says Silk has no bare blocks', { todo: 'finding 176' }, () => {
+// Finding 176, fixed by #2427: ownership and drop mistakes whose messages read like rule titles or
+// described something else.
+test('a bare block says Silk has no bare blocks', () => {
   const result = check(variant(swappedTail, '  {\n    let c = tracer(3, log)\n  }\n  return ()\n}\n\n// A failing'))
   assert.notEqual(result.status, 0, show(result))
   assert.doesNotMatch(result.stderr, /Expected identifier/, show(result))
   assert.match(result.stderr, /block/, show(result))
 })
 
-test('Intrinsic.replace(&mut slot, v) says replace takes the place itself', { todo: 'finding 176' }, () => {
+test('Intrinsic.replace(&mut slot, v) says replace takes the place itself', () => {
   const result = check(variant('Intrinsic.replace(slot,', 'Intrinsic.replace(&mut slot,'))
   assert.notEqual(result.status, 0, show(result))
   assert.doesNotMatch(result.stderr, /Assignment requires/, show(result))
 })
 
-test('a partial move out of a Drop type names the type and its Drop hook', { todo: 'finding 176' }, () => {
+test('a partial move out of a Drop type names the type and its Drop hook', () => {
   const result = check(variant('  let first = move pair.first', '  let t = tracer(9, log)\n  let tlog = move t.log\n  let first = move pair.first'))
   assert.match(result.stderr, /OWN0002\][^\n]*Tracer/, show(result))
 })
 
-test('a move inside a loop names the owner', { todo: 'finding 176' }, () => {
+test('a move inside a loop names the owner', () => {
   const result = check(variant('    let inner = tracer(i, log)', '    let inner = tracer(i, log)\n    consume(move outer)'))
   assert.match(result.stderr, /OWN0005\][^\n]*outer/, show(result))
 })
 
-test('dropping a binding twice names it, as reading a dropped field does', { todo: 'finding 176' }, () => {
+test('dropping a binding twice names it, as reading a dropped field does', () => {
   const result = check(variant('  drop first', '  drop first\n  drop first'))
   assert.match(result.stderr, /OWN0001\][^\n]*first/, show(result))
 })
 
-test('Copy on a Drop type says why it is invalid', { todo: 'finding 176' }, () => {
+test('Copy on a Drop type says why it is invalid', () => {
   const result = check(copyOnDrop())
   assert.match(result.stderr, /SEM0083\][^\n]*(Drop|Tracer)/, show(result))
 })
 
-test('calling the drop hook directly points at the drop statement', { todo: 'finding 176' }, () => {
+test('calling the drop hook directly points at the drop statement', () => {
   const result = check(variant(swappedTail, '  let mut c = tracer(3, log)\n  c.drop()\n  return ()\n}\n\n// A failing'))
   assert.match(result.stderr, /SEM0010\][\s\S]*drop c/, show(result))
 })

@@ -55,23 +55,31 @@ test('a return whose lifetimes differ shows both types', () => {
   assert.doesNotMatch(result.stderr, /An explicit return whose value violates the declaration result\n/, show(result))
 })
 
-// Finding 168, fixed by #2386: messages for a first hash map and a C-style dereference.
-test('a string key names HashKey and the key type', () => {
-  const result = silk(h, ['check'], { cwd: project(`import silk.allocator { Allocator, OutOfMemoryError }
+const firstMap = (key, value) => project(`import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
 import silk.hash { Hash }
 import silk.hash_map { HashMap }
 
 pub effect fn main() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let mut counts = HashMap<string, i32>.make(Hash.seed(1))
-  drop run HashMap<string, i32>.insert(&mut counts, "a", 1) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut counts = HashMap<${key}, i32>.make(Hash.seed(1))
+  drop run HashMap<${key}, i32>.insert(&mut counts, ${value}, 1) |> Effect.provideMut<Allocator>(&mut allocator)
   return 0
 }
-`) })
+`)
+
+// Finding 168, fixed by #2386: messages for a first hash map and a C-style dereference.
+// Since #2405 string and integer keys work; f64 still has no HashKey.
+test('a string key works', () => {
+  const result = silk(h, ['run', '--quiet'], { cwd: firstMap('string', '"a"') })
+  assert.equal(result.status, 0, show(result))
+})
+
+test('an f64 key names HashKey and the key type', () => {
+  const result = silk(h, ['check'], { cwd: firstMap('f64', '1.5') })
   assert.notEqual(result.status, 0, show(result))
   assert.match(result.stderr, /HashKey/, show(result))
-  assert.match(result.stderr, /string/, show(result))
+  assert.match(result.stderr, /f64/, show(result))
 })
 
 test('a C-style *n points at n.*', () => {
