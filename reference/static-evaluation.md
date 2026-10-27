@@ -95,16 +95,18 @@ remains runtime even when its initializer is a literal; preserving the value for
 requires `let static`. Inside a `static fn`, ordinary locals and control flow are already static and
 do not require `let static`.
 
-Only a type-qualified call to a function or inherent method, such as `Leaf.own(&leaf, spec)`,
-supplies static arguments in this release. Method-call syntax (`leaf.own(spec)`) and any call of an
-interface operation that declares a `static` parameter, through the interface or method syntax,
-cannot supply them yet. An implementing type gives the operation's body an inherent function and
-callers name that function.
+A runtime function's body supplies static arguments to any call it writes: a type-qualified call
+such as `Leaf.own(&leaf, spec)`, method-call syntax such as `leaf.own(spec)`, and a call of an
+interface operation that declares a `static` parameter, through the interface (`Walk.walk(&leaf,
+spec)`), method syntax, or a generic bound (`item.walk(spec)` for `T: Walk`). An interface call's
+static operands select the witness instance, as a direct call's select the callee's. A `static fn`
+body cannot call a function with `static` parameters yet.
 
 **Diagnostics:** Passing a runtime value to a static parameter, reading a runtime local from static
 evaluation, or using a runtime operation in a static initializer reports `SEM0176` at the operation
 and identifies the static boundary that required the value. A call through method syntax or an
-interface operation to a function with `static` parameters reports `SEM0249` at the call.
+interface operation to a function with `static` parameters where its static arguments cannot be
+selected, such as in a `static fn`, reports `SEM0249` at the call.
 
 **Evidence:** explicit static modes,
 static syntax recovery.
