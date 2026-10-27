@@ -48,7 +48,7 @@ pub fn main() -> i32 {
 
 Import as `Reflect` with `import silk.reflect { Reflect }`.
 
-Public declarations: 9.
+Public declarations: 11.
 
 <a id="namedKind"></a>
 
@@ -109,7 +109,18 @@ pub const otherKind: u8
 ```
 
 The [`Reflect.typeKind`](#Reflect.impl.typeKind) result for every other type, such as `i32`, `string`, a slice, an
-enum, or a union. It has no fields.
+enum, or a structural union `A | B`. It has no fields.
+
+<a id="unionKind"></a>
+
+## `unionKind`
+
+```silk
+pub const unionKind: u8
+```
+
+The [`Reflect.typeKind`](#Reflect.impl.typeKind) result for a nominal union, such as `union Shape { ... }`. It has no
+fields of its own; list its variants with [`Reflect.variants`](#Reflect.impl.variants).
 
 <a id="labeledFieldKind"></a>
 
@@ -131,6 +142,18 @@ pub const positionalFieldKind: u8
 ```
 
 The [`Reflect.fieldKind`](#Reflect.impl.fieldKind) result for a field with a position. Read the position with
+[`Reflect.fieldOrdinal`](#Reflect.impl.fieldOrdinal).
+
+<a id="variantFieldKind"></a>
+
+## `variantFieldKind`
+
+```silk
+pub const variantFieldKind: u8
+```
+
+The [`Reflect.fieldKind`](#Reflect.impl.fieldKind) result for a field of a union variant, from [`Reflect.variantFields`](#Reflect.impl.variantFields).
+It has both a name, read with [`Reflect.fieldLabel`](#Reflect.impl.fieldLabel), and a position in its variant, read with
 [`Reflect.fieldOrdinal`](#Reflect.impl.fieldOrdinal).
 
 <a id="Reflect"></a>
@@ -211,8 +234,8 @@ type has a kind, so a generic function can branch on the kind of its type parame
 pub static fn fieldKind<Owner, Value>(field: Intrinsic.Field<Owner, Value>) -> u8
 ```
 
-Returns [`labeledFieldKind`](#labeledFieldKind) for a named field, or [`positionalFieldKind`](#positionalFieldKind) for a positional
-field.
+Returns [`labeledFieldKind`](#labeledFieldKind) for a named field, [`positionalFieldKind`](#positionalFieldKind) for a positional
+field, or [`variantFieldKind`](#variantFieldKind) for a field of a union variant.
 
 <a id="Reflect.impl.fieldLabel"></a>
 
@@ -226,7 +249,8 @@ Returns the name of a named field, as written in the type declaration.
 
 #### Gotchas
 
-Use this function only for a field where [`Reflect.fieldKind`](#Reflect.impl.fieldKind) is [`labeledFieldKind`](#labeledFieldKind).
+Use this function only for a field where [`Reflect.fieldKind`](#Reflect.impl.fieldKind) is [`labeledFieldKind`](#labeledFieldKind) or
+[`variantFieldKind`](#variantFieldKind).
 
 <a id="Reflect.impl.fieldOrdinal"></a>
 
@@ -240,7 +264,8 @@ Returns the zero-based position of a positional field.
 
 #### Gotchas
 
-Use this function only for a field where [`Reflect.fieldKind`](#Reflect.impl.fieldKind) is [`positionalFieldKind`](#positionalFieldKind).
+Use this function only for a field where [`Reflect.fieldKind`](#Reflect.impl.fieldKind) is [`positionalFieldKind`](#positionalFieldKind) or
+[`variantFieldKind`](#variantFieldKind).
 
 <a id="Reflect.impl.borrowField"></a>
 
@@ -308,6 +333,174 @@ pub fn main() -> i32 {
 
 `field` must come from [`Reflect.fields`](#Reflect.impl.fields) for the same `Owner` type. `owner` must be a mutable
 borrow; a shared borrow is refused.
+
+<a id="Reflect.impl.variants"></a>
+
+### Associated function `variants`
+
+```silk
+pub static fn variants<Union>() -> Intrinsic.Variants<Union>
+```
+
+Returns the compile-time descriptors of the variants of the nominal union `Union`, in
+declaration order.
+
+#### Details
+
+Use the result as the sequence of a `static for`. Each element has the type
+`Intrinsic.Variant<Union>`. Give it to [`Reflect.variantLabel`](#Reflect.impl.variantLabel), [`Reflect.variantFields`](#Reflect.impl.variantFields),
+[`Reflect.makeVariant`](#Reflect.impl.makeVariant) or [`Reflect.isVariant`](#Reflect.impl.isVariant).
+
+#### Examples
+
+```silk
+import silk.option { Option }
+import silk.reflect { Reflect }
+
+union Command {
+  Status,
+  Clone { pub url: string, pub depth: u32 },
+}
+
+static fn fieldCount<U>(variant: Intrinsic.Variant<U>) -> usize {
+  let mut count: usize = 0
+  static for field in Reflect.variantFields(variant) { count = count + 1 }
+  return count
+}
+
+// Builds the variant of `U` named `word`, if it has no fields.
+fn unitNamed<U>(word: string) -> Option<U> {
+  static for variant in Reflect.variants<U>() {
+    static if fieldCount(variant) == 0 {
+      if word == Reflect.variantLabel(variant) {
+        return Option<U>.some(Reflect.makeVariant(variant, ()))
+      }
+    }
+  }
+  return Option<U>.none()
+}
+
+pub fn main() -> i32 {
+  let found = unitNamed<Command>("Status")
+  return match move found {
+    Option<Command>.Some {value: Command.Status} => 0
+    _ => 1
+  }
+}
+```
+
+<a id="Reflect.impl.variantLabel"></a>
+
+### Associated function `variantLabel`
+
+```silk
+pub static fn variantLabel<Union>(variant: Intrinsic.Variant<Union>) -> string<'static>
+```
+
+Returns the name of a variant, as written in the union declaration.
+
+<a id="Reflect.impl.variantFields"></a>
+
+### Associated function `variantFields`
+
+```silk
+pub static fn variantFields<Union>(variant: Intrinsic.Variant<Union>) -> Intrinsic.Fields<Union>
+```
+
+Returns the compile-time descriptors of the fields of a variant, in declaration order.
+
+#### Details
+
+Each element has the type `Intrinsic.Field<Union, Value>`, where `Value` is the type of that
+field, and the kind [`variantFieldKind`](#variantFieldKind). A unit variant has none.
+
+#### Gotchas
+
+The list contains only the `pub` fields, because visibility is judged from `silk/reflect`.
+A field descriptor of a variant cannot be given to [`Reflect.borrowField`](#Reflect.impl.borrowField), because the
+union holds the field only while that variant is active.
+
+<a id="Reflect.impl.makeVariant"></a>
+
+### Associated function `makeVariant`
+
+```silk
+pub fn makeVariant<Union, Fields>(static variant: Intrinsic.Variant<Union>, fields: Fields) -> Union
+```
+
+Returns the variant that `variant` describes, built from `fields`: a tuple of the variant's
+fields in declaration order, or `()` for a variant without fields.
+
+#### Details
+
+`variant` is a static argument, so the compiler selects the variant during specialization.
+At runtime this function is a plain variant construction, such as
+`Shape.Line {length: a, width: b}` for `makeVariant(line, (a, b))`. The tuple is
+moved into the variant.
+
+#### Examples
+
+```silk
+import silk.reflect { Reflect }
+
+union Shape {
+  Dot,
+  Circle { pub radius: u32 },
+  Line { pub length: u32, pub width: u32 },
+}
+
+fn area(shape: Shape) -> u32 {
+  return match move shape {
+    Shape.Dot => 0
+    Shape.Circle {radius} => radius * radius * 3
+    Shape.Line {length, width} => length * width
+  }
+}
+
+static fn fieldCount<U>(variant: Intrinsic.Variant<U>) -> usize {
+  let mut count: usize = 0
+  static for field in Reflect.variantFields(variant) { count = count + 1 }
+  return count
+}
+
+pub fn main() -> i32 {
+  let two: u32 = 2
+  let three: u32 = 3
+  let four: u32 = 4
+  let mut total: u32 = 0
+  static for variant in Reflect.variants<Shape>() {
+    let static count = fieldCount(variant)
+    static if count == 0 { total = total + area(Reflect.makeVariant(variant, ())) }
+    static if count == 1 { total = total + area(Reflect.makeVariant(variant, (two,))) }
+    static if count == 2 { total = total + area(Reflect.makeVariant(variant, (three, four))) }
+  }
+  // 0 + 12 + 12
+  if total != 24 {
+    return 1
+  }
+  return 0
+}
+```
+
+#### Gotchas
+
+The tuple must have exactly the variant's field types in declaration order. Every field of the
+variant must be `pub`, since the variant is built from `silk/reflect`.
+
+<a id="Reflect.impl.isVariant"></a>
+
+### Associated function `isVariant`
+
+```silk
+pub fn isVariant<Union>(owner: &Union, static variant: Intrinsic.Variant<Union>) -> bool
+```
+
+Returns whether `owner` holds the variant that `variant` describes.
+
+#### Details
+
+`variant` is a static argument, so at runtime this function is a plain test of the union's
+active variant, like a `match` with one arm for that variant.
 
 
 Category: Core.
