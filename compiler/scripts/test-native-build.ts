@@ -348,7 +348,7 @@ const program = Effect.gen(function* () {
   assert.equal(ir.status, 0, ir.stderr)
   assert.equal(ir.error, undefined)
   assert.equal(yield* fs.exists(marker), false, 'IR output must not invoke Clang')
-  assert.equal(yield* fs.exists(join(directory, 'module.ll.silk.ll')), false)
+  assert.equal(yield* fs.exists(join(directory, 'module.ll.silk.bc')), false)
   const bytes = yield* fs.readFile(join(directory, 'module.ll'))
   assert.ok(bytes.length > 0)
   const verified = yield* invoke(
@@ -357,11 +357,11 @@ const program = Effect.gen(function* () {
     directory,
   )
   assert.equal(verified.status, 0, verified.stderr)
-  const captured = join(directory, 'completed-backend.ll')
+  const captured = join(directory, 'completed-backend.bc')
   const linker = join(directory, 'clang-capture')
   yield* fs.writeFileString(
     linker,
-    `#!/bin/sh\nfor input in "$@"; do\ncase "$input" in\n*.silk.ll) cp "$input" ${quote(captured)} ;;\nesac\ndone\nexec ${quote(clang)} "$@"\n`,
+    `#!/bin/sh\nfor input in "$@"; do\ncase "$input" in\n*.silk.bc) cp "$input" ${quote(captured)} ;;\nesac\ndone\nexec ${quote(clang)} "$@"\n`,
   )
   yield* fs.chmod(linker, 0o755)
   const linked = yield* invoke(silk, argumentsFor('program'), directory, {
@@ -422,12 +422,24 @@ const program = Effect.gen(function* () {
     shuffled.stderr,
     /shuffle\.silk:3:67: error\[SEM0239\] Intrinsic\.simdShuffle needs 4 static lane indices, one per result lane, each below 8/,
   )
-  assert.deepEqual(
-    yield* fs.readFile(captured),
-    bytes,
-    'IR selector must retain the exact completed bytes passed to executable linking',
+  // The linked bitcode and the printed IR are one module: LLVM reads both back to the same text,
+  // apart from the module's own file name and the local value names the linked bitcode leaves out.
+  const disassembled = Effect.fnUntraced(function* (input: string, output: string) {
+    const read = yield* invoke(join(dirname(clang), 'opt'), ['-S', '-passes=strip', input, '-o', output], directory)
+    assert.equal(read.status, 0, read.stderr)
+    return (yield* fs.readFileString(join(directory, output)))
+      .split('\n')
+      .filter((line) => !line.startsWith('; ModuleID') && !line.startsWith('source_filename'))
+      .join('\n')
+  })
+  const assembled = yield* invoke(join(dirname(clang), 'llvm-as'), ['module.ll', '-o', 'module.bc'], directory)
+  assert.equal(assembled.status, 0, assembled.stderr)
+  assert.equal(
+    yield* disassembled(captured, 'completed-backend.ll'),
+    yield* disassembled('module.bc', 'module-read.ll'),
+    'IR output must print the exact module passed to executable linking',
   )
-  assert.equal(yield* fs.exists(join(directory, 'program.silk.ll')), false)
+  assert.equal(yield* fs.exists(join(directory, 'program.silk.bc')), false)
   const ran = yield* invoke(join(directory, 'program'), [], directory)
   assert.equal(ran.status, 42, ran.stderr)
   const explicit = yield* invoke(
@@ -437,7 +449,7 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(explicit.status, 0, explicit.stderr)
-  assert.equal(yield* fs.exists(join(directory, 'explicit.silk.ll')), false)
+  assert.equal(yield* fs.exists(join(directory, 'explicit.silk.bc')), false)
   // Without SILK_CLANG the compiler runs the first `clang` on PATH, also through a symbolic link
   // as PATH entries usually are, and with none there it refuses before linking.
   const ambient = Object.fromEntries(
@@ -3020,7 +3032,7 @@ const program = Effect.gen(function* () {
     SILK_CLANG: clang,
   })
   assert.equal(object.status, 0, object.stderr)
-  assert.equal(yield* fs.exists(join(library, 'silk.o.silk.ll')), false)
+  assert.equal(yield* fs.exists(join(library, 'silk.o.silk.bc')), false)
   const relocatable = yield* inspect('silk.o')
   assert.match(relocatable.header, /Type: Relocatable|MH_OBJECT/)
   assert.ok(exported(relocatable.symbols, 'silk_answer'), relocatable.symbols.join('\n'))
@@ -3154,7 +3166,7 @@ const program = Effect.gen(function* () {
   const rebuilt = yield* invoke(silk, libraryArguments('libsilk.a'), library, archiveEnvironment)
   assert.equal(rebuilt.status, 0, rebuilt.stderr)
   assert.deepEqual(yield* members('libsilk.a'), ['libsilk.a.silk.o'])
-  for (const intermediate of ['libsilk.a.silk.o', 'libsilk.a.silk.ll'])
+  for (const intermediate of ['libsilk.a.silk.o', 'libsilk.a.silk.bc'])
     assert.equal(yield* fs.exists(join(library, intermediate)), false, intermediate)
   const archived = yield* inspect('libsilk.a')
   assert.ok(exported(archived.symbols, 'silk_answer') && !exported(archived.symbols, 'main'))
