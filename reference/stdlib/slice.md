@@ -6,7 +6,8 @@ Borrowed subranges of slices, with no copy and no allocation.
 
 ## When to use
 Use [`Slice.view`](#Slice.impl.view) to give a part of a slice to a function that takes `&[T]`, such as the
-remaining input of a parser.
+remaining input of a parser. Use [`Slice.viewMut`](#Slice.impl.viewMut) to give a part of a slice to a function that
+takes `&mut [T]`, such as one row of a scratch buffer.
 
 ## Details
 A view borrows the input. It has the same lifetime as the input and does not copy elements.
@@ -74,6 +75,27 @@ Returns a shared borrow of the `length` elements of `values` that start at index
 
 The view does not copy elements and does not allocate. It cannot live longer than `values`.
 `view(values, values.length, 0)` is a valid empty view.
+
+#### Gotchas
+
+If `offset` is more than `values.length`, or `offset + length` is more than `values.length`,
+the program traps.
+
+<a id="Slice.impl.viewMut"></a>
+
+### Associated function `viewMut`
+
+```silk
+pub fn viewMut<'a, T>(values: &'a mut [T], offset: usize, length: usize) -> &'a mut [T]
+```
+
+Returns an exclusive borrow of the `length` elements of `values` that start at index `offset`.
+
+#### Details
+
+The view does not copy elements and does not allocate. Writes through it change `values`.
+While the view lives, `values` cannot be used. `viewMut(values, values.length, 0)` is a valid
+empty view.
 
 #### Gotchas
 
