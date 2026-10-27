@@ -3,6 +3,7 @@
 // pages of the docs.
 import { strict as assert } from 'node:assert'
 import { readdirSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
 import { test } from 'node:test'
 import { existsSync, here, initPackage, join, read, sh, sharedHome, show, silk, write } from './lib.mjs'
 
@@ -287,20 +288,29 @@ pub effect fn main() -> i32
   assert.match(ran.stderr, /at main\.main \(main:10:\d+\)/, show(ran))
 })
 
-// The install page supports Clang 18 and newer. Each Clang found in the usual Debian and Ubuntu
-// place, or named in SILK_NEW_USER_CLANGS (separated by colons), builds the same program.
+// The install page asks for Clang 22 or newer (#2420). Each Clang found in the usual Debian and
+// Ubuntu place, or named in SILK_NEW_USER_CLANGS (separated by colons), builds the same program
+// when it is new enough, and an older one is refused up front with the version it found.
 const clangs = (process.env.SILK_NEW_USER_CLANGS ?? '').split(':').filter((path) => path !== '')
 for (const dir of existsSync('/usr/lib') ? readdirSync('/usr/lib') : []) {
   const match = /^llvm-(\d+)$/.exec(dir)
-  if (match && Number(match[1]) >= 18 && existsSync(`/usr/lib/${dir}/bin/clang`)) clangs.push(`/usr/lib/${dir}/bin/clang`)
+  if (match && existsSync(`/usr/lib/${dir}/bin/clang`)) clangs.push(`/usr/lib/${dir}/bin/clang`)
 }
+const clangMajor = (clang) => Number(/clang version (\d+)/.exec(spawnSync(clang, ['--version'], { encoding: 'utf8' }).stdout ?? '')?.[1] ?? 0)
 
-test('a release build works with every supported Clang', { skip: clangs.length === 0 ? 'no Clang 18 or newer found' : false, todo: 'finding 173: Clang 18 crashes on release bitcode; minimum may be raised' }, () => {
+// Finding 173, settled by #2420: Clang 18 crashed on release bitcode, so older Clangs are refused.
+test('a release build works with every Clang 22 or newer, and an older Clang is refused by name', { skip: clangs.length === 0 ? 'no Clang found' : false }, () => {
   const dir = initPackage(h, fresh('clangs'))
   for (const clang of clangs) {
+    const major = clangMajor(clang)
     for (const flags of [[], ['--release']]) {
       const result = silk(h, ['run', '--quiet', '--clang', clang, ...flags], { cwd: dir })
-      assert.equal(result.status, 0, `${clang} ${flags.join(' ')}\n${show(result)}`)
+      if (major >= 22) {
+        assert.equal(result.status, 0, `${clang} ${flags.join(' ')}\n${show(result)}`)
+      } else {
+        assert.notEqual(result.status, 0, show(result))
+        assert.match(result.stderr, new RegExp(`need Clang 22 or newer, but .* is Clang ${major};`), show(result))
+      }
     }
   }
 })

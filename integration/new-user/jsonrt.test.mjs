@@ -39,8 +39,8 @@ test('the JSON program in programs/ prints each document or its error as documen
   assert.equal(result.stdout, expected, show(result))
 })
 
-// Finding 172: matching on Result without importing it.
-test('a match on Result.Success without the import says the import is missing', { todo: 'finding 172' }, () => {
+// Finding 172, fixed by #2419: matching on Result without importing it.
+test('a match on Result.Success without the import says the import is missing', () => {
   const result = silk(h, ['check'], { cwd: project(program.replace('import silk.result { Result }\n', '')) })
   assert.notEqual(result.status, 0, show(result))
   assert.match(result.stderr, /import silk\.result/, show(result))
