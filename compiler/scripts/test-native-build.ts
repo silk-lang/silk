@@ -3306,6 +3306,12 @@ const program = Effect.gen(function* () {
   assert.deepEqual(yield* packNames(), coldPacks, 'an unchanged rebuild keeps every pack')
   assert.deepEqual((yield* fs.stat(importSummaries)).mtime, summarizedAt, 'an unchanged rebuild keeps the import summaries')
   assert.deepEqual((yield* fs.stat(symbolMap)).mtime, mappedAt, 'an unchanged rebuild leaves the symbol map as it was')
+  // A build records every file it read beside the executable, so a rebuild that finds them all
+  // unchanged reuses the executable without loading a module.
+  const unchanged = yield* invoke(silk, ['build', '--stdlib', standardLibrary, '--timings'], split, splitEnvironment)
+  assert.equal(unchanged.status, 0, unchanged.stderr)
+  assert.doesNotMatch(unchanged.stdout + unchanged.stderr, /^\s+load\s/m, 'an unchanged rebuild loads nothing')
+  assert.ok(yield* fs.exists(`${splitExecutable}.inputs`), 'a build records what it read')
   yield* fs.writeFileString(join(split, 'src/helper.silk'), helperSource(5))
   yield* splitRun(9)
   const editedObjects = yield* objectNames()
