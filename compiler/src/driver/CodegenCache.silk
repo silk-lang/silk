@@ -13,6 +13,7 @@
 //! the command that linked the output and the output's length. A build whose link command and
 //! output still match it skips the link, so a build that changes nothing writes nothing.
 
+import backend.Bitcode
 import backend.CodegenUnits {CodegenUnit}
 import driver.HostRename
 import semantic.ContentHash {ContentHash}
@@ -25,6 +26,7 @@ import silk.list {List}
 import silk.native_thread {JoinHandle, NativeThread, SpawnError}
 import silk.option {Option}
 import silk.os_child_process {OsChildProcess}
+import silk.os_filesystem {OsFileSystem}
 import silk.result {Result}
 import silk.u64
 import silk.usize
@@ -103,21 +105,30 @@ pub effect fn publish(object: &Path) -> bool ! FileError | OutOfMemoryError ? &m
   return run HostRename.replaceFile(&compiled, object)
 }
 
-/// Runs each of `commands`, a Clang path and then its arguments, on up to `workers` threads, and
-/// answers each command's exit status in order: -1 when it did not start or did not exit.
+/// One unit's compile: the bitcode file its fragments encode to, and the command that compiles it,
+/// a Clang path and then its arguments.
+pub struct Job {
+  pub fragments: Bytes,
+  pub input: Bytes,
+  pub command: List<Bytes>,
+}
+
+/// Encodes each job's fragments to its input and runs its command, on up to `workers` threads,
+/// and answers each command's exit status in order: -1 when its input could not be written, or
+/// its command did not start or did not exit.
 ///
 /// # Details
-/// `sizes` weighs each command by the size of its input. The heaviest command goes first, to the
+/// `sizes` weighs each job by the size of its fragments. The heaviest job goes first, to the
 /// thread with the least weight so far, so one large unit never waits behind a queue of small ones.
-pub effect fn runAll(commands: List<List<Bytes>>, sizes: &[usize], workers: usize) -> List<i32> ! OutOfMemoryError | SpawnError ? &mut Allocator {
-  let count = List<List<Bytes>>.length(&commands)
+pub effect fn runAll(jobs: List<Job>, sizes: &[usize], workers: usize) -> List<i32> ! OutOfMemoryError | SpawnError ? &mut Allocator {
+  let count = List<Job>.length(&jobs)
   let mut threads = workers
   if threads > count { threads = count }
   if threads == usize.ZERO { threads = usize.ONE }
-  let mut batches = List<List<List<Bytes>>>.make()
+  let mut batches = List<List<Job>>.make()
   let mut loads = List<usize>.make()
-  while List<List<List<Bytes>>>.length(&batches) < threads {
-    run List<List<List<Bytes>>>.append(&mut batches, List<List<Bytes>>.make())
+  while List<List<Job>>.length(&batches) < threads {
+    run List<List<Job>>.append(&mut batches, List<Job>.make())
     run List<usize>.append(&mut loads, usize.ZERO)
   }
   // Each command's thread and its place in that thread's batch.
@@ -131,7 +142,7 @@ pub effect fn runAll(commands: List<List<Bytes>>, sizes: &[usize], workers: usiz
     run List<bool>.append(&mut taken, false)
     at = at + usize.ONE
   }
-  let mut pending = move commands
+  let mut pending = move jobs
   let mut placed = usize.ZERO
   while placed < count {
     let mut heaviest = usize.MAX
@@ -146,21 +157,21 @@ pub effect fn runAll(commands: List<List<Bytes>>, sizes: &[usize], workers: usiz
       if List<usize>.get(&loads, worker) < List<usize>.get(&loads, lightest) { lightest = worker }
       worker = worker + usize.ONE
     }
-    let slot = List<List<Bytes>>.length(&List<List<List<Bytes>>>.asSlice(&batches)[lightest])
+    let slot = List<Job>.length(&List<List<Job>>.asSlice(&batches)[lightest])
     List<usize>.set(&mut slots, heaviest, slot)
     List<usize>.set(&mut owners, heaviest, lightest)
     List<bool>.set(&mut taken, heaviest, true)
     let load = List<usize>.get(&loads, lightest) + weightOf(sizes, heaviest)
     List<usize>.set(&mut loads, lightest, load)
-    let mut commandsLeft = List<List<Bytes>>.asMutSlice(&mut pending)
-    let command = Intrinsic.replace(commandsLeft[heaviest], List<Bytes>.make())
-    let mut writable = List<List<List<Bytes>>>.asMutSlice(&mut batches)
-    run List<List<Bytes>>.append(&mut writable[lightest], move command)
+    let mut jobsLeft = List<Job>.asMutSlice(&mut pending)
+    let job = Intrinsic.replace(jobsLeft[heaviest], Job {fragments: Bytes.make(), input: Bytes.make(), command: List<Bytes>.make()})
+    let mut writable = List<List<Job>>.asMutSlice(&mut batches)
+    run List<Job>.append(&mut writable[lightest], move job)
     placed = placed + usize.ONE
   }
   let mut handles = List<JoinHandle<List<i32>>>.make()
-  while List<List<List<Bytes>>>.length(&batches) > usize.ZERO {
-    let batch = List<List<List<Bytes>>>.remove(&mut batches, usize.ZERO)
+  while List<List<Job>>.length(&batches) > usize.ZERO {
+    let batch = List<List<Job>>.remove(&mut batches, usize.ZERO)
     let handle = run NativeThread.spawn(
       fn() -> List<i32> {
         return run runBatch(move batch)
@@ -194,8 +205,8 @@ fn weightOf(sizes: &[usize], at: usize) -> usize {
   return usize.ZERO
 }
 
-// A worker thread's commands, run one at a time with services of its own.
-effect fn runBatch(batch: List<List<Bytes>>) -> List<i32> {
+// A worker thread's jobs, run one at a time with services of its own.
+effect fn runBatch(batch: List<Job>) -> List<i32> {
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut process = OsChildProcess.make()
   let ran = run Effect.result(
@@ -208,12 +219,16 @@ effect fn runBatch(batch: List<List<Bytes>>) -> List<i32> {
   }
 }
 
-effect fn runEach(batch: &List<List<Bytes>>) -> List<i32> ! FileError | OutOfMemoryError ? &mut ChildProcess | &mut Allocator {
-  let commands = List<List<Bytes>>.asSlice(batch)
+effect fn runEach(batch: &List<Job>) -> List<i32> ! FileError | OutOfMemoryError ? &mut ChildProcess | &mut Allocator {
+  let jobs = List<Job>.asSlice(batch)
+  let mut files = run OsFileSystem.make("/")
   let mut statuses = List<i32>.make()
   let mut at = usize.ZERO
-  while at < commands.length {
-    let parts = List<Bytes>.asSlice(&commands[at])
+  while at < jobs.length {
+    let bitcode = run Bitcode.compile(Bytes.asSlice(&jobs[at].fragments))
+    let input = run Path.fromBytes(Bytes.asSlice(&jobs[at].input))
+    run FileSystem.writeFile(&input, Bytes.asSlice(&bitcode)) |> Effect.provideMut<FileSystem>(&mut files)
+    let parts = List<Bytes>.asSlice(&jobs[at].command)
     let program = run Path.fromBytes(Bytes.asSlice(&parts[usize.ZERO]))
     let mut request = run ChildProcess.request(&program)
     let mut part = usize.ONE
