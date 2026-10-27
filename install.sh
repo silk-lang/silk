@@ -304,24 +304,16 @@ else
   printf 'It is the default toolchain; %s/bin/silk links to its compiler. This release has no silk tool.\n' "$silk_home"
 fi
 
-# Silk hands Clang textual LLVM IR. Clang 18 or newer reads it for ordinary programs; inline
-# assembly that reads or writes memory, as the no-libc Linux runtime uses, is emitted with LLVM 22's
-# target_mem0/target_mem1 memory locations, which only Clang 22 or newer reads.
+# Silk hands Clang LLVM 22 bitcode, which older Clang misreads.
 clang=${SILK_CLANG:-clang}
 if ! command -v "$clang" > /dev/null 2>&1; then
-  printf '\nSilk needs Clang 18 or newer to build programs (22 or newer for no-libc targets). Put it on PATH, or set SILK_CLANG to it.\n'
+  printf '\nSilk needs Clang 22 or newer to build programs. Put it on PATH, or set SILK_CLANG to it.\n'
 else
   clang_version=$("$clang" --version 2> /dev/null | head -n 1)
-  major=
-  case "$clang_version" in
-    *"Apple clang"*) ;;
-    *) major=$(printf '%s\n' "$clang_version" | sed -n 's/.*version \([0-9][0-9]*\).*/\1/p') ;;
-  esac
-  if [ -z "$major" ] || [ "$major" -lt 18 ]; then
-    printf '\nSilk needs Clang 18 or newer, but %s is: %s\n' "$clang" "$clang_version"
-    printf 'Put LLVM 18 or newer (22 for no-libc targets) on PATH, or set SILK_CLANG to its clang.\n'
-  elif [ "$major" -lt 22 ]; then
-    printf '\n%s is Clang %s: it builds ordinary programs, but no-libc targets need Clang 22 or newer.\n' "$clang" "$major"
+  major=$(printf '%s\n' "$clang_version" | sed -n 's/.*clang version \([0-9][0-9]*\).*/\1/p')
+  if [ -z "$major" ] || [ "$major" -lt 22 ]; then
+    printf '\nSilk needs Clang 22 or newer, but %s is: %s\n' "$clang" "$clang_version"
+    printf 'Put LLVM 22 or newer on PATH, or set SILK_CLANG to its clang.\n'
   fi
 fi
 
