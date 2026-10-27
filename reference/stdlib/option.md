@@ -50,45 +50,6 @@ pub fn main() -> i32 {
 An effect that requires `&Option<&S>` runs with or without a provider of `S`. See [`withSome`](#withSome).
 ```silk
 import silk.effect { Effect }
-import silk.option { Option, provideSome, withSome }
-
-service Tracer {
-  effect fn trace(value: i32) -> i32 ? &Tracer
-}
-
-struct Offset {
-  amount: i32,
-}
-
-impl Tracer for Offset {
-  effect fn trace(self: &Self, value: i32) -> i32 {
-    return value + self.amount
-  }
-}
-
-effect fn plain() -> i32 {
-  return 1
-}
-
-effect fn traced() -> i32 ? &Tracer {
-  return run Tracer.trace(1)
-}
-
-effect fn measure() -> i32 ? &Option<&Tracer> {
-  return run withSome<&Tracer>(plain(), traced())
-}
-
-pub fn main() -> i32 {
-  let offset = Offset {amount: 10}
-  let none = Option<never>.none()
-  let present = run provideSome<&Tracer>(measure(), &offset)
-  let absent = run Effect.provide(measure(), &none)
-  if present != 11 || absent != 1 {
-    return 1
-  }
-  return 0
-}
-```
 
 Import as `Option` with `import silk.option { Option }`.
 
@@ -172,6 +133,16 @@ pub value: T
 ```
 
 The owned present value.
+
+<a id="Option.impl.Copy"></a>
+
+## Implementation `Copy for Option<T>`
+
+```silk
+impl<T: Copy> Copy for Option<T>
+```
+
+An `Option` of a `Copy` type is `Copy`, so a struct with an `Option` field can be `Copy` too.
 
 <a id="Option.impl"></a>
 
@@ -598,7 +569,5 @@ The type argument is the requirement entry, such as `provideSome<&Tracer>`. The 
 borrowed for the execution of `program`. Every other requirement in `R` stays visible in the
 result.
 
-
-Category: Core.
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`.
