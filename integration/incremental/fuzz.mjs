@@ -150,6 +150,38 @@ const edits = {
     lines.splice(0, lines.length, ...replaced);
     return `rename private fn ${name} to ${renamed}`;
   },
+  // A call statement at the start of a function's body, to a helper this edit adds at the end of
+  // the file or, half the time, to one an earlier round added, so the walk reaches a new callee or
+  // an old one by a new path.
+  call(lines, round) {
+    const found = blocks(lines).filter((block) => /^(?:effect )?fn \w+/.test(lines[block.start]));
+    if (found.length === 0) return undefined;
+    const block = pick(found);
+    let open = block.start;
+    while (open < block.end && !/\{\s*$/.test(lines[open])) open += 1;
+    if (open >= block.end - 1) return undefined;
+    const helpers = lines.flatMap((line) => {
+      const named = /^fn (fuzzHelper\d+)\(\)/.exec(line);
+      return named ? [named[1]] : [];
+    });
+    let helper = helpers.length > 0 && random() < 0.5 ? pick(helpers) : undefined;
+    if (helper === undefined) {
+      helper = `fuzzHelper${round}`;
+      if (helpers.includes(helper)) return undefined;
+      lines.push('', `fn ${helper}() -> () {`, '  return ()', '}');
+    }
+    lines.splice(open + 1, 0, `  ${helper}()`);
+    return `call ${helper} from line ${open + 2}`;
+  },
+  // Takes out a call an earlier round added, so its callee may no longer be reached.
+  uncall(lines) {
+    const calls = lines.flatMap((line, at) => (/^\s+fuzzHelper\d+\(\)$/.test(line) ? [at] : []));
+    if (calls.length === 0) return undefined;
+    const at = pick(calls);
+    const removed = lines[at].trim();
+    lines.splice(at, 1);
+    return `remove the call ${removed} at line ${at + 1}`;
+  },
   duplicate(lines, round) {
     const found = blocks(lines).filter((block) => /^(?:effect )?fn \w+/.test(lines[block.start]));
     if (found.length === 0) return undefined;

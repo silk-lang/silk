@@ -25,7 +25,7 @@ node integration/incremental/fuzz.mjs --silk build/silkc --workspace . --package
 | `--edit-stdlib` | Edits the standard library copy too. |
 | `--keep-going` | Keeps going after a round whose builds disagree. |
 
-Each round makes one to three edits, each to a random file of the package's own folder (one edit in four goes to the standard library copy instead, with `--edit-stdlib`): a comment before a top-level item, a blank line, an integer literal one higher, two adjacent items swapped, a private function renamed through its file, a function copied under a new name, or a file put back as it was. Edits may well break the build. That is fine, since both builds must break the same way.
+Each round makes one to three edits, each to a random file of the package's own folder (one edit in four goes to the standard library copy instead, with `--edit-stdlib`): a comment before a top-level item, a blank line, an integer literal one higher, two adjacent items swapped, a private function renamed through its file, a function copied under a new name, a call to a helper added at the top of a function (the helper reused or appended to the file), such a call taken out again, or a file put back as it was. Edits may well break the build. That is fine, since both builds must break the same way.
 
 A round whose builds disagree is saved in `<work>/failures/round-<n>`: `edits.json` lists every round's edits up to it, `warm.txt` and `cold.txt` hold each build's status, executable digest and output, and `sources/` holds each file as it then read.
 
