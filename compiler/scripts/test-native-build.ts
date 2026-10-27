@@ -3243,7 +3243,7 @@ const program = Effect.gen(function* () {
   // The cache keeps each module's LLVM text as a file of its own beside the image, named by its
   // digest, so an unchanged rebuild finds every module's text where the last build left it.
   const packNames = Effect.fnUntraced(function* () {
-    const cache = join(split, 'build/cache')
+    const cache = join(split, 'build/cache/split')
     const folders = (yield* fs.readDirectory(cache)).filter((name) => name.endsWith('.packs'))
     assert.equal(folders.length, 1, `expected one pack folder, found ${folders.join(', ')}`)
     return (yield* fs.readDirectory(join(cache, folders[0]))).sort()
@@ -3252,7 +3252,7 @@ const program = Effect.gen(function* () {
   assert.ok(coldPacks.length > 2, `expected a pack per module, found ${coldPacks.join(', ')}`)
   // A load reads an unchanged file's imports from the summaries the last load kept beside the
   // cache instead of parsing the file, so an unchanged rebuild leaves them as they were.
-  const importSummaries = join(split, 'build/cache/imports')
+  const importSummaries = join(split, 'build/cache/split/imports')
   const summarizedAt = (yield* fs.stat(importSummaries)).mtime
   // An unchanged rebuild links nothing either: the executable stays the file the last link wrote.
   const splitExecutable = join(split, `build/llvm/${hostTarget}/debug/split`)
@@ -3307,6 +3307,33 @@ const program = Effect.gen(function* () {
   const releasedAt = (yield* fs.stat(releaseExecutable)).mtime
   yield* releaseBuild()
   assert.deepEqual((yield* fs.stat(releaseExecutable)).mtime, releasedAt, 'an unchanged release rebuild leaves the executable as it was')
+  // Workspace members share one output directory, and each keeps a cache of its own there, so
+  // building one member never replaces the cache another member's next build reads.
+  const pair = join(directory, 'pair')
+  yield* fs.writeFileString(join(pair, 'silk.toml'), '[workspace]\nmembers = ["first", "second"]\noutput-dir = "build"\n')
+  const memberSource = (value: number) => `pub fn main() -> i32 {\n  return ${value}\n}\n`
+  for (const member of ['first', 'second']) {
+    yield* fs.makeDirectory(join(pair, member, 'src'), { recursive: true })
+    yield* fs.writeFileString(join(pair, member, 'silk.toml'), `[package]\nname = "${member}"\nversion = "0.1.0"\n`)
+    yield* fs.writeFileString(join(pair, member, 'src/main.silk'), memberSource(1))
+  }
+  const memberBuild = Effect.fnUntraced(function* (member: string) {
+    const built = yield* invoke(silk, ['build', '--package', member, '--stdlib', standardLibrary], pair, splitEnvironment)
+    assert.equal(built.status, 0, built.stderr)
+  })
+  const memberImage = Effect.fnUntraced(function* (member: string) {
+    const names = (yield* fs.readDirectory(join(pair, 'build/cache', member))).filter((name) => /^semantic-[0-9a-f]{32}$/.test(name))
+    assert.equal(names.length, 1, `expected one semantic cache for ${member}, found ${names.join(', ')}`)
+    return join(pair, 'build/cache', member, names[0])
+  })
+  yield* memberBuild('first')
+  const firstImage = yield* memberImage('first')
+  const firstWritten = yield* fs.readFile(firstImage)
+  yield* memberBuild('second')
+  yield* fs.writeFileString(join(pair, 'second/src/main.silk'), memberSource(2))
+  yield* memberBuild('second')
+  assert.deepEqual(yield* fs.readFile(firstImage), firstWritten, "building another member leaves a member's cache as it was")
+  assert.notEqual(yield* memberImage('second'), firstImage)
   // A check replays the escape walks the last check left in the cache. A callback's call into
   // another module of the package is walked below the callback, so an edit there that adds a `run`
   // is reported as a cold check reports it, and an edit that keeps what the walk reads reports
