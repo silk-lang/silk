@@ -2205,6 +2205,31 @@ const program = Effect.gen(function* () {
     )
   }
   yield* fs.writeFileString(join(tuned, 'src/main.silk'), tunedMain)
+  if (process.platform === 'linux') {
+    // Static relocation links a dynamically linked executable at a fixed address, without PIE.
+    yield* fs.writeFileString(
+      join(tuned, 'silk.toml'),
+      `${tunedHeader}\n[profiles.fixed]\ntarget = "${hostTarget}"\nrelocation = "static"\n`,
+    )
+    yield* fs.writeFileString(argumentLog, '')
+    const fixedBuild = yield* invoke(
+      silk,
+      ['build', '--profile', 'fixed', '--stdlib', standardLibrary],
+      tuned,
+      { ...process.env, SILK_CLANG: recorder },
+    )
+    assert.equal(fixedBuild.status, 0, fixedBuild.stderr)
+    const fixedArguments = (yield* fs.readFileString(argumentLog)).split('\n')
+    assert.ok(
+      fixedArguments.includes('-fno-pic') && fixedArguments.includes('-no-pie') && !fixedArguments.includes('-static'),
+      fixedArguments.join(' '),
+    )
+    const fixedPath = join(tuned, 'build/llvm', hostTarget, 'fixed/tuned')
+    // ELF e_type 2 is an executable loaded at a fixed address; a PIE is 3.
+    assert.equal((yield* fs.readFile(fixedPath))[16], 2)
+    const fixedRun = yield* invoke(fixedPath, [], tuned)
+    assert.equal(fixedRun.status, 0, fixedRun.stderr)
+  }
   // Profile fields the native build cannot honor yet, a profile artifact other than the one
   // [package].kind requests, unknown manifest fields and reserved module names are refused
   // before anything is built, naming the manifest line.
