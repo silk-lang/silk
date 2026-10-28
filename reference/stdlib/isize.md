@@ -78,7 +78,7 @@ pub fn main() -> i32 {
 
 Import as `isize` with `import silk.isize`.
 
-Public declarations: 72.
+Public declarations: 73.
 
 <a id="MAX"></a>
 
@@ -747,6 +747,31 @@ pub fn saturatingMultiply(left: isize, right: isize) -> isize
 
 Returns `left * right`, clamped to [`MIN`](#MIN) or [`MAX`](#MAX). Use this function when a
 boundary value is the required overflow result.
+
+<a id="multiplyHigh"></a>
+
+## `multiplyHigh`
+
+```silk
+pub fn multiplyHigh(left: isize, right: isize) -> isize
+```
+
+Returns the high half of the exact double-width product `left * right`. It never overflows.
+
+### When to use
+
+Use this function with [`wrappingMultiply`](#wrappingMultiply), which returns the low half, when an algorithm
+needs the full product, such as multi-word arithmetic, multiply-shift hashing, or division by
+a precomputed reciprocal.
+
+### Details
+
+The width is the target word: the high 64 bits of a 128-bit product on a 64-bit target, and
+the high 32 bits of a 64-bit product on a 32-bit target.
+
+The product is signed, so the high half carries its sign: `multiplyHigh(-1, 1)` is `-1`. The
+full product is the high half times 2 to the power of the word width, plus the low half read
+as unsigned bits.
 
 <a id="checkedAdd"></a>
 
