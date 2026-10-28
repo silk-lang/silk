@@ -1553,15 +1553,39 @@ impl Validatable for User { /* ... */ }
 ```
 
 Scalar and borrowed `string` providers have no nominal declaration module, so only the contract's
-module may implement an interface for them. The same interface module may also implement that
-interface for an imported owned `String` nominal.
+module and the argument owner below may implement an interface for them. The same interface module
+may also implement that interface for an imported owned `String` nominal.
+
+An interface implementation may also appear in the module that declares the outer nominal type of
+the interface application's first type argument. This lets a library put its own type on the right
+of an operator whose left operand is a scalar:
+
+```silk,ignore
+// geometry/Vector2.silk
+import silk.ops { Multiply }
+
+pub struct Vector2 { pub x: f64, pub y: f64 }
+
+impl Multiply<Vector2, Vector2> for f64 {
+  fn multiply(left: f64, right: Vector2) -> Vector2 {
+    return Vector2 { x: left * right.x, y: left * right.y }
+  }
+}
+```
+
+Only the first type argument counts, so for one provider and one argument owner at most three
+modules (contract, provider, argument owner) can hold a competing head, and the program-wide
+coherence check reads all three. Such a conformance is found wherever its complete interface
+application is known: at an operator, a bound proof, or a qualified call that writes the
+application. A zero-operand or unapplied call that infers the application from the provider alone
+(INTF-006) reads only the contract's and the provider's modules.
 
 Third parties may define ordinary actor functions for any public type. To create a conformance
 between a foreign interface and foreign type, they define an owned nominal adapter and implement the
 interface for that adapter.
 
-**Boundary:** A module that owns neither the interface nor the nominal provider cannot declare
-their implementation. Imports never activate a conformance, and an `impl` in a neighboring directory
+**Boundary:** A module that owns neither the interface, the nominal provider, nor the first type
+argument's nominal cannot declare their implementation. Imports never activate a conformance, and an `impl` in a neighboring directory
 or package gains no ownership. Service and compiler-sealed intrinsic rules do not broaden.
 
 This locality rule does not require implementations to live inside either declaration. They remain
@@ -1664,17 +1688,43 @@ mapped `Plain.read` that needs `&mut P provides &ByteDuplex from &mut ByteDuplex
 under a head that states it. The constraints are discharged where a concrete provider instantiates
 the witness.
 
+An inherent head may bound its own parameters with the same syntax. The bounds are premises of
+every member of that block, and each call proves them under the owner application it selects, as
+it proves the member's own bounds. A type may have several inherent blocks with different bounds.
+
+```silk,ignore
+import silk.ownership { Copy }
+import silk.ops { Add, Multiply }
+
+struct Vector2<T> { x: T, y: T }
+
+impl<T: Copy> Vector2<T> {
+  fn swapped(self: Self) -> Self { return Vector2<T> { x: self.y, y: self.x } }
+}
+
+impl<T: Copy + Add<T, T> + Multiply<T, T>> Vector2<T> {
+  fn dot(self: Self, other: Self) -> T { return self.x * other.x + self.y * other.y }
+}
+```
+
+`v.dot(w)` is valid for `Vector2<i32>`; for a `Vector2<Name>` whose `Name` has no `Add`, the call
+reports the unproven bound while `swapped` stays available.
+
 **Boundary:** Every `impl` parameter must be determined by the interface application or provider
 head, and every bounded provider parameter must occur structurally inside the conformance provider.
 A parameter introduced only by a bound would create indistinguishable witnesses and is invalid.
-An inherent head takes neither bounds nor a `where` clause, and no head bounds arbitrary
-constructed types.
+An inherent head still names the whole family of its owner (`impl<T: Float> Vector2<T>`, never
+`impl Vector2<f64>`), takes interface, sealed-property and outlives bounds but no callable bound or
+`where` clause, and no head bounds arbitrary constructed types. Bounds never make two inherent
+members distinct: one name declared in two blocks is a duplicate member whatever their bounds.
 
 **Diagnostics:** An undetermined parameter reports an unconstrained-impl-parameter diagnostic at
 its declaration. A witness `where` constraint the head and operation do not state reports `SEM0083`
-at the mapping, and a `where` clause on an inherent head reports `SEM0194`. A bound whose provider does not occur inside the conformance provider reports the
-non-descending requirement described by IMPL-008. Invalid operations inside the body retain their
-ordinary missing-bound or contract diagnostics.
+at the mapping, and a `where` clause or callable bound on an inherent head reports `SEM0194`. A
+call to an inherent member whose block bound does not hold reports `SEM0121` at the call. A bound
+whose provider does not occur inside the conformance provider reports the non-descending
+requirement described by IMPL-008. Invalid operations inside the body retain their ordinary
+missing-bound or contract diagnostics.
 
 **Current compiler:** Aligned. Bounded `impl<...>` declarations use implicit `Self`, preserve all
 bound conjuncts, and delay concrete admission until every requirement is proven.
@@ -1783,25 +1833,31 @@ The parts of an `Effect` type in the provider, such as its success and error typ
 parts too, so `impl<'env, E: Debug> Outcome<Effect<'env; i32 ! E>> for Runner<Effect<'env; i32 ! E>>`
 descends.
 
+Only the provider position decides descent. The interface arguments of a bound may repeat the
+bounded parameter or name any other type, because every step still moves to a strict part of a
+finite concrete provider:
+
+```silk,ignore
+// Valid: proving Vec2<i32>: Sum<i32> needs i32: Add<i32, i32>, one step down.
+impl<T: Add<T, T>> Sum<T> for Vec2<T> { /* ... */ }
+```
+
 The compiler proves termination from the declaration itself. It does not use a recursion-depth
 limit, solver fuel, source order, or the set of currently reachable concrete calls.
 
 **Boundary:** A conditional conformance cannot require the same provider, a peer unrelated to the
-provider's structure, or a larger provider. It also cannot multiply an open parameter while proof
-descends or repeatedly rewrite a fixed interface argument to create an infinite chain. Those forms
-are rejected even when no current program happens to trigger the cycle.
+provider's structure, or a larger provider. Those forms are rejected even when no current program
+happens to trigger the cycle.
 
 This restriction intentionally excludes conformances conditioned only on a result or target type
 that is not structurally contained in the provider. An ordinary generic actor function can express
 that relationship without installing a global conformance fact.
 
 **Diagnostics:** A non-descending declaration reports a conditional-conformance-termination
-diagnostic at the offending bound. It names the required provider and conformance provider and
-explains whether the step stayed equal, moved to an unrelated peer, grew, duplicated an open
-parameter, or changed a fixed interface argument.
+diagnostic (`SEM0120`) at the offending bound.
 
-**Current compiler:** Aligned. Structural termination is checked against the implicit provider and
-retains the strict descent and occurrence invariants.
+**Current compiler:** Aligned. Structural termination is checked against the implicit provider:
+each bound's provider must be a parameter that occurs in it.
 
 **Evidence:** structural termination requirement,
 [termination proof](../bootstrap/packages/compiler/src/ConformanceHead.ts),
@@ -1870,9 +1926,9 @@ The later interface rules must preserve decisions already confirmed elsewhere:
   forms. See [SERV-001](requirements-and-services.md#serv-001--a-conformance-may-define-or-map-each-operation).
 - A service is an interface with dependency eligibility and no other distinct conformance behavior.
   See [SERV-003](requirements-and-services.md#serv-003--a-service-is-a-dependency-eligible-interface).
-- An interface conformance for a nominal provider belongs to the interface's module or the
-  provider's module; a service conformance belongs to the provider's module; a scalar or `string`
-  provider's conformance belongs to the interface's module. See
+- An interface conformance belongs to the interface's module, the nominal provider's module, or
+  the module declaring the nominal of the interface application's first type argument; a service
+  conformance belongs to the provider's module. See
   [IMPL-004](#impl-004--an-interface-or-its-nominal-provider-may-own-a-conformance).
 - Interface operation operands retain their declared move or borrow modes. They do not receive
   blanket reference adaptation.
