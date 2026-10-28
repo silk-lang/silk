@@ -129,6 +129,18 @@ struct Writer {
   site: u64,
   transfer: u64,
   frame: u64,
+  /// Per MIR block, whether its switch dispatches through a table of block addresses, and the
+  /// tables the function being built uses, defined once its blocks have positions.
+  threaded: List<bool>,
+  tables: List<JumpTable>,
+}
+
+/// A private table of block addresses one threaded switch loads from: its name, its array type,
+/// and the block handle of each slot.
+struct JumpTable {
+  name: Bytes,
+  ty: u64,
+  slots: List<u64>,
 }
 
 /// An observed trap's report inputs: the observer and selected-cause local addresses, the site
@@ -161,7 +173,8 @@ effect fn writerOfWidth(pointerBits: usize, fastPath: bool) -> Writer ! OutOfMem
     pointerBits: pointerBits, slots: List<u64>.make(), companions: List<u64>.make(),
     blocks: List<u64>.make(), copies: List<CallerCopy>.make(), parameters: List<u64>.make(), providers: List<u64>.make(),
     out: Bitcode.none(), failure: Bitcode.none(), context: Bitcode.none(), observer: Bitcode.none(), cause: Bitcode.none(),
-    site: Bitcode.none(), transfer: Bitcode.none(), frame: Bitcode.none()}
+    site: Bitcode.none(), transfer: Bitcode.none(), frame: Bitcode.none(), threaded: List<bool>.make(),
+    tables: List<JumpTable>.make()}
 }
 
 // Forgets the function just built, keeping the module and its counter.
@@ -4076,6 +4089,9 @@ effect fn emitBlock(
         return run compareChain(&mut writer.*, &tested, List<SwitchCase>.asSlice(&cases), otherwise, index)
       }
       let selected = List<SwitchCase>.asSlice(&cases)
+      if index < List<bool>.length(&writer.threaded) && List<bool>.get(&writer.threaded, index) {
+        return run emitThreadedSwitch(&mut writer.*, &tested, selected, otherwise)
+      }
       let mut table = List<u64>.make()
       let mut caseAt = usize.ZERO
       while caseAt < selected.length {
@@ -4088,6 +4104,156 @@ effect fn emitBlock(
       run Module.switch(&mut writer.*.module, tested.value, fallback, List<u64>.asSlice(&table))
     }
   }
+  return ()
+}
+
+// Threaded dispatch: a large switch inside a loop, such as a bytecode interpreter's, loads its
+// target from a table of block addresses and branches there with `indirectbr`. LLVM copies an
+// indirect branch's block into each predecessor (as it does for a computed `goto`), so every arm
+// dispatches the next case itself instead of jumping back to one shared jump-table branch, which
+// saves the jump and lets the branch predictor learn from each arm. A function with an `indirectbr`
+// is never inlined, so only switches with many cases inside a loop qualify.
+fn threadedMinimumCases() -> usize { return 64 }
+fn threadedMaximumValue() -> u64 { return 4096 }
+
+// Per MIR block, whether its switch qualifies for threaded dispatch: at least
+// `threadedMinimumCases` cases with distinct targets, every case value in `0..threadedMaximumValue`
+// of an integer of at most 64 bits, no target the entry block, and a case that reaches the switch again.
+effect fn threadedSwitches(function: &MirFunction, target: &Target) -> List<bool> ! OutOfMemoryError ? &mut Allocator {
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let mut result = List<bool>.make()
+  let wasm = same(Target.objectFormat(target), b"wasm")
+  let mut at = usize.ZERO
+  while at < blocks.length {
+    let mut qualifies = false
+    if let Terminator.Switch {cases, otherwise, ..} = &blocks[at].terminator {
+      let selected = List<SwitchCase>.asSlice(&cases)
+      qualifies = !wasm && selected.length >= threadedMinimumCases() && otherwise != usize.ZERO
+      let mut seen = List<bool>.make()
+      run List<bool>.appendRepeated(&mut seen, false, blocks.length)
+      let mut distinct = usize.ZERO
+      let mut caseAt = usize.ZERO
+      while qualifies && caseAt < selected.length {
+        let value = decimalBits(Bytes.asSlice(&selected[caseAt].decimal), false)
+        if selected[caseAt].negative || value >= threadedMaximumValue() || selected[caseAt].target == usize.ZERO {
+          qualifies = false
+        } else if !List<bool>.get(&seen, selected[caseAt].target) {
+          List<bool>.set(&mut seen, selected[caseAt].target, true)
+          distinct = distinct + usize.ONE
+        }
+        caseAt = caseAt + usize.ONE
+      }
+      if qualifies && distinct < threadedMinimumCases() { qualifies = false }
+      if qualifies { qualifies = run reachesAgain(function, at) }
+    }
+    run List<bool>.append(&mut result, qualifies)
+    at = at + usize.ONE
+  }
+  return move result
+}
+
+// Whether some successor of block `start` leads back to it.
+effect fn reachesAgain(function: &MirFunction, start: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let count = List<Block>.length(&function.blocks)
+  let mut visited = List<bool>.make()
+  run List<bool>.appendRepeated(&mut visited, false, count)
+  let mut pending = run MirFunction.successors(function, start)
+  while List<usize>.length(&pending) > usize.ZERO {
+    let block = match List<usize>.pop(&mut pending) {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => { break }
+    }
+    if block == start { return true }
+    if !List<bool>.get(&visited, block) {
+      List<bool>.set(&mut visited, block, true)
+      let next = run MirFunction.successors(function, block)
+      run List<usize>.appendSlice(&mut pending, List<usize>.asSlice(&next))
+    }
+  }
+  return false
+}
+
+// The threaded form of a qualifying switch (`threadedSwitches`): values past the table go to
+// `otherwise`, the rest load their block's address from the table and branch to it.
+effect fn emitThreadedSwitch(writer: &mut Writer, tested: &Value, cases: &[SwitchCase], otherwise: usize) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let fallback = blockAt(&writer.*, otherwise)
+  let mut highest: u64 = 0
+  let mut at = usize.ZERO
+  while at < cases.length {
+    let value = decimalBits(Bytes.asSlice(&cases[at].decimal), false)
+    if value > highest { highest = value }
+    at = at + usize.ONE
+  }
+  let span = u64.toUsize(highest) + usize.ONE
+  let mut slots = List<u64>.make()
+  run List<u64>.appendRepeated(&mut slots, fallback, span)
+  let mut targets = List<u64>.make()
+  run List<u64>.append(&mut targets, fallback)
+  at = usize.ZERO
+  while at < cases.length {
+    let block = blockAt(&writer.*, cases[at].target)
+    List<u64>.set(&mut slots, u64.toUsize(decimalBits(Bytes.asSlice(&cases[at].decimal), false)), block)
+    if !listed(List<u64>.asSlice(&targets), block) { run List<u64>.append(&mut targets, block) }
+    at = at + usize.ONE
+  }
+  let word = integerRepresentation(64, false)
+  let mut position = tested.*
+  if tested.scalar.bits < 64 { position = run castOf(&mut writer.*, Bitcode.castZExt(), tested, word) }
+  // An unsigned value whose every value has a slot needs no range check.
+  let covered = !tested.scalar.signed && tested.scalar.bits < 64 && span == u64.toUsize(u64.shiftLeft(1, usize.toU64(tested.scalar.bits)))
+  if !covered {
+    let inside = run compareWith(&mut writer.*, Bitcode.intUlt(), word, position.value, usize.toU64(span))
+    let dispatch = run Module.newBlock(&mut writer.*.module, 0)
+    run branchIf(&mut writer.*, inside, dispatch, fallback)
+    Module.startBlock(&mut writer.*.module, dispatch)
+  }
+  let pointer = run pointerType(&mut writer.*)
+  let ty = run Module.array(&mut writer.*.module, span, pointer)
+  let mut name = run Bytes.copy(Bytes.asSlice(&writer.symbol))
+  run Bytes.append(&mut name, b".dispatch.")
+  run appendDecimal(&mut name, usize.toU64(Module.fresh(&mut writer.*.module)))
+  let table = run Module.objectRef(&mut writer.*.module, Bytes.asSlice(&name), ty)
+  let indices = [position.value]
+  let slot = run Module.gep(&mut writer.*.module, 0, pointer, table, &indices)
+  let alignment = writer.pointerBits / 8
+  let address = run loadPointer(&mut writer.*, slot, alignment)
+  run Module.indirectBranch(&mut writer.*.module, address, List<u64>.asSlice(&targets))
+  run List<JumpTable>.append(&mut writer.*.tables, JumpTable {name: move name, ty: ty, slots: move slots})
+  return ()
+}
+
+fn listed(values: &[u64], value: u64) -> bool {
+  let mut at = usize.ZERO
+  while at < values.length {
+    if values[at] == value { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Defines the tables of the function just built, `function` of type `functionType`, now that its
+// blocks have positions.
+effect fn defineTables(writer: &mut Writer, functionType: u64, function: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut tables = List<JumpTable>.make()
+  let pending = Intrinsic.replace(writer.*.tables, move tables)
+  let listed = List<JumpTable>.asSlice(&pending)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let handles = List<u64>.asSlice(&listed[at].slots)
+    let mut addresses = List<u64>.make()
+    let mut slot = usize.ZERO
+    while slot < handles.length {
+      let position = writer.*.module.blockPosition(handles[slot])
+      run List<u64>.append(&mut addresses, run Module.blockAddress(&mut writer.*.module, functionType, function, position))
+      slot = slot + usize.ONE
+    }
+    let initializer = run Module.aggregate(&mut writer.*.module, listed[at].ty, List<u64>.asSlice(&addresses))
+    let global = run Module.defineObject(&mut writer.*.module, Bytes.asSlice(&listed[at].name), listed[at].ty, Bitcode.linkPrivate(), true, initializer)
+    Module.setUnnamed(&mut writer.*.module, global, 1)
+    at = at + usize.ONE
+  }
+  drop pending
   return ()
 }
 
@@ -4578,6 +4744,7 @@ pub effect fn emit(
   if !fastPath { lifetimes = run StackLifetimes.plan(function) }
   let companions = run companionLocals(function)
   run addBlocks(&mut writer, blocks.length)
+  if !fastPath { writer.threaded = run threadedSwitches(function, target) }
   at = usize.ZERO
   while at < blocks.length {
     let handle = blockAt(&writer, at)
@@ -4590,6 +4757,7 @@ pub effect fn emit(
     at = at + usize.ONE
   }
   run Module.endBody(&mut writer.module)
+  run defineTables(&mut writer, functionTy, defined)
   return run Module.serialize(&writer.module)
 }
 
