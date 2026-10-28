@@ -16,14 +16,19 @@
 //!   the place itself when the local is never borrowed and no block the call can continue to names
 //!   it. The callee owns the storage it receives for the call, so the local must be dead afterwards.
 //!
-//! Both keep the invariants `MirVerification.callDestinationsFresh` checks: a destination is still a
+//! - A local that every return path moves or copies whole into the result local, as its last use,
+//!   becomes the result local itself, so it is built in the caller's result storage.
+//!
+//! All keep the invariants `MirVerification.callDestinationsFresh` checks: a destination is still a
 //! whole temporary or the result local, never borrowed, and named by no argument.
 
+import backend.MirVerification
 import backend.Mir {
   AggregateField,
   AssemblyFragment,
   Block,
   Callee,
+  Cancel,
   Diagnostics,
   FailureEdge,
   Local,
@@ -37,6 +42,7 @@ import backend.Mir {
   Terminator,
 }
 import semantic.Type {Type}
+import semantic.TypedBody {Origin}
 import semantic.Types {Types}
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.box {Box}
@@ -48,7 +54,9 @@ import silk.usize
 /// Rewrites `function`'s call results and by-value arguments to skip the temporaries they pass
 /// through, where no reachable code can tell the difference.
 pub effect fn coalesce(function: &mut MirFunction) -> () ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  // Collapsing first folds each return's own temporary into `_0 = r`, which the rename needs.
   run collapseCopies(&mut function.*)
+  run renameReturned(&mut function.*)
   if !hasCall(&function.*) { return () }
   run forwardResults(&mut function.*)
   return run forwardArguments(&mut function.*)
@@ -316,6 +324,270 @@ fn isUserOrTemp(function: &MirFunction, local: usize) -> bool {
   }
 }
 
+// Renames the local every return moves into the result local to the result local itself, so a
+// value built up in a binding (`let mut r = ...; r.x = ...; return r`) is built in the caller's
+// result storage instead of copied there. Every statement naming the result must be `_0 = r` for
+// one whole user binding or temporary `r` of the result's type, and nothing reachable after one of
+// those statements may name `r` again. Paths that leave without returning `r`, such as a failure
+// exit, drop it as before, now in the result storage the caller does not read on failure.
+/// Statements and terminators below which `renameReturned` leaves a body alone.
+const smallBody: usize = 64
+
+fn bodySize(function: &MirFunction) -> usize {
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let mut size = blocks.length
+  let mut at = usize.ZERO
+  while at < blocks.length {
+    size = size + List<Statement>.length(&blocks[at].statements)
+    at = at + usize.ONE
+  }
+  return size
+}
+
+effect fn renameReturned(function: &mut MirFunction) -> () ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  // A small function is likely inlined, where its local result folds away anyway. Building it in
+  // the caller's slot instead leaves no local for SROA, so LLVM's inline cost loses that saving
+  // and stops inlining it (a 240-byte `let mut result = value; result.f = ...; return result`
+  // went out of line in silk-layout).
+  if bodySize(&function.*) < smallBody { return () }
+  let returned = run returnedLocal(&function.*)
+  if returned == usize.MAX { return () }
+  let mut blocks = List<Block>.asMutSlice(&mut function.blocks)
+  let mut block = usize.ZERO
+  while block < blocks.length {
+    let mut at = usize.ZERO
+    while at < List<Statement>.length(&blocks[block].statements) {
+      let returning = match &List<Statement>.asSlice(&blocks[block].statements)[at] {
+        Statement.Assign {destination, value: Rvalue.Use {value: used}, ..} => wholePlace(&destination) == usize.ZERO && wholeLocal(&used) == returned
+        _ => false
+      }
+      if returning {
+        drop List<Statement>.remove(&mut blocks[block].statements, at)
+        continue
+      }
+      renameStatement(&mut List<Statement>.asMutSlice(&mut blocks[block].statements)[at], returned)
+      at = at + usize.ONE
+    }
+    renameTerminator(&mut blocks[block].terminator, returned)
+    block = block + usize.ONE
+  }
+  // Drops of the local on paths that do not return it, such as a failure exit, now drop the
+  // result local, guarded by the same flags.
+  let mut locals = List<Local>.asMutSlice(&mut function.locals)
+  let mut at = usize.ZERO
+  while at < locals.length {
+    if let LocalKind.DropFlag {local: guarded, path} = &mut locals[at].kind {
+      if guarded == returned { guarded = usize.ZERO }
+      let mut steps = List<Projection>.asMutSlice(&mut path)
+      let mut step = usize.ZERO
+      while step < steps.length {
+        if let Projection.Index {local: index} = &mut steps[step] {
+          if index == returned { index = usize.ZERO }
+        }
+        step = step + usize.ONE
+      }
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+fn renamePlace(place: &mut Place, local: usize) -> () {
+  if place.local == local { place.local = usize.ZERO }
+  let mut steps = List<Projection>.asMutSlice(&mut place.projections)
+  let mut at = usize.ZERO
+  while at < steps.length {
+    if let Projection.Index {local: index} = &mut steps[at] {
+      if index == local { index = usize.ZERO }
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+fn renameOperand(operand: &mut Operand, local: usize) -> () {
+  match &mut operand.* {
+    Operand.Copy {place} => renamePlace(&mut place, local)
+    Operand.Move {place} => renamePlace(&mut place, local)
+    _ => ()
+  }
+  return ()
+}
+
+fn renameOperands(operands: &mut List<Operand>, local: usize) -> () {
+  let mut listed = List<Operand>.asMutSlice(&mut operands.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    renameOperand(&mut listed[at], local)
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+fn renameFields(fields: &mut List<AggregateField>, local: usize) -> () {
+  let mut listed = List<AggregateField>.asMutSlice(&mut fields.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    renameOperand(&mut listed[at].value, local)
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Every place `rvalueNames` counts except assembly inputs, which `returnedLocal` rules out.
+fn renameRvalue(value: &mut Rvalue, local: usize) -> () {
+  match &mut value.* {
+    Rvalue.Aggregate {fields} => renameFields(&mut fields, local)
+    Rvalue.Slice {data, count} => {
+      renameOperand(&mut data, local)
+      renameOperand(&mut count, local)
+    }
+    Rvalue.SliceLength {place} => renamePlace(&mut place, local)
+    Rvalue.SliceData {place} => renamePlace(&mut place, local)
+    Rvalue.PointerOffset {pointer, index, ..} => {
+      renameOperand(&mut pointer, local)
+      renameOperand(&mut index, local)
+    }
+    Rvalue.Use {value: used} => renameOperand(&mut used, local)
+    Rvalue.Ref {place, ..} => renamePlace(&mut place, local)
+    Rvalue.AddressOf {place, ..} => renamePlace(&mut place, local)
+    Rvalue.Unary {value: used, ..} => renameOperand(&mut used, local)
+    Rvalue.Binary {left, right, ..} => {
+      renameOperand(&mut left, local)
+      renameOperand(&mut right, local)
+    }
+    Rvalue.ScalarBinary {left, right, ..} => {
+      renameOperand(&mut left, local)
+      renameOperand(&mut right, local)
+    }
+    Rvalue.ScalarUnary {value: used, ..} => renameOperand(&mut used, local)
+    Rvalue.Convert {value: used, ..} => renameOperand(&mut used, local)
+    Rvalue.Fits {value: used, ..} => renameOperand(&mut used, local)
+    Rvalue.AddressIntegerConversion {operand, ..} => renameOperand(&mut operand, local)
+    Rvalue.Bitcast {value: used, ..} => renameOperand(&mut used, local)
+    Rvalue.Discriminant {place} => renamePlace(&mut place, local)
+    Rvalue.Inject {value: used, ..} => renameOperand(&mut used, local)
+    Rvalue.Variant {fields, ..} => renameFields(&mut fields, local)
+    Rvalue.ContextOf {place} => renamePlace(&mut place, local)
+    Rvalue.ContextHandle {address} => renameOperand(&mut address, local)
+    Rvalue.Atomic {operands, ..} => renameOperands(&mut operands, local)
+    Rvalue.Vector {operands, ..} => renameOperands(&mut operands, local)
+    Rvalue.StackAllocate {count, ..} => renameOperand(&mut count, local)
+    _ => ()
+  }
+  return ()
+}
+
+fn renameStatement(statement: &mut Statement, local: usize) -> () {
+  match &mut statement.* {
+    Statement.Assign {destination, value, ..} => {
+      renamePlace(&mut destination, local)
+      renameRvalue(&mut value, local)
+    }
+    Statement.Drop {destination, ..} => renamePlace(&mut destination, local)
+    Statement.FailureContext {destination, source, ..} => {
+      renamePlace(&mut destination, local)
+      if let Option<Place>.Some {value: from} = &mut source { renamePlace(&mut from, local) }
+    }
+    Statement.SetContextHandle {address, value, ..} => {
+      renameOperand(&mut address, local)
+      renameOperand(&mut value, local)
+    }
+  }
+  return ()
+}
+
+// Every place `terminatorNames` counts except diagnostics, which `returnedLocal` rules out.
+fn renameTerminator(terminator: &mut Terminator, local: usize) -> () {
+  match &mut terminator.* {
+    Terminator.Branch {condition, ..} => renameOperand(&mut condition, local)
+    Terminator.Switch {value, ..} => renameOperand(&mut value, local)
+    Terminator.TrapText {reason, ..} => renameOperand(&mut reason, local)
+    Terminator.Call {callee, arguments, providers, destination, failure, ..} => {
+      renameOperands(&mut arguments, local)
+      renameOperands(&mut providers, local)
+      renamePlace(&mut destination, local)
+      match &mut callee {
+        Callee.Indirect {address} => renameOperand(&mut address, local)
+        Callee.NativeIndirect {address, ..} => renameOperand(&mut address, local)
+        _ => ()
+      }
+      if let Option<FailureEdge>.Some {value: edge} = &mut failure { renamePlace(&mut edge.destination, local) }
+    }
+    _ => ()
+  }
+  return ()
+}
+
+// The local `renameReturned` can turn into the result local, or `usize.MAX`.
+effect fn returnedLocal(function: &MirFunction) -> usize ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  // A suspending frame keeps its locals in the frame; leave it alone.
+  if let Option<Origin>.Some {..} = &function.suspension { return usize.MAX }
+  if List<Cancel>.length(&function.cancels) != usize.ZERO { return usize.MAX }
+  let locals = List<Local>.asSlice(&function.locals)
+  if locals.length == usize.ZERO || !isReturn(function, usize.ZERO) { return usize.MAX }
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let mut returned = usize.MAX
+  let mut exits = List<usize>.make()
+  let mut block = usize.ZERO
+  while block < blocks.length {
+    if let Terminator.Relinquish {..} = &blocks[block].terminator { return usize.MAX }
+    if terminatorNames(&blocks[block].terminator, usize.ZERO) != usize.ZERO { return usize.MAX }
+    let statements = List<Statement>.asSlice(&blocks[block].statements)
+    let mut at = usize.ZERO
+    while at < statements.length {
+      if statementNames(&statements[at], usize.ZERO) != usize.ZERO {
+        let source = match &statements[at] {
+          Statement.Assign {destination, value: Rvalue.Use {value: used}, ..} => {
+            if wholePlace(&destination) != usize.ZERO { return usize.MAX }
+            wholeLocal(&used)
+          }
+          _ => { return usize.MAX }
+        }
+        if source == usize.MAX || (returned != usize.MAX && source != returned) { return usize.MAX }
+        returned = source
+        // Nothing after the move in its own block may name the local.
+        let mut after = at + usize.ONE
+        while after < statements.length {
+          if statementNames(&statements[after], source) != usize.ZERO { return usize.MAX }
+          after = after + usize.ONE
+        }
+        if terminatorNames(&blocks[block].terminator, source) != usize.ZERO { return usize.MAX }
+        let following = run MirFunction.successors(function, block)
+        run List<usize>.appendSlice(&mut exits, List<usize>.asSlice(&following))
+      }
+      at = at + usize.ONE
+    }
+    block = block + usize.ONE
+  }
+  if returned == usize.MAX || returned == usize.ZERO || !isUserOrTemp(function, returned) { return usize.MAX }
+  if !(run Type.equalsShared(&locals[returned].ty, &locals[usize.ZERO].ty)) { return usize.MAX }
+  // Assembly inputs and diagnostics sit behind boxes the rename does not reach.
+  block = usize.ZERO
+  while block < blocks.length {
+    if let Terminator.Call {diagnostics, ..} = &blocks[block].terminator {
+      if diagnosticsName(&diagnostics, returned) != usize.ZERO { return usize.MAX }
+    }
+    let statements = List<Statement>.asSlice(&blocks[block].statements)
+    let mut at = usize.ZERO
+    while at < statements.length {
+      match &statements[at] {
+        Statement.Assign {value: Rvalue.Assembly {fragment}, ..} => {
+          if operandsName(&Box<AssemblyFragment>.get(&fragment)[0].inputs, returned) != usize.ZERO { return usize.MAX }
+        }
+        Statement.Drop {diagnostics, ..} => {
+          if diagnosticsName(&diagnostics, returned) != usize.ZERO { return usize.MAX }
+        }
+        _ => ()
+      }
+      at = at + usize.ONE
+    }
+    block = block + usize.ONE
+  }
+  if run reachedNames(function, &exits, returned) { return usize.MAX }
+  return returned
+}
+
 // Collapses `b = v; ...; a = b` within a block into `a = v` when `b` is a whole user binding or
 // temporary named nowhere else and `a` is a whole local of the same type that nothing borrows,
 // drops or names in between. Lowering moves a call's result through a temporary, a `let` and
@@ -444,7 +716,12 @@ effect fn resultCandidate(function: &MirFunction, at: usize) -> usize ! OutOfMem
     return usize.MAX
   }
   let targetUses = usesOf(function, target)
-  if !forwardable(function, target, &targetUses) { return usize.MAX }
+  // A result local built up in place may be borrowed, but only after the call writes it.
+  let mut uses = targetUses
+  if isReturn(function, target) && uses.borrowed && !(run MirVerification.resultBorrowedBefore(function, at)) {
+    uses.borrowed = false
+  }
+  if !forwardable(function, target, &uses) { return usize.MAX }
   if terminatorNames(&blocks[at].terminator, target) != usize.ZERO { return usize.MAX }
   // A failed call may leave its destination partly written, so the failure path must not read it.
   if failed != usize.MAX {
