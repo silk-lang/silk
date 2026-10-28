@@ -1,9 +1,9 @@
 ---
-title: Synchronous native callbacks
-description: Native code addresses, complete-call callback promises, reentrancy, and indirect invocation.
+title: Native callbacks
+description: Native code addresses, immediate and deferred callback promises, reentrancy, and indirect invocation.
 ---
 
-# Synchronous native callbacks
+# Native callbacks
 
 This contract completes the existing exported C-address boundary. A native function pointer is a
 nonnull Copy address, with an exact C signature and behavioral contract. It has no captured Silk
@@ -12,11 +12,15 @@ environment. Borrowed data passed during invocation has a separate lifetime from
 ## Declaring callback invocation
 
 The sealed `Intrinsic.foreign` declaration clause accepts `callbacks`, a tuple naming every native
-function-pointer parameter. Each listed parameter promises synchronous invocation on the calling
-thread, entirely within the enclosing call, without retention for later invocation. Omitting a
-callback parameter does not imply that promise: unrestricted invocation is unadmitted and diagnoses.
-Requests for escaping callbacks or permitted unwind also diagnose; a callback that runs on another
-thread uses `threadCallbacks` instead.
+function-pointer parameter or callback field in a by-value C aggregate. Each listed callback promises
+synchronous invocation on the calling thread, entirely within the enclosing call, without retention
+for later invocation. Omitting a callback does not imply that promise: an incomplete contract
+diagnoses even when the declaration is never called.
+
+Use `deferredCallbacks` for retention followed by invocation during later calls on the registering
+thread, or `threadCallbacks` for invocation on any thread. A declaration selects one callback mode;
+its list must cover every callback exactly once. These invocation clauses do not narrow memory
+access, locality or pointer capture and cannot be combined with those narrowing promises.
 
 The function-pointer type itself accepts the same clause for its access behavior. In type clauses,
 unnamed parameters are identified by decimal ordinal strings, starting at `"0"`. Declaration clauses
@@ -41,8 +45,8 @@ create a loan or prove that arbitrary native code obeys these obligations.
 
 `Intrinsic.foreign(threadCallbacks: ("start",))` is the alternative to `callbacks` for a callback
 that native code may invoke on any thread, during the call or after it returns, such as the start
-routine of `pthread_create`. The tuple follows the `callbacks` rules: it names every native
-function-pointer parameter exactly once, and the resolved C signature is authenticated again. A
+routine of `pthread_create`. Its tuple names every native function-pointer parameter or by-value
+aggregate callback field exactly once, and the resolved C signature is authenticated again. A
 listed callback may take no reference parameter, since no loan of the caller can last until it runs.
 
 ```silk,ignore
@@ -58,6 +62,57 @@ The export itself needs nothing more: it has no captured environment, and Silk h
 or mutable global storage, so its body runs the same on a new thread. Whatever reaches it through
 its raw-pointer arguments is the unsafe caller's obligation, typically an owned value moved with
 `Pointer.take` (see the native pointer boundary) whose type is `Transferable` (THREAD-001).
+
+## Deferred callbacks on the registering thread
+
+`Intrinsic.foreign(deferredCallbacks: ("info.callback",))` permits native code to retain a callback
+after registration returns. Native code may invoke it only during a later call marked
+`Intrinsic.foreign(invokesDeferredCallbacks: true)`, on the thread that registered it. Registration
+does not itself invoke the deferred callback. Event-pump, wait and cancellation calls that can invoke
+retained callbacks must carry the marker. The marker is a literal `true`, not an expression or `false`.
+
+```silk,ignore
+extern "C" struct CallbackInfo {
+  nextInChain: ?*mut u8,
+  mode: u32,
+  callback: extern "C" fn(u32, ?*mut u8, ?*mut u8) -> (),
+  userdata1: ?*mut u8,
+  userdata2: ?*mut u8,
+}
+
+unsafe extern "C" fn requestAdapter(instance: ?*mut u8, info: CallbackInfo) -> u64
+  with Intrinsic.foreign(deferredCallbacks: ("info.callback",))
+
+unsafe extern "C" fn processEvents(instance: ?*mut u8) -> ()
+  with Intrinsic.foreign(invokesDeferredCallbacks: true)
+```
+
+The compiler records the invocation mode and the event-pump marker as behavior, but does not match
+registrations to a named pump or infer a native library's execution policy. The unsafe binding author
+must justify the same-thread and invocation-extent promises from that library's contract. A runtime
+callback mode that allows spontaneous or cross-thread invocation requires `threadCallbacks` instead.
+
+Deferred callbacks take no references or slices. Registration and marked invocation calls also take
+no references or slices: retained userdata has no compiler-proved relationship to a later call's
+loans. The raw-pointer userdata need not be `Transferable` solely because of deferred invocation.
+The unsafe owner must keep its storage alive and at a stable address, prevent conflicting access
+during reentry, and drain or cancel all pending invocations before freeing it. Same-thread invocation
+does not extend a borrow or establish ownership.
+
+## Callbacks in by-value aggregates
+
+A callback path starts with the written parameter name and follows C struct fields separated by
+dots, for example `"request.info.callback"`. Type aliases do not hide callbacks. Every callback
+leaf in the resolved by-value argument must be listed exactly once; omitted, duplicate, unknown
+and non-callback paths diagnose. The rule applies to all three callback modes.
+Fixed-array fields containing callbacks are rejected; indexed callback paths are not admitted.
+Arrays without callback leaves retain their ordinary C ABI rules.
+
+Traversal stops at raw pointers. A path cannot cross `nextInChain`, an opaque handle or a userdata
+pointer. Such storage, including any callbacks reachable through it, remains the unsafe binding
+author's explicit responsibility; the compiler neither discovers its runtime layout nor proves its
+lifetime. A binding should expose a typed by-value registration boundary when it needs checked
+callback coverage.
 
 ## Exported addresses and exact behavior
 
@@ -102,5 +157,5 @@ failure exits. Fatal traps and forbidden unwind do not promise cleanup or become
 
 The complete contract participates in source/interface identity, caches and mismatch diagnostics.
 C headers retain valid C syntax; the companion manifest retains the additional behavioral facts.
-LTO remains explicitly unsupported. Retained registration, cross-thread invocation, permitted
-unwind, captured callbacks and broader ABI forms require a separately admitted consumer.
+LTO remains explicitly unsupported. Permitted unwind and captured callbacks require a separately
+admitted consumer. Retained callbacks use the deferred same-thread or any-thread contracts above.
