@@ -1009,7 +1009,7 @@ const program = Effect.gen(function* () {
       refused.stderr,
       /^src\/main\.silk:1:8: error\[SEM0225\] Entry point `main` has a result or requirement the selected runtime `silk\/platform\/native\/start_sync` cannot start/m,
     )
-    assert.doesNotMatch(refused.stderr, /native_start_sync\.silk:/)
+    assert.doesNotMatch(refused.stderr, /platform\/native\/start_sync\.silk:/)
   }
   // A `main` that returns a borrow such as `string` gets the entry point error once, not the
   // `'static` hint that only leads to it.
