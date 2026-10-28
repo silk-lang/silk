@@ -1574,11 +1574,13 @@ impl Multiply<Vector2, Vector2> for f64 {
 ```
 
 Only the first type argument counts, so for one provider and one argument owner at most three
-modules (contract, provider, argument owner) can hold a competing head, and the program-wide
-coherence check reads all three. Such a conformance is found wherever its complete interface
-application is known: at an operator, a bound proof, or a qualified call that writes the
-application. A zero-operand or unapplied call that infers the application from the provider alone
-(INTF-006) reads only the contract's and the provider's modules.
+modules (contract, provider, argument owner) can hold a competing head. The coherence check of an
+argument-owned head reads all three, so it reports any overlap with a head in the other two. Such a
+conformance is found wherever its first type argument is known before selection: at an operator, in
+a bound proof, or at a qualified call that writes the application, as `Multiply<Vector2,
+Vector2>.multiply(2.0, v)`. Selection that starts from the provider alone reads only the contract's
+and the provider's modules: method syntax on the provider (`2.0.multiply(v)`), and a call that
+infers the application or leaves its first type argument to inference (INTF-006).
 
 Third parties may define ordinary actor functions for any public type. To create a conformance
 between a foreign interface and foreign type, they define an owned nominal adapter and implement the
