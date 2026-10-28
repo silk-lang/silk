@@ -116,6 +116,9 @@ struct Writer {
   blocks: List<u64>,
   /// Caller copies of indirect C arguments in the entry block: block, parameter and address.
   copies: List<CallerCopy>,
+  /// Entry-block copies that cold drops of whole aggregate locals run on: block, statement and
+  /// address (`emitDropCopySlots`).
+  dropCopies: List<DropCopy>,
   /// Its arguments: each written parameter's first lane (`none()` for a unit one), the hidden
   /// provider addresses, and the hidden result, failure, context, observer, cause and site
   /// addresses; a coroutine's transfer record and frame. Absent ones are `none()`.
@@ -161,7 +164,15 @@ struct CallerCopy {
   address: u64,
 }
 
+struct DropCopy {
+  block: usize,
+  statement: usize,
+  address: u64,
+  size: usize,
+}
+
 impl Copy for CallerCopy {}
+impl Copy for DropCopy {}
 
 effect fn writerFor(target: &Target, fastPath: bool) -> Writer ! OutOfMemoryError ? &mut Allocator {
   return run writerOfWidth(u32.toUsize(Target.pointerBits(target)), fastPath)
@@ -171,7 +182,7 @@ effect fn writerFor(target: &Target, fastPath: bool) -> Writer ! OutOfMemoryErro
 effect fn writerOfWidth(pointerBits: usize, fastPath: bool) -> Writer ! OutOfMemoryError ? &mut Allocator {
   return Writer {module: Module.make(), symbol: Bytes.make(), trap: Option<TrapReport>.none(), fastPath: fastPath,
     pointerBits: pointerBits, slots: List<u64>.make(), companions: List<u64>.make(),
-    blocks: List<u64>.make(), copies: List<CallerCopy>.make(), parameters: List<u64>.make(), providers: List<u64>.make(),
+    blocks: List<u64>.make(), copies: List<CallerCopy>.make(), dropCopies: List<DropCopy>.make(), parameters: List<u64>.make(), providers: List<u64>.make(),
     out: Bitcode.none(), failure: Bitcode.none(), context: Bitcode.none(), observer: Bitcode.none(), cause: Bitcode.none(),
     site: Bitcode.none(), transfer: Bitcode.none(), frame: Bitcode.none(), threaded: List<bool>.make(),
     tables: List<JumpTable>.make()}
@@ -183,6 +194,7 @@ fn resetFunction(writer: &mut Writer) -> () {
   List<u64>.clear(&mut writer.*.companions)
   List<u64>.clear(&mut writer.*.blocks)
   List<CallerCopy>.clear(&mut writer.*.copies)
+  List<DropCopy>.clear(&mut writer.*.dropCopies)
   List<u64>.clear(&mut writer.*.parameters)
   List<u64>.clear(&mut writer.*.providers)
   writer.out = Bitcode.none()
@@ -3580,6 +3592,100 @@ effect fn cCopySlots(writer: &mut Writer, parameters: &[CAbi.Lane], block: usize
   return ()
 }
 
+// Blocks reached from the entry without taking a failure edge or a cancel exit.
+effect fn hotBlocks(function: &MirFunction) -> List<bool> ! OutOfMemoryError ? &mut Allocator {
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let mut hot = List<bool>.make()
+  run List<bool>.appendRepeated(&mut hot, false, blocks.length)
+  if blocks.length == usize.ZERO { return move hot }
+  let mut pending = List<usize>.make()
+  run List<usize>.append(&mut pending, usize.ZERO)
+  List<bool>.set(&mut hot, usize.ZERO, true)
+  while List<usize>.length(&pending) > usize.ZERO {
+    let last = List<usize>.length(&pending) - usize.ONE
+    let at = List<usize>.get(&pending, last)
+    List<usize>.truncate(&mut pending, last)
+    let mut next = List<usize>.make()
+    match &blocks[at].terminator {
+      Terminator.Goto {target, ..} => run List<usize>.append(&mut next, target)
+      Terminator.Branch {thenBlock, elseBlock, ..} => {
+        run List<usize>.append(&mut next, thenBlock)
+        run List<usize>.append(&mut next, elseBlock)
+      }
+      Terminator.Call {normal, ..} => run List<usize>.append(&mut next, normal)
+      Terminator.Relinquish {resume, ..} => run List<usize>.append(&mut next, resume)
+      Terminator.Switch {cases, otherwise, ..} => {
+        let listed = List<SwitchCase>.asSlice(&cases)
+        let mut case = usize.ZERO
+        while case < listed.length {
+          run List<usize>.append(&mut next, listed[case].target)
+          case = case + usize.ONE
+        }
+        run List<usize>.append(&mut next, otherwise)
+      }
+      _ => {}
+    }
+    let reached = List<usize>.asSlice(&next)
+    let mut each = usize.ZERO
+    while each < reached.length {
+      if !List<bool>.get(&hot, reached[each]) {
+        List<bool>.set(&mut hot, reached[each], true)
+        run List<usize>.append(&mut pending, reached[each])
+      }
+      each = each + usize.ONE
+    }
+  }
+  return move hot
+}
+
+// A drop on a failure path that passes a whole aggregate local's own address to out-of-line drop
+// glue makes that local escape, so LLVM keeps it in memory on the hot path too: a struct literal
+// moved into an inlined constructor is built in a stack temporary and copied into place (#2507).
+// Such a drop runs on an entry-block copy instead, made by `copyBytes` just before the call; the
+// copy is a plain memory transfer, which leaves the local promotable.
+effect fn emitDropCopySlots(writer: &mut Writer, function: &MirFunction, target: &Target,
+  layouts: &TypeLayouts) -> () ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let hot = run hotBlocks(function)
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let locals = List<Local>.asSlice(&function.locals)
+  let word = usize.toU64(writer.pointerBits) / 8
+  let mut block = usize.ZERO
+  while block < blocks.length {
+    if !List<bool>.get(&hot, block) {
+      let statements = List<Statement>.asSlice(&blocks[block].statements)
+      let mut at = usize.ZERO
+      while at < statements.length {
+        if let Statement.Drop {destination, origin, ..} = &statements[at] {
+          if List<Projection>.length(&destination.projections) == usize.ZERO {
+            let local = destination.local
+            let facts = run layoutOf(layouts, &locals[local].ty, function, origin.location)
+            let kind = storageRepresentation(&locals[local].ty, target, facts)
+            if !kind.unit && usize.toU64(facts.size) > word * 2 {
+              let ty = run typeOf(&mut writer.*, kind)
+              let address = run Module.alloca(&mut writer.*.module, ty, usize.toU64(facts.alignment))
+              run List<DropCopy>.append(&mut writer.*.dropCopies, DropCopy {block: block, statement: at, address: address, size: facts.size})
+            }
+          }
+        }
+        at = at + usize.ONE
+      }
+    }
+    block = block + usize.ONE
+  }
+  return ()
+}
+
+// The entry-block copy that cold drop statement `statement` of block `block` runs on, if any.
+fn dropCopy(writer: &Writer, block: usize, statement: usize) -> Option<DropCopy> {
+  let listed = List<DropCopy>.asSlice(&writer.dropCopies)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if listed[at].block == block && listed[at].statement == statement { return Option<DropCopy>.some(listed[at]) }
+    at = at + usize.ONE
+  }
+  return Option<DropCopy>.none()
+}
+
 // The caller copy slot of indirect C argument `parameter` of block `block`'s call.
 fn callerCopy(writer: &Writer, block: usize, parameter: usize) -> u64 {
   let copies = List<CallerCopy>.asSlice(&writer.copies)
@@ -4063,8 +4169,13 @@ effect fn emitBlock(
       // then the current observer and cause in a program that observes diagnostics.
       Statement.Drop {destination, glue, diagnostics, origin} => {
         let address = run emitPlace(&mut writer.*, function, target, layouts, &destination)
+        let mut droppedAddress = address.value
+        if let Option<DropCopy>.Some {value: copy} = dropCopy(&writer.*, index, at) {
+          run copyBytes(&mut writer.*, copy.address, address.value, copy.size)
+          droppedAddress = copy.address
+        }
         let mut passed = List<u64>.make()
-        run List<u64>.append(&mut passed, address.value)
+        run List<u64>.append(&mut passed, droppedAddress)
         if let Option<Diagnostics>.Some {value: observed} = &diagnostics {
           run appendDiagnostics(&mut writer.*, function, target, layouts, &observed, &mut passed)
         }
@@ -4404,6 +4515,7 @@ effect fn emitEntrySlots(
 ) -> () ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
   run emitSlots(&mut writer.*, function, target, layouts, &Option<Suspended>.none())
   run emitCCopySlots(&mut writer.*, function, target, layouts, foreign)
+  if !writer.fastPath { run emitDropCopySlots(&mut writer.*, function, target, layouts) }
   let locals = List<Local>.asSlice(&function.locals)
   let parameters = List<Shared<Type>>.asSlice(&function.parameters)
   let mut cParameters = List<CAbi.Lane>.make()
