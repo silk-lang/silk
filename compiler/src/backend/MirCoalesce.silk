@@ -1,0 +1,490 @@
+//! Copy coalescing on lowered MIR: removes the temporaries a call's result and its by-value
+//! arguments pass through when nothing can observe the difference.
+//!
+//! # Details
+//! Lowering gives each call a fresh temporary destination and a fresh snapshot of each argument, so
+//! `return f(x)` copies `f`'s result into the function's own result, and `f(x)` copies `x` before the
+//! call. For a large `Copy` struct each copy is a `memcpy` that LLVM keeps, because the callee may
+//! write the address it receives. Two rewrites remove them:
+//!
+//! - A call whose temporary result is only moved or copied whole into the result local, or into
+//!   another temporary, by the first statement of its continuation writes that place directly. The
+//!   place must not be named by the call itself, borrowed anywhere, dropped anywhere, or named on the
+//!   call's failure path.
+//! - An argument that is a temporary snapshot of a place (a local and its constant field or element
+//!   projections), taken in the call's own block with nothing after it touching that local, passes
+//!   the place itself when the local is never borrowed and no block the call can continue to names
+//!   it. The callee owns the storage it receives for the call, so the local must be dead afterwards.
+//!
+//! Both keep the invariants `MirVerification.callDestinationsFresh` checks: a destination is still a
+//! whole temporary or the result local, never borrowed, and named by no argument.
+
+import backend.Mir {
+  AggregateField,
+  AssemblyFragment,
+  Block,
+  Callee,
+  Diagnostics,
+  FailureEdge,
+  Local,
+  LocalKind,
+  MirFunction,
+  Operand,
+  Place,
+  Projection,
+  Rvalue,
+  Statement,
+  Terminator,
+}
+import semantic.Type {Type}
+import semantic.Types {Types}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.box {Box}
+import silk.list {List}
+import silk.option {Option}
+import silk.ownership {Copy}
+import silk.usize
+
+/// Rewrites `function`'s call results and by-value arguments to skip the temporaries they pass
+/// through, where no reachable code can tell the difference.
+pub effect fn coalesce(function: &mut MirFunction) -> () ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  if !hasCall(&function.*) { return () }
+  run forwardResults(&mut function.*)
+  return run forwardArguments(&mut function.*)
+}
+
+// Whether `callee` follows the Silk calling convention rather than a C signature.
+fn silkCallee(callee: &Callee) -> bool {
+  return match &callee.* {
+    Callee.Instance {..} => true
+    Callee.Indirect {..} => true
+    _ => false
+  }
+}
+
+fn hasCall(function: &MirFunction) -> bool {
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let mut at = usize.ZERO
+  while at < blocks.length {
+    if let Terminator.Call {..} = &blocks[at].terminator { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// The whole local an operand copies or moves, or `usize.MAX`.
+fn wholeLocal(operand: &Operand) -> usize {
+  return match &operand.* {
+    Operand.Copy {place} => wholePlace(&place)
+    Operand.Move {place} => wholePlace(&place)
+    _ => usize.MAX
+  }
+}
+
+fn wholePlace(place: &Place) -> usize {
+  if List<Projection>.length(&place.projections) != usize.ZERO { return usize.MAX }
+  return place.local
+}
+
+fn isTemp(function: &MirFunction, local: usize) -> bool {
+  return match &List<Local>.asSlice(&function.locals)[local].kind { LocalKind.Temp => true _ => false }
+}
+
+fn isReturn(function: &MirFunction, local: usize) -> bool {
+  return match &List<Local>.asSlice(&function.locals)[local].kind { LocalKind.Return => true _ => false }
+}
+
+// Whether any local is a drop flag guarding a part of `local`.
+fn flagged(function: &MirFunction, local: usize) -> bool {
+  let locals = List<Local>.asSlice(&function.locals)
+  let mut at = usize.ZERO
+  while at < locals.length {
+    if let LocalKind.DropFlag {local: guarded, ..} = &locals[at].kind {
+      if guarded == local { return true }
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Counts of how `function` names one local.
+struct Uses {
+  // Places that name the local: operands, destinations, drops and index projections.
+  named: usize,
+  // Shared or exclusive borrows and address-of of a place of the local.
+  borrowed: bool,
+  // Drops of a place of the local.
+  dropped: bool,
+}
+
+impl Copy for Uses {}
+
+fn placeNames(place: &Place, local: usize) -> usize {
+  let mut count = usize.ZERO
+  if place.local == local { count = usize.ONE }
+  let steps = List<Projection>.asSlice(&place.projections)
+  let mut at = usize.ZERO
+  while at < steps.length {
+    if let Projection.Index {local: index} = &steps[at] {
+      if index == local { count = count + usize.ONE }
+    }
+    at = at + usize.ONE
+  }
+  return count
+}
+
+fn operandNames(operand: &Operand, local: usize) -> usize {
+  return match &operand.* {
+    Operand.Copy {place} => placeNames(&place, local)
+    Operand.Move {place} => placeNames(&place, local)
+    _ => usize.ZERO
+  }
+}
+
+fn operandsName(operands: &List<Operand>, local: usize) -> usize {
+  let listed = List<Operand>.asSlice(operands)
+  let mut count = usize.ZERO
+  let mut at = usize.ZERO
+  while at < listed.length {
+    count = count + operandNames(&listed[at], local)
+    at = at + usize.ONE
+  }
+  return count
+}
+
+fn fieldsName(fields: &List<AggregateField>, local: usize) -> usize {
+  let listed = List<AggregateField>.asSlice(fields)
+  let mut count = usize.ZERO
+  let mut at = usize.ZERO
+  while at < listed.length {
+    count = count + operandNames(&listed[at].value, local)
+    at = at + usize.ONE
+  }
+  return count
+}
+
+fn diagnosticsName(diagnostics: &Option<Diagnostics>, local: usize) -> usize {
+  if let Option<Diagnostics>.Some {value} = &diagnostics.* {
+    return operandNames(Diagnostics.observer(&value), local) + operandNames(Diagnostics.cause(&value), local)
+      + operandNames(Diagnostics.site(&value), local)
+  }
+  return usize.ZERO
+}
+
+fn rvalueNames(value: &Rvalue, local: usize) -> usize {
+  return match &value.* {
+    Rvalue.Aggregate {fields} => fieldsName(&fields, local)
+    Rvalue.Slice {data, count} => operandNames(&data, local) + operandNames(&count, local)
+    Rvalue.SliceLength {place} => placeNames(&place, local)
+    Rvalue.SliceData {place} => placeNames(&place, local)
+    Rvalue.PointerOffset {pointer, index, ..} => operandNames(&pointer, local) + operandNames(&index, local)
+    Rvalue.Use {value: used} => operandNames(&used, local)
+    Rvalue.Ref {place, ..} => placeNames(&place, local)
+    Rvalue.AddressOf {place, ..} => placeNames(&place, local)
+    Rvalue.Unary {value: used, ..} => operandNames(&used, local)
+    Rvalue.Binary {left, right, ..} => operandNames(&left, local) + operandNames(&right, local)
+    Rvalue.ScalarBinary {left, right, ..} => operandNames(&left, local) + operandNames(&right, local)
+    Rvalue.ScalarUnary {value: used, ..} => operandNames(&used, local)
+    Rvalue.Convert {value: used, ..} => operandNames(&used, local)
+    Rvalue.Fits {value: used, ..} => operandNames(&used, local)
+    Rvalue.AddressIntegerConversion {operand, ..} => operandNames(&operand, local)
+    Rvalue.Bitcast {value: used, ..} => operandNames(&used, local)
+    Rvalue.Discriminant {place} => placeNames(&place, local)
+    Rvalue.Inject {value: used, ..} => operandNames(&used, local)
+    Rvalue.Variant {fields, ..} => fieldsName(&fields, local)
+    Rvalue.ContextOf {place} => placeNames(&place, local)
+    Rvalue.ContextHandle {address} => operandNames(&address, local)
+    Rvalue.Assembly {fragment} => operandsName(&Box<AssemblyFragment>.get(&fragment)[0].inputs, local)
+    Rvalue.Atomic {operands, ..} => operandsName(&operands, local)
+    Rvalue.Vector {operands, ..} => operandsName(&operands, local)
+    Rvalue.StackAllocate {count, ..} => operandNames(&count, local)
+    _ => usize.ZERO
+  }
+}
+
+fn borrows(value: &Rvalue, local: usize) -> bool {
+  return match &value.* {
+    Rvalue.Ref {place, ..} => place.local == local
+    Rvalue.AddressOf {place, ..} => place.local == local
+    Rvalue.ContextOf {place} => place.local == local
+    _ => false
+  }
+}
+
+fn statementNames(statement: &Statement, local: usize) -> usize {
+  return match &statement.* {
+    Statement.Assign {destination, value, ..} => placeNames(&destination, local) + rvalueNames(&value, local)
+    Statement.Drop {destination, diagnostics, ..} => placeNames(&destination, local) + diagnosticsName(&diagnostics, local)
+    Statement.FailureContext {destination, source, ..} => {
+      let mut count = placeNames(&destination, local)
+      if let Option<Place>.Some {value: from} = &source { count = count + placeNames(&from, local) }
+      return count
+    }
+    Statement.SetContextHandle {address, value, ..} => operandNames(&address, local) + operandNames(&value, local)
+  }
+}
+
+fn terminatorNames(terminator: &Terminator, local: usize) -> usize {
+  return match &terminator.* {
+    Terminator.Branch {condition, ..} => operandNames(&condition, local)
+    Terminator.Switch {value, ..} => operandNames(&value, local)
+    Terminator.TrapText {reason, ..} => operandNames(&reason, local)
+    Terminator.Call {callee, arguments, providers, diagnostics, destination, failure, ..} => {
+      let mut count = operandsName(&arguments, local) + operandsName(&providers, local) + diagnosticsName(&diagnostics, local)
+        + placeNames(&destination, local)
+      match &callee {
+        Callee.Indirect {address} => { count = count + operandNames(&address, local) }
+        Callee.NativeIndirect {address, ..} => { count = count + operandNames(&address, local) }
+        _ => ()
+      }
+      if let Option<FailureEdge>.Some {value: edge} = &failure { count = count + placeNames(&edge.destination, local) }
+      return count
+    }
+    _ => usize.ZERO
+  }
+}
+
+// The result local is read by `return` and the failure slot by `fail`, so a block ending in either
+// names it.
+fn blockNames(function: &MirFunction, block: &Block, local: usize) -> usize {
+  let statements = List<Statement>.asSlice(&block.statements)
+  let mut count = terminatorNames(&block.terminator, local)
+  let mut at = usize.ZERO
+  while at < statements.length {
+    count = count + statementNames(&statements[at], local)
+    at = at + usize.ONE
+  }
+  let exits = match &block.terminator {
+    Terminator.Return {..} => isReturn(function, local)
+    Terminator.Fail {..} => match &List<Local>.asSlice(&function.locals)[local].kind { LocalKind.Failure => true _ => false }
+    _ => false
+  }
+  if exits { count = count + usize.ONE }
+  return count
+}
+
+fn usesOf(function: &MirFunction, local: usize) -> Uses {
+  let mut uses = Uses {named: usize.ZERO, borrowed: false, dropped: false}
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let mut at = usize.ZERO
+  while at < blocks.length {
+    uses.named = uses.named + terminatorNames(&blocks[at].terminator, local)
+    let statements = List<Statement>.asSlice(&blocks[at].statements)
+    let mut index = usize.ZERO
+    while index < statements.length {
+      uses.named = uses.named + statementNames(&statements[index], local)
+      match &statements[index] {
+        Statement.Assign {value, ..} => { if borrows(&value, local) { uses.borrowed = true } }
+        Statement.Drop {destination, ..} => { if destination.local == local { uses.dropped = true } }
+        _ => ()
+      }
+      index = index + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return uses
+}
+
+// Whether a block reachable from one of `starts`, including a start itself, names `local`.
+effect fn reachedNames(function: &MirFunction, starts: &List<usize>, local: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let mut seen = List<bool>.make()
+  run List<bool>.appendRepeated(&mut seen, false, blocks.length)
+  let mut pending = List<usize>.make()
+  run List<usize>.appendSlice(&mut pending, List<usize>.asSlice(starts))
+  while true {
+    let next = match List<usize>.pop(&mut pending) {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => { break }
+    }
+    if List<bool>.get(&seen, next) { continue }
+    List<bool>.set(&mut seen, next, true)
+    if blockNames(function, &blocks[next], local) != usize.ZERO { return true }
+    let following = run MirFunction.successors(function, next)
+    run List<usize>.appendSlice(&mut pending, List<usize>.asSlice(&following))
+  }
+  return false
+}
+
+// Whether `local` can stand in for a call's temporary destination: a whole result local or
+// temporary that nothing borrows or drops.
+fn forwardable(function: &MirFunction, local: usize, uses: &Uses) -> bool {
+  if !(isReturn(function, local) || isTemp(function, local)) { return false }
+  return !uses.borrowed && !uses.dropped && !flagged(function, local)
+}
+
+effect fn forwardResults(function: &mut MirFunction) -> () ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut at = usize.ZERO
+  while at < List<Block>.length(&function.blocks) {
+    let candidate = run resultCandidate(&function.*, at)
+    if candidate != usize.MAX {
+      let mut blocks = List<Block>.asMutSlice(&mut function.blocks)
+      let mut continuation = usize.MAX
+      if let Terminator.Call {destination, normal, ..} = &mut blocks[at].terminator {
+        destination.local = candidate
+        continuation = normal
+      }
+      drop List<Statement>.remove(&mut blocks[continuation].statements, usize.ZERO)
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// The local the call ending block `at` can write in place of its temporary destination, or
+// `usize.MAX`.
+effect fn resultCandidate(function: &MirFunction, at: usize) -> usize ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let mut temporary = usize.MAX
+  let mut next = usize.MAX
+  let mut failed = usize.MAX
+  if let Terminator.Call {callee, destination, normal, failure, ..} = &blocks[at].terminator {
+    // C calls check their destination against the foreign signature; leave them alone.
+    if !silkCallee(&callee) { return usize.MAX }
+    if let Option<FailureEdge>.Some {value: edge} = &failure { failed = edge.target }
+    temporary = wholePlace(&destination)
+    next = normal
+  }
+  if temporary == usize.MAX || !isTemp(function, temporary) { return usize.MAX }
+  let statements = List<Statement>.asSlice(&blocks[next].statements)
+  if statements.length == usize.ZERO { return usize.MAX }
+  let target = match &statements[usize.ZERO] {
+    Statement.Assign {destination, value: Rvalue.Use {value: used}, ..} => {
+      if wholeLocal(&used) != temporary { return usize.MAX }
+      wholePlace(&destination)
+    }
+    _ => { return usize.MAX }
+  }
+  if target == usize.MAX || target == temporary { return usize.MAX }
+  let locals = List<Local>.asSlice(&function.locals)
+  if !(run Type.equalsShared(&locals[temporary].ty, &locals[target].ty)) { return usize.MAX }
+  let temporaryUses = usesOf(function, temporary)
+  if temporaryUses.named != 2 || temporaryUses.borrowed || temporaryUses.dropped || flagged(function, temporary) {
+    return usize.MAX
+  }
+  let targetUses = usesOf(function, target)
+  if !forwardable(function, target, &targetUses) { return usize.MAX }
+  if terminatorNames(&blocks[at].terminator, target) != usize.ZERO { return usize.MAX }
+  // A failed call may leave its destination partly written, so the failure path must not read it.
+  if failed != usize.MAX {
+    let mut starts = List<usize>.make()
+    run List<usize>.append(&mut starts, failed)
+    if run reachedNames(function, &starts, target) { return usize.MAX }
+  }
+  return target
+}
+
+// A by-value argument and the snapshot statement it can replace.
+struct Snapshot {
+  argument: usize,
+  statement: usize,
+}
+
+impl Copy for Snapshot {}
+
+effect fn forwardArguments(function: &mut MirFunction) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < List<Block>.length(&function.blocks) {
+    let mut found = run argumentCandidates(&function.*, at)
+    // Later statements first, so earlier indexes stay valid.
+    while List<Snapshot>.length(&found) > usize.ZERO {
+      let picked = match List<Snapshot>.pop(&mut found) {
+        Option<Snapshot>.Some {value} => value
+        Option<Snapshot>.None => { break }
+      }
+      let mut blocks = List<Block>.asMutSlice(&mut function.blocks)
+      let removed = List<Statement>.remove(&mut blocks[at].statements, picked.statement)
+      let source = match move removed {
+        Statement.Assign {value: Rvalue.Use {value: Operand.Copy {place}}, ..} => move place
+        _ => { continue }
+      }
+      if let Terminator.Call {arguments, ..} = &mut blocks[at].terminator {
+        let mut listed = List<Operand>.asMutSlice(&mut arguments)
+        listed[picked.argument] = Operand.Copy {place: move source}
+      }
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Whether a place's projections are all fixed offsets into its local.
+fn fixedPath(place: &Place) -> bool {
+  let steps = List<Projection>.asSlice(&place.projections)
+  let mut at = usize.ZERO
+  while at < steps.length {
+    let fixed = match &steps[at] {
+      Projection.Field {..} => true
+      Projection.ConstIndex {..} => true
+      _ => false
+    }
+    if !fixed { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// The arguments of the call ending block `at` that can pass their source place directly, ordered
+// by the statement that snapshots them.
+effect fn argumentCandidates(function: &MirFunction, at: usize) -> List<Snapshot> ! OutOfMemoryError ? &mut Allocator {
+  let mut found = List<Snapshot>.make()
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let block = &blocks[at]
+  let arguments = match &block.terminator {
+    Terminator.Call {callee, arguments, ..} => {
+      if !silkCallee(&callee) { return move found }
+      List<Operand>.asSlice(&arguments)
+    }
+    _ => { return move found }
+  }
+  let statements = List<Statement>.asSlice(&block.statements)
+  let mut successors = List<usize>.make()
+  let mut statement = statements.length
+  while statement > usize.ZERO {
+    statement = statement - usize.ONE
+    let source = match &statements[statement] {
+      Statement.Assign {value: Rvalue.Use {value: Operand.Copy {place}}, ..} => &place
+      _ => { continue }
+    }
+    let temporary = match &statements[statement] {
+      Statement.Assign {destination, ..} => wholePlace(&destination)
+      _ => usize.MAX
+    }
+    if temporary == usize.MAX || !isTemp(function, temporary) || source.local == temporary { continue }
+    let mut argument = usize.ZERO
+    while argument < arguments.length && wholeLocal(&arguments[argument]) != temporary { argument = argument + usize.ONE }
+    if argument == arguments.length { continue }
+    let local = source.local
+    let kind = match &List<Local>.asSlice(&function.locals)[local].kind {
+      LocalKind.Parameter {..} => true
+      LocalKind.User {..} => true
+      LocalKind.Temp => true
+      _ => false
+    }
+    if !kind || !fixedPath(source) { continue }
+    let temporaryUses = usesOf(function, temporary)
+    if temporaryUses.named != 2 || temporaryUses.borrowed || temporaryUses.dropped { continue }
+    // Nothing between the snapshot and the call touches the source.
+    let mut later = statement + usize.ONE
+    let mut touched = false
+    while later < statements.length {
+      if statementNames(&statements[later], local) != usize.ZERO { touched = true }
+      later = later + usize.ONE
+    }
+    if touched || terminatorNames(&block.terminator, local) != usize.ZERO { continue }
+    let localUses = usesOf(function, local)
+    if localUses.borrowed { continue }
+    if List<usize>.length(&successors) == usize.ZERO { successors = run MirFunction.successors(function, at) }
+    if run reachedNames(function, &successors, local) { continue }
+    run List<Snapshot>.append(&mut found, Snapshot {argument: argument, statement: statement})
+  }
+  // Collected from the last statement back; reverse so popping removes the latest first.
+  let mut ordered = List<Snapshot>.make()
+  while List<Snapshot>.length(&found) > usize.ZERO {
+    match List<Snapshot>.pop(&mut found) {
+      Option<Snapshot>.Some {value} => { run List<Snapshot>.append(&mut ordered, value) }
+      Option<Snapshot>.None => { break }
+    }
+  }
+  return move ordered
+}
