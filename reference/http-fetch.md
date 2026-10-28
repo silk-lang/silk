@@ -312,7 +312,7 @@ import silk.http.fetch {Fetch, FetchOptions, FetchRequest, PoolMode, ProxyMode}
 import silk.http.fetch as HttpFetch
 import silk.http.fetch_native as FetchNative
 import silk.http.redirect as Redirect
-import silk.option {Option}
+import silk.core.option {Option}
 import silk.tls.trust_source {TrustSource}
 
 let mut nativeOptions = Native.Options.defaults()

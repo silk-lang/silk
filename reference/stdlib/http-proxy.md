@@ -47,7 +47,7 @@ import silk.http.proxy {
   RouteMode,
   selectRoute
 }
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.uri.uri { Uri }
 import silk.uri.reference { ParseError }

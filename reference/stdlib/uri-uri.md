@@ -25,7 +25,7 @@ apply scheme rules, such as a default port.
 ## Examples
 ### Read the parts of a URL
 ```silk
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.uri.uri { Uri }
 import silk.uri.reference { ParseError }

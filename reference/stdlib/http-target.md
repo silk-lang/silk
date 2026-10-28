@@ -29,7 +29,7 @@ of a URI, because a fragment is never sent.
 ```silk
 import silk.http.message { Method, ValueError, ValueReason }
 import silk.http.target { HttpAuthority, RequestTarget, effectiveAuthority }
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.core.result { Result }
 
 pub fn main() -> i32 {

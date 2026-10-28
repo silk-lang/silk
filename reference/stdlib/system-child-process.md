@@ -34,7 +34,7 @@ import silk.collections.bytes { Bytes }
 import silk.system.child_process { ChildProcess, ProcessError, ProcessOutcome, ProcessRequest }
 import silk.core.effect { Effect }
 import silk.system.filesystem { FileError, Path }
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.num.usize
 
 struct Completed {}

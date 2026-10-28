@@ -33,7 +33,7 @@ reinterprets bits.
 complement form. For zero, both zero counts return [`BITS`](#BITS).
 
 [`parse`](#parse) reads decimal text. A leading `-` is valid, and a leading `+` is not valid. To write a
-value as text, use `silk.format.Format.display` or `Format.displayWith` with a `Writer`. Neither
+value as text, use `silk.text.format.Format.display` or `Format.displayWith` with a `Writer`. Neither
 needs an `Allocator`.
 
 ## Gotchas
@@ -56,7 +56,7 @@ pub fn main() -> i32 {
 
 ### Parse decimal text and reject invalid text
 ```silk
-import silk.format { ParseError }
+import silk.text.format { ParseError }
 import silk.core.result { Result }
 import silk.num.i16
 
@@ -893,10 +893,10 @@ not skip spaces and does not accept digit separators.
 
 ### Errors
 
-- `ParseError` with reason `silk.format.NotANumber` if `text` is empty, starts with `+`,
+- `ParseError` with reason `silk.text.format.NotANumber` if `text` is empty, starts with `+`,
   contains a byte that is not a digit, or has bytes after the number. `offset` gives the byte
   position where the read stopped.
-- `ParseError` with reason `silk.format.OutOfRange` if the number is outside the range of `i16`.
+- `ParseError` with reason `silk.text.format.OutOfRange` if the number is outside the range of `i16`.
 
 
 Category: Numbers.

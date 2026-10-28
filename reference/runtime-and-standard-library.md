@@ -125,7 +125,7 @@ Only closed language bindings exist without source imports. Standard-library act
 types—enter a module scope only through explicit imports.
 
 ```silk
-import silk.option { Option }
+import silk.core.option { Option }
 
 pub fn main() -> i32 {
   let value = Option<i32>.some(42)
@@ -145,7 +145,7 @@ declarations it contains.
 
 **Boundary:** There is no implicit standard-library prelude, token-based module discovery, or
 fallback lookup after an unknown name. An LSP auto-import inserts ordinary source text. Importing an
-ordinary project module named `Option` is unrelated to `silk.option`.
+ordinary project module named `Option` is unrelated to `silk.core.option`.
 
 **Diagnostics:** Naming an unimported standard-library actor uses the ordinary unknown-name
 diagnostic and may include an auto-import action. Declaring a project module under reserved

@@ -23,7 +23,7 @@ it allocates. [`Headers.formatInto`](#Headers.impl.formatInto) writes `name: val
 ```silk
 import silk.http.message { Header, ValueError }
 import silk.http.headers { HeaderIterator, Headers, Limits }
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.core.result { Result }
 
 fn limits() -> Limits {

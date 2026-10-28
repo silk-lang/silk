@@ -498,7 +498,7 @@ pub escaped: bool
 Number
 ```
 
-A number. It is not converted. Use `silk.format.Format` to read its text.
+A number. It is not converted. Use `silk.text.format.Format` to read its text.
 
 <a id="JsonToken.Number.span"></a>
 

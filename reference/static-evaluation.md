@@ -386,7 +386,7 @@ static iteration syntax.
 
 **Status:** Confirmed
 
-`silk.format.Format.format<Args>(static template: string, args: &Args)` accepts one static template
+`silk.text.format.Format.format<Args>(static template: string, args: &Args)` accepts one static template
 and one ordinary shared reference to a tuple or record argument pack. Positional `{}` placeholders
 consume every tuple position in order. Named `{name}` placeholders select visible record fields;
 they may repeat, and unrelated fields may remain unused. `{{` and `}}` emit literal braces.
@@ -409,7 +409,7 @@ aggregate kinds or arity, unavailable fields, and missing `Display` evidence fai
 before Writer execution is published. An uncalled invalid application remains unevaluated.
 
 **Evidence:** template formatting requirements,
-[Format source actor](../stdlib/silk/format.silk).
+[Format source actor](../stdlib/silk/text/format.silk).
 
 ## Demand, diagnostics, and the runtime boundary
 

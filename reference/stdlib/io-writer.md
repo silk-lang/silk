@@ -7,7 +7,7 @@ The `Writer` effect: write bytes without knowing where they go.
 ## When to use
 Require `&mut Writer` in a function that writes output, such as text for a person or a file
 format. The caller decides where the bytes go when it provides the writer. Use
-`silk.format.Format` to write values as text. Use `silk.io.logger.Logger` for log events.
+`silk.text.format.Format` to write values as text. Use `silk.io.logger.Logger` for log events.
 
 ## Details
 A function that needs a writer has `? &mut Writer` in its type. The caller supplies a provider
@@ -72,7 +72,7 @@ pub effect fn main() -> i32
 ```
 
 ## See also
-- `silk.format` to write numbers, strings, and templates.
+- `silk.text.format` to write numbers, strings, and templates.
 - `silk.io.buffered_output` to make fewer, larger writes.
 
 Import as `Writer` with `import silk.io.writer { Writer }`.
@@ -122,7 +122,7 @@ The effect that receives output bytes, without the writer knowing where they go.
 
 Require `&mut Writer` in a function that writes output, such as text for a person or a file
 format. The caller decides where the bytes go when it provides the writer, with
-`Effect.provideMut<Writer>(&mut provider)`. Use `silk.format.Format` to write values as text,
+`Effect.provideMut<Writer>(&mut provider)`. Use `silk.text.format.Format` to write values as text,
 and `silk.io.logger.Logger` for log events. `silk.io.writer_native` has `StdoutWriter` and
 `StderrWriter`, and `silk.io.buffered_output` collects small writes into larger ones.
 

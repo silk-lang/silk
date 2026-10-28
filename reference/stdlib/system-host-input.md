@@ -28,7 +28,7 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.collections.bytes { Bytes }
 import silk.core.effect { Effect }
 import silk.system.host_input { HostInput, HostInputError }
-import silk.option { Option }
+import silk.core.option { Option }
 
 struct FixedInput {}
 

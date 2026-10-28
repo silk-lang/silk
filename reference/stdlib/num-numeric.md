@@ -10,7 +10,7 @@ concrete integer modules directly when an algorithm also needs width-specific co
 overflow, bitwise, or formatting operations.
 
 ## Details
-The helpers bound their type parameter with the operator interfaces of `silk.ops`, such as
+The helpers bound their type parameter with the operator interfaces of `silk.core.ops`, such as
 `T: Add<T, T>`. The compiler selects the conformance during specialization. A helper adds no
 effect requirement and no runtime dispatch.
 
@@ -22,7 +22,7 @@ outside the range of the type.
 ### Add values through one generic contract
 ```silk
 import silk.num.numeric { Numeric }
-import silk.ops { Add }
+import silk.core.ops { Add }
 
 fn total<T: Add<T, T>>(first: T, second: T, third: T) -> T {
   let partial = Numeric.add<T>(move first, move second)

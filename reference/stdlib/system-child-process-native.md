@@ -33,7 +33,7 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.system.child_process { ChildProcess, ProcessError }
 import silk.core.effect { Effect }
 import silk.system.filesystem { FileError, Path }
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.system.child_process_native { OsChildProcess }
 
 effect fn program() -> i32

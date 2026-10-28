@@ -709,7 +709,7 @@ effect fn measure() -> i32 ? &Base | &Option<&Tracer> {
 }
 ```
 
-The compiler recognizes only the union `Option` of `silk/option.silk`. There it stands for the
+The compiler recognizes only the union `Option` of `silk/core/option.silk`. There it stands for the
 `OptionService` declared beside it, applied to the same arguments, so the key reads one stdlib
 header and nothing else. A union named `Option` in any other module is not a requirement.
 
@@ -734,7 +734,7 @@ absent provider before the Effect runs. A plain provider of `S` does not satisfy
 **Diagnostics:** A plain provider of `S` given for `Option<&S>` reports `SEM0123`, as any provider
 that conforms to no required key does. Diagnostics and types name the service, `OptionService`.
 
-**Evidence:** [option standard library](../stdlib/silk/option.silk),
+**Evidence:** [option standard library](../stdlib/silk/core/option.silk),
 `standardOptionIsARequirementKey` and `partialSourcePremisesAndNeverProvidersDecideProvision`
 semantic conformance cases, `optional-service-provision` and `optional-service-plain-provider`
 corpus programs.

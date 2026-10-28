@@ -723,7 +723,7 @@ results themselves do not produce arithmetic traps.
 **Status:** Confirmed
 
 A user-defined type gets an operator by implementing that operator's sealed `Intrinsic` interface
-(INTR-007). The standard-library modules `silk.ops`, `silk.equal` and `silk.order` re-export these
+(INTR-007). The standard-library modules `silk.core.ops`, `silk.core.equal` and `silk.core.order` re-export these
 identities through transparent type aliases. The table is closed and fixed; no declaration can
 bind an operator, and no other interface or operation name has operator meaning.
 
@@ -748,7 +748,7 @@ importing a module or declaring an interface elsewhere cannot change which opera
 use selects.
 
 ```silk,ignore
-import silk.ops { Multiply }
+import silk.core.ops { Multiply }
 
 impl Multiply<f64, Vector> for Vector { multiply: Vector.scale }
 impl Multiply<Vector, f64> for Vector { multiply: Vector.dot }
@@ -803,9 +803,9 @@ writing one reports the parser's unexpected-token diagnostic.
 and static witness selection.
 
 **Evidence:** [sealed interfaces](../stdlib/intrinsic/operators.silk),
-[operator aliases](../stdlib/silk/ops.silk),
-[equality](../stdlib/silk/equal.silk),
-[ordering](../stdlib/silk/order.silk),
+[operator aliases](../stdlib/silk/core/ops.silk),
+[equality](../stdlib/silk/core/equal.silk),
+[ordering](../stdlib/silk/core/order.silk),
 operator contract tests,
 [conformance implementation forms](requirements-and-services.md#serv-001--a-conformance-may-define-or-map-each-operation).
 
@@ -1151,7 +1151,7 @@ value is outside its range. The corresponding `checkedToX` operation returns `Op
 `Option<X>.Some` when representable and `Option<X>.None` otherwise.
 
 ```silk
-import silk.option { Option }
+import silk.core.option { Option }
 
 fn narrow(value: i64) -> Option<u8> {
   return i64.checkedToU8(value)

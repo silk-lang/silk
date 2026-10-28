@@ -20,7 +20,7 @@ compares the whole needle at each candidate.
 ### Split off the first line
 ```silk
 import silk.text.byte_search
-import silk.option { Option }
+import silk.core.option { Option }
 
 pub fn main() -> i32 {
   let text = b"GET / HTTP/1.1\r\nHost: example.com\r\n"

@@ -45,7 +45,7 @@ done.
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.system.filesystem { FileError, Path }
-import silk.option { Option }
+import silk.core.option { Option }
 
 effect fn paths() -> bool
   ! FileError | OutOfMemoryError

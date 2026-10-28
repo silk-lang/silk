@@ -32,7 +32,7 @@ This excerpt shows the intended nesting inside an accepted HTTP upgrade. The app
 how many events to pump; `readEvent` never hides a loop that skips control events:
 
 ```silk,ignore
-import silk.option {Option}
+import silk.core.option {Option}
 import silk.http.websocket_server {Limits}
 import silk.http.websocket_server as WebSocketServer
 import silk.http.websocket_upgrade as WebSocketUpgrade

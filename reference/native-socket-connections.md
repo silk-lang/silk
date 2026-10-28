@@ -18,7 +18,7 @@ import silk.io.byte_duplex {ByteDuplex, ByteIoError}
 import silk.core.effect {Effect}
 import silk.system.monotonic_clock {MonotonicClock}
 import silk.net.socket_native {ConnectOptions, Connection, NativeSocketError, connectUnix}
-import silk.option {Option}
+import silk.core.option {Option}
 import silk.system.system_clock {Instant}
 
 effect fn sendRequest(connection: &mut Connection) -> ()

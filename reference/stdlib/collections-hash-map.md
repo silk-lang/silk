@@ -36,7 +36,7 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.collections.hash { Hash, Word }
 import silk.collections.hash_map { HashMap }
-import silk.option { Option }
+import silk.core.option { Option }
 
 pub effect fn main() -> i32
   ! OutOfMemoryError {

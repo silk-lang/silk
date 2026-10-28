@@ -22,7 +22,7 @@ grapheme clusters, or UTF-8 bytes. These functions do not allocate and have no e
 ### Validate a Unicode scalar integer
 ```silk
 import silk.text.char
-import silk.option { Option }
+import silk.core.option { Option }
 
 pub fn main() -> i32 {
   let scalar = char.fromU32(0x2603)

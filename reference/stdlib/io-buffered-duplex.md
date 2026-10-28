@@ -40,7 +40,7 @@ import silk.io.memory_byte_duplex {
   MemoryWriteEvent
 }
 import silk.system.monotonic_clock { MonotonicClock }
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.system.system_clock { Instant, SystemClock }
 
 struct FixedClock {}

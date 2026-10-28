@@ -295,7 +295,7 @@ const program = Effect.gen(function* () {
 
   // An import's module path and members hover and go to definition like any other name.
   const imported = [
-    'import silk.option { Option }',
+    'import silk.core.option { Option }',
     'pub fn main() -> i32 {',
     '  let none = Option<i32>.none()',
     '  return Option<i32>.unwrapOr(move none, 0)',
@@ -334,7 +334,7 @@ const program = Effect.gen(function* () {
   const pathShown = yield* request(session, 17, 'textDocument/hover', path)
   assert.ok(
     (pathShown['result'] as { contents: { value: string } }).contents.value.includes(
-      'module `silk.option`',
+      'module `silk.core.option`',
     ),
     JSON.stringify(pathShown),
   )
