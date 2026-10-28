@@ -664,6 +664,102 @@ pub effect fn main() -> i32
 }
 ```
 
+<a id="List.impl.insertSlice"></a>
+
+### Method `insertSlice`
+
+```silk
+pub effect fn insertSlice<T: Copy>(self: &mut Self, index: usize, values: &[T]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator
+```
+
+Inserts a copy of each element of `values` at position `index`, in order, and moves the
+elements from `index` onward `values.length` positions to the right.
+
+#### When to use
+
+Use `insertSlice` to insert many elements at once. It grows the list at most once and moves
+the later elements with one overlapping copy, where one [`List.insert`](#List.impl.insert) for each element moves
+them once per element.
+
+#### Errors
+
+- `OutOfMemoryError` if the `Allocator` cannot supply the new storage. The list does not
+  change.
+
+#### Gotchas
+
+If `index` is more than [`List.length`](#List.impl.length), the program traps.
+
+#### Examples
+```silk
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.list { List }
+
+pub effect fn main() -> i32
+  ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut values = List<u16>.make()
+  let ends: [u16; 2] = [1, 4]
+  let middle: [u16; 2] = [2, 3]
+  run List<u16>.appendSlice(&mut values, &ends) |> Effect.provideMut<Allocator>(&mut allocator)
+  run List<u16>.insertSlice(&mut values, 1, &middle) |> Effect.provideMut<Allocator>(&mut allocator)
+  if List<u16>.length(&values) != 4 || List<u16>.get(&values, 2) != 3 || List<u16>.get(&values, 3) != 4 {
+    return 1
+  }
+  return 0
+}
+```
+
+<a id="List.impl.insertRepeated"></a>
+
+### Method `insertRepeated`
+
+```silk
+pub effect fn insertRepeated<T: Copy>(self: &mut Self, index: usize, value: T, count: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator
+```
+
+Inserts `count` copies of `value` at position `index` and moves the elements from `index`
+onward `count` positions to the right.
+
+#### Details
+
+The list grows at most once, the later elements move with one overlapping copy, and the copies
+are written in one tight loop. A `count` of 0 does nothing and does not allocate.
+
+#### Errors
+
+- `OutOfMemoryError` if `length + count` overflows `usize`, or the `Allocator` cannot supply
+  the new storage. The list does not change.
+
+#### Gotchas
+
+If `index` is more than [`List.length`](#List.impl.length), the program traps.
+
+#### Examples
+```silk
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.list { List }
+
+pub effect fn main() -> i32
+  ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut values = List<u16>.make()
+  let ends: [u16; 2] = [1, 9]
+  run List<u16>.appendSlice(&mut values, &ends) |> Effect.provideMut<Allocator>(&mut allocator)
+  run List<u16>.insertRepeated(&mut values, 1, 5, 3) |> Effect.provideMut<Allocator>(&mut allocator)
+  if List<u16>.length(&values) != 5 || List<u16>.get(&values, 3) != 5 || List<u16>.get(&values, 4) != 9 {
+    return 1
+  }
+  return 0
+}
+```
+
 
 Category: Collections.
 
