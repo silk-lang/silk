@@ -3366,6 +3366,11 @@ const program = Effect.gen(function* () {
   })
   const coldPacks = yield* packNames()
   assert.ok(coldPacks.length > 2, `expected a pack per module, found ${coldPacks.join(', ')}`)
+  // The first rebuild after a cold build already reuses the executable: the cache folder the cold
+  // build made is its own output, not a file it read.
+  const firstRebuild = yield* invoke(silk, ['build', '--stdlib', standardLibrary, '--timings'], split, splitEnvironment)
+  assert.equal(firstRebuild.status, 0, firstRebuild.stderr)
+  assert.doesNotMatch(firstRebuild.stdout + firstRebuild.stderr, /^\s+load\s/m, 'the first rebuild after a cold build loads nothing')
   // A load reads an unchanged file's imports from the summaries the last load kept beside the
   // cache instead of parsing the file, so an unchanged rebuild leaves them as they were.
   const importSummaries = join(split, 'build/cache/split/imports')
