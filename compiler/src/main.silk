@@ -67,6 +67,8 @@ import driver.NativeToolchain
 import driver.CodegenCache
 import backend.Bitcode
 import backend.BitcodeText
+import backend.Bitcode {DebugFunction, DebugInfo, MarkedFunction, Module as BitcodeModule}
+import backend.Mir as MirNames
 import driver.InstalledCompiler
 import driver.ProcessImage
 import driver.Project as Projects {Form, Member, Project, ProjectError, SourceSelection, Stage, Workspace}
@@ -85,6 +87,8 @@ import silk.toml_scanner { TomlError }
 import silk.toml_value { Toml, TomlChild, Value as TomlValue }
 import semantic.Semantic {
   BackendBuild,
+  DebugLines,
+  DebugSourceLines,
   Request as SemanticRequest,
   Semantic,
   EventKind,
@@ -935,7 +939,7 @@ effect fn writeError(bytes: &[u8]) -> () ! WriterError {
 /// Two commands that build one package at once write the same `output`, so each makes its files in a
 /// new directory of its own beside it, renames the finished output over `output`, and removes the
 /// directory.
-effect fn compileIr(ir: &Bytes, units: &[CodegenUnit], packs: &[BuildRecord.PackBody], output: &Path, form: Form, stage: Stage, optimization: &[u8], debug: bool, relocation: &[u8],
+effect fn compileIr(ir: &Bytes, debugInfo: &[u8], units: &[CodegenUnit], packs: &[BuildRecord.PackBody], output: &Path, form: Form, stage: Stage, optimization: &[u8], debug: bool, relocation: &[u8],
   profileFlags: &[Bytes], target: &Target, supply: &Option<Supply>, linkInputs: &[NativeLinkInput], selectedClang: &Option<Bytes>,
   world: &WasiTools.World, started: bool, progress: &mut Progress) -> i32
 ! FileError | ProcessError | HostInputError | InvalidNativeLinkInput | OutOfMemoryError | WriterError
@@ -948,7 +952,7 @@ effect fn compileIr(ir: &Bytes, units: &[CodegenUnit], packs: &[BuildRecord.Pack
   let use = effect fn(resource: &mut Path) -> i32
   ! FileError | ProcessError | HostInputError | InvalidNativeLinkInput | OutOfMemoryError | WriterError
   ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
-    return run compileIrIn(&resource.*, ir, units, packs, output, form, stage, optimization, debug, relocation, profileFlags, target, supply,
+    return run compileIrIn(&resource.*, ir, debugInfo, units, packs, output, form, stage, optimization, debug, relocation, profileFlags, target, supply,
       linkInputs, selectedClang, world, started, &mut progress.*)
   }
   let release = effect fn(resource: &mut Path) -> () ? &mut FileSystem | &mut Allocator {
@@ -959,9 +963,51 @@ effect fn compileIr(ir: &Bytes, units: &[CodegenUnit], packs: &[BuildRecord.Pack
   return run Effect.useReleaseNonParking(move scratch, move use, move release)
 }
 
+// The line tables of a whole-program debug build of `text`, as `DebugInfo.encode` writes them: a
+// subprogram for each function with location markers, at its declaration's first line, and the line
+// and column of each marker. Each declaration's module is one source file.
+effect fn programDebugInfo(store: &mut Semantic, plan: &EmissionPlan, sources: &ModuleSources, text: &Bytes, optimized: bool) -> Bytes
+! Cycle | FileError | OutOfMemoryError ? &mut Allocator {
+  let module = run Bitcode.programModule(Bytes.asSlice(text))
+  let marked = run BitcodeModule.markedFunctions(&module)
+  let mut lines = DebugSourceLines.make()
+  let mut modules = List<ModuleId>.make()
+  let mut files = List<Bytes>.make()
+  let mut functions = List<DebugFunction>.make()
+  let listed = List<MarkedFunction>.asSlice(&marked)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let identity = EmissionPlan.identityOfSymbol(plan, Bytes.asSlice(&listed[at].symbol))
+    if identity != usize.MAX {
+      let declaration = EmissionPlan.identityDeclaration(plan, identity)
+      let placed = run Semantic.debugLines(&mut store.*, declaration, List<u64>.asSlice(&listed[at].positions), &mut lines)
+      if let Option<DebugLines>.Some {value} = move placed {
+        let owner = DeclarationId.moduleId(declaration)
+        let known = List<ModuleId>.asSlice(&modules)
+        let mut file = usize.ZERO
+        while file < known.length && !ModuleId.equals(&known[file], owner) { file = file + usize.ONE }
+        if file == known.length {
+          let location = run ModuleSourceFiles.sourceLocation(sources, owner)
+          let mut path = Bytes.make()
+          if let Option<Path>.Some {value: found} = &location.path { path = run Bytes.copy(Path.rawBytes(&found)) }
+          run List<ModuleId>.append(&mut modules, ModuleId.copy(owner))
+          run List<Bytes>.append(&mut files, move path)
+        }
+        let DebugLines {line, positions} = move value
+        run List<DebugFunction>.append(&mut functions, DebugFunction {symbol: run Bytes.copy(Bytes.asSlice(&listed[at].symbol)),
+          name: run MirNames.declarationName(declaration), file: file, line: line, positions: move positions})
+      }
+    }
+    at = at + usize.ONE
+  }
+  let info = DebugInfo {producer: run Bytes.copy(b"silk"), directory: Bytes.make(), optimized: optimized, files: move files,
+    functions: move functions}
+  return run DebugInfo.encode(&info)
+}
+
 // Compiles as `compileIr` does, with the intermediate files in `scratch` under the output's name,
 // which Clang records in the object.
-effect fn compileIrIn(scratch: &Path, ir: &Bytes, units: &[CodegenUnit], packs: &[BuildRecord.PackBody], output: &Path, form: Form, stage: Stage, optimization: &[u8], debug: bool,
+effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], units: &[CodegenUnit], packs: &[BuildRecord.PackBody], output: &Path, form: Form, stage: Stage, optimization: &[u8], debug: bool,
   relocation: &[u8], profileFlags: &[Bytes], target: &Target, supply: &Option<Supply>, linkInputs: &[NativeLinkInput],
   selectedClang: &Option<Bytes>, world: &WasiTools.World, started: bool, progress: &mut Progress) -> i32
 ! FileError | ProcessError | HostInputError | InvalidNativeLinkInput | OutOfMemoryError | WriterError
@@ -1209,6 +1255,7 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, units: &[CodegenUnit], packs: 
   let stamped = linked && !archive && linkInputs.length == usize.ZERO && Target.id(target) != TargetId.Wasm32Wasip2
   let mut command = run linkCommand(&process, Bytes.asSlice(&stem))
   if units.length == usize.ZERO { run appendDigest(&mut command, ContentHash.of(Bytes.asSlice(ir))) }
+  if debugInfo.length > usize.ZERO { run appendDigest(&mut command, ContentHash.of(debugInfo)) }
   if freestanding { run appendDigest(&mut command, ContentHash.of(WasmRuntime.source())) }
   let unitDirectory = run CodegenCache.directoryFor(output)
   let use = effect fn(resource: &mut Path) -> i32
@@ -1220,7 +1267,12 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, units: &[CodegenUnit], packs: 
       if let Option<Bytes>.None = &probed {
         if let ClangVersion.Failed {status} = run probeClang(&clang, origin, &mut progress.*) { return status }
       }
-      let bitcode = run Bitcode.compileProgram(Bytes.asSlice(ir))
+      let mut bitcode = Bytes.make()
+      if debugInfo.length == usize.ZERO {
+        bitcode = run Bitcode.compileProgram(Bytes.asSlice(ir))
+      } else {
+        bitcode = run Bitcode.compileProgramDebug(Bytes.asSlice(ir), debugInfo)
+      }
       run FileSystem.writeFile(&resource.*, Bytes.asSlice(&bitcode))
     }
     if freestanding { run FileSystem.writeFile(&runtimePath, WasmRuntime.source()) }
@@ -2247,6 +2299,11 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, cacheDirectory: Opti
         // An unchanged map is left alone, so a build that changes nothing writes nothing.
         if !run holds(&mapFile, Bytes.asSlice(&map)) { run FileSystem.writeFile(&mapFile, Bytes.asSlice(&map)) }
       }
+      // A debug build of the whole program also carries line tables.
+      let mut debugInfo = Bytes.make()
+      if debug && !split && stage != Stage.LlvmIr {
+        debugInfo = run programDebugInfo(&mut store, &plan, &sources, &text, !same(Bytes.asSlice(&optimization), b"none"))
+      }
       if stage == Stage.LlvmIr {
         let printed = run BitcodeText.printProgram(Bytes.asSlice(&text))
         run FileSystem.writeFile(output, Bytes.asSlice(&printed))
@@ -2289,7 +2346,7 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, cacheDirectory: Opti
       run Progress.begin(&mut progress.*, ProgressPhase.Link, usize.ZERO)
       run Progress.show(&mut progress.*, b"clang")
       status = run compileIr(
-        &text, List<CodegenUnit>.asSlice(&units), List<BuildRecord.PackBody>.asSlice(&packs), output, form, stage, Bytes.asSlice(&optimization), debug, Bytes.asSlice(&relocation),
+        &text, Bytes.asSlice(&debugInfo), List<CodegenUnit>.asSlice(&units), List<BuildRecord.PackBody>.asSlice(&packs), output, form, stage, Bytes.asSlice(&optimization), debug, Bytes.asSlice(&relocation),
         List<Bytes>.asSlice(&profileFlags), &target,
         &supply, ModuleSourceFiles.nativeLinkInputs(&sources), clang, &world, started, &mut progress.*,
       )
