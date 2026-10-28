@@ -1220,6 +1220,47 @@ fn exclusiveParameter(facts: Metrics, lane: Representation) -> bool {
   return facts.abi == Abi.Indirect || passedIndirectly(lane)
 }
 
+// The scalar a by-address record parameter travels as instead (#2469): a record whose only
+// field is a pointer, integer or float of the record's whole size, or such a record, passes as
+// that field. The callee stores it into a slot of its own on entry. A C export's own parameters
+// follow the C ABI instead, so its definition never asks.
+effect fn unwrappedParameter(layouts: &TypeLayouts, ty: &Shared<Type>, facts: Metrics,
+  function: &MirFunction, span: Location) -> Option<Shared<Type>> ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if facts.abi != Abi.Indirect || facts.tagged { return Option<Shared<Type>>.none() }
+  let mut current = Shared<Type>.clone(ty)
+  let mut depth = usize.ZERO
+  while depth < 8 {
+    let at = run TypeLayouts.firstMatching(layouts, &current)
+    if at == usize.MAX { return Option<Shared<Type>>.none() }
+    let listed = TypeLayouts.list(layouts)
+    if Shared<Layout>.with<usize>(&listed[at].layout, Layout.fieldCount) != usize.ONE { return Option<Shared<Type>>.none() }
+    let selected = Shared<Layout>.with<Option<Field>>(&listed[at].layout,
+      fn(layout: &Layout) -> Option<Field> { return Layout.fieldAt(layout, usize.ZERO) },
+    )
+    let field = match move selected {
+      Option<Field>.Some {value} => move value
+      Option<Field>.None => { return Option<Shared<Type>>.none() }
+    }
+    if field.offset != usize.ZERO { return Option<Shared<Type>>.none() }
+    let inner = run layoutOf(layouts, &field.ty, function, span)
+    if inner.size != facts.size || inner.tagged { return Option<Shared<Type>>.none() }
+    if inner.abi == Abi.Pointer || inner.abi == Abi.Integer || inner.abi == Abi.Floating {
+      return Option<Shared<Type>>.some(move field.ty)
+    }
+    if inner.abi != Abi.Indirect { return Option<Shared<Type>>.none() }
+    current = move field.ty
+    depth = depth + usize.ONE
+  }
+  return Option<Shared<Type>>.none()
+}
+
+// The lane an unwrapped parameter's field travels in.
+effect fn unwrappedLane(layouts: &TypeLayouts, field: &Shared<Type>, target: &Target,
+  function: &MirFunction, span: Location) -> Representation ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let facts = run layoutOf(layouts, field, function, span)
+  return storageRepresentation(field, target, facts)
+}
+
 // Whether `function` is a C export shim, whose lanes follow the C ABI instead (SIMD-010).
 fn cExport(function: &MirFunction) -> bool {
   return match &function.key { InstanceKey.Export {..} => true _ => false }
@@ -1571,6 +1612,13 @@ effect fn emitArgument(writer: &mut Writer, function: &MirFunction, target: &Tar
     place = Option<Address>.some(run emitPlace(&mut writer.*, function, target, layouts, &source))
   }
   if let Option<Address>.Some {value: address} = move place {
+    if address.representation.aggregate && !foreign {
+      let facts = run layoutOf(layouts, &address.ty, function, Location.generated())
+      if let Option<Shared<Type>>.Some {value: field} = run unwrappedParameter(layouts, &address.ty, facts, function, Location.generated()) {
+        let lane = run unwrappedLane(layouts, &field, target, function, Location.generated())
+        return Value {scalar: lane, value: run loadOf(&mut writer.*, lane, address.value, address.alignment)}
+      }
+    }
     if address.representation.aggregate || (!foreign && passedIndirectly(address.representation)) {
       return Value {scalar: pointerRepresentation(target), value: address.value}
     }
@@ -4338,6 +4386,16 @@ effect fn emitEntrySlots(
         continue
       }
     }
+    let span = locals[local + usize.ONE].origin.location
+    let mut unwrapped = Option<Shared<Type>>.none()
+    if !cExport(function) { unwrapped = run unwrappedParameter(layouts, &parameters[local], parameterLayout, function, span) }
+    if let Option<Shared<Type>>.Some {value: field} = move unwrapped {
+      let lane = run unwrappedLane(layouts, &field, target, function, span)
+      let address = Address {ty: move field, value: slot, alignment: parameterLayout.alignment, representation: lane}
+      run storeValue(&mut writer.*, &address, &Value {scalar: lane, value: input})
+      local = local + usize.ONE
+      continue
+    }
     if let Option<usize>.Some {..} = ownedParameter(function, &locals[local + usize.ONE], parameterLayout, kind) {
       local = local + usize.ONE
       continue
@@ -4382,7 +4440,10 @@ effect fn emitSlots(
       let mut owned = usize.MAX
       let mut outward = false
       if let Option<Suspended>.None = &suspended.* {
-        if let Option<usize>.Some {value: index} = ownedParameter(function, &locals[local], localLayout, kind) { owned = index }
+        if let Option<usize>.Some {value: index} = ownedParameter(function, &locals[local], localLayout, kind) {
+          let unwrapped = run unwrappedParameter(layouts, &locals[local].ty, localLayout, function, locals[local].origin.location)
+          if let Option<Shared<Type>>.None = &unwrapped { owned = index }
+        }
         outward = local == usize.ZERO && writer.out != Bitcode.none() && resultInOut(function, kind)
       }
       if owned != usize.MAX {
@@ -4660,7 +4721,11 @@ pub effect fn emit(
       if !lane.unit {
         let mut ty = pointer
         if facts.abi != Abi.Indirect && !passedIndirectly(lane) { ty = run typeOf(&mut writer, lane) }
-        if exclusiveParameter(facts, lane) {
+        let span = locals[at + usize.ONE].origin.location
+        let unwrapped = run unwrappedParameter(layouts, &parameters[at], facts, function, span)
+        if let Option<Shared<Type>>.Some {value: field} = &unwrapped {
+          ty = run typeOf(&mut writer, run unwrappedLane(layouts, &field, target, function, span))
+        } else if exclusiveParameter(facts, lane) {
           let position = usize.toU64(List<u64>.length(&lanes.types)) + 1
           let encoding: [u64; 2] = [0, Bitcode.attrNoAlias()]
           run addAttributes(&mut lanes, position, &encoding)
@@ -4878,6 +4943,10 @@ effect fn enterSignature(writer: &mut Writer, function: &MirFunction, target: &T
     if !lane.unit {
       let mut ty = pointer
       if facts.abi != Abi.Indirect && !passedIndirectly(lane) { ty = run typeOf(&mut writer.*, lane) }
+      let span = locals[at + usize.ONE].origin.location
+      if let Option<Shared<Type>>.Some {value: field} = run unwrappedParameter(layouts, &parameters[at], facts, function, span) {
+        ty = run typeOf(&mut writer.*, run unwrappedLane(layouts, &field, target, function, span))
+      }
       let added = run addParameter(&mut lanes, ty, Bitcode.named(Bitcode.prefixParameter(), at))
       run List<u64>.append(&mut writer.*.parameters, added)
     } else {
@@ -5191,6 +5260,15 @@ effect fn emitEnter(writer: &mut Writer, function: &MirFunction, target: &Target
     if !kind.unit && offset != usize.MAX {
       let slot = run byteOffset(&mut writer.*, frame, offset)
       let input = List<u64>.get(&writer.parameters, at)
+      let span = locals[at + usize.ONE].origin.location
+      if let Option<Shared<Type>>.Some {value: field} = run unwrappedParameter(layouts, &parameters[at], parameterLayout, function, span) {
+        let lane = run unwrappedLane(layouts, &field, target, function, span)
+        let address = Address {ty: move field, value: slot,
+          alignment: offsetAlignment(stepping.coroutine.alignment, offset), representation: lane}
+        run storeValue(&mut writer.*, &address, &Value {scalar: lane, value: input})
+        at = at + usize.ONE
+        continue
+      }
       if passedIndirectly(kind) {
         run copyBytes(&mut writer.*, slot, input, parameterLayout.size)
         at = at + usize.ONE
