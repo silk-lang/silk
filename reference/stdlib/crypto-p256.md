@@ -22,7 +22,7 @@ allocates. This module cannot sign.
 
 ## Gotchas
 A valid signature proves only that the holder of the private key signed the message. It does not
-prove that you can trust the key. To check a certificate chain, use the `silk.trust_*` modules.
+prove that you can trust the key. To check a certificate chain, use the `silk.tls.trust_*` modules.
 The key exchange does not authenticate the peer. Pass the shared secret through `silk.crypto.hkdf`
 before you use it as a key. The secret is not erased when it is dropped.
 
@@ -523,7 +523,7 @@ TLS. Nothing allocates.
 
 ### Gotchas
 A valid signature proves only that the holder of the private key signed the message. It does not
-prove that you can trust the key. To check a certificate chain, use the `silk.trust_*` modules.
+prove that you can trust the key. To check a certificate chain, use the `silk.tls.trust_*` modules.
 
 <a id="EcdsaP256Sha256.impl"></a>
 

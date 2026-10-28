@@ -21,7 +21,7 @@ functions hash the message, so give the message, not its digest.
 
 ## Gotchas
 A valid signature proves only that the holder of the private key signed the message. It does not
-prove that you can trust the key. To check a certificate chain, use the `silk.trust_*` modules.
+prove that you can trust the key. To check a certificate chain, use the `silk.tls.trust_*` modules.
 Keys with an exponent other than 65537, or shorter than 2048 bits, are rejected.
 
 ## Examples
@@ -166,7 +166,7 @@ its digest.
 
 ### Gotchas
 A valid signature proves only that the holder of the private key signed the message. It does
-not prove that you can trust the key. To check a certificate chain, use the `silk.trust_*`
+not prove that you can trust the key. To check a certificate chain, use the `silk.tls.trust_*`
 modules.
 
 <a id="RsaPublicKey.impl"></a>

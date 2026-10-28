@@ -347,7 +347,7 @@ than 16 lanes crosses every Silk function boundary through memory: LLVM passes s
 different registers with and without AVX and AVX-512.
 
 **Boundary:** `Target.hasCpuFeature` keeps answering for the profile inside the function, so a
-`static if` there, and a `silk.arch` wrapper it calls, still sees the profile. `static fn`,
+`static if` there, and a `silk.simd.x86` (or `aarch64`, `wasm`) wrapper it calls, still sees the profile. `static fn`,
 `extern` and interface operations take no `features`. Callees are not compiled again for the
 function's features.
 

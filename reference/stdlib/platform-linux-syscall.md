@@ -6,7 +6,7 @@ Direct Linux system calls for programs built with no libc.
 
 ## When to use
 Use `RawLinux` only in a raw Linux runtime, such as `silk.platform.linux.start`. A hosted program uses
-the libc providers (`silk.os_*` and `silk.native_*`) instead.
+the libc providers (the `*_native` modules and `silk.platform.native`) instead.
 
 ## Details
 The module exists only on Linux on x86_64 or aarch64, with the `libc` profile set to `none`. The

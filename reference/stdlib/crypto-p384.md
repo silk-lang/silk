@@ -18,7 +18,7 @@ Nothing allocates.
 
 ## Gotchas
 A valid signature proves only that the holder of the private key signed the message. It does not
-prove that you can trust the key. To check a certificate chain, use the `silk.trust_*` modules.
+prove that you can trust the key. To check a certificate chain, use the `silk.tls.trust_*` modules.
 
 ## Examples
 ### Verify a signature
@@ -350,7 +350,7 @@ Public keys are 97 bytes in uncompressed SEC1 form: `0x04`, then the X and Y coo
 
 ### Gotchas
 A valid signature proves only that the holder of the private key signed the message. It does not
-prove that you can trust the key. To check a certificate chain, use the `silk.trust_*` modules.
+prove that you can trust the key. To check a certificate chain, use the `silk.tls.trust_*` modules.
 
 <a id="EcdsaP384Sha384.impl"></a>
 

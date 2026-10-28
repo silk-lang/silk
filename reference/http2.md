@@ -8,11 +8,11 @@ machine. No native HTTP library or compiler intrinsic implements the protocol.
 
 | Module | Use |
 | --- | --- |
-| [`silk.http.http2`](stdlib/http2.md) | Drive a connection with incoming and outgoing bytes, including several concurrent streams. |
-| [`silk.http.http2_connection`](stdlib/http2-connection.md) | Drive the connection over the existing `HttpTransport` service, with buffering and absolute deadlines. |
-| [`silk.http.hpack`](stdlib/hpack.md) | Encode or decode complete field blocks with a connection's compression context. |
-| [`silk.http.http2_frame`](stdlib/http2-frame.md) | Read and write frame headers and use the protocol's error codes. |
-| [`silk.http.http2_headers`](stdlib/http2-headers.md) | Validate request, response, or trailer fields independently. |
+| [`silk.http.http2`](stdlib/http-http2.md) | Drive a connection with incoming and outgoing bytes, including several concurrent streams. |
+| [`silk.http.http2_connection`](stdlib/http-http2-connection.md) | Drive the connection over the existing `HttpTransport` service, with buffering and absolute deadlines. |
+| [`silk.http.hpack`](stdlib/http-hpack.md) | Encode or decode complete field blocks with a connection's compression context. |
+| [`silk.http.http2_frame`](stdlib/http-http2-frame.md) | Read and write frame headers and use the protocol's error codes. |
+| [`silk.http.http2_headers`](stdlib/http-http2-headers.md) | Validate request, response, or trailer fields independently. |
 
 The existing `Http`, HTTP/1.x exchange, HTTP/1.x server, and HTTP/1.x connection-pool APIs retain
 their documented protocol. Select `silk.http.http2` or `silk.http.http2_connection` when the application needs
