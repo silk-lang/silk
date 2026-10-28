@@ -9,6 +9,28 @@ struct Floats { float a[3]; };
 struct Doubles { double a, b, c, d; };
 struct Nested { struct Floats a; };
 struct Large { int64_t a, b, c; };
+struct CallbackInfo {
+  void *nextInChain;
+  uint32_t mode;
+  void (*callback)(uint32_t, uint32_t *);
+  uint32_t *userdata;
+};
+struct CallbackEnvelope { struct CallbackInfo info; };
+static struct CallbackInfo pending;
+
+void c_register_deferred(struct CallbackEnvelope envelope) {
+  pending = envelope.info;
+}
+void c_register_direct(void (*callback)(uint32_t, uint32_t *), uint32_t *userdata) {
+  pending = (struct CallbackInfo){0, 7, callback, userdata};
+}
+int c_process_deferred(void) {
+  if (!pending.callback) return 0;
+  struct CallbackInfo current = pending;
+  pending.callback = 0;
+  current.callback(current.mode, current.userdata);
+  return 1;
+}
 
 struct Scalar c_scalar(struct Scalar v) { v.a += 1.25; return v; }
 struct Byte c_byte(struct Byte v) { v.a += 1; return v; }

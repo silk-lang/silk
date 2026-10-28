@@ -1434,7 +1434,7 @@ non-native execution surface reports `SEM0193` with the foreign symbol and surfa
 
 **Current compiler:** Aligned. Semantic analysis records the contextual address conversion, MIR
 retains a dedicated foreign-address operation, and native lowering resolves it to the generated
-export thunk. The native corpus calls libc `qsort` through a Silk comparator. The [synchronous callback contract](./synchronous-native-callbacks.md) defines invocation extent, reentrancy and boundary termination.
+export thunk. The native corpus calls libc `qsort` through a Silk comparator and retains callbacks from direct and nested by-value arguments for invocation during a later C call. The [native callback contract](./synchronous-native-callbacks.md) defines synchronous, deferred same-thread and any-thread invocation, field-path coverage, reentrancy and boundary termination.
 
 **Evidence:** callback specification,
 [call resolution](../bootstrap/packages/compiler/src/CallResolution.ts),

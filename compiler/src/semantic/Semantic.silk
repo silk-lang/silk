@@ -142,7 +142,7 @@ import semantic.CallableSchema
 import semantic.CallableSchema {CallableSchema as SectionSchema}
 import semantic.CallableContract {CallableContract as CallableFacts, Failure as CallableFailure}
 import semantic.CallInput {CallInput, Arguments as CallArguments}
-import semantic.ForeignContract {ForeignContract}
+import semantic.ForeignContract {ForeignContract, Callbacks as ForeignCallbacks}
 import semantic.NativeForeign
 import hir.Directive as Directives
 import hir.Directive {Kind as DirectiveKind, Position as DirectivePosition}
@@ -13465,6 +13465,9 @@ effect fn resolveForeignFunction(resolver: &mut Resolver, owner: &mut Query<Answ
     environment: run Shared<Intersection>.make(run Intersection.of(List<Shared<Lifetime>>.asSlice(&regions))),
     invocationBinders: usize.ZERO, invocationUse: usize.MAX, invocationBounds: List<Outlives>.make(),
     parameters: move parts.inputs, result: move parts.output})
+  if contract.invokesDeferredCallbacks && !Shared<Type>.with<bool>(&signature, referenceFreeParameters) {
+    return Result<Shared<Type>, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.ForeignCallback, span))
+  }
   let ty = run Types.intern(Type.ForeignFunction {signature: move signature, behavior: contract})
   if !(run foreignAdmitted(&mut resolver.*, &ty)) {
     return Result<Shared<Type>, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.ForeignType, span))
@@ -27292,13 +27295,16 @@ effect fn resolveSignatureUnder(
   // checked where it is called (`targetLane`).
   let mut exportedLanes = false
   let mut foreignLanes = false
+  let mut referenceFreeForeign = false
   if value.foreign {
     let declarationAccess91 = declarationPosition(&resolver.*, key)
     let foreign = run foreignHeader(&mut resolver.*, &module, declarationAccess91)
     exportedLanes = foreign.exported && !foreign.global
     foreignLanes = !foreign.global
+    referenceFreeForeign = foreign.behavior.invokesDeferredCallbacks || foreign.behavior.callbacks == ForeignCallbacks.Deferred
     if let Option<GapCode>.Some {value: reason} = move foreign.gap {
-      if reason == GapCode.CAbiCallback {
+      if reason == GapCode.CAbiCallback || (reason == GapCode.ForeignContract
+        && (foreign.behavior.callbacks != ForeignCallbacks.None || foreign.behavior.invokesDeferredCallbacks)) {
         // C function-pointer parameters the directives do not name are the author's to name.
         if Bytes.length(&foreign.callbacks) != usize.ZERO {
           let mut named = run makeRejection(RejectionCode.ForeignType, &module, foreign.span)
@@ -27655,6 +27661,9 @@ effect fn resolveSignatureUnder(
     if let Option<Shared<Rejection>>.Some {value: diagnostic} = move exposure {
       return run memberRejected(move diagnostic, move dependencies)
     }
+    if referenceFreeForeign && Shared<Type>.with<bool>(&ty, borrowedLane) {
+      return run memberRejected(run reject(&resolver.*, &module, RejectionCode.ForeignCallback, value.span), move dependencies)
+    }
     if foreignLanes && (exportedLanes || !Shared<Type>.with<bool>(&ty, targetLane)) {
       let laneSpan = run parameterSpanOr(&mut resolver.*, &module, entries[at], value.span)
       if let Option<Shared<Rejection>>.Some {value: diagnostic} = move run foreignTypeGap(&mut resolver.*, &module, &ty, laneSpan) {
@@ -27690,6 +27699,13 @@ effect fn resolveSignatureUnder(
     if !known { run List<Shared<Type>>.append(&mut unknownInputs, Shared<Type>.clone(&ty)) }
     run List<Shared<Type>>.append(&mut parameters, move ty)
     at = at + usize.ONE
+  }
+  if foreignLanes {
+    let callbackLocation = InstanceLocation {module: key.module, declaration: declarationPosition(&resolver.*, key)}
+    if !run resolvedCallbackParameters(&mut resolver.*, &mut owner.*, &mut dependencies, callbackLocation,
+      List<Shared<Type>>.asSlice(&parameters), value.span) {
+      return run memberRejected(run reject(&resolver.*, &module, RejectionCode.ForeignCallback, value.span), move dependencies)
+    }
   }
   // A named `effect fn` capturing an input whose stored contents involve a type parameter retains
   // them for a region no written lifetime names. It elaborates one more lifetime binder for them,
@@ -30466,8 +30482,8 @@ effect fn structLayout(resolver: &mut Resolver, ty: &Shared<Type>) -> Option<boo
   return Option<bool>.none()
 }
 
-// A C signature lane outside the admitted subset. A callback still waits on the backend; any
-// other type is refused for good (SEM0187), and a plain struct is told to declare its C layout.
+// A C signature lane outside the admitted subset is rejected at its declaration (SEM0187);
+// a plain struct is told to declare its C layout.
 effect fn foreignTypeGap(resolver: &mut Resolver, module: &ModuleId, ty: &Shared<Type>, span: Span)
 -> Option<Shared<Rejection>> ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
   // Vector feature diagnostics retain their precise type and target requirement.
@@ -75894,9 +75910,8 @@ effect fn copyMirCValues(resolver: &Resolver, index: usize, anchor: &Option<Anch
   return move copied
 }
 
-// Closed scalar native contracts retain memory/locality identity; the legacy noCapture hint creates
-// no loan. A synchronous `@callbacks` list, or a `@threadCallbacks` list whose callbacks may run on
-// another thread, must name every written C pointer parameter exactly once.
+// Callback modes are mutually exclusive and cannot assert restricted memory access. Syntax
+// checks direct omissions here; signature resolution authenticates aliases and aggregate paths.
 effect fn admittedForeignDirectives(hir: &Module, directives: Range, parameters: Range) -> bool
 ! OutOfMemoryError ? &mut Allocator {
   if let Option<ForeignContract>.Some {..} = move NativeForeign.contract(hir, directives) {
@@ -75904,6 +75919,7 @@ effect fn admittedForeignDirectives(hir: &Module, directives: Range, parameters:
   }
   let mut fields = usize.ZERO
   let mut callbacks = false
+  let mut invokes = false
   let mut at = usize.ZERO
   while at < directives.length {
     let id = Module.child(hir, directives, at)
@@ -75926,17 +75942,21 @@ effect fn admittedForeignDirectives(hir: &Module, directives: Range, parameters:
         fields = fields + usize.ONE
         field = field + usize.ONE
       }
-    } else if kind == DirectiveKind.Callbacks || kind == DirectiveKind.ThreadCallbacks {
+    } else if callbackDirective(kind) {
       let listed = run Directives.texts(hir, id)
       if callbacks || !capturesCallbackParameters(hir, List<HirId>.asSlice(&listed), parameters) { return false }
       callbacks = true
       fields = fields + usize.ONE
+    } else if kind == DirectiveKind.InvokesDeferredCallbacks {
+      if invokes || Directives.arguments(hir, id).length != usize.ZERO { return false }
+      invokes = true
     } else {
       return false
     }
     at = at + usize.ONE
   }
-  return fields <= usize.ONE && (!hasCallbackParameter(hir, parameters) || callbacks)
+  return fields <= usize.ONE && (!invokes || fields == usize.ZERO || callbacks)
+    && (!hasCallbackParameter(hir, parameters) || callbacks)
 }
 
 // The first directive of a declaration that takes none, rejected: a name outside the table is
@@ -76221,9 +76241,9 @@ fn capturesPointerParameters(hir: &Module, elements: &[HirId], parameters: Range
   return true
 }
 
-// The `@callbacks` directive naming every C function-pointer parameter, as `@callbacks("compare")`.
+// A foreign field naming every directly written C function-pointer parameter.
 effect fn callbacksField(hir: &Module, parameters: Range) -> Bytes ! OutOfMemoryError ? &mut Allocator {
-  let mut field = run Bytes.copy(b"@callbacks(")
+  let mut field = run Bytes.copy(b"with Intrinsic.foreign(callbacks: (")
   let mut count = usize.ZERO
   let mut at = usize.ZERO
   while at < parameters.length {
@@ -76240,7 +76260,8 @@ effect fn callbacksField(hir: &Module, parameters: Range) -> Bytes ! OutOfMemory
     }
     at = at + usize.ONE
   }
-  run Bytes.append(&mut field, b")")
+  if count == usize.ONE { run Bytes.append(&mut field, b",") }
+  run Bytes.append(&mut field, b"))")
   return move field
 }
 
@@ -76266,9 +76287,10 @@ fn capturesCallbackParameters(hir: &Module, elements: &[HirId], parameters: Rang
       let mut parameter = usize.ZERO
       while parameter < parameters.length {
         if let Node.Parameter {name, ..} = Module.node(hir, Module.child(hir, parameters, parameter)) {
-          if nameIs(hir, name, Module.text(hir, spelling)) {
-            selected = true
-          }
+          let path = Module.text(hir, spelling)
+          let mut end = usize.ZERO
+          while end < path.length && path[end] != 46 { end = end + usize.ONE }
+          if nameIs(hir, name, Slice.view<u8>(path, usize.ZERO, end)) { selected = true }
         }
         parameter = parameter + usize.ONE
       }
@@ -76456,11 +76478,23 @@ effect fn foreignHeader(resolver: &mut Resolver, module: &ModuleId, ordinal: usi
             let mut noCapture = List<usize>.make()
             let mut callbacks = Bytes.make()
             if let Option<ForeignContract>.Some {value: literalBehavior} = move NativeForeign.contract(hir, directives) { behavior = literalBehavior }
+            let mut directiveAt = usize.ZERO
+            while directiveAt < directives.length {
+              if let Option<DirectiveKind>.Some {value: kind} = Directives.kindOf(hir, Module.child(hir, directives, directiveAt)) {
+                if kind == DirectiveKind.Callbacks { behavior.callbacks = ForeignCallbacks.Synchronous }
+                if kind == DirectiveKind.ThreadCallbacks { behavior.callbacks = ForeignCallbacks.Thread }
+                if kind == DirectiveKind.DeferredCallbacks { behavior.callbacks = ForeignCallbacks.Deferred }
+                if kind == DirectiveKind.InvokesDeferredCallbacks { behavior.invokesDeferredCallbacks = true }
+              }
+              directiveAt = directiveAt + usize.ONE
+            }
             if let Node.CallableContract {variadic, generics, parameters, result, isEffect, isStatic, isUnsafe, ..} = Module.node(hir, contract) {
               noCapture = run normalizedNoCapture(hir, directives, parameters)
               if !(run admittedForeignDirectives(hir, directives, parameters)) {
                 gap = Option<GapCode>.some(GapCode.ForeignContract)
-                if hasCallbackParameter(hir, parameters) {
+                if behavior.callbacks != ForeignCallbacks.None || behavior.invokesDeferredCallbacks {
+                  gap = Option<GapCode>.some(GapCode.CAbiCallback)
+                } else if hasCallbackParameter(hir, parameters) {
                   gap = Option<GapCode>.some(GapCode.CAbiCallback)
                   callbacks = run callbacksField(hir, parameters)
                 }
@@ -76640,7 +76674,7 @@ effect fn foreignSignature(
         declaration, span, false))
       at = at + usize.ONE
     }
-    return CAbi.Signature {importModule: Bytes.make(), importName: Bytes.make(), behavior: ForeignContract.conservative(), noCapture: List<usize>.make(), declaration: Shared<DeclarationId>.clone(declaration), symbol: run Bytes.copy(SealedCore.cSymbol(selected)),
+    return CAbi.Signature {importModule: Bytes.make(), importName: Bytes.make(), behavior: ForeignContract.conservative(), callbackContracts: Bytes.make(), noCapture: List<usize>.make(), declaration: Shared<DeclarationId>.clone(declaration), symbol: run Bytes.copy(SealedCore.cSymbol(selected)),
       source: GapSource.Declaration {declaration: Shared<DeclarationId>.clone(declaration), span: span}, result: move result, parameters: move lanes, global: false, variadic: false}
   }
   let key = run InstanceKey.named(declaration)
@@ -76689,31 +76723,164 @@ fn borrowedLane(value: &Type) -> bool {
   return match &value.* { Type.Reference {..} => true Type.Slice {..} => true _ => false }
 }
 
-// Header spelling alone cannot identify aliased C pointer lanes. Authenticate the callback list
-// again against the resolved C signature, including aliases and exact completeness. A thread
-// list's callbacks must also be reference-free.
-fn resolvedCallbackTuple(hir: &Module, elements: &[HirId], parameters: Range, lanes: &[CAbi.Lane], thread: bool) -> bool {
-  let mut count = usize.ZERO
+// Lists describe leaves reached only through by-value C structs. Raw pointers and references
+// are traversal boundaries: their pointees are the unsafe caller's ownership responsibility.
+fn callbackDirective(kind: DirectiveKind) -> bool {
+  return kind == DirectiveKind.Callbacks || kind == DirectiveKind.ThreadCallbacks || kind == DirectiveKind.DeferredCallbacks
+}
+
+struct CallbackLeaf { path: Bytes, position: Bytes, ty: Shared<Type> }
+
+effect fn callbackLeaves(
+  resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  ty: &Shared<Type>, path: &[u8], position: &[u8], encode: bool, span: Span, active: &mut List<Shared<Type>>, leaves: &mut List<CallbackLeaf>,
+) -> bool ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if Shared<Type>.with<bool>(ty, nativeFunctionPointer) {
+    run List<CallbackLeaf>.append(&mut leaves.*, CallbackLeaf {path: run Bytes.copy(path), position: run Bytes.copy(position), ty: Shared<Type>.clone(ty)})
+    return true
+  }
+  // Callback-bearing arrays have no admitted path syntax. Reject them rather than hiding their
+  // callbacks; ordinary fixed-array fields remain valid C data.
+  let array = Shared<Type>.with<Option<Shared<Type>>>(ty, fn(value: &Type) -> Option<Shared<Type>> {
+    return match &value.* { Type.Array {element, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&element)) _ => Option<Shared<Type>>.none() }
+  })
+  if let Option<Shared<Type>>.Some {value: element} = move array {
+    let before = List<CallbackLeaf>.length(&leaves.*)
+    if !run callbackLeaves(&mut resolver.*, &mut owner.*, &mut dependencies.*, &element, path, position, encode, span, &mut active.*, &mut leaves.*) { return false }
+    return before == List<CallbackLeaf>.length(&leaves.*)
+  }
+  let nominal = Shared<Type>.with<bool>(ty, fn(value: &Type) -> bool { return match &value.* { Type.Nominal {..} => true _ => false } })
+  if !nominal { return true }
+  let external = match move run structLayout(&mut resolver.*, ty) { Option<bool>.Some {value} => value _ => false }
+  if !external { return true }
+  let ancestors = List<Shared<Type>>.asSlice(&active.*)
+  let mut ancestor = usize.ZERO
+  while ancestor < ancestors.length {
+    if run Type.equalsShared(&ancestors[ancestor], ty) { return false }
+    ancestor = ancestor + usize.ONE
+  }
+  run List<Shared<Type>>.append(&mut active.*, Shared<Type>.clone(ty))
+  let names = run recordFieldNames(&mut resolver.*, ty)
+  let fields = List<Bytes>.asSlice(&names)
+  let moduleAt = declaringModuleOrdinal(&resolver.*, ty)
+  let module = resolvedModule(&resolver.*, moduleAt)
+  let declaration = match move run ordinalOfProvider(&mut resolver.*, &module, ty) {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => { return false }
+  }
+  let application = run internApplication(&mut resolver.*, ty)
   let mut at = usize.ZERO
-  while at < lanes.length {
-    if Shared<Type>.with<bool>(&lanes[at].ty, nativeFunctionPointer) { count = count + usize.ONE }
+  while at < fields.length {
+    let key = run internDeclaration(&mut resolver.*, Key {family: Family.MemberShape, module: moduleAt, name: application,
+      declaration: declaration, member: at, external: false})
+    let shaped = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, key, span)
+    let field = match move Shared<Result<Answer, NoRejection>>.with<Option<Shared<Type>>>(&shaped, singleMemberType) {
+      Option<Shared<Type>>.Some {value} => move value
+      Option<Shared<Type>>.None => { return false }
+    }
+    let mut nested = Bytes.make()
+    if !encode {
+      nested = run Bytes.copy(path)
+      run Bytes.append(&mut nested, b".")
+      run Bytes.append(&mut nested, Bytes.asSlice(&fields[at]))
+    }
+    let mut nestedPosition = Bytes.make()
+    if encode {
+      nestedPosition = run Bytes.copy(position)
+      run RuntimeEncoding.word(&mut nestedPosition, usize.toU64(at))
+    }
+    if !run callbackLeaves(&mut resolver.*, &mut owner.*, &mut dependencies.*, &field, Bytes.asSlice(&nested),
+      Bytes.asSlice(&nestedPosition), encode, span, &mut active.*, &mut leaves.*) { return false }
     at = at + usize.ONE
   }
-  if elements.length != count { return false }
-  at = usize.ZERO
-  while at < elements.length {
-    let mut selected = false
-    if let Node.TextLiteral {value: spelling} = Module.node(hir, elements[at]) {
-      let mut parameter = usize.ZERO
-      while parameter < parameters.length && parameter < lanes.length {
-        if let Node.Parameter {name, ..} = Module.node(hir, Module.child(hir, parameters, parameter)) {
-          if nameIs(hir, name, Module.text(hir, spelling)) {
-            selected = Shared<Type>.with<bool>(&lanes[parameter].ty, nativeFunctionPointer)
-            if thread && selected { selected = Shared<Type>.with<bool>(&lanes[parameter].ty, referenceFreeCallback) }
+  drop List<Shared<Type>>.pop(&mut active.*)
+  return true
+}
+
+// This is a signature obligation, not a call-site/backend check. Resolving aliases and field
+// shapes here also records the dependencies needed when an uncalled aggregate is edited.
+effect fn resolvedCallbackParameters(
+  resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  location: InstanceLocation, types: &[Shared<Type>], span: Span,
+) -> bool ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let module = resolvedModule(&resolver.*, location.module)
+  let observed = run source(&mut resolver.*, &module)
+  let mut names = List<Bytes>.make()
+  let mut listed = List<Bytes>.make()
+  let mut callbacks = false
+  let mut retained = false
+  let mut referenceFree = false
+  if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &observed, &module) {
+    let hir = IndexedSource.authored(indexed)
+    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+    if let Node.FunctionHeader {contract, ..} = Module.node(hir, declarations[location.declaration].header) {
+      if let Node.CallableContract {parameters, ..} = Module.node(hir, contract) {
+        let mut at = usize.ZERO
+        while at < parameters.length {
+          let mut spelling = Bytes.make()
+          if let Node.Parameter {name, ..} = Module.node(hir, Module.child(hir, parameters, at)) {
+            if let Node.Name {text} = Module.node(hir, name) { spelling = run Bytes.copy(Module.text(hir, text)) }
           }
+          run List<Bytes>.append(&mut names, move spelling)
+          at = at + usize.ONE
         }
-        parameter = parameter + usize.ONE
+        let directives = Directives.of(hir, declarations[location.declaration].local)
+        at = usize.ZERO
+        while at < directives.length {
+          let id = Module.child(hir, directives, at)
+          if let Option<DirectiveKind>.Some {value: kind} = Directives.kindOf(hir, id) {
+            if callbackDirective(kind) {
+              if callbacks { return false }
+              callbacks = true
+              retained = kind != DirectiveKind.Callbacks
+              if kind == DirectiveKind.DeferredCallbacks { referenceFree = true }
+              let elements = run Directives.texts(hir, id)
+              let entries = List<HirId>.asSlice(&elements)
+              if entries.length == usize.ZERO { return false }
+              let mut entry = usize.ZERO
+              while entry < entries.length {
+                if let Node.TextLiteral {value: spelling} = Module.node(hir, entries[entry]) {
+                  run List<Bytes>.append(&mut listed, run Bytes.copy(Module.text(hir, spelling)))
+                } else { return false }
+                entry = entry + usize.ONE
+              }
+            }
+            if kind == DirectiveKind.InvokesDeferredCallbacks { referenceFree = true }
+          }
+          at = at + usize.ONE
+        }
       }
+    }
+  }
+  drop observed
+  let parameterNames = List<Bytes>.asSlice(&names)
+  if parameterNames.length != types.length { return false }
+  let mut leaves = List<CallbackLeaf>.make()
+  let mut active = List<Shared<Type>>.make()
+  let mut parameter = usize.ZERO
+  while parameter < types.length {
+    if referenceFree && Shared<Type>.with<bool>(&types[parameter], borrowedLane) { return false }
+    if !run callbackLeaves(&mut resolver.*, &mut owner.*, &mut dependencies.*, &types[parameter],
+      Bytes.asSlice(&parameterNames[parameter]), b"", false, span, &mut active, &mut leaves) { return false }
+    parameter = parameter + usize.ONE
+  }
+  let found = List<CallbackLeaf>.asSlice(&leaves)
+  let entries = List<Bytes>.asSlice(&listed)
+  if found.length != entries.length { return false }
+  let mut at = usize.ZERO
+  while at < entries.length {
+    let mut earlier = usize.ZERO
+    while earlier < at {
+      if same(Bytes.asSlice(&entries[earlier]), Bytes.asSlice(&entries[at])) { return false }
+      earlier = earlier + usize.ONE
+    }
+    let mut selected = false
+    let mut leaf = usize.ZERO
+    while leaf < found.length {
+      if same(Bytes.asSlice(&entries[at]), Bytes.asSlice(&found[leaf].path)) {
+        selected = !retained || Shared<Type>.with<bool>(&found[leaf].ty, referenceFreeCallback)
+      }
+      leaf = leaf + usize.ONE
     }
     if !selected { return false }
     at = at + usize.ONE
@@ -76721,36 +76888,39 @@ fn resolvedCallbackTuple(hir: &Module, elements: &[HirId], parameters: Range, la
   return true
 }
 
-effect fn resolvedCallbackParameters(resolver: &mut Resolver, location: InstanceLocation, lanes: &[CAbi.Lane]) -> bool
-! Cycle | OutOfMemoryError ? &mut Allocator {
-  let module = resolvedModule(&resolver.*, location.module)
-  let observed = run source(&mut resolver.*, &module)
-  if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &observed, &module) {
-    let hir = IndexedSource.authored(indexed)
-    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
-    if let Node.FunctionHeader {contract, ..} = Module.node(hir, declarations[location.declaration].header) {
-      if let Node.CallableContract {parameters, ..} = Module.node(hir, contract) {
-        let directives = Directives.of(hir, declarations[location.declaration].local)
-        let mut at = usize.ZERO
-        while at < directives.length {
-          let id = Module.child(hir, directives, at)
-          if let Option<DirectiveKind>.Some {value: kind} = Directives.kindOf(hir, id) {
-            if kind == DirectiveKind.Callbacks || kind == DirectiveKind.ThreadCallbacks {
-              let listed = run Directives.texts(hir, id)
-              return resolvedCallbackTuple(hir, List<HirId>.asSlice(&listed), parameters, lanes, kind == DirectiveKind.ThreadCallbacks)
-            }
-          }
-          at = at + usize.ONE
-        }
-      }
-    }
-  }
+effect fn callbackContractIdentity(
+  resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  declaration: &Shared<DeclarationId>, lanes: &[CAbi.Lane], span: Span,
+) -> Bytes ! BackendGap | Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut leaves = List<CallbackLeaf>.make()
+  let mut active = List<Shared<Type>>.make()
   let mut at = usize.ZERO
   while at < lanes.length {
-    if Shared<Type>.with<bool>(&lanes[at].ty, nativeFunctionPointer) { return false }
+    // CAbi.identity already retains direct callback lanes; this encoding supplies nested leaves.
+    if Shared<Type>.with<bool>(&lanes[at].ty, nativeFunctionPointer) {
+      at = at + usize.ONE
+      continue
+    }
+    let mut position = Bytes.make()
+    run RuntimeEncoding.word(&mut position, usize.toU64(at))
+    if !run callbackLeaves(&mut resolver.*, &mut owner.*, &mut dependencies.*, &lanes[at].ty, b"",
+      Bytes.asSlice(&position), true, span, &mut active, &mut leaves) {
+      fail BackendGap.make(GapCode.CAbiCallback, declaration, span)
+    }
     at = at + usize.ONE
   }
-  return true
+  let mut encoded = Bytes.make()
+  let identity = DeclarationId.copyShared(declaration)
+  let listed = List<CallbackLeaf>.asSlice(&leaves)
+  run RuntimeEncoding.word(&mut encoded, usize.toU64(listed.length))
+  at = usize.ZERO
+  while at < listed.length {
+    run RuntimeEncoding.field(&mut encoded, Bytes.asSlice(&listed[at].position))
+    let callback = run Type.runtimeEncoding(&listed[at].ty, &identity)
+    run RuntimeEncoding.field(&mut encoded, Bytes.asSlice(&callback))
+    at = at + usize.ONE
+  }
+  return move encoded
 }
 
 effect fn cSignature(
@@ -76777,7 +76947,7 @@ effect fn cSignature(
     let object = run foreignLane(&mut resolver.*, &mut owner.*, &mut dependencies.*, &objectType, declaration, written.span, true)
     return CAbi.Signature {
       importModule: Bytes.make(), importName: Bytes.make(),
-      behavior: ForeignContract.conservative(), noCapture: List<usize>.make(),
+      behavior: ForeignContract.conservative(), callbackContracts: Bytes.make(), noCapture: List<usize>.make(),
       declaration: Shared<DeclarationId>.clone(declaration),
       symbol: move written.symbol,
       source: GapSource.Declaration {declaration: Shared<DeclarationId>.clone(declaration), span: written.span},
@@ -76853,13 +77023,16 @@ effect fn cSignature(
     at = at + usize.ONE
   }
   CAbi.assignArguments(&mut parameters, &result, &resolver.target)
-  let callbacksComplete = run resolvedCallbackParameters(&mut resolver.*, location, List<CAbi.Lane>.asSlice(&parameters))
-  if !callbacksComplete { fail BackendGap.make(GapCode.CAbiCallback, declaration, written.span) }
+  let mut callbackContracts = Bytes.make()
+  if written.behavior.callbacks != ForeignCallbacks.None {
+    callbackContracts = run callbackContractIdentity(&mut resolver.*, &mut owner.*, &mut dependencies.*, declaration,
+      List<CAbi.Lane>.asSlice(&parameters), written.span)
+  }
   let variadic = Shared<Result<Answer, NoRejection>>.with<bool>(&signature, signatureIsVariadic)
   if variadic && !CAbi.fullBoundary(&resolver.target) { fail BackendGap.make(GapCode.CAbiTarget, declaration, written.span) }
   return CAbi.Signature {
     importModule: move written.importModule, importName: move written.importName,
-    behavior: written.behavior, noCapture: move written.noCapture,
+    behavior: written.behavior, callbackContracts: move callbackContracts, noCapture: move written.noCapture,
     declaration: Shared<DeclarationId>.clone(declaration),
     symbol: move written.symbol,
     source: GapSource.Declaration {declaration: Shared<DeclarationId>.clone(declaration), span: written.span},
