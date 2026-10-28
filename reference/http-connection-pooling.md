@@ -5,7 +5,7 @@ description: Bounded local HTTP/1 connection ownership, conservative reuse, dete
 
 # HTTP connection pooling
 
-`silk.http_connection_pool` owns a finite set of complete HTTP/1 connections for one immutable
+`silk.http.connection_pool` owns a finite set of complete HTTP/1 connections for one immutable
 acquisition and security context. Pool state is local to one scheduler thread. Checkout is
 fail-fast, release is ownership-safe, and all network and allocator effects occur outside shared
 state.
@@ -187,7 +187,7 @@ one owned-acquisition path. HTTPS authenticates the exact original origin and us
 of the pool's frozen trust snapshot. The release guard remains armed from socket acquisition
 through TLS and HTTP-owner publication.
 
-Proxy-aware contexts consume the sealed [`silk.http_proxy`](http-proxy-routing.md) route identity.
+Proxy-aware contexts consume the sealed [`silk.http.proxy`](http-proxy-routing.md) route identity.
 Direct, Forward, and Tunnel keys are distinct. Forward reuse remains per original origin. Tunnel
 opening completes CONNECT before authenticating the original origin with TLS; proxy credentials
 remain route-owned and never enter tunneled origin headers. An unavailable or unsupported route
@@ -205,11 +205,11 @@ WebSocket pooling, ambient proxy discovery, trust refresh inside a pool, per-req
 replacement, or a general Stream abstraction.
 
 The implementation lives in
-[`http_connection_pool.silk`](../stdlib/silk/http_connection_pool.silk),
+[`http_connection_pool.silk`](../stdlib/silk/http/connection_pool.silk),
 with client ownership in
-[`http_exchange.silk`](../stdlib/silk/http_exchange.silk), native acquisition
+[`http_exchange.silk`](../stdlib/silk/http/exchange.silk), native acquisition
 in
-[`http_exchange_native.silk`](../stdlib/silk/http_exchange_native.silk), and
-route identity in [`http_proxy.silk`](../stdlib/silk/http_proxy.silk).
+[`http_exchange_native.silk`](../stdlib/silk/http/exchange_native.silk), and
+route identity in [`http_proxy.silk`](../stdlib/silk/http/proxy.silk).
 The normative delivery contract is the
 `bounded-http-connection-pooling` OpenSpec.

@@ -1,0 +1,389 @@
+//! Ownership and canonical ABI operations for WASI Preview 2 HTTP providers.
+//!
+//! # When to use
+//! Provider implementations use these operations to release HTTP resources and host-allocated
+//! values on every exit path. Applications use `silk.http.client_wasi` and `silk.http.server_wasi`.
+//!
+//! @category Native platform
+
+static if Intrinsic.profileText("target") == "wasm32-wasip2" {
+  import silk.platform.wasi.preview2 as host
+  import silk.platform.wasi.component as abi { ResultArea, Pollable }
+  import silk.platform.wasi.stream { InputStream, OutputStream, StreamError }
+  import silk.mem.allocator { Allocator, OutOfMemoryError }
+  import silk.collections.bytes { Bytes }
+  import silk.io.byte_duplex { ReadTransfer }
+  import silk.core.effect { Effect }
+  import silk.http.message { Header, OwnedResponseHead, ResponseHead, Status, ValueError, Version }
+  import silk.http.client { HttpError, HttpErrorKind, HttpCause }
+  import silk.http.exchange { Limits }
+  import silk.http.headers { Headers }
+  import silk.collections.list { List }
+  import silk.system.monotonic_clock { MonotonicClock }
+  import silk.system.system_clock { Instant, SystemClock }
+  import silk.option { Option }
+  import silk.core.ownership { Copy, Drop }
+  import silk.mem.pointer { Pointer }
+  import silk.core.result { Result }
+  import silk.collections.slice { Slice }
+  import silk.text.string { String, InvalidUtf8 }
+  import silk.num.u8
+  import silk.num.u32
+  import silk.num.usize
+
+  /// The type of an owned WASI HTTP handle. Only unsafe constructors accept this tag.
+  pub enum ResourceKind { Fields, OutgoingRequest, IncomingRequest, IncomingResponse, OutgoingResponse,
+    IncomingBody, OutgoingBody, FutureResponse, FutureTrailers, Options, ResponseOut }
+
+  /// An HTTP resource owner used by provider implementations. Drop releases an untransferred handle.
+  pub struct Resource { handleValue: Option<u32>, kind: ResourceKind }
+
+  impl Resource {
+    /// Takes a live handle of `kind`. The caller surrenders its previous owner and keeps any parent
+    /// alive until this owner is dropped or transferred.
+    pub unsafe fn take(handle: u32, kind: ResourceKind) -> Resource {
+      return Resource {handleValue: Option<u32>.some(handle), kind: kind}
+    }
+
+    /// Borrows the owned handle. Calling this after transfer traps.
+    pub fn handle(self: &Self) -> u32 {
+      return match &self.handleValue {
+        Option<u32>.Some {value} => value
+        Option<u32>.None => Intrinsic.trap("HTTP resource already transferred")
+      }
+    }
+
+    /// Transfers the handle without dropping it. The caller must give it to an owning host argument
+    /// or another owner, and must first release all child resources.
+    pub unsafe fn release(self: &mut Self) -> u32 {
+      let value = Resource.handle(&self.*)
+      self.handleValue = Option<u32>.none()
+      return value
+    }
+  }
+
+  impl Drop for Resource {
+    fn drop(self: &mut Self) -> () {
+      if let Option<u32>.Some {value} = &self.handleValue {
+        unsafe {
+          match self.kind {
+            ResourceKind.Fields => host.http_types_drop_fields(value)
+            ResourceKind.OutgoingRequest => host.http_types_drop_outgoing_request(value)
+            ResourceKind.IncomingRequest => host.http_types_drop_incoming_request(value)
+            ResourceKind.IncomingResponse => host.http_types_drop_incoming_response(value)
+            ResourceKind.OutgoingResponse => host.http_types_drop_outgoing_response(value)
+            ResourceKind.IncomingBody => host.http_types_drop_incoming_body(value)
+            ResourceKind.OutgoingBody => host.http_types_drop_outgoing_body(value)
+            ResourceKind.FutureResponse => host.http_types_drop_future_incoming_response(value)
+            ResourceKind.FutureTrailers => host.http_types_drop_future_trailers(value)
+            ResourceKind.Options => host.http_types_drop_request_options(value)
+            ResourceKind.ResponseOut => host.http_types_drop_response_outparam(value)
+          }
+        }
+      }
+    }
+  }
+
+  unsafe extern "C" fn free(pointer: ?[*]const u8) -> ()
+
+  /// Returns the wasm32 address of a borrowed byte slice; the borrow must survive the host call.
+  pub fn bytesAddress(bytes: &[u8]) -> u32 { return usize.toU32(Pointer.addressMany(Pointer.fromSlice(bytes))) }
+
+  /// Returns the wasm32 address of borrowed UTF-8 text; the borrow must survive the host call.
+  pub fn textAddress(text: string) -> u32 { return bytesAddress(String.utf8Bytes(text)) }
+
+  /// Copies an initialized host-owned buffer without taking ownership of it.
+  /// The caller guarantees `length` readable bytes and keeps the allocation alive during the copy.
+  pub unsafe effect fn copyBytes(pointer: ?[*]const u8, length: u32) -> Bytes
+    ! OutOfMemoryError ? &mut Allocator {
+    let mut output = run Bytes.zeroed(u32.toUsize(length))
+    if length > 0 {
+      let source = match move Pointer.nonNullMany(pointer) {
+        Option<[*]const u8>.Some {value} => value
+        Option<[*]const u8>.None => Intrinsic.trap("null nonempty HTTP host buffer")
+      }
+      let target = Bytes.asMutSlice(&mut output)
+      let mut at: usize = 0
+      while at < target.length { unsafe { target[at] = Pointer.read(Pointer.at(source, at)) } at = at + 1 }
+    }
+    return move output
+  }
+
+  fn nullBytes() -> ?[*]mut u8 {
+    return unsafe Intrinsic.pointerRequalify<?*mut u8, ?[*]mut u8>(Pointer.null<u8>())
+  }
+
+  fn word<T>(value: &T, offset: usize) -> u32 {
+    let mut result: u32 = 0
+    let mut at: usize = 4
+    while at > 0 { at = at - 1 result = result * 256 + u8.toU32(unsafe abi.byte(value, offset + at)) }
+    return result
+  }
+
+  // The error-code variant is aligned to eight bytes by its option<u64> cases. String-bearing
+  // cases put their pointer at offset 12 or 16; the remaining words hold tags, lengths or numbers.
+  extern "C" struct ErrorCode { tag: u8, padding: [u8; 7], first: u32,
+    pointer12: ?[*]mut u8, pointer16: ?[*]mut u8, word20: u32, tail: u64 }
+
+  fn emptyError() -> ErrorCode {
+    return ErrorCode {tag: 0, padding: [0; 7], first: 0, pointer12: nullBytes(), pointer16: nullBytes(), word20: 0, tail: 0}
+  }
+
+  fn freeError(error: &ErrorCode) -> () {
+    let tag = error.tag
+    // DNS, field-size records, and optional error descriptions.
+    if tag == 1 || tag == 24 || tag == 27 || tag == 30 || tag == 31 || tag == 32 || tag == 38 {
+      if unsafe abi.byte(error, 8) != 0 && word(error, 16) > 0 { unsafe free(error.pointer12) }
+    } else if tag == 14 {
+      if unsafe abi.byte(error, 12) != 0 && error.word20 > 0 { unsafe free(error.pointer16) }
+    } else if tag == 22 {
+      if unsafe abi.byte(error, 8) != 0 && unsafe abi.byte(error, 12) != 0 && error.word20 > 0 { unsafe free(error.pointer16) }
+    }
+  }
+
+  /// Storage for a canonical `result<resource, error-code>`. Drop frees an error's string payloads.
+  pub extern "C" struct HttpResult { tag: u8, error: ErrorCode }
+  impl HttpResult {
+    /// Initializes storage before passing its address to the host.
+    pub fn make() -> HttpResult { return HttpResult {tag: 0, error: emptyError()} }
+    /// Returns the handle on success, or an HTTP error retaining the WASI error ordinal.
+    pub effect fn handle(self: &Self) -> u32 ! HttpError {
+      if self.tag != 0 { fail hostError(u8.toU32(self.error.tag)) }
+      return word(&self.error, 0)
+    }
+  }
+  impl Drop for HttpResult {
+    fn drop(self: &mut Self) -> () { if self.tag != 0 { freeError(&self.error) } }
+  }
+
+  extern "C" struct OuterResult { tag: u8, inner: HttpResult }
+  /// Storage for the result of an HTTP future. Drop frees error payloads in a completed result.
+  pub extern "C" struct FutureResult { present: u8, outer: OuterResult }
+  impl FutureResult {
+    /// Initializes future result storage before a host `get` call.
+    pub fn make() -> FutureResult { return FutureResult {present: 0, outer: OuterResult {tag: 0, inner: HttpResult.make()}} }
+    /// Whether the future produced a value. A false result may be polled again after readiness.
+    pub fn ready(self: &Self) -> bool { return self.present != 0 }
+    /// Returns a completed response handle or fails with its error. Call only when ready is true.
+    pub effect fn response(self: &Self) -> u32 ! HttpError {
+      if self.present == 0 || self.outer.tag != 0 { fail protocol("HTTP future has no available value") }
+      return run HttpResult.handle(&self.outer.inner)
+    }
+    /// Checks a completed trailers result and releases its optional owned fields handle.
+    pub effect fn trailers(self: &Self) -> () ! HttpError {
+      let ignored = run FutureResult.response(self)
+      drop ignored
+      if self.outer.inner.error.tag != 0 {
+        unsafe host.http_types_drop_fields(word(&self.outer.inner.error, 4))
+      }
+    }
+  }
+
+  /// Makes a protocol failure for a malformed or unusable host result.
+  pub fn protocol(message: string<'static>) -> HttpError { return HttpError.make(HttpErrorKind.Protocol, message) }
+
+  /// Converts a WASI HTTP error ordinal, retaining it as the provider cause.
+  pub fn hostError(code: u32) -> HttpError {
+    let mut kind = HttpErrorKind.Protocol
+    if code == 0 || code == 8 || code == 9 || code == 10 || code == 33 { kind = HttpErrorKind.Timeout }
+    else if code >= 1 && code <= 11 { kind = HttpErrorKind.Connect }
+    else if code >= 12 && code <= 14 { kind = HttpErrorKind.Tls }
+    else if code >= 15 && code <= 24 { kind = HttpErrorKind.InvalidRequest }
+    return HttpError.caused(kind, "WASI HTTP operation failed", HttpCause.Provider {provider: "wasi:http/types@0.2", code: code})
+  }
+
+  /// Copies an optional deadline without transferring the caller's option.
+  pub fn deadline(value: &Option<Instant>) -> Option<Instant> {
+    return match &value.* {
+      Option<Instant>.Some {value: time} => Option<Instant>.some(SystemClock.make(SystemClock.seconds(&time), SystemClock.nanoseconds(&time)))
+      Option<Instant>.None => Option<Instant>.none()
+    }
+  }
+
+  /// Converts stream failures to HTTP failure kinds.
+  pub fn streamError(error: StreamError) -> HttpError {
+    if error == StreamError.Timeout { return HttpError.make(HttpErrorKind.Timeout, "HTTP deadline expired") }
+    return protocol("HTTP body stream failed")
+  }
+
+  fn operationError(error: StreamError, message: string<'static>) -> HttpError {
+    let mut failure = streamError(error)
+    if error != StreamError.Timeout { failure.message = message }
+    return move failure
+  }
+
+  /// Waits on an owned pollable and releases it, failing if the supplied clock reaches the deadline.
+  pub unsafe effect fn wait(pollable: u32, until: &Option<Instant>) -> () ! HttpError ? &mut MonotonicClock {
+    let owner = unsafe Pollable.take(pollable)
+    if !run Pollable.wait(&owner, until) { fail HttpError.make(HttpErrorKind.Timeout, "HTTP deadline expired") }
+  }
+
+  /// Drains an owned incoming body, validates completion and trailers, and enforces `maximum` bytes.
+  /// The body must be an incoming-body handle with no existing stream child.
+  pub unsafe effect fn readBody(body: Resource, maximum: usize, until: &Option<Instant>) -> Bytes
+    ! HttpError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock {
+    let mut owned = move body
+    let mut result = ResultArea.make()
+    unsafe host.http_types_incoming_body_stream(Resource.handle(&owned), abi.address(&mut result))
+    if ResultArea.byte(&result, 0) != 0 { fail protocol("HTTP body stream was already taken") }
+    let mut stream = unsafe InputStream.take(ResultArea.word32(&result, 4))
+    let mut bytes = Bytes.make()
+    let mut buffer: [u8; 8192] = [0; 8192]
+    while true {
+      let transfer = match move run Effect.result(InputStream.read(&mut stream, &mut buffer, deadline(until))) {
+        Result<ReadTransfer, StreamError>.Success {value} => move value
+        Result<ReadTransfer, StreamError>.Failure {error} => { fail operationError(error, "HTTP incoming body read failed") }
+      }
+      match move transfer {
+        ReadTransfer.End => { break }
+        ReadTransfer.Data {count} => {
+          if count > maximum - Bytes.length(&bytes) { fail HttpError.make(HttpErrorKind.TooLarge, "HTTP body exceeds its limit") }
+          run Bytes.append(&mut bytes, Slice.view(&buffer, 0, count))
+        }
+      }
+    }
+    drop stream
+    let handle = unsafe Resource.release(&mut owned)
+    let futureHandle = unsafe host.http_types_incoming_body_finish(handle)
+    let future = unsafe Resource.take(futureHandle, ResourceKind.FutureTrailers)
+    while true {
+      let mut ready = FutureResult.make()
+      unsafe host.http_types_future_trailers_get(Resource.handle(&future), abi.address(&mut ready))
+      if FutureResult.ready(&ready) { run FutureResult.trailers(&ready) break }
+      let pollable = unsafe host.http_types_future_trailers_subscribe(Resource.handle(&future))
+      unsafe { run wait(pollable, until) }
+    }
+    return move bytes
+  }
+
+  /// Writes all bytes and finishes an owned outgoing body. The request or response must already
+  /// have been sent to the host so that it can consume bytes under backpressure.
+  pub unsafe effect fn writeBody(body: Resource, bytes: &[u8], until: &Option<Instant>) -> ()
+    ! HttpError ? &mut MonotonicClock {
+    let mut owned = move body
+    if bytes.length > 0 {
+    let mut result = ResultArea.make()
+    unsafe host.http_types_outgoing_body_write(Resource.handle(&owned), abi.address(&mut result))
+    if ResultArea.byte(&result, 0) != 0 { fail protocol("HTTP body stream was already taken") }
+    let mut stream = unsafe OutputStream.take(ResultArea.word32(&result, 4))
+    let mut at: usize = 0
+    while at < bytes.length {
+      let written = match move run Effect.result(OutputStream.write(&mut stream, Slice.view(bytes, at, bytes.length - at), deadline(until))) {
+        Result<usize, StreamError>.Success {value} => value
+        Result<usize, StreamError>.Failure {error} => { fail operationError(error, "HTTP outgoing body write failed") }
+      }
+      at = at + written
+    }
+    match move run Effect.result(OutputStream.flush(&mut stream, deadline(until))) {
+      Result<(), StreamError>.Success {value: _} => {}
+      Result<(), StreamError>.Failure {error} => { fail operationError(error, "HTTP outgoing body flush failed") }
+    }
+    drop stream
+    }
+    let mut finished = HttpResult.make()
+    let handle = unsafe Resource.release(&mut owned)
+    unsafe host.http_types_outgoing_body_finish(handle, 0, 0, abi.address(&mut finished))
+    if finished.tag != 0 { fail hostError(u8.toU32(finished.error.tag)) }
+  }
+
+  /// One owned HTTP field, preserving its name and raw value bytes.
+  pub struct Field {
+    /// The UTF-8 field name.
+    pub name: String,
+    /// The field value bytes, which need not be UTF-8.
+    pub value: Bytes,
+  }
+
+  extern "C" struct RawField { name: ?[*]mut u8, nameLength: u32, value: ?[*]mut u8, valueLength: u32 }
+  impl Copy for RawField {}
+  extern "C" struct RawFields { data: ?[*]mut RawField, length: u32 }
+  impl Drop for RawFields {
+    fn drop(self: &mut Self) -> () {
+      if self.length == 0 { return () }
+      let pointer = match move Pointer.nonNullMany(self.data) {
+        Option<[*]const RawField>.Some {value} => value
+        Option<[*]const RawField>.None => Intrinsic.trap("null WASI HTTP fields")
+      }
+      let mut at: usize = 0
+      unsafe {
+        while at < u32.toUsize(self.length) {
+          let field = Pointer.read(Pointer.at(pointer, at))
+          if field.nameLength > 0 { free(field.name) }
+          if field.valueLength > 0 { free(field.value) }
+          at = at + 1
+        }
+        free(Pointer.bytes(Pointer.at(pointer, 0)))
+      }
+    }
+  }
+
+  /// Copies a live fields resource into ordinary owned values, preserving repeated fields and order.
+  /// The caller keeps the fields resource and its parent alive until the operation returns.
+  pub unsafe effect fn readFields(handle: u32) -> List<Field> ! HttpError | OutOfMemoryError ? &mut Allocator {
+    let empty = unsafe Intrinsic.pointerRequalify<?*mut RawField, ?[*]mut RawField>(Pointer.null<RawField>())
+    let mut raw = RawFields {data: empty, length: 0}
+    unsafe host.http_types_fields_entries(handle, abi.address(&mut raw))
+    let mut fields = List<Field>.make()
+    if raw.length == 0 { return move fields }
+    let pointer = match move Pointer.nonNullMany(raw.data) {
+      Option<[*]const RawField>.Some {value} => value
+      Option<[*]const RawField>.None => Intrinsic.trap("null WASI HTTP fields")
+    }
+    let mut at: usize = 0
+    while at < u32.toUsize(raw.length) {
+      let address = unsafe Pointer.at(pointer, at)
+      let field = unsafe Pointer.read(address)
+      let mut bytes = Bytes.make()
+      unsafe { bytes = run copyBytes(field.name, field.nameLength) }
+      let name = match move String.fromBytes(move bytes) {
+        Result<String, InvalidUtf8>.Success {value} => move value
+        Result<String, InvalidUtf8>.Failure {error: _} => { fail protocol("HTTP field name is not UTF-8") }
+      }
+      let mut value = Bytes.make()
+      unsafe { value = run copyBytes(field.value, field.valueLength) }
+      run List<Field>.append(&mut fields, Field {name: move name, value: move value})
+      at = at + 1
+    }
+    return move fields
+  }
+
+  /// Appends a field to a live mutable fields resource. Host header restrictions remain in force.
+  pub unsafe effect fn appendField(handle: u32, name: string, value: &[u8]) -> () ! HttpError {
+    let mut result = ResultArea.make()
+    unsafe host.http_types_fields_append(handle, textAddress(name), usize.toU32(String.byteLength(name)),
+      bytesAddress(value), usize.toU32(value.length), abi.address(&mut result))
+    if ResultArea.byte(&result, 0) != 0 { fail HttpError.make(HttpErrorKind.InvalidRequest, "WASI rejected an HTTP header") }
+  }
+
+  /// Validates and copies response fields and status into Silk's portable response-head value.
+  pub effect fn responseHead(status: u16, fields: &[Field]) -> OwnedResponseHead
+    ! HttpError | OutOfMemoryError ? &mut Allocator {
+    let limits = Limits.defaults().head.values
+    let mut headers = List<Header>.make()
+    let mut at: usize = 0
+    while at < fields.length {
+      let header = match move Header.make(String.view(&fields[at].name), Bytes.asSlice(&fields[at].value), limits) {
+        Result<Header, ValueError>.Success {value} => value
+        Result<Header, ValueError>.Failure {error: _} => { fail protocol("Invalid HTTP response field") }
+      }
+      run List<Header>.append(&mut headers, header)
+      at = at + 1
+    }
+    let code = match move Status.fromCode(status) {
+      Result<Status, ValueError>.Success {value} => value
+      Result<Status, ValueError>.Failure {error: _} => { fail protocol("Invalid HTTP response status") }
+    }
+    let borrowed = match move Headers.make(List<Header>.asSlice(&headers), limits) {
+      Result<Headers, ValueError>.Success {value} => value
+      Result<Headers, ValueError>.Failure {error: _} => { fail protocol("Invalid HTTP response fields") }
+    }
+    let head = match move ResponseHead.make(Version.Http11, move code, Option<&[u8]>.none(), borrowed, limits) {
+      Result<ResponseHead, ValueError>.Success {value} => move value
+      Result<ResponseHead, ValueError>.Failure {error: _} => { fail protocol("Invalid HTTP response head") }
+    }
+    return match move run ResponseHead.copy(&head, limits) {
+      Result<OwnedResponseHead, ValueError>.Success {value} => move value
+      Result<OwnedResponseHead, ValueError>.Failure {error: _} => { fail protocol("HTTP response fields exceed their limits") }
+    }
+  }
+}

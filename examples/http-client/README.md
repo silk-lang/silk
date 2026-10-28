@@ -1,6 +1,6 @@
 # HTTP client
 
-Three requests against [httpbingo](https://httpbingo.org) through `silk.http_client`: a GET with
+Three requests against [httpbingo](https://httpbingo.org) through `silk.http.client`: a GET with
 query parameters, a POST with a JSON body, and a GET that answers 404. The program is written
 against the `Http` service, and `main` provides `NativeHttp`, which owns the sockets, TLS, clocks,
 and the trust store (`SSL_CERT_FILE` or the platform bundle).

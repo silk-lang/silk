@@ -6,9 +6,9 @@ import { initPackage, join, sharedHome, show, silk, write } from './lib.mjs'
 
 const h = sharedHome()
 const dir = initPackage(h, 'mistakes')
-const logging = `import silk.effect { Effect }
-import silk.logger { LogError }
-import silk.os_logger { StdoutLogger }
+const logging = `import silk.core.effect { Effect }
+import silk.io.logger { LogError }
+import silk.io.logger_native { StdoutLogger }
 pub effect fn main() -> () ! LogError {
   let mut logger = StdoutLogger.make()
 `
@@ -35,8 +35,8 @@ const cases = [
   ['mixed integer types', 'pub fn main() -> i32 {\n  let a: i64 = 1\n  let b: i32 = 2\n  return a + b\n}\n', /error\[SEM0135\] Operator \+ does not accept \(i64, i32\)$/],
   ['used null', 'pub fn main() -> i32 {\n  let x = null\n  return 0\n}\n', /error\[SEM0006\] Unknown value null$/],
   ['logged a string variable (strings copy, no move needed)', `${logging}  let tea = "x"\n  run Effect.log("{t}", &.{ t: tea }) |> Effect.provideMut(&mut logger)\n}\n`, null],
-  ['logged without a provider', 'import silk.effect { Effect }\nimport silk.logger { LogError }\npub effect fn main() -> () ! LogError {\n  run Effect.log("hi", &())\n}\n', /error\[SEM0071\]/],
-  ['did not declare the failure', 'import silk.effect { Effect }\nimport silk.os_logger { StdoutLogger }\npub effect fn main() -> () {\n  let mut logger = StdoutLogger.make()\n  run Effect.log("hi", &()) |> Effect.provideMut(&mut logger)\n}\n', /error\[SEM0066\]/],
+  ['logged without a provider', 'import silk.core.effect { Effect }\nimport silk.io.logger { LogError }\npub effect fn main() -> () ! LogError {\n  run Effect.log("hi", &())\n}\n', /error\[SEM0071\]/],
+  ['did not declare the failure', 'import silk.core.effect { Effect }\nimport silk.io.logger_native { StdoutLogger }\npub effect fn main() -> () {\n  let mut logger = StdoutLogger.make()\n  run Effect.log("hi", &()) |> Effect.provideMut(&mut logger)\n}\n', /error\[SEM0066\]/],
   ['misspelled a placeholder', `${logging}  run Effect.log("hi {nmae}", &.{ name: 1 }) |> Effect.provideMut(&mut logger)\n}\n`, /error\[SEM0177\] template field \{nmae\} not found; available visible fields: name$/],
   ['left a placeholder open', `${logging}  run Effect.log("hi {name", &.{ name: 1 }) |> Effect.provideMut(&mut logger)\n}\n`, /error\[SEM0177\] template placeholder is not closed: \{name$/],
   ['logged a struct with no Display', `struct P { x: i32 }\n${logging}  let p = P { x: 1 }\n  run Effect.log("{p}", &.{ p: move p }) |> Effect.provideMut(&mut logger)\n}\n`, /error\[SEM0121\] `main\.P: silk[./]format\.Display` cannot be proved/],

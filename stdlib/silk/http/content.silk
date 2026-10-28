@@ -1,0 +1,2691 @@
+//! Decode the content of an HTTP response: gzip, deflate, and Zstandard, as named in
+//! `Content-Encoding`.
+//!
+//! # When to use
+//! Make a [`ResponseContext`] from a response head, and a [`CodingPlan`] from it. Then decode the
+//! body with a [`Decoder`] when you have the wire bytes, or with [`withReader`] over a
+//! `BufferedDuplex`. Use [`acceptEncoding`] to make the `Accept-Encoding` field of a request.
+//! `silk.http.exchange` and `silk.http.fetch` use this module for you.
+//!
+//! # Details
+//! With `Mode.Raw`, the body is returned as it was sent. With `Mode.Decode`, the codings in
+//! `Content-Encoding` are decoded in reverse order. A response can have at most four codings.
+//! [`CodingPlan.make`] checks all limits and memory before it reads the body. The decoder also
+//! removes the body framing, so give it the bytes after the head.
+//!
+//! # Errors
+//! - [`ContentError`] tells the reason and the byte counts so far. A coding error tells where the
+//!   coding is in `Content-Encoding`.
+//! - `OutOfMemoryError` if the `Allocator` fails.
+//!
+//! # Gotchas
+//! Decoded bytes are not final until the state is `End`. A later checksum, trailer, or framing
+//! error can still fail. A step can return no bytes, so call it again until the state is `End`.
+//! This module does not check that the body belongs to the head. `silk.http.exchange` does.
+//!
+//! # Examples
+//! ## Decode a gzip body
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.http.message { Method }
+//! import silk.http.body { TrailerPolicy }
+//! import silk.http.content {
+//!   CodingPlan,
+//!   ContentError,
+//!   ContentProgressState,
+//!   DecodeFailure,
+//!   DecodeProgress,
+//!   Decoder,
+//!   Mode,
+//!   ResponseContext
+//! }
+//! import silk.http.exchange { Limits as ClientLimits }
+//! import silk.http.fetch { FetchOptions }
+//! import silk.http.head { ParseError, ParsedResponse, ResponseHead, ResponseParser, parseResponse }
+//! import silk.http.body { BodyError }
+//! import silk.core.result { Result }
+//! import silk.collections.slice { Slice }
+//! import silk.num.usize
+//!
+//! effect fn program() -> i32
+//!   ! OutOfMemoryError
+//!   ? &mut Allocator {
+//!   let limits = ClientLimits.defaults()
+//!   let wire = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 28\r\n\r\n"
+//!   let parsed = match run parseResponse(&wire, limits.head) {
+//!     Result<ParsedResponse, ParseError>.Success { value } => move value
+//!     Result<ParsedResponse, ParseError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let head = match ResponseParser.head(&parsed.parser) {
+//!     Result<ResponseHead, ParseError>.Success { value } => value
+//!     Result<ResponseHead, ParseError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let context = match ResponseContext.make(head, Method.get(), TrailerPolicy.defaultPolicy()) {
+//!     Result<ResponseContext, BodyError>.Success { value } => move value
+//!     Result<ResponseContext, BodyError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let options = FetchOptions.defaults()
+//!   let plan = match CodingPlan.make(
+//!     move context,
+//!     Mode.Decode,
+//!     limits.responseBody,
+//!     move options.contentLimits
+//!   ) {
+//!     Result<CodingPlan, ContentError>.Success { value } => move value
+//!     Result<CodingPlan, ContentError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let made = run Effect.result(Decoder.make(move plan))
+//!   let mut decoder = match move made {
+//!     Result.Success { value } => move value
+//!     Result.Failure { error } => {
+//!       drop error
+//!       return 1
+//!     }
+//!   }
+//!
+//!   // gzip of "hello hello hello"
+//!   let body: [u8; 28] = [
+//!     31,
+//!     139,
+//!     8,
+//!     0,
+//!     0,
+//!     0,
+//!     0,
+//!     0,
+//!     2,
+//!     255,
+//!     203,
+//!     72,
+//!     205,
+//!     201,
+//!     201,
+//!     87,
+//!     200,
+//!     64,
+//!     144,
+//!     0,
+//!     128,
+//!     136,
+//!     249,
+//!     229,
+//!     17,
+//!     0,
+//!     0,
+//!     0,
+//!   ]
+//!
+//!   // A step can return no bytes. Call it again until the state is End.
+//!   let mut chunk: [u8; 64] = [0; 64]
+//!   let mut offset = usize.ZERO
+//!   let mut total = usize.ZERO
+//!   let mut first: u8 = 0
+//!   let mut done = false
+//!   let mut steps = 0
+//!   while !done && steps < 1000 {
+//!     let rest = Slice.view<u8>(&body, offset, body.length - offset)
+//!     let step = match Decoder.step(&mut decoder, rest, &mut chunk, true) {
+//!       Result<DecodeProgress, DecodeFailure>.Success { value } => move value
+//!       Result<DecodeProgress, DecodeFailure>.Failure { error: _ } => {
+//!         return 1
+//!       }
+//!     }
+//!     offset = offset + step.consumed
+//!     if step.progress.written > usize.ZERO && total == usize.ZERO {
+//!       first = chunk[0]
+//!     }
+//!     total = total + step.progress.written
+//!     done = step.progress.state == ContentProgressState.End
+//!     steps = steps + 1
+//!   }
+//!   if !done || total != 17 || first != 104 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//!
+//! effect fn failed<E>(error: E) -> i32 {
+//!   drop error
+//!   return 1
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   return run Effect.catchAll(program(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+//! }
+//! ```
+//!
+//! @category HTTP
+
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.io.buffered_duplex {BufferedDuplex}
+import silk.io.buffered_input {BufferError, FillOutcome}
+import silk.collections.bytes {Bytes}
+import silk.io.byte_duplex {ByteDuplex}
+import silk.core.effect {Effect}
+import silk.format {Debug, Format, Formatter}
+import silk.http.message {Header, Method, Status, ValueError}
+import silk.http.body {
+  Anomaly,
+  BodyComponent,
+  BodyError,
+  BodyReason,
+  CompletionKind as BodyCompletionKind,
+  Decoder as BodyDecoder,
+  Framing,
+  Limits as BodyLimits,
+  Progress as BodyProgress,
+  ProgressState as BodyProgressState,
+  Selection,
+  TrailerPolicy,
+  Trailers,
+  selectResponse,
+}
+import silk.http.head {HeaderIterator, ResponseHead}
+import silk.http.headers {Limits as HeaderLimits}
+import silk.compress.inflate {
+  DecodeError,
+  Decoder as InflateDecoder,
+  ErrorKind as InflateErrorKind,
+  Format as InflateFormat,
+  Limits as InflateLimits,
+  MEMORY_BOUND as INFLATE_MEMORY_BOUND,
+  Progress as InflateProgress,
+  Status as InflateStatus,
+}
+import silk.layout {Layout}
+import silk.system.monotonic_clock {MonotonicClock}
+import silk.option {Option}
+import silk.core.ownership {Copy}
+import silk.core.result {Result}
+import silk.collections.slice {Slice}
+import silk.text.string {String}
+import silk.system.system_clock {Instant, SystemClock}
+import silk.compress.zstd_block {BlockReason, BlockState}
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.io.writer {Writer, WriterError}
+import silk.compress.zstd {
+  Zstd,
+  ZstdError,
+  ZstdLimits,
+  ZstdProgress,
+  ZstdReason,
+  ZstdStatus,
+}
+
+const MAX_CODINGS: usize = 4
+const MAX_INTERMEDIATE_CAPACITY: usize = 65536
+const ZSTD_BLOCK_CAPACITY: usize = 131072
+
+/// Whether to decode the content.
+pub enum Mode {
+  /// Return the body as it was sent. `Content-Encoding` is not read.
+  Raw,
+  /// Decode the codings in `Content-Encoding`.
+  Decode,
+}
+
+/// A content coding that this module knows.
+pub enum Coding {
+  /// `identity`: no change. It still counts in `maxDepth`.
+  Identity,
+  /// `gzip`. More gzip members after the first are decoded too.
+  Gzip,
+  /// `x-gzip`, the old name of `gzip`.
+  XGzip,
+  /// `deflate`, as a zlib stream. Raw DEFLATE without the zlib wrapper fails.
+  Deflate,
+  /// `zstd`, within the window and memory limits.
+  Zstd,
+}
+
+/// Where a coding is in the `Content-Encoding` fields.
+pub struct CodingPosition {
+  /// The position of the coding over all `Content-Encoding` fields, from 0.
+  pub wireIndex: usize,
+  /// The position of the field in the response head, from 0.
+  pub fieldIndex: usize,
+  /// The position of the coding in its field, from 0.
+  pub elementIndex: usize,
+  /// The byte offset of the coding, or the bad byte, in the field value.
+  pub offset: usize,
+}
+
+impl Copy for CodingPosition {}
+
+impl Debug for CodingPosition {
+  /// Writes the fields, as `CodingPosition { wireIndex: ..., fieldIndex: ..., ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return run Format.debugFields(self, "CodingPosition", &mut formatter)
+  }
+}
+
+/// The limits for content decoding.
+pub struct Limits {
+  /// The maximum body bytes before decoding, after the framing is removed.
+  pub maxEncoded: u64,
+  /// The maximum total bytes from all decoding stages except the last.
+  pub maxIntermediate: u64,
+  /// The maximum decoded bytes.
+  pub maxDecoded: u64,
+  /// The maximum memory for the decoders, without the memory of the body decoder.
+  pub maxOwned: usize,
+  /// The maximum number of codings, including `identity`. It is from 1 to 4.
+  pub maxDepth: usize,
+  /// The size of the buffer between two stages. It is from 1 to 65536.
+  pub intermediateCapacity: usize,
+  /// The limits for each gzip or deflate decoder.
+  pub inflate: InflateLimits,
+  /// The limits for each Zstandard decoder.
+  pub zstd: ZstdLimits,
+}
+
+/// The limit that failed. See [`ContentReason.InvalidLimit`].
+pub enum ContentLimitKind {
+  /// `maxDepth`.
+  CodingDepth,
+  /// `intermediateCapacity`.
+  IntermediateCapacity,
+  /// `maxOwned`.
+  OwnedBytes,
+  /// `maxEncoded`.
+  EncodedBytes,
+  /// `maxIntermediate`.
+  IntermediateBytes,
+  /// `maxDecoded`.
+  DecodedBytes,
+}
+
+impl Debug for ContentLimitKind {
+  /// Writes the name of the variant, such as `CodingDepth`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      ContentLimitKind.CodingDepth => run Format.write(&mut formatter, b"CodingDepth")
+      ContentLimitKind.IntermediateCapacity => run Format.write(&mut formatter, b"IntermediateCapacity")
+      ContentLimitKind.OwnedBytes => run Format.write(&mut formatter, b"OwnedBytes")
+      ContentLimitKind.EncodedBytes => run Format.write(&mut formatter, b"EncodedBytes")
+      ContentLimitKind.IntermediateBytes => run Format.write(&mut formatter, b"IntermediateBytes")
+      ContentLimitKind.DecodedBytes => run Format.write(&mut formatter, b"DecodedBytes")
+    }
+  }
+}
+
+/// The reason that content decoding failed.
+pub union ContentReason<'head> {
+  /// A limit is not valid, or a byte count exceeded it.
+  InvalidLimit {
+    /// The limit.
+    pub limit: ContentLimitKind,
+    /// The value of the limit.
+    pub allowed: u64,
+    /// The value that was found.
+    pub attempted: u64,
+  },
+  /// An item in `Content-Encoding` is empty or not valid.
+  CodingSyntax {
+    /// Where the item is.
+    pub position: CodingPosition,
+  },
+  /// A coding has no decoder, for example `br`.
+  UnsupportedCoding {
+    /// Where the coding is.
+    pub position: CodingPosition,
+    /// The name of the coding, from the response head.
+    pub token: &'head [u8],
+  },
+  /// A 206 partial response has a coding other than `identity`, and `Mode.Decode` cannot decode a
+  /// part.
+  PartialResponse {
+    /// The first coding that is not `identity`.
+    pub position: CodingPosition,
+  },
+  /// The body is a tunnel, not content.
+  Tunnel,
+  /// The body framing failed.
+  Body {
+    /// The error from `silk.http.body`.
+    pub error: BodyError,
+  },
+  /// Reading from the transport failed.
+  Buffer {
+    /// The error, with its transport cause.
+    pub error: BufferError,
+  },
+  /// Gzip or deflate decoding failed.
+  Inflate {
+    /// The decoding stage, from 0. Stage 0 decodes the last coding.
+    pub stage: usize,
+    /// The position of the coding in `Content-Encoding`, from 0.
+    pub wireIndex: usize,
+    /// The error from `silk.compress.inflate`.
+    pub error: DecodeError,
+  },
+  /// Zstandard decoding failed.
+  Zstandard {
+    /// The decoding stage, from 0. Stage 0 decodes the last coding.
+    pub stage: usize,
+    /// The position of the coding in `Content-Encoding`, from 0.
+    pub wireIndex: usize,
+    /// The error from `silk.compress.zstd`.
+    pub error: ZstdError,
+  },
+  /// There were more bytes after the end of a compressed stream.
+  TrailingEncodedData {
+    /// The decoding stage, from 0. Stage 0 decodes the last coding.
+    pub stage: usize,
+    /// The position of the coding in `Content-Encoding`, from 0.
+    pub wireIndex: usize,
+  },
+  /// A byte count overflowed.
+  ArithmeticOverflow,
+  /// The reader had already failed or stopped.
+  InvalidState,
+}
+
+impl<'head> Debug for ContentReason<'head> {
+  /// Writes the name of the variant and its fields, such as `InvalidLimit { ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      ContentReason<'head>.InvalidLimit { limit, allowed, attempted } => {
+        let mut record = run Format.debugRecord("InvalidLimit", &mut formatter)
+        run Format.debugField(&mut record, "limit", &limit, &mut formatter)
+        run Format.debugField(&mut record, "allowed", &allowed, &mut formatter)
+        run Format.debugField(&mut record, "attempted", &attempted, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      ContentReason<'head>.CodingSyntax { position } => {
+        let mut record = run Format.debugRecord("CodingSyntax", &mut formatter)
+        run Format.debugField(&mut record, "position", &position, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      ContentReason<'head>.UnsupportedCoding { position, token } => {
+        let mut record = run Format.debugRecord("UnsupportedCoding", &mut formatter)
+        run Format.debugField(&mut record, "position", &position, &mut formatter)
+        run Format.debugField(&mut record, "token", &token, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      ContentReason<'head>.PartialResponse { position } => {
+        let mut record = run Format.debugRecord("PartialResponse", &mut formatter)
+        run Format.debugField(&mut record, "position", &position, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      ContentReason<'head>.Tunnel => run Format.write(&mut formatter, b"Tunnel")
+      ContentReason<'head>.Body { error } => {
+        let mut record = run Format.debugRecord("Body", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      ContentReason<'head>.Buffer { error } => {
+        let mut record = run Format.debugRecord("Buffer", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      ContentReason<'head>.Inflate { stage, wireIndex, error } => {
+        let mut record = run Format.debugRecord("Inflate", &mut formatter)
+        run Format.debugField(&mut record, "stage", &stage, &mut formatter)
+        run Format.debugField(&mut record, "wireIndex", &wireIndex, &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      ContentReason<'head>.Zstandard { stage, wireIndex, error } => {
+        let mut record = run Format.debugRecord("Zstandard", &mut formatter)
+        run Format.debugField(&mut record, "stage", &stage, &mut formatter)
+        run Format.debugField(&mut record, "wireIndex", &wireIndex, &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      ContentReason<'head>.TrailingEncodedData { stage, wireIndex } => {
+        let mut record = run Format.debugRecord("TrailingEncodedData", &mut formatter)
+        run Format.debugField(&mut record, "stage", &stage, &mut formatter)
+        run Format.debugField(&mut record, "wireIndex", &wireIndex, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      ContentReason<'head>.ArithmeticOverflow => run Format.write(&mut formatter, b"ArithmeticOverflow")
+      ContentReason<'head>.InvalidState => run Format.write(&mut formatter, b"InvalidState")
+    }
+  }
+}
+
+/// The error from content decoding, with the reason and the byte counts so far. A coding error
+/// tells where the coding is in `Content-Encoding`.
+pub struct ContentError<'head> {
+  /// The reason.
+  pub reason: ContentReason<'head>,
+  /// The decoded bytes written by the call before the error.
+  pub written: usize,
+  /// The total body bytes read, after the framing is removed.
+  pub totalEncoded: u64,
+  /// The total bytes from all stages except the last.
+  pub totalIntermediate: u64,
+  /// The total decoded bytes written.
+  pub totalDecoded: u64,
+}
+
+impl<'head> Debug for ContentError<'head> {
+  /// Writes the fields, as `ContentError { reason: ..., written: ..., ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return run Format.debugFields(self, "ContentError", &mut formatter)
+  }
+}
+
+/// Whether the content is complete.
+pub enum ContentProgressState {
+  /// There is more content. The bytes so far are not final.
+  Data,
+  /// The body and all decoding completed, and all checks passed.
+  End,
+}
+
+/// The progress of a read.
+pub struct ContentProgress {
+  /// The decoded bytes written by this call.
+  pub written: usize,
+  /// The total body bytes read, after the framing is removed.
+  pub totalEncoded: u64,
+  /// The total bytes from all stages except the last.
+  pub totalIntermediate: u64,
+  /// The total decoded bytes written.
+  pub totalDecoded: u64,
+  /// Whether the content is complete.
+  pub state: ContentProgressState,
+}
+
+/// Whether the connection can be used again after this response.
+pub enum ReuseDisposition {
+  /// Yes, but only after the content completes.
+  EligibleAfterCompletion,
+  /// Yes. The body had a clear end, there was no problem, and the content completed.
+  Reusable,
+  /// No. The body ends when the connection closes, or the framing had a problem.
+  NonReusable,
+}
+
+/// A summary of a [`CodingPlan`].
+pub struct AppliedPlan {
+  /// Whether the content is decoded.
+  pub mode: Mode,
+  /// The number of codings in `Content-Encoding`, including `identity`.
+  pub codingCount: usize,
+  /// The number of decoders that run, without `identity`.
+  pub decoderCount: usize,
+  /// Whether the connection can be used again.
+  pub reuse: ReuseDisposition,
+}
+
+impl Copy for AppliedPlan {}
+
+/// Information about the decoded content. The headers of the response are not changed.
+pub struct RepresentationView<'owner, 'head> {
+  headValue: ResponseHead<'head>,
+  appliedValue: AppliedPlan,
+  anomalyValue: Anomaly,
+  decodedAppliedValue: bool,
+  decodedLengthValue: Option<u64>,
+  marker: &'owner u8,
+}
+
+impl<'owner, 'head> RepresentationView<'owner, 'head> {
+  /// Returns the response head as received, with its `Content-Encoding` and `Content-Length`.
+  pub fn originalHead(self: &Self) -> ResponseHead<'head> { return self.headValue }
+  /// Returns the summary of the plan.
+  pub fn appliedPlan(self: &Self) -> AppliedPlan { return self.appliedValue }
+  /// Returns a framing problem of the response, if any.
+  pub fn anomaly(self: &Self) -> Anomaly { return self.anomalyValue }
+  /// Returns `true` if at least one decoder runs.
+  pub fn decodingApplied(self: &Self) -> bool { return self.decodedAppliedValue }
+  /// Returns the decoded length after completion, 0 for a response without a body, or `None` before
+  /// completion.
+  pub fn decodedLength(self: &Self) -> Option<u64> {
+    return match &self.decodedLengthValue {
+      Option<u64>.None => Option<u64>.none()
+      Option<u64>.Some {value} => Option<u64>.some(value)
+    }
+  }
+}
+
+/// Proof that the body and all decoding completed.
+pub struct ContentCompletion<'owner> {
+  kindValue: BodyCompletionKind,
+  decodedValue: u64,
+  anomalyValue: Anomaly,
+  reuseValue: ReuseDisposition,
+  marker: &'owner u8,
+}
+
+impl<'owner> ContentCompletion<'owner> {
+  /// Returns how the body ended: at a clear end, or when the connection closed.
+  pub fn bodyKind(self: &Self) -> BodyCompletionKind { return self.kindValue }
+  /// Returns the number of decoded bytes.
+  pub fn decodedBytes(self: &Self) -> u64 { return self.decodedValue }
+  /// Returns a framing problem of the response, if any.
+  pub fn anomaly(self: &Self) -> Anomaly { return self.anomalyValue }
+  /// Returns whether the connection can be used again.
+  pub fn reuse(self: &Self) -> ReuseDisposition { return self.reuseValue }
+}
+
+/// A response head with its request method and trailer policy, ready for a [`CodingPlan`].
+pub struct ResponseContext<'head, 'method, 'names> {
+  head: ResponseHead<'head>,
+  requestMethod: Method<'method>,
+  trailerPolicy: TrailerPolicy<'names>,
+  selection: Selection<'head>,
+  framing: Framing,
+  anomaly: Anomaly,
+}
+
+impl<'head, 'method, 'names> ResponseContext<'head, 'method, 'names> {
+  /// Selects the body framing of `head`, and returns a context. Fails if the framing is not valid.
+  pub fn make(
+    head: ResponseHead<'head>,
+    requestMethod: Method<'method>,
+    trailerPolicy: TrailerPolicy<'names>,
+  ) -> Result<ResponseContext<'head, 'method, 'names>, BodyError> {
+    let selected = selectResponse(head, &requestMethod, trailerPolicy)
+    match move selected {
+      Result<Selection<'head>, BodyError>.Failure {error} => {
+        return Result<ResponseContext<'head, 'method, 'names>, BodyError>.failResult(move error)
+      }
+      Result<Selection<'head>, BodyError>.Success {value} => {
+        let framing = value.framing()
+        let anomaly = value.anomaly()
+        return Result<ResponseContext<'head, 'method, 'names>, BodyError>.succeed(ResponseContext<'head, 'method, 'names> {
+          head: head,
+          requestMethod: requestMethod,
+          trailerPolicy: trailerPolicy,
+          selection: move value,
+          framing: framing,
+          anomaly: anomaly,
+        })
+      }
+    }
+    return Result<ResponseContext<'head, 'method, 'names>, BodyError>.failResult(
+      BodyError {
+        reason: BodyReason.InvalidState,
+        component: BodyComponent.Selection,
+        wireOffset: u64.MIN,
+        consumed: usize.ZERO,
+        written: usize.ZERO,
+        totalWire: u64.MIN,
+        totalPayload: u64.MIN,
+        fieldIndex: Option<usize>.none(),
+      },
+    )
+  }
+}
+
+struct CodingSlot<'head> {
+  present: bool,
+  coding: Coding,
+  position: CodingPosition,
+  token: &'head [u8],
+}
+
+impl<'head> Copy for CodingSlot<'head> {}
+
+union CodecConfigFailure {
+  Arithmetic,
+  Inflate {stage: usize, wireIndex: usize, kind: InflateErrorKind},
+  Zstandard {stage: usize, wireIndex: usize, reason: ZstdReason},
+}
+
+/// A checked plan to decode one response body. Use it one time.
+///
+/// # Details
+///
+/// With `Mode.Raw`, the body is returned as it was sent. With `Mode.Decode`, the codings in
+/// `Content-Encoding` (gzip, deflate, and Zstandard) are decoded in reverse order. A response can
+/// have at most four codings. [`CodingPlan.make`] checks all limits and memory before the body is
+/// read.
+pub struct CodingPlan<'head, 'method, 'names> {
+  headValue: ResponseHead<'head>,
+  requestMethod: Method<'method>,
+  trailerPolicy: TrailerPolicy<'names>,
+  selection: Selection<'head>,
+  framingValue: Framing,
+  anomalyValue: Anomaly,
+  mode: Mode,
+  bodyLimits: BodyLimits,
+  limits: Limits,
+  codingCount: usize,
+  decoderCount: usize,
+  coding0: CodingSlot<'head>,
+  coding1: CodingSlot<'head>,
+  coding2: CodingSlot<'head>,
+  coding3: CodingSlot<'head>,
+  ownedReservation: usize,
+}
+
+impl<'head, 'method, 'names> CodingPlan<'head, 'method, 'names> {
+  /// Reads `Content-Encoding` in `Mode.Decode`, and checks all limits and memory.
+  ///
+  /// It does not allocate or read the body.
+  pub fn make(
+    context: ResponseContext<'head, 'method, 'names>,
+    mode: Mode,
+    bodyLimits: BodyLimits,
+    limits: Limits,
+  ) -> Result<CodingPlan<'head, 'method, 'names>, ContentError<'head>> {
+    let head = context.head
+    let requestMethod = context.requestMethod
+    let trailerPolicy = context.trailerPolicy
+    let framing = context.framing
+    let anomaly = context.anomaly
+    let selection = move context.selection
+    let valid = validateLimits(&limits)
+    if let Result<(), ContentError<'head>>.Failure {error} = move valid {
+      return Result<CodingPlan<'head, 'method, 'names>, ContentError<'head>>.failResult(move error)
+    }
+    if isTunnel(framing) {
+      return planFailure<CodingPlan<'head, 'method, 'names>>(ContentReason<'head>.Tunnel)
+    }
+    let empty = emptyCodingSlot<'head>()
+    let mut coding0 = empty
+    let mut coding1 = empty
+    let mut coding2 = empty
+    let mut coding3 = empty
+    let mut codingCount = usize.ZERO
+    let mut decoderCount = usize.ZERO
+    if mode == Mode.Decode && !isEmpty(framing) {
+      let parsed = parseCodings(
+        head.fields(),
+        limits.maxDepth,
+        &mut coding0,
+        &mut coding1,
+        &mut coding2,
+        &mut coding3,
+        &mut codingCount,
+        &mut decoderCount,
+      )
+      if let Result<(), ContentError<'head>>.Failure {error} = move parsed {
+        return Result<CodingPlan<'head, 'method, 'names>, ContentError<'head>>.failResult(move error)
+      }
+      let status = head.status()
+      if Status.code(&status) == 206 && decoderCount > usize.ZERO {
+        let position = firstNonIdentity(coding0, coding1, coding2, coding3, codingCount)
+        return planFailure<CodingPlan<'head, 'method, 'names>>(
+          ContentReason<'head>.PartialResponse {position: position},
+        )
+      }
+      let configured = validateCodecConfiguration(
+        &limits,
+        decoderCount,
+        coding0,
+        coding1,
+        coding2,
+        coding3,
+      )
+      if let Result<(), CodecConfigFailure>.Failure {error} = move configured {
+        return match move error {
+          CodecConfigFailure.Arithmetic => planFailure<CodingPlan<'head, 'method, 'names>>(
+            ContentReason<'head>.ArithmeticOverflow,
+          )
+          CodecConfigFailure.Inflate {stage, wireIndex, kind} => {
+            return planFailure<CodingPlan<'head, 'method, 'names>>(ContentReason<'head>.Inflate {
+              stage: stage,
+              wireIndex: wireIndex,
+              error: DecodeError {kind: kind, consumed: usize.ZERO, written: usize.ZERO},
+            })
+          }
+          CodecConfigFailure.Zstandard {stage, wireIndex, reason} => {
+            return planFailure<CodingPlan<'head, 'method, 'names>>(ContentReason<'head>.Zstandard {
+              stage: stage,
+              wireIndex: wireIndex,
+              error: ZstdError {
+                reason: reason,
+                blockReason: BlockReason.None,
+                offset: u64.MIN,
+                consumed: usize.ZERO,
+                written: usize.ZERO,
+              },
+            })
+          }
+        }
+      }
+    }
+    let owned = match move ownedReservation(&limits, decoderCount, coding0, coding1, coding2, coding3) {
+      Result<usize, ContentError<'head>>.Failure {error} => {
+        return Result<CodingPlan<'head, 'method, 'names>, ContentError<'head>>.failResult(move error)
+      }
+      Result<usize, ContentError<'head>>.Success {value} => value
+    }
+    return Result<CodingPlan<'head, 'method, 'names>, ContentError<'head>>.succeed(CodingPlan<'head, 'method, 'names> {
+      headValue: head,
+      requestMethod: requestMethod,
+      trailerPolicy: trailerPolicy,
+      selection: move selection,
+      framingValue: framing,
+      anomalyValue: anomaly,
+      mode: mode,
+      bodyLimits: bodyLimits,
+      limits: move limits,
+      codingCount: codingCount,
+      decoderCount: decoderCount,
+      coding0: coding0,
+      coding1: coding1,
+      coding2: coding2,
+      coding3: coding3,
+      ownedReservation: owned,
+    })
+  }
+
+  /// Returns the response head as received.
+  pub fn originalHead(self: &Self) -> ResponseHead<'head> { return self.headValue }
+
+  /// Returns a framing problem of the response, if any.
+  pub fn selectionAnomaly(self: &Self) -> Anomaly { return self.anomalyValue }
+
+  /// Returns the body framing.
+  pub fn selectedFraming(self: &Self) -> Framing { return self.framingValue }
+
+  /// Returns the summary of the plan.
+  pub fn applied(self: &Self) -> AppliedPlan {
+    return AppliedPlan {
+      mode: self.mode,
+      codingCount: self.codingCount,
+      decoderCount: self.decoderCount,
+      reuse: initialReuse(self.framingValue, self.anomalyValue),
+    }
+  }
+
+  /// Returns the memory that the plan needs, as counted against `maxOwned`.
+  pub fn ownedBytes(self: &Self) -> usize { return self.ownedReservation }
+}
+
+/// The codings to name in an automatic `Accept-Encoding` field. `x-gzip` is never named.
+pub struct EnabledCodings {
+  /// Name `gzip`.
+  pub gzip: bool,
+  /// Name `deflate`.
+  pub deflate: bool,
+  /// Name `zstd`.
+  pub zstd: bool,
+}
+
+impl Copy for EnabledCodings {}
+
+/// What to send when no coding is enabled.
+pub enum EmptyEncodingPolicy {
+  /// Send `Accept-Encoding: identity`.
+  Identity,
+  /// Send no `Accept-Encoding` field.
+  Omit,
+}
+
+/// How to make the `Accept-Encoding` field.
+pub union AcceptEncoding<'value> {
+  /// Name the enabled codings, in the order gzip, deflate, zstd. Only in `Mode.Decode`.
+  Automatic {
+    /// The codings to name.
+    pub enabled: EnabledCodings,
+    /// What to send when no coding is enabled.
+    pub empty: EmptyEncodingPolicy
+  },
+  /// Send this value. The response is still checked as in the other cases.
+  Override {
+    /// The field value.
+    pub value: &'value [u8]
+  },
+  /// Send no `Accept-Encoding` field.
+  Omit,
+}
+
+/// Returns the `Accept-Encoding` field for `mode` and `policy`, or `None` when no field is sent.
+pub fn acceptEncoding<'value>(
+  mode: Mode,
+  policy: AcceptEncoding<'value>,
+  limits: HeaderLimits,
+) -> Result<Option<Header<'value>>, ValueError> {
+  return match move policy {
+    AcceptEncoding<'value>.Omit => Result<Option<Header<'value>>, ValueError>.succeed(
+      Option<Header<'value>>.none(),
+    )
+    AcceptEncoding<'value>.Override {value: overrideValue} => {
+      return makeAcceptEncoding(overrideValue, limits)
+    }
+    AcceptEncoding<'value>.Automatic {enabled, empty} => {
+      if mode == Mode.Raw {
+        return Result<Option<Header<'value>>, ValueError>.succeed(Option<Header<'value>>.none())
+      }
+      if enabled.gzip && enabled.deflate && enabled.zstd {
+        return makeAcceptEncoding<'value>(b"gzip, deflate, zstd", limits)
+      }
+      if enabled.gzip && enabled.deflate { return makeAcceptEncoding<'value>(b"gzip, deflate", limits) }
+      if enabled.gzip && enabled.zstd { return makeAcceptEncoding<'value>(b"gzip, zstd", limits) }
+      if enabled.deflate && enabled.zstd { return makeAcceptEncoding<'value>(b"deflate, zstd", limits) }
+      if enabled.gzip { return makeAcceptEncoding<'value>(b"gzip", limits) }
+      if enabled.deflate { return makeAcceptEncoding<'value>(b"deflate", limits) }
+      if enabled.zstd { return makeAcceptEncoding<'value>(b"zstd", limits) }
+      if empty == EmptyEncodingPolicy.Identity {
+        return makeAcceptEncoding<'value>(b"identity", limits)
+      }
+      return Result<Option<Header<'value>>, ValueError>.succeed(Option<Header<'value>>.none())
+    }
+  }
+}
+
+fn makeAcceptEncoding<'value>(
+  value: &'value [u8],
+  limits: HeaderLimits,
+) -> Result<Option<Header<'value>>, ValueError> {
+  match move Header.make("Accept-Encoding", value, limits) {
+    Result<Header<'value>, ValueError>.Failure {error} => {
+      return Result<Option<Header<'value>>, ValueError>.failResult(move error)
+    }
+    Result<Header<'value>, ValueError>.Success {value: header} => {
+      return Result<Option<Header<'value>>, ValueError>.succeed(Option<Header<'value>>.some(header))
+    }
+  }
+  return Result<Option<Header<'value>>, ValueError>.succeed(Option<Header<'value>>.none())
+}
+
+/// Checks `limits` without allocation or I/O.
+///
+/// # Details
+/// `maxDepth` must be from 1 to 4, and `intermediateCapacity` from 1 to 65536. The other limits can
+/// be 0, and are checked during planning or decoding. The limits of a decoder are checked when a
+/// plan selects it.
+pub fn validateLimits<'head>(limits: &Limits) -> Result<(), ContentError<'head>> {
+  if limits.maxDepth == usize.ZERO || limits.maxDepth > MAX_CODINGS {
+    return planFailure<()>(ContentReason<'head>.InvalidLimit {
+      limit: ContentLimitKind.CodingDepth,
+      allowed: usize.toU64(MAX_CODINGS),
+      attempted: usize.toU64(limits.maxDepth),
+    })
+  }
+  if limits.intermediateCapacity == usize.ZERO
+    || limits.intermediateCapacity > MAX_INTERMEDIATE_CAPACITY {
+    return planFailure<()>(ContentReason<'head>.InvalidLimit {
+      limit: ContentLimitKind.IntermediateCapacity,
+      allowed: usize.toU64(MAX_INTERMEDIATE_CAPACITY),
+      attempted: usize.toU64(limits.intermediateCapacity),
+    })
+  }
+  return Result<(), ContentError<'head>>.succeed(())
+}
+
+fn validateCodecConfiguration<'head>(
+  limits: &Limits,
+  decoderCount: usize,
+  slot0: CodingSlot<'head>,
+  slot1: CodingSlot<'head>,
+  slot2: CodingSlot<'head>,
+  slot3: CodingSlot<'head>,
+) -> Result<(), CodecConfigFailure> {
+  let staged = match move usize.checkedMultiply(ZSTD_BLOCK_CAPACITY, 3) {
+    Option<usize>.None => {
+      return Result<(), CodecConfigFailure>.failResult(CodecConfigFailure.Arithmetic)
+    }
+    Option<usize>.Some {value} => value
+  }
+  let withState = match move usize.checkedAdd(staged, Layout.of<Zstd>().bytes) {
+    Option<usize>.None => {
+      return Result<(), CodecConfigFailure>.failResult(CodecConfigFailure.Arithmetic)
+    }
+    Option<usize>.Some {value} => value
+  }
+  let requiredZstdWorkspace = match move usize.checkedAdd(withState, BlockState.workspaceBytes()) {
+    Option<usize>.None => {
+      return Result<(), CodecConfigFailure>.failResult(CodecConfigFailure.Arithmetic)
+    }
+    Option<usize>.Some {value} => value
+  }
+  let mut stage = usize.ZERO
+  while stage < decoderCount {
+    let slot = reverseStage(slot0, slot1, slot2, slot3, stage)
+    if slot.coding == Coding.Zstd {
+      if limits.zstd.workspaceBytes < requiredZstdWorkspace {
+        return Result<(), CodecConfigFailure>.failResult(CodecConfigFailure.Zstandard {
+          stage: stage,
+          wireIndex: slot.position.wireIndex,
+          reason: ZstdReason.WorkspaceLimit,
+        })
+      }
+      if limits.zstd.windowBytes == usize.ZERO
+        || limits.zstd.windowBytes > usize.MAX - requiredZstdWorkspace {
+        return Result<(), CodecConfigFailure>.failResult(CodecConfigFailure.Zstandard {
+          stage: stage,
+          wireIndex: slot.position.wireIndex,
+          reason: ZstdReason.InvalidConfiguration,
+        })
+      }
+    } else {
+      if limits.inflate.maxMemoryBytes < INFLATE_MEMORY_BOUND {
+        return Result<(), CodecConfigFailure>.failResult(CodecConfigFailure.Inflate {
+          stage: stage,
+          wireIndex: slot.position.wireIndex,
+          kind: InflateErrorKind.MemoryLimit,
+        })
+      }
+      if limits.inflate.maxMembers == u64.MIN {
+        return Result<(), CodecConfigFailure>.failResult(CodecConfigFailure.Inflate {
+          stage: stage,
+          wireIndex: slot.position.wireIndex,
+          kind: InflateErrorKind.MemberLimit,
+        })
+      }
+    }
+    stage = stage + usize.ONE
+  }
+  return Result<(), CodecConfigFailure>.succeed(())
+}
+
+fn parseCodings<'head>(
+  fields: HeaderIterator<'head>,
+  maxDepth: usize,
+  slot0: &mut CodingSlot<'head>,
+  slot1: &mut CodingSlot<'head>,
+  slot2: &mut CodingSlot<'head>,
+  slot3: &mut CodingSlot<'head>,
+  codingCount: &mut usize,
+  decoderCount: &mut usize,
+) -> Result<(), ContentError<'head>> {
+  let mut iterator = move fields
+  while true {
+    let next = iterator.next()
+    match move next {
+      Option<Header<'head>>.None => { return Result<(), ContentError<'head>>.succeed(()) }
+      Option<Header<'head>>.Some {value: header} => {
+        if !asciiName(Header.name(&header), "content-encoding") { continue }
+        let fieldIndex = iterator.fieldIndex()
+        let bytes = Header.value(&header)
+        if bytes.length == usize.ZERO {
+          return syntaxFailure<'head>(codingCount.*, fieldIndex, usize.ZERO, usize.ZERO)
+        }
+        let mut start = usize.ZERO
+        let mut element = usize.ZERO
+        while start <= bytes.length {
+          let mut comma = start
+          while comma < bytes.length && bytes[comma] != 44 { comma = comma + usize.ONE }
+          let mut tokenStart = start
+          while tokenStart < comma && isOws(bytes[tokenStart]) { tokenStart = tokenStart + usize.ONE }
+          let mut tokenEnd = comma
+          while tokenEnd > tokenStart && isOws(bytes[tokenEnd - usize.ONE]) {
+            tokenEnd = tokenEnd - usize.ONE
+          }
+          let position = CodingPosition {
+            wireIndex: codingCount.*,
+            fieldIndex: fieldIndex,
+            elementIndex: element,
+            offset: tokenStart,
+          }
+          if tokenStart == tokenEnd {
+            return planFailure<()>(ContentReason<'head>.CodingSyntax {position: position})
+          }
+          let token = Slice.view<u8>(bytes, tokenStart, tokenEnd - tokenStart)
+          let mut byteIndex = usize.ZERO
+          while byteIndex < token.length {
+            if !tokenByte(token[byteIndex]) {
+              let failed = CodingPosition {
+                wireIndex: codingCount.*,
+                fieldIndex: fieldIndex,
+                elementIndex: element,
+                offset: tokenStart + byteIndex,
+              }
+              return planFailure<()>(ContentReason<'head>.CodingSyntax {position: failed})
+            }
+            byteIndex = byteIndex + usize.ONE
+          }
+          if codingCount.* >= maxDepth {
+            return planFailure<()>(ContentReason<'head>.InvalidLimit {
+              limit: ContentLimitKind.CodingDepth,
+              allowed: usize.toU64(maxDepth),
+              attempted: usize.toU64(codingCount.* + usize.ONE),
+            })
+          }
+          let coding = match move recognizeCoding(token) {
+            Option<Coding>.None => {
+              return planFailure<()>(ContentReason<'head>.UnsupportedCoding {
+                position: position,
+                token: token,
+              })
+            }
+            Option<Coding>.Some {value} => value
+          }
+          let slot = CodingSlot<'head> {
+            present: true,
+            coding: coding,
+            position: position,
+            token: token,
+          }
+          if codingCount.* == usize.ZERO { slot0.* = move slot }
+          else if codingCount.* == usize.ONE { slot1.* = move slot }
+          else if codingCount.* == 2 { slot2.* = move slot }
+          else { slot3.* = move slot }
+          codingCount.* = codingCount.* + usize.ONE
+          if coding != Coding.Identity { decoderCount.* = decoderCount.* + usize.ONE }
+          if comma == bytes.length { break }
+          start = comma + usize.ONE
+          element = element + usize.ONE
+          if start == bytes.length {
+            return syntaxFailure<'head>(codingCount.*, fieldIndex, element, start)
+          }
+        }
+      }
+    }
+  }
+  return Result<(), ContentError<'head>>.succeed(())
+}
+
+fn recognizeCoding(token: &[u8]) -> Option<Coding> {
+  if asciiBytes(token, b"identity") { return Option<Coding>.some(Coding.Identity) }
+  if asciiBytes(token, b"gzip") { return Option<Coding>.some(Coding.Gzip) }
+  if asciiBytes(token, b"x-gzip") { return Option<Coding>.some(Coding.XGzip) }
+  if asciiBytes(token, b"deflate") { return Option<Coding>.some(Coding.Deflate) }
+  if asciiBytes(token, b"zstd") { return Option<Coding>.some(Coding.Zstd) }
+  return Option<Coding>.none()
+}
+
+fn firstNonIdentity<'head>(
+  slot0: CodingSlot<'head>,
+  slot1: CodingSlot<'head>,
+  slot2: CodingSlot<'head>,
+  slot3: CodingSlot<'head>,
+  count: usize,
+) -> CodingPosition {
+  let mut index = usize.ZERO
+  while index < count {
+    let slot = codingAt(&slot0, &slot1, &slot2, &slot3, index)
+    if slot.coding != Coding.Identity { return slot.position }
+    index = index + usize.ONE
+  }
+  return CodingPosition {wireIndex: usize.ZERO, fieldIndex: usize.ZERO, elementIndex: usize.ZERO, offset: usize.ZERO}
+}
+
+fn ownedReservation<'head>(
+  limits: &Limits,
+  decoderCount: usize,
+  slot0: CodingSlot<'head>,
+  slot1: CodingSlot<'head>,
+  slot2: CodingSlot<'head>,
+  slot3: CodingSlot<'head>,
+) -> Result<usize, ContentError<'head>> {
+  // Charge the actual inline reader, including inactive stage slots and edge descriptors.
+  // BodyDecoder owns its separate budget; each active codec reservation includes its inline state.
+  let mut owned = Layout.of<ContentReader<'static, 'static, 'static, ()>>().bytes
+    - Layout.of<BodyDecoder>().bytes
+  let buffers = match move usize.checkedMultiply(decoderCount, limits.intermediateCapacity) {
+    Option<usize>.None => { return arithmeticFailure<usize>() }
+    Option<usize>.Some {value} => value
+  }
+  owned = match move usize.checkedAdd(owned, buffers) {
+    Option<usize>.None => { return arithmeticFailure<usize>() }
+    Option<usize>.Some {value} => value
+  }
+  let mut index = usize.ZERO
+  while index < 4 {
+    let slot = codingAt(&slot0, &slot1, &slot2, &slot3, 3 - index)
+    if slot.present && slot.coding != Coding.Identity {
+      if slot.coding == Coding.Zstd {
+        owned = owned - Layout.of<Zstd>().bytes
+        owned = match move usize.checkedAdd(owned, limits.zstd.windowBytes) {
+          Option<usize>.None => { return arithmeticFailure<usize>() }
+          Option<usize>.Some {value} => value
+        }
+        owned = match move usize.checkedAdd(owned, limits.zstd.workspaceBytes) {
+          Option<usize>.None => { return arithmeticFailure<usize>() }
+          Option<usize>.Some {value} => value
+        }
+      } else {
+        owned = owned - Layout.of<InflateDecoder>().bytes
+        owned = match move usize.checkedAdd(owned, u64.toUsize(INFLATE_MEMORY_BOUND)) {
+          Option<usize>.None => { return arithmeticFailure<usize>() }
+          Option<usize>.Some {value} => value
+        }
+      }
+    }
+    index = index + usize.ONE
+  }
+  if owned > limits.maxOwned {
+    return planFailure<usize>(ContentReason<'head>.InvalidLimit {
+      limit: ContentLimitKind.OwnedBytes,
+      allowed: usize.toU64(limits.maxOwned),
+      attempted: usize.toU64(owned),
+    })
+  }
+  return Result<usize, ContentError<'head>>.succeed(owned)
+}
+
+
+fn codingAt<'head>(
+  slot0: &CodingSlot<'head>,
+  slot1: &CodingSlot<'head>,
+  slot2: &CodingSlot<'head>,
+  slot3: &CodingSlot<'head>,
+  index: usize,
+) -> CodingSlot<'head> {
+  if index == usize.ZERO { return slot0.* }
+  if index == usize.ONE { return slot1.* }
+  if index == 2 { return slot2.* }
+  return slot3.*
+}
+
+fn emptyCodingSlot<'head>() -> CodingSlot<'head> {
+  return CodingSlot<'head> {
+    present: false,
+    coding: Coding.Identity,
+    position: CodingPosition {wireIndex: usize.ZERO, fieldIndex: usize.ZERO, elementIndex: usize.ZERO, offset: usize.ZERO},
+    token: b"",
+  }
+}
+
+fn syntaxFailure<'head>(
+  wireIndex: usize,
+  fieldIndex: usize,
+  elementIndex: usize,
+  offset: usize,
+) -> Result<(), ContentError<'head>> {
+  return planFailure<()>(ContentReason<'head>.CodingSyntax {position: CodingPosition {
+    wireIndex: wireIndex,
+    fieldIndex: fieldIndex,
+    elementIndex: elementIndex,
+    offset: offset,
+  }})
+}
+
+fn arithmeticFailure<A, 'head>() -> Result<A, ContentError<'head>> {
+  return planFailure<A>(ContentReason<'head>.ArithmeticOverflow)
+}
+
+fn planFailure<A, 'head>(reason: ContentReason<'head>) -> Result<A, ContentError<'head>> {
+  return Result<A, ContentError<'head>>.failResult(ContentError<'head> {
+    reason: move reason,
+    written: usize.ZERO,
+    totalEncoded: u64.MIN,
+    totalIntermediate: u64.MIN,
+    totalDecoded: u64.MIN,
+  })
+}
+
+fn initialReuse(framing: Framing, anomaly: Anomaly) -> ReuseDisposition {
+  if anomaly != Anomaly.None || isCloseDelimited(framing) {
+    return ReuseDisposition.NonReusable
+  }
+  return ReuseDisposition.EligibleAfterCompletion
+}
+
+fn isEmpty(framing: Framing) -> bool {
+  return match move framing { Framing.Empty => true _ => false }
+}
+
+fn isTunnel(framing: Framing) -> bool {
+  return match move framing { Framing.Tunnel => true _ => false }
+}
+
+fn isCloseDelimited(framing: Framing) -> bool {
+  return match move framing { Framing.CloseDelimited => true _ => false }
+}
+
+fn isOws(value: u8) -> bool { return value == 9 || value == 32 }
+
+fn tokenByte(value: u8) -> bool {
+  if value >= 65 && value <= 90 { return true }
+  if value >= 97 && value <= 122 { return true }
+  if value >= 48 && value <= 57 { return true }
+  return value == 33 || value == 35 || value == 36 || value == 37 || value == 38
+    || value == 39 || value == 42 || value == 43 || value == 45 || value == 46
+    || value == 94 || value == 95 || value == 96 || value == 124 || value == 126
+}
+
+fn asciiName(left: string, right: string) -> bool {
+  return asciiBytes(String.utf8Bytes(left), String.utf8Bytes(right))
+}
+
+fn asciiBytes(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut index = usize.ZERO
+  while index < left.length {
+    if asciiLower(left[index]) != asciiLower(right[index]) { return false }
+    index = index + usize.ONE
+  }
+  return true
+}
+
+fn asciiLower(value: u8) -> u8 {
+  if value >= 65 && value <= 90 { return value + 32 }
+  return value
+}
+
+enum ReaderPhase { Live, Complete, Failed, Abandoned }
+
+struct Edge {
+  bytes: Bytes,
+  start: usize,
+  length: usize,
+  finalInput: bool,
+}
+
+union Stage {
+  Inactive,
+  Inflate {position: CodingPosition, decoder: InflateDecoder, finished: bool},
+  Zstandard {position: CodingPosition, decoder: Zstd, finished: bool},
+}
+
+union StageCause {
+  Inflate {error: DecodeError},
+  Zstandard {error: ZstdError},
+  Limit,
+  Trailing,
+  InvalidState,
+}
+
+struct StageProgress {
+  consumed: usize,
+  written: usize,
+  status: StageStatus,
+}
+
+enum StageStatus { NeedInput, NeedOutput, Finished }
+
+union StageTransition {
+  Success {progress: StageProgress},
+  Failure {consumed: usize, written: usize, cause: StageCause},
+}
+
+struct BufferedStageTransition {
+  transition: StageTransition,
+  byte: u8,
+  written: usize,
+}
+
+struct BufferedBodyStep {
+  attempted: Result<BodyProgress, BodyError>,
+  byte: u8,
+  written: usize,
+}
+
+struct Core {
+  framing: Framing,
+  anomaly: Anomaly,
+  applied: AppliedPlan,
+  limits: Limits,
+  body: BodyDecoder,
+  stage0: Stage,
+  stage1: Stage,
+  stage2: Stage,
+  stage3: Stage,
+  edge0: Edge,
+  edge1: Edge,
+  edge2: Edge,
+  edge3: Edge,
+  phase: ReaderPhase,
+  bodyFinished: bool,
+  transportEnded: bool,
+  totalEncoded: u64,
+  totalIntermediate: u64,
+  totalDecoded: u64,
+  marker: u8,
+}
+
+/// Decodes a body from wire bytes that you give, without I/O.
+///
+/// # Details
+/// The decoder owns its state. Bytes that `step` does not use, such as the next HTTP message, stay
+/// with you. The decoder also removes the body framing, so give it the bytes after the head.
+///
+/// # Gotchas
+/// Decoded bytes are not final until the state is `End`. A later checksum, trailer, or framing
+/// error can still fail. A step can return no bytes, so call it again until the state is `End`. It
+/// does not check that the body belongs to the head. `silk.http.exchange` does.
+pub struct Decoder {
+  core: Core,
+}
+
+/// The result of a [`Decoder.step`].
+pub struct DecodeProgress {
+  /// The input bytes that the step used.
+  pub consumed: usize,
+  /// The decoded bytes and the totals.
+  pub progress: ContentProgress,
+  /// `true` when the decoder needs more input before it can continue.
+  pub needsInput: bool,
+}
+
+/// The error from a [`Decoder.step`].
+pub struct DecodeFailure {
+  /// The input bytes that the step used before the error.
+  pub consumed: usize,
+  /// The error.
+  pub error: ContentError<'static>,
+}
+
+impl Decoder {
+  /// Returns a decoder for `plan`, and allocates its memory.
+  pub effect fn make<'head, 'method, 'names>(plan: CodingPlan<'head, 'method, 'names>) -> Decoder
+  ! ContentError<'head> | OutOfMemoryError
+  ? &mut Allocator {
+    let core = run acquireCore(move plan)
+    return Decoder {core: move core}
+  }
+  /// Decodes from `input` into `output`, and returns how much it used and wrote.
+  ///
+  /// # Details
+  /// Set `endOfInput` to `true` when no bytes come after `input`. The decoded bytes are final only
+  /// after the state is `End`. A step can write no bytes, so call it again. An empty `output` does
+  /// nothing.
+  pub fn step(self: &mut Self, input: &[u8], output: &mut [u8], endOfInput: bool) -> Result<
+    DecodeProgress,
+    DecodeFailure,
+  > {
+    if self.core.phase == ReaderPhase.Failed || self.core.phase == ReaderPhase.Abandoned {
+      return Result<DecodeProgress, DecodeFailure>.failResult(DecodeFailure {
+        consumed: usize.ZERO, error: stateError(&self.core),
+      })
+    }
+    if output.length == usize.ZERO {
+      return Result<DecodeProgress, DecodeFailure>.succeed(DecodeProgress {
+        consumed: usize.ZERO, progress: contentProgress(&self.core, usize.ZERO), needsInput: false,
+      })
+    }
+    if endOfInput {
+      self.core.transportEnded = true
+    }
+    let advanced: Result<CoreProgress, CoreFailure<'static>> = advanceCore(
+      &mut self.core,
+      input,
+      move output,
+    )
+    return match move advanced {
+      Result<CoreProgress, CoreFailure<'static>>.Success {value} => Result<
+        DecodeProgress,
+        DecodeFailure,
+      >.succeed(
+        DecodeProgress {
+          consumed: value.consumed,
+          progress: contentProgress(&self.core, value.written),
+          needsInput: value.written == usize.ZERO && !value.terminal && !value.internalProgress,
+        },
+      )
+      Result<CoreProgress, CoreFailure<'static>>.Failure {error} => {
+        self.core.phase = ReaderPhase.Failed
+        return Result<DecodeProgress, DecodeFailure>.failResult(
+          DecodeFailure {consumed: error.consumed, error: move error.error},
+        )
+      }
+    }
+  }
+  /// Returns the totals so far.
+  pub fn progress(self: &Self) -> ContentProgress {
+    return contentProgress(&self.core, usize.ZERO)
+  }
+  /// Returns proof of completion, or `None` if the content is not complete.
+  pub fn completion<'owner>(self: &'owner Self) -> Result<
+    Option<ContentCompletion<'owner>>,
+    ContentError<'static>,
+  > {
+    return coreCompletion(&self.core)
+  }
+  /// Returns the trailers, after the content completes.
+  pub fn trailers<'owner>(self: &'owner Self) -> Result<
+    Option<Trailers<'owner>>,
+    ContentError<'static>,
+  > {
+    return coreTrailers(&self.core)
+  }
+  /// Stops the decoder. Later calls fail.
+  pub fn abandon(self: &mut Self) -> () {
+    abandonCore(&mut self.core)
+    return ()
+  }
+}
+
+/// Reads the content of a body in the callback of [`withReader`].
+pub struct ContentReader<'reader, 'transport, 'head, P> {
+  transport: &'reader mut BufferedDuplex<'transport, P>,
+  core: Core,
+  head: ResponseHead<'head>,
+}
+
+impl<'reader, 'transport, 'head, P> ContentReader<'reader, 'transport, 'head, P> {
+  /// Returns information about the response head and the plan.
+  pub fn representation<'owner>(
+    self: &'owner Self,
+  ) -> Result<RepresentationView<'owner, 'head>, ContentError<'head>> {
+    if self.core.phase == ReaderPhase.Failed || self.core.phase == ReaderPhase.Abandoned {
+      return Result<RepresentationView<'owner, 'head>, ContentError<'head>>.failResult(
+        stateError(&self.core),
+      )
+    }
+    let mut decodedLength = Option<u64>.none()
+    if self.core.phase == ReaderPhase.Complete || isEmpty(self.core.framing) {
+      decodedLength = Option<u64>.some(self.core.totalDecoded)
+    }
+    return Result<RepresentationView<'owner, 'head>, ContentError<'head>>.succeed(
+      RepresentationView<'owner, 'head> {
+        headValue: self.head,
+        appliedValue: self.core.applied,
+        anomalyValue: self.core.anomaly,
+        decodedAppliedValue: self.core.applied.decoderCount > usize.ZERO,
+        decodedLengthValue: move decodedLength,
+        marker: &self.core.marker,
+      },
+    )
+  }
+
+  /// Returns proof of completion, after the body and all decoders finish.
+  pub fn completion<'owner>(
+    self: &'owner Self,
+  ) -> Result<Option<ContentCompletion<'owner>>, ContentError<'head>> {
+    return coreCompletion(&self.core)
+  }
+
+  /// Returns the trailers, after the content completes.
+  pub fn trailers<'owner>(
+    self: &'owner Self,
+  ) -> Result<Option<Trailers<'owner>>, ContentError<'head>> {
+    return coreTrailers(&self.core)
+  }
+
+  /// Reads decoded bytes into `output`. The bytes are final only after the state is `End`.
+  /// `deadline` is on the `MonotonicClock`.
+  pub effect fn readSome(
+    self: &mut Self,
+    output: &mut [u8],
+    deadline: Option<Instant>,
+  ) -> ContentProgress
+  ! ContentError<'head>
+  ? &mut MonotonicClock
+  where &'transport mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock {
+    if self.core.phase == ReaderPhase.Failed || self.core.phase == ReaderPhase.Abandoned {
+      fail stateError(&self.core)
+    }
+    if output.length == usize.ZERO {
+      return contentProgress(&self.core, usize.ZERO)
+    }
+    while true {
+      let input = self.transport.peek()
+      let advanced = advanceCore(&mut self.core, input, &mut output)
+      drop input
+      let consumed = match move advanced {
+        Result<CoreProgress, CoreFailure<'head>>.Failure {error: failure} => {
+          let wireConsumed = failure.consumed
+          let original = move failure.error
+          if wireConsumed > usize.ZERO {
+            let committed = run Effect.result(BufferedDuplex.consume(
+              &mut self.transport.*,
+              wireConsumed,
+            ))
+            if let Result<(), BufferError>.Failure {error} = move committed {
+              self.core.phase = ReaderPhase.Failed
+              let written = original.written
+              drop original
+              fail contentFailure(&self.core, written, ContentReason<'head>.Buffer {error: move error})
+            }
+          }
+          self.core.phase = ReaderPhase.Failed
+          fail move original
+        }
+        Result<CoreProgress, CoreFailure<'head>>.Success {value} => move value
+      }
+      let wireConsumed = consumed.consumed
+      let written = consumed.written
+      let terminal = consumed.terminal
+      let internalProgress = consumed.internalProgress
+      if wireConsumed > usize.ZERO {
+        let attempted = run Effect.result(BufferedDuplex.consume(
+          &mut self.transport.*,
+          wireConsumed,
+        ))
+        if let Result<(), BufferError>.Failure {error} = move attempted {
+          self.core.phase = ReaderPhase.Failed
+          fail contentFailure(&self.core, written, ContentReason<'head>.Buffer {error: move error})
+        }
+      }
+      if written > usize.ZERO || terminal || internalProgress {
+        return contentProgress(&self.core, written)
+      }
+      let filled = run Effect.result(BufferedDuplex.fill(
+        &mut self.transport.*,
+        usize.ONE,
+        copyDeadline(&deadline),
+      ))
+      match move filled {
+        Result<FillOutcome, BufferError>.Failure {error} => {
+          self.core.phase = ReaderPhase.Failed
+          fail contentFailure(&self.core, usize.ZERO, ContentReason<'head>.Buffer {error: move error})
+        }
+        Result<FillOutcome, BufferError>.Success {value} => match move value {
+          FillOutcome.Available {count} => {}
+          FillOutcome.End {available} => { self.core.transportEnded = true }
+        }
+      }
+    }
+    return contentProgress(&self.core, usize.ZERO)
+  }
+
+  fn abandon(self: &mut Self) -> () {
+    abandonCore(&mut self.core)
+    return ()
+  }
+
+}
+
+fn coreCompletion<'owner, 'head>(core: &'owner Core) -> Result<
+  Option<ContentCompletion<'owner>>,
+  ContentError<'head>,
+> {
+  if core.phase == ReaderPhase.Failed || core.phase == ReaderPhase.Abandoned {
+    return Result<Option<ContentCompletion<'owner>>, ContentError<'head>>.failResult(
+      stateError(&core.*),
+    )
+  }
+  if core.phase != ReaderPhase.Complete {
+    return Result<Option<ContentCompletion<'owner>>, ContentError<'head>>.succeed(
+      Option<ContentCompletion<'owner>>.none(),
+    )
+  }
+  let body = core.body.completion()
+  let kind = match move body {
+    Option.None => {
+      return Result<Option<ContentCompletion<'owner>>, ContentError<'head>>.succeed(
+        Option<ContentCompletion<'owner>>.none(),
+      )
+    }
+    Option.Some {value} => value.kind()
+  }
+  return Result<Option<ContentCompletion<'owner>>, ContentError<'head>>.succeed(
+    Option<ContentCompletion<'owner>>.some(
+      ContentCompletion<'owner> {
+        kindValue: kind,
+        decodedValue: core.totalDecoded,
+        anomalyValue: core.anomaly,
+        reuseValue: completedReuse(core.framing, core.anomaly),
+        marker: &core.marker,
+      },
+    ),
+  )
+}
+
+fn coreTrailers<'owner, 'head>(core: &'owner Core) -> Result<
+  Option<Trailers<'owner>>,
+  ContentError<'head>,
+> {
+  if core.phase == ReaderPhase.Failed || core.phase == ReaderPhase.Abandoned {
+    return Result<Option<Trailers<'owner>>, ContentError<'head>>.failResult(stateError(&core.*))
+  }
+  if core.phase != ReaderPhase.Complete {
+    return Result<Option<Trailers<'owner>>, ContentError<'head>>.succeed(
+      Option<Trailers<'owner>>.none(),
+    )
+  }
+  return Result<Option<Trailers<'owner>>, ContentError<'head>>.succeed(core.body.trailers())
+}
+
+struct CoreProgress {
+  consumed: usize,
+  written: usize,
+  internalProgress: bool,
+  terminal: bool,
+}
+
+struct CoreFailure<'head> {
+  consumed: usize,
+  error: ContentError<'head>,
+}
+
+fn advanceCore<'head>(
+  core: &mut Core,
+  input: &[u8],
+  output: &mut [u8],
+) -> Result<CoreProgress, CoreFailure<'head>> {
+  if core.phase == ReaderPhase.Complete {
+    return coreSuccess(usize.ZERO, usize.ZERO, false, true)
+  }
+  if core.phase != ReaderPhase.Live {
+    return coreFailure(usize.ZERO, stateError(&core.*))
+  }
+
+  let stages = core.applied.decoderCount
+  if stages > 3 {
+    let remaining = remainingDecoded(&core.*)
+    let downstream = advanceFinalStage(&mut core.stage3, &mut core.edge3, &mut output, remaining)
+    if let Option<StageTransition>.Some {value} = move downstream {
+      return commitFinal(move core, 3, move value)
+    }
+  }
+  if stages > 2 {
+    if stages == 3 {
+      let remaining = remainingDecoded(&core.*)
+      let downstream = advanceFinalStage(&mut core.stage2, &mut core.edge2, &mut output, remaining)
+      if let Option<StageTransition>.Some {value} = move downstream {
+        return commitFinal(move core, 2, move value)
+      }
+    } else {
+      let remaining = remainingIntermediate(&core.*)
+      let intermediate = advanceIntermediateStage(
+        &mut core.stage2,
+        &mut core.edge2,
+        &mut core.edge3,
+        remaining,
+      )
+      if let Option<StageTransition>.Some {value} = move intermediate {
+        return commitIntermediate(move core, 2, move value)
+      }
+    }
+  }
+  if stages > usize.ONE {
+    if stages == 2 {
+      let remaining = remainingDecoded(&core.*)
+      let downstream = advanceFinalStage(&mut core.stage1, &mut core.edge1, &mut output, remaining)
+      if let Option<StageTransition>.Some {value} = move downstream {
+        return commitFinal(move core, usize.ONE, move value)
+      }
+    } else {
+      let remaining = remainingIntermediate(&core.*)
+      let intermediate = advanceIntermediateStage(
+        &mut core.stage1,
+        &mut core.edge1,
+        &mut core.edge2,
+        remaining,
+      )
+      if let Option<StageTransition>.Some {value} = move intermediate {
+        return commitIntermediate(move core, usize.ONE, move value)
+      }
+    }
+  }
+  if stages > usize.ZERO {
+    if stages == usize.ONE {
+      let remaining = remainingDecoded(&core.*)
+      let downstream = advanceFinalStage(&mut core.stage0, &mut core.edge0, &mut output, remaining)
+      if let Option<StageTransition>.Some {value} = move downstream {
+        return commitFinal(move core, usize.ZERO, move value)
+      }
+    } else {
+      let remaining = remainingIntermediate(&core.*)
+      let intermediate = advanceIntermediateStage(
+        &mut core.stage0,
+        &mut core.edge0,
+        &mut core.edge1,
+        remaining,
+      )
+      if let Option<StageTransition>.Some {value} = move intermediate {
+        return commitIntermediate(move core, usize.ZERO, move value)
+      }
+    }
+  }
+
+  if !core.bodyFinished {
+    if stages == usize.ZERO {
+      return advanceBodyDirect(move core, input, move output)
+    }
+    if core.edge0.length == usize.ZERO {
+      return advanceBodyStaged(move core, input)
+    }
+  }
+  return coreSuccess(usize.ZERO, usize.ZERO, false, false)
+}
+
+fn advanceFinalStage<'head>(
+  stage: &mut Stage,
+  source: &mut Edge,
+  output: &mut [u8],
+  remaining: u64,
+) -> Option<StageTransition> {
+  if stageFinished(&stage.*) {
+    if source.length > usize.ZERO {
+      return Option<StageTransition>.some(StageTransition.Failure {
+        consumed: usize.ZERO,
+        written: usize.ZERO,
+        cause: StageCause.Trailing,
+      })
+    }
+    if source.finalInput {
+      return Option<StageTransition>.some(StageTransition.Success {progress: StageProgress {
+        consumed: usize.ZERO,
+        written: usize.ZERO,
+        status: StageStatus.Finished,
+      }})
+    }
+    return Option<StageTransition>.none()
+  }
+  if source.length == usize.ZERO && !source.finalInput { return Option<StageTransition>.none() }
+  let input = Slice.view<u8>(Bytes.asSlice(&source.bytes), source.start, source.length)
+  let count = cappedLength(remaining, output.length)
+  if count == output.length {
+    let transition = stageTransition(&mut stage.*, input, move output, source.finalInput)
+    drop input
+    return Option<StageTransition>.some(move transition)
+  }
+  let buffered = bufferedStageTransition(&mut stage.*, input, source.finalInput, count > usize.ZERO)
+  drop input
+  if buffered.written > usize.ZERO { output[0] = buffered.byte }
+  return Option<StageTransition>.some(move buffered.transition)
+}
+
+fn advanceIntermediateStage(
+  stage: &mut Stage,
+  source: &mut Edge,
+  destination: &mut Edge,
+  remaining: u64,
+) -> Option<StageTransition> {
+  if stageFinished(&stage.*) {
+    if source.length > usize.ZERO {
+      return Option<StageTransition>.some(StageTransition.Failure {
+        consumed: usize.ZERO,
+        written: usize.ZERO,
+        cause: StageCause.Trailing,
+      })
+    }
+    if source.finalInput && !destination.finalInput {
+      destination.finalInput = true
+      return Option<StageTransition>.some(StageTransition.Success {progress: StageProgress {
+        consumed: usize.ZERO,
+        written: usize.ZERO,
+        status: StageStatus.Finished,
+      }})
+    }
+    return Option<StageTransition>.none()
+  }
+  if destination.length > usize.ZERO { return Option<StageTransition>.none() }
+  if source.length == usize.ZERO && !source.finalInput { return Option<StageTransition>.none() }
+  let input = Slice.view<u8>(Bytes.asSlice(&source.bytes), source.start, source.length)
+  let buffered = bufferedStageTransition(
+    &mut stage.*,
+    input,
+    source.finalInput,
+    remaining > u64.MIN,
+  )
+  drop input
+  if buffered.written > usize.ZERO {
+    let writable = Bytes.asMutSlice(&mut destination.bytes)
+    writable[0] = buffered.byte
+  }
+  return Option<StageTransition>.some(move buffered.transition)
+}
+
+fn bufferedStageTransition(
+  stage: &mut Stage,
+  input: &[u8],
+  finalInput: bool,
+  permitOutput: bool,
+) -> BufferedStageTransition {
+  if permitOutput {
+    let mut output: [u8; 1] = [0]
+    let transition = stageTransition(move stage, input, &mut output, finalInput)
+    return bufferStageResult(move transition, output[0])
+  }
+  let mut output: [u8; 0] = []
+  let transition = stageTransition(move stage, input, &mut output, finalInput)
+  return bufferStageResult(move transition, 0)
+}
+
+fn bufferStageResult(transition: StageTransition, byte: u8) -> BufferedStageTransition {
+  return match move transition {
+    StageTransition.Success {progress} => {
+      let written = progress.written
+      return BufferedStageTransition {
+        transition: StageTransition.Success {progress: move progress},
+        byte: byte,
+        written: written,
+      }
+    }
+    StageTransition.Failure {consumed, written, cause} => BufferedStageTransition {
+      transition: StageTransition.Failure {
+        consumed: consumed,
+        written: written,
+        cause: move cause,
+      },
+      byte: byte,
+      written: written,
+    }
+  }
+}
+
+fn stageTransition(
+  stage: &mut Stage,
+  input: &[u8],
+  output: &mut [u8],
+  finalInput: bool,
+) -> StageTransition {
+  let available = output.length
+  let attempted = stepStage(&mut stage.*, input, move output, finalInput)
+  return match move attempted {
+    Result<StageProgress, StageCause>.Success {value} => {
+      if value.status == StageStatus.Finished && value.consumed < input.length {
+        return StageTransition.Failure {
+          consumed: value.consumed,
+          written: value.written,
+          cause: StageCause.Trailing,
+        }
+      }
+      if value.status == StageStatus.NeedOutput && available == usize.ZERO {
+        return StageTransition.Failure {
+          consumed: value.consumed,
+          written: value.written,
+          cause: StageCause.Limit,
+        }
+      }
+      return StageTransition.Success {progress: move value}
+    }
+    Result<StageProgress, StageCause>.Failure {error} => {
+      return match move error {
+      StageCause.Inflate {error: cause} => StageTransition.Failure {
+        consumed: cause.consumed,
+        written: cause.written,
+        cause: StageCause.Inflate {error: move cause},
+      }
+      StageCause.Zstandard {error: cause} => StageTransition.Failure {
+        consumed: cause.consumed,
+        written: cause.written,
+        cause: StageCause.Zstandard {error: move cause},
+      }
+      StageCause.Limit => StageTransition.Failure {
+        consumed: usize.ZERO,
+        written: usize.ZERO,
+        cause: StageCause.Limit,
+      }
+      StageCause.Trailing => StageTransition.Failure {
+        consumed: usize.ZERO,
+        written: usize.ZERO,
+        cause: StageCause.Trailing,
+      }
+      StageCause.InvalidState => StageTransition.Failure {
+        consumed: usize.ZERO,
+        written: usize.ZERO,
+        cause: StageCause.InvalidState,
+      }
+      }
+    }
+  }
+}
+
+fn stepStage(
+  stage: &mut Stage,
+  input: &[u8],
+  output: &mut [u8],
+  finalInput: bool,
+) -> Result<StageProgress, StageCause> {
+  let stored = Intrinsic.replace(stage.*, Stage.Inactive)
+  match move stored {
+    Stage.Inactive => {
+      return Result<StageProgress, StageCause>.failResult(StageCause.InvalidState)
+    }
+    Stage.Zstandard {position, decoder, finished} => {
+      let mut owned = move decoder
+      let attempted = Zstd.step(&mut owned, input, &mut output, finalInput)
+      stage.* = Stage.Zstandard {
+        position: position,
+        decoder: move owned,
+        finished: finished,
+      }
+      match move attempted {
+        Result<ZstdProgress, ZstdError>.Failure {error} => {
+          return Result<StageProgress, StageCause>.failResult(StageCause.Zstandard {error: move error})
+        }
+        Result<ZstdProgress, ZstdError>.Success {value} => {
+          return Result<StageProgress, StageCause>.succeed(StageProgress {
+            consumed: value.consumed,
+            written: value.written,
+            status: zstdStatus(value.status),
+          })
+        }
+      }
+    }
+    Stage.Inflate {position, decoder, finished} => {
+      let mut owned = move decoder
+      let attempted = InflateDecoder.step(&mut owned, input, &mut output, finalInput)
+      stage.* = Stage.Inflate {
+        position: position,
+        decoder: move owned,
+        finished: finished,
+      }
+      match move attempted {
+        Result<InflateProgress, DecodeError>.Failure {error} => {
+          return Result<StageProgress, StageCause>.failResult(StageCause.Inflate {error: move error})
+        }
+        Result<InflateProgress, DecodeError>.Success {value} => {
+          return Result<StageProgress, StageCause>.succeed(StageProgress {
+            consumed: value.consumed,
+            written: value.written,
+            status: inflateStatus(value.status),
+          })
+        }
+      }
+    }
+  }
+  return Result<StageProgress, StageCause>.failResult(StageCause.InvalidState)
+}
+
+fn inflateStatus(value: InflateStatus) -> StageStatus {
+  return match move value {
+    InflateStatus.NeedInput => StageStatus.NeedInput
+    InflateStatus.NeedOutput => StageStatus.NeedOutput
+    InflateStatus.Finished => StageStatus.Finished
+  }
+}
+
+fn zstdStatus(value: ZstdStatus) -> StageStatus {
+  return match move value {
+    ZstdStatus.NeedInput => StageStatus.NeedInput
+    ZstdStatus.NeedOutput => StageStatus.NeedOutput
+    ZstdStatus.Finished => StageStatus.Finished
+  }
+}
+
+fn commitFinal<'head>(
+  core: &mut Core,
+  stageIndex: usize,
+  transition: StageTransition,
+) -> Result<CoreProgress, CoreFailure<'head>> {
+  let wireIndex = stageWireIndex(&core.*, stageIndex)
+  return match move transition {
+    StageTransition.Success {progress} => {
+      consumeStageInput(&mut core.*, stageIndex, progress.consumed)
+      core.totalDecoded = core.totalDecoded + usize.toU64(progress.written)
+      if progress.status == StageStatus.Finished {
+        finishStage(&mut core.*, stageIndex)
+        if stageInputFinal(&core.*, stageIndex) && stageInputLength(&core.*, stageIndex) == usize.ZERO {
+          core.phase = ReaderPhase.Complete
+        }
+      }
+      return coreSuccess(
+        usize.ZERO,
+        progress.written,
+        progress.consumed > usize.ZERO || progress.status == StageStatus.Finished,
+        core.phase == ReaderPhase.Complete,
+      )
+    }
+    StageTransition.Failure {consumed, written, cause} => {
+      consumeStageInput(&mut core.*, stageIndex, consumed)
+      core.totalDecoded = core.totalDecoded + usize.toU64(written)
+      let reason = stageFailureReason(
+        move cause,
+        stageIndex,
+        wireIndex,
+        ContentLimitKind.DecodedBytes,
+        core.limits.maxDecoded,
+      )
+      return coreFailure(
+        usize.ZERO,
+        contentFailure(&core.*, written, move reason),
+      )
+    }
+  }
+}
+
+fn commitIntermediate<'head>(
+  core: &mut Core,
+  stageIndex: usize,
+  transition: StageTransition,
+) -> Result<CoreProgress, CoreFailure<'head>> {
+  let wireIndex = stageWireIndex(&core.*, stageIndex)
+  return match move transition {
+    StageTransition.Success {progress} => {
+      consumeStageInput(&mut core.*, stageIndex, progress.consumed)
+      setStageOutput(&mut core.*, stageIndex, progress.written)
+      core.totalIntermediate = core.totalIntermediate + usize.toU64(progress.written)
+      if progress.status == StageStatus.Finished { finishStage(&mut core.*, stageIndex) }
+      return coreSuccess(
+        usize.ZERO,
+        usize.ZERO,
+        progress.consumed > usize.ZERO || progress.written > usize.ZERO || progress.status == StageStatus.Finished,
+        false,
+      )
+    }
+    StageTransition.Failure {consumed, written, cause} => {
+      consumeStageInput(&mut core.*, stageIndex, consumed)
+      setStageOutput(&mut core.*, stageIndex, written)
+      core.totalIntermediate = core.totalIntermediate + usize.toU64(written)
+      let reason = stageFailureReason(
+        move cause,
+        stageIndex,
+        wireIndex,
+        ContentLimitKind.IntermediateBytes,
+        core.limits.maxIntermediate,
+      )
+      return coreFailure(
+        usize.ZERO,
+        contentFailure(&core.*, usize.ZERO, move reason),
+      )
+    }
+  }
+}
+
+fn advanceBodyDirect<'head>(
+  core: &mut Core,
+  input: &[u8],
+  output: &mut [u8],
+) -> Result<CoreProgress, CoreFailure<'head>> {
+  let encodedRemaining = remainingEncoded(&core.*)
+  let decodedRemaining = remainingDecoded(&core.*)
+  let mut remaining = encodedRemaining
+  let mut limit = ContentLimitKind.EncodedBytes
+  if decodedRemaining < encodedRemaining {
+    remaining = decodedRemaining
+    limit = ContentLimitKind.DecodedBytes
+  }
+  let count = cappedLength(remaining, output.length)
+  if count == output.length {
+    let attempted = BodyDecoder.step(&mut core.body, input, move output, core.transportEnded)
+    return commitBodyDirect(move core, move attempted, count, limit)
+  }
+  let buffered = bufferedBodyStep(&mut core.body, input, core.transportEnded, count > usize.ZERO)
+  if buffered.written > usize.ZERO { output[0] = buffered.byte }
+  return commitBodyDirect(move core, move buffered.attempted, count, limit)
+}
+
+fn commitBodyDirect<'head>(
+  core: &mut Core,
+  attempted: Result<BodyProgress, BodyError>,
+  offered: usize,
+  exhausted: ContentLimitKind,
+) -> Result<CoreProgress, CoreFailure<'head>> {
+  return match move attempted {
+    Result<BodyProgress, BodyError>.Failure {error} => {
+      core.totalEncoded = core.totalEncoded + usize.toU64(error.written)
+      core.totalDecoded = core.totalDecoded + usize.toU64(error.written)
+      let consumed = error.consumed
+      return coreFailure(
+        consumed,
+        contentFailure(&core.*, error.written, ContentReason<'head>.Body {error: move error}),
+      )
+    }
+    Result<BodyProgress, BodyError>.Success {value} => {
+      core.totalEncoded = core.totalEncoded + usize.toU64(value.written)
+      core.totalDecoded = core.totalDecoded + usize.toU64(value.written)
+      if value.state == BodyProgressState.NeedOutput && offered == usize.ZERO {
+        let reason = contentLimitReason(&core.*, exhausted)
+        return coreFailure(
+          value.consumed,
+          contentFailure(&core.*, value.written, move reason),
+        )
+      }
+      if value.state == BodyProgressState.Complete {
+        core.bodyFinished = true
+        core.phase = ReaderPhase.Complete
+      }
+      return coreSuccess(
+        value.consumed,
+        value.written,
+        value.consumed > usize.ZERO || value.written > usize.ZERO || value.state == BodyProgressState.Complete,
+        core.phase == ReaderPhase.Complete,
+      )
+    }
+  }
+}
+
+fn bufferedBodyStep(
+  body: &mut BodyDecoder,
+  input: &[u8],
+  finalInput: bool,
+  permitOutput: bool,
+) -> BufferedBodyStep {
+  if permitOutput {
+    let mut output: [u8; 1] = [0]
+    let attempted = BodyDecoder.step(move body, input, &mut output, finalInput)
+    return bufferBodyResult(move attempted, output[0])
+  }
+  let mut output: [u8; 0] = []
+  let attempted = BodyDecoder.step(move body, input, &mut output, finalInput)
+  return bufferBodyResult(move attempted, 0)
+}
+
+fn bufferBodyResult(
+  attempted: Result<BodyProgress, BodyError>,
+  byte: u8,
+) -> BufferedBodyStep {
+  return match move attempted {
+    Result<BodyProgress, BodyError>.Success {value} => {
+      let written = value.written
+      return BufferedBodyStep {
+        attempted: Result<BodyProgress, BodyError>.succeed(move value),
+        byte: byte,
+        written: written,
+      }
+    }
+    Result<BodyProgress, BodyError>.Failure {error} => {
+      let written = error.written
+      return BufferedBodyStep {
+        attempted: Result<BodyProgress, BodyError>.failResult(move error),
+        byte: byte,
+        written: written,
+      }
+    }
+  }
+}
+
+fn advanceBodyStaged<'head>(
+  core: &mut Core,
+  input: &[u8],
+) -> Result<CoreProgress, CoreFailure<'head>> {
+  let remaining = remainingEncoded(&core.*)
+  let writable = Bytes.asMutSlice(&mut core.edge0.bytes)
+  let count = cappedLength(remaining, writable.length)
+  drop writable
+  let buffered = bufferedBodyStep(&mut core.body, input, core.transportEnded, count > usize.ZERO)
+  if buffered.written > usize.ZERO {
+    let target = Bytes.asMutSlice(&mut core.edge0.bytes)
+    target[0] = buffered.byte
+  }
+  return match move buffered.attempted {
+    Result<BodyProgress, BodyError>.Failure {error} => {
+      core.edge0.start = usize.ZERO
+      core.edge0.length = error.written
+      core.totalEncoded = core.totalEncoded + usize.toU64(error.written)
+      let consumed = error.consumed
+      return coreFailure(
+        consumed,
+        contentFailure(&core.*, usize.ZERO, ContentReason<'head>.Body {error: move error}),
+      )
+    }
+    Result<BodyProgress, BodyError>.Success {value} => {
+      core.edge0.start = usize.ZERO
+      core.edge0.length = value.written
+      core.totalEncoded = core.totalEncoded + usize.toU64(value.written)
+      if value.state == BodyProgressState.NeedOutput && count == usize.ZERO {
+        let reason = contentLimitReason(&core.*, ContentLimitKind.EncodedBytes)
+        return coreFailure(
+          value.consumed,
+          contentFailure(&core.*, usize.ZERO, move reason),
+        )
+      }
+      if value.state == BodyProgressState.Complete {
+        core.bodyFinished = true
+        core.edge0.finalInput = true
+      }
+      return coreSuccess(
+        value.consumed,
+        usize.ZERO,
+        value.consumed > usize.ZERO || value.written > usize.ZERO || value.state == BodyProgressState.Complete,
+        false,
+      )
+    }
+  }
+}
+
+fn coreSuccess<'head>(
+  consumed: usize,
+  written: usize,
+  internalProgress: bool,
+  terminal: bool,
+) -> Result<CoreProgress, CoreFailure<'head>> {
+  return Result<CoreProgress, CoreFailure<'head>>.succeed(CoreProgress {
+    consumed: consumed,
+    written: written,
+    internalProgress: internalProgress,
+    terminal: terminal,
+  })
+}
+
+fn coreFailure<'head>(
+  consumed: usize,
+  error: ContentError<'head>,
+) -> Result<CoreProgress, CoreFailure<'head>> {
+  return Result<CoreProgress, CoreFailure<'head>>.failResult(CoreFailure<'head> {
+    consumed: consumed,
+    error: move error,
+  })
+}
+
+fn cappedLength(remaining: u64, available: usize) -> usize {
+  if remaining < usize.toU64(available) { return u64.toUsize(remaining) }
+  return available
+}
+
+fn remainingEncoded(core: &Core) -> u64 {
+  return core.limits.maxEncoded - core.totalEncoded
+}
+
+fn remainingIntermediate(core: &Core) -> u64 {
+  return core.limits.maxIntermediate - core.totalIntermediate
+}
+
+fn remainingDecoded(core: &Core) -> u64 {
+  return core.limits.maxDecoded - core.totalDecoded
+}
+
+fn contentLimitReason<'head>(
+  core: &Core,
+  kind: ContentLimitKind,
+) -> ContentReason<'head> {
+  let allowed = contentLimitAllowed(&core.*, kind)
+  let attempted = match move u64.checkedAdd(allowed, 1) {
+    Option<u64>.Some {value} => value
+    Option<u64>.None => allowed
+  }
+  return ContentReason<'head>.InvalidLimit {limit: kind, allowed: allowed, attempted: attempted}
+}
+
+fn contentLimitAllowed(core: &Core, kind: ContentLimitKind) -> u64 {
+  return match move kind {
+    ContentLimitKind.EncodedBytes => core.limits.maxEncoded
+    ContentLimitKind.IntermediateBytes => core.limits.maxIntermediate
+    ContentLimitKind.DecodedBytes => core.limits.maxDecoded
+    _ => u64.MIN
+  }
+}
+
+fn stageFailureReason<'head>(
+  cause: StageCause,
+  stage: usize,
+  wireIndex: usize,
+  limit: ContentLimitKind,
+  allowed: u64,
+) -> ContentReason<'head> {
+  return match move cause {
+    StageCause.Inflate {error} => ContentReason<'head>.Inflate {
+      stage: stage,
+      wireIndex: wireIndex,
+      error: move error,
+    }
+    StageCause.Zstandard {error} => ContentReason<'head>.Zstandard {
+      stage: stage,
+      wireIndex: wireIndex,
+      error: move error,
+    }
+    StageCause.Trailing => ContentReason<'head>.TrailingEncodedData {
+      stage: stage,
+      wireIndex: wireIndex,
+    }
+    StageCause.Limit => {
+      let attempted = match move u64.checkedAdd(allowed, 1) {
+        Option<u64>.Some {value} => value
+        Option<u64>.None => allowed
+      }
+      return ContentReason<'head>.InvalidLimit {
+        limit: limit,
+        allowed: allowed,
+        attempted: attempted,
+      }
+    }
+    StageCause.InvalidState => ContentReason<'head>.InvalidState
+  }
+}
+
+fn consumeStageInput(core: &mut Core, stage: usize, count: usize) -> () {
+  if stage == usize.ZERO { consumeEdge(&mut core.edge0, count) return () }
+  if stage == usize.ONE { consumeEdge(&mut core.edge1, count) return () }
+  if stage == 2 { consumeEdge(&mut core.edge2, count) return () }
+  consumeEdge(&mut core.edge3, count)
+  return ()
+}
+
+fn consumeEdge(edge: &mut Edge, count: usize) -> () {
+  edge.start = edge.start + count
+  edge.length = edge.length - count
+  if edge.length == usize.ZERO { edge.start = usize.ZERO }
+  return ()
+}
+
+fn setStageOutput(core: &mut Core, stage: usize, count: usize) -> () {
+  if stage == usize.ZERO {
+    core.edge1.start = usize.ZERO
+    core.edge1.length = count
+    return ()
+  }
+  if stage == usize.ONE {
+    core.edge2.start = usize.ZERO
+    core.edge2.length = count
+    return ()
+  }
+  core.edge3.start = usize.ZERO
+  core.edge3.length = count
+  return ()
+}
+
+fn finishStage(core: &mut Core, stage: usize) -> () {
+  if stage == usize.ZERO { markStageFinished(&mut core.stage0) return () }
+  if stage == usize.ONE { markStageFinished(&mut core.stage1) return () }
+  if stage == 2 { markStageFinished(&mut core.stage2) return () }
+  markStageFinished(&mut core.stage3)
+  return ()
+}
+
+fn stageWireIndex(core: &Core, stage: usize) -> usize {
+  if stage == usize.ZERO { return stagePosition(&core.stage0).wireIndex }
+  if stage == usize.ONE { return stagePosition(&core.stage1).wireIndex }
+  if stage == 2 { return stagePosition(&core.stage2).wireIndex }
+  return stagePosition(&core.stage3).wireIndex
+}
+
+fn stageFinished(stage: &Stage) -> bool {
+  return match &stage.* {
+    Stage.Inactive => false
+    Stage.Inflate {position, decoder, finished} => finished
+    Stage.Zstandard {position, decoder, finished} => finished
+  }
+}
+
+fn markStageFinished(stage: &mut Stage) -> () {
+  let stored = Intrinsic.replace(stage.*, Stage.Inactive)
+  stage.* = match move stored {
+    Stage.Inactive => Stage.Inactive
+    Stage.Inflate {position, decoder, finished} => Stage.Inflate {
+      position: position,
+      decoder: move decoder,
+      finished: true,
+    }
+    Stage.Zstandard {position, decoder, finished} => Stage.Zstandard {
+      position: position,
+      decoder: move decoder,
+      finished: true,
+    }
+  }
+  return ()
+}
+
+fn stagePosition(stage: &Stage) -> CodingPosition {
+  return match &stage.* {
+    Stage.Inactive => CodingPosition {
+      wireIndex: usize.ZERO,
+      fieldIndex: usize.ZERO,
+      elementIndex: usize.ZERO,
+      offset: usize.ZERO,
+    }
+    Stage.Inflate {position, decoder, finished} => position
+    Stage.Zstandard {position, decoder, finished} => position
+  }
+}
+
+fn stageInputLength(core: &Core, stage: usize) -> usize {
+  if stage == usize.ZERO { return core.edge0.length }
+  if stage == usize.ONE { return core.edge1.length }
+  if stage == 2 { return core.edge2.length }
+  return core.edge3.length
+}
+
+fn stageInputFinal(core: &Core, stage: usize) -> bool {
+  if stage == usize.ZERO { return core.edge0.finalInput }
+  if stage == usize.ONE { return core.edge1.finalInput }
+  if stage == 2 { return core.edge2.finalInput }
+  return core.edge3.finalInput
+}
+
+/// Gives a [`ContentReader`] for the body in `body` to `callback`, with the decoders of `plan`.
+///
+/// # Gotchas
+///
+/// Decoded bytes are not final until the body ends. A later checksum, trailer, or framing error can
+/// still fail.
+pub effect fn withReader<
+  'reader,
+  'transport: 'reader,
+  'head: 'reader,
+  'method: 'reader,
+  'names: 'reader,
+  'callback,
+  A,
+  E,
+  ?CallbackRequirements,
+  P,
+>(
+  plan: CodingPlan<'head, 'method, 'names>,
+  body: &'reader mut BufferedDuplex<'transport, P>,
+  callback: for<
+    'call,
+    'readerView: 'call,
+    'transportView: 'readerView,
+    'headView: 'readerView,
+  > once fn<'callback>(
+    &'call mut ContentReader<'readerView, 'transportView, 'headView, P>,
+  ) -> once Effect<'call; A ! E ? CallbackRequirements>,
+) -> A
+! E | ContentError<'head> | OutOfMemoryError
+? CallbackRequirements | &mut Allocator
+where &'transport mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock {
+  let head = plan.headValue
+  let core = run acquireCore(move plan)
+  let reader = ContentReader<'reader, 'transport, 'head, P> {transport: move body, core: move core, head: head}
+  let use = effect fn(owned: &mut ContentReader<'reader, 'transport, 'head, P>) -> A
+  ! E
+  ? CallbackRequirements {
+    return run callback(move owned)
+  }
+  let release = effect fn(owned: &mut ContentReader<'reader, 'transport, 'head, P>) -> () {
+    ContentReader.abandon(move owned)
+    return ()
+  }
+  return run Effect.useReleaseNonParking(move reader, move use, move release)
+}
+
+effect fn acquireCore<'head, 'method, 'names>(
+  plan: CodingPlan<'head, 'method, 'names>,
+) -> Core
+! ContentError<'head> | OutOfMemoryError
+? &mut Allocator {
+  let framing = plan.framingValue
+  let anomaly = plan.anomalyValue
+  let applied = plan.applied()
+  let bodyLimits = plan.bodyLimits
+  let policy = plan.trailerPolicy
+  let selection = move plan.selection
+  let coding0 = plan.coding0
+  let coding1 = plan.coding1
+  let coding2 = plan.coding2
+  let coding3 = plan.coding3
+  let decoderCount = plan.decoderCount
+  let capacity = plan.limits.intermediateCapacity
+  // Reject body configuration before allocating any content codec or edge.
+  let bodyAttempt = run Effect.result(BodyDecoder.make(move selection, bodyLimits, policy))
+  let bodyDecoder = match move bodyAttempt {
+    Result<Result<BodyDecoder, BodyError>, OutOfMemoryError>.Failure {error} => { fail move error }
+    Result<Result<BodyDecoder, BodyError>, OutOfMemoryError>.Success {value: created} => match move created {
+      Result<BodyDecoder, BodyError>.Failure {error} => {
+        fail contentError<'head>(ContentReason<'head>.Body {error: move error})
+      }
+      Result<BodyDecoder, BodyError>.Success {value: decoder} => move decoder
+    }
+  }
+  let mut stage0 = emptyStage()
+  let mut stage1 = emptyStage()
+  let mut stage2 = emptyStage()
+  let mut stage3 = emptyStage()
+  if decoderCount > usize.ZERO {
+    stage0 = run acquireStage(reverseStage(coding0, coding1, coding2, coding3, usize.ZERO), usize.ZERO, &plan.limits)
+  }
+  if decoderCount > usize.ONE {
+    stage1 = run acquireStage(reverseStage(coding0, coding1, coding2, coding3, usize.ONE), usize.ONE, &plan.limits)
+  }
+  if decoderCount > 2 {
+    stage2 = run acquireStage(reverseStage(coding0, coding1, coding2, coding3, 2), 2, &plan.limits)
+  }
+  if decoderCount > 3 {
+    stage3 = run acquireStage(reverseStage(coding0, coding1, coding2, coding3, 3), 3, &plan.limits)
+  }
+  let edge0 = run acquireEdge(decoderCount > usize.ZERO, capacity)
+  let edge1 = run acquireEdge(decoderCount > usize.ONE, capacity)
+  let edge2 = run acquireEdge(decoderCount > 2, capacity)
+  let edge3 = run acquireEdge(decoderCount > 3, capacity)
+  let complete = isEmpty(framing)
+  let mut phase = ReaderPhase.Live
+  if complete { phase = ReaderPhase.Complete }
+  let limits = move plan.limits
+  return Core {
+      framing: framing,
+      anomaly: anomaly,
+      applied: applied,
+      limits: move limits,
+      body: move bodyDecoder,
+      stage0: move stage0,
+      stage1: move stage1,
+      stage2: move stage2,
+      stage3: move stage3,
+      edge0: move edge0,
+      edge1: move edge1,
+      edge2: move edge2,
+      edge3: move edge3,
+      phase: phase,
+      bodyFinished: complete,
+      transportEnded: false,
+      totalEncoded: u64.MIN,
+      totalIntermediate: u64.MIN,
+      totalDecoded: u64.MIN,
+      marker: 0,
+  }
+}
+
+fn abandonCore(core: &mut Core) -> () {
+  if core.phase == ReaderPhase.Live {
+    core.body.abandon()
+    core.phase = ReaderPhase.Abandoned
+  }
+  return ()
+}
+
+effect fn acquireEdge(active: bool, capacity: usize) -> Edge
+! OutOfMemoryError
+? &mut Allocator {
+  let mut bytes = Bytes.make()
+  if active { bytes = run Bytes.zeroed(capacity) }
+  return Edge {bytes: move bytes, start: usize.ZERO, length: usize.ZERO, finalInput: false}
+}
+
+effect fn acquireStage<'head>(
+  slot: CodingSlot<'head>,
+  stage: usize,
+  limits: &Limits,
+) -> Stage
+! ContentError<'head> | OutOfMemoryError
+? &mut Allocator {
+  if slot.coding == Coding.Zstd {
+    let attempted = run Effect.result(Zstd.make(copyZstdLimits(&limits.zstd)))
+    return match move attempted {
+      Result<Zstd, ZstdError | OutOfMemoryError>.Success {value} => Stage.Zstandard {
+        position: slot.position,
+        decoder: move value,
+        finished: false,
+      }
+      Result<Zstd, ZstdError | OutOfMemoryError>.Failure {error} => match move error {
+        ZstdError cause => {
+          fail contentError<'head>(ContentReason<'head>.Zstandard {
+            stage: stage,
+            wireIndex: slot.position.wireIndex,
+            error: move cause,
+          })
+        }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+  }
+  let mut format = InflateFormat.Gzip
+  if slot.coding == Coding.Deflate { format = InflateFormat.Zlib }
+  let attempted = run Effect.result(InflateDecoder.make(format, copyInflateLimits(&limits.inflate)))
+  return match move attempted {
+    Result<InflateDecoder, DecodeError | OutOfMemoryError>.Success {value} => Stage.Inflate {
+      position: slot.position,
+      decoder: move value,
+      finished: false,
+    }
+    Result<InflateDecoder, DecodeError | OutOfMemoryError>.Failure {error} => match move error {
+      DecodeError cause => {
+        fail contentError<'head>(ContentReason<'head>.Inflate {
+          stage: stage,
+          wireIndex: slot.position.wireIndex,
+          error: move cause,
+        })
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+fn emptyStage() -> Stage {
+  return Stage.Inactive
+}
+
+fn reverseStage<'head>(
+  slot0: CodingSlot<'head>,
+  slot1: CodingSlot<'head>,
+  slot2: CodingSlot<'head>,
+  slot3: CodingSlot<'head>,
+  wanted: usize,
+) -> CodingSlot<'head> {
+  let mut index = MAX_CODINGS
+  let mut found = usize.ZERO
+  while index > usize.ZERO {
+    index = index - usize.ONE
+    let slot = codingAt(&slot0, &slot1, &slot2, &slot3, index)
+    if slot.present && slot.coding != Coding.Identity {
+      if found == wanted { return slot }
+      found = found + usize.ONE
+    }
+  }
+  return emptyCodingSlot<'head>()
+}
+
+fn copyInflateLimits(value: &InflateLimits) -> InflateLimits {
+  return InflateLimits {
+    maxInputBytes: value.maxInputBytes,
+    maxOutputBytes: value.maxOutputBytes,
+    maxMembers: value.maxMembers,
+    maxHeaderBytes: value.maxHeaderBytes,
+    maxMemoryBytes: value.maxMemoryBytes,
+  }
+}
+
+fn copyZstdLimits(value: &ZstdLimits) -> ZstdLimits {
+  return ZstdLimits {
+    inputBytes: value.inputBytes,
+    outputBytes: value.outputBytes,
+    frames: value.frames,
+    skippableBytes: value.skippableBytes,
+    windowBytes: value.windowBytes,
+    workspaceBytes: value.workspaceBytes,
+  }
+}
+
+fn completedReuse(framing: Framing, anomaly: Anomaly) -> ReuseDisposition {
+  if anomaly != Anomaly.None || isCloseDelimited(framing) {
+    return ReuseDisposition.NonReusable
+  }
+  return ReuseDisposition.Reusable
+}
+
+fn contentProgress(core: &Core, written: usize) -> ContentProgress {
+  let mut state = ContentProgressState.Data
+  if core.phase == ReaderPhase.Complete { state = ContentProgressState.End }
+  return ContentProgress {
+    written: written,
+    totalEncoded: core.totalEncoded,
+    totalIntermediate: core.totalIntermediate,
+    totalDecoded: core.totalDecoded,
+    state: state,
+  }
+}
+
+fn stateError<'head>(core: &Core) -> ContentError<'head> {
+  return contentFailure(move core, usize.ZERO, ContentReason<'head>.InvalidState)
+}
+
+fn contentError<'head>(reason: ContentReason<'head>) -> ContentError<'head> {
+  return ContentError<'head> {
+    reason: move reason,
+    written: usize.ZERO,
+    totalEncoded: u64.MIN,
+    totalIntermediate: u64.MIN,
+    totalDecoded: u64.MIN,
+  }
+}
+
+fn contentFailure<'head>(
+  core: &Core,
+  written: usize,
+  reason: ContentReason<'head>,
+) -> ContentError<'head> {
+  return ContentError<'head> {
+    reason: move reason,
+    written: written,
+    totalEncoded: core.totalEncoded,
+    totalIntermediate: core.totalIntermediate,
+    totalDecoded: core.totalDecoded,
+  }
+}
+
+fn copyDeadline(value: &Option<Instant>) -> Option<Instant> {
+  return match &value.* {
+    Option<Instant>.None => Option<Instant>.none()
+    Option<Instant>.Some {value: present} => Option<Instant>.some(
+      SystemClock.make(SystemClock.seconds(&present), SystemClock.nanoseconds(&present)),
+    )
+  }
+}

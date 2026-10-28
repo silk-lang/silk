@@ -5,7 +5,7 @@ description: Bounded HTTP response delivery, source-specific request bodies, own
 
 # One-shot HTTP fetch
 
-`silk.http_fetch` composes one semantic HTTP request into a completed one-shot result. It uses the
+`silk.http.fetch` composes one semantic HTTP request into a completed one-shot result. It uses the
 streaming client, redirect, content-decoding, proxy-routing, and connection-pool actors without
 hiding request-body authority, response completion, storage limits, or transport ownership.
 
@@ -97,7 +97,7 @@ representation.
 Reaching the discard cap before completion is an error and makes the connection ineligible for
 reuse. Discard is not redirect intermediate draining: it cannot convert truncation into success,
 does not stop at the response head, and performs no implicit cleanup read. Head-only handling
-belongs to `silk.http_exchange`.
+belongs to `silk.http.exchange`.
 
 ## Options and defaults
 
@@ -190,7 +190,7 @@ content metadata and permits unsupported content-coding names as metadata. It do
 sniff the body.
 
 Decode mode uses the coding set, ordering, windows, checksums, completion rules, and limits from
-`silk.http_content`. Unsupported coding is an error. Fetch generates Accept-Encoding only
+`silk.http.content`. Unsupported coding is an error. Fetch generates Accept-Encoding only
 for configured supported codings, only in Decode mode, and only when caller headers contain no
 Accept-Encoding field.
 
@@ -201,7 +201,7 @@ does not retry with another decoder or combine coded and decoded accounting.
 
 Manual mode returns the first completed response. Follow mode delegates method, body replay,
 Location, origin, downgrade, header sanitization, loop, history, intermediate response, and hop
-limits to [`silk.http_redirect`](http-redirects.md).
+limits to [`silk.http.redirect`](http-redirects.md).
 
 For every current redirect origin, InheritContext recomputes routing from the immutable client
 context. Direct bypasses that configured routing without consulting the environment. Direct and
@@ -281,7 +281,7 @@ state machines can publish a successfully completed owner as idle.
 
 ## Native HTTP and HTTPS
 
-Native composition uses `silk.http_fetch_native.Context<'configuration>`. `Context.make(route,
+Native composition uses `silk.http.fetch_native.Context<'configuration>`. `Context.make(route,
 options, limits)` owns one fresh native acquisition context without a pool.
 `Context.makeWithPool(route, options, limits, pool)` additionally copies one compatible direct-pool
 handle before publishing the context; trust or allocation failure leaves the source handle valid.
@@ -304,16 +304,16 @@ For plaintext HTTP, this example chooses fresh native acquisition, direct routin
 redirects, Raw content, a finite absolute deadline, and a 1 MiB collection cap:
 
 ```silk,ignore
-import silk.effect {Effect}
-import silk.http_exchange as Client
-import silk.http_exchange_native as Native
-import silk.http_content as Content
-import silk.http_fetch {Fetch, FetchOptions, FetchRequest, PoolMode, ProxyMode}
-import silk.http_fetch as HttpFetch
-import silk.http_fetch_native as FetchNative
-import silk.http_redirect as Redirect
+import silk.core.effect {Effect}
+import silk.http.exchange as Client
+import silk.http.exchange_native as Native
+import silk.http.content as Content
+import silk.http.fetch {Fetch, FetchOptions, FetchRequest, PoolMode, ProxyMode}
+import silk.http.fetch as HttpFetch
+import silk.http.fetch_native as FetchNative
+import silk.http.redirect as Redirect
 import silk.option {Option}
-import silk.trust_source {TrustSource}
+import silk.tls.trust_source {TrustSource}
 
 let mut nativeOptions = Native.Options.defaults()
 nativeOptions.trust = trustLimits
@@ -401,10 +401,10 @@ coalescing, HTTP/3, another parser or decoder, another socket or TLS implementat
 on an affine Stream abstraction.
 
 The target-neutral implementation lives in
-[`http_fetch.silk`](../stdlib/silk/http_fetch.silk), with supported native
+[`http_fetch.silk`](../stdlib/silk/http/fetch.silk), with supported native
 composition in
-[`http_fetch_native.silk`](../stdlib/silk/http_fetch_native.silk).
-The lower-level contracts are documented in [`silk.http_exchange`](http-exchange.md),
-[`silk.http_redirect`](http-redirects.md), [`silk.http_proxy`](http-proxy-routing.md), and
-[`silk.http_connection_pool`](http-connection-pooling.md). The normative delivery contract is the
+[`http_fetch_native.silk`](../stdlib/silk/http/fetch_native.silk).
+The lower-level contracts are documented in [`silk.http.exchange`](http-exchange.md),
+[`silk.http.redirect`](http-redirects.md), [`silk.http.proxy`](http-proxy-routing.md), and
+[`silk.http.connection_pool`](http-connection-pooling.md). The normative delivery contract is the
 `one-shot-http-fetch` OpenSpec.

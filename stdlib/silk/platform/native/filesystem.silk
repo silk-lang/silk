@@ -1,0 +1,1158 @@
+//! The system calls for files and directories, for the native `FileSystem` provider.
+//!
+//! # When to use
+//! `silk.system.filesystem_native` uses [`NativeFileSystem`]. Application code uses the `FileSystem` effect
+//! from `silk.system.filesystem` instead.
+//!
+//! # Details
+//! Each operation starts at the root directory and opens each part of the path relative to its
+//! parent. A symbolic link below the root resolves inside the root: an absolute target starts
+//! again at the root, and `..` never goes above it. So a path cannot leave the root. At most 40
+//! links resolve in one path. Removing a file and replacing a file act on a final link itself,
+//! not its target, and a listing reports a link as a link.
+//!
+//! [`FileHandle`] and [`DirectoryHandle`] each own one open descriptor. Close them with
+//! [`NativeFileSystem.closeFile`] or [`NativeFileSystem.closeDirectory`] to get a close error. A
+//! drop also closes them, and keeps an earlier error.
+//!
+//! An atomic write makes a new file in the same directory with a unique name, then makes it visible
+//! at the path. A replace uses `renameat`, which replaces a final symbolic link itself, not its
+//! target. A create uses `linkat`, which fails if any entry exists. New files get mode 0666,
+//! filtered by the umask. A replace keeps no permissions, owner, extended attributes, or hard links
+//! of the old file. A synchronized write calls `fsync` on the new file before it is visible, and on
+//! the directory after. This is not `F_FULLFSYNC`, and it does not promise that data survives a
+//! power loss.
+//!
+//! # Errors
+//! Each operation fails with `FileError`, with a portable reason and the native error code.
+//! `writeFileAtomic` fails with `AtomicWriteError`.
+//!
+//! # Gotchas
+//! - A call that a signal interrupts is made again, except `close`, which is never repeated.
+//! - Other processes must not change the temporary files of an atomic write.
+//! - The functions exist only on Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+//!
+//! @category Native platform
+
+static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArchitecture() == "aarch64" && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+import silk.core.ownership { Drop }
+import silk.mem.pointer { Pointer }
+import silk.collections.bytes { Bytes }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.option { Option }
+import silk.collections.slice { Slice }
+import silk.system.filesystem { FileSystem, FileError, FileOperation, FileReason, AtomicWriteError }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.i64
+import silk.num.isize
+import silk.num.usize
+
+extern "C" struct Timespec {
+ seconds: i64,
+ nanoseconds: i64,
+}
+extern "C" struct DirectoryStream {}
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+extern "C" struct Stat {
+  dev: i32,
+  mode: u16,
+  nlink: u16,
+  ino: u64,
+  uid: u32,
+  gid: u32,
+  rdev: i32,
+  atime: Timespec,
+  mtime: Timespec,
+  ctime: Timespec,
+  birthtime: Timespec,
+  size: i64,
+  blocks: i64,
+  blksize: i32,
+  flags: u32,
+  gen: u32,
+  lspare: i32,
+  qspare: [i64; 2],
+}
+fn emptyStat() -> Stat { return Stat { dev: 0, mode: 0, nlink: 0, ino: 0, uid: 0, gid: 0, rdev: 0, atime: Timespec { seconds: 0, nanoseconds: 0 }, mtime: Timespec { seconds: 0, nanoseconds: 0 }, ctime: Timespec { seconds: 0, nanoseconds: 0 }, birthtime: Timespec { seconds: 0, nanoseconds: 0 }, size: 0, blocks: 0, blksize: 0, flags: 0, gen: 0, lspare: 0, qspare: [0, 0] } }
+fn statMode(value: &Stat) -> u32 { return u16.toU32(value.mode) }
+const CREATE: i32 = 512
+const EXCLUSIVE: i32 = 2048
+const NONBLOCK: i32 = 4
+const DIRECTORY: i32 = 1048576
+const SEARCH: i32 = 1073741824
+const NOFOLLOW: i32 = 256
+const CLOEXEC: i32 = 16777216
+const NOFOLLOW_STAT: i32 = 32
+const REMOVE_DIRECTORY: i32 = 128
+const NOT_EMPTY: i32 = 66
+const OVERFLOW: i32 = 84
+const NAME_TOO_LONG: i32 = 63
+const LOOP: i32 = 62
+const NAME_OFFSET: usize = 21
+unsafe extern "C" fn mkdirat(fd: i32, path: ?[*]const u8, mode: u16) -> i32 with Intrinsic.foreign(noCapture: ("path",))
+fn fileMode() -> u16 { return 438 }
+fn directoryMode() -> u16 { return 448 }
+} else static if Intrinsic.targetArchitecture() == "x86_64" {
+extern "C" struct Stat {
+  dev: u64,
+  ino: u64,
+  nlink: u64,
+  mode: u32,
+  uid: u32,
+  gid: u32,
+  pad0: i32,
+  rdev: u64,
+  size: i64,
+  blksize: i64,
+  blocks: i64,
+  atime: Timespec,
+  mtime: Timespec,
+  ctime: Timespec,
+  reserved: [i64; 3],
+}
+fn emptyStat() -> Stat { return Stat { dev: 0, ino: 0, nlink: 0, mode: 0, uid: 0, gid: 0, pad0: 0, rdev: 0, size: 0, blksize: 0, blocks: 0, atime: Timespec { seconds: 0, nanoseconds: 0 }, mtime: Timespec { seconds: 0, nanoseconds: 0 }, ctime: Timespec { seconds: 0, nanoseconds: 0 }, reserved: [0, 0, 0] } }
+fn statMode(value: &Stat) -> u32 { return value.mode }
+const CREATE: i32 = 64
+const EXCLUSIVE: i32 = 128
+const NONBLOCK: i32 = 2048
+const DIRECTORY: i32 = 65536
+const SEARCH: i32 = 2097152
+const NOFOLLOW: i32 = 131072
+const CLOEXEC: i32 = 524288
+const NOFOLLOW_STAT: i32 = 256
+const REMOVE_DIRECTORY: i32 = 512
+const NOT_EMPTY: i32 = 39
+const OVERFLOW: i32 = 75
+const NAME_TOO_LONG: i32 = 36
+const LOOP: i32 = 40
+const NAME_OFFSET: usize = 19
+unsafe extern "C" fn mkdirat(fd: i32, path: ?[*]const u8, mode: u32) -> i32 with Intrinsic.foreign(noCapture: ("path",))
+fn fileMode() -> u32 { return 438 }
+fn directoryMode() -> u32 { return 448 }
+} else {
+extern "C" struct Stat {
+  dev: u64,
+  ino: u64,
+  mode: u32,
+  nlink: u32,
+  uid: u32,
+  gid: u32,
+  rdev: u64,
+  pad1: u64,
+  size: i64,
+  blksize: i32,
+  pad2: i32,
+  blocks: i64,
+  atime: Timespec,
+  mtime: Timespec,
+  ctime: Timespec,
+  reserved: [i32; 2],
+}
+fn emptyStat() -> Stat { return Stat { dev: 0, ino: 0, mode: 0, nlink: 0, uid: 0, gid: 0, rdev: 0, pad1: 0, size: 0, blksize: 0, pad2: 0, blocks: 0, atime: Timespec { seconds: 0, nanoseconds: 0 }, mtime: Timespec { seconds: 0, nanoseconds: 0 }, ctime: Timespec { seconds: 0, nanoseconds: 0 }, reserved: [0, 0] } }
+fn statMode(value: &Stat) -> u32 { return value.mode }
+const CREATE: i32 = 64
+const EXCLUSIVE: i32 = 128
+const NONBLOCK: i32 = 2048
+const DIRECTORY: i32 = 16384
+const SEARCH: i32 = 2097152
+const NOFOLLOW: i32 = 32768
+const CLOEXEC: i32 = 524288
+const NOFOLLOW_STAT: i32 = 256
+const REMOVE_DIRECTORY: i32 = 512
+const NOT_EMPTY: i32 = 39
+const OVERFLOW: i32 = 75
+const NAME_TOO_LONG: i32 = 36
+const LOOP: i32 = 40
+const NAME_OFFSET: usize = 19
+unsafe extern "C" fn mkdirat(fd: i32, path: ?[*]const u8, mode: u32) -> i32 with Intrinsic.foreign(noCapture: ("path",))
+fn fileMode() -> u32 { return 438 }
+fn directoryMode() -> u32 { return 448 }
+}
+unsafe extern "C" fn open(path: ?[*]const u8, flags: i32, ...) -> i32 with Intrinsic.foreign(noCapture: ("path",))
+unsafe extern "C" fn openat(fd: i32, path: ?[*]const u8, flags: i32, ...) -> i32 with Intrinsic.foreign(noCapture: ("path",))
+unsafe extern "C" fn close(fd: i32) -> i32
+unsafe extern "C" fn read(fd: i32, buffer: ?[*]mut u8, count: usize) -> isize with Intrinsic.foreign(noCapture: ("buffer",))
+unsafe extern "C" fn write(fd: i32, buffer: ?[*]const u8, count: usize) -> isize with Intrinsic.foreign(noCapture: ("buffer",))
+unsafe extern "C" fn fstat(fd: i32, value: *mut Stat) -> i32 with Intrinsic.foreign(noCapture: ("value",))
+unsafe extern "C" fn fstatat(fd: i32, path: ?[*]const u8, value: *mut Stat, flags: i32) -> i32 with Intrinsic.foreign(noCapture: ("path", "value"))
+unsafe extern "C" fn readlinkat(fd: i32, path: ?[*]const u8, buffer: ?[*]mut u8, size: usize) -> isize with Intrinsic.foreign(noCapture: ("path", "buffer"))
+unsafe extern "C" fn ftruncate(fd: i32, length: i64) -> i32
+unsafe extern "C" fn unlinkat(fd: i32, path: ?[*]const u8, flags: i32) -> i32 with Intrinsic.foreign(noCapture: ("path",))
+unsafe extern "C" fn renameat(oldfd: i32, oldpath: ?[*]const u8, newfd: i32, newpath: ?[*]const u8) -> i32 with Intrinsic.foreign(noCapture: ("oldpath", "newpath"))
+unsafe extern "C" fn linkat(oldfd: i32, oldpath: ?[*]const u8, newfd: i32, newpath: ?[*]const u8, flags: i32) -> i32 with Intrinsic.foreign(noCapture: ("oldpath", "newpath"))
+unsafe extern "C" fn fsync(fd: i32) -> i32
+unsafe extern "C" fn fdopendir(fd: i32) -> ?*mut DirectoryStream
+unsafe extern "C" fn dirfd(stream: *mut DirectoryStream) -> i32 with Intrinsic.foreign(noCapture: ("stream",))
+unsafe extern "C" fn readdir(stream: *mut DirectoryStream) -> ?*const DirectoryRecord with Intrinsic.foreign(noCapture: ("stream",))
+unsafe extern "C" fn closedir(stream: *mut DirectoryStream) -> i32 with Intrinsic.foreign(noCapture: ("stream",))
+extern "C" struct DirectoryRecord {
+ inode: u64,
+ position: i64,
+ recordLength: u16,
+}
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  unsafe extern "C" fn __error() -> *mut i32
+  const NOT_SUPPORTED: i32 = 45
+  const NOT_IMPLEMENTED: i32 = 78
+  unsafe fn errorSlot() -> *mut i32 { unsafe { return __error() } }
+} else {
+  unsafe extern "C" fn __errno_location() -> *mut i32
+  const NOT_SUPPORTED: i32 = 95
+  const NOT_IMPLEMENTED: i32 = 38
+  unsafe fn errorSlot() -> *mut i32 { unsafe { return __errno_location() } }
+}
+unsafe fn currentError() -> i32 { unsafe { return Pointer.read(errorSlot()) } }
+
+/// An open file. It owns its descriptor, and closes it one time.
+///
+/// Close it with [`NativeFileSystem.closeFile`] to get a close error. A drop also closes it, and
+/// keeps an earlier error.
+pub struct FileHandle { descriptor: Descriptor }
+struct Descriptor { fd: i32 }
+impl Drop for Descriptor {
+  fn drop(self: &mut Descriptor) -> () {
+    let fd = Intrinsic.replace(self.fd, -1)
+    if fd >= 0 { let ignored = unsafe close(fd) }
+  }
+}
+fn pendingLength(entry: &PendingEntry) -> usize { return Bytes.asSlice(&entry.name).length - 1 }
+struct PendingEntry {
+ name: Bytes,
+ kind: i32,
+}
+/// An open directory stream. It keeps a name that did not fit in the output, for the next call.
+///
+/// It owns one open descriptor. Close it with [`NativeFileSystem.closeDirectory`] to get a close
+/// error. A drop also closes it, and keeps an earlier error.
+pub struct DirectoryHandle {
+  stream: ?*mut DirectoryStream,
+  fd: i32,
+  pending: Option<PendingEntry>,
+  ended: bool,
+}
+impl Drop for DirectoryHandle {
+  fn drop(self: &mut DirectoryHandle) -> () {
+    let stream = Intrinsic.replace(self.stream, Pointer.null<DirectoryStream>())
+    if Pointer.isNull(stream) == false {
+      unsafe { let ignored = closedir(Intrinsic.pointerRequalify<?*mut DirectoryStream, *mut DirectoryStream>(stream)) }
+    }
+  }
+}
+
+fn reason(code: i32) -> FileReason {
+  if code == 2 { return FileSystem.notFound() }
+  if code == 17 { return FileSystem.alreadyExists() }
+  if code == 13 || code == 1 { return FileSystem.permissionDenied() }
+  if code == 22 || code == NAME_TOO_LONG || code == LOOP { return FileSystem.invalidPath() }
+  if code == 20 || code == 21 { return FileSystem.wrongType() }
+  if code == NOT_EMPTY { return FileSystem.notEmpty() }
+  if code == 28 || code == 12 { return FileSystem.noSpace() }
+  if code == 27 || code == OVERFLOW { return FileSystem.tooLarge() }
+  if code == NOT_SUPPORTED || code == NOT_IMPLEMENTED { return FileSystem.unsupported() }
+  return FileSystem.other()
+}
+effect fn reject(operation: FileOperation, code: i32) -> never ! FileError {
+  fail FileSystem.errorWithCode(move operation, reason(code), code)
+}
+effect fn logical(operation: FileOperation, why: FileReason) -> never ! FileError {
+  fail FileSystem.errorWithCode(move operation, move why, 0)
+}
+effect fn closeDescriptor(value: Descriptor, operation: FileOperation) -> () ! FileError {
+  let mut owner = move value
+  let fd = Intrinsic.replace(owner.fd, -1)
+  let status = unsafe close(fd)
+  if status != 0 { let code = unsafe currentError()
+    return run reject(move operation, code) }
+}
+effect fn terminatedRange(values: &[u8], start: usize, end: usize, operation: i32) -> Bytes ! FileError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let attempted = run Effect.result(makeTerminated(values, start, end) |> Effect.provideMut<Allocator>(&mut allocator))
+  return match move attempted {
+    Result<Bytes, OutOfMemoryError>.Success { value } => move value
+    Result<Bytes, OutOfMemoryError>.Failure { error } => run logical(FileOperation { code: operation }, FileSystem.noSpace())
+  }
+}
+effect fn makeTerminated(values: &[u8], start: usize, end: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut result = Bytes.make()
+  let mut index = start
+  while index < end {
+    let one = [values[index]]
+    run Bytes.append(&mut result, &one)
+    index = index + 1
+  }
+  let ending: [u8; 1] = [0]
+  run Bytes.append(&mut result, &ending)
+  return move result
+}
+fn normalized(path: &[u8]) -> bool {
+  if path.length == 0 { return false }
+  if path[0] != u8.toU8(47) { return false }
+  if path.length == 1 { return true }
+  let mut start: usize = 1
+  let mut index: usize = 1
+  while index <= path.length {
+    let mut boundary = index == path.length
+    if index < path.length {
+      if path[index] == u8.toU8(0) { return false }
+      if path[index] == u8.toU8(47) { boundary = true }
+    }
+    if boundary {
+      if index == start { return false }
+      if index - start == 1 && path[start] == u8.toU8(46) { return false }
+      if index - start == 2 && path[start] == u8.toU8(46) && path[start + 1] == u8.toU8(46) { return false }
+      start = index + 1
+    }
+    index = index + 1
+  }
+  return true
+}
+struct Parent {
+  descriptor: Descriptor,
+  leaf: Bytes,
+  // The real path of `descriptor` below the root: empty for the root, else `/a/b`.
+  directory: Bytes,
+  links: usize,
+}
+// At most this many symbolic links resolve in one path, as on Linux.
+const LINK_LIMIT: usize = 40
+// The largest link target read, the Linux PATH_MAX.
+const LINK_CAPACITY: usize = 4096
+// Path walks and *at parents open directories for search only (Linux O_PATH, Darwin O_SEARCH), so
+// an ancestor with execute but no read permission still resolves. Descriptors that are read with
+// fdopendir or synchronized with fsync are opened with childDirectory instead.
+effect fn rootDescriptor(root: &[u8], operation: i32) -> Descriptor ! FileError {
+  let name = run terminatedRange(root, 0, root.length, operation)
+  while true {
+    let fd = unsafe open(Pointer.fromSlice(Bytes.asSlice(&name)), SEARCH + DIRECTORY + NOFOLLOW + CLOEXEC)
+    if fd >= 0 { return Descriptor { fd: fd } }
+    let code = unsafe currentError()
+    if code != 4 { return run reject(FileOperation { code: operation }, code) }
+  }
+  return run logical(FileOperation { code: operation }, FileSystem.other())
+}
+effect fn childDirectory(parent: i32, name: &Bytes, operation: i32) -> Descriptor ! FileError {
+  return run directoryAt(parent, name, 0, operation)
+}
+effect fn searchDirectory(parent: i32, name: &Bytes, operation: i32) -> Descriptor ! FileError {
+  return run directoryAt(parent, name, SEARCH, operation)
+}
+effect fn directoryAt(parent: i32, name: &Bytes, access: i32, operation: i32) -> Descriptor ! FileError {
+  while true {
+    let fd = unsafe openat(parent, Pointer.fromSlice(Bytes.asSlice(name)), access + DIRECTORY + NOFOLLOW + CLOEXEC)
+    if fd >= 0 { return Descriptor { fd: fd } }
+    let code = unsafe currentError()
+    if code != 4 { return run reject(FileOperation { code: operation }, code) }
+  }
+  return run logical(FileOperation { code: operation }, FileSystem.other())
+}
+// The parent directory and last component of a normalized `path`. Symbolic links in its directory
+// components resolve inside the root; the last component is not followed.
+effect fn parentOf(root: &[u8], path: &[u8], operation: i32) -> Parent ! FileError {
+  if normalized(path) == false { return run logical(FileOperation { code: operation }, FileSystem.invalidPath()) }
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let attempted = run Effect.result(walk(root, path, 0, operation) |> Effect.provideMut<Allocator>(&mut allocator))
+  return match move attempted {
+    Result<Parent, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Parent, FileError | OutOfMemoryError>.Failure { error } => match move error {
+      FileError failure => { fail move failure }
+      OutOfMemoryError exhausted => run logical(FileOperation { code: operation }, FileSystem.noSpace())
+    }
+  }
+}
+// As `parentOf`, but a last component that is a symbolic link is followed too, inside the root.
+effect fn leafOf(root: &[u8], path: &[u8], operation: i32) -> Parent ! FileError {
+  if normalized(path) == false { return run logical(FileOperation { code: operation }, FileSystem.invalidPath()) }
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let attempted = run Effect.result(walkLeaf(root, path, operation) |> Effect.provideMut<Allocator>(&mut allocator))
+  return match move attempted {
+    Result<Parent, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Parent, FileError | OutOfMemoryError>.Failure { error } => match move error {
+      FileError failure => { fail move failure }
+      OutOfMemoryError exhausted => run logical(FileOperation { code: operation }, FileSystem.noSpace())
+    }
+  }
+}
+effect fn walkLeaf(root: &[u8], path: &[u8], operation: i32) -> Parent ! FileError | OutOfMemoryError ? &mut Allocator {
+  let mut found = run walk(root, path, 0, operation)
+  while isLink(found.descriptor.fd, &found.leaf) {
+    let links = found.links + 1
+    if links > LINK_LIMIT { return run reject(FileOperation { code: operation }, LOOP) }
+    let target = run readLink(found.descriptor.fd, &found.leaf, operation)
+    let mut text = Bytes.make()
+    if Bytes.asSlice(&target)[0] != u8.toU8(47) {
+      run Bytes.append(&mut text, Bytes.asSlice(&found.directory))
+      run Bytes.append(&mut text, b"/")
+    }
+    run Bytes.append(&mut text, Bytes.asSlice(&target))
+    let previous = Intrinsic.replace(found.descriptor, Descriptor { fd: -1 })
+    run closeDescriptor(move previous, FileOperation { code: operation })
+    found = run walk(root, Bytes.asSlice(&text), links, operation)
+  }
+  return move found
+}
+// Walks `path`, which starts with `/`, from the root. A directory component that is a symbolic
+// link is replaced by its target, read again from the root when the target is absolute. `.` stays
+// and `..` goes up one directory, but never above the root, so no path leaves it. `links` counts
+// the links already followed for this path.
+effect fn walk(root: &[u8], path: &[u8], links: usize, operation: i32) -> Parent ! FileError | OutOfMemoryError ? &mut Allocator {
+  let mut parent = run rootDescriptor(root, operation)
+  let mut directory = Bytes.make()
+  let mut followed = links
+  let mut pending = Bytes.make()
+  run Bytes.append(&mut pending, path)
+  let mut start: usize = 1
+  while true {
+    let end = componentEnd(Bytes.asSlice(&pending), start)
+    let last = end >= Bytes.length(&pending)
+    let step = componentStep(Bytes.asSlice(&pending), start, end)
+    if step == 1 {
+      // An empty component or `.`: the walk stays in this directory.
+      if last { return Parent { descriptor: move parent, leaf: run terminatedRange(b".", 0, 1, operation), directory: move directory, links: followed } }
+      start = end + 1
+    } else if step == 2 {
+      let shortened = parentLength(Bytes.asSlice(&directory))
+      Bytes.truncate(&mut directory, shortened)
+      let reopened = run reopen(root, Bytes.asSlice(&directory), operation)
+      let previous = Intrinsic.replace(parent, move reopened)
+      run closeDescriptor(move previous, FileOperation { code: operation })
+      if last { return Parent { descriptor: move parent, leaf: run terminatedRange(b".", 0, 1, operation), directory: move directory, links: followed } }
+      start = end + 1
+    } else {
+      let component = run terminatedRange(Bytes.asSlice(&pending), start, end, operation)
+      if last { return Parent { descriptor: move parent, leaf: move component, directory: move directory, links: followed } }
+      let mut opened = -1
+      let mut code = 4
+      while opened < 0 && code == 4 {
+        opened = unsafe openat(parent.fd, Pointer.fromSlice(Bytes.asSlice(&component)), SEARCH + DIRECTORY + NOFOLLOW + CLOEXEC)
+        if opened < 0 { code = unsafe currentError() }
+      }
+      if opened >= 0 {
+        let previous = Intrinsic.replace(parent, Descriptor { fd: opened })
+        run closeDescriptor(move previous, FileOperation { code: operation })
+        run Bytes.append(&mut directory, b"/")
+        run Bytes.append(&mut directory, Slice.view<u8>(Bytes.asSlice(&pending), start, end - start))
+        start = end + 1
+      } else {
+        // Linux reports a final no-follow link as ENOTDIR under O_DIRECTORY, Darwin as ELOOP.
+        if (code != 20 && code != LOOP) || isLink(parent.fd, &component) == false { return run reject(FileOperation { code: operation }, code) }
+        followed = followed + 1
+        if followed > LINK_LIMIT { return run reject(FileOperation { code: operation }, LOOP) }
+        let target = run readLink(parent.fd, &component, operation)
+        let mut next = Bytes.make()
+        run Bytes.append(&mut next, Bytes.asSlice(&target))
+        run Bytes.append(&mut next, b"/")
+        run Bytes.append(&mut next, Slice.view<u8>(Bytes.asSlice(&pending), end + 1, Bytes.length(&pending) - end - 1))
+        pending = move next
+        start = 0
+        if Bytes.asSlice(&target)[0] == u8.toU8(47) {
+          let reopened = run rootDescriptor(root, operation)
+          let previous = Intrinsic.replace(parent, move reopened)
+          run closeDescriptor(move previous, FileOperation { code: operation })
+          Bytes.truncate(&mut directory, 0)
+          start = 1
+        }
+      }
+    }
+  }
+  return run logical(FileOperation { code: operation }, FileSystem.other())
+}
+// The index of the `/` that ends the component at `start`, or the length of `text`.
+fn componentEnd(text: &[u8], start: usize) -> usize {
+  let mut end = start
+  while end < text.length && text[end] != u8.toU8(47) { end = end + 1 }
+  return end
+}
+// 1 for an empty or `.` component, 2 for `..`, and 0 for a name.
+fn componentStep(text: &[u8], start: usize, end: usize) -> i32 {
+  if end == start { return 1 }
+  if text[start] != u8.toU8(46) { return 0 }
+  if end - start == 1 { return 1 }
+  if end - start == 2 && text[start + 1] == u8.toU8(46) { return 2 }
+  return 0
+}
+// The length of `directory` without its last component; the root stays the root.
+fn parentLength(directory: &[u8]) -> usize {
+  let mut length = directory.length
+  while length > 0 {
+    length = length - 1
+    if directory[length] == u8.toU8(47) { return length }
+  }
+  return 0
+}
+// Opens `directory`, a path of real directories below the root, from the root again.
+effect fn reopen(root: &[u8], directory: &[u8], operation: i32) -> Descriptor ! FileError {
+  let mut parent = run rootDescriptor(root, operation)
+  let mut start: usize = 1
+  while start < directory.length {
+    let end = componentEnd(directory, start)
+    let component = run terminatedRange(directory, start, end, operation)
+    let next = run searchDirectory(parent.fd, &component, operation)
+    let previous = Intrinsic.replace(parent, move next)
+    run closeDescriptor(move previous, FileOperation { code: operation })
+    start = end + 1
+  }
+  return move parent
+}
+// Whether `name` in `fd` is a symbolic link. A name that cannot be inspected is not one; the
+// operation on it reports the failure.
+fn isLink(fd: i32, name: &Bytes) -> bool {
+  let mut value = emptyStat()
+  let status = unsafe fstatat(fd, Pointer.fromSlice(Bytes.asSlice(name)), Pointer.fromMutRef(&mut value), NOFOLLOW_STAT)
+  return status == 0 && u32.bitAnd(statMode(&value), u32.toU32(61440)) == u32.toU32(40960)
+}
+// The target of the symbolic link `name` in `fd`, without a NUL.
+effect fn readLink(fd: i32, name: &Bytes, operation: i32) -> Bytes ! FileError | OutOfMemoryError ? &mut Allocator {
+  let mut buffer = run Bytes.zeroed(LINK_CAPACITY)
+  let mut count: isize = -1
+  let mut code = 4
+  while count < 0 && code == 4 {
+    count = unsafe readlinkat(fd, Pointer.fromSlice(Bytes.asSlice(name)), Pointer.fromMutSlice(Bytes.asMutSlice(&mut buffer)), LINK_CAPACITY)
+    if count < 0 { code = unsafe currentError() }
+  }
+  if count < 0 { return run reject(FileOperation { code: operation }, code) }
+  let length = isize.toUsize(count)
+  if length == 0 { return run logical(FileOperation { code: operation }, FileSystem.notFound()) }
+  if length >= LINK_CAPACITY { return run reject(FileOperation { code: operation }, NAME_TOO_LONG) }
+  Bytes.truncate(&mut buffer, length)
+  return move buffer
+}
+effect fn descriptorStat(fd: i32, operation: i32) -> Stat ! FileError {
+  let mut value = emptyStat()
+  while true {
+    let status = unsafe fstat(fd, Pointer.fromMutRef(&mut value))
+    if status == 0 { return move value }
+    let code = unsafe currentError()
+    if code != 4 { return run reject(FileOperation { code: operation }, code) }
+  }
+  return run logical(FileOperation { code: operation }, FileSystem.other())
+}
+effect fn childStat(fd: i32, name: &Bytes, operation: i32) -> Stat ! FileError {
+  let mut value = emptyStat()
+  while true {
+    let status = unsafe fstatat(fd, Pointer.fromSlice(Bytes.asSlice(name)), Pointer.fromMutRef(&mut value), NOFOLLOW_STAT)
+    if status == 0 { return move value }
+    let code = unsafe currentError()
+    if code != 4 { return run reject(FileOperation { code: operation }, code) }
+  }
+  return run logical(FileOperation { code: operation }, FileSystem.other())
+}
+fn kind(value: &Stat) -> i32 {
+  let mode = u32.bitAnd(statMode(value), u32.toU32(61440))
+  if mode == u32.toU32(32768) { return 0 }
+  if mode == u32.toU32(16384) { return 1 }
+  if mode == u32.toU32(40960) { return 2 }
+  return -1
+}
+
+unsafe fn recordByte(pointer: [*]const u8, offset: usize) -> u8 {
+  unsafe { return Pointer.read(Pointer.at(pointer, offset)) }
+}
+unsafe fn recordU16(pointer: [*]const u8, offset: usize) -> usize {
+  unsafe { return u8.toUsize(recordByte(pointer, offset)) + u8.toUsize(recordByte(pointer, offset + 1)) * 256 }
+}
+effect fn copyName(pointer: [*]const u8, length: usize, operation: i32) -> Bytes ! FileError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let attempted = run Effect.result(copyNameAllocated(pointer, length) |> Effect.provideMut<Allocator>(&mut allocator))
+  return match move attempted {
+    Result<Bytes, OutOfMemoryError>.Success { value } => move value
+    Result<Bytes, OutOfMemoryError>.Failure { error } => run logical(FileOperation { code: operation }, FileSystem.noSpace())
+  }
+}
+effect fn copyNameAllocated(pointer: [*]const u8, length: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut result = Bytes.make()
+  let mut index: usize = 0
+  while index <= length {
+    let value = unsafe recordByte(pointer, NAME_OFFSET + index)
+    let one = [value]
+    run Bytes.append(&mut result, &one)
+    index = index + 1
+  }
+  return move result
+}
+
+// The owner keeps cleanup descriptor-relative even if an ancestor is renamed. Drop is the
+// exceptional-unwind backstop; ordinary completion explicitly captures every cleanup/close result.
+struct Publication {
+  parent: Parent,
+  file: FileHandle,
+  name: Bytes,
+  pending: bool,
+  published: bool,
+}
+impl Drop for Publication {
+  fn drop(self: &mut Publication) -> () {
+    if self.pending {
+      self.pending = false
+      let ignored = unsafe unlinkat(self.parent.descriptor.fd, Pointer.fromSlice(Bytes.asSlice(&self.name)), 0)
+    }
+  }
+}
+
+fn rememberFailure(primary: &mut Option<FileError>, error: FileError) -> () {
+  let previous = Intrinsic.replace(primary.*, Option<FileError>.none())
+  primary.* = match move previous {
+    Option<FileError>.Some { value } => Option<FileError>.some(move value)
+    Option<FileError>.None => Option<FileError>.some(move error)
+  }
+}
+fn rememberResult(primary: &mut Option<FileError>, result: Result<(), FileError>) -> () {
+  match move result {
+    Result<(), FileError>.Success { value } => ()
+    Result<(), FileError>.Failure { error } => rememberFailure(move primary, move error)
+  }
+}
+fn copyError(error: &FileError) -> FileError {
+  let operation = FileOperation { code: error.operation.code }
+  let why = FileReason { code: error.reason.code }
+  return match move FileSystem.providerCode(error) {
+    Option<i32>.Some { value } => FileSystem.errorWithCode(move operation, move why, value)
+    Option<i32>.None => FileSystem.error(move operation, move why)
+  }
+}
+effect fn finishFile(primary: Option<FileError>) -> () ! FileError {
+  match move primary {
+    Option<FileError>.Some { value } => { fail move value }
+    Option<FileError>.None => ()
+  }
+}
+effect fn rejectAtomic(error: FileError) -> never ! AtomicWriteError {
+  fail AtomicWriteError { published: false, cause: move error, cleanupError: Option<FileError>.none(), stagingName: Bytes.make() }
+}
+effect fn exclusiveFile(parent: i32, name: &Bytes, operation: i32) -> Descriptor ! FileError {
+  while true {
+    let fd = unsafe openat(parent, Pointer.fromSlice(Bytes.asSlice(name)), 1 + CREATE + EXCLUSIVE + NOFOLLOW + CLOEXEC, fileMode())
+    if fd >= 0 { return Descriptor { fd: fd } }
+    let code = unsafe currentError()
+    if code != 4 { return run reject(FileOperation { code: operation }, code) }
+  }
+  return run logical(FileOperation { code: operation }, FileSystem.other())
+}
+effect fn synchronize(fd: i32, operation: i32) -> () ! FileError {
+  while true {
+    let status = unsafe fsync(fd)
+    if status == 0 { return () }
+    let code = unsafe currentError()
+    if code == 22 || code == NOT_SUPPORTED || code == NOT_IMPLEMENTED {
+      fail FileSystem.errorWithCode(FileOperation { code: operation }, FileSystem.unsupported(), code)
+    }
+    if code != 4 { return run reject(FileOperation { code: operation }, code) }
+  }
+}
+// Search-only descriptors cannot be synchronized, so reopen the directory itself for fsync.
+effect fn synchronizeDirectory(parent: i32, operation: i32) -> () ! FileError {
+  let current = run terminatedRange(b".", 0, 1, operation)
+  let directory = run childDirectory(parent, &current, operation)
+  let mut primary = Option<FileError>.none()
+  let synchronized = run Effect.result(synchronize(directory.fd, operation))
+  rememberResult(&mut primary, move synchronized)
+  let closed = run Effect.result(closeDescriptor(move directory, FileOperation { code: operation }))
+  rememberResult(&mut primary, move closed)
+  return run finishFile(move primary)
+}
+effect fn makePublication(root: &[u8], path: &[u8]) -> Publication ! FileError {
+  let parent = run parentOf(root, path, 10)
+  let template = b".silk-stage-0000000000000000"
+  let name = run terminatedRange(template, 0, template.length, 10)
+  return Publication { parent: move parent, file: FileHandle { descriptor: Descriptor { fd: -1 } }, name: move name, pending: false, published: false }
+}
+fn sameName(left: &Bytes, right: &Bytes) -> bool {
+  let a = Bytes.asSlice(left)
+  let b = Bytes.asSlice(right)
+  if a.length != b.length { return false }
+  let mut index: usize = 0
+  while index < a.length {
+    if a[index] != b[index] { return false }
+    index = index + 1
+  }
+  return true
+}
+fn chooseStagingName(name: &mut Bytes, counter: &mut u64) -> () {
+  let mut candidate = counter.*
+  if counter.* == u64.MAX { counter.* = 0 } else { counter.* = counter.* + 1 }
+  let digits = b"0123456789abcdef"
+  let output = Bytes.asMutSlice(move name)
+  let mut remaining: usize = 16
+  while remaining > 0 {
+    remaining = remaining - 1
+    output[12 + remaining] = digits[u64.toUsize(candidate % 16)]
+    candidate = candidate / 16
+  }
+}
+effect fn claimStaging(owner: &mut Publication, counter: &mut u64) -> () ! FileError {
+  let mut attempts = 0
+  while attempts < 128 {
+    chooseStagingName(&mut owner.name, &mut counter)
+    // The public destination may itself have our staging spelling. Never claim it as a temporary.
+    if sameName(&owner.name, &owner.parent.leaf) == false {
+      let attempted = run Effect.result(exclusiveFile(owner.parent.descriptor.fd, &owner.name, 10))
+      match move attempted {
+        Result<Descriptor, FileError>.Success { value } => {
+          owner.file.descriptor = move value
+          owner.pending = true
+          return ()
+        }
+        Result<Descriptor, FileError>.Failure { error } => {
+          if error.reason.code != 1 { fail move error }
+        }
+      }
+    }
+    attempts = attempts + 1
+  }
+  return run logical(FileSystem.writeFileAtomicOperation(), FileSystem.alreadyExists())
+}
+effect fn replacementKind(parent: i32, name: &Bytes) -> () ! FileError {
+  let attempted = run Effect.result(childStat(parent, name, 10))
+  match move attempted {
+    Result<Stat, FileError>.Success { value } => {
+      let mode = u32.bitAnd(statMode(&value), u32.toU32(61440))
+      if mode != u32.toU32(32768) && mode != u32.toU32(40960) {
+        return run logical(FileSystem.writeFileAtomicOperation(), FileSystem.wrongType())
+      }
+    }
+    Result<Stat, FileError>.Failure { error } => {
+      if error.reason.code != 0 { fail move error }
+    }
+  }
+}
+effect fn closeStaging(owner: &mut Publication) -> () ! FileError {
+  if owner.file.descriptor.fd >= 0 {
+    let descriptor = Intrinsic.replace(owner.file.descriptor, Descriptor { fd: -1 })
+    run closeDescriptor(move descriptor, FileSystem.writeFileAtomicOperation())
+  }
+}
+effect fn publish(owner: &mut Publication, bytes: &[u8], policy: i32, durability: i32, counter: &mut u64) -> () ! FileError {
+  run claimStaging(&mut owner, move counter)
+  run NativeFileSystem.writeFile(&mut owner.file, bytes, 10)
+  if durability == 1 { run synchronize(owner.file.descriptor.fd, 11) }
+  // A close failure is still pre-publication; never retry close, including EINTR.
+  run closeStaging(&mut owner)
+  if policy == 0 { run replacementKind(owner.parent.descriptor.fd, &owner.parent.leaf) }
+  while true {
+    let mut status = 0
+    if policy == 0 {
+      status = unsafe renameat(owner.parent.descriptor.fd, Pointer.fromSlice(Bytes.asSlice(&owner.name)), owner.parent.descriptor.fd, Pointer.fromSlice(Bytes.asSlice(&owner.parent.leaf)))
+    } else {
+      // flags=0 does not follow a source symlink; the source is our O_EXCL-owned regular file.
+      status = unsafe linkat(owner.parent.descriptor.fd, Pointer.fromSlice(Bytes.asSlice(&owner.name)), owner.parent.descriptor.fd, Pointer.fromSlice(Bytes.asSlice(&owner.parent.leaf)), 0)
+    }
+    if status == 0 {
+      owner.published = true
+      if policy == 0 { owner.pending = false }
+      return ()
+    }
+    let code = unsafe currentError()
+    if code != 4 { return run reject(FileSystem.writeFileAtomicOperation(), code) }
+  }
+}
+effect fn removeStaging(owner: &mut Publication) -> () ! FileError {
+  if owner.pending {
+    // Do not let Drop silently retry a failed explicit cleanup after we report a residual name.
+    owner.pending = false
+    while true {
+      let status = unsafe unlinkat(owner.parent.descriptor.fd, Pointer.fromSlice(Bytes.asSlice(&owner.name)), 0)
+      if status == 0 { return () }
+      let code = unsafe currentError()
+      if code == 2 { return () }
+      if code != 4 { return run reject(FileSystem.writeFileAtomicOperation(), code) }
+    }
+  }
+}
+
+/// The file system functions. Each takes the root directory and a normalized path below it.
+///
+/// # When to use
+/// `silk.system.filesystem_native` uses it. Application code uses the `FileSystem` effect from
+/// `silk.system.filesystem` instead.
+///
+/// # Details
+/// Each operation starts at the root directory and opens each part of the path relative to its
+/// parent. A symbolic link below the root resolves inside the root, so a path cannot leave the
+/// root. Each operation fails with `FileError`, with a portable reason and the native error code.
+///
+/// # Gotchas
+/// - A call that a signal interrupts is made again, except `close`, which is never repeated.
+/// - The functions exist only on Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+pub struct NativeFileSystem {}
+impl NativeFileSystem {
+  /// Opens a regular file to read, or to write when `writing` is true. A file to write is truncated
+  /// only after it is found to be a regular file.
+  pub effect fn openFile(root: &[u8], path: &[u8], writing: bool, operation: i32) -> FileHandle ! FileError {
+    let parent = run leafOf(root, path, operation)
+    let mut descriptor = Descriptor { fd: -1 }
+    let mut opened = false
+    while opened == false {
+      let mut fd = -1
+      if writing {
+        fd = unsafe openat(parent.descriptor.fd, Pointer.fromSlice(Bytes.asSlice(&parent.leaf)), 1 + CREATE + NONBLOCK + NOFOLLOW + CLOEXEC, fileMode())
+      } else {
+        fd = unsafe openat(parent.descriptor.fd, Pointer.fromSlice(Bytes.asSlice(&parent.leaf)), NONBLOCK + NOFOLLOW + CLOEXEC)
+      }
+      if fd >= 0 { descriptor.fd = fd
+        opened = true
+      } else {
+        let code = unsafe currentError()
+        if code != 4 { return run reject(FileOperation { code: operation }, code) }
+      }
+    }
+    let metadata = run descriptorStat(descriptor.fd, operation)
+    if kind(&metadata) != 0 { return run logical(FileOperation { code: operation }, FileSystem.wrongType()) }
+    if writing {
+      let mut truncated = false
+      while truncated == false {
+        let status = unsafe ftruncate(descriptor.fd, 0)
+        if status == 0 { truncated = true } else {
+          let code = unsafe currentError()
+          if code != 4 { return run reject(FileOperation { code: operation }, code) }
+        }
+      }
+    }
+    run closeDescriptor(move parent.descriptor, FileOperation { code: operation })
+    return FileHandle { descriptor: move descriptor }
+  }
+
+  /// Creates a file at `path` and writes `bytes`, only if no entry exists.
+  ///
+  /// # Details
+  /// An existing file, directory, or symbolic link fails with `AlreadyExists`. The new file gets
+  /// mode 0666, filtered by the umask. A reader can see a part of the file during the write. If a
+  /// later write or close fails, the new partial file stays. It does not call `fsync`.
+  pub effect fn createFile(root: &[u8], path: &[u8], bytes: &[u8]) -> () ! FileError {
+    let parent = run parentOf(root, path, 9)
+    let descriptor = run exclusiveFile(parent.descriptor.fd, &parent.leaf, 9)
+    let mut handle = FileHandle { descriptor: move descriptor }
+    let mut primary = Option<FileError>.none()
+    let attempted = run Effect.result(NativeFileSystem.writeFile(&mut handle, bytes, 9))
+    rememberResult(&mut primary, move attempted)
+    let closed = run Effect.result(NativeFileSystem.closeFile(move handle, FileSystem.createFileOperation()))
+    rememberResult(&mut primary, move closed)
+    let parentClosed = run Effect.result(closeDescriptor(move parent.descriptor, FileSystem.createFileOperation()))
+    rememberResult(&mut primary, move parentClosed)
+    return run finishFile(move primary)
+  }
+
+  /// Writes `bytes` to a temporary file in the same directory, then makes it visible at `path` in
+  /// one step.
+  ///
+  /// # Details
+  /// `policy` 0 replaces with `renameat`. The path can be absent, a regular file, or a symbolic
+  /// link, which is replaced itself. A directory or another kind fails with `WrongType`. `policy` 1
+  /// creates with `linkat`, and fails with `AlreadyExists` if any entry exists.
+  ///
+  /// The temporary name is created with `O_EXCL`. At most 128 names are tried. The temporary entry
+  /// is removed through the open directory, not by its path again.
+  ///
+  /// `durability` 0 does not sync. `durability` 1 calls `fsync` on the file before it is visible,
+  /// then on the directory after. An unsupported policy or sync fails.
+  ///
+  /// # Errors
+  /// `AtomicWriteError` has the first error and whether the new contents are visible. A failed sync
+  /// or close of the directory reports that they are visible. A temporary entry that cannot be
+  /// removed is reported separately with its name.
+  pub effect fn writeFileAtomic(root: &[u8], path: &[u8], bytes: &[u8], policy: i32, durability: i32, counter: &mut u64) -> () ! AtomicWriteError {
+    if (policy != 0 && policy != 1) || (durability != 0 && durability != 1) {
+      return run rejectAtomic(FileSystem.error(FileSystem.writeFileAtomicOperation(), FileSystem.unsupported()))
+    }
+    let prepared = run Effect.result(makePublication(root, path))
+    let mut owner = match move prepared {
+      Result<Publication, FileError>.Success { value } => move value
+      Result<Publication, FileError>.Failure { error } => run rejectAtomic(move error)
+    }
+    let mut primary = Option<FileError>.none()
+    let attempted = run Effect.result(publish(&mut owner, bytes, policy, durability, move counter))
+    rememberResult(&mut primary, move attempted)
+    let closed = run Effect.result(closeStaging(&mut owner))
+    rememberResult(&mut primary, move closed)
+    let mut cleanupError = Option<FileError>.none()
+    let mut residual = Bytes.make()
+    let cleaned = run Effect.result(removeStaging(&mut owner))
+    match move cleaned {
+      Result<(), FileError>.Success { value } => ()
+      Result<(), FileError>.Failure { error } => {
+        rememberFailure(&mut primary, copyError(&error))
+        cleanupError = Option<FileError>.some(move error)
+        residual = Intrinsic.replace(owner.name, Bytes.make())
+        let length = Bytes.asSlice(&residual).length
+        Bytes.truncate(&mut residual, length - 1)
+      }
+    }
+    if owner.published && durability == 1 {
+      let synchronized = run Effect.result(synchronizeDirectory(owner.parent.descriptor.fd, 12))
+      rememberResult(&mut primary, move synchronized)
+    }
+    let parent = Intrinsic.replace(owner.parent.descriptor, Descriptor { fd: -1 })
+    let parentClosed = run Effect.result(closeDescriptor(move parent, FileSystem.writeFileAtomicOperation()))
+    rememberResult(&mut primary, move parentClosed)
+    match move primary {
+      Option<FileError>.Some { value } => {
+        fail AtomicWriteError { published: owner.published, cause: move value, cleanupError: move cleanupError, stagingName: move residual }
+      }
+      Option<FileError>.None => ()
+    }
+  }
+
+  /// Calls `fsync` on the directory at `path`, then closes it.
+  ///
+  /// If the file system does not support it (`EINVAL`, `ENOTSUP`, or `ENOSYS`), it fails with
+  /// `Unsupported` and the native code.
+  pub effect fn syncDirectory(root: &[u8], path: &[u8]) -> () ! FileError {
+    let parent = run leafOf(root, path, 12)
+    let directory = run childDirectory(parent.descriptor.fd, &parent.leaf, 12)
+    run closeDescriptor(move parent.descriptor, FileSystem.syncDirectoryOperation())
+    let mut primary = Option<FileError>.none()
+    let synchronized = run Effect.result(synchronize(directory.fd, 12))
+    rememberResult(&mut primary, move synchronized)
+    let closed = run Effect.result(closeDescriptor(move directory, FileSystem.syncDirectoryOperation()))
+    rememberResult(&mut primary, move closed)
+    return run finishFile(move primary)
+  }
+
+  /// Opens the directory at `path` as a stream.
+  pub effect fn openDirectory(root: &[u8], path: &[u8], operation: i32) -> DirectoryHandle ! FileError {
+    let parent = run leafOf(root, path, operation)
+    let mut descriptor = run childDirectory(parent.descriptor.fd, &parent.leaf, operation)
+    run closeDescriptor(move parent.descriptor, FileOperation { code: operation })
+    let stream = unsafe fdopendir(descriptor.fd)
+    if Pointer.isNull(stream) { let code = unsafe currentError()
+      return run reject(FileOperation { code: operation }, code) }
+    descriptor.fd = -1
+    let mut handle = DirectoryHandle { stream: stream, fd: -1, pending: Option<PendingEntry>.none(), ended: false }
+    let narrowed = unsafe Intrinsic.pointerRequalify<?*mut DirectoryStream, *mut DirectoryStream>(stream)
+    let fd = unsafe dirfd(narrowed)
+    if fd < 0 { let code = unsafe currentError()
+      return run reject(FileOperation { code: operation }, code) }
+    handle.fd = fd
+    return move handle
+  }
+
+  /// Writes the kind (0 for a file, 1 for a directory) and the length of the entry at `path`. A
+  /// symbolic link resolves inside the root.
+  pub effect fn inspect(root: &[u8], path: &[u8], outputKind: &mut i32, length: &mut usize, operation: i32) -> () ! FileError {
+    let parent = run leafOf(root, path, operation)
+    let metadata = run childStat(parent.descriptor.fd, &parent.leaf, operation)
+    let found = kind(&metadata)
+    if found < 0 { return run logical(FileOperation { code: operation }, FileSystem.wrongType()) }
+    if metadata.size < 0 { return run logical(FileOperation { code: operation }, FileSystem.tooLarge()) }
+    outputKind.* = found
+    length.* = u64.toUsize(i64.toU64(metadata.size))
+    run closeDescriptor(move parent.descriptor, FileOperation { code: operation })
+  }
+
+  /// Creates a directory (`command` 0), removes a file or symbolic link (1), or removes an empty
+  /// directory (2) at `path`. It does not follow a final symbolic link.
+  pub effect fn command(root: &[u8], path: &[u8], command: i32, operation: i32) -> () ! FileError {
+    if path.length == 1 { return run logical(FileOperation { code: operation }, FileSystem.invalidPath()) }
+    let parent = run parentOf(root, path, operation)
+    if command != 0 {
+      let metadata = run childStat(parent.descriptor.fd, &parent.leaf, operation)
+      let found = kind(&metadata)
+      // A link is removed itself, as a file is.
+      let expected = command - 1
+      if found != expected && (command != 1 || found != 2) { return run logical(FileOperation { code: operation }, FileSystem.wrongType()) }
+    }
+    let mut finished = false
+    while finished == false {
+      let mut status = 0
+      if command == 0 {
+        status = unsafe mkdirat(parent.descriptor.fd, Pointer.fromSlice(Bytes.asSlice(&parent.leaf)), directoryMode())
+      } else {
+        let mut flags = 0
+        if command == 2 { flags = REMOVE_DIRECTORY }
+        status = unsafe unlinkat(parent.descriptor.fd, Pointer.fromSlice(Bytes.asSlice(&parent.leaf)), flags)
+      }
+      if status == 0 { finished = true } else {
+        let code = unsafe currentError()
+        if code != 4 { return run reject(FileOperation { code: operation }, code) }
+      }
+    }
+    run closeDescriptor(move parent.descriptor, FileOperation { code: operation })
+  }
+
+  /// Reads at most `output.length` bytes into the start of `output`, and returns the count. Zero
+  /// means the end of the file.
+  pub effect fn readFile(handle: &mut FileHandle, output: &mut [u8], operation: i32) -> usize ! FileError {
+    if output.length == 0 { return 0 }
+    let mut requested = output.length
+    if requested > 2147479552 { requested = 2147479552 }
+    let pointer = Pointer.fromMutSlice(move output)
+    while true {
+      let count = unsafe read(handle.descriptor.fd, pointer, requested)
+      if count < 0 {
+        let code = unsafe currentError()
+        if code != 4 { return run reject(FileOperation { code: operation }, code) }
+      } else {
+        let length = isize.toUsize(count)
+        if length > requested { return run logical(FileOperation { code: operation }, FileSystem.other()) }
+        return length
+      }
+    }
+    return run logical(FileOperation { code: operation }, FileSystem.other())
+  }
+
+  /// Writes all of `input`. If it fails, part of `input` can be written already.
+  pub effect fn writeFile(handle: &mut FileHandle, input: &[u8], operation: i32) -> () ! FileError {
+    if input.length == 0 { return () }
+    let base = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice(input))
+    let mut offset: usize = 0
+    while offset < input.length {
+      let mut requested = input.length - offset
+      if requested > 2147479552 { requested = 2147479552 }
+      let address = unsafe Pointer.at(base, offset)
+      let next = unsafe Pointer.assumeMany(address)
+      let count = unsafe write(handle.descriptor.fd, next, requested)
+      if count < 0 {
+        let code = unsafe currentError()
+        if code != 4 { return run reject(FileOperation { code: operation }, code) }
+      } else {
+        let length = isize.toUsize(count)
+        if length == 0 || length > requested { return run logical(FileOperation { code: operation }, FileSystem.other()) }
+        offset = offset + length
+      }
+    }
+  }
+
+  /// Copies the name of the next directory entry to `output`, and returns true.
+  ///
+  /// If the name does not fit, it returns false, writes the needed size to `required`, and keeps
+  /// the name for the next call. A true result with a `count` of 0 is the end of the directory.
+  pub effect fn next(handle: &mut DirectoryHandle, output: &mut [u8], count: &mut usize, required: &mut usize, outputKind: &mut i32, operation: i32) -> bool ! FileError {
+    count.* = 0
+    required.* = 0
+    while true {
+      let pending = Intrinsic.replace(handle.pending, Option<PendingEntry>.none())
+      let mut found = false
+      let mut complete = false
+      match move pending {
+        Option<PendingEntry>.Some { value: entry } => {
+          let length = pendingLength(&entry)
+          found = true
+          if output.length < length {
+            required.* = length
+            handle.pending = Option<PendingEntry>.some(move entry)
+          } else {
+            let name = Bytes.asSlice(&entry.name)
+            let mut index: usize = 0
+            while index < length { output[index] = name[index]
+              index = index + 1 }
+            count.* = length
+            outputKind.* = entry.kind
+            complete = true
+          }
+        }
+        Option<PendingEntry>.None => ()
+      }
+      if found { return complete }
+      if handle.ended { return true }
+      let stream = unsafe Intrinsic.pointerRequalify<?*mut DirectoryStream, *mut DirectoryStream>(handle.stream)
+      unsafe { Pointer.write(errorSlot(), 0) }
+      let record = unsafe readdir(stream)
+      if Pointer.isNull(record) {
+        let code = unsafe currentError()
+        if code != 0 { return run reject(FileOperation { code: operation }, code) }
+        handle.ended = true
+        return true
+      }
+      let projected = unsafe Pointer.bytes(record)
+      let bytes = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(projected)
+      let extent = unsafe recordU16(bytes, 16)
+      if extent <= NAME_OFFSET { return run logical(FileOperation { code: operation }, FileSystem.other()) }
+      let mut length: usize = 0
+      let mut terminated = false
+      while length < extent - NAME_OFFSET && terminated == false {
+        let value = unsafe recordByte(bytes, NAME_OFFSET + length)
+        if value == u8.toU8(0) { terminated = true } else {
+          if value == u8.toU8(47) { return run logical(FileOperation { code: operation }, FileSystem.invalidPath()) }
+          length = length + 1
+        }
+      }
+      if terminated == false || length == 0 { return run logical(FileOperation { code: operation }, FileSystem.other()) }
+      static if Intrinsic.targetOperatingSystem() == "darwin" {
+        let declared = unsafe recordU16(bytes, 18)
+        if declared != length { return run logical(FileOperation { code: operation }, FileSystem.other()) }
+      }
+      let first = unsafe recordByte(bytes, NAME_OFFSET)
+      let mut skip = length == 1 && first == u8.toU8(46)
+      if length == 2 && first == u8.toU8(46) {
+        let second = unsafe recordByte(bytes, NAME_OFFSET + 1)
+        if second == u8.toU8(46) { skip = true }
+      }
+      if skip == false {
+        let name = run copyName(bytes, length, operation)
+        let metadata = run childStat(handle.fd, &name, operation)
+        let foundKind = kind(&metadata)
+        if foundKind < 0 { return run logical(FileOperation { code: operation }, FileSystem.wrongType()) }
+        handle.pending = Option<PendingEntry>.some(PendingEntry { name: move name, kind: foundKind })
+      }
+    }
+    return false
+  }
+
+  /// Creates a directory in `path` named `prefix`, `-`, and 16 hex digits of `counter`, and returns
+  /// true. It tries at most 128 names. If the name does not fit in `output`, it returns false and
+  /// writes the needed size to `required`.
+  pub effect fn createUnique(root: &[u8], path: &[u8], prefix: &[u8], counter: &mut u64, output: &mut [u8], count: &mut usize, required: &mut usize, operation: i32) -> bool ! FileError {
+    count.* = 0
+    required.* = 0
+    if prefix.length == 0 { return run logical(FileOperation { code: operation }, FileSystem.invalidPath()) }
+    let mut index: usize = 0
+    while index < prefix.length {
+      if prefix[index] == u8.toU8(0) || prefix[index] == u8.toU8(47) { return run logical(FileOperation { code: operation }, FileSystem.invalidPath()) }
+      index = index + 1
+    }
+    if prefix.length == 1 && prefix[0] == u8.toU8(46) { return run logical(FileOperation { code: operation }, FileSystem.invalidPath()) }
+    if prefix.length == 2 && prefix[0] == u8.toU8(46) && prefix[1] == u8.toU8(46) { return run logical(FileOperation { code: operation }, FileSystem.invalidPath()) }
+    if prefix.length > usize.MAX - 17 { return run logical(FileOperation { code: operation }, FileSystem.tooLarge()) }
+    let length = prefix.length + 17
+    if output.length < length { required.* = length
+      return false }
+    let parent = run leafOf(root, path, operation)
+    let directory = run searchDirectory(parent.descriptor.fd, &parent.leaf, operation)
+    run closeDescriptor(move parent.descriptor, FileOperation { code: operation })
+    index = 0
+    while index < prefix.length { output[index] = prefix[index]
+      index = index + 1 }
+    output[prefix.length] = u8.toU8(45)
+    let digits = b"0123456789abcdef"
+    let mut attempts = 0
+    while attempts < 128 {
+      let mut candidate = counter.*
+      if counter.* == u64.MAX { counter.* = 0 } else { counter.* = counter.* + 1 }
+      let mut remaining: usize = 16
+      while remaining > 0 {
+        remaining = remaining - 1
+        output[prefix.length + 1 + remaining] = digits[u64.toUsize(candidate % 16)]
+        candidate = candidate / 16
+      }
+      let name = run terminatedRange(&output, 0, length, operation)
+      let status = unsafe mkdirat(directory.fd, Pointer.fromSlice(Bytes.asSlice(&name)), directoryMode())
+      if status == 0 {
+        run closeDescriptor(move directory, FileOperation { code: operation })
+        count.* = length
+        return true
+      }
+      let code = unsafe currentError()
+      if code != 17 { return run reject(FileOperation { code: operation }, code) }
+      attempts = attempts + 1
+    }
+    return run logical(FileOperation { code: operation }, FileSystem.alreadyExists())
+  }
+
+  /// Closes the file one time. It does not try again after an interrupt.
+  pub effect fn closeFile(value: FileHandle, operation: FileOperation) -> () ! FileError {
+    return run closeDescriptor(move value.descriptor, move operation)
+  }
+  /// Closes the directory stream one time.
+  pub effect fn closeDirectory(value: DirectoryHandle, operation: FileOperation) -> () ! FileError {
+    let mut owner = move value
+    let stream = Intrinsic.replace(owner.stream, Pointer.null<DirectoryStream>())
+    let narrowed = unsafe Intrinsic.pointerRequalify<?*mut DirectoryStream, *mut DirectoryStream>(stream)
+    let status = unsafe closedir(narrowed)
+    if status != 0 { let code = unsafe currentError()
+      return run reject(move operation, code) }
+  }
+}
+}

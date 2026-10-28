@@ -24,7 +24,7 @@ invalidates. It checks the package as `silk check` does, but in a store opened w
 `Semantic.update` and checks again. It prints no diagnostics; each step writes one line:
 
 ```text
-silk-replay step=1 kind=trivia module=silk/bytes.silk demands=211352 hits=211338 units-run=14 marked-outdated=14 graph-units=64550 graph-bytes=46662656 answers=68759 mir-functions=5927 rejections=5 update-us=238 check-us=904871
+silk-replay step=1 kind=trivia module=silk/collections/bytes.silk demands=211352 hits=211338 units-run=14 marked-outdated=14 graph-units=64550 graph-bytes=46662656 answers=68759 mir-functions=5927 rejections=5 update-us=238 check-us=904871
 ```
 
 `demands`, `hits`, `units-run` and `marked-outdated` are what that step added to the store's
@@ -58,7 +58,7 @@ store's final profile, so a step that edits a `param` declaration compares again
 assembled before the edit.
 
 With `SILK_REPLAY_RUNS` set, every edit step also writes one `silk-replay-run step=<n> <unit>`
-line per unit it ran, such as `Body silk/bytes.Bytes.append`, and one
+line per unit it ran, such as `Body silk/collections/bytes.Bytes.append`, and one
 `silk-replay-stale step=<n> <unit> <- <dependee>` line per outdated unit that failed
 verification, naming the first dependee it found changed: another unit, a whole `file`, or an
 `input` by its module and selector. Count them to find what an edit fans out through:

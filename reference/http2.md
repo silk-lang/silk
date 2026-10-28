@@ -8,14 +8,14 @@ machine. No native HTTP library or compiler intrinsic implements the protocol.
 
 | Module | Use |
 | --- | --- |
-| [`silk.http2`](stdlib/http2.md) | Drive a connection with incoming and outgoing bytes, including several concurrent streams. |
-| [`silk.http2_connection`](stdlib/http2-connection.md) | Drive the connection over the existing `HttpTransport` service, with buffering and absolute deadlines. |
-| [`silk.hpack`](stdlib/hpack.md) | Encode or decode complete field blocks with a connection's compression context. |
-| [`silk.http2_frame`](stdlib/http2-frame.md) | Read and write frame headers and use the protocol's error codes. |
-| [`silk.http2_headers`](stdlib/http2-headers.md) | Validate request, response, or trailer fields independently. |
+| [`silk.http.http2`](stdlib/http-http2.md) | Drive a connection with incoming and outgoing bytes, including several concurrent streams. |
+| [`silk.http.http2_connection`](stdlib/http-http2-connection.md) | Drive the connection over the existing `HttpTransport` service, with buffering and absolute deadlines. |
+| [`silk.http.hpack`](stdlib/http-hpack.md) | Encode or decode complete field blocks with a connection's compression context. |
+| [`silk.http.http2_frame`](stdlib/http-http2-frame.md) | Read and write frame headers and use the protocol's error codes. |
+| [`silk.http.http2_headers`](stdlib/http-http2-headers.md) | Validate request, response, or trailer fields independently. |
 
 The existing `Http`, HTTP/1.x exchange, HTTP/1.x server, and HTTP/1.x connection-pool APIs retain
-their documented protocol. Select `silk.http2` or `silk.http2_connection` when the application needs
+their documented protocol. Select `silk.http.http2` or `silk.http.http2_connection` when the application needs
 HTTP/2 streams. The HTTP/2 connection itself multiplexes requests; no HTTP/1.x pool lease is involved.
 
 ## Connection establishment
@@ -23,10 +23,10 @@ HTTP/2 streams. The HTTP/2 connection itself multiplexes requests; no HTTP/1.x p
 For cleartext, agree on HTTP/2 before sending the client preface. RFC 9113 uses prior knowledge;
 it removed the old `h2c` HTTP/1.1 Upgrade exchange.
 
-For TLS, offer the protocol returned by `silk.http2_connection.protocol()` in
+For TLS, offer the protocol returned by `silk.http.http2_connection.protocol()` in
 `AlpnConfig.Offered`, with `required: true`. Authenticate the peer with the existing TLS client and
 trust source. `requireAlpn` checks that the authenticated connection selected `h2`. Supply the
-resulting `OwnedConnection` through `silk.http_transport.secured`. The Silk TLS client uses TLS 1.3.
+resulting `OwnedConnection` through `silk.http.transport.secured`. The Silk TLS client uses TLS 1.3.
 A server can supply an accepted plain connection or an already established TLS byte transport.
 
 `Connection.make` queues the client preface when appropriate and initial SETTINGS. `Driver.make`

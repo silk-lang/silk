@@ -1,0 +1,487 @@
+//! Percent-encode bytes for a URI component, and decode `%XX` escapes.
+//!
+//! # When to use
+//! Use [`UriPercent.encodeOwned`] to put data, such as a search term or a file name, into a
+//! component of a URI. Use [`UriPercent.decodeOwned`] or [`UriPercent.decodeOrBorrow`] to get the
+//! bytes back. The `...Into`, `appendEncoded`, and `decodeInPlace` functions reuse storage that you
+//! already have, and [`UriPercent.encodeToWriter`] writes to a `Writer`.
+//!
+//! # Details
+//! The [`PercentComponent`] selects which bytes stay as they are. All other bytes become `%XX` with
+//! uppercase hexadecimal digits. A `%` in the input is always encoded, so the input must be raw
+//! data, not text that is already encoded. Decoding is strict: each `%` must start a valid escape.
+//! The decoded bytes are not always valid UTF-8. Check them with `String.fromUtf8` if you need
+//! text.
+//!
+//! # Errors
+//! - [`DecodeError`] if the text has a `%` without two hexadecimal digits after it. `offset` is the
+//!   position of the `%`.
+//! - `OutOfMemoryError` from the functions that allocate.
+//! - `WriterError` from [`UriPercent.encodeToWriter`].
+//!
+//! # Gotchas
+//! This is generic URI encoding, not HTML form encoding. A `+` is not decoded to a space, and a
+//! space is encoded as `%20`. `Query` keeps `&`, `=`, and `+`, so use `Unreserved` to encode one
+//! key or value of a query string.
+//!
+//! # Examples
+//! ## Encode a query value and decode it again
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.collections.bytes { Bytes }
+//! import silk.core.effect { Effect }
+//! import silk.core.result { Result }
+//! import silk.text.string { String }
+//! import silk.uri.percent { DecodeError, PercentComponent, UriPercent }
+//!
+//! pub effect fn main() -> i32
+//!   ! OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let encoded = run UriPercent.encodeOwned(b"tea & cake", PercentComponent.Unreserved)
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   if String.view(&encoded) != "tea%20%26%20cake" {
+//!     return 1
+//!   }
+//!   let decoded = run UriPercent.decodeOwned(String.view(&encoded))
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   return match move decoded {
+//!     Result<Bytes, DecodeError>.Success { value } => {
+//!       let bytes = Bytes.asSlice(&value)
+//!       if bytes.length != 10 || bytes[4] != 38 {
+//!         return 1
+//!       }
+//!       return 0
+//!     }
+//!     Result<Bytes, DecodeError>.Failure { error: _ } => 1
+//!   }
+//! }
+//! ```
+//!
+//! @category Data formats
+
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.collections.bytes {Bytes}
+import silk.format {Debug, Format, Formatter}
+import silk.core.result {Result}
+import silk.option {Option}
+import silk.text.string {String}
+import silk.collections.slice {Slice}
+import silk.io.writer {Writer, WriterError}
+import silk.num.u8
+import silk.num.usize
+
+/// The URI component that the encoded bytes go into. It selects the bytes that stay as they are.
+///
+/// All components keep ASCII letters, digits, `-`, `.`, `_`, and `~`. The other components also
+/// keep the sub-delimiters `!$&'()*+,;=`, except where the variant says otherwise.
+///
+/// # Gotchas
+/// `Query` keeps `&`, `=`, and `+`, so use `Unreserved` to encode one key or value of a query
+/// string.
+pub enum PercentComponent {
+  /// User information. It keeps `:` and encodes `@`.
+  Userinfo,
+  /// A registered host name. It encodes `:` and `@`.
+  RegName,
+  /// One path segment. It keeps `:` and `@`, and encodes `/`.
+  PathSegment,
+  /// The first segment of a relative path. It encodes `:` and `/`, so the segment cannot look like
+  /// a scheme.
+  FirstPathSegment,
+  /// A full path. It keeps `/`, `:`, and `@`, and encodes `?` and `#`.
+  Path,
+  /// Only the unreserved bytes. It encodes all sub-delimiters. Use it for one key or value of a
+  /// query string.
+  Unreserved,
+  /// A full query. It keeps `/`, `?`, `:`, `@`, `&`, and `=`.
+  Query,
+  /// A full fragment. It keeps `/`, `?`, `:`, and `@`.
+  Fragment,
+}
+
+/// A `%` that does not start a valid escape.
+pub struct DecodeError {
+  /// The position of the `%`, from the start of the input.
+  pub offset: usize,
+}
+
+impl Debug for DecodeError {
+  /// Writes the fields, as `DecodeError { offset: ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return run Format.debugFields(self, "DecodeError", &mut formatter)
+  }
+}
+
+/// The result of [`UriPercent.decodeOrBorrow`]: the input itself, or new decoded bytes.
+///
+/// The bytes are not always valid UTF-8.
+pub union Decoded<'input> {
+  /// The input has no `%`, so it is returned as it is. Nothing is allocated.
+  Borrowed {
+    /// The input bytes.
+    pub values: &'input [u8],
+  },
+  /// The input has escapes. The decoded bytes are in new storage.
+  Owned {
+    /// The decoded bytes.
+    pub value: Bytes,
+  },
+}
+
+/// Functions that percent-encode and decode URI components.
+///
+/// # Details
+/// The [`PercentComponent`] selects which bytes stay as they are. All other bytes become `%XX` with
+/// uppercase hexadecimal digits. A `%` in the input is always encoded, so the input must be raw
+/// data, not text that is already encoded. Decoding is strict: each `%` must start a valid escape.
+/// The decoded bytes are not always valid UTF-8.
+///
+/// # Gotchas
+/// This is generic URI encoding, not HTML form encoding. A `+` is not decoded to a space, and a
+/// space is encoded as `%20`.
+pub struct UriPercent {}
+
+impl UriPercent {
+  /// Returns `values` encoded for `component`, in a new string.
+  ///
+  /// It allocates exactly the needed size, and nothing for an empty result.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` fails or the size does not fit in `usize`.
+  ///
+  /// # Gotchas
+  /// `Path` keeps `:`. If the path of a relative reference can start with a segment that contains
+  /// `:`, encode that segment with `FirstPathSegment`.
+  pub effect fn encodeOwned(values: &[u8], component: PercentComponent) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+    let mut output = Bytes.make()
+    let encoded = run UriPercent.encodeInto(&mut output, values, component)
+    // The encoder emits only allowed ASCII bytes and ASCII percent escapes.
+    return unsafe String.fromBytesUnchecked(move output)
+  }
+  /// Replaces the contents of `output` with `values` encoded for `component`.
+  ///
+  /// If `output` has enough capacity, it does not allocate.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` fails or the size does not fit in `usize`. `output`
+  ///   does not change.
+  pub effect fn encodeInto(output: &mut Bytes, values: &[u8], component: PercentComponent) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+    let length = run requiredEncodedLength(values, component)
+    let reserved = run reserveOutput(&mut output, length)
+    Bytes.clear(&mut output)
+    return run appendReserved(&mut output, values, component)
+  }
+  /// Returns the length of `values` encoded for `component`, or `None` if it does not fit in
+  /// `usize`.
+  ///
+  /// Each encoded byte counts as 3. Use it to reserve space for a URI that you build from more than
+  /// one component.
+  pub fn encodedLength(values: &[u8], component: PercentComponent) -> Option<usize> {
+    return encodedSize(values, component)
+  }
+  /// Adds `values` encoded for `component` to the end of `output`.
+  ///
+  /// The existing bytes of `output` do not change. If `output` has enough capacity, it does not
+  /// allocate.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` fails or the size does not fit in `usize`. `output`
+  ///   does not change.
+  pub effect fn appendEncoded(output: &mut Bytes, values: &[u8], component: PercentComponent) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+    let length = run requiredEncodedLength(values, component)
+    let reserved = run Bytes.reserveExact(&mut output, length)
+    return run appendReserved(&mut output, values, component)
+  }
+  /// Writes `values` encoded for `component` to the ambient `Writer`. It does not allocate.
+  ///
+  /// # Errors
+  /// - `WriterError` if the `Writer` fails. The bytes that it accepted stay written.
+  ///
+  /// # Gotchas
+  /// It does not flush the `Writer`.
+  pub effect fn encodeToWriter(values: &[u8], component: PercentComponent) -> ()
+  ! WriterError
+  ? &mut Writer {
+    let mut index = usize.ZERO
+    while index < values.length {
+      let start = index
+      while index < values.length && allowed(values[index], component) {
+        index = index + usize.ONE
+      }
+      if index > start {
+        let written = run Writer.writeAll(Slice.view<u8>(values, start, index - start))
+      }
+      if index < values.length {
+        let value = values[index]
+        let escaped = [u8.toU8(37), hex(value / u8.toU8(16)), hex(value % u8.toU8(16))]
+        let written = run Writer.writeAll(&escaped)
+        index = index + usize.ONE
+      }
+    }
+    return ()
+  }
+  /// Returns the bytes of `text` with each `%XX` escape decoded, in new storage.
+  ///
+  /// A `+` stays a `+`. It allocates exactly the needed size, and nothing for an empty result.
+  ///
+  /// # Errors
+  /// - `Failure` with a [`DecodeError`] if an escape is not valid. Nothing is allocated.
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn decodeOwned(text: string) -> Result<Bytes, DecodeError>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+    let mut output = Bytes.make()
+    let decoded = run UriPercent.decodeInto(&mut output, text)
+    return match move decoded {
+      Result<(), DecodeError>.Success {value: _} => Result<Bytes, DecodeError>.succeed(move output)
+      Result<(), DecodeError>.Failure {error} => Result<Bytes, DecodeError>.failResult(move error)
+    }
+  }
+  /// Replaces the contents of `output` with the decoded bytes of `text`.
+  ///
+  /// A `+` stays a `+`. If `output` has enough capacity, it does not allocate.
+  ///
+  /// # Errors
+  /// - `Failure` with a [`DecodeError`] if an escape is not valid. `output` does not change.
+  /// - `OutOfMemoryError` if the `Allocator` fails. `output` does not change.
+  pub effect fn decodeInto(output: &mut Bytes, text: string) -> Result<(), DecodeError>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+    let source = String.utf8Bytes(text)
+    let checked = decodedLength(source)
+    let length = match move checked {
+      Result<usize, DecodeError>.Success {value} => value
+      Result<usize, DecodeError>.Failure {error} => {
+        return Result<(), DecodeError>.failResult(move error)
+      }
+    }
+    let reserved = run reserveOutput(&mut output, length)
+    Bytes.clear(&mut output)
+    let mut index = usize.ZERO
+    while index < source.length {
+      let start = index
+      while index < source.length && source[index] != u8.toU8(37) {
+        index = index + usize.ONE
+      }
+      if index > start {
+        let appended = run Bytes.append(&mut output, Slice.view<u8>(source, start, index - start))
+      }
+      if index < source.length {
+        let decoded = [digit(source[index + usize.ONE]) * u8.toU8(16) + digit(source[index + 2])]
+        let appended = run Bytes.append(&mut output, &decoded)
+        index = index + 3
+      }
+    }
+    return Result<(), DecodeError>.succeed(())
+  }
+  /// Decodes the escapes of `values` in place, and returns the length of the decoded bytes.
+  ///
+  /// The decoded bytes are at the start of `values`. It does not allocate.
+  ///
+  /// # Errors
+  /// - `Failure` with a [`DecodeError`] if an escape is not valid. `values` does not change.
+  ///
+  /// # Gotchas
+  /// The bytes after the returned length are not specified. The length of the slice does not
+  /// change.
+  pub fn decodeInPlace(values: &mut [u8]) -> Result<usize, DecodeError> {
+    let checked = decodedLength(&values)
+    let length = match move checked {
+      Result<usize, DecodeError>.Success {value} => value
+      Result<usize, DecodeError>.Failure {error} => {
+        return Result<usize, DecodeError>.failResult(move error)
+      }
+    }
+    let mut index = usize.ZERO
+    let mut written = usize.ZERO
+    while index < values.length {
+      let mut value = values[index]
+      if value == u8.toU8(37) {
+        value = digit(values[index + usize.ONE]) * u8.toU8(16) + digit(values[index + 2])
+        index = index + 3
+      } else {
+        index = index + usize.ONE
+      }
+      values[written] = value
+      written = written + usize.ONE
+    }
+    return Result<usize, DecodeError>.succeed(length)
+  }
+  /// Returns `text` as it is if it has no `%`, or else the decoded bytes in new storage.
+  ///
+  /// Use it when most input has no escapes, to skip the allocation and the copy.
+  ///
+  /// # Errors
+  /// - `Failure` with a [`DecodeError`] if an escape is not valid. Nothing is allocated.
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn decodeOrBorrow<'input>(text: string<'input>) -> Result<Decoded<'input>, DecodeError>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+    let source = String.utf8Bytes(text)
+    let mut index = usize.ZERO
+    while index < source.length {
+      if source[index] == u8.toU8(37) {
+        let decoded = run UriPercent.decodeOwned(text)
+        return match move decoded {
+          Result<Bytes, DecodeError>.Success {value} => Result<Decoded<'input>, DecodeError>.succeed(
+            Decoded<'input>.Owned {value: move value},
+          )
+          Result<Bytes, DecodeError>.Failure {error} => Result<
+            Decoded<'input>,
+            DecodeError,
+          >.failResult(move error)
+        }
+      }
+      index = index + usize.ONE
+    }
+    return Result<Decoded<'input>, DecodeError>.succeed(Decoded<'input>.Borrowed {values: source})
+  }
+}
+
+effect fn requiredEncodedLength(values: &[u8], component: PercentComponent) -> usize ! OutOfMemoryError {
+  let size = encodedSize(values, component)
+  return match move size {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => run Allocator.outOfMemory()
+  }
+}
+
+// Callers reserve the complete output before emission, so append cannot grow between runs.
+effect fn appendReserved(output: &mut Bytes, values: &[u8], component: PercentComponent) -> ()
+! OutOfMemoryError
+? &mut Allocator {
+  let mut index = usize.ZERO
+  while index < values.length {
+    let start = index
+    while index < values.length && allowed(values[index], component) {
+      index = index + usize.ONE
+    }
+    if index > start {
+      let appended = run Bytes.append(&mut output, Slice.view<u8>(values, start, index - start))
+    }
+    if index < values.length {
+      let value = values[index]
+      let escaped = [u8.toU8(37), hex(value / u8.toU8(16)), hex(value % u8.toU8(16))]
+      let appended = run Bytes.append(&mut output, &escaped)
+      index = index + usize.ONE
+    }
+  }
+  return ()
+}
+
+fn encodedSize(values: &[u8], component: PercentComponent) -> Option<usize> {
+  let mut index = usize.ZERO
+  let mut length = usize.ZERO
+  while index < values.length {
+    let mut count: usize = 3
+    if allowed(values[index], component) {
+      count = usize.ONE
+    }
+    if length > usize.MAX - count {
+      return Option<usize>.none()
+    }
+    length = length + count
+    index = index + usize.ONE
+  }
+  return Option<usize>.some(length)
+}
+
+effect fn reserveOutput(output: &mut Bytes, length: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let current = Bytes.length(&output)
+  if length > current {
+    return run Bytes.reserveExact(&mut output, length - current)
+  }
+  return ()
+}
+
+fn decodedLength(source: &[u8]) -> Result<usize, DecodeError> {
+  let mut index = usize.ZERO
+  let mut length = usize.ZERO
+  while index < source.length {
+    if source[index] == u8.toU8(37) {
+      if source.length - index < 3 {
+        return Result<usize, DecodeError>.failResult(DecodeError {offset: index})
+      }
+      if digit(source[index + usize.ONE]) > u8.toU8(15) || digit(source[index + 2]) > u8.toU8(15) {
+        return Result<usize, DecodeError>.failResult(DecodeError {offset: index})
+      }
+      index = index + 3
+    } else {
+      index = index + usize.ONE
+    }
+    length = length + usize.ONE
+  }
+  return Result<usize, DecodeError>.succeed(length)
+}
+
+fn hex(value: u8) -> u8 {
+  if value < u8.toU8(10) {
+    return value + u8.toU8(48)
+  }
+  return value + u8.toU8(55)
+}
+
+fn digit(value: u8) -> u8 {
+  if value >= u8.toU8(48) && value <= u8.toU8(57) {
+    return value - u8.toU8(48)
+  }
+  if value >= u8.toU8(65) && value <= u8.toU8(70) {
+    return value - u8.toU8(55)
+  }
+  if value >= u8.toU8(97) && value <= u8.toU8(102) {
+    return value - u8.toU8(87)
+  }
+  return u8.toU8(255)
+}
+
+fn allowed(value: u8, component: PercentComponent) -> bool {
+  if value >= u8.toU8(65) && value <= u8.toU8(90) {
+    return true
+  }
+  if value >= u8.toU8(97) && value <= u8.toU8(122) {
+    return true
+  }
+  if value >= u8.toU8(48) && value <= u8.toU8(57) {
+    return true
+  }
+  if value == u8.toU8(45) || value == u8.toU8(46) || value == u8.toU8(95) || value == u8.toU8(126) {
+    return true
+  }
+  if component == PercentComponent.Unreserved {
+    return false
+  }
+  if value == u8.toU8(33) || value == u8.toU8(36) || value == u8.toU8(38) || value == u8.toU8(39) {
+    return true
+  }
+  if value == u8.toU8(40) || value == u8.toU8(41) || value == u8.toU8(42) || value == u8.toU8(43) {
+    return true
+  }
+  if value == u8.toU8(44) || value == u8.toU8(59) || value == u8.toU8(61) {
+    return true
+  }
+  if component == PercentComponent.RegName {
+    return false
+  }
+  if value == u8.toU8(58) {
+    return component != PercentComponent.FirstPathSegment
+  }
+  if component == PercentComponent.Userinfo {
+    return false
+  }
+  if value == u8.toU8(64) {
+    return true
+  }
+  if component == PercentComponent.Path {
+    return value == u8.toU8(47)
+  }
+  if component == PercentComponent.Query || component == PercentComponent.Fragment {
+    return value == u8.toU8(47) || value == u8.toU8(63)
+  }
+  return false
+}

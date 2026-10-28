@@ -9,9 +9,9 @@ let dir
 let server
 let lib
 
-const program = `import silk.effect { Effect }
-import silk.logger { LogError }
-import silk.os_logger { StdoutLogger }
+const program = `import silk.core.effect { Effect }
+import silk.io.logger { LogError }
+import silk.io.logger_native { StdoutLogger }
 import util.Text { shout }
 
 fn total(values: &[i32]) -> i32 {
@@ -139,7 +139,7 @@ test('hover on a type used as a qualifier shows its doc comment', { todo: 'findi
 })
 
 test('importing a name the module lacks is reported on the import line', { todo: 'finding 31' }, async () => {
-  const broken = program.replace('import silk.logger { LogError }', 'import silk.logger { LogError, Nope }')
+  const broken = program.replace('import silk.io.logger { LogError }', 'import silk.io.logger { LogError, Nope }')
   const diagnostics = await change(broken)
   await change(program)
   assert.ok(diagnostics.some((diagnostic) => diagnostic.code === 'SEM0014' && diagnostic.range.start.line === 1), JSON.stringify(diagnostics))

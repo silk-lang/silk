@@ -355,8 +355,8 @@ remain for their own reference areas.
 value into `Result<A, E>.Failure`.
 
 ```silk
-import silk.effect { Effect }
-import silk.result { Result }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
 
 struct HttpError {}
 struct OutOfMemoryError {}
@@ -396,7 +396,7 @@ branch specific to the names `Effect.result`, `Result`, `Success`, or `Failure`.
 `map` and `catchAll`; the compiler has no `Intrinsic.effectResult` operation or replacement
 completed-outcome primitive.
 
-**Evidence:** [ordinary source implementation](../stdlib/silk/effect.silk),
+**Evidence:** [ordinary source implementation](../stdlib/silk/core/effect.silk),
 minimal intrinsic boundary.
 
 ## Environment validity

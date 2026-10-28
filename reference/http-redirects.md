@@ -5,7 +5,7 @@ description: Bounded redirect policy, replay sources, authority changes, scoped 
 
 # HTTP redirects
 
-Use `silk.http_redirect` when one HTTP operation can follow redirect responses. The actor rebuilds
+Use `silk.http.redirect` when one HTTP operation can follow redirect responses. The actor rebuilds
 each request from semantic input. It does not parse a serialized request or retry transport
 failures. One scoped operation owns URI history, body replay state, intermediate responses, and the
 final response callback.
@@ -94,7 +94,7 @@ A followed response must contain exactly one Location field; duplicate fields re
 reference and can identify the current target.
 
 The operation copies Location while the response head is live, validates the raw limit and percent
-escapes, and resolves it through `silk.uri`. It accepts only HTTP or HTTPS with a valid host and
+escapes, and resolves it through `silk.uri.uri`. It accepts only HTTP or HTTPS with a valid host and
 effective port. User information is invalid. Both the raw reference and independently owned result
 use the URI byte limit, including the resolver's conservative capacity reservation.
 
@@ -128,7 +128,7 @@ cannot retain those fields.
 The same cross-origin transition resets generated Host policy to the normalized destination
 default and removes generated authorization. Explicit User-Agent and Accept controls remain because
 they are in the fixed safe set. This policy rebuild prevents credentials or an initial explicit Host
-from reappearing when `silk.http_request` generates the next head.
+from reappearing when `silk.http.request` generates the next head.
 
 The operation does not derive credentials from Location user information. It does not apply a DNS
 suffix rule, cookie jar, or implicit referrer policy.
@@ -208,7 +208,7 @@ on the higher-level Stream actor. It also introduces no compatibility alias, sec
 representation, or compiler-known redirect operation.
 
 The implementation lives in
-[`http_redirect.silk`](../stdlib/silk/http_redirect.silk), with narrow
-composition in [`http_exchange.silk`](../stdlib/silk/http_exchange.silk) and
+[`http_redirect.silk`](../stdlib/silk/http/redirect.silk), with narrow
+composition in [`http_exchange.silk`](../stdlib/silk/http/exchange.silk) and
 the existing proxy/native actors. The normative delivery contract is the
 `bounded-http-redirects` OpenSpec.

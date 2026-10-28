@@ -1,0 +1,3487 @@
+//! Send one HTTP request, follow redirects, decode the content, and deliver the body to a
+//! destination that you choose.
+//!
+//! # When to use
+//! Use this module when you need more control than `silk.http.client`: a sink for a large body, a
+//! body that you stream, content decoding, a proxy, or a connection pool. Make a [`Fetch`] around a
+//! [`FetchClient`], such as the `Context` of `silk.http.fetch_native`. Then call one function for
+//! each request.
+//!
+//! # Details
+//! There are three destinations:
+//! - `toSink*` gives the body to a [`Sink`] in chunks, in order.
+//! - `collect*` reads the whole body into memory, up to `maxBodyBytes`, and returns it only if it
+//!   is complete.
+//! - `discard*` reads and checks the body, and keeps nothing.
+//!
+//! The suffix tells what the request body is:
+//! - `Empty`: no body.
+//! - `Bytes`: a byte slice. It is sent again after a redirect that keeps the body.
+//! - `OneShot`: a `BodyProducer` that can run only one time. A redirect that must send the body
+//!   again fails with `ReplayUnavailable`.
+//! - `Replay`: a factory that makes a new producer for each attempt.
+//!
+//! [`FetchOptions`] sets redirects, content decoding, the pool, the proxy, one deadline for the
+//! whole operation, and all limits. `silk.http.redirect` applies the redirect rules, and
+//! `silk.http.content` decodes the content.
+//!
+//! # Errors
+//! - [`FetchError`] tells the phase and the reason, with the status and the URI when they are
+//!   known, and how many body bytes the destination got.
+//! - `RedirectError`, `ExchangeError`, `ValueError`, and `BodyError` from the lower modules.
+//! - [`DestinationFailure`] when your [`Sink`] fails.
+//! - `OutOfMemoryError` if the `Allocator` fails.
+//!
+//! # Gotchas
+//! The deadline is not renewed between redirects or phases. The default [`FetchOptions`] do not
+//! follow redirects and do not decode content. Set `redirect` and `content` to change that.
+//!
+//! @category HTTP
+
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.io.buffered_input {BufferError}
+import silk.io.byte_duplex {ByteDuplex}
+import silk.collections.bytes {Bytes}
+import silk.core.effect {Effect}
+import silk.format {Debug, Format, Formatter}
+import silk.http.message {Header, Method, OwnedResponseHead, ResponseHead, Status, ValueError, Version}
+import silk.http.body {BodyError, OwnedTrailers, Trailers}
+import silk.http.exchange as Client
+import silk.http.exchange {
+  ExchangeError,
+  ContinuePolicy,
+  Exchange,
+  ExchangePhase,
+  Limits as ClientLimits,
+  RouteTransport,
+}
+import silk.http.content as Content
+import silk.http.content {
+  AppliedPlan,
+  CodingPosition,
+  ContentError,
+  ContentLimitKind,
+  Limits as ContentLimits,
+  Mode as ContentMode,
+  ContentProgressState,
+  ContentReason,
+}
+import silk.http.headers {Headers, Limits as HeaderLimits}
+import silk.http.head {ResponseHead as ParsedResponseHead}
+import silk.http.redirect as Redirect
+import silk.http.redirect {
+  AttemptRequest,
+  BodyProducer,
+  HybridAttempt,
+  HybridAttemptClient,
+  HybridResponseHandler,
+  Policy as RedirectPolicy,
+  RedirectError,
+  ReplayFactory,
+}
+import silk.http.request {HeaderPolicy}
+import silk.http.transport {HttpTransport}
+import silk.compress.inflate {DecodeError, Limits as InflateLimits, MEMORY_BOUND as INFLATE_MEMORY_BOUND}
+import silk.system.monotonic_clock {MonotonicClock}
+import silk.option {Option}
+import silk.system.random {Random}
+import silk.core.result {Result}
+import silk.collections.slice {Slice}
+import silk.text.string {String}
+import silk.system.system_clock {Instant, SystemClock}
+import silk.num.u64
+import silk.uri.uri {OwnedUri, Uri}
+import silk.num.usize
+import silk.io.writer {Writer, WriterError}
+import silk.compress.zstd {ZstdError, ZstdLimits}
+
+/// Whether a connection can come from a pool.
+pub enum PoolMode {
+  /// Use the pool of the client when it has one. Otherwise open a new connection.
+  UseContextPool,
+  /// Always open a new connection, and never put it in a pool.
+  Fresh,
+}
+
+/// Whether the request uses the proxy policy of the client.
+pub enum ProxyMode {
+  /// Use the proxy policy of the client. The route is selected again for each redirect.
+  InheritContext,
+  /// Connect directly to the origin, without a proxy. Environment variables are not read.
+  Direct,
+}
+
+/// The phase of a fetch in which an error occurred.
+pub enum FetchPhase {
+  /// Checking or copying the URI.
+  Uri,
+  /// Selecting the route for an origin.
+  Route,
+  /// Getting a connection: the pool, name lookup, the connect, or TLS.
+  Connect,
+  /// Preparing or sending the request.
+  Request,
+  /// Applying the redirect rules.
+  Redirect,
+  /// Reading or copying the final response head.
+  Head,
+  /// Decoding the content, the framing, or the trailers.
+  Decode,
+  /// Giving the body to the sink, the collection, or the discard.
+  Destination,
+  /// Completing the response and deciding if the connection can be used again.
+  Finish,
+}
+
+impl Debug for FetchPhase {
+  /// Writes the name of the variant, such as `Uri`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      FetchPhase.Uri => run Format.write(&mut formatter, b"Uri")
+      FetchPhase.Route => run Format.write(&mut formatter, b"Route")
+      FetchPhase.Connect => run Format.write(&mut formatter, b"Connect")
+      FetchPhase.Request => run Format.write(&mut formatter, b"Request")
+      FetchPhase.Redirect => run Format.write(&mut formatter, b"Redirect")
+      FetchPhase.Head => run Format.write(&mut formatter, b"Head")
+      FetchPhase.Decode => run Format.write(&mut formatter, b"Decode")
+      FetchPhase.Destination => run Format.write(&mut formatter, b"Destination")
+      FetchPhase.Finish => run Format.write(&mut formatter, b"Finish")
+    }
+  }
+}
+
+/// The fetch limit that was exceeded. See [`FetchReason.LimitExceeded`].
+pub enum FetchLimit {
+  /// `maxEncodedBodyBytes`: the body bytes before decoding.
+  EncodedBodyBytes,
+  /// `maxDeliveredBodyBytes`: the body bytes given to the destination.
+  DeliveredBodyBytes,
+  /// `maxOwnedMetadataBytes`: the copies of the URI, the head, and the trailers.
+  OwnedMetadataBytes,
+  /// `maxBufferedBytes`: the read buffer.
+  BufferedBytes,
+  /// The `maxBodyBytes` of a `collect*` function.
+  CollectionBytes,
+  /// The `maxDiscardBytes` of a `discard*` function.
+  DiscardBytes,
+}
+
+impl Debug for FetchLimit {
+  /// Writes the name of the variant, such as `EncodedBodyBytes`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      FetchLimit.EncodedBodyBytes => run Format.write(&mut formatter, b"EncodedBodyBytes")
+      FetchLimit.DeliveredBodyBytes => run Format.write(&mut formatter, b"DeliveredBodyBytes")
+      FetchLimit.OwnedMetadataBytes => run Format.write(&mut formatter, b"OwnedMetadataBytes")
+      FetchLimit.BufferedBytes => run Format.write(&mut formatter, b"BufferedBytes")
+      FetchLimit.CollectionBytes => run Format.write(&mut formatter, b"CollectionBytes")
+      FetchLimit.DiscardBytes => run Format.write(&mut formatter, b"DiscardBytes")
+    }
+  }
+}
+
+/// The reason that content decoding failed. It is a copy of the `silk.http.content` error that does
+/// not borrow the response.
+pub union FetchContentReason {
+  /// A content limit is not valid, or a byte count exceeded it.
+  InvalidLimit {
+    /// The limit.
+    pub limit: ContentLimitKind,
+    /// The value of the limit.
+    pub allowed: u64,
+    /// The value that was found.
+    pub attempted: u64,
+  },
+  /// An item in `Content-Encoding` is empty or not valid.
+  CodingSyntax {
+    /// Where the item is.
+    pub position: CodingPosition,
+  },
+  /// A content coding has no decoder, for example `br`.
+  UnsupportedCoding {
+    /// Where the coding is.
+    pub position: CodingPosition,
+    /// A copy of the coding name.
+    pub token: Bytes,
+  },
+  /// A 206 partial response has a coding other than `identity`, which cannot be decoded.
+  PartialResponse {
+    /// The first coding that is not `identity`.
+    pub position: CodingPosition,
+  },
+  /// The response body is a tunnel, not content.
+  Tunnel,
+  /// The body framing failed.
+  Body {
+    /// The error from `silk.http.body`.
+    pub error: BodyError,
+  },
+  /// Reading from the transport failed.
+  Buffer {
+    /// The error, with its transport cause.
+    pub error: BufferError,
+  },
+  /// Gzip or zlib decoding failed.
+  Inflate {
+    /// The decoding stage, from 0, counted from the last coding.
+    pub stage: usize,
+    /// The position of the coding in `Content-Encoding`, from 0.
+    pub wireIndex: usize,
+    /// The error from `silk.compress.inflate`.
+    pub error: DecodeError,
+  },
+  /// Zstandard decoding failed.
+  Zstandard {
+    /// The decoding stage, from 0, counted from the last coding.
+    pub stage: usize,
+    /// The position of the coding in `Content-Encoding`, from 0.
+    pub wireIndex: usize,
+    /// The error from `silk.compress.zstd`.
+    pub error: ZstdError,
+  },
+  /// There were more bytes after the end of a compressed stream.
+  TrailingEncodedData {
+    /// The decoding stage, from 0, counted from the last coding.
+    pub stage: usize,
+    /// The position of the coding in `Content-Encoding`, from 0.
+    pub wireIndex: usize,
+  },
+  /// A byte count overflowed.
+  ArithmeticOverflow,
+  /// The content reader had already failed or stopped.
+  InvalidState,
+}
+
+impl Debug for FetchContentReason {
+  /// Writes the name of the variant and its fields, such as `InvalidLimit { ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      FetchContentReason.InvalidLimit { limit, allowed, attempted } => {
+        let mut record = run Format.debugRecord("InvalidLimit", &mut formatter)
+        run Format.debugField(&mut record, "limit", &limit, &mut formatter)
+        run Format.debugField(&mut record, "allowed", &allowed, &mut formatter)
+        run Format.debugField(&mut record, "attempted", &attempted, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      FetchContentReason.CodingSyntax { position } => {
+        let mut record = run Format.debugRecord("CodingSyntax", &mut formatter)
+        run Format.debugField(&mut record, "position", &position, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      FetchContentReason.UnsupportedCoding { position, token } => {
+        let mut record = run Format.debugRecord("UnsupportedCoding", &mut formatter)
+        run Format.debugField(&mut record, "position", &position, &mut formatter)
+        run Format.debugField(&mut record, "token", &token, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      FetchContentReason.PartialResponse { position } => {
+        let mut record = run Format.debugRecord("PartialResponse", &mut formatter)
+        run Format.debugField(&mut record, "position", &position, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      FetchContentReason.Tunnel => run Format.write(&mut formatter, b"Tunnel")
+      FetchContentReason.Body { error } => {
+        let mut record = run Format.debugRecord("Body", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      FetchContentReason.Buffer { error } => {
+        let mut record = run Format.debugRecord("Buffer", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      FetchContentReason.Inflate { stage, wireIndex, error } => {
+        let mut record = run Format.debugRecord("Inflate", &mut formatter)
+        run Format.debugField(&mut record, "stage", &stage, &mut formatter)
+        run Format.debugField(&mut record, "wireIndex", &wireIndex, &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      FetchContentReason.Zstandard { stage, wireIndex, error } => {
+        let mut record = run Format.debugRecord("Zstandard", &mut formatter)
+        run Format.debugField(&mut record, "stage", &stage, &mut formatter)
+        run Format.debugField(&mut record, "wireIndex", &wireIndex, &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      FetchContentReason.TrailingEncodedData { stage, wireIndex } => {
+        let mut record = run Format.debugRecord("TrailingEncodedData", &mut formatter)
+        run Format.debugField(&mut record, "stage", &stage, &mut formatter)
+        run Format.debugField(&mut record, "wireIndex", &wireIndex, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      FetchContentReason.ArithmeticOverflow => run Format.write(&mut formatter, b"ArithmeticOverflow")
+      FetchContentReason.InvalidState => run Format.write(&mut formatter, b"InvalidState")
+    }
+  }
+}
+
+/// A content decoding error, with byte counts. It owns its data.
+pub struct FetchContentError {
+  /// The reason.
+  pub reason: FetchContentReason,
+  /// The bytes written to the current output chunk.
+  pub written: usize,
+  /// The total encoded bytes read.
+  pub totalEncoded: u64,
+  /// The total bytes from decoding stages before the last one.
+  pub totalIntermediate: u64,
+  /// The total decoded bytes.
+  pub totalDecoded: u64,
+}
+
+impl Debug for FetchContentError {
+  /// Writes the fields, as `FetchContentError { reason: ..., written: ..., ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return run Format.debugFields(self, "FetchContentError", &mut formatter)
+  }
+}
+
+/// The reason of a [`FetchError`].
+pub union FetchReason {
+  /// The [`FetchOptions`] are not valid. See [`FetchOptions.validate`].
+  InvalidOptions,
+  /// The client rejected the HTTP limits in the options.
+  InvalidHttpOptions {
+    /// The error from the client.
+    pub error: ExchangeError,
+  },
+  /// Copying an HTTP value failed.
+  HttpValue {
+    /// The error from `silk.http.message`.
+    pub error: ValueError,
+  },
+  /// The body or the trailers of the final response are not valid.
+  HttpBody {
+    /// The error from `silk.http.body`.
+    pub error: BodyError,
+  },
+  /// The exchange failed while the body of the final response was read.
+  HttpClient {
+    /// The error from `silk.http.exchange`.
+    pub error: ExchangeError,
+  },
+  /// A byte count overflowed.
+  SizeOverflow,
+  /// Your sink rejected a chunk.
+  DestinationRejected,
+  /// Content decoding failed.
+  Content {
+    /// The content error.
+    pub error: FetchContentError,
+  },
+  /// A limit in [`FetchOptions`] or in the call was exceeded.
+  LimitExceeded {
+    /// The limit.
+    pub limit: FetchLimit,
+    /// The value of the limit.
+    pub allowed: u64,
+    /// The value that was found.
+    pub attempted: u64,
+  },
+  /// The final response is 101 Switching Protocols, or a 2xx for `CONNECT`. Fetch cannot use the
+  /// connection after such a response.
+  UnsupportedSwitchingResponse {
+    /// The status of the response.
+    pub status: Status,
+  },
+}
+
+impl Debug for FetchReason {
+  /// Writes the name of the variant and its fields, such as `InvalidOptions`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      FetchReason.InvalidOptions => run Format.write(&mut formatter, b"InvalidOptions")
+      FetchReason.InvalidHttpOptions { error } => {
+        let mut record = run Format.debugRecord("InvalidHttpOptions", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      FetchReason.HttpValue { error } => {
+        let mut record = run Format.debugRecord("HttpValue", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      FetchReason.HttpBody { error } => {
+        let mut record = run Format.debugRecord("HttpBody", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      FetchReason.HttpClient { error } => {
+        let mut record = run Format.debugRecord("HttpClient", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      FetchReason.SizeOverflow => run Format.write(&mut formatter, b"SizeOverflow")
+      FetchReason.DestinationRejected => run Format.write(&mut formatter, b"DestinationRejected")
+      FetchReason.Content { error } => {
+        let mut record = run Format.debugRecord("Content", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      FetchReason.LimitExceeded { limit, allowed, attempted } => {
+        let mut record = run Format.debugRecord("LimitExceeded", &mut formatter)
+        run Format.debugField(&mut record, "limit", &limit, &mut formatter)
+        run Format.debugField(&mut record, "allowed", &allowed, &mut formatter)
+        run Format.debugField(&mut record, "attempted", &attempted, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      FetchReason.UnsupportedSwitchingResponse { status } => {
+        let mut record = run Format.debugRecord("UnsupportedSwitchingResponse", &mut formatter)
+        run Format.debugField(&mut record, "status", &status, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+    }
+  }
+}
+
+/// The error from a fetch, with context. It owns its data.
+///
+/// # Details
+///
+/// It tells the phase and the reason, with the status and the URI when they are known, and how
+/// many body bytes the destination got.
+pub struct FetchError {
+  /// The phase in which the error occurred.
+  pub phase: FetchPhase,
+  /// The reason.
+  pub reason: FetchReason,
+  /// The status of the final response, when it is known.
+  pub status: Option<Status>,
+  /// A copy of the current URI, when it is known.
+  pub uri: Option<OwnedUri>,
+  /// The body bytes that the destination accepted before the error.
+  pub deliveredBodyBytes: u64,
+  /// The length of the chunk that the destination rejected, or 0.
+  pub offeredBodyBytes: usize,
+}
+
+impl Debug for FetchError {
+  /// Writes the fields, as `FetchError { phase: ..., reason: ..., ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return run Format.debugFields(self, "FetchError", &mut formatter)
+  }
+}
+
+/// The error from your [`Sink`], with the context of the fetch.
+pub struct DestinationFailure<E> {
+  /// The error from your sink.
+  pub error: E,
+  /// The context: the phase, the status, the URI, and the bytes delivered before the error.
+  pub context: FetchError,
+}
+
+impl<E: Debug> Debug for DestinationFailure<E> {
+  /// Writes the fields, as `DestinationFailure { error: ..., context: ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return run Format.debugFields(self, "DestinationFailure", &mut formatter)
+  }
+}
+
+/// How the content of the response was decoded.
+pub struct RepresentationMetadata {
+  /// The decoding plan that was used: raw, or which codings were decoded.
+  pub applied: AppliedPlan,
+  /// `true` when the framing and all decoding completed.
+  pub completed: bool,
+  /// The number of body bytes delivered, after completion.
+  pub deliveredBytes: Option<u64>,
+}
+
+/// The head of the final response, and how its content is decoded. Your sink gets it with each
+/// chunk.
+pub struct ResponseMetadata {
+  /// The URI of the final response, after redirects.
+  pub finalUri: OwnedUri,
+  /// The status, the reason, and the headers of the final response, as received.
+  pub head: OwnedResponseHead,
+  /// How the content is decoded. The headers are not changed by decoding.
+  pub representation: RepresentationMetadata,
+  /// The memory of the URI and head copies, in bytes.
+  pub ownedBytes: usize,
+}
+
+/// The result of a complete response, without the body.
+pub struct FetchResult {
+  /// The final URI and head.
+  pub metadata: ResponseMetadata,
+  /// The trailers of a chunked response, if any.
+  pub trailers: Option<OwnedTrailers>,
+  /// The number of redirects that were followed.
+  pub redirectCount: usize,
+  /// The body bytes before decoding.
+  pub encodedBodyBytes: u64,
+  /// The body bytes that the destination accepted.
+  pub deliveredBodyBytes: u64,
+  /// The memory of the URI, head, and trailer copies, in bytes.
+  pub ownedMetadataBytes: usize,
+}
+
+/// The result of a `collect*` function: the response and its whole body.
+pub struct CollectedResponse {
+  /// The response without the body.
+  pub result: FetchResult,
+  /// The whole body, decoded as selected in the options.
+  pub body: Bytes,
+}
+
+union RequestHeaders<'headers> {
+  Empty,
+  Borrowed {headers: Headers<'headers>},
+}
+
+/// The method, URI, headers, and header policy of a request. The body comes from the function that
+/// you call.
+pub struct FetchRequest<'uri, 'method, 'headers, 'policy> {
+  uriValue: Uri<'uri>,
+  methodValue: Method<'method>,
+  headersValue: RequestHeaders<'headers>,
+  headerPolicyValue: HeaderPolicy<'policy>,
+  versionValue: Version,
+  continuePolicyValue: ContinuePolicy,
+  limitsValue: HeaderLimits,
+  maxHeadBytesValue: usize,
+  maxCredentialBytesValue: usize,
+}
+
+impl<'uri, 'method, 'headers, 'policy> FetchRequest<'uri, 'method, 'headers, 'policy> {
+  /// Returns a request. `continuePolicy` selects `Expect: 100-continue`. The limits apply to the
+  /// head that is sent. See `prepare` in `silk.http.request`.
+  pub fn make(
+    uri: Uri<'uri>,
+    method: Method<'method>,
+    headers: Headers<'headers>,
+    headerPolicy: HeaderPolicy<'policy>,
+    version: Version,
+    continuePolicy: ContinuePolicy,
+    limits: HeaderLimits,
+    maxHeadBytes: usize,
+    maxCredentialBytes: usize,
+  ) -> Self {
+    return FetchRequest<'uri, 'method, 'headers, 'policy> {
+      uriValue: uri,
+      methodValue: method,
+      headersValue: RequestHeaders<'headers>.Borrowed {headers: headers},
+      headerPolicyValue: headerPolicy,
+      versionValue: version,
+      continuePolicyValue: move continuePolicy,
+      limitsValue: limits,
+      maxHeadBytesValue: maxHeadBytes,
+      maxCredentialBytesValue: maxCredentialBytes,
+    }
+  }
+  /// Returns a GET request for `uri`, with no headers, the default header policy, and the default
+  /// limits.
+  pub fn get(uri: Uri<'uri>) -> Self {
+    let limits = ClientLimits.defaults().head.values
+    return FetchRequest<'uri, 'method, 'headers, 'policy> {
+      uriValue: uri,
+      methodValue: Method.get(),
+      headersValue: RequestHeaders<'headers>.Empty,
+      headerPolicyValue: HeaderPolicy<'policy>.defaults(),
+      versionValue: Version.Http11,
+      continuePolicyValue: ContinuePolicy.Disabled,
+      limitsValue: limits,
+      maxHeadBytesValue: 65536,
+      maxCredentialBytesValue: 8192,
+    }
+  }
+}
+
+/// The settings of a fetch: redirects, content decoding, the pool, the proxy, one deadline for the
+/// whole operation, and all limits. Start from [`FetchOptions.defaults`].
+///
+/// # Gotchas
+///
+/// The deadline is not renewed between redirects or phases. The defaults do not follow redirects
+/// and do not decode content. Set `redirect` and `content` to change that.
+pub struct FetchOptions {
+  /// Whether and how to follow redirects. See `silk.http.redirect`.
+  pub redirect: RedirectPolicy,
+  /// Whether to give the body raw or decoded. See `silk.http.content`.
+  pub content: ContentMode,
+  /// Whether a connection can come from a pool.
+  pub pool: PoolMode,
+  /// Whether to use the proxy policy of the client.
+  pub proxy: ProxyMode,
+  /// One deadline on the `MonotonicClock` for the whole operation, including all redirects.
+  pub deadline: Option<Instant>,
+  /// The limits for the HTTP exchange: heads, framing, trailers, and buffers.
+  pub http: ClientLimits,
+  /// The limits for content decoding.
+  pub contentLimits: ContentLimits,
+  /// The maximum body bytes before decoding.
+  pub maxEncodedBodyBytes: u64,
+  /// The maximum body bytes that any destination gets.
+  pub maxDeliveredBodyBytes: u64,
+  /// The maximum memory for the copies of the URI, the head, and the trailers.
+  pub maxOwnedMetadataBytes: usize,
+  /// The size of the read buffer for the body. It must not be 0.
+  pub maxBufferedBytes: usize,
+}
+
+impl FetchOptions {
+  /// Returns options that do not follow redirects, do not decode content, use the pool and proxy
+  /// policy of the client, have no deadline, and allow bodies of 16 MiB.
+  pub fn defaults() -> FetchOptions {
+    let maxBody = u64.toU64(16777216)
+    return FetchOptions {
+      redirect: RedirectPolicy.defaults(),
+      content: ContentMode.Raw,
+      pool: PoolMode.UseContextPool,
+      proxy: ProxyMode.InheritContext,
+      deadline: Option<Instant>.none(),
+      http: ClientLimits.defaults(),
+      contentLimits: ContentLimits {
+        maxEncoded: maxBody,
+        maxIntermediate: maxBody,
+        maxDecoded: maxBody,
+        maxOwned: 2097152,
+        maxDepth: 4,
+        intermediateCapacity: 16384,
+        inflate: InflateLimits {
+          maxInputBytes: maxBody,
+          maxOutputBytes: maxBody,
+          maxMembers: 1024,
+          maxHeaderBytes: 65536,
+          maxMemoryBytes: INFLATE_MEMORY_BOUND,
+        },
+        zstd: ZstdLimits.make(),
+      },
+      maxEncodedBodyBytes: maxBody,
+      maxDeliveredBodyBytes: maxBody,
+      maxOwnedMetadataBytes: 278528,
+      maxBufferedBytes: 16384,
+    }
+  }
+  /// Checks that the options are consistent. It does not allocate or connect. Each fetch function
+  /// calls it first.
+  pub fn validate(self: &Self) -> Result<(), FetchError> {
+    if self.maxBufferedBytes == usize.ZERO {
+      return Result<(), FetchError>.failResult(
+        fetchFailure(FetchPhase.Destination, FetchReason.InvalidOptions),
+      )
+    }
+    if let Result<(), ExchangeError>.Failure {error} = move Client.validateLimits(&self.http) {
+      let phase = match & error {
+        ExchangeError.Head {error: _} => FetchPhase.Head
+        _ => FetchPhase.Connect
+      }
+      return Result<(), FetchError>.failResult(
+        fetchFailure(phase, FetchReason.InvalidHttpOptions {error: move error}),
+      )
+    }
+    if let Result<(), ContentError<'static>>.Failure {error} = move Content.validateLimits(
+      &self.contentLimits,
+    ) {
+      return Result<(), FetchError>.failResult(contentOptionFailure(move error))
+    }
+    return Result<(), FetchError>.succeed(())
+  }
+}
+
+/// A fetch client around a [`FetchClient`]. Make it with [`Fetch.make`], and pass it to the fetch
+/// functions.
+///
+/// # When to use
+///
+/// Use it when you need more control than `silk.http.client`: a sink for a large body, a body that
+/// you stream, content decoding, a proxy, or a connection pool. Use the `Context` of
+/// `silk.http.fetch_native` as the client.
+///
+/// # Details
+///
+/// Each fetch function sends one request, follows redirects, decodes the content, and delivers the
+/// body. The prefix of the function name tells the destination: `toSink*` gives the body to a
+/// [`Sink`] in chunks, in order; `collect*` reads the whole body into memory, up to
+/// `maxBodyBytes`, and returns it only if it is complete; `discard*` reads and checks the body and
+/// keeps nothing. The suffix tells the request body: `Empty`; `Bytes`, sent again after a redirect
+/// that keeps the body; `OneShot`, a producer that runs one time, so a redirect that must send the
+/// body again fails with `ReplayUnavailable`; or `Replay`, a factory that makes a new producer for
+/// each attempt.
+///
+/// # Gotchas
+///
+/// The deadline is not renewed between redirects or phases. The default [`FetchOptions`] do not
+/// follow redirects and do not decode content.
+pub struct Fetch<C> {
+  client: C,
+}
+
+impl<C> Fetch<C> {
+  /// Returns a fetch client that uses `client` to get connections.
+  pub fn make(client: C) -> Fetch<C> {
+    return Fetch<C> {client: move client}
+  }
+}
+
+/// A destination for the body chunks of a `toSink*` function. The chunks arrive in order. A
+/// failure of the sink becomes a [`DestinationFailure`].
+pub interface Sink<E, ?R> {
+  /// Accepts one chunk of the body.
+  ///
+  /// # Details
+  /// `metadata` is the final response head. `deadline` is the deadline of the whole fetch, or
+  /// `None`. The fetch reads no more body until this call returns. The chunk and the metadata are
+  /// only borrowed for this call.
+  effect<'call> fn write<'call>(
+    sink: &mut Self,
+    metadata: &'call ResponseMetadata,
+    chunk: &'call [u8],
+    deadline: &'call Option<Instant>,
+  ) -> () ! E ? R
+}
+
+/// Gets a connection and runs one attempt of a request. A fetch calls it again for each redirect.
+///
+/// # Details
+/// An implementation checks the options before it connects, and selects the route for the current
+/// URI. With `Fresh`, it does not use a pool. With `Direct`, it does not use a proxy policy.
+/// `deadline` is the deadline of the whole fetch.
+pub interface FetchClient<
+  'policy,
+  RoutedP,
+  DirectP,
+  A,
+  HandlerError,
+  AcquisitionError,
+  ?HandlerRequirements,
+  ?AcquisitionRequirements,
+> {
+  /// Connects and runs one attempt of `request` with these limits and modes.
+  effect fn withAttempt(
+    client: &mut Self,
+    request: AttemptRequest<'policy>,
+    httpLimits: ClientLimits,
+    poolMode: PoolMode,
+    proxyMode: ProxyMode,
+    deadline: Option<Instant>,
+  ) -> A ! HandlerError | AcquisitionError ? HandlerRequirements | AcquisitionRequirements | &mut HybridAttempt<'policy, RoutedP, DirectP, A, HandlerError ? HandlerRequirements> where
+    HandlerRequirements in Without<HandlerRequirements, ByteDuplex>,
+    HandlerRequirements in Without<HandlerRequirements, HttpTransport>
+}
+
+interface Destination<A, E, ?R> {
+  effect<'call> fn accept<'call>(
+    destination: &mut Self,
+    metadata: &'call ResponseMetadata,
+    chunk: &'call [u8],
+    deadline: &'call Option<Instant>,
+    deliveredBefore: u64,
+  ) -> () ! E ? R
+  fn publish(destination: Self, result: FetchResult) -> A
+}
+
+struct SinkDestination<SinkError, ?SinkRequirements, S> {
+  sink: S,
+}
+
+struct FetchAttemptAdapter<
+  'client,
+  'policy,
+  RoutedP,
+  DirectP,
+  A,
+  HandlerError,
+  AcquisitionError,
+  ?HandlerRequirements,
+  ?AcquisitionRequirements,
+  C,
+> {
+  client: &'client mut C,
+  httpLimits: ClientLimits,
+  poolMode: PoolMode,
+  proxyMode: ProxyMode,
+}
+
+impl<
+  'client,
+  'policy,
+  RoutedP,
+  DirectP,
+  A,
+  HandlerError,
+  AcquisitionError,
+  ?HandlerRequirements,
+  ?AcquisitionRequirements,
+  C: FetchClient<
+    'policy,
+    RoutedP,
+    DirectP,
+    A,
+    HandlerError,
+    AcquisitionError,
+    HandlerRequirements,
+    AcquisitionRequirements,
+  >,
+> HybridAttemptClient<
+  'policy,
+  RoutedP,
+  DirectP,
+  A,
+  HandlerError,
+  AcquisitionError,
+  AcquisitionRequirements,
+  HandlerRequirements,
+> for FetchAttemptAdapter<
+  'client,
+  'policy,
+  RoutedP,
+  DirectP,
+  A,
+  HandlerError,
+  AcquisitionError,
+  HandlerRequirements,
+  AcquisitionRequirements,
+  C,
+> {
+  effect fn withAttempt(
+    self: &mut Self,
+    request: AttemptRequest<'policy>,
+    deadline: Option<Instant>,
+  ) -> A
+  ! HandlerError | AcquisitionError
+  ? HandlerRequirements | AcquisitionRequirements | &mut HybridAttempt<'policy, RoutedP, DirectP, A, HandlerError ? HandlerRequirements>
+  where
+    HandlerRequirements in Without<HandlerRequirements, ByteDuplex>,
+    HandlerRequirements in Without<HandlerRequirements, HttpTransport> {
+    let httpLimits = self.httpLimits
+    let poolMode = self.poolMode
+    let proxyMode = self.proxyMode
+    let client = &mut self.client.*
+    return run FetchClient<
+      'policy,
+      RoutedP,
+      DirectP,
+      A,
+      HandlerError,
+      AcquisitionError,
+      HandlerRequirements,
+      AcquisitionRequirements,
+    >.withAttempt(&mut client, move request, httpLimits, poolMode, proxyMode, move deadline)
+  }
+}
+
+impl<SinkError: Intrinsic.Detached, ?SinkRequirements, S: Sink<SinkError ? SinkRequirements>> Destination<
+  FetchResult,
+  DestinationFailure<SinkError>,
+  SinkRequirements,
+> for SinkDestination<SinkError, SinkRequirements, S> {
+  effect<'call> fn accept<'call>(
+    self: &mut Self,
+    metadata: &'call ResponseMetadata,
+    chunk: &'call [u8],
+    deadline: &'call Option<Instant>,
+    deliveredBefore: u64,
+  ) -> () ! DestinationFailure<SinkError> ? SinkRequirements {
+    let attempted = run Effect.result(
+      Sink<SinkError ? SinkRequirements>.write(&mut self.sink, metadata, chunk, deadline),
+    )
+    return match move attempted {
+      Result.Success {value} => move value
+      Result.Failure {error} => {
+        let context = metadataFailure(
+          FetchPhase.Destination,
+          FetchReason.DestinationRejected,
+          metadata,
+          deliveredBefore,
+          chunk.length,
+        )
+        fail DestinationFailure<SinkError> {error: move error, context: move context}
+      }
+    }
+  }
+  fn publish(self: Self, result: FetchResult) -> FetchResult {
+    drop self
+    return move result
+  }
+}
+
+struct CollectDestination {
+  body: Bytes,
+  maximum: usize,
+}
+
+impl CollectDestination {
+  effect<'call> fn accept<'call>(
+    self: &mut Self,
+    metadata: &'call ResponseMetadata,
+    chunk: &'call [u8],
+    deadline: &'call Option<Instant>,
+    deliveredBefore: u64,
+  ) -> () ! FetchError | OutOfMemoryError ? &mut Allocator {
+    drop deadline
+    let attempted = match move usize.checkedAdd(Bytes.length(&self.body), chunk.length) {
+      Option.None => {
+        fail metadataFailure(
+          FetchPhase.Destination,
+          FetchReason.SizeOverflow,
+          metadata,
+          deliveredBefore,
+          chunk.length,
+        )
+      }
+      Option.Some {value} => value
+    }
+    if attempted > self.maximum {
+      fail metadataFailure(
+        FetchPhase.Destination,
+        FetchReason.LimitExceeded {
+          limit: FetchLimit.CollectionBytes,
+          allowed: usize.toU64(self.maximum),
+          attempted: usize.toU64(attempted),
+        },
+        metadata,
+        deliveredBefore,
+        chunk.length,
+      )
+    }
+    return run Bytes.append(&mut self.body, chunk)
+  }
+  fn publish(self: Self, result: FetchResult) -> CollectedResponse {
+    return CollectedResponse {result: move result, body: move self.body}
+  }
+}
+
+impl Destination<CollectedResponse, FetchError | OutOfMemoryError, &mut Allocator> for CollectDestination {
+  accept: CollectDestination.accept
+  publish: CollectDestination.publish
+}
+
+struct DiscardDestination {
+  maximum: u64,
+}
+
+impl DiscardDestination {
+  effect<'call> fn accept<'call>(
+    self: &mut Self,
+    metadata: &'call ResponseMetadata,
+    chunk: &'call [u8],
+    deadline: &'call Option<Instant>,
+    deliveredBefore: u64,
+  ) -> () ! FetchError {
+    drop deadline
+    let attempted = match move u64.checkedAdd(deliveredBefore, usize.toU64(chunk.length)) {
+      Option.None => {
+        fail metadataFailure(
+          FetchPhase.Destination,
+          FetchReason.SizeOverflow,
+          metadata,
+          deliveredBefore,
+          chunk.length,
+        )
+      }
+      Option.Some {value} => value
+    }
+    if attempted > self.maximum {
+      fail metadataFailure(
+        FetchPhase.Destination,
+        FetchReason.LimitExceeded {
+          limit: FetchLimit.DiscardBytes,
+          allowed: self.maximum,
+          attempted: attempted,
+        },
+        metadata,
+        deliveredBefore,
+        chunk.length,
+      )
+    }
+    return ()
+  }
+  fn publish(self: Self, result: FetchResult) -> FetchResult {
+    drop self
+    return move result
+  }
+}
+
+impl Destination<FetchResult, FetchError, never> for DiscardDestination {
+  accept: DiscardDestination.accept
+  publish: DiscardDestination.publish
+}
+
+interface SemanticRequestHandler<'policy, RoutedP, DirectP, A, E, ?R> {
+  effect<'call> fn handle<'call>(
+    handler: Self,
+    request: Redirect.Request<'call, 'call, 'call, 'policy>,
+  ) -> A ! E ? R where
+    &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+    &mut RoutedP provides &HttpTransport from &mut HttpTransport,
+    &mut RoutedP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random,
+    &mut RoutedP provides &ByteDuplex from &mut ByteDuplex,
+    &mut DirectP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+    &mut DirectP provides &HttpTransport from &mut HttpTransport
+}
+
+fn redirectRequest<'call, 'policy>(
+  uri: Uri<'call>,
+  method: Method<'call>,
+  headers: Headers<'call>,
+  headerPolicy: HeaderPolicy<'policy>,
+  version: Version,
+  continuePolicy: ContinuePolicy,
+  limits: HeaderLimits,
+  maxHeadBytes: usize,
+  maxCredentialBytes: usize,
+) -> Redirect.Request<'call, 'call, 'call, 'policy> {
+  return Redirect.Request<'call, 'call, 'call, 'policy> {
+    uri: uri,
+    method: method,
+    headers: headers,
+    headerPolicy: headerPolicy,
+    version: version,
+    continuePolicy: move continuePolicy,
+    limits: limits,
+    maxHeadBytes: maxHeadBytes,
+    maxCredentialBytes: maxCredentialBytes,
+  }
+}
+
+effect<'env> fn withSemanticRequest<
+  'uri,
+  'method,
+  'headers,
+  'policy,
+  RoutedP,
+  DirectP,
+  A,
+  E,
+  ?R,
+  H: SemanticRequestHandler<'policy, RoutedP, DirectP, A, E ? R> + 'env,
+  'env,
+>(request: FetchRequest<'uri, 'method, 'headers, 'policy>, handler: H) -> A ! E | ValueError ? R
+where
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport {
+  let FetchRequest<'uri, 'method, 'headers, 'policy> {
+    uriValue,
+    methodValue,
+    headersValue,
+    headerPolicyValue,
+    versionValue,
+    continuePolicyValue,
+    limitsValue,
+    maxHeadBytesValue,
+    maxCredentialBytesValue,
+  } = move request
+  return match move headersValue {
+    RequestHeaders.Empty => {
+      let empty: [Header<'static>; 0] = []
+      let headers = match move Headers.make(&empty, limitsValue) {
+        Result.Failure {error} => {
+          fail move error
+        }
+        Result.Success {value} => value
+      }
+      let selected = redirectRequest(
+        uriValue,
+        methodValue,
+        headers,
+        headerPolicyValue,
+        versionValue,
+        copyContinuePolicy(&continuePolicyValue),
+        limitsValue,
+        maxHeadBytesValue,
+        maxCredentialBytesValue,
+      )
+      return run SemanticRequestHandler<'policy, RoutedP, DirectP, A, E ? R>.handle(
+        move handler,
+        move selected,
+      )
+    }
+    RequestHeaders.Borrowed {headers} => {
+      let selected = redirectRequest(
+        uriValue,
+        methodValue,
+        headers,
+        headerPolicyValue,
+        versionValue,
+        move continuePolicyValue,
+        limitsValue,
+        maxHeadBytesValue,
+        maxCredentialBytesValue,
+      )
+      return run SemanticRequestHandler<'policy, RoutedP, DirectP, A, E ? R>.handle(
+        move handler,
+        move selected,
+      )
+    }
+  }
+}
+
+struct HeaderMetadata {
+  uri: OwnedUri,
+  head: OwnedResponseHead,
+  ownedBytes: usize,
+}
+
+effect fn checkedMetadataAdd(phase: FetchPhase, left: usize, right: usize) -> usize ! FetchError {
+  return match move usize.checkedAdd(left, right) {
+    Option.None => {
+      fail fetchFailure(phase, FetchReason.SizeOverflow)
+    }
+    Option.Some {value} => value
+  }
+}
+
+effect fn copyHeaderMetadata<'uri, 'head>(
+  uri: &Uri<'uri>,
+  head: &ParsedResponseHead<'head>,
+  limits: HeaderLimits,
+  maximum: usize,
+) -> HeaderMetadata ! FetchError | ValueError | OutOfMemoryError ? &mut Allocator {
+  let uriBytes = String.byteLength(Uri.format(uri))
+  if uriBytes > maximum {
+    fail limitFailure(
+      FetchPhase.Head,
+      FetchLimit.OwnedMetadataBytes,
+      usize.toU64(maximum),
+      usize.toU64(uriBytes),
+      u64.MIN,
+      usize.ZERO,
+    )
+  }
+  let mut headLimits = limits
+  headLimits.maxOwnedBytes = maximum - uriBytes
+  let copiedHead = match move run head.copy(headLimits) {
+    Result.Failure {error} => {
+      fail move error
+    }
+    Result.Success {value} => move value
+  }
+  let copiedView = OwnedResponseHead.view(&copiedHead)
+  let fields = copiedView.headers()
+  let headerBytes = match move Headers.requiredOwnedBytes(&fields) {
+    Result.Failure {error} => {
+      fail move error
+    }
+    Result.Success {value} => value
+  }
+  let reasonBytes = head.reason().length
+  let withHeaders = run checkedMetadataAdd(FetchPhase.Head, uriBytes, headerBytes)
+  let total = run checkedMetadataAdd(FetchPhase.Head, withHeaders, reasonBytes)
+  if total > maximum {
+    fail limitFailure(
+      FetchPhase.Head,
+      FetchLimit.OwnedMetadataBytes,
+      usize.toU64(maximum),
+      usize.toU64(total),
+      u64.MIN,
+      usize.ZERO,
+    )
+  }
+  let copiedUri = run Uri.copy(uri)
+  return HeaderMetadata {uri: move copiedUri, head: move copiedHead, ownedBytes: total}
+}
+
+effect fn copyFinalTrailers<'trailers>(
+  trailers: Option<Trailers<'trailers>>,
+  limits: HeaderLimits,
+  metadataUsed: usize,
+  metadataMaximum: usize,
+) -> Option<OwnedTrailers> ! FetchError | BodyError | OutOfMemoryError ? &mut Allocator {
+  return match move trailers {
+    Option.None => Option<OwnedTrailers>.none()
+    Option.Some {value} => {
+      let required = match move Trailers.requiredOwnedBytes(&value) {
+        Result.Failure {error} => {
+          fail move error
+        }
+        Result.Success {value: bytes} => bytes
+      }
+      let total = run checkedMetadataAdd(FetchPhase.Decode, metadataUsed, required)
+      if total > metadataMaximum {
+        fail limitFailure(
+          FetchPhase.Decode,
+          FetchLimit.OwnedMetadataBytes,
+          usize.toU64(metadataMaximum),
+          usize.toU64(total),
+          u64.MIN,
+          usize.ZERO,
+        )
+      }
+      let mut trailerLimits = limits
+      trailerLimits.maxOwnedBytes = metadataMaximum - metadataUsed
+      let copied = match move run Trailers.copy(&value, trailerLimits) {
+        Result.Failure {error} => {
+          fail move error
+        }
+        Result.Success {value: owned} => move owned
+      }
+      return Option<OwnedTrailers>.some(move copied)
+    }
+  }
+}
+
+effect fn startContent<'head, 'exchange: 'head, P>(
+  exchange: &'head mut Exchange<'exchange, P>,
+  mode: ContentMode,
+  limits: ContentLimits,
+  metadataUsed: usize,
+  metadataMaximum: usize,
+) -> AppliedPlan ! FetchError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock {
+  return match move run Effect.result(Client.beginContent(move exchange, mode, move limits)) {
+    Result.Success {value} => value
+    Result.Failure {error} => match move error {
+      ExchangeError cause => {
+        fail fetchFailure(FetchPhase.Decode, FetchReason.HttpClient {error: move cause})
+      }
+      OutOfMemoryError cause => {
+        fail move cause
+      }
+      ContentError<'head> cause => {
+        let owned = run ownContentError(move cause, metadataUsed, metadataMaximum)
+        fail fetchFailure(FetchPhase.Decode, FetchReason.Content {error: move owned})
+      }
+    }
+  }
+}
+
+struct DeliveryResponseHandler<RoutedP, DirectP, A, DestinationError, ?DestinationRequirements, D> {
+  destination: Option<D>,
+  content: ContentMode,
+  contentLimits: ContentLimits,
+  responseValueLimits: HeaderLimits,
+  maxEncodedBodyBytes: u64,
+  maxDeliveredBodyBytes: u64,
+  maxOwnedMetadataBytes: usize,
+  maxBufferedBytes: usize,
+  deadline: Option<Instant>,
+}
+
+effect fn deliverResponse<
+  'call,
+  'exchangeView: 'call,
+  P,
+  RoutedP,
+  DirectP,
+  A,
+  DestinationError,
+  ?DestinationRequirements,
+  D: Destination<A, DestinationError ? DestinationRequirements>,
+>(
+  handler: &mut DeliveryResponseHandler<
+    RoutedP,
+    DirectP,
+    A,
+    DestinationError,
+    DestinationRequirements,
+    D,
+  >,
+  uri: Uri<'call>,
+  hop: usize,
+  exchange: &'call mut Exchange<'exchangeView, P>,
+) -> A
+! FetchError | ValueError | BodyError | DestinationError | ExchangeError | OutOfMemoryError
+? DestinationRequirements | &mut Allocator | &mut MonotonicClock | &mut Random
+where
+  &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut P provides &HttpTransport from &mut HttpTransport {
+  let stored = Intrinsic.replace(handler.destination, Option<D>.none())
+  let destination = match move stored {
+    Option.Some {value} => move value
+    Option.None => unavailable<D>()
+  }
+  let content = handler.content
+  let contentLimits = copyContentLimits(&handler.contentLimits)
+  let responseValueLimits = handler.responseValueLimits
+  let maxEncodedBodyBytes = handler.maxEncodedBodyBytes
+  let maxDeliveredBodyBytes = handler.maxDeliveredBodyBytes
+  let maxOwnedMetadataBytes = handler.maxOwnedMetadataBytes
+  let maxBufferedBytes = handler.maxBufferedBytes
+  let deadline = copyDeadline(&handler.deadline)
+  let mut selectedDestination = move destination
+  let head = match move run Effect.result(exchange.head()) {
+    Result.Success {value} => value
+    Result.Failure {error} => {
+      fail fetchFailure(FetchPhase.Head, FetchReason.HttpClient {error: move error})
+    }
+  }
+  let status = head.status()
+  if exchange.phase() == ExchangePhase.Tunnel {
+    fail run borrowedResponseFailure(
+      FetchPhase.Head,
+      FetchReason.UnsupportedSwitchingResponse {status: status},
+      Option<Status>.some(status),
+      &uri,
+      u64.MIN,
+      usize.ZERO,
+    )
+  }
+  let copied = match move run Effect.result(
+    copyHeaderMetadata(&uri, &head, responseValueLimits, maxOwnedMetadataBytes),
+  ) {
+    Result.Success {value} => move value
+    Result.Failure {error} => match move error {
+      FetchError cause => {
+        fail enrichResponseStatus(move cause, status)
+      }
+      ValueError cause => {
+        let contextual = fetchFailure(FetchPhase.Head, FetchReason.HttpValue {error: move cause})
+        fail enrichResponseStatus(move contextual, status)
+      }
+      OutOfMemoryError cause => {
+        fail move cause
+      }
+    }
+  }
+  drop head
+  let mut selectedContentLimits = move contentLimits
+  if maxEncodedBodyBytes < selectedContentLimits.maxEncoded {
+    selectedContentLimits.maxEncoded = maxEncodedBodyBytes
+  }
+  let selected = run Effect.result(
+    startContent(
+      &mut exchange.*,
+      content,
+      move selectedContentLimits,
+      copied.ownedBytes,
+      maxOwnedMetadataBytes,
+    ),
+  )
+  let applied = match move selected {
+    Result.Success {value} => value
+    Result.Failure {error} => match move error {
+      FetchError cause => {
+        fail enrichResponseFailure(move cause, status, move copied.uri, u64.MIN, usize.ZERO)
+      }
+      OutOfMemoryError cause => {
+        fail move cause
+      }
+    }
+  }
+  let metadata = ResponseMetadata {
+    finalUri: move copied.uri,
+    head: move copied.head,
+    representation: RepresentationMetadata {
+      applied: applied,
+      completed: false,
+      deliveredBytes: Option<u64>.none(),
+    },
+    ownedBytes: copied.ownedBytes,
+  }
+  let mut buffer = run Bytes.zeroed(maxBufferedBytes)
+  let mut delivered = u64.MIN
+  let mut encoded = u64.MIN
+  while true {
+    let output = Bytes.asMutSlice(&mut buffer)
+    let progress = match move run Effect.result(Client.readContentSome(&mut exchange.*, move output)) {
+      Result.Success {value} => move value
+      Result.Failure {error} => match move error {
+        ExchangeError cause => {
+          fail ownedMetadataFailure(
+            FetchPhase.Decode,
+            FetchReason.HttpClient {error: move cause},
+            move metadata,
+            delivered,
+            usize.ZERO,
+          )
+        }
+        OutOfMemoryError cause => {
+          fail move cause
+        }
+      }
+    }
+    encoded = progress.totalEncoded
+    if encoded > maxEncodedBodyBytes {
+      fail ownedMetadataFailure(
+        FetchPhase.Decode,
+        FetchReason.LimitExceeded {
+          limit: FetchLimit.EncodedBodyBytes,
+          allowed: maxEncodedBodyBytes,
+          attempted: encoded,
+        },
+        move metadata,
+        delivered,
+        progress.written,
+      )
+    }
+    if progress.written > usize.ZERO {
+      let attempted = match move u64.checkedAdd(delivered, usize.toU64(progress.written)) {
+        Option.None => {
+          fail ownedMetadataFailure(
+            FetchPhase.Destination,
+            FetchReason.SizeOverflow,
+            move metadata,
+            delivered,
+            progress.written,
+          )
+        }
+        Option.Some {value} => value
+      }
+      if attempted > maxDeliveredBodyBytes {
+        fail ownedMetadataFailure(
+          FetchPhase.Destination,
+          FetchReason.LimitExceeded {
+            limit: FetchLimit.DeliveredBodyBytes,
+            allowed: maxDeliveredBodyBytes,
+            attempted: attempted,
+          },
+          move metadata,
+          delivered,
+          progress.written,
+        )
+      }
+      let chunk = Slice.view<u8>(Bytes.asSlice(&buffer), usize.ZERO, progress.written)
+      run Destination<A, DestinationError ? DestinationRequirements>.accept(
+        &mut selectedDestination,
+        &metadata,
+        chunk,
+        &deadline,
+        delivered,
+      )
+      delivered = attempted
+    }
+    if progress.state == ContentProgressState.End {
+      break
+    }
+  }
+  let trailerView = match move run Effect.result(Client.trailers(&exchange.*)) {
+    Result.Success {value} => move value
+    Result.Failure {error} => {
+      fail ownedMetadataFailure(
+        FetchPhase.Decode,
+        FetchReason.HttpClient {error: move error},
+        move metadata,
+        delivered,
+        usize.ZERO,
+      )
+    }
+  }
+  let trailers = match move run Effect.result(
+    copyFinalTrailers(
+      move trailerView,
+      responseValueLimits,
+      metadata.ownedBytes,
+      maxOwnedMetadataBytes,
+    ),
+  ) {
+    Result.Success {value} => move value
+    Result.Failure {error} => match move error {
+      FetchError cause => {
+        fail enrichMetadataFailure(move cause, move metadata, delivered, usize.ZERO)
+      }
+      BodyError cause => {
+        fail ownedMetadataFailure(
+          FetchPhase.Decode,
+          FetchReason.HttpBody {error: move cause},
+          move metadata,
+          delivered,
+          usize.ZERO,
+        )
+      }
+      OutOfMemoryError cause => {
+        fail move cause
+      }
+    }
+  }
+  let trailerBytes = match & trailers {
+    Option.None => usize.ZERO
+    Option.Some {value} => OwnedTrailers.ownedBytes(&value)
+  }
+  let totalMetadata = match move run Effect.result(
+    checkedMetadataAdd(FetchPhase.Decode, metadata.ownedBytes, trailerBytes),
+  ) {
+    Result.Success {value} => value
+    Result.Failure {error} => {
+      fail enrichMetadataFailure(move error, move metadata, delivered, usize.ZERO)
+    }
+  }
+  match move run Effect.result(Client.finishResponse(&mut exchange.*)) {
+    Result.Success {value} => {
+      drop value
+    }
+    Result.Failure {error} => {
+      fail ownedMetadataFailure(
+        FetchPhase.Finish,
+        FetchReason.HttpClient {error: move error},
+        move metadata,
+        delivered,
+        usize.ZERO,
+      )
+    }
+  }
+  let result = FetchResult {
+    metadata: ResponseMetadata {
+      finalUri: move metadata.finalUri,
+      head: move metadata.head,
+      representation: RepresentationMetadata {
+        applied: applied,
+        completed: true,
+        deliveredBytes: Option<u64>.some(delivered),
+      },
+      ownedBytes: metadata.ownedBytes,
+    },
+    trailers: move trailers,
+    redirectCount: hop,
+    encodedBodyBytes: encoded,
+    deliveredBodyBytes: delivered,
+    ownedMetadataBytes: totalMetadata,
+  }
+  return Destination<A, DestinationError ? DestinationRequirements>.publish(
+    move selectedDestination,
+    move result,
+  )
+}
+
+impl<
+  RoutedP,
+  DirectP,
+  A,
+  DestinationError,
+  ?DestinationRequirements,
+  D: Destination<A, DestinationError ? DestinationRequirements>,
+> HybridResponseHandler<
+  RoutedP,
+  DirectP,
+  A,
+  FetchError | ValueError | BodyError | DestinationError | ExchangeError | OutOfMemoryError,
+  DestinationRequirements | &mut Allocator | &mut MonotonicClock | &mut Random,
+> for DeliveryResponseHandler<RoutedP, DirectP, A, DestinationError, DestinationRequirements, D> {
+  effect<'call> fn handleRouted<
+    'call,
+    'exchangeView: 'call,
+    'transport: 'exchangeView,
+    'provider: 'transport,
+    'tunnel: 'provider,
+  >(
+    handler: &mut Self,
+    uri: Uri<'call>,
+    hop: usize,
+    exchange: &'call mut Exchange<
+      'exchangeView,
+      RouteTransport<'transport, 'provider, 'tunnel, RoutedP>,
+    >,
+  ) -> A
+  ! FetchError | ValueError | BodyError | DestinationError | ExchangeError | OutOfMemoryError
+  ? DestinationRequirements | &mut Allocator | &mut MonotonicClock | &mut Random
+  where
+    &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+    &mut RoutedP provides &HttpTransport from &mut HttpTransport,
+    &mut RoutedP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random,
+    &mut RoutedP provides &ByteDuplex from &mut ByteDuplex {
+    return run deliverResponse(&mut handler.*, uri, hop, &mut exchange.*)
+  }
+  effect<'call> fn handleDirect<'call, 'exchangeView: 'call>(
+    handler: &mut Self,
+    uri: Uri<'call>,
+    hop: usize,
+    exchange: &'call mut Exchange<'exchangeView, DirectP>,
+  ) -> A
+  ! FetchError | ValueError | BodyError | DestinationError | ExchangeError | OutOfMemoryError
+  ? DestinationRequirements | &mut Allocator | &mut MonotonicClock | &mut Random
+  where
+    &mut DirectP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+    &mut DirectP provides &HttpTransport from &mut HttpTransport {
+    return run deliverResponse(&mut handler.*, uri, hop, &mut exchange.*)
+  }
+}
+
+struct EmptyOperation<
+  'fetch,
+  'policy,
+  RoutedP,
+  DirectP,
+  A,
+  DestinationError,
+  AcquisitionError,
+  ?DestinationRequirements,
+  ?AcquisitionRequirements,
+  D,
+  C,
+> {
+  fetch: &'fetch mut Fetch<C>,
+  policyAnchor: [&'policy (); 0],
+  options: FetchOptions,
+  destination: D,
+}
+
+impl<
+  'fetch,
+  'policy,
+  RoutedP,
+  DirectP,
+  A,
+  DestinationError,
+  AcquisitionError,
+  ?DestinationRequirements,
+  ?AcquisitionRequirements,
+  D: Destination<A, DestinationError ? DestinationRequirements>,
+  C: FetchClient<
+    'policy,
+    RoutedP,
+    DirectP,
+    Redirect.AttemptStep<'policy, A>,
+    RedirectError | FetchError | ValueError | BodyError | DestinationError | ExchangeError | OutOfMemoryError,
+    AcquisitionError,
+    DestinationRequirements | &mut Redirect.SelectedBody<never, never> | &mut MonotonicClock | &mut Allocator | &mut Random,
+    AcquisitionRequirements,
+  >,
+> SemanticRequestHandler<'policy, RoutedP, DirectP, A, RedirectError | FetchError | ValueError | BodyError | DestinationError | ExchangeError | OutOfMemoryError | AcquisitionError ? DestinationRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random> for EmptyOperation<
+  'fetch,
+  'policy,
+  RoutedP,
+  DirectP,
+  A,
+  DestinationError,
+  AcquisitionError,
+  DestinationRequirements,
+  AcquisitionRequirements,
+  D,
+  C,
+>
+where
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport,
+  DestinationRequirements in Without<DestinationRequirements, ByteDuplex>,
+  DestinationRequirements in Without<DestinationRequirements, HttpTransport>,
+  AcquisitionRequirements in Without<AcquisitionRequirements, ByteDuplex>,
+  AcquisitionRequirements in Without<AcquisitionRequirements, HttpTransport> {
+  effect<'call> fn handle<'call>(
+    operation: Self,
+    request: Redirect.Request<'call, 'call, 'call, 'policy>,
+  ) -> A
+  ! RedirectError | FetchError | ValueError | BodyError | DestinationError | ExchangeError | OutOfMemoryError | AcquisitionError
+  ? DestinationRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random {
+    let EmptyOperation<
+      'fetch,
+      'policy,
+      RoutedP,
+      DirectP,
+      A,
+      DestinationError,
+      AcquisitionError,
+      DestinationRequirements,
+      AcquisitionRequirements,
+      D,
+      C,
+    > {fetch, policyAnchor, options, destination} = move operation
+    drop policyAnchor
+    let FetchOptions {
+      redirect,
+      content,
+      pool,
+      proxy,
+      deadline,
+      http,
+      contentLimits,
+      maxEncodedBodyBytes,
+      maxDeliveredBodyBytes,
+      maxOwnedMetadataBytes,
+      maxBufferedBytes,
+    } = move options
+    let mut selectedFetch = move fetch
+    let mut adapter = FetchAttemptAdapter<
+      'fetch,
+      'policy,
+      RoutedP,
+      DirectP,
+      Redirect.AttemptStep<'policy, A>,
+      RedirectError | FetchError | ValueError | BodyError | DestinationError | ExchangeError | OutOfMemoryError,
+      AcquisitionError,
+      DestinationRequirements | &mut Redirect.SelectedBody<never, never> | &mut MonotonicClock | &mut Allocator | &mut Random,
+      AcquisitionRequirements,
+      C,
+    > {client: &mut selectedFetch.client, httpLimits: http, poolMode: pool, proxyMode: proxy}
+    let mut scratch: [u8; 0] = []
+    let response = DeliveryResponseHandler<
+      RoutedP,
+      DirectP,
+      A,
+      DestinationError,
+      DestinationRequirements,
+      D,
+    > {
+      destination: Option<D>.some(move destination),
+      content: content,
+      contentLimits: move contentLimits,
+      responseValueLimits: http.responseBody.trailerValues,
+      maxEncodedBodyBytes: maxEncodedBodyBytes,
+      maxDeliveredBodyBytes: maxDeliveredBodyBytes,
+      maxOwnedMetadataBytes: maxOwnedMetadataBytes,
+      maxBufferedBytes: maxBufferedBytes,
+      deadline: copyDeadline(&deadline),
+    }
+    return run mapSwitching<
+      A,
+      RedirectError | FetchError | ValueError | BodyError | DestinationError | OutOfMemoryError | AcquisitionError,
+      DestinationRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random,
+    >(
+      Redirect.withEmptyHybridResponse(
+        &mut adapter,
+        move request,
+        &redirect,
+        copyDeadline(&deadline),
+        &mut scratch,
+        move response,
+      ),
+    )
+  }
+}
+
+effect fn admit(options: &FetchOptions) -> () ! FetchError {
+  return match move FetchOptions.validate(options) {
+    Result.Success {value} => move value
+    Result.Failure {error} => {
+      fail move error
+    }
+  }
+}
+
+/// Sends a request with no body, and gives the body of the final response to `sink` in chunks.
+pub effect<'env> fn toSinkEmpty<
+  'fetch,
+  'uri,
+  'method,
+  'headers,
+  'policy,
+  RoutedP,
+  DirectP,
+  SinkError: Intrinsic.Detached,
+  AcquisitionError,
+  ?SinkRequirements,
+  ?AcquisitionRequirements,
+  S: Sink<SinkError ? SinkRequirements> + 'env,
+  C: FetchClient<
+    'policy,
+    RoutedP,
+    DirectP,
+    Redirect.AttemptStep<'policy, FetchResult>,
+    RedirectError | FetchError | ValueError | BodyError | DestinationFailure<SinkError> | ExchangeError | OutOfMemoryError,
+    AcquisitionError,
+    SinkRequirements | &mut Redirect.SelectedBody<never, never> | &mut MonotonicClock | &mut Allocator | &mut Random,
+    AcquisitionRequirements,
+  >,
+  'env,
+>(
+  fetch: &'fetch mut Fetch<C>,
+  request: FetchRequest<'uri, 'method, 'headers, 'policy>,
+  options: FetchOptions,
+  sink: S,
+) -> FetchResult
+! RedirectError | FetchError | ValueError | BodyError | DestinationFailure<SinkError> | ExchangeError | OutOfMemoryError | AcquisitionError
+? SinkRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
+where
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport,
+  SinkRequirements in Without<SinkRequirements, ByteDuplex>,
+  SinkRequirements in Without<SinkRequirements, HttpTransport>,
+  AcquisitionRequirements in Without<AcquisitionRequirements, ByteDuplex>,
+  AcquisitionRequirements in Without<AcquisitionRequirements, HttpTransport> {
+  run admit(&options)
+  let operation = EmptyOperation<
+    'fetch,
+    'policy,
+    RoutedP,
+    DirectP,
+    FetchResult,
+    DestinationFailure<SinkError>,
+    AcquisitionError,
+    SinkRequirements,
+    AcquisitionRequirements,
+    SinkDestination<SinkError, SinkRequirements, S>,
+    C,
+  > {
+    fetch: move fetch,
+    policyAnchor: [],
+    options: move options,
+    destination: SinkDestination<SinkError, SinkRequirements, S> {sink: move sink},
+  }
+  return run withSemanticRequest<RoutedP, DirectP>(move request, move operation)
+}
+
+/// Sends a request with no body, and returns the body of the final response in memory. More than
+/// `maxBodyBytes` fails, and no partial body is returned.
+pub effect fn collectEmpty<
+  'fetch,
+  'uri,
+  'method,
+  'headers,
+  'policy,
+  RoutedP,
+  DirectP,
+  AcquisitionError,
+  ?AcquisitionRequirements,
+  C: FetchClient<
+    'policy,
+    RoutedP,
+    DirectP,
+    Redirect.AttemptStep<'policy, CollectedResponse>,
+    RedirectError | FetchError | ValueError | BodyError | ExchangeError | OutOfMemoryError,
+    AcquisitionError,
+    &mut Redirect.SelectedBody<never, never> | &mut MonotonicClock | &mut Allocator | &mut Random,
+    AcquisitionRequirements,
+  >,
+>(
+  fetch: &'fetch mut Fetch<C>,
+  request: FetchRequest<'uri, 'method, 'headers, 'policy>,
+  options: FetchOptions,
+  maxBodyBytes: usize,
+) -> CollectedResponse
+! RedirectError | FetchError | ValueError | BodyError | ExchangeError | OutOfMemoryError | AcquisitionError
+? AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
+where
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport,
+  AcquisitionRequirements in Without<AcquisitionRequirements, ByteDuplex>,
+  AcquisitionRequirements in Without<AcquisitionRequirements, HttpTransport> {
+  run admit(&options)
+  let operation = EmptyOperation<
+    'fetch,
+    'policy,
+    RoutedP,
+    DirectP,
+    CollectedResponse,
+    FetchError | OutOfMemoryError,
+    AcquisitionError,
+    &mut Allocator,
+    AcquisitionRequirements,
+    CollectDestination,
+    C,
+  > {
+    fetch: move fetch,
+    policyAnchor: [],
+    options: move options,
+    destination: CollectDestination {body: Bytes.make(), maximum: maxBodyBytes},
+  }
+  return run withSemanticRequest<RoutedP, DirectP>(move request, move operation)
+}
+
+/// Sends a request with no body, and reads and checks the body of the final response without
+/// keeping it. More than `maxDiscardBytes` fails.
+pub effect fn discardEmpty<
+  'fetch,
+  'uri,
+  'method,
+  'headers,
+  'policy,
+  RoutedP,
+  DirectP,
+  AcquisitionError,
+  ?AcquisitionRequirements,
+  C: FetchClient<
+    'policy,
+    RoutedP,
+    DirectP,
+    Redirect.AttemptStep<'policy, FetchResult>,
+    RedirectError | FetchError | ValueError | BodyError | ExchangeError | OutOfMemoryError,
+    AcquisitionError,
+    &mut Redirect.SelectedBody<never, never> | &mut MonotonicClock | &mut Allocator | &mut Random,
+    AcquisitionRequirements,
+  >,
+>(
+  fetch: &'fetch mut Fetch<C>,
+  request: FetchRequest<'uri, 'method, 'headers, 'policy>,
+  options: FetchOptions,
+  maxDiscardBytes: u64,
+) -> FetchResult
+! RedirectError | FetchError | ValueError | BodyError | ExchangeError | OutOfMemoryError | AcquisitionError
+? AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
+where
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport,
+  AcquisitionRequirements in Without<AcquisitionRequirements, ByteDuplex>,
+  AcquisitionRequirements in Without<AcquisitionRequirements, HttpTransport> {
+  run admit(&options)
+  let operation = EmptyOperation<
+    'fetch,
+    'policy,
+    RoutedP,
+    DirectP,
+    FetchResult,
+    FetchError,
+    AcquisitionError,
+    never,
+    AcquisitionRequirements,
+    DiscardDestination,
+    C,
+  > {
+    fetch: move fetch,
+    policyAnchor: [],
+    options: move options,
+    destination: DiscardDestination {maximum: maxDiscardBytes},
+  }
+  return run withSemanticRequest<RoutedP, DirectP>(move request, move operation)
+}
+
+struct BytesOperation<
+  'fetch,
+  'bytes,
+  'policy,
+  RoutedP,
+  DirectP,
+  A,
+  DestinationError,
+  AcquisitionError,
+  ?DestinationRequirements,
+  ?AcquisitionRequirements,
+  D,
+  C,
+> {
+  fetch: &'fetch mut Fetch<C>,
+  bytes: &'bytes [u8],
+  policyAnchor: [&'policy (); 0],
+  options: FetchOptions,
+  destination: D,
+}
+
+impl<
+  'fetch,
+  'bytes,
+  'policy,
+  RoutedP,
+  DirectP,
+  A,
+  DestinationError,
+  AcquisitionError,
+  ?DestinationRequirements,
+  ?AcquisitionRequirements,
+  D: Destination<A, DestinationError ? DestinationRequirements>,
+  C: FetchClient<
+    'policy,
+    RoutedP,
+    DirectP,
+    Redirect.AttemptStep<'policy, A>,
+    RedirectError | FetchError | ValueError | BodyError | DestinationError | ExchangeError | OutOfMemoryError,
+    AcquisitionError,
+    DestinationRequirements | &mut Redirect.SelectedBody<never, never> | &mut MonotonicClock | &mut Allocator | &mut Random,
+    AcquisitionRequirements,
+  >,
+> SemanticRequestHandler<'policy, RoutedP, DirectP, A, RedirectError | FetchError | ValueError | BodyError | DestinationError | ExchangeError | OutOfMemoryError | AcquisitionError ? DestinationRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random> for BytesOperation<
+  'fetch,
+  'bytes,
+  'policy,
+  RoutedP,
+  DirectP,
+  A,
+  DestinationError,
+  AcquisitionError,
+  DestinationRequirements,
+  AcquisitionRequirements,
+  D,
+  C,
+>
+where
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport,
+  DestinationRequirements in Without<DestinationRequirements, ByteDuplex>,
+  DestinationRequirements in Without<DestinationRequirements, HttpTransport>,
+  AcquisitionRequirements in Without<AcquisitionRequirements, ByteDuplex>,
+  AcquisitionRequirements in Without<AcquisitionRequirements, HttpTransport> {
+  effect<'call> fn handle<'call>(
+    operation: Self,
+    request: Redirect.Request<'call, 'call, 'call, 'policy>,
+  ) -> A
+  ! RedirectError | FetchError | ValueError | BodyError | DestinationError | ExchangeError | OutOfMemoryError | AcquisitionError
+  ? DestinationRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random {
+    let BytesOperation<
+      'fetch,
+      'bytes,
+      'policy,
+      RoutedP,
+      DirectP,
+      A,
+      DestinationError,
+      AcquisitionError,
+      DestinationRequirements,
+      AcquisitionRequirements,
+      D,
+      C,
+    > {fetch, bytes, policyAnchor, options, destination} = move operation
+    drop policyAnchor
+    let FetchOptions {
+      redirect,
+      content,
+      pool,
+      proxy,
+      deadline,
+      http,
+      contentLimits,
+      maxEncodedBodyBytes,
+      maxDeliveredBodyBytes,
+      maxOwnedMetadataBytes,
+      maxBufferedBytes,
+    } = move options
+    let mut selectedFetch = move fetch
+    let mut adapter = FetchAttemptAdapter<
+      'fetch,
+      'policy,
+      RoutedP,
+      DirectP,
+      Redirect.AttemptStep<'policy, A>,
+      RedirectError | FetchError | ValueError | BodyError | DestinationError | ExchangeError | OutOfMemoryError,
+      AcquisitionError,
+      DestinationRequirements | &mut Redirect.SelectedBody<never, never> | &mut MonotonicClock | &mut Allocator | &mut Random,
+      AcquisitionRequirements,
+      C,
+    > {client: &mut selectedFetch.client, httpLimits: http, poolMode: pool, proxyMode: proxy}
+    let mut scratch = run Bytes.zeroed(http.writeCapacity)
+    let response = DeliveryResponseHandler<
+      RoutedP,
+      DirectP,
+      A,
+      DestinationError,
+      DestinationRequirements,
+      D,
+    > {
+      destination: Option<D>.some(move destination),
+      content: content,
+      contentLimits: move contentLimits,
+      responseValueLimits: http.responseBody.trailerValues,
+      maxEncodedBodyBytes: maxEncodedBodyBytes,
+      maxDeliveredBodyBytes: maxDeliveredBodyBytes,
+      maxOwnedMetadataBytes: maxOwnedMetadataBytes,
+      maxBufferedBytes: maxBufferedBytes,
+      deadline: copyDeadline(&deadline),
+    }
+    return run mapSwitching<
+      A,
+      RedirectError | FetchError | ValueError | BodyError | DestinationError | OutOfMemoryError | AcquisitionError,
+      DestinationRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random,
+    >(
+      Redirect.withBytesHybridResponse(
+        &mut adapter,
+        move request,
+        &redirect,
+        bytes,
+        copyDeadline(&deadline),
+        Bytes.asMutSlice(&mut scratch),
+        move response,
+      ),
+    )
+  }
+}
+
+/// Sends a request with the body `bytes`, and gives the body of the final response to `sink` in
+/// chunks.
+pub effect<'env> fn toSinkBytes<
+  'fetch,
+  'uri,
+  'method,
+  'headers,
+  'policy,
+  'bytes,
+  RoutedP,
+  DirectP,
+  SinkError: Intrinsic.Detached,
+  AcquisitionError,
+  ?SinkRequirements,
+  ?AcquisitionRequirements,
+  S: Sink<SinkError ? SinkRequirements> + 'env,
+  C: FetchClient<
+    'policy,
+    RoutedP,
+    DirectP,
+    Redirect.AttemptStep<'policy, FetchResult>,
+    RedirectError | FetchError | ValueError | BodyError | DestinationFailure<SinkError> | ExchangeError | OutOfMemoryError,
+    AcquisitionError,
+    SinkRequirements | &mut Redirect.SelectedBody<never, never> | &mut MonotonicClock | &mut Allocator | &mut Random,
+    AcquisitionRequirements,
+  >,
+  'env,
+>(
+  fetch: &'fetch mut Fetch<C>,
+  request: FetchRequest<'uri, 'method, 'headers, 'policy>,
+  bytes: &'bytes [u8],
+  options: FetchOptions,
+  sink: S,
+) -> FetchResult
+! RedirectError | FetchError | ValueError | BodyError | DestinationFailure<SinkError> | ExchangeError | OutOfMemoryError | AcquisitionError
+? SinkRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
+where
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport,
+  SinkRequirements in Without<SinkRequirements, ByteDuplex>,
+  SinkRequirements in Without<SinkRequirements, HttpTransport>,
+  AcquisitionRequirements in Without<AcquisitionRequirements, ByteDuplex>,
+  AcquisitionRequirements in Without<AcquisitionRequirements, HttpTransport> {
+  run admit(&options)
+  let operation = BytesOperation<
+    'fetch,
+    'bytes,
+    'policy,
+    RoutedP,
+    DirectP,
+    FetchResult,
+    DestinationFailure<SinkError>,
+    AcquisitionError,
+    SinkRequirements,
+    AcquisitionRequirements,
+    SinkDestination<SinkError, SinkRequirements, S>,
+    C,
+  > {
+    fetch: move fetch,
+    bytes: bytes,
+    policyAnchor: [],
+    options: move options,
+    destination: SinkDestination<SinkError, SinkRequirements, S> {sink: move sink},
+  }
+  return run withSemanticRequest<RoutedP, DirectP>(move request, move operation)
+}
+
+/// Sends a request with the body `bytes`, and returns the body of the final response in memory.
+/// More than `maxBodyBytes` fails, and no partial body is returned.
+pub effect fn collectBytes<
+  'fetch,
+  'uri,
+  'method,
+  'headers,
+  'policy,
+  'bytes,
+  RoutedP,
+  DirectP,
+  AcquisitionError,
+  ?AcquisitionRequirements,
+  C: FetchClient<
+    'policy,
+    RoutedP,
+    DirectP,
+    Redirect.AttemptStep<'policy, CollectedResponse>,
+    RedirectError | FetchError | ValueError | BodyError | ExchangeError | OutOfMemoryError,
+    AcquisitionError,
+    &mut Redirect.SelectedBody<never, never> | &mut MonotonicClock | &mut Allocator | &mut Random,
+    AcquisitionRequirements,
+  >,
+>(
+  fetch: &'fetch mut Fetch<C>,
+  request: FetchRequest<'uri, 'method, 'headers, 'policy>,
+  bytes: &'bytes [u8],
+  options: FetchOptions,
+  maxBodyBytes: usize,
+) -> CollectedResponse
+! RedirectError | FetchError | ValueError | BodyError | ExchangeError | OutOfMemoryError | AcquisitionError
+? AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
+where
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport,
+  AcquisitionRequirements in Without<AcquisitionRequirements, ByteDuplex>,
+  AcquisitionRequirements in Without<AcquisitionRequirements, HttpTransport> {
+  run admit(&options)
+  let operation = BytesOperation<
+    'fetch,
+    'bytes,
+    'policy,
+    RoutedP,
+    DirectP,
+    CollectedResponse,
+    FetchError | OutOfMemoryError,
+    AcquisitionError,
+    &mut Allocator,
+    AcquisitionRequirements,
+    CollectDestination,
+    C,
+  > {
+    fetch: move fetch,
+    bytes: bytes,
+    policyAnchor: [],
+    options: move options,
+    destination: CollectDestination {body: Bytes.make(), maximum: maxBodyBytes},
+  }
+  return run withSemanticRequest<RoutedP, DirectP>(move request, move operation)
+}
+
+/// Sends a request with the body `bytes`, and reads and checks the body of the final response
+/// without keeping it. More than `maxDiscardBytes` fails.
+pub effect fn discardBytes<
+  'fetch,
+  'uri,
+  'method,
+  'headers,
+  'policy,
+  'bytes,
+  RoutedP,
+  DirectP,
+  AcquisitionError,
+  ?AcquisitionRequirements,
+  C: FetchClient<
+    'policy,
+    RoutedP,
+    DirectP,
+    Redirect.AttemptStep<'policy, FetchResult>,
+    RedirectError | FetchError | ValueError | BodyError | ExchangeError | OutOfMemoryError,
+    AcquisitionError,
+    &mut Redirect.SelectedBody<never, never> | &mut MonotonicClock | &mut Allocator | &mut Random,
+    AcquisitionRequirements,
+  >,
+>(
+  fetch: &'fetch mut Fetch<C>,
+  request: FetchRequest<'uri, 'method, 'headers, 'policy>,
+  bytes: &'bytes [u8],
+  options: FetchOptions,
+  maxDiscardBytes: u64,
+) -> FetchResult
+! RedirectError | FetchError | ValueError | BodyError | ExchangeError | OutOfMemoryError | AcquisitionError
+? AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
+where
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport,
+  AcquisitionRequirements in Without<AcquisitionRequirements, ByteDuplex>,
+  AcquisitionRequirements in Without<AcquisitionRequirements, HttpTransport> {
+  run admit(&options)
+  let operation = BytesOperation<
+    'fetch,
+    'bytes,
+    'policy,
+    RoutedP,
+    DirectP,
+    FetchResult,
+    FetchError,
+    AcquisitionError,
+    never,
+    AcquisitionRequirements,
+    DiscardDestination,
+    C,
+  > {
+    fetch: move fetch,
+    bytes: bytes,
+    policyAnchor: [],
+    options: move options,
+    destination: DiscardDestination {maximum: maxDiscardBytes},
+  }
+  return run withSemanticRequest<RoutedP, DirectP>(move request, move operation)
+}
+
+struct OneShotOperation<
+  'fetch,
+  'policy,
+  RoutedP,
+  DirectP,
+  A,
+  ProducerError,
+  DestinationError,
+  AcquisitionError,
+  ?ProducerRequirements,
+  ?DestinationRequirements,
+  ?AcquisitionRequirements,
+  Producer,
+  D,
+  C,
+> {
+  fetch: &'fetch mut Fetch<C>,
+  producer: Producer,
+  policyAnchor: [&'policy (); 0],
+  options: FetchOptions,
+  destination: D,
+}
+
+impl<
+  'fetch,
+  'policy,
+  RoutedP,
+  DirectP,
+  A,
+  ProducerError,
+  DestinationError,
+  AcquisitionError,
+  ?ProducerRequirements,
+  ?DestinationRequirements,
+  ?AcquisitionRequirements,
+  Producer: BodyProducer<ProducerError ? ProducerRequirements>,
+  D: Destination<A, DestinationError ? DestinationRequirements>,
+  C: FetchClient<
+    'policy,
+    RoutedP,
+    DirectP,
+    Redirect.AttemptStep<'policy, A>,
+    RedirectError | FetchError | ValueError | BodyError | ProducerError | DestinationError | ExchangeError | OutOfMemoryError,
+    AcquisitionError,
+    ProducerRequirements | DestinationRequirements | &mut Redirect.SelectedBody<
+      ProducerError,
+      ProducerRequirements,
+    > | &mut MonotonicClock | &mut Allocator | &mut Random,
+    AcquisitionRequirements,
+  >,
+> SemanticRequestHandler<'policy, RoutedP, DirectP, A, RedirectError | FetchError | ValueError | BodyError | ProducerError | DestinationError | ExchangeError | OutOfMemoryError | AcquisitionError ? ProducerRequirements | DestinationRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random> for OneShotOperation<
+  'fetch,
+  'policy,
+  RoutedP,
+  DirectP,
+  A,
+  ProducerError,
+  DestinationError,
+  AcquisitionError,
+  ProducerRequirements,
+  DestinationRequirements,
+  AcquisitionRequirements,
+  Producer,
+  D,
+  C,
+>
+where
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport,
+  ProducerRequirements in Without<ProducerRequirements, ByteDuplex>,
+  ProducerRequirements in Without<ProducerRequirements, HttpTransport>,
+  DestinationRequirements in Without<DestinationRequirements, ByteDuplex>,
+  DestinationRequirements in Without<DestinationRequirements, HttpTransport>,
+  AcquisitionRequirements in Without<AcquisitionRequirements, ByteDuplex>,
+  AcquisitionRequirements in Without<AcquisitionRequirements, HttpTransport> {
+  effect<'call> fn handle<'call>(
+    operation: Self,
+    request: Redirect.Request<'call, 'call, 'call, 'policy>,
+  ) -> A
+  ! RedirectError | FetchError | ValueError | BodyError | ProducerError | DestinationError | ExchangeError | OutOfMemoryError | AcquisitionError
+  ? ProducerRequirements | DestinationRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random {
+    let OneShotOperation<
+      'fetch,
+      'policy,
+      RoutedP,
+      DirectP,
+      A,
+      ProducerError,
+      DestinationError,
+      AcquisitionError,
+      ProducerRequirements,
+      DestinationRequirements,
+      AcquisitionRequirements,
+      Producer,
+      D,
+      C,
+    > {fetch, producer, policyAnchor, options, destination} = move operation
+    drop policyAnchor
+    let FetchOptions {
+      redirect,
+      content,
+      pool,
+      proxy,
+      deadline,
+      http,
+      contentLimits,
+      maxEncodedBodyBytes,
+      maxDeliveredBodyBytes,
+      maxOwnedMetadataBytes,
+      maxBufferedBytes,
+    } = move options
+    let mut selectedFetch = move fetch
+    let mut adapter = FetchAttemptAdapter<
+      'fetch,
+      'policy,
+      RoutedP,
+      DirectP,
+      Redirect.AttemptStep<'policy, A>,
+      RedirectError | FetchError | ValueError | BodyError | ProducerError | DestinationError | ExchangeError | OutOfMemoryError,
+      AcquisitionError,
+      ProducerRequirements | DestinationRequirements | &mut Redirect.SelectedBody<
+        ProducerError,
+        ProducerRequirements,
+      > | &mut MonotonicClock | &mut Allocator | &mut Random,
+      AcquisitionRequirements,
+      C,
+    > {client: &mut selectedFetch.client, httpLimits: http, poolMode: pool, proxyMode: proxy}
+    let mut scratch = run Bytes.zeroed(http.writeCapacity)
+    let response = DeliveryResponseHandler<
+      RoutedP,
+      DirectP,
+      A,
+      DestinationError,
+      DestinationRequirements,
+      D,
+    > {
+      destination: Option<D>.some(move destination),
+      content: content,
+      contentLimits: move contentLimits,
+      responseValueLimits: http.responseBody.trailerValues,
+      maxEncodedBodyBytes: maxEncodedBodyBytes,
+      maxDeliveredBodyBytes: maxDeliveredBodyBytes,
+      maxOwnedMetadataBytes: maxOwnedMetadataBytes,
+      maxBufferedBytes: maxBufferedBytes,
+      deadline: copyDeadline(&deadline),
+    }
+    return run mapSwitching<
+      A,
+      ProducerError | RedirectError | FetchError | ValueError | BodyError | DestinationError | OutOfMemoryError | AcquisitionError,
+      ProducerRequirements | DestinationRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random,
+    >(
+      Redirect.withOneShotHybridResponse<
+        RoutedP,
+        DirectP,
+        A,
+        ProducerError,
+        FetchError | ValueError | BodyError | DestinationError | ExchangeError | OutOfMemoryError,
+        AcquisitionError,
+        ProducerRequirements,
+        DestinationRequirements | &mut Allocator | &mut MonotonicClock | &mut Random,
+        AcquisitionRequirements,
+      >(
+        &mut adapter,
+        move request,
+        &redirect,
+        move producer,
+        copyDeadline(&deadline),
+        Bytes.asMutSlice(&mut scratch),
+        move response,
+      ),
+    )
+  }
+}
+
+/// Sends a request whose body comes from `producer` one time, and gives the body of the final
+/// response to `sink` in chunks.
+pub effect<'env> fn toSinkOneShot<
+  'fetch,
+  'uri,
+  'method,
+  'headers,
+  'policy,
+  RoutedP,
+  DirectP,
+  ProducerError,
+  SinkError: Intrinsic.Detached,
+  AcquisitionError,
+  ?ProducerRequirements,
+  ?SinkRequirements,
+  ?AcquisitionRequirements,
+  Producer: BodyProducer<ProducerError ? ProducerRequirements> + 'env,
+  S: Sink<SinkError ? SinkRequirements> + 'env,
+  C: FetchClient<
+    'policy,
+    RoutedP,
+    DirectP,
+    Redirect.AttemptStep<'policy, FetchResult>,
+    RedirectError | FetchError | ValueError | BodyError | ProducerError | DestinationFailure<
+      SinkError,
+    > | ExchangeError | OutOfMemoryError,
+    AcquisitionError,
+    ProducerRequirements | SinkRequirements | &mut Redirect.SelectedBody<
+      ProducerError,
+      ProducerRequirements,
+    > | &mut MonotonicClock | &mut Allocator | &mut Random,
+    AcquisitionRequirements,
+  >,
+  'env,
+>(
+  fetch: &'fetch mut Fetch<C>,
+  request: FetchRequest<'uri, 'method, 'headers, 'policy>,
+  producer: Producer,
+  options: FetchOptions,
+  sink: S,
+) -> FetchResult
+! RedirectError | FetchError | ValueError | BodyError | ProducerError | DestinationFailure<
+  SinkError,
+> | ExchangeError | OutOfMemoryError | AcquisitionError
+? ProducerRequirements | SinkRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
+where
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport,
+  ProducerRequirements in Without<ProducerRequirements, ByteDuplex>,
+  ProducerRequirements in Without<ProducerRequirements, HttpTransport>,
+  SinkRequirements in Without<SinkRequirements, ByteDuplex>,
+  SinkRequirements in Without<SinkRequirements, HttpTransport>,
+  AcquisitionRequirements in Without<AcquisitionRequirements, ByteDuplex>,
+  AcquisitionRequirements in Without<AcquisitionRequirements, HttpTransport> {
+  run admit(&options)
+  let operation = OneShotOperation<
+    'fetch,
+    'policy,
+    RoutedP,
+    DirectP,
+    FetchResult,
+    ProducerError,
+    DestinationFailure<SinkError>,
+    AcquisitionError,
+    ProducerRequirements,
+    SinkRequirements,
+    AcquisitionRequirements,
+    Producer,
+    SinkDestination<SinkError, SinkRequirements, S>,
+    C,
+  > {
+    fetch: move fetch,
+    producer: move producer,
+    policyAnchor: [],
+    options: move options,
+    destination: SinkDestination<SinkError, SinkRequirements, S> {sink: move sink},
+  }
+  return run withSemanticRequest<RoutedP, DirectP>(move request, move operation)
+}
+
+/// Sends a request whose body comes from `producer` one time, and returns the body of the final
+/// response in memory. More than `maxBodyBytes` fails, and no partial body is returned.
+pub effect<'env> fn collectOneShot<
+  'fetch,
+  'uri,
+  'method,
+  'headers,
+  'policy,
+  RoutedP,
+  DirectP,
+  ProducerError,
+  AcquisitionError,
+  ?ProducerRequirements,
+  ?AcquisitionRequirements,
+  Producer: BodyProducer<ProducerError ? ProducerRequirements> + 'env,
+  C: FetchClient<
+    'policy,
+    RoutedP,
+    DirectP,
+    Redirect.AttemptStep<'policy, CollectedResponse>,
+    RedirectError | FetchError | ValueError | BodyError | ProducerError | ExchangeError | OutOfMemoryError,
+    AcquisitionError,
+    ProducerRequirements | &mut Redirect.SelectedBody<ProducerError, ProducerRequirements> | &mut MonotonicClock | &mut Allocator | &mut Random,
+    AcquisitionRequirements,
+  >,
+  'env,
+>(
+  fetch: &'fetch mut Fetch<C>,
+  request: FetchRequest<'uri, 'method, 'headers, 'policy>,
+  producer: Producer,
+  options: FetchOptions,
+  maxBodyBytes: usize,
+) -> CollectedResponse
+! RedirectError | FetchError | ValueError | BodyError | ProducerError | ExchangeError | OutOfMemoryError | AcquisitionError
+? ProducerRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
+where
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport,
+  ProducerRequirements in Without<ProducerRequirements, ByteDuplex>,
+  ProducerRequirements in Without<ProducerRequirements, HttpTransport>,
+  AcquisitionRequirements in Without<AcquisitionRequirements, ByteDuplex>,
+  AcquisitionRequirements in Without<AcquisitionRequirements, HttpTransport> {
+  run admit(&options)
+  let operation = OneShotOperation<
+    'fetch,
+    'policy,
+    RoutedP,
+    DirectP,
+    CollectedResponse,
+    ProducerError,
+    FetchError | OutOfMemoryError,
+    AcquisitionError,
+    ProducerRequirements,
+    &mut Allocator,
+    AcquisitionRequirements,
+    Producer,
+    CollectDestination,
+    C,
+  > {
+    fetch: move fetch,
+    producer: move producer,
+    policyAnchor: [],
+    options: move options,
+    destination: CollectDestination {body: Bytes.make(), maximum: maxBodyBytes},
+  }
+  return run withSemanticRequest<RoutedP, DirectP>(move request, move operation)
+}
+
+/// Sends a request whose body comes from `producer` one time, and reads and checks the body of the
+/// final response without keeping it. More than `maxDiscardBytes` fails.
+pub effect<'env> fn discardOneShot<
+  'fetch,
+  'uri,
+  'method,
+  'headers,
+  'policy,
+  RoutedP,
+  DirectP,
+  ProducerError,
+  AcquisitionError,
+  ?ProducerRequirements,
+  ?AcquisitionRequirements,
+  Producer: BodyProducer<ProducerError ? ProducerRequirements> + 'env,
+  C: FetchClient<
+    'policy,
+    RoutedP,
+    DirectP,
+    Redirect.AttemptStep<'policy, FetchResult>,
+    RedirectError | FetchError | ValueError | BodyError | ProducerError | ExchangeError | OutOfMemoryError,
+    AcquisitionError,
+    ProducerRequirements | &mut Redirect.SelectedBody<ProducerError, ProducerRequirements> | &mut MonotonicClock | &mut Allocator | &mut Random,
+    AcquisitionRequirements,
+  >,
+  'env,
+>(
+  fetch: &'fetch mut Fetch<C>,
+  request: FetchRequest<'uri, 'method, 'headers, 'policy>,
+  producer: Producer,
+  options: FetchOptions,
+  maxDiscardBytes: u64,
+) -> FetchResult
+! RedirectError | FetchError | ValueError | BodyError | ProducerError | ExchangeError | OutOfMemoryError | AcquisitionError
+? ProducerRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
+where
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport,
+  ProducerRequirements in Without<ProducerRequirements, ByteDuplex>,
+  ProducerRequirements in Without<ProducerRequirements, HttpTransport>,
+  AcquisitionRequirements in Without<AcquisitionRequirements, ByteDuplex>,
+  AcquisitionRequirements in Without<AcquisitionRequirements, HttpTransport> {
+  run admit(&options)
+  let operation = OneShotOperation<
+    'fetch,
+    'policy,
+    RoutedP,
+    DirectP,
+    FetchResult,
+    ProducerError,
+    FetchError,
+    AcquisitionError,
+    ProducerRequirements,
+    never,
+    AcquisitionRequirements,
+    Producer,
+    DiscardDestination,
+    C,
+  > {
+    fetch: move fetch,
+    producer: move producer,
+    policyAnchor: [],
+    options: move options,
+    destination: DiscardDestination {maximum: maxDiscardBytes},
+  }
+  return run withSemanticRequest<RoutedP, DirectP>(move request, move operation)
+}
+
+struct ReplayOperation<
+  'fetch,
+  'policy,
+  RoutedP,
+  DirectP,
+  A,
+  FactoryError,
+  ProducerError,
+  DestinationError,
+  AcquisitionError,
+  ?FactoryRequirements,
+  ?ProducerRequirements,
+  ?DestinationRequirements,
+  ?AcquisitionRequirements,
+  Factory,
+  Producer,
+  D,
+  C,
+> {
+  fetch: &'fetch mut Fetch<C>,
+  factory: Factory,
+  policyAnchor: [&'policy (); 0],
+  options: FetchOptions,
+  destination: D,
+}
+
+impl<
+  'fetch,
+  'policy,
+  RoutedP,
+  DirectP,
+  A,
+  FactoryError,
+  ProducerError,
+  DestinationError,
+  AcquisitionError,
+  ?FactoryRequirements,
+  ?ProducerRequirements,
+  ?DestinationRequirements,
+  ?AcquisitionRequirements,
+  Factory: ReplayFactory<Producer, FactoryError, FactoryRequirements>,
+  Producer: BodyProducer<ProducerError ? ProducerRequirements>,
+  D: Destination<A, DestinationError ? DestinationRequirements>,
+  C: FetchClient<
+    'policy,
+    RoutedP,
+    DirectP,
+    Redirect.AttemptStep<'policy, A>,
+    RedirectError | FetchError | ValueError | BodyError | ProducerError | DestinationError | ExchangeError | OutOfMemoryError,
+    AcquisitionError,
+    ProducerRequirements | DestinationRequirements | &mut Redirect.SelectedBody<
+      ProducerError,
+      ProducerRequirements,
+    > | &mut MonotonicClock | &mut Allocator | &mut Random,
+    AcquisitionRequirements,
+  >,
+> SemanticRequestHandler<'policy, RoutedP, DirectP, A, RedirectError | FetchError | ValueError | BodyError | FactoryError | ProducerError | DestinationError | ExchangeError | OutOfMemoryError | AcquisitionError ? FactoryRequirements | ProducerRequirements | DestinationRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random> for ReplayOperation<
+  'fetch,
+  'policy,
+  RoutedP,
+  DirectP,
+  A,
+  FactoryError,
+  ProducerError,
+  DestinationError,
+  AcquisitionError,
+  FactoryRequirements,
+  ProducerRequirements,
+  DestinationRequirements,
+  AcquisitionRequirements,
+  Factory,
+  Producer,
+  D,
+  C,
+>
+where
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport,
+  FactoryRequirements in Without<FactoryRequirements, ByteDuplex>,
+  FactoryRequirements in Without<FactoryRequirements, HttpTransport>,
+  ProducerRequirements in Without<ProducerRequirements, ByteDuplex>,
+  ProducerRequirements in Without<ProducerRequirements, HttpTransport>,
+  DestinationRequirements in Without<DestinationRequirements, ByteDuplex>,
+  DestinationRequirements in Without<DestinationRequirements, HttpTransport>,
+  AcquisitionRequirements in Without<AcquisitionRequirements, ByteDuplex>,
+  AcquisitionRequirements in Without<AcquisitionRequirements, HttpTransport> {
+  effect<'call> fn handle<'call>(
+    operation: Self,
+    request: Redirect.Request<'call, 'call, 'call, 'policy>,
+  ) -> A
+  ! RedirectError | FetchError | ValueError | BodyError | FactoryError | ProducerError | DestinationError | ExchangeError | OutOfMemoryError | AcquisitionError
+  ? FactoryRequirements | ProducerRequirements | DestinationRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random {
+    let ReplayOperation<
+      'fetch,
+      'policy,
+      RoutedP,
+      DirectP,
+      A,
+      FactoryError,
+      ProducerError,
+      DestinationError,
+      AcquisitionError,
+      FactoryRequirements,
+      ProducerRequirements,
+      DestinationRequirements,
+      AcquisitionRequirements,
+      Factory,
+      Producer,
+      D,
+      C,
+    > {fetch, factory, policyAnchor, options, destination} = move operation
+    drop policyAnchor
+    let FetchOptions {
+      redirect,
+      content,
+      pool,
+      proxy,
+      deadline,
+      http,
+      contentLimits,
+      maxEncodedBodyBytes,
+      maxDeliveredBodyBytes,
+      maxOwnedMetadataBytes,
+      maxBufferedBytes,
+    } = move options
+    let mut selectedFetch = move fetch
+    let mut adapter = FetchAttemptAdapter<
+      'fetch,
+      'policy,
+      RoutedP,
+      DirectP,
+      Redirect.AttemptStep<'policy, A>,
+      RedirectError | FetchError | ValueError | BodyError | ProducerError | DestinationError | ExchangeError | OutOfMemoryError,
+      AcquisitionError,
+      ProducerRequirements | DestinationRequirements | &mut Redirect.SelectedBody<
+        ProducerError,
+        ProducerRequirements,
+      > | &mut MonotonicClock | &mut Allocator | &mut Random,
+      AcquisitionRequirements,
+      C,
+    > {client: &mut selectedFetch.client, httpLimits: http, poolMode: pool, proxyMode: proxy}
+    let mut scratch = run Bytes.zeroed(http.writeCapacity)
+    let response = DeliveryResponseHandler<
+      RoutedP,
+      DirectP,
+      A,
+      DestinationError,
+      DestinationRequirements,
+      D,
+    > {
+      destination: Option<D>.some(move destination),
+      content: content,
+      contentLimits: move contentLimits,
+      responseValueLimits: http.responseBody.trailerValues,
+      maxEncodedBodyBytes: maxEncodedBodyBytes,
+      maxDeliveredBodyBytes: maxDeliveredBodyBytes,
+      maxOwnedMetadataBytes: maxOwnedMetadataBytes,
+      maxBufferedBytes: maxBufferedBytes,
+      deadline: copyDeadline(&deadline),
+    }
+    return run mapSwitching<
+      A,
+      FactoryError | ProducerError | RedirectError | FetchError | ValueError | BodyError | DestinationError | OutOfMemoryError | AcquisitionError,
+      FactoryRequirements | ProducerRequirements | DestinationRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random,
+    >(
+      Redirect.withReplayHybridResponse<
+        RoutedP,
+        DirectP,
+        A,
+        FactoryError,
+        ProducerError,
+        FetchError | ValueError | BodyError | DestinationError | ExchangeError | OutOfMemoryError,
+        AcquisitionError,
+        FactoryRequirements,
+        ProducerRequirements,
+        DestinationRequirements | &mut Allocator | &mut MonotonicClock | &mut Random,
+        AcquisitionRequirements,
+        Producer,
+      >(
+        &mut adapter,
+        move request,
+        &redirect,
+        move factory,
+        copyDeadline(&deadline),
+        Bytes.asMutSlice(&mut scratch),
+        move response,
+      ),
+    )
+  }
+}
+
+/// Sends a request whose body comes from a new producer from `factory` for each attempt, and gives
+/// the body of the final response to `sink` in chunks.
+pub effect<'env> fn toSinkReplay<
+  'fetch,
+  'uri,
+  'method,
+  'headers,
+  'policy,
+  RoutedP,
+  DirectP,
+  FactoryError,
+  ProducerError,
+  SinkError: Intrinsic.Detached,
+  AcquisitionError,
+  ?FactoryRequirements,
+  ?ProducerRequirements,
+  ?SinkRequirements,
+  ?AcquisitionRequirements,
+  Factory: ReplayFactory<Producer, FactoryError, FactoryRequirements> + 'env,
+  Producer: BodyProducer<ProducerError ? ProducerRequirements>,
+  S: Sink<SinkError ? SinkRequirements> + 'env,
+  C: FetchClient<
+    'policy,
+    RoutedP,
+    DirectP,
+    Redirect.AttemptStep<'policy, FetchResult>,
+    RedirectError | FetchError | ValueError | BodyError | ProducerError | DestinationFailure<
+      SinkError,
+    > | ExchangeError | OutOfMemoryError,
+    AcquisitionError,
+    ProducerRequirements | SinkRequirements | &mut Redirect.SelectedBody<
+      ProducerError,
+      ProducerRequirements,
+    > | &mut MonotonicClock | &mut Allocator | &mut Random,
+    AcquisitionRequirements,
+  >,
+  'env,
+>(
+  fetch: &'fetch mut Fetch<C>,
+  request: FetchRequest<'uri, 'method, 'headers, 'policy>,
+  factory: Factory,
+  options: FetchOptions,
+  sink: S,
+) -> FetchResult
+! RedirectError | FetchError | ValueError | BodyError | FactoryError | ProducerError | DestinationFailure<
+  SinkError,
+> | ExchangeError | OutOfMemoryError | AcquisitionError
+? FactoryRequirements | ProducerRequirements | SinkRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
+where
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport,
+  FactoryRequirements in Without<FactoryRequirements, ByteDuplex>,
+  FactoryRequirements in Without<FactoryRequirements, HttpTransport>,
+  ProducerRequirements in Without<ProducerRequirements, ByteDuplex>,
+  ProducerRequirements in Without<ProducerRequirements, HttpTransport>,
+  SinkRequirements in Without<SinkRequirements, ByteDuplex>,
+  SinkRequirements in Without<SinkRequirements, HttpTransport>,
+  AcquisitionRequirements in Without<AcquisitionRequirements, ByteDuplex>,
+  AcquisitionRequirements in Without<AcquisitionRequirements, HttpTransport> {
+  run admit(&options)
+  let operation = ReplayOperation<
+    'fetch,
+    'policy,
+    RoutedP,
+    DirectP,
+    FetchResult,
+    FactoryError,
+    ProducerError,
+    DestinationFailure<SinkError>,
+    AcquisitionError,
+    FactoryRequirements,
+    ProducerRequirements,
+    SinkRequirements,
+    AcquisitionRequirements,
+    Factory,
+    Producer,
+    SinkDestination<SinkError, SinkRequirements, S>,
+    C,
+  > {
+    fetch: move fetch,
+    factory: move factory,
+    policyAnchor: [],
+    options: move options,
+    destination: SinkDestination<SinkError, SinkRequirements, S> {sink: move sink},
+  }
+  return run withSemanticRequest<RoutedP, DirectP>(move request, move operation)
+}
+
+/// Sends a request whose body comes from a new producer from `factory` for each attempt, and
+/// returns the body of the final response in memory. More than `maxBodyBytes` fails, and no partial
+/// body is returned.
+pub effect<'env> fn collectReplay<
+  'fetch,
+  'uri,
+  'method,
+  'headers,
+  'policy,
+  RoutedP,
+  DirectP,
+  FactoryError,
+  ProducerError,
+  AcquisitionError,
+  ?FactoryRequirements,
+  ?ProducerRequirements,
+  ?AcquisitionRequirements,
+  Factory: ReplayFactory<Producer, FactoryError, FactoryRequirements> + 'env,
+  Producer: BodyProducer<ProducerError ? ProducerRequirements>,
+  C: FetchClient<
+    'policy,
+    RoutedP,
+    DirectP,
+    Redirect.AttemptStep<'policy, CollectedResponse>,
+    RedirectError | FetchError | ValueError | BodyError | ProducerError | ExchangeError | OutOfMemoryError,
+    AcquisitionError,
+    ProducerRequirements | &mut Redirect.SelectedBody<ProducerError, ProducerRequirements> | &mut MonotonicClock | &mut Allocator | &mut Random,
+    AcquisitionRequirements,
+  >,
+  'env,
+>(
+  fetch: &'fetch mut Fetch<C>,
+  request: FetchRequest<'uri, 'method, 'headers, 'policy>,
+  factory: Factory,
+  options: FetchOptions,
+  maxBodyBytes: usize,
+) -> CollectedResponse
+! RedirectError | FetchError | ValueError | BodyError | FactoryError | ProducerError | ExchangeError | OutOfMemoryError | AcquisitionError
+? FactoryRequirements | ProducerRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
+where
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport,
+  FactoryRequirements in Without<FactoryRequirements, ByteDuplex>,
+  FactoryRequirements in Without<FactoryRequirements, HttpTransport>,
+  ProducerRequirements in Without<ProducerRequirements, ByteDuplex>,
+  ProducerRequirements in Without<ProducerRequirements, HttpTransport>,
+  AcquisitionRequirements in Without<AcquisitionRequirements, ByteDuplex>,
+  AcquisitionRequirements in Without<AcquisitionRequirements, HttpTransport> {
+  run admit(&options)
+  let operation = ReplayOperation<
+    'fetch,
+    'policy,
+    RoutedP,
+    DirectP,
+    CollectedResponse,
+    FactoryError,
+    ProducerError,
+    FetchError | OutOfMemoryError,
+    AcquisitionError,
+    FactoryRequirements,
+    ProducerRequirements,
+    &mut Allocator,
+    AcquisitionRequirements,
+    Factory,
+    Producer,
+    CollectDestination,
+    C,
+  > {
+    fetch: move fetch,
+    factory: move factory,
+    policyAnchor: [],
+    options: move options,
+    destination: CollectDestination {body: Bytes.make(), maximum: maxBodyBytes},
+  }
+  return run withSemanticRequest<RoutedP, DirectP>(move request, move operation)
+}
+
+/// Sends a request whose body comes from a new producer from `factory` for each attempt, and reads
+/// and checks the body of the final response without keeping it. More than `maxDiscardBytes` fails.
+pub effect<'env> fn discardReplay<
+  'fetch,
+  'uri,
+  'method,
+  'headers,
+  'policy,
+  RoutedP,
+  DirectP,
+  FactoryError,
+  ProducerError,
+  AcquisitionError,
+  ?FactoryRequirements,
+  ?ProducerRequirements,
+  ?AcquisitionRequirements,
+  Factory: ReplayFactory<Producer, FactoryError, FactoryRequirements> + 'env,
+  Producer: BodyProducer<ProducerError ? ProducerRequirements>,
+  C: FetchClient<
+    'policy,
+    RoutedP,
+    DirectP,
+    Redirect.AttemptStep<'policy, FetchResult>,
+    RedirectError | FetchError | ValueError | BodyError | ProducerError | ExchangeError | OutOfMemoryError,
+    AcquisitionError,
+    ProducerRequirements | &mut Redirect.SelectedBody<ProducerError, ProducerRequirements> | &mut MonotonicClock | &mut Allocator | &mut Random,
+    AcquisitionRequirements,
+  >,
+  'env,
+>(
+  fetch: &'fetch mut Fetch<C>,
+  request: FetchRequest<'uri, 'method, 'headers, 'policy>,
+  factory: Factory,
+  options: FetchOptions,
+  maxDiscardBytes: u64,
+) -> FetchResult
+! RedirectError | FetchError | ValueError | BodyError | FactoryError | ProducerError | ExchangeError | OutOfMemoryError | AcquisitionError
+? FactoryRequirements | ProducerRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
+where
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &HttpTransport from &mut HttpTransport,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut RoutedP provides &ByteDuplex from &mut ByteDuplex,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut DirectP provides &HttpTransport from &mut HttpTransport,
+  FactoryRequirements in Without<FactoryRequirements, ByteDuplex>,
+  FactoryRequirements in Without<FactoryRequirements, HttpTransport>,
+  ProducerRequirements in Without<ProducerRequirements, ByteDuplex>,
+  ProducerRequirements in Without<ProducerRequirements, HttpTransport>,
+  AcquisitionRequirements in Without<AcquisitionRequirements, ByteDuplex>,
+  AcquisitionRequirements in Without<AcquisitionRequirements, HttpTransport> {
+  run admit(&options)
+  let operation = ReplayOperation<
+    'fetch,
+    'policy,
+    RoutedP,
+    DirectP,
+    FetchResult,
+    FactoryError,
+    ProducerError,
+    FetchError,
+    AcquisitionError,
+    FactoryRequirements,
+    ProducerRequirements,
+    never,
+    AcquisitionRequirements,
+    Factory,
+    Producer,
+    DiscardDestination,
+    C,
+  > {
+    fetch: move fetch,
+    factory: move factory,
+    policyAnchor: [],
+    options: move options,
+    destination: DiscardDestination {maximum: maxDiscardBytes},
+  }
+  return run withSemanticRequest<RoutedP, DirectP>(move request, move operation)
+}
+
+fn copyInstant(value: &Instant) -> Instant {
+  return SystemClock.make(SystemClock.seconds(value), SystemClock.nanoseconds(value))
+}
+
+fn copyDeadline(value: &Option<Instant>) -> Option<Instant> {
+  return match & value.* {
+    Option.None => Option<Instant>.none()
+    Option.Some {value: present} => Option<Instant>.some(copyInstant(&present))
+  }
+}
+
+fn unavailable<T>() -> T {
+  return Intrinsic.trap("HTTP fetch: an internal value was missing where the fetch had just stored it")
+}
+
+fn fetchFailure(phase: FetchPhase, reason: FetchReason) -> FetchError {
+  return FetchError {
+    phase: phase,
+    reason: move reason,
+    status: Option<Status>.none(),
+    uri: Option<OwnedUri>.none(),
+    deliveredBodyBytes: u64.MIN,
+    offeredBodyBytes: usize.ZERO,
+  }
+}
+
+fn ownedResponseFailure(
+  phase: FetchPhase,
+  reason: FetchReason,
+  status: Option<Status>,
+  uri: OwnedUri,
+  delivered: u64,
+  offered: usize,
+) -> FetchError {
+  return FetchError {
+    phase: phase,
+    reason: move reason,
+    status: move status,
+    uri: Option<OwnedUri>.some(move uri),
+    deliveredBodyBytes: delivered,
+    offeredBodyBytes: offered,
+  }
+}
+
+fn enrichResponseStatus(error: FetchError, status: Status) -> FetchError {
+  let FetchError {phase, reason, status: priorStatus, uri, deliveredBodyBytes, offeredBodyBytes} = move error
+  drop priorStatus
+  return FetchError {
+    phase: phase,
+    reason: move reason,
+    status: Option<Status>.some(status),
+    uri: move uri,
+    deliveredBodyBytes: deliveredBodyBytes,
+    offeredBodyBytes: offeredBodyBytes,
+  }
+}
+
+effect fn borrowedResponseFailure<'uri>(
+  phase: FetchPhase,
+  reason: FetchReason,
+  status: Option<Status>,
+  uri: &Uri<'uri>,
+  delivered: u64,
+  offered: usize,
+) -> FetchError ! OutOfMemoryError ? &mut Allocator {
+  return ownedResponseFailure(
+    phase,
+    move reason,
+    move status,
+    run Uri.copy(uri),
+    delivered,
+    offered,
+  )
+}
+
+fn metadataFailure(
+  phase: FetchPhase,
+  reason: FetchReason,
+  metadata: &ResponseMetadata,
+  delivered: u64,
+  offered: usize,
+) -> FetchError {
+  let head = metadata.head.view()
+  let status = head.status()
+  drop head
+  return FetchError {
+    phase: phase,
+    reason: move reason,
+    status: Option<Status>.some(status),
+    uri: Option<OwnedUri>.none(),
+    deliveredBodyBytes: delivered,
+    offeredBodyBytes: offered,
+  }
+}
+
+fn ownedMetadataFailure(
+  phase: FetchPhase,
+  reason: FetchReason,
+  metadata: ResponseMetadata,
+  delivered: u64,
+  offered: usize,
+) -> FetchError {
+  let ResponseMetadata {finalUri, head, representation, ownedBytes} = move metadata
+  let headView = head.view()
+  let status = headView.status()
+  drop headView
+  drop head
+  drop representation
+  drop ownedBytes
+  return ownedResponseFailure(
+    phase,
+    move reason,
+    Option<Status>.some(status),
+    move finalUri,
+    delivered,
+    offered,
+  )
+}
+
+fn enrichResponseFailure(
+  error: FetchError,
+  status: Status,
+  uri: OwnedUri,
+  delivered: u64,
+  offered: usize,
+) -> FetchError {
+  let FetchError {
+    phase,
+    reason,
+    status: priorStatus,
+    uri: priorUri,
+    deliveredBodyBytes,
+    offeredBodyBytes,
+  } = move error
+  drop priorStatus
+  drop priorUri
+  drop deliveredBodyBytes
+  drop offeredBodyBytes
+  return ownedResponseFailure(
+    phase,
+    move reason,
+    Option<Status>.some(status),
+    move uri,
+    delivered,
+    offered,
+  )
+}
+
+fn enrichMetadataFailure(
+  error: FetchError,
+  metadata: ResponseMetadata,
+  delivered: u64,
+  offered: usize,
+) -> FetchError {
+  let FetchError {phase, reason, status, uri, deliveredBodyBytes, offeredBodyBytes} = move error
+  drop status
+  drop uri
+  drop deliveredBodyBytes
+  drop offeredBodyBytes
+  return ownedMetadataFailure(phase, move reason, move metadata, delivered, offered)
+}
+
+fn contentOptionFailure(error: ContentError<'static>) -> FetchError {
+  let ContentError<'static> {reason, written, totalEncoded, totalIntermediate, totalDecoded} = move error
+  return match move reason {
+    ContentReason.InvalidLimit {limit, allowed, attempted} => FetchError {
+      phase: FetchPhase.Decode,
+      reason: FetchReason.Content {
+        error: FetchContentError {
+          reason: FetchContentReason.InvalidLimit {
+            limit: limit,
+            allowed: allowed,
+            attempted: attempted,
+          },
+          written: written,
+          totalEncoded: totalEncoded,
+          totalIntermediate: totalIntermediate,
+          totalDecoded: totalDecoded,
+        },
+      },
+      status: Option<Status>.none(),
+      uri: Option<OwnedUri>.none(),
+      deliveredBodyBytes: u64.MIN,
+      offeredBodyBytes: usize.ZERO,
+    }
+    _ => fetchFailure(FetchPhase.Decode, FetchReason.InvalidOptions)
+  }
+}
+
+fn switchingFailure() -> FetchError {
+  let status = match move Status.fromCode(101) {
+    Result.Failure {error} => {
+      drop error
+      return unavailable<FetchError>()
+    }
+    Result.Success {value} => value
+  }
+  return FetchError {
+    phase: FetchPhase.Head,
+    reason: FetchReason.UnsupportedSwitchingResponse {status: status},
+    status: Option<Status>.some(status),
+    uri: Option<OwnedUri>.none(),
+    deliveredBodyBytes: u64.MIN,
+    offeredBodyBytes: usize.ZERO,
+  }
+}
+
+effect fn mapSwitching<'env, A, E, ?R>(attempted: once Effect<'env; A ! E | ExchangeError ? R>) -> A
+! E | ExchangeError | FetchError
+? R {
+  let outcome = run Effect.result(move attempted)
+  return match move outcome {
+    Result.Success {value} => move value
+    Result.Failure {error} => match move error {
+      ExchangeError.UnsupportedUpgrade => {
+        fail switchingFailure()
+      }
+      ExchangeError cause => {
+        fail move cause
+      }
+      E cause => {
+        fail move cause
+      }
+    }
+  }
+}
+
+fn limitFailure(
+  phase: FetchPhase,
+  limit: FetchLimit,
+  allowed: u64,
+  attempted: u64,
+  delivered: u64,
+  offered: usize,
+) -> FetchError {
+  return FetchError {
+    phase: phase,
+    reason: FetchReason.LimitExceeded {limit: limit, allowed: allowed, attempted: attempted},
+    status: Option<Status>.none(),
+    uri: Option<OwnedUri>.none(),
+    deliveredBodyBytes: delivered,
+    offeredBodyBytes: offered,
+  }
+}
+
+fn copyContinuePolicy(value: &ContinuePolicy) -> ContinuePolicy {
+  return match & value.* {
+    ContinuePolicy.Disabled => ContinuePolicy.Disabled
+    ContinuePolicy.Require100 {deadline} => ContinuePolicy.Require100 {
+      deadline: copyInstant(&deadline),
+    }
+  }
+}
+
+fn copyContentLimits(value: &ContentLimits) -> ContentLimits {
+  return ContentLimits {
+    maxEncoded: value.maxEncoded,
+    maxIntermediate: value.maxIntermediate,
+    maxDecoded: value.maxDecoded,
+    maxOwned: value.maxOwned,
+    maxDepth: value.maxDepth,
+    intermediateCapacity: value.intermediateCapacity,
+    inflate: InflateLimits {
+      maxInputBytes: value.inflate.maxInputBytes,
+      maxOutputBytes: value.inflate.maxOutputBytes,
+      maxMembers: value.inflate.maxMembers,
+      maxHeaderBytes: value.inflate.maxHeaderBytes,
+      maxMemoryBytes: value.inflate.maxMemoryBytes,
+    },
+    zstd: ZstdLimits {
+      inputBytes: value.zstd.inputBytes,
+      outputBytes: value.zstd.outputBytes,
+      frames: value.zstd.frames,
+      skippableBytes: value.zstd.skippableBytes,
+      windowBytes: value.zstd.windowBytes,
+      workspaceBytes: value.zstd.workspaceBytes,
+    },
+  }
+}
+
+effect fn ownContentError<'head>(
+  error: ContentError<'head>,
+  metadataUsed: usize,
+  metadataLimit: usize,
+) -> FetchContentError ! FetchError | OutOfMemoryError ? &mut Allocator {
+  let ContentError<'head> {reason, written, totalEncoded, totalIntermediate, totalDecoded} = move error
+  let ownedReason = match move reason {
+    ContentReason.InvalidLimit {limit, allowed, attempted} => FetchContentReason.InvalidLimit {
+      limit: limit,
+      allowed: allowed,
+      attempted: attempted,
+    }
+    ContentReason.CodingSyntax {position} => FetchContentReason.CodingSyntax {position: position}
+    ContentReason.UnsupportedCoding {position, token} => run ownUnsupportedCoding(
+      position,
+      token,
+      metadataUsed,
+      metadataLimit,
+    )
+    ContentReason.PartialResponse {position} => FetchContentReason.PartialResponse {
+      position: position,
+    }
+    ContentReason.Tunnel => FetchContentReason.Tunnel
+    ContentReason.Body {error: cause} => FetchContentReason.Body {error: move cause}
+    ContentReason.Buffer {error: cause} => FetchContentReason.Buffer {error: move cause}
+    ContentReason.Inflate {stage, wireIndex, error: cause} => FetchContentReason.Inflate {
+      stage: stage,
+      wireIndex: wireIndex,
+      error: move cause,
+    }
+    ContentReason.Zstandard {stage, wireIndex, error: cause} => FetchContentReason.Zstandard {
+      stage: stage,
+      wireIndex: wireIndex,
+      error: move cause,
+    }
+    ContentReason.TrailingEncodedData {stage, wireIndex} => FetchContentReason.TrailingEncodedData {
+      stage: stage,
+      wireIndex: wireIndex,
+    }
+    ContentReason.ArithmeticOverflow => FetchContentReason.ArithmeticOverflow
+    ContentReason.InvalidState => FetchContentReason.InvalidState
+  }
+  return FetchContentError {
+    reason: move ownedReason,
+    written: written,
+    totalEncoded: totalEncoded,
+    totalIntermediate: totalIntermediate,
+    totalDecoded: totalDecoded,
+  }
+}
+
+effect fn ownUnsupportedCoding(
+  position: CodingPosition,
+  token: &[u8],
+  metadataUsed: usize,
+  metadataLimit: usize,
+) -> FetchContentReason ! FetchError | OutOfMemoryError ? &mut Allocator {
+  let total = match move usize.checkedAdd(metadataUsed, token.length) {
+    Option.None => {
+      fail fetchFailure(FetchPhase.Decode, FetchReason.SizeOverflow)
+    }
+    Option.Some {value} => value
+  }
+  if total > metadataLimit {
+    fail limitFailure(
+      FetchPhase.Decode,
+      FetchLimit.OwnedMetadataBytes,
+      usize.toU64(metadataLimit),
+      usize.toU64(total),
+      u64.MIN,
+      usize.ZERO,
+    )
+  }
+  return FetchContentReason.UnsupportedCoding {position: position, token: run Bytes.copy(token)}
+}

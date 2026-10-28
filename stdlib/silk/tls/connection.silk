@@ -1,0 +1,1140 @@
+//! An authenticated TLS 1.3 connection over a `ByteDuplex` transport, with timeouts and close
+//! handling.
+//!
+//! # When to use
+//! Use [`withClient`] to authenticate a server, use the connection inside a callback, and close it
+//! when the callback returns. Use [`authenticateOwned`] when the connection must live longer than
+//! one scope, for example in a connection pool. Then you must call [`OwnedConnection.close`]. Load
+//! the trust snapshot before you call either one.
+//!
+//! # Details
+//! Authentication reads the wall clock one time for certificate dates, makes a `Client`, and runs
+//! the handshake over the transport. [`ConnectionOptions`] sets the handshake timeout, and an
+//! optional external deadline. You get the connection only after authentication succeeds. Then use
+//! [`OwnedConnection.readSome`], [`OwnedConnection.writeSome`], and [`OwnedConnection.flush`].
+//!
+//! # Errors
+//! - [`ConnectionError`] for a TLS failure, a transport failure, or a timeout.
+//! - `OutOfMemoryError` if the `Allocator` fails.
+//!
+//! # Gotchas
+//! After an I/O error or a cancellation, the connection closes its transport, so that no partial
+//! buffer is sent again. [`OwnedConnection.shutdownWrite`] sends `close_notify` and closes the
+//! write direction. [`OwnedConnection.close`] closes at once, without `close_notify`.
+//! [`withClient`] ignores errors from its own close, so that they do not hide the result of the
+//! callback.
+//!
+//! # Examples
+//! ## Connect every dependency
+//! This example gives the client no server bytes and no trust, so the handshake fails. A real
+//! program provides a network transport, the system clocks, a secure `Random`, and loaded trust in
+//! the same places.
+//!
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.tls.https_identity { HttpsIdentity, OriginHost, ReferenceIdentity }
+//! import silk.io.memory_byte_duplex { MemoryByteDuplex, MemoryReadEvent, MemoryWriteEvent }
+//! import silk.system.monotonic_clock { MonotonicClock }
+//! import silk.option { Option }
+//! import silk.system.random { Random }
+//! import silk.core.result { Result }
+//! import silk.system.system_clock { Instant, SystemClock }
+//! import silk.tls.client { AlpnConfig, ClientConfig, ClientLimits }
+//! import silk.tls.connection { OwnedConnection, ConnectionOptions, withClient }
+//! import silk.tls.trust_anchor { TrustAnchor }
+//! import silk.tls.trust_snapshot { SnapshotLimits, TrustSnapshot }
+//! import silk.num.u64
+//! import silk.num.usize
+//! import silk.collections.list { List }
+//!
+//! struct FixedWall {}
+//!
+//! impl SystemClock for FixedWall {
+//!   effect fn now(self: &mut Self) -> Instant {
+//!     return SystemClock.make(0, 0)
+//!   }
+//!
+//!   effect fn getResolution(self: &mut Self) -> u64 {
+//!     return u64.toU64(1)
+//!   }
+//! }
+//!
+//! struct FixedMonotonic {}
+//!
+//! impl MonotonicClock for FixedMonotonic {
+//!   effect fn now(self: &mut Self) -> Instant {
+//!     return SystemClock.make(0, 0)
+//!   }
+//!
+//!   effect fn getResolution(self: &mut Self) -> u64 {
+//!     return u64.toU64(1)
+//!   }
+//!
+//!   effect fn waitUntil(self: &mut Self, when: Instant) -> () {
+//!     drop when
+//!     return ()
+//!   }
+//!
+//!   effect fn waitFor(self: &mut Self, howLong: u64) -> () {
+//!     drop howLong
+//!     return ()
+//!   }
+//! }
+//!
+//! struct ExampleRandom {}
+//!
+//! impl Random for ExampleRandom {
+//!   effect fn fillBytes(self: &mut Self, output: &mut [u8]) -> () {
+//!     let mut index = usize.ZERO
+//!     while index < output.length {
+//!       output[index] = 1
+//!       index = index + usize.ONE
+//!     }
+//!     return ()
+//!   }
+//! }
+//!
+//! fn reference<'a>(host: &'a [u8]) -> ReferenceIdentity<'a> {
+//!   return match move HttpsIdentity.reference(OriginHost<'a>.Dns { bytes: host }) {
+//!     Result.Success { value } => value
+//!     Result.Failure { error } => {
+//!       Intrinsic.trap("unexpected failure")
+//!       return reference(host)
+//!     }
+//!   }
+//! }
+//!
+//! fn emptyTrust() -> TrustSnapshot {
+//!   return match move TrustSnapshot.fromAnchors(
+//!     List<TrustAnchor>.make(),
+//!     SnapshotLimits { anchors: 0, encodedBytes: 0 },
+//!   ) {
+//!     Result.Success { value } => move value
+//!     Result.Failure { error } => {
+//!       Intrinsic.trap("unexpected failure")
+//!       return emptyTrust()
+//!     }
+//!   }
+//! }
+//!
+//! effect fn inspect(connection: &mut OwnedConnection<MemoryByteDuplex>) -> i32 {
+//!   // The handshake fails in this example, so reaching this point is unexpected.
+//!   drop connection
+//!   return 1
+//! }
+//!
+//! effect<'env> fn expected<E: 'env, 'env>(error: E) -> i32 {
+//!   drop error
+//!   return 0
+//! }
+//!
+//! effect<'env> fn failed<E: 'env, 'env>(error: E) -> i32 {
+//!   drop error
+//!   return 1
+//! }
+//!
+//! effect fn program() -> i32
+//!   ! OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let reads = List<MemoryReadEvent>.make()
+//!   let writes = List<MemoryWriteEvent>.make()
+//!   let mut transport = run MemoryByteDuplex.make(move reads, move writes, 256, 4, Option<i32>.none())
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let trust = emptyTrust()
+//!   let mut wall = FixedWall {}
+//!   let mut monotonic = FixedMonotonic {}
+//!   let mut random = ExampleRandom {}
+//!   let host = b"example.com"
+//!   let config = ClientConfig {
+//!     reference: reference(&host),
+//!     alpn: AlpnConfig.defaults(),
+//!     limits: ClientLimits.defaults(),
+//!   }
+//!   let attempt = withClient<i32, never>(
+//!     move transport,
+//!     &config,
+//!     move trust,
+//!     ConnectionOptions.defaults(),
+//!     inspect,
+//!   )
+//!     |> Effect.provideMut<SystemClock>(&mut wall)
+//!     |> Effect.provideMut<MonotonicClock>(&mut monotonic)
+//!     |> Effect.provideMut<Random>(&mut random)
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!
+//!   // Without server bytes, authentication fails as expected.
+//!   return run Effect.catchAll(move attempt, expected)
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   return run Effect.catchAll(program(), failed)
+//! }
+//! ```
+//!
+//! @category TLS and certificates
+
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.io.byte_duplex {ByteDuplex, ByteIoError, ByteIoOperation, ReadTransfer}
+import silk.collections.bytes {Bytes}
+import silk.core.effect {Effect}
+import silk.format {Debug, Format, Formatter}
+import silk.system.monotonic_clock {MonotonicClock}
+import silk.option {Option}
+import silk.system.random {Random}
+import silk.core.result {Result}
+import silk.collections.slice {Slice}
+import silk.system.system_clock {Instant, SystemClock}
+import silk.tls.client {
+  Authentication,
+  Client,
+  ClientConfig,
+  ClientOperation,
+  Demand,
+  Progress,
+  TlsError,
+}
+import silk.tls.trust_snapshot {TrustSnapshot}
+import silk.num.u64
+import silk.num.usize
+import silk.io.writer {Writer, WriterError}
+
+/// The state of an [`OwnedConnection`]. Read it with [`OwnedConnection.phase`].
+pub enum ConnectionPhase {
+  /// You can read and write.
+  Open,
+  /// The server sent `close_notify`. You can still read plaintext that is buffered.
+  PeerEnded,
+  /// You called [`OwnedConnection.shutdownWrite`]. You can still read, but you cannot write.
+  WriteShutdown,
+  /// A TLS or transport error occurred. Later I/O fails. Call [`OwnedConnection.close`].
+  Invalid,
+  /// You called [`OwnedConnection.close`]. All later I/O fails.
+  Closed,
+}
+
+/// The error from authentication and from connection I/O: a TLS failure, a transport failure, or a
+/// timeout.
+pub union ConnectionError {
+  /// The TLS client rejected the server or the operation. After this error, the connection stays
+  /// failed.
+  Tls {
+    /// The TLS error.
+    pub error: TlsError,
+  },
+  /// The transport failed. During the handshake, a transport timeout becomes `HandshakeTimeout`.
+  Io {
+    /// The transport error.
+    pub error: ByteIoError,
+  },
+  /// The handshake did not complete before its deadline.
+  HandshakeTimeout,
+}
+
+impl Debug for ConnectionError {
+  /// Writes the name of the variant and its fields, such as `Tls { ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      ConnectionError.Tls { error } => {
+        let mut record = run Format.debugRecord("Tls", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      ConnectionError.Io { error } => {
+        let mut record = run Format.debugRecord("Io", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      ConnectionError.HandshakeTimeout => run Format.write(&mut formatter, b"HandshakeTimeout")
+    }
+  }
+}
+
+/// Timeouts for authentication: the handshake timeout and an optional external deadline. Start from
+/// [`ConnectionOptions.defaults`].
+pub struct ConnectionOptions {
+  /// The maximum duration of the handshake, in nanoseconds, measured with the `MonotonicClock`.
+  pub handshakeTimeoutNanoseconds: u64,
+  /// An optional absolute deadline on the `MonotonicClock`. If it is earlier than the handshake
+  /// timeout, the handshake stops at this deadline.
+  pub externalDeadline: Option<Instant>,
+}
+
+impl ConnectionOptions {
+  /// Returns a 30-second handshake timeout and no external deadline.
+  pub fn defaults() -> ConnectionOptions {
+    return ConnectionOptions {
+      handshakeTimeoutNanoseconds: u64.toU64(30000000000),
+      externalDeadline: Option<Instant>.none(),
+    }
+  }
+}
+
+/// The private authenticated protocol state carried by one scoped connection.
+struct ConnectionState {
+  client: Client,
+  input: Bytes,
+  inputOffset: usize,
+  inputLength: usize,
+  phaseValue: ConnectionPhase,
+}
+
+/// Unforgeable association marker created only after this exact provider authenticated the peer.
+///
+/// The owned `Client` retains the reference, ALPN, certificate, and validation-time evidence. This
+/// zero-state marker records that the module published that evidence together with this provider.
+struct AuthenticatedProvenance {}
+
+/// An authenticated TLS client connection that owns its transport `P`.
+///
+/// Get one from [`authenticateOwned`], or borrow one in the [`withClient`] callback. All I/O
+/// functions take an optional `deadline` on the `MonotonicClock`. Use `Option<Instant>.none()` to
+/// wait without a limit. Use [`OwnedConnection.readSome`], [`OwnedConnection.writeSome`], and
+/// [`OwnedConnection.flush`] for application data.
+///
+/// # Gotchas
+/// After an I/O error or a cancellation, the connection closes its transport, so that no partial
+/// buffer is sent again. [`OwnedConnection.shutdownWrite`] sends `close_notify` and closes the
+/// write direction. [`OwnedConnection.close`] closes at once, without `close_notify`. You must call
+/// [`OwnedConnection.close`] on a connection from [`authenticateOwned`].
+pub struct OwnedConnection<P> {
+  state: ConnectionState,
+  provider: P,
+  provenance: AuthenticatedProvenance,
+}
+
+impl<P> OwnedConnection<P> {
+  /// Returns the current [`ConnectionPhase`].
+  pub fn phase(self: &Self) -> ConnectionPhase {
+    return self.state.phaseValue
+  }
+  /// Returns the result of authentication: the cipher suite, the ALPN protocol, and the certificate
+  /// details.
+  pub fn authentication<'a>(self: &'a Self) -> Option<Authentication<'a>> {
+    return Client.authentication(&self.state.client)
+  }
+  /// Reads decrypted application data into `output`, and returns how many bytes it read.
+  ///
+  /// # Details
+  /// The function first sends TLS output that is waiting. It returns at least one byte, or the end
+  /// of input when the server sent `close_notify`.
+  ///
+  /// # Errors
+  /// - `Tls` with `TruncatedAfterAuthentication` if the transport ends without `close_notify`.
+  /// - `Tls` with `EmptyBuffer` if `output` is empty.
+  /// - `Io` if the transport fails or the `deadline` passes.
+  pub effect fn readSome<'connection>(
+    self: &'connection mut Self,
+    output: &mut [u8],
+    deadline: Option<Instant>,
+  ) -> ReadTransfer
+  ! ConnectionError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator | &mut Random
+  where
+    &mut P provides &ByteDuplex from &mut ByteDuplex,
+    &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random {
+    if self.state.phaseValue == ConnectionPhase.Invalid || self.state.phaseValue == ConnectionPhase.Closed {
+      fail connectionIo(ByteDuplex.closed(ByteIoOperation.Read))
+    }
+    if output.length == usize.ZERO {
+      return ReadTransfer.Data {count: usize.ZERO}
+    }
+    let guard = OperationGuard<'connection, P> {
+      state: &mut self.state,
+      provider: &mut self.provider,
+      completed: false,
+    }
+    let use = effect fn(owned: &mut OperationGuard<'connection, P>) -> ReadTransfer
+    ! ConnectionError | OutOfMemoryError
+    ? &mut MonotonicClock | &mut Allocator | &mut Random {
+      let operation = readSomeLoop(&mut owned.state.*, move output, &deadline)
+        |> Effect.provideMut<ByteDuplex>(&mut owned.provider.*)
+      let attempted = run Effect.result(move operation)
+      owned.completed = match & attempted {
+        Result<ReadTransfer, ConnectionError | OutOfMemoryError>.Success {value} => true
+        Result<ReadTransfer, ConnectionError | OutOfMemoryError>.Failure {error} => false
+      }
+      return run restore<ReadTransfer>(move attempted)
+    }
+    let release = effect fn(owned: &mut OperationGuard<'connection, P>) -> () {
+      if owned.completed {
+        return ()
+      }
+      owned.state.phaseValue = ConnectionPhase.Closed
+      owned.state.inputOffset = usize.ZERO
+      owned.state.inputLength = usize.ZERO
+      return run closeProvider<P>(&mut owned.provider.*)
+    }
+    return run Effect.useReleaseNonParking(move guard, move use, move release)
+  }
+  /// Encrypts and sends a prefix of `input`, and returns how many bytes it sent.
+  ///
+  /// # Details
+  /// One call encrypts at most one TLS record of 16384 bytes, and sends all of that record before
+  /// it returns. Call it again with the rest of `input`.
+  ///
+  /// # Errors
+  /// - `Tls` if the connection cannot write, for example after [`OwnedConnection.shutdownWrite`].
+  /// - `Io` if the transport fails, the server closed the connection, or the `deadline` passes.
+  pub effect fn writeSome<'connection>(
+    self: &'connection mut Self,
+    input: &[u8],
+    deadline: Option<Instant>,
+  ) -> usize
+  ! ConnectionError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator | &mut Random
+  where
+    &mut P provides &ByteDuplex from &mut ByteDuplex,
+    &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random {
+    if self.state.phaseValue != ConnectionPhase.Open {
+      fail connectionIo(ByteDuplex.closed(ByteIoOperation.Write))
+    }
+    if input.length == usize.ZERO {
+      return usize.ZERO
+    }
+    let guard = OperationGuard<'connection, P> {
+      state: &mut self.state,
+      provider: &mut self.provider,
+      completed: false,
+    }
+    let use = effect fn(owned: &mut OperationGuard<'connection, P>) -> usize
+    ! ConnectionError | OutOfMemoryError
+    ? &mut MonotonicClock | &mut Allocator | &mut Random {
+      let operation = writeSomeLoop(&mut owned.state.*, input, &deadline)
+        |> Effect.provideMut<ByteDuplex>(&mut owned.provider.*)
+      let attempted = run Effect.result(move operation)
+      owned.completed = match & attempted {
+        Result<usize, ConnectionError | OutOfMemoryError>.Success {value} => true
+        Result<usize, ConnectionError | OutOfMemoryError>.Failure {error} => false
+      }
+      return run restore<usize>(move attempted)
+    }
+    let release = effect fn(owned: &mut OperationGuard<'connection, P>) -> () {
+      if owned.completed {
+        return ()
+      }
+      owned.state.phaseValue = ConnectionPhase.Closed
+      owned.state.inputOffset = usize.ZERO
+      owned.state.inputLength = usize.ZERO
+      return run closeProvider<P>(&mut owned.provider.*)
+    }
+    return run Effect.useReleaseNonParking(move guard, move use, move release)
+  }
+  /// Sends all TLS output that is waiting, then flushes the transport.
+  pub effect fn flush<'connection>(self: &'connection mut Self, deadline: Option<Instant>) -> ()
+  ! ConnectionError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator | &mut Random
+  where
+    &mut P provides &ByteDuplex from &mut ByteDuplex,
+    &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random {
+    if self.state.phaseValue == ConnectionPhase.Invalid || self.state.phaseValue == ConnectionPhase.Closed {
+      fail connectionIo(ByteDuplex.closed(ByteIoOperation.Flush))
+    }
+    let guard = OperationGuard<'connection, P> {
+      state: &mut self.state,
+      provider: &mut self.provider,
+      completed: false,
+    }
+    let use = effect fn(owned: &mut OperationGuard<'connection, P>) -> ()
+    ! ConnectionError | OutOfMemoryError
+    ? &mut MonotonicClock | &mut Allocator | &mut Random {
+      let operation = flushConnection(&mut owned.state.*, move deadline)
+        |> Effect.provideMut<ByteDuplex>(&mut owned.provider.*)
+      let attempted = run Effect.result(move operation)
+      owned.completed = match & attempted {
+        Result<(), ConnectionError | OutOfMemoryError>.Success {value} => true
+        Result<(), ConnectionError | OutOfMemoryError>.Failure {error} => false
+      }
+      return run restore<()>(move attempted)
+    }
+    let release = effect fn(owned: &mut OperationGuard<'connection, P>) -> () {
+      if owned.completed {
+        return ()
+      }
+      owned.state.phaseValue = ConnectionPhase.Closed
+      owned.state.inputOffset = usize.ZERO
+      owned.state.inputLength = usize.ZERO
+      return run closeProvider<P>(&mut owned.provider.*)
+    }
+    return run Effect.useReleaseNonParking(move guard, move use, move release)
+  }
+  /// Sends `close_notify`, flushes, and closes the write direction of the transport.
+  ///
+  /// You can still read the response of the server after this call. Call [`OwnedConnection.close`]
+  /// when you are done.
+  pub effect fn shutdownWrite<'connection>(self: &'connection mut Self, deadline: Option<Instant>) -> ()
+  ! ConnectionError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator | &mut Random
+  where
+    &mut P provides &ByteDuplex from &mut ByteDuplex,
+    &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random {
+    if self.state.phaseValue == ConnectionPhase.Invalid || self.state.phaseValue == ConnectionPhase.Closed {
+      fail connectionIo(ByteDuplex.closed(ByteIoOperation.ShutdownWrite))
+    }
+    if self.state.phaseValue == ConnectionPhase.WriteShutdown {
+      return ()
+    }
+    let guard = OperationGuard<'connection, P> {
+      state: &mut self.state,
+      provider: &mut self.provider,
+      completed: false,
+    }
+    let use = effect fn(owned: &mut OperationGuard<'connection, P>) -> ()
+    ! ConnectionError | OutOfMemoryError
+    ? &mut MonotonicClock | &mut Allocator | &mut Random {
+      let operation = shutdownConnection(&mut owned.state.*, move deadline)
+        |> Effect.provideMut<ByteDuplex>(&mut owned.provider.*)
+      let attempted = run Effect.result(move operation)
+      owned.completed = match & attempted {
+        Result<(), ConnectionError | OutOfMemoryError>.Success {value} => true
+        Result<(), ConnectionError | OutOfMemoryError>.Failure {error} => false
+      }
+      return run restore<()>(move attempted)
+    }
+    let release = effect fn(owned: &mut OperationGuard<'connection, P>) -> () {
+      if owned.completed {
+        return ()
+      }
+      owned.state.phaseValue = ConnectionPhase.Closed
+      owned.state.inputOffset = usize.ZERO
+      owned.state.inputLength = usize.ZERO
+      return run closeProvider<P>(&mut owned.provider.*)
+    }
+    return run Effect.useReleaseNonParking(move guard, move use, move release)
+  }
+  /// Closes the transport at once, without `close_notify`.
+  ///
+  /// # Details
+  /// The phase becomes `Closed` before the transport is closed. A second call does nothing and
+  /// succeeds.
+  ///
+  /// # Errors
+  /// - `Io` if the transport fails to close. The connection stays closed.
+  pub effect fn close(self: &mut Self) -> ()
+  ! ConnectionError
+  ? Without<&mut ByteDuplex, ByteDuplex>
+  where &mut P provides &ByteDuplex from &mut ByteDuplex {
+    if self.state.phaseValue == ConnectionPhase.Closed {
+      return ()
+    }
+    self.state.phaseValue = ConnectionPhase.Closed
+    self.state.inputOffset = usize.ZERO
+    self.state.inputLength = usize.ZERO
+    let attempted = run Effect.result(
+      ByteDuplex.close()
+        |> Effect.provideMut<ByteDuplex>(&mut self.provider),
+    )
+    return match move attempted {
+      Result<(), ByteIoError>.Success {value} => move value
+      Result<(), ByteIoError>.Failure {error} => {
+        fail connectionIo(move error)
+      }
+    }
+  }
+}
+
+struct OperationGuard<'connection, P> {
+  state: &'connection mut ConnectionState,
+  provider: &'connection mut P,
+  completed: bool,
+}
+
+effect<'env> fn restore<A: 'env, 'env>(result: Result<A, ConnectionError | OutOfMemoryError>) -> A
+! ConnectionError | OutOfMemoryError {
+  return match move result {
+    Result<A, ConnectionError | OutOfMemoryError>.Success {value} => move value
+    Result<A, ConnectionError | OutOfMemoryError>.Failure {error} => match move error {
+      ConnectionError connection => {
+        fail move connection
+      }
+      OutOfMemoryError allocation => {
+        fail move allocation
+      }
+    }
+  }
+}
+
+effect fn flushConnection(connection: &mut ConnectionState, deadline: Option<Instant>) -> ()
+! ConnectionError | OutOfMemoryError
+? &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random {
+  run drainOutput(&mut connection.*, &deadline, false)
+  return run io(&mut connection.*, ByteDuplex.flush(move deadline))
+}
+
+effect fn shutdownConnection(connection: &mut ConnectionState, deadline: Option<Instant>) -> ()
+! ConnectionError | OutOfMemoryError
+? &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random {
+  let closing = Client.closeWrite(&mut connection.client)
+  let scheduled = run requireProgress(&mut connection.*, move closing)
+  drop scheduled
+  run drainOutput(&mut connection.*, &deadline, false)
+  run io(&mut connection.*, ByteDuplex.flush(copyDeadline(&deadline)))
+  run io(&mut connection.*, ByteDuplex.shutdownWrite(move deadline))
+  connection.phaseValue = ConnectionPhase.WriteShutdown
+  return ()
+}
+
+effect fn writeSomeLoop(connection: &mut ConnectionState, input: &[u8], deadline: &Option<Instant>) -> usize
+! ConnectionError | OutOfMemoryError
+? &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random {
+  run drainOutput(&mut connection.*, deadline, false)
+  let written = Client.writePlaintext(&mut connection.client, input)
+  let progress = run requireProgress(&mut connection.*, move written)
+  if progress.consumed > input.length {
+    connection.phaseValue = ConnectionPhase.Invalid
+    fail connectionIo(
+      ByteDuplex.invalidTransferCount(ByteIoOperation.Write, progress.consumed, input.length),
+    )
+  }
+  if progress.consumed > usize.ZERO {
+    let accepted = progress.consumed
+    run drainOutput(&mut connection.*, deadline, false)
+    return accepted
+  }
+  match progress.demand {
+    Demand.NeedOutput => {
+      run drainOutput(&mut connection.*, deadline, false)
+      return run writeSomeLoop(move connection, move input, move deadline)
+    }
+    Demand.PeerClosed => {
+      connection.phaseValue = ConnectionPhase.PeerEnded
+      fail connectionIo(ByteDuplex.closed(ByteIoOperation.Write))
+    }
+    Demand.Closed => {
+      fail connectionIo(ByteDuplex.closed(ByteIoOperation.Write))
+    }
+    Demand.NeedInput => {
+      fail connectionTls(TlsError.InvalidState {operation: ClientOperation.WritePlaintext})
+    }
+    Demand.PlaintextReady => {
+      fail connectionTls(TlsError.InvalidState {operation: ClientOperation.WritePlaintext})
+    }
+    Demand.Authenticated => {
+      fail connectionTls(TlsError.InvalidState {operation: ClientOperation.WritePlaintext})
+    }
+  }
+  fail connectionTls(TlsError.InvalidState {operation: ClientOperation.WritePlaintext})
+}
+
+struct AuthenticationGuard<P> {
+  provider: Option<P>,
+}
+
+/// Runs the TLS handshake over `provider`, and returns the authenticated connection.
+///
+/// # Details
+/// The function reads the `SystemClock` one time to check certificate dates, and uses the
+/// `MonotonicClock` for the timeouts in `options`. You own the result. Call
+/// [`OwnedConnection.close`] when you are done.
+///
+/// # Errors
+/// - [`ConnectionError`] if the handshake fails or times out. The function closes `provider` before
+///   it returns the error.
+/// - `OutOfMemoryError` if the `Allocator` fails.
+pub effect<'env> fn authenticateOwned<P: 'env, 'env>(
+  provider: P,
+  config: &ClientConfig,
+  trust: TrustSnapshot,
+  options: ConnectionOptions,
+) -> OwnedConnection<P>
+! ConnectionError | OutOfMemoryError
+? &mut SystemClock | &mut MonotonicClock | &mut Allocator | &mut Random
+where
+  &mut P provides &ByteDuplex from &mut ByteDuplex,
+  &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random {
+  let guard = AuthenticationGuard<P> {provider: Option<P>.some(move provider)}
+  let use = effect fn(owned: &mut AuthenticationGuard<P>) -> OwnedConnection<P>
+  ! ConnectionError | OutOfMemoryError
+  ? &mut SystemClock | &mut MonotonicClock | &mut Allocator | &mut Random {
+    let validationTime = run SystemClock.now()
+    let made = run Client.make(config, move trust, move validationTime)
+    let client = run requireClient(move made)
+    let scratch = run Bytes.zeroed(16384)
+    let state = ConnectionState {
+      client: move client,
+      input: move scratch,
+      inputOffset: usize.ZERO,
+      inputLength: usize.ZERO,
+      phaseValue: ConnectionPhase.Open,
+    }
+    let mut connectionState = move state
+    let start = run MonotonicClock.now()
+    let durationDeadline = MonotonicClock.deadlineAfter(&start, options.handshakeTimeoutNanoseconds)
+    let deadline = selectHandshakeDeadline(move durationDeadline, &options.externalDeadline)
+    run checkHandshakeDeadline(&mut connectionState, &deadline)
+    match &mut owned.provider {
+      Option<P>.Some {value: active} => {
+        let handshake = driveHandshake(&mut connectionState, &deadline)
+        run move handshake
+          |> Effect.provideMut<ByteDuplex>(&mut active)
+      }
+      Option<P>.None => {
+        return run unavailableOwner<OwnedConnection<P>>()
+      }
+    }
+    run checkHandshakeDeadline(&mut connectionState, &deadline)
+    let retained = Intrinsic.replace(owned.provider, Option<P>.none())
+    let ownedProvider = match move retained {
+      Option<P>.Some {value} => move value
+      Option<P>.None => {
+        return run unavailableOwner<OwnedConnection<P>>()
+      }
+    }
+    return OwnedConnection<P> {
+      state: move connectionState,
+      provider: move ownedProvider,
+      provenance: AuthenticatedProvenance {},
+    }
+  }
+  let release = effect fn(owned: &mut AuthenticationGuard<P>) -> () {
+    return match &mut owned.provider {
+      Option<P>.None => ()
+      Option<P>.Some {value: active} => {
+        return run closeProvider<P>(&mut active)
+      }
+    }
+  }
+  return run Effect.useReleaseNonParking(move guard, move use, move release)
+}
+
+/// Runs the TLS handshake over `provider`, calls `callback` with the authenticated connection, and
+/// then closes it.
+///
+/// # When to use
+/// Use it to authenticate a server and use the connection inside one scope. Use
+/// [`authenticateOwned`] when the connection must live longer, for example in a connection pool.
+/// Load the trust snapshot before you call it.
+///
+/// # Details
+/// The function reads the `SystemClock` one time to check certificate dates, and uses the
+/// `MonotonicClock` for the timeouts in `options`. /// The connection closes when the callback
+/// returns, fails, or is cancelled. Errors from that close are ignored. Call
+/// [`OwnedConnection.shutdownWrite`] in the callback to send `close_notify`.
+///
+/// # Errors
+/// - `E` from the callback.
+/// - [`ConnectionError`] if the handshake fails or times out.
+/// - `OutOfMemoryError` if the `Allocator` fails.
+pub effect<'env> fn withClient<'env, A, E, ?CallbackRequirements, P: 'env>(
+  provider: P,
+  config: &'env ClientConfig,
+  trust: TrustSnapshot,
+  options: ConnectionOptions,
+  callback: for<'call> once fn<'env>(&'call mut OwnedConnection<P>) -> once Effect<'call & 'env; A ! E ? CallbackRequirements>,
+) -> A
+! E | ConnectionError | OutOfMemoryError
+? CallbackRequirements | &mut SystemClock | &mut MonotonicClock | &mut Allocator | &mut Random
+where
+  &mut P provides &ByteDuplex from &mut ByteDuplex,
+  &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random,
+  CallbackRequirements in Without<CallbackRequirements, ByteDuplex> {
+  let owner = run authenticateOwned<P>(move provider, config, move trust, move options)
+  let use = effect fn(owned: &mut OwnedConnection<P>) -> A ! E ? CallbackRequirements {
+    return run callback(move owned)
+  }
+  let release = effect fn(owned: &mut OwnedConnection<P>) -> () {
+    return run closeOwned<P>(move owned)
+  }
+  return run Effect.useReleaseNonParking(move owner, move use, move release)
+}
+
+effect fn unavailableOwner<A>() -> A {
+  return Intrinsic.trap("TLS connection: the owner was missing where it had just been stored")
+}
+
+effect fn discardByteIoError(error: ByteIoError) -> () {
+  drop error
+  return ()
+}
+
+effect fn discardConnectionError(error: ConnectionError) -> () {
+  drop error
+  return ()
+}
+
+effect fn closeProvider<P>(provider: &mut P) -> ()
+where &mut P provides &ByteDuplex from &mut ByteDuplex {
+  let closed = ByteDuplex.close()
+    |> Effect.provideMut<ByteDuplex>(move provider)
+  return run Effect.catchAll(move closed, discardByteIoError)
+}
+
+effect fn closeOwned<P>(connection: &mut OwnedConnection<P>) -> ()
+where &mut P provides &ByteDuplex from &mut ByteDuplex {
+  let closed = OwnedConnection.close(move connection)
+  return run Effect.catchAll(move closed, discardConnectionError)
+}
+
+effect fn readSomeLoop(
+  connection: &mut ConnectionState,
+  output: &mut [u8],
+  deadline: &Option<Instant>,
+) -> ReadTransfer
+! ConnectionError | OutOfMemoryError
+? &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random {
+  run drainOutput(&mut connection.*, deadline, false)
+  let read = Client.readPlaintext(&mut connection.client, &mut output)
+  let progress = run requireProgress(&mut connection.*, move read)
+  if progress.written > usize.ZERO {
+    return ReadTransfer.Data {count: progress.written}
+  }
+  match progress.demand {
+    Demand.PeerClosed => {
+      if connection.phaseValue != ConnectionPhase.WriteShutdown {
+        connection.phaseValue = ConnectionPhase.PeerEnded
+      }
+      return ReadTransfer.End
+    }
+    Demand.Closed => {
+      if connection.phaseValue != ConnectionPhase.WriteShutdown {
+        connection.phaseValue = ConnectionPhase.PeerEnded
+      }
+      return ReadTransfer.End
+    }
+    Demand.NeedInput => {
+      run receiveInput(&mut connection.*, deadline, false)
+      return run readSomeLoop(move connection, move output, move deadline)
+    }
+    Demand.NeedOutput => {
+      run drainOutput(&mut connection.*, deadline, false)
+      return run readSomeLoop(move connection, move output, move deadline)
+    }
+    Demand.PlaintextReady => {
+      return run readSomeLoop(move connection, move output, move deadline)
+    }
+    Demand.Authenticated => {
+      return run readSomeLoop(move connection, move output, move deadline)
+    }
+  }
+  return ReadTransfer.End
+}
+
+fn authenticated(client: &Client) -> bool {
+  return match move Client.authentication(client) {
+    Option.None => false
+    Option.Some {value} => {
+      drop value
+      return true
+    }
+  }
+}
+
+effect fn driveHandshake(connection: &mut ConnectionState, deadline: &Instant) -> ()
+! ConnectionError | OutOfMemoryError
+? &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random {
+  while true {
+    run checkHandshakeDeadline(&mut connection.*, deadline)
+    // Output acknowledgment can publish the one-shot authentication event. Its borrowed
+    // metadata remains available after drainOutput consumes that progress result.
+    if authenticated(&connection.client) {
+      return ()
+    }
+    let advanced = run Client.progress(&mut connection.client)
+    let progress = run requireProgress(&mut connection.*, move advanced)
+    match progress.demand {
+      Demand.Authenticated => {
+        return run checkHandshakeDeadline(&mut connection.*, deadline)
+      }
+      Demand.NeedOutput => {
+        let writeDeadline = Option<Instant>.some(copyInstant(deadline))
+        run drainOutput(&mut connection.*, &writeDeadline, true)
+        run checkHandshakeDeadline(&mut connection.*, deadline)
+        let flushed = run Effect.result(
+          transportFlush(Option<Instant>.some(copyInstant(deadline)), true),
+        )
+        run requireConnection(&mut connection.*, move flushed)
+      }
+      Demand.NeedInput => {
+        let readDeadline = Option<Instant>.some(copyInstant(deadline))
+        run receiveInput(&mut connection.*, &readDeadline, true)
+      }
+      Demand.PlaintextReady => {
+        fail connectionTls(TlsError.InvalidState {operation: ClientOperation.Progress})
+      }
+      Demand.PeerClosed => {
+        fail connectionTls(TlsError.HandshakeTruncated)
+      }
+      Demand.Closed => {
+        fail connectionTls(TlsError.HandshakeTruncated)
+      }
+    }
+  }
+  return ()
+}
+
+effect fn receiveInput(
+  connection: &mut ConnectionState,
+  deadline: &Option<Instant>,
+  handshake: bool,
+) -> ()
+! ConnectionError | OutOfMemoryError
+? &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random {
+  if connection.inputOffset < connection.inputLength {
+    let available = Slice.view<u8>(
+      Bytes.asSlice(&connection.input),
+      connection.inputOffset,
+      connection.inputLength - connection.inputOffset,
+    )
+    let limit = available.length
+    let fed = run Client.feedInput(&mut connection.client, available)
+    drop available
+    let progress = run requireProgress(&mut connection.*, move fed)
+    if progress.consumed > limit {
+      connection.phaseValue = ConnectionPhase.Invalid
+      fail connectionIo(
+        ByteDuplex.invalidTransferCount(ByteIoOperation.Read, progress.consumed, limit),
+      )
+    }
+    connection.inputOffset = connection.inputOffset + progress.consumed
+    if connection.inputOffset == connection.inputLength {
+      connection.inputOffset = usize.ZERO
+      connection.inputLength = usize.ZERO
+    }
+    return ()
+  }
+  if handshake {
+    run checkHandshakeDeadlineOption(&mut connection.*, deadline)
+  }
+  let attempted = run Effect.result(
+    transportRead(Bytes.asMutSlice(&mut connection.input), copyDeadline(deadline), handshake),
+  )
+  let transfer = run requireConnection(&mut connection.*, move attempted)
+  match move transfer {
+    ReadTransfer.Data {count} => {
+      let limit = Bytes.asSlice(&connection.input).length
+      if count == usize.ZERO || count > limit {
+        connection.phaseValue = ConnectionPhase.Invalid
+        fail connectionIo(ByteDuplex.invalidTransferCount(ByteIoOperation.Read, count, limit))
+      }
+      connection.inputOffset = usize.ZERO
+      connection.inputLength = count
+      if handshake {
+        run checkHandshakeDeadlineOption(&mut connection.*, deadline)
+      }
+      return run receiveInput(move connection, move deadline, handshake)
+    }
+    ReadTransfer.End => {
+      if handshake {
+        run checkHandshakeDeadlineOption(&mut connection.*, deadline)
+      }
+      let endedInput = Client.endInput(&mut connection.client)
+      let ended = run requireProgress(&mut connection.*, move endedInput)
+      drop ended
+      return ()
+    }
+  }
+  return ()
+}
+
+effect fn drainOutput(connection: &mut ConnectionState, deadline: &Option<Instant>, handshake: bool) -> ()
+! ConnectionError | OutOfMemoryError
+? &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random {
+  while Client.pendingOutput(&connection.client).length > usize.ZERO {
+    if handshake {
+      run checkHandshakeDeadlineOption(&mut connection.*, deadline)
+    }
+    let pending = Client.pendingOutput(&connection.client)
+    let limit = pending.length
+    let attempted = run Effect.result(transportWrite(pending, copyDeadline(deadline), handshake))
+    drop pending
+    let count = run requireConnection(&mut connection.*, move attempted)
+    if count == usize.ZERO || count > limit {
+      connection.phaseValue = ConnectionPhase.Invalid
+      fail connectionIo(ByteDuplex.invalidTransferCount(ByteIoOperation.Write, count, limit))
+    }
+    let acknowledged = Client.ackWritten(&mut connection.client, count)
+    let progress = run requireProgress(&mut connection.*, move acknowledged)
+    drop progress
+    if handshake {
+      run checkHandshakeDeadlineOption(&mut connection.*, deadline)
+    }
+  }
+  return ()
+}
+
+effect fn transportRead(output: &mut [u8], deadline: Option<Instant>, handshake: bool) -> ReadTransfer
+! ConnectionError
+? &mut ByteDuplex | &mut MonotonicClock {
+  let completed = run Effect.result(ByteDuplex.readSome(move output, move deadline))
+  match move completed {
+    Result<ReadTransfer, ByteIoError>.Success {value} => {
+      return move value
+    }
+    Result<ReadTransfer, ByteIoError>.Failure {error} => {
+      return run transportFailure<ReadTransfer>(move error, handshake)
+    }
+  }
+  return ReadTransfer.End
+}
+
+effect fn transportWrite(input: &[u8], deadline: Option<Instant>, handshake: bool) -> usize
+! ConnectionError
+? &mut ByteDuplex | &mut MonotonicClock {
+  let completed = run Effect.result(ByteDuplex.writeSome(input, move deadline))
+  match move completed {
+    Result<usize, ByteIoError>.Success {value} => {
+      return value
+    }
+    Result<usize, ByteIoError>.Failure {error} => {
+      return run transportFailure<usize>(move error, handshake)
+    }
+  }
+  return usize.ZERO
+}
+
+effect fn transportFlush(deadline: Option<Instant>, handshake: bool) -> ()
+! ConnectionError
+? &mut ByteDuplex | &mut MonotonicClock {
+  let completed = run Effect.result(ByteDuplex.flush(move deadline))
+  return match move completed {
+    Result<(), ByteIoError>.Success {value} => move value
+    Result<(), ByteIoError>.Failure {error} => {
+      return run transportFailure<()>(move error, handshake)
+    }
+  }
+}
+
+effect fn transportFailure<A>(error: ByteIoError, handshake: bool) -> A ! ConnectionError {
+  return match move error {
+    ByteIoError.Timeout {operation} => {
+      if handshake {
+        drop operation
+        fail ConnectionError.HandshakeTimeout
+      }
+      fail connectionIo(ByteIoError.Timeout {operation: move operation})
+    }
+    ByteIoError.InvalidTransferCount {operation, count, limit} => {
+      fail connectionIo(
+        ByteIoError.InvalidTransferCount {operation: move operation, count: count, limit: limit},
+      )
+    }
+    ByteIoError.Closed {operation} => {
+      fail connectionIo(ByteIoError.Closed {operation: move operation})
+    }
+    ByteIoError.Provider {operation, code} => {
+      fail connectionIo(ByteIoError.Provider {operation: move operation, code: code})
+    }
+  }
+}
+
+effect fn io<'env, A, ?R>(
+  connection: &mut ConnectionState,
+  operation: once Effect<'env; A ! ByteIoError ? R>,
+) -> A ! ConnectionError ? R {
+  let completed = run Effect.result(move operation)
+  return match move completed {
+    Result<A, ByteIoError>.Success {value} => move value
+    Result<A, ByteIoError>.Failure {error} => {
+      connection.phaseValue = ConnectionPhase.Invalid
+      fail connectionIo(move error)
+    }
+  }
+}
+
+effect<'env> fn requireConnection<A: 'env, 'env>(connection: &mut ConnectionState, result: Result<A, ConnectionError>) -> A
+! ConnectionError {
+  return match move result {
+    Result<A, ConnectionError>.Success {value} => move value
+    Result<A, ConnectionError>.Failure {error} => {
+      connection.phaseValue = ConnectionPhase.Invalid
+      fail move error
+    }
+  }
+}
+
+effect fn requireClient(result: Result<Client, TlsError>) -> Client ! ConnectionError {
+  return match move result {
+    Result<Client, TlsError>.Success {value} => move value
+    Result<Client, TlsError>.Failure {error} => {
+      fail connectionTls(move error)
+    }
+  }
+}
+
+effect fn requireProgress(connection: &mut ConnectionState, result: Result<Progress, TlsError>) -> Progress
+! ConnectionError {
+  return match move result {
+    Result<Progress, TlsError>.Success {value} => move value
+    Result<Progress, TlsError>.Failure {error} => {
+      connection.phaseValue = ConnectionPhase.Invalid
+      fail connectionTls(move error)
+    }
+  }
+}
+
+fn connectionTls(error: TlsError) -> ConnectionError {
+  return ConnectionError.Tls {error: move error}
+}
+
+fn connectionIo(error: ByteIoError) -> ConnectionError {
+  return ConnectionError.Io {error: move error}
+}
+
+fn copyInstant(value: &Instant) -> Instant {
+  return SystemClock.make(SystemClock.seconds(value), SystemClock.nanoseconds(value))
+}
+
+fn copyDeadline(value: &Option<Instant>) -> Option<Instant> {
+  return match & value.* {
+    Option<Instant>.None => Option<Instant>.none()
+    Option<Instant>.Some {value: present} => Option<Instant>.some(copyInstant(&present))
+  }
+}
+
+fn earlier(left: &Instant, right: &Instant) -> bool {
+  let leftSeconds = SystemClock.seconds(left)
+  let rightSeconds = SystemClock.seconds(right)
+  if leftSeconds < rightSeconds {
+    return true
+  }
+  if leftSeconds > rightSeconds {
+    return false
+  }
+  return SystemClock.nanoseconds(left) < SystemClock.nanoseconds(right)
+}
+
+fn selectHandshakeDeadline(duration: Instant, external: &Option<Instant>) -> Instant {
+  return match & external.* {
+    Option<Instant>.None => {
+      return move duration
+    }
+    Option<Instant>.Some {value} => {
+      if earlier(&value, &duration) {
+        return copyInstant(&value)
+      }
+      return move duration
+    }
+  }
+}
+
+fn reached(now: &Instant, deadline: &Instant) -> bool {
+  let nowSeconds = SystemClock.seconds(now)
+  let deadlineSeconds = SystemClock.seconds(deadline)
+  if nowSeconds > deadlineSeconds {
+    return true
+  }
+  if nowSeconds < deadlineSeconds {
+    return false
+  }
+  return SystemClock.nanoseconds(now) >= SystemClock.nanoseconds(deadline)
+}
+
+effect fn checkHandshakeDeadline(connection: &mut ConnectionState, deadline: &Instant) -> ()
+! ConnectionError
+? &mut MonotonicClock {
+  let now = run MonotonicClock.now()
+  if reached(&now, deadline) {
+    connection.phaseValue = ConnectionPhase.Invalid
+    fail ConnectionError.HandshakeTimeout
+  }
+  return ()
+}
+
+effect fn checkHandshakeDeadlineOption(connection: &mut ConnectionState, deadline: &Option<Instant>) -> ()
+! ConnectionError
+? &mut MonotonicClock {
+  return match & deadline.* {
+    Option<Instant>.None => ()
+    Option<Instant>.Some {value} => run checkHandshakeDeadline(move connection, &value)
+  }
+}

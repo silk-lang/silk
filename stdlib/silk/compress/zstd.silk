@@ -1,0 +1,886 @@
+//! Decompress Zstandard data (RFC 8878) in steps, with fixed memory and limits that you set.
+//!
+//! # When to use
+//! Use [`Zstd`] to read `.zst` files or HTTP bodies with `Content-Encoding: zstd`. Make a decoder
+//! with [`Zstd.make`], and call [`Zstd.step`] until it returns `Finished`. This module does not
+//! compress.
+//!
+//! # Details
+//! The decoder supports all block types and all entropy modes, and more than one frame, including
+//! skippable frames. [`Zstd.make`] allocates all storage one time: the history window, three 128
+//! KiB staging buffers, and the entropy tables. [`Zstd.step`] does not allocate and keeps no borrow
+//! of your buffers. The [`ZstdLimits`] apply to the full input, across all frames.
+//!
+//! The end of a frame is not the end of the input. The decoder returns `Finished` only when the
+//! input is marked final, all of it is consumed, and each frame is complete.
+//!
+//! # Errors
+//! - `OutOfMemoryError` from [`Zstd.make`] if the `Allocator` fails.
+//! - [`ZstdError`] if the configuration is not valid, the data is not valid, a limit is exceeded,
+//!   or the calls do not follow the rules of [`Zstd.step`]. `reason` gives the cause and `offset`
+//!   the input position.
+//!
+//! # Gotchas
+//! Output is not verified until `Finished`, because a checksum or a truncated frame can fail later.
+//! A failure is permanent: drop the decoder and make a new one for another stream. Dictionaries are
+//! not supported.
+//!
+//! # Examples
+//! ## Decode a frame with one raw block
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.core.result { Result }
+//! import silk.compress.zstd { Zstd, ZstdError, ZstdLimits, ZstdProgress, ZstdStatus }
+//!
+//! pub effect fn main() -> i32
+//!   ! ZstdError | OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let mut decoder = run Zstd.make(ZstdLimits.make()) |> Effect.provideMut<Allocator>(&mut allocator)
+//!
+//!   // Magic number, a header for a 2-byte frame, a last raw block of 2 bytes, then "hi".
+//!   let input = b"\x28\xb5\x2f\xfd\x20\x02\x11\x00\x00hi"
+//!   let mut output: [u8; 16] = [0; 16]
+//!   return match Zstd.step(&mut decoder, &input, &mut output, true) {
+//!     Result<ZstdProgress, ZstdError>.Success { value } => {
+//!       if value.status != ZstdStatus.Finished || value.written != 2 || output[0] != 104
+//!         || output[1] != 105 {
+//!         return 1
+//!       }
+//!       return 0
+//!     }
+//!     Result<ZstdProgress, ZstdError>.Failure { error: _ } => 1
+//!   }
+//! }
+//! ```
+//!
+//! @category Data formats
+
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.format {Debug, Format, Formatter}
+import silk.layout {Layout}
+import silk.option {Option}
+import silk.mem.raw_buffer {RawBuffer}
+import silk.core.result {Result}
+import silk.compress.zstd_block {BlockState, BlockReason, BlockError}
+import silk.compress.zstd_checksum {Xxh64}
+import silk.num.u8
+import silk.num.u64
+import silk.num.usize
+import silk.io.writer {Writer, WriterError}
+
+const BLOCK_CAPACITY: usize = 131072
+
+/// The resource limits for one complete input, across all frames. [`ZstdLimits.make`] gives
+/// defaults.
+pub struct ZstdLimits {
+  /// The maximum number of input bytes to consume, with headers, checksums, and skippable frames.
+  pub inputBytes: u64,
+  /// The maximum number of decoded bytes, across all frames.
+  pub outputBytes: u64,
+  /// The maximum number of frames, regular and skippable.
+  pub frames: u64,
+  /// The maximum number of payload bytes in all skippable frames.
+  pub skippableBytes: u64,
+  /// The size of the history buffer that [`Zstd.make`] allocates. A frame that asks for a larger
+  /// window fails with `WindowLimit`. It must not be 0.
+  pub windowBytes: usize,
+  /// The storage budget other than the window: staging buffers, decoder state, and entropy tables.
+  /// If it is too small, [`Zstd.make`] fails with `WorkspaceLimit`.
+  pub workspaceBytes: usize,
+}
+
+impl ZstdLimits {
+  /// Returns default limits: 64 MiB of input, 256 MiB of output, 1024 frames, 8 MiB of skippable
+  /// data, an 8 MiB window, and a 1 MiB workspace.
+  pub fn make() -> Self {
+    return ZstdLimits {
+      inputBytes: 67108864,
+      outputBytes: 268435456,
+      frames: 1024,
+      skippableBytes: 8388608,
+      windowBytes: 8388608,
+      workspaceBytes: 1048576,
+    }
+  }
+}
+
+/// What the decoder needs after a successful step.
+pub enum ZstdStatus {
+  /// All given input is consumed. Call again with more input, or with `finalInput` set if there is
+  /// no more.
+  NeedInput,
+  /// The output buffer is full. Call again with an output buffer that is not empty, and the input
+  /// that was not consumed.
+  NeedOutput,
+  /// The final input is consumed and each frame is complete and verified.
+  Finished,
+}
+
+/// The result of one successful step.
+pub struct ZstdProgress {
+  /// The number of input bytes that this call consumed. Give only the rest of the input on the next
+  /// call.
+  pub consumed: usize,
+  /// The number of output bytes that this call wrote. Only this prefix of the output changed.
+  pub written: usize,
+  /// What the decoder needs next.
+  pub status: ZstdStatus,
+}
+
+/// The cause of a [`ZstdError`].
+pub enum ZstdReason {
+  /// No failure. The decoder uses it internally. A returned error never has it.
+  None,
+  /// The window size is 0, or the total storage size does not fit in `usize`.
+  InvalidConfiguration,
+  /// A call changes the final input after it was set, adds input after `Finished`, or uses a
+  /// decoder that lost its storage.
+  InvalidState,
+  /// The input does not start with the magic number of a Zstandard frame or a skippable frame.
+  InvalidMagic,
+  /// The reserved bit of a frame header is set.
+  ReservedFrame,
+  /// A block uses the reserved block type.
+  ReservedBlock,
+  /// A block is larger than the frame allows, or its size is not valid.
+  BlockSize,
+  /// The entropy data or the sequences of a compressed block are not valid. `blockReason` gives
+  /// more detail.
+  MalformedBlock,
+  /// A frame asks for a dictionary. Dictionaries are not supported.
+  UnsupportedDictionary,
+  /// The final input ends before the last frame is complete.
+  Truncated,
+  /// The frame checksum is not the XXH64 (seed 0) of the decoded bytes.
+  Checksum,
+  /// The decoded size of a frame is not the content size in its header.
+  ContentSize,
+  /// The consumed input would go over [`ZstdLimits.inputBytes`].
+  InputLimit,
+  /// The decoded output would go over [`ZstdLimits.outputBytes`].
+  OutputLimit,
+  /// The number of frames would go over [`ZstdLimits.frames`].
+  FrameLimit,
+  /// The skippable payload would go over [`ZstdLimits.skippableBytes`].
+  SkippableLimit,
+  /// A frame asks for a window larger than [`ZstdLimits.windowBytes`].
+  WindowLimit,
+  /// [`ZstdLimits.workspaceBytes`] is too small for the decoder storage.
+  WorkspaceLimit,
+}
+
+impl Debug for ZstdReason {
+  /// Writes the name of the variant, such as `None`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      ZstdReason.None => run Format.write(&mut formatter, b"None")
+      ZstdReason.InvalidConfiguration => run Format.write(&mut formatter, b"InvalidConfiguration")
+      ZstdReason.InvalidState => run Format.write(&mut formatter, b"InvalidState")
+      ZstdReason.InvalidMagic => run Format.write(&mut formatter, b"InvalidMagic")
+      ZstdReason.ReservedFrame => run Format.write(&mut formatter, b"ReservedFrame")
+      ZstdReason.ReservedBlock => run Format.write(&mut formatter, b"ReservedBlock")
+      ZstdReason.BlockSize => run Format.write(&mut formatter, b"BlockSize")
+      ZstdReason.MalformedBlock => run Format.write(&mut formatter, b"MalformedBlock")
+      ZstdReason.UnsupportedDictionary => run Format.write(&mut formatter, b"UnsupportedDictionary")
+      ZstdReason.Truncated => run Format.write(&mut formatter, b"Truncated")
+      ZstdReason.Checksum => run Format.write(&mut formatter, b"Checksum")
+      ZstdReason.ContentSize => run Format.write(&mut formatter, b"ContentSize")
+      ZstdReason.InputLimit => run Format.write(&mut formatter, b"InputLimit")
+      ZstdReason.OutputLimit => run Format.write(&mut formatter, b"OutputLimit")
+      ZstdReason.FrameLimit => run Format.write(&mut formatter, b"FrameLimit")
+      ZstdReason.SkippableLimit => run Format.write(&mut formatter, b"SkippableLimit")
+      ZstdReason.WindowLimit => run Format.write(&mut formatter, b"WindowLimit")
+      ZstdReason.WorkspaceLimit => run Format.write(&mut formatter, b"WorkspaceLimit")
+    }
+  }
+}
+
+/// A decoding failure. It is permanent for the decoder.
+///
+/// Each later call returns the same `reason` and `offset` with no progress. The output that earlier
+/// calls wrote is not valid.
+pub struct ZstdError {
+  /// The cause of the failure.
+  pub reason: ZstdReason,
+  /// For `MalformedBlock`, the part of the block that is not valid. For other reasons, it is
+  /// `BlockReason.None`.
+  pub blockReason: BlockReason,
+  /// The input position where the decoder found the problem, counted from the start of the full
+  /// input.
+  pub offset: u64,
+  /// The number of input bytes that this call consumed before it failed.
+  pub consumed: usize,
+  /// The number of output bytes that this call wrote before it failed.
+  pub written: usize,
+}
+
+impl Debug for ZstdError {
+  /// Writes the fields, as `ZstdError { reason: ..., blockReason: ..., ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return run Format.debugFields(self, "ZstdError", &mut formatter)
+  }
+}
+
+/// A Zstandard decoder for one complete input. It owns all its storage.
+///
+/// Dropping it releases the storage. Each regular frame starts with a new history, new entropy
+/// tables, and a new checksum, but the limits count across all frames.
+///
+/// # When to use
+/// Use it to read `.zst` files or HTTP bodies with `Content-Encoding: zstd`. Make a decoder with
+/// [`Zstd.make`], and call [`Zstd.step`] until it returns `Finished`. It does not compress.
+///
+/// # Details
+/// It supports all block types and all entropy modes, and more than one frame, including
+/// skippable frames. [`Zstd.make`] allocates all storage one time. [`Zstd.step`] does not allocate
+/// and keeps no borrow of your buffers. The end of a frame is not the end of the input: the decoder
+/// returns `Finished` only when the input is marked final, all of it is consumed, and each frame is
+/// complete.
+///
+/// # Gotchas
+/// Output is not verified until `Finished`, because a checksum or a truncated frame can fail later.
+/// A failure is permanent: drop the decoder and make a new one for another stream. Dictionaries are
+/// not supported.
+pub struct Zstd {
+  metadata: Metadata,
+  storage: Option<Workspace>,
+}
+
+struct Workspace {
+  history: Intrinsic.RawBuffer<u8>,
+  compressed: Intrinsic.RawBuffer<u8>,
+  literals: Intrinsic.RawBuffer<u8>,
+  decoded: Intrinsic.RawBuffer<u8>,
+  block: BlockState,
+  checksum: Xxh64,
+}
+
+struct Metadata {
+  limits: ZstdLimits,
+  phase: u8,
+  header: [u8; 18],
+  have: usize,
+  need: usize,
+  blockType: usize,
+  blockSize: usize,
+  lastBlock: bool,
+  checksumPresent: bool,
+  contentSizePresent: bool,
+  contentSize: u64,
+  frameOutput: u64,
+  windowSize: usize,
+  historyPosition: usize,
+  historyLength: usize,
+  decodedSize: usize,
+  drained: usize,
+  skipRemaining: u64,
+  totalInput: u64,
+  totalOutput: u64,
+  totalFrames: u64,
+  totalSkipped: u64,
+  finalKnown: bool,
+  finalOffset: u64,
+  reason: ZstdReason,
+  blockReason: BlockReason,
+  errorOffset: u64,
+  consumed: usize,
+  written: usize,
+}
+
+impl Zstd {
+  /// Returns a decoder that uses `limits`, with storage from the ambient `Allocator`.
+  ///
+  /// It allocates the window, three 128 KiB staging buffers, and the entropy tables. [`Zstd.step`]
+  /// does not allocate.
+  ///
+  /// # Errors
+  /// - [`ZstdError`] with `WorkspaceLimit` if `workspaceBytes` is too small, or with
+  ///   `InvalidConfiguration` if `windowBytes` is 0 or the total size does not fit in `usize`.
+  ///   These checks come before the allocation.
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn make(limits: ZstdLimits) -> Self ! ZstdError | OutOfMemoryError ? &mut Allocator {
+    let stateLayout = Layout.of<Zstd>()
+    let workspace = BLOCK_CAPACITY * 3 + stateLayout.bytes + BlockState.workspaceBytes()
+    if limits.workspaceBytes < workspace {
+      fail initialError(ZstdReason.WorkspaceLimit)
+    }
+    if limits.windowBytes == 0 || limits.windowBytes > usize.MAX - workspace {
+      fail initialError(ZstdReason.InvalidConfiguration)
+    }
+    let history = run allocateBytes(limits.windowBytes)
+    let compressed = run allocateBytes(BLOCK_CAPACITY)
+    let literals = run allocateBytes(BLOCK_CAPACITY)
+    let decoded = run allocateBytes(BLOCK_CAPACITY)
+    let metadata = Metadata {
+      limits: move limits,
+      phase: 0,
+      header: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      have: 0,
+      need: 4,
+      blockType: 0,
+      blockSize: 0,
+      lastBlock: false,
+      checksumPresent: false,
+      contentSizePresent: false,
+      contentSize: 0,
+      frameOutput: 0,
+      windowSize: 0,
+      historyPosition: 0,
+      historyLength: 0,
+      decodedSize: 0,
+      drained: 0,
+      skipRemaining: 0,
+      totalInput: 0,
+      totalOutput: 0,
+      totalFrames: 0,
+      totalSkipped: 0,
+      finalKnown: false,
+      finalOffset: 0,
+      reason: ZstdReason.None,
+      blockReason: BlockReason.None,
+      errorOffset: 0,
+      consumed: 0,
+      written: 0,
+    }
+    let block = run BlockState.make()
+    return Zstd {
+      metadata: move metadata,
+      storage: Option<Workspace>.some(
+        Workspace {
+          history: move history,
+          compressed: move compressed,
+          literals: move literals,
+          decoded: move decoded,
+          block: move block,
+          checksum: Xxh64.make(),
+        },
+      ),
+    }
+  }
+  /// Decodes from `input` into `output` and returns how much it consumed and wrote.
+  ///
+  /// On the next call, give only the input after the consumed prefix, and use only the written
+  /// prefix of the output. Set `finalInput` when `input` holds all remaining data. After that, each
+  /// call must set `finalInput` and give exactly the input that is not consumed yet. `NeedOutput`
+  /// with an empty output makes no progress.
+  ///
+  /// # Errors
+  /// - [`ZstdError`] if the data is not valid, a [`ZstdLimits`] value would be exceeded, the final
+  ///   input ends early (`Truncated`), or the call changes the final input (`InvalidState`).
+  ///
+  /// # Gotchas
+  /// Output is not verified until `Finished`. A failure is permanent for this decoder.
+  pub fn step(self: &mut Self, input: &[u8], output: &mut [u8], finalInput: bool) -> Result<
+    ZstdProgress,
+    ZstdError,
+  > {
+    let previous = Intrinsic.replace(self.storage, Option<Workspace>.none())
+    return match move previous {
+      Option<Workspace>.Some {value} => withWorkspace(
+        &mut self,
+        move value,
+        input,
+        move output,
+        finalInput,
+      )
+      Option<Workspace>.None => missingWorkspace(&mut self)
+    }
+  }
+}
+
+fn missingWorkspace(state: &mut Zstd) -> Result<ZstdProgress, ZstdError> {
+  stop(&mut state.metadata, ZstdReason.InvalidState)
+  return failed(&state.metadata)
+}
+
+fn withWorkspace(
+  state: &mut Zstd,
+  storage: Workspace,
+  input: &[u8],
+  output: &mut [u8],
+  finalInput: bool,
+) -> Result<ZstdProgress, ZstdError> {
+  let mut history = move storage.history
+  let mut compressed = move storage.compressed
+  let mut literals = move storage.literals
+  let mut decoded = move storage.decoded
+  let mut block = move storage.block
+  let mut checksum = move storage.checksum
+  let result = stepLoop(
+    &mut state.metadata,
+    &mut history,
+    &mut compressed,
+    &mut literals,
+    &mut decoded,
+    &mut block,
+    &mut checksum,
+    input,
+    move output,
+    finalInput,
+  )
+  state.storage = Option<Workspace>.some(
+    Workspace {
+      history: move history,
+      compressed: move compressed,
+      literals: move literals,
+      decoded: move decoded,
+      block: move block,
+      checksum: move checksum,
+    },
+  )
+  return move result
+}
+
+fn stepLoop(
+  state: &mut Metadata,
+  history: &mut Intrinsic.RawBuffer<u8>,
+  compressed: &mut Intrinsic.RawBuffer<u8>,
+  literals: &mut Intrinsic.RawBuffer<u8>,
+  decoded: &mut Intrinsic.RawBuffer<u8>,
+  block: &mut BlockState,
+  checksum: &mut Xxh64,
+  input: &[u8],
+  output: &mut [u8],
+  finalInput: bool,
+) -> Result<ZstdProgress, ZstdError> {
+  state.consumed = 0
+  state.written = 0
+  if state.reason != ZstdReason.None {
+    return failed(&state)
+  }
+  if state.phase == 8 {
+    if input.length != 0 || !finalInput {
+      stop(&mut state, ZstdReason.InvalidState)
+      return failed(&state)
+    }
+    return progressed(&state, ZstdStatus.Finished)
+  }
+  let available = usize.toU64(input.length)
+  if state.finalKnown {
+    if !finalInput || available != state.finalOffset - state.totalInput {
+      stop(&mut state, ZstdReason.InvalidState)
+      return failed(&state)
+    }
+  } else {
+    if finalInput {
+      if available > u64.MAX - state.totalInput {
+        stop(&mut state, ZstdReason.InputLimit)
+        return failed(&state)
+      }
+      state.finalKnown = true
+      state.finalOffset = state.totalInput + available
+    }
+  }
+  while state.reason == ZstdReason.None {
+    if state.phase == 4 {
+      while state.drained < state.decodedSize && state.written < output.length {
+        // `drained < decodedSize <= BLOCK_CAPACITY`, the decoded buffer's capacity; `allocateBytes`
+        // zero-fills every buffer, so all bytes are initialized.
+        let byte = unsafe RawBuffer.read<u8>(&decoded, state.drained)
+        output[state.written] = byte
+        let filled = RawBuffer.fill(&mut history, state.historyPosition, 1, byte)
+        state.historyPosition = state.historyPosition + 1
+        if state.historyPosition == state.limits.windowBytes {
+          state.historyPosition = 0
+        }
+        if state.historyLength < state.limits.windowBytes {
+          state.historyLength = state.historyLength + 1
+        }
+        state.drained = state.drained + 1
+        state.written = state.written + 1
+      }
+      if state.drained < state.decodedSize {
+        return progressed(&state, ZstdStatus.NeedOutput)
+      }
+      if state.lastBlock {
+        if state.contentSizePresent && state.frameOutput != state.contentSize {
+          stop(&mut state, ZstdReason.ContentSize)
+        } else {
+          if state.checksumPresent {
+            enter(&mut state, 5, 4)
+          } else {
+            enter(&mut state, 0, 4)
+          }
+        }
+      } else {
+        enter(&mut state, 2, 3)
+      }
+    } else {
+      if state.phase == 7 && state.skipRemaining == 0 {
+        enter(&mut state, 0, 4)
+      }
+      if state.consumed == input.length {
+        if state.finalKnown {
+          if state.phase == 0 && state.have == 0 && state.totalFrames > 0 {
+            state.phase = 8
+            return progressed(&state, ZstdStatus.Finished)
+          }
+          stop(&mut state, ZstdReason.Truncated)
+        } else {
+          return progressed(&state, ZstdStatus.NeedInput)
+        }
+      } else {
+        if state.totalInput == state.limits.inputBytes {
+          stop(&mut state, ZstdReason.InputLimit)
+        } else {
+          let byte = input[state.consumed]
+          state.consumed = state.consumed + 1
+          state.totalInput = state.totalInput + 1
+          if state.phase == 7 {
+            state.skipRemaining = state.skipRemaining - 1
+            state.totalSkipped = state.totalSkipped + 1
+          } else {
+            if state.phase == 3 {
+              let filled = RawBuffer.fill(&mut compressed, state.have, 1, byte)
+            } else {
+              state.header[state.have] = byte
+            }
+            state.have = state.have + 1
+            if state.have == state.need {
+              acceptPart(
+                &mut state,
+                &mut history,
+                &mut compressed,
+                &mut literals,
+                &mut decoded,
+                &mut block,
+                &mut checksum,
+              )
+            }
+          }
+        }
+      }
+    }
+  }
+  return failed(&state)
+}
+
+effect fn allocateBytes(length: usize) -> Intrinsic.RawBuffer<u8> ! OutOfMemoryError ? &mut Allocator {
+  let allocation = run Allocator.allocate(Layout {bytes: length, alignment: 1})
+  // The allocation was requested for `length` bytes with byte alignment.
+  let mut buffer = unsafe RawBuffer.from<u8>(move allocation, length)
+  let initialized = RawBuffer.fill(&mut buffer, 0, length, 0)
+  return move buffer
+}
+
+fn initialError(reason: ZstdReason) -> ZstdError {
+  return ZstdError {
+    reason: reason,
+    blockReason: BlockReason.None,
+    offset: 0,
+    consumed: 0,
+    written: 0,
+  }
+}
+
+fn stop(state: &mut Metadata, reason: ZstdReason) -> () {
+  state.reason = reason
+  state.errorOffset = state.totalInput
+  return ()
+}
+
+fn failed(state: &Metadata) -> Result<ZstdProgress, ZstdError> {
+  return Result<ZstdProgress, ZstdError>.failResult(
+    ZstdError {
+      reason: state.reason,
+      blockReason: state.blockReason,
+      offset: state.errorOffset,
+      consumed: state.consumed,
+      written: state.written,
+    },
+  )
+}
+
+fn progressed(state: &Metadata, status: ZstdStatus) -> Result<ZstdProgress, ZstdError> {
+  return Result<ZstdProgress, ZstdError>.succeed(
+    ZstdProgress {consumed: state.consumed, written: state.written, status: status},
+  )
+}
+
+fn enter(state: &mut Metadata, phase: u8, need: usize) -> () {
+  state.phase = phase
+  state.have = 0
+  state.need = need
+  return ()
+}
+
+fn little(bytes: &[u8], offset: usize, count: usize) -> u64 {
+  let mut value: u64 = 0
+  let mut index: usize = 0
+  while index < count {
+    value = u64.bitOr(value, u64.shiftLeft(u8.toU64(bytes[offset + index]), usize.toU64(index * 8)))
+    index = index + 1
+  }
+  return value
+}
+
+fn acceptPart(
+  state: &mut Metadata,
+  history: &mut Intrinsic.RawBuffer<u8>,
+  compressed: &mut Intrinsic.RawBuffer<u8>,
+  literals: &mut Intrinsic.RawBuffer<u8>,
+  decoded: &mut Intrinsic.RawBuffer<u8>,
+  block: &mut BlockState,
+  checksum: &mut Xxh64,
+) -> () {
+  if state.phase == 0 {
+    let magic = little(&state.header, 0, 4)
+    if magic != 0xfd2fb528 && u64.bitAnd(magic, 0xfffffff0) != 0x184d2a50 {
+      stop(&mut state, ZstdReason.InvalidMagic)
+      return ()
+    }
+    if state.totalFrames == state.limits.frames {
+      stop(&mut state, ZstdReason.FrameLimit)
+      return ()
+    }
+    state.totalFrames = state.totalFrames + 1
+    if magic == 0xfd2fb528 {
+      enter(&mut state, 1, 1)
+    } else {
+      enter(&mut state, 6, 4)
+    }
+    return ()
+  }
+  if state.phase == 1 {
+    if state.have == 1 {
+      let descriptor = u8.toUsize(state.header[0])
+      if usize.bitAnd(descriptor, 8) != 0 {
+        stop(&mut state, ZstdReason.ReservedFrame)
+        return ()
+      }
+      let single = usize.bitAnd(descriptor, 32) != 0
+      let sizeFlag = usize.shiftRight(descriptor, 6)
+      let dictFlag = usize.bitAnd(descriptor, 3)
+      let mut dictBytes: usize = dictFlag
+      if dictFlag == 3 {
+        dictBytes = 4
+      }
+      let mut sizeBytes: usize = 0
+      if sizeFlag == 0 {
+        if single {
+          sizeBytes = 1
+        }
+      }
+      if sizeFlag == 1 {
+        sizeBytes = 2
+      }
+      if sizeFlag == 2 {
+        sizeBytes = 4
+      }
+      if sizeFlag == 3 {
+        sizeBytes = 8
+      }
+      state.need = 1 + dictBytes + sizeBytes
+      if !single {
+        state.need = state.need + 1
+      }
+      if state.have < state.need {
+        return ()
+      }
+    }
+    acceptFrameHeader(&mut state, &mut block, &mut checksum)
+    return ()
+  }
+  if state.phase == 2 {
+    let header = little(&state.header, 0, 3)
+    state.lastBlock = u64.bitAnd(header, 1) != 0
+    state.blockType = u64.toUsize(u64.bitAnd(u64.shiftRight(header, 1), 3))
+    state.blockSize = u64.toUsize(u64.shiftRight(header, 3))
+    if state.blockType == 3 {
+      stop(&mut state, ZstdReason.ReservedBlock)
+      return ()
+    }
+    let mut maximum = BLOCK_CAPACITY
+    if state.windowSize < maximum {
+      maximum = state.windowSize
+    }
+    if state.blockSize > maximum || (state.blockType == 2 && state.blockSize == 0) {
+      stop(&mut state, ZstdReason.BlockSize)
+      return ()
+    }
+    let mut encodedSize = state.blockSize
+    if state.blockType == 1 {
+      encodedSize = 1
+    }
+    enter(&mut state, 3, encodedSize)
+    if encodedSize == 0 {
+      acceptBlock(
+        &mut state,
+        &history,
+        &compressed,
+        &mut literals,
+        &mut decoded,
+        &mut block,
+        &mut checksum,
+      )
+    }
+    return ()
+  }
+  if state.phase == 3 {
+    acceptBlock(
+      &mut state,
+      &history,
+      &compressed,
+      &mut literals,
+      &mut decoded,
+      &mut block,
+      &mut checksum,
+    )
+    return ()
+  }
+  if state.phase == 5 {
+    let expected = little(&state.header, 0, 4)
+    let actual = u64.bitAnd(Xxh64.finish(&checksum), 0xffffffff)
+    if actual != expected {
+      stop(&mut state, ZstdReason.Checksum)
+    } else {
+      enter(&mut state, 0, 4)
+    }
+    return ()
+  }
+  if state.phase == 6 {
+    let size = little(&state.header, 0, 4)
+    if size > state.limits.skippableBytes - state.totalSkipped {
+      stop(&mut state, ZstdReason.SkippableLimit)
+      return ()
+    }
+    state.skipRemaining = size
+    enter(&mut state, 7, 0)
+  }
+  return ()
+}
+
+fn acceptFrameHeader(state: &mut Metadata, block: &mut BlockState, checksum: &mut Xxh64) -> () {
+  let descriptor = u8.toUsize(state.header[0])
+  let single = usize.bitAnd(descriptor, 32) != 0
+  let sizeFlag = usize.shiftRight(descriptor, 6)
+  let dictFlag = usize.bitAnd(descriptor, 3)
+  let mut cursor: usize = 1
+  let mut window: u64 = 0
+  if !single {
+    let wd = u8.toU64(state.header[cursor])
+    let base = u64.shiftLeft(1, 10 + u64.shiftRight(wd, 3))
+    window = base + (base / 8) * u64.bitAnd(wd, 7)
+    cursor = cursor + 1
+  }
+  let mut dictBytes = dictFlag
+  if dictFlag == 3 {
+    dictBytes = 4
+  }
+  if little(&state.header, cursor, dictBytes) != 0 {
+    stop(&mut state, ZstdReason.UnsupportedDictionary)
+    return ()
+  }
+  cursor = cursor + dictBytes
+  let sizeBytes = state.need - cursor
+  let mut contentSize = little(&state.header, cursor, sizeBytes)
+  if sizeFlag == 1 {
+    contentSize = contentSize + 256
+  }
+  if single {
+    window = contentSize
+  }
+  if window > usize.toU64(state.limits.windowBytes) {
+    stop(&mut state, ZstdReason.WindowLimit)
+    return ()
+  }
+  state.windowSize = u64.toUsize(window)
+  state.contentSize = contentSize
+  state.contentSizePresent = sizeBytes != 0
+  state.checksumPresent = usize.bitAnd(descriptor, 4) != 0
+  state.frameOutput = 0
+  state.historyPosition = 0
+  state.historyLength = 0
+  BlockState.reset(&mut block)
+  checksum.* = Xxh64.make()
+  if state.contentSizePresent && contentSize > state.limits.outputBytes - state.totalOutput {
+    stop(&mut state, ZstdReason.OutputLimit)
+    return ()
+  }
+  enter(&mut state, 2, 3)
+  return ()
+}
+
+fn acceptBlock(
+  state: &mut Metadata,
+  history: &Intrinsic.RawBuffer<u8>,
+  compressed: &Intrinsic.RawBuffer<u8>,
+  literals: &mut Intrinsic.RawBuffer<u8>,
+  decoded: &mut Intrinsic.RawBuffer<u8>,
+  block: &mut BlockState,
+  checksum: &mut Xxh64,
+) -> () {
+  let mut size = state.blockSize
+  if state.blockType == 0 {
+    // `size = blockSize`, checked against a maximum of at most `BLOCK_CAPACITY`, the capacity of
+    // every block buffer; `allocateBytes` zero-fills them, so all bytes are initialized.
+    unsafe {
+      let copied = RawBuffer.copy<u8>(&mut decoded, 0, RawBuffer.view<u8>(&compressed, 0, size), size)
+    }
+  }
+  if state.blockType == 1 {
+    // Index zero lies within the compressed buffer, and `allocateBytes` zero-fills every buffer, so
+    // the byte is initialized.
+    let byte = unsafe RawBuffer.read<u8>(&compressed, 0)
+    let filled = RawBuffer.fill(&mut decoded, 0, size, byte)
+  }
+  if state.blockType == 2 {
+    let mut maximum = BLOCK_CAPACITY
+    if state.windowSize < maximum {
+      maximum = state.windowSize
+    }
+    // Each view stays within its buffer: `blockSize` and `BLOCK_CAPACITY` bound the block buffers
+    // and `windowBytes` is the history capacity; `allocateBytes` zero-fills them all.
+    unsafe {
+      let result = BlockState.decode(
+        &mut block,
+        RawBuffer.view<u8>(&compressed, 0, state.blockSize),
+        RawBuffer.viewMut<u8>(&mut literals, 0, BLOCK_CAPACITY),
+        RawBuffer.viewMut<u8>(&mut decoded, 0, maximum),
+        RawBuffer.view<u8>(&history, 0, state.limits.windowBytes),
+        state.historyPosition,
+        state.historyLength,
+        state.windowSize,
+      )
+      size = match move result {
+        Result<usize, BlockError>.Success {value} => value
+        Result<usize, BlockError>.Failure {error} => blockFailed(&mut state, move error)
+      }
+    }
+    if state.reason != ZstdReason.None {
+      return ()
+    }
+  }
+  if usize.toU64(size) > state.limits.outputBytes - state.totalOutput {
+    stop(&mut state, ZstdReason.OutputLimit)
+    return ()
+  }
+  if usize.toU64(size) > u64.MAX - state.frameOutput {
+    stop(&mut state, ZstdReason.ContentSize)
+    return ()
+  }
+  state.totalOutput = state.totalOutput + usize.toU64(size)
+  state.frameOutput = state.frameOutput + usize.toU64(size)
+  if state.contentSizePresent && state.frameOutput > state.contentSize {
+    stop(&mut state, ZstdReason.ContentSize)
+    return ()
+  }
+  let mut checksumIndex: usize = 0
+  while checksumIndex < size {
+    // `checksumIndex < size`, the decoded length, which is at most `BLOCK_CAPACITY`.
+    Xxh64.updateByte(&mut checksum, unsafe RawBuffer.read<u8>(&decoded, checksumIndex))
+    checksumIndex = checksumIndex + 1
+  }
+  state.decodedSize = size
+  state.drained = 0
+  enter(&mut state, 4, 0)
+  return ()
+}
+
+fn blockFailed(state: &mut Metadata, error: BlockError) -> usize {
+  state.blockReason = error.reason
+  stop(&mut state, ZstdReason.MalformedBlock)
+  state.errorOffset = state.totalInput - usize.toU64(state.blockSize) + usize.toU64(error.offset)
+  return 0
+}

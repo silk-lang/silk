@@ -1,0 +1,664 @@
+//! A scripted `ByteDuplex` transport in memory, for tests of protocol code.
+//!
+//! # When to use
+//! Use [`MemoryByteDuplex`] to test code that uses `silk.io.byte_duplex.ByteDuplex` without a network.
+//! A script controls what each read returns, how many bytes each write accepts, and when failures
+//! happen. After the test, check the bytes that the code wrote with [`MemoryByteDuplex.outbound`]
+//! and the order of operations with [`MemoryByteDuplex.audit`].
+//!
+//! # Details
+//! [`MemoryByteDuplex.make`] takes the read events, the write events, and the sizes of the output
+//! and audit storage. It allocates everything one time. The operations do not allocate.
+//!
+//! Each event has a `readyAt` time on the active `MonotonicClock`. An operation waits until the
+//! event is ready. If the deadline comes first, the operation fails with `Timeout`. When an event
+//! time is equal to the deadline, the deadline wins.
+//!
+//! A read returns the bytes of the current `Data` event, as many as fit in the output slice. When
+//! the read script is empty, reads return `End`. After `End`, reads return `End` and do not use the
+//! script.
+//!
+//! # Gotchas
+//! Each write uses the next write event. A vectored write is one write event that takes bytes from
+//! its slices in order. If there are no more write events, or the output storage is full, the
+//! write fails with a `Provider` error, code 1 or 2. If the audit storage is full, the next
+//! operation fails with code 3. Make the storage large enough for the whole test.
+//!
+//! This transport models a reliable byte stream only. It does not model packets, DNS, or
+//! certificates.
+//!
+//! # Examples
+//! ## Answer a request and check the response
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.io.buffered_duplex { BufferedDuplex, withBufferedCapacity }
+//! import silk.io.buffered_input { BufferError }
+//! import silk.io.byte_duplex { ByteDuplex }
+//! import silk.collections.bytes { Bytes }
+//! import silk.core.effect { Effect }
+//! import silk.collections.list { List }
+//! import silk.io.memory_byte_duplex {
+//!   MemoryByteDuplex,
+//!   MemoryReadEvent,
+//!   MemoryWriteAction,
+//!   MemoryWriteEvent
+//! }
+//! import silk.system.monotonic_clock { MonotonicClock }
+//! import silk.option { Option }
+//! import silk.system.system_clock { Instant, SystemClock }
+//!
+//! struct FixedClock {}
+//!
+//! impl MonotonicClock for FixedClock {
+//!   effect fn now(self: &mut Self) -> Instant {
+//!     return SystemClock.make(0, 0)
+//!   }
+//!
+//!   effect fn getResolution(self: &mut Self) -> u64 {
+//!     return 1
+//!   }
+//!
+//!   effect fn waitUntil(self: &mut Self, when: Instant) -> () {
+//!     return ()
+//!   }
+//!
+//!   effect fn waitFor(self: &mut Self, howLong: u64) -> () {
+//!     return ()
+//!   }
+//! }
+//!
+//! effect fn transport() -> MemoryByteDuplex
+//!   ! OutOfMemoryError
+//!   ? &mut Allocator {
+//!   let mut reads = List<MemoryReadEvent>.make()
+//!   let bytes = run Bytes.copy(&b"ping")
+//!   run List<MemoryReadEvent>.append(
+//!     &mut reads,
+//!     MemoryReadEvent.Data { readyAt: SystemClock.make(0, 0), bytes: move bytes }
+//!   )
+//!   let mut writes = List<MemoryWriteEvent>.make()
+//!   run List<MemoryWriteEvent>.append(
+//!     &mut writes,
+//!     MemoryWriteEvent {
+//!       readyAt: SystemClock.make(0, 0),
+//!       action: MemoryWriteAction.Accept { count: 4 }
+//!     }
+//!   )
+//!   return run MemoryByteDuplex.make(move reads, move writes, 4, 8, Option<i32>.none())
+//! }
+//!
+//! // Reads a 4-byte request and answers it.
+//! effect<'session> fn answer<'session, P>(session: &'session mut BufferedDuplex<'session, P>) -> ()
+//!   ! BufferError
+//!   ? &mut MonotonicClock where
+//!   &'session mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock {
+//!   let mut request: [u8; 4] = [0, 0, 0, 0]
+//!   run BufferedDuplex.readExact(&mut session.*, &mut request, Option<Instant>.none())
+//!   run BufferedDuplex.writeAll(&mut session.*, b"pong", Option<Instant>.none())
+//!   return run BufferedDuplex.flush(&mut session.*, Option<Instant>.none())
+//! }
+//!
+//! pub effect fn main() -> i32
+//!   ! BufferError | OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let mut clock = FixedClock {}
+//!   let mut duplex = run transport() |> Effect.provideMut<Allocator>(&mut allocator)
+//!   run withBufferedCapacity<(), BufferError>(&mut duplex, 16, 16, answer)
+//!     |> Effect.provideMut<MonotonicClock>(&mut clock)
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let sent = MemoryByteDuplex.outbound(&duplex)
+//!   if sent.length != 4 || sent[0] != 112 || sent[1] != 111 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Input and output
+
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.io.byte_duplex {ByteDuplex, ByteIoError, ByteIoOperation, ReadTransfer}
+import silk.collections.bytes {Bytes}
+import silk.system.monotonic_clock {MonotonicClock}
+import silk.option {Option}
+import silk.core.ownership {Copy}
+import silk.collections.slice {Slice}
+import silk.system.system_clock {Instant, SystemClock}
+import silk.num.usize
+import silk.collections.list {List}
+
+/// One step of the read script.
+pub union MemoryReadEvent {
+  /// Makes `bytes` available at `readyAt`. Reads take them in order, as many as fit in each output
+  /// slice.
+  Data {
+    /// The time when the event is ready.
+    pub readyAt: Instant,
+    /// The bytes that reads return.
+    pub bytes: Bytes,
+  },
+  /// Ends the stream at `readyAt`.
+  End {
+    /// The time when the event is ready.
+    pub readyAt: Instant,
+  },
+  /// Makes the read fail at `readyAt` with `ByteIoError.Provider`.
+  Failure {
+    /// The time when the event is ready.
+    pub readyAt: Instant,
+    /// The `code` of the `Provider` error.
+    pub code: i32,
+  },
+  /// Makes the read report `count` without writing bytes, to test the count check.
+  InvalidCount {
+    /// The time when the event is ready.
+    pub readyAt: Instant,
+    /// The count to report. Use 0 or a value larger than the output slice.
+    pub count: usize,
+  },
+}
+
+/// What one write does.
+pub union MemoryWriteAction {
+  /// Accepts up to `count` bytes from the start of the input.
+  Accept {
+    /// The maximum number of bytes to accept.
+    pub count: usize,
+  },
+  /// Makes the write fail with `ByteIoError.Provider`. No bytes are accepted.
+  Failure {
+    /// The `code` of the `Provider` error.
+    pub code: i32,
+  },
+  /// Makes the write report `count` without accepting bytes, to test the count check.
+  InvalidCount {
+    /// The count to report.
+    pub count: usize,
+  },
+}
+
+/// One step of the write script.
+pub struct MemoryWriteEvent {
+  /// The time when the write can happen.
+  pub readyAt: Instant,
+  /// What the write does.
+  pub action: MemoryWriteAction,
+}
+
+/// The state of a [`MemoryByteDuplex`], for checks in tests.
+pub enum MemoryByteDuplexPhase {
+  /// Reads and writes work.
+  Open,
+  /// The write direction is closed. Reads still work.
+  WriteShutdown,
+  /// The transport is closed.
+  Closed,
+  /// A write failed, or the script or storage ran out. Reads and writes fail.
+  Invalid,
+}
+
+/// One recorded operation.
+pub struct MemoryByteDuplexAudit {
+  /// The operation.
+  pub operation: ByteIoOperation,
+  /// The number of bytes that the operation moved. It is 0 for flush, shutdown, close, and
+  /// failures.
+  pub count: usize,
+}
+
+impl Copy for MemoryWriteAction {}
+impl Copy for MemoryByteDuplexAudit {}
+
+/// A scripted `ByteDuplex` transport in memory, for tests of protocol code. Make one with
+/// [`MemoryByteDuplex.make`] and provide it as `ByteDuplex`.
+///
+/// # When to use
+/// Use it to test code that uses `silk.io.byte_duplex.ByteDuplex` without a network. A script controls
+/// what each read returns, how many bytes each write accepts, and when failures happen. After the
+/// test, check the bytes that the code wrote with [`MemoryByteDuplex.outbound`] and the order of
+/// operations with [`MemoryByteDuplex.audit`].
+///
+/// # Details
+/// [`MemoryByteDuplex.make`] allocates everything one time. The operations do not allocate.
+///
+/// Each event has a `readyAt` time on the active `MonotonicClock`. An operation waits until the
+/// event is ready. If the deadline comes first, the operation fails with `Timeout`. When an event
+/// time is equal to the deadline, the deadline wins.
+///
+/// A read returns the bytes of the current `Data` event, as many as fit in the output slice. When
+/// the read script is empty, reads return `End`. After `End`, reads return `End` and do not use the
+/// script.
+///
+/// # Gotchas
+/// Each write uses the next write event. A vectored write is one write event that takes bytes from
+/// its slices in order. If there are no more write events, or the output storage is full, the
+/// write fails with a `Provider` error, code 1 or 2. If the audit storage is full, the next
+/// operation fails with code 3. Make the storage large enough for the whole test.
+///
+/// This transport models a reliable byte stream only. It does not model packets, DNS, or
+/// certificates.
+pub struct MemoryByteDuplex {
+  reads: List<MemoryReadEvent>,
+  activeRead: Option<MemoryReadEvent>,
+  readOffset: usize,
+  readEnded: bool,
+  writes: List<MemoryWriteEvent>,
+  writeIndex: usize,
+  outboundBytes: Bytes,
+  outboundLength: usize,
+  auditEntries: List<MemoryByteDuplexAudit>,
+  auditLength: usize,
+  phaseValue: MemoryByteDuplexPhase,
+  closeFailure: Option<i32>,
+  closeAttemptsValue: usize,
+}
+
+impl MemoryByteDuplex {
+  /// Returns a transport that follows `reads` and `writes`.
+  ///
+  /// # Details
+  ///
+  /// `outboundCapacity` is the maximum number of bytes that writes can accept in total.
+  /// `auditCapacity` is the maximum number of operations that the audit records, including the
+  /// close. If `closeFailure` is present, the first close fails with that provider code.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the storage.
+  pub effect fn make(
+    reads: List<MemoryReadEvent>,
+    writes: List<MemoryWriteEvent>,
+    outboundCapacity: usize,
+    auditCapacity: usize,
+    closeFailure: Option<i32>,
+  ) -> MemoryByteDuplex ! OutOfMemoryError ? &mut Allocator {
+    let outbound = run Bytes.zeroed(outboundCapacity)
+    let mut audit = List<MemoryByteDuplexAudit>.make()
+    let reserved = run List<MemoryByteDuplexAudit>.reserveExact(&mut audit, auditCapacity)
+    let mut index = usize.ZERO
+    while index < auditCapacity {
+      let appended = run List<MemoryByteDuplexAudit>.append(
+        &mut audit,
+        MemoryByteDuplexAudit {operation: ByteIoOperation.Read, count: usize.ZERO},
+      )
+      index = index + usize.ONE
+    }
+    return MemoryByteDuplex {
+      reads: move reads,
+      activeRead: Option<MemoryReadEvent>.none(),
+      readOffset: usize.ZERO,
+      readEnded: false,
+      writes: move writes,
+      writeIndex: usize.ZERO,
+      outboundBytes: move outbound,
+      outboundLength: usize.ZERO,
+      auditEntries: move audit,
+      auditLength: usize.ZERO,
+      phaseValue: MemoryByteDuplexPhase.Open,
+      closeFailure: move closeFailure,
+      closeAttemptsValue: usize.ZERO,
+    }
+  }
+
+  /// Returns all bytes that writes accepted, in order.
+  pub fn outbound<'a>(self: &'a Self) -> &'a [u8] {
+    let length = self.outboundLength
+    return Slice.view<u8>(Bytes.asSlice(&self.outboundBytes), usize.ZERO, length)
+  }
+
+  /// Returns the recorded operations, in order.
+  pub fn audit<'a>(self: &'a Self) -> &'a [MemoryByteDuplexAudit] {
+    let length = self.auditLength
+    return Slice.view<MemoryByteDuplexAudit>(
+      List<MemoryByteDuplexAudit>.asSlice(&self.auditEntries),
+      usize.ZERO,
+      length,
+    )
+  }
+
+  /// Returns the current state.
+  pub fn phase(self: &Self) -> MemoryByteDuplexPhase { return self.phaseValue }
+
+  /// Returns how many times the transport was closed, including closes that did nothing.
+  pub fn closeAttempts(self: &Self) -> usize { return self.closeAttemptsValue }
+
+  unsafe effect fn read(
+    self: &mut Self,
+    output: &mut [u8],
+    deadline: Option<Instant>,
+  ) -> ReadTransfer ! ByteIoError ? &mut MonotonicClock {
+    if output.length == usize.ZERO { return ReadTransfer.Data {count: usize.ZERO} }
+    if self.phaseValue == MemoryByteDuplexPhase.Closed || self.phaseValue == MemoryByteDuplexPhase.Invalid {
+      fail ByteDuplex.closed(ByteIoOperation.Read)
+    }
+    if self.readEnded { return ReadTransfer.End }
+    run ensureAudit(&mut self.*, ByteIoOperation.Read)
+    let prepared = prepareRead(&mut self.*)
+    let drained = match &self.activeRead {
+      Option<MemoryReadEvent>.None => true
+      Option<MemoryReadEvent>.Some {value: _} => false
+    }
+    if drained {
+      self.readEnded = true
+      let recorded = run record(&mut self.*, ByteIoOperation.Read, usize.ZERO)
+      return ReadTransfer.End
+    }
+    let readyAt = activeReadReadyAt(&self.activeRead)
+    run waitUntilReady(&readyAt, &deadline, ByteIoOperation.Read)
+    let transfer = run readReady(&mut self.*, move output)
+    match move transfer {
+      ReadTransfer.Data {count} => {
+        let recorded = run record(&mut self.*, ByteIoOperation.Read, count)
+        return ReadTransfer.Data {count: count}
+      }
+      ReadTransfer.End => {
+        self.readEnded = true
+        let recorded = run record(&mut self.*, ByteIoOperation.Read, usize.ZERO)
+        return ReadTransfer.End
+      }
+    }
+    return ReadTransfer.End
+  }
+
+  unsafe effect fn write(
+    self: &mut Self,
+    input: &[u8],
+    deadline: Option<Instant>,
+  ) -> usize ! ByteIoError ? &mut MonotonicClock {
+    let parts = [input]
+    return run unsafe MemoryByteDuplex.writeVectored(&mut self.*, &parts, move deadline)
+  }
+
+  // One write event takes bytes from the slices in order, as if they were one slice.
+  unsafe effect fn writeVectored(
+    self: &mut Self,
+    inputs: &[&[u8]],
+    deadline: Option<Instant>,
+  ) -> usize ! ByteIoError ? &mut MonotonicClock {
+    let mut total = usize.ZERO
+    let mut index = usize.ZERO
+    while index < inputs.length {
+      total = usize.saturatingAdd(total, inputs[index].length)
+      index = index + usize.ONE
+    }
+    if total == usize.ZERO { return usize.ZERO }
+    if self.phaseValue != MemoryByteDuplexPhase.Open {
+      fail ByteDuplex.closed(ByteIoOperation.Write)
+    }
+    run ensureAudit(&mut self.*, ByteIoOperation.Write)
+    if self.writeIndex >= List<MemoryWriteEvent>.length(&self.writes) {
+      self.phaseValue = MemoryByteDuplexPhase.Invalid
+      let recorded = run record(&mut self.*, ByteIoOperation.Write, usize.ZERO)
+      fail ByteDuplex.provider(ByteIoOperation.Write, 1)
+    }
+    let writeIndex = self.writeIndex
+    let readyAt = writeReadyAt(&self.writes, writeIndex)
+    run waitUntilReady(&readyAt, &deadline, ByteIoOperation.Write)
+    let action = writeAction(&self.writes, writeIndex)
+    self.writeIndex = self.writeIndex + usize.ONE
+    match move action {
+      MemoryWriteAction.Accept {count} => {
+        let mut accepted = count
+        if accepted > total { accepted = total }
+        if accepted == usize.ZERO { return usize.ZERO }
+        let outbound = Bytes.asSlice(&self.outboundBytes)
+        let capacity = outbound.length
+        drop outbound
+        let start = self.outboundLength
+        if accepted > capacity - start {
+          self.phaseValue = MemoryByteDuplexPhase.Invalid
+          let recorded = run record(&mut self.*, ByteIoOperation.Write, usize.ZERO)
+          fail ByteDuplex.provider(ByteIoOperation.Write, 2)
+        }
+        let mut target = Bytes.asMutSlice(&mut self.outboundBytes)
+        let mut copied = usize.ZERO
+        let mut part = usize.ZERO
+        let mut offset = usize.ZERO
+        while copied < accepted {
+          if offset == inputs[part].length {
+            part = part + usize.ONE
+            offset = usize.ZERO
+          } else {
+            target[start + copied] = inputs[part][offset]
+            offset = offset + usize.ONE
+            copied = copied + usize.ONE
+          }
+        }
+        drop target
+        self.outboundLength = start + accepted
+        let recorded = run record(&mut self.*, ByteIoOperation.Write, accepted)
+        return accepted
+      }
+      MemoryWriteAction.Failure {code} => {
+        self.phaseValue = MemoryByteDuplexPhase.Invalid
+        let recorded = run record(&mut self.*, ByteIoOperation.Write, usize.ZERO)
+        fail ByteDuplex.provider(ByteIoOperation.Write, code)
+      }
+      MemoryWriteAction.InvalidCount {count} => {
+        let recorded = run record(&mut self.*, ByteIoOperation.Write, usize.ZERO)
+        return count
+      }
+    }
+    return usize.ZERO
+  }
+
+  unsafe effect fn flushOutput(
+    self: &mut Self,
+    deadline: Option<Instant>,
+  ) -> () ! ByteIoError ? &mut MonotonicClock {
+    if self.phaseValue == MemoryByteDuplexPhase.Closed || self.phaseValue == MemoryByteDuplexPhase.Invalid {
+      fail ByteDuplex.closed(ByteIoOperation.Flush)
+    }
+    run ensureAudit(&mut self.*, ByteIoOperation.Flush)
+    run checkDeadline(&deadline, ByteIoOperation.Flush)
+    let recorded = run record(&mut self.*, ByteIoOperation.Flush, usize.ZERO)
+    return ()
+  }
+
+  unsafe effect fn shutdownOutput(
+    self: &mut Self,
+    deadline: Option<Instant>,
+  ) -> () ! ByteIoError ? &mut MonotonicClock {
+    if self.phaseValue == MemoryByteDuplexPhase.Closed || self.phaseValue == MemoryByteDuplexPhase.Invalid {
+      fail ByteDuplex.closed(ByteIoOperation.ShutdownWrite)
+    }
+    if self.phaseValue == MemoryByteDuplexPhase.WriteShutdown { return () }
+    run ensureAudit(&mut self.*, ByteIoOperation.ShutdownWrite)
+    run checkDeadline(&deadline, ByteIoOperation.ShutdownWrite)
+    let recorded = run record(&mut self.*, ByteIoOperation.ShutdownWrite, usize.ZERO)
+    self.phaseValue = MemoryByteDuplexPhase.WriteShutdown
+    return ()
+  }
+
+  unsafe effect fn closeLease(self: &mut Self) -> () ! ByteIoError {
+    self.closeAttemptsValue = self.closeAttemptsValue + usize.ONE
+    if self.phaseValue == MemoryByteDuplexPhase.Closed { return () }
+    self.phaseValue = MemoryByteDuplexPhase.Closed
+    if self.auditLength >= List<MemoryByteDuplexAudit>.length(&self.auditEntries) {
+      fail ByteDuplex.provider(ByteIoOperation.Close, 3)
+    }
+    let recorded = run record(&mut self.*, ByteIoOperation.Close, usize.ZERO)
+    return match move Intrinsic.replace(self.closeFailure, Option<i32>.none()) {
+      Option<i32>.None => ()
+      Option<i32>.Some {value: code} => { fail ByteDuplex.provider(ByteIoOperation.Close, code) }
+    }
+  }
+}
+
+impl ByteDuplex for MemoryByteDuplex {
+  readSomeRaw: MemoryByteDuplex.read
+  writeSomeRaw: MemoryByteDuplex.write
+  writeSomeVectoredRaw: MemoryByteDuplex.writeVectored
+  flushRaw: MemoryByteDuplex.flushOutput
+  shutdownWriteRaw: MemoryByteDuplex.shutdownOutput
+  closeRaw: MemoryByteDuplex.closeLease
+}
+
+fn cloneInstant(value: &Instant) -> Instant {
+  return SystemClock.make(SystemClock.seconds(value), SystemClock.nanoseconds(value))
+}
+
+fn reached(now: &Instant, target: &Instant) -> bool {
+  let nowSeconds = SystemClock.seconds(now)
+  let targetSeconds = SystemClock.seconds(target)
+  if nowSeconds > targetSeconds { return true }
+  if nowSeconds < targetSeconds { return false }
+  return SystemClock.nanoseconds(now) >= SystemClock.nanoseconds(target)
+}
+
+fn earlierOrEqual(left: &Instant, right: &Instant) -> bool {
+  let leftSeconds = SystemClock.seconds(left)
+  let rightSeconds = SystemClock.seconds(right)
+  if leftSeconds < rightSeconds { return true }
+  if leftSeconds > rightSeconds { return false }
+  return SystemClock.nanoseconds(left) <= SystemClock.nanoseconds(right)
+}
+
+effect fn checkDeadline(
+  deadline: &Option<Instant>,
+  operation: ByteIoOperation,
+) -> () ! ByteIoError ? &mut MonotonicClock {
+  let now = run MonotonicClock.now()
+  if let Option<Instant>.Some {value: limit} = &deadline.* {
+    if reached(&now, &limit) { fail ByteDuplex.timeout(move operation) }
+  }
+  return ()
+}
+
+effect fn waitUntilReady(
+  readyAt: &Instant,
+  deadline: &Option<Instant>,
+  operation: ByteIoOperation,
+) -> () ! ByteIoError ? &mut MonotonicClock {
+  let before = run MonotonicClock.now()
+  if let Option<Instant>.Some {value: limit} = &deadline.* {
+    if reached(&before, &limit) { fail ByteDuplex.timeout(move operation) }
+  }
+  if reached(&before, readyAt) { return () }
+  if let Option<Instant>.Some {value: limit} = &deadline.* {
+    if earlierOrEqual(&limit, readyAt) {
+      run MonotonicClock.waitUntil(cloneInstant(&limit))
+      fail ByteDuplex.timeout(move operation)
+    }
+  }
+  run MonotonicClock.waitUntil(cloneInstant(readyAt))
+  let after = run MonotonicClock.now()
+  if let Option<Instant>.Some {value: limit} = &deadline.* {
+    if reached(&after, &limit) { fail ByteDuplex.timeout(move operation) }
+  }
+  return ()
+}
+
+fn activeReadReadyAt(read: &Option<MemoryReadEvent>) -> Instant {
+  return match &read.* {
+    Option<MemoryReadEvent>.Some {value: event} => match &event {
+      MemoryReadEvent.Data {readyAt, bytes} => cloneInstant(&readyAt)
+      MemoryReadEvent.End {readyAt} => cloneInstant(&readyAt)
+      MemoryReadEvent.Failure {readyAt, code} => cloneInstant(&readyAt)
+      MemoryReadEvent.InvalidCount {readyAt, count} => cloneInstant(&readyAt)
+    }
+    Option<MemoryReadEvent>.None => SystemClock.make(0, 0)
+  }
+}
+
+fn writeReadyAt(writes: &List<MemoryWriteEvent>, index: usize) -> Instant {
+  return match &List<MemoryWriteEvent>.asSlice(writes)[index] {
+    MemoryWriteEvent {readyAt, action} => cloneInstant(&readyAt)
+  }
+}
+
+fn writeAction(writes: &List<MemoryWriteEvent>, index: usize) -> MemoryWriteAction {
+  return match &List<MemoryWriteEvent>.asSlice(writes)[index] {
+    MemoryWriteEvent {readyAt, action} => action
+  }
+}
+
+effect fn readReady(self: &mut MemoryByteDuplex, output: &mut [u8]) -> ReadTransfer ! ByteIoError {
+  let selected = Intrinsic.replace(self.activeRead, Option<MemoryReadEvent>.none())
+  match move selected {
+    Option<MemoryReadEvent>.None => { return ReadTransfer.End }
+    Option<MemoryReadEvent>.Some {value: event} => match move event {
+    MemoryReadEvent.Data {readyAt, bytes} => {
+      let source = Bytes.asSlice(&bytes)
+      let sourceLength = source.length
+      let available = sourceLength - self.readOffset
+      let mut count = available
+      if count > output.length { count = output.length }
+      let mut copied = usize.ZERO
+      while copied < count {
+        output[copied] = source[self.readOffset + copied]
+        copied = copied + usize.ONE
+      }
+      drop source
+      self.readOffset = self.readOffset + count
+      if self.readOffset == sourceLength {
+        self.readOffset = usize.ZERO
+        drop bytes
+      } else {
+        self.activeRead = Option<MemoryReadEvent>.some(MemoryReadEvent.Data {
+          readyAt: move readyAt,
+          bytes: move bytes,
+        })
+      }
+      return ReadTransfer.Data {count: count}
+    }
+    MemoryReadEvent.End {readyAt} => {
+      drop readyAt
+      return ReadTransfer.End
+    }
+    MemoryReadEvent.Failure {readyAt, code} => {
+      drop readyAt
+      let detail = code
+      self.phaseValue = MemoryByteDuplexPhase.Invalid
+      let recorded = run record(&mut self.*, ByteIoOperation.Read, usize.ZERO)
+      fail ByteDuplex.provider(ByteIoOperation.Read, detail)
+    }
+    MemoryReadEvent.InvalidCount {readyAt, count} => {
+      drop readyAt
+      let invalid = count
+      return ReadTransfer.Data {count: invalid}
+    }
+    }
+  }
+  return ReadTransfer.End
+}
+
+fn prepareRead(self: &mut MemoryByteDuplex) -> () {
+  match &self.activeRead {
+    Option<MemoryReadEvent>.Some {value: event} => { return () }
+    Option<MemoryReadEvent>.None => {}
+  }
+  if List<MemoryReadEvent>.length(&self.reads) == usize.ZERO { return () }
+  let selected = List<MemoryReadEvent>.remove(&mut self.reads, usize.ZERO)
+  self.activeRead = Option<MemoryReadEvent>.some(move selected)
+  return ()
+}
+
+effect fn ensureAudit(
+  self: &mut MemoryByteDuplex,
+  operation: ByteIoOperation,
+) -> () ! ByteIoError {
+  if self.auditLength >= List<MemoryByteDuplexAudit>.length(&self.auditEntries) {
+    self.phaseValue = MemoryByteDuplexPhase.Invalid
+    fail ByteDuplex.provider(move operation, 3)
+  }
+  return ()
+}
+
+effect fn record(
+  self: &mut MemoryByteDuplex,
+  operation: ByteIoOperation,
+  count: usize,
+) -> () ! ByteIoError {
+  if self.auditLength >= List<MemoryByteDuplexAudit>.length(&self.auditEntries) {
+    fail ByteDuplex.provider(move operation, 3)
+  }
+  let index = self.auditLength
+  List<MemoryByteDuplexAudit>.set(
+    &mut self.auditEntries,
+    index,
+    MemoryByteDuplexAudit {operation: move operation, count: count},
+  )
+  self.auditLength = index + usize.ONE
+  return ()
+}

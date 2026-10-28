@@ -1,18 +1,18 @@
 # HTTP body framing
 
 Import message-body selection, incremental codecs, trailer policy, limits, progress, and completion
-evidence from `silk.http_body`. The module frames exactly one HTTP/1.0 or HTTP/1.1 message body
-after `silk.http_head` has validated its head. It does not read or write a transport, decode content
+evidence from `silk.http.body`. The module frames exactly one HTTP/1.0 or HTTP/1.1 message body
+after `silk.http.head` has validated its head. It does not read or write a transport, decode content
 codings, or decide whether a connection is healthy.
 
 ```silk
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
-import silk.http_body { BodyError, Framing, Selection, TrailerPolicy, selectRequest }
-import silk.http_head { Limits, ParseError, Progress, RequestHead, RequestParser }
-import silk.http_headers { Limits as ValueLimits }
-import silk.result { Result }
-import silk.u64
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.http.body { BodyError, Framing, Selection, TrailerPolicy, selectRequest }
+import silk.http.head { Limits, ParseError, Progress, RequestHead, RequestParser }
+import silk.http.headers { Limits as ValueLimits }
+import silk.core.result { Result }
+import silk.num.u64
 
 fn inspect<'value>(outcome: Result<RequestHead<'value>, ParseError>) -> i32 {
   let head = match move outcome {
@@ -208,7 +208,7 @@ pause on a full output slice. Close-delimited framing copies payload without man
 reusable delimiter.
 
 `Encoder.beginFinish(&trailers)` validates the framing state and fixed-length total. For chunked
-framing, it accepts validated `silk.http_headers.Headers`, validates trailer syntax, the retained
+framing, it accepts validated `silk.http.headers.Headers`, validates trailer syntax, the retained
 policy and exclusions, and trailer limits, then copies the complete trailer snapshot into the
 encoder's reserved storage before emitting any finish byte. An invalid chunked trailer set
 therefore emits no terminating chunk or trailer prefix. `Encoder.continueFinish(output)` accepts no
@@ -239,7 +239,7 @@ successfully. Completion evidence does not assert that output was flushed or rec
 | `maxTrailerBytes`   | `usize`                    | Complete trailer section bytes, including CRLF delimiters. |
 | `maxTrailerFields`  | `usize`                    | Trailer field records.                                     |
 | `maxOwnedBytes`     | `usize`                    | Reserved byte backing and metadata indices.                |
-| `trailerValues`     | `silk.http_headers.Limits` | Trailer name, value, field, and owned-copy limits.         |
+| `trailerValues`     | `silk.http.headers.Limits` | Trailer name, value, field, and owned-copy limits.         |
 
 Zero is a real bound, not an unlimited setting.
 
@@ -323,5 +323,5 @@ response semantics, cancellation-driven draining, connection pooling, and proxy 
 their respective actors.
 
 The implementation and portable acceptance evidence live in
-[`http_body.silk`](../stdlib/silk/http_body.silk) and
+[`http_body.silk`](../stdlib/silk/http/body.silk) and
 `httpBodyAcceptance.ts`.

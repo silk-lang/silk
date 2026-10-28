@@ -5,13 +5,13 @@ description: Owned IP, domain, endpoint, and finite provider-replaceable resolut
 
 # Network addresses and resolution
 
-Use `silk.network_address` to parse and retain origin hosts, and `silk.resolver` to turn an owned
+Use `silk.net.address` to parse and retain origin hosts, and `silk.net.resolver` to turn an owned
 host and port into a finite owned endpoint sequence. The portable actors work without libc and can
 use deterministic Resolver providers in tests and embedded applications.
 
 ```silk
-import silk.network_address {AddressError, Host, Port}
-import silk.result {Result}
+import silk.net.address {AddressError, Host, Port}
+import silk.core.result {Result}
 
 pub fn main() -> i32 {
   let host = Host.parse("[2001:db8::1]")
@@ -69,7 +69,7 @@ before observable work.
 
 ## NativeSystemResolver
 
-`silk.native_resolver` is selected only for Darwin ARM64 system libc and GNU Linux x86-64/ARM64 GNU
+`silk.net.resolver_native` is selected only for Darwin ARM64 system libc and GNU Linux x86-64/ARM64 GNU
 libc. It is deliberately synchronous.
 
 - Domain plus `Some(deadline)` fails `DeadlineUnsupported` before clock sampling, allocation, query

@@ -1,0 +1,479 @@
+//! The native provider of the `FileSystem` effect, confined to one directory of the host.
+//!
+//! # When to use
+//! Provide [`OsFileSystem`] for `FileSystem` in a native program. Code that uses files uses
+//! `silk.system.filesystem`, so a test can provide a file system in memory.
+//!
+//! # Details
+//! [`OsFileSystem.make`] takes a root directory of the host. The path `/` of the provider is that
+//! root, not the root of the host. A path cannot leave the root: `..` is not valid in a `Path`, and
+//! the native provider resolves a symbolic link below the root inside the root. An absolute link
+//! target starts again at the root, and `..` in a target never goes above it.
+//!
+//! The write operations are different:
+//! - `writeFile` creates or truncates the file, then writes. If it fails, a partial file can stay.
+//! - `createFile` fails with `AlreadyExists` if the entry exists. If a later write fails, the new
+//!   partial file stays.
+//! - `writeFileAtomic` writes a temporary file in the same directory, then renames it to the path
+//!   (to replace) or links it (to create). A reader sees the old file or the complete new file,
+//!   never a part. A replace changes a final symbolic link itself, not its target.
+//!
+//! New files get mode 0666, filtered by the umask of the process. An atomic replace makes a new
+//! file, so the permissions, owner, extended attributes, and hard links of the old file are not
+//! kept. A synchronized atomic write calls `fsync` on the file before the rename, and on the
+//! directory after it. `syncDirectory` also uses `fsync`. These do not use `F_FULLFSYNC`, and do
+//! not promise that data survives a power loss.
+//!
+//! On WASI, roots name preopened guest directories. The host controls rights, file permissions, and synchronization support.
+//!
+//! Directory listings are sorted by the bytes of the paths. A native error becomes a `FileError`
+//! with a portable reason and the native code.
+//!
+//! # Errors
+//! - `FileError` for each failed operation. If a close fails after an earlier error, the earlier
+//!   error is returned.
+//! - `AtomicWriteError` from `writeFileAtomic`. It tells if the failure was before or after the new
+//!   contents became visible, and names a temporary file that cleanup could not remove.
+//! - `OutOfMemoryError` from operations that return owned bytes or paths.
+//!
+//! # Gotchas
+//! - Trust the root and its parent directories. The confinement does not protect against a process
+//!   that renames those directories, changes mounts, or changes the temporary files.
+//! - After `writeFileAtomic` fails with a published error, the new contents are visible. Do not
+//!   write again without a check.
+//! - The provider exists on WASI, Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+//!
+//! # Examples
+//! ## Write and read a file in a temporary directory
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.collections.bytes { Bytes }
+//! import silk.core.effect { Effect }
+//! import silk.system.filesystem { FileError, FileSystem, Path }
+//! import silk.system.filesystem_native { OsFileSystem }
+//!
+//! effect fn program() -> i32
+//!   ! FileError | OutOfMemoryError
+//!   ? &mut FileSystem | &mut Allocator {
+//!   // `/` is the root of the provider: /tmp on the host.
+//!   let root = run Path.make("/")
+//!   let scratch = run FileSystem.temporaryDirectory(&root, "silk-doc-")
+//!   let file = run Path.join(&scratch.path, "note.txt")
+//!   run FileSystem.writeFile(&file, b"hello")
+//!   let bytes = run FileSystem.readFile(&file)
+//!   let read = Bytes.asSlice(&bytes)
+//!   let same = read.length == 5 && read[0] == 104
+//!   drop read
+//!
+//!   // Remove the directory and the file in it.
+//!   run FileSystem.release(move scratch)
+//!   if !same {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//!
+//! effect fn failed<E>(error: E) -> i32 {
+//!   drop error
+//!   return 1
+//! }
+//!
+//! effect fn withFiles() -> i32
+//!   ! FileError | OutOfMemoryError
+//!   ? &mut Allocator {
+//!   let mut files = run OsFileSystem.make("/tmp")
+//!   return run program() |> Effect.provideMut<FileSystem>(&mut files)
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   return run Effect.catchAll(withFiles(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+//! }
+//! ```
+//!
+//! @category System
+
+static if Intrinsic.targetOperatingSystem() == "wasi" || (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArchitecture() == "aarch64" && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+  static if Intrinsic.targetOperatingSystem() == "wasi" {
+    import silk.platform.wasi.filesystem {WasiFileSystem as NativeFileSystem, FileHandle, DirectoryHandle}
+  } else {
+    import silk.platform.native.filesystem {NativeFileSystem, FileHandle, DirectoryHandle}
+  }
+  import silk.num.u64
+  import silk.core.bool
+  import silk.core.effect { Effect }
+  import silk.collections.bytes { Bytes }
+  import silk.text.string { String }
+  import silk.mem.allocator { Allocator, OutOfMemoryError }
+  import silk.system.filesystem { DirectoryEntry, DirectoryInfo, FileError, FileInfo, FileOperation, FileReason, FileSystem, Path, PublicationPolicy, Durability, AtomicWriteError }
+  import silk.num.i32
+  import silk.core.result { Result }
+  import silk.num.u8
+  import silk.num.usize
+  import silk.collections.list { List }
+  import silk.collections.slice { Slice }
+
+  /// The native `FileSystem` provider. It owns the bytes of its root directory.
+  ///
+  /// # Details
+  /// Each `Path` is resolved below the root. The root is never shown as a `Path`. An operation that
+  /// would leave the root fails. The path `/` of the provider is the root, not the root of the
+  /// host. The native provider resolves symbolic links below the root inside the root. New files
+  /// get mode 0666, filtered by the umask of the process. Directory listings are sorted by the
+  /// bytes of the paths. A native error becomes a `FileError` with a portable reason and the native code.
+  ///
+  /// On WASI, the root names a preopened guest directory. The host controls rights, permissions, and synchronization support.
+  ///
+  /// # Gotchas
+  /// - Trust the root and its parent directories. The confinement does not protect against a
+  ///   process that renames those directories, changes mounts, or changes the temporary files of
+  ///   `writeFileAtomic`.
+  /// - `writeFile` and `createFile` can leave a partial file when a write fails. Use
+  ///   `writeFileAtomic` when a reader must see the old file or the complete new file.
+  /// - Synchronized writes use `fsync`, not `F_FULLFSYNC`, and do not promise that data survives a
+  ///   power loss.
+  /// - The provider exists on WASI, Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+  pub struct OsFileSystem {
+    root: Bytes,
+    counter: u64,
+  }
+
+  impl OsFileSystem {
+    effect fn readFile(
+      self: &mut Self,
+      path: &Path
+    ) -> Bytes ! FileError | OutOfMemoryError ? &mut Allocator {
+      let mut handle = run NativeFileSystem.openFile(Bytes.asSlice(&self.root), Path.rawBytes(path), false, 0)
+      let attempted = run Effect.result(readLoop(&mut handle, run sizeHint(Bytes.asSlice(&self.root), Path.rawBytes(path))))
+      let closed = run Effect.result(NativeFileSystem.closeFile(move handle, FileSystem.readFileOperation()))
+      return match move attempted {
+        Result<Bytes, FileError | OutOfMemoryError>.Success { value: bytes } => match move closed {
+          Result<(), FileError>.Success { value: completed } => move bytes
+          Result<(), FileError>.Failure { error: closeFailure } => run discardThenReroute<Bytes>(move bytes, move closeFailure)
+        }
+        Result<Bytes, FileError | OutOfMemoryError>.Failure { error: primary } => match move primary {
+          FileError failure => run preserveFile(move failure, move closed)
+          OutOfMemoryError exhausted => run preserveOutOfMemory(move exhausted, move closed)
+        }
+      }
+    }
+
+    effect fn writeFile(self: &mut Self, path: &Path, bytes: &[u8]) -> () ! FileError {
+      let mut handle = run NativeFileSystem.openFile(Bytes.asSlice(&self.root), Path.rawBytes(path), true, 1)
+      let attempted = run Effect.result(writeLoop(&mut handle, bytes))
+      let closed = run Effect.result(NativeFileSystem.closeFile(move handle, FileSystem.writeFileOperation()))
+      return match move attempted {
+        Result<(), FileError>.Success { value: completed } => match move closed {
+          Result<(), FileError>.Success { value: closedValue } => ()
+          Result<(), FileError>.Failure { error: closeFailure } => run rerouteFile(move closeFailure)
+        }
+        Result<(), FileError>.Failure { error: primary } => run preserveFile(move primary, move closed)
+      }
+    }
+
+    /// Creates the file only if no entry exists. If a later write or close fails, the new file
+    /// stays.
+    effect fn createFile(self: &mut Self, path: &Path, bytes: &[u8]) -> () ! FileError {
+      return run NativeFileSystem.createFile(Bytes.asSlice(&self.root), Path.rawBytes(path), bytes)
+    }
+
+    /// Writes a temporary file, then makes it visible at `path` in one step.
+    ///
+    /// It is atomic for one file only. If the error says that the contents were published, they are
+    /// visible, even if a later sync failed. Do not write again without a check.
+    effect fn writeFileAtomic(
+      self: &mut Self,
+      path: &Path,
+      bytes: &[u8],
+      policy: PublicationPolicy,
+      durability: Durability
+    ) -> () ! AtomicWriteError {
+      let mut counter = self.counter
+      let attempted = run Effect.result(NativeFileSystem.writeFileAtomic(Bytes.asSlice(&self.root), Path.rawBytes(path), bytes, policy.code, durability.code, &mut counter))
+      self.counter = counter
+      match move attempted {
+        Result<(), AtomicWriteError>.Success { value } => ()
+        Result<(), AtomicWriteError>.Failure { error } => { fail move error }
+      }
+    }
+
+    /// Calls `fsync` on the directory, without following a symbolic link. If the file system does
+    /// not support it, it fails.
+    effect fn syncDirectory(self: &mut Self, path: &Path) -> () ! FileError {
+      return run NativeFileSystem.syncDirectory(Bytes.asSlice(&self.root), Path.rawBytes(path))
+    }
+
+    effect fn stat(self: &mut Self, path: &Path) -> FileInfo | DirectoryInfo ! FileError {
+      let mut kind = 0
+      let mut byteLength = usize.ZERO
+      run NativeFileSystem.inspect(Bytes.asSlice(&self.root), Path.rawBytes(path), &mut kind, &mut byteLength, 2)
+      if kind == 0 { return FileSystem.fileInfo(byteLength) }
+      return FileSystem.directoryInfo()
+    }
+
+    effect fn listDirectory(
+      self: &mut Self,
+      path: &Path
+    ) -> List<DirectoryEntry> ! FileError | OutOfMemoryError ? &mut Allocator {
+      let mut handle = run NativeFileSystem.openDirectory(Bytes.asSlice(&self.root), Path.rawBytes(path), 3)
+      let attempted = run Effect.result(listLoop(&mut handle, path))
+      let closed = run Effect.result(NativeFileSystem.closeDirectory(move handle, FileSystem.listDirectoryOperation()))
+      return match move attempted {
+        Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success { value: entries } => match move closed {
+          Result<(), FileError>.Success { value: completed } => move entries
+          Result<(), FileError>.Failure { error: closeFailure } => run discardThenReroute<List<DirectoryEntry>>(move entries, move closeFailure)
+        }
+        Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Failure { error: primary } => match move primary {
+          FileError failure => run preserveFile(move failure, move closed)
+          OutOfMemoryError exhausted => run preserveOutOfMemory(move exhausted, move closed)
+        }
+      }
+    }
+
+    /// Creates a directory in `parent` with a unique name that starts with `prefix`, and returns
+    /// its path.
+    ///
+    /// If the name does not fit in the buffer, the native call creates nothing. Then this function
+    /// makes a larger buffer and tries again.
+    effect fn createTemporaryDirectory(
+      self: &mut Self,
+      parent: &Path,
+      prefix: &[u8]
+    ) -> Path ! FileError | OutOfMemoryError ? &mut Allocator {
+      let mut buffer = run Bytes.zeroed(64)
+      let mut required: usize = 0
+      let mut length: usize = 0
+      let mut complete = false
+      while complete == false {
+        let mut counter = self.counter
+        let attempted = run Effect.result(NativeFileSystem.createUnique(Bytes.asSlice(&self.root), Path.rawBytes(parent), prefix, &mut counter, Bytes.asMutSlice(&mut buffer), &mut length, &mut required, 8))
+        self.counter = counter
+        complete = match move attempted {
+          Result<bool, FileError>.Success { value } => value
+          Result<bool, FileError>.Failure { error } => run rerouteFile(move error)
+        }
+        if complete == false { buffer = run Bytes.zeroed(required) }
+      }
+      let mut name = Bytes.make()
+      let view = Bytes.asSlice(&buffer)
+      let mut index: usize = 0
+      while index < length {
+        let one = [view[index]]
+        run Bytes.append(&mut name, &one)
+        index = index + 1
+      }
+      return run Path.joinBytes(parent, Bytes.asSlice(&name))
+    }
+
+    effect fn createDirectory(self: &mut Self, path: &Path) -> () ! FileError {
+      return run command(move self, path, FileSystem.createDirectoryOperation(), 0)
+    }
+
+    effect fn removeFile(self: &mut Self, path: &Path) -> () ! FileError {
+      return run command(move self, path, FileSystem.removeFileOperation(), 1)
+    }
+
+    effect fn removeDirectory(self: &mut Self, path: &Path) -> () ! FileError {
+      return run command(move self, path, FileSystem.removeDirectoryOperation(), 2)
+    }
+  }
+
+  impl OsFileSystem {
+    /// Returns a provider with a copy of the text `root` as its root directory, such as `"/"` or
+    /// `"/tmp"`. It does not open the directory.
+    ///
+    /// # Errors
+    /// `OutOfMemoryError` if the copy cannot be allocated.
+    ///
+    /// # Gotchas
+    /// `root` must be an absolute host path, not empty, with no NUL. Other values trap.
+    pub effect fn make(root: string) -> OsFileSystem ! OutOfMemoryError ? &mut Allocator {
+      return run OsFileSystem.makeBytes(String.utf8Bytes(root))
+    }
+
+    /// Returns a provider with a copy of `root` as its root directory. It does not open the
+    /// directory. The bytes do not have to be valid UTF-8.
+    ///
+    /// # When to use
+    /// Use it for a root that you got from the host as bytes, such as the working directory from
+    /// `HostInput.workingDirectory`.
+    ///
+    /// # Errors
+    /// `OutOfMemoryError` if the copy cannot be allocated.
+    ///
+    /// # Gotchas
+    /// `root` must be an absolute host path, not empty, with no NUL. Other values trap.
+    pub effect fn makeBytes(root: &[u8]) -> OsFileSystem ! OutOfMemoryError ? &mut Allocator {
+      let rootBytes = root
+      if rootBytes.length == usize.ZERO { Intrinsic.trap("OsFileSystem.makeBytes: the root is empty") }
+      if rootBytes[usize.ZERO] != u8.toU8(47) { Intrinsic.trap("OsFileSystem.makeBytes: the root is not an absolute path") }
+      let mut index = usize.ZERO
+      while index < rootBytes.length {
+        if rootBytes[index] == u8.toU8(0) { Intrinsic.trap("OsFileSystem.makeBytes: the root contains a NUL byte") }
+        index = index + usize.ONE
+      }
+      let owned = run Bytes.copy(rootBytes)
+      return OsFileSystem { root: move owned, counter: 0 }
+    }
+  }
+
+  fn pathBytes(path: &Path) -> &[u8] {
+    return Path.rawBytes(path)
+  }
+
+  fn ignoreClose(result: Result<(), FileError>) -> () {
+    return match move result {
+      Result<(), FileError>.Success { value: completed } => ()
+      Result<(), FileError>.Failure { error: failure } => ()
+    }
+  }
+
+  effect fn rerouteFile(error: FileError) -> never ! FileError { fail move error }
+  effect fn rerouteOutOfMemory(error: OutOfMemoryError) -> never ! OutOfMemoryError { fail move error }
+
+  effect<'env> fn discardThenReroute<T: 'env, 'env>(value: T, error: FileError) -> never ! FileError {
+    drop value
+    fail move error
+  }
+
+  effect fn preserveFile(error: FileError, closed: Result<(), FileError>) -> never ! FileError {
+    let ignored = ignoreClose(move closed)
+    fail move error
+  }
+
+  effect fn preserveOutOfMemory(
+    error: OutOfMemoryError,
+    closed: Result<(), FileError>
+  ) -> never ! OutOfMemoryError {
+    let ignored = ignoreClose(move closed)
+    fail move error
+  }
+
+  // The length of the file at `path` when it is about to be read, or zero when it cannot be
+  // inspected; `readLoop` takes it as a hint only.
+  effect fn sizeHint(root: &[u8], path: &[u8]) -> usize {
+    let mut kind = 0
+    let mut length = usize.ZERO
+    let inspected = run Effect.result(NativeFileSystem.inspect(root, path, &mut kind, &mut length, 0))
+    return match move inspected {
+      Result<(), FileError>.Success { value: done } => length
+      Result<(), FileError>.Failure { error: failure } => usize.ZERO
+    }
+  }
+
+  // Reads straight into the result, sized from `hint` plus one byte so the end of an unchanged file
+  // shows without growing it. A file that grew since is read in further 64 KiB steps.
+  effect fn readLoop(handle: &mut FileHandle, hint: usize) -> Bytes ! FileError | OutOfMemoryError ? &mut Allocator {
+    let mut result = run Bytes.zeroed(hint + usize.ONE)
+    let mut filled = usize.ZERO
+    let mut complete = false
+    while complete == false {
+      let capacity = Bytes.length(&result)
+      if filled == capacity {
+        let more = run Bytes.zeroed(65536)
+        run Bytes.append(&mut result, Bytes.asSlice(&more))
+      }
+      let room = Bytes.length(&result) - filled
+      let length = run NativeFileSystem.readFile(&mut handle, Slice.viewMut<u8>(Bytes.asMutSlice(&mut result), filled, room), 0)
+      if length == 0 { complete = true } else { filled = filled + length }
+    }
+    Bytes.truncate(&mut result, filled)
+    return move result
+  }
+
+  effect fn writeLoop(handle: &mut FileHandle, bytes: &[u8]) -> () ! FileError {
+    return run NativeFileSystem.writeFile(move handle, bytes, 1)
+  }
+
+  effect fn listLoop(
+    handle: &mut DirectoryHandle,
+    parent: &Path
+  ) -> List<DirectoryEntry> ! FileError | OutOfMemoryError ? &mut Allocator {
+    let mut entries = List<DirectoryEntry>.make()
+    let initialBuffer = Bytes.zeroed(64)
+    let mut buffer = run initialBuffer
+    let mut complete = false
+    while complete == false {
+      let mut kind = 0
+      let mut required = usize.ZERO
+      let mut length = usize.ZERO
+      let next = run NativeFileSystem.next(&mut handle, Bytes.asMutSlice(&mut buffer), &mut length, &mut required, &mut kind, 3)
+      if next == false {
+        buffer = run Bytes.zeroed(required)
+      } else {
+        if length == usize.ZERO {
+          complete = true
+        } else {
+          let view = Bytes.asSlice(&buffer)
+          let mut name = Bytes.make()
+          let mut index = usize.ZERO
+          while index < length {
+            let one = [view[index]]
+            let appended = run Bytes.append(&mut name, &one)
+            index = index + usize.ONE
+          }
+          let child = run Path.joinBytes(parent, Bytes.asSlice(&name))
+          let mut entryKind = FileSystem.directory()
+          if kind == 0 { entryKind = FileSystem.file() }
+          if kind == 2 { entryKind = FileSystem.symbolicLink() }
+          let insertion = insertionFor(&child, List<DirectoryEntry>.asSlice(&entries))
+          let inserted = run List<DirectoryEntry>.insert(
+            &mut entries,
+            insertion,
+            FileSystem.directoryEntry(move child, move entryKind)
+          )
+        }
+      }
+    }
+    return move entries
+  }
+
+  fn insertionFor(child: &Path, existing: &[DirectoryEntry]) -> usize {
+    let mut insertion = usize.ZERO
+    while insertion < existing.length {
+      let before = match &existing[insertion] {
+        DirectoryEntry { path, kind } => pathLess(child, &path)
+      }
+      if before { return insertion }
+      insertion = insertion + usize.ONE
+    }
+    return insertion
+  }
+
+  fn pathLess(left: &Path, right: &Path) -> bool {
+    let leftBytes = pathBytes(left)
+    let rightBytes = pathBytes(right)
+    let mut index = usize.ZERO
+    while index < leftBytes.length {
+      if rightBytes.length <= index { return false }
+      if leftBytes[index] < rightBytes[index] { return true }
+      if rightBytes[index] < leftBytes[index] { return false }
+      index = index + usize.ONE
+    }
+    if leftBytes.length < rightBytes.length { return true }
+    return false
+  }
+
+  effect fn command(
+    self: &mut OsFileSystem,
+    path: &Path,
+    operation: FileOperation,
+    selector: i32
+  ) -> () ! FileError {
+    return run NativeFileSystem.command(Bytes.asSlice(&self.root), Path.rawBytes(path), selector, operation.code)
+  }
+
+  impl FileSystem for OsFileSystem {
+    readFile: OsFileSystem.readFile
+    writeFile: OsFileSystem.writeFile
+    createFile: OsFileSystem.createFile
+    writeFileAtomic: OsFileSystem.writeFileAtomic
+    syncDirectory: OsFileSystem.syncDirectory
+    stat: OsFileSystem.stat
+    listDirectory: OsFileSystem.listDirectory
+    createDirectory: OsFileSystem.createDirectory
+    removeFile: OsFileSystem.removeFile
+    removeDirectory: OsFileSystem.removeDirectory
+    createTemporaryDirectory: OsFileSystem.createTemporaryDirectory
+  }
+}

@@ -405,7 +405,7 @@ Days and weeks are fixed spans: one day is exactly 24 hours and one week is exac
 They do not represent calendar days, time zones, daylight-saving transitions, or leap seconds.
 
 ```silk
-import silk.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock { MonotonicClock }
 
 effect fn pause() -> () ? &mut MonotonicClock {
   return run MonotonicClock.waitFor(1h30m)
@@ -505,7 +505,7 @@ values, strings or nominal enums. When an operator has only literal operands and
 integer context, its existing first-literal fallback still applies; this is not global inference.
 
 ```silk
-import silk.char { fromU32, toU32 }
+import silk.text.char { fromU32, toU32 }
 import silk.option { Option }
 
 fn checked(value: u32) -> Option<char> {
@@ -647,7 +647,7 @@ compile errors, cycles, and static-evaluation limits retain their diagnostic and
 
 **Status:** Confirmed
 
-The ordinary `silk.target` module publishes these primitive constants. Their initializers use the
+The ordinary `silk.core.target` module publishes these primitive constants. Their initializers use the
 same static evaluator as every other constant, and the selected target determines their values.
 
 | Fact          | Type    | Value                                        |
@@ -658,7 +658,7 @@ same static evaluator as every other constant, and the selected target determine
 | `pointerBits` | `u32`   | Target pointer width in bits                 |
 
 ```silk
-import silk.target { pointerBits, usizeMax, isizeMax, isizeMin }
+import silk.core.target { pointerBits, usizeMax, isizeMax, isizeMin }
 
 pub const MAX: usize = usizeMax
 pub const BITS: u32 = pointerBits
@@ -1520,7 +1520,7 @@ pointee's instances.
 **Status:** Confirmed
 
 The compiler exposes the pointer primitives through the sealed `Intrinsic` namespace, and the
-module `silk/pointer` exposes them as the ordinary `Pointer` API:
+module `silk/mem/pointer` exposes them as the ordinary `Pointer` API:
 
 | Operation                                                          | Safety | Result                                         |
 | ------------------------------------------------------------------ | ------ | ---------------------------------------------- |
@@ -1544,7 +1544,7 @@ initialized live value; writes require live writable storage. Aligned operations
 alignment. Unaligned operations emit no stronger LLVM alignment than the source guarantee.
 
 ```silk
-import silk.pointer { Pointer }
+import silk.mem.pointer { Pointer }
 
 fn seventh() -> i32 {
   let mut value = 0
@@ -1561,7 +1561,7 @@ The `Pointer` source API bounds `read` and `write` to a Copy pointee, so `Pointe
 applies the same Copy rule to every pointer read and write operation as the backstop for direct
 intrinsic use. Every primitive is available through LLVM on native and WebAssembly targets.
 
-**Boundary:** A pointer cannot move a non-Copy value through raw memory. `silk/output` provides
+**Boundary:** A pointer cannot move a non-Copy value through raw memory. `silk/mem/output` provides
 ordinary Copy output-state owners over raw storage. `Slot.address` consumes a raw slot selection
 without reading or initializing it. A foreign call does not change the owner's initialization state;
 `Uninitialized.assumeInitialized` requires an unsafe proof of a complete valid value.
@@ -1572,12 +1572,12 @@ reports the ordinary bound failure naming the Copy requirement. A pointer read o
 pointee is not Copy in constructed MIR is a structural verification violation and emits no artifact.
 
 **Current compiler:** Aligned. The `Pointer` intrinsic actor carries one all-target operation per
-primitive, each unsafe one with its caller invariant; `silk/pointer.silk` wraps them with the
+primitive, each unsafe one with its caller invariant; `silk/mem/pointer.silk` wraps them with the
 documented bounds.
 
 **Evidence:** raw pointer specification,
 [pointer intrinsics](../bootstrap/packages/compiler/src/Intrinsic.ts),
-[pointer source API](../stdlib/silk/pointer.silk),
+[pointer source API](../stdlib/silk/mem/pointer.silk),
 [unsafe boundaries](unsafe-intrinsics-and-targets.md#unsafe-003--unsafe-call-marks-one-invocation-unsafe---marks-a-statement-region).
 
 ### PTR-003 — Formation ends no loan and validity is the caller's obligation
@@ -1589,7 +1589,7 @@ it would anyway, and the pointer itself holds no loan on the root. The root stay
 mutable, and droppable while pointers to it exist.
 
 ```silk
-import silk.pointer { Pointer }
+import silk.mem.pointer { Pointer }
 
 fn address(value: i32) -> *const i32 {
   let pointer = Pointer.fromRef(&value)
@@ -1743,10 +1743,10 @@ parameter, its result or its failure. A call on the union runs the active member
 the remaining arguments unchanged.
 
 ```silk
-import silk.allocator { OutOfMemoryError }
+import silk.mem.allocator { OutOfMemoryError }
 import silk.format { Format }
-import silk.json_scanner { JsonError, JsonReason }
-import silk.writer { Writer, WriterError }
+import silk.json.scanner { JsonError, JsonReason }
+import silk.io.writer { Writer, WriterError }
 
 fn failure(flag: bool) -> JsonError | OutOfMemoryError {
   if flag {

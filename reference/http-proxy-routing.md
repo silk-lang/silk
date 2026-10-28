@@ -5,13 +5,13 @@ description: Explicit bounded forward-proxy policy, routed request admission, CO
 
 # HTTP proxy routing
 
-Use `silk.http_proxy` to select an explicit route for one HTTP origin. Proxy configuration is an
+Use `silk.http.proxy` to select an explicit route for one HTTP origin. Proxy configuration is an
 owned, bounded value. Route selection is pure: it does not resolve a name, open a connection, read
-ambient settings, or generate output. `silk.http_request` turns a selected route into a sealed
-routed request, and `silk.http_exchange.withRoute` scopes acquisition, CONNECT, optional origin TLS,
+ambient settings, or generate output. `silk.http.request` turns a selected route into a sealed
+routed request, and `silk.http.exchange.withRoute` scopes acquisition, CONNECT, optional origin TLS,
 and the final HTTP connection.
 
-> `silk.http_proxy` supports only plaintext HTTP proxy endpoints. A Forward route exposes the
+> `silk.http.proxy` supports only plaintext HTTP proxy endpoints. A Forward route exposes the
 > request target, headers, and any `Proxy-Authorization` value to the proxy hop and to observers of
 > that hop. HTTPS for the origin does not protect a Forward request or the CONNECT request that
 > precedes an origin TLS tunnel.
@@ -20,10 +20,10 @@ This complete program constructs a credential-free proxy configuration and selec
 Tunnel route without contacting the network:
 
 ```silk
-import silk.allocator {Allocator, OutOfMemoryError}
-import silk.effect {Effect}
-import silk.http_origin {Origin}
-import silk.http_proxy {
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.core.effect {Effect}
+import silk.http.origin {Origin}
+import silk.http.proxy {
   BypassPolicy,
   ProxyAuth,
   ProxyAuthContextId,
@@ -33,9 +33,9 @@ import silk.http_proxy {
   Route,
   RouteMode,
 }
-import silk.http_proxy as Proxy
-import silk.result {Result}
-import silk.uri {Uri}
+import silk.http.proxy as Proxy
+import silk.core.result {Result}
+import silk.uri.uri {Uri}
 
 effect fn select() -> i32 ! OutOfMemoryError ? &mut Allocator {
   let empty: [Origin; 0] = []
@@ -214,8 +214,8 @@ redirect following, pooling, replay, or permanent capability caching. It does no
 plaintext proxy hop protects request metadata or credentials.
 
 The implementation lives in
-[`http_proxy.silk`](../stdlib/silk/http_proxy.silk),
-[`http_request.silk`](../stdlib/silk/http_request.silk), and
-[`http_exchange.silk`](../stdlib/silk/http_exchange.silk). The normative
+[`http_proxy.silk`](../stdlib/silk/http/proxy.silk),
+[`http_request.silk`](../stdlib/silk/http/request.silk), and
+[`http_exchange.silk`](../stdlib/silk/http/exchange.silk). The normative
 delivery contract is recorded in the
 `http-proxy-routing` OpenSpec.

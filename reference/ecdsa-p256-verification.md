@@ -1,6 +1,6 @@
 # ECDSA P-256/SHA-256 verification
 
-Import `EcdsaP256Sha256` and `P256SignatureError` from `silk.p256`.
+Import `EcdsaP256Sha256` and `P256SignatureError` from `silk.crypto.p256`.
 `EcdsaP256Sha256.verify(publicKey, message, signature)` borrows three byte slices and returns
 `Result<(), P256SignatureError>`. It hashes the message exactly once with SHA-256; the input is a
 message, not a precomputed digest. Message byte lengths above 2^61−1 fail before hashing.
@@ -23,7 +23,7 @@ point at infinity, and compares r against the affine x-coordinate reduced modulo
 ## Retained certificate metadata
 
 `verifyCertificate(keyAlgorithm, publicKey, message, signatureAlgorithm, signature)` borrows
-`AlgorithmView` and `BitStringView` values from `silk.certificate`. It does not require a Certificate
+`AlgorithmView` and `BitStringView` values from `silk.tls.certificate`. It does not require a Certificate
 handle or parse another ASN.1 container. The views' retained OID contents, parameter DER and bit
 string contents are the metadata inputs; their `der` fields are not reparsed.
 

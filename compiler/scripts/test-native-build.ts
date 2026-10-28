@@ -695,7 +695,7 @@ const program = Effect.gen(function* () {
     join(adopted, 'main.silk'),
     [
       'import silk.layout { Layout }',
-      'import silk.pointer { Pointer }',
+      'import silk.mem.pointer { Pointer }',
       '',
       '// Counts every reclaim through the context address, a `usize` the program owns.',
       'export "C" fn countReclaim(context: ?*mut u8) -> () {',
@@ -992,7 +992,7 @@ const program = Effect.gen(function* () {
   yield* fs.makeDirectory(join(directory, 'synchronous/src'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'synchronous/silk.toml'),
-    '[package]\nname = "synchronous"\nversion = "0.1.0"\n\n[unstable]\ncomposition = { runtimes = [{ name = "synchronous", module = "silk/native_start_sync" }], defaults = ["synchronous"] }\n',
+    '[package]\nname = "synchronous"\nversion = "0.1.0"\n\n[unstable]\ncomposition = { runtimes = [{ name = "synchronous", module = "silk/platform/native/start_sync" }], defaults = ["synchronous"] }\n',
   )
   yield* fs.writeFileString(
     join(directory, 'synchronous/src/main.silk'),
@@ -1007,9 +1007,9 @@ const program = Effect.gen(function* () {
     assert.equal(refused.status, 1, refused.stderr)
     assert.match(
       refused.stderr,
-      /^src\/main\.silk:1:8: error\[SEM0225\] Entry point `main` has a result or requirement the selected runtime `silk\/native_start_sync` cannot start/m,
+      /^src\/main\.silk:1:8: error\[SEM0225\] Entry point `main` has a result or requirement the selected runtime `silk\/platform\/native\/start_sync` cannot start/m,
     )
-    assert.doesNotMatch(refused.stderr, /native_start_sync\.silk:/)
+    assert.doesNotMatch(refused.stderr, /platform\/native\/start_sync\.silk:/)
   }
   // A `main` that returns a borrow such as `string` gets the entry point error once, not the
   // `'static` hint that only leads to it.
@@ -1028,14 +1028,14 @@ const program = Effect.gen(function* () {
   // Errors new users meet in the book's later chapters name their subject and the fix, and a
   // `var` binding adds no unknown-value error at each later use.
   const fiberRoot = (body: string) =>
-    'import silk.effect { Effect }\nimport silk.fiber { Fiber }\nimport silk.logger { Logger, LogError }\nimport silk.monotonic_clock { MonotonicClock }\nimport silk.allocator { OutOfMemoryError }\nimport silk.scheduler { Scheduler, TaskIdExhaustedError }\nimport silk.string { String }\n\n' +
+    'import silk.core.effect { Effect }\nimport silk.concurrency.fiber { Fiber }\nimport silk.io.logger { Logger, LogError }\nimport silk.system.monotonic_clock { MonotonicClock }\nimport silk.mem.allocator { OutOfMemoryError }\nimport silk.concurrency.scheduler { Scheduler, TaskIdExhaustedError }\nimport silk.text.string { String }\n\n' +
     `effect fn root<'text>(title: string<'text>) -> () ! OutOfMemoryError | TaskIdExhaustedError ? &mut Scheduler | &mut MonotonicClock {\n  ${body}\n  drop fiber\n}\n\npub fn main() -> i32 {\n  return 0\n}\n`
   // A method call that borrows its receiver names the receiver, not the method.
   const boardRoot = (body: string) =>
     'struct Board {\n  pub items: [i32; 2],\n  pub count: usize,\n}\n\nimpl Board {\n  fn add(self: &mut Self, value: i32) -> usize {\n    self.items[0] = value\n    return self.count\n  }\n\n  fn first(self: &Self) -> &i32 {\n    return &self.items[0]\n  }\n}\n\n' +
     `pub fn main() -> i32 {\n  ${body}\n  return 0\n}\n`
   const testRoot = (body: string) =>
-    `import silk.testing { AssertionError, Testing }\n\n${body}\npub fn main() -> i32 {\n  return 0\n}\n`
+    `import silk.testing.testing { AssertionError, Testing }\n\n${body}\npub fn main() -> i32 {\n  return 0\n}\n`
   const subjects: Array<{ name: string; files: Record<string, string>; pattern: RegExp; errors?: number }> = [
     {
       name: 'fiberlogger',
@@ -1080,7 +1080,7 @@ const program = Effect.gen(function* () {
     {
       name: 'copybound',
       files: { 'main.silk': 'fn dup<C: Copy>(c: C) -> C {\n  return c\n}\n\npub fn main() -> i32 {\n  return dup(0)\n}\n' },
-      pattern: /error\[SEM0001\] Unknown type Copy; is `import silk\.ownership \{ Copy \}` missing\?/,
+      pattern: /error\[SEM0001\] Unknown type Copy; is `import silk\.core\.ownership \{ Copy \}` missing\?/,
     },
     {
       name: 'moduletypo',
@@ -1160,9 +1160,9 @@ const program = Effect.gen(function* () {
     {
       name: 'loggermethod',
       files: {
-        'main.silk': 'import silk.os_logger { StdoutLogger }\n\npub fn main() -> i32 {\n  let l = StdoutLogger.make()\n  drop l.info("x")\n  return 0\n}\n',
+        'main.silk': 'import silk.io.logger_native { StdoutLogger }\n\npub fn main() -> i32 {\n  let l = StdoutLogger.make()\n  drop l.info("x")\n  return 0\n}\n',
       },
-      pattern: /error\[SEM0010\] silk\.os_logger\.StdoutLogger has no method `info`/,
+      pattern: /error\[SEM0010\] silk\.io\.logger_native\.StdoutLogger has no method `info`/,
     },
     {
       name: 'optionmethod',
@@ -1189,8 +1189,8 @@ const program = Effect.gen(function* () {
     // A name a module only imports is told where it is declared, not to be marked `pub`.
     {
       name: 'reimportstd',
-      files: { 'main.silk': 'import silk.i64 { ParseError }\n\npub fn main() -> i32 {\n  return 0\n}\n' },
-      pattern: /error\[SEM0015\] `ParseError` is not declared in silk\.i64, which only imports it; import it from silk\.format/,
+      files: { 'main.silk': 'import silk.num.i64 { ParseError }\n\npub fn main() -> i32 {\n  return 0\n}\n' },
+      pattern: /error\[SEM0015\] `ParseError` is not declared in silk\.num\.i64, which only imports it; import it from silk\.format/,
     },
     {
       name: 'reimportlocal',
@@ -1213,14 +1213,14 @@ const program = Effect.gen(function* () {
     {
       name: 'displaydebug',
       files: {
-        'main.silk': 'import silk.effect { Effect }\nimport silk.logger { LogError }\nimport silk.option { Option }\nimport silk.os_logger { StdoutLogger }\n\npub effect fn main() -> () ! LogError {\n  let mut logger = StdoutLogger.make()\n  let o = Option<i32>.some(3)\n  run Effect.log("v {o}", &.{ o: move o }) |> Effect.provideMut(&mut logger)\n}\n',
+        'main.silk': 'import silk.core.effect { Effect }\nimport silk.io.logger { LogError }\nimport silk.option { Option }\nimport silk.io.logger_native { StdoutLogger }\n\npub effect fn main() -> () ! LogError {\n  let mut logger = StdoutLogger.make()\n  let o = Option<i32>.some(3)\n  run Effect.log("v {o}", &.{ o: move o }) |> Effect.provideMut(&mut logger)\n}\n',
       },
       pattern: /no implementation of `silk\.format\.Display` exists for `silk\.option\.Option<i32>`; it implements `silk\.format\.Debug`, so a template prints it with `\{value:\?\}`/,
     },
     {
       name: 'displaynodebug',
       files: {
-        'main.silk': 'import silk.effect { Effect }\nimport silk.logger { LogError }\nimport silk.os_logger { StdoutLogger }\n\nstruct Plain { value: i32, }\n\npub effect fn main() -> () ! LogError {\n  let mut logger = StdoutLogger.make()\n  let p = Plain { value: 1 }\n  run Effect.log("v {p}", &.{ p: move p }) |> Effect.provideMut(&mut logger)\n}\n',
+        'main.silk': 'import silk.core.effect { Effect }\nimport silk.io.logger { LogError }\nimport silk.io.logger_native { StdoutLogger }\n\nstruct Plain { value: i32, }\n\npub effect fn main() -> () ! LogError {\n  let mut logger = StdoutLogger.make()\n  let p = Plain { value: 1 }\n  run Effect.log("v {p}", &.{ p: move p }) |> Effect.provideMut(&mut logger)\n}\n',
       },
       pattern: /no implementation of `silk\.format\.Display` exists for `main\.Plain`\n/,
     },
@@ -1262,36 +1262,36 @@ const program = Effect.gen(function* () {
     // A private field the declaring module reads through a public function points at that function.
     {
       name: 'fieldaccessor',
-      files: { 'main.silk': 'import silk.system_clock { Instant }\n\nfn f(now: &Instant) -> i64 { return now.seconds() }\n\npub fn main() -> i32 {\n  return 0\n}\n' },
-      pattern: /error\[SEM0028\] Field `seconds` of silk\.system_clock\.Instant is private; read it with `SystemClock\.seconds\(&value\)` instead/,
+      files: { 'main.silk': 'import silk.system.system_clock { Instant }\n\nfn f(now: &Instant) -> i64 { return now.seconds() }\n\npub fn main() -> i32 {\n  return 0\n}\n' },
+      pattern: /error\[SEM0028\] Field `seconds` of silk\.system\.system_clock\.Instant is private; read it with `SystemClock\.seconds\(&value\)` instead/,
     },
     // A provision that matches nothing names the provider, the service and what the Effect requires.
     {
       name: 'providerselector',
-      files: { 'main.silk': 'import silk.effect { Effect }\n\nservice Doorbell {\n  effect fn ring() -> () ? &mut Doorbell\n}\n\nstruct Counting { rung: i32, }\n\nimpl Doorbell for Counting {\n  effect fn ring(self: &mut Self) -> () {\n    self.rung = self.rung + 1\n  }\n}\n\neffect fn visit() -> () ? &mut Doorbell {\n  run Doorbell.ring()\n}\n\nimport silk.system_clock { SystemClock }\n\npub effect fn main() -> i32 {\n  let mut bell = Counting { rung: 0 }\n  run visit() |> Effect.provideMut<SystemClock>(&mut bell)\n  return bell.rung\n}\n' },
-      pattern: /error\[SEM0123\] The Effect does not require silk\.system_clock\.SystemClock; it requires &mut main\.Doorbell/,
+      files: { 'main.silk': 'import silk.core.effect { Effect }\n\nservice Doorbell {\n  effect fn ring() -> () ? &mut Doorbell\n}\n\nstruct Counting { rung: i32, }\n\nimpl Doorbell for Counting {\n  effect fn ring(self: &mut Self) -> () {\n    self.rung = self.rung + 1\n  }\n}\n\neffect fn visit() -> () ? &mut Doorbell {\n  run Doorbell.ring()\n}\n\nimport silk.system.system_clock { SystemClock }\n\npub effect fn main() -> i32 {\n  let mut bell = Counting { rung: 0 }\n  run visit() |> Effect.provideMut<SystemClock>(&mut bell)\n  return bell.rung\n}\n' },
+      pattern: /error\[SEM0123\] The Effect does not require silk\.system\.system_clock\.SystemClock; it requires &mut main\.Doorbell/,
     },
     {
       name: 'providerunimplemented',
-      files: { 'main.silk': 'import silk.effect { Effect }\n\nservice Doorbell {\n  effect fn ring() -> () ? &mut Doorbell\n}\n\nstruct Counting { rung: i32, }\n\nimpl Doorbell for Counting {\n  effect fn ring(self: &mut Self) -> () {\n    self.rung = self.rung + 1\n  }\n}\n\neffect fn visit() -> () ? &mut Doorbell {\n  run Doorbell.ring()\n}\n\npub effect fn main() -> i32 {\n  let mut plain = 3\n  run visit() |> Effect.provideMut<Doorbell>(&mut plain)\n  return plain\n}\n' },
+      files: { 'main.silk': 'import silk.core.effect { Effect }\n\nservice Doorbell {\n  effect fn ring() -> () ? &mut Doorbell\n}\n\nstruct Counting { rung: i32, }\n\nimpl Doorbell for Counting {\n  effect fn ring(self: &mut Self) -> () {\n    self.rung = self.rung + 1\n  }\n}\n\neffect fn visit() -> () ? &mut Doorbell {\n  run Doorbell.ring()\n}\n\npub effect fn main() -> i32 {\n  let mut plain = 3\n  run visit() |> Effect.provideMut<Doorbell>(&mut plain)\n  return plain\n}\n' },
       pattern: /error\[SEM0123\] i32 does not implement main\.Doorbell, so it cannot provide it/,
     },
     {
       name: 'providernone',
-      files: { 'main.silk': 'import silk.effect { Effect }\n\nservice Doorbell {\n  effect fn ring() -> () ? &mut Doorbell\n}\n\nstruct Counting { rung: i32, }\n\nimpl Doorbell for Counting {\n  effect fn ring(self: &mut Self) -> () {\n    self.rung = self.rung + 1\n  }\n}\n\neffect fn visit() -> () ? &mut Doorbell {\n  run Doorbell.ring()\n}\n\npub effect fn main() -> i32 {\n  let mut plain = 3\n  run visit() |> Effect.provideMut(&mut plain)\n  return plain\n}\n' },
+      files: { 'main.silk': 'import silk.core.effect { Effect }\n\nservice Doorbell {\n  effect fn ring() -> () ? &mut Doorbell\n}\n\nstruct Counting { rung: i32, }\n\nimpl Doorbell for Counting {\n  effect fn ring(self: &mut Self) -> () {\n    self.rung = self.rung + 1\n  }\n}\n\neffect fn visit() -> () ? &mut Doorbell {\n  run Doorbell.ring()\n}\n\npub effect fn main() -> i32 {\n  let mut plain = 3\n  run visit() |> Effect.provideMut(&mut plain)\n  return plain\n}\n' },
       pattern: /error\[SEM0123\] i32 implements none of the services the Effect requires: &mut main\.Doorbell/,
     },
     // A test cannot declare a requirement row, so SEM0071 there only offers a provider.
     {
       name: 'testrequirement',
-      files: { 'main.silk': 'import silk.effect { Effect }\n\nservice Doorbell {\n  effect fn ring() -> () ? &mut Doorbell\n}\n\nstruct Counting { rung: i32, }\n\nimpl Doorbell for Counting {\n  effect fn ring(self: &mut Self) -> () {\n    self.rung = self.rung + 1\n  }\n}\n\neffect fn visit() -> () ? &mut Doorbell {\n  run Doorbell.ring()\n}\n\npub fn main() -> i32 {\n  return 0\n}\n\ntest effect fn rings() -> () {\n  run visit()\n}\n' },
+      files: { 'main.silk': 'import silk.core.effect { Effect }\n\nservice Doorbell {\n  effect fn ring() -> () ? &mut Doorbell\n}\n\nstruct Counting { rung: i32, }\n\nimpl Doorbell for Counting {\n  effect fn ring(self: &mut Self) -> () {\n    self.rung = self.rung + 1\n  }\n}\n\neffect fn visit() -> () ? &mut Doorbell {\n  run Doorbell.ring()\n}\n\npub fn main() -> i32 {\n  return 0\n}\n\ntest effect fn rings() -> () {\n  run visit()\n}\n' },
       pattern: /error\[SEM0071\] This `run` needs `&mut Doorbell`, which a test cannot declare; provide it with `\|> Effect\.provideMut\(&mut value\)`/,
     },
     // A conformance member returning another type names both types.
     {
       name: 'witnessresult',
-      files: { 'main.silk': 'import silk.system_clock { SystemClock }\n\nstruct Fixed {}\n\nimpl SystemClock for Fixed {\n  effect fn now(self: &mut Self) -> i64 { return 0 }\n  effect fn getResolution(self: &mut Self) -> u64 { return 1 }\n}\n\npub fn main() -> i32 {\n  return 0\n}\n' },
-      pattern: /error\[SEM0083\] Invalid conformance: member `now` does not match the operation of `SystemClock`: it returns `i64`, but the operation returns `silk\.system_clock\.Instant`/,
+      files: { 'main.silk': 'import silk.system.system_clock { SystemClock }\n\nstruct Fixed {}\n\nimpl SystemClock for Fixed {\n  effect fn now(self: &mut Self) -> i64 { return 0 }\n  effect fn getResolution(self: &mut Self) -> u64 { return 1 }\n}\n\npub fn main() -> i32 {\n  return 0\n}\n' },
+      pattern: /error\[SEM0083\] Invalid conformance: member `now` does not match the operation of `SystemClock`: it returns `i64`, but the operation returns `silk\.system\.system_clock\.Instant`/,
     },
     // A plain `test fn` that runs or declares a failure is told to become a `test effect fn`.
     {
@@ -1391,7 +1391,7 @@ const program = Effect.gen(function* () {
   )
   yield* fs.writeFileString(
     join(directory, 'staticspec/app/src/main.silk'),
-    'import silk.host_input { HostInput }\nimport spec.sized { sized }\n\npub effect fn main() -> i32\n  ? &mut HostInput {\n  if sized(5) != 5 { return 1 }\n  return 0\n}\n',
+    'import silk.system.host_input { HostInput }\nimport spec.sized { sized }\n\npub effect fn main() -> i32\n  ? &mut HostInput {\n  if sized(5) != 5 { return 1 }\n  return 0\n}\n',
   )
   for (const command of ['check', 'build']) {
     const refused = yield* invoke(
@@ -1464,7 +1464,7 @@ const program = Effect.gen(function* () {
   // An unhandled failure of another package is reported with that package's name.
   yield* fs.writeFileString(
     join(directory, 'libmsg/geo/src/lib.silk'),
-    'import silk.format { Debug, Format, Formatter }\nimport silk.writer { Writer, WriterError }\n\npub struct BadSide {}\n\nimpl Debug for BadSide {\n  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {\n    return run Format.debugFields(self, "BadSide", &mut formatter)\n  }\n}\n\npub effect fn side(length: i64) -> i64 ! BadSide {\n  if length < 0 { fail BadSide {} }\n  return length\n}\n',
+    'import silk.format { Debug, Format, Formatter }\nimport silk.io.writer { Writer, WriterError }\n\npub struct BadSide {}\n\nimpl Debug for BadSide {\n  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {\n    return run Format.debugFields(self, "BadSide", &mut formatter)\n  }\n}\n\npub effect fn side(length: i64) -> i64 ! BadSide {\n  if length < 0 { fail BadSide {} }\n  return length\n}\n',
   )
   yield* fs.writeFileString(
     join(directory, 'libmsg/app/src/main.silk'),
@@ -1511,20 +1511,20 @@ const program = Effect.gen(function* () {
   const staticCases: Array<[string, string, RegExp]> = [
     ["staticoverflow", "static fn grow(n: u8) -> u8 { return n + 100 }\nconst BIG: u8 = grow(200)\npub fn main() -> i32 { return 0 }\n", /error\[SEM0176\] Static evaluation of `n \+ 100` overflows its integer type\n/],
     ["staticzero", "static fn fib(n: u64) -> u64 { if n < 2 { return n } return fib(n - 1) + fib(n - 2) }\nconst Q: u64 = fib(20) / (fib(0))\npub fn main() -> i32 { return 0 }\n", /error\[SEM0176\] Static evaluation of `fib\(20\) \/ \(fib\(0\)\)` divides by zero\n/],
-    ["staticbyte", "import silk.static_text { StaticText }\nstatic fn at(text: string<'static>) -> u8 { return StaticText.byteAt(text, 50) }\nconst L: u8 = at(\"loud!!\")\npub fn main() -> i32 { return 0 }\n", /error\[SEM0176\] Static evaluation stops: index 50 is past the end of the 6-byte text\n/],
+    ["staticbyte", "import silk.core.static_text { StaticText }\nstatic fn at(text: string<'static>) -> u8 { return StaticText.byteAt(text, 50) }\nconst L: u8 = at(\"loud!!\")\npub fn main() -> i32 { return 0 }\n", /error\[SEM0176\] Static evaluation stops: index 50 is past the end of the 6-byte text\n/],
     ["staticplain", "fn plain() -> i32 { return 3 }\nstatic fn s() -> i32 { return plain() }\nconst P: i32 = s()\npub fn main() -> i32 { return 0 }\n", /error\[SEM0176\] `plain` is an ordinary fn, so static evaluation cannot call it; mark it `static fn` to call it here\n/],
-    ["phasebinding", "import silk.reflect { Reflect }\npub struct Stats { pub hits: i32, }\npub fn main() -> i32 { let f = Reflect.fields<Stats>() return 0 }\n", /error\[SEM0176\] Phase-only values exist only during static evaluation, so a runtime binding of a phase-only value is not allowed\n/],
+    ["phasebinding", "import silk.core.reflect { Reflect }\npub struct Stats { pub hits: i32, }\npub fn main() -> i32 { let f = Reflect.fields<Stats>() return 0 }\n", /error\[SEM0176\] Phase-only values exist only during static evaluation, so a runtime binding of a phase-only value is not allowed\n/],
     ["constcycle", "const A: i32 = B\nconst B: i32 = A\npub fn main() -> i32 { return A }\n", /error\[SEM0223\] `A` and `B` depend on each other in a cycle, so none of them can be resolved\n/],
   ]
   const interopCases: Array<[string, string, RegExp]> = [
     ["safeexport", "export \"C\" fn twice(v: i32) -> i32 {\n  return v * 2\n}\n\npub fn main() -> i32 {\n  return twice(0)\n}\n", /error\[SEM0082\] `twice\(\.\.\.\)` is unsafe; write `unsafe twice\(\.\.\.\)`, or put it in an `unsafe \{ \}` block\n/],
     ["staticread", "export \"C\" static calls: i32 = 4\n\npub fn main() -> i32 {\n  return calls\n}\n", /error\[SEM0082\] Reading `calls` is unsafe; put it in an `unsafe \{ \}` block\n/],
-    ["plaincallback", "import silk.pointer { Pointer }\n@callbacks(\"compare\")\nunsafe extern \"C\" fn qsort(base: ?[*]mut u8, count: usize, size: usize, compare: extern \"C\" fn([*]const u8, [*]const u8) -> i32) -> ()\n\nfn cmp(a: [*]const u8, b: [*]const u8) -> i32 { return 0 }\n\npub fn main() -> i32 {\n  let mut items: [u8; 4] = [3, 1, 2, 0]\n  unsafe qsort(Pointer.fromMutSlice(&mut items), 4, 1, cmp)\n  return 0\n}\n", /error\[SEM0012\] This parameter takes a C function pointer, and a Silk fn has no C address; pass an `export "C" fn` here\n/],
+    ["plaincallback", "import silk.mem.pointer { Pointer }\n@callbacks(\"compare\")\nunsafe extern \"C\" fn qsort(base: ?[*]mut u8, count: usize, size: usize, compare: extern \"C\" fn([*]const u8, [*]const u8) -> i32) -> ()\n\nfn cmp(a: [*]const u8, b: [*]const u8) -> i32 { return 0 }\n\npub fn main() -> i32 {\n  let mut items: [u8; 4] = [3, 1, 2, 0]\n  unsafe qsort(Pointer.fromMutSlice(&mut items), 4, 1, cmp)\n  return 0\n}\n", /error\[SEM0012\] This parameter takes a C function pointer, and a Silk fn has no C address; pass an `export "C" fn` here\n/],
     ["boolstatic", "export \"C\" static calls: bool = false\n\npub fn main() -> i32 {\n  return 0\n}\n", /error\[SEM0187\] A C static holds one C integer, float, or pointer, so it cannot have type bool\n/],
     ["assignstatic", "export \"C\" static calls: i32 = 0\n\npub fn main() -> i32 {\n  unsafe { calls = 1 }\n  return 0\n}\n", /error\[SEM0036\] `calls` is a C static, which Silk code can read but not assign\n/],
   ]
   // Template errors say what the placeholder needs, at the call, with no note into the standard library.
-  const templateUse = (call: string) => `import silk.os_writer { StderrWriter }\n\npub fn main() -> i32 {\n  ${call}\n  return 0\n}\n`
+  const templateUse = (call: string) => `import silk.io.writer_native { StderrWriter }\n\npub fn main() -> i32 {\n  ${call}\n  return 0\n}\n`
   const templateCases: Array<[string, string, RegExp]> = [
     ["lonebrace", templateUse('StderrWriter.print("} {name}\\n", &.{ name: "Ada" })'), /error\[SEM0177\] a lone `\}` in a template must be written `\}\}`, which writes one `\}`\n/],
     ["widthtext", templateUse('StderrWriter.print("{name:>w$}\\n", &.{ name: "Ada", w: "x" })'), /error\[SEM0121\] A width or precision read from a field, as in `\{name:w\$\}`, needs an integer, and this field is `string<'static>`\n/],
@@ -1535,15 +1535,15 @@ const program = Effect.gen(function* () {
     ["abovescalar", "pub fn main() -> i32 {\n  let c = '\\u{110000}'\n  return 0\n}\n", /error\[SEM0085\] Invalid static literal: `\\u\{110000\}` is above `\\u\{10FFFF\}`, the largest Unicode scalar value\n/],
     ["notbyte", "pub fn main() -> i32 {\n  let b = b\"\\u{100}\"\n  return 0\n}\n", /error\[SEM0085\] Invalid static literal: `\\u\{100\}` is not a byte; a byte string holds values up to `\\u\{FF\}`, also written `\\xFF`\n/],
     ["badescape", "pub fn main() -> i32 {\n  let s = \"a\\qb\"\n  return 0\n}\n", /error\[SEM0085\] Invalid static literal: `\\q` is not an escape; /],
-    ["textlength", "pub fn main() -> i32 {\n  let t = \"abc\"\n  let n = t.length\n  return 0\n}\n", /error\[SEM0026\] A string has no fields; call the `silk\.string` functions on it, as in `String\.byteLength\(text\)` for its length in bytes\n/],
+    ["textlength", "pub fn main() -> i32 {\n  let t = \"abc\"\n  let n = t.length\n  return 0\n}\n", /error\[SEM0026\] A string has no fields; call the `silk\.text\.string` functions on it, as in `String\.byteLength\(text\)` for its length in bytes\n/],
     ["textindex", "pub fn main() -> i32 {\n  let t = \"abc\"\n  let n = t[0]\n  return 0\n}\n", /error\[SEM0032\] A string cannot be indexed, because a character can take more than one byte; read a byte with `String\.utf8Bytes\(text\)\[i\]`, or step through characters with `String\.nextScalar`\n/],
-    ["textmethod", "pub fn main() -> i32 {\n  let t = \"abc\"\n  let n = t.startsWith(\"a\")\n  return 0\n}\n", /error\[SEM0010\] A string has no methods; call `String\.startsWith\(text, \.\.\.\)` instead, with `import silk\.string \{ String \}`\n/],
+    ["textmethod", "pub fn main() -> i32 {\n  let t = \"abc\"\n  let n = t.startsWith(\"a\")\n  return 0\n}\n", /error\[SEM0010\] A string has no methods; call `String\.startsWith\(text, \.\.\.\)` instead, with `import silk\.text\.string \{ String \}`\n/],
     ["textplus", "pub fn main() -> i32 {\n  let t = \"abc\"\n  let n = t + \"!\"\n  return 0\n}\n", /error\[SEM0135\] Operator \+ does not join strings; build an owned `String` with `String\.copy` and `String\.append`, or write the text with a `Format\.format` template\n/],
-    ["reflectimport", "struct P { x: i32 }\n\npub fn main() -> i32 {\n  let mut n = 0\n  static for f in Reflect.fields<P>() { n = n + 1 }\n  return n\n}\n", /error\[SEM0009\] Unknown name Reflect; is `import silk\.reflect \{ Reflect \}` missing\?\n/],
+    ["reflectimport", "struct P { x: i32 }\n\npub fn main() -> i32 {\n  let mut n = 0\n  static for f in Reflect.fields<P>() { n = n + 1 }\n  return n\n}\n", /error\[SEM0009\] Unknown name Reflect; is `import silk\.core\.reflect \{ Reflect \}` missing\?\n/],
     ["prefixstar", "fn bump(n: &mut i32) -> () {\n  *n = *n + 1\n}\n\npub fn main() -> i32 {\n  let mut x = 1\n  bump(&mut x)\n  return x\n}\n", /error\[PAR0010\] Silk has no prefix `\*`; a dereference follows the value, as in `n\.\* = n\.\* \+ 1`\n/],
-    ["floatkey", "import silk.hash { Hash }\nimport silk.hash_map { HashMap }\n\npub fn main() -> i32 {\n  let counts = HashMap<f64, i32>.make(Hash.seed(1))\n  if HashMap<f64, i32>.contains(&counts, 1.5) { return 1 }\n  return 0\n}\n", /error\[SEM0121\] `f64: silk\.hash\.HashKey` cannot be proved: no implementation of `silk\.hash\.HashKey` exists for `f64`\n/],
-    ["unordered", "import silk.allocator { Allocator, OutOfMemoryError }\nimport silk.effect { Effect }\nimport silk.list { List }\n\nstruct P { x: i32, }\n\npub effect fn main() -> () ! OutOfMemoryError {\n  let mut allocator = Allocator.systemAllocatorProvider()\n  let mut l = List<P>.make()\n  run List<P>.sort(&mut l) |> Effect.provideMut<Allocator>(&mut allocator)\n}\n", /error\[SEM0121\] `main\.P: silk\.order\.Order` cannot be proved: no implementation of `silk\.order\.Order` exists for `main\.P`\n/],
-    ["resultimport", "import silk.effect { Effect }\n\neffect fn parse() -> i32 ! () { return 1 }\n\npub effect fn main() -> i32 {\n  let parsed = run Effect.result(parse())\n  return match move parsed {\n    Result.Success { value } => value\n    _ => 2\n  }\n}\n", /error\[SEM0009\] Unknown name Result; is `import silk\.result \{ Result \}` missing\?\n/],
+    ["floatkey", "import silk.collections.hash { Hash }\nimport silk.collections.hash_map { HashMap }\n\npub fn main() -> i32 {\n  let counts = HashMap<f64, i32>.make(Hash.seed(1))\n  if HashMap<f64, i32>.contains(&counts, 1.5) { return 1 }\n  return 0\n}\n", /error\[SEM0121\] `f64: silk\.collections\.hash\.HashKey` cannot be proved: no implementation of `silk\.collections\.hash\.HashKey` exists for `f64`\n/],
+    ["unordered", "import silk.mem.allocator { Allocator, OutOfMemoryError }\nimport silk.core.effect { Effect }\nimport silk.collections.list { List }\n\nstruct P { x: i32, }\n\npub effect fn main() -> () ! OutOfMemoryError {\n  let mut allocator = Allocator.systemAllocatorProvider()\n  let mut l = List<P>.make()\n  run List<P>.sort(&mut l) |> Effect.provideMut<Allocator>(&mut allocator)\n}\n", /error\[SEM0121\] `main\.P: silk\.order\.Order` cannot be proved: no implementation of `silk\.order\.Order` exists for `main\.P`\n/],
+    ["resultimport", "import silk.core.effect { Effect }\n\neffect fn parse() -> i32 ! () { return 1 }\n\npub effect fn main() -> i32 {\n  let parsed = run Effect.result(parse())\n  return match move parsed {\n    Result.Success { value } => value\n    _ => 2\n  }\n}\n", /error\[SEM0009\] Unknown name Result; is `import silk\.core\.result \{ Result \}` missing\?\n/],
     ["enumgone", "enum(u16) Status { Ok = 200, Created = 201, }\nenum Light { Red, Green, }\n\npub fn main() -> i32 {\n  let gone = Status.Gone\n  return 0\n}\n", /error\[SEM0153\] Enum Status has no member Gone\n/],
     ["enumrange", "enum(u8) Big { A = 256, }\n\npub fn main() -> i32 { return 0 }\n", /error\[SEM0150\] Discriminant 256 of Big\.A does not fit in u8 \(0 to 255\)\n/],
     ["enumsuccessor", "enum(u8) Edge { A = 255, B, }\n\npub fn main() -> i32 { return 0 }\n", /error\[SEM0151\] Edge\.B follows A = 255, so its implicit discriminant does not fit in u8 \(0 to 255\); give it an explicit discriminant\n/],
@@ -1554,18 +1554,18 @@ const program = Effect.gen(function* () {
     ["enumorder", "enum(u16) Status { Ok = 200, Created = 201, }\nenum Light { Red, Green, }\n\npub fn main() -> i32 {\n  if Status.Ok < Status.Created { return 1 }\n  return 0\n}\n", /error\[SEM0157\] Enum Status has no order, so < does not apply; compare backing values with `Status\.value\(\.\.\.\)` instead\n/],
     ["enumvaluemethod", "enum(u16) Status { Ok = 200, Created = 201, }\nenum Light { Red, Green, }\n\npub fn main() -> i32 {\n  let n = Status.Ok.value()\n  return 0\n}\n", /error\[SEM0010\] Enum members have no `value` method; read the backing value with `Status\.value\(member\)`\n/],
     ["enumintpattern", "enum(u16) Status { Ok = 200, Created = 201, }\nenum Light { Red, Green, }\n\nfn code(s: Status) -> i32 {\n  return match s {\n    200 => 1\n    _ => 0\n  }\n}\n\npub fn main() -> i32 { return code(Status.Ok) }\n", /error\[SEM0162\] Integer pattern 200 cannot match enum Status; match its members, or match on `Status\.value\(\.\.\.\)` instead\n/],
-    ["bareblock", "import silk.ownership { Drop }\n\nstruct Tracer { id: i32, log: i32, }\n\nimpl Drop for Tracer {\n  fn drop(self: &mut Tracer) -> () {\n    return ()\n  }\n}\n\nfn tracer(id: i32) -> Tracer { return Tracer { id: id, log: 0 } }\n\nfn consume(t: Tracer) -> () { return () }\n\npub fn main() -> i32 {\n  {\n    let c = tracer(3)\n  }\n  return 0\n}\n", /error\[PAR0010\] Silk has no bare blocks; move these statements into a helper function, whose locals end when it returns\n/],
-    ["replaceborrow", "import silk.ownership { Drop }\n\nstruct Tracer { id: i32, log: i32, }\n\nimpl Drop for Tracer {\n  fn drop(self: &mut Tracer) -> () {\n    return ()\n  }\n}\n\nfn tracer(id: i32) -> Tracer { return Tracer { id: id, log: 0 } }\n\nfn consume(t: Tracer) -> () { return () }\n\npub fn main() -> i32 {\n  let mut slot = tracer(1)\n  let old = Intrinsic.replace(&mut slot, tracer(2))\n  return 0\n}\n", /error\[SEM0036\] `Intrinsic\.replace` takes the place to replace, not a borrow of it; drop the `&mut`, as in `Intrinsic\.replace\(slot, value\)`\n/],
-    ["droppartial", "import silk.ownership { Drop }\n\nstruct Tracer { id: i32, log: i32, }\n\nimpl Drop for Tracer {\n  fn drop(self: &mut Tracer) -> () {\n    return ()\n  }\n}\n\nfn tracer(id: i32) -> Tracer { return Tracer { id: id, log: 0 } }\n\nfn consume(t: Tracer) -> () { return () }\n\npub fn main() -> i32 {\n  let t = tracer(1)\n  let l = move t.log\n  return 0\n}\n", /error\[OWN0002\] main\.Tracer has a Drop hook, so no part of it can be moved out; move or borrow the whole value, or read a Copy part\n/],
-    ["loopmove", "import silk.ownership { Drop }\n\nstruct Tracer { id: i32, log: i32, }\n\nimpl Drop for Tracer {\n  fn drop(self: &mut Tracer) -> () {\n    return ()\n  }\n}\n\nfn tracer(id: i32) -> Tracer { return Tracer { id: id, log: 0 } }\n\nfn consume(t: Tracer) -> () { return () }\n\npub fn main() -> i32 {\n  let outer = tracer(1)\n  let mut i = 0\n  while i < 2 {\n    consume(move outer)\n    i = i + 1\n  }\n  return 0\n}\n", /error\[OWN0005\] `outer` is moved inside this loop, so the next iteration would use it after the move; create it inside the loop, or leave the loop right after moving it\n/],
-    ["droptwice", "import silk.ownership { Drop }\n\nstruct Tracer { id: i32, log: i32, }\n\nimpl Drop for Tracer {\n  fn drop(self: &mut Tracer) -> () {\n    return ()\n  }\n}\n\nfn tracer(id: i32) -> Tracer { return Tracer { id: id, log: 0 } }\n\nfn consume(t: Tracer) -> () { return () }\n\npub fn main() -> i32 {\n  let first = tracer(1)\n  drop first\n  drop first\n  return 0\n}\n", /error\[OWN0001\] first was moved and cannot be used again\n/],
-    ["dropcopy", "import silk.ownership { Copy, Drop }\n\nstruct Tracer { id: i32, log: i32, }\n\nimpl Copy for Tracer {}\n\nimpl Drop for Tracer {\n  fn drop(self: &mut Tracer) -> () {\n    return ()\n  }\n}\n\nfn tracer(id: i32) -> Tracer { return Tracer { id: id, log: 0 } }\n\nfn consume(t: Tracer) -> () { return () }\n\npub fn main() -> i32 { return 0 }\n", /error\[SEM0083\] Invalid conformance: main\.Tracer has a Drop hook, so it cannot be Copy: every copy would run the hook again\n/],
-    ["dropmethod", "import silk.ownership { Drop }\n\nstruct Tracer { id: i32, log: i32, }\n\nimpl Drop for Tracer {\n  fn drop(self: &mut Tracer) -> () {\n    return ()\n  }\n}\n\nfn tracer(id: i32) -> Tracer { return Tracer { id: id, log: 0 } }\n\nfn consume(t: Tracer) -> () { return () }\n\npub fn main() -> i32 {\n  let mut c = tracer(1)\n  c.drop()\n  return 0\n}\n", /error\[SEM0010\] `drop` is not a method; write `drop c` to end the value early, which runs its Drop hook, if it has one\n/],
-    ["slicelen", "import silk.usize\n\npub fn main() -> i32 {\n  let bytes: &[u8] = b\"abc\"\n  return usize.toI32(bytes.len)\n}\n", /error\[SEM0027\] &'static \[u8\] has no field `len`; its element count is `\.length`\n/],
+    ["bareblock", "import silk.core.ownership { Drop }\n\nstruct Tracer { id: i32, log: i32, }\n\nimpl Drop for Tracer {\n  fn drop(self: &mut Tracer) -> () {\n    return ()\n  }\n}\n\nfn tracer(id: i32) -> Tracer { return Tracer { id: id, log: 0 } }\n\nfn consume(t: Tracer) -> () { return () }\n\npub fn main() -> i32 {\n  {\n    let c = tracer(3)\n  }\n  return 0\n}\n", /error\[PAR0010\] Silk has no bare blocks; move these statements into a helper function, whose locals end when it returns\n/],
+    ["replaceborrow", "import silk.core.ownership { Drop }\n\nstruct Tracer { id: i32, log: i32, }\n\nimpl Drop for Tracer {\n  fn drop(self: &mut Tracer) -> () {\n    return ()\n  }\n}\n\nfn tracer(id: i32) -> Tracer { return Tracer { id: id, log: 0 } }\n\nfn consume(t: Tracer) -> () { return () }\n\npub fn main() -> i32 {\n  let mut slot = tracer(1)\n  let old = Intrinsic.replace(&mut slot, tracer(2))\n  return 0\n}\n", /error\[SEM0036\] `Intrinsic\.replace` takes the place to replace, not a borrow of it; drop the `&mut`, as in `Intrinsic\.replace\(slot, value\)`\n/],
+    ["droppartial", "import silk.core.ownership { Drop }\n\nstruct Tracer { id: i32, log: i32, }\n\nimpl Drop for Tracer {\n  fn drop(self: &mut Tracer) -> () {\n    return ()\n  }\n}\n\nfn tracer(id: i32) -> Tracer { return Tracer { id: id, log: 0 } }\n\nfn consume(t: Tracer) -> () { return () }\n\npub fn main() -> i32 {\n  let t = tracer(1)\n  let l = move t.log\n  return 0\n}\n", /error\[OWN0002\] main\.Tracer has a Drop hook, so no part of it can be moved out; move or borrow the whole value, or read a Copy part\n/],
+    ["loopmove", "import silk.core.ownership { Drop }\n\nstruct Tracer { id: i32, log: i32, }\n\nimpl Drop for Tracer {\n  fn drop(self: &mut Tracer) -> () {\n    return ()\n  }\n}\n\nfn tracer(id: i32) -> Tracer { return Tracer { id: id, log: 0 } }\n\nfn consume(t: Tracer) -> () { return () }\n\npub fn main() -> i32 {\n  let outer = tracer(1)\n  let mut i = 0\n  while i < 2 {\n    consume(move outer)\n    i = i + 1\n  }\n  return 0\n}\n", /error\[OWN0005\] `outer` is moved inside this loop, so the next iteration would use it after the move; create it inside the loop, or leave the loop right after moving it\n/],
+    ["droptwice", "import silk.core.ownership { Drop }\n\nstruct Tracer { id: i32, log: i32, }\n\nimpl Drop for Tracer {\n  fn drop(self: &mut Tracer) -> () {\n    return ()\n  }\n}\n\nfn tracer(id: i32) -> Tracer { return Tracer { id: id, log: 0 } }\n\nfn consume(t: Tracer) -> () { return () }\n\npub fn main() -> i32 {\n  let first = tracer(1)\n  drop first\n  drop first\n  return 0\n}\n", /error\[OWN0001\] first was moved and cannot be used again\n/],
+    ["dropcopy", "import silk.core.ownership { Copy, Drop }\n\nstruct Tracer { id: i32, log: i32, }\n\nimpl Copy for Tracer {}\n\nimpl Drop for Tracer {\n  fn drop(self: &mut Tracer) -> () {\n    return ()\n  }\n}\n\nfn tracer(id: i32) -> Tracer { return Tracer { id: id, log: 0 } }\n\nfn consume(t: Tracer) -> () { return () }\n\npub fn main() -> i32 { return 0 }\n", /error\[SEM0083\] Invalid conformance: main\.Tracer has a Drop hook, so it cannot be Copy: every copy would run the hook again\n/],
+    ["dropmethod", "import silk.core.ownership { Drop }\n\nstruct Tracer { id: i32, log: i32, }\n\nimpl Drop for Tracer {\n  fn drop(self: &mut Tracer) -> () {\n    return ()\n  }\n}\n\nfn tracer(id: i32) -> Tracer { return Tracer { id: id, log: 0 } }\n\nfn consume(t: Tracer) -> () { return () }\n\npub fn main() -> i32 {\n  let mut c = tracer(1)\n  c.drop()\n  return 0\n}\n", /error\[SEM0010\] `drop` is not a method; write `drop c` to end the value early, which runs its Drop hook, if it has one\n/],
+    ["slicelen", "import silk.num.usize\n\npub fn main() -> i32 {\n  let bytes: &[u8] = b\"abc\"\n  return usize.toI32(bytes.len)\n}\n", /error\[SEM0027\] &'static \[u8\] has no field `len`; its element count is `\.length`\n/],
     ["tupleordinal", "tuple Range(i32, i32)\n\npub fn main() -> i32 {\n  let r = Range(3, 10)\n  return r.2\n}\n", /error\[SEM0027\] main\.Range has no element `\.2`; it has 2 elements, `\.0` and `\.1`\n/],
     ["tuplearity", "tuple Range(i32, i32)\n\npub fn main() -> i32 {\n  let r = Range(3)\n  return 0\n}\n", /error\[SEM0172\] main\.Range expects 2 tuple elements but received 1\n/],
     ["shiftoperator", "pub fn main() -> i32 {\n  let x = (-8 >> 1)\n  return x\n}\n", /error\[PAR0010\] Silk has no `<<` or `>>`; shift with the functions of the value's type, as in `i32\.shiftLeft\(value, count\)` or `i32\.shiftRight\(value, count\)`\n/],
-    ["ascast", "import silk.u8\n\npub fn main() -> i32 {\n  let x = (u8.MAX as i32)\n  return x\n}\n", /error\[PAR0002\] Silk has no `as` cast; convert with a function of the source type/],
+    ["ascast", "import silk.num.u8\n\npub fn main() -> i32 {\n  let x = (u8.MAX as i32)\n  return x\n}\n", /error\[PAR0002\] Silk has no `as` cast; convert with a function of the source type/],
     ["tuplefields", "tuple Range(i32, i32)\n\npub fn main() -> i32 {\n  let r = Range { 0: 3, 1: 10 }\n  return 0\n}\n", /error\[PAR0010\] A tuple's elements have no field names; build it by position, as in `Pair\(first, second\)`\n/],
     ["ternary", "pub fn main() -> i32 {\n  let c = true\n  let x = c ? 1 : 2\n  return x\n}\n", /error\[PAR0010\] Silk has no `c \? a : b`; write an `if` with a final `else` as the value, as in `if c \{ a \} else \{ b \}`\n/],
     ["matchthroughborrow", "union Status {\n  Open,\n  Done { day: u32 },\n}\n\nfn mark(status: &Status) -> i32 {\n  return match status.* {\n    Status.Open => 0\n    Status.Done { .. } => 1\n  }\n}\n\npub fn main() -> i32 {\n  let s = Status.Open\n  return mark(&s)\n}\n", /error\[OWN0003\] `match status\.\*` would move `status\.\*` out of a borrow, which cannot give it away; write `match &status\.\*` to look at it\n/],
@@ -1583,8 +1583,8 @@ const program = Effect.gen(function* () {
   }
   // Parking checks run at build time: each names what parks and the rule it breaks.
   const parkingCases: Array<[string, string, RegExp]> = [
-    ["parkfinalizer", "import silk.effect { Effect }\nimport silk.fiber { Fiber }\neffect fn finish() -> () {\n  run Fiber<(), ()>.yieldNow()\n  return ()\n}\neffect fn body() -> i32 { return 3 }\npub fn main() -> i32 {\n  return run Effect.ensuringNonParking(body(), finish())\n}\n", /error\[SEM0139\] `finish` must not park, because this call needs an `Intrinsic\.NonParking` value, but running it can park; move work that can suspend, such as `Effect\.sleep`, out of it\n/],
-    ["heldaccess", "import silk.allocator { Allocator, OutOfMemoryError }\nimport silk.effect { Effect }\nimport silk.fiber { Fiber }\nimport silk.shared { Shared }\nstruct Counter { value: i32 }\neffect fn noisy() -> () {\n  run Fiber<(), ()>.yieldNow()\n  return ()\n}\nfn bump(c: &mut Counter) -> i32 {\n  run noisy()\n  c.value = c.value + 1\n  return c.value\n}\neffect fn work() -> i32 ! OutOfMemoryError {\n  let mut allocator = Allocator.systemAllocatorProvider()\n  let shared = run (Shared<Counter>.make(Counter { value: 0 })\n    |> Effect.provideMut<Allocator>(&mut allocator))\n  return Shared<Counter>.withMut<i32>(&shared, bump)\n}\neffect fn recover(error: OutOfMemoryError) -> i32 { return -1 }\npub fn main() -> i32 {\n  return run Effect.catchAll(work(), recover)\n}\n", /error\[OWN0016\] `noisy\(\)` runs an Effect while a local-shared access such as `Shared\.withMut` holds its exclusive borrow; take what you need out of the value, return it, and run the Effect after the access returns\n/],
+    ["parkfinalizer", "import silk.core.effect { Effect }\nimport silk.concurrency.fiber { Fiber }\neffect fn finish() -> () {\n  run Fiber<(), ()>.yieldNow()\n  return ()\n}\neffect fn body() -> i32 { return 3 }\npub fn main() -> i32 {\n  return run Effect.ensuringNonParking(body(), finish())\n}\n", /error\[SEM0139\] `finish` must not park, because this call needs an `Intrinsic\.NonParking` value, but running it can park; move work that can suspend, such as `Effect\.sleep`, out of it\n/],
+    ["heldaccess", "import silk.mem.allocator { Allocator, OutOfMemoryError }\nimport silk.core.effect { Effect }\nimport silk.concurrency.fiber { Fiber }\nimport silk.mem.shared { Shared }\nstruct Counter { value: i32 }\neffect fn noisy() -> () {\n  run Fiber<(), ()>.yieldNow()\n  return ()\n}\nfn bump(c: &mut Counter) -> i32 {\n  run noisy()\n  c.value = c.value + 1\n  return c.value\n}\neffect fn work() -> i32 ! OutOfMemoryError {\n  let mut allocator = Allocator.systemAllocatorProvider()\n  let shared = run (Shared<Counter>.make(Counter { value: 0 })\n    |> Effect.provideMut<Allocator>(&mut allocator))\n  return Shared<Counter>.withMut<i32>(&shared, bump)\n}\neffect fn recover(error: OutOfMemoryError) -> i32 { return -1 }\npub fn main() -> i32 {\n  return run Effect.catchAll(work(), recover)\n}\n", /error\[OWN0016\] `noisy\(\)` runs an Effect while a local-shared access such as `Shared\.withMut` holds its exclusive borrow; take what you need out of the value, return it, and run the Effect after the access returns\n/],
   ]
   for (const [name, source, expected] of parkingCases) {
     yield* fs.makeDirectory(join(directory, `${name}/src`), { recursive: true })
@@ -1603,14 +1603,14 @@ const program = Effect.gen(function* () {
   // A shift count out of range is the caller's mistake, so the trap names the caller's line.
   yield* fs.makeDirectory(join(directory, 'shiftcount/src'), { recursive: true })
   yield* fs.writeFileString(join(directory, 'shiftcount/silk.toml'), '[package]\nname = "shiftcount"\nversion = "0.1.0"\n')
-  yield* fs.writeFileString(join(directory, 'shiftcount/src/main.silk'), 'import silk.u32\n\nfn count(n: u32) -> u32 { return n + 31 }\n\npub fn main() -> i32 {\n  let shifted = u32.shiftLeft(1, count(1))\n  return u32.toI32(shifted)\n}\n')
+  yield* fs.writeFileString(join(directory, 'shiftcount/src/main.silk'), 'import silk.num.u32\n\nfn count(n: u32) -> u32 { return n + 31 }\n\npub fn main() -> i32 {\n  let shifted = u32.shiftLeft(1, count(1))\n  return u32.toI32(shifted)\n}\n')
   const shiftCount = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(directory, 'shiftcount'), { ...process.env, SILK_CLANG: clang })
   assert.notEqual(shiftCount.status, 0, shiftCount.stderr)
   assert.match(shiftCount.stderr, /^fatal trap: invalid shift count\n {2}at main\.main \(main:6:17\)$/m)
   // A width or precision field can be any integer, so a bare literal needs no `usize` annotation.
   yield* fs.makeDirectory(join(directory, 'widthint/src'), { recursive: true })
   yield* fs.writeFileString(join(directory, 'widthint/silk.toml'), '[package]\nname = "widthint"\nversion = "0.1.0"\n')
-  yield* fs.writeFileString(join(directory, 'widthint/src/main.silk'), 'import silk.os_writer { StderrWriter }\n\npub fn main() -> i32 {\n  StderrWriter.print("[{name:>w$}] [{v:.p$}]\\n", &.{ name: "Ada", w: 5, v: 7, p: 3 })\n  return 0\n}\n')
+  yield* fs.writeFileString(join(directory, 'widthint/src/main.silk'), 'import silk.io.writer_native { StderrWriter }\n\npub fn main() -> i32 {\n  StderrWriter.print("[{name:>w$}] [{v:.p$}]\\n", &.{ name: "Ada", w: 5, v: 7, p: 3 })\n  return 0\n}\n')
   const widthInt = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(directory, 'widthint'), { ...process.env, SILK_CLANG: clang })
   assert.equal(widthInt.status, 0, widthInt.stderr)
   assert.match(widthInt.stderr, /^\[  Ada\] \[007\]$/m)
@@ -1665,7 +1665,7 @@ const program = Effect.gen(function* () {
   )
   yield* fs.writeFileString(
     join(directory, 'tested/src/util/check.silk'),
-    'import silk.testing { AssertionError, Testing }\n\npub fn half(value: i32) -> i32 {\n  return value / 2\n}\n\ntest effect fn halvesEvenly() -> () ! AssertionError<\'static> {\n  run Testing.expect(half(84) == 42, "84 halves to 42")\n}\n\ntest effect fn failsOnPurpose() -> () ! AssertionError<\'static> {\n  run Testing.expect(half(3) == 2, "integer division truncates")\n}\n\ntest fn dividesByZero() -> () {\n  let zero: i32 = 0\n  let quotient = half(2) / zero\n}\n',
+    'import silk.testing.testing { AssertionError, Testing }\n\npub fn half(value: i32) -> i32 {\n  return value / 2\n}\n\ntest effect fn halvesEvenly() -> () ! AssertionError<\'static> {\n  run Testing.expect(half(84) == 42, "84 halves to 42")\n}\n\ntest effect fn failsOnPurpose() -> () ! AssertionError<\'static> {\n  run Testing.expect(half(3) == 2, "integer division truncates")\n}\n\ntest fn dividesByZero() -> () {\n  let zero: i32 = 0\n  let quotient = half(2) / zero\n}\n',
   )
   const selectedTests = yield* invoke(
     silk,
@@ -1770,9 +1770,9 @@ const program = Effect.gen(function* () {
       '///',
       '/// ```silk',
       '/// import lib { circumference }',
-      '/// import silk.effect { Effect }',
-      '/// import silk.os_writer { StdoutWriter }',
-      '/// import silk.writer { Writer, WriterError }',
+      '/// import silk.core.effect { Effect }',
+      '/// import silk.io.writer_native { StdoutWriter }',
+      '/// import silk.io.writer { Writer, WriterError }',
       '///',
       '/// pub effect fn main() -> i32 ! WriterError {',
       '///   let mut out = StdoutWriter.make()',
@@ -1959,10 +1959,10 @@ const program = Effect.gen(function* () {
   yield* fs.writeFileString(
     join(threads, 'main.silk'),
     [
-      'import silk.allocator { Allocator, OutOfMemoryError }',
-      'import silk.box { Box }',
-      'import silk.effect { Effect }',
-      'import silk.native_thread { NativeThread, SpawnError }',
+      'import silk.mem.allocator { Allocator, OutOfMemoryError }',
+      'import silk.mem.box { Box }',
+      'import silk.core.effect { Effect }',
+      'import silk.concurrency.thread_native { NativeThread, SpawnError }',
       'effect fn program() -> i32 ! OutOfMemoryError | SpawnError {',
       '  let mut allocator = Allocator.systemAllocatorProvider()',
       '  let owned = run Box<i32>.make(20) |> Effect.provideMut<Allocator>(&mut allocator)',
@@ -2036,10 +2036,10 @@ const program = Effect.gen(function* () {
   yield* fs.writeFileString(
     join(churn, 'main.silk'),
     [
-      'import silk.allocator { Allocator, OutOfMemoryError }',
-      'import silk.effect { Effect }',
-      'import silk.list { List }',
-      'import silk.native_thread { NativeThread, SpawnError }',
+      'import silk.mem.allocator { Allocator, OutOfMemoryError }',
+      'import silk.core.effect { Effect }',
+      'import silk.collections.list { List }',
+      'import silk.concurrency.thread_native { NativeThread, SpawnError }',
       'effect fn fill(count: i32) -> i32 ! OutOfMemoryError ? &mut Allocator {',
       '  let mut values = List<i32>.make()',
       '  let mut at: i32 = 0',
@@ -2109,10 +2109,10 @@ const program = Effect.gen(function* () {
   yield* fs.writeFileString(
     join(arena, 'main.silk'),
     [
-      'import silk.allocator { Allocator, OutOfMemoryError }',
-      'import silk.arena { Arena }',
-      'import silk.box { Box }',
-      'import silk.effect { Effect }',
+      'import silk.mem.allocator { Allocator, OutOfMemoryError }',
+      'import silk.mem.arena { Arena }',
+      'import silk.mem.box { Box }',
+      'import silk.core.effect { Effect }',
       'effect fn program() -> i32 ! OutOfMemoryError {',
       '  let mut arena = Arena.make(Allocator.systemAllocatorProvider())',
       '  let first = run Box<i32>.make(40) |> Effect.provideMut<Allocator>(&mut arena)',
@@ -2269,19 +2269,19 @@ const program = Effect.gen(function* () {
   // manifest line.
   const locatedRefusals = [
     [
-      '[unstable]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["main"] }\n',
+      '[unstable]\ncomposition = { runtimes = [{ name = "start", module = "silk/platform/native/start_sync" }], defaults = ["main"] }\n',
       /silk\.toml:6: unstable\.composition\.defaults entry "main" names no runtime in unstable\.composition\.runtimes; it lists "start"/,
     ],
     [
-      '[unstable]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], components = [{ capability = "execution-storage", bindings = [\n  { module = "m", declaration = "f" },\n] }] }\n',
+      '[unstable]\ncomposition = { runtimes = [{ name = "start", module = "silk/platform/native/start_sync" }], defaults = ["start"], components = [{ capability = "execution-storage", bindings = [\n  { module = "m", declaration = "f" },\n] }] }\n',
       /silk\.toml:7: unstable\.composition\.components\.bindings entry has no operation/,
     ],
     [
-      '[unstable]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], components = [{ capability = "execution-storage", bindings = [{ operation = "frobnicate", module = "m", declaration = "f" }] }] }\n',
+      '[unstable]\ncomposition = { runtimes = [{ name = "start", module = "silk/platform/native/start_sync" }], defaults = ["start"], components = [{ capability = "execution-storage", bindings = [{ operation = "frobnicate", module = "m", declaration = "f" }] }] }\n',
       /silk\.toml:6: unstable\.composition\.components\.bindings\.operation = "frobnicate" is not an operation; use create, acquire, release or destroy/,
     ],
     [
-      '[unstable]\ncomposition = { retention = [\n  { module = "main", declaration = "main" },\n], runtimes = [\n  { name = "start", module = "silk/native_start_sync", declaration = "x" },\n], defaults = ["start"] }\n',
+      '[unstable]\ncomposition = { retention = [\n  { module = "main", declaration = "main" },\n], runtimes = [\n  { name = "start", module = "silk/platform/native/start_sync", declaration = "x" },\n], defaults = ["start"] }\n',
       /silk\.toml:9: unstable\.composition\.runtimes\.declaration is not a supported field/,
     ],
     [
@@ -2303,19 +2303,19 @@ const program = Effect.gen(function* () {
     ],
     ['[profiles."1fast"]\ntarget = "x86_64-unknown-linux-gnu"\n', /silk\.toml:5: InvalidInput: profiles\.1fast: a profile name is/],
     [
-      '[unstable]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], bogus = 1 }\n',
+      '[unstable]\ncomposition = { runtimes = [{ name = "start", module = "silk/platform/native/start_sync" }], defaults = ["start"], bogus = 1 }\n',
       /silk\.toml:6: unstable\.composition\.bogus is not a supported field/,
     ],
     [
-      '[unstable]\ncomposition = { runtimes = [\n  { name = "start", module = "silk/native_start_sync", bogus = 1 },\n], defaults = ["start"] }\n',
+      '[unstable]\ncomposition = { runtimes = [\n  { name = "start", module = "silk/platform/native/start_sync", bogus = 1 },\n], defaults = ["start"] }\n',
       /silk\.toml:7: unstable\.composition\.runtimes\.bogus is not a supported field/,
     ],
     [
-      '[unstable]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], retention = [{ module = "main", declaration = "main", extra = 1 }] }\n',
+      '[unstable]\ncomposition = { runtimes = [{ name = "start", module = "silk/platform/native/start_sync" }], defaults = ["start"], retention = [{ module = "main", declaration = "main", extra = 1 }] }\n',
       /silk\.toml:6: unstable\.composition\.retention\.extra is not a supported field/,
     ],
     [
-      '[unstable]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], requirements = ["x"] }\n',
+      '[unstable]\ncomposition = { runtimes = [{ name = "start", module = "silk/platform/native/start_sync" }], defaults = ["start"], requirements = ["x"] }\n',
       /silk\.toml:6: unstable\.composition\.requirements is not supported by the native compiler yet/,
     ],
     [
@@ -3427,8 +3427,8 @@ const program = Effect.gen(function* () {
   const logged = join(directory, 'logged')
   yield* fs.makeDirectory(join(logged, 'src'), { recursive: true })
   yield* fs.writeFileString(join(logged, 'silk.toml'), '[package]\nname = "logged"\nversion = "0.1.0"\n')
-  const loggedSource = (message: string) => 'import silk.effect { Effect }\nimport silk.logger { LogError }\n'
-    + 'import silk.os_logger { StdoutLogger }\n\npub effect fn main() -> () ! LogError {\n  let mut logger = StdoutLogger.make()\n'
+  const loggedSource = (message: string) => 'import silk.core.effect { Effect }\nimport silk.io.logger { LogError }\n'
+    + 'import silk.io.logger_native { StdoutLogger }\n\npub effect fn main() -> () ! LogError {\n  let mut logger = StdoutLogger.make()\n'
     + `  run Effect.log("${message}\\n", &()) |> Effect.provideMut(&mut logger)\n}\n`
   const loggedExecutable = join(logged, `build/llvm/${hostTarget}/debug/logged`)
   const loggedBuild = Effect.fnUntraced(function* (message: string) {
@@ -3499,10 +3499,10 @@ const program = Effect.gen(function* () {
     join(escapes, 'src/main.silk'),
     [
       'import helper',
-      'import silk.allocator {Allocator, OutOfMemoryError}',
-      'import silk.effect {Effect}',
-      'import silk.result {Result}',
-      'import silk.shared {Shared}',
+      'import silk.mem.allocator {Allocator, OutOfMemoryError}',
+      'import silk.core.effect {Effect}',
+      'import silk.core.result {Result}',
+      'import silk.mem.shared {Shared}',
       '',
       'fn use(value: &mut i32) -> i32 {',
       '  return helper.compute() + value.*',

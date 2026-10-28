@@ -1,0 +1,224 @@
+//! The provider protocol that prepares child Fibers and publishes them atomically.
+//!
+//! # When to use
+//! Implement [`Scheduler`] to supply the task policy for `Fiber.forkChild`. Application code uses
+//! the Fiber operations and a provider such as `silk.concurrency.local_scheduler`, not this protocol.
+//!
+//! # Details
+//! A fork has two steps:
+//!
+//! 1. `Scheduler.prepare` allocates and prepares one child, but does not publish it. The returned
+//!    [`PendingPublication`] owns the complete task submission, the response channel, and the
+//!    Fiber.
+//! 2. `Fiber.forkChild` registers that data after the exclusive service dispatch ends, and parks
+//!    until the driver accepts or rejects the child.
+//!
+//! Thus no executable value crosses the service boundary.
+//!
+//! # Errors
+//! `prepare` fails with `OutOfMemoryError`, or with [`TaskIdExhaustedError`] when no task identity
+//! is left.
+//!
+//! # Gotchas
+//! A provider must not expose the Fiber before publication succeeds. A publication failure consumes
+//! the complete pending value and returns no Fiber.
+//!
+//! @category Concurrency
+
+import silk.mem.allocator { OutOfMemoryError }
+import silk.concurrency.execution { Wake }
+import silk.concurrency.fiber { Fiber, CompletionCanceller }
+import silk.format { Debug, Format, Formatter }
+import silk.collections.hash { Hash }
+import silk.collections.hash { HashKey, HashSeed }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.core.ownership { Copy }
+import silk.mem.shared { Shared }
+import silk.num.u64
+import silk.io.writer { Writer, WriterError }
+
+/// A task identity that is unique within one Scheduler execution.
+///
+/// # Details
+///
+/// A provider reserves identities monotonically and does not reuse them during one execution.
+pub struct TaskId {
+  /// The provider-local monotonic identity value.
+  pub value: u64,
+}
+
+impl Copy for TaskId {}
+
+fn taskIdEquals(left: &TaskId, right: &TaskId) -> bool {
+  return left.value == right.value
+}
+
+fn taskIdHash(identity: &TaskId, seed: &HashSeed) -> u64 {
+  return Hash.mix(seed, identity.value)
+}
+
+impl HashKey for TaskId { equals: TaskId.taskIdEquals hash: TaskId.taskIdHash }
+
+/// A typed failure that reports exhaustion of the task identity space.
+pub struct TaskIdExhaustedError {}
+
+impl Debug for TaskIdExhaustedError {
+  /// Writes `TaskIdExhaustedError`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return run Format.debugFields(self, "TaskIdExhaustedError", &mut formatter)
+  }
+}
+
+/// A response that records whether one prepared child was published or rejected.
+///
+/// # Details
+///
+/// The parent owns this cell while parked. The Scheduler driver changes `phase` exactly once before
+/// it wakes the parent.
+pub struct PublicationResponse {
+  /// The current publication decision.
+  pub phase: ResponseWaiting | ResponsePublished | ResponseRejected,
+}
+
+/// A publication decision has not been made yet.
+pub struct ResponseWaiting {}
+
+/// The Scheduler accepted the prepared child for publication.
+pub struct ResponsePublished {}
+
+/// The Scheduler rejected and destroyed the prepared child without activation.
+pub struct ResponseRejected {}
+
+/// A parent task has no pending publication request.
+pub struct NoRequest {}
+
+/// A parent is parked until the Scheduler processes one publication request.
+pub struct PendingRequest {
+  /// The Wake consumed after the publication response has been stored.
+  pub wake: Wake,
+}
+
+/// The parent-facing mailbox for one child publication request.
+pub struct TaskMailbox {
+  /// The request currently visible to the Scheduler driver.
+  pub request: NoRequest | PendingRequest,
+  /// The response cell written before the request Wake is consumed.
+  pub response: Shared<PublicationResponse>,
+}
+
+/// A submission slot contains no prepared child.
+pub struct NoSubmission {}
+
+/// A submission slot owns one complete prepared child.
+pub struct PendingSubmission {
+  /// The prepared task moved into the slot before the parent parks.
+  pub task: PreparedTask,
+}
+
+/// The child-task payload paired with one parent mailbox request.
+pub struct SubmissionSlot {
+  /// The currently installed child submission.
+  pub phase: NoSubmission | PendingSubmission,
+}
+
+/// A complete unpublished task that one Scheduler provider prepared.
+///
+/// # Details
+/// The Scheduler driver can put this data into its private task store, or destroy it unchanged. The
+/// Execution stays `Initial` until a successful publication calls `Execution.notifyInitial`.
+pub struct PreparedTask {
+  /// The reserved identity of the child.
+  pub identity: TaskId,
+  /// The identity of the structured parent.
+  pub parent: TaskId,
+  /// The unpublished child Execution.
+  pub execution: Intrinsic.Execution<()>,
+  /// The type-erased endpoint used if the task is cancelled.
+  pub canceller: CompletionCanceller,
+  /// The child's own publication-request mailbox.
+  pub mailbox: Shared<TaskMailbox>,
+  /// The child's own publication-submission slot.
+  pub submission: Shared<SubmissionSlot>,
+}
+
+/// A prepared child Fiber and the canonical data required for atomic publication.
+///
+/// # Details
+///
+/// `Fiber.forkChild` moves `task` into `parentSubmission`, installs a Wake in `parentMailbox`, and
+/// parks until `response` reports acceptance or rejection. No executable value crosses the service
+/// boundary.
+pub struct PendingPublication<A, E> {
+  /// The affine result handle returned only after successful publication.
+  pub fiber: Fiber<A, E>,
+  /// The mailbox owned by the parent task.
+  pub parentMailbox: Shared<TaskMailbox>,
+  /// The submission slot owned by the parent task.
+  pub parentSubmission: Shared<SubmissionSlot>,
+  /// The response observed after the parent resumes.
+  pub response: Shared<PublicationResponse>,
+  /// The complete unpublished child task.
+  pub task: PreparedTask,
+}
+
+/// A mutable service that prepares one child task for later atomic publication.
+///
+/// # When to use
+///
+/// Implement it to supply the task policy for `Fiber.forkChild`. Application code uses the Fiber
+/// operations and a provider such as `silk.concurrency.local_scheduler`, not this protocol.
+///
+/// # Details
+///
+/// `prepare` allocates and prepares one child, but does not publish it. `Fiber.forkChild` registers
+/// the returned [`PendingPublication`] after the exclusive service dispatch ends, and parks until
+/// the driver accepts or rejects the child. Thus no executable value crosses the service boundary.
+/// /// Each task receives a distinct owned provider. `prepare` ends its exclusive provider access
+/// before the caller registers the returned publication data and parks for the response.
+pub service Scheduler {
+  /// Prepares one lazy child task and returns its affine publication value.
+  ///
+  /// # Details
+  ///
+  /// The child can require only its owned Scheduler and MonotonicClock providers. Preparation
+  /// reserves all child endpoints and one task identity before it returns. It does not activate
+  /// the child.
+  effect fn prepare<A: 'static, E: 'static>(
+    child: once Effect<'static;
+      A
+      ! E
+      ? &mut Scheduler | &mut MonotonicClock
+    >
+  ) -> PendingPublication<A, E>
+  ! OutOfMemoryError | TaskIdExhaustedError
+  ? &mut Scheduler
+}
+
+impl Scheduler {
+  /// Creates one canonical pending publication from its prepared data.
+  ///
+  /// # When to use
+  ///
+  /// Use this provider operation after all child task storage and endpoints have been prepared.
+  ///
+  /// # Details
+  ///
+  /// The parent mailbox, submission slot, and response must belong to the calling task. The
+  /// prepared task remains unpublished and must not have received initial readiness.
+  pub fn pending<A, E>(
+    fiber: Fiber<A, E>,
+    parentMailbox: Shared<TaskMailbox>,
+    parentSubmission: Shared<SubmissionSlot>,
+    response: Shared<PublicationResponse>,
+    task: PreparedTask,
+  ) -> PendingPublication<A, E> {
+    return PendingPublication<A, E> {
+      fiber: move fiber,
+      parentMailbox: move parentMailbox,
+      parentSubmission: move parentSubmission,
+      response: move response,
+      task: move task,
+    }
+  }
+}
+

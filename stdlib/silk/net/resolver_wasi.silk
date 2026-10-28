@@ -1,0 +1,112 @@
+//! DNS resolution through a WASI Preview 2 network capability.
+//!
+//! # When to use
+//! Provide `WasiResolver` for the portable `Resolver` service in a Preview 2 component.
+//! The runtime must grant name lookup. The provider owns its network capability and releases each
+//! lookup stream on success, failure, or timeout.
+//!
+//! @category Networking
+
+static if Intrinsic.profileText("target") == "wasm32-wasip2" {
+  import silk.platform.wasi.preview2 as host
+  import silk.platform.wasi.component as abi { ResultArea, Pollable }
+  import silk.net.socket_wasi { Network }
+  import silk.mem.allocator { Allocator, OutOfMemoryError }
+  import silk.core.effect { Effect }
+  import silk.system.monotonic_clock { MonotonicClock }
+  import silk.system.monotonic_clock_native { OsMonotonicClock }
+  import silk.net.address { DomainHost, Endpoint, IpAddress, Ipv4Address, Ipv6Address }
+  import silk.net.resolver { Resolver, ResolverError, ResolveRequest, ResolvedEndpoints, FamilySelection }
+  import silk.option { Option }
+  import silk.core.ownership { Drop }
+  import silk.mem.pointer { Pointer }
+  import silk.core.result { Result }
+  import silk.num.u8
+  import silk.num.u16
+  import silk.num.u32
+  import silk.num.usize
+
+  /// The WASI provider for `Resolver`, owning its network capability and host monotonic clock.
+  /// Domain deadlines are absolute times on `OsMonotonicClock`. Host policy controls name lookup.
+  pub struct WasiResolver { network: Network, clock: OsMonotonicClock }
+
+  struct Lookup { handle: u32 }
+  impl Drop for Lookup {
+    fn drop(self: &mut Self) -> () { unsafe host.sockets_ip_name_lookup_drop_resolve_address_stream(self.handle) }
+  }
+
+  fn error(code: u8) -> ResolverError {
+    return match code {
+      4 => ResolverError.SystemResources
+      5 => ResolverError.Timeout
+      18 => ResolverError.NameNotFound
+      19 => ResolverError.TemporaryFailure
+      _ => ResolverError.Provider {code: u32.toI32(u8.toU32(code))}
+    }
+  }
+
+  impl WasiResolver {
+    /// Acquires the host-granted default network and a host monotonic clock.
+    pub fn make() -> WasiResolver {
+      return WasiResolver {network: Network.make(), clock: OsMonotonicClock.make()}
+    }
+  }
+
+  impl Resolver for WasiResolver {
+    effect fn resolveDomain(self: &mut Self, request: &ResolveRequest, domain: &DomainHost) -> ResolvedEndpoints
+      ! ResolverError | OutOfMemoryError ? &mut Allocator {
+      let until = ResolveRequest.deadline(request)
+      let expired = run abi.expired(&until) |> Effect.provideMut<MonotonicClock>(&mut self.clock)
+      if expired { fail ResolverError.Timeout }
+      let name = DomainHost.bytes(domain)
+      let mut result = ResultArea.make()
+      unsafe host.sockets_ip_name_lookup_resolve_addresses(Network.handle(&self.network),
+        usize.toU32(Pointer.addressMany(Pointer.fromSlice(name))), usize.toU32(name.length), abi.address(&mut result))
+      if ResultArea.byte(&result, 0) != 0 { fail error(ResultArea.byte(&result, 4)) }
+      let lookup = Lookup {handle: ResultArea.word32(&result, 4)}
+      let mut addresses = match move ResolvedEndpoints.make(ResolveRequest.maxResults(request)) {
+        Result<ResolvedEndpoints, ResolverError>.Success {value} => move value
+        Result<ResolvedEndpoints, ResolverError>.Failure {error: failure} => { fail move failure }
+      }
+      while true {
+        let expired = run abi.expired(&until) |> Effect.provideMut<MonotonicClock>(&mut self.clock)
+        if expired { fail ResolverError.Timeout }
+        unsafe host.sockets_ip_name_lookup_resolve_address_stream_resolve_next_address(lookup.handle, abi.address(&mut result))
+        if ResultArea.byte(&result, 0) != 0 {
+          let code = ResultArea.byte(&result, 2)
+          if code != 8 { fail error(code) }
+          let pollableHandle = unsafe host.sockets_ip_name_lookup_resolve_address_stream_subscribe(lookup.handle)
+          let pollable = unsafe Pollable.take(pollableHandle)
+          let ready = run Pollable.wait(&pollable, &until)
+            |> Effect.provideMut<MonotonicClock>(&mut self.clock)
+          if !ready { fail ResolverError.Timeout }
+          continue
+        }
+        if ResultArea.byte(&result, 2) == 0 { break }
+        let mut address = IpAddress.V4 {value: Ipv4Address.fromOctets([0; 4])}
+        if ResultArea.byte(&result, 4) == 0 {
+          address = IpAddress.V4 {value: Ipv4Address.fromOctets([
+            ResultArea.byte(&result, 6), ResultArea.byte(&result, 7),
+            ResultArea.byte(&result, 8), ResultArea.byte(&result, 9)])}
+        } else {
+          let mut octets: [u8; 16] = [0; 16]
+          let mut at: usize = 0
+          while at < 8 {
+            let part = ResultArea.word16(&result, 6 + at * 2)
+            octets[at * 2] = u16.toU8(part / 256)
+            octets[at * 2 + 1] = u16.toU8(part % 256)
+            at = at + 1
+          }
+          address = IpAddress.V6 {value: Ipv6Address.fromOctets(octets)}
+        }
+        let family = ResolveRequest.family(request)
+        if (family == FamilySelection.V4 && !IpAddress.isV4(&address)) ||
+          (family == FamilySelection.V6 && IpAddress.isV4(&address)) { continue }
+        let admitted = run ResolvedEndpoints.admit(&mut addresses, Endpoint.make(address, ResolveRequest.port(request)))
+        drop admitted
+      }
+      if ResolvedEndpoints.length(&addresses) == 0 { fail ResolverError.NoAddress }
+      return move addresses
+    }
+  }
+}

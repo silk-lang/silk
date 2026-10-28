@@ -251,7 +251,7 @@ the protected Effect succeeds with `A` and the handler succeeds with `B`, the re
 success type is the normalized union `A | B`.
 
 ```silk
-import silk.effect { Effect }
+import silk.core.effect { Effect }
 
 struct NotFoundError {}
 
@@ -295,7 +295,7 @@ member.
 **Current compiler:** Aligned. `Effect.catch` and `Effect.catchAll` use separate protected and
 handler success types and normalize the result to `A | B`.
 
-**Evidence:** [current recovery signatures](../stdlib/silk/effect.silk),
+**Evidence:** [current recovery signatures](../stdlib/silk/core/effect.silk),
 selective recovery tests.
 
 ## FAIL-005 — `catch<S>` recovers any selected nonempty subset
@@ -316,7 +316,7 @@ Success and failure types use ordinary union normalization. Requirement rows ret
 capability, access, and role normalization.
 
 ```silk
-import silk.effect { Effect }
+import silk.core.effect { Effect }
 
 struct NotFoundError {}
 struct InvalidInputError {}
@@ -345,7 +345,7 @@ spelled through a union alias has the same members the union spells directly, so
 `union` inside the alias stays one member: `catch` removes it whole or not at all.
 
 ```silk
-import silk.effect { Effect }
+import silk.core.effect { Effect }
 
 struct NotFoundError {}
 struct InvalidInputError {}
@@ -428,7 +428,7 @@ unselected value to return, and the selected payload is still needed by the hand
 `Selected` or `Unselected` case also lets generic code branch without knowing every concrete member
 of either union.
 
-**Evidence:** [set-to-set `Without` behavior](../stdlib/silk/effect.silk),
+**Evidence:** [set-to-set `Without` behavior](../stdlib/silk/core/effect.silk),
 current singleton recovery path,
 current singleton-only specification.
 
@@ -491,7 +491,7 @@ exactly once before observing the retained context. Compiler-generated coroutine
 are not logical source frames.
 
 **Evidence:** [ownership cleanup rule](ownership-and-borrowing.md#cleanup-001--cleanup-follows-ownership),
-[effect finalization contract](../stdlib/silk/effect.silk),
+[effect finalization contract](../stdlib/silk/core/effect.silk),
 effect-entry trace and cleanup tests.
 
 ## FAIL-007 — A trap is fatal and remains outside Effect outcomes

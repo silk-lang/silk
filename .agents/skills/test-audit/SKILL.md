@@ -58,7 +58,7 @@ isolated checkout for controls and report missing control evidence explicitly.
 - Performance claims belong in opt-in benchmarks. Do not add timing, byte-count,
   or instruction-count assertions to correctness tests.
 
-Source-written tests use `test effect fn` and `silk.testing` assertions through
+Source-written tests use `test effect fn` and `silk.testing.testing` assertions through
 the existing providers. Write multiline fixtures with Silk triple-quoted strings,
 not escaped `\n` strings or semicolon-separated statements. Keep support scoped
 to its owning concept; do not introduce TypeScript test harnesses for Silk claims.

@@ -1,4 +1,4 @@
-// Real native silk.http_client requests against two loopback HTTP servers: query encoding, header
+// Real native silk.http.client requests against two loopback HTTP servers: query encoding, header
 // defaults and overrides, bodies, status handling, redirects, credential stripping, and limits.
 import * as assert from 'node:assert/strict'
 import * as Config from 'effect/Config'
@@ -152,7 +152,7 @@ try {
     no_proxy: '',
   })
   assert.equal(result.status, 0, JSON.stringify(result))
-  console.log('Native silk.http_client conformance passed')
+  console.log('Native silk.http.client conformance passed')
 } finally {
   for (const timer of timers) clearTimeout(timer)
   main?.closeAllConnections?.()

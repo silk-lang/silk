@@ -133,9 +133,9 @@ Hello, world!
 `silk init` writes a `silk.toml` and a `src/main.silk`. Even "hello world" names what it needs:
 
 ```silk
-import silk.effect { Effect }
-import silk.logger { LogError }
-import silk.os_logger { StdoutLogger }
+import silk.core.effect { Effect }
+import silk.io.logger { LogError }
+import silk.io.logger_native { StdoutLogger }
 
 pub effect fn main() -> ()
   ! LogError {
@@ -249,7 +249,7 @@ Tests  1 passed, 0 failed (0 cached, 1 executed, 1 selected, 1 discovered)
 ### Ownership and cleanup
 
 ```silk
-import silk.ownership { Drop }
+import silk.core.ownership { Drop }
 
 struct Connection { id: i32 }
 
@@ -295,7 +295,7 @@ fn area(shape: Circle | Rect) -> f64 {
 ### Compile-time selection
 
 ```silk
-import silk.target { Target, Arch }
+import silk.core.target { Target, Arch }
 
 fn wordBits() -> u32 {
   static if Target.arch() == Arch.Wasm32 {

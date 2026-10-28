@@ -55,7 +55,7 @@ for (const match of wat.matchAll(/^  \(import "([^"]+)" "([^"]+)" \(func .*$/gm)
 }
 if (count < 190) throw new Error(`WIT world unexpectedly contains only ${count} imports`)
 output += '}\n'
-const destination = `${root}stdlib/silk/wasi_preview2.silk`
+const destination = `${root}stdlib/silk/platform/wasi/preview2.silk`
 if (process.argv.includes('--check')) {
   if (readFileSync(destination, 'utf8') !== output) throw new Error('wasi_preview2.silk is stale')
 } else writeFileSync(destination, output)

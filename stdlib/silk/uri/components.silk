@@ -1,0 +1,668 @@
+//! Build a URI reference from its components, or change the components of a parsed one.
+//!
+//! # When to use
+//! Use [`UriComponents`] to make a URL from parts, such as a host from a configuration file and a
+//! path from user input, or to change one part of a parsed URL. Give each part as raw bytes, which
+//! are encoded for you, or as text that is already encoded. To only read a URL, use
+//! `silk.uri.reference`.
+//!
+//! # Details
+//! [`UriComponents.make`] returns an empty relative reference, and [`UriComponents.fromReference`]
+//! borrows each part of a parsed reference. Change the public fields, and then call
+//! [`UriComponents.serializeOwned`], [`UriComponents.serializeInto`], or
+//! [`UriComponents.buildOwned`]. Raw values are percent-encoded for their component with
+//! `silk.uri.percent`. Encoded values keep their escape spelling. Each part is checked before
+//! anything is written, and the result is parsed again to make sure that it is a valid reference.
+//!
+//! # Errors
+//! - `ParseError` if a part is not valid. The offset is a position in that part, or a position in
+//!   the output if the parts do not make a valid reference together.
+//! - `OutOfMemoryError` from the functions that allocate.
+//!
+//! # Examples
+//! ## Build a URL with encoded parts
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.option { Option }
+//! import silk.core.result { Result }
+//! import silk.text.string { String }
+//! import silk.uri.components { Authority, ComponentValue, Host, Serialization, UriComponents }
+//! import silk.uri.reference { ParseError }
+//!
+//! pub effect fn main() -> i32
+//!   ! OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let mut parts = UriComponents<'static>.make()
+//!   parts.scheme = Option<string<'static>>.some("https")
+//!   parts.authority = Option<Authority<'static>>.some(
+//!     Authority<'static> {
+//!       userinfo: Option<ComponentValue<'static>>.none(),
+//!       host: Host<'static>.RegName {
+//!         value: ComponentValue<'static>.Encoded { text: "example.com" }
+//!       },
+//!       port: Option<string<'static>>.none()
+//!     }
+//!   )
+//!   parts.path = ComponentValue<'static>.Raw { bytes: b"/my files" }
+//!   parts.query = Option<ComponentValue<'static>>.some(
+//!     ComponentValue<'static>.Raw { bytes: b"q=tea time" }
+//!   )
+//!   let built = run UriComponents.serializeOwned(&parts, Serialization.Full)
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   return match move built {
+//!     Result<String, ParseError>.Success { value } => {
+//!       if String.view(&value) != "https://example.com/my%20files?q=tea%20time" {
+//!         return 1
+//!       }
+//!       return 0
+//!     }
+//!     Result<String, ParseError>.Failure { error: _ } => 1
+//!   }
+//! }
+//! ```
+//!
+//! @category Data formats
+
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.collections.bytes {Bytes}
+import silk.option {Option}
+import silk.core.result {Result}
+import silk.text.string {String}
+import silk.collections.slice {Slice}
+import silk.uri.percent {UriPercent}
+import silk.uri.percent {PercentComponent}
+import silk.uri.reference {
+  UriReference,
+  OwnedUriReference,
+  ParseError,
+  ParseReason,
+  Component,
+  HostKind,
+}
+import silk.num.usize
+import silk.num.u8
+
+/// The value of a component: raw bytes to encode, or text that is already encoded.
+pub union ComponentValue<'text> {
+  /// Raw bytes. Each byte that the component does not allow is percent-encoded.
+  Raw {
+    /// The bytes to encode. A `%` is data, so it becomes `%25`.
+    pub bytes: &'text [u8],
+  },
+  /// Text that is already encoded. It is checked, and its escapes are written as they are.
+  Encoded {
+    /// The encoded text. It must not contain the delimiters of other components, such as `?` in a
+    /// path.
+    pub text: string<'text>,
+  },
+}
+
+/// The host of an authority: a name or an IP literal.
+pub union Host<'text> {
+  /// A registered name or an IPv4 address. A raw value is encoded with `RegName` rules.
+  RegName {
+    /// The host name. It can be empty.
+    pub value: ComponentValue<'text>,
+  },
+  /// An IPv6 or IPvFuture literal. It must be valid host syntax.
+  IpLiteral {
+    /// The literal with its brackets, such as `[2001:db8::1]`.
+    pub text: string<'text>,
+  },
+}
+
+/// The authority of a URI: optional user information, a host, and an optional port.
+pub struct Authority<'text> {
+  /// The user information, or `None`. A present empty value writes `@` with nothing before it.
+  pub userinfo: Option<ComponentValue<'text>>,
+  /// The host.
+  pub host: Host<'text>,
+  /// The port as decimal digits, or `None`. A present empty value writes `:` with no digits.
+  pub port: Option<string<'text>>,
+}
+
+/// The components that a serialization writes.
+pub enum Serialization {
+  /// All components. Present empty components keep their delimiters.
+  Full,
+  /// All components except the user information and its `@`. Use it to log or show a URL without
+  /// its credentials.
+  WithoutAuthentication,
+  /// Only the path and the query, such as the target of an HTTP request line.
+  PathAndQuery,
+}
+
+/// The components of a URI reference, as fields that you can change.
+///
+/// The fields borrow their bytes or text. An absent component (`None`) and a present empty
+/// component are different. The path is always present, but it can be empty.
+pub struct UriComponents<'text> {
+  /// The scheme without the `:`, or `None` for a relative reference.
+  pub scheme: Option<string<'text>>,
+  /// The authority without the `//`, or `None`.
+  pub authority: Option<Authority<'text>>,
+  /// The full path, with its `/` separators. A raw path keeps `/` and encodes `?` and `#`.
+  pub path: ComponentValue<'text>,
+  /// The query without the `?`, or `None`.
+  pub query: Option<ComponentValue<'text>>,
+  /// The fragment without the `#`, or `None`.
+  pub fragment: Option<ComponentValue<'text>>,
+}
+
+impl<'text> UriComponents<'text> {
+  /// Returns an empty relative reference: no scheme, no authority, an empty path, no query, and no
+  /// fragment.
+  pub fn make() -> UriComponents<'text> {
+    return UriComponents<'text> {
+      scheme: Option<string<'text>>.none(),
+      authority: Option<Authority<'text>>.none(),
+      path: ComponentValue<'text>.Encoded {text: ""},
+      query: Option<ComponentValue<'text>>.none(),
+      fragment: Option<ComponentValue<'text>>.none(),
+    }
+  }
+  /// Returns the components of `reference` as encoded values that borrow from it.
+  ///
+  /// If you change nothing, `Full` serialization gives the original text again.
+  pub fn fromReference(reference: &UriReference<'text>) -> UriComponents<'text> {
+    let authority = authorityFromReference(reference)
+    return UriComponents<'text> {
+      scheme: UriReference.scheme(reference),
+      authority: move authority,
+      path: ComponentValue<'text>.Encoded {text: UriReference.path(reference)},
+      query: encodedOptional(UriReference.query(reference)),
+      fragment: encodedOptional(UriReference.fragment(reference)),
+    }
+  }
+  /// Replaces the contents of `output` with the components that `selection` names.
+  ///
+  /// In a reference without a scheme, a `:` in the first segment of a raw path is encoded, so the
+  /// segment cannot look like a scheme. If `output` has enough capacity, it does not allocate.
+  ///
+  /// # Errors
+  /// - `Failure` with a `ParseError` if a component is not valid. The offset is a position in that
+  ///   component, and `output` does not change. The components that `selection` leaves out are also
+  ///   checked.
+  /// - `Failure` with a `ParseError` if the result is not a valid reference. The offset is a
+  ///   position in `output`, which holds the text that failed.
+  /// - `OutOfMemoryError` if the `Allocator` fails or the size does not fit in `usize`. `output`
+  ///   does not change.
+  ///
+  /// # Gotchas
+  /// `PathAndQuery` can give text that is not a complete URI reference.
+  pub effect fn serializeInto(output: &mut Bytes, self: &Self, selection: Serialization) -> Result<
+    (),
+    ParseError,
+  > ! OutOfMemoryError ? &mut Allocator {
+    let failure = validate(self)
+    match move failure {
+      Option<ParseError>.Some {value} => {
+        return Result<(), ParseError>.failResult(value)
+      }
+      Option<ParseError>.None => {}
+    }
+    let length = run serializedLength(&self.*, selection)
+    let previous = Bytes.length(&output.*)
+    if previous < length {
+      let reserved = run Bytes.reserveExact(&mut output, length - previous)
+    }
+    Bytes.clear(&mut output)
+    let emitted = run emit(&mut output, self, selection)
+    if selection != Serialization.PathAndQuery {
+      // Component validation and percent encoding emit ASCII only.
+      let text = unsafe String.fromUtf8Unchecked(Bytes.asSlice(&output.*))
+      return validateSerialization(text)
+    }
+    return Result<(), ParseError>.succeed(())
+  }
+  /// Returns the components that `selection` names as a new string.
+  ///
+  /// It allocates exactly the needed size, and nothing for an empty result.
+  ///
+  /// # Errors
+  /// - `Failure` with a `ParseError` if a component is not valid, or the result is not a valid
+  ///   reference.
+  /// - `OutOfMemoryError` if the `Allocator` fails or the size does not fit in `usize`.
+  pub effect fn serializeOwned(self: &Self, selection: Serialization) -> Result<String, ParseError>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+    let mut output = Bytes.make()
+    let result = run UriComponents.serializeInto(&mut output, self, selection)
+    return match move result {
+      Result<(), ParseError>.Failure {error} => Result<String, ParseError>.failResult(error)
+      Result<(), ParseError>.Success {value: _} => {
+        // Serialized components contain only validated ASCII and generated ASCII escapes.
+        let text = unsafe String.fromBytesUnchecked(move output)
+        return Result<String, ParseError>.succeed(move text)
+      }
+    }
+  }
+  /// Returns all components as a new `OwnedUriReference`. The text is not copied again.
+  ///
+  /// # Errors
+  /// - `Failure` with a `ParseError` if a component is not valid, or the result is not a valid
+  ///   reference.
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn buildOwned(self: &Self) -> Result<OwnedUriReference, ParseError>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+    let result = run UriComponents.serializeOwned(self, Serialization.Full)
+    return match move result {
+      Result<String, ParseError>.Failure {error} => Result<OwnedUriReference, ParseError>.failResult(
+        error,
+      )
+      Result<String, ParseError>.Success {value} => OwnedUriReference.fromString(move value)
+    }
+  }
+}
+
+fn encodedHost<'text>(text: string<'text>, literal: bool) -> Host<'text> {
+  if literal {
+    return Host<'text>.IpLiteral {text: text}
+  }
+  return Host<'text>.RegName {value: ComponentValue<'text>.Encoded {text: text}}
+}
+
+fn authorityFromReference<'text>(reference: &UriReference<'text>) -> Option<Authority<'text>> {
+  return match move UriReference.host(reference) {
+    Option<string<'text>>.None => Option<Authority<'text>>.none()
+    Option<string<'text>>.Some {value} => {
+      let literal = match move UriReference.hostKind(reference) {
+        Option<HostKind>.Some {value: kind} => kind == HostKind.Ipv6 || kind == HostKind.IpvFuture
+        Option<HostKind>.None => false
+      }
+      let host = encodedHost(value, literal)
+      return Option<Authority<'text>>.some(
+        Authority<'text> {
+          userinfo: encodedOptional(UriReference.userinfo(reference)),
+          host: move host,
+          port: UriReference.port(reference),
+        },
+      )
+    }
+  }
+}
+
+fn encodedOptional<'text>(value: Option<string<'text>>) -> Option<ComponentValue<'text>> {
+  return match move value {
+    Option<string<'text>>.Some {value: text} => Option<ComponentValue<'text>>.some(
+      ComponentValue<'text>.Encoded {text: text},
+    )
+    Option<string<'text>>.None => Option<ComponentValue<'text>>.none()
+  }
+}
+
+fn hasScheme<'text>(self: &UriComponents<'text>) -> bool {
+  return match & self.scheme {
+    Option<string<'text>>.Some {value: _} => true
+    Option<string<'text>>.None => false
+  }
+}
+
+fn hasAuthority<'text>(self: &UriComponents<'text>) -> bool {
+  return match & self.authority {
+    Option<Authority<'text>>.Some {value: _} => true
+    Option<Authority<'text>>.None => false
+  }
+}
+
+fn componentBytes<'text>(value: &ComponentValue<'text>) -> &'text [u8] {
+  return match & value.* {
+    ComponentValue<'text>.Raw {bytes} => bytes
+    ComponentValue<'text>.Encoded {text} => String.utf8Bytes(text)
+  }
+}
+
+fn invalid(component: Component, offset: usize) -> Option<ParseError> {
+  return Option<ParseError>.some(
+    ParseError {reason: ParseReason.InvalidCharacter, component: component, offset: offset},
+  )
+}
+
+fn validateValue<'text>(value: &ComponentValue<'text>, component: Component) -> Option<ParseError> {
+  return match & value.* {
+    ComponentValue<'text>.Raw {bytes: _} => Option<ParseError>.none()
+    ComponentValue<'text>.Encoded {text} => UriReference.validateComponent(text, component)
+  }
+}
+
+fn validateOptional<'text>(value: &Option<ComponentValue<'text>>, component: Component) -> Option<
+  ParseError,
+> {
+  return match & value.* {
+    Option<ComponentValue<'text>>.Some {value: present} => validateValue(&present, component)
+    Option<ComponentValue<'text>>.None => Option<ParseError>.none()
+  }
+}
+
+fn validateHost<'text>(host: &Host<'text>) -> Option<ParseError> {
+  return match & host.* {
+    Host<'text>.IpLiteral {text} => {
+      let bytes = String.utf8Bytes(text)
+      if bytes.length == usize.ZERO {
+        return invalid(Component.Host, usize.ZERO)
+      }
+      if bytes[usize.ZERO] != u8.toU8(91) {
+        return invalid(Component.Host, usize.ZERO)
+      }
+      return UriReference.validateComponent(text, Component.Host)
+    }
+    Host<'text>.RegName {value} => {
+      match & value {
+        ComponentValue<'text>.Encoded {text} => {
+          let bytes = String.utf8Bytes(text)
+          if bytes.length > usize.ZERO {
+            if bytes[usize.ZERO] == u8.toU8(91) {
+              return invalid(Component.Host, usize.ZERO)
+            }
+          }
+        }
+        ComponentValue<'text>.Raw {bytes: _} => {}
+      }
+      return validateValue(&value, Component.Host)
+    }
+  }
+}
+
+fn validate<'text>(self: &UriComponents<'text>) -> Option<ParseError> {
+  match & self.scheme {
+    Option<string<'text>>.Some {value} => {
+      match move UriReference.validateComponent(value, Component.Scheme) {
+        Option<ParseError>.Some {value: error} => {
+          return Option<ParseError>.some(error)
+        }
+        Option<ParseError>.None => {}
+      }
+    }
+    Option<string<'text>>.None => {}
+  }
+  match & self.authority {
+    Option<Authority<'text>>.Some {value} => {
+      match move validateOptional(&value.userinfo, Component.Userinfo) {
+        Option<ParseError>.Some {value: error} => {
+          return Option<ParseError>.some(error)
+        }
+        Option<ParseError>.None => {}
+      }
+      match move validateHost(&value.host) {
+        Option<ParseError>.Some {value: error} => {
+          return Option<ParseError>.some(error)
+        }
+        Option<ParseError>.None => {}
+      }
+      match & value.port {
+        Option<string<'text>>.Some {value: text} => {
+          match move UriReference.validateComponent(text, Component.Port) {
+            Option<ParseError>.Some {value: error} => {
+              return Option<ParseError>.some(error)
+            }
+            Option<ParseError>.None => {}
+          }
+        }
+        Option<string<'text>>.None => {}
+      }
+    }
+    Option<Authority<'text>>.None => {}
+  }
+  match move validateValue(&self.path, Component.Path) {
+    Option<ParseError>.Some {value: error} => {
+      return Option<ParseError>.some(error)
+    }
+    Option<ParseError>.None => {}
+  }
+  let bytes = componentBytes(&self.path)
+  if hasAuthority(self) {
+    if bytes.length > usize.ZERO {
+      if bytes[usize.ZERO] != u8.toU8(47) {
+        return invalid(Component.Path, usize.ZERO)
+      }
+    }
+  } else {
+    if bytes.length > usize.ONE {
+      if bytes[usize.ZERO] == u8.toU8(47) && bytes[usize.ONE] == u8.toU8(47) {
+        return invalid(Component.Path, usize.ONE)
+      }
+    }
+    if !hasScheme(self) {
+      match & self.path {
+        ComponentValue<'text>.Encoded {text: _} => {
+          let mut index = usize.ZERO
+          while index < bytes.length && bytes[index] != u8.toU8(47) {
+            if bytes[index] == u8.toU8(58) {
+              return invalid(Component.Path, index)
+            }
+            index = index + usize.ONE
+          }
+        }
+        ComponentValue<'text>.Raw {bytes: _} => {}
+      }
+    }
+  }
+  match move validateOptional(&self.query, Component.Query) {
+    Option<ParseError>.Some {value: error} => {
+      return Option<ParseError>.some(error)
+    }
+    Option<ParseError>.None => {}
+  }
+  return validateOptional(&self.fragment, Component.Fragment)
+}
+
+effect fn checkedSize(left: usize, right: usize) -> usize ! OutOfMemoryError {
+  return match move usize.checkedAdd(left, right) {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => run Allocator.outOfMemory()
+  }
+}
+
+effect fn valueLength<'text>(value: &ComponentValue<'text>, context: PercentComponent) -> usize
+! OutOfMemoryError {
+  return match & value.* {
+    ComponentValue<'text>.Encoded {text} => String.byteLength(text)
+    ComponentValue<'text>.Raw {bytes} => {
+      return match move UriPercent.encodedLength(bytes, context) {
+        Option<usize>.Some {value: length} => length
+        Option<usize>.None => run Allocator.outOfMemory()
+      }
+    }
+  }
+}
+
+effect fn optionalLength<'text>(value: &Option<ComponentValue<'text>>, context: PercentComponent) -> usize
+! OutOfMemoryError {
+  return match & value.* {
+    Option<ComponentValue<'text>>.None => usize.ZERO
+    Option<ComponentValue<'text>>.Some {value: present} => {
+      let length = run valueLength(&present, context)
+      return run checkedSize(length, usize.ONE)
+    }
+  }
+}
+
+effect fn hostLength<'text>(host: &Host<'text>) -> usize ! OutOfMemoryError {
+  return match & host.* {
+    Host<'text>.IpLiteral {text} => String.byteLength(text)
+    Host<'text>.RegName {value} => run valueLength(&value, PercentComponent.RegName)
+  }
+}
+
+fn firstSegmentLength(bytes: &[u8]) -> usize {
+  let mut index = usize.ZERO
+  while index < bytes.length && bytes[index] != u8.toU8(47) {
+    index = index + usize.ONE
+  }
+  return index
+}
+
+effect fn pathLength<'text>(self: &UriComponents<'text>) -> usize ! OutOfMemoryError {
+  if !hasScheme(self) && !hasAuthority(self) {
+    match & self.path {
+      ComponentValue<'text>.Raw {bytes} => {
+        let split = firstSegmentLength(bytes)
+        let first = ComponentValue<'text>.Raw {
+          bytes: Slice.view<u8>(bytes, usize.ZERO, split),
+        }
+        let rest = ComponentValue<'text>.Raw {
+          bytes: Slice.view<u8>(bytes, split, bytes.length - split),
+        }
+        let head = run valueLength(&first, PercentComponent.FirstPathSegment)
+        let tail = run valueLength(&rest, PercentComponent.Path)
+        return run checkedSize(head, tail)
+      }
+      ComponentValue<'text>.Encoded {text: _} => {}
+    }
+  }
+  return run valueLength(&self.path, PercentComponent.Path)
+}
+
+effect fn serializedLength<'text>(self: &UriComponents<'text>, selection: Serialization) -> usize
+! OutOfMemoryError {
+  let mut length = run pathLength(self)
+  let query = run optionalLength(&self.query, PercentComponent.Query)
+  length = run checkedSize(length, query)
+  if selection == Serialization.PathAndQuery {
+    return length
+  }
+  let fragment = run optionalLength(&self.fragment, PercentComponent.Fragment)
+  length = run checkedSize(length, fragment)
+  match & self.scheme {
+    Option<string<'text>>.Some {value} => {
+      length = run checkedSize(length, String.byteLength(value))
+      length = run checkedSize(length, usize.ONE)
+    }
+    Option<string<'text>>.None => {}
+  }
+  match & self.authority {
+    Option<Authority<'text>>.Some {value} => {
+      length = run checkedSize(length, usize.ONE + usize.ONE)
+      if selection != Serialization.WithoutAuthentication {
+        let userinfo = run optionalLength(&value.userinfo, PercentComponent.Userinfo)
+        length = run checkedSize(length, userinfo)
+      }
+      let host = run hostLength(&value.host)
+      length = run checkedSize(length, host)
+      match & value.port {
+        Option<string<'text>>.Some {value: port} => {
+          length = run checkedSize(length, String.byteLength(port))
+          length = run checkedSize(length, usize.ONE)
+        }
+        Option<string<'text>>.None => {}
+      }
+    }
+    Option<Authority<'text>>.None => {}
+  }
+  return length
+}
+
+effect fn appendText(output: &mut Bytes, text: string) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run Bytes.append(&mut output, String.utf8Bytes(text))
+}
+
+effect fn appendValue<'text>(
+  output: &mut Bytes,
+  value: &ComponentValue<'text>,
+  context: PercentComponent,
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  return match & value.* {
+    ComponentValue<'text>.Encoded {text} => run appendText(&mut output, text)
+    ComponentValue<'text>.Raw {bytes} => run UriPercent.appendEncoded(&mut output, bytes, context)
+  }
+}
+
+effect fn appendOptional<'text>(
+  output: &mut Bytes,
+  value: &Option<ComponentValue<'text>>,
+  delimiter: string,
+  context: PercentComponent,
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  return match & value.* {
+    Option<ComponentValue<'text>>.None => ()
+    Option<ComponentValue<'text>>.Some {value: present} => {
+      let prefix = run appendText(&mut output, delimiter)
+      return run appendValue(&mut output, &present, context)
+    }
+  }
+}
+
+effect fn appendPath<'text>(output: &mut Bytes, self: &UriComponents<'text>) -> ()
+! OutOfMemoryError
+? &mut Allocator {
+  if !hasScheme(self) && !hasAuthority(self) {
+    match & self.path {
+      ComponentValue<'text>.Raw {bytes} => {
+        let split = firstSegmentLength(bytes)
+        let first = run UriPercent.appendEncoded(
+          &mut output,
+          Slice.view<u8>(bytes, usize.ZERO, split),
+          PercentComponent.FirstPathSegment,
+        )
+        return run UriPercent.appendEncoded(
+          &mut output,
+          Slice.view<u8>(bytes, split, bytes.length - split),
+          PercentComponent.Path,
+        )
+      }
+      ComponentValue<'text>.Encoded {text: _} => {}
+    }
+  }
+  return run appendValue(&mut output, &self.path, PercentComponent.Path)
+}
+
+effect fn emit<'text>(output: &mut Bytes, self: &UriComponents<'text>, selection: Serialization) -> ()
+! OutOfMemoryError
+? &mut Allocator {
+  if selection != Serialization.PathAndQuery {
+    match & self.scheme {
+      Option<string<'text>>.Some {value} => {
+        let scheme = run appendText(&mut output, value)
+        let colon = run appendText(&mut output, ":")
+      }
+      Option<string<'text>>.None => {}
+    }
+    match & self.authority {
+      Option<Authority<'text>>.Some {value} => {
+        let prefix = run appendText(&mut output, "//")
+        if selection != Serialization.WithoutAuthentication {
+          let info = run appendOptional(&mut output, &value.userinfo, "", PercentComponent.Userinfo)
+          match & value.userinfo {
+            Option<ComponentValue<'text>>.Some {value: _} => {
+              let delimiter = run appendText(&mut output, "@")
+            }
+            Option<ComponentValue<'text>>.None => {}
+          }
+        }
+        match & value.host {
+          Host<'text>.RegName {value: name} => {
+            let host = run appendValue(&mut output, &name, PercentComponent.RegName)
+          }
+          Host<'text>.IpLiteral {text} => {
+            let host = run appendText(&mut output, text)
+          }
+        }
+        match & value.port {
+          Option<string<'text>>.Some {value: port} => {
+            let delimiter = run appendText(&mut output, ":")
+            let value = run appendText(&mut output, port)
+          }
+          Option<string<'text>>.None => {}
+        }
+      }
+      Option<Authority<'text>>.None => {}
+    }
+  }
+  let path = run appendPath(&mut output, self)
+  let query = run appendOptional(&mut output, &self.query, "?", PercentComponent.Query)
+  if selection != Serialization.PathAndQuery {
+    let fragment = run appendOptional(&mut output, &self.fragment, "#", PercentComponent.Fragment)
+  }
+  return ()
+}
+
+fn validateSerialization<'text>(text: string<'text>) -> Result<(), ParseError> {
+  return match move UriReference.parse(text) {
+    Result<UriReference<'text>, ParseError>.Failure {error} => Result<(), ParseError>.failResult(
+      error,
+    )
+    Result<UriReference<'text>, ParseError>.Success {value: _} => Result<(), ParseError>.succeed(())
+  }
+}

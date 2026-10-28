@@ -43,10 +43,10 @@ you display it, use `f64.isFinite` or `f32.isFinite`.
 ## Examples
 ### Write a padded number and a template into a buffer
 ```silk
-import silk.effect { Effect }
+import silk.core.effect { Effect }
 import silk.format { Alignment, Format, FormatOptions, Sign, Style }
 import silk.option { Option }
-import silk.writer { Writer, WriterError }
+import silk.io.writer { Writer, WriterError }
 
 struct CaptureWriter {
   bytes: [u8; 64],
@@ -121,7 +121,7 @@ pub effect fn main() -> i32
 ### Read a number from text
 ```silk
 import silk.format { Format, NotANumber, OutOfRange, ParseError }
-import silk.result { Result }
+import silk.core.result { Result }
 
 fn read(text: string) -> i32 {
   return match move Format.i32Value(text) {
@@ -142,8 +142,8 @@ pub fn main() -> i32 {
 ```
 
 ## See also
-- `silk.writer` for the `Writer` effect that receives the output.
-- `silk.os_writer` for `StdoutWriter` and `StderrWriter`, which write to standard output and
+- `silk.io.writer` for the `Writer` effect that receives the output.
+- `silk.io.writer_native` for `StdoutWriter` and `StderrWriter`, which write to standard output and
   standard error.
 
 Import as `Format` with `import silk.format { Format }`.
@@ -742,7 +742,7 @@ private fields, or it is a union with fields in a variant. Write each field with
 
 ```silk
 import silk.format { Debug, Format, Formatter }
-import silk.writer { Writer, WriterError }
+import silk.io.writer { Writer, WriterError }
 
 struct Account {
   pub name: string,
@@ -876,9 +876,9 @@ and a negative one traps.
 ##### Write a tuple and a record
 
 ```silk
-import silk.effect { Effect }
+import silk.core.effect { Effect }
 import silk.format { Format }
-import silk.writer { Writer, WriterError }
+import silk.io.writer { Writer, WriterError }
 
 struct CaptureWriter {
   bytes: [u8; 64],
@@ -1644,9 +1644,9 @@ use [`Format.writeLeadingPadding`](#Format.impl.writeLeadingPadding) and [`Forma
 #### Display a point as `(x, y)`
 
 ```silk
-import silk.effect { Effect }
+import silk.core.effect { Effect }
 import silk.format { Display, Format, Formatter }
-import silk.writer { Writer, WriterError }
+import silk.io.writer { Writer, WriterError }
 
 struct CaptureWriter {
   bytes: [u8; 64],

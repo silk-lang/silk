@@ -1,0 +1,564 @@
+//! Run another program, wait for it to end, and get its exit code and all of its output.
+//!
+//! # When to use
+//! Make a [`ProcessRequest`] with [`ChildProcess.request`], add arguments and environment
+//! variables, and run it with [`ChildProcess.submit`]. This is not a shell. Spaces, quotes, and
+//! other special characters in an argument are passed to the program as they are.
+//!
+//! # Details
+//! Arguments and environment entries are bytes, kept in the order you add them. The environment of
+//! the child starts empty: the child gets only the variables that you set. The child uses the
+//! working directory of the caller, unless you use [`ChildProcess.requestWithin`]. Standard input
+//! of the child is closed.
+//!
+//! [`ChildProcess.submit`] blocks until the child ends. The [`ProcessOutcome`] owns all standard
+//! output and standard error. An exit code that is not 0 is a normal outcome, not an error.
+//!
+//! # Errors
+//! - [`ProcessError`] if the child cannot start, the wait fails, or the output cannot be captured.
+//! - `OutOfMemoryError` if the `Allocator` cannot supply the request or the captured output.
+//!
+//! # Gotchas
+//! An argument, an environment name, or an environment value must not contain NUL. The request uses
+//! NUL to separate entries.
+//!
+//! # Examples
+//! ## Run a program with a test provider and read its exit code
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.collections.bytes { Bytes }
+//! import silk.system.child_process { ChildProcess, ProcessError, ProcessOutcome, ProcessRequest }
+//! import silk.core.effect { Effect }
+//! import silk.system.filesystem { FileError, Path }
+//! import silk.option { Option }
+//! import silk.num.usize
+//!
+//! struct Completed {}
+//!
+//! effect fn execute(self: &mut Completed, request: &ProcessRequest) -> ProcessOutcome
+//!   ! ProcessError | OutOfMemoryError
+//!   ? &mut Allocator {
+//!   return ChildProcess.exited(
+//!     usize.toI32(ChildProcess.argumentCount(request)),
+//!     Bytes.make(),
+//!     Bytes.make()
+//!   )
+//! }
+//!
+//! impl ChildProcess for Completed {
+//!   execute: Completed.execute
+//! }
+//!
+//! pub effect fn main() -> i32
+//!   ! FileError | OutOfMemoryError | ProcessError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let mut provider = Completed {}
+//!   let path = run Path.make("/usr/bin/git") |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let mut request = run ChildProcess.request(&path) |> Effect.provideMut<Allocator>(&mut allocator)
+//!   run ChildProcess.addArgument(&mut request, "status")
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let outcome = run ChildProcess.submit(&request) |> Effect.provideMut<ChildProcess>(&mut provider)
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   return match move ChildProcess.exitCode(&outcome) {
+//!     Option<i32>.Some { value } => value - 1
+//!     Option<i32>.None => 1
+//!   }
+//! }
+//! ```
+//!
+//! @category System
+
+// The portable child-process boundary: one blocking execution from structured input to structured
+// output. It is not a shell. The request carries an executable path and ordered argument bytes, and
+// no part of it is ever parsed as a command line, so a space, a quote, or a metacharacter inside an
+// argument reaches the child as data.
+
+import silk.core.bool
+import silk.collections.bytes { Bytes }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.allocator { OutOfMemoryError }
+import silk.system.filesystem { Path }
+import silk.format { Debug, Format, Formatter }
+import silk.num.i32
+import silk.option { Option }
+import silk.text.string { String }
+import silk.num.u8
+import silk.num.usize
+import silk.io.writer { Writer, WriterError }
+
+/// The step that failed, as recorded in a [`ProcessError`]: spawn, wait, or capture.
+pub struct ProcessOperation {
+  /// The stable numeric code for the provider-reported execution stage.
+  pub code: i32,
+}
+
+impl Debug for ProcessOperation {
+  /// Writes the name of the code, such as `Spawn`, or the code when it has no name.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match processOperationName(self.code) {
+      Option<string<'static>>.Some { value } => run Format.writeText(&mut formatter, value)
+      Option<string<'static>>.None => run Format.debugFields(self, "ProcessOperation", &mut formatter)
+    }
+  }
+}
+
+// The name of a `ProcessOperation` code, in the form of a variant name.
+fn processOperationName(code: i32) -> Option<string<'static>> {
+  if code == 0 { return Option<string<'static>>.some("Spawn") }
+  if code == 1 { return Option<string<'static>>.some("Wait") }
+  if code == 2 { return Option<string<'static>>.some("Capture") }
+  return Option<string<'static>>.none()
+}
+
+/// The portable reason for a [`ProcessError`]. Compare its code with the constructors such as
+/// [`ChildProcess.notFound`].
+pub struct ProcessReason {
+  /// The stable numeric code for the portable recovery category.
+  pub code: i32,
+}
+
+impl Debug for ProcessReason {
+  /// Writes the name of the code, such as `NotFound`, or the code when it has no name.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match processReasonName(self.code) {
+      Option<string<'static>>.Some { value } => run Format.writeText(&mut formatter, value)
+      Option<string<'static>>.None => run Format.debugFields(self, "ProcessReason", &mut formatter)
+    }
+  }
+}
+
+// The name of a `ProcessReason` code, in the form of a variant name.
+fn processReasonName(code: i32) -> Option<string<'static>> {
+  if code == 0 { return Option<string<'static>>.some("NotFound") }
+  if code == 1 { return Option<string<'static>>.some("PermissionDenied") }
+  if code == 2 { return Option<string<'static>>.some("InvalidRequest") }
+  if code == 3 { return Option<string<'static>>.some("NoSpace") }
+  if code == 4 { return Option<string<'static>>.some("Unsupported") }
+  if code == 5 { return Option<string<'static>>.some("Other") }
+  return Option<string<'static>>.none()
+}
+
+/// The error when a child process cannot start, cannot be waited for, or its output cannot be
+/// captured.
+///
+/// # Details
+///
+/// Decide how to recover from `reason`. [`ChildProcess.providerCode`] gives a code from the
+/// provider, such as an `errno` value, for diagnostics. A child that exits with a code other than 0
+/// is a [`ProcessOutcome`], not this error.
+pub struct ProcessError {
+  /// The execution stage reported by the provider.
+  pub operation: ProcessOperation,
+  /// The portable category that callers can use for recovery.
+  pub reason: ProcessReason,
+  providerCodeValue: i32,
+  hasProviderCode: bool,
+}
+
+impl Debug for ProcessError {
+  /// Writes the fields, as `ProcessError { operation: Spawn, reason: NotFound, providerCode: 2 }`.
+  /// It leaves out `providerCode` when there is none.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    let mut record = run Format.debugRecord("ProcessError", &mut formatter)
+    run Format.debugField(&mut record, "operation", &self.operation, &mut formatter)
+    run Format.debugField(&mut record, "reason", &self.reason, &mut formatter)
+    if self.hasProviderCode {
+      run Format.debugField(&mut record, "providerCode", &self.providerCodeValue, &mut formatter)
+    }
+    return run Format.debugFinish(record, &mut formatter)
+  }
+}
+
+/// A request to run one program, with its arguments, environment, and working directory.
+///
+/// # Details
+///
+/// Arguments and environment entries are bytes, so a value from the host can go to the child
+/// without changes. They keep the order in which you add them. The environment of the child
+/// starts empty: the child gets only the variables that you set. The child uses the working
+/// directory of the caller, unless the request comes from [`ChildProcess.requestWithin`]. This is
+/// not a shell: spaces, quotes, and other special characters in an argument go to the program as
+/// they are.
+///
+/// # Gotchas
+///
+/// The bytes must not contain NUL, because NUL separates the entries.
+pub struct ProcessRequest {
+  programValue: Bytes,
+  argumentValues: Bytes,
+  argumentTotal: usize,
+  environmentValues: Bytes,
+  environmentTotal: usize,
+  directoryValue: Bytes,
+}
+
+effect fn terminate(target: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  let terminator = [u8.toU8(0)]
+  let appended = run Bytes.append(move target, &terminator)
+  return ()
+}
+
+/// A child that ended with an exit code.
+pub struct Exited {
+  /// The code the child returned. Any value, including a nonzero one, is ordinary data.
+  pub code: i32,
+  /// The complete captured standard output, owned by this outcome.
+  pub output: Bytes,
+  /// The complete captured standard error, owned by this outcome.
+  pub errors: Bytes,
+}
+
+/// A child that a signal ended.
+pub struct Signaled {
+  /// The platform signal number that terminated the child.
+  pub signal: i32,
+  /// The complete captured standard output, owned by this outcome.
+  pub output: Bytes,
+  /// The complete captured standard error, owned by this outcome.
+  pub errors: Bytes,
+}
+
+/// How a child ended: with an exit code or by a signal, and its captured output.
+///
+/// # Details
+///
+/// Use [`ChildProcess.exitCode`] and [`ChildProcess.terminatingSignal`]. The exit code and the
+/// signal are separate, so a signal number cannot be read as an exit code.
+pub struct ProcessOutcome {
+  /// The completed outcome.
+  pub value: Exited | Signaled,
+}
+
+/// The effect that runs child processes: run another program, wait for it to end, and get its
+/// exit code and all of its output.
+///
+/// # When to use
+///
+/// Make a [`ProcessRequest`] with [`ChildProcess.request`], add arguments and environment
+/// variables, and run it with [`ChildProcess.submit`]. This is not a shell. Spaces, quotes, and
+/// other special characters in an argument are passed to the program as they are.
+///
+/// # Details
+///
+/// A provider implements `execute`. Callers use [`ChildProcess.submit`]. Native programs use the
+/// provider in `silk.system.child_process_native`.
+pub service ChildProcess {
+  /// Runs `request`, waits until the child ends, and returns the outcome with all captured output.
+  ///
+  /// # Details
+  ///
+  /// Standard input of the child is closed. An exit code other than 0 is a normal outcome.
+  ///
+  /// # Errors
+  ///
+  /// - [`ProcessError`] if the child cannot start, the wait fails, or the output cannot be
+  ///   captured.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the captured output.
+  effect fn execute(
+    request: &ProcessRequest
+  ) -> ProcessOutcome ! ProcessError | OutOfMemoryError ? &mut ChildProcess | &mut Allocator
+}
+
+impl ChildProcess {
+  /// Returns the stage for preparing and starting the child process.
+  pub fn spawnOperation() -> ProcessOperation { return ProcessOperation { code: 0 } }
+
+  /// Returns the stage for waiting until the child process terminates.
+  pub fn waitOperation() -> ProcessOperation { return ProcessOperation { code: 1 } }
+
+  /// Returns the stage for copying the completed output and error streams.
+  pub fn captureOperation() -> ProcessOperation { return ProcessOperation { code: 2 } }
+
+  /// Returns the stable numeric code for an execution stage.
+  pub fn operationCode(operation: ProcessOperation) -> i32 { return operation.code }
+
+  /// Returns the reason used when no executable exists at the requested path.
+  pub fn notFound() -> ProcessReason { return ProcessReason { code: 0 } }
+
+  /// Returns the reason used when the provider denies access to the requested executable.
+  pub fn permissionDenied() -> ProcessReason { return ProcessReason { code: 1 } }
+
+  /// Returns the reason used when the provider cannot present the request to its process boundary.
+  pub fn invalidRequest() -> ProcessReason { return ProcessReason { code: 2 } }
+
+  /// Returns the reason used when process setup or captured output exhausts provider storage.
+  pub fn noSpace() -> ProcessReason { return ProcessReason { code: 3 } }
+
+  /// Returns the reason used when the provider does not support the requested process operation.
+  pub fn unsupported() -> ProcessReason { return ProcessReason { code: 4 } }
+
+  /// Returns the reason used when no other portable recovery category applies.
+  pub fn other() -> ProcessReason { return ProcessReason { code: 5 } }
+
+  /// Returns the stable numeric code for a portable recovery category.
+  pub fn reasonCode(reason: ProcessReason) -> i32 { return reason.code }
+
+  /// Creates a process failure without a provider-defined numeric code.
+  pub fn failure(operation: ProcessOperation, reason: ProcessReason) -> ProcessError {
+    return ProcessError {
+      operation: move operation,
+      reason: move reason,
+      providerCodeValue: 0,
+      hasProviderCode: false
+    }
+  }
+
+  /// Creates a process failure with a provider-defined numeric code for diagnostics.
+  pub fn failureWithCode(
+    operation: ProcessOperation,
+    reason: ProcessReason,
+    code: i32
+  ) -> ProcessError {
+    return ProcessError {
+      operation: move operation,
+      reason: move reason,
+      providerCodeValue: code,
+      hasProviderCode: true
+    }
+  }
+
+  /// Returns the provider-defined numeric code, or `None` when the failure has no such code.
+  pub fn providerCode(error: &ProcessError) -> Option<i32> {
+    if error.hasProviderCode { return Option<i32>.some(error.providerCodeValue) }
+    return Option<i32>.none()
+  }
+
+  /// Returns a request to run `program`, with no arguments, an empty environment, and the working
+  /// directory of the caller.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the request.
+  pub effect fn request(program: &Path) -> ProcessRequest ! OutOfMemoryError ? &mut Allocator {
+    let owned = run Bytes.copy(Path.rawBytes(program))
+    return ProcessRequest {
+      programValue: move owned,
+      argumentValues: Bytes.make(),
+      argumentTotal: usize.ZERO,
+      environmentValues: Bytes.make(),
+      environmentTotal: usize.ZERO,
+      directoryValue: Bytes.make()
+    }
+  }
+
+  /// Returns a request to run `program` in `directory`, with no arguments and an empty environment.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the request.
+  pub effect fn requestWithin(
+    program: &Path,
+    directory: &Path
+  ) -> ProcessRequest ! OutOfMemoryError ? &mut Allocator {
+    let mut built = run ChildProcess.request(program)
+    let appended = run Bytes.append(&mut built.directoryValue, Path.rawBytes(directory))
+    return move built
+  }
+
+  /// Adds a copy of the text `value` as the next argument.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the storage. Do not use the request
+  ///   again, because it can contain part of the argument.
+  ///
+  /// # Gotchas
+  ///
+  /// `value` must not contain NUL.
+  pub effect fn addArgument(
+    self: &mut ProcessRequest,
+    value: string
+  ) -> () ! OutOfMemoryError ? &mut Allocator {
+    return run ChildProcess.addArgumentBytes(&mut self.*, String.utf8Bytes(value))
+  }
+
+  /// Adds a copy of `value` as the next argument. The bytes do not have to be valid UTF-8.
+  ///
+  /// # When to use
+  ///
+  /// Use it for an argument that you got as bytes, such as a host path from `Path.rawBytes` or a
+  /// program argument, so you can pass it on without changes.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the storage. Do not use the request
+  ///   again, because it can contain part of the argument.
+  ///
+  /// # Gotchas
+  ///
+  /// `value` must not contain NUL.
+  pub effect fn addArgumentBytes(
+    self: &mut ProcessRequest,
+    value: &[u8]
+  ) -> () ! OutOfMemoryError ? &mut Allocator {
+    let appended = run Bytes.append(&mut self.argumentValues, value)
+    let terminated = run terminate(&mut self.argumentValues)
+    self.argumentTotal = self.argumentTotal + usize.ONE
+    return ()
+  }
+
+  /// Adds the environment entry `name=value`, where `name` and `value` are text.
+  ///
+  /// # Details
+  ///
+  /// The environment of the request starts empty. This function does not read the environment of
+  /// the caller. It does not check that `name` is a valid variable name.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the storage. Do not use the request
+  ///   again, because it can contain part of the entry.
+  ///
+  /// # Gotchas
+  ///
+  /// `name` and `value` must not contain NUL.
+  pub effect fn setVariable(
+    self: &mut ProcessRequest,
+    name: string,
+    value: string
+  ) -> () ! OutOfMemoryError ? &mut Allocator {
+    return run ChildProcess.setVariableBytes(&mut self.*, String.utf8Bytes(name), String.utf8Bytes(value))
+  }
+
+  /// Adds the environment entry `name=value`. The bytes do not have to be valid UTF-8.
+  ///
+  /// # When to use
+  ///
+  /// Use it for a value that you got as bytes, such as a copy of a variable from `HostInput`, so
+  /// you can pass it on without changes.
+  ///
+  /// # Details
+  ///
+  /// The environment of the request starts empty. This function does not read the environment of
+  /// the caller. It does not check that `name` is a valid variable name.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the storage. Do not use the request
+  ///   again, because it can contain part of the entry.
+  ///
+  /// # Gotchas
+  ///
+  /// `name` and `value` must not contain NUL.
+  pub effect fn setVariableBytes(
+    self: &mut ProcessRequest,
+    name: &[u8],
+    value: &[u8]
+  ) -> () ! OutOfMemoryError ? &mut Allocator {
+    let appendedName = run Bytes.append(&mut self.environmentValues, name)
+    let separator = [u8.toU8(61)]
+    let appendedSeparator = run Bytes.append(&mut self.environmentValues, &separator)
+    let appendedValue = run Bytes.append(&mut self.environmentValues, value)
+    let terminated = run terminate(&mut self.environmentValues)
+    self.environmentTotal = self.environmentTotal + usize.ONE
+    return ()
+  }
+
+  /// Borrows the executable path bytes for the lifetime of the request borrow.
+  pub fn program(self: &ProcessRequest) -> &[u8] {
+    return Bytes.asSlice(&self.programValue)
+  }
+
+  /// Borrows all ordered arguments as one block of NUL-terminated entries.
+  pub fn arguments(self: &ProcessRequest) -> &[u8] {
+    return Bytes.asSlice(&self.argumentValues)
+  }
+
+  /// Returns the number of calls to [`addArgument`] that completed successfully.
+  pub fn argumentCount(self: &ProcessRequest) -> usize {
+    return self.argumentTotal
+  }
+
+  /// Borrows the explicit environment as one block of NUL-terminated `name=value` entries.
+  pub fn environment(self: &ProcessRequest) -> &[u8] {
+    return Bytes.asSlice(&self.environmentValues)
+  }
+
+  /// Returns the number of calls to [`setVariable`] that completed successfully.
+  pub fn environmentCount(self: &ProcessRequest) -> usize {
+    return self.environmentTotal
+  }
+
+  /// Borrows the selected working-directory bytes, or an empty view when the child inherits one.
+  pub fn workingDirectory(self: &ProcessRequest) -> &[u8] {
+    return Bytes.asSlice(&self.directoryValue)
+  }
+
+  /// Reports whether the request selects a working directory instead of inheriting one.
+  pub fn hasWorkingDirectory(self: &ProcessRequest) -> bool {
+    return Bytes.length(&self.directoryValue) != usize.ZERO
+  }
+
+  /// Creates an exited outcome that owns `output` and `errors`.
+  pub fn exited(code: i32, output: Bytes, errors: Bytes) -> ProcessOutcome {
+    return ProcessOutcome {
+      value: Exited { code: code, output: move output, errors: move errors }
+    }
+  }
+
+  /// Creates a signaled outcome that owns `output` and `errors`.
+  pub fn signaled(signal: i32, output: Bytes, errors: Bytes) -> ProcessOutcome {
+    return ProcessOutcome {
+      value: Signaled { signal: signal, output: move output, errors: move errors }
+    }
+  }
+
+  /// Reports whether a signal terminated the child instead of an exit code.
+  pub fn isSignaled(outcome: &ProcessOutcome) -> bool {
+    return match &outcome.value {
+      Exited { code, output, errors } => false
+      Signaled { signal, output, errors } => true
+    }
+  }
+
+  /// Returns the exit code, or `None` when a signal terminated the child.
+  pub fn exitCode(outcome: &ProcessOutcome) -> Option<i32> {
+    return match &outcome.value {
+      Exited { code, output, errors } => Option<i32>.some(code)
+      Signaled { signal, output, errors } => Option<i32>.none()
+    }
+  }
+
+  /// Returns the terminating signal number, or `None` when the child returned an exit code.
+  pub fn terminatingSignal(outcome: &ProcessOutcome) -> Option<i32> {
+    return match &outcome.value {
+      Exited { code, output, errors } => Option<i32>.none()
+      Signaled { signal, output, errors } => Option<i32>.some(signal)
+    }
+  }
+
+  /// Borrows the complete captured standard output without consuming the outcome.
+  pub fn outputBytes(outcome: &ProcessOutcome) -> &[u8] {
+    return match &outcome.value {
+      Exited { code, output, errors } => Bytes.asSlice(&output)
+      Signaled { signal, output, errors } => Bytes.asSlice(&output)
+    }
+  }
+
+  /// Borrows the complete captured standard error without consuming the outcome.
+  pub fn errorBytes(outcome: &ProcessOutcome) -> &[u8] {
+    return match &outcome.value {
+      Exited { code, output, errors } => Bytes.asSlice(&errors)
+      Signaled { signal, output, errors } => Bytes.asSlice(&errors)
+    }
+  }
+
+  /// Runs `request` with the active provider, waits until the child ends, and returns the outcome.
+  ///
+  /// # Details
+  ///
+  /// It blocks. Standard input of the child is closed. The outcome owns all standard output and
+  /// standard error. An exit code other than 0 is a normal outcome.
+  ///
+  /// # Errors
+  ///
+  /// - [`ProcessError`] if the child cannot start, the wait fails, or the output cannot be
+  ///   captured.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the captured output.
+  pub effect fn submit(
+    request: &ProcessRequest
+  ) -> ProcessOutcome ! ProcessError | OutOfMemoryError ? &mut ChildProcess | &mut Allocator {
+    return run ChildProcess.execute(request)
+  }
+}
+

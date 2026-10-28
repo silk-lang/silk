@@ -4,7 +4,7 @@ Two sealed properties say which values may cross a thread boundary. Thread-spawn
 execution APIs bound their inputs on them, so a program that would share non-atomic state between
 threads is rejected where the value is handed off. The compiler derives both properties from a
 type's stored parts. A type that synchronizes its own storage, such as a lock built on
-`silk.atomic`, asserts them with an `impl`.
+`silk.concurrency.atomic`, asserts them with an `impl`.
 
 ## Terms
 
@@ -15,7 +15,7 @@ type's stored parts. A type that synchronizes its own storage, such as a lock bu
   payloads, a structural union's members, an array's element, a closure's captures, and the
   realized storage of an opaque representation.
 
-## THREAD-001 — `Transferable` and `Concurrent` are sealed `Intrinsic` properties published by `silk.thread`
+## THREAD-001 — `Transferable` and `Concurrent` are sealed `Intrinsic` properties published by `silk.concurrency.thread`
 
 **Status:** Confirmed
 
@@ -27,7 +27,7 @@ The sealed namespace has two thread properties:
 The standard library publishes them under ordinary names through TYPE-004 aliases:
 
 ```silk,ignore
-// silk/thread.silk
+// silk/concurrency/thread.silk
 pub type Transferable = Intrinsic.Transferable
 pub type Concurrent = Intrinsic.Concurrent
 ```
@@ -37,7 +37,7 @@ Either one is a bound, `T: Transferable`, or an `impl` head, `impl Concurrent fo
 each use:
 
 ```silk
-import silk.thread { Transferable }
+import silk.concurrency.thread { Transferable }
 
 struct Job { id: i32 }
 
@@ -89,8 +89,8 @@ type again while proving it holds. Reaching the same declaration with different 
 `Growing<T>` storing `Growing<[T; 1]>`, cannot be proved.
 
 ```silk
-import silk.list { List }
-import silk.thread { Concurrent, Transferable }
+import silk.collections.list { List }
+import silk.concurrency.thread { Concurrent, Transferable }
 
 struct Inbox { items: List<i32> }
 
@@ -128,7 +128,7 @@ impl<T: Concurrent> Concurrent for Buffer<T> {}
 The compiler does not inspect the type's parts when such an `impl` applies. The declaring module
 is responsible for every access through the storage the type reaches: transferring a `Buffer<T>`
 must not leave another owner of `base`, and sharing one across threads must synchronize every
-write, for example with `silk.atomic`.
+write, for example with `silk.concurrency.atomic`.
 
 Coherence follows the sealed-property rules for `Copy`: the `impl` lives in the type's declaring
 module, and at most one `impl` of a property applies to a type.
@@ -149,8 +149,8 @@ for the applied type under the caller's premises (THREAD-002). A generic caller 
 parameter only when it declares the same bound.
 
 ```silk,ignore
-import silk.shared { Shared }
-import silk.thread { Transferable }
+import silk.mem.shared { Shared }
+import silk.concurrency.thread { Transferable }
 
 fn send<T: Transferable>(value: T) -> () {}
 
@@ -165,7 +165,7 @@ pub fn main() -> i32 {
 
 **Current compiler:** Aligned.
 
-## THREAD-005 — `silk.native_thread` runs a Transferable closure on a new native thread
+## THREAD-005 — `silk.concurrency.thread_native` runs a Transferable closure on a new native thread
 
 **Status:** Confirmed
 
@@ -192,12 +192,12 @@ the process.
 **Diagnostics:** A closure or result without its bound reports `SEM0121`. Thread creation failure
 is the typed `SpawnError` carrying the `pthread_create` error number.
 
-**Evidence:** [native threads](../stdlib/silk/native_thread.silk), native corpus
+**Evidence:** [native threads](../stdlib/silk/concurrency/thread_native.silk), native corpus
 (`native-thread-spawn-join`, `native-thread-cross-wake`).
 
 **Current compiler:** Aligned.
 
-## THREAD-006 — `silk.sync` shares values between native threads
+## THREAD-006 — `silk.concurrency.sync` shares values between native threads
 
 **Status:** Confirmed
 
@@ -228,11 +228,11 @@ boundary), with the handle or guard as the anchor.
 **Boundary:** The targets of `Atomic.wait`. Locking a mutex again on the thread that holds it
 deadlocks. Reference cycles of `Arc` handles leak.
 
-**Evidence:** [synchronization](../stdlib/silk/sync.silk), native corpus (`sync-arc-mutex-parker`).
+**Evidence:** [synchronization](../stdlib/silk/concurrency/sync.silk), native corpus (`sync-arc-mutex-parker`).
 
 **Current compiler:** Aligned.
 
-## THREAD-007 — `silk.work_queue` moves owned values between native threads
+## THREAD-007 — `silk.concurrency.work_queue` moves owned values between native threads
 
 **Status:** Confirmed
 
@@ -262,11 +262,11 @@ Handles are `Transferable` and `Concurrent` when `T` is `Transferable`, except t
 `Allocator`. A receive can report nothing for a moment while a send is between its swap and its
 store.
 
-**Evidence:** [work queues](../stdlib/silk/work_queue.silk), native corpus (`work-queue-threads`).
+**Evidence:** [work queues](../stdlib/silk/concurrency/work_queue.silk), native corpus (`work-queue-threads`).
 
 **Current compiler:** Aligned.
 
-## THREAD-008 — `silk.thread_pool` runs tasks on a work-stealing pool of native threads
+## THREAD-008 — `silk.concurrency.thread_pool` runs tasks on a work-stealing pool of native threads
 
 **Status:** Confirmed
 
@@ -295,7 +295,7 @@ requirements or errors, so a task returns its own failures as a value, for examp
 `Execution.parkTransferable`; blocking the native thread holds up a whole worker. A task spawned
 after its pool was dropped is dropped unstarted, and its handle never finishes.
 
-**Evidence:** [thread pool](../stdlib/silk/thread_pool.silk), native corpus (`thread-pool-tasks`).
+**Evidence:** [thread pool](../stdlib/silk/concurrency/thread_pool.silk), native corpus (`thread-pool-tasks`).
 
 **Current compiler:** Aligned.
 
@@ -310,7 +310,7 @@ thread through the wasi-threads import `wasi.thread-spawn`; the host instantiate
 on the same memory and calls its exported `wasi_thread_start`. The compiler's linked runtime gives
 each thread a 1 MiB stack from the allocator before the thread runs, and `JoinHandle.join` and
 `Atomic.wait` block with `memory.atomic.wait32`. `NativeThread.processorCount` asks the host
-through `silk.thread-parallelism`.
+through `silk.concurrency.thread-parallelism`.
 
 ```toml
 [profiles.web]
@@ -333,8 +333,8 @@ the thread entry the runtime calls; hosts do not call it.
 **Diagnostics:** `threading = "multi"` on a native target is still refused as not native. A thread
 the host cannot start is the typed `SpawnError` carrying the error number the host returned.
 
-**Evidence:** [native threads](../stdlib/silk/native_thread.silk),
-[wasm entry](../stdlib/silk/wasm_start.silk), [runner](../stdlib/host/wasm-runner.mjs),
+**Evidence:** [native threads](../stdlib/silk/concurrency/thread_native.silk),
+[wasm entry](../stdlib/silk/platform/wasm/start.silk), [runner](../stdlib/host/wasm-runner.mjs),
 `compiler/scripts/test-native-build.ts`.
 
 **Current compiler:** Aligned.

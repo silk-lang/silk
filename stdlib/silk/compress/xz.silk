@@ -1,0 +1,378 @@
+//! Decode XZ containers and verify their blocks, index, and footer.
+//!
+//! # When to use
+//! Use [`Xz.decode`] for `.xz` files containing a single LZMA2 filter per block.
+//!
+//! # Details
+//! Supports concatenated streams, stream padding, multiple blocks, optional block sizes, and
+//! none, CRC-32, CRC-64, or SHA-256 checks. Other filter chains are rejected. The caller supplies
+//! output storage; probability tables allocate through the ambient allocator. Index records are
+//! checked by scanning the already-validated block framing again, without allocating an index.
+//!
+//! @category Data formats
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.compress.limits { DecodeLimits, DecodeReason, DecodeError, Decoded }
+import silk.compress.lzma_decode { LzmaState }
+import silk.compress.lzma2_decode { Lzma2Stream }
+import silk.compress.checksum { CompressionChecksum }
+import silk.crypto.sha2 { Sha256 }
+import silk.collections.slice { Slice }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+/// A complete-buffer XZ decoder for blocks with a single LZMA2 filter.
+pub struct Xz {}
+
+impl Xz {
+  /// Decodes complete XZ streams into the start of `output` and verifies container integrity.
+  ///
+  /// # Details
+  /// Accepts concatenated streams separated by multiples of four zero padding bytes. Each block
+  /// must use a single LZMA2 filter. Verifies header, block, index, and footer checksums; optional
+  /// block sizes; exact index records; and matching stream flags. Supports none, CRC-32, CRC-64,
+  /// and SHA-256 block checks. Probability tables allocate with the ambient allocator. The output
+  /// buffer holds dictionary history. Limits apply across all streams in the input.
+  ///
+  /// # Errors
+  /// `DecodeError` reports malformed or truncated data, invalid sizes or distances, checksum
+  /// mismatches, unsupported filters or checks, and input/output/dictionary/workspace limits.
+  /// Discard output after failure. `OutOfMemoryError` reports probability-table allocation failure.
+  pub effect fn decode(input: &[u8], output: &mut [u8], limits: DecodeLimits) -> Decoded
+    ! OutOfMemoryError | DecodeError
+    ? &mut Allocator {
+    let mut end = output.length
+    if limits.maxOutputBytes < end {
+      end = limits.maxOutputBytes
+    }
+    let mut state = LzmaState.make(input.length, end)
+    if input.length > limits.maxInputBytes {
+      fail DecodeError { reason: DecodeReason.InputLimit, consumed: 0, written: 0 }
+    }
+    while !state.failed {
+      let check = streamHeader(&mut state, input)
+      let recordsStart = state.ip
+      let mut blocks: u64 = 0
+      while !state.failed && state.ip < input.length && input[state.ip] != 0 {
+        let header = blockHeader(&mut state, input, limits.maxDictionaryBytes)
+        if state.failed {
+          break
+        }
+        let packedStart = state.ip
+        let outputStart = state.op
+        run Lzma2Stream.decode(&mut state, input, &mut output, limits.maxWorkspaceBytes)
+        if state.failed {
+          break
+        }
+        let packed = state.ip - packedStart
+        let unpacked = state.op - outputStart
+        if (header.packed != u64.MAX && header.packed != usize.toU64(packed))
+          || (header.unpacked != u64.MAX && header.unpacked != usize.toU64(unpacked)) {
+          LzmaState.reject(&mut state, DecodeReason.InvalidSize)
+          break
+        }
+        padding(&mut state, input, packed)
+        verifyCheck(&mut state, input, Slice.view<u8>(&output, outputStart, unpacked), check)
+        blocks = blocks + 1
+      }
+      if state.failed {
+        break
+      }
+      indexAndFooter(&mut state, input, recordsStart, blocks, check, limits.maxDictionaryBytes)
+      if state.failed {
+        break
+      }
+      let paddingStart = state.ip
+      while state.ip < input.length && input[state.ip] == 0 {
+        state.ip = state.ip + 1
+      }
+      if usize.remainder(state.ip - paddingStart, 4) != 0 {
+        LzmaState.reject(&mut state, DecodeReason.InvalidData)
+        break
+      }
+      if state.ip == input.length {
+        return Decoded { consumed: state.ip, written: state.op }
+      }
+    }
+    fail LzmaState.error(&state)
+  }
+}
+
+struct BlockHeader {
+  size: usize,
+  packed: u64,
+  unpacked: u64,
+}
+
+fn streamHeader(state: &mut LzmaState, input: &[u8]) -> u32 {
+  let magic = b"\xfd7zXZ\x00"
+  let mut index: usize = 0
+  while index < 6 && !state.failed {
+    if LzmaState.byte(&mut state, input) != u8.toU32(magic[index]) {
+      LzmaState.reject(&mut state, DecodeReason.InvalidHeader)
+    }
+    index = index + 1
+  }
+  let flagsStart = state.ip
+  let reserved = LzmaState.byte(&mut state, input)
+  let check = LzmaState.byte(&mut state, input)
+  let stored = LzmaState.little(&mut state, input, 4)
+  if state.failed {
+    return 0
+  }
+  if reserved != 0 || u32.bitAnd(check, 240) != 0 {
+    LzmaState.reject(&mut state, DecodeReason.InvalidHeader)
+    return 0
+  }
+  if stored != u32.toU64(CompressionChecksum.crc32(Slice.view<u8>(input, flagsStart, 2))) {
+    LzmaState.reject(&mut state, DecodeReason.ChecksumMismatch)
+  }
+  if check != 0 && check != 1 && check != 4 && check != 10 {
+    LzmaState.reject(&mut state, DecodeReason.UnsupportedCheck)
+  }
+  return check
+}
+
+fn blockHeader(state: &mut LzmaState, input: &[u8], dictionaryLimit: u64) -> BlockHeader {
+  let start = state.ip
+  let size = (u32.toUsize(LzmaState.byte(&mut state, input)) + 1) * 4
+  let mut packed = u64.MAX
+  let mut unpacked = u64.MAX
+  let end = state.inputEnd
+  if state.failed || size < 8 || size > end - start {
+    LzmaState.reject(&mut state, DecodeReason.TruncatedInput)
+    return BlockHeader { size: size, packed: packed, unpacked: unpacked }
+  }
+  state.inputEnd = start + size - 4
+  let flags = LzmaState.byte(&mut state, input)
+  if u32.bitAnd(flags, 60) != 0 {
+    LzmaState.reject(&mut state, DecodeReason.InvalidHeader)
+  }
+  if u32.bitAnd(flags, 3) != 0 {
+    LzmaState.reject(&mut state, DecodeReason.UnsupportedFilter)
+  }
+  if u32.bitAnd(flags, 64) != 0 {
+    packed = variable(&mut state, input)
+  }
+  if u32.bitAnd(flags, 128) != 0 {
+    unpacked = variable(&mut state, input)
+  }
+  let filter = variable(&mut state, input)
+  let properties = variable(&mut state, input)
+  let property = LzmaState.byte(&mut state, input)
+  if filter != 33 {
+    LzmaState.reject(&mut state, DecodeReason.UnsupportedFilter)
+  }
+  if properties != 1 || property > 40 {
+    LzmaState.reject(&mut state, DecodeReason.InvalidHeader)
+  }
+  if !state.failed {
+    let mut dictionary: u64 = 4294967295
+    if property < 40 {
+      dictionary = u64.shiftLeft(
+        2 + u32.toU64(u32.bitAnd(property, 1)),
+        u32.toU64(u32.shiftRight(property, 1)) + 11
+      )
+    }
+    if dictionary > dictionaryLimit {
+      LzmaState.reject(&mut state, DecodeReason.DictionaryLimit)
+    }
+    state.dictionarySize = dictionary
+  }
+  while state.ip < state.inputEnd && !state.failed {
+    if LzmaState.byte(&mut state, input) != 0 {
+      LzmaState.reject(&mut state, DecodeReason.InvalidHeader)
+    }
+  }
+  state.inputEnd = end
+  let stored = LzmaState.little(&mut state, input, 4)
+  if !state.failed
+    && stored != u32.toU64(CompressionChecksum.crc32(Slice.view<u8>(input, start, size - 4))) {
+    LzmaState.reject(&mut state, DecodeReason.ChecksumMismatch)
+  }
+  return BlockHeader { size: size, packed: packed, unpacked: unpacked }
+}
+
+// XZ variable-length integers are canonical base-128 values of at most 63 bits.
+fn variable(state: &mut LzmaState, input: &[u8]) -> u64 {
+  let mut value: u64 = 0
+  let mut index: u64 = 0
+  while index < 9 && !state.failed {
+    let byte = LzmaState.byte(&mut state, input)
+    value = u64.bitOr(value, u64.shiftLeft(u32.toU64(u32.bitAnd(byte, 127)), index * 7))
+    if byte < 128 {
+      if index != 0 && byte == 0 {
+        LzmaState.reject(&mut state, DecodeReason.InvalidData)
+      }
+      return value
+    }
+    index = index + 1
+  }
+  LzmaState.reject(&mut state, DecodeReason.InvalidData)
+  return 0
+}
+
+fn padding(state: &mut LzmaState, input: &[u8], size: usize) -> () {
+  let count = usize.remainder(4 - usize.remainder(size, 4), 4)
+  let mut index: usize = 0
+  while index < count && !state.failed {
+    if LzmaState.byte(&mut state, input) != 0 {
+      LzmaState.reject(&mut state, DecodeReason.InvalidData)
+    }
+    index = index + 1
+  }
+}
+
+fn checkSize(check: u32) -> usize {
+  if check == 1 {
+    return 4
+  }
+  if check == 4 {
+    return 8
+  }
+  if check == 10 {
+    return 32
+  }
+  return 0
+}
+
+fn verifyCheck(state: &mut LzmaState, input: &[u8], output: &[u8], check: u32) -> () {
+  if state.failed {
+    return ()
+  }
+  if check == 1 {
+    let stored = LzmaState.little(&mut state, input, 4)
+    if stored != u32.toU64(CompressionChecksum.crc32(output)) {
+      LzmaState.reject(&mut state, DecodeReason.ChecksumMismatch)
+    }
+  } else if check == 4 {
+    let stored = LzmaState.little(&mut state, input, 8)
+    if stored != CompressionChecksum.crc64(output) {
+      LzmaState.reject(&mut state, DecodeReason.ChecksumMismatch)
+    }
+  } else if check == 10 {
+    let computed = Sha256.hash(output)
+    let mut index: usize = 0
+    while index < 32 && !state.failed {
+      if LzmaState.byte(&mut state, input) != u8.toU32(computed[index]) {
+        LzmaState.reject(&mut state, DecodeReason.ChecksumMismatch)
+      }
+      index = index + 1
+    }
+  }
+}
+
+// Scan only chunk framing from a block already decoded above. This makes exact index validation
+// linear in input size while avoiding an allocation proportional to the number of blocks.
+fn scanChunks(state: &mut LzmaState, input: &[u8]) -> () {
+  while !state.failed {
+    let control = LzmaState.byte(&mut state, input)
+    if control == 0 || state.failed {
+      return ()
+    }
+    let high = LzmaState.byte(&mut state, input)
+    let low = LzmaState.byte(&mut state, input)
+    let mut unpacked = high * 256 + low + 1
+    let mut packed = unpacked
+    if control >= 128 {
+      unpacked = unpacked + u32.bitAnd(control, 31) * 65536
+      let packedHigh = LzmaState.byte(&mut state, input)
+      let packedLow = LzmaState.byte(&mut state, input)
+      packed = packedHigh * 256 + packedLow + 1
+      if control >= 192 {
+        let property = LzmaState.byte(&mut state, input)
+      }
+    }
+    if state.failed {
+      return ()
+    }
+    if u32.toUsize(packed) > state.inputEnd - state.ip
+      || u32.toUsize(unpacked) > state.outputEnd - state.op {
+      LzmaState.reject(&mut state, DecodeReason.InvalidSize)
+      return ()
+    }
+    state.ip = state.ip + u32.toUsize(packed)
+    state.op = state.op + u32.toUsize(unpacked)
+  }
+}
+
+fn indexAndFooter(
+  state: &mut LzmaState,
+  input: &[u8],
+  recordsStart: usize,
+  blocks: u64,
+  check: u32,
+  dictionaryLimit: u64
+) -> () {
+  let indexStart = state.ip
+  if LzmaState.byte(&mut state, input) != 0 {
+    LzmaState.reject(&mut state, DecodeReason.InvalidData)
+  }
+  if variable(&mut state, input) != blocks {
+    LzmaState.reject(&mut state, DecodeReason.InvalidSize)
+  }
+  let mut scanner = LzmaState.make(indexStart, state.op)
+  scanner.ip = recordsStart
+  let mut record: u64 = 0
+  while record < blocks && !state.failed {
+    let header = blockHeader(&mut scanner, input, dictionaryLimit)
+    let packedStart = scanner.ip
+    let outputStart = scanner.op
+    scanChunks(&mut scanner, input)
+    let packed = scanner.ip - packedStart
+    let unpacked = scanner.op - outputStart
+    let unpadded = usize.toU64(header.size) + usize.toU64(packed) + usize.toU64(checkSize(check))
+    if variable(&mut state, input) != unpadded
+      || variable(&mut state, input) != usize.toU64(unpacked) {
+      LzmaState.reject(&mut state, DecodeReason.InvalidSize)
+    }
+    padding(&mut scanner, input, packed)
+    if checkSize(check) > scanner.inputEnd - scanner.ip {
+      LzmaState.reject(&mut scanner, DecodeReason.InvalidSize)
+    }
+    if scanner.failed {
+      LzmaState.reject(&mut state, DecodeReason.InvalidSize)
+      return ()
+    }
+    scanner.ip = scanner.ip + checkSize(check)
+    record = record + 1
+  }
+  if scanner.ip != indexStart {
+    LzmaState.reject(&mut state, DecodeReason.InvalidSize)
+  }
+  let indexBytes = state.ip - indexStart
+  padding(&mut state, input, indexBytes)
+  let dataEnd = state.ip
+  let stored = LzmaState.little(&mut state, input, 4)
+  if state.failed {
+    return ()
+  }
+  if stored
+    != u32.toU64(
+    CompressionChecksum.crc32(Slice.view<u8>(input, indexStart, dataEnd - indexStart))
+  ) {
+    LzmaState.reject(&mut state, DecodeReason.ChecksumMismatch)
+  }
+  let indexSize = state.ip - indexStart
+  let footerCrc = LzmaState.little(&mut state, input, 4)
+  let footerStart = state.ip
+  let backward = LzmaState.little(&mut state, input, 4)
+  let reserved = LzmaState.byte(&mut state, input)
+  let footerCheck = LzmaState.byte(&mut state, input)
+  let magic1 = LzmaState.byte(&mut state, input)
+  let magic2 = LzmaState.byte(&mut state, input)
+  if state.failed {
+    return ()
+  }
+  if footerCrc != u32.toU64(CompressionChecksum.crc32(Slice.view<u8>(input, footerStart, 6))) {
+    LzmaState.reject(&mut state, DecodeReason.ChecksumMismatch)
+  }
+  if (backward + 1) * 4 != usize.toU64(indexSize) {
+    LzmaState.reject(&mut state, DecodeReason.InvalidSize)
+  }
+  if reserved != 0 || footerCheck != check || magic1 != 89 || magic2 != 90 {
+    LzmaState.reject(&mut state, DecodeReason.InvalidHeader)
+  }
+}

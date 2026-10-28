@@ -1,0 +1,613 @@
+//! Ed25519 signature verification for 32-byte public keys and 64-byte signatures (RFC 8032).
+//!
+//! # When to use
+//! Use [`Ed25519PublicKey`] to check that a message was signed by the holder of a known Ed25519
+//! key, such as a release signing key. This module verifies only; it cannot sign.
+//!
+//! # Details
+//! `fromBytes` decodes and checks the public key once. `verify` borrows the message and the
+//! signature, requires the scalar half of the signature to be below the group order, and checks
+//! the cofactorless equation `[S]B = R + [k]A` with `k = SHA-512(R || A || M) mod L`. Arithmetic
+//! uses bounded local storage, without an allocator.
+//!
+//! # Gotchas
+//! Verification works on public data and does not try to run in constant time. A valid
+//! signature proves only that the key holder signed these exact bytes. For prehashed formats, such
+//! as minisign's `ED` algorithm, pass the digest as the message.
+//!
+//! # Examples
+//! ## Reject a signature over a different message
+//! ```silk
+//! import silk.crypto.ed25519 {Ed25519PublicKey}
+//! import silk.core.result {Result}
+//!
+//! pub fn main() -> i32 {
+//!   // RFC 8032 section 7.1, test 1: the empty message.
+//!   let key: [u8; 32] = [
+//!     215, 90, 152, 1, 130, 177, 10, 183, 213, 75, 254, 211, 201, 100, 7, 58,
+//!     14, 225, 114, 243, 218, 166, 35, 37, 175, 2, 26, 104, 247, 7, 81, 26,
+//!   ]
+//!   let signature: [u8; 64] = [
+//!     229, 86, 67, 0, 195, 96, 172, 114, 144, 134, 226, 204, 128, 110, 130, 138,
+//!     132, 135, 127, 30, 184, 229, 217, 116, 216, 115, 224, 101, 34, 73, 1, 85,
+//!     95, 184, 130, 21, 144, 163, 59, 172, 198, 30, 57, 112, 28, 249, 180, 107,
+//!     210, 91, 245, 240, 89, 91, 190, 36, 101, 81, 65, 67, 142, 122, 16, 11,
+//!   ]
+//!   let empty: [u8; 0] = []
+//!   let other: [u8; 1] = [0]
+//!   return match Ed25519PublicKey.fromBytes(&key) {
+//!     Result.Failure { error } => 1
+//!     Result.Success { value: verifier } => {
+//!       let accepted = match verifier.verify(&empty, &signature) {
+//!         Result.Success { value } => true
+//!         Result.Failure { error } => false
+//!       }
+//!       let forged = match verifier.verify(&other, &signature) {
+//!         Result.Success { value } => true
+//!         Result.Failure { error } => false
+//!       }
+//!       if !accepted || forged {
+//!         return 2
+//!       }
+//!       return 0
+//!     }
+//!   }
+//! }
+//! ```
+//!
+//! @category Cryptography
+
+import silk.format { Debug, Format, Formatter }
+import silk.num.i64
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.crypto.sha2 { Sha512 }
+import silk.collections.slice { Slice }
+import silk.num.u8
+import silk.num.u64
+import silk.num.usize
+import silk.io.writer { Writer, WriterError }
+
+/// A rejected Ed25519 input, without the input bytes in the error.
+pub enum Ed25519Error {
+  /// A public key encoding whose length is not 32 bytes.
+  InvalidKeyLength,
+  /// A public key that does not encode a point on the curve.
+  InvalidKey,
+  /// A signature whose length is not 64 bytes.
+  InvalidSignatureLength,
+  /// A signature that does not verify for this key and message.
+  InvalidSignature,
+}
+
+impl Debug for Ed25519Error {
+  /// Writes the name of the variant, such as `InvalidKeyLength`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      Ed25519Error.InvalidKeyLength => run Format.write(&mut formatter, b"InvalidKeyLength")
+      Ed25519Error.InvalidKey => run Format.write(&mut formatter, b"InvalidKey")
+      Ed25519Error.InvalidSignatureLength => run Format.write(&mut formatter, b"InvalidSignatureLength")
+      Ed25519Error.InvalidSignature => run Format.write(&mut formatter, b"InvalidSignature")
+    }
+  }
+}
+
+/// A decoded Ed25519 public key, for signature verification only (RFC 8032).
+///
+/// # When to use
+///
+/// Use it to check that a message was signed by the holder of a known Ed25519 key, such as a
+/// release signing key. Decode the key once with [`Ed25519PublicKey.fromBytes`], then call
+/// [`Ed25519PublicKey.verify`]. It cannot sign.
+///
+/// # Gotchas
+///
+/// Verification works on public data and does not try to run in constant time. A valid signature
+/// proves only that the key holder signed these exact bytes. For prehashed formats, such as
+/// minisign's `ED` algorithm, pass the digest as the message.
+pub struct Ed25519PublicKey {
+  encoded: [u8; 32],
+
+  // The negated key point, as the verification equation uses it.
+  negated: Point,
+}
+
+impl Ed25519PublicKey {
+  /// Decodes exactly 32 borrowed public key bytes.
+  ///
+  /// # Errors
+  /// `InvalidKeyLength` when `bytes` is not 32 bytes long, and `InvalidKey` when it does not
+  /// encode a curve point.
+  pub fn fromBytes(bytes: &[u8]) -> Result<Ed25519PublicKey, Ed25519Error> {
+    if bytes.length != 32 {
+      return Result<Ed25519PublicKey, Ed25519Error>.failResult(Ed25519Error.InvalidKeyLength)
+    }
+    let constants = curve()
+    let mut encoded: [u8; 32] = [0; 32]
+    let mut index = usize.ZERO
+    while index < 32 {
+      encoded[index] = bytes[index]
+      index = index + usize.ONE
+    }
+    let mut negated = identity()
+    if !decodeNegated(&constants, &encoded, &mut negated) {
+      return Result<Ed25519PublicKey, Ed25519Error>.failResult(Ed25519Error.InvalidKey)
+    }
+    return Result<Ed25519PublicKey, Ed25519Error>.succeed(
+      Ed25519PublicKey { encoded: encoded, negated: negated }
+    )
+  }
+
+  /// Returns the 32-byte encoding this key was decoded from.
+  pub fn bytes(self: &Ed25519PublicKey) -> [u8; 32] {
+    return self.encoded
+  }
+
+  /// Checks that `signature` is this key's Ed25519 signature of `message`.
+  ///
+  /// It borrows the message and the signature, requires the scalar half of the signature to be
+  /// below the group order, and checks the cofactorless equation `[S]B = R + [k]A` with
+  /// `k = SHA-512(R || A || M) mod L`. It does not allocate.
+  ///
+  /// # Gotchas
+  /// It does not try to run in constant time. A valid signature proves only that the key holder
+  /// signed these exact bytes. For prehashed formats, such as minisign's `ED` algorithm, pass the
+  /// digest as the message.
+  ///
+  /// # Errors
+  /// `InvalidSignatureLength` when `signature` is not 64 bytes long, and `InvalidSignature` when
+  /// its scalar is not below the group order or the verification equation does not hold.
+  pub fn verify(self: &Ed25519PublicKey, message: &[u8], signature: &[u8]) -> Result<
+    (),
+    Ed25519Error
+  > {
+    if signature.length != 64 {
+      return Result<(), Ed25519Error>.failResult(Ed25519Error.InvalidSignatureLength)
+    }
+    let mut scalar: [u8; 32] = [0; 32]
+    let mut index = usize.ZERO
+    while index < 32 {
+      scalar[index] = signature[32 + index]
+      index = index + usize.ONE
+    }
+    if !belowOrder(&scalar) {
+      return Result<(), Ed25519Error>.failResult(Ed25519Error.InvalidSignature)
+    }
+    let mut digest = Sha512.make()
+    digest.update(Slice.view<u8>(signature, usize.ZERO, 32))
+    digest.update(&self.encoded)
+    digest.update(message)
+    let challenge = reduce(&digest.finish())
+    let constants = curve()
+
+    // [S]B - [k]A must encode to R.
+    let mut sum = multiply(&constants, &self.negated, &challenge)
+    let signed = multiply(&constants, &constants.base, &scalar)
+    sum = addPoints(&constants, &sum, &signed)
+    let encoded = encodePoint(&sum)
+    let mut difference: u8 = 0
+    index = usize.ZERO
+    while index < 32 {
+      difference = u8.bitOr(difference, u8.bitXor(encoded[index], signature[index]))
+      index = index + usize.ONE
+    }
+    if difference != 0 {
+      return Result<(), Ed25519Error>.failResult(Ed25519Error.InvalidSignature)
+    }
+    return Result<(), Ed25519Error>.succeed(())
+  }
+}
+
+// Field elements modulo 2^255 - 19 as sixteen 16-bit limbs, the representation `silk.crypto.x25519`
+// uses. Every operation returns canonical limbs.
+struct Field {
+  limbs: [u64; 16],
+}
+
+impl Copy for Field {}
+
+// Extended twisted Edwards coordinates (X : Y : Z : T) with x = X/Z, y = Y/Z and xy = T/Z.
+struct Point {
+  x: Field,
+  y: Field,
+  z: Field,
+  t: Field,
+}
+
+impl Copy for Point {}
+
+// Curve constants, derived from their definitions rather than written out.
+struct Curve {
+  d: Field,
+  doubledD: Field,
+  rootMinusOne: Field,
+  base: Point,
+}
+
+fn curve() -> Curve {
+  // d = -121665 / 121666.
+  let numerator = subtract(&zero(), &small(121665))
+  let d = product(&numerator, &inverse(&small(121666)))
+  let doubledD = add(&d, &d)
+
+  // sqrt(-1) = 2^((p - 1) / 4); the exponent is 2^253 - 5.
+  let rootMinusOne = power(&small(2), &exponent(251, 31))
+  let mut constants = Curve {
+    d: d,
+    doubledD: doubledD,
+    rootMinusOne: rootMinusOne,
+    base: identity()
+  }
+
+  // The base point encodes as 0x58 followed by 31 bytes of 0x66.
+  let mut encoded: [u8; 32] = [0x66; 32]
+  encoded[0] = 0x58
+  let mut negatedBase = identity()
+  let decoded = decodeNegated(&constants, &encoded, &mut negatedBase)
+  constants.base = negate(&negatedBase)
+  return move constants
+}
+
+fn zero() -> Field {
+  return Field { limbs: [0; 16] }
+}
+
+fn small(value: u64) -> Field {
+  let mut result = zero()
+  result.limbs[0] = u64.bitAnd(value, 65535)
+  result.limbs[1] = u64.shiftRight(value, 16)
+  return result
+}
+
+// A little-endian exponent of the form 2^k - c: `low` in byte zero, 0xFF in bytes 1 to 30 and
+// `high` in byte 31.
+fn exponent(low: u8, high: u8) -> [u8; 32] {
+  let mut bytes: [u8; 32] = [0xFF; 32]
+  bytes[0] = low
+  bytes[31] = high
+  return bytes
+}
+
+// Input limbs are below 2^42. Three carry passes and one conditional subtraction of p leave
+// canonical limbs, as in `silk.crypto.x25519`.
+fn normalize(value: Field) -> Field {
+  let mut result = value
+  let mut pass = usize.ZERO
+  while pass < 3 {
+    let mut index = usize.ZERO
+    while index < 15 {
+      let carry = u64.shiftRight(result.limbs[index], 16)
+      result.limbs[index] = u64.bitAnd(result.limbs[index], 65535)
+      result.limbs[index + 1] = u64.wrappingAdd(result.limbs[index + 1], carry)
+      index = index + usize.ONE
+    }
+    let carry = u64.shiftRight(result.limbs[15], 15)
+    result.limbs[15] = u64.bitAnd(result.limbs[15], 32767)
+    result.limbs[0] = u64.wrappingAdd(result.limbs[0], u64.wrappingMultiply(carry, 19))
+    pass = pass + usize.ONE
+  }
+  let mut reduced = zero()
+  let mut carry: u64 = 19
+  let mut index = usize.ZERO
+  while index < 15 {
+    let sum = u64.wrappingAdd(result.limbs[index], carry)
+    reduced.limbs[index] = u64.bitAnd(sum, 65535)
+    carry = u64.shiftRight(sum, 16)
+    index = index + usize.ONE
+  }
+  let top = u64.wrappingAdd(result.limbs[15], carry)
+  reduced.limbs[15] = u64.bitAnd(top, 32767)
+  let mask = u64.wrappingSubtract(0, u64.shiftRight(top, 15))
+  index = usize.ZERO
+  while index < 16 {
+    result.limbs[index] = u64.bitXor(
+      result.limbs[index],
+      u64.bitAnd(mask, u64.bitXor(result.limbs[index], reduced.limbs[index])),
+    )
+    index = index + usize.ONE
+  }
+  return result
+}
+
+fn add(left: &Field, right: &Field) -> Field {
+  let mut result = zero()
+  let mut index = usize.ZERO
+  while index < 16 {
+    result.limbs[index] = u64.wrappingAdd(left.limbs[index], right.limbs[index])
+    index = index + usize.ONE
+  }
+  return normalize(result)
+}
+
+fn subtract(left: &Field, right: &Field) -> Field {
+  let mut result = zero()
+  let mut index = usize.ZERO
+  while index < 16 {
+    // Adding 2p keeps every limb nonnegative.
+    let mut twicePrime: u64 = 131070
+    if index == 0 {
+      twicePrime = 131034
+    }
+    if index == 15 {
+      twicePrime = 65534
+    }
+    result.limbs[index] = u64.wrappingSubtract(
+      u64.wrappingAdd(left.limbs[index], twicePrime),
+      right.limbs[index]
+    )
+    index = index + usize.ONE
+  }
+  return normalize(result)
+}
+
+fn product(left: &Field, right: &Field) -> Field {
+  let mut wide: [u64; 32] = [0; 32]
+  let mut i = usize.ZERO
+  while i < 16 {
+    let mut j = usize.ZERO
+    while j < 16 {
+      wide[i + j] = u64.wrappingAdd(
+        wide[i + j],
+        u64.wrappingMultiply(left.limbs[i], right.limbs[j])
+      )
+      j = j + usize.ONE
+    }
+    i = i + usize.ONE
+  }
+  let mut result = zero()
+  i = usize.ZERO
+  while i < 16 {
+    result.limbs[i] = u64.wrappingAdd(wide[i], u64.wrappingMultiply(38, wide[i + 16]))
+    i = i + usize.ONE
+  }
+  return normalize(result)
+}
+
+fn square(value: &Field) -> Field {
+  return product(value, value)
+}
+
+// `base` raised to the little-endian 256-bit exponent `bits`.
+fn power(base: &Field, bits: &[u8; 32]) -> Field {
+  let mut result = small(1)
+  let mut remaining: usize = 256
+  while remaining > 0 {
+    remaining = remaining - usize.ONE
+    result = square(&result)
+    if u8.bitAnd(u8.shiftRight(bits[remaining / 8], usize.toU8(remaining % 8)), 1) == 1 {
+      result = product(&result, base)
+    }
+  }
+  return result
+}
+
+fn inverse(value: &Field) -> Field {
+  // p - 2 = 2^255 - 21.
+  return power(value, &exponent(235, 127))
+}
+
+fn decode(bytes: &[u8; 32]) -> Field {
+  let mut result = zero()
+  let mut index = usize.ZERO
+  while index < 16 {
+    result.limbs[index] = u64.bitOr(
+      u8.toU64(bytes[index * 2]),
+      u64.shiftLeft(u8.toU64(bytes[index * 2 + 1]), 8)
+    )
+    index = index + usize.ONE
+  }
+  result.limbs[15] = u64.bitAnd(result.limbs[15], 32767)
+  return normalize(result)
+}
+
+fn encode(value: &Field) -> [u8; 32] {
+  let mut result: [u8; 32] = [0; 32]
+  let mut index = usize.ZERO
+  while index < 16 {
+    result[index * 2] = u64.toU8(u64.bitAnd(value.limbs[index], 255))
+    result[index * 2 + 1] = u64.toU8(u64.shiftRight(value.limbs[index], 8))
+    index = index + usize.ONE
+  }
+  return result
+}
+
+fn same(left: &Field, right: &Field) -> bool {
+  let mut index = usize.ZERO
+  while index < 16 {
+    if left.limbs[index] != right.limbs[index] {
+      return false
+    }
+    index = index + usize.ONE
+  }
+  return true
+}
+
+fn parity(value: &Field) -> u8 {
+  return u64.toU8(u64.bitAnd(value.limbs[0], 1))
+}
+
+fn identity() -> Point {
+  return Point { x: zero(), y: small(1), z: small(1), t: zero() }
+}
+
+fn negate(point: &Point) -> Point {
+  return Point {
+    x: subtract(&zero(), &point.x),
+    y: point.y,
+    z: point.z,
+    t: subtract(&zero(), &point.t)
+  }
+}
+
+// The unified addition law for a = -1 (add-2008-hwcd-3), which also doubles.
+fn addPoints(constants: &Curve, left: &Point, right: &Point) -> Point {
+  let a = product(&subtract(&left.y, &left.x), &subtract(&right.y, &right.x))
+  let b = product(&add(&left.y, &left.x), &add(&right.y, &right.x))
+  let c = product(&product(&left.t, &right.t), &constants.doubledD)
+  let zz = product(&left.z, &right.z)
+  let d = add(&zz, &zz)
+  let e = subtract(&b, &a)
+  let f = subtract(&d, &c)
+  let g = add(&d, &c)
+  let h = add(&b, &a)
+  return Point { x: product(&e, &f), y: product(&h, &g), z: product(&g, &f), t: product(&e, &h) }
+}
+
+// [scalar]point for a little-endian 256-bit scalar, by double-and-add on public data.
+fn multiply(constants: &Curve, point: &Point, scalar: &[u8; 32]) -> Point {
+  let mut result = identity()
+  let mut remaining: usize = 256
+  while remaining > 0 {
+    remaining = remaining - usize.ONE
+    result = addPoints(constants, &result, &result)
+    if u8.bitAnd(u8.shiftRight(scalar[remaining / 8], usize.toU8(remaining % 8)), 1) == 1 {
+      result = addPoints(constants, &result, point)
+    }
+  }
+  return result
+}
+
+fn encodePoint(point: &Point) -> [u8; 32] {
+  let reciprocal = inverse(&point.z)
+  let x = product(&point.x, &reciprocal)
+  let y = product(&point.y, &reciprocal)
+  let mut bytes = encode(&y)
+  bytes[31] = u8.bitXor(bytes[31], u8.shiftLeft(parity(&x), 7))
+  return bytes
+}
+
+// Decodes `bytes` as a point and stores its negation in `output`; false when `bytes` encodes no
+// point. Follows RFC 8032 section 5.1.3, with y taken modulo p as most implementations do.
+fn decodeNegated(constants: &Curve, bytes: &[u8; 32], output: &mut Point) -> bool {
+  let one = small(1)
+  let y = decode(bytes)
+
+  // x^2 = (y^2 - 1) / (d y^2 + 1) = u / v.
+  let ySquared = square(&y)
+  let u = subtract(&ySquared, &one)
+  let v = add(&product(&ySquared, &constants.d), &one)
+
+  // x = u v^3 (u v^7)^((p - 5) / 8); the exponent is 2^252 - 3.
+  let v3 = product(&square(&v), &v)
+  let v7 = product(&square(&v3), &v)
+  let candidate = power(&product(&u, &v7), &exponent(253, 15))
+  let mut x = product(&product(&u, &v3), &candidate)
+  let mut check = product(&square(&x), &v)
+  if !same(&check, &u) {
+    x = product(&x, &constants.rootMinusOne)
+    check = product(&square(&x), &v)
+    if !same(&check, &u) {
+      return false
+    }
+  }
+
+  // Pick the root whose sign is the opposite of the encoded one, giving the negated point.
+  if parity(&x) == u8.shiftRight(bytes[31], 7) {
+    x = subtract(&zero(), &x)
+  }
+  output.* = Point { x: x, y: y, z: one, t: product(&x, &y) }
+  return true
+}
+
+// The group order L = 2^252 + 27742317777372353535851937790883648493, little-endian.
+fn order() -> [i64; 32] {
+  return [
+    0xED,
+    0xD3,
+    0xF5,
+    0x5C,
+    0x1A,
+    0x63,
+    0x12,
+    0x58,
+    0xD6,
+    0x9C,
+    0xF7,
+    0xA2,
+    0xDE,
+    0xF9,
+    0xDE,
+    0x14,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0x10,
+  ]
+}
+
+// Whether the little-endian `scalar` is below L.
+fn belowOrder(scalar: &[u8; 32]) -> bool {
+  let limit = order()
+  let mut index: usize = 32
+  while index > 0 {
+    index = index - usize.ONE
+    let value = u8.toI64(scalar[index])
+    if value < limit[index] {
+      return true
+    }
+    if value > limit[index] {
+      return false
+    }
+  }
+  return false
+}
+
+// A 64-byte little-endian number modulo L, as TweetNaCl's `modL` computes it.
+fn reduce(wide: &[u8; 64]) -> [u8; 32] {
+  let limit = order()
+  let mut x: [i64; 64] = [0; 64]
+  let mut index = usize.ZERO
+  while index < 64 {
+    x[index] = u8.toI64(wide[index])
+    index = index + usize.ONE
+  }
+  let mut i: usize = 63
+  while i >= 32 {
+    let mut carry: i64 = 0
+    let mut j = i - 32
+    while j < i - 12 {
+      x[j] = x[j] + carry - 16 * x[i] * limit[j - (i - 32)]
+      carry = i64.shiftRight(x[j] + 128, 8)
+      x[j] = x[j] - carry * 256
+      j = j + usize.ONE
+    }
+    x[j] = x[j] + carry
+    x[i] = 0
+    i = i - usize.ONE
+  }
+  let mut carry: i64 = 0
+  index = usize.ZERO
+  while index < 32 {
+    x[index] = x[index] + carry - i64.shiftRight(x[31], 4) * limit[index]
+    carry = i64.shiftRight(x[index], 8)
+    x[index] = i64.bitAnd(x[index], 255)
+    index = index + usize.ONE
+  }
+  index = usize.ZERO
+  while index < 32 {
+    x[index] = x[index] - carry * limit[index]
+    index = index + usize.ONE
+  }
+  let mut result: [u8; 32] = [0; 32]
+  index = usize.ZERO
+  while index < 32 {
+    if index < 31 {
+      x[index + 1] = x[index + 1] + i64.shiftRight(x[index], 8)
+    }
+    result[index] = i64.toU8(i64.bitAnd(x[index], 255))
+    index = index + usize.ONE
+  }
+  return result
+}

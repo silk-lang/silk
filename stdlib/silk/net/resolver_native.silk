@@ -1,0 +1,477 @@
+//! The native provider of the `Resolver` effect, with the `getaddrinfo` function of the system.
+//!
+//! # When to use
+//! Provide [`NativeSystemResolver`] for `Resolver` in a native program when a blocking lookup is
+//! acceptable. Code that resolves uses `silk.net.resolver`, so a test can provide a fake.
+//!
+//! # Details
+//! A host name without a deadline makes one `getaddrinfo` call with the name as written, so names in
+//! the hosts file, such as `localhost`, resolve. The result is copied, and the list of the system is
+//! freed one time, also on errors. Numeric hosts do not call the provider.
+//!
+//! # Errors
+//! `ResolverError` if the host is not found, has no address of the selected family, or the lookup
+//! fails. A host name with a deadline fails with `DeadlineUnsupported`.
+//!
+//! # Gotchas
+//! - A host name with a deadline fails with `DeadlineUnsupported` before the lookup. After
+//!   `getaddrinfo` starts, it cannot be cancelled or limited in time or memory.
+//! - The lookup blocks the thread. It does not let another fiber run.
+//! - [`NativeSystemResolver.make`] fails to compile on targets other than Darwin on aarch64, and
+//!   Linux with GNU libc on x86_64 or aarch64.
+//!
+//! # Examples
+//! ## Use the system resolver
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.system.monotonic_clock { MonotonicClock }
+//! import silk.net.resolver_native { NativeSystemResolver }
+//! import silk.net.address { AddressError, Host, Port }
+//! import silk.option { Option }
+//! import silk.system.monotonic_clock_native { OsMonotonicClock }
+//! import silk.core.result { Result }
+//! import silk.net.resolver { FamilySelection, ResolveRequest, ResolvedEndpoints, Resolver, ResolverError }
+//! import silk.system.system_clock { Instant, SystemClock }
+//!
+//! fn request(name: string, deadline: Option<Instant>) -> Option<ResolveRequest> {
+//!   let host = match Host.parse(name) {
+//!     Result<Host, AddressError>.Success { value } => value
+//!     Result<Host, AddressError>.Failure { error: _ } => {
+//!       return Option<ResolveRequest>.none()
+//!     }
+//!   }
+//!   return match ResolveRequest.make(host, Port.fromU16(443), FamilySelection.Any, 8, move deadline) {
+//!     Result<ResolveRequest, ResolverError>.Success { value } => Option<ResolveRequest>.some(
+//!       move value
+//!     )
+//!     Result<ResolveRequest, ResolverError>.Failure { error: _ } => Option<ResolveRequest>.none()
+//!   }
+//! }
+//!
+//! // Returns the number of endpoints of `name`. It blocks until the system lookup ends.
+//! effect fn countEndpoints(name: string) -> usize
+//!   ! ResolverError | OutOfMemoryError
+//!   ? &mut Resolver | &mut MonotonicClock | &mut Allocator {
+//!   let lookup = match request(name, Option<Instant>.none()) {
+//!     Option.Some { value } => move value
+//!     Option.None => {
+//!       return 0
+//!     }
+//!   }
+//!   let endpoints = run Resolver.resolve(&lookup)
+//!   return ResolvedEndpoints.length(&endpoints)
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let mut resolver = NativeSystemResolver.make()
+//!   let mut clock = OsMonotonicClock.make()
+//!
+//!   // A host name with a deadline fails before the lookup starts.
+//!   let limited = match request("example.com", Option<Instant>.some(SystemClock.make(1, 0))) {
+//!     Option.Some { value } => move value
+//!     Option.None => {
+//!       return 1
+//!     }
+//!   }
+//!   let attempted = run Effect.result(Resolver.resolve(&limited))
+//!     |> Effect.provideMut<Resolver>(&mut resolver)
+//!     |> Effect.provideMut<MonotonicClock>(&mut clock)
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   return match move attempted {
+//!     Result.Success { value: _ } => 1
+//!     Result.Failure { error } => match move error {
+//!       ResolverError.DeadlineUnsupported => 0
+//!       _ => 1
+//!     }
+//!   }
+//! }
+//! ```
+//!
+//! @category Networking
+
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.net.address {DomainHost, Endpoint, IpAddress, Ipv4Address, Ipv6Address, Port}
+import silk.option {Option}
+import silk.core.ownership {Copy, Drop}
+import silk.mem.pointer {Pointer}
+import silk.net.resolver {FamilySelection, NativeResolverOperation, NativeResultReason, ResolveRequest, ResolvedEndpoints, Resolver, ResolverError}
+import silk.core.result {Result}
+import silk.collections.slice {Slice}
+import silk.num.u16
+import silk.num.u32
+import silk.num.usize
+
+extern "C" struct SockAddr {}
+
+extern "C" struct DarwinAddrInfo {
+  flags: i32,
+  family: i32,
+  socketType: i32,
+  protocol: i32,
+  addressLength: u32,
+  canonicalName: ?[*]mut u8,
+  address: ?*mut SockAddr,
+  next: ?*mut DarwinAddrInfo,
+}
+impl Copy for DarwinAddrInfo {}
+unsafe extern "C" fn __error() -> *mut i32
+
+extern "C" struct GnuAddrInfo {
+  flags: i32,
+  family: i32,
+  socketType: i32,
+  protocol: i32,
+  addressLength: u32,
+  address: ?*mut SockAddr,
+  canonicalName: ?[*]mut u8,
+  next: ?*mut GnuAddrInfo,
+}
+impl Copy for GnuAddrInfo {}
+unsafe extern "C" fn __errno_location() -> *mut i32
+
+const IPV4_FAMILY: i32 = 2
+
+fn nativeIpv6Family() -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "darwin" { return 30 } else { return 10 }
+}
+
+fn nativeNumericService() -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "darwin" { return 4096 } else { return 1024 }
+}
+
+fn nativeAgain() -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "darwin" { return 2 } else { return -3 }
+}
+
+fn nativeFamily() -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "darwin" { return 5 } else { return -6 }
+}
+
+fn nativeMemory() -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "darwin" { return 6 } else { return -10 }
+}
+
+fn nativeNoname() -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "darwin" { return 8 } else { return -2 }
+}
+
+fn nativeSystem() -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "darwin" { return 11 } else { return -11 }
+}
+
+unsafe extern "C" fn darwinGetAddrInfo(
+  node: ?[*]const u8,
+  serviceText: ?[*]const u8,
+  hints: *const DarwinAddrInfo,
+  result: *mut ?*mut DarwinAddrInfo,
+) -> i32 as "getaddrinfo" with Intrinsic.foreign(noCapture: ("node", "serviceText", "hints", "result"))
+unsafe extern "C" fn darwinFreeAddrInfo(result: *mut DarwinAddrInfo) -> () as "freeaddrinfo"
+
+unsafe extern "C" fn gnuGetAddrInfo(
+  node: ?[*]const u8,
+  serviceText: ?[*]const u8,
+  hints: *const GnuAddrInfo,
+  result: *mut ?*mut GnuAddrInfo,
+) -> i32 as "getaddrinfo" with Intrinsic.foreign(noCapture: ("node", "serviceText", "hints", "result"))
+unsafe extern "C" fn gnuFreeAddrInfo(result: *mut GnuAddrInfo) -> () as "freeaddrinfo"
+
+const UNSPECIFIED_FAMILY: i32 = 0
+const STREAM_SOCKET: i32 = 1
+const TCP_PROTOCOL: i32 = 6
+
+struct AddrInfoChain { head: ?*mut u8 }
+
+impl Drop for AddrInfoChain {
+  fn drop(self: &mut AddrInfoChain) -> () {
+    let head = Intrinsic.replace(self.head, Pointer.null<u8>())
+    if !Pointer.isNull<u8>(head) {
+      static if Intrinsic.targetOperatingSystem() == "darwin" {
+        let typed = unsafe Intrinsic.pointerReinterpret<?*mut u8, ?*mut DarwinAddrInfo>(head)
+      let present = unsafe Intrinsic.pointerRequalify<?*mut DarwinAddrInfo, *mut DarwinAddrInfo>(typed)
+        unsafe { darwinFreeAddrInfo(present) }
+      } else {
+        let typed = unsafe Intrinsic.pointerReinterpret<?*mut u8, ?*mut GnuAddrInfo>(head)
+      let present = unsafe Intrinsic.pointerRequalify<?*mut GnuAddrInfo, *mut GnuAddrInfo>(typed)
+        unsafe { gnuFreeAddrInfo(present) }
+      }
+    }
+  }
+}
+
+/// The native `Resolver` provider, with the `getaddrinfo` function of the system. It has no state.
+///
+/// # When to use
+/// Provide it for `Resolver` in a native program when a blocking lookup is acceptable. Code that
+/// resolves uses `silk.net.resolver`, so a test can provide a fake.
+///
+/// # Details
+/// A host name without a deadline makes one `getaddrinfo` call with the name as written, so names in
+/// the hosts file, such as `localhost`, resolve. The result is copied, and the list of the system is
+/// freed one time, also on errors. Numeric hosts do not call the provider.
+///
+/// # Gotchas
+/// - A host name with a deadline fails with `DeadlineUnsupported` before the lookup. After
+///   `getaddrinfo` starts, it cannot be cancelled or limited in time or memory.
+/// - The lookup blocks the thread. It does not let another fiber run.
+pub struct NativeSystemResolver {}
+
+impl NativeSystemResolver {
+  /// Returns a resolver. It does no lookup.
+  ///
+  /// # Gotchas
+  /// It fails to compile on targets other than Darwin on aarch64, and Linux with GNU libc on x86_64
+  /// or aarch64.
+  pub fn make() -> NativeSystemResolver {
+    static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArchitecture() == "aarch64" && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+   return NativeSystemResolver {}
+    } else {
+      compileError("NativeSystemResolver requires a supported Darwin or GNU libc profile")
+    }
+  }
+
+  effect fn resolveDomain(
+    self: &mut Self,
+    request: &ResolveRequest,
+    domain: &DomainHost,
+  ) -> ResolvedEndpoints
+  ! ResolverError | OutOfMemoryError
+  ? &mut Allocator {
+    static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArchitecture() == "aarch64" && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+      if ResolveRequest.hasDeadline(request) { fail ResolverError.DeadlineUnsupported }
+
+      let mut node = zeroNode()
+      let source = DomainHost.bytes(domain)
+      let mut index = usize.ZERO
+      while index < source.length {
+        node[index] = source[index]
+        index = index + usize.ONE
+      }
+      // The name goes to `getaddrinfo` as written, so the hosts file and the system's lookup rules
+      // apply: glibc does not match `localhost.` against the `localhost` hosts entry.
+      node[source.length] = 0
+
+      let mut serviceText = zeroService()
+      let port = ResolveRequest.port(request)
+      writePort(Port.value(&port), &mut serviceText)
+
+      let lookup = unsafe lookupAddressInfo(
+      Pointer.fromSlice<u8>(Slice.view<u8>(&node, usize.ZERO, source.length + usize.ONE)),
+      Pointer.fromSlice<u8>(&serviceText),
+      ResolveRequest.family(request),
+    )
+    let status = lookup.status
+    let head = lookup.head
+    if status != 0 { return run rejectStatus(status) }
+      if Pointer.isNull<u8>(head) {
+        fail ResolverError.InvalidNativeResult {
+          reason: NativeResultReason.NullChain,
+          index: usize.ZERO,
+        }
+      }
+
+      let mut owner = AddrInfoChain {head: head}
+      let made = ResolvedEndpoints.make(ResolveRequest.maxResults(request))
+      let mut resolved = match move made {
+        Result<ResolvedEndpoints, ResolverError>.Failure {error} => { fail move error }
+        Result<ResolvedEndpoints, ResolverError>.Success {value} => move value
+      }
+      let mut current = head
+      let mut ordinal = usize.ZERO
+      while !Pointer.isNull<u8>(current) {
+        let entry = unsafe readEntry(current)
+        run admitEntry(&entry, ordinal, request, &mut resolved)
+        current = entry.next
+        ordinal = ordinal + usize.ONE
+      }
+      if ResolvedEndpoints.length(&resolved) == usize.ZERO { fail ResolverError.NoAddress }
+      return move resolved
+
+    } else {
+      compileError("NativeSystemResolver requires a supported Darwin or GNU libc profile")
+    }
+  }
+}
+
+impl Resolver for NativeSystemResolver {
+  resolveDomain: NativeSystemResolver.resolveDomain
+}
+
+fn zeroNode() -> [u8; 255] {
+  return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+}
+
+fn zeroService() -> [u8; 6] { return [0, 0, 0, 0, 0, 0] }
+
+fn writePort(port: u16, output: &mut [u8]) -> () {
+  let mut remaining = port
+  let mut divisor: u16 = 10000
+  let mut started = false
+  let mut cursor = usize.ZERO
+  while divisor > 0 {
+    let digit = remaining / divisor
+    if digit != 0 || started || divisor == 1 {
+      output[cursor] = 48 + u16.toU8(digit)
+      cursor = cursor + usize.ONE
+      started = true
+    }
+    remaining = remaining % divisor
+    divisor = divisor / 10
+  }
+  output[cursor] = 0
+}
+
+fn darwinHints(family: FamilySelection) -> DarwinAddrInfo {
+  let selected = match family {
+    FamilySelection.Any => UNSPECIFIED_FAMILY
+    FamilySelection.V4 => IPV4_FAMILY
+    FamilySelection.V6 => nativeIpv6Family()
+  }
+  return DarwinAddrInfo {
+    flags: nativeNumericService(),
+    family: selected,
+    socketType: STREAM_SOCKET,
+    protocol: TCP_PROTOCOL,
+    addressLength: 0,
+    canonicalName: unsafe Intrinsic.pointerRequalify<?*mut u8, ?[*]mut u8>(Pointer.null<u8>()),
+    address: Pointer.null<SockAddr>(),
+    next: Pointer.null<DarwinAddrInfo>(),
+  }
+}
+
+fn gnuHints(family: FamilySelection) -> GnuAddrInfo {
+  let selected = match family {
+    FamilySelection.Any => UNSPECIFIED_FAMILY
+    FamilySelection.V4 => IPV4_FAMILY
+    FamilySelection.V6 => nativeIpv6Family()
+  }
+  return GnuAddrInfo {
+    flags: nativeNumericService(),
+    family: selected,
+    socketType: STREAM_SOCKET,
+    protocol: TCP_PROTOCOL,
+    addressLength: 0,
+    canonicalName: unsafe Intrinsic.pointerRequalify<?*mut u8, ?[*]mut u8>(Pointer.null<u8>()),
+    address: Pointer.null<SockAddr>(),
+    next: Pointer.null<GnuAddrInfo>(),
+  }
+}
+
+struct AddressInfoLookup { status: i32, head: ?*mut u8 }
+struct AddrInfo { family: i32, addressLength: u32, address: ?*mut SockAddr, next: ?*mut u8 }
+impl Copy for AddrInfo {}
+unsafe fn lookupAddressInfo(node: ?[*]const u8, serviceText: ?[*]const u8, family: FamilySelection) -> AddressInfoLookup {
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    let hints = darwinHints(family)
+    let mut head = Pointer.null<DarwinAddrInfo>()
+    let status = unsafe darwinGetAddrInfo(node, serviceText, Pointer.fromRef<DarwinAddrInfo>(&hints), Pointer.fromMutRef<?*mut DarwinAddrInfo>(&mut head))
+    return AddressInfoLookup {status: status, head: unsafe Intrinsic.pointerReinterpret<?*mut DarwinAddrInfo, ?*mut u8>(head)}
+  } else {
+    let hints = gnuHints(family)
+    let mut head = Pointer.null<GnuAddrInfo>()
+    let status = unsafe gnuGetAddrInfo(node, serviceText, Pointer.fromRef<GnuAddrInfo>(&hints), Pointer.fromMutRef<?*mut GnuAddrInfo>(&mut head))
+    return AddressInfoLookup {status: status, head: unsafe Intrinsic.pointerReinterpret<?*mut GnuAddrInfo, ?*mut u8>(head)}
+  }
+}
+unsafe fn readEntry(pointer: ?*mut u8) -> AddrInfo {
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    let typed = unsafe Intrinsic.pointerReinterpret<?*mut u8, ?*mut DarwinAddrInfo>(pointer)
+    let present = unsafe Intrinsic.pointerRequalify<?*mut DarwinAddrInfo, *const DarwinAddrInfo>(typed)
+    let native = unsafe Pointer.read<DarwinAddrInfo>(present)
+    return AddrInfo {family: native.family, addressLength: native.addressLength, address: native.address, next: unsafe Intrinsic.pointerReinterpret<?*mut DarwinAddrInfo, ?*mut u8>(native.next)}
+  } else {
+    let typed = unsafe Intrinsic.pointerReinterpret<?*mut u8, ?*mut GnuAddrInfo>(pointer)
+    let present = unsafe Intrinsic.pointerRequalify<?*mut GnuAddrInfo, *const GnuAddrInfo>(typed)
+    let native = unsafe Pointer.read<GnuAddrInfo>(present)
+    return AddrInfo {family: native.family, addressLength: native.addressLength, address: native.address, next: unsafe Intrinsic.pointerReinterpret<?*mut GnuAddrInfo, ?*mut u8>(native.next)}
+  }
+}
+unsafe fn currentError() -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    return unsafe Pointer.read<i32>(unsafe __error())
+  } else {
+    return unsafe Pointer.read<i32>(unsafe __errno_location())
+  }
+}
+
+
+effect fn rejectStatus(status: i32) -> never ! ResolverError {
+  if status == nativeNoname() { fail ResolverError.NameNotFound }
+  if status == nativeAgain() { fail ResolverError.TemporaryFailure }
+  if status == nativeFamily() { fail ResolverError.FamilyUnsupported }
+  if status == nativeMemory() { fail ResolverError.SystemResources }
+  let mut errno = Option<i32>.none()
+  if status == nativeSystem() { errno = Option<i32>.some(unsafe currentError()) }
+  fail ResolverError.NativeFailure {
+    operation: NativeResolverOperation.GetAddrInfo,
+    eai: status,
+    errno: move errno,
+  }
+}
+
+effect fn admitEntry(
+  entry: &AddrInfo,
+  ordinal: usize,
+  request: &ResolveRequest,
+  output: &mut ResolvedEndpoints,
+) -> ()
+! ResolverError | OutOfMemoryError
+? &mut Allocator {
+  if entry.family != IPV4_FAMILY && entry.family != nativeIpv6Family() {
+    fail ResolverError.InvalidNativeResult {
+      reason: NativeResultReason.UnknownFamily,
+      index: ordinal,
+    }
+  }
+  if Pointer.isNull<SockAddr>(entry.address) {
+    fail ResolverError.InvalidNativeResult {
+      reason: NativeResultReason.NullAddress,
+      index: ordinal,
+    }
+  }
+  let mut needed: usize = 16
+  if entry.family == nativeIpv6Family() { needed = 28 }
+  if u32.toUsize(entry.addressLength) < needed {
+    fail ResolverError.InvalidNativeResult {
+      reason: NativeResultReason.ShortAddress,
+      index: ordinal,
+    }
+  }
+  let selection = ResolveRequest.family(request)
+  if entry.family == IPV4_FAMILY && selection == FamilySelection.V6 { return () }
+  if entry.family == nativeIpv6Family() && selection == FamilySelection.V4 { return () }
+  let bytes = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(
+    unsafe Pointer.bytes<SockAddr>(entry.address),
+  )
+  if entry.family == IPV4_FAMILY {
+    let octets = [
+      unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(bytes, 4)),
+      unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(bytes, 5)),
+      unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(bytes, 6)),
+      unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(bytes, 7)),
+    ]
+    let admitted = run ResolvedEndpoints.admit(
+      move output,
+      Endpoint.make(
+        IpAddress.V4 {value: Ipv4Address.fromOctets(move octets)},
+        ResolveRequest.port(request),
+      ),
+    )
+  } else {
+    let mut octets: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let mut index = usize.ZERO
+    while index < 16 {
+      octets[index] = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(bytes, 8 + index))
+      index = index + usize.ONE
+    }
+    let admitted = run ResolvedEndpoints.admit(
+      move output,
+      Endpoint.make(
+        IpAddress.V6 {value: Ipv6Address.fromOctets(move octets)},
+        ResolveRequest.port(request),
+      ),
+    )
+  }
+  return ()
+}

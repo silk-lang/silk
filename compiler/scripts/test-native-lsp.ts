@@ -440,7 +440,7 @@ const program = Effect.gen(function* () {
   })
 
   // An import of a name its module lacks is reported on the import, as `silk check` reports it.
-  yield* change(session, uri, 9, 'import silk.list { Nope }\n' + fixed)
+  yield* change(session, uri, 9, 'import silk.collections.list { Nope }\n' + fixed)
   const missing = yield* diagnosticsFor(session, uri, 9, [])
   assert.deepEqual(
     missing.diagnostics.map(({ range, code }) => ({ line: range.start.line, code })),
@@ -562,13 +562,13 @@ const program = Effect.gen(function* () {
     ['SEM0015'],
     'a closed member keeps its saved text',
   )
-  yield* change(members, store, 3, 'import silk.list { L }\n' + stored)
+  yield* change(members, store, 3, 'import silk.collections.list { L }\n' + stored)
   yield* diagnosticsFor(members, store, 3, [])
   yield* members.send({
     jsonrpc: '2.0',
     id: 2,
     method: 'textDocument/completion',
-    params: { textDocument: { uri: store }, position: { line: 0, character: 20 } },
+    params: { textDocument: { uri: store }, position: { line: 0, character: 32 } },
   })
   const offered = (yield* notificationsUntil(members, 2)).response
   const labels = (offered['result'] as { items: Array<{ label: string }> }).items.map(({ label }) => label)

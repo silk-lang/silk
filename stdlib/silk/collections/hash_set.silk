@@ -1,0 +1,910 @@
+//! Hash sets that own their elements, with deterministic seeded hashing.
+//!
+//! # When to use
+//! Use [`HashSet`] to test membership fast, or to keep one copy of each value. The element type
+//! must implement `silk.collections.hash.HashKey`. Use `silk.collections.list.List` when order or duplicate values matter.
+//!
+//! # Details
+//! [`HashSet.make`] does not allocate. The first insert allocates eight buckets.
+//! [`HashSet.makeWithCapacity`] and [`HashSet.reserve`] allocate room for a known number of
+//! elements in one step. [`HashSet.clear`] drops the elements and keeps the buckets for reuse, and
+//! [`HashSet.clearAndFree`] also releases them. The set rebuilds its table before more than three
+//! quarters of the buckets are in use. A bucket stays in use after a removal, until the next
+//! rebuild. The rebuild doubles the number of buckets if the elements fill more than half of them.
+//! Otherwise it keeps the number and only clears the removed buckets, so a set that inserts and
+//! removes forever keeps a bucket count in proportion to its largest length. A failed growth leaves
+//! the elements, the length, and the bucket count unchanged.
+//!
+//! The same seed and the same operations give the same bucket order on each target. To visit each
+//! element, scan the buckets from 0 to [`HashSet.bucketCount`], test [`HashSet.occupiedAt`], and
+//! read [`HashSet.elementAt`]. This order is the bucket order, not the order of insertion.
+//!
+//! # Gotchas
+//! Each lookup consumes its probe value. If an equal element is already in the set, an insert keeps
+//! the old element and drops the new one. [`HashSet.elementAt`] copies, so the element type must be
+//! `Copy`. [`HashSet.contains`] and [`HashSet.indexOf`] work for elements that are not `Copy`.
+//!
+//! # Examples
+//! ## Count the different values in a list
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.collections.hash { Hash, Word }
+//! import silk.collections.hash_set { HashSet }
+//!
+//! pub effect fn main() -> i32
+//!   ! OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let mut seen = HashSet<Word>.make(Hash.seed(17))
+//!   let values: [u64; 5] = [3, 1, 3, 2, 1]
+//!   let mut index: usize = 0
+//!   while index < 5 {
+//!     let duplicate = run HashSet<Word>.insert(&mut seen, Hash.word(values[index]))
+//!       |> Effect.provideMut<Allocator>(&mut allocator)
+//!     index = index + 1
+//!   }
+//!   if HashSet<Word>.length(&seen) != 3 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Collections
+
+// A hashed set over the allocation substrate, on the same table `hash_map.silk` describes: open
+// addressing with linear probing over an element buffer and a state buffer of one width, each
+// element carrying the hash it was placed under, and every bucket index reduced in u64 arithmetic
+// before it narrows to `usize`.
+//
+// The table is written out again rather than reached for, because a bound is not carried into a
+// nested generic call: a `T: HashKey` body cannot hand its own `T` to a `K: HashKey` function, so a
+// set cannot be a map whose values are empty. What the two share is the shape, not the code.
+
+import silk.core.bool
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.allocator { OutOfMemoryError }
+import silk.collections.hash { HashKey, HashSeed }
+import silk.layout { Layout }
+import silk.layout { LayoutOverflow }
+import silk.option { Option }
+import silk.core.ownership { Copy, Drop }
+import silk.mem.raw_buffer { RawBuffer }
+import silk.simd.simd
+import silk.simd.mask16
+import silk.simd.u8x16
+import silk.mem.slot { Slot }
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+
+/// A slot is vacant, and no element was ever placed here.
+const VACANT: u8 = 0
+
+/// A slot holds an initialized element when its state byte is at least `OCCUPIED`. The low seven bits
+/// are the top seven bits of its hash, so a probe can skip a slot without reading the element.
+const OCCUPIED: u8 = 128
+
+/// A slot held an element that was removed. Probing continues through it.
+const REMOVED: u8 = 2
+
+/// The width a set takes when it first allocates.
+const INITIAL_WIDTH: usize = 8
+
+/// An internal part of the storage of [`HashSet`]. User code does not use it.
+pub struct Member<T> {
+  hash: u64,
+  value: T,
+}
+
+impl<T: Copy> Copy for Member<T> {}
+
+/// An internal part of the storage of [`HashSet`]. User code does not use it.
+pub struct Unseeded<T> {
+  anchor: [Member<T>; 0],
+}
+
+/// An internal part of the storage of [`HashSet`]. User code does not use it.
+pub struct Slots<T> {
+  members: Intrinsic.RawBuffer<Member<T>>,
+  states: Intrinsic.RawBuffer<u8>,
+}
+
+/// A hash set that owns unique elements, with deterministic seeded hashing.
+///
+/// # When to use
+///
+/// Use it to test membership fast, or to keep one copy of each value. The element type must
+/// implement `silk.collections.hash.HashKey`. Use `silk.collections.list.List` when order or duplicate values matter.
+///
+/// # Details
+///
+/// [`HashSet.make`] does not allocate. The first insert allocates eight buckets.
+/// [`HashSet.makeWithCapacity`] and [`HashSet.reserve`] allocate room for a known number of
+/// elements in one step. [`HashSet.clear`] drops the elements and keeps the buckets for reuse, and
+/// [`HashSet.clearAndFree`] also releases them. The set rebuilds its table before more than three
+/// quarters of the buckets are in use. A bucket stays in use after a removal, until the next
+/// rebuild. The rebuild doubles the number of buckets if the elements fill more than half of them.
+/// Otherwise it keeps the number and only clears the removed buckets, so a set that inserts and
+/// removes forever keeps a bucket count in proportion to its largest length. A failed growth leaves
+/// the elements, the length, and the bucket count unchanged.
+///
+/// To visit each element, scan the buckets from 0 to [`HashSet.bucketCount`], test
+/// [`HashSet.occupiedAt`], and read [`HashSet.elementAt`]. This order is the bucket order, not the
+/// order of insertion. The same seed and the same operations give the same bucket order on each
+/// target.
+///
+/// Each element is unique under `HashKey.equals`. An insert of an element that is already present
+/// keeps the old element. The set uses one seed for all of its hashes. Dropping the set drops each
+/// element and then releases the storage.
+///
+/// # Gotchas
+///
+/// Each lookup consumes its probe value. [`HashSet.elementAt`] copies, so the element type must be
+/// `Copy`. [`HashSet.contains`] and [`HashSet.indexOf`] work for elements that are not `Copy`.
+pub struct HashSet<T> {
+  storage: Unseeded<T> | Slots<T>,
+  seed: HashSeed,
+  count: usize,
+  used: usize,
+  capacity: usize,
+}
+
+impl<T> HashSet<T> {
+  /// Returns an empty set that uses `seed` for each hash. This function does not allocate.
+  ///
+  /// # Details
+  ///
+  /// The seed and the sequence of operations decide the bucket order.
+  pub fn make(seed: HashSeed) -> HashSet<T> {
+    return HashSet<T> {
+      storage: Unseeded<T> { anchor: [] },
+      seed: move seed,
+      count: usize.ZERO,
+      used: usize.ZERO,
+      capacity: usize.ZERO,
+    }
+  }
+
+  /// Returns an empty set that uses `seed` for each hash, with buckets for at least `capacity`
+  /// elements before the first rebuild.
+  ///
+  /// # When to use
+  ///
+  /// Use `makeWithCapacity` when the number of elements is known or can be estimated before the
+  /// inserts, so that the table allocates once instead of growing step by step.
+  ///
+  /// # Details
+  ///
+  /// The length is 0. Inserts of up to `capacity` elements do not allocate. The bucket count is the
+  /// smallest of 8, 16, 32, and so on that keeps `capacity` elements under three quarters of the
+  /// buckets. A `capacity` of 0 does not allocate and gives the same set as [`HashSet.make`]. The
+  /// seed and the sequence of operations decide the bucket order.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the bucket count overflows `usize`, or the `Allocator` cannot supply
+  ///   the storage.
+  pub effect fn makeWithCapacity(seed: HashSeed, capacity: usize) -> HashSet<T>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+    let mut made = HashSet<T>.make(move seed)
+    run HashSet<T>.reserve(&mut made, capacity)
+    return move made
+  }
+
+  /// Returns the number of elements in the set.
+  pub fn length(self: &Self) -> usize {
+    return self.count
+  }
+
+  /// Returns the number of buckets. Each bucket index from 0 to this value minus 1 is valid for
+  /// [`HashSet.occupiedAt`].
+  pub fn bucketCount(self: &Self) -> usize {
+    return self.capacity
+  }
+
+  /// Returns `true` if the bucket at `index` holds an element. Returns `false` for an index out of
+  /// range.
+  pub fn occupiedAt(self: &Self, index: usize) -> bool {
+    if self.capacity <= index {
+      return false
+    }
+    return stateAt<T>(self, index) >= OCCUPIED
+  }
+
+  /// Adds `value` to the set. Returns `true` if the set already held an equal element, or `false`
+  /// if `value` is new.
+  ///
+  /// # Details
+  ///
+  /// If an equal element is already present, the set does not change and drops `value`. The set
+  /// keeps the element that it already held.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the table must grow and the `Allocator` cannot supply the storage. The
+  ///   set does not change.
+  pub effect<'env> fn insert<T: HashKey + 'env, 'env>(
+    self: &mut Self,
+    value: T
+  ) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let hashed = HashKey.hash(&value, &self.seed)
+    let tag = tagOf(hashed)
+    if usize.ZERO < self.capacity {
+      let storage = Intrinsic.replace(self.storage, Unseeded<T> { anchor: [] })
+      let mut owned = openStorage<T>(move storage)
+      let mut found = false
+      let mut index = bucketOf(hashed, self.capacity)
+      let mut scanned = usize.ZERO
+      // The probe keeps `index` below `capacity`. `states` holds one initialized byte per slot, and
+      // a slot whose state byte is occupied holds an initialized member.
+      unsafe {
+        while scanned < self.capacity {
+          let seen = RawBuffer.view<u8>(&owned.states, usize.ZERO, self.capacity)
+          let skip = skipToCandidate(seen, index, self.capacity - scanned, tag)
+          scanned = scanned + skip
+          index = wrapIndex(index + skip, self.capacity)
+          if scanned == self.capacity {
+            break
+          }
+          let state = seen[index]
+          if state == VACANT {
+            break
+          }
+          if state == tag {
+            let held = RawBuffer.view<Member<T>>(&owned.members, index, usize.ONE)
+            if held[usize.ZERO].hash == hashed {
+              if HashKey.equals(&held[usize.ZERO].value, &value) {
+                found = true
+                break
+              }
+            }
+          }
+          index = advance(index, self.capacity)
+          scanned = scanned + usize.ONE
+        }
+      }
+      self.storage = move owned
+      if found {
+        let released = release<T>(move value)
+        return true
+      }
+    }
+    // The element is absent. Growth is allocated before the storage is opened, so a failure here
+    // never observes the set with its buffers taken out.
+    if needsRoom(self.used, self.capacity) {
+      let next = rebuiltWidth(self.count, self.capacity)
+      let fresh = run allocateSlots<T>(next)
+      let storage = Intrinsic.replace(self.storage, Unseeded<T> { anchor: [] })
+      self.storage = migrate<T>(move storage, self.capacity, move fresh, next)
+      self.capacity = next
+      self.used = self.count
+    }
+    let storage = Intrinsic.replace(self.storage, Unseeded<T> { anchor: [] })
+    let mut owned = openStorage<T>(move storage)
+    let mut index = bucketOf(hashed, self.capacity)
+    let mut searching = true
+    while searching {
+      // A table's `states` holds one initialized byte for each of its `capacity` slots.
+      let seen = unsafe RawBuffer.view<u8>(&owned.states, usize.ZERO, self.capacity)
+      if seen[index] >= OCCUPIED {
+        index = advance(index, self.capacity)
+      } else {
+        searching = false
+      }
+    }
+    let fresh = vacantAt<T>(&owned, index)
+    let written = writeMember<T>(&mut owned, index, Member<T> { hash: hashed, value: move value })
+    self.storage = move owned
+    self.count = self.count + usize.ONE
+    if fresh {
+      self.used = self.used + usize.ONE
+    }
+    return false
+  }
+
+  /// Returns `true` if the set holds an element equal to `value`.
+  ///
+  /// # Details
+  ///
+  /// This function consumes `value`. It does not change the set.
+  pub fn contains<T: HashKey>(self: &Self, value: T) -> bool {
+    if self.capacity == usize.ZERO {
+      return false
+    }
+    let hashed = HashKey.hash(&value, &self.seed)
+    let tag = tagOf(hashed)
+    let mut index = bucketOf(hashed, self.capacity)
+    let mut scanned = usize.ZERO
+    let seen = statesOf<T>(self)
+    while scanned < self.capacity {
+      let skip = skipToCandidate(seen, index, self.capacity - scanned, tag)
+      scanned = scanned + skip
+      index = wrapIndex(index + skip, self.capacity)
+      if scanned == self.capacity {
+        break
+      }
+      let state = seen[index]
+      if state == VACANT {
+        return false
+      }
+      if state == tag {
+        let held = memberAt<T>(self, index)
+        if held[usize.ZERO].hash == hashed {
+          if HashKey.equals(&held[usize.ZERO].value, &value) {
+            return true
+          }
+        }
+      }
+      index = advance(index, self.capacity)
+      scanned = scanned + usize.ONE
+    }
+    return false
+  }
+
+  /// Returns the bucket index of the element equal to `value`, or `None` if there is no such
+  /// element.
+  ///
+  /// # When to use
+  ///
+  /// Use `indexOf` to find an element without a copy or a move, for example when the element type
+  /// is not `Copy`.
+  ///
+  /// # Details
+  ///
+  /// This function consumes `value`. It does not change the set.
+  pub fn indexOf<T: HashKey>(self: &Self, value: T) -> Option<usize> {
+    if self.capacity == usize.ZERO {
+      return Option<usize>.none()
+    }
+    let hashed = HashKey.hash(&value, &self.seed)
+    let tag = tagOf(hashed)
+    let mut index = bucketOf(hashed, self.capacity)
+    let mut scanned = usize.ZERO
+    let seen = statesOf<T>(self)
+    while scanned < self.capacity {
+      let skip = skipToCandidate(seen, index, self.capacity - scanned, tag)
+      scanned = scanned + skip
+      index = wrapIndex(index + skip, self.capacity)
+      if scanned == self.capacity {
+        break
+      }
+      let state = seen[index]
+      if state == VACANT {
+        return Option<usize>.none()
+      }
+      if state == tag {
+        let held = memberAt<T>(self, index)
+        if held[usize.ZERO].hash == hashed {
+          if HashKey.equals(&held[usize.ZERO].value, &value) {
+            return Option<usize>.some(index)
+          }
+        }
+      }
+      index = advance(index, self.capacity)
+      scanned = scanned + usize.ONE
+    }
+    return Option<usize>.none()
+  }
+
+  /// Removes the element equal to `value` and returns the stored element. Returns `None` if there
+  /// is no such element.
+  ///
+  /// # Details
+  ///
+  /// The caller owns the returned element. This function consumes `value`. It does not allocate.
+  pub fn remove<T: HashKey>(self: &mut Self, value: T) -> Option<T> {
+    if self.capacity == usize.ZERO {
+      return Option<T>.none()
+    }
+    let hashed = HashKey.hash(&value, &self.seed)
+    let tag = tagOf(hashed)
+    let storage = Intrinsic.replace(self.storage, Unseeded<T> { anchor: [] })
+    let mut owned = openStorage<T>(move storage)
+    let mut found = self.capacity
+    let mut index = bucketOf(hashed, self.capacity)
+    let mut scanned = usize.ZERO
+    // The probe keeps `index` below `capacity`. `states` holds one initialized byte per slot, and a
+    // slot whose state byte is occupied holds an initialized member.
+    unsafe {
+      while scanned < self.capacity {
+        let seen = RawBuffer.view<u8>(&owned.states, usize.ZERO, self.capacity)
+        let skip = skipToCandidate(seen, index, self.capacity - scanned, tag)
+        scanned = scanned + skip
+        index = wrapIndex(index + skip, self.capacity)
+        if scanned == self.capacity {
+          break
+        }
+        let state = seen[index]
+        if state == VACANT {
+          break
+        }
+        if state == tag {
+          let held = RawBuffer.view<Member<T>>(&owned.members, index, usize.ONE)
+          if held[usize.ZERO].hash == hashed {
+            if HashKey.equals(&held[usize.ZERO].value, &value) {
+              found = index
+              break
+            }
+          }
+        }
+        index = advance(index, self.capacity)
+        scanned = scanned + usize.ONE
+      }
+    }
+    if self.capacity <= found {
+      self.storage = move owned
+      return Option<T>.none()
+    }
+    let carried = evict<T>(&mut owned, found)
+    let marked = markRemoved<T>(&mut owned, found)
+    self.storage = move owned
+    self.count = self.count - usize.ONE
+    return Option<T>.some(move carried)
+  }
+
+  /// Returns a copy of the element in the bucket at `index`.
+  ///
+  /// # When to use
+  ///
+  /// Use `elementAt` with [`HashSet.occupiedAt`] to visit each element in bucket order.
+  ///
+  /// # Gotchas
+  ///
+  /// The element type must be `Copy`. If `index` is out of range or the bucket is empty, the
+  /// program traps.
+  pub fn elementAt<T: Copy>(self: &Self, index: usize) -> T {
+    if !HashSet<T>.occupiedAt(self, index) {
+      Intrinsic.trap("HashSet.elementAt: the bucket is out of range or empty")
+    }
+    return keep<T>(readMember<T>(self, index))
+  }
+
+  /// Makes sure that at least `additional` more elements fit before the next rebuild.
+  ///
+  /// # When to use
+  ///
+  /// Use `reserve` before a run of inserts whose count is known, so that the table grows at most
+  /// once.
+  ///
+  /// # Details
+  ///
+  /// If the buckets already hold `additional` more elements under three quarters of the bucket
+  /// count, this function does nothing. Otherwise, it rebuilds the table once, with the smallest
+  /// bucket count, doubling from the current one or from 8, that holds the length plus `additional`
+  /// elements. The rebuild also reclaims the buckets of removed elements. The length does not
+  /// change. An
+  /// `additional` of 0 does nothing.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the length plus `additional` overflows `usize`, the bucket count
+  ///   overflows `usize`, or the `Allocator` cannot supply the storage. The set does not change.
+  pub effect fn reserve(self: &mut Self, additional: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    if additional == usize.ZERO {
+      return ()
+    }
+    let wanted = match move usize.checkedAdd(self.used, additional) {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => run Allocator.outOfMemory()
+    }
+    if holds(self.capacity, wanted) {
+      return ()
+    }
+    let entries = match move usize.checkedAdd(self.count, additional) {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => run Allocator.outOfMemory()
+    }
+    let mut next = self.capacity
+    if next == usize.ZERO {
+      next = INITIAL_WIDTH
+    }
+    while !holds(next, entries) {
+      if usize.MAX - next < next {
+        return run Allocator.outOfMemory()
+      }
+      next = next + next
+    }
+    let fresh = run allocateSlots<T>(next)
+    let storage = Intrinsic.replace(self.storage, Unseeded<T> { anchor: [] })
+    self.storage = migrate<T>(move storage, self.capacity, move fresh, next)
+    self.capacity = next
+    self.used = self.count
+    return ()
+  }
+
+  /// Drops every element and sets the length to 0. The bucket count does not change.
+  ///
+  /// # When to use
+  ///
+  /// Use `clear` to reuse a set, such as one filled again on each pass of a loop: later inserts up
+  /// to the old size do not allocate. Use [`HashSet.clearAndFree`] to also release the storage.
+  ///
+  /// # Details
+  ///
+  /// The buckets of removed elements are reclaimed too. This function does not allocate.
+  pub fn clear(self: &mut Self) -> () {
+    if self.capacity == usize.ZERO {
+      return ()
+    }
+    let storage = Intrinsic.replace(self.storage, Unseeded<T> { anchor: [] })
+    let mut owned = openStorage<T>(move storage)
+    let emptied = emptyTable<T>(&mut owned, self.capacity)
+    self.storage = move owned
+    self.count = usize.ZERO
+    self.used = usize.ZERO
+    return ()
+  }
+
+  /// Drops every element and releases the storage. The length and the bucket count become 0.
+  ///
+  /// # When to use
+  ///
+  /// Use `clearAndFree` when the set stays alive but its storage is no longer needed. Use
+  /// [`HashSet.clear`] to keep the buckets for reuse.
+  ///
+  /// # Details
+  ///
+  /// This function does not allocate and does not need an `Allocator`. The next insert allocates
+  /// eight buckets again, as on a set from [`HashSet.make`]. The seed does not change.
+  pub fn clearAndFree(self: &mut Self) -> () {
+    let storage = Intrinsic.replace(self.storage, Unseeded<T> { anchor: [] })
+    let width = Intrinsic.replace(self.capacity, usize.ZERO)
+    let emptied = Intrinsic.replace(self.count, usize.ZERO)
+    let reclaimed = Intrinsic.replace(self.used, usize.ZERO)
+    return match move storage {
+      Unseeded<T> nothing => ()
+      Slots<T> held => releaseSlots<T>(move held, width)
+    }
+  }
+}
+
+// Diverges on the arms the surrounding logic has already proven impossible.
+fn absurd<T>() -> T {
+  return Intrinsic.trap("HashSet: an internal state the surrounding logic ruled out was reached")
+}
+
+fn stateAt<T>(self: &HashSet<T>, index: usize) -> u8 {
+  return match &self.storage {
+    Unseeded<T> nothing => VACANT
+    // Every caller passes an index below the table's capacity; state bytes are always initialized.
+    Slots<T> { members, states } => firstByte(unsafe RawBuffer.view<u8>(&states, index, usize.ONE))
+  }
+}
+
+fn firstByte(seen: &[u8]) -> u8 {
+  return seen[usize.ZERO]
+}
+
+fn memberAt<T>(self: &HashSet<T>, index: usize) -> &[Member<T>] {
+  return match &self.storage {
+    Unseeded<T> { anchor } => emptySlice<T>(&anchor)
+    // Every caller passes an index below the capacity whose state byte is occupied.
+    Slots<T> { members, states } => unsafe RawBuffer.view<Member<T>>(&members, index, usize.ONE)
+  }
+}
+
+fn emptySlice<T>(anchor: &[Member<T>]) -> &[Member<T>] {
+  return anchor
+}
+
+/// Reduces a hash to a bucket index in u64 arithmetic, so the index does not depend on the width of
+/// `usize` and one seed therefore fixes one order on every supported target.
+fn bucketOf(hashed: u64, width: usize) -> usize {
+  return u64.toUsize(u64.remainder(hashed, usize.toU64(width)))
+}
+
+fn advance(index: usize, width: usize) -> usize {
+  let next = index + usize.ONE
+  if next == width {
+    return usize.ZERO
+  }
+  return next
+}
+
+impl<T> Drop for HashSet<T> {
+  fn drop(self: &mut HashSet<T>) -> () {
+    return HashSet<T>.clearAndFree(move self)
+  }
+}
+
+// Releases every occupied element exactly once and then both buffers, so a set dropped while
+// non-empty destroys what it still owns rather than leaking it.
+fn releaseSlots<T>(held: Slots<T>, width: usize) -> () {
+  let mut owned = move held
+  unsafe {
+    let mut index = usize.ZERO
+    while index < width {
+      let seen = RawBuffer.view<u8>(&owned.states, usize.ZERO, width)
+      if seen[index] >= OCCUPIED {
+        let selected = RawBuffer.slot(&mut owned.members, index)
+        let cleared = Slot.dropValue(move selected)
+      }
+      index = index + usize.ONE
+    }
+    drop owned
+  }
+  return ()
+}
+
+// Drops every occupied element in place and marks every bucket vacant, keeping both buffers.
+fn emptyTable<T>(owned: &mut Slots<T>, width: usize) -> () {
+  unsafe {
+    let mut index = usize.ZERO
+    while index < width {
+      let seen = RawBuffer.view<u8>(&owned.states, usize.ZERO, width)
+      if seen[index] >= OCCUPIED {
+        let selected = RawBuffer.slot(&mut owned.members, index)
+        let cleared = Slot.dropValue(move selected)
+      }
+      index = index + usize.ONE
+    }
+  }
+  RawBuffer.fill(&mut owned.states, usize.ZERO, width, VACANT)
+  return ()
+}
+
+// Reports whether `width` buckets hold `used` buckets in use without a rebuild: the insert that
+// brings the table to `used` passes the three-quarter test in `needsRoom`.
+fn holds(width: usize, used: usize) -> bool {
+  if width == usize.ZERO {
+    return false
+  }
+  let quarter = width / (usize.ONE + usize.ONE + usize.ONE + usize.ONE)
+  return used <= width - quarter
+}
+
+fn openStorage<T>(storage: Unseeded<T> | Slots<T>) -> Slots<T> {
+  return match move storage {
+    Unseeded<T> nothing => absurd<Slots<T>>()
+    Slots<T> held => move held
+  }
+}
+
+effect fn overflowed() -> Layout ! OutOfMemoryError {
+  return run Allocator.outOfMemory()
+}
+
+// Both buffers exist before either is installed, so an allocation that fails releases the one
+// already taken and leaves the caller's set exactly as it was.
+effect fn allocateSlots<T>(count: usize) -> Slots<T> ! OutOfMemoryError ? &mut Allocator {
+  let states = run vacantStates(count)
+  let members = run memberStorage<T>(count)
+  return Slots<T> { members: move members, states: move states }
+}
+
+effect fn vacantStates(count: usize) -> Intrinsic.RawBuffer<u8> ! OutOfMemoryError ? &mut Allocator {
+  let element = Layout.of<u8>()
+  let plan = Layout.repeat(move element, count)
+  let layout = match move plan {
+    Layout ready => move ready
+    LayoutOverflow overflow => run overflowed()
+  }
+  let recipe = Allocator.allocate(move layout)
+  let allocation = run recipe
+  return markVacant(move allocation, count)
+}
+
+fn markVacant(allocation: Intrinsic.Allocation, count: usize) -> Intrinsic.RawBuffer<u8> {
+  unsafe {
+    let mut made = RawBuffer.from<u8>(move allocation, count)
+    let mut index = usize.ZERO
+    while index < count {
+      let selected = RawBuffer.slot(&mut made, index)
+      let written = Slot.write<u8>(move selected, VACANT)
+      index = index + usize.ONE
+    }
+    return move made
+  }
+  return absurd<Intrinsic.RawBuffer<u8>>()
+}
+
+effect fn memberStorage<T>(count: usize) -> Intrinsic.RawBuffer<Member<T>> ! OutOfMemoryError ? &mut Allocator {
+  let element = Layout.of<Member<T>>()
+  let plan = Layout.repeat(move element, count)
+  let layout = match move plan {
+    Layout ready => move ready
+    LayoutOverflow overflow => run overflowed()
+  }
+  let recipe = Allocator.allocate(move layout)
+  let allocation = run recipe
+  return adopt<T>(move allocation, count)
+}
+
+fn adopt<T>(allocation: Intrinsic.Allocation, count: usize) -> Intrinsic.RawBuffer<Member<T>> {
+  unsafe {
+    return RawBuffer.from<Member<T>>(move allocation, count)
+  }
+  return absurd<Intrinsic.RawBuffer<Member<T>>>()
+}
+
+/// Reports whether one more element would take the set past three quarters of its buckets.
+fn needsRoom(used: usize, width: usize) -> bool {
+  if width == usize.ZERO {
+    return true
+  }
+  let quarter = width / (usize.ONE + usize.ONE + usize.ONE + usize.ONE)
+  return width - quarter < used + usize.ONE
+}
+
+// The width of the table that replaces a full one. When the entries fill at most half of the
+// buckets, removed marks are what filled it, so the rebuild keeps the width and only drops those
+// marks. Otherwise the width doubles. A map that inserts and removes keys forever therefore keeps
+// a width in proportion to its largest number of entries.
+fn rebuiltWidth(count: usize, width: usize) -> usize {
+  if width == usize.ZERO {
+    return INITIAL_WIDTH
+  }
+  if count + usize.ONE <= width / (usize.ONE + usize.ONE) {
+    return width
+  }
+  return width + width
+}
+
+// Rehomes every occupied element into the replacement table under the hash it was placed with, then
+// releases the old buffers. The removed marks do not travel, so growth reclaims them.
+fn migrate<T>(
+  storage: Unseeded<T> | Slots<T>,
+  width: usize,
+  fresh: Slots<T>,
+  next: usize
+) -> Slots<T> {
+  return match move storage {
+    Unseeded<T> nothing => move fresh
+    Slots<T> held => rehome<T>(move held, width, move fresh, next)
+  }
+}
+
+fn rehome<T>(old: Slots<T>, width: usize, fresh: Slots<T>, next: usize) -> Slots<T> {
+  let mut source = move old
+  let mut target = move fresh
+  unsafe {
+    let mut index = usize.ZERO
+    while index < width {
+      let seen = RawBuffer.view<u8>(&source.states, usize.ZERO, width)
+      if seen[index] >= OCCUPIED {
+        let selected = RawBuffer.slot(&mut source.members, index)
+        let carried = Slot.take(move selected)
+        let placed = settle<T>(&mut target, move carried, next)
+      }
+      index = index + usize.ONE
+    }
+    drop source
+  }
+  return move target
+}
+
+// Places one element at the first slot its own probe run does not already occupy. Every slot of a
+// replacement table is vacant, so the run always ends.
+fn settle<T>(target: &mut Slots<T>, carried: Member<T>, next: usize) -> () {
+  let hashed = memberHash<T>(&carried)
+  let mut index = bucketOf(hashed, next)
+  let mut searching = true
+  while searching {
+    // A replacement table's `states` holds one initialized byte for each of its `next` slots.
+    let seen = unsafe RawBuffer.view<u8>(&target.states, usize.ZERO, next)
+    if seen[index] >= OCCUPIED {
+      index = advance(index, next)
+    } else {
+      searching = false
+    }
+  }
+  let written = writeMember<T>(move target, index, move carried)
+  return ()
+}
+
+fn memberHash<T>(member: &Member<T>) -> u64 {
+  return member.hash
+}
+
+fn writeMember<T>(owned: &mut Slots<T>, index: usize, member: Member<T>) -> () {
+  let tag = tagOf(member.hash)
+  unsafe {
+    let selected = RawBuffer.slot(&mut owned.members, index)
+    let written = Slot.write<Member<T>>(move selected, move member)
+  }
+  // Every caller passes an index below the table's capacity; state bytes are always initialized.
+  let mut states = unsafe RawBuffer.viewMut<u8>(&mut owned.states, index, usize.ONE)
+  states[usize.ZERO] = tag
+  return ()
+}
+
+fn vacantAt<T>(owned: &Slots<T>, index: usize) -> bool {
+  // Every caller passes an index below the table's capacity; state bytes are always initialized.
+  let seen = unsafe RawBuffer.view<u8>(&owned.states, index, usize.ONE)
+  return seen[usize.ZERO] == VACANT
+}
+
+fn markRemoved<T>(owned: &mut Slots<T>, index: usize) -> () {
+  // Every caller passes an index below the table's capacity; state bytes are always initialized.
+  let mut states = unsafe RawBuffer.viewMut<u8>(&mut owned.states, index, usize.ONE)
+  states[usize.ZERO] = REMOVED
+  return ()
+}
+
+fn release<T>(value: T) -> () {
+  drop value
+  return ()
+}
+
+fn keep<T>(member: Member<T>) -> T {
+  return match move member {
+    Member<T> { hash, value } => move value
+  }
+}
+
+fn evict<T>(owned: &mut Slots<T>, index: usize) -> T {
+  unsafe {
+    let selected = RawBuffer.slot(&mut owned.members, index)
+    let taken = Slot.take(move selected)
+    return keep<T>(move taken)
+  }
+  return absurd<T>()
+}
+
+fn readMember<T: Copy>(self: &HashSet<T>, index: usize) -> Member<T> {
+  return match &self.storage {
+    Unseeded<T> nothing => absurd<Member<T>>()
+    Slots<T> { members, states } => readAt<T>(&members, index)
+  }
+}
+
+fn readAt<T: Copy>(members: &Intrinsic.RawBuffer<Member<T>>, index: usize) -> Member<T> {
+  unsafe {
+    return RawBuffer.read<Member<T>>(members, index)
+  }
+  return absurd<Member<T>>()
+}
+
+// The state byte of an occupied slot: `OCCUPIED` and the top seven bits of `hashed`.
+fn tagOf(hashed: u64) -> u8 {
+  return u8.bitOr(OCCUPIED, u64.toU8(u64.shiftRight(hashed, 57)))
+}
+
+fn wrapIndex(index: usize, width: usize) -> usize {
+  if index == width {
+    return usize.ZERO
+  }
+  return index
+}
+
+// The number of slots from `index` up to the next one that is vacant or carries `tag`, at most
+// `limit` and never past the end of `seen`. A probe skips them, since none can hold its key and
+// none ends the probe. Sixteen state bytes are tested at a time where the CPU has 128-bit vectors.
+fn skipToCandidate(seen: &[u8], index: usize, limit: usize, tag: u8) -> usize {
+  let mut room = seen.length - index
+  if limit < room {
+    room = limit
+  }
+  let mut skipped = usize.ZERO
+  static if simd.hardware() {
+    let wanted = u8x16.splat(tag)
+    let vacant = u8x16.splat(VACANT)
+    while skipped + 16 <= room {
+      let group = u8x16.load(seen, index + skipped)
+      let stops = u8x16.lanesEqual(group, wanted) | u8x16.lanesEqual(group, vacant)
+      if mask16.any(stops) {
+        return skipped + mask16.firstSet(stops)
+      }
+      skipped = skipped + 16
+    }
+  }
+  while skipped < room {
+    let state = seen[index + skipped]
+    if state == tag || state == VACANT {
+      return skipped
+    }
+    skipped = skipped + usize.ONE
+  }
+  return skipped
+}
+
+// Every state byte of an allocated table; empty before the first allocation.
+fn statesOf<T>(self: &HashSet<T>) -> &[u8] {
+  return match &self.storage {
+    Unseeded<T> nothing => b""
+    // An allocated table's `states` holds one initialized byte for each of its `capacity` slots.
+    Slots<T> { members, states } => unsafe RawBuffer.view<u8>(&states, usize.ZERO, self.capacity)
+  }
+}
