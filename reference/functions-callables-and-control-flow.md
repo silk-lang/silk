@@ -134,8 +134,10 @@ fn slowTag(value: i64) -> u8 with Intrinsic.inlineNever() {
 An ordinary function can carry one inline clause. `with Intrinsic.inline()` asks the optimizer to
 prefer inlining the function into its callers. `with Intrinsic.inlineAlways()` asks it to inline
 the function into every caller it can, whatever its size. `with Intrinsic.inlineNever()` asks it
-never to inline the function, which keeps a rarely taken path out of its callers. The clause takes
-no arguments and does not change what the function computes.
+never to inline the function, which keeps a rarely taken path out of its callers. `with
+Intrinsic.cold()` also never inlines the function, and tells the optimizer that calls to it are
+rarely reached, so the branches leading to such a call are laid out and register-allocated as the
+unlikely ones. The clause takes no arguments and does not change what the function computes.
 
 A function without a clause that takes a parameter written as a callable type (`fn(A) -> B`) or as
 an `Effect<...>` is treated as if it carried `with Intrinsic.inline()`. Such a function, like
