@@ -1,0 +1,398 @@
+//! The closed directive table and the readers of written directives.
+//!
+//! A directive tells the compiler how to build a declaration, never what the declaration means.
+//! The table below is the whole vocabulary: no source declares a directive, an argument is a
+//! literal, and no `static` evaluation or `Reflect` query can see one. Each directive has one
+//! class, which says what removing it does:
+//!
+//! - a hint leaves the same program with the same behavior;
+//! - an optimizer fact leaves the same behavior with fewer optimizations;
+//! - a checked contract leaves the same runtime behavior, though some uses may stop compiling;
+//! - a target directive leaves the same results in slower code;
+//! - a codegen shape describes a body written for that shape, so removing it breaks the body.
+import hir.Hir {HirId, HirRef, Module, Node, Range}
+import lexer.Span {Span}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.list {List}
+import silk.option {Option}
+import silk.string {String}
+import silk.usize
+
+/// One directive of the closed table.
+pub enum Kind {
+  /// `@inline`: asks callers to inline the function.
+  Inline,
+  /// `@inlineAlways`: asks every caller to inline the function.
+  InlineAlways,
+  /// `@inlineNever`: asks callers never to inline the function.
+  InlineNever,
+  /// `@cold`: the function is rarely called, so it stays out of line and the branches that reach
+  /// it are laid out as the unlikely ones.
+  Cold,
+  /// `@nonParking`: every call owes a proof that the callee never parks its thread (SEM0139).
+  NonParking,
+  /// `@features("avx2", ...)`: compiles an `unsafe` function for extra CPU features.
+  Features,
+  /// `@foreign(memory:, locality:, noCapture:)`: facts about a C function the optimizer trusts.
+  Foreign,
+  /// `@callbacks("compare", ...)`: names the C function-pointer parameters called during the call.
+  Callbacks,
+  /// `@threadCallbacks("routine", ...)`: names the C function-pointer parameters that may be
+  /// called on another thread.
+  ThreadCallbacks,
+  /// `@naked`: no prologue or epilogue; the body is assembly only.
+  Naked,
+  /// `@noReturn`: the function never returns.
+  NoReturn,
+}
+
+/// What removing a directive does to a program.
+pub enum Class {
+  Hint,
+  OptimizerFact,
+  CheckedContract,
+  Target,
+  CodegenShape,
+}
+
+/// Where a directive is written.
+pub enum Position {
+  /// An ordinary function or method, with a Silk body and no linkage.
+  Function,
+  /// A function with C linkage, imported with `extern` or defined with `export`.
+  Linked,
+  /// A service or interface operation.
+  Operation,
+  /// A foreign function type, `extern "C" fn(...) -> T`.
+  ForeignType,
+  /// Any other declaration, which takes no directive.
+  Other,
+}
+
+/// What a directive's argument list holds.
+pub enum Schema {
+  /// No argument.
+  Empty,
+  /// Named arguments drawn from the directive's names, each at most once.
+  Named,
+  /// Bare text literals. An empty list fits, so its reader can say why it is empty.
+  Texts,
+}
+
+/// The number of directives in the table.
+pub const COUNT: usize = 11
+
+/// The directive at `index` in table order, for `index` below [`COUNT`].
+pub fn at(index: usize) -> Kind {
+  return match index {
+    0 => Kind.Inline
+    1 => Kind.InlineAlways
+    2 => Kind.InlineNever
+    3 => Kind.Cold
+    4 => Kind.NonParking
+    5 => Kind.Features
+    6 => Kind.Foreign
+    7 => Kind.Callbacks
+    8 => Kind.ThreadCallbacks
+    9 => Kind.Naked
+    _ => Kind.NoReturn
+  }
+}
+
+/// The name written after `@`.
+pub fn spelling(kind: Kind) -> string<'static> {
+  return match kind {
+    Kind.Inline => "inline"
+    Kind.InlineAlways => "inlineAlways"
+    Kind.InlineNever => "inlineNever"
+    Kind.Cold => "cold"
+    Kind.NonParking => "nonParking"
+    Kind.Features => "features"
+    Kind.Foreign => "foreign"
+    Kind.Callbacks => "callbacks"
+    Kind.ThreadCallbacks => "threadCallbacks"
+    Kind.Naked => "naked"
+    Kind.NoReturn => "noReturn"
+  }
+}
+
+/// The directive's class.
+pub fn class(kind: Kind) -> Class {
+  return match kind {
+    Kind.Inline => Class.Hint
+    Kind.InlineAlways => Class.Hint
+    Kind.InlineNever => Class.Hint
+    Kind.Cold => Class.Hint
+    Kind.NonParking => Class.CheckedContract
+    Kind.Features => Class.Target
+    Kind.Foreign => Class.OptimizerFact
+    Kind.Callbacks => Class.CheckedContract
+    Kind.ThreadCallbacks => Class.CheckedContract
+    Kind.Naked => Class.CodegenShape
+    Kind.NoReturn => Class.CodegenShape
+  }
+}
+
+/// Whether `kind` may be written at `position`.
+pub fn admits(kind: Kind, position: Position) -> bool {
+  return match kind {
+    Kind.Inline => position == Position.Function
+    Kind.InlineAlways => position == Position.Function
+    Kind.InlineNever => position == Position.Function
+    Kind.Cold => position == Position.Function
+    Kind.NonParking => position == Position.Function || position == Position.Operation
+    Kind.Features => position == Position.Function
+    Kind.Foreign => position == Position.Linked || position == Position.ForeignType
+    Kind.Callbacks => position == Position.Linked
+    Kind.ThreadCallbacks => position == Position.Linked
+    Kind.Naked => position == Position.Linked
+    Kind.NoReturn => position == Position.Linked
+  }
+}
+
+/// Whether the declaration `kind` describes must be `unsafe`: `@features` runs instructions the
+/// running machine may lack, and a codegen shape describes a body the compiler cannot check.
+pub fn requiresUnsafe(kind: Kind) -> bool {
+  return kind == Kind.Features || kind == Kind.Naked || kind == Kind.NoReturn
+}
+
+/// The shape of the directive's arguments.
+pub fn schema(kind: Kind) -> Schema {
+  return match kind {
+    Kind.Foreign => Schema.Named
+    Kind.Features => Schema.Texts
+    Kind.Callbacks => Schema.Texts
+    Kind.ThreadCallbacks => Schema.Texts
+    _ => Schema.Empty
+  }
+}
+
+/// Whether a named argument `name` belongs to the schema of `kind`.
+pub fn argumentNamed(kind: Kind, name: &[u8]) -> bool {
+  if kind != Kind.Foreign { return false }
+  return same(name, b"memory") || same(name, b"locality") || same(name, b"noCapture")
+}
+
+/// One line describing the directive, for hover text and the generated reference.
+pub fn summary(kind: Kind) -> string<'static> {
+  return match kind {
+    Kind.Inline => "Asks callers to inline this function."
+    Kind.InlineAlways => "Asks every caller to inline this function."
+    Kind.InlineNever => "Asks callers never to inline this function."
+    Kind.Cold => "Marks this function rarely called, so it stays out of line on an unlikely path."
+    Kind.NonParking => "Every call owes a proof that the callee never parks its thread."
+    Kind.Features => "Compiles this unsafe function for the listed CPU features."
+    Kind.Foreign => "States what a C function does with memory, which the optimizer trusts."
+    Kind.Callbacks => "Names the C function-pointer parameters the call invokes before it returns."
+    Kind.ThreadCallbacks => "Names the C function-pointer parameters that may run on another thread."
+    Kind.Naked => "Builds this function without a prologue or epilogue; its body is assembly only."
+    Kind.NoReturn => "States that this function never returns."
+  }
+}
+
+/// The table entry `written` names, if any.
+pub fn named(written: &[u8]) -> Option<Kind> {
+  let mut index = usize.ZERO
+  while index < COUNT {
+    if same(written, String.utf8Bytes(spelling(at(index)))) { return Option<Kind>.some(at(index)) }
+    index = index + usize.ONE
+  }
+  return Option<Kind>.none()
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn nameIs(hir: &Module, id: HirId, expected: &[u8]) -> bool {
+  return match Module.node(hir, id) {
+    Node.Name {text} => same(Module.text(hir, text), expected)
+    _ => false
+  }
+}
+
+/// The table entry the written directive `id` names; none for an unknown name or a node that is
+/// no directive.
+pub fn kindOf(hir: &Module, id: HirId) -> Option<Kind> {
+  if let Node.Directive {name, ..} = Module.node(hir, id) {
+    if let Node.Name {text} = Module.node(hir, name) { return named(Module.text(hir, text)) }
+  }
+  return Option<Kind>.none()
+}
+
+/// The first directive among `directives` that is `kind`.
+pub fn find(hir: &Module, directives: Range, kind: Kind) -> Option<HirId> {
+  let mut at = usize.ZERO
+  while at < directives.length {
+    let id = Module.child(hir, directives, at)
+    if let Option<Kind>.Some {value} = kindOf(hir, id) {
+      if value == kind { return Option<HirId>.some(id) }
+    }
+    at = at + usize.ONE
+  }
+  return Option<HirId>.none()
+}
+
+/// The value of the named argument `name` of the directive `id`, if written.
+pub fn argument(hir: &Module, id: HirId, name: &[u8]) -> Option<HirId> {
+  if let Node.Directive {arguments, ..} = Module.node(hir, id) {
+    let mut at = usize.ZERO
+    while at < arguments.length {
+      if let Node.DirectiveArgument {name: written, value} = Module.node(hir, Module.child(hir, arguments, at)) {
+        if written.present && nameIs(hir, written.id, name) { return Option<HirId>.some(value) }
+      }
+      at = at + usize.ONE
+    }
+  }
+  return Option<HirId>.none()
+}
+
+/// The arguments of the directive `id`; empty for any other node.
+pub fn arguments(hir: &Module, id: HirId) -> Range {
+  if let Node.Directive {arguments, ..} = Module.node(hir, id) { return arguments }
+  return Range.empty()
+}
+
+/// The values a text list holds, in written order: every element of a tuple value, and any other
+/// value itself. `@features("a", "b")` and a `with` clause's `features: ("a", "b")` hold the same.
+pub effect fn values(hir: &Module, value: HirId, output: &mut List<HirId>) -> () ! OutOfMemoryError ? &mut Allocator {
+  if let Node.TupleExpression {elements} = Module.node(hir, value) {
+    let mut at = usize.ZERO
+    while at < elements.length {
+      run List<HirId>.append(&mut output.*, Module.child(hir, elements, at))
+      at = at + usize.ONE
+    }
+    return ()
+  }
+  if let Node.UnitLiteral = Module.node(hir, value) { return () }
+  return run List<HirId>.append(&mut output.*, value)
+}
+
+/// The values of every bare argument of the directive `id`, flattened by [`values`].
+pub effect fn texts(hir: &Module, id: HirId) -> List<HirId> ! OutOfMemoryError ? &mut Allocator {
+  let mut output = List<HirId>.make()
+  let written = arguments(hir, id)
+  let mut at = usize.ZERO
+  while at < written.length {
+    if let Node.DirectiveArgument {name, value} = Module.node(hir, Module.child(hir, written, at)) {
+      if !name.present { run values(hir, value, &mut output) }
+    }
+    at = at + usize.ONE
+  }
+  return move output
+}
+
+// Whether the directive `id`'s arguments fit the schema of `kind`. A value's own literal is a later
+// reader's question; this decides only which arguments are written.
+fn fits(hir: &Module, id: HirId, kind: Kind) -> bool {
+  let written = arguments(hir, id)
+  let shape = schema(kind)
+  if shape == Schema.Empty { return written.length == usize.ZERO }
+  if shape == Schema.Texts {
+    let mut at = usize.ZERO
+    while at < written.length {
+      if let Node.DirectiveArgument {name, ..} = Module.node(hir, Module.child(hir, written, at)) {
+        if name.present { return false }
+      }
+      at = at + usize.ONE
+    }
+    return true
+  }
+  let mut at = usize.ZERO
+  while at < written.length {
+    if let Node.DirectiveArgument {name, ..} = Module.node(hir, Module.child(hir, written, at)) {
+      if !name.present { return false }
+      if let Node.Name {text} = Module.node(hir, name.id) {
+        if !argumentNamed(kind, Module.text(hir, text)) { return false }
+        let mut earlier = usize.ZERO
+        while earlier < at {
+          if let Node.DirectiveArgument {name: previous, ..} = Module.node(hir, Module.child(hir, written, earlier)) {
+            if previous.present && nameIs(hir, previous.id, Module.text(hir, text)) { return false }
+          }
+          earlier = earlier + usize.ONE
+        }
+      } else {
+        return false
+      }
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// The span of the first directive outside the table, or whose arguments do not fit its schema
+/// (SEM0235).
+pub fn unknown(hir: &Module, directives: Range) -> Option<Span> {
+  let mut at = usize.ZERO
+  while at < directives.length {
+    let id = Module.child(hir, directives, at)
+    let known = match kindOf(hir, id) {
+      Option<Kind>.Some {value} => fits(hir, id, value)
+      Option<Kind>.None => false
+    }
+    if !known { return Option<Span>.some(Module.span(hir, id)) }
+    at = at + usize.ONE
+  }
+  return Option<Span>.none()
+}
+
+/// The span of the first known directive that `position` does not admit (SEM0236).
+pub fn misplaced(hir: &Module, directives: Range, position: Position) -> Option<Span> {
+  let mut at = usize.ZERO
+  while at < directives.length {
+    let id = Module.child(hir, directives, at)
+    if let Option<Kind>.Some {value} = kindOf(hir, id) {
+      if !admits(value, position) { return Option<Span>.some(Module.span(hir, id)) }
+    }
+    at = at + usize.ONE
+  }
+  return Option<Span>.none()
+}
+
+/// Whether two of `directives` are the same table entry, or two are inline hints.
+pub fn repeated(hir: &Module, directives: Range) -> bool {
+  let mut at = usize.ZERO
+  while at < directives.length {
+    if let Option<Kind>.Some {value: later} = kindOf(hir, Module.child(hir, directives, at)) {
+      let mut earlier = usize.ZERO
+      while earlier < at {
+        if let Option<Kind>.Some {value: first} = kindOf(hir, Module.child(hir, directives, earlier)) {
+          if first == later || (inlining(first) && inlining(later)) { return true }
+        }
+        earlier = earlier + usize.ONE
+      }
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+/// Whether `kind` is one of the inline hints.
+pub fn inlining(kind: Kind) -> bool {
+  return kind == Kind.Inline || kind == Kind.InlineAlways || kind == Kind.InlineNever || kind == Kind.Cold
+}
+
+/// The span of the first inline hint among `directives`.
+pub fn inlineHint(hir: &Module, directives: Range) -> Option<Span> {
+  let mut at = usize.ZERO
+  while at < directives.length {
+    let id = Module.child(hir, directives, at)
+    if let Option<Kind>.Some {value} = kindOf(hir, id) {
+      if inlining(value) { return Option<Span>.some(Module.span(hir, id)) }
+    }
+    at = at + usize.ONE
+  }
+  return Option<Span>.none()
+}
+
+/// The directives of the declaration `id`; empty for any other node.
+pub fn of(hir: &Module, id: HirId) -> Range {
+  if let Node.Declaration {directives, ..} = Module.node(hir, id) { return directives }
+  return Range.empty()
+}
