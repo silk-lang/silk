@@ -122,7 +122,8 @@ declare it as an inherent member and map the conformance operation to it; an inl
 body remains valid when no separately callable operation is useful.
 
 Only the module declaring a nominal type may declare its inherent impls. A conformance belongs to
-the provider's module or, for an interface, to the interface's module, as
+the provider's module or, for an interface, to the interface's module or the module declaring the
+interface application's first type argument, as
 [IMPL-004](generics-interfaces-and-specialization.md#impl-004--an-interface-or-its-nominal-provider-may-own-a-conformance)
 defines.
 Another module adds behavior for an existing public type as a free function qualified by the

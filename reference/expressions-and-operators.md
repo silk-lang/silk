@@ -741,8 +741,9 @@ bind an operator, and no other interface or operation name has operator meaning.
 
 The left (or only) operand is the provider: `a * b` means `Multiply<B, Output>.multiply(a, b)` for
 the conformance of `a`'s type, where `B` is `b`'s type and `Output` is whatever that conformance
-declares. The conformance is found like any other (IMPL-004): in the interface's module or in the
-module that declares the provider. No imported module is scanned for operator declarations, so
+declares. The conformance is found like any other (IMPL-004): in the interface's module, in the
+module that declares the provider, or in the module that declares `B`, so a library can supply
+`2.0 * vector` for its own `Vector`. No imported module is scanned for operator declarations, so
 importing a module or declaring an interface elsewhere cannot change which operation an existing
 use selects.
 
