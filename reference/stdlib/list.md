@@ -416,6 +416,7 @@ If `index` is not less than [`List.length`](#List.impl.length), the program trap
 pub effect fn reserve(self: &mut Self, additional: usize) -> ()
   ! OutOfMemoryError
   ? &mut Allocator
+  with Intrinsic.inlineAlways()
 ```
 
 Makes sure that at least `additional` more elements fit without another allocation.
@@ -443,6 +444,7 @@ capacity by doubling until the elements fit. The length does not change.
 pub effect fn reserveExact(self: &mut Self, additional: usize) -> ()
   ! OutOfMemoryError
   ? &mut Allocator
+  with Intrinsic.inlineAlways()
 ```
 
 Makes sure that at least `additional` more elements fit, with no extra capacity.
