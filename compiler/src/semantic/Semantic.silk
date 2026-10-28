@@ -144,6 +144,8 @@ import semantic.CallableContract {CallableContract as CallableFacts, Failure as 
 import semantic.CallInput {CallInput, Arguments as CallArguments}
 import semantic.ForeignContract {ForeignContract}
 import semantic.NativeForeign
+import hir.Directive as Directives
+import hir.Directive {Kind as DirectiveKind, Position as DirectivePosition}
 import semantic.DeclarationId {DeclarationId, OwnerStep, contentKind}
 import semantic.SourceInputs as Inputs {SourceInputs, Selector as SourceSelector, Facet as SourceFacet}
 import semantic.DeclarationTable
@@ -7181,6 +7183,64 @@ fn supportedConstraints(hir: &Module, constraints: Range) -> bool {
   return true
 }
 
+// The first conflict among a function's or operation's directives: one outside the table or whose
+// arguments do not fit it (SEM0235); one its position does not take, or any on a `static`
+// function, which runs only at compile time (SEM0236); a `@features` list problem (SEM0242,
+// SEM0243); or two of one directive, which stays unsupported. Only the signature query reads it,
+// so an edit of a directive reruns no body check.
+effect fn directiveConflict(resolver: &mut Resolver, module: &ModuleId, ordinal: usize) -> Option<HeaderConflict>
+! Cycle | OutOfMemoryError ? &mut Allocator {
+  drop run observedDeclaration(&mut resolver.*, module, ordinal, SourceFacet.Directives)
+  let answer = run observedDeclaration(&mut resolver.*, module, ordinal, SourceFacet.Header)
+  if let Option<&IndexedSource>.Some {value} = move sourceOf(&resolver.*, &answer, module) {
+    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(value))
+    if ordinal >= declarations.length { return Option<HeaderConflict>.none() }
+    let hir = IndexedSource.authored(value)
+    let directives = Directives.of(hir, declarations[ordinal].local)
+    if directives.length == usize.ZERO { return Option<HeaderConflict>.none() }
+    let mut position = DirectivePosition.Other
+    let mut contract = Option<HirId>.none()
+    let mut functionName = Bytes.make()
+    if let Node.FunctionHeader {name, contract: written, linkage, ..} = Module.node(hir, declarations[ordinal].header) {
+      position = DirectivePosition.Function
+      if linkage.present { position = DirectivePosition.Linked }
+      contract = Option<HirId>.some(written)
+      if let Node.Name {text} = Module.node(hir, name) { functionName = run Bytes.copy(Module.text(hir, text)) }
+    }
+    if let Node.OperationHeader {contract: written, ..} = Module.node(hir, declarations[ordinal].header) {
+      position = DirectivePosition.Operation
+      contract = Option<HirId>.some(written)
+    }
+    let mut isUnsafe = false
+    let mut isStatic = false
+    if let Option<HirId>.Some {value: written} = move contract {
+      if let Node.CallableContract {isUnsafe: unsafeWritten, isStatic: staticWritten, ..} = Module.node(hir, written) {
+        isUnsafe = unsafeWritten
+        isStatic = staticWritten
+      }
+    }
+    if let Option<Span>.Some {value: clause} = move Directives.unknown(hir, directives) {
+      return conflictAt(RejectionCode.UnknownDirective, clause)
+    }
+    if let Option<Span>.Some {value: clause} = move Directives.misplaced(hir, directives, position) {
+      return conflictAt(RejectionCode.MisplacedDirective, clause)
+    }
+    if position == DirectivePosition.Function {
+      if let Option<HirId>.Some {value: directive} = move Directives.find(hir, directives, DirectiveKind.Features) {
+        let problem = run featuresConflict(&resolver.*, hir, directive, isUnsafe, isStatic, Bytes.asSlice(&functionName),
+          Module.span(hir, declarations[ordinal].header))
+        if let Option<HeaderConflict>.Some {..} = &problem { return move problem }
+      }
+    }
+    if isStatic { return conflictAt(RejectionCode.MisplacedDirective, Module.span(hir, Module.child(hir, directives, usize.ZERO))) }
+    // A linked function's directives are checked against its C contract (`foreignHeader`).
+    if position != DirectivePosition.Linked && Directives.repeated(hir, directives) {
+      return conflictAt(RejectionCode.Unsupported, Module.span(hir, Module.child(hir, directives, usize.ZERO)))
+    }
+  }
+  return Option<HeaderConflict>.none()
+}
+
 effect fn signatureSyntax(resolver: &mut Resolver, module: &ModuleId, ordinal: usize) -> Option<
   WrittenSignature,
 > ! Cycle | OutOfMemoryError ? &mut Allocator {
@@ -7212,21 +7272,14 @@ effect fn signatureSyntax(resolver: &mut Resolver, module: &ModuleId, ordinal: u
     let mut callable = Option<HirId>.none()
     let mut isPublic = false
     // Foreign headers are typed normally; backend coverage checks retain linkage gaps.
-    let mut plain = true
     let mut foreign = false
     let mut linkageSpan = declarationSpan
-    let mut unknown = Option<Span>.none()
-    let mut misplaced = Option<Span>.none()
     // A linked function's ABI other than "C", its spelling, whether it is imported, and its name.
     let mut foreignAbi = Option<Span>.none()
     let mut abiText = Bytes.make()
     let mut imported = false
     let mut functionName = Bytes.make()
-    // A `with Intrinsic.machine(features: ...)` clause of an ordinary function (SIMD-009).
-    let mut features = Option<FeaturesProperty>.none()
-    // The first `Intrinsic.inline()`, `inlineAlways()` or `inlineNever()` clause (FUNC-003).
-    let mut inlineSpan = Option<Span>.none()
-    if let Node.FunctionHeader {name: spelled, contract, linkage, properties, isPublic: visible, ..} = written {
+    if let Node.FunctionHeader {name: spelled, contract, linkage, isPublic: visible, ..} = written {
       callable = Option<HirId>.some(contract)
       isPublic = visible
       foreign = linkage.present
@@ -7243,28 +7296,13 @@ effect fn signatureSyntax(resolver: &mut Resolver, module: &ModuleId, ordinal: u
           }
         }
       }
-      plain = linkage.present || plainProperties(hir, properties)
-      unknown = unknownProperty(hir, properties)
-      if !linkage.present { misplaced = misplacedProperty(hir, properties, true) }
-      // An inline clause shapes how callers compile a Silk body, which a linked function has none of.
-      if linkage.present { misplaced = inlineClause(hir, properties) }
-      inlineSpan = inlineClause(hir, properties)
-      features = featuresProperty(hir, properties)
-      if linkage.present {
-        if let Option<FeaturesProperty>.Some {value: property} = &features {
-          misplaced = Option<Span>.some(Module.span(hir, property.clause))
-        }
-      }
     }
     let mut operation = false
-    if let Node.OperationHeader {contract, properties, ..} = written {
+    if let Node.OperationHeader {contract, ..} = written {
       operation = true
       callable = Option<HirId>.some(contract)
       // An operation has no visibility of its own; it shares its interface's or service's.
       isPublic = contractPublic(hir, declarations, ordinal)
-      plain = nonParkingProperties(hir, properties)
-      unknown = unknownProperty(hir, properties)
-      misplaced = misplacedProperty(hir, properties, false)
     }
     if let Node.CallableContract {..} = written {
       callable = Option<HirId>.some(declarations[ordinal].header)
@@ -7326,29 +7364,12 @@ effect fn signatureSyntax(resolver: &mut Resolver, module: &ModuleId, ordinal: u
           }
         }
         let mut headerConflict = Option<HeaderConflict>.none()
-        let mut featureProblem = Option<HeaderConflict>.none()
-        // A `static` function runs only at compile time, so no caller inlines it.
-        let mut staticInline = Option<Span>.none()
-        if isStatic { staticInline = move inlineSpan }
-        if let Option<FeaturesProperty>.Some {value: property} = &features {
-          if !foreign {
-            featureProblem = run featuresConflict(&resolver.*, hir, &property, isUnsafe, isStatic, Bytes.asSlice(&functionName), declarationSpan)
-          }
-        }
         if let Option<Span>.Some {value: conflict} = move testConflict {
           if testDetail.length != usize.ZERO {
             headerConflict = run namedHeaderConflict(RejectionCode.InvalidTestDeclaration, conflict, b"detail", testDetail)
           } else {
             headerConflict = conflictAt(RejectionCode.InvalidTestDeclaration, conflict)
           }
-        } else if let Option<Span>.Some {value: clause} = move unknown {
-          headerConflict = conflictAt(RejectionCode.UnknownProperty, clause)
-        } else if let Option<Span>.Some {value: clause} = move misplaced {
-          headerConflict = conflictAt(RejectionCode.MisplacedProperty, clause)
-        } else if let Option<HeaderConflict>.Some {value: problem} = move featureProblem {
-          headerConflict = Option<HeaderConflict>.some(move problem)
-        } else if let Option<Span>.Some {value: clause} = move staticInline {
-          headerConflict = conflictAt(RejectionCode.MisplacedProperty, clause)
         } else if let Option<Span>.Some {value: abiSpan} = move foreignAbi {
           // Only the C ABI exists (SEM0185); the linkage names the ABI it asked for.
           headerConflict = run namedHeaderConflict(RejectionCode.UnsupportedForeignAbi, abiSpan, b"abi", Bytes.asSlice(&abiText))
@@ -7450,7 +7471,7 @@ effect fn signatureSyntax(resolver: &mut Resolver, module: &ModuleId, ordinal: u
             isUnsafe: isUnsafe,
             isStatic: isStatic,
             isPublic: isPublic,
-            supported: (!variadic || foreign) && supportedConstraints(hir, constraints) && plain && (!isStatic || (!isEffect && !isUnsafe && !failures.present && !requirements.present && !environment.present && staticPosition)),
+            supported: (!variadic || foreign) && supportedConstraints(hir, constraints) && (!isStatic || (!isEffect && !isUnsafe && !failures.present && !requirements.present && !environment.present && staticPosition)),
             span: Module.span(hir, contract),
             staticSlots: move staticSlots,
             headerConflict: move headerConflict,
@@ -13418,7 +13439,7 @@ effect fn resolveForeignFunction(resolver: &mut Resolver, owner: &mut Query<Answ
   let mut behavior = Option<ForeignContract>.none()
   if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &observed, module) {
     let hir = IndexedSource.authored(indexed)
-    if let Node.ForeignFunctionType {abi, binders: written, properties, ..} = &syntax {
+    if let Node.ForeignFunctionType {abi, binders: written, directives, ..} = &syntax {
       let c = match Module.node(hir, abi) { Node.TextLiteral {value: text} => same(Module.text(hir, text), b"C") _ => false }
       if !c {
         return Result<Shared<Type>, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.UnsupportedForeignAbi, span))
@@ -13426,7 +13447,7 @@ effect fn resolveForeignFunction(resolver: &mut Resolver, owner: &mut Query<Answ
       if written.length != usize.ZERO {
         return Result<Shared<Type>, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.ForeignDeclarationRestriction, span))
       }
-      behavior = NativeForeign.contract(hir, properties)
+      behavior = NativeForeign.contract(hir, directives)
     }
   }
   let contract = match move behavior {
@@ -27255,6 +27276,18 @@ effect fn resolveSignatureUnder(
     }
     return run memberRejected(run Shared<Rejection>.make(move diagnostic), move dependencies)
   }
+  let declarationAccessDirectives = declarationPosition(&resolver.*, key)
+  if let Option<HeaderConflict>.Some {value: conflict} = move run directiveConflict(&mut resolver.*, &module, declarationAccessDirectives) {
+    let mut diagnostic = run makeRejection(conflict.code, &module, conflict.span)
+    let filled = List<MessageArgument>.asSlice(&conflict.arguments)
+    let mut hole = usize.ZERO
+    while hole < filled.length {
+      run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(Bytes.asSlice(&filled[hole].name)),
+        value: run Bytes.copy(Bytes.asSlice(&filled[hole].value))})
+      hole = hole + usize.ONE
+    }
+    return run memberRejected(run Shared<Rejection>.make(move diagnostic), move dependencies)
+  }
   // An export's shim is always built, so its target lanes are checked here; an import's are
   // checked where it is called (`targetLane`).
   let mut exportedLanes = false
@@ -27266,7 +27299,7 @@ effect fn resolveSignatureUnder(
     foreignLanes = !foreign.global
     if let Option<GapCode>.Some {value: reason} = move foreign.gap {
       if reason == GapCode.CAbiCallback {
-        // C function-pointer parameters the properties do not name are the author's to name.
+        // C function-pointer parameters the directives do not name are the author's to name.
         if Bytes.length(&foreign.callbacks) != usize.ZERO {
           let mut named = run makeRejection(RejectionCode.ForeignType, &module, foreign.span)
           run List<MessageArgument>.append(&mut named.arguments, MessageArgument {name: run Bytes.copy(b"template"), value: run Bytes.copy(b"2")})
@@ -42213,8 +42246,8 @@ effect fn foreignFunctionAddress(resolver: &mut Resolver, owner: &mut Query<Answ
   if let Option<&IndexedSource>.Some {value: source} = move sourceOf(&resolver.*, &sourceAnswer, targetModule) {
     let hir = IndexedSource.authored(source)
     let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(source))
-    if let Node.FunctionHeader {properties, ..} = Module.node(hir, declarations[ordinal].header) {
-      declaredContract = NativeForeign.contract(hir, properties)
+    if let Node.FunctionHeader {..} = Module.node(hir, declarations[ordinal].header) {
+      declaredContract = NativeForeign.contract(hir, Directives.of(hir, declarations[ordinal].local))
     }
   }
   let validBehavior = match move declaredContract {
@@ -74331,7 +74364,7 @@ effect fn provideCall(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejec
   return Result<MirCallTarget, PreparationFailure>.succeed(move call)
 }
 
-// Whether a service operation's header declares `with Intrinsic.nonParking()`: each call then owes
+// Whether a service operation is written `@nonParking`: each call then owes
 // the NonParking proof for the witness its provider selects (SEM0139).
 effect fn operationNonParking(resolver: &mut Resolver, operation: &DeclarationId) -> bool
 ! Cycle | OutOfMemoryError ? &mut Allocator {
@@ -74341,13 +74374,14 @@ effect fn operationNonParking(resolver: &mut Resolver, operation: &DeclarationId
     Option<InstanceLocation>.None => { return false }
   }
   let module = resolvedModule(&resolver.*, location.module)
-  let answer = run observedDeclaration(&mut resolver.*, &module, location.declaration, SourceFacet.Header)
+  let answer = run observedDeclaration(&mut resolver.*, &module, location.declaration, SourceFacet.Directives)
   if let Option<&IndexedSource>.Some {value} = move sourceOf(&resolver.*, &answer, &module) {
     let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(value))
     if location.declaration >= declarations.length { return false }
     let hir = IndexedSource.authored(value)
-    if let Node.OperationHeader {properties, ..} = Module.node(hir, declarations[location.declaration].header) {
-      return properties.length == usize.ONE && nonParkingProperties(hir, properties)
+    if let Node.OperationHeader {..} = Module.node(hir, declarations[location.declaration].header) {
+      let directives = Directives.of(hir, declarations[location.declaration].local)
+      if let Option<HirId>.Some {..} = move Directives.find(hir, directives, DirectiveKind.NonParking) { return true }
     }
   }
   return false
@@ -75861,36 +75895,42 @@ effect fn copyMirCValues(resolver: &Resolver, index: usize, anchor: &Option<Anch
 }
 
 // Closed scalar native contracts retain memory/locality identity; the legacy noCapture hint creates
-// no loan. A synchronous callbacks tuple, or a threadCallbacks tuple whose callbacks may run on
+// no loan. A synchronous `@callbacks` list, or a `@threadCallbacks` list whose callbacks may run on
 // another thread, must name every written C pointer parameter exactly once.
-fn admittedForeignProperties(hir: &Module, properties: Range, parameters: Range) -> bool {
-  if let Option<ForeignContract>.Some {..} = move NativeForeign.declarationContract(hir, properties) {
+effect fn admittedForeignDirectives(hir: &Module, directives: Range, parameters: Range) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  if let Option<ForeignContract>.Some {..} = move NativeForeign.contract(hir, directives) {
     return !hasCallbackParameter(hir, parameters)
   }
   let mut fields = usize.ZERO
   let mut callbacks = false
   let mut at = usize.ZERO
-  while at < properties.length {
-    if let Node.PropertyClause {namespace, operation, properties: written} = Module.node(hir, Module.child(hir, properties, at)) {
-      if !nameIs(hir, namespace, b"Intrinsic") || !nameIs(hir, operation, b"foreign") { return false }
+  while at < directives.length {
+    let id = Module.child(hir, directives, at)
+    let kind = match Directives.kindOf(hir, id) {
+      Option<DirectiveKind>.Some {value} => value
+      Option<DirectiveKind>.None => { return false }
+    }
+    if kind == DirectiveKind.Foreign {
+      let written = Directives.arguments(hir, id)
       let mut field = usize.ZERO
       while field < written.length {
-        if let Node.Property {name, value} = Module.node(hir, Module.child(hir, written, field)) {
-          if nameIs(hir, name, b"noCapture") {
-            if !capturesPointerParameters(hir, value, parameters) { return false }
-          } else if nameIs(hir, name, b"module") || nameIs(hir, name, b"name") {
-            field = field + usize.ONE
-            continue
-          } else if nameIs(hir, name, b"callbacks") || nameIs(hir, name, b"threadCallbacks") {
-            if callbacks || !capturesCallbackParameters(hir, value, parameters) { return false }
-            callbacks = true
-          } else { return false }
+        if let Node.DirectiveArgument {name, value} = Module.node(hir, Module.child(hir, written, field)) {
+          if !name.present || !nameIs(hir, name.id, b"noCapture") { return false }
+          let mut listed = List<HirId>.make()
+          run Directives.values(hir, value, &mut listed)
+          if !capturesPointerParameters(hir, List<HirId>.asSlice(&listed), parameters) { return false }
         } else {
           return false
         }
         fields = fields + usize.ONE
         field = field + usize.ONE
       }
+    } else if kind == DirectiveKind.Callbacks || kind == DirectiveKind.ThreadCallbacks {
+      let listed = run Directives.texts(hir, id)
+      if callbacks || !capturesCallbackParameters(hir, List<HirId>.asSlice(&listed), parameters) { return false }
+      callbacks = true
+      fields = fields + usize.ONE
     } else {
       return false
     }
@@ -75899,35 +75939,22 @@ fn admittedForeignProperties(hir: &Module, properties: Range, parameters: Range)
   return fields <= usize.ONE && (!hasCallbackParameter(hir, parameters) || callbacks)
 }
 
-// A callable header's admitted properties: none, or one field-free `Intrinsic.nonParking()`.
-// On a service operation the property makes each call owe the NonParking proof for its selected
-// witness (`operationNonParking`); the build proves it (SEM0139). Every other property is a gap.
-fn nonParkingProperties(hir: &Module, properties: Range) -> bool {
-  if properties.length == usize.ZERO { return true }
-  if properties.length != usize.ONE { return false }
-  if let Node.PropertyClause {namespace, operation, properties: written} = Module.node(hir, Module.child(hir, properties, usize.ZERO)) {
-    return nameIs(hir, namespace, b"Intrinsic") && nameIs(hir, operation, b"nonParking") && written.length == usize.ZERO
-  }
-  return false
-}
-
-// A `module with ...` declaration's first property clause, rejected: no property applies to a
-// module, so a clause outside the property vocabulary is unknown (SEM0235) and a known one, which
-// describes a function, is misplaced (SEM0236). No clause is silently ignored.
-effect fn modulePropertyRejection(resolver: &mut Resolver, module: &ModuleId, ordinal: usize) -> Option<Shared<Rejection>>
+// The first directive of a declaration that takes none, rejected: a name outside the table is
+// unknown (SEM0235) and a known one, which describes a function, is misplaced (SEM0236). No
+// directive is silently ignored. Functions and operations check their own in `directiveConflict`.
+effect fn directiveRejection(resolver: &mut Resolver, module: &ModuleId, ordinal: usize) -> Option<Shared<Rejection>>
 ! Cycle | OutOfMemoryError ? &mut Allocator {
-  let observed = run source(&mut resolver.*, module)
+  let observed = run observedDeclaration(&mut resolver.*, module, ordinal, SourceFacet.Directives)
   let mut refused = Option<HeaderConflict>.none()
   if let Option<&IndexedSource>.Some {value} = move sourceOf(&resolver.*, &observed, module) {
     let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(value))
     let hir = IndexedSource.authored(value)
     if ordinal < declarations.length {
-      if let Node.ModulePropertyHeader {properties} = Module.node(hir, declarations[ordinal].header) {
-        if let Option<Span>.Some {value: clause} = move unknownProperty(hir, properties) {
-          refused = conflictAt(RejectionCode.UnknownProperty, clause)
-        } else if properties.length > usize.ZERO {
-          refused = conflictAt(RejectionCode.MisplacedProperty, Module.span(hir, Module.child(hir, properties, usize.ZERO)))
-        }
+      let directives = Directives.of(hir, declarations[ordinal].local)
+      if let Option<Span>.Some {value: clause} = move Directives.unknown(hir, directives) {
+        refused = conflictAt(RejectionCode.UnknownDirective, clause)
+      } else if let Option<Span>.Some {value: clause} = move Directives.misplaced(hir, directives, DirectivePosition.Other) {
+        refused = conflictAt(RejectionCode.MisplacedDirective, clause)
       }
     }
   }
@@ -75936,92 +75963,6 @@ effect fn modulePropertyRejection(resolver: &mut Resolver, module: &ModuleId, or
     return Option<Shared<Rejection>>.some(run reject(&resolver.*, module, conflict.code, conflict.span))
   }
   return Option<Shared<Rejection>>.none()
-}
-
-// The span of the first `Intrinsic.foreign(...)` or `Intrinsic.machine(...)` header property
-// clause, which describe an `extern` function only, on a declaration that has no foreign linkage
-// (SEM0236). With `featuresAllowed`, an ordinary function's `Intrinsic.machine(features: ...)`
-// clause is admitted (SIMD-009), and so is an inline clause, which only an ordinary function's
-// body can honor; any other declaration's inline clause is misplaced.
-fn misplacedProperty(hir: &Module, properties: Range, featuresAllowed: bool) -> Option<Span> {
-  let mut at = usize.ZERO
-  while at < properties.length {
-    let clause = Module.child(hir, properties, at)
-    if let Node.PropertyClause {namespace, operation, properties: written} = Module.node(hir, clause) {
-      let features = featuresAllowed && nameIs(hir, operation, b"machine") && featuresOnly(hir, written)
-      if nameIs(hir, namespace, b"Intrinsic") && (nameIs(hir, operation, b"foreign") || nameIs(hir, operation, b"machine")) && !features {
-        return Option<Span>.some(Module.span(hir, clause))
-      }
-      if !featuresAllowed && nameIs(hir, namespace, b"Intrinsic") && inlineOperation(hir, operation) {
-        return Option<Span>.some(Module.span(hir, clause))
-      }
-    }
-    at = at + usize.ONE
-  }
-  return Option<Span>.none()
-}
-
-// Whether a property clause's fields are one or more `features:` entries and nothing else.
-fn featuresOnly(hir: &Module, written: Range) -> bool {
-  if written.length == usize.ZERO { return false }
-  let mut field = usize.ZERO
-  while field < written.length {
-    if let Node.Property {name, ..} = Module.node(hir, Module.child(hir, written, field)) {
-      if !nameIs(hir, name, b"features") { return false }
-    } else {
-      return false
-    }
-    field = field + usize.ONE
-  }
-  return true
-}
-
-// Whether an ordinary function's property clauses are all admitted: at most one field-free
-// `Intrinsic.nonParking()`, at most one `Intrinsic.machine(features: ...)` (SIMD-009) and at most
-// one field-free inline clause.
-fn plainProperties(hir: &Module, properties: Range) -> bool {
-  if nonParkingProperties(hir, properties) { return true }
-  let mut parking = usize.ZERO
-  let mut machine = usize.ZERO
-  let mut inlining = usize.ZERO
-  let mut at = usize.ZERO
-  while at < properties.length {
-    if let Node.PropertyClause {namespace, operation, properties: written} = Module.node(hir, Module.child(hir, properties, at)) {
-      if !nameIs(hir, namespace, b"Intrinsic") { return false }
-      if nameIs(hir, operation, b"nonParking") && written.length == usize.ZERO {
-        parking = parking + usize.ONE
-      } else if nameIs(hir, operation, b"machine") && featuresOnly(hir, written) {
-        machine = machine + usize.ONE
-      } else if inlineOperation(hir, operation) && written.length == usize.ZERO {
-        inlining = inlining + usize.ONE
-      } else {
-        return false
-      }
-    } else {
-      return false
-    }
-    at = at + usize.ONE
-  }
-  return parking <= usize.ONE && machine <= usize.ONE && inlining <= usize.ONE
-}
-
-// Whether a property clause's operation is `inline`, `inlineAlways`, `inlineNever` or `cold`.
-fn inlineOperation(hir: &Module, operation: HirId) -> bool {
-  return nameIs(hir, operation, b"inline") || nameIs(hir, operation, b"inlineAlways") || nameIs(hir, operation, b"inlineNever")
-    || nameIs(hir, operation, b"cold")
-}
-
-// The span of the first `Intrinsic` inline clause among `properties`.
-fn inlineClause(hir: &Module, properties: Range) -> Option<Span> {
-  let mut at = usize.ZERO
-  while at < properties.length {
-    let clause = Module.child(hir, properties, at)
-    if let Node.PropertyClause {namespace, operation, ..} = Module.node(hir, clause) {
-      if nameIs(hir, namespace, b"Intrinsic") && inlineOperation(hir, operation) { return Option<Span>.some(Module.span(hir, clause)) }
-    }
-    at = at + usize.ONE
-  }
-  return Option<Span>.none()
 }
 
 // Whether a written parameter type is a callable or an `Effect`. Such a function, like `Effect.map`
@@ -76081,31 +76022,31 @@ fn forwardingBody(hir: &Module, declaration: HirId) -> bool {
   return false
 }
 
-// How a declaration's inline clause asks its callers to inline it, a hint for a function that takes
-// a callable or an `Effect` (always, for a forwarding wrapper), and `Default` for any other
+// How a declaration's inline directive asks its callers to inline it, a hint for a function that
+// takes a callable or an `Effect` (always, for a forwarding wrapper), and `Default` for any other
 // declaration.
 effect fn declarationInlining(resolver: &mut Resolver, module: &ModuleId, ordinal: usize) -> MirInlining
 ! Cycle | OutOfMemoryError ? &mut Allocator {
+  drop run observedDeclaration(&mut resolver.*, module, ordinal, SourceFacet.Directives)
   let answer = run observedDeclaration(&mut resolver.*, module, ordinal, SourceFacet.Header)
   let mut inlining = MirInlining.Default
   if let Option<&IndexedSource>.Some {value} = move sourceOf(&resolver.*, &answer, module) {
     let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(value))
     if ordinal < declarations.length {
       let hir = IndexedSource.authored(value)
-      if let Node.FunctionHeader {properties, linkage, contract, ..} = Module.node(hir, declarations[ordinal].header) {
+      if let Node.FunctionHeader {linkage, contract, ..} = Module.node(hir, declarations[ordinal].header) {
         if !linkage.present && takesCallable(hir, contract) {
           inlining = MirInlining.Hint
           if forwardingBody(hir, declarations[ordinal].local) { inlining = MirInlining.Always }
         }
+        let directives = Directives.of(hir, declarations[ordinal].local)
         let mut at = usize.ZERO
-        while !linkage.present && at < properties.length {
-          if let Node.PropertyClause {namespace, operation, ..} = Module.node(hir, Module.child(hir, properties, at)) {
-            if nameIs(hir, namespace, b"Intrinsic") {
-              if nameIs(hir, operation, b"inline") { inlining = MirInlining.Hint }
-              if nameIs(hir, operation, b"inlineAlways") { inlining = MirInlining.Always }
-              if nameIs(hir, operation, b"inlineNever") { inlining = MirInlining.Never }
-              if nameIs(hir, operation, b"cold") { inlining = MirInlining.Cold }
-            }
+        while !linkage.present && at < directives.length {
+          if let Option<DirectiveKind>.Some {value: kind} = Directives.kindOf(hir, Module.child(hir, directives, at)) {
+            if kind == DirectiveKind.Inline { inlining = MirInlining.Hint }
+            if kind == DirectiveKind.InlineAlways { inlining = MirInlining.Always }
+            if kind == DirectiveKind.InlineNever { inlining = MirInlining.Never }
+            if kind == DirectiveKind.Cold { inlining = MirInlining.Cold }
           }
           at = at + usize.ONE
         }
@@ -76115,66 +76056,28 @@ effect fn declarationInlining(resolver: &mut Resolver, module: &ModuleId, ordina
   return inlining
 }
 
-// The clause and value of the first `features:` entry of an `Intrinsic.machine(...)` clause.
-fn featuresProperty(hir: &Module, properties: Range) -> Option<FeaturesProperty> {
-  let mut at = usize.ZERO
-  while at < properties.length {
-    let clause = Module.child(hir, properties, at)
-    if let Node.PropertyClause {namespace, operation, properties: written} = Module.node(hir, clause) {
-      if nameIs(hir, namespace, b"Intrinsic") && nameIs(hir, operation, b"machine") {
-        let mut field = usize.ZERO
-        while field < written.length {
-          if let Node.Property {name, value} = Module.node(hir, Module.child(hir, written, field)) {
-            if nameIs(hir, name, b"features") {
-              return Option<FeaturesProperty>.some(FeaturesProperty {clause: clause, value: value})
-            }
-          }
-          field = field + usize.ONE
-        }
-      }
-    }
-    at = at + usize.ONE
-  }
-  return Option<FeaturesProperty>.none()
-}
-
-struct FeaturesProperty {
-  clause: HirId,
-  value: HirId,
-}
-
-// The entries of a `features:` value: a tuple of text literals, or one parenthesized literal.
-// A non-literal entry is returned as its span in `invalid`, and so is an empty list, which `empty`
-// marks.
-effect fn featureEntries(hir: &Module, value: HirId) -> FeatureEntries ! OutOfMemoryError ? &mut Allocator {
+// The entries of an `@features(...)` directive: its text literals, in written order. A non-literal
+// entry is returned as its span in `invalid`, and so is an empty list, which `empty` marks.
+effect fn featureEntries(hir: &Module, directive: HirId) -> FeatureEntries ! OutOfMemoryError ? &mut Allocator {
   let mut names = List<Bytes>.make()
   let mut spans = List<Span>.make()
   let mut invalid = Option<Span>.none()
   let mut empty = false
-  if let Node.UnitLiteral = Module.node(hir, value) {
+  let listed = run Directives.texts(hir, directive)
+  let elements = List<HirId>.asSlice(&listed)
+  let mut at = usize.ZERO
+  while at < elements.length {
+    if let Node.TextLiteral {value: text} = Module.node(hir, elements[at]) {
+      run List<Bytes>.append(&mut names, run Bytes.copy(Module.text(hir, text)))
+      run List<Span>.append(&mut spans, Module.span(hir, elements[at]))
+    } else if let Option<Span>.None = &invalid {
+      invalid = Option<Span>.some(Module.span(hir, elements[at]))
+    }
+    at = at + usize.ONE
+  }
+  if elements.length == usize.ZERO {
     empty = true
-    invalid = Option<Span>.some(Module.span(hir, value))
-  } else if let Node.TupleExpression {elements} = Module.node(hir, value) {
-    let mut at = usize.ZERO
-    while at < elements.length {
-      let element = Module.child(hir, elements, at)
-      if let Node.TextLiteral {value: text} = Module.node(hir, element) {
-        run List<Bytes>.append(&mut names, run Bytes.copy(Module.text(hir, text)))
-        run List<Span>.append(&mut spans, Module.span(hir, element))
-      } else if let Option<Span>.None = &invalid {
-        invalid = Option<Span>.some(Module.span(hir, element))
-      }
-      at = at + usize.ONE
-    }
-    if elements.length == usize.ZERO {
-      empty = true
-      invalid = Option<Span>.some(Module.span(hir, value))
-    }
-  } else if let Node.TextLiteral {value: text} = Module.node(hir, value) {
-    run List<Bytes>.append(&mut names, run Bytes.copy(Module.text(hir, text)))
-    run List<Span>.append(&mut spans, Module.span(hir, value))
-  } else {
-    invalid = Option<Span>.some(Module.span(hir, value))
+    invalid = Option<Span>.some(Module.span(hir, directive))
   }
   return FeatureEntries {names: move names, spans: move spans, invalid: move invalid, empty: empty}
 }
@@ -76189,9 +76092,9 @@ struct FeatureEntries {
 // The first conflict of a function's `features:` list: an empty list or an entry outside the
 // target's catalog (SEM0242), a `static` function (SEM0236), or a function not declared `unsafe`
 // (SEM0243).
-effect fn featuresConflict(resolver: &Resolver, hir: &Module, property: &FeaturesProperty, isUnsafe: bool,
+effect fn featuresConflict(resolver: &Resolver, hir: &Module, directive: HirId, isUnsafe: bool,
   isStatic: bool, name: &[u8], span: Span) -> Option<HeaderConflict> ! OutOfMemoryError ? &mut Allocator {
-  let entries = run featureEntries(hir, property.value)
+  let entries = run featureEntries(hir, directive)
   if let Option<Span>.Some {value: invalid} = &entries.invalid {
     if entries.empty {
       let mut arguments = List<MessageArgument>.make()
@@ -76210,7 +76113,7 @@ effect fn featuresConflict(resolver: &Resolver, hir: &Module, property: &Feature
     }
     at = at + usize.ONE
   }
-  if isStatic { return conflictAt(RejectionCode.MisplacedProperty, Module.span(hir, property.clause)) }
+  if isStatic { return conflictAt(RejectionCode.MisplacedDirective, Module.span(hir, directive)) }
   if !isUnsafe { return run namedHeaderConflict(RejectionCode.FeatureFunctionRequiresUnsafe, span, b"name", name) }
   return Option<HeaderConflict>.none()
 }
@@ -76224,19 +76127,21 @@ effect fn featureConflict(resolver: &Resolver, span: Span, feature: &[u8]) -> Op
   return Option<HeaderConflict>.some(HeaderConflict {code: RejectionCode.UnknownFunctionFeature, span: span, arguments: move arguments})
 }
 
-// The CPU features a declaration's `with Intrinsic.machine(features: ...)` clause lists, as
-// written; empty for any other declaration (SIMD-009). Reads the header facet only.
+// The CPU features a declaration's `@features(...)` directive lists, as written; empty for any
+// other declaration (SIMD-009). Reads the header and directives facets only.
 effect fn declarationFeatures(resolver: &mut Resolver, module: &ModuleId, ordinal: usize) -> List<Bytes>
 ! Cycle | OutOfMemoryError ? &mut Allocator {
+  drop run observedDeclaration(&mut resolver.*, module, ordinal, SourceFacet.Directives)
   let answer = run observedDeclaration(&mut resolver.*, module, ordinal, SourceFacet.Header)
   if let Option<&IndexedSource>.Some {value} = move sourceOf(&resolver.*, &answer, module) {
     let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(value))
     if ordinal < declarations.length {
       let hir = IndexedSource.authored(value)
-      if let Node.FunctionHeader {properties, linkage, ..} = Module.node(hir, declarations[ordinal].header) {
+      if let Node.FunctionHeader {linkage, ..} = Module.node(hir, declarations[ordinal].header) {
         if !linkage.present {
-          if let Option<FeaturesProperty>.Some {value: property} = move featuresProperty(hir, properties) {
-            let entries = run featureEntries(hir, property.value)
+          let directives = Directives.of(hir, declarations[ordinal].local)
+          if let Option<HirId>.Some {value: directive} = move Directives.find(hir, directives, DirectiveKind.Features) {
+            let entries = run featureEntries(hir, directive)
             return move entries.names
           }
         }
@@ -76287,37 +76192,6 @@ effect fn featureAttribute(resolver: &Resolver, listed: &[Bytes]) -> Bytes ! Out
   return move text
 }
 
-// The span of the first header property clause that is, or has an argument, outside the
-// language's property vocabulary (SEM0235): `Intrinsic.foreign(memory:, locality:, noCapture:, callbacks:,
-// threadCallbacks:)`,
-// `Intrinsic.machine(naked:, noReturn:, features:)` and the argument-free `Intrinsic.nonParking()`,
-// `Intrinsic.inline()`, `Intrinsic.inlineAlways()` and `Intrinsic.inlineNever()`. Whether
-// a known property is admitted where it is written stays the position's own question.
-fn unknownProperty(hir: &Module, properties: Range) -> Option<Span> {
-  let mut at = usize.ZERO
-  while at < properties.length {
-    let clause = Module.child(hir, properties, at)
-    if let Node.PropertyClause {namespace, operation, properties: written} = Module.node(hir, clause) {
-      let foreign = nameIs(hir, operation, b"foreign")
-      let machine = nameIs(hir, operation, b"machine")
-      if !nameIs(hir, namespace, b"Intrinsic") || (!foreign && !machine && !nameIs(hir, operation, b"nonParking") && !inlineOperation(hir, operation)) {
-        return Option<Span>.some(Module.span(hir, clause))
-      }
-      let mut field = usize.ZERO
-      while field < written.length {
-        if let Node.Property {name, ..} = Module.node(hir, Module.child(hir, written, field)) {
-          let known = (foreign && (nameIs(hir, name, b"memory") || nameIs(hir, name, b"locality") || nameIs(hir, name, b"noCapture")
-            || nameIs(hir, name, b"callbacks") || nameIs(hir, name, b"threadCallbacks") || nameIs(hir, name, b"module") || nameIs(hir, name, b"name"))) || (machine && (nameIs(hir, name, b"naked") || nameIs(hir, name, b"noReturn") || nameIs(hir, name, b"features")))
-          if !known { return Option<Span>.some(Module.span(hir, clause)) }
-        }
-        field = field + usize.ONE
-      }
-    }
-    at = at + usize.ONE
-  }
-  return Option<Span>.none()
-}
-
 fn nameIs(hir: &Module, id: HirId, spelling: &[u8]) -> bool {
   return match Module.node(hir, id) {
     Node.Name {text} => same(Module.text(hir, text), spelling)
@@ -76325,33 +76199,31 @@ fn nameIs(hir: &Module, id: HirId, spelling: &[u8]) -> bool {
   }
 }
 
-fn capturesPointerParameters(hir: &Module, value: HirId, parameters: Range) -> bool {
-  if let Node.TupleExpression {elements} = Module.node(hir, value) {
-    let mut at = usize.ZERO
-    while at < elements.length {
-      let element = Module.child(hir, elements, at)
-      if let Node.TextLiteral {value: text} = Module.node(hir, element) {
-        if !pointerParameterNamed(hir, parameters, Module.text(hir, text)) { return false }
-        let mut earlier = usize.ZERO
-        while earlier < at {
-          if let Node.TextLiteral {value: previous} = Module.node(hir, Module.child(hir, elements, earlier)) {
-            if same(Module.text(hir, previous), Module.text(hir, text)) { return false }
-          }
-          earlier = earlier + usize.ONE
+// Whether `elements` are distinct text literals that each name a C pointer parameter.
+fn capturesPointerParameters(hir: &Module, elements: &[HirId], parameters: Range) -> bool {
+  if elements.length == usize.ZERO { return false }
+  let mut at = usize.ZERO
+  while at < elements.length {
+    if let Node.TextLiteral {value: text} = Module.node(hir, elements[at]) {
+      if !pointerParameterNamed(hir, parameters, Module.text(hir, text)) { return false }
+      let mut earlier = usize.ZERO
+      while earlier < at {
+        if let Node.TextLiteral {value: previous} = Module.node(hir, elements[earlier]) {
+          if same(Module.text(hir, previous), Module.text(hir, text)) { return false }
         }
-      } else {
-        return false
+        earlier = earlier + usize.ONE
       }
-      at = at + usize.ONE
+    } else {
+      return false
     }
-    return true
+    at = at + usize.ONE
   }
-  return false
+  return true
 }
 
-// The `callbacks` field naming every C function-pointer parameter, as `callbacks: ("compare",)`.
+// The `@callbacks` directive naming every C function-pointer parameter, as `@callbacks("compare")`.
 effect fn callbacksField(hir: &Module, parameters: Range) -> Bytes ! OutOfMemoryError ? &mut Allocator {
-  let mut field = run Bytes.copy(b"callbacks: (")
+  let mut field = run Bytes.copy(b"@callbacks(")
   let mut count = usize.ZERO
   let mut at = usize.ZERO
   while at < parameters.length {
@@ -76368,7 +76240,6 @@ effect fn callbacksField(hir: &Module, parameters: Range) -> Bytes ! OutOfMemory
     }
     at = at + usize.ONE
   }
-  if count == usize.ONE { run Bytes.append(&mut field, b",") }
   run Bytes.append(&mut field, b")")
   return move field
 }
@@ -76384,52 +76255,52 @@ fn hasCallbackParameter(hir: &Module, parameters: Range) -> bool {
   return false
 }
 
-fn capturesCallbackParameters(hir: &Module, value: HirId, parameters: Range) -> bool {
-  if let Node.TupleExpression {elements} = Module.node(hir, value) {
-    let mut at = usize.ZERO
-    while at < elements.length {
-      let mut selected = false
-      if let Node.TextLiteral {value: spelling} = Module.node(hir, Module.child(hir, elements, at)) {
-        let mut parameter = usize.ZERO
-        while parameter < parameters.length {
-          if let Node.Parameter {name, annotation, ..} = Module.node(hir, Module.child(hir, parameters, parameter)) {
-            if nameIs(hir, name, Module.text(hir, spelling)) {
-              selected = true
-            }
+// Whether `elements` are distinct text literals that name parameters, together naming every C
+// function-pointer parameter.
+fn capturesCallbackParameters(hir: &Module, elements: &[HirId], parameters: Range) -> bool {
+  if elements.length == usize.ZERO { return false }
+  let mut at = usize.ZERO
+  while at < elements.length {
+    let mut selected = false
+    if let Node.TextLiteral {value: spelling} = Module.node(hir, elements[at]) {
+      let mut parameter = usize.ZERO
+      while parameter < parameters.length {
+        if let Node.Parameter {name, ..} = Module.node(hir, Module.child(hir, parameters, parameter)) {
+          if nameIs(hir, name, Module.text(hir, spelling)) {
+            selected = true
           }
-          parameter = parameter + usize.ONE
         }
-        let mut earlier = usize.ZERO
-        while earlier < at {
-          if let Node.TextLiteral {value: previous} = Module.node(hir, Module.child(hir, elements, earlier)) {
-            if same(Module.text(hir, previous), Module.text(hir, spelling)) { return false }
-          }
-          earlier = earlier + usize.ONE
-        }
+        parameter = parameter + usize.ONE
       }
-      if !selected { return false }
-      at = at + usize.ONE
-    }
-    let mut parameter = usize.ZERO
-    while parameter < parameters.length {
-      if let Node.Parameter {name, annotation, ..} = Module.node(hir, Module.child(hir, parameters, parameter)) {
-        if let Node.ForeignFunctionType {..} = Module.node(hir, annotation) {
-          let mut listed = false
-          let mut entry = usize.ZERO
-          while entry < elements.length {
-            if let Node.TextLiteral {value: spelling} = Module.node(hir, Module.child(hir, elements, entry)) {
-              if nameIs(hir, name, Module.text(hir, spelling)) { listed = true }
-            }
-            entry = entry + usize.ONE
-          }
-          if !listed { return false }
+      let mut earlier = usize.ZERO
+      while earlier < at {
+        if let Node.TextLiteral {value: previous} = Module.node(hir, elements[earlier]) {
+          if same(Module.text(hir, previous), Module.text(hir, spelling)) { return false }
         }
+        earlier = earlier + usize.ONE
       }
-      parameter = parameter + usize.ONE
     }
-    return true
+    if !selected { return false }
+    at = at + usize.ONE
   }
-  return false
+  let mut parameter = usize.ZERO
+  while parameter < parameters.length {
+    if let Node.Parameter {name, annotation, ..} = Module.node(hir, Module.child(hir, parameters, parameter)) {
+      if let Node.ForeignFunctionType {..} = Module.node(hir, annotation) {
+        let mut listed = false
+        let mut entry = usize.ZERO
+        while entry < elements.length {
+          if let Node.TextLiteral {value: spelling} = Module.node(hir, elements[entry]) {
+            if nameIs(hir, name, Module.text(hir, spelling)) { listed = true }
+          }
+          entry = entry + usize.ONE
+        }
+        if !listed { return false }
+      }
+    }
+    parameter = parameter + usize.ONE
+  }
+  return true
 }
 
 fn pointerParameterNamed(hir: &Module, parameters: Range, spelling: &[u8]) -> bool {
@@ -76448,35 +76319,27 @@ fn pointerParameterNamed(hir: &Module, parameters: Range, spelling: &[u8]) -> bo
   return false
 }
 
-effect fn normalizedNoCapture(hir: &Module, properties: Range, parameters: Range) -> List<usize>
+// The positions of the parameters an `@foreign(noCapture: ...)` argument names, in parameter order.
+effect fn normalizedNoCapture(hir: &Module, directives: Range, parameters: Range) -> List<usize>
 ! OutOfMemoryError ? &mut Allocator {
   let mut selected = List<usize>.make()
+  let mut listed = List<HirId>.make()
+  if let Option<HirId>.Some {value: directive} = move Directives.find(hir, directives, DirectiveKind.Foreign) {
+    if let Option<HirId>.Some {value} = move Directives.argument(hir, directive, b"noCapture") {
+      run Directives.values(hir, value, &mut listed)
+    }
+  }
+  let elements = List<HirId>.asSlice(&listed)
   let mut parameter = usize.ZERO
   while parameter < parameters.length {
     if let Node.Parameter {name, ..} = Module.node(hir, Module.child(hir, parameters, parameter)) {
       let mut retained = false
-      let mut clause = usize.ZERO
-      while clause < properties.length {
-        if let Node.PropertyClause {properties: fields, ..} = Module.node(hir, Module.child(hir, properties, clause)) {
-          let mut field = usize.ZERO
-          while field < fields.length {
-            if let Node.Property {name: property, value} = Module.node(hir, Module.child(hir, fields, field)) {
-              if nameIs(hir, property, b"noCapture") {
-                if let Node.TupleExpression {elements} = Module.node(hir, value) {
-                  let mut entry = usize.ZERO
-                  while entry < elements.length {
-                    if let Node.TextLiteral {value: spelling} = Module.node(hir, Module.child(hir, elements, entry)) {
-                      if nameIs(hir, name, Module.text(hir, spelling)) { retained = true }
-                    }
-                    entry = entry + usize.ONE
-                  }
-                }
-              }
-            }
-            field = field + usize.ONE
-          }
+      let mut entry = usize.ZERO
+      while entry < elements.length {
+        if let Node.TextLiteral {value: spelling} = Module.node(hir, elements[entry]) {
+          if nameIs(hir, name, Module.text(hir, spelling)) { retained = true }
         }
-        clause = clause + usize.ONE
+        entry = entry + usize.ONE
       }
       if retained { run List<usize>.append(&mut selected, parameter) }
     }
@@ -76501,6 +76364,38 @@ effect fn linked(resolver: &mut Resolver, module: &ModuleId, ordinal: usize) -> 
   return false
 }
 
+// The position of the `#` that separates a WebAssembly import's module from its field, or
+// `usize.MAX` for a symbol that names no pair.
+fn wasmPairSplit(symbol: &[u8]) -> usize {
+  let mut at = usize.ZERO
+  while at < symbol.length {
+    if symbol[at] == 35 { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+// The native symbol of a WebAssembly import of `pair`: `__silk_import_` followed by the pair with
+// every byte other than an ASCII letter or digit written as `_` and two lowercase hex digits.
+effect fn wasmImportSymbol(pair: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let digits: &[u8] = b"0123456789abcdef"
+  let mut symbol = run Bytes.copy(b"__silk_import_")
+  let mut at = usize.ZERO
+  while at < pair.length {
+    let byte = pair[at]
+    let plain = (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+    if plain {
+      run Bytes.append(&mut symbol, Slice.view<u8>(pair, at, usize.ONE))
+    } else {
+      run Bytes.append(&mut symbol, b"_")
+      run Bytes.append(&mut symbol, Slice.view<u8>(digits, u8.toUsize(byte / 16), usize.ONE))
+      run Bytes.append(&mut symbol, Slice.view<u8>(digits, u8.toUsize(byte % 16), usize.ONE))
+    }
+    at = at + usize.ONE
+  }
+  return move symbol
+}
+
 struct ForeignHeader {
   importModule: Bytes,
   importName: Bytes,
@@ -76513,8 +76408,8 @@ struct ForeignHeader {
   exported: bool,
   /// Whether the declaration is a C object (`static`) rather than a function.
   global: bool,
-  /// The `callbacks` field a function with C function-pointer parameters needs when its
-  /// properties do not name each of them once, as `callbacks: ("compare",)`; empty otherwise.
+  /// The `@callbacks` directive a function with C function-pointer parameters needs when its
+  /// directives do not name each of them once, as `@callbacks("compare")`; empty otherwise.
   callbacks: Bytes,
 }
 
@@ -76531,7 +76426,8 @@ effect fn foreignHeader(resolver: &mut Resolver, module: &ModuleId, ordinal: usi
     let hir = IndexedSource.authored(value)
     if ordinal < declarations.length {
       let span = Module.span(hir, declarations[ordinal].header)
-      if let Node.StaticHeader {name, linkage, properties, ..} = Module.node(hir, declarations[ordinal].header) {
+      let directives = Directives.of(hir, declarations[ordinal].local)
+      if let Node.StaticHeader {name, linkage, ..} = Module.node(hir, declarations[ordinal].header) {
         if let Node.Linkage {direction, abi, symbol} = Module.node(hir, linkage) {
           let mut symbolName = Bytes.make()
           if let Node.Name {text} = Module.node(hir, name) { symbolName = run Bytes.copy(Module.text(hir, text)) }
@@ -76539,14 +76435,14 @@ effect fn foreignHeader(resolver: &mut Resolver, module: &ModuleId, ordinal: usi
             if let Node.TextLiteral {value: text} = Module.node(hir, symbol.id) { symbolName = run Bytes.copy(Module.text(hir, text)) }
           }
           let mut gap = Option<GapCode>.none()
-          if properties.length > usize.ZERO { gap = Option<GapCode>.some(GapCode.ForeignContract) }
+          if directives.length > usize.ZERO { gap = Option<GapCode>.some(GapCode.ForeignContract) }
           let mut c = false
           if let Node.TextLiteral {value: text} = Module.node(hir, abi) { c = same(Module.text(hir, text), b"C") }
           if !c { gap = Option<GapCode>.some(GapCode.ForeignAbi) }
           return ForeignHeader {importModule: Bytes.make(), importName: Bytes.make(), behavior: ForeignContract.conservative(), noCapture: List<usize>.make(), symbol: move symbolName, gap: move gap, span: span, exported: direction == LinkageDirection.Export, global: true, callbacks: Bytes.make()}
         }
       }
-      if let Node.FunctionHeader {name, contract, linkage, properties, ..} = Module.node(hir, declarations[ordinal].header) {
+      if let Node.FunctionHeader {name, contract, linkage, ..} = Module.node(hir, declarations[ordinal].header) {
         if linkage.present {
           if let Node.Linkage {direction, abi, symbol} = Module.node(hir, linkage.id) {
             let exported = direction == LinkageDirection.Export
@@ -76559,10 +76455,10 @@ effect fn foreignHeader(resolver: &mut Resolver, module: &ModuleId, ordinal: usi
             let mut behavior = ForeignContract.conservative()
             let mut noCapture = List<usize>.make()
             let mut callbacks = Bytes.make()
-            if let Option<ForeignContract>.Some {value: literalBehavior} = move NativeForeign.declarationContract(hir, properties) { behavior = literalBehavior }
+            if let Option<ForeignContract>.Some {value: literalBehavior} = move NativeForeign.contract(hir, directives) { behavior = literalBehavior }
             if let Node.CallableContract {variadic, generics, parameters, result, isEffect, isStatic, isUnsafe, ..} = Module.node(hir, contract) {
-              noCapture = run normalizedNoCapture(hir, properties, parameters)
-              if !admittedForeignProperties(hir, properties, parameters) {
+              noCapture = run normalizedNoCapture(hir, directives, parameters)
+              if !(run admittedForeignDirectives(hir, directives, parameters)) {
                 gap = Option<GapCode>.some(GapCode.ForeignContract)
                 if hasCallbackParameter(hir, parameters) {
                   gap = Option<GapCode>.some(GapCode.CAbiCallback)
@@ -76582,12 +76478,12 @@ effect fn foreignHeader(resolver: &mut Resolver, module: &ModuleId, ordinal: usi
                 }
               }
               if exported && !isUnsafe {
-                let asserted = NativeForeign.contract(hir, properties)
+                let asserted = NativeForeign.contract(hir, directives)
                 match move asserted {
                   Option<ForeignContract>.Some {value: assertedBehavior} => {
                     if !ForeignContract.same(assertedBehavior, ForeignContract.conservative()) { gap = Option<GapCode>.some(GapCode.ForeignContract) }
                   }
-                  Option<ForeignContract>.None => { if properties.length > usize.ZERO { gap = Option<GapCode>.some(GapCode.ForeignContract) } }
+                  Option<ForeignContract>.None => { if directives.length > usize.ZERO { gap = Option<GapCode>.some(GapCode.ForeignContract) } }
                 }
               }
               if generics.length > usize.ZERO || isEffect || isStatic || (!isUnsafe && !exported) {
@@ -76599,35 +76495,27 @@ effect fn foreignHeader(resolver: &mut Resolver, module: &ModuleId, ordinal: usi
             if !c { gap = Option<GapCode>.some(GapCode.ForeignAbi) }
             let mut importModule = Bytes.make()
             let mut importName = Bytes.make()
-            let mut modulePresent = false
-            let mut namePresent = false
-            let mut clause = usize.ZERO
-            while clause < properties.length {
-              if let Node.PropertyClause {properties: fields, ..} = Module.node(hir, Module.child(hir, properties, clause)) {
-                let mut field = usize.ZERO
-                while field < fields.length {
-                  if let Node.Property {name: property, value: propertyValue} = Module.node(hir, Module.child(hir, fields, field)) {
-                    let isModule = nameIs(hir, property, b"module")
-                    let isName = nameIs(hir, property, b"name")
-                    if isModule || isName {
-                      if exported || !same(MachineTarget.objectFormat(&resolver.target), b"wasm") || (isModule && modulePresent) || (isName && namePresent) {
-                        gap = Option<GapCode>.some(GapCode.ForeignContract)
-                      }
-                      if isModule { modulePresent = true } else { namePresent = true }
-                      if let Node.TextLiteral {value: text} = Module.node(hir, propertyValue) {
-                        let bytes = Module.text(hir, text)
-                        if !NativeForeign.validWasmName(bytes) { gap = Option<GapCode>.some(GapCode.ForeignContract) }
-                        if isModule { importModule = run Bytes.copy(bytes) } else { importName = run Bytes.copy(bytes) }
-                      } else { gap = Option<GapCode>.some(GapCode.ForeignContract) }
-                    }
-                  }
-                  field = field + usize.ONE
-                }
+            // A WebAssembly import writes its module and field as `extern "C" as "module#name"`. An
+            // empty field imports the function's own name. The native symbol is derived from the
+            // pair, so two imports of one pair share it and no other declaration can. An export's
+            // `#` is part of its WIT name, as in `"example:api/items@1.0.0#read"`.
+            let split = wasmPairSplit(Bytes.asSlice(&symbolName))
+            if split != usize.MAX && !exported {
+              let pair = Bytes.asSlice(&symbolName)
+              importModule = run Bytes.copy(Slice.view<u8>(pair, usize.ZERO, split))
+              importName = run Bytes.copy(Slice.view<u8>(pair, split + usize.ONE, pair.length - split - usize.ONE))
+              if Bytes.length(&importName) == usize.ZERO {
+                if let Node.Name {text} = Module.node(hir, name) { importName = run Bytes.copy(Module.text(hir, text)) }
               }
-              clause = clause + usize.ONE
+              if !same(MachineTarget.objectFormat(&resolver.target), b"wasm") || !NativeForeign.validWasmName(Bytes.asSlice(&importModule))
+                || !NativeForeign.validWasmName(Bytes.asSlice(&importName)) {
+                gap = Option<GapCode>.some(GapCode.ForeignContract)
+              }
+              let mut filled = run Bytes.copy(Bytes.asSlice(&importModule))
+              run Bytes.append(&mut filled, b"#")
+              run Bytes.append(&mut filled, Bytes.asSlice(&importName))
+              symbolName = run wasmImportSymbol(Bytes.asSlice(&filled))
             }
-            if namePresent && !modulePresent { gap = Option<GapCode>.some(GapCode.ForeignContract) }
-            if modulePresent && !namePresent { importName = run Bytes.copy(Bytes.asSlice(&symbolName)) }
             return ForeignHeader {importModule: move importModule, importName: move importName, behavior: behavior, noCapture: move noCapture, symbol: move symbolName, gap: move gap, span: span, exported: exported, global: false, callbacks: move callbacks}
           }
         }
@@ -76801,39 +76689,36 @@ fn borrowedLane(value: &Type) -> bool {
   return match &value.* { Type.Reference {..} => true Type.Slice {..} => true _ => false }
 }
 
-// Header spelling alone cannot identify aliased C pointer lanes. Authenticate the callback tuple
+// Header spelling alone cannot identify aliased C pointer lanes. Authenticate the callback list
 // again against the resolved C signature, including aliases and exact completeness. A thread
-// tuple's callbacks must also be reference-free.
-fn resolvedCallbackTuple(hir: &Module, value: HirId, parameters: Range, lanes: &[CAbi.Lane], thread: bool) -> bool {
+// list's callbacks must also be reference-free.
+fn resolvedCallbackTuple(hir: &Module, elements: &[HirId], parameters: Range, lanes: &[CAbi.Lane], thread: bool) -> bool {
   let mut count = usize.ZERO
   let mut at = usize.ZERO
   while at < lanes.length {
     if Shared<Type>.with<bool>(&lanes[at].ty, nativeFunctionPointer) { count = count + usize.ONE }
     at = at + usize.ONE
   }
-  if let Node.TupleExpression {elements} = Module.node(hir, value) {
-    if elements.length != count { return false }
-    at = usize.ZERO
-    while at < elements.length {
-      let mut selected = false
-      if let Node.TextLiteral {value: spelling} = Module.node(hir, Module.child(hir, elements, at)) {
-        let mut parameter = usize.ZERO
-        while parameter < parameters.length && parameter < lanes.length {
-          if let Node.Parameter {name, ..} = Module.node(hir, Module.child(hir, parameters, parameter)) {
-            if nameIs(hir, name, Module.text(hir, spelling)) {
-              selected = Shared<Type>.with<bool>(&lanes[parameter].ty, nativeFunctionPointer)
-              if thread && selected { selected = Shared<Type>.with<bool>(&lanes[parameter].ty, referenceFreeCallback) }
-            }
+  if elements.length != count { return false }
+  at = usize.ZERO
+  while at < elements.length {
+    let mut selected = false
+    if let Node.TextLiteral {value: spelling} = Module.node(hir, elements[at]) {
+      let mut parameter = usize.ZERO
+      while parameter < parameters.length && parameter < lanes.length {
+        if let Node.Parameter {name, ..} = Module.node(hir, Module.child(hir, parameters, parameter)) {
+          if nameIs(hir, name, Module.text(hir, spelling)) {
+            selected = Shared<Type>.with<bool>(&lanes[parameter].ty, nativeFunctionPointer)
+            if thread && selected { selected = Shared<Type>.with<bool>(&lanes[parameter].ty, referenceFreeCallback) }
           }
-          parameter = parameter + usize.ONE
         }
+        parameter = parameter + usize.ONE
       }
-      if !selected { return false }
-      at = at + usize.ONE
     }
-    return true
+    if !selected { return false }
+    at = at + usize.ONE
   }
-  return false
+  return true
 }
 
 effect fn resolvedCallbackParameters(resolver: &mut Resolver, location: InstanceLocation, lanes: &[CAbi.Lane]) -> bool
@@ -76843,21 +76728,19 @@ effect fn resolvedCallbackParameters(resolver: &mut Resolver, location: Instance
   if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &observed, &module) {
     let hir = IndexedSource.authored(indexed)
     let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
-    if let Node.FunctionHeader {contract, properties, ..} = Module.node(hir, declarations[location.declaration].header) {
+    if let Node.FunctionHeader {contract, ..} = Module.node(hir, declarations[location.declaration].header) {
       if let Node.CallableContract {parameters, ..} = Module.node(hir, contract) {
-        let mut clause = usize.ZERO
-        while clause < properties.length {
-          if let Node.PropertyClause {properties: fields, ..} = Module.node(hir, Module.child(hir, properties, clause)) {
-            let mut field = usize.ZERO
-            while field < fields.length {
-              if let Node.Property {name, value} = Module.node(hir, Module.child(hir, fields, field)) {
-                if nameIs(hir, name, b"callbacks") { return resolvedCallbackTuple(hir, value, parameters, lanes, false) }
-                if nameIs(hir, name, b"threadCallbacks") { return resolvedCallbackTuple(hir, value, parameters, lanes, true) }
-              }
-              field = field + usize.ONE
+        let directives = Directives.of(hir, declarations[location.declaration].local)
+        let mut at = usize.ZERO
+        while at < directives.length {
+          let id = Module.child(hir, directives, at)
+          if let Option<DirectiveKind>.Some {value: kind} = Directives.kindOf(hir, id) {
+            if kind == DirectiveKind.Callbacks || kind == DirectiveKind.ThreadCallbacks {
+              let listed = run Directives.texts(hir, id)
+              return resolvedCallbackTuple(hir, List<HirId>.asSlice(&listed), parameters, lanes, kind == DirectiveKind.ThreadCallbacks)
             }
           }
-          clause = clause + usize.ONE
+          at = at + usize.ONE
         }
       }
     }
@@ -89139,6 +89022,11 @@ impl Semantic {
       }
     }
     let kind = DeclarationId.kind(&declaration.identity)
+    if kind != OwnerKind.Function {
+      if let Option<Shared<Rejection>>.Some { value } = move run directiveRejection(&mut self.resolver, module, declaration.ordinal) {
+        run appendDeclarationRejection(&mut sweep.rejections, move value)
+      }
+    }
     let mut families = List<Family>.make()
     match kind {
       OwnerKind.Function => {
@@ -89318,11 +89206,6 @@ impl Semantic {
           if Shared<Result<Answer, NoRejection>>.with<bool>(&head, checkedConformanceHead) {
             run List<Family>.append(&mut families, Family.Witnesses)
           }
-        }
-      }
-      OwnerKind.ModuleProperty => {
-        if let Option<Shared<Rejection>>.Some { value } = move run modulePropertyRejection(&mut self.resolver, module, declaration.ordinal) {
-          run appendDeclarationRejection(&mut sweep.rejections, move value)
         }
       }
 
@@ -91849,7 +91732,13 @@ impl Semantic {
         // Without a selected runtime the application supplies its own C entry, so only then may it
         // claim `main` or `_start`.
         let entry = NativeForeign.entrySymbol(Bytes.asSlice(&claim.symbol))
-        let reserved = NativeForeign.reservedSymbol(Bytes.asSlice(&claim.symbol)) && (hostedStart(runtime) || !entry)
+        let mut reserved = NativeForeign.reservedSymbol(Bytes.asSlice(&claim.symbol)) && (hostedStart(runtime) || !entry)
+        // An import's `"module#name"` names a WebAssembly pair, not a symbol; its declaration
+        // checks the pair and its target (`foreignHeader`).
+        if !claim.exported && !claim.global && wasmPairSplit(Bytes.asSlice(&claim.symbol)) != usize.MAX {
+          valid = true
+          reserved = false
+        }
         if !valid {
           run appendDeclarationRejection(&mut rejections.*, run reject(&self.resolver, &module, RejectionCode.InvalidForeignSymbol, claim.span))
           continue
@@ -98451,6 +98340,11 @@ effect fn appendForeignClaim(found: &mut List<ForeignClaim>, hir: &Module, modul
     }
     // A declaration name is never empty unless recovery stood in for a missing one.
     if !symbol.present && Bytes.asSlice(&spelled).length == usize.ZERO { damaged = true }
+    // A function import's `"module#"` imports its own name, so it claims the pair it fills in.
+    let split = wasmPairSplit(Bytes.asSlice(&spelled))
+    if !global && direction == LinkageDirection.Import && split != usize.MAX && split + usize.ONE == Bytes.length(&spelled) {
+      if let Node.Name {text} = Module.node(hir, name) { run Bytes.append(&mut spelled, Module.text(hir, text)) }
+    }
     run List<ForeignClaim>.append(&mut found.*, ForeignClaim {
       module: module, declaration: declaration, symbol: move spelled, span: span, header: header,
       exported: direction == LinkageDirection.Export, global: global, damaged: damaged,
