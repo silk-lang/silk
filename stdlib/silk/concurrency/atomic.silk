@@ -1,0 +1,487 @@
+//! Atomic memory operations on raw pointers, with explicit memory orderings.
+//!
+//! # When to use
+//! Use these operations to build synchronization: counters, flags, lock words, and queues that
+//! several threads read and write at the same time. For most code, the types in `silk.concurrency.sync` (`Arc`,
+//! `Mutex`, `Parker`) are easier and safer.
+//!
+//! # Details
+//! Each operation is one indivisible access to a naturally aligned integer or data pointer. The
+//! [`MemoryOrder`] argument is static, so the operation and its ordering are fixed at compile time.
+//! The model is the C++20 model: an acquire load that reads a release store makes every write
+//! before that store visible after the load.
+//!
+//! [`Atomic.wait`], [`Atomic.notifyOne`] and [`Atomic.notifyAll`] are a futex: a thread sleeps
+//! until the value at an address changes. They work on Darwin on aarch64, Linux with GNU libc on
+//! x86_64 or aarch64, and wasm32.
+//!
+//! # Gotchas
+//! - A plain access that races with any other access to the same location is undefined behavior,
+//!   also when the other access is atomic. Make every access to a shared location atomic, with the
+//!   same width.
+//! - All operations except [`Atomic.fence`] are unsafe. The caller proves that the pointer is live
+//!   and aligned.
+//!
+//! # Examples
+//! ## Count and claim a flag
+//! ```silk
+//! import silk.concurrency.atomic { Atomic, CompareExchange, MemoryOrder }
+//! import silk.mem.pointer { Pointer }
+//!
+//! // Claims a one-time flag. Only the first caller gets true.
+//! fn claim(flag: *mut u32) -> bool {
+//!   return match unsafe Atomic.compareExchange<u32>(
+//!     flag,
+//!     0,
+//!     1,
+//!     MemoryOrder.Acquire,
+//!     MemoryOrder.Relaxed
+//!   ) {
+//!     CompareExchange<u32>.Exchanged => true
+//!     CompareExchange<u32>.Observed { value } => false
+//!   }
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   let mut hits: u64 = 0
+//!   let counter = Pointer.fromMutRef(&mut hits)
+//!
+//!   // fetchAdd returns the value before the add.
+//!   let before = unsafe Atomic.fetchAdd<u64>(counter, 5, MemoryOrder.Relaxed)
+//!   if before != 0 || unsafe Atomic.load<u64>(counter, MemoryOrder.Relaxed) != 5 {
+//!     return 1
+//!   }
+//!
+//!   let mut claimed: u32 = 0
+//!   let flag = Pointer.fromMutRef(&mut claimed)
+//!   if !claim(flag) || claim(flag) {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Concurrency
+
+import silk.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.pointer { Pointer }
+import silk.num.u32
+import silk.num.u64
+
+extern "C" struct WaitTimespec {
+  seconds: i64,
+  nanoseconds: i64,
+}
+
+unsafe extern "C" fn __ulock_wait(operation: u32, address: *const u32, value: u64, timeout: u32) -> i32 with Intrinsic.foreign(noCapture: ("address",))
+unsafe extern "C" fn __ulock_wake(operation: u32, address: *const u32, wakeValue: u64) -> i32 with Intrinsic.foreign(noCapture: ("address",))
+unsafe extern "C" fn syscall(number: i64, ...) -> i64
+unsafe extern "C" fn __errno_location() -> *mut i32
+// The multi-threaded wasm32 runtime's `memory.atomic.wait32` and `memory.atomic.notify`.
+unsafe extern "C" fn silk_wasm_wait32(address: *const u32, expected: u32, timeout: i64) -> i32
+unsafe extern "C" fn silk_wasm_notify(address: *const u32, count: u32) -> ()
+unsafe fn currentError() -> i32 { unsafe { return Pointer.read<i32>(__errno_location()) } }
+
+// Darwin `UL_COMPARE_AND_WAIT | ULF_NO_ERRNO`: failures return the negated errno.
+const darwinCompareAndWait: u32 = 16777217
+// Darwin `ULF_WAKE_ALL`.
+const darwinWakeAll: u32 = 256
+// Linux `FUTEX_WAIT | FUTEX_PRIVATE_FLAG` and `FUTEX_WAKE | FUTEX_PRIVATE_FLAG`.
+const futexWait: i64 = 128
+const futexWake: i64 = 129
+
+unsafe fn linuxFutex() -> i64 {
+  static if Intrinsic.targetArchitecture() == "x86_64" { return 202 } else { return 98 }
+}
+
+// Wakes one waiter on `pointer`, or every waiter when `all` is true.
+unsafe fn notifyWaiters(pointer: *const u32, all: bool) -> () {
+  static if Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArchitecture() == "aarch64" && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system" {
+    let mut operation = darwinCompareAndWait
+    if all { operation = darwinCompareAndWait | darwinWakeAll }
+    let status = unsafe __ulock_wake(operation, pointer, 0)
+    // -ENOENT reports that nothing waited.
+    if status != 0 && status != -2 { Intrinsic.trap("Atomic.notify: the operating system wake call failed") }
+    return ()
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64") {
+      let mut count: i64 = 1
+      if all { count = 2147483647 }
+      let address = Pointer.address<u32>(pointer)
+      let woken = unsafe syscall(unsafe linuxFutex(), address, futexWake, count)
+      if woken < 0 { Intrinsic.trap("Atomic.notify: the operating system wake call failed") }
+      return ()
+    } else {
+      static if Intrinsic.targetArchitecture() == "wasm32" && Intrinsic.profileText("threading") == "single" {
+        // One thread has nobody else to wake.
+        return ()
+      } else {
+        static if Intrinsic.targetArchitecture() == "wasm32" && Intrinsic.profileText("threading") == "multi" {
+          let mut count: u32 = 1
+          if all { count = 4294967295 }
+          unsafe silk_wasm_notify(pointer, count)
+          return ()
+        } else { compileError("Atomic notify requires a Darwin or GNU libc profile, or WebAssembly") }
+      }
+    }
+  }
+}
+
+/// The ordering constraint of one atomic operation.
+///
+/// # Details
+///
+/// The model is the C++20 model: an acquire load that reads a release store makes every write
+/// before that store visible after the load. The order is a static argument, so the operation and
+/// its ordering are fixed at compile time.
+pub enum MemoryOrder {
+  /// Atomicity only. It orders no other access.
+  Relaxed,
+  /// A load that later reads and writes cannot move before.
+  Acquire,
+  /// A store that earlier reads and writes cannot move after.
+  Release,
+  /// Both acquire and release. Use it for read-modify-write operations and fences.
+  AcquireRelease,
+  /// Acquire and release, plus one total order over every sequentially consistent operation.
+  SequentiallyConsistent,
+}
+
+// The static text the atomic intrinsics take for `order`.
+static fn spelling(order: MemoryOrder) -> string<'static> {
+  if order == MemoryOrder.Relaxed { return "relaxed" }
+  if order == MemoryOrder.Acquire { return "acquire" }
+  if order == MemoryOrder.Release { return "release" }
+  if order == MemoryOrder.AcquireRelease { return "acquireRelease" }
+  return "sequentiallyConsistent"
+}
+
+/// The outcome of a compare-exchange.
+pub union CompareExchange<T> {
+  /// The pointee equaled the expected value and now holds the desired one.
+  Exchanged,
+  /// The pointee held `value`, and nothing was stored.
+  Observed {
+    /// The value read instead of the expected one.
+    pub value: T
+  }
+}
+
+/// The atomic operations over raw pointers, with explicit memory orderings.
+///
+/// # When to use
+///
+/// Use these operations to build synchronization: counters, flags, lock words, and queues that
+/// several threads read and write at the same time. For most code, the types in `silk.concurrency.sync` (`Arc`,
+/// `Mutex`, `Parker`) are easier and safer.
+///
+/// # Details
+///
+/// Each operation is one indivisible access to a naturally aligned integer or data pointer.
+/// `T` is one of `u8`, `u16`, `u32`, `u64`, `usize`, `i8`, `i16`, `i32`, `i64`, `isize`, or a data
+/// pointer for `load`, `store`, `swap`, and the compare-exchanges. The arithmetic and bitwise
+/// operations take integers only and wrap on overflow.
+///
+/// # Gotchas
+///
+/// - A plain access that races with any other access to the same location is undefined behavior,
+///   also when the other access is atomic. Make every access to a shared location atomic, with the
+///   same width.
+/// - All operations except [`Atomic.fence`] are unsafe. The caller proves that the pointer is live
+///   and aligned.
+pub struct Atomic {}
+
+impl Atomic {
+  /// Reads the pointee atomically.
+  ///
+  /// # Safety
+  ///
+  /// The pointer must address live, initialized, naturally aligned storage for `T`. The order must
+  /// be `Relaxed`, `Acquire`, or `SequentiallyConsistent`.
+  /// Every access to the same location that can happen at the same time must be atomic and have
+  /// the same width.
+  pub unsafe fn load<T: Copy>(pointer: *const T, static order: MemoryOrder) -> T {
+    let static spelled = spelling(order)
+    unsafe { return Intrinsic.atomicLoad<T>(pointer, spelled) }
+  }
+
+  /// Writes `value` to the pointee atomically.
+  ///
+  /// # Safety
+  ///
+  /// The pointer must address live, naturally aligned, writable storage for `T`. The order must be
+  /// `Relaxed`, `Release`, or `SequentiallyConsistent`.
+  /// Every access to the same location that can happen at the same time must be atomic and have
+  /// the same width.
+  pub unsafe fn store<T: Copy>(pointer: *mut T, value: T, static order: MemoryOrder) -> () {
+    let static spelled = spelling(order)
+    unsafe { return Intrinsic.atomicStore<T>(pointer, value, spelled) }
+  }
+
+  /// Replaces the pointee with `value` and returns the previous value.
+  ///
+  /// # Safety
+  ///
+  /// The pointer must address live, initialized, naturally aligned, writable storage for `T`.
+  /// Every access to the same location that can happen at the same time must be atomic and have
+  /// the same width.
+  pub unsafe fn swap<T: Copy>(pointer: *mut T, value: T, static order: MemoryOrder) -> T {
+    let static spelled = spelling(order)
+    unsafe { return Intrinsic.atomicSwap<T>(pointer, value, spelled) }
+  }
+
+  /// Stores `desired` if the pointee equals `expected`. Otherwise it returns the value it read.
+  ///
+  /// # Details
+  /// `success` orders the exchange. `failure` orders the read when nothing is stored. `failure`
+  /// must be `Relaxed`, `Acquire`, or `SequentiallyConsistent`.
+  ///
+  /// # Safety
+  /// The pointer must address live, initialized, naturally aligned, writable storage for `T`.
+  /// Every access to the same location that can happen at the same time must be atomic and have
+  /// the same width.
+  pub unsafe fn compareExchange<T: Copy>(pointer: *mut T, expected: T, desired: T, static success: MemoryOrder,
+    static failure: MemoryOrder) -> CompareExchange<T> {
+    let static onSuccess = spelling(success)
+    let static onFailure = spelling(failure)
+    let mut observed = expected
+    let exchanged = unsafe Intrinsic.atomicCompareExchange<T>(pointer, Intrinsic.pointerFromMutRef<T>(&mut observed), desired,
+      onSuccess, onFailure)
+    if exchanged { return CompareExchange<T>.Exchanged }
+    return CompareExchange<T>.Observed {value: observed}
+  }
+
+  /// Stores `desired` if the pointee equals `expected`. Otherwise it returns the value it read. It
+  /// can also fail spuriously: return `Observed` with a value equal to `expected`.
+  ///
+  /// # When to use
+  /// Use it in a retry loop. Use [`Atomic.compareExchange`] when one attempt must decide.
+  ///
+  /// # Details
+  /// This spurious failure lets a load-linked, store-conditional target use one attempt per call.
+  /// Call it in a loop that retries on any observed value. `success` orders the exchange. `failure`
+  /// orders the read when nothing is stored. `failure` must be `Relaxed`, `Acquire`, or
+  /// `SequentiallyConsistent`.
+  ///
+  /// # Safety
+  /// The pointer must address live, initialized, naturally aligned, writable storage for `T`.
+  /// Every access to the same location that can happen at the same time must be atomic and have
+  /// the same width.
+  pub unsafe fn compareExchangeWeak<T: Copy>(pointer: *mut T, expected: T, desired: T, static success: MemoryOrder,
+    static failure: MemoryOrder) -> CompareExchange<T> {
+    let static onSuccess = spelling(success)
+    let static onFailure = spelling(failure)
+    let mut observed = expected
+    let exchanged = unsafe Intrinsic.atomicCompareExchangeWeak<T>(pointer, Intrinsic.pointerFromMutRef<T>(&mut observed),
+      desired, onSuccess, onFailure)
+    if exchanged { return CompareExchange<T>.Exchanged }
+    return CompareExchange<T>.Observed {value: observed}
+  }
+
+  /// Adds `value` to the pointee, wrapping on overflow, and returns the previous value.
+  ///
+  /// # Safety
+  ///
+  /// The pointer must address live, initialized, naturally aligned, writable storage for `T`.
+  /// Every access to the same location that can happen at the same time must be atomic and have
+  /// the same width.
+  pub unsafe fn fetchAdd<T: Copy>(pointer: *mut T, value: T, static order: MemoryOrder) -> T {
+    let static spelled = spelling(order)
+    unsafe { return Intrinsic.atomicFetchAdd<T>(pointer, value, spelled) }
+  }
+
+  /// Subtracts `value` from the pointee, wrapping on overflow, and returns the previous value.
+  ///
+  /// # Safety
+  ///
+  /// The pointer must address live, initialized, naturally aligned, writable storage for `T`.
+  /// Every access to the same location that can happen at the same time must be atomic and have
+  /// the same width.
+  pub unsafe fn fetchSubtract<T: Copy>(pointer: *mut T, value: T, static order: MemoryOrder) -> T {
+    let static spelled = spelling(order)
+    unsafe { return Intrinsic.atomicFetchSubtract<T>(pointer, value, spelled) }
+  }
+
+  /// Stores the bitwise and of the pointee and `value`, and returns the previous value.
+  ///
+  /// # Safety
+  ///
+  /// The pointer must address live, initialized, naturally aligned, writable storage for `T`.
+  /// Every access to the same location that can happen at the same time must be atomic and have
+  /// the same width.
+  pub unsafe fn fetchBitAnd<T: Copy>(pointer: *mut T, value: T, static order: MemoryOrder) -> T {
+    let static spelled = spelling(order)
+    unsafe { return Intrinsic.atomicFetchBitAnd<T>(pointer, value, spelled) }
+  }
+
+  /// Stores the bitwise or of the pointee and `value`, and returns the previous value.
+  ///
+  /// # Safety
+  ///
+  /// The pointer must address live, initialized, naturally aligned, writable storage for `T`.
+  /// Every access to the same location that can happen at the same time must be atomic and have
+  /// the same width.
+  pub unsafe fn fetchBitOr<T: Copy>(pointer: *mut T, value: T, static order: MemoryOrder) -> T {
+    let static spelled = spelling(order)
+    unsafe { return Intrinsic.atomicFetchBitOr<T>(pointer, value, spelled) }
+  }
+
+  /// Stores the bitwise exclusive or of the pointee and `value`, and returns the previous value.
+  ///
+  /// # Safety
+  ///
+  /// The pointer must address live, initialized, naturally aligned, writable storage for `T`.
+  /// Every access to the same location that can happen at the same time must be atomic and have
+  /// the same width.
+  pub unsafe fn fetchBitXor<T: Copy>(pointer: *mut T, value: T, static order: MemoryOrder) -> T {
+    let static spelled = spelling(order)
+    unsafe { return Intrinsic.atomicFetchBitXor<T>(pointer, value, spelled) }
+  }
+
+  /// Stores the smaller of the pointee and `value`, and returns the previous value.
+  ///
+  /// # Safety
+  ///
+  /// The pointer must address live, initialized, naturally aligned, writable storage for `T`.
+  /// Every access to the same location that can happen at the same time must be atomic and have
+  /// the same width.
+  pub unsafe fn fetchMinimum<T: Copy>(pointer: *mut T, value: T, static order: MemoryOrder) -> T {
+    let static spelled = spelling(order)
+    unsafe { return Intrinsic.atomicFetchMinimum<T>(pointer, value, spelled) }
+  }
+
+  /// Stores the larger of the pointee and `value`, and returns the previous value.
+  ///
+  /// # Safety
+  ///
+  /// The pointer must address live, initialized, naturally aligned, writable storage for `T`.
+  /// Every access to the same location that can happen at the same time must be atomic and have
+  /// the same width.
+  pub unsafe fn fetchMaximum<T: Copy>(pointer: *mut T, value: T, static order: MemoryOrder) -> T {
+    let static spelled = spelling(order)
+    unsafe { return Intrinsic.atomicFetchMaximum<T>(pointer, value, spelled) }
+  }
+
+  /// Sleeps while the pointee equals `expected`, until a notify, the timeout, or a spurious wakeup.
+  ///
+  /// # Details
+  /// The comparison and the sleep are one atomic step against [`Atomic.notifyOne`] and
+  /// [`Atomic.notifyAll`]. Thus a notify after a store that changed the pointee is never lost.
+  ///
+  /// `timeout` is a relative bound in nanoseconds. `Option.None` waits with no bound. The result is
+  /// `false` only when the timeout ended the wait. A `true` result tells nothing about the pointee,
+  /// so check the condition again in a loop.
+  ///
+  /// It works on Darwin on aarch64, Linux with GNU libc on x86_64 or aarch64, and wasm32.
+  ///
+  /// # Gotchas
+  /// Single-threaded WebAssembly has no other thread to change the pointee. A wait that sleeps with
+  /// no timeout traps, and a wait with a timeout returns `false` at once.
+  ///
+  /// # Safety
+  /// The pointer must address live, naturally aligned storage for a `u32`. Every other access to it
+  /// must be atomic.
+  pub unsafe fn wait(pointer: *const u32, expected: u32, timeout: Option<u64>) -> bool {
+    static if Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArchitecture() == "aarch64" && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system" {
+      // `__ulock_wait` takes whole microseconds, where zero means no timeout.
+      let mut microseconds: u32 = 0
+      let mut clamped = false
+      if let Option<u64>.Some {value} = move timeout {
+        let mut rounded = value / 1000
+        if value % 1000 != 0 || rounded == 0 { rounded = rounded + 1 }
+        if rounded > 4294967295 {
+          rounded = 4294967295
+          clamped = true
+        }
+        microseconds = u64.toU32(rounded)
+      }
+      let status = unsafe __ulock_wait(darwinCompareAndWait, pointer, u32.toU64(expected), microseconds)
+      // -ETIMEDOUT; a clamped timeout that elapsed is a spurious wakeup instead.
+      if status == -60 { return clamped }
+      if status < 0 && status != -4 { Intrinsic.trap("Atomic.wait: the operating system wait call failed") }
+      return true
+    } else {
+      static if Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64") {
+        let mut limit = WaitTimespec {seconds: 0, nanoseconds: 0}
+        let mut bounded = false
+        if let Option<u64>.Some {value} = move timeout {
+          let seconds = value / 1000000000
+          // Past `i64.MAX` seconds the bound is unreachable; wait without one.
+          if seconds <= 9223372036854775807 {
+            limit = WaitTimespec {seconds: u64.toI64(seconds), nanoseconds: u64.toI64(value % 1000000000)}
+            bounded = true
+          }
+        }
+        let address = Pointer.address<u32>(pointer)
+        let mut limitAddress: usize = 0
+        if bounded { limitAddress = Pointer.address<WaitTimespec>(Pointer.fromRef<WaitTimespec>(&limit)) }
+        let status = unsafe syscall(unsafe linuxFutex(), address, futexWait, u32.toU64(expected), limitAddress)
+        if status == 0 { return true }
+        let nativeError = unsafe currentError()
+        // ETIMEDOUT; EAGAIN when the pointee differed, and EINTR, are wakeups.
+        if nativeError == 110 { return false }
+        if nativeError != 11 && nativeError != 4 { Intrinsic.trap("Atomic.wait: the operating system wait call failed") }
+        return true
+      } else {
+        static if Intrinsic.targetArchitecture() == "wasm32" && Intrinsic.profileText("threading") == "single" {
+          if unsafe Atomic.load<u32>(pointer, MemoryOrder.SequentiallyConsistent) != expected { return true }
+          if let Option<u64>.None = move timeout { Intrinsic.trap("Atomic.wait: waiting without a timeout on a single thread can never be woken") }
+          return false
+        } else {
+          static if Intrinsic.targetArchitecture() == "wasm32" && Intrinsic.profileText("threading") == "multi" {
+            // A negative bound waits forever, as does one past `i64.MAX` nanoseconds.
+            let mut limit: i64 = -1
+            if let Option<u64>.Some {value} = move timeout {
+              if value <= 9223372036854775807 { limit = u64.toI64(value) }
+            }
+            // 2 reports that the bound passed; 0 (woken) and 1 (the pointee differed) are wakeups.
+            return unsafe silk_wasm_wait32(pointer, expected, limit) != 2
+          } else { compileError("Atomic wait requires a Darwin or GNU libc profile, or WebAssembly") }
+        }
+      }
+    }
+  }
+
+  /// Wakes at least one thread blocked in [`Atomic.wait`] on `pointer`, if any is.
+  ///
+  /// # Details
+  ///
+  /// Store the new value before the notify. A waiter that has not yet slept sees the changed value
+  /// and does not sleep, so the wakeup is never lost. It works on Darwin on aarch64, Linux with GNU
+  /// libc on x86_64 or aarch64, and wasm32.
+  ///
+  /// # Safety
+  ///
+  /// The pointer must address live, naturally aligned storage for a `u32`.
+  pub unsafe fn notifyOne(pointer: *const u32) -> () {
+    return unsafe notifyWaiters(pointer, false)
+  }
+
+  /// Wakes every thread blocked in [`Atomic.wait`] on `pointer`.
+  ///
+  /// # Details
+  ///
+  /// Store the new value before the notify. A waiter that has not yet slept sees the changed value
+  /// and does not sleep, so the wakeup is never lost. It works on Darwin on aarch64, Linux with GNU
+  /// libc on x86_64 or aarch64, and wasm32.
+  ///
+  /// # Safety
+  ///
+  /// The pointer must address live, naturally aligned storage for a `u32`.
+  pub unsafe fn notifyAll(pointer: *const u32) -> () {
+    return unsafe notifyWaiters(pointer, true)
+  }
+
+  /// Orders memory accesses around this point without accessing memory itself.
+  ///
+  /// # Details
+  ///
+  /// The order must not be `Relaxed`. A release fence before a relaxed store, paired with an
+  /// acquire fence after a relaxed load that reads it, synchronizes like a release store and an
+  /// acquire load.
+  pub fn fence(static order: MemoryOrder) -> () {
+    let static spelled = spelling(order)
+    return Intrinsic.atomicFence(spelled)
+  }
+}

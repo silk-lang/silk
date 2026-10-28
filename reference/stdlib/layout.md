@@ -18,7 +18,7 @@ inputs and return an error value instead of an invalid layout.
 ### Size storage for repeated values
 ```silk
 import silk.layout { Layout, LayoutOverflow }
-import silk.usize
+import silk.num.usize
 
 pub fn main() -> i32 {
   let element = Layout.of<i32>()

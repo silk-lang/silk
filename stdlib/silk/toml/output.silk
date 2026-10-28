@@ -1,0 +1,486 @@
+//! Write a TOML document or a single TOML string or key through the ambient `Writer`.
+//!
+//! # When to use
+//! Use [`TomlOutput.write`] to write a `silk.toml.value` tree, for example after you change a
+//! parsed document. Use [`TomlOutput.writeKey`] and [`TomlOutput.writeString`] with
+//! `silk.toml.codec` to write a document line by line.
+//!
+//! # Details
+//! [`TomlOutput.write`] checks the full tree before it writes the first byte. In each table, it
+//! writes the plain members first, as `key = value` lines, and then each nested table as a `[path]`
+//! section and each array of tables as `[[path]]` sections. A table inside an array is written
+//! inline as `{ ... }`. The table kind is not used, so a dotted or inline table in the source is
+//! written as a section. Integers, floats, dates, and times are written with their stored text.
+//!
+//! # Errors
+//! - `TomlError` if the tree cannot be written as TOML: the root is not a table, a key occurs two
+//!   times in one table, a stored number or date is not valid, an array of tables is empty or holds
+//!   a value that is not a table, or the nesting is deeper than 64. `offset` is 0.
+//! - `WriterError` if the `Writer` fails. The bytes that it accepted stay written.
+//! - `OutOfMemoryError` if the `Allocator` cannot supply the table path.
+//!
+//! # Gotchas
+//! The output order can differ from the source order, because the plain members of a table come
+//! before its nested tables. Comments and the original spelling of strings are not kept. The
+//! functions do not flush the `Writer`.
+//!
+//! # Examples
+//! ## Write a parsed document
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.toml.output { TomlOutput }
+//! import silk.toml.scanner { TomlError }
+//! import silk.toml.value { Toml }
+//! import silk.io.writer { Writer, WriterError }
+//!
+//! struct CaptureWriter {
+//!   bytes: [u8; 64],
+//!   length: usize,
+//! }
+//!
+//! impl Writer for CaptureWriter {
+//!   effect fn writeAll(self: &mut Self, value: &[u8]) -> ()
+//!     ! WriterError
+//!     ? &mut Writer {
+//!     let mut index: usize = 0
+//!     while index < value.length {
+//!       self.bytes[self.length] = value[index]
+//!       self.length = self.length + 1
+//!       index = index + 1
+//!     }
+//!     return ()
+//!   }
+//!
+//!   effect fn flush(self: &mut Self) -> ()
+//!     ! WriterError
+//!     ? &mut Writer {
+//!     return ()
+//!   }
+//! }
+//!
+//! fn holds(writer: &CaptureWriter, expected: &[u8]) -> bool {
+//!   if writer.length != expected.length {
+//!     return false
+//!   }
+//!   let mut index: usize = 0
+//!   while index < expected.length {
+//!     if writer.bytes[index] != expected[index] {
+//!       return false
+//!     }
+//!     index = index + 1
+//!   }
+//!   return true
+//! }
+//!
+//! pub effect fn main() -> i32
+//!   ! TomlError | OutOfMemoryError | WriterError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let document = run Toml.parse(b"owner = { name = \"Ada\" }\nport = 80\n")
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let mut output = CaptureWriter { bytes: [0; 64], length: 0 }
+//!   run TomlOutput.write(&document) |> Effect.provideMut<Allocator>(&mut allocator)
+//!     |> Effect.provideMut<Writer>(&mut output)
+//!
+//!   // The plain member `port` comes first, and the inline table becomes a section.
+//!   if !holds(&output, b"port = 80\n[owner]\nname = \"Ada\"\n") {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Data formats
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.box { Box }
+import silk.option { Option }
+import silk.collections.slice { Slice }
+import silk.text.string { String }
+import silk.toml.scanner { TomlError, TomlReason, TomlScalarKind, TomlScanner, TomlSpan }
+import silk.toml.value { TomlChild, Value }
+import silk.num.u8
+import silk.num.usize
+import silk.collections.list { List }
+import silk.io.writer { Writer, WriterError }
+
+/// Functions that write TOML through the ambient `Writer`.
+///
+/// Use [`TomlOutput.write`] to write a `silk.toml.value` tree, for example after you change a
+/// parsed document. Use [`TomlOutput.writeKey`] and [`TomlOutput.writeString`] with
+/// `silk.toml.codec` to write a document line by line. The functions do not flush the `Writer`.
+pub struct TomlOutput {}
+
+impl TomlOutput {
+  /// Writes the document `document` as TOML. The root must be a table.
+  ///
+  /// It checks the full tree first, so a [`TomlError`] occurs before any byte is written.
+  ///
+  /// # Errors
+  /// - `TomlError` if the tree cannot be written as TOML: the root is not a table, a key occurs two
+  ///   times in one table, a stored number or date is not valid, an array of tables is empty or
+  ///   holds a value that is not a table, or the nesting is deeper than 64. `offset` is 0.
+  /// - `WriterError` if the `Writer` fails. The bytes that it accepted stay written.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the table path.
+  ///
+  /// # Gotchas
+  /// It does not flush the `Writer`. In each table, it writes the plain members first, as
+  /// `key = value` lines, and then each nested table as a `[path]` section and each array of
+  /// tables as `[[path]]` sections, so the output order can differ from the source order. A dotted
+  /// or inline table in the source is written as a section. Comments and the original spelling of
+  /// strings are not kept.
+  pub effect fn write(document: &Value)
+    -> () ! TomlError | OutOfMemoryError | WriterError ? &mut Allocator | &mut Writer {
+    run check(document, usize.ZERO, true)
+    let mut path = List<String>.make()
+    return run writeTable(document, &mut path, true)
+  }
+
+  /// Writes `value` as a TOML basic string in `"` quotes.
+  ///
+  /// It escapes `"` and `\`, writes the common control characters as `\b`, `\t`, `\n`, `\f`, and
+  /// `\r`, and writes the other control characters as `\u00XX`. Other text is written as it is.
+  ///
+  /// # Errors
+  /// - `WriterError` if the `Writer` fails.
+  pub effect fn writeString(value: string) -> () ! WriterError ? &mut Writer {
+    let bytes = String.utf8Bytes(value)
+    run Writer.writeAll(b"\"")
+    let mut at = usize.ZERO
+    let mut start = usize.ZERO
+    while at < bytes.length {
+      let byte = bytes[at]
+      if byte < 32 || byte == 34 || byte == 92 || byte == 127 {
+        if start < at { run Writer.writeAll(Slice.view<u8>(bytes, start, at - start)) }
+        if byte == 34 { run Writer.writeAll(b"\\\"") }
+        else if byte == 92 { run Writer.writeAll(b"\\\\") }
+        else if byte == 8 { run Writer.writeAll(b"\\b") }
+        else if byte == 12 { run Writer.writeAll(b"\\f") }
+        else if byte == 10 { run Writer.writeAll(b"\\n") }
+        else if byte == 13 { run Writer.writeAll(b"\\r") }
+        else if byte == 9 { run Writer.writeAll(b"\\t") }
+        else {
+          let escaped = [u8.toU8(92), u8.toU8(117), u8.toU8(48), u8.toU8(48),
+            digit(byte / u8.toU8(16)), digit(byte % u8.toU8(16))]
+          run Writer.writeAll(&escaped)
+        }
+        start = at + usize.ONE
+      }
+      at = at + usize.ONE
+    }
+    if start < bytes.length { run Writer.writeAll(Slice.view<u8>(bytes, start, bytes.length - start)) }
+    return run Writer.writeAll(b"\"")
+  }
+
+  /// Writes `value` as a TOML key.
+  ///
+  /// A key that has only ASCII letters, digits, `-`, and `_` is written bare. Other keys, and the
+  /// empty key, are written with [`TomlOutput.writeString`].
+  ///
+  /// # Errors
+  /// - `WriterError` if the `Writer` fails.
+  pub effect fn writeKey(value: string) -> () ! WriterError ? &mut Writer {
+    let bytes = String.utf8Bytes(value)
+    let mut bare = bytes.length > usize.ZERO
+    let mut at = usize.ZERO
+    while at < bytes.length {
+      let byte = bytes[at]
+      if !((byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) ||
+        (byte >= 48 && byte <= 57) || byte == 45 || byte == 95) { bare = false }
+      at = at + usize.ONE
+    }
+    if bare { return run Writer.writeAll(bytes) }
+    return run TomlOutput.writeString(value)
+  }
+}
+
+fn digit(value: u8) -> u8 {
+  if value < 10 { return value + u8.toU8(48) }
+  return value - u8.toU8(10) + u8.toU8(65)
+}
+
+fn invalid(reason: TomlReason) -> TomlError { return TomlError { reason: move reason, offset: usize.ZERO } }
+
+fn isTable(value: &Value) -> bool {
+  return match &value.* {
+    Value.Table { entries: tableEntries, kind: tableKind } => true
+    _ => false
+  }
+}
+
+fn isTableArray(value: &Value) -> bool {
+  return match &value.* {
+    Value.Array { values: arrayValues, tables } => tables
+    _ => false
+  }
+}
+
+fn childCount(value: &Value) -> usize {
+  return match &value.* {
+    Value.Array { values, tables: arrayTables } => {
+      let boxed = Box<List<TomlChild>>.get(&values)
+      return List<TomlChild>.length(&boxed[0])
+    }
+    Value.Table { entries, kind: tableKind } => {
+      let boxed = Box<List<TomlChild>>.get(&entries)
+      return List<TomlChild>.length(&boxed[0])
+    }
+    _ => usize.ZERO
+  }
+}
+
+fn childAt<'a>(value: &'a Value, index: usize) -> Option<&'a TomlChild> {
+  return match &value.* {
+    Value.Array { values, tables: arrayTables } => {
+      let boxed = Box<List<TomlChild>>.get(&values)
+      let children = List<TomlChild>.asSlice(&boxed[0])
+      if index < children.length { return Option<&'a TomlChild>.some(&children[index]) }
+      return Option<&'a TomlChild>.none()
+    }
+    Value.Table { entries, kind: tableKind } => {
+      let boxed = Box<List<TomlChild>>.get(&entries)
+      let children = List<TomlChild>.asSlice(&boxed[0])
+      if index < children.length { return Option<&'a TomlChild>.some(&children[index]) }
+      return Option<&'a TomlChild>.none()
+    }
+    _ => Option<&'a TomlChild>.none()
+  }
+}
+
+effect fn writeRaw(text: &String) -> () ! WriterError ? &mut Writer {
+  let value = String.view(text)
+  return run Writer.writeAll(String.utf8Bytes(value))
+}
+
+fn validScalar(text: &String, expected: TomlScalarKind) -> bool {
+  let view = String.view(text)
+  let bytes = String.utf8Bytes(view)
+  let scanner = TomlScanner.make(bytes)
+  let found = TomlScanner.scalarKind(&scanner, TomlSpan { offset: usize.ZERO, length: bytes.length })
+  return match move found {
+    Option<TomlScalarKind>.None => false
+    Option<TomlScalarKind>.Some { value } => match move value {
+      TomlScalarKind.Integer => match move expected { TomlScalarKind.Integer => true _ => false }
+      TomlScalarKind.Float => match move expected { TomlScalarKind.Float => true _ => false }
+      TomlScalarKind.OffsetDateTime => match move expected { TomlScalarKind.OffsetDateTime => true _ => false }
+      TomlScalarKind.LocalDateTime => match move expected { TomlScalarKind.LocalDateTime => true _ => false }
+      TomlScalarKind.LocalDate => match move expected { TomlScalarKind.LocalDate => true _ => false }
+      TomlScalarKind.LocalTime => match move expected { TomlScalarKind.LocalTime => true _ => false }
+      _ => false
+    }
+  }
+}
+
+effect fn check(value: &Value, depth: usize, root: bool) -> () ! TomlError {
+  if depth > 64 { fail invalid(TomlReason.DepthExceeded) }
+  match &value.* {
+    Value.Integer { text } => { if !validScalar(&text, TomlScalarKind.Integer) { fail invalid(TomlReason.InvalidNumber) } }
+    Value.Float { text } => { if !validScalar(&text, TomlScalarKind.Float) { fail invalid(TomlReason.InvalidNumber) } }
+    Value.OffsetDateTime { text } => { if !validScalar(&text, TomlScalarKind.OffsetDateTime) { fail invalid(TomlReason.InvalidDateTime) } }
+    Value.LocalDateTime { text } => { if !validScalar(&text, TomlScalarKind.LocalDateTime) { fail invalid(TomlReason.InvalidDateTime) } }
+    Value.LocalDate { text } => { if !validScalar(&text, TomlScalarKind.LocalDate) { fail invalid(TomlReason.InvalidDateTime) } }
+    Value.LocalTime { text } => { if !validScalar(&text, TomlScalarKind.LocalTime) { fail invalid(TomlReason.InvalidDateTime) } }
+    Value.Array { values, tables } => {
+      if root { fail invalid(TomlReason.TableConflict) }
+      let length = childCount(value)
+      if tables && length == usize.ZERO { fail invalid(TomlReason.TableConflict) }
+      let mut at = usize.ZERO
+      while at < length {
+        let found = childAt(value, at)
+        match move found {
+          Option<&TomlChild>.Some { value: item } => match &item.* {
+            TomlChild.Item { value: child } => {
+              if tables && !isTable(&child) { fail invalid(TomlReason.TableConflict) }
+              run check(&child, depth + usize.ONE, false)
+            }
+            _ => { fail invalid(TomlReason.TableConflict) }
+          }
+          Option<&TomlChild>.None => { fail invalid(TomlReason.TableConflict) }
+        }
+        at = at + usize.ONE
+      }
+    }
+    Value.Table { entries, kind: _ } => {
+      let length = childCount(value)
+      let mut at = usize.ZERO
+      while at < length {
+        let found = childAt(value, at)
+        match move found {
+          Option<&TomlChild>.Some { value: item } => match &item.* {
+            TomlChild.Member { entry } => {
+              let mut previous = usize.ZERO
+              while previous < at {
+                let earlier = childAt(value, previous)
+                match move earlier {
+                  Option<&TomlChild>.Some { value: prior } => match &prior.* {
+                    TomlChild.Member { entry: priorEntry } => {
+                      if String.view(&entry.key) == String.view(&priorEntry.key) {
+                        fail invalid(TomlReason.DuplicateKey)
+                      }
+                    }
+                    _ => { fail invalid(TomlReason.TableConflict) }
+                  }
+                  Option<&TomlChild>.None => { fail invalid(TomlReason.TableConflict) }
+                }
+                previous = previous + usize.ONE
+              }
+              run check(&entry.value, depth + usize.ONE, false)
+            }
+            _ => { fail invalid(TomlReason.TableConflict) }
+          }
+          Option<&TomlChild>.None => { fail invalid(TomlReason.TableConflict) }
+        }
+        at = at + usize.ONE
+      }
+    }
+    _ => { if root { fail invalid(TomlReason.TableConflict) } }
+  }
+  return ()
+}
+
+effect fn writePath(path: &List<String>) -> () ! WriterError ? &mut Writer {
+  let parts = List<String>.asSlice(path)
+  let mut at = usize.ZERO
+  while at < parts.length {
+    if at > usize.ZERO { run Writer.writeAll(b".") }
+    run TomlOutput.writeKey(String.view(&parts[at]))
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn writeTable(value: &Value, path: &mut List<String>, root: bool)
+  -> () ! TomlError | OutOfMemoryError | WriterError ? &mut Allocator | &mut Writer {
+  return match &value.* {
+    Value.Table { entries, kind: _ } => {
+      if !root {
+        run Writer.writeAll(b"[")
+        run writePath(&path.*)
+        run Writer.writeAll(b"]\n")
+      }
+      let length = childCount(value)
+      let mut at = usize.ZERO
+      while at < length {
+        let found = childAt(value, at)
+        match move found {
+          Option<&TomlChild>.Some { value: item } => match &item.* {
+            TomlChild.Member { entry } => {
+              let nested = isTable(&entry.value) || isTableArray(&entry.value)
+              if !nested {
+                run TomlOutput.writeKey(String.view(&entry.key))
+                run Writer.writeAll(b" = ")
+                run writeValue(&entry.value)
+                run Writer.writeAll(b"\n")
+              }
+            }
+            _ => { fail invalid(TomlReason.TableConflict) }
+          }
+          Option<&TomlChild>.None => { fail invalid(TomlReason.TableConflict) }
+        }
+        at = at + usize.ONE
+      }
+      at = usize.ZERO
+      while at < length {
+        let found = childAt(value, at)
+        match move found {
+          Option<&TomlChild>.Some { value: item } => match &item.* {
+            TomlChild.Member { entry } => {
+              let nested = isTable(&entry.value) || isTableArray(&entry.value)
+              if nested {
+                let name = run String.copy(String.view(&entry.key))
+                run List<String>.append(&mut path.*, move name)
+                if isTable(&entry.value) { run writeTable(&entry.value, &mut path.*, false) }
+                else { run writeArrayTables(&entry.value, &mut path.*) }
+                let last = List<String>.length(&path.*) - usize.ONE
+                let removed = List<String>.remove(&mut path.*, last)
+                drop removed
+              }
+            }
+            _ => { fail invalid(TomlReason.TableConflict) }
+          }
+          Option<&TomlChild>.None => { fail invalid(TomlReason.TableConflict) }
+        }
+        at = at + usize.ONE
+      }
+      return ()
+    }
+    _ => { fail invalid(TomlReason.TableConflict) }
+  }
+}
+
+effect fn writeArrayTables(value: &Value, path: &mut List<String>)
+  -> () ! TomlError | OutOfMemoryError | WriterError ? &mut Allocator | &mut Writer {
+  let length = childCount(value)
+  let mut at = usize.ZERO
+  while at < length {
+    run Writer.writeAll(b"[[")
+    run writePath(&path.*)
+    run Writer.writeAll(b"]]\n")
+    let found = childAt(value, at)
+    match move found {
+      Option<&TomlChild>.Some { value: item } => match &item.* {
+        TomlChild.Item { value: table } => { run writeTable(&table, &mut path.*, true) }
+        _ => { fail invalid(TomlReason.TableConflict) }
+      }
+      Option<&TomlChild>.None => { fail invalid(TomlReason.TableConflict) }
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn writeValue(value: &Value) -> () ! TomlError | WriterError ? &mut Writer {
+  return match &value.* {
+    Value.Integer { text } => run writeRaw(&text)
+    Value.Float { text } => run writeRaw(&text)
+    Value.OffsetDateTime { text } => run writeRaw(&text)
+    Value.LocalDateTime { text } => run writeRaw(&text)
+    Value.LocalDate { text } => run writeRaw(&text)
+    Value.LocalTime { text } => run writeRaw(&text)
+    Value.Boolean { value: yes } => {
+      if yes { return run Writer.writeAll(b"true") }
+      return run Writer.writeAll(b"false")
+    }
+    Value.String { text } => run TomlOutput.writeString(String.view(&text))
+    Value.Array { values, tables: _ } => {
+      let length = childCount(value)
+      run Writer.writeAll(b"[")
+      let mut at = usize.ZERO
+      while at < length {
+        if at > usize.ZERO { run Writer.writeAll(b", ") }
+        let found = childAt(value, at)
+        match move found {
+          Option<&TomlChild>.Some { value: item } => match &item.* {
+            TomlChild.Item { value: child } => { run writeValue(&child) }
+            _ => { fail invalid(TomlReason.TableConflict) }
+          }
+          Option<&TomlChild>.None => { fail invalid(TomlReason.TableConflict) }
+        }
+        at = at + usize.ONE
+      }
+      return run Writer.writeAll(b"]")
+    }
+    Value.Table { entries, kind: _ } => {
+      let length = childCount(value)
+      run Writer.writeAll(b"{")
+      let mut at = usize.ZERO
+      while at < length {
+        if at > usize.ZERO { run Writer.writeAll(b", ") }
+        let found = childAt(value, at)
+        match move found {
+          Option<&TomlChild>.Some { value: item } => match &item.* {
+            TomlChild.Member { entry } => {
+              run TomlOutput.writeKey(String.view(&entry.key))
+              run Writer.writeAll(b" = ")
+              run writeValue(&entry.value)
+            }
+            _ => { fail invalid(TomlReason.TableConflict) }
+          }
+          Option<&TomlChild>.None => { fail invalid(TomlReason.TableConflict) }
+        }
+        at = at + usize.ONE
+      }
+      return run Writer.writeAll(b"}")
+    }
+  }
+}

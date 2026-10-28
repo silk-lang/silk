@@ -1,22 +1,22 @@
 # HTTP content decoding
 
 Import scoped response-content planning, streaming, metadata, completion, and request negotiation
-from `silk.http_content`. The actor composes `silk.http_body`, `silk.buffered_duplex`,
-`silk.inflate`, and `silk.zstd` in ordinary Silk source. It adds no compiler-known library actor or
+from `silk.http.content`. The actor composes `silk.http.body`, `silk.io.buffered_duplex`,
+`silk.compress.inflate`, and `silk.compress.zstd` in ordinary Silk source. It adds no compiler-known library actor or
 target-specific codec path.
 
 ```silk
-import silk.http { Header, ValueError }
-import silk.http_content {
+import silk.http.message { Header, ValueError }
+import silk.http.content {
   AcceptEncoding,
   EmptyEncodingPolicy,
   EnabledCodings,
   Mode,
   acceptEncoding,
 }
-import silk.http_headers { Limits }
+import silk.http.headers { Limits }
 import silk.option { Option }
-import silk.result { Result }
+import silk.core.result { Result }
 
 fn negotiationLimits() -> Limits {
   return Limits {

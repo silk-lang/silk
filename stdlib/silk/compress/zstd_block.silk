@@ -1,0 +1,1391 @@
+//! Internal bounded zstd compressed-block decoding with retained entropy tables.
+//!
+//! # Details
+//! Callers supply literal, output, and circular history storage. A failed decode invalidates the
+//! state.
+//!
+//! @category Data formats
+
+import silk.format {Debug, Format, Formatter}
+import silk.core.result {Result}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.layout {Layout}
+import silk.mem.raw_buffer {RawBuffer}
+import silk.mem.slot {Slot}
+import silk.num.usize
+import silk.num.u8
+import silk.num.u64
+import silk.io.writer {Writer, WriterError}
+
+/// The invalid component of a compressed zstd block.
+pub enum BlockReason {
+  /// No compressed-block failure applies.
+  None,
+  /// A literal header, tree, or stream is invalid.
+  Literals,
+  /// A sequence header, table, or bitstream is invalid.
+  Sequences,
+  /// A match points outside the available window.
+  Offset,
+  /// The decoded block exceeds the supplied output storage.
+  Output,
+}
+
+impl Debug for BlockReason {
+  /// Writes the name of the variant, such as `None`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      BlockReason.None => run Format.write(&mut formatter, b"None")
+      BlockReason.Literals => run Format.write(&mut formatter, b"Literals")
+      BlockReason.Sequences => run Format.write(&mut formatter, b"Sequences")
+      BlockReason.Offset => run Format.write(&mut formatter, b"Offset")
+      BlockReason.Output => run Format.write(&mut formatter, b"Output")
+    }
+  }
+}
+
+/// A compressed-block failure and its local compressed byte position.
+pub struct BlockError {
+  /// The invalid component.
+  pub reason: BlockReason,
+  /// The local compressed byte position.
+  pub offset: usize,
+}
+
+impl Debug for BlockError {
+  /// Writes the fields, as `BlockError { reason: ..., offset: ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return run Format.debugFields(self, "BlockError", &mut formatter)
+  }
+}
+
+// Each entry packs an eight-bit symbol, a four-bit bit count, and the next-state baseline.
+struct Fse {
+  entries: Intrinsic.RawBuffer<usize>,
+  log: usize,
+  ready: bool,
+}
+
+/// Retained entropy tables and repeat offsets for one zstd frame.
+pub struct BlockState {
+  // Huffman entries pack the symbol in the low byte and its consumed bit count above it.
+  hEntries: Intrinsic.RawBuffer<usize>,
+  hLog: usize,
+  ll: Fse,
+  ml: Fse,
+  of: Fse,
+  weights: Fse,
+  rep1: usize,
+  rep2: usize,
+  rep3: usize,
+}
+
+struct Bits {
+  position: usize,
+  end: usize,
+  failed: bool,
+}
+
+impl BlockState {
+  /// Allocates fresh entropy tables and sets the initial repeat offsets for one frame.
+  ///
+  /// # Details
+  /// The state owns five exact allocations and releases them when dropped. Decode and reset do not
+  /// allocate.
+  pub effect fn make() -> BlockState ! OutOfMemoryError ? &mut Allocator {
+    let hAllocation = run Allocator.allocate(Layout.of<[usize; 2048]>())
+    // The allocation was requested with `Layout.of<[usize; 2048]>()`, which fits 2048 entries.
+    let mut hEntries = unsafe RawBuffer.from<usize>(move hAllocation, 2048)
+    initialize(&mut hEntries, 2048)
+    let ll = run makeFse()
+    let ml = run makeFse()
+    let of = run makeFse()
+    let weights = run makeFse()
+    return BlockState {
+      hEntries: move hEntries,
+      hLog: 0,
+      ll: move ll,
+      ml: move ml,
+      of: move of,
+      weights: move weights,
+      rep1: 1,
+      rep2: 4,
+      rep3: 8,
+    }
+  }
+  /// Restores fresh entropy tables and repeat offsets before a new frame.
+  pub fn reset(self: &mut Self) -> () {
+    self.hLog = 0
+    self.ll.ready = false
+    self.ml.ready = false
+    self.of.ready = false
+    self.rep1 = 1
+    self.rep2 = 4
+    self.rep3 = 8
+    return ()
+  }
+  /// Returns a conservative byte bound for tables and transient algorithm scratch on supported
+  /// targets.
+  ///
+  /// # Details
+  /// This bound excludes caller-owned compressed, literal, output, and history storage.
+  pub fn workspaceBytes() -> usize {
+    return 131072
+  }
+  /// Decodes one complete compressed block into caller-owned storage without allocation.
+  ///
+  /// # Details
+  /// Returns the initialized output length. `historyPosition` is the next circular write position.
+  /// `historyLength` counts valid bytes from earlier blocks. `windowSize` bounds match distances.
+  ///
+  /// # Gotchas
+  /// Failure can change tables and scratch bytes. Discard the frame state after failure.
+  pub fn decode(
+    self: &mut Self,
+    input: &[u8],
+    literals: &mut [u8],
+    output: &mut [u8],
+    history: &[u8],
+    historyPosition: usize,
+    historyLength: usize,
+    windowSize: usize,
+  ) -> Result<usize, BlockError> {
+    if input.length == 0 || input.length > 131072 {
+      return failure(BlockReason.Literals, 0)
+    }
+    let mut cursor = Bits {position: 0, end: input.length * 8, failed: false}
+    let literalCount = decodeLiterals(&mut self, input, &mut cursor, &mut literals)
+    if cursor.failed {
+      return failure(BlockReason.Literals, cursor.position / 8)
+    }
+    let mut position = cursor.position / 8
+    if position >= input.length {
+      return failure(BlockReason.Sequences, position)
+    }
+    let first = u8.toUsize(input[position])
+    position = position + 1
+    let mut sequences = first
+    if first >= 128 {
+      if position >= input.length {
+        return failure(BlockReason.Sequences, position)
+      }
+      if first == 255 {
+        if input.length - position < 2 {
+          return failure(BlockReason.Sequences, position)
+        }
+        sequences = u8.toUsize(input[position]) + u8.toUsize(input[position + 1]) * 256 + 32512
+        position = position + 2
+      } else {
+        sequences = (first - 128) * 256 + u8.toUsize(input[position])
+        position = position + 1
+      }
+    }
+    if sequences == 0 {
+      if position != input.length {
+        return failure(BlockReason.Sequences, position)
+      }
+      if literalCount > output.length {
+        return failure(BlockReason.Output, position)
+      }
+      let mut i: usize = 0
+      while i < literalCount {
+        output[i] = literals[i]
+        i = i + 1
+      }
+      return Result<usize, BlockError>.succeed(literalCount)
+    }
+    if position >= input.length {
+      return failure(BlockReason.Sequences, position)
+    }
+    let modes = u8.toUsize(input[position])
+    position = position + 1
+    if modes % 4 != 0 {
+      return failure(BlockReason.Sequences, position - 1)
+    }
+    cursor.position = position * 8
+    if !sequenceTable(&mut self.ll, input, &mut cursor, modes / 64, 35, 9, 0) {
+      return failure(BlockReason.Sequences, cursor.position / 8)
+    }
+    if !sequenceTable(&mut self.of, input, &mut cursor, (modes / 16) % 4, 31, 8, 1) {
+      return failure(BlockReason.Sequences, cursor.position / 8)
+    }
+    if !sequenceTable(&mut self.ml, input, &mut cursor, (modes / 4) % 4, 52, 9, 2) {
+      return failure(BlockReason.Sequences, cursor.position / 8)
+    }
+    position = cursor.position / 8
+    let mut reverse = reverseBits(input, position, input.length)
+    let mut llState = readReverse(input, &mut reverse, self.ll.log)
+    let mut ofState = readReverse(input, &mut reverse, self.of.log)
+    let mut mlState = readReverse(input, &mut reverse, self.ml.log)
+    let mut written: usize = 0
+    let mut usedLiterals: usize = 0
+    let mut sequence: usize = 0
+    while sequence < sequences {
+      if reverse.failed {
+        return failure(BlockReason.Sequences, reverse.position / 8)
+      }
+      let llCode = (tableGet(&self.ll.entries, llState) % 256)
+      let mlCode = (tableGet(&self.ml.entries, mlState) % 256)
+      let ofCode = (tableGet(&self.of.entries, ofState) % 256)
+      let offsetBits = readReverse(input, &mut reverse, ofCode)
+      let offsetValue = u64.shiftLeft(1, usize.toU64(ofCode)) + usize.toU64(offsetBits)
+      let matchLength = matchBase(mlCode) + readReverse(input, &mut reverse, matchBits(mlCode))
+      let literalLength = literalBase(llCode) + readReverse(
+        input,
+        &mut reverse,
+        literalBits(llCode),
+      )
+      if reverse.failed {
+        return failure(BlockReason.Sequences, reverse.position / 8)
+      }
+      if literalLength > literalCount - usedLiterals {
+        return failure(BlockReason.Literals, position)
+      }
+      if literalLength > output.length - written {
+        return failure(BlockReason.Output, position)
+      }
+      let mut i: usize = 0
+      while i < literalLength {
+        output[written] = literals[usedLiterals]
+        written = written + 1
+        usedLiterals = usedLiterals + 1
+        i = i + 1
+      }
+      let mut distance: usize = 0
+      if offsetValue > 3 {
+        let wideDistance = offsetValue - 3
+        if wideDistance > usize.toU64(windowSize) {
+          return failure(BlockReason.Offset, position)
+        }
+        distance = u64.toUsize(wideDistance)
+        self.rep3 = self.rep2
+        self.rep2 = self.rep1
+        self.rep1 = distance
+      } else {
+        let mut repeat = u64.toUsize(offsetValue)
+        if literalLength == 0 {
+          repeat = repeat + 1
+        }
+        if repeat == 1 {
+          distance = self.rep1
+        }
+        if repeat == 2 {
+          distance = self.rep2
+          self.rep2 = self.rep1
+          self.rep1 = distance
+        }
+        if repeat == 3 {
+          distance = self.rep3
+          self.rep3 = self.rep2
+          self.rep2 = self.rep1
+          self.rep1 = distance
+        }
+        if repeat == 4 {
+          if self.rep1 <= 1 {
+            return failure(BlockReason.Offset, position)
+          }
+          distance = self.rep1 - 1
+          self.rep3 = self.rep2
+          self.rep2 = self.rep1
+          self.rep1 = distance
+        }
+      }
+      if distance == 0 || distance > windowSize {
+        return failure(BlockReason.Offset, position)
+      }
+      if distance > written && distance - written > historyLength {
+        return failure(BlockReason.Offset, position)
+      }
+      if historyLength > history.length || (history.length > 0 && historyPosition >= history.length) {
+        return failure(BlockReason.Offset, position)
+      }
+      if matchLength > output.length - written {
+        return failure(BlockReason.Output, position)
+      }
+      i = 0
+      while i < matchLength {
+        if distance <= written {
+          output[written] = output[written - distance]
+        } else {
+          let back = distance - written
+          let mut index: usize = 0
+          if historyPosition >= back {
+            index = historyPosition - back
+          } else {
+            index = history.length - (back - historyPosition)
+          }
+          output[written] = history[index]
+        }
+        written = written + 1
+        i = i + 1
+      }
+      sequence = sequence + 1
+      if sequence < sequences {
+        llState = (tableGet(&self.ll.entries, llState) / 4096) + readReverse(
+          input,
+          &mut reverse,
+          ((tableGet(&self.ll.entries, llState) / 256) % 16),
+        )
+        mlState = (tableGet(&self.ml.entries, mlState) / 4096) + readReverse(
+          input,
+          &mut reverse,
+          ((tableGet(&self.ml.entries, mlState) / 256) % 16),
+        )
+        ofState = (tableGet(&self.of.entries, ofState) / 4096) + readReverse(
+          input,
+          &mut reverse,
+          ((tableGet(&self.of.entries, ofState) / 256) % 16),
+        )
+      }
+    }
+    if reverse.failed || reverse.position != reverse.end {
+      return failure(BlockReason.Sequences, reverse.position / 8)
+    }
+    let remaining = literalCount - usedLiterals
+    if remaining > output.length - written {
+      return failure(BlockReason.Output, position)
+    }
+    let mut i: usize = 0
+    while i < remaining {
+      output[written + i] = literals[usedLiterals + i]
+      i = i + 1
+    }
+    return Result<usize, BlockError>.succeed(written + remaining)
+  }
+}
+
+fn failure(reason: BlockReason, offset: usize) -> Result<usize, BlockError> {
+  return Result<usize, BlockError>.failResult(BlockError {reason: reason, offset: offset})
+}
+
+effect fn makeFse() -> Fse ! OutOfMemoryError ? &mut Allocator {
+  let allocation = run Allocator.allocate(Layout.of<[usize; 512]>())
+  // The allocation was requested with `Layout.of<[usize; 512]>()`, which fits 512 entries.
+  let mut entries = unsafe RawBuffer.from<usize>(move allocation, 512)
+  initialize(&mut entries, 512)
+  return Fse {entries: move entries, log: 0, ready: false}
+}
+
+fn initialize(entries: &mut Intrinsic.RawBuffer<usize>, count: usize) -> () {
+  let mut i: usize = 0
+  while i < count {
+    Slot.write<usize>(RawBuffer.slot<usize>(&mut entries, i), 0)
+    i = i + 1
+  }
+  return ()
+}
+
+fn tableGet(entries: &Intrinsic.RawBuffer<usize>, index: usize) -> usize {
+  // Every caller passes an index below the table's fixed entry count, and the tables are filled
+  // when they are made.
+  return unsafe RawBuffer.read<usize>(&entries, index)
+}
+
+fn tableSet(entries: &mut Intrinsic.RawBuffer<usize>, index: usize, value: usize) -> () {
+  // Every caller passes an index below the table's fixed entry count.
+  let mut view = unsafe RawBuffer.viewMut<usize>(&mut entries, index, 1)
+  view[0] = value
+  return ()
+}
+
+fn highBit(value: usize) -> usize {
+  let mut bits: usize = 0
+  let mut rest = value
+  while rest > 1 {
+    rest = rest / 2
+    bits = bits + 1
+  }
+  return bits
+}
+
+fn power(bits: usize) -> usize {
+  return usize.shiftLeft(1, bits)
+}
+
+fn readForward(input: &[u8], cursor: &mut Bits, count: usize) -> usize {
+  if cursor.failed || cursor.position > cursor.end || count > cursor.end - cursor.position {
+    cursor.failed = true
+    return 0
+  }
+  let mut result: usize = 0
+  let mut i: usize = 0
+  while i < count {
+    let position = cursor.position + i
+    let bit = (u8.toUsize(input[position / 8]) / power(position % 8)) % 2
+    result = result + bit * power(i)
+    i = i + 1
+  }
+  cursor.position = cursor.position + count
+  return result
+}
+
+fn reverseBits(input: &[u8], start: usize, end: usize) -> Bits {
+  if end <= start || end > input.length {
+    return Bits {position: start * 8, end: start * 8, failed: true}
+  }
+  let last = u8.toUsize(input[end - 1])
+  if last == 0 {
+    return Bits {position: start * 8, end: start * 8, failed: true}
+  }
+  return Bits {position: (end - 1) * 8 + highBit(last), end: start * 8, failed: false}
+}
+
+fn readReverse(input: &[u8], cursor: &mut Bits, count: usize) -> usize {
+  if cursor.failed || cursor.position < cursor.end || count > cursor.position - cursor.end {
+    cursor.failed = true
+    return 0
+  }
+  cursor.position = cursor.position - count
+  let mut forward = Bits {position: cursor.position, end: cursor.position + count, failed: false}
+  return readForward(input, &mut forward, count)
+}
+
+fn paddedReverse(input: &[u8], cursor: &mut Bits, count: usize) -> usize {
+  let available = cursor.position - cursor.end
+  if available >= count {
+    return readReverse(input, &mut cursor, count)
+  }
+  return readReverse(input, &mut cursor, available) * power(count - available)
+}
+
+fn buildFse(table: &mut Fse, counts: &[usize], log: usize, symbols: usize) -> bool {
+  // 65535 represents the format's normalized probability -1.
+  let size = power(log)
+  if size > 512 || symbols > counts.length {
+    return false
+  }
+  let mut high = size
+  let mut sum: usize = 0
+  let mut present: usize = 0
+  let mut next = zeros256()
+  let mut symbol: usize = 0
+  while symbol < symbols {
+    let count = counts[symbol]
+    if count == 65535 {
+      if high == 0 {
+        return false
+      }
+      high = high - 1
+      tableSet(&mut table.entries, high, symbol)
+      next[symbol] = 1
+      sum = sum + 1
+      present = present + 1
+    } else {
+      next[symbol] = count
+      sum = sum + count
+      if count > 0 {
+        present = present + 1
+      }
+    }
+    if sum > size {
+      return false
+    }
+    symbol = symbol + 1
+  }
+  if sum != size || present < 2 {
+    return false
+  }
+  let step = size / 2 + size / 8 + 3
+  let mut position: usize = 0
+  symbol = 0
+  while symbol < symbols {
+    let count = counts[symbol]
+    if count != 65535 {
+      let mut i: usize = 0
+      while i < count {
+        tableSet(&mut table.entries, position, symbol)
+        position = (position + step) % size
+        while position >= high {
+          position = (position + step) % size
+        }
+        i = i + 1
+      }
+    }
+    symbol = symbol + 1
+  }
+  if position != 0 {
+    return false
+  }
+  position = 0
+  while position < size {
+    let value = next[(tableGet(&table.entries, position) % 256)]
+    if value == 0 {
+      return false
+    }
+    next[(tableGet(&table.entries, position) % 256)] = value + 1
+    let bits = log - highBit(value)
+    let symbol = tableGet(&table.entries, position) % 256
+    tableSet(
+      &mut table.entries,
+      position,
+      symbol + bits * 256 + (value * power(bits) - size) * 4096,
+    )
+    position = position + 1
+  }
+  table.log = log
+  table.ready = true
+  return true
+}
+
+fn readFse(table: &mut Fse, input: &[u8], cursor: &mut Bits, maxSymbol: usize, maxLog: usize) -> bool {
+  let log = readForward(input, &mut cursor, 4) + 5
+  if cursor.failed || log > maxLog {
+    return false
+  }
+  let mut remaining = power(log)
+  let mut counts = zeros256()
+  let mut symbol: usize = 0
+  let mut nonzero: usize = 0
+  while remaining > 0 {
+    if symbol > maxSymbol {
+      return false
+    }
+    let bits = highBit(remaining + 1) + 1
+    let threshold = power(bits) - 1 - (remaining + 1)
+    let low = readForward(input, &mut cursor, bits - 1)
+    let mut decoded = low
+    if low >= threshold {
+      let top = readForward(input, &mut cursor, 1)
+      decoded = low + top * power(bits - 1)
+      if decoded >= power(bits - 1) {
+        decoded = decoded - threshold
+      }
+    }
+    if cursor.failed {
+      return false
+    }
+    if decoded == 0 {
+      counts[symbol] = 65535
+      remaining = remaining - 1
+      nonzero = nonzero + 1
+    } else {
+      let count = decoded - 1
+      if count > remaining {
+        return false
+      }
+      counts[symbol] = count
+      remaining = remaining - count
+      if count > 0 {
+        nonzero = nonzero + 1
+      }
+    }
+    symbol = symbol + 1
+    if decoded == 1 {
+      let mut repeat: usize = 3
+      while repeat == 3 {
+        repeat = readForward(input, &mut cursor, 2)
+        if cursor.failed || repeat > maxSymbol + 1 - symbol {
+          return false
+        }
+        symbol = symbol + repeat
+      }
+    }
+  }
+  cursor.position = ((cursor.position + 7) / 8) * 8
+  if cursor.position > cursor.end || nonzero < 2 {
+    return false
+  }
+  return buildFse(&mut table, &counts, log, symbol)
+}
+
+fn sequenceTable(
+  table: &mut Fse,
+  input: &[u8],
+  cursor: &mut Bits,
+  mode: usize,
+  maxSymbol: usize,
+  maxLog: usize,
+  kind: usize,
+) -> bool {
+  if mode == 3 {
+    return table.ready
+  }
+  if mode == 2 {
+    return readFse(&mut table, input, &mut cursor, maxSymbol, maxLog)
+  }
+  if mode == 1 {
+    let symbol = readForward(input, &mut cursor, 8)
+    if cursor.failed || symbol > maxSymbol {
+      return false
+    }
+    tableSet(&mut table.entries, 0, symbol)
+    table.log = 0
+    table.ready = true
+    return true
+  }
+  let mut counts = zeros256()
+  if kind == 0 {
+    let defaults: [usize; 36] = [
+      4,
+      3,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      1,
+      1,
+      1,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      3,
+      2,
+      1,
+      1,
+      1,
+      1,
+      1,
+      65535,
+      65535,
+      65535,
+      65535,
+    ]
+    let mut i: usize = 0
+    while i < 36 {
+      counts[i] = defaults[i]
+      i = i + 1
+    }
+    return buildFse(&mut table, &counts, 6, 36)
+  }
+  if kind == 1 {
+    let defaults: [usize; 29] = [
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      2,
+      2,
+      2,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      65535,
+      65535,
+      65535,
+      65535,
+      65535,
+    ]
+    let mut i: usize = 0
+    while i < 29 {
+      counts[i] = defaults[i]
+      i = i + 1
+    }
+    return buildFse(&mut table, &counts, 5, 29)
+  }
+  let defaults: [usize; 53] = [
+    1,
+    4,
+    3,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    65535,
+    65535,
+    65535,
+    65535,
+    65535,
+    65535,
+    65535,
+  ]
+  let mut i: usize = 0
+  while i < 53 {
+    counts[i] = defaults[i]
+    i = i + 1
+  }
+  return buildFse(&mut table, &counts, 6, 53)
+}
+
+fn literalBits(code: usize) -> usize {
+  if code < 16 {
+    return 0
+  }
+  let bits: [usize; 20] = [1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+  return bits[code - 16]
+}
+
+fn literalBase(code: usize) -> usize {
+  if code < 16 {
+    return code
+  }
+  let bases: [usize; 20] = [
+    16,
+    18,
+    20,
+    22,
+    24,
+    28,
+    32,
+    40,
+    48,
+    64,
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    16384,
+    32768,
+    65536,
+  ]
+  return bases[code - 16]
+}
+
+fn matchBits(code: usize) -> usize {
+  if code < 32 {
+    return 0
+  }
+  let bits: [usize; 21] = [1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+  return bits[code - 32]
+}
+
+fn matchBase(code: usize) -> usize {
+  if code < 32 {
+    return code + 3
+  }
+  let bases: [usize; 21] = [
+    35,
+    37,
+    39,
+    41,
+    43,
+    47,
+    51,
+    59,
+    67,
+    83,
+    99,
+    131,
+    259,
+    515,
+    1027,
+    2051,
+    4099,
+    8195,
+    16387,
+    32771,
+    65539,
+  ]
+  return bases[code - 32]
+}
+
+fn huffmanTree(state: &mut BlockState, input: &[u8], cursor: &mut Bits) -> bool {
+  let header = readForward(input, &mut cursor, 8)
+  if cursor.failed {
+    return false
+  }
+  let mut weights = zeros256()
+  let mut count: usize = 0
+  if header >= 128 {
+    count = header - 127
+    let mut index: usize = 0
+    while index < count {
+      let byte = readForward(input, &mut cursor, 8)
+      weights[index] = byte / 16
+      if index + 1 < count {
+        weights[index + 1] = byte % 16
+      }
+      index = index + 2
+    }
+  } else {
+    let start = cursor.position / 8
+    if header == 0 || header > (cursor.end - cursor.position) / 8 {
+      return false
+    }
+    let end = start + header
+    let mut description = Bits {position: cursor.position, end: end * 8, failed: false}
+    if !readFse(&mut state.weights, input, &mut description, 11, 6) {
+      return false
+    }
+    let mut reverse = reverseBits(input, description.position / 8, end)
+    let mut state1 = readReverse(input, &mut reverse, state.weights.log)
+    let mut state2 = readReverse(input, &mut reverse, state.weights.log)
+    if reverse.failed {
+      return false
+    }
+    let mut done = false
+    while !done {
+      if count >= 254 {
+        return false
+      }
+      weights[count] = (tableGet(&state.weights.entries, state1) % 256)
+      count = count + 1
+      let bits1 = ((tableGet(&state.weights.entries, state1) / 256) % 16)
+      if bits1 > reverse.position - reverse.end {
+        let rest = paddedReverse(input, &mut reverse, bits1)
+        state1 = (tableGet(&state.weights.entries, state1) / 4096) + rest
+        weights[count] = (tableGet(&state.weights.entries, state2) % 256)
+        count = count + 1
+        done = true
+      } else {
+        state1 = (tableGet(&state.weights.entries, state1) / 4096) + readReverse(
+          input,
+          &mut reverse,
+          bits1,
+        )
+        weights[count] = (tableGet(&state.weights.entries, state2) % 256)
+        count = count + 1
+        let bits2 = ((tableGet(&state.weights.entries, state2) / 256) % 16)
+        if bits2 > reverse.position - reverse.end {
+          let rest = paddedReverse(input, &mut reverse, bits2)
+          state2 = (tableGet(&state.weights.entries, state2) / 4096) + rest
+          if count >= 255 {
+            return false
+          }
+          weights[count] = (tableGet(&state.weights.entries, state1) % 256)
+          count = count + 1
+          done = true
+        } else {
+          state2 = (tableGet(&state.weights.entries, state2) / 4096) + readReverse(
+            input,
+            &mut reverse,
+            bits2,
+          )
+        }
+      }
+    }
+    cursor.position = end * 8
+  }
+  if cursor.failed || count == 0 || count >= 256 {
+    return false
+  }
+  let mut sum: usize = 0
+  let mut i: usize = 0
+  while i < count {
+    let weight = weights[i]
+    if weight > 11 {
+      return false
+    }
+    if weight > 0 {
+      sum = sum + power(weight - 1)
+    }
+    i = i + 1
+  }
+  if sum == 0 {
+    return false
+  }
+  let log = highBit(sum) + 1
+  if log > 11 {
+    return false
+  }
+  let remainder = power(log) - sum
+  if remainder == 0 || power(highBit(remainder)) != remainder {
+    return false
+  }
+  weights[count] = highBit(remainder) + 1
+  count = count + 1
+  let mut ones: usize = 0
+  i = 0
+  while i < count {
+    if weights[i] == 1 {
+      ones = ones + 1
+    }
+    i = i + 1
+  }
+  if ones < 2 || ones % 2 != 0 {
+    return false
+  }
+  let mut position: usize = 0
+  let mut weight: usize = 1
+  while weight <= log {
+    i = 0
+    while i < count {
+      if weights[i] == weight {
+        let length = power(weight - 1)
+        let mut entry: usize = 0
+        while entry < length {
+          tableSet(&mut state.hEntries, position, i + (log + 1 - weight) * 256)
+          position = position + 1
+          entry = entry + 1
+        }
+      }
+      i = i + 1
+    }
+    weight = weight + 1
+  }
+  if position != power(log) {
+    return false
+  }
+  state.hLog = log
+  return true
+}
+
+fn huffmanStream(
+  state: &BlockState,
+  input: &[u8],
+  start: usize,
+  end: usize,
+  literals: &mut [u8],
+  outputStart: usize,
+  outputLength: usize,
+) -> bool {
+  let mut reverse = reverseBits(input, start, end)
+  if reverse.failed {
+    return false
+  }
+  let mut i: usize = 0
+  while i < outputLength {
+    let saved = reverse.position
+    let entry = paddedReverse(input, &mut reverse, state.hLog)
+    reverse.position = saved
+    let bits = (tableGet(&state.hEntries, entry) / 256)
+    if bits == 0 || bits > reverse.position - reverse.end {
+      return false
+    }
+    reverse.position = reverse.position - bits
+    literals[outputStart + i] = usize.toU8((tableGet(&state.hEntries, entry) % 256))
+    i = i + 1
+  }
+  return !reverse.failed && reverse.position == reverse.end
+}
+
+fn decodeLiterals(state: &mut BlockState, input: &[u8], cursor: &mut Bits, literals: &mut [u8]) -> usize {
+  let kind = readForward(input, &mut cursor, 2)
+  let format = readForward(input, &mut cursor, 2)
+  let mut regenerated: usize = 0
+  if kind < 2 {
+    if format == 0 || format == 2 {
+      cursor.position = 3
+      regenerated = readForward(input, &mut cursor, 5)
+    } else {
+      let mut bits: usize = 20
+      if format == 1 {
+        bits = 12
+      }
+      regenerated = readForward(input, &mut cursor, bits)
+    }
+    if cursor.failed || regenerated > literals.length {
+      cursor.failed = true
+      return 0
+    }
+    if kind == 0 {
+      if regenerated > (cursor.end - cursor.position) / 8 {
+        cursor.failed = true
+        return 0
+      }
+      let mut i: usize = 0
+      while i < regenerated {
+        literals[i] = input[cursor.position / 8 + i]
+        i = i + 1
+      }
+      cursor.position = cursor.position + regenerated * 8
+    } else {
+      let value = readForward(input, &mut cursor, 8)
+      let mut i: usize = 0
+      while i < regenerated {
+        literals[i] = usize.toU8(value)
+        i = i + 1
+      }
+    }
+    return regenerated
+  }
+  let mut bits: usize = 18
+  if format < 2 {
+    bits = 10
+  } else {
+    if format == 2 {
+      bits = 14
+    }
+  }
+  regenerated = readForward(input, &mut cursor, bits)
+  let compressed = readForward(input, &mut cursor, bits)
+  if cursor.failed || regenerated > literals.length || compressed > (cursor.end - cursor.position) / 8 {
+    cursor.failed = true
+    return 0
+  }
+  if format != 0 && regenerated < 6 {
+    cursor.failed = true
+    return 0
+  }
+  let end = cursor.position / 8 + compressed
+  if kind == 2 {
+    let savedEnd = cursor.end
+    cursor.end = end * 8
+    let valid = huffmanTree(&mut state, input, &mut cursor)
+    cursor.end = savedEnd
+    if !valid {
+      cursor.failed = true
+      return 0
+    }
+  } else {
+    if state.hLog == 0 {
+      cursor.failed = true
+      return 0
+    }
+  }
+  let mut start = cursor.position / 8
+  if format == 0 {
+    if !huffmanStream(&state, input, start, end, &mut literals, 0, regenerated) {
+      cursor.failed = true
+      return 0
+    }
+  } else {
+    if start > end || end - start < 6 {
+      cursor.failed = true
+      return 0
+    }
+    let size1 = readForward(input, &mut cursor, 16)
+    let size2 = readForward(input, &mut cursor, 16)
+    let size3 = readForward(input, &mut cursor, 16)
+    start = cursor.position / 8
+    if size1 + size2 + size3 > end - start {
+      cursor.failed = true
+      return 0
+    }
+    let each = (regenerated + 3) / 4
+    if each * 3 > regenerated {
+      cursor.failed = true
+      return 0
+    }
+    if !huffmanStream(&state, input, start, start + size1, &mut literals, 0, each) {
+      cursor.failed = true
+      return 0
+    }
+    start = start + size1
+    if !huffmanStream(&state, input, start, start + size2, &mut literals, each, each) {
+      cursor.failed = true
+      return 0
+    }
+    start = start + size2
+    if !huffmanStream(&state, input, start, start + size3, &mut literals, each * 2, each) {
+      cursor.failed = true
+      return 0
+    }
+    start = start + size3
+    if !huffmanStream(&state, input, start, end, &mut literals, each * 3, regenerated - each * 3) {
+      cursor.failed = true
+      return 0
+    }
+  }
+  cursor.position = end * 8
+  return regenerated
+}
+
+fn zeros256() -> [usize; 256] {
+  return [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+  ]
+}

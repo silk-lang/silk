@@ -1,0 +1,722 @@
+//! Fibers: handles to child tasks, with typed outcomes and one observer each.
+//!
+//! # When to use
+//! | Operation | Use it to |
+//! |---|---|
+//! | [`forkChild`] | Start structured child work under the current `Scheduler` |
+//! | [`join`] | Wait for a child, and raise its failure in the current effect |
+//! | [`await`] | Wait for a child, and get success, failure or cancellation as data |
+//! | [`yieldNow`] | Let other ready tasks run before the current task continues |
+//!
+//! Run the root program with `silk.concurrency.local_scheduler`, which provides the `Scheduler` service.
+//!
+//! # Details
+//! A [`Fiber`] has one completion observer. [`await`] and [`join`] consume the Fiber, so a Fiber
+//! has at most one waiter. A successful fork publishes the complete child before it returns the
+//! Fiber. The child body starts only when the scheduler drives it, not during the fork.
+//!
+//! Completion, cancellation and yields notify an `Execution` with no allocation.
+//!
+//! The other items ([`CompletionProducer`], [`CompletionCanceller`], [`PreparedFiber`] and the
+//! completion functions) are for scheduler providers, not for application code.
+//!
+//! # Errors
+//! - [`forkChild`] fails with `OutOfMemoryError` or `TaskIdExhaustedError`.
+//! - [`join`] raises the typed failure of the child unchanged, or [`Cancelled`].
+//!
+//! # Gotchas
+//! Dropping a Fiber stops the observation. It does not cancel the task. The scheduler cancels
+//! unfinished children when the root finishes.
+//!
+//! # Examples
+//! ## Fork two children and join them
+//! ```silk
+//! import silk.mem.allocator { OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.concurrency.fiber { Cancelled, Fiber }
+//! import silk.concurrency.local_scheduler { LocalScheduler, StalledError }
+//! import silk.system.monotonic_clock { MonotonicClock }
+//! import silk.system.monotonic_clock_native { OsMonotonicClock }
+//! import silk.concurrency.scheduler { Scheduler, TaskIdExhaustedError }
+//!
+//! effect fn square(value: i32) -> i32 {
+//!   // Lets the other ready task run first.
+//!   run Fiber.yieldNow()
+//!   return value * value
+//! }
+//!
+//! effect fn root() -> i32
+//!   ! OutOfMemoryError | TaskIdExhaustedError | Cancelled
+//!   ? &mut Scheduler | &mut MonotonicClock {
+//!   let three = run Fiber<i32, never>.forkChild(square(3))
+//!   let four = run Fiber<i32, never>.forkChild(square(4))
+//!
+//!   // join parks the root until the child finishes.
+//!   let first = run three.join()
+//!   let second = run four.join()
+//!   if first + second != 25 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//!
+//! effect fn program() -> i32
+//!   ! OutOfMemoryError | TaskIdExhaustedError | Cancelled | StalledError {
+//!   let mut clock = OsMonotonicClock.make()
+//!   let mut scheduler = LocalScheduler.make()
+//!   return run scheduler.execute<i32, OutOfMemoryError | TaskIdExhaustedError | Cancelled>(root())
+//!     |> Effect.provideMut<MonotonicClock>(&mut clock)
+//! }
+//!
+//! effect fn failed<E>(error: E) -> i32 {
+//!   drop error
+//!   return 1
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   return run Effect.catchAll(program(), failed)
+//! }
+//! ```
+//!
+//! ## Get a child failure as data
+//! ```silk
+//! import silk.mem.allocator { OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.concurrency.fiber { Failure, Fiber, Outcome }
+//! import silk.concurrency.local_scheduler { LocalScheduler, StalledError }
+//! import silk.system.monotonic_clock { MonotonicClock }
+//! import silk.system.monotonic_clock_native { OsMonotonicClock }
+//! import silk.concurrency.scheduler { Scheduler, TaskIdExhaustedError }
+//!
+//! struct Invalid {
+//!   code: i32,
+//! }
+//!
+//! effect fn check(value: i32) -> i32
+//!   ! Invalid {
+//!   if value < 0 {
+//!     fail Invalid { code: value }
+//!   }
+//!   return value
+//! }
+//!
+//! effect fn root() -> i32
+//!   ! OutOfMemoryError | TaskIdExhaustedError
+//!   ? &mut Scheduler | &mut MonotonicClock {
+//!   let child = run Fiber<i32, Invalid>.forkChild(check(-7))
+//!
+//!   // await gives the outcome as data. It does not raise the failure.
+//!   let outcome = run child.await()
+//!   let Outcome<i32, Invalid> { value } = move outcome
+//!   return match move value {
+//!     Failure<Invalid> { error } => {
+//!       if error.code != -7 {
+//!         return 1
+//!       }
+//!       return 0
+//!     }
+//!     _ => 1
+//!   }
+//! }
+//!
+//! effect fn program() -> i32
+//!   ! OutOfMemoryError | TaskIdExhaustedError | StalledError {
+//!   let mut clock = OsMonotonicClock.make()
+//!   let mut scheduler = LocalScheduler.make()
+//!   return run scheduler.execute<i32, OutOfMemoryError | TaskIdExhaustedError>(root())
+//!     |> Effect.provideMut<MonotonicClock>(&mut clock)
+//! }
+//!
+//! effect fn failed<E>(error: E) -> i32 {
+//!   drop error
+//!   return 1
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   return run Effect.catchAll(program(), failed)
+//! }
+//! ```
+//!
+//! @category Concurrency
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.concurrency.execution { Execution, Wake }
+import silk.format { Debug, Format, Formatter }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.concurrency.scheduler { Scheduler, PendingPublication, PendingRequest, PendingSubmission, PreparedTask, PublicationResponse, ResponsePublished, ResponseRejected, ResponseWaiting, SubmissionSlot, TaskIdExhaustedError, TaskMailbox }
+import silk.mem.shared { Shared }
+import silk.io.writer { Writer, WriterError }
+
+struct PayloadEmpty {}
+struct PayloadSuccess<A> { value: A }
+struct PayloadFailure<E> { error: E }
+struct PayloadTaken {}
+
+struct CompletionPayload<A, E> {
+  phase: PayloadEmpty | PayloadSuccess<A> | PayloadFailure<E> | PayloadTaken,
+}
+
+struct NoWaiter {}
+struct PendingWaiter { wake: Wake }
+struct SignalPending { waiter: NoWaiter | PendingWaiter }
+struct SignalReady {}
+struct SignalCancelled {}
+
+struct CompletionSignal {
+  phase: SignalPending | SignalReady | SignalCancelled,
+}
+
+/// The producer endpoint for one Fiber result.
+///
+/// # Details
+///
+/// A Scheduler provider owns this endpoint until it calls [`completeSuccess`] or
+/// [`completeFailure`]. Both operations consume the endpoint and notify one parked observer.
+pub struct CompletionProducer<A, E> {
+  payload: Shared<CompletionPayload<A, E>>,
+  signal: Shared<CompletionSignal>,
+}
+
+/// The type-erased cancellation endpoint for one Fiber result.
+///
+/// # Details
+///
+/// A task store can retain this endpoint without storing the Fiber success or failure types.
+/// [`cancel`] consumes the endpoint and notifies one parked observer.
+pub struct CompletionCanceller {
+  signal: Shared<CompletionSignal>,
+}
+
+/// An affine handle that observes one task result or cancellation.
+///
+/// # When to use
+///
+/// Get one from [`forkChild`], which starts structured child work under the current `Scheduler`.
+/// Use [`join`] to wait for the child and raise its failure in the current effect, or [`await`] to
+/// get success, failure or cancellation as data. Run the root program with
+/// `silk.concurrency.local_scheduler`, which provides the `Scheduler` service.
+///
+/// # Details
+///
+/// A Fiber has one completion observer. [`await`] and [`join`] consume the handle, so a Fiber has
+/// at most one waiter. The child body starts only when the scheduler drives it, not during the
+/// fork.
+///
+/// # Gotchas
+///
+/// Dropping the handle stops the observation. It does not cancel its task. The scheduler cancels
+/// unfinished children when the root finishes.
+pub struct Fiber<A, E> {
+  payload: Shared<CompletionPayload<A, E>>,
+  signal: Shared<CompletionSignal>,
+}
+
+impl<A, E> Fiber<A, E> {
+  /// Allocates the producer, canceller, and affine Fiber endpoints for one task.
+  ///
+  /// # When to use
+  ///
+  /// Use this provider operation before a Scheduler constructs and publishes a task.
+  ///
+  /// # Details
+  ///
+  /// No endpoint becomes visible until both Shared completion cells exist. Observation and
+  /// notification allocate no further storage.
+  pub effect fn prepare() -> PreparedFiber<A, E>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+    let payload = run Shared<CompletionPayload<A, E>>.make(CompletionPayload<A, E> {
+      phase: PayloadEmpty {},
+    })
+    let signal = run Shared<CompletionSignal>.make(CompletionSignal {
+      phase: SignalPending { waiter: NoWaiter {} },
+    })
+    let producerPayload = Shared<CompletionPayload<A, E>>.clone(&payload)
+    let producerSignal = Shared<CompletionSignal>.clone(&signal)
+    let cancellerSignal = Shared<CompletionSignal>.clone(&signal)
+    return PreparedFiber<A, E> {
+      producer: CompletionProducer<A, E> {
+        payload: move producerPayload,
+        signal: move producerSignal,
+      },
+      canceller: CompletionCanceller { signal: move cancellerSignal },
+      fiber: Fiber<A, E> { payload: move payload, signal: move signal },
+    }
+  }
+
+  /// Completes one Fiber with `value` and notifies its observer.
+  ///
+  /// # Details
+  ///
+  /// This operation stores `value` before it publishes readiness. It consumes the producer endpoint
+  /// and allocates no storage.
+  pub fn completeSuccess(producer: CompletionProducer<A, E>, value: A) -> () {
+    let CompletionProducer<A, E> { payload, signal } = move producer
+    let stored = Shared.withMut(&payload, storeSuccess<A, E>(move value))
+    let published = Shared.withMut(&signal, publishReady)
+    notify(move published)
+    drop payload
+    drop signal
+    return ()
+  }
+
+  /// Completes one Fiber with `error` and notifies its observer.
+  ///
+  /// # Details
+  ///
+  /// This operation stores `error` before it publishes readiness. It consumes the producer endpoint
+  /// and allocates no storage.
+  pub fn completeFailure(producer: CompletionProducer<A, E>, error: E) -> () {
+    let CompletionProducer<A, E> { payload, signal } = move producer
+    let stored = Shared.withMut(&payload, storeFailure<A, E>(move error))
+    let published = Shared.withMut(&signal, publishReady)
+    notify(move published)
+    drop payload
+    drop signal
+    return ()
+  }
+
+  /// Publishes cancellation and notifies one parked Fiber observer.
+  ///
+  /// # Details
+  ///
+  /// This operation is independent of the Fiber success and failure types. It consumes the
+  /// cancellation endpoint and allocates no storage.
+  pub fn cancel(canceller: CompletionCanceller) -> () {
+    let CompletionCanceller { signal } = move canceller
+    let published = Shared.withMut(&signal, publishCancelled)
+    notify(move published)
+    drop signal
+    return ()
+  }
+
+  /// Consumes a Fiber and returns its success, typed failure, or cancellation as data.
+  ///
+  /// # Details
+  ///
+  /// A terminal Fiber returns immediately. A pending Fiber parks the current Execution and installs
+  /// exactly one Wake. Observation and resumption allocate no storage.
+  pub effect<'env> fn await<'env>(self: Self) -> Outcome<A, E> {
+    let Fiber<A, E> { payload, signal } = move self
+    let selected = Shared.withMut(&signal, inspectSignal)
+    return run finishObservation(move payload, move signal, move selected)
+  }
+
+  /// Consumes a Fiber, returns its success value, and propagates failure or cancellation.
+  ///
+  /// # Details
+  ///
+  /// A typed task failure is raised unchanged. Cancellation raises [`Cancelled`]. A pending Fiber
+  /// parks with the same allocation-free one-observer protocol as [`await`].
+  pub effect<'env> fn join<'env>(self: Self) -> A
+  ! E | Cancelled {
+    let observed = run Fiber<A, E>.await(move self)
+    let Outcome<A, E> { value } = move observed
+    return match move value {
+      Success<A> { value: success } => move success
+      Failure<E> { error } => run raiseFailure<A, E>(move error)
+      Cancelled {} => run raiseCancellation<A>()
+    }
+  }
+
+  /// Relinquishes the current Execution once and immediately reports that it is ready.
+  ///
+  /// # When to use
+  ///
+  /// Use this operation to let tasks that are already ready run before the current task continues
+  /// under a FIFO provider.
+  ///
+  /// # Details
+  ///
+  /// This operation consumes its Wake during registration. It needs no Scheduler service and
+  /// allocates no storage. The provider selects the next activation order.
+  pub effect fn yieldNow() -> () {
+    run Execution.park(notifyYield)
+    return ()
+  }
+}
+
+/// The three possible terminal observations of a Fiber.
+pub struct Outcome<A, E> {
+  /// The completed success, typed failure, or cancellation value.
+  pub value: Success<A> | Failure<E> | Cancelled,
+}
+
+/// A successful Fiber outcome.
+pub struct Success<A> {
+  /// The value returned by the task.
+  pub value: A,
+}
+
+/// A typed failed Fiber outcome.
+pub struct Failure<E> {
+  /// The error raised by the task.
+  pub error: E,
+}
+
+/// A Fiber outcome that reports structured task cancellation.
+pub struct Cancelled {}
+
+impl Debug for Cancelled {
+  /// Writes `Cancelled`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return run Format.debugFields(self, "Cancelled", &mut formatter)
+  }
+}
+
+/// The three endpoints created for one future Fiber result.
+///
+/// # Details
+///
+/// A Scheduler provider gives `fiber` to the caller, captures `producer` in the task, and stores
+/// `canceller` in its type-erased task entry.
+pub struct PreparedFiber<A, E> {
+  /// The endpoint that publishes a success or typed failure.
+  pub producer: CompletionProducer<A, E>,
+  /// The type-erased endpoint that publishes cancellation.
+  pub canceller: CompletionCanceller,
+  /// The affine result handle returned after task publication succeeds.
+  pub fiber: Fiber<A, E>,
+}
+
+fn storeSuccess<A, E>(self: &mut CompletionPayload<A, E>, value: A) -> () {
+  let previous = Intrinsic.replace(self.phase, PayloadSuccess<A> { value: move value })
+  drop previous
+  return ()
+}
+
+fn storeFailure<A, E>(self: &mut CompletionPayload<A, E>, error: E) -> () {
+  let previous = Intrinsic.replace(self.phase, PayloadFailure<E> { error: move error })
+  drop previous
+  return ()
+}
+
+struct PublishedSignal { waiter: NoWaiter | PendingWaiter }
+
+fn publishReady(self: &mut CompletionSignal) -> PublishedSignal {
+  let previous = Intrinsic.replace(self.phase, SignalReady {})
+  return match move previous {
+    SignalPending { waiter } => PublishedSignal { waiter: move waiter }
+    SignalReady {} => PublishedSignal { waiter: NoWaiter {} }
+    SignalCancelled {} => retainPublishedCancellation(move self)
+  }
+}
+
+fn retainPublishedCancellation(self: &mut CompletionSignal) -> PublishedSignal {
+  self.phase = SignalCancelled {}
+  return PublishedSignal { waiter: NoWaiter {} }
+}
+
+fn publishCancelled(self: &mut CompletionSignal) -> PublishedSignal {
+  let previous = Intrinsic.replace(self.phase, SignalCancelled {})
+  return match move previous {
+    SignalPending { waiter } => PublishedSignal { waiter: move waiter }
+    SignalReady {} => retainPublishedReadiness(move self)
+    SignalCancelled {} => PublishedSignal { waiter: NoWaiter {} }
+  }
+}
+
+fn retainPublishedReadiness(self: &mut CompletionSignal) -> PublishedSignal {
+  self.phase = SignalReady {}
+  return PublishedSignal { waiter: NoWaiter {} }
+}
+
+fn notify(published: PublishedSignal) -> () {
+  let PublishedSignal { waiter } = move published
+  return match move waiter {
+    NoWaiter {} => ()
+    PendingWaiter { wake } => Execution.wake(move wake)
+  }
+}
+
+struct ObservePending {}
+struct ObserveReady {}
+struct ObserveCancelled {}
+
+fn inspectSignal(self: &mut CompletionSignal) -> ObservePending | ObserveReady | ObserveCancelled {
+  return match &self.phase {
+    SignalPending { .. } => ObservePending {}
+    SignalReady {} => ObserveReady {}
+    SignalCancelled {} => ObserveCancelled {}
+  }
+}
+
+struct WaitInstalled {}
+struct WaitAlreadyComplete { wake: Wake }
+struct WaitAlreadyOccupied { wake: Wake }
+
+fn installEmptyWaiter(
+  self: &mut CompletionSignal,
+  wake: Wake,
+) -> WaitInstalled {
+  self.phase = SignalPending { waiter: PendingWaiter { wake: move wake } }
+  return WaitInstalled {}
+}
+
+fn rejectOccupiedWaiter(
+  self: &mut CompletionSignal,
+  retained: Wake,
+  rejected: Wake,
+) -> WaitAlreadyOccupied {
+  self.phase = SignalPending { waiter: PendingWaiter { wake: move retained } }
+  return WaitAlreadyOccupied { wake: move rejected }
+}
+
+fn installPending(
+  self: &mut CompletionSignal,
+  waiter: NoWaiter | PendingWaiter,
+  wake: Wake,
+) -> WaitInstalled | WaitAlreadyOccupied {
+  return match move waiter {
+    NoWaiter {} => installEmptyWaiter(move self, move wake)
+    PendingWaiter { wake: retained } => rejectOccupiedWaiter(
+      move self,
+      move retained,
+      move wake,
+    )
+  }
+}
+
+fn retainReadyWaiter(
+  self: &mut CompletionSignal,
+  wake: Wake,
+) -> WaitAlreadyComplete {
+  self.phase = SignalReady {}
+  return WaitAlreadyComplete { wake: move wake }
+}
+
+fn retainCancelledWaiter(
+  self: &mut CompletionSignal,
+  wake: Wake,
+) -> WaitAlreadyComplete {
+  self.phase = SignalCancelled {}
+  return WaitAlreadyComplete { wake: move wake }
+}
+
+fn installWaiter(
+  self: &mut CompletionSignal,
+  wake: Wake,
+) -> WaitInstalled | WaitAlreadyComplete | WaitAlreadyOccupied {
+  let previous = Intrinsic.replace(self.phase, SignalCancelled {})
+  return match move previous {
+    SignalPending { waiter } => installPending(move self, move waiter, move wake)
+    SignalReady {} => retainReadyWaiter(move self, move wake)
+    SignalCancelled {} => retainCancelledWaiter(move self, move wake)
+  }
+}
+
+fn finishInstallation(
+  installed: WaitInstalled | WaitAlreadyComplete | WaitAlreadyOccupied,
+) -> () {
+  return match move installed {
+    WaitInstalled {} => ()
+    WaitAlreadyComplete { wake } => Execution.wake(move wake)
+    WaitAlreadyOccupied { wake } => Execution.wake(move wake)
+  }
+}
+
+struct WaitGuard { signal: Shared<CompletionSignal> }
+
+fn registerWait(wake: Wake, signal: Shared<CompletionSignal>) -> WaitGuard {
+  let installed = Shared.withMut(&signal, installWaiter(move wake))
+  finishInstallation(move installed)
+  return WaitGuard { signal: move signal }
+}
+
+fn takePayload<A, E>(
+  self: &mut CompletionPayload<A, E>,
+  marker: (),
+) -> Success<A> | Failure<E> {
+  drop marker
+  let previous = Intrinsic.replace(self.phase, PayloadTaken {})
+  return match move previous {
+    PayloadSuccess<A> { value } => Success<A> { value: move value }
+    PayloadFailure<E> { error } => Failure<E> { error: move error }
+    PayloadEmpty {} => missingPayload<A, E>()
+    PayloadTaken {} => missingPayload<A, E>()
+  }
+}
+
+fn missingPayload<A, E>() -> Success<A> | Failure<E> {
+  return Intrinsic.trap("Fiber: the completion payload was empty or already taken")
+}
+
+fn finishReady<A, E>(
+  payload: Shared<CompletionPayload<A, E>>,
+  signal: Shared<CompletionSignal>,
+) -> Outcome<A, E> {
+  let selected = Shared.withMut(&payload, takePayload<A, E>(()))
+  drop payload
+  drop signal
+  return Outcome<A, E> { value: move selected }
+}
+
+fn finishCancelled<A, E>(
+  payload: Shared<CompletionPayload<A, E>>,
+  signal: Shared<CompletionSignal>,
+) -> Outcome<A, E> {
+  drop payload
+  drop signal
+  return Outcome<A, E> { value: Cancelled {} }
+}
+
+effect<'env> fn wait<A: 'env, E: 'env, 'env>(
+  payload: Shared<CompletionPayload<A, E>>,
+  signal: Shared<CompletionSignal>,
+) -> Outcome<A, E> {
+  let registrationSignal = Shared<CompletionSignal>.clone(&signal)
+  let registration = registerWait(move registrationSignal)
+  run Execution.park(move registration)
+  let selected = Shared.withMut(&signal, inspectSignal)
+  return run finishObservation(move payload, move signal, move selected)
+}
+
+effect<'env> fn finishObservation<A: 'env, E: 'env, 'env>(
+  payload: Shared<CompletionPayload<A, E>>,
+  signal: Shared<CompletionSignal>,
+  selected: ObservePending | ObserveReady | ObserveCancelled,
+) -> Outcome<A, E> {
+  return match move selected {
+    ObservePending {} => run wait<A, E>(move payload, move signal)
+    ObserveReady {} => finishReady<A, E>(move payload, move signal)
+    ObserveCancelled {} => finishCancelled<A, E>(move payload, move signal)
+  }
+}
+
+struct PublicationGuard {}
+struct PublicationAccepted {}
+struct PublicationRejected {}
+
+fn installSubmission(
+  slot: &mut SubmissionSlot,
+  task: PreparedTask,
+) -> () {
+  let previous = Intrinsic.replace(
+    slot.phase,
+    PendingSubmission { task: move task },
+  )
+  drop previous
+  return ()
+}
+
+fn installPublicationRequest(
+  mailbox: &mut TaskMailbox,
+  wake: Wake,
+) -> () {
+  let previous = Intrinsic.replace(
+    mailbox.request,
+    PendingRequest { wake: move wake },
+  )
+  drop previous
+  return ()
+}
+
+fn registerPublication(
+  wake: Wake,
+  mailbox: Shared<TaskMailbox>,
+  submission: Shared<SubmissionSlot>,
+  task: PreparedTask,
+) -> PublicationGuard {
+  let stored = Shared.withMut(&submission, installSubmission(move task))
+  let requested = Shared.withMut(&mailbox, installPublicationRequest(move wake))
+  drop mailbox
+  drop submission
+  return PublicationGuard {}
+}
+
+fn takePublicationResponse(
+  response: &mut PublicationResponse,
+) -> PublicationAccepted | PublicationRejected {
+  let previous = Intrinsic.replace(response.phase, ResponseWaiting {})
+  return match move previous {
+    ResponsePublished {} => PublicationAccepted {}
+    ResponseWaiting {} => PublicationRejected {}
+    ResponseRejected {} => PublicationRejected {}
+  }
+}
+
+effect fn rejectPublication() -> () ! OutOfMemoryError {
+  fail OutOfMemoryError {}
+}
+
+effect fn finishPublication(
+  response: Shared<PublicationResponse>,
+) -> () ! OutOfMemoryError {
+  let selected = Shared.withMut(&response, takePublicationResponse)
+  drop response
+  return match move selected {
+    PublicationAccepted {} => ()
+    PublicationRejected {} => run rejectPublication()
+  }
+}
+
+effect<'env> fn publishPending<A: 'env, E: 'env, 'env>(
+  pending: PendingPublication<A, E>,
+) -> Fiber<A, E>
+! OutOfMemoryError {
+  let PendingPublication<A, E> {
+    fiber,
+    parentMailbox,
+    parentSubmission,
+    response,
+    task,
+  } = move pending
+  let registration = registerPublication(
+    move parentMailbox,
+    move parentSubmission,
+    move task,
+  )
+  run Execution.park(move registration)
+  run finishPublication(move response)
+  return move fiber
+}
+
+struct YieldGuard {}
+
+fn notifyYield(wake: Wake) -> YieldGuard {
+  Execution.wake(move wake)
+  return YieldGuard {}
+}
+
+effect<'env> fn raiseFailure<A, E: 'env, 'env>(error: E) -> A ! E {
+  fail move error
+}
+
+effect fn raiseCancellation<A>() -> A ! Cancelled {
+  fail Cancelled {}
+}
+
+impl<A: 'static, E: 'static> Fiber<A, E> {
+  /// Prepares and atomically publishes one child task, then returns its affine Fiber.
+  ///
+  /// # When to use
+  ///
+  /// Use this operation to run closed work or work that uses the child Scheduler and MonotonicClock
+  /// providers.
+  ///
+  /// # Details
+  ///
+  /// Preparation finishes its exclusive Scheduler dispatch before publication starts. Publication
+  /// returns the Fiber only after the provider accepts the complete child. The provider records
+  /// that acceptance and wakes the parent before it notifies the child's initial readiness. The
+  /// child body starts only when the Scheduler later drives it.
+  ///
+  /// # Gotchas
+  ///
+  /// Allocation refusal or task-identity exhaustion raises the exact preparation failure:
+  /// `OutOfMemoryError` or `TaskIdExhaustedError`. Publication refusal raises `OutOfMemoryError`,
+  /// returns no Fiber, and does not activate the child. Dropping the Fiber does not cancel the
+  /// child. The scheduler cancels unfinished children when the root finishes.
+  pub effect fn forkChild(
+    child: once Effect<'static;
+      A
+      ! E
+      ? &mut Scheduler | &mut MonotonicClock
+    >
+  ) -> Fiber<A, E>
+  ! OutOfMemoryError | TaskIdExhaustedError
+  ? &mut Scheduler {
+    let pending = run Scheduler.prepare<A, E>(move child)
+    return run publishPending<A, E>(move pending)
+  }
+}

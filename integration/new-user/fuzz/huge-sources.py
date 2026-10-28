@@ -3,7 +3,7 @@
 # Usage: python3 huge-sources.py <workdir> [case...]
 import os, subprocess, sys, time, shutil
 W=sys.argv[1]; only=sys.argv[2:]
-HDR='import silk.effect { Effect }\nimport silk.logger { LogError }\nimport silk.os_logger { StdoutLogger }\n\n'
+HDR='import silk.core.effect { Effect }\nimport silk.io.logger { LogError }\nimport silk.io.logger_native { StdoutLogger }\n\n'
 def prog(body, extra=''):
     return HDR+extra+'\npub effect fn main() -> () ! LogError {\n  let mut logger = StdoutLogger.make()\n'+body+'\n}\n'
 def logv(e): return f'  let v = {e}\n  run Effect.log("{{v}}\\n", &.{{ v: v }}) |> Effect.provideMut(&mut logger)'

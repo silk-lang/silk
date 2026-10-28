@@ -36,7 +36,7 @@ application; it resolves to the same canonical module identity, not a copy or a 
 Ordinary visibility and selective/public import rules apply. Unselected runtime sources are not
 loaded. A runtime descriptor names a source module; ordinary calls in that module select the
 application function and adapt its result. Runtime descriptors do not name an invocation function.
-The distribution selects `silk/native_start` for hosted executables and `silk/wasm_start` for
+The distribution selects `silk/platform/native/start` for hosted executables and `silk/platform/wasm/start` for
 standalone WebAssembly executables. Their source C exports define `main`. Explicit libraries,
 objects, and runtime-none profiles acquire no default startup or storage component.
 

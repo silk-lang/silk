@@ -1,6 +1,6 @@
 # WebSocket server handshake
 
-`silk.websocket_upgrade` validates a WebSocket opening request and runs an explicit application
+`silk.http.websocket_upgrade` validates a WebSocket opening request and runs an explicit application
 decision before the HTTP server switches protocols. It reuses the scoped HTTP server connection
 and its buffered byte transport. Frame parsing, message writes, compression, and client handshakes
 belong to separate APIs.
@@ -9,9 +9,9 @@ The pure accept transformation validates the key and writes into caller storage.
 program checks the RFC sample without a transport or allocator:
 
 ```silk
-import silk.result {Result}
-import silk.usize
-import silk.websocket_upgrade as Upgrade
+import silk.core.result {Result}
+import silk.num.usize
+import silk.http.websocket_upgrade as Upgrade
 
 pub fn main() -> i32 {
   let mut output: [u8; 28] = [

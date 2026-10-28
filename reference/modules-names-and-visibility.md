@@ -849,7 +849,7 @@ namespace alias or a selected-member list so the import never creates a binding 
 otherwise reserved.
 
 ```silk
-import silk.effect { Effect }
+import silk.core.effect { Effect }
 ```
 
 Reserved segments in any nonfinal position are ordinary parts of the canonical module identity.
@@ -857,8 +857,8 @@ Every module-closure, name-resolution, formatting, and tooling consumer observes
 path segments.
 
 **Boundary:** Contextual acceptance is limited to import paths. A reserved word remains invalid as a
-declaration name or explicit alias. `import silk.effect` is invalid because its implicit namespace
-binding would be named `effect`; selected-member imports such as `import silk.effect { Effect }`
+declaration name or explicit alias. `import silk.core.effect` is invalid because its implicit namespace
+binding would be named `effect`; selected-member imports such as `import silk.core.effect { Effect }`
 are valid because they state legal bindings explicitly. A legal explicit namespace alias remains
 valid under IMPORT-002 when a caller specifically needs the module namespace.
 
@@ -896,21 +896,21 @@ of its inherent members, reached through the type under NAME-005. The same rule 
 `Effect`, `List`, `Result`, filesystem services, target providers, and the primitive namespaces:
 
 ```silk
-import silk.effect { Effect }
-import silk.i32
+import silk.core.effect { Effect }
+import silk.num.i32
 ```
 
 `Effect<A ! E ? R>` remains language type syntax. The selected binding `Effect` names the ordinary
 standard-library struct `Effect`, and `Effect.provide` is an inherent member declared in that
-struct's `impl Effect` block. `silk.i32` declares no owner type: its operations are root
+struct's `impl Effect` block. `silk.num.i32` declares no owner type: its operations are root
 declarations reached through the namespace binding `i32`.
 
 The ownership properties are ordinary standard-library names too. `Copy` and `Drop` are aliases of
-the sealed `Intrinsic.Copy` and `Intrinsic.Drop` published by `silk.ownership` (INTR-006), and a
+the sealed `Intrinsic.Copy` and `Intrinsic.Drop` published by `silk.core.ownership` (INTR-006), and a
 module that spells them imports them:
 
 ```silk
-import silk.ownership { Copy }
+import silk.core.ownership { Copy }
 
 struct Point { x: i32, y: i32 }
 
@@ -924,7 +924,7 @@ files, but that packaging privilege does not inject its declarations into every 
 Tooling may add missing imports automatically; auto-import is a source edit, not invisible lookup.
 
 A foundational type spelling does not create an ordinary nominal declaration in the module scope.
-Therefore `import silk.i32` may bind namespace `i32` while type positions continue to use the
+Therefore `import silk.num.i32` may bind namespace `i32` while type positions continue to use the
 closed language spelling `i32`; selecting the `Effect` struct behaves similarly beside Effect type
 syntax. This does not create general separate type and value namespaces for user
 declarations.

@@ -238,7 +238,7 @@ handler can fail, or a provision operation whose acquisition has requirements, d
 boundary unless those new channels are also eliminated.
 
 ```silk
-import silk.effect { Effect }
+import silk.core.effect { Effect }
 
 struct ProblemError {}
 

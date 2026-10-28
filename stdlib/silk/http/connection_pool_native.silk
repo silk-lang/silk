@@ -1,0 +1,559 @@
+//! Connection pools that open native TCP, HTTPS, and Unix socket connections.
+//!
+//! # When to use
+//! Use [`withDirectPool`] to reuse connections to network origins, then call [`withConnection`] for
+//! each request. Use [`withUnixPool`] and [`withUnixConnection`] when all requests go through one
+//! Unix socket, for example to a local daemon. `silk.http.fetch_native` can send requests through a
+//! pool from this module.
+//!
+//! # Details
+//! Each pool has one [`Context`] with the native options, the HTTP limits, and an optional trust
+//! snapshot. The pool copies the trust snapshot when it starts, and each new HTTPS connection gets
+//! its own copy. The pool rules, such as limits, reuse, and expiry, are in
+//! `silk.http.connection_pool`.
+//!
+//! The context removes `options.deadline`. Each checkout gives its own deadline, and a pooled
+//! connection keeps no deadline.
+//!
+//! # Errors
+//! - `PoolError` from `silk.http.connection_pool`.
+//! - The native errors of a new connection: resolver, socket, TLS, identity, and trust errors.
+//! - The error of the handler.
+//!
+//! # Gotchas
+//! - A direct pool accepts only direct keys. A Unix pool accepts only keys for its own path. Other
+//!   keys fail with `PoolError.ContextMismatch`, before any network contact.
+//! - Proxy keys always fail with `PoolError.ContextMismatch`. These contexts do not open proxy
+//!   connections.
+//! - An HTTPS origin also fails with `PoolError.ContextMismatch` if the pool has no trust snapshot.
+//!   Give `preparedTrust` to use HTTPS.
+//!
+//! @category HTTP
+
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.http.body {Limits as BodyLimits}
+import silk.http.exchange {ExchangeError, Connection, ConnectionHandler, Limits}
+import silk.http.exchange_native as Native {
+  NativeExchangeError,
+  NativeRoute,
+  NativeTransport,
+  Options,
+}
+import silk.http.connection_pool as Pool {
+  CheckoutResult,
+  Config,
+  ConnectionKey,
+  Handle,
+  PoolContext,
+  PoolContextCopy,
+  PoolError,
+  PoolHandler,
+}
+import silk.http.origin {Origin}
+import silk.http.head {Limits as HeadLimits}
+import silk.http.headers {Limits as HeaderLimits}
+import silk.http.transport {HttpTransport}
+import silk.tls.https_identity {IdentityError}
+import silk.system.monotonic_clock {MonotonicClock}
+import silk.net.socket_native {NativeSocketError}
+import silk.option {Option}
+import silk.system.random {Random}
+import silk.net.resolver {ResolverError}
+import silk.core.result {Result}
+import silk.system.system_clock {Instant, SystemClock}
+import silk.tls.connection {ConnectionError}
+import silk.tls.trust_snapshot {SnapshotLimits, TrustSourceError, TrustSnapshot}
+
+union ContextRoute {
+  Direct,
+  Unix {route: NativeRoute},
+}
+
+/// The settings that a native pool uses to open connections.
+///
+/// # Details
+/// Only [`withDirectPool`] and [`withUnixPool`] make a context. It holds the route (direct or one
+/// Unix path), the native options without a deadline, the HTTP limits, and a copy of the trust
+/// snapshot. It does not change after the pool starts.
+pub struct Context {
+  routeValue: ContextRoute,
+  optionsValue: Options,
+  limitsValue: Limits,
+  trustValue: Option<TrustSnapshot>,
+}
+
+fn pooledOptions(value: &Options) -> Options {
+  return Options {
+    maximumAddresses: value.maximumAddresses,
+    family: value.family,
+    noDelay: value.noDelay,
+    pollIntervalNanoseconds: value.pollIntervalNanoseconds,
+    maximumAttempts: value.maximumAttempts,
+    deadline: Option<Instant>.none(),
+    handshakeNanoseconds: value.handshakeNanoseconds,
+    tls: value.tls,
+    trust: value.trust,
+    alpn: value.alpn,
+  }
+}
+
+effect fn copySnapshot(
+  snapshot: &TrustSnapshot,
+  limits: SnapshotLimits,
+) -> TrustSnapshot
+! TrustSourceError | OutOfMemoryError
+? &mut Allocator {
+  let copied = run TrustSnapshot.copy(snapshot, limits)
+  return match move copied {
+    Result<TrustSnapshot, TrustSourceError>.Success {value} => move value
+    Result<TrustSnapshot, TrustSourceError>.Failure {error} => { fail move error }
+  }
+}
+
+effect fn copyOptionalSnapshot(
+  snapshot: &Option<TrustSnapshot>,
+  limits: SnapshotLimits,
+) -> Option<TrustSnapshot>
+! TrustSourceError | OutOfMemoryError
+? &mut Allocator {
+  return match & snapshot.* {
+    Option.None => Option<TrustSnapshot>.none()
+    Option.Some {value} => Option<TrustSnapshot>.some(run copySnapshot(&value, limits))
+  }
+}
+
+effect fn copyBorrowedSnapshot(
+  snapshot: Option<&TrustSnapshot>,
+  limits: SnapshotLimits,
+) -> Option<TrustSnapshot>
+! TrustSourceError | OutOfMemoryError
+? &mut Allocator {
+  return match move snapshot {
+    Option.None => Option<TrustSnapshot>.none()
+    Option.Some {value} => Option<TrustSnapshot>.some(run copySnapshot(value, limits))
+  }
+}
+
+fn copyRoute(route: &ContextRoute) -> ContextRoute {
+  return match & route.* {
+    ContextRoute.Direct => ContextRoute.Direct
+    ContextRoute.Unix {route: stored} => ContextRoute.Unix {route: stored}
+  }
+}
+
+fn hasTrust(context: &Context) -> bool {
+  return match & context.trustValue {
+    Option.None => false
+    Option.Some {value} => true
+  }
+}
+
+fn sameHeaderLimits(left: &HeaderLimits, right: &HeaderLimits) -> bool {
+  return left.maxMethodBytes == right.maxMethodBytes
+    && left.maxTargetBytes == right.maxTargetBytes
+    && left.maxNameBytes == right.maxNameBytes
+    && left.maxValueBytes == right.maxValueBytes
+    && left.maxFields == right.maxFields
+    && left.maxFieldBytes == right.maxFieldBytes
+    && left.maxOwnedBytes == right.maxOwnedBytes
+}
+
+fn sameHeadLimits(left: &HeadLimits, right: &HeadLimits) -> bool {
+  return left.maxHeadBytes == right.maxHeadBytes
+    && left.maxStartLineBytes == right.maxStartLineBytes
+    && left.maxFieldLineBytes == right.maxFieldLineBytes
+    && left.maxOwnedBytes == right.maxOwnedBytes
+    && sameHeaderLimits(&left.values, &right.values)
+}
+
+fn sameBodyLimits(left: &BodyLimits, right: &BodyLimits) -> bool {
+  return left.maxWireBytes == right.maxWireBytes
+    && left.maxPayloadBytes == right.maxPayloadBytes
+    && left.maxChunkBytes == right.maxChunkBytes
+    && left.maxChunks == right.maxChunks
+    && left.maxChunkLineBytes == right.maxChunkLineBytes
+    && left.maxExtensionBytes == right.maxExtensionBytes
+    && left.maxTrailerBytes == right.maxTrailerBytes
+    && left.maxTrailerFields == right.maxTrailerFields
+    && left.maxOwnedBytes == right.maxOwnedBytes
+    && sameHeaderLimits(&left.trailerValues, &right.trailerValues)
+}
+
+/// Returns whether all the fields of two HTTP connection limits are equal.
+pub fn limitsEqual(left: &Limits, right: &Limits) -> bool {
+  return sameHeadLimits(&left.head, &right.head)
+    && sameBodyLimits(&left.requestBody, &right.requestBody)
+    && sameBodyLimits(&left.responseBody, &right.responseBody)
+    && left.readCapacity == right.readCapacity
+    && left.writeCapacity == right.writeCapacity
+    && left.maxRequests == right.maxRequests
+    && left.maxInformationalResponses == right.maxInformationalResponses
+    && left.maxInformationalWireBytes == right.maxInformationalWireBytes
+    && left.maxDiscardWireBytes == right.maxDiscardWireBytes
+}
+
+impl Context {
+  effect fn copyContext(context: &Self) -> Context
+  ! TrustSourceError | OutOfMemoryError
+  ? &mut Allocator {
+    let route = copyRoute(&context.routeValue)
+    let trust = run copyOptionalSnapshot(
+      &context.trustValue,
+      context.optionsValue.trust.snapshot,
+    )
+    return Context {
+      routeValue: move route,
+      optionsValue: pooledOptions(&context.optionsValue),
+      limitsValue: context.limitsValue,
+      trustValue: move trust,
+    }
+  }
+
+  fn acceptsKey(context: &Self, key: &ConnectionKey) -> bool {
+    let origin = ConnectionKey.origin(key)
+    if Origin.secure(&origin) && !hasTrust(&context.*) { return false }
+    return match & context.routeValue {
+      ContextRoute.Direct => ConnectionKey.isDirect(key)
+      ContextRoute.Unix {route} => {
+        return ConnectionKey.matchesUnixPath(key, NativeRoute.path(&route))
+      }
+    }
+  }
+
+  effect fn acquire(
+    context: &Self,
+    key: &ConnectionKey,
+    deadline: Option<Instant>,
+  ) -> Connection<NativeTransport>
+  ! NativeExchangeError
+    | ExchangeError
+    | ResolverError
+    | NativeSocketError
+    | ConnectionError
+    | IdentityError
+    | TrustSourceError
+    | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random {
+    let origin = ConnectionKey.origin(key)
+    let mut trust = Option<TrustSnapshot>.none()
+    if Origin.secure(&origin) {
+      trust = run copyOptionalSnapshot(
+        &context.trustValue,
+        context.optionsValue.trust.snapshot,
+      )
+    }
+    return match & context.routeValue {
+      ContextRoute.Direct => run Native.acquireOwned(
+        origin,
+        pooledOptions(&context.optionsValue),
+        context.limitsValue,
+        move trust,
+        move deadline,
+      )
+      ContextRoute.Unix {route} => run Native.acquireUnixOwned(
+        NativeRoute.path(&route),
+        origin,
+        pooledOptions(&context.optionsValue),
+        context.limitsValue,
+        move trust,
+        move deadline,
+      )
+    }
+  }
+}
+
+impl PoolContextCopy<
+  TrustSourceError | OutOfMemoryError ? &mut Allocator
+> for Context {
+  copy: Context.copyContext
+}
+
+impl PoolContext<
+  ConnectionKey,
+  NativeTransport,
+  NativeExchangeError
+    | ExchangeError
+    | ResolverError
+    | NativeSocketError
+    | ConnectionError
+    | IdentityError
+    | TrustSourceError
+    | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random
+> for Context {
+  accepts: Context.acceptsKey
+  acquire: Context.acquire
+}
+
+effect fn directContext(
+  options: Options,
+  limits: Limits,
+  preparedTrust: Option<&TrustSnapshot>,
+) -> Context
+! TrustSourceError | OutOfMemoryError
+? &mut Allocator {
+  let trust = run copyBorrowedSnapshot(move preparedTrust, options.trust.snapshot)
+  return Context {
+    routeValue: ContextRoute.Direct,
+    optionsValue: pooledOptions(&options),
+    limitsValue: limits,
+    trustValue: move trust,
+  }
+}
+
+effect fn unixContext(
+  path: &[u8],
+  options: Options,
+  limits: Limits,
+  preparedTrust: Option<&TrustSnapshot>,
+) -> Context
+! NativeExchangeError | NativeSocketError | TrustSourceError | OutOfMemoryError
+? &mut Allocator {
+  let route = run Native.admitUnixRoute(path)
+  let trust = run copyBorrowedSnapshot(move preparedTrust, options.trust.snapshot)
+  return Context {
+    routeValue: ContextRoute.Unix {route: move route},
+    optionsValue: pooledOptions(&options),
+    limitsValue: limits,
+    trustValue: move trust,
+  }
+}
+
+/// Makes a pool for direct TCP and HTTPS connections, lends it to `handler`, and closes it after.
+///
+/// # Details
+/// The pool copies `preparedTrust` with the `options.trust.snapshot` limits before the handler
+/// starts, and each new HTTPS connection gets its own copy. `options.deadline` is not used. Give a
+/// deadline to each [`withConnection`] instead. The pool rules, such as limits, reuse, and expiry,
+/// are those of `silk.http.connection_pool.withPool`.
+///
+/// # Gotchas
+/// The pool accepts only direct keys, and opens no proxy connections. Other keys fail with
+/// `PoolError.ContextMismatch` before any network contact. An HTTPS origin also fails with
+/// `PoolError.ContextMismatch` if `preparedTrust` is absent.
+///
+/// # Errors
+/// - `PoolError.InvalidConfig` if `config` is not valid.
+/// - `TrustSourceError` or `OutOfMemoryError` if the trust snapshot cannot be copied.
+/// - The error of the handler.
+pub effect<'env> fn withDirectPool<
+  A,
+  E,
+  ?R,
+  H: PoolHandler<ConnectionKey, NativeTransport, Context, A, E ? R> + 'env,
+  'env,
+>(
+  config: Config,
+  options: Options,
+  limits: Limits,
+  preparedTrust: Option<&TrustSnapshot>,
+  handler: H,
+) -> A
+! E | PoolError | TrustSourceError | OutOfMemoryError
+? R | &mut Allocator
+where &mut NativeTransport provides &HttpTransport from &mut HttpTransport {
+  let context = run directContext(move options, limits, move preparedTrust)
+  return run Pool.withPool<ConnectionKey, NativeTransport, Context, A, E, R, H>(
+    config,
+    move context,
+    move handler,
+  )
+}
+
+/// Makes a pool for the Unix socket at `path`, lends it to `handler`, and closes it after.
+///
+/// # Details
+/// All connections go to `path`. The origin of each request can be HTTP or HTTPS. For HTTPS, TLS
+/// checks the certificate against the origin, not the path. The pool copies `path` and
+/// `preparedTrust` before the handler starts. `options.deadline` is not used.
+///
+/// # Errors
+/// - `PoolError.InvalidConfig` if `config` is not valid.
+/// - `NativeSocketError` if `path` is not a valid socket path, or Unix sockets are not supported on
+///   the target.
+/// - `TrustSourceError` or `OutOfMemoryError` if a copy fails.
+/// - The error of the handler.
+pub effect<'env> fn withUnixPool<
+  A,
+  E,
+  ?R,
+  H: PoolHandler<ConnectionKey, NativeTransport, Context, A, E ? R> + 'env,
+  'env,
+>(
+  config: Config,
+  path: &[u8],
+  options: Options,
+  limits: Limits,
+  preparedTrust: Option<&TrustSnapshot>,
+  handler: H,
+) -> A
+! E | PoolError | NativeExchangeError | NativeSocketError | TrustSourceError | OutOfMemoryError
+? R | &mut Allocator
+where &mut NativeTransport provides &HttpTransport from &mut HttpTransport {
+  let context = run unixContext(path, move options, limits, move preparedTrust)
+  return run Pool.withPool<ConnectionKey, NativeTransport, Context, A, E, R, H>(
+    config,
+    move context,
+    move handler,
+  )
+}
+
+/// Returns another handle for the same pool. If the copy of the context fails, the first handle
+/// stays valid and no new handle is made.
+pub effect fn copyHandle(
+  handle: &Handle<ConnectionKey, NativeTransport, Context>,
+) -> Handle<ConnectionKey, NativeTransport, Context>
+! TrustSourceError | OutOfMemoryError
+? &mut Allocator {
+  return run Pool.copyHandle(handle)
+}
+
+/// Returns whether the HTTP limits of the pool are equal to `limits`, in all fields.
+///
+/// `silk.http.fetch_native` calls it before a checkout, so that a request never uses a connection
+/// with other limits.
+pub fn acceptsLimits(
+  handle: &Handle<ConnectionKey, NativeTransport, Context>,
+  limits: Limits,
+) -> bool {
+  let context = Pool.context(handle)
+  return limitsEqual(&context.limitsValue, &limits)
+}
+
+/// Checks out one connection to `origin` from a direct pool, and lends it to `handler`.
+///
+/// # Details
+/// To open a new connection, the pool uses the earlier of `requestDeadline` and
+/// `acquisitionDeadline`. The handler uses `requestDeadline` for its exchanges. The connection goes
+/// back to the pool only if it is eligible for reuse.
+///
+/// # Errors
+/// - `PoolError.ContextMismatch` if the pool is a Unix pool. Nothing is sent.
+/// - `PoolError` for a full or closed pool, or an expired deadline.
+/// - The native errors of a new connection (resolver, socket, TLS, identity, and trust errors),
+///   and the error of the handler.
+pub effect<'env> fn withConnection<
+  A,
+  E,
+  ?R,
+  H: ConnectionHandler<NativeTransport, A, E ? R> + 'env,
+  'env,
+>(
+  handle: &Handle<ConnectionKey, NativeTransport, Context>,
+  origin: Origin,
+  requestDeadline: Option<Instant>,
+  acquisitionDeadline: Option<Instant>,
+  handler: H,
+) -> CheckoutResult<A>
+! E
+  | PoolError
+  | NativeExchangeError
+  | ExchangeError
+  | ResolverError
+  | NativeSocketError
+  | ConnectionError
+  | IdentityError
+  | TrustSourceError
+  | OutOfMemoryError
+? R | &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random
+where
+  &mut NativeTransport provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut NativeTransport provides &HttpTransport from &mut HttpTransport {
+  let key = ConnectionKey.direct(origin)
+  return run Pool.withConnection<
+    NativeTransport,
+    A,
+    E,
+    OutOfMemoryError,
+    NativeExchangeError
+      | ExchangeError
+      | ResolverError
+      | NativeSocketError
+      | ConnectionError
+      | IdentityError
+      | TrustSourceError
+      | OutOfMemoryError,
+    &mut Allocator,
+    &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random,
+    R,
+    ConnectionKey,
+    Context,
+    H,
+  >(
+    handle,
+    &key,
+    move requestDeadline,
+    move acquisitionDeadline,
+    move handler,
+  )
+}
+
+/// Checks out one connection to `origin` from a Unix pool, and lends it to `handler`.
+///
+/// # Details
+/// `path` and `origin` make the key. To open a new connection, the pool uses the earlier of
+/// `requestDeadline` and `acquisitionDeadline`. The handler uses `requestDeadline` for its
+/// exchanges. The connection goes back to the pool only if it is eligible for reuse.
+///
+/// # Errors
+/// - `PoolError.ContextMismatch` if `path` is not the path of the pool, or if the pool is a direct
+///   pool. Nothing is sent.
+/// - `PoolError` for a full or closed pool, or an expired deadline.
+/// - The native errors of a new connection (resolver, socket, TLS, identity, and trust errors),
+///   and the error of the handler.
+pub effect<'env> fn withUnixConnection<
+  A,
+  E,
+  ?R,
+  H: ConnectionHandler<NativeTransport, A, E ? R> + 'env,
+  'env,
+>(
+  handle: &Handle<ConnectionKey, NativeTransport, Context>,
+  path: &[u8],
+  origin: Origin,
+  requestDeadline: Option<Instant>,
+  acquisitionDeadline: Option<Instant>,
+  handler: H,
+) -> CheckoutResult<A>
+! E
+  | PoolError
+  | NativeExchangeError
+  | ExchangeError
+  | ResolverError
+  | NativeSocketError
+  | ConnectionError
+  | IdentityError
+  | TrustSourceError
+  | OutOfMemoryError
+? R | &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random
+where
+  &mut NativeTransport provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+  &mut NativeTransport provides &HttpTransport from &mut HttpTransport {
+  let key = run ConnectionKey.unix(origin, path)
+  return run Pool.withConnection<
+    NativeTransport,
+    A,
+    E,
+    OutOfMemoryError,
+    NativeExchangeError
+      | ExchangeError
+      | ResolverError
+      | NativeSocketError
+      | ConnectionError
+      | IdentityError
+      | TrustSourceError
+      | OutOfMemoryError,
+    &mut Allocator,
+    &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random,
+    R,
+    ConnectionKey,
+    Context,
+    H,
+  >(
+    handle,
+    &key,
+    move requestDeadline,
+    move acquisitionDeadline,
+    move handler,
+  )
+}

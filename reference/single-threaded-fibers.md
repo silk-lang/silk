@@ -1,6 +1,6 @@
 # Single-threaded schedulers and Fibers
 
-The `silk.scheduler`, `silk.fiber`, and `silk.local_scheduler` modules provide explicit local
+The `silk.concurrency.scheduler`, `silk.concurrency.fiber`, and `silk.concurrency.local_scheduler` modules provide explicit local
 structured concurrency in ordinary Silk source. An application selects a scheduler provider at its
 entry point. The provider owns the root and every child as independently resumable Executions until
 the root terminates.
@@ -26,14 +26,14 @@ standard-library policy.
 terminates.
 
 ```silk
-import silk.allocator { OutOfMemoryError }
-import silk.effect { Effect }
-import silk.fiber { Fiber, Cancelled, Outcome }
-import silk.local_scheduler { LocalScheduler, StalledError }
-import silk.monotonic_clock { MonotonicClock }
-import silk.scheduler { Scheduler, TaskIdExhaustedError }
-import silk.system_clock { SystemClock }
-import silk.system_clock { Instant }
+import silk.mem.allocator { OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.concurrency.fiber { Fiber, Cancelled, Outcome }
+import silk.concurrency.local_scheduler { LocalScheduler, StalledError }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.concurrency.scheduler { Scheduler, TaskIdExhaustedError }
+import silk.system.system_clock { SystemClock }
+import silk.system.system_clock { Instant }
 
 struct ParentClock {
   mark: Instant,
@@ -123,7 +123,7 @@ Execution owner remains invalid.
 **Diagnostics:** A park-capable Effect with no explicit owner reports `SEM0140`. Scheduler choice
 and construction have no compiler diagnostic because they are ordinary source calls.
 
-**Evidence:** [LocalScheduler source](../stdlib/silk/local_scheduler.silk),
+**Evidence:** [LocalScheduler source](../stdlib/silk/concurrency/local_scheduler.silk),
 scheduler and Fiber tests.
 
 ### FIBER-002 — Child creation is atomic and initially deferred
@@ -147,7 +147,7 @@ raises `Allocator.OutOfMemoryError`. Neither failure is converted to a child out
 Effect-contract compatibility. No declaration receives special behavior from the spelling
 `Scheduler`, `Fiber`, or `forkChild`.
 
-**Evidence:** [Scheduler preparation protocol](../stdlib/silk/scheduler.silk),
+**Evidence:** [Scheduler preparation protocol](../stdlib/silk/concurrency/scheduler.silk),
 atomic fork fixture.
 
 ### FIBER-003 — Fiber observation is affine and non-polling
@@ -168,7 +168,7 @@ cancels the child. The task remains attached to its parent until either one term
 **Diagnostics:** Reusing a Fiber consumed by `await` or `join` reports the ordinary affine
 `OWN0001` diagnostic.
 
-**Evidence:** [Fiber source](../stdlib/silk/fiber.silk),
+**Evidence:** [Fiber source](../stdlib/silk/concurrency/fiber.silk),
 observation fixture.
 
 ### FIBER-004 — Child lifetime is structured by the parent task
@@ -209,7 +209,7 @@ name a task from a later `execute` call.
 
 **Diagnostics:** Ready order and stale-node discard do not add typed failures or source diagnostics.
 
-**Evidence:** [LocalScheduler ready queue](../stdlib/silk/local_scheduler.silk),
+**Evidence:** [LocalScheduler ready queue](../stdlib/silk/concurrency/local_scheduler.silk),
 FIFO, yield, and stale-readiness tests.
 
 ### FIBER-006 — Typed shutdown preserves the root outcome and provider reuse

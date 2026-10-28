@@ -1,12 +1,12 @@
 # Standard-padded Base64
 
-Import `Base64`, `Base64Error`, and `Base64Reason` from `silk.base64`. The actor implements one
+Import `Base64`, `Base64Error`, and `Base64Reason` from `silk.encoding.base64`. The actor implements one
 strict RFC 4648 standard-padded byte codec. It uses the `A–Z`, `a–z`, `0–9`, `+`, `/` alphabet and
 emits every required `=`. It never inserts whitespace or a NUL terminator.
 
 ```silk
-import silk.base64 { Base64, Base64Error }
-import silk.result { Result }
+import silk.encoding.base64 { Base64, Base64Error }
+import silk.core.result { Result }
 
 pub fn main() -> i32 {
   let mut output: [u8; 4] = [0, 0, 0, 0]
@@ -85,5 +85,5 @@ responsibility of their protocol actors. Base64 does not provide confidentiality
 
 The normative encoding and independent vectors come from [RFC 4648 sections 3–5 and
 10](https://www.rfc-editor.org/rfc/rfc4648.html). The implementation and acceptance evidence live in
-[`base64.silk`](../stdlib/silk/base64.silk) and
+[`base64.silk`](../stdlib/silk/encoding/base64.silk) and
 `base64Acceptance.ts`.

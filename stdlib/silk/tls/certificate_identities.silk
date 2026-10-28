@@ -1,0 +1,1134 @@
+//! Decode the subject alternative names (SAN) of a certificate: the DNS names and IP addresses that
+//! it is for.
+//!
+//! # When to use
+//! Use [`CertificateSan.decode`] to read the SAN list of a certificate, and pass the result to
+//! `HttpsIdentity.verify` to check a host name. Use [`CertificateSan.decodeValue`] when you have
+//! only the DER of a GeneralNames value.
+//!
+//! # Details
+//! The functions write one `PresentedIdentity` for each name into storage that you give, in source
+//! order, and return how many they wrote. The names borrow the input. Nothing allocates. Forms
+//! other than DNS names and IP addresses are returned as `Other` with their raw bytes.
+//!
+//! # Errors
+//! - [`SanDecodeError`] if the DER is not valid, there are two SAN extensions, the SAN is empty,
+//!   the storage is too small, or a limit is exceeded.
+//!
+//! # Gotchas
+//! After an error, the storage can hold some names. Do not use them. These functions check the
+//! encoding only. `HttpsIdentity.verify` checks DNS syntax and IP lengths.
+//!
+//! # Examples
+//! ## Decode a SAN value
+//! ```silk
+//! import silk.tls.certificate_identities {
+//!   CertificateSan,
+//!   SanDecodeError,
+//!   SanDecodeLimits,
+//!   SanDecodeSummary
+//! }
+//! import silk.tls.https_identity { PresentedIdentity }
+//! import silk.core.result { Result }
+//!
+//! pub fn main() -> i32 {
+//!   // GeneralNames with one dNSName: SEQUENCE { [2] "a.example" }.
+//!   let der = b"\x30\x0b\x82\x09a.example"
+//!   let mut storage: [PresentedIdentity; 4] = [PresentedIdentity.Other { tag: 0, bytes: b"" }; 4]
+//!   return match CertificateSan.decodeValue(der, &mut storage, SanDecodeLimits.standard()) {
+//!     Result<SanDecodeSummary, SanDecodeError>.Success { value } => {
+//!       if value.count != 1 {
+//!         return 1
+//!       }
+//!       return match storage[0] {
+//!         PresentedIdentity.Dns { bytes } => {
+//!           if bytes.length != 9 {
+//!             return 1
+//!           }
+//!           return 0
+//!         }
+//!         _ => 1
+//!       }
+//!     }
+//!     Result<SanDecodeSummary, SanDecodeError>.Failure { error: _ } => 1
+//!   }
+//! }
+//! ```
+//!
+//! @category TLS and certificates
+
+import silk.tls.certificate {Certificate, DecodeReason, ExtensionView}
+import silk.format {Debug, Format, Formatter}
+import silk.tls.https_identity {PresentedIdentity}
+import silk.core.ownership {Copy}
+import silk.core.result {Result}
+import silk.option {Option}
+import silk.collections.slice {Slice}
+import silk.num.u8
+import silk.num.usize
+import silk.io.writer {Writer, WriterError}
+
+/// Finite resource budgets for one SAN decode operation.
+pub struct SanDecodeLimits {
+  /// Maximum extension count scanned, including unrelated extensions.
+  pub extensions: usize,
+  /// Maximum sum of all extension OID and value lengths, or raw GeneralNames length.
+  pub inputBytes: usize,
+  /// Maximum number of GeneralName descriptors.
+  pub identities: usize,
+  /// Maximum number of traversed DER nodes.
+  pub nodes: usize,
+  /// Maximum DER depth. The implementation also enforces a ceiling of 32.
+  pub depth: usize,
+}
+
+impl Copy for SanDecodeLimits {}
+
+impl SanDecodeLimits {
+  /// Returns budgets of 256 extensions, 1 MiB input, 256 identities, 4096 nodes, and depth 32.
+  pub fn standard() -> SanDecodeLimits {
+    return SanDecodeLimits {
+      extensions: 256,
+      inputBytes: 1048576,
+      identities: 256,
+      nodes: 4096,
+      depth: 32,
+    }
+  }
+}
+
+/// The category of a SAN adapter failure.
+pub enum SanDecodeClass {
+  /// The SAN DER or GeneralName schema is malformed.
+  Malformed,
+  /// Input, traversal, or descriptor storage exceeds a budget.
+  ResourceLimit,
+}
+
+impl Debug for SanDecodeClass {
+  /// Writes the name of the variant, such as `Malformed`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      SanDecodeClass.Malformed => run Format.write(&mut formatter, b"Malformed")
+      SanDecodeClass.ResourceLimit => run Format.write(&mut formatter, b"ResourceLimit")
+    }
+  }
+}
+
+/// The adapter-specific cause of a SAN failure.
+pub enum SanDecodeReason {
+  /// DER encoding or GeneralName schema is invalid.
+  InvalidDer,
+  /// More than one subjectAltName extension is present.
+  DuplicateSan,
+  /// A present SAN contains no names.
+  EmptySan,
+  /// The extension count exceeds its budget.
+  Extensions,
+  /// Input bytes exceed their budget.
+  InputBytes,
+  /// The descriptor count exceeds its budget.
+  Identities,
+  /// Caller storage cannot hold every descriptor.
+  Storage,
+  /// DER node count exceeds its budget.
+  Nodes,
+  /// DER depth exceeds its budget or the hard ceiling of 32.
+  Depth,
+}
+
+impl Debug for SanDecodeReason {
+  /// Writes the name of the variant, such as `InvalidDer`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      SanDecodeReason.InvalidDer => run Format.write(&mut formatter, b"InvalidDer")
+      SanDecodeReason.DuplicateSan => run Format.write(&mut formatter, b"DuplicateSan")
+      SanDecodeReason.EmptySan => run Format.write(&mut formatter, b"EmptySan")
+      SanDecodeReason.Extensions => run Format.write(&mut formatter, b"Extensions")
+      SanDecodeReason.InputBytes => run Format.write(&mut formatter, b"InputBytes")
+      SanDecodeReason.Identities => run Format.write(&mut formatter, b"Identities")
+      SanDecodeReason.Storage => run Format.write(&mut formatter, b"Storage")
+      SanDecodeReason.Nodes => run Format.write(&mut formatter, b"Nodes")
+      SanDecodeReason.Depth => run Format.write(&mut formatter, b"Depth")
+    }
+  }
+}
+
+/// An owned SAN error with an offset in GeneralNames DER, or zero for extension-list failures.
+pub struct SanDecodeError {
+  /// The category of this failure.
+  pub kind: SanDecodeClass,
+  /// The failed adapter rule.
+  pub reason: SanDecodeReason,
+  /// The failed DER offset. Extension-list failures use zero.
+  pub offset: usize,
+}
+
+impl Debug for SanDecodeError {
+  /// Writes the fields, as `SanDecodeError { kind: ..., reason: ..., ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return run Format.debugFields(self, "SanDecodeError", &mut formatter)
+  }
+}
+
+/// The initialized descriptor prefix after successful decoding.
+pub struct SanDecodeSummary {
+  /// Whether a subjectAltName extension was present.
+  pub present: bool,
+  /// Number of initialized entries in caller storage.
+  pub count: usize,
+  /// Number of DER nodes traversed while validating the selected GeneralNames value.
+  pub nodes: usize,
+}
+
+/// Operations that decode the subject alternative names (SAN) of a certificate: the DNS names and
+/// IP addresses that it is for.
+///
+/// # When to use
+///
+/// Use [`CertificateSan.decode`] to read the SAN list of a certificate, and pass the result to
+/// `HttpsIdentity.verify` to check a host name. Use [`CertificateSan.decodeValue`] when you have
+/// only the DER of a GeneralNames value.
+///
+/// # Details
+///
+/// The functions write one `PresentedIdentity` for each name into storage that you give, in source
+/// order, and return how many they wrote. The names borrow the input. Nothing allocates. Forms
+/// other than DNS names and IP addresses are returned as `Other` with their raw bytes.
+///
+/// # Gotchas
+///
+/// After an error, the storage can hold some names. Do not use them. These functions check the
+/// encoding only. `HttpsIdentity.verify` checks DNS syntax and IP lengths.
+pub struct CertificateSan {}
+
+struct Span {
+  start: usize,
+  content: usize,
+  end: usize,
+  tag: usize,
+}
+
+impl Copy for Span {}
+
+struct Reader<'a> {
+  bytes: &'a [u8],
+  cursor: usize,
+  nodes: usize,
+  limits: SanDecodeLimits,
+  failed: bool,
+  error: SanDecodeError,
+}
+
+fn emptySpan() -> Span {
+  return Span {start: 0, content: 0, end: 0, tag: 0}
+}
+
+fn reject(reader: &mut Reader, kind: SanDecodeClass, reason: SanDecodeReason, offset: usize) -> () {
+  if !reader.failed {
+    reader.failed = true
+    reader.error = SanDecodeError {kind: kind, reason: reason, offset: offset}
+  }
+}
+
+fn malformed(reader: &mut Reader, reason: DecodeReason, offset: usize) -> () {
+  return reject(&mut reader, SanDecodeClass.Malformed, SanDecodeReason.InvalidDer, offset)
+}
+
+fn limited(reader: &mut Reader, reason: DecodeReason, offset: usize) -> () {
+  return reject(&mut reader, SanDecodeClass.ResourceLimit, SanDecodeReason.InputBytes, offset)
+}
+
+fn octet(reader: &Reader, index: usize) -> usize {
+  return u8.toUsize(reader.bytes[index])
+}
+
+fn read(reader: &mut Reader, end: usize, depth: usize, field: bool) -> Span {
+  if reader.failed {
+    return emptySpan()
+  }
+  let start = reader.cursor
+  if start >= end {
+    let ignored = malformed(&mut reader, DecodeReason.Truncated, end)
+    return emptySpan()
+  }
+  let tag = octet(&reader, start)
+  let mut at = start + 1
+  if tag % 32 == 31 {
+    let mut number = usize.ZERO
+    let mut first = true
+    let mut more = true
+    while more && !reader.failed {
+      if at >= end {
+        let ignored = malformed(&mut reader, DecodeReason.Truncated, end)
+        return emptySpan()
+      }
+      let byte = octet(&reader, at)
+      if first && byte % 128 == 0 {
+        let ignored = malformed(&mut reader, DecodeReason.Tag, at)
+        return emptySpan()
+      }
+      if number > (usize.MAX - byte % 128) / 128 {
+        let ignored = limited(&mut reader, DecodeReason.SizeOverflow, at)
+        return emptySpan()
+      }
+      number = number * 128 + byte % 128
+      first = false
+      more = byte >= 128
+      at = at + 1
+    }
+    if number < 31 {
+      let ignored = malformed(&mut reader, DecodeReason.Tag, start)
+      return emptySpan()
+    }
+  }
+  if tag == 0 || tag == 32 {
+    let ignored = malformed(&mut reader, DecodeReason.Tag, start)
+    return emptySpan()
+  }
+  if at >= end {
+    let ignored = malformed(&mut reader, DecodeReason.Truncated, end)
+    return emptySpan()
+  }
+  let firstLength = octet(&reader, at)
+  let lengthAt = at
+  at = at + 1
+  let mut size = firstLength
+  if firstLength >= 128 {
+    if firstLength == 128 || firstLength == 255 {
+      let ignored = malformed(&mut reader, DecodeReason.Length, lengthAt)
+      return emptySpan()
+    }
+    let count = firstLength - 128
+    if count > end - at {
+      let ignored = malformed(&mut reader, DecodeReason.Truncated, end)
+      return emptySpan()
+    }
+    if octet(&reader, at) == 0 {
+      let ignored = malformed(&mut reader, DecodeReason.Length, at)
+      return emptySpan()
+    }
+    size = 0
+    let mut index = usize.ZERO
+    while index < count {
+      let byte = octet(&reader, at)
+      if size > (usize.MAX - byte) / 256 {
+        let ignored = limited(&mut reader, DecodeReason.SizeOverflow, at)
+        return emptySpan()
+      }
+      size = size * 256 + byte
+      at = at + 1
+      index = index + 1
+    }
+    if size < 128 {
+      let ignored = malformed(&mut reader, DecodeReason.Length, lengthAt)
+      return emptySpan()
+    }
+  }
+  if size > usize.MAX - at {
+    let ignored = limited(&mut reader, DecodeReason.SizeOverflow, start)
+    return emptySpan()
+  }
+  let stop = at + size
+  if stop > end {
+    let ignored = malformed(&mut reader, DecodeReason.Truncated, end)
+    return emptySpan()
+  }
+  if depth > reader.limits.depth || depth > 32 {
+    let ignored = reject(&mut reader, SanDecodeClass.ResourceLimit, SanDecodeReason.Depth, start)
+    return emptySpan()
+  }
+  if reader.nodes >= reader.limits.nodes {
+    let ignored = reject(&mut reader, SanDecodeClass.ResourceLimit, SanDecodeReason.Nodes, start)
+    return emptySpan()
+  }
+  reader.nodes = reader.nodes + 1
+  reader.cursor = stop
+  let span = Span {start: start, content: at, end: stop, tag: tag}
+  let ignored = universal(&mut reader, span)
+  return span
+}
+
+fn expect(reader: &mut Reader, end: usize, depth: usize, tag: usize) -> Span {
+  let span = read(&mut reader, end, depth, false)
+  if !reader.failed && span.tag != tag {
+    let ignored = malformed(&mut reader, DecodeReason.Tag, span.start)
+  }
+  return span
+}
+
+fn finish(reader: &mut Reader, end: usize) -> () {
+  if !reader.failed && reader.cursor != end {
+    let offset = reader.cursor
+    return malformed(&mut reader, DecodeReason.Schema, offset)
+  }
+}
+
+fn bitString(reader: &mut Reader, span: Span) -> () {
+  let size = span.end - span.content
+  if size == 0 {
+    return malformed(&mut reader, DecodeReason.BitString, span.start)
+  }
+  let count = octet(&reader, span.content)
+  if count > 7 || (size == 1 && count != 0) {
+    return malformed(&mut reader, DecodeReason.BitString, span.start)
+  }
+  let mut divisor: usize = 1
+  let mut i = usize.ZERO
+  while i < count {
+    divisor = divisor * 2
+    i = i + 1
+  }
+  if size > 1 && octet(&reader, span.end - 1) % divisor != 0 {
+    return malformed(&mut reader, DecodeReason.BitString, span.start)
+  }
+}
+
+fn universal(reader: &mut Reader, span: Span) -> () {
+  let tag = span.tag
+  // Universal tag numbers have fixed encoding forms, even without an open-value schema.
+  if tag < 64 {
+    let number = tag % 32
+    let constructed = tag >= 32
+    if number == 15 {
+      return malformed(&mut reader, DecodeReason.Tag, span.start)
+    }
+    if number == 8 || number == 11 || number == 16 || number == 17 || number == 29 {
+      if !constructed {
+        return malformed(&mut reader, DecodeReason.Tag, span.start)
+      }
+    } else {
+      if constructed && (number == 1 || number == 2 || number == 3 || number == 4 || number == 5 || number == 6 || number == 7 || number == 9 || number == 10 || number == 12 || number == 13 || number == 14 || (number >= 18 && number <= 30)) {
+        return malformed(&mut reader, DecodeReason.Tag, span.start)
+      }
+    }
+  }
+  let size = span.end - span.content
+  if tag == 2 || tag == 10 {
+    if size == 0 {
+      return malformed(&mut reader, DecodeReason.Integer, span.start)
+    }
+    if size > 1 {
+      let a = octet(&reader, span.content)
+      let b = octet(&reader, span.content + 1)
+      if (a == 0 && b < 128) || (a == 255 && b >= 128) {
+        return malformed(&mut reader, DecodeReason.Integer, span.start)
+      }
+    }
+  } else if tag == 1 {
+    if size != 1 {
+      return malformed(&mut reader, DecodeReason.Boolean, span.start)
+    }
+    let b = octet(&reader, span.content)
+    if b != 0 && b != 255 {
+      return malformed(&mut reader, DecodeReason.Boolean, span.start)
+    }
+  } else if tag == 9 {
+    return realValue(&mut reader, span)
+  } else if tag == 23 || tag == 24 {
+    return timeValue(&mut reader, span)
+  } else if tag == 3 {
+    return bitString(&mut reader, span)
+  } else if tag == 5 {
+    if size != 0 {
+      return malformed(&mut reader, DecodeReason.Tag, span.start)
+    }
+  } else if tag == 6 || tag == 13 {
+    if size == 0 {
+      return malformed(&mut reader, DecodeReason.Oid, span.start)
+    }
+    let mut index = span.content
+    let mut first = true
+    while index < span.end {
+      let b = octet(&reader, index)
+      if first && b == 128 {
+        return malformed(&mut reader, DecodeReason.Oid, index)
+      }
+      first = (b < 128)
+      index = index + 1
+    }
+    if !first {
+      return malformed(&mut reader, DecodeReason.Oid, span.end)
+    }
+  } else if tag == 12 || tag == 18 || tag == 19 || tag == 22 || tag == 26 || tag == 28 || tag == 30 {
+    return stringValue(&mut reader, span)
+  }
+}
+
+// X.690 sections 8.5 and 11.3: canonical binary/decimal REAL, plus special values.
+fn realValue(reader: &mut Reader, span: Span) -> () {
+  if span.content == span.end {
+    return ()
+  }
+  let first = octet(&reader, span.content)
+  let mut at = span.content + 1
+  if first >= 64 && first <= 67 {
+    if at != span.end {
+      return malformed(&mut reader, DecodeReason.Schema, span.start)
+    }
+    return ()
+  }
+  if first >= 128 {
+    if first % 64 / 4 != 0 {
+      return malformed(&mut reader, DecodeReason.Schema, span.start)
+    }
+    let mut count = first % 4 + 1
+    if count == 4 {
+      if at >= span.end {
+        return malformed(&mut reader, DecodeReason.Schema, span.start)
+      }
+      count = octet(&reader, at)
+      at = at + 1
+      if count < 4 {
+        return malformed(&mut reader, DecodeReason.Schema, span.start)
+      }
+    }
+    if count >= span.end - at {
+      return malformed(&mut reader, DecodeReason.Schema, span.start)
+    }
+    if count > 1 {
+      let a = octet(&reader, at)
+      let b = octet(&reader, at + 1)
+      if (a == 0 && b < 128) || (a == 255 && b >= 128) {
+        return malformed(&mut reader, DecodeReason.Schema, span.start)
+      }
+    }
+    at = at + count
+    if octet(&reader, at) == 0 || octet(&reader, span.end - 1) % 2 == 0 {
+      return malformed(&mut reader, DecodeReason.Schema, span.start)
+    }
+    return ()
+  }
+  if first != 3 || at >= span.end {
+    return malformed(&mut reader, DecodeReason.Schema, span.start)
+  }
+  if octet(&reader, at) == 45 {
+    at = at + 1
+  }
+  if at >= span.end {
+    return malformed(&mut reader, DecodeReason.Schema, span.start)
+  }
+  if octet(&reader, at) < 49 || octet(&reader, at) > 57 {
+    return malformed(&mut reader, DecodeReason.Schema, span.start)
+  }
+  while at < span.end && octet(&reader, at) >= 48 && octet(&reader, at) <= 57 {
+    at = at + 1
+  }
+  if octet(&reader, at - 1) == 48 || span.end - at < 3 {
+    return malformed(&mut reader, DecodeReason.Schema, span.start)
+  }
+  if octet(&reader, at) != 46 || octet(&reader, at + 1) != 69 {
+    return malformed(&mut reader, DecodeReason.Schema, span.start)
+  }
+  at = at + 2
+  if octet(&reader, at) == 43 {
+    if span.end - at != 2 || octet(&reader, at + 1) != 48 {
+      return malformed(&mut reader, DecodeReason.Schema, span.start)
+    }
+    return ()
+  }
+  if octet(&reader, at) == 45 {
+    at = at + 1
+  }
+  if at >= span.end {
+    return malformed(&mut reader, DecodeReason.Schema, span.start)
+  }
+  if octet(&reader, at) < 49 || octet(&reader, at) > 57 {
+    return malformed(&mut reader, DecodeReason.Schema, span.start)
+  }
+  while at < span.end {
+    let byte = octet(&reader, at)
+    if byte < 48 || byte > 57 {
+      return malformed(&mut reader, DecodeReason.Schema, span.start)
+    }
+    at = at + 1
+  }
+}
+
+fn decimal(reader: &mut Reader, at: usize, count: usize) -> usize {
+  let mut result = usize.ZERO
+  let mut index = usize.ZERO
+  while index < count {
+    let byte = octet(&reader, at + index)
+    if byte < 48 || byte > 57 {
+      let ignored = malformed(&mut reader, DecodeReason.Time, at + index)
+      return 0
+    }
+    result = result * 10 + byte - 48
+    index = index + 1
+  }
+  return result
+}
+
+// Canonical UTC/GeneralizedTime includes seconds and Z; only GeneralizedTime admits a fraction.
+fn timeValue(reader: &mut Reader, span: Span) -> () {
+  let mut digits: usize = 2
+  if span.tag == 24 {
+    digits = 4
+  }
+  let size = span.end - span.content
+  if size < digits + 11 {
+    return malformed(&mut reader, DecodeReason.Time, span.start)
+  }
+  if octet(&reader, span.end - 1) != 90 {
+    return malformed(&mut reader, DecodeReason.Time, span.start)
+  }
+  if size != digits + 11 {
+    if span.tag != 24 || size < digits + 13 {
+      return malformed(&mut reader, DecodeReason.Time, span.start)
+    }
+    let mut at = span.content + digits + 10
+    if octet(&reader, at) != 46 || octet(&reader, span.end - 2) == 48 {
+      return malformed(&mut reader, DecodeReason.Time, span.start)
+    }
+    at = at + 1
+    while at < span.end - 1 {
+      let byte = octet(&reader, at)
+      if byte < 48 || byte > 57 {
+        return malformed(&mut reader, DecodeReason.Time, at)
+      }
+      at = at + 1
+    }
+  }
+  let mut year = decimal(&mut reader, span.content, digits)
+  if digits == 2 {
+    if year >= 50 {
+      year = year + 1900
+    } else {
+      year = year + 2000
+    }
+  }
+  let at = span.content + digits
+  let month = decimal(&mut reader, at, 2)
+  let day = decimal(&mut reader, at + 2, 2)
+  let hour = decimal(&mut reader, at + 4, 2)
+  let minute = decimal(&mut reader, at + 6, 2)
+  let second = decimal(&mut reader, at + 8, 2)
+  let mut days: usize = 31
+  if month == 4 || month == 6 || month == 9 || month == 11 {
+    days = 30
+  }
+  if month == 2 {
+    days = 28
+    if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+      days = 29
+    }
+  }
+  if year == 0 || month == 0 || month > 12 || day == 0 || day > days || hour > 23 || minute > 59 || second > 60 || (second == 60 && (span.tag != 24 || hour != 23 || minute != 59)) {
+    return malformed(&mut reader, DecodeReason.Time, span.start)
+  }
+}
+
+fn stringValue(reader: &mut Reader, span: Span) -> () {
+  let mut at = span.content
+  let size = span.end - at
+  if (span.tag == 30 && size % 2 != 0) || (span.tag == 28 && size % 4 != 0) {
+    return malformed(&mut reader, DecodeReason.StringEncoding, span.start)
+  }
+  while at < span.end {
+    let b = octet(&reader, at)
+    if span.tag == 19 {
+      let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 '()+,-./:=?"
+      let mut found = false
+      let mut i = usize.ZERO
+      while i < alphabet.length {
+        if u8.toUsize(alphabet[i]) == b {
+          found = true
+        }
+        i = i + 1
+      }
+      if !found {
+        return malformed(&mut reader, DecodeReason.StringEncoding, at)
+      }
+      at = at + 1
+    } else if span.tag == 18 || span.tag == 26 {
+      if (span.tag == 18 && b != 32 && (b < 48 || b > 57)) || (span.tag == 26 && (b < 32 || b > 126)) {
+        return malformed(&mut reader, DecodeReason.StringEncoding, at)
+      }
+      at = at + 1
+    } else if span.tag == 22 {
+      if b > 127 {
+        return malformed(&mut reader, DecodeReason.StringEncoding, at)
+      }
+      at = at + 1
+    } else if span.tag == 30 {
+      let value = b * 256 + octet(&reader, at + 1)
+      if value >= 55296 && value <= 57343 {
+        return malformed(&mut reader, DecodeReason.StringEncoding, at)
+      }
+      at = at + 2
+    } else if span.tag == 28 {
+      // First octet must be zero, which also keeps arithmetic portable to 32-bit targets.
+      if b != 0 {
+        return malformed(&mut reader, DecodeReason.StringEncoding, at)
+      }
+      let value = octet(&reader, at + 1) * 65536 + octet(&reader, at + 2) * 256 + octet(
+        &reader,
+        at + 3,
+      )
+      if value > 1114111 || (value >= 55296 && value <= 57343) {
+        return malformed(&mut reader, DecodeReason.StringEncoding, at)
+      }
+      at = at + 4
+    } else {
+      let mut count: usize = 1
+      let mut value = b
+      let mut minimum = usize.ZERO
+      if b >= 128 {
+        if b >= 194 && b <= 223 {
+          count = 2
+          value = b - 192
+          minimum = 128
+        } else if b >= 224 && b <= 239 {
+          count = 3
+          value = b - 224
+          minimum = 2048
+        } else if b >= 240 && b <= 244 {
+          count = 4
+          value = b - 240
+          minimum = 65536
+        } else {
+          return malformed(&mut reader, DecodeReason.StringEncoding, at)
+        }
+      }
+      if count > span.end - at {
+        return malformed(&mut reader, DecodeReason.StringEncoding, at)
+      }
+      let mut i: usize = 1
+      while i < count {
+        let next = octet(&reader, at + i)
+        if next < 128 || next > 191 {
+          return malformed(&mut reader, DecodeReason.StringEncoding, at + i)
+        }
+        value = value * 64 + next - 128
+        i = i + 1
+      }
+      if value < minimum || value > 1114111 || (value >= 55296 && value <= 57343) {
+        return malformed(&mut reader, DecodeReason.StringEncoding, at)
+      }
+      at = at + count
+    }
+  }
+}
+
+fn ordered(reader: &Reader, left: Span, right: Span) -> bool {
+  let mut a = left.start
+  let mut b = right.start
+  while a < left.end && b < right.end {
+    let av = octet(&reader, a)
+    let bv = octet(&reader, b)
+    if av < bv {
+      return true
+    }
+    if av > bv {
+      return false
+    }
+    a = a + 1
+    b = b + 1
+  }
+  return a == left.end
+}
+
+// Opaque open values still require complete, bounded DER framing and primitive encodings.
+fn openValue(reader: &mut Reader, span: Span, depth: usize) -> () {
+  if reader.failed {
+    return ()
+  }
+  if span.tag / 32 % 2 == 1 {
+    reader.cursor = span.content
+    while reader.cursor < span.end && !reader.failed {
+      let child = read(&mut reader, span.end, depth + 1, false)
+      let ignored = openValue(&mut reader, child, depth + 1)
+    }
+  }
+  reader.cursor = span.end
+}
+
+fn directoryString(reader: &mut Reader, end: usize, depth: usize) -> () {
+  let value = read(&mut reader, end, depth, false)
+  if reader.failed {
+    return ()
+  }
+  if (value.tag != 12 && value.tag != 19 && value.tag != 20 && value.tag != 28 && value.tag != 30) || value.content == value.end {
+    return malformed(&mut reader, DecodeReason.Schema, value.start)
+  }
+  return finish(&mut reader, end)
+}
+
+fn directoryName(reader: &mut Reader, end: usize) -> () {
+  let whole = expect(&mut reader, end, 3, 48)
+  if reader.failed {
+    return ()
+  }
+  let done = finish(&mut reader, end)
+  reader.cursor = whole.content
+  while reader.cursor < whole.end && !reader.failed {
+    let set = expect(&mut reader, whole.end, 4, 49)
+    if reader.failed {
+      return ()
+    }
+    reader.cursor = set.content
+    if reader.cursor == set.end {
+      return malformed(&mut reader, DecodeReason.Schema, set.start)
+    }
+    let mut previous = emptySpan()
+    let mut hasPrevious = false
+    while reader.cursor < set.end && !reader.failed {
+      let attribute = expect(&mut reader, set.end, 5, 48)
+      if reader.failed {
+        return ()
+      }
+      if hasPrevious && !ordered(&reader, previous, attribute) {
+        return malformed(&mut reader, DecodeReason.SetOrder, attribute.start)
+      }
+      previous = attribute
+      hasPrevious = true
+      reader.cursor = attribute.content
+      let oid = expect(&mut reader, attribute.end, 6, 6)
+      let value = read(&mut reader, attribute.end, 6, true)
+      let checked = openValue(&mut reader, value, 6)
+      let done = finish(&mut reader, attribute.end)
+    }
+  }
+}
+
+fn generalName(reader: &mut Reader, span: Span) -> () {
+  if reader.failed {
+    return ()
+  }
+  let tag = span.tag
+  if tag == 129 || tag == 130 || tag == 134 {
+    return stringValue(
+      &mut reader,
+      Span {start: span.start, content: span.content, end: span.end, tag: 22},
+    )
+  }
+  if tag == 135 {
+    return ()
+  }
+  if tag == 136 {
+    return universal(
+      &mut reader,
+      Span {start: span.start, content: span.content, end: span.end, tag: 6},
+    )
+  }
+  reader.cursor = span.content
+  if tag == 160 {
+    let oid = expect(&mut reader, span.end, 3, 6)
+    let wrapper = expect(&mut reader, span.end, 3, 160)
+    if reader.failed {
+      return ()
+    }
+    let done = finish(&mut reader, span.end)
+    reader.cursor = wrapper.content
+    let value = read(&mut reader, wrapper.end, 4, true)
+    let checked = openValue(&mut reader, value, 4)
+    return finish(&mut reader, wrapper.end)
+  }
+  if tag == 164 {
+    return directoryName(&mut reader, span.end)
+  }
+  if tag == 165 {
+    let first = read(&mut reader, span.end, 3, false)
+    if reader.failed {
+      return ()
+    }
+    let mut party = first
+    if first.tag == 160 {
+      reader.cursor = first.content
+      let checked = directoryString(&mut reader, first.end, 4)
+      party = read(&mut reader, span.end, 3, false)
+    }
+    if reader.failed {
+      return ()
+    }
+    if party.tag != 161 {
+      return malformed(&mut reader, DecodeReason.Schema, party.start)
+    }
+    let done = finish(&mut reader, span.end)
+    reader.cursor = party.content
+    return directoryString(&mut reader, party.end, 4)
+  }
+  if tag == 163 {
+    // ORAddress has required BuiltInStandardAttributes and optional domain-defined and extension attributes.
+    // Attribute semantics are outside HTTPS identity matching; their complete DER remains validated.
+    let builtin = expect(&mut reader, span.end, 3, 48)
+    let checked = openValue(&mut reader, builtin, 3)
+    if reader.cursor < span.end && !reader.failed {
+      let optional = read(&mut reader, span.end, 3, false)
+      if optional.tag != 48 && optional.tag != 49 {
+        return malformed(&mut reader, DecodeReason.Schema, optional.start)
+      }
+      let checked = openValue(&mut reader, optional, 3)
+      if optional.tag == 48 && reader.cursor < span.end && !reader.failed {
+        let extensions = expect(&mut reader, span.end, 3, 49)
+        let checked = openValue(&mut reader, extensions, 3)
+      }
+    }
+    return finish(&mut reader, span.end)
+  }
+  return malformed(&mut reader, DecodeReason.Tag, span.start)
+}
+
+impl CertificateSan {
+  /// Checks one DER GeneralNames value and returns the number of names, without storage.
+  ///
+  /// The DER structure and the encoding of each GeneralName are checked. Some ASN.1 types inside
+  /// `otherName` and `x400Address` are not checked. Nothing allocates.
+  ///
+  /// # Errors
+  /// - `Failure` with a [`SanDecodeError`] if the DER is not valid or a limit is exceeded.
+  pub fn validateValue(
+    value: &[u8],
+    limits: SanDecodeLimits,
+  ) -> Result<SanDecodeSummary, SanDecodeError> {
+    if value.length > limits.inputBytes {
+      return Result<SanDecodeSummary, SanDecodeError>.failResult(
+        SanDecodeError {
+          kind: SanDecodeClass.ResourceLimit,
+          reason: SanDecodeReason.InputBytes,
+          offset: 0,
+        },
+      )
+    }
+    let mut reader = Reader {
+      bytes: value,
+      cursor: 0,
+      nodes: 0,
+      limits: limits,
+      failed: false,
+      error: SanDecodeError {
+        kind: SanDecodeClass.Malformed,
+        reason: SanDecodeReason.InvalidDer,
+        offset: 0,
+      },
+    }
+    let root = expect(&mut reader, value.length, 1, 48)
+    let done = finish(&mut reader, value.length)
+    if !reader.failed && root.content == root.end {
+      let ignored = reject(
+        &mut reader,
+        SanDecodeClass.Malformed,
+        SanDecodeReason.EmptySan,
+        root.start,
+      )
+    }
+    reader.cursor = root.content
+    let mut count = usize.ZERO
+    while reader.cursor < root.end && !reader.failed {
+      let offset = reader.cursor
+      if count >= limits.identities {
+        let ignored = reject(
+          &mut reader,
+          SanDecodeClass.ResourceLimit,
+          SanDecodeReason.Identities,
+          offset,
+        )
+      } else {
+        let entry = read(&mut reader, root.end, 2, false)
+        let checked = generalName(&mut reader, entry)
+        if !reader.failed {
+          count = count + 1
+          reader.cursor = entry.end
+        }
+      }
+    }
+    if reader.failed {
+      return Result<SanDecodeSummary, SanDecodeError>.failResult(move reader.error)
+    }
+    return Result<SanDecodeSummary, SanDecodeError>.succeed(
+      SanDecodeSummary {present: true, count: count, nodes: reader.nodes},
+    )
+  }
+  /// Decodes the DER GeneralNames value `value` into `storage`, and returns the number of names.
+  ///
+  /// The names borrow `value`. The DER structure and the encoding of each GeneralName are checked.
+  /// Some ASN.1 types inside `otherName` and `x400Address` are not checked.
+  ///
+  /// # Errors
+  /// - `Failure` with a [`SanDecodeError`] if the DER is not valid, `storage` is too small, or a
+  ///   limit is exceeded.
+  ///
+  /// # Gotchas
+  /// After an error, `storage` can hold some names. Do not use them. This function checks the
+  /// encoding only. `HttpsIdentity.verify` checks DNS syntax and IP lengths.
+  pub fn decodeValue<'a>(
+    value: &'a [u8],
+    storage: &mut [PresentedIdentity<'a>],
+    limits: SanDecodeLimits,
+  ) -> Result<SanDecodeSummary, SanDecodeError> {
+    if value.length > limits.inputBytes {
+      return Result<SanDecodeSummary, SanDecodeError>.failResult(
+        SanDecodeError {
+          kind: SanDecodeClass.ResourceLimit,
+          reason: SanDecodeReason.InputBytes,
+          offset: 0,
+        },
+      )
+    }
+    let mut reader = Reader<'a> {
+      bytes: value,
+      cursor: 0,
+      nodes: 0,
+      limits: limits,
+      failed: false,
+      error: SanDecodeError {
+        kind: SanDecodeClass.Malformed,
+        reason: SanDecodeReason.InvalidDer,
+        offset: 0,
+      },
+    }
+    let root = expect(&mut reader, value.length, 1, 48)
+    let done = finish(&mut reader, value.length)
+    if !reader.failed && root.content == root.end {
+      let ignored = reject(
+        &mut reader,
+        SanDecodeClass.Malformed,
+        SanDecodeReason.EmptySan,
+        root.start,
+      )
+    }
+    reader.cursor = root.content
+    let mut count = usize.ZERO
+    while reader.cursor < root.end && !reader.failed {
+      let offset = reader.cursor
+      if count >= limits.identities {
+        let ignored = reject(
+          &mut reader,
+          SanDecodeClass.ResourceLimit,
+          SanDecodeReason.Identities,
+          offset,
+        )
+      } else if count >= storage.length {
+        let ignored = reject(
+          &mut reader,
+          SanDecodeClass.ResourceLimit,
+          SanDecodeReason.Storage,
+          offset,
+        )
+      } else {
+        let entry = read(&mut reader, root.end, 2, false)
+        let checked = generalName(&mut reader, entry)
+        if !reader.failed {
+          let bytes = Slice.view<u8>(value, entry.content, entry.end - entry.content)
+          if entry.tag == 130 {
+            storage[count] = PresentedIdentity<'a>.Dns {bytes: bytes}
+          } else if entry.tag == 135 {
+            storage[count] = PresentedIdentity<'a>.Ip {bytes: bytes}
+          } else {
+            storage[count] = PresentedIdentity<'a>.Other {
+              tag: usize.toU8(entry.tag % 32),
+              bytes: bytes,
+            }
+          }
+          count = count + 1
+          reader.cursor = entry.end
+        }
+      }
+    }
+    if reader.failed {
+      return Result<SanDecodeSummary, SanDecodeError>.failResult(move reader.error)
+    }
+    return Result<SanDecodeSummary, SanDecodeError>.succeed(
+      SanDecodeSummary {present: true, count: count, nodes: reader.nodes},
+    )
+  }
+  /// Finds the SAN extension of `certificate`, decodes it into `storage`, and returns a summary.
+  ///
+  /// If the certificate has no SAN extension, `present` is `false` and `count` is 0. The function
+  /// writes one `PresentedIdentity` for each name into `storage`, in source order. The names
+  /// borrow `certificate`. Nothing allocates. Forms other than DNS names and IP addresses are
+  /// returned as `Other` with their raw bytes.
+  ///
+  /// # Errors
+  /// - `Failure` with a [`SanDecodeError`] if there are two SAN extensions, the SAN is empty or not
+  ///   valid, `storage` is too small, or a limit is exceeded.
+  ///
+  /// # Gotchas
+  /// After an error, `storage` can hold some names. Do not use them. This function checks the
+  /// encoding only. `HttpsIdentity.verify` checks DNS syntax and IP lengths.
+  pub fn decode<'a>(
+    certificate: &'a Certificate,
+    storage: &mut [PresentedIdentity<'a>],
+    limits: SanDecodeLimits,
+  ) -> Result<SanDecodeSummary, SanDecodeError> {
+    let count = Certificate.extensionCount(certificate)
+    if count > limits.extensions {
+      return Result<SanDecodeSummary, SanDecodeError>.failResult(
+        SanDecodeError {
+          kind: SanDecodeClass.ResourceLimit,
+          reason: SanDecodeReason.Extensions,
+          offset: 0,
+        },
+      )
+    }
+    let mut index = usize.ZERO
+    let mut total = usize.ZERO
+    let mut matches = usize.ZERO
+    let mut selected = usize.ZERO
+    while index < count {
+      let extension = Certificate.extension(certificate, index)
+      match move extension {
+        Option<ExtensionView<'a>>.Some {value: item} => {
+          if item.oid.length > limits.inputBytes - total {
+            return Result<SanDecodeSummary, SanDecodeError>.failResult(
+              SanDecodeError {
+                kind: SanDecodeClass.ResourceLimit,
+                reason: SanDecodeReason.InputBytes,
+                offset: 0,
+              },
+            )
+          }
+          total = total + item.oid.length
+          if item.value.length > limits.inputBytes - total {
+            return Result<SanDecodeSummary, SanDecodeError>.failResult(
+              SanDecodeError {
+                kind: SanDecodeClass.ResourceLimit,
+                reason: SanDecodeReason.InputBytes,
+                offset: 0,
+              },
+            )
+          }
+          total = total + item.value.length
+          if item.oid.length == 3 && item.oid[0] == usize.toU8(85) && item.oid[1] == usize.toU8(29) && item.oid[2] == usize.toU8(
+            17,
+          ) {
+            matches = matches + 1
+            selected = index
+          }
+        }
+        Option<ExtensionView<'a>>.None => {}
+      }
+      index = index + 1
+    }
+    if matches > 1 {
+      return Result<SanDecodeSummary, SanDecodeError>.failResult(
+        SanDecodeError {
+          kind: SanDecodeClass.Malformed,
+          reason: SanDecodeReason.DuplicateSan,
+          offset: 0,
+        },
+      )
+    }
+    if matches == 0 {
+      return Result<SanDecodeSummary, SanDecodeError>.succeed(
+        SanDecodeSummary {present: false, count: 0, nodes: 0},
+      )
+    }
+    let extension = Certificate.extension(certificate, selected)
+    match move extension {
+      Option<ExtensionView<'a>>.Some {value: item} => {
+        return CertificateSan.decodeValue(item.value, &mut storage, limits)
+      }
+      Option<ExtensionView<'a>>.None => {
+        return Result<SanDecodeSummary, SanDecodeError>.failResult(
+          SanDecodeError {
+            kind: SanDecodeClass.Malformed,
+            reason: SanDecodeReason.InvalidDer,
+            offset: 0,
+          },
+        )
+      }
+    }
+  }
+}

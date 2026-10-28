@@ -5,8 +5,8 @@ description: Bounded unfragmented WebSocket server frames, scoped channel owners
 
 # WebSocket server messages
 
-`silk.websocket_server` provides bounded message I/O after
-`silk.websocket_upgrade.withUpgrade` has validated and flushed an HTTP WebSocket handshake. It
+`silk.http.websocket_server` provides bounded message I/O after
+`silk.http.websocket_upgrade.withUpgrade` has validated and flushed an HTTP WebSocket handshake. It
 wraps the exact upgraded `BufferedDuplex`, including any first-frame bytes already read with the
 HTTP request, and lends one affine `ServerWebSocket` to a higher-ranked callback.
 
@@ -33,9 +33,9 @@ how many events to pump; `readEvent` never hides a loop that skips control event
 
 ```silk,ignore
 import silk.option {Option}
-import silk.websocket_server {Limits}
-import silk.websocket_server as WebSocketServer
-import silk.websocket_upgrade as WebSocketUpgrade
+import silk.http.websocket_server {Limits}
+import silk.http.websocket_server as WebSocketServer
+import silk.http.websocket_upgrade as WebSocketUpgrade
 
 let upgraded = run WebSocketUpgrade.withUpgrade(
   &mut request,
@@ -218,10 +218,10 @@ concurrency, a client API, listener or router ownership, a server framework, TLS
 native `wss`, or an automatic retry path.
 
 The implementation lives in
-[`websocket_server.silk`](../stdlib/silk/websocket_server.silk) and uses
+[`websocket_server.silk`](../stdlib/silk/http/websocket_server.silk) and uses
 the scoped upgrade actor in
-[`websocket_upgrade.silk`](../stdlib/silk/websocket_upgrade.silk) plus
+[`websocket_upgrade.silk`](../stdlib/silk/http/websocket_upgrade.silk) plus
 the shared buffered channel in
-[`buffered_duplex.silk`](../stdlib/silk/buffered_duplex.silk). The
+[`buffered_duplex.silk`](../stdlib/silk/io/buffered_duplex.silk). The
 normative contract is the
 `websocket-server-messages` OpenSpec.

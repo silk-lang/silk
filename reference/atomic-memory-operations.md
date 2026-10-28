@@ -3,7 +3,7 @@
 Atomic intrinsics give ordinary Silk source the indivisible memory accesses and orderings that
 locks, reference counts, and lock-free queues are built from. The compiler supplies only the
 accesses and the fence; every lock, counter, and queue is standard-library or user source. The
-public API is `silk.atomic`, which maps its `MemoryOrder` enum to the static ordering text these
+public API is `silk.concurrency.atomic`, which maps its `MemoryOrder` enum to the static ordering text these
 intrinsics take.
 
 ## Terms

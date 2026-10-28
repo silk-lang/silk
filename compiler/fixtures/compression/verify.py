@@ -10,16 +10,16 @@ ROOT = Path(__file__).resolve().parents[3]
 CASES = [(0, 0), (1, 0), (2, 1), (3, 0), (257, 1), (258, 0), (259, 0),
          (32768, 1), (65539, 2), (90000, 3), (90001, 4)]
 
-SOURCE = '''import silk.allocator {Allocator, OutOfMemoryError}
-import silk.effect {Effect}
-import silk.deflate {Deflate, EncodeError}
-import silk.inflate {Format}
-import silk.list {List}
-import silk.os_writer {StdoutWriter}
-import silk.writer {Writer, WriterError}
-import silk.slice {Slice}
-import silk.u32
-import silk.usize
+SOURCE = '''import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.core.effect {Effect}
+import silk.compress.deflate {Deflate, EncodeError}
+import silk.compress.inflate {Format}
+import silk.collections.list {List}
+import silk.io.writer_native {StdoutWriter}
+import silk.io.writer {Writer, WriterError}
+import silk.collections.slice {Slice}
+import silk.num.u32
+import silk.num.usize
 
 effect fn emit(size: usize, mode: usize, format: Format) -> ()
 ! OutOfMemoryError | EncodeError | WriterError ? &mut Allocator {

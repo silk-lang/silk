@@ -681,7 +681,7 @@ fn read(slot: Slot) -> i32 { return slot.value }
 fn length(buffer: &Intrinsic.RawBuffer<i32>) -> usize { return Intrinsic.rawBufferCount<i32>(buffer) }
 ```
 
-The standard library's `silk.raw_buffer.RawBuffer` and `silk.slot.Slot` actors are such ordinary
+The standard library's `silk.mem.raw_buffer.RawBuffer` and `silk.mem.slot.Slot` actors are such ordinary
 declarations: their sibling functions take `Intrinsic.RawBuffer<T>` and `Intrinsic.Slot<'s, T>`.
 
 **Boundary:** There is no alias or fallback. A bare `Slot<'s, T>` where no `Slot` is declared or
@@ -694,7 +694,7 @@ storage spelling with no ordinary declaration in scope reports an ordinary unkno
 
 **Evidence:** intrinsic catalog tests.
 
-### INTR-006 — `Copy` and `Drop` are sealed `Intrinsic` properties published by `silk.ownership`
+### INTR-006 — `Copy` and `Drop` are sealed `Intrinsic` properties published by `silk.core.ownership`
 
 **Status:** Confirmed
 
@@ -706,7 +706,7 @@ The two ownership properties are members of the sealed namespace:
 The standard library publishes them under ordinary names through TYPE-004 aliases:
 
 ```silk,ignore
-// silk/ownership.silk
+// silk/core/ownership.silk
 pub type Copy = Intrinsic.Copy
 pub type Drop = Intrinsic.Drop
 ```
@@ -716,7 +716,7 @@ same property, so `impl Copy for Point {}` and `impl Intrinsic.Copy for Point {}
 conformance, and a second one is a duplicate:
 
 ```silk
-import silk.ownership { Copy }
+import silk.core.ownership { Copy }
 
 struct Point { x: i32, y: i32 }
 
@@ -925,7 +925,7 @@ Ordinary wrapper functions need no target annotation: their reachable primitive 
 compatibility transitively. Ordinary source cannot add to, subtract from, or override an intrinsic's
 compiler-owned target set.
 
-Target-conditional source uses the ordinary static `silk.target` API and `static if`. Static
+Target-conditional source uses the ordinary static `silk.core.target` API and `static if`. Static
 selection removes an inactive intrinsic call before executable availability is checked. Runtime
 conditions, target reflection, and runtime target inspection remain unavailable. Portable public
 APIs may also use ordinary source abstractions and target-appropriate providers.
@@ -1398,7 +1398,7 @@ capture. A named `export "C" fn` item contextually converts to the C function-po
 when its signature and declared behavior match exactly and its body is synchronous with no type or value generics. Per-call lifetime binders are permitted.
 
 ```silk,ignore
-import silk.pointer { Pointer }
+import silk.mem.pointer { Pointer }
 
 unsafe extern "C" fn qsort(
   base: ?[*]mut i32,
@@ -1525,7 +1525,7 @@ commits the companions while removing the complete artifact set after a partial 
 
 **Status:** Confirmed
 
-`silk/os_system_clock` declares the C-layout `Timespec` record and the libc functions
+`silk/system/system_clock_native` declares the C-layout `Timespec` record and the libc functions
 `clock_gettime` and `clock_getres` in ordinary Silk. Its service implementation calls those
 functions with `CLOCK_REALTIME`, validates the returned fraction and resolution, and then constructs
 the portable `SystemClock` values. Darwin and Linux use the same admitted C classes; Linux retains
@@ -1545,7 +1545,7 @@ foreign inventory identifies the libc functions, and the old intrinsic operation
 runtime names, and generated C functions have been deleted.
 
 **Evidence:** clock-service specification,
-[system-clock source](../stdlib/silk/os_system_clock.silk),
+[system-clock source](../stdlib/silk/system/system_clock_native.silk),
 clock integration tests.
 
 See [Scalar C variadics](integer-c-variadics.md) for true ellipsis declarations, default argument

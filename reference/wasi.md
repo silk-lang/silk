@@ -60,7 +60,7 @@ mapping the package directory to guest `/` even when invoked from a subdirectory
 
 ## Application entry
 
-The bundled `silk.wasi_start` runtime accepts `main` returning `()` or `i32`, and Effects with
+The bundled `silk.platform.wasi.start` runtime accepts `main` returning `()` or `i32`, and Effects with
 either result. An Effect may require `&mut HostInput`; the runtime supplies an owned snapshot
 of command arguments and environment. All other services use explicit providers.
 
@@ -83,11 +83,11 @@ represents success or failure: zero succeeds and every nonzero status becomes fa
 | `SystemClock`, `MonotonicClock` | `OsSystemClock`, `OsMonotonicClock` |
 | `Random` | `OsRandom` |
 | Allocation, containers, codecs, crypto, local executions | The target-neutral providers |
-| TCP streams and listeners (Preview 2) | `silk.wasi_socket`, implementing `ByteDuplex` |
-| UDP datagrams (Preview 2) | `silk.wasi_datagram.UdpSocket` |
-| `Resolver` (Preview 2) | `silk.wasi_resolver.WasiResolver` |
-| `Http` (Preview 2) | `silk.http_client_wasi.WasiHttp` |
-| Incoming HTTP (Preview 2) | `silk.wasi_http_server.Exchange` |
+| TCP streams and listeners (Preview 2) | `silk.net.socket_wasi`, implementing `ByteDuplex` |
+| UDP datagrams (Preview 2) | `silk.net.datagram_wasi.UdpSocket` |
+| `Resolver` (Preview 2) | `silk.net.resolver_wasi.WasiResolver` |
+| `Http` (Preview 2) | `silk.http.client_wasi.WasiHttp` |
+| Incoming HTTP (Preview 2) | `silk.http.server_wasi.Exchange` |
 
 Filesystem roots use guest paths. `OsFileSystem.make("/data")` can access only a host-granted
 preopen containing that path. A preopen named `.` represents guest `/`. The longest matching
@@ -101,9 +101,9 @@ standardize terminal detection, so automatic logger colors are disabled. The com
 are single-threaded. `threading = "multi"` is rejected; the existing freestanding WebAssembly
 threads extension is separate. WASI provides no child-process spawning or POSIX signals.
 
-`silk.wasi` exposes all Preview 1 system-call bindings and the canonical memory records for
+`silk.platform.wasi.preview1` exposes all Preview 1 system-call bindings and the canonical memory records for
 custom providers, including polling, descriptor rights, offsets, metadata, and inherited sockets.
-`silk.wasi_preview2` exposes all 200 canonical imports of the bundled WASI 0.2.12 command and
+`silk.platform.wasi.preview2` exposes all 200 canonical imports of the bundled WASI 0.2.12 command and
 HTTP interfaces: clocks, streams, polling, randomness, filesystem, sockets, DNS, and HTTP.
 These unsafe bindings require canonical ABI layout, ownership, and resource lifetimes.
 The higher-level providers own those resources and release them on success, failure, or timeout.

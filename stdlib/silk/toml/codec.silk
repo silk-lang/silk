@@ -1,0 +1,354 @@
+//! Convert TOML values to Silk values, and write Silk values as TOML.
+//!
+//! # When to use
+//! After `silk.toml.value` parses a document, use [`TomlCodec.decodeOne`] to read a `bool`, `i32`,
+//! or `i64`, and [`TomlCodec.deserializeOne`] to read an `f64` or an owned `String`. Use
+//! [`TomlCodec.writeOne`] to write a value after a key when you write TOML by hand.
+//!
+//! # Details
+//! | Type | Write | Read |
+//! |------|-------|------|
+//! | `bool` | [`Serialize`] | [`Decode`] from `Boolean` |
+//! | `i32`, `i64` | [`Serialize`] | [`Decode`] from `Integer`, with `0x`, `0o`, `0b` and `_` |
+//! | `f64` | [`Serialize`] | [`Deserialize`] from `Float`, with `inf` and `nan` |
+//! | `string`, `String` | [`Serialize`] | [`Deserialize`] from `String` (only `String`) |
+//!
+//! To support your own type, implement the interfaces for it.
+//!
+//! # Errors
+//! - `TomlError` with `TypeMismatch` if the value has a different kind, or with `NumberOutOfRange`
+//!   if the number does not fit the type. An `Integer` is not converted to `f64`. All codec errors
+//!   have `offset` 0, because the value is not tied to a position in the source.
+//! - `WriterError` if the `Writer` fails.
+//! - `OutOfMemoryError` if the `Allocator` cannot supply the output of `deserializeOne`.
+//!
+//! # Examples
+//! ## Read typed settings
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.option { Option }
+//! import silk.core.result { Result }
+//! import silk.toml.codec { TomlCodec }
+//! import silk.toml.scanner { TomlError }
+//! import silk.toml.value { Toml, Value }
+//!
+//! fn port(document: &Value) -> i32 {
+//!   return match Toml.field(document, "port") {
+//!     Option<&Value>.Some { value } => match TomlCodec.decodeOne<i32>(value) {
+//!       Result<i32, TomlError>.Success { value: number } => number
+//!       Result<i32, TomlError>.Failure { error: _ } => 0
+//!     }
+//!     Option<&Value>.None => 0
+//!   }
+//! }
+//!
+//! pub effect fn main() -> i32
+//!   ! TomlError | OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let document = run Toml.parse(b"port = 8_080\nratio = 0.5\n")
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let ratio = match Toml.field(&document, "ratio") {
+//!     Option<&Value>.Some { value } => run TomlCodec.deserializeOne<f64>(value)
+//!       |> Effect.provideMut<Allocator>(&mut allocator)
+//!     Option<&Value>.None => 0.0
+//!   }
+//!   if port(&document) != 8080 || ratio != 0.5 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Data formats
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.num.f64
+import silk.format { Format, ParseError }
+import silk.num.i64
+import silk.core.result { Result }
+import silk.collections.slice { Slice }
+import silk.text.string { String }
+import silk.toml.output { TomlOutput }
+import silk.toml.scanner { TomlError, TomlReason }
+import silk.toml.value { Value }
+import silk.num.u8
+import silk.num.usize
+import silk.collections.list { List }
+import silk.io.writer { Writer, WriterError }
+
+/// A type that can write itself as one TOML value.
+///
+/// The standard library implements it for `bool`, `i32`, `i64`, `f64`, `string`, and `String`.
+/// Implement it for your own type to write the type with [`TomlCodec.writeOne`].
+pub interface Serialize {
+  /// Writes `self` as a TOML value through the ambient `Writer`. It does not write a key or a
+  /// newline.
+  ///
+  /// # Errors
+  /// - `WriterError` if the `Writer` fails.
+  /// - `TomlError` if the value has no TOML form.
+  effect fn serialize(self: &Self) -> () ! TomlError | WriterError ? &mut Writer
+}
+
+/// A type that can read itself from a TOML value without allocation.
+///
+/// The standard library implements it for `bool` (from `Boolean`), and `i32` and `i64` (from
+/// `Integer`, with `0x`, `0o`, `0b` and `_`). Read it with [`TomlCodec.decodeOne`].
+pub interface Decode {
+  /// Returns the value that `value` holds, or a `TomlError` if it is of a different kind or out of
+  /// range.
+  fn decode(value: &Value) -> Result<Self, TomlError>
+}
+
+/// A type that can read itself from a TOML value and allocate.
+///
+/// The standard library implements it for `f64` (from `Float`, with `inf` and `nan`; an `Integer`
+/// is not converted) and `String` (from `String`). Read it with [`TomlCodec.deserializeOne`].
+pub interface Deserialize {
+  /// Returns the value that `value` holds.
+  ///
+  /// # Errors
+  /// - `TomlError` if `value` is of a different kind or out of range.
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  effect fn deserialize(value: &Value) -> Self ! TomlError | OutOfMemoryError ? &mut Allocator
+}
+
+/// Functions that select the conversion for a type.
+pub struct TomlCodec {}
+
+struct FloatText {
+  bytes: [u8; 32],
+  length: usize,
+}
+
+effect fn writeAll(self: &mut FloatText, values: &[u8]) -> () ! WriterError {
+  if self.length + values.length > 32 { fail Writer.failure() }
+  let mut at = usize.ZERO
+  while at < values.length {
+    self.bytes[self.length] = values[at]
+    self.length = self.length + usize.ONE
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn flush(self: &mut FloatText) -> () ! WriterError { return () }
+impl Writer for FloatText {
+  writeAll: FloatText.writeAll
+  flush: FloatText.flush
+}
+
+fn floatText() -> FloatText {
+  return FloatText { bytes: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], length: usize.ZERO }
+}
+
+impl TomlCodec {
+  /// Writes `value` as a TOML value through the ambient `Writer`.
+  ///
+  /// An `f64` without a fraction gets `.0`, so it reads back as a float. NaN is written as `nan`
+  /// and infinity as `inf` or `-inf`. Strings are written as basic strings with escapes.
+  ///
+  /// # Errors
+  /// - `WriterError` if the `Writer` fails.
+  /// - `TomlError` if the type rejects the value.
+  ///
+  /// # Gotchas
+  /// It writes only the value. Write the key and ` = ` before it, and a newline after it.
+  pub effect fn writeOne<T: Serialize>(value: &T) -> () ! TomlError | WriterError ? &mut Writer {
+    return run Serialize.serialize(value)
+  }
+
+  /// Returns `value` converted to `T` without allocation.
+  ///
+  /// Returns a `Failure` with `TypeMismatch` if `value` has a different kind, or with
+  /// `NumberOutOfRange` if the number does not fit `T`.
+  pub fn decodeOne<T: Decode>(value: &Value) -> Result<T, TomlError> {
+    return Decode.decode(value)
+  }
+
+  /// Returns `value` converted to `T`, with memory from the ambient `Allocator`.
+  ///
+  /// # Errors
+  /// - `TomlError` with `TypeMismatch` if `value` has a different kind, or with `NumberOutOfRange`
+  ///   if the number does not fit `T`.
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn deserializeOne<T: Deserialize>(value: &Value)
+    -> T ! TomlError | OutOfMemoryError ? &mut Allocator {
+    return run Deserialize.deserialize(value)
+  }
+}
+
+fn error(reason: TomlReason) -> TomlError {
+  return TomlError { reason: move reason, offset: usize.ZERO }
+}
+
+fn parseI64(text: string) -> Result<i64, TomlError> {
+  let bytes = String.utf8Bytes(text)
+  if bytes.length == usize.ZERO { return Result<i64, TomlError>.failResult(error(TomlReason.InvalidNumber)) }
+  let mut at = usize.ZERO
+  let mut negative = false
+  if bytes[at] == 43 || bytes[at] == 45 {
+    negative = bytes[at] == 45
+    at = at + usize.ONE
+  }
+  let mut radix: i64 = 10
+  if at + usize.ONE < bytes.length && bytes[at] == 48 {
+    if bytes[at + usize.ONE] == 120 { radix = 16
+      at = at + 2 }
+    else if bytes[at + usize.ONE] == 111 { radix = 8
+      at = at + 2 }
+    else if bytes[at + usize.ONE] == 98 { radix = 2
+      at = at + 2 }
+  }
+  if at >= bytes.length { return Result<i64, TomlError>.failResult(error(TomlReason.InvalidNumber)) }
+  let mut limit = -i64.MAX
+  if negative { limit = i64.MIN }
+  let mut total: i64 = 0
+  let mut digits = usize.ZERO
+  while at < bytes.length {
+    let byte = bytes[at]
+    if byte != 95 {
+      let mut digit: i64 = -1
+      if byte >= 48 && byte <= 57 { digit = u8.toI64(byte - 48) }
+      else if byte >= 65 && byte <= 70 { digit = u8.toI64(byte - 65) + 10 }
+      else if byte >= 97 && byte <= 102 { digit = u8.toI64(byte - 97) + 10 }
+      if digit < 0 || digit >= radix {
+        return Result<i64, TomlError>.failResult(error(TomlReason.InvalidNumber))
+      }
+      if total < (limit + digit) / radix {
+        return Result<i64, TomlError>.failResult(error(TomlReason.NumberOutOfRange))
+      }
+      total = total * radix - digit
+      digits = digits + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  if digits == usize.ZERO { return Result<i64, TomlError>.failResult(error(TomlReason.InvalidNumber)) }
+  if negative { return Result<i64, TomlError>.succeed(total) }
+  return Result<i64, TomlError>.succeed(-total)
+}
+
+impl Serialize for bool {
+  effect fn serialize(self: &Self) -> () ! TomlError | WriterError ? &mut Writer {
+    if self.* { return run Writer.writeAll(b"true") }
+    return run Writer.writeAll(b"false")
+  }
+}
+
+impl Decode for bool {
+  fn decode(value: &Value) -> Result<Self, TomlError> {
+    return match &value.* {
+      Value.Boolean { value: decoded } => Result<bool, TomlError>.succeed(decoded)
+      _ => Result<bool, TomlError>.failResult(error(TomlReason.TypeMismatch))
+    }
+  }
+}
+
+impl Serialize for i64 {
+  effect fn serialize(self: &Self) -> () ! TomlError | WriterError ? &mut Writer {
+    return run Format.display<i64>(self)
+  }
+}
+
+impl Decode for i64 {
+  fn decode(value: &Value) -> Result<Self, TomlError> {
+    return match &value.* {
+      Value.Integer { text } => parseI64(String.view(&text))
+      _ => Result<i64, TomlError>.failResult(error(TomlReason.TypeMismatch))
+    }
+  }
+}
+
+impl Serialize for i32 {
+  effect fn serialize(self: &Self) -> () ! TomlError | WriterError ? &mut Writer {
+    return run Format.display<i32>(self)
+  }
+}
+
+impl Decode for i32 {
+  fn decode(value: &Value) -> Result<Self, TomlError> {
+    return match move TomlCodec.decodeOne<i64>(value) {
+      Result<i64, TomlError>.Failure { error: failure } => Result<i32, TomlError>.failResult(move failure)
+      Result<i64, TomlError>.Success { value: decoded } => {
+        if decoded < -2147483648 || decoded > 2147483647 {
+          return Result<i32, TomlError>.failResult(error(TomlReason.NumberOutOfRange))
+        }
+        return Result<i32, TomlError>.succeed(i64.toI32(decoded))
+      }
+    }
+  }
+}
+
+impl Serialize for f64 {
+  effect fn serialize(self: &Self) -> () ! TomlError | WriterError ? &mut Writer {
+    if f64.isNaN(self.*) { return run Writer.writeAll(b"nan") }
+    if f64.isInfinite(self.*) {
+      if f64.isSignNegative(self.*) { return run Writer.writeAll(b"-inf") }
+      return run Writer.writeAll(b"inf")
+    }
+    let mut text = floatText()
+    run Format.display<f64>(self) |> Effect.provideMut<Writer>(&mut text)
+    let bytes = Slice.view<u8>(&text.bytes, usize.ZERO, text.length)
+    let mut at = usize.ZERO
+    let mut marked = false
+    while at < bytes.length {
+      if bytes[at] == 46 || bytes[at] == 101 || bytes[at] == 69 { marked = true }
+      at = at + usize.ONE
+    }
+    run Writer.writeAll(bytes)
+    if !marked { return run Writer.writeAll(b".0") }
+    return ()
+  }
+}
+
+impl Deserialize for f64 {
+  effect fn deserialize(value: &Value) -> Self ! TomlError | OutOfMemoryError ? &mut Allocator {
+    return match &value.* {
+      Value.Float { text } => {
+        let spelling = String.view(&text)
+        if spelling == "inf" || spelling == "+inf" { return f64.INFINITY }
+        if spelling == "-inf" { return f64.negate(f64.INFINITY) }
+        if spelling == "nan" || spelling == "+nan" || spelling == "-nan" {
+          return f64.fromBits(9221120237041090560)
+        }
+        let source = String.utf8Bytes(spelling)
+        let mut clean = List<u8>.make()
+        let mut at = usize.ZERO
+        while at < source.length {
+          if source[at] != 95 { run List<u8>.append(&mut clean, source[at]) }
+          at = at + usize.ONE
+        }
+        let normalized = unsafe String.fromUtf8Unchecked(List<u8>.asSlice(&clean))
+        return match move Format.f64Value(normalized) {
+          Result<f64, ParseError>.Success { value: decoded } => decoded
+          Result<f64, ParseError>.Failure { error: failure } => { fail error(TomlReason.NumberOutOfRange) }
+        }
+      }
+      _ => { fail error(TomlReason.TypeMismatch) }
+    }
+  }
+}
+
+impl<'a> Serialize for string<'a> {
+  effect fn serialize(self: &Self) -> () ! TomlError | WriterError ? &mut Writer {
+    return run TomlOutput.writeString(self.*)
+  }
+}
+
+impl Serialize for String {
+  effect fn serialize(self: &Self) -> () ! TomlError | WriterError ? &mut Writer {
+    return run TomlOutput.writeString(String.view(self))
+  }
+}
+
+impl Deserialize for String {
+  effect fn deserialize(value: &Value) -> Self ! TomlError | OutOfMemoryError ? &mut Allocator {
+    return match &value.* {
+      Value.String { text } => run String.copy(String.view(&text))
+      _ => { fail error(TomlReason.TypeMismatch) }
+    }
+  }
+}

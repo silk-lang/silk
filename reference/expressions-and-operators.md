@@ -609,7 +609,7 @@ when that distinction is part of the program's contract.
 rounded finite results are values, not diagnostics or traps.
 
 **Evidence:** floating scalar specification,
-[floating actor modules](../stdlib/silk/f32.silk),
+[floating actor modules](../stdlib/silk/num/f32.silk),
 floating-point tests,
 pinned native arithmetic corpus.
 
@@ -653,7 +653,7 @@ be inferred from representation.
 current operator diagnostic model.
 
 **Evidence:** [scalar catalog](../bootstrap/packages/compiler/src/Scalar.ts),
-[character actor](../stdlib/silk/char.silk),
+[character actor](../stdlib/silk/text/char.silk),
 string equality tests,
 character tests.
 
@@ -1138,8 +1138,8 @@ domain-specific named conversion without changing the language rule.
 functions use the ordinary actor-operation diagnostic.
 
 **Evidence:** [narrow compatibility](values-and-types.md#type-003--compatibility-is-exact-except-for-closed-named-relations),
-[integer actor modules](../stdlib/silk/i32.silk),
-[floating actor modules](../stdlib/silk/f64.silk),
+[integer actor modules](../stdlib/silk/num/i32.silk),
+[floating actor modules](../stdlib/silk/num/f64.silk),
 [scalar enum representation access](values-and-types.md#enum-004--enumvalue-exposes-the-backing-integer-in-one-direction).
 
 ### CONV-002 — Integer conversion chooses trapping or checked range handling explicitly
@@ -1175,7 +1175,7 @@ conversion operation. A checked conversion returns `Option<X>.None` rather than 
 typed failure.
 
 **Evidence:** integer scalar specification,
-[integer conversion APIs](../stdlib/silk/i64.silk),
+[integer conversion APIs](../stdlib/silk/num/i64.silk),
 integer scalar tests.
 
 ### CONV-003 — Floating conversion states its rounding and trap boundary
@@ -1206,7 +1206,7 @@ source provenance. An unavailable conversion name or wrong source type uses the 
 diagnostic.
 
 **Evidence:** floating scalar specification,
-[floating conversion APIs](../stdlib/silk/f64.silk),
+[floating conversion APIs](../stdlib/silk/num/f64.silk),
 floating-point tests.
 
 ### CONV-004 — Bit reinterpretation is distinct from numeric conversion
@@ -1233,5 +1233,5 @@ No ordinary operator performs bit reinterpretation implicitly.
 Incorrect widths or operand types use the ordinary call type diagnostic.
 
 **Evidence:** floating representation specification,
-[floating actor modules](../stdlib/silk/f64.silk),
+[floating actor modules](../stdlib/silk/num/f64.silk),
 floating representation tests.

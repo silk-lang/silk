@@ -233,7 +233,7 @@ baseline. x86-64 also admits the microarchitecture levels `x86-64-v2` (`cx16`, `
 `avx512vl`). A model other than the default is passed to Clang for tuning.
 
 In a manifest profile, `cpu.model = "native"` asks the machine that runs the compiler, through
-`silk.cpu`, and adds each catalog feature it has to `cpu.features`; the model stays the default.
+`silk.simd.cpu`, and adds each catalog feature it has to `cpu.features`; the model stays the default.
 The frozen profile therefore names a concrete feature list, and two machines with the same
 features share caches. Only the compiler's own target can be native; another target with
 `native` is an unsupported combination of `cpu.model`. `InitialProfile.freeze` itself never

@@ -1,0 +1,346 @@
+//! A native `TrustSource` provider that loads trust anchors from one PEM file.
+//!
+//! # When to use
+//! Provide [`NativeFileTrustSource`] for `TrustSource` when your program uses one PEM bundle of CA
+//! certificates, for example `/etc/ssl/certs/ca-certificates.crt` on Debian or `/etc/ssl/cert.pem`
+//! on macOS.
+//!
+//! # Details
+//! [`NativeFileTrustSource.make`] copies the root directory and the path. It does no I/O. Each
+//! `load` opens the file again, reads at most the input limit, closes it, and decodes it with
+//! `TrustSnapshot.fromAnnotatedPem`. Text outside the certificate blocks is allowed. A bad block
+//! fails the load. Each snapshot owns its anchors.
+//!
+//! The path is opened below the root without following symbolic links, as in
+//! `silk.platform.native.filesystem`. Trust the root and its parent directories. To change the file, write a
+//! new file and rename it. A change in place can be read half way.
+//!
+//! # Errors
+//! `TrustSourceError` for bad configuration, a file error, a file over the input limit, or bad PEM.
+//! `OutOfMemoryError` if the allocation fails.
+//!
+//! # Gotchas
+//! - It does not look for a default file, read environment variables, or use the trust store of the
+//!   system (such as the macOS keychain). It does not check revocation.
+//! - The provider exists only on Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+//!
+//! # Examples
+//! ## Configure a bundle and see a load fail
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.core.result { Result }
+//! import silk.system.filesystem { FileError, Path }
+//! import silk.tls.trust_source_native { NativeFileTrustSource }
+//! import silk.tls.trust_snapshot { TrustLoadLimits, TrustSourceError }
+//! import silk.tls.trust_source { TrustSource }
+//!
+//! effect fn program() -> i32
+//!   ! FileError | TrustSourceError | OutOfMemoryError
+//!   ? &mut Allocator {
+//!   // On Debian, the bundle is /etc/ssl/certs/ca-certificates.crt. On macOS, /etc/ssl/cert.pem.
+//!   let bundle = run Path.fromBytes(b"/ca-certificates.crt")
+//!   let debian = run NativeFileTrustSource.make(b"/etc/ssl/certs", &bundle)
+//!   drop debian
+//!
+//!   // `make` does no I/O. A missing file fails at `load`.
+//!   let missing = run Path.fromBytes(b"/silk-doc-missing.pem")
+//!   let mut source = run NativeFileTrustSource.make(b"/tmp", &missing)
+//!   let loaded = run Effect.result(TrustSource.load(TrustLoadLimits.defaults()))
+//!     |> Effect.provideMut<TrustSource>(&mut source)
+//!   return match move loaded {
+//!     Result.Success { value: _ } => 1
+//!     Result.Failure { error: failure } => match move failure {
+//!       TrustSourceError.File { operation: _, error: cause } => {
+//!         drop cause
+//!         return 0
+//!       }
+//!       _ => 1
+//!     }
+//!   }
+//! }
+//!
+//! effect fn failed<E>(error: E) -> i32 {
+//!   drop error
+//!   return 1
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   return run Effect.catchAll(program(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+//! }
+//! ```
+//!
+//! @category TLS and certificates
+
+static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArchitecture() == "aarch64" && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+  import silk.mem.allocator {Allocator, OutOfMemoryError}
+  import silk.collections.bytes {Bytes}
+  import silk.core.effect {Effect}
+  import silk.system.filesystem {FileError, FileSystem, Path}
+  import silk.platform.native.filesystem {FileHandle, NativeFileSystem}
+  import silk.option {Option}
+  import silk.core.result {Result}
+  import silk.collections.slice {Slice}
+  import silk.tls.trust_snapshot {
+    TrustConfigurationReason,
+    TrustFileOperation,
+    TrustLimitKind,
+    TrustLoadLimits,
+    TrustSnapshot,
+    TrustSourceError,
+  }
+  import silk.tls.trust_source {TrustSource}
+  import silk.num.u8
+  import silk.num.usize
+
+  const CONFIGURATION_BYTES: usize = 4096
+  const READ_BYTES: usize = 4096
+
+  /// A `TrustSource` provider that owns a root directory and a path to a PEM file below it. It does
+  /// not cache snapshots.
+  ///
+  /// # When to use
+  /// Provide it for `TrustSource` when your program uses one PEM bundle of CA certificates, for
+  /// example `/etc/ssl/certs/ca-certificates.crt` on Debian or `/etc/ssl/cert.pem` on macOS.
+  ///
+  /// # Details
+  /// Each `load` opens the file again, reads at most the input limit, closes it, and decodes it
+  /// with `TrustSnapshot.fromAnnotatedPem`. Text outside the certificate blocks is allowed. A bad
+  /// block fails the load. Each snapshot owns its anchors. The path is opened below the root
+  /// without following symbolic links. Trust the root and its parent directories. To change the
+  /// file, write a new file and rename it. A change in place can be read half way.
+  ///
+  /// # Gotchas
+  /// - It does not look for a default file, read environment variables, or use the trust store of
+  ///   the system (such as the macOS keychain). It does not check revocation.
+  /// - The provider exists only on Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+  pub struct NativeFileTrustSource {
+    root: Bytes,
+    path: Path,
+  }
+
+  impl NativeFileTrustSource {
+    /// Returns a provider for the PEM file at `path` below `root`. It does no I/O.
+    ///
+    /// # Errors
+    /// - `TrustSourceError` with `InvalidConfiguration` if `root` is empty, is not absolute, or has
+    ///   NUL, or if `root` and `path` together have more than 4096 bytes.
+    /// - `OutOfMemoryError` if the copies cannot be allocated.
+    pub effect fn make(
+      root: &[u8],
+      path: &Path,
+    ) -> NativeFileTrustSource
+    ! TrustSourceError | OutOfMemoryError
+    ? &mut Allocator {
+      if root.length == usize.ZERO {
+        return run rejectConfiguration(TrustConfigurationReason.EmptyRoot)
+      }
+      if root[usize.ZERO] != u8.toU8(47) {
+        return run rejectConfiguration(TrustConfigurationReason.NonAbsoluteRoot)
+      }
+      let mut index = usize.ZERO
+      while index < root.length {
+        if root[index] == u8.toU8(0) {
+          return run rejectConfiguration(TrustConfigurationReason.NulRoot)
+        }
+        index = index + usize.ONE
+      }
+      let pathBytes = Path.rawBytes(path)
+      let combined = match move usize.checkedAdd(root.length, pathBytes.length) {
+        Option<usize>.Some {value} => value
+        Option<usize>.None => {
+          return run rejectConfiguration(TrustConfigurationReason.PathBytes)
+        }
+      }
+      if combined > CONFIGURATION_BYTES {
+        return run rejectConfiguration(TrustConfigurationReason.PathBytes)
+      }
+      let ownedRoot = run Bytes.copy(root)
+      let copiedPath = run Effect.result(Path.fromBytes(pathBytes))
+      let ownedPath = match move copiedPath {
+        Result<Path, FileError | OutOfMemoryError>.Success {value} => move value
+        Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+          FileError invalid => {
+            return run rejectConfiguration(TrustConfigurationReason.PathBytes)
+          }
+          OutOfMemoryError exhausted => { return run rerouteOutOfMemory(move exhausted) }
+        }
+      }
+      return NativeFileTrustSource {root: move ownedRoot, path: move ownedPath}
+    }
+
+    effect fn loadCurrent(
+      self: &mut Self,
+      limits: TrustLoadLimits,
+    ) -> TrustSnapshot
+    ! TrustSourceError | OutOfMemoryError
+    ? &mut Allocator {
+      let handle = run openConfigured(&self.*)
+      let mut active = move handle
+      let acquired = run Effect.result(readBounded(&mut active, limits.decode.inputBytes))
+      let closed = run Effect.result(
+        NativeFileSystem.closeFile(move active, FileSystem.readFileOperation()),
+      )
+      let input = match move acquired {
+        Result<Bytes, TrustSourceError | OutOfMemoryError>.Success {value} => match move closed {
+          Result<(), FileError>.Success {value: completed} => move value
+          Result<(), FileError>.Failure {error} => {
+            return run discardThenRejectClose(move value, move error)
+          }
+        }
+        Result<Bytes, TrustSourceError | OutOfMemoryError>.Failure {error} => match move error {
+          TrustSourceError primary => {
+            return run preserveTrustSource(move primary, move closed)
+          }
+          OutOfMemoryError exhausted => {
+            return run preserveOutOfMemory(move exhausted, move closed)
+          }
+        }
+      }
+      let decoded = run TrustSnapshot.fromAnnotatedPem(Bytes.asSlice(&input), limits)
+      return match move decoded {
+        Result<TrustSnapshot, TrustSourceError>.Success {value} => move value
+        Result<TrustSnapshot, TrustSourceError>.Failure {error} => {
+          return run rerouteTrustSource(move error)
+        }
+      }
+    }
+  }
+
+  impl TrustSource for NativeFileTrustSource {
+    load: NativeFileTrustSource.loadCurrent
+  }
+
+  effect fn openConfigured(
+    source: &NativeFileTrustSource,
+  ) -> FileHandle ! TrustSourceError {
+    let opened = run Effect.result(
+      NativeFileSystem.openFile(
+        Bytes.asSlice(&source.root),
+        Path.rawBytes(&source.path),
+        false,
+        FileSystem.operationCode(FileSystem.readFileOperation()),
+      ),
+    )
+    return match move opened {
+      Result<FileHandle, FileError>.Success {value} => move value
+      Result<FileHandle, FileError>.Failure {error} => {
+        return run rejectFile(TrustFileOperation.Open, move error)
+      }
+    }
+  }
+
+  effect fn readBounded(
+    handle: &mut FileHandle,
+    limit: usize,
+  ) -> Bytes
+  ! TrustSourceError | OutOfMemoryError
+  ? &mut Allocator {
+    let mut output = Bytes.make()
+    let mut remaining = limit
+    if remaining > usize.ZERO {
+      let mut scratch = run Bytes.zeroed(READ_BYTES)
+      let mut complete = false
+      while remaining > usize.ZERO && !complete {
+        if remaining < Bytes.length(&scratch) {
+          Bytes.truncate(&mut scratch, remaining)
+        }
+        let read = run Effect.result(
+          NativeFileSystem.readFile(
+            &mut handle,
+            Bytes.asMutSlice(&mut scratch),
+            FileSystem.operationCode(FileSystem.readFileOperation()),
+          ),
+        )
+        let count = match move read {
+          Result<usize, FileError>.Success {value} => value
+          Result<usize, FileError>.Failure {error} => {
+            return run rejectFile(TrustFileOperation.Read, move error)
+          }
+        }
+        if count == usize.ZERO {
+          complete = true
+        } else {
+          let initialized = Slice.view<u8>(Bytes.asSlice(&scratch), usize.ZERO, count)
+          run Bytes.append(&mut output, initialized)
+          remaining = remaining - count
+        }
+      }
+      if complete { return move output }
+    }
+    let mut probe: [u8; 1] = [0]
+    let probed = run Effect.result(
+      NativeFileSystem.readFile(
+        &mut handle,
+        &mut probe,
+        FileSystem.operationCode(FileSystem.readFileOperation()),
+      ),
+    )
+    let count = match move probed {
+      Result<usize, FileError>.Success {value} => value
+      Result<usize, FileError>.Failure {error} => {
+        return run rejectFile(TrustFileOperation.Read, move error)
+      }
+    }
+    if count == usize.ZERO { return move output }
+    return run rejectInputLimit(move output, limit)
+  }
+
+  effect fn rejectConfiguration(
+    reason: TrustConfigurationReason,
+  ) -> never ! TrustSourceError {
+    fail TrustSourceError.InvalidConfiguration {reason: move reason}
+  }
+
+  effect fn rejectFile(
+    operation: TrustFileOperation,
+    error: FileError,
+  ) -> never ! TrustSourceError {
+    fail TrustSourceError.File {operation: move operation, error: move error}
+  }
+
+  effect fn rejectInputLimit(value: Bytes, limit: usize) -> never ! TrustSourceError {
+    drop value
+    fail TrustSourceError.LimitExceeded {kind: TrustLimitKind.InputBytes, limit: limit}
+  }
+
+  effect fn discardThenRejectClose(
+    value: Bytes,
+    error: FileError,
+  ) -> never ! TrustSourceError {
+    drop value
+    return run rejectFile(TrustFileOperation.Close, move error)
+  }
+
+  fn ignoreClose(closed: Result<(), FileError>) -> () {
+    return match move closed {
+      Result<(), FileError>.Success {value: completed} => ()
+      Result<(), FileError>.Failure {error: failure} => ()
+    }
+  }
+
+  effect fn preserveTrustSource(
+    error: TrustSourceError,
+    closed: Result<(), FileError>,
+  ) -> never ! TrustSourceError {
+    let ignored = ignoreClose(move closed)
+    fail move error
+  }
+
+  effect fn preserveOutOfMemory(
+    error: OutOfMemoryError,
+    closed: Result<(), FileError>,
+  ) -> never ! OutOfMemoryError {
+    let ignored = ignoreClose(move closed)
+    fail move error
+  }
+
+  effect fn rerouteTrustSource(error: TrustSourceError) -> never ! TrustSourceError {
+    fail move error
+  }
+
+  effect fn rerouteOutOfMemory(error: OutOfMemoryError) -> never ! OutOfMemoryError {
+    fail move error
+  }
+}

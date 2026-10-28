@@ -1,16 +1,16 @@
 # HTTP head parsing and serialization
 
 Import the incremental parsers, borrowed heads, limits, and memory serializers from
-`silk.http_head`. The module parses exactly one strict HTTP/1.0 or HTTP/1.1 request or response
+`silk.http.head`. The module parses exactly one strict HTTP/1.0 or HTTP/1.1 request or response
 head. It stops at the terminating empty line; body bytes, a pipelined message, and all transport
 state remain with the caller.
 
 ```silk
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
-import silk.http_head { Limits, ParseError, Progress, ProgressState, RequestParser }
-import silk.http_headers { Limits as ValueLimits }
-import silk.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.http.head { Limits, ParseError, Progress, ProgressState, RequestParser }
+import silk.http.headers { Limits as ValueLimits }
+import silk.core.result { Result }
 
 effect fn parse() -> i32 ! OutOfMemoryError ? &mut Allocator {
   let limits = Limits {
@@ -107,7 +107,7 @@ separate `OutOfMemoryError` channel, and transport failures are not parser error
 
 ## Atomic memory serialization
 
-`requestSerializedSize` and `responseSerializedSize` validate a shared `silk.http` head and calculate
+`requestSerializedSize` and `responseSerializedSize` validate a shared `silk.http.message` head and calculate
 its exact canonical size with checked arithmetic. `writeRequestInto` and `writeResponseInto` perform
 that entire pass before their first write. They emit one SP between start-line components, `: ` for
 each ordered field, CRLF for every line, and one terminating empty line. Responses always retain the
@@ -127,5 +127,5 @@ content decoding, transport reads and writes, proxy policy, and HTTP client/serv
 belong to their respective actors.
 
 The implementation and portable acceptance evidence live in
-[`http_head.silk`](../stdlib/silk/http_head.silk) and
+[`http_head.silk`](../stdlib/silk/http/head.silk) and
 `httpHeadAcceptance.ts`.

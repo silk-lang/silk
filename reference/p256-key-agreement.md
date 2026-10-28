@@ -1,6 +1,6 @@
 # P-256 key agreement
 
-`silk.p256 { P256, P256Error }` owns bounded secp256r1 arithmetic and an ephemeral scalar.
+`silk.crypto.p256 { P256, P256Error }` owns bounded secp256r1 arithmetic and an ephemeral scalar.
 `P256.fromBytes(bytes)` admits exactly 32 big-endian bytes representing an integer in 1 through
 n−1. The returned scalar has private storage and does not implement `Copy`. `publicKey()` borrows
 it and returns 65 bytes: `0x04 || x || y`, with two 32-byte big-endian coordinates.

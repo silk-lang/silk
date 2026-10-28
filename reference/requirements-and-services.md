@@ -692,7 +692,7 @@ type does not conform to `K` reports the ordinary conformance mismatch at the ac
 **Current standard library:** `Effect.provideEffect` uses the access-independent service-role
 selector `K`. No compatibility alias is retained in this green-field codebase.
 
-**Evidence:** [current Effect standard library](../stdlib/silk/effect.silk),
+**Evidence:** [current Effect standard library](../stdlib/silk/core/effect.silk),
 provider elaboration tests.
 
 ## SERV-011 — `&Option<&S>` is an optional service

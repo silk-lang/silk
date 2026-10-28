@@ -58,7 +58,7 @@ specializations include ordinary helper calls and selected provider implementati
 generic executable conservatively retains the modes permitted by its declared exact bound, while an
 unavailable executable remains unavailable rather than being reported as direct.
 
-This is a target-neutral semantic substrate. The ordinary `silk.execution` module supplies safe
+This is a target-neutral semantic substrate. The ordinary `silk.concurrency.execution` module supplies safe
 construction, drive, and park operations over sealed compiler identities. An explicit `Execution`
 construction is the propagation delimiter. Its erased body keeps its complete summary. An ordinary
 owner-side drive caller does not inherit the body's `ExternalPark` mode.
@@ -79,7 +79,7 @@ capture/provider or reachability path.
 identity. Its compiler-owned activation lifecycle is `Unstarted`, `Running`, `Relinquished`,
 `Completed`, and `Destroyed`; these are semantic states, not a promised backend tag layout. The
 source readiness phases `Initial`, `InitialReady`, `Dormant`, and `Eligible` are ordinary
-`silk.execution` policy over a package control word (EXEC-009). The owner may drive only `Initial`,
+`silk.concurrency.execution` policy over a package control word (EXEC-009). The owner may drive only `Initial`,
 `InitialReady`, or `Eligible`, and driving a registering or dormant execution is a fatal state
 trap. Execution-internal stable loans may cross
 parking, but construction cannot retain caller loans and completion cannot return a loan into
@@ -110,8 +110,8 @@ Signaling or dropping the cancelled Wake releases the final package authority an
 readiness.
 
 Schedulers, deferred values, timers, coroutine ports, ready queues, and cancellation policies are
-ordinary source actors built over this narrow seam. The shipped `silk.scheduler`, `silk.fiber`, and
-`silk.local_scheduler` modules follow this rule: the language does not select those actors, and the
+ordinary source actors built over this narrow seam. The shipped `silk.concurrency.scheduler`, `silk.concurrency.fiber`, and
+`silk.concurrency.local_scheduler` modules follow this rule: the language does not select those actors, and the
 compiler does not recognize their source names.
 
 ## Public contract and recursion
@@ -274,7 +274,7 @@ consumed after frame cleanup on completion or cancellation. An unstarted Executi
 acquires no state. A retained Wake cannot keep canceled frame storage alive.
 
 The hosted default owns an explicitly unlimited per-instance policy in
-`silk/execution_storage`; there is no environment-variable limit or thread-local
+`silk/concurrency/execution_storage`; there is no environment-variable limit or thread-local
 accounting. A custom provider chooses its own finite capacity and returns null on
 state or frame refusal. The compiler translates that refusal to the existing fatal
 exhaustion path. This contract is shared by native and LLVM-to-Wasm lowering.

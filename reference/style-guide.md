@@ -89,7 +89,7 @@ callable waiting for that receiver. This is not special treatment for Effect API
 is an inherent member of the `Effect` struct and has the same shape:
 
 ```silk
-import silk.effect { Effect }
+import silk.core.effect { Effect }
 
 let specialized = Effect.provide(computation, &clock)
 let piped = computation |> Effect.provide(&clock)
@@ -178,15 +178,15 @@ exposes exactly the type's associated items—variants, contract operations, and
 one import names both the type and its operations:
 
 ```silk
-import silk.effect { Effect }
+import silk.core.effect { Effect }
 
 let provided = computation |> Effect.provide(&clock)
 return run provided
 ```
 
 Import a module namespace when the module itself is the subject being taught, or when the operation
-is a root declaration with no owner type, as in the primitive namespaces `silk.i32` and
-`silk.usize`. A namespace binding exposes only root declarations and never reaches an inherent
+is a root declaration with no owner type, as in the primitive namespaces `silk.num.i32` and
+`silk.num.usize`. A namespace binding exposes only root declarations and never reaches an inherent
 member, so `import silk.option` followed by `option.map(...)` is not a
 substitute for the owner import. Select a root declaration directly when an example reads it
 unqualified or when repeated qualification would obscure the example's actual point; an inherent
@@ -202,8 +202,8 @@ fn id(user: &User) -> i32 {
 
 Use canonical names without aliases. Standard-library operation modules provide a public owner,
 using a zero-data scope struct when there is no principal data type. Import that owner selectively,
-for example `import silk.static_sequence { StaticSequence }` or `import silk.pointer { Pointer }`.
-Primitive modules keep their lowercase names: `import silk.usize` makes `usize.ZERO` available.
+for example `import silk.core.static_sequence { StaticSequence }` or `import silk.mem.pointer { Pointer }`.
+Primitive modules keep their lowercase names: `import silk.num.usize` makes `usize.ZERO` available.
 
 Use an alias only to resolve a real name collision. First consider giving the declarations more
 specific canonical names. When both names must remain, alias one selected type and keep its
