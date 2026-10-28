@@ -568,7 +568,7 @@ const program = Effect.gen(function* () {
     jsonrpc: '2.0',
     id: 2,
     method: 'textDocument/completion',
-    params: { textDocument: { uri: store }, position: { line: 0, character: 20 } },
+    params: { textDocument: { uri: store }, position: { line: 0, character: 32 } },
   })
   const offered = (yield* notificationsUntil(members, 2)).response
   const labels = (offered['result'] as { items: Array<{ label: string }> }).items.map(({ label }) => label)
