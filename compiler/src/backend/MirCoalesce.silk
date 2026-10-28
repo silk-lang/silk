@@ -10,7 +10,8 @@
 //! - A call whose temporary result is only moved or copied whole into the result local, or into
 //!   another temporary, by the first statement of its continuation writes that place directly. The
 //!   place must not be named by the call itself, borrowed anywhere, dropped anywhere, or named on the
-//!   call's failure path.
+//!   call's failure path. A user binding (`x = f()`) may be borrowed elsewhere, as long as no local
+//!   that may hold a loan of it reaches the call.
 //! - An argument that is a temporary snapshot of a place (a local and its constant field or element
 //!   projections), taken in the call's own block with nothing after it touching that local, passes
 //!   the place itself when the local is never borrowed and no block the call can continue to names
@@ -20,7 +21,7 @@
 //!   becomes the result local itself, so it is built in the caller's result storage.
 //!
 //! All keep the invariants `MirVerification.callDestinationsFresh` checks: a destination is still a
-//! whole temporary or the result local, never borrowed, and named by no argument.
+//! whole temporary, user binding or the result local, and named by no argument.
 
 import backend.MirVerification
 import backend.Mir {
@@ -41,6 +42,7 @@ import backend.Mir {
   Statement,
   Terminator,
 }
+import hir.Hir {Access}
 import semantic.Type {Type}
 import semantic.TypedBody {Origin}
 import semantic.Types {Types}
@@ -49,6 +51,7 @@ import silk.box {Box}
 import silk.list {List}
 import silk.option {Option}
 import silk.ownership {Copy}
+import silk.shared {Shared}
 import silk.usize
 
 /// Rewrites `function`'s call results and by-value arguments to skip the temporaries they pass
@@ -313,6 +316,189 @@ effect fn reachedNames(function: &MirFunction, starts: &List<usize>, local: usiz
     run List<usize>.appendSlice(&mut pending, List<usize>.asSlice(&following))
   }
   return false
+}
+
+fn isUser(function: &MirFunction, local: usize) -> bool {
+  return match &List<Local>.asSlice(&function.locals)[local].kind { LocalKind.User {..} => true _ => false }
+}
+
+// Whether a value of `value`'s type can hold a loan: a reference, a view, or a raw address.
+fn holdsLoan(value: &Type) -> bool {
+  if Type.holdsView(value) { return true }
+  return match &value.* {
+    Type.Pointer {..} => true
+    _ => false
+  }
+}
+
+fn localHoldsLoan(function: &MirFunction, local: usize) -> bool {
+  return Shared<Type>.with<bool>(&List<Local>.asSlice(&function.locals)[local].ty, holdsLoan)
+}
+
+fn primitiveLocal(function: &MirFunction, local: usize) -> bool {
+  return Shared<Type>.with<bool>(&List<Local>.asSlice(&function.locals)[local].ty, fn(value: &Type) -> bool {
+    return match &value.* { Type.Primitive {..} => true _ => false }
+  })
+}
+
+// Whether a callee handed `local` could store a loan through it: an exclusive reference or a
+// pointer to storage that can hold one.
+fn storesThrough(value: &Type) -> bool {
+  return match &value.* {
+    Type.Reference {referent, access, ..} => access == Access.Mutable && Shared<Type>.with<bool>(&referent, holdsLoan)
+    Type.Pointer {pointee, ..} => Shared<Type>.with<bool>(&pointee, holdsLoan)
+    _ => false
+  }
+}
+
+// How many times a call's operands (not its destinations) name `local`.
+fn callOperandsName(terminator: &Terminator, local: usize) -> usize {
+  if let Terminator.Call {callee, arguments, providers, diagnostics, ..} = &terminator.* {
+    let mut count = operandsName(&arguments, local) + operandsName(&providers, local) + diagnosticsName(&diagnostics, local)
+    match &callee {
+      Callee.Indirect {address} => { count = count + operandNames(&address, local) }
+      Callee.NativeIndirect {address, ..} => { count = count + operandNames(&address, local) }
+      _ => ()
+    }
+    return count
+  }
+  return usize.ZERO
+}
+
+// Whether a place's projections step through an address, so a write to it lands outside its local.
+fn throughAddress(place: &Place) -> bool {
+  let steps = List<Projection>.asSlice(&place.projections)
+  let mut at = usize.ZERO
+  while at < steps.length {
+    let deref = match &steps[at] { Projection.Deref => true _ => false }
+    if deref { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn anyNamed(tainted: &List<usize>, statement: &Statement) -> bool {
+  let listed = List<usize>.asSlice(tainted)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if statementNames(statement, listed[at]) != usize.ZERO { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn anyCallOperand(tainted: &List<usize>, terminator: &Terminator) -> bool {
+  let listed = List<usize>.asSlice(tainted)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if callOperandsName(terminator, listed[at]) != usize.ZERO { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Whether one of `operands` hands the callee storage it could keep a loan in.
+fn handsStorage(function: &MirFunction, operands: &List<Operand>) -> bool {
+  let locals = List<Local>.asSlice(&function.locals)
+  let listed = List<Operand>.asSlice(operands)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let named = match &listed[at] {
+      Operand.Copy {place} => place.local
+      Operand.Move {place} => place.local
+      _ => usize.MAX
+    }
+    if named != usize.MAX {
+      let whole = wholeLocal(&listed[at]) == named
+      let ty = &locals[named].ty
+      // A part of a local is judged by the whole, which holds the part.
+      if whole && Shared<Type>.with<bool>(ty, storesThrough) { return true }
+      if !whole && Shared<Type>.with<bool>(ty, holdsLoan) { return true }
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+effect fn taint(tainted: &mut List<usize>, local: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let listed = List<usize>.asSlice(&tainted.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if listed[at] == local { return false }
+    at = at + usize.ONE
+  }
+  run List<usize>.append(&mut tainted.*, local)
+  return true
+}
+
+// Whether a loan of the user binding `target` may reach the call ending block `at`, so that call
+// must not write `target` directly: the callee would read the binding through the loan while it
+// writes its result there. Locals that may hold such a loan are followed from each shared or
+// exclusive borrow of `target` through the whole body, ignoring order: a statement naming one
+// taints its destination unless that is a primitive, and a call taints its destination when its
+// type can hold a loan. Taking `target`'s address, writing through an address, or handing a
+// callee a place it could store the loan in gives up.
+effect fn loanReachesCall(function: &MirFunction, target: usize, at: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let locals = List<Local>.asSlice(&function.locals)
+  let mut tainted = List<usize>.make()
+  let mut changed = true
+  while changed {
+    changed = false
+    let mut block = usize.ZERO
+    while block < blocks.length {
+      let statements = List<Statement>.asSlice(&blocks[block].statements)
+      let mut index = usize.ZERO
+      while index < statements.length {
+        let statement = &statements[index]
+        let mut origin = false
+        if let Statement.Assign {value, ..} = &statement.* {
+          match &value {
+            Rvalue.Ref {place, ..} => { if place.local == target { origin = true } }
+            Rvalue.AddressOf {place, ..} => { if place.local == target { return true } }
+            Rvalue.ContextOf {place} => { if place.local == target { return true } }
+            _ => ()
+          }
+        }
+        if origin || anyNamed(&tainted, statement) {
+          match &statement.* {
+            Statement.Assign {destination, value, ..} => {
+              if throughAddress(&destination) { return true }
+              let escapes = match &value {
+                Rvalue.AddressIntegerConversion {..} => true
+                Rvalue.Bitcast {..} => true
+                _ => false
+              }
+              if escapes { return true }
+              if origin || !primitiveLocal(function, destination.local) {
+                if run taint(&mut tainted, destination.local) { changed = true }
+              }
+            }
+            _ => { return true }
+          }
+        }
+        index = index + usize.ONE
+      }
+      let terminator = &blocks[block].terminator
+      if block != at && anyCallOperand(&tainted, terminator) {
+        if let Terminator.Call {arguments, providers, destination, failure, ..} = &terminator.* {
+          if handsStorage(function, &arguments) || handsStorage(function, &providers) { return true }
+          if throughAddress(&destination) { return true }
+          if localHoldsLoan(function, destination.local) {
+            if run taint(&mut tainted, destination.local) { changed = true }
+          }
+          if let Option<FailureEdge>.Some {value: edge} = &failure {
+            if throughAddress(&edge.destination) { return true }
+            if localHoldsLoan(function, edge.destination.local) {
+              if run taint(&mut tainted, edge.destination.local) { changed = true }
+            }
+          }
+        }
+      }
+      block = block + usize.ONE
+    }
+  }
+  return anyCallOperand(&tainted, &blocks[at].terminator)
 }
 
 // Whether `local` is a user binding or temporary.
@@ -721,7 +907,14 @@ effect fn resultCandidate(function: &MirFunction, at: usize) -> usize ! OutOfMem
   if isReturn(function, target) && uses.borrowed && !(run MirVerification.resultBorrowedBefore(function, at)) {
     uses.borrowed = false
   }
-  if !forwardable(function, target, &uses) { return usize.MAX }
+  if isUser(function, target) {
+    // A binding the call overwrites (`x = f()`) may be borrowed elsewhere, as long as no loan of it
+    // can reach the call.
+    if uses.dropped || flagged(function, target) { return usize.MAX }
+    if uses.borrowed && run loanReachesCall(function, target, at) { return usize.MAX }
+  } else if !forwardable(function, target, &uses) {
+    return usize.MAX
+  }
   if terminatorNames(&blocks[at].terminator, target) != usize.ZERO { return usize.MAX }
   // A failed call may leave its destination partly written, so the failure path must not read it.
   if failed != usize.MAX {
