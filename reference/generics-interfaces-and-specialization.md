@@ -1695,7 +1695,7 @@ every member of that block, and each call proves them under the owner applicatio
 it proves the member's own bounds. A type may have several inherent blocks with different bounds.
 
 ```silk,ignore
-import silk.ownership { Copy }
+import silk.core.ownership { Copy }
 import silk.ops { Add, Multiply }
 
 struct Vector2<T> { x: T, y: T }
