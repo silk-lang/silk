@@ -1098,14 +1098,42 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, units: &[CodegenUnit], packs: 
     run ChildProcess.addArgumentBytes(&mut process, Bytes.asSlice(&shared[flag]))
     flag = flag + usize.ONE
   }
+  // A Linux executable links with the lld installed beside Clang when there is one: it links the
+  // compiler in a third of the time the system linker takes.
+  let mut supplied = false
+  if let Option<Supply>.Some {value: selected} = &supply.* {
+    if let Option<Path>.Some {..} = &selected.linker { supplied = true }
+  }
+  let lld = linked && !freestanding && !supplied && same(Target.operatingSystem(target), b"linux")
+  // Clang's version is asked once: it stamps a split build's objects, and it names where Clang is
+  // installed.
+  let mut probed = Option<Bytes>.none()
+  if units.length > usize.ZERO || lld {
+    match move run probeClang(&clang, origin, &mut progress.*) {
+      ClangVersion.Answered {output: answer} => { probed = Option<Bytes>.some(move answer) }
+      ClangVersion.Failed {status} => { return status }
+    }
+  }
+  if lld {
+    if let Option<Bytes>.Some {value: answer} = &probed {
+      if let Option<Bytes>.Some {value: linker} = move run installedLld(Bytes.asSlice(&answer)) {
+        let mut ldPath = run Bytes.copy(b"--ld-path=")
+        run Bytes.append(&mut ldPath, Bytes.asSlice(&linker))
+        run ChildProcess.addArgumentBytes(&mut process, Bytes.asSlice(&ldPath))
+      }
+    }
+  }
   // A split build links the cached object of each codegen unit instead of compiling the module.
   let mut objects = List<Path>.make()
-  if units.length > usize.ZERO {
-    objects = match move run compileUnits(scratch, &clang, origin, shared, units, packs, output, &mut progress.*) {
-      UnitBuild.Objects {paths} => move paths
-      UnitBuild.Failed {status} => { return status }
+  if let Option<Bytes>.Some {value: answer} = &probed {
+    if units.length > usize.ZERO {
+      objects = match move run compileUnits(scratch, &clang, origin, Bytes.asSlice(&answer), shared, units, packs, output, &mut progress.*) {
+        UnitBuild.Objects {paths} => move paths
+        UnitBuild.Failed {status} => { return status }
+      }
     }
-  } else {
+  }
+  if units.length == usize.ZERO {
     run ChildProcess.addArgument(&mut process, "-x")
     run ChildProcess.addArgument(&mut process, "ir")
     run ChildProcess.addArgumentBytes(&mut process, Bytes.asSlice(&intermediate))
@@ -1189,7 +1217,9 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, units: &[CodegenUnit], packs: 
     if stamped && run CodegenCache.linkedBy(&unitDirectory, Bytes.asSlice(&command), output) { return 0 }
     run CodegenCache.forgetLink(&unitDirectory)
     if units.length == usize.ZERO {
-      if let ClangVersion.Failed {status} = run probeClang(&clang, origin, &mut progress.*) { return status }
+      if let Option<Bytes>.None = &probed {
+        if let ClangVersion.Failed {status} = run probeClang(&clang, origin, &mut progress.*) { return status }
+      }
       let bitcode = run Bitcode.compileProgram(Bytes.asSlice(ir))
       run FileSystem.writeFile(&resource.*, Bytes.asSlice(&bitcode))
     }
@@ -1306,6 +1336,41 @@ union UnitBuild {
   Failed {status: i32},
 }
 
+// The `ld.lld` in the directory Clang's `--version` output names as its installation, when it is
+// there.
+effect fn installedLld(version: &[u8]) -> Option<Bytes> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let label = b"InstalledDir: "
+  let mut start = usize.ZERO
+  while start < version.length {
+    let mut end = start
+    while end < version.length && version[end] != 10 { end = end + usize.ONE }
+    let line = Slice.view<u8>(version, start, end - start)
+    if line.length > label.length && same(Slice.view<u8>(line, usize.ZERO, label.length), label) {
+      let mut linker = run Bytes.copy(Slice.view<u8>(line, label.length, line.length - label.length))
+      run Bytes.append(&mut linker, b"/ld.lld")
+      let path = match move run Effect.result(Path.fromBytes(Bytes.asSlice(&linker))) {
+        Result<Path, FileError | OutOfMemoryError>.Success {value} => move value
+        Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+          FileError failure => {
+            drop failure
+            return Option<Bytes>.none()
+          }
+          OutOfMemoryError exhausted => { fail move exhausted }
+        }
+      }
+      let mut found = false
+      match move run Effect.result(FileSystem.exists(&path)) {
+        Result<bool, FileError>.Success {value} => { found = value }
+        Result<bool, FileError>.Failure {error} => { drop error }
+      }
+      if !found { return Option<Bytes>.none() }
+      return Option<Bytes>.some(move linker)
+    }
+    start = end + usize.ONE
+  }
+  return Option<Bytes>.none()
+}
+
 // Clang's `--version` output, or the status of a build that cannot use it after writing why.
 union ClangVersion {
   Answered {output: Bytes},
@@ -1363,19 +1428,16 @@ effect fn unstartedClang(clang: &Path, origin: &[u8], progress: &mut Progress) -
 // Compiles each codegen unit whose object the cache beside `output` lacks, on worker threads, with
 // its IR in `scratch`, and answers every unit's object. `origin` says where `clang` came from, for
 // the error when it cannot start.
-effect fn compileUnits(scratch: &Path, clang: &Path, origin: &[u8], common: &[Bytes], units: &[CodegenUnit], packs: &[BuildRecord.PackBody],
+effect fn compileUnits(scratch: &Path, clang: &Path, origin: &[u8], probed: &[u8], common: &[Bytes], units: &[CodegenUnit],
+  packs: &[BuildRecord.PackBody],
   output: &Path,
   progress: &mut Progress) -> UnitBuild
 ! FileError | ProcessError | HostInputError | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
   // An object is reused only for the same Clang, flags and unit text.
-  let probed = match move run probeClang(clang, origin, &mut progress.*) {
-    ClangVersion.Answered {output: answer} => move answer
-    ClangVersion.Failed {status} => { return UnitBuild.Failed {status: status} }
-  }
   let mut identity = run Bytes.copy(Path.rawBytes(clang))
   run Bytes.append(&mut identity, b"\n")
-  run Bytes.append(&mut identity, Bytes.asSlice(&probed))
+  run Bytes.append(&mut identity, probed)
   let mut at = usize.ZERO
   while at < common.length {
     run Bytes.append(&mut identity, b"\n")
@@ -1976,7 +2038,7 @@ effect fn appendDecimal(text: &mut Bytes, value: usize) -> () ! OutOfMemoryError
   return run Bytes.append(&mut text.*, &[usize.toU8(48 + usize.remainder(value, 10))])
 }
 
-effect fn build(sourcePath: &Path, manifest: Option<&Path>, cacheDirectory: Option<&Path>, output: &Path, display: &Path, form: Form, stage: Stage, standardLibrary: Option<Path>, profile: InitialProfile, maxMemory: Option<usize>, bindings: List<Supplied>, supplyRequest: &SupplyRequest, testing: bool, stats: bool, clang: &Option<Bytes>, heading: &Option<Bytes>, alias: Option<&[u8]>, abandon: bool, progress: &mut Progress) -> Compiled
+effect fn build(sourcePath: &Path, manifest: Option<&Path>, cacheDirectory: Option<&Path>, output: &Path, display: &Path, form: Form, stage: Stage, standardLibrary: Option<Path>, profile: InitialProfile, maxMemory: Option<usize>, bindings: List<Supplied>, supplyRequest: &SupplyRequest, testing: bool, stats: bool, clang: &Option<Bytes>, heading: &Option<Bytes>, alias: Option<&[u8]>, knownCompiler: Option<Bytes>, abandon: bool, progress: &mut Progress) -> Compiled
 ! ApplicationError | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
   let zone = Profiler.zone(b"build")
@@ -2043,8 +2105,13 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, cacheDirectory: Opti
   // A project build checks on a revisable store that reads and writes the cache file `silk check`
   // keeps for the same target and profile, so an unchanged module's checks are reused and the
   // last build's record replays (see `Semantic.replayBuild`).
-  let mut compiler = Option<Bytes>.none()
-  if let Option<&Path>.Some {..} = &cacheDirectory { compiler = run CacheStamp.compiler() }
+  // The compiler's identity, read once: a caller that already read it passes it as `knownCompiler`.
+  let mut compiler = move knownCompiler
+  if let Option<&Path>.Some {..} = &cacheDirectory {
+    if let Option<Bytes>.None = &compiler { compiler = run CacheStamp.compiler() }
+  } else {
+    compiler = Option<Bytes>.none()
+  }
   let mut revisable = false
   if let Option<Bytes>.Some {..} = &compiler { revisable = true }
   let mut imports = Option<&Path>.none()
@@ -2094,9 +2161,12 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, cacheDirectory: Opti
   // A copy of the process writes the image while the units compile and link, and the build
   // returns without waiting for it.
   if let Option<CacheFile>.Some {value: file} = &cache {
-    if let BackendBuild.Module {units, ..} = &compiled { run SemanticCache.storePacks(&file, List<CodegenUnit>.asSlice(&units)) }
-    run SemanticCache.saveDetached(&mut store, &file)
-    if let BackendBuild.Module {units, ..} = &compiled { run SemanticCache.prunePacks(&file, List<CodegenUnit>.asSlice(&units)) }
+    let mut built = Option<&[CodegenUnit]>.none()
+    if let BackendBuild.Module {units, ..} = &compiled {
+      run SemanticCache.storePacks(&file, List<CodegenUnit>.asSlice(&units))
+      built = Option<&[CodegenUnit]>.some(List<CodegenUnit>.asSlice(&units))
+    }
+    run SemanticCache.saveDetached(&mut store, &file, move built)
     if let Option<&Path>.Some {value: directory} = &cacheDirectory { run saveParsed(directory, &sources, &store) }
   }
   let packs = run Semantic.takePacks(&mut store)
@@ -2231,6 +2301,12 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, cacheDirectory: Opti
       if status == 0 {
         if receipts { run reportCompiled(display, sourcePath, output, &target, EmissionPlan.symbolCount(&plan)) }
       }
+      // A process about to exit leaves the program's text and plan to the exit, as the store below.
+      if abandon {
+        run abandonValue(move plan)
+        run abandonValue(move text)
+        run abandonValue(move units)
+      }
     }
     BackendBuild.Unsupported {gaps} => {
       // The single-source form keeps the machine record the corpus harness parses.
@@ -2284,6 +2360,8 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, cacheDirectory: Opti
     run abandonValue(move store)
     run abandonValue(move sources)
     run abandonValue(move packs)
+    run abandonValue(move cache)
+    run abandonValue(move request)
     return Compiled.Finished {status: status}
   }
   // The linked runner iterates this same catalog; its identities bind the plan (TEST-004).
@@ -2931,15 +3009,15 @@ effect fn reportRejection(sources: &ModuleSources, diagnostic: &Shared<Rejection
 // for a compiler without an identity or a build with profile bindings, which may hold secrets that
 // must not reach the disk.
 effect fn testBuildKey(kind: &[u8], sourcePath: &Path, manifest: &Option<&Path>, output: &Path, display: &Path, standardLibrary: &Option<Path>,
-  profile: &InitialProfile, bindings: &List<Supplied>, clang: &Option<Bytes>) -> Option<Bytes>
+  profile: &InitialProfile, bindings: &List<Supplied>, clang: &Option<Bytes>, stamped: &Option<Bytes>) -> Option<Bytes>
 ! HostInputError | OutOfMemoryError ? &mut FileSystem | &mut HostInput | &mut Allocator {
   if List<Supplied>.length(bindings) != usize.ZERO { return Option<Bytes>.none() }
-  let compiler = match move run CacheStamp.compiler() {
-    Option<Bytes>.Some {value} => move value
+  let compiler = match &stamped.* {
+    Option<Bytes>.Some {value} => Bytes.asSlice(&value)
     Option<Bytes>.None => { return Option<Bytes>.none() }
   }
   let mut key = run Bytes.copy(kind)
-  run RuntimeEncoding.field(&mut key, Bytes.asSlice(&compiler))
+  run RuntimeEncoding.field(&mut key, compiler)
   let mut identity = Bytes.make()
   run InitialProfile.appendIdentity(profile, &mut identity)
   run RuntimeEncoding.field(&mut key, Bytes.asSlice(&identity))
@@ -3188,7 +3266,8 @@ effect fn test(sourcePath: &Path, manifest: Option<&Path>, output: &Path, displa
   let mut recordBytes = run Bytes.copy(Path.rawBytes(output))
   run Bytes.append(&mut recordBytes, b".inputs")
   let recordPath = run Path.fromBytes(Bytes.asSlice(&recordBytes))
-  let key = run testBuildKey(b"silk-test-runner-1", sourcePath, &manifest, output, display, &standardLibrary, &profile, &bindings, clang)
+  let key = run testBuildKey(b"silk-test-runner-1", sourcePath, &manifest, output, display, &standardLibrary, &profile, &bindings, clang,
+    &run CacheStamp.compiler())
   let mut identities = List<Bytes>.make()
   let mut reused = Option<List<Bytes>>.none()
   if !noCache { reused = run reusedTests(&recordPath, &key, output) }
@@ -3209,7 +3288,7 @@ effect fn test(sourcePath: &Path, manifest: Option<&Path>, output: &Path, displa
     run Bytes.append(&mut mapBytes, b".symbols")
     run BuildInputs.exclude(&mut recorder, &run Path.fromBytes(Bytes.asSlice(&mapBytes)))
     let mut silent = Progress.off()
-    let built = run build(sourcePath, move manifest, Option<&Path>.none(), output, display, Form.Executable, Stage.Final, move standardLibrary, move profile, Option<usize>.none(), move bindings, request, true, false, clang, &Option<Bytes>.none(), Option<&[u8]>.none(), false, &mut silent)
+    let built = run build(sourcePath, move manifest, Option<&Path>.none(), output, display, Form.Executable, Stage.Final, move standardLibrary, move profile, Option<usize>.none(), move bindings, request, true, false, clang, &Option<Bytes>.none(), Option<&[u8]>.none(), Option<Bytes>.none(), false, &mut silent)
       |> Effect.provideMut<FileSystem>(&mut recorder)
     let catalog = match move built {
       Compiled.Finished {status} => { return status }
@@ -3392,7 +3471,7 @@ effect fn buildSource(working: &Path, sourcePath: &Path, output: &Path, stage: O
   }
   let automatic = SupplyRequest.Automatic
   let mut silent = Progress.off()
-  let built = run build(sourcePath, Option<&Path>.none(), Option<&Path>.none(), output, working, form, selected, move standardLibrary, move profile, Option<usize>.none(), List<Supplied>.make(), &automatic, false, stats, clang, &Option<Bytes>.none(), Option<&[u8]>.none(), true, &mut silent)
+  let built = run build(sourcePath, Option<&Path>.none(), Option<&Path>.none(), output, working, form, selected, move standardLibrary, move profile, Option<usize>.none(), List<Supplied>.make(), &automatic, false, stats, clang, &Option<Bytes>.none(), Option<&[u8]>.none(), Option<Bytes>.none(), true, &mut silent)
   return match move built {
     Compiled.Finished {status} => status
     Compiled.Tests {identities} => {
@@ -3918,10 +3997,15 @@ effect fn buildProjectTarget(project: &Project, plan: ProjectPlan, standardLibra
   // build that changes nothing reads its inputs and nothing else (`reusedBuild`).
   let record = run reuseRecordFor(&path)
   let mut key = Option<Bytes>.none()
+  // The compiler's identity, which keys the reuse record and stamps the cache.
+  let mut stamp = Option<Bytes>.none()
+  let mut wanted = form == Form.Executable && stage == Stage.Final
+  if let Option<Path>.Some {..} = &cacheHome { wanted = true }
+  if wanted { stamp = run CacheStamp.compiler() }
   if form == Form.Executable && stage == Stage.Final {
     let manifestPath = Option<&Path>.some(Projects.manifest(project))
     key = run testBuildKey(b"silk-build-1", Projects.entry(project), &manifestPath, &path, Projects.directory(project), standardLibrary, &profile,
-      &bindings, clang)
+      &bindings, clang, &stamp)
     let current = move key
     key = run withMemoryLimit(move current, &maxMemory)
   }
@@ -3939,7 +4023,7 @@ effect fn buildProjectTarget(project: &Project, plan: ProjectPlan, standardLibra
     run BuildInputs.exclude(&mut recorder, &run symbolMapFor(&path))
     run BuildInputs.exclude(&mut recorder, &record)
     built = run build(Projects.entry(project), Option<&Path>.some(Projects.manifest(project)),
-      borrowedPath(&cacheHome), &path, Projects.directory(project), form, stage, move library, move profile, move maxMemory, move bindings, Projects.supply(project), false, false, clang, &heading, Option<&[u8]>.none(), abandon, &mut progress)
+      borrowedPath(&cacheHome), &path, Projects.directory(project), form, stage, move library, move profile, move maxMemory, move bindings, Projects.supply(project), false, false, clang, &heading, Option<&[u8]>.none(), move stamp, abandon, &mut progress)
       |> Effect.provideMut<FileSystem>(&mut recorder)
     let succeeded = match &built {
       Compiled.Finished {status} => status == 0
@@ -5524,7 +5608,7 @@ effect fn runExample(package: &Project, options: &ProjectOptions, host: &[Bytes]
   let library = Option<Path>.some(run Path.fromBytes(Path.rawBytes(libraryRoot)))
   let mut files = run ExampleSources.make(entry, code)
   let mut silent = Progress.off()
-  let built = run build(entry, Option<&Path>.some(Projects.manifest(package)), Option<&Path>.none(), output, Projects.directory(package), Form.Executable, Stage.Final, move library, move profile, move maxMemory, move bindings, Projects.supply(package), false, false, &Option<Bytes>.none(), &Option<Bytes>.none(), Option<&[u8]>.some(alias), false, &mut silent)
+  let built = run build(entry, Option<&Path>.some(Projects.manifest(package)), Option<&Path>.none(), output, Projects.directory(package), Form.Executable, Stage.Final, move library, move profile, move maxMemory, move bindings, Projects.supply(package), false, false, &Option<Bytes>.none(), &Option<Bytes>.none(), Option<&[u8]>.some(alias), Option<Bytes>.none(), false, &mut silent)
     |> Effect.provideMut<FileSystem>(&mut files)
   let status = match move built {
     Compiled.Finished {status} => status
