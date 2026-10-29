@@ -23,7 +23,7 @@ Public declarations: 200.
 
 ```silk
 pub unsafe extern "C" fn io_poll_pollable_ready(p0: u32) -> u32
-    as "silk_wasip2_io_poll_pollable_ready" with Intrinsic.foreign(module: "wasi:io/poll@0.2.12", name: "[method]pollable.ready")
+    as "wasi:io/poll@0.2.12#[method]pollable.ready"
 ```
 
 Calls `wasi:io/poll@0.2.12#[method]pollable.ready` with its canonical ABI.
@@ -35,7 +35,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn io_poll_pollable_block(p0: u32) -> ()
-    as "silk_wasip2_io_poll_pollable_block" with Intrinsic.foreign(module: "wasi:io/poll@0.2.12", name: "[method]pollable.block")
+    as "wasi:io/poll@0.2.12#[method]pollable.block"
 ```
 
 Calls `wasi:io/poll@0.2.12#[method]pollable.block` with its canonical ABI.
@@ -47,7 +47,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn io_poll_poll(p0: u32, p1: u32, p2: u32) -> ()
-    as "silk_wasip2_io_poll_poll" with Intrinsic.foreign(module: "wasi:io/poll@0.2.12", name: "poll")
+    as "wasi:io/poll@0.2.12#poll"
 ```
 
 Calls `wasi:io/poll@0.2.12#poll` with its canonical ABI.
@@ -59,7 +59,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn io_poll_drop_pollable(p0: u32) -> ()
-    as "silk_wasip2_io_poll_drop_pollable" with Intrinsic.foreign(module: "wasi:io/poll@0.2.12", name: "[resource-drop]pollable")
+    as "wasi:io/poll@0.2.12#[resource-drop]pollable"
 ```
 
 Calls `wasi:io/poll@0.2.12#[resource-drop]pollable` with its canonical ABI.
@@ -71,7 +71,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn clocks_monotonic_clock_now() -> u64
-    as "silk_wasip2_clocks_monotonic_clock_now" with Intrinsic.foreign(module: "wasi:clocks/monotonic-clock@0.2.12", name: "now")
+    as "wasi:clocks/monotonic-clock@0.2.12#now"
 ```
 
 Calls `wasi:clocks/monotonic-clock@0.2.12#now` with its canonical ABI.
@@ -83,7 +83,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn clocks_monotonic_clock_resolution() -> u64
-    as "silk_wasip2_clocks_monotonic_clock_resolution" with Intrinsic.foreign(module: "wasi:clocks/monotonic-clock@0.2.12", name: "resolution")
+    as "wasi:clocks/monotonic-clock@0.2.12#resolution"
 ```
 
 Calls `wasi:clocks/monotonic-clock@0.2.12#resolution` with its canonical ABI.
@@ -95,7 +95,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn clocks_monotonic_clock_subscribe_instant(p0: u64) -> u32
-    as "silk_wasip2_clocks_monotonic_clock_subscribe_instant" with Intrinsic.foreign(module: "wasi:clocks/monotonic-clock@0.2.12", name: "subscribe-instant")
+    as "wasi:clocks/monotonic-clock@0.2.12#subscribe-instant"
 ```
 
 Calls `wasi:clocks/monotonic-clock@0.2.12#subscribe-instant` with its canonical ABI.
@@ -107,7 +107,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn clocks_monotonic_clock_subscribe_duration(p0: u64) -> u32
-    as "silk_wasip2_clocks_monotonic_clock_subscribe_duration" with Intrinsic.foreign(module: "wasi:clocks/monotonic-clock@0.2.12", name: "subscribe-duration")
+    as "wasi:clocks/monotonic-clock@0.2.12#subscribe-duration"
 ```
 
 Calls `wasi:clocks/monotonic-clock@0.2.12#subscribe-duration` with its canonical ABI.
@@ -119,7 +119,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn io_error_error_to_debug_string(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_io_error_error_to_debug_string" with Intrinsic.foreign(module: "wasi:io/error@0.2.12", name: "[method]error.to-debug-string")
+    as "wasi:io/error@0.2.12#[method]error.to-debug-string"
 ```
 
 Calls `wasi:io/error@0.2.12#[method]error.to-debug-string` with its canonical ABI.
@@ -131,7 +131,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn io_error_drop_error(p0: u32) -> ()
-    as "silk_wasip2_io_error_drop_error" with Intrinsic.foreign(module: "wasi:io/error@0.2.12", name: "[resource-drop]error")
+    as "wasi:io/error@0.2.12#[resource-drop]error"
 ```
 
 Calls `wasi:io/error@0.2.12#[resource-drop]error` with its canonical ABI.
@@ -143,7 +143,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn io_streams_input_stream_read(p0: u32, p1: u64, p2: u32) -> ()
-    as "silk_wasip2_io_streams_input_stream_read" with Intrinsic.foreign(module: "wasi:io/streams@0.2.12", name: "[method]input-stream.read")
+    as "wasi:io/streams@0.2.12#[method]input-stream.read"
 ```
 
 Calls `wasi:io/streams@0.2.12#[method]input-stream.read` with its canonical ABI.
@@ -155,7 +155,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn io_streams_input_stream_blocking_read(p0: u32, p1: u64, p2: u32) -> ()
-    as "silk_wasip2_io_streams_input_stream_blocking_read" with Intrinsic.foreign(module: "wasi:io/streams@0.2.12", name: "[method]input-stream.blocking-read")
+    as "wasi:io/streams@0.2.12#[method]input-stream.blocking-read"
 ```
 
 Calls `wasi:io/streams@0.2.12#[method]input-stream.blocking-read` with its canonical ABI.
@@ -167,7 +167,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn io_streams_input_stream_skip(p0: u32, p1: u64, p2: u32) -> ()
-    as "silk_wasip2_io_streams_input_stream_skip" with Intrinsic.foreign(module: "wasi:io/streams@0.2.12", name: "[method]input-stream.skip")
+    as "wasi:io/streams@0.2.12#[method]input-stream.skip"
 ```
 
 Calls `wasi:io/streams@0.2.12#[method]input-stream.skip` with its canonical ABI.
@@ -179,7 +179,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn io_streams_input_stream_blocking_skip(p0: u32, p1: u64, p2: u32) -> ()
-    as "silk_wasip2_io_streams_input_stream_blocking_skip" with Intrinsic.foreign(module: "wasi:io/streams@0.2.12", name: "[method]input-stream.blocking-skip")
+    as "wasi:io/streams@0.2.12#[method]input-stream.blocking-skip"
 ```
 
 Calls `wasi:io/streams@0.2.12#[method]input-stream.blocking-skip` with its canonical ABI.
@@ -191,7 +191,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn io_streams_input_stream_subscribe(p0: u32) -> u32
-    as "silk_wasip2_io_streams_input_stream_subscribe" with Intrinsic.foreign(module: "wasi:io/streams@0.2.12", name: "[method]input-stream.subscribe")
+    as "wasi:io/streams@0.2.12#[method]input-stream.subscribe"
 ```
 
 Calls `wasi:io/streams@0.2.12#[method]input-stream.subscribe` with its canonical ABI.
@@ -203,7 +203,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn io_streams_output_stream_check_write(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_io_streams_output_stream_check_write" with Intrinsic.foreign(module: "wasi:io/streams@0.2.12", name: "[method]output-stream.check-write")
+    as "wasi:io/streams@0.2.12#[method]output-stream.check-write"
 ```
 
 Calls `wasi:io/streams@0.2.12#[method]output-stream.check-write` with its canonical ABI.
@@ -215,7 +215,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn io_streams_output_stream_write(p0: u32, p1: u32, p2: u32, p3: u32) -> ()
-    as "silk_wasip2_io_streams_output_stream_write" with Intrinsic.foreign(module: "wasi:io/streams@0.2.12", name: "[method]output-stream.write")
+    as "wasi:io/streams@0.2.12#[method]output-stream.write"
 ```
 
 Calls `wasi:io/streams@0.2.12#[method]output-stream.write` with its canonical ABI.
@@ -227,7 +227,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn io_streams_output_stream_blocking_write_and_flush(p0: u32, p1: u32, p2: u32, p3: u32) -> ()
-    as "silk_wasip2_io_streams_output_stream_blocking_write_and_flush" with Intrinsic.foreign(module: "wasi:io/streams@0.2.12", name: "[method]output-stream.blocking-write-and-flush")
+    as "wasi:io/streams@0.2.12#[method]output-stream.blocking-write-and-flush"
 ```
 
 Calls `wasi:io/streams@0.2.12#[method]output-stream.blocking-write-and-flush` with its canonical ABI.
@@ -239,7 +239,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn io_streams_output_stream_flush(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_io_streams_output_stream_flush" with Intrinsic.foreign(module: "wasi:io/streams@0.2.12", name: "[method]output-stream.flush")
+    as "wasi:io/streams@0.2.12#[method]output-stream.flush"
 ```
 
 Calls `wasi:io/streams@0.2.12#[method]output-stream.flush` with its canonical ABI.
@@ -251,7 +251,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn io_streams_output_stream_blocking_flush(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_io_streams_output_stream_blocking_flush" with Intrinsic.foreign(module: "wasi:io/streams@0.2.12", name: "[method]output-stream.blocking-flush")
+    as "wasi:io/streams@0.2.12#[method]output-stream.blocking-flush"
 ```
 
 Calls `wasi:io/streams@0.2.12#[method]output-stream.blocking-flush` with its canonical ABI.
@@ -263,7 +263,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn io_streams_output_stream_subscribe(p0: u32) -> u32
-    as "silk_wasip2_io_streams_output_stream_subscribe" with Intrinsic.foreign(module: "wasi:io/streams@0.2.12", name: "[method]output-stream.subscribe")
+    as "wasi:io/streams@0.2.12#[method]output-stream.subscribe"
 ```
 
 Calls `wasi:io/streams@0.2.12#[method]output-stream.subscribe` with its canonical ABI.
@@ -275,7 +275,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn io_streams_output_stream_write_zeroes(p0: u32, p1: u64, p2: u32) -> ()
-    as "silk_wasip2_io_streams_output_stream_write_zeroes" with Intrinsic.foreign(module: "wasi:io/streams@0.2.12", name: "[method]output-stream.write-zeroes")
+    as "wasi:io/streams@0.2.12#[method]output-stream.write-zeroes"
 ```
 
 Calls `wasi:io/streams@0.2.12#[method]output-stream.write-zeroes` with its canonical ABI.
@@ -287,7 +287,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn io_streams_output_stream_blocking_write_zeroes_and_flush(p0: u32, p1: u64, p2: u32) -> ()
-    as "silk_wasip2_io_streams_output_stream_blocking_write_zeroes_and_flush" with Intrinsic.foreign(module: "wasi:io/streams@0.2.12", name: "[method]output-stream.blocking-write-zeroes-and-flush")
+    as "wasi:io/streams@0.2.12#[method]output-stream.blocking-write-zeroes-and-flush"
 ```
 
 Calls `wasi:io/streams@0.2.12#[method]output-stream.blocking-write-zeroes-and-flush` with its canonical ABI.
@@ -299,7 +299,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn io_streams_output_stream_splice(p0: u32, p1: u32, p2: u64, p3: u32) -> ()
-    as "silk_wasip2_io_streams_output_stream_splice" with Intrinsic.foreign(module: "wasi:io/streams@0.2.12", name: "[method]output-stream.splice")
+    as "wasi:io/streams@0.2.12#[method]output-stream.splice"
 ```
 
 Calls `wasi:io/streams@0.2.12#[method]output-stream.splice` with its canonical ABI.
@@ -311,7 +311,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn io_streams_output_stream_blocking_splice(p0: u32, p1: u32, p2: u64, p3: u32) -> ()
-    as "silk_wasip2_io_streams_output_stream_blocking_splice" with Intrinsic.foreign(module: "wasi:io/streams@0.2.12", name: "[method]output-stream.blocking-splice")
+    as "wasi:io/streams@0.2.12#[method]output-stream.blocking-splice"
 ```
 
 Calls `wasi:io/streams@0.2.12#[method]output-stream.blocking-splice` with its canonical ABI.
@@ -323,7 +323,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn io_streams_drop_input_stream(p0: u32) -> ()
-    as "silk_wasip2_io_streams_drop_input_stream" with Intrinsic.foreign(module: "wasi:io/streams@0.2.12", name: "[resource-drop]input-stream")
+    as "wasi:io/streams@0.2.12#[resource-drop]input-stream"
 ```
 
 Calls `wasi:io/streams@0.2.12#[resource-drop]input-stream` with its canonical ABI.
@@ -335,7 +335,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn io_streams_drop_output_stream(p0: u32) -> ()
-    as "silk_wasip2_io_streams_drop_output_stream" with Intrinsic.foreign(module: "wasi:io/streams@0.2.12", name: "[resource-drop]output-stream")
+    as "wasi:io/streams@0.2.12#[resource-drop]output-stream"
 ```
 
 Calls `wasi:io/streams@0.2.12#[resource-drop]output-stream` with its canonical ABI.
@@ -347,7 +347,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_new_fields() -> u32
-    as "silk_wasip2_http_types_new_fields" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[constructor]fields")
+    as "wasi:http/types@0.2.12#[constructor]fields"
 ```
 
 Calls `wasi:http/types@0.2.12#[constructor]fields` with its canonical ABI.
@@ -359,7 +359,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_fields_from_list(p0: u32, p1: u32, p2: u32) -> ()
-    as "silk_wasip2_http_types_fields_from_list" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[static]fields.from-list")
+    as "wasi:http/types@0.2.12#[static]fields.from-list"
 ```
 
 Calls `wasi:http/types@0.2.12#[static]fields.from-list` with its canonical ABI.
@@ -371,7 +371,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_fields_get(p0: u32, p1: u32, p2: u32, p3: u32) -> ()
-    as "silk_wasip2_http_types_fields_get" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]fields.get")
+    as "wasi:http/types@0.2.12#[method]fields.get"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]fields.get` with its canonical ABI.
@@ -383,7 +383,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_fields_has(p0: u32, p1: u32, p2: u32) -> u32
-    as "silk_wasip2_http_types_fields_has" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]fields.has")
+    as "wasi:http/types@0.2.12#[method]fields.has"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]fields.has` with its canonical ABI.
@@ -395,7 +395,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_fields_set(p0: u32, p1: u32, p2: u32, p3: u32, p4: u32, p5: u32) -> ()
-    as "silk_wasip2_http_types_fields_set" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]fields.set")
+    as "wasi:http/types@0.2.12#[method]fields.set"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]fields.set` with its canonical ABI.
@@ -407,7 +407,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_fields_delete(p0: u32, p1: u32, p2: u32, p3: u32) -> ()
-    as "silk_wasip2_http_types_fields_delete" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]fields.delete")
+    as "wasi:http/types@0.2.12#[method]fields.delete"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]fields.delete` with its canonical ABI.
@@ -419,7 +419,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_fields_append(p0: u32, p1: u32, p2: u32, p3: u32, p4: u32, p5: u32) -> ()
-    as "silk_wasip2_http_types_fields_append" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]fields.append")
+    as "wasi:http/types@0.2.12#[method]fields.append"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]fields.append` with its canonical ABI.
@@ -431,7 +431,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_fields_entries(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_http_types_fields_entries" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]fields.entries")
+    as "wasi:http/types@0.2.12#[method]fields.entries"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]fields.entries` with its canonical ABI.
@@ -443,7 +443,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_fields_clone(p0: u32) -> u32
-    as "silk_wasip2_http_types_fields_clone" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]fields.clone")
+    as "wasi:http/types@0.2.12#[method]fields.clone"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]fields.clone` with its canonical ABI.
@@ -455,7 +455,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_incoming_request_method(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_http_types_incoming_request_method" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]incoming-request.method")
+    as "wasi:http/types@0.2.12#[method]incoming-request.method"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]incoming-request.method` with its canonical ABI.
@@ -467,7 +467,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_incoming_request_path_with_query(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_http_types_incoming_request_path_with_query" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]incoming-request.path-with-query")
+    as "wasi:http/types@0.2.12#[method]incoming-request.path-with-query"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]incoming-request.path-with-query` with its canonical ABI.
@@ -479,7 +479,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_incoming_request_scheme(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_http_types_incoming_request_scheme" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]incoming-request.scheme")
+    as "wasi:http/types@0.2.12#[method]incoming-request.scheme"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]incoming-request.scheme` with its canonical ABI.
@@ -491,7 +491,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_incoming_request_authority(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_http_types_incoming_request_authority" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]incoming-request.authority")
+    as "wasi:http/types@0.2.12#[method]incoming-request.authority"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]incoming-request.authority` with its canonical ABI.
@@ -503,7 +503,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_incoming_request_headers(p0: u32) -> u32
-    as "silk_wasip2_http_types_incoming_request_headers" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]incoming-request.headers")
+    as "wasi:http/types@0.2.12#[method]incoming-request.headers"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]incoming-request.headers` with its canonical ABI.
@@ -515,7 +515,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_incoming_request_consume(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_http_types_incoming_request_consume" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]incoming-request.consume")
+    as "wasi:http/types@0.2.12#[method]incoming-request.consume"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]incoming-request.consume` with its canonical ABI.
@@ -527,7 +527,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_new_outgoing_request(p0: u32) -> u32
-    as "silk_wasip2_http_types_new_outgoing_request" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[constructor]outgoing-request")
+    as "wasi:http/types@0.2.12#[constructor]outgoing-request"
 ```
 
 Calls `wasi:http/types@0.2.12#[constructor]outgoing-request` with its canonical ABI.
@@ -539,7 +539,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_outgoing_request_body(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_http_types_outgoing_request_body" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]outgoing-request.body")
+    as "wasi:http/types@0.2.12#[method]outgoing-request.body"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]outgoing-request.body` with its canonical ABI.
@@ -551,7 +551,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_outgoing_request_method(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_http_types_outgoing_request_method" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]outgoing-request.method")
+    as "wasi:http/types@0.2.12#[method]outgoing-request.method"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]outgoing-request.method` with its canonical ABI.
@@ -563,7 +563,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_outgoing_request_set_method(p0: u32, p1: u32, p2: u32, p3: u32) -> u32
-    as "silk_wasip2_http_types_outgoing_request_set_method" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]outgoing-request.set-method")
+    as "wasi:http/types@0.2.12#[method]outgoing-request.set-method"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]outgoing-request.set-method` with its canonical ABI.
@@ -575,7 +575,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_outgoing_request_path_with_query(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_http_types_outgoing_request_path_with_query" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]outgoing-request.path-with-query")
+    as "wasi:http/types@0.2.12#[method]outgoing-request.path-with-query"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]outgoing-request.path-with-query` with its canonical ABI.
@@ -587,7 +587,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_outgoing_request_set_path_with_query(p0: u32, p1: u32, p2: u32, p3: u32) -> u32
-    as "silk_wasip2_http_types_outgoing_request_set_path_with_query" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]outgoing-request.set-path-with-query")
+    as "wasi:http/types@0.2.12#[method]outgoing-request.set-path-with-query"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]outgoing-request.set-path-with-query` with its canonical ABI.
@@ -599,7 +599,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_outgoing_request_scheme(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_http_types_outgoing_request_scheme" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]outgoing-request.scheme")
+    as "wasi:http/types@0.2.12#[method]outgoing-request.scheme"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]outgoing-request.scheme` with its canonical ABI.
@@ -611,7 +611,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_outgoing_request_set_scheme(p0: u32, p1: u32, p2: u32, p3: u32, p4: u32) -> u32
-    as "silk_wasip2_http_types_outgoing_request_set_scheme" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]outgoing-request.set-scheme")
+    as "wasi:http/types@0.2.12#[method]outgoing-request.set-scheme"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]outgoing-request.set-scheme` with its canonical ABI.
@@ -623,7 +623,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_outgoing_request_authority(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_http_types_outgoing_request_authority" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]outgoing-request.authority")
+    as "wasi:http/types@0.2.12#[method]outgoing-request.authority"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]outgoing-request.authority` with its canonical ABI.
@@ -635,7 +635,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_outgoing_request_set_authority(p0: u32, p1: u32, p2: u32, p3: u32) -> u32
-    as "silk_wasip2_http_types_outgoing_request_set_authority" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]outgoing-request.set-authority")
+    as "wasi:http/types@0.2.12#[method]outgoing-request.set-authority"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]outgoing-request.set-authority` with its canonical ABI.
@@ -647,7 +647,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_outgoing_request_headers(p0: u32) -> u32
-    as "silk_wasip2_http_types_outgoing_request_headers" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]outgoing-request.headers")
+    as "wasi:http/types@0.2.12#[method]outgoing-request.headers"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]outgoing-request.headers` with its canonical ABI.
@@ -659,7 +659,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_new_request_options() -> u32
-    as "silk_wasip2_http_types_new_request_options" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[constructor]request-options")
+    as "wasi:http/types@0.2.12#[constructor]request-options"
 ```
 
 Calls `wasi:http/types@0.2.12#[constructor]request-options` with its canonical ABI.
@@ -671,7 +671,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_request_options_connect_timeout(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_http_types_request_options_connect_timeout" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]request-options.connect-timeout")
+    as "wasi:http/types@0.2.12#[method]request-options.connect-timeout"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]request-options.connect-timeout` with its canonical ABI.
@@ -683,7 +683,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_request_options_set_connect_timeout(p0: u32, p1: u32, p2: u64) -> u32
-    as "silk_wasip2_http_types_request_options_set_connect_timeout" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]request-options.set-connect-timeout")
+    as "wasi:http/types@0.2.12#[method]request-options.set-connect-timeout"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]request-options.set-connect-timeout` with its canonical ABI.
@@ -695,7 +695,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_request_options_first_byte_timeout(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_http_types_request_options_first_byte_timeout" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]request-options.first-byte-timeout")
+    as "wasi:http/types@0.2.12#[method]request-options.first-byte-timeout"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]request-options.first-byte-timeout` with its canonical ABI.
@@ -707,7 +707,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_request_options_set_first_byte_timeout(p0: u32, p1: u32, p2: u64) -> u32
-    as "silk_wasip2_http_types_request_options_set_first_byte_timeout" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]request-options.set-first-byte-timeout")
+    as "wasi:http/types@0.2.12#[method]request-options.set-first-byte-timeout"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]request-options.set-first-byte-timeout` with its canonical ABI.
@@ -719,7 +719,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_request_options_between_bytes_timeout(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_http_types_request_options_between_bytes_timeout" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]request-options.between-bytes-timeout")
+    as "wasi:http/types@0.2.12#[method]request-options.between-bytes-timeout"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]request-options.between-bytes-timeout` with its canonical ABI.
@@ -731,7 +731,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_request_options_set_between_bytes_timeout(p0: u32, p1: u32, p2: u64) -> u32
-    as "silk_wasip2_http_types_request_options_set_between_bytes_timeout" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]request-options.set-between-bytes-timeout")
+    as "wasi:http/types@0.2.12#[method]request-options.set-between-bytes-timeout"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]request-options.set-between-bytes-timeout` with its canonical ABI.
@@ -743,7 +743,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_response_outparam_set(p0: u32, p1: u32, p2: u32, p3: u32, p4: u64, p5: u32, p6: u32, p7: u32, p8: u32) -> ()
-    as "silk_wasip2_http_types_response_outparam_set" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[static]response-outparam.set")
+    as "wasi:http/types@0.2.12#[static]response-outparam.set"
 ```
 
 Calls `wasi:http/types@0.2.12#[static]response-outparam.set` with its canonical ABI.
@@ -755,7 +755,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_incoming_response_status(p0: u32) -> u32
-    as "silk_wasip2_http_types_incoming_response_status" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]incoming-response.status")
+    as "wasi:http/types@0.2.12#[method]incoming-response.status"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]incoming-response.status` with its canonical ABI.
@@ -767,7 +767,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_incoming_response_headers(p0: u32) -> u32
-    as "silk_wasip2_http_types_incoming_response_headers" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]incoming-response.headers")
+    as "wasi:http/types@0.2.12#[method]incoming-response.headers"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]incoming-response.headers` with its canonical ABI.
@@ -779,7 +779,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_incoming_response_consume(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_http_types_incoming_response_consume" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]incoming-response.consume")
+    as "wasi:http/types@0.2.12#[method]incoming-response.consume"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]incoming-response.consume` with its canonical ABI.
@@ -791,7 +791,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_incoming_body_stream(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_http_types_incoming_body_stream" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]incoming-body.stream")
+    as "wasi:http/types@0.2.12#[method]incoming-body.stream"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]incoming-body.stream` with its canonical ABI.
@@ -803,7 +803,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_incoming_body_finish(p0: u32) -> u32
-    as "silk_wasip2_http_types_incoming_body_finish" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[static]incoming-body.finish")
+    as "wasi:http/types@0.2.12#[static]incoming-body.finish"
 ```
 
 Calls `wasi:http/types@0.2.12#[static]incoming-body.finish` with its canonical ABI.
@@ -815,7 +815,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_future_trailers_subscribe(p0: u32) -> u32
-    as "silk_wasip2_http_types_future_trailers_subscribe" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]future-trailers.subscribe")
+    as "wasi:http/types@0.2.12#[method]future-trailers.subscribe"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]future-trailers.subscribe` with its canonical ABI.
@@ -827,7 +827,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_future_trailers_get(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_http_types_future_trailers_get" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]future-trailers.get")
+    as "wasi:http/types@0.2.12#[method]future-trailers.get"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]future-trailers.get` with its canonical ABI.
@@ -839,7 +839,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_new_outgoing_response(p0: u32) -> u32
-    as "silk_wasip2_http_types_new_outgoing_response" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[constructor]outgoing-response")
+    as "wasi:http/types@0.2.12#[constructor]outgoing-response"
 ```
 
 Calls `wasi:http/types@0.2.12#[constructor]outgoing-response` with its canonical ABI.
@@ -851,7 +851,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_outgoing_response_status_code(p0: u32) -> u32
-    as "silk_wasip2_http_types_outgoing_response_status_code" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]outgoing-response.status-code")
+    as "wasi:http/types@0.2.12#[method]outgoing-response.status-code"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]outgoing-response.status-code` with its canonical ABI.
@@ -863,7 +863,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_outgoing_response_set_status_code(p0: u32, p1: u32) -> u32
-    as "silk_wasip2_http_types_outgoing_response_set_status_code" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]outgoing-response.set-status-code")
+    as "wasi:http/types@0.2.12#[method]outgoing-response.set-status-code"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]outgoing-response.set-status-code` with its canonical ABI.
@@ -875,7 +875,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_outgoing_response_headers(p0: u32) -> u32
-    as "silk_wasip2_http_types_outgoing_response_headers" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]outgoing-response.headers")
+    as "wasi:http/types@0.2.12#[method]outgoing-response.headers"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]outgoing-response.headers` with its canonical ABI.
@@ -887,7 +887,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_outgoing_response_body(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_http_types_outgoing_response_body" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]outgoing-response.body")
+    as "wasi:http/types@0.2.12#[method]outgoing-response.body"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]outgoing-response.body` with its canonical ABI.
@@ -899,7 +899,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_outgoing_body_write(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_http_types_outgoing_body_write" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]outgoing-body.write")
+    as "wasi:http/types@0.2.12#[method]outgoing-body.write"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]outgoing-body.write` with its canonical ABI.
@@ -911,7 +911,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_outgoing_body_finish(p0: u32, p1: u32, p2: u32, p3: u32) -> ()
-    as "silk_wasip2_http_types_outgoing_body_finish" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[static]outgoing-body.finish")
+    as "wasi:http/types@0.2.12#[static]outgoing-body.finish"
 ```
 
 Calls `wasi:http/types@0.2.12#[static]outgoing-body.finish` with its canonical ABI.
@@ -923,7 +923,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_future_incoming_response_subscribe(p0: u32) -> u32
-    as "silk_wasip2_http_types_future_incoming_response_subscribe" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]future-incoming-response.subscribe")
+    as "wasi:http/types@0.2.12#[method]future-incoming-response.subscribe"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]future-incoming-response.subscribe` with its canonical ABI.
@@ -935,7 +935,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_future_incoming_response_get(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_http_types_future_incoming_response_get" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[method]future-incoming-response.get")
+    as "wasi:http/types@0.2.12#[method]future-incoming-response.get"
 ```
 
 Calls `wasi:http/types@0.2.12#[method]future-incoming-response.get` with its canonical ABI.
@@ -947,7 +947,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_http_error_code(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_http_types_http_error_code" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "http-error-code")
+    as "wasi:http/types@0.2.12#http-error-code"
 ```
 
 Calls `wasi:http/types@0.2.12#http-error-code` with its canonical ABI.
@@ -959,7 +959,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_drop_fields(p0: u32) -> ()
-    as "silk_wasip2_http_types_drop_fields" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[resource-drop]fields")
+    as "wasi:http/types@0.2.12#[resource-drop]fields"
 ```
 
 Calls `wasi:http/types@0.2.12#[resource-drop]fields` with its canonical ABI.
@@ -971,7 +971,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_drop_incoming_request(p0: u32) -> ()
-    as "silk_wasip2_http_types_drop_incoming_request" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[resource-drop]incoming-request")
+    as "wasi:http/types@0.2.12#[resource-drop]incoming-request"
 ```
 
 Calls `wasi:http/types@0.2.12#[resource-drop]incoming-request` with its canonical ABI.
@@ -983,7 +983,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_drop_outgoing_request(p0: u32) -> ()
-    as "silk_wasip2_http_types_drop_outgoing_request" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[resource-drop]outgoing-request")
+    as "wasi:http/types@0.2.12#[resource-drop]outgoing-request"
 ```
 
 Calls `wasi:http/types@0.2.12#[resource-drop]outgoing-request` with its canonical ABI.
@@ -995,7 +995,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_drop_request_options(p0: u32) -> ()
-    as "silk_wasip2_http_types_drop_request_options" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[resource-drop]request-options")
+    as "wasi:http/types@0.2.12#[resource-drop]request-options"
 ```
 
 Calls `wasi:http/types@0.2.12#[resource-drop]request-options` with its canonical ABI.
@@ -1007,7 +1007,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_drop_response_outparam(p0: u32) -> ()
-    as "silk_wasip2_http_types_drop_response_outparam" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[resource-drop]response-outparam")
+    as "wasi:http/types@0.2.12#[resource-drop]response-outparam"
 ```
 
 Calls `wasi:http/types@0.2.12#[resource-drop]response-outparam` with its canonical ABI.
@@ -1019,7 +1019,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_drop_incoming_response(p0: u32) -> ()
-    as "silk_wasip2_http_types_drop_incoming_response" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[resource-drop]incoming-response")
+    as "wasi:http/types@0.2.12#[resource-drop]incoming-response"
 ```
 
 Calls `wasi:http/types@0.2.12#[resource-drop]incoming-response` with its canonical ABI.
@@ -1031,7 +1031,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_drop_incoming_body(p0: u32) -> ()
-    as "silk_wasip2_http_types_drop_incoming_body" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[resource-drop]incoming-body")
+    as "wasi:http/types@0.2.12#[resource-drop]incoming-body"
 ```
 
 Calls `wasi:http/types@0.2.12#[resource-drop]incoming-body` with its canonical ABI.
@@ -1043,7 +1043,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_drop_future_trailers(p0: u32) -> ()
-    as "silk_wasip2_http_types_drop_future_trailers" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[resource-drop]future-trailers")
+    as "wasi:http/types@0.2.12#[resource-drop]future-trailers"
 ```
 
 Calls `wasi:http/types@0.2.12#[resource-drop]future-trailers` with its canonical ABI.
@@ -1055,7 +1055,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_drop_outgoing_response(p0: u32) -> ()
-    as "silk_wasip2_http_types_drop_outgoing_response" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[resource-drop]outgoing-response")
+    as "wasi:http/types@0.2.12#[resource-drop]outgoing-response"
 ```
 
 Calls `wasi:http/types@0.2.12#[resource-drop]outgoing-response` with its canonical ABI.
@@ -1067,7 +1067,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_drop_outgoing_body(p0: u32) -> ()
-    as "silk_wasip2_http_types_drop_outgoing_body" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[resource-drop]outgoing-body")
+    as "wasi:http/types@0.2.12#[resource-drop]outgoing-body"
 ```
 
 Calls `wasi:http/types@0.2.12#[resource-drop]outgoing-body` with its canonical ABI.
@@ -1079,7 +1079,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_types_drop_future_incoming_response(p0: u32) -> ()
-    as "silk_wasip2_http_types_drop_future_incoming_response" with Intrinsic.foreign(module: "wasi:http/types@0.2.12", name: "[resource-drop]future-incoming-response")
+    as "wasi:http/types@0.2.12#[resource-drop]future-incoming-response"
 ```
 
 Calls `wasi:http/types@0.2.12#[resource-drop]future-incoming-response` with its canonical ABI.
@@ -1091,7 +1091,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn http_outgoing_handler_handle(p0: u32, p1: u32, p2: u32, p3: u32) -> ()
-    as "silk_wasip2_http_outgoing_handler_handle" with Intrinsic.foreign(module: "wasi:http/outgoing-handler@0.2.12", name: "handle")
+    as "wasi:http/outgoing-handler@0.2.12#handle"
 ```
 
 Calls `wasi:http/outgoing-handler@0.2.12#handle` with its canonical ABI.
@@ -1103,7 +1103,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn cli_environment_get_environment(p0: u32) -> ()
-    as "silk_wasip2_cli_environment_get_environment" with Intrinsic.foreign(module: "wasi:cli/environment@0.2.12", name: "get-environment")
+    as "wasi:cli/environment@0.2.12#get-environment"
 ```
 
 Calls `wasi:cli/environment@0.2.12#get-environment` with its canonical ABI.
@@ -1115,7 +1115,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn cli_environment_get_arguments(p0: u32) -> ()
-    as "silk_wasip2_cli_environment_get_arguments" with Intrinsic.foreign(module: "wasi:cli/environment@0.2.12", name: "get-arguments")
+    as "wasi:cli/environment@0.2.12#get-arguments"
 ```
 
 Calls `wasi:cli/environment@0.2.12#get-arguments` with its canonical ABI.
@@ -1127,7 +1127,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn cli_environment_initial_cwd(p0: u32) -> ()
-    as "silk_wasip2_cli_environment_initial_cwd" with Intrinsic.foreign(module: "wasi:cli/environment@0.2.12", name: "initial-cwd")
+    as "wasi:cli/environment@0.2.12#initial-cwd"
 ```
 
 Calls `wasi:cli/environment@0.2.12#initial-cwd` with its canonical ABI.
@@ -1139,7 +1139,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn cli_exit_exit(p0: u32) -> ()
-    as "silk_wasip2_cli_exit_exit" with Intrinsic.foreign(module: "wasi:cli/exit@0.2.12", name: "exit")
+    as "wasi:cli/exit@0.2.12#exit"
 ```
 
 Calls `wasi:cli/exit@0.2.12#exit` with its canonical ABI.
@@ -1151,7 +1151,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn cli_exit_exit_with_code(p0: u32) -> ()
-    as "silk_wasip2_cli_exit_exit_with_code" with Intrinsic.foreign(module: "wasi:cli/exit@0.2.12", name: "exit-with-code")
+    as "wasi:cli/exit@0.2.12#exit-with-code"
 ```
 
 Calls `wasi:cli/exit@0.2.12#exit-with-code` with its canonical ABI.
@@ -1163,7 +1163,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn cli_stdin_get_stdin() -> u32
-    as "silk_wasip2_cli_stdin_get_stdin" with Intrinsic.foreign(module: "wasi:cli/stdin@0.2.12", name: "get-stdin")
+    as "wasi:cli/stdin@0.2.12#get-stdin"
 ```
 
 Calls `wasi:cli/stdin@0.2.12#get-stdin` with its canonical ABI.
@@ -1175,7 +1175,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn cli_stdout_get_stdout() -> u32
-    as "silk_wasip2_cli_stdout_get_stdout" with Intrinsic.foreign(module: "wasi:cli/stdout@0.2.12", name: "get-stdout")
+    as "wasi:cli/stdout@0.2.12#get-stdout"
 ```
 
 Calls `wasi:cli/stdout@0.2.12#get-stdout` with its canonical ABI.
@@ -1187,7 +1187,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn cli_stderr_get_stderr() -> u32
-    as "silk_wasip2_cli_stderr_get_stderr" with Intrinsic.foreign(module: "wasi:cli/stderr@0.2.12", name: "get-stderr")
+    as "wasi:cli/stderr@0.2.12#get-stderr"
 ```
 
 Calls `wasi:cli/stderr@0.2.12#get-stderr` with its canonical ABI.
@@ -1199,7 +1199,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn cli_terminal_input_drop_terminal_input(p0: u32) -> ()
-    as "silk_wasip2_cli_terminal_input_drop_terminal_input" with Intrinsic.foreign(module: "wasi:cli/terminal-input@0.2.12", name: "[resource-drop]terminal-input")
+    as "wasi:cli/terminal-input@0.2.12#[resource-drop]terminal-input"
 ```
 
 Calls `wasi:cli/terminal-input@0.2.12#[resource-drop]terminal-input` with its canonical ABI.
@@ -1211,7 +1211,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn cli_terminal_output_drop_terminal_output(p0: u32) -> ()
-    as "silk_wasip2_cli_terminal_output_drop_terminal_output" with Intrinsic.foreign(module: "wasi:cli/terminal-output@0.2.12", name: "[resource-drop]terminal-output")
+    as "wasi:cli/terminal-output@0.2.12#[resource-drop]terminal-output"
 ```
 
 Calls `wasi:cli/terminal-output@0.2.12#[resource-drop]terminal-output` with its canonical ABI.
@@ -1223,7 +1223,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn cli_terminal_stdin_get_terminal_stdin(p0: u32) -> ()
-    as "silk_wasip2_cli_terminal_stdin_get_terminal_stdin" with Intrinsic.foreign(module: "wasi:cli/terminal-stdin@0.2.12", name: "get-terminal-stdin")
+    as "wasi:cli/terminal-stdin@0.2.12#get-terminal-stdin"
 ```
 
 Calls `wasi:cli/terminal-stdin@0.2.12#get-terminal-stdin` with its canonical ABI.
@@ -1235,7 +1235,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn cli_terminal_stdout_get_terminal_stdout(p0: u32) -> ()
-    as "silk_wasip2_cli_terminal_stdout_get_terminal_stdout" with Intrinsic.foreign(module: "wasi:cli/terminal-stdout@0.2.12", name: "get-terminal-stdout")
+    as "wasi:cli/terminal-stdout@0.2.12#get-terminal-stdout"
 ```
 
 Calls `wasi:cli/terminal-stdout@0.2.12#get-terminal-stdout` with its canonical ABI.
@@ -1247,7 +1247,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn cli_terminal_stderr_get_terminal_stderr(p0: u32) -> ()
-    as "silk_wasip2_cli_terminal_stderr_get_terminal_stderr" with Intrinsic.foreign(module: "wasi:cli/terminal-stderr@0.2.12", name: "get-terminal-stderr")
+    as "wasi:cli/terminal-stderr@0.2.12#get-terminal-stderr"
 ```
 
 Calls `wasi:cli/terminal-stderr@0.2.12#get-terminal-stderr` with its canonical ABI.
@@ -1259,7 +1259,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn clocks_wall_clock_now(p0: u32) -> ()
-    as "silk_wasip2_clocks_wall_clock_now" with Intrinsic.foreign(module: "wasi:clocks/wall-clock@0.2.12", name: "now")
+    as "wasi:clocks/wall-clock@0.2.12#now"
 ```
 
 Calls `wasi:clocks/wall-clock@0.2.12#now` with its canonical ABI.
@@ -1271,7 +1271,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn clocks_wall_clock_resolution(p0: u32) -> ()
-    as "silk_wasip2_clocks_wall_clock_resolution" with Intrinsic.foreign(module: "wasi:clocks/wall-clock@0.2.12", name: "resolution")
+    as "wasi:clocks/wall-clock@0.2.12#resolution"
 ```
 
 Calls `wasi:clocks/wall-clock@0.2.12#resolution` with its canonical ABI.
@@ -1283,7 +1283,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_descriptor_read_via_stream(p0: u32, p1: u64, p2: u32) -> ()
-    as "silk_wasip2_filesystem_types_descriptor_read_via_stream" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[method]descriptor.read-via-stream")
+    as "wasi:filesystem/types@0.2.12#[method]descriptor.read-via-stream"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[method]descriptor.read-via-stream` with its canonical ABI.
@@ -1295,7 +1295,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_descriptor_write_via_stream(p0: u32, p1: u64, p2: u32) -> ()
-    as "silk_wasip2_filesystem_types_descriptor_write_via_stream" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[method]descriptor.write-via-stream")
+    as "wasi:filesystem/types@0.2.12#[method]descriptor.write-via-stream"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[method]descriptor.write-via-stream` with its canonical ABI.
@@ -1307,7 +1307,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_descriptor_append_via_stream(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_filesystem_types_descriptor_append_via_stream" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[method]descriptor.append-via-stream")
+    as "wasi:filesystem/types@0.2.12#[method]descriptor.append-via-stream"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[method]descriptor.append-via-stream` with its canonical ABI.
@@ -1319,7 +1319,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_descriptor_advise(p0: u32, p1: u64, p2: u64, p3: u32, p4: u32) -> ()
-    as "silk_wasip2_filesystem_types_descriptor_advise" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[method]descriptor.advise")
+    as "wasi:filesystem/types@0.2.12#[method]descriptor.advise"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[method]descriptor.advise` with its canonical ABI.
@@ -1331,7 +1331,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_descriptor_sync_data(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_filesystem_types_descriptor_sync_data" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[method]descriptor.sync-data")
+    as "wasi:filesystem/types@0.2.12#[method]descriptor.sync-data"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[method]descriptor.sync-data` with its canonical ABI.
@@ -1343,7 +1343,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_descriptor_get_flags(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_filesystem_types_descriptor_get_flags" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[method]descriptor.get-flags")
+    as "wasi:filesystem/types@0.2.12#[method]descriptor.get-flags"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[method]descriptor.get-flags` with its canonical ABI.
@@ -1355,7 +1355,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_descriptor_get_type(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_filesystem_types_descriptor_get_type" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[method]descriptor.get-type")
+    as "wasi:filesystem/types@0.2.12#[method]descriptor.get-type"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[method]descriptor.get-type` with its canonical ABI.
@@ -1367,7 +1367,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_descriptor_set_size(p0: u32, p1: u64, p2: u32) -> ()
-    as "silk_wasip2_filesystem_types_descriptor_set_size" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[method]descriptor.set-size")
+    as "wasi:filesystem/types@0.2.12#[method]descriptor.set-size"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[method]descriptor.set-size` with its canonical ABI.
@@ -1379,7 +1379,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_descriptor_set_times(p0: u32, p1: u32, p2: u64, p3: u32, p4: u32, p5: u64, p6: u32, p7: u32) -> ()
-    as "silk_wasip2_filesystem_types_descriptor_set_times" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[method]descriptor.set-times")
+    as "wasi:filesystem/types@0.2.12#[method]descriptor.set-times"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[method]descriptor.set-times` with its canonical ABI.
@@ -1391,7 +1391,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_descriptor_read(p0: u32, p1: u64, p2: u64, p3: u32) -> ()
-    as "silk_wasip2_filesystem_types_descriptor_read" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[method]descriptor.read")
+    as "wasi:filesystem/types@0.2.12#[method]descriptor.read"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[method]descriptor.read` with its canonical ABI.
@@ -1403,7 +1403,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_descriptor_write(p0: u32, p1: u32, p2: u32, p3: u64, p4: u32) -> ()
-    as "silk_wasip2_filesystem_types_descriptor_write" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[method]descriptor.write")
+    as "wasi:filesystem/types@0.2.12#[method]descriptor.write"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[method]descriptor.write` with its canonical ABI.
@@ -1415,7 +1415,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_descriptor_read_directory(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_filesystem_types_descriptor_read_directory" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[method]descriptor.read-directory")
+    as "wasi:filesystem/types@0.2.12#[method]descriptor.read-directory"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[method]descriptor.read-directory` with its canonical ABI.
@@ -1427,7 +1427,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_descriptor_sync(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_filesystem_types_descriptor_sync" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[method]descriptor.sync")
+    as "wasi:filesystem/types@0.2.12#[method]descriptor.sync"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[method]descriptor.sync` with its canonical ABI.
@@ -1439,7 +1439,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_descriptor_create_directory_at(p0: u32, p1: u32, p2: u32, p3: u32) -> ()
-    as "silk_wasip2_filesystem_types_descriptor_create_directory_at" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[method]descriptor.create-directory-at")
+    as "wasi:filesystem/types@0.2.12#[method]descriptor.create-directory-at"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[method]descriptor.create-directory-at` with its canonical ABI.
@@ -1451,7 +1451,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_descriptor_stat(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_filesystem_types_descriptor_stat" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[method]descriptor.stat")
+    as "wasi:filesystem/types@0.2.12#[method]descriptor.stat"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[method]descriptor.stat` with its canonical ABI.
@@ -1463,7 +1463,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_descriptor_stat_at(p0: u32, p1: u32, p2: u32, p3: u32, p4: u32) -> ()
-    as "silk_wasip2_filesystem_types_descriptor_stat_at" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[method]descriptor.stat-at")
+    as "wasi:filesystem/types@0.2.12#[method]descriptor.stat-at"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[method]descriptor.stat-at` with its canonical ABI.
@@ -1475,7 +1475,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_descriptor_set_times_at(p0: u32, p1: u32, p2: u32, p3: u32, p4: u32, p5: u64, p6: u32, p7: u32, p8: u64, p9: u32, p10: u32) -> ()
-    as "silk_wasip2_filesystem_types_descriptor_set_times_at" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[method]descriptor.set-times-at")
+    as "wasi:filesystem/types@0.2.12#[method]descriptor.set-times-at"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[method]descriptor.set-times-at` with its canonical ABI.
@@ -1487,7 +1487,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_descriptor_link_at(p0: u32, p1: u32, p2: u32, p3: u32, p4: u32, p5: u32, p6: u32, p7: u32) -> ()
-    as "silk_wasip2_filesystem_types_descriptor_link_at" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[method]descriptor.link-at")
+    as "wasi:filesystem/types@0.2.12#[method]descriptor.link-at"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[method]descriptor.link-at` with its canonical ABI.
@@ -1499,7 +1499,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_descriptor_open_at(p0: u32, p1: u32, p2: u32, p3: u32, p4: u32, p5: u32, p6: u32) -> ()
-    as "silk_wasip2_filesystem_types_descriptor_open_at" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[method]descriptor.open-at")
+    as "wasi:filesystem/types@0.2.12#[method]descriptor.open-at"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[method]descriptor.open-at` with its canonical ABI.
@@ -1511,7 +1511,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_descriptor_readlink_at(p0: u32, p1: u32, p2: u32, p3: u32) -> ()
-    as "silk_wasip2_filesystem_types_descriptor_readlink_at" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[method]descriptor.readlink-at")
+    as "wasi:filesystem/types@0.2.12#[method]descriptor.readlink-at"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[method]descriptor.readlink-at` with its canonical ABI.
@@ -1523,7 +1523,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_descriptor_remove_directory_at(p0: u32, p1: u32, p2: u32, p3: u32) -> ()
-    as "silk_wasip2_filesystem_types_descriptor_remove_directory_at" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[method]descriptor.remove-directory-at")
+    as "wasi:filesystem/types@0.2.12#[method]descriptor.remove-directory-at"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[method]descriptor.remove-directory-at` with its canonical ABI.
@@ -1535,7 +1535,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_descriptor_rename_at(p0: u32, p1: u32, p2: u32, p3: u32, p4: u32, p5: u32, p6: u32) -> ()
-    as "silk_wasip2_filesystem_types_descriptor_rename_at" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[method]descriptor.rename-at")
+    as "wasi:filesystem/types@0.2.12#[method]descriptor.rename-at"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[method]descriptor.rename-at` with its canonical ABI.
@@ -1547,7 +1547,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_descriptor_symlink_at(p0: u32, p1: u32, p2: u32, p3: u32, p4: u32, p5: u32) -> ()
-    as "silk_wasip2_filesystem_types_descriptor_symlink_at" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[method]descriptor.symlink-at")
+    as "wasi:filesystem/types@0.2.12#[method]descriptor.symlink-at"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[method]descriptor.symlink-at` with its canonical ABI.
@@ -1559,7 +1559,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_descriptor_unlink_file_at(p0: u32, p1: u32, p2: u32, p3: u32) -> ()
-    as "silk_wasip2_filesystem_types_descriptor_unlink_file_at" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[method]descriptor.unlink-file-at")
+    as "wasi:filesystem/types@0.2.12#[method]descriptor.unlink-file-at"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[method]descriptor.unlink-file-at` with its canonical ABI.
@@ -1571,7 +1571,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_descriptor_is_same_object(p0: u32, p1: u32) -> u32
-    as "silk_wasip2_filesystem_types_descriptor_is_same_object" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[method]descriptor.is-same-object")
+    as "wasi:filesystem/types@0.2.12#[method]descriptor.is-same-object"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[method]descriptor.is-same-object` with its canonical ABI.
@@ -1583,7 +1583,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_descriptor_metadata_hash(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_filesystem_types_descriptor_metadata_hash" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[method]descriptor.metadata-hash")
+    as "wasi:filesystem/types@0.2.12#[method]descriptor.metadata-hash"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[method]descriptor.metadata-hash` with its canonical ABI.
@@ -1595,7 +1595,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_descriptor_metadata_hash_at(p0: u32, p1: u32, p2: u32, p3: u32, p4: u32) -> ()
-    as "silk_wasip2_filesystem_types_descriptor_metadata_hash_at" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[method]descriptor.metadata-hash-at")
+    as "wasi:filesystem/types@0.2.12#[method]descriptor.metadata-hash-at"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[method]descriptor.metadata-hash-at` with its canonical ABI.
@@ -1607,7 +1607,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_directory_entry_stream_read_directory_entry(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_filesystem_types_directory_entry_stream_read_directory_entry" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[method]directory-entry-stream.read-directory-entry")
+    as "wasi:filesystem/types@0.2.12#[method]directory-entry-stream.read-directory-entry"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[method]directory-entry-stream.read-directory-entry` with its canonical ABI.
@@ -1619,7 +1619,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_filesystem_error_code(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_filesystem_types_filesystem_error_code" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "filesystem-error-code")
+    as "wasi:filesystem/types@0.2.12#filesystem-error-code"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#filesystem-error-code` with its canonical ABI.
@@ -1631,7 +1631,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_drop_descriptor(p0: u32) -> ()
-    as "silk_wasip2_filesystem_types_drop_descriptor" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[resource-drop]descriptor")
+    as "wasi:filesystem/types@0.2.12#[resource-drop]descriptor"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[resource-drop]descriptor` with its canonical ABI.
@@ -1643,7 +1643,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_types_drop_directory_entry_stream(p0: u32) -> ()
-    as "silk_wasip2_filesystem_types_drop_directory_entry_stream" with Intrinsic.foreign(module: "wasi:filesystem/types@0.2.12", name: "[resource-drop]directory-entry-stream")
+    as "wasi:filesystem/types@0.2.12#[resource-drop]directory-entry-stream"
 ```
 
 Calls `wasi:filesystem/types@0.2.12#[resource-drop]directory-entry-stream` with its canonical ABI.
@@ -1655,7 +1655,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn filesystem_preopens_get_directories(p0: u32) -> ()
-    as "silk_wasip2_filesystem_preopens_get_directories" with Intrinsic.foreign(module: "wasi:filesystem/preopens@0.2.12", name: "get-directories")
+    as "wasi:filesystem/preopens@0.2.12#get-directories"
 ```
 
 Calls `wasi:filesystem/preopens@0.2.12#get-directories` with its canonical ABI.
@@ -1667,7 +1667,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_network_drop_network(p0: u32) -> ()
-    as "silk_wasip2_sockets_network_drop_network" with Intrinsic.foreign(module: "wasi:sockets/network@0.2.12", name: "[resource-drop]network")
+    as "wasi:sockets/network@0.2.12#[resource-drop]network"
 ```
 
 Calls `wasi:sockets/network@0.2.12#[resource-drop]network` with its canonical ABI.
@@ -1679,7 +1679,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_instance_network_instance_network() -> u32
-    as "silk_wasip2_sockets_instance_network_instance_network" with Intrinsic.foreign(module: "wasi:sockets/instance-network@0.2.12", name: "instance-network")
+    as "wasi:sockets/instance-network@0.2.12#instance-network"
 ```
 
 Calls `wasi:sockets/instance-network@0.2.12#instance-network` with its canonical ABI.
@@ -1691,7 +1691,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_udp_udp_socket_start_bind(p0: u32, p1: u32, p2: u32, p3: u32, p4: u32, p5: u32, p6: u32, p7: u32, p8: u32, p9: u32, p10: u32, p11: u32, p12: u32, p13: u32, p14: u32) -> ()
-    as "silk_wasip2_sockets_udp_udp_socket_start_bind" with Intrinsic.foreign(module: "wasi:sockets/udp@0.2.12", name: "[method]udp-socket.start-bind")
+    as "wasi:sockets/udp@0.2.12#[method]udp-socket.start-bind"
 ```
 
 Calls `wasi:sockets/udp@0.2.12#[method]udp-socket.start-bind` with its canonical ABI.
@@ -1703,7 +1703,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_udp_udp_socket_finish_bind(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_sockets_udp_udp_socket_finish_bind" with Intrinsic.foreign(module: "wasi:sockets/udp@0.2.12", name: "[method]udp-socket.finish-bind")
+    as "wasi:sockets/udp@0.2.12#[method]udp-socket.finish-bind"
 ```
 
 Calls `wasi:sockets/udp@0.2.12#[method]udp-socket.finish-bind` with its canonical ABI.
@@ -1715,7 +1715,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_udp_udp_socket_stream(p0: u32, p1: u32, p2: u32, p3: u32, p4: u32, p5: u32, p6: u32, p7: u32, p8: u32, p9: u32, p10: u32, p11: u32, p12: u32, p13: u32, p14: u32) -> ()
-    as "silk_wasip2_sockets_udp_udp_socket_stream" with Intrinsic.foreign(module: "wasi:sockets/udp@0.2.12", name: "[method]udp-socket.stream")
+    as "wasi:sockets/udp@0.2.12#[method]udp-socket.stream"
 ```
 
 Calls `wasi:sockets/udp@0.2.12#[method]udp-socket.stream` with its canonical ABI.
@@ -1727,7 +1727,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_udp_udp_socket_local_address(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_sockets_udp_udp_socket_local_address" with Intrinsic.foreign(module: "wasi:sockets/udp@0.2.12", name: "[method]udp-socket.local-address")
+    as "wasi:sockets/udp@0.2.12#[method]udp-socket.local-address"
 ```
 
 Calls `wasi:sockets/udp@0.2.12#[method]udp-socket.local-address` with its canonical ABI.
@@ -1739,7 +1739,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_udp_udp_socket_remote_address(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_sockets_udp_udp_socket_remote_address" with Intrinsic.foreign(module: "wasi:sockets/udp@0.2.12", name: "[method]udp-socket.remote-address")
+    as "wasi:sockets/udp@0.2.12#[method]udp-socket.remote-address"
 ```
 
 Calls `wasi:sockets/udp@0.2.12#[method]udp-socket.remote-address` with its canonical ABI.
@@ -1751,7 +1751,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_udp_udp_socket_address_family(p0: u32) -> u32
-    as "silk_wasip2_sockets_udp_udp_socket_address_family" with Intrinsic.foreign(module: "wasi:sockets/udp@0.2.12", name: "[method]udp-socket.address-family")
+    as "wasi:sockets/udp@0.2.12#[method]udp-socket.address-family"
 ```
 
 Calls `wasi:sockets/udp@0.2.12#[method]udp-socket.address-family` with its canonical ABI.
@@ -1763,7 +1763,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_udp_udp_socket_unicast_hop_limit(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_sockets_udp_udp_socket_unicast_hop_limit" with Intrinsic.foreign(module: "wasi:sockets/udp@0.2.12", name: "[method]udp-socket.unicast-hop-limit")
+    as "wasi:sockets/udp@0.2.12#[method]udp-socket.unicast-hop-limit"
 ```
 
 Calls `wasi:sockets/udp@0.2.12#[method]udp-socket.unicast-hop-limit` with its canonical ABI.
@@ -1775,7 +1775,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_udp_udp_socket_set_unicast_hop_limit(p0: u32, p1: u32, p2: u32) -> ()
-    as "silk_wasip2_sockets_udp_udp_socket_set_unicast_hop_limit" with Intrinsic.foreign(module: "wasi:sockets/udp@0.2.12", name: "[method]udp-socket.set-unicast-hop-limit")
+    as "wasi:sockets/udp@0.2.12#[method]udp-socket.set-unicast-hop-limit"
 ```
 
 Calls `wasi:sockets/udp@0.2.12#[method]udp-socket.set-unicast-hop-limit` with its canonical ABI.
@@ -1787,7 +1787,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_udp_udp_socket_receive_buffer_size(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_sockets_udp_udp_socket_receive_buffer_size" with Intrinsic.foreign(module: "wasi:sockets/udp@0.2.12", name: "[method]udp-socket.receive-buffer-size")
+    as "wasi:sockets/udp@0.2.12#[method]udp-socket.receive-buffer-size"
 ```
 
 Calls `wasi:sockets/udp@0.2.12#[method]udp-socket.receive-buffer-size` with its canonical ABI.
@@ -1799,7 +1799,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_udp_udp_socket_set_receive_buffer_size(p0: u32, p1: u64, p2: u32) -> ()
-    as "silk_wasip2_sockets_udp_udp_socket_set_receive_buffer_size" with Intrinsic.foreign(module: "wasi:sockets/udp@0.2.12", name: "[method]udp-socket.set-receive-buffer-size")
+    as "wasi:sockets/udp@0.2.12#[method]udp-socket.set-receive-buffer-size"
 ```
 
 Calls `wasi:sockets/udp@0.2.12#[method]udp-socket.set-receive-buffer-size` with its canonical ABI.
@@ -1811,7 +1811,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_udp_udp_socket_send_buffer_size(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_sockets_udp_udp_socket_send_buffer_size" with Intrinsic.foreign(module: "wasi:sockets/udp@0.2.12", name: "[method]udp-socket.send-buffer-size")
+    as "wasi:sockets/udp@0.2.12#[method]udp-socket.send-buffer-size"
 ```
 
 Calls `wasi:sockets/udp@0.2.12#[method]udp-socket.send-buffer-size` with its canonical ABI.
@@ -1823,7 +1823,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_udp_udp_socket_set_send_buffer_size(p0: u32, p1: u64, p2: u32) -> ()
-    as "silk_wasip2_sockets_udp_udp_socket_set_send_buffer_size" with Intrinsic.foreign(module: "wasi:sockets/udp@0.2.12", name: "[method]udp-socket.set-send-buffer-size")
+    as "wasi:sockets/udp@0.2.12#[method]udp-socket.set-send-buffer-size"
 ```
 
 Calls `wasi:sockets/udp@0.2.12#[method]udp-socket.set-send-buffer-size` with its canonical ABI.
@@ -1835,7 +1835,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_udp_udp_socket_subscribe(p0: u32) -> u32
-    as "silk_wasip2_sockets_udp_udp_socket_subscribe" with Intrinsic.foreign(module: "wasi:sockets/udp@0.2.12", name: "[method]udp-socket.subscribe")
+    as "wasi:sockets/udp@0.2.12#[method]udp-socket.subscribe"
 ```
 
 Calls `wasi:sockets/udp@0.2.12#[method]udp-socket.subscribe` with its canonical ABI.
@@ -1847,7 +1847,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_udp_incoming_datagram_stream_receive(p0: u32, p1: u64, p2: u32) -> ()
-    as "silk_wasip2_sockets_udp_incoming_datagram_stream_receive" with Intrinsic.foreign(module: "wasi:sockets/udp@0.2.12", name: "[method]incoming-datagram-stream.receive")
+    as "wasi:sockets/udp@0.2.12#[method]incoming-datagram-stream.receive"
 ```
 
 Calls `wasi:sockets/udp@0.2.12#[method]incoming-datagram-stream.receive` with its canonical ABI.
@@ -1859,7 +1859,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_udp_incoming_datagram_stream_subscribe(p0: u32) -> u32
-    as "silk_wasip2_sockets_udp_incoming_datagram_stream_subscribe" with Intrinsic.foreign(module: "wasi:sockets/udp@0.2.12", name: "[method]incoming-datagram-stream.subscribe")
+    as "wasi:sockets/udp@0.2.12#[method]incoming-datagram-stream.subscribe"
 ```
 
 Calls `wasi:sockets/udp@0.2.12#[method]incoming-datagram-stream.subscribe` with its canonical ABI.
@@ -1871,7 +1871,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_udp_outgoing_datagram_stream_check_send(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_sockets_udp_outgoing_datagram_stream_check_send" with Intrinsic.foreign(module: "wasi:sockets/udp@0.2.12", name: "[method]outgoing-datagram-stream.check-send")
+    as "wasi:sockets/udp@0.2.12#[method]outgoing-datagram-stream.check-send"
 ```
 
 Calls `wasi:sockets/udp@0.2.12#[method]outgoing-datagram-stream.check-send` with its canonical ABI.
@@ -1883,7 +1883,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_udp_outgoing_datagram_stream_send(p0: u32, p1: u32, p2: u32, p3: u32) -> ()
-    as "silk_wasip2_sockets_udp_outgoing_datagram_stream_send" with Intrinsic.foreign(module: "wasi:sockets/udp@0.2.12", name: "[method]outgoing-datagram-stream.send")
+    as "wasi:sockets/udp@0.2.12#[method]outgoing-datagram-stream.send"
 ```
 
 Calls `wasi:sockets/udp@0.2.12#[method]outgoing-datagram-stream.send` with its canonical ABI.
@@ -1895,7 +1895,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_udp_outgoing_datagram_stream_subscribe(p0: u32) -> u32
-    as "silk_wasip2_sockets_udp_outgoing_datagram_stream_subscribe" with Intrinsic.foreign(module: "wasi:sockets/udp@0.2.12", name: "[method]outgoing-datagram-stream.subscribe")
+    as "wasi:sockets/udp@0.2.12#[method]outgoing-datagram-stream.subscribe"
 ```
 
 Calls `wasi:sockets/udp@0.2.12#[method]outgoing-datagram-stream.subscribe` with its canonical ABI.
@@ -1907,7 +1907,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_udp_drop_udp_socket(p0: u32) -> ()
-    as "silk_wasip2_sockets_udp_drop_udp_socket" with Intrinsic.foreign(module: "wasi:sockets/udp@0.2.12", name: "[resource-drop]udp-socket")
+    as "wasi:sockets/udp@0.2.12#[resource-drop]udp-socket"
 ```
 
 Calls `wasi:sockets/udp@0.2.12#[resource-drop]udp-socket` with its canonical ABI.
@@ -1919,7 +1919,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_udp_drop_incoming_datagram_stream(p0: u32) -> ()
-    as "silk_wasip2_sockets_udp_drop_incoming_datagram_stream" with Intrinsic.foreign(module: "wasi:sockets/udp@0.2.12", name: "[resource-drop]incoming-datagram-stream")
+    as "wasi:sockets/udp@0.2.12#[resource-drop]incoming-datagram-stream"
 ```
 
 Calls `wasi:sockets/udp@0.2.12#[resource-drop]incoming-datagram-stream` with its canonical ABI.
@@ -1931,7 +1931,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_udp_drop_outgoing_datagram_stream(p0: u32) -> ()
-    as "silk_wasip2_sockets_udp_drop_outgoing_datagram_stream" with Intrinsic.foreign(module: "wasi:sockets/udp@0.2.12", name: "[resource-drop]outgoing-datagram-stream")
+    as "wasi:sockets/udp@0.2.12#[resource-drop]outgoing-datagram-stream"
 ```
 
 Calls `wasi:sockets/udp@0.2.12#[resource-drop]outgoing-datagram-stream` with its canonical ABI.
@@ -1943,7 +1943,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_udp_create_socket_create_udp_socket(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_sockets_udp_create_socket_create_udp_socket" with Intrinsic.foreign(module: "wasi:sockets/udp-create-socket@0.2.12", name: "create-udp-socket")
+    as "wasi:sockets/udp-create-socket@0.2.12#create-udp-socket"
 ```
 
 Calls `wasi:sockets/udp-create-socket@0.2.12#create-udp-socket` with its canonical ABI.
@@ -1955,7 +1955,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_tcp_socket_start_bind(p0: u32, p1: u32, p2: u32, p3: u32, p4: u32, p5: u32, p6: u32, p7: u32, p8: u32, p9: u32, p10: u32, p11: u32, p12: u32, p13: u32, p14: u32) -> ()
-    as "silk_wasip2_sockets_tcp_tcp_socket_start_bind" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[method]tcp-socket.start-bind")
+    as "wasi:sockets/tcp@0.2.12#[method]tcp-socket.start-bind"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[method]tcp-socket.start-bind` with its canonical ABI.
@@ -1967,7 +1967,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_tcp_socket_finish_bind(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_sockets_tcp_tcp_socket_finish_bind" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[method]tcp-socket.finish-bind")
+    as "wasi:sockets/tcp@0.2.12#[method]tcp-socket.finish-bind"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[method]tcp-socket.finish-bind` with its canonical ABI.
@@ -1979,7 +1979,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_tcp_socket_start_connect(p0: u32, p1: u32, p2: u32, p3: u32, p4: u32, p5: u32, p6: u32, p7: u32, p8: u32, p9: u32, p10: u32, p11: u32, p12: u32, p13: u32, p14: u32) -> ()
-    as "silk_wasip2_sockets_tcp_tcp_socket_start_connect" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[method]tcp-socket.start-connect")
+    as "wasi:sockets/tcp@0.2.12#[method]tcp-socket.start-connect"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[method]tcp-socket.start-connect` with its canonical ABI.
@@ -1991,7 +1991,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_tcp_socket_finish_connect(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_sockets_tcp_tcp_socket_finish_connect" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[method]tcp-socket.finish-connect")
+    as "wasi:sockets/tcp@0.2.12#[method]tcp-socket.finish-connect"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[method]tcp-socket.finish-connect` with its canonical ABI.
@@ -2003,7 +2003,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_tcp_socket_start_listen(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_sockets_tcp_tcp_socket_start_listen" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[method]tcp-socket.start-listen")
+    as "wasi:sockets/tcp@0.2.12#[method]tcp-socket.start-listen"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[method]tcp-socket.start-listen` with its canonical ABI.
@@ -2015,7 +2015,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_tcp_socket_finish_listen(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_sockets_tcp_tcp_socket_finish_listen" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[method]tcp-socket.finish-listen")
+    as "wasi:sockets/tcp@0.2.12#[method]tcp-socket.finish-listen"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[method]tcp-socket.finish-listen` with its canonical ABI.
@@ -2027,7 +2027,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_tcp_socket_accept(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_sockets_tcp_tcp_socket_accept" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[method]tcp-socket.accept")
+    as "wasi:sockets/tcp@0.2.12#[method]tcp-socket.accept"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[method]tcp-socket.accept` with its canonical ABI.
@@ -2039,7 +2039,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_tcp_socket_local_address(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_sockets_tcp_tcp_socket_local_address" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[method]tcp-socket.local-address")
+    as "wasi:sockets/tcp@0.2.12#[method]tcp-socket.local-address"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[method]tcp-socket.local-address` with its canonical ABI.
@@ -2051,7 +2051,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_tcp_socket_remote_address(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_sockets_tcp_tcp_socket_remote_address" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[method]tcp-socket.remote-address")
+    as "wasi:sockets/tcp@0.2.12#[method]tcp-socket.remote-address"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[method]tcp-socket.remote-address` with its canonical ABI.
@@ -2063,7 +2063,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_tcp_socket_is_listening(p0: u32) -> u32
-    as "silk_wasip2_sockets_tcp_tcp_socket_is_listening" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[method]tcp-socket.is-listening")
+    as "wasi:sockets/tcp@0.2.12#[method]tcp-socket.is-listening"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[method]tcp-socket.is-listening` with its canonical ABI.
@@ -2075,7 +2075,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_tcp_socket_address_family(p0: u32) -> u32
-    as "silk_wasip2_sockets_tcp_tcp_socket_address_family" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[method]tcp-socket.address-family")
+    as "wasi:sockets/tcp@0.2.12#[method]tcp-socket.address-family"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[method]tcp-socket.address-family` with its canonical ABI.
@@ -2087,7 +2087,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_tcp_socket_set_listen_backlog_size(p0: u32, p1: u64, p2: u32) -> ()
-    as "silk_wasip2_sockets_tcp_tcp_socket_set_listen_backlog_size" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[method]tcp-socket.set-listen-backlog-size")
+    as "wasi:sockets/tcp@0.2.12#[method]tcp-socket.set-listen-backlog-size"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[method]tcp-socket.set-listen-backlog-size` with its canonical ABI.
@@ -2099,7 +2099,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_tcp_socket_keep_alive_enabled(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_sockets_tcp_tcp_socket_keep_alive_enabled" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[method]tcp-socket.keep-alive-enabled")
+    as "wasi:sockets/tcp@0.2.12#[method]tcp-socket.keep-alive-enabled"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[method]tcp-socket.keep-alive-enabled` with its canonical ABI.
@@ -2111,7 +2111,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_tcp_socket_set_keep_alive_enabled(p0: u32, p1: u32, p2: u32) -> ()
-    as "silk_wasip2_sockets_tcp_tcp_socket_set_keep_alive_enabled" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[method]tcp-socket.set-keep-alive-enabled")
+    as "wasi:sockets/tcp@0.2.12#[method]tcp-socket.set-keep-alive-enabled"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[method]tcp-socket.set-keep-alive-enabled` with its canonical ABI.
@@ -2123,7 +2123,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_tcp_socket_keep_alive_idle_time(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_sockets_tcp_tcp_socket_keep_alive_idle_time" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[method]tcp-socket.keep-alive-idle-time")
+    as "wasi:sockets/tcp@0.2.12#[method]tcp-socket.keep-alive-idle-time"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[method]tcp-socket.keep-alive-idle-time` with its canonical ABI.
@@ -2135,7 +2135,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_tcp_socket_set_keep_alive_idle_time(p0: u32, p1: u64, p2: u32) -> ()
-    as "silk_wasip2_sockets_tcp_tcp_socket_set_keep_alive_idle_time" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[method]tcp-socket.set-keep-alive-idle-time")
+    as "wasi:sockets/tcp@0.2.12#[method]tcp-socket.set-keep-alive-idle-time"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[method]tcp-socket.set-keep-alive-idle-time` with its canonical ABI.
@@ -2147,7 +2147,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_tcp_socket_keep_alive_interval(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_sockets_tcp_tcp_socket_keep_alive_interval" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[method]tcp-socket.keep-alive-interval")
+    as "wasi:sockets/tcp@0.2.12#[method]tcp-socket.keep-alive-interval"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[method]tcp-socket.keep-alive-interval` with its canonical ABI.
@@ -2159,7 +2159,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_tcp_socket_set_keep_alive_interval(p0: u32, p1: u64, p2: u32) -> ()
-    as "silk_wasip2_sockets_tcp_tcp_socket_set_keep_alive_interval" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[method]tcp-socket.set-keep-alive-interval")
+    as "wasi:sockets/tcp@0.2.12#[method]tcp-socket.set-keep-alive-interval"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[method]tcp-socket.set-keep-alive-interval` with its canonical ABI.
@@ -2171,7 +2171,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_tcp_socket_keep_alive_count(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_sockets_tcp_tcp_socket_keep_alive_count" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[method]tcp-socket.keep-alive-count")
+    as "wasi:sockets/tcp@0.2.12#[method]tcp-socket.keep-alive-count"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[method]tcp-socket.keep-alive-count` with its canonical ABI.
@@ -2183,7 +2183,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_tcp_socket_set_keep_alive_count(p0: u32, p1: u32, p2: u32) -> ()
-    as "silk_wasip2_sockets_tcp_tcp_socket_set_keep_alive_count" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[method]tcp-socket.set-keep-alive-count")
+    as "wasi:sockets/tcp@0.2.12#[method]tcp-socket.set-keep-alive-count"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[method]tcp-socket.set-keep-alive-count` with its canonical ABI.
@@ -2195,7 +2195,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_tcp_socket_hop_limit(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_sockets_tcp_tcp_socket_hop_limit" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[method]tcp-socket.hop-limit")
+    as "wasi:sockets/tcp@0.2.12#[method]tcp-socket.hop-limit"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[method]tcp-socket.hop-limit` with its canonical ABI.
@@ -2207,7 +2207,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_tcp_socket_set_hop_limit(p0: u32, p1: u32, p2: u32) -> ()
-    as "silk_wasip2_sockets_tcp_tcp_socket_set_hop_limit" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[method]tcp-socket.set-hop-limit")
+    as "wasi:sockets/tcp@0.2.12#[method]tcp-socket.set-hop-limit"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[method]tcp-socket.set-hop-limit` with its canonical ABI.
@@ -2219,7 +2219,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_tcp_socket_receive_buffer_size(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_sockets_tcp_tcp_socket_receive_buffer_size" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[method]tcp-socket.receive-buffer-size")
+    as "wasi:sockets/tcp@0.2.12#[method]tcp-socket.receive-buffer-size"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[method]tcp-socket.receive-buffer-size` with its canonical ABI.
@@ -2231,7 +2231,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_tcp_socket_set_receive_buffer_size(p0: u32, p1: u64, p2: u32) -> ()
-    as "silk_wasip2_sockets_tcp_tcp_socket_set_receive_buffer_size" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[method]tcp-socket.set-receive-buffer-size")
+    as "wasi:sockets/tcp@0.2.12#[method]tcp-socket.set-receive-buffer-size"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[method]tcp-socket.set-receive-buffer-size` with its canonical ABI.
@@ -2243,7 +2243,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_tcp_socket_send_buffer_size(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_sockets_tcp_tcp_socket_send_buffer_size" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[method]tcp-socket.send-buffer-size")
+    as "wasi:sockets/tcp@0.2.12#[method]tcp-socket.send-buffer-size"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[method]tcp-socket.send-buffer-size` with its canonical ABI.
@@ -2255,7 +2255,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_tcp_socket_set_send_buffer_size(p0: u32, p1: u64, p2: u32) -> ()
-    as "silk_wasip2_sockets_tcp_tcp_socket_set_send_buffer_size" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[method]tcp-socket.set-send-buffer-size")
+    as "wasi:sockets/tcp@0.2.12#[method]tcp-socket.set-send-buffer-size"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[method]tcp-socket.set-send-buffer-size` with its canonical ABI.
@@ -2267,7 +2267,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_tcp_socket_subscribe(p0: u32) -> u32
-    as "silk_wasip2_sockets_tcp_tcp_socket_subscribe" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[method]tcp-socket.subscribe")
+    as "wasi:sockets/tcp@0.2.12#[method]tcp-socket.subscribe"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[method]tcp-socket.subscribe` with its canonical ABI.
@@ -2279,7 +2279,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_tcp_socket_shutdown(p0: u32, p1: u32, p2: u32) -> ()
-    as "silk_wasip2_sockets_tcp_tcp_socket_shutdown" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[method]tcp-socket.shutdown")
+    as "wasi:sockets/tcp@0.2.12#[method]tcp-socket.shutdown"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[method]tcp-socket.shutdown` with its canonical ABI.
@@ -2291,7 +2291,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_drop_tcp_socket(p0: u32) -> ()
-    as "silk_wasip2_sockets_tcp_drop_tcp_socket" with Intrinsic.foreign(module: "wasi:sockets/tcp@0.2.12", name: "[resource-drop]tcp-socket")
+    as "wasi:sockets/tcp@0.2.12#[resource-drop]tcp-socket"
 ```
 
 Calls `wasi:sockets/tcp@0.2.12#[resource-drop]tcp-socket` with its canonical ABI.
@@ -2303,7 +2303,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_tcp_create_socket_create_tcp_socket(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_sockets_tcp_create_socket_create_tcp_socket" with Intrinsic.foreign(module: "wasi:sockets/tcp-create-socket@0.2.12", name: "create-tcp-socket")
+    as "wasi:sockets/tcp-create-socket@0.2.12#create-tcp-socket"
 ```
 
 Calls `wasi:sockets/tcp-create-socket@0.2.12#create-tcp-socket` with its canonical ABI.
@@ -2315,7 +2315,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_ip_name_lookup_resolve_address_stream_resolve_next_address(p0: u32, p1: u32) -> ()
-    as "silk_wasip2_sockets_ip_name_lookup_resolve_address_stream_resolve_next_address" with Intrinsic.foreign(module: "wasi:sockets/ip-name-lookup@0.2.12", name: "[method]resolve-address-stream.resolve-next-address")
+    as "wasi:sockets/ip-name-lookup@0.2.12#[method]resolve-address-stream.resolve-next-address"
 ```
 
 Calls `wasi:sockets/ip-name-lookup@0.2.12#[method]resolve-address-stream.resolve-next-address` with its canonical ABI.
@@ -2327,7 +2327,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_ip_name_lookup_resolve_address_stream_subscribe(p0: u32) -> u32
-    as "silk_wasip2_sockets_ip_name_lookup_resolve_address_stream_subscribe" with Intrinsic.foreign(module: "wasi:sockets/ip-name-lookup@0.2.12", name: "[method]resolve-address-stream.subscribe")
+    as "wasi:sockets/ip-name-lookup@0.2.12#[method]resolve-address-stream.subscribe"
 ```
 
 Calls `wasi:sockets/ip-name-lookup@0.2.12#[method]resolve-address-stream.subscribe` with its canonical ABI.
@@ -2339,7 +2339,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_ip_name_lookup_resolve_addresses(p0: u32, p1: u32, p2: u32, p3: u32) -> ()
-    as "silk_wasip2_sockets_ip_name_lookup_resolve_addresses" with Intrinsic.foreign(module: "wasi:sockets/ip-name-lookup@0.2.12", name: "resolve-addresses")
+    as "wasi:sockets/ip-name-lookup@0.2.12#resolve-addresses"
 ```
 
 Calls `wasi:sockets/ip-name-lookup@0.2.12#resolve-addresses` with its canonical ABI.
@@ -2351,7 +2351,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn sockets_ip_name_lookup_drop_resolve_address_stream(p0: u32) -> ()
-    as "silk_wasip2_sockets_ip_name_lookup_drop_resolve_address_stream" with Intrinsic.foreign(module: "wasi:sockets/ip-name-lookup@0.2.12", name: "[resource-drop]resolve-address-stream")
+    as "wasi:sockets/ip-name-lookup@0.2.12#[resource-drop]resolve-address-stream"
 ```
 
 Calls `wasi:sockets/ip-name-lookup@0.2.12#[resource-drop]resolve-address-stream` with its canonical ABI.
@@ -2363,7 +2363,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn random_random_get_random_bytes(p0: u64, p1: u32) -> ()
-    as "silk_wasip2_random_random_get_random_bytes" with Intrinsic.foreign(module: "wasi:random/random@0.2.12", name: "get-random-bytes")
+    as "wasi:random/random@0.2.12#get-random-bytes"
 ```
 
 Calls `wasi:random/random@0.2.12#get-random-bytes` with its canonical ABI.
@@ -2375,7 +2375,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn random_random_get_random_u64() -> u64
-    as "silk_wasip2_random_random_get_random_u64" with Intrinsic.foreign(module: "wasi:random/random@0.2.12", name: "get-random-u64")
+    as "wasi:random/random@0.2.12#get-random-u64"
 ```
 
 Calls `wasi:random/random@0.2.12#get-random-u64` with its canonical ABI.
@@ -2387,7 +2387,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn random_insecure_get_insecure_random_bytes(p0: u64, p1: u32) -> ()
-    as "silk_wasip2_random_insecure_get_insecure_random_bytes" with Intrinsic.foreign(module: "wasi:random/insecure@0.2.12", name: "get-insecure-random-bytes")
+    as "wasi:random/insecure@0.2.12#get-insecure-random-bytes"
 ```
 
 Calls `wasi:random/insecure@0.2.12#get-insecure-random-bytes` with its canonical ABI.
@@ -2399,7 +2399,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn random_insecure_get_insecure_random_u64() -> u64
-    as "silk_wasip2_random_insecure_get_insecure_random_u64" with Intrinsic.foreign(module: "wasi:random/insecure@0.2.12", name: "get-insecure-random-u64")
+    as "wasi:random/insecure@0.2.12#get-insecure-random-u64"
 ```
 
 Calls `wasi:random/insecure@0.2.12#get-insecure-random-u64` with its canonical ABI.
@@ -2411,7 +2411,7 @@ The caller supplies valid handles and memory, and honors the WIT ownership contr
 
 ```silk
 pub unsafe extern "C" fn random_insecure_seed_insecure_seed(p0: u32) -> ()
-    as "silk_wasip2_random_insecure_seed_insecure_seed" with Intrinsic.foreign(module: "wasi:random/insecure-seed@0.2.12", name: "insecure-seed")
+    as "wasi:random/insecure-seed@0.2.12#insecure-seed"
 ```
 
 Calls `wasi:random/insecure-seed@0.2.12#insecure-seed` with its canonical ABI.

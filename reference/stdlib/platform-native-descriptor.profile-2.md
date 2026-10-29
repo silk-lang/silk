@@ -58,7 +58,7 @@ Public declarations: 5.
 ## `read`
 
 ```silk
-pub unsafe extern "C" fn read(fd: i32, buffer: ?[*]mut u8, count: usize) -> isize with Intrinsic.foreign(noCapture: ("buffer",))
+pub unsafe extern "C" fn read(fd: i32, buffer: ?[*]mut u8, count: usize) -> isize
 ```
 
 The C `read` function: reads at most `count` bytes from `fd` into `buffer`.
@@ -72,7 +72,7 @@ error code at once.
 ## `write`
 
 ```silk
-pub unsafe extern "C" fn write(fd: i32, buffer: ?[*]const u8, count: usize) -> isize with Intrinsic.foreign(noCapture: ("buffer",))
+pub unsafe extern "C" fn write(fd: i32, buffer: ?[*]const u8, count: usize) -> isize
 ```
 
 The C `write` function: writes at most `count` bytes from `buffer` to `fd`.

@@ -394,7 +394,7 @@ The descriptor event flags.
 pub unsafe extern "C" fn args_get(
     argv: ?[*]mut ?[*]mut u8,
     buffer: ?[*]mut u8
-  ) -> u32 as "silk_wasi_args_get" with Intrinsic.foreign(noCapture: ("argv", "buffer"))
+  ) -> u32 as "silk_wasi_args_get"
 ```
 
 Calls WASI `args_get` with the Preview 1 ABI.
@@ -410,7 +410,7 @@ All pointers must address the buffers and structures that the WASI specification
 pub unsafe extern "C" fn args_sizes_get(
     count: *mut u32,
     size: *mut u32
-  ) -> u32 as "silk_wasi_args_sizes_get" with Intrinsic.foreign(noCapture: ("count", "size"))
+  ) -> u32 as "silk_wasi_args_sizes_get"
 ```
 
 Calls WASI `args_sizes_get` with the Preview 1 ABI.
@@ -426,7 +426,7 @@ All pointers must address the buffers and structures that the WASI specification
 pub unsafe extern "C" fn environ_get(
     environ: ?[*]mut ?[*]mut u8,
     buffer: ?[*]mut u8
-  ) -> u32 as "silk_wasi_environ_get" with Intrinsic.foreign(noCapture: ("environ", "buffer"))
+  ) -> u32 as "silk_wasi_environ_get"
 ```
 
 Calls WASI `environ_get` with the Preview 1 ABI.
@@ -442,7 +442,7 @@ All pointers must address the buffers and structures that the WASI specification
 pub unsafe extern "C" fn environ_sizes_get(
     count: *mut u32,
     size: *mut u32
-  ) -> u32 as "silk_wasi_environ_sizes_get" with Intrinsic.foreign(noCapture: ("count", "size"))
+  ) -> u32 as "silk_wasi_environ_sizes_get"
 ```
 
 Calls WASI `environ_sizes_get` with the Preview 1 ABI.
@@ -458,7 +458,7 @@ All pointers must address the buffers and structures that the WASI specification
 pub unsafe extern "C" fn clock_res_get(
     clock: u32,
     resolution: *mut u64
-  ) -> u32 as "silk_wasi_clock_res_get" with Intrinsic.foreign(noCapture: ("resolution",))
+  ) -> u32 as "silk_wasi_clock_res_get"
 ```
 
 Calls WASI `clock_res_get` with the Preview 1 ABI.
@@ -475,7 +475,7 @@ pub unsafe extern "C" fn clock_time_get(
     clock: u32,
     precision: u64,
     time: *mut u64
-  ) -> u32 as "silk_wasi_clock_time_get" with Intrinsic.foreign(noCapture: ("time",))
+  ) -> u32 as "silk_wasi_clock_time_get"
 ```
 
 Calls WASI `clock_time_get` with the Preview 1 ABI.
@@ -552,7 +552,7 @@ All pointers must address the buffers and structures that the WASI specification
 pub unsafe extern "C" fn fd_fdstat_get(
     fd: u32,
     stat: *mut FdStat
-  ) -> u32 as "silk_wasi_fd_fdstat_get" with Intrinsic.foreign(noCapture: ("stat",))
+  ) -> u32 as "silk_wasi_fd_fdstat_get"
 ```
 
 Calls WASI `fd_fdstat_get` with the Preview 1 ABI.
@@ -601,7 +601,7 @@ All pointers must address the buffers and structures that the WASI specification
 pub unsafe extern "C" fn fd_filestat_get(
     fd: u32,
     stat: *mut FileStat
-  ) -> u32 as "silk_wasi_fd_filestat_get" with Intrinsic.foreign(noCapture: ("stat",))
+  ) -> u32 as "silk_wasi_fd_filestat_get"
 ```
 
 Calls WASI `fd_filestat_get` with the Preview 1 ABI.
@@ -654,7 +654,7 @@ pub unsafe extern "C" fn fd_pread(
     count: u32,
     offset: u64,
     read: *mut u32
-  ) -> u32 as "silk_wasi_fd_pread" with Intrinsic.foreign(noCapture: ("vectors", "read"))
+  ) -> u32 as "silk_wasi_fd_pread"
 ```
 
 Calls WASI `fd_pread` with the Preview 1 ABI.
@@ -670,7 +670,7 @@ All pointers must address the buffers and structures that the WASI specification
 pub unsafe extern "C" fn fd_prestat_get(
     fd: u32,
     stat: *mut Prestat
-  ) -> u32 as "silk_wasi_fd_prestat_get" with Intrinsic.foreign(noCapture: ("stat",))
+  ) -> u32 as "silk_wasi_fd_prestat_get"
 ```
 
 Calls WASI `fd_prestat_get` with the Preview 1 ABI.
@@ -687,7 +687,7 @@ pub unsafe extern "C" fn fd_prestat_dir_name(
     fd: u32,
     path: ?[*]mut u8,
     length: u32
-  ) -> u32 as "silk_wasi_fd_prestat_dir_name" with Intrinsic.foreign(noCapture: ("path",))
+  ) -> u32 as "silk_wasi_fd_prestat_dir_name"
 ```
 
 Calls WASI `fd_prestat_dir_name` with the Preview 1 ABI.
@@ -706,7 +706,7 @@ pub unsafe extern "C" fn fd_pwrite(
     count: u32,
     offset: u64,
     written: *mut u32
-  ) -> u32 as "silk_wasi_fd_pwrite" with Intrinsic.foreign(noCapture: ("vectors", "written"))
+  ) -> u32 as "silk_wasi_fd_pwrite"
 ```
 
 Calls WASI `fd_pwrite` with the Preview 1 ABI.
@@ -724,7 +724,7 @@ pub unsafe extern "C" fn fd_read(
     vectors: ?[*]const IoVector,
     count: u32,
     read: *mut u32
-  ) -> u32 as "silk_wasi_fd_read" with Intrinsic.foreign(noCapture: ("vectors", "read"))
+  ) -> u32 as "silk_wasi_fd_read"
 ```
 
 Calls WASI `fd_read` with the Preview 1 ABI.
@@ -743,7 +743,7 @@ pub unsafe extern "C" fn fd_readdir(
     length: u32,
     cookie: u64,
     used: *mut u32
-  ) -> u32 as "silk_wasi_fd_readdir" with Intrinsic.foreign(noCapture: ("buffer", "used"))
+  ) -> u32 as "silk_wasi_fd_readdir"
 ```
 
 Calls WASI `fd_readdir` with the Preview 1 ABI.
@@ -774,7 +774,7 @@ pub unsafe extern "C" fn fd_seek(
     offset: i64,
     whence: u32,
     position: *mut u64
-  ) -> u32 as "silk_wasi_fd_seek" with Intrinsic.foreign(noCapture: ("position",))
+  ) -> u32 as "silk_wasi_fd_seek"
 ```
 
 Calls WASI `fd_seek` with the Preview 1 ABI.
@@ -803,7 +803,7 @@ All pointers must address the buffers and structures that the WASI specification
 pub unsafe extern "C" fn fd_tell(
     fd: u32,
     position: *mut u64
-  ) -> u32 as "silk_wasi_fd_tell" with Intrinsic.foreign(noCapture: ("position",))
+  ) -> u32 as "silk_wasi_fd_tell"
 ```
 
 Calls WASI `fd_tell` with the Preview 1 ABI.
@@ -821,7 +821,7 @@ pub unsafe extern "C" fn fd_write(
     vectors: ?[*]const ConstIoVector,
     count: u32,
     written: *mut u32
-  ) -> u32 as "silk_wasi_fd_write" with Intrinsic.foreign(noCapture: ("vectors", "written"))
+  ) -> u32 as "silk_wasi_fd_write"
 ```
 
 Calls WASI `fd_write` with the Preview 1 ABI.
@@ -838,7 +838,7 @@ pub unsafe extern "C" fn path_create_directory(
     fd: u32,
     path: ?[*]const u8,
     length: u32
-  ) -> u32 as "silk_wasi_path_create_directory" with Intrinsic.foreign(noCapture: ("path",))
+  ) -> u32 as "silk_wasi_path_create_directory"
 ```
 
 Calls WASI `path_create_directory` with the Preview 1 ABI.
@@ -857,7 +857,7 @@ pub unsafe extern "C" fn path_filestat_get(
     path: ?[*]const u8,
     length: u32,
     stat: *mut FileStat
-  ) -> u32 as "silk_wasi_path_filestat_get" with Intrinsic.foreign(noCapture: ("path", "stat"))
+  ) -> u32 as "silk_wasi_path_filestat_get"
 ```
 
 Calls WASI `path_filestat_get` with the Preview 1 ABI.
@@ -878,7 +878,7 @@ pub unsafe extern "C" fn path_filestat_set_times(
     access: u64,
     modified: u64,
     flags: u32
-  ) -> u32 as "silk_wasi_path_filestat_set_times" with Intrinsic.foreign(noCapture: ("path",))
+  ) -> u32 as "silk_wasi_path_filestat_set_times"
 ```
 
 Calls WASI `path_filestat_set_times` with the Preview 1 ABI.
@@ -899,7 +899,7 @@ pub unsafe extern "C" fn path_link(
     newfd: u32,
     newpath: ?[*]const u8,
     newlength: u32
-  ) -> u32 as "silk_wasi_path_link" with Intrinsic.foreign(noCapture: ("oldpath", "newpath"))
+  ) -> u32 as "silk_wasi_path_link"
 ```
 
 Calls WASI `path_link` with the Preview 1 ABI.
@@ -922,7 +922,7 @@ pub unsafe extern "C" fn path_open(
     inheriting: u64,
     descriptorFlags: u32,
     opened: *mut u32
-  ) -> u32 as "silk_wasi_path_open" with Intrinsic.foreign(noCapture: ("path", "opened"))
+  ) -> u32 as "silk_wasi_path_open"
 ```
 
 Calls WASI `path_open` with the Preview 1 ABI.
@@ -942,11 +942,7 @@ pub unsafe extern "C" fn path_readlink(
     buffer: ?[*]mut u8,
     capacity: u32,
     used: *mut u32
-  ) -> u32 as "silk_wasi_path_readlink" with Intrinsic.foreign(noCapture: (
-    "path",
-    "buffer",
-    "used"
-  ))
+  ) -> u32 as "silk_wasi_path_readlink"
 ```
 
 Calls WASI `path_readlink` with the Preview 1 ABI.
@@ -963,7 +959,7 @@ pub unsafe extern "C" fn path_remove_directory(
     fd: u32,
     path: ?[*]const u8,
     length: u32
-  ) -> u32 as "silk_wasi_path_remove_directory" with Intrinsic.foreign(noCapture: ("path",))
+  ) -> u32 as "silk_wasi_path_remove_directory"
 ```
 
 Calls WASI `path_remove_directory` with the Preview 1 ABI.
@@ -983,7 +979,7 @@ pub unsafe extern "C" fn path_rename(
     newfd: u32,
     newpath: ?[*]const u8,
     newlength: u32
-  ) -> u32 as "silk_wasi_path_rename" with Intrinsic.foreign(noCapture: ("oldpath", "newpath"))
+  ) -> u32 as "silk_wasi_path_rename"
 ```
 
 Calls WASI `path_rename` with the Preview 1 ABI.
@@ -1002,7 +998,7 @@ pub unsafe extern "C" fn path_symlink(
     fd: u32,
     newpath: ?[*]const u8,
     newlength: u32
-  ) -> u32 as "silk_wasi_path_symlink" with Intrinsic.foreign(noCapture: ("oldpath", "newpath"))
+  ) -> u32 as "silk_wasi_path_symlink"
 ```
 
 Calls WASI `path_symlink` with the Preview 1 ABI.
@@ -1019,7 +1015,7 @@ pub unsafe extern "C" fn path_unlink_file(
     fd: u32,
     path: ?[*]const u8,
     length: u32
-  ) -> u32 as "silk_wasi_path_unlink_file" with Intrinsic.foreign(noCapture: ("path",))
+  ) -> u32 as "silk_wasi_path_unlink_file"
 ```
 
 Calls WASI `path_unlink_file` with the Preview 1 ABI.
@@ -1037,11 +1033,7 @@ pub unsafe extern "C" fn poll_oneoff(
     events: ?[*]mut Event,
     count: u32,
     received: *mut u32
-  ) -> u32 as "silk_wasi_poll_oneoff" with Intrinsic.foreign(noCapture: (
-    "subscriptions",
-    "events",
-    "received"
-  ))
+  ) -> u32 as "silk_wasi_poll_oneoff"
 ```
 
 Calls WASI `poll_oneoff` with the Preview 1 ABI.
@@ -1084,7 +1076,7 @@ All pointers must address the buffers and structures that the WASI specification
 pub unsafe extern "C" fn random_get(
     buffer: ?[*]mut u8,
     length: u32
-  ) -> u32 as "silk_wasi_random_get" with Intrinsic.foreign(noCapture: ("buffer",))
+  ) -> u32 as "silk_wasi_random_get"
 ```
 
 Calls WASI `random_get` with the Preview 1 ABI.
@@ -1114,7 +1106,7 @@ pub unsafe extern "C" fn sock_accept(
     fd: u32,
     flags: u32,
     accepted: *mut u32
-  ) -> u32 as "silk_wasi_sock_accept" with Intrinsic.foreign(noCapture: ("accepted",))
+  ) -> u32 as "silk_wasi_sock_accept"
 ```
 
 Calls WASI `sock_accept` with the Preview 1 ABI.
@@ -1134,11 +1126,7 @@ pub unsafe extern "C" fn sock_recv(
     flags: u32,
     received: *mut u32,
     resultFlags: *mut u16
-  ) -> u32 as "silk_wasi_sock_recv" with Intrinsic.foreign(noCapture: (
-    "vectors",
-    "received",
-    "resultFlags"
-  ))
+  ) -> u32 as "silk_wasi_sock_recv"
 ```
 
 Calls WASI `sock_recv` with the Preview 1 ABI.
@@ -1157,7 +1145,7 @@ pub unsafe extern "C" fn sock_send(
     count: u32,
     flags: u32,
     sent: *mut u32
-  ) -> u32 as "silk_wasi_sock_send" with Intrinsic.foreign(noCapture: ("vectors", "sent"))
+  ) -> u32 as "silk_wasi_sock_send"
 ```
 
 Calls WASI `sock_send` with the Preview 1 ABI.
