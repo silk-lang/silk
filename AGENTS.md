@@ -6,8 +6,9 @@
   `compiler/native-seed.json`; `compiler/scripts/` holds the TypeScript tooling CI runs around it.
 - `stdlib/` is the standard library, `corpus/` the shared native acceptance corpus, and
   `reference/` the prescriptive language reference.
-- `bootstrap/` is the frozen TypeScript compiler. It only has to build the anchored first native
-  compiler (`bootstrap/anchor.json`); never extend it, and change it only when that build breaks.
+- There is no TypeScript compiler. The first native compiler, n0, was built by a TypeScript
+  bootstrap that now lives only in git history and the `bootstrap-v0.0.0` release; every later
+  compiler is built from a pinned native seed.
 
 ## Green-field policy
 

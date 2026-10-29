@@ -173,7 +173,7 @@ guard, endpoint, or suspended payload logically active, and it cannot resurrect 
 **Diagnostics:** Cleanup does not add a typed failure. Fatal traps use Silk's non-unwinding trap
 contract and do not promise post-trap cleanup.
 
-**Evidence:** [cleanup ownership model](../bootstrap/packages/compiler/src/SuspensionOwnership.ts),
+**Evidence:** [cleanup ownership model](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/SuspensionOwnership.ts),
 separation pressure tests,
 native corpus
 (`independent-execution-zero-sized-guard-cancel`, `effect-borrowed-recovery-park-resume-cancel`).
@@ -265,7 +265,7 @@ Dropping `InitialReady` performs the same unstarted-body cleanup as dropping `In
 Lifecycle admission failure occurs at runtime as a fatal trap outside Effect failure channels.
 
 **Evidence:** Execution package tests,
-[lifecycle transition actor](../bootstrap/packages/compiler/src/ExecutionTransition.ts).
+[lifecycle transition actor](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/ExecutionTransition.ts).
 
 ### EXEC-009 — The package protocol is safe when Wakes are signaled from other threads
 

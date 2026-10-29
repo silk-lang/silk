@@ -1,7 +1,7 @@
 # Acceptance corpus
 
-The shared acceptance corpus is plain data: one directory per program, read by both compilers'
-harnesses without the TypeScript compiler. `corpus.mjs` is the only reader and depends on Node
+The shared acceptance corpus is plain data: one directory per program, read by the native corpus
+harness. `corpus.mjs` is the only reader and depends on Node
 built-ins alone.
 
 - `native/<name>/` holds a program that compiles and runs natively.
@@ -44,7 +44,7 @@ The file is canonical JSON: keys sorted, two-space indentation, one trailing new
 A program under `invalid/` lists every diagnostic compilation must report, in the order the
 compiler reports them: its code and its span in `main.silk` as `line:column-line:column`, both
 1-based and counting characters. `formatSpan` in `corpus.mjs` writes this form. Messages are never
-compared. The bootstrap's tests and the native corpus harness both check the exact list: native
+compared. The native corpus harness checks the exact list: native
 programs that are still rejected with a different list are reported as `DIAGNOSTIC_PARITY` gaps,
 and an accepted program fails.
 

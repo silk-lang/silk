@@ -45,7 +45,7 @@ Dropping an Effect value does not run it. `drop answer()` constructs and discard
 `drop run answer()` executes it and discards its successful result.
 
 **Evidence:** expression-statement requirements,
-[semantic implementation](../bootstrap/packages/compiler/src/Elaboration.ts),
+[semantic implementation](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Elaboration.ts),
 elaboration tests.
 
 When the operand is an owned place, `drop place` performs cleanup on its live remainder, including

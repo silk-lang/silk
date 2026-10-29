@@ -59,7 +59,7 @@ malformed rather than reporting the complete Effect type as an undifferentiated 
 kind. The compiler may normalize a failure channel with internal set machinery, but no failure-row
 kind or value projection appears in source, semantic generic arguments, tooling, or runtime data.
 
-**Evidence:** [row representation](../bootstrap/packages/compiler/src/Type.ts).
+**Evidence:** [row representation](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Type.ts).
 
 ## EFF-008 — An effect function declares the contract of its returned Effect
 
@@ -183,8 +183,8 @@ is a result-type mismatch. A caller or later use cannot infer another result typ
 been written explicitly. Omitting `-> ()` is valid, including on `pub effect fn main()`, and must not
 produce a missing-entry or unresolved-result diagnostic.
 
-**Evidence:** [function grammar](../bootstrap/packages/compiler/src/Parser.ts),
-[declaration default](../bootstrap/packages/compiler/src/DeclarationCollection.ts).
+**Evidence:** [function grammar](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Parser.ts),
+[declaration default](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/DeclarationCollection.ts).
 
 ## EFF-011 — Omitted channels have fixed empty meanings
 
@@ -217,9 +217,9 @@ direction: visibility and recursion do not change the meaning of an omitted chan
 function has one locally readable contract. Tooling may propose an explicit contract edit, but the
 language does not silently infer one.
 
-**Evidence:** [function grammar](../bootstrap/packages/compiler/src/Parser.ts),
-[declaration defaults](../bootstrap/packages/compiler/src/DeclarationCollection.ts),
-[effect-block contract collection](../bootstrap/packages/compiler/src/ExpressionAnalysis.ts),
+**Evidence:** [function grammar](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Parser.ts),
+[declaration defaults](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/DeclarationCollection.ts),
+[effect-block contract collection](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/ExpressionAnalysis.ts),
 effect-block typing regressions.
 
 ## EFF-012 — Ordinary failure types and generic requirement rows preserve a contract
@@ -273,7 +273,7 @@ remain the distinct `?R` kind.
 
 **Evidence:** row-preserving ownership tests,
 generic effect-block failure regression,
-[contract-row inference diagnostics](../bootstrap/packages/compiler/src/Diagnostic.ts).
+[contract-row inference diagnostics](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Diagnostic.ts).
 
 ## EFF-013 — Compatible Effects may join across construction sites
 

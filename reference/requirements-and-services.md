@@ -180,8 +180,8 @@ table for interfaces and services.
 
 **Evidence:** earlier service mapping requirement,
 interface witness specification,
-[current parser](../bootstrap/packages/compiler/src/Parser.ts),
-[current conformance facts](../bootstrap/packages/compiler/src/DeclarationFacts.ts).
+[current parser](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Parser.ts),
+[current conformance facts](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/DeclarationFacts.ts).
 
 ## SERV-002 — Only services may be Effect requirements
 
@@ -237,7 +237,7 @@ it must not silently synthesize a service declaration or wrapper.
 requirement parameters, while concrete structs and ordinary interfaces receive `SEM0070`.
 
 **Evidence:** service declaration specification,
-[requirement validation](../bootstrap/packages/compiler/src/DeclarationResolution.ts).
+[requirement validation](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/DeclarationResolution.ts).
 
 ## SERV-003 — A service is a dependency-eligible interface
 
@@ -293,8 +293,8 @@ Effect dependency key is formed.
 
 **Evidence:** earlier service/interface distinction,
 interface contract specification,
-[current conformance facts](../bootstrap/packages/compiler/src/DeclarationFacts.ts),
-[current conformance proof](../bootstrap/packages/compiler/src/ConformanceProof.ts).
+[current conformance facts](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/DeclarationFacts.ts),
+[current conformance proof](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/ConformanceProof.ts).
 
 ## SERV-004 — A requirement key is a service and nominal role
 
@@ -366,8 +366,8 @@ normalized form.
 `DefaultRole`, strongest-access union normalization, and `at` spelling. The superseded `@` role
 spelling is not accepted as a compatibility alias.
 
-**Evidence:** [current requirement representation](../bootstrap/packages/compiler/src/Type.ts),
-[current row resolution](../bootstrap/packages/compiler/src/DeclarationResolution.ts),
+**Evidence:** [current requirement representation](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Type.ts),
+[current row resolution](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/DeclarationResolution.ts),
 current generic-row specification.
 
 ## SERV-005 — Generic requirement rows preserve normalized entries
@@ -408,7 +408,7 @@ while the generic body is checked.
 including nominal roles and access, and concrete specializations and diagnostics use `at` spelling.
 
 **Evidence:** [generic Effect-contract rule](effect-contracts.md#eff-012--ordinary-failure-types-and-generic-requirement-rows-preserve-a-contract),
-[current row inference](../bootstrap/packages/compiler/src/internal/TypeInference.ts),
+[current row inference](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/internal/TypeInference.ts),
 generic-row tests.
 
 ## SERV-006 — Requirement access and provider ownership are separate
@@ -460,8 +460,8 @@ call. The diagnostic must distinguish insufficient access from missing service c
 **Current compiler:** Aligned. Requirement rows store shared or exclusive access independently from
 provider binding, while provision separately supports shared, exclusive, and owned capture.
 
-**Evidence:** [provider-binding intrinsics](../bootstrap/packages/compiler/src/Intrinsic.ts),
-[provider-selection rules](../bootstrap/packages/compiler/src/ProviderSelection.ts),
+**Evidence:** [provider-binding intrinsics](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Intrinsic.ts),
+[provider-selection rules](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/ProviderSelection.ts),
 ownership tests.
 
 ## SERV-007 — Provision infers exactly one compatible requirement key
@@ -517,8 +517,8 @@ candidate using `at` spelling. Ambiguous conformance evidence for the selected k
 service-role keys; provider access is checked afterward. Selectors use `Clock` or
 `Clock at Primary`, and access-bearing selectors and the superseded `@` spelling are rejected.
 
-**Evidence:** [provider-selection implementation](../bootstrap/packages/compiler/src/ProviderSelection.ts),
-[provider-selection diagnostics](../bootstrap/packages/compiler/src/Diagnostic.ts),
+**Evidence:** [provider-selection implementation](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/ProviderSelection.ts),
+[provider-selection diagnostics](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Diagnostic.ts),
 provider-selection tests,
 flow-function provision specification.
 
@@ -561,8 +561,8 @@ providing nothing when its selected key is absent.
 complete normalized entry regardless of its retained access, and uses `at` for non-default roles.
 
 **Evidence:** current generic-row specification,
-[current type-level subtraction](../bootstrap/packages/compiler/src/Type.ts),
-[current provider wrappers](../bootstrap/packages/compiler/src/Stdlib.generated.ts).
+[current type-level subtraction](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Type.ts),
+[current provider wrappers](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Stdlib.generated.ts).
 
 ## SERV-009 — Provision is lazy, lexical, and applies to one Effect layer
 

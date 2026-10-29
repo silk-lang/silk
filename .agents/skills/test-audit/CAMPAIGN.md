@@ -3,7 +3,7 @@
 Use this mode only for an explicitly requested whole selfhost subsystem audit.
 [SKILL.md](SKILL.md)'s value bar, proof tiers, Linux timing budget, and LOUD GAPS
 rules apply throughout. Cover the requested surface without expanding into
-bootstrap tests or a repository-wide cleanup.
+a repository-wide cleanup.
 
 ## 1. Scope and baseline
 

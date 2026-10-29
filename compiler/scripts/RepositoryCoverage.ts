@@ -120,8 +120,6 @@ export const docPrograms = Effect.fn('RepositoryCoverage.docPrograms')(function*
 })
 
 export const exclusion = (path: string) => {
-  if (path.startsWith('bootstrap/'))
-    return 'Frozen TypeScript bootstrap; it only compiles the anchored first native compiler.'
   if (path.startsWith('compiler/src/'))
     return 'Compiler implementation and source cases; covered by self-build and native-cases.'
   if (path.startsWith('compiler/fixtures/'))

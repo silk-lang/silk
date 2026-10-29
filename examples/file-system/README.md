@@ -15,11 +15,12 @@ This minimal provider supports ordinary writes only. `createFile`, `writeFileAto
 atomic publication, or durability. Atomic-write failures report `published: false`, no cleanup
 failure, and an empty staging name because no staging file was created.
 
-This source is a standalone acceptance fixture rather than a manifest-based CLI project. Run its
-structured compiler checks from the repository root with:
+This source is a standalone acceptance fixture rather than a manifest-based CLI project. Selfhost
+CI's repository coverage builds and runs it; from the repository root you can do the same with:
 
 ```sh
-pnpm --filter @silklang/compiler exec vitest run test/FileSystemAcceptance.test.ts
+silk build examples/file-system/main.silk -o build/file-system --stdlib stdlib
+./build/file-system
 ```
 
 The process exits with `42`, the checksum of the four bytes written and read back.

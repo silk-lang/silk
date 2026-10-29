@@ -64,7 +64,7 @@ representations could have the same width. `u32`, `char`, and `f32` remain three
 **Diagnostics:** An unresolved type spelling reports `SEM0001`. A value declaration used where a
 type is required reports `SEM0018`.
 
-**Evidence:** [scalar catalog](../bootstrap/packages/compiler/src/Scalar.ts),
+**Evidence:** [scalar catalog](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Scalar.ts),
 integer scalar specification,
 floating scalar specification,
 string specification.
@@ -103,7 +103,7 @@ receives no conversion diagnostic when used at another expected type.
 
 **Evidence:** [unit result rule](effect-contracts.md#eff-010--omitting-the-result-annotation-declares-unit),
 [failure bottom rule](typed-failures.md#fail-002--fail-follows-ordinary-ownership-rules-and-has-type-never),
-[type compatibility](../bootstrap/packages/compiler/src/TypeCompatibility.ts).
+[type compatibility](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/TypeCompatibility.ts).
 
 ### TYPE-003 — Compatibility is exact except for closed named relations
 
@@ -137,7 +137,7 @@ runtime value fits, an array does not decay into a slice, and `string` does not 
 fields `SEM0025`, array elements `SEM0030`, assignments `SEM0037`, and incompatible union widening
 `SEM0040`. Return mismatches report `SEM0129`.
 
-**Evidence:** [compatibility implementation](../bootstrap/packages/compiler/src/TypeCompatibility.ts),
+**Evidence:** [compatibility implementation](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/TypeCompatibility.ts),
 [callable modes](functions-callables-and-control-flow.md#callable-003--invocation-mode-describes-access-to-the-callable-environment),
 [Effect access](ownership-and-borrowing.md#effect-own-002--run-access-derives-from-use-of-the-effect-environment).
 
@@ -305,7 +305,7 @@ origin. An unapplied generic alias used with missing or extra arguments receives
 type-argument arity diagnostic at the use. `type Both = A + B` receives one parser diagnostic,
 `PAR0002`, spanning the `+ B` tail, because a bound list is valid only in a generic parameter list.
 
-**Evidence:** [alias resolution](../bootstrap/packages/compiler/src/NameResolution.ts),
+**Evidence:** [alias resolution](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/NameResolution.ts),
 alias tests.
 
 ## Scalar values and literals
@@ -341,7 +341,7 @@ and pointer-sized integers implicitly. Such transformations require explicit ope
 
 **Evidence:** integer scalar specification,
 `usize` specification,
-[scalar catalog](../bootstrap/packages/compiler/src/Scalar.ts).
+[scalar catalog](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Scalar.ts).
 
 ### INT-002 — Integer literals are exact until an immediate context selects their type
 
@@ -427,7 +427,7 @@ The largest valid total is `18_446_744_073_709_551_615` nanoseconds. A larger ex
 module surface retains the exact scaled value, not the source padding or component grouping.
 
 **Evidence:** duration literal specification,
-[duration analysis and lowering](../bootstrap/packages/compiler/src/ExpressionAnalysis.ts),
+[duration analysis and lowering](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/ExpressionAnalysis.ts),
 integer-scalar duration tests,
 clock integration tests.
 
@@ -533,7 +533,7 @@ the ordinary type-mismatch diagnostic; `fromU32` represents an invalid integer a
 than a diagnostic or trap.
 
 **Evidence:** character literal specification,
-[character scalar catalog](../bootstrap/packages/compiler/src/Scalar.ts),
+[character scalar catalog](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Scalar.ts),
 character tests,
 conversion and engine tests.
 
@@ -711,7 +711,7 @@ private nominal type, and a direct or mutual inline field cycle does not acquire
 reports `SEM0019`; inline recursive layouts report `SEM0020`.
 
 **Evidence:** struct type specification,
-[declaration index](../bootstrap/packages/compiler/src/DeclarationIndex.ts).
+[declaration index](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/DeclarationIndex.ts).
 
 ### STRUCT-002 — Raw struct construction is complete and visibility-based
 
@@ -751,7 +751,7 @@ checks that field's visibility, and uses `SEM0021` when a required field is inac
 nominal type has no source struct declaration.
 
 **Evidence:** struct value tests,
-[struct literal elaboration](../bootstrap/packages/compiler/src/Elaboration.ts).
+[struct literal elaboration](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Elaboration.ts).
 
 ### STRUCT-003 — Field projection follows the declared nominal field
 
@@ -867,7 +867,7 @@ and the shared target-layout catalog is the single authority used before native 
 
 **Evidence:** C-layout record specification,
 target layout specification,
-[layout implementation](../bootstrap/packages/compiler/src/Layout.ts).
+[layout implementation](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Layout.ts).
 
 ## Tuples and contextual aggregate literals
 
@@ -1141,7 +1141,7 @@ ABI, or permission to reinterpret values. A backend cannot invent a fallback tag
 absent from the verified layout plan.
 
 **Evidence:** layout tests,
-[MIR verification](../bootstrap/packages/compiler/src/MirVerification.ts).
+[MIR verification](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/MirVerification.ts).
 
 ## Scalar enum values
 
@@ -1351,7 +1351,7 @@ type. Invalid elements do not create a partially initialized array.
 reports `SEM0030` at that element; a contextual length mismatch reports `SEM0031` at the literal.
 
 **Evidence:** fixed-array specification,
-[array elaboration](../bootstrap/packages/compiler/src/Elaboration.ts).
+[array elaboration](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Elaboration.ts).
 
 ### ARRAY-003 — A repeated array evaluates one value and repeats its storage
 
@@ -1427,7 +1427,7 @@ out-of-bounds index `SEM0034`. A dynamic overrun is a runtime trap rather than a
 
 **Evidence:** fixed-array indexing,
 slice indexing,
-[index diagnostics](../bootstrap/packages/compiler/src/Diagnostic.ts).
+[index diagnostics](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Diagnostic.ts).
 
 ### VIEW-001 — References and slices include access mode in their type
 
@@ -1514,9 +1514,9 @@ are, and instance keys treat it as an ordinary concrete runtime type that does n
 pointee's instances.
 
 **Evidence:** raw pointer specification,
-[pointer type variant](../bootstrap/packages/compiler/src/Type.ts),
-[pointer layout](../bootstrap/packages/compiler/src/Layout.ts),
-[C ABI classification](../bootstrap/packages/compiler/src/CAbi.ts).
+[pointer type variant](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Type.ts),
+[pointer layout](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Layout.ts),
+[C ABI classification](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/CAbi.ts).
 
 ### PTR-002 — Pointer primitives are sealed and split by safety
 
@@ -1579,7 +1579,7 @@ primitive, each unsafe one with its caller invariant; `silk/mem/pointer.silk` wr
 documented bounds.
 
 **Evidence:** raw pointer specification,
-[pointer intrinsics](../bootstrap/packages/compiler/src/Intrinsic.ts),
+[pointer intrinsics](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Intrinsic.ts),
 [pointer source API](../stdlib/silk/mem/pointer.silk),
 [unsafe boundaries](unsafe-intrinsics-and-targets.md#unsafe-003--unsafe-call-marks-one-invocation-unsafe---marks-a-statement-region).
 
@@ -1698,7 +1698,7 @@ TIR/MIR mappings and LLVM lowering for native and WebAssembly targets consume ca
 member identities. Exact and opaque executable representations remain compiler-private while their
 public contract spelling is preserved.
 
-**Evidence:** [union normalization](../bootstrap/packages/compiler/src/Type.ts),
+**Evidence:** [union normalization](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Type.ts),
 [ordinary failure values](typed-failures.md#fail-001--any-concrete-lifetime-valid-value-may-be-a-typed-failure).
 
 ### UNION-002 — Precise injection and union widening occur only at immediate expected boundaries
@@ -1733,7 +1733,7 @@ with no source-visible, serialization, or stable ABI identity.
 and uncovered members. Ownership diagnostics still apply when moving an affine payload.
 
 **Evidence:** structural union specification,
-[compatibility implementation](../bootstrap/packages/compiler/src/TypeCompatibility.ts),
+[compatibility implementation](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/TypeCompatibility.ts),
 [match narrowing](functions-callables-and-control-flow.md#match-004--matching-narrows-only-inside-the-selected-arm).
 
 ### UNION-003 — A union takes a reference-only interface that every member implements
@@ -1827,5 +1827,5 @@ An unavailable initializer leaves the binding unavailable. A later incompatible 
 use, such as `SEM0012` for the call above.
 
 **Evidence:** semantic binding facts,
-[literal contextualization](../bootstrap/packages/compiler/src/Elaboration.ts),
+[literal contextualization](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Elaboration.ts),
 union conversion specification.
