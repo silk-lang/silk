@@ -1045,17 +1045,37 @@ matches only itself, and a prerelease compiler builds only dependencies written 
 **Boundary:** A dependency name must be an identifier other than `silk`, `silkc`, `Intrinsic`
 or `self`. When `package` is present it must equal the dependency's `[package].name`. Dependencies are
 not transitive: a package imports only the packages its own manifest lists. Packages cannot depend
-on each other in a cycle. Only `path` dependencies exist; `git`, `url`, `version`, `tag`, `rev`,
-`branch`, `hash`, `optional` and `workspace` are reserved and refused as not supported yet.
+on each other in a cycle. A dependency is a `path` dependency or a git dependency; `url`, `version`,
+`tag`, `branch`, `hash`, `optional` and `workspace` are reserved and refused as not supported yet.
+
+A git dependency names a repository with `git` and pins one commit with `rev`, its full hash (40 or
+64 lowercase hexadecimal digits). `path` selects the package's directory relative to the
+repository root, which is the default; only that package and the packages it reaches are read, so
+one package of a multi-package repository can be used alone.
+
+```toml
+[dependencies]
+vector = { git = "https://github.com/example/gpu.git", rev = "ef277166234015091490a56f88476f442599fe30", path = "vector" }
+```
+
+`silk build`, `check`, `test` and `run` fetch each missing commit with the `git` on `PATH` into
+`$SILK_HOME/git/<commit>` (`$HOME/.silk/git` when `SILK_HOME` is unset), once; later builds read
+that checkout without the network. The commit fixes the package's whole dependency graph: a package
+read from a checkout may depend by `path` only on packages in the same repository, and on other git
+dependencies by commit. Because a commit hash names the same files forever, no lock file is
+needed. A tag or branch is refused, since either can move.
 
 **Diagnostics:** An invalid dependency name, a missing or unreadable dependency manifest, a
 `package` name that does not match, a dependency written for another release line, and a package
 cycle are invalid-manifest errors that name the dependency, exit with status 2, and give the
 `silk.toml` line at fault: the dependency's entry or field in the depending manifest, or the line of
-the dependency's own manifest when that is the one at fault. A path below a dependency with no exact module reports `MOD0001` like any other import.
+the dependency's own manifest when that is the one at fault. A git dependency without a full commit
+hash in `rev`, a `rev` without `git`, a `path` that leaves the repository, a checkout's `path`
+dependency outside its repository, and a fetch that fails are reported the same way. A path below a dependency with no exact module reports `MOD0001` like any other import.
 
 **Evidence:** [native package graph](../compiler/src/semantic/PackageGraph.silk),
 [package dependency loading](../compiler/src/driver/Packages.silk),
+[git checkouts](../compiler/src/driver/GitCheckouts.silk),
 [dependency resolution cases](../compiler/src/semantic/SemanticConformanceCases.silk),
 [dependency loading cases](../compiler/src/semantic/SemanticLoweringCases.silk),
 [native build contract](../compiler/scripts/test-native-build.ts).

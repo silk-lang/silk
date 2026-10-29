@@ -53,6 +53,7 @@ import semantic.PackageGraph {PackageGraph}
 import semantic.Query {Cycle}
 import semantic.TypedBody {uncheckedReasonCount, uncheckedReasonName}
 import driver.ModuleSources as ModuleSourceFiles {InvalidBuildComposition, InvalidSourceRoot, MissingManifest, MissingStandardLibrary, ModuleSources}
+import driver.GitCheckouts
 import driver.Packages as PackageSources {InvalidDependency}
 import driver.HeapRelease
 import driver.ManifestFields
@@ -1761,6 +1762,63 @@ fn borrowedPath(path: &Option<Path>) -> Option<&Path> {
   }
 }
 
+// Fetches into `store` the git dependencies that the package of `sourcePath` reaches: the package
+// `manifest` declares, or else the one of the nearest silk.toml above `sourcePath`. A manifest
+// that cannot be read or parsed fetches nothing; loading reports it.
+effect fn fetchDependencies(sourcePath: &Path, manifest: Option<&Path>, store: &Path) -> ()
+! InvalidDependency | HostInputError | FileError | OutOfMemoryError
+? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
+  let mut located = Option<Path>.none()
+  if let Option<&Path>.Some {value} = move manifest {
+    located = Option<Path>.some(run Path.fromBytes(Path.rawBytes(value)))
+  } else {
+    let mut directory = run Path.parent(sourcePath)
+    while true {
+      let current = match move directory {
+        Option<Path>.Some {value} => move value
+        Option<Path>.None => { break }
+      }
+      let candidate = run Path.join(&current, "silk.toml")
+      let found = run FileSystem.exists(&candidate)
+      if found {
+        located = Option<Path>.some(move candidate)
+        break
+      }
+      if Path.isRoot(&current) { break }
+      directory = run Path.parent(&current)
+    }
+  }
+  let path = match move located {
+    Option<Path>.Some {value} => move value
+    Option<Path>.None => { return () }
+  }
+  let contents = match move run Effect.result(FileSystem.readFile(&path)) {
+    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError unread => {
+        drop unread
+        return ()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let document = match move run Effect.result(Toml.parse(Bytes.asSlice(&contents))) {
+    Result<TomlValue, TomlError | OutOfMemoryError>.Success {value} => move value
+    Result<TomlValue, TomlError | OutOfMemoryError>.Failure {error} => match move error {
+      TomlError malformed => {
+        drop malformed
+        return ()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let directory = match move run Path.parent(&path) {
+    Option<Path>.Some {value} => move value
+    Option<Path>.None => { return () }
+  }
+  run PackageSources.fetch(&directory, &document, store)
+}
+
 // Loads the program rooted at `sourcePath` (within `manifest`'s package when given), publishes
 // every module reachable through imports, and assembles the final profile with `bindings`. A test
 // analysis is rooted at the bundled runner. A refused profile is reported in `format` and answers
@@ -1786,7 +1844,16 @@ effect fn prepare(sourcePath: &Path, manifest: Option<&Path>, standardLibrary: O
       summaries = Option<ImportSummaries>.some(run SemanticCache.openImports(directory, Bytes.asSlice(&stamped)))
     }
   }
-  let attempted = run Effect.result(Analyses.open(sourcePath, move manifest, move standardLibrary, profile, move bindings, testing, revisable, move alias, move summaries))
+  // Git dependencies are fetched into the checkout store before loading, which only reads it.
+  let checkoutStore = run GitCheckouts.store()
+  if let Option<Path>.Some {value: checkouts} = &checkoutStore {
+    let fetched = run Effect.result(fetchDependencies(sourcePath, manifest, &checkouts))
+    if let Result<(), InvalidDependency | HostInputError | FileError | OutOfMemoryError>.Failure {error} = move fetched {
+      run Progress.refuse(&mut progress.*, usize.ONE)
+      return Prepared.Finished {status: run report(move error)}
+    }
+  }
+  let attempted = run Effect.result(Analyses.open(sourcePath, move manifest, move standardLibrary, borrowedPath(&checkoutStore), profile, move bindings, testing, revisable, move alias, move summaries))
   let opened = match move attempted {
     Result<Opened, FileError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError>.Success {value} => move value
     Result<Opened, FileError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError>.Failure {error} => {
@@ -5557,7 +5624,7 @@ effect fn rootPackage(directory: &Path, document: &TomlValue) -> RootPackage ! F
 // Adds the package at `command.path` to the located manifest's `[dependencies]`, by the path
 // from the manifest's directory, under `--name` or else its package name with `-` spelled `_`.
 // The edited manifest's dependencies are loaded and checked before it is written.
-effect fn addedDependency(working: &Path, command: AddCommand) -> ()
+effect fn addedDependency(working: &Path, command: AddCommand, store: Option<&Path>) -> ()
 ! ApplicationError | ProjectError | InvalidDependency | ManifestEditRefused | FileError | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut Allocator | &mut Writer {
   let AddCommand {path, name, manifestPath} = move command
@@ -5614,7 +5681,7 @@ effect fn addedDependency(working: &Path, command: AddCommand) -> ()
   }
   // A package that already reaches this one through its dependencies would close a cycle.
   let reached = run rootPackage(&dependency, &dependencyDocument)
-  let reachable = run PackageSources.load(&dependency, &dependencyDocument, Bytes.asSlice(&reached.identity), &reached.sourceRoot)
+  let reachable = run PackageSources.load(&dependency, &dependencyDocument, Bytes.asSlice(&reached.identity), &reached.sourceRoot, store)
   let root = run rootPackage(&directory, &document)
   if let Option<&Path>.Some {value: _} = move PackageSources.dependencyRoot(&reachable, Bytes.asSlice(&root.identity)) {
     let mut reason = run Bytes.copy(Bytes.asSlice(&reached.identity))
@@ -5623,7 +5690,7 @@ effect fn addedDependency(working: &Path, command: AddCommand) -> ()
     run Bytes.append(&mut reason, b", directly or through other packages, so adding it would form a cycle")
     return run refusedDependency(dependencyKey, Bytes.asSlice(&reason))
   }
-  let checked = run PackageSources.load(&directory, &edited, Bytes.asSlice(&root.identity), &root.sourceRoot)
+  let checked = run PackageSources.load(&directory, &edited, Bytes.asSlice(&root.identity), &root.sourceRoot, store)
   drop checked
   run FileSystem.writeFile(&manifest, Bytes.asSlice(&next))
   run Writer.writeAll(b"Added dependency ")
@@ -5903,7 +5970,8 @@ effect fn program() -> i32
       let mut files = run OsFileSystem.make("/")
       let standardLibrary = run standardLibraryFor(&working, &configured)
         |> Effect.provideMut<FileSystem>(&mut files)
-      return run LspCommand.runHost(move standardLibrary, hostTarget())
+      let store = run GitCheckouts.store()
+      return run LspCommand.runHost(move standardLibrary, move store, hostTarget())
     }
     if same(selected, b"doctest") {
       let mut files = run OsFileSystem.make("/")
@@ -5995,7 +6063,8 @@ effect fn program() -> i32
         |> Effect.provideMut<FileSystem>(&mut files)
     }
     Request.Add {command: invocation} => {
-      let outcome = run Effect.result(addedDependency(&working, move invocation)
+      let store = run GitCheckouts.store()
+      let outcome = run Effect.result(addedDependency(&working, move invocation, borrowedPath(&store))
         |> Effect.provideMut<FileSystem>(&mut files))
       return run reportedEdit(move outcome)
     }

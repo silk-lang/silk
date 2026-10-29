@@ -2630,6 +2630,90 @@ const program = Effect.gen(function* () {
     notToml.stderr,
     /Invalid Silk project manifest .*packaged\/broken\/silk\.toml:4: dependency `broken` of app@1\.0\.0: its silk\.toml is not valid TOML: the line ends before its table header, key or value is complete/,
   )
+  // A git dependency pinned to a commit reads one package of a multi-package repository, fetched
+  // once into $SILK_HOME/git, and builds again from that checkout without the repository.
+  const repository = join(directory, 'git/repository')
+  yield* fs.makeDirectory(join(repository, 'vector/src'), { recursive: true })
+  yield* fs.makeDirectory(join(repository, 'shared'), { recursive: true })
+  yield* fs.makeDirectory(join(repository, 'webgpu'), { recursive: true })
+  yield* fs.writeFileString(
+    join(repository, 'vector/silk.toml'),
+    '[package]\nname = "vector"\nversion = "0.1.0"\nsource = "src"\nexports = ["length"]\n\n[dependencies]\nshared = { path = "../shared" }\n',
+  )
+  yield* fs.writeFileString(
+    join(repository, 'vector/src/length.silk'),
+    'import shared.base { base }\n\npub fn length() -> i32 {\n  return base() * 2\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(repository, 'shared/silk.toml'),
+    '[package]\nname = "shared"\nversion = "0.1.0"\nsource = "."\nexports = ["base"]\n',
+  )
+  yield* fs.writeFileString(join(repository, 'shared/base.silk'), 'pub fn base() -> i32 {\n  return 21\n}\n')
+  // A package the dependency does not reach is never read, so its manifest may be anything.
+  yield* fs.writeFileString(join(repository, 'webgpu/silk.toml'), 'not toml [\n')
+  const git = (args: ReadonlyArray<string>) => {
+    const ran = spawnSync('git', ['-C', repository, ...args], { encoding: 'utf8' })
+    assert.equal(ran.status, 0, ran.stderr)
+    return ran.stdout.trim()
+  }
+  git(['init', '--quiet'])
+  git(['add', '.'])
+  git(['-c', 'user.name=Silk', '-c', 'user.email=silk@example.com', '-c', 'commit.gpgsign=false', 'commit', '--quiet', '-m', 'packages'])
+  const commit = git(['rev-parse', 'HEAD'])
+  const silkHome = join(directory, 'git/home')
+  const gitManifest = (fields: string) =>
+    `[package]\nname = "app"\nversion = "1.0.0"\nsource = "."\n\n[dependencies]\nvector = { ${fields} }\n`
+  yield* fs.makeDirectory(join(directory, 'git/app'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'git/app/main.silk'),
+    'import vector.length { length }\n\npub fn main() -> i32 {\n  return length()\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'git/app/silk.toml'),
+    gitManifest(`git = "${pathToFileURL(repository).href}", rev = "${commit}", path = "vector"`),
+  )
+  const fetched = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(directory, 'git/app'), {
+    ...process.env,
+    SILK_CLANG: clang,
+    SILK_HOME: silkHome,
+  })
+  assert.equal(fetched.status, 42, fetched.stderr)
+  assert.equal(yield* fs.exists(join(silkHome, `git/${commit}.fetched`)), true)
+  assert.equal(yield* fs.exists(join(silkHome, `git/${commit}/.git`)), false)
+  yield* fs.remove(repository, { recursive: true })
+  const cached = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(directory, 'git/app'), {
+    ...process.env,
+    SILK_CLANG: clang,
+    SILK_HOME: silkHome,
+  })
+  assert.equal(cached.status, 42, cached.stderr)
+  // A commit the repository cannot serve fails the fetch at the dependency's git line.
+  yield* fs.writeFileString(
+    join(directory, 'git/app/silk.toml'),
+    gitManifest(`git = "${pathToFileURL(repository).href}", rev = "${'0'.repeat(40)}", path = "vector"`),
+  )
+  const unreachable = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(directory, 'git/app'), {
+    ...process.env,
+    SILK_CLANG: sentinel,
+    SILK_HOME: silkHome,
+  })
+  assert.equal(unreachable.status, 2, 'an unreachable commit was accepted')
+  assert.match(
+    unreachable.stderr,
+    /git\/app\/silk\.toml:7: dependency `vector` of app@1\.0\.0: fetching commit 0{40} of file:.* failed: /,
+  )
+  // A revision must be a full commit hash; tags and branches move, so they are not accepted.
+  yield* fs.writeFileString(
+    join(directory, 'git/app/silk.toml'),
+    gitManifest(`git = "${pathToFileURL(repository).href}", rev = "main", path = "vector"`),
+  )
+  const moving = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(directory, 'git/app'), {
+    ...process.env,
+    SILK_CLANG: sentinel,
+    SILK_HOME: silkHome,
+  })
+  assert.equal(moving.status, 2, 'a branch name was accepted as rev')
+  assert.match(moving.stderr, /dependency `vector` of app@1\.0\.0: rev must be a full commit hash/)
   // A workspace member builds against a sibling member by path and shares the workspace's output.
   const workspace = join(directory, 'workspace')
   yield* fs.makeDirectory(join(workspace, 'app'), { recursive: true })
