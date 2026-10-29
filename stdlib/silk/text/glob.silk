@@ -1,0 +1,1541 @@
+//! Glob patterns: compile a pattern such as `src/**/*.{silk,toml}` and test paths against it,
+//! and inspect text for glob syntax.
+//!
+//! # When to use
+//! Use [`Pattern`] to select files by name, for example to filter a directory listing or a list
+//! of changed paths. To find matching files on a file system, use `silk.system.glob_scan`, which
+//! walks directories with this matcher.
+//!
+//! # Details
+//! A pattern is a list of segments separated by `/`:
+//!
+//! - `*` matches any characters within one segment, and `?` matches one character that is not a
+//!   separator.
+//! - `**` as a whole segment matches any number of segments, including none, so `a/**/b` matches
+//!   `a/b` and `a/x/y/b`.
+//! - `[abc]`, `[a-z]`, `[!abc]` and `[^abc]` match one character from, or not from, a set. A class
+//!   can name `/` explicitly. POSIX named classes such as `[:alpha:]` are not expanded.
+//! - `{a,b}` matches one of its alternatives, which can nest. `{1..9}`, `{01..10}`, `{9..1..2}` and
+//!   `{a..g}` match one value of a numeric or letter range, with padding and a step.
+//! - `?(a|b)`, `*(a|b)`, `+(a|b)`, `@(a|b)` and `!(a|b)` match zero or one, any number, one or
+//!   more, exactly one, or none of the alternatives.
+//! - A leading `!` inverts the result, and `\` escapes the next character.
+//!
+//! An unclosed class, brace or group, and a bare parenthesis, are literal text. The rules and the
+//! test expectations follow the `picomatch` package; [`isGlob`] and [`globParent`] follow
+//! `is-glob` and `glob-parent`.
+//!
+//! Patterns and paths are text, and each operation also has a `Bytes` form for host paths that
+//! are not UTF-8. Matching never normalizes a path.
+//!
+//! # Examples
+//! ## Test paths against one compiled pattern
+//! ```silk
+//! import silk.text.glob { Pattern, Dots }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//!
+//! effect fn check() -> i32 ! OutOfMemoryError ? &mut Allocator {
+//!   let sources = run Pattern.make("src/**/*.{silk,toml}")
+//!   let nested = run Pattern.matches(&sources, "src/driver/main.silk", Dots.Match)
+//!   let other = run Pattern.matches(&sources, "docs/index.md", Dots.Match)
+//!   let hidden = run Pattern.matches(&sources, "src/.cache/x.silk", Dots.Hide)
+//!   if !nested.matches || other.matches || hidden.matches {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//!
+//! effect fn exhausted(error: OutOfMemoryError) -> i32 {
+//!   drop error
+//!   return 2
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   return run Effect.catchAll(check(), exhausted) |> Effect.provideMut<Allocator>(&mut allocator)
+//! }
+//! ```
+//!
+//! @category Text
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.core.bool
+import silk.text.string { String, InvalidUtf8 }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.i64
+import silk.num.usize
+
+/// How wildcards treat path segments that start with `.`.
+///
+/// # Details
+///
+/// Only wildcards (`*`, `?`, `**`, classes and groups) are restricted. A pattern that spells a
+/// leading `.` literally, such as `.github/*`, matches such segments in every mode.
+pub enum Dots {
+  /// Wildcards match every segment, including hidden names and `.` and `..`.
+  Match,
+  /// Wildcards do not match the segments `.` and `..`, but do match other hidden names.
+  SkipTraversal,
+  /// Wildcards match no segment that starts with `.`, so `.` and `..` are excluded too.
+  Hide,
+}
+
+/// The outcome of matching one path against a pattern.
+pub struct MatchResult {
+  /// Whether the path matches. A leading `!` negation in the pattern is already applied.
+  pub matches: bool,
+  /// Whether the pattern starts with an odd number of `!`, so `matches` is the inverted result.
+  pub negated: bool,
+}
+
+/// Which bytes of a candidate path separate its segments.
+pub enum Separators {
+  /// Only `/` separates segments, as on POSIX hosts.
+  Slash,
+  /// Both `/` and `\` separate segments, as in Windows paths. The pattern itself still uses
+  /// `/` between segments and `\` as its escape.
+  SlashOrBackslash,
+}
+
+impl Copy for MatchResult {}
+
+enum Op {
+  Byte,
+  Never,
+  End,
+  Any,
+  Star,
+  Class,
+  Group,
+  Negative,
+  AlternativeEnd,
+  Globstar,
+  Skip,
+  Sequence,
+  Digit
+}
+
+struct Node {
+  op: Op,
+  byte: u8,
+  next: usize,
+  close: usize,
+  alternative: usize,
+  owner: usize,
+  auxiliary: usize,
+  segment: bool,
+  wildcard: bool,
+}
+
+impl Copy for Node {}
+
+struct Frame {
+  open: usize,
+  last: usize,
+}
+
+impl Copy for Frame {}
+
+struct Rune {
+  value: u32,
+  length: usize,
+}
+
+impl Copy for Rune {}
+
+struct ClassSpan {
+  low: u32,
+  high: u32,
+}
+
+impl Copy for ClassSpan {}
+
+struct Number {
+  valid: bool,
+  value: i64,
+}
+
+impl Copy for Number {}
+
+struct Sequence {
+  valid: bool,
+  from: i64,
+  to: i64,
+  step: u64,
+  width: usize,
+  longest: usize,
+  letters: bool,
+}
+
+impl Copy for Sequence {}
+
+/// A compiled glob pattern that can be matched against many paths.
+///
+/// # When to use
+///
+/// Compile a pattern once with [`Pattern.make`] and match it with [`Pattern.matches`] when you
+/// test more than one path. For a single test, [`matches`] compiles and matches in one call.
+///
+/// # Details
+///
+/// A `Pattern` owns a copy of its source and its compiled program, so the source can be dropped
+/// after [`Pattern.make`] returns. Matching runs in time proportional to the pattern size times
+/// the path length: groups and braces are compiled into one program, never expanded into every
+/// alternative.
+pub struct Pattern {
+  written: Bytes,
+  nodes: List<Node>,
+  spans: List<ClassSpan>,
+  sequences: List<Sequence>,
+  start: usize,
+  negated: bool,
+  repeats: bool,
+}
+
+fn separator(byte: u8, windows: bool) -> bool {
+  return byte == 47 || (windows && byte == 92)
+}
+
+fn extglob(byte: u8) -> bool {
+  return byte == 63 || byte == 42 || byte == 43 || byte == 64 || byte == 33
+}
+
+fn escaped(byte: u8) -> u8 {
+  if byte == 98 {
+    return 8
+  }
+  if byte == 110 {
+    return 10
+  }
+  if byte == 114 {
+    return 13
+  }
+  if byte == 116 {
+    return 9
+  }
+  return byte
+}
+
+fn announced(byte: u8) -> usize {
+  if byte < 192 {
+    return 1
+  }
+  if byte < 224 {
+    return 2
+  }
+  if byte < 240 {
+    return 3
+  }
+  if byte < 248 {
+    return 4
+  }
+  return 1
+}
+
+// Directory entries need not be UTF-8. Invalid units become U+FFFD one byte at a time.
+fn rune(bytes: &[u8], at: usize) -> Rune {
+  let first = bytes[at]
+  if first < 128 {
+    return Rune { value: u8.toU32(first), length: 1 }
+  }
+  let length = announced(first)
+  if first < 194 || first > 244 || at + length > bytes.length {
+    return Rune { value: 65533, length: 1 }
+  }
+  let mut value = u8.toU32(first)
+  if length == 2 {
+    value = value - 192
+  }
+  if length == 3 {
+    value = value - 224
+  }
+  if length == 4 {
+    value = value - 240
+  }
+  let mut i: usize = 1
+  while i < length {
+    let byte = bytes[at + i]
+    if byte < 128 || byte > 191 {
+      return Rune { value: 65533, length: 1 }
+    }
+    value = value * 64 + u8.toU32(byte - 128)
+    i = i + 1
+  }
+  if (length == 3 && value < 2048) || (length == 4 && value < 65536) || value > 1114111
+    || (value >= 55296 && value <= 57343) {
+    return Rune { value: 65533, length: 1 }
+  }
+  return Rune { value: value, length: length }
+}
+
+fn classRune(bytes: &[u8], at: usize) -> Rune {
+  if bytes[at] == 92 {
+    if at + 1 == bytes.length {
+      return Rune { value: 0, length: 0 }
+    }
+    let read = rune(bytes, at + 1)
+    if bytes[at + 1] < 128 {
+      return Rune { value: u8.toU32(escaped(bytes[at + 1])), length: 2 }
+    }
+    return Rune { value: read.value, length: read.length + 1 }
+  }
+  return rune(bytes, at)
+}
+
+fn classEnd(bytes: &[u8], open: usize) -> usize {
+  let mut at = open + 1
+  if at < bytes.length && (bytes[at] == 33 || bytes[at] == 94) {
+    at = at + 1
+  }
+  let mut first = true
+  while at < bytes.length && (first || bytes[at] != 93) {
+    let low = classRune(bytes, at)
+    if low.length == 0 {
+      return 0
+    }
+    at = at + low.length
+    if at + 1 < bytes.length && bytes[at] == 45 && bytes[at + 1] != 93 {
+      let high = classRune(bytes, at + 1)
+      if high.length == 0 {
+        return 0
+      }
+      at = at + 1 + high.length
+    }
+    first = false
+  }
+  if at == bytes.length {
+    return 0
+  }
+  return at + 1
+}
+
+fn number(bytes: &[u8], start: usize, end: usize) -> Number {
+  let mut at = start
+  let negative = at < end && bytes[at] == 45
+  if negative {
+    at = at + 1
+  }
+  if at == end {
+    return Number { valid: false, value: 0 }
+  }
+
+  // Accumulate negatively so i64.MIN is representable without overflowing.
+  let mut value: i64 = 0
+  while at < end {
+    let byte = bytes[at]
+    if byte < 48 || byte > 57 {
+      return Number { valid: false, value: 0 }
+    }
+    let digit = u8.toI64(byte - 48)
+    if value < -922337203685477580 || (value == -922337203685477580 && digit > 8) {
+      return Number { valid: false, value: 0 }
+    }
+    value = value * 10 - digit
+    at = at + 1
+  }
+  if !negative {
+    if value == i64.MIN {
+      return Number { valid: false, value: 0 }
+    }
+    value = 0 - value
+  }
+  return Number { valid: true, value: value }
+}
+
+fn padded(bytes: &[u8], start: usize, end: usize) -> bool {
+  let mut at = start
+  if at < end && bytes[at] == 45 {
+    at = at + 1
+  }
+  return at + 1 < end && bytes[at] == 48
+}
+
+fn letter(byte: u8) -> bool {
+  return (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+}
+
+fn sequence(bytes: &[u8], start: usize, end: usize) -> Sequence {
+  let invalid = Sequence {
+    valid: false,
+    from: 0,
+    to: 0,
+    step: 1,
+    width: 0,
+    longest: 0,
+    letters: false,
+  }
+  let mut split = end
+  let mut second = end
+  let mut at = start
+  while at + 1 < end {
+    if bytes[at] == 46 && bytes[at + 1] == 46 {
+      if split == end {
+        split = at
+      } else {
+        if second != end {
+          return invalid
+        }
+        second = at
+      }
+      at = at + 2
+    } else {
+      at = at + 1
+    }
+  }
+  if split == end {
+    return invalid
+  }
+  let mut step: u64 = 1
+  if second != end {
+    let read = number(bytes, second + 2, end)
+    if !read.valid || read.value == i64.MIN {
+      return invalid
+    }
+    let mut value = read.value
+    if value < 0 {
+      value = 0 - value
+    }
+    if value > 0 {
+      step = i64.toU64(value)
+    }
+  }
+  let from = number(bytes, start, split)
+  let to = number(bytes, split + 2, second)
+  if split == start + 1 && second == split + 3 && letter(bytes[start]) && letter(bytes[split + 2]) {
+    return Sequence {
+      valid: true,
+      from: u8.toI64(bytes[start]),
+      to: u8.toI64(bytes[split + 2]),
+      step: step,
+      width: 0,
+      longest: 1,
+      letters: true,
+    }
+  }
+  if !from.valid || !to.valid {
+    return invalid
+  }
+  let mut longest = split - start
+  if second - split - 2 > longest {
+    longest = second - split - 2
+  }
+  let mut width: usize = 0
+  if padded(bytes, start, split) || padded(bytes, split + 2, second) {
+    width = longest
+  }
+  return Sequence {
+    valid: true,
+    from: from.value,
+    to: to.value,
+    step: step,
+    width: width,
+    longest: longest,
+    letters: false,
+  }
+}
+
+fn magnitude(value: i64) -> u64 {
+  if value >= 0 {
+    return i64.toU64(value)
+  }
+  return i64.toU64(0 - (value + 1)) + 1
+}
+
+fn inSequence(seq: Sequence, value: i64) -> bool {
+  if seq.from <= seq.to {
+    if value < seq.from || value > seq.to {
+      return false
+    }
+  } else {
+    if value > seq.from || value < seq.to {
+      return false
+    }
+  }
+  let mut distance: u64 = 0
+  if (value < 0) != (seq.from < 0) {
+    distance = magnitude(value) + magnitude(seq.from)
+  } else {
+    let a = magnitude(value)
+    let b = magnitude(seq.from)
+    if a >= b {
+      distance = a - b
+    } else {
+      distance = b - a
+    }
+  }
+  return distance % seq.step == 0
+}
+
+fn sequenceHas(seq: Sequence, path: &[u8], start: usize, length: usize) -> bool {
+  if seq.letters {
+    return length == 1 && path[start] != 92 && inSequence(seq, u8.toI64(path[start]))
+  }
+  let end = start + length
+  let mut digits = start
+  if digits < end && path[digits] == 45 {
+    digits = digits + 1
+  }
+  if digits == end {
+    return false
+  }
+  if path[digits] == 48 && digits + 1 < end && length != seq.width {
+    return false
+  }
+  let mut zeros: usize = 0
+  while digits + zeros + 1 < end && path[digits + zeros] == 48 {
+    zeros = zeros + 1
+  }
+  let read = number(path, start, end)
+  if !read.valid || !inSequence(seq, read.value) || (read.value == 0 && digits != start) {
+    return false
+  }
+  if zeros == 0 {
+    return length >= seq.width
+  }
+  return length == seq.width
+}
+
+fn blank(byte: u8, next: usize) -> Node {
+  return Node {
+    op: Op.Byte,
+    byte: byte,
+    next: next,
+    close: 0,
+    alternative: 0,
+    owner: 0,
+    auxiliary: 0,
+    segment: false,
+    wildcard: false,
+  }
+}
+
+impl Pattern {
+  /// Compiles `pattern`.
+  ///
+  /// # Details
+  ///
+  /// Every pattern compiles. An unclosed class, brace or group is matched as literal text, as
+  /// is a bare parenthesis.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the compiled program.
+  pub effect fn make(pattern: string) -> Pattern
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run Pattern.makeBytes(String.utf8Bytes(pattern))
+  }
+
+  /// Compiles the pattern `pattern`, given as host bytes that need not be UTF-8.
+  ///
+  /// # Details
+  ///
+  /// Bytes that are not UTF-8 match themselves. `?` and classes consume one Unicode scalar of
+  /// the candidate.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the compiled program.
+  pub effect fn makeBytes(pattern: &[u8]) -> Pattern
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut nodes = List<Node>.make()
+    let reserved = run List<Node>.reserveExact(&mut nodes, pattern.length + 1)
+    let mut at: usize = 0
+    while at < pattern.length {
+      let added = run List<Node>.append(&mut nodes, blank(pattern[at], at + 1))
+      at = at + 1
+    }
+    let mut terminal = blank(0, pattern.length)
+    terminal.op = Op.End
+    let added = run List<Node>.append(&mut nodes, terminal)
+    let mut start: usize = 0
+    while start < pattern.length && pattern[start] == 33 {
+      if start + 1 < pattern.length && pattern[start + 1] == 40 {
+        break
+      }
+      start = start + 1
+    }
+
+    // Pair delimiters iteratively. A close abandons intervening unclosed groups of the other kind.
+    let mut stack = List<Frame>.make()
+    at = start
+    let mut segment = true
+    let mut noClassFrom = pattern.length
+    while at < pattern.length {
+      let byte = pattern[at]
+      let mut node = List<Node>.get(&nodes, at)
+      node.segment = segment
+      let changed = List<Node>.set(&mut nodes, at, node)
+      if byte == 92 && at + 1 < pattern.length {
+        at = at + 1 + announced(pattern[at + 1])
+        segment = false
+      } else {
+        let mut end: usize = 0
+        if byte == 91 && at < noClassFrom {
+          end = classEnd(pattern, at)
+        }
+        if byte == 91 && end == 0 && at < noClassFrom {
+          noClassFrom = at
+        }
+        if end != 0 {
+          at = end
+          segment = false
+        } else {
+          let isExt = extglob(byte) && at + 1 < pattern.length && pattern[at + 1] == 40
+          if byte == 123 || isExt {
+            if List<Frame>.length(&stack) != 0 {
+              let parent = List<Frame>.get(&stack, List<Frame>.length(&stack) - 1)
+              let mut outer = List<Node>.get(&nodes, parent.open)
+              outer.auxiliary = 1
+              let changed = List<Node>.set(&mut nodes, parent.open, outer)
+            }
+            let added = run List<Frame>.append(&mut stack, Frame { open: at, last: at })
+            segment = true
+            if isExt {
+              at = at + 2
+            } else {
+              at = at + 1
+            }
+          } else {
+            let count = List<Frame>.length(&stack)
+            if (byte == 44 || byte == 124) && count != 0 {
+              let mut frame = List<Frame>.get(&stack, count - 1)
+              if (pattern[frame.open] == 123) == (byte == 44) {
+                let mut previous = List<Node>.get(&nodes, frame.last)
+                previous.alternative = at
+                let changed = List<Node>.set(&mut nodes, frame.last, previous)
+                node.owner = frame.open + 1
+                let nodeChanged = List<Node>.set(&mut nodes, at, node)
+                frame.last = at
+                let frameChanged = List<Frame>.set(&mut stack, count - 1, frame)
+                segment = true
+              } else {
+                segment = false
+              }
+            } else {
+              if (byte == 125 || byte == 41) && count != 0 {
+                let mut depth = count
+                while depth > 0 {
+                  let frame = List<Frame>.get(&stack, depth - 1)
+                  if (pattern[frame.open] == 123) == (byte == 125) {
+                    break
+                  }
+                  depth = depth - 1
+                }
+                if depth > 0 {
+                  let frame = List<Frame>.get(&stack, depth - 1)
+                  let mut previous = List<Node>.get(&nodes, frame.last)
+                  previous.alternative = at
+                  let changed = List<Node>.set(&mut nodes, frame.last, previous)
+                  let mut opener = List<Node>.get(&nodes, frame.open)
+                  opener.close = at
+                  let openerChanged = List<Node>.set(&mut nodes, frame.open, opener)
+                  node.owner = frame.open + 1
+                  let nodeChanged = List<Node>.set(&mut nodes, at, node)
+                  let removed = List<Frame>.truncate(&mut stack, depth - 1)
+                }
+                segment = false
+              } else {
+                segment = byte == 47
+              }
+            }
+            at = at + 1
+          }
+        }
+      }
+    }
+    let mut spans = List<ClassSpan>.make()
+    let mut sequences = List<Sequence>.make()
+    let mut repeats = false
+    at = start
+    while at < pattern.length {
+      let mut node = List<Node>.get(&nodes, at)
+      let byte = node.byte
+      if node.owner != 0 && List<Node>.get(&nodes, node.owner - 1).close != 0 {
+        let opener = List<Node>.get(&nodes, node.owner - 1)
+        node.op = Op.AlternativeEnd
+        node.next = opener.close + 1
+        if opener.byte == 42 || opener.byte == 43 {
+          node.auxiliary = node.owner
+        }
+        let changed = List<Node>.set(&mut nodes, at, node)
+        at = at + 1
+      } else {
+        if node.close != 0 {
+          if byte == 42 || byte == 43 {
+            repeats = true
+          }
+          let mut first = at + 2
+          if byte == 123 {
+            first = at + 1
+          }
+          let mut seq = sequence(pattern, 0, 0)
+          if byte == 123 && node.auxiliary == 0 && node.alternative == node.close {
+            seq = sequence(pattern, first, node.close)
+          }
+          if seq.valid {
+            node.op = Op.Sequence
+            node.auxiliary = List<Sequence>.length(&sequences)
+            let added = run List<Sequence>.append(&mut sequences, seq)
+            node.next = node.close + 1
+            let changed = List<Node>.set(&mut nodes, at, node)
+            let mut i = at + 1
+            while i <= node.close {
+              let mut digit = List<Node>.get(&nodes, i)
+              digit.op = Op.Never
+              if i + seq.longest > node.close {
+                digit.op = Op.Digit
+              }
+              let changed = List<Node>.set(&mut nodes, i, digit)
+              i = i + 1
+            }
+            at = node.close + 1
+          } else {
+            node.op = Op.Group
+            if byte == 33 {
+              node.op = Op.Negative
+            }
+            node.next = first
+            node.auxiliary = node.close + 1
+            node.wildcard = byte == 33
+            let changed = List<Node>.set(&mut nodes, at, node)
+            if byte != 123 {
+              let mut inner = List<Node>.get(&nodes, at + 1)
+              inner.op = Op.Never
+              if byte == 33 {
+                inner.op = Op.Star
+              }
+              inner.next = node.close + 1
+              let changed = List<Node>.set(&mut nodes, at + 1, inner)
+            }
+            at = first
+          }
+        } else {
+          if byte == 42 {
+            let double = at + 1 < pattern.length && pattern[at + 1] == 42
+              && !(at + 2 < pattern.length && pattern[at + 2] == 40)
+            let mut after = at + 1
+            if double {
+              after = at + 2
+            }
+
+            // Like upstream skip_globstars, consecutive **/ segments collapse before classification.
+            let mut lastStar = at
+            if double {
+              while after + 3 < pattern.length && pattern[after] == 47 && pattern[after + 1] == 42
+                && pattern[after + 2] == 42
+                && pattern[after + 3] == 47 {
+                lastStar = after + 1
+                after = after + 3
+              }
+              if after + 3 == pattern.length && pattern[after] == 47 && pattern[after + 1] == 42
+                && pattern[after + 2] == 42 {
+                lastStar = after + 1
+                after = after + 3
+              }
+            }
+            let startsSegment = node.segment || lastStar > at
+            let mut outside = after
+            if double && startsSegment {
+              while outside < pattern.length {
+                let end = List<Node>.get(&nodes, outside)
+                if end.owner == 0 {
+                  break
+                }
+                let owner = List<Node>.get(&nodes, end.owner - 1)
+                if owner.close == 0 {
+                  break
+                }
+                outside = owner.close + 1
+              }
+            }
+            let globstar = double && startsSegment
+              && (outside == pattern.length || pattern[outside] == 47)
+            node.wildcard = true
+            if globstar {
+              node.op = Op.Globstar
+              node.wildcard = false
+              node.next = after
+              if outside < pattern.length {
+                node.next = outside + 1
+              }
+              node.auxiliary = at + 1
+
+              // **/* does not match the empty path.
+              node.segment = outside + 2 == pattern.length && outside < pattern.length
+                && pattern[outside + 1] == 42
+              let mut skip = List<Node>.get(&nodes, at + 1)
+              skip.op = Op.Skip
+              skip.next = at
+              skip.auxiliary = after
+              skip.wildcard = true
+              skip.segment = outside == pattern.length
+              let changed = List<Node>.set(&mut nodes, at + 1, skip)
+              if outside == after && outside < pattern.length {
+                after = after + 1
+              }
+            } else {
+              node.op = Op.Star
+              node.next = after
+              if double {
+                let mut skipped = List<Node>.get(&nodes, at + 1)
+                skipped.op = Op.Never
+                let changed = List<Node>.set(&mut nodes, at + 1, skipped)
+              }
+            }
+            let changed = List<Node>.set(&mut nodes, at, node)
+            at = after
+          } else {
+            if byte == 63 {
+              node.op = Op.Any
+              node.wildcard = !(at + 1 < pattern.length && pattern[at + 1] == 40)
+            }
+            let mut end: usize = 0
+            if byte == 91 && at < noClassFrom {
+              end = classEnd(pattern, at)
+            }
+            if end != 0 {
+              node.op = Op.Class
+              node.auxiliary = List<ClassSpan>.length(&spans)
+              node.next = end
+              node.wildcard = pattern[at + 1] != 40
+              let mut i = at + 1
+              node.segment = pattern[i] == 33 || pattern[i] == 94
+              if node.segment {
+                i = i + 1
+              }
+              while i < end - 1 {
+                let low = classRune(pattern, i)
+                i = i + low.length
+                let mut high = low.value
+                if i + 1 < end - 1 && pattern[i] == 45 {
+                  let read = classRune(pattern, i + 1)
+                  high = read.value
+                  i = i + 1 + read.length
+                }
+                let added = run List<ClassSpan>.append(
+                  &mut spans,
+                  ClassSpan { low: low.value, high: high },
+                )
+              }
+              node.close = List<ClassSpan>.length(&spans)
+              let changed = List<Node>.set(&mut nodes, at, node)
+              at = end
+            } else {
+              if byte == 92 && at + 1 < pattern.length {
+                node.byte = escaped(pattern[at + 1])
+                node.next = at + 2
+                if at + 1 + announced(pattern[at + 1]) > pattern.length {
+                  node.op = Op.Never
+                }
+                let changed = List<Node>.set(&mut nodes, at, node)
+                at = at + 1 + announced(pattern[at + 1])
+              } else {
+                if byte >= 128 && at + announced(byte) > pattern.length {
+                  node.op = Op.Never
+                }
+                let changed = List<Node>.set(&mut nodes, at, node)
+                at = at + announced(byte)
+              }
+            }
+          }
+        }
+      }
+    }
+    let written = run Bytes.copy(pattern)
+    return Pattern {
+      written: move written,
+      nodes: move nodes,
+      spans: move spans,
+      sequences: move sequences,
+      start: start,
+      negated: start % 2 == 1,
+      repeats: repeats,
+    }
+  }
+
+  /// Borrows the bytes the pattern was compiled from.
+  pub fn sourceBytes(self: &Self) -> &[u8] {
+    return Bytes.asSlice(&self.written)
+  }
+
+  /// Matches `path` against the pattern, with `/` as the only separator.
+  ///
+  /// # Details
+  ///
+  /// The path is matched as written: it is not normalized, so `a/./b` and `a/b` are different
+  /// paths. `dots` decides whether wildcards match hidden segments.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the scratch rows, which are
+  ///   proportional to the pattern size.
+  pub effect fn matches(self: &Self, path: string, dots: Dots) -> MatchResult
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run Pattern.matchesWithBytes(self, String.utf8Bytes(path), dots, Separators.Slash)
+  }
+
+  /// Matches the host path `path`, which need not be UTF-8, with `/` as the only separator.
+  ///
+  /// # Details
+  ///
+  /// A byte that is not part of valid UTF-8 counts as one character for `?` and classes.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the scratch rows.
+  pub effect fn matchesBytes(self: &Self, path: &[u8], dots: Dots) -> MatchResult
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run Pattern.matchesWithBytes(self, path, dots, Separators.Slash)
+  }
+
+  /// Matches `path` against the pattern with the segment separators `separators`.
+  ///
+  /// # When to use
+  ///
+  /// Use it with `Separators.SlashOrBackslash` to match Windows paths such as `src\main.silk`
+  /// against a pattern written with `/`.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the scratch rows.
+  pub effect fn matchesWith(
+    self: &Self,
+    path: string,
+    dots: Dots,
+    separators: Separators,
+  ) -> MatchResult
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run Pattern.matchesWithBytes(self, String.utf8Bytes(path), dots, separators)
+  }
+
+  /// Matches the host path `path` against the pattern with the segment separators `separators`.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the scratch rows.
+  pub effect fn matchesWithBytes(
+    self: &Self,
+    path: &[u8],
+    dots: Dots,
+    separators: Separators,
+  ) -> MatchResult
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let windows = separators == Separators.SlashOrBackslash
+    let count = List<Node>.length(&self.nodes)
+
+    // Four future byte positions, the current row, and one idle row suffice even for UTF-8.
+    let mut rowCount: usize = 5
+    if self.repeats {
+      rowCount = 6
+    }
+    let mut rows = run Bytes.zeroed(count * rowCount)
+    let nodes = List<Node>.asSlice(&self.nodes)
+    let mut position = path.length + 1
+    while position > 0 {
+      position = position - 1
+      let current = (position % 5) * count
+      let closed = closedAt(path, position, dots, windows)
+      let mut pass: usize = 1
+      if self.repeats {
+        pass = 0
+      }
+      while pass < 2 {
+        let mut base = current
+        if pass == 0 {
+          base = count * 5
+        }
+        let mut index = count
+        while index > self.start {
+          index = index - 1
+          let node = &nodes[index]
+          let mut value = false
+          if !(closed && node.wildcard) {
+            let stored = Bytes.asSlice(&rows)
+            value = evaluate(
+              self,
+              node,
+              index,
+              path,
+              position,
+              windows,
+              stored,
+              base,
+              count,
+              pass == 0,
+            )
+          }
+          let writable = Bytes.asMutSlice(&mut rows)
+          writable[base + index] = 0
+          if value {
+            writable[base + index] = 1
+          }
+        }
+        pass = pass + 1
+      }
+    }
+    let matched = Bytes.asSlice(&rows)[self.start] != 0
+    return MatchResult { matches: matched != self.negated, negated: self.negated }
+  }
+}
+
+fn closedAt(path: &[u8], index: usize, dots: Dots, windows: bool) -> bool {
+  if dots == Dots.Match {
+    return false
+  }
+  if dots == Dots.Hide && index < path.length && path[index] == 46
+    && (index == 0 || separator(path[index - 1], windows)) {
+    return true
+  }
+  let mut start = index
+  let mut before: usize = 0
+  while start > 0 && before < 2 && path[start - 1] == 46 {
+    start = start - 1
+    before = before + 1
+  }
+  let mut length: usize = 0
+  while start + length < path.length && length < 3 && path[start + length] == 46 {
+    length = length + 1
+  }
+  return (start == 0 || separator(path[start - 1], windows)) && (length == 1 || length == 2)
+    && (start + length == path.length || separator(path[start + length], windows))
+}
+
+fn evaluate(
+  pattern: &Pattern,
+  node: &Node,
+  index: usize,
+  path: &[u8],
+  position: usize,
+  windows: bool,
+  rows: &[u8],
+  base: usize,
+  count: usize,
+  idle: bool,
+) -> bool {
+  let atEnd = position == path.length
+  let nextByte = ((position + 1) % 5) * count
+  if node.op == Op.End {
+    return atEnd
+  }
+  if node.op == Op.Never {
+    return false
+  }
+  if node.op == Op.Byte {
+    if atEnd {
+      return false
+    }
+    let mut equal = path[position] == node.byte
+    if node.byte == 47 {
+      equal = separator(path[position], windows)
+    }
+    return equal && rows[nextByte + node.next] != 0
+  }
+  if node.op == Op.AlternativeEnd {
+    return rows[base + node.next] != 0
+      || (!idle && node.auxiliary != 0 && rows[count * 5 + node.auxiliary - 1] != 0)
+  }
+  if node.op == Op.Group || node.op == Op.Negative {
+    let mut answer = rows[base + node.next] != 0
+    let mut alternative = node.alternative
+    while !answer && alternative != node.close {
+      answer = rows[base + alternative + 1] != 0
+      alternative = List<Node>.get(&pattern.nodes, alternative).alternative
+    }
+    if node.op == Op.Negative {
+      return !answer && rows[base + index + 1] != 0
+    }
+    return answer || ((node.byte == 63 || node.byte == 42) && rows[base + node.auxiliary] != 0)
+  }
+  if node.op == Op.Globstar {
+    return !(node.segment && atEnd)
+      && (rows[base + node.next] != 0 || rows[base + node.auxiliary] != 0)
+  }
+  if node.op == Op.Skip {
+    if atEnd {
+      return node.segment && rows[base + node.auxiliary] != 0
+    }
+    if separator(path[position], windows) {
+      return rows[nextByte + node.next] != 0
+    }
+    return rows[nextByte + index] != 0
+  }
+  if node.op == Op.Sequence {
+    let seq = List<Sequence>.get(&pattern.sequences, node.auxiliary)
+    if seq.letters && inSequence(seq, 92) && rows[base + node.next] != 0 {
+      return true
+    }
+    let mut length: usize = 1
+    while length <= seq.longest && position + length <= path.length {
+      if rows[base + node.next - length] != 0 && sequenceHas(seq, path, position, length) {
+        return true
+      }
+      length = length + 1
+    }
+    return false
+  }
+  if node.op == Op.Digit {
+    if atEnd {
+      return false
+    }
+    let byte = path[position]
+    return ((byte >= 48 && byte <= 57) || byte == 45 || (byte >= 65 && byte <= 122))
+      && rows[nextByte + node.next] != 0
+  }
+  if node.op == Op.Star && rows[base + node.next] != 0 {
+    return true
+  }
+  if atEnd {
+    return false
+  }
+  let read = rune(path, position)
+  let after = ((position + read.length) % 5) * count
+  if node.op == Op.Star {
+    return !separator(path[position], windows) && rows[after + index] != 0
+  }
+  if node.op == Op.Any {
+    return !separator(path[position], windows) && rows[after + node.next] != 0
+  }
+  if node.op == Op.Class {
+    let mut span = node.auxiliary
+    let mut found = false
+    while span < node.close {
+      let interval = List<ClassSpan>.get(&pattern.spans, span)
+      if read.value >= interval.low && read.value <= interval.high {
+        found = true
+      }
+      span = span + 1
+    }
+    return found != node.segment && rows[after + node.next] != 0
+  }
+  return false
+}
+
+/// Compiles `pattern` and matches `path` against it once, with `Dots.Match` and `/` as the only
+/// separator.
+///
+/// # When to use
+///
+/// Use it for a single test. To test many paths, compile once with [`Pattern.make`].
+///
+/// # Errors
+///
+/// - `OutOfMemoryError` if the `Allocator` cannot supply the compiled program or scratch rows.
+pub effect fn matches(pattern: string, path: string) -> MatchResult
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let compiled = run Pattern.make(pattern)
+  return run Pattern.matches(&compiled, path, Dots.Match)
+}
+
+// A cached search preserves linear scans through repeated malformed openers.
+struct Next {
+  byte: u8,
+  ready: bool,
+  from: usize,
+  found: usize,
+}
+
+fn next(byte: u8) -> Next {
+  return Next { byte: byte, ready: false, from: 0, found: 0 }
+}
+
+fn indexFrom(search: &mut Next, text: &[u8], from: usize) -> usize {
+  if search.ready && from >= search.from && search.found >= from {
+    return search.found
+  }
+  let mut at = from
+  while at < text.length && text[at] != search.byte {
+    at = at + 1
+  }
+  search.ready = true
+  search.from = from
+  search.found = at
+  return at
+}
+
+fn atIs(text: &[u8], at: usize, byte: u8) -> bool {
+  return at < text.length && text[at] == byte
+}
+
+fn lineBreak(text: &[u8], at: usize) -> bool {
+  if at >= text.length {
+    return false
+  }
+  if text[at] == 10 || text[at] == 13 {
+    return true
+  }
+  return text[at] == 226 && atIs(text, at + 1, 128)
+    && (atIs(text, at + 2, 168) || atIs(text, at + 2, 169))
+}
+
+fn isExtglob(text: &[u8]) -> bool {
+  let mut closes = next(41)
+  let mut lineEnd: usize = 0
+  let mut at: usize = 0
+  while at < text.length {
+    let byte = text[at]
+    if byte == 92 && at + 1 < text.length && !lineBreak(text, at + 1) {
+      at = at + 2
+    } else {
+      if (byte == 64 || byte == 63 || byte == 33 || byte == 43 || byte == 42)
+        && atIs(text, at + 1, 40) {
+        let inside = at + 2
+        if lineEnd < inside {
+          lineEnd = inside
+          while lineEnd < text.length && !lineBreak(text, lineEnd) {
+            lineEnd = lineEnd + 1
+          }
+        }
+        if indexFrom(&mut closes, text, inside) < lineEnd {
+          return true
+        }
+      }
+      at = at + 1
+    }
+  }
+  return false
+}
+
+fn isGlobBytes(text: &[u8]) -> bool {
+  if text.length == 0 {
+    return false
+  }
+  if isExtglob(text) || text[0] == 33 {
+    return true
+  }
+  let mut squares = next(93)
+  let mut curlies = next(125)
+  let mut parens = next(41)
+  let mut pipes = next(124)
+  let mut backslashes = next(92)
+
+  // Zero is the not-yet-searched state; length is the searched-and-absent state.
+  let mut closeSquare: usize = 0
+  let mut closeCurly: usize = 0
+  let mut closeParen: usize = 0
+  let mut pipe: usize = 0
+  let mut backslash: usize = 0
+  let mut index: usize = 0
+  while index < text.length {
+    let byte = text[index]
+    if byte == 42 {
+      return true
+    }
+    if atIs(text, index + 1, 63) && (byte == 93 || byte == 46 || byte == 43 || byte == 41) {
+      return true
+    }
+    if closeSquare != text.length && byte == 91 && !atIs(text, index + 1, 93) {
+      if closeSquare == 0 || closeSquare < index {
+        closeSquare = indexFrom(&mut squares, text, index)
+      }
+      if closeSquare < text.length && closeSquare > index {
+        if backslash == text.length || backslash > closeSquare {
+          return true
+        }
+        backslash = indexFrom(&mut backslashes, text, index)
+        if backslash > closeSquare {
+          return true
+        }
+      }
+    }
+    if closeCurly != text.length && byte == 123 && !atIs(text, index + 1, 125) {
+      closeCurly = indexFrom(&mut curlies, text, index)
+      if closeCurly < text.length && closeCurly > index {
+        backslash = indexFrom(&mut backslashes, text, index)
+        if backslash > closeCurly {
+          return true
+        }
+      }
+    }
+    if closeParen != text.length && byte == 40 && atIs(text, index + 1, 63)
+      && (atIs(text, index + 2, 58) || atIs(text, index + 2, 33) || atIs(text, index + 2, 61))
+      && !atIs(text, index + 3, 41) {
+      closeParen = indexFrom(&mut parens, text, index)
+      if closeParen < text.length && closeParen > index {
+        backslash = indexFrom(&mut backslashes, text, index)
+        if backslash > closeParen {
+          return true
+        }
+      }
+    }
+    if pipe != text.length && byte == 40 && !atIs(text, index + 1, 124) {
+      if pipe == 0 || pipe < index {
+        pipe = indexFrom(&mut pipes, text, index)
+      }
+      if pipe < text.length && !atIs(text, pipe + 1, 41) {
+        closeParen = indexFrom(&mut parens, text, pipe)
+        if closeParen < text.length && closeParen > pipe {
+          backslash = indexFrom(&mut backslashes, text, pipe)
+          if backslash > closeParen {
+            return true
+          }
+        }
+      }
+    }
+    if byte == 92 {
+      let escapedAt = index + 1
+      let mut closer: u8 = 0
+      if atIs(text, escapedAt, 123) {
+        closer = 125
+      }
+      if atIs(text, escapedAt, 40) {
+        closer = 41
+      }
+      if atIs(text, escapedAt, 91) {
+        closer = 93
+      }
+
+      // Match the upstream UTF-16-unit skip over UTF-8 bytes, including malformed input.
+      if escapedAt >= text.length || text[escapedAt] < 192 {
+        index = index + 2
+      } else {
+        if text[escapedAt] >= 224 && text[escapedAt] < 240 {
+          index = index + 4
+        } else {
+          index = index + 3
+        }
+      }
+      let mut found = text.length
+      if closer == 125 {
+        found = indexFrom(&mut curlies, text, index)
+      }
+      if closer == 41 {
+        found = indexFrom(&mut parens, text, index)
+      }
+      if closer == 93 {
+        found = indexFrom(&mut squares, text, index)
+      }
+      if found < text.length {
+        index = found + 1
+      }
+      if atIs(text, index, 33) {
+        return true
+      }
+    } else {
+      index = index + 1
+    }
+  }
+  return false
+}
+
+fn hasExtglobPrefixBytes(text: &[u8]) -> bool {
+  let mut slashes: usize = 0
+  let mut at: usize = 0
+  while at < text.length {
+    let byte = text[at]
+    if (byte == 64 || byte == 43 || byte == 33) && atIs(text, at + 1, 40) && slashes % 2 == 0 {
+      return true
+    }
+    if byte == 92 {
+      slashes = slashes + 1
+    } else {
+      slashes = 0
+    }
+    at = at + 1
+  }
+  return false
+}
+
+fn detectGlobSyntaxBytes(text: &[u8]) -> bool {
+  if atIs(text, 0, 33) || hasExtglobPrefixBytes(text) {
+    return true
+  }
+  let mut slashes: usize = 0
+  let mut at: usize = 0
+  while at < text.length {
+    let byte = text[at]
+    if (byte == 42 || byte == 123 || byte == 91 || byte == 63) && slashes % 2 == 0 {
+      return true
+    }
+    if byte == 92 {
+      slashes = slashes + 1
+    } else {
+      slashes = 0
+    }
+    at = at + 1
+  }
+  return false
+}
+
+fn isGlobby(text: &[u8]) -> bool {
+  let mut lastOpen = text.length
+  let mut lastClose = text.length
+  let mut at: usize = 0
+  while at < text.length {
+    if text[at] == 40 {
+      lastOpen = at
+    }
+    if text[at] == 41 {
+      lastClose = at
+    }
+    if (text[at] == 123 || text[at] == 91) && (at == 0 || text[at - 1] != 92) {
+      return true
+    }
+    at = at + 1
+  }
+  if lastOpen < text.length && lastOpen + 1 < text.length
+    && (lastClose == text.length || lastClose < lastOpen) {
+    return true
+  }
+  return isGlobBytes(text)
+}
+
+// Zero denotes '.', otherwise the answer is a prefix of text. appended models
+// glob-parent's synthetic final 'a' without copying the entire input first.
+fn dirnameLength(text: &[u8], appended: bool) -> usize {
+  let root = atIs(text, 0, 47)
+  let mut afterName = appended
+  let mut at = text.length
+  while at > 1 {
+    at = at - 1
+    if text[at] != 47 {
+      afterName = true
+    } else {
+      if afterName {
+        if root && at == 1 {
+          return 2
+        }
+        return at
+      }
+    }
+  }
+  if root {
+    return 1
+  }
+  return 0
+}
+
+fn enclosure(text: &[u8]) -> bool {
+  if text.length == 0 {
+    return false
+  }
+  let last = text[text.length - 1]
+  let mut open: u8 = 0
+  if last == 125 {
+    open = 123
+  }
+  if last == 93 {
+    open = 91
+  }
+  if open == 0 {
+    return false
+  }
+  let mut at: usize = 0
+  while at < text.length && text[at] != open {
+    at = at + 1
+  }
+  while at + 1 < text.length {
+    at = at + 1
+    if text[at] == 47 {
+      return true
+    }
+  }
+  return false
+}
+
+fn unescapeByte(byte: u8) -> bool {
+  return byte == 33 || byte == 42 || byte == 63 || byte == 124 || byte == 91 || byte == 93
+    || byte == 40
+    || byte == 41
+    || byte == 123
+    || byte == 125
+}
+
+effect fn globParentBytes(pattern: &[u8]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut end = dirnameLength(pattern, true)
+  if enclosure(pattern) {
+    end = pattern.length
+  }
+  while end > 0 && isGlobby(Slice.view(pattern, 0, end)) {
+    end = dirnameLength(Slice.view(pattern, 0, end), false)
+  }
+  if end == 0 {
+    return run Bytes.copy(b".")
+  }
+  let mut result = Bytes.make()
+  run Bytes.reserveExact(&mut result, end)
+  let mut at: usize = 0
+  let mut start: usize = 0
+  while at < end {
+    if pattern[at] == 92 && at + 1 < end && unescapeByte(pattern[at + 1]) {
+      run Bytes.append(&mut result, Slice.view(pattern, start, at - start))
+      at = at + 1
+      start = at
+    }
+    at = at + 1
+  }
+  run Bytes.append(&mut result, Slice.view(pattern, start, end - start))
+  return move result
+}
+
+/// Whether `text` is a glob pattern by the rules of the `is-glob` package, version 4.0.3.
+///
+/// # When to use
+///
+/// Use it to decide whether a user-written path should be matched as a pattern or used as
+/// written. An unclosed `[` or `{` does not count, and neither does an escaped character.
+pub fn isGlob(text: string) -> bool {
+  return isGlobBytes(String.utf8Bytes(text))
+}
+
+/// Whether `text` contains an unescaped `@(`, `+(` or `!(`, whether or not it is closed.
+pub fn hasExtglobPrefix(text: string) -> bool {
+  return hasExtglobPrefixBytes(String.utf8Bytes(text))
+}
+
+/// Whether `text` contains any unescaped glob syntax: `*`, `?`, `[`, `{`, a leading `!` or an
+/// extglob prefix, even when a group is never closed.
+///
+/// # When to use
+///
+/// Use it to find text that a glob matcher would treat differently from a literal path. It is
+/// broader than [`isGlob`], which also requires groups to be closed.
+pub fn detectGlobSyntax(text: string) -> bool {
+  return detectGlobSyntaxBytes(String.utf8Bytes(text))
+}
+
+/// Returns the longest leading directory of `pattern` that contains no glob syntax, with escapes
+/// removed, by the rules of the `glob-parent` package, version 6.0.2.
+///
+/// # When to use
+///
+/// Use it to find the directory a scan for `pattern` must start from: `src/**/*.silk` gives
+/// `src`, and a pattern with no literal directory gives `.`.
+///
+/// # Details
+///
+/// It looks only at the text and never at a file system. Segments are separated by `/`.
+///
+/// # Errors
+///
+/// - `OutOfMemoryError` if the `Allocator` cannot supply the result.
+pub effect fn globParent(pattern: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let parent = run globParentBytes(String.utf8Bytes(pattern))
+
+  // Removing ASCII escape bytes from UTF-8 text leaves UTF-8 text.
+  return match move String.fromBytes(move parent) {
+    Result<String, InvalidUtf8>.Success { value } => move value
+    Result<String, InvalidUtf8>.Failure { error } => {
+      drop error
+      return String.make()
+    }
+  }
+}

@@ -1,0 +1,625 @@
+//! Find the files and directories that a glob pattern matches, by walking directories through
+//! the `FileSystem` effect.
+//!
+//! # When to use
+//! Use [`scan`] to collect every match of a pattern such as `src/**/*.silk`, or a [`Walker`] to
+//! take matches one at a time. To test paths you already have, use `silk.text.glob` directly.
+//!
+//! # Details
+//! A scan reads only the directories its pattern can reach. A literal segment is looked up
+//! directly, a wildcard segment lists one directory, and `**` descends into every directory
+//! below. Results are relative to [`ScanOptions.base`], joined with `/`, with `.` and `..`
+//! segments of the pattern resolved, and each one is reported once. A pattern that starts with
+//! `/` is scanned from the provider's root and reports absolute paths. The order of results is
+//! unspecified.
+//!
+//! Names are host bytes and are reported as they are, also when they are not UTF-8.
+//!
+//! A literal segment follows a symbolic link, so `docs/*.md` works when `docs` is a link to a
+//! directory. A link that a wildcard matched is never entered, which also keeps a scan from
+//! looping through a cycle of links; it is reported only when [`ScanOptions.onlyFiles`] is
+//! false.
+//!
+//! Every read goes through the `FileSystem` effect, so a scan sees exactly what the provider
+//! shows, and a provider in memory or one that records reads works the same way.
+//!
+//! # Errors
+//! - `FileError` if the starting directory is missing or is not a directory, or if a directory
+//!   cannot be read for a reason other than its having gone away.
+//! - `OutOfMemoryError` from every operation that returns owned paths.
+//!
+//! # Examples
+//! ## Find the Silk sources of a project
+//! ```silk
+//! import silk.system.glob_scan { ScanOptions, scan }
+//! import silk.system.filesystem { FileError, FileSystem, Path }
+//! import silk.system.filesystem_native { OsFileSystem }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.collections.bytes { Bytes }
+//! import silk.collections.list { List }
+//! import silk.core.effect { Effect }
+//!
+//! effect fn program() -> i32 ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+//!   let root = run Path.root()
+//!   let scratch = run FileSystem.temporaryDirectory(&root, "silk-glob-")
+//!   run FileSystem.writeFileWithParents(&run Path.join(&scratch.path, "src/main.silk"), b"")
+//!   run FileSystem.writeFileWithParents(&run Path.join(&scratch.path, "src/net/http.silk"), b"")
+//!   run FileSystem.writeFileWithParents(&run Path.join(&scratch.path, "README.md"), b"")
+//!   let options = run ScanOptions.make(&scratch.path)
+//!   let found = run scan("src/**/*.silk", move options)
+//!   let count = List<Bytes>.length(&found)
+//!   drop found
+//!   run FileSystem.release(move scratch)
+//!   if count != 2 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//!
+//! effect fn failed<E>(error: E) -> i32 {
+//!   drop error
+//!   return 2
+//! }
+//!
+//! effect fn withFiles() -> i32 ! FileError | OutOfMemoryError ? &mut Allocator {
+//!   let mut files = run OsFileSystem.make("/tmp")
+//!   return run program() |> Effect.provideMut<FileSystem>(&mut files)
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   return run Effect.catchAll(withFiles(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+//! }
+//! ```
+//!
+//! @category System
+
+import silk.text.glob { Pattern, Dots }
+import silk.text.string { String }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.system.filesystem {
+  DirectoryEntry,
+  DirectoryInfo,
+  FileError,
+  FileInfo,
+  FileSystem,
+  Path
+}
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.collections.hash { Hash, HashKey, HashSeed }
+import silk.collections.hash_set { HashSet }
+import silk.collections.slice { Slice }
+import silk.num.i32
+import silk.num.u8
+import silk.num.usize
+
+/// What a scan starts from and which entries it reports.
+pub struct ScanOptions {
+  /// The directory relative patterns start from. Results are relative to it.
+  pub base: Path,
+  /// Whether wildcards match names that start with `.`. A component that starts with a literal
+  /// `.` matches such names either way.
+  pub dot: bool,
+  /// Whether only regular files are reported. When false, directories and symbolic links that a
+  /// wildcard matched are reported too.
+  pub onlyFiles: bool,
+}
+
+impl ScanOptions {
+  /// Options that scan from `base`, skip hidden names, and report regular files only.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot copy `base`.
+  pub effect fn make(base: &Path) -> ScanOptions
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return ScanOptions {
+      base: run Path.fromBytes(Path.rawBytes(base)) |> Effect.catchAll(keepRoot),
+      dot: false,
+      onlyFiles: true,
+    }
+  }
+}
+
+// `Path.fromBytes` only fails on bytes that are not a path, and a path's own bytes always are one.
+effect fn keepRoot(error: FileError | OutOfMemoryError) -> Path
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match move error {
+    FileError ignored => {
+      drop ignored
+      return run Path.root()
+    }
+    OutOfMemoryError exhausted => {
+      fail move exhausted
+    }
+  }
+}
+
+struct Component {
+  pattern: Pattern,
+  literal: bool,
+  globstar: bool,
+}
+
+// What one entry is, as far as matching needs to know.
+enum Kind {
+  File,
+  Directory,
+  Link,
+}
+
+struct Work {
+  path: Path,
+  display: Bytes,
+  index: usize,
+}
+
+struct Key {
+  path: Bytes,
+  index: usize,
+}
+
+fn equalBytes(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut index = usize.ZERO
+  while index < left.length {
+    if left[index] != right[index] {
+      return false
+    }
+    index = index + usize.ONE
+  }
+  return true
+}
+
+fn keyEquals(left: &Key, right: &Key) -> bool {
+  return left.index == right.index
+    && equalBytes(Bytes.asSlice(&left.path), Bytes.asSlice(&right.path))
+}
+
+fn keyHash(value: &Key, seed: &HashSeed) -> u64 {
+  let mut hashed = Hash.mix(seed, usize.toU64(value.index))
+  let bytes = Bytes.asSlice(&value.path)
+  let mut index = usize.ZERO
+  while index < bytes.length {
+    hashed = Hash.combine(hashed, u8.toU64(bytes[index]))
+    index = index + usize.ONE
+  }
+  return hashed
+}
+
+impl HashKey for Key {
+  equals: Key.keyEquals
+
+  hash: Key.keyHash
+}
+
+/// A scan in progress: the directories still to read and the matches not yet returned.
+pub struct Walker {
+  options: ScanOptions,
+  components: List<Component>,
+  directoryOnly: bool,
+  work: List<Work>,
+  ready: List<Bytes>,
+  seen: HashSet<Key>,
+}
+
+fn isAbsolute(path: &[u8]) -> bool {
+  return path.length > usize.ZERO && path[usize.ZERO] == 47
+}
+
+fn isLiteral(pattern: &[u8]) -> bool {
+  let mut index = usize.ZERO
+  while index < pattern.length {
+    let c = pattern[index]
+    if c == 42 || c == 63 || c == 91 || c == 123 || c == 33 || c == 92 {
+      return false
+    }
+    if (c == 64 || c == 43) && index + usize.ONE < pattern.length
+      && pattern[index + usize.ONE] == 40 {
+      return false
+    }
+    index = index + usize.ONE
+  }
+  return true
+}
+
+// `child` appended to the display path `base`, with `.` and `..` components resolved lexically.
+effect fn join(base: &[u8], child: &[u8]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut combined = Bytes.make()
+  if !isAbsolute(child) {
+    run Bytes.append(&mut combined, base)
+    if base.length > usize.ZERO && base[base.length - usize.ONE] != 47 {
+      run Bytes.append(&mut combined, b"/")
+    }
+  }
+  run Bytes.append(&mut combined, child)
+  let input = Bytes.asSlice(&combined)
+  let absolute = isAbsolute(input)
+  let mut result = Bytes.make()
+  if absolute {
+    run Bytes.append(&mut result, b"/")
+  }
+  let mut start = usize.ZERO
+  let mut index = usize.ZERO
+  while index <= input.length {
+    if index == input.length || input[index] == 47 {
+      let part = Slice.view(input, start, index - start)
+      if part.length > usize.ZERO && !equalBytes(part, b".") {
+        if equalBytes(part, b"..") {
+          let existing = Bytes.asSlice(&result)
+          let mut last = existing.length
+          while last > usize.ZERO && existing[last - usize.ONE] != 47 {
+            last = last - usize.ONE
+          }
+          let previous = Slice.view(existing, last, existing.length - last)
+          if previous.length > usize.ZERO && !equalBytes(previous, b"..") {
+            let mut length = last
+            if length > usize.ZERO && !(absolute && length == usize.ONE) {
+              length = length - usize.ONE
+            }
+            Bytes.truncate(&mut result, length)
+          } else if !absolute {
+            if existing.length > usize.ZERO {
+              run Bytes.append(&mut result, b"/")
+            }
+            run Bytes.append(&mut result, part)
+          }
+        } else {
+          let length = Bytes.length(&result)
+          if length > usize.ZERO && Bytes.asSlice(&result)[length - usize.ONE] != 47 {
+            run Bytes.append(&mut result, b"/")
+          }
+          run Bytes.append(&mut result, part)
+        }
+      }
+      start = index + usize.ONE
+    }
+    index = index + usize.ONE
+  }
+  return move result
+}
+
+// The final component of a provider path.
+fn finalName(path: &[u8]) -> &[u8] {
+  let mut start = path.length
+  while start > usize.ZERO && path[start - usize.ONE] != 47 {
+    start = start - usize.ONE
+  }
+  return Slice.view(path, start, path.length - start)
+}
+
+// Whether a failed lookup means only that there is nothing to match there.
+fn absentReason(error: &FileError) -> bool {
+  let reason = error.reason.code
+  return reason == FileSystem.reasonCode(FileSystem.notFound())
+    || reason == FileSystem.reasonCode(FileSystem.wrongType())
+    || reason == FileSystem.reasonCode(FileSystem.invalidPath())
+}
+
+// What `path` is once symbolic links are followed, or none when nothing is there.
+effect fn kindAt(path: &Path) -> Option<Kind>
+  ! FileError
+  ? &mut FileSystem {
+  return match move run Effect.result(FileSystem.stat(path)) {
+    Result<FileInfo | DirectoryInfo, FileError>.Success { value } => match move value {
+      FileInfo file => {
+        drop file
+        Option<Kind>.some(Kind.File)
+      }
+      DirectoryInfo directory => {
+        drop directory
+        Option<Kind>.some(Kind.Directory)
+      }
+    }
+    Result<FileInfo | DirectoryInfo, FileError>.Failure { error } => {
+      if absentReason(&error) {
+        drop error
+        return Option<Kind>.none()
+      }
+      fail move error
+    }
+  }
+}
+
+// The provider path that the literal component `name` names below `directory`, or none when it
+// names nothing a provider path can reach (`..` above the root, or bytes no path holds).
+effect fn literalPath(directory: &Path, name: &[u8]) -> Option<Path>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if equalBytes(name, b".") {
+    return Option<Path>.some(
+      run Path.fromBytes(Path.rawBytes(directory)) |> Effect.catchAll(keepRoot),
+    )
+  }
+  if equalBytes(name, b"..") {
+    return run Path.parent(directory)
+  }
+  return match move run Effect.result(Path.joinBytes(directory, name)) {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => Option<Path>.some(move value)
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
+      FileError ignored => {
+        drop ignored
+        return Option<Path>.none()
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+effect fn enqueue(self: &mut Walker, path: Path, display: Bytes, index: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let key = Key { path: run Bytes.copy(Bytes.asSlice(&display)), index: index }
+  let duplicate = run HashSet<Key>.insert(&mut self.seen, move key)
+  if !duplicate {
+    run List<Work>.append(
+      &mut self.work,
+      Work { path: move path, display: move display, index: index },
+    )
+  }
+}
+
+effect fn emit(self: &mut Walker, display: Bytes) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let key = Key { path: run Bytes.copy(Bytes.asSlice(&display)), index: usize.MAX }
+  let duplicate = run HashSet<Key>.insert(&mut self.seen, move key)
+  if !duplicate {
+    run List<Bytes>.append(&mut self.ready, move display)
+  }
+}
+
+impl Walker {
+  /// Starts a scan for the pattern `written` below `options.base`, or below the provider's root
+  /// when `written` starts with `/`.
+  ///
+  /// # Details
+  ///
+  /// The pattern is split at `/` into segments, and each directory is read only when a segment
+  /// can match below it: `src/*.silk` lists `src` and nothing else. Braces and groups work within
+  /// one segment; an alternative that contains `/`, such as `{a/b,c}`, is not scanned. A pattern
+  /// that ends with `/` reports directories only, and so reports nothing while `onlyFiles` is
+  /// set. An empty pattern reports nothing.
+  ///
+  /// # Errors
+  ///
+  /// - `FileError` if the starting directory does not exist or is not a directory.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the walker.
+  pub effect fn make(written: string, options: ScanOptions) -> Walker
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator {
+    let pattern = String.utf8Bytes(written)
+    let absolute = isAbsolute(pattern)
+    let mut root = run Path.fromBytes(Path.rawBytes(&options.base)) |> Effect.catchAll(keepRoot)
+    if absolute {
+      root = run Path.root()
+    }
+    match move run kindAt(&root) {
+      Option<Kind>.Some { value } => {
+        if value != Kind.Directory {
+          fail FileSystem.error(FileSystem.listDirectoryOperation(), FileSystem.wrongType())
+        }
+      }
+      Option<Kind>.None => {
+        fail FileSystem.error(FileSystem.listDirectoryOperation(), FileSystem.notFound())
+      }
+    }
+    let mut display = Bytes.make()
+    if absolute {
+      display = run Bytes.copy(b"/")
+    }
+    let mut components = List<Component>.make()
+    let mut start = usize.ZERO
+    let mut index = usize.ZERO
+    while index <= pattern.length {
+      if index == pattern.length || pattern[index] == 47 {
+        if index > start {
+          let text = Slice.view(pattern, start, index - start)
+          let globstar = equalBytes(text, b"**")
+          let mut repeated = false
+          let count = List<Component>.length(&components)
+          if globstar && count > usize.ZERO {
+            repeated = List<Component>.asSlice(&components)[count - usize.ONE].globstar
+          }
+          if !repeated {
+            let compiled = run Pattern.makeBytes(text)
+            run List<Component>.append(
+              &mut components,
+              Component { pattern: move compiled, literal: isLiteral(text), globstar: globstar },
+            )
+          }
+        }
+        start = index + usize.ONE
+      }
+      index = index + usize.ONE
+    }
+    let directoryOnly = pattern.length > usize.ZERO && pattern[pattern.length - usize.ONE] == 47
+    let mut walker = Walker {
+      options: move options,
+      components: move components,
+      directoryOnly: directoryOnly,
+      work: List<Work>.make(),
+      ready: List<Bytes>.make(),
+      seen: HashSet<Key>.make(Hash.seed(0)),
+    }
+    if List<Component>.length(&walker.components) > usize.ZERO {
+      run enqueue(&mut walker, move root, move display, usize.ZERO)
+    } else if absolute && !walker.options.onlyFiles {
+      run emit(&mut walker, move display)
+    }
+    return move walker
+  }
+
+  /// Returns the next match, or none once the scan is done. The order is unspecified.
+  ///
+  /// # Errors
+  ///
+  /// - `FileError` if a directory the scan reaches cannot be read for a reason other than its
+  ///   having gone away.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply a listing or a result.
+  pub effect fn next(self: &mut Self) -> Option<Bytes>
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator {
+    while true {
+      let available = List<Bytes>.length(&self.ready)
+      if available > usize.ZERO {
+        return Option<Bytes>.some(List<Bytes>.remove(&mut self.ready, available - usize.ONE))
+      }
+      let pending = List<Work>.length(&self.work)
+      if pending == usize.ZERO {
+        return Option<Bytes>.none()
+      }
+      let item = List<Work>.remove(&mut self.work, pending - usize.ONE)
+      run process(&mut self, &item)
+    }
+    return Option<Bytes>.none()
+  }
+
+  /// Returns every match the scan has not returned yet.
+  ///
+  /// # Errors
+  ///
+  /// - The errors of [`Walker.next`].
+  pub effect fn collect(self: &mut Self) -> List<Bytes>
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator {
+    let mut result = List<Bytes>.make()
+    while true {
+      match move run Walker.next(&mut self) {
+        Option<Bytes>.None => {
+          break
+        }
+        Option<Bytes>.Some { value } => {
+          run List<Bytes>.append(&mut result, move value)
+        }
+      }
+    }
+    return move result
+  }
+}
+
+effect fn process(self: &mut Walker, item: &Work) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let index = item.index
+  let component = &List<Component>.asSlice(&self.components)[index]
+  let literal = component.literal
+  let globstar = component.globstar
+  if literal {
+    let name = run Bytes.copy(Pattern.sourceBytes(&component.pattern))
+    let target = match move run literalPath(&item.path, Bytes.asSlice(&name)) {
+      Option<Path>.Some { value } => move value
+      Option<Path>.None => {
+        return ()
+      }
+    }
+    let kind = match move run kindAt(&target) {
+      Option<Kind>.Some { value } => value
+      Option<Kind>.None => {
+        return ()
+      }
+    }
+    return run candidate(&mut self, item, move target, Bytes.asSlice(&name), kind, false)
+  }
+  if globstar && index + usize.ONE < List<Component>.length(&self.components) {
+    let path = run Path.fromBytes(Path.rawBytes(&item.path)) |> Effect.catchAll(keepRoot)
+    let display = run Bytes.copy(Bytes.asSlice(&item.display))
+    run enqueue(&mut self, move path, move display, index + usize.ONE)
+  }
+  let entries = match move run Effect.result(FileSystem.listDirectory(&item.path)) {
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Failure {
+      error
+    } => match move error {
+      FileError failure => {
+        if absentReason(&failure) {
+          drop failure
+          return ()
+        }
+        fail move failure
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+  let mut listed = move entries
+  while List<DirectoryEntry>.length(&listed) > usize.ZERO {
+    let entry = List<DirectoryEntry>.remove(&mut listed, usize.ZERO)
+    let name = run Bytes.copy(finalName(Path.rawBytes(&entry.path)))
+    let current = &List<Component>.asSlice(&self.components)[index]
+    let source = Pattern.sourceBytes(&current.pattern)
+    let bytes = Bytes.asSlice(&name)
+    let hidden = !self.options.dot && bytes.length > usize.ZERO && bytes[usize.ZERO] == 46
+      && (source.length == usize.ZERO || source[usize.ZERO] != 46)
+    if !hidden {
+      let matched = run Pattern.matchesBytes(&current.pattern, bytes, Dots.Match)
+      if matched.matches {
+        let code = entry.kind.code
+        let mut kind = Kind.Link
+        if code == FileSystem.entryKindCode(FileSystem.file()) {
+          kind = Kind.File
+        } else if code == FileSystem.entryKindCode(FileSystem.directory()) {
+          kind = Kind.Directory
+        }
+        run candidate(&mut self, item, move entry.path, bytes, kind, globstar)
+      }
+    }
+  }
+}
+
+effect fn candidate(
+  self: &mut Walker,
+  item: &Work,
+  path: Path,
+  name: &[u8],
+  kind: Kind,
+  globstar: bool,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let display = run join(Bytes.asSlice(&item.display), name)
+  let last = item.index + usize.ONE == List<Component>.length(&self.components)
+  if last && (!self.directoryOnly || kind == Kind.Directory)
+    && (!self.options.onlyFiles || kind == Kind.File) {
+    run emit(&mut self, run Bytes.copy(Bytes.asSlice(&display)))
+  }
+
+  // A link a wildcard matched is never entered, so a scan cannot loop through a cycle of links.
+  if kind != Kind.Directory || (last && !globstar) {
+    return ()
+  }
+  let mut next = item.index + usize.ONE
+  if globstar {
+    next = item.index
+  }
+  run enqueue(&mut self, move path, move display, next)
+}
+
+/// Returns every path that `pattern` matches below `options.base`, in unspecified order.
+///
+/// # Details
+///
+/// It is [`Walker.make`] followed by [`Walker.collect`]; the walker's rules apply.
+///
+/// # Errors
+///
+/// - The errors of [`Walker.make`] and [`Walker.next`].
+pub effect fn scan(pattern: string, options: ScanOptions) -> List<Bytes>
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let mut walker = run Walker.make(pattern, move options)
+  return run Walker.collect(&mut walker)
+}
