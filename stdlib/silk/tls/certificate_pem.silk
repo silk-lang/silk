@@ -1,0 +1,502 @@
+//! Internal strict PEM framing and canonical base64 for owned certificate decoders.
+//!
+//! # Details
+//!
+//! The scanner accepts only certificate blocks and ASCII space, tab, CR, and LF separators. It
+//! checks complete blocks and byte budgets before allocation. Certificate schema checks belong to
+//! the caller.
+//!
+//! @category TLS and certificates
+
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.collections.bytes {Bytes}
+import silk.tls.certificate {DecodeLimits, DecodeError, DecodeClass, DecodeReason, DecodeOffsetSpace}
+import silk.core.ownership {Copy}
+import silk.core.result {Result}
+import silk.num.usize
+import silk.num.u8
+
+/// One independently owned decoded block and the input position after its END line.
+pub struct PemBlock {
+  /// The exact decoded bytes, without a claim that they form a certificate.
+  pub bytes: Bytes,
+  /// The input offset after the END line, including its newline when present.
+  pub nextOffset: usize,
+}
+
+/// Internal strict certificate PEM operations.
+pub struct Pem {}
+
+struct Marker {
+  labelStart: usize,
+  labelEnd: usize,
+  next: usize,
+}
+
+impl Copy for Marker {}
+
+struct Body {
+  end: usize,
+  next: usize,
+  length: usize,
+}
+
+impl Copy for Body {}
+
+impl Pem {
+  /// Skips printable annotation lines outside blocks, retaining suspect boundary bytes for
+  /// rejection.
+  ///
+  /// # Details
+  ///
+  /// ASCII text and whitespace are annotations only between complete blocks. A line containing
+  /// a hyphen boundary, BEGIN or END is always sent to the strict block decoder, even when
+  /// malformed or indented. Non-text control bytes are never discarded.
+  pub fn skipAnnotations(input: &[u8], offset: usize) -> usize {
+    let mut cursor = Pem.skipWhitespace(input, offset)
+    while cursor < input.length {
+      let start = cursor
+      while cursor < input.length && input[cursor] != 10 && input[cursor] != 13 {
+        let byte = input[cursor]
+        if (byte < 32 && byte != 9) || byte > 126 {
+          return cursor
+        }
+        if startsAt(input, cursor, b"-----") || startsAt(input, cursor, b"BEGIN ") || startsAt(input, cursor, b"END ") {
+          return start
+        }
+        cursor = cursor + usize.ONE
+      }
+      cursor = Pem.skipWhitespace(input, cursor)
+    }
+    return cursor
+  }
+  /// Returns the first offset without a space, tab, CR, or LF byte.
+  ///
+  /// # Details
+  ///
+  /// An offset at or beyond the input end returns the input length. This operation allocates
+  /// nothing.
+  pub fn skipWhitespace(input: &[u8], offset: usize) -> usize {
+    let mut cursor = offset
+    if cursor > input.length {
+      return input.length
+    }
+    while cursor < input.length {
+      if !whitespace(input[cursor]) {
+        return cursor
+      }
+      cursor = cursor + usize.ONE
+    }
+    return cursor
+  }
+  /// Decodes one strict CERTIFICATE block into owned bytes, with exact byte and certificate limits.
+  ///
+  /// # Details
+  ///
+  /// The caller supplies the BEGIN offset, block index, and previously decoded DER byte total.
+  /// Failures use input offsets and expose no partial bytes. Allocation refusal uses
+  /// `OutOfMemoryError`. Complete lexical validation precedes allocation. The caller validates the
+  /// returned DER schema.
+  ///
+  /// # Gotchas
+  ///
+  /// Other well-formed labels are unsupported. Headers, explanatory text, mismatched markers, and
+  /// noncanonical base64 fail. This operation stops after one END line. The caller must check
+  /// trailing input or decode further blocks.
+  pub effect fn decodeNext(
+    input: &[u8],
+    offset: usize,
+    limits: DecodeLimits,
+    certificateIndex: usize,
+    totalDerBytes: usize,
+  ) -> Result<PemBlock, DecodeError> ! OutOfMemoryError ? &mut Allocator {
+    if input.length > limits.inputBytes {
+      return failure<PemBlock>(
+        DecodeClass.ResourceLimit,
+        DecodeReason.InputBytes,
+        certificateIndex,
+        limits.inputBytes,
+      )
+    }
+    if certificateIndex >= limits.certificates {
+      return failure<PemBlock>(
+        DecodeClass.ResourceLimit,
+        DecodeReason.Certificates,
+        certificateIndex,
+        offset,
+      )
+    }
+    let opening = marker(input, offset, true, certificateIndex)
+    let begin = match move opening {
+      Result<Marker, DecodeError>.Failure {error} => {
+        return Result<PemBlock, DecodeError>.failResult(error)
+      }
+      Result<Marker, DecodeError>.Success {value} => value
+    }
+    let certificateLabel = b"CERTIFICATE"
+    if !sameRange(
+      input,
+      begin.labelStart,
+      begin.labelEnd,
+      &certificateLabel,
+      usize.ZERO,
+      certificateLabel.length,
+    ) {
+      return failure<PemBlock>(
+        DecodeClass.Unsupported,
+        DecodeReason.PemLabel,
+        certificateIndex,
+        offset,
+      )
+    }
+    let scanned = scan(input, begin, limits, certificateIndex, totalDerBytes)
+    let body = match move scanned {
+      Result<Body, DecodeError>.Failure {error} => {
+        return Result<PemBlock, DecodeError>.failResult(error)
+      }
+      Result<Body, DecodeError>.Success {value} => value
+    }
+    let mut bytes = Bytes.make()
+    let reserved = run Bytes.reserveExact(&mut bytes, body.length)
+    let mut cursor = begin.next
+    let mut count = usize.ZERO
+    let mut accumulator = usize.ZERO
+    while cursor < body.end {
+      let byte = input[cursor]
+      if !whitespace(byte) {
+        if byte != u8.toU8(61) {
+          accumulator = accumulator * usize.toUsize(64) + sextet(byte)
+          count = count + usize.ONE
+          if count == usize.toUsize(2) {
+            let output: [u8; 1] = [usize.toU8(accumulator / usize.toUsize(16))]
+            let appended = run Bytes.append(&mut bytes, &output)
+            accumulator = accumulator % usize.toUsize(16)
+          }
+          if count == usize.toUsize(3) {
+            let output: [u8; 1] = [usize.toU8(accumulator / usize.toUsize(4))]
+            let appended = run Bytes.append(&mut bytes, &output)
+            accumulator = accumulator % usize.toUsize(4)
+          }
+          if count == usize.toUsize(4) {
+            let output: [u8; 1] = [usize.toU8(accumulator)]
+            let appended = run Bytes.append(&mut bytes, &output)
+            accumulator = usize.ZERO
+            count = usize.ZERO
+          }
+        }
+      }
+      cursor = cursor + usize.ONE
+    }
+    return Result<PemBlock, DecodeError>.succeed(
+      PemBlock {bytes: move bytes, nextOffset: body.next},
+    )
+  }
+}
+
+fn startsAt(input: &[u8], offset: usize, expected: &[u8]) -> bool {
+  if expected.length > input.length - offset { return false }
+  let mut index = usize.ZERO
+  while index < expected.length {
+    if input[offset + index] != expected[index] { return false }
+    index = index + usize.ONE
+  }
+  return true
+}
+
+fn failure<T>(kind: DecodeClass, reason: DecodeReason, index: usize, offset: usize) -> Result<
+  T,
+  DecodeError,
+> {
+  return Result<T, DecodeError>.failResult(
+    DecodeError {
+      kind: kind,
+      reason: reason,
+      certificateIndex: index,
+      offsetSpace: DecodeOffsetSpace.Input,
+      offset: offset,
+    },
+  )
+}
+
+fn horizontal(byte: u8) -> bool {
+  return byte == u8.toU8(32) || byte == u8.toU8(9)
+}
+
+fn newline(byte: u8) -> bool {
+  return byte == u8.toU8(13) || byte == u8.toU8(10)
+}
+
+fn whitespace(byte: u8) -> bool {
+  return horizontal(byte) || newline(byte)
+}
+
+fn sameRange(left: &[u8], start: usize, end: usize, right: &[u8], other: usize, otherEnd: usize) -> bool {
+  if end - start != otherEnd - other {
+    return false
+  }
+  let mut offset = usize.ZERO
+  while offset < end - start {
+    if left[start + offset] != right[other + offset] {
+      return false
+    }
+    offset = offset + usize.ONE
+  }
+  return true
+}
+
+fn matches(input: &[u8], start: usize, text: &[u8]) -> bool {
+  if start > input.length {
+    return false
+  }
+  if text.length > input.length - start {
+    return false
+  }
+  return sameRange(input, start, start + text.length, text, usize.ZERO, text.length)
+}
+
+fn marker(input: &[u8], offset: usize, begin: bool, index: usize) -> Result<Marker, DecodeError> {
+  let opening = b"-----BEGIN "
+  let closing = b"-----END "
+  let mut prefixLength = closing.length
+  if begin {
+    prefixLength = opening.length
+  }
+  let mut cursor = offset
+  let mut pos = usize.ZERO
+  while pos < prefixLength {
+    if cursor >= input.length {
+      return failure<Marker>(DecodeClass.Malformed, DecodeReason.Truncated, index, input.length)
+    }
+    let mut expected = u8.toU8(0)
+    if begin {
+      expected = opening[pos]
+    } else {
+      expected = closing[pos]
+    }
+    if input[cursor] != expected {
+      return failure<Marker>(DecodeClass.Malformed, DecodeReason.PemSyntax, index, cursor)
+    }
+    cursor = cursor + usize.ONE
+    pos = pos + usize.ONE
+  }
+  let labelStart = cursor
+  let hyphens = b"-----"
+  let mut separator = false
+  while cursor < input.length {
+    if matches(input, cursor, &hyphens) {
+      break
+    }
+    let byte = input[cursor]
+    if byte < u8.toU8(32) || byte > u8.toU8(126) {
+      return failure<Marker>(DecodeClass.Malformed, DecodeReason.PemSyntax, index, cursor)
+    }
+    if byte == u8.toU8(32) || byte == u8.toU8(45) {
+      if cursor == labelStart || separator {
+        return failure<Marker>(DecodeClass.Malformed, DecodeReason.PemSyntax, index, cursor)
+      }
+      separator = true
+    } else {
+      separator = false
+    }
+    cursor = cursor + usize.ONE
+  }
+  if cursor == input.length {
+    return failure<Marker>(DecodeClass.Malformed, DecodeReason.Truncated, index, cursor)
+  }
+  if separator {
+    return failure<Marker>(DecodeClass.Malformed, DecodeReason.PemSyntax, index, cursor)
+  }
+  let labelEnd = cursor
+  cursor = cursor + hyphens.length
+  while cursor < input.length {
+    if !horizontal(input[cursor]) {
+      break
+    }
+    cursor = cursor + usize.ONE
+  }
+  if cursor == input.length {
+    if begin {
+      return failure<Marker>(DecodeClass.Malformed, DecodeReason.Truncated, index, cursor)
+    }
+  } else {
+    if !newline(input[cursor]) {
+      return failure<Marker>(DecodeClass.Malformed, DecodeReason.PemSyntax, index, cursor)
+    }
+    let cr = input[cursor] == u8.toU8(13)
+    cursor = cursor + usize.ONE
+    if cr && cursor < input.length {
+      if input[cursor] == u8.toU8(10) {
+        cursor = cursor + usize.ONE
+      }
+    }
+  }
+  return Result<Marker, DecodeError>.succeed(
+    Marker {labelStart: labelStart, labelEnd: labelEnd, next: cursor},
+  )
+}
+
+fn sextet(byte: u8) -> usize {
+  let value = u8.toUsize(byte)
+  if value >= usize.toUsize(65) && value <= usize.toUsize(90) {
+    return value - usize.toUsize(65)
+  }
+  if value >= usize.toUsize(97) && value <= usize.toUsize(122) {
+    return value - usize.toUsize(97) + usize.toUsize(26)
+  }
+  if value >= usize.toUsize(48) && value <= usize.toUsize(57) {
+    return value - usize.toUsize(48) + usize.toUsize(52)
+  }
+  if value == usize.toUsize(43) {
+    return usize.toUsize(62)
+  }
+  if value == usize.toUsize(47) {
+    return usize.toUsize(63)
+  }
+  return usize.toUsize(64)
+}
+
+fn scan(input: &[u8], begin: Marker, limits: DecodeLimits, index: usize, total: usize) -> Result<
+  Body,
+  DecodeError,
+> {
+  let mut cursor = begin.next
+  let mut lineClean = true
+  let mut count = usize.ZERO
+  let mut previous = usize.ZERO
+  let mut previousOffset = cursor
+  let mut padded = false
+  let mut thirdPadding = false
+  let mut length = usize.ZERO
+  while cursor < input.length {
+    let byte = input[cursor]
+    if newline(byte) {
+      lineClean = true
+    } else {
+      if !horizontal(byte) {
+        if byte == u8.toU8(45) {
+          if !lineClean {
+            return failure<Body>(DecodeClass.Malformed, DecodeReason.PemSyntax, index, cursor)
+          }
+          let parsed = marker(input, cursor, false, index)
+          let ending = match move parsed {
+            Result<Marker, DecodeError>.Failure {error} => {
+              return Result<Body, DecodeError>.failResult(error)
+            }
+            Result<Marker, DecodeError>.Success {value} => value
+          }
+          if !sameRange(
+            input,
+            begin.labelStart,
+            begin.labelEnd,
+            input,
+            ending.labelStart,
+            ending.labelEnd,
+          ) {
+            return failure<Body>(
+              DecodeClass.Malformed,
+              DecodeReason.PemSyntax,
+              index,
+              ending.labelStart,
+            )
+          }
+          if count != usize.ZERO {
+            return failure<Body>(DecodeClass.Malformed, DecodeReason.Truncated, index, cursor)
+          }
+          if length == usize.ZERO {
+            return failure<Body>(DecodeClass.Malformed, DecodeReason.Base64, index, cursor)
+          }
+          return Result<Body, DecodeError>.succeed(
+            Body {end: cursor, next: ending.next, length: length},
+          )
+        }
+        if byte == u8.toU8(0) || byte == u8.toU8(11) || byte == u8.toU8(12) || byte > u8.toU8(127) {
+          return failure<Body>(DecodeClass.Malformed, DecodeReason.PemSyntax, index, cursor)
+        }
+        lineClean = false
+        if padded {
+          return failure<Body>(DecodeClass.Malformed, DecodeReason.Base64, index, cursor)
+        }
+        let value = sextet(byte)
+        if byte == u8.toU8(61) {
+          if count < usize.toUsize(2) {
+            return failure<Body>(DecodeClass.Malformed, DecodeReason.Base64, index, cursor)
+          }
+          if count == usize.toUsize(2) {
+            if previous % usize.toUsize(16) != usize.ZERO {
+              return failure<Body>(
+                DecodeClass.Malformed,
+                DecodeReason.Base64,
+                index,
+                previousOffset,
+              )
+            }
+            thirdPadding = true
+          } else {
+            if !thirdPadding && previous % usize.toUsize(4) != usize.ZERO {
+              return failure<Body>(
+                DecodeClass.Malformed,
+                DecodeReason.Base64,
+                index,
+                previousOffset,
+              )
+            }
+            padded = true
+          }
+        } else {
+          if value == usize.toUsize(64) || thirdPadding {
+            return failure<Body>(DecodeClass.Malformed, DecodeReason.Base64, index, cursor)
+          }
+        }
+        count = count + usize.ONE
+        if count == usize.toUsize(4) {
+          let mut additional = usize.toUsize(3)
+          if padded {
+            additional = usize.toUsize(2)
+          }
+          if thirdPadding {
+            additional = usize.ONE
+          }
+          if additional > usize.MAX - length {
+            return failure<Body>(
+              DecodeClass.ResourceLimit,
+              DecodeReason.SizeOverflow,
+              index,
+              cursor,
+            )
+          }
+          let next = length + additional
+          if next > limits.certificateBytes {
+            return failure<Body>(
+              DecodeClass.ResourceLimit,
+              DecodeReason.CertificateBytes,
+              index,
+              cursor,
+            )
+          }
+          if total > usize.MAX - next {
+            return failure<Body>(
+              DecodeClass.ResourceLimit,
+              DecodeReason.SizeOverflow,
+              index,
+              cursor,
+            )
+          }
+          if total + next > limits.totalDerBytes {
+            return failure<Body>(
+              DecodeClass.ResourceLimit,
+              DecodeReason.TotalDerBytes,
+              index,
+              cursor,
+            )
+          }
+          length = next
+          count = usize.ZERO
+        }
+        previous = value
+        previousOffset = cursor
+      }
+    }
+    cursor = cursor + usize.ONE
+  }
+  return failure<Body>(DecodeClass.Malformed, DecodeReason.Truncated, index, input.length)
+}

@@ -1,0 +1,1209 @@
+//! UTF-8 text: owned strings, validation of bytes, search, splitting, trimming, and traversal one
+//! Unicode scalar at a time.
+//!
+//! # When to use
+//! Use the built-in `string` type for borrowed text, such as a literal or a view into a buffer. Use
+//! [`String`] when the text must own its storage, for example to build text at runtime. Use
+//! `silk.collections.bytes.Bytes` for bytes that are not necessarily UTF-8.
+//!
+//! # Details
+//! A `string` and a [`String`] always hold valid UTF-8.
+//!
+//! - [`String.fromUtf8`] checks bytes and borrows them as a `string`. It does not allocate.
+//! - [`String.copyUtf8`] checks bytes and copies them into a new [`String`].
+//! - [`String.fromBytes`] checks an owned `Bytes` value and keeps its storage, with no copy.
+//!   [`String.intoBytes`] gives the storage back as `Bytes`.
+//!
+//! [`String.find`], [`String.split`], [`String.trim`], and [`String.slice`] search and cut text
+//! without allocation. They return views of the input, and their offsets count UTF-8 bytes.
+//!
+//! A failed [`String.append`] or [`String.appendOwned`] leaves the string unchanged. Traversal with
+//! [`String.nextScalar`] gives Unicode scalar values and byte offsets. It does not give grapheme
+//! clusters, so one visible character can be more than one scalar.
+//!
+//! # Gotchas
+//! A [`ScalarCursor`] is valid only for the string where the traversal started, and only while that
+//! string does not change. Start with [`String.scalarCursor`] and advance only with
+//! [`String.nextCursor`].
+//!
+//! # Examples
+//! ## Check bytes as UTF-8
+//! ```silk
+//! import silk.core.result { Result }
+//! import silk.text.string { String, InvalidUtf8 }
+//!
+//! pub fn main() -> i32 {
+//!   let valid = String.fromUtf8(b"Silk") |> Result<string, InvalidUtf8>.unwrapOr("")
+//!   let rejected = String.fromUtf8(b"a\x80") |> Result<string, InvalidUtf8>.unwrapOr("")
+//!   if String.byteLength(valid) != 4 || String.byteLength(rejected) != 0 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! ## Count the scalars of a string
+//! ```silk
+//! import silk.core.option { Option }
+//! import silk.text.string { String, ScalarStep }
+//!
+//! pub fn main() -> i32 {
+//!   // "né" has 2 scalars in 3 bytes.
+//!   let text = "né"
+//!   let mut count = 0
+//!   let mut step = String.nextScalar(text, String.scalarCursor())
+//!   while true {
+//!     match move step {
+//!       Option<ScalarStep>.Some { value } => {
+//!         count = count + 1
+//!         step = String.nextScalar(text, String.nextCursor(move value))
+//!       }
+//!       Option<ScalarStep>.None => {
+//!         break
+//!       }
+//!     }
+//!   }
+//!   if count != 2 || String.byteLength(text) != 3 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! ## Build an owned string
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.text.string { String }
+//!
+//! pub effect fn main() -> i32
+//!   ! OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let mut text = run String.copy("hello") |> Effect.provideMut<Allocator>(&mut allocator)
+//!   run String.append(&mut text, ", world") |> Effect.provideMut<Allocator>(&mut allocator)
+//!   if String.view(&text) != "hello, world" {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Text
+
+import silk.core.bool
+import silk.text.byte_search
+import silk.collections.bytes { Bytes }
+import silk.text.char
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.format { Debug, Format, Formatter }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.simd.aarch64
+import silk.simd.wasm
+import silk.simd.x86
+import silk.simd.simd
+import silk.simd.mask16
+import silk.simd.u8x16
+import silk.collections.slice { Slice }
+import silk.core.target { Arch, Target }
+import silk.num.u32
+import silk.num.u8
+import silk.num.usize
+import silk.io.writer { Writer, WriterError }
+
+/// Owned UTF-8 text. Dropping a `String` releases its storage.
+///
+/// # Details
+///
+/// Get a borrowed `string` view with [`String.view`]. A `String` is affine. Use [`String.copy`] to
+/// make an independent copy of a view. A `String` always holds valid UTF-8. A failed
+/// [`String.append`] or [`String.appendOwned`] leaves the string unchanged.
+///
+/// The capacity is the number of UTF-8 bytes that fit before the next allocation. Use
+/// [`String.makeWithCapacity`] or [`String.reserve`] to allocate before a run of appends.
+/// [`String.clear`] keeps the storage for reuse, and [`String.clearAndFree`] releases it.
+///
+/// # Gotchas
+///
+/// Traversal with [`String.nextScalar`] gives Unicode scalar values, not grapheme clusters, so one
+/// visible character can be more than one scalar.
+pub struct String {
+  bytes: Bytes,
+}
+
+impl Debug for String {
+  /// Writes the text as a quoted string, like a `string`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    let text = String.view(self)
+    return run Debug.debug(&text, &mut formatter)
+  }
+}
+
+impl String {
+  /// Returns `values` as a `string` view, with no UTF-8 check.
+  ///
+  /// # When to use
+  ///
+  /// Use this function only when earlier code proves that all of `values` is valid UTF-8, such as a
+  /// buffer that this module made. Use [`String.fromUtf8`] in other cases.
+  ///
+  /// # Gotchas
+  ///
+  /// This function is `unsafe`. If `values` is not valid UTF-8, the behavior of later text
+  /// operations is not defined.
+  pub unsafe fn fromUtf8Unchecked(values: &[u8]) -> string {
+    unsafe { return Intrinsic.stringFromUtf8Unchecked(values) }
+    return ""
+  }
+
+  /// Checks that `values` is valid UTF-8 and returns it as a `string` view. This function does not
+  /// allocate.
+  ///
+  /// # Details
+  ///
+  /// The view borrows `values` and has the same lifetime.
+  ///
+  /// # Errors
+  ///
+  /// - [`InvalidUtf8`] if `values` is not valid UTF-8. `offset` gives the position of the first
+  ///   invalid byte.
+  pub fn fromUtf8(values: &[u8]) -> Result<string, InvalidUtf8> {
+    let failure = match move firstInvalidUtf8(values) {
+      Option<usize>.Some { value } => move value
+      Option<usize>.None => values.length + usize.ONE
+    }
+    if failure <= values.length {
+      return Result<string, InvalidUtf8>.failResult(InvalidUtf8 { offset: failure })
+    }
+    let text = unsafe String.fromUtf8Unchecked(values)
+    return Result<string, InvalidUtf8>.succeed(text)
+    return Result<string, InvalidUtf8>.failResult(InvalidUtf8 { offset: usize.ZERO })
+  }
+
+  /// Returns an empty `String`. This function does not allocate.
+  pub fn make() -> String {
+    return String { bytes: Bytes.make() }
+  }
+
+  /// Returns an empty `String` with storage for exactly `capacity` UTF-8 bytes.
+  ///
+  /// # When to use
+  ///
+  /// Use `makeWithCapacity` to build text with appends when its byte length is known or can be
+  /// estimated, so that the string allocates once.
+  ///
+  /// # Details
+  ///
+  /// The capacity counts UTF-8 bytes, not characters. A `capacity` of 0 does not allocate.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the storage.
+  ///
+  /// # Examples
+  /// ```silk
+  /// import silk.mem.allocator { Allocator, OutOfMemoryError }
+  /// import silk.core.effect { Effect }
+  /// import silk.text.string { String }
+  ///
+  /// pub effect fn main() -> i32
+  ///   ! OutOfMemoryError {
+  ///   let mut allocator = Allocator.systemAllocatorProvider()
+  ///   let mut text = run String.makeWithCapacity(32) |> Effect.provideMut<Allocator>(&mut allocator)
+  ///   run String.append(&mut text, "hello") |> Effect.provideMut<Allocator>(&mut allocator)
+  ///   String.clear(&mut text)
+  ///   if String.ownedByteLength(&text) != 0 || String.capacity(&text) != 32 {
+  ///     return 1
+  ///   }
+  ///   return 0
+  /// }
+  /// ```
+  pub effect fn makeWithCapacity(capacity: usize) -> String ! OutOfMemoryError ? &mut Allocator {
+    let bytes = run Bytes.makeWithCapacity(capacity)
+    return String { bytes: move bytes }
+  }
+
+  /// Returns the number of UTF-8 bytes the storage holds before the next append allocates.
+  pub fn capacity(self: &Self) -> usize {
+    return Bytes.capacity(&self.bytes)
+  }
+
+  /// Makes sure that at least `additional` more UTF-8 bytes fit without another allocation, with
+  /// room to spare for later appends. The text does not change.
+  ///
+  /// # When to use
+  ///
+  /// Use `reserve` before a run of appends whose total is not known. Use [`String.reserveExact`]
+  /// when the final byte length is known.
+  ///
+  /// # Details
+  ///
+  /// If the capacity is already sufficient, this function does nothing. Otherwise, it grows the
+  /// capacity by doubling until the bytes fit.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the byte length plus `additional` overflows `usize`, or the
+  ///   `Allocator` cannot supply the storage. The string does not change.
+  pub effect fn reserve(self: &mut Self, additional: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    return run Bytes.reserve(&mut self.bytes, additional)
+  }
+
+  /// Makes sure that at least `additional` more UTF-8 bytes fit, with no extra capacity. The text
+  /// does not change.
+  ///
+  /// # Details
+  ///
+  /// If the capacity is already sufficient, this function does nothing and does not shrink the
+  /// storage. Otherwise, it makes one allocation for exactly the byte length plus `additional`.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the byte length plus `additional` overflows `usize`, or the
+  ///   `Allocator` cannot supply the storage. The string does not change.
+  pub effect fn reserveExact(self: &mut Self, additional: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    return run Bytes.reserveExact(&mut self.bytes, additional)
+  }
+
+  /// Releases the capacity beyond the byte length.
+  ///
+  /// # Details
+  ///
+  /// If the capacity equals the byte length, this function does nothing. If the string is empty,
+  /// it releases the storage. Otherwise, it moves the text into storage for exactly its byte
+  /// length.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the new storage. The string does not
+  ///   change. An empty string never fails.
+  pub effect fn shrinkToFit(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    return run Bytes.shrinkToFit(&mut self.bytes)
+  }
+
+  /// Removes all text. The storage stays allocated for reuse.
+  ///
+  /// # Details
+  ///
+  /// Later appends up to the old capacity do not allocate. Use [`String.clearAndFree`] to also
+  /// release the storage.
+  pub fn clear(self: &mut Self) -> () {
+    return Bytes.clear(&mut self.bytes)
+  }
+
+  /// Removes all text and releases the storage. The byte length and the capacity become 0.
+  ///
+  /// # Details
+  ///
+  /// This function does not allocate and does not need an `Allocator`. Use [`String.clear`] to keep
+  /// the storage for reuse.
+  pub fn clearAndFree(self: &mut Self) -> () {
+    return Bytes.clearAndFree(&mut self.bytes)
+  }
+
+  /// Checks that `values` is valid UTF-8 and returns it as a `String` that keeps the same storage.
+  ///
+  /// # When to use
+  ///
+  /// Use `fromBytes` to turn an owned byte buffer, such as file contents, into owned text without a
+  /// copy. Use [`String.fromUtf8`] to borrow bytes without taking ownership.
+  ///
+  /// # Details
+  ///
+  /// This function consumes `values`. On success, the `String` keeps the allocation and capacity of
+  /// `values`. This function does not allocate and does not copy.
+  ///
+  /// # Errors
+  ///
+  /// - [`InvalidUtf8`] if `values` is not valid UTF-8. `offset` gives the position of the first
+  ///   invalid byte. The storage of `values` is released.
+  pub fn fromBytes(values: Bytes) -> Result<String, InvalidUtf8> {
+    let failure = firstInvalidUtf8(Bytes.asSlice(&values))
+    return match move failure {
+      Option<usize>.Some {value} => Result<String, InvalidUtf8>.failResult(
+        InvalidUtf8 {offset: value},
+      )
+      Option<usize>.None => Result<String, InvalidUtf8>.succeed(String {bytes: move values})
+    }
+  }
+  /// Returns `values` as a `String` that keeps the same storage, with no UTF-8 check.
+  ///
+  /// # When to use
+  ///
+  /// Use this function only when earlier code proves that all bytes of `values` are valid UTF-8.
+  /// Use [`String.fromBytes`] in other cases.
+  ///
+  /// # Gotchas
+  ///
+  /// This function is `unsafe`. If `values` is not valid UTF-8, the behavior of later text
+  /// operations is not defined.
+  pub unsafe fn fromBytesUnchecked(values: Bytes) -> String {
+    return String {bytes: move values}
+  }
+  /// Returns the storage of the string as `Bytes`, with no copy.
+  ///
+  /// # Details
+  ///
+  /// This function consumes the string. The result keeps the allocation, the capacity, and the
+  /// UTF-8 contents. After the conversion, the bytes can change to any value.
+  pub fn intoBytes(self: Self) -> Bytes {
+    return match move self {
+      String {bytes} => move bytes
+    }
+  }
+
+  /// Returns a new `String` that holds a copy of `value`.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the storage.
+  pub effect fn copy(value: string) -> String ! OutOfMemoryError ? &mut Allocator {
+    let source = Intrinsic.stringUtf8Bytes(value)
+    let bytes = run Bytes.copy(source)
+    return String { bytes: move bytes }
+  }
+
+  /// Checks that `values` is valid UTF-8 and returns a new `String` that holds a copy.
+  ///
+  /// # When to use
+  ///
+  /// Use `copyUtf8` when the text must live longer than the buffer of `values`. Use
+  /// [`String.fromUtf8`] to borrow the bytes without allocation.
+  ///
+  /// # Errors
+  ///
+  /// - [`InvalidUtf8`] as the `Result` failure if `values` is not valid UTF-8. `offset` gives the
+  ///   position of the first invalid byte. The function does not allocate.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the storage.
+  pub effect fn copyUtf8(values: &[u8]) -> Result<String, InvalidUtf8> ! OutOfMemoryError ? &mut Allocator {
+    let failure = match move firstInvalidUtf8(values) {
+      Option<usize>.Some { value } => move value
+      Option<usize>.None => values.length + usize.ONE
+    }
+    if failure <= values.length {
+      return Result<String, InvalidUtf8>.failResult(InvalidUtf8 { offset: failure })
+    }
+    let bytes = run Bytes.copy(values)
+    return Result<String, InvalidUtf8>.succeed(String { bytes: move bytes })
+  }
+
+  /// Adds a copy of `value` at the end of the string.
+  ///
+  /// # When to use
+  ///
+  /// Use `append` for borrowed text. Use [`String.appendOwned`] when the suffix is an owned
+  /// [`String`].
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the storage. The string does not change.
+  pub effect fn append(self: &mut Self, value: string) -> () ! OutOfMemoryError ? &mut Allocator {
+    let suffix = Intrinsic.stringUtf8Bytes(value)
+    return run Bytes.append(&mut self.bytes, suffix)
+  }
+
+  /// Adds the text of `value` at the end of the string and consumes `value`.
+  ///
+  /// # When to use
+  ///
+  /// Use `appendOwned` when the suffix is an owned [`String`] that the caller does not need again.
+  /// Use [`String.append`] for borrowed text.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the storage. The string does not change,
+  ///   and `value` is dropped.
+  pub effect fn appendOwned(self: &mut Self, value: String) -> () ! OutOfMemoryError ? &mut Allocator {
+    let suffix = Bytes.asSlice(&value.bytes)
+    return run Bytes.append(&mut self.bytes, suffix)
+  }
+
+  /// Returns a `string` view of the text. This function does not allocate or copy.
+  pub fn view(self: &Self) -> string {
+    let bytes = Bytes.asSlice(&self.bytes)
+    return unsafe String.fromUtf8Unchecked(bytes)
+  }
+
+  /// Returns the UTF-8 bytes of `value` as a shared slice.
+  pub fn utf8Bytes(value: string) -> &[u8] {
+    return Intrinsic.stringUtf8Bytes(value)
+  }
+
+  /// Returns the number of UTF-8 bytes in `value`. This is not the number of characters.
+  pub fn byteLength(value: string) -> usize {
+    return Intrinsic.stringByteLength(value)
+  }
+
+  /// Returns `true` if `offset` is a valid place to cut `value`: the start of a scalar, or the end
+  /// of the text.
+  ///
+  /// # When to use
+  ///
+  /// Use `isCharBoundary` to check an offset before you give it to [`String.slice`], when the
+  /// offset does not come from a search such as [`String.find`].
+  ///
+  /// # Details
+  ///
+  /// Offsets count UTF-8 bytes. Offset `0` and offset `String.byteLength(value)` are always
+  /// boundaries. An offset after the end gives `false`.
+  pub fn isCharBoundary(value: string, offset: usize) -> bool {
+    let bytes = Intrinsic.stringUtf8Bytes(value)
+    if offset == bytes.length { return true }
+    if offset > bytes.length { return false }
+    return continuation(bytes[offset]) == false
+  }
+
+  /// Returns the `length` bytes of `value` that start at byte `offset`, as a `string` view. This
+  /// function does not allocate or copy.
+  ///
+  /// # When to use
+  ///
+  /// Use `slice` to cut text at offsets from [`String.find`], [`String.findLast`], or
+  /// [`String.scalarByteOffset`]. Those offsets are always at the start of a scalar.
+  ///
+  /// # Details
+  ///
+  /// Offsets and lengths count UTF-8 bytes, not characters. The view borrows `value` and has the
+  /// same lifetime. `slice(value, String.byteLength(value), 0)` is a valid empty view.
+  ///
+  /// # Gotchas
+  ///
+  /// The program traps if the range does not fit in `value`, or if `offset` or `offset + length`
+  /// falls inside a multi-byte scalar. Check an offset of unknown origin with
+  /// [`String.isCharBoundary`] first.
+  ///
+  /// # Examples
+  ///
+  /// ## Take a word out of a sentence
+  ///
+  /// ```silk
+  /// import silk.text.string { String }
+  ///
+  /// pub fn main() -> i32 {
+  ///   // "é" is two bytes, so "café" ends at byte 5.
+  ///   let text = "café au lait"
+  ///   if String.slice(text, 0, 5) != "café" || String.slice(text, 6, 2) != "au" {
+  ///     return 1
+  ///   }
+  ///   return 0
+  /// }
+  /// ```
+  pub fn slice(value: string, offset: usize, length: usize) -> string {
+    let bytes = Intrinsic.stringUtf8Bytes(value)
+    if offset > bytes.length || length > bytes.length - offset {
+      Intrinsic.trap("String.slice: the range ends past the end of the text")
+    }
+    let part = Slice.view<u8>(bytes, offset, length)
+    if !String.isCharBoundary(value, offset) || !String.isCharBoundary(value, offset + length) {
+      Intrinsic.trap("String.slice: the range does not start and end on character boundaries")
+    }
+    return unsafe String.fromUtf8Unchecked(part)
+  }
+
+  /// Returns `true` if `value` begins with `prefix`. Every text begins with the empty string.
+  ///
+  /// # Details
+  ///
+  /// The comparison is exact, byte for byte. It does not ignore case and does not normalize
+  /// Unicode, so `"é"` written as one scalar does not begin with `"e"`.
+  pub fn startsWith(value: string, prefix: string) -> bool {
+    let bytes = Intrinsic.stringUtf8Bytes(value)
+    let wanted = Intrinsic.stringUtf8Bytes(prefix)
+    if wanted.length > bytes.length { return false }
+    return bytesMatchAt(bytes, usize.ZERO, wanted)
+  }
+
+  /// Returns `true` if `value` ends with `suffix`. Every text ends with the empty string.
+  ///
+  /// # Details
+  ///
+  /// The comparison is exact, byte for byte. It does not ignore case and does not normalize
+  /// Unicode.
+  pub fn endsWith(value: string, suffix: string) -> bool {
+    let bytes = Intrinsic.stringUtf8Bytes(value)
+    let wanted = Intrinsic.stringUtf8Bytes(suffix)
+    if wanted.length > bytes.length { return false }
+    return bytesMatchAt(bytes, bytes.length - wanted.length, wanted)
+  }
+
+  /// Returns `true` if `needle` occurs anywhere in `value`. Every text contains the empty string.
+  ///
+  /// # Details
+  ///
+  /// The comparison is exact, byte for byte. It does not ignore case and does not normalize
+  /// Unicode. The search compares sixteen bytes at a time on CPUs with 128-bit vectors.
+  pub fn contains(value: string, needle: string) -> bool {
+    return match String.find(value, needle) {
+      Option<usize>.Some { value: found } => true
+      Option<usize>.None => false
+    }
+  }
+
+  /// Returns the byte offset of the first occurrence of `needle` in `value`, or `None`.
+  ///
+  /// # Details
+  ///
+  /// The offset counts UTF-8 bytes and is always the start of a scalar, so it can go straight to
+  /// [`String.slice`]. An empty `needle` occurs at offset `0`. The comparison is exact, byte for
+  /// byte, with no case folding or Unicode normalization. The search compares sixteen bytes at a
+  /// time on CPUs with 128-bit vectors and does not allocate.
+  ///
+  /// # Examples
+  ///
+  /// ## Read the value of a setting
+  ///
+  /// ```silk
+  /// import silk.core.option { Option }
+  /// import silk.text.string { String }
+  ///
+  /// pub fn main() -> i32 {
+  ///   let line = "name = Silk"
+  ///   let at = match String.find(line, " = ") {
+  ///     Option<usize>.Some { value } => value
+  ///     Option<usize>.None => { return 1 }
+  ///   }
+  ///   let start = at + 3
+  ///   let value = String.slice(line, start, String.byteLength(line) - start)
+  ///   if at != 4 || value != "Silk" {
+  ///     return 1
+  ///   }
+  ///   return 0
+  /// }
+  /// ```
+  pub fn find(value: string, needle: string) -> Option<usize> {
+    return byte_search.findSlice(Intrinsic.stringUtf8Bytes(value), Intrinsic.stringUtf8Bytes(needle))
+  }
+
+  /// Returns the byte offset of the last occurrence of `needle` in `value`, or `None`.
+  ///
+  /// # Details
+  ///
+  /// The offset counts UTF-8 bytes and is always the start of a scalar, so it can go straight to
+  /// [`String.slice`]. An empty `needle` occurs at offset `String.byteLength(value)`. The
+  /// comparison is exact, byte for byte, with no case folding or Unicode normalization. This
+  /// function does not allocate.
+  ///
+  /// # Examples
+  ///
+  /// ## Take the extension of a file name
+  ///
+  /// ```silk
+  /// import silk.core.option { Option }
+  /// import silk.text.string { String }
+  ///
+  /// pub fn main() -> i32 {
+  ///   let name = "archive.tar.gz"
+  ///   let dot = match String.findLast(name, ".") {
+  ///     Option<usize>.Some { value } => value
+  ///     Option<usize>.None => { return 1 }
+  ///   }
+  ///   let extension = String.slice(name, dot + 1, String.byteLength(name) - dot - 1)
+  ///   if extension != "gz" {
+  ///     return 1
+  ///   }
+  ///   return 0
+  /// }
+  /// ```
+  pub fn findLast(value: string, needle: string) -> Option<usize> {
+    let bytes = Intrinsic.stringUtf8Bytes(value)
+    let wanted = Intrinsic.stringUtf8Bytes(needle)
+    if wanted.length > bytes.length { return Option<usize>.none() }
+    if wanted.length == usize.ZERO { return Option<usize>.some(bytes.length) }
+    let last = wanted.length - usize.ONE
+    // Every match ends with the last byte of the needle; find those from the end.
+    let mut end = bytes.length
+    while end >= wanted.length {
+      let window = Slice.view<u8>(bytes, last, end - last)
+      let hit = match byte_search.findLast(window, wanted[last]) {
+        Option<usize>.Some { value: found } => found
+        Option<usize>.None => { return Option<usize>.none() }
+      }
+      let start = hit
+      if bytesMatchAt(bytes, start, wanted) {
+        return Option<usize>.some(start)
+      }
+      end = start + last
+    }
+    return Option<usize>.none()
+  }
+
+  /// Returns a [`Split`] that gives the pieces of `value` between occurrences of `separator`, one
+  /// at a time.
+  ///
+  /// # When to use
+  ///
+  /// Use `split` to read fields separated by a comma, words separated by a space, or lines
+  /// separated by `"\n"`. Read the pieces with [`Split.next`]. Use [`Split.remainder`] to take
+  /// the rest of the text in one piece, for example the value after the first `=`.
+  ///
+  /// # Details
+  ///
+  /// The pieces are views of `value`, with its lifetime, and this function does not allocate. A
+  /// separator at the start or the end of `value`, or two separators in a row, give an empty piece,
+  /// so `"a,,b"` split on `","` gives `"a"`, `""`, and `"b"`, and an empty `value` gives one empty
+  /// piece. A [`Split`] is `Copy`, so copying it starts a second, independent reading.
+  ///
+  /// # Gotchas
+  ///
+  /// An empty `separator` matches nowhere, so the only piece is all of `value`. Text with Windows
+  /// line endings split on `"\n"` keeps a `"\r"` at the end of each line; [`String.trimEnd`]
+  /// removes it.
+  ///
+  /// # Examples
+  ///
+  /// ## Add up comma-separated numbers
+  ///
+  /// ```silk
+  /// import silk.text.format { ParseError }
+  /// import silk.num.i32
+  /// import silk.core.option { Option }
+  /// import silk.core.result { Result }
+  /// import silk.text.string { String, Split }
+  ///
+  /// pub fn main() -> i32 {
+  ///   let mut fields = String.split("4, 5,6", ",")
+  ///   let mut total = 0
+  ///   while true {
+  ///     let field = match Split.next(&mut fields) {
+  ///       Option<string>.Some { value } => value
+  ///       Option<string>.None => { break }
+  ///     }
+  ///     total = total + (i32.parse(String.trim(field)) |> Result<i32, ParseError>.unwrapOr(0))
+  ///   }
+  ///   if total != 15 {
+  ///     return 1
+  ///   }
+  ///   return 0
+  /// }
+  /// ```
+  pub fn split<'text, 'separator>(value: string<'text>, separator: string<'separator>) -> Split<'text, 'separator> {
+    return Split<'text, 'separator> { rest: value, separator: separator, finished: false }
+  }
+
+  /// Returns `value` without the whitespace at its start and its end. This function does not
+  /// allocate or copy.
+  ///
+  /// # Details
+  ///
+  /// Whitespace is every scalar with the Unicode `White_Space` property: the ASCII space, tab, line
+  /// feed, vertical tab, form feed, and carriage return, and also U+0085, the no-break space
+  /// U+00A0, U+1680, U+2000 to U+200A, U+2028, U+2029, U+202F, U+205F, and U+3000. Whitespace
+  /// inside the text stays. The result is a view of `value` with the same lifetime.
+  ///
+  /// # Examples
+  ///
+  /// ## Clean up a line of input
+  ///
+  /// ```silk
+  /// import silk.text.string { String }
+  ///
+  /// pub fn main() -> i32 {
+  ///   if String.trim("\t  hello world \r\n") != "hello world" || String.trim("   ") != "" {
+  ///     return 1
+  ///   }
+  ///   return 0
+  /// }
+  /// ```
+  pub fn trim(value: string) -> string {
+    return String.trimEnd(String.trimStart(value))
+  }
+
+  /// Returns `value` without the whitespace at its start. This function does not allocate or copy.
+  ///
+  /// # Details
+  ///
+  /// Whitespace is every scalar with the Unicode `White_Space` property: the ASCII space, tab, line
+  /// feed, vertical tab, form feed, and carriage return, and also U+0085, the no-break space
+  /// U+00A0, U+1680, U+2000 to U+200A, U+2028, U+2029, U+202F, U+205F, and U+3000. The result is a
+  /// view of `value` with the same lifetime.
+  pub fn trimStart(value: string) -> string {
+    let bytes = Intrinsic.stringUtf8Bytes(value)
+    let mut start = usize.ZERO
+    while start < bytes.length {
+      let width = whitespaceWidth(bytes, start)
+      if width == usize.ZERO { break }
+      start = start + width
+    }
+    return unsafe String.fromUtf8Unchecked(Slice.view<u8>(bytes, start, bytes.length - start))
+  }
+
+  /// Returns `value` without the whitespace at its end. This function does not allocate or copy.
+  ///
+  /// # Details
+  ///
+  /// Whitespace is every scalar with the Unicode `White_Space` property: the ASCII space, tab, line
+  /// feed, vertical tab, form feed, and carriage return, and also U+0085, the no-break space
+  /// U+00A0, U+1680, U+2000 to U+200A, U+2028, U+2029, U+202F, U+205F, and U+3000. The result is a
+  /// view of `value` with the same lifetime.
+  pub fn trimEnd(value: string) -> string {
+    let bytes = Intrinsic.stringUtf8Bytes(value)
+    let mut end = bytes.length
+    while end > usize.ZERO {
+      // Step back to the first byte of the last scalar.
+      let mut start = end - usize.ONE
+      while continuation(bytes[start]) {
+        start = start - usize.ONE
+      }
+      if whitespaceWidth(bytes, start) == usize.ZERO { break }
+      end = start
+    }
+    return unsafe String.fromUtf8Unchecked(Slice.view<u8>(bytes, usize.ZERO, end))
+  }
+
+  /// Returns the UTF-8 bytes of the string as a shared slice.
+  pub fn ownedUtf8Bytes(self: &Self) -> &[u8] {
+    return Bytes.asSlice(&self.bytes)
+  }
+
+  /// Returns the number of UTF-8 bytes in the string. This is not the number of characters.
+  pub fn ownedByteLength(self: &Self) -> usize {
+    return Bytes.length(&self.bytes)
+  }
+
+  /// Returns a cursor at the start of a string, before the first scalar.
+  ///
+  /// # Details
+  ///
+  /// Give the cursor to [`String.nextScalar`] to read the first scalar.
+  pub fn scalarCursor() -> ScalarCursor {
+    return ScalarCursor { byteOffset: usize.ZERO }
+  }
+
+  /// Returns the byte position of `cursor` in its string.
+  pub fn cursorByteOffset(cursor: &ScalarCursor) -> usize {
+    return cursor.byteOffset
+  }
+
+  /// Returns the Unicode scalar that `step` read.
+  pub fn scalarValue(step: &ScalarStep) -> char {
+    return step.scalar
+  }
+
+  /// Returns the byte position where the scalar of `step` starts.
+  pub fn scalarByteOffset(step: &ScalarStep) -> usize {
+    return step.byteOffset
+  }
+
+  /// Returns the cursor after the scalar of `step`, and consumes `step`.
+  ///
+  /// # Details
+  ///
+  /// Give the cursor to [`String.nextScalar`] to read the next scalar.
+  pub fn nextCursor(step: ScalarStep) -> ScalarCursor {
+    return match move step {
+      ScalarStep { scalar, byteOffset, next } => move next
+    }
+  }
+
+  /// Reads the scalar at `cursor` in `value`. Returns `None` at the end of the text.
+  ///
+  /// # Details
+  ///
+  /// A present [`ScalarStep`] holds the scalar, its byte position, and the cursor after it. Read
+  /// them with [`String.scalarValue`], [`String.scalarByteOffset`], and [`String.nextCursor`]. This
+  /// function does not allocate.
+  ///
+  /// # Gotchas
+  ///
+  /// `cursor` must come from [`String.scalarCursor`] or [`String.nextCursor`] for the same `value`.
+  /// A cursor from a different string gives incorrect results.
+  pub fn nextScalar(value: string, cursor: ScalarCursor) -> Option<ScalarStep> {
+    let bytes = Intrinsic.stringUtf8Bytes(value)
+    let offset = cursor.byteOffset
+    if offset == bytes.length { return Option<ScalarStep>.none() }
+    let first = bytes[offset]
+    let mut scalar = scalar32(first)
+    let mut width = usize.ONE
+    if byte(194) <= first {
+      if first <= byte(223) {
+        scalar = (scalar32(first) - u32.toU32(192)) * u32.toU32(64)
+          + (scalar32(bytes[offset + usize.ONE]) - u32.toU32(128))
+        width = 2
+      } else {
+        if first <= byte(239) {
+          scalar = (scalar32(first) - u32.toU32(224)) * u32.toU32(4096)
+            + (scalar32(bytes[offset + usize.ONE]) - u32.toU32(128)) * u32.toU32(64)
+            + (scalar32(bytes[offset + 2]) - u32.toU32(128))
+          width = 3
+        } else {
+          scalar = (scalar32(first) - u32.toU32(240)) * u32.toU32(262144)
+            + (scalar32(bytes[offset + usize.ONE]) - u32.toU32(128)) * u32.toU32(4096)
+            + (scalar32(bytes[offset + 2]) - u32.toU32(128)) * u32.toU32(64)
+            + (scalar32(bytes[offset + 3]) - u32.toU32(128))
+          width = 4
+        }
+      }
+    }
+    return match move char.fromU32(scalar) {
+      Option<char>.Some { value: decoded } => Option<ScalarStep>.some(ScalarStep {
+        scalar: decoded,
+        byteOffset: offset,
+        next: ScalarCursor { byteOffset: offset + width }
+      })
+      Option<char>.None => Option<ScalarStep>.none()
+    }
+  }
+}
+
+/// The error value of a UTF-8 check: the position of the first invalid byte.
+pub struct InvalidUtf8 {
+  /// The zero-based position of the first byte that is not valid UTF-8.
+  pub offset: usize,
+}
+
+impl Debug for InvalidUtf8 {
+  /// Writes the fields, as `InvalidUtf8 { offset: ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return run Format.debugFields(self, "InvalidUtf8", &mut formatter)
+  }
+}
+
+/// A position in a string for traversal one scalar at a time.
+///
+/// # Details
+///
+/// Get the first cursor from [`String.scalarCursor`] and the next one from [`String.nextCursor`].
+pub struct ScalarCursor {
+  byteOffset: usize,
+}
+
+/// One scalar that [`String.nextScalar`] read, with its byte position and the cursor after it.
+pub struct ScalarStep {
+  scalar: char,
+  byteOffset: usize,
+  next: ScalarCursor,
+}
+
+/// The pieces of a text between occurrences of a separator, read one at a time. Make one with
+/// [`String.split`].
+///
+/// # Details
+///
+/// Each piece is a `string` view of the text that was split, with its lifetime. Read the pieces
+/// with [`Split.next`], or take everything not yet read with [`Split.remainder`]. A `Split` does not
+/// allocate. It is `Copy`, so a copy reads the remaining pieces again on its own.
+pub struct Split<'text, 'separator> {
+  rest: string<'text>,
+  separator: string<'separator>,
+  finished: bool,
+}
+
+impl<'text, 'separator> Copy for Split<'text, 'separator> {}
+
+impl<'text, 'separator> Split<'text, 'separator> {
+  /// Returns the next piece of the text, or `None` after the last piece.
+  ///
+  /// # Details
+  ///
+  /// A piece is the text up to the next separator, without the separator. The last piece is the
+  /// text after the last separator, which is empty when the text ends with the separator. Text
+  /// with no separator gives one piece: all of the text. The piece is a view with the lifetime of
+  /// the text that was split. This function does not allocate.
+  ///
+  /// # Examples
+  ///
+  /// ## Read the parts of a path
+  ///
+  /// ```silk
+  /// import silk.core.option { Option }
+  /// import silk.text.string { String, Split }
+  ///
+  /// pub fn main() -> i32 {
+  ///   let mut parts = String.split("usr/local/bin", "/")
+  ///   let mut count = 0
+  ///   let mut last = ""
+  ///   while true {
+  ///     match Split.next(&mut parts) {
+  ///       Option<string>.Some { value } => {
+  ///         count = count + 1
+  ///         last = value
+  ///       }
+  ///       Option<string>.None => { break }
+  ///     }
+  ///   }
+  ///   if count != 3 || last != "bin" {
+  ///     return 1
+  ///   }
+  ///   return 0
+  /// }
+  /// ```
+  pub fn next(self: &mut Split<'text, 'separator>) -> Option<string<'text>> {
+    if self.finished { return Option<string<'text>>.none() }
+    let rest = self.rest
+    let bytes = Intrinsic.stringUtf8Bytes(rest)
+    let separator = Intrinsic.stringUtf8Bytes(self.separator)
+    if separator.length > usize.ZERO {
+      match byte_search.findSlice(bytes, separator) {
+        Option<usize>.Some { value: at } => {
+          let after = at + separator.length
+          self.rest = unsafe String.fromUtf8Unchecked(Slice.view<u8>(bytes, after, bytes.length - after))
+          return Option<string<'text>>.some(unsafe String.fromUtf8Unchecked(Slice.view<u8>(bytes, usize.ZERO, at)))
+        }
+        Option<usize>.None => {}
+      }
+    }
+    self.finished = true
+    self.rest = ""
+    return Option<string<'text>>.some(rest)
+  }
+
+  /// Returns the text that [`Split.next`] has not given yet, in one piece, and ends the split.
+  ///
+  /// # When to use
+  ///
+  /// Use `remainder` to split only at the first separator: call [`Split.next`] once for the part
+  /// before it, then `remainder` for everything after it, separators included.
+  ///
+  /// # Details
+  ///
+  /// After `remainder`, [`Split.next`] returns `None`. After the last piece, `remainder` returns
+  /// `None`. The text is a view with the lifetime of the text that was split.
+  ///
+  /// # Examples
+  ///
+  /// ## Split a setting at its first `=`
+  ///
+  /// ```silk
+  /// import silk.core.option { Option }
+  /// import silk.text.string { String, Split }
+  ///
+  /// pub fn main() -> i32 {
+  ///   let mut parts = String.split("query=a=b", "=")
+  ///   let key = Split.next(&mut parts) |> Option<string>.unwrapOr("")
+  ///   let value = Split.remainder(&mut parts) |> Option<string>.unwrapOr("")
+  ///   if key != "query" || value != "a=b" {
+  ///     return 1
+  ///   }
+  ///   return 0
+  /// }
+  /// ```
+  pub fn remainder(self: &mut Split<'text, 'separator>) -> Option<string<'text>> {
+    if self.finished { return Option<string<'text>>.none() }
+    self.finished = true
+    let rest = self.rest
+    self.rest = ""
+    return Option<string<'text>>.some(rest)
+  }
+}
+
+fn byte(value: u8) -> u8 {
+  return value
+}
+
+// Whether `needle` occurs in `haystack` at `start`; the caller keeps it in bounds.
+fn bytesMatchAt(haystack: &[u8], start: usize, needle: &[u8]) -> bool {
+  let mut offset = usize.ZERO
+  while offset < needle.length {
+    if haystack[start + offset] != needle[offset] { return false }
+    offset = offset + usize.ONE
+  }
+  return true
+}
+
+// The byte width of the White_Space scalar that starts at `at` in valid UTF-8, or zero when the
+// scalar there is not whitespace.
+fn whitespaceWidth(bytes: &[u8], at: usize) -> usize {
+  let first = bytes[at]
+  if first == byte(32) || (byte(9) <= first && first <= byte(13)) { return usize.ONE }
+  if first < byte(194) || first > byte(227) { return usize.ZERO }
+  let second = bytes[at + usize.ONE]
+  if first == byte(194) {
+    // U+0085 and U+00A0.
+    if second == byte(133) || second == byte(160) { return 2 }
+    return usize.ZERO
+  }
+  if first < byte(225) { return usize.ZERO }
+  let third = bytes[at + 2]
+  // U+1680.
+  if first == byte(225) && second == byte(154) && third == byte(128) { return 3 }
+  if first == byte(226) {
+    // U+2000 to U+200A, U+2028, U+2029, and U+202F.
+    if second == byte(128) && (third <= byte(138) || third == byte(168) || third == byte(169) || third == byte(175)) {
+      return 3
+    }
+    // U+205F.
+    if second == byte(129) && third == byte(159) { return 3 }
+    return usize.ZERO
+  }
+  // U+3000.
+  if first == byte(227) && second == byte(128) && third == byte(128) { return 3 }
+  return usize.ZERO
+}
+
+fn continuation(value: u8) -> bool {
+  if value < byte(128) { return false }
+  return value <= byte(191)
+}
+
+/// Returns the first byte offset at which UTF-8 validation fails, or None for complete valid text.
+fn firstInvalidUtf8(values: &[u8]) -> Option<usize> {
+  // Targets with a sixteen-lane byte table lookup check whole blocks at once.
+  static if (Target.arch() == Arch.X86_64 && Target.hasCpuFeature("ssse3")) || (Target.arch() == Arch.Aarch64 && Target.hasCpuFeature("neon")) || (Target.arch() == Arch.Wasm32 && Target.hasCpuFeature("simd128")) {
+    return firstInvalidUtf8Blocks(values)
+  }
+  return firstInvalidUtf8From(values, usize.ZERO)
+}
+
+// Lane `i` is `table[indices[i]]`; every index is below sixteen.
+fn nibbleLookup(table: simd<u8, 16>, indices: simd<u8, 16>) -> simd<u8, 16> {
+  static if Target.arch() == Arch.X86_64 {
+    return x86.shuffleBytes(table, indices)
+  }
+  static if Target.arch() == Arch.Aarch64 {
+    return aarch64.tableLookup(table, indices)
+  }
+  return wasm.swizzle(table, indices)
+}
+
+// Validates sixteen bytes at a time with the lookup method of Keiser and Lemire ("Validating
+// UTF-8 In Less Than One Instruction Per Byte"). Three table lookups on the high and low nibbles
+// of each byte and the high nibble of the next flag every error that two bytes can show; a
+// separate check catches missing third and fourth bytes. A block only says whether an error is
+// near, so the scalar loop finds its exact offset, starting at the character that begins at or
+// before the previous block, since an error can belong to a sequence that started there.
+fn firstInvalidUtf8Blocks(values: &[u8]) -> Option<usize> {
+  // Error bits: 1 too short, 2 too long, 4 overlong 3, 8 too large, 16 surrogate, 32 overlong 2,
+  // 64 too large 1000 or overlong 4, 128 two continuations.
+  let firstHigh = u8x16.fromArray([2, 2, 2, 2, 2, 2, 2, 2, 128, 128, 128, 128, 33, 1, 21, 73])
+  let firstLow = u8x16.fromArray([231, 163, 131, 131, 139, 203, 203, 203, 203, 203, 203, 203, 203, 219, 203, 203])
+  let secondHigh = u8x16.fromArray([1, 1, 1, 1, 1, 1, 1, 1, 230, 174, 186, 186, 1, 1, 1, 1])
+  // Bytes that still need a continuation when they end a block: a lead in the last lane, a
+  // three- or four-byte lead in the second to last, a four-byte lead in the third to last.
+  let incompleteLimit = u8x16.fromArray([255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 239, 223, 191])
+  let four = u8x16.splat(byte(4))
+  let lowNibble = u8x16.splat(byte(15))
+  let high = u8x16.splat(byte(128))
+  let zero = u8x16.splat(byte(0))
+  let mut previous = zero
+  let mut previousIncomplete = zero
+  let mut at = usize.ZERO
+  while at + 16 <= values.length {
+    let input = u8x16.load(values, at)
+    let mut error = previousIncomplete
+    if mask16.any(u8x16.lanesGreaterOrEqual(input, high)) {
+      let previous1 = u8x16.shuffle(previous, input, [15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30])
+      let previous2 = u8x16.shuffle(previous, input, [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29])
+      let previous3 = u8x16.shuffle(previous, input, [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28])
+      let special = nibbleLookup(firstHigh, u8x16.shiftRight(previous1, four)) & nibbleLookup(firstLow, previous1 & lowNibble) & nibbleLookup(secondHigh, u8x16.shiftRight(input, four))
+      // A byte two after a three- or four-byte lead, or three after a four-byte lead, must be a
+      // continuation; the two-continuations bit in `special` says it is one.
+      let third = u8x16.saturatingSubtract(previous2, u8x16.splat(byte(96)))
+      let fourth = u8x16.saturatingSubtract(previous3, u8x16.splat(byte(112)))
+      error = ((third | fourth) & high) ^ special
+      previousIncomplete = u8x16.saturatingSubtract(input, incompleteLimit)
+    } else {
+      previousIncomplete = zero
+    }
+    if u8x16.reduceBitOr(error) != byte(0) {
+      let mut start = usize.ZERO
+      if at >= 16 {
+        start = characterStart(values, at - 16)
+      }
+      return firstInvalidUtf8From(values, start)
+    }
+    previous = input
+    at = at + 16
+  }
+  return firstInvalidUtf8From(values, characterStart(values, at))
+}
+
+// Where to resume byte-by-byte validation at `offset`, when the characters before it have been
+// checked except for a sequence that may run into `offset`: the nearest lead byte up to three
+// bytes back when its sequence reaches `offset`, else `offset` itself.
+fn characterStart(values: &[u8], offset: usize) -> usize {
+  let mut back = usize.ONE
+  while back <= 3 && back <= offset {
+    let lead = values[offset - back]
+    if continuation(lead) == false {
+      let mut width = usize.ONE
+      if lead >= byte(240) {
+        width = 4
+      } else if lead >= byte(224) {
+        width = 3
+      } else if lead >= byte(192) {
+        width = 2
+      }
+      if width > back {
+        return offset - back
+      }
+      return offset
+    }
+    back = back + usize.ONE
+  }
+  return offset
+}
+
+// Validates from `start`, which must begin a character after valid text.
+fn firstInvalidUtf8From(values: &[u8], start: usize) -> Option<usize> {
+  let mut index = start
+  while index < values.length {
+    let first = values[index]
+    if first < byte(128) {
+      index = index + usize.ONE
+      // Skip the rest of an ASCII run sixteen bytes at a time.
+      static if simd.hardware() {
+        let high = u8x16.splat(byte(128))
+        while index + 16 <= values.length {
+          let found = u8x16.lanesGreaterOrEqual(u8x16.load(values, index), high)
+          if mask16.any(found) {
+            index = index + mask16.firstSet(found)
+            break
+          }
+          index = index + 16
+        }
+      }
+    } else {
+      if first < byte(194) { return Option<usize>.some(index) }
+      if first <= byte(223) {
+        if values.length <= index + usize.ONE { return Option<usize>.some(index) }
+        if continuation(values[index + usize.ONE]) == false {
+          return Option<usize>.some(index + usize.ONE)
+        }
+        index = index + 2
+      } else {
+        if first <= byte(239) {
+          if values.length <= index + 2 { return Option<usize>.some(index) }
+          let second = values[index + usize.ONE]
+          let third = values[index + 2]
+          if continuation(second) == false { return Option<usize>.some(index + usize.ONE) }
+          if continuation(third) == false { return Option<usize>.some(index + 2) }
+          if first == byte(224) {
+            if second < byte(160) { return Option<usize>.some(index + usize.ONE) }
+          }
+          if first == byte(237) {
+            if byte(159) < second { return Option<usize>.some(index + usize.ONE) }
+          }
+          index = index + 3
+        } else {
+          if byte(244) < first { return Option<usize>.some(index) }
+          if values.length <= index + 3 { return Option<usize>.some(index) }
+          let second = values[index + usize.ONE]
+          let third = values[index + 2]
+          let fourth = values[index + 3]
+          if continuation(second) == false { return Option<usize>.some(index + usize.ONE) }
+          if continuation(third) == false { return Option<usize>.some(index + 2) }
+          if continuation(fourth) == false { return Option<usize>.some(index + 3) }
+          if first == byte(240) {
+            if second < byte(144) { return Option<usize>.some(index + usize.ONE) }
+          }
+          if first == byte(244) {
+            if byte(143) < second { return Option<usize>.some(index + usize.ONE) }
+          }
+          index = index + 4
+        }
+      }
+    }
+  }
+  return Option<usize>.none()
+}
+
+// Appending grows the existing storage rather than copying the whole string into fresh storage
+// first. The atomicity is the same either way — the underlying byte append builds its replacement
+// buffer in full before committing, so a failed allocation leaves the original untouched — but the
+// cost is not: composing a message from several pieces is what this API is for, and a copy per
+// piece made that quadratic in the message and linear in allocations.
+
+fn scalar32(value: u8) -> u32 {
+  return u8.toU32(value)
+}

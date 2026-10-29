@@ -295,7 +295,7 @@ const program = Effect.gen(function* () {
 
   // An import's module path and members hover and go to definition like any other name.
   const imported = [
-    'import silk.option { Option }',
+    'import silk.core.option { Option }',
     'pub fn main() -> i32 {',
     '  let none = Option<i32>.none()',
     '  return Option<i32>.unwrapOr(move none, 0)',
@@ -305,7 +305,7 @@ const program = Effect.gen(function* () {
   yield* change(session, uri, 7, imported)
   const importing = yield* diagnosticsFor(session, uri, 7, [])
   assert.deepEqual(importing.diagnostics, [], JSON.stringify(importing))
-  const member = { textDocument: { uri }, position: { line: 0, character: 22 } }
+  const member = { textDocument: { uri }, position: { line: 0, character: 27 } }
   const memberShown = yield* request(session, 15, 'textDocument/hover', member)
   assert.ok(
     (memberShown['result'] as { contents: { value: string } }).contents.value.includes(
@@ -313,10 +313,10 @@ const program = Effect.gen(function* () {
     ),
     JSON.stringify(memberShown),
   )
-  const library = pathToFileURL(join(stdlib, 'silk', 'option.silk')).href
+  const library = pathToFileURL(join(stdlib, 'silk', 'core', 'option.silk')).href
   // The doc comment's code links point at the lines of what they name.
   const documented = (memberShown['result'] as { contents: { value: string } }).contents.value
-  const optionLines = readFileSync(join(stdlib, 'silk', 'option.silk'), 'utf8').split('\n')
+  const optionLines = readFileSync(join(stdlib, 'silk', 'core', 'option.silk'), 'utf8').split('\n')
   const someLine = optionLines.findIndex((line) => line.includes('pub fn some(')) + 1
   assert.ok(documented.includes(`[\`some\`](${library}#L${someLine})`), documented)
   // A union case resolves too, and nothing is left as a bare bracketed link.
@@ -330,11 +330,11 @@ const program = Effect.gen(function* () {
     range: { start: { line: number; character: number } }
   }
   assert.equal(memberDefined.uri, library, JSON.stringify(memberDefined))
-  const path = { textDocument: { uri }, position: { line: 0, character: 13 } }
+  const path = { textDocument: { uri }, position: { line: 0, character: 18 } }
   const pathShown = yield* request(session, 17, 'textDocument/hover', path)
   assert.ok(
     (pathShown['result'] as { contents: { value: string } }).contents.value.includes(
-      'module `silk.option`',
+      'module `silk.core.option`',
     ),
     JSON.stringify(pathShown),
   )
@@ -346,7 +346,7 @@ const program = Effect.gen(function* () {
 
   // A standard-library file opened from there gets the same features, from the package that
   // reads it.
-  const libraryText = readFileSync(join(stdlib, 'silk', 'option.silk'), 'utf8')
+  const libraryText = readFileSync(join(stdlib, 'silk', 'core', 'option.silk'), 'utf8')
   yield* session.send({
     jsonrpc: '2.0',
     method: 'textDocument/didOpen',
@@ -440,7 +440,7 @@ const program = Effect.gen(function* () {
   })
 
   // An import of a name its module lacks is reported on the import, as `silk check` reports it.
-  yield* change(session, uri, 9, 'import silk.list { Nope }\n' + fixed)
+  yield* change(session, uri, 9, 'import silk.collections.list { Nope }\n' + fixed)
   const missing = yield* diagnosticsFor(session, uri, 9, [])
   assert.deepEqual(
     missing.diagnostics.map(({ range, code }) => ({ line: range.start.line, code })),
@@ -562,13 +562,13 @@ const program = Effect.gen(function* () {
     ['SEM0015'],
     'a closed member keeps its saved text',
   )
-  yield* change(members, store, 3, 'import silk.list { L }\n' + stored)
+  yield* change(members, store, 3, 'import silk.collections.list { L }\n' + stored)
   yield* diagnosticsFor(members, store, 3, [])
   yield* members.send({
     jsonrpc: '2.0',
     id: 2,
     method: 'textDocument/completion',
-    params: { textDocument: { uri: store }, position: { line: 0, character: 20 } },
+    params: { textDocument: { uri: store }, position: { line: 0, character: 32 } },
   })
   const offered = (yield* notificationsUntil(members, 2)).response
   const labels = (offered['result'] as { items: Array<{ label: string }> }).items.map(({ label }) => label)

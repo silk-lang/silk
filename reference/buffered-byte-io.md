@@ -1,7 +1,7 @@
 # Buffered byte I/O
 
 Silk's buffered byte actors provide fixed-capacity lookahead and output retention for incremental
-protocols. They build on `silk.byte_duplex.ByteDuplex`; they do not replace its exact partial
+protocols. They build on `silk.io.byte_duplex.ByteDuplex`; they do not replace its exact partial
 transfer contract or turn `Writer` and `StandardInput` into a duplex service.
 
 ## Storage and ownership
@@ -41,22 +41,22 @@ This complete example opens an empty in-memory transport, performs a zero-byte b
 and lets the scope close the transport:
 
 ```silk
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.buffered_duplex {
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.io.buffered_duplex {
   BufferedContext,
   BufferedDuplex,
   withBufferedCapacityContext,
 }
-import silk.buffered_input { BufferError, FillOutcome }
-import silk.byte_duplex { ByteDuplex }
-import silk.effect { Effect }
-import silk.memory_byte_duplex { MemoryByteDuplex, MemoryReadEvent, MemoryWriteEvent }
-import silk.monotonic_clock { MonotonicClock }
-import silk.option { Option }
-import silk.system_clock { Instant, SystemClock }
-import silk.u64
-import silk.usize
-import silk.list { List }
+import silk.io.buffered_input { BufferError, FillOutcome }
+import silk.io.byte_duplex { ByteDuplex }
+import silk.core.effect { Effect }
+import silk.io.memory_byte_duplex { MemoryByteDuplex, MemoryReadEvent, MemoryWriteEvent }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.core.option { Option }
+import silk.system.system_clock { Instant, SystemClock }
+import silk.num.u64
+import silk.num.usize
+import silk.collections.list { List }
 
 struct FixedClock {}
 struct Inspection { minimum: usize }

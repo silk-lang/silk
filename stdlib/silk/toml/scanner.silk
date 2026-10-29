@@ -1,0 +1,858 @@
+//! Validate TOML source and read it as a sequence of tokens.
+//!
+//! # When to use
+//! Most programs use `silk.toml.value`, which calls this scanner for them. Use [`TomlScanner`]
+//! directly to check that a document is valid TOML without allocating, or to read tokens and their
+//! source spans, for example in an editor tool.
+//!
+//! # Details
+//! [`TomlScanner.validate`] checks the full syntax of TOML 1.1.0: UTF-8, keys, strings, numbers,
+//! dates and times, arrays, inline tables, and headers. It does not check that each key is defined
+//! one time, because that needs a table tree. [`TomlScanner.next`] returns one token at a time.
+//! Tokens hold a [`TomlSpan`] into the input, not a copy, and do not decode strings. The scanner
+//! does not allocate.
+//!
+//! # Errors
+//! The functions return a `Result` with a [`TomlError`]. `offset` is the byte position of the first
+//! problem in the input.
+//!
+//! # Gotchas
+//! [`TomlScanner.next`] does not check that the tokens make a valid document. Call
+//! [`TomlScanner.validate`] first. `validate` does not move the position of the scanner.
+//!
+//! # Examples
+//! ## Validate a document and count its keys
+//! ```silk
+//! import silk.core.result { Result }
+//! import silk.toml.scanner { TomlError, TomlScanner, TomlToken }
+//!
+//! pub fn main() -> i32 {
+//!   let mut scanner = TomlScanner.make(b"name = \"Ada\"\nyear = 1815\n")
+//!   match TomlScanner.validate(&mut scanner) {
+//!     Result<bool, TomlError>.Success { value: _ } => {}
+//!     Result<bool, TomlError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let mut keys = 0
+//!   let mut atLineStart = true
+//!   while true {
+//!     match TomlScanner.next(&mut scanner) {
+//!       Result<TomlToken, TomlError>.Success { value } => match move value {
+//!         TomlToken.EndOfInput => {
+//!           break
+//!         }
+//!         TomlToken.Newline => {
+//!           atLineStart = true
+//!         }
+//!         TomlToken.Text { span: _ } => {
+//!           if atLineStart {
+//!             keys = keys + 1
+//!           }
+//!           atLineStart = false
+//!         }
+//!         _ => {
+//!           atLineStart = false
+//!         }
+//!       }
+//!       Result<TomlToken, TomlError>.Failure { error: _ } => {
+//!         return 1
+//!       }
+//!     }
+//!   }
+//!   if keys != 2 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! ## Find the position of a syntax error
+//! ```silk
+//! import silk.core.result { Result }
+//! import silk.toml.scanner { TomlError, TomlReason, TomlScanner }
+//!
+//! pub fn main() -> i32 {
+//!   let mut scanner = TomlScanner.make(b"port = 80x\n")
+//!   return match TomlScanner.validate(&mut scanner) {
+//!     Result<bool, TomlError>.Failure {
+//!       error: TomlError { reason: TomlReason.InvalidNumber, offset }
+//!     } => {
+//!       if offset != 7 {
+//!         return 1
+//!       }
+//!       return 0
+//!     }
+//!     _ => 1
+//!   }
+//! }
+//! ```
+//!
+//! @category Data formats
+
+import silk.text.format { Debug, Format, Formatter }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.collections.slice { Slice }
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import silk.text.utf8_decoder { Utf8Decoder, Utf8Step }
+import silk.io.writer { Writer, WriterError }
+
+const U2: usize = 2
+const U3: usize = 3
+const U4: usize = 4
+const U5: usize = 5
+const U6: usize = 6
+const U7: usize = 7
+const U8: usize = 8
+const U10: usize = 10
+
+/// The maximum number of arrays and inline tables that can be nested in one value.
+pub const MAX_DEPTH: usize = 64
+
+/// A range of bytes in the input: `length` bytes from `offset`.
+pub struct TomlSpan {
+  /// The position of the first byte, from the start of the input.
+  pub offset: usize,
+  /// The number of bytes.
+  pub length: usize,
+}
+impl Copy for TomlSpan {}
+impl Copy for TomlError {}
+
+/// The cause of a [`TomlError`].
+pub enum TomlReason {
+  /// A byte that TOML does not allow at this position, such as a missing `=` or an unexpected
+  /// bracket.
+  UnexpectedByte,
+  /// The input ends before a string, array, inline table, or header is closed.
+  UnexpectedEnd,
+  /// The input is not valid UTF-8.
+  InvalidUtf8,
+  /// A string is not closed, or holds a control character that must be escaped.
+  InvalidString,
+  /// A basic string has an escape that TOML does not define, or a `\u` or `\U` escape that is not a
+  /// Unicode scalar value.
+  InvalidEscape,
+  /// An unquoted value is not a valid integer, float, or boolean.
+  InvalidNumber,
+  /// A date or time has a field out of range or the wrong form.
+  InvalidDateTime,
+  /// A `silk.toml.codec` conversion found a value of a different kind.
+  TypeMismatch,
+  /// A `silk.toml.codec` conversion found a valid number that does not fit the target type.
+  NumberOutOfRange,
+  /// A key is defined two times in one table.
+  DuplicateKey,
+  /// A table definition conflicts with an earlier value or table, for example a second `[a]` header
+  /// or a header inside an inline table. `silk.toml.output` also uses it for a tree that it cannot
+  /// write.
+  TableConflict,
+  /// More than [`MAX_DEPTH`] arrays or inline tables are nested.
+  DepthExceeded,
+}
+
+impl Debug for TomlReason {
+  /// Writes the name of the variant, such as `UnexpectedByte`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      TomlReason.UnexpectedByte => run Format.write(&mut formatter, b"UnexpectedByte")
+      TomlReason.UnexpectedEnd => run Format.write(&mut formatter, b"UnexpectedEnd")
+      TomlReason.InvalidUtf8 => run Format.write(&mut formatter, b"InvalidUtf8")
+      TomlReason.InvalidString => run Format.write(&mut formatter, b"InvalidString")
+      TomlReason.InvalidEscape => run Format.write(&mut formatter, b"InvalidEscape")
+      TomlReason.InvalidNumber => run Format.write(&mut formatter, b"InvalidNumber")
+      TomlReason.InvalidDateTime => run Format.write(&mut formatter, b"InvalidDateTime")
+      TomlReason.TypeMismatch => run Format.write(&mut formatter, b"TypeMismatch")
+      TomlReason.NumberOutOfRange => run Format.write(&mut formatter, b"NumberOutOfRange")
+      TomlReason.DuplicateKey => run Format.write(&mut formatter, b"DuplicateKey")
+      TomlReason.TableConflict => run Format.write(&mut formatter, b"TableConflict")
+      TomlReason.DepthExceeded => run Format.write(&mut formatter, b"DepthExceeded")
+    }
+  }
+}
+
+/// A TOML error: the cause and the byte position where it occurred.
+pub struct TomlError {
+  /// The cause of the error.
+  pub reason: TomlReason,
+  /// The byte position of the problem in the input. Errors that are not tied to a source position,
+  /// such as codec errors, use 0.
+  pub offset: usize,
+}
+
+impl Debug for TomlError {
+  /// Writes the fields, as `TomlError { reason: ..., offset: ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return run Format.debugFields(self, "TomlError", &mut formatter)
+  }
+}
+
+/// The kind of an unquoted value, from [`TomlScanner.scalarKind`].
+pub enum TomlScalarKind {
+  /// A decimal integer, or a hexadecimal (`0x`), octal (`0o`), or binary (`0b`) integer.
+  Integer,
+  /// A float with a fraction or an exponent, or `inf` or `nan` with an optional sign.
+  Float,
+  /// `true` or `false`.
+  Boolean,
+  /// A date and time with a UTC offset, such as `1979-05-27T07:32:00Z`.
+  OffsetDateTime,
+  /// A date and time without an offset.
+  LocalDateTime,
+  /// A calendar date.
+  LocalDate,
+  /// A time of day.
+  LocalTime,
+}
+
+/// One token of TOML source. Use [`TomlScanner.slice`] to get the bytes of a span.
+pub union TomlToken {
+  /// A bare key or an unquoted value, such as `name`, `42`, or `1979-05-27 07:32:00`.
+  ///
+  /// Dots stay in the token, so a dotted bare key such as `a.b` and a float such as `3.14` are each
+  /// one token. In a value position, use [`TomlScanner.scalarKind`] to find the kind of value.
+  Text {
+    /// The source bytes of the token.
+    pub span: TomlSpan,
+  },
+  /// A quoted key or string. The span includes the quotes, and escapes are not decoded. Use
+  /// `silk.toml.text` to decode it.
+  String {
+    /// The source bytes of the token, with the quotes.
+    pub span: TomlSpan,
+    /// `true` for a literal string, which uses `'` quotes and has no escapes.
+    pub literal: bool,
+    /// `true` for a string with three quotes at each end.
+    pub multiline: bool,
+  },
+  /// The `=` between a key and its value.
+  Equals,
+  /// A `.` at the start of a token, such as the one after the quoted part of `"a".b`. A dot inside
+  /// a bare spelling stays in [`TomlToken.Text`].
+  Dot,
+  /// The `,` between array elements or inline table members.
+  Comma,
+  /// A `[`. It starts an array or a header.
+  ArrayBegin,
+  /// A `]`. It ends an array or a header.
+  ArrayEnd,
+  /// A `{`. It starts an inline table.
+  InlineBegin,
+  /// A `}`. It ends an inline table.
+  InlineEnd,
+  /// The end of a line: LF or CRLF. Comments are skipped.
+  Newline,
+  /// The end of the input. Each later call returns it again.
+  EndOfInput,
+}
+impl Copy for TomlToken {}
+
+/// A scanner that borrows the complete source of one TOML document. It does not allocate.
+///
+/// # When to use
+/// Most programs use `silk.toml.value`, which calls this scanner for them. Use it directly to check
+/// that a document is valid TOML without allocating, or to read tokens and their source spans, for
+/// example in an editor tool.
+///
+/// # Details
+/// [`TomlScanner.validate`] checks the full syntax of TOML 1.1.0, but not that each key is defined
+/// one time. [`TomlScanner.next`] returns one token at a time. Tokens hold a [`TomlSpan`] into the
+/// input, not a copy, and do not decode strings.
+///
+/// # Gotchas
+/// [`TomlScanner.next`] does not check that the tokens make a valid document. Call
+/// [`TomlScanner.validate`] first.
+pub struct TomlScanner<'input> {
+  input: &'input [u8],
+  cursor: usize,
+}
+
+struct ParseState {
+  cursor: usize,
+  error: TomlError,
+  failed: bool,
+}
+
+fn digit(byte: u8) -> bool { return byte >= 48 && byte <= 57 }
+fn alpha(byte: u8) -> bool { return (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) }
+fn bare(byte: u8) -> bool { return alpha(byte) || digit(byte) || byte == 45 || byte == 95 }
+fn horizontal(byte: u8) -> bool { return byte == 32 || byte == 9 }
+fn hex(byte: u8) -> bool { return digit(byte) || (byte >= 65 && byte <= 70) || (byte >= 97 && byte <= 102) }
+fn valueOf(byte: u8) -> u32 { return u8.toU32(byte - 48) }
+
+fn same(input: &[u8], start: usize, end: usize, word: &[u8]) -> bool {
+  if end - start != word.length { return false }
+  let mut index = usize.ZERO
+  while index < word.length {
+    if input[start + index] != word[index] { return false }
+    index = index + usize.ONE
+  }
+  return true
+}
+
+fn numberDigits(input: &[u8], cursor: &mut usize, end: usize, radix: u8) -> bool {
+  let mut seen = false
+  let mut previousDigit = false
+  while cursor.* < end {
+    let byte = input[cursor.*]
+    let mut valid = digit(byte)
+    if radix == 2 { valid = byte == 48 || byte == 49 }
+    else if radix == 8 { valid = byte >= 48 && byte <= 55 }
+    else if radix == 16 { valid = hex(byte) }
+    if valid {
+      seen = true
+      previousDigit = true
+      cursor.* = cursor.* + usize.ONE
+    } else if byte == 95 {
+      if !previousDigit || cursor.* + usize.ONE >= end { return false }
+      let next = input[cursor.* + usize.ONE]
+      let mut nextValid = digit(next)
+      if radix == 2 { nextValid = next == 48 || next == 49 }
+      else if radix == 8 { nextValid = next >= 48 && next <= 55 }
+      else if radix == 16 { nextValid = hex(next) }
+      if !nextValid { return false }
+      previousDigit = false
+      cursor.* = cursor.* + usize.ONE
+    } else { break }
+  }
+  return seen && previousDigit
+}
+
+fn numberKind(input: &[u8], start: usize, end: usize) -> Option<TomlScalarKind> {
+  if same(input, start, end, b"inf") || same(input, start, end, b"nan")
+    || same(input, start, end, b"+inf") || same(input, start, end, b"-inf")
+    || same(input, start, end, b"+nan") || same(input, start, end, b"-nan") {
+    return Option<TomlScalarKind>.some(TomlScalarKind.Float)
+  }
+  let mut at = start
+  let mut signed = false
+  if at < end && (input[at] == 43 || input[at] == 45) { signed = true
+    at = at + usize.ONE }
+  if at >= end { return Option<TomlScalarKind>.none() }
+  if at + usize.ONE < end && input[at] == 48 {
+    let prefix = input[at + usize.ONE]
+    if prefix == 120 || prefix == 111 || prefix == 98 {
+      if signed { return Option<TomlScalarKind>.none() }
+      at = at + U2
+      let mut radix: u8 = 2
+      if prefix == 120 { radix = 16 } else if prefix == 111 { radix = 8 }
+      if !numberDigits(input, &mut at, end, radix) || at != end { return Option<TomlScalarKind>.none() }
+      return Option<TomlScalarKind>.some(TomlScalarKind.Integer)
+    }
+  }
+  let first = at
+  if !numberDigits(input, &mut at, end, 10) { return Option<TomlScalarKind>.none() }
+  if at - first > usize.ONE && input[first] == 48 { return Option<TomlScalarKind>.none() }
+  let mut floating = false
+  if at < end && input[at] == 46 {
+    floating = true
+    at = at + usize.ONE
+    if !numberDigits(input, &mut at, end, 10) { return Option<TomlScalarKind>.none() }
+  }
+  if at < end && (input[at] == 101 || input[at] == 69) {
+    floating = true
+    at = at + usize.ONE
+    if at < end && (input[at] == 43 || input[at] == 45) { at = at + usize.ONE }
+    if !numberDigits(input, &mut at, end, 10) { return Option<TomlScalarKind>.none() }
+  }
+  if at != end { return Option<TomlScalarKind>.none() }
+  if floating { return Option<TomlScalarKind>.some(TomlScalarKind.Float) }
+  return Option<TomlScalarKind>.some(TomlScalarKind.Integer)
+}
+
+fn two(input: &[u8], at: usize) -> u32 { return valueOf(input[at]) * 10 + valueOf(input[at + usize.ONE]) }
+fn four(input: &[u8], at: usize) -> u32 { return two(input, at) * 100 + two(input, at + U2) }
+fn fixedDigits(input: &[u8], at: usize, count: usize, end: usize) -> bool {
+  if at + count > end { return false }
+  let mut i = at
+  while i < at + count { if !digit(input[i]) { return false }
+    i = i + usize.ONE }
+  return true
+}
+fn leap(year: u32) -> bool { return year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) }
+fn datePart(input: &[u8], at: usize, end: usize) -> bool {
+  if at + U10 > end || !fixedDigits(input, at, 4, end) || input[at + U4] != 45
+    || !fixedDigits(input, at + U5, 2, end) || input[at + U7] != 45
+    || !fixedDigits(input, at + U8, 2, end) { return false }
+  let year = four(input, at)
+  let month = two(input, at + U5)
+  let day = two(input, at + U8)
+  if month < 1 || month > 12 { return false }
+  let mut days: u32 = 31
+  if month == 4 || month == 6 || month == 9 || month == 11 { days = 30 }
+  if month == 2 { if leap(year) { days = 29 } else { days = 28 } }
+  return day >= 1 && day <= days
+}
+fn timePart(input: &[u8], at: usize, end: usize) -> usize {
+  if at + U5 > end || !fixedDigits(input, at, 2, end) || input[at + U2] != 58
+    || !fixedDigits(input, at + U3, 2, end) { return at }
+  if two(input, at) > 23 || two(input, at + U3) > 59 { return at }
+  let mut cursor = at + U5
+  if cursor < end && input[cursor] == 58 {
+    if !fixedDigits(input, cursor + usize.ONE, 2, end) || two(input, cursor + usize.ONE) > 60 { return at }
+    cursor = cursor + U3
+    if cursor < end && input[cursor] == 46 {
+      cursor = cursor + usize.ONE
+      let first = cursor
+      while cursor < end && digit(input[cursor]) { cursor = cursor + usize.ONE }
+      if cursor == first { return at }
+    }
+  }
+  return cursor
+}
+fn dateTimeKind(input: &[u8], start: usize, end: usize) -> Option<TomlScalarKind> {
+  let mut cursor = start
+  let mut date = false
+  if datePart(input, start, end) { date = true
+    cursor = start + U10 }
+  if date && cursor == end { return Option<TomlScalarKind>.some(TomlScalarKind.LocalDate) }
+  if date {
+    if cursor >= end || (input[cursor] != 84 && input[cursor] != 116 && input[cursor] != 32) {
+      return Option<TomlScalarKind>.none()
+    }
+    cursor = cursor + usize.ONE
+  }
+  let timeEnd = timePart(input, cursor, end)
+  if timeEnd == cursor { return Option<TomlScalarKind>.none() }
+  cursor = timeEnd
+  if cursor == end {
+    if date { return Option<TomlScalarKind>.some(TomlScalarKind.LocalDateTime) }
+    return Option<TomlScalarKind>.some(TomlScalarKind.LocalTime)
+  }
+  if !date { return Option<TomlScalarKind>.none() }
+  if (input[cursor] == 90 || input[cursor] == 122) && cursor + usize.ONE == end {
+    return Option<TomlScalarKind>.some(TomlScalarKind.OffsetDateTime)
+  }
+  if (input[cursor] == 43 || input[cursor] == 45) && cursor + U6 == end
+    && fixedDigits(input, cursor + usize.ONE, 2, end) && input[cursor + U3] == 58
+    && fixedDigits(input, cursor + U4, 2, end)
+    && two(input, cursor + usize.ONE) <= 23 && two(input, cursor + U4) <= 59 {
+    return Option<TomlScalarKind>.some(TomlScalarKind.OffsetDateTime)
+  }
+  return Option<TomlScalarKind>.none()
+}
+
+fn scalarKind(input: &[u8], start: usize, end: usize) -> Option<TomlScalarKind> {
+  if same(input, start, end, b"true") || same(input, start, end, b"false") {
+    return Option<TomlScalarKind>.some(TomlScalarKind.Boolean)
+  }
+  let temporal = dateTimeKind(input, start, end)
+  match move temporal {
+    Option<TomlScalarKind>.Some { value } => { return Option<TomlScalarKind>.some(move value) }
+    Option<TomlScalarKind>.None => {}
+  }
+  return numberKind(input, start, end)
+}
+
+impl ParseState {
+  fn make() -> ParseState {
+    return ParseState { cursor: usize.ZERO, error: TomlError { reason: TomlReason.UnexpectedByte, offset: usize.ZERO }, failed: false }
+  }
+  fn recordError(self: &mut ParseState, reason: TomlReason, offset: usize) -> bool {
+    if !self.failed { self.error = TomlError { reason: reason, offset: offset }
+    self.failed = true }
+    return false
+  }
+  fn recordCurrent(self: &mut ParseState, reason: TomlReason) -> bool {
+    let offset = self.cursor
+    return ParseState.recordError(&mut self.*, reason, offset)
+  }
+  fn recordRelative(self: &mut ParseState, reason: TomlReason, delta: usize) -> bool {
+    let offset = self.cursor + delta
+    return ParseState.recordError(&mut self.*, reason, offset)
+  }
+  fn skipHorizontal(self: &mut ParseState, input: &[u8]) {
+    while self.cursor < input.length && horizontal(input[self.cursor]) {
+      self.cursor = self.cursor + usize.ONE
+    }
+  }
+  fn newline(self: &mut ParseState, input: &[u8]) -> bool {
+    if self.cursor >= input.length { return false }
+    if input[self.cursor] == 10 { self.cursor = self.cursor + usize.ONE
+    return true }
+    if input[self.cursor] == 13 && self.cursor + usize.ONE < input.length
+      && input[self.cursor + usize.ONE] == 10 { self.cursor = self.cursor + U2
+    return true }
+    return false
+  }
+  fn comment(self: &mut ParseState, input: &[u8]) -> bool {
+    if self.cursor >= input.length || input[self.cursor] != 35 { return true }
+    self.cursor = self.cursor + usize.ONE
+    while self.cursor < input.length {
+      let byte = input[self.cursor]
+      if byte == 10 || byte == 13 { break }
+      if byte < 32 && byte != 9 || byte == 127 { return ParseState.recordCurrent(&mut self.*, TomlReason.UnexpectedByte) }
+      self.cursor = self.cursor + usize.ONE
+    }
+    return true
+  }
+  fn spaces(self: &mut ParseState, input: &[u8], multiline: bool) -> bool {
+    while true {
+      ParseState.skipHorizontal(&mut self.*, input)
+      if multiline && self.cursor < input.length && input[self.cursor] == 35 {
+        if !ParseState.comment(&mut self.*, input) { return false }
+      }
+      if multiline && ParseState.newline(&mut self.*, input) { continue }
+      return true
+    }
+    return false
+  }
+  fn string(self: &mut ParseState, input: &[u8], key: bool) -> bool {
+    let start = self.cursor
+    let quote = input[self.cursor]
+    let literal = quote == 39
+    let multi = self.cursor + U2 < input.length
+      && input[self.cursor + usize.ONE] == quote && input[self.cursor + U2] == quote
+    if multi && key { return ParseState.recordError(&mut self.*, TomlReason.InvalidString, start) }
+    if multi { self.cursor = self.cursor + U3 } else { self.cursor = self.cursor + usize.ONE }
+    if multi { if ParseState.newline(&mut self.*, input) {} }
+    while self.cursor < input.length {
+      let byte = input[self.cursor]
+      if byte == quote {
+        if !multi { self.cursor = self.cursor + usize.ONE
+    return true }
+        if self.cursor + U2 < input.length && input[self.cursor + usize.ONE] == quote
+          && input[self.cursor + U2] == quote {
+          self.cursor = self.cursor + U3
+          let mut extra = usize.ZERO
+          while extra < 2 && self.cursor < input.length && input[self.cursor] == quote {
+            self.cursor = self.cursor + usize.ONE
+            extra = extra + usize.ONE
+          }
+          if self.cursor < input.length && input[self.cursor] == quote {
+            return ParseState.recordCurrent(&mut self.*, TomlReason.InvalidString)
+          }
+          return true
+        }
+      }
+      if byte == 92 && !literal {
+        self.cursor = self.cursor + usize.ONE
+        if self.cursor >= input.length { return ParseState.recordCurrent(&mut self.*, TomlReason.InvalidEscape) }
+        let escape = input[self.cursor]
+        if escape == 98 || escape == 116 || escape == 110 || escape == 102 || escape == 114
+          || escape == 101 || escape == 34 || escape == 92 {
+          self.cursor = self.cursor + usize.ONE
+          continue
+        }
+        if escape == 120 || escape == 117 || escape == 85 {
+          let mut count: usize = U8
+          if escape == 120 { count = U2 } else if escape == 117 { count = U4 }
+          self.cursor = self.cursor + usize.ONE
+          if self.cursor + count > input.length { return ParseState.recordCurrent(&mut self.*, TomlReason.InvalidEscape) }
+          let mut scalar: u32 = 0
+          let mut i = usize.ZERO
+          while i < count {
+            let d = input[self.cursor + i]
+            if !hex(d) { return ParseState.recordRelative(&mut self.*, TomlReason.InvalidEscape, i) }
+            let mut n: u32 = 0
+            if digit(d) { n = u8.toU32(d - 48) }
+            else if d <= 70 { n = u8.toU32(d - 55) }
+            else { n = u8.toU32(d - 87) }
+            scalar = u32.bitOr(u32.shiftLeft(scalar, 4), n)
+            i = i + usize.ONE
+          }
+          if scalar > 1114111 || (scalar >= 55296 && scalar <= 57343) {
+            return ParseState.recordCurrent(&mut self.*, TomlReason.InvalidEscape)
+          }
+          self.cursor = self.cursor + count
+          continue
+        }
+        if multi && (escape == 32 || escape == 9 || escape == 10 || escape == 13) {
+          while self.cursor < input.length && horizontal(input[self.cursor]) {
+            self.cursor = self.cursor + usize.ONE
+          }
+          if !ParseState.newline(&mut self.*, input) { return ParseState.recordCurrent(&mut self.*, TomlReason.InvalidEscape) }
+          while self.cursor < input.length {
+            if horizontal(input[self.cursor]) { self.cursor = self.cursor + usize.ONE
+    continue }
+            if ParseState.newline(&mut self.*, input) { continue }
+            break
+          }
+          continue
+        }
+        return ParseState.recordCurrent(&mut self.*, TomlReason.InvalidEscape)
+      }
+      if byte == 10 || byte == 13 {
+        if !multi || !ParseState.newline(&mut self.*, input) { return ParseState.recordCurrent(&mut self.*, TomlReason.InvalidString) }
+        continue
+      }
+      if byte < 32 && byte != 9 || byte == 127 { return ParseState.recordCurrent(&mut self.*, TomlReason.InvalidString) }
+      self.cursor = self.cursor + usize.ONE
+    }
+    return ParseState.recordCurrent(&mut self.*, TomlReason.UnexpectedEnd)
+  }
+  fn key(self: &mut ParseState, input: &[u8]) -> bool {
+    ParseState.skipHorizontal(&mut self.*, input)
+    if self.cursor >= input.length { return ParseState.recordCurrent(&mut self.*, TomlReason.UnexpectedEnd) }
+    let byte = input[self.cursor]
+    if byte == 34 || byte == 39 { return ParseState.string(&mut self.*, input, true) }
+    let start = self.cursor
+    while self.cursor < input.length && bare(input[self.cursor]) {
+      self.cursor = self.cursor + usize.ONE
+    }
+    if self.cursor == start { return ParseState.recordCurrent(&mut self.*, TomlReason.UnexpectedByte) }
+    return true
+  }
+  fn keyPath(self: &mut ParseState, input: &[u8]) -> bool {
+    if !ParseState.key(&mut self.*, input) { return false }
+    while true {
+      ParseState.skipHorizontal(&mut self.*, input)
+      if self.cursor >= input.length || input[self.cursor] != 46 { return true }
+      self.cursor = self.cursor + usize.ONE
+      if !ParseState.key(&mut self.*, input) { return false }
+    }
+    return false
+  }
+  fn scalar(self: &mut ParseState, input: &[u8]) -> bool {
+    let start = self.cursor
+    while self.cursor < input.length {
+      let byte = input[self.cursor]
+      if horizontal(byte) || byte == 10 || byte == 13 || byte == 35 || byte == 44
+        || byte == 93 || byte == 125 { break }
+      self.cursor = self.cursor + usize.ONE
+    }
+    if self.cursor == start { return ParseState.recordError(&mut self.*, TomlReason.UnexpectedByte, start) }
+    if self.cursor < input.length && input[self.cursor] == 32 && datePart(input, start, self.cursor)
+      && self.cursor + U3 < input.length && fixedDigits(input, self.cursor + usize.ONE, 2, input.length)
+      && input[self.cursor + U3] == 58 {
+      self.cursor = self.cursor + usize.ONE
+      while self.cursor < input.length {
+        let byte = input[self.cursor]
+        if horizontal(byte) || byte == 10 || byte == 13 || byte == 35 || byte == 44
+          || byte == 93 || byte == 125 { break }
+        self.cursor = self.cursor + usize.ONE
+      }
+    }
+    let kind = scalarKind(input, start, self.cursor)
+    match move kind {
+      Option<TomlScalarKind>.Some { value: _ } => { return true }
+      Option<TomlScalarKind>.None => {
+        if digit(input[start]) && self.cursor - start >= 5
+          && (input[start + U2] == 58 || input[start + U4] == 45) {
+          return ParseState.recordError(&mut self.*, TomlReason.InvalidDateTime, start)
+        }
+        return ParseState.recordError(&mut self.*, TomlReason.InvalidNumber, start)
+      }
+    }
+  }
+  fn value(self: &mut ParseState, input: &[u8], depth: usize) -> bool {
+    if self.cursor >= input.length { return ParseState.recordCurrent(&mut self.*, TomlReason.UnexpectedEnd) }
+    let byte = input[self.cursor]
+    if byte == 34 || byte == 39 { return ParseState.string(&mut self.*, input, false) }
+    if byte == 91 {
+      if depth >= MAX_DEPTH { return ParseState.recordCurrent(&mut self.*, TomlReason.DepthExceeded) }
+      self.cursor = self.cursor + usize.ONE
+      if !ParseState.spaces(&mut self.*, input, true) { return false }
+      if self.cursor < input.length && input[self.cursor] == 93 { self.cursor = self.cursor + usize.ONE
+    return true }
+      while true {
+        if !ParseState.value(&mut self.*, input, depth + usize.ONE) { return false }
+        if !ParseState.spaces(&mut self.*, input, true) { return false }
+        if self.cursor >= input.length { return ParseState.recordCurrent(&mut self.*, TomlReason.UnexpectedEnd) }
+        if input[self.cursor] == 93 { self.cursor = self.cursor + usize.ONE
+    return true }
+        if input[self.cursor] != 44 { return ParseState.recordCurrent(&mut self.*, TomlReason.UnexpectedByte) }
+        self.cursor = self.cursor + usize.ONE
+        if !ParseState.spaces(&mut self.*, input, true) { return false }
+        if self.cursor < input.length && input[self.cursor] == 93 { self.cursor = self.cursor + usize.ONE
+    return true }
+      }
+    }
+    if byte == 123 {
+      if depth >= MAX_DEPTH { return ParseState.recordCurrent(&mut self.*, TomlReason.DepthExceeded) }
+      self.cursor = self.cursor + usize.ONE
+      if !ParseState.spaces(&mut self.*, input, true) { return false }
+      if self.cursor < input.length && input[self.cursor] == 125 { self.cursor = self.cursor + usize.ONE
+    return true }
+      while true {
+        if !ParseState.keyPath(&mut self.*, input) { return false }
+        ParseState.skipHorizontal(&mut self.*, input)
+        if self.cursor >= input.length || input[self.cursor] != 61 {
+          return ParseState.recordCurrent(&mut self.*, TomlReason.UnexpectedByte)
+        }
+        self.cursor = self.cursor + usize.ONE
+        ParseState.skipHorizontal(&mut self.*, input)
+        if !ParseState.value(&mut self.*, input, depth + usize.ONE) { return false }
+        if !ParseState.spaces(&mut self.*, input, true) { return false }
+        if self.cursor >= input.length { return ParseState.recordCurrent(&mut self.*, TomlReason.UnexpectedEnd) }
+        if input[self.cursor] == 125 { self.cursor = self.cursor + usize.ONE
+    return true }
+        if input[self.cursor] != 44 { return ParseState.recordCurrent(&mut self.*, TomlReason.UnexpectedByte) }
+        self.cursor = self.cursor + usize.ONE
+        if !ParseState.spaces(&mut self.*, input, true) { return false }
+        if self.cursor < input.length && input[self.cursor] == 125 { self.cursor = self.cursor + usize.ONE
+    return true }
+      }
+    }
+    return ParseState.scalar(&mut self.*, input)
+  }
+  fn header(self: &mut ParseState, input: &[u8]) -> bool {
+    self.cursor = self.cursor + usize.ONE
+    let array = self.cursor < input.length && input[self.cursor] == 91
+    if array { self.cursor = self.cursor + usize.ONE }
+    if !ParseState.keyPath(&mut self.*, input) { return false }
+    ParseState.skipHorizontal(&mut self.*, input)
+    if self.cursor >= input.length || input[self.cursor] != 93 {
+      return ParseState.recordCurrent(&mut self.*, TomlReason.UnexpectedByte)
+    }
+    self.cursor = self.cursor + usize.ONE
+    if array {
+      if self.cursor >= input.length || input[self.cursor] != 93 {
+        return ParseState.recordCurrent(&mut self.*, TomlReason.UnexpectedByte)
+      }
+      self.cursor = self.cursor + usize.ONE
+    }
+    return true
+  }
+  fn lineEnd(self: &mut ParseState, input: &[u8]) -> bool {
+    ParseState.skipHorizontal(&mut self.*, input)
+    if !ParseState.comment(&mut self.*, input) { return false }
+    if self.cursor == input.length || ParseState.newline(&mut self.*, input) { return true }
+    return ParseState.recordCurrent(&mut self.*, TomlReason.UnexpectedByte)
+  }
+  fn utf8(self: &mut ParseState, input: &[u8]) -> bool {
+    let mut decoder = Utf8Decoder.make()
+    let mut at = usize.ZERO
+    while at < input.length {
+      let step = Utf8Decoder.step(&mut decoder, input[at], at)
+      match move step {
+        Utf8Step.Invalid { offset } => { return ParseState.recordError(&mut self.*, TomlReason.InvalidUtf8, offset) }
+        _ => {}
+      }
+      at = at + usize.ONE
+    }
+    if Utf8Decoder.pending(&decoder) { return ParseState.recordError(&mut self.*, TomlReason.InvalidUtf8, at) }
+    return true
+  }
+  /// Validates a complete TOML 1.1.0 document. Key equality and table ownership are reader work.
+  fn validate(self: &mut ParseState, input: &[u8]) -> Result<bool, TomlError> {
+    self.cursor = usize.ZERO
+    self.failed = false
+    if !ParseState.utf8(&mut self.*, input) { return Result<bool, TomlError>.failResult(self.error) }
+    while self.cursor < input.length {
+      ParseState.skipHorizontal(&mut self.*, input)
+      if self.cursor == input.length { break }
+      if input[self.cursor] == 35 || input[self.cursor] == 10 || input[self.cursor] == 13 {
+        if !ParseState.lineEnd(&mut self.*, input) { return Result<bool, TomlError>.failResult(self.error) }
+        continue
+      }
+      if input[self.cursor] == 91 {
+        if !ParseState.header(&mut self.*, input) { return Result<bool, TomlError>.failResult(self.error) }
+      } else {
+        if !ParseState.keyPath(&mut self.*, input) { return Result<bool, TomlError>.failResult(self.error) }
+        ParseState.skipHorizontal(&mut self.*, input)
+        if self.cursor >= input.length || input[self.cursor] != 61 {
+          let ignored = ParseState.recordCurrent(&mut self.*, TomlReason.UnexpectedByte)
+          return Result<bool, TomlError>.failResult(self.error)
+        }
+        self.cursor = self.cursor + usize.ONE
+        ParseState.skipHorizontal(&mut self.*, input)
+        if !ParseState.value(&mut self.*, input, usize.ZERO) { return Result<bool, TomlError>.failResult(self.error) }
+      }
+      if !ParseState.lineEnd(&mut self.*, input) { return Result<bool, TomlError>.failResult(self.error) }
+    }
+    self.cursor = usize.ZERO
+    return Result<bool, TomlError>.succeed(true)
+  }
+  /// Returns the next lexical token, retaining raw source spans for names and values.
+  fn next(self: &mut ParseState, input: &[u8]) -> Result<TomlToken, TomlError> {
+    while self.cursor < input.length {
+      let byte = input[self.cursor]
+      if horizontal(byte) { self.cursor = self.cursor + usize.ONE
+    continue }
+      if byte == 35 {
+        if !ParseState.comment(&mut self.*, input) { return Result<TomlToken, TomlError>.failResult(self.error) }
+        continue
+      }
+      if ParseState.newline(&mut self.*, input) { return Result<TomlToken, TomlError>.succeed(TomlToken.Newline) }
+      let at = self.cursor
+      self.cursor = self.cursor + usize.ONE
+      if byte == 61 { return Result<TomlToken, TomlError>.succeed(TomlToken.Equals) }
+      if byte == 46 { return Result<TomlToken, TomlError>.succeed(TomlToken.Dot) }
+      if byte == 44 { return Result<TomlToken, TomlError>.succeed(TomlToken.Comma) }
+      if byte == 91 { return Result<TomlToken, TomlError>.succeed(TomlToken.ArrayBegin) }
+      if byte == 93 { return Result<TomlToken, TomlError>.succeed(TomlToken.ArrayEnd) }
+      if byte == 123 { return Result<TomlToken, TomlError>.succeed(TomlToken.InlineBegin) }
+      if byte == 125 { return Result<TomlToken, TomlError>.succeed(TomlToken.InlineEnd) }
+      if byte == 34 || byte == 39 {
+        self.cursor = at
+        let multi = at + U2 < input.length && input[at + usize.ONE] == byte
+          && input[at + U2] == byte
+        if !ParseState.string(&mut self.*, input, false) { return Result<TomlToken, TomlError>.failResult(self.error) }
+        return Result<TomlToken, TomlError>.succeed(TomlToken.String {
+          span: TomlSpan { offset: at, length: self.cursor - at }, literal: byte == 39, multiline: multi,
+        })
+      }
+      if byte == 13 { return Result<TomlToken, TomlError>.failResult(TomlError { reason: TomlReason.UnexpectedByte, offset: at }) }
+      while self.cursor < input.length {
+        let current = input[self.cursor]
+        if horizontal(current) || current == 10 || current == 13 || current == 35 || current == 61
+          || current == 44 || current == 91 || current == 93 || current == 123 || current == 125
+          || current == 34 || current == 39 { break }
+        self.cursor = self.cursor + usize.ONE
+      }
+      if self.cursor < input.length && input[self.cursor] == 32 && datePart(input, at, self.cursor)
+        && self.cursor + U3 < input.length && fixedDigits(input, self.cursor + usize.ONE, U2, input.length)
+        && input[self.cursor + U3] == 58 {
+        self.cursor = self.cursor + usize.ONE
+        while self.cursor < input.length {
+          let current = input[self.cursor]
+          if horizontal(current) || current == 10 || current == 13 || current == 35
+            || current == 44 || current == 93 || current == 125 { break }
+          self.cursor = self.cursor + usize.ONE
+        }
+      }
+      return Result<TomlToken, TomlError>.succeed(TomlToken.Text {
+        span: TomlSpan { offset: at, length: self.cursor - at },
+      })
+    }
+    return Result<TomlToken, TomlError>.succeed(TomlToken.EndOfInput)
+  }
+}
+
+impl<'input> TomlScanner<'input> {
+  /// Returns a scanner at the start of `input`.
+  pub fn make(input: &'input [u8]) -> TomlScanner<'input> {
+    return TomlScanner<'input> { input: input, cursor: usize.ZERO }
+  }
+  /// Checks the syntax of the full input as a TOML 1.1.0 document. It does not move the scanner.
+  ///
+  /// Returns `Success(true)` for valid syntax. It does not check that each key is defined one time.
+  /// `silk.toml.value` does that when it builds the tree.
+  ///
+  /// # Errors
+  /// - [`TomlError`] for the first syntax problem in the input.
+  pub fn validate(self: &mut TomlScanner) -> Result<bool, TomlError> {
+    let mut state = ParseState.make()
+    return ParseState.validate(&mut state, self.input)
+  }
+  /// Returns the next token and moves past it. Spaces, tabs, and comments are skipped.
+  ///
+  /// After the last token, it returns [`TomlToken.EndOfInput`] on each call.
+  ///
+  /// # Errors
+  /// - [`TomlError`] for a string that is not closed, a bad comment, or a lone carriage return.
+  ///   `next` does not check the full syntax. Call [`TomlScanner.validate`] first.
+  pub fn next(self: &mut TomlScanner) -> Result<TomlToken, TomlError> {
+    let mut state = ParseState.make()
+    state.cursor = self.cursor
+    let result = ParseState.next(&mut state, self.input)
+    self.cursor = state.cursor
+    return move result
+  }
+  /// Returns the kind of the unquoted value in `span`, or `None` if the bytes are not a valid
+  /// integer, float, boolean, date, or time.
+  pub fn scalarKind(self: &TomlScanner, span: TomlSpan) -> Option<TomlScalarKind> {
+    return scalarKind(self.input, span.offset, span.offset + span.length)
+  }
+  /// Returns the source bytes of `span`. They borrow from the input, not from the scanner.
+  pub fn slice(self: &TomlScanner<'input>, span: TomlSpan) -> &'input [u8] {
+    return Slice.view<u8>(self.input, span.offset, span.length)
+  }
+  /// Returns the byte position where the next call to [`TomlScanner.next`] starts.
+  pub fn offset(self: &TomlScanner) -> usize { return self.cursor }
+}

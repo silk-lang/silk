@@ -1,0 +1,584 @@
+//! Encode and decode standard Base64 (RFC 4648, with padding) into byte slices that you supply.
+//!
+//! # When to use
+//! Use [`Base64`] when a protocol needs the standard alphabet (`A-Z`, `a-z`, `0-9`, `+`, `/`) with
+//! `=` padding, for example HTTP Basic authentication or a JSON field. Call
+//! [`Base64.encodedLength`] or [`Base64.decodedLength`] to get the exact size of the output, and
+//! then [`Base64.encodeInto`] or [`Base64.decodeInto`] to write it.
+//!
+//! # Details
+//! The functions do not allocate. They return a `Result`, and they check all input and the size of
+//! the output before they write the first byte. A failure does not change the output. A success
+//! changes only the prefix that it reports.
+//!
+//! Decoding is strict. It rejects whitespace, the URL-safe characters `-` and `_`, missing or
+//! misplaced padding, and unused bits that are not zero, so each byte sequence has exactly one
+//! encoding.
+//!
+//! # Errors
+//! The functions return a [`Base64Error`]. Its `reason` tells you what failed, and `offset` gives
+//! the position in the input for a decoding error.
+//!
+//! # Gotchas
+//! This module has no MIME, PEM, URL-safe, unpadded, or streaming variant. Base64 is an encoding,
+//! not encryption.
+//!
+//! # Examples
+//! ## Encode and decode a short message
+//! ```silk
+//! import silk.encoding.base64 { Base64, Base64Error }
+//! import silk.core.result { Result }
+//!
+//! pub fn main() -> i32 {
+//!   let mut encoded: [u8; 8] = [0; 8]
+//!   let written = match Base64.encodeInto(&mut encoded, b"Hi!?") {
+//!     Result<usize, Base64Error>.Success { value } => value
+//!     Result<usize, Base64Error>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   // "Hi!?" encodes to "SGkhPw==".
+//!   if written != 8 || encoded[0] != 83 || encoded[6] != 61 {
+//!     return 1
+//!   }
+//!   let mut decoded: [u8; 4] = [0; 4]
+//!   return match Base64.decodeInto(&mut decoded, &encoded) {
+//!     Result<usize, Base64Error>.Success { value } => {
+//!       if value != 4 || decoded[0] != 72 || decoded[3] != 63 {
+//!         return 1
+//!       }
+//!       return 0
+//!     }
+//!     Result<usize, Base64Error>.Failure { error: _ } => 1
+//!   }
+//! }
+//! ```
+//!
+//! ## Reject input that is not strict Base64
+//! ```silk
+//! import silk.encoding.base64 { Base64, Base64Error, Base64Reason }
+//! import silk.core.option { Option }
+//! import silk.core.result { Result }
+//!
+//! pub fn main() -> i32 {
+//!   // `-` is URL-safe Base64, not standard Base64.
+//!   return match Base64.decodedLength(b"ab-d") {
+//!     Result<usize, Base64Error>.Failure { error } => {
+//!       if error.reason != Base64Reason.InvalidByte
+//!         || Option<usize>.unwrapOr(move error.offset, 0) != 2 {
+//!         return 1
+//!       }
+//!       return 0
+//!     }
+//!     Result<usize, Base64Error>.Success { value: _ } => 1
+//!   }
+//! }
+//! ```
+//!
+//! @category Data formats
+
+import silk.text.format { Debug, Format, Formatter }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.simd.simd
+import silk.simd.mask16
+import silk.simd.u32x4
+import silk.simd.u8x16
+import silk.num.u8
+import silk.num.usize
+import silk.io.writer { Writer, WriterError }
+
+/// The cause of a [`Base64Error`].
+pub enum Base64Reason {
+  /// The encoded input is not empty and its length is not a multiple of 4. `offset` is the input
+  /// length.
+  InvalidLength,
+  /// An input byte is not in the standard alphabet. `offset` is its position.
+  InvalidByte,
+  /// `=` occurs before the last two positions, or `=` is followed by a byte that is not `=`.
+  /// `offset` is the position of the misplaced `=`, or the input length.
+  InvalidPadding,
+  /// The last character before the padding has unused bits that are not zero, such as `QR==` in
+  /// place of `QQ==`. `offset` is its position.
+  NonCanonicalPadBits,
+  /// The encoded length does not fit in `usize`.
+  SizeOverflow,
+  /// The output slice is too short. `required` and `available` give the two lengths.
+  OutputTooSmall,
+}
+
+impl Debug for Base64Reason {
+  /// Writes the name of the variant, such as `InvalidLength`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      Base64Reason.InvalidLength => run Format.write(&mut formatter, b"InvalidLength")
+      Base64Reason.InvalidByte => run Format.write(&mut formatter, b"InvalidByte")
+      Base64Reason.InvalidPadding => run Format.write(&mut formatter, b"InvalidPadding")
+      Base64Reason.NonCanonicalPadBits => run Format.write(&mut formatter, b"NonCanonicalPadBits")
+      Base64Reason.SizeOverflow => run Format.write(&mut formatter, b"SizeOverflow")
+      Base64Reason.OutputTooSmall => run Format.write(&mut formatter, b"OutputTooSmall")
+    }
+  }
+}
+
+/// A Base64 failure.
+///
+/// Decoding errors set `offset`. `OutputTooSmall` sets `required` and `available`. The fields that
+/// do not apply to the reason are `None`.
+pub struct Base64Error {
+  /// The cause of the failure.
+  pub reason: Base64Reason,
+  /// For a decoding error, the position in the input: the bad byte for `InvalidByte` and
+  /// `NonCanonicalPadBits`, the misplaced `=` or the input length for `InvalidPadding`, and the
+  /// input length for `InvalidLength`.
+  pub offset: Option<usize>,
+  /// For `OutputTooSmall`, the number of bytes that the output needs.
+  pub required: Option<usize>,
+  /// For `OutputTooSmall`, the length of the output that you gave.
+  pub available: Option<usize>,
+}
+
+impl Debug for Base64Error {
+  /// Writes the fields, as `Base64Error { reason: ..., offset: ..., ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return run Format.debugFields(self, "Base64Error", &mut formatter)
+  }
+}
+
+/// Functions for strict standard Base64 with padding (RFC 4648).
+///
+/// # When to use
+///
+/// Use it when a protocol needs the standard alphabet (`A-Z`, `a-z`, `0-9`, `+`, `/`) with `=`
+/// padding, for example HTTP Basic authentication or a JSON field. Call [`Base64.encodedLength`]
+/// or [`Base64.decodedLength`] to get the exact size of the output, and then
+/// [`Base64.encodeInto`] or [`Base64.decodeInto`] to write it.
+///
+/// # Details
+///
+/// The functions do not allocate. They check all input and the size of the output before they
+/// write the first byte. A failure does not change the output. Decoding is strict. It rejects
+/// whitespace, the URL-safe characters `-` and `_`, missing or misplaced padding, and unused bits
+/// that are not zero.
+///
+/// # Gotchas
+///
+/// There is no MIME, PEM, URL-safe, unpadded, or streaming variant. Base64 is an encoding, not
+/// encryption.
+pub struct Base64 {}
+
+impl Base64 {
+  /// Returns the length of the Base64 text for `inputLength` bytes: 4 for each started group of 3
+  /// bytes.
+  ///
+  /// Returns 0 for 0.
+  ///
+  /// # Errors
+  /// - `SizeOverflow` if the length does not fit in `usize`.
+  pub fn encodedLength(inputLength: usize) -> Result<usize, Base64Error> {
+    let groups = inputLength / 3
+    let remainder = inputLength % 3
+    let maximumGroups = usize.MAX / 4
+    if groups > maximumGroups {
+      return Result<usize, Base64Error>.failResult(sizeOverflow())
+    }
+    let mut length = groups * 4
+    if remainder != usize.ZERO {
+      if length > usize.MAX - 4 {
+        return Result<usize, Base64Error>.failResult(sizeOverflow())
+      }
+      length = length + 4
+    }
+    return Result<usize, Base64Error>.succeed(length)
+  }
+
+  /// Checks that `input` is strict Base64 and returns the number of bytes that it decodes to.
+  ///
+  /// Returns 0 for empty input. Use it to size the output of [`Base64.decodeInto`].
+  ///
+  /// Decoding is strict. It rejects whitespace, the URL-safe characters `-` and `_`, missing or
+  /// misplaced padding, and unused bits that are not zero, so each byte sequence has exactly one
+  /// encoding.
+  ///
+  /// # Errors
+  /// - `InvalidLength`, `InvalidByte`, `InvalidPadding`, or `NonCanonicalPadBits` for the first
+  ///   problem in `input`, from left to right. `offset` gives its position.
+  pub fn decodedLength(input: &[u8]) -> Result<usize, Base64Error> {
+    if input.length == usize.ZERO {
+      return Result<usize, Base64Error>.succeed(usize.ZERO)
+    }
+    if input.length % 4 != usize.ZERO {
+      return Result<usize, Base64Error>.failResult(at(
+        Base64Reason.InvalidLength,
+        input.length,
+      ))
+    }
+
+    let mut index = usize.ZERO
+    let mut length = usize.ZERO
+    // Check sixteen characters at a time, leaving the final quantum and any block with a bad
+    // byte to the loop below, which finds the offset.
+    static if simd.hardware() {
+      while index + 20 <= input.length {
+        if mask16.all(sextetLanes(u8x16.load(input, index))) == false {
+          break
+        }
+        length = length + 12
+        index = index + 16
+      }
+    }
+    while index < input.length {
+      let first = sextetAt(input, index)
+      let firstValue = match move first {
+        Result<u8, Base64Error>.Failure { error } => {
+          return Result<usize, Base64Error>.failResult(move error)
+        }
+        Result<u8, Base64Error>.Success { value } => value
+      }
+      let second = sextetAt(input, index + usize.ONE)
+      let secondValue = match move second {
+        Result<u8, Base64Error>.Failure { error } => {
+          return Result<usize, Base64Error>.failResult(move error)
+        }
+        Result<u8, Base64Error>.Success { value } => value
+      }
+      let finalQuantum = input.length - index == 4
+      if !finalQuantum {
+        let third = sextetAt(input, index + 2)
+        match move third {
+          Result<u8, Base64Error>.Failure { error } => {
+            return Result<usize, Base64Error>.failResult(move error)
+          }
+          Result<u8, Base64Error>.Success { value: _ } => {}
+        }
+        let fourth = sextetAt(input, index + 3)
+        match move fourth {
+          Result<u8, Base64Error>.Failure { error } => {
+            return Result<usize, Base64Error>.failResult(move error)
+          }
+          Result<u8, Base64Error>.Success { value: _ } => {}
+        }
+        length = length + 3
+        index = index + 4
+      } else {
+        let thirdByte = input[index + 2]
+        let fourthByte = input[index + 3]
+        if thirdByte == 61 {
+          if fourthByte != 61 {
+            return Result<usize, Base64Error>.failResult(at(
+              Base64Reason.InvalidPadding,
+              input.length,
+            ))
+          }
+          if u8.bitAnd(secondValue, 15) != 0 {
+            return Result<usize, Base64Error>.failResult(at(
+              Base64Reason.NonCanonicalPadBits,
+              index + usize.ONE,
+            ))
+          }
+          return Result<usize, Base64Error>.succeed(length + usize.ONE)
+        }
+
+        let third = sextetAt(input, index + 2)
+        let thirdValue = match move third {
+          Result<u8, Base64Error>.Failure { error } => {
+            return Result<usize, Base64Error>.failResult(move error)
+          }
+          Result<u8, Base64Error>.Success { value } => value
+        }
+        if fourthByte == 61 {
+          if u8.bitAnd(thirdValue, 3) != 0 {
+            return Result<usize, Base64Error>.failResult(at(
+              Base64Reason.NonCanonicalPadBits,
+              index + 2,
+            ))
+          }
+          return Result<usize, Base64Error>.succeed(length + 2)
+        }
+
+        let fourth = sextetAt(input, index + 3)
+        match move fourth {
+          Result<u8, Base64Error>.Failure { error } => {
+            return Result<usize, Base64Error>.failResult(move error)
+          }
+          Result<u8, Base64Error>.Success { value: _ } => {}
+        }
+        return Result<usize, Base64Error>.succeed(length + 3)
+      }
+    }
+    return Result<usize, Base64Error>.succeed(length)
+  }
+
+  /// Writes the Base64 text of `input` to the start of `output` and returns the number of bytes
+  /// written.
+  ///
+  /// It writes no NUL terminator. The bytes of `output` after the written prefix do not change.
+  ///
+  /// # Errors
+  /// - `SizeOverflow` if the encoded length does not fit in `usize`.
+  /// - `OutputTooSmall` if `output` is shorter than [`Base64.encodedLength`]. `output` does not
+  ///   change.
+  pub fn encodeInto(output: &mut [u8], input: &[u8]) -> Result<usize, Base64Error> {
+    let checked = Base64.encodedLength(input.length)
+    let required = match move checked {
+      Result<usize, Base64Error>.Failure { error } => {
+        return Result<usize, Base64Error>.failResult(move error)
+      }
+      Result<usize, Base64Error>.Success { value } => value
+    }
+    if output.length < required {
+      return Result<usize, Base64Error>.failResult(tooSmall(required, output.length))
+    }
+
+    let mut source = usize.ZERO
+    let mut target = usize.ZERO
+    // Twelve input bytes to sixteen characters at a time; a block reads sixteen input bytes.
+    static if simd.hardware() {
+      while source + 16 <= input.length {
+        u8x16.store(&mut output, target, encodeBlock(u8x16.load(input, source)))
+        source = source + 12
+        target = target + 16
+      }
+    }
+    while input.length - source >= 3 {
+      let first = input[source]
+      let second = input[source + usize.ONE]
+      let third = input[source + 2]
+      output[target] = alphabet(u8.shiftRight(first, 2))
+      output[target + usize.ONE] = alphabet(u8.bitOr(
+        u8.shiftLeft(u8.bitAnd(first, 3), 4),
+        u8.shiftRight(second, 4),
+      ))
+      output[target + 2] = alphabet(u8.bitOr(
+        u8.shiftLeft(u8.bitAnd(second, 15), 2),
+        u8.shiftRight(third, 6),
+      ))
+      output[target + 3] = alphabet(u8.bitAnd(third, 63))
+      source = source + 3
+      target = target + 4
+    }
+
+    let tail = input.length - source
+    if tail == usize.ONE {
+      let first = input[source]
+      output[target] = alphabet(u8.shiftRight(first, 2))
+      output[target + usize.ONE] = alphabet(u8.shiftLeft(u8.bitAnd(first, 3), 4))
+      output[target + 2] = 61
+      output[target + 3] = 61
+    } else if tail == 2 {
+      let first = input[source]
+      let second = input[source + usize.ONE]
+      output[target] = alphabet(u8.shiftRight(first, 2))
+      output[target + usize.ONE] = alphabet(u8.bitOr(
+        u8.shiftLeft(u8.bitAnd(first, 3), 4),
+        u8.shiftRight(second, 4),
+      ))
+      output[target + 2] = alphabet(u8.shiftLeft(u8.bitAnd(second, 15), 2))
+      output[target + 3] = 61
+    }
+    return Result<usize, Base64Error>.succeed(required)
+  }
+
+  /// Decodes the Base64 text `input` to the start of `output` and returns the number of bytes
+  /// written.
+  ///
+  /// The bytes of `output` after the written prefix do not change.
+  ///
+  /// Decoding is strict. It rejects whitespace, the URL-safe characters `-` and `_`, missing or
+  /// misplaced padding, and unused bits that are not zero, so each byte sequence has exactly one
+  /// encoding.
+  ///
+  /// # Errors
+  /// - `InvalidLength`, `InvalidByte`, `InvalidPadding`, or `NonCanonicalPadBits` if `input` is not
+  ///   strict Base64. These errors come before `OutputTooSmall`.
+  /// - `OutputTooSmall` if `output` is shorter than [`Base64.decodedLength`].
+  ///
+  /// `output` does not change when an error occurs.
+  pub fn decodeInto(output: &mut [u8], input: &[u8]) -> Result<usize, Base64Error> {
+    let checked = Base64.decodedLength(input)
+    let required = match move checked {
+      Result<usize, Base64Error>.Failure { error } => {
+        return Result<usize, Base64Error>.failResult(move error)
+      }
+      Result<usize, Base64Error>.Success { value } => value
+    }
+    if output.length < required {
+      return Result<usize, Base64Error>.failResult(tooSmall(required, output.length))
+    }
+
+    let mut source = usize.ZERO
+    let mut target = usize.ZERO
+    // Sixteen characters to twelve bytes at a time. A block stores sixteen bytes, so it runs only
+    // while at least eight more characters follow; their bytes overwrite the four extra ones.
+    static if simd.hardware() {
+      while source + 24 <= input.length {
+        u8x16.store(&mut output, target, decodeBlock(u8x16.load(input, source)))
+        source = source + 16
+        target = target + 12
+      }
+    }
+    while source < input.length {
+      let first = validatedSextet(input[source])
+      let second = validatedSextet(input[source + usize.ONE])
+      output[target] = u8.bitOr(
+        u8.shiftLeft(first, 2),
+        u8.shiftRight(second, 4),
+      )
+      target = target + usize.ONE
+
+      if input[source + 2] != 61 {
+        let third = validatedSextet(input[source + 2])
+        output[target] = u8.bitOr(
+          u8.shiftLeft(second, 4),
+          u8.shiftRight(third, 2),
+        )
+        target = target + usize.ONE
+        if input[source + 3] != 61 {
+          let fourth = validatedSextet(input[source + 3])
+          output[target] = u8.bitOr(u8.shiftLeft(third, 6), fourth)
+          target = target + usize.ONE
+        }
+      }
+      source = source + 4
+    }
+    return Result<usize, Base64Error>.succeed(required)
+  }
+}
+
+fn sizeOverflow() -> Base64Error {
+  return Base64Error {
+    reason: Base64Reason.SizeOverflow,
+    offset: Option<usize>.none(),
+    required: Option<usize>.none(),
+    available: Option<usize>.none(),
+  }
+}
+
+fn at(reason: Base64Reason, offset: usize) -> Base64Error {
+  return Base64Error {
+    reason: reason,
+    offset: Option<usize>.some(offset),
+    required: Option<usize>.none(),
+    available: Option<usize>.none(),
+  }
+}
+
+fn tooSmall(required: usize, available: usize) -> Base64Error {
+  return Base64Error {
+    reason: Base64Reason.OutputTooSmall,
+    offset: Option<usize>.none(),
+    required: Option<usize>.some(required),
+    available: Option<usize>.some(available),
+  }
+}
+
+fn sextetAt(input: &[u8], index: usize) -> Result<u8, Base64Error> {
+  let value = input[index]
+  if value == 61 {
+    return Result<u8, Base64Error>.failResult(at(Base64Reason.InvalidPadding, index))
+  }
+  if value >= 65 && value <= 90 {
+    return Result<u8, Base64Error>.succeed(value - 65)
+  }
+  if value >= 97 && value <= 122 {
+    return Result<u8, Base64Error>.succeed(value - 71)
+  }
+  if value >= 48 && value <= 57 {
+    return Result<u8, Base64Error>.succeed(value + 4)
+  }
+  if value == 43 {
+    return Result<u8, Base64Error>.succeed(62)
+  }
+  if value == 47 {
+    return Result<u8, Base64Error>.succeed(63)
+  }
+  return Result<u8, Base64Error>.failResult(at(Base64Reason.InvalidByte, index))
+}
+
+// decodedLength has already proved that every call site supplies a standard-alphabet byte.
+fn validatedSextet(value: u8) -> u8 {
+  if value >= 65 && value <= 90 {
+    return value - 65
+  }
+  if value >= 97 && value <= 122 {
+    return value - 71
+  }
+  if value >= 48 && value <= 57 {
+    return value + 4
+  }
+  if value == 43 {
+    return 62
+  }
+  return 63
+}
+
+fn alphabet(value: u8) -> u8 {
+  if value < 26 {
+    return value + 65
+  }
+  if value < 52 {
+    return value + 71
+  }
+  if value < 62 {
+    return value - 4
+  }
+  if value == 62 {
+    return 43
+  }
+  return 47
+}
+
+// The method of Muła and Lemire ("Faster Base64 Encoding and Decoding Using AVX2 Instructions"),
+// with shifts and masks in place of multiplications so that it needs only portable operations.
+
+// Encodes the first twelve bytes of `input` to sixteen characters.
+fn encodeBlock(input: simd<u8, 16>) -> simd<u8, 16> {
+  // Each 32-bit lane gets the bytes b, a, c, b of one group a, b, c, so that the 16-bit halves
+  // hold a:b and b:c.
+  let spread = u8x16.shuffle(input, input, [1, 0, 2, 1, 4, 3, 5, 4, 7, 6, 8, 7, 10, 9, 11, 10])
+  let lanes = u8x16.bitcastToU32x4(spread)
+  let sextet = u32x4.splat(63)
+  let first = u32x4.shiftRight(lanes, u32x4.splat(10)) & sextet
+  let second = u32x4.shiftLeft(lanes, u32x4.splat(4)) & u32x4.splat(16128)
+  let third = u32x4.shiftRight(lanes, u32x4.splat(6)) & u32x4.splat(4128768)
+  let fourth = u32x4.shiftLeft(lanes, u32x4.splat(8)) & u32x4.splat(1056964608)
+  let indices = u32x4.bitcastToU8x16(first | second | third | fourth)
+  // `A` is 65, `a` is 26 + 71, `0` is 52 - 4, `+` is 62 - 19 and `/` is 63 - 16.
+  let mut shift = u8x16.splat(65)
+  shift = u8x16.wrappingAdd(shift, u8x16.select(u8x16.lanesGreaterOrEqual(indices, u8x16.splat(26)), u8x16.splat(6), u8x16.splat(0)))
+  shift = u8x16.wrappingAdd(shift, u8x16.select(u8x16.lanesGreaterOrEqual(indices, u8x16.splat(52)), u8x16.splat(181), u8x16.splat(0)))
+  shift = u8x16.wrappingAdd(shift, u8x16.select(u8x16.lanesGreaterOrEqual(indices, u8x16.splat(62)), u8x16.splat(241), u8x16.splat(0)))
+  shift = u8x16.wrappingAdd(shift, u8x16.select(u8x16.lanesGreaterOrEqual(indices, u8x16.splat(63)), u8x16.splat(3), u8x16.splat(0)))
+  return u8x16.wrappingAdd(indices, shift)
+}
+
+// Lanes that hold a character of the standard alphabet.
+fn sextetLanes(input: simd<u8, 16>) -> mask<16> {
+  let upper = u8x16.lanesGreaterOrEqual(input, u8x16.splat(65)) & u8x16.lanesLessOrEqual(input, u8x16.splat(90))
+  let lower = u8x16.lanesGreaterOrEqual(input, u8x16.splat(97)) & u8x16.lanesLessOrEqual(input, u8x16.splat(122))
+  let digit = u8x16.lanesGreaterOrEqual(input, u8x16.splat(48)) & u8x16.lanesLessOrEqual(input, u8x16.splat(57))
+  let symbol = u8x16.lanesEqual(input, u8x16.splat(43)) | u8x16.lanesEqual(input, u8x16.splat(47))
+  return upper | lower | digit | symbol
+}
+
+// Decodes sixteen characters of the standard alphabet to twelve bytes, followed by four bytes of
+// no meaning.
+fn decodeBlock(input: simd<u8, 16>) -> simd<u8, 16> {
+  // `A` to `Z` minus 65, `a` to `z` minus 71, `0` to `9` plus 4, `+` plus 19 and `/` plus 16.
+  let lower = u8x16.lanesGreaterOrEqual(input, u8x16.splat(97))
+  let upper = u8x16.lanesGreaterOrEqual(input, u8x16.splat(65))
+  let digit = u8x16.lanesGreaterOrEqual(input, u8x16.splat(48))
+  let plus = u8x16.lanesEqual(input, u8x16.splat(43))
+  let mut shift = u8x16.select(plus, u8x16.splat(19), u8x16.splat(16))
+  shift = u8x16.select(digit, u8x16.splat(4), shift)
+  shift = u8x16.select(upper, u8x16.splat(191), shift)
+  shift = u8x16.select(lower, u8x16.splat(185), shift)
+  let lanes = u8x16.bitcastToU32x4(u8x16.wrappingAdd(input, shift))
+  // Lane bytes s0, s1, s2, s3 become the 24-bit value s0 s1 s2 s3, whose bytes are c, b, a.
+  let first = u32x4.shiftLeft(lanes & u32x4.splat(63), u32x4.splat(18))
+  let second = u32x4.shiftLeft(lanes, u32x4.splat(4)) & u32x4.splat(258048)
+  let third = u32x4.shiftRight(lanes, u32x4.splat(10)) & u32x4.splat(4032)
+  let fourth = u32x4.shiftRight(lanes, u32x4.splat(24))
+  let packed = u32x4.bitcastToU8x16(first | second | third | fourth)
+  return u8x16.shuffle(packed, packed, [2, 1, 0, 6, 5, 4, 10, 9, 8, 14, 13, 12, 3, 7, 11, 15])
+}

@@ -7,9 +7,9 @@ import { initPackage, join, read, sharedHome, show, silk, write } from './lib.mj
 
 const h = sharedHome()
 
-const logging = `import silk.effect { Effect }
-import silk.logger { LogError }
-import silk.os_logger { StdoutLogger }
+const logging = `import silk.core.effect { Effect }
+import silk.io.logger { LogError }
+import silk.io.logger_native { StdoutLogger }
 
 pub effect fn main() -> () ! LogError {
   let mut logger = StdoutLogger.make()
@@ -94,7 +94,7 @@ test('a project opened through a symbolic link builds', () => {
 
 // [what the newcomer did, program, pattern the first error must match]
 const unclear = [
-  ['called a method the type lacks', 'finding 32', 'import silk.allocator { Allocator, OutOfMemoryError }\nimport silk.list { List }\n\neffect fn fill() -> () ! OutOfMemoryError ? &mut Allocator {\n  let mut list = List<i32>.make()\n  run list.push(1)\n}\n\npub fn main() -> i32 {\n  return 0\n}\n', /push/],
+  ['called a method the type lacks', 'finding 32', 'import silk.mem.allocator { Allocator, OutOfMemoryError }\nimport silk.collections.list { List }\n\neffect fn fill() -> () ! OutOfMemoryError ? &mut Allocator {\n  let mut list = List<i32>.make()\n  run list.push(1)\n}\n\npub fn main() -> i32 {\n  return 0\n}\n', /push/],
   ['used List without importing it', 'finding 32', 'struct Tags {\n  names: List<i32>\n}\n\npub fn main() -> i32 {\n  return 0\n}\n', /List/],
   ['wrote a tuple return type', 'finding 33', 'fn pair() -> (i32, i32) {\n  return (1, 2)\n}\n\npub fn main() -> i32 {\n  return 0\n}\n', /tuple/],
   ['saved the file with a byte order mark', 'finding 34', '﻿pub fn main() -> i32 {\n  return 0\n}\n', null],

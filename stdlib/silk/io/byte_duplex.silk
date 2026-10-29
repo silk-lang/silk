@@ -1,0 +1,430 @@
+//! The `ByteDuplex` effect: a two-way byte stream, such as a TCP connection, with partial reads and
+//! writes and deadlines.
+//!
+//! # When to use
+//! Require `&mut ByteDuplex` in protocol code that must know exactly how many bytes each read and
+//! write moved, such as HTTP or TLS. Most code uses it through `silk.io.buffered_duplex`. Use
+//! `silk.io.writer.Writer` when each write must complete or fail as a whole.
+//!
+//! # Details
+//! [`ByteDuplex.readSome`], [`ByteDuplex.writeSome`], and [`ByteDuplex.writeSomeVectored`] can move
+//! fewer bytes than the caller offers. A successful read or write of a non-empty slice moves at
+//! least one byte. The bytes after that count stay with the caller. `ReadTransfer.End` means that
+//! the peer ended the stream. It is not a message of the protocol.
+//!
+//! Each operation takes a deadline: an absolute time on the active `MonotonicClock`, or none.
+//!
+//! A provider implements the `unsafe` `...Raw` operations. The safe operations check the counts
+//! that the provider reports, so callers use only the safe operations.
+//!
+//! # Errors
+//! - [`ByteIoError`] for each failure. `Timeout` when the deadline passes, `Closed` after a close,
+//!   `Provider` for a failure of the transport.
+//!
+//! # Gotchas
+//! If a provider reports a count that is not possible, the safe operation closes the transport and
+//! fails with `InvalidTransferCount`. Do not try again with the same buffer. If an operation is
+//! canceled during a transfer, it is not known how many bytes moved. Close the transport.
+//!
+//! # See also
+//! - `silk.io.buffered_duplex` for buffered reads and writes over a `ByteDuplex`.
+//! - `silk.io.memory_byte_duplex` for a scripted transport to use in tests.
+//!
+//! @category Input and output
+
+import silk.text.format {Debug, Format, Formatter}
+import silk.system.monotonic_clock {MonotonicClock}
+import silk.core.option {Option}
+import silk.core.effect {Effect}
+import silk.system.system_clock {Instant, SystemClock}
+import silk.num.usize
+import silk.io.writer {Writer, WriterError}
+
+/// The operation that failed, as recorded in a [`ByteIoError`].
+pub enum ByteIoOperation {
+  /// A read.
+  Read,
+  /// A write.
+  Write,
+  /// A flush.
+  Flush,
+  /// A close of the write direction.
+  ShutdownWrite,
+  /// A close of the whole transport.
+  Close,
+}
+
+impl Debug for ByteIoOperation {
+  /// Writes the name of the variant, such as `Read`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      ByteIoOperation.Read => run Format.write(&mut formatter, b"Read")
+      ByteIoOperation.Write => run Format.write(&mut formatter, b"Write")
+      ByteIoOperation.Flush => run Format.write(&mut formatter, b"Flush")
+      ByteIoOperation.ShutdownWrite => run Format.write(&mut formatter, b"ShutdownWrite")
+      ByteIoOperation.Close => run Format.write(&mut formatter, b"Close")
+    }
+  }
+}
+
+/// The error from a [`ByteDuplex`] operation.
+///
+/// # Details
+///
+/// `Timeout` means that the deadline passed, `Closed` that the transport or its write direction is
+/// closed, and `Provider` that the transport failed for its own reason. `InvalidTransferCount`
+/// means that the provider reported a count that is not possible. The safe operation then closes
+/// the transport.
+///
+/// # Gotchas
+///
+/// After `InvalidTransferCount`, do not try again with the same buffer. If an operation is canceled
+/// during a transfer, it is not known how many bytes moved. Close the transport.
+pub union ByteIoError {
+  /// The deadline passed before the operation completed.
+  Timeout {
+    /// The operation that failed.
+    pub operation: ByteIoOperation,
+  },
+  /// The provider reported a count that is not possible: 0, or more than the slice length. The
+  /// transport is closed.
+  InvalidTransferCount {
+    /// The operation that failed.
+    pub operation: ByteIoOperation,
+    /// The count that the provider reported.
+    pub count: usize,
+    /// The length of the slice that the caller offered.
+    pub limit: usize,
+  },
+  /// The transport, or its write direction, is closed.
+  Closed {
+    /// The operation that failed.
+    pub operation: ByteIoOperation,
+  },
+  /// The transport failed for its own reason, such as a connection reset.
+  Provider {
+    /// The operation that failed.
+    pub operation: ByteIoOperation,
+    /// A code that the provider defines, such as an `errno` value.
+    pub code: i32,
+  },
+}
+
+impl Debug for ByteIoError {
+  /// Writes the name of the variant and its fields, such as `Timeout { ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      ByteIoError.Timeout { operation } => {
+        let mut record = run Format.debugRecord("Timeout", &mut formatter)
+        run Format.debugField(&mut record, "operation", &operation, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      ByteIoError.InvalidTransferCount { operation, count, limit } => {
+        let mut record = run Format.debugRecord("InvalidTransferCount", &mut formatter)
+        run Format.debugField(&mut record, "operation", &operation, &mut formatter)
+        run Format.debugField(&mut record, "count", &count, &mut formatter)
+        run Format.debugField(&mut record, "limit", &limit, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      ByteIoError.Closed { operation } => {
+        let mut record = run Format.debugRecord("Closed", &mut formatter)
+        run Format.debugField(&mut record, "operation", &operation, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      ByteIoError.Provider { operation, code } => {
+        let mut record = run Format.debugRecord("Provider", &mut formatter)
+        run Format.debugField(&mut record, "operation", &operation, &mut formatter)
+        run Format.debugField(&mut record, "code", &code, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+    }
+  }
+}
+
+/// The result of a read.
+pub union ReadTransfer {
+  /// The read put bytes at the start of the output slice.
+  Data {
+    /// The number of bytes that the read put in the output slice. It is at least 1 for a non-empty
+    /// slice.
+    pub count: usize,
+  },
+  /// The peer ended the stream. Later reads also return `End`.
+  End,
+}
+
+/// The effect for one two-way byte stream that the code uses alone, such as a TCP connection,
+/// with partial reads and writes and deadlines.
+///
+/// # When to use
+///
+/// Require `&mut ByteDuplex` in protocol code that must know exactly how many bytes each read and
+/// write moved, such as HTTP or TLS. Most code uses it through `silk.io.buffered_duplex`. Use
+/// `silk.io.writer.Writer` when each write must complete or fail as a whole.
+///
+/// # Details
+///
+/// A read or write can move fewer bytes than the caller offers. A successful read or write of a
+/// non-empty slice moves at least one byte. `ReadTransfer.End` means that the peer ended the
+/// stream. Each operation takes a deadline: an absolute time on the active `MonotonicClock`, or
+/// none.
+///
+/// A provider implements the `...Raw` operations. Callers use the safe operations with the same
+/// names without `Raw`: [`ByteDuplex.readSome`], [`ByteDuplex.writeSome`],
+/// [`ByteDuplex.writeSomeVectored`], [`ByteDuplex.flush`], [`ByteDuplex.shutdownWrite`], and
+/// [`ByteDuplex.close`]. A direct call to a `...Raw` operation is `unsafe`, because its count is
+/// not checked.
+///
+/// # Gotchas
+///
+/// If a provider reports a count that is not possible, the safe operation closes the transport and
+/// fails with `InvalidTransferCount`. If an operation is canceled during a transfer, it is not
+/// known how many bytes moved. Close the transport.
+pub service ByteDuplex {
+  /// The provider read. It puts bytes at the start of `output` and returns their count, or `End`.
+  unsafe effect fn readSomeRaw(
+    output: &mut [u8],
+    deadline: Option<Instant>
+  ) -> ReadTransfer ! ByteIoError ? &mut ByteDuplex | &mut MonotonicClock
+
+  /// The provider write. It sends bytes from the start of `input` and returns their count.
+  unsafe effect fn writeSomeRaw(
+    input: &[u8],
+    deadline: Option<Instant>
+  ) -> usize ! ByteIoError ? &mut ByteDuplex | &mut MonotonicClock
+
+  /// The provider vectored write. It sends bytes from the slices of `inputs`, in order, as if they
+  /// were one slice, and returns their count. The safe wrapper calls it only when the slices hold
+  /// at least one byte.
+  ///
+  /// # Details
+  ///
+  /// A provider can send several slices in one operation, such as one `writev` system call. A
+  /// provider with no such operation writes [`ByteDuplex.firstNonEmpty`] with its own write.
+  unsafe effect fn writeSomeVectoredRaw(
+    inputs: &[&[u8]],
+    deadline: Option<Instant>
+  ) -> usize ! ByteIoError ? &mut ByteDuplex | &mut MonotonicClock
+
+  /// The provider flush. It sends any bytes that the provider holds in a buffer.
+  unsafe effect fn flushRaw(
+    deadline: Option<Instant>
+  ) -> () ! ByteIoError ? &mut ByteDuplex | &mut MonotonicClock
+
+  /// The provider close of the write direction. The safe wrapper flushes before it calls this.
+  unsafe effect fn shutdownWriteRaw(
+    deadline: Option<Instant>
+  ) -> () ! ByteIoError ? &mut ByteDuplex | &mut MonotonicClock
+
+  /// The provider close of the whole transport. After the first call, the provider stays closed,
+  /// and a later call must succeed and do nothing.
+  unsafe effect fn closeRaw() -> () ! ByteIoError ? &mut ByteDuplex with Intrinsic.nonParking()
+}
+
+impl ByteDuplex {
+  /// Reads at least one byte into the start of `output`, or returns `ReadTransfer.End` if the peer
+  /// ended the stream.
+  ///
+  /// # Details
+  ///
+  /// An empty `output` returns a count of 0 and does not use the provider. `deadline` is an
+  /// absolute time on the active `MonotonicClock`. `Option.none()` means no time limit.
+  ///
+  /// # Errors
+  ///
+  /// - `ByteIoError.Timeout` if the deadline passes.
+  /// - `ByteIoError.InvalidTransferCount` if the provider reports 0 or more than `output.length`.
+  ///   The transport is closed, also if the close fails.
+  /// - `ByteIoError.Closed` or `ByteIoError.Provider` from the provider.
+  pub effect fn readSome(
+    output: &mut [u8],
+    deadline: Option<Instant>
+  ) -> ReadTransfer ! ByteIoError ? &mut ByteDuplex | &mut MonotonicClock {
+    if output.length == usize.ZERO { return ReadTransfer.Data {count: usize.ZERO} }
+    let limit = output.length
+    let transfer = run unsafe ByteDuplex.readSomeRaw(move output, move deadline)
+    match move transfer {
+      ReadTransfer.End => { return ReadTransfer.End }
+      ReadTransfer.Data {count} => {
+        if count == usize.ZERO || count > limit {
+          return run invalidReadCount(count, limit)
+        }
+        return ReadTransfer.Data {count: count}
+      }
+    }
+    return ReadTransfer.End
+  }
+
+  /// Writes at least one byte from the start of `input` and returns how many bytes it wrote.
+  ///
+  /// # Details
+  ///
+  /// An empty `input` returns 0 and does not use the provider. The bytes after the returned count
+  /// are not written. Call `writeSome` again with the rest. `deadline` is an absolute time on the
+  /// active `MonotonicClock`. `Option.none()` means no time limit.
+  ///
+  /// # Errors
+  ///
+  /// - `ByteIoError.Timeout` if the deadline passes.
+  /// - `ByteIoError.InvalidTransferCount` if the provider reports 0 or more than `input.length`.
+  ///   The transport is closed, also if the close fails.
+  /// - `ByteIoError.Closed` or `ByteIoError.Provider` from the provider.
+  pub effect fn writeSome(
+    input: &[u8],
+    deadline: Option<Instant>
+  ) -> usize ! ByteIoError ? &mut ByteDuplex | &mut MonotonicClock {
+    if input.length == usize.ZERO { return usize.ZERO }
+    let count = run unsafe ByteDuplex.writeSomeRaw(input, move deadline)
+    if count == usize.ZERO || count > input.length {
+      return run invalidWriteCount(count, input.length)
+    }
+    return count
+  }
+
+  /// Writes at least one byte from the slices of `inputs`, in order, as if they were one slice, and
+  /// returns how many bytes it wrote.
+  ///
+  /// # When to use
+  ///
+  /// Use it for a message that is in several parts, such as buffered bytes and a large body, so
+  /// that a provider such as a socket can send the parts in one operation without a copy.
+  ///
+  /// # Details
+  ///
+  /// The count can end inside any slice. The bytes after it are not written. When the slices hold
+  /// no bytes, it returns 0 and does not use the provider. `deadline` is an absolute time on the
+  /// active `MonotonicClock`. `Option.none()` means no time limit.
+  ///
+  /// # Errors
+  ///
+  /// - `ByteIoError.Timeout` if the deadline passes.
+  /// - `ByteIoError.InvalidTransferCount` if the provider reports 0 or more than the sum of the
+  ///   slice lengths. The transport is closed, also if the close fails.
+  /// - `ByteIoError.Closed` or `ByteIoError.Provider` from the provider.
+  pub effect fn writeSomeVectored(
+    inputs: &[&[u8]],
+    deadline: Option<Instant>
+  ) -> usize ! ByteIoError ? &mut ByteDuplex | &mut MonotonicClock {
+    let mut total = usize.ZERO
+    let mut index = usize.ZERO
+    while index < inputs.length {
+      total = usize.saturatingAdd(total, inputs[index].length)
+      index = index + usize.ONE
+    }
+    if total == usize.ZERO { return usize.ZERO }
+    let count = run unsafe ByteDuplex.writeSomeVectoredRaw(inputs, move deadline)
+    if count == usize.ZERO || count > total {
+      return run invalidWriteCount(count, total)
+    }
+    return count
+  }
+
+  /// Returns the first slice of `inputs` that is not empty, or an empty slice.
+  ///
+  /// # When to use
+  ///
+  /// Use it to implement `writeSomeVectoredRaw` in a provider that has no faster way to write
+  /// several slices: write the returned slice with the provider's own write. A partial write of
+  /// the first part is a valid vectored write.
+  pub fn firstNonEmpty<'a>(inputs: &[&'a [u8]]) -> &'a [u8] {
+    let mut index = usize.ZERO
+    while index < inputs.length {
+      if inputs[index].length != usize.ZERO { return inputs[index] }
+      index = index + usize.ONE
+    }
+    return b""
+  }
+
+  /// Sends any bytes that the provider holds in a buffer.
+  ///
+  /// # Errors
+  ///
+  /// - `ByteIoError` from the provider, or `Timeout` if the deadline passes.
+  pub effect fn flush(
+    deadline: Option<Instant>
+  ) -> () ! ByteIoError ? &mut ByteDuplex | &mut MonotonicClock {
+    return run unsafe ByteDuplex.flushRaw(move deadline)
+  }
+
+  /// Flushes and then closes the write direction. Reads still work.
+  ///
+  /// # When to use
+  ///
+  /// Use it to tell the peer that no more data comes, while you still read its answer.
+  ///
+  /// # Errors
+  ///
+  /// - `ByteIoError` from the flush or the shutdown, or `Timeout` if the deadline passes.
+  pub effect fn shutdownWrite(
+    deadline: Option<Instant>
+  ) -> () ! ByteIoError ? &mut ByteDuplex | &mut MonotonicClock {
+    run ByteDuplex.flush(copyDeadline(&deadline))
+    return run unsafe ByteDuplex.shutdownWriteRaw(move deadline)
+  }
+
+  /// Closes the whole transport. A later call does nothing.
+  ///
+  /// # Errors
+  ///
+  /// - `ByteIoError` from the provider. The transport is closed also when the close reports an
+  ///   error.
+  pub effect fn close() -> () ! ByteIoError ? &mut ByteDuplex {
+    return run unsafe ByteDuplex.closeRaw()
+  }
+
+  /// Returns `ByteIoError.Timeout` for `operation`. Providers use it.
+  pub fn timeout(operation: ByteIoOperation) -> ByteIoError {
+    return ByteIoError.Timeout {operation: move operation}
+  }
+
+  /// Returns `ByteIoError.InvalidTransferCount` with the reported `count` and the slice length
+  /// `limit`.
+  pub fn invalidTransferCount(
+    operation: ByteIoOperation,
+    count: usize,
+    limit: usize,
+  ) -> ByteIoError {
+    return ByteIoError.InvalidTransferCount {
+      operation: move operation,
+      count: count,
+      limit: limit,
+    }
+  }
+
+  /// Returns `ByteIoError.Closed` for `operation`. Providers use it.
+  pub fn closed(operation: ByteIoOperation) -> ByteIoError {
+    return ByteIoError.Closed {operation: move operation}
+  }
+
+  /// Returns `ByteIoError.Provider` for `operation` with a provider-defined `code`.
+  pub fn provider(operation: ByteIoOperation, code: i32) -> ByteIoError {
+    return ByteIoError.Provider {operation: move operation, code: code}
+  }
+}
+
+effect fn invalidReadCount(count: usize, limit: usize) -> ReadTransfer
+! ByteIoError
+? &mut ByteDuplex {
+  let closed = run Effect.result(ByteDuplex.close())
+  drop closed
+  fail ByteDuplex.invalidTransferCount(ByteIoOperation.Read, count, limit)
+}
+
+effect fn invalidWriteCount(count: usize, limit: usize) -> usize
+! ByteIoError
+? &mut ByteDuplex {
+  let closed = run Effect.result(ByteDuplex.close())
+  drop closed
+  fail ByteDuplex.invalidTransferCount(ByteIoOperation.Write, count, limit)
+}
+
+fn copyInstant(value: &Instant) -> Instant {
+  return SystemClock.make(SystemClock.seconds(value), SystemClock.nanoseconds(value))
+}
+
+fn copyDeadline(value: &Option<Instant>) -> Option<Instant> {
+  return match &value.* {
+    Option<Instant>.None => Option<Instant>.none()
+    Option<Instant>.Some {value: present} => Option<Instant>.some(copyInstant(&present))
+  }
+}

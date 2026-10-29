@@ -1,0 +1,930 @@
+//! A simple HTTP client: send a request, and get the whole response in memory.
+//!
+//! # When to use
+//! Use [`Http`] to call web APIs. Code that sends requests requires `? &mut Http`. The program
+//! gives a provider one time, near `main`: `NativeHttp` from `silk.http.client_native` for real
+//! requests, or a fake in tests. Use `silk.http.exchange` to stream bodies or to control the
+//! connection.
+//!
+//! # Details
+//! Build a [`Request`] with chained calls, such as `Request.get("/repos").query("page",
+//! "2").bearer(token)`. Building never allocates and never fails. [`Http.send`] checks the request.
+//! A response with any status, also 4xx and 5xx, is a [`Response`]. Call [`Response.expectOk`] to
+//! make a status outside 200 to 299 an error.
+//!
+//! # Errors
+//! - [`HttpError`] for all failures. Its `kind` tells what failed, `status` has the response status
+//!   if one arrived, and `cause` keeps the error from the lower module.
+//! - `OutOfMemoryError` if the `Allocator` fails.
+//!
+//! # Gotchas
+//! A request holds at most 8 path segments, 16 query parameters, and 32 headers. More fail at send
+//! time with `InvalidRequest`. [`Request.json`] writes only the fields that are visible from your
+//! module. Fields that are private to another module are not written.
+//!
+//! # Examples
+//! ## Test code that uses Http with a fake provider
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.http.client { Http, HttpError, Request, Response }
+//! import silk.text.string { String }
+//!
+//! struct FakeHttp {
+//!   calls: i32,
+//! }
+//!
+//! impl Http for FakeHttp {
+//!   effect fn send(self: &mut Self, request: Request) -> Response
+//!     ! HttpError | OutOfMemoryError
+//!     ? &mut Allocator {
+//!     self.calls = self.calls + 1
+//!     let url = run request.resolveUrl("https://api.example.com")
+//!     if String.view(&url) == "https://api.example.com/search?q=a%20b" {
+//!       return run Response.make(200, b"found")
+//!     }
+//!     return run Response.make(404, b"")
+//!   }
+//! }
+//!
+//! // This function works with any provider.
+//! effect fn search() -> i32
+//!   ! HttpError | OutOfMemoryError
+//!   ? &mut Http | &mut Allocator {
+//!   let response = run Http.send(Request.get("/search").query("q", "a b"))
+//!   let checked = run response.expectOk()
+//!   let text = run checked.text()
+//!   if text != "found" {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//!
+//! pub effect fn main() -> i32
+//!   ! HttpError | OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let mut fake = FakeHttp { calls: 0 }
+//!   let code = run search() |> Effect.provideMut<Http>(&mut fake)
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   if fake.calls != 1 {
+//!     return 1
+//!   }
+//!   return code
+//! }
+//! ```
+//!
+//! @category HTTP
+
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.collections.bytes {Bytes}
+import silk.core.effect {Effect}
+import silk.text.format {Debug, Format, Formatter}
+import silk.http.message {Header, Method, OwnedResponseHead, ResponseHead, Status, ValueError, Version}
+import silk.http.exchange {ExchangeError, Limits as ExchangeLimits}
+import silk.http.headers {Headers, Limits as HeaderLimits}
+import silk.http.request {RequestError}
+import silk.tls.https_identity {IdentityError}
+import silk.json.codec {Deserialize}
+import silk.json.output {JsonOptions}
+import silk.json.reflect {JsonReflect}
+import silk.json.scanner {JsonError}
+import silk.json.value {Json, Value}
+import silk.core.option {Option}
+import silk.core.ownership {Copy}
+import silk.net.resolver {ResolverError}
+import silk.core.result {Result}
+import silk.collections.slice {Slice}
+import silk.text.string {InvalidUtf8, String}
+import silk.tls.connection {ConnectionError}
+import silk.tls.trust_snapshot {TrustSourceError}
+import silk.uri.percent {PercentComponent, UriPercent}
+import silk.uri.reference {ParseError as UriError}
+import silk.num.usize
+import silk.io.writer {Writer, WriterError}
+
+/// The maximum number of path segments in a request.
+pub const MAX_PATH_SEGMENTS: usize = 8
+/// The maximum number of query parameters in a request.
+pub const MAX_QUERY_PARAMETERS: usize = 16
+/// The maximum number of headers that you add to a request.
+pub const MAX_HEADERS: usize = 32
+
+/// What kind of failure an [`HttpError`] reports.
+pub enum HttpErrorKind {
+  /// The URL is not valid, has user information, or its scheme is not `http` or `https`.
+  InvalidUrl,
+  /// A method or a header is not valid, or the request has too many parts.
+  InvalidRequest,
+  /// The request body could not be encoded.
+  Encode,
+  /// Name resolution or the TCP connection failed.
+  Connect,
+  /// TLS negotiation, certificate validation, or the trust store failed.
+  Tls,
+  /// The request deadline passed.
+  Timeout,
+  /// The response broke the HTTP rules or a limit.
+  Protocol,
+  /// The response body exceeded the configured limit.
+  TooLarge,
+  /// A redirect is not valid, is not safe, or there were too many redirects.
+  Redirect,
+  /// The status is not from 200 to 299, and [`Response.expectOk`] or the provider rejects it.
+  Status,
+  /// The response body could not be decoded as requested.
+  Decode,
+}
+
+impl Debug for HttpErrorKind {
+  /// Writes the name of the variant, such as `InvalidUrl`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      HttpErrorKind.InvalidUrl => run Format.write(&mut formatter, b"InvalidUrl")
+      HttpErrorKind.InvalidRequest => run Format.write(&mut formatter, b"InvalidRequest")
+      HttpErrorKind.Encode => run Format.write(&mut formatter, b"Encode")
+      HttpErrorKind.Connect => run Format.write(&mut formatter, b"Connect")
+      HttpErrorKind.Tls => run Format.write(&mut formatter, b"Tls")
+      HttpErrorKind.Timeout => run Format.write(&mut formatter, b"Timeout")
+      HttpErrorKind.Protocol => run Format.write(&mut formatter, b"Protocol")
+      HttpErrorKind.TooLarge => run Format.write(&mut formatter, b"TooLarge")
+      HttpErrorKind.Redirect => run Format.write(&mut formatter, b"Redirect")
+      HttpErrorKind.Status => run Format.write(&mut formatter, b"Status")
+      HttpErrorKind.Decode => run Format.write(&mut formatter, b"Decode")
+    }
+  }
+}
+
+/// The lower-level error behind an [`HttpError`], kept for code that needs the detail.
+pub union HttpCause {
+  /// No lower-level error.
+  None,
+  /// An HTTP host interface failed with a provider-specific error code.
+  Provider {
+    /// The host interface identifying the code's domain.
+    pub provider: string<'static>,
+    /// The host's error code, such as a WASI HTTP error variant ordinal.
+    pub code: u32,
+  },
+  /// URL parsing failed.
+  Uri {
+    /// The parser failure.
+    pub error: UriError,
+  },
+  /// A header or status value was invalid.
+  Value {
+    /// The value failure.
+    pub error: ValueError,
+  },
+  /// Request preparation failed.
+  Request {
+    /// The preparation failure.
+    pub error: RequestError,
+  },
+  /// The HTTP exchange failed.
+  Exchange {
+    /// The exchange failure.
+    pub error: ExchangeError,
+  },
+  /// Name resolution failed.
+  Resolver {
+    /// The resolver failure.
+    pub error: ResolverError,
+  },
+  /// TLS negotiation or certificate validation failed.
+  Tls {
+    /// The connection failure.
+    pub error: ConnectionError,
+  },
+  /// The server certificate identity could not be checked.
+  Identity {
+    /// The identity failure.
+    pub error: IdentityError,
+  },
+  /// The trust store could not be loaded.
+  Trust {
+    /// The trust source failure.
+    pub error: TrustSourceError,
+  },
+  /// JSON encoding or decoding failed.
+  Json {
+    /// The JSON failure.
+    pub error: JsonError,
+  },
+  /// The body was not valid UTF-8.
+  Utf8 {
+    /// The decoding failure.
+    pub error: InvalidUtf8,
+  },
+}
+
+impl Debug for HttpCause {
+  /// Writes the name of the variant and its fields, such as `None`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      HttpCause.None => run Format.write(&mut formatter, b"None")
+      HttpCause.Provider {provider, code} => {
+        let mut record = run Format.debugRecord("Provider", &mut formatter)
+        run Format.debugField(&mut record, "provider", &provider, &mut formatter)
+        run Format.debugField(&mut record, "code", &code, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      HttpCause.Uri { error } => {
+        let mut record = run Format.debugRecord("Uri", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      HttpCause.Value { error } => {
+        let mut record = run Format.debugRecord("Value", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      HttpCause.Request { error } => {
+        let mut record = run Format.debugRecord("Request", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      HttpCause.Exchange { error } => {
+        let mut record = run Format.debugRecord("Exchange", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      HttpCause.Resolver { error } => {
+        let mut record = run Format.debugRecord("Resolver", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      HttpCause.Tls { error } => {
+        let mut record = run Format.debugRecord("Tls", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      HttpCause.Identity { error } => {
+        let mut record = run Format.debugRecord("Identity", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      HttpCause.Trust { error } => {
+        let mut record = run Format.debugRecord("Trust", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      HttpCause.Json { error } => {
+        let mut record = run Format.debugRecord("Json", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      HttpCause.Utf8 { error } => {
+        let mut record = run Format.debugRecord("Utf8", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+    }
+  }
+}
+
+/// One HTTP client failure.
+///
+/// # Details
+///
+/// `kind` tells what failed, `status` has the response status if one arrived, and `cause` keeps
+/// the error from the lower module.
+pub struct HttpError {
+  /// What went wrong.
+  pub kind: HttpErrorKind,
+  /// A short description for people.
+  pub message: string<'static>,
+  /// The response status, when a response arrived.
+  pub status: Option<u16>,
+  /// The lower-level error, when there is one.
+  pub cause: HttpCause,
+}
+
+impl Debug for HttpError {
+  /// Writes the fields, as `HttpError { kind: ..., message: ..., ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return run Format.debugFields(self, "HttpError", &mut formatter)
+  }
+}
+
+impl HttpError {
+  /// Makes an error with no status and no lower-level cause.
+  pub fn make(kind: HttpErrorKind, message: string<'static>) -> HttpError {
+    return HttpError {kind: kind, message: message, status: Option<u16>.none(), cause: HttpCause.None}
+  }
+
+  /// Makes an error that keeps a lower-level cause.
+  pub fn caused(kind: HttpErrorKind, message: string<'static>, cause: HttpCause) -> HttpError {
+    return HttpError {kind: kind, message: message, status: Option<u16>.none(), cause: move cause}
+  }
+}
+
+/// One query parameter or header as given to a [`Request`].
+pub struct Field<'a> {
+  /// The parameter or header name.
+  pub name: string<'a>,
+  /// The parameter or header value.
+  pub value: string<'a>,
+}
+
+impl<'a> Copy for Field<'a> {}
+
+/// The request payload and its media type.
+pub union Body<'a> {
+  /// No payload.
+  Empty,
+  /// Borrowed payload bytes.
+  Borrowed {
+    /// The payload.
+    pub data: &'a [u8],
+    /// The `Content-Type` value.
+    pub contentType: string<'a>,
+  },
+  /// Owned payload bytes, such as encoded JSON.
+  Owned {
+    /// The payload.
+    pub data: Bytes,
+    /// The `Content-Type` value.
+    pub contentType: string<'static>,
+  },
+}
+
+/// An HTTP request that you build with chained calls. Nothing is checked or sent until
+/// [`Http.send`].
+///
+/// # Details
+///
+/// Build it with chained calls, such as `Request.get("/repos").query("page", "2").bearer(token)`.
+/// Nothing is checked until [`Http.send`]. Only [`Request.json`] allocates.
+///
+/// # Gotchas
+///
+/// A request holds at most 8 path segments, 16 query parameters, and 32 headers. More fail at send
+/// time with `InvalidRequest`. [`Request.json`] writes only the fields that are visible from your
+/// module.
+pub struct Request<'a> {
+  methodValue: Method<'static>,
+  urlValue: string<'a>,
+  pathValues: [string<'a>; 8],
+  pathCount: usize,
+  queryValues: [Field<'a>; 16],
+  queryCount: usize,
+  headerValues: [Field<'a>; 32],
+  headerCount: usize,
+  overflowValue: bool,
+  bodyValue: Body<'a>,
+  timeoutValue: Option<u64>,
+  maxBodyValue: Option<usize>,
+  redirectValue: Option<usize>,
+  bearerValue: Option<string<'a>>,
+}
+
+impl<'a> Request<'a> {
+  /// Starts a request with an explicit method.
+  pub fn make(method: Method<'static>, url: string<'a>) -> Request<'a> {
+    let empty = Field<'a> {name: "", value: ""}
+    return Request<'a> {
+      methodValue: method,
+      urlValue: url,
+      pathValues: [
+        "", "", "", "", "", "", "", "",
+      ],
+      pathCount: usize.ZERO,
+      queryValues: [
+        empty, empty, empty, empty, empty, empty, empty, empty,
+        empty, empty, empty, empty, empty, empty, empty, empty,
+      ],
+      queryCount: usize.ZERO,
+      headerValues: [
+        empty, empty, empty, empty, empty, empty, empty, empty,
+        empty, empty, empty, empty, empty, empty, empty, empty,
+        empty, empty, empty, empty, empty, empty, empty, empty,
+        empty, empty, empty, empty, empty, empty, empty, empty,
+      ],
+      headerCount: usize.ZERO,
+      overflowValue: false,
+      bodyValue: Body<'a>.Empty,
+      timeoutValue: Option<u64>.none(),
+      maxBodyValue: Option<usize>.none(),
+      redirectValue: Option<usize>.none(),
+      bearerValue: Option<string<'a>>.none(),
+    }
+  }
+
+  /// Starts a GET request.
+  pub fn get(url: string<'a>) -> Request<'a> { return Request<'a>.make(Method.get(), url) }
+  /// Starts a POST request.
+  pub fn post(url: string<'a>) -> Request<'a> { return Request<'a>.make(Method.post(), url) }
+  /// Starts a PUT request.
+  pub fn put(url: string<'a>) -> Request<'a> { return Request<'a>.make(Method.put(), url) }
+  /// Starts a PATCH request.
+  pub fn patch(url: string<'a>) -> Request<'a> { return Request<'a>.make(Method.patch(), url) }
+  /// Starts a DELETE request.
+  pub fn delete(url: string<'a>) -> Request<'a> { return Request<'a>.make(Method.delete(), url) }
+  /// Starts a HEAD request.
+  pub fn head(url: string<'a>) -> Request<'a> { return Request<'a>.make(Method.head(), url) }
+  /// Starts an OPTIONS request.
+  pub fn options(url: string<'a>) -> Request<'a> { return Request<'a>.make(Method.options(), url) }
+
+  /// Adds `segment` to the end of the URL path, as given, such as `"/repos"`.
+  pub fn path(self: Self, segment: string<'a>) -> Request<'a> {
+    let mut next = move self
+    if next.pathCount == MAX_PATH_SEGMENTS {
+      next.overflowValue = true
+      return move next
+    }
+    next.pathValues[next.pathCount] = segment
+    next.pathCount = next.pathCount + usize.ONE
+    return move next
+  }
+
+  /// Adds a query parameter. The name and the value are percent-encoded when the request is sent.
+  pub fn query(self: Self, name: string<'a>, value: string<'a>) -> Request<'a> {
+    let mut next = move self
+    if next.queryCount == MAX_QUERY_PARAMETERS {
+      next.overflowValue = true
+      return move next
+    }
+    next.queryValues[next.queryCount] = Field<'a> {name: name, value: value}
+    next.queryCount = next.queryCount + usize.ONE
+    return move next
+  }
+
+  /// Adds a header. The name and value are validated when the request is sent.
+  ///
+  /// # Details
+  ///
+  /// `User-Agent`, `Accept`, `Authorization`, and `Host` replace the generated values.
+  /// `Content-Length` and `Transfer-Encoding` are generated from the body and are rejected.
+  pub fn header(self: Self, name: string<'a>, value: string<'a>) -> Request<'a> {
+    let mut next = move self
+    if next.headerCount == MAX_HEADERS {
+      next.overflowValue = true
+      return move next
+    }
+    next.headerValues[next.headerCount] = Field<'a> {name: name, value: value}
+    next.headerCount = next.headerCount + usize.ONE
+    return move next
+  }
+
+  /// Sets `Authorization: Bearer <token>`, replacing any `Authorization` header.
+  pub fn bearer(self: Self, token: string<'a>) -> Request<'a> {
+    let mut next = move self
+    next.bearerValue = Option<string<'a>>.some(token)
+    return move next
+  }
+
+  /// Sends borrowed bytes with an explicit `Content-Type`.
+  pub fn bytes(self: Self, data: &'a [u8], contentType: string<'a>) -> Request<'a> {
+    let mut next = move self
+    next.bodyValue = Body<'a>.Borrowed {data: data, contentType: contentType}
+    return move next
+  }
+
+  /// Sends UTF-8 text as `text/plain; charset=utf-8`.
+  pub fn text(self: Self, text: string<'a>) -> Request<'a> {
+    let mut next = move self
+    next.bodyValue = Body<'a>.Borrowed {data: String.utf8Bytes(text), contentType: "text/plain; charset=utf-8"}
+    return move next
+  }
+
+  /// Serializes the visible fields of `value` as compact JSON and sends it as `application/json`.
+  ///
+  /// # Details
+  ///
+  /// `value` is a named or anonymous struct, such as `&.{ title: "Water plants" }`. Its fields are
+  /// written in declaration order through their `Serialize` witnesses. The bytes are allocated
+  /// from the ambient allocator.
+  ///
+  /// # Gotchas
+  ///
+  /// Fields that are private to another module are not written.
+  pub effect fn json<T>(self: Self, value: &T) -> Request<'a>
+  ! HttpError | OutOfMemoryError
+  ? &mut Allocator {
+    let data = run encodeJson<T>(value)
+    let mut next = move self
+    next.bodyValue = Body<'a>.Owned {data: move data, contentType: "application/json"}
+    return move next
+  }
+
+  /// Sets the deadline of this request, in place of the default of the provider.
+  pub fn timeoutSeconds(self: Self, seconds: u64) -> Request<'a> {
+    let mut next = move self
+    next.timeoutValue = Option<u64>.some(seconds)
+    return move next
+  }
+
+  /// Sets the maximum size of the response body, in place of the default of the provider.
+  pub fn maxBodyBytes(self: Self, limit: usize) -> Request<'a> {
+    let mut next = move self
+    next.maxBodyValue = Option<usize>.some(limit)
+    return move next
+  }
+
+  /// Sets the maximum number of redirects to follow. With 0, a redirect response is returned as it
+  /// is.
+  pub fn maxRedirects(self: Self, hops: usize) -> Request<'a> {
+    let mut next = move self
+    next.redirectValue = Option<usize>.some(hops)
+    return move next
+  }
+
+  /// Returns the request method.
+  pub fn method(self: &Self) -> Method<'static> { return self.methodValue }
+
+  /// Returns the URL exactly as given, before path segments and query parameters.
+  pub fn url(self: &Self) -> string<'a> { return self.urlValue }
+
+  /// Returns the path segments in the order they were added.
+  pub fn paths(self: &Self) -> &[string<'a>] {
+    return Slice.view<string<'a>>(&self.pathValues, usize.ZERO, self.pathCount)
+  }
+
+  /// Returns the query parameters in the order they were added.
+  pub fn queryParameters(self: &Self) -> &[Field<'a>] {
+    return Slice.view<Field<'a>>(&self.queryValues, usize.ZERO, self.queryCount)
+  }
+
+  /// Returns the headers in the order they were added.
+  pub fn headers(self: &Self) -> &[Field<'a>] {
+    return Slice.view<Field<'a>>(&self.headerValues, usize.ZERO, self.headerCount)
+  }
+
+  /// Returns the payload bytes, empty when there is no body.
+  pub fn bodyBytes(self: &Self) -> &[u8] {
+    return match & self.bodyValue {
+      Body.Empty => b""
+      Body.Borrowed {data, contentType} => data
+      Body.Owned {data, contentType} => Bytes.asSlice(&data)
+    }
+  }
+
+  /// Returns the payload's `Content-Type`, when there is a body.
+  pub fn contentType(self: &Self) -> Option<string<'a>> {
+    return match & self.bodyValue {
+      Body.Empty => Option<string<'a>>.none()
+      Body.Borrowed {data, contentType} => Option<string<'a>>.some(contentType)
+      Body.Owned {data, contentType} => Option<string<'a>>.some(contentType)
+    }
+  }
+
+  /// Returns whether the request has a body.
+  pub fn hasBody(self: &Self) -> bool {
+    return match & self.bodyValue {
+      Body.Empty => false
+      _ => true
+    }
+  }
+
+  /// Returns `true` if the request has more parts than it can hold. [`Http.send`] then fails with
+  /// `InvalidRequest`.
+  pub fn overflowed(self: &Self) -> bool { return self.overflowValue }
+
+  /// Returns the per-request timeout in seconds, when set.
+  pub fn timeout(self: &Self) -> Option<u64> {
+    return match & self.timeoutValue {
+      Option.None => Option<u64>.none()
+      Option.Some {value} => Option<u64>.some(value)
+    }
+  }
+
+  /// Returns the per-request response body limit, when set.
+  pub fn maxBody(self: &Self) -> Option<usize> { return copySize(&self.maxBodyValue) }
+
+  /// Returns the bearer token, when set.
+  pub fn bearerToken(self: &Self) -> Option<string<'a>> {
+    return match & self.bearerValue {
+      Option.None => Option<string<'a>>.none()
+      Option.Some {value} => Option<string<'a>>.some(value)
+    }
+  }
+
+  /// Returns the per-request redirect limit, when set.
+  pub fn redirects(self: &Self) -> Option<usize> { return copySize(&self.redirectValue) }
+
+  /// Returns the full URL: `base` if the URL has no scheme, then the URL, the path segments, and
+  /// the percent-encoded query parameters.
+  pub effect fn resolveUrl(self: &Self, base: string) -> String ! OutOfMemoryError ? &mut Allocator {
+    let mut output = Bytes.make()
+    if !hasScheme(self.urlValue) {
+      run Bytes.append(&mut output, String.utf8Bytes(base))
+    }
+    run Bytes.append(&mut output, String.utf8Bytes(self.urlValue))
+    let mut index = usize.ZERO
+    while index < self.pathCount {
+      run Bytes.append(&mut output, String.utf8Bytes(self.pathValues[index]))
+      index = index + usize.ONE
+    }
+    let mut separator: u8 = 63
+    if containsByte(Bytes.asSlice(&output), 63) { separator = 38 }
+    index = usize.ZERO
+    while index < self.queryCount {
+      let field = self.queryValues[index]
+      let mark = [separator]
+      run Bytes.append(&mut output, &mark)
+      run UriPercent.appendEncoded(&mut output, String.utf8Bytes(field.name), PercentComponent.Unreserved)
+      run Bytes.append(&mut output, b"=")
+      run UriPercent.appendEncoded(&mut output, String.utf8Bytes(field.value), PercentComponent.Unreserved)
+      separator = 38
+      index = index + usize.ONE
+    }
+    // Every appended byte is UTF-8 from a string or ASCII from the percent encoder.
+    return unsafe String.fromBytesUnchecked(move output)
+  }
+}
+
+/// A complete response: status, headers, and the whole body in memory.
+///
+/// # Details
+///
+/// A response with any status, also 4xx and 5xx, is a `Response`. Call [`Response.expectOk`] to
+/// make a status outside 200 to 299 an error.
+pub struct Response {
+  headValue: OwnedResponseHead,
+  bodyValue: Bytes,
+  urlValue: String,
+}
+
+impl Response {
+  /// Makes a response from a head, a body, and the final URL. Providers use it.
+  pub fn fromParts(head: OwnedResponseHead, body: Bytes, url: String) -> Response {
+    return Response {headValue: move head, bodyValue: move body, urlValue: move url}
+  }
+
+  /// Makes a response with no headers, for fake providers in tests.
+  pub effect fn make(status: u16, body: &[u8]) -> Response
+  ! HttpError | OutOfMemoryError
+  ? &mut Allocator {
+    let empty: [Header<'static>; 0] = []
+    return run Response.withHeaders(status, &empty, body)
+  }
+
+  /// Makes a response with headers, for fake providers in tests.
+  pub effect fn withHeaders(status: u16, headers: &[Header], body: &[u8]) -> Response
+  ! HttpError | OutOfMemoryError
+  ? &mut Allocator {
+    let limits = ExchangeLimits.defaults().head.values
+    let code = match move Status.fromCode(status) {
+      Result.Success {value} => move value
+      Result.Failure {error} => { fail valueFailure(HttpErrorKind.InvalidRequest, "Invalid response status.", move error) }
+    }
+    let fields = match move Headers.make(headers, limits) {
+      Result.Success {value} => move value
+      Result.Failure {error} => { fail valueFailure(HttpErrorKind.InvalidRequest, "Invalid response headers.", move error) }
+    }
+    let head = match move ResponseHead.make(Version.Http11, move code, Option<&[u8]>.none(), fields, limits) {
+      Result.Success {value} => move value
+      Result.Failure {error} => { fail valueFailure(HttpErrorKind.InvalidRequest, "Invalid response head.", move error) }
+    }
+    let owned = match move run head.copy(limits) {
+      Result.Success {value} => move value
+      Result.Failure {error} => { fail valueFailure(HttpErrorKind.InvalidRequest, "Invalid response head.", move error) }
+    }
+    let data = run Bytes.copy(body)
+    return Response {headValue: move owned, bodyValue: move data, urlValue: String.make()}
+  }
+
+  /// Returns the status code, such as 200 or 404.
+  pub fn status(self: &Self) -> u16 {
+    let head = self.headValue.view()
+    let code = head.status()
+    return code.code()
+  }
+
+  /// Returns `true` if the status is from 200 to 299.
+  pub fn ok(self: &Self) -> bool {
+    let code = self.status()
+    return code >= 200 && code <= 299
+  }
+
+  /// Returns the value of the first header with this name, compared without case.
+  pub fn header<'r>(self: &'r Self, name: string) -> Option<&'r [u8]> {
+    let head = self.headValue.view()
+    let fields = head.headers()
+    return match move fields.getFirst(name) {
+      Option.None => Option<&'r [u8]>.none()
+      Option.Some {value} => Option<&'r [u8]>.some(Header.value(&value))
+    }
+  }
+
+  /// Returns the response head with every header.
+  pub fn head<'r>(self: &'r Self) -> ResponseHead<'r> { return self.headValue.view() }
+
+  /// Returns the body bytes.
+  pub fn body(self: &Self) -> &[u8] { return Bytes.asSlice(&self.bodyValue) }
+
+  /// Moves the body out of the response.
+  pub fn intoBody(self: Self) -> Bytes {
+    let Response {headValue, bodyValue, urlValue} = move self
+    drop headValue
+    drop urlValue
+    return move bodyValue
+  }
+
+  /// Returns the URL of the response, after redirects. It is empty for a response from
+  /// [`Response.make`].
+  pub fn url(self: &Self) -> string { return String.view(&self.urlValue) }
+
+  /// Returns the body as text. Fails with `Decode` if the body is not valid UTF-8.
+  pub effect fn text(self: &Self) -> string ! HttpError {
+    return match move String.fromUtf8(Bytes.asSlice(&self.bodyValue)) {
+      Result.Success {value} => move value
+      Result.Failure {error} => {
+        fail HttpError.caused(HttpErrorKind.Decode, "Response body is not UTF-8.", HttpCause.Utf8 {error: move error})
+      }
+    }
+  }
+
+  /// Parses the body as one JSON document. Fails with `Decode` if it is not valid JSON.
+  pub effect fn json(self: &Self) -> Value ! HttpError | OutOfMemoryError ? &mut Allocator {
+    let parsed = run Effect.result(Json.parse(Bytes.asSlice(&self.bodyValue)))
+    return match move parsed {
+      Result.Success {value} => move value
+      Result.Failure {error} => match move error {
+        JsonError failure => { fail jsonFailure("Response body is not valid JSON.", move failure) }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+  }
+
+  /// Decodes the body as one JSON document of type `T`. Fails with `Decode` if it does not match.
+  pub effect fn decode<T: Deserialize>(self: &Self) -> T ! HttpError | OutOfMemoryError ? &mut Allocator {
+    let decoded = run Effect.result(Json.deserialize<T>(Bytes.asSlice(&self.bodyValue)))
+    return match move decoded {
+      Result.Success {value} => move value
+      Result.Failure {error} => match move error {
+        JsonError failure => { fail jsonFailure("Response body does not match the expected JSON.", move failure) }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+  }
+
+  /// Returns the response if its status is from 200 to 299. Otherwise fails with a `Status` error
+  /// that has the status.
+  pub effect fn expectOk(self: Self) -> Response ! HttpError {
+    if self.ok() { return move self }
+    let code = self.status()
+    drop self
+    fail HttpError {
+      kind: HttpErrorKind.Status,
+      message: "The server answered with a non-2xx status.",
+      status: Option<u16>.some(code),
+      cause: HttpCause.None,
+    }
+  }
+}
+
+/// The service that sends HTTP requests.
+///
+/// # Details
+/// The provider decides how requests travel. `NativeHttp` in `silk.http.client_native` uses sockets
+/// and TLS, and a test provider can return fixed responses. A provider can also wrap another
+/// provider, for example to add headers, logs, or retries, and forward with
+/// `Effect.provideMut<Http>`.
+///
+/// # When to use
+///
+/// Use it to call web APIs. Code that sends requests requires `? &mut Http`. The program gives a
+/// provider one time, near `main`: `NativeHttp` from `silk.http.client_native` for real requests,
+/// or a fake in tests. Use `silk.http.exchange` to stream bodies or to control the connection.
+pub service Http {
+  /// Sends one request and returns the complete response, whatever its status.
+  ///
+  /// # Details
+  ///
+  /// It checks the request first. A response with a 4xx or 5xx status is a success. Call
+  /// `Response.expectOk` to make it an error.
+  ///
+  /// # Errors
+  ///
+  /// - `HttpError` for all failures. Its `kind` tells what failed, `status` has the response
+  ///   status if one arrived, and `cause` keeps the error from the lower module. A request with
+  ///   more than 8 path segments, 16 query parameters, or 32 headers fails with
+  ///   `InvalidRequest`.
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  effect fn send(request: Request) -> Response ! HttpError | OutOfMemoryError ? &mut Http | &mut Allocator
+}
+
+impl Http {
+  /// Sends a GET request to `url`.
+  pub effect fn get(url: string) -> Response ! HttpError | OutOfMemoryError ? &mut Http | &mut Allocator {
+    return run Http.send(Request.get(url))
+  }
+
+  /// Sends `value` as JSON in a POST request to `url`.
+  pub effect fn postJson<T>(url: string, value: &T) -> Response
+  ! HttpError | OutOfMemoryError
+  ? &mut Http | &mut Allocator {
+    let request = run Request.post(url).json<T>(value)
+    return run Http.send(move request)
+  }
+}
+
+fn copySize(value: &Option<usize>) -> Option<usize> {
+  return match & value.* {
+    Option.None => Option<usize>.none()
+    Option.Some {value: present} => Option<usize>.some(present)
+  }
+}
+
+fn hasScheme(url: string) -> bool {
+  let bytes = String.utf8Bytes(url)
+  let mut index = usize.ZERO
+  while index < bytes.length {
+    let value = bytes[index]
+    if value == 58 { return index > usize.ZERO }
+    let letter = (value >= 65 && value <= 90) || (value >= 97 && value <= 122)
+    let other = index > usize.ZERO && ((value >= 48 && value <= 57) || value == 43 || value == 45 || value == 46)
+    if !letter && !other { return false }
+    index = index + usize.ONE
+  }
+  return false
+}
+
+fn containsByte(bytes: &[u8], wanted: u8) -> bool {
+  let mut index = usize.ZERO
+  while index < bytes.length {
+    if bytes[index] == wanted { return true }
+    index = index + usize.ONE
+  }
+  return false
+}
+
+fn valueFailure(kind: HttpErrorKind, message: string<'static>, error: ValueError) -> HttpError {
+  return HttpError.caused(kind, message, HttpCause.Value {error: move error})
+}
+
+fn jsonFailure(message: string<'static>, error: JsonError) -> HttpError {
+  return HttpError.caused(HttpErrorKind.Decode, message, HttpCause.Json {error: move error})
+}
+
+struct CountingWriter {
+  count: usize,
+}
+
+impl Writer for CountingWriter {
+  effect fn writeAll(self: &mut Self, bytes: &[u8]) -> () ! WriterError ? &mut Writer {
+    self.count = self.count + bytes.length
+  }
+  effect fn flush(self: &mut Self) -> () ! WriterError ? &mut Writer {
+    return ()
+  }
+}
+
+struct FillingWriter<'t> {
+  target: &'t mut [u8],
+  offset: usize,
+}
+
+impl<'t> FillingWriter<'t> {
+  effect fn fill(self: &mut Self, bytes: &[u8]) -> () ! WriterError {
+    if bytes.length > self.target.length - self.offset { fail Writer.failure() }
+    let mut index = usize.ZERO
+    while index < bytes.length {
+      self.target[self.offset + index] = bytes[index]
+      index = index + usize.ONE
+    }
+    self.offset = self.offset + bytes.length
+  }
+}
+
+impl<'t> Writer for FillingWriter<'t> {
+  effect fn writeAll(self: &mut Self, bytes: &[u8]) -> () ! WriterError ? &mut Writer {
+    return run self.fill(bytes)
+  }
+  effect fn flush(self: &mut Self) -> () ! WriterError ? &mut Writer {
+    return ()
+  }
+}
+
+effect fn writeJson<T>(value: &T) -> () ! JsonError | WriterError ? &mut Writer {
+  return run JsonReflect.write<T>(value, &JsonOptions.compact())
+}
+
+effect fn encodeJson<T>(value: &T) -> Bytes ! HttpError | OutOfMemoryError ? &mut Allocator {
+  // Measure first, then fill storage from the caller's allocator; serialization is deterministic.
+  let mut counter = CountingWriter {count: usize.ZERO}
+  let measured = run Effect.result(writeJson<T>(value) |> Effect.provideMut<Writer>(&mut counter))
+  if let Result.Failure {error} = move measured {
+    return run encodeFailure(move error)
+  }
+  let mut data = run Bytes.zeroed(counter.count)
+  let mut filler = FillingWriter {target: Bytes.asMutSlice(&mut data), offset: usize.ZERO}
+  let written = run Effect.result(writeJson<T>(value) |> Effect.provideMut<Writer>(&mut filler))
+  let complete = filler.offset == counter.count
+  drop filler
+  if let Result.Failure {error} = move written {
+    return run encodeFailure(move error)
+  }
+  if !complete { fail HttpError.make(HttpErrorKind.Encode, "JSON encoding changed between passes.") }
+  return move data
+}
+
+effect fn encodeFailure(error: JsonError | WriterError) -> never ! HttpError {
+  return match move error {
+    JsonError failure => {
+      fail HttpError.caused(HttpErrorKind.Encode, "Could not encode the JSON body.", HttpCause.Json {error: move failure})
+    }
+    WriterError failure => { fail HttpError.make(HttpErrorKind.Encode, "Could not encode the JSON body.") }
+  }
+}

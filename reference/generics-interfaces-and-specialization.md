@@ -1562,7 +1562,7 @@ of an operator whose left operand is a scalar:
 
 ```silk,ignore
 // geometry/Vector2.silk
-import silk.ops { Multiply }
+import silk.core.ops { Multiply }
 
 pub struct Vector2 { pub x: f64, pub y: f64 }
 
@@ -1695,8 +1695,8 @@ every member of that block, and each call proves them under the owner applicatio
 it proves the member's own bounds. A type may have several inherent blocks with different bounds.
 
 ```silk,ignore
-import silk.ownership { Copy }
-import silk.ops { Add, Multiply }
+import silk.core.ownership { Copy }
+import silk.core.ops { Add, Multiply }
 
 struct Vector2<T> { x: T, y: T }
 
@@ -1780,7 +1780,7 @@ allowed. The one exception is a bound the provider's declaration already places 
 parameter: every value of the type satisfies it, so repeating it on the head selects nothing.
 
 ```silk,ignore
-import silk.ownership {Drop}
+import silk.core.ownership {Drop}
 
 struct Guard<'a> { value: &'a i32 }
 

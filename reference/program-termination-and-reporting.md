@@ -126,8 +126,8 @@ Hosted startup requires every error of an Effect `main` to implement `Debug`, an
 with an `unhandled value:` line holding the active error's `Debug` form.
 
 ```silk
-import silk.format { Debug, Format, Formatter }
-import silk.writer { Writer, WriterError }
+import silk.text.format { Debug, Format, Formatter }
+import silk.io.writer { Writer, WriterError }
 
 pub struct NotFoundError {
   resourceId: i32,

@@ -1,0 +1,360 @@
+//! Operating-system threads that each run one `Transferable` closure and return its result.
+//!
+//! # When to use
+//! Use [`NativeThread.spawn`] to run independent work on a new native thread, and
+//! [`JoinHandle.join`] to wait for its result. For many small tasks, use `silk.concurrency.thread_pool`.
+//!
+//! # Details
+//! The closure and its result must be `Transferable`. The closure must be detached: it owns all
+//! that it captures, and borrows nothing from the caller. Each thread runs its closure as the body
+//! of one transferable `Execution` package (EXEC-010). Thus one non-generic C entry point starts
+//! closures of any type.
+//!
+//! Threads use `pthread_create` on Darwin and GNU libc targets, and wasi-threads on wasm32 with
+//! `threading = "multi"`. A native thread gets an 8 MiB stack, the default main-thread stack on
+//! Darwin and Linux, so work that fits on the main thread fits on a spawned one. The platform's
+//! own thread default is smaller on Darwin (512 KiB). A wasm32 thread gets the 1 MiB stack its
+//! runtime gives every thread.
+//!
+//! # Errors
+//! [`SpawnError`] if the system cannot make the thread. `OutOfMemoryError` if the start or result
+//! storage cannot be allocated.
+//!
+//! # Gotchas
+//! - Dropping a [`JoinHandle`] without a join waits for the thread. Thus the result storage that
+//!   the handle owns lives longer than each write to it.
+//! - A fatal trap on any thread ends the whole process.
+//!
+//! # Examples
+//! ## Compute on another thread
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.concurrency.thread_native { NativeThread, SpawnError }
+//!
+//! fn sum(limit: i32) -> i32 {
+//!   let mut total = 0
+//!   let mut index = 1
+//!   while index <= limit {
+//!     total = total + index
+//!     index = index + 1
+//!   }
+//!   return total
+//! }
+//!
+//! effect fn program() -> i32
+//!   ! OutOfMemoryError | SpawnError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!
+//!   // The closure owns what it captures, so it can run on the new thread.
+//!   let limit = 100
+//!   let handle = run NativeThread.spawn(
+//!     fn() -> i32 {
+//!       return sum(limit)
+//!     }
+//!   )
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!
+//!   // Other work runs here while the thread computes.
+//!   if handle.join() != 5050 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//!
+//! effect fn failed<E>(error: E) -> i32 {
+//!   drop error
+//!   return 1
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   return run Effect.catchAll(program(), failed)
+//! }
+//! ```
+//!
+//! @category Concurrency
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.box { Box }
+import silk.concurrency.execution { Execution, TransferableExecution }
+import silk.text.format { Debug, Format, Formatter }
+import silk.core.ownership { Drop }
+import silk.mem.pointer { Pointer }
+import silk.num.i64
+import silk.num.isize
+import silk.num.u32
+import silk.concurrency.thread { Transferable }
+import silk.io.writer { Writer, WriterError }
+
+unsafe extern "C" fn pthread_create(
+  thread: *mut usize,
+  attributes: ?*const u8,
+  start: extern "C" fn(?*mut u8) -> ?*mut u8,
+  argument: ?*mut u8,
+) -> i32 with Intrinsic.foreign(threadCallbacks: ("start",))
+unsafe extern "C" fn pthread_attr_init(attributes: *mut u8) -> i32
+unsafe extern "C" fn pthread_attr_setstacksize(attributes: *mut u8, size: usize) -> i32
+unsafe extern "C" fn pthread_attr_destroy(attributes: *mut u8) -> i32
+unsafe extern "C" fn pthread_join(thread: usize, result: ?*mut ?*mut u8) -> i32
+unsafe extern "C" fn sched_yield() -> i32
+unsafe extern "C" fn sysconf(name: i32) -> i64
+// The wasi-threads runtime the compiler links into a multi-threaded wasm32 module.
+unsafe extern "C" fn silk_wasm_thread_spawn(argument: ?*mut u8) -> isize
+unsafe extern "C" fn silk_wasm_thread_join(handle: usize) -> ()
+unsafe extern "C" fn silk_wasm_parallelism() -> u32
+
+/// The thread could not be created, for example because a resource limit was reached.
+pub struct SpawnError {
+  /// The error number `pthread_create` returned.
+  pub code: i32,
+}
+
+impl Debug for SpawnError {
+  /// Writes the fields, as `SpawnError { code: ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return run Format.debugFields(self, "SpawnError", &mut formatter)
+  }
+}
+
+// The package a new thread drives, until the thread takes it.
+struct Waiting { execution: TransferableExecution<()> }
+struct Taken {}
+struct StartCell { state: Waiting | Taken }
+
+// The closure's result, written once by the thread before it ends.
+struct Pending {}
+struct Done<T> { value: T }
+struct ResultCell<T> { state: Pending | Done<T> }
+
+// The address of the result storage the joining handle owns, a `ResultCell<T>`. Only the thread
+// writes through it, and the handle reads only after `pthread_join` returns, which orders the two.
+struct ResultAddress<T> { pointer: *mut u8 }
+impl<T: Transferable> Transferable for ResultAddress<T> {}
+
+/// The owner of one running native thread and the storage for its result.
+///
+/// # Gotchas
+///
+/// Dropping a handle without calling [`JoinHandle.join`] waits for the thread and drops its result.
+/// Thus the result storage that the handle owns lives longer than each write to it.
+pub struct JoinHandle<T> {
+  thread: usize,
+  joined: bool,
+  start: Box<StartCell>,
+  result: Box<ResultCell<T>>,
+}
+
+impl<T> JoinHandle<T> {
+  /// Waits for the thread to finish and returns the value its closure produced.
+  pub fn join(self: Self) -> T {
+    let mut handle = move self
+    handle.wait()
+    let finished = Intrinsic.replace(handle.result.getMut()[0].state, Pending {})
+    return match move finished {
+      Pending nothing => unfinished<T>()
+      Done<T> { value } => move value
+    }
+  }
+
+  fn wait(self: &mut Self) -> () {
+    if self.joined { return () }
+    self.joined = true
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      unsafe silk_wasm_thread_join(self.thread)
+    } else {
+      if unsafe pthread_join(self.thread, Pointer.null<?*mut u8>()) != 0 { failedJoin() }
+    }
+    return ()
+  }
+}
+
+impl<T> Drop for JoinHandle<T> {
+  fn drop(self: &mut JoinHandle<T>) -> () {
+    self.wait()
+    return ()
+  }
+}
+
+/// The owner of native thread creation.
+///
+/// # When to use
+/// Use [`NativeThread.spawn`] to run independent work on a new operating-system thread, and
+/// [`JoinHandle.join`] to wait for its result. For many small tasks, use `silk.concurrency.thread_pool`.
+///
+/// # Details
+/// The closure and its result must be `Transferable`. The closure must be detached: it owns all
+/// that it captures, and borrows nothing from the caller. Threads use `pthread_create` on Darwin
+/// and GNU libc targets, and wasi-threads on wasm32 with `threading = "multi"`. A native thread
+/// gets an 8 MiB stack, the default main-thread stack on Darwin and Linux, so work that fits on the
+/// main thread fits on a spawned one. A wasm32 thread gets the 1 MiB stack that its runtime gives
+/// every thread.
+///
+/// # Gotchas
+/// A fatal trap on any thread ends the whole process.
+pub struct NativeThread {}
+
+impl NativeThread {
+  /// Returns the number of processors online, at least one.
+  ///
+  /// # Details
+  /// Use it to size a worker pool. The operating system can still run other work on those
+  /// processors.
+  pub fn processorCount() -> usize {
+    supportedTarget()
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      return u32.toUsize(unsafe silk_wasm_parallelism())
+    }
+    // `_SC_NPROCESSORS_ONLN`.
+    let mut name: i32 = 84
+    static if Intrinsic.targetOperatingSystem() == "darwin" { name = 58 }
+    let online = unsafe sysconf(name)
+    if online < 1 { return 1 }
+    return i64.toUsize(online)
+  }
+
+  /// Offers the rest of the current thread's time slice to other runnable threads.
+  pub fn yieldNow() -> () {
+    supportedTarget()
+    // A WebAssembly thread has no scheduler call to give up its slice.
+    static if Intrinsic.targetArchitecture() != "wasm32" {
+      let ignored = unsafe sched_yield()
+    }
+    return ()
+  }
+
+  /// Starts `work` on a new native thread and returns the handle that joins it.
+  ///
+  /// # Details
+  ///
+  /// The thread's start storage and result storage come from the selected `Allocator`. Creation
+  /// failure reports [`SpawnError`] and drops `work` without running it.
+  pub effect<'static> fn spawn<
+    T: 'static + Transferable,
+    F: 'static + once fn() -> T + Intrinsic.Detached + Transferable
+  >(work: F) -> JoinHandle<T>
+  ! OutOfMemoryError | SpawnError
+  ? &mut Allocator {
+    supportedTarget()
+    let handle = run startThread<T, F>(move work)
+    return move handle
+  }
+
+  /// Runs the thread a wasm32 runtime started with `argument`.
+  ///
+  /// # Details
+  ///
+  /// Only the wasm32 runtime calls this, on the new thread, with the argument `spawn` passed to the
+  /// runtime's thread creation. A wasm32 module roots no standard-library export of its own, so the
+  /// runtime's entry module exports the thread entry and forwards here.
+  pub unsafe fn runStarted(argument: ?*mut u8) -> () {
+    unsafe runThread(argument)
+    return ()
+  }
+}
+
+// Native threads use `pthread_create`, which Darwin and GNU libc provide, or wasi-threads in a
+// multi-threaded wasm32 profile.
+fn supportedTarget() -> () {
+  static if Intrinsic.targetOperatingSystem() == "darwin" || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.profileText("libc") == "gnu") || (Intrinsic.targetArchitecture() == "wasm32" && Intrinsic.profileText("threading") == "multi") {
+    return ()
+  } else { compileError("Native threads require a Darwin or GNU libc target, or wasm32 with threading = \"multi\"") }
+}
+
+// Allocates the result and start cells, packages `work`, and creates the thread.
+effect<'static> fn startThread<
+  T: 'static + Transferable,
+  F: 'static + once fn() -> T + Intrinsic.Detached + Transferable
+>(work: F) -> JoinHandle<T>
+! OutOfMemoryError | SpawnError
+? &mut Allocator {
+  let mut result = run Box<ResultCell<T>>.make(ResultCell<T> { state: Pending {} })
+  let cell = Pointer.fromMutRef(&mut result.getMut()[0])
+  let address = ResultAddress<T> { pointer: unsafe Intrinsic.pointerReinterpret<*mut ResultCell<T>, *mut u8>(cell) }
+  let execution = run Execution.makeTransferable(runWork<T, F>(move work, move address), (), ready)
+  let mut start = run Box<StartCell>.make(StartCell { state: Waiting { execution: move execution } })
+  let startCell = Pointer.fromMutRef(&mut start.getMut()[0])
+  let erased = unsafe Intrinsic.pointerReinterpret<*mut StartCell, *mut u8>(startCell)
+  let argument = unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(erased)
+  let thread = run createThread(argument)
+  return JoinHandle<T> { thread: thread, joined: false, start: move start, result: move result }
+}
+
+// A native thread's stack: the 8 MiB main-thread default on Darwin and Linux. The compiler's
+// nesting limits assume that much, and Darwin's 512 KiB thread default overflows the language
+// server's compiler thread on ordinary code.
+const STACK_BYTES: usize = 8388608
+
+// Starts a thread in `silkNativeThreadStart` with `argument`, answering the handle `wait` joins.
+effect fn createThread(argument: ?*mut u8) -> usize ! SpawnError {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    // The runtime answers the thread's record address, or a negated error number.
+    let started = unsafe silk_wasm_thread_spawn(argument)
+    if started < 0 { fail SpawnError { code: isize.toI32(0 - started) } }
+    return isize.toUsize(started)
+  } else {
+    // Storage for a `pthread_attr_t`: 64 bytes on Darwin and GNU libc arm64, 56 on GNU libc x86_64.
+    let mut storage: [u64; 8] = [0; 8]
+    let attributes = unsafe Intrinsic.pointerReinterpret<*mut [u64; 8], *mut u8>(Pointer.fromMutRef(&mut storage))
+    let initialized = unsafe pthread_attr_init(attributes)
+    if initialized != 0 { fail SpawnError { code: initialized } }
+    let sized = unsafe pthread_attr_setstacksize(attributes, STACK_BYTES)
+    if sized != 0 {
+      let destroyed = unsafe pthread_attr_destroy(attributes)
+      fail SpawnError { code: sized }
+    }
+    let mut thread: usize = 0
+    let selected = unsafe Intrinsic.pointerRequalify<*mut u8, ?*const u8>(attributes)
+    let code = unsafe pthread_create(Pointer.fromMutRef(&mut thread), selected, silkNativeThreadStart, argument)
+    let destroyed = unsafe pthread_attr_destroy(attributes)
+    if code != 0 { fail SpawnError { code: code } }
+    return thread
+  }
+}
+
+// The thread body: run the closure and store its value where the handle will read it.
+effect fn runWork<T, F: once fn() -> T>(work: F, address: ResultAddress<T>) -> () {
+  let value = work()
+  unsafe {
+    let cell = Intrinsic.pointerReinterpret<*mut u8, *mut ResultCell<T>>(address.pointer)
+    Pointer.put<ResultCell<T>>(cell, ResultCell<T> { state: Done<T> { value: move value } })
+  }
+  return ()
+}
+
+fn ready(state: &()) -> () { return () }
+
+// The one C entry point every native thread starts in.
+export "C" fn silkNativeThreadStart(argument: ?*mut u8) -> ?*mut u8 {
+  unsafe runThread(argument)
+  return Pointer.null<u8>()
+}
+
+// A new thread's body. It takes the package out of the start cell, so the handle's later drop of
+// that cell finds it empty, and drives it to completion.
+unsafe fn runThread(argument: ?*mut u8) -> () {
+  let present = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(argument)
+  let cell = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut StartCell>(present)
+  let taken = unsafe Pointer.take<StartCell>(cell)
+  unsafe { Pointer.put<StartCell>(cell, StartCell { state: Taken {} }) }
+  let StartCell { state } = move taken
+  match move state {
+    Waiting { execution } => run Execution.drive(execution.local(), (), completed, suspended)
+    Taken nothing => ()
+  }
+  return ()
+}
+
+fn completed(state: (), value: ()) -> () { return () }
+
+// A closure body cannot park, so its package never suspends.
+fn suspended(state: (), execution: Intrinsic.Execution<()>) -> () {
+  return Intrinsic.trap("NativeThread: a thread body tried to suspend")
+}
+
+fn failedJoin() -> () {
+  return Intrinsic.trap("NativeThread.join: the operating system join call failed")
+}
+
+fn unfinished<T>() -> T {
+  return Intrinsic.trap("NativeThread.join: the thread finished without a result")
+}

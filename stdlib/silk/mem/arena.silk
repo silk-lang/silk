@@ -1,0 +1,344 @@
+//! A bump allocator over chunks it acquires from another allocator.
+//!
+//! # When to use
+//! Provide an [`Arena`] for `Allocator` when a phase of a program makes many allocations with
+//! similar lifetimes, such as building a tree that is dropped all at once. Every container that
+//! allocates through `Allocator`, such as `List`, `Bytes`, `Box` and `Shared`, works in it
+//! unchanged.
+//!
+//! # Details
+//! [`Arena`] owns a child provider, passed to [`make`], and asks it for chunks. An allocation bumps
+//! a cursor through the current chunk and calls nothing else. Each chunk counts its live
+//! allocations, so dropping an allocation is one atomic decrement and returns no memory by itself.
+//!
+//! An allocation never borrows its arena. Dropping or resetting the arena returns every chunk that
+//! no live allocation points into to the child at once; a chunk that still holds a live allocation
+//! is returned when its last allocation drops, on whichever thread drops it.
+//!
+//! # Gotchas
+//! Memory freed inside a chunk is not reused: a `List` that grows in an arena leaves each earlier
+//! buffer behind until the whole chunk is free. One long-lived allocation keeps its whole chunk
+//! alive. Requests larger than half a chunk get a chunk of their own.
+//!
+//! # Examples
+//! ## Build a list in an arena
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//!
+//! import silk.mem.arena { Arena }
+//!
+//! import silk.core.effect { Effect }
+//!
+//! import silk.collections.list { List }
+//!
+//! effect fn build() -> i32
+//! ! OutOfMemoryError {
+//!   let mut arena = Arena.make(Allocator.systemAllocatorProvider())
+//!   let mut values = List<i32>.make()
+//!   run List<i32>.append(&mut values, 40)
+//!     |> Effect.provideMut<Allocator>(&mut arena)
+//!   run List<i32>.append(&mut values, 2)
+//!     |> Effect.provideMut<Allocator>(&mut arena)
+//!   return List<i32>.get(&values, 0) + List<i32>.get(&values, 1)
+//! }
+//!
+//! effect fn recover(error: OutOfMemoryError) -> i32 {
+//!   return 0
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   return run Effect.catchAll(build(), recover)
+//! }
+//! ```
+//!
+//! @category Memory
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.concurrency.atomic { Atomic, MemoryOrder }
+import silk.core.effect { Effect }
+import silk.mem.layout { Layout, LayoutOverflow }
+import silk.core.option { Option }
+import silk.core.ownership { Drop }
+import silk.mem.pointer { Pointer }
+import silk.mem.raw_buffer { RawBuffer }
+import silk.mem.slot { Slot }
+import silk.concurrency.thread { Transferable }
+import silk.num.usize
+
+// A chunk is one child allocation of words. It starts with its live-allocation count, then the
+// owner of the chunk's own storage, moved into the chunk so no Silk value owns it; allocations
+// follow. While the arena still bumps into a chunk the count carries `bias()` on top of the
+// allocations dropped so far, so no drop can reach zero; retiring the chunk removes the bias minus
+// the allocations it handed out, which leaves exactly the live ones.
+struct Owner { storage: Intrinsic.RawBuffer<usize> }
+
+fn bias() -> usize {
+  return usize.MAX / 2
+}
+
+fn wordBytes() -> usize {
+  return Layout.of<usize>().bytes
+}
+
+// The owner sits one word in, so the count and the owner never share a word.
+fn ownerOffset() -> usize {
+  let alignment = Layout.of<Owner>().alignment
+  return (wordBytes() + alignment - 1) / alignment * alignment
+}
+
+fn headerBytes() -> usize {
+  return ownerOffset() + Layout.of<Owner>().bytes
+}
+
+/// The chunk sizes an [`Arena`] uses.
+pub struct ArenaOptions {
+  /// The size in bytes of the first chunk.
+  pub firstChunkBytes: usize,
+  /// The largest size in bytes a regular chunk grows to. Each new chunk doubles the previous one
+  /// up to this size.
+  pub maximumChunkBytes: usize,
+}
+
+impl ArenaOptions {
+  /// Returns the default sizes: a 4 KiB first chunk that doubles up to 1 MiB.
+  pub fn default() -> ArenaOptions {
+    return ArenaOptions { firstChunkBytes: 4096, maximumChunkBytes: 1048576 }
+  }
+}
+
+/// What [`Arena.reset`] does with the current chunk.
+pub enum ArenaReset {
+  /// Retires the current chunk; it is returned to the child once no allocation points into it.
+  Release,
+  /// Keeps the current chunk for the next allocations when no allocation points into it, and
+  /// otherwise retires it like `Release`.
+  RetainCapacity,
+}
+
+/// A bump allocator that provides `Allocator` from chunks of a child provider `A`.
+///
+/// # When to use
+///
+/// Provide an arena for `Allocator` when a phase of a program makes many allocations with similar
+/// lifetimes, such as building a tree that is dropped all at once. Every container that allocates
+/// through `Allocator`, such as `List`, `Bytes`, `Box` and `Shared`, works in it unchanged.
+///
+/// # Details
+///
+/// The arena owns its child and asks it for chunks. An allocation bumps a cursor through the
+/// current chunk and calls nothing else. Each chunk counts its live allocations, so dropping an
+/// allocation is one atomic decrement and returns no memory by itself.
+///
+/// An allocation never borrows its arena. Dropping or resetting the arena returns to the child at
+/// once each chunk that no live allocation points into. A chunk that still holds a live allocation
+/// is returned when its last allocation drops, on whichever thread drops it.
+///
+/// Allocation failure is the child's: the arena fails with `OutOfMemoryError` only when the child
+/// refuses a chunk.
+///
+/// # Gotchas
+///
+/// Memory freed inside a chunk is not reused: a `List` that grows in an arena leaves each earlier
+/// buffer behind until the whole chunk is free. One long-lived allocation keeps its whole chunk
+/// alive. Requests larger than half a chunk get a chunk of their own.
+pub struct Arena<A> {
+  child: A,
+  // The current chunk, or null before the first allocation and after a reset.
+  chunk: ?*mut u8,
+  // The offset of the next free byte and the size of the current chunk.
+  cursor: usize,
+  limit: usize,
+  // Allocations handed out from the current chunk.
+  issued: usize,
+  nextBytes: usize,
+  maximumBytes: usize,
+}
+
+impl<A: Transferable> Transferable for Arena<A> {}
+
+impl<A> Arena<A> {
+  /// Creates an arena over `child` with the default chunk sizes. It allocates nothing until the
+  /// first request.
+  pub fn make(child: A) -> Arena<A> {
+    return Arena<A>.withOptions(move child, ArenaOptions.default())
+  }
+
+  /// Creates an arena over `child` with explicit chunk sizes. It allocates nothing until the first
+  /// request.
+  pub fn withOptions(child: A, options: ArenaOptions) -> Arena<A> {
+    let mut first = options.firstChunkBytes
+    if first < headerBytes() * 2 { first = headerBytes() * 2 }
+    let mut maximum = options.maximumChunkBytes
+    if maximum < first { maximum = first }
+    return Arena<A> {
+      child: move child, chunk: Pointer.null<u8>(), cursor: 0, limit: 0, issued: 0, nextBytes: first, maximumBytes: maximum
+    }
+  }
+
+  /// Stops allocating from the current chunk.
+  ///
+  /// # Details
+  ///
+  /// Allocations made before the reset stay valid. Their chunk is returned to the child when the
+  /// last of them drops, or now when none is alive. With `ArenaReset.RetainCapacity`, a current
+  /// chunk that no allocation points into stays for the next allocations.
+  ///
+  /// # Gotchas
+  ///
+  /// One long-lived allocation keeps its whole chunk alive after the reset.
+  pub fn reset(self: &mut Self, mode: ArenaReset) -> () {
+    unsafe retire<A>(&mut self.*, mode == ArenaReset.RetainCapacity)
+    return ()
+  }
+
+  /// Returns the bytes left in the current chunk before the arena asks its child for another.
+  pub fn available(self: &Self) -> usize {
+    return self.limit - self.cursor
+  }
+
+  // Bumps the cursor past `layout` in the current chunk and returns where it starts, or nothing
+  // when there is no chunk or it does not fit.
+  fn bump(self: &mut Self, layout: &Layout) -> Option<Placed> {
+    let chunk = match Pointer.nonNullMut<u8>(self.chunk) {
+      Option<*mut u8>.Some { value } => unsafe Pointer.assumeManyMut<u8>(value)
+      Option<*mut u8>.None => { return Option<Placed>.none() }
+    }
+    let start = usize.saturatingAdd(Pointer.addressMany<u8>(chunk), self.cursor)
+    let offset = usize.saturatingAdd(self.cursor, padding(start, layout.alignment))
+    let end = usize.saturatingAdd(offset, layout.bytes)
+    if end > self.limit { return Option<Placed>.none() }
+    self.cursor = end
+    self.issued = self.issued + 1
+    return Option<Placed>.some(Placed { at: unsafe Pointer.atMut<u8>(chunk, offset), chunk: chunk })
+  }
+}
+
+impl<A> Allocator for Arena<A>
+where &mut A provides &Allocator from &mut Allocator {
+  effect fn allocate(self: &mut Self, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
+    if let Option<Placed>.Some { value } = self.bump(&layout) {
+      return unsafe adopt(value.at, move layout, value.chunk)
+    }
+    let needed = usize.saturatingAdd(usize.saturatingAdd(headerBytes(), layout.bytes), layout.alignment)
+    // A large request gets a chunk of its own, which the arena never bumps into.
+    if needed > self.nextBytes / 2 {
+      let chunk = run acquire<A>(&mut self.child, needed, 1)
+      let start = usize.saturatingAdd(Pointer.addressMany<u8>(chunk), headerBytes())
+      let at = unsafe Pointer.atMut<u8>(chunk, headerBytes() + padding(start, layout.alignment))
+      return unsafe adopt(at, move layout, chunk)
+    }
+    let bytes = self.nextBytes
+    let chunk = run acquire<A>(&mut self.child, bytes, bias())
+    unsafe retire<A>(&mut self.*, false)
+    self.chunk = unsafe Pointer.atMut<u8>(chunk, 0)
+    self.cursor = headerBytes()
+    self.limit = bytes / wordBytes() * wordBytes()
+    self.issued = 0
+    self.nextBytes = usize.saturatingMultiply(bytes, 2)
+    if self.nextBytes > self.maximumBytes { self.nextBytes = self.maximumBytes }
+    // A fresh chunk always fits the request, since it is larger than twice the request.
+    return match self.bump(&layout) {
+      Option<Placed>.Some { value } => unsafe adopt(value.at, move layout, value.chunk)
+      Option<Placed>.None => run Allocator.outOfMemory()
+    }
+  }
+}
+
+
+impl<A> Drop for Arena<A> {
+  fn drop(self: &mut Arena<A>) -> () {
+    unsafe retire<A>(&mut self.*, false)
+    return ()
+  }
+}
+
+// The bytes from `address` to the next multiple of `alignment`, a power of two.
+fn padding(address: usize, alignment: usize) -> usize {
+  return usize.bitAnd(alignment - usize.bitAnd(address, alignment - 1), alignment - 1)
+}
+
+// Acquires one chunk of at least `bytes` from the child and starts its count at `count`.
+effect fn acquire<A>(child: &mut A, bytes: usize, count: usize) -> [*]mut u8 ! OutOfMemoryError
+where &mut A provides &Allocator from &mut Allocator {
+  let words = usize.saturatingAdd(bytes, wordBytes() - 1) / wordBytes()
+  let layout = match move Layout.repeat(Layout.of<usize>(), words) {
+    LayoutOverflow nothing => run Allocator.outOfMemory()
+    Layout { bytes: total, alignment } => Layout { bytes: total, alignment: alignment }
+  }
+  let acquiring = Allocator.allocate(move layout) |> Effect.provideMut<Allocator>(&mut child.*)
+  let allocation = run acquiring
+  let mut storage = unsafe RawBuffer.from<usize>(move allocation, words)
+  let counter = Slot.address(RawBuffer.slot<usize>(&mut storage, 0))
+  unsafe {
+    let chunk = Pointer.assumeManyMut<u8>(Intrinsic.pointerReinterpret<*mut usize, *mut u8>(counter))
+    Pointer.write<usize>(counter, count)
+    Pointer.put<Owner>(ownerOf(chunk), Owner { storage: move storage })
+    return chunk
+  }
+}
+
+unsafe fn ownerOf(chunk: [*]mut u8) -> *mut Owner {
+  unsafe { return Intrinsic.pointerReinterpret<*mut u8, *mut Owner>(Pointer.atMut<u8>(chunk, ownerOffset())) }
+}
+
+unsafe fn counterOf(chunk: [*]mut u8) -> *mut usize {
+  unsafe { return Intrinsic.pointerReinterpret<*mut u8, *mut usize>(Pointer.atMut<u8>(chunk, 0)) }
+}
+
+// Where one request landed: its first byte and the chunk that holds it.
+struct Placed { at: *mut u8, chunk: [*]mut u8 }
+
+// Hands out `layout` at `at` inside `chunk`, which the allocation keeps alive.
+unsafe fn adopt(at: *mut u8, layout: Layout, chunk: [*]mut u8) -> Intrinsic.Allocation {
+  let reclaim: extern "C" fn(?*mut u8) -> () = silkArenaReclaim
+  unsafe { return Intrinsic.allocationAdopt(at, move layout, reclaim, Pointer.atMut<u8>(chunk, 0)) }
+}
+
+// Removes the current chunk's bias. A chunk left with no live allocation is kept for reuse when
+// `keep` is set, and otherwise returned to the child.
+unsafe fn retire<A>(arena: &mut Arena<A>, keep: bool) -> () {
+  let chunk = match Pointer.nonNullMut<u8>(arena.chunk) {
+    Option<*mut u8>.Some { value } => unsafe Pointer.assumeManyMut<u8>(value)
+    Option<*mut u8>.None => { return () }
+  }
+  let removed = bias() - arena.issued
+  arena.issued = 0
+  let counter = unsafe counterOf(chunk)
+  if unsafe Atomic.fetchSubtract<usize>(counter, removed, MemoryOrder.Release) != removed {
+    arena.chunk = Pointer.null<u8>()
+    arena.cursor = 0
+    arena.limit = 0
+    return ()
+  }
+  Atomic.fence(MemoryOrder.Acquire)
+  if keep {
+    unsafe Pointer.write<usize>(counter, bias())
+    arena.cursor = headerBytes()
+    return ()
+  }
+  arena.chunk = Pointer.null<u8>()
+  arena.cursor = 0
+  arena.limit = 0
+  unsafe release(chunk)
+  return ()
+}
+
+// Returns a chunk with no live allocation to the child by dropping the storage it owns.
+unsafe fn release(chunk: [*]mut u8) -> () {
+  unsafe {
+    let owner = Pointer.take<Owner>(ownerOf(chunk))
+    drop owner
+  }
+  return ()
+}
+
+// The reclaim function of every arena allocation: its context is the chunk it came from.
+export "C" fn silkArenaReclaim(context: ?*mut u8) -> () {
+  let present = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(context)
+  let chunk = unsafe Pointer.assumeManyMut<u8>(present)
+  let counter = unsafe counterOf(chunk)
+  if unsafe Atomic.fetchSubtract<usize>(counter, 1, MemoryOrder.Release) != 1 { return () }
+  Atomic.fence(MemoryOrder.Acquire)
+  unsafe release(chunk)
+  return ()
+}

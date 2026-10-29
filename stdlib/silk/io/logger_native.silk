@@ -1,0 +1,293 @@
+//! Native providers of the `Logger` effect: [`StderrLogger`] writes log lines to standard error,
+//! and [`StdoutLogger`] writes the bare messages to standard output.
+//!
+//! # When to use
+//! Provide [`StderrLogger`] for `Logger` in a native program. It is the normal choice for
+//! diagnostics, because it keeps the log out of the program output. Provide [`StdoutLogger`] when
+//! the messages are the output of the program. Code that logs uses `silk.io.logger`, so a test can
+//! provide `InMemoryLogger` instead.
+//!
+//! # Details
+//! [`StderrLogger`] writes one line for each message: the level, a colon and a space, the formatted
+//! message, and a newline, such as `warning: disk 91% full`. It holds the standard error lock of
+//! `silk.io.writer_native` for the whole line, so lines of different threads do not mix. It formats into a
+//! buffer of 64 bytes on the stack. Thus a short line is one system call, and the logger does not
+//! allocate.
+//!
+//! [`StderrLogger.make`] colors the level name when standard error is a terminal, the `NO_COLOR`
+//! environment variable is not set or is empty, and `TERM` is not `dumb`. It checks once, at the
+//! first message. [`StderrLogger.withColor`] turns color on or off without a check.
+//!
+//! [`StdoutLogger`] formats each message directly to standard output. It adds no level, timestamp,
+//! or newline, has no lock, and does not allocate.
+//!
+//! # Errors
+//! `LogError` with code 3 if the write fails. Part of the message can be written already.
+//!
+//! # Gotchas
+//! - The providers exist on WASI, Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+//! - A message template for [`StderrLogger`] must not end with a newline. The logger adds one.
+//! - [`StderrLogger.make`] reads the environment at the first message. A change to `NO_COLOR` after
+//!   that has no effect on the same logger.
+//!
+//! # Examples
+//! ## Log to standard error
+//! ```silk
+//! import silk.core.effect { Effect }
+//! import silk.io.logger { LogError, Logger }
+//! import silk.io.logger_native { StderrLogger }
+//!
+//! pub effect fn main() -> i32
+//!   ! LogError {
+//!   let mut logger = StderrLogger.make()
+//!   let values = .{ name: "silk", count: 3 }
+//!
+//!   // Writes "info: silk started 3 workers" and a newline to standard error.
+//!   run Effect.logInfo("{name} started {count} workers", &values)
+//!     |> Effect.provideMut<Logger>(&mut logger)
+//!   return 0
+//! }
+//! ```
+//!
+//! ## Log to standard output
+//! ```silk
+//! import silk.core.effect { Effect }
+//! import silk.io.logger { LogError, Logger }
+//! import silk.io.logger_native { StdoutLogger }
+//!
+//! pub effect fn main() -> i32
+//!   ! LogError {
+//!   let mut logger = StdoutLogger.make()
+//!   let values = .{ name: "silk", count: 3 }
+//!
+//!   // The logger adds no newline, so the template ends with one.
+//!   run Effect.logInfo("{name} started {count} workers\n", &values)
+//!     |> Effect.provideMut<Logger>(&mut logger)
+//!   return 0
+//! }
+//! ```
+//!
+//! WASI does not define terminal detection; automatic color selection is disabled on that target.
+//!
+//! @category Input and output
+
+static if Intrinsic.targetOperatingSystem() == "wasi" || (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArchitecture() == "aarch64" && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+  import silk.io.writer { WriterError, Writer }
+  import silk.io.writer_native { LockedStderr, StderrWriter, StdoutWriter }
+  import silk.io.logger { Logger, LogError, LogLevel }
+  import silk.core.effect { Effect }
+  import silk.core.result { Result }
+  import silk.text.format { Format }
+  static if Intrinsic.targetOperatingSystem() == "wasi" {
+    import silk.platform.wasi.descriptor {WasiDescriptor as NativeDescriptor}
+  } else {
+    import silk.platform.native.descriptor {NativeDescriptor}
+  }
+  import silk.core.option { Option }
+  import silk.mem.pointer { Pointer }
+
+  unsafe extern "C" fn getenv(name: ?[*]const u8) -> ?[*]const u8 with Intrinsic.foreign(noCapture: ("name",))
+
+/// A `Logger` provider that writes one line for each message to standard error, with the level.
+///
+/// # Details
+///
+/// Each line is the level name (`trace`, `debug`, `info`, `warning`, or `error`), a colon and a
+/// space, the formatted message, and a newline. The logger holds the standard error lock of
+/// `silk.io.writer_native` for the whole line. Thus lines of different threads do not mix, also with
+/// `StderrWriter` writes. The logger does not allocate.
+///
+/// With color, the level name has an ANSI color: `error` bold red, `warning` bold yellow, `info`
+/// green, `debug` blue, and `trace` cyan. The message has no color.
+///
+/// # Gotchas
+///
+/// The template must not end with a newline. The logger adds one.
+pub struct StderrLogger {
+  color: ColorChoice,
+}
+
+// Whether the level name has color. `Detect` changes to `Always` or `Never` at the first message.
+enum ColorChoice {
+  Detect,
+  Always,
+  Never,
+}
+
+impl StderrLogger {
+  /// Returns a logger that colors the level name when the terminal can show it. It does not write
+  /// anything.
+  ///
+  /// # Details
+  ///
+  /// On WASI, automatic color selection stays disabled because WASI does not define terminal detection.
+  /// At the first message, the logger uses color when standard error is a terminal, `NO_COLOR` is
+  /// not set or is empty, and `TERM` is not `dumb`. Later messages use the same answer.
+  pub fn make() -> StderrLogger { return StderrLogger { color: ColorChoice.Detect } }
+
+  /// Returns a logger that colors the level name when `enabled` is true, and never otherwise. It
+  /// does not check the terminal or the environment.
+  ///
+  /// # When to use
+  ///
+  /// Use it when the program has its own color setting, such as a `--color` flag.
+  pub fn withColor(enabled: bool) -> StderrLogger {
+    if enabled { return StderrLogger { color: ColorChoice.Always } }
+    return StderrLogger { color: ColorChoice.Never }
+  }
+
+  effect fn writeStderr<Args>(
+    self: &mut Self,
+    level: LogLevel,
+    static template: string<'static>,
+    args: &Args
+  ) -> () ! LogError {
+    if self.color == ColorChoice.Detect {
+      if run detectColor() {
+        self.color = ColorChoice.Always
+      } else {
+        self.color = ColorChoice.Never
+      }
+    }
+    let prefix = levelPrefix(level, self.color == ColorChoice.Always)
+    let mut buffer: [u8; 64] = [0; 64]
+    let mut stderr = StderrWriter.lock(&mut buffer)
+    let completed = run Effect.result(formatStderr<Args>(&mut stderr, prefix, template, args))
+    return match move completed {
+      Result<(), WriterError>.Success { value: _ } => ()
+      Result<(), WriterError>.Failure { error: _ } => run writeFailure()
+    }
+  }
+}
+
+// Standard error is a terminal, `NO_COLOR` is unset or empty, and `TERM` is not `dumb`.
+effect fn detectColor() -> bool {
+  static if Intrinsic.targetOperatingSystem() == "wasi" { return false } else {
+  if !run NativeDescriptor.isTerminal(2) { return false }
+  if compareEnvironment(b"NO_COLOR\x00", b"") == EnvironmentMatch.NonEmpty { return false }
+  return compareEnvironment(b"TERM\x00", b"dumb\x00") != EnvironmentMatch.Equal
+  }
+}
+
+// What `getenv` returned for a variable, compared with an expected value.
+enum EnvironmentMatch {
+  Unset,
+  Empty,
+  Equal,
+  NonEmpty,
+}
+
+// Looks up the NUL-terminated `name`. `Equal` when the value and its NUL match `expected`, which
+// ends with a NUL; an empty `expected` matches nothing.
+fn compareEnvironment(name: &[u8], expected: &[u8]) -> EnvironmentMatch {
+  let found = Pointer.nonNullMany<u8>(unsafe getenv(Pointer.fromSlice<u8>(name)))
+  return match move found {
+    Option<[*]const u8>.None => EnvironmentMatch.Unset
+    Option<[*]const u8>.Some { value } => {
+      if unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(value, 0)) == 0 { return EnvironmentMatch.Empty }
+      if expected.length == 0 { return EnvironmentMatch.NonEmpty }
+      let mut index: usize = 0
+      while index < expected.length {
+        // The value ends at its NUL, so the read stops at the first difference or at the NUL.
+        if unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(value, index)) != expected[index] {
+          return EnvironmentMatch.NonEmpty
+        }
+        index = index + 1
+      }
+      return EnvironmentMatch.Equal
+    }
+  }
+}
+
+effect fn formatStderr<Args>(
+  writer: &mut LockedStderr,
+  prefix: string<'static>,
+  static template: string<'static>,
+  args: &Args
+) -> () ! WriterError {
+  return run formatLine<Args>(prefix, template, args) |> Effect.provideMut<Writer>(&mut writer)
+}
+
+effect fn formatLine<Args>(
+  prefix: string<'static>,
+  static template: string<'static>,
+  args: &Args
+) -> () ! WriterError ? &mut Writer {
+  run Writer.writeString(prefix)
+  run Format.format<Args>(template, args)
+  run Writer.writeString("\n")
+  // Flush under the lock, so that a failure is reported and not lost in the drop.
+  return run Writer.flush()
+}
+
+fn levelPrefix(level: LogLevel, color: bool) -> string<'static> {
+  if color {
+    return match level {
+      LogLevel.Trace => "\u{1b}[36mtrace\u{1b}[0m: "
+      LogLevel.Debug => "\u{1b}[34mdebug\u{1b}[0m: "
+      LogLevel.Info => "\u{1b}[32minfo\u{1b}[0m: "
+      LogLevel.Warning => "\u{1b}[1;33mwarning\u{1b}[0m: "
+      LogLevel.Error => "\u{1b}[1;31merror\u{1b}[0m: "
+    }
+  }
+  return match level {
+    LogLevel.Trace => "trace: "
+    LogLevel.Debug => "debug: "
+    LogLevel.Info => "info: "
+    LogLevel.Warning => "warning: "
+    LogLevel.Error => "error: "
+  }
+}
+
+impl Logger for StderrLogger {
+  log: StderrLogger.writeStderr
+}
+
+/// A `Logger` provider that writes only the formatted message to standard output, and ignores the
+/// level.
+///
+/// # When to use
+///
+/// Use it when the log messages are the output of the program. For diagnostics, use
+/// [`StderrLogger`].
+///
+/// # Gotchas
+///
+/// It adds no newline, so end each template with one. It has no lock, so messages of different
+/// threads can mix.
+pub struct StdoutLogger {}
+
+impl StdoutLogger {
+  /// Returns a logger. It does not write anything.
+  pub fn make() -> StdoutLogger { return StdoutLogger {} }
+
+  effect fn writeStdout<Args>(
+    self: &mut Self,
+    level: LogLevel,
+    static template: string<'static>,
+    args: &Args
+  ) -> () ! LogError {
+    let mut streams = StdoutWriter.make()
+    let completed = run Effect.result(formatStdout<Args>(&mut streams, template, args))
+    return match move completed {
+      Result<(), WriterError>.Success { value: _ } => ()
+      Result<(), WriterError>.Failure { error: _ } => run writeFailure()
+    }
+  }
+}
+
+effect fn formatStdout<Args>(
+  writer: &mut StdoutWriter,
+  static template: string<'static>,
+  args: &Args
+) -> () ! WriterError {
+  return run Format.format<Args>(template, args) |> Effect.provideMut<Writer>(&mut writer)
+}
+
+effect fn writeFailure() -> never ! LogError { fail Logger.failure(3) }
+
+impl Logger for StdoutLogger {
+  log: StdoutLogger.writeStdout
+}
+
+}

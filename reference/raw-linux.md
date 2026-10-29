@@ -1,10 +1,10 @@
 # Raw Linux executables
 
 The synchronous raw runtime supports x86-64 and ARM64 Linux with `libc = "none"`,
-static linking and static relocation. Select `silk/raw_start` as a named runtime
+static linking and static relocation. Select `silk/platform/linux/start` as a named runtime
 module and `_start` as the loader entry. The application exports ordinary Silk
 `pub fn main(inputs: &ProcessInputs) -> i32`, importing `ProcessInputs` from
-`silk.raw_process_inputs`. No C startup object or generated hosted entry supplies
+`silk.platform.linux.process_inputs`. No C startup object or generated hosted entry supplies
 this composition.
 
 The source entry captures the kernel stack before changing it, observes the
@@ -20,14 +20,14 @@ aligned, readable, terminated kernel stack image. Validation of required facts d
 not make an arbitrary address safe to inspect. Accessors return nullable pointers
 for missing indices and do not allocate or copy strings.
 
-`silk.raw_linux` provides unsafe syscall0 through syscall6 and a non-returning
+`silk.platform.linux.syscall` provides unsafe syscall0 through syscall6 and a non-returning
 one-argument syscall operation. These follow Linux register conventions, declare
 memory effects, and expose the machine-word result. `error` decodes unsigned -4095
 through -1 into positive error numbers. `read` and `write` expose partial transfers,
 EOF and errors directly; callers own retry and progress policy. Pointer conversion
 uses typed target assembly and grants neither ownership nor memory validity.
 
-`Mapping.allocate` in `silk.raw_mapping` reserves an anonymous private read/write
+`Mapping.allocate` in `silk.platform.linux.mapping` reserves an anonymous private read/write
 mapping. The page size must come from validated process inputs. Size must be
 positive; alignment and page size must be powers of two. Checked arithmetic rejects
 overflow before the syscall. Over-aligned allocations retain one complete mapping

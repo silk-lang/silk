@@ -1,0 +1,474 @@
+//! Shared ownership, locks and thread parking for values that several native threads use.
+//!
+//! # When to use
+//! - [`Arc`] gives several threads ownership of one value.
+//! - [`Mutex`] lets them change the value one thread at a time.
+//! - [`Parker`] puts a thread to sleep until another thread wakes it.
+//!
+//! # Details
+//! [`Arc`] counts its handles atomically. Thus threads can clone and drop handles at the same time.
+//! The last handle to drop, on any thread, drops the value.
+//!
+//! [`Mutex`] is a futex lock on [`Atomic.wait`] and [`Atomic.notifyOne`]. An uncontended lock or
+//! unlock is one atomic operation. A contended lock sleeps in the operating system and does not
+//! spin.
+//!
+//! [`Parker`] holds one wakeup token. Thus an unpark that comes before the park is not lost.
+//!
+//! Each type keeps its shared state in its own allocation, and reaches it through raw pointers that
+//! it computed when that allocation was new. Handles and guards only copy those pointers. Each
+//! write to state that other threads can see is atomic or done under the lock.
+//!
+//! # Gotchas
+//! - These types need the same targets as [`Atomic.wait`]: Darwin on aarch64, Linux with GNU libc
+//!   on x86_64 or aarch64, and wasm32.
+//! - An `Arc<T>` gives only shared borrows. Change the value through a `Mutex` or atomics. Unlike
+//!   `Shared<T>`, `Arc<T>` does not detect reentrant access.
+//! - A reference cycle of `Arc` handles leaks.
+//!
+//! # Examples
+//! ## Count on two threads
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.concurrency.thread_native { NativeThread, SpawnError }
+//! import silk.concurrency.sync { Arc, Mutex }
+//!
+//! fn addOne(total: Arc<Mutex<i32>>) -> i32 {
+//!   let mut guard = total.get().lock()
+//!   let value = guard.getMut()
+//!   value.* = value.* + 1
+//!   return 0
+//! }
+//!
+//! effect fn program() -> i32
+//!   ! OutOfMemoryError | SpawnError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let mutex = run Mutex<i32>.make(41) |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let total = run Arc<Mutex<i32>>.make(move mutex) |> Effect.provideMut<Allocator>(&mut allocator)
+//!
+//!   // Each thread gets its own handle to the same mutex.
+//!   let mine = total.clone()
+//!   let worker = run NativeThread.spawn(
+//!     fn() -> i32 {
+//!       return addOne(move mine)
+//!     }
+//!   )
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   if worker.join() != 0 {
+//!     return 1
+//!   }
+//!   let guard = total.get().lock()
+//!   if guard.get().* != 42 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//!
+//! effect fn failed<E>(error: E) -> i32 {
+//!   drop error
+//!   return 1
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   return run Effect.catchAll(program(), failed)
+//! }
+//! ```
+//!
+//! ## Wait for another thread
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.concurrency.thread_native { NativeThread, SpawnError }
+//! import silk.concurrency.sync { Parker, Unparker }
+//!
+//! fn wake(unparker: Unparker) -> i32 {
+//!   unparker.unpark()
+//!   return 0
+//! }
+//!
+//! effect fn program() -> i32
+//!   ! OutOfMemoryError | SpawnError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let parker = run Parker.make() |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let unparker = parker.unparker()
+//!   let worker = run NativeThread.spawn(
+//!     fn() -> i32 {
+//!       return wake(move unparker)
+//!     }
+//!   )
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!
+//!   // Waits for the token. The worker can unpark before or after this call.
+//!   parker.park()
+//!   return worker.join()
+//! }
+//!
+//! effect fn failed<E>(error: E) -> i32 {
+//!   drop error
+//!   return 1
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   return run Effect.catchAll(program(), failed)
+//! }
+//! ```
+//!
+//! @category Concurrency
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.concurrency.atomic { Atomic, CompareExchange, MemoryOrder }
+import silk.mem.box { Box }
+import silk.core.option { Option }
+import silk.core.ownership { Drop }
+import silk.mem.pointer { Pointer }
+import silk.concurrency.thread { Concurrent, Transferable }
+import silk.num.usize
+
+// Heap storage that owns itself. `pin` moves the box holding the value into the value's own
+// `root`, so no handle owns the allocation; `unpin` takes the box back out and drops it, which
+// drops the value and releases the allocation exactly once.
+struct Unrooted {}
+struct Root<T> { storage: Box<Pinned<T>> }
+struct Pinned<T> {
+  value: T,
+  root: Unrooted | Root<T>,
+}
+
+effect<'env> fn pin<'env, T>(value: T) -> *mut Pinned<T> ! OutOfMemoryError ? &mut Allocator {
+  let mut storage = run Box<Pinned<T>>.make(Pinned<T> { value: move value, root: Unrooted {} })
+  let pinned = Pointer.fromMutRef(&mut storage.getMut()[0])
+  let mut anchor = ()
+  unsafe {
+    let fresh = Pointer.borrowMut(&mut anchor, pinned)
+    fresh.root = Root<T> { storage: move storage }
+  }
+  return pinned
+}
+
+// The caller proves `pinned` came from `pin`, is unpinned once, and that nothing uses it after.
+unsafe fn unpin<T>(pinned: *mut Pinned<T>) -> () {
+  let mut anchor = ()
+  let held = unsafe Pointer.borrowMut(&mut anchor, pinned)
+  let root = Intrinsic.replace(held.root, Unrooted {})
+  match move root {
+    Root<T> { storage } => release<T>(move storage)
+    Unrooted nothing => ()
+  }
+  return ()
+}
+
+fn release<T>(storage: Box<Pinned<T>>) -> () { return () }
+
+// The value a fresh pinned allocation holds, borrowed exclusively. Only `make` functions use it,
+// while no other handle exists.
+unsafe fn fresh<'a, T>(anchor: &'a mut (), pinned: *mut Pinned<T>) -> &'a mut T {
+  unsafe { return &mut Pointer.borrowMut(&mut anchor.*, pinned).value }
+}
+
+struct ArcState<T> {
+  count: usize,
+  value: T,
+}
+
+/// A thread-safe reference-counted handle to one shared value.
+///
+/// # When to use
+///
+/// Use it to give several native threads ownership of one value. Change the value through a
+/// [`Mutex`] or atomics.
+///
+/// # Details
+///
+/// It counts its handles atomically, so threads can clone and drop handles at the same time. The
+/// last handle to drop, on any thread, drops the value. /// [`get`] borrows the value for as long
+/// as the handle is borrowed. `Arc<T>` is `Transferable` and `Concurrent` when `T` is both, since
+/// every handle lets its thread read the value.
+///
+/// # Gotchas
+///
+/// - It gives only shared borrows. Unlike `Shared<T>`, it does not detect reentrant access.
+/// - A reference cycle of `Arc` handles leaks.
+/// - These types need the same targets as `Atomic.wait`: Darwin on aarch64, Linux with GNU libc on
+/// x86_64 or aarch64, and wasm32.
+pub struct Arc<T> {
+  cell: *mut Pinned<ArcState<T>>,
+  counter: *mut usize,
+  value: *mut T,
+}
+
+impl<T: Transferable + Concurrent> Transferable for Arc<T> {}
+impl<T: Transferable + Concurrent> Concurrent for Arc<T> {}
+
+impl<T> Arc<T> {
+  /// Moves `value` into a new allocation owned by one handle.
+  pub effect<'env> fn make<'env>(value: T) -> Arc<T> ! OutOfMemoryError ? &mut Allocator {
+    let cell = run pin<ArcState<T>>(ArcState<T> { count: 1, value: move value })
+    let mut anchor = ()
+    let state = unsafe fresh<ArcState<T>>(&mut anchor, cell)
+    return Arc<T> { cell: cell, counter: Pointer.fromMutRef(&mut state.count), value: Pointer.fromMutRef(&mut state.value) }
+  }
+
+  /// Adds one handle to the same value.
+  ///
+  /// # Details
+  ///
+  /// The count is a word, and a count past half its range traps before the handle exists.
+  pub fn clone(self: &Self) -> Arc<T> {
+    let previous = unsafe Atomic.fetchAdd<usize>(self.counter, 1, MemoryOrder.Relaxed)
+    if previous > usize.MAX / 2 { Intrinsic.trap("Arc.clone: too many handles to one value") }
+    return Arc<T> { cell: self.cell, counter: self.counter, value: self.value }
+  }
+
+  /// Borrows the shared value for as long as this handle is borrowed.
+  pub fn get<'a>(self: &'a Self) -> &'a T {
+    // The value lives until the last handle drops, and is never written through a handle.
+    return unsafe Pointer.borrow(self, self.value)
+  }
+
+  /// Returns the number of handles at the time of the read. Other threads can change it at once.
+  pub fn count(self: &Self) -> usize {
+    return unsafe Atomic.load<usize>(self.counter, MemoryOrder.Relaxed)
+  }
+}
+
+impl<T> Drop for Arc<T> {
+  fn drop(self: &mut Arc<T>) -> () {
+    // Release orders this thread's use of the value before the final drop; the acquire fence
+    // orders every other thread's use before it.
+    if unsafe Atomic.fetchSubtract<usize>(self.counter, 1, MemoryOrder.Release) != 1 { return () }
+    Atomic.fence(MemoryOrder.Acquire)
+    unsafe unpin<ArcState<T>>(self.cell)
+    return ()
+  }
+}
+
+// The lock word: unlocked, locked with no sleeper, or locked with possible sleepers.
+const unlocked: u32 = 0
+const locked: u32 = 1
+const contended: u32 = 2
+
+struct MutexState<T> {
+  word: u32,
+  value: T,
+}
+
+/// A lock that gives one thread at a time exclusive access to a value.
+///
+/// # Details
+///
+/// [`lock`] returns a [`MutexGuard`], which borrows the value until it is dropped. `Mutex<T>` is
+/// `Transferable` and `Concurrent` when `T` is `Transferable`: the lock passes the value between
+/// threads one at a time. Share a mutex by putting it in an [`Arc`]. It is a futex lock: an
+/// uncontended lock or unlock is one atomic operation, and a contended lock sleeps in the operating
+/// system and does not spin.
+///
+/// # Gotchas
+///
+/// - Locking a mutex again on the thread that holds it deadlocks.
+/// - These types need the same targets as `Atomic.wait`: Darwin on aarch64, Linux with GNU libc on
+/// x86_64 or aarch64, and wasm32.
+pub struct Mutex<T> {
+  cell: *mut Pinned<MutexState<T>>,
+  word: *mut u32,
+  value: *mut T,
+}
+
+impl<T: Transferable> Transferable for Mutex<T> {}
+impl<T: Transferable> Concurrent for Mutex<T> {}
+
+impl<T> Mutex<T> {
+  /// Moves `value` into a new, unlocked mutex.
+  pub effect<'env> fn make<'env>(value: T) -> Mutex<T> ! OutOfMemoryError ? &mut Allocator {
+    let cell = run pin<MutexState<T>>(MutexState<T> { word: unlocked, value: move value })
+    let mut anchor = ()
+    let state = unsafe fresh<MutexState<T>>(&mut anchor, cell)
+    return Mutex<T> { cell: cell, word: Pointer.fromMutRef(&mut state.word), value: Pointer.fromMutRef(&mut state.value) }
+  }
+
+  /// Waits until the lock is free, takes it, and returns the guard that releases it.
+  pub fn lock<'a>(self: &'a Self) -> MutexGuard<'a, T> {
+    if unsafe acquired(self.word, unlocked, locked) { return MutexGuard<'a, T> { mutex: self } }
+    // Mark the lock contended, so the holder's unlock wakes a sleeper, then sleep until it is free.
+    while unsafe Atomic.swap<u32>(self.word, contended, MemoryOrder.Acquire) != unlocked {
+      let woken = unsafe Atomic.wait(self.word, contended, Option<u64>.none())
+    }
+    return MutexGuard<'a, T> { mutex: self }
+  }
+
+  /// Takes the lock when it is free, without waiting.
+  pub fn tryLock<'a>(self: &'a Self) -> Option<MutexGuard<'a, T>> {
+    if unsafe acquired(self.word, unlocked, locked) {
+      return Option<MutexGuard<'a, T>>.some(MutexGuard<'a, T> { mutex: self })
+    }
+    return Option<MutexGuard<'a, T>>.none()
+  }
+}
+
+unsafe fn acquired(word: *mut u32, expected: u32, desired: u32) -> bool {
+  return match unsafe Atomic.compareExchange<u32>(word, expected, desired, MemoryOrder.Acquire, MemoryOrder.Relaxed) {
+    CompareExchange<u32>.Exchanged => true
+    CompareExchange<u32>.Observed {..} => false
+  }
+}
+
+impl<T> Drop for Mutex<T> {
+  fn drop(self: &mut Mutex<T>) -> () {
+    // A guard borrows the mutex, so none is live here and the value is no longer shared.
+    unsafe unpin<MutexState<T>>(self.cell)
+    return ()
+  }
+}
+
+/// Exclusive access to the value of a locked [`Mutex`]. Dropping the guard unlocks the mutex.
+pub struct MutexGuard<'a, T> {
+  mutex: &'a Mutex<T>,
+}
+
+impl<'a, T> MutexGuard<'a, T> {
+  /// Borrows the locked value.
+  pub fn get<'b>(self: &'b Self) -> &'b T {
+    // The guard holds the lock, so no other thread writes the value while it is borrowed.
+    return unsafe Pointer.borrow(self, self.mutex.value)
+  }
+
+  /// Borrows the locked value exclusively.
+  pub fn getMut<'b>(self: &'b mut Self) -> &'b mut T {
+    // The guard holds the lock, so no other thread reads or writes the value while it is borrowed.
+    let value = self.mutex.value
+    return unsafe Pointer.borrowMut(&mut self.*, value)
+  }
+}
+
+impl<'a, T> Drop for MutexGuard<'a, T> {
+  fn drop(self: &mut MutexGuard<'a, T>) -> () {
+    // Release orders this thread's writes before the next holder's acquire.
+    if unsafe Atomic.swap<u32>(self.mutex.word, unlocked, MemoryOrder.Release) == contended {
+      unsafe Atomic.notifyOne(self.mutex.word)
+    }
+    return ()
+  }
+}
+
+// The park word: no token, a token waiting, or the owner asleep.
+const empty: u32 = 0
+const notified: u32 = 1
+const parked: u32 = 4294967295
+
+struct ParkState {
+  count: usize,
+  word: u32,
+}
+
+/// A one-token sleep for the thread that owns it.
+///
+/// # Details
+/// [`park`] returns at once if a token is waiting, and consumes it. If no token is waiting, it
+/// sleeps until an [`Unparker`] supplies one. Tokens do not add up: several unparks before one park
+/// wake it one time. A `Parker` stays with its thread. Its [`Unparker`]s go to the threads that
+/// wake it.
+///
+/// # Gotchas
+/// - `park` can also return with no token. Check your own condition again in a loop.
+/// - These types need the same targets as `Atomic.wait`: Darwin on aarch64, Linux with GNU libc on
+/// x86_64 or aarch64, and wasm32.
+pub struct Parker {
+  handle: ParkHandle,
+}
+
+/// The waking side of a [`Parker`]. Any thread can hold one.
+pub struct Unparker {
+  handle: ParkHandle,
+}
+
+struct ParkHandle {
+  cell: *mut Pinned<ParkState>,
+  count: *mut usize,
+  word: *mut u32,
+}
+
+impl Transferable for Unparker {}
+impl Concurrent for Unparker {}
+impl Transferable for Parker {}
+
+impl Parker {
+  /// Makes a parker with no token.
+  pub effect fn make() -> Parker ! OutOfMemoryError ? &mut Allocator {
+    let cell = run pin<ParkState>(ParkState { count: 1, word: empty })
+    let mut anchor = ()
+    let state = unsafe fresh<ParkState>(&mut anchor, cell)
+    return Parker { handle: ParkHandle { cell: cell, count: Pointer.fromMutRef(&mut state.count), word: Pointer.fromMutRef(&mut state.word) } }
+  }
+
+  /// Returns an [`Unparker`] that wakes this parker.
+  pub fn unparker(self: &Self) -> Unparker {
+    return Unparker { handle: self.handle.clone() }
+  }
+
+  /// Consumes a waiting token, or sleeps until one arrives.
+  ///
+  /// # Gotchas
+  /// It can also return with no token. Check your own condition again in a loop.
+  pub fn park(self: &Self) -> () {
+    let word = self.handle.word
+    // Notified becomes empty, and empty becomes parked, in one step.
+    if unsafe Atomic.fetchSubtract<u32>(word, 1, MemoryOrder.Acquire) == notified { return () }
+    while true {
+      let woken = unsafe Atomic.wait(word, parked, Option<u64>.none())
+      if unsafe acquiredOrdered(word, notified, empty) { return () }
+    }
+    return ()
+  }
+
+  /// Consumes a waiting token, or sleeps until one arrives or `timeout` nanoseconds pass. Returns
+  /// whether it consumed a token.
+  ///
+  /// # Gotchas
+  /// It can also return `false` early, with no token. Check your own condition again in a loop.
+  pub fn parkTimeout(self: &Self, timeout: u64) -> bool {
+    let word = self.handle.word
+    if unsafe Atomic.fetchSubtract<u32>(word, 1, MemoryOrder.Acquire) == notified { return true }
+    let woken = unsafe Atomic.wait(word, parked, Option<u64>.some(timeout))
+    // Parked or notified, whichever it holds now, becomes empty.
+    return unsafe Atomic.swap<u32>(word, empty, MemoryOrder.Acquire) == notified
+  }
+}
+
+impl Unparker {
+  /// Supplies the token, and wakes the parker if it sleeps.
+  pub fn unpark(self: &Self) -> () {
+    let word = self.handle.word
+    // Release orders this thread's writes before the parker's acquire.
+    if unsafe Atomic.swap<u32>(word, notified, MemoryOrder.Release) == parked { unsafe Atomic.notifyOne(word) }
+    return ()
+  }
+
+  /// Adds another unparker for the same parker.
+  pub fn clone(self: &Self) -> Unparker {
+    return Unparker { handle: self.handle.clone() }
+  }
+}
+
+unsafe fn acquiredOrdered(word: *mut u32, expected: u32, desired: u32) -> bool {
+  return match unsafe Atomic.compareExchange<u32>(word, expected, desired, MemoryOrder.Acquire, MemoryOrder.Acquire) {
+    CompareExchange<u32>.Exchanged => true
+    CompareExchange<u32>.Observed {..} => false
+  }
+}
+
+impl ParkHandle {
+  fn clone(self: &Self) -> ParkHandle {
+    let previous = unsafe Atomic.fetchAdd<usize>(self.count, 1, MemoryOrder.Relaxed)
+    if previous > usize.MAX / 2 { Intrinsic.trap("ParkHandle.clone: too many handles to one parking cell") }
+    return ParkHandle { cell: self.cell, count: self.count, word: self.word }
+  }
+}
+
+impl Drop for ParkHandle {
+  fn drop(self: &mut ParkHandle) -> () {
+    if unsafe Atomic.fetchSubtract<usize>(self.count, 1, MemoryOrder.Release) != 1 { return () }
+    Atomic.fence(MemoryOrder.Acquire)
+    unsafe unpin<ParkState>(self.cell)
+    return ()
+  }
+}

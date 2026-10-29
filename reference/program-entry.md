@@ -30,17 +30,17 @@ runtime-none profiles acquire no default startup or execution-storage component.
 
 **Status:** Confirmed
 
-The hosted executable default is `silk/native_start`. Its source C `main(argc, argv)` snapshots
+The hosted executable default is `silk/platform/native/start`. Its source C `main(argc, argv)` snapshots
 process inputs, creates a bounded lexical diagnostic observer, owns an Execution, and drives the
 application to completion. It accepts ordinary integer or unit results, or an Effect producing unit
 with no requirements or one mutable HostInput requirement. The HostInput requirement is satisfied
 by an ordinary source provider backed by the owned snapshot.
 
-The standalone WebAssembly default is `silk/wasm_start`. Its C export is `main() -> i32`; it owns an
+The standalone WebAssembly default is `silk/platform/wasm/start`. Its C export is `main() -> i32`; it owns an
 Execution and accepts integer, unit, or requirement-free Effect-unit results. It installs no native
 host-input provider or diagnostic reporter and publishes no `silk_main` adapter.
 
-The WASI command default is `silk/wasi_start`. Its `_start() -> ()` export owns an Execution and
+The WASI command default is `silk/platform/wasi/start`. Its `_start() -> ()` export owns an Execution and
 accepts integer, unit, or Effects producing either result, with no requirements or one mutable
 HostInput requirement. It supplies an owned snapshot of WASI arguments and environment, finishes
 cleanup, then exits through WASI. See [WASI targets](wasi.md).

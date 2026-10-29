@@ -5,7 +5,7 @@ description: Acquire owned or scoped TCP and pathname-Unix ByteDuplex connection
 
 # Native socket connections
 
-`silk.native_socket` is the ordinary-source native transport for numeric TCP endpoints and local
+`silk.net.socket_native` is the ordinary-source native transport for numeric TCP endpoints and local
 pathname-Unix sockets. `connectResolvedOwned` and `connectUnixOwned` return the authoritative
 affine `Connection`; their scoped counterparts consume that owner and lend it to one callback. The
 module is selected only for aarch64 Apple Darwin with system libc and aarch64 or x86-64 GNU/Linux
@@ -14,12 +14,12 @@ with GNU libc. Portable, no-libc, musl, and Windows profiles do not expose it or
 ## Open a local pathname connection
 
 ```silk
-import silk.byte_duplex {ByteDuplex, ByteIoError}
-import silk.effect {Effect}
-import silk.monotonic_clock {MonotonicClock}
-import silk.native_socket {ConnectOptions, Connection, NativeSocketError, connectUnix}
-import silk.option {Option}
-import silk.system_clock {Instant}
+import silk.io.byte_duplex {ByteDuplex, ByteIoError}
+import silk.core.effect {Effect}
+import silk.system.monotonic_clock {MonotonicClock}
+import silk.net.socket_native {ConnectOptions, Connection, NativeSocketError, connectUnix}
+import silk.core.option {Option}
+import silk.system.system_clock {Instant}
 
 effect fn sendRequest(connection: &mut Connection) -> ()
 ! ByteIoError

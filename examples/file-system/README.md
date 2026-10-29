@@ -7,7 +7,7 @@ program constructs a provider-absolute `Path`, passes one complete byte view to
 
 The provider is deliberately ordinary Silk source. A native application can instead provide the
 confined `OsFileSystem`; a browser or Wasm application can provide a virtual filesystem without
-changing the consumer operations. Importing `silk.filesystem` never selects a platform or an
+changing the consumer operations. Importing `silk.system.filesystem` never selects a platform or an
 ambient current directory.
 
 This minimal provider supports ordinary writes only. `createFile`, `writeFileAtomic`, and

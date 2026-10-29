@@ -1,0 +1,429 @@
+//! The binary plan and receipt formats that let `silk test` control the test runner.
+//!
+//! # When to use
+//! `silk.testing.runner` uses this module. The host (the `silk test` driver) writes a plan file, and
+//! the runner writes a receipt file. You do not call it from normal code.
+//!
+//! # Details
+//! A plan starts with the magic `SLKTPLN1`, a version (`1`), a mode, and a 32-byte nonce. All
+//! integers are little-endian. There are two modes:
+//!
+//! - Per-test mode (`1`). The plan has the count of discovered tests, then one catalog entry per
+//!   test: ordinal, declaration name, execution identity, and action (`0` run, `1` cached). The
+//!   receipt has one result per selected test. Its disposition is `0` cached, `1` passed, or `2`
+//!   failed.
+//! - Uncached mode (`2`). The plan is exactly 256 bytes. It holds a SHA-256 digest of the catalog
+//!   (see [`updateCatalogDigest`]) and the test count, then zero padding. The receipt is also
+//!   padded to 256 bytes.
+//!
+//! A receipt starts with the magic `SLKTRCP1`, the version, the mode, the nonce of the plan, and
+//! the SHA-256 of the complete plan. It ends with the counts and the status.
+//!
+//! A progress record lets the host continue a run after a test traps. It is exactly 48 bytes: the
+//! magic `SLKTPRG1`, the ordinal of the test that is starting, then the cached, executed, passed
+//! and failed counts before that test. The runner writes one before each test body runs, so after
+//! an abnormal exit the record names the test that stopped the process.
+//!
+//! # Gotchas
+//! - A [`Plan`] does not stop at the first error. After a failure it reads as empty, and [`failed`]
+//!   stays true. Check [`failed`] or the `bool` results before a test body runs.
+//! - Test output goes to the inherited stdout and stderr. Only the receipt decides the result.
+//!
+//! @category Testing
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.core.option { Option }
+import silk.crypto.sha2 { Sha256 }
+import silk.collections.slice { Slice }
+import silk.text.string { String }
+import silk.num.u32
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+
+const VERSION: u32 = 1
+const PER_TEST: u32 = 1
+const UNCACHED: u32 = 2
+const COMPACT_BYTES: usize = 256
+const HARD_MAXIMUM_BYTES: usize = 16777216
+
+/// A cursor over one borrowed plan file that the `silk test` driver wrote.
+///
+/// # Gotchas
+/// It does not stop at the first error. After a failure it reads as empty, and [`failed`]
+/// stays true. Check [`failed`] or the `bool` results before a test body runs.
+pub struct Plan<'a> {
+  bytes: &'a [u8],
+  cursor: usize,
+  modeValue: u32,
+  failedValue: bool,
+}
+
+/// One borrowed per-test catalog entry.
+pub struct Entry<'a> {
+  executionBytes: &'a [u8],
+  actionValue: u8,
+  validValue: bool,
+}
+
+/// A run's position when a test started: the catalog ordinal of that test and the counts before it.
+///
+/// # Details
+/// The runner writes it with [`progressRecord`] before each test body runs. After the process
+/// stops abnormally, [`readProgress`] reads it back, and a new runner continues after that test.
+pub struct Progress {
+  /// The catalog ordinal of the test that was starting.
+  pub ordinal: u64,
+  /// The cached passes before that test.
+  pub cachedCount: u64,
+  /// The tests executed before that test.
+  pub executed: u64,
+  /// The tests that passed before that test, cached passes included.
+  pub passed: u64,
+  /// The tests that failed before that test.
+  pub failedCount: u64,
+}
+
+/// An owned receipt under construction. Start it with [`beginReceipt`].
+pub struct Receipt {
+  bytes: Bytes,
+  modeValue: u32,
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut different: u8 = 0
+  let mut index = usize.ZERO
+  while index < left.length {
+    different = u8.bitOr(different, u8.bitXor(left[index], right[index]))
+    index = index + usize.ONE
+  }
+  return different == 0
+}
+
+fn reject(plan: &mut Plan) -> () { plan.failedValue = true }
+
+fn take<'a>(plan: &mut Plan<'a>, length: usize) -> &'a [u8] {
+  if plan.failedValue || length > plan.bytes.length - plan.cursor {
+    reject(&mut plan)
+    return Slice.view<u8>(plan.bytes, usize.ZERO, usize.ZERO)
+  }
+  let result = Slice.view<u8>(plan.bytes, plan.cursor, length)
+  plan.cursor = plan.cursor + length
+  return result
+}
+
+fn readU8(plan: &mut Plan) -> u8 {
+  let bytes = take(&mut plan, usize.ONE)
+  if plan.failedValue { return 0 }
+  return bytes[usize.ZERO]
+}
+
+fn readU32(plan: &mut Plan) -> u32 {
+  let bytes = take(&mut plan, 4)
+  if plan.failedValue { return 0 }
+  let mut result: u32 = 0
+  let mut index = usize.ZERO
+  while index < 4 {
+    result = u32.bitOr(result, u32.shiftLeft(u8.toU32(bytes[index]), usize.toU32(index * 8)))
+    index = index + usize.ONE
+  }
+  return result
+}
+
+fn readU64(plan: &mut Plan) -> u64 {
+  let bytes = take(&mut plan, 8)
+  if plan.failedValue { return 0 }
+  let mut result: u64 = 0
+  let mut index = usize.ZERO
+  while index < 8 {
+    result = u64.bitOr(result, u64.shiftLeft(u8.toU64(bytes[index]), usize.toU64(index * 8)))
+    index = index + usize.ONE
+  }
+  return result
+}
+
+fn readText<'a>(plan: &mut Plan<'a>) -> &'a [u8] {
+  let length = readU64(&mut plan)
+  let narrowed = u64.checkedToUsize(length)
+  return match move narrowed {
+    Option<usize>.Some { value } => take(&mut plan, value)
+    Option<usize>.None => rejectedEmpty(&mut plan)
+  }
+}
+
+fn rejectedEmpty<'a>(plan: &mut Plan<'a>) -> &'a [u8] {
+  reject(&mut plan)
+  return Slice.view<u8>(plan.bytes, usize.ZERO, usize.ZERO)
+}
+
+effect fn append(out: &mut Bytes, bytes: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run Bytes.append(&mut out, bytes)
+}
+
+effect fn appendU8(out: &mut Bytes, value: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  let one = [value]
+  return run append(&mut out, &one)
+}
+
+effect fn appendU32(out: &mut Bytes, value: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut index = usize.ZERO
+  while index < 4 {
+    let shifted = u32.shiftRight(value, usize.toU32(index * 8))
+    run appendU8(&mut out, u32.toU8(u32.bitAnd(shifted, 255)))
+    index = index + usize.ONE
+  }
+  return ()
+}
+
+effect fn appendU64(out: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut index = usize.ZERO
+  while index < 8 {
+    let shifted = u64.shiftRight(value, usize.toU64(index * 8))
+    run appendU8(&mut out, u64.toU8(u64.bitAnd(shifted, 255)))
+    index = index + usize.ONE
+  }
+  return ()
+}
+
+effect fn appendText(out: &mut Bytes, value: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run appendU64(&mut out, usize.toU64(value.length))
+  return run append(&mut out, value)
+}
+
+/// Opens a plan and checks its magic, version, mode and nonce framing.
+///
+/// If a check fails, the returned plan is already rejected: it reads as empty, and [`failed`]
+/// returns `true`.
+pub fn openPlan<'a>(bytes: &'a [u8]) -> Plan<'a> {
+  let mut plan = Plan<'a> {bytes: bytes, cursor: usize.ZERO, modeValue: 0, failedValue: false}
+  let magic = take(&mut plan, 8)
+  let version = readU32(&mut plan)
+  let mode = readU32(&mut plan)
+  let nonce = take(&mut plan, 32)
+  drop nonce
+  if same(magic, b"SLKTPLN1") == false || version != VERSION || (mode != PER_TEST && mode != UNCACHED) {
+    reject(&mut plan)
+  }
+  plan.modeValue = mode
+  return move plan
+}
+
+/// Returns true for a per-test plan (mode `1`).
+pub fn isPerTest(plan: &Plan) -> bool { return plan.modeValue == PER_TEST }
+
+/// Returns true for an uncached plan of 256 bytes (mode `2`).
+pub fn isUncached(plan: &Plan) -> bool { return plan.modeValue == UNCACHED }
+
+/// Returns true after a check on the plan fails. It does not become false again.
+pub fn failed(plan: &Plan) -> bool { return plan.failedValue }
+
+/// Reads the test count of a per-test plan, and checks it and the size bound of the file.
+///
+/// The count must equal `expectedDiscovered`. Call it before any test body runs.
+pub fn beginPerTest(plan: &mut Plan, expectedDiscovered: u64) -> bool {
+  if !isPerTest(&plan) { reject(&mut plan) return false }
+  let discovered = readU64(&mut plan)
+  if discovered != expectedDiscovered { reject(&mut plan) return false }
+  let count = match move u64.checkedToUsize(discovered) {
+    Option<usize>.Some { value } => value
+    Option<usize>.None => { reject(&mut plan) return false }
+  }
+  let mut bound = HARD_MAXIMUM_BYTES
+  if count <= (HARD_MAXIMUM_BYTES - 4096) / 256 { bound = 4096 + count * 256 }
+  if bound < 84 || plan.bytes.length > bound - 84 { reject(&mut plan) return false }
+  return !plan.failedValue
+}
+
+/// Reads and checks the next catalog entry.
+///
+/// The ordinal and declaration name must match the expected values, and a cached entry must have an
+/// execution identity. For an uncached plan, it returns [`uncachedEntry`] and reads nothing.
+pub fn readEntry<'a>(
+  plan: &mut Plan<'a>,
+  expectedOrdinal: u64,
+  expectedDeclaration: &[u8],
+) -> Entry<'a> {
+  if isUncached(&plan) { return uncachedEntry(plan.bytes) }
+  let ordinal = readU64(&mut plan)
+  let declaration = readText(&mut plan)
+  let execution = readText(&mut plan)
+  let action = readU8(&mut plan)
+  let valid = !plan.failedValue
+    && ordinal == expectedOrdinal
+    && declaration.length != usize.ZERO
+    && same(declaration, expectedDeclaration)
+    && (action == 0 || action == 1)
+    && (action == 0 || execution.length != usize.ZERO)
+  if !valid { reject(&mut plan) }
+  return Entry<'a> {executionBytes: execution, actionValue: action, validValue: valid}
+}
+
+/// Returns true for a valid entry that the host marked as a cache hit.
+pub fn cached(entry: &Entry) -> bool { return entry.validValue && entry.actionValue == 1 }
+
+/// Borrows the opaque execution identity of an entry.
+pub fn executionIdentity<'a>(entry: &Entry<'a>) -> &'a [u8] { return entry.executionBytes }
+
+/// Returns the empty entry that is not cached, for uncached mode.
+pub fn uncachedEntry<'a>(bytes: &'a [u8]) -> Entry<'a> {
+  return Entry<'a> {
+    executionBytes: Slice.view<u8>(bytes, usize.ZERO, usize.ZERO),
+    actionValue: 0,
+    validValue: true,
+  }
+}
+
+/// Checks that a per-test plan ends exactly after the catalog.
+pub fn finishPerTest(plan: &mut Plan) -> bool {
+  if plan.cursor != plan.bytes.length { reject(&mut plan) }
+  return !plan.failedValue
+}
+
+/// Checks an uncached plan: exactly 256 bytes, the catalog digest, the test count, and zero
+/// padding.
+pub fn validateUncached(
+  plan: &mut Plan,
+  expectedCatalogDigest: &[u8],
+  expectedDiscovered: u64,
+) -> bool {
+  if failed(&plan) || !isUncached(&plan) || plan.bytes.length != COMPACT_BYTES {
+    reject(&mut plan)
+    return false
+  }
+  let digest = take(&mut plan, 32)
+  let discovered = readU64(&mut plan)
+  if failed(&plan) { return false }
+  if !same(digest, expectedCatalogDigest) || discovered != expectedDiscovered {
+    reject(&mut plan)
+    return false
+  }
+  while plan.cursor < plan.bytes.length {
+    if readU8(&mut plan) != 0 {
+      reject(&mut plan)
+      return false
+    }
+  }
+  return !plan.failedValue
+}
+
+/// Adds one catalog identity to the digest of an uncached plan.
+///
+/// It hashes the ordinal and the identity length as 8-byte little-endian values, then the identity.
+pub fn updateCatalogDigest(state: &mut Sha256, ordinal: u64, identity: &[u8]) -> () {
+  let mut ordinalBytes: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0]
+  let mut lengthBytes: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0]
+  let mut index = usize.ZERO
+  while index < 8 {
+    ordinalBytes[index] = u64.toU8(u64.bitAnd(u64.shiftRight(ordinal, usize.toU64(index * 8)), 255))
+    lengthBytes[index] = u64.toU8(u64.bitAnd(u64.shiftRight(usize.toU64(identity.length), usize.toU64(index * 8)), 255))
+    index = index + usize.ONE
+  }
+  Sha256.update(&mut state.*, &ordinalBytes)
+  Sha256.update(&mut state.*, &lengthBytes)
+  return Sha256.update(&mut state.*, identity)
+}
+
+/// Starts a receipt for `plan`. It copies the nonce and hashes the complete plan.
+///
+/// `selected` is the number of results that follow in per-test mode.
+pub effect fn beginReceipt(
+  plan: &[u8],
+  perTest: bool,
+  selected: u64,
+) -> Receipt ! OutOfMemoryError ? &mut Allocator {
+  let mut bytes = Bytes.make()
+  run append(&mut bytes, b"SLKTRCP1")
+  run appendU32(&mut bytes, VERSION)
+  let mut mode = UNCACHED
+  if perTest { mode = PER_TEST }
+  run appendU32(&mut bytes, mode)
+  run append(&mut bytes, Slice.view<u8>(plan, 16, 32))
+  let digest = Sha256.hash(plan)
+  run append(&mut bytes, &digest)
+  if perTest { run appendU64(&mut bytes, selected) }
+  return Receipt {bytes: move bytes, modeValue: mode}
+}
+
+/// Appends one per-test result. Append results in ordinal order.
+///
+/// # Gotchas
+/// It traps if the receipt is not per-test, or if `disposition` is more than `2`.
+pub effect fn appendResult(
+  receipt: &mut Receipt,
+  ordinal: u64,
+  declaration: &[u8],
+  execution: &[u8],
+  disposition: u8,
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  if receipt.modeValue != PER_TEST || disposition > 2 { Intrinsic.trap("appendResult: the receipt is not per-test or the disposition is more than 2") }
+  run appendU64(&mut receipt.bytes, ordinal)
+  run appendText(&mut receipt.bytes, declaration)
+  run appendText(&mut receipt.bytes, execution)
+  return run appendU8(&mut receipt.bytes, disposition)
+}
+
+/// Appends the counts and the status, and returns the receipt bytes.
+///
+/// In uncached mode the receipt is padded to exactly 256 bytes.
+pub effect fn finishReceipt(
+  receipt: Receipt,
+  discovered: u64,
+  selected: u64,
+  cachedCount: u64,
+  executed: u64,
+  passed: u64,
+  failedCount: u64,
+  status: u32,
+) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut owned = move receipt
+  run appendU64(&mut owned.bytes, discovered)
+  run appendU64(&mut owned.bytes, selected)
+  run appendU64(&mut owned.bytes, cachedCount)
+  run appendU64(&mut owned.bytes, executed)
+  run appendU64(&mut owned.bytes, passed)
+  run appendU64(&mut owned.bytes, failedCount)
+  run appendU32(&mut owned.bytes, status)
+  if owned.modeValue == UNCACHED {
+    while owned.bytes.length() < COMPACT_BYTES { run appendU8(&mut owned.bytes, 0) }
+    if owned.bytes.length() != COMPACT_BYTES { Intrinsic.trap("test exchange: the compact receipt has the wrong length") }
+  }
+  return move owned.bytes
+}
+
+/// Returns the 48-byte progress record of `progress`.
+///
+/// # Details
+/// The record is the magic `SLKTPRG1`, then the ordinal and the four counts as 8-byte
+/// little-endian integers.
+pub effect fn progressRecord(progress: &Progress) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut bytes = Bytes.make()
+  run append(&mut bytes, b"SLKTPRG1")
+  run appendU64(&mut bytes, progress.ordinal)
+  run appendU64(&mut bytes, progress.cachedCount)
+  run appendU64(&mut bytes, progress.executed)
+  run appendU64(&mut bytes, progress.passed)
+  run appendU64(&mut bytes, progress.failedCount)
+  return move bytes
+}
+
+/// Reads a progress record that [`progressRecord`] wrote.
+///
+/// # Details
+/// It returns `None` unless `bytes` is exactly one record with the `SLKTPRG1` magic.
+pub fn readProgress(bytes: &[u8]) -> Option<Progress> {
+  let mut record = Plan {bytes: bytes, cursor: usize.ZERO, modeValue: 0, failedValue: false}
+  let magic = take(&mut record, 8)
+  let progress = Progress {
+    ordinal: readU64(&mut record),
+    cachedCount: readU64(&mut record),
+    executed: readU64(&mut record),
+    passed: readU64(&mut record),
+    failedCount: readU64(&mut record),
+  }
+  if record.failedValue || !same(magic, b"SLKTPRG1") || record.cursor != bytes.length {
+    return Option<Progress>.none()
+  }
+  return Option<Progress>.some(move progress)
+}

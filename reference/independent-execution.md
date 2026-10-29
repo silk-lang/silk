@@ -1,6 +1,6 @@
 # Independently resumable Effect executions
 
-The `silk.execution` module packages one lazy Effect so an ordinary source owner can select its
+The `silk.concurrency.execution` module packages one lazy Effect so an ordinary source owner can select its
 first activation, receive it back when it relinquishes control, and drive it again after external
 readiness. This is explicit local execution ownership. It does not create a scheduler, fiber,
 thread, queue, timer, or implicit program-entry owner.
@@ -16,7 +16,7 @@ returns control to an owner outside the body.
 - An **activation** is one legal call to `Execution.drive`.
 - The **branch state** is owner data transferred to exactly one drive-outcome callback.
 - A **Wake** is the affine readiness authority for one parked generation. It is the ordinary
-  source struct `Wake` exported by `silk.execution`.
+  source struct `Wake` exported by `silk.concurrency.execution`.
 - The **registration guard** is the value returned by `Execution.park`'s registration callback and
   retained until that generation resumes or is destroyed.
 
@@ -64,14 +64,14 @@ Construction failure is `Allocator.OutOfMemoryError`. It publishes no Execution 
 under ordinary Effect cleanup. Later refusal by the selected execution-storage component is a fatal trap,
 not an allocator requirement or typed failure.
 
-**Boundary:** Importing `silk.execution` and constructing ordinary Effects allocate no execution
+**Boundary:** Importing `silk.concurrency.execution` and constructing ordinary Effects allocate no execution
 package. Only `Execution.make` selects this storage boundary.
 
 **Diagnostics:** An endpoint that is not detached and non-parking reports `SEM0139` at the failed
 property application. A package layout mismatch at the unsafe intrinsic boundary reports
 `SEM0142`.
 
-**Evidence:** [ordinary source implementation](../stdlib/silk/execution.silk),
+**Evidence:** [ordinary source implementation](../stdlib/silk/concurrency/execution.silk),
 package tests.
 
 ### EXEC-002 — The owner drives only Initial, InitialReady, or Eligible executions
@@ -114,7 +114,7 @@ continues.
 Signaling or dropping a Wake consumes it. A stale or duplicate Wake cannot publish a second
 readiness event.
 
-The readiness phase and the park generation are ordinary source policy in `silk.execution`. They
+The readiness phase and the park generation are ordinary source policy in `silk.concurrency.execution`. They
 live together in one package control word that the compiler zeroes and never interprets, so one
 compare-exchange checks a Wake's generation and moves its phase (EXEC-009). A Wake carries its
 generation; signaling a Wake whose Execution was dropped, completed, or parked again publishes
@@ -124,7 +124,7 @@ authority.
 **Diagnostics:** Reusing a consumed Wake reports the ordinary affine `OWN0001` diagnostic. Parking
 while an incompatible local-shared access loan is live reports `OWN0016` before lowering.
 
-**Evidence:** [ordinary source policy](../stdlib/silk/execution.silk),
+**Evidence:** [ordinary source policy](../stdlib/silk/concurrency/execution.silk),
 external parking tests.
 
 ### EXEC-004 — Executions are local affine owners
@@ -142,7 +142,7 @@ may cross parking; a result cannot return a view into package-owned storage.
 
 **Boundary:** `LocalExecution` permits same-thread suspension, parking, and owner transfer. The
 package protocol itself is safe across threads (EXEC-009), but neither intrinsic handle is
-`Transferable` (THREAD-002). Only the `silk.execution` wrappers of EXEC-010 move to another thread.
+`Transferable` (THREAD-002). Only the `silk.concurrency.execution` wrappers of EXEC-010 move to another thread.
 
 **Diagnostics:** Unsatisfied `Intrinsic.Detached` or `Intrinsic.NonParking` properties report
 `SEM0139` with the retained capture, provider, or parking path. Missing explicit ownership of a
@@ -230,7 +230,7 @@ The compiler recognizes only these sealed target-neutral Execution primitives:
 - `Intrinsic.executionLive` reports whether the Execution handle still exists.
 
 `Wake`, `Execution.park`, `Execution.wake`, `Execution.notifyInitial`, and the drive admission
-check are ordinary source in `silk.execution`.
+check are ordinary source in `silk.concurrency.execution`.
 Schedulers, fibers, deferred values, timers, reactors, ready queues, fairness, cancellation policy,
 and structured concurrency are ordinary source concepts built over those primitives and
 [`Shared`](local-shared-ownership.md).
@@ -281,7 +281,7 @@ atomically, under the memory model of ATOMIC-001:
 | Notifying marker | `executionNotify` claims it with a compare-exchange before it checks liveness and runs the endpoint. A drop either claims it first, which makes later notifications run nothing, or leaves itself to the running notification, which performs it after the endpoint returns. |
 | Control words | `executionLoad` is an acquire load, `executionStore` a release store, and `executionCompareExchange` an acquire-release compare-exchange that yields the value it observed. |
 
-`silk.execution` keeps the park generation and the readiness phase in control word 0 as
+`silk.concurrency.execution` keeps the park generation and the readiness phase in control word 0 as
 `generation * 8 + phase`, and moves between phases only by compare-exchange of that word. A parked
 generation stays `Registering` until its drive returns with the body's frames stored; the drive
 then makes it `Dormant`, or `Eligible` when a signal was latched meanwhile. A signal publishes
@@ -295,7 +295,7 @@ each access to the plain one.
 
 **Diagnostics:** None. A notification racing a drop runs nothing instead of trapping.
 
-**Evidence:** [ordinary source policy](../stdlib/silk/execution.silk), native corpus
+**Evidence:** [ordinary source policy](../stdlib/silk/concurrency/execution.silk), native corpus
 (`independent-execution-stale-generation-wake`).
 
 **Current compiler:** Aligned.
@@ -342,7 +342,7 @@ stay local.
 reports `SEM0121`. Adopting, or parking transferably in, a package made by `Execution.make` is a
 fatal state trap.
 
-**Evidence:** [ordinary source policy](../stdlib/silk/execution.silk), native corpus
+**Evidence:** [ordinary source policy](../stdlib/silk/concurrency/execution.silk), native corpus
 (`transferable-execution-wake`, `transferable-execution-adopt-local`), invalid corpus
 (`transferable-execution-bounds`).
 

@@ -1,0 +1,855 @@
+//! A fixed-size output buffer that collects small writes and sends them as larger writes.
+//!
+//! # When to use
+//! Use [`BufferedOutput`] when a program makes many small writes to a byte transport and each
+//! transport write has a cost, such as a system call. Make the buffer with [`BufferedOutput.make`],
+//! write with [`BufferedOutput.writeAll`], and end with [`BufferedOutput.finish`].
+//! To give code that requires `&mut Writer` a buffered destination, wrap that destination, such as
+//! `silk.io.writer_native.StdoutWriter`, in a [`BufferedWriter`].
+//!
+//! Each operation has two forms. The deadline form, such as `writeAll`, uses a
+//! `silk.io.byte_duplex.ByteDuplex` transport and a deadline. The `Writer` form, such as
+//! `writeAllWriter`, uses a `silk.io.writer.Writer` provider and has no deadline.
+//!
+//! # Details
+//! When a write returns, the buffer owns the accepted bytes. The buffer sends pending bytes to the
+//! transport only when it is full or when the caller flushes it. Input that is longer than the
+//! buffer is not copied: once the pending bytes are sent, it goes to the transport directly. A
+//! flush sends all pending bytes in order, one time each.
+//!
+//! A failed transport write or flush makes the buffer terminal. After that, each write and flush
+//! fails with `BufferError.Terminal`. The error reports exactly how many bytes the transport
+//! accepted before the failure.
+//!
+//! # Gotchas
+//! Dropping a `BufferedOutput` does not flush it. Pending bytes that are not flushed are lost. Call
+//! [`BufferedOutput.finish`] before the buffer goes out of scope.
+//!
+//! # Examples
+//! ## Collect two writes into one transport write
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.io.buffered_input { BufferError }
+//! import silk.io.buffered_output { BufferedOutput }
+//! import silk.core.effect { Effect }
+//! import silk.io.writer { Writer, WriterError }
+//!
+//! // A Writer provider that counts the calls and bytes it receives.
+//! struct CountingWriter {
+//!   calls: usize,
+//!   bytes: usize,
+//! }
+//!
+//! impl Writer for CountingWriter {
+//!   effect fn writeAll(self: &mut Self, val: &[u8]) -> ()
+//!     ! WriterError
+//!     ? &mut Writer {
+//!     self.calls = self.calls + 1
+//!     self.bytes = self.bytes + val.length
+//!     return ()
+//!   }
+//!
+//!   effect fn flush(self: &mut Self) -> ()
+//!     ! WriterError
+//!     ? &mut Writer {
+//!     return ()
+//!   }
+//! }
+//!
+//! pub effect fn main() -> i32
+//!   ! BufferError | OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let mut output = run BufferedOutput.make(64) |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let mut sink = CountingWriter { calls: 0, bytes: 0 }
+//!   run BufferedOutput.writeAllWriter(&mut output, b"hello, ") |> Effect.provideMut<Writer>(&mut sink)
+//!   run BufferedOutput.writeAllWriter(&mut output, b"world") |> Effect.provideMut<Writer>(&mut sink)
+//!
+//!   // Both writes fit in the buffer, so the sink has received nothing yet.
+//!   if sink.calls != 0 {
+//!     return 1
+//!   }
+//!   run BufferedOutput.flushWriter(&mut output) |> Effect.provideMut<Writer>(&mut sink)
+//!   if sink.calls != 1 || sink.bytes != 12 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Input and output
+
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.io.buffered_input {BufferError, MAX_CAPACITY}
+import silk.io.byte_duplex {ByteDuplex, ByteIoError}
+import silk.collections.bytes {Bytes}
+import silk.core.effect {Effect}
+import silk.mem.layout {Layout}
+import silk.system.monotonic_clock {MonotonicClock}
+import silk.core.option {Option}
+import silk.mem.raw_buffer {RawBuffer}
+import silk.core.result {Result}
+import silk.collections.slice {Slice}
+import silk.system.system_clock {Instant, SystemClock}
+import silk.num.usize
+import silk.io.writer {Writer, WriterError}
+
+/// A fixed-size buffer that holds output bytes until the transport receives them.
+///
+/// # When to use
+///
+/// Use it when a program makes many small writes to a byte transport and each transport write has
+/// a cost, such as a system call. Make the buffer with [`BufferedOutput.make`], write with
+/// [`BufferedOutput.writeAll`], and end with [`BufferedOutput.finish`].
+///
+/// Each operation has two forms. The deadline form, such as `writeAll`, uses a
+/// `silk.io.byte_duplex.ByteDuplex` transport and a deadline. The `Writer` form, such as
+/// `writeAllWriter`, uses a `silk.io.writer.Writer` provider and has no deadline.
+///
+/// # Details
+///
+/// The buffer sends pending bytes to the transport only when it is full or when the caller flushes
+/// it. Input that is longer than the buffer is not copied: once the pending bytes are sent, it goes
+/// to the transport directly. A failed transport write or flush makes the buffer terminal. After
+/// that, each write and flush fails with `BufferError.Terminal`.
+///
+/// The buffer has one allocation of [`BufferedOutput.capacity`] bytes. The size does not change
+/// after [`BufferedOutput.make`]. [`BufferedOutput.pending`] gives the number of bytes that the
+/// buffer holds and the transport has not yet received.
+///
+/// # Gotchas
+///
+/// Dropping the buffer does not flush it. Pending bytes that are not flushed are lost. Call
+/// [`BufferedOutput.finish`] before the buffer goes out of scope.
+pub struct BufferedOutput {
+  storage: Intrinsic.RawBuffer<u8>,
+  capacityValue: usize,
+  start: usize,
+  end: usize,
+  terminal: bool,
+}
+
+impl BufferedOutput {
+  /// Returns an empty buffer that holds at most `capacity` bytes.
+  ///
+  /// # Details
+  ///
+  /// This function makes one allocation of `capacity` bytes from the active `Allocator`. The buffer
+  /// does no transport operation until the first write that does not fit or the first flush.
+  ///
+  /// # Errors
+  ///
+  /// - `BufferError.InvalidCapacity` if `capacity` is zero or more than
+  ///   `silk.io.buffered_input.MAX_CAPACITY` (1 MiB). The function does not allocate.
+  /// - `OutOfMemoryError` if the active `Allocator` cannot supply `capacity` bytes.
+  pub effect fn make(capacity: usize) -> BufferedOutput
+  ! BufferError | OutOfMemoryError
+  ? &mut Allocator {
+    if capacity == usize.ZERO || capacity > MAX_CAPACITY {
+      fail BufferError.InvalidCapacity {capacity: capacity}
+    }
+    let allocation = run Allocator.allocate(Layout {bytes: capacity, alignment: usize.ONE})
+    // The allocation was requested for `capacity` bytes with byte alignment.
+    let mut storage = unsafe RawBuffer.from<u8>(move allocation, capacity)
+    RawBuffer.fill(&mut storage, usize.ZERO, capacity, 0)
+    return BufferedOutput {
+      storage: move storage,
+      capacityValue: capacity,
+      start: usize.ZERO,
+      end: usize.ZERO,
+      terminal: false,
+    }
+  }
+
+  /// Returns the maximum number of bytes that the buffer can hold. This value does not change.
+  pub fn capacity(self: &Self) -> usize { return self.capacityValue }
+
+  /// Returns the number of bytes that the buffer holds and the transport has not yet received.
+  pub fn pending(self: &Self) -> usize { return self.end - self.start }
+
+  /// Returns `true` if an earlier transport failure made the buffer unusable.
+  ///
+  /// # Details
+  ///
+  /// A failed transport write or flush makes the buffer terminal. A terminal buffer stays terminal.
+  /// Each later write of one or more bytes and each later flush fails with `BufferError.Terminal`.
+  pub fn isTerminal(self: &Self) -> bool { return self.terminal }
+
+  /// Copies the longest prefix of `input` that fits into the buffer and returns its length.
+  ///
+  /// # When to use
+  ///
+  /// Use `writeSome` when the caller can continue with a partial write, such as a loop that also
+  /// does other work. Use [`BufferedOutput.writeAll`] to write all of `input`.
+  ///
+  /// # Details
+  ///
+  /// If the buffer is full, this function first sends all pending bytes to the active `ByteDuplex`
+  /// transport. Then it copies input bytes into the free space. If `input` is longer than
+  /// [`BufferedOutput.capacity`], it does not copy: it gives the pending bytes and `input` to
+  /// `ByteDuplex.writeSomeVectored`, or only `input` to `ByteDuplex.writeSome` when nothing is
+  /// pending, until the transport accepts some input bytes, and returns their count. For a
+  /// non-empty `input`, the result is at least 1. For an empty `input`, the result is 0 and the
+  /// transport is not used.
+  ///
+  /// # Errors
+  ///
+  /// - `BufferError.Terminal` if an earlier failure made the buffer terminal.
+  /// - `BufferError.WriteFailed` if the transport fails or `deadline` passes. The buffer becomes
+  ///   terminal. `drained` gives the number of pending bytes that the transport received.
+  pub effect fn writeSome(
+    self: &mut Self,
+    input: &[u8],
+    deadline: Option<Instant>,
+  ) -> usize
+  ! BufferError
+  ? &mut ByteDuplex | &mut MonotonicClock {
+    if input.length == usize.ZERO { return usize.ZERO }
+    if self.terminal { fail BufferError.Terminal }
+    // An input longer than the buffer is not copied: send it with the pending bytes in one write.
+    if self.start < self.end && input.length > self.capacityValue {
+      return run writeGathered(&mut self.*, input, &deadline)
+    }
+    let mut drained = usize.ZERO
+    if self.end == self.capacityValue { drained = run drainPending(&mut self.*, &deadline) }
+    // An empty buffer gains nothing from a copy of more than it holds: send the input directly.
+    if self.end == usize.ZERO && input.length > self.capacityValue {
+      return run writeDirect(&mut self.*, input, drained, &deadline)
+    }
+    let count = minimum(input.length, self.capacityValue - self.end)
+    copyIn(&mut self.storage, self.end, input, count)
+    self.end = self.end + count
+    return count
+  }
+
+  /// Copies all of `input` into the buffer and sends pending bytes to the transport when the buffer
+  /// is full.
+  ///
+  /// # When to use
+  ///
+  /// Use `writeAll` for normal output through a `ByteDuplex` transport. Use
+  /// [`BufferedOutput.writeAllWriter`] for a `Writer` provider.
+  ///
+  /// # Details
+  ///
+  /// When this function returns, the buffer owns all of `input`, or the transport already has
+  /// them. The transport does not necessarily have the buffered bytes yet. Call
+  /// [`BufferedOutput.flush`] to send them. A part of `input` that is longer than the buffer goes
+  /// to the transport directly, without a copy. `deadline` applies to each transport write that
+  /// this call makes.
+  ///
+  /// # Errors
+  ///
+  /// - `BufferError.Terminal` if an earlier failure made the buffer terminal.
+  /// - `BufferError.WriteFailed` if the transport fails or `deadline` passes. The buffer becomes
+  ///   terminal. `accepted` gives the number of `input` bytes that the buffer accepted before the
+  ///   failure. `drained` gives the number of pending bytes that the transport received.
+  pub effect fn writeAll(
+    self: &mut Self,
+    input: &[u8],
+    deadline: Option<Instant>,
+  ) -> ()
+  ! BufferError
+  ? &mut ByteDuplex | &mut MonotonicClock {
+    let mut accepted = usize.ZERO
+    while accepted < input.length {
+      let remaining = Slice.view<u8>(input, accepted, input.length - accepted)
+      let attempted = run Effect.result(BufferedOutput.writeSome(
+        &mut self.*,
+        remaining,
+        copyDeadline(&deadline),
+      ))
+      drop remaining
+      let count = match move attempted {
+        Result<usize, BufferError>.Success {value} => value
+        Result<usize, BufferError>.Failure {error} => {
+          fail addCallerAcceptance(move error, accepted)
+        }
+      }
+      accepted = accepted + count
+    }
+    return ()
+  }
+
+  /// Copies each element of `inputs` into the buffer in order, as one [`BufferedOutput.writeAll`]
+  /// call for each element.
+  ///
+  /// # When to use
+  ///
+  /// Use `writeVecAll` to write a message that is in more than one `Bytes` value, such as a header
+  /// and a body, without first joining the values.
+  ///
+  /// # Details
+  ///
+  /// Before it writes, this function adds the lengths of all elements and checks the sum for
+  /// overflow. `deadline` applies to each transport write that this call makes.
+  ///
+  /// # Errors
+  ///
+  /// - `BufferError.LengthOverflow` if the sum of the element lengths overflows `usize`. The
+  ///   function writes nothing.
+  /// - `BufferError.Terminal` if an earlier failure made the buffer terminal.
+  /// - `BufferError.WriteFailed` if the transport fails or `deadline` passes. The buffer becomes
+  ///   terminal. `accepted` counts the accepted bytes of all elements together, not only the bytes
+  ///   of the element that failed.
+  pub effect fn writeVecAll(
+    self: &mut Self,
+    inputs: &[Bytes],
+    deadline: Option<Instant>,
+  ) -> ()
+  ! BufferError
+  ? &mut ByteDuplex | &mut MonotonicClock {
+    let mut total = usize.ZERO
+    let mut index = usize.ZERO
+    while index < inputs.length {
+      total = run checkedAggregateLength(total, Bytes.length(&inputs[index]))
+      index = index + usize.ONE
+    }
+    drop total
+    let mut accepted = usize.ZERO
+    index = usize.ZERO
+    while index < inputs.length {
+      let bytes = Bytes.asSlice(&inputs[index])
+      let attempted = run Effect.result(BufferedOutput.writeAll(
+        &mut self.*,
+        bytes,
+        copyDeadline(&deadline),
+      ))
+      let length = bytes.length
+      drop bytes
+      match move attempted {
+        Result<(), BufferError>.Success {value} => { drop value }
+        Result<(), BufferError>.Failure {error} => {
+          fail addCallerAcceptance(move error, accepted)
+        }
+      }
+      accepted = accepted + length
+      index = index + usize.ONE
+    }
+    return ()
+  }
+
+  /// Sends all pending bytes to the transport and then flushes the transport.
+  ///
+  /// # When to use
+  ///
+  /// Use `flush` at a message boundary when the other side must receive the bytes now, such as
+  /// before the program waits for a response.
+  ///
+  /// # Details
+  ///
+  /// This function sends pending bytes in order, one time each, and then calls
+  /// `ByteDuplex.flush`. When it returns, [`BufferedOutput.pending`] is 0. `deadline` applies to
+  /// each transport operation that this call makes.
+  ///
+  /// # Errors
+  ///
+  /// - `BufferError.Terminal` if an earlier failure made the buffer terminal.
+  /// - `BufferError.WriteFailed` if a transport write or the transport flush fails, or if
+  ///   `deadline` passes. The buffer becomes terminal. `drained` gives the number of pending bytes
+  ///   that the transport received.
+  pub effect fn flush(
+    self: &mut Self,
+    deadline: Option<Instant>,
+  ) -> ()
+  ! BufferError
+  ? &mut ByteDuplex | &mut MonotonicClock {
+    if self.terminal { fail BufferError.Terminal }
+    let written = run drainPending(&mut self.*, &deadline)
+    let attempted = run Effect.result(ByteDuplex.flush(move deadline))
+    match move attempted {
+      Result<(), ByteIoError>.Success {value} => { drop value return () }
+      Result<(), ByteIoError>.Failure {error} => {
+        self.terminal = true
+        fail BufferError.WriteFailed {
+          accepted: usize.ZERO,
+          drained: written,
+          error: move error,
+        }
+      }
+    }
+    return ()
+  }
+
+  /// Sends all pending bytes to the transport and then flushes the transport.
+  ///
+  /// # When to use
+  ///
+  /// Use `finish` as the last operation on a buffer. The name shows that the output is complete.
+  /// Dropping a buffer does not flush it. [`BufferedOutput.flush`] has the same behavior.
+  ///
+  /// # Details
+  ///
+  /// This function sends pending bytes in order, one time each, and then calls
+  /// `ByteDuplex.flush`. When it returns, [`BufferedOutput.pending`] is 0. `deadline` applies to
+  /// each transport operation that this call makes.
+  ///
+  /// # Errors
+  ///
+  /// - `BufferError.Terminal` if an earlier failure made the buffer terminal.
+  /// - `BufferError.WriteFailed` if a transport write or the transport flush fails, or if
+  ///   `deadline` passes. The buffer becomes terminal. `drained` gives the number of pending bytes
+  ///   that the transport received.
+  pub effect fn finish(
+    self: &mut Self,
+    deadline: Option<Instant>,
+  ) -> ()
+  ! BufferError
+  ? &mut ByteDuplex | &mut MonotonicClock {
+    return run BufferedOutput.flush(move self, move deadline)
+  }
+
+  /// Accepts `input` into the buffer, or sends it to the active `Writer` together with the
+  /// pending bytes, and returns the number of accepted bytes. This function has no deadline.
+  ///
+  /// # When to use
+  ///
+  /// Use `writeSomeWriter` when the destination is a `Writer`, such as standard output, and the
+  /// caller can continue with a partial write. Use [`BufferedOutput.writeAllWriter`] to write all
+  /// of `input`.
+  ///
+  /// # Details
+  ///
+  /// If `input` fits in the free part of the buffer, this function copies it. If it is shorter
+  /// than the whole buffer, this function sends the pending bytes in one `Writer.writeAll`
+  /// call and then copies `input`. Otherwise it does not copy: it sends the pending bytes and then
+  /// `input` in one `Writer.writeVectored` call, and the buffer is empty after it. If no bytes are
+  /// pending, it sends `input` in one `Writer.writeAll` call. Thus the result is the length of
+  /// `input` in every case. A provider such as `silk.io.writer_native.StdoutWriter` sends a vectored write
+  /// in one system call.
+  ///
+  /// # Errors
+  ///
+  /// - `BufferError.Terminal` if an earlier failure made the buffer terminal.
+  /// - `BufferError.UnknownExternalTransfer` if the `Writer` fails. The buffer becomes terminal.
+  ///   The destination can have received some of the pending bytes and of `input`.
+  pub effect fn writeSomeWriter(self: &mut Self, input: &[u8]) -> usize
+  ! BufferError
+  ? &mut Writer {
+    if input.length == usize.ZERO { return usize.ZERO }
+    if self.terminal { fail BufferError.Terminal }
+    if self.start == self.end {
+      self.start = usize.ZERO
+      self.end = usize.ZERO
+    }
+    if input.length <= self.capacityValue - self.end {
+      copyIn(&mut self.storage, self.end, input, input.length)
+      self.end = self.end + input.length
+      return input.length
+    }
+    if input.length < self.capacityValue {
+      // As with Rust's BufWriter, a small input waits for the next fill instead of going out with
+      // the pending bytes, so a Writer without its own writeVectored gets one write per fill.
+      drop run drainWriter(&mut self.*, usize.ZERO)
+      copyIn(&mut self.storage, usize.ZERO, input, input.length)
+      self.end = input.length
+      return input.length
+    }
+    let attempted = run Effect.result(sendWithPending(&self.*, input))
+    self.start = usize.ZERO
+    self.end = usize.ZERO
+    match move attempted {
+      Result<(), WriterError>.Success {value} => { drop value }
+      Result<(), WriterError>.Failure {error} => {
+        self.terminal = true
+        fail BufferError.UnknownExternalTransfer {progress: usize.ZERO, error: move error}
+      }
+    }
+    return input.length
+  }
+
+  /// Accepts all of `input`. This function uses the active `Writer` provider when `input` does not
+  /// fit in the buffer.
+  ///
+  /// # When to use
+  ///
+  /// Use `writeAllWriter` to buffer many small writes to a `Writer`, such as standard output. Use
+  /// [`BufferedOutput.writeAll`] for a `ByteDuplex` transport with a deadline.
+  ///
+  /// # Details
+  ///
+  /// When this function returns, the buffer owns all of `input`, or the `Writer` already has
+  /// them. The `Writer` does not necessarily have the buffered bytes yet. Call
+  /// [`BufferedOutput.flushWriter`] to send them. An `input` as long as the buffer or longer goes to
+  /// the `Writer` without a copy, after the pending bytes, in one
+  /// `Writer.writeVectored` call.
+  ///
+  /// # Errors
+  ///
+  /// - `BufferError.Terminal` if an earlier failure made the buffer terminal.
+  /// - `BufferError.UnknownExternalTransfer` if the `Writer` fails. The buffer becomes terminal.
+  ///   `progress` gives the number of `input` bytes that the buffer accepted before the failure.
+  ///   The destination can have received some of the pending bytes and of `input`.
+  pub effect fn writeAllWriter(self: &mut Self, input: &[u8]) -> ()
+  ! BufferError
+  ? &mut Writer {
+    let mut accepted = usize.ZERO
+    while accepted < input.length {
+      let remaining = Slice.view<u8>(input, accepted, input.length - accepted)
+      let attempted = run Effect.result(BufferedOutput.writeSomeWriter(&mut self.*, remaining))
+      drop remaining
+      let count = match move attempted {
+        Result<usize, BufferError>.Success {value} => value
+        Result<usize, BufferError>.Failure {error} => {
+          fail addCallerAcceptance(move error, accepted)
+        }
+      }
+      accepted = accepted + count
+    }
+    return ()
+  }
+
+  /// Sends all pending bytes to the active `Writer` in one call and then calls `Writer.flush`.
+  ///
+  /// # When to use
+  ///
+  /// Use `flushWriter` as the last operation on a buffer that writes to a `Writer`, and at each
+  /// point where the destination must have the bytes now.
+  ///
+  /// # Details
+  ///
+  /// When this function returns, [`BufferedOutput.pending`] is 0.
+  ///
+  /// # Errors
+  ///
+  /// - `BufferError.Terminal` if an earlier failure made the buffer terminal.
+  /// - `BufferError.UnknownExternalTransfer` if `Writer.writeAll` or `Writer.flush` fails. The
+  ///   buffer becomes terminal. A `Writer` does not report partial progress. Thus the destination
+  ///   can have received some, all, or none of the pending bytes.
+  pub effect fn flushWriter(self: &mut Self) -> () ! BufferError ? &mut Writer {
+    if self.terminal { fail BufferError.Terminal }
+    let accepted = run drainWriter(&mut self.*, usize.ZERO)
+    let attempted = run Effect.result(Writer.flush())
+    match move attempted {
+      Result<(), WriterError>.Success {value} => { drop value return () }
+      Result<(), WriterError>.Failure {error} => {
+        self.terminal = true
+        fail BufferError.UnknownExternalTransfer {progress: accepted, error: move error}
+      }
+    }
+    return ()
+  }
+}
+
+effect fn checkedAggregateLength(total: usize, additional: usize) -> usize ! BufferError {
+  return match move usize.checkedAdd(total, additional) {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => { fail BufferError.LengthOverflow }
+  }
+}
+
+effect fn drainPending(
+  output: &mut BufferedOutput,
+  deadline: &Option<Instant>,
+) -> usize
+! BufferError
+? &mut ByteDuplex | &mut MonotonicClock {
+  let mut written = usize.ZERO
+  while output.start < output.end {
+    // The pending range is start..end, within `capacity`; the zero fill at `make` keeps it
+    // initialized.
+    let pending = unsafe RawBuffer.view<u8>(
+      &output.storage,
+      output.start,
+      output.end - output.start,
+    )
+    let attempted = run Effect.result(ByteDuplex.writeSome(pending, copyDeadline(deadline)))
+    drop pending
+    let count = match move attempted {
+      Result<usize, ByteIoError>.Success {value} => value
+      Result<usize, ByteIoError>.Failure {error} => {
+        output.terminal = true
+        fail BufferError.WriteFailed {
+          accepted: usize.ZERO,
+          drained: written,
+          error: move error,
+        }
+      }
+    }
+    output.start = output.start + count
+    written = written + count
+  }
+  output.start = usize.ZERO
+  output.end = usize.ZERO
+  return written
+}
+
+// Sends the pending bytes and then `input` in vectored transport writes, until the transport
+// accepts at least one byte of `input`.
+effect fn writeGathered(
+  output: &mut BufferedOutput,
+  input: &[u8],
+  deadline: &Option<Instant>,
+) -> usize
+! BufferError
+? &mut ByteDuplex | &mut MonotonicClock {
+  let mut drained = usize.ZERO
+  while output.start < output.end {
+    let waiting = output.end - output.start
+    // The pending range is start..end, within `capacity`; the zero fill at `make` keeps it
+    // initialized.
+    let pending = unsafe RawBuffer.view<u8>(&output.storage, output.start, waiting)
+    let parts = [pending, input]
+    let attempted = run Effect.result(ByteDuplex.writeSomeVectored(&parts, copyDeadline(deadline)))
+    drop parts
+    drop pending
+    let count = match move attempted {
+      Result<usize, ByteIoError>.Success {value} => value
+      Result<usize, ByteIoError>.Failure {error} => {
+        output.terminal = true
+        fail BufferError.WriteFailed {
+          accepted: usize.ZERO,
+          drained: drained,
+          error: move error,
+        }
+      }
+    }
+    if count > waiting {
+      output.start = usize.ZERO
+      output.end = usize.ZERO
+      return count - waiting
+    }
+    output.start = output.start + count
+    drained = drained + count
+  }
+  output.start = usize.ZERO
+  output.end = usize.ZERO
+  return run writeDirect(&mut output.*, input, drained, deadline)
+}
+
+// Sends a slice longer than the buffer past the empty buffer, in one transport write.
+effect fn writeDirect(
+  output: &mut BufferedOutput,
+  input: &[u8],
+  drained: usize,
+  deadline: &Option<Instant>,
+) -> usize
+! BufferError
+? &mut ByteDuplex | &mut MonotonicClock {
+  let attempted = run Effect.result(ByteDuplex.writeSome(input, copyDeadline(deadline)))
+  return match move attempted {
+    Result<usize, ByteIoError>.Success {value} => value
+    Result<usize, ByteIoError>.Failure {error} => {
+      output.terminal = true
+      fail BufferError.WriteFailed {
+        accepted: usize.ZERO,
+        drained: drained,
+        error: move error,
+      }
+    }
+  }
+}
+
+// Sends the pending bytes and then `input` in one `Writer` call.
+effect fn sendWithPending(output: &BufferedOutput, input: &[u8]) -> () ! WriterError ? &mut Writer {
+  if output.start == output.end { return run Writer.writeAll(input) }
+  // The pending range is start..end, within `capacity`; the zero fill at `make` keeps it
+  // initialized.
+  let pending = unsafe RawBuffer.view<u8>(&output.storage, output.start, output.end - output.start)
+  let parts = [pending, input]
+  return run Writer.writeVectored(&parts)
+}
+
+effect fn drainWriter(output: &mut BufferedOutput, prior: usize) -> usize
+! BufferError
+? &mut Writer {
+  if output.start == output.end { return prior }
+  // The pending range is start..end, within `capacity`; the zero fill at `make` keeps it
+  // initialized.
+  let pending = unsafe RawBuffer.view<u8>(
+    &output.storage,
+    output.start,
+    output.end - output.start,
+  )
+  let attempted = run Effect.result(Writer.writeAll(pending))
+  drop pending
+  match move attempted {
+    Result<(), WriterError>.Success {value} => {
+      drop value
+      let accepted = prior + output.end - output.start
+      output.start = usize.ZERO
+      output.end = usize.ZERO
+      return accepted
+    }
+    Result<(), WriterError>.Failure {error} => {
+      output.terminal = true
+      fail BufferError.UnknownExternalTransfer {progress: prior, error: move error}
+    }
+  }
+  return prior
+}
+
+// Every caller passes `start + count` within the storage's capacity and `count` within
+// `input.length`.
+fn copyIn(storage: &mut Intrinsic.RawBuffer<u8>, start: usize, input: &[u8], count: usize) -> () {
+  // In bounds by the caller contract above. Bytes have no drop, so the overwritten slots leak
+  // nothing.
+  unsafe { return RawBuffer.copy<u8>(&mut storage.*, start, Slice.view<u8>(input, usize.ZERO, count), count) }
+}
+
+fn minimum(left: usize, right: usize) -> usize {
+  if left < right { return left }
+  return right
+}
+
+fn copyInstant(value: &Instant) -> Instant {
+  return SystemClock.make(SystemClock.seconds(value), SystemClock.nanoseconds(value))
+}
+
+fn copyDeadline(value: &Option<Instant>) -> Option<Instant> {
+  return match &value.* {
+    Option<Instant>.None => Option<Instant>.none()
+    Option<Instant>.Some {value: present} => Option<Instant>.some(copyInstant(&present))
+  }
+}
+
+fn addCallerAcceptance(failure: BufferError, prior: usize) -> BufferError {
+  return match move failure {
+    BufferError.WriteFailed {accepted, drained, error: cause} => BufferError.WriteFailed {
+      accepted: prior + accepted,
+      drained: drained,
+      error: move cause,
+    }
+    BufferError.UnknownExternalTransfer {progress, error: cause} => BufferError.UnknownExternalTransfer {
+      progress: prior + progress,
+      error: move cause,
+    }
+    BufferError.InvalidCapacity {capacity} => BufferError.InvalidCapacity {capacity: capacity}
+    BufferError.BufferTooSmall {requested, capacity} => BufferError.BufferTooSmall {
+      requested: requested,
+      capacity: capacity,
+    }
+    BufferError.InvalidConsumption {requested, available} => BufferError.InvalidConsumption {
+      requested: requested,
+      available: available,
+    }
+    BufferError.InvalidReadCount {count, limit} => BufferError.InvalidReadCount {
+      count: count,
+      limit: limit,
+    }
+    BufferError.UnexpectedEnd {progress} => BufferError.UnexpectedEnd {progress: progress}
+    BufferError.ReadFailed {progress, error: cause} => BufferError.ReadFailed {
+      progress: progress,
+      error: move cause,
+    }
+    BufferError.InputFailed {progress, error: cause} => BufferError.InputFailed {
+      progress: progress,
+      error: move cause,
+    }
+    BufferError.LengthOverflow => BufferError.LengthOverflow
+    BufferError.Terminal => BufferError.Terminal
+  }
+}
+
+/// A `Writer` that owns a destination `Writer` and collects small writes into larger ones.
+///
+/// # When to use
+///
+/// Use `BufferedWriter` when code that requires `&mut Writer` makes many small writes, such as
+/// field-by-field output, and each write to the destination has a cost, such as a system call.
+/// Wrap the destination, such as `silk.io.writer_native.StdoutWriter`, with [`BufferedWriter.make`] and
+/// provide the result as the `Writer`. Use [`BufferedOutput`] when the caller keeps the
+/// destination itself or writes to a `ByteDuplex`.
+///
+/// # Details
+///
+/// `Writer.writeAll` copies small writes into the buffer and sends them when it is full, so the
+/// destination gets one write per fill. A write as long as the buffer or longer goes to the destination
+/// after the pending bytes, without a copy.
+/// `Writer.flush` sends the pending bytes and then flushes the destination. A failed write or
+/// flush of the destination makes the buffer terminal, as for [`BufferedOutput`]. Each later
+/// write or flush fails with a [`WriterError`].
+///
+/// # Gotchas
+///
+/// Dropping a `BufferedWriter` does not flush it. Pending bytes that are not flushed are lost.
+/// Call `Writer.flush` or [`BufferedWriter.finish`] before the writer goes out of scope.
+///
+/// # Examples
+///
+/// ```silk
+/// import silk.mem.allocator { Allocator, OutOfMemoryError }
+/// import silk.io.buffered_input { BufferError }
+/// import silk.io.buffered_output { BufferedWriter }
+/// import silk.core.effect { Effect }
+/// import silk.io.writer_native { StdoutWriter }
+/// import silk.io.writer { Writer, WriterError }
+///
+/// pub effect fn main() -> i32
+///   ! BufferError | OutOfMemoryError | WriterError {
+///   let mut allocator = Allocator.systemAllocatorProvider()
+///   let mut output = run BufferedWriter<StdoutWriter>.make(StdoutWriter.make(), 4096)
+///     |> Effect.provideMut<Allocator>(&mut allocator)
+///   run Writer.writeString("one ") |> Effect.provideMut<Writer>(&mut output)
+///   run Writer.writeString("write\n") |> Effect.provideMut<Writer>(&mut output)
+///   let stdout = run BufferedWriter<StdoutWriter>.finish(move output)
+///   drop stdout
+///   return 0
+/// }
+/// ```
+pub struct BufferedWriter<W> {
+  destination: W,
+  buffer: BufferedOutput,
+}
+
+impl<W> BufferedWriter<W> {
+  /// Returns a writer that sends its bytes to `destination` through a buffer of `capacity` bytes.
+  ///
+  /// # Errors
+  ///
+  /// - `BufferError.InvalidCapacity` if `capacity` is zero or more than
+  ///   `silk.io.buffered_input.MAX_CAPACITY` (1 MiB).
+  /// - `OutOfMemoryError` if the active `Allocator` cannot supply `capacity` bytes.
+  pub effect fn make<W>(destination: W, capacity: usize) -> BufferedWriter<W>
+  ! BufferError | OutOfMemoryError
+  ? &mut Allocator {
+    let buffer = run BufferedOutput.make(capacity)
+    return BufferedWriter<W> {destination: move destination, buffer: move buffer}
+  }
+
+  /// Returns the number of bytes that the buffer holds and the destination has not yet received.
+  pub fn pending<W>(self: &Self) -> usize { return BufferedOutput.pending(&self.buffer) }
+
+  /// Sends the pending bytes, flushes the destination, and returns it.
+  ///
+  /// # Errors
+  ///
+  /// - [`WriterError`] if an earlier failure made the buffer terminal, or if the destination fails.
+  ///   The destination is dropped.
+  pub effect fn finish<W: Writer>(self: Self) -> W ! WriterError {
+    let mut output = move self
+    run Writer.flush() |> Effect.provideMut<Writer>(&mut output)
+    return move output.destination
+  }
+}
+
+impl<W: Writer> Writer for BufferedWriter<W> {
+  effect fn writeAll(self: &mut Self, val: &[u8]) -> () ! WriterError ? &mut Writer {
+    let attempted = run Effect.result(
+      BufferedOutput.writeAllWriter(&mut self.buffer, val) |> Effect.provideMut<Writer>(&mut self.destination),
+    )
+    match move attempted {
+      Result<(), BufferError>.Success {value} => { drop value }
+      Result<(), BufferError>.Failure {error} => { fail writerError(move error) }
+    }
+    return ()
+  }
+
+  effect fn flush(self: &mut Self) -> () ! WriterError ? &mut Writer {
+    let attempted = run Effect.result(
+      BufferedOutput.flushWriter(&mut self.buffer) |> Effect.provideMut<Writer>(&mut self.destination),
+    )
+    match move attempted {
+      Result<(), BufferError>.Success {value} => { drop value }
+      Result<(), BufferError>.Failure {error} => { fail writerError(move error) }
+    }
+    return ()
+  }
+}
+
+// The destination's own error when it failed; otherwise, as for a terminal buffer, a generic one.
+fn writerError(error: BufferError) -> WriterError {
+  return match move error {
+    BufferError.UnknownExternalTransfer {progress: _, error: failure} => move failure
+    _ => Writer.failure()
+  }
+}

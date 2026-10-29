@@ -1,0 +1,736 @@
+//! The origin of an HTTP request: the scheme, host, and port that a connection goes to.
+//!
+//! # When to use
+//! Use [`Origin.fromUri`] to get the origin of a URL. The client connects to the host and port of
+//! the origin, and for HTTPS checks the server certificate against the host. Use
+//! [`Origin.authorityInto`] to write the `Host` value.
+//!
+//! # Details
+//! An `Origin` has no path, and does not allocate. A missing port becomes 80 for `http` and 443 for
+//! `https`. [`Origin.authorityInto`] writes a lowercase domain, the canonical IP text, and the port
+//! only when it is not the default. A `Host` field that you give never changes the host that TLS
+//! checks.
+//!
+//! # Errors
+//! - [`OriginError`] if the scheme is not `http` or `https`, the URI has user information, or the
+//!   host or port is not valid.
+//!
+//! # Examples
+//! ## Get the origin of a URL
+//! ```silk
+//! import silk.http.origin { Origin, OriginError }
+//! import silk.net.address { Port }
+//! import silk.core.result { Result }
+//! import silk.uri.uri { Uri }
+//! import silk.uri.reference { ParseError }
+//!
+//! pub fn main() -> i32 {
+//!   let uri = match Uri.parse("https://Example.COM/docs?page=2") {
+//!     Result<Uri, ParseError>.Success { value } => value
+//!     Result<Uri, ParseError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let origin = match Origin.fromUri(&uri) {
+//!     Result<Origin, OriginError>.Success { value } => value
+//!     Result<Origin, OriginError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   if !Origin.secure(&origin) || Port.value(&Origin.port(&origin)) != 443 {
+//!     return 1
+//!   }
+//!
+//!   // The default port is not written, and the domain is lowercase.
+//!   let mut output: [u8; 64] = [0; 64]
+//!   let length = match Origin.authorityInto(&origin, &mut output) {
+//!     Result<usize, OriginError>.Success { value } => value
+//!     Result<usize, OriginError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   if length != 11 || output[0] != 101 {
+//!     return 1
+//!   }
+//!   if !Origin.matchesAuthority(&origin, "example.com:443") {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category HTTP
+
+import silk.text.format {Debug, Format, Formatter}
+import silk.net.address {Host, DomainHost, Ipv4Address, Ipv6Address, Port, AddressError}
+import silk.core.option {Option}
+import silk.core.ownership {Copy}
+import silk.core.result {Result}
+import silk.collections.slice {Slice}
+import silk.text.string {String}
+import silk.uri.uri {Uri}
+import silk.num.u8
+import silk.num.u16
+import silk.num.usize
+import silk.io.writer {Writer, WriterError}
+
+/// The reason that an origin is not valid, or that its text does not fit: the scheme is not `http`
+/// or `https`, the URI has user information, the host or port is not valid, or the output is too
+/// small.
+pub enum OriginError {
+  /// The scheme is not `http` or `https`.
+  InvalidScheme,
+  /// The URI has user information, as in `user@host`.
+  UserInfo,
+  /// The URI has no host.
+  MissingHost,
+  /// The host is not a valid domain name or IP address. See `Host.parse` in `silk.net.address`.
+  InvalidHost,
+  /// The port is empty, not a number, or not from 1 to 65535.
+  InvalidPort,
+  /// The output buffer is too small. Nothing was written.
+  OutputTooSmall,
+}
+
+impl Debug for OriginError {
+  /// Writes the name of the variant, such as `InvalidScheme`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      OriginError.InvalidScheme => run Format.write(&mut formatter, b"InvalidScheme")
+      OriginError.UserInfo => run Format.write(&mut formatter, b"UserInfo")
+      OriginError.MissingHost => run Format.write(&mut formatter, b"MissingHost")
+      OriginError.InvalidHost => run Format.write(&mut formatter, b"InvalidHost")
+      OriginError.InvalidPort => run Format.write(&mut formatter, b"InvalidPort")
+      OriginError.OutputTooSmall => run Format.write(&mut formatter, b"OutputTooSmall")
+    }
+  }
+}
+
+/// The scheme, host, and port of an HTTP server. Make it with [`Origin.fromUri`] or
+/// [`Origin.make`].
+pub struct Origin {
+  hostValue: Host,
+  portValue: Port,
+  secureValue: bool,
+}
+
+impl Copy for Origin {}
+
+impl Origin {
+  /// Returns the origin for `host` and `port`. `secure` selects HTTPS. Port 0 returns
+  /// `InvalidPort`.
+  pub fn make(host: Host, port: Port, secure: bool) -> Result<Origin, OriginError> {
+    if Port.value(&port) == 0 {
+      return Result<Origin, OriginError>.failResult(OriginError.InvalidPort)
+    }
+    return Result<Origin, OriginError>.succeed(Origin {
+      hostValue: host,
+      portValue: port,
+      secureValue: secure,
+    })
+  }
+
+  /// Returns the origin of an `http` or `https` URI.
+  ///
+  /// # Details
+  /// A missing port becomes 80 for `http` and 443 for `https`. The path, query, and fragment are
+  /// ignored. User information returns `UserInfo`.
+  pub fn fromUri(uri: &Uri) -> Result<Origin, OriginError> {
+    let scheme = String.utf8Bytes(Uri.scheme(uri))
+    let secure = foldedEqual(scheme, b"https")
+    if !secure && !foldedEqual(scheme, b"http") {
+      return Result<Origin, OriginError>.failResult(OriginError.InvalidScheme)
+    }
+    let checked1 = Uri.userinfo(uri)
+    match move checked1 {
+      Option<string>.Some {value} => {
+        return Result<Origin, OriginError>.failResult(OriginError.UserInfo)
+      }
+      Option<string>.None => {}
+    }
+    let checked2 = Uri.host(uri)
+    let text = match move checked2 {
+      Option<string>.Some {value} => value
+      Option<string>.None => {
+        return Result<Origin, OriginError>.failResult(OriginError.MissingHost)
+      }
+    }
+    let checked3 = Host.parse(text)
+    let host = match move checked3 {
+      Result<Host, AddressError>.Success {value} => value
+      Result<Host, AddressError>.Failure {error} => {
+        return Result<Origin, OriginError>.failResult(OriginError.InvalidHost)
+      }
+    }
+    let mut defaultPort: usize = 80
+    if secure {
+      defaultPort = 443
+    }
+    let mut selectedPort = defaultPort
+    let portOption = Uri.port(uri)
+    match move portOption {
+      Option<string>.Some {value: portText} => {
+        let parsedPort = parsePort(String.utf8Bytes(portText))
+        match move parsedPort {
+          Result<Port, OriginError>.Success {value: admittedPort} => {
+            selectedPort = u16.toUsize(Port.value(&admittedPort))
+          }
+          Result<Port, OriginError>.Failure {error} => {
+            return Result<Origin, OriginError>.failResult(move error)
+          }
+        }
+      }
+      Option<string>.None => {}
+    }
+    let madePort = Port.make(selectedPort)
+    let port = match move madePort {
+      Result<Port, AddressError>.Success {value} => value
+      Result<Port, AddressError>.Failure {error} => {
+        return Result<Origin, OriginError>.failResult(OriginError.InvalidPort)
+      }
+    }
+    return Result<Origin, OriginError>.succeed(
+      Origin {hostValue: host, portValue: port, secureValue: secure},
+    )
+  }
+  /// Returns the host. The client resolves it, and TLS checks the certificate against it.
+  pub fn host(self: &Self) -> Host {
+    return self.hostValue
+  }
+  /// Returns the port, with the default port if the URI had none.
+  pub fn port(self: &Self) -> Port {
+    return self.portValue
+  }
+  /// Returns `true` for HTTPS.
+  pub fn secure(self: &Self) -> bool {
+    return self.secureValue
+  }
+  /// Returns `true` if the scheme, the port, and the host are equal. Domains are compared without
+  /// case.
+  pub fn equals(self: &Self, other: &Self) -> bool {
+    return self.secureValue == other.secureValue && Port.value(&self.portValue) == Port.value(
+      &other.portValue,
+    ) && hostsEqual(&self.hostValue, &other.hostValue)
+  }
+  /// Writes `host` or `host:port` to the start of `output`, and returns the length. The port is
+  /// written only when it is not the default. If `output` is too small, it writes nothing.
+  pub fn authorityInto(self: &Self, output: &mut [u8]) -> Result<usize, OriginError> {
+    let mut scratch: [u8; 261] = [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+    ]
+    let madeLength = formatHost(&self.hostValue, &mut scratch)
+    let mut length = match move madeLength {
+      Result<usize, OriginError>.Success {value} => value
+      Result<usize, OriginError>.Failure {error} => {
+        return Result<usize, OriginError>.failResult(move error)
+      }
+    }
+    let port = u16.toUsize(Port.value(&self.portValue))
+    let mut defaultPort: usize = 80
+    if self.secureValue {
+      defaultPort = 443
+    }
+    if port != defaultPort {
+      scratch[length] = 58
+      length = length + usize.ONE
+      let mut divisor: usize = 10000
+      while divisor > usize.ONE && port / divisor == usize.ZERO {
+        divisor = divisor / 10
+      }
+      while divisor > usize.ZERO {
+        scratch[length] = usize.toU8((port / divisor) % 10) + 48
+        length = length + usize.ONE
+        divisor = divisor / 10
+      }
+    }
+    if output.length < length {
+      return Result<usize, OriginError>.failResult(OriginError.OutputTooSmall)
+    }
+    let mut index = usize.ZERO
+    while index < length {
+      output[index] = scratch[index]
+      index = index + usize.ONE
+    }
+    return Result<usize, OriginError>.succeed(length)
+  }
+  /// Writes `host:port` to the start of `output`, and returns the length. The port is always
+  /// written. If `output` is too small, it writes nothing.
+  pub fn authorityWithPortInto(self: &Self, output: &mut [u8]) -> Result<usize, OriginError> {
+    let mut scratch: [u8; 261] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let hostLength = match move formatHost(&self.hostValue, &mut scratch) {
+      Result<usize, OriginError>.Failure {error} => {
+        return Result<usize, OriginError>.failResult(move error)
+      }
+      Result<usize, OriginError>.Success {value} => value
+    }
+    let port = u16.toUsize(Port.value(&self.portValue))
+    scratch[hostLength] = 58
+    let mut length = hostLength + usize.ONE
+    let mut divisor: usize = 10000
+    while divisor > usize.ONE && port / divisor == usize.ZERO {
+      divisor = divisor / 10
+    }
+    while divisor > usize.ZERO {
+      scratch[length] = usize.toU8((port / divisor) % 10) + 48
+      length = length + usize.ONE
+      divisor = divisor / 10
+    }
+    if output.length < length {
+      return Result<usize, OriginError>.failResult(OriginError.OutputTooSmall)
+    }
+    let mut index = usize.ZERO
+    while index < length {
+      output[index] = scratch[index]
+      index = index + usize.ONE
+    }
+    return Result<usize, OriginError>.succeed(length)
+  }
+  /// Returns `true` if `text` names this origin.
+  ///
+  /// # Details
+  /// `text` is a host with an optional port. The default port can be written or not. Domains are
+  /// compared without case, and equal IP addresses match in any spelling.
+  pub fn matchesAuthority(self: &Self, text: string) -> bool {
+    let bytes = String.utf8Bytes(text)
+    if bytes.length == usize.ZERO {
+      return false
+    }
+    let mut hostEnd = bytes.length
+    let mut portStart = bytes.length
+    if bytes[0] == 91 {
+      let mut index = usize.ONE
+      while index < bytes.length && bytes[index] != 93 {
+        index = index + usize.ONE
+      }
+      if index == bytes.length {
+        return false
+      }
+      hostEnd = index + usize.ONE
+      if hostEnd < bytes.length {
+        if bytes[hostEnd] != 58 {
+          return false
+        }
+        portStart = hostEnd + usize.ONE
+        if portStart == bytes.length {
+          return false
+        }
+      }
+    } else {
+      let mut index = usize.ZERO
+      while index < bytes.length {
+        if bytes[index] == 58 {
+          hostEnd = index
+          portStart = index + usize.ONE
+          break
+        }
+        index = index + usize.ONE
+      }
+      if hostEnd < bytes.length && portStart == bytes.length {
+        return false
+      }
+    }
+    let checked4 = Host.parseBytes(Slice.view<u8>(bytes, usize.ZERO, hostEnd))
+    let host = match move checked4 {
+      Result<Host, AddressError>.Success {value} => value
+      Result<Host, AddressError>.Failure {error} => {
+        return false
+      }
+    }
+    let mut defaultPort: usize = 80
+    if self.secureValue {
+      defaultPort = 443
+    }
+    let mut port = defaultPort
+    if portStart < bytes.length {
+      let checked5 = parsePort(Slice.view<u8>(bytes, portStart, bytes.length - portStart))
+      match move checked5 {
+        Result<Port, OriginError>.Success {value} => {
+          port = u16.toUsize(Port.value(&value))
+        }
+        Result<Port, OriginError>.Failure {error} => {
+          return false
+        }
+      }
+    }
+    return port == u16.toUsize(Port.value(&self.portValue)) && hostsEqual(&host, &self.hostValue)
+  }
+}
+
+fn folded(byte: u8) -> u8 {
+  if byte >= 65 && byte <= 90 {
+    return byte + 32
+  }
+  return byte
+}
+
+fn foldedEqual(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut index = usize.ZERO
+  while index < left.length {
+    if folded(left[index]) != folded(right[index]) {
+      return false
+    }
+    index = index + usize.ONE
+  }
+  return true
+}
+
+fn hostsEqual(left: &Host, right: &Host) -> bool {
+  return match & left.* {
+    Host.Domain {value: a} => {
+      return match & right.* {
+        Host.Domain {value: b} => DomainHost.equals(&a, &b)
+        _ => false
+      }
+    }
+    Host.Ipv4 {value: a} => {
+      return match & right.* {
+        Host.Ipv4 {value: b} => Ipv4Address.equals(&a, &b)
+        _ => false
+      }
+    }
+    Host.Ipv6 {value: a} => {
+      return match & right.* {
+        Host.Ipv6 {value: b} => Ipv6Address.equals(&a, &b)
+        _ => false
+      }
+    }
+  }
+}
+
+fn parsePort(bytes: &[u8]) -> Result<Port, OriginError> {
+  if bytes.length == usize.ZERO {
+    return Result<Port, OriginError>.failResult(OriginError.InvalidPort)
+  }
+  let mut value = usize.ZERO
+  let mut index = usize.ZERO
+  while index < bytes.length {
+    let byte = bytes[index]
+    if byte < 48 || byte > 57 {
+      return Result<Port, OriginError>.failResult(OriginError.InvalidPort)
+    }
+    let digit = u8.toUsize(byte - 48)
+    if value > (65535 - digit) / 10 {
+      return Result<Port, OriginError>.failResult(OriginError.InvalidPort)
+    }
+    value = value * 10 + digit
+    index = index + usize.ONE
+  }
+  if value == usize.ZERO {
+    return Result<Port, OriginError>.failResult(OriginError.InvalidPort)
+  }
+  let checked6 = Port.make(value)
+  return match move checked6 {
+    Result<Port, AddressError>.Success {value: admitted} => Result<Port, OriginError>.succeed(
+      admitted,
+    )
+    Result<Port, AddressError>.Failure {error} => Result<Port, OriginError>.failResult(
+      OriginError.InvalidPort,
+    )
+  }
+}
+
+fn formatHost(host: &Host, output: &mut [u8]) -> Result<usize, OriginError> {
+  match & host.* {
+    Host.Domain {value} => {
+      let bytes = DomainHost.bytes(&value)
+      let mut index = usize.ZERO
+      while index < bytes.length {
+        output[index] = folded(bytes[index])
+        index = index + usize.ONE
+      }
+      return Result<usize, OriginError>.succeed(bytes.length)
+    }
+    Host.Ipv4 {value} => {
+      let formatted = Ipv4Address.formatInto(&value, &mut output)
+      return match move formatted {
+        Result<usize, AddressError>.Success {value: count} => Result<usize, OriginError>.succeed(
+          count,
+        )
+        Result<usize, AddressError>.Failure {error} => Result<usize, OriginError>.failResult(
+          OriginError.InvalidHost,
+        )
+      }
+    }
+    Host.Ipv6 {value} => {
+      let formatted = Ipv6Address.formatInto(&value, &mut output)
+      let count = match move formatted {
+        Result<usize, AddressError>.Success {value: size} => size
+        Result<usize, AddressError>.Failure {error} => {
+          return Result<usize, OriginError>.failResult(OriginError.InvalidHost)
+        }
+      }
+      let mut index = count
+      while index > usize.ZERO {
+        index = index - usize.ONE
+        output[index + usize.ONE] = output[index]
+      }
+      output[0] = 91
+      output[count + usize.ONE] = 93
+      return Result<usize, OriginError>.succeed(count + 2)
+    }
+  }
+  return Result<usize, OriginError>.failResult(OriginError.InvalidHost)
+}

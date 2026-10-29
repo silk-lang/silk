@@ -47,15 +47,15 @@ for i in range(n):
 lines.append('  run dumpList(&list)')
 expect.extend(str(x) for x in l)
 lines.append('  run showLen(map.length())'); expect.append(str(len(m)))
-src=f'''import silk.allocator {{ Allocator, OutOfMemoryError }}
-import silk.effect {{ Effect }}
-import silk.hash {{ Hash, Word }}
-import silk.hash_map {{ HashMap }}
-import silk.hash_set {{ HashSet }}
-import silk.list {{ List }}
-import silk.logger {{ LogError, Logger }}
-import silk.option {{ Option }}
-import silk.os_logger {{ StdoutLogger }}
+src=f'''import silk.mem.allocator {{ Allocator, OutOfMemoryError }}
+import silk.core.effect {{ Effect }}
+import silk.collections.hash {{ Hash, Word }}
+import silk.collections.hash_map {{ HashMap }}
+import silk.collections.hash_set {{ HashSet }}
+import silk.collections.list {{ List }}
+import silk.io.logger {{ LogError, Logger }}
+import silk.core.option {{ Option }}
+import silk.io.logger_native {{ StdoutLogger }}
 
 fn opt(value: Option<i64>) -> i64 {{
   return match move value {{

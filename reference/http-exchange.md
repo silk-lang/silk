@@ -5,7 +5,7 @@ description: Explicit request policy, owned sessions, scoped exchanges, and boun
 
 # Streaming HTTP client
 
-Use `silk.http_request` to prepare an origin-bound request and `silk.http_exchange` to send it through
+Use `silk.http.request` to prepare an origin-bound request and `silk.http.exchange` to send it through
 one owned session. Request preparation copies the head before network output. The session retains
 its concrete transport, parser storage, buffered input suffix, origin, HTTP version, and overall
 absolute deadline. `makeOwned` returns that owner; `withOwned` lends it within a terminal-close
@@ -31,16 +31,16 @@ an error, and never retries or replays output.
 
 ## Explicit Basic credentials
 
-`silk.http_basic.encodeInto` accepts caller-encoded username and password bytes plus scratch and
+`silk.http.basic.encodeInto` accepts caller-encoded username and password bytes plus scratch and
 output buffers. It rejects a colon in the username and controls or DEL in either field. It checks
 both capacities before changing output and allocates nothing. Non-ASCII character encoding belongs
 to the caller. Basic is absent unless requested, remains bound to the prepared origin, and requires
 TLS unless `AllowInsecureBasic` is explicit. This option does not change HTTPS peer verification.
 
 ```silk
-import silk.http_basic as Basic
-import silk.result {Result}
-import silk.usize as usize
+import silk.http.basic as Basic
+import silk.core.result {Result}
+import silk.num.usize as usize
 
 pub fn main() -> i32 {
   let mut scratch: [u8; 3] = [0, 0, 0]
@@ -110,7 +110,7 @@ resource twice. Fatal traps remain outside structured cleanup guarantees.
 
 ## Native HTTPS and deadlines
 
-`silk.http_exchange_native.withConnection` resolves and connects an owned native socket. For HTTPS it
+`silk.http.exchange_native.withConnection` resolves and connects an owned native socket. For HTTPS it
 loads the selected trust snapshot inside the resource scope and authenticates the original origin
 before any HTTP bytes. TrustSource, SystemClock, MonotonicClock, Random and Allocator remain explicit
 requirements. HTTP/1.1 offers only `http/1.1`; absence is accepted by default and rejected under the

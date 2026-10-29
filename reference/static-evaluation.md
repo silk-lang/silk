@@ -239,11 +239,11 @@ reports `SEM0176` at the invalid operation. The failed evaluation exposes no par
 
 **Evidence:** static mutation limits.
 
-### STATIC-007 — `silk.static_text` inspects UTF-8 bytes without exposing storage
+### STATIC-007 — `silk.core.static_text` inspects UTF-8 bytes without exposing storage
 
 **Status:** Confirmed
 
-The ordinary standard-library module `silk.static_text` provides static byte operations for text
+The ordinary standard-library module `silk.core.static_text` provides static byte operations for text
 available during compilation:
 
 | Member                                | Result   | Meaning                                                                    |
@@ -254,7 +254,7 @@ available during compilation:
 | `StaticText.slice(value, start, end)` | `string` | Text in one byte range whose endpoints are UTF-8 scalar boundaries         |
 
 ```silk,ignore
-import silk.static_text { StaticText }
+import silk.core.static_text { StaticText }
 
 static fn hasAccent(value: string) -> bool {
   return StaticText.byteLength(value) == 3 && StaticText.byteAt(value, 1) == 195
@@ -270,7 +270,7 @@ in runtime TIR.
 endpoint that splits a UTF-8 scalar encoding. Both failures are phase violations with source text
 provenance rather than runtime traps. `concat` is bounded by the ordinary retained-value budget.
 
-**Evidence:** [static text source actor](../stdlib/silk/static_text.silk),
+**Evidence:** [static text source actor](../stdlib/silk/core/static_text.silk),
 static value requirements.
 
 ## Reflection, static sequences, iteration, and formatting
@@ -279,7 +279,7 @@ static value requirements.
 
 **Status:** Confirmed
 
-`silk.reflect` exposes canonical descriptors for one concrete aggregate type and its fields. Named
+`silk.core.reflect` exposes canonical descriptors for one concrete aggregate type and its fields. Named
 tuples and anonymous positional aggregates expose positions; named structs and anonymous records
 expose visible labels. Declaration order, nominal owner identity, generic substitution, aggregate
 kind, and the reflecting declaration's visibility authority are retained.
@@ -321,18 +321,18 @@ is an ordinary mutable loan of the field, so the owner is unusable while it live
 field descriptor is not a place of its union, so `borrowField` refuses it (`SEM0012`).
 
 **Evidence:** static reflection requirements,
-[reflection source actor](../stdlib/silk/reflect.silk).
+[reflection source actor](../stdlib/silk/core/reflect.silk).
 
 ### STATIC-009 — Static sequences are immutable compile-time values
 
 **Status:** Confirmed
 
-`silk.static_sequence` provides `empty`, `append`, `concat`, `length`, and `at` over
+`silk.core.static_sequence` provides `empty`, `append`, `concat`, `length`, and `at` over
 `Intrinsic.StaticSequence<Element>`. Every operation returns a complete canonical value; append and
 concatenation do not mutate the input sequence.
 
 ```silk,ignore
-import silk.static_sequence { StaticSequence }
+import silk.core.static_sequence { StaticSequence }
 
 static fn values() -> Intrinsic.StaticSequence<i32> {
   let mut result = StaticSequence.empty<i32>()
@@ -347,7 +347,7 @@ runtime layout. It cannot appear in a residual signature, binding, call, ownersh
 artifact. `at` rejects an out-of-bounds index during static evaluation.
 
 **Evidence:** static sequence requirements,
-[static sequence source actor](../stdlib/silk/static_sequence.silk).
+[static sequence source actor](../stdlib/silk/core/static_sequence.silk).
 
 ### STATIC-010 — `static for` generates ordinary runtime work from finite static elements
 
@@ -360,7 +360,7 @@ field descriptor's concrete `Field<Owner, Value>` type, so one authored body can
 interfaces and generate differently typed runtime operations.
 
 ```silk,ignore
-import silk.reflect { Reflect }
+import silk.core.reflect { Reflect }
 
 fn visit<Owner>(owner: &Owner) -> () {
   static for field in Reflect.fields<Owner>() {
@@ -386,7 +386,7 @@ static iteration syntax.
 
 **Status:** Confirmed
 
-`silk.format.Format.format<Args>(static template: string, args: &Args)` accepts one static template
+`silk.text.format.Format.format<Args>(static template: string, args: &Args)` accepts one static template
 and one ordinary shared reference to a tuple or record argument pack. Positional `{}` placeholders
 consume every tuple position in order. Named `{name}` placeholders select visible record fields;
 they may repeat, and unrelated fields may remain unused. `{{` and `}}` emit literal braces.
@@ -409,7 +409,7 @@ aggregate kinds or arity, unavailable fields, and missing `Display` evidence fai
 before Writer execution is published. An uncalled invalid application remains unevaluated.
 
 **Evidence:** template formatting requirements,
-[Format source actor](../stdlib/silk/format.silk).
+[Format source actor](../stdlib/silk/text/format.silk).
 
 ## Demand, diagnostics, and the runtime boundary
 
@@ -472,11 +472,11 @@ arguments produces the same code, semantic details, related spans, and trace enc
 
 ## Target information
 
-### STATIC-014 — `silk.target` exposes target information only as static source values
+### STATIC-014 — `silk.core.target` exposes target information only as static source values
 
 **Status:** Confirmed
 
-The ordinary standard-library module `silk.target` exposes individual machine facts:
+The ordinary standard-library module `silk.core.target` exposes individual machine facts:
 
 | Member                     | Type              | Value                                  |
 | -------------------------- | ----------------- | -------------------------------------- |
@@ -491,12 +491,12 @@ The ordinary standard-library module `silk.target` exposes individual machine fa
 | `isizeMax`                 | `isize`           | Largest signed pointer-sized integer   |
 | `isizeMin`                 | `isize`           | Smallest signed pointer-sized integer  |
 
-Use `silk.compilation` for typed logical build choices. Source checks use the narrow domain needed
+Use `silk.core.compilation` for typed logical build choices. Source checks use the narrow domain needed
 for the decision. The complete [compilation profile](compilation-profiles.md) also contains resolved
 package parameters and controls static-evaluation identity.
 
 ```silk,ignore
-import silk.target { Target, Arch }
+import silk.core.target { Target, Arch }
 
 fn targetWordBits() -> u32 {
   static if Target.arch() == Arch.Wasm32 {
@@ -510,7 +510,7 @@ fn targetWordBits() -> u32 {
 The selected target is fixed before any demanded specialization executes. The result of static
 selection is ordinary residual source; no target-profile parameter or runtime probe remains.
 
-**Boundary:** `silk.target` is ordinary source and receives no compiler-known name privilege. The
+**Boundary:** `silk.core.target` is ordinary source and receives no compiler-known name privilege. The
 sealed individual target and profile-fact intrinsics are static-only and have no runtime lowering. Target data cannot be changed by source, inferred from the host when an
 explicit target was selected, or queried dynamically at runtime. A selected cleanup-free target
 value may appear in residual code only as an embedded ordinary value.

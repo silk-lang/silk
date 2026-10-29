@@ -1,0 +1,1274 @@
+//! The native provider for the `Http` service of [`silk.http.client`].
+//!
+//! # When to use
+//! Give [`NativeHttp`] one time, near `main`, with `Effect.provideMut<Http>(&mut http)`. All code
+//! that requires `? &mut Http` then sends real requests over sockets and TLS.
+//!
+//! # Details
+//! The provider has its own clocks, random source, and trust store, so you give only an allocator.
+//! The defaults are a deadline of 30 seconds for each request, a response body of at most 16 MiB,
+//! up to 10 redirects, and the PEM bundle of the platform for HTTPS: `/etc/ssl/cert.pem` on macOS
+//! and `/etc/ssl/certs/ca-certificates.crt` on Linux. [`NativeHttp.fromEnvironment`] uses the file
+//! in `SSL_CERT_FILE` when it is set, and the proxies in `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`,
+//! and `NO_PROXY`. Each request opens a new HTTP/1.1 connection and sends `Accept-Encoding:
+//! identity`, so the body arrives as the server sent it.
+//!
+//! Redirects follow the Fetch standard. After 303, and after 301 or 302 for a POST, the client
+//! sends a GET without a body. After 307 and 308, it sends the same method and body. A redirect
+//! from HTTPS to HTTP fails. A redirect to another origin does not send `Authorization` and
+//! `Cookie`.
+//!
+//! # Gotchas
+//! The deadline covers the TLS handshake and the HTTP exchange, but not the name lookup and the TCP
+//! connect. The macOS keychain is not used, only the PEM bundle. [`NativeHttp.make`] reads no
+//! environment variables, so it never uses a proxy. Only `http://` proxies are supported.
+//!
+//! # Examples
+//! ## Set up the client
+//! The request in this example fails before it connects, because `ftp` is not supported.
+//!
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.http.client { Http, HttpError, HttpErrorKind, Request, Response }
+//! import silk.http.client_native { NativeHttp }
+//! import silk.core.result { Result }
+//!
+//! effect fn check() -> i32
+//!   ! OutOfMemoryError
+//!   ? &mut Http | &mut Allocator {
+//!   // A scheme other than http or https fails before any connection.
+//!   let sent = run Effect.result(Http.send(Request.get("ftp://example.com/version")))
+//!   return match move sent {
+//!     Result.Success { value: _ } => 1
+//!     Result.Failure { error } => match move error {
+//!       HttpError failure => {
+//!         if failure.kind == HttpErrorKind.InvalidUrl {
+//!           return 0
+//!         }
+//!         return 1
+//!       }
+//!       OutOfMemoryError allocation => {
+//!         fail move allocation
+//!       }
+//!     }
+//!   }
+//! }
+//!
+//! pub effect fn main() -> i32
+//!   ! OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let mut http = NativeHttp.make().baseUrl("https://api.example.com").header(
+//!     "Accept",
+//!     "application/json"
+//!   ).timeoutSeconds(10)
+//!   return run check() |> Effect.provideMut<Http>(&mut http)
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//! }
+//! ```
+//!
+//! @category HTTP
+
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.encoding.base64 {Base64}
+import silk.io.byte_duplex {ByteIoError}
+import silk.collections.bytes {Bytes}
+import silk.core.effect {Effect}
+import silk.system.filesystem {FileError, Path}
+import silk.system.host_input {HostInput, HostInputError}
+import silk.http.message {Header, Method, OwnedResponseHead, Status, Version}
+import silk.http.client {Field, Http, HttpCause, HttpError, HttpErrorKind, Request, Response}
+import silk.http.exchange as Exchange
+import silk.http.exchange {
+  Connection,
+  ConnectionHandler,
+  ContinuePolicy,
+  Exchange as Live,
+  ExchangeError,
+  Limits,
+  RequestOptions,
+  RouteHandler,
+  RouteTransport,
+}
+import silk.http.exchange_native as ExchangeNative
+import silk.http.exchange_native {NativeExchangeError, NativeRouteProvider, NativeTransport, Options}
+import silk.tls.certificate_path {ValidationError, ValidationReason}
+import silk.http.headers {Headers, Limits as HeaderLimits}
+import silk.http.origin {Origin}
+import silk.http.proxy {
+  BypassPolicy,
+  ProxyAuth,
+  ProxyAuthContextId,
+  ProxyConfig,
+  ProxyConfigId,
+  ProxyError,
+  ProxyReason,
+  Route,
+  RouteMode,
+  selectRoute,
+}
+import silk.http.request as Prepare
+import silk.http.request {Authorization, BodyMode, HeaderControl, HeaderPolicy, PreparedRequest, RequestError}
+import silk.http.transport {HttpTransport, TransportError}
+import silk.tls.https_identity {IdentityError}
+import silk.collections.list {List}
+import silk.system.monotonic_clock {MonotonicClock}
+import silk.core.option {Option}
+import silk.system.random {Random}
+import silk.net.resolver {ResolverError}
+import silk.core.result {Result}
+import silk.collections.slice {Slice}
+import silk.text.string {String}
+import silk.system.system_clock {Instant, SystemClock}
+import silk.tls.client {CertificateIdentityFailure, TlsError}
+import silk.tls.connection {ConnectionError}
+import silk.tls.trust_snapshot {TrustSnapshot, TrustSourceError}
+import silk.tls.trust_source {TrustSource}
+import silk.num.u64
+import silk.uri.uri {Uri}
+import silk.uri.reference {UriReference}
+import silk.num.usize
+
+static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArchitecture() == "aarch64" && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText(
+  "libc",
+) == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText(
+  "libc",
+) == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+  import silk.tls.trust_source_native {NativeFileTrustSource}
+  import silk.system.monotonic_clock_native {OsMonotonicClock}
+  import silk.system.random_native {OsRandom}
+  import silk.net.socket_native {NativeSocketError}
+  import silk.system.system_clock_native {OsSystemClock}
+
+  /// The default deadline for one request, in seconds.
+  pub const DEFAULT_TIMEOUT_SECONDS: u64 = 30
+  /// The default response body limit, in bytes.
+  pub const DEFAULT_MAX_BODY_BYTES: usize = 16777216
+  /// The default number of redirects followed.
+  pub const DEFAULT_MAX_REDIRECTS: usize = 10
+  /// The maximum number of headers that [`NativeHttp.header`] adds.
+  pub const MAX_DEFAULT_HEADERS: usize = 16
+
+  union TrustChoice<'config> {
+    Platform,
+    Borrowed {path: string<'config>},
+    Owned {path: Bytes},
+  }
+
+  /// A native HTTP client. It holds the defaults for all requests: the base URL, headers, limits,
+  /// and trust.
+  ///
+  /// # When to use
+  ///
+  /// Give it one time, near `main`, with `Effect.provideMut<Http>(&mut http)`. All code that
+  /// requires `? &mut Http` then sends real requests over sockets and TLS.
+  ///
+  /// # Details
+  ///
+  /// The provider has its own clocks, random source, and trust store, so you give only an
+  /// allocator. The defaults are a deadline of 30 seconds for each request, a response body of at
+  /// most 16 MiB, up to 10 redirects, and the PEM bundle of the platform for HTTPS:
+  /// `/etc/ssl/cert.pem` on macOS and `/etc/ssl/certs/ca-certificates.crt` on Linux. Each request
+  /// opens a new HTTP/1.1 connection and sends `Accept-Encoding: identity`, so the body arrives as
+  /// the server sent it.
+  ///
+  /// Redirects follow the Fetch standard. After 303, and after 301 or 302 for a POST, the client
+  /// sends a GET without a body. After 307 and 308, it sends the same method and body. A redirect
+  /// from HTTPS to HTTP fails. A redirect to another origin does not send `Authorization` and
+  /// `Cookie`.
+  ///
+  /// # Gotchas
+  ///
+  /// The deadline covers the TLS handshake and the HTTP exchange, but not the name lookup and the
+  /// TCP connect. The macOS keychain is not used, only the PEM bundle. [`NativeHttp.make`] reads no
+  /// environment variables, so it never uses a proxy. Only `http://` proxies are supported.
+  pub struct NativeHttp<'config> {
+    baseValue: string<'config>,
+    headerValues: [Field<'config>; 16],
+    headerCount: usize,
+    overflowValue: bool,
+    timeoutValue: u64,
+    maxBodyValue: usize,
+    redirectValue: usize,
+    failOnStatusValue: bool,
+    trustChoice: TrustChoice<'config>,
+    trust: Option<NativeFileTrustSource>,
+    clock: OsMonotonicClock,
+    random: OsRandom,
+    secureProxy: Option<ProxyConfig>,
+    plainProxy: Option<ProxyConfig>,
+    noProxy: Bytes,
+  }
+
+  impl<'config> NativeHttp<'config> {
+    /// Returns a client with the default limits and the PEM bundle of the platform. It reads
+    /// nothing yet.
+    ///
+    /// # Details
+    ///
+    /// The defaults are a deadline of 30 seconds for each request, a response body of at most 16
+    /// MiB, up to 10 redirects, and the PEM bundle `/etc/ssl/cert.pem` on macOS or
+    /// `/etc/ssl/certs/ca-certificates.crt` on Linux. Use [`NativeHttp.fromEnvironment`] to honor
+    /// `SSL_CERT_FILE`.
+    pub fn make() -> NativeHttp<'config> {
+      let empty = Field<'config> {name: "", value: ""}
+      return NativeHttp<'config> {
+        baseValue: "",
+        headerValues: [
+          empty, empty,
+          empty, empty,
+          empty, empty,
+          empty, empty,
+          empty, empty,
+          empty, empty,
+          empty, empty,
+          empty, empty,
+        ],
+        headerCount: usize.ZERO,
+        overflowValue: false,
+        timeoutValue: DEFAULT_TIMEOUT_SECONDS,
+        maxBodyValue: DEFAULT_MAX_BODY_BYTES,
+        redirectValue: DEFAULT_MAX_REDIRECTS,
+        failOnStatusValue: false,
+        trustChoice: TrustChoice<'config>.Platform,
+        trust: Option<NativeFileTrustSource>.none(),
+        clock: OsMonotonicClock.make(),
+        random: OsRandom.make(),
+        secureProxy: Option<ProxyConfig>.none(),
+        plainProxy: Option<ProxyConfig>.none(),
+        noProxy: Bytes.make(),
+      }
+    }
+
+    /// Makes a client that uses `SSL_CERT_FILE` as its PEM bundle and the proxy variables when they
+    /// are set.
+    ///
+    /// # Details
+    ///
+    /// A relative `SSL_CERT_FILE` is resolved against the working directory. An empty value fails.
+    ///
+    /// HTTPS requests go through `HTTPS_PROXY`, then `https_proxy`, `ALL_PROXY`, and `all_proxy`,
+    /// the first one that is set and not empty. Plain HTTP requests go through `HTTP_PROXY`, then
+    /// `http_proxy`, `ALL_PROXY`, and `all_proxy`. HTTPS uses a `CONNECT` tunnel, so TLS still
+    /// checks the server certificate. A proxy URL such as `http://user:pass@proxy:3128` sends Basic
+    /// credentials to the proxy. A URL without a scheme is read as `http://`.
+    ///
+    /// `NO_PROXY` or `no_proxy` lists hosts that are reached directly, separated by commas. An entry
+    /// matches the host and its subdomains, so `example.com` and `.example.com` both match
+    /// `api.example.com`. A port in an entry is ignored, and `*` matches every host. An address
+    /// range such as `10.0.0.0/8` matches nothing; list the addresses instead.
+    ///
+    /// # Errors
+    ///
+    /// A proxy URL that is not valid fails with `InvalidUrl`. Only `http://` proxies are supported,
+    /// so an `https://` or `socks5://` proxy URL fails too.
+    pub effect fn fromEnvironment() -> NativeHttp<'config>
+    ! HttpError | HostInputError | OutOfMemoryError
+    ? &mut HostInput | &mut Allocator {
+      let selected = run HostInput.variable(b"SSL_CERT_FILE")
+      let mut client = NativeHttp<'config>.make()
+      let secureNames: [&'static [u8]; 4] = [b"HTTPS_PROXY", b"https_proxy", b"ALL_PROXY", b"all_proxy"]
+      let plainNames: [&'static [u8]; 4] = [b"HTTP_PROXY", b"http_proxy", b"ALL_PROXY", b"all_proxy"]
+      let bypassNames: [&'static [u8]; 2] = [b"NO_PROXY", b"no_proxy"]
+      let secureUrl = run firstVariable(&secureNames)
+      if let Option.Some {value: secureText} = &secureUrl {
+        client.secureProxy = Option<ProxyConfig>.some(run proxyConfig(Bytes.asSlice(&secureText), u64.toU64(1)))
+      }
+      let plainUrl = run firstVariable(&plainNames)
+      if let Option.Some {value: plainText} = &plainUrl {
+        client.plainProxy = Option<ProxyConfig>.some(run proxyConfig(Bytes.asSlice(&plainText), u64.toU64(2)))
+      }
+      let hosts = run firstVariable(&bypassNames)
+      if let Option.Some {value: bypassText} = move hosts {
+        client.noProxy = move bypassText
+      }
+      match move selected {
+        Option.None => { return move client }
+        Option.Some {value} => {
+          if Bytes.length(&value) == usize.ZERO {
+            fail HttpError.make(HttpErrorKind.Tls, "SSL_CERT_FILE is empty; unset it to use the platform PEM bundle.")
+          }
+          if Bytes.asSlice(&value)[usize.ZERO] == 47 {
+            client.trustChoice = TrustChoice<'config>.Owned {path: move value}
+            return move client
+          }
+          let mut absolute = run HostInput.workingDirectory()
+          let cwd = Bytes.asSlice(&absolute)
+          let needsSeparator = cwd.length > usize.ZERO && cwd[cwd.length - usize.ONE] != 47
+          drop cwd
+          if needsSeparator { run Bytes.append(&mut absolute, b"/") }
+          run Bytes.append(&mut absolute, Bytes.asSlice(&value))
+          client.trustChoice = TrustChoice<'config>.Owned {path: move absolute}
+          return move client
+        }
+      }
+    }
+
+    /// Puts `url` before each request URL that has no scheme, such as `"/repos"`.
+    pub fn baseUrl(self: Self, url: string<'config>) -> NativeHttp<'config> {
+      let mut next = move self
+      next.baseValue = url
+      return move next
+    }
+
+    /// Adds a header to each request. A header of the request with the same name replaces it.
+    pub fn header(self: Self, name: string<'config>, value: string<'config>) -> NativeHttp<'config> {
+      let mut next = move self
+      if next.headerCount == MAX_DEFAULT_HEADERS {
+        next.overflowValue = true
+        return move next
+      }
+      next.headerValues[next.headerCount] = Field<'config> {name: name, value: value}
+      next.headerCount = next.headerCount + usize.ONE
+      return move next
+    }
+
+    /// Sets the default deadline for each request.
+    pub fn timeoutSeconds(self: Self, seconds: u64) -> NativeHttp<'config> {
+      let mut next = move self
+      next.timeoutValue = seconds
+      return move next
+    }
+
+    /// Sets the default response body limit.
+    pub fn maxBodyBytes(self: Self, limit: usize) -> NativeHttp<'config> {
+      let mut next = move self
+      next.maxBodyValue = limit
+      return move next
+    }
+
+    /// Sets how many redirects requests follow by default. With 0, a redirect response is returned
+    /// as it is.
+    pub fn maxRedirects(self: Self, hops: usize) -> NativeHttp<'config> {
+      let mut next = move self
+      next.redirectValue = hops
+      return move next
+    }
+
+    /// Makes each final response with a status outside 200 to 299 fail with a `Status` error.
+    pub fn failOnStatus(self: Self) -> NativeHttp<'config> {
+      let mut next = move self
+      next.failOnStatusValue = true
+      return move next
+    }
+
+    /// Uses the PEM bundle at the absolute path `path`, such as `"/etc/ssl/cert.pem"`, instead of
+    /// the platform bundle.
+    pub fn trustBundle(self: Self, path: string<'config>) -> NativeHttp<'config> {
+      let mut next = move self
+      next.trustChoice = TrustChoice<'config>.Borrowed {path: path}
+      next.trust = Option<NativeFileTrustSource>.none()
+      return move next
+    }
+  }
+
+  fn platformBundle() -> &'static [u8] {
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      return b"/etc/ssl/cert.pem"
+    } else {
+      return b"/etc/ssl/certs/ca-certificates.crt"
+    }
+  }
+
+  struct Settings {
+    timeoutSeconds: u64,
+    maxBody: usize,
+    redirects: usize,
+  }
+
+  struct Received {
+    status: u16,
+    head: OwnedResponseHead,
+    body: Bytes,
+    location: Option<String>,
+  }
+
+  fn isRedirect(status: u16) -> bool {
+    return status == 301 || status == 302 || status == 303 || status == 307 || status == 308
+  }
+
+  fn sameName(left: string, right: string) -> bool {
+    let a = String.utf8Bytes(left)
+    let b = String.utf8Bytes(right)
+    if a.length != b.length { return false }
+    let mut index = usize.ZERO
+    while index < a.length {
+      let mut x = a[index]
+      let mut y = b[index]
+      if x >= 65 && x <= 90 { x = x + 32 }
+      if y >= 65 && y <= 90 { y = y + 32 }
+      if x != y { return false }
+      index = index + usize.ONE
+    }
+    return true
+  }
+
+  fn invalid(message: string<'static>) -> HttpError {
+    return HttpError.make(HttpErrorKind.InvalidRequest, message)
+  }
+
+  fn redirectFailure(message: string<'static>) -> HttpError {
+    return HttpError.make(HttpErrorKind.Redirect, message)
+  }
+
+  fn limitsFor(maxBody: usize) -> Limits {
+    let mut selected = Limits.defaults()
+    selected.maxRequests = usize.ONE
+    // Leave room above the caller's limit so the client reports TooLarge before framing does.
+    let room = usize.toU64(maxBody) + u64.toU64(65536)
+    if room > selected.responseBody.maxPayloadBytes {
+      selected.responseBody.maxPayloadBytes = room
+      selected.responseBody.maxWireBytes = room + room
+    }
+    return selected
+  }
+
+  effect fn ensureTrust(client: &mut NativeHttp) -> () ! HttpError | OutOfMemoryError ? &mut Allocator {
+    if let Option.Some {value} = &client.trust { return () }
+    let configured = match & client.trustChoice {
+      TrustChoice.Platform => run Effect.result(trustAt(platformBundle()))
+      TrustChoice.Borrowed {path} => run Effect.result(trustAt(String.utf8Bytes(path)))
+      TrustChoice.Owned {path} => run Effect.result(trustAt(Bytes.asSlice(&path)))
+    }
+    match move configured {
+      Result.Success {value} => { client.trust = Option<NativeFileTrustSource>.some(move value) }
+      Result.Failure {error} => match move error {
+        HttpError failure => { fail move failure }
+        FileError failure => { fail HttpError.make(HttpErrorKind.Tls, "The PEM bundle path is not a valid file name.") }
+        TrustSourceError failure => {
+          fail HttpError.caused(HttpErrorKind.Tls, "Could not configure the PEM trust bundle.", HttpCause.Trust {error: move failure})
+        }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+  }
+
+  effect fn trustAt(bundle: &[u8]) -> NativeFileTrustSource
+  ! HttpError | FileError | TrustSourceError | OutOfMemoryError
+  ? &mut Allocator {
+    if bundle.length == usize.ZERO || bundle.length > 4096 || bundle[usize.ZERO] != 47 {
+      fail HttpError.make(HttpErrorKind.Tls, "The PEM bundle must be an absolute path of at most 4096 bytes.")
+    }
+    let mut index = usize.ZERO
+    let mut separator = usize.ZERO
+    while index < bundle.length {
+      if bundle[index] == 0 { fail HttpError.make(HttpErrorKind.Tls, "The PEM bundle path contains a NUL byte.") }
+      if bundle[index] == 47 { separator = index }
+      index = index + usize.ONE
+    }
+    if separator + usize.ONE == bundle.length {
+      fail HttpError.make(HttpErrorKind.Tls, "The PEM bundle path names a directory, not a file.")
+    }
+    // The parent directory is trusted configuration (on macOS /etc is a symlink); only the final
+    // file is opened beneath it with the no-follow policy.
+    let path = run Path.fromBytes(Slice.view<u8>(bundle, separator, bundle.length - separator))
+    if separator == usize.ZERO {
+      return run NativeFileTrustSource.make(b"/", &path)
+    }
+    return run NativeFileTrustSource.make(Slice.view<u8>(bundle, usize.ZERO, separator), &path)
+  }
+
+  effect fn firstVariable(names: &[&'static [u8]]) -> Option<Bytes>
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+    let mut index = usize.ZERO
+    while index < names.length {
+      let found = run HostInput.variable(names[index])
+      if let Option.Some {value: text} = move found {
+        if Bytes.length(&text) > usize.ZERO { return Option<Bytes>.some(move text) }
+      }
+      index = index + usize.ONE
+    }
+    return Option<Bytes>.none()
+  }
+
+  fn isSpace(byte: u8) -> bool {
+    return byte == 32 || byte == 9 || byte == 10 || byte == 13
+  }
+
+  fn lowered(byte: u8) -> u8 {
+    if byte >= 65 && byte <= 90 { return byte + 32 }
+    return byte
+  }
+
+  fn hexValue(byte: u8) -> Option<u8> {
+    if byte >= 48 && byte <= 57 { return Option<u8>.some(byte - 48) }
+    let folded = lowered(byte)
+    if folded >= 97 && folded <= 102 { return Option<u8>.some(folded - 87) }
+    return Option<u8>.none()
+  }
+
+  fn statusOf(head: &OwnedResponseHead) -> u16 {
+    let view = head.view()
+    return Status.code(&view.status())
+  }
+
+  fn badProxy() -> HttpError {
+    return HttpError.make(HttpErrorKind.InvalidUrl, "The proxy URL is not valid; only http://host:port proxies are supported.")
+  }
+
+  // Reads a proxy URL such as `http://user:pass@proxy:3128/`. The user information becomes a Basic
+  // token, because ProxyConfig accepts only a scheme, a host, and a port.
+  effect fn proxyConfig(raw: &[u8], id: u64) -> ProxyConfig ! HttpError | OutOfMemoryError ? &mut Allocator {
+    let mut start = usize.ZERO
+    let mut end = raw.length
+    while start < end && isSpace(raw[start]) { start = start + usize.ONE }
+    while end > start && isSpace(raw[end - usize.ONE]) { end = end - usize.ONE }
+    let mut full = Bytes.make()
+    let mut index = start
+    let mut scheme = false
+    while index + usize.ONE + usize.ONE < end {
+      if raw[index] == 58 && raw[index + usize.ONE] == 47 && raw[index + usize.ONE + usize.ONE] == 47 {
+        scheme = true
+        break
+      }
+      if raw[index] == 47 || raw[index] == 64 { break }
+      index = index + usize.ONE
+    }
+    if !scheme { run Bytes.append(&mut full, b"http://") }
+    run Bytes.append(&mut full, Slice.view<u8>(raw, start, end - start))
+    let text = Bytes.asSlice(&full)
+    let mut authority = usize.ZERO
+    index = usize.ZERO
+    while index + usize.ONE + usize.ONE < text.length {
+      if text[index] == 58 && text[index + usize.ONE] == 47 && text[index + usize.ONE + usize.ONE] == 47 {
+        authority = index + 3
+        break
+      }
+      index = index + usize.ONE
+    }
+    let mut finish = authority
+    while finish < text.length && text[finish] != 47 && text[finish] != 63 && text[finish] != 35 { finish = finish + usize.ONE }
+    // Only an empty path or `/` may follow the authority.
+    if finish < text.length && !(finish + usize.ONE == text.length && text[finish] == 47) { fail badProxy() }
+    let mut at = Option<usize>.none()
+    index = authority
+    while index < finish {
+      if text[index] == 64 { at = Option<usize>.some(index) }
+      index = index + usize.ONE
+    }
+    let mut stripped = Bytes.make()
+    run Bytes.append(&mut stripped, Slice.view<u8>(text, usize.ZERO, authority))
+    let mut authentication = ProxyAuth.none(ProxyAuthContextId.make(id))
+    match move at {
+      Option.None => run Bytes.append(&mut stripped, Slice.view<u8>(text, authority, finish - authority))
+      Option.Some {value: sign} => {
+        run Bytes.append(&mut stripped, Slice.view<u8>(text, sign + usize.ONE, finish - sign - usize.ONE))
+        let mut credentials = Bytes.make()
+        index = authority
+        while index < sign {
+          let mut byte = text[index]
+          if byte == 37 && index + usize.ONE + usize.ONE < sign {
+            if let Option.Some {value: high} = hexValue(text[index + usize.ONE]) {
+              if let Option.Some {value: low} = hexValue(text[index + usize.ONE + usize.ONE]) {
+                byte = high * 16 + low
+                index = index + usize.ONE + usize.ONE
+              }
+            }
+          }
+          run Bytes.append(&mut credentials, &[byte])
+          index = index + usize.ONE
+        }
+        let size = match move Base64.encodedLength(Bytes.length(&credentials)) {
+          Result.Success {value} => value
+          Result.Failure {error} => { fail badProxy() }
+        }
+        let mut token = run Bytes.zeroed(size)
+        match move Base64.encodeInto(Bytes.asMutSlice(&mut token), Bytes.asSlice(&credentials)) {
+          Result.Success {value} => { drop value }
+          Result.Failure {error} => { fail badProxy() }
+        }
+        authentication = match move run ProxyAuth.preparedBasic(ProxyAuthContextId.make(id), Bytes.asSlice(&token)) {
+          Result.Success {value} => move value
+          Result.Failure {error} => { fail badProxy() }
+        }
+      }
+    }
+    drop text
+    let url = match move run String.copyUtf8(Bytes.asSlice(&stripped)) {
+      Result.Success {value} => move value
+      Result.Failure {error} => { fail badProxy() }
+    }
+    let none: [Origin; 0] = []
+    let bypass = match move run BypassPolicy.copy(&none) {
+      Result.Success {value} => move value
+      Result.Failure {error} => { fail badProxy() }
+    }
+    return match move ProxyConfig.fromUri(ProxyConfigId.make(id), String.view(&url), move authentication, move bypass, 65536) {
+      Result.Success {value} => move value
+      Result.Failure {error} => match move error {
+        ProxyError.Admission {error: admission} => match admission.reason {
+          ProxyReason.UnsupportedProxyTransport => {
+            fail HttpError.make(HttpErrorKind.InvalidUrl, "HTTPS proxies are not supported; use an http:// proxy URL.")
+          }
+          _ => { fail badProxy() }
+        }
+        _ => { fail badProxy() }
+      }
+    }
+  }
+
+  // Whether `host` matches an entry of a NO_PROXY list.
+  fn bypassed(list: &[u8], host: &[u8]) -> bool {
+    let mut name = host
+    if name.length >= 2 && name[usize.ZERO] == 91 && name[name.length - usize.ONE] == 93 {
+      name = Slice.view<u8>(host, usize.ONE, host.length - 2)
+    }
+    let mut start = usize.ZERO
+    while start <= list.length {
+      let mut end = start
+      while end < list.length && list[end] != 44 { end = end + usize.ONE }
+      if entryMatches(Slice.view<u8>(list, start, end - start), name) { return true }
+      start = end + usize.ONE
+    }
+    return false
+  }
+
+  fn entryMatches(raw: &[u8], host: &[u8]) -> bool {
+    let mut start = usize.ZERO
+    let mut end = raw.length
+    while start < end && isSpace(raw[start]) { start = start + usize.ONE }
+    while end > start && isSpace(raw[end - usize.ONE]) { end = end - usize.ONE }
+    if end - start == usize.ONE && raw[start] == 42 { return true }
+    if start < end && raw[start] == 42 { start = start + usize.ONE }
+    if start < end && raw[start] == 46 { start = start + usize.ONE }
+    if start < end && raw[start] == 91 {
+      // An IPv6 literal such as `[::1]:8080`.
+      start = start + usize.ONE
+      let mut close = start
+      while close < end && raw[close] != 93 { close = close + usize.ONE }
+      end = close
+    } else {
+      let mut colons = usize.ZERO
+      let mut last = end
+      let mut index = start
+      while index < end {
+        if raw[index] == 58 {
+          colons = colons + usize.ONE
+          last = index
+        }
+        index = index + usize.ONE
+      }
+      if colons == usize.ONE { end = last }
+    }
+    let length = end - start
+    if length == usize.ZERO || length > host.length { return false }
+    let offset = host.length - length
+    if offset > usize.ZERO && host[offset - usize.ONE] != 46 { return false }
+    let mut index = usize.ZERO
+    while index < length {
+      if lowered(raw[start + index]) != lowered(host[offset + index]) { return false }
+      index = index + usize.ONE
+    }
+    return true
+  }
+
+  struct Handler<'b> {
+    request: PreparedRequest,
+    body: &'b [u8],
+    deadline: Instant,
+    maxBody: usize,
+  }
+
+  impl<'b> ConnectionHandler<
+    NativeTransport,
+    Received,
+    HttpError | ExchangeError | OutOfMemoryError
+    ? &mut Allocator | &mut MonotonicClock | &mut Random
+  > for Handler<'b> {
+    effect<'call> fn handle<'call>(handler: Self, connection: &'call mut Connection<NativeTransport>) -> Received
+    ! HttpError | ExchangeError | OutOfMemoryError
+    ? &mut Allocator | &mut MonotonicClock | &mut Random {
+      let Handler<'b> {request, body, deadline, maxBody} = move handler
+      let options = RequestOptions {deadline: Option<Instant>.some(move deadline), continuePolicy: ContinuePolicy.Disabled}
+      let callback = effect fn(exchange: &mut Live<NativeTransport>) -> Received
+      ! HttpError | ExchangeError | OutOfMemoryError
+      ? &mut Allocator | &mut MonotonicClock | &mut Random {
+        return run exchangeBody(&mut exchange.*, body, maxBody)
+      }
+      return run Exchange.withExchange(&mut connection.*, &request, move options, move callback)
+    }
+  }
+
+  // The same exchange as Handler, over a connection from withProxyRoute.
+  struct RouteBody<'b> {
+    request: PreparedRequest,
+    body: &'b [u8],
+    deadline: Instant,
+    maxBody: usize,
+  }
+
+  impl<'b> RouteBody<'b> {
+    effect<'call> fn handle<'configuration, 'call, 'transport: 'call, 'provider: 'transport, 'tunnel: 'provider>(
+      handler: Self,
+      route: Route<'configuration>,
+      connection: &'call mut Connection<RouteTransport<'transport, 'provider, 'tunnel, NativeRouteProvider>>,
+    ) -> Received
+    ! HttpError | ExchangeError | OutOfMemoryError
+    ? &mut Allocator | &mut MonotonicClock | &mut Random {
+      drop route
+      let RouteBody<'b> {request, body, deadline, maxBody} = move handler
+      let options = RequestOptions {deadline: Option<Instant>.some(move deadline), continuePolicy: ContinuePolicy.Disabled}
+      let callback = effect fn(exchange: &mut Live<RouteTransport<'transport, 'provider, 'tunnel, NativeRouteProvider>>) -> Received
+      ! HttpError | ExchangeError | OutOfMemoryError
+      ? &mut Allocator | &mut MonotonicClock | &mut Random {
+        return run exchangeBody(&mut exchange.*, body, maxBody)
+      }
+      return run Exchange.withExchange(&mut connection.*, &request, move options, move callback)
+    }
+  }
+
+  impl<'configuration, 'b> RouteHandler<
+    'configuration,
+    NativeRouteProvider,
+    Received,
+    HttpError | ExchangeError | OutOfMemoryError
+    ? &mut Allocator | &mut MonotonicClock | &mut Random
+  > for RouteBody<'b> {
+    handle: RouteBody.handle
+  }
+
+  effect fn exchangeBody<P>(exchange: &mut Live<P>, payload: &[u8], maxBody: usize) -> Received
+  ! HttpError | ExchangeError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock | &mut Random
+  where
+    &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
+    run Exchange.send(&mut exchange.*)
+    let mut offset = usize.ZERO
+    while offset < payload.length {
+      let progress = run Exchange.writeSome(&mut exchange.*, Slice.view<u8>(payload, offset, payload.length - offset))
+      offset = offset + progress.consumed
+    }
+    let entries: [Header<'static>; 0] = []
+    let trailers = match move Headers.make(&entries, Limits.defaults().head.values) {
+      Result.Success {value} => move value
+      Result.Failure {error} => { fail invalid("Could not prepare the request trailers.") }
+    }
+    run Exchange.finishRequest(&mut exchange.*, &trailers)
+    let status = run Exchange.receiveFinal(&mut exchange.*)
+    let live = run Live.head(&exchange.*)
+    let head = match move run live.copy(Limits.defaults().head.values) {
+      Result.Success {value} => move value
+      Result.Failure {error} => {
+        fail HttpError.caused(HttpErrorKind.Protocol, "The response head exceeds the header limits.", HttpCause.Value {error: move error})
+      }
+    }
+    let mut location = Option<String>.none()
+    if isRedirect(status) {
+      location = run redirectLocation(&head)
+    }
+    let mut body = Bytes.make()
+    let mut scratch = run Bytes.zeroed(16384)
+    while true {
+      let count = run Exchange.readSome(&mut exchange.*, Bytes.asMutSlice(&mut scratch))
+      if count == usize.ZERO { break }
+      if count > maxBody - Bytes.length(&body) {
+        fail HttpError {
+          kind: HttpErrorKind.TooLarge,
+          message: "The response body exceeds the configured limit.",
+          status: Option<u16>.some(status),
+          cause: HttpCause.None,
+        }
+      }
+      run Bytes.append(&mut body, Slice.view<u8>(Bytes.asSlice(&scratch), usize.ZERO, count))
+    }
+    run Exchange.finishResponse(&mut exchange.*)
+    return Received {status: status, head: move head, body: move body, location: move location}
+  }
+
+  // A redirect without a `Location` field has nowhere to go, so it is returned as the response
+  // (RFC 9110 section 15.4).
+  effect fn redirectLocation(head: &OwnedResponseHead) -> Option<String> ! HttpError | OutOfMemoryError ? &mut Allocator {
+    let view = head.view()
+    let mut fields = view.headers().iter()
+    let mut selected = Option<&[u8]>.none()
+    while true {
+      let next = fields.next()
+      match move next {
+        Option.None => { break }
+        Option.Some {value} => {
+          if sameName(Header.name(&value), "location") {
+            if let Option.Some {value: previous} = &selected {
+              fail redirectFailure("The redirect has more than one Location header.")
+            }
+            selected = Option<&[u8]>.some(Header.value(&value))
+          }
+        }
+      }
+    }
+    let bytes = match move selected {
+      Option.Some {value} => value
+      Option.None => { return Option<String>.none() }
+    }
+    if bytes.length == usize.ZERO || bytes.length > 8192 {
+      fail redirectFailure("The redirect Location must contain 1 to 8192 bytes.")
+    }
+    return match move run String.copyUtf8(bytes) {
+      Result.Success {value} => Option<String>.some(move value)
+      Result.Failure {error} => { fail redirectFailure("The redirect Location is not UTF-8.") }
+    }
+  }
+
+  effect fn attempt<'r>(
+    client: &mut NativeHttp,
+    defaults: &[Field<'r>],
+    method: Method<'static>,
+    url: string,
+    request: &Request<'r>,
+    bearer: &'r [u8],
+    withBody: bool,
+    credentials: bool,
+    settings: &Settings,
+  ) -> Received
+  ! HttpError | ProxyError | RequestError | ExchangeError | NativeExchangeError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError
+  ? &mut Allocator {
+    let uri = match move Uri.parse(url) {
+      Result.Success {value} => move value
+      Result.Failure {error} => {
+        fail HttpError.caused(HttpErrorKind.InvalidUrl, "The URL is not a valid absolute URI.", HttpCause.Uri {error: move error})
+      }
+    }
+    let origin = match move Origin.fromUri(&uri) {
+      Result.Success {value} => move value
+      Result.Failure {error} => {
+        fail HttpError.make(HttpErrorKind.InvalidUrl, "The URL must be http or https with a host and no credentials.")
+      }
+    }
+    if request.overflowed() {
+      fail invalid("The request has more path segments, query parameters, or headers than it can hold.")
+    }
+    let limits = limitsFor(settings.maxBody)
+    let values = limits.head.values
+    let mut policy = HeaderPolicy<'r>.defaults()
+    let mut entries = List<Header<'r>>.make()
+    let mut hasEncoding = false
+    let mut hasContentType = false
+    let requested = request.headers()
+    let mut index = usize.ZERO
+    // Provider defaults first; a request header with the same name replaces the default.
+    while index < defaults.length + requested.length {
+      let mut field = Field<'r> {name: "", value: ""}
+      let mut use = true
+      if index < defaults.length {
+        field = defaults[index]
+        let mut other = usize.ZERO
+        while other < requested.length {
+          if sameName(requested[other].name, field.name) { use = false }
+          other = other + usize.ONE
+        }
+      } else {
+        field = requested[index - defaults.length]
+      }
+      if use {
+        if sameName(field.name, "accept-encoding") { hasEncoding = true }
+        if sameName(field.name, "content-type") { hasContentType = true }
+        let bytes = String.utf8Bytes(field.value)
+        match slotFor(field.name, credentials) {
+          Slot.UserAgent => { policy.userAgent = HeaderControl<'r>.Value {value: bytes} }
+          Slot.Accept => { policy.accept = HeaderControl<'r>.Value {value: bytes} }
+          Slot.Host => { policy.host = HeaderControl<'r>.Value {value: bytes} }
+          Slot.Authorization => { policy.authorization = Authorization<'r>.Value {value: bytes} }
+          Slot.Skip => {}
+          Slot.Plain => run appendHeader<'r>(&mut entries, field.name, bytes, values)
+        }
+      }
+      index = index + usize.ONE
+    }
+    if credentials && bearer.length > usize.ZERO {
+      policy.authorization = Authorization<'r>.Value {value: bearer}
+    }
+    if !hasEncoding {
+      run appendHeader<'r>(&mut entries, "Accept-Encoding", b"identity", values)
+    }
+    let mut payloadLength = usize.ZERO
+    let mut body = BodyMode.Empty
+    if withBody {
+      payloadLength = request.bodyBytes().length
+      body = BodyMode.KnownLength {length: usize.toU64(payloadLength)}
+      if !hasContentType {
+        if let Option.Some {value: contentType} = move request.contentType() {
+          run appendHeader<'r>(&mut entries, "Content-Type", String.utf8Bytes(contentType), values)
+        }
+      }
+    }
+    let headers = match move Headers.make(List<Header<'r>>.asSlice(&entries), values) {
+      Result.Success {value} => move value
+      Result.Failure {error} => {
+        fail HttpError.caused(HttpErrorKind.InvalidRequest, "The request headers exceed the header limits.", HttpCause.Value {error: move error})
+      }
+    }
+    run ensureTrust(&mut client.*)
+    let secure = Origin.secure(&origin)
+    let host = match uri.host() {
+      Option.Some {value} => String.utf8Bytes(value)
+      Option.None => b""
+    }
+    let mut configured = &client.plainProxy
+    if secure { configured = &client.secureProxy }
+    let mut route = Option<Route>.none()
+    if let Option.Some {value: proxy} = &configured.* {
+      if !bypassed(Bytes.asSlice(&client.noProxy), host) {
+        route = Option<Route>.some(selectRoute(&proxy, origin))
+      }
+    }
+    // A plain HTTP origin behind a proxy sends the full URI to the proxy; a tunnel sends the usual
+    // request through it.
+    let prepared = match &route {
+      Option.Some {value: through} => match Route.mode(&through) {
+        RouteMode.Forward => run Prepare.prepareForward(&through, &uri, Version.Http11, method, &headers, &policy, body, false, values, limits.head.maxHeadBytes, 8192)
+        _ => run Prepare.fromUri(&uri, Version.Http11, method, &headers, &policy, body, false, values, limits.head.maxHeadBytes, 8192)
+      }
+      Option.None => run Prepare.fromUri(&uri, Version.Http11, method, &headers, &policy, body, false, values, limits.head.maxHeadBytes, 8192)
+    }
+    let nanoseconds = settings.timeoutSeconds * u64.toU64(1000000000)
+    let now = run MonotonicClock.now() |> Effect.provideMut<MonotonicClock>(&mut client.clock)
+    let deadline = MonotonicClock.deadlineAfter(&now, nanoseconds)
+    let mut options = Options.defaults()
+    options.handshakeNanoseconds = nanoseconds
+    let payload = Slice.view<u8>(request.bodyBytes(), usize.ZERO, payloadLength)
+    let taken = Intrinsic.replace(client.trust, Option<NativeFileTrustSource>.none())
+    let mut trust = match move taken {
+      Option.Some {value} => move value
+      Option.None => { fail HttpError.make(HttpErrorKind.Tls, "The PEM trust bundle is not configured.") }
+    }
+    let mut wall = OsSystemClock.make()
+    if let Option.Some {value: through} = move route {
+      let routed = RouteBody {request: move prepared, body: payload, deadline: move deadline, maxBody: settings.maxBody}
+      let result = run Effect.result(viaProxy(through, move options, limits, &mut trust, move routed)
+        |> Effect.provideMut<SystemClock>(&mut wall)
+        |> Effect.provideMut<MonotonicClock>(&mut client.clock)
+        |> Effect.provideMut<Random>(&mut client.random))
+      client.trust = Option<NativeFileTrustSource>.some(move trust)
+      return match move result {
+        Result.Success {value} => move value
+        Result.Failure {error} => { fail move error }
+      }
+    }
+    let handler = Handler {request: move prepared, body: payload, deadline: move deadline, maxBody: settings.maxBody}
+    let outcome = run Effect.result(ExchangeNative.withConnection(origin, move options, limits, move handler)
+      |> Effect.provideMut<TrustSource>(&mut trust)
+      |> Effect.provideMut<SystemClock>(&mut wall)
+      |> Effect.provideMut<MonotonicClock>(&mut client.clock)
+      |> Effect.provideMut<Random>(&mut client.random))
+    client.trust = Option<NativeFileTrustSource>.some(move trust)
+    return match move outcome {
+      Result.Success {value} => move value
+      Result.Failure {error} => { fail move error }
+    }
+  }
+
+  // Sends one request through the proxy route. A tunnel to an https origin checks its certificate
+  // with a snapshot of the client's trust bundle.
+  effect fn viaProxy<'configuration, 'b>(
+    route: Route<'configuration>,
+    options: Options,
+    limits: Limits,
+    trust: &mut NativeFileTrustSource,
+    handler: RouteBody<'b>,
+  ) -> Received
+  ! HttpError | ProxyError | ExchangeError | NativeExchangeError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random {
+    let mut snapshot = Option<TrustSnapshot>.none()
+    if Origin.secure(&Route.originalOrigin(&route)) {
+      snapshot = Option<TrustSnapshot>.some(run TrustSource.load(options.trust) |> Effect.provideMut<TrustSource>(&mut trust.*))
+    }
+    return run ExchangeNative.withProxyRoute(route, move options, limits, move snapshot, move handler)
+  }
+
+  enum Slot {
+    UserAgent,
+    Accept,
+    Host,
+    Authorization,
+    Skip,
+    Plain,
+  }
+
+  fn slotFor(name: string, credentials: bool) -> Slot {
+    if sameName(name, "user-agent") { return Slot.UserAgent }
+    if sameName(name, "accept") { return Slot.Accept }
+    if sameName(name, "host") { return Slot.Host }
+    if sameName(name, "authorization") {
+      if credentials { return Slot.Authorization }
+      return Slot.Skip
+    }
+    if sameName(name, "cookie") && !credentials { return Slot.Skip }
+    return Slot.Plain
+  }
+
+  effect fn appendHeader<'r>(entries: &mut List<Header<'r>>, name: string<'r>, value: &'r [u8], values: HeaderLimits) -> ()
+  ! HttpError | OutOfMemoryError
+  ? &mut Allocator {
+    let header = match move Header.make(name, value, values) {
+      Result.Success {value: made} => move made
+      Result.Failure {error} => {
+        fail HttpError.caused(HttpErrorKind.InvalidRequest, "A request header name or value is invalid.", HttpCause.Value {error: move error})
+      }
+    }
+    run List<Header<'r>>.append(&mut entries.*, header)
+  }
+
+  effect fn follow(client: &mut NativeHttp, request: Request) -> Response
+  ! HttpError | ProxyError | RequestError | ExchangeError | NativeExchangeError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError
+  ? &mut Allocator {
+    let settings = Settings {
+      timeoutSeconds: Option<u64>.unwrapOr(request.timeout(), client.timeoutValue),
+      maxBody: Option<usize>.unwrapOr(request.maxBody(), client.maxBodyValue),
+      redirects: Option<usize>.unwrapOr(request.redirects(), client.redirectValue),
+    }
+    if client.overflowValue {
+      fail invalid("The client has more default headers than it can hold.")
+    }
+    let mut bearer = Bytes.make()
+    if let Option.Some {value: token} = move request.bearerToken() {
+      run Bytes.append(&mut bearer, b"Bearer ")
+      run Bytes.append(&mut bearer, String.utf8Bytes(token))
+    }
+    let defaultValues = client.headerValues
+    let defaults = Slice.view<Field>(&defaultValues, usize.ZERO, client.headerCount)
+    let mut current = run request.resolveUrl(client.baseValue)
+    let mut method = request.method()
+    let mut withBody = request.hasBody()
+    let mut credentials = true
+    let mut hops = usize.ZERO
+    while true {
+      let received = run attempt(&mut client.*, defaults, method, String.view(&current), &request, Bytes.asSlice(&bearer), withBody, credentials, &settings)
+      let Received {status, head, body, location} = move received
+      let target = match move location {
+        Option.None => {
+          return run finish(client.failOnStatusValue, status, move head, move body, move current)
+        }
+        Option.Some {value} => move value
+      }
+      if settings.redirects == usize.ZERO {
+        drop target
+        return run finish(client.failOnStatusValue, status, move head, move body, move current)
+      }
+      drop head
+      drop body
+      if hops == settings.redirects { fail redirectFailure("The request exceeded its redirect limit.") }
+      let next = run resolveRedirect(String.view(&current), String.view(&target), &mut credentials)
+      if status == 303 && !Method.equals(&method, &Method.head()) {
+        method = Method.get()
+        withBody = false
+      }
+      if (status == 301 || status == 302) && Method.equals(&method, &Method.post()) {
+        method = Method.get()
+        withBody = false
+      }
+      current = move next
+      hops = hops + usize.ONE
+    }
+    fail redirectFailure("The redirect loop ended unexpectedly.")
+  }
+
+  effect fn finish(failOnStatus: bool, status: u16, head: OwnedResponseHead, body: Bytes, url: String) -> Response ! HttpError {
+    let response = Response.fromParts(move head, move body, move url)
+    if failOnStatus { return run response.expectOk() }
+    return move response
+  }
+
+  effect fn resolveRedirect(current: string, location: string, credentials: &mut bool) -> String
+  ! HttpError | OutOfMemoryError
+  ? &mut Allocator {
+    let base = match move Uri.parse(current) {
+      Result.Success {value} => move value
+      Result.Failure {error} => { fail redirectFailure("The redirect source URL is invalid.") }
+    }
+    let reference = match move UriReference.parse(location) {
+      Result.Success {value} => move value
+      Result.Failure {error} => {
+        fail HttpError.caused(HttpErrorKind.Redirect, "The redirect Location is not a valid URI reference.", HttpCause.Uri {error: move error})
+      }
+    }
+    let resolved = match move run Uri.resolveOwned(&base, &reference) {
+      Result.Success {value} => move value
+      Result.Failure {error} => {
+        fail HttpError.caused(HttpErrorKind.Redirect, "The redirect Location does not resolve to a URL.", HttpCause.Uri {error: move error})
+      }
+    }
+    let view = resolved.view()
+    if let Option.Some {value} = move view.userinfo() {
+      fail redirectFailure("The redirect Location contains credentials.")
+    }
+    let scheme = view.scheme()
+    if !sameName(scheme, "http") && !sameName(scheme, "https") {
+      fail redirectFailure("The redirect Location is not an http or https URL.")
+    }
+    if sameName(base.scheme(), "https") && sameName(scheme, "http") {
+      fail redirectFailure("Refused a redirect from HTTPS to HTTP.")
+    }
+    let from = Origin.fromUri(&base)
+    let to = Origin.fromUri(&view)
+    let same = match & from {
+      Result.Success {value: left} => match & to {
+        Result.Success {value: right} => left.equals(&right)
+        Result.Failure {error} => false
+      }
+      Result.Failure {error} => false
+    }
+    if !same { credentials.* = false }
+    drop view
+    return resolved.intoString()
+  }
+
+  /// Whether an exchange failure is the request deadline, at any transport layer.
+  fn exchangeTimedOut(failure: &ExchangeError) -> bool {
+    return match &failure.* {
+      ExchangeError.Timeout => true
+      ExchangeError.OutputTimeout {progress} => true
+      ExchangeError.Transport {error} => transportTimedOut(&error)
+      ExchangeError.Output {error, progress} => transportTimedOut(&error)
+      _ => false
+    }
+  }
+
+  fn transportTimedOut(failure: &TransportError) -> bool {
+    return match &failure.* {
+      TransportError.Plain {error} => ioTimedOut(&error)
+      TransportError.Secured {error} => match &error {
+        ConnectionError.Io {error: io} => ioTimedOut(&io)
+        ConnectionError.HandshakeTimeout => true
+        _ => false
+      }
+    }
+  }
+
+  fn ioTimedOut(failure: &ByteIoError) -> bool {
+    return match &failure.* {
+      ByteIoError.Timeout {operation} => true
+      _ => false
+    }
+  }
+
+  // The message names the most common reasons a handshake fails, so a program that prints only
+  // `HttpError.message` still says what went wrong. The full error stays in `HttpCause.Tls`.
+  fn tlsMessage(failure: &ConnectionError) -> string<'static> {
+    return match &failure.* {
+      ConnectionError.Tls {error} => match &error {
+        TlsError.PeerAlert {code} => alertMessage(code)
+        TlsError.ProtocolViolation {reason} => "The server broke the TLS 1.3 protocol during the handshake."
+        TlsError.CertificateDecode {error: decode} => "The server certificate could not be decoded."
+        TlsError.CertificatePath {error: path} => pathMessage(&path)
+        TlsError.CertificateIdentity {error: identity} => match &identity {
+          CertificateIdentityFailure.Match {error: matched} => "The server certificate is not valid for this host name."
+          _ => "The names in the server certificate could not be read."
+        }
+        TlsError.CertificateVerify {error: verify} => "The server's TLS signature did not verify against its certificate key."
+        TlsError.UnsupportedProfile => "The server chose a TLS cipher suite, key exchange group, or signature algorithm that is not supported."
+        TlsError.HandshakeTruncated => "The server closed the connection during the TLS handshake."
+        TlsError.LimitExceeded {kind, limit} => "The server's TLS handshake exceeds a configured limit."
+        _ => "The TLS connection failed."
+      }
+      ConnectionError.Io {error} => "The connection failed during the TLS handshake."
+      _ => "The TLS connection failed."
+    }
+  }
+
+  fn alertMessage(code: u8) -> string<'static> {
+    // protocol_version (70) is what a server without TLS 1.3 sends; handshake_failure (40) and
+    // insufficient_security (71) mean no offered algorithm was acceptable.
+    if code == 70 { return "The server does not support TLS 1.3." }
+    if code == 40 || code == 71 {
+      return "The server rejected the TLS handshake: it may not support TLS 1.3 or the offered algorithms."
+    }
+    if code == 112 { return "The server does not recognize the requested host name." }
+    if code == 120 { return "The server requires an application protocol other than HTTP/1.1." }
+    return "The server ended the TLS handshake with an alert."
+  }
+
+  fn pathMessage(failure: &ValidationError) -> string<'static> {
+    let mut reason = failure.reason
+    if reason == ValidationReason.NoValidPath {
+      if let Option.Some {value} = &failure.detailReason { reason = value }
+    }
+    if reason == ValidationReason.InvalidTime { return "The server certificate has expired or is not yet valid." }
+    if reason == ValidationReason.NoIssuer || reason == ValidationReason.IssuerMismatch {
+      return "The server certificate is not signed by a trusted root."
+    }
+    if reason == ValidationReason.UnsupportedAlgorithm || reason == ValidationReason.UnsupportedParameters
+      || reason == ValidationReason.InvalidKey {
+      return "The server certificate uses a key or signature algorithm that is not supported."
+    }
+    if reason == ValidationReason.InvalidSignature { return "A signature in the server certificate chain is not valid." }
+    if reason == ValidationReason.InvalidUsage { return "The server certificate is not allowed for TLS server authentication." }
+    return "The server certificate chain is not valid."
+  }
+
+  effect fn classify(error: ProxyError | RequestError | ExchangeError | NativeExchangeError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError) -> never ! HttpError {
+    return match move error {
+      ProxyError failure => match move failure {
+        ProxyError.ProxyAuthenticationRequired {response} => {
+          fail HttpError {
+            kind: HttpErrorKind.Connect,
+            message: "The proxy requires authentication; put the credentials in the proxy URL.",
+            status: Option<u16>.some(statusOf(&response)),
+            cause: HttpCause.None,
+          }
+        }
+        ProxyError.ProxyRejected {response} => {
+          fail HttpError {
+            kind: HttpErrorKind.Connect,
+            message: "The proxy refused to open a tunnel to the server.",
+            status: Option<u16>.some(statusOf(&response)),
+            cause: HttpCause.None,
+          }
+        }
+        _ => { fail HttpError.make(HttpErrorKind.Connect, "The proxy answer is not valid.") }
+      }
+      RequestError failure => {
+        fail HttpError.caused(HttpErrorKind.InvalidRequest, "Could not prepare the request.", HttpCause.Request {error: move failure})
+      }
+      ExchangeError failure => {
+        if exchangeTimedOut(&failure) {
+          fail HttpError.caused(HttpErrorKind.Timeout, "The request deadline passed.", HttpCause.Exchange {error: move failure})
+        }
+        fail HttpError.caused(HttpErrorKind.Protocol, "The HTTP exchange failed.", HttpCause.Exchange {error: move failure})
+      }
+      NativeExchangeError failure => match move failure {
+        NativeExchangeError.AlpnMismatch {error: connection} => {
+          fail HttpError.caused(HttpErrorKind.Tls, "The server did not agree to HTTP/1.1.", HttpCause.Tls {error: move connection})
+        }
+        _ => { fail HttpError.make(HttpErrorKind.Connect, "Could not open the connection.") }
+      }
+      ResolverError failure => {
+        fail HttpError.caused(HttpErrorKind.Connect, "Could not resolve the host name.", HttpCause.Resolver {error: move failure})
+      }
+      NativeSocketError failure => { fail HttpError.make(HttpErrorKind.Connect, "Could not connect to the server.") }
+      ConnectionError failure => match & failure {
+        ConnectionError.HandshakeTimeout => {
+          fail HttpError.caused(HttpErrorKind.Timeout, "The TLS handshake did not finish before the deadline.", HttpCause.Tls {error: move failure})
+        }
+        _ => { fail HttpError.caused(HttpErrorKind.Tls, tlsMessage(&failure), HttpCause.Tls {error: move failure}) }
+      }
+      IdentityError failure => {
+        fail HttpError.caused(HttpErrorKind.Tls, "The server name cannot be checked against its certificate.", HttpCause.Identity {error: move failure})
+      }
+      TrustSourceError failure => {
+        fail HttpError.caused(HttpErrorKind.Tls, "Could not load the PEM trust bundle.", HttpCause.Trust {error: move failure})
+      }
+    }
+  }
+
+  impl<'config> Http for NativeHttp<'config> {
+    effect fn send(self: &mut Self, request: Request) -> Response ! HttpError | OutOfMemoryError ? &mut Allocator {
+      let outcome = run Effect.result(follow(&mut self.*, move request))
+      return match move outcome {
+        Result.Success {value} => move value
+        Result.Failure {error} => match move error {
+          HttpError failure => { fail move failure }
+          OutOfMemoryError exhausted => { fail move exhausted }
+          ProxyError failure => run classify(move failure)
+          RequestError failure => run classify(move failure)
+          ExchangeError failure => run classify(move failure)
+          NativeExchangeError failure => run classify(move failure)
+          ResolverError failure => run classify(move failure)
+          NativeSocketError failure => run classify(move failure)
+          ConnectionError failure => run classify(move failure)
+          IdentityError failure => run classify(move failure)
+          TrustSourceError failure => run classify(move failure)
+        }
+      }
+    }
+  }
+}

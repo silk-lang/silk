@@ -100,7 +100,7 @@ NaN lane holds only for `simdLanesNotEqual`. The ordering comparisons take numer
 `simdSelect` takes lane `i` of `chosen` where mask lane `i` is set and of `other` elsewhere.
 
 **Boundary:** These are compiler primitives in the sealed `Intrinsic` namespace (INTR-001). The
-`silk.simd` modules are the public API over them: one module per shape, such as `silk.simd.u8x16`
+`silk.simd.simd` modules are the public API over them: one module per shape, such as `silk.simd.u8x16`
 for `simd<u8, 16>` and `silk.simd.mask16` for `mask<16>`, for every lane type at 128 and 256 bits.
 
 **Diagnostics:** A type argument that is not an admitted vector, or a mask for an ordering
@@ -274,7 +274,7 @@ CPU feature (PROFILE-006), and the LLVM intrinsic the call lowers to:
 | `wasmNarrowUnsigned`        | `i16x8` → `u8x16`                                                       | wasm32 `simd128`                    |
 | `wasmNarrowSigned`          | `i16x8` → `i8x16`                                                       | wasm32 `simd128`                    |
 
-`silk.arch.x86`, `silk.arch.aarch64` and `silk.arch.wasm` wrap each row in a function named for
+`silk.simd.x86`, `silk.simd.aarch64` and `silk.simd.wasm` wrap each row in a function named for
 its instruction. A wrapper calls the operation inside `static if` and otherwise computes the same
 lanes with portable code, so it is correct on every target.
 
@@ -296,13 +296,13 @@ CPU feature the profile does not select reports `SEM0241`.
 **Status:** Confirmed
 
 ```silk,ignore
-import silk.cpu { CpuFeatures }
+import silk.simd.cpu { CpuFeatures }
 
 let machine = CpuFeatures.detect()
 if CpuFeatures.has(&machine, "avx2") { ... }
 ```
 
-`silk.cpu` names a set of CPU features of the target architecture, spelled as in PROFILE-006.
+`silk.simd.cpu` names a set of CPU features of the target architecture, spelled as in PROFILE-006.
 `CpuFeatures.selected()` is the set the profile selects. `CpuFeatures.detect()` asks the running
 machine and always contains the selected set: x86-64 Linux reads `cpuid` through ASSEMBLY-001
 and counts AVX and AVX-512 features only when `xgetbv` shows the operating system saves their
@@ -319,7 +319,7 @@ each compiled for their features.
 
 **Current compiler:** Aligned.
 
-**Evidence:** `corpus/native/cpu-detect`; `silk.cpu` doctest.
+**Evidence:** `corpus/native/cpu-detect`; `silk.simd.cpu` doctest.
 
 ## SIMD-009 — A function can be compiled for more CPU features than its profile
 
@@ -338,16 +338,16 @@ if CpuFeatures.has(&machine, "avx2") { total = unsafe sumAvx2(values) }
 function for the listed CPU features of the target (PROFILE-006), their implications, and the
 profile's own features. Its body may use SIMD-007 operations those features admit. Running it on a
 CPU without them is undefined, so the function is `unsafe fn` and each caller proves the machine
-has them, usually with `silk.cpu` (SIMD-008).
+has them, usually with `silk.simd.cpu` (SIMD-008).
 
 Callees keep the profile's features. LLVM inlines a callee into a function with more features,
-never the reverse, so portable `silk.simd` helpers called from the function are compiled with its
+never the reverse, so portable `silk.simd.simd` helpers called from the function are compiled with its
 features once inlined. To make that boundary safe, a vector wider than 128 bits or a mask of more
 than 16 lanes crosses every Silk function boundary through memory: LLVM passes such values in
 different registers with and without AVX and AVX-512.
 
 **Boundary:** `Target.hasCpuFeature` keeps answering for the profile inside the function, so a
-`static if` there, and a `silk.arch` wrapper it calls, still sees the profile. `static fn`,
+`static if` there, and a `silk.simd.x86` (or `aarch64`, `wasm`) wrapper it calls, still sees the profile. `static fn`,
 `extern` and interface operations take no `features`. Callees are not compiled again for the
 function's features.
 
@@ -423,14 +423,14 @@ The x86 rounds take the operand order of the instructions: the state, then the r
 `x86CarrylessMultiply` multiplies lane 0 of each operand into a 128-bit product, low half in lane
 0; a program picks other halves with `simdShuffle` first.
 
-`silk.arch.aes` computes SubBytes, ShiftRows, MixColumns and their inverses with portable code,
-without tables. `silk.arch.x86` and `silk.arch.aarch64` wrap each operation on `u8x16` states and
-fall back to `silk.arch.aes` when the profile lacks the feature, like the SIMD-007 wrappers.
+`silk.crypto.aes_round` computes SubBytes, ShiftRows, MixColumns and their inverses with portable code,
+without tables. `silk.simd.x86` and `silk.simd.aarch64` wrap each operation on `u8x16` states and
+fall back to `silk.crypto.aes_round` when the profile lacks the feature, like the SIMD-007 wrappers.
 
 **Boundary:** Key-generation assist is not in the catalog yet. SIMD-012 adds the SHA-256
 instructions. The
 portable fallbacks run in constant time but are much slower than the instructions, so a program
-that encrypts much data selects a kernel at run time with `silk.cpu` (SIMD-008) and a function
+that encrypts much data selects a kernel at run time with `silk.simd.cpu` (SIMD-008) and a function
 compiled for `aes` (SIMD-009).
 
 **Diagnostics:** As SIMD-007: `SEM0239` for a first operand outside the catalog and `SEM0241`
@@ -466,9 +466,9 @@ The SIMD-007 catalog also holds the SHA-256 instructions, all on `u32x4`:
 The operands follow the instructions. `x86Sha256Rounds2` takes C, D, G and H, then A, B, E and F
 (each in lanes 3 to 0), then two message words plus round constants in lanes 0 and 1, which
 `sha256rnds2` reads from `xmm0`. `x86-64` gains the `sha` feature, which implies `sse2`, and
-`silk.cpu` detects it.
+`silk.simd.cpu` detects it.
 
-`silk.arch.x86` and `silk.arch.aarch64` wrap each operation and fall back to portable code when
+`silk.simd.x86` and `silk.simd.aarch64` wrap each operation and fall back to portable code when
 the profile lacks the feature, like the SIMD-007 wrappers.
 
 **Boundary:** SHA-1 and SHA-512 instructions are not in the catalog yet.

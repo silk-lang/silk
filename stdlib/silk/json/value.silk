@@ -1,0 +1,701 @@
+//! Parse JSON into a tree of values, read fields from it, and write it back.
+//!
+//! # When to use
+//! Use [`Json.parse`] when the shape of a document is not fixed, or when you need only a few fields
+//! of a larger document. Read the fields with [`Json.field`], [`Json.fieldAt`], and the `as...`
+//! functions. Use [`Json.deserialize`] or [`Json.decode`] to read a document straight into a typed
+//! value, and [`Json.serialize`] to write a typed value. To read tokens without building a tree,
+//! use `silk.json.scanner`.
+//!
+//! # Details
+//! Parsing is strict (RFC 8259): no comments, no trailing commas, and no duplicate keys in an
+//! object. Arrays and objects keep the order of the source. A number keeps its source text and is
+//! converted only when you call [`Json.asI32`] or a similar function. String escapes are decoded
+//! when the document is parsed. If parsing fails, everything that was built is released.
+//!
+//! # Errors
+//! - `JsonError` if the input is not valid JSON, has a duplicate key, nests deeper than `MAX_DEPTH`
+//!   (64), or has content after the value. `offset` gives the position.
+//! - `OutOfMemoryError` if the `Allocator` cannot supply the tree.
+//! - `WriterError` from the write functions if the `Writer` fails.
+//!
+//! # Gotchas
+//! A borrowed field or string cannot live longer than the [`Value`] that owns it. The write
+//! functions do not flush the `Writer`.
+//!
+//! # Examples
+//! ## Read fields from a document
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.json.scanner { JsonError }
+//! import silk.json.value { Json }
+//! import silk.core.option { Option }
+//!
+//! pub effect fn main() -> i32
+//!   ! JsonError | OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let document = run Json.parse(b"{\"id\":42,\"user\":{\"name\":\"Ada\"}}")
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let id = Json.field(&document, "id") |> Json.asI32 |> Option<i32>.unwrapOr(0)
+//!   let name = Json.field(&document, "user") |> Json.fieldAt("name") |> Json.asString
+//!     |> Option<string>.unwrapOr("")
+//!   if id != 42 || name != "Ada" {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! ## Read a typed value directly
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.json.scanner { JsonError }
+//! import silk.json.value { Json }
+//! import silk.collections.list { List }
+//!
+//! pub effect fn main() -> i32
+//!   ! JsonError | OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let values = run Json.deserialize<List<i64>>(b"[1, 2, 39]")
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   if List<i64>.length(&values) != 3 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Data formats
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.box { Box }
+import silk.num.f32
+import silk.num.f64
+import silk.text.format { Format, ParseError }
+import silk.json.output { JsonOptions, JsonOutput }
+import silk.json.scanner { JsonError, JsonReason, JsonScanner, JsonSpan, JsonToken }
+import silk.json.codec { Decode, Deserialize, JsonCodec, Serialize }
+import silk.json.text { JsonText }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.text.string { String }
+import silk.num.usize
+import silk.collections.list { List }
+import silk.io.writer { Writer, WriterError }
+
+/// One key and value of a JSON object.
+pub struct JsonEntry {
+  /// The key, with escapes decoded.
+  pub key: String,
+  /// The value.
+  pub value: Value,
+}
+
+/// One element of an array or one member of an object.
+///
+/// # Details
+///
+/// Arrays and objects use the same storage type, so nested arrays and objects drop in the same way.
+pub union JsonChild {
+  /// An array element.
+  Item {
+    /// The element.
+    pub value: Value
+  },
+  /// An object member.
+  Member {
+    /// The key and the value.
+    pub entry: JsonEntry
+  },
+}
+
+/// One JSON value: null, a boolean, a number, a string, an array, or an object.
+///
+/// # Details
+///
+/// A `Value` owns all of its children. Use `match` to get the kind, or the `Json.as...` functions
+/// to read a field of a known kind. Arrays and objects keep the order of the source. A number keeps
+/// its source text and is converted only when you call [`Json.asI32`] or a similar function.
+///
+/// # Gotchas
+///
+/// A borrowed field or string cannot live longer than the `Value` that owns it.
+pub union Value {
+  /// JSON `null`.
+  Null,
+  /// JSON `true` or `false`.
+  Bool {
+    /// The boolean value.
+    pub value: bool
+  },
+  /// A JSON number, kept as its source text.
+  Number {
+    /// The number as it was written in the source, such as `"-1.5e3"`.
+    pub text: String
+  },
+  /// A JSON string.
+  String {
+    /// The text, with escapes decoded.
+    pub text: String
+  },
+  /// A JSON array.
+  Array {
+    /// The elements in source order. Each is a `JsonChild.Item`.
+    pub values: Box<List<JsonChild>>
+  },
+  /// A JSON object.
+  Object {
+    /// The members in source order. Each is a `JsonChild.Member`.
+    pub entries: Box<List<JsonChild>>
+  },
+}
+
+/// The owner type of the JSON parse, write, and read operations. It has no fields and is never
+/// constructed.
+pub struct Json {}
+
+impl Json {
+  /// Parses `bytes` as one complete JSON document and returns its tree.
+  ///
+  /// # When to use
+  ///
+  /// Use it when the shape of a document is not fixed, or when you need only a few fields of a
+  /// larger document. To read a typed value, use [`Json.deserialize`] or [`Json.decode`].
+  ///
+  /// # Details
+  ///
+  /// Parsing is strict (RFC 8259): no comments, no trailing commas, and no duplicate keys in an
+  /// object. String escapes are decoded when the document is parsed.
+  ///
+  /// # Errors
+  ///
+  /// - `JsonError` if `bytes` is not one valid JSON value, if an object has a duplicate key, if the
+  ///   nesting is deeper than 64, or if content follows the value. The partial tree is dropped.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the tree.
+  pub effect fn parse(bytes: &[u8]) -> Value ! JsonError | OutOfMemoryError ? &mut Allocator {
+    let mut scanner = JsonScanner.make(bytes)
+    let first = run nextToken(&mut scanner)
+    let parsed = run parseToken(&mut scanner, move first, bytes.length)
+    let document = run expectValue(move parsed, bytes.length)
+    let tail = run nextToken(&mut scanner)
+    match move tail {
+      JsonToken.EndOfInput => { return move document }
+      _ => { fail inputError(JsonReason.TrailingContent, bytes.length) }
+    }
+  }
+
+  /// Reads `bytes` as one complete JSON document of type `T`. It does not allocate.
+  ///
+  /// # When to use
+  ///
+  /// Use it for types that implement `Decode`, such as numbers and `bool`. Use [`Json.deserialize`]
+  /// for types that need memory, such as `String` and `List<T>`.
+  ///
+  /// # Errors
+  ///
+  /// - `JsonError` if the JSON is not valid, the value does not have type `T` (`TypeMismatch`), a
+  ///   number does not fit (`NumberOutOfRange`), or content follows the value (`TrailingContent`).
+  pub fn decode<T: Decode>(bytes: &[u8]) -> Result<T, JsonError> {
+    let mut scanner = JsonScanner.make(bytes)
+    let parsed = JsonCodec.decodeOne<T>(&mut scanner)
+    return match move parsed {
+      Result<T, JsonError>.Failure { error } => Result<T, JsonError>.failResult(move error)
+      Result<T, JsonError>.Success { value } => match move JsonScanner.next(&mut scanner) {
+        Result<JsonToken, JsonError>.Failure { error } => Result<T, JsonError>.failResult(move error)
+        Result<JsonToken, JsonError>.Success { value: tail } => match move tail {
+          JsonToken.EndOfInput => Result<T, JsonError>.succeed(move value)
+          _ => Result<T, JsonError>.failResult(
+            JsonError.at(JsonReason.TrailingContent, JsonScanner.offset(&scanner)))
+        }
+      }
+    }
+  }
+
+  /// Reads `bytes` as one complete JSON document of type `T`.
+  ///
+  /// # Errors
+  ///
+  /// - `JsonError` if the JSON is not valid, the value does not have type `T`, or content follows
+  ///   the value.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the value.
+  pub effect fn deserialize<T: Deserialize>(bytes: &[u8])
+    -> T ! JsonError | OutOfMemoryError ? &mut Allocator {
+    let mut scanner = JsonScanner.make(bytes)
+    let value = run JsonCodec.deserializeOne<T>(&mut scanner)
+    let tail = run nextToken(&mut scanner)
+    match move tail {
+      JsonToken.EndOfInput => { return move value }
+      _ => { fail JsonError.at(JsonReason.TrailingContent, JsonScanner.offset(&scanner)) }
+    }
+  }
+
+  /// Writes `value` as JSON to the `Writer`, with `options`.
+  ///
+  /// # Errors
+  ///
+  /// - `JsonError` if the nesting is deeper than the limit in `options`, or a float is not finite.
+  /// - `WriterError` if the `Writer` fails. Bytes that it accepted before the failure stay written.
+  ///
+  /// # Examples
+  ///
+  /// ## Write a struct
+  /// ```silk
+  /// import silk.core.effect { Effect }
+  /// import silk.json.codec { Serialize }
+  /// import silk.json.object { JsonObject }
+  /// import silk.json.output { JsonOptions }
+  /// import silk.json.scanner { JsonError }
+  /// import silk.json.value { Json }
+  /// import silk.io.writer { Writer, WriterError }
+  ///
+  /// struct CaptureWriter {
+  ///   bytes: [u8; 64],
+  ///   length: usize,
+  /// }
+  ///
+  /// impl Writer for CaptureWriter {
+  ///   effect fn writeAll(self: &mut Self, value: &[u8]) -> ()
+  ///     ! WriterError
+  ///     ? &mut Writer {
+  ///     let mut index: usize = 0
+  ///     while index < value.length {
+  ///       self.bytes[self.length] = value[index]
+  ///       self.length = self.length + 1
+  ///       index = index + 1
+  ///     }
+  ///     return ()
+  ///   }
+  ///
+  ///   effect fn flush(self: &mut Self) -> ()
+  ///     ! WriterError
+  ///     ? &mut Writer {
+  ///     return ()
+  ///   }
+  /// }
+  ///
+  /// fn holds(writer: &CaptureWriter, expected: &[u8]) -> bool {
+  ///   if writer.length != expected.length {
+  ///     return false
+  ///   }
+  ///   let mut index: usize = 0
+  ///   while index < expected.length {
+  ///     if writer.bytes[index] != expected[index] {
+  ///       return false
+  ///     }
+  ///     index = index + 1
+  ///   }
+  ///   return true
+  /// }
+  ///
+  /// struct Point {
+  ///   x: i32,
+  ///   y: i32,
+  /// }
+  ///
+  /// impl Serialize for Point {
+  ///   effect fn serialize(self: &Self, options: &JsonOptions) -> ()
+  ///     ! JsonError | WriterError
+  ///     ? &mut Writer {
+  ///     return run JsonObject.begin(options) |> JsonObject.field("x", &self.x)
+  ///       |> JsonObject.field("y", &self.y)
+  ///       |> JsonObject.end
+  ///   }
+  /// }
+  ///
+  /// pub effect fn main() -> i32
+  ///   ! JsonError | WriterError {
+  ///   let mut writer = CaptureWriter { bytes: [0; 64], length: 0 }
+  ///   let point = Point { x: 3, y: -4 }
+  ///   run Json.serialize(&point, &JsonOptions.compact()) |> Effect.provideMut<Writer>(&mut writer)
+  ///   if !holds(&writer, b"{\"x\":3,\"y\":-4}") {
+  ///     return 1
+  ///   }
+  ///   return 0
+  /// }
+  /// ```
+  pub effect fn serialize<T: Serialize>(value: &T, options: &JsonOptions)
+    -> () ! JsonError | WriterError ? &mut Writer {
+    return run JsonCodec.writeOne<T>(value, options)
+  }
+
+  /// Writes `document` as compact JSON to the `Writer`. It does not flush the `Writer`.
+  ///
+  /// # Errors
+  ///
+  /// - `JsonError` if the nesting is deeper than 64.
+  /// - `WriterError` if the `Writer` fails. Bytes that it accepted before the failure stay written.
+  pub effect fn write(document: &Value) -> () ! JsonError | WriterError ? &mut Writer {
+    let options = JsonOptions.compact()
+    return run Json.writeWith(document, &options)
+  }
+
+  /// Writes `document` as JSON to the `Writer`, with the indentation and depth limit of `options`.
+  /// It does not flush the `Writer`.
+  ///
+  /// # Errors
+  ///
+  /// - `JsonError` if the nesting is deeper than the limit in `options`.
+  /// - `WriterError` if the `Writer` fails. Bytes that it accepted before the failure stay written.
+  pub effect fn writeWith(document: &Value, options: &JsonOptions)
+    -> () ! JsonError | WriterError ? &mut Writer {
+    return run writeNode(document, options)
+  }
+
+  /// Returns the value of member `key` of an object. Returns an absent option if `self` is not an
+  /// object or has no such key.
+  pub fn field<'a>(self: &'a Value, key: string) -> Option<&'a Value> {
+    return match &self.* {
+      Value.Object { entries } => {
+        let boxed = Box<List<JsonChild>>.get(&entries)
+        return findMember(&boxed[0], key)
+      }
+      _ => Option<&'a Value>.none()
+    }
+  }
+
+  /// Returns the value of member `key` if `self` is a present object. Returns an absent option in
+  /// other cases.
+  ///
+  /// # When to use
+  ///
+  /// Use it to read nested fields in a chain: `Json.field(&doc, "user") |> Json.fieldAt("name")`.
+  pub fn fieldAt<'a>(self: Option<&'a Value>, key: string) -> Option<&'a Value> {
+    return match move self {
+      Option<&'a Value>.None => Option<&'a Value>.none()
+      Option<&'a Value>.Some { value } => Json.field(value, key)
+    }
+  }
+
+  /// Returns the number as `i32`. Returns an absent option if the value is absent, is not a number,
+  /// is not written as a plain integer (`1.0` and `1e3` are not), or does not fit in `i32`.
+  pub fn asI32(self: Option<&Value>) -> Option<i32> {
+    return match move self {
+      Option<&Value>.None => Option<i32>.none()
+      Option<&Value>.Some { value } => match &value.* {
+        Value.Number { text } => match move Format.i32Value(String.view(&text)) {
+          Result<i32, ParseError>.Success { value: parsed } => Option<i32>.some(parsed)
+          Result<i32, ParseError>.Failure { error: _ } => Option<i32>.none()
+        }
+        _ => Option<i32>.none()
+      }
+    }
+  }
+
+  /// Returns the number as `i64`. Returns an absent option if the value is absent, is not a number,
+  /// is not written as a plain integer (`1.0` and `1e3` are not), or does not fit in `i64`.
+  pub fn asI64(self: Option<&Value>) -> Option<i64> {
+    return match move self {
+      Option<&Value>.None => Option<i64>.none()
+      Option<&Value>.Some { value } => match &value.* {
+        Value.Number { text } => match move Format.i64Value(String.view(&text)) {
+          Result<i64, ParseError>.Success { value: parsed } => Option<i64>.some(parsed)
+          Result<i64, ParseError>.Failure { error: _ } => Option<i64>.none()
+        }
+        _ => Option<i64>.none()
+      }
+    }
+  }
+
+  /// Returns the number as `u64`. Returns an absent option if the value is absent, is not a number,
+  /// is not written as a plain integer (`1.0` and `1e3` are not), or does not fit in `u64`.
+  pub fn asU64(self: Option<&Value>) -> Option<u64> {
+    return match move self {
+      Option<&Value>.None => Option<u64>.none()
+      Option<&Value>.Some { value } => match &value.* {
+        Value.Number { text } => match move Format.u64Value(String.view(&text)) {
+          Result<u64, ParseError>.Success { value: parsed } => Option<u64>.some(parsed)
+          Result<u64, ParseError>.Failure { error: _ } => Option<u64>.none()
+        }
+        _ => Option<u64>.none()
+      }
+    }
+  }
+
+  /// Returns the number as `f64`, rounded to the nearest value. Returns an absent option if the
+  /// value is absent, is not a number, or is too large for a finite `f64`.
+  pub fn asF64(self: Option<&Value>) -> Option<f64> {
+    return match move self {
+      Option<&Value>.None => Option<f64>.none()
+      Option<&Value>.Some { value } => match &value.* {
+        Value.Number { text } => match move Format.f64Value(String.view(&text)) {
+          Result<f64, ParseError>.Success { value: parsed } => {
+            if !f64.isFinite(parsed) { return Option<f64>.none() }
+            return Option<f64>.some(parsed)
+          }
+          Result<f64, ParseError>.Failure { error: _ } => Option<f64>.none()
+        }
+        _ => Option<f64>.none()
+      }
+    }
+  }
+
+  /// Returns the number as `f32`, rounded to the nearest value. Returns an absent option if the
+  /// value is absent, is not a number, or is too large for a finite `f32`.
+  pub fn asF32(self: Option<&Value>) -> Option<f32> {
+    return match move self {
+      Option<&Value>.None => Option<f32>.none()
+      Option<&Value>.Some { value } => match &value.* {
+        Value.Number { text } => match move Format.f32Value(String.view(&text)) {
+          Result<f32, ParseError>.Success { value: parsed } => {
+            if !f32.isFinite(parsed) { return Option<f32>.none() }
+            return Option<f32>.some(parsed)
+          }
+          Result<f32, ParseError>.Failure { error: _ } => Option<f32>.none()
+        }
+        _ => Option<f32>.none()
+      }
+    }
+  }
+
+  /// Returns the text of a string. Returns an absent option if the value is absent or is not a
+  /// string. The text is borrowed from the tree.
+  pub fn asString<'a>(self: Option<&'a Value>) -> Option<string<'a>> {
+    return match move self {
+      Option<&'a Value>.None => Option<string<'a>>.none()
+      Option<&'a Value>.Some { value } => match &value.* {
+        Value.String { text } => Option<string<'a>>.some(String.view(&text))
+        _ => Option<string<'a>>.none()
+      }
+    }
+  }
+}
+
+impl Serialize for Value {
+  effect fn serialize(self: &Self, options: &JsonOptions)
+    -> () ! JsonError | WriterError ? &mut Writer {
+    return run Json.writeWith(self, options)
+  }
+}
+
+impl Deserialize for Value {
+  effect fn deserialize(scanner: &mut JsonScanner)
+    -> Self ! JsonError | OutOfMemoryError ? &mut Allocator {
+    let first = run nextToken(&mut scanner.*)
+    let end = JsonScanner.length(&scanner.*)
+    let parsed = run parseToken(&mut scanner.*, move first, end)
+    return run expectValue(move parsed, end)
+  }
+}
+
+fn findMember<'a>(entries: &'a List<JsonChild>, key: string) -> Option<&'a Value> {
+  let values = List<JsonChild>.asSlice(entries)
+  let mut index = usize.ZERO
+  while index < values.length {
+    match &values[index] {
+      JsonChild.Member { entry } => {
+        if String.view(&entry.key) == key { return Option<&'a Value>.some(&entry.value) }
+      }
+      _ => {}
+    }
+    index = index + usize.ONE
+  }
+  return Option<&'a Value>.none()
+}
+
+effect fn nextToken(scanner: &mut JsonScanner) -> JsonToken ! JsonError {
+  return match move JsonScanner.next(&mut scanner.*) {
+    Result<JsonToken, JsonError>.Success { value } => move value
+    Result<JsonToken, JsonError>.Failure { error } => { fail move error }
+  }
+}
+
+effect fn parseToken(scanner: &mut JsonScanner, token: JsonToken, end: usize)
+  -> Option<Value> ! JsonError | OutOfMemoryError ? &mut Allocator {
+  return match move token {
+    JsonToken.Null => Option<Value>.some(Value.Null)
+    JsonToken.True => Option<Value>.some(Value.Bool { value: true })
+    JsonToken.False => Option<Value>.some(Value.Bool { value: false })
+    JsonToken.Number { span } => {
+      let offset = span.offset
+      let raw = JsonScanner.slice(&scanner.*, move span)
+      let copied = run JsonText.copy(raw)
+      let text = unsafe String.fromBytesUnchecked(move copied)
+      return Option<Value>.some(Value.Number { text: move text })
+    }
+    JsonToken.String { span, escaped } => {
+      let offset = span.offset
+      let decoded = run JsonText.decode(JsonScanner.slice(&scanner.*, move span), offset, escaped)
+      let text = unsafe String.fromBytesUnchecked(move decoded)
+      return Option<Value>.some(Value.String { text: move text })
+    }
+    JsonToken.ArrayBegin => Option<Value>.some(run parseArray(&mut scanner.*, end))
+    JsonToken.ObjectBegin => Option<Value>.some(run parseObject(&mut scanner.*, end))
+    JsonToken.ArrayEnd => Option<Value>.none()
+    JsonToken.ObjectEnd => Option<Value>.none()
+    _ => { fail inputError(JsonReason.UnexpectedByte, end) }
+  }
+}
+
+effect fn expectValue(parsed: Option<Value>, end: usize) -> Value ! JsonError {
+  return match move parsed {
+    Option<Value>.Some { value } => move value
+    Option<Value>.None => { fail inputError(JsonReason.UnexpectedByte, end) }
+  }
+}
+
+effect fn parseArray(scanner: &mut JsonScanner, end: usize)
+  -> Value ! JsonError | OutOfMemoryError ? &mut Allocator {
+  let mut values = List<JsonChild>.make()
+  let mut first = true
+  while true {
+    let token = run nextToken(&mut scanner.*)
+    let parsed = run parseToken(&mut scanner.*, move token, end)
+    let value = match move parsed {
+      Option<Value>.Some { value } => move value
+      Option<Value>.None => {
+        if first {
+          let boxed = run Box<List<JsonChild>>.make(move values)
+          return Value.Array { values: move boxed }
+        }
+        fail inputError(JsonReason.UnexpectedByte, end)
+      }
+    }
+    first = false
+    run List<JsonChild>.append(&mut values, JsonChild.Item { value: move value })
+    let separator = run nextToken(&mut scanner.*)
+    match move separator {
+      JsonToken.ArrayEnd => {
+        let boxed = run Box<List<JsonChild>>.make(move values)
+        return Value.Array { values: move boxed }
+      }
+      JsonToken.ValueSeparator => {}
+      _ => { fail inputError(JsonReason.UnexpectedByte, end) }
+    }
+  }
+  fail inputError(JsonReason.UnexpectedEnd, end)
+}
+
+effect fn parseObject(scanner: &mut JsonScanner, end: usize)
+  -> Value ! JsonError | OutOfMemoryError ? &mut Allocator {
+  let mut entries = List<JsonChild>.make()
+  let mut first = true
+  while true {
+    let token = run nextToken(&mut scanner.*)
+    let keySpan = match move token {
+      JsonToken.String { span, escaped: _ } => span
+      JsonToken.ObjectEnd => {
+        if first {
+          let boxed = run Box<List<JsonChild>>.make(move entries)
+          return Value.Object { entries: move boxed }
+        }
+        fail inputError(JsonReason.UnexpectedByte, end)
+      }
+      _ => { fail inputError(JsonReason.UnexpectedByte, end) }
+    }
+    first = false
+    let offset = keySpan.offset
+    let raw = JsonScanner.slice(&scanner.*, move keySpan)
+    let decoded = run JsonText.decode(raw, offset, true)
+    let key = unsafe String.fromBytesUnchecked(move decoded)
+    if containsKey(&entries, String.view(&key)) {
+      fail inputError(JsonReason.DuplicateKey, offset)
+    }
+    let colon = run nextToken(&mut scanner.*)
+    match move colon {
+      JsonToken.KeySeparator => {}
+      _ => { fail inputError(JsonReason.UnexpectedByte, end) }
+    }
+    let valueToken = run nextToken(&mut scanner.*)
+    let parsed = run parseToken(&mut scanner.*, move valueToken, end)
+    let value = run expectValue(move parsed, end)
+    run List<JsonChild>.append(&mut entries, JsonChild.Member {
+      entry: JsonEntry { key: move key, value: move value }
+    })
+    let separator = run nextToken(&mut scanner.*)
+    match move separator {
+      JsonToken.ObjectEnd => {
+        let boxed = run Box<List<JsonChild>>.make(move entries)
+        return Value.Object { entries: move boxed }
+      }
+      JsonToken.ValueSeparator => {}
+      _ => { fail inputError(JsonReason.UnexpectedByte, end) }
+    }
+  }
+  fail inputError(JsonReason.UnexpectedEnd, end)
+}
+
+fn containsKey(entries: &List<JsonChild>, key: string) -> bool {
+  let old = List<JsonChild>.asSlice(entries)
+  let mut index = usize.ZERO
+  while index < old.length {
+    match &old[index] {
+      JsonChild.Member { entry } => {
+        if String.view(&entry.key) == key { return true }
+      }
+      _ => {}
+    }
+    index = index + usize.ONE
+  }
+  return false
+}
+
+effect fn writeNode(document: &Value, options: &JsonOptions)
+  -> () ! JsonError | WriterError ? &mut Writer {
+  return match &document.* {
+    Value.Null => run Writer.writeAll(b"null")
+    Value.Bool { value } => {
+      if value { return run Writer.writeAll(b"true") }
+      return run Writer.writeAll(b"false")
+    }
+    Value.Number { text } => run JsonOutput.writeNumber(String.view(&text))
+    Value.String { text } => run JsonOutput.writeString(String.view(&text))
+    Value.Array { values } => {
+      let child = run JsonOptions.child(options)
+      let boxed = Box<List<JsonChild>>.get(&values)
+      let items = List<JsonChild>.asSlice(&boxed[0])
+      run Writer.writeAll(b"[")
+      let mut index = usize.ZERO
+      while index < items.length {
+        run JsonOutput.separator(&child, index == usize.ZERO)
+        match &items[index] {
+          JsonChild.Item { value } => { run writeNode(&value, &child) }
+          _ => { fail outputError(JsonReason.InvalidValue) }
+        }
+        index = index + usize.ONE
+      }
+      if items.length != usize.ZERO { run JsonOutput.line(options) }
+      return run Writer.writeAll(b"]")
+    }
+    Value.Object { entries } => {
+      let child = run JsonOptions.child(options)
+      let boxed = Box<List<JsonChild>>.get(&entries)
+      let members = List<JsonChild>.asSlice(&boxed[0])
+      run Writer.writeAll(b"{")
+      let mut index = usize.ZERO
+      while index < members.length {
+        run JsonOutput.separator(&child, index == usize.ZERO)
+        match &members[index] {
+          JsonChild.Member { entry } => {
+            run JsonOutput.writeString(String.view(&entry.key))
+            run JsonOutput.colon(&child)
+            run writeNode(&entry.value, &child)
+          }
+          _ => { fail outputError(JsonReason.InvalidValue) }
+        }
+        index = index + usize.ONE
+      }
+      if members.length != usize.ZERO { run JsonOutput.line(options) }
+      return run Writer.writeAll(b"}")
+    }
+  }
+}
+
+fn inputError(reason: JsonReason, offset: usize) -> JsonError {
+  return JsonError {
+    reason: reason,
+    offset: Option<usize>.some(offset),
+    required: Option<usize>.none(),
+    available: Option<usize>.none(),
+  }
+}
+
+fn outputError(reason: JsonReason) -> JsonError {
+  return JsonError {
+    reason: reason,
+    offset: Option<usize>.none(),
+    required: Option<usize>.none(),
+    available: Option<usize>.none(),
+  }
+}

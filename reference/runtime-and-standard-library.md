@@ -125,7 +125,7 @@ Only closed language bindings exist without source imports. Standard-library act
 types—enter a module scope only through explicit imports.
 
 ```silk
-import silk.option { Option }
+import silk.core.option { Option }
 
 pub fn main() -> i32 {
   let value = Option<i32>.some(42)
@@ -134,8 +134,8 @@ pub fn main() -> i32 {
 }
 ```
 
-The type spellings `i32` and `Effect<A ! E ? R>` remain language syntax. Importing `silk.i32` or
-selecting `Effect` from `silk.effect` creates an ordinary value binding containing actor operations;
+The type spellings `i32` and `Effect<A ! E ? R>` remain language syntax. Importing `silk.num.i32` or
+selecting `Effect` from `silk.core.effect` creates an ordinary value binding containing actor operations;
 it does not define or replace the language type.
 
 Canonical standard-library modules occupy the reserved `silk.*` distribution identity. Project
@@ -145,7 +145,7 @@ declarations it contains.
 
 **Boundary:** There is no implicit standard-library prelude, token-based module discovery, or
 fallback lookup after an unknown name. An LSP auto-import inserts ordinary source text. Importing an
-ordinary project module named `Option` is unrelated to `silk.option`.
+ordinary project module named `Option` is unrelated to `silk.core.option`.
 
 **Diagnostics:** Naming an unimported standard-library actor uses the ordinary unknown-name
 diagnostic and may include an auto-import action. Declaring a project module under reserved
@@ -217,7 +217,7 @@ intrinsics available on every target it promises. It must not import, construct,
 target-provider implementation.
 
 ```silk,ignore
-// silk/filesystem
+// silk/system/filesystem
 pub service FileSystem {
   effect fn readFile(path: &Path) -> Bytes ! FileError ? &mut FileSystem
 }
@@ -227,8 +227,8 @@ The portable contract owns general values, typed failures, and reusable helpers.
 may implement it for one host:
 
 ```silk,ignore
-// silk/os_filesystem
-import silk.filesystem { FileSystem }
+// silk/system/filesystem_native
+import silk.system.filesystem { FileSystem }
 
 pub struct OsFileSystem { /* ordinary owned provider state */ }
 impl FileSystem for OsFileSystem { /* maps ordinary source operations */ }
@@ -268,8 +268,8 @@ initialization and acquires no allocator, provider, registry entry, thread, glob
 resource.
 
 ```silk,ignore
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
 
 effect fn copyValues(values: &[i32]) -> List<i32> ! OutOfMemoryError ? &mut Allocator {
   let mut result = List<i32>.make()
@@ -337,7 +337,7 @@ visibility, and no catalog namespace becomes visible without an explicit import.
 
 **Status:** Confirmed
 
-`silk.inflate` exposes `Decoder`, explicit `Format.Raw`, `Format.Zlib`, and `Format.Gzip`, and
+`silk.compress.inflate` exposes `Decoder`, explicit `Format.Raw`, `Format.Zlib`, and `Format.Gzip`, and
 caller-supplied `Limits`. `Decoder.make` requires an allocator and acquires one 32 KiB history
 buffer and a bounded table workspace. Its two allocations are released by ordinary drop. `Decoder.step` is pure, allocates nothing,
 and retains no input or output borrow.
@@ -385,13 +385,13 @@ emission is required. The module neither detects formats nor provides encoders o
 distances, unsupported methods and dictionaries, truncation, checksums, member size, invalid use,
 and each resource limit. No codec-specific compiler intrinsic or runtime provider is involved.
 
-**Evidence:** [canonical decoder](../stdlib/silk/inflate.silk),
+**Evidence:** [canonical decoder](../stdlib/silk/compress/inflate.silk),
 shared native acceptance,
 independent fixture provenance.
 
 ### P-256 ephemeral key agreement
 
-`silk.p256 { P256, P256Error }` provides ordinary-source, bounded P-256 arithmetic. Scalars are
+`silk.crypto.p256 { P256, P256Error }` provides ordinary-source, bounded P-256 arithmetic. Scalars are
 opaque owners imported from exactly 32 big-endian bytes in 1..n−1 or generated with explicit
 exclusive `Random`. Public keys are 65-byte uncompressed SEC1 points. Agreement validates the
 peer, consumes the scalar, and returns a complete fixed 32-byte shared x-coordinate or a typed
@@ -402,14 +402,14 @@ error. Deterministic calls allocate nothing and require no host service. See the
 
 **Status:** Confirmed
 
-`silk.hmac` exposes `HmacSha256` and `HmacSha384`. Each actor provides `make(key)`,
+`silk.crypto.hmac` exposes `HmacSha256` and `HmacSha384`. Each actor provides `make(key)`,
 `update(self: &mut Self, bytes)`, consuming `finish(self: Self)`, and one-shot
 `authenticate(key, message)`. Keys and message inputs are borrowed byte slices. The tags are fixed
 `[u8; 32]` and `[u8; 48]` values respectively. Empty keys, messages, and updates are admitted.
 Any segmentation of the same message produces the same tag. Keys longer than the hash block size
 (64 or 128 bytes) are hashed before key padding.
 
-`silk.hkdf` exposes `HkdfSha256`, `HkdfSha384`, and `OutputTooLongError`. Both actors implement
+`silk.crypto.hkdf` exposes `HkdfSha256`, `HkdfSha384`, and `OutputTooLongError`. Both actors implement
 RFC 5869: `extract(salt, ikm)` borrows byte slices and returns a fixed-size PRK (32 or 48 bytes).
 Empty salt has the same meaning as a salt of HashLen zero bytes. `expand(prk, info, output)` borrows
 a fixed-size PRK array, a byte slice of context information, and a mutable caller-owned byte slice.
@@ -423,8 +423,8 @@ variable-length inputs and use bounded key storage, with no providers, native cr
 bit-length limit, including its initial key pad. These actors do not provide tag verification,
 constant-time comparison, truncation policy, TLS labels, password hashing, or secret zeroization.
 
-**Evidence:** [HMAC source](../stdlib/silk/hmac.silk),
-[HKDF source](../stdlib/silk/hkdf.silk),
+**Evidence:** [HMAC source](../stdlib/silk/crypto/hmac.silk),
+[HKDF source](../stdlib/silk/crypto/hkdf.silk),
 known-answer acceptance corpus,
 [RFC 4231](https://www.rfc-editor.org/rfc/rfc4231.html), and
 [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html).
@@ -433,7 +433,7 @@ known-answer acceptance corpus,
 
 **Status:** Confirmed
 
-`silk.chacha20_poly1305` exports `ChaCha20Poly1305` and `AeadError`. The ordinary synchronous
+`silk.crypto.chacha20_poly1305` exports `ChaCha20Poly1305` and `AeadError`. The ordinary synchronous
 operations `seal(key, nonce, aad, plaintext, ciphertext, tag)` and
 `open(key, nonce, aad, ciphertext, tag, plaintext)` return `Result<(), AeadError>`. Inputs are
 shared byte slices and destinations are exclusive byte slices. Keys contain exactly 32 bytes,
@@ -455,7 +455,7 @@ reviewed generated output do not guarantee constant-time execution across future
 runtimes, physical secret erasure, or production security. The module provides no transport,
 nonce generation, replay protection, or peer authentication policy.
 
-**Evidence:** [canonical source](../stdlib/silk/chacha20_poly1305.silk),
+**Evidence:** [canonical source](../stdlib/silk/crypto/chacha20_poly1305.silk),
 shared acceptance,
 fixture provenance, and
 [RFC 8439](https://www.rfc-editor.org/rfc/rfc8439).
@@ -464,7 +464,7 @@ fixture provenance, and
 
 **Status:** Confirmed
 
-`silk.aes_gcm` exports `AesGcm` and `AesGcmError`. `seal(key, nonce, aad, plaintext,
+`silk.crypto.aes_gcm` exports `AesGcm` and `AesGcmError`. `seal(key, nonce, aad, plaintext,
 ciphertext, tag)` and `open(key, nonce, aad, ciphertext, tag, plaintext)` return
 `Result<(), AesGcmError>`. Inputs are shared byte slices and destinations are exclusive byte
 slices. Keys must contain 16 or 32 bytes, nonces 12 bytes, and detached tags exactly 16 bytes.
@@ -485,7 +485,7 @@ The caller supplies a nonce unique under the key and enforces per-key usage limi
 The module provides no nonce generation, TLS records, replay protection, peer identity,
 physical secret-erasure guarantee, or audited constant-time/production-security claim.
 
-**Evidence:** [canonical AES-GCM source](../stdlib/silk/aes_gcm.silk),
+**Evidence:** [canonical AES-GCM source](../stdlib/silk/crypto/aes_gcm.silk),
 shared acceptance, and
 fixture provenance.
 
@@ -493,8 +493,8 @@ fixture provenance.
 
 **Status:** Confirmed
 
-`silk.uri.Uri` accepts RFC 3986's `URI` production: a scheme is required and a fragment is allowed.
-`silk.uri_reference.UriReference` also accepts relative references. Both are lifetime-bound borrowed values.
+`silk.uri.uri.Uri` accepts RFC 3986's `URI` production: a scheme is required and a fragment is allowed.
+`silk.uri.reference.UriReference` also accepts relative references. Both are lifetime-bound borrowed values.
 Parsing stores the input view and validated byte ranges without allocating. Accessors retain the
 input lifetime; no view can outlive its storage. `copy` and `parseOwned` explicitly create
 `OwnedUri` or `OwnedUriReference`; `fromString` validates and adopts existing owned text without
@@ -521,7 +521,7 @@ The recomposed serialization is validated again. Dot removal can expose `//` in 
 an original authority: resolving `/a/..//g` against `x:a` gives `x://g` with authority `g`.
 Resolving `/a/..//g:h` instead returns an invalid-port failure at byte 6 of the recomposed text.
 
-`silk.uri_percent` encodes raw bytes for userinfo, reg-name, path segment, first relative path
+`silk.uri.percent` encodes raw bytes for userinfo, reg-name, path segment, first relative path
 segment, whole path, query, fragment, or unreserved-only data. Encoding escapes percent signs and creates uppercase hex escapes.
 The first-relative-segment context also escapes colon, preventing data from becoming a scheme.
 Decoding returns bytes, preserves plus signs, and reports malformed escapes at their percent sign.
@@ -531,14 +531,14 @@ streams to a Writer. `decodeInPlace` validates before compacting bytes and leave
 unchanged. `decodeOrBorrow` borrows unchanged input when it contains no escapes. Owned percent
 operations calculate the exact output size and reserve once.
 
-`silk.uri_components.UriComponents` constructs and modifies borrowed components. `ComponentValue`
+`silk.uri.components.UriComponents` constructs and modifies borrowed components. `ComponentValue`
 distinguishes raw bytes from encoded text, preventing accidental double encoding. `Host` separates
 registered names from bracketed IP literals; authority retains unsplit userinfo and lexical ports.
 Serialization can emit every component, omit authentication, or emit only path and query. Reusable
 serialization validates and sizes components before replacing output, and owned construction adopts
 its completed buffer. Raw colons in the first relative path segment are escaped.
 
-The general `silk.slice.Slice.view` operation creates a lifetime-preserving borrowed subslice.
+The general `silk.collections.slice.Slice.view` operation creates a lifetime-preserving borrowed subslice.
 It checks offset and length without overflowing, permits an empty view at the end, and traps on
 out-of-bounds requests. URI code uses this ordinary wrapper over `Intrinsic.sliceView`; the compiler
 has no URI-specific operations.
@@ -548,19 +548,19 @@ policy, DNS lookup, TLS service identity, IDNA, WHATWG URL, IRI normalization, f
 username/password interpretation, service lookup, and canonicalization are separate concerns.
 
 **Evidence:** [RFC 3986](https://www.rfc-editor.org/rfc/rfc3986.html),
-[URI source](../stdlib/silk/uri.silk),
-[reference source](../stdlib/silk/uri_reference.silk),
-[percent coding](../stdlib/silk/uri_percent.silk),
-[component construction](../stdlib/silk/uri_components.silk).
+[URI source](../stdlib/silk/uri/uri.silk),
+[reference source](../stdlib/silk/uri/reference.silk),
+[percent coding](../stdlib/silk/uri/percent.silk),
+[component construction](../stdlib/silk/uri/components.silk).
 
 ### STDLIB-010 — HTTP/1.x values preserve bytes, order, and ownership
 
 **Status:** Confirmed
 
-The public HTTP value surface is split into three actors. `silk.http` owns HTTP/1.0 and HTTP/1.1
+The public HTTP value surface is split into three actors. `silk.http.message` owns HTTP/1.0 and HTTP/1.1
 versions, open case-sensitive method tokens, status codes from 100 through 599, validated fields,
-and request/response heads. `silk.http_headers` owns ordered borrowed and owned collections,
-lookups, metadata iteration, and field-line formatting. `silk.http_target` owns origin, absolute,
+and request/response heads. `silk.http.headers` owns ordered borrowed and owned collections,
+lookups, metadata iteration, and field-line formatting. `silk.http.target` owns origin, absolute,
 authority, and asterisk request-target forms, HTTP authority validation, URI conversion, and Host
 selection. All are ordinary target-neutral Silk declarations; there is no HTTP intrinsic or
 target-provider requirement.
@@ -596,9 +596,9 @@ a body, decode content, manage trailers or connections, resolve DNS/IDNA, impose
 scheme policy, or implement a client, server, or proxy exchange. Those behaviors remain with the
 dependent HTTP issues rather than accruing hidden policy here.
 
-**Evidence:** [HTTP values](../stdlib/silk/http.silk),
-[ordered headers](../stdlib/silk/http_headers.silk),
-[request targets](../stdlib/silk/http_target.silk),
+**Evidence:** [HTTP values](../stdlib/silk/http/message.silk),
+[ordered headers](../stdlib/silk/http/headers.silk),
+[request targets](../stdlib/silk/http/target.silk),
 shared acceptance, and
 pinned Zig comparison fixture.
 
@@ -618,7 +618,7 @@ module import is harmless, while a selected member import of an unavailable acto
 Generic intrinsic restrictions still apply to executable calls independently of provider spelling.
 
 ```silk,ignore
-import silk.os_filesystem
+import silk.system.filesystem_native as os_filesystem
 
 pub fn main() -> i32 {
   // This module can have an empty selected surface; no unavailable actor is imported.
@@ -643,7 +643,7 @@ source feature.
 
 **Evidence:** [TARGET-001](unsafe-intrinsics-and-targets.md#target-001--intrinsic-availability-is-checked-only-for-the-selected-executable-closure),
 canonical provider modules,
-[current OS provider source](../stdlib/silk/os_filesystem.silk).
+[current OS provider source](../stdlib/silk/system/filesystem_native.silk).
 
 ### PROVIDER-002 — Entry points receive no implicit service providers
 
@@ -655,9 +655,9 @@ standard stream, or other application service. The standalone WebAssembly startu
 application Effect. A custom source runtime may provide services under its own visible contract.
 
 ```silk,ignore
-import silk.effect { Effect }
-import silk.logger { LogError, LogLevel, Logger }
-import silk.os_logger { StdoutLogger }
+import silk.core.effect { Effect }
+import silk.io.logger { LogError, LogLevel, Logger }
+import silk.io.logger_native { StdoutLogger }
 
 effect fn program() -> () ! LogError ? &mut Logger {
   return run Logger.log(LogLevel.Info, "ready", &())
@@ -704,7 +704,7 @@ function, constant, provider, or intrinsic contributes no executable support sol
 module was loaded.
 
 ```silk,ignore
-import silk.os_child_process { OsChildProcess }
+import silk.system.child_process_native { OsChildProcess }
 
 pub fn main() -> i32 {
   return 0
@@ -789,7 +789,7 @@ and by importing ordinary APIs and constructing or providing their implementatio
 It does not park an unfinished execution or schedule another one. The sealed Execution and
 ExecutionRef identities provide a separate narrow seam for independently owned activation and
 external parking.
-The ordinary `silk.execution` module exposes safe construction, drive, and park operations.
+The ordinary `silk.concurrency.execution` module exposes safe construction, drive, and park operations.
 Schedulers, executors, queues, timers, deferred values, and cancellation policies remain ordinary
 source. Programs that cannot reach these sealed operations acquire no scheduler or fiber cost.
 
@@ -833,7 +833,7 @@ The build selects a source runtime independently of the loader entry symbol. The
 through an ordinary C export. The compiler discovers C exports and explicit retained declarations;
 it does not discover a specially shaped application `main` or generate an invocation adapter.
 
-The distribution's hosted `silk/native_start` composition exports C `main(argc, argv)`. It snapshots
+The distribution's hosted `silk/platform/native/start` composition exports C `main(argc, argv)`. It snapshots
 process inputs, installs bounded diagnostics, owns one Execution, and calls the application.
 Its source interfaces adapt an ordinary `i32`, unit, or an Effect producing unit with no requirements
 or one mutable HostInput requirement. Integer results become exit status; unit and Effect success
@@ -841,7 +841,7 @@ become zero. An unhandled typed failure drops its owned payload before reporting
 including when allocation or stderr output fails. Fatal traps remain abnormal termination without
 cleanup guarantees. A NonParking constraint rejects application bodies needing an external scheduler.
 
-The standalone WebAssembly composition `silk/wasm_start` exports `main() -> i32`. It owns one
+The standalone WebAssembly composition `silk/platform/wasm/start` exports `main() -> i32`. It owns one
 Execution and adapts integer, unit, and requirement-free Effect results. It provides no host inputs
 or native reporter. Typed failures drop their payload and return one; machine traps remain bare.
 
@@ -982,7 +982,7 @@ canonical source requirements.
 
 ## Zstandard decoding
 
-`silk.zstd { Zstd }` provides bounded RFC 8878 decoding in ordinary Silk source. It accepts all
+`silk.compress.zstd { Zstd }` provides bounded RFC 8878 decoding in ordinary Silk source. It accepts all
 non-dictionary compressed-block modes, raw and RLE blocks, concatenated frames, and skippable
 frames. Nonzero dictionary IDs fail explicitly. The decoder validates frame content sizes and
 the low 32 bits of seed-zero XXH64 whenever a frame carries a checksum.
@@ -1014,18 +1014,18 @@ transient scratch. The constructor checks these limits before allocating. A fram
 window above the configured capacity fails before its blocks are decoded. Larger configured
 windows are permitted within representable storage limits.
 
-The cataloged `silk/support/zstd_block` and `silk/support/zstd_checksum` modules expose low-level
+The cataloged `silk/compress/zstd_block` and `silk/compress/zstd_checksum` modules expose low-level
 support actors under ordinary visibility rules. Applications should use `Zstd` for frame
 validation, limits, and terminal semantics.
 
 **Evidence:** [Zstandard format](https://www.rfc-editor.org/rfc/rfc8878.html),
 [HTTP window sizing](https://www.rfc-editor.org/rfc/rfc9659.html),
-[canonical source](../stdlib/silk/zstd.silk).
+[canonical source](../stdlib/silk/compress/zstd.silk).
 
 ## Certificate decoding
 
-`silk.certificate { Certificate, DecodeLimits }` decodes one DER certificate with `decodeDer`
-or one strict PEM certificate with `decodePem`. `silk.certificate_bundle { CertificateBundle }`
+`silk.tls.certificate { Certificate, DecodeLimits }` decodes one DER certificate with `decodeDer`
+or one strict PEM certificate with `decodePem`. `silk.tls.certificate_bundle { CertificateBundle }`
 decodes one or more PEM certificates atomically. These are ordinary Silk actors with an explicit
 `Allocator` requirement. Inputs are borrowed for the Effect's lifetime; successful outputs own
 independent DER storage. Views borrow that storage and cannot outlive their certificate or bundle.
@@ -1056,13 +1056,13 @@ Decoding does not verify signatures, establish trust, build or validate paths, m
 identities, or acquire roots. A successful parse is not a certificate-validity decision. Generic
 public ASN.1 tooling is outside this API.
 
-**Evidence:** [certificate actor](../stdlib/silk/certificate.silk),
-[bundle actor](../stdlib/silk/certificate_bundle.silk),
+**Evidence:** [certificate actor](../stdlib/silk/tls/certificate.silk),
+[bundle actor](../stdlib/silk/tls/certificate_bundle.silk),
 decoding contract and fixture provenance.
 
 ## Certificate semantic profiles and trust anchors
 
-`silk.certificate_profile { CertificateProfile, CertificateRole, ProfileLimits }` applies the
+`silk.tls.certificate_profile { CertificateProfile, CertificateRole, ProfileLimits }` applies the
 restricted TLS-server certificate profile to a borrowed decoded `Certificate`. Inspection admits
 P-256 or bounded RSA keys, supported SHA-256 certificate signature metadata, strict extension DER,
 and role-specific BasicConstraints, KeyUsage, ExtendedKeyUsage, SAN, and NameConstraints policy.
@@ -1080,7 +1080,7 @@ subject's original retained TBSCertificate bytes with the issuer's admitted key.
 edge only. Successful inspection or signature verification does not check dates, authority, a
 complete path, accumulated constraints, HTTPS identity, revocation, or transparency.
 
-`silk.trust_anchor { TrustAnchor }` owns an explicitly authoritative certificate. The simple
+`silk.tls.trust_anchor { TrustAnchor }` owns an explicitly authoritative certificate. The simple
 constructor is an infallible ownership move and deliberately preserves unsupported roots. The
 constrained constructor can add an independent maximum-intermediate count and strict DNS/IP
 NameConstraints DER; these additions never replace embedded certificate restrictions. Cloning
@@ -1091,8 +1091,8 @@ Constructing a `TrustAnchor` is a trust decision, not certificate validation. Na
 and trust-source replacement are separate APIs, and loading native certificate bytes does not
 claim equivalence with an operating system's trust policy.
 
-**Evidence:** [profile actor](../stdlib/silk/certificate_profile.silk),
-[trust-anchor actor](../stdlib/silk/trust_anchor.silk),
+**Evidence:** [profile actor](../stdlib/silk/tls/certificate_profile.silk),
+[trust-anchor actor](../stdlib/silk/tls/trust_anchor.silk),
 implementation contract,
 pinned x509-limbo fixtures.
 Profile comparisons also preserve the fixed Zig HTTP snapshot
@@ -1101,7 +1101,7 @@ oracle.
 
 ## Bounded certificate-path validation
 
-`silk.certificate_path { CertificatePath, ValidationLimits, ValidatedPath, ValidationError }`
+`silk.tls.certificate_path { CertificatePath, ValidationLimits, ValidatedPath, ValidationError }`
 builds a deterministic TLS-server certificate path from one borrowed leaf, caller-ordered peer
 intermediates, and explicit caller-ordered `TrustAnchor` values. Search is iterative depth-first:
 at each depth it considers anchors first and then intermediates. The first fully valid path wins,
@@ -1134,14 +1134,14 @@ and Finished messages before accepting application data. `revocationStatus()` is
 `NotChecked`; success is not a claim of complete RFC 5280, browser Web PKI, production security,
 revocation, or transparency equivalence.
 
-**Evidence:** [path actor](../stdlib/silk/certificate_path.silk),
+**Evidence:** [path actor](../stdlib/silk/tls/certificate_path.silk),
 implementation contract,
 fixture provenance, and
 offline importer.
 
 ## Owned trust snapshots and replaceable trust sources
 
-`silk.trust_snapshot { TrustSnapshot, SnapshotLimits, TrustLoadLimits, TrustSourceError }`
+`silk.tls.trust_snapshot { TrustSnapshot, SnapshotLimits, TrustLoadLimits, TrustSourceError }`
 represents one opaque, immutable owner of an ordered sequence of explicit `TrustAnchor` values.
 `fromAnchors` consumes an existing list without allocation after checking its complete count and
 aggregate retained byte size. Empty explicit trust is valid and authenticates no peer. `fromPem`
@@ -1162,8 +1162,8 @@ primary anchors followed by the additional anchors without deduplication or rest
 Dropping either source cannot invalidate the new owner. A less-restricted additional anchor can
 therefore widen authority and must be an application policy decision.
 
-`silk.trust_source.TrustSource` is the portable lexical service for loading one independent bounded
-snapshot. `silk.memory_trust_source.MemoryTrustSource` owns an explicit current snapshot, copies it
+`silk.tls.trust_source.TrustSource` is the portable lexical service for loading one independent bounded
+snapshot. `silk.tls.trust_source_memory.MemoryTrustSource` owns an explicit current snapshot, copies it
 on each load, and atomically exchanges it with `replace`, returning the complete old owner without
 allocation. Replacement affects only later loads: prior results survive replacement and provider
 drop. The memory provider performs no I/O, environment lookup, refresh, caching, or global
@@ -1174,15 +1174,15 @@ not verify signatures, identities, time, revocation, or policy. Native PEM acqui
 separate provider concern, and loading the same certificate bytes as an operating system store does
 not reproduce that system's trust policy.
 
-**Evidence:** [snapshot actor](../stdlib/silk/trust_snapshot.silk),
-[service actor](../stdlib/silk/trust_source.silk),
-[memory provider](../stdlib/silk/memory_trust_source.silk),
+**Evidence:** [snapshot actor](../stdlib/silk/tls/trust_snapshot.silk),
+[service actor](../stdlib/silk/tls/trust_source.silk),
+[memory provider](../stdlib/silk/tls/trust_source_memory.silk),
 implementation contract,
 shared native acceptance.
 
 ## Owned authenticated TLS connections
 
-`silk.tls_connection.authenticateOwned` consumes one `ByteDuplex` provider and one independently
+`silk.tls.connection.authenticateOwned` consumes one `ByteDuplex` provider and one independently
 prepared `TrustSnapshot`, then returns one affine `OwnedConnection<P>` only after TLS 1.3
 authentication and a final deadline check. Trust preparation is deliberately outside the provider
 cleanup guard: applications may load, decode, combine, or copy a snapshot first, and a preparation
@@ -1217,7 +1217,7 @@ failure so cleanup cannot replace callback success, typed failure, or structured
 Fatal traps remain outside these structured cleanup guarantees. HTTP exchange borrowing and pool
 return/eviction policy are intentionally deferred to JUL-23 and JUL-197.
 
-**Evidence:** [owned TLS actor](../stdlib/silk/tls_connection.silk),
+**Evidence:** [owned TLS actor](../stdlib/silk/tls/connection.silk),
 owned-transport contract,
 scoped TLS contract,
 portable TLS witness.
@@ -1240,7 +1240,7 @@ The following are deliberately outside the first stable model:
 
 ## X25519 key agreement {#STDLIB-X25519}
 
-`silk.x25519.X25519` owns an ephemeral scalar and its canonical 32-byte little-endian public key.
+`silk.crypto.x25519.X25519` owns an ephemeral scalar and its canonical 32-byte little-endian public key.
 Use `X25519.generate()` with explicit exclusive `Random` provision for production: each call
 requests exactly 32 fresh bytes, clamps them and derives X25519(secret, 9). Provider failure
 remains fatal, without retry or insecure fallback. Deterministic `fromSecret` imports exactly
@@ -1259,7 +1259,7 @@ output do not establish universal constant-time execution or production security
 
 ### STDLIB-RSA — bounded RSA SHA-256 verification
 
-`silk.rsa` exports `RsaPublicKey` and `RsaError`. `fromComponents` admits canonical unsigned
+`silk.crypto.rsa` exports `RsaPublicKey` and `RsaError`. `fromComponents` admits canonical unsigned
 big-endian odd moduli containing 2048 through 4096 significant bits and exactly the exponent
 bytes `01 00 01`. The resulting key owns bounded private storage. Verification borrows the key,
 message and signature; it requires no service, entropy, allocation or private-key operation.
@@ -1295,7 +1295,7 @@ only to the recorded compiler profiles; it does not claim FIPS validation or com
 
 ### STDLIB-010 — TLS label derivation preserves raw bytes and rejects lengths before mutation
 
-`silk/tls_hkdf` supplies `TlsHkdfSha256` and `TlsHkdfSha384` over the corresponding generic HKDF
+`silk/tls/hkdf` supplies `TlsHkdfSha256` and `TlsHkdfSha384` over the corresponding generic HKDF
 actors. Each `expandLabel` borrows a fixed 32-byte or 48-byte secret, label and context slices, and
 an exclusive output slice. It fills the complete output or returns `LabelError` without changing it.
 
@@ -1321,10 +1321,10 @@ not establish constant-time execution or secret erasure.
 
 ### STDLIB-011 — bounded TLS 1.3 record protection and byte driving
 
-`silk/tls_record` supplies separate affine `TlsRecordSender` and `TlsRecordReceiver` owners for
+`silk/tls/record` supplies separate affine `TlsRecordSender` and `TlsRecordReceiver` owners for
 AES-128-GCM/SHA-256, AES-256-GCM/SHA-384, and ChaCha20-Poly1305/SHA-256. Protected constructors
 require the suite hash's exact traffic-secret width, derive the AEAD key and 12-byte IV through
-`silk/tls_hkdf`, allocate all direction storage once, and start a private sequence at zero.
+`silk/tls/hkdf`, allocate all direction storage once, and start a private sequence at zero.
 Plaintext constructors frame the initial handshake records without fabricating a protected epoch.
 
 The sender queues at most 16,384 content bytes into one record, exposes the stable unacknowledged
@@ -1347,7 +1347,7 @@ drive network resources, reserve client KeyUpdate policy, or decide `close_notif
 
 ### STDLIB-012 — authenticated bounded TLS 1.3 client
 
-`silk/tls_client` composes the record directions, explicit `TrustSnapshot`, caller-supplied
+`silk/tls/client` composes the record directions, explicit `TrustSnapshot`, caller-supplied
 `Instant`, HTTPS reference identity, bounded certificate path, selected signature primitives, and
 TLS key schedule into one affine transport-independent client. `Client.make` consumes trust and
 copies the validated reference and ALPN configuration; DNS uses one owned lowercase A-label for

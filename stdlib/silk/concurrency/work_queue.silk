@@ -1,0 +1,648 @@
+//! Queues that move owned values between native threads, for work-stealing schedulers.
+//!
+//! # When to use
+//! | Type | Use it for |
+//! |---|---|
+//! | [`WorkDeque`] | The work of one thread, which idle threads can steal |
+//! | [`Injector`] | A queue that all threads push to and take from |
+//! | [`Mailbox`] | Many threads that send to one receiver |
+//!
+//! # Details
+//! [`WorkDeque.make`] returns the [`Worker`] that owns a Chase-Lev deque. The worker pushes and
+//! pops at the bottom with no contention. Its [`Stealer`]s take from the top with one
+//! compare-exchange. The ring grows by doubling. Old rings stay allocated until the deque is
+//! dropped, because a stealer can still read one.
+//!
+//! [`Injector`] is a FIFO list under a `Mutex`. [`Mailbox`] is the Vyukov multi-producer,
+//! single-consumer queue: a send is one swap and one store, with no lock.
+//!
+//! Each pushed value moves into its own allocation (a parcel), and the queues move parcel addresses
+//! atomically. Only the thread that wins a value reads it. Thus no thread copies a value that it
+//! does not own.
+//!
+//! # Errors
+//! Each push and send allocates, so it requires `Allocator` and can fail with `OutOfMemoryError`.
+//!
+//! # Gotchas
+//! - [`Stealer.steal`] returns [`Steal.Retry`] when it loses a race. The caller decides whether to
+//!   try again.
+//! - [`MailboxReceiver.receive`] can return `None` for a short time while a send is between its two
+//!   steps.
+//!
+//! # Examples
+//! ## Steal work on another thread
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.concurrency.thread_native { NativeThread, SpawnError }
+//! import silk.core.option { Option }
+//! import silk.concurrency.work_queue { Steal, Stealer, WorkDeque }
+//!
+//! // Takes the oldest value. A lost race gives Retry, so try again.
+//! fn stealOne(stealer: Stealer<i32>) -> i32 {
+//!   while true {
+//!     match move stealer.steal() {
+//!       Steal<i32>.Success { value } => {
+//!         return value
+//!       }
+//!       Steal<i32>.Empty => {
+//!         return 0
+//!       }
+//!       Steal<i32>.Retry => {}
+//!     }
+//!   }
+//!   return 0
+//! }
+//!
+//! effect fn program() -> i32
+//!   ! OutOfMemoryError | SpawnError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let mut worker = run WorkDeque.make<i32>() |> Effect.provideMut<Allocator>(&mut allocator)
+//!   run worker.push(1) |> Effect.provideMut<Allocator>(&mut allocator)
+//!   run worker.push(2) |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let stealer = worker.stealer()
+//!   let thief = run NativeThread.spawn(
+//!     fn() -> i32 {
+//!       return stealOne(move stealer)
+//!     }
+//!   )
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!
+//!   // The thief takes from the top (oldest), the owner pops from the bottom (newest).
+//!   let stolen = thief.join()
+//!   let popped = match move worker.pop() {
+//!     Option<i32>.Some { value } => value
+//!     Option<i32>.None => 0
+//!   }
+//!   if stolen != 1 || popped != 2 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//!
+//! effect fn failed<E>(error: E) -> i32 {
+//!   drop error
+//!   return 1
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   return run Effect.catchAll(program(), failed)
+//! }
+//! ```
+//!
+//! ## Send through a mailbox and an injector
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.core.option { Option }
+//! import silk.concurrency.work_queue { Injector, Mailbox }
+//!
+//! effect fn program() -> i32
+//!   ! OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!
+//!   // A mailbox: senders on any thread, one receiver.
+//!   let mut receiver = run Mailbox.make<i32>() |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let sender = receiver.sender()
+//!   run sender.send(7) |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let received = match move receiver.receive() {
+//!     Option<i32>.Some { value } => value
+//!     Option<i32>.None => 0
+//!   }
+//!
+//!   // An injector: a shared FIFO queue.
+//!   let queue = run Injector<i32>.make() |> Effect.provideMut<Allocator>(&mut allocator)
+//!   run queue.push(1) |> Effect.provideMut<Allocator>(&mut allocator)
+//!   run queue.push(2) |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let first = match move queue.pop() {
+//!     Option<i32>.Some { value } => value
+//!     Option<i32>.None => 0
+//!   }
+//!   if received != 7 || first != 1 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//!
+//! effect fn outOfMemory(error: OutOfMemoryError) -> i32 {
+//!   return 1
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   return run Effect.catchAll(program(), outOfMemory)
+//! }
+//! ```
+//!
+//! @category Concurrency
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.concurrency.atomic { Atomic, CompareExchange, MemoryOrder }
+import silk.mem.box { Box }
+import silk.num.isize
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy, Drop }
+import silk.mem.pointer { Pointer }
+import silk.concurrency.sync { Arc, Mutex }
+import silk.concurrency.thread { Concurrent, Transferable }
+import silk.num.usize
+
+// Parcels: one owned value in heap storage that owns itself. `wrap` moves the box into the
+// storage's own `root`, so the parcel's address alone carries the value between threads; `unwrap`
+// and `discard` take the box back out and drop it, which releases the allocation exactly once.
+struct Unrooted {}
+struct Root<T> { storage: Box<Pinned<T>> }
+struct Pinned<T> {
+  value: T,
+  root: Unrooted | Root<T>,
+}
+struct Full<T> { value: T }
+struct Vacant {}
+// `next` links parcels in the injector and mailbox lists; the deque leaves it null. Every
+// parcel travels as its erased address (`?*mut u8`, never null), which the atomic operations take
+// whatever `T` is. Only the helpers below see the typed pointer.
+struct Parcel<T> {
+  next: ?*mut u8,
+  slot: Full<T> | Vacant,
+}
+
+effect<'env> fn wrap<'env, T>(slot: Full<T> | Vacant) -> ?*mut u8 ! OutOfMemoryError ? &mut Allocator {
+  let parcel = Parcel<T> { next: Pointer.null<u8>(), slot: move slot }
+  let mut storage = run Box<Pinned<Parcel<T>>>.make(Pinned<Parcel<T>> { value: move parcel, root: Unrooted {} })
+  let pinned = Pointer.fromMutRef(&mut storage.getMut()[0])
+  let mut anchor = ()
+  unsafe {
+    let fresh = Pointer.borrowMut(&mut anchor, pinned)
+    fresh.root = Root<Parcel<T>> { storage: move storage }
+  }
+  let raw = unsafe Intrinsic.pointerReinterpret<*mut Pinned<Parcel<T>>, *mut u8>(pinned)
+  return unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(raw)
+}
+
+// Takes the value out of a parcel the caller owns, leaving the parcel vacant and allocated.
+unsafe fn take<T>(parcel: ?*mut u8) -> T {
+  let raw = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(parcel)
+  let pinned = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Pinned<Parcel<T>>>(raw)
+  let mut anchor = ()
+  let held = unsafe Pointer.borrowMut(&mut anchor, pinned)
+  let slot = Intrinsic.replace(held.value.slot, Vacant {})
+  return match move slot {
+    Full<T> { value } => move value
+    Vacant nothing => vacant<T>()
+  }
+}
+
+// Releases a parcel the caller owns, dropping any value it still holds.
+unsafe fn discard<T>(parcel: ?*mut u8) -> () {
+  let raw = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(parcel)
+  let pinned = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Pinned<Parcel<T>>>(raw)
+  let mut anchor = ()
+  let held = unsafe Pointer.borrowMut(&mut anchor, pinned)
+  let root = Intrinsic.replace(held.root, Unrooted {})
+  match move root {
+    Root<Parcel<T>> { storage } => release<Parcel<T>>(move storage)
+    Unrooted nothing => ()
+  }
+  return ()
+}
+
+fn release<T>(storage: Box<Pinned<T>>) -> () { return () }
+
+// Takes the value out of a parcel the caller owns and releases the parcel.
+unsafe fn unwrap<T>(parcel: ?*mut u8) -> T {
+  let value = unsafe take<T>(parcel)
+  unsafe discard<T>(parcel)
+  return move value
+}
+
+// The address of a parcel's link, which other threads read and write only atomically.
+unsafe fn link<T>(parcel: ?*mut u8) -> *mut ?*mut u8 {
+  let raw = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(parcel)
+  let pinned = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Pinned<Parcel<T>>>(raw)
+  let anchor = ()
+  let held = unsafe Pointer.borrow(&anchor, pinned)
+  let address = Pointer.fromRef(&held.value.next)
+  return unsafe Intrinsic.pointerRequalify<*const ?*mut u8, *mut ?*mut u8>(address)
+}
+
+fn vacant<T>() -> T {
+  return Intrinsic.trap("WorkQueue: a parcel was taken twice")
+}
+
+fn exchanged<T: Copy>(outcome: CompareExchange<T>) -> bool {
+  return match move outcome {
+    CompareExchange<T>.Exchanged => true
+    CompareExchange<T>.Observed {..} => false
+  }
+}
+
+// One ring of parcel addresses. `mask` and `base` never change after construction; the slots
+// change only atomically, through `base`.
+struct Ring {
+  mask: usize,
+  base: [*]mut ?*mut u8,
+  slots: List<?*mut u8>,
+}
+
+effect<'env> fn makeRing<'env>(capacity: usize) -> Box<Ring> ! OutOfMemoryError ? &mut Allocator {
+  let mut slots = List<?*mut u8>.make()
+  let mut at: usize = 0
+  while at < capacity {
+    run List<?*mut u8>.append(&mut slots, Pointer.null<u8>())
+    at = at + 1
+  }
+  let start = Pointer.fromSlice(List<?*mut u8>.asSlice(&slots))
+  let base = unsafe Intrinsic.pointerRequalify<?[*]const ?*mut u8, [*]mut ?*mut u8>(start)
+  return run Box<Ring>.make(Ring { mask: capacity - 1, base: base, slots: move slots })
+}
+
+// The slot that holds logical index `index`.
+unsafe fn slotAt(ring: *mut Ring, index: isize) -> *mut ?*mut u8 {
+  let anchor = ()
+  let held = unsafe Pointer.borrow(&anchor, ring)
+  return unsafe Pointer.atMut(held.base, isize.toUsize(index) & held.mask)
+}
+
+unsafe fn ringCapacity(ring: *mut Ring) -> isize {
+  let anchor = ()
+  let held = unsafe Pointer.borrow(&anchor, ring)
+  return usize.toIsize(held.mask + 1)
+}
+
+struct DequeWords<T> {
+  top: isize,
+  bottom: isize,
+  ring: *mut Ring,
+  // Every ring the deque has used, newest last. Only the worker appends.
+  rings: List<Box<Ring>>,
+}
+
+// The shared deque. Its pointers address `words`, computed while the box was fresh.
+struct DequeState<T> {
+  words: Box<DequeWords<T>>,
+  top: *mut isize,
+  bottom: *mut isize,
+  ring: *mut *mut Ring,
+  rings: *mut List<Box<Ring>>,
+}
+
+impl<T: Transferable> Transferable for DequeState<T> {}
+impl<T: Transferable> Concurrent for DequeState<T> {}
+
+impl<T> Drop for DequeState<T> {
+  fn drop(self: &mut DequeState<T>) -> () {
+    // The last handle is gone, so every parcel still between top and bottom belongs to the deque.
+    unsafe {
+      let mut at = Atomic.load<isize>(self.top, MemoryOrder.Relaxed)
+      let bottom = Atomic.load<isize>(self.bottom, MemoryOrder.Relaxed)
+      let current = Atomic.load<*mut Ring>(self.ring, MemoryOrder.Relaxed)
+      while at < bottom {
+        discard<T>(Atomic.load<?*mut u8>(slotAt(current, at), MemoryOrder.Relaxed))
+        at = at + 1
+      }
+    }
+    return ()
+  }
+}
+
+/// The constructor of work-stealing deques: the work of one thread, which idle threads can steal.
+///
+/// # Details
+/// [`WorkDeque.make`] returns the [`Worker`] that owns a Chase-Lev deque. The worker pushes and
+/// pops at the bottom with no contention. Its [`Stealer`]s take from the top with one
+/// compare-exchange. The ring grows by doubling. Old rings stay allocated until the deque is
+/// dropped, because a stealer can still read one. Each push allocates, so it can fail with
+/// `OutOfMemoryError`.
+pub struct WorkDeque {}
+
+impl WorkDeque {
+  /// Makes an empty deque and returns the worker that owns it.
+  pub effect fn make<T>() -> Worker<T> ! OutOfMemoryError ? &mut Allocator {
+    let mut first = run makeRing(16)
+    let current = Pointer.fromMutRef(&mut first.getMut()[0])
+    let mut rings = List<Box<Ring>>.make()
+    run List<Box<Ring>>.append(&mut rings, move first)
+    let mut words = run Box<DequeWords<T>>.make(DequeWords<T> { top: 0, bottom: 0, ring: current, rings: move rings })
+    let fresh = &mut words.getMut()[0]
+    let top = Pointer.fromMutRef(&mut fresh.top)
+    let bottom = Pointer.fromMutRef(&mut fresh.bottom)
+    let ringWord = Pointer.fromMutRef(&mut fresh.ring)
+    let ringList = Pointer.fromMutRef(&mut fresh.rings)
+    let state = DequeState<T> { words: move words, top: top, bottom: bottom, ring: ringWord, rings: ringList }
+    return Worker<T> { state: run Arc<DequeState<T>>.make(move state) }
+  }
+}
+
+/// The owner of a work-stealing deque. It pushes and pops at the bottom.
+///
+/// # Details
+/// A worker is `Transferable` when `T` is, so it can move to the thread that runs the work. Push
+/// and pop take it exclusively. [`Worker.pop`] returns the newest value.
+pub struct Worker<T> {
+  state: Arc<DequeState<T>>,
+}
+
+/// What one steal attempt found.
+pub union Steal<T> {
+  /// The deque was empty.
+  Empty,
+  /// Another thread took the value that this attempt saw. Try again.
+  Retry,
+  /// The oldest value in the deque, now owned by the caller.
+  Success {
+    /// The stolen value.
+    pub value: T
+  }
+}
+
+impl<T> Worker<T> {
+  /// Pushes `value` at the bottom, growing the ring when it is full.
+  pub effect<'env> fn push<'env>(self: &mut Self, value: T) -> () ! OutOfMemoryError ? &mut Allocator {
+    let parcel = run wrap<T>(Full<T> { value: move value })
+    let state = self.state.get()
+    let bottom = unsafe Atomic.load<isize>(state.bottom, MemoryOrder.Relaxed)
+    let top = unsafe Atomic.load<isize>(state.top, MemoryOrder.Acquire)
+    let mut current = unsafe Atomic.load<*mut Ring>(state.ring, MemoryOrder.Relaxed)
+    if bottom - top >= unsafe ringCapacity(current) {
+      current = run grow<T>(state, current, top, bottom)
+    }
+    unsafe Atomic.store<?*mut u8>(unsafe slotAt(current, bottom), parcel, MemoryOrder.Relaxed)
+    // Release publishes the slot before the new bottom that makes it stealable.
+    Atomic.fence(MemoryOrder.Release)
+    unsafe Atomic.store<isize>(state.bottom, bottom + 1, MemoryOrder.Relaxed)
+    return ()
+  }
+
+  /// Pops the most recently pushed value, or reports none when the deque is empty.
+  pub fn pop(self: &mut Self) -> Option<T> {
+    let state = self.state.get()
+    let bottom = unsafe Atomic.load<isize>(state.bottom, MemoryOrder.Relaxed) - 1
+    let current = unsafe Atomic.load<*mut Ring>(state.ring, MemoryOrder.Relaxed)
+    unsafe Atomic.store<isize>(state.bottom, bottom, MemoryOrder.Relaxed)
+    // Orders the claimed bottom before reading top, against a stealer's opposite order.
+    Atomic.fence(MemoryOrder.SequentiallyConsistent)
+    let top = unsafe Atomic.load<isize>(state.top, MemoryOrder.Relaxed)
+    if top > bottom {
+      unsafe Atomic.store<isize>(state.bottom, bottom + 1, MemoryOrder.Relaxed)
+      return Option<T>.none()
+    }
+    let parcel = unsafe Atomic.load<?*mut u8>(unsafe slotAt(current, bottom), MemoryOrder.Relaxed)
+    if top == bottom {
+      // The last value: the worker and the stealers race for it on top.
+      let won = exchanged<isize>(unsafe Atomic.compareExchange<isize>(state.top, top, top + 1,
+        MemoryOrder.SequentiallyConsistent, MemoryOrder.Relaxed))
+      unsafe Atomic.store<isize>(state.bottom, bottom + 1, MemoryOrder.Relaxed)
+      if !won { return Option<T>.none() }
+    }
+    return Option<T>.some(unsafe unwrap<T>(parcel))
+  }
+
+  /// Returns a stealer for this deque.
+  pub fn stealer(self: &Self) -> Stealer<T> {
+    return Stealer<T> { state: self.state.clone() }
+  }
+}
+
+// Copies the live range into a ring twice the size and publishes it. Old rings stay allocated
+// until the deque drops, since a stealer may still read a slot of one.
+effect<'env> fn grow<'env, T>(state: &DequeState<T>, old: *mut Ring, top: isize, bottom: isize) -> *mut Ring
+! OutOfMemoryError ? &mut Allocator {
+  let size = unsafe ringCapacity(old)
+  let mut larger = run makeRing(isize.toUsize(size) * 2)
+  let current = Pointer.fromMutRef(&mut larger.getMut()[0])
+  let mut at = top
+  while at < bottom {
+    unsafe {
+      let parcel = Atomic.load<?*mut u8>(slotAt(old, at), MemoryOrder.Relaxed)
+      Atomic.store<?*mut u8>(slotAt(current, at), parcel, MemoryOrder.Relaxed)
+    }
+    at = at + 1
+  }
+  let mut anchor = ()
+  let rings = unsafe Pointer.borrowMut(&mut anchor, state.rings)
+  run List<Box<Ring>>.append(&mut rings.*, move larger)
+  // Release publishes the copied slots before stealers can load the new ring.
+  unsafe Atomic.store<*mut Ring>(state.ring, current, MemoryOrder.Release)
+  return current
+}
+
+/// A handle that takes the oldest values from a [`Worker`]'s deque, from any thread.
+///
+/// # Details
+///
+/// A stealer is `Transferable` and `Concurrent` when `T` is `Transferable`.
+pub struct Stealer<T> {
+  state: Arc<DequeState<T>>,
+}
+
+impl<T> Stealer<T> {
+  /// Takes the oldest value, or reports that the deque was empty or that the attempt lost a race.
+  pub fn steal(self: &Self) -> Steal<T> {
+    let state = self.state.get()
+    let top = unsafe Atomic.load<isize>(state.top, MemoryOrder.Acquire)
+    // Orders reading top before bottom, against the worker's pop.
+    Atomic.fence(MemoryOrder.SequentiallyConsistent)
+    let bottom = unsafe Atomic.load<isize>(state.bottom, MemoryOrder.Acquire)
+    if top >= bottom { return Steal<T>.Empty }
+    let current = unsafe Atomic.load<*mut Ring>(state.ring, MemoryOrder.Acquire)
+    let parcel = unsafe Atomic.load<?*mut u8>(unsafe slotAt(current, top), MemoryOrder.Relaxed)
+    // Winning top transfers the parcel; a loser never touches it.
+    let won = exchanged<isize>(unsafe Atomic.compareExchange<isize>(state.top, top, top + 1,
+      MemoryOrder.SequentiallyConsistent, MemoryOrder.Relaxed))
+    if !won { return Steal<T>.Retry }
+    return Steal<T>.Success { value: unsafe unwrap<T>(parcel) }
+  }
+
+  /// Adds another stealer for the same deque.
+  pub fn clone(self: &Self) -> Stealer<T> {
+    return Stealer<T> { state: self.state.clone() }
+  }
+}
+
+// A FIFO list of parcels, linked through `next`; only touched under the injector's lock.
+struct InjectorList<T> {
+  head: ?*mut u8,
+  tail: ?*mut u8,
+}
+
+impl<T: Transferable> Transferable for InjectorList<T> {}
+
+impl<T> Drop for InjectorList<T> {
+  fn drop(self: &mut InjectorList<T>) -> () {
+    while !Pointer.isNull(self.head) {
+      let first = self.head
+      self.head = unsafe Pointer.read(unsafe link<T>(first))
+      unsafe discard<T>(first)
+    }
+    return ()
+  }
+}
+
+/// A shared FIFO queue that all threads can push to and take from.
+///
+/// # Details
+/// Clones are handles to the same queue. An injector is `Transferable` and `Concurrent` when `T` is
+/// `Transferable`. Each operation holds the lock only to link or unlink one parcel.
+pub struct Injector<T> {
+  queue: Arc<Mutex<InjectorList<T>>>,
+}
+
+impl<T> Injector<T> {
+  /// Makes an empty queue.
+  pub effect<'env> fn make<'env>() -> Injector<T> ! OutOfMemoryError ? &mut Allocator {
+    let empty = InjectorList<T> { head: Pointer.null<u8>(), tail: Pointer.null<u8>() }
+    let locked = run Mutex<InjectorList<T>>.make(move empty)
+    return Injector<T> { queue: run Arc<Mutex<InjectorList<T>>>.make(move locked) }
+  }
+
+  /// Appends `value` at the back.
+  pub effect<'env> fn push<'env>(self: &Self, value: T) -> () ! OutOfMemoryError ? &mut Allocator {
+    let parcel = run wrap<T>(Full<T> { value: move value })
+    let mut guard = self.queue.get().lock()
+    let list = guard.getMut()
+    if Pointer.isNull(list.tail) {
+      list.head = parcel
+    } else {
+      unsafe Pointer.write(unsafe link<T>(list.tail), parcel)
+    }
+    list.tail = parcel
+    return ()
+  }
+
+  /// Takes the value at the front, or reports none when the queue is empty.
+  pub fn pop(self: &Self) -> Option<T> {
+    let first = takeFirst<T>(self.queue.get())
+    if Pointer.isNull(first) { return Option<T>.none() }
+    // The parcel was unlinked under the lock, so this thread owns it.
+    return Option<T>.some(unsafe unwrap<T>(first))
+  }
+
+  /// Adds another handle to the same queue.
+  pub fn clone(self: &Self) -> Injector<T> {
+    return Injector<T> { queue: self.queue.clone() }
+  }
+}
+
+fn takeFirst<T>(queue: &Mutex<InjectorList<T>>) -> ?*mut u8 {
+  let mut guard = queue.lock()
+  let list = guard.getMut()
+  let first = list.head
+  if Pointer.isNull(first) { return first }
+  list.head = unsafe Pointer.read(unsafe link<T>(first))
+  if Pointer.isNull(list.head) { list.tail = Pointer.null<u8>() }
+  return first
+}
+
+struct MailWords {
+  head: ?*mut u8,
+  tail: ?*mut u8,
+}
+
+// The shared mailbox. Senders swap `head`; only the receiver moves `tail`. The parcel at `tail` is
+// always vacant: it is the stub the next send links after.
+struct MailboxState<T> {
+  words: Box<MailWords>,
+  head: *mut ?*mut u8,
+  tail: *mut ?*mut u8,
+}
+
+impl<T: Transferable> Transferable for MailboxState<T> {}
+impl<T: Transferable> Concurrent for MailboxState<T> {}
+
+impl<T> Drop for MailboxState<T> {
+  fn drop(self: &mut MailboxState<T>) -> () {
+    // Every sender is gone, so the list from tail is complete.
+    unsafe {
+      let mut node = Atomic.load<?*mut u8>(self.tail, MemoryOrder.Relaxed)
+      while !Pointer.isNull(node) {
+        let current = node
+        node = Atomic.load<?*mut u8>(link<T>(current), MemoryOrder.Acquire)
+        discard<T>(current)
+      }
+    }
+    return ()
+  }
+}
+
+/// The constructor of multi-producer, single-consumer mailboxes: many threads that send to one
+/// receiver.
+///
+/// # Details
+/// It is the Vyukov queue: a send is one swap and one store, with no lock. Each send allocates, so
+/// it can fail with `OutOfMemoryError`.
+///
+/// # Gotchas
+/// [`MailboxReceiver.receive`] can return `None` for a short time while a send is between its two
+/// steps.
+pub struct Mailbox {}
+
+impl Mailbox {
+  /// Makes an empty mailbox and returns its receiver.
+  pub effect fn make<T>() -> MailboxReceiver<T> ! OutOfMemoryError ? &mut Allocator {
+    let stub = run wrap<T>(Vacant {})
+    let mut words = run Box<MailWords>.make(MailWords { head: stub, tail: stub })
+    let fresh = &mut words.getMut()[0]
+    let head = Pointer.fromMutRef(&mut fresh.head)
+    let tail = Pointer.fromMutRef(&mut fresh.tail)
+    let state = MailboxState<T> { words: move words, head: head, tail: tail }
+    return MailboxReceiver<T> { state: run Arc<MailboxState<T>>.make(move state) }
+  }
+}
+
+/// The one receiving end of a [`Mailbox`].
+///
+/// # Details
+/// A receiver is `Transferable` when `T` is. A receive takes it exclusively.
+pub struct MailboxReceiver<T> {
+  state: Arc<MailboxState<T>>,
+}
+
+impl<T> MailboxReceiver<T> {
+  /// Takes the oldest value sent, or reports none.
+  ///
+  /// # Gotchas
+  ///
+  /// A send that has swapped itself in but not yet linked reports none until it links, so a
+  /// caller that knows a value is coming retries.
+  pub fn receive(self: &mut Self) -> Option<T> {
+    let state = self.state.get()
+    let stub = unsafe Atomic.load<?*mut u8>(state.tail, MemoryOrder.Relaxed)
+    let next = unsafe Atomic.load<?*mut u8>(unsafe link<T>(stub), MemoryOrder.Acquire)
+    if Pointer.isNull(next) { return Option<T>.none() }
+    // The arrived parcel becomes the new stub once its value is out.
+    let value = unsafe take<T>(next)
+    unsafe Atomic.store<?*mut u8>(state.tail, next, MemoryOrder.Relaxed)
+    unsafe discard<T>(stub)
+    return Option<T>.some(move value)
+  }
+
+  /// Returns a sender for this mailbox.
+  pub fn sender(self: &Self) -> MailboxSender<T> {
+    return MailboxSender<T> { state: self.state.clone() }
+  }
+}
+
+/// A sending end of a [`Mailbox`]. Any thread can hold one.
+///
+/// # Details
+/// A sender is `Transferable` and `Concurrent` when `T` is `Transferable`.
+pub struct MailboxSender<T> {
+  state: Arc<MailboxState<T>>,
+}
+
+impl<T> MailboxSender<T> {
+  /// Sends `value` to the receiver.
+  pub effect<'env> fn send<'env>(self: &Self, value: T) -> () ! OutOfMemoryError ? &mut Allocator {
+    let parcel = run wrap<T>(Full<T> { value: move value })
+    let state = self.state.get()
+    let previous = unsafe Atomic.swap<?*mut u8>(state.head, parcel, MemoryOrder.AcquireRelease)
+    // Release publishes the parcel's value to the receiver's acquire load of this link.
+    unsafe Atomic.store<?*mut u8>(unsafe link<T>(previous), parcel, MemoryOrder.Release)
+    return ()
+  }
+
+  /// Adds another sender for the same mailbox.
+  pub fn clone(self: &Self) -> MailboxSender<T> {
+    return MailboxSender<T> { state: self.state.clone() }
+  }
+}

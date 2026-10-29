@@ -43,7 +43,7 @@ const withStub = async (body: string, run: (path: string) => Promise<void>): Pro
   }
 }
 
-const compiled = `if [ "$5" != --stdlib ] || [ ! -f "$6/silk/i32.silk" ] || ! grep -qxF 'version = "0.1.0"' silk.toml; then exit 4; fi
+const compiled = `if [ "$5" != --stdlib ] || [ ! -f "$6/silk/num/i32.silk" ] || ! grep -qxF 'version = "0.1.0"' silk.toml; then exit 4; fi
 case "$6" in */) exit 5;; esac
 if [ "$1" != build ] || [ "$2" != memory/driver.silk ] || [ ! -f memory/driver.silk ] || [ "$3" != -o ] || [ "$4" != program ]; then exit 3; fi
 while [ "$1" != "-o" ]; do shift; done
@@ -110,7 +110,7 @@ void it('supplies corpus runtime components as the host default composition', as
   }
   await withStub(
     `[ -f test/refusing.silk ] || exit 7
-grep -qxF 'composition = { runtimes = [{ name = "hosted", module = "silk/native_start" }], defaults = ["hosted"], retention = [], requirements = [], components = [{ capability = "execution-storage", bindings = [{ operation = "acquire", module = "test/refusing", declaration = "refuse" }] }] }' silk.toml || exit 8
+grep -qxF 'composition = { runtimes = [{ name = "hosted", module = "silk/platform/native/start" }], defaults = ["hosted"], retention = [], requirements = [], components = [{ capability = "execution-storage", bindings = [{ operation = "acquire", module = "test/refusing", declaration = "refuse" }] }] }' silk.toml || exit 8
 ${compiled}`,
     async (silkc) => {
       assert.deepStrictEqual(await runCase(silkc, composed), { name: 'literal', status: 'pass' })
@@ -208,7 +208,7 @@ void it('retains exact gap source locations and rejects malformed location recor
   const gap = {
     code: 'typed-form',
     reason: 'deferred valid form',
-    source: { module: 'silk/option.silk', span: { start: 12, end: 27 } },
+    source: { module: 'silk/core/option.silk', span: { start: 12, end: 27 } },
   }
   const encode = (value: unknown): string =>
     `SILK_UNSUPPORTED_JSON=${JSON.stringify({ gaps: [value] })}`
@@ -220,7 +220,7 @@ void it('retains exact gap source locations and rejects malformed location recor
     { start: 12, end: '27' },
   ]) {
     assert.strictEqual(
-      parseUnsupported(encode({ ...gap, source: { module: 'silk/option.silk', span } })),
+      parseUnsupported(encode({ ...gap, source: { module: 'silk/core/option.silk', span } })),
       undefined,
     )
   }
@@ -296,7 +296,7 @@ void it('retains build diagnostic codes and byte spans without turning rejection
   const record =
     'SILK_BUILD_ERROR={"code":"SEM0006","span":{"start":28,"end":34},"module":"main.silk"}'
   const other =
-    'SILK_BUILD_ERROR={"code":"SEM0012","span":{"start":6,"end":9},"module":"silk/uri.silk"}'
+    'SILK_BUILD_ERROR={"code":"SEM0012","span":{"start":6,"end":9},"module":"silk/uri/uri.silk"}'
   const gaps = 'SILK_UNSUPPORTED_JSON={"gaps":[{"code":"typed-form","reason":"not lowered"}]}'
   await withStub(`echo '${record}' >&2; exit 1`, async (silkc) => {
     const result = await runCase(silkc, literal)

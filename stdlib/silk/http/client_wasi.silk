@@ -1,0 +1,244 @@
+//! The WASI Preview 2 provider for the portable `Http` service.
+//!
+//! # When to use
+//! Provide `WasiHttp.make()` for `Http` in a component whose host enables `wasi:http`.
+//! The host supplies HTTP transport, TLS verification, and network policy.
+//!
+//! # Details
+//! Defaults are a 30-second deadline for the whole request, a 16 MiB response body, and ten
+//! redirects. Request overrides are honored. Redirects follow Fetch method rules, reject HTTPS
+//! downgrades, and remove credentials when the origin changes. Request and response bodies stream
+//! through host backpressure; the returned response owns the complete body.
+//!
+//! @category HTTP
+
+static if Intrinsic.profileText("target") == "wasm32-wasip2" {
+  import silk.platform.wasi.preview2 as host
+  import silk.platform.wasi.component as abi { ResultArea }
+  import silk.platform.wasi.http as wasi { Resource, ResourceKind, HttpResult, FutureResult, Field }
+  import silk.mem.allocator { Allocator, OutOfMemoryError }
+  import silk.collections.bytes { Bytes }
+  import silk.core.effect { Effect }
+  import silk.http.message { Method, OwnedResponseHead }
+  import silk.http.client { Http, HttpError, HttpErrorKind, Request, Response }
+  import silk.http.origin { Origin, OriginError }
+  import silk.collections.list { List }
+  import silk.system.monotonic_clock { MonotonicClock }
+  import silk.system.monotonic_clock_native { OsMonotonicClock }
+  import silk.system.system_clock { Instant }
+  import silk.core.option { Option }
+  import silk.core.result { Result }
+  import silk.text.string { String, InvalidUtf8 }
+  import silk.uri.uri { Uri }
+  import silk.uri.reference { UriReference, ParseError }
+  import silk.num.u32
+  import silk.num.u64
+  import silk.num.usize
+
+  /// A WASI HTTP provider with a host monotonic clock. Hosts control transport and TLS policy.
+  pub struct WasiHttp { clock: OsMonotonicClock }
+  impl WasiHttp {
+    /// Makes a client with a 30-second deadline, a 16 MiB body limit, and ten redirects by default.
+    pub fn make() -> WasiHttp { return WasiHttp {clock: OsMonotonicClock.make()} }
+  }
+
+  fn equalName(value: string, lower: string) -> bool {
+    let left = String.utf8Bytes(value)
+    let right = String.utf8Bytes(lower)
+    if left.length != right.length { return false }
+    let mut at: usize = 0
+    while at < left.length {
+      let mut byte = left[at]
+      if byte >= 65 && byte <= 90 { byte = byte + 32 }
+      if byte != right[at] { return false }
+      at = at + 1
+    }
+    return true
+  }
+
+  fn invalid(message: string<'static>) -> HttpError { return HttpError.make(HttpErrorKind.InvalidRequest, message) }
+
+  effect fn attempt(request: &Request, url: string, method: Method<'static>, withBody: bool,
+    credentials: bool, discardBodyFields: bool, maximum: usize, until: &Option<Instant>) -> Response
+    ! HttpError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock {
+    if run abi.expired(until) { fail HttpError.make(HttpErrorKind.Timeout, "HTTP deadline expired") }
+    unsafe {
+      let parsed = match move UriReference.parse(url) {
+        Result<UriReference, ParseError>.Success {value} => value
+        Result<UriReference, ParseError>.Failure {error: _} => { fail HttpError.make(HttpErrorKind.InvalidUrl, "Invalid HTTP URL") }
+      }
+      let scheme = Option<string>.unwrapOr(UriReference.scheme(&parsed), "")
+      if !equalName(scheme, "http") && !equalName(scheme, "https") {
+        fail HttpError.make(HttpErrorKind.InvalidUrl, "HTTP requires an http or https URL")
+      }
+      if let Option<string>.Some {value: _} = move UriReference.userinfo(&parsed) {
+        fail HttpError.make(HttpErrorKind.InvalidUrl, "HTTP URLs must not contain credentials")
+      }
+      let authority = Option<string>.unwrapOr(UriReference.authority(&parsed), "")
+      if String.byteLength(authority) == 0 { fail HttpError.make(HttpErrorKind.InvalidUrl, "HTTP URL has no authority") }
+      let mut path = run String.copy(UriReference.path(&parsed))
+      if String.byteLength(String.view(&path)) == 0 { run String.append(&mut path, "/") }
+      if let Option<string>.Some {value} = move UriReference.query(&parsed) {
+        run String.append(&mut path, "?")
+        run String.append(&mut path, value)
+      }
+      let mut fields = Resource.take(host.http_types_new_fields(), ResourceKind.Fields)
+      let headers = Request.headers(request)
+      let mut contentType = false
+      let mut bearer = false
+      if let Option<string>.Some {value: _} = move Request.bearerToken(request) { bearer = true }
+      let mut at: usize = 0
+      while at < headers.length {
+        let field = headers[at]
+        at = at + 1
+        if !credentials && (equalName(field.name, "authorization") || equalName(field.name, "cookie") || equalName(field.name, "proxy-authorization")) { continue }
+        if bearer && equalName(field.name, "authorization") { continue }
+        if discardBodyFields && (equalName(field.name, "content-type") || equalName(field.name, "content-length") || equalName(field.name, "content-encoding") || equalName(field.name, "content-language") || equalName(field.name, "content-location")) { continue }
+        if equalName(field.name, "content-type") { contentType = true }
+        run wasi.appendField(Resource.handle(&fields), field.name, String.utf8Bytes(field.value))
+      }
+      if withBody && !contentType {
+        if let Option<string>.Some {value} = move Request.contentType(request) {
+          run wasi.appendField(Resource.handle(&fields), "Content-Type", String.utf8Bytes(value))
+        }
+      }
+      if credentials {
+        if let Option<string>.Some {value} = move Request.bearerToken(request) {
+          let mut token = run String.copy("Bearer ")
+          run String.append(&mut token, value)
+          run wasi.appendField(Resource.handle(&fields), "Authorization", String.utf8Bytes(String.view(&token)))
+        }
+      }
+      let mut outgoing = Resource.take(host.http_types_new_outgoing_request(Resource.release(&mut fields)), ResourceKind.OutgoingRequest)
+      let handle = Resource.handle(&outgoing)
+      // The `other` case preserves arbitrary valid methods, including their case.
+      let verb = Method.format(&method)
+      if host.http_types_outgoing_request_set_method(handle, 9, wasi.textAddress(verb), usize.toU32(String.byteLength(verb))) != 0 {
+        fail invalid("WASI rejected the HTTP method")
+      }
+      let pathText = String.view(&path)
+      if host.http_types_outgoing_request_set_path_with_query(handle, 1, wasi.textAddress(pathText), usize.toU32(String.byteLength(pathText))) != 0 {
+        fail invalid("WASI rejected the HTTP path and query")
+      }
+      let mut schemeTag: u32 = 0
+      if equalName(scheme, "https") { schemeTag = 1 }
+      if host.http_types_outgoing_request_set_scheme(handle, 1, schemeTag, 0, 0) != 0 ||
+        host.http_types_outgoing_request_set_authority(handle, 1, wasi.textAddress(authority), usize.toU32(String.byteLength(authority))) != 0 {
+        fail HttpError.make(HttpErrorKind.InvalidUrl, "WASI rejected the HTTP origin")
+      }
+      let mut bodyResult = ResultArea.make()
+      host.http_types_outgoing_request_body(handle, abi.address(&mut bodyResult))
+      if ResultArea.byte(&bodyResult, 0) != 0 { fail wasi.protocol("HTTP request body was already taken") }
+      let body = Resource.take(ResultArea.word32(&bodyResult, 4), ResourceKind.OutgoingBody)
+      let mut submitted = HttpResult.make()
+      host.http_outgoing_handler_handle(Resource.release(&mut outgoing), 0, 0, abi.address(&mut submitted))
+      let future = Resource.take(run HttpResult.handle(&submitted), ResourceKind.FutureResponse)
+      let mut written = Result<(), HttpError>.Success {value: ()}
+      if withBody { written = run Effect.result(wasi.writeBody(move body, Request.bodyBytes(request), until)) }
+      else { written = run Effect.result(wasi.writeBody(move body, b"", until)) }
+      // A server may finish its response before consuming the request body. A closed output
+      // stream then leaves a valid response in the future; deadlines and request errors still fail.
+      if let Result<(), HttpError>.Failure {error} = move written {
+        if error.kind != HttpErrorKind.Protocol { fail move error }
+      }
+      let mut responseHandle: u32 = 0
+      while true {
+        let mut ready = FutureResult.make()
+        host.http_types_future_incoming_response_get(Resource.handle(&future), abi.address(&mut ready))
+        if FutureResult.ready(&ready) { responseHandle = run FutureResult.response(&ready) break }
+        run wasi.wait(host.http_types_future_incoming_response_subscribe(Resource.handle(&future)), until)
+      }
+      let incoming = Resource.take(responseHandle, ResourceKind.IncomingResponse)
+      let status = u32.toU16(host.http_types_incoming_response_status(responseHandle))
+      let responseFields = Resource.take(host.http_types_incoming_response_headers(responseHandle), ResourceKind.Fields)
+      let copied = run wasi.readFields(Resource.handle(&responseFields))
+      drop responseFields
+      let head = run wasi.responseHead(status, List<Field>.asSlice(&copied))
+      let mut consumed = ResultArea.make()
+      host.http_types_incoming_response_consume(responseHandle, abi.address(&mut consumed))
+      if ResultArea.byte(&consumed, 0) != 0 { fail wasi.protocol("HTTP response body was already consumed") }
+      let incomingBody = Resource.take(ResultArea.word32(&consumed, 4), ResourceKind.IncomingBody)
+      let data = run wasi.readBody(move incomingBody, maximum, until)
+      drop incoming
+      return Response.fromParts(move head, move data, run String.copy(url))
+    }
+  }
+
+  effect fn redirect(current: string, location: string, credentials: &mut bool) -> String
+    ! HttpError | OutOfMemoryError ? &mut Allocator {
+    let base = match move Uri.parse(current) {
+      Result.Success {value} => value
+      Result.Failure {error: _} => { fail HttpError.make(HttpErrorKind.Redirect, "Invalid redirect source URL") }
+    }
+    let reference = match move UriReference.parse(location) {
+      Result.Success {value} => value
+      Result.Failure {error: _} => { fail HttpError.make(HttpErrorKind.Redirect, "Invalid redirect Location") }
+    }
+    let resolved = match move run Uri.resolveOwned(&base, &reference) {
+      Result.Success {value} => move value
+      Result.Failure {error: _} => { fail HttpError.make(HttpErrorKind.Redirect, "Cannot resolve redirect Location") }
+    }
+    let view = resolved.view()
+    let scheme = view.scheme()
+    if !equalName(scheme, "http") && !equalName(scheme, "https") {
+      fail HttpError.make(HttpErrorKind.Redirect, "Redirect requires an http or https URL")
+    }
+    if let Option<string>.Some {value: _} = move view.userinfo() { fail HttpError.make(HttpErrorKind.Redirect, "Redirect URL contains credentials") }
+    if equalName(base.scheme(), "https") && equalName(scheme, "http") { fail HttpError.make(HttpErrorKind.Redirect, "HTTPS redirect would downgrade to HTTP") }
+    let from = Origin.fromUri(&base)
+    let to = Origin.fromUri(&view)
+    let same = match &from {
+      Result.Success {value: left} => match &to { Result.Success {value: right} => Origin.equals(&left, &right) _ => false }
+      _ => false
+    }
+    if !same { credentials.* = false }
+    drop view
+    return resolved.intoString()
+  }
+
+  effect fn send(request: Request) -> Response ! HttpError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock {
+    if Request.overflowed(&request) { fail invalid("HTTP request has too many parts") }
+    let seconds = Option<u64>.unwrapOr(Request.timeout(&request), 30)
+    if seconds > 18446744073 { fail invalid("HTTP timeout exceeds the host duration range") }
+    if seconds == 0 { fail HttpError.make(HttpErrorKind.Timeout, "HTTP deadline expired") }
+    let timeout = seconds * 1000000000
+    let now = run MonotonicClock.now()
+    let until = Option<Instant>.some(MonotonicClock.deadlineAfter(&now, timeout))
+    let maximum = Option<usize>.unwrapOr(Request.maxBody(&request), 16777216)
+    let redirects = Option<usize>.unwrapOr(Request.redirects(&request), 10)
+    let mut current = run Request.resolveUrl(&request, "")
+    let mut method = Request.method(&request)
+    let mut withBody = Request.hasBody(&request)
+    let mut credentials = true
+    let mut discardBodyFields = false
+    let mut hops: usize = 0
+    while true {
+      let response = run attempt(&request, String.view(&current), method, withBody, credentials, discardBodyFields, maximum, &until)
+      let status = Response.status(&response)
+      if redirects == 0 || (status != 301 && status != 302 && status != 303 && status != 307 && status != 308) { return move response }
+      let location = match move Response.header(&response, "location") {
+        Option<&[u8]>.Some {value} => match move String.fromUtf8(value) {
+          Result<string, InvalidUtf8>.Success {value: text} => text
+          Result<string, InvalidUtf8>.Failure {error: _} => { fail HttpError.make(HttpErrorKind.Redirect, "Redirect Location is not UTF-8") }
+        }
+        Option<&[u8]>.None => { return move response }
+      }
+      if hops == redirects { fail HttpError.make(HttpErrorKind.Redirect, "HTTP redirect limit exceeded") }
+      let next = run redirect(String.view(&current), location, &mut credentials)
+      if (status == 303 && !Method.equals(&method, &Method.head())) || ((status == 301 || status == 302) && Method.equals(&method, &Method.post())) {
+        method = Method.get()
+        withBody = false
+        discardBodyFields = true
+      }
+      current = move next
+      hops = hops + 1
+    }
+    fail HttpError.make(HttpErrorKind.Redirect, "HTTP redirect loop ended unexpectedly")
+  }
+
+  impl Http for WasiHttp {
+    effect fn send(self: &mut Self, request: Request) -> Response ! HttpError | OutOfMemoryError ? &mut Allocator {
+      return run send(move request) |> Effect.provideMut<MonotonicClock>(&mut self.clock)
+    }
+  }
+}

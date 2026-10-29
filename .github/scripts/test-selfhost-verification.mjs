@@ -95,11 +95,11 @@ try {
   )
   assert.notStrictEqual(invoke({}).status, 0)
   // The gate verifies only: a gate that rewrites a tracked source fails.
-  writeFileSync(gate, '#!/bin/sh\nprintf "\\n// formatted witness\\n" >> stdlib/silk/i32.silk\n')
+  writeFileSync(gate, '#!/bin/sh\nprintf "\\n// formatted witness\\n" >> stdlib/silk/num/i32.silk\n')
   const rewritten = invoke()
   assert.notStrictEqual(rewritten.status, 0)
   assert.match(rewritten.stdout + rewritten.stderr, /changed tracked sources/)
-  execFileSync('git', ['checkout', '--', 'stdlib/silk/i32.silk'], {
+  execFileSync('git', ['checkout', '--', 'stdlib/silk/num/i32.silk'], {
     cwd: checkout,
   })
   writeFileSync(gate, verifyingGate)
@@ -116,16 +116,16 @@ try {
     bootstrap,
     `import {writeFileSync} from 'node:fs'; writeFileSync(${JSON.stringify(sentinel)}, 'bootstrap'); process.exit(98);`,
   )
-  const stdlib = join(checkout, 'stdlib/silk/i32.silk')
+  const stdlib = join(checkout, 'stdlib/silk/num/i32.silk')
   writeFileSync(stdlib, readFileSync(stdlib, 'utf8') + '\n// consumer corpus stdlib witness\n')
   const calls = join(temporary, 'compiler-calls')
   writeFileSync(
     compiler,
     `#!/bin/sh
 if [ "$6" != '${checkout}/stdlib' ]; then exit 8; fi
-if ! grep -q 'consumer corpus stdlib witness' "$6/silk/i32.silk"; then exit 9; fi
+if ! grep -q 'consumer corpus stdlib witness' "$6/silk/num/i32.silk"; then exit 9; fi
 printf '%s:%s\\n' "$8" "\${10}" >> '${calls}'
-if grep -q 'import silk.json_reflect' "$2"; then
+if grep -q 'import silk.json.reflect' "$2"; then
   printf '%s\\n' 'SILK_UNSUPPORTED_JSON={"gaps":[{"code":"smoke-gap","reason":"fake compiler gap"}]}' >&2
   exit 1
 fi

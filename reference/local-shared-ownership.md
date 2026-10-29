@@ -1,6 +1,6 @@
 # Allocation-backed local shared ownership
 
-The `silk.shared` module provides explicit, allocation-backed shared lifetime for values that stay
+The `silk.mem.shared` module provides explicit, allocation-backed shared lifetime for values that stay
 inside one local execution domain. `Shared<T>` is not a lexical borrow and is not thread-safe shared
 ownership. Each handle is an affine strong obligation, and access is confined to a take-once
 callback.
@@ -14,9 +14,9 @@ This small program creates one shared counter. It updates the value through one 
 value through a second owner.
 
 ```silk
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
-import silk.shared { Shared }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.mem.shared { Shared }
 
 struct Counter { value: i32 }
 fn increment(counter: &mut Counter) -> i32 {
@@ -73,7 +73,7 @@ fn withMut<T, A>(self: &Shared<T>, use: once fn(&mut T) -> A) -> A
 `Shared.clone`, `Shared.with`, and `Shared.withMut` allocate nothing themselves and carry no
 allocator requirement.
 
-**Boundary:** Importing `silk.shared`, moving a handle, accessing its value, and dropping a non-last
+**Boundary:** Importing `silk.mem.shared`, moving a handle, accessing its value, and dropping a non-last
 handle do not select hidden storage. The control-block layout is private and exposes no raw address
 or allocation identity.
 
@@ -81,7 +81,7 @@ or allocation identity.
 layout diagnostic. A mismatched unsafe allocation/initializer pair reports `SEM0138` and publishes
 no usable shared core.
 
-**Evidence:** [ordinary source implementation](../stdlib/silk/shared.silk),
+**Evidence:** [ordinary source implementation](../stdlib/silk/mem/shared.silk),
 allocation specification.
 
 ### SHARED-002 — Every handle is affine, strong, and local
@@ -150,7 +150,7 @@ reader state. Separate control blocks may be accessed independently.
 **Diagnostics:** Reentrant conflict is a fatal non-unwinding trap, not a typed failure or a
 recoverable busy result. No post-trap cleanup is promised.
 
-**Evidence:** [shared implementation](../stdlib/silk/shared.silk),
+**Evidence:** [shared implementation](../stdlib/silk/mem/shared.silk),
 native lifecycle coverage.
 
 ### SHARED-005 — Strong cycles remain allocated

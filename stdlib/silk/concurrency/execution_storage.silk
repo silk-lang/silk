@@ -1,0 +1,245 @@
+//! Storage for the private execution frames that the compiler makes.
+//!
+//! # When to use
+//! The compiler and the runtime use this module through its C exports. Application code does not
+//! call it.
+//!
+//! # Details
+//! Each [`ExecutionStorage`] state owns its limit, its accounting and its reservations. There is no
+//! shared counter and no environment lookup. Allocation and release use the declared allocator of
+//! the selected target.
+//!
+//! # Errors
+//! [`ExecutionStorage.make`] fails with `OutOfMemoryError`. [`ExecutionStorage.acquire`] returns
+//! null when a frame does not fit in the limit or cannot be allocated.
+//!
+//! # Gotchas
+//! - Raw frame access is unsafe. A frame is valid only until it is released or its state is
+//!   destroyed.
+//! - One state needs exclusive use. Independent states can use a concurrent host allocator.
+//!
+//! @category Concurrency
+
+static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.profileText(
+  "libc",
+) == "gnu") || Intrinsic.targetArchitecture() == "wasm32" {
+  import silk.core.ownership {Copy, Drop}
+  import silk.mem.pointer {Pointer}
+  import silk.mem.layout {Layout}
+  import silk.mem.allocator {OutOfMemoryError}
+  import silk.core.effect {Effect}
+  import silk.num.usize
+  unsafe extern "C" fn malloc(size: usize) -> ?*mut u8
+  unsafe extern "C" fn free(pointer: ?*mut u8) -> ()
+  extern "C" struct Reservation {
+    next: ?*mut Reservation,
+    payload: ?*mut u8,
+    charged: usize,
+  }
+  impl Copy for Reservation {}
+  extern "C" struct Accounting {
+    head: ?*mut Reservation,
+    used: usize,
+    limit: usize,
+  }
+  impl Copy for Accounting {}
+  /// An affine state that owns its private-frame reservations and capacity limit.
+  pub struct ExecutionStorage {
+    handle: ?*mut u8,
+  }
+  impl Drop for ExecutionStorage {
+    fn drop(self: &mut ExecutionStorage) -> () {
+      let handle = Intrinsic.replace(self.handle, Pointer.null<u8>())
+      unsafe {
+        destroy(handle)
+      }
+    }
+  }
+  unsafe fn accounting(handle: ?*mut u8) -> *mut Accounting {
+    unsafe {
+      let typed = Intrinsic.pointerReinterpret<?*mut u8, ?*mut Accounting>(handle)
+      return Intrinsic.pointerRequalify<?*mut Accounting, *mut Accounting>(typed)
+    }
+  }
+  unsafe fn reservation(handle: ?*mut Reservation) -> *mut Reservation {
+    unsafe {
+      return Intrinsic.pointerRequalify<?*mut Reservation, *mut Reservation>(handle)
+    }
+  }
+  unsafe fn bytes<T>(value: *mut T) -> ?*mut u8 {
+    unsafe {
+      let nullable = Intrinsic.pointerRequalify<*mut T, ?*mut T>(value)
+      return Intrinsic.pointerReinterpret<?*mut T, ?*mut u8>(nullable)
+    }
+  }
+  unsafe fn destroy(handle: ?*mut u8) -> () {
+    if Pointer.isNull<u8>(handle) {
+      return ()
+    }
+    unsafe {
+      let state = Pointer.read<Accounting>(accounting(handle))
+      let mut cursor = state.head
+      while Pointer.isNull<Reservation>(cursor) == false {
+        let node = reservation(cursor)
+        let next = Pointer.read<Reservation>(node).next
+        free(bytes<Reservation>(node))
+        cursor = next
+      }
+      free(handle)
+    }
+  }
+  unsafe fn acquire(handle: ?*mut u8, size: usize, alignment: usize) -> ?*mut u8 {
+    if size == 0 || alignment == 0 {
+      return Pointer.null<u8>()
+    }
+    if (alignment & (alignment - 1)) != 0 {
+      return Pointer.null<u8>()
+    }
+    let header = Layout.of<Reservation>().bytes
+    let padding = alignment - 1
+    if padding > usize.MAX - header {
+      return Pointer.null<u8>()
+    }
+    let overhead = header + padding
+    if size > usize.MAX - overhead {
+      return Pointer.null<u8>()
+    }
+    let charged = size + overhead
+    unsafe {
+      let pointer = accounting(handle)
+      let mut state = Pointer.read<Accounting>(pointer)
+      if state.used > state.limit || charged > state.limit - state.used {
+        return Pointer.null<u8>()
+      }
+      let allocation = malloc(charged)
+      if Pointer.isNull<u8>(allocation) {
+        return Pointer.null<u8>()
+      }
+      let base = Intrinsic.pointerRequalify<?*mut u8, [*]mut u8>(allocation)
+      let afterHeader = Pointer.atMut<u8>(base, header)
+      let remainder = Pointer.address<u8>(afterHeader) % alignment
+      let mut adjustment: usize = 0
+      if remainder != 0 {
+        adjustment = alignment - remainder
+      }
+      let payload = Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(
+        Pointer.atMut<u8>(base, header + adjustment),
+      )
+      let node = Intrinsic.pointerReinterpret<?*mut u8, ?*mut Reservation>(allocation)
+      Pointer.write<Reservation>(
+        reservation(node),
+        Reservation {next: state.head, payload: payload, charged: charged},
+      )
+      state.head = node
+      state.used = state.used + charged
+      Pointer.write<Accounting>(pointer, state)
+      return payload
+    }
+  }
+  unsafe fn release(handle: ?*mut u8, payload: ?*mut u8) -> () {
+    unsafe {
+      let pointer = accounting(handle)
+      let mut state = Pointer.read<Accounting>(pointer)
+      let mut cursor = state.head
+      let mut previous = Pointer.null<Reservation>()
+      while Pointer.isNull<Reservation>(cursor) == false {
+        let node = reservation(cursor)
+        let value = Pointer.read<Reservation>(node)
+        if Pointer.address<u8>(value.payload) == Pointer.address<u8>(payload) {
+          if Pointer.isNull<Reservation>(previous) {
+            state.head = value.next
+          } else {
+            let before = reservation(previous)
+            let mut link = Pointer.read<Reservation>(before)
+            link.next = value.next
+            Pointer.write<Reservation>(before, link)
+          }
+          state.used = state.used - value.charged
+          Pointer.write<Accounting>(pointer, state)
+          free(bytes<Reservation>(node))
+          return ()
+        }
+        previous = cursor
+        cursor = value.next
+      }
+    }
+  }
+  impl ExecutionStorage {
+    /// Creates an independent state whose frame reservations can charge at most `limit` bytes.
+    ///
+    /// # Details
+    ///
+    /// Charges include each reservation header and alignment padding. The fixed state allocation
+    /// is excluded. Refusal acquires no state and reports OutOfMemoryError.
+    pub effect fn make(limit: usize) -> ExecutionStorage ! OutOfMemoryError {
+      let handle = unsafe malloc(Layout.of<Accounting>().bytes)
+      if Pointer.isNull<u8>(handle) {
+        fail OutOfMemoryError {}
+      }
+      unsafe {
+        Pointer.write<Accounting>(
+          accounting(handle),
+          Accounting {head: Pointer.null<Reservation>(), used: 0, limit: limit},
+        )
+      }
+      return ExecutionStorage {handle: handle}
+    }
+    /// Returns the bytes charged to this state's current frame reservations.
+    pub fn used(self: &ExecutionStorage) -> usize {
+      unsafe {
+        return Pointer.read<Accounting>(accounting(self.handle)).used
+      }
+    }
+    /// Acquires a fixed-address frame or returns null without retaining a partial reservation.
+    ///
+    /// # Gotchas
+    ///
+    /// The caller must initialize bytes before reading, obey the requested extent, and stop using
+    /// the pointer before release or state destruction. A zero size or invalid alignment returns
+    /// null.
+    pub unsafe fn acquire(self: &mut ExecutionStorage, size: usize, alignment: usize) -> ?*mut u8 {
+      unsafe {
+        return acquire(self.handle, size, alignment)
+      }
+    }
+    /// Releases one frame acquired from this state and removes its charge.
+    ///
+    /// # Gotchas
+    ///
+    /// The caller must finish semantic cleanup and stop every access before releasing the frame.
+    pub unsafe fn release(self: &mut ExecutionStorage, frame: ?*mut u8) -> () {
+      unsafe {
+        return release(self.handle, frame)
+      }
+    }
+  }
+  effect fn createDefault() -> ?*mut u8 ! OutOfMemoryError {
+    let mut owner = run ExecutionStorage.make(usize.MAX)
+    return Intrinsic.replace(owner.handle, Pointer.null<u8>())
+  }
+  effect fn refused(error: OutOfMemoryError) -> ?*mut u8 {
+    return Pointer.null<u8>()
+  }
+  /// Acquires the default component's independent, explicitly unlimited storage state.
+  export "C" fn silk_execution_storage_create() -> ?*mut u8 {
+    return run Effect.catchAll(createDefault(), refused)
+  }
+  /// Acquires a frame for a live state previously returned by the component's create operation.
+  export "C" fn silk_execution_storage_acquire(state: ?*mut u8, size: usize, alignment: usize) -> ?*mut u8 {
+    unsafe {
+      return acquire(state, size, alignment)
+    }
+  }
+  /// Releases a frame after compiler-owned semantic cleanup has completed.
+  export "C" fn silk_execution_storage_release(state: ?*mut u8, frame: ?*mut u8) -> () {
+    unsafe {
+      return release(state, frame)
+    }
+  }
+  /// Destroys a state after the compiler has released every semantically live frame.
+  export "C" fn silk_execution_storage_destroy(state: ?*mut u8) -> () {
+    unsafe {
+      return destroy(state)
+    }
+  }
+}

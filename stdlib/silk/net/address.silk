@@ -1,0 +1,1222 @@
+//! IP addresses, ports, endpoints, and the host of a URI, as checked values that do not allocate.
+//!
+//! # When to use
+//! Use [`Host.parse`] on the host of a URI. It returns a domain name, an IPv4 address, or an IPv6
+//! address. Give the result to `silk.net.resolver` to get endpoints, and keep it to check the identity
+//! of an HTTPS server. Use [`Ipv4Address`], [`Ipv6Address`], [`Port`], and [`Endpoint`] when you
+//! already have a numeric address.
+//!
+//! # Details
+//! Addresses store their bytes in network order. A [`DomainHost`] keeps the spelling of its input
+//! in a fixed buffer of 253 bytes, and compares without case. The `formatInto` functions write the
+//! canonical text into a buffer that you give. IPv6 text uses the short lowercase form of RFC 5952,
+//! for example `2001:db8::1`.
+//!
+//! # Errors
+//! - [`AddressError`] tells which rule failed, and the byte offset where it failed.
+//!
+//! # Gotchas
+//! Only plain ASCII domains are accepted. Convert an internationalized name to its `xn--` form
+//! first. These forms fail: a trailing dot, percent escapes, an IPv6 zone such as `%eth0`,
+//! IPvFuture, user information, a port, and old IPv4 forms such as `127.1` or `0x7f.0.0.1`.
+//!
+//! # Examples
+//! ## Parse hosts and format an address
+//! ```silk
+//! import silk.net.address { AddressError, Host, Ipv6Address, Port }
+//! import silk.core.result { Result }
+//!
+//! pub fn main() -> i32 {
+//!   let host = match Host.parse("[2001:DB8:0:0::1]") {
+//!     Result<Host, AddressError>.Success { value } => value
+//!     Result<Host, AddressError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let address = match host {
+//!     Host.Ipv6 { value } => value
+//!     _ => {
+//!       return 1
+//!     }
+//!   }
+//!   let mut text: [u8; 64] = [0; 64]
+//!   let length = match Ipv6Address.formatInto(&address, &mut text) {
+//!     Result<usize, AddressError>.Success { value } => value
+//!     Result<usize, AddressError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!
+//!   // The canonical form is "2001:db8::1".
+//!   if length != 11 || text[0] != 50 || text[9] != 58 || text[10] != 49 {
+//!     return 1
+//!   }
+//!   let failed = match Port.make(70000) {
+//!     Result<Port, AddressError>.Success { value: _ } => false
+//!     Result<Port, AddressError>.Failure { error: AddressError.InvalidPort { value } } => value
+//!       == 70000
+//!     Result<Port, AddressError>.Failure { error: _ } => false
+//!   }
+//!   if !failed {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Networking
+
+import silk.text.format {Debug, Display, Format, Formatter}
+import silk.core.option {Option}
+import silk.core.ownership {Copy}
+import silk.core.result {Result}
+import silk.collections.slice {Slice}
+import silk.text.string {String}
+import silk.num.u16
+import silk.num.u8
+import silk.num.usize
+import silk.io.writer {Writer, WriterError}
+
+/// The rule that rejected an IP address. [`AddressError.InvalidAddress`] carries it, with the byte
+/// offset where the check failed.
+pub enum AddressReason {
+  /// The numeric address input is empty.
+  Empty,
+  /// An input byte is not admitted in this position.
+  InvalidCharacter,
+  /// An address component has invalid syntax.
+  InvalidComponent,
+  /// An IPv4 part has a leading zero, as in `010`. The old octal form is not accepted.
+  LeadingZero,
+  /// An address component exceeds its numeric range.
+  ComponentOverflow,
+  /// The address has the wrong number of parts: IPv4 needs 4, and IPv6 needs 8 or `::`.
+  WrongComponentCount,
+  /// The IPv6 text has `::` more than one time.
+  MultipleCompression,
+  /// The IPv6 text has `::` together with all 8 parts, so `::` replaces nothing.
+  CompressionWithoutOmission,
+}
+
+impl Debug for AddressReason {
+  /// Writes the name of the variant, such as `Empty`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      AddressReason.Empty => run Format.write(&mut formatter, b"Empty")
+      AddressReason.InvalidCharacter => run Format.write(&mut formatter, b"InvalidCharacter")
+      AddressReason.InvalidComponent => run Format.write(&mut formatter, b"InvalidComponent")
+      AddressReason.LeadingZero => run Format.write(&mut formatter, b"LeadingZero")
+      AddressReason.ComponentOverflow => run Format.write(&mut formatter, b"ComponentOverflow")
+      AddressReason.WrongComponentCount => run Format.write(&mut formatter, b"WrongComponentCount")
+      AddressReason.MultipleCompression => run Format.write(&mut formatter, b"MultipleCompression")
+      AddressReason.CompressionWithoutOmission => run Format.write(&mut formatter, b"CompressionWithoutOmission")
+    }
+  }
+}
+
+/// The rule that rejected a domain name. [`AddressError.InvalidHost`] carries it, with the byte
+/// offset where the check failed.
+pub enum HostReason {
+  /// The domain name is empty.
+  EmptyName,
+  /// The name is longer than 253 bytes.
+  NameTooLong,
+  /// A domain label is empty.
+  EmptyLabel,
+  /// A label, the part between two dots, is longer than 63 bytes.
+  LabelTooLong,
+  /// The domain contains a NUL byte.
+  Nul,
+  /// The domain contains a non-ASCII byte.
+  NonAscii,
+  /// An input byte is not admitted in this position.
+  InvalidCharacter,
+  /// A domain label begins or ends with a hyphen.
+  EdgeHyphen,
+  /// A label that starts with `xn--` is not a valid Punycode label.
+  InvalidALabel,
+  /// The name ends with a dot, as in `example.com.`.
+  TrailingDot,
+  /// The last label has only digits, so the name looks like an IPv4 address.
+  NumericFinalLabel,
+}
+
+impl Debug for HostReason {
+  /// Writes the name of the variant, such as `EmptyName`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      HostReason.EmptyName => run Format.write(&mut formatter, b"EmptyName")
+      HostReason.NameTooLong => run Format.write(&mut formatter, b"NameTooLong")
+      HostReason.EmptyLabel => run Format.write(&mut formatter, b"EmptyLabel")
+      HostReason.LabelTooLong => run Format.write(&mut formatter, b"LabelTooLong")
+      HostReason.Nul => run Format.write(&mut formatter, b"Nul")
+      HostReason.NonAscii => run Format.write(&mut formatter, b"NonAscii")
+      HostReason.InvalidCharacter => run Format.write(&mut formatter, b"InvalidCharacter")
+      HostReason.EdgeHyphen => run Format.write(&mut formatter, b"EdgeHyphen")
+      HostReason.InvalidALabel => run Format.write(&mut formatter, b"InvalidALabel")
+      HostReason.TrailingDot => run Format.write(&mut formatter, b"TrailingDot")
+      HostReason.NumericFinalLabel => run Format.write(&mut formatter, b"NumericFinalLabel")
+    }
+  }
+}
+
+/// A host form that is valid in a URI, but that this module does not accept.
+pub enum UnsupportedHostForm {
+  /// The host uses unsupported IPvFuture syntax.
+  IpvFuture,
+  /// The IPv6 host has a zone, as in `[fe80::1%25eth0]`.
+  ZoneIdentifier,
+  /// The host contains unsupported percent escapes.
+  EscapedHost,
+  /// The input has user information, as in `user@host`. Give only the host.
+  UserInfo,
+  /// The input has a port, as in `host:80`. Give only the host.
+  PortDelimiter,
+  /// The input has `/`, `?`, or `#`. Give only the host.
+  UriDelimiter,
+}
+
+impl Debug for UnsupportedHostForm {
+  /// Writes the name of the variant, such as `IpvFuture`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      UnsupportedHostForm.IpvFuture => run Format.write(&mut formatter, b"IpvFuture")
+      UnsupportedHostForm.ZoneIdentifier => run Format.write(&mut formatter, b"ZoneIdentifier")
+      UnsupportedHostForm.EscapedHost => run Format.write(&mut formatter, b"EscapedHost")
+      UnsupportedHostForm.UserInfo => run Format.write(&mut formatter, b"UserInfo")
+      UnsupportedHostForm.PortDelimiter => run Format.write(&mut formatter, b"PortDelimiter")
+      UnsupportedHostForm.UriDelimiter => run Format.write(&mut formatter, b"UriDelimiter")
+    }
+  }
+}
+
+/// The error from parsing, checking, or formatting a value in this module.
+pub union AddressError {
+  /// The IP address text is not valid.
+  InvalidAddress {
+    /// The rule that failed.
+    pub reason: AddressReason,
+    /// The zero-based byte offset of the rejected input.
+    pub offset: usize,
+  },
+  /// The domain name is not valid.
+  InvalidHost {
+    /// The rule that failed.
+    pub reason: HostReason,
+    /// The zero-based byte offset of the rejected input.
+    pub offset: usize,
+  },
+  /// The port number is more than 65535.
+  InvalidPort {
+    /// The number that you gave.
+    pub value: usize,
+  },
+  /// The host uses a form that this module does not accept.
+  UnsupportedForm {
+    /// The form that was found.
+    pub form: UnsupportedHostForm,
+    /// The zero-based byte offset of the rejected input.
+    pub offset: usize,
+  },
+  /// The output buffer is too small. Nothing was written.
+  OutputTooSmall {
+    /// The number of bytes that the text needs.
+    pub required: usize,
+    /// The length of the buffer that you gave.
+    pub available: usize,
+  },
+}
+
+impl Debug for AddressError {
+  /// Writes the name of the variant and its fields, such as `InvalidAddress { ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      AddressError.InvalidAddress { reason, offset } => {
+        let mut record = run Format.debugRecord("InvalidAddress", &mut formatter)
+        run Format.debugField(&mut record, "reason", &reason, &mut formatter)
+        run Format.debugField(&mut record, "offset", &offset, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      AddressError.InvalidHost { reason, offset } => {
+        let mut record = run Format.debugRecord("InvalidHost", &mut formatter)
+        run Format.debugField(&mut record, "reason", &reason, &mut formatter)
+        run Format.debugField(&mut record, "offset", &offset, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      AddressError.InvalidPort { value } => {
+        let mut record = run Format.debugRecord("InvalidPort", &mut formatter)
+        run Format.debugField(&mut record, "value", &value, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      AddressError.UnsupportedForm { form, offset } => {
+        let mut record = run Format.debugRecord("UnsupportedForm", &mut formatter)
+        run Format.debugField(&mut record, "form", &form, &mut formatter)
+        run Format.debugField(&mut record, "offset", &offset, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      AddressError.OutputTooSmall { required, available } => {
+        let mut record = run Format.debugRecord("OutputTooSmall", &mut formatter)
+        run Format.debugField(&mut record, "required", &required, &mut formatter)
+        run Format.debugField(&mut record, "available", &available, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+    }
+  }
+}
+
+/// An IPv4 address, as 4 bytes in network order.
+pub struct Ipv4Address {
+  octetsValue: [u8; 4],
+}
+
+/// An IPv6 address, as 16 bytes in network order.
+pub struct Ipv6Address {
+  octetsValue: [u8; 16],
+}
+
+/// An IPv4 or an IPv6 address.
+pub union IpAddress {
+  /// An IPv4 address.
+  V4 {
+    /// The four network-order IPv4 octets.
+    pub value: Ipv4Address,
+  },
+  /// An IPv6 address.
+  V6 {
+    /// The sixteen network-order IPv6 octets.
+    pub value: Ipv6Address,
+  },
+}
+
+/// A TCP or UDP port, from 0 to 65535. Port 0 is accepted, for example to let the system choose the
+/// port of a listener.
+pub struct Port {
+  valueBits: u16,
+}
+
+/// An IP address and a port that you can connect to.
+pub struct Endpoint {
+  addressValue: IpAddress,
+  portValue: Port,
+}
+
+/// A checked ASCII domain name, such as `example.com`. It keeps the spelling of its input, and
+/// compares without case.
+///
+/// It stores the name in a fixed buffer of 253 bytes and does not allocate. Only plain ASCII names
+/// are accepted. Convert an internationalized name to its `xn--` form first.
+pub struct DomainHost {
+  bytesValue: [u8; 253],
+  lengthValue: usize,
+}
+
+/// The host of a URI: a domain name, an IPv4 address, or an IPv6 address. Make it with
+/// [`Host.parse`].
+pub union Host {
+  /// A validated ASCII domain host.
+  Domain {
+    /// The domain name, spelled as in the input.
+    pub value: DomainHost,
+  },
+  /// An owned IPv4 origin host.
+  Ipv4 {
+    /// The four network-order IPv4 octets.
+    pub value: Ipv4Address,
+  },
+  /// An owned IPv6 origin host.
+  Ipv6 {
+    /// The sixteen network-order IPv6 octets.
+    pub value: Ipv6Address,
+  },
+}
+
+/// The namespace of this module. The functions are on the value types.
+pub struct NetworkAddress {}
+
+impl Copy for AddressError {}
+impl Copy for Ipv4Address {}
+impl Copy for Ipv6Address {}
+impl Copy for IpAddress {}
+impl Copy for Port {}
+impl Copy for Endpoint {}
+impl Copy for DomainHost {}
+impl Copy for Host {}
+
+fn invalidAddress(reason: AddressReason, offset: usize) -> AddressError {
+  return AddressError.InvalidAddress {reason: reason, offset: offset}
+}
+
+fn invalidHost(reason: HostReason, offset: usize) -> AddressError {
+  return AddressError.InvalidHost {reason: reason, offset: offset}
+}
+
+fn unsupported(form: UnsupportedHostForm, offset: usize) -> AddressError {
+  return AddressError.UnsupportedForm {form: form, offset: offset}
+}
+
+fn zeroDomainBytes() -> [u8; 253] { return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
+fn zeroGroups() -> [u16; 8] { return [0, 0, 0, 0, 0, 0, 0, 0] }
+fn zeroIpv4Text() -> [u8; 15] { return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
+fn zeroIpv6Text() -> [u8; 39] { return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
+
+fn isDecimal(value: u8) -> bool { return value >= 48 && value <= 57 }
+fn isHex(value: u8) -> bool {
+  return isDecimal(value) || (value >= 65 && value <= 70) || (value >= 97 && value <= 102)
+}
+fn hexValue(value: u8) -> u16 {
+  if value <= 57 { return u8.toU16(value - 48) }
+  if value <= 70 { return u8.toU16(value - 65 + 10) }
+  return u8.toU16(value - 97 + 10)
+}
+fn folded(value: u8) -> u8 {
+  if value >= 65 && value <= 90 { return value + 32 }
+  return value
+}
+fn isLdh(value: u8) -> bool {
+  return (value >= 65 && value <= 90) || (value >= 97 && value <= 122) || isDecimal(value) || value == 45
+}
+
+fn punycodeDigit(value: u8) -> usize {
+  let normalized = folded(value)
+  if normalized >= 97 && normalized <= 122 { return u8.toUsize(normalized - 97) }
+  if normalized >= 48 && normalized <= 57 { return u8.toUsize(normalized - 48 + 26) }
+  return 36
+}
+
+fn punycodeThreshold(k: usize, bias: usize) -> usize {
+  if k <= bias { return usize.ONE }
+  let offset = k - bias
+  if offset >= 26 { return 26 }
+  return offset
+}
+
+fn adaptPunycodeBias(deltaValue: usize, points: usize, first: bool) -> Option<usize> {
+  let mut delta = deltaValue / 2
+  if first { delta = deltaValue / 700 }
+  delta = match move usize.checkedAdd(delta, delta / points) {
+    Option<usize>.None => { return Option<usize>.none() }
+    Option<usize>.Some {value} => value
+  }
+  let mut scale = usize.ZERO
+  while delta > 455 {
+    delta = delta / 35
+    scale = match move usize.checkedAdd(scale, 36) {
+      Option<usize>.None => { return Option<usize>.none() }
+      Option<usize>.Some {value} => value
+    }
+  }
+  let numerator = match move usize.checkedMultiply(36, delta) {
+    Option<usize>.None => { return Option<usize>.none() }
+    Option<usize>.Some {value} => value
+  }
+  return usize.checkedAdd(scale, numerator / (delta + 38))
+}
+
+// This checks the RFC 3492 bootstring payload carried by an ASCII `xn--` label. DomainHost does
+// not perform Unicode mapping or the IDNA contextual, bidirectional, or code-point-table checks.
+fn validALabel(bytes: &[u8], start: usize, end: usize) -> bool {
+  let payload = start + 4
+  if payload >= end { return false }
+  let mut delimiter = end
+  let mut scan = payload
+  while scan < end {
+    if bytes[scan] == 45 { delimiter = scan }
+    scan = scan + usize.ONE
+  }
+  let mut outputLength = usize.ZERO
+  let mut cursor = payload
+  if delimiter < end {
+    if delimiter == payload || delimiter + usize.ONE >= end { return false }
+    outputLength = delimiter - payload
+    cursor = delimiter + usize.ONE
+  }
+  let mut codePoint: usize = 128
+  let mut insertion = usize.ZERO
+  let mut bias: usize = 72
+  let mut decoded = false
+  while cursor < end {
+    let oldInsertion = insertion
+    let mut weight = usize.ONE
+    let mut k: usize = 36
+    while true {
+      if cursor >= end { return false }
+      let digit = punycodeDigit(bytes[cursor])
+      if digit >= 36 { return false }
+      cursor = cursor + usize.ONE
+      let weighted = match move usize.checkedMultiply(digit, weight) {
+        Option<usize>.None => { return false }
+        Option<usize>.Some {value} => value
+      }
+      insertion = match move usize.checkedAdd(insertion, weighted) {
+        Option<usize>.None => { return false }
+        Option<usize>.Some {value} => value
+      }
+      let threshold = punycodeThreshold(k, bias)
+      if digit < threshold { break }
+      weight = match move usize.checkedMultiply(weight, 36 - threshold) {
+        Option<usize>.None => { return false }
+        Option<usize>.Some {value} => value
+      }
+      k = match move usize.checkedAdd(k, 36) {
+        Option<usize>.None => { return false }
+        Option<usize>.Some {value} => value
+      }
+    }
+    outputLength = match move usize.checkedAdd(outputLength, usize.ONE) {
+      Option<usize>.None => { return false }
+      Option<usize>.Some {value} => value
+    }
+    bias = match move adaptPunycodeBias(insertion - oldInsertion, outputLength, oldInsertion == usize.ZERO) {
+      Option<usize>.None => { return false }
+      Option<usize>.Some {value} => value
+    }
+    codePoint = match move usize.checkedAdd(codePoint, insertion / outputLength) {
+      Option<usize>.None => { return false }
+      Option<usize>.Some {value} => value
+    }
+    if codePoint > 1114111 || (codePoint >= 55296 && codePoint <= 57343) { return false }
+    insertion = match move usize.checkedAdd(insertion % outputLength, usize.ONE) {
+      Option<usize>.None => { return false }
+      Option<usize>.Some {value} => value
+    }
+    decoded = true
+  }
+  return decoded
+}
+struct ParsedIpv4 {
+  value: Ipv4Address,
+  next: usize,
+}
+
+fn parseIpv4Range(bytes: &[u8], start: usize, end: usize) -> Result<ParsedIpv4, AddressError> {
+  if start >= end {
+    return Result<ParsedIpv4, AddressError>.failResult(invalidAddress(AddressReason.Empty, start))
+  }
+  let mut parts: [u8; 4] = [0, 0, 0, 0]
+  let mut component = usize.ZERO
+  let mut at = start
+  while component < 4 {
+    if at >= end {
+      return Result<ParsedIpv4, AddressError>.failResult(invalidAddress(AddressReason.WrongComponentCount, at))
+    }
+    let first = at
+    let mut value: u16 = 0
+    let mut digits = usize.ZERO
+    while at < end && bytes[at] != 46 {
+      let byte = bytes[at]
+      if !isDecimal(byte) {
+        return Result<ParsedIpv4, AddressError>.failResult(invalidAddress(AddressReason.InvalidCharacter, at))
+      }
+      if digits == usize.ZERO && byte == 48 && at + usize.ONE < end && bytes[at + usize.ONE] != 46 {
+        return Result<ParsedIpv4, AddressError>.failResult(invalidAddress(AddressReason.LeadingZero, at))
+      }
+      value = value * 10 + u8.toU16(byte - 48)
+      if value > 255 {
+        return Result<ParsedIpv4, AddressError>.failResult(invalidAddress(AddressReason.ComponentOverflow, first))
+      }
+      digits = digits + usize.ONE
+      at = at + usize.ONE
+    }
+    if digits == usize.ZERO {
+      return Result<ParsedIpv4, AddressError>.failResult(invalidAddress(AddressReason.InvalidComponent, first))
+    }
+    parts[component] = u16.toU8(value)
+    component = component + usize.ONE
+    if component < 4 {
+      if at >= end || bytes[at] != 46 {
+        return Result<ParsedIpv4, AddressError>.failResult(invalidAddress(AddressReason.WrongComponentCount, at))
+      }
+      at = at + usize.ONE
+    }
+  }
+  if at != end {
+    return Result<ParsedIpv4, AddressError>.failResult(invalidAddress(AddressReason.WrongComponentCount, at))
+  }
+  return Result<ParsedIpv4, AddressError>.succeed(ParsedIpv4 {
+    value: Ipv4Address {octetsValue: move parts},
+    next: at,
+  })
+}
+
+struct SectionCount { value: usize }
+impl Copy for SectionCount {}
+
+fn parseIpv6Section(
+  bytes: &[u8],
+  start: usize,
+  end: usize,
+  output: &mut [u16],
+  allowIpv4: bool,
+) -> Result<SectionCount, AddressError> {
+  if start == end { return Result<SectionCount, AddressError>.succeed(SectionCount {value: usize.ZERO}) }
+  let mut count = usize.ZERO
+  let mut at = start
+  while at < end {
+    if count >= output.length {
+      return Result<SectionCount, AddressError>.failResult(invalidAddress(AddressReason.WrongComponentCount, at))
+    }
+    let tokenStart = at
+    let mut tokenEnd = at
+    let mut dotted = false
+    while tokenEnd < end && bytes[tokenEnd] != 58 {
+      if bytes[tokenEnd] == 46 { dotted = true }
+      tokenEnd = tokenEnd + usize.ONE
+    }
+    if tokenEnd == tokenStart {
+      return Result<SectionCount, AddressError>.failResult(invalidAddress(AddressReason.InvalidComponent, tokenStart))
+    }
+    if dotted {
+      if !allowIpv4 || tokenEnd != end || count + 2 > output.length {
+        return Result<SectionCount, AddressError>.failResult(invalidAddress(AddressReason.InvalidComponent, tokenStart))
+      }
+      let parsed = parseIpv4Range(bytes, tokenStart, tokenEnd)
+      let address = match move parsed {
+        Result<ParsedIpv4, AddressError>.Failure {error} => {
+          return Result<SectionCount, AddressError>.failResult(move error)
+        }
+        Result<ParsedIpv4, AddressError>.Success {value} => value.value
+      }
+      let octets = Ipv4Address.octets(&address)
+      output[count] = u8.toU16(octets[0]) * 256 + u8.toU16(octets[1])
+      output[count + usize.ONE] = u8.toU16(octets[2]) * 256 + u8.toU16(octets[3])
+      count = count + 2
+    } else {
+      let length = tokenEnd - tokenStart
+      if length == usize.ZERO || length > 4 {
+        return Result<SectionCount, AddressError>.failResult(invalidAddress(AddressReason.InvalidComponent, tokenStart))
+      }
+      let mut value: u16 = 0
+      let mut cursor = tokenStart
+      while cursor < tokenEnd {
+        if !isHex(bytes[cursor]) {
+          return Result<SectionCount, AddressError>.failResult(invalidAddress(AddressReason.InvalidCharacter, cursor))
+        }
+        value = value * 16 + hexValue(bytes[cursor])
+        cursor = cursor + usize.ONE
+      }
+      output[count] = value
+      count = count + usize.ONE
+    }
+    if tokenEnd < end {
+      at = tokenEnd + usize.ONE
+      if at == end {
+        return Result<SectionCount, AddressError>.failResult(invalidAddress(AddressReason.InvalidComponent, tokenEnd))
+      }
+    } else {
+      at = end
+    }
+  }
+  return Result<SectionCount, AddressError>.succeed(SectionCount {value: count})
+}
+
+impl Ipv4Address {
+  /// Returns the IPv4 address with these 4 bytes, in network order.
+  pub fn fromOctets(octets: [u8; 4]) -> Ipv4Address {
+    return Ipv4Address {octetsValue: move octets}
+  }
+
+  /// Parses decimal dotted text, such as `192.0.2.1`. Each part is 0 to 255 without leading zeros.
+  pub fn parse(text: string) -> Result<Ipv4Address, AddressError> {
+    return Ipv4Address.parseBytes(String.utf8Bytes(text))
+  }
+
+  /// Parses decimal dotted text, such as `192.0.2.1`. Each part is 0 to 255 without leading zeros.
+  ///
+  /// # When to use
+  /// Use it for text that you have as bytes, such as part of a request you read. For a `string`,
+  /// use `Ipv4Address.parse`.
+  pub fn parseBytes(bytes: &[u8]) -> Result<Ipv4Address, AddressError> {
+    let parsed = parseIpv4Range(bytes, usize.ZERO, bytes.length)
+    return match move parsed {
+      Result<ParsedIpv4, AddressError>.Failure {error} => Result<Ipv4Address, AddressError>.failResult(move error)
+      Result<ParsedIpv4, AddressError>.Success {value} => Result<Ipv4Address, AddressError>.succeed(value.value)
+    }
+  }
+
+  /// Returns the owned network-order octets by value.
+  pub fn octets(self: &Self) -> [u8; 4] { return self.octetsValue }
+
+  /// Reports exact binary equality.
+  pub fn equals(self: &Self, other: &Self) -> bool {
+    let left = self.octetsValue
+    let right = other.octetsValue
+    return left[0] == right[0] && left[1] == right[1] && left[2] == right[2] && left[3] == right[3]
+  }
+
+  /// Writes the canonical text to the start of `output`, and returns its length. If `output` is too
+  /// small, it writes nothing and returns `OutputTooSmall`.
+  pub fn formatInto(self: &Self, output: &mut [u8]) -> Result<usize, AddressError> {
+    let mut staged = zeroIpv4Text()
+    let octets = self.octetsValue
+    let mut cursor = usize.ZERO
+    let mut index = usize.ZERO
+    while index < 4 {
+      if index > usize.ZERO {
+        staged[cursor] = 46
+        cursor = cursor + usize.ONE
+      }
+      cursor = writeDecimalU16(u8.toU16(octets[index]), &mut staged, cursor)
+      index = index + usize.ONE
+    }
+    if output.length < cursor {
+      return Result<usize, AddressError>.failResult(AddressError.OutputTooSmall {required: cursor, available: output.length})
+    }
+    index = usize.ZERO
+    while index < cursor {
+      output[index] = staged[index]
+      index = index + usize.ONE
+    }
+    return Result<usize, AddressError>.succeed(cursor)
+  }
+}
+
+impl Ipv6Address {
+  /// Returns the IPv6 address with these 16 bytes, in network order.
+  pub fn fromOctets(octets: [u8; 16]) -> Ipv6Address {
+    return Ipv6Address {octetsValue: move octets}
+  }
+
+  /// Parses hexadecimal IPv6 text, such as `2001:db8::1`, without brackets or a zone. A dotted IPv4
+  /// end, as in `::ffff:192.0.2.1`, is not accepted.
+  pub fn parse(text: string) -> Result<Ipv6Address, AddressError> {
+    return Ipv6Address.parseBytes(String.utf8Bytes(text))
+  }
+
+  /// Parses hexadecimal IPv6 text, such as `2001:db8::1`, without brackets or a zone. A dotted IPv4
+  /// end, as in `::ffff:192.0.2.1`, is not accepted.
+  ///
+  /// # When to use
+  /// Use it for text that you have as bytes, such as part of a request you read. For a `string`,
+  /// use `Ipv6Address.parse`.
+  pub fn parseBytes(bytes: &[u8]) -> Result<Ipv6Address, AddressError> {
+    if bytes.length == usize.ZERO {
+      return Result<Ipv6Address, AddressError>.failResult(invalidAddress(AddressReason.Empty, usize.ZERO))
+    }
+    let mut compression = bytes.length
+    let mut index = usize.ZERO
+    while index + usize.ONE < bytes.length {
+      if bytes[index] == 58 && bytes[index + usize.ONE] == 58 {
+        if compression != bytes.length {
+          return Result<Ipv6Address, AddressError>.failResult(invalidAddress(AddressReason.MultipleCompression, index))
+        }
+        compression = index
+        index = index + 2
+      } else {
+        index = index + usize.ONE
+      }
+    }
+    let mut left = zeroGroups()
+    let mut right = zeroGroups()
+    let leftEnd = compression
+    let mut rightStart = bytes.length
+    if compression != bytes.length { rightStart = compression + 2 }
+    let leftCountResult = parseIpv6Section(bytes, usize.ZERO, leftEnd, &mut left, compression == bytes.length)
+    let leftCount = match move leftCountResult {
+      Result<SectionCount, AddressError>.Failure {error} => {
+        return Result<Ipv6Address, AddressError>.failResult(move error)
+      }
+      Result<SectionCount, AddressError>.Success {value} => value.value
+    }
+    let rightCountResult = parseIpv6Section(bytes, rightStart, bytes.length, &mut right, true)
+    let rightCount = match move rightCountResult {
+      Result<SectionCount, AddressError>.Failure {error} => {
+        return Result<Ipv6Address, AddressError>.failResult(move error)
+      }
+      Result<SectionCount, AddressError>.Success {value} => value.value
+    }
+    let groupCount: usize = 8
+    if compression == bytes.length {
+      if leftCount != groupCount {
+        return Result<Ipv6Address, AddressError>.failResult(invalidAddress(AddressReason.WrongComponentCount, bytes.length))
+      }
+    } else {
+      if leftCount + rightCount >= groupCount {
+        return Result<Ipv6Address, AddressError>.failResult(invalidAddress(AddressReason.CompressionWithoutOmission, compression))
+      }
+    }
+    let mut groups = zeroGroups()
+    index = usize.ZERO
+    while index < leftCount {
+      groups[index] = left[index]
+      index = index + usize.ONE
+    }
+    index = usize.ZERO
+    while index < rightCount {
+      groups[groupCount - rightCount + index] = right[index]
+      index = index + usize.ONE
+    }
+    let mut octets: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    index = usize.ZERO
+    while index < groupCount {
+      octets[index * 2] = u16.toU8(groups[index] / 256)
+      octets[index * 2 + usize.ONE] = u16.toU8(groups[index] % 256)
+      index = index + usize.ONE
+    }
+    return Result<Ipv6Address, AddressError>.succeed(Ipv6Address {octetsValue: move octets})
+  }
+
+  /// Returns the owned network-order octets by value.
+  pub fn octets(self: &Self) -> [u8; 16] { return self.octetsValue }
+
+  /// Reports exact binary equality.
+  pub fn equals(self: &Self, other: &Self) -> bool {
+    let left = self.octetsValue
+    let right = other.octetsValue
+    let mut index = usize.ZERO
+    while index < 16 {
+      if left[index] != right[index] { return false }
+      index = index + usize.ONE
+    }
+    return true
+  }
+
+  /// Writes the canonical lowercase text, such as `2001:db8::1`, to the start of `output`, and
+  /// returns its length. If `output` is too small, it writes nothing and returns `OutputTooSmall`.
+  pub fn formatInto(self: &Self, output: &mut [u8]) -> Result<usize, AddressError> {
+    let octets = self.octetsValue
+    let mut groups = zeroGroups()
+    let mut index = usize.ZERO
+    while index < 8 {
+      groups[index] = u8.toU16(octets[index * 2]) * 256 + u8.toU16(octets[index * 2 + usize.ONE])
+      index = index + usize.ONE
+    }
+    let mut bestStart: usize = 8
+    let mut bestLength = usize.ZERO
+    index = usize.ZERO
+    while index < 8 {
+      if groups[index] == 0 {
+        let start = index
+        while index < 8 && groups[index] == 0 { index = index + usize.ONE }
+        let length = index - start
+        if length >= 2 && length > bestLength {
+          bestStart = start
+          bestLength = length
+        }
+      } else {
+        index = index + usize.ONE
+      }
+    }
+    let mut staged = zeroIpv6Text()
+    let mut cursor = usize.ZERO
+    index = usize.ZERO
+    while index < 8 {
+      if index == bestStart {
+        staged[cursor] = 58
+        staged[cursor + usize.ONE] = 58
+        cursor = cursor + 2
+        index = index + bestLength
+      } else {
+        if cursor > usize.ZERO && staged[cursor - usize.ONE] != 58 {
+          staged[cursor] = 58
+          cursor = cursor + usize.ONE
+        }
+        cursor = writeHexU16(groups[index], &mut staged, cursor)
+        index = index + usize.ONE
+      }
+    }
+    if output.length < cursor {
+      return Result<usize, AddressError>.failResult(AddressError.OutputTooSmall {required: cursor, available: output.length})
+    }
+    index = usize.ZERO
+    while index < cursor {
+      output[index] = staged[index]
+      index = index + usize.ONE
+    }
+    return Result<usize, AddressError>.succeed(cursor)
+  }
+}
+
+impl IpAddress {
+  /// Returns `true` for an IPv4 address.
+  pub fn isV4(self: &Self) -> bool {
+    return match & self.* {
+      IpAddress.V4 {value} => true
+      IpAddress.V6 {value} => false
+    }
+  }
+
+  /// Returns `true` if the two addresses are of the same family and have the same bytes. An IPv4
+  /// address never equals an IPv6 address, also not an IPv4-mapped one.
+  pub fn equals(self: &Self, other: &Self) -> bool {
+    return match & self.* {
+      IpAddress.V4 {value: left} => match & other.* {
+        IpAddress.V4 {value: right} => Ipv4Address.equals(&left, &right)
+        IpAddress.V6 {value} => false
+      }
+      IpAddress.V6 {value: left} => match & other.* {
+        IpAddress.V4 {value} => false
+        IpAddress.V6 {value: right} => Ipv6Address.equals(&left, &right)
+      }
+    }
+  }
+
+  /// Writes the canonical text of the IPv4 or IPv6 address to the start of `output`, and returns
+  /// its length. IPv6 has no brackets.
+  pub fn formatInto(self: &Self, output: &mut [u8]) -> Result<usize, AddressError> {
+    return match & self.* {
+      IpAddress.V4 {value} => Ipv4Address.formatInto(&value, move output)
+      IpAddress.V6 {value} => Ipv6Address.formatInto(&value, move output)
+    }
+  }
+}
+
+impl Port {
+  /// Returns the port, or `InvalidPort` if `value` is more than 65535.
+  pub fn make(value: usize) -> Result<Port, AddressError> {
+    if value > 65535 {
+      return Result<Port, AddressError>.failResult(AddressError.InvalidPort {value: value})
+    }
+    return Result<Port, AddressError>.succeed(Port {valueBits: usize.toU16(value)})
+  }
+
+  /// Returns the port with this number. Every `u16` is a valid port.
+  pub fn fromU16(value: u16) -> Port { return Port {valueBits: value} }
+
+  /// Returns the port number.
+  pub fn value(self: &Self) -> u16 { return self.valueBits }
+}
+
+impl Endpoint {
+  /// Returns the endpoint for `address` and `port`.
+  pub fn make(address: IpAddress, port: Port) -> Endpoint {
+    return Endpoint {addressValue: move address, portValue: move port}
+  }
+
+  /// Returns the owned address by value.
+  pub fn address(self: &Self) -> IpAddress { return self.addressValue }
+
+  /// Returns the checked port by value.
+  pub fn port(self: &Self) -> Port { return self.portValue }
+
+  /// Reports exact address-and-port equality.
+  pub fn equals(self: &Self, other: &Self) -> bool {
+    return IpAddress.equals(&self.addressValue, &other.addressValue) && self.portValue.valueBits == other.portValue.valueBits
+  }
+}
+
+impl DomainHost {
+  /// Checks the text `text` as a domain name and copies it.
+  ///
+  /// # Details
+  /// The name must be plain ASCII, 1 to 253 bytes, with labels of 1 to 63 bytes that do not begin
+  /// or end with a hyphen. A label that starts with `xn--` must be valid Punycode. The last label
+  /// must not be only digits.
+  ///
+  /// # Errors
+  /// - [`AddressError.InvalidHost`] with a [`HostReason`] and the byte offset if a rule fails. A
+  ///   trailing dot, as in `example.com.`, fails with `TrailingDot`.
+  ///
+  /// # Gotchas
+  /// Convert an internationalized name to its `xn--` form first.
+  pub fn make(text: string) -> Result<DomainHost, AddressError> {
+    return DomainHost.makeBytes(String.utf8Bytes(text))
+  }
+
+  /// Checks `bytes` as a domain name and copies it.
+  ///
+  /// # When to use
+  /// Use it for a name that you have as bytes, such as part of a request you read. For a `string`,
+  /// use `DomainHost.make`.
+  ///
+  /// # Details
+  /// The name must be plain ASCII, 1 to 253 bytes, with labels of 1 to 63 bytes that do not begin
+  /// or end with a hyphen. A label that starts with `xn--` must be valid Punycode. The last label
+  /// must not be only digits.
+  ///
+  /// # Errors
+  /// - [`AddressError.InvalidHost`] with a [`HostReason`] and the byte offset if a rule fails. A
+  ///   trailing dot, as in `example.com.`, fails with `TrailingDot`.
+  ///
+  /// # Gotchas
+  /// Convert an internationalized name to its `xn--` form first.
+  pub fn makeBytes(bytes: &[u8]) -> Result<DomainHost, AddressError> {
+    let length = bytes.length
+    if length == usize.ZERO {
+      return Result<DomainHost, AddressError>.failResult(invalidHost(HostReason.EmptyName, usize.ZERO))
+    }
+    if length > 253 {
+      return Result<DomainHost, AddressError>.failResult(invalidHost(HostReason.NameTooLong, 253))
+    }
+    if bytes[length - usize.ONE] == 46 {
+      return Result<DomainHost, AddressError>.failResult(invalidHost(HostReason.TrailingDot, length - usize.ONE))
+    }
+    let mut at = usize.ZERO
+    while at < length {
+      if bytes[at] == 0 {
+        return Result<DomainHost, AddressError>.failResult(invalidHost(HostReason.Nul, at))
+      }
+      at = at + usize.ONE
+    }
+    at = usize.ZERO
+    while at < length {
+      if bytes[at] > 127 {
+        return Result<DomainHost, AddressError>.failResult(invalidHost(HostReason.NonAscii, at))
+      }
+      at = at + usize.ONE
+    }
+    let mut labelStart = usize.ZERO
+    let mut finalNumeric = true
+    at = usize.ZERO
+    while at <= length {
+      if at == length || bytes[at] == 46 {
+        let labelLength = at - labelStart
+        if labelLength == usize.ZERO {
+          return Result<DomainHost, AddressError>.failResult(invalidHost(HostReason.EmptyLabel, at))
+        }
+        if labelLength > 63 {
+          return Result<DomainHost, AddressError>.failResult(invalidHost(HostReason.LabelTooLong, labelStart))
+        }
+        if bytes[labelStart] == 45 {
+          return Result<DomainHost, AddressError>.failResult(invalidHost(HostReason.EdgeHyphen, labelStart))
+        }
+        if bytes[at - usize.ONE] == 45 {
+          return Result<DomainHost, AddressError>.failResult(invalidHost(HostReason.EdgeHyphen, at - usize.ONE))
+        }
+        if labelLength >= 4 && folded(bytes[labelStart]) == 120
+          && folded(bytes[labelStart + usize.ONE]) == 110
+          && bytes[labelStart + 2] == 45 && bytes[labelStart + 3] == 45
+          && !validALabel(bytes, labelStart, at) {
+          return Result<DomainHost, AddressError>.failResult(invalidHost(HostReason.InvalidALabel, labelStart))
+        }
+        if at < length {
+          labelStart = at + usize.ONE
+          finalNumeric = true
+        }
+      } else {
+        if !isLdh(bytes[at]) {
+          return Result<DomainHost, AddressError>.failResult(invalidHost(HostReason.InvalidCharacter, at))
+        }
+        if !isDecimal(bytes[at]) { finalNumeric = false }
+      }
+      at = at + usize.ONE
+    }
+    if finalNumeric {
+      return Result<DomainHost, AddressError>.failResult(invalidHost(HostReason.NumericFinalLabel, labelStart))
+    }
+    let mut owned = zeroDomainBytes()
+    at = usize.ZERO
+    while at < length {
+      owned[at] = bytes[at]
+      at = at + usize.ONE
+    }
+    return Result<DomainHost, AddressError>.succeed(DomainHost {bytesValue: move owned, lengthValue: length})
+  }
+
+  /// Returns the name, spelled as in the input.
+  pub fn bytes<'a>(self: &'a Self) -> &'a [u8] {
+    return Slice.view<u8>(&self.bytesValue, usize.ZERO, self.lengthValue)
+  }
+
+  /// Returns the stored byte length.
+  pub fn length(self: &Self) -> usize { return self.lengthValue }
+
+  /// Returns `true` if the names are equal without case, so `Example.COM` equals `example.com`.
+  pub fn equals(self: &Self, other: &Self) -> bool {
+    if self.lengthValue != other.lengthValue { return false }
+    let mut index = usize.ZERO
+    while index < self.lengthValue {
+      if folded(self.bytesValue[index]) != folded(other.bytesValue[index]) { return false }
+      index = index + usize.ONE
+    }
+    return true
+  }
+}
+
+impl Host {
+  /// Parses the host part of a URI.
+  ///
+  /// # Details
+  /// `[...]` is parsed as IPv6, decimal dotted text is parsed as IPv4, and all other text as a
+  /// domain name. Give only the host, without user information or a port. The result does not
+  /// allocate. Give it to `silk.net.resolver` to get endpoints, and keep it to check the identity of
+  /// an HTTPS server.
+  ///
+  /// # Errors
+  /// - [`AddressError`] with the rule that failed and the byte offset where it failed.
+  ///
+  /// # Gotchas
+  /// These forms fail: a trailing dot, percent escapes, an IPv6 zone such as `%eth0`, IPvFuture,
+  /// user information, a port, non-ASCII names, and old IPv4 forms such as `127.1` or
+  /// `0x7f.0.0.1`.
+  pub fn parse(text: string) -> Result<Host, AddressError> {
+    return Host.parseBytes(String.utf8Bytes(text))
+  }
+
+  /// Parses the host part of a URI.
+  ///
+  /// # When to use
+  /// Use it for a host that you have as bytes, such as the host of a URI you parsed. For a
+  /// `string`, use `Host.parse`.
+  ///
+  /// # Details
+  /// `[...]` is parsed as IPv6, decimal dotted text is parsed as IPv4, and all other text as a
+  /// domain name. Give only the host, without user information or a port. The result does not
+  /// allocate. Give it to `silk.net.resolver` to get endpoints, and keep it to check the identity of
+  /// an HTTPS server.
+  ///
+  /// # Errors
+  /// - [`AddressError`] with the rule that failed and the byte offset where it failed.
+  ///
+  /// # Gotchas
+  /// These forms fail: a trailing dot, percent escapes, an IPv6 zone such as `%eth0`, IPvFuture,
+  /// user information, a port, non-ASCII names, and old IPv4 forms such as `127.1` or
+  /// `0x7f.0.0.1`.
+  pub fn parseBytes(bytes: &[u8]) -> Result<Host, AddressError> {
+    if bytes.length >= 2 && bytes[0] == 91 && bytes[bytes.length - usize.ONE] == 93 {
+      let interior = Slice.view<u8>(bytes, usize.ONE, bytes.length - 2)
+      let mut index = usize.ZERO
+      while index < interior.length {
+        if interior[index] == 37 {
+          return Result<Host, AddressError>.failResult(unsupported(UnsupportedHostForm.ZoneIdentifier, index + usize.ONE))
+        }
+        index = index + usize.ONE
+      }
+      if interior.length >= 2 && (interior[0] == 86 || interior[0] == 118) {
+        index = usize.ONE
+        while index < interior.length && isHex(interior[index]) { index = index + usize.ONE }
+        if index < interior.length && interior[index] == 46 {
+          return Result<Host, AddressError>.failResult(unsupported(UnsupportedHostForm.IpvFuture, usize.ONE))
+        }
+      }
+      let parsed = Ipv6Address.parseBytes(interior)
+      return match move parsed {
+        Result<Ipv6Address, AddressError>.Failure {error} => Result<Host, AddressError>.failResult(move error)
+        Result<Ipv6Address, AddressError>.Success {value} => Result<Host, AddressError>.succeed(Host.Ipv6 {value: move value})
+      }
+    }
+    let mut index = usize.ZERO
+    while index < bytes.length {
+      let byte = bytes[index]
+      if byte == 37 {
+        return Result<Host, AddressError>.failResult(unsupported(UnsupportedHostForm.EscapedHost, index))
+      }
+      if byte == 64 {
+        return Result<Host, AddressError>.failResult(unsupported(UnsupportedHostForm.UserInfo, index))
+      }
+      if byte == 47 || byte == 63 || byte == 35 || byte == 91 || byte == 93 {
+        return Result<Host, AddressError>.failResult(unsupported(UnsupportedHostForm.UriDelimiter, index))
+      }
+      if byte == 58 {
+        return Result<Host, AddressError>.failResult(unsupported(UnsupportedHostForm.PortDelimiter, index))
+      }
+      index = index + usize.ONE
+    }
+    let parsedV4 = Ipv4Address.parseBytes(bytes)
+    match move parsedV4 {
+      Result<Ipv4Address, AddressError>.Success {value} => {
+        return Result<Host, AddressError>.succeed(Host.Ipv4 {value: move value})
+      }
+      Result<Ipv4Address, AddressError>.Failure {error} => {}
+    }
+    let domain = DomainHost.makeBytes(bytes)
+    return match move domain {
+      Result<DomainHost, AddressError>.Failure {error} => Result<Host, AddressError>.failResult(move error)
+      Result<DomainHost, AddressError>.Success {value} => Result<Host, AddressError>.succeed(Host.Domain {value: move value})
+    }
+  }
+
+  /// Returns the IP address of a numeric host, or `()` for a domain name.
+  pub fn numeric(self: &Self) -> IpAddress | () {
+    return match & self.* {
+      Host.Domain {value} => ()
+      Host.Ipv4 {value} => IpAddress.V4 {value: value}
+      Host.Ipv6 {value} => IpAddress.V6 {value: value}
+    }
+  }
+}
+
+fn decimalDigits(value: u16) -> usize {
+  if value >= 100 { return 3 }
+  if value >= 10 { return 2 }
+  return usize.ONE
+}
+
+fn writeDecimalU16(value: u16, output: &mut [u8], start: usize) -> usize {
+  let count = decimalDigits(value)
+  let mut divisor: u16 = 1
+  let mut index = usize.ONE
+  while index < count {
+    divisor = divisor * 10
+    index = index + usize.ONE
+  }
+  let mut remaining = value
+  index = usize.ZERO
+  while index < count {
+    output[start + index] = 48 + u16.toU8(remaining / divisor)
+    remaining = remaining % divisor
+    if divisor > 1 { divisor = divisor / 10 }
+    index = index + usize.ONE
+  }
+  return start + count
+}
+
+fn writeHexU16(value: u16, output: &mut [u8], start: usize) -> usize {
+  let mut digits = usize.ONE
+  if value >= 4096 { digits = 4 }
+  else {
+    if value >= 256 { digits = 3 }
+    else {
+      if value >= 16 { digits = 2 }
+    }
+  }
+  let mut shift = (digits - usize.ONE) * 4
+  let mut index = usize.ZERO
+  while index < digits {
+    let nibble = u16.toU8((value / usize.toU16(pow16(shift / 4))) % 16)
+    if nibble < 10 {
+      output[start + index] = 48 + nibble
+    } else {
+      output[start + index] = 87 + nibble
+    }
+    if shift >= 4 { shift = shift - 4 }
+    index = index + usize.ONE
+  }
+  return start + digits
+}
+
+fn pow16(power: usize) -> usize {
+  let mut value = usize.ONE
+  let mut index = usize.ZERO
+  while index < power {
+    value = value * 16
+    index = index + usize.ONE
+  }
+  return value
+}
+
+impl Display for Ipv4Address {
+  effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    let mut output = zeroIpv4Text()
+    let rendered = Ipv4Address.formatInto(self, &mut output)
+    return match move rendered {
+      Result<usize, AddressError>.Failure {error} => { return Intrinsic.trap("Ipv4Address.display: the address did not fit its text buffer") }
+      Result<usize, AddressError>.Success {value} => run Format.write(&mut formatter, Slice.view<u8>(&output, usize.ZERO, value))
+    }
+  }
+}
+
+impl Display for Ipv6Address {
+  effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    let mut output = zeroIpv6Text()
+    let rendered = Ipv6Address.formatInto(self, &mut output)
+    return match move rendered {
+      Result<usize, AddressError>.Failure {error} => { return Intrinsic.trap("Ipv6Address.display: the address did not fit its text buffer") }
+      Result<usize, AddressError>.Success {value} => run Format.write(&mut formatter, Slice.view<u8>(&output, usize.ZERO, value))
+    }
+  }
+}
+
+impl Display for IpAddress {
+  effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match & self.* {
+      IpAddress.V4 {value} => run Display.display(&value, &mut formatter)
+      IpAddress.V6 {value} => run Display.display(&value, &mut formatter)
+    }
+  }
+}
+
+impl Display for DomainHost {
+  effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return run Format.write(&mut formatter, DomainHost.bytes(self))
+  }
+}

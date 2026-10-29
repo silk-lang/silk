@@ -1,0 +1,702 @@
+//! A work-stealing pool of native threads that runs lazy tasks in parallel.
+//!
+//! # When to use
+//! 1. Call [`ThreadPool.make`] to start the worker threads.
+//! 2. Call [`Pool.block`] on a normal thread to run a program on the pool.
+//! 3. In a task, start more tasks with [`Pool.spawn`] and wait for one with [`TaskHandle.join`].
+//!
+//! # Details
+//! Each task is a closed, `Transferable` lazy effect, packaged with `Execution.makeTransferable`.
+//! Thus a task can start on one worker, park, and continue on a different worker.
+//!
+//! A ready task goes on one shared ready list. An idle worker moves a batch of ready tasks into its
+//! own `WorkDeque`. A worker with nothing to do steals from the deques of the other workers, and
+//! then sleeps on a `Parker`. When a parked task wakes, it goes back on the ready list and a
+//! sleeping worker wakes. Thus no worker spins.
+//!
+//! A [`Pool`] is a small `Transferable` handle that tasks capture to start more tasks. The
+//! [`ThreadPool`] owns the threads. Dropping it stops and joins each worker, and drops the tasks
+//! that are not finished.
+//!
+//! # Errors
+//! [`ThreadPool.make`] fails with `SpawnError` or `OutOfMemoryError`. [`Pool.spawn`] and
+//! [`Pool.block`] fail with `OutOfMemoryError`. A task is a closed effect, so wrap a task that can
+//! fail in `Effect.result` and get its failure as a value.
+//!
+//! # Gotchas
+//! - Task bodies and results must be `Transferable` and `'static`.
+//! - In a task, wait for anything other than a [`TaskHandle`] with `Execution.parkTransferable`. A
+//!   call that blocks the native thread, such as [`Pool.block`], holds up a whole worker.
+//! - Call [`TaskHandle.join`] only from inside a pool task.
+//! - The pool uses the system allocator for its own storage, not the `Allocator` of the caller.
+//!
+//! # Examples
+//! ## Sum two halves in parallel
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.concurrency.thread_native { SpawnError }
+//! import silk.core.result { Result }
+//! import silk.concurrency.thread_pool { Pool, ThreadPool }
+//!
+//! effect fn sumRange(from: i64, to: i64) -> i64 {
+//!   let mut total: i64 = 0
+//!   let mut at = from
+//!   while at < to {
+//!     total = total + at
+//!     at = at + 1
+//!   }
+//!   return total
+//! }
+//!
+//! // Runs the low half as a new task, and the high half in this task.
+//! effect fn both(pool: Pool) -> i64
+//!   ! OutOfMemoryError {
+//!   let low = run pool.spawn(sumRange(0, 500))
+//!   let high = run sumRange(500, 1001)
+//!   let lowValue = run low.join()
+//!   return lowValue + high
+//! }
+//!
+//! effect fn program() -> i32
+//!   ! OutOfMemoryError | SpawnError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let threads = run ThreadPool.make(4) |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let pool = threads.pool()
+//!
+//!   // A task is a closed effect, so its own failures come back as a value.
+//!   let result = run pool.block(Effect.result(both(pool.clone())))
+//!   return match move result {
+//!     Result<i64, OutOfMemoryError>.Success { value } => {
+//!       if value != 500500 {
+//!         return 1
+//!       }
+//!       return 0
+//!     }
+//!     Result<i64, OutOfMemoryError>.Failure { error } => 1
+//!   }
+//! }
+//!
+//! effect fn failed<E>(error: E) -> i32 {
+//!   drop error
+//!   return 1
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   return run Effect.catchAll(program(), failed)
+//! }
+//! ```
+//!
+//! @category Concurrency
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.concurrency.execution { Execution, TransferableExecution, TransferableWake }
+import silk.collections.list { List }
+import silk.concurrency.thread_native { JoinHandle, NativeThread, SpawnError }
+import silk.core.option { Option }
+import silk.core.ownership { Drop }
+import silk.concurrency.sync { Arc, Mutex, Parker, Unparker }
+import silk.concurrency.thread { Concurrent, Transferable }
+import silk.num.usize
+import silk.concurrency.work_queue { Steal, Stealer, WorkDeque, Worker }
+
+// A task's completion. `Running` holds whoever waits for it: a parked task or a blocked thread.
+struct NoWaiter {}
+struct TaskWaiter { wake: TransferableWake }
+struct ThreadWaiter { unparker: Unparker }
+struct Running { waiter: NoWaiter | TaskWaiter | ThreadWaiter }
+struct Finished<A> { value: A }
+struct Collected {}
+struct Completion<A> { phase: Running | Finished<A> | Collected }
+
+/// The handle of one pool task, which gives back its result.
+///
+/// # Details
+///
+/// A handle is `Transferable` when `A` is. Dropping it detaches the task, which still runs.
+pub struct TaskHandle<A> {
+  completion: Arc<Mutex<Completion<A>>>,
+}
+
+impl<A> TaskHandle<A> {
+  /// Parks the calling task until this task finishes, then returns its result.
+  ///
+  /// # Gotchas
+  /// Only a pool task can join. A join from any other place is a fatal state trap.
+  pub effect fn join(self: Self) -> A {
+    let handle = move self
+    while true {
+      let taken = finishedValue<A>(handle.completion.get())
+      if let Option<A>.Some { value } = move taken { return move value }
+      run Execution.parkTransferable(fn(wake: TransferableWake) -> () {
+        return awaitCompletion<A>(handle.completion.get(), move wake)
+      })
+    }
+    return unreachable<A>()
+  }
+}
+
+fn finishedValue<A>(completion: &Mutex<Completion<A>>) -> Option<A> {
+  let mut guard = completion.lock()
+  let state = guard.getMut()
+  let phase = Intrinsic.replace(state.phase, Collected {})
+  return match move phase {
+    Finished<A> { value } => Option<A>.some(move value)
+    Running waiting => keepRunning<A>(&mut state.*, move waiting)
+    Collected nothing => Option<A>.none()
+  }
+}
+
+fn keepRunning<A>(state: &mut Completion<A>, running: Running) -> Option<A> {
+  state.phase = move running
+  return Option<A>.none()
+}
+
+// Registers a parked joiner, or wakes it at once when the task finished in the meantime. A wake
+// while the joiner is still registering is latched until its worker holds it again.
+fn awaitCompletion<A>(completion: &Mutex<Completion<A>>, wake: TransferableWake) -> () {
+  let mut guard = completion.lock()
+  let state = guard.getMut()
+  let phase = Intrinsic.replace(state.phase, Collected {})
+  return match move phase {
+    Running ignored => keepWaiting<A>(&mut state.*, TaskWaiter { wake: move wake })
+    Finished<A> done => wakeNow<A>(&mut state.*, move done, move wake)
+    Collected nothing => ()
+  }
+}
+
+fn keepWaiting<A>(state: &mut Completion<A>, waiter: TaskWaiter) -> () {
+  state.phase = Running { waiter: move waiter }
+  return ()
+}
+
+fn wakeNow<A>(state: &mut Completion<A>, done: Finished<A>, wake: TransferableWake) -> () {
+  state.phase = move done
+  Execution.wakeTransferable(move wake)
+  return ()
+}
+
+fn complete<A>(completion: &Mutex<Completion<A>>, value: A) -> () {
+  let mut guard = completion.lock()
+  let state = guard.getMut()
+  let phase = Intrinsic.replace(state.phase, Finished<A> { value: move value })
+  return match move phase {
+    Running { waiter } => notify(move waiter)
+    Finished<A> stale => ()
+    Collected nothing => ()
+  }
+}
+
+fn notify(waiter: NoWaiter | TaskWaiter | ThreadWaiter) -> () {
+  return match move waiter {
+    NoWaiter nothing => ()
+    TaskWaiter { wake } => Execution.wakeTransferable(move wake)
+    ThreadWaiter { unparker } => unparker.unpark()
+  }
+}
+
+// The pool's task table. Slot indices are task ids; `next` links the ready list and the free list.
+struct Vacant {}
+struct Parked { execution: TransferableExecution<()> }
+struct Taken {}
+struct Slot {
+  task: Vacant | Parked | Taken,
+  next: usize,
+}
+
+struct PoolState {
+  slots: List<Slot>,
+  head: usize,
+  tail: usize,
+  free: usize,
+  // Which workers are asleep, or about to be, waiting for work.
+  idle: List<bool>,
+  shutdown: bool,
+}
+
+struct PoolShared {
+  state: Mutex<PoolState>,
+  unparkers: List<Unparker>,
+}
+
+fn none() -> usize { return usize.MAX }
+
+// Appends `id` to the ready list and returns a sleeping worker to wake, or `none`.
+fn link(state: &mut PoolState, id: usize) -> usize {
+  let tail = state.tail
+  let slots = List<Slot>.asMutSlice(&mut state.slots)
+  slots[id].next = none()
+  if tail == none() {
+    state.head = id
+  } else {
+    slots[tail].next = id
+  }
+  state.tail = id
+  return takeIdle(&mut state.*)
+}
+
+fn takeIdle(state: &mut PoolState) -> usize {
+  let flags = List<bool>.asMutSlice(&mut state.idle)
+  let mut at = usize.ZERO
+  while at < flags.length {
+    if flags[at] {
+      flags[at] = false
+      return at
+    }
+    at = at + 1
+  }
+  return none()
+}
+
+fn unlink(state: &mut PoolState) -> usize {
+  let id = state.head
+  if id == none() { return id }
+  state.head = List<Slot>.asSlice(&state.slots)[id].next
+  if state.head == none() { state.tail = none() }
+  return id
+}
+
+fn wakeWorker(pool: &PoolShared, worker: usize) -> () {
+  if worker != none() { List<Unparker>.asSlice(&pool.unparkers)[worker].unpark() }
+  return ()
+}
+
+fn enqueue(pool: &PoolShared, id: usize) -> () {
+  let mut guard = pool.state.lock()
+  let worker = link(guard.getMut(), id)
+  drop guard
+  wakeWorker(pool, worker)
+  return ()
+}
+
+// The readiness endpoint of every task: it runs on the waking thread and must not allocate, so
+// it only links the task's preallocated slot.
+struct TaskHook {
+  pool: Arc<PoolShared>,
+  id: usize,
+}
+
+fn ready(hook: &TaskHook) -> () {
+  enqueue(hook.pool.get(), hook.id)
+  return ()
+}
+
+effect fn reserveSlot(pool: &PoolShared) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let mut guard = pool.state.lock()
+  let state = guard.getMut()
+  let id = state.free
+  if id != none() {
+    state.free = List<Slot>.asSlice(&state.slots)[id].next
+    return id
+  }
+  run List<Slot>.append(&mut state.slots, Slot { task: Taken {}, next: none() })
+  return List<Slot>.length(&state.slots) - 1
+}
+
+fn fillSlot(pool: &PoolShared, id: usize, execution: TransferableExecution<()>) -> () {
+  let mut guard = pool.state.lock()
+  let state = guard.getMut()
+  if state.shutdown {
+    // A stopped pool runs nothing more. Dropping the task here also drops its hook, which
+    // would otherwise keep the pool alive from inside its own table.
+    let slots = List<Slot>.asMutSlice(&mut state.slots)
+    slots[id].task = Vacant {}
+    slots[id].next = state.free
+    state.free = id
+    drop guard
+    drop execution
+    return ()
+  }
+  let slots = List<Slot>.asMutSlice(&mut state.slots)
+  slots[id].task = Parked { execution: move execution }
+  let worker = link(&mut state.*, id)
+  drop guard
+  wakeWorker(pool, worker)
+  return ()
+}
+
+effect<'static> fn runTask<
+  A: 'static + Transferable,
+  F: once Effect<'static; A> + Intrinsic.Detached + Transferable
+>(task: F, completion: Arc<Mutex<Completion<A>>>) -> () {
+  let value = run move task
+  complete<A>(completion.get(), move value)
+  return ()
+}
+
+effect<'env> fn launch<
+  'env,
+  A: 'static + Transferable,
+  F: once Effect<'static; A> + Intrinsic.Detached + Transferable
+>(pool: &Arc<PoolShared>, task: F) -> TaskHandle<A> ! OutOfMemoryError ? &mut Allocator {
+  let waiting = Completion<A> { phase: Running { waiter: NoWaiter {} } }
+  let locked = run Mutex<Completion<A>>.make(move waiting)
+  let completion = run Arc<Mutex<Completion<A>>>.make(move locked)
+  let id = run reserveSlot(pool.get())
+  let hook = TaskHook { pool: pool.clone(), id: id }
+  let execution = run Execution.makeTransferable(runTask<A, F>(move task, completion.clone()), move hook, ready)
+  // An Initial execution may be driven directly, so the slot goes on the ready list as it is.
+  fillSlot(pool.get(), id, move execution)
+  return TaskHandle<A> { completion: move completion }
+}
+
+/// A handle to a running pool, which tasks capture to start more tasks.
+///
+/// # Details
+///
+/// A handle is `Transferable` and `Concurrent`. It does not keep the worker threads running:
+/// once the [`ThreadPool`] that made it is dropped, a spawned task is dropped unstarted and its
+/// [`TaskHandle`] never finishes.
+pub struct Pool {
+  shared: Arc<PoolShared>,
+}
+
+impl Pool {
+  /// Starts `task` as a new pool task and returns the handle that joins it.
+  ///
+  /// # Details
+  /// The task is ready at once. It can start on any worker before this call returns.
+  ///
+  /// # Gotchas
+  /// `task` cannot fail. For a task that can, such as an `effect fn` call with
+  /// `! OutOfMemoryError`, spawn `Effect.result(task)` and handle the `Result` that `join` returns.
+  pub effect<'env> fn spawn<
+    'env,
+    A: 'static + Transferable,
+    F: once Effect<'static; A> + Intrinsic.Detached + Transferable
+  >(self: &Self, task: F) -> TaskHandle<A> ! OutOfMemoryError {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    return run launch<A, F>(&self.shared, move task) |> Effect.provideMut<Allocator>(&mut allocator)
+  }
+
+  /// Runs `task` on the pool and blocks the calling thread until it finishes.
+  ///
+  /// # Gotchas
+  ///
+  /// Calling it from a pool task blocks that task's worker for the whole wait.
+  pub effect<'env> fn block<
+    'env,
+    A: 'static + Transferable,
+    F: once Effect<'static; A> + Intrinsic.Detached + Transferable
+  >(self: &Self, task: F) -> A ! OutOfMemoryError {
+    let handle = run self.spawn<A, F>(move task)
+    return run awaitThread<A>(move handle)
+  }
+
+  /// Returns another handle to the same pool.
+  pub fn clone(self: &Self) -> Pool {
+    return Pool { shared: self.shared.clone() }
+  }
+}
+
+// Driving one task. The slot is `Taken` while a worker drives it; a parked task goes back to
+// `Parked` before its wake can relink it, since `drive` publishes readiness only after `suspended`.
+struct SlotOwner {
+  pool: Arc<PoolShared>,
+  id: usize,
+}
+
+fn takeExecution(pool: &PoolShared, id: usize) -> TransferableExecution<()> {
+  let mut guard = pool.state.lock()
+  let state = guard.getMut()
+  let task = Intrinsic.replace(List<Slot>.asMutSlice(&mut state.slots)[id].task, Taken {})
+  return match move task {
+    Parked { execution } => move execution
+    Vacant nothing => unreachable<TransferableExecution<()>>()
+    Taken nothing => unreachable<TransferableExecution<()>>()
+  }
+}
+
+fn finished(owner: SlotOwner, result: ()) -> () {
+  let pool = owner.pool.get()
+  let mut guard = pool.state.lock()
+  let state = guard.getMut()
+  let slot = &mut List<Slot>.asMutSlice(&mut state.slots)[owner.id]
+  slot.task = Vacant {}
+  slot.next = state.free
+  state.free = owner.id
+  return ()
+}
+
+fn suspended(owner: SlotOwner, execution: Intrinsic.Execution<()>) -> () {
+  let adopted = TransferableExecution<()>.adopt(move execution)
+  let pool = owner.pool.get()
+  let mut guard = pool.state.lock()
+  let state = guard.getMut()
+  let slots = List<Slot>.asMutSlice(&mut state.slots)
+  slots[owner.id].task = Parked { execution: move adopted }
+  return ()
+}
+
+effect fn drive(pool: &Arc<PoolShared>, id: usize) -> () {
+  let execution = takeExecution(pool.get(), id)
+  let owner = SlotOwner { pool: pool.clone(), id: id }
+  run Execution.drive(execution.local(), move owner, finished, suspended)
+  return ()
+}
+
+// One worker thread.
+struct WorkerContext {
+  pool: Arc<PoolShared>,
+  index: usize,
+  parker: Parker,
+  local: Worker<usize>,
+  stealers: List<Stealer<usize>>,
+}
+
+fn workerMain(context: WorkerContext) -> () {
+  return run Effect.catchAll(workerLoop(move context), workerFailed)
+}
+
+effect fn workerFailed(error: OutOfMemoryError) -> () {
+  // A worker that cannot queue work cannot keep the pool's guarantees.
+  return Intrinsic.trap("ThreadPool: a worker could not queue work")
+}
+
+// How many ready tasks a worker moves from the shared list into its own deque at once.
+const batch: usize = 16
+
+effect fn workerLoop(context: WorkerContext) -> () ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut worker = move context
+  while true {
+    let next = run findTask(&mut worker) |> Effect.provideMut<Allocator>(&mut allocator)
+    if next != none() {
+      run drive(&worker.pool, next)
+    } else if sleep(&worker) {
+      return ()
+    }
+  }
+  return ()
+}
+
+effect fn findTask(worker: &mut WorkerContext) -> usize ! OutOfMemoryError ? &mut Allocator {
+  if let Option<usize>.Some { value } = move worker.local.pop() { return value }
+  let shared = run takeBatch(&mut worker.*)
+  if shared != none() { return shared }
+  return steal(&worker.*)
+}
+
+// Moves up to `batch` ready tasks into the worker's deque and returns one of them. When it moves
+// more than one, it wakes another sleeping worker to steal some.
+effect fn takeBatch(worker: &mut WorkerContext) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let pool = worker.pool.get()
+  let mut guard = pool.state.lock()
+  let state = guard.getMut()
+  let first = unlink(&mut state.*)
+  if first == none() { return first }
+  let mut moved = usize.ZERO
+  while moved < batch {
+    let id = unlink(&mut state.*)
+    if id == none() { break }
+    run worker.local.push(id)
+    moved = moved + 1
+  }
+  let mut helper = none()
+  if moved > usize.ZERO { helper = takeIdle(&mut state.*) }
+  drop guard
+  wakeWorker(pool, helper)
+  return first
+}
+
+fn steal(worker: &WorkerContext) -> usize {
+  let stealers = List<Stealer<usize>>.asSlice(&worker.stealers)
+  let mut retry = true
+  while retry {
+    retry = false
+    let mut at = usize.ZERO
+    while at < stealers.length {
+      if at != worker.index {
+        match stealers[at].steal() {
+          Steal<usize>.Success { value } => { return value }
+          Steal<usize>.Retry => { retry = true }
+          Steal<usize>.Empty => {}
+        }
+      }
+      at = at + 1
+    }
+  }
+  return none()
+}
+
+// Marks the worker idle and parks it, unless work or shutdown arrived first. Returns whether the
+// pool is shutting down.
+fn sleep(worker: &WorkerContext) -> bool {
+  let pool = worker.pool.get()
+  let mut guard = pool.state.lock()
+  let state = guard.getMut()
+  if state.shutdown { return true }
+  if state.head != none() { return false }
+  let flags = List<bool>.asMutSlice(&mut state.idle)
+  flags[worker.index] = true
+  drop guard
+  worker.parker.park()
+  return false
+}
+
+/// The owner of a pool's worker threads: a work-stealing pool of native threads that runs lazy
+/// tasks in parallel.
+///
+/// # When to use
+///
+/// Call [`ThreadPool.make`] to start the worker threads, then [`Pool.block`] on a normal thread to
+/// run a program on the pool. In a task, start more tasks with [`Pool.spawn`] and wait for one with
+/// [`TaskHandle.join`].
+///
+/// # Details
+///
+/// Each task is a closed, `Transferable` lazy effect, so a task can start on one worker, park, and
+/// continue on a different worker. Idle workers steal work from each other and then sleep, so no
+/// worker spins. /// Dropping it stops every worker, joins its thread, and drops the tasks still
+/// unfinished.
+///
+/// # Gotchas
+///
+/// - Task bodies and results must be `Transferable` and `'static`.
+/// - A task is a closed effect, so wrap a task that can fail in `Effect.result` and get its failure
+///   as a value.
+/// - The pool uses the system allocator for its own storage, not the `Allocator` of the caller.
+pub struct ThreadPool {
+  handle: Pool,
+  threads: List<JoinHandle<()>>,
+}
+
+impl ThreadPool {
+  /// Starts a pool of `workers` native threads, all waiting for tasks.
+  ///
+  /// # Details
+  ///
+  /// Zero workers means one. If a thread fails to start, the ones already started are stopped
+  /// and joined before the error returns.
+  pub effect fn make(workers: usize) -> ThreadPool ! OutOfMemoryError | SpawnError ? &mut Allocator {
+    let mut count = workers
+    if count == usize.ZERO { count = 1 }
+    let mut parkers = List<Parker>.make()
+    let mut unparkers = List<Unparker>.make()
+    let mut deques = List<Worker<usize>>.make()
+    let mut stealers = List<Stealer<usize>>.make()
+    let mut idle = List<bool>.make()
+    let mut at = usize.ZERO
+    while at < count {
+      let parker = run Parker.make()
+      run List<Unparker>.append(&mut unparkers, parker.unparker())
+      run List<Parker>.append(&mut parkers, move parker)
+      let deque = run WorkDeque.make<usize>()
+      run List<Stealer<usize>>.append(&mut stealers, deque.stealer())
+      run List<Worker<usize>>.append(&mut deques, move deque)
+      run List<bool>.append(&mut idle, false)
+      at = at + 1
+    }
+    let state = PoolState { slots: List<Slot>.make(), head: none(), tail: none(), free: none(), idle: move idle, shutdown: false }
+    let locked = run Mutex<PoolState>.make(move state)
+    let shared = run Arc<PoolShared>.make(PoolShared { state: move locked, unparkers: move unparkers })
+    let mut owner = ThreadPool { handle: Pool { shared: move shared }, threads: List<JoinHandle<()>>.make() }
+    run startWorkers(&owner.handle.shared, move parkers, move deques, &stealers, &mut owner.threads)
+    return move owner
+  }
+
+  /// Returns a handle to this pool.
+  pub fn pool(self: &Self) -> Pool {
+    return self.handle.clone()
+  }
+}
+
+impl Drop for ThreadPool {
+  fn drop(self: &mut ThreadPool) -> () {
+    let threads = Intrinsic.replace(self.threads, List<JoinHandle<()>>.make())
+    stop(self.handle.shared.get(), move threads)
+    return ()
+  }
+}
+
+effect fn startWorkers(
+  pool: &Arc<PoolShared>,
+  parkers: List<Parker>,
+  deques: List<Worker<usize>>,
+  stealers: &List<Stealer<usize>>,
+  threads: &mut List<JoinHandle<()>>,
+) -> () ! OutOfMemoryError | SpawnError ? &mut Allocator {
+  let mut remainingParkers = move parkers
+  let mut remainingDeques = move deques
+  while List<Parker>.length(&remainingParkers) > usize.ZERO {
+    let index = List<Parker>.length(&remainingParkers) - 1
+    let parker = List<Parker>.remove(&mut remainingParkers, index)
+    let deque = List<Worker<usize>>.remove(&mut remainingDeques, index)
+    let mut own = List<Stealer<usize>>.make()
+    let all = List<Stealer<usize>>.asSlice(stealers)
+    let mut at = usize.ZERO
+    while at < all.length {
+      run List<Stealer<usize>>.append(&mut own, all[at].clone())
+      at = at + 1
+    }
+    let context = WorkerContext { pool: pool.clone(), index: index, parker: move parker, local: move deque, stealers: move own }
+    let thread = run NativeThread.spawn(fn() -> () { return workerMain(move context) })
+    run List<JoinHandle<()>>.append(&mut threads.*, move thread)
+  }
+  return ()
+}
+
+// The calling thread is not a pool task, so it waits on a Parker.
+effect fn awaitThread<A>(handle: TaskHandle<A>) -> A ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let parker = run Parker.make() |> Effect.provideMut<Allocator>(&mut allocator)
+  while true {
+    let taken = finishedValue<A>(handle.completion.get())
+    if let Option<A>.Some { value } = move taken { return move value }
+    if registerThread<A>(handle.completion.get(), parker.unparker()) { parker.park() }
+  }
+  return unreachable<A>()
+}
+
+// Returns whether the task is still running, after registering the thread to be woken.
+fn registerThread<A>(completion: &Mutex<Completion<A>>, unparker: Unparker) -> bool {
+  let mut guard = completion.lock()
+  let state = guard.getMut()
+  let phase = Intrinsic.replace(state.phase, Collected {})
+  return match move phase {
+    Running ignored => keepThread<A>(&mut state.*, ThreadWaiter { unparker: move unparker })
+    Finished<A> done => restoreFinished<A>(&mut state.*, move done)
+    Collected nothing => false
+  }
+}
+
+fn keepThread<A>(state: &mut Completion<A>, waiter: ThreadWaiter) -> bool {
+  state.phase = Running { waiter: move waiter }
+  return true
+}
+
+fn restoreFinished<A>(state: &mut Completion<A>, done: Finished<A>) -> bool {
+  state.phase = move done
+  return false
+}
+
+// Stops the workers, joins them, and drops every task still in the table. Dropping the parked
+// executions also drops their hooks, which hold the pool.
+fn stop(pool: &PoolShared, threads: List<JoinHandle<()>>) -> () {
+  let mut guard = pool.state.lock()
+  let state = guard.getMut()
+  state.shutdown = true
+  drop guard
+  let unparkers = List<Unparker>.asSlice(&pool.unparkers)
+  let mut at = usize.ZERO
+  while at < unparkers.length {
+    unparkers[at].unpark()
+    at = at + 1
+  }
+  let mut remaining = move threads
+  while List<JoinHandle<()>>.length(&remaining) > usize.ZERO {
+    let last = List<JoinHandle<()>>.length(&remaining) - 1
+    let thread = List<JoinHandle<()>>.remove(&mut remaining, last)
+    thread.join()
+  }
+  let mut final = pool.state.lock()
+  let slots = Intrinsic.replace(final.getMut().slots, List<Slot>.make())
+  drop final
+  drop slots
+  return ()
+}
+
+fn unreachable<T>() -> T {
+  return Intrinsic.trap("ThreadPool: a worker execution was missing where it had just been stored")
+}

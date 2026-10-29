@@ -1,22 +1,22 @@
 # HTTP content decoding
 
 Import scoped response-content planning, streaming, metadata, completion, and request negotiation
-from `silk.http_content`. The actor composes `silk.http_body`, `silk.buffered_duplex`,
-`silk.inflate`, and `silk.zstd` in ordinary Silk source. It adds no compiler-known library actor or
+from `silk.http.content`. The actor composes `silk.http.body`, `silk.io.buffered_duplex`,
+`silk.compress.inflate`, and `silk.compress.zstd` in ordinary Silk source. It adds no compiler-known library actor or
 target-specific codec path.
 
 ```silk
-import silk.http { Header, ValueError }
-import silk.http_content {
+import silk.http.message { Header, ValueError }
+import silk.http.content {
   AcceptEncoding,
   EmptyEncodingPolicy,
   EnabledCodings,
   Mode,
   acceptEncoding,
 }
-import silk.http_headers { Limits }
-import silk.option { Option }
-import silk.result { Result }
+import silk.http.headers { Limits }
+import silk.core.option { Option }
+import silk.core.result { Result }
 
 fn negotiationLimits() -> Limits {
   return Limits {
@@ -55,7 +55,7 @@ pub fn main() -> i32 {
 performs response-body selection itself and atomically retains the validated head, request method,
 trailer policy, framing selection, and exact `Selection.anomaly`. A caller cannot inject a framing
 or anomaly selected elsewhere. `CodingPlan.make` consumes that affine context together with
-`Mode`, `http_body.Limits`, and finite content `Limits`; the context and its selection cannot be
+`Mode`, `body.Limits`, and finite content `Limits`; the context and its selection cannot be
 reused.
 
 This low-level contract does not prove that bytes later supplied to `withReader` came from the
@@ -115,7 +115,7 @@ Content `Limits` apply independently:
 | `intermediateCapacity` | Each active staging edge, from one through 65,536 bytes                                                    |
 
 Codec-specific limits remain part of the same plan. Body-decoder storage remains governed by
-`http_body.Limits.maxOwnedBytes` and is not double-counted. The inline reader charge excludes that
+`body.Limits.maxOwnedBytes` and is not double-counted. The inline reader charge excludes that
 body state and active codec state already included in codec reservations. It includes inactive
 stage slots, edge descriptors, metadata, padding, and the transport reference. Zero byte allowances
 are real limits.

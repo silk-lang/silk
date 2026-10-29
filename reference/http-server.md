@@ -1,11 +1,11 @@
 # Streaming HTTP server
 
-`silk.http_server` owns one serial HTTP/1.0 or HTTP/1.1 exchange over an explicitly supplied byte
+`silk.http.server` owns one serial HTTP/1.0 or HTTP/1.1 exchange over an explicitly supplied byte
 transport. The connection, each request, each response writer, and each upgraded channel are scoped
 loans; none can escape the callback that owns the concrete provider.
 
 ```silk
-import silk.http_server {
+import silk.http.server {
   BodyMode,
   Connection,
   ConnectionHandler,
@@ -32,7 +32,7 @@ the buffered-I/O maximum; they are checked before parser or buffer allocation. O
 remain meaningful, and a zero request limit closes without reading. Deadlines are optional absolute
 `Instant` values and are never refreshed between fragments.
 
-Request bodies are method-independent and use the shared `silk.http_body` decoder. A handler must
+Request bodies are method-independent and use the shared `silk.http.body` decoder. A handler must
 read a body to completion or explicitly discard it under a finite wire-byte budget before reuse;
 there is no automatic drain. Each discard call receives its own allowance from the current decoder
 wire coordinate. If decoding fails after committing input, the server consumes that exact reported
@@ -64,8 +64,8 @@ remain outside current structured-finalizer guarantees.
 
 Generic Upgrade and successful CONNECT tunnel handoff fully write and flush the switching response,
 then lend the same buffered channel with its exact unread suffix. HTTP operations cannot resume
-afterward. `silk.http_server_native.serveNext` is available only on the native targets admitted by
-`silk.native_socket`; it accepts exactly one connection per call and creates no background queue or
+afterward. `silk.http.server_native.serveNext` is available only on the native targets admitted by
+`silk.net.socket_native`; it accepts exactly one connection per call and creates no background queue or
 task.
 
 `ConnectionHandler<P, A, E, ?R>` is the nominal compile-time adapter used by `withConnection` and

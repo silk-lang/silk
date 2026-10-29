@@ -152,12 +152,12 @@ has no language support.
 
 ## Running tests
 
-The `silk.testing` module provides a source-defined boolean expectation. It returns unit when the
+The `silk.testing.testing` module provides a source-defined boolean expectation. It returns unit when the
 condition is true and fails with `AssertionError` carrying the supplied message when it is false.
 The helper has no service requirement and uses the same typed failure channel as other Effects.
 
 ```silk
-import silk.testing { AssertionError, Testing }
+import silk.testing.testing { AssertionError, Testing }
 
 test effect fn additionWorks() -> () ! AssertionError<'static> {
   return run Testing.expect(1 + 1 == 2, "expected two")
@@ -212,7 +212,7 @@ body in local provision or a nested Effect. Exact callable requirement rows rema
 future source-written host can provide services explicitly.
 
 ```silk
-import silk.effect { Effect }
+import silk.core.effect { Effect }
 
 service Clock { effect fn value() -> i32 ? &Clock }
 struct FixedClock { value: i32 }
@@ -263,7 +263,7 @@ silk test             # reuses an unchanged runner, then runs every selected tes
 silk test --no-cache  # builds the runner again, then runs every selected test
 ```
 
-The plan and receipt the host exchanges with the runner (`silk.test_exchange`) also have a
+The plan and receipt the host exchanges with the runner (`silk.testing.exchange`) also have a
 per-test mode that marks cache hits; `silk test` always uses the compact uncached mode.
 
 **Boundary:** Reusing passed results needs a per-test identity that covers each test's transitive

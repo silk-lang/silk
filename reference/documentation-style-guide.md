@@ -51,7 +51,7 @@ content, and each example heading. Declaration comments use this form:
 /// Explain a choice only when the code cannot show it.
 ///
 /// ```silk
-/// import silk.option { Option }
+/// import silk.core.option { Option }
 ///
 /// pub fn main() -> i32 {
 ///   let value = Option<i32>.some(2)
@@ -97,7 +97,7 @@ never show the module comment. Thus the description of an item must be in the co
 - When a module comment states a fact about one item, also state that fact in the comment of the
   item.
 
-For example, if the module comment of `silk.box` says that a long chain of boxes uses one stack
+For example, if the module comment of `silk.mem.box` says that a long chain of boxes uses one stack
 frame for each link, the `Box` comment and the `Box.into` comment must also say it.
 
 ## Each comment is self-sufficient
@@ -144,7 +144,7 @@ Use one summary paragraph. Add useful sections in the standard order. Under `# E
 
 Use one blank `//!` line before each module section. Put section content directly after its heading.
 
-The `silk.box` header is the model:
+The `silk.mem.box` header is the model:
 
 ```silk,ignore
 //! One owned heap indirection for recursive data and values whose storage must have a stable size.
@@ -176,7 +176,7 @@ modules. Put one blank `//!` line before it:
 
 ```silk,ignore
 //! # See also
-//! Use the `silk.char` module when a value is a Unicode scalar rather than an arbitrary byte.
+//! Use the `silk.text.char` module when a value is a Unicode scalar rather than an arbitrary byte.
 //!
 //! @category Numbers
 ```
@@ -211,7 +211,7 @@ Use code formatting without a link when:
 - the symbol-link resolver cannot reach the target; or
 - repeated links make a paragraph difficult to read.
 
-For example, use `self`, `None`, `|>`, and `silk.string.String` as code when no resolvable symbol
+For example, use `self`, `None`, `|>`, and `silk.text.string.String` as code when no resolvable symbol
 link is available.
 
 Link a related API when it is:
@@ -470,8 +470,8 @@ associated items, so calls remain qualified and contextual. This follows
 Preferred:
 
 ```silk
-import silk.usize
-import silk.list { List }
+import silk.num.usize
+import silk.collections.list { List }
 
 pub fn main() -> i32 {
   let values = List<i32>.make()
@@ -580,7 +580,7 @@ This comment documents `List.length`. The signature gives the remaining informat
 /// ## Use a present and an absent value
 ///
 /// ```silk
-/// import silk.option { Option }
+/// import silk.core.option { Option }
 ///
 /// pub fn main() -> i32 {
 ///   let present = Option<i32>.some(7)
@@ -621,10 +621,10 @@ an owned value pipeline.
 /// ## Get the second list element
 ///
 /// ```silk
-/// import silk.allocator { Allocator, OutOfMemoryError }
-/// import silk.effect { Effect }
-/// import silk.usize
-/// import silk.list { List }
+/// import silk.mem.allocator { Allocator, OutOfMemoryError }
+/// import silk.core.effect { Effect }
+/// import silk.num.usize
+/// import silk.collections.list { List }
 ///
 /// pub effect fn main() -> i32
 ///   ! OutOfMemoryError {
@@ -719,6 +719,6 @@ publication.
 - [ ] The rendered comment is easy to scan in an editor and generated reference page.
 
 Use canonical import names in every example, including inline snippets and comments. Select the
-standard-library owner (`import silk.pointer { Pointer }`) and import primitive modules without an
-alias (`import silk.usize`). Reserve aliases for actual collisions or examples explicitly teaching
+standard-library owner (`import silk.mem.pointer { Pointer }`) and import primitive modules without an
+alias (`import silk.num.usize`). Reserve aliases for actual collisions or examples explicitly teaching
 alias syntax. Prefer more specific declaration names before introducing a collision alias.

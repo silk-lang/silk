@@ -1,0 +1,377 @@
+//! Native `Writer` providers for standard output and standard error, and a lock for whole messages
+//! on standard error.
+//!
+//! # When to use
+//! Provide [`StdoutWriter`] or [`StderrWriter`] for `Writer` in a native program. Code that writes
+//! uses `silk.io.writer`, so a test can provide a writer to memory instead.
+//!
+//! Use [`StderrWriter.print`] for a debug message on standard error. Use [`StderrWriter.lock`] when
+//! several writes must reach standard error as one message, with no output of other threads
+//! between them.
+//!
+//! # Details
+//! [`StdoutWriter`] and [`StderrWriter`] have no buffer. Each write writes all bytes to the
+//! descriptor, and flush does nothing. The process owns the descriptors, and the providers do not
+//! close them.
+//!
+//! `Writer.writeVectored` sends several slices in one `writev` system call, up to eight slices for
+//! each call.
+//!
+//! WASI commands have one thread. Their standard error lock does not need host synchronization.
+//!
+//! Standard error has one lock for the whole process: the lock of the C library's `stderr` stream.
+//! Each [`StderrWriter`] write takes it for the duration of that write. [`StderrWriter.lock`] keeps
+//! it until the [`LockedStderr`] drops, and collects the writes in a small buffer that the caller
+//! lends. The lock is recursive: the thread that holds it can take it again, for example to report
+//! a failure in the middle of a message. Standard output has no lock. A program that writes to it
+//! from several threads controls the order itself.
+//!
+//! # Errors
+//! `WriterError` if a write fails. Part of the bytes can be written already.
+//!
+//! # Gotchas
+//! - The providers exist on WASI, Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+//! - The lock orders only writes that take it. A direct write to descriptor 2, such as one from
+//!   `silk.platform.native.descriptor`, can come between the parts of a locked message.
+//!
+//! # Examples
+//! ## Write to standard output
+//! ```silk
+//! import silk.core.effect { Effect }
+//! import silk.io.writer_native { StdoutWriter }
+//! import silk.io.writer { Writer, WriterError }
+//!
+//! pub effect fn main() -> i32
+//!   ! WriterError {
+//!   let mut out = StdoutWriter.make()
+//!   run Writer.writeString("Silk\n") |> Effect.provideMut<Writer>(&mut out)
+//!   return 0
+//! }
+//! ```
+//!
+//! ## Print a debug message
+//! ```silk
+//! import silk.io.writer_native { StderrWriter }
+//!
+//! pub fn main() -> i32 {
+//!   let values = .{ name: "cache", hits: 3 }
+//!   StderrWriter.print("{name}: {hits} hits\n", &values)
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Input and output
+
+static if Intrinsic.targetOperatingSystem() == "wasi" || (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArchitecture() == "aarch64" && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+  import silk.core.effect { Effect }
+  import silk.text.format { Format }
+  static if Intrinsic.targetOperatingSystem() == "wasi" {
+    import silk.platform.wasi.descriptor {WasiDescriptor as NativeDescriptor}
+  } else {
+    import silk.platform.native.descriptor {NativeDescriptor}
+  }
+  import silk.core.ownership { Drop }
+  import silk.collections.slice { Slice }
+  import silk.num.usize
+  import silk.io.writer { Writer, WriterError }
+
+static if Intrinsic.targetOperatingSystem() == "wasi" {
+  fn lockStandardError() -> () {}
+  fn unlockStandardError() -> () {}
+} else {
+// The C library's `FILE`. Only its lock is used.
+extern "C" struct CStream {}
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  unsafe extern "C" static standardErrorStream: *mut CStream as "__stderrp"
+} else {
+  unsafe extern "C" static standardErrorStream: *mut CStream as "stderr"
+}
+// POSIX stream locks are recursive: the owner thread can lock again, and each lock needs one unlock.
+unsafe extern "C" fn flockfile(stream: *mut CStream) -> () with Intrinsic.foreign(noCapture: ("stream",))
+unsafe extern "C" fn funlockfile(stream: *mut CStream) -> () with Intrinsic.foreign(noCapture: ("stream",))
+
+fn lockStandardError() -> () { unsafe { return flockfile(standardErrorStream) } }
+fn unlockStandardError() -> () { unsafe { return funlockfile(standardErrorStream) } }
+}
+/// A `Writer` for standard output.
+///
+/// # Details
+/// It has no buffer. Each write writes all bytes to the descriptor, and flush does nothing. The
+/// process owns the descriptor, and the writer does not close it. `Writer.writeVectored` sends up
+/// to eight slices in one `writev` system call.
+///
+/// # Gotchas
+/// Standard output has no lock. A program that writes to it from several threads controls the
+/// order itself.
+pub struct StdoutWriter {
+}
+
+/// A `Writer` for standard error.
+///
+/// # Details
+///
+/// WASI commands have one thread, so their standard error lock requires no host synchronization.
+/// Each write takes the standard error lock for its duration. Thus one write never comes in the
+/// middle of a message that another thread holds with [`StderrWriter.lock`]. It has no buffer, and
+/// flush does nothing. The process owns the descriptor, and the writer does not close it.
+///
+/// # Gotchas
+/// The lock orders only writes that take it. A direct write to descriptor 2, such as one from
+/// `silk.platform.native.descriptor`, can come between the parts of a locked message.
+pub struct StderrWriter {
+}
+
+impl StdoutWriter {
+  /// Returns a writer. It does not write.
+  pub fn make() -> StdoutWriter { return StdoutWriter {} }
+}
+
+impl StderrWriter {
+  /// Returns a writer. It does not write.
+  pub fn make() -> StderrWriter { return StderrWriter {} }
+
+  /// Takes the standard error lock and returns a `Writer` that collects writes in `buffer`.
+  ///
+  /// # When to use
+  ///
+  /// Use `lock` when several writes must reach standard error together, such as a formatted line.
+  /// For one formatted message, [`StderrWriter.print`] is shorter.
+  ///
+  /// # Details
+  ///
+  /// The call waits until no other thread holds the lock. The [`LockedStderr`] keeps the lock until
+  /// it drops, and then writes the bytes that are left in `buffer`. A write that does not fit in
+  /// the free part of `buffer` goes out at once, together with the buffered bytes in one system
+  /// call. Thus a buffer of 64 bytes gives one system call for most short lines. An empty `buffer`
+  /// gives one system call for each write.
+  ///
+  /// WASI commands have one thread, so the lock requires no host synchronization.
+  /// The lock is recursive. A second `lock` on the same thread returns at once, and its bytes go
+  /// out before the bytes that the first [`LockedStderr`] still holds.
+  ///
+  /// # Gotchas
+  ///
+  /// - Keep the lock for a short time. Each other thread that writes to standard error waits.
+  /// - The bytes in `buffer` are lost if the program traps before the drop.
+  ///
+  /// # Examples
+  ///
+  /// ## Write one line from several parts
+  ///
+  /// ```silk
+  /// import silk.core.effect { Effect }
+  /// import silk.text.format { Format }
+  /// import silk.io.writer_native { StderrWriter }
+  /// import silk.io.writer { Writer, WriterError }
+  ///
+  /// effect fn report(count: i32) -> ()
+  ///   ! WriterError
+  ///   ? &mut Writer {
+  ///   run Writer.writeString("worker: ")
+  ///   run Format.format("{} jobs left", &(count,))
+  ///   return run Writer.writeString("\n")
+  /// }
+  ///
+  /// pub effect fn main() -> i32
+  ///   ! WriterError {
+  ///   let mut buffer: [u8; 64] = [0; 64]
+  ///   let mut stderr = StderrWriter.lock(&mut buffer)
+  ///
+  ///   // No other thread can write to standard error between the three parts.
+  ///   run report(3) |> Effect.provideMut<Writer>(&mut stderr)
+  ///   run Writer.flush() |> Effect.provideMut<Writer>(&mut stderr)
+  ///   return 0
+  /// }
+  /// ```
+  pub fn lock<'a>(buffer: &'a mut [u8]) -> LockedStderr<'a> {
+    lockStandardError()
+    return LockedStderr<'a> { buffer: move buffer, end: usize.ZERO }
+  }
+
+  /// Formats `template` with `args` and writes it to standard error as one message. It ignores
+  /// failures.
+  ///
+  /// # When to use
+  ///
+  /// Use `print` for a debug message, such as a value during a search for a bug. For program
+  /// output, provide a `Writer`. For log events, use `silk.io.logger`.
+  ///
+  /// # Details
+  ///
+  /// The template rules are those of `silk.text.format.Format.format`, and the compiler checks them.
+  /// The call holds the standard error lock while it formats and writes, so messages of different
+  /// threads do not mix. It formats into a buffer of 64 bytes on the stack. Thus a short message is
+  /// one system call, and the call does not allocate. It adds no newline.
+  ///
+  /// # Gotchas
+  ///
+  /// A failed write is not reported. Part of the message can be written already.
+  ///
+  /// # Examples
+  ///
+  /// ## Print a value with its name
+  ///
+  /// ```silk
+  /// import silk.io.writer_native { StderrWriter }
+  ///
+  /// pub fn main() -> i32 {
+  ///   let width = 80
+  ///   StderrWriter.print("width = {}\n", &(width,))
+  ///   return 0
+  /// }
+  /// ```
+  pub fn print<Args>(static template: string<'static>, args: &Args) -> () {
+    let mut buffer: [u8; 64] = [0; 64]
+    let mut stderr = StderrWriter.lock(&mut buffer)
+    let formatted = run Effect.result(formatLocked<Args>(&mut stderr, template, args))
+    drop formatted
+    return ()
+  }
+}
+
+effect fn formatLocked<Args>(
+  writer: &mut LockedStderr,
+  static template: string<'static>,
+  args: &Args
+) -> () ! WriterError {
+  return run Format.format<Args>(template, args) |> Effect.provideMut<Writer>(&mut writer)
+}
+
+/// A `Writer` for standard error that holds the standard error lock until it drops.
+///
+/// # Details
+///
+/// Make one with [`StderrWriter.lock`]. It collects writes in the buffer that the caller lent, and
+/// writes them when the buffer is full, on `Writer.flush`, and when it drops. A drop ignores a
+/// failure. Flush first to see it.
+pub struct LockedStderr<'a> {
+  buffer: &'a mut [u8],
+  end: usize,
+}
+
+impl<'a> LockedStderr<'a> {
+  effect fn writeLocked(self: &mut Self, val: &[u8]) -> () ! WriterError {
+    if val.length <= self.buffer.length - self.end {
+      let mut index = usize.ZERO
+      while index < val.length {
+        self.buffer[self.end + index] = val[index]
+        index = index + usize.ONE
+      }
+      self.end = self.end + val.length
+      return ()
+    }
+    // The bytes do not fit: send the buffered bytes and `val` in one vectored write.
+    let rest = [val]
+    return run self.writeGathered(&rest)
+  }
+
+  effect fn writeVectoredLocked(self: &mut Self, vals: &[&[u8]]) -> () ! WriterError {
+    let mut total = usize.ZERO
+    let mut index = usize.ZERO
+    while index < vals.length {
+      total = total + vals[index].length
+      index = index + usize.ONE
+    }
+    if total > self.buffer.length - self.end {
+      return run self.writeGathered(vals)
+    }
+    index = usize.ZERO
+    while index < vals.length {
+      run self.writeLocked(vals[index])
+      index = index + usize.ONE
+    }
+    return ()
+  }
+
+  // Sends the buffered bytes and then `rest` in vectored writes, and empties the buffer.
+  effect fn writeGathered(self: &mut Self, rest: &[&[u8]]) -> () ! WriterError {
+    let mut nativeError = 0
+    let held = self.end
+    self.end = usize.ZERO
+    let written = run NativeDescriptor.writeAllGather(2, Slice.view<u8>(&self.buffer, usize.ZERO, held), rest, &mut nativeError)
+    if written == false { fail Writer.failure() }
+    return ()
+  }
+
+  effect fn flushLocked(self: &mut Self) -> () ! WriterError {
+    if self.end == usize.ZERO { return () }
+    let mut nativeError = 0
+    let held = self.end
+    self.end = usize.ZERO
+    let written = run NativeDescriptor.writeAll(2, Slice.view<u8>(&self.buffer, usize.ZERO, held), &mut nativeError)
+    if written == false { fail Writer.failure() }
+    return ()
+  }
+}
+
+impl<'a> Writer for LockedStderr<'a> {
+  effect fn writeAll(self: &mut Self, val: &[u8]) -> () ! WriterError ? &mut Writer {
+    return run self.writeLocked(val)
+  }
+  effect fn flush(self: &mut Self) -> () ! WriterError ? &mut Writer {
+    return run self.flushLocked()
+  }
+  effect fn writeVectored(self: &mut Self, vals: &[&[u8]]) -> () ! WriterError ? &mut Writer {
+    return run self.writeVectoredLocked(vals)
+  }
+}
+
+impl<'a> Drop for LockedStderr<'a> {
+  fn drop(self: &mut LockedStderr<'a>) -> () {
+    let flushed = run Effect.result(self.flushLocked())
+    drop flushed
+    unlockStandardError()
+    return ()
+  }
+}
+
+impl Writer for StdoutWriter {
+  effect fn writeAll(self: &mut Self, val: &[u8]) -> () ! WriterError ? &mut Writer {
+    let mut nativeError = 0
+    let written = run NativeDescriptor.writeAll(1, val, &mut nativeError)
+    if written == false {
+      fail Writer.failure()
+    }
+    return ()
+  }
+  effect fn flush(self: &mut Self) -> () ! WriterError ? &mut Writer {
+    return ()
+  }
+  effect fn writeVectored(self: &mut Self, vals: &[&[u8]]) -> () ! WriterError ? &mut Writer {
+    let mut nativeError = 0
+    let written = run NativeDescriptor.writeAllGather(1, b"", vals, &mut nativeError)
+    if written == false {
+      fail Writer.failure()
+    }
+    return ()
+  }
+}
+
+impl Writer for StderrWriter {
+  effect fn writeAll(self: &mut Self, val: &[u8]) -> () ! WriterError ? &mut Writer {
+    let mut nativeError = 0
+    lockStandardError()
+    let written = run NativeDescriptor.writeAll(2, val, &mut nativeError)
+    unlockStandardError()
+    if written == false {
+      fail Writer.failure()
+    }
+    return ()
+  }
+  effect fn flush(self: &mut Self) -> () ! WriterError ? &mut Writer {
+    return ()
+  }
+  effect fn writeVectored(self: &mut Self, vals: &[&[u8]]) -> () ! WriterError ? &mut Writer {
+    let mut nativeError = 0
+    lockStandardError()
+    let written = run NativeDescriptor.writeAllGather(2, b"", vals, &mut nativeError)
+    unlockStandardError()
+    if written == false {
+      fail Writer.failure()
+    }
+    return ()
+  }
+}
+
+
+}

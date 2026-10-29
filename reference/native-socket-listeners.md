@@ -5,7 +5,7 @@ description: Scoped nonblocking TCP and pathname-Unix listeners with owned accep
 
 # Native socket listeners
 
-`silk.native_socket` creates one affine listening descriptor and admits one independently owned
+`silk.net.socket_native` creates one affine listening descriptor and admits one independently owned
 connection at a time. The actor is ordinary selected Silk source: it is available on aarch64 Darwin
 with Apple system libc and on aarch64 or x86-64 GNU/Linux with glibc. It is absent on Windows, musl,
 no-libc profiles, and WebAssembly.
@@ -15,8 +15,8 @@ the requested port is zero: the kernel-assigned nonzero port is published only a
 `listen`, and `getsockname` all succeed.
 
 ```silk
-import silk.native_socket {Accepted, AcceptedContext, AcceptedView, BoundAddress, ListenOptions, Listener, NativeSocketError, listen, withAcceptedContext}
-import silk.network_address {Endpoint, IpAddress, Ipv4Address, Port}
+import silk.net.socket_native {Accepted, AcceptedContext, AcceptedView, BoundAddress, ListenOptions, Listener, NativeSocketError, listen, withAcceptedContext}
+import silk.net.address {Endpoint, IpAddress, Ipv4Address, Port}
 
 fn loopbackListener() -> Endpoint {
   return Endpoint.make(

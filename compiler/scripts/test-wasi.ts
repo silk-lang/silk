@@ -160,10 +160,10 @@ const program = Effect.gen(function* () {
     )
     yield* fs.writeFileString(join(examples, 'marker'), 'package directory')
     const example = [
-      'import silk.allocator { Allocator, OutOfMemoryError }',
-      'import silk.effect { Effect }',
-      'import silk.filesystem { FileSystem, FileError, Path }',
-      'import silk.os_filesystem { OsFileSystem }',
+      'import silk.mem.allocator { Allocator, OutOfMemoryError }',
+      'import silk.core.effect { Effect }',
+      'import silk.system.filesystem { FileSystem, FileError, Path }',
+      'import silk.system.filesystem_native { OsFileSystem }',
       'pub effect fn main() -> i32 ! FileError | OutOfMemoryError {',
       '  let mut allocator = Allocator.systemAllocatorProvider()',
       '  let mut fs = run OsFileSystem.make("/") |> Effect.provideMut<Allocator>(&mut allocator)',

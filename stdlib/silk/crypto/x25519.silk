@@ -1,0 +1,495 @@
+//! Agree on a shared secret with X25519 (RFC 7748) Diffie-Hellman.
+//!
+//! # When to use
+//! Use [`X25519`] when two parties must get the same secret over a channel that others can read,
+//! for example in a TLS 1.3 or Noise handshake. Each side makes a key with [`X25519.generate`],
+//! sends [`X25519.publicKey`], and calls [`X25519.agree`] with the public key of the other side.
+//! Then derive the real keys from the shared secret with `silk.crypto.hkdf`.
+//!
+//! # Details
+//! Secrets, public keys, and shared secrets are 32 bytes, little-endian. A secret is clamped as RFC
+//! 7748 says, so all 32-byte values are valid. [`X25519.agree`] consumes the key, because an
+//! ephemeral key is for one exchange. Nothing allocates.
+//!
+//! # Errors
+//! - [`X25519Error`] for an input with the wrong length, or for a peer key that gives an all-zero
+//!   secret.
+//!
+//! # Gotchas
+//! The exchange does not tell you who the other side is. An attacker in the middle can run one
+//! exchange with each side. Authenticate the exchange, for example with a certificate signature. Do
+//! not use the shared secret directly as a key. The key is not erased when it is dropped.
+//!
+//! # Examples
+//! ## Agree on a secret (RFC 7748 test vector)
+//! ```silk
+//! import silk.core.result { Result }
+//! import silk.crypto.x25519 { X25519, X25519Error }
+//!
+//! pub fn main() -> i32 {
+//!   // Real programs use `X25519.generate()` with a secure `Random` provider.
+//!   let alice = match X25519.fromSecret(
+//!     b"\x77\x07\x6d\x0a\x73\x18\xa5\x7d\x3c\x16\xc1\x72\x51\xb2\x66\x45\xdf\x4c\x2f\x87\xeb\xc0\x99\x2a\xb1\x77\xfb\xa5\x1d\xb9\x2c\x2a"
+//!   ) {
+//!     Result<X25519, X25519Error>.Success { value } => move value
+//!     Result<X25519, X25519Error>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let bob = match X25519.fromSecret(
+//!     b"\x5d\xab\x08\x7e\x62\x4a\x8a\x4b\x79\xe1\x7f\x8b\x83\x80\x0e\xe6\x6f\x3b\xb1\x29\x26\x18\xb6\xfd\x1c\x2f\x8b\x27\xff\x88\xe0\xeb"
+//!   ) {
+//!     Result<X25519, X25519Error>.Success { value } => move value
+//!     Result<X25519, X25519Error>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let alicePublic = X25519.publicKey(&alice)
+//!   let bobPublic = X25519.publicKey(&bob)
+//!   let fromAlice = match X25519.agree(move alice, &bobPublic) {
+//!     Result<[u8; 32], X25519Error>.Success { value } => value
+//!     Result<[u8; 32], X25519Error>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let fromBob = match X25519.agree(move bob, &alicePublic) {
+//!     Result<[u8; 32], X25519Error>.Success { value } => value
+//!     Result<[u8; 32], X25519Error>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!
+//!   // Both sides get 4a5d9d5b...1742.
+//!   if alicePublic[0] != 0x85 || fromAlice[0] != 0x4a || fromBob[0] != 0x4a || fromBob[31] != 0x42 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Cryptography
+
+import silk.text.format {Debug, Format, Formatter}
+import silk.system.random {Random}
+import silk.core.result {Result}
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.io.writer {Writer, WriterError}
+
+/// The reason that an X25519 call failed. It holds no secret bytes.
+pub union X25519Error {
+  /// The secret is not 32 bytes.
+  InvalidScalarLength,
+  /// The public key of the peer is not 32 bytes.
+  InvalidPeerLength,
+  /// The public key of the peer gives an all-zero shared secret. This occurs for a few low-order
+  /// points that a hostile peer can send.
+  AllZeroSharedSecret,
+}
+
+impl Debug for X25519Error {
+  /// Writes the name of the variant and its fields, such as `InvalidScalarLength`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      X25519Error.InvalidScalarLength => run Format.write(&mut formatter, b"InvalidScalarLength")
+      X25519Error.InvalidPeerLength => run Format.write(&mut formatter, b"InvalidPeerLength")
+      X25519Error.AllZeroSharedSecret => run Format.write(&mut formatter, b"AllZeroSharedSecret")
+    }
+  }
+}
+
+/// An X25519 key pair for one exchange: a secret and its public key.
+///
+/// # When to use
+/// Use it when two parties must get the same secret over a channel that others can read, for
+/// example in a TLS 1.3 or Noise handshake. Each side makes a key with [`X25519.generate`], sends
+/// [`X25519.publicKey`], and calls [`X25519.agree`] with the public key of the other side.
+///
+/// # Details
+/// [`X25519.agree`] consumes it. Make a new one for each exchange. Secrets, public keys, and shared
+/// secrets are 32 bytes, little-endian. Nothing allocates.
+///
+/// # Gotchas
+/// The exchange does not tell you who the other side is. An attacker in the middle can run one
+/// exchange with each side. Authenticate the exchange, for example with a certificate signature.
+/// Derive the real keys from the shared secret with `silk.crypto.hkdf`. The key is not erased when it is
+/// dropped.
+pub struct X25519 {
+  scalar: [u8; 32],
+  public: [u8; 32],
+}
+
+impl X25519 {
+  /// Returns the key pair for the 32-byte secret `bytes`, after RFC 7748 clamping.
+  ///
+  /// Use it for test vectors or a secret that you stored. The bytes are copied.
+  ///
+  /// # Errors
+  /// - `InvalidScalarLength` if `bytes` is not 32 bytes.
+  ///
+  /// # Gotchas
+  /// For a new exchange, use [`X25519.generate`]. A secret that is used for two exchanges gives the
+  /// same public key to both, so the exchanges can be linked.
+  pub fn fromSecret(bytes: &[u8]) -> Result<X25519, X25519Error> {
+    if bytes.length != 32 {
+      return Result<X25519, X25519Error>.failResult(X25519Error.InvalidScalarLength)
+    }
+    return Result<X25519, X25519Error>.succeed(make(bytes))
+  }
+  /// Returns a new key pair with a secret from 32 bytes of the ambient `Random`.
+  ///
+  /// The `Random` provider must be cryptographically secure. If it fails, the program stops. There
+  /// is no fallback to a weaker source.
+  pub effect fn generate() -> X25519 ? &mut Random {
+    let mut bytes = zeroBytes()
+    run Random.fillBytes(&mut bytes)
+    return make(&bytes)
+  }
+  /// Returns the 32-byte public key to send to the peer. It does not consume the key pair.
+  pub fn publicKey(self: &X25519) -> [u8; 32] {
+    return self.public
+  }
+  /// Returns the 32-byte shared secret for the public key `peer` of the other side, and consumes
+  /// the key pair.
+  ///
+  /// As RFC 7748 says, the top bit of `peer` is ignored and any 32-byte value is accepted, also a
+  /// point that is not on the curve.
+  ///
+  /// # Errors
+  /// - `InvalidPeerLength` if `peer` is not 32 bytes.
+  /// - `AllZeroSharedSecret` if the result is all zeros. Stop the exchange.
+  ///
+  /// The key pair is consumed also when it fails.
+  ///
+  /// # Gotchas
+  /// Pass the result through a key derivation function such as `silk.crypto.hkdf` before you use it as a
+  /// key.
+  pub fn agree(self: X25519, peer: &[u8]) -> Result<[u8; 32], X25519Error> {
+    if peer.length != 32 {
+      return Result<[u8; 32], X25519Error>.failResult(X25519Error.InvalidPeerLength)
+    }
+    let shared = multiply(&self.scalar, peer)
+    // A bounded sum keeps all bytes in the reduction, including optimized Wasm output.
+    let mut total: u32 = 0
+    let mut index: usize = 0
+    while index < 32 {
+      total = u32.wrappingAdd(total, u8.toU32(shared[index]))
+      index = index + 1
+    }
+    if total == 0 {
+      return Result<[u8; 32], X25519Error>.failResult(X25519Error.AllZeroSharedSecret)
+    }
+    return Result<[u8; 32], X25519Error>.succeed(move shared)
+  }
+}
+
+fn make(bytes: &[u8]) -> X25519 {
+  let mut scalar = zeroBytes()
+  let mut index: usize = 0
+  while index < 32 {
+    scalar[index] = bytes[index]
+    index = index + 1
+  }
+  scalar[0] = u8.bitAnd(scalar[0], 248)
+  scalar[31] = u8.bitOr(u8.bitAnd(scalar[31], 127), 64)
+  let mut base = zeroBytes()
+  base[0] = 9
+  let public = multiply(&scalar, &base)
+  return X25519 {scalar: move scalar, public: move public}
+}
+
+// Limb bounds below prove these wrapping operations never lose significant bits.
+// They avoid overflow-check branches and widened multiply helpers on secret data.
+struct Field {
+  limbs: [u64; 16],
+}
+
+fn zero() -> Field {
+  return Field {limbs: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}
+}
+
+fn one() -> Field {
+  let mut result = zero()
+  result.limbs[0] = 1
+  return move result
+}
+
+// Input limbs are below 2^42. First carry folding leaves limb zero below 2^32;
+// the second pass leaves it at most 65554. The third resolves the final carry.
+// If that carry travels through the top limb, all preceding limbs became zero,
+// so adding 19 to limb zero cannot need another pass. All loops are fixed.
+fn normalize(value: Field) -> Field {
+  let mut result = move value
+  let mut pass: usize = 0
+  while pass < 3 {
+    let mut index: usize = 0
+    while index < 15 {
+      let carry = u64.shiftRight(result.limbs[index], 16)
+      result.limbs[index] = u64.bitAnd(result.limbs[index], 65535)
+      result.limbs[index + 1] = u64.wrappingAdd(result.limbs[index + 1], carry)
+      index = index + 1
+    }
+    let carry = u64.shiftRight(result.limbs[15], 15)
+    result.limbs[15] = u64.bitAnd(result.limbs[15], 32767)
+    result.limbs[0] = u64.wrappingAdd(result.limbs[0], u64.wrappingMultiply(carry, 19))
+    pass = pass + 1
+  }
+  // The normalized value is below 2^255. Adding 19 overflows bit255 exactly
+  // when subtraction of p is needed, so one mask selection canonicalizes it.
+  let mut reduced = zero()
+  let mut carry: u64 = 19
+  let mut index: usize = 0
+  while index < 15 {
+    let sum = u64.wrappingAdd(result.limbs[index], carry)
+    reduced.limbs[index] = u64.bitAnd(sum, 65535)
+    carry = u64.shiftRight(sum, 16)
+    index = index + 1
+  }
+  let top = u64.wrappingAdd(result.limbs[15], carry)
+  reduced.limbs[15] = u64.bitAnd(top, 32767)
+  let mask = u64.wrappingSubtract(0, u64.shiftRight(top, 15))
+  index = 0
+  while index < 16 {
+    result.limbs[index] = u64.bitXor(
+      result.limbs[index],
+      u64.bitAnd(mask, u64.bitXor(result.limbs[index], reduced.limbs[index])),
+    )
+    index = index + 1
+  }
+  return move result
+}
+
+fn add(left: &Field, right: &Field) -> Field {
+  let mut result = zero()
+  let mut index: usize = 0
+  while index < 16 {
+    result.limbs[index] = u64.wrappingAdd(left.limbs[index], right.limbs[index])
+    index = index + 1
+  }
+  return normalize(move result)
+}
+
+fn subtract(left: &Field, right: &Field) -> Field {
+  let mut result = zero()
+  let mut index: usize = 0
+  while index < 16 {
+    let mut twicePrime: u64 = 131070
+    if index == 0 {
+      twicePrime = 131034
+    }
+    if index == 15 {
+      twicePrime = 65534
+    }
+    result.limbs[index] = u64.wrappingSubtract(
+      u64.wrappingAdd(left.limbs[index], twicePrime),
+      right.limbs[index],
+    )
+    index = index + 1
+  }
+  return normalize(move result)
+}
+
+fn product(left: &Field, right: &Field) -> Field {
+  // Canonical limbs are <=65535. Each convolution accumulator is <2^36;
+  // folding at most 38 times a high accumulator keeps each low limb <2^42.
+  let mut wide: [u64; 32] = [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+  ]
+  let mut i: usize = 0
+  while i < 16 {
+    let mut j: usize = 0
+    while j < 16 {
+      wide[i + j] = u64.wrappingAdd(
+        wide[i + j],
+        u64.wrappingMultiply(left.limbs[i], right.limbs[j]),
+      )
+      j = j + 1
+    }
+    i = i + 1
+  }
+  let mut result = zero()
+  i = 0
+  while i < 16 {
+    result.limbs[i] = u64.wrappingAdd(wide[i], u64.wrappingMultiply(38, wide[i + 16]))
+    i = i + 1
+  }
+  return normalize(move result)
+}
+
+fn square(value: &Field) -> Field {
+  return product(value, value)
+}
+
+fn times121665(value: &Field) -> Field {
+  let mut result = zero()
+  let mut index: usize = 0
+  while index < 16 {
+    result.limbs[index] = u64.wrappingMultiply(value.limbs[index], 121665)
+    index = index + 1
+  }
+  return normalize(move result)
+}
+
+fn swap(left: &mut Field, right: &mut Field, bit: u64) -> () {
+  let mask = u64.wrappingSubtract(0, bit)
+  let mut index: usize = 0
+  while index < 16 {
+    let difference = u64.bitAnd(mask, u64.bitXor(left.limbs[index], right.limbs[index]))
+    left.limbs[index] = u64.bitXor(left.limbs[index], difference)
+    right.limbs[index] = u64.bitXor(right.limbs[index], difference)
+    index = index + 1
+  }
+}
+
+fn inverse(value: &Field) -> Field {
+  let mut result = one()
+  let mut remaining: usize = 255
+  while remaining > 0 {
+    remaining = remaining - 1
+    result = square(&result)
+    // Bits2 and4 are the only zero bits in the public exponent 2^255−21.
+    if remaining != 2 && remaining != 4 {
+      result = product(&result, value)
+    }
+  }
+  return move result
+}
+
+fn decode(bytes: &[u8]) -> Field {
+  let mut result = zero()
+  let mut index: usize = 0
+  while index < 16 {
+    result.limbs[index] = u64.bitOr(
+      u8.toU64(bytes[index * 2]),
+      u64.shiftLeft(u8.toU64(bytes[index * 2 + 1]), 8),
+    )
+    index = index + 1
+  }
+  result.limbs[15] = u64.bitAnd(result.limbs[15], 32767)
+  return normalize(move result)
+}
+
+fn encode(value: &Field) -> [u8; 32] {
+  let mut result = zeroBytes()
+  let mut index: usize = 0
+  while index < 16 {
+    result[index * 2] = u64.toU8(u64.bitAnd(value.limbs[index], 255))
+    result[index * 2 + 1] = u64.toU8(u64.shiftRight(value.limbs[index], 8))
+    index = index + 1
+  }
+  return result
+}
+
+fn multiply(scalar: &[u8], peer: &[u8]) -> [u8; 32] {
+  let x1 = decode(peer)
+  let mut x2 = one()
+  let mut z2 = zero()
+  let mut x3 = decode(peer)
+  let mut z3 = one()
+  let mut previous: u64 = 0
+  let mut remaining: usize = 255
+  while remaining > 0 {
+    remaining = remaining - 1
+    let bit = u64.bitAnd(
+      u64.shiftRight(u8.toU64(scalar[remaining / 8]), usize.toU64(remaining % 8)),
+      1,
+    )
+    let switched = u64.bitXor(previous, bit)
+    swap(&mut x2, &mut x3, switched)
+    swap(&mut z2, &mut z3, switched)
+    previous = bit
+    let a = add(&x2, &z2)
+    let aa = square(&a)
+    let b = subtract(&x2, &z2)
+    let bb = square(&b)
+    let e = subtract(&aa, &bb)
+    let c = add(&x3, &z3)
+    let d = subtract(&x3, &z3)
+    let da = product(&d, &a)
+    let cb = product(&c, &b)
+    let sum = add(&da, &cb)
+    x3 = square(&sum)
+    let difference = subtract(&da, &cb)
+    let differenceSquared = square(&difference)
+    z3 = product(&x1, &differenceSquared)
+    x2 = product(&aa, &bb)
+    let scaled = times121665(&e)
+    let combined = add(&aa, &scaled)
+    z2 = product(&e, &combined)
+  }
+  swap(&mut x2, &mut x3, previous)
+  swap(&mut z2, &mut z3, previous)
+  let reciprocal = inverse(&z2)
+  let result = product(&x2, &reciprocal)
+  return encode(&result)
+}
+
+fn zeroBytes() -> [u8; 32] {
+  return [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+  ]
+}

@@ -1,0 +1,833 @@
+//! Check that a server certificate is for the host name or IP address in an HTTPS URL (RFC 6125 and
+//! RFC 9110).
+//!
+//! # When to use
+//! After certificate path validation succeeds, call [`HttpsIdentity.reference`] with the host of
+//! the URL, and then [`HttpsIdentity.verify`] with the subject alternative names of the leaf
+//! certificate. `silk.tls.client` does this for you.
+//!
+//! # Details
+//! DNS names compare without regard to ASCII case. A wildcard is allowed only as the full leftmost
+//! label of a certificate name, and it matches exactly one label: `*.example.com` matches
+//! `api.example.com`, but not `example.com` or `a.b.example.com`. An IP address matches only an IP
+//! SAN with the same bytes. All SANs are checked before a match is returned, and nothing allocates.
+//!
+//! # Errors
+//! - [`IdentityError`] if the host is not a valid DNS name, a SAN is not valid, a limit is
+//!   exceeded, or no SAN matches (`NoMatch`).
+//!
+//! # Gotchas
+//! Use the host from the URL, before DNS resolution. Never use a resolved address or a CNAME
+//! target. The common name (CN) is never used. Names with a trailing dot and Unicode names are
+//! rejected: convert an internationalized name to its `xn--` form first. A match does not prove
+//! that the chain is trusted.
+//!
+//! # Examples
+//! ## Match a host against a wildcard certificate
+//! ```silk
+//! import silk.tls.https_identity {
+//!   CertificateIdentities,
+//!   HttpsIdentity,
+//!   IdentityError,
+//!   IdentityLimits,
+//!   IdentityMatch,
+//!   OriginHost,
+//!   PresentedIdentity,
+//!   ReferenceIdentity
+//! }
+//! import silk.core.result { Result }
+//!
+//! fn certificateView<'a>(entries: &'a [PresentedIdentity<'a>]) -> CertificateIdentities<'a> {
+//!   return CertificateIdentities<'a>.Decoded { entries: entries }
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   let reference = match HttpsIdentity.reference(
+//!     OriginHost<'static>.Dns { bytes: b"API.example.com" }
+//!   ) {
+//!     Result<ReferenceIdentity, IdentityError>.Success { value } => value
+//!     Result<ReferenceIdentity, IdentityError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let sans: [PresentedIdentity<'static>; 2] = [
+//!     PresentedIdentity<'static>.Dns { bytes: b"example.com" },
+//!     PresentedIdentity<'static>.Dns { bytes: b"*.example.com" }
+//!   ]
+//!   let certificate = certificateView(&sans)
+//!   return match HttpsIdentity.verify(&reference, &certificate, IdentityLimits.standard()) {
+//!     Result<IdentityMatch, IdentityError>.Success { value } => {
+//!       // The wildcard at index 1 matches. Case does not matter.
+//!       if value.sanIndex != 1 {
+//!         return 1
+//!       }
+//!       return 0
+//!     }
+//!     Result<IdentityMatch, IdentityError>.Failure { error: _ } => 1
+//!   }
+//! }
+//! ```
+//!
+//! @category TLS and certificates
+
+import silk.text.format {Debug, Format, Formatter}
+import silk.core.ownership {Copy}
+import silk.core.result {Result}
+import silk.num.u8
+import silk.num.usize
+import silk.core.option {Option}
+import silk.collections.slice {Slice}
+import silk.io.writer {Writer, WriterError}
+
+/// A reference form that HTTPS identity verification does not support.
+pub enum UnsupportedForm {
+  /// An IPvFuture reference is unsupported.
+  IpvFuture,
+  /// A scoped address reference is unsupported.
+  ZoneIdentifier,
+  /// A URI-ID reference is unsupported for HTTPS.
+  UriId,
+  /// An SRV-ID reference is unsupported for HTTPS.
+  SrvId,
+}
+
+impl Debug for UnsupportedForm {
+  /// Writes the name of the variant, such as `IpvFuture`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      UnsupportedForm.IpvFuture => run Format.write(&mut formatter, b"IpvFuture")
+      UnsupportedForm.ZoneIdentifier => run Format.write(&mut formatter, b"ZoneIdentifier")
+      UnsupportedForm.UriId => run Format.write(&mut formatter, b"UriId")
+      UnsupportedForm.SrvId => run Format.write(&mut formatter, b"SrvId")
+    }
+  }
+}
+
+/// The original HTTPS host, classified by the caller before DNS resolution.
+pub union OriginHost<'name> {
+  /// Borrowed ASCII DNS bytes without a trailing dot.
+  Dns {
+    /// The exact bytes. No normalization or text conversion is implicit.
+    pub bytes: &'name [u8],
+  },
+  /// Four owned network-order address octets.
+  Ipv4 {
+    /// The exact bytes. No normalization or text conversion is implicit.
+    pub bytes: [u8; 4],
+  },
+  /// Sixteen owned network-order address octets.
+  Ipv6 {
+    /// The exact bytes. No normalization or text conversion is implicit.
+    pub bytes: [u8; 16],
+  },
+  /// An explicitly unsupported reference form.
+  Unsupported {
+    /// The unsupported reference form.
+    pub form: UnsupportedForm,
+  },
+}
+
+/// The host to check, from [`HttpsIdentity.reference`]. Values that you build yourself are checked
+/// again by [`HttpsIdentity.verify`].
+pub union ReferenceIdentity<'name> {
+  /// Borrowed ASCII DNS bytes without a trailing dot.
+  Dns {
+    /// The exact bytes. No normalization or text conversion is implicit.
+    pub bytes: &'name [u8],
+  },
+  /// Four owned network-order address octets.
+  Ipv4 {
+    /// The exact bytes. No normalization or text conversion is implicit.
+    pub bytes: [u8; 4],
+  },
+  /// Sixteen owned network-order address octets.
+  Ipv6 {
+    /// The exact bytes. No normalization or text conversion is implicit.
+    pub bytes: [u8; 16],
+  },
+}
+
+/// One untrusted SAN descriptor in original certificate order.
+pub union PresentedIdentity<'cert> {
+  /// Borrowed ASCII DNS bytes without a trailing dot.
+  Dns {
+    /// The exact bytes. No normalization or text conversion is implicit.
+    pub bytes: &'cert [u8],
+  },
+  /// Borrowed network-order address octets. Only lengths four and sixteen are valid.
+  Ip {
+    /// The exact bytes. No normalization or text conversion is implicit.
+    pub bytes: &'cert [u8],
+  },
+  /// An uninterpreted GeneralName with an alternative number other than two or seven.
+  Other {
+    /// The decoded GeneralName alternative number, from zero through eight except two and seven.
+    pub tag: u8,
+    /// The complete alternative content octets, counted even when this form is ignored.
+    pub bytes: &'cert [u8],
+  },
+}
+
+/// A structural failure reported by a complete SAN decoder.
+pub enum CertificateStructureError {
+  /// The SAN input violates DER framing.
+  InvalidDer,
+  /// A GeneralName violates its structural encoding.
+  InvalidGeneralName,
+  /// The certificate contains more than one SAN extension.
+  DuplicateSanExtension,
+  /// A present SAN extension has no GeneralNames.
+  EmptySanExtension,
+}
+
+impl Debug for CertificateStructureError {
+  /// Writes the name of the variant, such as `InvalidDer`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      CertificateStructureError.InvalidDer => run Format.write(&mut formatter, b"InvalidDer")
+      CertificateStructureError.InvalidGeneralName => run Format.write(&mut formatter, b"InvalidGeneralName")
+      CertificateStructureError.DuplicateSanExtension => run Format.write(&mut formatter, b"DuplicateSanExtension")
+      CertificateStructureError.EmptySanExtension => run Format.write(&mut formatter, b"EmptySanExtension")
+    }
+  }
+}
+
+/// The SAN state of a certificate. A certificate without a SAN extension is different from one with
+/// an empty SAN extension.
+pub union CertificateIdentities<'cert> {
+  /// The certificate has no SAN extension. Common names are never consulted.
+  Absent,
+  /// All SAN descriptors in source order, with no filtered entries.
+  Decoded {
+    /// The complete shared descriptor slice and payloads, bounded by the same lifetime.
+    pub entries: &'cert [PresentedIdentity<'cert>],
+  },
+  /// A structural failure that must prevent a match.
+  Malformed {
+    /// The failed rule.
+    pub reason: CertificateStructureError,
+  },
+}
+
+/// The first failed DNS admission rule under the documented precedence.
+pub enum NameError {
+  /// The name has no octets.
+  EmptyName,
+  /// The name exceeds 253 octets.
+  NameTooLong,
+  /// A label has no octets.
+  EmptyLabel,
+  /// A label exceeds 63 octets.
+  LabelTooLong,
+  /// The name contains an embedded zero octet.
+  Nul,
+  /// The name contains an octet above 127.
+  NonAscii,
+  /// A label contains an octet outside ASCII letters, digits and hyphens.
+  InvalidCharacter,
+  /// A label starts or ends with a hyphen.
+  EdgeHyphen,
+  /// The name ends with a dot.
+  TrailingDot,
+  /// A reference contains an asterisk.
+  WildcardReference,
+  /// The final label contains decimal digits only.
+  NumericFinalLabel,
+  /// A wildcard name has no suffix.
+  MissingWildcardSuffix,
+}
+
+impl Debug for NameError {
+  /// Writes the name of the variant, such as `EmptyName`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      NameError.EmptyName => run Format.write(&mut formatter, b"EmptyName")
+      NameError.NameTooLong => run Format.write(&mut formatter, b"NameTooLong")
+      NameError.EmptyLabel => run Format.write(&mut formatter, b"EmptyLabel")
+      NameError.LabelTooLong => run Format.write(&mut formatter, b"LabelTooLong")
+      NameError.Nul => run Format.write(&mut formatter, b"Nul")
+      NameError.NonAscii => run Format.write(&mut formatter, b"NonAscii")
+      NameError.InvalidCharacter => run Format.write(&mut formatter, b"InvalidCharacter")
+      NameError.EdgeHyphen => run Format.write(&mut formatter, b"EdgeHyphen")
+      NameError.TrailingDot => run Format.write(&mut formatter, b"TrailingDot")
+      NameError.WildcardReference => run Format.write(&mut formatter, b"WildcardReference")
+      NameError.NumericFinalLabel => run Format.write(&mut formatter, b"NumericFinalLabel")
+      NameError.MissingWildcardSuffix => run Format.write(&mut formatter, b"MissingWildcardSuffix")
+    }
+  }
+}
+
+/// An invalid SAN descriptor form or binary address size.
+pub enum CertificateIdentityError {
+  /// An IP SAN has neither four nor sixteen octets.
+  InvalidIpLength,
+  /// An Other descriptor uses tag two, seven, or a number above eight.
+  WrongGeneralNameTag,
+}
+
+impl Debug for CertificateIdentityError {
+  /// Writes the name of the variant, such as `InvalidIpLength`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      CertificateIdentityError.InvalidIpLength => run Format.write(&mut formatter, b"InvalidIpLength")
+      CertificateIdentityError.WrongGeneralNameTag => run Format.write(&mut formatter, b"WrongGeneralNameTag")
+    }
+  }
+}
+
+/// The exhausted matcher budget.
+pub enum LimitKind {
+  /// The total descriptor count exceeds the configured budget.
+  SanCount,
+  /// The sum of payload lengths exceeds the configured budget.
+  SanBytes,
+}
+
+impl Debug for LimitKind {
+  /// Writes the name of the variant, such as `SanCount`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      LimitKind.SanCount => run Format.write(&mut formatter, b"SanCount")
+      LimitKind.SanBytes => run Format.write(&mut formatter, b"SanBytes")
+    }
+  }
+}
+
+/// An identity failure that is independent of certificate path trust.
+pub union IdentityError {
+  /// The reference violates DNS admission rules.
+  MalformedReference {
+    /// The failed rule.
+    pub reason: NameError,
+  },
+  /// The complete SAN structure is malformed.
+  MalformedCertificateStructure {
+    /// The failed rule.
+    pub reason: CertificateStructureError,
+  },
+  /// A DNS SAN violates name admission rules.
+  MalformedCertificateName {
+    /// The original zero-based SAN index.
+    pub index: usize,
+    /// The failed rule.
+    pub reason: NameError,
+  },
+  /// A SAN descriptor has an invalid form.
+  MalformedCertificateIdentity {
+    /// The original zero-based SAN index.
+    pub index: usize,
+    /// The failed rule.
+    pub reason: CertificateIdentityError,
+  },
+  /// An explicitly unsupported reference form.
+  Unsupported {
+    /// The unsupported reference form.
+    pub form: UnsupportedForm,
+  },
+  /// A count or byte budget was exceeded.
+  LimitExceeded {
+    /// The exhausted resource budget.
+    pub kind: LimitKind,
+  },
+  /// No eligible SAN matches the reference.
+  NoMatch,
+}
+
+impl Debug for IdentityError {
+  /// Writes the name of the variant and its fields, such as `MalformedReference { ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      IdentityError.MalformedReference { reason } => {
+        let mut record = run Format.debugRecord("MalformedReference", &mut formatter)
+        run Format.debugField(&mut record, "reason", &reason, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      IdentityError.MalformedCertificateStructure { reason } => {
+        let mut record = run Format.debugRecord("MalformedCertificateStructure", &mut formatter)
+        run Format.debugField(&mut record, "reason", &reason, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      IdentityError.MalformedCertificateName { index, reason } => {
+        let mut record = run Format.debugRecord("MalformedCertificateName", &mut formatter)
+        run Format.debugField(&mut record, "index", &index, &mut formatter)
+        run Format.debugField(&mut record, "reason", &reason, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      IdentityError.MalformedCertificateIdentity { index, reason } => {
+        let mut record = run Format.debugRecord("MalformedCertificateIdentity", &mut formatter)
+        run Format.debugField(&mut record, "index", &index, &mut formatter)
+        run Format.debugField(&mut record, "reason", &reason, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      IdentityError.Unsupported { form } => {
+        let mut record = run Format.debugRecord("Unsupported", &mut formatter)
+        run Format.debugField(&mut record, "form", &form, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      IdentityError.LimitExceeded { kind } => {
+        let mut record = run Format.debugRecord("LimitExceeded", &mut formatter)
+        run Format.debugField(&mut record, "kind", &kind, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      IdentityError.NoMatch => run Format.write(&mut formatter, b"NoMatch")
+    }
+  }
+}
+
+/// The limits for one [`HttpsIdentity.verify`] call. Each limit is inclusive, and 0 allows nothing.
+pub struct IdentityLimits {
+  /// Maximum number of descriptors, including ignored and unsupported forms.
+  pub maxSanCount: usize,
+  /// Maximum sum of all payload lengths, counting each alias occurrence.
+  pub maxSanBytes: usize,
+}
+
+/// The first matching SAN index after validation of the entire SAN set.
+pub struct IdentityMatch {
+  /// The original zero-based index of the first matching SAN.
+  pub sanIndex: usize,
+}
+
+/// Checks that a server certificate is for the host name or IP address in an HTTPS URL (RFC 6125
+/// and RFC 9110).
+///
+/// # When to use
+///
+/// After certificate path validation succeeds, call [`HttpsIdentity.reference`] with the host of
+/// the URL, and then [`HttpsIdentity.verify`] with the subject alternative names of the leaf
+/// certificate. `silk.tls.client` does this for you.
+///
+/// # Details
+///
+/// DNS names compare without regard to ASCII case. A wildcard is allowed only as the full leftmost
+/// label of a certificate name, and it matches exactly one label: `*.example.com` matches
+/// `api.example.com`, but not `example.com` or `a.b.example.com`. An IP address matches only an IP
+/// SAN with the same bytes. Nothing allocates.
+///
+/// # Gotchas
+///
+/// Use the host from the URL, before DNS resolution. Never use a resolved address or a CNAME
+/// target. The common name (CN) is never used. Names with a trailing dot and Unicode names are
+/// rejected: convert an internationalized name to its `xn--` form first. A match does not prove
+/// that the chain is trusted.
+pub struct HttpsIdentity {}
+
+impl<'a> Copy for OriginHost<'a> {}
+
+impl<'a> Copy for ReferenceIdentity<'a> {}
+
+impl<'a> Copy for PresentedIdentity<'a> {}
+
+impl<'a> Copy for CertificateIdentities<'a> {}
+
+impl Copy for IdentityError {}
+
+impl Copy for IdentityLimits {}
+
+impl Copy for IdentityMatch {}
+
+impl IdentityLimits {
+  /// Returns inclusive limits of 256 SAN descriptors and 65536 payload octets.
+  pub fn standard() -> IdentityLimits {
+    return IdentityLimits {maxSanCount: 256, maxSanBytes: 65536}
+  }
+}
+
+impl HttpsIdentity {
+  /// Returns the shared HTTPS-profile admission error for one exact DNS name, when invalid.
+  ///
+  /// # Details
+  ///
+  /// This applies the canonical 253-octet, LDH-label, edge-hyphen, wildcard-free, and
+  /// nonnumeric-final-label grammar used by HTTPS reference identities.
+  pub fn exactDnsNameError(bytes: &[u8]) -> Option<NameError> {
+    return nameError(bytes, false)
+  }
+
+  /// Returns the shared HTTPS-profile admission error for one presented DNS name, when invalid.
+  ///
+  /// # Details
+  ///
+  /// A wildcard is admitted only as the complete leftmost `*.` label and remains included in the
+  /// 253-octet total-name bound. All other label policy is identical to exact DNS names.
+  pub fn presentedDnsNameError(bytes: &[u8]) -> Option<NameError> {
+    if bytes.length > 0 && bytes[0] == 42 {
+      if bytes.length < 2 || bytes[1] != 46 {
+        return nameFailure(NameError.WildcardReference)
+      }
+      return nameError(bytes, true)
+    }
+    return nameError(bytes, false)
+  }
+}
+
+fn nameFailure(reason: NameError) -> Option<NameError> {
+  return Option<NameError>.some(reason)
+}
+
+// Ordered passes preserve public error precedence. Total accepted names are at most 253 bytes.
+fn nameError(bytes: &[u8], wildcard: bool) -> Option<NameError> {
+  let n = bytes.length
+  if n == 0 {
+    return nameFailure(NameError.EmptyName)
+  }
+  if n > 253 {
+    return nameFailure(NameError.NameTooLong)
+  }
+  let mut at = usize.ZERO
+  while at < n {
+    if bytes[at] == 0 {
+      return nameFailure(NameError.Nul)
+    }
+    at = at + 1
+  }
+  at = 0
+  while at < n {
+    if bytes[at] > 127 {
+      return nameFailure(NameError.NonAscii)
+    }
+    at = at + 1
+  }
+  if bytes[n - 1] == 46 {
+    return nameFailure(NameError.TrailingDot)
+  }
+  if !wildcard {
+    at = 0
+    while at < n {
+      if bytes[at] == 42 {
+        return nameFailure(NameError.WildcardReference)
+      }
+      at = at + 1
+    }
+  }
+  if wildcard && n == 1 {
+    return nameFailure(NameError.MissingWildcardSuffix)
+  }
+  let mut start = usize.ZERO
+  if wildcard {
+    start = 2
+  }
+  while start < n {
+    let mut end = start
+    while end < n && bytes[end] != 46 {
+      end = end + 1
+    }
+    if end == start {
+      return nameFailure(NameError.EmptyLabel)
+    }
+    if end - start > 63 {
+      return nameFailure(NameError.LabelTooLong)
+    }
+    at = start
+    let mut numeric = true
+    while at < end {
+      let byte = bytes[at]
+      let digit = byte >= 48 && byte <= 57
+      let alpha = (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+      if !digit && !alpha && byte != 45 {
+        return nameFailure(NameError.InvalidCharacter)
+      }
+      if !digit {
+        numeric = false
+      }
+      at = at + 1
+    }
+    if bytes[start] == 45 || bytes[end - 1] == 45 {
+      return nameFailure(NameError.EdgeHyphen)
+    }
+    if end == n && numeric {
+      return nameFailure(NameError.NumericFinalLabel)
+    }
+    start = end + 1
+  }
+  return Option<NameError>.none()
+}
+
+// Non-ASCII validation precedes this classification; misplaced/multiple stars must be ignored.
+fn ignoredWildcard(bytes: &[u8]) -> bool {
+  let mut at = usize.ZERO
+  let mut found = false
+  while at < bytes.length {
+    if bytes[at] == 42 {
+      if found || at != 0 {
+        return true
+      }
+      found = true
+    }
+    at = at + 1
+  }
+  return found && bytes.length > 1 && bytes[1] != 46
+}
+
+fn sanNameError(bytes: &[u8]) -> Option<NameError> {
+  let mut at = usize.ZERO
+  while at < bytes.length {
+    if bytes[at] > 127 {
+      return nameFailure(NameError.NonAscii)
+    }
+    at = at + 1
+  }
+  if ignoredWildcard(bytes) {
+    return Option<NameError>.none()
+  }
+  return nameError(bytes, bytes.length > 0 && bytes[0] == 42)
+}
+
+fn folded(byte: u8) -> u8 {
+  if byte >= 65 && byte <= 90 {
+    return byte + 32
+  }
+  return byte
+}
+
+fn equal(bytes: &[u8], other: &[u8], fold: bool) -> bool {
+  if bytes.length != other.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < bytes.length {
+    if fold {
+      if folded(bytes[at]) != folded(other[at]) {
+        return false
+      }
+    } else {
+      if bytes[at] != other[at] {
+        return false
+      }
+    }
+    at = at + 1
+  }
+  return true
+}
+
+fn dnsMatch(reference: &[u8], presented: &[u8]) -> bool {
+  if ignoredWildcard(presented) {
+    return false
+  }
+  if presented[0] != 42 {
+    return equal(reference, presented, true)
+  }
+  // Length gating keeps reference work charged to candidate bytes. The first label is at most 63 bytes.
+  let suffixLength = presented.length - 1
+  if reference.length <= suffixLength || reference.length - suffixLength > 63 {
+    return false
+  }
+  let firstLength = reference.length - suffixLength
+  let mut at = usize.ZERO
+  while at < firstLength {
+    if reference[at] == 46 {
+      return false
+    }
+    at = at + 1
+  }
+  return equal(
+    Slice.view<u8>(reference, firstLength, suffixLength),
+    Slice.view<u8>(presented, 1, suffixLength),
+    true,
+  )
+}
+
+fn payloadLength<'cert>(entry: &PresentedIdentity<'cert>) -> usize {
+  return match & entry.* {
+    PresentedIdentity<'cert>.Dns {bytes} => bytes.length
+    PresentedIdentity<'cert>.Ip {bytes} => bytes.length
+    PresentedIdentity<'cert>.Other {tag, bytes} => bytes.length
+  }
+}
+
+fn malformedName(index: usize, reason: NameError) -> IdentityError {
+  return IdentityError.MalformedCertificateName {index: index, reason: reason}
+}
+
+fn malformedIdentity(index: usize, reason: CertificateIdentityError) -> IdentityError {
+  return IdentityError.MalformedCertificateIdentity {index: index, reason: reason}
+}
+
+fn validateEntry<'cert>(entry: &PresentedIdentity<'cert>, index: usize) -> Option<IdentityError> {
+  return match & entry.* {
+    PresentedIdentity<'cert>.Dns {bytes} => {
+      return match move sanNameError(bytes) {
+        Option<NameError>.Some {value} => Option<IdentityError>.some(malformedName(index, value))
+        Option<NameError>.None => Option<IdentityError>.none()
+      }
+    }
+    PresentedIdentity<'cert>.Ip {bytes} => {
+      if bytes.length != 4 && bytes.length != 16 {
+        return Option<IdentityError>.some(
+          malformedIdentity(index, CertificateIdentityError.InvalidIpLength),
+        )
+      }
+      return Option<IdentityError>.none()
+    }
+    PresentedIdentity<'cert>.Other {tag, bytes} => {
+      if tag == 2 || tag == 7 || tag > 8 {
+        return Option<IdentityError>.some(
+          malformedIdentity(index, CertificateIdentityError.WrongGeneralNameTag),
+        )
+      }
+      return Option<IdentityError>.none()
+    }
+  }
+}
+
+fn matches<'name, 'cert>(reference: &ReferenceIdentity<'name>, entry: &PresentedIdentity<'cert>) -> bool {
+  return match & reference.* {
+    ReferenceIdentity<'name>.Dns {bytes: name} => {
+      return match & entry.* {
+        PresentedIdentity<'cert>.Dns {bytes} => dnsMatch(name, bytes)
+        PresentedIdentity<'cert>.Ip {bytes} => false
+        PresentedIdentity<'cert>.Other {tag, bytes} => false
+      }
+    }
+    ReferenceIdentity<'name>.Ipv4 {bytes: address} => {
+      return match & entry.* {
+        PresentedIdentity<'cert>.Dns {bytes} => false
+        PresentedIdentity<'cert>.Ip {bytes} => equal(&address, bytes, false)
+        PresentedIdentity<'cert>.Other {tag, bytes} => false
+      }
+    }
+    ReferenceIdentity<'name>.Ipv6 {bytes: address} => {
+      return match & entry.* {
+        PresentedIdentity<'cert>.Dns {bytes} => false
+        PresentedIdentity<'cert>.Ip {bytes} => equal(&address, bytes, false)
+        PresentedIdentity<'cert>.Other {tag, bytes} => false
+      }
+    }
+  }
+}
+
+impl HttpsIdentity {
+  /// Checks the host of an HTTPS URL and returns it as a reference to verify. It does not allocate.
+  ///
+  /// A DNS name must be 1 to 253 ASCII bytes, with labels of 1 to 63 letters, digits, and hyphens.
+  /// A label must not start or end with a hyphen, and the last label must not be all digits. An IP
+  /// address must already be converted to its 4 or 16 bytes.
+  ///
+  /// # Errors
+  /// - `MalformedReference` with the first rule that the name breaks.
+  /// - `Unsupported` for an IPvFuture address, a zone identifier, a URI-ID, or an SRV-ID.
+  ///
+  /// # Gotchas
+  /// Use the host from the URL, before DNS resolution. Remove brackets and the port first. An
+  /// `xn--` label is not checked as Punycode.
+  pub fn reference<'name>(host: OriginHost<'name>) -> Result<
+    ReferenceIdentity<'name>,
+    IdentityError,
+  > {
+    return match move host {
+      OriginHost<'name>.Dns {bytes} => {
+        let error = nameError(bytes, false)
+        return match move error {
+          Option<NameError>.Some {value} => Result<
+            ReferenceIdentity<'name>,
+            IdentityError,
+          >.failResult(IdentityError.MalformedReference {reason: value})
+          Option<NameError>.None => Result<ReferenceIdentity<'name>, IdentityError>.succeed(
+            ReferenceIdentity<'name>.Dns {bytes: bytes},
+          )
+        }
+      }
+      OriginHost<'name>.Ipv4 {bytes} => Result<ReferenceIdentity<'name>, IdentityError>.succeed(
+        ReferenceIdentity<'name>.Ipv4 {bytes: bytes},
+      )
+      OriginHost<'name>.Ipv6 {bytes} => Result<ReferenceIdentity<'name>, IdentityError>.succeed(
+        ReferenceIdentity<'name>.Ipv6 {bytes: bytes},
+      )
+      OriginHost<'name>.Unsupported {form} => Result<
+        ReferenceIdentity<'name>,
+        IdentityError,
+      >.failResult(IdentityError.Unsupported {form: form})
+    }
+  }
+  /// Checks all SANs of `certificate`, and returns the index of the first one that matches
+  /// `reference`.
+  ///
+  /// DNS names compare without regard to ASCII case. A wildcard SAN matches one label. A wildcard
+  /// in another position is ignored. An IP SAN must have the same 4 or 16 bytes. An IPv4 address
+  /// does not match its IPv6-mapped form.
+  ///
+  /// # Errors
+  /// - `NoMatch` if no SAN matches, the certificate has no SAN, or it has only other name forms.
+  /// - `MalformedCertificateStructure`, `MalformedCertificateName`, or
+  ///   `MalformedCertificateIdentity` if a SAN is not valid.
+  /// - `LimitExceeded` if the SANs go over `limits`.
+  /// - `MalformedReference` if `reference` is not valid.
+  ///
+  /// # Gotchas
+  /// One SAN that is not valid fails the call, also when an earlier SAN matches. A match does not
+  /// check the chain, the dates, or the TLS handshake. The common name (CN) is never used.
+  pub fn verify<'name, 'cert>(
+    reference: &ReferenceIdentity<'name>,
+    certificate: &CertificateIdentities<'cert>,
+    limits: IdentityLimits,
+  ) -> Result<IdentityMatch, IdentityError> {
+    let error = match & reference.* {
+      ReferenceIdentity<'name>.Dns {bytes} => nameError(bytes, false)
+      ReferenceIdentity<'name>.Ipv4 {bytes} => Option<NameError>.none()
+      ReferenceIdentity<'name>.Ipv6 {bytes} => Option<NameError>.none()
+    }
+    match move error {
+      Option<NameError>.Some {value} => {
+        return Result<IdentityMatch, IdentityError>.failResult(
+          IdentityError.MalformedReference {reason: value},
+        )
+      }
+      Option<NameError>.None => {}
+    }
+    return match & certificate.* {
+      CertificateIdentities<'cert>.Absent => Result<IdentityMatch, IdentityError>.failResult(
+        IdentityError.NoMatch,
+      )
+      CertificateIdentities<'cert>.Malformed {reason} => Result<
+        IdentityMatch,
+        IdentityError,
+      >.failResult(IdentityError.MalformedCertificateStructure {reason: reason})
+      CertificateIdentities<'cert>.Decoded {entries} => {
+        if entries.length == 0 {
+          return Result<IdentityMatch, IdentityError>.failResult(
+            IdentityError.MalformedCertificateStructure {
+              reason: CertificateStructureError.EmptySanExtension,
+            },
+          )
+        }
+        if entries.length > limits.maxSanCount {
+          return Result<IdentityMatch, IdentityError>.failResult(
+            IdentityError.LimitExceeded {kind: LimitKind.SanCount},
+          )
+        }
+        let mut at = usize.ZERO
+        let mut total = usize.ZERO
+        while at < entries.length {
+          let length = payloadLength(&entries[at])
+          // Subtraction avoids usize overflow and checks the budget before inspecting any payload.
+          if length > limits.maxSanBytes - total {
+            return Result<IdentityMatch, IdentityError>.failResult(
+              IdentityError.LimitExceeded {kind: LimitKind.SanBytes},
+            )
+          }
+          total = total + length
+          at = at + 1
+        }
+        at = 0
+        while at < entries.length {
+          let invalid = validateEntry(&entries[at], at)
+          match move invalid {
+            Option<IdentityError>.Some {value} => {
+              return Result<IdentityMatch, IdentityError>.failResult(value)
+            }
+            Option<IdentityError>.None => {}
+          }
+          at = at + 1
+        }
+        at = 0
+        while at < entries.length {
+          if matches(&reference, &entries[at]) {
+            return Result<IdentityMatch, IdentityError>.succeed(IdentityMatch {sanIndex: at})
+          }
+          at = at + 1
+        }
+        return Result<IdentityMatch, IdentityError>.failResult(IdentityError.NoMatch)
+      }
+    }
+  }
+}
