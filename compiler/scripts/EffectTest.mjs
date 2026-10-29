@@ -8,7 +8,9 @@ const timeout = 3000
 const effectIt = (provide) => {
   const it = (name, body) => test(name, { timeout }, body)
   it.effect = (name, body) =>
-    test(name, { timeout }, () => Effect.runPromise(provide(Effect.scoped(Effect.suspend(body)))))
+    test(name, { timeout }, (t) =>
+      Effect.runPromise(provide(Effect.scoped(Effect.suspend(body))), { signal: t.signal }),
+    )
   it.layer = (layer) => (register) => register(effectIt((effect) => Effect.provide(effect, layer)))
   return it
 }
