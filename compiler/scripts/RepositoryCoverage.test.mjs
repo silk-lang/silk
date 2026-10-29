@@ -93,7 +93,6 @@ it.effect(
         'examples/new/main.silk': 'pub fn main() -> i32 { return 0 }',
         'examples/new/Util.silk': 'pub fn answer() -> i32 { return 42 }',
         'compiler/conformance/new/library.silk': 'pub fn answer() -> i32 { return 42 }',
-        'bootstrap/packages/compiler/fixture.silk': 'pub fn main() -> i32 { return 0 }',
         'corpus/native/new/main.silk': 'pub fn main() -> i32 { return 0 }',
         'stdlib/new.silk': '//! ```silk\n//! pub fn main() -> i32 { return 42 }\n//! ```',
       }
@@ -118,7 +117,7 @@ it.effect(
           'stdlib/new.silk#doc-1',
         ],
       )
-      assert.strictEqual(inventory.excluded.length, 4)
+      assert.strictEqual(inventory.excluded.length, 3)
       assert.isTrue(inventory.excluded.every(({ reason }) => reason.length > 0))
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 )

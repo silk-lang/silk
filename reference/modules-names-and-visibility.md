@@ -636,7 +636,7 @@ own members (`order.Ordering.Less`), reports `SEM0222`; select the type and writ
 
 **Evidence:** basename has no semantic role,
 inherent member index,
-[qualified lookup](../bootstrap/packages/compiler/src/NameResolution.ts),
+[qualified lookup](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/NameResolution.ts),
 standard-library namespace tests.
 
 ## Visibility

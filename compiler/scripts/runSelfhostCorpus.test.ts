@@ -11,7 +11,7 @@ import {
   runCase,
   runCorpus,
   summarize,
-} from './runSelfhostCorpus.js'
+} from './runSelfhostCorpus.ts'
 
 const literal: Corpus.Program = {
   name: 'literal',

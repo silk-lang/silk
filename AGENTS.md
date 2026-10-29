@@ -6,8 +6,9 @@
   `compiler/native-seed.json`; `compiler/scripts/` holds the TypeScript tooling CI runs around it.
 - `stdlib/` is the standard library, `corpus/` the shared native acceptance corpus, and
   `reference/` the prescriptive language reference.
-- `bootstrap/` is the frozen TypeScript compiler. It only has to build the anchored first native
-  compiler (`bootstrap/anchor.json`); never extend it, and change it only when that build breaks.
+- There is no TypeScript compiler. The first native compiler, n0, was built by a TypeScript
+  bootstrap that now lives only in git history and the `bootstrap-v0.0.0` release; every later
+  compiler is built from a pinned native seed.
 
 ## Green-field policy
 
@@ -25,8 +26,8 @@ behavior, data format, build artifact, or internal representation is a compatibi
 ## Repository workflow
 
 - The Node tooling in `compiler/scripts` uses pnpm and Vitest; `pnpm test:scripts` tests it, and
-  Selfhost CI runs it too. `pnpm format` and `pnpm lint` (Oxfmt, Oxlint) are optional local
-  helpers that CI no longer runs.
+  Selfhost CI runs it too. Node runs the `.ts` files directly by stripping types; there is no
+  TypeScript compiler, formatter or linter.
 - `main` is the only integration branch. A pull request merges when its required checks pass on its
   exact head: `Focused Linux Silk`. Selfhost CI runs on every push to a pull request into `main`
   (a newer push cancels the older run); a stack head or a branch without such a PR is dispatched

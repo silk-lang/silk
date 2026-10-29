@@ -229,7 +229,7 @@ Incompatible argument types report `SEM0012` at the argument. Applying a non-cal
 `SEM0075`. A redundant empty call of a unary function reports `SEM0078`; invalid ownership uses the
 corresponding `OWN` diagnostic.
 
-**Evidence:** [call semantic diagnostics](../bootstrap/packages/compiler/src/Diagnostic.ts),
+**Evidence:** [call semantic diagnostics](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Diagnostic.ts),
 callable specification,
 [parameter ownership](ownership-and-borrowing.md#call-001--parameter-types-determine-ownership-transfer-or-borrowing).
 
@@ -342,7 +342,7 @@ of the explicit spelling: a `self: &mut Self` method called through a shared ref
 `SEM0058` as `&mut counter` does, a `self: Self` method on an affine referent reports `OWN0012`, and
 an outstanding loan of the referent that conflicts with the reborrow reports `OWN0010`.
 
-**Evidence:** [method call semantics](../bootstrap/packages/compiler/src/ExpressionAnalysis.ts),
+**Evidence:** [method call semantics](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/ExpressionAnalysis.ts),
 method-call specification,
 reference receiver tests,
 [inherent members](modules-names-and-visibility.md#name-005--a-nominal-qualifier-exposes-only-its-associated-items).
@@ -431,7 +431,7 @@ at the offending terminal and identify the contributing types. A failure left un
 reports `SEM0066`; generic failure values are not dropped from that check.
 
 **Evidence:** effect-block terminal specification,
-[canonical join implementation](../bootstrap/packages/compiler/src/Match.ts),
+[canonical join implementation](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Match.ts),
 effect-block typing tests.
 
 ## Callable values and pipelines

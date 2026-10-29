@@ -12,7 +12,8 @@ know Silk compiler internals. Familiarity with Rust, Effect, or Effect TypeScrip
 not assumed.
 
 Language and compiler contributors are a secondary audience. Evidence links connect each rule to
-the detailed artifacts used to verify or reconcile it.
+the detailed artifacts used to verify or reconcile it. Links into `bootstrap/` point at the last
+commit that still had the TypeScript bootstrap compiler; it is no longer in the repository.
 
 ## Authority during stabilization
 

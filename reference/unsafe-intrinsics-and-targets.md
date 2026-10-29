@@ -117,7 +117,7 @@ acknowledgements, and semantic analysis applies the same invocation rule to intr
 source callables.
 
 **Evidence:** intrinsic boundary specification,
-[unsafe parser](../bootstrap/packages/compiler/src/Parser.ts),
+[unsafe parser](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Parser.ts),
 unsafe-call diagnostics.
 
 ### UNSAFE-002 — Ordinary source may declare a caller-owned unsafe contract
@@ -216,9 +216,9 @@ not a compiler error.
 **Current compiler:** Aligned. The statement block grants lexical authority, while the prefix grants
 authority only to its directly wrapped complete call and not to nested argument calls.
 
-**Evidence:** [unsafe block parser](../bootstrap/packages/compiler/src/Parser.ts),
-[unsafe semantic admission](../bootstrap/packages/compiler/src/Elaboration.ts),
-[unsafe syntax formatting](../bootstrap/packages/compiler/src/SyntaxFormatter.ts).
+**Evidence:** [unsafe block parser](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Parser.ts),
+[unsafe semantic admission](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Elaboration.ts),
+[unsafe syntax formatting](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/SyntaxFormatter.ts).
 
 ### UNSAFE-004 — An unsafe effect function is acknowledged when its Effect is constructed
 
@@ -262,7 +262,7 @@ Effect, ownership, and execution-boundary diagnostics.
 **Current compiler:** Aligned. Source and intrinsic unsafe Effect constructors are acknowledged when
 called, and the resulting ordinary Effect runs without a second unsafe marker.
 
-**Evidence:** [intrinsic Effect catalog](../bootstrap/packages/compiler/src/Intrinsic.ts),
+**Evidence:** [intrinsic Effect catalog](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Intrinsic.ts),
 OS intrinsic acceptance,
 [Effect construction and execution](effects-and-execution.md).
 
@@ -325,7 +325,7 @@ witness may satisfy an unsafe operation; the reverse is rejected.
 
 **Evidence:** [callable contracts](functions-callables-and-control-flow.md),
 [interface operation compatibility](generics-interfaces-and-specialization.md#impl-003--each-implementation-must-satisfy-the-substituted-operation-contract),
-[intrinsic catalog](../bootstrap/packages/compiler/src/Intrinsic.ts).
+[intrinsic catalog](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Intrinsic.ts).
 
 ### UNSAFE-006 — Unsafe permission does not suspend ownership, borrowing, or cleanup rules
 
@@ -430,7 +430,7 @@ single-call marker.
 
 **Evidence:** [partial application](functions-callables-and-control-flow.md),
 [callable ownership](ownership-and-borrowing.md),
-[intrinsic catalog](../bootstrap/packages/compiler/src/Intrinsic.ts).
+[intrinsic catalog](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Intrinsic.ts).
 
 ### UNSAFE-008 — Unsafe declarations use ordinary visibility and document their caller contract
 
@@ -480,7 +480,7 @@ and flow into editor information. The non-blocking LSP warning for a missing or 
 section is not yet implemented.
 
 **Evidence:** [module and visibility rules](modules-names-and-visibility.md),
-[documentation block model](../bootstrap/packages/compiler/src/DocBlock.ts),
+[documentation block model](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/DocBlock.ts),
 editor documentation tests.
 
 ## Sealed intrinsic boundary
@@ -566,7 +566,7 @@ safety, unsafe invariants, consumers, compiler identities, targets, and private 
 tests compare the checked inventory with accepted semantic calls.
 
 **Evidence:** intrinsic inventory,
-[catalog implementation](../bootstrap/packages/compiler/src/Intrinsic.ts),
+[catalog implementation](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Intrinsic.ts),
 catalog verification.
 
 ### INTR-003 — An intrinsic must be the smallest irreducible primitive with a real consumer
@@ -886,7 +886,7 @@ instance discovery, deduplicates unavailable diagnostics by canonical operation 
 before LLVM lowering or emission.
 
 **Evidence:** intrinsic target availability specification,
-[availability selection](../bootstrap/packages/compiler/src/IntrinsicAvailability.ts),
+[availability selection](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/IntrinsicAvailability.ts),
 target-availability tests.
 
 ### TARGET-002 — Unreachable target-specific primitives have no artifact cost
@@ -912,7 +912,7 @@ operation.
 **Current compiler:** Aligned in the validated intrinsic inventory and backend preparation model.
 
 **Evidence:** pay-for-use target requirement,
-[intrinsic availability selection](../bootstrap/packages/compiler/src/IntrinsicAvailability.ts),
+[intrinsic availability selection](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/IntrinsicAvailability.ts),
 intrinsic inventory tests.
 
 ### TARGET-003 — Target unavailability is a compile-time compatibility error
@@ -943,8 +943,8 @@ catching a failure, adding an unsafe block, or providing a service.
 **Current compiler:** Aligned for LLVM target availability classes. Finer target-triple
 availability, if needed, must refine the same compile-time rule rather than create runtime fallback.
 
-**Evidence:** [target diagnostic](../bootstrap/packages/compiler/src/Diagnostic.ts),
-[target selection](../bootstrap/packages/compiler/src/Target.ts),
+**Evidence:** [target diagnostic](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Diagnostic.ts),
+[target selection](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Target.ts),
 target availability specification,
 [static target selection](static-evaluation.md#static-009--silktarget-exposes-target-information-only-as-static-source-values).
 
@@ -988,9 +988,9 @@ records the symbol and ABI as header facts with no body, and the module semantic
 them so a symbol change invalidates dependents.
 
 **Evidence:** foreign function specification,
-[declaration collection](../bootstrap/packages/compiler/src/DeclarationCollection.ts),
-[declaration completion](../bootstrap/packages/compiler/src/DeclarationCompletion.ts),
-[foreign diagnostics](../bootstrap/packages/compiler/src/Diagnostic.ts).
+[declaration collection](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/DeclarationCollection.ts),
+[declaration completion](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/DeclarationCompletion.ts),
+[foreign diagnostics](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Diagnostic.ts).
 
 ### FFI-002 — Foreign functions are unsafe by declaration
 
@@ -1023,8 +1023,8 @@ missing-acknowledgement diagnostic as any unsafe source callable.
 presentations are reused unchanged from unsafe source functions.
 
 **Evidence:** foreign function specification,
-[declaration completion](../bootstrap/packages/compiler/src/DeclarationCompletion.ts),
-[foreign diagnostics](../bootstrap/packages/compiler/src/Diagnostic.ts).
+[declaration completion](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/DeclarationCompletion.ts),
+[foreign diagnostics](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Diagnostic.ts).
 
 ### FFI-003 — Foreign signatures admit only the C-compatible scalar subset
 
@@ -1078,8 +1078,8 @@ and System V x86-64, and no extension attribute under GNU AAPCS64.
 **Evidence:** foreign function specification,
 pointer admission,
 [C-layout field contract](values-and-types.md#struct-006--c-layout-records-make-an-explicit-field-layout-promise),
-[C ABI classification](../bootstrap/packages/compiler/src/CAbi.ts),
-[declaration completion](../bootstrap/packages/compiler/src/DeclarationCompletion.ts).
+[C ABI classification](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/CAbi.ts),
+[declaration completion](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/DeclarationCompletion.ts).
 
 ### FFI-004 — Foreign declarations carry no Silk-only contract and are callable only
 
@@ -1112,8 +1112,8 @@ no callable. A first-class use reports `SEM0189` at the use.
 first-class check runs at the use site.
 
 **Evidence:** foreign function specification,
-[declaration completion](../bootstrap/packages/compiler/src/DeclarationCompletion.ts),
-[foreign diagnostics](../bootstrap/packages/compiler/src/Diagnostic.ts).
+[declaration completion](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/DeclarationCompletion.ts),
+[foreign diagnostics](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Diagnostic.ts).
 
 ### FFI-005 — Foreign symbols are valid, unreserved, and unique per executable
 
@@ -1151,8 +1151,8 @@ is a backend diagnostic naming the symbol.
 agreement is checked when the executable origin collects reachable foreign calls for the target.
 
 **Evidence:** foreign function specification,
-[symbol spelling and reservation](../bootstrap/packages/compiler/src/ForeignSymbol.ts),
-[C ABI signature identity](../bootstrap/packages/compiler/src/CAbi.ts).
+[symbol spelling and reservation](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/ForeignSymbol.ts),
+[C ABI signature identity](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/CAbi.ts).
 
 ### FFI-006 — Foreign calls use linked symbols and enforced unwind boundaries
 
@@ -1211,7 +1211,7 @@ diagnostic.
 calling convention and external linkage, emits the fatal unwind guard, and records each symbol with its machine and behavioral contract.
 
 **Evidence:** foreign function specification,
-[C ABI signature](../bootstrap/packages/compiler/src/CAbi.ts).
+[C ABI signature](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/CAbi.ts).
 
 ### FFI-007 — Foreign functions use explicit pay-for-use bindings
 
@@ -1243,7 +1243,7 @@ intrinsic calls. LLVM emission declares their C ABI symbols and records determin
 LLVM-to-Wasm rejects a reachable C static, variadic tail or callback lane before emission.
 
 **Evidence:** foreign function specification,
-[C ABI classification](../bootstrap/packages/compiler/src/CAbi.ts).
+[C ABI classification](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/CAbi.ts).
 
 ### FFI-008 — `export "C"` publishes one C-callable symbol behind a generated thunk
 
@@ -1295,8 +1295,8 @@ function declaration, and the native backend declares one external C-calling-con
 export that forwards its scalar lanes to the implementation.
 
 **Evidence:** export specification,
-[declaration collection](../bootstrap/packages/compiler/src/DeclarationCollection.ts),
-[native program emission](../bootstrap/packages/compiler/src/NativeProgram.ts).
+[declaration collection](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/DeclarationCollection.ts),
+[native program emission](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/NativeProgram.ts).
 
 ### FFI-009 — Exported signatures and contracts follow the foreign admission rules
 
@@ -1333,9 +1333,9 @@ on the export header; the suspension check reads the MIR function's classificati
 planning gate, the same predicate the native backend uses to decide suspendability.
 
 **Evidence:** export specification,
-[declaration collection](../bootstrap/packages/compiler/src/DeclarationCollection.ts),
-[C ABI classification](../bootstrap/packages/compiler/src/CAbi.ts),
-[foreign planning](../bootstrap/packages/compiler/src/ForeignPlanning.ts).
+[declaration collection](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/DeclarationCollection.ts),
+[C ABI classification](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/CAbi.ts),
+[foreign planning](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/ForeignPlanning.ts).
 
 ### FFI-010 — Exported functions are discovery roots on native targets
 
@@ -1367,8 +1367,8 @@ onto the MIR module, which is the only input the backends receive, and into the 
 emission header.
 
 **Evidence:** export specification,
-[instance discovery](../bootstrap/packages/compiler/src/Instances.ts),
-[foreign planning](../bootstrap/packages/compiler/src/ForeignPlanning.ts).
+[instance discovery](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Instances.ts),
+[foreign planning](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/ForeignPlanning.ts).
 
 ### FFI-011 — Export symbols are unique across imports and exports
 
@@ -1405,9 +1405,9 @@ construction, and the native backend populates the artifact's export inventory f
 module.
 
 **Evidence:** export specification,
-[symbol spelling and reservation](../bootstrap/packages/compiler/src/ForeignSymbol.ts),
-[foreign planning](../bootstrap/packages/compiler/src/ForeignPlanning.ts),
-[native program emission](../bootstrap/packages/compiler/src/NativeProgram.ts).
+[symbol spelling and reservation](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/ForeignSymbol.ts),
+[foreign planning](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/ForeignPlanning.ts),
+[native program emission](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/NativeProgram.ts).
 
 ### FFI-012 — C function pointers are exact exported addresses
 
@@ -1475,8 +1475,8 @@ retains a dedicated foreign-address operation, and native lowering resolves it t
 export thunk. The native corpus calls libc `qsort` through a Silk comparator and retains callbacks from direct and nested by-value arguments for invocation during a later C call. The [native callback contract](./synchronous-native-callbacks.md) defines synchronous, deferred same-thread and any-thread invocation, field-path coverage, reentrancy and boundary termination.
 
 **Evidence:** callback specification,
-[call resolution](../bootstrap/packages/compiler/src/CallResolution.ts),
-[native foreign lowering](../bootstrap/packages/compiler/src/NativeForeignOperation.ts).
+[call resolution](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/CallResolution.ts),
+[native foreign lowering](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/NativeForeignOperation.ts).
 
 ### FFI-013 — C statics are immutable bindings to native data symbols
 
@@ -1513,8 +1513,8 @@ emission, artifact metadata, and native shared/static-library acceptance all ret
 and C type.
 
 **Evidence:** data-symbol specification,
-[foreign-static lowering](../bootstrap/packages/compiler/src/LowerExpression.ts),
-[native program emission](../bootstrap/packages/compiler/src/NativeProgram.ts).
+[foreign-static lowering](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/LowerExpression.ts),
+[native program emission](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/NativeProgram.ts).
 
 ### FFI-014 — Native libraries publish C interface companions
 
@@ -1555,9 +1555,9 @@ the driver invokes them on every native-library success path, and `NativeToolcha
 commits the companions while removing the complete artifact set after a partial failure.
 
 **Evidence:** interface-artifact specification,
-[header renderer](../bootstrap/packages/compiler/src/CHeader.ts),
-[manifest renderer](../bootstrap/packages/compiler/src/AbiManifest.ts),
-[driver](../bootstrap/packages/compiler/src/Driver.ts).
+[header renderer](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/CHeader.ts),
+[manifest renderer](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/AbiManifest.ts),
+[driver](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Driver.ts).
 
 ### FFI-015 — The OS system clock is an ordinary libc boundary
 

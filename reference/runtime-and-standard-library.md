@@ -729,7 +729,7 @@ reachable specialized operations.
 
 **Evidence:** [TARGET-002](unsafe-intrinsics-and-targets.md#target-002--unreachable-target-specific-primitives-have-no-artifact-cost),
 [explicit module closure](modules-names-and-visibility.md#module-004--compilation-loads-only-the-transitively-reachable-module-closure),
-[current intrinsic availability](../bootstrap/packages/compiler/src/IntrinsicAvailability.ts).
+[current intrinsic availability](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/IntrinsicAvailability.ts).
 
 ### RUNTIME-003 — Toolchain runtime support guarantees contracts, not implementation ABI
 
@@ -770,7 +770,7 @@ toolchain does not imply compatibility merely because a symbol existed in anothe
 and are not presented as a user-facing runtime library.
 
 **Evidence:** [sealed intrinsic contracts](unsafe-intrinsics-and-targets.md#sealed-intrinsic-boundary),
-[current native toolchain composition](../bootstrap/packages/compiler/src/ToolchainPlan.ts).
+[current native toolchain composition](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/ToolchainPlan.ts).
 
 ### RUNTIME-004 — Silk has no ambient runtime facilities
 
@@ -884,7 +884,7 @@ required runtime artifacts report one deterministic broken-toolchain diagnostic 
 and observed component identities. The compiler does not continue with fallback copies, an older
 runtime, or a user module shadowing the missing standard source.
 
-**Current toolchain:** Aligned. [`ToolchainIntegrity`](../bootstrap/packages/compiler/src/ToolchainIntegrity.ts)
+**Current toolchain:** Aligned. [`ToolchainIntegrity`](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/ToolchainIntegrity.ts)
 publishes one normalized `silk-toolchain-v1` graph covering the compiler, catalog, exact source
 bytes, sealed intrinsic inventory, target providers, and per-target runtime support. Its SHA-256
 identities exclude absolute paths, timestamps, directory enumeration order, and other checkout
@@ -932,7 +932,7 @@ does not reinterpret a broken installation as a source or backend error.
 **Evidence:** [module diagnostics](modules-names-and-visibility.md),
 [entry diagnostics](program-entry.md),
 [target diagnostics](unsafe-intrinsics-and-targets.md#target-availability),
-[CLI reporting](../bootstrap/packages/cli/src/Report.ts).
+[CLI reporting](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/cli/src/Report.ts).
 
 ### TOOLING-001 — Tooling presents library source and derived availability honestly
 
