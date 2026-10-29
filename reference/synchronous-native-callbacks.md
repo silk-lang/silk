@@ -6,7 +6,8 @@ description: Native code addresses, immediate and deferred callback promises, re
 # Native callbacks
 
 This contract completes the existing exported C-address boundary. A native function pointer is a
-nonnull Copy address, with an exact C signature and behavioral contract. It has no captured Silk
+nonnull Copy address, with an exact C signature and behavioral contract. Its nullable form,
+`?extern "C" fn(...) -> R`, may hold NULL and cannot be called until it is refined. It has no captured Silk
 environment. Borrowed data passed during invocation has a separate lifetime from the code address.
 
 ## Declaring callback invocation
@@ -18,8 +19,11 @@ for later invocation. Omitting a callback does not imply that promise: an incomp
 diagnoses even when the declaration is never called.
 
 Use `deferredCallbacks` for retention followed by invocation during later calls on the registering
-thread, or `threadCallbacks` for invocation on any thread. A declaration selects one callback mode;
-its list must cover every callback exactly once. These invocation clauses do not narrow memory
+thread, or `threadCallbacks` for invocation on any thread. A declaration may give each mode one
+list, so one registration can take a deferred completion callback and an any-thread error
+callback; together the lists must name every callback exactly once, and a callback in two lists
+diagnoses. Each callback's mode is part of the declaration's native identity. These invocation
+clauses do not narrow memory
 access, locality or pointer capture and cannot be combined with those narrowing promises.
 
 The function-pointer type itself accepts the same clause for its access behavior. In type clauses,
@@ -104,8 +108,10 @@ does not extend a borrow or establish ownership.
 A callback path starts with the written parameter name and follows C struct fields separated by
 dots, for example `"request.info.callback"`. Type aliases do not hide callbacks. Every callback
 leaf in the resolved by-value argument must be listed exactly once; omitted, duplicate, unknown
-and non-callback paths diagnose. The rule applies to all three callback modes.
-Fixed-array fields containing callbacks are rejected; indexed callback paths are not admitted.
+and non-callback paths diagnose. The rule applies across all of a declaration's callback lists.
+A nullable `?extern "C" fn` parameter or field is a callback leaf too, and is listed like any other;
+native code must test it before calling it. Fixed-array fields containing callbacks are rejected;
+indexed callback paths are not admitted.
 Arrays without callback leaves retain their ordinary C ABI rules.
 
 Traversal stops at raw pointers. A path cannot cross `nextInChain`, an opaque handle or a userdata
@@ -130,7 +136,9 @@ Unannotated exports have conservative behavior and match conservative native poi
 
 Calling a native pointer value requires `unsafe`, exact arguments and a supported native target.
 The address is called at runtime under the target C ABI. It does not become an ordinary specialized
-Silk callable. Nullable native invocation is unadmitted; a native address must be nonnull and valid.
+Silk callable. A `?extern "C" fn` value is not callable: test it with `Intrinsic.pointerIsNull`, then
+refine it with `unsafe Intrinsic.pointerRequalify` to the nonnull type with the same signature and
+behavior. A called native address must be nonnull and valid.
 
 Single-value reference parameters require the `borrow` promise, just as direct foreign calls do.
 Their loans last through the complete indirect invocation. Nested invocations may use independent

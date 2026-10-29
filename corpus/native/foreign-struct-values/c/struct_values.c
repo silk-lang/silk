@@ -24,6 +24,10 @@ void c_register_deferred(struct CallbackEnvelope envelope) {
 void c_register_direct(void (*callback)(uint32_t, uint32_t *), uint32_t *userdata) {
   pending = (struct CallbackInfo){0, 7, callback, userdata};
 }
+void c_register_mixed(void (*lost)(uint32_t, uint32_t *), void (*error)(uint32_t, uint32_t *), uint32_t *userdata) {
+  error(3, userdata);
+  pending = (struct CallbackInfo){0, 5, lost, userdata};
+}
 int c_process_deferred(void) {
   if (!pending.callback) return 0;
   struct CallbackInfo current = pending;

@@ -843,7 +843,9 @@ pub extern "C" struct Timespec {
 }
 ```
 
-A C-layout record is nongeneric. Its fields may be fixed-width integers, `isize`, `usize`, `f32`,
+A C-layout record declares no type or row parameters. It may declare lifetime parameters, as in
+`extern "C" struct BufferRef<'a>`: a lifetime has no representation, so the record keeps one C
+layout, and the lifetime can tie a borrowed handle or descriptor to its owner. Its fields may be fixed-width integers, `isize`, `usize`, `f32`,
 `f64`, raw pointers, non-zero fixed arrays of permitted fields, and other valid C-layout records.
 The compiler places those fields in declaration order with the C ABI's alignment, internal
 padding, and tail padding for the selected target.
@@ -855,7 +857,7 @@ Unit, `bool`, `char`, strings, references, slices, ordinary structs by value, un
 callables, Effect values, type parameters, represented types, and zero-length arrays cannot be
 C-layout fields.
 
-**Diagnostics:** A generic C-layout declaration and an unsupported field type each report a stable
+**Diagnostics:** A C-layout declaration with a type or row parameter and an unsupported field type each report a stable
 semantic diagnostic at the source syntax that violates the layout contract. The nominal type
 remains available for tooling, but the compiler withholds the C-layout promise.
 
