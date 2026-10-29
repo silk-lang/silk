@@ -456,8 +456,9 @@ explicit conversion APIs belong to the expressions and operators reference.
 **Boundary:** Integers do not become floats implicitly, and `f32` does not widen to `f64` after it
 has been typed. A conversion must be explicit even when mathematically exact.
 
-**Diagnostics:** A floating spelling that cannot produce a supported floating value reports
-`SEM0095`. Contextual type mismatches use the enclosing boundary's ordinary diagnostic.
+**Diagnostics:** A floating literal that rounds to infinity at its selected width, such as
+`1.0e100` as `f32` or `1.0e400` as `f64`, reports `SEM0095` at the literal. Contextual type
+mismatches use the enclosing boundary's ordinary diagnostic.
 
 **Evidence:** floating scalar specification,
 floating tests.
