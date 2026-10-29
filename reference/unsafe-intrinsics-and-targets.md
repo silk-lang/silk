@@ -1037,8 +1037,8 @@ distinct from Silk type compatibility. The admitted subset is:
 - `f32` and `f64` as the C `float` and `double` classes; and
 - Qualified single/many and nullable/non-null pointers for any pointee `T` as the C pointer class, without requiring the
   pointee itself to be admitted; and
-- `extern "C" fn(P...) -> R` as one C function-pointer class when every parameter and result is
-  admitted recursively; and
+- `extern "C" fn(P...) -> R` and its nullable form `?extern "C" fn(P...) -> R` as one C
+  function-pointer class when every parameter and result is admitted recursively; and
 - Single-value reference parameters explicitly named by `borrow` in the sealed [foreign contract](foreign-call-contracts.md), lowered to one C pointer while retaining the full ordinary loan.
 
 ```silk,ignore
@@ -1440,6 +1440,23 @@ unsafe export "C" fn compare(left: *const i32, right: *const i32) -> i32
 The native backend supplies the address of the same C-ABI thunk published for external callers.
 The address passes unchanged through the foreign call. Calling a runtime native pointer requires `unsafe` and uses a distinct guarded C-ABI indirect call. Ordinary functions, generic functions,
 effect or suspending functions, naked machine functions, and anonymous or capturing callables never acquire a C callback address.
+
+A C function-pointer slot that may hold NULL has the type `?extern "C" fn(P...) -> R`, with the
+same representation, signature and behavior. A nonnull address, including an export converted in
+context, weakens to it implicitly. It is never called: `Intrinsic.pointerIsNull<F>(value)` tests
+it, `unsafe Intrinsic.pointerRequalify<F, G>(value)` refines it to the nonnull type `G` that has the
+same signature and behavior, and `Intrinsic.pointerNullFunction<F>()` gives its null value. Data
+pointers never convert to either form.
+
+```silk,ignore
+type Optional = ?extern "C" fn(u32, ?*mut u8) -> ()
+
+extern "C" struct CallbackInfo { callback: Optional, userdata: ?*mut u8 }
+
+fn unset() -> CallbackInfo {
+  return CallbackInfo {callback: Intrinsic.pointerNullFunction<Optional>(), userdata: Pointer.null<u8>()}
+}
+```
 
 **Boundary:** Callback conversion is contextual; naming `compare` where a Silk callable is expected
 still produces its ordinary Silk callable value. Imported foreign functions remain callable-only.
