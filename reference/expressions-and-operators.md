@@ -768,7 +768,10 @@ tests `!= Less`. Their result is `bool`.
 Operator selection uses the precise operand types. It does not use the expected result type,
 perform implicit conversion, inspect runtime tags, or choose by import order. Exactly one
 conformance must accept the operands. Its declared result becomes the expression's type. Inside a
-generic body, a bound such as `T: Add<T, T>` or `T: Order` supplies the operation.
+generic body, a bound such as `T: Add<T, T>` or `T: Order` supplies the operation. When no bound
+does, a conformance the operands apply can: under `T: Multiply<T, T>`, `scale * point` selects
+`impl<T: Multiply<T, T>> Multiply<Point<T>, Point<T>> for Scale<T>`, and the body proves that
+conformance's bounds from its own.
 
 Concrete scalar and `string` operands always use the built-in operators of OP-002 to OP-008; the
 sealed conformances for scalars (INTR-008), such as `Add<i32, i32> for i32`, serve generic
@@ -796,7 +799,8 @@ alias declarations by spelling. Conformance selection after the binding is ordin
 
 **Diagnostics:** No conformance accepting the operands reports `SEM0135` at the operator. More than
 one reports `SEM0136`, listing the competing conformances. A missing bound in a generic body reports
-the ordinary unsatisfied-bound diagnostic. The former `operator` declaration marker is not syntax;
+the ordinary unsatisfied-bound diagnostic, `SEM0121` at the operator when the selected
+conformance's bound does not follow from the body's. The former `operator` declaration marker is not syntax;
 writing one reports the parser's unexpected-token diagnostic.
 
 **Current compiler:** Aligned. Generic bounds and concrete conformances use the same fixed binding
