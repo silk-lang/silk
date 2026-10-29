@@ -208,7 +208,7 @@ void it('retains exact gap source locations and rejects malformed location recor
   const gap = {
     code: 'typed-form',
     reason: 'deferred valid form',
-    source: { module: 'silk/option.silk', span: { start: 12, end: 27 } },
+    source: { module: 'silk/core/option.silk', span: { start: 12, end: 27 } },
   }
   const encode = (value: unknown): string =>
     `SILK_UNSUPPORTED_JSON=${JSON.stringify({ gaps: [value] })}`
@@ -220,7 +220,7 @@ void it('retains exact gap source locations and rejects malformed location recor
     { start: 12, end: '27' },
   ]) {
     assert.strictEqual(
-      parseUnsupported(encode({ ...gap, source: { module: 'silk/option.silk', span } })),
+      parseUnsupported(encode({ ...gap, source: { module: 'silk/core/option.silk', span } })),
       undefined,
     )
   }

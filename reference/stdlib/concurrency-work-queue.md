@@ -39,7 +39,7 @@ Each push and send allocates, so it requires `Allocator` and can fail with `OutO
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.concurrency.thread_native { NativeThread, SpawnError }
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.concurrency.work_queue { Steal, Stealer, WorkDeque }
 
 // Takes the oldest value. A lost race gives Retry, so try again.
@@ -98,7 +98,7 @@ pub fn main() -> i32 {
 ```silk
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.concurrency.work_queue { Injector, Mailbox }
 
 effect fn program() -> i32

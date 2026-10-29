@@ -30,7 +30,7 @@ import silk.collections.bytes { Bytes }
 import silk.core.effect { Effect }
 import silk.system.host_input { HostInputError }
 import silk.platform.native.host_input { NativeHostInput }
-import silk.option { Option }
+import silk.core.option { Option }
 
 effect fn program() -> i32
   ! HostInputError | OutOfMemoryError

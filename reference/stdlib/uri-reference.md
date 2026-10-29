@@ -30,7 +30,7 @@ RFC 3986 syntax. Encode them with `silk.uri.percent` first.
 ## Examples
 ### Read the parts of a relative reference
 ```silk
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.uri.reference { ParseError, UriReference }
 

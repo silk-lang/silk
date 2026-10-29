@@ -183,7 +183,7 @@ fn measure<T: Sized>(value: &T) -> Count {
 An interface alias names one complete interface application, including its arguments:
 
 ```silk
-import silk.ops { Add }
+import silk.core.ops { Add }
 
 type AddInt = Add<i32, i32>
 
@@ -193,11 +193,11 @@ fn sum<T: AddInt>(left: T, right: i32) -> i32 {
 ```
 
 An alias of an unapplied generic declaration takes its arguments at each use site, exactly as the
-target's own name does. `Add<i32, i32>` below denotes `silk.ops.Add<i32, i32>`, and a use that
+target's own name does. `Add<i32, i32>` below denotes `silk.core.ops.Add<i32, i32>`, and a use that
 omits or miscounts the arguments receives the target's ordinary arity diagnostic at that use:
 
 ```silk
-import silk.ops
+import silk.core.ops
 
 type Add = ops.Add
 
@@ -506,7 +506,7 @@ integer context, its existing first-literal fallback still applies; this is not 
 
 ```silk
 import silk.text.char { fromU32, toU32 }
-import silk.option { Option }
+import silk.core.option { Option }
 
 fn checked(value: u32) -> Option<char> {
   return fromU32(value)
@@ -1744,7 +1744,7 @@ the remaining arguments unchanged.
 
 ```silk
 import silk.mem.allocator { OutOfMemoryError }
-import silk.format { Format }
+import silk.text.format { Format }
 import silk.json.scanner { JsonError, JsonReason }
 import silk.io.writer { Writer, WriterError }
 

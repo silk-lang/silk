@@ -52,7 +52,7 @@ import silk.io.byte_duplex { ByteDuplex }
 import silk.core.effect { Effect }
 import silk.io.memory_byte_duplex { MemoryByteDuplex, MemoryReadEvent, MemoryWriteEvent }
 import silk.system.monotonic_clock { MonotonicClock }
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.system.system_clock { Instant, SystemClock }
 import silk.num.u64
 import silk.num.usize

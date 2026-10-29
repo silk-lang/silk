@@ -15,7 +15,7 @@ import silk.http.content {
   acceptEncoding,
 }
 import silk.http.headers { Limits }
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.core.result { Result }
 
 fn negotiationLimits() -> Limits {

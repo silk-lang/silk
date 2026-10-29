@@ -6,7 +6,7 @@ Completed outcomes that hold a success value or a failure value as ordinary data
 
 ## When to use
 Use [`Result`](#Result) when a caller must keep, return, or inspect an outcome as a value, and the
-failure needs a reason. Use `silk.option.Option` when "no value" needs no reason. Use an
+failure needs a reason. Use `silk.core.option.Option` when "no value" needs no reason. Use an
 effect failure channel (`!`) when the failure must propagate with `fail` and `run`.
 
 Use [`map`](#Result.impl.map) to transform a success, [`mapError`](#Result.impl.mapError) to transform a failure, [`flatMap`](#Result.impl.flatMap) to chain a

@@ -1562,7 +1562,7 @@ of an operator whose left operand is a scalar:
 
 ```silk,ignore
 // geometry/Vector2.silk
-import silk.ops { Multiply }
+import silk.core.ops { Multiply }
 
 pub struct Vector2 { pub x: f64, pub y: f64 }
 
@@ -1696,7 +1696,7 @@ it proves the member's own bounds. A type may have several inherent blocks with 
 
 ```silk,ignore
 import silk.core.ownership { Copy }
-import silk.ops { Add, Multiply }
+import silk.core.ops { Add, Multiply }
 
 struct Vector2<T> { x: T, y: T }
 

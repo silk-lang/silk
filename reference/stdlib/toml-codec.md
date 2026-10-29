@@ -31,7 +31,7 @@ To support your own type, implement the interfaces for it.
 ```silk
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.toml.codec { TomlCodec }
 import silk.toml.scanner { TomlError }

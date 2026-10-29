@@ -16,7 +16,7 @@ import silk.collections.bytes { Bytes }
 import silk.core.effect { Effect }
 import silk.system.host_input { HostInput, HostInputError }
 import silk.io.logger { LogError }
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.io.logger_native { StdoutLogger }
 import silk.core.result { Result }
 import silk.text.string { String, InvalidUtf8 }

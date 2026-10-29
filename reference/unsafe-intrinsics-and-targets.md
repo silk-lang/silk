@@ -810,8 +810,8 @@ that does not match the sealed signature, and a second conformance for the same 
 INTR-001, or `SEM0083` where it is written as a bound.
 
 **Current compiler:** Aligned. Both compilers read the shared sealed file on demand and resolve
-its members, including through the transparent aliases in `silk.ops`, `silk.equal` and
-`silk.order`. Operator syntax binds to the sealed identities (OP-009).
+its members, including through the transparent aliases in `silk.core.ops`, `silk.core.equal` and
+`silk.core.order`. Operator syntax binds to the sealed identities (OP-009).
 
 **Evidence:** operator contract tests,
 module closure tests.

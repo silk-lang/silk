@@ -187,7 +187,7 @@ return run provided
 Import a module namespace when the module itself is the subject being taught, or when the operation
 is a root declaration with no owner type, as in the primitive namespaces `silk.num.i32` and
 `silk.num.usize`. A namespace binding exposes only root declarations and never reaches an inherent
-member, so `import silk.option` followed by `option.map(...)` is not a
+member, so `import silk.core.option` followed by `option.map(...)` is not a
 substitute for the owner import. Select a root declaration directly when an example reads it
 unqualified or when repeated qualification would obscure the example's actual point; an inherent
 member cannot be selected on its own.
@@ -221,7 +221,7 @@ UserAudit.record(&user)
 Namespace imports, member aliases, and hybrid imports have their ordinary language meaning. A
 reference page specifically documenting those forms should show them directly even though general
 examples prefer the owner import. A root type declared beside an owner is not an associated item of
-that owner: select `ParseError` directly with `import silk.format { Format, ParseError }` rather
+that owner: select `ParseError` directly with `import silk.text.format { Format, ParseError }` rather
 than writing `Format.ParseError`. A conformance still belongs to the module IMPL-004 permits,
 whichever type an example imports.
 

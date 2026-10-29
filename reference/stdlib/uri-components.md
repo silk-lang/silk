@@ -28,7 +28,7 @@ anything is written, and the result is parsed again to make sure that it is a va
 ```silk
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.text.string { String }
 import silk.uri.components { Authority, ComponentValue, Host, Serialization, UriComponents }

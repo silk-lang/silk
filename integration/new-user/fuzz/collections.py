@@ -54,7 +54,7 @@ import silk.collections.hash_map {{ HashMap }}
 import silk.collections.hash_set {{ HashSet }}
 import silk.collections.list {{ List }}
 import silk.io.logger {{ LogError, Logger }}
-import silk.option {{ Option }}
+import silk.core.option {{ Option }}
 import silk.io.logger_native {{ StdoutLogger }}
 
 fn opt(value: Option<i64>) -> i64 {{

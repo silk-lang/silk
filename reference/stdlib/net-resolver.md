@@ -45,7 +45,7 @@ import silk.net.address {
   Ipv6Address,
   Port
 }
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.net.resolver { FamilySelection, ResolveRequest, ResolvedEndpoints, Resolver, ResolverError }
 import silk.system.system_clock { Instant, SystemClock }

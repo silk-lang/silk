@@ -31,7 +31,7 @@ the behavior is undefined.
 ## Examples
 ### Write and read through pointers to a local value and a slice
 ```silk
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.mem.pointer { Pointer }
 
 fn third(values: &[i32]) -> i32 {
@@ -491,7 +491,7 @@ The caller must prove all of these:
 #### Examples
 
 ```silk
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.mem.pointer { Pointer }
 
 struct Inline {

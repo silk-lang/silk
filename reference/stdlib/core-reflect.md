@@ -354,7 +354,7 @@ Use the result as the sequence of a `static for`. Each element has the type
 #### Examples
 
 ```silk
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.core.reflect { Reflect }
 
 union Command {

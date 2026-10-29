@@ -51,7 +51,7 @@ import silk.http.head {
   parseRequest
 }
 import silk.http.headers { Limits as ValueLimits }
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.http.websocket_upgrade { Limits, Offer, UpgradeError, acceptInto, inspect, rejectionStatus }
 

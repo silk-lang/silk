@@ -51,7 +51,7 @@ content, and each example heading. Declaration comments use this form:
 /// Explain a choice only when the code cannot show it.
 ///
 /// ```silk
-/// import silk.option { Option }
+/// import silk.core.option { Option }
 ///
 /// pub fn main() -> i32 {
 ///   let value = Option<i32>.some(2)
@@ -580,7 +580,7 @@ This comment documents `List.length`. The signature gives the remaining informat
 /// ## Use a present and an absent value
 ///
 /// ```silk
-/// import silk.option { Option }
+/// import silk.core.option { Option }
 ///
 /// pub fn main() -> i32 {
 ///   let present = Option<i32>.some(7)

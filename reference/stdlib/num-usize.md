@@ -41,7 +41,7 @@ Use [`ZERO`](#ZERO) and [`ONE`](#ONE) where a literal has no type context, becau
 is an `i32`.
 
 [`parse`](#parse) reads decimal text. A sign is not valid. To write a value as text, use
-`silk.format.Format.display` or `Format.displayWith` with a `Writer`. Neither needs an
+`silk.text.format.Format.display` or `Format.displayWith` with a `Writer`. Neither needs an
 `Allocator`.
 
 ## Gotchas
@@ -50,7 +50,7 @@ A value valid as usize on a 64-bit target can be out of range on a 32-bit target
 ## Examples
 ### Keep a count within the target range
 ```silk
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.num.usize
 
 pub fn main() -> i32 {
@@ -66,7 +66,7 @@ pub fn main() -> i32 {
 
 ### Parse decimal text and reject invalid text
 ```silk
-import silk.format { ParseError }
+import silk.text.format { ParseError }
 import silk.core.result { Result }
 import silk.num.usize
 
@@ -896,10 +896,10 @@ accept digit separators.
 
 ### Errors
 
-- `ParseError` with reason `silk.format.NotANumber` if `text` is empty, has a sign, contains a
+- `ParseError` with reason `silk.text.format.NotANumber` if `text` is empty, has a sign, contains a
   byte that is not a digit, or has bytes after the number. `offset` gives the byte position
   where the read stopped.
-- `ParseError` with reason `silk.format.OutOfRange` if the number is outside the range of
+- `ParseError` with reason `silk.text.format.OutOfRange` if the number is outside the range of
   `usize` on the target.
 
 

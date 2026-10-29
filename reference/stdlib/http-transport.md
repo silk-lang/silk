@@ -44,7 +44,7 @@ import silk.io.memory_byte_duplex {
   MemoryWriteEvent
 }
 import silk.system.monotonic_clock { MonotonicClock }
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.system.random { Random }
 import silk.core.result { Result }
 import silk.system.system_clock { Instant, SystemClock }

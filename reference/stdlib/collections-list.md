@@ -56,7 +56,7 @@ pub effect fn main() -> i32
 ```silk
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.num.usize
 import silk.collections.list { List }
 

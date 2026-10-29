@@ -614,10 +614,10 @@ let profile = user_profile.make(42)
 `make` is a member of `UserProfile`, not a root declaration, so the namespace form reports an
 unknown module member. Write `UserProfile.make(42)` through the selected type. The same boundary
 applies to a root type reached through a nominal qualifier: `Format.ParseError` resolves nothing
-when `ParseError` is a root struct of `silk/format`; select it directly with
-`import silk.format { Format, ParseError }`.
+when `ParseError` is a root struct of `silk/text/format`; select it directly with
+`import silk.text.format { Format, ParseError }`.
 
-An inherent member is never selected on its own. `import silk.option { map }` reports `SEM0197`
+An inherent member is never selected on its own. `import silk.core.option { map }` reports `SEM0197`
 because `Option.map` is a member of `Option`; import the owner and qualify the member.
 
 **Boundary:** An inherent member keeps the visibility of its declaration: a member declared without
@@ -881,7 +881,7 @@ without imports. Ordinary standard-library types and namespaces are not. A modul
 standard-library API it names.
 
 ```silk
-import silk.option { Option }
+import silk.core.option { Option }
 
 pub fn main() -> i32 {
   let value = Option<i32>.some(42)

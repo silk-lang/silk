@@ -26,7 +26,7 @@ when you select the slot.
 ```silk
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
-import silk.layout { Layout }
+import silk.mem.layout { Layout }
 import silk.mem.raw_buffer { RawBuffer }
 import silk.mem.slot { Slot }
 

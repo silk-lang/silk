@@ -32,7 +32,7 @@ import silk.core.effect { Effect }
 import silk.system.monotonic_clock { MonotonicClock }
 import silk.net.resolver_native { NativeSystemResolver }
 import silk.net.address { AddressError, Host, Port }
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.system.monotonic_clock_native { OsMonotonicClock }
 import silk.core.result { Result }
 import silk.net.resolver { FamilySelection, ResolveRequest, ResolvedEndpoints, Resolver, ResolverError }

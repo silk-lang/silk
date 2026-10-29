@@ -34,7 +34,7 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.json.scanner { JsonError }
 import silk.json.value { Json }
-import silk.option { Option }
+import silk.core.option { Option }
 
 pub effect fn main() -> i32
   ! JsonError | OutOfMemoryError {

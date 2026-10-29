@@ -182,7 +182,7 @@ out before the bytes that the first [`LockedStderr`](#LockedStderr) still holds.
 
 ```silk
 import silk.core.effect { Effect }
-import silk.format { Format }
+import silk.text.format { Format }
 import silk.io.writer_native { StderrWriter }
 import silk.io.writer { Writer, WriterError }
 
@@ -224,7 +224,7 @@ output, provide a `Writer`. For log events, use `silk.io.logger`.
 
 #### Details
 
-The template rules are those of `silk.format.Format.format`, and the compiler checks them.
+The template rules are those of `silk.text.format.Format.format`, and the compiler checks them.
 The call holds the standard error lock while it formats and writes, so messages of different
 threads do not mix. It formats into a buffer of 64 bytes on the stack. Thus a short message is
 one system call, and the call does not allocate. It adds no newline.

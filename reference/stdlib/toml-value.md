@@ -32,7 +32,7 @@ you which case occurred.
 ```silk
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.toml.scanner { TomlError }
 import silk.toml.value { Toml, Value }
 

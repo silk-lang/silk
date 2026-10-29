@@ -28,7 +28,7 @@ NUL, DEL, other control bytes, and leading or trailing spaces or tabs.
 ```silk
 import silk.http.message { Header, ResponseHead, Status, StatusClass, ValueError, Version }
 import silk.http.headers { Headers, Limits }
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.core.result { Result }
 
 fn limits() -> Limits {

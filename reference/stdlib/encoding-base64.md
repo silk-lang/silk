@@ -61,7 +61,7 @@ pub fn main() -> i32 {
 ### Reject input that is not strict Base64
 ```silk
 import silk.encoding.base64 { Base64, Base64Error, Base64Reason }
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.core.result { Result }
 
 pub fn main() -> i32 {

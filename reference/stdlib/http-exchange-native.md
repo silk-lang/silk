@@ -47,7 +47,7 @@ prepare.
 ```silk
 import silk.http.exchange_native { NativeExchangeError, Options, preflight }
 import silk.http.origin { Origin, OriginError }
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.system.system_clock { Instant, SystemClock }
 import silk.uri.uri { Uri }

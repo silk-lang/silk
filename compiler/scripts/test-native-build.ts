@@ -694,7 +694,7 @@ const program = Effect.gen(function* () {
   yield* fs.writeFileString(
     join(adopted, 'main.silk'),
     [
-      'import silk.layout { Layout }',
+      'import silk.mem.layout { Layout }',
       'import silk.mem.pointer { Pointer }',
       '',
       '// Counts every reclaim through the context address, a `usize` the program owns.',
@@ -1167,15 +1167,15 @@ const program = Effect.gen(function* () {
     {
       name: 'optionmethod',
       files: {
-        'main.silk': 'import silk.option { Option }\n\npub fn main() -> i32 {\n  let o = Option<i32>.some(1)\n  drop o.frob()\n  return 0\n}\n',
+        'main.silk': 'import silk.core.option { Option }\n\npub fn main() -> i32 {\n  let o = Option<i32>.some(1)\n  drop o.frob()\n  return 0\n}\n',
       },
-      pattern: /error\[SEM0010\] silk\.option\.Option<i32> has no method `frob`/,
+      pattern: /error\[SEM0010\] silk\.core\.option\.Option<i32> has no method `frob`/,
     },
     // `==` on two values whose type implements Equal is told to compare shared borrows.
     {
       name: 'borrowedequal',
       files: {
-        'main.silk': 'import silk.equal { Equal }\n\nstruct Id { value: i32, }\n\nfn same(left: &Id, right: &Id) -> bool { return left.value == right.value }\n\nimpl Equal for Id { equals: same }\n\npub fn main() -> i32 {\n  let a = Id { value: 1 }\n  let b = Id { value: 1 }\n  if a == b { return 1 }\n  return 0\n}\n',
+        'main.silk': 'import silk.core.equal { Equal }\n\nstruct Id { value: i32, }\n\nfn same(left: &Id, right: &Id) -> bool { return left.value == right.value }\n\nimpl Equal for Id { equals: same }\n\npub fn main() -> i32 {\n  let a = Id { value: 1 }\n  let b = Id { value: 1 }\n  if a == b { return 1 }\n  return 0\n}\n',
       },
       pattern: /error\[SEM0135\] Operator == does not accept \(main\.Id, main\.Id\); compare shared borrows, as in `&a == &b`/,
     },
@@ -1190,7 +1190,7 @@ const program = Effect.gen(function* () {
     {
       name: 'reimportstd',
       files: { 'main.silk': 'import silk.num.i64 { ParseError }\n\npub fn main() -> i32 {\n  return 0\n}\n' },
-      pattern: /error\[SEM0015\] `ParseError` is not declared in silk\.num\.i64, which only imports it; import it from silk\.format/,
+      pattern: /error\[SEM0015\] `ParseError` is not declared in silk\.num\.i64, which only imports it; import it from silk\.text\.format/,
     },
     {
       name: 'reimportlocal',
@@ -1213,16 +1213,16 @@ const program = Effect.gen(function* () {
     {
       name: 'displaydebug',
       files: {
-        'main.silk': 'import silk.core.effect { Effect }\nimport silk.io.logger { LogError }\nimport silk.option { Option }\nimport silk.io.logger_native { StdoutLogger }\n\npub effect fn main() -> () ! LogError {\n  let mut logger = StdoutLogger.make()\n  let o = Option<i32>.some(3)\n  run Effect.log("v {o}", &.{ o: move o }) |> Effect.provideMut(&mut logger)\n}\n',
+        'main.silk': 'import silk.core.effect { Effect }\nimport silk.io.logger { LogError }\nimport silk.core.option { Option }\nimport silk.io.logger_native { StdoutLogger }\n\npub effect fn main() -> () ! LogError {\n  let mut logger = StdoutLogger.make()\n  let o = Option<i32>.some(3)\n  run Effect.log("v {o}", &.{ o: move o }) |> Effect.provideMut(&mut logger)\n}\n',
       },
-      pattern: /no implementation of `silk\.format\.Display` exists for `silk\.option\.Option<i32>`; it implements `silk\.format\.Debug`, so a template prints it with `\{value:\?\}`/,
+      pattern: /no implementation of `silk\.text\.format\.Display` exists for `silk\.core\.option\.Option<i32>`; it implements `silk\.text\.format\.Debug`, so a template prints it with `\{value:\?\}`/,
     },
     {
       name: 'displaynodebug',
       files: {
         'main.silk': 'import silk.core.effect { Effect }\nimport silk.io.logger { LogError }\nimport silk.io.logger_native { StdoutLogger }\n\nstruct Plain { value: i32, }\n\npub effect fn main() -> () ! LogError {\n  let mut logger = StdoutLogger.make()\n  let p = Plain { value: 1 }\n  run Effect.log("v {p}", &.{ p: move p }) |> Effect.provideMut(&mut logger)\n}\n',
       },
-      pattern: /no implementation of `silk\.format\.Display` exists for `main\.Plain`\n/,
+      pattern: /no implementation of `silk\.text\.format\.Display` exists for `main\.Plain`\n/,
     },
     // Operands read through a reference print with their lifetime elided.
     {
@@ -1464,7 +1464,7 @@ const program = Effect.gen(function* () {
   // An unhandled failure of another package is reported with that package's name.
   yield* fs.writeFileString(
     join(directory, 'libmsg/geo/src/lib.silk'),
-    'import silk.format { Debug, Format, Formatter }\nimport silk.io.writer { Writer, WriterError }\n\npub struct BadSide {}\n\nimpl Debug for BadSide {\n  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {\n    return run Format.debugFields(self, "BadSide", &mut formatter)\n  }\n}\n\npub effect fn side(length: i64) -> i64 ! BadSide {\n  if length < 0 { fail BadSide {} }\n  return length\n}\n',
+    'import silk.text.format { Debug, Format, Formatter }\nimport silk.io.writer { Writer, WriterError }\n\npub struct BadSide {}\n\nimpl Debug for BadSide {\n  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {\n    return run Format.debugFields(self, "BadSide", &mut formatter)\n  }\n}\n\npub effect fn side(length: i64) -> i64 ! BadSide {\n  if length < 0 { fail BadSide {} }\n  return length\n}\n',
   )
   yield* fs.writeFileString(
     join(directory, 'libmsg/app/src/main.silk'),
@@ -1542,7 +1542,7 @@ const program = Effect.gen(function* () {
     ["reflectimport", "struct P { x: i32 }\n\npub fn main() -> i32 {\n  let mut n = 0\n  static for f in Reflect.fields<P>() { n = n + 1 }\n  return n\n}\n", /error\[SEM0009\] Unknown name Reflect; is `import silk\.core\.reflect \{ Reflect \}` missing\?\n/],
     ["prefixstar", "fn bump(n: &mut i32) -> () {\n  *n = *n + 1\n}\n\npub fn main() -> i32 {\n  let mut x = 1\n  bump(&mut x)\n  return x\n}\n", /error\[PAR0010\] Silk has no prefix `\*`; a dereference follows the value, as in `n\.\* = n\.\* \+ 1`\n/],
     ["floatkey", "import silk.collections.hash { Hash }\nimport silk.collections.hash_map { HashMap }\n\npub fn main() -> i32 {\n  let counts = HashMap<f64, i32>.make(Hash.seed(1))\n  if HashMap<f64, i32>.contains(&counts, 1.5) { return 1 }\n  return 0\n}\n", /error\[SEM0121\] `f64: silk\.collections\.hash\.HashKey` cannot be proved: no implementation of `silk\.collections\.hash\.HashKey` exists for `f64`\n/],
-    ["unordered", "import silk.mem.allocator { Allocator, OutOfMemoryError }\nimport silk.core.effect { Effect }\nimport silk.collections.list { List }\n\nstruct P { x: i32, }\n\npub effect fn main() -> () ! OutOfMemoryError {\n  let mut allocator = Allocator.systemAllocatorProvider()\n  let mut l = List<P>.make()\n  run List<P>.sort(&mut l) |> Effect.provideMut<Allocator>(&mut allocator)\n}\n", /error\[SEM0121\] `main\.P: silk\.order\.Order` cannot be proved: no implementation of `silk\.order\.Order` exists for `main\.P`\n/],
+    ["unordered", "import silk.mem.allocator { Allocator, OutOfMemoryError }\nimport silk.core.effect { Effect }\nimport silk.collections.list { List }\n\nstruct P { x: i32, }\n\npub effect fn main() -> () ! OutOfMemoryError {\n  let mut allocator = Allocator.systemAllocatorProvider()\n  let mut l = List<P>.make()\n  run List<P>.sort(&mut l) |> Effect.provideMut<Allocator>(&mut allocator)\n}\n", /error\[SEM0121\] `main\.P: silk\.core\.order\.Order` cannot be proved: no implementation of `silk\.core\.order\.Order` exists for `main\.P`\n/],
     ["resultimport", "import silk.core.effect { Effect }\n\neffect fn parse() -> i32 ! () { return 1 }\n\npub effect fn main() -> i32 {\n  let parsed = run Effect.result(parse())\n  return match move parsed {\n    Result.Success { value } => value\n    _ => 2\n  }\n}\n", /error\[SEM0009\] Unknown name Result; is `import silk\.core\.result \{ Result \}` missing\?\n/],
     ["enumgone", "enum(u16) Status { Ok = 200, Created = 201, }\nenum Light { Red, Green, }\n\npub fn main() -> i32 {\n  let gone = Status.Gone\n  return 0\n}\n", /error\[SEM0153\] Enum Status has no member Gone\n/],
     ["enumrange", "enum(u8) Big { A = 256, }\n\npub fn main() -> i32 { return 0 }\n", /error\[SEM0150\] Discriminant 256 of Big\.A does not fit in u8 \(0 to 255\)\n/],
@@ -1579,7 +1579,7 @@ const program = Effect.gen(function* () {
     assert.equal(checked.status, 1, checked.stderr)
     assert.match(checked.stderr, expected)
     assert.equal(checked.stderr.match(/error\[/g)?.length, 1, checked.stderr)
-    assert.doesNotMatch(checked.stderr, /stdlib\/silk\/format\.silk/, checked.stderr)
+    assert.doesNotMatch(checked.stderr, /stdlib\/silk\/text\/format\.silk/, checked.stderr)
   }
   // Parking checks run at build time: each names what parks and the rule it breaks.
   const parkingCases: Array<[string, string, RegExp]> = [
