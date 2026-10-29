@@ -305,7 +305,7 @@ const program = Effect.gen(function* () {
   yield* change(session, uri, 7, imported)
   const importing = yield* diagnosticsFor(session, uri, 7, [])
   assert.deepEqual(importing.diagnostics, [], JSON.stringify(importing))
-  const member = { textDocument: { uri }, position: { line: 0, character: 22 } }
+  const member = { textDocument: { uri }, position: { line: 0, character: 27 } }
   const memberShown = yield* request(session, 15, 'textDocument/hover', member)
   assert.ok(
     (memberShown['result'] as { contents: { value: string } }).contents.value.includes(
@@ -313,10 +313,10 @@ const program = Effect.gen(function* () {
     ),
     JSON.stringify(memberShown),
   )
-  const library = pathToFileURL(join(stdlib, 'silk', 'option.silk')).href
+  const library = pathToFileURL(join(stdlib, 'silk', 'core', 'option.silk')).href
   // The doc comment's code links point at the lines of what they name.
   const documented = (memberShown['result'] as { contents: { value: string } }).contents.value
-  const optionLines = readFileSync(join(stdlib, 'silk', 'option.silk'), 'utf8').split('\n')
+  const optionLines = readFileSync(join(stdlib, 'silk', 'core', 'option.silk'), 'utf8').split('\n')
   const someLine = optionLines.findIndex((line) => line.includes('pub fn some(')) + 1
   assert.ok(documented.includes(`[\`some\`](${library}#L${someLine})`), documented)
   // A union case resolves too, and nothing is left as a bare bracketed link.
@@ -330,7 +330,7 @@ const program = Effect.gen(function* () {
     range: { start: { line: number; character: number } }
   }
   assert.equal(memberDefined.uri, library, JSON.stringify(memberDefined))
-  const path = { textDocument: { uri }, position: { line: 0, character: 13 } }
+  const path = { textDocument: { uri }, position: { line: 0, character: 18 } }
   const pathShown = yield* request(session, 17, 'textDocument/hover', path)
   assert.ok(
     (pathShown['result'] as { contents: { value: string } }).contents.value.includes(
@@ -346,7 +346,7 @@ const program = Effect.gen(function* () {
 
   // A standard-library file opened from there gets the same features, from the package that
   // reads it.
-  const libraryText = readFileSync(join(stdlib, 'silk', 'option.silk'), 'utf8')
+  const libraryText = readFileSync(join(stdlib, 'silk', 'core', 'option.silk'), 'utf8')
   yield* session.send({
     jsonrpc: '2.0',
     method: 'textDocument/didOpen',
