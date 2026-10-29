@@ -12,7 +12,7 @@ import backend.InstanceKey {HelperRole, InstanceKey}
 import backend.InstanceIdentity {InstanceIdentity}
 import backend.StackLifetimes
 import backend.StackLifetimes {BlockMarkers, Marker}
-import backend.Layout {Abi, Field, Layout, Metrics, Sequence, Slice as SliceFacts, Tagged as TaggedFacts, TypeLayout}
+import backend.Layout {Abi, Field, Layout, Metrics, Sequence, Slice as SliceFacts, Storage, Tagged as TaggedFacts, TypeLayout}
 import backend.TypeLayouts {DataSpan, TypeLayouts}
 import backend.Gap {Code as GapCode, Gap, Source as GapSource}
 import backend.Mir
@@ -128,6 +128,9 @@ struct Writer {
   /// provider addresses, and the hidden result, failure, context, observer, cause and site
   /// addresses; a coroutine's transfer record and frame. Absent ones are `none()`.
   parameters: List<u64>,
+  /// Each written parameter's further lanes when it travels in several (`parameterLanes`), three
+  /// per parameter, `none()` past its last.
+  extras: List<u64>,
   providers: List<u64>,
   out: u64,
   failure: u64,
@@ -187,7 +190,7 @@ effect fn writerFor(target: &Target, fastPath: bool) -> Writer ! OutOfMemoryErro
 effect fn writerOfWidth(pointerBits: usize, fastPath: bool) -> Writer ! OutOfMemoryError ? &mut Allocator {
   return Writer {module: Module.make(), located: usize.ZERO, symbol: Bytes.make(), trap: Option<TrapReport>.none(), fastPath: fastPath,
     pointerBits: pointerBits, slots: List<u64>.make(), companions: List<u64>.make(),
-    blocks: List<u64>.make(), scalars: List<bool>.make(), copies: List<CallerCopy>.make(), dropCopies: List<DropCopy>.make(), parameters: List<u64>.make(), providers: List<u64>.make(),
+    blocks: List<u64>.make(), scalars: List<bool>.make(), copies: List<CallerCopy>.make(), dropCopies: List<DropCopy>.make(), parameters: List<u64>.make(), extras: List<u64>.make(), providers: List<u64>.make(),
     out: Bitcode.none(), failure: Bitcode.none(), context: Bitcode.none(), observer: Bitcode.none(), cause: Bitcode.none(),
     site: Bitcode.none(), transfer: Bitcode.none(), frame: Bitcode.none(), threaded: List<bool>.make(),
     tables: List<JumpTable>.make()}
@@ -202,6 +205,7 @@ fn resetFunction(writer: &mut Writer) -> () {
   List<CallerCopy>.clear(&mut writer.*.copies)
   List<DropCopy>.clear(&mut writer.*.dropCopies)
   List<u64>.clear(&mut writer.*.parameters)
+  List<u64>.clear(&mut writer.*.extras)
   List<u64>.clear(&mut writer.*.providers)
   writer.out = Bitcode.none()
   writer.failure = Bitcode.none()
@@ -481,8 +485,16 @@ effect fn notOf(writer: &mut Writer, kind: Representation, value: u64) -> u64 ! 
   return run binaryOf(&mut writer.*, Bitcode.opXor(), value, ones)
 }
 
+// A bool lives in memory as a byte, as Clang keeps C's `bool`: loads read an `i8` and truncate it,
+// and `storeOf` widens an `i1` first. Every access to the byte then has one type, so SROA can
+// promote a slot whose bool a whole-record copy also moves as a byte (#2489).
 effect fn loadOf(writer: &mut Writer, kind: Representation, address: u64, alignment: usize) -> u64 ! OutOfMemoryError ? &mut Allocator {
   let ty = run typeOf(&mut writer.*, kind)
+  if kind.bits == usize.ONE && !kind.aggregate && !kind.pointer && !kind.floating && !kind.unit && kind.lanes == usize.ZERO {
+    let byte = run Module.integer(&mut writer.*.module, 8)
+    let loaded = run Module.load(&mut writer.*.module, byte, address, usize.toU64(alignment), false)
+    return run Module.cast(&mut writer.*.module, Bitcode.castTrunc(), loaded, ty)
+  }
   return run Module.load(&mut writer.*.module, ty, address, usize.toU64(alignment), false)
 }
 
@@ -492,6 +504,12 @@ effect fn loadPointer(writer: &mut Writer, address: u64, alignment: usize) -> u6
 }
 
 effect fn storeOf(writer: &mut Writer, value: u64, address: u64, alignment: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let flag = run Module.integer(&mut writer.*.module, 1)
+  if Module.typeOf(&writer.*.module, value) == flag {
+    let byte = run Module.integer(&mut writer.*.module, 8)
+    let widened = run Module.cast(&mut writer.*.module, Bitcode.castZExt(), value, byte)
+    return run Module.store(&mut writer.*.module, widened, address, usize.toU64(alignment), false)
+  }
   return run Module.store(&mut writer.*.module, value, address, usize.toU64(alignment), false)
 }
 
@@ -585,6 +603,19 @@ effect fn markLife(writer: &mut Writer, which: &[u8], local: usize, companions: 
     }
     at = at + usize.ONE
   }
+}
+
+// Per local, whether markLife writes nothing for it: a scalar slot without a context companion.
+effect fn unmarkedSlots(writer: &Writer, companions: &[usize]) -> List<bool> ! OutOfMemoryError ? &mut Allocator {
+  let mut result = List<bool>.make()
+  run List<bool>.appendSlice(&mut result, List<bool>.asSlice(&writer.*.scalars))
+  let flags = List<bool>.asMutSlice(&mut result)
+  let mut at = usize.ZERO
+  while at < companions.length {
+    flags[companions[at]] = false
+    at = at + usize.ONE
+  }
+  return move result
 }
 
 effect fn lifetimeCalls(writer: &mut Writer, which: &[u8], locals: &[usize], companions: &[usize]) -> ()
@@ -920,7 +951,9 @@ effect fn defineGuardedReclaim(writer: &mut Writer) -> () ! OutOfMemoryError ? &
   return run Module.endBody(&mut writer.*.module)
 }
 
-// The personality of every foreign guard: it terminates during either unwind phase.
+// The personality of every foreign guard: it terminates during either unwind phase. Every unit
+// defines it, as a hidden `linkonce_odr` function, so a link keeps one copy per image. Mach-O's
+// compact unwind encodes at most three personalities, and private copies count one each (#2547).
 effect fn defineForeignPersonality(writer: &mut Writer) -> () ! OutOfMemoryError ? &mut Allocator {
   let int32 = run integerType(&mut writer.*, 32)
   let int64 = run integerType(&mut writer.*, 64)
@@ -931,7 +964,8 @@ effect fn defineForeignPersonality(writer: &mut Writer) -> () ! OutOfMemoryError
   let encoding: [u64; 6] = [0, Bitcode.attrNoInline(), 0, Bitcode.attrNoUnwind(), 0, Bitcode.attrNoReturn()]
   run Module.attributeGroup(&mut writer.*.module, Bitcode.positionFunction(), &encoding)
   let attributes = run Module.endAttributes(&mut writer.*.module)
-  let function = run Module.defineFunction(&mut writer.*.module, b"__silk_foreign_personality", ty, Bitcode.linkInternal(), attributes)
+  let function = run Module.defineFunction(&mut writer.*.module, b"__silk_foreign_personality", ty, Bitcode.linkLinkOnceOdr(), attributes)
+  Module.setHidden(&mut writer.*.module, function)
   let names = [Bitcode.plain(Bitcode.prefix(b"version")), Bitcode.plain(Bitcode.prefix(b"actions")), Bitcode.plain(Bitcode.prefix(b"class")),
     Bitcode.plain(Bitcode.prefix(b"exception")), Bitcode.plain(Bitcode.prefix(b"context"))]
   run Module.beginBody(&mut writer.*.module, function, &parameters, &names)
@@ -1021,10 +1055,18 @@ effect fn defineFatalDispatch(writer: &mut Writer, target: &Target) -> () ! OutO
   let firstIncoming = [zero, deliver, handle, selection]
   let first = run Module.phi(&mut writer.*.module, wordTy, &firstIncoming)
   Module.setName(&mut writer.*.module, first, Bitcode.plain(Bitcode.prefix(b"first")))
-  let callbackParameters = [pointer, pointer, byte, wordTy, wordTy, pointer, pointer, pointer, pointer, pointer]
+  // The adapter is a Silk function, so its reason and origin slices arrive as pointer and length
+  // lanes (#2530); the descriptors hold the pointer at offset 0 and the length one word later.
+  let reasonData = run loadPointer(&mut writer.*, reason, usize.ZERO)
+  let reasonLengthAddress = run byteOffset(&mut writer.*, reason, word)
+  let reasonLength = run Module.load(&mut writer.*.module, wordTy, reasonLengthAddress, 0, false)
+  let originData = run loadPointer(&mut writer.*, origin, usize.ZERO)
+  let originLengthAddress = run byteOffset(&mut writer.*, origin, word)
+  let originLength = run Module.load(&mut writer.*.module, wordTy, originLengthAddress, 0, false)
+  let callbackParameters = [pointer, pointer, byte, wordTy, wordTy, pointer, wordTy, pointer, wordTy, pointer, pointer, pointer]
   let callbackType = run functionType(&mut writer.*, wordTy, &callbackParameters)
   let event = run Module.int(&mut writer.*.module, byte, 6)
-  let arguments = [callable, state, event, first, zero, reason, origin, null, null, null]
+  let arguments = [callable, state, event, first, zero, reasonData, reasonLength, originData, originLength, null, null, null]
   let answer = run Module.call(&mut writer.*.module, callbackType, callback, &arguments, 0, false)
   Module.setName(&mut writer.*.module, answer, Bitcode.plain(Bitcode.prefix(b"answer")))
   run branch(&mut writer.*, done)
@@ -1309,6 +1351,140 @@ effect fn unwrappedLane(layouts: &TypeLayouts, field: &Shared<Type>, target: &Ta
   function: &MirFunction, span: Location) -> Representation ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
   let facts = run layoutOf(layouts, field, function, span)
   return storageRepresentation(field, target, facts)
+}
+
+// The lanes a by-address record parameter travels in instead of its address (#2469, #2530): a
+// record wrapping one scalar of its whole size passes as that scalar (`field`, stored as a value
+// of its type); any other record of at most 32 bytes whose storage is at most four pointers,
+// integers, floats and bools (a slice counts as its address and length) passes them as one lane
+// each, at their offsets. A tagged record, an empty one and any other keep their address (`count`
+// zero).
+struct ParameterLanes {
+  count: usize,
+  field: Option<Shared<Type>>,
+  lanes: [Representation; 4],
+  offsets: [usize; 4],
+}
+
+// One scalar of a record's storage for `parameterLanes`, at its offset in the record; an `opaque`
+// span is storage no lane carries.
+struct StorageLeaf {
+  offset: usize,
+  size: usize,
+  lane: Representation,
+  opaque: bool,
+}
+
+impl Copy for StorageLeaf {}
+
+effect fn parameterLanes(layouts: &TypeLayouts, ty: &Shared<Type>, facts: Metrics, target: &Target,
+  function: &MirFunction, span: Location) -> ParameterLanes ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let unit = integerRepresentation(usize.ZERO, false)
+  let mut split = ParameterLanes {count: usize.ZERO, field: Option<Shared<Type>>.none(), lanes: [unit, unit, unit, unit],
+    offsets: [usize.ZERO, usize.ZERO, usize.ZERO, usize.ZERO]}
+  if let Option<Shared<Type>>.Some {value: field} = run unwrappedParameter(layouts, ty, facts, function, span) {
+    split.lanes[0] = run unwrappedLane(layouts, &field, target, function, span)
+    split.count = usize.ONE
+    split.field = Option<Shared<Type>>.some(move field)
+    return move split
+  }
+  if facts.abi != Abi.Indirect || facts.tagged || facts.size == usize.ZERO || facts.size > 32 { return move split }
+  let mut leaves = List<StorageLeaf>.make()
+  run collectLeaves(layouts, ty, usize.ZERO, target, function, span, usize.ZERO, &mut leaves)
+  let listed = List<StorageLeaf>.asSlice(&leaves)
+  if listed.length == usize.ZERO || listed.length > 4 { return move split }
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if listed[at].opaque { return move split }
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < listed.length {
+    split.lanes[at] = listed[at].lane
+    split.offsets[at] = listed[at].offset
+    at = at + usize.ONE
+  }
+  split.count = listed.length
+  return move split
+}
+
+// Stores a split parameter's lanes, `inputs` (`parameterLanes`), into its slot.
+effect fn storeLanes(writer: &mut Writer, split: &ParameterLanes, slot: u64, alignment: usize, inputs: &[u64]) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  if let Option<Shared<Type>>.Some {value: field} = &split.field {
+    let address = Address {ty: Shared<Type>.clone(&field), value: slot, alignment: alignment, representation: split.lanes[0]}
+    return run storeValue(&mut writer.*, &address, &Value {scalar: split.lanes[0], value: inputs[0]})
+  }
+  let mut at = usize.ZERO
+  while at < split.count {
+    let mut address = slot
+    if split.offsets[at] != usize.ZERO { address = run byteOffset(&mut writer.*, slot, split.offsets[at]) }
+    run storeOf(&mut writer.*, inputs[at], address, offsetAlignment(alignment, split.offsets[at]))
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Adds the parameter lanes of `split` after its first, recording them in `writer.extras`.
+effect fn addExtraLanes(writer: &mut Writer, signature: &mut Signature, split: &ParameterLanes, at: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut lane = usize.ONE
+  while lane < 4 {
+    let mut added = Bitcode.none()
+    if lane < split.count {
+      let ty = run typeOf(&mut writer.*, split.lanes[lane])
+      added = run addParameter(&mut signature.*, ty, Bitcode.named2(Bitcode.prefixParameter(), at, lane))
+    }
+    run List<u64>.append(&mut writer.*.extras, added)
+    lane = lane + usize.ONE
+  }
+  return ()
+}
+
+// Appends the scalars of `ty`'s storage at `base` to `leaves`, in offset order.
+effect fn collectLeaves(layouts: &TypeLayouts, ty: &Shared<Type>, base: usize, target: &Target, function: &MirFunction,
+  span: Location, depth: usize, leaves: &mut List<StorageLeaf>) -> () ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if List<StorageLeaf>.length(&leaves.*) > 4 { return () }
+  let facts = run layoutOf(layouts, ty, function, span)
+  if facts.size == usize.ZERO { return () }
+  if !facts.tagged && (facts.abi == Abi.Pointer || facts.abi == Abi.Integer || facts.abi == Abi.Floating) {
+    let mut lane = storageRepresentation(ty, target, facts)
+    // A bool travels as its byte.
+    if lane.bits == usize.ONE && facts.size == usize.ONE && !lane.floating && !lane.pointer { lane = integerRepresentation(8, false) }
+    let plain = !lane.aggregate && !lane.unit && lane.lanes == usize.ZERO && lane.bits == facts.size * 8
+    run List<StorageLeaf>.append(&mut leaves.*, StorageLeaf {offset: base, size: facts.size, lane: lane, opaque: !plain})
+    return ()
+  }
+  if facts.abi == Abi.Indirect && !facts.tagged && depth < 8 {
+    let at = run TypeLayouts.firstMatching(layouts, ty)
+    if at != usize.MAX {
+      let listed = TypeLayouts.list(layouts)
+      // A slice is its element address and then its length.
+      let length = Shared<Layout>.with<usize>(&listed[at].layout, fn(layout: &Layout) -> usize {
+        if let Storage.Slice {lengthOffset, ..} = &layout.storage { return lengthOffset }
+        return usize.MAX
+      })
+      if length != usize.MAX {
+        let word = u32.toUsize(Target.pointerBits(target)) / 8
+        run List<StorageLeaf>.append(&mut leaves.*, StorageLeaf {offset: base, size: word, lane: pointerRepresentation(target), opaque: false})
+        run List<StorageLeaf>.append(&mut leaves.*, StorageLeaf {offset: base + length, size: word,
+          lane: integerRepresentation(word * 8, false), opaque: false})
+        return ()
+      }
+      let count = Shared<Layout>.with<usize>(&listed[at].layout, Layout.fieldCount)
+      if count > usize.ZERO && count <= 4 {
+        let mut index = usize.ZERO
+        while index < count {
+          let field = run fieldFact(layouts, ty, index, function, span)
+          run collectLeaves(layouts, &field.ty, base + field.offset, target, function, span, depth + usize.ONE, &mut leaves.*)
+          index = index + usize.ONE
+        }
+        return ()
+      }
+    }
+  }
+  run List<StorageLeaf>.append(&mut leaves.*, StorageLeaf {offset: base, size: facts.size, lane: integerRepresentation(8, false),
+    opaque: true})
+  return ()
 }
 
 // Whether `function` is a C export shim, whose lanes follow the C ABI instead (SIMD-010).
@@ -1654,6 +1830,15 @@ effect fn emitOperand(
 
 effect fn emitArgument(writer: &mut Writer, function: &MirFunction, target: &Target,
   layouts: &TypeLayouts, operand: &Operand, foreign: bool) -> Value ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut lanes = List<Value>.make()
+  run appendArgument(&mut writer.*, function, target, layouts, operand, foreign, &mut lanes)
+  return List<Value>.get(&lanes, usize.ZERO)
+}
+
+// Appends the lanes `operand` passes in: a split record's (`parameterLanes`) for a Silk callee,
+// else its one value, which is unit for a unit argument.
+effect fn appendArgument(writer: &mut Writer, function: &MirFunction, target: &Target,
+  layouts: &TypeLayouts, operand: &Operand, foreign: bool, lanes: &mut List<Value>) -> () ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
   let mut place = Option<Address>.none()
   if let Operand.Copy {place: source} = &operand.* {
     place = Option<Address>.some(run emitPlace(&mut writer.*, function, target, layouts, &source))
@@ -1664,13 +1849,22 @@ effect fn emitArgument(writer: &mut Writer, function: &MirFunction, target: &Tar
   if let Option<Address>.Some {value: address} = move place {
     if address.representation.aggregate && !foreign {
       let facts = run layoutOf(layouts, &address.ty, function, Location.generated())
-      if let Option<Shared<Type>>.Some {value: field} = run unwrappedParameter(layouts, &address.ty, facts, function, Location.generated()) {
-        let lane = run unwrappedLane(layouts, &field, target, function, Location.generated())
-        return Value {scalar: lane, value: run loadOf(&mut writer.*, lane, address.value, address.alignment)}
+      let split = run parameterLanes(layouts, &address.ty, facts, target, function, Location.generated())
+      if split.count != usize.ZERO {
+        let mut at = usize.ZERO
+        while at < split.count {
+          let mut source = address.value
+          if split.offsets[at] != usize.ZERO { source = run byteOffset(&mut writer.*, address.value, split.offsets[at]) }
+          let lane = split.lanes[at]
+          run List<Value>.append(&mut lanes.*, Value {scalar: lane,
+            value: run loadOf(&mut writer.*, lane, source, offsetAlignment(address.alignment, split.offsets[at]))})
+          at = at + usize.ONE
+        }
+        return ()
       }
     }
     if address.representation.aggregate || (!foreign && passedIndirectly(address.representation)) {
-      return Value {scalar: pointerRepresentation(target), value: address.value}
+      return run List<Value>.append(&mut lanes.*, Value {scalar: pointerRepresentation(target), value: address.value})
     }
   }
   let value = run emitOperand(&mut writer.*, function, target, layouts, operand)
@@ -1680,7 +1874,7 @@ effect fn emitArgument(writer: &mut Writer, function: &MirFunction, target: &Tar
     let owner = InstanceKey.identity(&function.key)
     fail Gap.relative(GapCode.TypedForm, &owner, Location.generated())
   }
-  return value
+  return run List<Value>.append(&mut lanes.*, value)
 }
 
 fn lengthRepresentation(target: &Target) -> Representation {
@@ -3820,7 +4014,9 @@ effect fn emitCCall(writer: &mut Writer, function: &MirFunction, target: &Target
     }
   }
   let output = run emitPlace(&mut writer.*, function, target, layouts, destination)
-  if !(run Type.equalsShared(&output.ty, &signature.result.ty)) { fail Gap.relative(GapCode.ForeignAbi, &owner, span) }
+  // Lanes compare by representation: a C-layout record's lifetimes, such as the invocation
+  // lifetime an elided `BufferRef` parameter gets, are validity only (#2541).
+  if !(run Type.runtimeEqualsShared(&output.ty, &signature.result.ty)) { fail Gap.relative(GapCode.ForeignAbi, &owner, span) }
   let mut address = Bitcode.none()
   if let Callee.NativeIndirect {address: operand, ..} = &callee.* {
     let loaded = run emitOperand(&mut writer.*, function, target, layouts, &operand)
@@ -3841,7 +4037,7 @@ effect fn emitCCall(writer: &mut Writer, function: &MirFunction, target: &Target
         Operand.Move {place} => run emitPlace(&mut writer.*, function, target, layouts, &place)
         _ => { fail Gap.relative(GapCode.ForeignAbi, &owner, span) }
       }
-      if !(run Type.equalsShared(&selected.ty, &lane.ty)) { fail Gap.relative(GapCode.ForeignAbi, &owner, span) }
+      if !(run Type.runtimeEqualsShared(&selected.ty, &lane.ty)) { fail Gap.relative(GapCode.ForeignAbi, &owner, span) }
       if lane.passing == CPassing.Indirect {
         let copy = callerCopy(&writer.*, block, at)
         run copyBytes(&mut writer.*, copy, selected.value, lane.layout.size)
@@ -4001,8 +4197,14 @@ effect fn emitCallInner(
   let mut evaluated = List<Value>.make()
   let mut index = usize.ZERO
   while index < values.length {
-    let value = run emitArgument(&mut writer.*, function, target, layouts, &values[index], false)
-    if !value.scalar.unit { run List<Value>.append(&mut evaluated, value) }
+    let mut lanes = List<Value>.make()
+    run appendArgument(&mut writer.*, function, target, layouts, &values[index], false, &mut lanes)
+    let passed = List<Value>.asSlice(&lanes)
+    let mut lane = usize.ZERO
+    while lane < passed.length {
+      if !passed[lane].scalar.unit { run List<Value>.append(&mut evaluated, passed[lane]) }
+      lane = lane + usize.ONE
+    }
     index = index + usize.ONE
   }
   // A wide vector result is written through the caller's address like an aggregate (SIMD-009).
@@ -4567,14 +4769,15 @@ effect fn emitEntrySlots(
       }
     }
     let span = locals[local + usize.ONE].origin.location
-    let mut unwrapped = Option<Shared<Type>>.none()
-    if !cExport(function) { unwrapped = run unwrappedParameter(layouts, &parameters[local], parameterLayout, function, span) }
-    if let Option<Shared<Type>>.Some {value: field} = move unwrapped {
-      let lane = run unwrappedLane(layouts, &field, target, function, span)
-      let address = Address {ty: move field, value: slot, alignment: parameterLayout.alignment, representation: lane}
-      run storeValue(&mut writer.*, &address, &Value {scalar: lane, value: input})
-      local = local + usize.ONE
-      continue
+    if !cExport(function) {
+      let split = run parameterLanes(layouts, &parameters[local], parameterLayout, target, function, span)
+      if split.count != usize.ZERO {
+        let inputs = [input, List<u64>.get(&writer.extras, local * 3), List<u64>.get(&writer.extras, local * 3 + 1),
+          List<u64>.get(&writer.extras, local * 3 + 2)]
+        run storeLanes(&mut writer.*, &split, slot, parameterLayout.alignment, &inputs)
+        local = local + usize.ONE
+        continue
+      }
     }
     if let Option<usize>.Some {..} = ownedParameter(function, &locals[local + usize.ONE], parameterLayout, kind) {
       local = local + usize.ONE
@@ -4622,8 +4825,8 @@ effect fn emitSlots(
       let mut outward = false
       if let Option<Suspended>.None = &suspended.* {
         if let Option<usize>.Some {value: index} = ownedParameter(function, &locals[local], localLayout, kind) {
-          let unwrapped = run unwrappedParameter(layouts, &locals[local].ty, localLayout, function, locals[local].origin.location)
-          if let Option<Shared<Type>>.None = &unwrapped { owned = index }
+          let split = run parameterLanes(layouts, &locals[local].ty, localLayout, target, function, locals[local].origin.location)
+          if split.count == usize.ZERO { owned = index }
         }
         outward = local == usize.ZERO && writer.out != Bitcode.none() && resultInOut(function, kind)
       }
@@ -4900,6 +5103,7 @@ pub effect fn emit(
         part = part + usize.ONE
       }
       run List<u64>.append(&mut writer.parameters, first)
+      run List<u64>.appendRepeated(&mut writer.extras, Bitcode.none(), 3)
     } else {
       let facts = run layoutOf(layouts, &parameters[at], function, locals[at + usize.ONE].origin.location)
       let lane = storageRepresentation(&parameters[at], target, facts)
@@ -4907,17 +5111,19 @@ pub effect fn emit(
         let mut ty = pointer
         if facts.abi != Abi.Indirect && !passedIndirectly(lane) { ty = run typeOf(&mut writer, lane) }
         let span = locals[at + usize.ONE].origin.location
-        let unwrapped = run unwrappedParameter(layouts, &parameters[at], facts, function, span)
-        if let Option<Shared<Type>>.Some {value: field} = &unwrapped {
-          ty = run typeOf(&mut writer, run unwrappedLane(layouts, &field, target, function, span))
+        let split = run parameterLanes(layouts, &parameters[at], facts, target, function, span)
+        if split.count != usize.ZERO {
+          ty = run typeOf(&mut writer, split.lanes[0])
         } else if exclusiveParameter(facts, lane) {
           let position = usize.toU64(List<u64>.length(&lanes.types)) + 1
           let encoding: [u64; 2] = [0, Bitcode.attrNoAlias()]
           run addAttributes(&mut lanes, position, &encoding)
         }
         run List<u64>.append(&mut writer.parameters, run addParameter(&mut lanes, ty, Bitcode.named(Bitcode.prefixParameter(), at)))
+        run addExtraLanes(&mut writer, &mut lanes, &split, at)
       } else {
         run List<u64>.append(&mut writer.parameters, Bitcode.none())
+        run List<u64>.appendRepeated(&mut writer.extras, Bitcode.none(), 3)
       }
     }
     at = at + usize.ONE
@@ -4995,9 +5201,7 @@ pub effect fn emit(
   run beginFunction(&mut writer, defined, &lanes)
   let ordinary = Option<Suspended>.none()
   let blocks = List<Block>.asSlice(&function.blocks)
-  // An unoptimized compile never reads lifetime markers, so a fast-path function plans none.
   let mut lifetimes = StackLifetimes.Markers {blocks: List<BlockMarkers>.make()}
-  if !fastPath { lifetimes = run StackLifetimes.plan(function) }
   let companions = run companionLocals(function)
   run addBlocks(&mut writer, blocks.length)
   if !fastPath { writer.threaded = run threadedSwitches(function, target) }
@@ -5007,6 +5211,11 @@ pub effect fn emit(
     startBlock(&mut writer, handle)
     if at == usize.ZERO {
       run emitEntrySlots(&mut writer, function, target, layouts, foreign)
+      // An unoptimized compile never reads lifetime markers, so a fast-path function plans none.
+      if !fastPath {
+        let skip = run unmarkedSlots(&writer, List<usize>.asSlice(&companions))
+        lifetimes = run StackLifetimes.plan(function, List<bool>.asSlice(&skip))
+      }
     }
     run emitBlock(&mut writer, function, target, layouts, &blocks[at], foreign, identities, &ordinary, at,
       List<BlockMarkers>.asSlice(&lifetimes.blocks), List<usize>.asSlice(&companions))
@@ -5135,13 +5344,14 @@ effect fn enterSignature(writer: &mut Writer, function: &MirFunction, target: &T
       let mut ty = pointer
       if facts.abi != Abi.Indirect && !passedIndirectly(lane) { ty = run typeOf(&mut writer.*, lane) }
       let span = locals[at + usize.ONE].origin.location
-      if let Option<Shared<Type>>.Some {value: field} = run unwrappedParameter(layouts, &parameters[at], facts, function, span) {
-        ty = run typeOf(&mut writer.*, run unwrappedLane(layouts, &field, target, function, span))
-      }
+      let split = run parameterLanes(layouts, &parameters[at], facts, target, function, span)
+      if split.count != usize.ZERO { ty = run typeOf(&mut writer.*, split.lanes[0]) }
       let added = run addParameter(&mut lanes, ty, Bitcode.named(Bitcode.prefixParameter(), at))
       run List<u64>.append(&mut writer.*.parameters, added)
+      run addExtraLanes(&mut writer.*, &mut lanes, &split, at)
     } else {
       run List<u64>.append(&mut writer.*.parameters, Bitcode.none())
+      run List<u64>.appendRepeated(&mut writer.*.extras, Bitcode.none(), 3)
     }
     at = at + usize.ONE
   }
@@ -5171,9 +5381,15 @@ effect fn callEnter(writer: &mut Writer, symbol: &[u8], transfer: u64, out: u64)
   let mut arguments = List<u64>.make()
   run List<u64>.append(&mut arguments, transfer)
   let parameters = List<u64>.asSlice(&writer.parameters)
+  let extras = List<u64>.asSlice(&writer.extras)
   let mut at = usize.ZERO
   while at < parameters.length {
     if parameters[at] != Bitcode.none() { run List<u64>.append(&mut arguments, parameters[at]) }
+    let mut lane = usize.ZERO
+    while lane < 3 && at * 3 + lane < extras.length {
+      if extras[at * 3 + lane] != Bitcode.none() { run List<u64>.append(&mut arguments, extras[at * 3 + lane]) }
+      lane = lane + usize.ONE
+    }
     at = at + usize.ONE
   }
   run appendWords(&mut arguments, List<u64>.asSlice(&writer.providers))
@@ -5452,11 +5668,11 @@ effect fn emitEnter(writer: &mut Writer, function: &MirFunction, target: &Target
       let slot = run byteOffset(&mut writer.*, frame, offset)
       let input = List<u64>.get(&writer.parameters, at)
       let span = locals[at + usize.ONE].origin.location
-      if let Option<Shared<Type>>.Some {value: field} = run unwrappedParameter(layouts, &parameters[at], parameterLayout, function, span) {
-        let lane = run unwrappedLane(layouts, &field, target, function, span)
-        let address = Address {ty: move field, value: slot,
-          alignment: offsetAlignment(stepping.coroutine.alignment, offset), representation: lane}
-        run storeValue(&mut writer.*, &address, &Value {scalar: lane, value: input})
+      let split = run parameterLanes(layouts, &parameters[at], parameterLayout, target, function, span)
+      if split.count != usize.ZERO {
+        let inputs = [input, List<u64>.get(&writer.extras, at * 3), List<u64>.get(&writer.extras, at * 3 + 1),
+          List<u64>.get(&writer.extras, at * 3 + 2)]
+        run storeLanes(&mut writer.*, &split, slot, offsetAlignment(stepping.coroutine.alignment, offset), &inputs)
         at = at + usize.ONE
         continue
       }
@@ -5782,8 +5998,14 @@ effect fn emitSuspendingCall(
   let values = List<Operand>.asSlice(arguments)
   let mut index = usize.ZERO
   while index < values.length {
-    let value = run emitArgument(&mut writer.*, function, target, layouts, &values[index], false)
-    if !value.scalar.unit { run List<u64>.append(&mut passed, value.value) }
+    let mut lanes = List<Value>.make()
+    run appendArgument(&mut writer.*, function, target, layouts, &values[index], false, &mut lanes)
+    let given = List<Value>.asSlice(&lanes)
+    let mut lane = usize.ZERO
+    while lane < given.length {
+      if !given[lane].scalar.unit { run List<u64>.append(&mut passed, given[lane].value) }
+      lane = lane + usize.ONE
+    }
     index = index + usize.ONE
   }
   let hidden = List<Operand>.asSlice(providers)

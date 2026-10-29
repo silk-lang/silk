@@ -17,6 +17,9 @@
 //!
 //! The image is two files ([`CacheImage.Files`]): its leaves and nodes at that path, and its roots
 //! at `semantic-<digest>.roots`, which [`prefetch`] reads and decodes on threads of their own.
+//! [`prefetch`] starts before the store that names the file is loaded, so it finds the file through
+//! `profile-<digest>`, which names the file the target and profile the command line selects last
+//! opened.
 //!
 //! A build's definitions are kept beside the file rather than in its image: each module's
 //! definitions are one pack body (see `BuildRecord.Pack`), a file of `semantic-<digest>.packs`
@@ -149,6 +152,15 @@ fn lockName(path: &[u8]) -> bool {
 /// A cache file read and decoded on a thread of its own ([`prefetch`]) while the build loads its
 /// sources, which [`openPrefetched`] takes when it is the file the store names.
 pub struct Prefetch {
+  // The file that names the image this target and profile last opened (`choiceName`).
+  choice: Path,
+  // The image the threads read; none when none was chosen or no thread started.
+  reading: Option<Reading>,
+}
+
+// The threads reading one image, and its path.
+struct Reading {
+  path: Bytes,
   handle: JoinHandle<Option<Fetched>>,
   // The roots file, read on a thread of its own beside the graph file.
   roots: JoinHandle<Option<CacheImage.Roots>>,
@@ -163,35 +175,58 @@ struct Fetched {
   packs: List<BuildRecord.PackBody>,
 }
 
-/// Starts reading the one cache file in `cache` on a thread of its own, before the store that
-/// names its file exists: the file's name digests the target and profile, which only the loaded
-/// store knows. None when the directory holds no file or several (builds that alternate between
-/// profiles), or no thread can start; `open` then reads the file itself.
-pub effect fn prefetch(cache: &Path, building: bool) -> Option<Prefetch> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  let entries = match move run Effect.result(FileSystem.listDirectory(cache)) {
-    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success {value} => move value
-    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Failure {error} => match move error {
+/// Starts reading the cache file in `cache` that the target and profile `profile` (the bytes
+/// `InitialProfile.appendIdentity` gives) last opened, on threads of their own, before the store
+/// that names its file exists: the file's name digests the final profile, which only the loaded
+/// store knows. A directory holding one file and no record for `profile` reads that file. None
+/// when `cache` cannot name the record; `openPrefetched` then reads the file itself, as it does
+/// when no thread starts or the threads read another file.
+pub effect fn prefetch(cache: &Path, building: bool, profile: &[u8]) -> Option<Prefetch> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let choice = match move run choicePath(cache, profile) {
+    Option<Path>.Some {value} => move value
+    Option<Path>.None => { return Option<Prefetch>.none() }
+  }
+  let chosen = match move run Effect.result(FileSystem.readFile(&choice)) {
+    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => {
+      if imageName(Bytes.asSlice(&value)) { Option<Bytes>.some(move value) } else { Option<Bytes>.none() }
+    }
+    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
       FileError failure => {
         drop failure
-        return Option<Prefetch>.none()
+        Option<Bytes>.none()
       }
       OutOfMemoryError exhausted => { fail move exhausted }
     }
   }
-  let found = List<DirectoryEntry>.asSlice(&entries)
+  let listed = run entries(cache)
+  let found = List<DirectoryEntry>.asSlice(&listed)
   let mut named = Option<Bytes>.none()
+  let mut images = usize.ZERO
   let mut at = usize.ZERO
   while at < found.length {
     let path = Path.rawBytes(&found[at].path)
     at = at + usize.ONE
     if !imageName(path) { continue }
-    if let Option<Bytes>.Some {..} = &named { return Option<Prefetch>.none() }
-    named = Option<Bytes>.some(run Bytes.copy(path))
+    images = images + usize.ONE
+    let wanted = match &chosen {
+      Option<Bytes>.Some {value} => namedBy(path, Bytes.asSlice(&value))
+      Option<Bytes>.None => true
+    }
+    if wanted { named = Option<Bytes>.some(run Bytes.copy(path)) }
+  }
+  // Without a record, a directory of several files leaves no way to tell which is this profile's.
+  if let Option<Bytes>.None = &chosen {
+    if images > usize.ONE { named = Option<Bytes>.none() }
   }
   let path = match move named {
     Option<Bytes>.Some {value} => move value
-    Option<Bytes>.None => { return Option<Prefetch>.none() }
+    Option<Bytes>.None => { return Option<Prefetch>.some(Prefetch {choice: move choice, reading: Option<Reading>.none()}) }
   }
+  return Option<Prefetch>.some(Prefetch {choice: move choice, reading: run startReading(move path, building)})
+}
+
+// Starts the threads that read the image at `path`; none when either cannot start.
+effect fn startReading(path: Bytes, building: bool) -> Option<Reading> ! OutOfMemoryError ? &mut Allocator {
   let rootsPath = run Bytes.copy(Bytes.asSlice(&path))
   let roots = match move run Effect.result(NativeThread.spawn(
     fn() -> Option<CacheImage.Roots> {
@@ -202,26 +237,54 @@ pub effect fn prefetch(cache: &Path, building: bool) -> Option<Prefetch> ! OutOf
     Result<JoinHandle<Option<CacheImage.Roots>>, OutOfMemoryError | SpawnError>.Failure {error} => match move error {
       SpawnError unstarted => {
         drop unstarted
-        return Option<Prefetch>.none()
+        return Option<Reading>.none()
       }
       OutOfMemoryError exhausted => { fail move exhausted }
     }
   }
+  let graphPath = run Bytes.copy(Bytes.asSlice(&path))
   return match move run Effect.result(NativeThread.spawn(
     fn() -> Option<Fetched> {
-      return run fetchDetached(move path, building)
+      return run fetchDetached(move graphPath, building)
     }
   )) {
-    Result<JoinHandle<Option<Fetched>>, OutOfMemoryError | SpawnError>.Success {value} => Option<Prefetch>.some(Prefetch {handle: move value,
-      roots: move roots})
+    Result<JoinHandle<Option<Fetched>>, OutOfMemoryError | SpawnError>.Success {value} => Option<Reading>.some(Reading {path: move path,
+      handle: move value, roots: move roots})
     Result<JoinHandle<Option<Fetched>>, OutOfMemoryError | SpawnError>.Failure {error} => match move error {
       SpawnError unstarted => {
         drop unstarted
-        return Option<Prefetch>.none()
+        return Option<Reading>.none()
       }
       OutOfMemoryError exhausted => { fail move exhausted }
     }
   }
+}
+
+// The file in `cache` that names the image the target and profile `profile` last opened:
+// `profile-` and the hex of the digest of `profile`.
+effect fn choicePath(cache: &Path, profile: &[u8]) -> Option<Path> ! OutOfMemoryError ? &mut Allocator {
+  let digest = ContentHash.of(profile)
+  let mut name = run Bytes.copy(b"profile-")
+  run appendHex(&mut name, digest.high)
+  run appendHex(&mut name, digest.low)
+  return match move run Effect.result(Path.joinBytes(cache, Bytes.asSlice(&name))) {
+    Result<Path, FileError | OutOfMemoryError>.Success {value} => Option<Path>.some(move value)
+    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => {
+        drop failure
+        return Option<Path>.none()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// Whether the file at `path` has the name `name`.
+fn namedBy(path: &[u8], name: &[u8]) -> bool {
+  if path.length < name.length { return false }
+  let start = path.length - name.length
+  if start > usize.ZERO && path[start - usize.ONE] != 47 { return false }
+  return same(Slice.view<u8>(path, start, name.length), name)
 }
 
 // Whether `path` names a cache file, `semantic-` and 32 hex digits, rather than its pack directory.
@@ -403,6 +466,7 @@ pub effect fn openPrefetched(store: &mut Semantic, request: &Request, cache: &Pa
       OutOfMemoryError exhausted => { fail move exhausted }
     }
   }
+  let imageFile = run Bytes.copy(Bytes.asSlice(&name))
   let mut lockName = run Bytes.copy(Bytes.asSlice(&name))
   run Bytes.append(&mut name, b".packs")
   let packs = match move run Effect.result(Path.joinBytes(cache, Bytes.asSlice(&name))) {
@@ -431,9 +495,16 @@ pub effect fn openPrefetched(store: &mut Semantic, request: &Request, cache: &Pa
   let mut fetched = Option<Fetched>.none()
   let mut fetchedRoots = Option<CacheImage.Roots>.none()
   if let Option<Prefetch>.Some {value: started} = move prefetched {
-    let Prefetch {handle, roots: rootsHandle} = move started
-    fetched = handle.join()
-    fetchedRoots = rootsHandle.join()
+    let Prefetch {choice, reading} = move started
+    let mut guessed = false
+    if let Option<Reading>.Some {value: read} = move reading {
+      let Reading {path: readPath, handle, roots: rootsHandle} = move read
+      guessed = same(Bytes.asSlice(&readPath), Path.rawBytes(&path))
+      fetched = handle.join()
+      fetchedRoots = rootsHandle.join()
+    }
+    // The next prefetch for this profile reads this file.
+    if !guessed { run remember(&choice, Bytes.asSlice(&imageFile)) }
   }
   if let Option<Fetched>.Some {value: read} = move fetched {
     if same(Bytes.asSlice(&read.path), Path.rawBytes(&path)) && same(Bytes.asSlice(&read.stamp), Bytes.asSlice(&stamp)) {
@@ -456,6 +527,18 @@ pub effect fn openPrefetched(store: &mut Semantic, request: &Request, cache: &Pa
   }
   return Option<CacheFile>.some(CacheFile {path: move path, packs: move packs, lock: move lock, stamp: move stamp, adopted: move adopted,
     read: move kept})
+}
+
+// Records in `choice` that its profile opens the image named `name`; best effort, like the cache.
+effect fn remember(choice: &Path, name: &[u8]) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  match move run Effect.result(write(choice, name)) {
+    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Success {..} => {}
+    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => { drop failure }
+      AtomicWriteError failure => { drop failure }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
 }
 
 // The image whose graph file is at `path` and whose roots file is beside it, under `stamp`; none
