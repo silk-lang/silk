@@ -21,6 +21,11 @@ first, then `-0.0` before `+0.0`, and positive NaNs last.
 NaN payloads. The source-defined rounding, extrema, sign, and square-root helpers canonicalize
 NaN results so native and WebAssembly execution agree on their bits.
 
+The trigonometric, inverse trigonometric, exponential, logarithmic, power, cube root, [`hypot`](#hypot),
+and [`fma`](#fma) functions never call a host math library. Each states its error bound in units in
+the last place, returns the same bits on every target, WebAssembly included, and gives the
+canonical quiet NaN for every NaN result.
+
 ## Gotchas
 Converting to an integer discards the fractional part and traps for NaN, infinity, or a value
 outside the destination range. The `checkedTo*` counterparts return `None` on exactly those
@@ -45,7 +50,7 @@ pub fn main() -> i32 {
 
 Import as `f32` with `import silk.num.f32`.
 
-Public declarations: 60.
+Public declarations: 71.
 
 <a id="MAX"></a>
 
@@ -491,6 +496,220 @@ Approximates cosine within four units in the last place using deterministic resu
 ### Details
 
 NaN and either infinity return the canonical quiet NaN. Either signed zero returns positive one.
+
+<a id="tan"></a>
+
+## `tan`
+
+```silk
+pub fn tan(value: f32) -> f32
+```
+
+Approximates tangent within one unit in the last place using deterministic result bits.
+
+### Details
+
+The tangent is computed in binary64 and rounded once to binary32, so the result stays accurate
+for every finite input, including the largest. NaN and either infinity return the canonical
+quiet NaN. Either signed zero returns unchanged.
+
+<a id="atan"></a>
+
+## `atan`
+
+```silk
+pub fn atan(value: f32) -> f32
+```
+
+Approximates arctangent within one unit in the last place using deterministic result bits.
+
+### Details
+
+The result is in `[-pi/2, pi/2]`. NaN returns the canonical quiet NaN, either signed zero
+returns unchanged, and an infinity returns pi/2 with its sign.
+
+<a id="atan2"></a>
+
+## `atan2`
+
+```silk
+pub fn atan2(y: f32, x: f32) -> f32
+```
+
+Approximates the angle of the point `(x, y)` from the positive x axis within one unit in the
+last place using deterministic result bits.
+
+### When to use
+
+Use this function instead of `atan(y / x)` to get the angle of a vector in every quadrant,
+including when `x` is zero.
+
+### Details
+
+The result is in `[-pi, pi]` and takes the sign of `y`, including a signed zero `y`. A zero
+`y` returns itself when `x` is positive or `+0.0`, and pi with the sign of `y` when `x` is
+negative or `-0.0`. A zero `x` with nonzero `y` gives pi/2 with the sign of `y`. Two
+infinities give an odd multiple of pi/4. A NaN in either operand returns the canonical quiet
+NaN.
+
+<a id="asin"></a>
+
+## `asin`
+
+```silk
+pub fn asin(value: f32) -> f32
+```
+
+Approximates arcsine within one unit in the last place using deterministic result bits.
+
+### Details
+
+The result is in `[-pi/2, pi/2]`. Either signed zero returns unchanged. NaN and any argument
+outside `[-1, 1]` return the canonical quiet NaN.
+
+<a id="acos"></a>
+
+## `acos`
+
+```silk
+pub fn acos(value: f32) -> f32
+```
+
+Approximates arccosine within one unit in the last place using deterministic result bits.
+
+### Details
+
+The result is in `[0, pi]`. One returns positive zero. NaN and any argument outside `[-1, 1]`
+return the canonical quiet NaN.
+
+<a id="exp"></a>
+
+## `exp`
+
+```silk
+pub fn exp(value: f32) -> f32
+```
+
+Approximates `e` raised to `value` within one unit in the last place using deterministic result
+bits.
+
+### Details
+
+A result too large for `f32` is positive infinity, and one too small is positive zero.
+Negative infinity returns positive zero, positive infinity returns itself, and NaN returns the
+canonical quiet NaN. Either signed zero returns one.
+
+<a id="log"></a>
+
+## `log`
+
+```silk
+pub fn log(value: f32) -> f32
+```
+
+Approximates the natural logarithm within one unit in the last place using deterministic result
+bits.
+
+### Details
+
+Either signed zero returns negative infinity, and one returns positive zero. Positive infinity
+returns itself. NaN and any negative argument return the canonical quiet NaN.
+
+<a id="pow"></a>
+
+## `pow`
+
+```silk
+pub fn pow(base: f32, exponent: f32) -> f32
+```
+
+Approximates `base` raised to `exponent` within one unit in the last place using deterministic
+result bits.
+
+### Details
+
+A negative `base` has a real power only for an integer `exponent`, and an odd integer gives a
+negative result. A result too large for `f32` is an infinity, and one too small is a zero, each
+with that sign.
+
+### Gotchas
+
+The special cases follow IEEE-754 `pow`:
+
+- A zero `exponent` returns one for every `base`, NaN included, and a `base` of one returns one
+  for every `exponent`, NaN included.
+- A `base` of negative one with an infinite `exponent` returns one.
+- A zero `base` with a negative `exponent` returns an infinity, negative only for `-0.0` with an
+  odd integer `exponent`. With a positive `exponent` it returns a zero signed the same way.
+- With an infinite `exponent`, a `base` whose magnitude is below one gives positive zero for
+  positive infinity and positive infinity for negative infinity. A magnitude above one gives the
+  reverse.
+- A negative finite `base` with a finite non-integer `exponent`, and any other NaN operand,
+  returns the canonical quiet NaN.
+
+<a id="cbrt"></a>
+
+## `cbrt`
+
+```silk
+pub fn cbrt(value: f32) -> f32
+```
+
+Approximates the real cube root within one unit in the last place using deterministic result
+bits.
+
+### Details
+
+The result has the sign of `value`, so a negative argument has a negative root. Either signed
+zero and either infinity return unchanged. NaN returns the canonical quiet NaN.
+
+<a id="hypot"></a>
+
+## `hypot`
+
+```silk
+pub fn hypot(x: f32, y: f32) -> f32
+```
+
+Approximates `sqrt(x * x + y * y)` within one unit in the last place using deterministic
+result bits, without intermediate overflow or underflow.
+
+### When to use
+
+Use this function for the length of a vector or the distance between two points. It stays
+accurate where squaring an operand would overflow to infinity or underflow to zero.
+
+### Details
+
+The result is never negative, and the signs of the operands do not matter. An infinite
+operand returns positive infinity even when the other is NaN. Otherwise a NaN operand returns
+the canonical quiet NaN.
+
+<a id="fma"></a>
+
+## `fma`
+
+```silk
+pub fn fma(left: f32, right: f32, addend: f32) -> f32
+```
+
+Computes `left * right + addend` with a single rounding, as the IEEE-754 fused multiply-add.
+
+### When to use
+
+Use this function for exact dot products, polynomial evaluation, and error terms, where
+rounding the product separately loses the low half that the addend should cancel.
+
+### Details
+
+The result is correctly rounded on every target, so it has one admissible value. Targets with a
+fused multiply-add instruction, AArch64 and x86-64 with the `fma` CPU feature, compute it with
+that instruction. Other targets, WebAssembly included, compute it with binary64 arithmetic.
+
+### Gotchas
+
+A NaN operand, or an infinite product with a zero operand or an infinite addend of the other
+sign, returns the canonical quiet NaN.
 
 <a id="toF32"></a>
 

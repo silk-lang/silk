@@ -667,7 +667,9 @@ The compiler-owned storage types are members of the sealed namespace and are spe
   (ALLOC-002).
 - `Intrinsic.RawBuffer<T>`: typed raw storage owned independently of its allocator provider.
   `Intrinsic.rawBufferEmpty<T>()` builds one with no slots that owns no storage; its drop releases
-  nothing.
+  nothing. A buffer is four words: its base address, its element count, and the reclaim function
+  and context of the allocation it adopted. It keeps neither the byte count, which is the count
+  times the element size, nor the alignment, which release never reads.
 - `Intrinsic.Slot<'storage, T>`: a lexical exclusive projection into one buffer element.
 
 `Slot`, `RawBuffer` and `Allocation` are ordinary names. Source may declare, import and use types,
