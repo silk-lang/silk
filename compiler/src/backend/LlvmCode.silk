@@ -1378,6 +1378,59 @@ effect fn parameterLanes(layouts: &TypeLayouts, ty: &Shared<Type>, facts: Metric
   return move split
 }
 
+// The lanes an ordinary Silk definition's by-address result travels back in instead of the
+// caller's `%out` (#2489): a record that splits into at most two lanes (`parameterLanes`) is
+// returned as those lanes, one value or a two-field literal structure, so a small record such as
+// `{bool, usize}` comes back in registers. A fallible definition still writes its success through
+// `%out`, and a C export follows the C ABI (`count` zero for both).
+effect fn resultLanes(layouts: &TypeLayouts, ty: &Shared<Type>, facts: Metrics, kind: Representation, target: &Target,
+  function: &MirFunction, span: Location, fallible: bool) -> ParameterLanes ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut split = run parameterLanes(layouts, ty, facts, target, function, span)
+  if fallible || !kind.aggregate || split.count > 2 { split.count = usize.ZERO }
+  return move split
+}
+
+// The LLVM type of a result returned in `split`'s lanes (`resultLanes`).
+effect fn resultLanesType(writer: &mut Writer, split: &ParameterLanes) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  if split.count == usize.ONE { return run typeOf(&mut writer.*, split.lanes[0]) }
+  let mut fields = List<u64>.make()
+  let mut at = usize.ZERO
+  while at < split.count {
+    run List<u64>.append(&mut fields, run typeOf(&mut writer.*, split.lanes[at]))
+    at = at + usize.ONE
+  }
+  return run Module.structure(&mut writer.*.module, List<u64>.asSlice(&fields))
+}
+
+// Loads `split`'s lanes from the record at `source` into the value a definition returns.
+effect fn loadResultLanes(writer: &mut Writer, split: &ParameterLanes, source: u64, alignment: usize) -> u64
+! OutOfMemoryError ? &mut Allocator {
+  let ty = run resultLanesType(&mut writer.*, split)
+  let mut combined = Bitcode.none()
+  if split.count != usize.ONE { combined = run Module.poison(&mut writer.*.module, ty) }
+  let mut at = usize.ZERO
+  while at < split.count {
+    let mut address = source
+    if split.offsets[at] != usize.ZERO { address = run byteOffset(&mut writer.*, source, split.offsets[at]) }
+    let lane = run loadOf(&mut writer.*, split.lanes[at], address, offsetAlignment(alignment, split.offsets[at]))
+    if split.count == usize.ONE { return lane }
+    combined = run Module.insertValue(&mut writer.*.module, combined, lane, at)
+    at = at + usize.ONE
+  }
+  return combined
+}
+
+// Stores a result returned in `split`'s lanes (`resultLanes`) into the record at `destination`.
+effect fn storeResultLanes(writer: &mut Writer, split: &ParameterLanes, returned: u64, destination: u64, alignment: usize) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let mut inputs: [u64; 2] = [returned, returned]
+  if split.count != usize.ONE {
+    inputs[0] = run Module.extractValue(&mut writer.*.module, returned, usize.ZERO)
+    inputs[1] = run Module.extractValue(&mut writer.*.module, returned, usize.ONE)
+  }
+  return run storeLanes(&mut writer.*, split, destination, alignment, &inputs)
+}
+
 // Stores a split parameter's lanes, `inputs` (`parameterLanes`), into its slot.
 effect fn storeLanes(writer: &mut Writer, split: &ParameterLanes, slot: u64, alignment: usize, inputs: &[u64]) -> ()
 ! OutOfMemoryError ? &mut Allocator {
@@ -3432,6 +3485,13 @@ effect fn emitReturn(
     if fallible { return run returnStatus(&mut writer.*, false) }
     return run Module.retVoid(&mut writer.*.module)
   }
+  // A small record comes back in its lanes (`resultLanes`).
+  let split = run resultLanes(layouts, &function.result, resultLayout, kind, target, function, span, fallible)
+  if split.count != usize.ZERO {
+    let slot = slotOf(&writer.*, usize.ZERO)
+    let lanes = run loadResultLanes(&mut writer.*, &split, slot, resultLayout.alignment)
+    return run Module.ret(&mut writer.*.module, lanes)
+  }
   let value = run emitOperand(&mut writer.*, function, target, layouts, &returned)
   // A fallible function returns its status and writes success to the caller's out-slot (D3).
   if fallible {
@@ -4180,16 +4240,20 @@ effect fn emitCallInner(
   let pointer = run pointerType(&mut writer.*)
   let mut resultType = run voidType(&mut writer.*)
   let mut extended = false
+  let resultFacts = run layoutOf(layouts, &output.ty, function, Location.generated())
+  let split = run resultLanes(layouts, &output.ty, resultFacts, kind, target, function, Location.generated(), fallible)
   if fallible {
     resultType = run integerType(&mut writer.*, usize.ONE)
     extended = writer.fastPath
+  } else if split.count != usize.ZERO {
+    resultType = run resultLanesType(&mut writer.*, &split)
   } else if !outward {
     resultType = run typeOf(&mut writer.*, kind)
     extended = extendedFlag(&writer.*, kind)
   }
+  let leadingOutput = outward && !fallible && split.count == usize.ZERO
   let mut parameters = List<u64>.make()
   let mut passed = List<u64>.make()
-  let leadingOutput = outward && !fallible
   if leadingOutput {
     run List<u64>.append(&mut parameters, pointer)
     run List<u64>.append(&mut passed, output.value)
@@ -4236,7 +4300,9 @@ effect fn emitCallInner(
     let onSuccess = blockAt(&writer.*, normal)
     return run branchIf(&mut writer.*, returned, onFailure, onSuccess)
   }
-  if !kind.unit && !outward {
+  if split.count != usize.ZERO {
+    run storeResultLanes(&mut writer.*, &split, returned, output.value, output.alignment)
+  } else if !kind.unit && !outward {
     run storeValue(&mut writer.*, &output, &Value {scalar: kind, value: returned})
   }
   let next = blockAt(&writer.*, normal)
@@ -5037,6 +5103,13 @@ pub effect fn emit(
   } else if !outward {
     resultType = run typeOf(&mut writer, result)
     if extendedFlag(&writer, result) { run addAttributes(&mut lanes, Bitcode.positionResult(), &[0, Bitcode.attrZeroExt()]) }
+  } else {
+    let split = run resultLanes(layouts, &function.result, resultFacts, result, target, function,
+      locals[usize.ZERO].origin.location, fallible)
+    if split.count != usize.ZERO {
+      resultType = run resultLanesType(&mut writer, &split)
+      outward = false
+    }
   }
   let symbol = run InstanceIdentity.name(identities, &function.key)
   writer.symbol = move symbol
@@ -5464,7 +5537,14 @@ effect fn emitDriver(writer: &mut Writer, function: &MirFunction, target: &Targe
   let clear = run integerOf(&mut writer.*, 8, 0)
   run storeOf(&mut writer.*, clear, failed, usize.ZERO)
   let mut out = Bitcode.none()
-  if fallible || result.aggregate || passedIndirectly(result) { out = writer.out }
+  let split = run resultLanes(layouts, &function.result, resultFacts, result, target, function,
+    locals[usize.ZERO].origin.location, fallible)
+  if split.count != usize.ZERO {
+    // The frame writes the record here; the driver returns its lanes (`resultLanes`).
+    let ty = run typeOf(&mut writer.*, result)
+    out = run Module.alloca(&mut writer.*.module, ty, usize.toU64(resultFacts.alignment))
+    Module.setName(&mut writer.*.module, out, hiddenName(b"result"))
+  } else if fallible || result.aggregate || passedIndirectly(result) { out = writer.out }
   else if !result.unit {
     let ty = run typeOf(&mut writer.*, result)
     out = run Module.alloca(&mut writer.*.module, ty, usize.toU64(resultFacts.alignment))
@@ -5492,6 +5572,10 @@ effect fn emitDriver(writer: &mut Writer, function: &MirFunction, target: &Targe
     let zero = run integerOf(&mut writer.*, 8, 0)
     let status = run compareOf(&mut writer.*, Bitcode.intNe(), flag, zero)
     return run Module.ret(&mut writer.*.module, status)
+  }
+  if split.count != usize.ZERO {
+    let lanes = run loadResultLanes(&mut writer.*, &split, out, resultFacts.alignment)
+    return run Module.ret(&mut writer.*.module, lanes)
   }
   if result.aggregate || result.unit || passedIndirectly(result) { return run Module.retVoid(&mut writer.*.module) }
   let value = run loadOf(&mut writer.*, result, out, resultFacts.alignment)
