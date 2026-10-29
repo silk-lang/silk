@@ -1917,6 +1917,17 @@ const program = Effect.gen(function* () {
     yield* fs.writeFileString(join(ordered, 'order.txt'), `${beforeLast}\n${last}\n`)
     placedFirst(yield* orderedBuild(), beforeLast, last)
   }
+  // Each profile keeps its own cache file, and a file per profile names it, so the next build in
+  // either profile prefetches its own file rather than none.
+  const orderedCache = join(ordered, 'build/cache/ordered')
+  const orderedEntries = yield* fs.readDirectory(orderedCache)
+  const profileImages = orderedEntries.filter((name) => /^semantic-[0-9a-f]{32}$/.test(name)).sort()
+  assert.equal(profileImages.length, 2, `expected a cache file per profile, found ${profileImages.join(', ')}`)
+  const choices = orderedEntries.filter((name) => /^profile-[0-9a-f]{32}$/.test(name))
+  assert.equal(choices.length, 2, `expected a profile record per profile, found ${choices.join(', ')}`)
+  const chosen: Array<string> = []
+  for (const choice of choices) chosen.push(yield* fs.readFileString(join(orderedCache, choice)))
+  assert.deepEqual(chosen.sort(), profileImages, 'each profile record names its own cache file')
   for (const selection of [['--root', 'main.silk'], ['--file', 'src/util/check.txt']]) {
     const refusedTests = yield* invoke(
       silk,
