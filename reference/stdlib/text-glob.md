@@ -29,8 +29,8 @@ An unclosed class, brace or group, and a bare parenthesis, are literal text. The
 test expectations follow the `picomatch` package; [`isGlob`](#isGlob) and [`globParent`](#globParent) follow
 `is-glob` and `glob-parent`.
 
-Patterns and paths are text, and each operation also has a `Bytes` form for host paths that
-are not UTF-8. Matching never normalizes a path.
+Patterns and paths are text. [`Pattern`](#Pattern) and the inspection functions also have `Bytes` forms
+for host patterns and paths that are not UTF-8. Matching never normalizes a path.
 
 ## Examples
 ### Test paths against one compiled pattern
@@ -63,7 +63,7 @@ pub fn main() -> i32 {
 
 Import as `glob` with `import silk.text.glob as glob`.
 
-Public declarations: 9.
+Public declarations: 13.
 
 <a id="Dots"></a>
 
@@ -370,6 +370,61 @@ Use it for a single test. To test many paths, compile once with [`Pattern.make`]
 ### Errors
 
 - `OutOfMemoryError` if the `Allocator` cannot supply the compiled program or scratch rows.
+
+<a id="isGlobBytes"></a>
+
+## `isGlobBytes`
+
+```silk
+pub fn isGlobBytes(text: &[u8]) -> bool
+```
+
+Whether the host bytes `text` are a glob pattern by the rules of the `is-glob` package,
+version 4.0.3. An unclosed `[` or `{` does not count, and neither does an escaped character.
+
+<a id="hasExtglobPrefixBytes"></a>
+
+## `hasExtglobPrefixBytes`
+
+```silk
+pub fn hasExtglobPrefixBytes(text: &[u8]) -> bool
+```
+
+Whether the host bytes `text` contain an unescaped `@(`, `+(` or `!(`, whether or not it is
+closed.
+
+<a id="detectGlobSyntaxBytes"></a>
+
+## `detectGlobSyntaxBytes`
+
+```silk
+pub fn detectGlobSyntaxBytes(text: &[u8]) -> bool
+```
+
+Whether the host bytes `text` contain any unescaped glob syntax: `*`, `?`, `[`, `{`, a leading
+`!` or an extglob prefix, even when a group is never closed.
+
+<a id="globParentBytes"></a>
+
+## `globParentBytes`
+
+```silk
+pub effect fn globParentBytes(pattern: &[u8]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator
+```
+
+Returns the longest leading directory of the host bytes `pattern` that contains no glob
+syntax, with escapes removed, by the rules of the `glob-parent` package, version 6.0.2.
+
+### Details
+
+A pattern with no literal directory gives `.`. It looks only at the bytes, never at a file
+system, and keeps bytes that are not glob syntax as they are, also when they are not UTF-8.
+
+### Errors
+
+- `OutOfMemoryError` if the `Allocator` cannot supply the result.
 
 <a id="isGlob"></a>
 

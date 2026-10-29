@@ -13,9 +13,14 @@ take matches one at a time. To test paths you already have, use `silk.text.glob`
 A scan reads only the directories its pattern can reach. A literal segment is looked up
 directly, a wildcard segment lists one directory, and `**` descends into every directory
 below. Results are relative to [`ScanOptions.base`](#ScanOptions.base), joined with `/`, with `.` and `..`
-segments of the pattern resolved, and each one is reported once. A pattern that starts with
-`/` is scanned from the provider's root and reports absolute paths. The order of results is
-unspecified.
+segments of the pattern resolved, and each one is reported once; the base itself is `.`. A
+pattern that starts with `/` is scanned from the provider's root and reports absolute paths.
+The order of results is unspecified.
+
+Each segment is matched on its own, so a `!` at the start of a segment negates that segment
+only: `!test/*.silk` matches files in every directory except `test`. There is no
+whole-pattern negation; to leave matches out, test the results with a `silk.text.glob`
+pattern.
 
 Names are host bytes and are reported as they are, also when they are not UTF-8.
 
@@ -28,8 +33,10 @@ Every read goes through the `FileSystem` effect, so a scan sees exactly what the
 shows, and a provider in memory or one that records reads works the same way.
 
 ## Errors
-- `FileError` if the starting directory is missing or is not a directory, or if a directory
-  cannot be read for a reason other than its having gone away.
+- `FileError` if the starting directory is missing or is not a directory, or if the provider
+  refuses a lookup or a listing, for example with `PermissionDenied`. An entry that is
+  missing, is not a directory, or has a name no path can hold is not an error: it matches
+  nothing.
 - `OutOfMemoryError` from every operation that returns owned paths.
 
 ## Examples
@@ -78,7 +85,7 @@ pub fn main() -> i32 {
 
 Import as `glob_scan` with `import silk.system.glob_scan as glob_scan`.
 
-Public declarations: 3.
+Public declarations: 4.
 
 <a id="ScanOptions"></a>
 
@@ -179,15 +186,61 @@ when `written` starts with `/`.
 
 #### Details
 
+Results are relative to `options.base`, joined with `/`, with `.` and `..` segments of the
+pattern resolved, and each path is reported once; the base itself is `.`. A pattern that
+starts with `/` reports absolute paths. The order is unspecified.
+
 The pattern is split at `/` into segments, and each directory is read only when a segment
 can match below it: `src/*.silk` lists `src` and nothing else. Braces and groups work within
-one segment; an alternative that contains `/`, such as `{a/b,c}`, is not scanned. A pattern
-that ends with `/` reports directories only, and so reports nothing while `onlyFiles` is
-set. An empty pattern reports nothing.
+one segment. A `/` inside braces still splits the pattern, so `{a/b,c}` becomes the segments
+`{a` and `b,c}`, which match those names literally. A `!` at the start of a segment negates
+that segment only. A pattern that ends with `/` reports directories only, and so reports
+nothing while `onlyFiles` is set. An empty pattern reports nothing.
+
+A literal segment follows a symbolic link, so a link it names counts as what it points to.
+A link that a wildcard matched is never entered and is reported only when `onlyFiles` is
+false.
 
 #### Errors
 
-- `FileError` if the starting directory does not exist or is not a directory.
+- `FileError` if the starting directory does not exist or is not a directory, or if the
+  provider refuses to look it up.
+- `OutOfMemoryError` if the `Allocator` cannot supply the walker.
+
+<a id="Walker.impl.makeBytes"></a>
+
+### Associated function `makeBytes`
+
+```silk
+pub effect fn makeBytes(pattern: &[u8], options: ScanOptions) -> Walker
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator
+```
+
+Starts a scan for the host-byte pattern `pattern`, which need not be UTF-8, below
+`options.base`, or below the provider's root when `pattern` starts with `/`.
+
+#### Details
+
+Results are relative to `options.base`, joined with `/`, with `.` and `..` segments of the
+pattern resolved, and each path is reported once; the base itself is `.`. A pattern that
+starts with `/` reports absolute paths. The order is unspecified.
+
+The pattern is split at `/` into segments, and each directory is read only when a segment
+can match below it: `src/*.silk` lists `src` and nothing else. Braces and groups work within
+one segment. A `/` inside braces still splits the pattern, so `{a/b,c}` becomes the segments
+`{a` and `b,c}`, which match those names literally. A `!` at the start of a segment negates
+that segment only. A pattern that ends with `/` reports directories only, and so reports
+nothing while `onlyFiles` is set. An empty pattern reports nothing.
+
+A literal segment follows a symbolic link, so a link it names counts as what it points to.
+A link that a wildcard matched is never entered and is reported only when `onlyFiles` is
+false.
+
+#### Errors
+
+- `FileError` if the starting directory does not exist or is not a directory, or if the
+  provider refuses to look it up.
 - `OutOfMemoryError` if the `Allocator` cannot supply the walker.
 
 <a id="Walker.impl.next"></a>
@@ -200,12 +253,19 @@ pub effect fn next(self: &mut Self) -> Option<Bytes>
     ? &mut FileSystem | &mut Allocator
 ```
 
-Returns the next match, or none once the scan is done. The order is unspecified.
+Returns the next match, or none once the scan is done.
+
+#### Details
+
+A match is a path relative to the base, joined with `/`, or an absolute path for an absolute
+pattern; the base itself is `.`. Each path is returned once, in unspecified order. Once it
+returns none, it keeps returning none.
 
 #### Errors
 
-- `FileError` if a directory the scan reaches cannot be read for a reason other than its
-  having gone away.
+- `FileError` if the provider refuses to look up or list an entry the scan reaches, for
+  example with `PermissionDenied`. An entry that is missing or is not a directory matches
+  nothing instead.
 - `OutOfMemoryError` if the `Allocator` cannot supply a listing or a result.
 
 <a id="Walker.impl.collect"></a>
@@ -218,7 +278,8 @@ pub effect fn collect(self: &mut Self) -> List<Bytes>
     ? &mut FileSystem | &mut Allocator
 ```
 
-Returns every match the scan has not returned yet.
+Returns every match the scan has not returned yet, in unspecified order, as
+[`Walker.next`](#Walker.impl.next) would return them one at a time.
 
 #### Errors
 
@@ -238,11 +299,46 @@ Returns every path that `pattern` matches below `options.base`, in unspecified o
 
 ### Details
 
-It is [`Walker.make`](#Walker.impl.make) followed by [`Walker.collect`](#Walker.impl.collect); the walker's rules apply.
+Results are relative to `options.base`, joined with `/`, with `.` and `..` segments of the
+pattern resolved, and each path is reported once; the base itself is `.`. A pattern that
+starts with `/` is scanned from the provider's root and reports absolute paths. Each segment is
+matched on its own: a `/` inside braces still splits the pattern, and a `!` at the start of a
+segment negates that segment only. A literal segment follows a symbolic link; a link that a
+wildcard matched is never entered and is reported only when `onlyFiles` is false.
 
 ### Errors
 
-- The errors of [`Walker.make`](#Walker.impl.make) and [`Walker.next`](#Walker.impl.next).
+- `FileError` if the starting directory does not exist or is not a directory, or if the
+  provider refuses to look up or list an entry the scan reaches.
+- `OutOfMemoryError` if the `Allocator` cannot supply a listing or a result.
+
+<a id="scanBytes"></a>
+
+## `scanBytes`
+
+```silk
+pub effect fn scanBytes(pattern: &[u8], options: ScanOptions) -> List<Bytes>
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator
+```
+
+Returns every path that the host-byte pattern `pattern`, which need not be UTF-8, matches below
+`options.base`, in unspecified order.
+
+### Details
+
+Results are relative to `options.base`, joined with `/`, with `.` and `..` segments of the
+pattern resolved, and each path is reported once; the base itself is `.`. A pattern that
+starts with `/` is scanned from the provider's root and reports absolute paths. Each segment is
+matched on its own: a `/` inside braces still splits the pattern, and a `!` at the start of a
+segment negates that segment only. A literal segment follows a symbolic link; a link that a
+wildcard matched is never entered and is reported only when `onlyFiles` is false.
+
+### Errors
+
+- `FileError` if the starting directory does not exist or is not a directory, or if the
+  provider refuses to look up or list an entry the scan reaches.
+- `OutOfMemoryError` if the `Allocator` cannot supply a listing or a result.
 
 
 Category: System.
