@@ -145,7 +145,6 @@ The `usize` value one for a step or count that has no other type context.
 
 ```silk
 pub fn toU8(value: usize) -> u8
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` to `u8`. Traps if `value` is outside the `u8` range. Use
@@ -168,7 +167,6 @@ range. Use this function when an out-of-range value is input data.
 
 ```silk
 pub fn toU16(value: usize) -> u16
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` to `u16`. Traps if `value` is outside the `u16` range. Use
@@ -191,7 +189,6 @@ range. Use this function when an out-of-range value is input data.
 
 ```silk
 pub fn toU32(value: usize) -> u32
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` to `u32`. Traps if `value` is outside the `u32` range. Use
@@ -214,7 +211,6 @@ range. Use this function when an out-of-range value is input data.
 
 ```silk
 pub fn toU64(value: usize) -> u64
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` exactly to `u64`. Every `usize` value is representable.
@@ -258,7 +254,6 @@ checked-conversion code can select the same source and destination type.
 
 ```silk
 pub fn toI8(value: usize) -> i8
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` to `i8`. Traps if `value` is outside the `i8` range. Use
@@ -281,7 +276,6 @@ range. Use this function when an out-of-range value is input data.
 
 ```silk
 pub fn toI16(value: usize) -> i16
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` to `i16`. Traps if `value` is outside the `i16` range. Use
@@ -304,7 +298,6 @@ range. Use this function when an out-of-range value is input data.
 
 ```silk
 pub fn toI32(value: usize) -> i32
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` to `i32`. Traps if `value` is outside the `i32` range. Use
@@ -327,7 +320,6 @@ range. Use this function when an out-of-range value is input data.
 
 ```silk
 pub fn toI64(value: usize) -> i64
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` to `i64`. Traps if `value` is outside the `i64` range. Use
@@ -350,7 +342,6 @@ range. Use this function when an out-of-range value is input data.
 
 ```silk
 pub fn toIsize(value: usize) -> isize
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` to `isize`. Traps if `value` is outside the `isize` range. Use

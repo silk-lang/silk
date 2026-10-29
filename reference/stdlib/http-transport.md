@@ -279,7 +279,7 @@ Sends all bytes that writes accepted to the provider.
 ### Operation `close`
 
 ```silk
-effect fn close() -> () ! TransportError ? &mut HttpTransport with Intrinsic.nonParking()
+effect fn close() -> () ! TransportError ? &mut HttpTransport
 ```
 
 Closes the transport without waiting. A second call does nothing. It does not flush. After it,

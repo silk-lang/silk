@@ -143,7 +143,6 @@ becomes [`MAX`](#MAX). Use this function when the positive boundary is required.
 
 ```silk
 pub fn toU8(value: i16) -> u8
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` to `u8`. Traps if `value` is outside the `u8` range. Use
@@ -166,7 +165,6 @@ range. Use this function when an out-of-range value is input data.
 
 ```silk
 pub fn toU16(value: i16) -> u16
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` to `u16`. Traps if `value` is outside the `u16` range. Use
@@ -189,7 +187,6 @@ range. Use this function when an out-of-range value is input data.
 
 ```silk
 pub fn toU32(value: i16) -> u32
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` to `u32`. Traps if `value` is outside the `u32` range. Use
@@ -212,7 +209,6 @@ range. Use this function when an out-of-range value is input data.
 
 ```silk
 pub fn toU64(value: i16) -> u64
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` to `u64`. Traps if `value` is outside the `u64` range. Use
@@ -235,7 +231,6 @@ range. Use this function when an out-of-range value is input data.
 
 ```silk
 pub fn toUsize(value: i16) -> usize
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` to `usize`. Traps if `value` is outside the `usize` range. Use
@@ -258,7 +253,6 @@ range. Use this function when an out-of-range value is input data.
 
 ```silk
 pub fn toI8(value: i16) -> i8
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` to `i8`. Traps if `value` is outside the `i8` range. Use
@@ -303,7 +297,6 @@ checked-conversion code can select the same source and destination type.
 
 ```silk
 pub fn toI32(value: i16) -> i32
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` exactly to `i32`. Every `i16` value is representable.
@@ -325,7 +318,6 @@ representable.
 
 ```silk
 pub fn toI64(value: i16) -> i64
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` exactly to `i64`. Every `i16` value is representable.
@@ -347,7 +339,6 @@ representable.
 
 ```silk
 pub fn toIsize(value: i16) -> isize
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` exactly to `isize`. Every `i16` value is representable.

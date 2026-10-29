@@ -1519,6 +1519,7 @@ const program = Effect.gen(function* () {
   const interopCases: Array<[string, string, RegExp]> = [
     ["safeexport", "export \"C\" fn twice(v: i32) -> i32 {\n  return v * 2\n}\n\npub fn main() -> i32 {\n  return twice(0)\n}\n", /error\[SEM0082\] `twice\(\.\.\.\)` is unsafe; write `unsafe twice\(\.\.\.\)`, or put it in an `unsafe \{ \}` block\n/],
     ["staticread", "export \"C\" static calls: i32 = 4\n\npub fn main() -> i32 {\n  return calls\n}\n", /error\[SEM0082\] Reading `calls` is unsafe; put it in an `unsafe \{ \}` block\n/],
+    ["nocallbacks", "unsafe extern \"C\" fn qsort(base: [*]mut u8, count: usize, size: usize, compare: extern \"C\" fn([*]const u8, [*]const u8) -> i32) -> ()\n\nexport \"C\" fn cmp(a: [*]const u8, b: [*]const u8) -> i32 { return 0 }\n\npub fn main() -> i32 {\n  return 0\n}\n", /error\[SEM0187\] A C function-pointer parameter must be named in the declaration's directives; add `@callbacks\("compare"\)` before the declaration\n/],
     ["plaincallback", "import silk.mem.pointer { Pointer }\n@callbacks(\"compare\")\nunsafe extern \"C\" fn qsort(base: ?[*]mut u8, count: usize, size: usize, compare: extern \"C\" fn([*]const u8, [*]const u8) -> i32) -> ()\n\nfn cmp(a: [*]const u8, b: [*]const u8) -> i32 { return 0 }\n\npub fn main() -> i32 {\n  let mut items: [u8; 4] = [3, 1, 2, 0]\n  unsafe qsort(Pointer.fromMutSlice(&mut items), 4, 1, cmp)\n  return 0\n}\n", /error\[SEM0012\] This parameter takes a C function pointer, and a Silk fn has no C address; pass an `export "C" fn` here\n/],
     ["boolstatic", "export \"C\" static calls: bool = false\n\npub fn main() -> i32 {\n  return 0\n}\n", /error\[SEM0187\] A C static holds one C integer, float, or pointer, so it cannot have type bool\n/],
     ["assignstatic", "export \"C\" static calls: i32 = 0\n\npub fn main() -> i32 {\n  unsafe { calls = 1 }\n  return 0\n}\n", /error\[SEM0036\] `calls` is a C static, which Silk code can read but not assign\n/],
@@ -1865,6 +1866,56 @@ const program = Effect.gen(function* () {
     assert.equal(refusedInput.status, 1, refusedInput.stderr)
     assert.match(refusedInput.stderr, /silk: invalid native link input: .*silk\.toml: /)
     assert.match(refusedInput.stderr, rule)
+  }
+  // `[native].function-order` places the functions it lists first in the executable's code, in its
+  // order, and a change to the file alone links again. A path outside the package is refused.
+  const ordered = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-ordered-' })
+  const orderedManifest = (order: string) =>
+    `[package]\nname = "ordered"\nversion = "0.1.0"\nsource = "."\n${order}`
+  yield* fs.writeFileString(
+    join(ordered, 'main.silk'),
+    'fn twice(value: i32) -> i32 {\n  return value * 2\n}\n\npub fn main() -> i32 {\n  return twice(0)\n}\n',
+  )
+  yield* fs.writeFileString(join(ordered, 'silk.toml'), orderedManifest('[native]\nfunction-order = "/tmp/order.txt"\n'))
+  const escapedOrder = yield* invoke(silk, ['build', '--stdlib', standardLibrary], ordered, { ...process.env, SILK_CLANG: clang })
+  assert.equal(escapedOrder.status, 1, escapedOrder.stderr)
+  assert.match(escapedOrder.stderr, /silk\.toml: \[native\]\.function-order must be a relative path below the manifest's directory/)
+  const functionAddresses = Effect.fnUntraced(function* (executable: string) {
+    const listed = yield* invoke(join(dirname(clang), 'llvm-nm'), ['--defined-only', executable], ordered)
+    assert.equal(listed.status, 0, listed.stderr)
+    const addresses = new Map<string, bigint>()
+    for (const line of listed.stdout.split('\n')) {
+      const symbol = /^([0-9a-f]+) [tT] _?(silk_\S+)$/.exec(line)
+      if (symbol) addresses.set(symbol[2], BigInt(`0x${symbol[1]}`))
+    }
+    return addresses
+  })
+  for (const profile of [[], ['--release']]) {
+    const executable = join(ordered, `build/llvm/${hostTarget}/${profile.length === 0 ? 'debug' : 'release'}/ordered`)
+    const orderedBuild = Effect.fnUntraced(function* () {
+      const built = yield* invoke(silk, ['build', '--stdlib', standardLibrary, ...profile], ordered, { ...process.env, SILK_CLANG: clang })
+      assert.equal(built.status, 0, built.stderr)
+      return yield* functionAddresses(executable)
+    })
+    yield* fs.writeFileString(join(ordered, 'silk.toml'), orderedManifest(''))
+    const unordered = [...(yield* orderedBuild()).entries()].sort((left, right) => (left[1] < right[1] ? -1 : 1))
+    assert.ok(unordered.length > 2, `${profile}: too few Silk functions to order`)
+    // The two functions linked last, listed in reverse.
+    const last = unordered[unordered.length - 1][0]
+    const beforeLast = unordered[unordered.length - 2][0]
+    const placedFirst = (addresses: Map<string, bigint>, first: string, second: string) => {
+      const firstAddress = addresses.get(first) ?? 0n
+      const secondAddress = addresses.get(second) ?? 0n
+      assert.ok(firstAddress < secondAddress, `${profile}: ${first} is not placed before ${second}`)
+      for (const [name, address] of addresses) {
+        if (name !== first && name !== second) assert.ok(secondAddress < address, `${profile}: ${name} is placed before the listed functions`)
+      }
+    }
+    yield* fs.writeFileString(join(ordered, 'order.txt'), `# startup\n\n  ${last}  \n${beforeLast}\n`)
+    yield* fs.writeFileString(join(ordered, 'silk.toml'), orderedManifest('[native]\nfunction-order = "order.txt"\n'))
+    placedFirst(yield* orderedBuild(), last, beforeLast)
+    yield* fs.writeFileString(join(ordered, 'order.txt'), `${beforeLast}\n${last}\n`)
+    placedFirst(yield* orderedBuild(), beforeLast, last)
   }
   for (const selection of [['--root', 'main.silk'], ['--file', 'src/util/check.txt']]) {
     const refusedTests = yield* invoke(
