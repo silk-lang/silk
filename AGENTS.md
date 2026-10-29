@@ -26,8 +26,8 @@ behavior, data format, build artifact, or internal representation is a compatibi
 ## Repository workflow
 
 - The Node tooling in `compiler/scripts` uses pnpm and Vitest; `pnpm test:scripts` tests it, and
-  Selfhost CI runs it too. `pnpm format` and `pnpm lint` (Oxfmt, Oxlint) are optional local
-  helpers that CI no longer runs.
+  Selfhost CI runs it too. Node runs the `.ts` files directly by stripping types; there is no
+  TypeScript compiler, formatter or linter.
 - `main` is the only integration branch. A pull request merges when its required checks pass on its
   exact head: `Focused Linux Silk`. Selfhost CI runs on every push to a pull request into `main`
   (a newer push cancels the older run); a stack head or a branch without such a PR is dispatched

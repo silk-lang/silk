@@ -28,7 +28,7 @@ An empty `expected.stdout` asserts empty output; a missing one asserts nothing.
 
 The file is canonical JSON: keys sorted, two-space indentation, one trailing newline, as
 `formatOutcome` in `corpus.mjs` writes it. A test rejects any other formatting, so write it with
-`formatOutcome` or by hand in that form. `oxfmt` does not format these files.
+`formatOutcome` or by hand in that form.
 
 | Key                | Required | Value                                                                                                                                                                                          |
 | ------------------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
