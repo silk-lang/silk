@@ -1176,6 +1176,20 @@ link = [
 ]
 ```
 
+`[native].function-order` names a text file below the manifest's directory that lists function
+symbols, one per line, such as `silk_1f3a9c...` as `nm` prints them; blank lines and lines starting
+with `#` are ignored. A Linux or macOS executable link places those functions first, in the listed
+order, so code that runs together, such as a program's startup path, shares pages. On Linux the
+build compiles each function into its own section and links with lld (the one installed beside
+Clang, else `ld.lld` on `PATH`) and `--symbol-ordering-file`; on macOS it passes `-order_file`. A
+listed symbol the program does not define draws a linker warning. A wasm32 link ignores the file.
+Editing the file links the executable again.
+
+```toml
+[native]
+function-order = "startup.order"
+```
+
 **Boundary:** The compiler does not verify that a link input defines the symbol or that its real
 C signature matches the declaration. Supplied `Driver.CompileRequest.foreignInterfaces` JSON snapshots are validated before backend/cache use; detectable signature or behavioral mismatches report both origins. Other unsafe contract violations are undefined behavior under
 [SAFETY-001](#safety-001--only-violating-an-explicit-unsafe-contract-permits-undefined-behavior).
