@@ -238,3 +238,19 @@ The frozen profile therefore names a concrete feature list, and two machines wit
 features share caches. Only the compiler's own target can be native; another target with
 `native` is an unsupported combination of `cpu.model`. `InitialProfile.freeze` itself never
 reads the host.
+
+## PROFILE-007 — Profile-guided optimization
+
+Two environment variables pass Clang's instrumentation-based profile-guided optimization through
+`silk build`, for native targets only (a wasm build ignores them):
+
+- `SILK_PROFILE_GENERATE=<dir>` builds an instrumented program. Each run writes a `.profraw` file
+  into `<dir>` (Clang's `-fprofile-generate=<dir>`; `LLVM_PROFILE_FILE` overrides the file name).
+- `SILK_PROFILE_USE=<file>` builds with the merged profile (`llvm-profdata merge -o <file>
+  <dir>/*.profraw`). Functions the profile does not cover, or covers from older source, are
+  compiled as usual without warnings.
+
+Both variables are part of the build fingerprint, and the profile's content hash is part of every
+object's cache key, so changing either the variable or the profile rebuilds the objects. The
+profile describes one build of the program: regenerate it after changing the source or the
+compiler.
