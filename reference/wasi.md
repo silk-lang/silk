@@ -196,19 +196,21 @@ is implemented by:
 export "C" fn increment(value: u32) -> u32 { return value + 1 }
 ```
 
-An imported component function uses an ordinary foreign declaration with explicit module and
-member names. The local link symbol must distinguish imports from different modules:
+An imported component function uses an ordinary foreign declaration that writes its module and
+member names as `as "module#name"` after the signature:
 
 ```silk
-unsafe extern "C" fn read(handle: u32) -> u32 as "counter_read"
-  with Intrinsic.foreign(module: "example:counter/api@1.0.0", name: "[method]counter.read")
+unsafe extern "C" fn read(handle: u32) -> u32 as "example:counter/api@1.0.0#[method]counter.read"
 ```
 
-`module` and `name` are nonempty string literals without NUL, accepted only on WebAssembly
-function imports. `name` requires `module`; when omitted, it defaults to the link symbol.
-These properties select linkage and make no memory or lifetime promise. Existing foreign
-contract fields apply separately. Conflicting module/member claims for one link symbol are
-rejected. WebAssembly export symbol strings may contain WIT punctuation, for example:
+The text before the first `#` is the module and the text after it is the member. The module must be
+nonempty, neither part may contain NUL, and the pair is accepted only on WebAssembly function
+imports.
+`as "module#"`, with nothing after the `#`, imports the function's own name. The pair selects
+linkage and makes no memory or lifetime promise. Foreign directives such as `@foreign` apply
+separately. The native symbol is derived from the pair, so two imports of one pair share it and no
+other declaration can claim it. WebAssembly export symbol strings may contain WIT punctuation, for
+example:
 
 ```silk
 export "C" fn read(value: u32) -> u32 as "example:counter/api@1.0.0#read" { return value }

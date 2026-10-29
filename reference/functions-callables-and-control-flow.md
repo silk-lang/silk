@@ -111,46 +111,49 @@ reports `SEM0087` under STMT-001.
 **Evidence:** [Effect construction](effects-and-execution.md#eff-001--calling-an-effect-function-constructs-an-effect),
 [eager setup](effects-and-execution.md#eff-005--an-ordinary-function-can-construct-a-deferred-effect).
 
-### FUNC-003 — An inline clause tells the optimizer how to inline a function
+### FUNC-003 — An inline directive tells the optimizer how to inline a function
 
 **Status:** Confirmed
 
 ```silk
-fn isSmall(value: i64) -> bool with Intrinsic.inline() {
+@inline
+fn isSmall(value: i64) -> bool {
   return value >= -1024 && value < 1024
 }
 
-fn tag(value: i64) -> u8 with Intrinsic.inlineAlways() {
+@inlineAlways
+fn tag(value: i64) -> u8 {
   if isSmall(value) { return 1 }
   return slowTag(value)
 }
 
-fn slowTag(value: i64) -> u8 with Intrinsic.inlineNever() {
+@inlineNever
+fn slowTag(value: i64) -> u8 {
   if value < 0 { return 2 }
   return 3
 }
 ```
 
-An ordinary function can carry one inline clause. `with Intrinsic.inline()` asks the optimizer to
-prefer inlining the function into its callers. `with Intrinsic.inlineAlways()` asks it to inline
-the function into every caller it can, whatever its size. `with Intrinsic.inlineNever()` asks it
-never to inline the function, which keeps a rarely taken path out of its callers. `with
-Intrinsic.cold()` also never inlines the function, and tells the optimizer that calls to it are
+An ordinary function can carry one inline directive, written on its own line before the
+declaration. `@inline` asks the optimizer to prefer inlining the function into its callers.
+`@inlineAlways` asks it to inline the function into every caller it can, whatever its size.
+`@inlineNever` asks it never to inline the function, which keeps a rarely taken path out of its
+callers. `@cold` also never inlines the function, and tells the optimizer that calls to it are
 rarely reached, so the branches leading to such a call are laid out and register-allocated as the
-unlikely ones. The clause takes no arguments and does not change what the function computes.
+unlikely ones. The directive takes no arguments and does not change what the function computes.
 
-A function without a clause that takes a parameter written as a callable type (`fn(A) -> B`) or as
-an `Effect<...>` is treated as if it carried `with Intrinsic.inline()`. Such a function, like
-`Effect.map`, mostly calls its argument, and inlining it lets the optimizer run that argument's code
-in place. Its own `with Intrinsic.inlineNever()` or `with Intrinsic.inlineAlways()` still decides.
+A function without a directive that takes a parameter written as a callable type (`fn(A) -> B`) or
+as an `Effect<...>` is treated as if it carried `@inline`. Such a function, like `Effect.map`,
+mostly calls its argument, and inlining it lets the optimizer run that argument's code in place.
+Its own `@inlineNever` or `@inlineAlways` still decides.
 
-**Boundary:** The clause is a request to the optimizer. A debug build compiles each module apart,
+**Boundary:** The directive is a request to the optimizer. A debug build compiles each module apart,
 so a call into another module is not inlined there. A recursive call is never inlined into itself.
 A `static fn`, an `extern` or `export` function and an interface or service operation take no
-inline clause.
+inline directive.
 
-**Diagnostics:** An inline clause with arguments reports `SEM0235`. The clause on a `static`,
-`extern` or `export` function or on an operation reports `SEM0236`. A second inline clause on one
+**Diagnostics:** An inline directive with arguments reports `SEM0235`. The directive on a `static`,
+`extern` or `export` function or on an operation reports `SEM0236`. A second inline directive on one
 function is not supported.
 
 **Current compiler:** Aligned. The function's LLVM definition carries `inlinehint`,
