@@ -18,8 +18,11 @@ for later invocation. Omitting a callback does not imply that promise: an incomp
 diagnoses even when the declaration is never called.
 
 Use `deferredCallbacks` for retention followed by invocation during later calls on the registering
-thread, or `threadCallbacks` for invocation on any thread. A declaration selects one callback mode;
-its list must cover every callback exactly once. These invocation clauses do not narrow memory
+thread, or `threadCallbacks` for invocation on any thread. A declaration may give each mode one
+list, so one registration can take a deferred completion callback and an any-thread error
+callback; together the lists must name every callback exactly once, and a callback in two lists
+diagnoses. Each callback's mode is part of the declaration's native identity. These invocation
+clauses do not narrow memory
 access, locality or pointer capture and cannot be combined with those narrowing promises.
 
 The function-pointer type itself accepts the same clause for its access behavior. In type clauses,
@@ -104,7 +107,7 @@ does not extend a borrow or establish ownership.
 A callback path starts with the written parameter name and follows C struct fields separated by
 dots, for example `"request.info.callback"`. Type aliases do not hide callbacks. Every callback
 leaf in the resolved by-value argument must be listed exactly once; omitted, duplicate, unknown
-and non-callback paths diagnose. The rule applies to all three callback modes.
+and non-callback paths diagnose. The rule applies across all of a declaration's callback lists.
 Fixed-array fields containing callbacks are rejected; indexed callback paths are not admitted.
 Arrays without callback leaves retain their ordinary C ABI rules.
 
