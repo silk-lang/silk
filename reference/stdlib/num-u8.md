@@ -138,7 +138,6 @@ checked-conversion code can select the same source and destination type.
 
 ```silk
 pub fn toU16(value: u8) -> u16
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` exactly to `u16`. Every `u8` value is representable.
@@ -160,7 +159,6 @@ representable.
 
 ```silk
 pub fn toU32(value: u8) -> u32
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` exactly to `u32`. Every `u8` value is representable.
@@ -182,7 +180,6 @@ representable.
 
 ```silk
 pub fn toU64(value: u8) -> u64
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` exactly to `u64`. Every `u8` value is representable.
@@ -204,7 +201,6 @@ representable.
 
 ```silk
 pub fn toUsize(value: u8) -> usize
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` exactly to `usize`. Every `u8` value is representable.
@@ -226,7 +222,6 @@ representable.
 
 ```silk
 pub fn toI8(value: u8) -> i8
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` to `i8`. Traps if `value` is outside the `i8` range. Use
@@ -249,7 +244,6 @@ range. Use this function when an out-of-range value is input data.
 
 ```silk
 pub fn toI16(value: u8) -> i16
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` exactly to `i16`. Every `u8` value is representable.
@@ -271,7 +265,6 @@ representable.
 
 ```silk
 pub fn toI32(value: u8) -> i32
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` exactly to `i32`. Every `u8` value is representable.
@@ -293,7 +286,6 @@ representable.
 
 ```silk
 pub fn toI64(value: u8) -> i64
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` exactly to `i64`. Every `u8` value is representable.
@@ -315,7 +307,6 @@ representable.
 
 ```silk
 pub fn toIsize(value: u8) -> isize
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` exactly to `isize`. Every `u8` value is representable.

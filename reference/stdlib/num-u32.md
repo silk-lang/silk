@@ -108,7 +108,6 @@ The fixed width of `u32`, in bits.
 
 ```silk
 pub fn toU8(value: u32) -> u8
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` to `u8`. Traps if `value` is outside the `u8` range. Use
@@ -131,7 +130,6 @@ range. Use this function when an out-of-range value is input data.
 
 ```silk
 pub fn toU16(value: u32) -> u16
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` to `u16`. Traps if `value` is outside the `u16` range. Use
@@ -176,7 +174,6 @@ checked-conversion code can select the same source and destination type.
 
 ```silk
 pub fn toU64(value: u32) -> u64
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` exactly to `u64`. Every `u32` value is representable.
@@ -198,7 +195,6 @@ representable.
 
 ```silk
 pub fn toUsize(value: u32) -> usize
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` exactly to `usize`. Every `u32` value is representable.
@@ -220,7 +216,6 @@ representable.
 
 ```silk
 pub fn toI8(value: u32) -> i8
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` to `i8`. Traps if `value` is outside the `i8` range. Use
@@ -243,7 +238,6 @@ range. Use this function when an out-of-range value is input data.
 
 ```silk
 pub fn toI16(value: u32) -> i16
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` to `i16`. Traps if `value` is outside the `i16` range. Use
@@ -266,7 +260,6 @@ range. Use this function when an out-of-range value is input data.
 
 ```silk
 pub fn toI32(value: u32) -> i32
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` to `i32`. Traps if `value` is outside the `i32` range. Use
@@ -289,7 +282,6 @@ range. Use this function when an out-of-range value is input data.
 
 ```silk
 pub fn toI64(value: u32) -> i64
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` exactly to `i64`. Every `u32` value is representable.
@@ -311,7 +303,6 @@ representable.
 
 ```silk
 pub fn toIsize(value: u32) -> isize
-with Intrinsic.inlineAlways()
 ```
 
 Converts `value` to `isize`. Traps if `value` is outside the `isize` range. Use

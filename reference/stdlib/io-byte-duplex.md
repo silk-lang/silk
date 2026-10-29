@@ -419,7 +419,7 @@ The provider close of the write direction. The safe wrapper flushes before it ca
 ### Operation `closeRaw`
 
 ```silk
-unsafe effect fn closeRaw() -> () ! ByteIoError ? &mut ByteDuplex with Intrinsic.nonParking()
+unsafe effect fn closeRaw() -> () ! ByteIoError ? &mut ByteDuplex
 ```
 
 The provider close of the whole transport. After the first call, the provider stays closed,
