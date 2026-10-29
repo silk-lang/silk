@@ -3409,9 +3409,9 @@ const program = Effect.gen(function* () {
   assert.ok(coldObjects.length > 2, `expected an object per module, found ${coldObjects.join(', ')}`)
   // Every unit that guards a foreign call defines the foreign personality, and the link keeps one
   // copy: Mach-O's compact unwind encodes at most three personalities (#2547).
-  const linked = yield* invoke(join(tools, 'llvm-nm'), [join(split, `build/llvm/${hostTarget}/debug/split`)], split)
-  assert.equal(linked.status, 0, linked.stderr)
-  const personalities = linked.stdout.split('\n').filter((line) => /\s_?__silk_foreign_personality$/.test(line))
+  const personalitySymbols = yield* invoke(join(tools, 'llvm-nm'), [join(split, `build/llvm/${hostTarget}/debug/split`)], split)
+  assert.equal(personalitySymbols.status, 0, personalitySymbols.stderr)
+  const personalities = personalitySymbols.stdout.split('\n').filter((line) => /\s_?__silk_foreign_personality$/.test(line))
   assert.equal(personalities.length, 1, personalities.join('\n'))
   // The cache keeps each module's LLVM text as a file of its own beside the image, named by its
   // digest, so an unchanged rebuild finds every module's text where the last build left it.
