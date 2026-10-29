@@ -2680,13 +2680,6 @@ const program = Effect.gen(function* () {
   assert.equal(fetched.status, 42, fetched.stderr)
   assert.equal(yield* fs.exists(join(silkHome, `git/${commit}.fetched`)), true)
   assert.equal(yield* fs.exists(join(silkHome, `git/${commit}/.git`)), false)
-  yield* fs.remove(repository, { recursive: true })
-  const cached = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(directory, 'git/app'), {
-    ...process.env,
-    SILK_CLANG: clang,
-    SILK_HOME: silkHome,
-  })
-  assert.equal(cached.status, 42, cached.stderr)
   // A commit the repository cannot serve fails the fetch at the dependency's git line.
   yield* fs.writeFileString(
     join(directory, 'git/app/silk.toml'),
@@ -2700,8 +2693,19 @@ const program = Effect.gen(function* () {
   assert.equal(unreachable.status, 2, 'an unreachable commit was accepted')
   assert.match(
     unreachable.stderr,
-    /git\/app\/silk\.toml:7: dependency `vector` of app@1\.0\.0: fetching commit 0{40} of file:.* failed: /,
+    /git\/app\/silk\.toml:7: dependency `vector` of app@1\.0\.0: fetching commit 0{40} of file:.* failed: the repository has no such commit/,
   )
+  yield* fs.writeFileString(
+    join(directory, 'git/app/silk.toml'),
+    gitManifest(`git = "${pathToFileURL(repository).href}", rev = "${commit}", path = "vector"`),
+  )
+  yield* fs.remove(repository, { recursive: true })
+  const cached = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(directory, 'git/app'), {
+    ...process.env,
+    SILK_CLANG: clang,
+    SILK_HOME: silkHome,
+  })
+  assert.equal(cached.status, 42, cached.stderr)
   // A revision must be a full commit hash; tags and branches move, so they are not accepted.
   yield* fs.writeFileString(
     join(directory, 'git/app/silk.toml'),
