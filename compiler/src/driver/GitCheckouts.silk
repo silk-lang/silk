@@ -1,0 +1,247 @@
+//! The store of git checkouts that git dependencies read: one directory per commit.
+//!
+//! # Details
+//! A dependency `{ git = "<url>", rev = "<commit>" }` reads the files of that commit from
+//! `<store>/<commit>`, where the store is `$SILK_HOME/git`, or `$HOME/.silk/git` when `SILK_HOME`
+//! is unset. A commit hash names its whole tree, so a checkout never changes once written and two
+//! URLs serving the same commit share it. A checkout is complete once the marker file
+//! `<store>/<commit>.fetched` exists; a directory without one is a fetch that stopped part way and
+//! is fetched again. Fetching runs the `git` on `PATH` and keeps no `.git` directory. Two
+//! processes fetching the same missing commit at once can disturb each other's checkout; the
+//! marker is written last, so a disturbed fetch fails rather than leaving a partial checkout marked
+//! complete, and the next build fetches it again.
+
+import driver.CommandPath
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.collections.bytes {Bytes}
+import silk.core.effect {Effect}
+import silk.system.child_process {ChildProcess, ProcessError, ProcessOutcome, ProcessRequest}
+import silk.system.filesystem {FileError, FileSystem, Path}
+import silk.system.host_input {HostInput, HostInputError}
+import silk.core.option {Option}
+import silk.core.result {Result}
+import silk.collections.slice {Slice}
+import silk.text.string {String}
+import silk.num.usize
+
+/// A fetch that did not produce a checkout. `detail` says which step failed and what git printed.
+pub struct FetchFailed {
+  pub detail: Bytes,
+}
+
+/// The checkout store: `$SILK_HOME/git`, else `$HOME/.silk/git`, or `None` when the variable
+/// does not name an absolute path without `.` or `..` segments.
+pub effect fn store() -> Option<Path> ! HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+  if let Option<Bytes>.Some {value} = move run HostInput.variableNamed("SILK_HOME") {
+    return run below(Bytes.asSlice(&value), b"git")
+  }
+  if let Option<Bytes>.Some {value} = move run HostInput.variableNamed("HOME") {
+    return run below(Bytes.asSlice(&value), b".silk/git")
+  }
+  return Option<Path>.none()
+}
+
+// `directory/relative`, or `None` when `directory` is not an absolute path a `Path` can hold.
+effect fn below(directory: &[u8], relative: &[u8]) -> Option<Path> ! OutOfMemoryError ? &mut Allocator {
+  if directory.length == usize.ZERO || directory[usize.ZERO] != 47 { return Option<Path>.none() }
+  // A trailing separator would make an empty component.
+  let mut end = directory.length
+  while end > usize.ONE && directory[end - usize.ONE] == 47 { end = end - usize.ONE }
+  let mut joined = run Bytes.copy(Slice.view<u8>(directory, usize.ZERO, end))
+  if end > usize.ONE { run Bytes.append(&mut joined, b"/") }
+  run Bytes.append(&mut joined, relative)
+  return match move run Effect.result(Path.fromBytes(Bytes.asSlice(&joined))) {
+    Result<Path, FileError | OutOfMemoryError>.Success {value} => Option<Path>.some(move value)
+    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError invalid => {
+        drop invalid
+        return Option<Path>.none()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+/// Whether `url` names a repository git can fetch from any directory: a URL with a scheme, an
+/// `scp`-style `host:path`, or an absolute path. A relative path or a value starting with `-` is
+/// refused, since the fetch runs inside the checkout and must never read a URL as an option.
+pub fn isRepository(url: &[u8]) -> bool {
+  if url.length == usize.ZERO || url[usize.ZERO] == 45 { return false }
+  if url[usize.ZERO] == 47 { return true }
+  let mut at = usize.ZERO
+  while at < url.length {
+    if url[at] == 58 { return at > usize.ZERO }
+    if url[at] == 47 { return false }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+/// Whether `rev` is a full commit hash: 40 (SHA-1) or 64 (SHA-256) lowercase hexadecimal digits.
+/// Only a full hash names one commit for good, so it is the only revision a dependency takes.
+pub fn isCommit(rev: &[u8]) -> bool {
+  if rev.length != usize.add(0, 40) && rev.length != usize.add(0, 64) { return false }
+  let mut at = usize.ZERO
+  while at < rev.length {
+    let byte = rev[at]
+    if !((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102)) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// The directory holding the files of commit `rev` in the checkout store `store`.
+pub effect fn checkout(store: &Path, rev: &[u8]) -> Path ! FileError | OutOfMemoryError ? &mut Allocator {
+  return run Path.joinBytes(store, rev)
+}
+
+// The marker whose presence says the checkout of `rev` is complete.
+effect fn marker(store: &Path, rev: &[u8]) -> Path ! FileError | OutOfMemoryError ? &mut Allocator {
+  let mut name = run Bytes.copy(rev)
+  run Bytes.append(&mut name, b".fetched")
+  return run Path.joinBytes(store, Bytes.asSlice(&name))
+}
+
+/// Whether the store holds a complete checkout of commit `rev`.
+pub effect fn fetched(store: &Path, rev: &[u8]) -> bool ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let done = run marker(store, rev)
+  return run FileSystem.exists(&done)
+}
+
+/// Fetches commit `rev` of the repository at `url` into the store, unless it is already there.
+/// It asks the server for that one commit, and when the server refuses a request by hash, fetches
+/// every branch and tag and checks the commit out of them.
+pub effect fn fetch(store: &Path, url: &[u8], rev: &[u8]) -> ()
+  ! FetchFailed | HostInputError | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
+  let done = run marker(store, rev)
+  let complete = run FileSystem.exists(&done)
+  if complete { return () }
+  let git = match move run gitProgram() {
+    Option<Path>.Some {value} => move value
+    Option<Path>.None => run failed(b"fetching it needs git, and no git is on PATH", b"")
+  }
+  run FileSystem.createDirectoriesRecursively(store)
+  let target = run checkout(store, rev)
+  // A directory without the marker is an earlier fetch that stopped part way.
+  let stale = run FileSystem.exists(&target)
+  if stale { run FileSystem.removeDirectoryRecursively(&target) }
+  let directory = Path.rawBytes(&target)
+  // A 64-digit hash names a commit of a SHA-256 repository, which only a SHA-256 clone can fetch.
+  if rev.length == usize.add(0, 64) {
+    let initialize: [&[u8]; 4] = [b"init", b"--quiet", b"--object-format=sha256", directory]
+    run step(&git, &initialize, b"git init")
+  } else {
+    let initialize: [&[u8]; 3] = [b"init", b"--quiet", directory]
+    run step(&git, &initialize, b"git init")
+  }
+  // `--` ends the options, so no URL is read as one.
+  let one: [&[u8]; 9] = [b"-C", directory, b"fetch", b"--quiet", b"--depth", b"1", b"--", url, rev]
+  let pinned = run attempt(&git, &one)
+  if let Option<Bytes>.Some {value: refused} = move pinned {
+    drop refused
+    let every: [&[u8]; 8] = [b"-C", directory, b"fetch", b"--quiet", b"--tags", b"--", url, b"+refs/heads/*:refs/remotes/origin/*"]
+    run step(&git, &every, b"git fetch")
+  }
+  let mut commit = run Bytes.copy(rev)
+  run Bytes.append(&mut commit, b"^{commit}")
+  let verify: [&[u8]; 6] = [b"-C", directory, b"rev-parse", b"--verify", b"--quiet", Bytes.asSlice(&commit)]
+  if let Option<Bytes>.Some {value: missing} = move run attempt(&git, &verify) {
+    drop missing
+    run failed(b"the repository has no such commit", b"")
+  }
+  let select: [&[u8]; 8] = [b"-C", directory, b"-c", b"advice.detachedHead=false", b"checkout", b"--quiet", b"--detach", Bytes.asSlice(&commit)]
+  run step(&git, &select, b"git checkout")
+  let metadata = run Path.join(&target, ".git")
+  run FileSystem.removeDirectoryRecursively(&metadata)
+  let mut record = run Bytes.copy(url)
+  run Bytes.append(&mut record, b"\n")
+  run Bytes.append(&mut record, rev)
+  run Bytes.append(&mut record, b"\n")
+  run FileSystem.writeFile(&done, Bytes.asSlice(&record))
+  return ()
+}
+
+effect fn failed(reason: &[u8], output: &[u8]) -> never ! FetchFailed | OutOfMemoryError ? &mut Allocator {
+  let mut detail = run Bytes.copy(reason)
+  // git ends its message with a newline; the detail is one line, so only the first is kept.
+  let mut end = usize.ZERO
+  while end < output.length && output[end] != 10 { end = end + usize.ONE }
+  if end > usize.ZERO {
+    run Bytes.append(&mut detail, b": ")
+    run Bytes.append(&mut detail, Slice.view<u8>(output, usize.ZERO, end))
+  }
+  fail FetchFailed {detail: move detail}
+}
+
+// Runs git with `arguments`, failing with `what failed` and git's first error line.
+effect fn step(git: &Path, arguments: &[&[u8]], what: &[u8]) -> ()
+  ! FetchFailed | HostInputError | OutOfMemoryError
+  ? &mut ChildProcess | &mut HostInput | &mut Allocator {
+  if let Option<Bytes>.Some {value} = move run attempt(git, arguments) {
+    let mut reason = run Bytes.copy(what)
+    run Bytes.append(&mut reason, b" failed")
+    run failed(Bytes.asSlice(&reason), Bytes.asSlice(&value))
+  }
+  return ()
+}
+
+// Runs git with `arguments`: `None` when it succeeds, else what it printed to standard error.
+effect fn attempt(git: &Path, arguments: &[&[u8]]) -> Option<Bytes>
+  ! HostInputError | OutOfMemoryError
+  ? &mut ChildProcess | &mut HostInput | &mut Allocator {
+  let mut request = run gitRequest(git)
+  let mut at = usize.ZERO
+  while at < arguments.length {
+    run ChildProcess.addArgumentBytes(&mut request, arguments[at])
+    at = at + usize.ONE
+  }
+  return match move run Effect.result(ChildProcess.submit(&request)) {
+    Result<ProcessOutcome, ProcessError | OutOfMemoryError>.Success {value: outcome} => {
+      if let Option<i32>.Some {value: code} = move ChildProcess.exitCode(&outcome) {
+        if code == 0 { return Option<Bytes>.none() }
+      }
+      return Option<Bytes>.some(run Bytes.copy(ChildProcess.errorBytes(&outcome)))
+    }
+    Result<ProcessOutcome, ProcessError | OutOfMemoryError>.Failure {error} => match move error {
+      ProcessError refused => {
+        drop refused
+        return Option<Bytes>.some(run Bytes.copy(b"git could not be started"))
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// A request for `git`, with the environment it needs to reach a server: the search path, home and
+// configuration directories, proxies, certificates and SSH agent. It never prompts for credentials.
+effect fn gitRequest(git: &Path) -> ProcessRequest ! HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+  let mut request = run ChildProcess.request(git)
+  let entries = [
+    "PATH", "HOME", "USER", "TMPDIR", "LANG", "LC_ALL", "XDG_CONFIG_HOME", "SSH_AUTH_SOCK", "GIT_SSH_COMMAND",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "no_proxy", "all_proxy",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "GIT_SSL_CAINFO",
+  ]
+  let names: &[string<'static>] = &entries
+  let mut at = usize.ZERO
+  while at < names.length {
+    if let Option<Bytes>.Some {value} = move run HostInput.variableNamed(names[at]) {
+      run ChildProcess.setVariableBytes(&mut request, String.utf8Bytes(names[at]), Bytes.asSlice(&value))
+    }
+    at = at + usize.ONE
+  }
+  run ChildProcess.setVariableBytes(&mut request, b"GIT_TERMINAL_PROMPT", b"0")
+  return move request
+}
+
+// The first `git` on `PATH`, or `None`.
+effect fn gitProgram() -> Option<Path> ! HostInputError | FileError | OutOfMemoryError ? &mut HostInput | &mut FileSystem | &mut Allocator {
+  let searchPath = match move run HostInput.variableNamed("PATH") {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => { return Option<Path>.none() }
+  }
+  return match move run CommandPath.search(Bytes.asSlice(&searchPath), b"git") {
+    Option<Bytes>.Some {value} => Option<Path>.some(run Path.fromBytes(Bytes.asSlice(&value)))
+    Option<Bytes>.None => Option<Path>.none()
+  }
+}
