@@ -79,8 +79,8 @@ returning operand behavior on Darwin hosts, and rejection of reserved registers 
 
 **Status:** Candidate.
 
-**Rule:** `@naked` and `@noReturn` require an unsafe, monomorphic,
-ordinary zero-argument function returning unit. An unsafe C export is allowed with these directives.
+**Rule:** `@naked` and `@noReturn` require an unsafe, monomorphic, zero-argument C export
+(`export "C"`) returning unit; on any other function they report SEM0236.
 Its body contains exactly one terminal operand-free unit assembly call with side effects and
 no-return; an enclosing `return` or unsafe acknowledgement is structural. No locals, other calls,
 branches, cleanup, captures, loans or additional statements are admitted.

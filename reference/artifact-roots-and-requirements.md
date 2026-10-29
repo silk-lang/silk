@@ -104,30 +104,31 @@ configuration origins. Missing physical symbols remain final-link failures.
 
 **Status:** Candidate.
 
-**Rule:** An `@native(...)` directive on a foreign declaration activates with that declaration's
+**Rule:** A native requirement attached to a foreign declaration activates with that declaration's
 reachability. A module-bound native requirement activates when its selected module belongs to the
-closure, even if no function in it is reachable; its spelling is not yet chosen, since the
-`module with` clause that would have held it no longer exists. Artifact configuration requirements
-always activate for the artifact. Multiple `@native` directives on one declaration compose; native
-requirements do not change foreign behavioral contracts. Module-bound requirements may occur inside
-module-level static selection.
+closure, even if no function in it is reachable. Artifact configuration requirements always
+activate for the artifact. Multiple requirements on one declaration compose; native requirements do
+not change foreign behavioral contracts. Module-bound requirements may occur inside module-level
+static selection. Neither source spelling is chosen yet: the directive set has no `@native`, and the
+`module with` clause that would have held a module-bound requirement no longer exists.
 
-**Example:**
+**Example:** a candidate spelling, not yet accepted by the compiler.
 
-```silk
+```silk,ignore
 @foreign(memory: "read")
 @native(kind: "library", name: "values", linkage: "dynamic")
 unsafe extern "C" fn readValue() -> i32 as "read_value"
 ```
 
-The values library is required only when `readValue` enters the artifact's reachable foreign set.
+The values library would be required only when `readValue` enters the artifact's reachable foreign
+set.
 
 **Boundary:** An unreachable foreign declaration or inactive module branch contributes no
 requirement. A source directive cannot request artifact scope, a filesystem path or a raw command.
 No symbol or standard-library actor spelling implies a dependency.
 
 **Diagnostics:** Unsupported attachment and malformed directives diagnose at the directive and offending
-property. Reachability alone does not suppress ordinary errors in active declarations.
+argument. Reachability alone does not suppress ordinary errors in active declarations.
 
 **Evidence:** D-015; artifact-root-planning specification.
 
