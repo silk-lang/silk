@@ -1692,7 +1692,9 @@ the witness.
 
 An inherent head may bound its own parameters with the same syntax. The bounds are premises of
 every member of that block, and each call proves them under the owner application it selects, as
-it proves the member's own bounds. A type may have several inherent blocks with different bounds.
+it proves the member's own bounds. A member body uses them as a bounded generic function does, so
+under `T: Zero + Twice` it may write `Zero.zero()` or `value.twice()`. A type may have several
+inherent blocks with different bounds.
 
 ```silk,ignore
 import silk.core.ownership { Copy }
