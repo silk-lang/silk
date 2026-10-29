@@ -32,7 +32,7 @@ export const Manifest = Schema.Struct({
       profiles: Schema.Array(
         Schema.Struct({
           name: Schema.NonEmptyString,
-          optimization: Schema.Literals(['none', 'speed']),
+          optimization: Schema.Literals(['none', 'speed', 'size']),
           debug: Schema.Boolean,
         }),
       ),

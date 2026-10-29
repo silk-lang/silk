@@ -273,6 +273,16 @@ Speed
 
 Optimization for speed.
 
+<a id="Optimization.Size"></a>
+
+### `Size`
+
+```silk
+Size
+```
+
+Optimization for code size.
+
 <a id="Safety"></a>
 
 ## `Safety`
