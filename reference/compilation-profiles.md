@@ -38,7 +38,7 @@ The profile separates these domains:
 | Link                  | static or dynamic                                                     |
 | Code model            | small or large                                                        |
 | Relocation            | static or position independent                                        |
-| Optimization          | none or speed                                                         |
+| Optimization          | none, speed or size                                                   |
 | Debug information     | enabled or disabled                                                   |
 | Safety                | checked or unchecked library policy                                   |
 | Threading             | single or multi library policy                                        |
