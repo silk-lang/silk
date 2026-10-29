@@ -50,7 +50,7 @@ for (const match of wat.matchAll(/^  \(import "([^"]+)" "([^"]+)" \(func .*$/gm)
   output += `  /// Calls \`${module}#${member}\` with its canonical ABI.\n`
   output += `  /// The caller supplies valid handles and memory, and honors the WIT ownership contract.\n`
   output += `  pub unsafe extern "C" fn ${name}(${params.map((type, i) => `p${i}: ${lane(type)}`).join(', ')}) -> ${lane(result)}\n`
-  output += `    as "silk_wasip2_${name}" with Intrinsic.foreign(module: "${module}", name: "${member}")\n\n`
+  output += `    as "${module}#${member}"\n\n`
   count++
 }
 if (count < 190) throw new Error(`WIT world unexpectedly contains only ${count} imports`)

@@ -1176,6 +1176,25 @@ link = [
 ]
 ```
 
+`[native].function-order` names a text file below the manifest's directory that lists function
+symbols, one per line, such as `silk_1f3a9c...`; blank lines and lines starting with `#` are
+ignored. Write each symbol as the program's LLVM IR and a Linux `nm` spell it, without the leading
+underscore Mach-O adds. A debug build writes these names beside its output in `<output>.symbols`.
+A Silk function's symbol derives from its declaration, not its body, so editing a body keeps it
+while renaming the function or changing its signature does not. A Linux or macOS executable link
+places the listed functions first, in the listed order, so code that runs together, such as a
+program's startup path, shares pages. On Linux the build compiles each function into its own
+section and links with `--symbol-ordering-file`, using lld: the one installed beside Clang, else
+`ld.lld` on `PATH`; an explicit platform-supply linker must be lld too. On macOS it passes
+`-order_file`. lld warns about a listed symbol the program does not define; the macOS linker
+skips it silently. A file that lists no symbol, and a wasm32 link, order nothing. Editing the
+listed symbols links the executable again.
+
+```toml
+[native]
+function-order = "startup.order"
+```
+
 **Boundary:** The compiler does not verify that a link input defines the symbol or that its real
 C signature matches the declaration. Supplied `Driver.CompileRequest.foreignInterfaces` JSON snapshots are validated before backend/cache use; detectable signature or behavioral mismatches report both origins. Other unsafe contract violations are undefined behavior under
 [SAFETY-001](#safety-001--only-violating-an-explicit-unsafe-contract-permits-undefined-behavior).
