@@ -25,7 +25,7 @@ behavior, data format, build artifact, or internal representation is a compatibi
 
 ## Repository workflow
 
-- The Node tooling in `compiler/scripts` uses pnpm and Vitest; `pnpm test:scripts` tests it, and
+- The Node tooling in `compiler/scripts` uses pnpm and `node:test`; `pnpm test:scripts` tests it, and
   Selfhost CI runs it too. Node runs the `.ts` files directly by stripping types; there is no
   TypeScript compiler, formatter or linter.
 - `main` is the only integration branch. A pull request merges when its required checks pass on its
@@ -105,7 +105,8 @@ After changing stdlib doc comments, regenerate `reference/stdlib` with `doc-refe
   resources; failures are typed errors with a discriminated reason.
 - Name public operations with `Effect.fn('Actor.operation')` and reusable internal ones with
   `Effect.fnUntraced`.
-- Tests import `it` and `assert` from `@effect/vitest` and keep assertions inside the Effect.
+- Tests import `it` and `assert` from `compiler/scripts/EffectTest.mjs` and keep assertions inside
+  the Effect.
 - Never use non-null assertions (`!`) or lint suppressions; cast only for truths TypeScript cannot
   express.
 

@@ -1,7 +1,7 @@
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { assert, it } from '@effect/vitest'
+import { assert, it } from './EffectTest.mjs'
 import * as Effect from 'effect/Effect'
 import * as Config from 'effect/Config'
 import * as Exit from 'effect/Exit'

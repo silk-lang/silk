@@ -1,4 +1,4 @@
-import { assert, it } from '@effect/vitest'
+import { assert, it } from './EffectTest.mjs'
 import { verify } from './DiagnosticCatalog.mjs'
 
 const definitions = [
