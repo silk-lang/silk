@@ -4,13 +4,13 @@ Define immediate native call behavior, unsafe optimization assertions, complete-
 
 ### Requirement: Foreign calls carry an explicit conservative behavioral contract
 
-Every foreign declaration SHALL carry normalized memory, locality, capture, borrow, returned-alias, return, callback-invocation and forbidden-unwind facts. An omitted property clause SHALL mean external read/write memory, possible pointer capture, no borrowed parameters, no returned-alias assertion and normal return; it SHALL NOT admit unlisted callback arguments. Source MAY narrow those facts only through `with Intrinsic.foreign(...)` on an unsafe foreign declaration or export. Native function-pointer types carry normalized access behavior. Unknown or duplicate properties, wrong literal kinds, nonexistent parameters and invalid type/contract combinations SHALL diagnose at their source spans. Parameter sets SHALL normalize by ordinal; property order and renamed local parameters SHALL NOT alter behavioral identity.
+Every foreign declaration SHALL carry normalized memory, locality, capture, borrow, returned-alias, return, callback-invocation and forbidden-unwind facts. Omitted directives SHALL mean external read/write memory, possible pointer capture, no borrowed parameters, no returned-alias assertion and normal return; they SHALL NOT admit unlisted callback arguments. Source MAY narrow those facts only through directives such as `@foreign(...)`, written before an unsafe foreign declaration or export. Native function-pointer types carry normalized access behavior. Unknown or duplicate directive arguments, wrong literal kinds, nonexistent parameters and invalid type/contract combinations SHALL diagnose at their source spans. Parameter sets SHALL normalize by ordinal; argument order and renamed local parameters SHALL NOT alter behavioral identity.
 
-Every function-pointer parameter and callback leaf in a by-value C aggregate SHALL be named exactly once across the declaration's invocation lists, which give each mode at most one list. `callbacks` promises synchronous, same-thread invocation within the complete call without retention. `deferredCallbacks` permits retention and invocation only during later marked calls on the registering thread. `threadCallbacks` permits invocation on any thread, during or after registration. `invokesDeferredCallbacks: true` marks calls that may invoke previously retained same-thread callbacks. Raw-pointer pointees are not traversed. Explicit permitted unwind remains rejected. See [native callbacks](./synchronous-native-callbacks.md) for field paths, retained-data obligations, reference restrictions and indirect invocation.
+Every function-pointer parameter and callback leaf in a by-value C aggregate SHALL be named exactly once across the declaration's invocation directives, which give each mode at most one list. `@callbacks` promises synchronous, same-thread invocation within the complete call without retention. `@deferredCallbacks` permits retention and invocation only during later marked calls on the registering thread. `@threadCallbacks` permits invocation on any thread, during or after registration. `@invokesDeferredCallbacks` marks calls that may invoke previously retained same-thread callbacks. Raw-pointer pointees are not traversed. Explicit permitted unwind remains rejected. See [native callbacks](./synchronous-native-callbacks.md) for field paths, retained-data obligations, reference restrictions and indirect invocation.
 
 #### Scenario: Preserve an unannotated declaration
 
-- **WHEN** a source declaration provides no behavior clause
+- **WHEN** a source declaration provides no behavior directive
 - **THEN** semantic, executable and emitted contracts remain conservative and contain no optimistic memory, capture, returned-alias or no-return assertions
 
 #### Scenario: Validate unsafe assertions
@@ -57,7 +57,7 @@ Normalized behavioral contracts SHALL enter semantic surfaces, executable/MIR in
 
 #### Scenario: Invalidate behavior changes
 
-- **WHEN** a selected declaration changes only its admitted behavior clause
+- **WHEN** a selected declaration changes only its admitted behavior directives
 - **THEN** its semantic/native interface identity changes and incompatible cached results are not reused
 
 ### Requirement: A foreign unwind terminates at the Silk boundary
@@ -74,20 +74,20 @@ Foreign exception propagation SHALL be forbidden. When an admitted native platfo
 - **WHEN** the designated boundary verification lanes run
 - **THEN** they compile, link, inspect and execute the admitted fixtures with pinned supplies and fail when required supplies or fixtures are missing
 
-## Source properties
+## Source directives
 
-Use an optional contextual `with Intrinsic.foreign(...)` tail after the optional symbol rename. This is a compiler-owned declaration property, not a source function execution or a library actor recognized by name. Ordinary unsafe acknowledgement remains mandatory. Arguments are literal named properties, with exact field/type validation and source spans:
+Write optional directives such as `@foreign(...)` on the lines before the declaration. A directive is compiler-owned, not a source function execution or a library actor recognized by name. Ordinary unsafe acknowledgement remains mandatory. `@foreign` takes the literal named arguments `memory`, `locality` and `noCapture`, with exact field/type validation and source spans. `borrow` and `returned` below are candidate contract facts with no source spelling yet; writing them as `@foreign` arguments reports SEM0235.
 
 - `memory`: `"none" | "read" | "write" | "readwrite"`, default `"readwrite"`.
 - `locality`: `"external" | "arguments"`, default `"external"`. `memory: "none"` canonicalizes locality to external because there are no accesses. Arguments means only memory reachable through pointer parameters; it does not permit hidden globals or inaccessible allocator state.
 - `noCapture`: tuple of raw-pointer parameter names, default empty. The assertion forbids all pointer capture, including return capture; it does not promise non-freeing or make the pointer owning.
 - `borrow`: tuple of single-value reference parameter names, default empty. Each named parameter asserts noncapture and non-freeing for the complete call. Every reference parameter requires this assertion. Slices and borrowed results remain unadmitted. This gives immediate native code one C pointer while keeping the existing reference loan checker and initialization rules authoritative.
-- `returned`: one raw-pointer parameter name, absent by default. Result must have the identical pointer type. It asserts exact pointer equality, not fresh allocation or ownership. It conflicts with noCapture on the same parameter and with noReturn.
-- `noReturn`: Boolean, default false; true requires a unit result. It permits no successful continuation. A foreign implementation that returns despite this unsafe assertion violates its declaration contract.
-- `callbacks`, `deferredCallbacks`, or `threadCallbacks`: a tuple of parameter names or dotted by-value aggregate callback paths. A declaration may combine lists of different modes; together they cover every callback exactly once. The modes select synchronous non-retained, deferred same-thread, or any-thread invocation, respectively. These clauses retain conservative memory behavior and cannot combine with narrowing memory/locality/capture assertions.
-- `invokesDeferredCallbacks`: literal `true` marks an event-pump, wait or other call that may invoke callbacks retained on the calling thread. It retains conservative external read/write memory behavior. Deferred registrations, deferred callback signatures and marked invocation calls cannot take references or slices.
+- `returned`: one raw-pointer parameter name, absent by default. Result must have the identical pointer type. It asserts exact pointer equality, not fresh allocation or ownership. It conflicts with noCapture on the same parameter and with `@noReturn`.
+- `@noReturn`: a separate directive with no arguments, absent by default; it requires a unit result. It permits no successful continuation. A foreign implementation that returns despite this unsafe assertion violates its declaration contract.
+- `@callbacks`, `@deferredCallbacks`, or `@threadCallbacks`: separate directives whose bare text arguments are parameter names or dotted by-value aggregate callback paths. A declaration may combine directives of different modes; together they cover every callback exactly once. The modes select synchronous non-retained, deferred same-thread, or any-thread invocation, respectively. These directives retain conservative memory behavior and cannot combine with narrowing memory/locality/capture assertions.
+- `@invokesDeferredCallbacks`: a separate directive with no arguments that marks an event-pump, wait or other call that may invoke callbacks retained on the calling thread. It retains conservative external read/write memory behavior. Deferred registrations, deferred callback signatures and marked invocation calls cannot take references or slices.
 
-Unknown, duplicate, wrong-kind, unknown-parameter and conflicting properties diagnose at the property/parameter origin. Assertions on exported source functions and function-pointer types are not admitted by this clause; their delivered contracts remain conservative. No generalized attribute strings or arbitrary LLVM properties enter source. Named sets normalize to parameter ordinals, not source aliases or property order.
+Unknown, duplicate, wrong-kind, unknown-parameter and conflicting directives and arguments diagnose at the directive/parameter origin. Assertions on exported source functions and function-pointer types are not admitted by these directives; their delivered contracts remain conservative. No generalized attribute strings or arbitrary LLVM properties enter source. Named sets normalize to parameter ordinals, not source aliases or argument order.
 
 The alternative of treating raw pointer formation as a borrow is rejected: JUL-123 deliberately made raw pointers non-owning and loanless. Explicit reference parameters make the loan lifetime visible to existing checking without manufacturing provenance for arbitrary native pointers. Existing output storage still uses raw write-only pointers and explicit unsafe initialization acknowledgement; a memory assertion never initializes an owner.
 
@@ -95,4 +95,4 @@ The alternative of treating raw pointer formation as a borrow is rejected: JUL-1
 
 Embedders pass ABI JSON snapshots in `Driver.CompileRequest.foreignInterfaces`, with a `SourceFile` identity for each supplied file. Schema 2 is strict and includes normalized contracts. The driver compares all supplied records with one another and with the reachable C inventory before invoking tools or reusing cached emission. A mismatch uses SEM0192 and relates the source declaration and supplied file; malformed/obsolete records use SEM0188. Missing interfaces do not authorize guesses about object-code behavior. Supplied interface bytes participate in the backend cache key. This API does not discover platform supplies or infer interfaces from linker inputs.
 
-WebAssembly function imports additionally accept literal `module` and `name` linkage properties; see [WASI and WIT linkage](wasi.md#custom-wit-worlds-imports-and-exports). They do not narrow the foreign memory or lifetime contract.
+WebAssembly function imports additionally name their module and member as `as "module#name"` after the signature; see [WASI and WIT linkage](wasi.md#custom-wit-worlds-imports-and-exports). The pair does not narrow the foreign memory or lifetime contract.
