@@ -626,6 +626,7 @@ The concrete comparison operators are available as follows:
 | `f32` or `f64` of identical width | Yes        | Yes                  | Ordinary IEEE comparison                       |
 | `char`                            | Yes        | Yes                  | Unicode scalar-value order                     |
 | `string`                          | Yes        | No                   | Exact UTF-8 sequence equality                  |
+| `&[u8]` or `&mut [u8]`            | Yes        | No                   | Exact byte sequence equality                   |
 | One identical scalar enum type    | Yes        | No                   | Declared member identity                       |
 
 Every comparison returns `bool` and evaluates both operands left to right exactly once.
@@ -641,10 +642,13 @@ fn same(left: string, right: string) -> bool {
 ```
 
 Character ordering is not locale collation, normalization, or grapheme ordering. String equality
-does not normalize, case-fold, or allocate.
+does not normalize, case-fold, or allocate. Byte slice equality compares lengths, then bytes; two
+views of different validity lifetimes compare, as two strings do.
 
-**Boundary:** Structs, arrays, unions, references, slices, callable values, Effect values, and
-services do not receive implicit structural or identity equality. Boolean, string, and scalar enum
+**Boundary:** Structs, arrays, unions, references, slices other than byte slices, callable values,
+Effect values, and services do not receive implicit structural or identity equality. A shared slice
+`&[T]` implements `Equal` and `Order` element by element when `T` does, so `Equal.equals` and
+`Order.compare` accept it. Boolean, string, and scalar enum
 ordering are also unavailable. Enum equality additionally requires one canonical enum type under
 OP-011. A future user-defined equality or ordering contract must be declared explicitly; it cannot
 be inferred from representation.
