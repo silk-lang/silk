@@ -2,13 +2,22 @@ import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { assert, it } from '@effect/vitest'
+import { assert, it } from './EffectTest.mjs'
 import * as Effect from 'effect/Effect'
 import * as FileSystem from 'effect/FileSystem'
 import * as Result from 'effect/Result'
-import { vi } from 'vitest'
+import { mock } from 'node:test'
 import * as NativeProcess from './NativeProcess.ts'
-import {
+
+// CompilerRelease reaches `gh` through NativeProcess.execute; tests swap in a transport handler.
+let handler
+mock.module('./NativeProcess.ts', {
+  exports: {
+    ...NativeProcess,
+    execute: (...args) => (handler ?? NativeProcess.execute)(...args),
+  },
+})
+const {
   assetIdentity,
   devCounter,
   isManagedMerge,
@@ -19,7 +28,7 @@ import {
   publish,
   releaseBody,
   releaseBodyLimit,
-} from './CompilerRelease.mjs'
+} = await import('./CompilerRelease.mjs')
 
 const require = createRequire(new URL('../../package.json', import.meta.url))
 const { NodeServices } = await import(pathToFileURL(require.resolve('@effect/platform-node')).href)
@@ -53,10 +62,15 @@ const outcome = (value) => ({
   signal: null,
   deadline: null,
 })
-const transport = Effect.fnUntraced(function* (handler) {
+const transport = Effect.fnUntraced(function* (next) {
   yield* Effect.acquireRelease(
-    Effect.sync(() => vi.spyOn(NativeProcess, 'execute').mockImplementation(handler)),
-    (spy) => Effect.sync(() => spy.mockRestore()),
+    Effect.sync(() => {
+      handler = next
+    }),
+    () =>
+      Effect.sync(() => {
+        handler = undefined
+      }),
   )
 })
 

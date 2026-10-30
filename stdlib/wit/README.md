@@ -12,3 +12,7 @@ SILK_WASM_TOOLS=/path/to/wasm-tools node .github/scripts/generate-wasi-bindings.
 
 Application packages may provide their own WIT package and world through
 `[component].wit` and `[component].world` in `silk.toml`.
+
+`deps/logging.wit` is `wasi:logging@0.1.0-draft` from
+[WebAssembly/wasi-logging](https://github.com/WebAssembly/wasi-logging), a draft proposal that only
+`silk.io.logger_wasi` uses.
