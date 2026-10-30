@@ -672,11 +672,16 @@ const program = Effect.gen(function* () {
     runWasm: (bytes: Uint8Array, options?: { onReport?: (report: string) => void }) => Promise<number>
     SilkError: new (...values: Array<unknown>) => Error & { report: string }
   }
+  // `pick` lives in a second file, so the line table names two sources.
+  yield* fs.writeFileString(
+    join(directory, 'picking.silk'),
+    'pub fn pick(values: &[i32], at: usize) -> i32 { return values[at] }\n',
+  )
   yield* fs.writeFileString(
     join(directory, 'trap.silk'),
     [
-      'fn pick(values: &[i32], at: usize) -> i32 { return values[at] }',
-      'fn outer(at: usize) -> i32 { let values: [i32; 2] = [1, 2] return pick(&values, at) }',
+      'import picking',
+      'fn outer(at: usize) -> i32 { let values: [i32; 2] = [1, 2] return picking.pick(&values, at) }',
       'pub fn main() -> i32 { return outer(5) }',
       '',
     ].join('\n'),
@@ -730,6 +735,9 @@ const program = Effect.gen(function* () {
   const trapSource = sourceMap.sources.findIndex((path) => path.endsWith('/trap.silk'))
   assert.ok(trapSource >= 0, sourceMap.sources.join(', '))
   assert.equal(sourceMap.sourcesContent[trapSource], yield* fs.readFileString(join(directory, 'trap.silk')))
+  // Each sequence starts in file 1, so a function there names it without `set_file`.
+  const pickingSource = sourceMap.sources.findIndex((path) => path.endsWith('/picking.silk'))
+  assert.ok(pickingSource >= 0, sourceMap.sources.join(', '))
   assert.match(sourceMap.mappings, /^[A-Za-z0-9+/]+(,[A-Za-z0-9+/]+)*$/)
   const trapBytes = yield* fs.readFile(join(directory, 'trap.wasm'))
   const trapped = yield* Effect.promise(() =>
@@ -740,7 +748,7 @@ const program = Effect.gen(function* () {
   )
   assert.ok(trapped instanceof runner.SilkError, String(trapped))
   assert.equal(trapped.message, 'fatal trap: index out of bounds')
-  assert.match(trapped.report, /^fatal trap: index out of bounds\n {2}at trap\.pick \(trap:1:\d+\)\n/)
+  assert.match(trapped.report, /^fatal trap: index out of bounds\n {2}at picking\.pick \(picking:1:\d+\)\n/)
   assert.match(trapped.stack ?? '', /trap\.outer/, 'the engine stack names the callers from the name section')
   const reports: Array<string> = []
   const failureBytes = yield* fs.readFile(join(directory, 'failure.wasm'))

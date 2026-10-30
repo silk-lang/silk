@@ -67,7 +67,7 @@ const importedMemory = (bytes) => {
 /** A Silk program stopped by a trap, with the report the program wrote. */
 export class SilkError extends Error {
   constructor(report, cause) {
-    super(report.split('\n', 1)[0] || String(cause?.message ?? cause), { cause })
+    super(report.split('\n', 1)[0] || String(cause?.message ?? cause), { cause: engineError(cause) })
     this.name = 'SilkError'
     /** The whole report, such as `fatal trap: ...` and its `at` lines. */
     this.report = report
@@ -89,6 +89,14 @@ const readReport = (instance, from) => {
   // A shared memory's view must be copied before it is decoded.
   const view = new Uint8Array(memory.buffer, (address() >>> 0) + from, end - from).slice()
   return new TextDecoder().decode(view)
+}
+
+// The engine's error from a trap's parts, as a `WebAssembly.RuntimeError` again.
+const engineError = (parts) => {
+  if (parts instanceof Error || typeof parts !== 'object' || parts === null) return parts
+  const error = new WebAssembly.RuntimeError(parts.message)
+  if (parts.stack !== undefined) error.stack = parts.stack
+  return error
 }
 
 // The imports one instance needs. `spawn` starts a thread from a start argument and answers its
@@ -123,7 +131,8 @@ const runRole = (data, post) => {
     }
   } catch (error) {
     if (!(error instanceof WebAssembly.RuntimeError)) throw error
-    post({ kind: 'trap', error, report: readReport(reading, before) })
+    // Not every browser can clone an Error into a message, so its parts cross instead.
+    post({ kind: 'trap', error: { name: error.name, message: error.message, stack: error.stack }, report: readReport(reading, before) })
   }
 }
 
@@ -165,7 +174,7 @@ export const runWasm = async (bytes, options = {}) => {
           workers.delete(worker)
           worker.terminate()
         } else if (message.kind === 'trap') {
-          finish(reject, message.report ? new SilkError(message.report, message.error) : message.error)
+          finish(reject, message.report ? new SilkError(message.report, message.error) : engineError(message.error))
         }
       })
     }
