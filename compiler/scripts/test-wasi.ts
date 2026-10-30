@@ -186,6 +186,29 @@ const program = Effect.gen(function* () {
     assert.notEqual(deepRun.status, 0)
     assert.match(deepRun.stderr.toString(), /fatal trap: index out of bounds\n {2}at main\.pick \(main:2:52\)\n/)
     assert.match(deepRun.stderr.toString(), /- main\.outer\n\s+at .*main\.silk:3:67/)
+    // `--coredump` has Wasmtime write a core dump of the trapped module, which is a wasm module.
+    if (target === 'wasm32-wasip1') {
+      const core = join(directory, 'trap.core')
+      const dumped = yield* invoke(compiler, ['run', '--target', target, '--stdlib', join(repo, 'stdlib'), '--quiet', '--coredump', core])
+      assert.notEqual(dumped.status, 0)
+      const coreBytes = yield* fs.readFile(core)
+      assert.deepEqual([...coreBytes.subarray(0, 4)], [0, 0x61, 0x73, 0x6d])
+      // Wasmtime splits its `-D` options at commas, so a path holding one is refused.
+      const comma = yield* invoke(compiler, ['run', '--target', target, '--stdlib', join(repo, 'stdlib'), '--quiet', '--coredump', 'a,b'])
+      assert.equal(comma.status, 2)
+      assert.match(comma.stderr.toString(), /the `--coredump` path cannot contain a comma/)
+    }
+    // `debug` starts the program under Wasmtime's debugger stub, listening on `--port`.
+    const recorder = join(directory, 'fake-wasmtime')
+    yield* fs.writeFileString(recorder, '#!/bin/sh\nprintf "%s\\n" "$@"\n')
+    yield* fs.chmod(recorder, 0o755)
+    const debugged = yield* invoke(
+      compiler,
+      ['debug', '--target', target, '--stdlib', join(repo, 'stdlib'), '--quiet', '--port', '4711', 'first'],
+      { env: { ...env, SILK_WASMTIME: recorder } },
+    )
+    assert.equal(debugged.status, 0, debugged.stderr.toString())
+    assert.match(debugged.stdout.toString(), /^run\n--dir\n\.::\/\n-g\n4711\n\S+\nfirst\n$/)
     // An unhandled error reports its name, origin, call path and value, as on native targets.
     yield* fs.writeFileString(
       join(directory, 'main.silk'),
