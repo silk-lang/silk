@@ -442,6 +442,29 @@ this Execution to its owner. The Wake invokes the fixed readiness endpoint at mo
 A call from a body that [`make`](#Execution.impl.make) made is a fatal state trap, because that endpoint cannot run
 on another thread.
 
+<a id="Execution.impl.interrupt"></a>
+
+### Associated function `interrupt`
+
+```silk
+pub fn interrupt<A>(execution: &mut Intrinsic.Execution<A>, token: usize) -> ()
+```
+
+Asks a parked Execution to resume the interruptible boundary for `token`.
+
+#### Details
+
+A dormant Execution becomes eligible and its readiness endpoint runs, as for a [`wake`](#Execution.impl.wake). An
+eligible one keeps its place. When it is next driven, every frame above the boundary that
+`Intrinsic.interruptibleEffect` opened for `token` is abandoned from its suspension point,
+innermost first, which runs its `Drop` hooks and non-parking finalizers. Then the boundary
+resumes with `false`. Wakes of the interrupted park publish nothing.
+
+#### Gotchas
+
+The parked body must be inside a boundary for `token`, and `token` must not be 0. Interrupting
+an Execution that is not dormant or eligible is a fatal state trap.
+
 <a id="Execution.impl.wakeTransferable"></a>
 
 ### Associated function `wakeTransferable`
