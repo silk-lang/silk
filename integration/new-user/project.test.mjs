@@ -244,6 +244,19 @@ test('a misspelled module path hints at the right case', { todo: 'finding 24' },
   assert.match(result.stderr, /util\.Math/)
 })
 
+test('a runtime trap in a debug build names the functions that called it', () => {
+  const dir = initPackage(h, fresh('trap-chain'))
+  write(join(dir, 'src/main.silk'), [
+    'fn pick(values: &[i32], at: usize) -> i32 { return values[at] }',
+    'fn outer(at: usize) -> i32 { let values: [i32; 2] = [1, 2] return pick(&values, at) }',
+    'pub fn main() -> i32 { return outer(5) }',
+    '',
+  ].join('\n'))
+  const ran = silk(h, ['run', '--quiet'], { cwd: dir })
+  assert.ok(ran.signal === 'SIGILL' || ran.status === 132, show(ran))
+  assert.match(ran.stderr, /fatal trap: index out of bounds\n  at main\.pick \(main:1:\d+\)\n  at main\.outer\n  at main\.main\n/)
+})
+
 test('runtime traps report the kind and place and exit 132', () => {
   const dir = initPackage(h, fresh('trap'))
   for (const [body, kind] of [
