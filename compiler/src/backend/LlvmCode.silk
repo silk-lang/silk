@@ -16,6 +16,7 @@ import backend.Layout {Abi, Field, Layout, Metrics, Sequence, Slice as SliceFact
 import backend.TypeLayouts {DataSpan, TypeLayouts}
 import backend.Gap {Code as GapCode, Gap, Source as GapSource}
 import backend.Mir
+import backend.MirCoalesce
 import backend.Mir {
   AggregateField,
   AssemblyFragment,
@@ -154,6 +155,12 @@ struct Writer {
   /// Per MIR block, whether every path from it ends in `fail` or a trap, so its calls are cold
   /// and branches into it are unlikely (#2568). Empty in fast-path builds.
   cold: List<bool>,
+  /// Per MIR block, the large `let` binding its call writes in place of its temporary, or
+  /// `usize.MAX`; the call's normal block then skips its first statement, the move out of the
+  /// temporary (#2515). Empty in fast-path builds.
+  direct: List<usize>,
+  /// Per MIR block, whether it continues such a call, so its first statement is skipped.
+  bound: List<bool>,
   tables: List<JumpTable>,
 }
 
@@ -204,7 +211,7 @@ effect fn writerOfWidth(pointerBits: usize, fastPath: bool) -> Writer ! OutOfMem
     blocks: List<u64>.make(), scalars: List<bool>.make(), alignments: List<usize>.make(), copies: List<CallerCopy>.make(), dropCopies: List<DropCopy>.make(), parameters: List<u64>.make(), extras: List<u64>.make(), providers: List<u64>.make(),
     out: Bitcode.none(), failure: Bitcode.none(), context: Bitcode.none(), observer: Bitcode.none(), cause: Bitcode.none(),
     site: Bitcode.none(), transfer: Bitcode.none(), frame: Bitcode.none(), threaded: List<bool>.make(), cold: List<bool>.make(),
-    tables: List<JumpTable>.make()}
+    direct: List<usize>.make(), bound: List<bool>.make(), tables: List<JumpTable>.make()}
 }
 
 // Forgets the function just built, keeping the module and its counter.
@@ -475,6 +482,44 @@ fn blockAt(writer: &Writer, index: usize) -> u64 {
 // Whether MIR block `index` only leads to `fail` or a trap (Writer.cold).
 fn isCold(writer: &Writer, index: usize) -> bool {
   return index < List<bool>.length(&writer.cold) && List<bool>.get(&writer.cold, index)
+}
+
+// The binding the call ending MIR block `index` writes directly, or `usize.MAX` (Writer.direct).
+fn directBinding(writer: &Writer, index: usize) -> usize {
+  if index < List<usize>.length(&writer.direct) { return List<usize>.get(&writer.direct, index) }
+  return usize.MAX
+}
+
+// The smallest binding a call writes in place. LLVM promotes a smaller one to registers once
+// inlining removes its borrows, which a call writing its address would prevent.
+fn directMinimumSize() -> usize { return 128 }
+
+// Fills Writer.direct and Writer.bound for `function`.
+effect fn directBindings(writer: &mut Writer, function: &MirFunction, layouts: &TypeLayouts) -> ()
+! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let locals = List<Local>.asSlice(&function.locals)
+  let mut result = run List<usize>.makeWithCapacity(blocks.length)
+  run List<usize>.appendRepeated(&mut result, usize.MAX, blocks.length)
+  let mut bound = run List<bool>.makeWithCapacity(blocks.length)
+  run List<bool>.appendRepeated(&mut bound, false, blocks.length)
+  let mut at = usize.ZERO
+  while at < blocks.length {
+    let binding = run MirCoalesce.bindingCandidate(function, at)
+    if binding != usize.MAX {
+      let facts = run layoutOf(layouts, &locals[binding].ty, function, locals[binding].origin.location)
+      if facts.size >= directMinimumSize() {
+        if let Terminator.Call {normal, ..} = &blocks[at].terminator {
+          List<usize>.set(&mut result, at, binding)
+          List<bool>.set(&mut bound, normal, true)
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  writer.direct = move result
+  writer.bound = move bound
+  return ()
 }
 
 // The storage address of MIR local `index`.
@@ -4854,7 +4899,9 @@ effect fn emitBlock(
       startAt = startAt + usize.ONE
     }
     run locate(&mut writer.*, Mir.statementOrigin(&statements[at]))
-    match & statements[at] {
+    let skipped = at == usize.ZERO && index < List<bool>.length(&writer.bound) && List<bool>.get(&writer.bound, index)
+    // The call before this block already wrote the binding this statement moves into.
+    if !skipped { match & statements[at] {
       Statement.Assign {destination, value, origin} => {
         match &value {
           // A callback's address is its emitted symbol (failure observer note N1).
@@ -4910,7 +4957,7 @@ effect fn emitBlock(
         let slot = run byteOffset(&mut writer.*, base.value, companionHandleOffset(target))
         run storeOf(&mut writer.*, handle.value, slot, usize.ZERO)
       }
-    }
+    } }
     while endAt < ends.length && ends[endAt].at == at {
       run markLife(&mut writer.*, b"end", ends[endAt].local, companions)
       endAt = endAt + usize.ONE
@@ -4953,6 +5000,10 @@ effect fn emitBlock(
             &arguments, &providers, &diagnostics, &destination, &failure, origin.location)
         }
       } else {
+        let binding = directBinding(&writer.*, index)
+        let written = if binding == usize.MAX { run Mir.copyPlace(&destination) } else {
+          Place {local: binding, projections: List<Projection>.make()}
+        }
         run emitCall(
           &mut writer.*,
           function,
@@ -4964,7 +5015,7 @@ effect fn emitBlock(
           &arguments,
           &providers,
           &diagnostics,
-          &destination,
+          &written,
           normal,
           &failure,
           origin.location,
@@ -5947,6 +5998,7 @@ pub effect fn emit(
   if !fastPath {
     writer.threaded = run threadedSwitches(function, target)
     writer.cold = run coldBlocks(function)
+    run directBindings(&mut writer, function, layouts)
   }
   at = usize.ZERO
   while at < blocks.length {
