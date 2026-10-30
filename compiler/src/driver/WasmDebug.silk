@@ -1,0 +1,556 @@
+//! Moves the DWARF of a linked wasm module into a separate file and derives a source map from its
+//! line table, for browsers.
+//!
+//! # When to use
+//! A debug build of a `wasm32-unknown-unknown` executable calls [`split`] on the linked module, then
+//! writes the original module as `<output>.debug.wasm`, the returned module as `<output>`, and
+//! [`sourceMap`] as `<output>.map`.
+//!
+//! # Details
+//! The returned module has no `.debug_*` sections and ends with an `external_debug_info` section
+//! naming the debug file, which Chrome's DWARF support follows, and a `sourceMappingURL` section
+//! naming the map, which Firefox and Safari read. Both files keep the same code section, so the
+//! DWARF's code offsets hold for either.
+//!
+//! The map follows `wasm-sourcemap.py`: one segment per row of the `.debug_line` programs, whose
+//! column is the row's byte offset in the module. DWARF 4 and 5 line programs are read; an
+//! end-of-sequence row and an address outside the code section add no segment.
+import driver.WasmNames as WasmNames {Reader}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.collections.bytes {Bytes}
+import silk.core.option {Option}
+import silk.collections.slice {Slice}
+import silk.collections.list {List}
+import silk.core.ownership {Copy}
+import silk.num.i64
+import silk.num.u8
+import silk.num.u64
+import silk.num.usize
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn startsWith(text: &[u8], prefix: &[u8]) -> bool {
+  return text.length >= prefix.length && same(Slice.view<u8>(text, usize.ZERO, prefix.length), prefix)
+}
+
+// One row of a line program: the module offset of an instruction, and its source position.
+struct Row {
+  offset: usize,
+  source: usize,
+  line: usize,
+  column: usize,
+}
+impl Copy for Row {}
+
+/// The rows of a module's line programs, by module offset, and the sources they name.
+pub struct LineTable {
+  sources: List<Bytes>,
+  rows: List<Row>,
+}
+
+impl LineTable {
+  /// The path of each source the rows name, as the DWARF names it.
+  pub fn paths(self: &Self) -> &[Bytes] { return List<Bytes>.asSlice(&self.sources) }
+
+  /// The number of rows.
+  pub fn length(self: &Self) -> usize { return List<Row>.length(&self.rows) }
+}
+
+/// A module without its DWARF, and the line table its DWARF held.
+pub struct Split {
+  /// The module to publish: no `.debug_*` sections, then `external_debug_info` and
+  /// `sourceMappingURL`.
+  pub module: Bytes,
+  /// The rows of the module's `.debug_line`.
+  pub lines: LineTable,
+}
+
+fn readFixed(bytes: &[u8], reader: &mut Reader, size: usize) -> u64 {
+  let mut value: u64 = 0
+  let mut at = usize.ZERO
+  while at < size {
+    let byte = WasmNames.readByte(bytes, &mut reader.*)
+    if at < 8 { value = u64.bitOr(value, u64.shiftLeft(u8.toU64(byte), usize.toU64(at * 8))) }
+    at = at + usize.ONE
+  }
+  return value
+}
+
+// A signed LEB128 number of at most 32 bits.
+fn readSigned(bytes: &[u8], reader: &mut Reader) -> i64 {
+  let mut value: u64 = 0
+  let mut shift = usize.ZERO
+  while true {
+    let byte = WasmNames.readByte(bytes, &mut reader.*)
+    if reader.failed { return 0 }
+    value = u64.bitOr(value, u64.shiftLeft(u8.toU64(byte & 127), usize.toU64(shift)))
+    shift = shift + 7
+    if (byte & 128) == 0 {
+      if (byte & 64) != 0 { return u64.toI64(value) - u64.toI64(u64.shiftLeft(1, usize.toU64(shift))) }
+      return u64.toI64(value)
+    }
+    if shift > 28 {
+      reader.failed = true
+      return 0
+    }
+  }
+  return 0
+}
+
+// The NUL-terminated string at the reader's position.
+fn readText<'a>(bytes: &'a [u8], reader: &mut Reader) -> &'a [u8] {
+  let start = reader.at
+  while reader.at < reader.end && bytes[reader.at] != 0 { reader.at = reader.at + usize.ONE }
+  if reader.at >= reader.end {
+    reader.failed = true
+    return Slice.view<u8>(bytes, start, usize.ZERO)
+  }
+  let text = Slice.view<u8>(bytes, start, reader.at - start)
+  reader.at = reader.at + usize.ONE
+  return text
+}
+
+// The NUL-terminated string at `offset` in `section`, or an empty one.
+fn textAt<'a>(section: &'a [u8], offset: u64) -> &'a [u8] {
+  let start = u64.toUsize(offset)
+  if start >= section.length { return Slice.view<u8>(section, usize.ZERO, usize.ZERO) }
+  let mut end = start
+  while end < section.length && section[end] != 0 { end = end + usize.ONE }
+  return Slice.view<u8>(section, start, end - start)
+}
+
+// The DWARF sections a line program reads.
+struct Sections<'a> {
+  line: &'a [u8],
+  lineText: &'a [u8],
+  text: &'a [u8],
+}
+
+// One entry of a DWARF 5 directory or file table: its path and directory index.
+struct Entry<'a> {
+  path: &'a [u8],
+  directory: usize,
+}
+
+// Reads one attribute of `form` from a DWARF 5 entry: a string form sets `path`, a number sets
+// `number`, and other forms are skipped. Unknown forms fail the reader.
+fn readForm<'a>(sections: &Sections<'a>, reader: &mut Reader, form: usize, path: &mut &'a [u8], number: &mut usize) -> () {
+  let bytes = sections.line
+  if form == 8 {
+    path.* = readText(bytes, &mut reader.*)
+  } else if form == 31 {
+    path.* = textAt(sections.lineText, readFixed(bytes, &mut reader.*, 4))
+  } else if form == 14 {
+    path.* = textAt(sections.text, readFixed(bytes, &mut reader.*, 4))
+  } else if form == 15 {
+    number.* = WasmNames.readNumber(bytes, &mut reader.*)
+  } else if form == 11 {
+    number.* = u64.toUsize(readFixed(bytes, &mut reader.*, 1))
+  } else if form == 5 {
+    number.* = u64.toUsize(readFixed(bytes, &mut reader.*, 2))
+  } else if form == 6 {
+    number.* = u64.toUsize(readFixed(bytes, &mut reader.*, 4))
+  } else if form == 7 {
+    let skipped = readFixed(bytes, &mut reader.*, 8)
+  } else if form == 30 {
+    let skipped = readFixed(bytes, &mut reader.*, 16)
+  } else if form == 9 {
+    let length = WasmNames.readNumber(bytes, &mut reader.*)
+    if length > reader.end - reader.at { reader.failed = true } else { reader.at = reader.at + length }
+  } else {
+    reader.failed = true
+  }
+}
+
+// Reads a DWARF 5 directory or file table into `entries`.
+effect fn readEntries<'a>(sections: &Sections<'a>, reader: &mut Reader, entries: &mut List<Entry<'a>>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let bytes = sections.line
+  let formats = u64.toUsize(readFixed(bytes, &mut reader.*, 1))
+  let mut kinds = List<usize>.make()
+  let mut forms = List<usize>.make()
+  let mut at = usize.ZERO
+  while at < formats && !reader.failed {
+    run List<usize>.append(&mut kinds, WasmNames.readNumber(bytes, &mut reader.*))
+    run List<usize>.append(&mut forms, WasmNames.readNumber(bytes, &mut reader.*))
+    at = at + usize.ONE
+  }
+  let count = WasmNames.readNumber(bytes, &mut reader.*)
+  let mut entry = usize.ZERO
+  while entry < count && !reader.failed {
+    let mut path = Slice.view<u8>(bytes, usize.ZERO, usize.ZERO)
+    let mut directory = usize.ZERO
+    let mut field = usize.ZERO
+    while field < formats && !reader.failed {
+      let kind = List<usize>.asSlice(&kinds)[field]
+      let mut text = Slice.view<u8>(bytes, usize.ZERO, usize.ZERO)
+      let mut number = usize.ZERO
+      readForm(sections, &mut reader.*, List<usize>.asSlice(&forms)[field], &mut text, &mut number)
+      // DW_LNCT_path and DW_LNCT_directory_index.
+      if kind == 1 { path = text }
+      if kind == 2 { directory = number }
+      field = field + usize.ONE
+    }
+    run List<Entry<'a>>.append(&mut entries.*, Entry {path: path, directory: directory})
+    entry = entry + usize.ONE
+  }
+}
+
+// `name` under `directory`, unless it is absolute.
+effect fn joined(directory: &[u8], name: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  if startsWith(name, b"/") || directory.length == usize.ZERO { return run Bytes.copy(name) }
+  let mut path = run Bytes.copy(directory)
+  if !(directory[directory.length - usize.ONE] == 47) { run Bytes.append(&mut path, b"/") }
+  run Bytes.append(&mut path, name)
+  return move path
+}
+
+// The index of `path` in the table's sources, added when new.
+effect fn sourceIndex(table: &mut LineTable, path: Bytes) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let sources = List<Bytes>.asSlice(&table.sources)
+  let mut at = usize.ZERO
+  while at < sources.length {
+    if same(Bytes.asSlice(&sources[at]), Bytes.asSlice(&path)) { return at }
+    at = at + usize.ONE
+  }
+  let index = List<Bytes>.length(&table.sources)
+  run List<Bytes>.append(&mut table.sources, move path)
+  return index
+}
+
+// Reads the line program at the reader's position into `table`, with each address moved by
+// `codeStart` and limited to `codeLength`. Returns false when it is malformed.
+effect fn readProgram(sections: &Sections, reader: &mut Reader, codeStart: usize, codeLength: usize, table: &mut LineTable) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let bytes = sections.line
+  let unitLength = u64.toUsize(readFixed(bytes, &mut reader.*, 4))
+  if reader.failed || unitLength > reader.end - reader.at || unitLength == usize.ZERO { return false }
+  let unitEnd = reader.at + unitLength
+  let version = u64.toUsize(readFixed(bytes, &mut reader.*, 2))
+  if version < 2 || version > 5 { return false }
+  let mut addressSize = usize.ONE * 4
+  if version >= 5 {
+    addressSize = u64.toUsize(readFixed(bytes, &mut reader.*, 1))
+    let selector = readFixed(bytes, &mut reader.*, 1)
+  }
+  let headerLength = u64.toUsize(readFixed(bytes, &mut reader.*, 4))
+  if reader.failed || headerLength > unitEnd - reader.at { return false }
+  let programStart = reader.at + headerLength
+  let minimumLength = u64.toUsize(readFixed(bytes, &mut reader.*, 1))
+  if version >= 4 { let operations = readFixed(bytes, &mut reader.*, 1) }
+  let defaultStatement = readFixed(bytes, &mut reader.*, 1)
+  let mut lineBase = u64.toI64(readFixed(bytes, &mut reader.*, 1))
+  if lineBase >= 128 { lineBase = lineBase - 256 }
+  let lineRange = u64.toUsize(readFixed(bytes, &mut reader.*, 1))
+  let opcodeBase = u64.toUsize(readFixed(bytes, &mut reader.*, 1))
+  if reader.failed || lineRange == usize.ZERO || opcodeBase == usize.ZERO { return false }
+  let lengthsStart = reader.at
+  reader.at = reader.at + opcodeBase - usize.ONE
+  // The path of each file, by its index in the program.
+  let mut files = List<Bytes>.make()
+  if version >= 5 {
+    let mut directories = List<Entry>.make()
+    run readEntries(sections, &mut reader.*, &mut directories)
+    let mut names = List<Entry>.make()
+    run readEntries(sections, &mut reader.*, &mut names)
+    if reader.failed { return false }
+    let folders = List<Entry>.asSlice(&directories)
+    let mut compilation = Slice.view<u8>(bytes, usize.ZERO, usize.ZERO)
+    if folders.length > usize.ZERO { compilation = folders[usize.ZERO].path }
+    let entries = List<Entry>.asSlice(&names)
+    let mut index = usize.ZERO
+    while index < entries.length {
+      let name = &entries[index]
+      index = index + usize.ONE
+      let mut folder = Slice.view<u8>(bytes, usize.ZERO, usize.ZERO)
+      if name.directory < folders.length { folder = folders[name.directory].path }
+      let directory = run joined(compilation, folder)
+      run List<Bytes>.append(&mut files, run joined(Bytes.asSlice(&directory), name.path))
+    }
+  } else {
+    let mut folders = List<Bytes>.make()
+    while !reader.failed {
+      let folder = readText(bytes, &mut reader.*)
+      if folder.length == usize.ZERO { break }
+      run List<Bytes>.append(&mut folders, run Bytes.copy(folder))
+    }
+    // DWARF 4 numbers files from 1, so index 0 has no file.
+    run List<Bytes>.append(&mut files, Bytes.make())
+    while !reader.failed {
+      let name = readText(bytes, &mut reader.*)
+      if name.length == usize.ZERO { break }
+      let directory = WasmNames.readNumber(bytes, &mut reader.*)
+      let modified = WasmNames.readNumber(bytes, &mut reader.*)
+      let size = WasmNames.readNumber(bytes, &mut reader.*)
+      let mut folder = Slice.view<u8>(bytes, usize.ZERO, usize.ZERO)
+      if directory > usize.ZERO && directory <= List<Bytes>.length(&folders) {
+        folder = Bytes.asSlice(&List<Bytes>.asSlice(&folders)[directory - usize.ONE])
+      }
+      run List<Bytes>.append(&mut files, run joined(folder, name))
+    }
+  }
+  if reader.failed { return false }
+  // The index of each file in the table's sources, once a row names it.
+  let mut chosen = List<usize>.make()
+  run List<usize>.appendRepeated(&mut chosen, usize.MAX, List<Bytes>.length(&files))
+  reader.at = programStart
+  let mut address = usize.ZERO
+  // Every version starts the file register at 1, also DWARF 5, whose file table counts from 0.
+  let mut file = usize.ONE
+  let mut line: i64 = 1
+  let mut column = usize.ZERO
+  while reader.at < unitEnd && !reader.failed {
+    let opcode = u8.toUsize(WasmNames.readByte(bytes, &mut reader.*))
+    let mut emit = false
+    let mut reset = false
+    if opcode >= opcodeBase {
+      let adjusted = opcode - opcodeBase
+      address = address + (adjusted / lineRange) * minimumLength
+      line = line + lineBase + usize.toI64(adjusted % lineRange)
+      emit = true
+    } else if opcode == 0 {
+      let length = WasmNames.readNumber(bytes, &mut reader.*)
+      if reader.failed || length == usize.ZERO || length > unitEnd - reader.at { return false }
+      let next = reader.at + length
+      let extended = WasmNames.readByte(bytes, &mut reader.*)
+      if extended == 1 {
+        reset = true
+      } else if extended == 2 {
+        address = u64.toUsize(u64.bitAnd(readFixed(bytes, &mut reader.*, addressSize), 4294967295))
+      }
+      reader.at = next
+    } else if opcode == 1 {
+      emit = true
+    } else if opcode == 2 {
+      address = address + WasmNames.readNumber(bytes, &mut reader.*) * minimumLength
+    } else if opcode == 3 {
+      line = line + readSigned(bytes, &mut reader.*)
+    } else if opcode == 4 {
+      file = WasmNames.readNumber(bytes, &mut reader.*)
+    } else if opcode == 5 {
+      column = WasmNames.readNumber(bytes, &mut reader.*)
+    } else if opcode == 8 {
+      address = address + ((255 - opcodeBase) / lineRange) * minimumLength
+    } else if opcode == 9 {
+      address = address + u64.toUsize(readFixed(bytes, &mut reader.*, 2))
+    } else {
+      // Skip the operands of other standard opcodes, as many as the header gives.
+      let operands = u8.toUsize(bytes[lengthsStart + opcode - usize.ONE])
+      let mut at = usize.ZERO
+      while at < operands {
+        let skipped = WasmNames.readNumber(bytes, &mut reader.*)
+        at = at + usize.ONE
+      }
+    }
+    // A sequence of a function the linker dropped starts at a tombstone address past the code.
+    if emit && address < codeLength && line >= 0 && line <= 2147483647 && file < List<Bytes>.length(&files) {
+      let mut source = List<usize>.asSlice(&chosen)[file]
+      if source == usize.MAX {
+        source = run sourceIndex(&mut table.*, run Bytes.copy(Bytes.asSlice(&List<Bytes>.asSlice(&files)[file])))
+        List<usize>.set(&mut chosen, file, source)
+      }
+      run List<Row>.append(&mut table.rows, Row {offset: codeStart + address, source: source, line: i64.toUsize(line), column: column})
+    }
+    if reset {
+      address = usize.ZERO
+      file = usize.ONE
+      line = 1
+      column = usize.ZERO
+    }
+  }
+  reader.at = unitEnd
+  return !reader.failed
+}
+
+// Appends a custom section named `name` whose payload is the string `value`.
+effect fn appendTextSection(output: &mut Bytes, name: &[u8], value: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut payload = Bytes.make()
+  run WasmNames.appendNumber(&mut payload, name.length)
+  run Bytes.append(&mut payload, name)
+  run WasmNames.appendNumber(&mut payload, value.length)
+  run Bytes.append(&mut payload, value)
+  run WasmNames.appendPart(&mut output.*, 0, Bytes.asSlice(&payload))
+}
+
+/// `module` without its `.debug_*` sections, naming `debugUrl` in `external_debug_info` and
+/// `mapUrl` in `sourceMappingURL`, and the rows of its `.debug_line`. None when `module` is not a
+/// well-formed core module, has no `.debug_line`, or its line programs are malformed.
+pub effect fn split(module: &[u8], debugUrl: &[u8], mapUrl: &[u8]) -> Option<Split> ! OutOfMemoryError ? &mut Allocator {
+  let header = b"\x00asm\x01\x00\x00\x00"
+  if module.length < header.length || !same(Slice.view<u8>(module, usize.ZERO, header.length), header) {
+    return Option<Split>.none()
+  }
+  let empty = Slice.view<u8>(module, usize.ZERO, usize.ZERO)
+  let mut sections = Sections {line: empty, lineText: empty, text: empty}
+  let mut hasLines = false
+  let mut reader = Reader {at: header.length, end: module.length, failed: false}
+  let mut output = run Bytes.copy(header)
+  let mut codeStart = usize.ZERO
+  let mut codeLength = usize.ZERO
+  while reader.at < module.length {
+    let start = reader.at
+    let id = WasmNames.readByte(module, &mut reader)
+    let length = WasmNames.readNumber(module, &mut reader)
+    if reader.failed || length > module.length - reader.at { return Option<Split>.none() }
+    let body = reader.at
+    let end = body + length
+    reader.at = end
+    if id == 0 {
+      let mut inner = Reader {at: body, end: end, failed: false}
+      let nameLength = WasmNames.readNumber(module, &mut inner)
+      if inner.failed || nameLength > end - inner.at { return Option<Split>.none() }
+      let name = Slice.view<u8>(module, inner.at, nameLength)
+      let contents = Slice.view<u8>(module, inner.at + nameLength, end - inner.at - nameLength)
+      if startsWith(name, b".debug_") {
+        if same(name, b".debug_line") {
+          sections.line = contents
+          hasLines = true
+        } else if same(name, b".debug_line_str") {
+          sections.lineText = contents
+        } else if same(name, b".debug_str") {
+          sections.text = contents
+        }
+        continue
+      }
+      if same(name, b"external_debug_info") || same(name, b"sourceMappingURL") { continue }
+    }
+    if id == 10 {
+      codeStart = Bytes.length(&output) + (body - start)
+      codeLength = length
+    }
+    run Bytes.append(&mut output, Slice.view<u8>(module, start, end - start))
+  }
+  if !hasLines { return Option<Split>.none() }
+  let mut table = LineTable {sources: List<Bytes>.make(), rows: List<Row>.make()}
+  let mut lines = Reader {at: usize.ZERO, end: sections.line.length, failed: false}
+  while lines.at < lines.end {
+    if !run readProgram(&sections, &mut lines, codeStart, codeLength, &mut table) { return Option<Split>.none() }
+  }
+  // Rows by offset; of rows at one offset, the last one read wins.
+  let rows = List<Row>.asSlice(&table.rows)
+  let mut order = List<u64>.make()
+  let mut at = usize.ZERO
+  while at < rows.length {
+    run List<u64>.append(&mut order, u64.bitOr(u64.shiftLeft(usize.toU64(rows[at].offset), 32), usize.toU64(at)))
+    at = at + usize.ONE
+  }
+  run List<u64>.sort(&mut order)
+  let mut sorted = List<Row>.make()
+  let keys = List<u64>.asSlice(&order)
+  at = usize.ZERO
+  while at < keys.length {
+    let row = rows[u64.toUsize(u64.bitAnd(keys[at], 4294967295))]
+    at = at + usize.ONE
+    let count = List<Row>.length(&sorted)
+    if count > usize.ZERO && List<Row>.asSlice(&sorted)[count - usize.ONE].offset == row.offset {
+      List<Row>.set(&mut sorted, count - usize.ONE, row)
+    } else {
+      run List<Row>.append(&mut sorted, row)
+    }
+  }
+  table.rows = move sorted
+  run appendTextSection(&mut output, b"external_debug_info", debugUrl)
+  run appendTextSection(&mut output, b"sourceMappingURL", mapUrl)
+  return Option<Split>.some(Split {module: move output, lines: move table})
+}
+
+effect fn appendVlq(output: &mut Bytes, value: i64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let digits = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+  let mut rest = usize.ZERO
+  if value < 0 { rest = i64.toUsize(0 - value) * 2 + usize.ONE } else { rest = i64.toUsize(value) * 2 }
+  while true {
+    let mut digit = rest & 31
+    rest = usize.shiftRight(rest, 5)
+    if rest != usize.ZERO { digit = digit | 32 }
+    run Bytes.append(&mut output.*, &[digits[digit]])
+    if rest == usize.ZERO { return () }
+  }
+}
+
+// Appends `text` as a JSON string.
+effect fn appendJsonText(output: &mut Bytes, text: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let hex = b"0123456789abcdef"
+  run Bytes.append(&mut output.*, b"\"")
+  let mut at = usize.ZERO
+  while at < text.length {
+    let byte = text[at]
+    at = at + usize.ONE
+    if byte == 34 {
+      run Bytes.append(&mut output.*, b"\\\"")
+    } else if byte == 92 {
+      run Bytes.append(&mut output.*, b"\\\\")
+    } else if byte == 10 {
+      run Bytes.append(&mut output.*, b"\\n")
+    } else if byte < 32 {
+      run Bytes.append(&mut output.*, b"\\u00")
+      run Bytes.append(&mut output.*, &[hex[u8.toUsize(byte / 16)], hex[u8.toUsize(byte % 16)]])
+    } else {
+      run Bytes.append(&mut output.*, &[byte])
+    }
+  }
+  run Bytes.append(&mut output.*, b"\"")
+}
+
+fn signed(value: usize) -> i64 { return usize.toI64(value) }
+
+/// The source map of `table`, a JSON object of version 3 whose single line has one segment per
+/// row. `contents` holds the text of each source in [`LineTable.paths`], or none to leave it out.
+pub effect fn sourceMap(table: &LineTable, contents: &[Option<Bytes>]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut output = run Bytes.copy(b"{\"version\":3,\"sources\":[")
+  let sources = List<Bytes>.asSlice(&table.sources)
+  let mut at = usize.ZERO
+  while at < sources.length {
+    if at > usize.ZERO { run Bytes.append(&mut output, b",") }
+    run appendJsonText(&mut output, Bytes.asSlice(&sources[at]))
+    at = at + usize.ONE
+  }
+  run Bytes.append(&mut output, b"],\"sourcesContent\":[")
+  at = usize.ZERO
+  while at < sources.length {
+    if at > usize.ZERO { run Bytes.append(&mut output, b",") }
+    if at < contents.length && Option<Bytes>.isSome(&contents[at]) {
+      if let Option<Bytes>.Some {value} = &contents[at] { run appendJsonText(&mut output, Bytes.asSlice(&value)) }
+    } else {
+      run Bytes.append(&mut output, b"null")
+    }
+    at = at + usize.ONE
+  }
+  run Bytes.append(&mut output, b"],\"names\":[],\"mappings\":\"")
+  let mut offset = usize.ZERO
+  let mut source = usize.ZERO
+  let mut line = usize.ZERO
+  let mut column = usize.ZERO
+  let mut first = true
+  let rows = List<Row>.asSlice(&table.rows)
+  at = usize.ZERO
+  while at < rows.length {
+    let row = rows[at]
+    at = at + usize.ONE
+    if !first { run Bytes.append(&mut output, b",") }
+    first = false
+    // Lines and columns of a source map count from 0; DWARF's count from 1, and 0 means unknown.
+    run appendVlq(&mut output, signed(row.offset) - signed(offset))
+    offset = row.offset
+    // Line 0 is code with no source line: a segment with only its offset ends the last mapping.
+    if row.line == usize.ZERO { continue }
+    let rowLine = row.line - usize.ONE
+    let mut rowColumn = usize.ZERO
+    if row.column > usize.ZERO { rowColumn = row.column - usize.ONE }
+    run appendVlq(&mut output, signed(row.source) - signed(source))
+    run appendVlq(&mut output, signed(rowLine) - signed(line))
+    run appendVlq(&mut output, signed(rowColumn) - signed(column))
+    source = row.source
+    line = rowLine
+    column = rowColumn
+  }
+  run Bytes.append(&mut output, b"\"}\n")
+  return move output
+}

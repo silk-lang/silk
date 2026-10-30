@@ -5,10 +5,12 @@
 Writes the report of an unhandled error or a trap to a descriptor, with fixed limits.
 
 ## When to use
-The native and WASI runtimes (`silk.platform.native.start`, `silk.platform.wasi.start` and
-`silk.platform.native.diagnostics`) use `NativeReport` to print an unhandled error and its call
-path to standard error, and `ErrorForm` to print the error's value after it. Use them in a
-custom runtime.
+The native and wasm runtimes (`silk.platform.native.start`, `silk.platform.wasi.start`,
+`silk.platform.wasm.start` and `silk.platform.native.diagnostics`) use `NativeReport` to print
+an unhandled error and its call path to standard error, and `ErrorForm` to print the error's
+value after it. Use them in a custom runtime. On `wasm32-unknown-unknown`, which has no
+descriptors, every report goes to the module's report buffer, which the host reads through the
+exported `silk_report` and `silk_report_length`.
 
 ## Details
 A report is lines of text:
@@ -51,4 +53,4 @@ This module declares no public items.
 
 Category: Native platform.
 
-Profiles: `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.
+Profiles: `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu-no-libc`.

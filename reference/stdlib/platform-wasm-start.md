@@ -15,7 +15,7 @@ calls the exported `main` function with no arguments and gets an `i32` exit stat
 |---|---|
 | `i32` | The value |
 | `()` | `0` |
-| `Effect<() ! E>` | `0` on success, `1` on a failure (the payload is dropped first) |
+| `Effect<() ! E>` | `0` on success, `1` on a failure (`E` must implement `Debug`) |
 
 The application runs inside its own `Execution`. Nested transfers complete before the exported
 `main` returns. If the application is still parked at the end, or the `Execution` cannot be
@@ -29,7 +29,14 @@ thread `NativeThread.spawn` starts.
   requirement.
 - The complete application call must satisfy `Intrinsic.NonParking`. To park on an external
   event, the application must own that wait itself.
-- There is no diagnostic observer. A fatal trap stays a bare machine trap, with no cleanup.
+- A module has no descriptors, so the report of an unhandled error or a trap goes to a buffer in
+  the module. The host reads it through the exported `silk_report` (its address) and
+  `silk_report_length`; the std lib's `host/wasm-runner.mjs` prints it, and rejects a trap with
+  an `Error` that carries it. A report longer than 8 KiB is cut short.
+- A fatal trap writes its report, then executes `unreachable`, with no cleanup.
+- A debug build keeps its DWARF out of the module: `silk build` writes it as
+  `<output>.debug.wasm`, which the module names in `external_debug_info`, and a source map as
+  `<output>.map`, which it names in `sourceMappingURL`. Serve both beside the module.
 
 Public declarations: 0.
 

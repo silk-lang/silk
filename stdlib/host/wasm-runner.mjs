@@ -4,6 +4,11 @@
 // starts every thread as another Worker that instantiates the same module on the same memory.
 // A module without threads runs the same way. Browsers use `runWasm` from a module script.
 //
+// A module reports an unhandled error or a trap into a buffer of its own memory, which it exports
+// as `silk_report` (the address) and `silk_report_length`. `runWasm` passes the report of a `main`
+// that fails to `options.onReport` (by default `console.error`), and rejects a trap with a
+// `SilkError` that carries the report, and whose stack is the report followed by the engine's.
+//
 // Every Worker is created by the top-level thread, never by another Worker, so a thread that
 // returns cannot take the threads it started with it. `main` never runs on the top-level thread,
 // because a browser's main thread may not block in `memory.atomic.wait32`.
@@ -59,6 +64,41 @@ const importedMemory = (bytes) => {
   return undefined
 }
 
+/** A Silk program stopped by a trap, with the report the program wrote. */
+export class SilkError extends Error {
+  constructor(report, cause) {
+    super(report.split('\n', 1)[0] || String(cause?.message ?? cause), { cause: engineError(cause) })
+    this.name = 'SilkError'
+    /** The whole report, such as `fatal trap: ...` and its `at` lines. */
+    this.report = report
+    this.stack = `${report}${cause?.stack ?? String(cause)}`
+  }
+}
+
+const reportLength = (instance) => {
+  const length = instance.exports.silk_report_length
+  return typeof length === 'function' ? length() >>> 0 : 0
+}
+
+// The report text `instance` wrote after its first `from` bytes.
+const readReport = (instance, from) => {
+  const address = instance.exports.silk_report
+  const memory = instance.exports.memory
+  const end = reportLength(instance)
+  if (typeof address !== 'function' || !(memory instanceof WebAssembly.Memory) || end <= from) return ''
+  // A shared memory's view must be copied before it is decoded.
+  const view = new Uint8Array(memory.buffer, (address() >>> 0) + from, end - from).slice()
+  return new TextDecoder().decode(view)
+}
+
+// The engine's error from a trap's parts, as a `WebAssembly.RuntimeError` again.
+const engineError = (parts) => {
+  if (parts instanceof Error || typeof parts !== 'object' || parts === null) return parts
+  const error = new WebAssembly.RuntimeError(parts.message)
+  if (parts.stack !== undefined) error.stack = parts.stack
+  return error
+}
+
 // The imports one instance needs. `spawn` starts a thread from a start argument and answers its
 // positive id, or a negative error.
 const importsFor = (memory, spawn, parallelism) => ({
@@ -78,11 +118,21 @@ const runRole = (data, post) => {
     data.module,
     importsFor(data.memory, spawn, data.parallelism),
   )
-  if (data.role === 'main') {
-    post({ kind: 'exit', status: instance.exports.main() })
-  } else {
-    instance.exports.wasi_thread_start(data.thread, data.argument)
-    post({ kind: 'done' })
+  const exported = data.memory === undefined ? instance.exports : { ...instance.exports, memory: data.memory }
+  const reading = { exports: exported }
+  const before = reportLength(reading)
+  try {
+    if (data.role === 'main') {
+      const status = instance.exports.main()
+      post({ kind: 'exit', status, report: readReport(reading, before) })
+    } else {
+      instance.exports.wasi_thread_start(data.thread, data.argument)
+      post({ kind: 'done' })
+    }
+  } catch (error) {
+    if (!(error instanceof WebAssembly.RuntimeError)) throw error
+    // Not every browser can clone an Error into a message, so its parts cross instead.
+    post({ kind: 'trap', error: { name: error.name, message: error.message, stack: error.stack }, report: readReport(reading, before) })
   }
 }
 
@@ -116,11 +166,16 @@ export const runWasm = async (bytes, options = {}) => {
           start({ role: 'thread', thread: message.thread, argument: message.argument }).catch(
             (error) => finish(reject, error),
           )
-        } else if (message.kind === 'exit') finish(resolve, message.status)
+        } else if (message.kind === 'exit') {
+          if (message.report) (options.onReport ?? ((report) => console.error(report.trimEnd())))(message.report)
+          finish(resolve, message.status)
+        }
         else if (message.kind === 'done') {
           workers.delete(worker)
           worker.terminate()
-        } else if (message.kind === 'trap') finish(reject, message.error)
+        } else if (message.kind === 'trap') {
+          finish(reject, message.report ? new SilkError(message.report, message.error) : engineError(message.error))
+        }
       })
     }
     start({ role: 'main' }).catch((error) => finish(reject, error))
