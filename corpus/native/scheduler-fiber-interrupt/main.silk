@@ -1,0 +1,150 @@
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.concurrency.fiber { Cancelled, Failure, Fiber, FirstLeft, FirstRight, Outcome, Success }
+import silk.concurrency.local_scheduler { LocalScheduler, StalledError }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.concurrency.scheduler { Scheduler, TaskIdExhaustedError }
+import silk.mem.shared { Shared }
+import silk.core.ownership { Drop }
+import silk.core.result { Result }
+
+// Counts the Drop hooks that cancellation runs in parked children.
+struct Counter { dropped: i32 }
+struct Guard { counter: Shared<Counter> }
+fn bump(counter: &mut Counter) -> () { counter.dropped = counter.dropped + 1 return () }
+impl Drop for Guard {
+  fn drop(self: &mut Guard) -> () { Shared.withMut(&self.counter, bump) return () }
+}
+fn readDropped(counter: &mut Counter) -> i32 { return counter.dropped }
+
+struct Problem { code: i32 }
+
+// Parks for an hour, far beyond the program's run, unless it is cancelled.
+effect fn sleeper(counter: Shared<Counter>) -> i32 ? &mut MonotonicClock {
+  let guard = Guard { counter: move counter }
+  run Effect.sleep(3600000000000)
+  drop guard
+  return 1
+}
+
+// Forks a sleeping grandchild, then sleeps itself.
+effect fn parent(counter: Shared<Counter>) -> i32
+  ! OutOfMemoryError | TaskIdExhaustedError
+  ? &mut Scheduler | &mut MonotonicClock {
+  let child = run Fiber<i32, never>.forkChild(sleeper(Shared<Counter>.clone(&counter)))
+  drop child
+  return run sleeper(move counter)
+}
+
+effect fn quick(value: i32) -> i32 {
+  run Fiber.yieldNow()
+  return value
+}
+
+effect fn failing(code: i32) -> i32 ! Problem {
+  run Fiber.yieldNow()
+  fail Problem { code: code }
+}
+
+// Whether the Drop hooks have not run exactly `expected` times.
+effect fn dropped(counter: &Shared<Counter>, expected: i32) -> bool {
+  return Shared<Counter>.withMut<i32>(counter, readDropped) != expected
+}
+
+effect fn isCancelled(outcome: Outcome<i32, never>) -> bool {
+  let Outcome<i32, never> { value } = move outcome
+  return match move value { Cancelled {} => true _ => false }
+}
+
+effect fn successValue<E>(outcome: Outcome<i32, E>) -> i32 {
+  let Outcome<i32, E> { value } = move outcome
+  return match move value { Success<i32> { value: found } => found _ => -1 }
+}
+
+effect fn root() -> i32
+  ! OutOfMemoryError | TaskIdExhaustedError | Cancelled | Problem
+  ? &mut Scheduler | &mut MonotonicClock {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let counter = run Shared<Counter>.make(Counter { dropped: 0 })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+
+  // Interrupting a parked child cancels it and its grandchild, and runs their Drop hooks first.
+  let tree = run Fiber<i32, OutOfMemoryError | TaskIdExhaustedError>.forkChild(parent(Shared<Counter>.clone(&counter)))
+  run Fiber.yieldNow()
+  run Fiber.yieldNow()
+  let treeOutcome = run tree.interrupt()
+  let Outcome<i32, OutOfMemoryError | TaskIdExhaustedError> { value: treeValue } = move treeOutcome
+  let treeCancelled = match move treeValue { Cancelled {} => true _ => false }
+  if !treeCancelled { return 1 }
+  if run dropped(&counter, 2) { return 2 }
+
+  // A child that already finished keeps its real outcome.
+  let finished = run Fiber<i32, never>.forkChild(quick(9))
+  run Fiber.yieldNow()
+  run Fiber.yieldNow()
+  let finishedOutcome = run finished.interrupt()
+  let finishedValue = run successValue<never>(move finishedOutcome)
+  if finishedValue != 9 { return 3 }
+
+  // awaitEither returns the first outcome and the other Fiber, still running.
+  let slow = run Fiber<i32, never>.forkChild(sleeper(Shared<Counter>.clone(&counter)))
+  let fast = run Fiber<i32, never>.forkChild(quick(5))
+  let first = run slow.awaitEither<i32, never>(move fast)
+  let remaining = match move first {
+    FirstLeft<i32, never, i32, never> { outcome: _, other: _ } => { return 4 }
+    FirstRight<i32, never, i32, never> { other, outcome } => {
+      let fastValue = run successValue<never>(move outcome)
+      if fastValue != 5 { return 5 }
+      move other
+    }
+  }
+  if run dropped(&counter, 2) { return 6 }
+  let remainingOutcome = run remaining.interrupt()
+  let remainingCancelled = run isCancelled(move remainingOutcome)
+  if !remainingCancelled { return 7 }
+  if run dropped(&counter, 3) { return 8 }
+
+  // race takes the first result and cancels the loser.
+  let loser = run Fiber<i32, never>.forkChild(sleeper(Shared<Counter>.clone(&counter)))
+  let winner = run Fiber<i32, never>.forkChild(quick(42))
+  let won = run loser.race(move winner)
+  if won != 42 { return 9 }
+  if run dropped(&counter, 4) { return 10 }
+
+  // A typed failure of the winner is raised unchanged.
+  let failed = run Fiber<i32, Problem>.forkChild(failing(17))
+  let parked = run Fiber<i32, Problem>.forkChild(failingSleeper(Shared<Counter>.clone(&counter)))
+  let raced = run Effect.result(failed.race(move parked))
+  let code = match move raced {
+    Result<i32, Problem | Cancelled>.Failure { error } => match move error {
+      Problem { code } => code
+      Cancelled {} => -1
+    }
+    Result<i32, Problem | Cancelled>.Success { value: _ } => -2
+  }
+  if code != 17 { return 11 }
+  if run dropped(&counter, 5) { return 12 }
+  return won
+}
+
+effect fn failingSleeper(counter: Shared<Counter>) -> i32 ! Problem ? &mut MonotonicClock {
+  return run sleeper(move counter)
+}
+
+effect fn program() -> i32
+  ! OutOfMemoryError | TaskIdExhaustedError | Cancelled | Problem | StalledError {
+  let mut clock = OsMonotonicClock.make()
+  let mut scheduler = LocalScheduler.make()
+  return run scheduler.execute<i32, OutOfMemoryError | TaskIdExhaustedError | Cancelled | Problem>(root())
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  return 100
+}
+
+pub fn main() -> i32 {
+  return run Effect.catchAll(program(), failed)
+}

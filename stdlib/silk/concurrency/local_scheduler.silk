@@ -83,7 +83,7 @@ import silk.system.monotonic_clock { MonotonicClock }
 import silk.core.option { Option }
 import silk.core.ownership { Copy, Drop }
 import silk.core.result { Result }
-import silk.concurrency.scheduler { Scheduler, NoRequest, NoSubmission, PendingPublication, PendingRequest, PendingSubmission, PreparedTask, PublicationResponse, ResponsePublished, ResponseRejected, ResponseWaiting, SubmissionSlot, TaskId, TaskIdExhaustedError, TaskMailbox }
+import silk.concurrency.scheduler { Scheduler, NoRequest, NoSubmission, PendingCancel, PendingCancellation, PendingPublication, PendingRequest, PendingSubmission, PreparedTask, PublicationResponse, ResponsePublished, ResponseRejected, ResponseWaiting, SubmissionSlot, TaskId, TaskIdExhaustedError, TaskMailbox }
 import silk.mem.shared { Shared }
 import silk.system.system_clock { SystemClock }
 import silk.system.system_clock { Instant }
@@ -166,7 +166,7 @@ impl LocalScheduler {
     }
     let context = run Shared<TaskContext>.make(move contextValue)
       |> Effect.provideMut<Allocator>(&mut allocator)
-    let prepared = run Fiber<RootTaskCompleted, RootTaskNeverFailed>.prepare()
+    let prepared = run Fiber<RootTaskCompleted, RootTaskNeverFailed>.prepare(TaskId { value: 0 })
       |> Effect.provideMut<Allocator>(&mut allocator)
     let rootState = run Shared<RootState<A, E>>.make(RootState<A, E> {
       phase: RootPending {},
@@ -732,7 +732,7 @@ effect fn prepareChild<A: 'static, E: 'static>(
     timerInbox: childTimerInbox,
   } = move reserved
   let mut allocator = Allocator.systemAllocatorProvider()
-  let prepared = run Fiber<A, E>.prepare() |> Effect.provideMut<Allocator>(&mut allocator)
+  let prepared = run Fiber<A, E>.prepare(identity) |> Effect.provideMut<Allocator>(&mut allocator)
   let response = run Shared<PublicationResponse>.make(PublicationResponse {
     phase: ResponseWaiting {},
   }) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -788,7 +788,18 @@ effect fn prepareChild<A: 'static, E: 'static>(
   )
 }
 
-impl Scheduler for SchedulerClient { prepare: SchedulerClient.prepareChild }
+effect fn requestChildCancel(self: &mut SchedulerClient, target: TaskId) -> PendingCancellation {
+  return PendingCancellation {
+    parentMailbox: Shared<TaskMailbox>.clone(&self.mailbox),
+    parentSubmission: Shared<SubmissionSlot>.clone(&self.submission),
+    target: target,
+  }
+}
+
+impl Scheduler for SchedulerClient {
+  prepare: SchedulerClient.prepareChild
+  requestCancel: SchedulerClient.requestChildCancel
+}
 
 struct Initial {}
 struct Running {}
@@ -1482,7 +1493,7 @@ fn takeRequest(
 
 fn takeSubmission(
   slot: &mut SubmissionSlot,
-) -> NoSubmission | PendingSubmission {
+) -> NoSubmission | PendingSubmission | PendingCancel {
   return Intrinsic.replace(slot.phase, NoSubmission {})
 }
 
@@ -1726,6 +1737,7 @@ effect fn processPublication(driver: &mut Driver, identity: TaskId) -> () {
         move response,
         move task,
       )
+      PendingCancel { target } => finishCancelRequest(move driver, identity, target, move wake, move response)
     }
   }
 }
@@ -1744,9 +1756,22 @@ fn missingSubmission() -> Shared<SubmissionSlot> {
   return Intrinsic.trap("LocalScheduler: the task has no submission slot")
 }
 
+fn finishCancelRequest(
+  driver: &mut Driver,
+  requester: TaskId,
+  target: TaskId,
+  wake: Wake,
+  response: Shared<PublicationResponse>,
+) -> () {
+  drop response
+  cancelRequested(move driver, requester, target)
+  Execution.wake(move wake)
+  return ()
+}
+
 fn finishNoRequest(
   response: Shared<PublicationResponse>,
-  phase: NoSubmission | PendingSubmission,
+  phase: NoSubmission | PendingSubmission | PendingCancel,
 ) -> () {
   drop response
   drop phase
@@ -1878,7 +1903,21 @@ fn finishCompletedTask(driver: &mut Driver, identity: TaskId) -> () {
   let found = readTaskLinks(&mut driver.store.tasks, identity, &mut links)
   if !found { return () }
 
-  let mut child = links.firstChild
+  queueChildren(&mut driver.*, links.firstChild)
+  unlinkFromParent(&mut driver.*, identity, links.parent)
+  let timerWake = disarmRegistration(&mut driver.store, identity)
+  let removed = HashMap<TaskId, TaskEntry>.remove(&mut driver.store.tasks, identity)
+  releaseRemoved(move removed)
+  drop timerWake
+  if identity.value == 0 { driver.rootComplete = true }
+
+  drainCancellations(&mut driver.*)
+  return ()
+}
+
+// Queues each child of a task for cancellation.
+fn queueChildren(driver: &mut Driver, firstChild: NoLink | TaskLink) -> () {
+  let mut child = firstChild
   while hasLink(child) {
     let childIdentity = requireIdentity(child)
     let mut childLinks = TaskLinks {
@@ -1905,7 +1944,11 @@ fn finishCompletedTask(driver: &mut Driver, identity: TaskId) -> () {
     }
   }
 
-  let parent = links.parent
+  return ()
+}
+
+// Removes a task from its parent's list of children.
+fn unlinkFromParent(driver: &mut Driver, identity: TaskId, parent: NoLink | TaskLink) -> () {
   if hasLink(parent) {
     let parentIdentity = requireIdentity(parent)
     let mut parentLinks = TaskLinks {
@@ -1959,12 +2002,11 @@ fn finishCompletedTask(driver: &mut Driver, identity: TaskId) -> () {
     }
   }
 
-  let timerWake = disarmRegistration(&mut driver.store, identity)
-  let removed = HashMap<TaskId, TaskEntry>.remove(&mut driver.store.tasks, identity)
-  releaseRemoved(move removed)
-  drop timerWake
-  if identity.value == 0 { driver.rootComplete = true }
+  return ()
+}
 
+// Cancels each queued task and queues its children in turn.
+fn drainCancellations(driver: &mut Driver) -> () {
   while hasLink(driver.cancellationHead) {
     let selected = requireIdentity(driver.cancellationHead)
     let mut selectedLinks = TaskLinks {
@@ -2021,6 +2063,37 @@ fn finishCompletedTask(driver: &mut Driver, identity: TaskId) -> () {
       drop selectedTimerWake
     }
   }
+  return ()
+}
+
+// Cancels `target` and its unfinished descendants for a request from `requester`. A target that
+// already finished, or that is the requester or one of its ancestors, is left as it is.
+fn cancelRequested(driver: &mut Driver, requester: TaskId, target: TaskId) -> () {
+  let mut ancestor: NoLink | TaskLink = TaskLink { identity: requester }
+  while hasLink(ancestor) {
+    let selected = requireIdentity(ancestor)
+    if selected.value == target.value { return () }
+    let mut selectedLinks = TaskLinks {
+      parent: NoLink {},
+      firstChild: NoLink {},
+      nextSibling: NoLink {},
+    }
+    let selectedFound = readTaskLinks(&mut driver.store.tasks, selected, &mut selectedLinks)
+    ancestor = NoLink {}
+    if selectedFound { ancestor = selectedLinks.parent }
+  }
+  let mut links = TaskLinks {
+    parent: NoLink {},
+    firstChild: NoLink {},
+    nextSibling: NoLink {},
+  }
+  let found = readTaskLinks(&mut driver.store.tasks, target, &mut links)
+  if !found { return () }
+  unlinkFromParent(&mut driver.*, target, links.parent)
+  let nextWork = driver.cancellationHead
+  let linked = HashMap.withMut(&mut driver.store.tasks, target, installCancellationLink(nextWork))
+  if linked { driver.cancellationHead = TaskLink { identity: target } }
+  drainCancellations(&mut driver.*)
   return ()
 }
 

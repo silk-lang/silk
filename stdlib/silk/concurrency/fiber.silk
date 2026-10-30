@@ -6,6 +6,9 @@
 //! | [`forkChild`] | Start structured child work under the current `Scheduler` |
 //! | [`join`] | Wait for a child, and raise its failure in the current effect |
 //! | [`await`] | Wait for a child, and get success, failure or cancellation as data |
+//! | [`interrupt`] | Cancel a child that is still running, and get its final outcome |
+//! | [`awaitEither`] | Wait for the first of two children, and keep the other running |
+//! | [`race`] | Take the result of whichever of two children finishes first, and cancel the other |
 //! | [`yieldNow`] | Let other ready tasks run before the current task continues |
 //!
 //! Run the root program with `silk.concurrency.local_scheduler`, which provides the `Scheduler` service.
@@ -25,8 +28,12 @@
 //! - [`join`] raises the typed failure of the child unchanged, or [`Cancelled`].
 //!
 //! # Gotchas
-//! Dropping a Fiber stops the observation. It does not cancel the task. The scheduler cancels
-//! unfinished children when the root finishes.
+//! Dropping a Fiber stops the observation. It does not cancel the task; [`interrupt`] does. The
+//! scheduler cancels unfinished children when their parent finishes.
+//!
+//! Cancellation takes effect only at a park, such as a wait for a timer or for another Fiber. It
+//! runs `Drop` hooks and non-parking finalizers (`Effect.ensuringNonParking`,
+//! `Effect.useReleaseNonParking`), but not `Effect.ensuring` finalizers.
 //!
 //! # Examples
 //! ## Fork two children and join them
@@ -143,7 +150,7 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.concurrency.execution { Execution, Wake }
 import silk.text.format { Debug, Format, Formatter }
 import silk.system.monotonic_clock { MonotonicClock }
-import silk.concurrency.scheduler { Scheduler, PendingPublication, PendingRequest, PendingSubmission, PreparedTask, PublicationResponse, ResponsePublished, ResponseRejected, ResponseWaiting, SubmissionSlot, TaskIdExhaustedError, TaskMailbox }
+import silk.concurrency.scheduler { Scheduler, PendingCancel, PendingCancellation, PendingPublication, PendingRequest, PendingSubmission, PreparedTask, PublicationResponse, ResponsePublished, ResponseRejected, ResponseWaiting, SubmissionSlot, TaskId, TaskIdExhaustedError, TaskMailbox }
 import silk.mem.shared { Shared }
 import silk.io.writer { Writer, WriterError }
 
@@ -158,7 +165,9 @@ struct CompletionPayload<A, E> {
 
 struct NoWaiter {}
 struct PendingWaiter { wake: Wake }
-struct SignalPending { waiter: NoWaiter | PendingWaiter }
+// The second signal of an `awaitEither`: its completion takes the Wake parked in `partner`.
+struct PartnerWaiter { partner: Shared<CompletionSignal> }
+struct SignalPending { waiter: NoWaiter | PendingWaiter | PartnerWaiter }
 struct SignalReady {}
 struct SignalCancelled {}
 
@@ -204,11 +213,12 @@ pub struct CompletionCanceller {
 ///
 /// # Gotchas
 ///
-/// Dropping the handle stops the observation. It does not cancel its task. The scheduler cancels
-/// unfinished children when the root finishes.
+/// Dropping the handle stops the observation. It does not cancel its task; [`interrupt`] does. The
+/// scheduler cancels unfinished children when their parent finishes.
 pub struct Fiber<A, E> {
   payload: Shared<CompletionPayload<A, E>>,
   signal: Shared<CompletionSignal>,
+  identity: TaskId,
 }
 
 impl<A, E> Fiber<A, E> {
@@ -221,8 +231,9 @@ impl<A, E> Fiber<A, E> {
   /// # Details
   ///
   /// No endpoint becomes visible until both Shared completion cells exist. Observation and
-  /// notification allocate no further storage.
-  pub effect fn prepare() -> PreparedFiber<A, E>
+  /// notification allocate no further storage. `identity` is the task the Fiber observes, which
+  /// [`interrupt`] asks the Scheduler to cancel.
+  pub effect fn prepare(identity: TaskId) -> PreparedFiber<A, E>
   ! OutOfMemoryError
   ? &mut Allocator {
     let payload = run Shared<CompletionPayload<A, E>>.make(CompletionPayload<A, E> {
@@ -240,7 +251,7 @@ impl<A, E> Fiber<A, E> {
         signal: move producerSignal,
       },
       canceller: CompletionCanceller { signal: move cancellerSignal },
-      fiber: Fiber<A, E> { payload: move payload, signal: move signal },
+      fiber: Fiber<A, E> { payload: move payload, signal: move signal, identity: identity },
     }
   }
 
@@ -297,9 +308,78 @@ impl<A, E> Fiber<A, E> {
   /// A terminal Fiber returns immediately. A pending Fiber parks the current Execution and installs
   /// exactly one Wake. Observation and resumption allocate no storage.
   pub effect<'env> fn await<'env>(self: Self) -> Outcome<A, E> {
-    let Fiber<A, E> { payload, signal } = move self
+    let Fiber<A, E> { payload, signal, identity } = move self
     let selected = Shared.withMut(&signal, inspectSignal)
     return run finishObservation(move payload, move signal, move selected)
+  }
+
+  /// Cancels the task unless it already finished, and returns its final outcome.
+  ///
+  /// # When to use
+  ///
+  /// Use `interrupt` to stop a child whose result is no longer needed, such as the loser of a race.
+  ///
+  /// # Details
+  ///
+  /// The current task parks until the Scheduler has processed the request. Cancelling drops the
+  /// child's parked Execution and its unfinished descendants, which runs their `Drop` hooks and
+  /// their non-parking finalizers (`Effect.ensuringNonParking`, `Effect.useReleaseNonParking`).
+  /// Thus that cleanup has finished when `interrupt` returns. A child that finished before the
+  /// request gives its real outcome, so the result is `Success` or `Failure` as well as
+  /// `Cancelled`.
+  ///
+  /// # Gotchas
+  ///
+  /// A child is cancelled only at a park, such as a wait for a timer or for another Fiber. Code
+  /// between two parks always runs to its end. `Effect.ensuring` finalizers do not run on
+  /// cancellation. Interrupting the current task or one of its ancestors does nothing, and the
+  /// await that follows then waits for that task to finish.
+  pub effect<'env> fn interrupt<'env>(self: Self) -> Outcome<A, E> ? &mut Scheduler {
+    let pending = run Scheduler.requestCancel(self.identity)
+    run submitCancellation(move pending)
+    return run Fiber<A, E>.await(move self)
+  }
+
+  /// Waits for the first of two tasks to finish, and returns its outcome with the other Fiber.
+  ///
+  /// # When to use
+  ///
+  /// Use `awaitEither` to act on whichever child finishes first. Use [`race`] when the other child
+  /// should then be cancelled.
+  ///
+  /// # Details
+  ///
+  /// If both tasks have finished, `self` wins. The other Fiber is returned unobserved and still
+  /// running, so the caller can await, interrupt, or drop it. Like [`await`], a failure or a
+  /// cancellation of the winner is data in its `Outcome`.
+  pub effect<'env> fn awaitEither<'env, B: 'env, F: 'env>(
+    self: Self,
+    other: Fiber<B, F>,
+  ) -> FirstLeft<A, E, B, F> | FirstRight<A, E, B, F> {
+    return run awaitFirst<A, E, B, F>(move self, move other)
+  }
+
+  /// Waits for the first of two tasks to finish, cancels the other, and returns the first result.
+  ///
+  /// # When to use
+  ///
+  /// Use `race` to take whichever of two equivalent computations finishes first, such as two
+  /// replicas of one request.
+  ///
+  /// # Details
+  ///
+  /// The first task to finish wins, whatever its outcome: a typed failure of the winner is raised
+  /// unchanged, and a cancelled winner raises [`Cancelled`]. The other task is cancelled with
+  /// [`interrupt`] before `race` returns, so its cleanup has finished. If both have finished,
+  /// `self` wins.
+  pub effect<'env> fn race<'env>(self: Self, other: Fiber<A, E>) -> A
+  ! E | Cancelled
+  ? &mut Scheduler {
+    let first = run awaitFirst<A, E, A, E>(move self, move other)
+    return match move first {
+      FirstLeft<A, E, A, E> { outcome, other: loser } => run finishRace<A, E>(move outcome, move loser)
+      FirstRight<A, E, A, E> { other: loser, outcome } => run finishRace<A, E>(move outcome, move loser)
+    }
   }
 
   /// Consumes a Fiber, returns its success value, and propagates failure or cancellation.
@@ -357,6 +437,22 @@ pub struct Failure<E> {
 /// A Fiber outcome that reports structured task cancellation.
 pub struct Cancelled {}
 
+/// The first task of an [`awaitEither`] finished first.
+pub struct FirstLeft<A, E, B, F> {
+  /// The outcome of the first task.
+  pub outcome: Outcome<A, E>,
+  /// The second task, unobserved and possibly still running.
+  pub other: Fiber<B, F>,
+}
+
+/// The second task of an [`awaitEither`] finished first.
+pub struct FirstRight<A, E, B, F> {
+  /// The first task, unobserved and possibly still running.
+  pub other: Fiber<A, E>,
+  /// The outcome of the second task.
+  pub outcome: Outcome<B, F>,
+}
+
 impl Debug for Cancelled {
   /// Writes `Cancelled`.
   effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
@@ -391,7 +487,7 @@ fn storeFailure<A, E>(self: &mut CompletionPayload<A, E>, error: E) -> () {
   return ()
 }
 
-struct PublishedSignal { waiter: NoWaiter | PendingWaiter }
+struct PublishedSignal { waiter: NoWaiter | PendingWaiter | PartnerWaiter }
 
 fn publishReady(self: &mut CompletionSignal) -> PublishedSignal {
   let previous = Intrinsic.replace(self.phase, SignalReady {})
@@ -423,10 +519,44 @@ fn retainPublishedReadiness(self: &mut CompletionSignal) -> PublishedSignal {
 
 fn notify(published: PublishedSignal) -> () {
   let PublishedSignal { waiter } = move published
+  return wakeWaiter(move waiter)
+}
+
+fn wakeWaiter(waiter: NoWaiter | PendingWaiter | PartnerWaiter) -> () {
   return match move waiter {
     NoWaiter {} => ()
     PendingWaiter { wake } => Execution.wake(move wake)
+    PartnerWaiter { partner } => wakePartner(move partner)
   }
+}
+
+fn wakePartner(partner: Shared<CompletionSignal>) -> () {
+  let taken = Shared.withMut(&partner, takeWaiter)
+  drop partner
+  return wakeWaiter(move taken)
+}
+
+// Takes the waiter of a pending signal and leaves it pending with none.
+fn takeWaiter(self: &mut CompletionSignal) -> NoWaiter | PendingWaiter | PartnerWaiter {
+  let previous = Intrinsic.replace(self.phase, SignalCancelled {})
+  return match move previous {
+    SignalPending { waiter } => keepPending(move self, move waiter)
+    SignalReady {} => keepReady(move self)
+    SignalCancelled {} => NoWaiter {}
+  }
+}
+
+fn keepPending(
+  self: &mut CompletionSignal,
+  waiter: NoWaiter | PendingWaiter | PartnerWaiter,
+) -> NoWaiter | PendingWaiter | PartnerWaiter {
+  self.phase = SignalPending { waiter: NoWaiter {} }
+  return move waiter
+}
+
+fn keepReady(self: &mut CompletionSignal) -> NoWaiter | PendingWaiter | PartnerWaiter {
+  self.phase = SignalReady {}
+  return NoWaiter {}
 }
 
 struct ObservePending {}
@@ -464,7 +594,7 @@ fn rejectOccupiedWaiter(
 
 fn installPending(
   self: &mut CompletionSignal,
-  waiter: NoWaiter | PendingWaiter,
+  waiter: NoWaiter | PendingWaiter | PartnerWaiter,
   wake: Wake,
 ) -> WaitInstalled | WaitAlreadyOccupied {
   return match move waiter {
@@ -474,7 +604,17 @@ fn installPending(
       move retained,
       move wake,
     )
+    PartnerWaiter { partner } => rejectPartnerWaiter(move self, move partner, move wake)
   }
+}
+
+fn rejectPartnerWaiter(
+  self: &mut CompletionSignal,
+  partner: Shared<CompletionSignal>,
+  rejected: Wake,
+) -> WaitAlreadyOccupied {
+  self.phase = SignalPending { waiter: PartnerWaiter { partner: move partner } }
+  return WaitAlreadyOccupied { wake: move rejected }
 }
 
 fn retainReadyWaiter(
@@ -669,6 +809,133 @@ effect<'env> fn publishPending<A: 'env, E: 'env, 'env>(
   run Execution.park(move registration)
   run finishPublication(move response)
   return move fiber
+}
+
+fn installCancel(slot: &mut SubmissionSlot, target: TaskId) -> () {
+  let previous = Intrinsic.replace(slot.phase, PendingCancel { target: target })
+  drop previous
+  return ()
+}
+
+fn registerCancellation(
+  wake: Wake,
+  mailbox: Shared<TaskMailbox>,
+  submission: Shared<SubmissionSlot>,
+  target: TaskId,
+) -> PublicationGuard {
+  let stored = Shared.withMut(&submission, installCancel(target))
+  let requested = Shared.withMut(&mailbox, installPublicationRequest(move wake))
+  drop mailbox
+  drop submission
+  return PublicationGuard {}
+}
+
+effect fn submitCancellation(pending: PendingCancellation) -> () {
+  let PendingCancellation { parentMailbox, parentSubmission, target } = move pending
+  let registration = registerCancellation(move parentMailbox, move parentSubmission, target)
+  run Execution.park(move registration)
+  return ()
+}
+
+fn isSettled(self: &mut CompletionSignal) -> bool {
+  return match &self.phase {
+    SignalPending { .. } => false
+    _ => true
+  }
+}
+
+fn clearWaiter(signal: &Shared<CompletionSignal>) -> () {
+  let cleared = Shared.withMut(signal, takeWaiter)
+  drop cleared
+  return ()
+}
+
+// Links a pending second signal to the first, so its completion wakes the waiter parked there. A
+// settled second signal returns the link, for the caller to fire at once.
+fn installPartner(
+  self: &mut CompletionSignal,
+  partner: Shared<CompletionSignal>,
+) -> NoWaiter | PendingWaiter | PartnerWaiter {
+  let previous = Intrinsic.replace(self.phase, SignalCancelled {})
+  return match move previous {
+    SignalPending { waiter } => linkPartner(move self, move waiter, move partner)
+    SignalReady {} => firePartnerReady(move self, move partner)
+    SignalCancelled {} => PartnerWaiter { partner: move partner }
+  }
+}
+
+fn linkPartner(
+  self: &mut CompletionSignal,
+  waiter: NoWaiter | PendingWaiter | PartnerWaiter,
+  partner: Shared<CompletionSignal>,
+) -> NoWaiter | PendingWaiter | PartnerWaiter {
+  drop waiter
+  self.phase = SignalPending { waiter: PartnerWaiter { partner: move partner } }
+  return NoWaiter {}
+}
+
+fn firePartnerReady(
+  self: &mut CompletionSignal,
+  partner: Shared<CompletionSignal>,
+) -> NoWaiter | PendingWaiter | PartnerWaiter {
+  self.phase = SignalReady {}
+  return PartnerWaiter { partner: move partner }
+}
+
+struct EitherGuard {}
+
+fn registerEither(
+  wake: Wake,
+  first: Shared<CompletionSignal>,
+  second: Shared<CompletionSignal>,
+) -> EitherGuard {
+  let installed = Shared.withMut(&first, installWaiter(move wake))
+  finishInstallation(move installed)
+  let partner = Shared<CompletionSignal>.clone(&first)
+  let linked = Shared.withMut(&second, installPartner(move partner))
+  wakeWaiter(move linked)
+  drop first
+  drop second
+  return EitherGuard {}
+}
+
+effect<'env> fn awaitFirst<A: 'env, E: 'env, B: 'env, F: 'env, 'env>(
+  left: Fiber<A, E>,
+  right: Fiber<B, F>,
+) -> FirstLeft<A, E, B, F> | FirstRight<A, E, B, F> {
+  let leftSettled = Shared<CompletionSignal>.withMut<bool>(&left.signal, isSettled)
+  let rightSettled = Shared<CompletionSignal>.withMut<bool>(&right.signal, isSettled)
+  if !leftSettled && !rightSettled {
+    let registration = registerEither(
+      Shared<CompletionSignal>.clone(&left.signal),
+      Shared<CompletionSignal>.clone(&right.signal),
+    )
+    run Execution.park(move registration)
+    clearWaiter(&left.signal)
+    clearWaiter(&right.signal)
+  }
+  if Shared<CompletionSignal>.withMut<bool>(&left.signal, isSettled) {
+    let outcome = run Fiber<A, E>.await(move left)
+    return FirstLeft<A, E, B, F> { outcome: move outcome, other: move right }
+  }
+  let outcome = run Fiber<B, F>.await(move right)
+  return FirstRight<A, E, B, F> { other: move left, outcome: move outcome }
+}
+
+effect<'env> fn finishRace<A: 'env, E: 'env, 'env>(
+  outcome: Outcome<A, E>,
+  loser: Fiber<A, E>,
+) -> A
+! E | Cancelled
+? &mut Scheduler {
+  let lost = run Fiber<A, E>.interrupt(move loser)
+  drop lost
+  let Outcome<A, E> { value } = move outcome
+  return match move value {
+    Success<A> { value: success } => move success
+    Failure<E> { error } => run raiseFailure<A, E>(move error)
+    Cancelled {} => run raiseCancellation<A>()
+  }
 }
 
 struct YieldGuard {}
