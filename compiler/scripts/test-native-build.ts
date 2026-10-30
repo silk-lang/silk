@@ -403,6 +403,23 @@ const program = Effect.gen(function* () {
     '--debug', 'true', '--optimization', 'none', '--emit', 'llvm-ir'], directory, { ...process.env, SILK_CLANG: sentinel })
   assert.equal(variablesIr.status, 0, variablesIr.stderr)
   assert.match(yield* fs.readFileString(join(directory, 'variables.ll')), /#dbg_declare\(ptr %[\w.]+, !\d+, !DIExpression\(\), !\d+\)/)
+  // The slots and parameter spills before a function's first statement carry no location, so a
+  // debugger's prologue ends after them and a breakpoint on the function reads its parameters.
+  const variablesBitcode = yield* invoke(silk, ['build', 'variables.silk', '-o', 'variables.bc', '--stdlib', standardLibrary,
+    '--debug', 'true', '--optimization', 'none', '--emit', 'llvm-bitcode'], directory, { ...process.env, SILK_CLANG: clang })
+  assert.equal(variablesBitcode.status, 0, variablesBitcode.stderr)
+  const fromBitcode = yield* invoke(join(dirname(clang), 'llvm-dis'), ['variables.bc', '-o', 'variables-bitcode.ll'], directory)
+  assert.equal(fromBitcode.status, 0, fromBitcode.stderr)
+  for (const listing of ['variables.ll', 'variables-bitcode.ll']) {
+    const text = yield* fs.readFileString(join(directory, listing))
+    const subprogram = text.match(/^(!\d+) = distinct !DISubprogram\(name: "variables\.pick"/m)?.[1]
+    assert.ok(subprogram, listing)
+    // Its body up to the first located instruction holds the slots and a spill of each parameter.
+    const body = text.slice(text.indexOf(`!dbg ${subprogram} {\n`))
+    const opening = body.slice(0, body.indexOf(', !dbg '))
+    assert.match(opening, /^\s*%[\w.]+ = alloca /m, listing)
+    assert.ok((opening.match(/^\s*store /gm)?.length ?? 0) >= 3, listing)
+  }
   const fromText = yield* invoke(clang, ['-x', 'ir', '-c', 'variables.ll', '-o', 'variables-text.o'], directory)
   assert.equal(fromText.status, 0, fromText.stderr)
   const variablesObject = yield* invoke(silk, ['build', 'variables.silk', '-o', 'variables.o', '--stdlib', standardLibrary,
@@ -981,7 +998,23 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang, SILK_LLDB: lldb },
   )
   assert.equal(debugged.status, 0, debugged.stderr)
-  assert.match(debugged.stdout, /^--\n\S*\/build\/llvm\/[^/]+\/debug\/native-build\nfirst\n--stdlib\n$/)
+  // Before the program, LLDB gets a summary that shows a `string` by its length.
+  const stringSummary = /^-o\nscript def silk_string\(value, internal\): [^\n]+\n-o\ntype summary add -x '\^string\(<\.\+>\)\?\$' -F silk_string\n/
+  const debuggedProgram = /--\n\S*\/build\/llvm\/[^/]+\/debug\/native-build\nfirst\n--stdlib\n$/
+  assert.match(debugged.stdout, new RegExp(stringSummary.source + debuggedProgram.source))
+  // An empty `SILK_LLDB` is unset: `debug` uses `lldb` on PATH.
+  const lldbDirectory = join(directory, 'lldb-path')
+  yield* fs.makeDirectory(lldbDirectory)
+  yield* fs.copyFile(lldb, join(lldbDirectory, 'lldb'))
+  yield* fs.chmod(join(lldbDirectory, 'lldb'), 0o755)
+  const defaulted = yield* invoke(
+    silk,
+    ['debug', '--stdlib', standardLibrary],
+    directory,
+    { ...process.env, SILK_CLANG: clang, SILK_LLDB: '', PATH: `${lldbDirectory}:${process.env.PATH ?? ''}` },
+  )
+  assert.equal(defaulted.status, 0, defaulted.stderr)
+  assert.match(defaulted.stdout, new RegExp(stringSummary.source + /--\n\S*\/debug\/native-build\n$/.source))
   const nativeCore = yield* invoke(
     silk,
     ['run', '--stdlib', standardLibrary, '--coredump', 'core.dump'],
