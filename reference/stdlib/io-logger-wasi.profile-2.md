@@ -19,7 +19,7 @@ a component imports it only when it provides [`WasiLogger`](#WasiLogger). A comp
 
 Each call passes the level, the context given to [`WasiLogger.make`](#WasiLogger.impl.make), and the formatted message.
 The logger formats into a 512-byte buffer on the stack, so a longer message is passed as several
-records, in order. The logger does not allocate.
+records, in order, each ending on a whole character. The logger does not allocate.
 
 ## Errors
 None. `wasi:logging` cannot refuse a message.
@@ -65,7 +65,7 @@ A `Logger` provider that passes each formatted message, its level and a fixed co
 
 ### Details
 
-A message longer than 512 bytes is passed as several records, in order.
+A message longer than 512 bytes is passed as several records, in order, each ending on a whole character.
 
 <a id="WasiLogger.impl"></a>
 
