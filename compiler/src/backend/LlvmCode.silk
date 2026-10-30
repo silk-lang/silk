@@ -919,10 +919,13 @@ effect fn pairField(writer: &mut Writer, pair: u64, index: usize) -> u64 ! OutOf
 }
 
 /// Shared module definitions, emitted into every unit: the fatal dispatch helper and the foreign
-/// personality.
-pub effect fn declarations(target: &Target) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+/// personality. An unoptimized build (`fastPath`) for a target that lists frames also gets the
+/// helper's frame walk (`listsFrames`).
+pub effect fn declarations(target: &Target, fastPath: bool) -> Bytes ! OutOfMemoryError ? &mut Allocator {
   let mut writer = run writerFor(target, false)
-  run defineFatalDispatch(&mut writer, target)
+  let frames = listsFrames(target, fastPath)
+  run defineFatalDispatch(&mut writer, target, frames)
+  if frames { run defineFrameStep(&mut writer, target) }
   run defineForeignPersonality(&mut writer)
   run defineGuardedReclaim(&mut writer)
   return run Module.serialize(&writer.module)
@@ -982,7 +985,11 @@ effect fn defineForeignPersonality(writer: &mut Writer) -> () ! OutOfMemoryError
 // cause's pool handle, or `0`, the trap reason and its site label (failure observer note N7). A
 // null observer reports nothing. A record without an adapter is an execution's trap record, which
 // forwards to the observer of the drive running it, without a cause.
-effect fn defineFatalDispatch(writer: &mut Writer, target: &Target) -> () ! OutOfMemoryError ? &mut Allocator {
+//
+// With `frames`, event 6 carries no cause. The helper then walks the stack and reports each
+// listed caller frame as event 8 with its name (`defineFrameStep`), and the cause last as event 9,
+// so the call chain reads right below the trap site.
+effect fn defineFatalDispatch(writer: &mut Writer, target: &Target, frames: bool) -> () ! OutOfMemoryError ? &mut Allocator {
   let word = wordSize(target)
   let bits = word * 8
   let void = run voidType(&mut writer.*)
@@ -1070,13 +1077,217 @@ effect fn defineFatalDispatch(writer: &mut Writer, target: &Target) -> () ! OutO
   let callbackParameters = [pointer, pointer, byte, wordTy, wordTy, pointer, wordTy, pointer, wordTy, pointer, pointer, pointer]
   let callbackType = run functionType(&mut writer.*, wordTy, &callbackParameters)
   let event = run Module.int(&mut writer.*.module, byte, 6)
-  let arguments = [callable, state, event, first, zero, reasonData, reasonLength, originData, originLength, null, null, null]
+  let mut reported = first
+  if frames { reported = zero }
+  let arguments = [callable, state, event, reported, zero, reasonData, reasonLength, originData, originLength, null, null, null]
   let answer = run Module.call(&mut writer.*.module, callbackType, callback, &arguments, 0, false)
   Module.setName(&mut writer.*.module, answer, Bitcode.plain(Bitcode.prefix(b"answer")))
+  if frames {
+    // The walk record `{callback, callable, state, count, site, site length}` the frame step
+    // reads.
+    let walkType = run Module.structure(&mut writer.*.module, &[pointer, pointer, pointer, wordTy, pointer, wordTy])
+    let walk = run Module.alloca(&mut writer.*.module, walkType, usize.toU64(word))
+    Module.setName(&mut writer.*.module, walk, Bitcode.plain(Bitcode.prefix(b"walk")))
+    run Module.store(&mut writer.*.module, callback, walk, usize.toU64(word), false)
+    let callableSlot = run byteOffset(&mut writer.*, walk, word)
+    run Module.store(&mut writer.*.module, callable, callableSlot, usize.toU64(word), false)
+    let stateSlot = run byteOffset(&mut writer.*, walk, word * 2)
+    run Module.store(&mut writer.*.module, state, stateSlot, usize.toU64(word), false)
+    let countSlot = run byteOffset(&mut writer.*, walk, word * 3)
+    run Module.store(&mut writer.*.module, zero, countSlot, usize.toU64(word), false)
+    let siteSlot = run byteOffset(&mut writer.*, walk, word * 4)
+    run Module.store(&mut writer.*.module, originData, siteSlot, usize.toU64(word), false)
+    let siteLengthSlot = run byteOffset(&mut writer.*, walk, word * 5)
+    run Module.store(&mut writer.*.module, originLength, siteLengthSlot, usize.toU64(word), false)
+    let int32 = run integerType(&mut writer.*, 32)
+    let stepParameters = [pointer, pointer]
+    let stepType = run functionType(&mut writer.*, int32, &stepParameters)
+    let step = run Module.functionRef(&mut writer.*.module, b"silk.diagnostic.frame", stepType)
+    let walkParameters = [pointer, pointer]
+    let walkArguments = [step, walk]
+    let walked = run callNamed(&mut writer.*, b"_Unwind_Backtrace", int32, &walkParameters, &walkArguments)
+    let causeBlock = run labelled(&mut writer.*, b"reportCause")
+    let caused = run compareOf(&mut writer.*, Bitcode.intNe(), first, zero)
+    run branchIf(&mut writer.*, caused, causeBlock, done)
+    startBlock(&mut writer.*, causeBlock)
+    let causeEvent = run Module.int(&mut writer.*.module, byte, 9)
+    let causeArguments = [callable, state, causeEvent, first, zero, null, zero, null, zero, null, null, null]
+    let causeAnswer = run Module.call(&mut writer.*.module, callbackType, callback, &causeArguments, 0, false)
+  }
   run branch(&mut writer.*, done)
   startBlock(&mut writer.*, done)
   run Module.retVoid(&mut writer.*.module)
   return run Module.endBody(&mut writer.*.module)
+}
+
+// Whether a build lists each function in the frame table a trap's report walks: an unoptimized
+// one, which keeps every function out of line, for a native target, whose unwinder walks the stack.
+fn listsFrames(target: &Target, fastPath: bool) -> bool {
+  return fastPath && !same(Target.objectFormat(target), b"wasm")
+}
+
+// The section of the frame table, and the symbols the linker defines at its bounds.
+fn framesSection(target: &Target) -> &'static [u8] {
+  if same(Target.objectFormat(target), b"macho") { return b"__DATA,__silk_frames" }
+  return b"silk_frames"
+}
+
+fn framesStart(target: &Target) -> &'static [u8] {
+  if same(Target.objectFormat(target), b"macho") { return b"\x01section$start$__DATA$__silk_frames" }
+  return b"__start_silk_frames"
+}
+
+fn framesStop(target: &Target) -> &'static [u8] {
+  if same(Target.objectFormat(target), b"macho") { return b"\x01section$end$__DATA$__silk_frames" }
+  return b"__stop_silk_frames"
+}
+
+// The `_Unwind_Backtrace` callback of the fatal helper's walk: `silk.diagnostic.frame(context,
+// walk)` looks the frame's function start up in the frame table, `{function, name}` entries the
+// linker gathers into one section. Each listed frame is reported as event 8 with its name, except
+// a first one whose name leads the trap's site label (`module.function (module:line:column)`):
+// that is the trapping function, which the site already names. The walk stops after `frameLimit`
+// listed frames.
+effect fn defineFrameStep(writer: &mut Writer, target: &Target) -> () ! OutOfMemoryError ? &mut Allocator {
+  let word = wordSize(target)
+  let bits = word * 8
+  let pointer = run pointerType(&mut writer.*)
+  let wordTy = run integerType(&mut writer.*, bits)
+  let byte = run integerType(&mut writer.*, 8)
+  let int32 = run integerType(&mut writer.*, 32)
+  let parameters = [pointer, pointer]
+  let ty = run functionType(&mut writer.*, int32, &parameters)
+  Module.beginAttributes(&mut writer.*.module)
+  let encoding: [u64; 4] = [0, Bitcode.attrNoInline(), 0, Bitcode.attrCold()]
+  run Module.attributeGroup(&mut writer.*.module, Bitcode.positionFunction(), &encoding)
+  let attributes = run Module.endAttributes(&mut writer.*.module)
+  let function = run Module.defineFunction(&mut writer.*.module, b"silk.diagnostic.frame", ty, Bitcode.linkInternal(), attributes)
+  let names = [Bitcode.plain(Bitcode.prefix(b"context")), Bitcode.plain(Bitcode.prefix(b"walk"))]
+  run Module.beginBody(&mut writer.*.module, function, &parameters, &names)
+  let context = Bitcode.local(0)
+  let walk = Bitcode.local(1)
+  let entry = run labelled(&mut writer.*, b"entry")
+  let lookup = run labelled(&mut writer.*, b"lookup")
+  let scan = run labelled(&mut writer.*, b"scan")
+  let test = run labelled(&mut writer.*, b"test")
+  let advance = run labelled(&mut writer.*, b"advance")
+  let found = run labelled(&mut writer.*, b"found")
+  let firstFrame = run labelled(&mut writer.*, b"first")
+  let compare = run labelled(&mut writer.*, b"compare")
+  let space = run labelled(&mut writer.*, b"space")
+  let report = run labelled(&mut writer.*, b"report")
+  let next = run labelled(&mut writer.*, b"next")
+  let stop = run labelled(&mut writer.*, b"stop")
+  let null = run nullOf(&mut writer.*)
+  let zero = run Module.zero(&mut writer.*.module, wordTy)
+  let one = run Module.int(&mut writer.*.module, wordTy, 1)
+  startBlock(&mut writer.*, entry)
+  let countAddress = run byteOffset(&mut writer.*, walk, word * 3)
+  let count = run Module.load(&mut writer.*.module, wordTy, countAddress, usize.toU64(word), false)
+  Module.setName(&mut writer.*.module, count, Bitcode.plain(Bitcode.prefix(b"count")))
+  let limit = run Module.int(&mut writer.*.module, wordTy, usize.toU64(frameLimit()))
+  let exhausted = run compareOf(&mut writer.*, Bitcode.intUgt(), count, limit)
+  run branchIf(&mut writer.*, exhausted, stop, lookup)
+  startBlock(&mut writer.*, lookup)
+  let startParameters = [pointer]
+  let startArguments = [context]
+  let start = run callNamed(&mut writer.*, b"_Unwind_GetRegionStart", wordTy, &startParameters, &startArguments)
+  Module.setName(&mut writer.*.module, start, Bitcode.plain(Bitcode.prefix(b"start")))
+  let entryType = run Module.pair(&mut writer.*.module, pointer, pointer)
+  let first = run Module.declareWeakObject(&mut writer.*.module, framesStart(target), entryType)
+  let last = run Module.declareWeakObject(&mut writer.*.module, framesStop(target), entryType)
+  run branch(&mut writer.*, scan)
+  startBlock(&mut writer.*, scan)
+  let following = run Module.reserve(&mut writer.*.module)
+  let atIncoming = [first, lookup, following, advance]
+  let at = run Module.phi(&mut writer.*.module, pointer, &atIncoming)
+  Module.setName(&mut writer.*.module, at, Bitcode.plain(Bitcode.prefix(b"at")))
+  let more = run compareOf(&mut writer.*, Bitcode.intUlt(), at, last)
+  run branchIf(&mut writer.*, more, test, next)
+  startBlock(&mut writer.*, test)
+  let listed = run loadPointer(&mut writer.*, at, word)
+  let listedWord = run Module.cast(&mut writer.*.module, Bitcode.castPtrToInt(), listed, wordTy)
+  let hit = run compareOf(&mut writer.*, Bitcode.intEq(), listedWord, start)
+  run branchIf(&mut writer.*, hit, found, advance)
+  startBlock(&mut writer.*, advance)
+  let after = run byteOffset(&mut writer.*, at, word * 2)
+  Module.bind(&mut writer.*.module, following, after)
+  run branch(&mut writer.*, scan)
+  startBlock(&mut writer.*, found)
+  let counted = run binaryOf(&mut writer.*, Bitcode.opAdd(), count, one)
+  run Module.store(&mut writer.*.module, counted, countAddress, usize.toU64(word), false)
+  let nameAddress = run byteOffset(&mut writer.*, at, word)
+  let name = run loadPointer(&mut writer.*, nameAddress, word)
+  let nameData = run loadPointer(&mut writer.*, name, word)
+  let nameLengthAddress = run byteOffset(&mut writer.*, name, word)
+  let nameLength = run Module.load(&mut writer.*.module, wordTy, nameLengthAddress, usize.toU64(word), false)
+  let trapping = run compareOf(&mut writer.*, Bitcode.intEq(), count, zero)
+  run branchIf(&mut writer.*, trapping, firstFrame, report)
+  // The first listed frame is skipped when the site label is its name followed by ` (`.
+  startBlock(&mut writer.*, firstFrame)
+  let siteSlot = run byteOffset(&mut writer.*, walk, word * 4)
+  let site = run loadPointer(&mut writer.*, siteSlot, word)
+  let siteLengthSlot = run byteOffset(&mut writer.*, walk, word * 5)
+  let siteLength = run Module.load(&mut writer.*.module, wordTy, siteLengthSlot, usize.toU64(word), false)
+  let shorter = run compareOf(&mut writer.*, Bitcode.intUlt(), nameLength, siteLength)
+  run branchIf(&mut writer.*, shorter, compare, report)
+  startBlock(&mut writer.*, compare)
+  let compareParameters = [pointer, pointer, wordTy]
+  let compareArguments = [nameData, site, nameLength]
+  let compared = run callNamed(&mut writer.*, b"memcmp", int32, &compareParameters, &compareArguments)
+  let int32Zero = run Module.zero(&mut writer.*.module, int32)
+  let leading = run compareOf(&mut writer.*, Bitcode.intEq(), compared, int32Zero)
+  run branchIf(&mut writer.*, leading, space, report)
+  startBlock(&mut writer.*, space)
+  let afterName = run indexedOffset(&mut writer.*, site, nameLength)
+  let nextByte = run Module.load(&mut writer.*.module, byte, afterName, 1, false)
+  let blank = run Module.int(&mut writer.*.module, byte, 32)
+  let named = run compareOf(&mut writer.*, Bitcode.intEq(), nextByte, blank)
+  run branchIf(&mut writer.*, named, next, report)
+  startBlock(&mut writer.*, report)
+  let callback = run loadPointer(&mut writer.*, walk, word)
+  let callableSlot = run byteOffset(&mut writer.*, walk, word)
+  let callable = run loadPointer(&mut writer.*, callableSlot, word)
+  let stateSlot = run byteOffset(&mut writer.*, walk, word * 2)
+  let state = run loadPointer(&mut writer.*, stateSlot, word)
+  let callbackParameters = [pointer, pointer, byte, wordTy, wordTy, pointer, wordTy, pointer, wordTy, pointer, pointer, pointer]
+  let callbackType = run functionType(&mut writer.*, wordTy, &callbackParameters)
+  let event = run Module.int(&mut writer.*.module, byte, 8)
+  let arguments = [callable, state, event, zero, zero, nameData, nameLength, null, zero, null, null, null]
+  let answer = run Module.call(&mut writer.*.module, callbackType, callback, &arguments, 0, false)
+  run branch(&mut writer.*, next)
+  // `_URC_NO_REASON` continues the walk; `_URC_END_OF_STACK` ends it.
+  startBlock(&mut writer.*, next)
+  let continuing = run Module.int(&mut writer.*.module, int32, 0)
+  run Module.ret(&mut writer.*.module, continuing)
+  startBlock(&mut writer.*, stop)
+  let ended = run Module.int(&mut writer.*.module, int32, 5)
+  run Module.ret(&mut writer.*.module, ended)
+  return run Module.endBody(&mut writer.*.module)
+}
+
+// The most caller frames one trap reports; a deeper chain, such as a runaway recursion, ends
+// there.
+fn frameLimit() -> usize { return 64 }
+
+// In a build that lists frames, adds the entry `{defined, name}` of a function that has a frame
+// name to the frame table the fatal helper's walk reads (`defineFrameStep`).
+effect fn frameEntry(writer: &mut Writer, function: &MirFunction, target: &Target, defined: u64) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  if !listsFrames(target, writer.fastPath) || Bytes.length(&function.frame) == usize.ZERO { return () }
+  let label = run staticString(&mut writer.*, Bytes.asSlice(&function.frame), wordSize(target) * 8)
+  let pointer = run pointerType(&mut writer.*)
+  let ty = run Module.pair(&mut writer.*.module, pointer, pointer)
+  let elements = [defined, label]
+  let initializer = run Module.aggregate(&mut writer.*.module, ty, &elements)
+  let mut name = run Bytes.copy(Bytes.asSlice(&writer.symbol))
+  run Bytes.append(&mut name, b".frame")
+  let entry = run Module.defineObject(&mut writer.*.module, Bytes.asSlice(&name), ty, Bitcode.linkExternal(), false, initializer)
+  Module.setHidden(&mut writer.*.module, entry)
+  Module.setAlignment(&mut writer.*.module, entry, usize.toU64(wordSize(target)))
+  let section = run Module.section(&mut writer.*.module, framesSection(target))
+  Module.setSection(&mut writer.*.module, entry, section)
+  return ()
 }
 
 // Branches to a trap when `condition` holds. Under an observer, the trap first reports `reason` at
@@ -5214,6 +5425,7 @@ pub effect fn emit(
       resetFunction(&mut writer)
       run emitStep(&mut writer, function, target, layouts, foreign, identities, &suspended, &stepping, Bytes.asSlice(&base))
     }
+    run frameEntry(&mut writer, function, target, defined)
     return run Module.serialize(&writer.module)
   }
   run beginFunction(&mut writer, defined, &lanes)
@@ -5241,6 +5453,7 @@ pub effect fn emit(
   }
   run Module.endBody(&mut writer.module)
   run defineTables(&mut writer, functionTy, defined)
+  run frameEntry(&mut writer, function, target, defined)
   return run Module.serialize(&writer.module)
 }
 
