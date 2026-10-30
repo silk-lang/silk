@@ -659,11 +659,99 @@ const program = Effect.gen(function* () {
     WebAssembly.Module.exports(wasmModule)
       .map((entry) => entry.name)
       .sort(),
-    ['main', 'memory'],
-    'a module exports only its named C exports and its memory',
+    ['main', 'memory', 'silk_report', 'silk_report_length'],
+    'a module exports only its named C exports, its memory and its report buffer',
   )
   const wasmMain = new WebAssembly.Instance(wasmModule, {}).exports.main as () => number
   assert.equal(wasmMain(), 42)
+  // A trap and an unhandled error write their Silk report into the module, and the std lib's
+  // runner turns it into an Error whose stack names the module's frames (#2599).
+  const runner = (yield* Effect.promise(
+    () => import(pathToFileURL(join(standardLibrary, 'host/wasm-runner.mjs')).href),
+  )) as {
+    runWasm: (bytes: Uint8Array, options?: { onReport?: (report: string) => void }) => Promise<number>
+    SilkError: new (...values: Array<unknown>) => Error & { report: string }
+  }
+  yield* fs.writeFileString(
+    join(directory, 'trap.silk'),
+    [
+      'fn pick(values: &[i32], at: usize) -> i32 { return values[at] }',
+      'fn outer(at: usize) -> i32 { let values: [i32; 2] = [1, 2] return pick(&values, at) }',
+      'pub fn main() -> i32 { return outer(5) }',
+      '',
+    ].join('\n'),
+  )
+  yield* fs.writeFileString(
+    join(directory, 'failure.silk'),
+    [
+      'import silk.io.writer {Writer, WriterError}',
+      'import silk.text.format {Debug, Format, Formatter}',
+      'pub struct ConfigError { pub code: i32 }',
+      'impl Debug for ConfigError {',
+      '  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {',
+      '    return run Format.debugFields(self, "ConfigError", &mut formatter)',
+      '  }',
+      '}',
+      'effect fn load(code: i32) -> i32 ! ConfigError { if code > 0 { fail ConfigError { code: code } } return code }',
+      'pub effect fn main() -> () ! ConfigError { let code = run load(7) }',
+      '',
+    ].join('\n'),
+  )
+  for (const name of ['trap', 'failure']) {
+    const built = yield* invoke(
+      silk,
+      ['build', `${name}.silk`, '-o', `${name}.wasm`, '--stdlib', standardLibrary, '--target', 'wasm32-unknown-unknown',
+        '--optimization', 'none', '--debug', 'true'],
+      directory,
+      { ...process.env, SILK_CLANG: clang },
+    )
+    assert.equal(built.status, 0, built.stderr)
+  }
+  // A debug browser module ships without its DWARF: the module with it is `<output>.debug.wasm`,
+  // and a source map derived from its lines is `<output>.map`, each named by a custom section.
+  const shipped = new WebAssembly.Module(yield* fs.readFile(join(directory, 'trap.wasm')))
+  const sectionText = (name: string) =>
+    WebAssembly.Module.customSections(shipped, name).map((section) => {
+      const bytes = new Uint8Array(section)
+      return new TextDecoder().decode(bytes.subarray(1, 1 + bytes[0]))
+    })
+  assert.deepEqual(WebAssembly.Module.customSections(shipped, '.debug_info'), [])
+  assert.deepEqual(sectionText('external_debug_info'), ['trap.wasm.debug.wasm'])
+  assert.deepEqual(sectionText('sourceMappingURL'), ['trap.wasm.map'])
+  const withDwarf = new WebAssembly.Module(yield* fs.readFile(join(directory, 'trap.wasm.debug.wasm')))
+  assert.equal(WebAssembly.Module.customSections(withDwarf, '.debug_line').length, 1)
+  const sourceMap = JSON.parse(yield* fs.readFileString(join(directory, 'trap.wasm.map'))) as {
+    version: number
+    sources: Array<string>
+    sourcesContent: Array<string | null>
+    mappings: string
+  }
+  assert.equal(sourceMap.version, 3)
+  const trapSource = sourceMap.sources.findIndex((path) => path.endsWith('/trap.silk'))
+  assert.ok(trapSource >= 0, sourceMap.sources.join(', '))
+  assert.equal(sourceMap.sourcesContent[trapSource], yield* fs.readFileString(join(directory, 'trap.silk')))
+  assert.match(sourceMap.mappings, /^[A-Za-z0-9+/]+(,[A-Za-z0-9+/]+)*$/)
+  const trapBytes = yield* fs.readFile(join(directory, 'trap.wasm'))
+  const trapped = yield* Effect.promise(() =>
+    runner.runWasm(trapBytes).then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+  )
+  assert.ok(trapped instanceof runner.SilkError, String(trapped))
+  assert.equal(trapped.message, 'fatal trap: index out of bounds')
+  assert.match(trapped.report, /^fatal trap: index out of bounds\n {2}at trap\.pick \(trap:1:\d+\)\n/)
+  assert.match(trapped.stack ?? '', /trap\.outer/, 'the engine stack names the callers from the name section')
+  const reports: Array<string> = []
+  const failureBytes = yield* fs.readFile(join(directory, 'failure.wasm'))
+  const failedStatus = yield* Effect.promise(() =>
+    runner.runWasm(failureBytes, { onReport: (report) => reports.push(report) })
+  )
+  assert.equal(failedStatus, 1)
+  assert.match(
+    reports.join(''),
+    /^unhandled error: failure\.ConfigError\n {2}at failure\.load \(failure:9:\d+\)\n {2}at failure\.main \(failure:10:\d+\)\nunhandled value: ConfigError \{ code: 7 \}\n$/,
+  )
   // Clang's generic wasm CPU enables bulk memory only from Clang 19, and the runtime needs it: the
   // compiler asks for it, so a Clang whose default leaves it off still builds the module.
   const withoutBulkMemory = join(directory, 'clang-without-bulk-memory')
