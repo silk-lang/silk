@@ -6,6 +6,8 @@
 //! 3. In a fiber, start more fibers with [`Pool.fork`], and wait for one with [`PoolFiber.join`]
 //!    or [`PoolFiber.await`].
 //! 4. Stop a fiber and get its final outcome with [`PoolFiber.interrupt`].
+//! 5. Wait for the first of two fibers with [`PoolFiber.awaitEither`], or keep the first result
+//!    and cancel the other with [`PoolFiber.race`].
 //!
 //! # Details
 //! A pool fiber is a `Transferable` lazy effect, packaged with `Execution.makeTransferable`. Thus
@@ -28,7 +30,7 @@
 //!
 //! # Errors
 //! - [`ThreadPool.make`] fails with `SpawnError` or `OutOfMemoryError`.
-//! - [`Pool.fork`] fails with `OutOfMemoryError`.
+//! - [`Pool.fork`], [`PoolFiber.awaitEither`] and [`PoolFiber.race`] fail with `OutOfMemoryError`.
 //! - [`Pool.block`] and [`PoolFiber.join`] raise the typed failure of the fiber unchanged, or
 //!   `Cancelled`. [`PoolFiber.await`] returns them as data.
 //!
@@ -36,8 +38,8 @@
 //! - Fiber bodies, results and failures must be `Transferable` and `'static`.
 //! - In a fiber, wait for anything other than a [`PoolFiber`] with `Execution.parkTransferable`. A
 //!   call that blocks the native thread, such as [`Pool.block`], holds up a whole worker.
-//! - Call [`PoolFiber.join`], [`PoolFiber.await`], [`PoolFiber.interrupt`] and [`Pool.yieldNow`]
-//!   only from inside a pool fiber.
+//! - Call the waiting operations of [`PoolFiber`] and [`Pool.yieldNow`] only from inside a pool
+//!   fiber.
 //! - A fiber that never parks runs to the end, even after an interrupt.
 //! - The pool uses the system allocator for its own storage, not the `Allocator` of the caller.
 //!
@@ -154,11 +156,13 @@ import silk.concurrency.thread { Concurrent, Transferable }
 import silk.num.usize
 import silk.concurrency.work_queue { Steal, Stealer, WorkDeque, Worker }
 
-// A fiber's completion. `Running` holds whoever waits for it: a parked fiber or a blocked thread.
+// A fiber's completion. `Running` holds whoever waits for it: a parked fiber, a blocked thread, or
+// a fiber that waits for the first of two fibers through a shared hub.
 struct NoWaiter {}
 struct FiberWaiter { wake: TransferableWake }
 struct ThreadWaiter { unparker: Unparker }
-struct Running { waiter: NoWaiter | FiberWaiter | ThreadWaiter }
+struct HubWaiter { hub: Arc<Mutex<Hub>>, left: bool }
+struct Running { waiter: NoWaiter | FiberWaiter | ThreadWaiter | HubWaiter }
 struct Done<A, E> { value: Success<A> | Failure<E> | Cancelled }
 struct Collected {}
 struct Completion<A, E> { phase: Running | Done<A, E> | Collected }
@@ -222,6 +226,192 @@ impl<A, E> PoolFiber<A, E> {
     requestCancel(self.pool.get(), self.id, self.ticket)
     return run PoolFiber<A, E>.await(move self)
   }
+
+  /// Parks the calling fiber until the first of two fibers ends, and returns its outcome with the
+  /// other fiber.
+  ///
+  /// # When to use
+  /// Use `awaitEither` to act on whichever fiber ends first. Use [`race`] when the other fiber
+  /// should then be cancelled.
+  ///
+  /// # Details
+  /// If both had already ended before the call, `self` wins. The other fiber is returned
+  /// unobserved and possibly still running, so the caller can await, interrupt, or drop it. A
+  /// failure or a cancellation of the winner is data in its `Outcome`.
+  ///
+  /// # Errors
+  /// Fails with `OutOfMemoryError` when the shared wait cannot be allocated. It allocates only when
+  /// neither fiber has ended yet.
+  ///
+  /// # Gotchas
+  /// Only a pool fiber can wait. A wait from any other place is a fatal state trap.
+  pub effect fn awaitEither<B, F>(self: Self, other: PoolFiber<B, F>) -> PoolFirstLeft<A, E, B, F> | PoolFirstRight<A, E, B, F>
+    ! OutOfMemoryError {
+    let leftDone = isDone<A, E>(self.completion.get())
+    if !leftDone && !isDone<B, F>(other.completion.get()) {
+      let mut allocator = Allocator.systemAllocatorProvider()
+      let hub = run makeHub() |> Effect.provideMut<Allocator>(&mut allocator)
+      run Execution.parkTransferable(fn(wake: TransferableWake) -> () {
+        return registerEither<A, E, B, F>(&hub, self.completion.get(), other.completion.get(), move wake)
+      })
+      clearHub<A, E>(self.completion.get())
+      clearHub<B, F>(other.completion.get())
+      if !hub.get().lock().get().left {
+        let outcome = run PoolFiber<B, F>.await(move other)
+        return PoolFirstRight<A, E, B, F> { other: move self, outcome: move outcome }
+      }
+    } else if !leftDone {
+      let outcome = run PoolFiber<B, F>.await(move other)
+      return PoolFirstRight<A, E, B, F> { other: move self, outcome: move outcome }
+    }
+    let outcome = run PoolFiber<A, E>.await(move self)
+    return PoolFirstLeft<A, E, B, F> { outcome: move outcome, other: move other }
+  }
+
+  /// Parks the calling fiber until the first of two fibers ends, cancels the other, and returns
+  /// the first result.
+  ///
+  /// # When to use
+  /// Use `race` to take whichever of two equivalent computations ends first, such as two replicas
+  /// of one request.
+  ///
+  /// # Details
+  /// The first fiber to end wins, whatever its outcome: its typed failure is raised unchanged, and
+  /// a cancelled winner raises `Cancelled`. The other fiber is cancelled with [`interrupt`] before
+  /// `race` returns, so its cleanup has finished. If both had already ended before the call,
+  /// `self` wins.
+  ///
+  /// # Errors
+  /// Fails with `OutOfMemoryError` when the shared wait cannot be allocated.
+  ///
+  /// # Gotchas
+  /// Only a pool fiber can race. A race from any other place is a fatal state trap.
+  pub effect fn race(self: Self, other: PoolFiber<A, E>) -> A ! E | Cancelled | OutOfMemoryError {
+    let first = run PoolFiber<A, E>.awaitEither<A, E>(move self, move other)
+    return match move first {
+      PoolFirstLeft<A, E, A, E> { outcome, other: loser } => run finishRace<A, E>(move outcome, move loser)
+      PoolFirstRight<A, E, A, E> { other: loser, outcome } => run finishRace<A, E>(move outcome, move loser)
+    }
+  }
+}
+
+/// The first fiber of a [`PoolFiber.awaitEither`] ended first.
+pub struct PoolFirstLeft<A, E, B, F> {
+  /// The outcome of the first fiber.
+  pub outcome: Outcome<A, E>,
+  /// The second fiber, unobserved and possibly still running.
+  pub other: PoolFiber<B, F>,
+}
+
+/// The second fiber of a [`PoolFiber.awaitEither`] ended first.
+pub struct PoolFirstRight<A, E, B, F> {
+  /// The first fiber, unobserved and possibly still running.
+  pub other: PoolFiber<A, E>,
+  /// The outcome of the second fiber.
+  pub outcome: Outcome<B, F>,
+}
+
+effect fn finishRace<A, E>(outcome: Outcome<A, E>, loser: PoolFiber<A, E>) -> A ! E | Cancelled {
+  let lost = run PoolFiber<A, E>.interrupt(move loser)
+  drop lost
+  return run raise<A, E>(move outcome)
+}
+
+// The shared wait of an `awaitEither`: the waiting fiber's Wake, taken by the first completion,
+// which records whether it was the left fiber.
+struct NoWake {}
+struct HubWake { wake: TransferableWake }
+struct Hub {
+  wake: NoWake | HubWake,
+  left: bool,
+}
+
+effect fn makeHub() -> Arc<Mutex<Hub>> ! OutOfMemoryError ? &mut Allocator {
+  let locked = run Mutex<Hub>.make(Hub { wake: NoWake {}, left: true })
+  return run Arc<Mutex<Hub>>.make(move locked)
+}
+
+fn wakeHub(hub: &Mutex<Hub>, left: bool) -> () {
+  let mut guard = hub.lock()
+  let state = guard.getMut()
+  let taken = Intrinsic.replace(state.wake, NoWake {})
+  return match move taken {
+    HubWake { wake } => firstWake(&mut state.*, move wake, left)
+    NoWake nothing => ()
+  }
+}
+
+fn firstWake(state: &mut Hub, wake: TransferableWake, left: bool) -> () {
+  state.left = left
+  Execution.wakeTransferable(move wake)
+  return ()
+}
+
+// Stores the Wake in the hub, then makes the hub the waiter of both fibers. A fiber that already
+// ended takes the Wake at once.
+fn registerEither<A, E, B, F>(
+  hub: &Arc<Mutex<Hub>>,
+  left: &Mutex<Completion<A, E>>,
+  right: &Mutex<Completion<B, F>>,
+  wake: TransferableWake,
+) -> () {
+  let mut guard = hub.get().lock()
+  let state = guard.getMut()
+  state.wake = HubWake { wake: move wake }
+  drop guard
+  installHub<A, E>(left, HubWaiter { hub: hub.clone(), left: true })
+  installHub<B, F>(right, HubWaiter { hub: hub.clone(), left: false })
+  return ()
+}
+
+fn installHub<A, E>(completion: &Mutex<Completion<A, E>>, waiter: HubWaiter) -> () {
+  let mut guard = completion.lock()
+  let state = guard.getMut()
+  let phase = Intrinsic.replace(state.phase, Collected {})
+  return match move phase {
+    Running ignored => keepHub<A, E>(&mut state.*, move waiter)
+    Done<A, E> done => {
+      state.phase = move done
+      let HubWaiter { hub, left } = move waiter
+      return wakeHub(hub.get(), left)
+    }
+    Collected nothing => ()
+  }
+}
+
+fn keepHub<A, E>(state: &mut Completion<A, E>, waiter: HubWaiter) -> () {
+  state.phase = Running { waiter: move waiter }
+  return ()
+}
+
+// Drops a hub waiter that the fiber did not use, so the hub goes away with the wait.
+fn clearHub<A, E>(completion: &Mutex<Completion<A, E>>) -> () {
+  let mut guard = completion.lock()
+  let state = guard.getMut()
+  let phase = Intrinsic.replace(state.phase, Collected {})
+  state.phase = match move phase {
+    Running { waiter } => Running { waiter: withoutHub(move waiter) }
+    Done<A, E> done => move done
+    Collected nothing => Collected {}
+  }
+  return ()
+}
+
+fn withoutHub(waiter: NoWaiter | FiberWaiter | ThreadWaiter | HubWaiter) -> NoWaiter | FiberWaiter | ThreadWaiter | HubWaiter {
+  return match move waiter {
+    HubWaiter ignored => NoWaiter {}
+    NoWaiter nothing => NoWaiter {}
+    FiberWaiter kept => move kept
+    ThreadWaiter kept => move kept
+  }
+}
+
+fn isDone<A, E>(completion: &Mutex<Completion<A, E>>) -> bool {
+  let guard = completion.lock()
+  return match &guard.get().phase {
+    Done<A, E> ignored => true
+    _ => false
+  }
 }
 
 // Takes a finished outcome, leaving `Collected`, or puts a running phase back.
@@ -280,7 +470,7 @@ fn complete<A, E>(completion: &Mutex<Completion<A, E>>, value: Success<A> | Fail
 fn publish<A, E>(
   state: &mut Completion<A, E>,
   value: Success<A> | Failure<E> | Cancelled,
-  waiter: NoWaiter | FiberWaiter | ThreadWaiter,
+  waiter: NoWaiter | FiberWaiter | ThreadWaiter | HubWaiter,
 ) -> () {
   state.phase = Done<A, E> { value: move value }
   return notify(move waiter)
@@ -291,11 +481,12 @@ fn keepFirst<A, E>(state: &mut Completion<A, E>, first: Done<A, E>) -> () {
   return ()
 }
 
-fn notify(waiter: NoWaiter | FiberWaiter | ThreadWaiter) -> () {
+fn notify(waiter: NoWaiter | FiberWaiter | ThreadWaiter | HubWaiter) -> () {
   return match move waiter {
     NoWaiter nothing => ()
     FiberWaiter { wake } => Execution.wakeTransferable(move wake)
     ThreadWaiter { unparker } => unparker.unpark()
+    HubWaiter { hub, left } => wakeHub(hub.get(), left)
   }
 }
 
