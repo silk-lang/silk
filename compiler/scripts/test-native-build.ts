@@ -414,8 +414,11 @@ const program = Effect.gen(function* () {
     const text = yield* fs.readFileString(join(directory, listing))
     const subprogram = text.match(/^(!\d+) = distinct !DISubprogram\(name: "variables\.pick"/m)?.[1]
     assert.ok(subprogram, listing)
-    const opening = new RegExp(`^define [^\\n]* !dbg ${subprogram} \\{\\n(?:\\w+:\\n)?\\s*%\\w+ = alloca [^!\\n]*\\n`, 'm')
-    assert.match(text, opening, listing)
+    // Its body up to the first located instruction holds the slots and a spill of each parameter.
+    const body = text.slice(text.indexOf(`!dbg ${subprogram} {\n`))
+    const opening = body.slice(0, body.indexOf(', !dbg '))
+    assert.match(opening, /^\s*%[\w.]+ = alloca /m, listing)
+    assert.ok((opening.match(/^\s*store /gm)?.length ?? 0) >= 3, listing)
   }
   const fromText = yield* invoke(clang, ['-x', 'ir', '-c', 'variables.ll', '-o', 'variables-text.o'], directory)
   assert.equal(fromText.status, 0, fromText.stderr)
