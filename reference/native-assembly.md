@@ -79,8 +79,8 @@ returning operand behavior on Darwin hosts, and rejection of reserved registers 
 
 **Status:** Candidate.
 
-**Rule:** `with Intrinsic.machine(naked: true, noReturn: true)` requires an unsafe, monomorphic,
-ordinary zero-argument function returning unit. An unsafe C export is allowed with this property.
+**Rule:** `@naked` and `@noReturn` require an unsafe, monomorphic, zero-argument C export
+(`export "C"`) returning unit; on any other function they report SEM0236.
 Its body contains exactly one terminal operand-free unit assembly call with side effects and
 no-return; an enclosing `return` or unsafe acknowledgement is structural. No locals, other calls,
 branches, cleanup, captures, loans or additional statements are admitted.
@@ -88,8 +88,9 @@ branches, cleanup, captures, loans or additional statements are admitted.
 **Example:**
 
 ```silk
-unsafe export "C" fn entry() -> () as "entry"
-  with Intrinsic.machine(naked: true, noReturn: true) {
+@naked
+@noReturn
+unsafe export "C" fn entry() -> () as "entry" {
   return unsafe Intrinsic.assembly<()>(
     "movq %rsp, %rdi\njmp native_entry_probe", "", "", "readwrite", true, true, ())
 }
@@ -104,8 +105,8 @@ No implicit stack realignment, alignment override, probes or instrumentation is 
 modes, effect bodies, generic/argument-bearing functions and arbitrary native attributes are rejected.
 Attributes express the validated body; actual object inspection verifies its machine shape.
 
-**Diagnostics:** Invalid property combinations and incompatible body/profile shapes diagnose at the
-property and body before backend execution.
+**Diagnostics:** Invalid directive combinations and incompatible body/profile shapes diagnose at the
+directive and body before backend execution.
 
 **Evidence:** LLVM naked prohibits IR argument use; designated debug/optimized object and independent
 C probe fixtures. Source-owned complete startup and raw OS composition remain JUL-136.

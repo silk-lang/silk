@@ -326,7 +326,8 @@ each compiled for their features.
 **Status:** Confirmed
 
 ```silk,ignore
-unsafe fn sumAvx2(values: &[u8]) -> u64 with Intrinsic.machine(features: ("avx2",)) {
+@features("avx2")
+unsafe fn sumAvx2(values: &[u8]) -> u64 {
   // Intrinsic.x86ShuffleBytes<simd<u8, 32>> is admitted here.
 }
 
@@ -334,7 +335,7 @@ let machine = CpuFeatures.detect()
 if CpuFeatures.has(&machine, "avx2") { total = unsafe sumAvx2(values) }
 ```
 
-`with Intrinsic.machine(features: ("a", "b"))` on an ordinary runtime function compiles that
+`@features("a", "b")` on an ordinary runtime function compiles that
 function for the listed CPU features of the target (PROFILE-006), their implications, and the
 profile's own features. Its body may use SIMD-007 operations those features admit. Running it on a
 CPU without them is undefined, so the function is `unsafe fn` and each caller proves the machine
@@ -348,11 +349,11 @@ different registers with and without AVX and AVX-512.
 
 **Boundary:** `Target.hasCpuFeature` keeps answering for the profile inside the function, so a
 `static if` there, and a `silk.simd.x86` (or `aarch64`, `wasm`) wrapper it calls, still sees the profile. `static fn`,
-`extern` and interface operations take no `features`. Callees are not compiled again for the
+`extern` and interface operations take no `@features`. Callees are not compiled again for the
 function's features.
 
 **Diagnostics:** An entry that is not a text literal naming a CPU feature of the target reports
-`SEM0242`. A function with `features` that is not `unsafe` reports `SEM0243`. The clause on a
+`SEM0242`. A function with `@features` that is not `unsafe` reports `SEM0243`. The directive on a
 `static`, `extern` or `export` function reports `SEM0236`.
 
 **Current compiler:** Aligned. The function's LLVM definition carries a `"target-features"`
@@ -383,7 +384,7 @@ way the target's C compilers pass the vector type of the same lanes, such as `__
 | wasm32 | 128 bits | `simd128` |
 
 **Boundary:** A mask has no C type and does not cross. A callback pointer type takes no vector. The
-profile decides the register, not the function: a function compiled with `features` (SIMD-009) passes
+profile decides the register, not the function: a function compiled with `@features` (SIMD-009) passes
 vectors to C like the rest of the program. A C static may hold a vector.
 
 **Diagnostics:** A vector in an imported C signature whose width the target's C ABI does not pass
@@ -399,7 +400,8 @@ at the call. The same vector in an exported signature reports the `c-abi-vector`
 **Status:** Confirmed
 
 ```silk,ignore
-unsafe fn encrypt(block: simd<u64, 2>, key: simd<u64, 2>) -> simd<u64, 2> with Intrinsic.machine(features: ("aes",)) {
+@features("aes")
+unsafe fn encrypt(block: simd<u64, 2>, key: simd<u64, 2>) -> simd<u64, 2> {
   return Intrinsic.x86AesEncrypt<simd<u64, 2>>(block, key)
 }
 ```
@@ -446,7 +448,8 @@ instructions themselves when the machine has them, and carry-less products).
 **Status:** Confirmed
 
 ```silk,ignore
-unsafe fn rounds(cdgh: simd<u32, 4>, abef: simd<u32, 4>, wk: simd<u32, 4>) -> simd<u32, 4> with Intrinsic.machine(features: ("sha",)) {
+@features("sha")
+unsafe fn rounds(cdgh: simd<u32, 4>, abef: simd<u32, 4>, wk: simd<u32, 4>) -> simd<u32, 4> {
   return Intrinsic.x86Sha256Rounds2<simd<u32, 4>>(cdgh, abef, wk)
 }
 ```

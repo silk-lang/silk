@@ -1421,16 +1421,16 @@ when its signature and declared behavior match exactly and its body is synchrono
 ```silk,ignore
 import silk.mem.pointer { Pointer }
 
+@callbacks("compare")
 unsafe extern "C" fn qsort(
   base: ?[*]mut i32,
   count: usize,
   size: usize,
-  compare: extern "C" fn(*const i32, *const i32) -> i32
-    with Intrinsic.foreign(memory: "read", locality: "arguments"),
-) -> () with Intrinsic.foreign(callbacks: ("compare",))
+  compare: @foreign(memory: "read", locality: "arguments") extern "C" fn(*const i32, *const i32) -> i32,
+) -> ()
 
-unsafe export "C" fn compare(left: *const i32, right: *const i32) -> i32
-  with Intrinsic.foreign(memory: "read", locality: "arguments") {
+@foreign(memory: "read", locality: "arguments")
+unsafe export "C" fn compare(left: *const i32, right: *const i32) -> i32 {
   let a = unsafe Pointer.read(left)
   let b = unsafe Pointer.read(right)
   if a < b { return -1 }
