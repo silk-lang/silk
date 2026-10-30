@@ -1812,6 +1812,14 @@ const program = Effect.gen(function* () {
   const shiftCount = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(directory, 'shiftcount'), { ...process.env, SILK_CLANG: clang })
   assert.notEqual(shiftCount.status, 0, shiftCount.stderr)
   assert.match(shiftCount.stderr, /^fatal trap: invalid shift count\n {2}at main\.main \(main:6:17\)$/m)
+  // A trap after a fiber resumes names the suspended callers of the resumed frame, which only its
+  // frame chain holds: the fiber's driver, not `work`, called `pick`'s step.
+  yield* fs.makeDirectory(join(directory, 'resumedtrap/src'), { recursive: true })
+  yield* fs.writeFileString(join(directory, 'resumedtrap/silk.toml'), '[package]\nname = "resumedtrap"\nversion = "0.1.0"\n')
+  yield* fs.writeFileString(join(directory, 'resumedtrap/src/main.silk'), 'import silk.mem.allocator { OutOfMemoryError }\nimport silk.core.effect { Effect }\nimport silk.concurrency.fiber { Cancelled, Fiber }\nimport silk.concurrency.local_scheduler { LocalScheduler, StalledError }\nimport silk.system.monotonic_clock { MonotonicClock }\nimport silk.system.monotonic_clock_native { OsMonotonicClock }\nimport silk.concurrency.scheduler { Scheduler, TaskIdExhaustedError }\nfn at(values: &[i32], index: usize) -> i32 { return values[index] }\neffect fn pick(values: &[i32], index: usize) -> i32 {\n  run Fiber.yieldNow()\n  return at(values, index)\n}\neffect fn work(index: usize) -> i32 {\n  let values = [1, 2, 3]\n  return run pick(&values, index)\n}\neffect fn root() -> i32 ! OutOfMemoryError | TaskIdExhaustedError | Cancelled ? &mut Scheduler | &mut MonotonicClock {\n  let child = run Fiber<i32, never>.forkChild(work(5))\n  return run child.join()\n}\npub effect fn main() -> i32 ! OutOfMemoryError | TaskIdExhaustedError | Cancelled | StalledError {\n  let mut clock = OsMonotonicClock.make()\n  let mut scheduler = LocalScheduler.make()\n  return run scheduler.execute<i32, OutOfMemoryError | TaskIdExhaustedError | Cancelled>(root())\n    |> Effect.provideMut<MonotonicClock>(&mut clock)\n}\n')
+  const resumedTrap = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(directory, 'resumedtrap'), { ...process.env, SILK_CLANG: clang })
+  assert.notEqual(resumedTrap.status, 0, resumedTrap.stderr)
+  assert.match(resumedTrap.stderr, /^fatal trap: index out of bounds\n {2}at main\.at \(main:8:53\)\n {2}at main\.pick\n {2}at main\.work\n {2}at main\.main\n/m)
   // A width or precision field can be any integer, so a bare literal needs no `usize` annotation.
   yield* fs.makeDirectory(join(directory, 'widthint/src'), { recursive: true })
   yield* fs.writeFileString(join(directory, 'widthint/silk.toml'), '[package]\nname = "widthint"\nversion = "0.1.0"\n')
