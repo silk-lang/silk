@@ -9,6 +9,10 @@
 // that fails to `options.onReport` (by default `console.error`), and rejects a trap with a
 // `SilkError` that carries the report, and whose stack is the report followed by the engine's.
 //
+// A module that logs through `silk.io.logger_console` imports `silk.console`. The runner passes
+// each message to `options.onLog(level, text)`, where `level` is one of `LOG_LEVELS`, and by
+// default to the console method of the level.
+//
 // Every Worker is created by the top-level thread, never by another Worker, so a thread that
 // returns cannot take the threads it started with it. `main` never runs on the top-level thread,
 // because a browser's main thread may not block in `memory.atomic.wait32`.
@@ -99,12 +103,19 @@ const engineError = (parts) => {
   return error
 }
 
+// The level names of `silk.console`, by the level number it passes.
+export const LOG_LEVELS = ['trace', 'debug', 'info', 'warning', 'error']
+
+const consoleMethods = { trace: 'debug', debug: 'debug', info: 'info', warning: 'warn', error: 'error' }
+
+const decoder = new TextDecoder()
+
 // The imports one instance needs. `spawn` starts a thread from a start argument and answers its
-// positive id, or a negative error.
-const importsFor = (memory, spawn, parallelism) => ({
+// positive id, or a negative error; `log` takes the parts of one console message.
+const importsFor = (memory, spawn, parallelism, log) => ({
   env: memory === undefined ? {} : { memory },
   wasi: { 'thread-spawn': spawn },
-  silk: { 'thread-parallelism': () => parallelism },
+  silk: { 'thread-parallelism': () => parallelism, console: log },
 })
 
 // One Worker's work: `main`, whose status it reports, or one thread.
@@ -114,12 +125,26 @@ const runRole = (data, post) => {
     post({ kind: 'spawn', thread, argument })
     return thread
   }
+  const reading = { exports: undefined }
+  // A message's parts, copied out of memory, until the part that ends it.
+  let parts = []
+  const log = (level, address, length, more) => {
+    parts.push(new Uint8Array(reading.exports.memory.buffer, address >>> 0, length >>> 0).slice())
+    if (more) return
+    const joined = new Uint8Array(parts.reduce((total, part) => total + part.length, 0))
+    let at = 0
+    for (const part of parts) {
+      joined.set(part, at)
+      at += part.length
+    }
+    parts = []
+    post({ kind: 'log', level: LOG_LEVELS[level] ?? 'info', text: decoder.decode(joined) })
+  }
   const instance = new WebAssembly.Instance(
     data.module,
-    importsFor(data.memory, spawn, data.parallelism),
+    importsFor(data.memory, spawn, data.parallelism, log),
   )
-  const exported = data.memory === undefined ? instance.exports : { ...instance.exports, memory: data.memory }
-  const reading = { exports: exported }
+  reading.exports = data.memory === undefined ? instance.exports : { ...instance.exports, memory: data.memory }
   const before = reportLength(reading)
   try {
     if (data.role === 'main') {
@@ -166,6 +191,9 @@ export const runWasm = async (bytes, options = {}) => {
           start({ role: 'thread', thread: message.thread, argument: message.argument }).catch(
             (error) => finish(reject, error),
           )
+        } else if (message.kind === 'log') {
+          const onLog = options.onLog ?? ((level, text) => console[consoleMethods[level]](text))
+          onLog(message.level, message.text)
         } else if (message.kind === 'exit') {
           if (message.report) (options.onReport ?? ((report) => console.error(report.trimEnd())))(message.report)
           finish(resolve, message.status)
