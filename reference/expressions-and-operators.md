@@ -67,7 +67,7 @@ later child even when runtime control may skip it.
 ordinary diagnostic for its own type, ownership, failure, requirement, or place boundary.
 
 **Evidence:** [call evaluation](functions-callables-and-control-flow.md#call-001--a-call-evaluates-each-argument-once-from-left-to-right),
-[aggregate TIR evaluation order](../bootstrap/packages/compiler/src/Tir.ts).
+[aggregate TIR evaluation order](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Tir.ts).
 
 ### EVAL-002 — Conditional and deferred forms state which children do not evaluate eagerly
 
@@ -189,7 +189,7 @@ qualification is not available for service operations.
 `SEM0027` or `SEM0028`. Indexing a non-indexable value reports `SEM0032`; a non-`usize` index reports
 `SEM0033`; a statically invalid index reports `SEM0034`. Calling a non-callable reports `SEM0075`.
 
-**Evidence:** [postfix parser](../bootstrap/packages/compiler/src/Parser.ts),
+**Evidence:** [postfix parser](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Parser.ts),
 indexing syntax specification,
 [callable application](functions-callables-and-control-flow.md#call-002--calls-satisfy-the-declared-positional-parameter-contract).
 
@@ -215,8 +215,8 @@ when the selected `+` operation cannot accept their precise types.
 receive a parser diagnostic at the damaged group boundary; diagnostics within the grouped
 expression remain attached to their original source.
 
-**Evidence:** [grouped expression parser](../bootstrap/packages/compiler/src/Parser.ts),
-[expression TIR](../bootstrap/packages/compiler/src/Tir.ts).
+**Evidence:** [grouped expression parser](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Parser.ts),
+[expression TIR](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Tir.ts).
 
 ### EXPR-004 — Assignment is a statement, not a value expression
 
@@ -252,7 +252,7 @@ page.
 
 **Evidence:** assignment syntax specification,
 [conditional value rule](functions-callables-and-control-flow.md#if-002--an-if-with-a-final-else-is-a-value),
-[assignment parser](../bootstrap/packages/compiler/src/Parser.ts).
+[assignment parser](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Parser.ts).
 
 ### EXPR-005 — A non-unit expression result must be used or explicitly discarded
 
@@ -279,7 +279,7 @@ writing an effect-function call alone neither runs it nor silently throws the Ef
 the programmer to bind, return, compose, or explicitly drop it.
 
 **Evidence:** [STMT-001](statements-and-discarding.md#stmt-001--a-non-unit-expression-result-must-be-handled-explicitly),
-[expression statement analysis](../bootstrap/packages/compiler/src/Elaboration.ts).
+[expression statement analysis](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Elaboration.ts).
 
 ### EXPR-006 — Expression nesting is limited to 256 active child edges
 
@@ -314,8 +314,8 @@ caught or converted to `PAR0005`.
 half-open span of the first significant token in the rejected child. One maximal rejected region
 produces one diagnostic; a later independent over-budget expression may produce its own.
 
-**Evidence:** [expression nesting actor](../bootstrap/packages/compiler/src/Parser/ExpressionNesting.ts),
-[bounded expression parser](../bootstrap/packages/compiler/src/Parser/Expression.ts),
+**Evidence:** [expression nesting actor](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Parser/ExpressionNesting.ts),
+[bounded expression parser](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Parser/Expression.ts),
 diagnostic catalog,
 bootstrap syntax specification.
 
@@ -422,8 +422,8 @@ to enclose an Effect pipeline.
 diagnostics at the damaged or unexpected operator. A well-grouped expression is then checked under
 the operand contracts below.
 
-**Evidence:** [operator metadata](../bootstrap/packages/compiler/src/Operator.ts),
-[precedence parser](../bootstrap/packages/compiler/src/Parser.ts),
+**Evidence:** [operator metadata](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Operator.ts),
+[precedence parser](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Parser.ts),
 operator syntax specification,
 [pipeline rule](functions-callables-and-control-flow.md#pipe-001--a-pipeline-invokes-one-unary-callable-after-evaluating-its-left-value).
 
@@ -458,7 +458,7 @@ reports `SEM0012` at the incompatible operand using the selected operation's exp
 types. A future user-defined contract must preserve an equally local diagnostic without falling
 back to runtime lookup.
 
-**Evidence:** [operator elaboration](../bootstrap/packages/compiler/src/Elaboration.ts),
+**Evidence:** [operator elaboration](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Elaboration.ts),
 [scalar actor modules](../stdlib/silk),
 operator pipeline tests,
 static interface evidence.
@@ -626,6 +626,7 @@ The concrete comparison operators are available as follows:
 | `f32` or `f64` of identical width | Yes        | Yes                  | Ordinary IEEE comparison                       |
 | `char`                            | Yes        | Yes                  | Unicode scalar-value order                     |
 | `string`                          | Yes        | No                   | Exact UTF-8 sequence equality                  |
+| `&[u8]` or `&mut [u8]`            | Yes        | No                   | Exact byte sequence equality                   |
 | One identical scalar enum type    | Yes        | No                   | Declared member identity                       |
 
 Every comparison returns `bool` and evaluates both operands left to right exactly once.
@@ -641,10 +642,13 @@ fn same(left: string, right: string) -> bool {
 ```
 
 Character ordering is not locale collation, normalization, or grapheme ordering. String equality
-does not normalize, case-fold, or allocate.
+does not normalize, case-fold, or allocate. Byte slice equality compares lengths, then bytes; two
+views of different validity lifetimes compare, as two strings do.
 
-**Boundary:** Structs, arrays, unions, references, slices, callable values, Effect values, and
-services do not receive implicit structural or identity equality. Boolean, string, and scalar enum
+**Boundary:** Structs, arrays, unions, references, slices other than byte slices, callable values,
+Effect values, and services do not receive implicit structural or identity equality. A shared slice
+`&[T]` implements `Equal` and `Order` element by element when `T` does, so `Equal.equals` and
+`Order.compare` accept it. Boolean, string, and scalar enum
 ordering are also unavailable. Enum equality additionally requires one canonical enum type under
 OP-011. A future user-defined equality or ordering contract must be declared explicitly; it cannot
 be inferred from representation.
@@ -652,7 +656,7 @@ be inferred from representation.
 **Diagnostics:** An unavailable comparison reports `SEM0012` at the incompatible operand under the
 current operator diagnostic model.
 
-**Evidence:** [scalar catalog](../bootstrap/packages/compiler/src/Scalar.ts),
+**Evidence:** [scalar catalog](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Scalar.ts),
 [character actor](../stdlib/silk/text/char.silk),
 string equality tests,
 character tests.
@@ -715,7 +719,7 @@ positions distinguish them without runtime inspection.
 results themselves do not produce arithmetic traps.
 
 **Evidence:** bitwise operator tests,
-[operator metadata](../bootstrap/packages/compiler/src/Operator.ts),
+[operator metadata](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Operator.ts),
 [integer actor modules](../stdlib/silk).
 
 ### OP-009 — Each overloadable operator is bound to one sealed Intrinsic interface
@@ -768,7 +772,10 @@ tests `!= Less`. Their result is `bool`.
 Operator selection uses the precise operand types. It does not use the expected result type,
 perform implicit conversion, inspect runtime tags, or choose by import order. Exactly one
 conformance must accept the operands. Its declared result becomes the expression's type. Inside a
-generic body, a bound such as `T: Add<T, T>` or `T: Order` supplies the operation.
+generic body, a bound such as `T: Add<T, T>` or `T: Order` supplies the operation. When no bound
+does, a conformance the operands apply can: under `T: Multiply<T, T>`, `scale * point` selects
+`impl<T: Multiply<T, T>> Multiply<Point<T>, Point<T>> for Scale<T>`, and the body proves that
+conformance's bounds from its own.
 
 Concrete scalar and `string` operands always use the built-in operators of OP-002 to OP-008; the
 sealed conformances for scalars (INTR-008), such as `Add<i32, i32> for i32`, serve generic
@@ -796,7 +803,8 @@ alias declarations by spelling. Conformance selection after the binding is ordin
 
 **Diagnostics:** No conformance accepting the operands reports `SEM0135` at the operator. More than
 one reports `SEM0136`, listing the competing conformances. A missing bound in a generic body reports
-the ordinary unsatisfied-bound diagnostic. The former `operator` declaration marker is not syntax;
+the ordinary unsatisfied-bound diagnostic, `SEM0121` at the operator when the selected
+conformance's bound does not follow from the body's. The former `operator` declaration marker is not syntax;
 writing one reports the parser's unexpected-token diagnostic.
 
 **Current compiler:** Aligned. Generic bounds and concrete conformances use the same fixed binding
@@ -871,7 +879,7 @@ diagnostic exists.
 
 **Evidence:** [branch ownership](ownership-and-borrowing.md#flow-001--ownership-is-valid-on-every-path-that-reaches-an-operation),
 [Effect execution boundaries](effects-and-execution.md#eff-006--an-ordinary-function-may-run-only-a-closed-effect),
-[short-circuit elaboration](../bootstrap/packages/compiler/src/Elaboration.ts),
+[short-circuit elaboration](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Elaboration.ts),
 conditional mutation and evaluation tests.
 
 ### OP-011 — Scalar enum equality is nominal and ordering requires representation access
@@ -952,7 +960,7 @@ right expression. Ownership and loan conflicts retain their corresponding `OWN` 
 
 **Evidence:** [mutable ownership rule](ownership-and-borrowing.md#own-005--mutation-requires-one-live-mutable-root-owner),
 assignment syntax,
-[assignment analysis](../bootstrap/packages/compiler/src/Elaboration.ts).
+[assignment analysis](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Elaboration.ts).
 
 ### ASSIGN-002 — Assignment validates its destination before evaluating its replacement
 
@@ -993,7 +1001,7 @@ destination, right-expression, or cleanup provenance that caused them.
 
 **Evidence:** mutable-loop assignment specification,
 destination-before-right test,
-[replacement MIR contract](../bootstrap/packages/compiler/src/Mir.ts).
+[replacement MIR contract](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Mir.ts).
 
 ### ASSIGN-003 — A replacement cannot consume its own destination
 
@@ -1070,7 +1078,7 @@ operation under the sealed `Intrinsic` namespace. Reconciliation should retain `
 unless Silk first gains an ordinary representation of writable places.
 
 **Evidence:** place-replacement semantic requirement,
-[current implementation](../bootstrap/packages/compiler/src/Elaboration.ts),
+[current implementation](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Elaboration.ts),
 place replacement tests.
 
 ### ASSIGN-005 — Compound assignment is not currently language syntax
@@ -1097,8 +1105,8 @@ operator, naming the `x = x + 1` form. The same code reports a postfix `x++` or 
 `for ... in` loop, a `var` binding, and a `c ? a : b` conditional, each once with its Silk
 spelling. No semantic compound-assignment operation is synthesized.
 
-**Evidence:** [assignment parser](../bootstrap/packages/compiler/src/Parser.ts),
-[operator vocabulary](../bootstrap/packages/compiler/src/Operator.ts).
+**Evidence:** [assignment parser](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Parser.ts),
+[operator vocabulary](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Operator.ts).
 
 ## Explicit conversion
 

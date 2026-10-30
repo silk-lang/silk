@@ -26,7 +26,7 @@ token belongs to one maximal unsupported-byte region.
 rather than emitting one error per byte.
 
 **Evidence:** lexer specification,
-[identifier byte classes](../bootstrap/packages/compiler/src/internal/ByteClass.ts),
+[identifier byte classes](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/internal/ByteClass.ts),
 lexer tests.
 
 ## LEXICAL-002 — The keyword vocabulary is closed
@@ -53,8 +53,8 @@ as an identifier merely because the surrounding grammar would otherwise make its
 **Diagnostics:** Keyword misuse is a syntax error at the position where the grammar requires a
 different token. There is no separate lexical diagnostic for a correctly spelled keyword.
 
-**Evidence:** [keyword table](../bootstrap/packages/compiler/src/Lexer.ts),
-[token catalog](../bootstrap/packages/compiler/src/Token.ts),
+**Evidence:** [keyword table](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Lexer.ts),
+[token catalog](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Token.ts),
 complete-identifier tests.
 
 ## LEXICAL-003 — Line comments end at the physical line boundary
@@ -171,7 +171,7 @@ amounts report `LEX0008`, unknown units `LEX0009`, repeated units `LEX0010`, out
 `LEX0005`.
 
 **Evidence:** duration literal specification,
-[duration actor](../bootstrap/packages/compiler/src/internal/DurationLiteral.ts),
+[duration actor](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/internal/DurationLiteral.ts),
 lexer tests.
 
 ## LEXICAL-006 — Static text and byte literals have a closed form vocabulary
@@ -221,7 +221,7 @@ text literal. There is no raw byte-string form.
 `LEX0003`; malformed escapes and invalid decoded literal data report the corresponding static-data
 diagnostic without publishing a partial value.
 
-**Evidence:** [literal-form catalog](../bootstrap/packages/compiler/src/LiteralForm.ts),
+**Evidence:** [literal-form catalog](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/LiteralForm.ts),
 literal-form tests,
 raw-string acceptance tests,
 static text specification.
@@ -254,7 +254,7 @@ identifier followed by a character literal.
 **Diagnostics:** Zero or multiple decoded scalars report `LEX0007`. An absent closing delimiter
 reports `LEX0003`; malformed escapes receive their literal diagnostic.
 
-**Evidence:** [literal-form catalog](../bootstrap/packages/compiler/src/LiteralForm.ts),
+**Evidence:** [literal-form catalog](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/LiteralForm.ts),
 character scalar tests,
 literal-form tests.
 
@@ -274,8 +274,8 @@ when their prefix resembles a supported modifier.
 **Diagnostics:** Unsupported byte regions report `LEX0001`. Other malformed token introductions
 use their specific lexical diagnostic.
 
-**Evidence:** [lexer implementation](../bootstrap/packages/compiler/src/Lexer.ts),
-[lossless token model](../bootstrap/packages/compiler/src/Token.ts),
+**Evidence:** [lexer implementation](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Lexer.ts),
+[lossless token model](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Token.ts),
 lexer tests.
 
 ## LEXICAL-009 — An apostrophe distinguishes lifetime names from character literals

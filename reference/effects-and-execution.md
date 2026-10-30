@@ -111,11 +111,11 @@ conversion diagnostic such as `SEM0040`. When the return sites themselves have n
 join, `SEM0163` is reported at the first disagreeing return. A terminal inside `unsafe {}` keeps the
 same success or failure contribution it would have outside `unsafe`.
 
-**Evidence:** [statement return analysis](../bootstrap/packages/compiler/src/StatementAnalysis.ts),
-[effect-block analysis](../bootstrap/packages/compiler/src/ExpressionAnalysis.ts),
+**Evidence:** [statement return analysis](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/StatementAnalysis.ts),
+[effect-block analysis](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/ExpressionAnalysis.ts),
 return-contract regressions,
 effect-block terminal regressions,
-[MIR return verification](../bootstrap/packages/compiler/src/Mir.ts).
+[MIR return verification](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Mir.ts).
 
 ## EFF-003 — `run` executes exactly one Effect layer
 
@@ -220,9 +220,9 @@ Capture discovery visits every expression operand in the deferred body. In parti
 used only as the argument of `Enum.value(binding)` is still captured; enum conversion does not hide
 the dependency from the Effect environment.
 
-**Evidence:** [effect-block capture analysis](../bootstrap/packages/compiler/src/ExpressionAnalysis.ts),
+**Evidence:** [effect-block capture analysis](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/ExpressionAnalysis.ts),
 effect-block capture parity corpus,
-[effect-block lowering](../bootstrap/packages/compiler/src/Lower.ts).
+[effect-block lowering](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Lower.ts).
 
 ## EFF-006 — An ordinary function may run only a closed Effect
 

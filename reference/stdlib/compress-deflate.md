@@ -10,7 +10,8 @@ Select the container with `silk.compress.inflate.Format`. Use `silk.compress.inf
 
 ## Details
 The encoder uses a 32 KiB history window and fixed Huffman codes. It emits deterministic
-output, with no timestamps or optional gzip headers. The caller owns the output buffer.
+output, with no timestamps or optional gzip headers. The caller owns the output buffer;
+[`Deflate.encodedBound`](#Deflate.impl.encodedBound) gives a size that always fits.
 A table of 32768 `usize` entries is allocated through the ambient allocator and released
 before the call returns. Each input position considers one match of at most 258 bytes.
 
@@ -76,6 +77,24 @@ A deterministic LZ77 and fixed-Huffman DEFLATE encoder for complete input buffer
 impl Deflate
 ```
 
+<a id="Deflate.impl.encodedBound"></a>
+
+### Associated function `encodedBound`
+
+```silk
+pub fn encodedBound(length: usize, format: Format) -> Option<usize>
+```
+
+Returns the most bytes [`Deflate.encode`](#Deflate.impl.encode) can write for `length` input bytes in `format`, or
+`None` if that count does not fit in `usize`.
+
+#### Details
+An output buffer of this size never fails with `EncodeError`. The bound is
+`length + (length + 17) / 8` plus the container: 0 bytes for raw DEFLATE, 6 for zlib, and 18
+for gzip. It covers 9 bits per input byte, which no literal or match exceeds, the 3-bit block
+header, the 7-bit end-of-block code, and the final partial byte. Input of distinct bytes from
+144 through 255 reaches it exactly.
+
 <a id="Deflate.impl.encode"></a>
 
 ### Associated function `encode`
@@ -97,8 +116,9 @@ and the gzip size trailer are included. No compression levels or preset dictiona
 Input and output must not overlap, as enforced by their shared and exclusive borrows.
 
 #### Errors
-`EncodeError` means the output buffer filled; discard its partial stream. `OutOfMemoryError`
-means the match table could not be allocated. The caller controls both buffer sizes.
+`EncodeError` means the output buffer filled; discard its partial stream. It never occurs when
+`output` holds at least `Deflate.encodedBound(input.length, format)` bytes. `OutOfMemoryError`
+means the match table could not be allocated.
 
 
 Category: Data formats.

@@ -209,7 +209,7 @@ no static result. A value outside the admitted domain is rejected at the static 
 than acquiring a second compile-time ownership model.
 
 **Evidence:** static value requirements,
-[canonical static values](../bootstrap/packages/compiler/src/StaticValue.ts).
+[canonical static values](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/StaticValue.ts).
 
 ### STATIC-006 — Static mutation replaces one complete local value
 
@@ -468,7 +468,7 @@ Changing a threshold does not change the meaning of a program that remains withi
 arguments produces the same code, semantic details, related spans, and trace encoding.
 
 **Evidence:** static diagnostic requirements,
-[diagnostic catalog](../bootstrap/packages/compiler/src/Diagnostic.ts).
+[diagnostic catalog](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Diagnostic.ts).
 
 ## Target information
 
@@ -521,4 +521,4 @@ enums from different nominal types uses the ordinary cross-enum diagnostic.
 
 **Evidence:** static target requirements,
 sealed target primitive requirements,
-[intrinsic catalog](../bootstrap/packages/compiler/src/Intrinsic.ts).
+[intrinsic catalog](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Intrinsic.ts).

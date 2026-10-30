@@ -1,15 +1,22 @@
 //! The packages one build reads: the root package and every package its `[dependencies]` reach.
 //!
 //! # Details
-//! Each manifest's `[dependencies]` table maps a dependency name to `{ path, package? }`
-//! (PACKAGE-002). Loading follows those tables depth first from the root package and checks the
-//! rules a build relies on: identifier names other than `silk` and `Intrinsic`, a readable manifest
-//! at each path, a matching `package` name, no name that is also one of the owner's own top-level
-//! modules (PACKAGE-003), no package cycle, and one version and one directory per package name
-//! (PACKAGE-004). An entry takes no field but `path` and `package`. A dependency's
-//! `[package].exports` must list modules that exist in it (PACKAGE-006).
+//! Each manifest's `[dependencies]` table maps a dependency name to `{ path, package? }`, or to a
+//! git dependency `{ git, rev, path?, package? }` (PACKAGE-002). Loading follows those tables depth
+//! first from the root package and checks the rules a build relies on: identifier names other than
+//! `silk` and `Intrinsic`, a readable manifest at each path, a matching `package` name, no name that
+//! is also one of the owner's own top-level modules (PACKAGE-003), no package cycle, and one version
+//! and one directory per package name (PACKAGE-004). An entry takes no field but `path`, `git`,
+//! `rev` and `package`. A dependency's `[package].exports` must list modules that exist in it
+//! (PACKAGE-006).
+//!
+//! A git dependency reads the package at `path` (the repository root by default) in the checkout
+//! of commit `rev` (driver/GitCheckouts). Loading only reads checkouts; [`fetch`] writes the
+//! missing ones first. A package read from a checkout reaches other packages by `path` only inside
+//! the same checkout, so a commit pins its whole dependency graph.
 
 import driver.CommandPath
+import driver.GitCheckouts as Checkouts {FetchFailed}
 import driver.ManifestFields
 import driver.ManifestText
 import ReleaseVersion
@@ -19,7 +26,9 @@ import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.mem.box {Box}
 import silk.collections.bytes {Bytes}
 import silk.core.effect {Effect}
+import silk.system.child_process {ChildProcess}
 import silk.system.filesystem {FileError, FileSystem, Path}
+import silk.system.host_input {HostInput, HostInputError}
 import silk.core.option {Option}
 import silk.core.result {Result}
 import silk.collections.slice {Slice}
@@ -49,6 +58,8 @@ struct Package {
   sourceRoot: Path,
   // The canonical paths, such as `codec/Json.silk`, of the modules other packages may import.
   exports: List<Bytes>,
+  // The root of the git checkout it was read from, or `None` for a package outside the store.
+  checkout: Option<Path>,
 }
 
 // One edge of the graph: package `owner` imports package `package` as `name`.
@@ -62,6 +73,8 @@ struct Edge {
 pub struct Packages {
   packages: List<Package>,
   edges: List<Edge>,
+  // The git checkout store, or `None` when the command has none and git dependencies are refused.
+  store: Option<Path>,
 }
 
 fn same(left: &[u8], right: &[u8]) -> bool {
@@ -272,6 +285,211 @@ fn onStack(stack: &[Bytes], identity: &[u8]) -> bool {
   return false
 }
 
+// Whether `path` is `root` or a path below it.
+fn within(root: &[u8], path: &[u8]) -> bool {
+  if path.length < root.length || !same(Slice.view<u8>(path, usize.ZERO, root.length), root) { return false }
+  return path.length == root.length || path[root.length] == 47
+}
+
+// Whether `written` is a relative path with no `..` segment, so it stays below the directory it
+// is joined to.
+fn contained(written: &[u8]) -> bool {
+  if written.length == usize.ZERO || written[usize.ZERO] == 47 { return false }
+  let mut start = usize.ZERO
+  let mut cursor = usize.ZERO
+  while cursor <= written.length {
+    if cursor == written.length || written[cursor] == 47 {
+      if cursor - start == usize.add(0, 2) && written[start] == 46 && written[start + usize.ONE] == 46 { return false }
+      start = cursor + usize.ONE
+    }
+    cursor = cursor + usize.ONE
+  }
+  return true
+}
+
+// `path`'s real directory, or `path` itself when it cannot be resolved, so that paths reaching one
+// directory through different symbolic links compare equal.
+effect fn real(path: Path) -> Path ! FileError | OutOfMemoryError ? &mut Allocator {
+  return match move run CommandPath.canonical(Path.rawBytes(&path)) {
+    Option<Bytes>.Some {value} => run Path.fromBytes(Bytes.asSlice(&value))
+    Option<Bytes>.None => move path
+  }
+}
+
+// Where a dependency's manifest is, and the checkout holding it.
+struct Located {
+  directory: Path,
+  checkout: Option<Path>,
+}
+
+// The directory of the manifest the dependency `name` of `owner`, whose entry is `entry`, reads.
+// A git dependency's is `path` below the checkout of `rev`, the checkout root by default. A path
+// dependency's is `path` from `ownerDirectory`, and must stay inside `ownerCheckout` when the owner
+// was read from one.
+effect fn locate(packages: &Packages, owner: &[u8], name: &[u8], entry: &TomlValue, ownerDirectory: &Path, ownerCheckout: &Option<Path>) -> Located
+! InvalidDependency | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let rev = Toml.field(entry, "rev")
+  if let Option<&TomlValue>.Some {value: _} = move Toml.field(entry, "git") {
+    let url = match move Toml.asString(Toml.field(entry, "git")) {
+      Option<string>.Some {value} => String.utf8Bytes(value)
+      Option<string>.None => b""
+    }
+    if !Checkouts.isRepository(url) {
+      run invalid(owner, name, b"git must be the repository URL or absolute path, as git = \"https://example.com/library.git\"", ownerDirectory, b"git")
+    }
+    let commit = match move Toml.asString(rev) {
+      Option<string>.Some {value} => String.utf8Bytes(value)
+      Option<string>.None => run invalid(owner, name, b"a git dependency needs rev, the full hash of the commit to build", ownerDirectory, b"git")
+    }
+    if !Checkouts.isCommit(commit) {
+      run invalid(owner, name, b"rev must be a full commit hash: 40 or 64 lowercase hexadecimal digits", ownerDirectory, b"rev")
+    }
+    let store = match &packages.store {
+      Option<Path>.Some {value} => &value
+      Option<Path>.None => run invalid(owner, name, b"this command cannot read git dependencies: neither SILK_HOME nor HOME names a directory for their checkouts", ownerDirectory, b"git")
+    }
+    let present = run Checkouts.fetched(store, commit)
+    if !present {
+      let mut reason = run Bytes.copy(b"commit ")
+      run Bytes.append(&mut reason, commit)
+      run Bytes.append(&mut reason, b" of ")
+      run Bytes.append(&mut reason, url)
+      run Bytes.append(&mut reason, b" is not fetched yet; silk build, check, test and run fetch it")
+      run invalid(owner, name, Bytes.asSlice(&reason), ownerDirectory, b"rev")
+    }
+    let root = run real(run Checkouts.checkout(store, commit))
+    let mut directory = run copyPath(&root)
+    if let Option<&TomlValue>.Some {value: _} = move Toml.field(entry, "path") {
+      let inner = match move Toml.asString(Toml.field(entry, "path")) {
+        Option<string>.Some {value} => String.utf8Bytes(value)
+        Option<string>.None => b"/"
+      }
+      if !contained(inner) {
+        run invalid(owner, name, b"path of a git dependency must name a directory inside the repository, relative to its root", ownerDirectory, b"path")
+      }
+      directory = run real(run Path.joinBytes(&root, inner))
+      if !within(Path.rawBytes(&root), Path.rawBytes(&directory)) {
+        run invalid(owner, name, b"path of a git dependency must name a directory inside the repository, relative to its root", ownerDirectory, b"path")
+      }
+    }
+    return Located {directory: move directory, checkout: Option<Path>.some(move root)}
+  }
+  if let Option<&TomlValue>.Some {value: _} = move rev {
+    run invalid(owner, name, b"rev pins a git dependency; add git, the repository URL", ownerDirectory, b"rev")
+  }
+  let written = match move Toml.asString(Toml.field(entry, "path")) {
+    Option<string>.Some {value} => String.utf8Bytes(value)
+    Option<string>.None => run invalid(owner, name, b"path must name the directory of the dependency's silk.toml", ownerDirectory, b"path")
+  }
+  // A dependency is read at its real directory, so paths that reach one package through
+  // different symbolic links name one directory.
+  let directory = run real(run CommandPath.resolve(ownerDirectory, written))
+  return match &ownerCheckout.* {
+    Option<Path>.Some {value: root} => {
+      if !within(Path.rawBytes(&root), Path.rawBytes(&directory)) {
+        run invalid(owner, name, b"a package from a git dependency reaches packages by path only inside its own repository", ownerDirectory, b"path")
+      }
+      return Located {directory: move directory, checkout: Option<Path>.some(run copyPath(&root))}
+    }
+    Option<Path>.None => Located {directory: move directory, checkout: Option<Path>.none()}
+  }
+}
+
+/// Fetches into the checkout store `store` (driver/GitCheckouts) every git dependency that the
+/// package whose manifest `document` sits in `directory` reaches, directly or through other
+/// packages, and that the store lacks. It follows only entries it can read and leaves every other
+/// check to [`load`]. A fetch that fails is an invalid dependency naming its `git` line.
+pub effect fn fetch(directory: &Path, document: &TomlValue, store: &Path) -> ()
+! InvalidDependency | HostInputError | FileError | OutOfMemoryError
+? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
+  let mut seen = List<Bytes>.make()
+  run fetchVisit(directory, document, store, &mut seen)
+}
+
+effect fn fetchVisit(directory: &Path, document: &TomlValue, store: &Path, seen: &mut List<Bytes>) -> ()
+! InvalidDependency | HostInputError | FileError | OutOfMemoryError
+? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
+  let children = match move Toml.field(document, "dependencies") {
+    Option<&TomlValue>.Some {value} => match move members(value) {
+      Option<&[TomlChild]>.Some {value: listed} => listed
+      Option<&[TomlChild]>.None => { return () }
+    }
+    Option<&TomlValue>.None => { return () }
+  }
+  let mut at = usize.ZERO
+  while at < children.length {
+    if let TomlChild.Member {entry} = &children[at] {
+      let name = String.ownedUtf8Bytes(&entry.key)
+      let mut target = Option<Path>.none()
+      let url = Toml.asString(Toml.field(&entry.value, "git"))
+      let rev = Toml.asString(Toml.field(&entry.value, "rev"))
+      let path = Toml.asString(Toml.field(&entry.value, "path"))
+      if let Option<string>.Some {value: written} = move url {
+        if let Option<string>.Some {value: pinned} = move rev {
+          let commit = String.utf8Bytes(pinned)
+          if Checkouts.isCommit(commit) && Checkouts.isRepository(String.utf8Bytes(written)) {
+            let fetched = run Effect.result(Checkouts.fetch(store, String.utf8Bytes(written), commit))
+            match move fetched {
+              Result<(), FetchFailed | HostInputError | FileError | OutOfMemoryError>.Success {value: _} => {}
+              Result<(), FetchFailed | HostInputError | FileError | OutOfMemoryError>.Failure {error} => match move error {
+                FetchFailed failure => {
+                  let mut reason = run Bytes.copy(b"fetching commit ")
+                  run Bytes.append(&mut reason, commit)
+                  run Bytes.append(&mut reason, b" of ")
+                  run Bytes.append(&mut reason, String.utf8Bytes(written))
+                  run Bytes.append(&mut reason, b" failed: ")
+                  run Bytes.append(&mut reason, Bytes.asSlice(&failure.detail))
+                  let owner = match move run identityOf(document) {
+                    Option<Bytes>.Some {value} => move value
+                    Option<Bytes>.None => run Bytes.copy(Path.rawBytes(directory))
+                  }
+                  run invalid(Bytes.asSlice(&owner), name, Bytes.asSlice(&reason), directory, b"git")
+                }
+                HostInputError unread => { fail move unread }
+                FileError unwritten => {
+                  let mut reason = run Bytes.copy(b"its checkout cannot be written below ")
+                  run Bytes.append(&mut reason, Path.rawBytes(store))
+                  drop unwritten
+                  let owner = match move run identityOf(document) {
+                    Option<Bytes>.Some {value} => move value
+                    Option<Bytes>.None => run Bytes.copy(Path.rawBytes(directory))
+                  }
+                  run invalid(Bytes.asSlice(&owner), name, Bytes.asSlice(&reason), directory, b"git")
+                }
+                OutOfMemoryError exhausted => { fail move exhausted }
+              }
+            }
+            let root = run Checkouts.checkout(store, commit)
+            if let Option<string>.Some {value: inner} = move path {
+              if contained(String.utf8Bytes(inner)) {
+                target = Option<Path>.some(run Path.joinBytes(&root, String.utf8Bytes(inner)))
+              }
+            } else {
+              target = Option<Path>.some(move root)
+            }
+          }
+        }
+      } else if let Option<string>.Some {value: written} = move path {
+        target = Option<Path>.some(run CommandPath.resolve(directory, String.utf8Bytes(written)))
+      }
+      if let Option<Path>.Some {value: found} = move target {
+        let resolved = run real(move found)
+        if !onStack(List<Bytes>.asSlice(&seen.*), Path.rawBytes(&resolved)) {
+          run List<Bytes>.append(&mut seen.*, run Bytes.copy(Path.rawBytes(&resolved)))
+          let manifest = run Path.join(&resolved, "silk.toml")
+          if let Result<Bytes, FileError | OutOfMemoryError>.Success {value: contents} = move run Effect.result(FileSystem.readFile(&manifest)) {
+            if let Result<TomlValue, TomlError | OutOfMemoryError>.Success {value: dependency} = move run Effect.result(Toml.parse(Bytes.asSlice(&contents))) {
+              run fetchVisit(&resolved, &dependency, store, &mut seen.*)
+            }
+          }
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
 // Loads every dependency the package at `owner` declares in `document`, then theirs.
 effect fn visit(packages: &mut Packages, owner: usize, document: &TomlValue, stack: &mut List<Bytes>) -> ()
 ! InvalidDependency | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
@@ -283,6 +501,8 @@ effect fn visit(packages: &mut Packages, owner: usize, document: &TomlValue, sta
   let ownerIdentity = run Bytes.copy(Bytes.asSlice(&listedOwner[owner].identity))
   let ownerManifest = run copyPath(&listedOwner[owner].manifest)
   let ownerSourceRoot = run copyPath(&listedOwner[owner].sourceRoot)
+  let mut ownerCheckout = Option<Path>.none()
+  if let Option<Path>.Some {value} = &listedOwner[owner].checkout { ownerCheckout = Option<Path>.some(run copyPath(&value)) }
   let owned = Bytes.asSlice(&ownerIdentity)
   let children = match move members(listed) {
     Option<&[TomlChild]>.Some {value} => value
@@ -313,16 +533,19 @@ effect fn visit(packages: &mut Packages, owner: usize, document: &TomlValue, sta
         while field < fields.length {
           if let TomlChild.Member {entry: written} = &fields[field] {
             let key = String.ownedUtf8Bytes(&written.key)
-            if !same(key, b"path") && !same(key, b"package") {
+            if !same(key, b"path") && !same(key, b"package") && !same(key, b"git") && !same(key, b"rev") {
               // Other sources and their modifiers are reserved for a later release.
-              let reserved = same(key, b"git") || same(key, b"url") || same(key, b"version") || same(key, b"tag")
-                || same(key, b"rev") || same(key, b"branch") || same(key, b"hash") || same(key, b"optional")
+              let reserved = same(key, b"url") || same(key, b"version") || same(key, b"tag")
+                || same(key, b"branch") || same(key, b"hash") || same(key, b"optional")
                 || same(key, b"workspace")
               let mut reason = run Bytes.copy(key)
               if reserved {
-                run Bytes.append(&mut reason, b" is not supported yet; a dependency takes only path and package")
+                run Bytes.append(&mut reason, b" is not supported yet; a dependency takes only path, git, rev and package")
+                if same(key, b"tag") || same(key, b"branch") {
+                  run Bytes.append(&mut reason, b"; pin a git dependency to a full commit hash with rev")
+                }
               } else {
-                run Bytes.append(&mut reason, b" is not a supported field; a dependency takes only path and package")
+                run Bytes.append(&mut reason, b" is not a supported field; a dependency takes only path, git, rev and package")
               }
               run invalid(owned, name, Bytes.asSlice(&reason), &ownerManifest, key)
             }
@@ -330,21 +553,12 @@ effect fn visit(packages: &mut Packages, owner: usize, document: &TomlValue, sta
           field = field + usize.ONE
         }
       }
-      let written = match move Toml.asString(Toml.field(&entry.value, "path")) {
-        Option<string>.Some {value} => String.utf8Bytes(value)
-        Option<string>.None => run invalid(owned, name, b"path must name the directory of the dependency's silk.toml", &ownerManifest, b"path")
-      }
       let hidden = run shadows(&ownerSourceRoot, name)
       if hidden {
         run invalid(owned, name, b"the name is also a top-level module or directory of this package's source root", &ownerManifest, b"")
       }
-      let lexical = run CommandPath.resolve(&ownerManifest, written)
-      // A dependency is read at its real directory, so paths that reach one checkout through
-      // different symbolic links name one directory.
-      let directory = match move run CommandPath.canonical(Path.rawBytes(&lexical)) {
-        Option<Bytes>.Some {value} => run Path.fromBytes(Bytes.asSlice(&value))
-        Option<Bytes>.None => move lexical
-      }
+      let located = run locate(&packages.*, owned, name, &entry.value, &ownerManifest, &ownerCheckout)
+      let Located {directory, checkout} = move located
       let manifest = run Path.join(&directory, "silk.toml")
       let read = run Effect.result(FileSystem.readFile(&manifest))
       let contents = match move read {
@@ -430,7 +644,7 @@ effect fn visit(packages: &mut Packages, owner: usize, document: &TomlValue, sta
         let exports = run exportsOf(Bytes.asSlice(&identity), &dependency, &directory, &sourceRoot)
         run List<Package>.append(&mut packages.packages, Package {
           identity: run Bytes.copy(Bytes.asSlice(&identity)), name: run Bytes.copy(packageName),
-          manifest: move directory, sourceRoot: move sourceRoot, exports: move exports,
+          manifest: move directory, sourceRoot: move sourceRoot, exports: move exports, checkout: move checkout,
         })
         run List<Bytes>.append(&mut stack.*, run Bytes.copy(Bytes.asSlice(&identity)))
         let added = List<Package>.length(&packages.packages) - usize.ONE
@@ -449,20 +663,24 @@ effect fn visit(packages: &mut Packages, owner: usize, document: &TomlValue, sta
 }
 
 /// Loads the root package, whose manifest `document` sits in `manifest` with module identity
-/// `identity` and modules below `sourceRoot`, and every package its dependencies reach.
-pub effect fn load(manifest: &Path, document: &TomlValue, identity: &[u8], sourceRoot: &Path) -> Packages
+/// `identity` and modules below `sourceRoot`, and every package its dependencies reach. Git
+/// dependencies read their checkouts in `store` (driver/GitCheckouts) and are refused when it is
+/// `None` or lacks the commit; [`fetch`] writes missing checkouts first.
+pub effect fn load(manifest: &Path, document: &TomlValue, identity: &[u8], sourceRoot: &Path, store: Option<&Path>) -> Packages
 ! InvalidDependency | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
   let name = match move Toml.asString(Toml.fieldAt(Toml.field(document, "package"), "name")) {
     Option<string>.Some {value} => String.utf8Bytes(value)
     Option<string>.None => b""
   }
-  let mut packages = Packages {packages: List<Package>.make(), edges: List<Edge>.make()}
+  let mut kept = Option<Path>.none()
+  if let Option<&Path>.Some {value} = move store { kept = Option<Path>.some(run copyPath(value)) }
+  let mut packages = Packages {packages: List<Package>.make(), edges: List<Edge>.make(), store: move kept}
   // The root's own exports are part of its public surface, so the build checks them even when its
   // root module imports none of them.
   let exports = run exportsOf(identity, document, manifest, sourceRoot)
   run List<Package>.append(&mut packages.packages, Package {
     identity: run Bytes.copy(identity), name: run Bytes.copy(name), manifest: run copyPath(manifest),
-    sourceRoot: run copyPath(sourceRoot), exports: move exports,
+    sourceRoot: run copyPath(sourceRoot), exports: move exports, checkout: Option<Path>.none(),
   })
   let mut stack = List<Bytes>.make()
   run List<Bytes>.append(&mut stack, run Bytes.copy(identity))

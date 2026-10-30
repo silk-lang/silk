@@ -100,8 +100,8 @@ kinds in this area.
 
 **Evidence:** [generic Effect contract](effect-contracts.md#eff-012--ordinary-failure-types-and-generic-requirement-rows-preserve-a-contract),
 current generic specification,
-[type-parameter parser](../bootstrap/packages/compiler/src/Parser.ts),
-[canonical type representation](../bootstrap/packages/compiler/src/Type.ts).
+[type-parameter parser](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Parser.ts),
+[canonical type representation](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Type.ts).
 
 ### GEN-002 — A generic nominal type application is explicit and canonical
 
@@ -147,7 +147,7 @@ concrete.
 
 **Evidence:** generic application specification,
 [nominal type identity](values-and-types.md),
-[type resolution](../bootstrap/packages/compiler/src/DeclarationResolution.ts).
+[type resolution](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/DeclarationResolution.ts).
 
 ### GEN-003 — A generic call infers only from supplied arguments and declared constraints
 
@@ -213,7 +213,7 @@ and stable rule use an ordered prefix because provider APIs and ordinary partial
 on it.
 
 **Evidence:** current inference specification,
-[call specialization](../bootstrap/packages/compiler/src/CallResolution.ts),
+[call specialization](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/CallResolution.ts),
 [provider inference](requirements-and-services.md#serv-007--provision-infers-exactly-one-compatible-requirement-key).
 
 ### GEN-004 — A generic body is checked once against its declared contract
@@ -313,8 +313,8 @@ escaping callable. A backend must not report an internal MIR error for a generic
 semantic analysis could not close.
 
 **Evidence:** finite specialization specification,
-[instance discovery](../bootstrap/packages/compiler/src/Instances.ts),
-[specialization identity](../bootstrap/packages/compiler/src/Specialization.ts).
+[instance discovery](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Instances.ts),
+[specialization identity](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Specialization.ts).
 
 ### GEN-006 — Recursive generic calls cannot grow a new type argument chain
 
@@ -393,7 +393,7 @@ call and shows the current and requested applications. It must be rejected befor
 discovery recursively expands the family.
 
 **Evidence:** runtime specialization requirement,
-[generic instance discovery](../bootstrap/packages/compiler/src/Instances.ts).
+[generic instance discovery](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Instances.ts).
 
 ### GEN-007 — Struct construction infers omitted arguments from supplied fields
 
@@ -460,7 +460,7 @@ representation parameters after a written prefix, retains every origin, and reje
 conflicting evidence before TIR lowering.
 
 **Evidence:** representation inference tests,
-[struct literal analysis](../bootstrap/packages/compiler/src/ExpressionAnalysis.ts),
+[struct literal analysis](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/ExpressionAnalysis.ts),
 [generic call inference](#gen-003--a-generic-call-infers-only-from-supplied-arguments-and-declared-constraints).
 
 ### GEN-008 — A qualified member call writes its owner's arguments on the owner
@@ -548,7 +548,7 @@ lifetimes. Both reject a member list on an unwritten owner whose parameters the 
 with `SEM0221`, and an incomplete owner application with `SEM0051`. Owner-independent members
 keep their own generic list.
 
-**Evidence:** [call specialization](../bootstrap/packages/compiler/src/CallResolution.ts),
+**Evidence:** [call specialization](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/CallResolution.ts),
 [generic call inference](#gen-003--a-generic-call-infers-only-from-supplied-arguments-and-declared-constraints).
 
 ## Executable representation parameters
@@ -895,8 +895,8 @@ provider argument to an interface application reports the ordinary interface-arg
 its written generic parameters contain only additional contract arguments. Bounds and
 conformances bind the provider without adding a duplicated interface argument.
 
-**Evidence:** [current interface parser](../bootstrap/packages/compiler/src/Parser.ts),
-[current interface application](../bootstrap/packages/compiler/src/DeclarationFacts.ts).
+**Evidence:** [current interface parser](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Parser.ts),
+[current interface application](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/DeclarationFacts.ts).
 
 ### INTF-002 — An interface contains compile-time operation contracts and their defaults
 
@@ -976,7 +976,7 @@ contract, signature or witness table; only the instances of that body are checke
 
 **Evidence:** complete interface contracts,
 [service/interface boundary](requirements-and-services.md#serv-003--a-service-is-a-dependency-eligible-interface),
-[interface parser](../bootstrap/packages/compiler/src/Parser.ts).
+[interface parser](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Parser.ts).
 
 ### INTF-003 — A bound applies an interface to its provider parameter
 
@@ -1030,7 +1030,7 @@ application on its right; no provider argument is synthesized into that applicat
 
 **Evidence:** current interface-bound tests,
 conditional conformance specification,
-[bound declaration facts](../bootstrap/packages/compiler/src/DeclarationFacts.ts).
+[bound declaration facts](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/DeclarationFacts.ts).
 
 ### INTF-004 — `+` joins independent bounds on one parameter
 
@@ -1086,8 +1086,8 @@ stop at whichever bound happens to be written first.
 **Current compiler:** Aligned. Parsing and declaration facts preserve every normalized conjunct,
 static calls can select operations from each contract, and duplicate conjuncts are diagnosed.
 
-**Evidence:** [bound parser](../bootstrap/packages/compiler/src/Parser.ts),
-[bound facts](../bootstrap/packages/compiler/src/DeclarationFacts.ts),
+**Evidence:** [bound parser](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Parser.ts),
+[bound facts](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/DeclarationFacts.ts),
 [static operation selection](#intf-006--a-qualified-interface-call-requires-one-static-application).
 
 ### INTF-005 — Interface operations use their declared ownership and Effect contracts
@@ -1235,8 +1235,8 @@ unknown-interface-member diagnostic and does not fall back to a module function 
 the same `Self` substitution and witness selection. Operator syntax binds to its fixed
 sealed `Intrinsic` interface under OP-009.
 
-**Evidence:** [bound operation resolution](../bootstrap/packages/compiler/src/CallResolution.ts),
-[bound witness lowering](../bootstrap/packages/compiler/src/WitnessLowering.ts),
+**Evidence:** [bound operation resolution](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/CallResolution.ts),
+[bound witness lowering](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/WitnessLowering.ts),
 bound-operation tests,
 [explicit operator eligibility](expressions-and-operators.md#op-009--each-overloadable-operator-is-bound-to-one-sealed-intrinsic-interface).
 
@@ -1287,7 +1287,7 @@ supplied to a concrete receiver by more than one interface reports `SEM0202` nam
 each supplying application; write one applied qualified call such as `Printed<i32>.print(&report)`
 to select it. Arguments never select among supplying applications.
 
-**Evidence:** [bound receiver resolution](../bootstrap/packages/compiler/src/ExpressionAnalysis.ts),
+**Evidence:** [bound receiver resolution](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/ExpressionAnalysis.ts),
 method-call specification.
 
 ### INTF-008 — A `static fn` operation is answered by a static witness
@@ -1396,8 +1396,8 @@ before operation mappings are checked. An invalid `Self` use retains the context
 **Current compiler:** Aligned. The provider appears only after `for`, binds `Self`, and may supply
 operations inline, by mapping, or through both forms in one conformance.
 
-**Evidence:** [current impl parser](../bootstrap/packages/compiler/src/Parser.ts),
-[current conformance facts](../bootstrap/packages/compiler/src/DeclarationFacts.ts).
+**Evidence:** [current impl parser](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Parser.ts),
+[current conformance facts](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/DeclarationFacts.ts).
 
 ### IMPL-002 — A conformance supplies every interface operation exactly once
 
@@ -1452,7 +1452,7 @@ subject to the same completeness and duplicate checks.
 
 **Evidence:** [confirmed implementation forms](requirements-and-services.md#serv-001--a-conformance-may-define-or-map-each-operation),
 user witness tests,
-[conformance parser](../bootstrap/packages/compiler/src/Parser.ts).
+[conformance parser](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Parser.ts).
 
 ### IMPL-003 — Each implementation must satisfy the substituted operation contract
 
@@ -1515,7 +1515,7 @@ ordinary type names and never fall through to lowering as invalid MIR.
 result, failure, and requirement contracts for both interfaces and services.
 
 **Evidence:** complete witness compatibility,
-[witness compatibility implementation](../bootstrap/packages/compiler/src/DeclarationResolution.ts),
+[witness compatibility implementation](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/DeclarationResolution.ts),
 interface witness tests,
 [nested Effect contract](effects-and-execution.md#eff-004--nested-effects-are-ordinary-values).
 
@@ -1636,7 +1636,7 @@ for a modifier that has no conformance meaning.
 dimension is superseded: program-wide coherence and endpoint visibility already determine every
 usable goal, and current source syntax needs no general conformance visibility modifier.
 
-**Evidence:** [current impl parser](../bootstrap/packages/compiler/src/Parser.ts),
+**Evidence:** [current impl parser](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Parser.ts),
 [non-activating imports](modules-names-and-visibility.md#module-005--imports-have-no-runtime-behavior).
 
 ### IMPL-006 — A generic `impl` may require conformances of contained parameters
@@ -1692,7 +1692,9 @@ the witness.
 
 An inherent head may bound its own parameters with the same syntax. The bounds are premises of
 every member of that block, and each call proves them under the owner application it selects, as
-it proves the member's own bounds. A type may have several inherent blocks with different bounds.
+it proves the member's own bounds. A member body uses them as a bounded generic function does, so
+under `T: Zero + Twice` it may write `Zero.zero()` or `value.twice()`. A type may have several
+inherent blocks with different bounds.
 
 ```silk,ignore
 import silk.core.ownership { Copy }
@@ -1815,7 +1817,7 @@ repeats a region, or bounds a region reports `SEM0220` at the declaration.
 whose provider and interface applications may unify without consulting their bounds.
 
 **Evidence:** coherence requirement,
-[overlap implementation](../bootstrap/packages/compiler/src/ConformanceHead.ts),
+[overlap implementation](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/ConformanceHead.ts),
 overlap rejection tests.
 
 ### IMPL-008 — Conditional proof must descend through provider structure
@@ -1862,7 +1864,7 @@ diagnostic (`SEM0120`) at the offending bound.
 each bound's provider must be a parameter that occurs in it.
 
 **Evidence:** structural termination requirement,
-[termination proof](../bootstrap/packages/compiler/src/ConformanceHead.ts),
+[termination proof](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/ConformanceHead.ts),
 termination tests.
 
 ### IMPL-009 — Concrete proof is complete, static, and order-independent

@@ -554,7 +554,7 @@ These are compiler architecture rules, not additional source obligations:
   private, non-overlapping linear-memory region. Growth failure follows SUSP-006 on both targets.
 
 The complete-key frame invariant is exercised by the
-[coroutine-frame lookup](../bootstrap/packages/compiler/src/CoroutineFrame.ts) and the
+[coroutine-frame lookup](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/CoroutineFrame.ts) and the
 contract-row suspension parity corpus.
 
 The complete architecture contract remains in the archived

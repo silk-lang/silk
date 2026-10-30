@@ -50,7 +50,7 @@ pub fn main() -> i32 {
 
 Import as `f32` with `import silk.num.f32`.
 
-Public declarations: 71.
+Public declarations: 72.
 
 <a id="MAX"></a>
 
@@ -94,8 +94,27 @@ Positive infinity with the binary32 bit pattern `0x7F800000`.
 
 ### Details
 
-No source literal spells infinity directly. This initializer deliberately exceeds [`MAX`](#MAX), and
-decimal-to-binary32 rounding produces the infinity encoding.
+No source literal spells infinity, and a literal that rounds to infinity is rejected. Doubling
+[`MAX`](#MAX) overflows to the infinity encoding.
+
+<a id="NAN"></a>
+
+## `NAN`
+
+```silk
+pub const NAN: f32
+```
+
+The canonical quiet NaN, with the binary32 bit pattern `0x7FC00000`.
+
+### Details
+
+No source literal spells NaN. Infinity minus infinity is NaN, and static evaluation always
+produces the canonical quiet NaN for a NaN result.
+
+### Gotchas
+
+NaN compares unequal to every value, itself included. Test for it with [`isNaN`](#isNaN).
 
 <a id="PI"></a>
 

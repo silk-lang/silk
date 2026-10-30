@@ -118,6 +118,24 @@ InvalidDomain
 
 A DCE local domain is not person (0), group (1), or organization (2).
 
+<a id="UuidError.impl.Debug"></a>
+
+## Implementation `Debug for UuidError`
+
+```silk
+impl Debug for UuidError
+```
+
+<a id="UuidError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `InvalidText`.
+
 <a id="UuidVariant"></a>
 
 ## `UuidVariant`

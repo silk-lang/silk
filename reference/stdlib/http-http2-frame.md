@@ -199,6 +199,24 @@ Zero for a connection error, otherwise the affected stream identifier.
 impl Copy for ProtocolError
 ```
 
+<a id="ProtocolError.impl.Debug"></a>
+
+## Implementation `Debug for ProtocolError`
+
+```silk
+impl Debug for ProtocolError
+```
+
+<a id="ProtocolError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `ProtocolError { code: ..., stream: ... }`.
+
 <a id="FrameHeader"></a>
 
 ## `FrameHeader`

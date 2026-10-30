@@ -37,6 +37,7 @@ import backend.Mir {
   SwitchCase,
   Terminator,
   TrapSite,
+  Variable,
 }
 import hir.Hir {InfixOperator, PrefixOperator}
 import semantic.SourceLocations {Location}
@@ -50,6 +51,8 @@ import semantic.StaticValue
 import semantic.StaticValue {Sign as StaticSign, Value as StaticData}
 import semantic.SealedCore {CFunction, Lifecycle}
 import semantic.Target {Target}
+import semantic.TypeText
+import semantic.ModuleId {ModuleId}
 import semantic.Type {ArrayShape, Type}
 import semantic.TypedBody {Origin}
 import silk.mem.box {Box}
@@ -102,6 +105,8 @@ struct Writer {
   located: usize,
   /// The defined function's symbol, which qualifies its private constants.
   symbol: Bytes,
+  /// The function's `MirFunction.lines`, which give each location marker its detail.
+  lines: List<u64>,
   /// Where a trap emitted for the current statement reports to the current observer (event 6, N7).
   trap: Option<TrapReport>,
   /// Whether the code is shaped for an unoptimized (`-O0`) compile, whose fast instruction selector
@@ -119,6 +124,9 @@ struct Writer {
   /// Per MIR local, whether its slot is a scalar `alloca`. SROA promotes every marked local of
   /// that shape to a register, so its lifetime markers would only cost parse and pass time.
   scalars: List<bool>,
+  /// Per MIR local, the alignment of its storage, or `usize.MAX` where `emitSlots` read no layout.
+  /// Places rooted at a local start from it instead of looking the layout up again.
+  alignments: List<usize>,
   /// Caller copies of indirect C arguments in the entry block: block, parameter and address.
   copies: List<CallerCopy>,
   /// Entry-block copies that cold drops of whole aggregate locals run on: block, statement and
@@ -143,6 +151,9 @@ struct Writer {
   /// Per MIR block, whether its switch dispatches through a table of block addresses, and the
   /// tables the function being built uses, defined once its blocks have positions.
   threaded: List<bool>,
+  /// Per MIR block, whether every path from it ends in `fail` or a trap, so its calls are cold
+  /// and branches into it are unlikely (#2568). Empty in fast-path builds.
+  cold: List<bool>,
   tables: List<JumpTable>,
 }
 
@@ -188,11 +199,11 @@ effect fn writerFor(target: &Target, fastPath: bool) -> Writer ! OutOfMemoryErro
 
 // A writer for a target whose addresses are `pointerBits` wide; zero for declarations, which use none.
 effect fn writerOfWidth(pointerBits: usize, fastPath: bool) -> Writer ! OutOfMemoryError ? &mut Allocator {
-  return Writer {module: Module.make(), located: usize.ZERO, symbol: Bytes.make(), trap: Option<TrapReport>.none(), fastPath: fastPath,
+  return Writer {module: Module.make(), located: usize.ZERO, symbol: Bytes.make(), lines: List<u64>.make(), trap: Option<TrapReport>.none(), fastPath: fastPath,
     pointerBits: pointerBits, slots: List<u64>.make(), companions: List<u64>.make(),
-    blocks: List<u64>.make(), scalars: List<bool>.make(), copies: List<CallerCopy>.make(), dropCopies: List<DropCopy>.make(), parameters: List<u64>.make(), extras: List<u64>.make(), providers: List<u64>.make(),
+    blocks: List<u64>.make(), scalars: List<bool>.make(), alignments: List<usize>.make(), copies: List<CallerCopy>.make(), dropCopies: List<DropCopy>.make(), parameters: List<u64>.make(), extras: List<u64>.make(), providers: List<u64>.make(),
     out: Bitcode.none(), failure: Bitcode.none(), context: Bitcode.none(), observer: Bitcode.none(), cause: Bitcode.none(),
-    site: Bitcode.none(), transfer: Bitcode.none(), frame: Bitcode.none(), threaded: List<bool>.make(),
+    site: Bitcode.none(), transfer: Bitcode.none(), frame: Bitcode.none(), threaded: List<bool>.make(), cold: List<bool>.make(),
     tables: List<JumpTable>.make()}
 }
 
@@ -202,6 +213,7 @@ fn resetFunction(writer: &mut Writer) -> () {
   List<u64>.clear(&mut writer.*.companions)
   List<u64>.clear(&mut writer.*.blocks)
   List<bool>.clear(&mut writer.*.scalars)
+  List<usize>.clear(&mut writer.*.alignments)
   List<CallerCopy>.clear(&mut writer.*.copies)
   List<DropCopy>.clear(&mut writer.*.dropCopies)
   List<u64>.clear(&mut writer.*.parameters)
@@ -460,6 +472,11 @@ fn blockAt(writer: &Writer, index: usize) -> u64 {
   return List<u64>.get(&writer.blocks, index)
 }
 
+// Whether MIR block `index` only leads to `fail` or a trap (Writer.cold).
+fn isCold(writer: &Writer, index: usize) -> bool {
+  return index < List<bool>.length(&writer.cold) && List<bool>.get(&writer.cold, index)
+}
+
 // The storage address of MIR local `index`.
 fn slotOf(writer: &Writer, index: usize) -> u64 {
   return List<u64>.get(&writer.slots, index)
@@ -547,7 +564,7 @@ effect fn callNamed(writer: &mut Writer, name: &[u8], result: u64, parameters: &
 effect fn callIntrinsic(writer: &mut Writer, stem: &[u8], kind: Representation, operands: &[u64]) -> u64
 ! OutOfMemoryError ? &mut Allocator {
   let ty = run typeOf(&mut writer.*, kind)
-  let mut parameters = List<u64>.make()
+  let mut parameters = run List<u64>.makeWithCapacity(operands.length)
   let mut at = usize.ZERO
   while at < operands.length {
     run List<u64>.append(&mut parameters, ty)
@@ -570,6 +587,25 @@ effect fn branch(writer: &mut Writer, target: u64) -> () ! OutOfMemoryError ? &m
 
 effect fn branchIf(writer: &mut Writer, condition: u64, onTrue: u64, onFalse: u64) -> () ! OutOfMemoryError ? &mut Allocator {
   return run Module.condBr(&mut writer.*.module, condition, onTrue, onFalse)
+}
+
+// Like [`branchIf`] for a condition that rarely holds, such as a fallible call's failure status:
+// `llvm.expect.i1(condition, false)` gives the branch cold weights, so LLVM places `onTrue` out of
+// line even without a profile (#2568).
+effect fn branchUnlikely(writer: &mut Writer, condition: u64, onTrue: u64, onFalse: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run branchExpecting(&mut writer.*, condition, false, onTrue, onFalse)
+}
+
+// Branches on `condition`, telling LLVM it is usually `expected`.
+effect fn branchExpecting(writer: &mut Writer, condition: u64, expected: bool, onTrue: u64, onFalse: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let flag = run integerType(&mut writer.*, 1)
+  let mut bit: u64 = 0
+  if expected { bit = 1 }
+  let likely = run integerOf(&mut writer.*, 1, bit)
+  let parameters = [flag, flag]
+  let arguments = [condition, likely]
+  let hinted = run callNamed(&mut writer.*, b"llvm.expect.i1", flag, &parameters, &arguments)
+  return run Module.condBr(&mut writer.*.module, hinted, onTrue, onFalse)
 }
 
 // Starts or ends the life of a local's stack slot (backend.StackLifetimes), in Clang 22's
@@ -692,10 +728,22 @@ fn extendedFlag(writer: &Writer, value: Representation) -> bool {
 // The result attributes of a function returning `zeroext` when `extended`, declared and called
 // alike: an attribute list operand.
 effect fn resultAttributes(writer: &mut Writer, extended: bool) -> u64 ! OutOfMemoryError ? &mut Allocator {
-  if !extended { return 0 }
+  return run callAttributes(&mut writer.*, extended, false)
+}
+
+// A call's attributes: `zeroext` on an `extended` result, and `cold` on a call in a block that
+// only leads to `fail` or a trap, so LLVM neither inlines it nor lays its path out inline.
+effect fn callAttributes(writer: &mut Writer, extended: bool, cold: bool) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  if !extended && !cold { return 0 }
   Module.beginAttributes(&mut writer.*.module)
-  let encoding: [u64; 2] = [0, Bitcode.attrZeroExt()]
-  run Module.attributeGroup(&mut writer.*.module, Bitcode.positionResult(), &encoding)
+  if cold {
+    let coldEncoding: [u64; 2] = [0, Bitcode.attrCold()]
+    run Module.attributeGroup(&mut writer.*.module, Bitcode.positionFunction(), &coldEncoding)
+  }
+  if extended {
+    let encoding: [u64; 2] = [0, Bitcode.attrZeroExt()]
+    run Module.attributeGroup(&mut writer.*.module, Bitcode.positionResult(), &encoding)
+  }
   return run Module.endAttributes(&mut writer.*.module)
 }
 
@@ -915,10 +963,19 @@ effect fn pairField(writer: &mut Writer, pair: u64, index: usize) -> u64 ! OutOf
 }
 
 /// Shared module definitions, emitted into every unit: the fatal dispatch helper and the foreign
-/// personality.
-pub effect fn declarations(target: &Target) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+/// personality. An unoptimized build (`fastPath`), which lists its functions in the frame table,
+/// also gets the helper's frame walk: the table lookup, the report of one listed frame, the chain
+/// of a stepped frame's suspended callers, and, for a target whose unwinder walks the stack
+/// (`unwinds`), the unwinder's callback.
+pub effect fn declarations(target: &Target, fastPath: bool) -> Bytes ! OutOfMemoryError ? &mut Allocator {
   let mut writer = run writerFor(target, false)
-  run defineFatalDispatch(&mut writer, target)
+  run defineFatalDispatch(&mut writer, target, fastPath)
+  if fastPath {
+    run defineFrameName(&mut writer, target)
+    run defineFrameReport(&mut writer, target)
+    run defineStepChain(&mut writer, target)
+    if unwinds(target) { run defineFrameStep(&mut writer, target) }
+  }
   run defineForeignPersonality(&mut writer)
   run defineGuardedReclaim(&mut writer)
   return run Module.serialize(&writer.module)
@@ -978,7 +1035,13 @@ effect fn defineForeignPersonality(writer: &mut Writer) -> () ! OutOfMemoryError
 // cause's pool handle, or `0`, the trap reason and its site label (failure observer note N7). A
 // null observer reports nothing. A record without an adapter is an execution's trap record, which
 // forwards to the observer of the drive running it, without a cause.
-effect fn defineFatalDispatch(writer: &mut Writer, target: &Target) -> () ! OutOfMemoryError ? &mut Allocator {
+//
+// With `frames`, event 6 carries no cause. The helper then reports each listed caller frame as
+// event 8 with its name, and the cause last as event 9, so the call chain reads right below the
+// trap site. A native target's unwinder walks the stack (`defineFrameStep`), and each stepped
+// frame it meets adds the suspended callers its step record leads to (`defineStepChain`). On a
+// wasm target, which has no unwinder, the helper walks the step records alone.
+effect fn defineFatalDispatch(writer: &mut Writer, target: &Target, frames: bool) -> () ! OutOfMemoryError ? &mut Allocator {
   let word = wordSize(target)
   let bits = word * 8
   let void = run voidType(&mut writer.*)
@@ -1066,13 +1129,442 @@ effect fn defineFatalDispatch(writer: &mut Writer, target: &Target) -> () ! OutO
   let callbackParameters = [pointer, pointer, byte, wordTy, wordTy, pointer, wordTy, pointer, wordTy, pointer, pointer, pointer]
   let callbackType = run functionType(&mut writer.*, wordTy, &callbackParameters)
   let event = run Module.int(&mut writer.*.module, byte, 6)
-  let arguments = [callable, state, event, first, zero, reasonData, reasonLength, originData, originLength, null, null, null]
+  let mut reported = first
+  if frames { reported = zero }
+  let arguments = [callable, state, event, reported, zero, reasonData, reasonLength, originData, originLength, null, null, null]
   let answer = run Module.call(&mut writer.*.module, callbackType, callback, &arguments, 0, false)
   Module.setName(&mut writer.*.module, answer, Bitcode.plain(Bitcode.prefix(b"answer")))
+  if frames {
+    // The walk record `{callback, callable, state, count, site, site length, steps}` the frame
+    // walk reads, `steps` the innermost step record it has yet to chain.
+    let walkType = run Module.structure(&mut writer.*.module, &[pointer, pointer, pointer, wordTy, pointer, wordTy, pointer])
+    let walk = run Module.alloca(&mut writer.*.module, walkType, usize.toU64(word))
+    Module.setName(&mut writer.*.module, walk, Bitcode.plain(Bitcode.prefix(b"walk")))
+    run Module.store(&mut writer.*.module, callback, walk, usize.toU64(word), false)
+    let callableSlot = run byteOffset(&mut writer.*, walk, word)
+    run Module.store(&mut writer.*.module, callable, callableSlot, usize.toU64(word), false)
+    let stateSlot = run byteOffset(&mut writer.*, walk, word * 2)
+    run Module.store(&mut writer.*.module, state, stateSlot, usize.toU64(word), false)
+    let countSlot = run byteOffset(&mut writer.*, walk, word * 3)
+    run Module.store(&mut writer.*.module, zero, countSlot, usize.toU64(word), false)
+    let siteSlot = run byteOffset(&mut writer.*, walk, word * 4)
+    run Module.store(&mut writer.*.module, originData, siteSlot, usize.toU64(word), false)
+    let siteLengthSlot = run byteOffset(&mut writer.*, walk, word * 5)
+    run Module.store(&mut writer.*.module, originLength, siteLengthSlot, usize.toU64(word), false)
+    let active = run activeSteps(&mut writer.*, word)
+    let innermost = run loadPointer(&mut writer.*, active, word)
+    let stepsSlot = run byteOffset(&mut writer.*, walk, word * 6)
+    run Module.store(&mut writer.*.module, innermost, stepsSlot, usize.toU64(word), false)
+    if unwinds(target) {
+      let int32 = run integerType(&mut writer.*, 32)
+      let stepParameters = [pointer, pointer]
+      let stepType = run functionType(&mut writer.*, int32, &stepParameters)
+      let step = run Module.functionRef(&mut writer.*.module, b"silk.diagnostic.frame", stepType)
+      let walkParameters = [pointer, pointer]
+      let walkArguments = [step, walk]
+      let walked = run callNamed(&mut writer.*, b"_Unwind_Backtrace", int32, &walkParameters, &walkArguments)
+    } else {
+      // Each step record names its stepped frame, then the suspended callers it leads to.
+      let records = run labelled(&mut writer.*, b"records")
+      let stepped = run labelled(&mut writer.*, b"stepped")
+      let walked = run labelled(&mut writer.*, b"walked")
+      run branch(&mut writer.*, records)
+      startBlock(&mut writer.*, records)
+      let steps = run loadPointer(&mut writer.*, stepsSlot, word)
+      let unstepped = run compareOf(&mut writer.*, Bitcode.intEq(), steps, null)
+      run branchIf(&mut writer.*, unstepped, walked, stepped)
+      startBlock(&mut writer.*, stepped)
+      let top = run loadPointer(&mut writer.*, steps, word)
+      let resume = run loadWordAt(&mut writer.*, top, Coroutine.resumeOffset(word))
+      let named = run callFrameName(&mut writer.*, resume)
+      run callFrameReport(&mut writer.*, walk, named)
+      run callStepChain(&mut writer.*, walk)
+      let countSlotAgain = run byteOffset(&mut writer.*, walk, word * 3)
+      let count = run Module.load(&mut writer.*.module, wordTy, countSlotAgain, usize.toU64(word), false)
+      let limit = run Module.int(&mut writer.*.module, wordTy, usize.toU64(frameLimit()))
+      let exhausted = run compareOf(&mut writer.*, Bitcode.intUgt(), count, limit)
+      run branchIf(&mut writer.*, exhausted, walked, records)
+      startBlock(&mut writer.*, walked)
+    }
+    let causeBlock = run labelled(&mut writer.*, b"reportCause")
+    let caused = run compareOf(&mut writer.*, Bitcode.intNe(), first, zero)
+    run branchIf(&mut writer.*, caused, causeBlock, done)
+    startBlock(&mut writer.*, causeBlock)
+    let causeEvent = run Module.int(&mut writer.*.module, byte, 9)
+    let causeArguments = [callable, state, causeEvent, first, zero, null, zero, null, zero, null, null, null]
+    let causeAnswer = run Module.call(&mut writer.*.module, callbackType, callback, &causeArguments, 0, false)
+  }
   run branch(&mut writer.*, done)
   startBlock(&mut writer.*, done)
   run Module.retVoid(&mut writer.*.module)
   return run Module.endBody(&mut writer.*.module)
+}
+
+// Whether a trap's report walks the machine stack with the unwinder: on a native target. A wasm
+// target's report walks the step records alone.
+fn unwinds(target: &Target) -> bool {
+  return !same(Target.objectFormat(target), b"wasm")
+}
+
+// The section of the frame table, and the symbols the linker defines at its bounds.
+fn framesSection(target: &Target) -> &'static [u8] {
+  if same(Target.objectFormat(target), b"macho") { return b"__DATA,__silk_frames" }
+  return b"silk_frames"
+}
+
+fn framesStart(target: &Target) -> &'static [u8] {
+  if same(Target.objectFormat(target), b"macho") { return b"\x01section$start$__DATA$__silk_frames" }
+  return b"__start_silk_frames"
+}
+
+fn framesStop(target: &Target) -> &'static [u8] {
+  if same(Target.objectFormat(target), b"macho") { return b"\x01section$end$__DATA$__silk_frames" }
+  return b"__stop_silk_frames"
+}
+
+// The `_Unwind_Backtrace` callback of the fatal helper's walk: `silk.diagnostic.frame(context,
+// walk)` reports the frame's function when the frame table lists it (`defineFrameReport`). When
+// the function is the step of the frame the innermost step record holds, the frame's suspended
+// callers follow (`defineStepChain`). The walk stops after `frameLimit` listed frames.
+effect fn defineFrameStep(writer: &mut Writer, target: &Target) -> () ! OutOfMemoryError ? &mut Allocator {
+  let word = wordSize(target)
+  let bits = word * 8
+  let pointer = run pointerType(&mut writer.*)
+  let wordTy = run integerType(&mut writer.*, bits)
+  let int32 = run integerType(&mut writer.*, 32)
+  let parameters = [pointer, pointer]
+  let ty = run functionType(&mut writer.*, int32, &parameters)
+  let attributes = run diagnosticAttributes(&mut writer.*)
+  let function = run Module.defineFunction(&mut writer.*.module, b"silk.diagnostic.frame", ty, Bitcode.linkInternal(), attributes)
+  let names = [Bitcode.plain(Bitcode.prefix(b"context")), Bitcode.plain(Bitcode.prefix(b"walk"))]
+  run Module.beginBody(&mut writer.*.module, function, &parameters, &names)
+  let context = Bitcode.local(0)
+  let walk = Bitcode.local(1)
+  let entry = run labelled(&mut writer.*, b"entry")
+  let lookup = run labelled(&mut writer.*, b"lookup")
+  let stepped = run labelled(&mut writer.*, b"stepped")
+  let own = run labelled(&mut writer.*, b"own")
+  let reportStep = run labelled(&mut writer.*, b"reportStep")
+  let chain = run labelled(&mut writer.*, b"chain")
+  let report = run labelled(&mut writer.*, b"report")
+  let next = run labelled(&mut writer.*, b"next")
+  let stop = run labelled(&mut writer.*, b"stop")
+  let null = run nullOf(&mut writer.*)
+  startBlock(&mut writer.*, entry)
+  let countAddress = run byteOffset(&mut writer.*, walk, word * 3)
+  let count = run Module.load(&mut writer.*.module, wordTy, countAddress, usize.toU64(word), false)
+  let limit = run Module.int(&mut writer.*.module, wordTy, usize.toU64(frameLimit()))
+  let exhausted = run compareOf(&mut writer.*, Bitcode.intUgt(), count, limit)
+  run branchIf(&mut writer.*, exhausted, stop, lookup)
+  startBlock(&mut writer.*, lookup)
+  let startParameters = [pointer]
+  let startArguments = [context]
+  let start = run callNamed(&mut writer.*, b"_Unwind_GetRegionStart", wordTy, &startParameters, &startArguments)
+  let code = run Module.cast(&mut writer.*.module, Bitcode.castIntToPtr(), start, pointer)
+  Module.setName(&mut writer.*.module, code, Bitcode.plain(Bitcode.prefix(b"code")))
+  let named = run callFrameName(&mut writer.*, code)
+  let stepsSlot = run byteOffset(&mut writer.*, walk, word * 6)
+  let steps = run loadPointer(&mut writer.*, stepsSlot, word)
+  let unstepped = run compareOf(&mut writer.*, Bitcode.intEq(), steps, null)
+  run branchIf(&mut writer.*, unstepped, report, stepped)
+  startBlock(&mut writer.*, stepped)
+  let top = run loadPointer(&mut writer.*, steps, word)
+  let resume = run loadWordAt(&mut writer.*, top, Coroutine.resumeOffset(word))
+  let stepping = run compareOf(&mut writer.*, Bitcode.intEq(), resume, code)
+  run branchIf(&mut writer.*, stepping, own, report)
+  // The step of a record's bottom frame runs under that frame's own driver, which the walk meets
+  // next and reports under the same name.
+  startBlock(&mut writer.*, own)
+  let parent = run loadPointer(&mut writer.*, top, word)
+  let bottom = run compareOf(&mut writer.*, Bitcode.intEq(), parent, null)
+  run branchIf(&mut writer.*, bottom, chain, reportStep)
+  startBlock(&mut writer.*, reportStep)
+  run callFrameReport(&mut writer.*, walk, named)
+  run branch(&mut writer.*, chain)
+  startBlock(&mut writer.*, chain)
+  run callStepChain(&mut writer.*, walk)
+  run branch(&mut writer.*, next)
+  startBlock(&mut writer.*, report)
+  run callFrameReport(&mut writer.*, walk, named)
+  run branch(&mut writer.*, next)
+  // `_URC_NO_REASON` continues the walk; `_URC_END_OF_STACK` ends it.
+  startBlock(&mut writer.*, next)
+  let continuing = run Module.int(&mut writer.*.module, int32, 0)
+  run Module.ret(&mut writer.*.module, continuing)
+  startBlock(&mut writer.*, stop)
+  let ended = run Module.int(&mut writer.*.module, int32, 5)
+  run Module.ret(&mut writer.*.module, ended)
+  return run Module.endBody(&mut writer.*.module)
+}
+
+// The attributes of the frame walk's helpers: never inlined, and cold.
+effect fn diagnosticAttributes(writer: &mut Writer) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  Module.beginAttributes(&mut writer.*.module)
+  let encoding: [u64; 4] = [0, Bitcode.attrNoInline(), 0, Bitcode.attrCold()]
+  run Module.attributeGroup(&mut writer.*.module, Bitcode.positionFunction(), &encoding)
+  return run Module.endAttributes(&mut writer.*.module)
+}
+
+// `silk.diagnostic.name(code)` answers the name descriptor the frame table lists for the function
+// at `code`, or null. The table holds `{function, name}` entries the linker gathers into one
+// section (`frameEntry`).
+effect fn defineFrameName(writer: &mut Writer, target: &Target) -> () ! OutOfMemoryError ? &mut Allocator {
+  let word = wordSize(target)
+  let pointer = run pointerType(&mut writer.*)
+  let parameters = [pointer]
+  let ty = run functionType(&mut writer.*, pointer, &parameters)
+  let attributes = run diagnosticAttributes(&mut writer.*)
+  let function = run Module.defineFunction(&mut writer.*.module, b"silk.diagnostic.name", ty, Bitcode.linkInternal(), attributes)
+  let names = [Bitcode.plain(Bitcode.prefix(b"code"))]
+  run Module.beginBody(&mut writer.*.module, function, &parameters, &names)
+  let code = Bitcode.local(0)
+  let entry = run labelled(&mut writer.*, b"entry")
+  let scan = run labelled(&mut writer.*, b"scan")
+  let test = run labelled(&mut writer.*, b"test")
+  let advance = run labelled(&mut writer.*, b"advance")
+  let found = run labelled(&mut writer.*, b"found")
+  let missing = run labelled(&mut writer.*, b"missing")
+  startBlock(&mut writer.*, entry)
+  let entryType = run Module.pair(&mut writer.*.module, pointer, pointer)
+  let first = run Module.declareWeakObject(&mut writer.*.module, framesStart(target), entryType)
+  let last = run Module.declareWeakObject(&mut writer.*.module, framesStop(target), entryType)
+  run branch(&mut writer.*, scan)
+  startBlock(&mut writer.*, scan)
+  let following = run Module.reserve(&mut writer.*.module)
+  let atIncoming = [first, entry, following, advance]
+  let at = run Module.phi(&mut writer.*.module, pointer, &atIncoming)
+  Module.setName(&mut writer.*.module, at, Bitcode.plain(Bitcode.prefix(b"at")))
+  let more = run compareOf(&mut writer.*, Bitcode.intUlt(), at, last)
+  run branchIf(&mut writer.*, more, test, missing)
+  startBlock(&mut writer.*, test)
+  let listed = run loadPointer(&mut writer.*, at, word)
+  let hit = run compareOf(&mut writer.*, Bitcode.intEq(), listed, code)
+  run branchIf(&mut writer.*, hit, found, advance)
+  startBlock(&mut writer.*, advance)
+  let after = run byteOffset(&mut writer.*, at, word * 2)
+  Module.bind(&mut writer.*.module, following, after)
+  run branch(&mut writer.*, scan)
+  startBlock(&mut writer.*, found)
+  let nameAddress = run byteOffset(&mut writer.*, at, word)
+  let name = run loadPointer(&mut writer.*, nameAddress, word)
+  run Module.ret(&mut writer.*.module, name)
+  startBlock(&mut writer.*, missing)
+  let null = run nullOf(&mut writer.*)
+  run Module.ret(&mut writer.*.module, null)
+  return run Module.endBody(&mut writer.*.module)
+}
+
+effect fn callFrameName(writer: &mut Writer, code: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let pointer = run pointerType(&mut writer.*)
+  let parameters = [pointer]
+  let arguments = [code]
+  let named = run callNamed(&mut writer.*, b"silk.diagnostic.name", pointer, &parameters, &arguments)
+  Module.setName(&mut writer.*.module, named, Bitcode.plain(Bitcode.prefix(b"named")))
+  return named
+}
+
+// `silk.diagnostic.report(walk, name)` counts a listed frame and reports it as event 8 with its
+// name descriptor `name`; a null `name` is an unlisted frame. A first listed frame whose name
+// leads the trap's site label (`module.function (module:line:column)`) is the trapping function,
+// which the site already names, so it is counted without a report.
+effect fn defineFrameReport(writer: &mut Writer, target: &Target) -> () ! OutOfMemoryError ? &mut Allocator {
+  let word = wordSize(target)
+  let bits = word * 8
+  let void = run voidType(&mut writer.*)
+  let pointer = run pointerType(&mut writer.*)
+  let wordTy = run integerType(&mut writer.*, bits)
+  let byte = run integerType(&mut writer.*, 8)
+  let int32 = run integerType(&mut writer.*, 32)
+  let parameters = [pointer, pointer]
+  let ty = run functionType(&mut writer.*, void, &parameters)
+  let attributes = run diagnosticAttributes(&mut writer.*)
+  let function = run Module.defineFunction(&mut writer.*.module, b"silk.diagnostic.report", ty, Bitcode.linkInternal(), attributes)
+  let names = [Bitcode.plain(Bitcode.prefix(b"walk")), Bitcode.plain(Bitcode.prefix(b"name"))]
+  run Module.beginBody(&mut writer.*.module, function, &parameters, &names)
+  let walk = Bitcode.local(0)
+  let name = Bitcode.local(1)
+  let entry = run labelled(&mut writer.*, b"entry")
+  let listed = run labelled(&mut writer.*, b"listed")
+  let firstFrame = run labelled(&mut writer.*, b"first")
+  let compare = run labelled(&mut writer.*, b"compare")
+  let space = run labelled(&mut writer.*, b"space")
+  let report = run labelled(&mut writer.*, b"report")
+  let done = run labelled(&mut writer.*, b"done")
+  let null = run nullOf(&mut writer.*)
+  let zero = run Module.zero(&mut writer.*.module, wordTy)
+  let one = run Module.int(&mut writer.*.module, wordTy, 1)
+  startBlock(&mut writer.*, entry)
+  let unlisted = run compareOf(&mut writer.*, Bitcode.intEq(), name, null)
+  run branchIf(&mut writer.*, unlisted, done, listed)
+  startBlock(&mut writer.*, listed)
+  let countAddress = run byteOffset(&mut writer.*, walk, word * 3)
+  let count = run Module.load(&mut writer.*.module, wordTy, countAddress, usize.toU64(word), false)
+  Module.setName(&mut writer.*.module, count, Bitcode.plain(Bitcode.prefix(b"count")))
+  let counted = run binaryOf(&mut writer.*, Bitcode.opAdd(), count, one)
+  run Module.store(&mut writer.*.module, counted, countAddress, usize.toU64(word), false)
+  let nameData = run loadPointer(&mut writer.*, name, word)
+  let nameLengthAddress = run byteOffset(&mut writer.*, name, word)
+  let nameLength = run Module.load(&mut writer.*.module, wordTy, nameLengthAddress, usize.toU64(word), false)
+  let trapping = run compareOf(&mut writer.*, Bitcode.intEq(), count, zero)
+  run branchIf(&mut writer.*, trapping, firstFrame, report)
+  // The first listed frame is skipped when the site label is its name followed by ` (`.
+  startBlock(&mut writer.*, firstFrame)
+  let siteSlot = run byteOffset(&mut writer.*, walk, word * 4)
+  let site = run loadPointer(&mut writer.*, siteSlot, word)
+  let siteLengthSlot = run byteOffset(&mut writer.*, walk, word * 5)
+  let siteLength = run Module.load(&mut writer.*.module, wordTy, siteLengthSlot, usize.toU64(word), false)
+  let shorter = run compareOf(&mut writer.*, Bitcode.intUlt(), nameLength, siteLength)
+  run branchIf(&mut writer.*, shorter, compare, report)
+  startBlock(&mut writer.*, compare)
+  let compareParameters = [pointer, pointer, wordTy]
+  let compareArguments = [nameData, site, nameLength]
+  let compared = run callNamed(&mut writer.*, b"memcmp", int32, &compareParameters, &compareArguments)
+  let int32Zero = run Module.zero(&mut writer.*.module, int32)
+  let leading = run compareOf(&mut writer.*, Bitcode.intEq(), compared, int32Zero)
+  run branchIf(&mut writer.*, leading, space, report)
+  startBlock(&mut writer.*, space)
+  let afterName = run indexedOffset(&mut writer.*, site, nameLength)
+  let nextByte = run Module.load(&mut writer.*.module, byte, afterName, 1, false)
+  let blank = run Module.int(&mut writer.*.module, byte, 32)
+  let siteNamed = run compareOf(&mut writer.*, Bitcode.intEq(), nextByte, blank)
+  run branchIf(&mut writer.*, siteNamed, done, report)
+  startBlock(&mut writer.*, report)
+  let callback = run loadPointer(&mut writer.*, walk, word)
+  let callableSlot = run byteOffset(&mut writer.*, walk, word)
+  let callable = run loadPointer(&mut writer.*, callableSlot, word)
+  let stateSlot = run byteOffset(&mut writer.*, walk, word * 2)
+  let state = run loadPointer(&mut writer.*, stateSlot, word)
+  let callbackParameters = [pointer, pointer, byte, wordTy, wordTy, pointer, wordTy, pointer, wordTy, pointer, pointer, pointer]
+  let callbackType = run functionType(&mut writer.*, wordTy, &callbackParameters)
+  let event = run Module.int(&mut writer.*.module, byte, 8)
+  let arguments = [callable, state, event, zero, zero, nameData, nameLength, null, zero, null, null, null]
+  let answer = run Module.call(&mut writer.*.module, callbackType, callback, &arguments, 0, false)
+  run branch(&mut writer.*, done)
+  startBlock(&mut writer.*, done)
+  run Module.retVoid(&mut writer.*.module)
+  return run Module.endBody(&mut writer.*.module)
+}
+
+effect fn callFrameReport(writer: &mut Writer, walk: u64, named: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let void = run voidType(&mut writer.*)
+  let pointer = run pointerType(&mut writer.*)
+  let parameters = [pointer, pointer]
+  let arguments = [walk, named]
+  let none = run callNamed(&mut writer.*, b"silk.diagnostic.report", void, &parameters, &arguments)
+  return ()
+}
+
+// `silk.diagnostic.chain(walk)` reports the suspended callers of the frame the walk's innermost
+// unchained step record holds, parent by parent (`defineFrameReport`), then moves the walk to the
+// record's outer one. Only the frame chain knows these callers: each one's step returned when it
+// pushed its callee, and a frame resumed later runs from its driver. The chain ends at the bottom
+// frame, or after `frameLimit` frames. On a native target, the bottom frame is left out: its own
+// driver steps the record, and the unwinder meets that driver, which bears the frame's name.
+effect fn defineStepChain(writer: &mut Writer, target: &Target) -> () ! OutOfMemoryError ? &mut Allocator {
+  let word = wordSize(target)
+  let bits = word * 8
+  let void = run voidType(&mut writer.*)
+  let pointer = run pointerType(&mut writer.*)
+  let wordTy = run integerType(&mut writer.*, bits)
+  let parameters = [pointer]
+  let ty = run functionType(&mut writer.*, void, &parameters)
+  let attributes = run diagnosticAttributes(&mut writer.*)
+  let function = run Module.defineFunction(&mut writer.*.module, b"silk.diagnostic.chain", ty, Bitcode.linkInternal(), attributes)
+  let names = [Bitcode.plain(Bitcode.prefix(b"walk"))]
+  run Module.beginBody(&mut writer.*.module, function, &parameters, &names)
+  let walk = Bitcode.local(0)
+  let entry = run labelled(&mut writer.*, b"entry")
+  let stepped = run labelled(&mut writer.*, b"stepped")
+  let parents = run labelled(&mut writer.*, b"parents")
+  let check = run labelled(&mut writer.*, b"check")
+  let report = run labelled(&mut writer.*, b"report")
+  let done = run labelled(&mut writer.*, b"done")
+  let null = run nullOf(&mut writer.*)
+  startBlock(&mut writer.*, entry)
+  let stepsSlot = run byteOffset(&mut writer.*, walk, word * 6)
+  let steps = run loadPointer(&mut writer.*, stepsSlot, word)
+  let unstepped = run compareOf(&mut writer.*, Bitcode.intEq(), steps, null)
+  run branchIf(&mut writer.*, unstepped, done, stepped)
+  startBlock(&mut writer.*, stepped)
+  let top = run loadPointer(&mut writer.*, steps, word)
+  let outer = run loadWordAt(&mut writer.*, steps, word)
+  run Module.store(&mut writer.*.module, outer, stepsSlot, usize.toU64(word), false)
+  let caller = run loadPointer(&mut writer.*, top, word)
+  run branch(&mut writer.*, parents)
+  startBlock(&mut writer.*, parents)
+  let following = run Module.reserve(&mut writer.*.module)
+  let frameIncoming = [caller, stepped, following, report]
+  let frame = run Module.phi(&mut writer.*.module, pointer, &frameIncoming)
+  Module.setName(&mut writer.*.module, frame, Bitcode.plain(Bitcode.prefix(b"frame")))
+  let zero = run Module.zero(&mut writer.*.module, wordTy)
+  let walked = run Module.reserve(&mut writer.*.module)
+  let depthIncoming = [zero, stepped, walked, report]
+  let depth = run Module.phi(&mut writer.*.module, wordTy, &depthIncoming)
+  Module.setName(&mut writer.*.module, depth, Bitcode.plain(Bitcode.prefix(b"depth")))
+  let ended = run compareOf(&mut writer.*, Bitcode.intEq(), frame, null)
+  run branchIf(&mut writer.*, ended, done, check)
+  startBlock(&mut writer.*, check)
+  let parent = run loadPointer(&mut writer.*, frame, word)
+  Module.setName(&mut writer.*.module, parent, Bitcode.plain(Bitcode.prefix(b"parent")))
+  if unwinds(target) {
+    let last = run compareOf(&mut writer.*, Bitcode.intEq(), parent, null)
+    run branchIf(&mut writer.*, last, done, report)
+  } else {
+    run branch(&mut writer.*, report)
+  }
+  startBlock(&mut writer.*, report)
+  let resume = run loadWordAt(&mut writer.*, frame, Coroutine.resumeOffset(word))
+  let named = run callFrameName(&mut writer.*, resume)
+  run callFrameReport(&mut writer.*, walk, named)
+  Module.bind(&mut writer.*.module, following, parent)
+  let one = run Module.int(&mut writer.*.module, wordTy, 1)
+  let deeper = run binaryOf(&mut writer.*, Bitcode.opAdd(), depth, one)
+  Module.bind(&mut writer.*.module, walked, deeper)
+  let countAddress = run byteOffset(&mut writer.*, walk, word * 3)
+  let count = run Module.load(&mut writer.*.module, wordTy, countAddress, usize.toU64(word), false)
+  let limit = run Module.int(&mut writer.*.module, wordTy, usize.toU64(frameLimit()))
+  let exhausted = run compareOf(&mut writer.*, Bitcode.intUgt(), count, limit)
+  let deep = run compareOf(&mut writer.*, Bitcode.intUgt(), deeper, limit)
+  let ending = run binaryOf(&mut writer.*, Bitcode.opOr(), exhausted, deep)
+  run branchIf(&mut writer.*, ending, done, parents)
+  startBlock(&mut writer.*, done)
+  run Module.retVoid(&mut writer.*.module)
+  return run Module.endBody(&mut writer.*.module)
+}
+
+effect fn callStepChain(writer: &mut Writer, walk: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let void = run voidType(&mut writer.*)
+  let pointer = run pointerType(&mut writer.*)
+  let parameters = [pointer]
+  let arguments = [walk]
+  let none = run callNamed(&mut writer.*, b"silk.diagnostic.chain", void, &parameters, &arguments)
+  return ()
+}
+
+// The most caller frames one trap reports; a deeper chain, such as a runaway recursion, ends
+// there.
+fn frameLimit() -> usize { return 64 }
+
+// In an unoptimized build, adds the entry `{defined, name}` of a function that has a frame name to
+// the frame table the fatal helper's walk reads (`defineFrameName`). `suffix` follows the
+// function's symbol in the defined function's, as `$step` does for the frame's step.
+effect fn frameEntry(writer: &mut Writer, function: &MirFunction, target: &Target, defined: u64, suffix: &[u8]) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  if !writer.fastPath || Bytes.length(&function.frame) == usize.ZERO { return () }
+  let label = run staticString(&mut writer.*, Bytes.asSlice(&function.frame), wordSize(target) * 8)
+  let pointer = run pointerType(&mut writer.*)
+  let ty = run Module.pair(&mut writer.*.module, pointer, pointer)
+  let elements = [defined, label]
+  let initializer = run Module.aggregate(&mut writer.*.module, ty, &elements)
+  let mut name = run Bytes.copy(Bytes.asSlice(&writer.symbol))
+  run Bytes.append(&mut name, suffix)
+  run Bytes.append(&mut name, b".frame")
+  let entry = run Module.defineObject(&mut writer.*.module, Bytes.asSlice(&name), ty, Bitcode.linkExternal(), false, initializer)
+  Module.setHidden(&mut writer.*.module, entry)
+  Module.setAlignment(&mut writer.*.module, entry, usize.toU64(wordSize(target)))
+  let section = run Module.section(&mut writer.*.module, framesSection(target))
+  Module.setSection(&mut writer.*.module, entry, section)
+  return ()
 }
 
 // Branches to a trap when `condition` holds. Under an observer, the trap first reports `reason` at
@@ -1693,8 +2185,12 @@ effect fn emitPlace(
   let owner = InstanceKey.identity(&function.key)
   let span = locals[place.local].origin.location
   let mut ty = Shared<Type>.clone(&locals[place.local].ty)
-  let rootLayout = run layoutOf(layouts, &ty, function, span)
-  let mut alignment = rootLayout.alignment
+  let mut alignment = usize.MAX
+  if place.local < List<usize>.length(&writer.alignments) { alignment = List<usize>.get(&writer.alignments, place.local) }
+  if alignment == usize.MAX {
+    let rootLayout = run layoutOf(layouts, &ty, function, span)
+    alignment = rootLayout.alignment
+  }
   let mut address = slotOf(&writer.*, place.local)
   let projections = List<Projection>.asSlice(&place.projections)
   let mut at = usize.ZERO
@@ -2587,7 +3083,7 @@ effect fn emitVector(
   let input = first.scalar
   if primitive == IntrinsicPrimitive.SimdMinimum || primitive == IntrinsicPrimitive.SimdMaximum ||
     primitive == IntrinsicPrimitive.SimdMulAdd {
-    let mut arguments = List<u64>.make()
+    let mut arguments = run List<u64>.makeWithCapacity(lowered.length)
     let mut used = usize.ZERO
     while used < lowered.length {
       run List<u64>.append(&mut arguments, lowered[used].value)
@@ -4140,8 +4636,9 @@ effect fn emitCall(
     return run emitCCall(&mut writer.*, function, target, layouts, &foreign[index], callee, arguments,
       providers, diagnostics, destination, normal, failure, span, block)
   }
+  let cold = isCold(&writer.*, block)
   return run emitCallInner(&mut writer.*, function, target, layouts, identities,
-    callee, arguments, providers, diagnostics, destination, normal, failure, span)
+    callee, arguments, providers, diagnostics, destination, normal, failure, span, cold)
 }
 
 effect fn emitCallInner(
@@ -4158,6 +4655,7 @@ effect fn emitCallInner(
   normal: usize,
   failure: &Option<FailureEdge>,
   span: Location,
+  cold: bool,
 ) -> () ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
   let output = run emitPlace(&mut writer.*, function, target, layouts, destination)
   let kind = output.representation
@@ -4256,7 +4754,7 @@ effect fn emitCallInner(
     let symbol = run InstanceIdentity.name(identities, &key)
     calleeValue = run Module.functionRef(&mut writer.*.module, Bytes.asSlice(&symbol), functionTy)
   }
-  let attributes = run resultAttributes(&mut writer.*, extended)
+  let attributes = run callAttributes(&mut writer.*, extended, cold)
   let mut returned = Bitcode.none()
   if InstanceKey.fixedLinkage(&function.key) {
     returned = run invokeGuarded(&mut writer.*, functionTy, calleeValue, List<u64>.asSlice(&passed), attributes)
@@ -4266,7 +4764,7 @@ effect fn emitCallInner(
   if fallible {
     let onFailure = blockAt(&writer.*, handler)
     let onSuccess = blockAt(&writer.*, normal)
-    return run branchIf(&mut writer.*, returned, onFailure, onSuccess)
+    return run branchUnlikely(&mut writer.*, returned, onFailure, onSuccess)
   }
   if !kind.unit && !outward {
     run storeValue(&mut writer.*, &output, &Value {scalar: kind, value: returned})
@@ -4355,7 +4853,7 @@ effect fn emitBlock(
       run markLife(&mut writer.*, b"start", starts[startAt].local, companions)
       startAt = startAt + usize.ONE
     }
-    run locate(&mut writer.*, statementOrigin(&statements[at]))
+    run locate(&mut writer.*, Mir.statementOrigin(&statements[at]))
     match & statements[at] {
       Statement.Assign {destination, value, origin} => {
         match &value {
@@ -4423,7 +4921,7 @@ effect fn emitBlock(
     run markLife(&mut writer.*, b"start", starts[startAt].local, companions)
     startAt = startAt + usize.ONE
   }
-  run locate(&mut writer.*, terminatorOrigin(&block.terminator))
+  run locate(&mut writer.*, Mir.terminatorOrigin(&block.terminator))
   match & block.terminator {
     Terminator.Goto {target: next, origin: _} => {
       let handle = blockAt(&writer.*, next)
@@ -4433,7 +4931,12 @@ effect fn emitBlock(
       let tested = run emitOperand(&mut writer.*, function, target, layouts, &condition)
       let onTrue = blockAt(&writer.*, thenBlock)
       let onFalse = blockAt(&writer.*, elseBlock)
-      run branchIf(&mut writer.*, tested.value, onTrue, onFalse)
+      let coldTrue = isCold(&writer.*, thenBlock)
+      if coldTrue != isCold(&writer.*, elseBlock) {
+        run branchExpecting(&mut writer.*, tested.value, !coldTrue, onTrue, onFalse)
+      } else {
+        run branchIf(&mut writer.*, tested.value, onTrue, onFalse)
+      }
     }
     Terminator.Return {origin} => match &suspended.* {
       Option<Suspended>.Some {value: stepping} => run emitStepReturn(&mut writer.*, function, target, layouts, &stepping, origin.location)
@@ -4542,6 +5045,56 @@ effect fn emitBlock(
 // dispatches the next case itself instead of jumping back to one shared jump-table branch, which
 // saves the jump and lets the branch predictor learn from each arm. A function with an `indirectbr`
 // is never inlined, so only switches with many cases inside a loop qualify.
+// Per MIR block, whether every path from it ends in `fail`, a trap or `unreachable`: such a block
+// builds and reports an error or stops, so it is rarely taken (Writer.cold). The facts flow
+// backward from those exits until nothing changes.
+effect fn coldBlocks(function: &MirFunction) -> List<bool> ! OutOfMemoryError ? &mut Allocator {
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let mut cold = List<bool>.make()
+  run List<bool>.appendRepeated(&mut cold, false, blocks.length)
+  let mut changed = true
+  while changed {
+    changed = false
+    let mut at = blocks.length
+    while at > usize.ZERO {
+      at = at - usize.ONE
+      if !List<bool>.get(&cold, at) && leadsOnlyToCold(&blocks[at].terminator, &cold) {
+        List<bool>.set(&mut cold, at, true)
+        changed = true
+      }
+    }
+  }
+  return move cold
+}
+
+fn leadsOnlyToCold(terminator: &Terminator, cold: &List<bool>) -> bool {
+  return match &terminator.* {
+    Terminator.Fail {..} => true
+    Terminator.Trap {..} => true
+    Terminator.TrapText {..} => true
+    Terminator.Unreachable {..} => true
+    Terminator.Goto {target, ..} => List<bool>.get(cold, target)
+    Terminator.Branch {thenBlock, elseBlock, ..} => List<bool>.get(cold, thenBlock) && List<bool>.get(cold, elseBlock)
+    Terminator.Call {normal, failure, ..} => List<bool>.get(cold, normal) && failureCold(&failure, cold)
+    Terminator.Switch {cases, otherwise, ..} => List<bool>.get(cold, otherwise) && casesCold(List<SwitchCase>.asSlice(&cases), cold)
+    _ => false
+  }
+}
+
+fn failureCold(failure: &Option<FailureEdge>, cold: &List<bool>) -> bool {
+  if let Option<FailureEdge>.Some {value: edge} = &failure.* { return List<bool>.get(cold, edge.target) }
+  return true
+}
+
+fn casesCold(cases: &[SwitchCase], cold: &List<bool>) -> bool {
+  let mut at = usize.ZERO
+  while at < cases.length {
+    if !List<bool>.get(cold, cases[at].target) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
 fn threadedMinimumCases() -> usize { return 64 }
 fn threadedMaximumValue() -> u64 { return 4096 }
 
@@ -4811,6 +5364,7 @@ effect fn emitSlots(
     let mut slot = Bitcode.none()
     let mut named = true
     let mut scalarSlot = false
+    let mut aligned = usize.MAX
     if resident != usize.MAX {
       slot = run byteOffset(&mut writer.*, frame, resident)
     } else {
@@ -4820,6 +5374,7 @@ effect fn emitSlots(
         function,
         locals[local].origin.location,
       )
+      aligned = localLayout.alignment
       let kind = storageRepresentation(&locals[local].ty, target, localLayout)
       let mut owned = usize.MAX
       let mut outward = false
@@ -4850,6 +5405,7 @@ effect fn emitSlots(
     }
     run List<u64>.append(&mut writer.*.slots, slot)
     run List<bool>.append(&mut writer.*.scalars, scalarSlot)
+    run List<usize>.append(&mut writer.*.alignments, aligned)
     run List<u64>.append(&mut writer.*.companions, Bitcode.none())
     local = local + usize.ONE
   }
@@ -4871,6 +5427,179 @@ effect fn emitSlots(
     Module.setName(&mut writer.*.module, address, Bitcode.named(Bitcode.prefixCompanion(), owned[companionAt]))
     List<u64>.set(&mut writer.*.companions, owned[companionAt], address)
     companionAt = companionAt + usize.ONE
+  }
+  // A debug build names each source variable's slot. A step's variables live in its frame, which
+  // it reaches through a computed address, so it names none.
+  if let Option<Suspended>.None = &suspended.* {
+    let variables = List<Variable>.asSlice(&function.variables)
+    if variables.length > usize.ZERO {
+      let owner = InstanceKey.identity(&function.key)
+      let viewer = Shared<DeclarationId>.with<ModuleId>(&owner, fn(id: &DeclarationId) -> ModuleId {
+        return ModuleId.copy(id.moduleId())
+      })
+      let mut at = usize.ZERO
+      while at < variables.length {
+        let mut slot = Bitcode.none()
+        if variables[at].local < locals.length { slot = List<u64>.get(&writer.slots, variables[at].local) }
+        if slot != Bitcode.none() {
+          let mut words = List<u64>.make()
+          let mut budget: usize = 256
+          run debugType(&mut words, &locals[variables[at].local].ty, layouts, target, &viewer, 4, &mut budget)
+          run Module.variable(&mut writer.*.module, slot, variables[at].place, variables[at].argument,
+            Bytes.asSlice(&variables[at].name), List<u64>.asSlice(&words))
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  return ()
+}
+
+// How a debugger reads a value of a type with no layout of its own to describe.
+struct DebugShape {
+  // 0 unknown, 1 a DWARF base type of `encoding`, 2 a pointer to `inner`, 3 a string.
+  kind: usize,
+  encoding: u64,
+  inner: Option<Shared<Type>>,
+}
+
+fn debugShape(ty: &Shared<Type>) -> DebugShape {
+  return Shared<Type>.with<DebugShape>(ty, fn(value: &Type) -> DebugShape {
+    return match &value.* {
+      Type.Reference {referent, ..} => DebugShape {kind: 2, encoding: 0, inner: Option<Shared<Type>>.some(Shared<Type>.clone(&referent))}
+      Type.Pointer {pointee, ..} => DebugShape {kind: 2, encoding: 0, inner: Option<Shared<Type>>.some(Shared<Type>.clone(&pointee))}
+      Type.String {..} => DebugShape {kind: 3, encoding: 0, inner: Option<Shared<Type>>.none()}
+      Type.Primitive {name} => {
+        let word = Bytes.asSlice(&name)
+        // DW_ATE_boolean, DW_ATE_UTF, DW_ATE_float, DW_ATE_signed and DW_ATE_unsigned.
+        let mut encoding: u64 = 0
+        if same(word, b"bool") {
+          encoding = 2
+        } else if same(word, b"char") {
+          encoding = 16
+        } else if word.length > usize.ZERO && word[usize.ZERO] == 102 {
+          encoding = 4
+        } else if word.length > usize.ZERO && word[usize.ZERO] == 105 {
+          encoding = 5
+        } else if word.length > usize.ZERO && word[usize.ZERO] == 117 {
+          encoding = 7
+        }
+        if encoding == 0 { return DebugShape {kind: 0, encoding: 0, inner: Option<Shared<Type>>.none()} }
+        return DebugShape {kind: 1, encoding: encoding, inner: Option<Shared<Type>>.none()}
+      }
+      _ => DebugShape {kind: 0, encoding: 0, inner: Option<Shared<Type>>.none()}
+    }
+  })
+}
+
+// Appends the debug type words of `ty` (`Bitcode.Module.variable`), spelled as `viewer` reads it,
+// following at most `depth` levels of members and pointees and describing at most `budget` members
+// in all. Fields are named by their index.
+effect fn debugType(words: &mut List<u64>, ty: &Shared<Type>, layouts: &TypeLayouts, target: &Target, viewer: &ModuleId,
+  depth: usize, budget: &mut usize) -> () ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let found = run TypeLayouts.firstMatching(layouts, ty)
+  if depth == usize.ZERO || found == usize.MAX {
+    return run List<u64>.append(&mut words.*, 0)
+  }
+  let listed = TypeLayouts.list(layouts)
+  let layout = Shared<Layout>.clone(&listed[found].layout)
+  let metrics = Shared<Layout>.with<Metrics>(&layout, Layout.metrics)
+  let mut name = Bytes.make()
+  if let Option<Bytes>.Some {value} = run TypeText.displayElided(ty, viewer) { name = move value }
+  let bits = usize.toU64(metrics.size * 8)
+  let pointerBits = u32.toU64(Target.pointerBits(target))
+  let shape = debugShape(ty)
+  if shape.kind == 1 {
+    let basic: [u64; 3] = [1, shape.encoding, bits]
+    run List<u64>.appendSlice(&mut words.*, &basic)
+    return run Bitcode.appendName(&mut words.*, Bytes.asSlice(&name))
+  }
+  if shape.kind == 2 && metrics.abi == Abi.Pointer {
+    let pointer: [u64; 2] = [2, pointerBits]
+    run List<u64>.appendSlice(&mut words.*, &pointer)
+    if let Option<Shared<Type>>.Some {value: inner} = &shape.inner {
+      return run debugType(&mut words.*, &inner, layouts, target, viewer, depth - usize.ONE, &mut budget.*)
+    }
+    return run List<u64>.append(&mut words.*, 0)
+  }
+  let header: [u64; 3] = [3, bits, usize.toU64(metrics.alignment * 8)]
+  if shape.kind == 3 || Shared<Layout>.with<bool>(&layout, fn(value: &Layout) -> bool {
+    return match &value.storage { Storage.Slice {..} => true _ => false }
+  }) {
+    // An address and a length; a string's bytes are `u8`.
+    let mut lengthOffset = pointerBits / 8
+    if let Option<SliceFacts>.Some {value: facts} = Shared<Layout>.with<Option<SliceFacts>>(&layout, Layout.sliceFacts) {
+      lengthOffset = usize.toU64(facts.lengthOffset)
+    }
+    run List<u64>.appendSlice(&mut words.*, &header)
+    run Bitcode.appendName(&mut words.*, Bytes.asSlice(&name))
+    run List<u64>.append(&mut words.*, 2)
+    run Bitcode.appendName(&mut words.*, b"pointer")
+    let pointer: [u64; 3] = [0, 2, pointerBits]
+    run List<u64>.appendSlice(&mut words.*, &pointer)
+    if shape.kind == 3 {
+      let byte: [u64; 3] = [1, 7, 8]
+      run List<u64>.appendSlice(&mut words.*, &byte)
+      run Bitcode.appendName(&mut words.*, b"u8")
+    } else if let Option<SliceFacts>.Some {value: facts} = Shared<Layout>.with<Option<SliceFacts>>(&layout, Layout.sliceFacts) {
+      run debugType(&mut words.*, &facts.element, layouts, target, viewer, depth - usize.ONE, &mut budget.*)
+    } else {
+      run List<u64>.append(&mut words.*, 0)
+    }
+    run Bitcode.appendName(&mut words.*, b"length")
+    let length: [u64; 4] = [lengthOffset * 8, 1, 7, pointerBits]
+    run List<u64>.appendSlice(&mut words.*, &length)
+    return run Bitcode.appendName(&mut words.*, b"usize")
+  }
+  if let Option<TaggedFacts>.Some {value: tagged} = Shared<Layout>.with<Option<TaggedFacts>>(&layout, Layout.taggedFacts) {
+    // A union shows its tag; its payload depends on it.
+    run List<u64>.appendSlice(&mut words.*, &header)
+    run Bitcode.appendName(&mut words.*, Bytes.asSlice(&name))
+    run List<u64>.append(&mut words.*, 1)
+    run Bitcode.appendName(&mut words.*, b"tag")
+    let tag: [u64; 4] = [0, 1, 7, usize.toU64(tagged.tagSize * 8)]
+    run List<u64>.appendSlice(&mut words.*, &tag)
+    return run Bitcode.appendName(&mut words.*, b"")
+  }
+  let count = Shared<Layout>.with<usize>(&layout, Layout.fieldCount)
+  if count == usize.ZERO && metrics.abi == Abi.Integer && metrics.size > usize.ZERO {
+    // A scalar enum is its unsigned tag.
+    let tag: [u64; 3] = [1, 7, bits]
+    run List<u64>.appendSlice(&mut words.*, &tag)
+    return run Bitcode.appendName(&mut words.*, Bytes.asSlice(&name))
+  }
+  if count == usize.ZERO {
+    run List<u64>.appendSlice(&mut words.*, &header)
+    run Bitcode.appendName(&mut words.*, Bytes.asSlice(&name))
+    return run List<u64>.append(&mut words.*, 0)
+  }
+  // A record names its fields by index; an array, `[0]` and on, up to 64 elements.
+  let sequence = Shared<Layout>.with<bool>(&layout, fn(value: &Layout) -> bool {
+    return match &value.storage { Storage.Sequence {..} => true _ => false }
+  })
+  let mut shown = count
+  if shown > 64 { shown = 64 }
+  if shown > budget.* { shown = budget.* }
+  budget.* = budget.* - shown
+  run List<u64>.appendSlice(&mut words.*, &header)
+  run Bitcode.appendName(&mut words.*, Bytes.asSlice(&name))
+  run List<u64>.append(&mut words.*, usize.toU64(shown))
+  let mut index = usize.ZERO
+  while index < shown {
+    let mut label = Bytes.make()
+    if sequence { run Bytes.append(&mut label, b"[") }
+    run appendDecimal(&mut label, usize.toU64(index))
+    if sequence { run Bytes.append(&mut label, b"]") }
+    run Bitcode.appendName(&mut words.*, Bytes.asSlice(&label))
+    let field = Shared<Layout>.with<Option<Field>>(&layout, fn(value: &Layout) -> Option<Field> { return Layout.fieldAt(value, index) })
+    if let Option<Field>.Some {value: member} = move field {
+      run List<u64>.append(&mut words.*, usize.toU64(member.offset * 8))
+      run debugType(&mut words.*, &member.ty, layouts, target, viewer, depth - usize.ONE, &mut budget.*)
+    } else {
+      let unknown: [u64; 2] = [0, 0]
+      run List<u64>.appendSlice(&mut words.*, &unknown)
+    }
+    index = index + usize.ONE
   }
   return ()
 }
@@ -5034,6 +5763,7 @@ pub effect fn emit(
   let indexed = run TypeLayouts.copyOf(supplied)
   let layouts = &indexed
   let mut writer = run writerFor(target, fastPath)
+  run List<u64>.appendSlice(&mut writer.lines, List<u64>.asSlice(&function.lines))
   let locals = List<Local>.asSlice(&function.locals)
   let resultFacts = run layoutOf(layouts, &function.result, function, locals[usize.ZERO].origin.location)
   let result = storageRepresentation(&function.result, target, resultFacts)
@@ -5177,6 +5907,13 @@ pub effect fn emit(
       run List<u64>.append(&mut functionAttributes, Bitcode.attrNoInline())
     }
   }
+  // A function written `@optimizeSize` is built for size in any profile (FUNC-003).
+  if function.optimizeSize && !guarded {
+    run List<u64>.append(&mut functionAttributes, 0)
+    run List<u64>.append(&mut functionAttributes, Bitcode.attrOptimizeForSize())
+    run List<u64>.append(&mut functionAttributes, 0)
+    run List<u64>.append(&mut functionAttributes, Bitcode.attrMinSize())
+  }
   run addAttributes(&mut lanes, Bitcode.positionFunction(), List<u64>.asSlice(&functionAttributes))
   let functionTy = run functionType(&mut writer, resultType, List<u64>.asSlice(&lanes.types))
   let attributes = run attributeList(&mut writer, &lanes)
@@ -5196,6 +5933,7 @@ pub effect fn emit(
       resetFunction(&mut writer)
       run emitStep(&mut writer, function, target, layouts, foreign, identities, &suspended, &stepping, Bytes.asSlice(&base))
     }
+    run frameEntry(&mut writer, function, target, defined, b"")
     return run Module.serialize(&writer.module)
   }
   run beginFunction(&mut writer, defined, &lanes)
@@ -5204,7 +5942,10 @@ pub effect fn emit(
   let mut lifetimes = StackLifetimes.Markers {blocks: List<BlockMarkers>.make()}
   let companions = run companionLocals(function)
   run addBlocks(&mut writer, blocks.length)
-  if !fastPath { writer.threaded = run threadedSwitches(function, target) }
+  if !fastPath {
+    writer.threaded = run threadedSwitches(function, target)
+    writer.cold = run coldBlocks(function)
+  }
   at = usize.ZERO
   while at < blocks.length {
     let handle = blockAt(&writer, at)
@@ -5223,6 +5964,7 @@ pub effect fn emit(
   }
   run Module.endBody(&mut writer.module)
   run defineTables(&mut writer, functionTy, defined)
+  run frameEntry(&mut writer, function, target, defined, b"")
   return run Module.serialize(&writer.module)
 }
 
@@ -5441,12 +6183,45 @@ effect fn stepType(writer: &mut Writer) -> u64 ! OutOfMemoryError ? &mut Allocat
   return run functionType(&mut writer.*, int32, &parameters)
 }
 
-// Steps the frame on top of `transfer`, answering the step's completion code.
-effect fn stepTop(writer: &mut Writer, transfer: u64, top: u64, word: usize) -> u64 ! OutOfMemoryError ? &mut Allocator {
+// Steps the frame on top of `transfer`, answering the step's completion code. In an unoptimized
+// build, `steps` is the driver's step record (`stepRecord`), which the step runs published in.
+effect fn stepTop(writer: &mut Writer, transfer: u64, top: u64, steps: u64, word: usize) -> u64 ! OutOfMemoryError ? &mut Allocator {
   let resume = run loadWordAt(&mut writer.*, top, Coroutine.resumeOffset(word))
   let ty = run stepType(&mut writer.*)
   let arguments = [transfer, top]
-  return run Module.call(&mut writer.*.module, ty, resume, &arguments, 0, false)
+  if steps == Bitcode.none() { return run Module.call(&mut writer.*.module, ty, resume, &arguments, 0, false) }
+  let active = run activeSteps(&mut writer.*, word)
+  let outer = run loadPointer(&mut writer.*, active, word)
+  run storeWordAt(&mut writer.*, top, steps, usize.ZERO)
+  run storeWordAt(&mut writer.*, outer, steps, word)
+  run storeOf(&mut writer.*, steps, active, word)
+  let code = run Module.call(&mut writer.*.module, ty, resume, &arguments, 0, false)
+  run storeOf(&mut writer.*, outer, active, word)
+  return code
+}
+
+// The step record of a driver in an unoptimized build, `{top, outer}`, or `none()` in an optimized
+// one. While a driver steps a frame, its record holds that frame and the record it hides, and the
+// thread's innermost record (`activeSteps`) is it, so a trap's report can name the
+// suspended callers of the frame, which only the frame chain knows (`defineStepChain`).
+effect fn stepRecord(writer: &mut Writer, word: usize) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  if !writer.fastPath { return Bitcode.none() }
+  let pointer = run pointerType(&mut writer.*)
+  let ty = run Module.array(&mut writer.*.module, 2, pointer)
+  let record = run Module.alloca(&mut writer.*.module, ty, usize.toU64(word))
+  Module.setName(&mut writer.*.module, record, hiddenName(b"steps"))
+  return record
+}
+
+// The thread-local address of the innermost step record (`stepRecord`), null outside every step.
+effect fn activeSteps(writer: &mut Writer, word: usize) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let pointer = run pointerType(&mut writer.*)
+  let null = run nullOf(&mut writer.*)
+  let active = run Module.defineObject(&mut writer.*.module, b"__silk_active_steps", pointer, Bitcode.linkLinkOnceOdr(), false, null)
+  Module.setHidden(&mut writer.*.module, active)
+  Module.setThreadLocal(&mut writer.*.module, active, 1)
+  Module.setAlignment(&mut writer.*.module, active, usize.toU64(word))
+  return active
 }
 
 // Whether `value` is the null address.
@@ -5487,6 +6262,7 @@ effect fn emitDriver(writer: &mut Writer, function: &MirFunction, target: &Targe
   if packageStart(function) { return run emitPackageDriver(&mut writer.*, function, target, layouts, stepping, symbol) }
   let entry = run labelled(&mut writer.*, b"entry")
   startBlock(&mut writer.*, entry)
+  let steps = run stepRecord(&mut writer.*, word)
   let wordTy = run wordType(&mut writer.*)
   let record = run Module.array(&mut writer.*.module, 4, wordTy)
   let transfer = run Module.alloca(&mut writer.*.module, record, usize.toU64(word))
@@ -5515,7 +6291,7 @@ effect fn emitDriver(writer: &mut Writer, function: &MirFunction, target: &Targe
   let step = run labelled(&mut writer.*, b"step")
   run branchIf(&mut writer.*, empty, finish, step)
   startBlock(&mut writer.*, step)
-  let code = run stepTop(&mut writer.*, transfer, top, word)
+  let code = run stepTop(&mut writer.*, transfer, top, steps, word)
   run branch(&mut writer.*, drive)
   startBlock(&mut writer.*, finish)
   let exit = run labelled(&mut writer.*, b"exit")
@@ -5549,6 +6325,7 @@ effect fn emitPackageDriver(writer: &mut Writer, function: &MirFunction, target:
   let word = wordSize(target)
   let entry = run labelled(&mut writer.*, b"entry")
   startBlock(&mut writer.*, entry)
+  let steps = run stepRecord(&mut writer.*, word)
   let header = List<u64>.get(&writer.parameters, usize.ZERO)
   let transfer = run byteOffset(&mut writer.*, header, usize.ZERO)
   Module.setName(&mut writer.*.module, transfer, hiddenName(b"transfer"))
@@ -5567,7 +6344,7 @@ effect fn emitPackageDriver(writer: &mut Writer, function: &MirFunction, target:
   let step = run labelled(&mut writer.*, b"step")
   run branchIf(&mut writer.*, empty, finish, step)
   startBlock(&mut writer.*, step)
-  let code = run stepTop(&mut writer.*, transfer, top, word)
+  let code = run stepTop(&mut writer.*, transfer, top, steps, word)
   let relinquishedCode = run integerOf(&mut writer.*, 32, 2)
   let relinquished = run compareOf(&mut writer.*, Bitcode.intEq(), code, relinquishedCode)
   let parked = run labelled(&mut writer.*, b"parked")
@@ -5729,6 +6506,7 @@ effect fn emitStep(writer: &mut Writer, function: &MirFunction, target: &Target,
   let name = run suffixed(symbol, b"$step")
   let defined = run Module.defineFunction(&mut writer.*.module, Bytes.asSlice(&name), ty, Bitcode.linkExternal(), attributes)
   if guarded { run guard(&mut writer.*, defined) }
+  run frameEntry(&mut writer.*, function, target, defined, b"$step")
   run beginFunction(&mut writer.*, defined, &lanes)
   let transfer = writer.transfer
   let frame = writer.frame
@@ -5830,7 +6608,7 @@ effect fn emitStep(writer: &mut Writer, function: &MirFunction, target: &Target,
         let zero = run integerOf(&mut writer.*, 8, 0)
         let taken = run compareOf(&mut writer.*, Bitcode.intNe(), flag, zero)
         let onFailure = blockAt(&writer.*, edge.target)
-        run branchIf(&mut writer.*, taken, onFailure, onSuccess)
+        run branchUnlikely(&mut writer.*, taken, onFailure, onSuccess)
       } else {
         run branch(&mut writer.*, onSuccess)
       }
@@ -6109,7 +6887,7 @@ effect fn coercionType(writer: &mut Writer, lane: &CAbi.Lane) -> u64 ! OutOfMemo
   let first = run typeOf(&mut writer.*, pieceRepresentation(parts[usize.ZERO]))
   if lane.grouped { return run Module.array(&mut writer.*.module, parts.length, first) }
   if parts.length == usize.ONE { return first }
-  let mut fields = List<u64>.make()
+  let mut fields = run List<u64>.makeWithCapacity(parts.length)
   let mut at = usize.ZERO
   while at < parts.length {
     run List<u64>.append(&mut fields, run typeOf(&mut writer.*, pieceRepresentation(parts[at])))
@@ -6403,7 +7181,7 @@ fn sameDeclarationRight(first: &DeclarationId, right: &Shared<DeclarationId>) ->
 pub effect fn retained(symbols: &[Bytes]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
   let mut writer = run writerOfWidth(usize.ZERO, false)
   let ty = run addressOnlyType(&mut writer)
-  let mut elements = List<u64>.make()
+  let mut elements = run List<u64>.makeWithCapacity(symbols.length)
   let mut at = usize.ZERO
   while at < symbols.length {
     run List<u64>.append(&mut elements, run Module.functionRef(&mut writer.module, Bytes.asSlice(&symbols[at]), ty))
@@ -6418,43 +7196,28 @@ pub effect fn retained(symbols: &[Bytes]) -> Bytes ! OutOfMemoryError ? &mut All
   return run Module.serialize(&writer.module)
 }
 
-// The origin of one statement, or absence for one without.
-fn statementOrigin(statement: &Statement) -> Option<Origin> {
-  return match &statement.* {
-    Statement.Assign {origin, ..} => Option<Origin>.some(origin)
-    Statement.Drop {origin, ..} => Option<Origin>.some(origin)
-    Statement.FailureContext {origin, ..} => Option<Origin>.some(origin)
-    _ => Option<Origin>.none()
-  }
-}
-
-fn terminatorOrigin(terminator: &Terminator) -> Option<Origin> {
-  return match &terminator.* {
-    Terminator.Goto {origin, ..} => Option<Origin>.some(origin)
-    Terminator.Branch {origin, ..} => Option<Origin>.some(origin)
-    Terminator.Return {origin} => Option<Origin>.some(origin)
-    Terminator.Call {origin, ..} => Option<Origin>.some(origin)
-    Terminator.Fail {origin} => Option<Origin>.some(origin)
-    Terminator.Trap {origin, ..} => Option<Origin>.some(origin)
-    Terminator.TrapText {origin, ..} => Option<Origin>.some(origin)
-    Terminator.Unreachable {origin} => Option<Origin>.some(origin)
-    Terminator.Switch {origin, ..} => Option<Origin>.some(origin)
-    _ => Option<Origin>.none()
-  }
-}
-
 // Marks the instructions emitted next as coming from `origin`, by its first token boundary in the
-// declaration, which a debug build resolves to a line and column (`Bitcode.markerLocation`). The
-// marker holds no source position, so the emitted body stays a function of the MIR alone.
+// declaration (`Mir.markerPosition`), and, in a build with line tables, by the line and column
+// `MirFunction.lines` gives it, which a debug build turns into its rows (`Bitcode.markerLocation`).
+// The marker holds nothing the MIR does not, so the emitted body stays a function of the MIR alone.
 effect fn locate(writer: &mut Writer, origin: Option<Origin>) -> () ! OutOfMemoryError ? &mut Allocator {
-  let placed = match origin {
-    Option<Origin>.Some {value} => value.location
-    Option<Origin>.None => { return () }
-  }
+  let position = Mir.markerPosition(origin)
   // A compiler-made statement has no authored position and keeps the last one.
-  if !Location.isAuthored(placed) { return () }
-  let position = placed.start + usize.ONE
-  if position == writer.located { return () }
+  if position == usize.ZERO || position == writer.located { return () }
   writer.located = position
-  return run Module.location(&mut writer.*.module, usize.toU64(position), 0)
+  let lines = List<u64>.asSlice(&writer.lines)
+  let mut place: u64 = 0
+  let mut low = usize.ZERO
+  let mut high = lines.length / 2
+  let wanted = usize.toU64(position)
+  while low < high {
+    let middle = low + (high - low) / 2
+    let found = lines[middle * 2]
+    if found == wanted {
+      place = lines[middle * 2 + usize.ONE]
+      break
+    }
+    if found < wanted { low = middle + usize.ONE } else { high = middle }
+  }
+  return run Module.location(&mut writer.*.module, wanted, place)
 }
