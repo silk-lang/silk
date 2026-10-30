@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset=".github/assets/silk-wordmark-dark.svg">
-    <img src=".github/assets/silk-wordmark-light.svg" alt="Silk" width="280">
+    <img src=".github/assets/silk-wordmark-light.svg" alt="Silk" width="240">
   </picture>
 </p>
 
