@@ -527,6 +527,22 @@ If the deadline passes while the task is still parked inside the interruptible b
 `Execution.interrupt` with the token, so the boundary resumes with `false`. The provider
 removes a deadline once it fires. `Effect.timeoutAt` arms one deadline per boundary.
 
+<a id="Scheduler.armDeadlineAfter"></a>
+
+### Operation `armDeadlineAfter`
+
+```silk
+effect fn armDeadlineAfter(howLong: u64) -> usize ? &mut Scheduler
+```
+
+Arms a deadline `howLong` nanoseconds after the provider next reads its clock, and returns its
+token, which is never 0.
+
+#### Details
+
+It behaves as [`armDeadline`](#Scheduler.armDeadline), but the provider measures the duration itself, so a stale
+clock reading in the calling task does not shorten it. `Effect.timeout` uses it.
+
 <a id="Scheduler.disarmDeadline"></a>
 
 ### Operation `disarmDeadline`

@@ -462,8 +462,9 @@ resumes with `false`. Wakes of the interrupted park publish nothing.
 
 #### Gotchas
 
-The parked body must be inside a boundary for `token`, and `token` must not be 0. Interrupting
-an Execution that is not dormant or eligible is a fatal state trap.
+The parked body must be inside a boundary for `token`, and `token` must not be 0. With no
+such boundary, every frame is abandoned, as when the Execution is dropped. Interrupting an
+Execution that is not dormant or eligible is a fatal state trap.
 
 <a id="Execution.impl.wakeTransferable"></a>
 

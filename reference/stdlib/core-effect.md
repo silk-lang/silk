@@ -1038,7 +1038,7 @@ failures and needs no providers. If `value` is affine, the effect can run one ti
 pub effect fn timeout<'env, A, E, ?R>(
     self: once Effect<'env; A ! E ? R>,
     howLong: u64
-  ) -> A ! E | TimeoutError ? R | &mut Scheduler | &mut MonotonicClock
+  ) -> A ! E | TimeoutError ? R | &mut Scheduler
 ```
 
 Runs `self`, and stops it with [`TimeoutError`](#TimeoutError) if it has not finished `howLong` nanoseconds
@@ -1046,13 +1046,14 @@ from now.
 
 #### Details
 
-The deadline is a mark of the active `MonotonicClock` plus `howLong`. See [`timeoutAt`](#Effect.impl.timeoutAt) for
-how the effect stops.
+The Scheduler reads its clock when the task next yields to it, so a stale clock reading in
+the task does not shorten the wait. See [`timeoutAt`](#Effect.impl.timeoutAt) for how the effect stops.
 
 #### Gotchas
 
-It needs a `Scheduler` provider, such as `LocalScheduler`. The effect stops only at a park.
-`ensuring` finalizers inside it do not run when it stops.
+It needs a `Scheduler` provider, such as `LocalScheduler`. The effect stops only at a park,
+and work before its first park is not counted. `ensuring` finalizers inside it do not run
+when it stops.
 
 <a id="Effect.impl.timeoutAt"></a>
 
