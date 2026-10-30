@@ -144,6 +144,10 @@ an `Effect<...>` is treated as if it carried `with Intrinsic.inline()`. Such a f
 `Effect.map`, mostly calls its argument, and inlining it lets the optimizer run that argument's code
 in place. Its own `with Intrinsic.inlineNever()` or `with Intrinsic.inlineAlways()` still decides.
 
+`@optimizeSize` is written alongside any of these and builds the function for small code whatever
+the build's profile: its LLVM definition carries `optsize` and `minsize`. It suits cold setup code,
+table builders and generic growth paths in an otherwise speed-optimized WebAssembly module.
+
 **Boundary:** The clause is a request to the optimizer. A debug build compiles each module apart,
 so a call into another module is not inlined there. A recursive call is never inlined into itself.
 A `static fn`, an `extern` or `export` function and an interface or service operation take no
