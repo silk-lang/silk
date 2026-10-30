@@ -1,0 +1,167 @@
+//! Turns Wasmtime's report of a trap into the frames of a Silk trap report.
+//!
+//! # When to use
+//! `silk test` on a WASI target calls [`frames`] on the standard error of a runner that Wasmtime
+//! stopped, so a trap's callers read like those of a native unoptimized build, under the test.
+//!
+//! # Details
+//! Wasmtime writes `error while executing at wasm backtrace:`, one numbered line per frame with
+//! the frame's name from the module's `name` section or DWARF, an `at <file>:<line>:<column>`
+//! line under it when `WASMTIME_BACKTRACE_DETAILS=1` gives one, and last `wasm trap: <reason>`.
+//! The innermost frame is left out when the program reported the trap itself, since its report
+//! already names that site; frames of the standard library (names that start with `silk/`) and of
+//! the host's entry code are left out too.
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.collections.bytes {Bytes}
+import silk.core.option {Option}
+import silk.collections.slice {Slice}
+import silk.num.usize
+import silk.collections.list {List}
+
+fn startsWith(text: &[u8], prefix: &[u8]) -> bool {
+  if text.length < prefix.length { return false }
+  let mut at = usize.ZERO
+  while at < prefix.length {
+    if text[at] != prefix[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// The first index of `needle` in `text`, or `usize.MAX`.
+fn find(text: &[u8], needle: &[u8]) -> usize {
+  if needle.length > text.length { return usize.MAX }
+  let mut at = usize.ZERO
+  while at + needle.length <= text.length {
+    if startsWith(Slice.view<u8>(text, at, text.length - at), needle) { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+// `line` without its leading spaces.
+fn trimmed(line: &[u8]) -> &[u8] {
+  let mut at = usize.ZERO
+  while at < line.length && line[at] == 32 { at = at + usize.ONE }
+  return Slice.view<u8>(line, at, line.length - at)
+}
+
+fn digit(byte: u8) -> bool { return byte >= 48 && byte <= 57 }
+
+// The frame name of a frame line, `N: 0x1f - name`, `N: name` or `- name`, without the module
+// prefix Wasmtime writes before `!`; none for another line.
+fn frameName(line: &[u8]) -> Option<&[u8]> {
+  let text = trimmed(line)
+  let mut start = usize.ZERO
+  if text.length > usize.ZERO && digit(text[usize.ZERO]) {
+    while start < text.length && digit(text[start]) { start = start + usize.ONE }
+    if start == text.length || text[start] != 58 { return Option<&[u8]>.none() }
+    start = start + usize.ONE
+    let rest = trimmed(Slice.view<u8>(text, start, text.length - start))
+    let address = find(rest, b" - ")
+    let mut name = rest
+    if startsWith(rest, b"0x") && address != usize.MAX {
+      name = Slice.view<u8>(rest, address + 3, rest.length - address - 3)
+    }
+    return Option<&[u8]>.some(withoutModule(name))
+  }
+  if startsWith(text, b"- ") {
+    return Option<&[u8]>.some(withoutModule(Slice.view<u8>(text, 2, text.length - 2)))
+  }
+  return Option<&[u8]>.none()
+}
+
+fn withoutModule(name: &[u8]) -> &[u8] {
+  let mut at = name.length
+  while at > usize.ZERO {
+    if name[at - usize.ONE] == 33 { return Slice.view<u8>(name, at, name.length - at) }
+    at = at - usize.ONE
+  }
+  return name
+}
+
+// Whether a frame belongs to the standard library or the host's entry code, which a report leaves
+// out.
+fn hidden(name: &[u8]) -> bool {
+  return startsWith(name, b"silk/") || startsWith(name, b"wasi:") || startsWith(name, b"_start")
+    || startsWith(name, b"__original_main")
+}
+
+/// The trap that stopped a Wasmtime run, read from its standard error `error`.
+pub struct Trap {
+  /// The reason after `wasm trap: `, such as ``wasm `unreachable` instruction executed`` or
+  /// `call stack exhausted`.
+  pub reason: Bytes,
+  /// One report line for each listed frame: `<indent>  at <name>`, followed by ` (<location>)`
+  /// when Wasmtime gives one.
+  pub frames: Bytes,
+}
+
+/// Whether `trap` came from Silk's own trap, which reports its reason and site before it executes
+/// `unreachable`.
+pub fn reported(trap: &Trap) -> bool {
+  return startsWith(Bytes.asSlice(&trap.reason), b"wasm `unreachable`")
+}
+
+/// Whether `trap` is Wasmtime's interruption of a run that outlived its `-W timeout`.
+pub fn interrupted(trap: &Trap) -> bool {
+  return startsWith(Bytes.asSlice(&trap.reason), b"interrupt")
+}
+
+/// Reads the trap in Wasmtime's standard error `error`, or none when `error` reports no trap. Each
+/// frame line starts with `indent`; a location under `base` followed by `/` is written relative to
+/// it. When the program reported the trap itself ([`reported`]), the innermost frame is left out.
+pub effect fn frames(error: &[u8], indent: &[u8], base: &[u8]) -> Option<Trap> ! OutOfMemoryError ? &mut Allocator {
+  let start = find(error, b"wasm backtrace:")
+  let cause = find(error, b"wasm trap: ")
+  if start == usize.MAX || cause == usize.MAX || cause < start { return Option<Trap>.none() }
+  let mut reasonEnd = cause + 11
+  while reasonEnd < error.length && error[reasonEnd] != 10 { reasonEnd = reasonEnd + usize.ONE }
+  let reason = run Bytes.copy(Slice.view<u8>(error, cause + 11, reasonEnd - cause - 11))
+  let mut skip = startsWith(Bytes.asSlice(&reason), b"wasm `unreachable`")
+  let mut output = Bytes.make()
+  let mut previous = Bytes.make()
+  // Whether the frame being read is written, so its location line goes with it.
+  let mut writing = false
+  let mut at = start
+  while at < error.length && error[at] != 10 { at = at + usize.ONE }
+  while at < cause {
+    at = at + usize.ONE
+    let lineStart = at
+    while at < error.length && error[at] != 10 { at = at + usize.ONE }
+    let line = Slice.view<u8>(error, lineStart, at - lineStart)
+    if find(line, b"wasm trap: ") != usize.MAX { break }
+    let text = trimmed(line)
+    if let Option<&[u8]>.Some {value: name} = frameName(line) {
+      if writing { run Bytes.append(&mut output, b"\n") }
+      writing = false
+      if skip {
+        skip = false
+      } else if !hidden(name) && !(Bytes.length(&previous) == name.length && startsWith(Bytes.asSlice(&previous), name)) {
+        run Bytes.append(&mut output, indent)
+        run Bytes.append(&mut output, b"  at ")
+        run Bytes.append(&mut output, name)
+        Bytes.truncate(&mut previous, usize.ZERO)
+        run Bytes.append(&mut previous, name)
+        writing = true
+      }
+    } else if startsWith(text, b"at ") {
+      if writing {
+        let mut location = Slice.view<u8>(text, 3, text.length - 3)
+        if base.length > usize.ZERO && startsWith(location, base) && location.length > base.length && location[base.length] == 47 {
+          location = Slice.view<u8>(location, base.length + 1, location.length - base.length - 1)
+        }
+        run Bytes.append(&mut output, b" (")
+        run Bytes.append(&mut output, location)
+        run Bytes.append(&mut output, b")\n")
+        writing = false
+      }
+    } else {
+      if writing { run Bytes.append(&mut output, b"\n") }
+      writing = false
+      if !startsWith(text, b"note:") && text.length > usize.ZERO && !digit(text[usize.ZERO]) { break }
+    }
+  }
+  if writing { run Bytes.append(&mut output, b"\n") }
+  return Option<Trap>.some(Trap {reason: move reason, frames: move output})
+}
