@@ -10,6 +10,9 @@ Fibers: handles to child tasks, with typed outcomes and one observer each.
 | [`forkChild`](#Fiber.impl.forkChild) | Start structured child work under the current `Scheduler` |
 | [`join`](#Fiber.impl.join) | Wait for a child, and raise its failure in the current effect |
 | [`await`](#Fiber.impl.await) | Wait for a child, and get success, failure or cancellation as data |
+| [`interrupt`](#Fiber.impl.interrupt) | Cancel a child that is still running, and get its final outcome |
+| [`awaitEither`](#Fiber.impl.awaitEither) | Wait for the first of two children, and keep the other running |
+| [`race`](#Fiber.impl.race) | Take the result of whichever of two children finishes first, and cancel the other |
 | [`yieldNow`](#Fiber.impl.yieldNow) | Let other ready tasks run before the current task continues |
 
 Run the root program with `silk.concurrency.local_scheduler`, which provides the `Scheduler` service.
@@ -29,8 +32,12 @@ completion functions) are for scheduler providers, not for application code.
 - [`join`](#Fiber.impl.join) raises the typed failure of the child unchanged, or [`Cancelled`](#Cancelled).
 
 ## Gotchas
-Dropping a Fiber stops the observation. It does not cancel the task. The scheduler cancels
-unfinished children when the root finishes.
+Dropping a Fiber stops the observation. It does not cancel the task; [`interrupt`](#Fiber.impl.interrupt) does. The
+scheduler cancels unfinished children when their parent finishes.
+
+Cancellation takes effect only at a park, such as a wait for a timer or for another Fiber. It
+runs `Drop` hooks and non-parking finalizers (`Effect.ensuringNonParking`,
+`Effect.useReleaseNonParking`), but not `Effect.ensuring` finalizers.
 
 ## Examples
 ### Fork two children and join them
@@ -143,7 +150,7 @@ pub fn main() -> i32 {
 
 Import as `Fiber` with `import silk.concurrency.fiber { Fiber }`.
 
-Public declarations: 8.
+Public declarations: 10.
 
 <a id="CompletionProducer"></a>
 
@@ -200,8 +207,8 @@ fork.
 
 ### Gotchas
 
-Dropping the handle stops the observation. It does not cancel its task. The scheduler cancels
-unfinished children when the root finishes.
+Dropping the handle stops the observation. It does not cancel its task; [`interrupt`](#Fiber.impl.interrupt) does. The
+scheduler cancels unfinished children when their parent finishes.
 
 <a id="Fiber.impl"></a>
 
@@ -216,7 +223,7 @@ impl<A, E> Fiber<A, E>
 ### Associated function `prepare`
 
 ```silk
-pub effect fn prepare() -> PreparedFiber<A, E>
+pub effect fn prepare(identity: TaskId) -> PreparedFiber<A, E>
   ! OutOfMemoryError
   ? &mut Allocator
 ```
@@ -230,7 +237,8 @@ Use this provider operation before a Scheduler constructs and publishes a task.
 #### Details
 
 No endpoint becomes visible until both Shared completion cells exist. Observation and
-notification allocate no further storage.
+notification allocate no further storage. `identity` is the task the Fiber observes, which
+[`interrupt`](#Fiber.impl.interrupt) asks the Scheduler to cancel.
 
 <a id="Fiber.impl.completeSuccess"></a>
 
@@ -291,6 +299,87 @@ Consumes a Fiber and returns its success, typed failure, or cancellation as data
 
 A terminal Fiber returns immediately. A pending Fiber parks the current Execution and installs
 exactly one Wake. Observation and resumption allocate no storage.
+
+<a id="Fiber.impl.interrupt"></a>
+
+### Method `interrupt`
+
+```silk
+pub effect<'env> fn interrupt<'env>(self: Self) -> Outcome<A, E> ? &mut Scheduler
+```
+
+Cancels the task unless it already finished, and returns its final outcome.
+
+#### When to use
+
+Use `interrupt` to stop a child whose result is no longer needed, such as the loser of a race.
+
+#### Details
+
+The current task parks until the Scheduler has processed the request. Cancelling drops the
+child's parked Execution and its unfinished descendants, which runs their `Drop` hooks and
+their non-parking finalizers (`Effect.ensuringNonParking`, `Effect.useReleaseNonParking`).
+Thus that cleanup has finished when `interrupt` returns. A child that finished before the
+request gives its real outcome, so the result is `Success` or `Failure` as well as
+`Cancelled`.
+
+#### Gotchas
+
+A child is cancelled only at a park, such as a wait for a timer or for another Fiber. Code
+between two parks always runs to its end. `Effect.ensuring` finalizers do not run on
+cancellation. Interrupting the current task or one of its ancestors does nothing, and the
+await that follows then waits for that task to finish.
+
+Interrupt a Fiber only under the Scheduler that forked it. The request names the task by its
+identity within that Scheduler, so under another Scheduler it reaches an unrelated task.
+
+<a id="Fiber.impl.awaitEither"></a>
+
+### Method `awaitEither`
+
+```silk
+pub effect<'env> fn awaitEither<'env, B: 'env, F: 'env>(
+    self: Self,
+    other: Fiber<B, F>,
+  ) -> FirstLeft<A, E, B, F> | FirstRight<A, E, B, F>
+```
+
+Waits for the first of two tasks to finish, and returns its outcome with the other Fiber.
+
+#### When to use
+
+Use `awaitEither` to act on whichever child finishes first. Use [`race`](#Fiber.impl.race) when the other child
+should then be cancelled.
+
+#### Details
+
+If both tasks had already finished before the call, `self` wins. The other Fiber is returned unobserved and still
+running, so the caller can await, interrupt, or drop it. Like [`await`](#Fiber.impl.await), a failure or a
+cancellation of the winner is data in its `Outcome`.
+
+<a id="Fiber.impl.race"></a>
+
+### Method `race`
+
+```silk
+pub effect<'env> fn race<'env>(self: Self, other: Fiber<A, E>) -> A
+  ! E | Cancelled
+  ? &mut Scheduler
+```
+
+Waits for the first of two tasks to finish, cancels the other, and returns the first result.
+
+#### When to use
+
+Use `race` to take whichever of two equivalent computations finishes first, such as two
+replicas of one request.
+
+#### Details
+
+The first task to finish wins, whatever its outcome: a typed failure of the winner is raised
+unchanged, and a cancelled winner raises [`Cancelled`](#Cancelled). The other task is cancelled with
+[`interrupt`](#Fiber.impl.interrupt) before `race` returns, so its cleanup has finished. If both had already
+finished before the call, `self` wins.
 
 <a id="Fiber.impl.join"></a>
 
@@ -397,6 +486,66 @@ pub struct Cancelled
 ```
 
 A Fiber outcome that reports structured task cancellation.
+
+<a id="FirstLeft"></a>
+
+## `FirstLeft`
+
+```silk
+pub struct FirstLeft<A, E, B, F>
+```
+
+The first task of an [`awaitEither`](#Fiber.impl.awaitEither) finished first.
+
+<a id="FirstLeft.outcome"></a>
+
+### Field `outcome`
+
+```silk
+pub outcome: Outcome<A, E>
+```
+
+The outcome of the first task.
+
+<a id="FirstLeft.other"></a>
+
+### Field `other`
+
+```silk
+pub other: Fiber<B, F>
+```
+
+The second task, unobserved and possibly still running.
+
+<a id="FirstRight"></a>
+
+## `FirstRight`
+
+```silk
+pub struct FirstRight<A, E, B, F>
+```
+
+The second task of an [`awaitEither`](#Fiber.impl.awaitEither) finished first.
+
+<a id="FirstRight.other"></a>
+
+### Field `other`
+
+```silk
+pub other: Fiber<A, E>
+```
+
+The first task, unobserved and possibly still running.
+
+<a id="FirstRight.outcome"></a>
+
+### Field `outcome`
+
+```silk
+pub outcome: Outcome<B, F>
+```
+
+The outcome of the second task.
 
 <a id="Cancelled.impl.Debug"></a>
 
