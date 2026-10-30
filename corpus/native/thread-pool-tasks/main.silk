@@ -1,10 +1,12 @@
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.collections.list { List }
+import silk.concurrency.execution { Execution, TransferableWake }
+import silk.concurrency.fiber { Cancelled, Failure, Outcome, Success }
 import silk.concurrency.thread_native { SpawnError }
 import silk.core.result { Result }
 import silk.concurrency.sync { Arc }
-import silk.concurrency.thread_pool { Pool, TaskHandle, ThreadPool }
+import silk.concurrency.thread_pool { Pool, PoolFiber, ThreadPool }
 
 effect fn sum(from: i64, to: i64) -> i64 {
   let mut total: i64 = 0
@@ -16,42 +18,42 @@ effect fn sum(from: i64, to: i64) -> i64 {
   return total
 }
 
-// Many independent tasks joined in order.
-effect fn fanOut(pool: Pool) -> i64 ! OutOfMemoryError {
-  let mut handles = List<TaskHandle<i64>>.make()
+// Many independent fibers joined in order.
+effect fn fanOut(pool: Pool) -> i64 ! OutOfMemoryError | Cancelled {
+  let mut fibers = List<PoolFiber<i64, never>>.make()
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut at: i64 = 0
   while at < 1000 {
-    let handle = run pool.spawn(sum(at * 100, at * 100 + 100))
-    run List<TaskHandle<i64>>.append(&mut handles, move handle) |> Effect.provideMut<Allocator>(&mut allocator)
+    let fiber = run pool.fork(sum(at * 100, at * 100 + 100))
+    run List<PoolFiber<i64, never>>.append(&mut fibers, move fiber) |> Effect.provideMut<Allocator>(&mut allocator)
     at = at + 1
   }
   let mut total: i64 = 0
-  while List<TaskHandle<i64>>.length(&handles) > 0 {
-    let handle = List<TaskHandle<i64>>.remove(&mut handles, 0)
-    let value = run handle.join()
+  while List<PoolFiber<i64, never>>.length(&fibers) > 0 {
+    let fiber = List<PoolFiber<i64, never>>.remove(&mut fibers, 0)
+    let value = run fiber.join()
     total = total + value
   }
   return total
 }
 
-// A chain of tasks, each joining the next, so every one parks.
-effect fn chain(pool: Pool, depth: i64) -> i64 {
+// A chain of fibers, each joining the next, so every one parks.
+effect fn chain(pool: Pool, depth: i64) -> i64 ! Cancelled {
   if depth == 0 { return 1 }
-  let next = run Effect.result(pool.spawn(chain(pool.clone(), depth - 1)))
+  let next = run Effect.result(pool.fork(chain(pool.clone(), depth - 1)))
   return match move next {
-    Result<TaskHandle<i64>, OutOfMemoryError>.Success { value } => 1 + run value.join()
-    Result<TaskHandle<i64>, OutOfMemoryError>.Failure { error } => -1000000
+    Result<PoolFiber<i64, Cancelled>, OutOfMemoryError>.Success { value } => 1 + run value.join()
+    Result<PoolFiber<i64, Cancelled>, OutOfMemoryError>.Failure { error } => -1000000
   }
 }
 
-// Detached tasks holding Arc markers, left for the pool's drop.
+// Detached fibers holding Arc markers, left for the pool's drop.
 effect fn detach(pool: Pool, marker: Arc<i32>) -> i64 ! OutOfMemoryError {
   let mut at = 0
   while at < 50 {
     let copy = marker.clone()
-    let handle = run pool.spawn(hold(move copy))
-    drop handle
+    let fiber = run pool.fork(hold(move copy))
+    drop fiber
     at = at + 1
   }
   return 0
@@ -62,29 +64,132 @@ effect fn hold(marker: Arc<i32>) -> i64 {
   return 0
 }
 
-effect fn program() -> i32 ! OutOfMemoryError | SpawnError {
+struct Invalid { code: i32 }
+
+effect fn check(value: i32) -> i32 ! Invalid {
+  if value < 0 { fail Invalid { code: value } }
+  return value
+}
+
+// A typed failure comes back as data from await, and raised unchanged from join.
+effect fn failures(pool: Pool) -> i32 ! OutOfMemoryError | Cancelled {
+  let bad = run pool.fork(check(-7))
+  let outcome = run bad.await()
+  let Outcome<i32, Invalid> { value } = move outcome
+  let code = match move value {
+    Failure<Invalid> { error } => error.code
+    _ => 0
+  }
+  if code != -7 { return 1 }
+  let other = run pool.fork(check(-3))
+  let raised = run Effect.result(other.join())
+  return match move raised {
+    Result<i32, Invalid | Cancelled>.Failure { error } => expectInvalid(move error, -3)
+    Result<i32, Invalid | Cancelled>.Success { value: ignored } => 2
+  }
+}
+
+fn expectInvalid(error: Invalid | Cancelled, code: i32) -> i32 {
+  return match move error {
+    Invalid { code: raised } => if raised == code { 0 } else { 3 }
+    Cancelled {} => 4
+  }
+}
+
+// Parks and drops its Wake, so only an interrupt ends it.
+effect fn forever(marker: Arc<i32>) -> i32 {
+  run Execution.parkTransferable(fn(wake: TransferableWake) -> () {
+    drop wake
+    return ()
+  })
+  return marker.get().*
+}
+
+// Yields until interrupted.
+effect fn spin(marker: Arc<i32>) -> i32 {
+  while true { run Pool.yieldNow() }
+  return marker.get().*
+}
+
+fn isCancelled(outcome: Outcome<i32, never>) -> bool {
+  let Outcome<i32, never> { value } = move outcome
+  return match move value {
+    Cancelled {} => true
+    _ => false
+  }
+}
+
+fn isSuccess(outcome: Outcome<i64, never>, expected: i64) -> bool {
+  let Outcome<i64, never> { value } = move outcome
+  return match move value {
+    Success<i64> { value: got } => got == expected
+    _ => false
+  }
+}
+
+// An interrupt cancels a parked fiber, a yielding one and an unstarted one, and runs their cleanup.
+// A fiber that finished first keeps its outcome.
+effect fn interrupts(pool: Pool, marker: Arc<i32>) -> i32 ! OutOfMemoryError {
+  let parked = run pool.fork(forever(marker.clone()))
+  run Pool.yieldNow()
+  if !isCancelled(run parked.interrupt()) { return 1 }
+  let spinning = run pool.fork(spin(marker.clone()))
+  run Pool.yieldNow()
+  if !isCancelled(run spinning.interrupt()) { return 2 }
+  // Interrupted at once, so most of these are cancelled before any worker starts them.
+  let mut at = 0
+  while at < 2000 {
+    let early = run pool.fork(forever(marker.clone()))
+    if !isCancelled(run early.interrupt()) { return 3 }
+    at = at + 1
+  }
+  let done = run pool.fork(sum(0, 10))
+  let value = run done.await()
+  if !isSuccess(move value, 45) { return 4 }
+  let finished = run pool.fork(sum(0, 10))
+  run Pool.yieldNow()
+  run Pool.yieldNow()
+  let outcome = run finished.interrupt()
+  drop outcome
+  return 0
+}
+
+effect fn program() -> i32 ! OutOfMemoryError | SpawnError | Cancelled {
   let mut allocator = Allocator.systemAllocatorProvider()
   let marker = run Arc<i32>.make(7) |> Effect.provideMut<Allocator>(&mut allocator)
   let threads = run ThreadPool.make(4) |> Effect.provideMut<Allocator>(&mut allocator)
   let pool = threads.pool()
-  let fan = run pool.block(Effect.result(fanOut(pool.clone())))
-  if !matches(move fan, 4999950000) { return 1 }
+  let fan = run pool.block(fanOut(pool.clone()))
+  if fan != 4999950000 { return 1 }
   let depth = run pool.block(chain(pool.clone(), 200))
   if depth != 201 { return 2 }
-  let detached = run pool.block(Effect.result(detach(pool.clone(), marker.clone())))
-  drop detached
+  let failed = run pool.block(failures(pool.clone()))
+  if failed != 0 { return 3 }
+  let interrupted = run pool.block(interrupts(pool.clone(), marker.clone()))
+  if interrupted != 0 { return 5 }
+  if marker.count() != 1 { return 6 }
+  let detached = run pool.block(detach(pool.clone(), marker.clone()))
+  // A fiber still parked when the pool drops is cancelled, and its cleanup runs.
+  let stuck = run pool.fork(forever(marker.clone()))
+  drop stuck
+  let kept = pool.clone()
   drop pool
   drop threads
   if marker.count() != 1 { return 4 }
-  return 42
-}
-
-fn matches(outcome: Result<i64, OutOfMemoryError>, expected: i64) -> bool {
-  return match move outcome {
-    Result<i64, OutOfMemoryError>.Success { value } => value == expected
-    Result<i64, OutOfMemoryError>.Failure { error } => false
+  // A handle kept past the pool's drop forks fibers that are cancelled before they start.
+  let afterDrop = run Effect.result(kept.block(sum(0, 10)))
+  return match move afterDrop {
+    Result<i64, OutOfMemoryError | Cancelled>.Failure { error } => lateCancelled(move error)
+    Result<i64, OutOfMemoryError | Cancelled>.Success { value: unexpected } => 7
   }
 }
 
-effect fn recover(error: OutOfMemoryError | SpawnError) -> i32 { return -2 }
+fn lateCancelled(error: OutOfMemoryError | Cancelled) -> i32 {
+  return match move error {
+    Cancelled {} => 42
+    OutOfMemoryError refused => 8
+  }
+}
+
+effect fn recover(error: OutOfMemoryError | SpawnError | Cancelled) -> i32 { return -2 }
 pub fn main() -> i32 { return run Effect.catchAll(program(), recover) }
