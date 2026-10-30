@@ -192,6 +192,8 @@ const program = Effect.gen(function* () {
     const resumed = yield* invoke(compiler, ['run', '--target', target, '--stdlib', join(repo, 'stdlib'), '--quiet'])
     assert.notEqual(resumed.status, 0)
     assert.match(resumed.stderr.toString(), /fatal trap: index out of bounds\n {2}at main\.at \(main:8:53\)\n {2}at main\.pick\n {2}at main\.work\n(?! {2}at)/)
+    // Wasmtime's trace names the step by its function, keeping the `$step` suffix.
+    assert.match(resumed.stderr.toString(), /main\.pick\$step\n/)
     yield* fs.writeFileString(
       join(directory, 'main.silk'),
       [
