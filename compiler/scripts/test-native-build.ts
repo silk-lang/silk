@@ -375,6 +375,20 @@ const program = Effect.gen(function* () {
     directory,
   )
   assert.equal(verified.status, 0, verified.stderr)
+  // A debug build's IR carries the line tables its objects get, which Clang reads as written.
+  const debugIr = yield* invoke(silk, [...argumentsFor('debug.ll'), '--debug', 'true', '--optimization', 'none', '--emit', 'llvm-ir'],
+    directory, { ...process.env, SILK_CLANG: sentinel })
+  assert.equal(debugIr.status, 0, debugIr.stderr)
+  const debugText = yield* fs.readFileString(join(directory, 'debug.ll'))
+  assert.match(debugText, /^define [^\n]* !dbg !\d+ \{$/m)
+  assert.match(debugText, /= distinct !DISubprogram\(name: "main\.main", scope: !\d+, file: !\d+, line: \d+,/)
+  assert.match(debugText, /, !dbg !\d+\n/)
+  assert.match(debugText, /= !DIFile\(filename: "[^"]*main\.silk"/)
+  const debugObject = yield* invoke(clang, ['-x', 'ir', '-c', 'debug.ll', '-o', 'debug.o'], directory)
+  assert.equal(debugObject.status, 0, debugObject.stderr)
+  const debugRows = yield* invoke(join(dirname(clang), 'llvm-dwarfdump'), ['--debug-line', 'debug.o'], directory)
+  assert.equal(debugRows.status, 0, debugRows.stderr)
+  assert.match(debugRows.stdout, /^0x[0-9a-f]+\s+[1-9]\d*\s+\d+\s/m)
   const captured = join(directory, 'completed-backend.bc')
   const linker = join(directory, 'clang-capture')
   yield* fs.writeFileString(
@@ -3655,6 +3669,24 @@ const program = Effect.gen(function* () {
   const editedPacks = yield* packNames()
   assert.equal(editedPacks.filter((name) => !coldPacks.includes(name)).length, 1, 'an edit to one module writes one pack')
   assert.equal(editedPacks.length, coldPacks.length, 'a build removes the packs no unit names')
+  // Each unit carries line tables made from the lines its location markers name, so a function
+  // that moves recompiles its unit alone, and the unit's rows name the lines it moved to.
+  const rowLines = Effect.fnUntraced(function* (object: string) {
+    const dumped = yield* invoke(join(tools, 'llvm-dwarfdump'), ['--debug-line', join(unitObjects, object)], split)
+    assert.equal(dumped.status, 0, dumped.stderr)
+    assert.match(dumped.stdout, /helper\.silk/)
+    const lines = new Set<number>()
+    for (const row of dumped.stdout.matchAll(/^0x[0-9a-f]+\s+(\d+)\s+\d+\s/gm)) {
+      if (row[1] !== '0') lines.add(Number(row[1]))
+    }
+    return [...lines].sort()
+  })
+  assert.deepEqual(yield* rowLines(compiled[0]), [2])
+  yield* fs.writeFileString(join(split, 'src/helper.silk'), `// moved\n\n${helperSource(5)}`)
+  yield* splitRun(9)
+  const movedObjects = (yield* objectNames()).filter((name) => !editedObjects.includes(name))
+  assert.equal(movedObjects.length, 1, `a moved function compiles one unit, added ${movedObjects.join(', ')}`)
+  assert.deepEqual(yield* rowLines(movedObjects[0]), [4])
   // A rebuild replays the record the last build left in the cache: an edit to a body lowers only
   // the instances it touched, and an edit that changes what the program reaches walks it again
   // from the record, lowering only the bodies it touched and the ones they newly reach (here the
