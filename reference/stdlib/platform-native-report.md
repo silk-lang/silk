@@ -5,8 +5,12 @@
 Writes the report of an unhandled error or a trap to a descriptor, with fixed limits.
 
 ## When to use
-The native runtime (`silk.platform.native.start` and `silk.platform.native.diagnostics`) uses [`NativeReport`](#NativeReport) to
-print an unhandled error and its call path to standard error. Use it in a custom runtime.
+The native and wasm runtimes (`silk.platform.native.start`, `silk.platform.wasi.start`,
+`silk.platform.wasm.start` and `silk.platform.native.diagnostics`) use [`NativeReport`](#NativeReport) to print
+an unhandled error and its call path to standard error, and [`ErrorForm`](#ErrorForm) to print the error's
+value after it. Use them in a custom runtime. On `wasm32-unknown-unknown`, which has no
+descriptors, every report goes to the module's report buffer, which the host reads through the
+exported `silk_report` and `silk_report_length`.
 
 ## Details
 A report is lines of text:
@@ -45,7 +49,7 @@ pub fn main() -> i32 {
 
 Import as `NativeReport` with `import silk.platform.native.report { NativeReport }`.
 
-Public declarations: 1.
+Public declarations: 2.
 
 <a id="NativeReport"></a>
 
@@ -58,8 +62,9 @@ pub struct NativeReport
 One report: its descriptor, its remaining byte and frame limits, and whether it is complete.
 
 ### When to use
-The native runtime (`silk.platform.native.start` and `silk.platform.native.diagnostics`) uses it to print an
-unhandled error and its call path to standard error. Use it in a custom runtime.
+The native and WASI runtimes (`silk.platform.native.start`, `silk.platform.wasi.start` and
+`silk.platform.native.diagnostics`) use it to print an unhandled error and its call path to
+standard error. Use it in a custom runtime.
 
 ### Details
 Each fragment is written only if it fits in the byte limit. When a limit is reached, the
@@ -115,6 +120,21 @@ Starts a new report on the same descriptor, with the full byte and frame limits 
 
 #### When to use
 Use it when one report writer serves several reports, such as one for each failed test.
+
+<a id="NativeReport.impl.resume"></a>
+
+### Method `resume`
+
+```silk
+pub fn resume(self: &mut Self) -> ()
+```
+
+Starts the next part of the same report with the full frame limit again. The byte limit
+keeps counting, so a report that ran out of bytes stays incomplete.
+
+#### When to use
+Use it when one report has two lists of frames, such as a trap's caller frames and then the
+cause the trap happened while handling.
 
 <a id="NativeReport.impl.unhandled"></a>
 
@@ -185,7 +205,82 @@ pub fn succeeded(self: &Self) -> bool
 
 Returns whether all fragments were written within the limits.
 
+<a id="ErrorForm"></a>
+
+## `ErrorForm`
+
+```silk
+pub struct ErrorForm
+```
+
+The `Debug` form of an error, at most 1024 bytes, kept so a runtime can drop the error before
+its observer reports it, and print the form after the report.
+
+### When to use
+The native and WASI runtimes use it for the `unhandled value:` line of an unhandled error. Use
+it in a custom runtime.
+
+### Details
+A longer form is cut at a character boundary and marked as truncated. It does not allocate.
+
+<a id="ErrorForm.impl.Writer"></a>
+
+## Implementation `Writer for ErrorForm`
+
+```silk
+impl Writer for ErrorForm
+```
+
+<a id="ErrorForm.impl.Writer.writeAll"></a>
+
+### Operation `writeAll`
+
+```silk
+effect fn writeAll(self: &mut Self, bytes: &[u8]) -> () ! WriterError ? &mut Writer
+```
+
+<a id="ErrorForm.impl.Writer.flush"></a>
+
+### Operation `flush`
+
+```silk
+effect fn flush(self: &mut Self) -> () ! WriterError ? &mut Writer
+```
+
+<a id="ErrorForm.impl"></a>
+
+## Implementation `ErrorForm`
+
+```silk
+impl ErrorForm
+```
+
+<a id="ErrorForm.impl.capture"></a>
+
+### Associated function `capture`
+
+```silk
+pub effect fn capture<E: Debug>(error: &E) -> ErrorForm
+```
+
+Returns the `Debug` form of `error`, cut to 1024 bytes at a character boundary. A form that
+fails to format keeps the part written before the failure.
+
+<a id="ErrorForm.impl.write"></a>
+
+### Method `write`
+
+```silk
+pub effect fn write(self: &Self, fd: i32) -> bool
+```
+
+Writes the line `unhandled value: ` with the form to `fd`, and ` [value truncated]` when the
+form was cut. Returns false if a write failed.
+
+#### Gotchas
+A write can fail after part of the line was written.
+
 
 Category: Native platform.
 
-Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`.
+Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`.

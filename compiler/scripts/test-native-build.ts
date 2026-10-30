@@ -131,7 +131,10 @@ const program = Effect.gen(function* () {
   // `run` lists the progress options it accepts.
   const runHelp = yield* invoke(silk, ['run', '--help'], directory)
   assert.equal(runHelp.status, 0, runHelp.stderr)
-  assert.match(runHelp.stdout, /^usage: silk run .*\[--progress auto\|live\|plain\|never\] \[--quiet\]/)
+  assert.match(runHelp.stdout, /^usage: silk run .*\[--progress auto\|live\|plain\|never\] \[--quiet\] \[--coredump <path>\]/)
+  const debugHelp = yield* invoke(silk, ['debug', '--help'], directory)
+  assert.equal(debugHelp.status, 0, debugHelp.stderr)
+  assert.match(debugHelp.stdout, /^usage: silk debug .*\[--port <\[address:\]port>\]/)
   // Toolchains belong to the silk tool, not the compiler: `silk toolchain` and `+<version>` are unknown here.
   const toolchain = yield* invoke(silk, ['toolchain'], directory)
   assert.equal(toolchain.status, 2, toolchain.stderr)
@@ -375,6 +378,52 @@ const program = Effect.gen(function* () {
     directory,
   )
   assert.equal(verified.status, 0, verified.stderr)
+  // A debug build's IR carries the line tables its objects get, which Clang reads as written.
+  const debugIr = yield* invoke(silk, [...argumentsFor('debug.ll'), '--debug', 'true', '--optimization', 'none', '--emit', 'llvm-ir'],
+    directory, { ...process.env, SILK_CLANG: sentinel })
+  assert.equal(debugIr.status, 0, debugIr.stderr)
+  const debugText = yield* fs.readFileString(join(directory, 'debug.ll'))
+  assert.match(debugText, /^define [^\n]* !dbg !\d+ \{$/m)
+  assert.match(debugText, /= distinct !DISubprogram\(name: "main\.main", scope: !\d+, file: !\d+, line: \d+,/)
+  assert.match(debugText, /, !dbg !\d+\n/)
+  assert.match(debugText, /= !DIFile\(filename: "[^"]*main\.silk"/)
+  const debugObject = yield* invoke(clang, ['-x', 'ir', '-c', 'debug.ll', '-o', 'debug.o'], directory)
+  assert.equal(debugObject.status, 0, debugObject.stderr)
+  const debugRows = yield* invoke(join(dirname(clang), 'llvm-dwarfdump'), ['--debug-line', 'debug.o'], directory)
+  assert.equal(debugRows.status, 0, debugRows.stderr)
+  assert.match(debugRows.stdout, /^0x[0-9a-f]+\s+[1-9]\d*\s+\d+\s/m)
+  // A debug build declares each parameter and binding at the slot that holds it, with its type, so
+  // a debugger reads them by name. A binding a return writes in place is declared at the result.
+  yield* fs.writeFileString(
+    join(directory, 'variables.silk'),
+    'fn pick(values: &[i32], index: usize) -> i32 {\n  let total = values[index] + 1\n  return total\n}\n\n' +
+      'pub fn main() -> i32 {\n  let values = [1, 2, 3]\n  let chosen = pick(&values, 1)\n  return chosen - 3\n}\n',
+  )
+  const variablesIr = yield* invoke(silk, ['build', 'variables.silk', '-o', 'variables.ll', '--stdlib', standardLibrary,
+    '--debug', 'true', '--optimization', 'none', '--emit', 'llvm-ir'], directory, { ...process.env, SILK_CLANG: sentinel })
+  assert.equal(variablesIr.status, 0, variablesIr.stderr)
+  assert.match(yield* fs.readFileString(join(directory, 'variables.ll')), /#dbg_declare\(ptr %[\w.]+, !\d+, !DIExpression\(\), !\d+\)/)
+  const fromText = yield* invoke(clang, ['-x', 'ir', '-c', 'variables.ll', '-o', 'variables-text.o'], directory)
+  assert.equal(fromText.status, 0, fromText.stderr)
+  const variablesObject = yield* invoke(silk, ['build', 'variables.silk', '-o', 'variables.o', '--stdlib', standardLibrary,
+    '--debug', 'true', '--optimization', 'none', '--emit', 'object'], directory, { ...process.env, SILK_CLANG: clang })
+  assert.equal(variablesObject.status, 0, variablesObject.stderr)
+  const literal = (text: string) => text.replace(/[[\]&;().]/g, '\\$&')
+  // One debug-info entry with `tag`, `name` and `type`, without crossing into the next entry.
+  const declared = (tag: string, name: string, type: string) =>
+    new RegExp(`${tag}\\n(?:[ \\t]+DW_AT_\\w+[^\\n]*\\n)*?[ \\t]+DW_AT_name\\t\\("${name}"\\)\\n` +
+      `(?:[ \\t]+DW_AT_\\w+[^\\n]*\\n)*?[ \\t]+DW_AT_type\\t\\([^"\\n]*"${literal(type)}"\\)`)
+  for (const object of ['variables-text.o', 'variables.o']) {
+    const variablesInfo = yield* invoke(join(dirname(clang), 'llvm-dwarfdump'), ['--debug-info', object], directory)
+    assert.equal(variablesInfo.status, 0, variablesInfo.stderr)
+    assert.doesNotMatch(variablesInfo.stderr, /invalid|error/i, object)
+    assert.match(variablesInfo.stdout, declared('DW_TAG_formal_parameter', 'values', '&[i32]'), object)
+    assert.match(variablesInfo.stdout, declared('DW_TAG_formal_parameter', 'index', 'usize'), object)
+    assert.match(variablesInfo.stdout, declared('DW_TAG_variable', 'total', 'i32'), object)
+    assert.match(variablesInfo.stdout, declared('DW_TAG_variable', 'values', '[i32; 3]'), object)
+    assert.match(variablesInfo.stdout, /DW_TAG_member\n[ \t]+DW_AT_name\t\("length"\)/, object)
+    assert.match(variablesInfo.stdout, /DW_TAG_member\n[ \t]+DW_AT_name\t\("\[2\]"\)/, object)
+  }
   const captured = join(directory, 'completed-backend.bc')
   const linker = join(directory, 'clang-capture')
   yield* fs.writeFileString(
@@ -659,11 +708,145 @@ const program = Effect.gen(function* () {
     WebAssembly.Module.exports(wasmModule)
       .map((entry) => entry.name)
       .sort(),
-    ['main', 'memory'],
-    'a module exports only its named C exports and its memory',
+    ['main', 'memory', 'silk_report', 'silk_report_length'],
+    'a module exports only its named C exports, its memory and its report buffer',
   )
   const wasmMain = new WebAssembly.Instance(wasmModule, {}).exports.main as () => number
   assert.equal(wasmMain(), 42)
+  // A trap and an unhandled error write their Silk report into the module, and the std lib's
+  // runner turns it into an Error whose stack names the module's frames (#2599).
+  const runner = (yield* Effect.promise(
+    () => import(pathToFileURL(join(standardLibrary, 'host/wasm-runner.mjs')).href),
+  )) as {
+    runWasm: (
+      bytes: Uint8Array,
+      options?: { onReport?: (report: string) => void; onLog?: (level: string, text: string) => void },
+    ) => Promise<number>
+    SilkError: new (...values: Array<unknown>) => Error & { report: string }
+  }
+  // `pick` lives in a second file, so the line table names two sources.
+  yield* fs.writeFileString(
+    join(directory, 'picking.silk'),
+    'pub fn pick(values: &[i32], at: usize) -> i32 { return values[at] }\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'trap.silk'),
+    [
+      'import picking',
+      'fn outer(at: usize) -> i32 { let values: [i32; 2] = [1, 2] return picking.pick(&values, at) }',
+      'pub fn main() -> i32 { return outer(5) }',
+      '',
+    ].join('\n'),
+  )
+  yield* fs.writeFileString(
+    join(directory, 'failure.silk'),
+    [
+      'import silk.io.writer {Writer, WriterError}',
+      'import silk.text.format {Debug, Format, Formatter}',
+      'pub struct ConfigError { pub code: i32 }',
+      'impl Debug for ConfigError {',
+      '  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {',
+      '    return run Format.debugFields(self, "ConfigError", &mut formatter)',
+      '  }',
+      '}',
+      'effect fn load(code: i32) -> i32 ! ConfigError { if code > 0 { fail ConfigError { code: code } } return code }',
+      'pub effect fn main() -> () ! ConfigError { let code = run load(7) }',
+      '',
+    ].join('\n'),
+  )
+  for (const name of ['trap', 'failure']) {
+    const built = yield* invoke(
+      silk,
+      ['build', `${name}.silk`, '-o', `${name}.wasm`, '--stdlib', standardLibrary, '--target', 'wasm32-unknown-unknown',
+        '--optimization', 'none', '--debug', 'true'],
+      directory,
+      { ...process.env, SILK_CLANG: clang },
+    )
+    assert.equal(built.status, 0, built.stderr)
+  }
+  // A debug browser module ships without its DWARF: the module with it is `<output>.debug.wasm`,
+  // and a source map derived from its lines is `<output>.map`, each named by a custom section.
+  const shipped = new WebAssembly.Module(yield* fs.readFile(join(directory, 'trap.wasm')))
+  const sectionText = (name: string) =>
+    WebAssembly.Module.customSections(shipped, name).map((section) => {
+      const bytes = new Uint8Array(section)
+      return new TextDecoder().decode(bytes.subarray(1, 1 + bytes[0]))
+    })
+  assert.deepEqual(WebAssembly.Module.customSections(shipped, '.debug_info'), [])
+  assert.deepEqual(sectionText('external_debug_info'), ['trap.wasm.debug.wasm'])
+  assert.deepEqual(sectionText('sourceMappingURL'), ['trap.wasm.map'])
+  const withDwarf = new WebAssembly.Module(yield* fs.readFile(join(directory, 'trap.wasm.debug.wasm')))
+  assert.equal(WebAssembly.Module.customSections(withDwarf, '.debug_line').length, 1)
+  const sourceMap = JSON.parse(yield* fs.readFileString(join(directory, 'trap.wasm.map'))) as {
+    version: number
+    sources: Array<string>
+    sourcesContent: Array<string | null>
+    mappings: string
+  }
+  assert.equal(sourceMap.version, 3)
+  const trapSource = sourceMap.sources.findIndex((path) => path.endsWith('/trap.silk'))
+  assert.ok(trapSource >= 0, sourceMap.sources.join(', '))
+  assert.equal(sourceMap.sourcesContent[trapSource], yield* fs.readFileString(join(directory, 'trap.silk')))
+  // Each sequence starts in file 1, so a function there names it without `set_file`.
+  const pickingSource = sourceMap.sources.findIndex((path) => path.endsWith('/picking.silk'))
+  assert.ok(pickingSource >= 0, sourceMap.sources.join(', '))
+  assert.match(sourceMap.mappings, /^[A-Za-z0-9+/]+(,[A-Za-z0-9+/]+)*$/)
+  const trapBytes = yield* fs.readFile(join(directory, 'trap.wasm'))
+  const trapped = yield* Effect.promise(() =>
+    runner.runWasm(trapBytes).then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+  )
+  assert.ok(trapped instanceof runner.SilkError, String(trapped))
+  assert.equal(trapped.message, 'fatal trap: index out of bounds')
+  assert.match(trapped.report, /^fatal trap: index out of bounds\n {2}at picking\.pick \(picking:1:\d+\)\n/)
+  assert.match(trapped.stack ?? '', /trap\.outer/, 'the engine stack names the callers from the name section')
+  const reports: Array<string> = []
+  const failureBytes = yield* fs.readFile(join(directory, 'failure.wasm'))
+  const failedStatus = yield* Effect.promise(() =>
+    runner.runWasm(failureBytes, { onReport: (report) => reports.push(report) })
+  )
+  assert.equal(failedStatus, 1)
+  assert.match(
+    reports.join(''),
+    /^unhandled error: failure\.ConfigError\n {2}at failure\.load \(failure:9:\d+\)\n {2}at failure\.main \(failure:10:\d+\)\nunhandled value: ConfigError \{ code: 7 \}\n$/,
+  )
+  // `ConsoleLogger` hands each message to the host's console through the one import a module
+  // that logs this way has; a message longer than its buffer arrives in parts the runner joins.
+  yield* fs.writeFileString(
+    join(directory, 'logging.silk'),
+    [
+      'import silk.core.effect { Effect }',
+      'import silk.io.logger { LogError, Logger }',
+      'import silk.io.logger_console { ConsoleLogger }',
+      'pub effect fn main() -> () ! LogError {',
+      '  let mut logger = ConsoleLogger.make()',
+      `  let values = .{ name: "silk", long: "${'x'.repeat(600)}" }`,
+      '  run Effect.logInfo("{name} started", &values) |> Effect.provideMut<Logger>(&mut logger)',
+      '  run Effect.logError("long {long}!", &values) |> Effect.provideMut<Logger>(&mut logger)',
+      '  return ()',
+      '}',
+      '',
+    ].join('\n'),
+  )
+  const logBuilt = yield* invoke(
+    silk,
+    ['build', 'logging.silk', '-o', 'logging.wasm', '--stdlib', standardLibrary, '--target', 'wasm32-unknown-unknown'],
+    directory,
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(logBuilt.status, 0, logBuilt.stderr)
+  const logBytes = yield* fs.readFile(join(directory, 'logging.wasm'))
+  assert.deepEqual(WebAssembly.Module.imports(new WebAssembly.Module(logBytes)), [
+    { module: 'silk', name: 'console', kind: 'function' },
+  ])
+  const consoleLines: Array<[string, string]> = []
+  const loggedStatus = yield* Effect.promise(() =>
+    runner.runWasm(logBytes, { onLog: (level, text) => consoleLines.push([level, text]) })
+  )
+  assert.equal(loggedStatus, 0)
+  assert.deepEqual(consoleLines, [['info', 'silk started'], ['error', `long ${'x'.repeat(600)}!`]])
   // Clang's generic wasm CPU enables bulk memory only from Clang 19, and the runtime needs it: the
   // compiler asks for it, so a Clang whose default leaves it off still builds the module.
   const withoutBulkMemory = join(directory, 'clang-without-bulk-memory')
@@ -786,6 +969,27 @@ const program = Effect.gen(function* () {
     yield* fs.exists(join(directory, 'build/llvm', hostTarget, 'debug/native-build')),
     true,
   )
+  // `debug` builds the same executable and becomes LLDB on it, with the program's arguments after
+  // its path; `--coredump` belongs to WASI programs and is refused for a native one.
+  const lldb = join(directory, 'fake-lldb')
+  yield* fs.writeFileString(lldb, '#!/bin/sh\nprintf "%s\\n" "$@"\n')
+  yield* fs.chmod(lldb, 0o755)
+  const debugged = yield* invoke(
+    silk,
+    ['debug', '--stdlib', standardLibrary, 'first', '--', '--stdlib'],
+    directory,
+    { ...process.env, SILK_CLANG: clang, SILK_LLDB: lldb },
+  )
+  assert.equal(debugged.status, 0, debugged.stderr)
+  assert.match(debugged.stdout, /^--\n\S*\/build\/llvm\/[^/]+\/debug\/native-build\nfirst\n--stdlib\n$/)
+  const nativeCore = yield* invoke(
+    silk,
+    ['run', '--stdlib', standardLibrary, '--coredump', 'core.dump'],
+    directory,
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(nativeCore.status, 2, nativeCore.stderr)
+  assert.match(nativeCore.stderr, /`--coredump` needs a WASI target/)
   // `clean` removes the whole output directory; a project already clean stays clean.
   const cleaned = yield* invoke(silk, ['clean'], directory)
   assert.equal(cleaned.status, 0, cleaned.stderr)
@@ -1608,6 +1812,14 @@ const program = Effect.gen(function* () {
   const shiftCount = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(directory, 'shiftcount'), { ...process.env, SILK_CLANG: clang })
   assert.notEqual(shiftCount.status, 0, shiftCount.stderr)
   assert.match(shiftCount.stderr, /^fatal trap: invalid shift count\n {2}at main\.main \(main:6:17\)$/m)
+  // A trap after a fiber resumes names the suspended callers of the resumed frame, which only its
+  // frame chain holds: the fiber's driver, not `work`, called `pick`'s step.
+  yield* fs.makeDirectory(join(directory, 'resumedtrap/src'), { recursive: true })
+  yield* fs.writeFileString(join(directory, 'resumedtrap/silk.toml'), '[package]\nname = "resumedtrap"\nversion = "0.1.0"\n')
+  yield* fs.writeFileString(join(directory, 'resumedtrap/src/main.silk'), 'import silk.mem.allocator { OutOfMemoryError }\nimport silk.core.effect { Effect }\nimport silk.concurrency.fiber { Cancelled, Fiber }\nimport silk.concurrency.local_scheduler { LocalScheduler, StalledError }\nimport silk.system.monotonic_clock { MonotonicClock }\nimport silk.system.monotonic_clock_native { OsMonotonicClock }\nimport silk.concurrency.scheduler { Scheduler, TaskIdExhaustedError }\nfn at(values: &[i32], index: usize) -> i32 { return values[index] }\neffect fn pick(values: &[i32], index: usize) -> i32 {\n  run Fiber.yieldNow()\n  return at(values, index)\n}\neffect fn work(index: usize) -> i32 {\n  let values = [1, 2, 3]\n  return run pick(&values, index)\n}\neffect fn root() -> i32 ! OutOfMemoryError | TaskIdExhaustedError | Cancelled ? &mut Scheduler | &mut MonotonicClock {\n  let child = run Fiber<i32, never>.forkChild(work(5))\n  return run child.join()\n}\npub effect fn main() -> i32 ! OutOfMemoryError | TaskIdExhaustedError | Cancelled | StalledError {\n  let mut clock = OsMonotonicClock.make()\n  let mut scheduler = LocalScheduler.make()\n  return run scheduler.execute<i32, OutOfMemoryError | TaskIdExhaustedError | Cancelled>(root())\n    |> Effect.provideMut<MonotonicClock>(&mut clock)\n}\n')
+  const resumedTrap = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(directory, 'resumedtrap'), { ...process.env, SILK_CLANG: clang })
+  assert.notEqual(resumedTrap.status, 0, resumedTrap.stderr)
+  assert.match(resumedTrap.stderr, /^fatal trap: index out of bounds\n {2}at main\.at \(main:8:53\)\n {2}at main\.pick\n {2}at main\.work\n {2}at main\.main\n/m)
   // A width or precision field can be any integer, so a bare literal needs no `usize` annotation.
   yield* fs.makeDirectory(join(directory, 'widthint/src'), { recursive: true })
   yield* fs.writeFileString(join(directory, 'widthint/silk.toml'), '[package]\nname = "widthint"\nversion = "0.1.0"\n')
@@ -3559,6 +3771,24 @@ const program = Effect.gen(function* () {
   const editedPacks = yield* packNames()
   assert.equal(editedPacks.filter((name) => !coldPacks.includes(name)).length, 1, 'an edit to one module writes one pack')
   assert.equal(editedPacks.length, coldPacks.length, 'a build removes the packs no unit names')
+  // Each unit carries line tables made from the lines its location markers name, so a function
+  // that moves recompiles its unit alone, and the unit's rows name the lines it moved to.
+  const rowLines = Effect.fnUntraced(function* (object: string) {
+    const dumped = yield* invoke(join(tools, 'llvm-dwarfdump'), ['--debug-line', join(unitObjects, object)], split)
+    assert.equal(dumped.status, 0, dumped.stderr)
+    assert.match(dumped.stdout, /helper\.silk/)
+    const lines = new Set<number>()
+    for (const row of dumped.stdout.matchAll(/^0x[0-9a-f]+\s+(\d+)\s+\d+\s/gm)) {
+      if (row[1] !== '0') lines.add(Number(row[1]))
+    }
+    return [...lines].sort()
+  })
+  assert.deepEqual(yield* rowLines(compiled[0]), [2])
+  yield* fs.writeFileString(join(split, 'src/helper.silk'), `// moved\n\n${helperSource(5)}`)
+  yield* splitRun(9)
+  const movedObjects = (yield* objectNames()).filter((name) => !editedObjects.includes(name))
+  assert.equal(movedObjects.length, 1, `a moved function compiles one unit, added ${movedObjects.join(', ')}`)
+  assert.deepEqual(yield* rowLines(movedObjects[0]), [4])
   // A rebuild replays the record the last build left in the cache: an edit to a body lowers only
   // the instances it touched, and an edit that changes what the program reaches walks it again
   // from the record, lowering only the bodies it touched and the ones they newly reach (here the

@@ -7,9 +7,18 @@ The command entry for WASI Preview 1 and Preview 2.
 ## Details
 The application can return `i32`, `()`, or an Effect with either result.
 An Effect can require `HostInput`; the entry supplies an owned argument and environment snapshot.
-Other services require explicit providers. Success returns the application status, or zero for `()`.
-Failure drops its payload and returns status one. Cleanup completes before the WASI exit call.
-The application must satisfy `Intrinsic.NonParking`. A parked execution returns status one.
+Each error of the Effect must implement `Debug`. Other services require explicit providers.
+Success returns the application status, or zero for `()`. Cleanup completes before the WASI exit
+call. The application must satisfy `Intrinsic.NonParking`. A parked execution returns status one.
+
+An unhandled error prints a report to standard error and returns status one. The report has at
+most 4096 bytes and 32 frames, and ends with an `unhandled value:` line that holds the error's
+`Debug` form, cut to 1024 bytes.
+
+## Gotchas
+- A trap prints `fatal trap: ` with its reason and site to standard error, then stops the
+  program without cleanup. A WASI program cannot walk its own stack, so the runtime's own trace,
+  such as Wasmtime's `wasm backtrace`, lists the calling functions.
 
 Public declarations: 0.
 

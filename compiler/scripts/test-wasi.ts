@@ -89,6 +89,32 @@ const program = Effect.gen(function* () {
       const wit = yield* invoke(wasmTools, ['component', 'wit', output])
       assert.equal(wit.status, 0, wit.stderr.toString())
       assert.match(wit.stdout.toString(), /export wasi:cli\/run/)
+      // The bundled world lists the draft `wasi:logging`, which only a component that logs
+      // through it imports.
+      assert.doesNotMatch(wit.stdout.toString(), /wasi:logging/)
+      yield* fs.writeFileString(
+        join(directory, 'logging.silk'),
+        [
+          'import silk.core.effect { Effect }',
+          'import silk.io.logger { LogError, Logger }',
+          'import silk.io.logger_wasi { WasiLogger }',
+          'pub effect fn main() -> i32 ! LogError {',
+          '  let mut logger = WasiLogger.make("startup")',
+          '  run Effect.logInfo("started", &()) |> Effect.provideMut<Logger>(&mut logger)',
+          '  return 0',
+          '}',
+          '',
+        ].join('\n'),
+      )
+      const loggingOutput = join(directory, 'logging.wasm')
+      const logging = yield* invoke(
+        compiler,
+        ['build', 'logging.silk', '-o', loggingOutput, '--target', target, '--stdlib', join(repo, 'stdlib')],
+      )
+      assert.equal(logging.status, 0, logging.stderr.toString())
+      const loggingWit = yield* invoke(wasmTools, ['component', 'wit', loggingOutput])
+      assert.equal(loggingWit.status, 0, loggingWit.stderr.toString())
+      assert.match(loggingWit.stdout.toString(), /import wasi:logging\/logging@0\.1\.0-draft;/)
     }
     const ran = yield* invoke(
       wasmtime,
@@ -136,6 +162,92 @@ const program = Effect.gen(function* () {
     ])
     assert.equal(trapped.status, 1, trapped.stderr.toString())
     assert.match(trapped.stdout.toString(), /1 passed, 2 failed/)
+    assert.match(trapped.stdout.toString(), /fatal trap: WASI test trap\n {6}at main\.traps \(main:3:/)
+    // A trap names its callers with their lines from Wasmtime's trace, under the test or after the
+    // report, and the module's name section reads as the source does (#2599).
+    yield* fs.writeFileString(
+      join(directory, 'main.silk'),
+      [
+        'import silk.testing.testing {AssertionError, Testing}',
+        'fn pick(values: &[i32], at: usize) -> i32 { return values[at] }',
+        'fn outer(at: usize) -> i32 { let values: [i32; 2] = [1, 2] return pick(&values, at) }',
+        'test effect fn trapsDeep() -> () ! AssertionError<\'static> { let value = outer(5) run Testing.expect(value == 1, "never") }',
+        'pub fn main() -> i32 { return outer(5) }',
+        '',
+      ].join('\n'),
+    )
+    const deep = yield* invoke(compiler, ['test', '--target', target, '--stdlib', join(repo, 'stdlib'), '--no-cache'])
+    assert.equal(deep.status, 1, deep.stderr.toString())
+    assert.match(
+      deep.stdout.toString(),
+      /fatal trap: index out of bounds\n {6}at main\.pick \(main:2:52\)\n {6}at main\.outer \(main\.silk:3:67\)\n {6}at main\.trapsDeep \(main\.silk:4:\d+\)\n {4}FAIL/,
+    )
+    const deepRun = yield* invoke(compiler, ['run', '--target', target, '--stdlib', join(repo, 'stdlib'), '--quiet'])
+    assert.notEqual(deepRun.status, 0)
+    assert.match(deepRun.stderr.toString(), /fatal trap: index out of bounds\n {2}at main\.pick \(main:2:52\)\n/)
+    assert.match(deepRun.stderr.toString(), /- main\.outer\n\s+at .*main\.silk:3:67/)
+    // A trap after a fiber resumes names the suspended callers of the resumed frame from its step
+    // records, since a wasm module has no unwinder to walk.
+    yield* fs.writeFileString(join(directory, 'main.silk'), 'import silk.mem.allocator { OutOfMemoryError }\nimport silk.core.effect { Effect }\nimport silk.concurrency.fiber { Cancelled, Fiber }\nimport silk.concurrency.local_scheduler { LocalScheduler, StalledError }\nimport silk.system.monotonic_clock { MonotonicClock }\nimport silk.system.monotonic_clock_native { OsMonotonicClock }\nimport silk.concurrency.scheduler { Scheduler, TaskIdExhaustedError }\nfn at(values: &[i32], index: usize) -> i32 { return values[index] }\neffect fn pick(values: &[i32], index: usize) -> i32 {\n  run Fiber.yieldNow()\n  return at(values, index)\n}\neffect fn work(index: usize) -> i32 {\n  let values = [1, 2, 3]\n  return run pick(&values, index)\n}\neffect fn root() -> i32 ! OutOfMemoryError | TaskIdExhaustedError | Cancelled ? &mut Scheduler | &mut MonotonicClock {\n  let child = run Fiber<i32, never>.forkChild(work(5))\n  return run child.join()\n}\npub effect fn main() -> i32 ! OutOfMemoryError | TaskIdExhaustedError | Cancelled | StalledError {\n  let mut clock = OsMonotonicClock.make()\n  let mut scheduler = LocalScheduler.make()\n  return run scheduler.execute<i32, OutOfMemoryError | TaskIdExhaustedError | Cancelled>(root())\n    |> Effect.provideMut<MonotonicClock>(&mut clock)\n}\n')
+    const resumed = yield* invoke(compiler, ['run', '--target', target, '--stdlib', join(repo, 'stdlib'), '--quiet'])
+    assert.notEqual(resumed.status, 0)
+    assert.match(resumed.stderr.toString(), /fatal trap: index out of bounds\n {2}at main\.at \(main:8:53\)\n {2}at main\.pick\n {2}at main\.work\n(?! {2}at)/)
+    yield* fs.writeFileString(
+      join(directory, 'main.silk'),
+      [
+        'fn pick(values: &[i32], at: usize) -> i32 { return values[at] }',
+        'fn outer(at: usize) -> i32 { let values: [i32; 2] = [1, 2] return pick(&values, at) }',
+        'pub fn main() -> i32 { return outer(5) }',
+        '',
+      ].join('\n'),
+    )
+    // `--coredump` has Wasmtime write a core dump of the trapped module, which is a wasm module.
+    if (target === 'wasm32-wasip1') {
+      const core = join(directory, 'trap.core')
+      const dumped = yield* invoke(compiler, ['run', '--target', target, '--stdlib', join(repo, 'stdlib'), '--quiet', '--coredump', core])
+      assert.notEqual(dumped.status, 0)
+      const coreBytes = yield* fs.readFile(core)
+      assert.deepEqual([...coreBytes.subarray(0, 4)], [0, 0x61, 0x73, 0x6d])
+      // Wasmtime splits its `-D` options at commas, so a path holding one is refused.
+      const comma = yield* invoke(compiler, ['run', '--target', target, '--stdlib', join(repo, 'stdlib'), '--quiet', '--coredump', 'a,b'])
+      assert.equal(comma.status, 2)
+      assert.match(comma.stderr.toString(), /the `--coredump` path cannot contain a comma/)
+    }
+    // `debug` starts the program under Wasmtime's debugger stub, listening on `--port`.
+    const recorder = join(directory, 'fake-wasmtime')
+    yield* fs.writeFileString(recorder, '#!/bin/sh\nprintf "%s\\n" "$@"\n')
+    yield* fs.chmod(recorder, 0o755)
+    const debugged = yield* invoke(
+      compiler,
+      ['debug', '--target', target, '--stdlib', join(repo, 'stdlib'), '--quiet', '--port', '4711', 'first'],
+      { env: { ...env, SILK_WASMTIME: recorder } },
+    )
+    assert.equal(debugged.status, 0, debugged.stderr.toString())
+    assert.match(debugged.stdout.toString(), /^run\n--dir\n\.::\/\n-g\n4711\n\S+\nfirst\n$/)
+    // An unhandled error reports its name, origin, call path and value, as on native targets.
+    yield* fs.writeFileString(
+      join(directory, 'main.silk'),
+      [
+        'import silk.io.writer {Writer, WriterError}',
+        'import silk.text.format {Debug, Format, Formatter}',
+        'pub struct ConfigError { pub code: i32 }',
+        'impl Debug for ConfigError {',
+        '  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {',
+        '    return run Format.debugFields(self, "ConfigError", &mut formatter)',
+        '  }',
+        '}',
+        'effect fn load(code: i32) -> i32 ! ConfigError { if code > 0 { fail ConfigError { code: code } } return code }',
+        'effect fn configure(code: i32) -> i32 ! ConfigError { return run load(code) }',
+        'pub effect fn main() -> () ! ConfigError { let code = run configure(7) }',
+        '',
+      ].join('\n'),
+    )
+    const unhandled = yield* invoke(compiler, ['run', '--target', target, '--stdlib', join(repo, 'stdlib'), '--quiet'])
+    assert.equal(unhandled.status, 1, unhandled.stderr.toString())
+    assert.match(
+      unhandled.stderr.toString(),
+      /unhandled error: main\.ConfigError\n {2}at main\.load \(main:9:\d+\)\n {2}at main\.configure \(main:10:\d+\)\n {2}at main\.main \(main:11:\d+\)\nunhandled value: ConfigError \{ code: 7 \}\n/,
+    )
     // Empty host snapshots and nonzero command status work for each entry adapter.
     yield* fs.writeFileString(join(directory, 'main.silk'), 'pub fn main() -> i32 { return 42 }\n')
     const statusBuild = yield* build(target, output)
