@@ -15,7 +15,7 @@ Resource handles belong to the component instance and must be dropped or transfe
 
 Import as `wasi_preview2` with `import silk.platform.wasi.preview2 as wasi_preview2`.
 
-Public declarations: 200.
+Public declarations: 201.
 
 <a id="io_poll_pollable_ready"></a>
 
@@ -1095,6 +1095,18 @@ pub unsafe extern "C" fn http_outgoing_handler_handle(p0: u32, p1: u32, p2: u32,
 ```
 
 Calls `wasi:http/outgoing-handler@0.2.12#handle` with its canonical ABI.
+The caller supplies valid handles and memory, and honors the WIT ownership contract.
+
+<a id="logging_logging_log"></a>
+
+## `logging_logging_log`
+
+```silk
+pub unsafe extern "C" fn logging_logging_log(p0: u32, p1: u32, p2: u32, p3: u32, p4: u32) -> ()
+    as "wasi:logging/logging@0.1.0-draft#log"
+```
+
+Calls `wasi:logging/logging@0.1.0-draft#log` with its canonical ABI.
 The caller supplies valid handles and memory, and honors the WIT ownership contract.
 
 <a id="cli_environment_get_environment"></a>

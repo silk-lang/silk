@@ -683,7 +683,10 @@ const program = Effect.gen(function* () {
   const runner = (yield* Effect.promise(
     () => import(pathToFileURL(join(standardLibrary, 'host/wasm-runner.mjs')).href),
   )) as {
-    runWasm: (bytes: Uint8Array, options?: { onReport?: (report: string) => void }) => Promise<number>
+    runWasm: (
+      bytes: Uint8Array,
+      options?: { onReport?: (report: string) => void; onLog?: (level: string, text: string) => void },
+    ) => Promise<number>
     SilkError: new (...values: Array<unknown>) => Error & { report: string }
   }
   // `pick` lives in a second file, so the line table names two sources.
@@ -774,6 +777,41 @@ const program = Effect.gen(function* () {
     reports.join(''),
     /^unhandled error: failure\.ConfigError\n {2}at failure\.load \(failure:9:\d+\)\n {2}at failure\.main \(failure:10:\d+\)\nunhandled value: ConfigError \{ code: 7 \}\n$/,
   )
+  // `ConsoleLogger` hands each message to the host's console through the one import a module
+  // that logs this way has; a message longer than its buffer arrives in parts the runner joins.
+  yield* fs.writeFileString(
+    join(directory, 'logging.silk'),
+    [
+      'import silk.core.effect { Effect }',
+      'import silk.io.logger { LogError, Logger }',
+      'import silk.io.logger_console { ConsoleLogger }',
+      'pub effect fn main() -> () ! LogError {',
+      '  let mut logger = ConsoleLogger.make()',
+      `  let values = .{ name: "silk", long: "${'x'.repeat(600)}" }`,
+      '  run Effect.logInfo("{name} started", &values) |> Effect.provideMut<Logger>(&mut logger)',
+      '  run Effect.logError("long {long}!", &values) |> Effect.provideMut<Logger>(&mut logger)',
+      '  return ()',
+      '}',
+      '',
+    ].join('\n'),
+  )
+  const logBuilt = yield* invoke(
+    silk,
+    ['build', 'logging.silk', '-o', 'logging.wasm', '--stdlib', standardLibrary, '--target', 'wasm32-unknown-unknown'],
+    directory,
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(logBuilt.status, 0, logBuilt.stderr)
+  const logBytes = yield* fs.readFile(join(directory, 'logging.wasm'))
+  assert.deepEqual(WebAssembly.Module.imports(new WebAssembly.Module(logBytes)), [
+    { module: 'silk', name: 'console', kind: 'function' },
+  ])
+  const consoleLines: Array<[string, string]> = []
+  const loggedStatus = yield* Effect.promise(() =>
+    runner.runWasm(logBytes, { onLog: (level, text) => consoleLines.push([level, text]) })
+  )
+  assert.equal(loggedStatus, 0)
+  assert.deepEqual(consoleLines, [['info', 'silk started'], ['error', `long ${'x'.repeat(600)}!`]])
   // Clang's generic wasm CPU enables bulk memory only from Clang 19, and the runtime needs it: the
   // compiler asks for it, so a Clang whose default leaves it off still builds the module.
   const withoutBulkMemory = join(directory, 'clang-without-bulk-memory')
