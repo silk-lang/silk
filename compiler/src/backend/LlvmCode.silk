@@ -37,6 +37,7 @@ import backend.Mir {
   SwitchCase,
   Terminator,
   TrapSite,
+  Variable,
 }
 import hir.Hir {InfixOperator, PrefixOperator}
 import semantic.SourceLocations {Location}
@@ -50,6 +51,8 @@ import semantic.StaticValue
 import semantic.StaticValue {Sign as StaticSign, Value as StaticData}
 import semantic.SealedCore {CFunction, Lifecycle}
 import semantic.Target {Target}
+import semantic.TypeText
+import semantic.ModuleId {ModuleId}
 import semantic.Type {ArrayShape, Type}
 import semantic.TypedBody {Origin}
 import silk.mem.box {Box}
@@ -5191,6 +5194,179 @@ effect fn emitSlots(
     Module.setName(&mut writer.*.module, address, Bitcode.named(Bitcode.prefixCompanion(), owned[companionAt]))
     List<u64>.set(&mut writer.*.companions, owned[companionAt], address)
     companionAt = companionAt + usize.ONE
+  }
+  // A debug build names each source variable's slot. A step's variables live in its frame, which
+  // it reaches through a computed address, so it names none.
+  if let Option<Suspended>.None = &suspended.* {
+    let variables = List<Variable>.asSlice(&function.variables)
+    if variables.length > usize.ZERO {
+      let owner = InstanceKey.identity(&function.key)
+      let viewer = Shared<DeclarationId>.with<ModuleId>(&owner, fn(id: &DeclarationId) -> ModuleId {
+        return ModuleId.copy(id.moduleId())
+      })
+      let mut at = usize.ZERO
+      while at < variables.length {
+        let mut slot = Bitcode.none()
+        if variables[at].local < locals.length { slot = List<u64>.get(&writer.slots, variables[at].local) }
+        if slot != Bitcode.none() {
+          let mut words = List<u64>.make()
+          let mut budget: usize = 256
+          run debugType(&mut words, &locals[variables[at].local].ty, layouts, target, &viewer, 4, &mut budget)
+          run Module.variable(&mut writer.*.module, slot, variables[at].place, variables[at].argument,
+            Bytes.asSlice(&variables[at].name), List<u64>.asSlice(&words))
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  return ()
+}
+
+// How a debugger reads a value of a type with no layout of its own to describe.
+struct DebugShape {
+  // 0 unknown, 1 a DWARF base type of `encoding`, 2 a pointer to `inner`, 3 a string.
+  kind: usize,
+  encoding: u64,
+  inner: Option<Shared<Type>>,
+}
+
+fn debugShape(ty: &Shared<Type>) -> DebugShape {
+  return Shared<Type>.with<DebugShape>(ty, fn(value: &Type) -> DebugShape {
+    return match &value.* {
+      Type.Reference {referent, ..} => DebugShape {kind: 2, encoding: 0, inner: Option<Shared<Type>>.some(Shared<Type>.clone(&referent))}
+      Type.Pointer {pointee, ..} => DebugShape {kind: 2, encoding: 0, inner: Option<Shared<Type>>.some(Shared<Type>.clone(&pointee))}
+      Type.String {..} => DebugShape {kind: 3, encoding: 0, inner: Option<Shared<Type>>.none()}
+      Type.Primitive {name} => {
+        let word = Bytes.asSlice(&name)
+        // DW_ATE_boolean, DW_ATE_UTF, DW_ATE_float, DW_ATE_signed and DW_ATE_unsigned.
+        let mut encoding: u64 = 0
+        if same(word, b"bool") {
+          encoding = 2
+        } else if same(word, b"char") {
+          encoding = 16
+        } else if word.length > usize.ZERO && word[usize.ZERO] == 102 {
+          encoding = 4
+        } else if word.length > usize.ZERO && word[usize.ZERO] == 105 {
+          encoding = 5
+        } else if word.length > usize.ZERO && word[usize.ZERO] == 117 {
+          encoding = 7
+        }
+        if encoding == 0 { return DebugShape {kind: 0, encoding: 0, inner: Option<Shared<Type>>.none()} }
+        return DebugShape {kind: 1, encoding: encoding, inner: Option<Shared<Type>>.none()}
+      }
+      _ => DebugShape {kind: 0, encoding: 0, inner: Option<Shared<Type>>.none()}
+    }
+  })
+}
+
+// Appends the debug type words of `ty` (`Bitcode.Module.variable`), spelled as `viewer` reads it,
+// following at most `depth` levels of members and pointees and describing at most `budget` members
+// in all. Fields are named by their index.
+effect fn debugType(words: &mut List<u64>, ty: &Shared<Type>, layouts: &TypeLayouts, target: &Target, viewer: &ModuleId,
+  depth: usize, budget: &mut usize) -> () ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let found = run TypeLayouts.firstMatching(layouts, ty)
+  if depth == usize.ZERO || found == usize.MAX {
+    return run List<u64>.append(&mut words.*, 0)
+  }
+  let listed = TypeLayouts.list(layouts)
+  let layout = Shared<Layout>.clone(&listed[found].layout)
+  let metrics = Shared<Layout>.with<Metrics>(&layout, Layout.metrics)
+  let mut name = Bytes.make()
+  if let Option<Bytes>.Some {value} = run TypeText.displayElided(ty, viewer) { name = move value }
+  let bits = usize.toU64(metrics.size * 8)
+  let pointerBits = u32.toU64(Target.pointerBits(target))
+  let shape = debugShape(ty)
+  if shape.kind == 1 {
+    let basic: [u64; 3] = [1, shape.encoding, bits]
+    run List<u64>.appendSlice(&mut words.*, &basic)
+    return run Bitcode.appendName(&mut words.*, Bytes.asSlice(&name))
+  }
+  if shape.kind == 2 && metrics.abi == Abi.Pointer {
+    let pointer: [u64; 2] = [2, pointerBits]
+    run List<u64>.appendSlice(&mut words.*, &pointer)
+    if let Option<Shared<Type>>.Some {value: inner} = &shape.inner {
+      return run debugType(&mut words.*, &inner, layouts, target, viewer, depth - usize.ONE, &mut budget.*)
+    }
+    return run List<u64>.append(&mut words.*, 0)
+  }
+  let header: [u64; 3] = [3, bits, usize.toU64(metrics.alignment * 8)]
+  if shape.kind == 3 || Shared<Layout>.with<bool>(&layout, fn(value: &Layout) -> bool {
+    return match &value.storage { Storage.Slice {..} => true _ => false }
+  }) {
+    // An address and a length; a string's bytes are `u8`.
+    let mut lengthOffset = pointerBits / 8
+    if let Option<SliceFacts>.Some {value: facts} = Shared<Layout>.with<Option<SliceFacts>>(&layout, Layout.sliceFacts) {
+      lengthOffset = usize.toU64(facts.lengthOffset)
+    }
+    run List<u64>.appendSlice(&mut words.*, &header)
+    run Bitcode.appendName(&mut words.*, Bytes.asSlice(&name))
+    run List<u64>.append(&mut words.*, 2)
+    run Bitcode.appendName(&mut words.*, b"pointer")
+    let pointer: [u64; 3] = [0, 2, pointerBits]
+    run List<u64>.appendSlice(&mut words.*, &pointer)
+    if shape.kind == 3 {
+      let byte: [u64; 3] = [1, 7, 8]
+      run List<u64>.appendSlice(&mut words.*, &byte)
+      run Bitcode.appendName(&mut words.*, b"u8")
+    } else if let Option<SliceFacts>.Some {value: facts} = Shared<Layout>.with<Option<SliceFacts>>(&layout, Layout.sliceFacts) {
+      run debugType(&mut words.*, &facts.element, layouts, target, viewer, depth - usize.ONE, &mut budget.*)
+    } else {
+      run List<u64>.append(&mut words.*, 0)
+    }
+    run Bitcode.appendName(&mut words.*, b"length")
+    let length: [u64; 4] = [lengthOffset * 8, 1, 7, pointerBits]
+    run List<u64>.appendSlice(&mut words.*, &length)
+    return run Bitcode.appendName(&mut words.*, b"usize")
+  }
+  if let Option<TaggedFacts>.Some {value: tagged} = Shared<Layout>.with<Option<TaggedFacts>>(&layout, Layout.taggedFacts) {
+    // A union shows its tag; its payload depends on it.
+    run List<u64>.appendSlice(&mut words.*, &header)
+    run Bitcode.appendName(&mut words.*, Bytes.asSlice(&name))
+    run List<u64>.append(&mut words.*, 1)
+    run Bitcode.appendName(&mut words.*, b"tag")
+    let tag: [u64; 4] = [0, 1, 7, usize.toU64(tagged.tagSize * 8)]
+    run List<u64>.appendSlice(&mut words.*, &tag)
+    return run Bitcode.appendName(&mut words.*, b"")
+  }
+  let count = Shared<Layout>.with<usize>(&layout, Layout.fieldCount)
+  if count == usize.ZERO && metrics.abi == Abi.Integer && metrics.size > usize.ZERO {
+    // A scalar enum is its unsigned tag.
+    let tag: [u64; 3] = [1, 7, bits]
+    run List<u64>.appendSlice(&mut words.*, &tag)
+    return run Bitcode.appendName(&mut words.*, Bytes.asSlice(&name))
+  }
+  if count == usize.ZERO {
+    run List<u64>.appendSlice(&mut words.*, &header)
+    run Bitcode.appendName(&mut words.*, Bytes.asSlice(&name))
+    return run List<u64>.append(&mut words.*, 0)
+  }
+  // A record names its fields by index; an array, `[0]` and on, up to 64 elements.
+  let sequence = Shared<Layout>.with<bool>(&layout, fn(value: &Layout) -> bool {
+    return match &value.storage { Storage.Sequence {..} => true _ => false }
+  })
+  let mut shown = count
+  if shown > 64 { shown = 64 }
+  if shown > budget.* { shown = budget.* }
+  budget.* = budget.* - shown
+  run List<u64>.appendSlice(&mut words.*, &header)
+  run Bitcode.appendName(&mut words.*, Bytes.asSlice(&name))
+  run List<u64>.append(&mut words.*, usize.toU64(shown))
+  let mut index = usize.ZERO
+  while index < shown {
+    let mut label = Bytes.make()
+    if sequence { run Bytes.append(&mut label, b"[") }
+    run appendDecimal(&mut label, usize.toU64(index))
+    if sequence { run Bytes.append(&mut label, b"]") }
+    run Bitcode.appendName(&mut words.*, Bytes.asSlice(&label))
+    let field = Shared<Layout>.with<Option<Field>>(&layout, fn(value: &Layout) -> Option<Field> { return Layout.fieldAt(value, index) })
+    if let Option<Field>.Some {value: member} = move field {
+      run List<u64>.append(&mut words.*, usize.toU64(member.offset * 8))
+      run debugType(&mut words.*, &member.ty, layouts, target, viewer, depth - usize.ONE, &mut budget.*)
+    } else {
+      let unknown: [u64; 2] = [0, 0]
+      run List<u64>.appendSlice(&mut words.*, &unknown)
+    }
+    index = index + usize.ONE
   }
   return ()
 }

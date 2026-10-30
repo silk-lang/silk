@@ -392,6 +392,38 @@ const program = Effect.gen(function* () {
   const debugRows = yield* invoke(join(dirname(clang), 'llvm-dwarfdump'), ['--debug-line', 'debug.o'], directory)
   assert.equal(debugRows.status, 0, debugRows.stderr)
   assert.match(debugRows.stdout, /^0x[0-9a-f]+\s+[1-9]\d*\s+\d+\s/m)
+  // A debug build declares each parameter and binding at the slot that holds it, with its type, so
+  // a debugger reads them by name. A binding a return writes in place is declared at the result.
+  yield* fs.writeFileString(
+    join(directory, 'variables.silk'),
+    'fn pick(values: &[i32], index: usize) -> i32 {\n  let total = values[index] + 1\n  return total\n}\n\n' +
+      'pub fn main() -> i32 {\n  let values = [1, 2, 3]\n  let chosen = pick(&values, 1)\n  return chosen - 3\n}\n',
+  )
+  const variablesIr = yield* invoke(silk, ['build', 'variables.silk', '-o', 'variables.ll', '--stdlib', standardLibrary,
+    '--debug', 'true', '--optimization', 'none', '--emit', 'llvm-ir'], directory, { ...process.env, SILK_CLANG: sentinel })
+  assert.equal(variablesIr.status, 0, variablesIr.stderr)
+  assert.match(yield* fs.readFileString(join(directory, 'variables.ll')), /#dbg_declare\(ptr %[\w.]+, !\d+, !DIExpression\(\), !\d+\)/)
+  const fromText = yield* invoke(clang, ['-x', 'ir', '-c', 'variables.ll', '-o', 'variables-text.o'], directory)
+  assert.equal(fromText.status, 0, fromText.stderr)
+  const variablesObject = yield* invoke(silk, ['build', 'variables.silk', '-o', 'variables.o', '--stdlib', standardLibrary,
+    '--debug', 'true', '--optimization', 'none', '--emit', 'object'], directory, { ...process.env, SILK_CLANG: clang })
+  assert.equal(variablesObject.status, 0, variablesObject.stderr)
+  const literal = (text: string) => text.replace(/[[\]&;().]/g, '\\$&')
+  // One debug-info entry with `tag`, `name` and `type`, without crossing into the next entry.
+  const declared = (tag: string, name: string, type: string) =>
+    new RegExp(`${tag}\\n(?:[ \\t]+DW_AT_\\w+[^\\n]*\\n)*?[ \\t]+DW_AT_name\\t\\("${name}"\\)\\n` +
+      `(?:[ \\t]+DW_AT_\\w+[^\\n]*\\n)*?[ \\t]+DW_AT_type\\t\\([^"\\n]*"${literal(type)}"\\)`)
+  for (const object of ['variables-text.o', 'variables.o']) {
+    const variablesInfo = yield* invoke(join(dirname(clang), 'llvm-dwarfdump'), ['--debug-info', object], directory)
+    assert.equal(variablesInfo.status, 0, variablesInfo.stderr)
+    assert.doesNotMatch(variablesInfo.stderr, /invalid|error/i, object)
+    assert.match(variablesInfo.stdout, declared('DW_TAG_formal_parameter', 'values', '&[i32]'), object)
+    assert.match(variablesInfo.stdout, declared('DW_TAG_formal_parameter', 'index', 'usize'), object)
+    assert.match(variablesInfo.stdout, declared('DW_TAG_variable', 'total', 'i32'), object)
+    assert.match(variablesInfo.stdout, declared('DW_TAG_variable', 'values', '[i32; 3]'), object)
+    assert.match(variablesInfo.stdout, /DW_TAG_member\n[ \t]+DW_AT_name\t\("length"\)/, object)
+    assert.match(variablesInfo.stdout, /DW_TAG_member\n[ \t]+DW_AT_name\t\("\[2\]"\)/, object)
+  }
   const captured = join(directory, 'completed-backend.bc')
   const linker = join(directory, 'clang-capture')
   yield* fs.writeFileString(

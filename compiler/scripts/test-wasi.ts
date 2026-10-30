@@ -193,6 +193,10 @@ const program = Effect.gen(function* () {
       assert.notEqual(dumped.status, 0)
       const coreBytes = yield* fs.readFile(core)
       assert.deepEqual([...coreBytes.subarray(0, 4)], [0, 0x61, 0x73, 0x6d])
+      // Wasmtime splits its `-D` options at commas, so a path holding one is refused.
+      const comma = yield* invoke(compiler, ['run', '--target', target, '--stdlib', join(repo, 'stdlib'), '--quiet', '--coredump', 'a,b'])
+      assert.equal(comma.status, 2)
+      assert.match(comma.stderr.toString(), /the `--coredump` path cannot contain a comma/)
     }
     // `debug` starts the program under Wasmtime's debugger stub, listening on `--port`.
     const recorder = join(directory, 'fake-wasmtime')
