@@ -13,6 +13,7 @@ Fibers: handles to child tasks, with typed outcomes and one observer each.
 | [`yieldNow`](#Fiber.impl.yieldNow) | Let other ready tasks run before the current task continues |
 
 Run the root program with `silk.concurrency.local_scheduler`, which provides the `Scheduler` service.
+For fibers that run in parallel on native threads, use `silk.concurrency.thread_pool`.
 
 ## Details
 A [`Fiber`](#Fiber) has one completion observer. [`await`](#Fiber.impl.await) and [`join`](#Fiber.impl.join) consume the Fiber, so a Fiber

@@ -278,7 +278,7 @@ atomically, under the memory model of ATOMIC-001:
 | --- | --- |
 | Authority count | A grant adds one with relaxed ordering. A release subtracts one with release ordering, and the holder that released the last unit runs an acquire fence before it drops the allocation. |
 | Lifecycle | The owner's drive and drop store it atomically. Completion and destruction use release stores; `executionLive` loads it with acquire ordering. |
-| Notifying marker | `executionNotify` claims it with a compare-exchange before it checks liveness and runs the endpoint. A drop either claims it first, which makes later notifications run nothing, or leaves itself to the running notification, which performs it after the endpoint returns. |
+| Notifying marker | `executionNotify` claims it with a compare-exchange before it checks liveness and runs the endpoint. While another thread's notification of an earlier generation holds it, the claim is retried, so no generation's notification is lost. A drop either claims it first, which makes later notifications run nothing, or leaves itself to the running notification, which performs it after the endpoint returns. |
 | Control words | `executionLoad` is an acquire load, `executionStore` a release store, and `executionCompareExchange` an acquire-release compare-exchange that yields the value it observed. |
 
 `silk.concurrency.execution` keeps the park generation and the readiness phase in control word 0 as
