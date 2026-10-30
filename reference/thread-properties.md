@@ -276,7 +276,10 @@ returns a `PoolFiber<A, E>`. Its outcome is the `Outcome<A, E>` of `silk.concurr
 `Success`, `Failure` with the typed error, or `Cancelled`. `PoolFiber.await` parks the calling
 fiber and returns the outcome as data; `PoolFiber.join` returns the success value and raises the
 failure unchanged, or `Cancelled`. `PoolFiber.interrupt` cancels the fiber unless it finished
-first, waits for it, and returns its final outcome. `Pool.yieldNow` puts the calling fiber at the
+first, waits for it, and returns its final outcome. `PoolFiber.awaitEither` waits for the first
+of two fibers and returns its outcome with the other, still running, as `PoolFirstLeft` or
+`PoolFirstRight`; `PoolFiber.race` returns the first result and interrupts the other. Both
+allocate one shared wait when neither fiber has ended. `Pool.yieldNow` puts the calling fiber at the
 end of the ready list. `Pool.block(task)` runs a fiber from an ordinary thread and sleeps that
 thread until it ends. Dropping the `ThreadPool` stops and joins every worker and cancels the
 fibers still unfinished.

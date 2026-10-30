@@ -10,6 +10,8 @@ A work-stealing pool of native threads that runs fibers in parallel.
 3. In a fiber, start more fibers with [`Pool.fork`](#Pool.impl.fork), and wait for one with [`PoolFiber.join`](#PoolFiber.impl.join)
    or [`PoolFiber.await`](#PoolFiber.impl.await).
 4. Stop a fiber and get its final outcome with [`PoolFiber.interrupt`](#PoolFiber.impl.interrupt).
+5. Wait for the first of two fibers with [`PoolFiber.awaitEither`](#PoolFiber.impl.awaitEither), or keep the first result
+   and cancel the other with [`PoolFiber.race`](#PoolFiber.impl.race).
 
 ## Details
 A pool fiber is a `Transferable` lazy effect, packaged with `Execution.makeTransferable`. Thus
@@ -32,7 +34,7 @@ fibers that are not finished.
 
 ## Errors
 - [`ThreadPool.make`](#ThreadPool.impl.make) fails with `SpawnError` or `OutOfMemoryError`.
-- [`Pool.fork`](#Pool.impl.fork) fails with `OutOfMemoryError`.
+- [`Pool.fork`](#Pool.impl.fork), [`PoolFiber.awaitEither`](#PoolFiber.impl.awaitEither) and [`PoolFiber.race`](#PoolFiber.impl.race) fail with `OutOfMemoryError`.
 - [`Pool.block`](#Pool.impl.block) and [`PoolFiber.join`](#PoolFiber.impl.join) raise the typed failure of the fiber unchanged, or
   `Cancelled`. [`PoolFiber.await`](#PoolFiber.impl.await) returns them as data.
 
@@ -40,8 +42,8 @@ fibers that are not finished.
 - Fiber bodies, results and failures must be `Transferable` and `'static`.
 - In a fiber, wait for anything other than a [`PoolFiber`](#PoolFiber) with `Execution.parkTransferable`. A
   call that blocks the native thread, such as [`Pool.block`](#Pool.impl.block), holds up a whole worker.
-- Call [`PoolFiber.join`](#PoolFiber.impl.join), [`PoolFiber.await`](#PoolFiber.impl.await), [`PoolFiber.interrupt`](#PoolFiber.impl.interrupt) and [`Pool.yieldNow`](#Pool.impl.yieldNow)
-  only from inside a pool fiber.
+- Call the waiting operations of [`PoolFiber`](#PoolFiber) and [`Pool.yieldNow`](#Pool.impl.yieldNow) only from inside a pool
+  fiber.
 - A fiber that never parks runs to the end, even after an interrupt.
 - The pool uses the system allocator for its own storage, not the `Allocator` of the caller.
 
@@ -144,7 +146,7 @@ pub fn main() -> i32 {
 
 Import as `ThreadPool` with `import silk.concurrency.thread_pool { ThreadPool }`.
 
-Public declarations: 3.
+Public declarations: 5.
 
 <a id="PoolFiber"></a>
 
@@ -218,6 +220,121 @@ typed failure.
 #### Gotchas
 - Only a pool fiber can interrupt. An interrupt from any other place is a fatal state trap.
 - A fiber that never parks runs to the end, so the interrupt waits for that.
+
+<a id="PoolFiber.impl.awaitEither"></a>
+
+### Method `awaitEither`
+
+```silk
+pub effect fn awaitEither<B, F>(self: Self, other: PoolFiber<B, F>) -> PoolFirstLeft<A, E, B, F> | PoolFirstRight<A, E, B, F>
+    ! OutOfMemoryError
+```
+
+Parks the calling fiber until the first of two fibers ends, and returns its outcome with the
+other fiber.
+
+#### When to use
+Use `awaitEither` to act on whichever fiber ends first. Use [`race`](#PoolFiber.impl.race) when the other fiber
+should then be cancelled.
+
+#### Details
+If both had already ended before the call, `self` wins. The other fiber is returned
+unobserved and possibly still running, so the caller can await, interrupt, or drop it. A
+failure or a cancellation of the winner is data in its `Outcome`.
+
+#### Errors
+Fails with `OutOfMemoryError` when the shared wait cannot be allocated. It allocates only when
+neither fiber has ended yet.
+
+#### Gotchas
+Only a pool fiber can wait. A wait from any other place is a fatal state trap.
+
+<a id="PoolFiber.impl.race"></a>
+
+### Method `race`
+
+```silk
+pub effect fn race(self: Self, other: PoolFiber<A, E>) -> A ! E | Cancelled | OutOfMemoryError
+```
+
+Parks the calling fiber until the first of two fibers ends, cancels the other, and returns
+the first result.
+
+#### When to use
+Use `race` to take whichever of two equivalent computations ends first, such as two replicas
+of one request.
+
+#### Details
+The first fiber to end wins, whatever its outcome: its typed failure is raised unchanged, and
+a cancelled winner raises `Cancelled`. The other fiber is cancelled with [`interrupt`](#PoolFiber.impl.interrupt) before
+`race` returns, so its cleanup has finished. If both had already ended before the call,
+`self` wins.
+
+#### Errors
+Fails with `OutOfMemoryError` when the shared wait cannot be allocated.
+
+#### Gotchas
+Only a pool fiber can race. A race from any other place is a fatal state trap.
+
+<a id="PoolFirstLeft"></a>
+
+## `PoolFirstLeft`
+
+```silk
+pub struct PoolFirstLeft<A, E, B, F>
+```
+
+The first fiber of a [`PoolFiber.awaitEither`](#PoolFiber.impl.awaitEither) ended first.
+
+<a id="PoolFirstLeft.outcome"></a>
+
+### Field `outcome`
+
+```silk
+pub outcome: Outcome<A, E>
+```
+
+The outcome of the first fiber.
+
+<a id="PoolFirstLeft.other"></a>
+
+### Field `other`
+
+```silk
+pub other: PoolFiber<B, F>
+```
+
+The second fiber, unobserved and possibly still running.
+
+<a id="PoolFirstRight"></a>
+
+## `PoolFirstRight`
+
+```silk
+pub struct PoolFirstRight<A, E, B, F>
+```
+
+The second fiber of a [`PoolFiber.awaitEither`](#PoolFiber.impl.awaitEither) ended first.
+
+<a id="PoolFirstRight.other"></a>
+
+### Field `other`
+
+```silk
+pub other: PoolFiber<A, E>
+```
+
+The first fiber, unobserved and possibly still running.
+
+<a id="PoolFirstRight.outcome"></a>
+
+### Field `outcome`
+
+```silk
+pub outcome: Outcome<B, F>
+```
+
+The outcome of the second fiber.
 
 <a id="Pool"></a>
 
