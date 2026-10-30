@@ -124,6 +124,23 @@ effect fn allocate(layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError ? 
 
 Returns one allocation for `layout`, or fails with no partial storage.
 
+<a id="Allocator.growsInPlace"></a>
+
+### Operation `growsInPlace`
+
+```silk
+effect fn growsInPlace() -> bool ? &mut Allocator
+```
+
+Returns whether storage this provider allocated from the process heap may grow in place,
+without a new `allocate` request.
+
+#### Details
+
+The default is false, so a provider that wraps [`Allocator.systemAllocatorProvider`](#Allocator.impl.systemAllocatorProvider) to
+count, limit or audit requests sees every growth as a new request. The system provider
+returns true, and `List` then grows its heap storage with `realloc` (#2641).
+
 <a id="Allocator.impl"></a>
 
 ## Implementation `Allocator`
@@ -193,6 +210,14 @@ impl Allocator for SystemAllocator
 
 ```silk
 allocate: SystemAllocator.systemAllocate
+```
+
+<a id="SystemAllocator.impl.Allocator.growsInPlace"></a>
+
+### Operation `growsInPlace`
+
+```silk
+effect fn growsInPlace(self: &mut Self) -> bool ? &mut Allocator
 ```
 
 
