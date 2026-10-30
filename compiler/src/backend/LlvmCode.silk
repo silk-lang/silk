@@ -146,6 +146,9 @@ struct Writer {
   /// Per MIR block, whether its switch dispatches through a table of block addresses, and the
   /// tables the function being built uses, defined once its blocks have positions.
   threaded: List<bool>,
+  /// Per MIR block, whether every path from it ends in `fail` or a trap, so its calls are cold
+  /// and branches into it are unlikely (#2568). Empty in fast-path builds.
+  cold: List<bool>,
   tables: List<JumpTable>,
 }
 
@@ -195,7 +198,7 @@ effect fn writerOfWidth(pointerBits: usize, fastPath: bool) -> Writer ! OutOfMem
     pointerBits: pointerBits, slots: List<u64>.make(), companions: List<u64>.make(),
     blocks: List<u64>.make(), scalars: List<bool>.make(), alignments: List<usize>.make(), copies: List<CallerCopy>.make(), dropCopies: List<DropCopy>.make(), parameters: List<u64>.make(), extras: List<u64>.make(), providers: List<u64>.make(),
     out: Bitcode.none(), failure: Bitcode.none(), context: Bitcode.none(), observer: Bitcode.none(), cause: Bitcode.none(),
-    site: Bitcode.none(), transfer: Bitcode.none(), frame: Bitcode.none(), threaded: List<bool>.make(),
+    site: Bitcode.none(), transfer: Bitcode.none(), frame: Bitcode.none(), threaded: List<bool>.make(), cold: List<bool>.make(),
     tables: List<JumpTable>.make()}
 }
 
@@ -464,6 +467,11 @@ fn blockAt(writer: &Writer, index: usize) -> u64 {
   return List<u64>.get(&writer.blocks, index)
 }
 
+// Whether MIR block `index` only leads to `fail` or a trap (Writer.cold).
+fn isCold(writer: &Writer, index: usize) -> bool {
+  return index < List<bool>.length(&writer.cold) && List<bool>.get(&writer.cold, index)
+}
+
 // The storage address of MIR local `index`.
 fn slotOf(writer: &Writer, index: usize) -> u64 {
   return List<u64>.get(&writer.slots, index)
@@ -574,6 +582,25 @@ effect fn branch(writer: &mut Writer, target: u64) -> () ! OutOfMemoryError ? &m
 
 effect fn branchIf(writer: &mut Writer, condition: u64, onTrue: u64, onFalse: u64) -> () ! OutOfMemoryError ? &mut Allocator {
   return run Module.condBr(&mut writer.*.module, condition, onTrue, onFalse)
+}
+
+// Like [`branchIf`] for a condition that rarely holds, such as a fallible call's failure status:
+// `llvm.expect.i1(condition, false)` gives the branch cold weights, so LLVM places `onTrue` out of
+// line even without a profile (#2568).
+effect fn branchUnlikely(writer: &mut Writer, condition: u64, onTrue: u64, onFalse: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run branchExpecting(&mut writer.*, condition, false, onTrue, onFalse)
+}
+
+// Branches on `condition`, telling LLVM it is usually `expected`.
+effect fn branchExpecting(writer: &mut Writer, condition: u64, expected: bool, onTrue: u64, onFalse: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let flag = run integerType(&mut writer.*, 1)
+  let mut bit: u64 = 0
+  if expected { bit = 1 }
+  let likely = run integerOf(&mut writer.*, 1, bit)
+  let parameters = [flag, flag]
+  let arguments = [condition, likely]
+  let hinted = run callNamed(&mut writer.*, b"llvm.expect.i1", flag, &parameters, &arguments)
+  return run Module.condBr(&mut writer.*.module, hinted, onTrue, onFalse)
 }
 
 // Starts or ends the life of a local's stack slot (backend.StackLifetimes), in Clang 22's
@@ -696,10 +723,22 @@ fn extendedFlag(writer: &Writer, value: Representation) -> bool {
 // The result attributes of a function returning `zeroext` when `extended`, declared and called
 // alike: an attribute list operand.
 effect fn resultAttributes(writer: &mut Writer, extended: bool) -> u64 ! OutOfMemoryError ? &mut Allocator {
-  if !extended { return 0 }
+  return run callAttributes(&mut writer.*, extended, false)
+}
+
+// A call's attributes: `zeroext` on an `extended` result, and `cold` on a call in a block that
+// only leads to `fail` or a trap, so LLVM neither inlines it nor lays its path out inline.
+effect fn callAttributes(writer: &mut Writer, extended: bool, cold: bool) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  if !extended && !cold { return 0 }
   Module.beginAttributes(&mut writer.*.module)
-  let encoding: [u64; 2] = [0, Bitcode.attrZeroExt()]
-  run Module.attributeGroup(&mut writer.*.module, Bitcode.positionResult(), &encoding)
+  if cold {
+    let coldEncoding: [u64; 2] = [0, Bitcode.attrCold()]
+    run Module.attributeGroup(&mut writer.*.module, Bitcode.positionFunction(), &coldEncoding)
+  }
+  if extended {
+    let encoding: [u64; 2] = [0, Bitcode.attrZeroExt()]
+    run Module.attributeGroup(&mut writer.*.module, Bitcode.positionResult(), &encoding)
+  }
   return run Module.endAttributes(&mut writer.*.module)
 }
 
@@ -4359,8 +4398,9 @@ effect fn emitCall(
     return run emitCCall(&mut writer.*, function, target, layouts, &foreign[index], callee, arguments,
       providers, diagnostics, destination, normal, failure, span, block)
   }
+  let cold = isCold(&writer.*, block)
   return run emitCallInner(&mut writer.*, function, target, layouts, identities,
-    callee, arguments, providers, diagnostics, destination, normal, failure, span)
+    callee, arguments, providers, diagnostics, destination, normal, failure, span, cold)
 }
 
 effect fn emitCallInner(
@@ -4377,6 +4417,7 @@ effect fn emitCallInner(
   normal: usize,
   failure: &Option<FailureEdge>,
   span: Location,
+  cold: bool,
 ) -> () ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
   let output = run emitPlace(&mut writer.*, function, target, layouts, destination)
   let kind = output.representation
@@ -4475,7 +4516,7 @@ effect fn emitCallInner(
     let symbol = run InstanceIdentity.name(identities, &key)
     calleeValue = run Module.functionRef(&mut writer.*.module, Bytes.asSlice(&symbol), functionTy)
   }
-  let attributes = run resultAttributes(&mut writer.*, extended)
+  let attributes = run callAttributes(&mut writer.*, extended, cold)
   let mut returned = Bitcode.none()
   if InstanceKey.fixedLinkage(&function.key) {
     returned = run invokeGuarded(&mut writer.*, functionTy, calleeValue, List<u64>.asSlice(&passed), attributes)
@@ -4485,7 +4526,7 @@ effect fn emitCallInner(
   if fallible {
     let onFailure = blockAt(&writer.*, handler)
     let onSuccess = blockAt(&writer.*, normal)
-    return run branchIf(&mut writer.*, returned, onFailure, onSuccess)
+    return run branchUnlikely(&mut writer.*, returned, onFailure, onSuccess)
   }
   if !kind.unit && !outward {
     run storeValue(&mut writer.*, &output, &Value {scalar: kind, value: returned})
@@ -4652,7 +4693,12 @@ effect fn emitBlock(
       let tested = run emitOperand(&mut writer.*, function, target, layouts, &condition)
       let onTrue = blockAt(&writer.*, thenBlock)
       let onFalse = blockAt(&writer.*, elseBlock)
-      run branchIf(&mut writer.*, tested.value, onTrue, onFalse)
+      let coldTrue = isCold(&writer.*, thenBlock)
+      if coldTrue != isCold(&writer.*, elseBlock) {
+        run branchExpecting(&mut writer.*, tested.value, !coldTrue, onTrue, onFalse)
+      } else {
+        run branchIf(&mut writer.*, tested.value, onTrue, onFalse)
+      }
     }
     Terminator.Return {origin} => match &suspended.* {
       Option<Suspended>.Some {value: stepping} => run emitStepReturn(&mut writer.*, function, target, layouts, &stepping, origin.location)
@@ -4761,6 +4807,56 @@ effect fn emitBlock(
 // dispatches the next case itself instead of jumping back to one shared jump-table branch, which
 // saves the jump and lets the branch predictor learn from each arm. A function with an `indirectbr`
 // is never inlined, so only switches with many cases inside a loop qualify.
+// Per MIR block, whether every path from it ends in `fail`, a trap or `unreachable`: such a block
+// builds and reports an error or stops, so it is rarely taken (Writer.cold). The facts flow
+// backward from those exits until nothing changes.
+effect fn coldBlocks(function: &MirFunction) -> List<bool> ! OutOfMemoryError ? &mut Allocator {
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let mut cold = List<bool>.make()
+  run List<bool>.appendRepeated(&mut cold, false, blocks.length)
+  let mut changed = true
+  while changed {
+    changed = false
+    let mut at = blocks.length
+    while at > usize.ZERO {
+      at = at - usize.ONE
+      if !List<bool>.get(&cold, at) && leadsOnlyToCold(&blocks[at].terminator, &cold) {
+        List<bool>.set(&mut cold, at, true)
+        changed = true
+      }
+    }
+  }
+  return move cold
+}
+
+fn leadsOnlyToCold(terminator: &Terminator, cold: &List<bool>) -> bool {
+  return match &terminator.* {
+    Terminator.Fail {..} => true
+    Terminator.Trap {..} => true
+    Terminator.TrapText {..} => true
+    Terminator.Unreachable {..} => true
+    Terminator.Goto {target, ..} => List<bool>.get(cold, target)
+    Terminator.Branch {thenBlock, elseBlock, ..} => List<bool>.get(cold, thenBlock) && List<bool>.get(cold, elseBlock)
+    Terminator.Call {normal, failure, ..} => List<bool>.get(cold, normal) && failureCold(&failure, cold)
+    Terminator.Switch {cases, otherwise, ..} => List<bool>.get(cold, otherwise) && casesCold(List<SwitchCase>.asSlice(&cases), cold)
+    _ => false
+  }
+}
+
+fn failureCold(failure: &Option<FailureEdge>, cold: &List<bool>) -> bool {
+  if let Option<FailureEdge>.Some {value: edge} = &failure.* { return List<bool>.get(cold, edge.target) }
+  return true
+}
+
+fn casesCold(cases: &[SwitchCase], cold: &List<bool>) -> bool {
+  let mut at = usize.ZERO
+  while at < cases.length {
+    if !List<bool>.get(cold, cases[at].target) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
 fn threadedMinimumCases() -> usize { return 64 }
 fn threadedMaximumValue() -> u64 { return 4096 }
 
@@ -5434,7 +5530,10 @@ pub effect fn emit(
   let mut lifetimes = StackLifetimes.Markers {blocks: List<BlockMarkers>.make()}
   let companions = run companionLocals(function)
   run addBlocks(&mut writer, blocks.length)
-  if !fastPath { writer.threaded = run threadedSwitches(function, target) }
+  if !fastPath {
+    writer.threaded = run threadedSwitches(function, target)
+    writer.cold = run coldBlocks(function)
+  }
   at = usize.ZERO
   while at < blocks.length {
     let handle = blockAt(&writer, at)
@@ -6061,7 +6160,7 @@ effect fn emitStep(writer: &mut Writer, function: &MirFunction, target: &Target,
         let zero = run integerOf(&mut writer.*, 8, 0)
         let taken = run compareOf(&mut writer.*, Bitcode.intNe(), flag, zero)
         let onFailure = blockAt(&writer.*, edge.target)
-        run branchIf(&mut writer.*, taken, onFailure, onSuccess)
+        run branchUnlikely(&mut writer.*, taken, onFailure, onSuccess)
       } else {
         run branch(&mut writer.*, onSuccess)
       }
