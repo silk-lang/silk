@@ -132,7 +132,7 @@ pub fn main() -> i32 {
 
 Import as `Effect` with `import silk.core.effect { Effect }`.
 
-Public declarations: 3.
+Public declarations: 4.
 
 <a id="Effect"></a>
 
@@ -1030,6 +1030,64 @@ Returns an effect that succeeds with `value` when it runs.
 The call evaluates `value` immediately and moves it into the effect. The effect has no
 failures and needs no providers. If `value` is affine, the effect can run one time.
 
+<a id="Effect.impl.timeout"></a>
+
+### Method `timeout`
+
+```silk
+pub effect fn timeout<'env, A, E, ?R>(
+    self: once Effect<'env; A ! E ? R>,
+    howLong: u64
+  ) -> A ! E | TimeoutError ? R | &mut Scheduler
+```
+
+Runs `self`, and stops it with [`TimeoutError`](#TimeoutError) if it has not finished `howLong` nanoseconds
+from now.
+
+#### Details
+
+The Scheduler reads its clock when the task next yields to it, so a stale clock reading in
+the task does not shorten the wait. See [`timeoutAt`](#Effect.impl.timeoutAt) for how the effect stops.
+
+#### Gotchas
+
+It needs a `Scheduler` provider, such as `LocalScheduler`. The effect stops only at a park,
+and work before its first park is not counted. `ensuring` finalizers inside it do not run
+when it stops.
+
+<a id="Effect.impl.timeoutAt"></a>
+
+### Method `timeoutAt`
+
+```silk
+pub effect fn timeoutAt<'env, A, E, ?R>(
+    self: once Effect<'env; A ! E ? R>,
+    deadline: Instant
+  ) -> A ! E | TimeoutError ? R | &mut Scheduler
+```
+
+Runs `self`, and stops it with [`TimeoutError`](#TimeoutError) if it has not finished by `deadline`.
+
+#### When to use
+
+Use `timeoutAt` to bound several steps by one deadline. Use [`timeout`](#Effect.impl.timeout) for a duration.
+
+#### Details
+
+`self` runs in the current task, with no new Fiber. If the deadline passes while the task is
+parked inside `self`, such as in a clock wait or a Fiber join, the Scheduler interrupts the
+task: each frame of `self` is abandoned from its park, innermost first. That runs `Drop`
+hooks and non-parking finalizers (`ensuringNonParking`, `useReleaseNonParking`). Then this
+call fails with `TimeoutError`. A success or typed failure of `self` before the deadline is
+returned unchanged. Nested timeouts work; the one whose deadline passes first stops.
+
+#### Gotchas
+
+It needs a `Scheduler` provider, such as `LocalScheduler`. The effect stops only at a park:
+code between two parks always runs to its end, and an effect that never parks never stops.
+`ensuring` finalizers inside it do not run when it stops. Children forked inside it keep
+running; interrupt them, or let their parent finish.
+
 <a id="Effect.impl.sleep"></a>
 
 ### Associated function `sleep`
@@ -1049,6 +1107,34 @@ advance virtual time.
 
 A duration of 0 returns without a wait. If the deadline is more than the clock can represent,
 the program traps.
+
+<a id="TimeoutError"></a>
+
+## `TimeoutError`
+
+```silk
+pub struct TimeoutError
+```
+
+Raised by [`Effect.timeout`](#Effect.impl.timeout) and [`Effect.timeoutAt`](#Effect.impl.timeoutAt) when the deadline passes first.
+
+<a id="TimeoutError.impl.Debug"></a>
+
+## Implementation `Debug for TimeoutError`
+
+```silk
+impl Debug for TimeoutError
+```
+
+<a id="TimeoutError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes `TimeoutError`.
 
 <a id="Pair"></a>
 

@@ -158,11 +158,16 @@ impl LocalScheduler {
     let timerInbox = run Shared<TimerRequestInbox>.make(TimerRequestInbox {
       request: NoTimerRequest {},
     }) |> Effect.provideMut<Allocator>(&mut allocator)
+    let deadlines = run Shared<DeadlineBook>.make(DeadlineBook {
+      entries: List<DeadlineEntry>.make(),
+      nextToken: 1,
+    }) |> Effect.provideMut<Allocator>(&mut allocator)
     let identities = TaskIdSource { next: 1, exhausted: false }
     let contextValue = TaskContext {
       identities: move identities,
       clock: Shared<ClockState>.clone(&clock),
       timerInbox: Shared<TimerRequestInbox>.clone(&timerInbox),
+      deadlines: Shared<DeadlineBook>.clone(&deadlines),
     }
     let context = run Shared<TaskContext>.make(move contextValue)
       |> Effect.provideMut<Allocator>(&mut allocator)
@@ -250,6 +255,7 @@ impl LocalScheduler {
       rootComplete: false,
       clock: move clock,
       timerInbox: move timerInbox,
+      deadlines: move deadlines,
     }
     let mut boxedDriver = run Box<Driver>.make(move driverValue)
       |> Effect.provideMut<Allocator>(&mut allocator)
@@ -405,6 +411,7 @@ struct TaskContext {
   identities: TaskIdSource,
   clock: Shared<ClockState>,
   timerInbox: Shared<TimerRequestInbox>,
+  deadlines: Shared<DeadlineBook>,
 }
 struct ReservedIdentity { identity: TaskId }
 struct Reserved {
@@ -796,9 +803,128 @@ effect fn requestChildCancel(self: &mut SchedulerClient, target: TaskId) -> Pend
   }
 }
 
+// The deadlines tasks armed, unordered. Tokens are unique within one run and never 0. A relative
+// entry holds its duration in `after` until the driver resolves it against a fresh clock mark.
+struct DeadlineBook {
+  entries: List<DeadlineEntry>,
+  nextToken: usize,
+}
+
+struct DeadlineEntry {
+  identity: TaskId,
+  token: usize,
+  seconds: i64,
+  nanoseconds: i64,
+  relative: bool,
+  after: u64,
+}
+
+impl Copy for DeadlineEntry {}
+
+fn cloneDeadlines(context: &mut TaskContext) -> Shared<DeadlineBook> {
+  return Shared<DeadlineBook>.clone(&context.deadlines)
+}
+
+fn reserveToken(book: &mut DeadlineBook) -> usize {
+  let token = book.nextToken
+  if token == usize.MAX {
+    return Intrinsic.trap("LocalScheduler: the deadline tokens are exhausted")
+  }
+  book.nextToken = token + 1
+  return token
+}
+
+fn takeDeadlines(book: &mut DeadlineBook) -> List<DeadlineEntry> {
+  return Intrinsic.replace(book.entries, List<DeadlineEntry>.make())
+}
+
+fn restoreDeadlines(book: &mut DeadlineBook, entries: List<DeadlineEntry>) -> () {
+  book.entries = move entries
+  return ()
+}
+
+fn impossibleDeadlineAllocation(error: OutOfMemoryError) -> () {
+  drop error
+  return Intrinsic.trap("LocalScheduler: storage for a deadline could not be allocated")
+}
+
+effect fn armTaskDeadline(self: &mut SchedulerClient, deadline: Instant) -> usize {
+  let entry = DeadlineEntry {
+    identity: self.identity,
+    token: 0,
+    seconds: SystemClock.seconds(&deadline),
+    nanoseconds: SystemClock.nanoseconds(&deadline),
+    relative: false,
+    after: 0,
+  }
+  drop deadline
+  return run addTaskDeadline(&mut self.*, entry)
+}
+
+effect fn armTaskDeadlineAfter(self: &mut SchedulerClient, howLong: u64) -> usize {
+  let entry = DeadlineEntry {
+    identity: self.identity,
+    token: 0,
+    seconds: 0,
+    nanoseconds: 0,
+    relative: true,
+    after: howLong,
+  }
+  return run addTaskDeadline(&mut self.*, entry)
+}
+
+// Appends `entry` with a fresh token and returns the token.
+effect fn addTaskDeadline(self: &mut SchedulerClient, armed: DeadlineEntry) -> usize {
+  let book = Shared<TaskContext>.withMut<Shared<DeadlineBook>>(&self.context, cloneDeadlines)
+  let token = Shared<DeadlineBook>.withMut<usize>(&book, reserveToken)
+  let mut entries = Shared<DeadlineBook>.withMut<List<DeadlineEntry>>(&book, takeDeadlines)
+  let mut entry = armed
+  entry.token = token
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let appended = List<DeadlineEntry>.append(&mut entries, entry)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let outcome = run Effect.result(move appended)
+  let finished = match move outcome {
+    Result<(), OutOfMemoryError>.Success { value } => finishTimerAppend(move value)
+    Result<(), OutOfMemoryError>.Failure { error } => impossibleDeadlineAllocation(move error)
+  }
+  drop finished
+  Shared.withMut(&book, restoreDeadlines(move entries))
+  drop book
+  return token
+}
+
+// Removes the deadline with `token`, if it is still armed.
+fn removeDeadline(book: &mut DeadlineBook, token: usize) -> () {
+  let count = List<DeadlineEntry>.length(&book.entries)
+  let mut at = usize.ZERO
+  while at < count {
+    let entry = List<DeadlineEntry>.get(&book.entries, at)
+    if entry.token == token {
+      let last = List<DeadlineEntry>.pop(&mut book.entries)
+      if at + usize.ONE < count {
+        if let Option<DeadlineEntry>.Some { value } = move last { List<DeadlineEntry>.set(&mut book.entries, at, value) }
+      }
+      return ()
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn disarmTaskDeadline(self: &mut SchedulerClient, token: usize) -> () {
+  let book = Shared<TaskContext>.withMut<Shared<DeadlineBook>>(&self.context, cloneDeadlines)
+  Shared.withMut(&book, removeDeadline(token))
+  drop book
+  return ()
+}
+
 impl Scheduler for SchedulerClient {
   prepare: SchedulerClient.prepareChild
   requestCancel: SchedulerClient.requestChildCancel
+  armDeadline: SchedulerClient.armTaskDeadline
+  armDeadlineAfter: SchedulerClient.armTaskDeadlineAfter
+  disarmDeadline: SchedulerClient.disarmTaskDeadline
 }
 
 struct Initial {}
@@ -882,6 +1008,7 @@ struct Driver {
   rootComplete: bool,
   clock: Shared<ClockState>,
   timerInbox: Shared<TimerRequestInbox>,
+  deadlines: Shared<DeadlineBook>,
 }
 
 struct DurableDriver { boxed: Box<Driver> }
@@ -1328,6 +1455,7 @@ fn dueAt(timer: &TimerEntry, mark: &ClockSnapshot) -> bool {
 
 fn drainDueTimers(driver: &mut Driver) -> () {
   let mark = Shared<ClockState>.with<ClockSnapshot>(&driver.clock, snapshotClock)
+  Shared.withMut(&driver.deadlines, resolveRelativeDeadlines(&mark))
   let mut collecting = true
   while collecting && List<TimerEntry>.length(&driver.store.timers) > usize.ZERO {
     let earliest = List<TimerEntry>.get(&driver.store.timers, usize.ZERO)
@@ -1393,11 +1521,148 @@ struct NoTimerDeadline {}
 struct TimerDeadline { value: Instant }
 
 fn earliestTimer(driver: &Driver) -> NoTimerDeadline | TimerDeadline {
-  if List<TimerEntry>.length(&driver.store.timers) == usize.ZERO {
-    return NoTimerDeadline {}
+  let mut found = false
+  let mut seconds: i64 = 0
+  let mut nanoseconds: i64 = 0
+  if List<TimerEntry>.length(&driver.store.timers) > usize.ZERO {
+    let timer = List<TimerEntry>.get(&driver.store.timers, usize.ZERO)
+    found = true
+    seconds = timer.seconds
+    nanoseconds = timer.nanoseconds
   }
-  let timer = List<TimerEntry>.get(&driver.store.timers, usize.ZERO)
-  return TimerDeadline { value: SystemClock.make(timer.seconds, timer.nanoseconds) }
+  let deadline = Shared<DeadlineBook>.with<DeadlineMark>(&driver.deadlines, earliestDeadline)
+  if deadline.found && (!found || deadline.seconds < seconds || (deadline.seconds == seconds && deadline.nanoseconds < nanoseconds)) {
+    found = true
+    seconds = deadline.seconds
+    nanoseconds = deadline.nanoseconds
+  }
+  if !found { return NoTimerDeadline {} }
+  return TimerDeadline { value: SystemClock.make(seconds, nanoseconds) }
+}
+
+struct DeadlineMark { found: bool, seconds: i64, nanoseconds: i64 }
+
+fn earliestDeadline(book: &DeadlineBook) -> DeadlineMark {
+  let mut mark = DeadlineMark { found: false, seconds: 0, nanoseconds: 0 }
+  let count = List<DeadlineEntry>.length(&book.entries)
+  let mut at = usize.ZERO
+  while at < count {
+    let entry = List<DeadlineEntry>.get(&book.entries, at)
+    if entry.relative {
+      // The driver resolves it on its next pass, so it wakes at once.
+      return DeadlineMark { found: true, seconds: i64.MIN, nanoseconds: 0 }
+    }
+    if !mark.found || entry.seconds < mark.seconds || (entry.seconds == mark.seconds && entry.nanoseconds < mark.nanoseconds) {
+      mark = DeadlineMark { found: true, seconds: entry.seconds, nanoseconds: entry.nanoseconds }
+    }
+    at = at + usize.ONE
+  }
+  return move mark
+}
+
+struct NoDueDeadline {}
+struct DueDeadline { entry: DeadlineEntry }
+
+// Removes one deadline due at `mark`, if any.
+fn takeDueDeadline(book: &mut DeadlineBook, mark: &ClockSnapshot) -> NoDueDeadline | DueDeadline {
+  let count = List<DeadlineEntry>.length(&book.entries)
+  let mut at = usize.ZERO
+  while at < count {
+    let entry = List<DeadlineEntry>.get(&book.entries, at)
+    let due = !entry.relative && (entry.seconds < mark.seconds || (entry.seconds == mark.seconds && entry.nanoseconds <= mark.nanoseconds))
+    if due {
+      removeDeadline(&mut book.*, entry.token)
+      removeInnerDeadlines(&mut book.*, entry)
+      return DueDeadline { entry: entry }
+    }
+    at = at + usize.ONE
+  }
+  return NoDueDeadline {}
+}
+
+// Removes the deadlines the same task armed after `fired`. Their boundaries are inside the one the
+// interrupt resumes, so its frames are abandoned with them, and none can disarm them.
+fn removeInnerDeadlines(book: &mut DeadlineBook, fired: DeadlineEntry) -> () {
+  let mut at = List<DeadlineEntry>.length(&book.entries)
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    let entry = List<DeadlineEntry>.get(&book.entries, at)
+    if entry.identity.value == fired.identity.value && entry.token > fired.token {
+      removeDeadline(&mut book.*, entry.token)
+    }
+  }
+  return ()
+}
+
+// Turns each relative deadline into a mark `after` nanoseconds past `mark`.
+fn resolveRelativeDeadlines(book: &mut DeadlineBook, mark: &ClockSnapshot) -> () {
+  let count = List<DeadlineEntry>.length(&book.entries)
+  let mut at = usize.ZERO
+  while at < count {
+    let mut entry = List<DeadlineEntry>.get(&book.entries, at)
+    if entry.relative {
+      let start = SystemClock.make(mark.seconds, mark.nanoseconds)
+      let deadline = MonotonicClock.deadlineAfter(&start, entry.after)
+      entry.seconds = SystemClock.seconds(&deadline)
+      entry.nanoseconds = SystemClock.nanoseconds(&deadline)
+      entry.relative = false
+      drop start
+      drop deadline
+      List<DeadlineEntry>.set(&mut book.entries, at, entry)
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Removes every deadline a finished or cancelled task left armed, since no boundary is left to
+// disarm it.
+fn removeTaskDeadlines(book: &mut DeadlineBook, identity: TaskId) -> () {
+  let mut at = List<DeadlineEntry>.length(&book.entries)
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    let entry = List<DeadlineEntry>.get(&book.entries, at)
+    if entry.identity.value == identity.value { removeDeadline(&mut book.*, entry.token) }
+  }
+  return ()
+}
+
+// Interrupts each task whose deadline has passed. The task's armed timer wait, if any, is disarmed
+// first, since its park is abandoned. A task that already finished is skipped.
+fn fireDueDeadlines(driver: &mut Driver) -> () {
+  let mark = Shared<ClockState>.with<ClockSnapshot>(&driver.clock, snapshotClock)
+  Shared.withMut(&driver.deadlines, resolveRelativeDeadlines(&mark))
+  let mut collecting = true
+  while collecting {
+    let selected = Shared.withMut(&driver.deadlines, takeDueDeadline(&mark))
+    match move selected {
+      NoDueDeadline {} => { collecting = false }
+      DueDeadline { entry } => deliverDeadline(&mut driver.*, entry)
+    }
+  }
+  return ()
+}
+
+fn deliverDeadline(driver: &mut Driver, entry: DeadlineEntry) -> () {
+  let disarmed = disarmRegistration(&mut driver.store, entry.identity)
+  drop disarmed
+  let interrupted = HashMap.withMut(&mut driver.store.tasks, entry.identity, interruptEntry(entry.token))
+  return ()
+}
+
+fn interruptEntry(entry: &mut TaskEntry, token: usize) -> () {
+  let selected = Intrinsic.replace(entry.execution, NoExecution {})
+  return match move selected {
+    NoExecution {} => ()
+    StoredExecution { execution } => interruptStored(move entry, move execution, token)
+  }
+}
+
+fn interruptStored(entry: &mut TaskEntry, execution: Intrinsic.Execution<()>, token: usize) -> () {
+  let mut selected = move execution
+  Execution.interrupt<()>(&mut selected, token)
+  entry.execution = StoredExecution { execution: move selected }
+  return ()
 }
 
 effect fn waitUntilTimer(value: Instant) -> ()
@@ -1906,6 +2171,7 @@ fn finishCompletedTask(driver: &mut Driver, identity: TaskId) -> () {
   queueChildren(&mut driver.*, links.firstChild)
   unlinkFromParent(&mut driver.*, identity, links.parent)
   let timerWake = disarmRegistration(&mut driver.store, identity)
+  Shared.withMut(&driver.deadlines, removeTaskDeadlines(identity))
   let removed = HashMap<TaskId, TaskEntry>.remove(&mut driver.store.tasks, identity)
   releaseRemoved(move removed)
   drop timerWake
@@ -2058,6 +2324,7 @@ fn drainCancellations(driver: &mut Driver) -> () {
         }
       }
       let selectedTimerWake = disarmRegistration(&mut driver.store, selected)
+      Shared.withMut(&driver.deadlines, removeTaskDeadlines(selected))
       let cancelled = HashMap<TaskId, TaskEntry>.remove(&mut driver.store.tasks, selected)
       cancelRemoved(move cancelled)
       drop selectedTimerWake
@@ -2117,6 +2384,7 @@ effect fn refreshDurable(owner: &mut DurableDriver) -> ()
 fn drainDurableTimers(owner: &mut DurableDriver) -> () {
   let mut drivers = Box<Driver>.getMut(&mut owner.boxed)
   drainDueTimers(&mut drivers[0])
+  fireDueDeadlines(&mut drivers[0])
   return ()
 }
 
