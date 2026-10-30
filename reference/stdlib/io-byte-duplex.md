@@ -419,6 +419,7 @@ The provider close of the write direction. The safe wrapper flushes before it ca
 ### Operation `closeRaw`
 
 ```silk
+@nonParking
 unsafe effect fn closeRaw() -> () ! ByteIoError ? &mut ByteDuplex
 ```
 

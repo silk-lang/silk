@@ -279,6 +279,7 @@ Sends all bytes that writes accepted to the provider.
 ### Operation `close`
 
 ```silk
+@nonParking
 effect fn close() -> () ! TransportError ? &mut HttpTransport
 ```
 

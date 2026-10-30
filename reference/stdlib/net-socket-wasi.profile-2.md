@@ -372,6 +372,7 @@ unsafe effect fn shutdownWriteRaw(self: &mut Self, deadline: Option<Instant>) ->
 ### Operation `closeRaw`
 
 ```silk
+@nonParking
 unsafe effect fn closeRaw(self: &mut Self) -> () ! ByteIoError
 ```
 
