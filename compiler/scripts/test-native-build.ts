@@ -131,7 +131,10 @@ const program = Effect.gen(function* () {
   // `run` lists the progress options it accepts.
   const runHelp = yield* invoke(silk, ['run', '--help'], directory)
   assert.equal(runHelp.status, 0, runHelp.stderr)
-  assert.match(runHelp.stdout, /^usage: silk run .*\[--progress auto\|live\|plain\|never\] \[--quiet\]/)
+  assert.match(runHelp.stdout, /^usage: silk run .*\[--progress auto\|live\|plain\|never\] \[--quiet\] \[--coredump <path>\]/)
+  const debugHelp = yield* invoke(silk, ['debug', '--help'], directory)
+  assert.equal(debugHelp.status, 0, debugHelp.stderr)
+  assert.match(debugHelp.stdout, /^usage: silk debug .*\[--port <\[address:\]port>\]/)
   // Toolchains belong to the silk tool, not the compiler: `silk toolchain` and `+<version>` are unknown here.
   const toolchain = yield* invoke(silk, ['toolchain'], directory)
   assert.equal(toolchain.status, 2, toolchain.stderr)
@@ -934,6 +937,27 @@ const program = Effect.gen(function* () {
     yield* fs.exists(join(directory, 'build/llvm', hostTarget, 'debug/native-build')),
     true,
   )
+  // `debug` builds the same executable and becomes LLDB on it, with the program's arguments after
+  // its path; `--coredump` belongs to WASI programs and is refused for a native one.
+  const lldb = join(directory, 'fake-lldb')
+  yield* fs.writeFileString(lldb, '#!/bin/sh\nprintf "%s\\n" "$@"\n')
+  yield* fs.chmod(lldb, 0o755)
+  const debugged = yield* invoke(
+    silk,
+    ['debug', '--stdlib', standardLibrary, 'first', '--', '--stdlib'],
+    directory,
+    { ...process.env, SILK_CLANG: clang, SILK_LLDB: lldb },
+  )
+  assert.equal(debugged.status, 0, debugged.stderr)
+  assert.match(debugged.stdout, /^--\n\S*\/build\/llvm\/[^/]+\/debug\/native-build\nfirst\n--stdlib\n$/)
+  const nativeCore = yield* invoke(
+    silk,
+    ['run', '--stdlib', standardLibrary, '--coredump', 'core.dump'],
+    directory,
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(nativeCore.status, 2, nativeCore.stderr)
+  assert.match(nativeCore.stderr, /`--coredump` needs a WASI target/)
   // `clean` removes the whole output directory; a project already clean stays clean.
   const cleaned = yield* invoke(silk, ['clean'], directory)
   assert.equal(cleaned.status, 0, cleaned.stderr)
