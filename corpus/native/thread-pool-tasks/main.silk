@@ -1,12 +1,12 @@
 import silk.mem.allocator { Allocator, OutOfMemoryError }
-import silk.core.effect { Effect }
+import silk.core.effect { Effect, TimeoutError }
 import silk.collections.list { List }
 import silk.concurrency.execution { Execution, TransferableWake }
 import silk.concurrency.fiber { Cancelled, Failure, Outcome, Success }
 import silk.concurrency.thread_native { SpawnError }
 import silk.core.result { Result }
 import silk.concurrency.sync { Arc }
-import silk.concurrency.thread_pool { Pool, PoolFiber, PoolFirstLeft, PoolFirstRight, ThreadPool }
+import silk.concurrency.thread_pool { Pool, PoolFiber, PoolFirstLeft, PoolFirstRight, PoolTask, ThreadPool }
 
 effect fn sum(from: i64, to: i64) -> i64 {
   let mut total: i64 = 0
@@ -193,6 +193,108 @@ effect fn either(pool: Pool, marker: Arc<i32>) -> i32 ! OutOfMemoryError | Cance
 
 effect fn constant(value: i32) -> i32 { return value }
 
+// Holds a marker reference, so the marker count shows the cleanup of abandoned frames.
+struct Counted { marker: Arc<i32> }
+
+// Parks with no Wake left; the pool's drop cancels it.
+effect fn parkForever() -> i32 {
+  run Execution.parkTransferable(fn(wake: TransferableWake) -> () {
+    drop wake
+    return ()
+  })
+  return 0
+}
+
+// Joins a fiber that never ends, inside a timeout of `howLong`.
+effect fn waitStuck(pool: Pool, marker: Arc<i32>, howLong: u64) -> i32 ! TimeoutError | OutOfMemoryError | Cancelled ? &mut PoolTask {
+  let held = Counted { marker: marker.clone() }
+  let stuck = run pool.fork(parkForever())
+  let value = run Pool.timeout(stuck.join(), howLong)
+  drop held
+  return value
+}
+
+effect fn isTimeout<A>(body: once Effect<'static; A ! TimeoutError | OutOfMemoryError | Cancelled ? &mut PoolTask>) -> bool ! OutOfMemoryError | Cancelled ? &mut PoolTask {
+  let result = run Effect.result(move body)
+  return match move result {
+    Result<A, TimeoutError | OutOfMemoryError | Cancelled>.Failure { error } => timedOut(move error)
+    Result<A, TimeoutError | OutOfMemoryError | Cancelled>.Success { value } => false
+  }
+}
+
+fn timedOut(error: TimeoutError | OutOfMemoryError | Cancelled) -> bool {
+  return match move error {
+    TimeoutError {} => true
+    _ => false
+  }
+}
+
+// Spins with yields for at least `rounds` parks.
+effect fn spinFor(rounds: i32) -> i32 {
+  let mut at = 0
+  while at < rounds {
+    run Pool.yieldNow()
+    at = at + 1
+  }
+  return rounds
+}
+
+// A deadline interrupts a parked join and a yielding loop; a body that ends first keeps its value;
+// nested timeouts stop at the shorter one; a typed failure passes through.
+effect fn timeouts(pool: Pool, marker: Arc<i32>) -> i32 ! OutOfMemoryError | Cancelled ? &mut PoolTask {
+  if !run isTimeout<i32>(waitStuck(pool.clone(), marker.clone(), 1000000)) { return 1 }
+  if !run isTimeout<i32>(Pool.timeout(spin(marker.clone()), 2000000)) { return 2 }
+  let quick = run Effect.result(Pool.timeout(spinFor(3), 10000000000))
+  let kept = match move quick {
+    Result<i32, TimeoutError>.Success { value } => value
+    Result<i32, TimeoutError>.Failure { error } => -1
+  }
+  if kept != 3 { return 3 }
+  let inner = Pool.timeout(waitStuck(pool.clone(), marker.clone(), 1000000), 10000000000)
+  if !run isTimeout<i32>(Effect.mapError(move inner, flatten)) { return 4 }
+  let outer = Pool.timeout(waitStuck(pool.clone(), marker.clone(), 10000000000), 1000000)
+  if !run isTimeout<i32>(Effect.mapError(move outer, flatten)) { return 5 }
+  let failed = run Effect.result(Pool.timeout(check(-5), 10000000000))
+  let code = match move failed {
+    Result<i32, Invalid | TimeoutError>.Failure { error } => invalidCode(move error)
+    Result<i32, Invalid | TimeoutError>.Success { value } => 0
+  }
+  if code != -5 { return 6 }
+  // Many fibers time out at once across the workers.
+  let mut fibers = List<PoolFiber<i32, OutOfMemoryError | Cancelled>>.make()
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut at = 0
+  while at < 200 {
+    let fiber = run pool.fork(expectTimeout(pool.clone(), marker.clone()))
+    run List<PoolFiber<i32, OutOfMemoryError | Cancelled>>.append(&mut fibers, move fiber) |> Effect.provideMut<Allocator>(&mut allocator)
+    at = at + 1
+  }
+  while List<PoolFiber<i32, OutOfMemoryError | Cancelled>>.length(&fibers) > 0 {
+    let fiber = List<PoolFiber<i32, OutOfMemoryError | Cancelled>>.remove(&mut fibers, 0)
+    let value = run Effect.mapError(fiber.join(), dropFiberError)
+    if value != 0 { return 7 }
+  }
+  return 0
+}
+
+effect fn expectTimeout(pool: Pool, marker: Arc<i32>) -> i32 ! OutOfMemoryError | Cancelled ? &mut PoolTask {
+  if run isTimeout<i32>(waitStuck(move pool, move marker, 500000)) { return 0 }
+  return 1
+}
+
+fn dropFiberError(error: OutOfMemoryError | Cancelled) -> OutOfMemoryError | Cancelled { return move error }
+
+fn flatten(error: TimeoutError | OutOfMemoryError | Cancelled | TimeoutError) -> TimeoutError | OutOfMemoryError | Cancelled {
+  return move error
+}
+
+fn invalidCode(error: Invalid | TimeoutError) -> i32 {
+  return match move error {
+    Invalid { code } => code
+    TimeoutError {} => 1
+  }
+}
+
 effect fn program() -> i32 ! OutOfMemoryError | SpawnError | Cancelled {
   let mut allocator = Allocator.systemAllocatorProvider()
   let marker = run Arc<i32>.make(7) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -208,6 +310,8 @@ effect fn program() -> i32 ! OutOfMemoryError | SpawnError | Cancelled {
   if interrupted != 0 { return 5 }
   let raced = run pool.block(either(pool.clone(), marker.clone()))
   if raced != 0 { return 9 }
+  let timed = run pool.block(timeouts(pool.clone(), marker.clone()))
+  if timed != 0 { return 10 + timed }
   if marker.count() != 1 { return 6 }
   let detached = run pool.block(detach(pool.clone(), marker.clone()))
   // A fiber still parked when the pool drops is cancelled, and its cleanup runs.

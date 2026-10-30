@@ -12,6 +12,7 @@ A work-stealing pool of native threads that runs fibers in parallel.
 4. Stop a fiber and get its final outcome with [`PoolFiber.interrupt`](#PoolFiber.impl.interrupt).
 5. Wait for the first of two fibers with [`PoolFiber.awaitEither`](#PoolFiber.impl.awaitEither), or keep the first result
    and cancel the other with [`PoolFiber.race`](#PoolFiber.impl.race).
+6. Bound a wait in a fiber with [`Pool.timeout`](#Pool.impl.timeout).
 
 ## Details
 A pool fiber is a `Transferable` lazy effect, packaged with `Execution.makeTransferable`. Thus
@@ -28,6 +29,11 @@ cancelled by the next worker that takes it: the worker drops the parked frames, 
 the outcome is `Cancelled`. A running fiber is cancelled the next time it parks, for example in
 [`Pool.yieldNow`](#Pool.impl.yieldNow) or [`PoolFiber.join`](#PoolFiber.impl.join).
 
+Each fiber body gets its own [`PoolTask`](#PoolTask) provider, which holds the fiber's deadlines.
+[`Pool.timeout`](#Pool.impl.timeout) arms one, as `Effect.timeout` does under a `Scheduler`. When it passes while
+the fiber is parked inside the timed effect, the pool interrupts the fiber there, and the call
+fails with `TimeoutError`. Idle workers sleep only until the earliest deadline.
+
 A [`Pool`](#Pool) is a small `Transferable` handle that fibers capture to fork more fibers. The
 [`ThreadPool`](#ThreadPool) owns the threads. Dropping it stops and joins each worker, and cancels the
 fibers that are not finished.
@@ -37,6 +43,7 @@ fibers that are not finished.
 - [`Pool.fork`](#Pool.impl.fork), [`PoolFiber.awaitEither`](#PoolFiber.impl.awaitEither) and [`PoolFiber.race`](#PoolFiber.impl.race) fail with `OutOfMemoryError`.
 - [`Pool.block`](#Pool.impl.block) and [`PoolFiber.join`](#PoolFiber.impl.join) raise the typed failure of the fiber unchanged, or
   `Cancelled`. [`PoolFiber.await`](#PoolFiber.impl.await) returns them as data.
+- [`Pool.timeout`](#Pool.impl.timeout) fails with `TimeoutError` when its deadline passes first.
 
 ## Gotchas
 - Fiber bodies, results and failures must be `Transferable` and `'static`.
@@ -44,7 +51,7 @@ fibers that are not finished.
   call that blocks the native thread, such as [`Pool.block`](#Pool.impl.block), holds up a whole worker.
 - Call the waiting operations of [`PoolFiber`](#PoolFiber) and [`Pool.yieldNow`](#Pool.impl.yieldNow) only from inside a pool
   fiber.
-- A fiber that never parks runs to the end, even after an interrupt.
+- A fiber that never parks runs to the end, even after an interrupt or a timeout.
 - The pool uses the system allocator for its own storage, not the `Allocator` of the caller.
 
 ## Examples
@@ -85,6 +92,53 @@ effect fn program() -> i32
     return 1
   }
   return 0
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  return 1
+}
+
+pub fn main() -> i32 {
+  return run Effect.catchAll(program(), failed)
+}
+```
+
+### Stop a wait after one millisecond
+```silk
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect, TimeoutError }
+import silk.core.result { Result }
+import silk.concurrency.execution { Execution, TransferableWake }
+import silk.concurrency.fiber { Cancelled }
+import silk.concurrency.thread_native { SpawnError }
+import silk.concurrency.thread_pool { Pool, PoolTask, ThreadPool }
+
+// Parks and drops its Wake, so nothing ever resumes it.
+effect fn forever() -> i32 {
+  run Execution.parkTransferable(fn(wake: TransferableWake) -> () {
+    drop wake
+    return ()
+  })
+  return 1
+}
+
+effect fn waitBriefly(pool: Pool) -> i32
+  ! OutOfMemoryError ? &mut PoolTask {
+  let stuck = run pool.fork(forever())
+  let waited = run Effect.result(Pool.timeout(stuck.join(), 1000000))
+  return match move waited {
+    Result<i32, Cancelled | TimeoutError>.Failure { error } => 0
+    Result<i32, Cancelled | TimeoutError>.Success { value } => 1
+  }
+}
+
+effect fn program() -> i32
+  ! OutOfMemoryError | SpawnError | Cancelled {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let threads = run ThreadPool.make(2) |> Effect.provideMut<Allocator>(&mut allocator)
+  let pool = threads.pool()
+  return run pool.block(waitBriefly(pool.clone()))
 }
 
 effect fn failed<E>(error: E) -> i32 {
@@ -146,7 +200,7 @@ pub fn main() -> i32 {
 
 Import as `ThreadPool` with `import silk.concurrency.thread_pool { ThreadPool }`.
 
-Public declarations: 5.
+Public declarations: 6.
 
 <a id="PoolFiber"></a>
 
@@ -336,6 +390,44 @@ pub outcome: Outcome<B, F>
 
 The outcome of the second fiber.
 
+<a id="PoolTask"></a>
+
+## `PoolTask`
+
+```silk
+pub service PoolTask
+```
+
+The deadlines of the calling pool fiber, which [`Pool.timeout`](#Pool.impl.timeout) arms.
+
+### Details
+Every pool fiber gets its own provider, so its body can require `&mut PoolTask`. It works like
+the deadline operations of `Scheduler`: when a deadline passes while the fiber is parked inside
+the interruptible boundary that `Intrinsic.interruptibleEffect` opened for its token, the pool
+interrupts the fiber with that token. A deadline that passes while the fiber runs interrupts it
+at its next park inside the boundary. The pool measures time on the OS monotonic clock.
+
+<a id="PoolTask.armDeadlineAfter"></a>
+
+### Operation `armDeadlineAfter`
+
+```silk
+effect fn armDeadlineAfter(howLong: u64) -> usize ? &mut PoolTask
+```
+
+Arms a deadline `howLong` nanoseconds from now for the calling fiber, and returns its token,
+which is never 0. The pool removes a deadline once it fires.
+
+<a id="PoolTask.disarmDeadline"></a>
+
+### Operation `disarmDeadline`
+
+```silk
+effect fn disarmDeadline(token: usize) -> () ? &mut PoolTask
+```
+
+Disarms a deadline the calling fiber armed. A deadline that already fired is ignored.
+
 <a id="Pool"></a>
 
 ## `Pool`
@@ -367,7 +459,7 @@ pub effect<'env> fn fork<
     'env,
     A: 'static + Transferable,
     E: 'static + Transferable,
-    F: once Effect<'static; A ! E> + Intrinsic.Detached + Transferable
+    F: once Effect<'static; A ! E ? &mut PoolTask> + Intrinsic.Detached + Transferable
   >(self: &Self, task: F) -> PoolFiber<A, E> ! OutOfMemoryError
 ```
 
@@ -390,7 +482,7 @@ pub effect<'env> fn block<
     'env,
     A: 'static + Transferable,
     E: 'static + Transferable,
-    F: once Effect<'static; A ! E> + Intrinsic.Detached + Transferable
+    F: once Effect<'static; A ! E ? &mut PoolTask> + Intrinsic.Detached + Transferable
   >(self: &Self, task: F) -> A ! OutOfMemoryError | E | Cancelled
 ```
 
@@ -429,6 +521,37 @@ cancels it here.
 
 #### Gotchas
 Only a pool fiber can yield. A yield from any other place is a fatal state trap.
+
+<a id="Pool.impl.timeout"></a>
+
+### Associated function `timeout`
+
+```silk
+pub effect fn timeout<'env, A, E, ?R>(
+    body: once Effect<'env; A ! E ? R>,
+    howLong: u64
+  ) -> A ! E | TimeoutError ? R | &mut PoolTask
+```
+
+Runs `body` in the calling fiber, and stops it with `TimeoutError` if it has not finished
+`howLong` nanoseconds from now.
+
+#### Details
+It works as `Effect.timeout` does under a `Scheduler`. If the deadline passes while the fiber
+is parked inside `body`, such as in a [`PoolFiber.join`](#PoolFiber.impl.join) or [`Pool.yieldNow`](#Pool.impl.yieldNow), the pool
+interrupts the fiber, and if it passes while the fiber runs, the fiber is interrupted at its
+next park inside `body`. Each frame of `body` is abandoned from its park, innermost first, which
+runs `Drop` hooks and non-parking finalizers. Then this call fails with `TimeoutError`. A
+success or typed failure of `body` before the deadline is returned unchanged. Nested timeouts
+work; the one whose deadline passes first stops. The pool measures time on the OS monotonic
+clock, from this call.
+
+#### Gotchas
+- Only a pool fiber has the `PoolTask` provider it needs.
+- The effect stops only at a park: code between two parks always runs to its end, and an
+  effect that never parks never stops. `ensuring` finalizers inside it do not run when it
+  stops.
+- Fibers forked inside it keep running; interrupt them, or wait for them.
 
 <a id="ThreadPool"></a>
 
