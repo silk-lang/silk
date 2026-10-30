@@ -116,6 +116,21 @@ Starts a new report on the same descriptor, with the full byte and frame limits 
 #### When to use
 Use it when one report writer serves several reports, such as one for each failed test.
 
+<a id="NativeReport.impl.resume"></a>
+
+### Method `resume`
+
+```silk
+pub fn resume(self: &mut Self) -> ()
+```
+
+Starts the next part of the same report with the full frame limit again. The byte limit
+keeps counting, so a report that ran out of bytes stays incomplete.
+
+#### When to use
+Use it when one report has two lists of frames, such as a trap's caller frames and then the
+cause the trap happened while handling.
+
 <a id="NativeReport.impl.unhandled"></a>
 
 ### Method `unhandled`

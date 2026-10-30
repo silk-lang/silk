@@ -17,7 +17,8 @@ has the error name and its origin, but frames and causes can be missing.
 ## Gotchas
 - The observer does not close the descriptor of the report, and does not end the process.
 - An unhandled error gives status 1, also when the report cannot be written.
-- A trap writes a report, then the program stops.
+- A trap writes a report, then the program stops. In an unoptimized build the report also
+  names the functions that called the trapping one, without those of the standard library.
 
 Import as `NativeDiagnostics` with `import silk.platform.native.diagnostics { NativeDiagnostics }`.
 
@@ -57,7 +58,8 @@ writes only the caller frames of that error.
 ### Gotchas
 - The observer does not close the descriptor of the report, and does not end the process.
 - An unhandled error gives status 1, also when the report cannot be written.
-- A trap writes a report, then the program stops.
+- A trap writes a report, then the program stops. In an unoptimized build the report also
+  names the functions that called the trapping one, without those of the standard library.
 
 <a id="NativeDiagnostics.impl"></a>
 
