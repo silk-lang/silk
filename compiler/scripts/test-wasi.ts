@@ -136,6 +136,54 @@ const program = Effect.gen(function* () {
     ])
     assert.equal(trapped.status, 1, trapped.stderr.toString())
     assert.match(trapped.stdout.toString(), /1 passed, 2 failed/)
+    assert.match(trapped.stdout.toString(), /fatal trap: WASI test trap\n {6}at main\.traps \(main:3:/)
+    // A trap names its callers with their lines from Wasmtime's trace, under the test or after the
+    // report, and the module's name section reads as the source does (#2599).
+    yield* fs.writeFileString(
+      join(directory, 'main.silk'),
+      [
+        'import silk.testing.testing {AssertionError, Testing}',
+        'fn pick(values: &[i32], at: usize) -> i32 { return values[at] }',
+        'fn outer(at: usize) -> i32 { let values: [i32; 2] = [1, 2] return pick(&values, at) }',
+        'test effect fn trapsDeep() -> () ! AssertionError<\'static> { let value = outer(5) run Testing.expect(value == 1, "never") }',
+        'pub fn main() -> i32 { return outer(5) }',
+        '',
+      ].join('\n'),
+    )
+    const deep = yield* invoke(compiler, ['test', '--target', target, '--stdlib', join(repo, 'stdlib'), '--no-cache'])
+    assert.equal(deep.status, 1, deep.stderr.toString())
+    assert.match(
+      deep.stdout.toString(),
+      /fatal trap: index out of bounds\n {6}at main\.pick \(main:2:52\)\n {6}at main\.outer \(main\.silk:3:67\)\n {6}at main\.trapsDeep \(main\.silk:4:\d+\)\n {4}FAIL/,
+    )
+    const deepRun = yield* invoke(compiler, ['run', '--target', target, '--stdlib', join(repo, 'stdlib'), '--quiet'])
+    assert.notEqual(deepRun.status, 0)
+    assert.match(deepRun.stderr.toString(), /fatal trap: index out of bounds\n {2}at main\.pick \(main:2:52\)\n/)
+    assert.match(deepRun.stderr.toString(), /- main\.outer\n\s+at .*main\.silk:3:67/)
+    // An unhandled error reports its name, origin, call path and value, as on native targets.
+    yield* fs.writeFileString(
+      join(directory, 'main.silk'),
+      [
+        'import silk.io.writer {Writer, WriterError}',
+        'import silk.text.format {Debug, Format, Formatter}',
+        'pub struct ConfigError { pub code: i32 }',
+        'impl Debug for ConfigError {',
+        '  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {',
+        '    return run Format.debugFields(self, "ConfigError", &mut formatter)',
+        '  }',
+        '}',
+        'effect fn load(code: i32) -> i32 ! ConfigError { if code > 0 { fail ConfigError { code: code } } return code }',
+        'effect fn configure(code: i32) -> i32 ! ConfigError { return run load(code) }',
+        'pub effect fn main() -> () ! ConfigError { let code = run configure(7) }',
+        '',
+      ].join('\n'),
+    )
+    const unhandled = yield* invoke(compiler, ['run', '--target', target, '--stdlib', join(repo, 'stdlib'), '--quiet'])
+    assert.equal(unhandled.status, 1, unhandled.stderr.toString())
+    assert.match(
+      unhandled.stderr.toString(),
+      /unhandled error: main\.ConfigError\n {2}at main\.load \(main:9:\d+\)\n {2}at main\.configure \(main:10:\d+\)\n {2}at main\.main \(main:11:\d+\)\nunhandled value: ConfigError \{ code: 7 \}\n/,
+    )
     // Empty host snapshots and nonzero command status work for each entry adapter.
     yield* fs.writeFileString(join(directory, 'main.silk'), 'pub fn main() -> i32 { return 42 }\n')
     const statusBuild = yield* build(target, output)

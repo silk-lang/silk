@@ -64,6 +64,8 @@ import driver.CommandPath
 import driver.EditReplay as EditReplays {Edit, InvalidReplayScript, Kind as EditKind}
 import driver.PlatformSupply as PlatformSupplies {Request as SupplyRequest, Supply, SupplyError}
 import driver.WasiTools
+import driver.WasmNames as WasmNames {FunctionNames}
+import driver.WasmTrace
 import driver.NativeToolchain
 import driver.CodegenCache
 import backend.Bitcode
@@ -940,7 +942,7 @@ effect fn writeError(bytes: &[u8]) -> () ! WriterError {
 /// Two commands that build one package at once write the same `output`, so each makes its files in a
 /// new directory of its own beside it, renames the finished output over `output`, and removes the
 /// directory.
-effect fn compileIr(ir: &Bytes, debugInfo: &[u8], units: &[CodegenUnit], packs: &[BuildRecord.PackBody], output: &Path, form: Form, stage: Stage, optimization: &[u8], debug: bool, relocation: &[u8],
+effect fn compileIr(ir: &Bytes, debugInfo: &[u8], functionNames: &FunctionNames, units: &[CodegenUnit], packs: &[BuildRecord.PackBody], output: &Path, form: Form, stage: Stage, optimization: &[u8], debug: bool, relocation: &[u8],
   profileFlags: &[Bytes], target: &Target, supply: &Option<Supply>, linkInputs: &[NativeLinkInput], functionOrder: Option<&Path>,
   selectedClang: &Option<Bytes>, world: &WasiTools.World, started: bool, progress: &mut Progress) -> i32
 ! FileError | ProcessError | HostInputError | InvalidNativeLinkInput | OutOfMemoryError | WriterError
@@ -953,7 +955,7 @@ effect fn compileIr(ir: &Bytes, debugInfo: &[u8], units: &[CodegenUnit], packs: 
   let use = effect fn(resource: &mut Path) -> i32
   ! FileError | ProcessError | HostInputError | InvalidNativeLinkInput | OutOfMemoryError | WriterError
   ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
-    return run compileIrIn(&resource.*, ir, debugInfo, units, packs, output, form, stage, optimization, debug, relocation, profileFlags, target, supply,
+    return run compileIrIn(&resource.*, ir, debugInfo, functionNames, units, packs, output, form, stage, optimization, debug, relocation, profileFlags, target, supply,
       linkInputs, functionOrder, selectedClang, world, started, &mut progress.*)
   }
   let release = effect fn(resource: &mut Path) -> () ? &mut FileSystem | &mut Allocator {
@@ -1006,9 +1008,25 @@ effect fn programDebugInfo(store: &mut Semantic, plan: &EmissionPlan, sources: &
   return run DebugInfo.encode(&info)
 }
 
+// The source name of each emitted function, as a trap report names its frames: `main.pick`, or
+// `main.Buffer.drop` for the drop glue of `main.Buffer`. A helper an instance needs is named after
+// its declaration.
+effect fn readableNames(plan: &EmissionPlan) -> FunctionNames ! OutOfMemoryError ? &mut Allocator {
+  let mut names = FunctionNames.make()
+  let count = EmissionPlan.symbolCount(plan)
+  let mut at = usize.ZERO
+  while at < count {
+    let mut name = run MirNames.declarationName(EmissionPlan.identityDeclaration(plan, at))
+    if same(EmissionPlan.identityFamily(plan, at), b"drop") { run Bytes.append(&mut name, b".drop") }
+    run FunctionNames.add(&mut names, EmissionPlan.identitySymbol(plan, at), Bytes.asSlice(&name))
+    at = at + usize.ONE
+  }
+  return move names
+}
+
 // Compiles as `compileIr` does, with the intermediate files in `scratch` under the output's name,
 // which Clang records in the object.
-effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], units: &[CodegenUnit], packs: &[BuildRecord.PackBody], output: &Path, form: Form, stage: Stage, optimization: &[u8], debug: bool,
+effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], functionNames: &FunctionNames, units: &[CodegenUnit], packs: &[BuildRecord.PackBody], output: &Path, form: Form, stage: Stage, optimization: &[u8], debug: bool,
   relocation: &[u8], profileFlags: &[Bytes], target: &Target, supply: &Option<Supply>, linkInputs: &[NativeLinkInput],
   functionOrder: Option<&Path>, selectedClang: &Option<Bytes>, world: &WasiTools.World, started: bool, progress: &mut Progress) -> i32
 ! FileError | ProcessError | HostInputError | InvalidNativeLinkInput | OutOfMemoryError | WriterError
@@ -1310,6 +1328,8 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], units: &[Cod
   let mut command = run linkCommand(&process, Bytes.asSlice(&stem))
   if units.length == usize.ZERO { run appendDigest(&mut command, ContentHash.of(Bytes.asSlice(ir))) }
   if debugInfo.length > usize.ZERO { run appendDigest(&mut command, ContentHash.of(debugInfo)) }
+  // A renamed function changes the published names even when its symbol stays the same.
+  if FunctionNames.length(functionNames) > usize.ZERO { run appendDigest(&mut command, FunctionNames.digest(functionNames)) }
   if freestanding { run appendDigest(&mut command, ContentHash.of(WasmRuntime.source())) }
   if let Option<Bytes>.Some {value: order} = &ordering { run appendDigest(&mut command, ContentHash.of(Bytes.asSlice(&order))) }
   let unitDirectory = run CodegenCache.directoryFor(output)
@@ -1352,6 +1372,14 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], units: &[Cod
     }
     if compiled != 0 { return compiled }
     if units.length > usize.ZERO { run CodegenCache.prune(&unitDirectory, linkedObjects) }
+    // Engines print the name section in their traces, so a debug module names its functions as
+    // the source does, before a component wraps it.
+    if freestanding && FunctionNames.length(functionNames) > usize.ZERO {
+      let module = run FileSystem.readFile(&staged)
+      if let Option<Bytes>.Some {value: renamed} = move run WasmNames.rename(Bytes.asSlice(&module), functionNames) {
+        run FileSystem.writeFile(&staged, Bytes.asSlice(&renamed))
+      }
+    }
     if let Option<ProcessRequest>.Some {value: archiving} = &archiver {
       let archived = run submitted(&archiving, &mut progress.*)
       if archived != 0 { return archived }
@@ -2490,6 +2518,11 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, cacheDirectory: Opti
         // An unchanged map is left alone, so a build that changes nothing writes nothing.
         if !run holds(&mapFile, Bytes.asSlice(&map)) { run FileSystem.writeFile(&mapFile, Bytes.asSlice(&map)) }
       }
+      // A debug wasm executable names its functions as the source does (`WasmNames`).
+      let mut functionNames = FunctionNames.make()
+      if debug && stage == Stage.Final && form == Form.Executable && same(Target.objectFormat(&target), b"wasm") {
+        functionNames = run readableNames(&plan)
+      }
       // A debug build of the whole program also carries line tables.
       let mut debugInfo = Bytes.make()
       if debug && !split && stage != Stage.LlvmIr {
@@ -2538,7 +2571,7 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, cacheDirectory: Opti
       run Progress.show(&mut progress.*, b"clang")
       // A link input the target cannot link fails this package's link, like a linker error.
       let linked = run Effect.result(compileIr(
-        &text, Bytes.asSlice(&debugInfo), List<CodegenUnit>.asSlice(&units), List<BuildRecord.PackBody>.asSlice(&packs), output, form, stage, Bytes.asSlice(&optimization), debug, Bytes.asSlice(&relocation),
+        &text, Bytes.asSlice(&debugInfo), &functionNames, List<CodegenUnit>.asSlice(&units), List<BuildRecord.PackBody>.asSlice(&packs), output, form, stage, Bytes.asSlice(&optimization), debug, Bytes.asSlice(&relocation),
         List<Bytes>.asSlice(&profileFlags), &target,
         &supply, ModuleSourceFiles.nativeLinkInputs(&sources), ModuleSourceFiles.functionOrder(&sources), clang, &world, started,
         &mut progress.*,
@@ -3528,6 +3561,16 @@ effect fn test(sourcePath: &Path, manifest: Option<&Path>, output: &Path, displa
 ! ApplicationError | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Writer | &mut Types {
   let wasi = same(Target.operatingSystem(InitialProfile.target(&profile)), b"wasi")
+  // A WASI trap's frames are located relative to the root source's directory, which DWARF names
+  // by its canonical path.
+  let parent = match move run Path.parent(sourcePath) {
+    Option<Path>.Some {value} => move value
+    Option<Path>.None => run Path.fromBytes(b".")
+  }
+  let sourceDirectory = match move run CommandPath.canonical(Path.rawBytes(&parent)) {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => run Bytes.copy(Path.rawBytes(&parent))
+  }
   // An unchanged project reuses the runner it built last time, whatever the filters select;
   // `--no-cache` builds it again (TEST-008).
   let mut recordBytes = run Bytes.copy(Path.rawBytes(output))
@@ -3625,7 +3668,26 @@ effect fn test(sourcePath: &Path, manifest: Option<&Path>, output: &Path, displa
     run ChildProcess.addArgumentBytes(&mut process, limit)
     let outcome = run ChildProcess.submit(&process)
     run Writer.writeAll(ChildProcess.outputBytes(&outcome))
-    run writeError(ChildProcess.errorBytes(&outcome))
+    // Wasmtime's report of a trap becomes the frames under the test, as a native trap's would.
+    let mut trap = Option<WasmTrace.Trap>.none()
+    if wasi {
+      trap = run WasmTrace.frames(ChildProcess.errorBytes(&outcome), ChildProcess.outputBytes(&outcome), b"    ", Bytes.asSlice(&sourceDirectory))
+    }
+    if let Option<WasmTrace.Trap>.Some {value: trapped} = &trap {
+      run writeError(Bytes.asSlice(&trapped.output))
+      if WasmTrace.interrupted(&trapped) {
+        run writeError(b"silk test: the test did not finish within ")
+        run writeError(limit)
+        run writeError(b" s; pass --timeout <seconds> to change the limit, or 0 for none\n")
+      } else if !WasmTrace.reported(&trapped) {
+        run Writer.writeAll(b"    fatal trap: ")
+        run Writer.writeAll(Bytes.asSlice(&trapped.reason))
+        run Writer.writeAll(b"\n")
+      }
+      run Writer.writeAll(Bytes.asSlice(&trapped.frames))
+    } else {
+      run writeError(ChildProcess.errorBytes(&outcome))
+    }
     status = 2
     running = false
     if let Option<i32>.Some {value} = move ChildProcess.exitCode(&outcome) {
@@ -4219,7 +4281,7 @@ effect fn buildProjectTarget(project: &Project, plan: ProjectPlan, standardLibra
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
   // A library is Silk source for other packages: building it checks it and makes no artifact.
   if Projects.form(project) == Form.Library {
-    return run checkTarget(project, move plan, standardLibrary, false, false, settings)
+    return run checkTarget(project, move plan, standardLibrary, false, false, abandon, settings)
   }
   let ProjectPlan {input: planned, bindings, name: profileNamed, maxMemory} = move plan
   let form = Projects.form(project)
@@ -4486,7 +4548,7 @@ effect fn writeDiagnostics(target: &Target, json: bool, diagnostics: &Bytes, pro
 // module and the imports of every reached one. Diagnostics go to standard error in `format`,
 // after a `[<target>]` header in the human format, as the TypeScript `silk check` writes them.
 // The status is 0, 1 when a declaration is rejected, or 2 for an unsupported construct.
-effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Option<Path>, json: bool, roots: bool, settings: &ProgressSettings) -> ProjectArtifact
+effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Option<Path>, json: bool, roots: bool, abandon: bool, settings: &ProgressSettings) -> ProjectArtifact
 ! ApplicationError | InitialProfileProblem | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
   let ProjectPlan {input: planned, bindings, name: _, maxMemory: unlimited} = move plan
@@ -4550,9 +4612,7 @@ effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Op
   // An executable's runtime is checked against the application too, so `check` reports a `main`
   // the runtime cannot start, as `build` does. Only those refusals are reported from it.
   if let Option<ModuleId>.Some {value: selected} = &runtime {
-    let mut started = List<ModuleId>.make()
-    run List<ModuleId>.append(&mut started, ModuleId.copy(&selected))
-    let entered = run Semantic.checkDeclarations(&mut store, &mut request, List<ModuleId>.asSlice(&started), &runtime)
+    let entered = run Semantic.checkRuntime(&mut store, &mut request, &selected, List<ModuleId>.asSlice(&sweptModules))
     let refused = List<Shared<Rejection>>.asSlice(&entered.rejections)
     let mut refusal = usize.ZERO
     while refusal < refused.length {
@@ -4626,6 +4686,15 @@ effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Op
   }
   run writeDiagnostics(&target, json, &out, &mut progress)
   run Progress.finish(&mut progress, Projects.name(project), status == 0)
+  if abandon {
+    // The process exits right after this check, and its exit returns the store's pages at once,
+    // so they are not freed one by one first.
+    run abandonValue(move store)
+    run abandonValue(move sources)
+    run abandonValue(move request)
+    run abandonValue(move cache)
+    run abandonValue(move checked)
+  }
   return ProjectArtifact {status: status, target: target, path: move path}
 }
 
@@ -4688,9 +4757,7 @@ effect fn replayCheck(store: &mut Semantic, request: &mut SemanticRequest, roots
 ? &mut Allocator | &mut Types {
   let zone = Profiler.zone(b"replayCheck")
   if let Option<ModuleId>.Some {value: selected} = &runtime.* {
-    let mut started = List<ModuleId>.make()
-    run List<ModuleId>.append(&mut started, ModuleId.copy(&selected))
-    let entered = run Semantic.checkDeclarations(&mut store.*, &mut request.*, List<ModuleId>.asSlice(&started), runtime)
+    let entered = run Semantic.checkRuntime(&mut store.*, &mut request.*, &selected, roots)
     drop entered
   }
   let checked = run Semantic.checkDeclarations(&mut store.*, &mut request.*, roots, runtime)
@@ -5160,7 +5227,7 @@ effect fn checkProject(working: &Path, command: CheckCommand) -> i32
   let mut at = usize.ZERO
   while at < projects.length {
     if selection.members { settings.position = at + usize.ONE }
-    let checked = run memberStatus(run Effect.result(checkOne(&projects[at], &options, &standardLibrary, json, roots, &settings, &edits, differential)))
+    let checked = run memberStatus(run Effect.result(checkOne(&projects[at], &options, &standardLibrary, json, roots, &settings, &edits, differential, at + usize.ONE == projects.length)))
     if checked == 0 { succeeded = succeeded + usize.ONE }
     status = worse(status, checked)
     at = at + usize.ONE
@@ -5170,7 +5237,7 @@ effect fn checkProject(working: &Path, command: CheckCommand) -> i32
 }
 
 // Checks one project's planned compilations, as `checkProject` does for each selected project.
-effect fn checkOne(project: &Project, options: &ProjectOptions, standardLibrary: &Option<Path>, json: bool, roots: bool, packages: &ProgressSettings, edits: &Option<List<Edit>>, differential: bool) -> i32
+effect fn checkOne(project: &Project, options: &ProjectOptions, standardLibrary: &Option<Path>, json: bool, roots: bool, packages: &ProgressSettings, edits: &Option<List<Edit>>, differential: bool, last: bool) -> i32
 ! ApplicationError | InitialProfileProblem | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types | &mut Writer {
   let mut plans = match move run projectPlans(project, options, Projects.targets(project)) {
@@ -5189,7 +5256,8 @@ effect fn checkOne(project: &Project, options: &ProjectOptions, standardLibrary:
   let mut attempts = List<ProjectArtifact>.make()
   while List<ProjectPlan>.length(&plans) > usize.ZERO {
     let plan = List<ProjectPlan>.remove(&mut plans, usize.ZERO)
-    run List<ProjectArtifact>.append(&mut attempts, run checkTarget(project, move plan, standardLibrary, json, roots, &settings))
+    let abandon = last && List<ProjectPlan>.length(&plans) == usize.ZERO
+    run List<ProjectArtifact>.append(&mut attempts, run checkTarget(project, move plan, standardLibrary, json, roots, abandon, &settings))
   }
   // Each attempt has reported itself on standard error, so only the status is left to combine.
   let attempted = List<ProjectArtifact>.asSlice(&attempts)

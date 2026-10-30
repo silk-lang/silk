@@ -36,6 +36,24 @@ In particular 1 is access denied, 5 timeout, 8 would block, and 14 connection re
 pub code: u32
 ```
 
+<a id="SocketError.impl.Debug"></a>
+
+## Implementation `Debug for SocketError`
+
+```silk
+impl Debug for SocketError
+```
+
+<a id="SocketError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes `SocketError { code: <code> }`.
+
 <a id="SocketAddress"></a>
 
 ## `SocketAddress`
