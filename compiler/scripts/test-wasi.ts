@@ -89,6 +89,32 @@ const program = Effect.gen(function* () {
       const wit = yield* invoke(wasmTools, ['component', 'wit', output])
       assert.equal(wit.status, 0, wit.stderr.toString())
       assert.match(wit.stdout.toString(), /export wasi:cli\/run/)
+      // The bundled world lists the draft `wasi:logging`, which only a component that logs
+      // through it imports.
+      assert.doesNotMatch(wit.stdout.toString(), /wasi:logging/)
+      yield* fs.writeFileString(
+        join(directory, 'logging.silk'),
+        [
+          'import silk.core.effect { Effect }',
+          'import silk.io.logger { LogError, Logger }',
+          'import silk.io.logger_wasi { WasiLogger }',
+          'pub effect fn main() -> i32 ! LogError {',
+          '  let mut logger = WasiLogger.make("startup")',
+          '  run Effect.logInfo("started", &()) |> Effect.provideMut<Logger>(&mut logger)',
+          '  return 0',
+          '}',
+          '',
+        ].join('\n'),
+      )
+      const loggingOutput = join(directory, 'logging.wasm')
+      const logging = yield* invoke(
+        compiler,
+        ['build', 'logging.silk', '-o', loggingOutput, '--target', target, '--stdlib', join(repo, 'stdlib')],
+      )
+      assert.equal(logging.status, 0, logging.stderr.toString())
+      const loggingWit = yield* invoke(wasmTools, ['component', 'wit', loggingOutput])
+      assert.equal(loggingWit.status, 0, loggingWit.stderr.toString())
+      assert.match(loggingWit.stdout.toString(), /import wasi:logging\/logging@0\.1\.0-draft;/)
     }
     const ran = yield* invoke(
       wasmtime,
