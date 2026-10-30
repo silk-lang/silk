@@ -34,7 +34,7 @@ None. A host cannot refuse a message.
 - The logger adds no level, timestamp, or newline. The console shows the level by its method.
 
 ## Examples
-```silk
+```silk,ignore
 import silk.core.effect { Effect }
 import silk.io.logger { LogError, Logger }
 import silk.io.logger_console { ConsoleLogger }

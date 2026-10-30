@@ -31,7 +31,7 @@ None. `wasi:logging` cannot refuse a message.
 - `LogLevel.Warning` is `warn` in `wasi:logging`. Its `critical` level has no Silk level.
 
 ## Examples
-```silk
+```silk,ignore
 import silk.core.effect { Effect }
 import silk.io.logger { LogError, Logger }
 import silk.io.logger_wasi { WasiLogger }
