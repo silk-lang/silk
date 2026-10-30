@@ -10,7 +10,7 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { assert, it } from '@effect/vitest'
+import { assert, it } from './EffectTest.mjs'
 import * as Effect from 'effect/Effect'
 import * as Schema from 'effect/Schema'
 import { createRequire } from 'node:module'

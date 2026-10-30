@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs'
-import { assert, it } from '@effect/vitest'
+import { assert, it } from './EffectTest.mjs'
 import { rewrite, tables } from './UnicodeTables.mjs'
 
 const unicodeData = [
