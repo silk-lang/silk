@@ -104,31 +104,31 @@ configuration origins. Missing physical symbols remain final-link failures.
 
 **Status:** Candidate.
 
-**Rule:** `with Intrinsic.native(...)` on a foreign declaration activates with that declaration's
-reachability. A standalone `module with Intrinsic.native(...)` clause activates when its selected module belongs to the closure,
-even if no function in it is reachable. Artifact configuration requirements always activate for the
-artifact. Multiple sealed function clauses compose; native requirements do not change foreign
-behavioral contracts. Module clauses may occur inside module-level static selection.
+**Rule:** A native requirement attached to a foreign declaration activates with that declaration's
+reachability. A module-bound native requirement activates when its selected module belongs to the
+closure, even if no function in it is reachable. Artifact configuration requirements always
+activate for the artifact. Multiple requirements on one declaration compose; native requirements do
+not change foreign behavioral contracts. Module-bound requirements may occur inside module-level
+static selection. Neither source spelling is chosen yet: the directive set has no `@native`, and the
+`module with` clause that would have held a module-bound requirement no longer exists.
 
-**Example:**
+**Example:** a candidate spelling, not yet accepted by the compiler.
 
-```silk
-module with Intrinsic.native(kind: "startup-object", name: "startup")
-
+```silk,ignore
+@foreign(memory: "read")
+@native(kind: "library", name: "values", linkage: "dynamic")
 unsafe extern "C" fn readValue() -> i32 as "read_value"
-  with Intrinsic.foreign(memory: "read")
-  with Intrinsic.native(kind: "library", name: "values", linkage: "dynamic")
 ```
 
-The startup requirement is module-bound. The values library is required only when `readValue`
-enters the artifact's reachable foreign set.
+The values library would be required only when `readValue` enters the artifact's reachable foreign
+set.
 
 **Boundary:** An unreachable foreign declaration or inactive module branch contributes no
-requirement. A source clause cannot request artifact scope, a filesystem path or a raw command.
+requirement. A source directive cannot request artifact scope, a filesystem path or a raw command.
 No symbol or standard-library actor spelling implies a dependency.
 
-**Diagnostics:** Unsupported attachment and malformed clauses diagnose at the clause and offending
-property. Reachability alone does not suppress ordinary errors in active declarations.
+**Diagnostics:** Unsupported attachment and malformed directives diagnose at the directive and offending
+argument. Reachability alone does not suppress ordinary errors in active declarations.
 
 **Evidence:** D-015; artifact-root-planning specification.
 
