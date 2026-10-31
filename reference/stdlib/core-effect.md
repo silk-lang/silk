@@ -14,8 +14,9 @@ statements are often clearer than combinators.
 
 ## Details
 Combinators are lazy. When code passes an effect to a combinator, the effect does not run. Most
-combinators take a `once Effect`, so that value runs at most one time. [`retry`](#Effect.impl.retry) takes a
-reusable effect because it can run the effect more than one time.
+combinators take a `once Effect`, so that value runs at most one time. [`retry`](#Effect.impl.retry) and
+[`repeat`](#Effect.impl.repeat) take a reusable effect because they run it more than one time, as a
+`silk.core.schedule.Schedule` says.
 
 Sequential combinators stop at the first typed failure, unless a recovery operation handles it.
 The signatures show how the channels combine. Two steps usually give the unions `! E | F` and
@@ -132,7 +133,7 @@ pub fn main() -> i32 {
 
 Import as `Effect` with `import silk.core.effect { Effect }`.
 
-Public declarations: 3.
+Public declarations: 4.
 
 <a id="Effect"></a>
 
@@ -766,21 +767,158 @@ The name is not `if` because `if` is a keyword.
 ```silk
 pub effect fn retry<'env, A, E, ?R>(
     mut self: mut Effect<'env; A ! E ? R>,
-    retries: usize
-  ) -> A ! E ? R
+    schedule: &Schedule
+  ) -> A ! E ? R | &mut MonotonicClock | &mut InsecureRandom
 ```
 
-Runs `self` and, after each typed failure, runs it again, at most `retries` more times.
+Runs `self` and, after each typed failure, waits as `schedule` says and runs it again.
 
 #### Details
 
-A success stops the attempts. If each attempt fails, the last failure propagates. Earlier
-failure values are dropped. A `retries` of 0 gives one attempt. `self` must be a reusable
-effect (`mut Effect`).
+A success stops the attempts. When `schedule` stops, the last failure propagates. Earlier
+failure values are dropped. `Schedule.recurs(2)` makes at most three attempts. `self` must be
+a reusable effect (`mut Effect`).
+
+The waits use `MonotonicClock`, so under a task scheduler they park only the current task.
+`InsecureRandom` supplies the jitter of a jittered schedule, and is required even when the
+schedule has none.
 
 #### Gotchas
 
-There is no delay between attempts. A trap stops the attempts at once and is not retried.
+A trap stops the attempts at once and is not retried.
+
+#### Examples
+
+##### Retry at once, at most twice
+```silk
+import silk.core.effect { Effect }
+import silk.core.schedule { Schedule }
+import silk.system.insecure_random { InsecureRandom }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+
+struct Busy {}
+
+struct Attempts {
+  count: i32,
+}
+
+effect fn attempt(attempts: &mut Attempts) -> i32 ! Busy {
+  attempts.count = attempts.count + 1
+  if attempts.count < 3 { fail Busy {} }
+  return attempts.count
+}
+
+effect fn busy(error: Busy) -> i32 {
+  drop error
+  return 0
+}
+
+pub fn main() -> i32 {
+  let mut attempts = Attempts { count: 0 }
+  let mut random = InsecureRandom.seeded(1)
+  let mut clock = OsMonotonicClock.make()
+  let twice = Schedule.recurs(2)
+  let value = run Effect.retry(attempt(&mut attempts), &twice)
+    |> Effect.catchAll(busy)
+    |> Effect.provideMut<InsecureRandom>(&mut random)
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+  if value != 3 {
+    return 1
+  }
+  return 0
+}
+```
+
+<a id="Effect.impl.retryWhile"></a>
+
+### Method `retryWhile`
+
+```silk
+pub effect fn retryWhile<'env, A, E, ?R>(
+    mut self: mut Effect<'env; A ! E ? R>,
+    schedule: &Schedule,
+    retryable: fn<'env>(&E) -> bool
+  ) -> A ! E ? R | &mut MonotonicClock | &mut InsecureRandom
+```
+
+Runs `self` and, after each typed failure that `retryable` accepts, waits as `schedule` says
+and runs it again.
+
+#### Details
+
+A success stops the attempts. A failure that `retryable` rejects propagates at once, before
+`schedule` is asked. When `schedule` stops, the last failure propagates. Earlier failure
+values are dropped. `self` must be a reusable effect (`mut Effect`).
+
+The waits use `MonotonicClock`, so under a task scheduler they park only the current task.
+`InsecureRandom` supplies the jitter of a jittered schedule, and is required even when the
+schedule has none.
+
+#### Gotchas
+
+A trap stops the attempts at once and is not retried.
+
+<a id="Effect.impl.repeat"></a>
+
+### Method `repeat`
+
+```silk
+pub effect fn repeat<'env, A, E, ?R>(
+    mut self: mut Effect<'env; A ! E ? R>,
+    schedule: &Schedule
+  ) -> A ! E ? R | &mut MonotonicClock | &mut InsecureRandom
+```
+
+Runs `self`, then runs it again after each delay of `schedule`, and returns the last success.
+
+#### When to use
+
+Use it for work on a timer, such as a poll, a heartbeat, or a note on each beat. Use
+`Schedule.fixed` for a steady beat.
+
+#### Details
+
+The first run happens at once. `Schedule.recurs(3)` runs `self` four times. A typed failure
+stops the repeats and propagates. `self` must be a reusable effect (`mut Effect`).
+
+The waits use `MonotonicClock`, so under a task scheduler they park only the current task.
+`InsecureRandom` supplies the jitter of a jittered schedule, and is required even when the
+schedule has none.
+
+#### Examples
+
+##### Count four runs
+```silk
+import silk.core.effect { Effect }
+import silk.core.schedule { Schedule }
+import silk.system.insecure_random { InsecureRandom }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+
+struct Counter {
+  count: i32,
+}
+
+effect fn tick(counter: &mut Counter) -> i32 {
+  counter.count = counter.count + 1
+  return counter.count
+}
+
+pub fn main() -> i32 {
+  let mut counter = Counter { count: 0 }
+  let mut random = InsecureRandom.seeded(1)
+  let mut clock = OsMonotonicClock.make()
+  let thrice = Schedule.recurs(3)
+  let last = run Effect.repeat(tick(&mut counter), &thrice)
+    |> Effect.provideMut<InsecureRandom>(&mut random)
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+  if last != 4 {
+    return 1
+  }
+  return 0
+}
+```
 
 <a id="Effect.impl.bindRequirement"></a>
 
@@ -1030,6 +1168,64 @@ Returns an effect that succeeds with `value` when it runs.
 The call evaluates `value` immediately and moves it into the effect. The effect has no
 failures and needs no providers. If `value` is affine, the effect can run one time.
 
+<a id="Effect.impl.timeout"></a>
+
+### Method `timeout`
+
+```silk
+pub effect fn timeout<'env, A, E, ?R>(
+    self: once Effect<'env; A ! E ? R>,
+    howLong: u64
+  ) -> A ! E | TimeoutError ? R | &mut Scheduler
+```
+
+Runs `self`, and stops it with [`TimeoutError`](#TimeoutError) if it has not finished `howLong` nanoseconds
+from now.
+
+#### Details
+
+The Scheduler reads its clock when the task next yields to it, so a stale clock reading in
+the task does not shorten the wait. See [`timeoutAt`](#Effect.impl.timeoutAt) for how the effect stops.
+
+#### Gotchas
+
+It needs a `Scheduler` provider, such as `LocalScheduler`. The effect stops only at a park,
+and work before its first park is not counted. `ensuring` finalizers inside it do not run
+when it stops.
+
+<a id="Effect.impl.timeoutAt"></a>
+
+### Method `timeoutAt`
+
+```silk
+pub effect fn timeoutAt<'env, A, E, ?R>(
+    self: once Effect<'env; A ! E ? R>,
+    deadline: Instant
+  ) -> A ! E | TimeoutError ? R | &mut Scheduler
+```
+
+Runs `self`, and stops it with [`TimeoutError`](#TimeoutError) if it has not finished by `deadline`.
+
+#### When to use
+
+Use `timeoutAt` to bound several steps by one deadline. Use [`timeout`](#Effect.impl.timeout) for a duration.
+
+#### Details
+
+`self` runs in the current task, with no new Fiber. If the deadline passes while the task is
+parked inside `self`, such as in a clock wait or a Fiber join, the Scheduler interrupts the
+task: each frame of `self` is abandoned from its park, innermost first. That runs `Drop`
+hooks and non-parking finalizers (`ensuringNonParking`, `useReleaseNonParking`). Then this
+call fails with `TimeoutError`. A success or typed failure of `self` before the deadline is
+returned unchanged. Nested timeouts work; the one whose deadline passes first stops.
+
+#### Gotchas
+
+It needs a `Scheduler` provider, such as `LocalScheduler`. The effect stops only at a park:
+code between two parks always runs to its end, and an effect that never parks never stops.
+`ensuring` finalizers inside it do not run when it stops. Children forked inside it keep
+running; interrupt them, or let their parent finish.
+
 <a id="Effect.impl.sleep"></a>
 
 ### Associated function `sleep`
@@ -1049,6 +1245,34 @@ advance virtual time.
 
 A duration of 0 returns without a wait. If the deadline is more than the clock can represent,
 the program traps.
+
+<a id="TimeoutError"></a>
+
+## `TimeoutError`
+
+```silk
+pub struct TimeoutError
+```
+
+Raised by [`Effect.timeout`](#Effect.impl.timeout) and [`Effect.timeoutAt`](#Effect.impl.timeoutAt) when the deadline passes first.
+
+<a id="TimeoutError.impl.Debug"></a>
+
+## Implementation `Debug for TimeoutError`
+
+```silk
+impl Debug for TimeoutError
+```
+
+<a id="TimeoutError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes `TimeoutError`.
 
 <a id="Pair"></a>
 

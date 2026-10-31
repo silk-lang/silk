@@ -908,6 +908,10 @@ pub union RunPlan {
   /// Runs the Effect an exclusive reference lends: `inner` runs the lender's storage through the
   /// reference without consuming it (EFFECT-OWN-002).
   Lent {pub inner: usize},
+  /// Runs part 1, a body that succeeds with `()`, as an interruptible boundary for the token in
+  /// part 0. The run succeeds with `true` when the body completes, and with `false` when an
+  /// interrupt request for the token abandoned the frames above it at a suspension point.
+  Interrupt {pub inner: usize},
 }
 
 /// One alternative of a finite Effect join and the step that runs it.
@@ -1055,6 +1059,8 @@ struct Builder {
   held: List<HeldFailure>,
   // The composed Effects whose pending cleanup a cancel exit inside them runs, innermost last.
   cancelScopes: List<CancelScope>,
+  // The interruptible boundaries a cancel exit inside them may resume, innermost last.
+  interrupts: List<InterruptBoundary>,
   // Set while a cancel landing is lowered: its calls run to completion, so they record no exit.
   landing: bool,
   // The published value of each constant this body reads.
@@ -1073,6 +1079,18 @@ struct HeldFailure {
   slot: usize,
   cleanup: Option<Shared<Type>>,
   depth: usize,
+}
+
+// An interruptible boundary open while its body is lowered. A cancel exit recorded inside it first
+// compares the package's interrupt word with `token`: on a match it clears the word, runs the
+// cleanup of the cancel scopes and held failures opened inside the boundary, and continues at
+// `continuation`, allocated by the first such exit. The marks count the scopes and held failures
+// open when the boundary opened; a plan's expansion acquires no owner or pending temporary.
+struct InterruptBoundary {
+  token: usize,
+  scopes: usize,
+  held: usize,
+  continuation: usize,
 }
 
 // A composed Effect whose cleanup is still pending while its protected part runs: a finalizer, a
@@ -3537,6 +3555,7 @@ effect fn recordCancel(builder: &mut Builder, origin: Origin) -> ()
   let point = builder.current
   let entry = run block(&mut builder.*, origin)
   resume(&mut builder.*, entry)
+  if List<InterruptBoundary>.length(&builder.interrupts) > usize.ZERO { run interruptDispatch(&mut builder.*, origin) }
   // Cleanup runs innermost first, before the point's own drops, as in an exit that completes:
   // each enclosing composed Effect's pending cleanup, and each failure held across this point.
   // A held failure is never delivered: once the scopes opened while it waits have run their
@@ -3560,6 +3579,89 @@ effect fn recordCancel(builder: &mut Builder, origin: Origin) -> ()
   run leaveFunction(&mut builder.*, ExitKind.Abandons, origin)
   resume(&mut builder.*, point)
   return run List<Cancel>.append(&mut builder.*.function.cancels, Cancel {point: point, entry: entry})
+}
+
+// Starts a cancel exit inside interruptible boundaries: a package that is not dropped and whose
+// interrupt word names an open boundary's token resumes that boundary. Lowering continues in the
+// block that cancels the frame, which a dropped package and every other word reach.
+effect fn interruptDispatch(builder: &mut Builder, origin: Origin) -> ()
+! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let word = run storagePrimitive(b"usize")
+  let wordAddress = run SealedCore.address(&word)
+  let bytes = run SealedCore.bytes()
+  // The header's fields up to the interrupt word are each one word wide, so field `k` is at word `k`.
+  let running = run storageValue(&mut builder.*, &bytes, Rvalue.RunningPackage, origin)
+  let integer = run storageValue(&mut builder.*, &word, Rvalue.AddressIntegerConversion {operand: Operand.Copy {place: place(running)},
+    destinationType: Shared<Type>.clone(&word)}, origin)
+  let header = run storageValue(&mut builder.*, &wordAddress, Rvalue.AddressIntegerConversion {
+    operand: Operand.Copy {place: place(integer)}, destinationType: Shared<Type>.clone(&wordAddress)}, origin)
+  let lifecycleAddress = run storageValue(&mut builder.*, &wordAddress, Rvalue.PointerOffset {pointer: Operand.Copy {place: place(header)},
+    index: run wordOperand(SealedCore.ordinal(CoreField.HeaderLifecycle)), element: Shared<Type>.clone(&word)}, origin)
+  let lifecycle = run wordAtomic(&mut builder.*, lifecycleAddress, IntrinsicPrimitive.AtomicLoad, List<Operand>.make(),
+    MemoryOrder.Acquire, &word, origin)
+  let dropped = run storageCondition(&mut builder.*, InfixOperator.Equals, Operand.Copy {place: place(lifecycle)},
+    run wordOperand(SealedCore.lifecycleWord(Lifecycle.Destroyed)), origin)
+  let cancelling = run block(&mut builder.*, origin)
+  let requested = run block(&mut builder.*, origin)
+  terminate(&mut builder.*, Terminator.Branch {condition: move dropped, thenBlock: cancelling, elseBlock: requested, origin: origin})
+  resume(&mut builder.*, requested)
+  let address = run storageValue(&mut builder.*, &wordAddress, Rvalue.PointerOffset {pointer: Operand.Copy {place: place(header)},
+    index: run wordOperand(SealedCore.ordinal(CoreField.HeaderInterrupt)), element: Shared<Type>.clone(&word)}, origin)
+  let request = run wordAtomic(&mut builder.*, address, IntrinsicPrimitive.AtomicLoad, List<Operand>.make(), MemoryOrder.Acquire,
+    &word, origin)
+  // The innermost boundary with the requested token resumes; an outer one would abandon it.
+  let mut at = List<InterruptBoundary>.length(&builder.interrupts)
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    let token = List<InterruptBoundary>.asSlice(&builder.interrupts)[at].token
+    let matched = run storageCondition(&mut builder.*, InfixOperator.Equals, Operand.Copy {place: place(request)},
+      Operand.Copy {place: place(token)}, origin)
+    let resuming = run block(&mut builder.*, origin)
+    let next = run block(&mut builder.*, origin)
+    terminate(&mut builder.*, Terminator.Branch {condition: move matched, thenBlock: resuming, elseBlock: next, origin: origin})
+    resume(&mut builder.*, resuming)
+    let unit = run Types.intern(Type.Unit)
+    let mut cleared = List<Operand>.make()
+    run List<Operand>.append(&mut cleared, run wordOperand(usize.ZERO))
+    drop run wordAtomic(&mut builder.*, address, IntrinsicPrimitive.AtomicStore, move cleared, MemoryOrder.Release, &unit, origin)
+    run resumeBoundary(&mut builder.*, at, origin)
+    resume(&mut builder.*, next)
+  }
+  terminate(&mut builder.*, Terminator.Goto {target: cancelling, origin: origin})
+  resume(&mut builder.*, cancelling)
+  return ()
+}
+
+// Runs the cleanup a cancel exit would for the cancel scopes and held failures opened inside
+// boundary `at`, innermost first, then continues at the boundary's continuation.
+effect fn resumeBoundary(builder: &mut Builder, at: usize, origin: Origin) -> ()
+! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let floorScopes = List<InterruptBoundary>.asSlice(&builder.interrupts)[at].scopes
+  let floorHeld = List<InterruptBoundary>.asSlice(&builder.interrupts)[at].held
+  let mut held = List<HeldFailure>.length(&builder.held)
+  let mut scope = List<CancelScope>.length(&builder.cancelScopes)
+  while held > floorHeld || scope > floorScopes {
+    if held > floorHeld && List<HeldFailure>.asSlice(&builder.held)[held - usize.ONE].depth >= scope {
+      held = held - usize.ONE
+      let listed = List<HeldFailure>.asSlice(&builder.held)
+      let slot = listed[held].slot
+      let dropped = copyOptionalType(&listed[held].cleanup)
+      run release(&mut builder.*, slot, origin)
+      let value = place(slot)
+      run dropUnused(&mut builder.*, &value, &dropped, origin)
+    } else {
+      scope = scope - usize.ONE
+      run enterLanding(&mut builder.*, scope, origin)
+    }
+  }
+  if List<InterruptBoundary>.asSlice(&builder.interrupts)[at].continuation == usize.MAX {
+    let continuation = run block(&mut builder.*, origin)
+    let mut boundaries = List<InterruptBoundary>.asMutSlice(&mut builder.*.interrupts)
+    boundaries[at].continuation = continuation
+  }
+  let target = List<InterruptBoundary>.asSlice(&builder.interrupts)[at].continuation
+  terminate(&mut builder.*, Terminator.Goto {target: target, origin: origin})
+  return ()
 }
 
 // Continues a cancel exit through scope `at`'s landing, resuming where its dispatch returns.
@@ -7090,6 +7192,107 @@ effect fn callAllocator(builder: &mut Builder, plan: &StoragePlan, selected: usi
   return output
 }
 
+// `rawBufferResize<T>(buffer, count)`: system storage (reclaim 0 with a nonzero context, the
+// address `malloc` returned) grows with `realloc` to `count` slots plus the alignment padding
+// `systemAllocationAcquire` adds, and the base is aligned again inside the result. `realloc` keeps
+// the old bytes from the start of the block, so the slots move along when the base's offset into
+// the block changes. Every refusal leaves the buffer as it was and yields false.
+effect fn lowerBufferResize(builder: &mut Builder, plan: &StoragePlan, buffer: &Place, requested: Operand,
+  ty: &Shared<Type>, origin: Origin) -> Operand ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let word = run storagePrimitive(b"usize")
+  let address = run SealedCore.bytes()
+  let count = run storageValue(&mut builder.*, &word, Rvalue.Use {value: move requested}, origin)
+  let output = run storageValue(&mut builder.*, ty, Rvalue.Use {value: Operand.Boolean {value: false}}, origin)
+  let done = run block(&mut builder.*, origin)
+  if plan.size == usize.ZERO {
+    terminate(&mut builder.*, Terminator.Goto {target: done, origin: origin})
+    resume(&mut builder.*, done)
+    return Operand.Copy {place: place(output)}
+  }
+  let reclaim = run storageValue(&mut builder.*, &word, Rvalue.Use {value: Operand.Copy {place: run storagePlace(buffer, true,
+    &[SealedCore.ordinal(CoreField.BufferReclaim)])}}, origin)
+  let context = run storageValue(&mut builder.*, &word, Rvalue.Use {value: Operand.Copy {place: run storagePlace(buffer, true,
+    &[SealedCore.ordinal(CoreField.BufferContext)])}}, origin)
+  let held = run storageValue(&mut builder.*, &word, Rvalue.Use {value: Operand.Copy {place: run storagePlace(buffer, true,
+    &[SealedCore.ordinal(CoreField.BufferCount)])}}, origin)
+  let padding = plan.alignment - usize.ONE
+  // The largest slot count whose bytes and padding still fit in a word.
+  let ceiling = run storageValue(&mut builder.*, &word, Rvalue.Unary {operation: PrefixOperator.BitwiseNot,
+    value: run wordOperand(padding)}, origin)
+  let limit = run storageValue(&mut builder.*, &word, Rvalue.Binary {operation: InfixOperator.Divide,
+    left: Operand.Copy {place: place(ceiling)}, right: run wordOperand(plan.size)}, origin)
+  let system = run storageCondition(&mut builder.*, InfixOperator.Equals, Operand.Copy {place: place(reclaim)}, run wordOperand(usize.ZERO), origin)
+  let owned = run storageCondition(&mut builder.*, InfixOperator.NotEquals, Operand.Copy {place: place(context)}, run wordOperand(usize.ZERO), origin)
+  let grows = run storageCondition(&mut builder.*, InfixOperator.GreaterOrEqual, Operand.Copy {place: place(count)},
+    Operand.Copy {place: place(held)}, origin)
+  let fits = run storageCondition(&mut builder.*, InfixOperator.LessOrEqual, Operand.Copy {place: place(count)},
+    Operand.Copy {place: place(limit)}, origin)
+  let nonzero = run storageCondition(&mut builder.*, InfixOperator.NotEquals, Operand.Copy {place: place(count)}, run wordOperand(usize.ZERO), origin)
+  let first = run storageCondition(&mut builder.*, InfixOperator.BitAnd, move system, move owned, origin)
+  let second = run storageCondition(&mut builder.*, InfixOperator.BitAnd, move grows, move fits, origin)
+  let both = run storageCondition(&mut builder.*, InfixOperator.BitAnd, move first, move second, origin)
+  let eligible = run storageCondition(&mut builder.*, InfixOperator.BitAnd, move both, move nonzero, origin)
+  let request = run block(&mut builder.*, origin)
+  terminate(&mut builder.*, Terminator.Branch {condition: move eligible, thenBlock: request, elseBlock: done, origin: origin})
+  resume(&mut builder.*, request)
+  let bytes = run storageValue(&mut builder.*, &word, Rvalue.Binary {operation: InfixOperator.Multiply,
+    left: Operand.Copy {place: place(count)}, right: run wordOperand(plan.size)}, origin)
+  let physical = run storageValue(&mut builder.*, &word, Rvalue.Binary {operation: InfixOperator.Add,
+    left: Operand.Copy {place: place(bytes)}, right: run wordOperand(padding)}, origin)
+  let old = run storageValue(&mut builder.*, &address, Rvalue.AddressIntegerConversion {operand: Operand.Copy {place: place(context)},
+    destinationType: Shared<Type>.clone(&address)}, origin)
+  let mut arguments = List<Operand>.make()
+  run List<Operand>.append(&mut arguments, Operand.Copy {place: place(old)})
+  run List<Operand>.append(&mut arguments, Operand.Copy {place: place(physical)})
+  let raw = run callAllocator(&mut builder.*, plan, 4, move arguments, &address, origin)
+  let missing = run storageCondition(&mut builder.*, InfixOperator.Equals, Operand.Copy {place: place(raw)},
+    Operand.Null {ty: Shared<Type>.clone(&address)}, origin)
+  let acquired = run block(&mut builder.*, origin)
+  terminate(&mut builder.*, Terminator.Branch {condition: move missing, thenBlock: done, elseBlock: acquired, origin: origin})
+  resume(&mut builder.*, acquired)
+  let fresh = run storageValue(&mut builder.*, &word, Rvalue.AddressIntegerConversion {operand: Operand.Copy {place: place(raw)},
+    destinationType: Shared<Type>.clone(&word)}, origin)
+  let base = run storageValue(&mut builder.*, &word, Rvalue.Use {value: Operand.Copy {place: run storagePlace(buffer, true,
+    &[SealedCore.ordinal(CoreField.BufferBase)])}}, origin)
+  let offset = run storageValue(&mut builder.*, &word, Rvalue.Binary {operation: InfixOperator.Subtract,
+    left: Operand.Copy {place: place(base)}, right: Operand.Copy {place: place(context)}}, origin)
+  let advanced = run storageValue(&mut builder.*, &word, Rvalue.Binary {operation: InfixOperator.Add,
+    left: Operand.Copy {place: place(fresh)}, right: run wordOperand(padding)}, origin)
+  let aligned = run storageValue(&mut builder.*, &word, Rvalue.Binary {operation: InfixOperator.BitAnd,
+    left: Operand.Copy {place: place(advanced)}, right: Operand.Copy {place: place(ceiling)}}, origin)
+  let moved = run storageValue(&mut builder.*, &word, Rvalue.Binary {operation: InfixOperator.Add,
+    left: Operand.Copy {place: place(fresh)}, right: Operand.Copy {place: place(offset)}}, origin)
+  let shifted = run storageCondition(&mut builder.*, InfixOperator.NotEquals, Operand.Copy {place: place(moved)},
+    Operand.Copy {place: place(aligned)}, origin)
+  let shifting = run block(&mut builder.*, origin)
+  let settled = run block(&mut builder.*, origin)
+  terminate(&mut builder.*, Terminator.Branch {condition: move shifted, thenBlock: shifting, elseBlock: settled, origin: origin})
+  resume(&mut builder.*, shifting)
+  let destination = run storageValue(&mut builder.*, &address, Rvalue.AddressIntegerConversion {operand: Operand.Copy {place: place(aligned)},
+    destinationType: Shared<Type>.clone(&address)}, origin)
+  let source = run storageValue(&mut builder.*, &address, Rvalue.AddressIntegerConversion {operand: Operand.Copy {place: place(moved)},
+    destinationType: Shared<Type>.clone(&address)}, origin)
+  let kept = run storageValue(&mut builder.*, &word, Rvalue.Binary {operation: InfixOperator.Multiply,
+    left: Operand.Copy {place: place(held)}, right: run wordOperand(plan.size)}, origin)
+  let mut shifts = List<Operand>.make()
+  run List<Operand>.append(&mut shifts, Operand.Copy {place: place(destination)})
+  run List<Operand>.append(&mut shifts, Operand.Copy {place: place(source)})
+  run List<Operand>.append(&mut shifts, Operand.Copy {place: place(kept)})
+  drop run callAllocator(&mut builder.*, plan, 2, move shifts, &address, origin)
+  terminate(&mut builder.*, Terminator.Goto {target: settled, origin: origin})
+  resume(&mut builder.*, settled)
+  run assign(&mut builder.*, run storagePlace(buffer, true, &[SealedCore.ordinal(CoreField.BufferBase)]),
+    Rvalue.Use {value: Operand.Copy {place: place(aligned)}}, origin)
+  run assign(&mut builder.*, run storagePlace(buffer, true, &[SealedCore.ordinal(CoreField.BufferCount)]),
+    Rvalue.Use {value: Operand.Copy {place: place(count)}}, origin)
+  run assign(&mut builder.*, run storagePlace(buffer, true, &[SealedCore.ordinal(CoreField.BufferContext)]),
+    Rvalue.Use {value: Operand.Copy {place: place(fresh)}}, origin)
+  run assign(&mut builder.*, place(output), Rvalue.Use {value: Operand.Boolean {value: true}}, origin)
+  terminate(&mut builder.*, Terminator.Goto {target: done, origin: origin})
+  resume(&mut builder.*, done)
+  return Operand.Copy {place: place(output)}
+}
+
 // The aligned base address of the allocation a raw buffer referenced by `buffer` owns, as `*mut T`.
 effect fn bufferBase(builder: &mut Builder, buffer: &Place, element: &Shared<Type>, origin: Origin) -> usize
 ! OutOfMemoryError ? &mut Allocator | &mut Types {
@@ -7532,6 +7735,7 @@ effect fn helperBuilder(creator: &Builder, key: InstanceKey, result: &Shared<Typ
     cancelEveryCall: cancellable,
     held: List<HeldFailure>.make(),
     cancelScopes: List<CancelScope>.make(),
+    interrupts: List<InterruptBoundary>.make(),
     landing: false,
     constants: run copyConstants(List<ConstantValue>.asSlice(&creator.constants)),
     written: List<Shared<Type>>.make(), closed: List<Shared<Type>>.make(), writtenLookup: InternIndex.make(),
@@ -7887,9 +8091,9 @@ effect fn controlWord(builder: &mut Builder, access: &PackageAccess, index: Oper
   let word = run storagePrimitive(b"usize")
   let selected = run storageValue(&mut builder.*, &word, Rvalue.Use {value: move index}, origin)
   let valid = run storageCondition(&mut builder.*, InfixOperator.LessOrEqual, Operand.Copy {place: place(selected)},
-    run wordOperand(usize.ONE), origin)
+    run wordOperand(2), origin)
   run trapUnless(&mut builder.*, move valid, TrapReason.InvalidExecutionControlWord, origin)
-  // The two words are adjacent, so the selected one is the first advanced by the index.
+  // The three words are adjacent, so the selected one is the first advanced by the index.
   let wordAddress = run SealedCore.address(&word)
   let first = run storageValue(&mut builder.*, &wordAddress, Rvalue.AddressOf {access: Access.Mutable,
     place: run headerField(access, CoreField.HeaderControl)}, origin)
@@ -7899,8 +8103,9 @@ effect fn controlWord(builder: &mut Builder, access: &PackageAccess, index: Oper
 
 // The reference operations over one package: a new reference from a handle, a control word load,
 // store or compare-exchange, the fixed readiness endpoint, and liveness. Notification first claims
-// the notifying marker; a drop that arrives while the endpoint runs is performed once it returns,
-// and a notification that finds the package dropping or dead runs nothing (EXEC-009).
+// the notifying marker, waiting while another thread's notification holds it; a drop that arrives
+// while the endpoint runs is performed once it returns, and a notification that finds the package
+// dropping or dead runs nothing (EXEC-009).
 effect fn lowerReference(builder: &mut Builder, operation: StorageOperation, operands: List<Operand>, ty: &Shared<Type>,
   origin: Origin) -> Operand ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
   let owner = InstanceKey.identity(&builder.function.key)
@@ -7952,12 +8157,22 @@ effect fn lowerReference(builder: &mut Builder, operation: StorageOperation, ope
       // The marker is 0 when idle, 1 while notifying, 2 when a drop waits for the endpoint, and 3
       // once the package is dropping.
       let marker = run headerAddress(&mut builder.*, &access, CoreField.HeaderNotifying, origin)
+      let claiming = run block(&mut builder.*, origin)
+      let holding = run block(&mut builder.*, origin)
+      let busy = run block(&mut builder.*, origin)
+      let after = run block(&mut builder.*, origin)
+      terminate(&mut builder.*, Terminator.Goto {target: claiming, origin: origin})
+      resume(&mut builder.*, claiming)
       let observed = run wordExchange(&mut builder.*, marker, run wordOperand(usize.ZERO), run wordOperand(usize.ONE), origin)
       let claimed = run storageCondition(&mut builder.*, InfixOperator.Equals, Operand.Copy {place: place(observed)},
         run wordOperand(usize.ZERO), origin)
-      let holding = run block(&mut builder.*, origin)
-      let after = run block(&mut builder.*, origin)
-      terminate(&mut builder.*, Terminator.Branch {condition: move claimed, thenBlock: holding, elseBlock: after, origin: origin})
+      terminate(&mut builder.*, Terminator.Branch {condition: move claimed, thenBlock: holding, elseBlock: busy, origin: origin})
+      // Another thread's notification of an earlier generation still runs the endpoint. This one is
+      // the only winner of its own generation, so it waits for the marker instead of being lost.
+      resume(&mut builder.*, busy)
+      let held = run storageCondition(&mut builder.*, InfixOperator.Equals, Operand.Copy {place: place(observed)},
+        run wordOperand(usize.ONE), origin)
+      terminate(&mut builder.*, Terminator.Branch {condition: move held, thenBlock: claiming, elseBlock: after, origin: origin})
       resume(&mut builder.*, holding)
       let live = run livePackage(&mut builder.*, &access, origin)
       let notifying = run block(&mut builder.*, origin)
@@ -8309,6 +8524,9 @@ effect fn lowerStorage(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Mo
       run List<Operand>.append(&mut arguments, Operand.Copy {place: place(bytes)})
       drop run callAllocator(&mut builder.*, &plan, 2, move arguments, &address, origin)
       return Operand.Unit
+    }
+    StorageOperation.RawBufferResize => {
+      return run lowerBufferResize(&mut builder.*, &plan, &first, List<Operand>.remove(&mut operands, usize.ZERO), ty, origin)
     }
     StorageOperation.RawBufferFill => {
       let offset = run storageValue(&mut builder.*, &word, Rvalue.Use {value: List<Operand>.remove(&mut operands, usize.ZERO)}, origin)
@@ -9050,6 +9268,33 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
       run List<Projection>.append(&mut lender.projections, Projection.Deref)
       run executePlan(&mut builder.*, steps, inner, &lender, output, sink, &mut bound.*, origin)
     }
+    RunPlan.Interrupt {inner} => {
+      // The body's frames above this one are abandoned by an interrupt for the token, which
+      // resumes here with `false` once the cleanup opened inside the boundary has run.
+      let tokenType = run usizeType()
+      let token = run temporary(&mut builder.*, &tokenType, origin)
+      run assign(&mut builder.*, place(token), Rvalue.Use {value: Operand.Copy {place: run projectedPart(environment, usize.ZERO)}},
+        origin)
+      let bodyPart = run projectedPart(environment, usize.ONE)
+      run List<InterruptBoundary>.append(&mut builder.*.interrupts, InterruptBoundary {token: token,
+        scopes: List<CancelScope>.length(&builder.cancelScopes), held: List<HeldFailure>.length(&builder.held),
+        continuation: usize.MAX})
+      let unit = run Types.intern(Type.Unit)
+      let done = run temporary(&mut builder.*, &unit, origin)
+      run executePlan(&mut builder.*, steps, inner, &bodyPart, done, sink, &mut bound.*, origin)
+      let boundary = match move List<InterruptBoundary>.pop(&mut builder.*.interrupts) {
+        Option<InterruptBoundary>.Some {value} => move value
+        Option<InterruptBoundary>.None => { return run unsupported(&owner, origin, GapCode.EffectForm) }
+      }
+      run assign(&mut builder.*, place(output), Rvalue.Use {value: Operand.Boolean {value: true}}, origin)
+      if boundary.continuation == usize.MAX { return () }
+      let joined = run block(&mut builder.*, origin)
+      terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
+      resume(&mut builder.*, boundary.continuation)
+      run assign(&mut builder.*, place(output), Rvalue.Use {value: Operand.Boolean {value: false}}, origin)
+      terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
+      resume(&mut builder.*, joined)
+    }
     RunPlan.Suspend {inner} => {
       run markSuspension(&mut builder.*, origin)
       let deferredPart = run projectedPart(environment, usize.ZERO)
@@ -9334,6 +9579,7 @@ effect fn planCallees(steps: &[RunPlan], step: usize, callees: &mut List<Instanc
       run appendDrop(&mut glues.*, &callbackDrop)
     }
     RunPlan.Suspend {inner} => { run planCallees(steps, inner, &mut callees.*, &mut glues.*) }
+    RunPlan.Interrupt {inner} => { run planCallees(steps, inner, &mut callees.*, &mut glues.*) }
     RunPlan.Lent {inner} => { run planCallees(steps, inner, &mut callees.*, &mut glues.*) }
   }
   return ()
@@ -10947,6 +11193,7 @@ impl MirFunction {
       cancelEveryCall: false,
       held: List<HeldFailure>.make(),
       cancelScopes: List<CancelScope>.make(),
+      interrupts: List<InterruptBoundary>.make(),
       landing: false,
       constants: move constants,
       written: List<Shared<Type>>.make(),

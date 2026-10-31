@@ -266,34 +266,64 @@ store.
 
 **Current compiler:** Aligned.
 
-## THREAD-008 — `silk.concurrency.thread_pool` runs tasks on a work-stealing pool of native threads
+## THREAD-008 — `silk.concurrency.thread_pool` runs fibers on a work-stealing pool of native threads
 
 **Status:** Confirmed
 
 `ThreadPool.make(workers)` starts the worker threads, and `pool()` returns a `Pool` handle.
-`Pool.spawn(task)` starts a closed, `Transferable`, `'static` lazy effect as a pool task and
-returns a `TaskHandle<A>`. `TaskHandle.join` parks the joining task until the result is ready.
-`Pool.block(task)` runs a task from an ordinary thread and sleeps that thread until it finishes.
-Dropping the `ThreadPool` stops and joins every worker and drops the tasks still unfinished.
+`Pool.fork(task)` starts a `Transferable`, `'static` lazy effect `A ! E` as a pool fiber and
+returns a `PoolFiber<A, E>`. Its outcome is the `Outcome<A, E>` of `silk.concurrency.fiber`:
+`Success`, `Failure` with the typed error, or `Cancelled`. `PoolFiber.await` parks the calling
+fiber and returns the outcome as data; `PoolFiber.join` returns the success value and raises the
+failure unchanged, or `Cancelled`. `PoolFiber.interrupt` cancels the fiber unless it finished
+first, waits for it, and returns its final outcome. `PoolFiber.awaitEither` waits for the first
+of two fibers and returns its outcome with the other, still running, as `PoolFirstLeft` or
+`PoolFirstRight`; `PoolFiber.race` returns the first result and interrupts the other. Both
+allocate one shared wait when neither fiber has ended. `Pool.yieldNow` puts the calling fiber at the
+end of the ready list. `Pool.timeout(body, howLong)` runs `body` in the calling fiber and fails with
+`TimeoutError` when it is still parked inside `body` `howLong` nanoseconds later. `Pool.block(task)` runs a fiber from an ordinary thread and sleeps that
+thread until it ends. Dropping the `ThreadPool` stops and joins every worker and cancels the
+fibers still unfinished.
 
 ```silk,ignore
 let threads = run ThreadPool.make(4) |> Effect.provideMut<Allocator>(&mut allocator)
 let pool = threads.pool()
-let total = run pool.block(Effect.result(split(pool.clone())))
+let total = run pool.block(split(pool.clone()))
 ```
 
-Each task is packaged with `Execution.makeTransferable` (EXEC-010), so it can park on one worker
-and resume on another. Its readiness endpoint links the task's preallocated slot onto one shared
-ready list and wakes a sleeping worker; it never allocates. A worker moves a batch of ready tasks
+Each fiber is packaged with `Execution.makeTransferable` (EXEC-010), so it can park on one worker
+and resume on another. Its readiness endpoint links the fiber's preallocated slot onto one shared
+ready list and wakes a sleeping worker; it never allocates. A worker moves a batch of ready fibers
 into its own `WorkDeque` (THREAD-007), and an idle worker steals from the others' deques before
-it sleeps on a `Parker`. A `Pool` is `Transferable` and `Concurrent`, so tasks capture it to spawn
-more tasks.
+it sleeps on a `Parker`. A `Pool` is `Transferable` and `Concurrent`, so fibers capture it to fork
+more fibers.
 
-**Boundary:** The targets of native threads and `Atomic.wait`. A task's effect has no
-requirements or errors, so a task returns its own failures as a value, for example with
-`Effect.result`. Waiting inside a task for anything other than a `TaskHandle` must park with
-`Execution.parkTransferable`; blocking the native thread holds up a whole worker. A task spawned
-after its pool was dropped is dropped unstarted, and its handle never finishes.
+Cancellation is a flag in the fiber's slot, not in the package control words. The worker that
+next takes a flagged fiber drops its execution instead of driving it, which runs the cancel exits
+(EXEC-005); a guard the body owns records `Cancelled` and wakes the waiter. A fiber that is parked
+and not ready is put on the ready list for that; a running fiber is flagged and cancelled when it
+next parks. Each slot carries a ticket that changes when its fiber goes away, so a late wake or
+interrupt for a finished or cancelled fiber does nothing.
+
+Each fiber body runs with its own `PoolTask` provider, so a `Pool.fork` body may require
+`&mut PoolTask`; a body with no requirements is accepted as well. `PoolTask.armDeadlineAfter`
+adds a deadline on the OS monotonic clock to the pool's book under the pool lock, with a token
+that grows across the pool, and `Pool.timeout` opens `Intrinsic.interruptibleEffect` for it, as
+`Effect.timeoutAt` does. Workers fire due deadlines when they take work or go to sleep,
+and an idle worker parks only until the earliest deadline. A fired deadline goes to its fiber only
+when the slot's ticket still matches, and removes the deadlines that fiber armed later, whose
+boundaries the interrupt abandons. A parked fiber gets the token with `Execution.interruptHeld`,
+which makes a dormant one eligible for the pool to queue and latches a park that is still
+registering; a fiber a worker is driving keeps the token in its slot until it parks. A fiber that
+finishes or is cancelled drops its deadlines.
+
+**Boundary:** The targets of native threads and `Atomic.wait`. A fiber's effect requires at most
+`&mut PoolTask`. Waiting inside a fiber for anything other than a `PoolFiber` must park with
+`Execution.parkTransferable`; blocking the native thread holds up a whole worker. A fiber that
+never parks cannot be cancelled before it ends. A fiber forked after its pool was dropped is
+cancelled before it starts. Pool fibers do not provide the `Scheduler` service, so they use
+`Pool.timeout`, not `Effect.timeout`; there is no deadline form, since an `Instant` names no clock
+the pool can wait on.
 
 **Evidence:** [thread pool](../stdlib/silk/concurrency/thread_pool.silk), native corpus (`thread-pool-tasks`).
 

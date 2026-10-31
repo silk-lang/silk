@@ -1423,8 +1423,12 @@ effect fn internDeclaration(resolver: &mut Resolver, key: Key) -> Key
       }
     }
   }
-  let module = resolvedModule(&resolver.*, key.module)
-  drop run observedSource(&mut resolver.*, &module, SourceSelector.Declaration {handle: handle, facet: SourceFacet.Alive})
+  // A store that is never revised loaded this source when it interned the handle, so the read
+  // only matters to a unit that records it.
+  if cached == usize.MAX || recording(&resolver.*) || recordingUnit(&resolver.*) != usize.MAX {
+    let module = resolvedModule(&resolver.*, key.module)
+    drop run observedSource(&mut resolver.*, &module, SourceSelector.Declaration {handle: handle, facet: SourceFacet.Alive})
+  }
   return Key {
     family: key.family,
     module: key.module,
@@ -2685,6 +2689,10 @@ struct Resolver {
   impliedWalks: List<ImpliedWalk>,
   impliedLookup: InternIndex,
   impliedRevision: u32,
+  // Each declaration's successful `templateBinders`, kept only while the store is never revised and
+  // no unit records its reads, when building them again reads nothing a later unit could observe.
+  templateBinderSets: List<TemplateBinders>,
+  templateBinderLookup: InternIndex,
   // The walks of the unit runs in progress whose demand path a walk may read, innermost last. Each
   // run reads only its own and drops them when it ends.
   runWalks: List<ImpliedWalk>,
@@ -2700,6 +2708,17 @@ struct Resolver {
 // the signature it read, retained so its address names that signature while the walk is kept,
 // whether a call owes the bounds, what the walk found, and the answer edges and graph records its
 // unit made, which a unit reusing the walk makes again.
+// The binders `templateBinders` built for one declaration, by module ordinal and position: its
+// owner and, per binder, its kind (0 row, 1 type, 2 lifetime), name and parameter ordinal.
+struct TemplateBinders {
+  module: usize,
+  ordinal: usize,
+  owner: Option<DeclarationId>,
+  kinds: List<u8>,
+  names: List<Bytes>,
+  ordinals: List<usize>,
+}
+
 struct ImpliedWalk {
   unitRun: usize,
   application: usize,
@@ -8298,7 +8317,7 @@ effect fn distinctDependencies(edges: &[Dependency]) -> List<Dependency> ! OutOf
     run List<Dependency>.shrinkToFit(&mut kept)
     return move kept
   }
-  let mut lookup = InternIndex.make()
+  let mut lookup = run InternIndex.withCapacity(edges.length)
   while at < edges.length {
     let edge = edges[at]
     let hashed = dependencyHash(edge)
@@ -10226,6 +10245,35 @@ fn writtenGenerics(hir: &Module, written: Node) -> Range {
 }
 
 effect fn templateBinders(resolver: &mut Resolver, module: &ModuleId, ordinal: usize) -> Result<
+  List<Binder>,
+  Shared<Rejection>,
+> ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if recording(&resolver.*) || recordingUnit(&resolver.*) != usize.MAX {
+    return run writtenTemplateBinders(&mut resolver.*, module, ordinal)
+  }
+  let moduleOrdinal = knownModuleOrdinal(&resolver.*, module)
+  if moduleOrdinal == usize.MAX { return run writtenTemplateBinders(&mut resolver.*, module, ordinal) }
+  let hashed = Hash.combine(Hash.mix(&Hash.seed(0), usize.toU64(moduleOrdinal)), usize.toU64(ordinal))
+  let sets = List<TemplateBinders>.asSlice(&resolver.templateBinderSets)
+  let mut at = InternIndex.first(&resolver.templateBinderLookup, hashed)
+  while at != usize.MAX {
+    if sets[at].module == moduleOrdinal && sets[at].ordinal == ordinal {
+      return Result<List<Binder>, Shared<Rejection>>.succeed(run keptTemplateBinders(&sets[at]))
+    }
+    at = InternIndex.after(&resolver.templateBinderLookup, at)
+  }
+  let built = run writtenTemplateBinders(&mut resolver.*, module, ordinal)
+  if let Result<List<Binder>, Shared<Rejection>>.Success {value} = &built {
+    if let Option<TemplateBinders>.Some {value: kept} = move run keepTemplateBinders(moduleOrdinal, ordinal, List<Binder>.asSlice(&value)) {
+      run List<TemplateBinders>.append(&mut resolver.templateBinderSets, move kept)
+      run InternIndex.record(&mut resolver.templateBinderLookup, hashed)
+    }
+  }
+  return move built
+}
+
+// The binders a declaration's written generics introduce, read from its syntax.
+effect fn writtenTemplateBinders(resolver: &mut Resolver, module: &ModuleId, ordinal: usize) -> Result<
   List<Binder>,
   Shared<Rejection>,
 > ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
@@ -13175,6 +13223,93 @@ effect fn roleDeclaration(
   return Result<Shared<Type>, Shared<Rejection>>.failResult(
     run reject(&resolver.*, module, RejectionCode.InvalidRequirement, parsed.span),
   )
+}
+
+// Fresh binders from a kept `TemplateBinders`, built as `writtenTemplateBinders` builds them: each
+// with its own handles, since `Shared.with` borrows a handle exclusively.
+effect fn keptTemplateBinders(kept: &TemplateBinders) -> List<Binder> ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let kinds = List<u8>.asSlice(&kept.kinds)
+  let mut binders = run List<Binder>.makeWithCapacity(kinds.length)
+  if let Option<DeclarationId>.Some {value: owner} = &kept.owner {
+    let names = List<Bytes>.asSlice(&kept.names)
+    let ordinals = List<usize>.asSlice(&kept.ordinals)
+    let mut at = usize.ZERO
+    while at < kinds.length {
+      let name = run Bytes.copy(Bytes.asSlice(&names[at]))
+      if kinds[at] == 0 {
+        run List<Binder>.append(&mut binders, Binder.Row {
+          name: move name,
+          value: RowParameter {declaration: run Shared<DeclarationId>.make(DeclarationId.copy(&owner)), ordinal: ordinals[at]},
+          bound: Option<Shared<Row>>.none(),
+        })
+      } else if kinds[at] == 1 {
+        let parameterType = run Types.intern(Type.Parameter {declaration: DeclarationId.copy(&owner), ordinal: ordinals[at]})
+        run List<Binder>.append(&mut binders, Binder.Type {name: move name, value: move parameterType})
+      } else {
+        run List<Binder>.append(&mut binders, Binder.Lifetime {
+          name: move name,
+          value: run Shared<Lifetime>.make(Lifetime.Parameter {declaration: DeclarationId.copy(&owner), ordinal: ordinals[at]}),
+        })
+      }
+      at = at + usize.ONE
+    }
+  }
+  return move binders
+}
+
+// What `keptTemplateBinders` needs to build `binders` again, or `None` when a binder is not one
+// `writtenTemplateBinders` builds.
+effect fn keepTemplateBinders(module: usize, ordinal: usize, binders: &[Binder]) -> Option<TemplateBinders> ! OutOfMemoryError ? &mut Allocator {
+  let mut kept = TemplateBinders {module: module, ordinal: ordinal, owner: Option<DeclarationId>.none(),
+    kinds: List<u8>.make(), names: List<Bytes>.make(), ordinals: List<usize>.make()}
+  let mut at = usize.ZERO
+  while at < binders.length {
+    let mut kind: u8 = 0
+    let mut position = usize.MAX
+    let mut owner = Option<DeclarationId>.none()
+    match &binders[at] {
+      Binder.Row {value, bound, ..} => {
+        if let Option<Shared<Row>>.Some {..} = &bound { return Option<TemplateBinders>.none() }
+        position = value.ordinal
+        owner = Option<DeclarationId>.some(DeclarationId.copyShared(&value.declaration))
+      }
+      Binder.Type {value, ..} => {
+        kind = 1
+        let parts = run Type.copy(&value)
+        if let Type.Parameter {declaration, ordinal: written} = move parts {
+          position = written
+          owner = Option<DeclarationId>.some(move declaration)
+        }
+      }
+      Binder.Lifetime {value, ..} => {
+        kind = 2
+        let parts = Shared<Lifetime>.with<Option<DeclarationId>>(&value, fn(node: &Lifetime) -> Option<DeclarationId> {
+          if let Lifetime.Parameter {declaration, ..} = &node.* { return Option<DeclarationId>.some(DeclarationId.copy(&declaration)) }
+          return Option<DeclarationId>.none()
+        })
+        position = Shared<Lifetime>.with<usize>(&value, fn(node: &Lifetime) -> usize {
+          if let Lifetime.Parameter {ordinal: written, ..} = &node.* { return written }
+          return usize.MAX
+        })
+        owner = move parts
+      }
+    }
+    let identity = match move owner {
+      Option<DeclarationId>.Some {value} => move value
+      Option<DeclarationId>.None => { return Option<TemplateBinders>.none() }
+    }
+    if position == usize.MAX { return Option<TemplateBinders>.none() }
+    if let Option<DeclarationId>.Some {value: known} = &kept.owner {
+      if !DeclarationId.equals(&known, &identity) { return Option<TemplateBinders>.none() }
+    } else {
+      kept.owner = Option<DeclarationId>.some(move identity)
+    }
+    run List<u8>.append(&mut kept.kinds, kind)
+    run List<Bytes>.append(&mut kept.names, run Bytes.copy(binderName(&binders[at])))
+    run List<usize>.append(&mut kept.ordinals, position)
+    at = at + usize.ONE
+  }
+  return Option<TemplateBinders>.some(move kept)
 }
 
 effect fn copyBinder(binder: &Binder) -> Binder ! OutOfMemoryError ? &mut Allocator {
@@ -27957,6 +28092,49 @@ effect fn resolveSignatureUnder(
   // `effect<'env> fn f<A: 'env, 'env>`, except that the environment still meets every other input's
   // regions. The body assumes the bounds and every call proves them.
   let ownerKind = DeclarationId.kind(&signatureOwner)
+  // Under an application the elaborated binder still exists, so its coordinates and the callable
+  // representations after it stay those of the authored signature: the inputs it bounds are those
+  // whose authored contents are generic, as `s: S` is in `effect fn go<S>(e: Effect<i32>, s: S)`
+  // even when `S` is applied to `i32`.
+  if boundsPhase == BoundPhase.Application && value.isEffect && !value.environment.present && ownCount > usize.ZERO
+    && ownerKind != OwnerKind.EffectBlock && ownerKind != OwnerKind.Anonymous {
+    let authored = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies, key, Span.make(usize.ZERO, usize.ZERO))
+    if let Option<SignatureFacts>.Some {value: facts} = move Shared<Result<Answer, NoRejection>>.with<Option<SignatureFacts>>(
+      &authored, signatureFacts) {
+      let applied = List<Shared<Type>>.asSlice(&parameters)
+      if facts.parameters == applied.length {
+        // The authored inputs name the implicit callable representations too, so every binder's
+        // representation is read.
+        let binderCount = facts.binders
+        let mut declared = List<Constraint>.make()
+        let mut boundAt = usize.ZERO
+        while boundAt < facts.constraints {
+          let bound = Shared<Result<Answer, NoRejection>>.with<Option<Constraint>>(&authored,
+            fn(answer: &Result<Answer, NoRejection>) -> Option<Constraint> { return signatureConstraintAt(answer, boundAt) })
+          if let Option<Constraint>.Some {value: found} = move bound { run List<Constraint>.append(&mut declared, move found) }
+          boundAt = boundAt + usize.ONE
+        }
+        let authoredRepresentations = run representationsOf(&signatureOwner, binderCount, List<Constraint>.asSlice(&declared))
+        let mut generic = List<Shared<Type>>.make()
+        let mut inputAt = usize.ZERO
+        while inputAt < applied.length {
+          let written = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Type>>>(&authored,
+            fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> { return signatureParameter(answer, inputAt) })
+          if let Option<Shared<Type>>.Some {value: authoredInput} = move written {
+            let mut ignored = List<Shared<Lifetime>>.make()
+            if !run Type.retainedRegions(&authoredInput, &signatureOwner,
+              List<Option<Shared<Type>>>.asSlice(&authoredRepresentations), &mut ignored, false) {
+              run List<Shared<Type>>.append(&mut generic, Shared<Type>.clone(&applied[inputAt]))
+            }
+          }
+          inputAt = inputAt + usize.ONE
+        }
+        hasUnknown = List<Shared<Type>>.length(&generic) > usize.ZERO
+        if hasUnknown && unknownSpan.end == usize.ZERO { unknownSpan = value.span }
+        unknownInputs = move generic
+      }
+    }
+  }
   if value.isEffect && !value.environment.present && hasUnknown && ownerKind != OwnerKind.EffectBlock
     && ownerKind != OwnerKind.Anonymous {
     let contents = match move run elidedLifetime(&mut resolver.*, &module, unknownSpan, &mut elision) {
@@ -30402,6 +30580,14 @@ effect fn unifyHeadCandidate(
   if exactHeadMatched(&matched) {
     matched = run admitRepresentations(&head, List<Shared<DeclarationId>>.asSlice(&variables), &mut trial)
   }
+  // A head whose contract only its bounds decide, as `Step<R | Q>` for `Both<A, B>`, is matched
+  // again with those bounds solved.
+  if exactHeadUndetermined(&matched) {
+    let mut solved = run copyBindings(fixed)
+    matched = run matchHeadThroughBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &head, knownProvider,
+      contract, List<Shared<DeclarationId>>.asSlice(&variables), &mut solved, module, span)
+    trial = move solved
+  }
   match move matched {
     Unification.Unified => {
       if let Option<List<Binding>>.Some {..} = &selected.* {
@@ -30409,8 +30595,16 @@ effect fn unifyHeadCandidate(
           run reject(&resolver.*, module, RejectionCode.TypeArgumentInference, span),
         )
       }
-      let closed = run closedHeadCallEvidence(List<Binding>.asSlice(&trial),
+      let mut closed = run closedHeadCallEvidence(List<Binding>.asSlice(&trial),
         List<Shared<DeclarationId>>.asSlice(&variables), callOwner)
+      // The head's own parameters that the contract left open may be fixed by its bounds, as
+      // `R` in `impl<?R, A: Step<R>> Step<R> for Wrap<A>`.
+      if let Option<List<Binding>>.None = &closed {
+        run solveHeadBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &head,
+          List<Shared<DeclarationId>>.asSlice(&variables), &mut trial, module, span, usize.ZERO)
+        closed = run closedHeadCallEvidence(List<Binding>.asSlice(&trial),
+          List<Shared<DeclarationId>>.asSlice(&variables), callOwner)
+      }
       if let Option<List<Binding>>.Some {value} = move closed {
         selected.* = Option<List<Binding>>.some(move value)
       } else { undecided.* = true }
@@ -32200,8 +32394,62 @@ effect fn collectQualifiedValue(hir: &Module, expression: HirId, calls: &mut Lis
       value: true, id: expression, span: Module.span(hir, expression), reference: move reference,
       generics: HirRef.absent(), pipeline: false,
     })
+  } else {
+    run collectModuleQualifiedOwner(hir, expression, &mut calls.*)
   }
   return ()
+}
+
+// `g.Box<i32>.make` writes a module-qualified type as an applied owner, which a value cannot reach
+// through the module name. The owner path is recorded as a qualified value so body typing can
+// report how to import the type instead of an unsupported construct.
+effect fn collectModuleQualifiedOwner(hir: &Module, expression: HirId, calls: &mut List<CallSyntax>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  if let Node.MemberExpression {selector, fields} = Module.node(hir, expression) {
+    if fields.present { return () }
+    if let Node.MemberSelector {subject, ..} = Module.node(hir, selector) {
+      if let Node.AppliedType {target, ..} = Module.node(hir, subject) {
+        if let Node.NamedType {path, hasMode, ..} = Module.node(hir, target) {
+          if hasMode { return () }
+          if let Node.Path {segments} = Module.node(hir, path) {
+            if segments.length != 2 { return () }
+            let first = Module.child(hir, segments, usize.ZERO)
+            let second = Module.child(hir, segments, usize.ONE)
+            if let Node.Name {text: namespace} = Module.node(hir, first) {
+              if same(Module.text(hir, namespace), b"Intrinsic") { return () }
+              if let Node.Name {text: member} = Module.node(hir, second) {
+                run List<CallSyntax>.append(&mut calls.*, CallSyntax {
+                  exactItem: false, value: true, id: subject, span: Module.span(hir, path),
+                  reference: CallReference.Qualified {
+                    namespace: run Bytes.copy(Module.text(hir, namespace)), member: run Bytes.copy(Module.text(hir, member)),
+                    subjectSpan: Module.span(hir, first), memberSpan: Module.span(hir, second), application: HirRef.absent(),
+                  },
+                  generics: HirRef.absent(), pipeline: false,
+                })
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return ()
+}
+
+// The refusal of a module-qualified applied owner, as `g.Box` in `g.Box<i32>.make`.
+effect fn moduleQualifiedOwnerRefusal(source: &SourceIndex, cursor: &AuthoredCursor, calls: &[ResolvedCall], expression: HirId)
+  -> Option<Shared<Rejection>> ! RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  if let Node.MemberExpression {selector, fields} = run bodyNode(source, cursor, expression) {
+    if fields.present { return Option<Shared<Rejection>>.none() }
+    if let Node.MemberSelector {subject, ..} = run bodyNode(source, cursor, selector) {
+      if let Option<Result<ResolvedTarget, Shared<Rejection>>>.Some {value: Result<ResolvedTarget, Shared<Rejection>>.Failure {error}} = move run resolvedCall(calls, subject) {
+        if Shared<Rejection>.with<bool>(&error, fn(found: &Rejection) -> bool { return found.code == RejectionCode.ModuleQualifiedType }) {
+          return Option<Shared<Rejection>>.some(move error)
+        }
+      }
+    }
+  }
+  return Option<Shared<Rejection>>.none()
 }
 
 effect fn collectElements(hir: &Module, elements: Range, annotations: &mut List<HirId>, calls: &mut List<CallSyntax>) -> ()
@@ -32338,6 +32586,7 @@ effect fn collectInvocation(hir: &Module, expression: HirId, input: CallInput, a
     Node.MemberExpression {..} => {
       let qualified = run qualifiedCallReference(hir, callee)
       if let Option<CallReference>.Some {value} = move qualified { reference = move value }
+      else { run collectModuleQualifiedOwner(hir, callee, &mut calls.*) }
     }
     Node.IntegerLiteral {..} => {
       reference = CallReference.NonCallable
@@ -33316,8 +33565,9 @@ effect fn compositionTarget(resolver: &mut Resolver, owner: &mut Query<Answer, N
   if operation == Composition.Finalize || operation == Composition.FinalizeNonParking { arity = 4 }
   if operation == Composition.UseRelease { arity = 5 }
   if operation == Composition.Observe { arity = 4 }
-  // A suspension infers its channels from the deferred Effect and writes no type arguments.
-  if operation == Composition.Suspend { arity = usize.ZERO }
+  // A suspension and an interruptible boundary infer their channels from the body and write no
+  // type arguments.
+  if operation == Composition.Suspend || operation == Composition.Interrupt { arity = usize.ZERO }
   let mut written = List<Argument>.make()
   if !generics.present {
     // Finalizers, observations and provision selectors infer from their operands.
@@ -34003,6 +34253,7 @@ effect fn intrinsicCallTarget(
   if same(member, b"bindRequirementOwned") { composition = Option<Composition>.some(Composition.BindOwned) }
   if same(member, b"observeDiagnostics") { composition = Option<Composition>.some(Composition.Observe) }
   if same(member, b"suspendEffect") { composition = Option<Composition>.some(Composition.Suspend) }
+  if same(member, b"interruptibleEffect") { composition = Option<Composition>.some(Composition.Interrupt) }
   if let Option<Composition>.Some {value: operation} = move composition {
     let callSpan = run staticSpan(&mut resolver.*, module, syntax.id)
     return run compositionTarget(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, moduleOrdinal,
@@ -35428,7 +35679,6 @@ effect fn genericOperationRejection(module: &ModuleId, span: Span, operation: &D
 effect fn inferredInterfaceApplication(
   resolver: &mut Resolver,
   owner: &mut Query<Answer, NoRejection>,
-  request: &mut Request,
   dependencies: &mut List<Dependency>,
   contractModule: usize,
   contractOrdinal: usize,
@@ -35448,15 +35698,7 @@ effect fn inferredInterfaceApplication(
       external: false,
     }
   let declarationAccess113 = run internDeclaration(&mut resolver.*, declarationAccess113Request)
-  let bucket = run proofDemand(
-    &mut resolver.*,
-    &mut owner.*,
-    &mut request.*,
-    &mut dependencies.*,
-    declarationAccess113,
-    span,
-    true,
-  )
+  let bucket = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, declarationAccess113, span)
   let failed = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Rejection>>>(&bucket, answerCause)
   if let Option<Shared<Rejection>>.Some {value} = move failed {
     return Result<Shared<Type>, Shared<Rejection>>.failResult(move value)
@@ -35491,11 +35733,17 @@ effect fn inferredInterfaceApplication(
         if exactHeadMatched(&matched) {
           let binderCount = Shared<ImplementationHead>.with<usize>(&head, headBinderCount)
           let lent = List<Shared<Lifetime>>.make()
-          let fixed = run matchedArguments(binderCount, &headOwner, List<Binding>.asSlice(&bindings),
+          let mut fixed = run matchedArguments(binderCount, &headOwner, List<Binding>.asSlice(&bindings),
             List<Shared<Lifetime>>.asSlice(&lent))
+          if let Option<List<Argument>>.None = &fixed {
+            run solveHeadBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &head,
+              List<Shared<DeclarationId>>.asSlice(&variables), &mut bindings, module, span, usize.ZERO)
+            fixed = run matchedArguments(binderCount, &headOwner, List<Binding>.asSlice(&bindings),
+              List<Shared<Lifetime>>.asSlice(&lent))
+          }
           if let Option<List<Argument>>.Some {value: arguments} = move fixed {
             drop arguments
-            let candidate = run Type.applyBindings(&found.contract, List<Binding>.asSlice(&bindings), true)
+            let candidate = run appliedThrough(&found.contract, List<Binding>.asSlice(&bindings))
             let known = List<Shared<Type>>.asSlice(&candidates)
             let mut repeated = false
             let mut seen = usize.ZERO
@@ -35612,7 +35860,7 @@ effect fn metOperationProvider(
     if run Type.equalsShared(&met, provider) { return Option<MetOperation>.none() }
     let mut metContract = Shared<Type>.clone(contract)
     if generic {
-      let application = run inferredInterfaceApplication(&mut resolver.*, &mut owner.*, &mut request.*,
+      let application = run inferredInterfaceApplication(&mut resolver.*, &mut owner.*,
         &mut dependencies.*, interfaceModule, interfaceOrdinal, &met, module, span)
       metContract = match move application {
         Result<Shared<Type>, Shared<Rejection>>.Success {value} => move value
@@ -35648,6 +35896,39 @@ effect fn metOperationProvider(
     round = round + usize.ONE
   }
   return Option<MetOperation>.none()
+}
+
+// Whether an interface operation applied to `contract` for `provider` takes the provider, or a
+// reference to it, as its first operand.
+effect fn operationTakesProvider(
+  resolver: &mut Resolver,
+  owner: &mut Query<Answer, NoRejection>,
+  request: &mut Request,
+  dependencies: &mut List<Dependency>,
+  contract: &Shared<Type>,
+  provider: &Shared<Type>,
+  contractModule: usize,
+  operationOrdinal: usize,
+  span: Span,
+) -> Result<bool, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator | &mut Types {
+  let contractKey = run internApplication(&mut resolver.*, contract)
+  let providerKey = run internApplication(&mut resolver.*, provider)
+  let appliedRequest = Key {
+    family: Family.AppliedOperation, module: contractModule, name: contractKey,
+    declaration: operationOrdinal, member: providerKey, external: false,
+  }
+  let applied = run internDeclaration(&mut resolver.*, appliedRequest)
+  let signature = run proofDemand(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, applied, span, true)
+  let failure = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Rejection>>>(&signature, answerCause)
+  if let Option<Shared<Rejection>>.Some {value} = move failure {
+    return Result<bool, Shared<Rejection>>.failResult(move value)
+  }
+  return Result<bool, Shared<Rejection>>.succeed(match move run receiverPosition(&signature, provider) {
+    Option<ReceiverPosition>.Some {..} => true
+    Option<ReceiverPosition>.None => false
+  })
 }
 
 effect fn checkQualifiedInterfaceCall<'scope>(
@@ -35708,6 +35989,10 @@ effect fn checkQualifiedInterfaceCall<'scope>(
   let mut laterPositions = List<usize>.make()
   let mut laterTypes = List<Shared<Type>>.make()
   let mut genericContract = false
+  // The caller's bounds on this interface, as `A: Delay` and `B: Delay` in
+  // `impl<A: Delay, B: Delay> Delay for Longer<A, B>`.
+  let mut boundContracts = List<Shared<Type>>.make()
+  let mut boundProviders = List<Shared<Type>>.make()
   let mut at = usize.ZERO
   while at < constraints.length {
     if let Constraint.Conforms {provider, contract} = &constraints[at] {
@@ -35725,16 +36010,101 @@ effect fn checkQualifiedInterfaceCall<'scope>(
         if selectedGoal { selectedGoal = run Type.equalsShared(&contract, &requested) }
       }
       if selectedGoal {
-        if let Option<Shared<Type>>.Some {value: unused} = &chosenContract {
-          return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
-        }
-        chosenContract = Option<Shared<Type>>.some(Shared<Type>.clone(&contract))
-        chosenProvider = Option<Shared<Type>>.some(Shared<Type>.clone(&provider))
+        run List<Shared<Type>>.append(&mut boundContracts, Shared<Type>.clone(&contract))
+        run List<Shared<Type>>.append(&mut boundProviders, Shared<Type>.clone(&provider))
       }
     }
     at = at + usize.ONE
   }
+  let declarationAccess114Request = Key {
+      family: Family.Operations,
+      module: selected.module,
+      name: usize.ZERO,
+      declaration: selected.ordinal,
+      member: usize.ZERO,
+      external: false,
+    }
+  let declarationAccess114 = run internDeclaration(&mut resolver.*, declarationAccess114Request)
+  let listed = run proofDemand(
+    &mut resolver.*,
+    &mut owner.*,
+    &mut request.*,
+    &mut dependencies.*,
+    declarationAccess114,
+    span,
+    true,
+  )
+  let failure = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Rejection>>>(
+    &listed,
+    answerCause,
+  )
+  if let Option<Shared<Rejection>>.Some {value} = move failure {
+    return Result<BodyNodeId, Shared<Rejection>>.failResult(move value)
+  }
+  let count = Shared<Result<Answer, NoRejection>>.with<usize>(&listed, operationCount)
+  let mut operation = Option<DeclarationId>.none()
+  let mut operationOrdinal = usize.MAX
+  at = usize.ZERO
+  while at < count {
+    let found = Shared<Result<Answer, NoRejection>>.with<Option<Shared<DeclarationId>>>(
+      &listed,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<DeclarationId>> {
+        return operationAt(answer, at)
+      },
+    )
+    if let Option<Shared<DeclarationId>>.Some {value: candidate} = move found {
+      let named = Shared<DeclarationId>.with<bool>(
+        &candidate,
+        fn(value: &DeclarationId) -> bool {
+          return DeclarationId.named(value, Bytes.asSlice(&qualifier.member))
+        },
+      )
+      if named {
+        let ordinal = run ordinalOfIdentity(&mut resolver.*, &contractModule, &candidate)
+        if let Option<usize>.Some {value: position} = move ordinal {
+          operation = run declarationAt(&mut resolver.*, &contractModule, position)
+          operationOrdinal = position
+        }
+        break
+      }
+    }
+    at = at + usize.ONE
+  }
+  let operationId = match move operation {
+    Option<DeclarationId>.Some {value} => move value
+    Option<DeclarationId>.None => {
+      return run bodyRejection(&resolver.*, module, RejectionCode.UnknownOperation, span)
+    }
+  }
+  // A bound fixes the provider of an operation whose first operand is not `Self`, or of a call
+  // without operands. Otherwise the first operand's provider selects among the bounds, so
+  // `Delay.next(&mut schedule.left)` takes `A: Delay` and a concrete operand takes its conformance.
+  let boundCount = List<Shared<Type>>.length(&boundContracts)
+  let mut operandSelects = false
+  // One bound keeps its direct selection unless the operand is a place, the only operand that
+  // could name a concrete provider beside it and types without an expected type.
+  let mut placeOperand = false
+  if CallArguments.length(arguments) > usize.ZERO {
+    placeOperand = run placeSyntax(&resolver.source, cursor, run bodyArgument(&resolver.source, cursor, arguments, usize.ZERO))
+  }
+  if boundCount > usize.ZERO && CallArguments.length(arguments) > usize.ZERO && (boundCount > usize.ONE || placeOperand) {
+    let takesSelf = run operationTakesProvider(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
+      &List<Shared<Type>>.asSlice(&boundContracts)[usize.ZERO], &List<Shared<Type>>.asSlice(&boundProviders)[usize.ZERO],
+      selected.module, operationOrdinal, span)
+    operandSelects = match move takesSelf {
+      Result<bool, Shared<Rejection>>.Success {value} => value
+      Result<bool, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
+    }
+  }
+  if boundCount > usize.ZERO && !operandSelects {
+    if boundCount > usize.ONE {
+      return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+    }
+    chosenContract = Option<Shared<Type>>.some(Shared<Type>.clone(&List<Shared<Type>>.asSlice(&boundContracts)[usize.ZERO]))
+    chosenProvider = Option<Shared<Type>>.some(Shared<Type>.clone(&List<Shared<Type>>.asSlice(&boundProviders)[usize.ZERO]))
+  }
   let mut firstArgument = Option<BodyNodeId>.none()
+  let mut firstLength = usize.ZERO
   let needsInference = match & chosenContract {
     Option<Shared<Type>>.Some {..} => false
     Option<Shared<Type>>.None => true
@@ -35755,6 +36125,7 @@ effect fn checkQualifiedInterfaceCall<'scope>(
       return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
     }
     let firstId = run bodyArgument(&resolver.source, cursor, arguments, usize.ZERO)
+    firstLength = List<BodyNode>.length(&nodes.*)
     // A borrowed receiver borrows its operand itself, so `&slice` selects the slice's conformance
     // through `& &[E]` instead of reborrowing the elements.
     let checked = match run bodyNode(&resolver.source, cursor, firstId) {
@@ -35850,9 +36221,46 @@ effect fn checkQualifiedInterfaceCall<'scope>(
         }
       }
     }
-    if generic {
+    // A bound on exactly the operand's provider, under any borrows, supplies its application, as
+    // `A: Step<R>` does for an `A` or `&A` operand. An operand of other open parameters keeps the
+    // one bound, as before operands selected among bounds.
+    let mut peeled = Shared<Type>.clone(&operand)
+    while let Option<Shared<Type>>.Some {value: referent} = Shared<Type>.with<Option<Shared<Type>>>(&peeled, providerTarget) {
+      peeled = move referent
+    }
+    let mut boundApplication = Option<Shared<Type>>.none()
+    let listedProviders = List<Shared<Type>>.asSlice(&boundProviders)
+    let listedContracts = List<Shared<Type>>.asSlice(&boundContracts)
+    let mut boundAt = usize.ZERO
+    while boundAt < listedProviders.length {
+      if run Type.equalsShared(&listedProviders[boundAt], &peeled) {
+        if let Option<Shared<Type>>.Some {value: earlier} = &boundApplication {
+          if !run Type.equalsShared(&earlier, &listedContracts[boundAt]) {
+            return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
+          }
+        }
+        boundApplication = Option<Shared<Type>>.some(Shared<Type>.clone(&listedContracts[boundAt]))
+      }
+      boundAt = boundAt + usize.ONE
+    }
+    if listedProviders.length == usize.ONE && Type.hasOpenRuntimeParameters(&peeled) {
+      if let Option<Shared<Type>>.None = &boundApplication {
+        boundApplication = Option<Shared<Type>>.some(Shared<Type>.clone(&listedContracts[usize.ZERO]))
+        peeled = Shared<Type>.clone(&listedProviders[usize.ZERO])
+      }
+    }
+    if let Option<Shared<Type>>.Some {value: bound} = move boundApplication {
+      chosenContract = Option<Shared<Type>>.some(move bound)
+      // An operand that reaches the bound's provider only through borrows is checked again
+      // against the operation's parameter, which reborrows it.
+      if !run Type.equalsShared(&peeled, &operand) {
+        firstArgument = Option<BodyNodeId>.none()
+        List<BodyNode>.truncate(&mut nodes.*, firstLength)
+      }
+      operand = move peeled
+    } else if generic {
       // INTF-006: the operand's provider selects the one application its conformances supply.
-      let application = run inferredInterfaceApplication(&mut resolver.*, &mut owner.*, &mut request.*,
+      let application = run inferredInterfaceApplication(&mut resolver.*, &mut owner.*,
         &mut dependencies.*, selected.module, selected.ordinal, &operand, module, span)
       chosenContract = match move application {
         Result<Shared<Type>, Shared<Rejection>>.Success {value} => Option<Shared<Type>>.some(move value)
@@ -35880,64 +36288,6 @@ effect fn checkQualifiedInterfaceCall<'scope>(
     Option<Shared<Type>>.Some {value} => move value
     Option<Shared<Type>>.None => {
       return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span)
-    }
-  }
-  let declarationAccess114Request = Key {
-      family: Family.Operations,
-      module: selected.module,
-      name: usize.ZERO,
-      declaration: selected.ordinal,
-      member: usize.ZERO,
-      external: false,
-    }
-  let declarationAccess114 = run internDeclaration(&mut resolver.*, declarationAccess114Request)
-  let listed = run proofDemand(
-    &mut resolver.*,
-    &mut owner.*,
-    &mut request.*,
-    &mut dependencies.*,
-    declarationAccess114,
-    span,
-    true,
-  )
-  let failure = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Rejection>>>(
-    &listed,
-    answerCause,
-  )
-  if let Option<Shared<Rejection>>.Some {value} = move failure {
-    return Result<BodyNodeId, Shared<Rejection>>.failResult(move value)
-  }
-  let count = Shared<Result<Answer, NoRejection>>.with<usize>(&listed, operationCount)
-  let mut operation = Option<DeclarationId>.none()
-  at = usize.ZERO
-  while at < count {
-    let found = Shared<Result<Answer, NoRejection>>.with<Option<Shared<DeclarationId>>>(
-      &listed,
-      fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<DeclarationId>> {
-        return operationAt(answer, at)
-      },
-    )
-    if let Option<Shared<DeclarationId>>.Some {value: candidate} = move found {
-      let named = Shared<DeclarationId>.with<bool>(
-        &candidate,
-        fn(value: &DeclarationId) -> bool {
-          return DeclarationId.named(value, Bytes.asSlice(&qualifier.member))
-        },
-      )
-      if named {
-        let ordinal = run ordinalOfIdentity(&mut resolver.*, &contractModule, &candidate)
-        if let Option<usize>.Some {value: position} = move ordinal {
-          operation = run declarationAt(&mut resolver.*, &contractModule, position)
-        }
-        break
-      }
-    }
-    at = at + usize.ONE
-  }
-  let operationId = match move operation {
-    Option<DeclarationId>.Some {value} => move value
-    Option<DeclarationId>.None => {
-      return run bodyRejection(&resolver.*, module, RejectionCode.UnknownOperation, span)
     }
   }
   let selectedCall = run selectOperationCall(
@@ -49846,6 +50196,9 @@ effect fn compositionChannels(resolver: &Resolver, module: &ModuleId, cursor: &A
   if operation == Composition.Observe {
     return run observedChannels(resolver, module, cursor, arguments, operands, written, constraints, span)
   }
+  if operation == Composition.Interrupt {
+    return run interruptedChannels(resolver, module, cursor, arguments, operands, constraints)
+  }
   return run finalizedChannels(resolver, module, cursor, arguments, operation, operands, written, constraints, span)
 }
 
@@ -49919,6 +50272,28 @@ effect fn observedChannels(resolver: &Resolver, module: &ModuleId, cursor: &Auth
     }
   }
   return Result<EffectChannels, Shared<Rejection>>.succeed(move observed)
+}
+
+// The channels of `interruptibleEffect(token, body)`: a `usize` token and a body that succeeds with
+// `()`. The boundary succeeds with whether the body completed, and keeps its failure and
+// requirements.
+effect fn interruptedChannels(resolver: &Resolver, module: &ModuleId, cursor: &AuthoredCursor, arguments: CallArguments,
+  operands: &[Shared<Type>], constraints: &[Constraint]) -> Result<EffectChannels, Shared<Rejection>>
+! RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let tokenSpan = run bodySpan(&resolver.source, cursor, run bodyArgument(&resolver.source, cursor, arguments, usize.ZERO))
+  let bodySpanned = run bodySpan(&resolver.source, cursor, run bodyArgument(&resolver.source, cursor, arguments, usize.ONE))
+  if !Shared<Type>.with<bool>(&operands[usize.ZERO], fn(value: &Type) -> bool { return primitiveNamed(value, b"usize") }) {
+    return run channelRejection(resolver, module, RejectionCode.TypeMismatch, tokenSpan)
+  }
+  let body = match move run runnableChannels(&operands[usize.ONE], constraints) {
+    Option<EffectChannels>.Some {value} => move value
+    Option<EffectChannels>.None => { return run channelRejection(resolver, module, RejectionCode.RunNonEffect, bodySpanned) }
+  }
+  if !Shared<Type>.with<bool>(&body.success, unitShape) {
+    return run channelRejection(resolver, module, RejectionCode.TypeMismatch, bodySpanned)
+  }
+  return Result<EffectChannels, Shared<Rejection>>.succeed(EffectChannels {success: run primitiveType(b"bool"),
+    failure: move body.failure, requirements: move body.requirements})
 }
 
 // The channels of `catchFailure<S>`: the protected or handler success, the residual and handler
@@ -50499,6 +50874,10 @@ effect fn checkStorageCall<'scope>(
         run List<Option<Shared<Type>>>.append(&mut contexts, Option<Shared<Type>>.none())
         run List<Option<Shared<Type>>>.append(&mut contexts, Option<Shared<Type>>.some(Shared<Type>.clone(&word)))
       }
+      StorageOperation.RawBufferResize => {
+        run List<Option<Shared<Type>>>.append(&mut contexts, Option<Shared<Type>>.none())
+        run List<Option<Shared<Type>>>.append(&mut contexts, Option<Shared<Type>>.some(Shared<Type>.clone(&word)))
+      }
       StorageOperation.RawBufferFill => {
         run List<Option<Shared<Type>>>.append(&mut contexts, Option<Shared<Type>>.none())
         run List<Option<Shared<Type>>>.append(&mut contexts, Option<Shared<Type>>.some(Shared<Type>.clone(&word)))
@@ -50686,6 +51065,14 @@ effect fn checkStorageCall<'scope>(
           Option<StorageView>.None => false
         }
         if !destination || !source { return Result<BodyNodeId, Shared<Rejection>>.failResult(move mismatch) }
+      }
+      StorageOperation.RawBufferResize => {
+        let accepted = match move run storageView(&subject, false) {
+          Option<StorageView>.Some {value: view} => view.access == Access.Mutable && run Type.equalsShared(&view.target, &buffer)
+          Option<StorageView>.None => false
+        }
+        if !accepted { return Result<BodyNodeId, Shared<Rejection>>.failResult(move mismatch) }
+        ty = run primitiveType(b"bool")
       }
       StorageOperation.RawBufferFill => {
         let octet = run primitiveType(b"u8")
@@ -51264,6 +51651,9 @@ effect fn checkNamedValue<'scope>(
     _ => false
   }
   if !namedValue { return Option<Result<BodyNodeId, Shared<Rejection>>>.none() }
+  if let Option<Shared<Rejection>>.Some {value: refusal} = move run moduleQualifiedOwnerRefusal(&resolver.source, cursor, calls, expression) {
+    return Option<Result<BodyNodeId, Shared<Rejection>>>.some(Result<BodyNodeId, Shared<Rejection>>.failResult(move refusal))
+  }
   let span = run bodySpan(&resolver.source, cursor, expression)
   let selected = run resolvedCall(calls, expression)
   match move selected {
@@ -51299,7 +51689,7 @@ effect fn checkNamedValue<'scope>(
     Option<Result<ResolvedTarget, Shared<Rejection>>>.Some {value: Result<ResolvedTarget, Shared<Rejection>>.Failure {error}} => {
       let rejectedValue = Shared<Rejection>.with<bool>(&error, fn(value: &Rejection) -> bool {
         return value.code == RejectionCode.ForeignFunctionNotFirstClass || value.code == RejectionCode.ForeignStaticUnavailable
-          || value.code == RejectionCode.PrivateMember
+          || value.code == RejectionCode.PrivateMember || value.code == RejectionCode.UnknownImportedMember
       })
       if rejectedValue {
         return Option<Result<BodyNodeId, Shared<Rejection>>>.some(Result<BodyNodeId, Shared<Rejection>>.failResult(move error))
@@ -54847,14 +55237,17 @@ effect fn inferEffectBound(fresh: &DeclarationId, inferred: &mut List<Binding>, 
   let joint = match &unified { Unification.Unified => true _ => false }
   if !joint {
     // A failure the call already fixed wider, as `E` fixed by a handler `onAny(error: Overdrawn |
-    // Frozen)` before an Effect failing with `Frozen` is piped in, still covers the offered one
-    // (the bound's proof checks it); the success and requirements are inferred without it.
-    let failurePattern = List<Shared<Type>>.remove(&mut patterns, usize.ONE)
-    let failureEvidence = List<Shared<Type>>.remove(&mut evidence, usize.ONE)
-    drop run Type.unifyAll(List<Shared<Type>>.asSlice(&patterns), List<Shared<Type>>.asSlice(&evidence),
-      List<Shared<DeclarationId>>.asSlice(&variables), Comparison.Exact, &mut inferred.*)
-    drop run Type.unify(&failurePattern, &failureEvidence, List<Shared<DeclarationId>>.asSlice(&variables), Comparison.Exact,
-      &mut inferred.*)
+    // Frozen)` before an Effect failing with `Frozen` is piped in, still covers the offered one,
+    // and so do fixed requirements, as `? &mut PoolTask` for an Effect that needs nothing (the
+    // bound's proof checks both). Each channel is then inferred on its own.
+    let channels = List<Shared<Type>>.asSlice(&patterns)
+    let offers = List<Shared<Type>>.asSlice(&evidence)
+    let mut at = usize.ZERO
+    while at < channels.length {
+      drop run Type.unify(&channels[at], &offers[at], List<Shared<DeclarationId>>.asSlice(&variables), Comparison.Exact,
+        &mut inferred.*)
+      at = at + usize.ONE
+    }
   }
   drop unified
   let carrier = run Types.intern(Type.Effect {
@@ -54947,7 +55340,7 @@ effect fn inferCallableBound(resolver: &mut Resolver, owner: &mut Query<Answer, 
   let effectsBound = run effectBound(&sourceType, &promised)
   if let Option<EffectBound>.Some {value: effects} = move effectsBound {
     // An Effect that can fail, such as an `effect fn` call with `! OutOfMemoryError`, offered
-    // where one that cannot is required, as by `Pool.spawn`, determines no binding.
+    // where one that cannot is required, as by a closed task bound, determines no binding.
     if Shared<Type>.with<bool>(&effects.wanted.failure, neverType) && !Shared<Type>.with<bool>(&effects.offered.failure, neverType) {
       return Option<Shared<Rejection>>.some(run failingEffectRejection(module, span, &effects.offered.failure))
     }
@@ -56685,6 +57078,9 @@ effect fn checkInvocationOnce<'scope>(
     Option<Result<ResolvedTarget, Shared<Rejection>>>.Some {value} => match move value {
       Result<ResolvedTarget, Shared<Rejection>>.Success {value: target} => move target
       Result<ResolvedTarget, Shared<Rejection>>.Failure {error} => {
+        if let Option<Shared<Rejection>>.Some {value: refusal} = move run moduleQualifiedOwnerRefusal(&resolver.source, cursor, calls, callee) {
+          return Result<BodyNodeId, Shared<Rejection>>.failResult(move refusal)
+        }
         return Result<BodyNodeId, Shared<Rejection>>.failResult(move error)
       }
     }
@@ -74125,6 +74521,16 @@ effect fn compositePlan(resolver: &mut Resolver, owner: &mut Query<Answer, NoRej
         run List<MirRunPlan>.append(&mut steps.*, MirRunPlan.Suspend {inner: deferred})
         return Result<usize, PreparationFailure>.succeed(List<MirRunPlan>.length(&steps.*) - usize.ONE)
       }
+      // An interruptible boundary runs its body, part 1; the token, part 0, is data.
+      if operation == Composition.Interrupt {
+        let body = match move run compositePlan(&mut resolver.*, &mut owner.*, &mut dependencies.*, body, node, caller,
+          callerBindings, projections, identity, &stored[usize.ONE], origin, own, &mut bound.*, module, &mut steps.*, anchor) {
+          Result<usize, PreparationFailure>.Success {value} => value
+          Result<usize, PreparationFailure>.Failure {error} => { return Result<usize, PreparationFailure>.failResult(move error) }
+        }
+        run List<MirRunPlan>.append(&mut steps.*, MirRunPlan.Interrupt {inner: body})
+        return Result<usize, PreparationFailure>.succeed(List<MirRunPlan>.length(&steps.*) - usize.ONE)
+      }
       if operation != Composition.CatchFailure && operation != Composition.Finalize && operation != Composition.FinalizeNonParking {
         return Result<usize, PreparationFailure>.failResult(PreparationFailure.Coverage {code: GapCode.EffectForm})
       }
@@ -74300,6 +74706,9 @@ effect fn executableTargets(ty: &Shared<Type>, targets: &mut List<InstanceKey>, 
       } else if operation == Composition.UseRelease || operation == Composition.Observe {
         first = usize.ONE
         last = 2
+      } else if operation == Composition.Interrupt {
+        first = usize.ONE
+        last = usize.ONE
       }
       if last >= stored.length { return false }
       // The runner drops its data parts in place: a bracket's resource, a binding's provider and
@@ -74573,6 +74982,7 @@ effect fn storagePlan(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejec
   run List<Shared<DeclarationId>>.append(&mut externs, run SealedCore.cFunction(&allocation, SealedFunction.Free))
   run List<Shared<DeclarationId>>.append(&mut externs, run SealedCore.cFunction(&allocation, SealedFunction.Memmove))
   run List<Shared<DeclarationId>>.append(&mut externs, run SealedCore.cFunction(&allocation, SealedFunction.Memset))
+  run List<Shared<DeclarationId>>.append(&mut externs, run SealedCore.cFunction(&allocation, SealedFunction.Realloc))
   let mut element = run Types.intern(Type.Unit)
   if StorageOperation.typeArity(operation) > usize.ZERO || operation == StorageOperation.Replace {
     element = run storageInstanceType(body, node, usize.ZERO, callerBindings, projections)
@@ -81057,7 +81467,9 @@ effect fn resolveProofBounds(
     provider: Shared<Type>.clone(&applications[key.member]),
   }
   let mut bindings = List<Binding>.make()
-  let matched = run matchConformanceHead(&head, &goal, &mut bindings)
+  let headSpan = Shared<ImplementationHead>.with<Span>(&head, fn(value: &ImplementationHead) -> Span { return value.span })
+  let matched = run matchGoalHead(&mut resolver.*, &mut owner.*, &mut dependencies, &head, &goal, &mut bindings, &module,
+    headSpan)
   if !exactHeadMatched(&matched) {
     let span = Shared<ImplementationHead>.with<Span>(
       &head,
@@ -81109,6 +81521,377 @@ fn proofBoundAt(answer: &Result<Answer, NoRejection>, at: usize) -> Option<Const
     }
   }
   return Option<Constraint>.none()
+}
+
+// How deeply a head's bound may be solved through its own provider's heads (`solveHeadBounds`).
+const HEAD_BOUND_DEPTH: usize = 16
+
+// `value` under `bindings`, applied until no bound variable remains, since a binding may name
+// another bound variable.
+effect fn appliedThrough(value: &Shared<Type>, bindings: &[Binding]) -> Shared<Type>
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut current = Shared<Type>.clone(value)
+  let mut pass = usize.ZERO
+  while pass <= bindings.length {
+    let next = run Type.applyBindings(&current, bindings, true)
+    if run Type.equalsShared(&next, &current) { return move next }
+    current = move next
+    pass = pass + usize.ONE
+  }
+  return move current
+}
+
+// Fixes a conformance head's parameters that its provider leaves open through the head's own
+// bounds, as `R` in `impl<?R, A: Step<R>> Step<R> for Wrap<A>` once `A` is matched
+// (`solveBounds`).
+effect fn solveHeadBounds(
+  resolver: &mut Resolver,
+  owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut List<Dependency>,
+  head: &Shared<ImplementationHead>,
+  variables: &[Shared<DeclarationId>],
+  bindings: &mut List<Binding>,
+  module: &ModuleId,
+  span: Span,
+  depth: usize,
+) -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator | &mut Types {
+  let headOwner = Shared<ImplementationHead>.with<DeclarationId>(head,
+    fn(value: &ImplementationHead) -> DeclarationId { return DeclarationId.copyShared(&value.declaration) })
+  let mut providers = List<Shared<Type>>.make()
+  let mut contracts = List<Shared<Type>>.make()
+  run appendHeadConformances(head, &Option<DeclarationId>.none(), &mut providers, &mut contracts)
+  return run solveBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &headOwner,
+    List<Shared<Type>>.asSlice(&providers), List<Shared<Type>>.asSlice(&contracts), variables, &mut bindings.*, module, span,
+    depth)
+}
+
+// The `provider: contract` bounds of a head, with its parameters renamed to `renamed` when given.
+effect fn appendHeadConformances(head: &Shared<ImplementationHead>, renamed: &Option<DeclarationId>,
+  providers: &mut List<Shared<Type>>, contracts: &mut List<Shared<Type>>) -> ()
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let headOwner = Shared<ImplementationHead>.with<DeclarationId>(head,
+    fn(value: &ImplementationHead) -> DeclarationId { return DeclarationId.copyShared(&value.declaration) })
+  let count = Shared<ImplementationHead>.with<usize>(head, headConstraintCount)
+  let mut at = usize.ZERO
+  while at < count {
+    let bound = Shared<ImplementationHead>.with<Constraint>(head, fn(value: &ImplementationHead) -> Constraint {
+      return copyConstraint(&List<Constraint>.asSlice(&value.binders.constraints)[at])
+    })
+    if let Constraint.Conforms {provider, contract} = move bound {
+      if let Option<DeclarationId>.Some {value: replacement} = &renamed.* {
+        run List<Shared<Type>>.append(&mut providers.*, run Type.renameParameters(&provider, &headOwner, &replacement))
+        run List<Shared<Type>>.append(&mut contracts.*, run Type.renameParameters(&contract, &headOwner, &replacement))
+      } else {
+        run List<Shared<Type>>.append(&mut providers.*, move provider)
+        run List<Shared<Type>>.append(&mut contracts.*, move contract)
+      }
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Fixes parameters of `boundOwner` that the bounds `providers[i]: contracts[i]` determine: a bound
+// whose provider is closed under `bindings` meets the one head of that provider whose contract
+// unifies with the bound's, and takes the bindings that meeting gives. Passes repeat while one
+// adds a binding, so bound order does not matter; a bound that no single head meets fixes nothing.
+// The bindings only guide selection: whoever adopts them still proves every bound.
+effect fn solveBounds(
+  resolver: &mut Resolver,
+  owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut List<Dependency>,
+  boundOwner: &DeclarationId,
+  providers: &[Shared<Type>],
+  contracts: &[Shared<Type>],
+  variables: &[Shared<DeclarationId>],
+  bindings: &mut List<Binding>,
+  module: &ModuleId,
+  span: Span,
+  depth: usize,
+) -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator | &mut Types {
+  if depth >= HEAD_BOUND_DEPTH { return () }
+  let mut progressed = true
+  while progressed {
+    progressed = false
+    let mut at = usize.ZERO
+    while at < providers.length {
+      if run solveBound(&mut resolver.*, &mut owner.*, &mut dependencies.*, boundOwner, &providers[at], &contracts[at],
+        variables, &mut bindings.*, module, span, depth) {
+        progressed = true
+      }
+      at = at + usize.ONE
+    }
+  }
+  return ()
+}
+
+// One bound of `solveBounds`; whether it added a binding.
+effect fn solveBound(
+  resolver: &mut Resolver,
+  owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut List<Dependency>,
+  boundOwner: &DeclarationId,
+  provider: &Shared<Type>,
+  contract: &Shared<Type>,
+  variables: &[Shared<DeclarationId>],
+  bindings: &mut List<Binding>,
+  module: &ModuleId,
+  span: Span,
+  depth: usize,
+) -> bool
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator | &mut Types {
+  let provided = run appliedThrough(provider, List<Binding>.asSlice(&bindings.*))
+  if run typeMentionsOwner(&provided, boundOwner) { return false }
+  let wanted = run appliedThrough(contract, List<Binding>.asSlice(&bindings.*))
+  if !run typeMentionsOwner(&wanted, boundOwner) { return false }
+  let contractModule = declaringModuleOrdinal(&resolver.*, &wanted)
+  if contractModule == usize.MAX { return false }
+  let contractSource = resolvedModule(&resolver.*, contractModule)
+  let contractOrdinal = match move run ordinalOfProvider(&mut resolver.*, &contractSource, &wanted) {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => { return false }
+  }
+  let providerApplication = run internApplication(&mut resolver.*, &provided)
+  let bucketKey = run internDeclaration(&mut resolver.*, Key {
+    family: Family.ConformanceHeads, module: contractModule, name: providerApplication,
+    declaration: contractOrdinal, member: usize.ZERO, external: false,
+  })
+  let bucket = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, bucketKey, span)
+  if let Option<Shared<Rejection>>.Some {..} = move Shared<Result<Answer, NoRejection>>.with<Option<Shared<Rejection>>>(
+    &bucket, answerCause) {
+    return false
+  }
+  // A nested head of the same declaration gets its own parameters at each depth.
+  let mut scope = run Bytes.copy(b"\0head-bound-")
+  let level = [usize.toU8(depth) + 'a']
+  run Bytes.append(&mut scope, &level)
+  let count = Shared<Result<Answer, NoRejection>>.with<usize>(&bucket, bucketCount)
+  let mut chosen = Option<List<Binding>>.none()
+  let mut chosenOwner = Option<DeclarationId>.none()
+  let mut at = usize.ZERO
+  while at < count {
+    let listed = Shared<Result<Answer, NoRejection>>.with<Option<Shared<ImplementationHead>>>(&bucket,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<ImplementationHead>> { return bucketAt(answer, at) })
+    at = at + usize.ONE
+    let head = match move listed {
+      Option<Shared<ImplementationHead>>.Some {value} => move value
+      Option<Shared<ImplementationHead>>.None => { continue }
+    }
+    let found = match move Shared<ImplementationHead>.with<Option<HeadTerms>>(&head, headTerms) {
+      Option<HeadTerms>.Some {value} => move value
+      Option<HeadTerms>.None => { continue }
+    }
+    let headOwner = DeclarationId.copyShared(&found.declaration)
+    let fresh = run DeclarationId.inference(&headOwner, Bytes.asSlice(&scope))
+    let headProvider = run Type.renameParameters(&found.provider, &headOwner, &fresh)
+    let headContract = run Type.renameParameters(&found.contract, &headOwner, &fresh)
+    let mut opened = List<Shared<DeclarationId>>.make()
+    let mut variableAt = usize.ZERO
+    while variableAt < variables.length {
+      run List<Shared<DeclarationId>>.append(&mut opened, Shared<DeclarationId>.clone(&variables[variableAt]))
+      variableAt = variableAt + usize.ONE
+    }
+    run List<Shared<DeclarationId>>.append(&mut opened, run Shared<DeclarationId>.make(DeclarationId.copy(&fresh)))
+    let open = List<Shared<DeclarationId>>.asSlice(&opened)
+    let mut trial = run copyBindings(List<Binding>.asSlice(&bindings.*))
+    let providerMet = run Type.unify(&headProvider, &provided, open, Comparison.Exact, &mut trial)
+    if !exactHeadMatched(&providerMet) { continue }
+    let mut wantedNow = run appliedThrough(&wanted, List<Binding>.asSlice(&trial))
+    let mut offeredNow = run appliedThrough(&headContract, List<Binding>.asSlice(&trial))
+    let mut met = run Type.unify(&wantedNow, &offeredNow, open, Comparison.Exact, &mut trial)
+    if let Unification.Distinct = &met { continue }
+    if exactHeadUndetermined(&met) {
+      let decided = run unifyDecidedArguments(&wantedNow, &offeredNow, open, &mut trial)
+      if let Unification.Distinct = &decided { continue }
+    }
+    // The met head's own parameters may in turn be fixed only by its bounds.
+    let mut innerProviders = List<Shared<Type>>.make()
+    let mut innerContracts = List<Shared<Type>>.make()
+    run appendHeadConformances(&head, &Option<DeclarationId>.some(DeclarationId.copy(&fresh)), &mut innerProviders,
+      &mut innerContracts)
+    run solveBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &fresh,
+      List<Shared<Type>>.asSlice(&innerProviders), List<Shared<Type>>.asSlice(&innerContracts), open, &mut trial, module,
+      span, depth + usize.ONE)
+    if exactHeadUndetermined(&met) {
+      wantedNow = run appliedThrough(&wanted, List<Binding>.asSlice(&trial))
+      offeredNow = run appliedThrough(&headContract, List<Binding>.asSlice(&trial))
+      met = run Type.unify(&wantedNow, &offeredNow, open, Comparison.Exact, &mut trial)
+    }
+    if !exactHeadMatched(&met) { continue }
+    if let Option<List<Binding>>.Some {..} = &chosen { return false }
+    chosen = Option<List<Binding>>.some(move trial)
+    chosenOwner = Option<DeclarationId>.some(move fresh)
+  }
+  let metOwner = match move chosenOwner {
+    Option<DeclarationId>.Some {value} => move value
+    Option<DeclarationId>.None => { return false }
+  }
+  if let Option<List<Binding>>.Some {value} = move chosen {
+    // A solution that leaves an outer parameter naming the met head's own open parameter fixes
+    // nothing the caller can use.
+    // The outer bindings are kept resolved and the met head's own are dropped, so no binding the
+    // caller sees names a parameter it does not open, as `OutA` of a nested `Both` would.
+    let solved = List<Binding>.asSlice(&value)
+    let mut adopted = List<Binding>.make()
+    let mut at = usize.ZERO
+    while at < solved.length {
+      if sharedDeclarationListed(variables, &solved[at].declaration) {
+        let mut resolved = Argument.copy(&solved[at].value)
+        let mut pass = usize.ZERO
+        while pass < solved.length {
+          resolved = run Argument.applyBindings(&resolved, solved, true)
+          pass = pass + usize.ONE
+        }
+        if run argumentMentionsOwner(&resolved, &metOwner) { return false }
+        run List<Binding>.append(&mut adopted, Binding {
+          declaration: Shared<DeclarationId>.clone(&solved[at].declaration), ordinal: solved[at].ordinal, value: move resolved,
+        })
+      }
+      at = at + usize.ONE
+    }
+    let before = List<Binding>.length(&bindings.*)
+    bindings.* = move adopted
+    return List<Binding>.length(&bindings.*) > before
+  }
+  return false
+}
+
+// Whether an operand is a local or a field or referent path of one, borrowed or not.
+effect fn placeSyntax(source: &SourceIndex, cursor: &AuthoredCursor, operand: HirId) -> bool
+! RevisionMismatch {
+  return match run bodyNode(source, cursor, operand) {
+    Node.IdentifierExpression {..} => true
+    Node.MemberExpression {..} => true
+    Node.FieldExpression {subject, ..} => run placeSyntax(source, cursor, subject)
+    Node.ReferentExpression {subject} => run placeSyntax(source, cursor, subject)
+    Node.BorrowExpression {operand: borrowed, ..} => run placeSyntax(source, cursor, borrowed)
+    _ => false
+  }
+}
+
+fn sharedDeclarationListed(listed: &[Shared<DeclarationId>], declaration: &Shared<DeclarationId>) -> bool {
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if sameDeclarationShared(&listed[at], declaration) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Unifies the type arguments of two applications of one nominal declaration one at a time,
+// keeping each that unifies: the decided parts of a comparison whose whole is undetermined, as
+// `In` and `Pair<A, B>` in `Step<In, Pair<A, B> ? R | Q>` against `Step<i32, Pair<u64, u64> ? never>`.
+// Distinct when some argument is.
+effect fn unifyDecidedArguments(left: &Shared<Type>, right: &Shared<Type>, variables: &[Shared<DeclarationId>],
+  bindings: &mut List<Binding>) -> Unification
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let count = Shared<Type>.with<usize>(left, nominalApplicationArity)
+  if count == usize.MAX || count != Shared<Type>.with<usize>(right, nominalApplicationArity) {
+    return Unification.Undetermined {at: Shared<Type>.clone(left)}
+  }
+  let mut at = usize.ZERO
+  while at < count {
+    let first = Shared<Type>.with<Option<Shared<Type>>>(left, fn(value: &Type) -> Option<Shared<Type>> {
+      return nominalTypeArgumentAt(value, at) })
+    let second = Shared<Type>.with<Option<Shared<Type>>>(right, fn(value: &Type) -> Option<Shared<Type>> {
+      return nominalTypeArgumentAt(value, at) })
+    if let Option<Shared<Type>>.Some {value: leftArgument} = &first {
+      if let Option<Shared<Type>>.Some {value: rightArgument} = &second {
+        let one = run Type.unify(&leftArgument, &rightArgument, variables, Comparison.Exact, &mut bindings.*)
+        if let Unification.Distinct = &one { return Unification.Distinct }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return Unification.Unified
+}
+
+// The argument count of a nominal application; `usize.MAX` for any other type.
+fn nominalApplicationArity(value: &Type) -> usize {
+  return match &value.* {
+    Type.Nominal {arguments, ..} => List<Argument>.length(&arguments)
+    _ => usize.MAX
+  }
+}
+
+// The nominal application's argument at `at` when it is a type.
+fn nominalTypeArgumentAt(value: &Type, at: usize) -> Option<Shared<Type>> {
+  if let Type.Nominal {arguments, ..} = &value.* {
+    let listed = List<Argument>.asSlice(&arguments)
+    if at < listed.length {
+      if let Argument.Type {value: argument} = &listed[at] { return Option<Shared<Type>>.some(Shared<Type>.clone(&argument)) }
+    }
+  }
+  return Option<Shared<Type>>.none()
+}
+
+// Matches a conformance head whose contract the joint comparison left undetermined: the provider
+// first, then the head parameters its bounds fix (`solveHeadBounds`), then the contract, so
+// `impl<?R, ?Q, A: Step<R>, B: Step<Q>> Step<R | Q> for Both<A, B>` meets `Step<never>` for
+// `Both<Leaf, Leaf>`.
+effect fn matchHeadThroughBounds(
+  resolver: &mut Resolver,
+  owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut List<Dependency>,
+  head: &Shared<ImplementationHead>,
+  provider: &Shared<Type>,
+  contract: &Shared<Type>,
+  variables: &[Shared<DeclarationId>],
+  bindings: &mut List<Binding>,
+  module: &ModuleId,
+  span: Span,
+) -> Unification
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator | &mut Types {
+  let found = match move Shared<ImplementationHead>.with<Option<HeadTerms>>(head, headTerms) {
+    Option<HeadTerms>.Some {value} => move value
+    Option<HeadTerms>.None => { return Unification.Distinct }
+  }
+  let matched = run Type.unify(&found.provider, provider, variables, Comparison.Exact, &mut bindings.*)
+  if !exactHeadMatched(&matched) { return move matched }
+  let admitted = run admitRepresentations(head, variables, &mut bindings.*)
+  if !exactHeadMatched(&admitted) { return move admitted }
+  // The contract's decided parts, as `In` in `Step<In, Pair<A, B> ? R | Q>`, fix what they can
+  // before the bounds are solved.
+  let early = run unifyDecidedArguments(&found.contract, contract, variables, &mut bindings.*)
+  if let Unification.Distinct = &early { return move early }
+  run solveHeadBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, head, variables, &mut bindings.*, module, span,
+    usize.ZERO)
+  let solved = run appliedThrough(&found.contract, List<Binding>.asSlice(&bindings.*))
+  return run Type.unify(&solved, contract, variables, Comparison.Exact, &mut bindings.*)
+}
+
+// Matches a conformance head with a proof goal (`matchConformanceHead`); a head whose contract
+// that comparison leaves undetermined is matched again with the parameters its bounds fix
+// (`matchHeadThroughBounds`).
+effect fn matchGoalHead(
+  resolver: &mut Resolver,
+  owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut List<Dependency>,
+  head: &Shared<ImplementationHead>,
+  goal: &ConformanceGoal,
+  bindings: &mut List<Binding>,
+  module: &ModuleId,
+  span: Span,
+) -> Unification
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator | &mut Types {
+  let matched = run matchConformanceHead(head, goal, &mut bindings.*)
+  if !exactHeadUndetermined(&matched) { return move matched }
+  let mut variables = List<Shared<DeclarationId>>.make()
+  run List<Shared<DeclarationId>>.append(&mut variables, Shared<ImplementationHead>.with<Shared<DeclarationId>>(head,
+    fn(value: &ImplementationHead) -> Shared<DeclarationId> { return Shared<DeclarationId>.clone(&value.declaration) }))
+  let mut solved = List<Binding>.make()
+  let retried = run matchHeadThroughBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, head, &goal.provider,
+    &goal.contract, List<Shared<DeclarationId>>.asSlice(&variables), &mut solved, module, span)
+  if !exactHeadMatched(&retried) { return move matched }
+  bindings.* = move solved
+  return move retried
 }
 
 effect fn matchConformanceHead(
@@ -81603,7 +82386,8 @@ effect fn proveGoal(
   at = usize.ZERO
   while at < coherent.length {
     let mut bindings = List<Binding>.make()
-    let answer = run matchConformanceHead(&coherent[at], goal, &mut bindings)
+    let answer = run matchGoalHead(&mut resolver.*, &mut owner.*, &mut dependencies.*, &coherent[at], goal, &mut bindings,
+      siteModule, siteSpan)
     if exactHeadMatched(&answer) {
       if let Option<Shared<ImplementationHead>>.Some {value: _} = &selected {
         return Option<Shared<Rejection>>.some(
@@ -87971,6 +88755,8 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       impliedWalks: List<ImpliedWalk>.make(),
       impliedLookup: InternIndex.make(),
       impliedRevision: 0,
+      templateBinderSets: List<TemplateBinders>.make(),
+      templateBinderLookup: InternIndex.make(),
       runWalks: List<ImpliedWalk>.make(),
       pathFrames: usize.ZERO,
       pathReads: usize.ZERO,
@@ -89734,8 +90520,12 @@ impl Semantic {
       run InternIndex.record(&mut lookup, ModuleId.hash(&listed))
       run List<ModuleId>.append(&mut others, move listed)
     }
+    // A walk of statics only, as the runtime's from its roots, is another check of the same
+    // module than its whole walk, so it keeps a unit of its own: sharing one, each would find the
+    // other's memo and record, and replay or walk again on every check.
     let mut member = usize.ZERO
-    if List<ModuleId>.length(&others) > usize.ZERO { member = u64.toUsize(u64.shiftRight(digest, 1)) }
+    if staticsOnly { digest = Hash.mix(&Hash.seed(digest), 1) }
+    if List<ModuleId>.length(&others) > usize.ZERO || staticsOnly { member = u64.toUsize(u64.shiftRight(digest, 1)) }
     let word = run internKey(&mut self.resolver, Key {family: Family.ModuleCheck, module: module, name: usize.ONE,
       declaration: usize.MAX, member: member, external: false})
     let unit = u64.toUsize(word.value)

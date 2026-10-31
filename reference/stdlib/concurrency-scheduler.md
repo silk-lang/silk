@@ -29,7 +29,7 @@ the complete pending value and returns no Fiber.
 
 Import as `Scheduler` with `import silk.concurrency.scheduler { Scheduler }`.
 
-Public declarations: 15.
+Public declarations: 17.
 
 <a id="TaskId"></a>
 
@@ -240,6 +240,32 @@ pub struct NoSubmission
 
 A submission slot contains no prepared child.
 
+<a id="PendingCancel"></a>
+
+## `PendingCancel`
+
+```silk
+pub struct PendingCancel
+```
+
+A submission slot asks the Scheduler driver to cancel one task.
+
+### Details
+
+The driver cancels the target and its unfinished descendants, then wakes the requesting task. A
+target that already finished, or that is the requesting task or one of its ancestors, is left
+as it is.
+
+<a id="PendingCancel.target"></a>
+
+### Field `target`
+
+```silk
+pub target: TaskId
+```
+
+The task to cancel.
+
 <a id="PendingSubmission"></a>
 
 ## `PendingSubmission`
@@ -275,7 +301,7 @@ The child-task payload paired with one parent mailbox request.
 ### Field `phase`
 
 ```silk
-pub phase: NoSubmission | PendingSubmission
+pub phase: NoSubmission | PendingSubmission | PendingCancel
 ```
 
 The currently installed child submission.
@@ -466,6 +492,111 @@ Prepares one lazy child task and returns its affine publication value.
 The child can require only its owned Scheduler and MonotonicClock providers. Preparation
 reserves all child endpoints and one task identity before it returns. It does not activate
 the child.
+
+<a id="Scheduler.requestCancel"></a>
+
+### Operation `requestCancel`
+
+```silk
+effect fn requestCancel(target: TaskId) -> PendingCancellation ? &mut Scheduler
+```
+
+Prepares a request to cancel one task, for the calling task to submit.
+
+#### Details
+
+The returned value carries the calling task's own mailbox and submission slot.
+`Fiber.interrupt` submits it after the exclusive service dispatch ends, and parks until the
+driver has cancelled the target. Cancelling drops the target's parked Execution, which runs its
+cancel exits, and publishes `Cancelled` to the target's Fiber.
+
+<a id="Scheduler.armDeadline"></a>
+
+### Operation `armDeadline`
+
+```silk
+effect fn armDeadline(deadline: Instant) -> usize ? &mut Scheduler
+```
+
+Arms a deadline for the calling task and returns its token, which is never 0.
+
+#### Details
+
+If the deadline passes while the task is still parked inside the interruptible boundary that
+`Intrinsic.interruptibleEffect` opened for the token, the provider calls
+`Execution.interrupt` with the token, so the boundary resumes with `false`. The provider
+removes a deadline once it fires. `Effect.timeoutAt` arms one deadline per boundary.
+
+<a id="Scheduler.armDeadlineAfter"></a>
+
+### Operation `armDeadlineAfter`
+
+```silk
+effect fn armDeadlineAfter(howLong: u64) -> usize ? &mut Scheduler
+```
+
+Arms a deadline `howLong` nanoseconds after the provider next reads its clock, and returns its
+token, which is never 0.
+
+#### Details
+
+It behaves as [`armDeadline`](#Scheduler.armDeadline), but the provider measures the duration itself, so a stale
+clock reading in the calling task does not shorten it. `Effect.timeout` uses it.
+
+<a id="Scheduler.disarmDeadline"></a>
+
+### Operation `disarmDeadline`
+
+```silk
+effect fn disarmDeadline(token: usize) -> () ? &mut Scheduler
+```
+
+Disarms a deadline the calling task armed. A deadline that already fired is ignored.
+
+<a id="PendingCancellation"></a>
+
+## `PendingCancellation`
+
+```silk
+pub struct PendingCancellation
+```
+
+A cancellation request that a Scheduler provider prepared for the calling task.
+
+### Details
+
+`Fiber.interrupt` moves the request into `parentSubmission`, installs a Wake in `parentMailbox`,
+and parks until the driver has processed it.
+
+<a id="PendingCancellation.parentMailbox"></a>
+
+### Field `parentMailbox`
+
+```silk
+pub parentMailbox: Shared<TaskMailbox>
+```
+
+The mailbox owned by the requesting task.
+
+<a id="PendingCancellation.parentSubmission"></a>
+
+### Field `parentSubmission`
+
+```silk
+pub parentSubmission: Shared<SubmissionSlot>
+```
+
+The submission slot owned by the requesting task.
+
+<a id="PendingCancellation.target"></a>
+
+### Field `target`
+
+```silk
+pub target: TaskId
+```
+
+The task to cancel.
 
 <a id="Scheduler.impl"></a>
 

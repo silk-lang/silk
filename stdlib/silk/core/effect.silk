@@ -10,8 +10,9 @@
 //!
 //! # Details
 //! Combinators are lazy. When code passes an effect to a combinator, the effect does not run. Most
-//! combinators take a `once Effect`, so that value runs at most one time. [`retry`] takes a
-//! reusable effect because it can run the effect more than one time.
+//! combinators take a `once Effect`, so that value runs at most one time. [`retry`] and
+//! [`repeat`] take a reusable effect because they run it more than one time, as a
+//! `silk.core.schedule.Schedule` says.
 //!
 //! Sequential combinators stop at the first typed failure, unless a recovery operation handles it.
 //! The signatures show how the channels combine. Two steps usually give the unions `! E | F` and
@@ -663,22 +664,209 @@ impl Effect {
     return run onFalse()
   }
 
-  /// Runs `self` and, after each typed failure, runs it again, at most `retries` more times.
+  /// Runs `self` and, after each typed failure, waits as `schedule` says and runs it again.
   ///
   /// # Details
   ///
-  /// A success stops the attempts. If each attempt fails, the last failure propagates. Earlier
-  /// failure values are dropped. A `retries` of 0 gives one attempt. `self` must be a reusable
-  /// effect (`mut Effect`).
+  /// A success stops the attempts. When `schedule` stops, the last failure propagates. Earlier
+  /// failure values are dropped. `Schedule.recurs(2)` makes at most three attempts. `self` must be
+  /// a reusable effect (`mut Effect`).
+  ///
+  /// The waits use `MonotonicClock`, so under a task scheduler they park only the current task.
+  /// `InsecureRandom` supplies the jitter of a jittered schedule, and is required even when the
+  /// schedule has none.
   ///
   /// # Gotchas
   ///
-  /// There is no delay between attempts. A trap stops the attempts at once and is not retried.
+  /// A trap stops the attempts at once and is not retried.
+  ///
+  /// # Examples
+  ///
+  /// ## Retry at once, at most twice
+  /// ```silk
+  /// import silk.core.effect { Effect }
+  /// import silk.core.schedule { Schedule }
+  /// import silk.system.insecure_random { InsecureRandom }
+  /// import silk.system.monotonic_clock { MonotonicClock }
+  /// import silk.system.monotonic_clock_native { OsMonotonicClock }
+  ///
+  /// struct Busy {}
+  ///
+  /// struct Attempts {
+  ///   count: i32,
+  /// }
+  ///
+  /// effect fn attempt(attempts: &mut Attempts) -> i32 ! Busy {
+  ///   attempts.count = attempts.count + 1
+  ///   if attempts.count < 3 { fail Busy {} }
+  ///   return attempts.count
+  /// }
+  ///
+  /// effect fn busy(error: Busy) -> i32 {
+  ///   drop error
+  ///   return 0
+  /// }
+  ///
+  /// pub fn main() -> i32 {
+  ///   let mut attempts = Attempts { count: 0 }
+  ///   let mut random = InsecureRandom.seeded(1)
+  ///   let mut clock = OsMonotonicClock.make()
+  ///   let twice = Schedule.recurs(2)
+  ///   let value = run Effect.retry(attempt(&mut attempts), &twice)
+  ///     |> Effect.catchAll(busy)
+  ///     |> Effect.provideMut<InsecureRandom>(&mut random)
+  ///     |> Effect.provideMut<MonotonicClock>(&mut clock)
+  ///   if value != 3 {
+  ///     return 1
+  ///   }
+  ///   return 0
+  /// }
+  /// ```
   pub effect fn retry<'env, A, E, ?R>(
     mut self: mut Effect<'env; A ! E ? R>,
-    retries: usize
-  ) -> A ! E ? R {
-    return run retryLoop(self, retries)
+    schedule: &Schedule
+  ) -> A ! E ? R | &mut MonotonicClock | &mut InsecureRandom {
+    let begun = run MonotonicClock.now()
+    let mut state = schedule.start(move begun)
+    while true {
+      let completed = run Effect.result(self)
+      match move completed {
+        Result<A, E>.Success { value } => {
+          return move value
+        }
+        Result<A, E>.Failure { error } => {
+          let now = run MonotonicClock.now()
+          match run schedule.next(&mut state, &now) {
+            Option<u64>.None => {
+              fail move error
+            }
+            Option<u64>.Some { value: delay } => {
+              drop move error
+              run MonotonicClock.waitFor(delay)
+            }
+          }
+        }
+      }
+    }
+    return Intrinsic.trap("Effect.retry: unreachable")
+  }
+
+  /// Runs `self` and, after each typed failure that `retryable` accepts, waits as `schedule` says
+  /// and runs it again.
+  ///
+  /// # Details
+  ///
+  /// A success stops the attempts. A failure that `retryable` rejects propagates at once, before
+  /// `schedule` is asked. When `schedule` stops, the last failure propagates. Earlier failure
+  /// values are dropped. `self` must be a reusable effect (`mut Effect`).
+  ///
+  /// The waits use `MonotonicClock`, so under a task scheduler they park only the current task.
+  /// `InsecureRandom` supplies the jitter of a jittered schedule, and is required even when the
+  /// schedule has none.
+  ///
+  /// # Gotchas
+  ///
+  /// A trap stops the attempts at once and is not retried.
+  pub effect fn retryWhile<'env, A, E, ?R>(
+    mut self: mut Effect<'env; A ! E ? R>,
+    schedule: &Schedule,
+    retryable: fn<'env>(&E) -> bool
+  ) -> A ! E ? R | &mut MonotonicClock | &mut InsecureRandom {
+    let begun = run MonotonicClock.now()
+    let mut state = schedule.start(move begun)
+    while true {
+      let completed = run Effect.result(self)
+      match move completed {
+        Result<A, E>.Success { value } => {
+          return move value
+        }
+        Result<A, E>.Failure { error } => {
+          if !retryable(&error) { fail move error }
+          let now = run MonotonicClock.now()
+          match run schedule.next(&mut state, &now) {
+            Option<u64>.None => {
+              fail move error
+            }
+            Option<u64>.Some { value: delay } => {
+              drop move error
+              run MonotonicClock.waitFor(delay)
+            }
+          }
+        }
+      }
+    }
+    return Intrinsic.trap("Effect.retryWhile: unreachable")
+  }
+
+  /// Runs `self`, then runs it again after each delay of `schedule`, and returns the last success.
+  ///
+  /// # When to use
+  ///
+  /// Use it for work on a timer, such as a poll, a heartbeat, or a note on each beat. Use
+  /// `Schedule.fixed` for a steady beat.
+  ///
+  /// # Details
+  ///
+  /// The first run happens at once. `Schedule.recurs(3)` runs `self` four times. A typed failure
+  /// stops the repeats and propagates. `self` must be a reusable effect (`mut Effect`).
+  ///
+  /// The waits use `MonotonicClock`, so under a task scheduler they park only the current task.
+  /// `InsecureRandom` supplies the jitter of a jittered schedule, and is required even when the
+  /// schedule has none.
+  ///
+  /// # Examples
+  ///
+  /// ## Count four runs
+  /// ```silk
+  /// import silk.core.effect { Effect }
+  /// import silk.core.schedule { Schedule }
+  /// import silk.system.insecure_random { InsecureRandom }
+  /// import silk.system.monotonic_clock { MonotonicClock }
+  /// import silk.system.monotonic_clock_native { OsMonotonicClock }
+  ///
+  /// struct Counter {
+  ///   count: i32,
+  /// }
+  ///
+  /// effect fn tick(counter: &mut Counter) -> i32 {
+  ///   counter.count = counter.count + 1
+  ///   return counter.count
+  /// }
+  ///
+  /// pub fn main() -> i32 {
+  ///   let mut counter = Counter { count: 0 }
+  ///   let mut random = InsecureRandom.seeded(1)
+  ///   let mut clock = OsMonotonicClock.make()
+  ///   let thrice = Schedule.recurs(3)
+  ///   let last = run Effect.repeat(tick(&mut counter), &thrice)
+  ///     |> Effect.provideMut<InsecureRandom>(&mut random)
+  ///     |> Effect.provideMut<MonotonicClock>(&mut clock)
+  ///   if last != 4 {
+  ///     return 1
+  ///   }
+  ///   return 0
+  /// }
+  /// ```
+  pub effect fn repeat<'env, A, E, ?R>(
+    mut self: mut Effect<'env; A ! E ? R>,
+    schedule: &Schedule
+  ) -> A ! E ? R | &mut MonotonicClock | &mut InsecureRandom {
+    let begun = run MonotonicClock.now()
+    let mut state = schedule.start(move begun)
+    let mut last = run self
+    while true {
+      let now = run MonotonicClock.now()
+      match run schedule.next(&mut state, &now) {
+        Option<u64>.None => {
+          return move last
+        }
+        Option<u64>.Some { value: delay } => {
+          run MonotonicClock.waitFor(delay)
+          last = run self
+        }
+      }
+    }
+    return Intrinsic.trap("Effect.repeat: unreachable")
   }
 
   /// Satisfies one shared requirement of `self` with a shared borrow of `provider`.
@@ -893,6 +1081,56 @@ impl Effect {
     return move value
   }
 
+  /// Runs `self`, and stops it with [`TimeoutError`] if it has not finished `howLong` nanoseconds
+  /// from now.
+  ///
+  /// # Details
+  ///
+  /// The Scheduler reads its clock when the task next yields to it, so a stale clock reading in
+  /// the task does not shorten the wait. See [`timeoutAt`] for how the effect stops.
+  ///
+  /// # Gotchas
+  ///
+  /// It needs a `Scheduler` provider, such as `LocalScheduler`. The effect stops only at a park,
+  /// and work before its first park is not counted. `ensuring` finalizers inside it do not run
+  /// when it stops.
+  pub effect fn timeout<'env, A, E, ?R>(
+    self: once Effect<'env; A ! E ? R>,
+    howLong: u64
+  ) -> A ! E | TimeoutError ? R | &mut Scheduler {
+    let token = run Scheduler.armDeadlineAfter(howLong)
+    return run runTimed<A, E, R>(move self, token)
+  }
+
+  /// Runs `self`, and stops it with [`TimeoutError`] if it has not finished by `deadline`.
+  ///
+  /// # When to use
+  ///
+  /// Use `timeoutAt` to bound several steps by one deadline. Use [`timeout`] for a duration.
+  ///
+  /// # Details
+  ///
+  /// `self` runs in the current task, with no new Fiber. If the deadline passes while the task is
+  /// parked inside `self`, such as in a clock wait or a Fiber join, the Scheduler interrupts the
+  /// task: each frame of `self` is abandoned from its park, innermost first. That runs `Drop`
+  /// hooks and non-parking finalizers (`ensuringNonParking`, `useReleaseNonParking`). Then this
+  /// call fails with `TimeoutError`. A success or typed failure of `self` before the deadline is
+  /// returned unchanged. Nested timeouts work; the one whose deadline passes first stops.
+  ///
+  /// # Gotchas
+  ///
+  /// It needs a `Scheduler` provider, such as `LocalScheduler`. The effect stops only at a park:
+  /// code between two parks always runs to its end, and an effect that never parks never stops.
+  /// `ensuring` finalizers inside it do not run when it stops. Children forked inside it keep
+  /// running; interrupt them, or let their parent finish.
+  pub effect fn timeoutAt<'env, A, E, ?R>(
+    self: once Effect<'env; A ! E ? R>,
+    deadline: Instant
+  ) -> A ! E | TimeoutError ? R | &mut Scheduler {
+    let token = run Scheduler.armDeadline(move deadline)
+    return run runTimed<A, E, R>(move self, token)
+  }
+
   /// Waits `howLong` nanoseconds on the timeline of the active `MonotonicClock` provider.
   ///
   /// # Details
@@ -921,6 +1159,58 @@ effect<'env> fn failCompleted<A, E: 'env, 'env>(error: E) -> Result<A, E> {
   return Result<A, E>.failResult(move error)
 }
 
+/// Raised by [`Effect.timeout`] and [`Effect.timeoutAt`] when the deadline passes first.
+pub struct TimeoutError {}
+
+impl Debug for TimeoutError {
+  /// Writes `TimeoutError`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return run Format.debugFields(self, "TimeoutError", &mut formatter)
+  }
+}
+
+// Runs `body` inside the interrupt boundary for the armed deadline `token`.
+effect fn runTimed<'env, A, E, ?R>(
+  body: once Effect<'env; A ! E ? R>,
+  token: usize
+) -> A ! E | TimeoutError ? R | &mut Scheduler {
+  let mut slot = TimedSlot<A> { phase: TimedPending {} }
+  // A typed failure disarms the deadline before it leaves the boundary. An interrupt finds the
+  // deadline already removed by the Scheduler that fired it.
+  let guarded = Intrinsic.catchFailure<E>(storeTimed<A, E, R>(&mut slot, move body), effect fn(error: E) -> never ! E ? &mut Scheduler {
+    run Scheduler.disarmDeadline(token)
+    fail move error
+  })
+  let completed = run Intrinsic.interruptibleEffect(token, move guarded)
+  let TimedSlot<A> { phase } = move slot
+  if !completed {
+    drop phase
+    fail TimeoutError {}
+  }
+  run Scheduler.disarmDeadline(token)
+  return match move phase {
+    TimedPending {} => missingTimedOutcome<A>()
+    TimedFinished<A> { value } => move value
+  }
+}
+
+struct TimedPending {}
+struct TimedFinished<A> { value: A }
+struct TimedSlot<A> { phase: TimedPending | TimedFinished<A> }
+
+effect<'env> fn storeTimed<'env, A: 'env, E: 'env, ?R>(
+  slot: &'env mut TimedSlot<A>,
+  body: once Effect<'env; A ! E ? R>
+) -> () ! E ? R {
+  let value = run body
+  slot.phase = TimedFinished<A> { value: move value }
+  return ()
+}
+
+fn missingTimedOutcome<A>() -> A {
+  return Intrinsic.trap("Effect.timeoutAt: the effect completed without an outcome")
+}
+
 /// The two success values that [`zip`] returns, in operand order.
 pub struct Pair<A, B> {
   /// The success value of the first effect.
@@ -939,23 +1229,6 @@ pub struct Triple<A, B, C> {
   pub third: C,
 }
 
-effect fn retryLoop<'env, A, E, ?R>(
-  mut self: mut Effect<'env; A ! E ? R>,
-  retries: usize
-) -> A ! E ? R {
-  if retries == 0 {
-    return run self
-  }
-  let completed = run Effect.result(self)
-  return match move completed {
-    Result<A, E>.Success { value: success } => move success
-    Result<A, E>.Failure { error } => {
-      drop move error
-      return run retryLoop<A, E, R>(self, retries - 1)
-    }
-  }
-}
-
 effect fn acquireProvider<'env, ?S, A, P, E, F, ?R, ?Q>(
   self: once Effect<'env; A ! E ? R>,
   acquire: &Effect<'env; P ! F ? Q>
@@ -967,3 +1240,10 @@ where &'env mut P provides S from R {
 }
 
 import silk.system.monotonic_clock { MonotonicClock }
+import silk.core.schedule { Schedule }
+import silk.core.option { Option }
+import silk.system.insecure_random { InsecureRandom }
+import silk.system.system_clock { Instant }
+import silk.concurrency.scheduler { Scheduler }
+import silk.text.format { Debug, Format, Formatter }
+import silk.io.writer { Writer, WriterError }

@@ -1,0 +1,212 @@
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect, TimeoutError }
+import silk.concurrency.execution { Execution, Wake }
+import silk.concurrency.fiber { Cancelled, Fiber, Outcome }
+import silk.concurrency.local_scheduler { LocalScheduler, StalledError }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.concurrency.scheduler { Scheduler, TaskIdExhaustedError }
+import silk.mem.shared { Shared }
+import silk.core.ownership { Drop }
+import silk.core.result { Result }
+import silk.num.u64
+
+// Counts the Drop hooks and finalizers that an interrupted timeout runs.
+struct Counter { count: i32 }
+struct Guard { counter: Shared<Counter> }
+fn bump(counter: &mut Counter) -> () { counter.count = counter.count + 1 return () }
+impl Drop for Guard {
+  fn drop(self: &mut Guard) -> () { Shared.withMut(&self.counter, bump) return () }
+}
+fn readCount(counter: &mut Counter) -> i32 { return counter.count }
+
+struct Problem { code: i32 }
+
+const HOUR: u64 = 3600000000000
+const MILLISECOND: u64 = 1000000
+
+// Parks for an hour unless it is interrupted.
+effect fn sleeper(counter: Shared<Counter>) -> i32 ? &mut MonotonicClock {
+  let guard = Guard { counter: move counter }
+  run Effect.sleep(HOUR)
+  drop guard
+  return 1
+}
+
+effect fn bumpEffect(counter: &Shared<Counter>) -> () {
+  Shared.withMut(counter, bump)
+  return ()
+}
+
+// Sleeps for an hour under a non-parking finalizer.
+effect fn finalized(counter: Shared<Counter>) -> i32 ? &mut MonotonicClock {
+  let marker = Shared<Counter>.clone(&counter)
+  let value = run Effect.ensuringNonParking(sleeper(move counter), bumpEffect(&marker))
+  drop marker
+  return value
+}
+
+effect fn quick(value: i32) -> i32 ? &mut MonotonicClock {
+  run Effect.sleep(MILLISECOND)
+  return value
+}
+
+effect fn failing(code: i32) -> i32 ! Problem {
+  fail Problem { code: code }
+}
+
+// Whether the Drop hooks and finalizers have not run exactly `expected` times.
+effect fn miscounted(counter: &Shared<Counter>, expected: i32) -> bool {
+  return Shared<Counter>.withMut<i32>(counter, readCount) != expected
+}
+
+// Whether `outcome` is a TimeoutError.
+effect fn timedOut<A>(outcome: Result<A, TimeoutError>) -> bool {
+  return match move outcome {
+    Result<A, TimeoutError>.Failure { error } => { drop error true }
+    Result<A, TimeoutError>.Success { value } => { drop value false }
+  }
+}
+
+// An inner timeout that fires first is caught inside the outer one, which then completes.
+effect fn innerFirst(counter: Shared<Counter>) -> i32 ? &mut Scheduler | &mut MonotonicClock {
+  let inner = run Effect.result(Effect.timeout(sleeper(move counter), MILLISECOND))
+  if run timedOut<i32>(move inner) { return 7 }
+  return 0
+}
+
+// Works for a while without a park, so the task's clock reading goes stale.
+effect fn spin(rounds: i32) -> u64 {
+  let mut round = 0
+  let mut state: u64 = 12345
+  while round < rounds {
+    state = u64.wrappingAdd(u64.wrappingMultiply(state, 6364136223846793005), 1442695040888963407)
+    state = u64.bitXor(state, u64.shiftRight(state, 13))
+    round = round + 1
+  }
+  return state
+}
+
+// Sleeps for an hour under a timeout of an hour.
+effect fn timedSleeper(counter: Shared<Counter>) -> i32 ! TimeoutError ? &mut Scheduler | &mut MonotonicClock {
+  return run Effect.timeout(sleeper(move counter), HOUR)
+}
+
+fn lose(wake: Wake) -> () {
+  drop wake
+  return ()
+}
+
+// Waits on a child that never finishes in time.
+effect fn joinSleeper(counter: Shared<Counter>) -> i32
+  ! OutOfMemoryError | TaskIdExhaustedError | Cancelled
+  ? &mut Scheduler | &mut MonotonicClock {
+  let child = run Fiber<i32, never>.forkChild(sleeper(move counter))
+  let joining = child.join()
+  let joined = run Effect.result(Effect.timeout(move joining, MILLISECOND))
+  return match move joined {
+    Result<i32, Cancelled | TimeoutError>.Failure { error } => match move error {
+      TimeoutError {} => 9
+      Cancelled {} => 0
+    }
+    Result<i32, Cancelled | TimeoutError>.Success { value: _ } => 0
+  }
+}
+
+effect fn root() -> i32
+  ! OutOfMemoryError | TaskIdExhaustedError | Cancelled | Problem | TimeoutError
+  ? &mut Scheduler | &mut MonotonicClock {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let counter = run Shared<Counter>.make(Counter { count: 0 })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+
+  // A parked effect stops at the deadline and its Drop hooks run.
+  let slept = run Effect.result(Effect.timeout(sleeper(Shared<Counter>.clone(&counter)), MILLISECOND))
+  if !run timedOut<i32>(move slept) { return 1 }
+  if run miscounted(&counter, 1) { return 2 }
+
+  // The task can wait on its clock again after an interrupted wait.
+  let again = run quick(3)
+  if again != 3 { return 3 }
+
+  // A non-parking finalizer runs when the effect stops.
+  let stopped = run Effect.result(Effect.timeout(finalized(Shared<Counter>.clone(&counter)), MILLISECOND))
+  if !run timedOut<i32>(move stopped) { return 4 }
+  if run miscounted(&counter, 3) { return 5 }
+
+  // An effect that finishes first keeps its value, and its typed failure is unchanged.
+  let fast = run Effect.timeout(quick(5), HOUR)
+  if fast != 5 { return 6 }
+  let raised = run Effect.result(Effect.timeout(failing(17), HOUR))
+  let code = match move raised {
+    Result<i32, Problem | TimeoutError>.Failure { error } => match move error {
+      Problem { code } => code
+      TimeoutError {} => -1
+    }
+    Result<i32, Problem | TimeoutError>.Success { value: _ } => -2
+  }
+  if code != 17 { return 7 }
+
+  // Nested: the inner deadline passes first and the outer effect completes.
+  let nested = run Effect.timeout(innerFirst(Shared<Counter>.clone(&counter)), HOUR)
+  if nested != 7 { return 8 }
+  if run miscounted(&counter, 4) { return 9 }
+
+  // Nested: the outer deadline passes first and abandons the inner timeout too.
+  let outer = run Effect.result(Effect.timeout(Effect.timeout(sleeper(Shared<Counter>.clone(&counter)), HOUR), MILLISECOND))
+  if !run timedOut<i32>(move outer) { return 10 }
+  if run miscounted(&counter, 5) { return 11 }
+
+  // A timeout inside a child stops its join; the grandchild is cancelled when the child finishes.
+  let child = run Fiber<i32, OutOfMemoryError | TaskIdExhaustedError | Cancelled>.forkChild(
+    joinSleeper(Shared<Counter>.clone(&counter)))
+  let childValue = run child.join()
+  if childValue != 9 { return 12 }
+  if run miscounted(&counter, 6) { return 13 }
+
+  // The duration starts when the Scheduler next reads its clock, not at the task's stale reading.
+  let state = run spin(500000000)
+  let fresh = run Effect.result(Effect.timeout(quick(u64.toI32(state % 2) + 20), 150 * MILLISECOND))
+  let freshValue = match move fresh {
+    Result<i32, TimeoutError>.Success { value } => value
+    Result<i32, TimeoutError>.Failure { error } => {
+      drop error
+      0
+    }
+  }
+  if freshValue != 20 && freshValue != 21 { return 14 }
+
+  // An interrupted child leaves no deadline behind: with nothing left to wake the root, the run
+  // stalls at once rather than an hour later.
+  let timed = run Fiber<i32, TimeoutError>.forkChild(timedSleeper(Shared<Counter>.clone(&counter)))
+  run Fiber.yieldNow()
+  let timedOutcome = run timed.interrupt()
+  drop timedOutcome
+  if run miscounted(&counter, 7) { return 15 }
+  run Execution.park(lose)
+  return 16
+}
+
+effect fn program() -> i32
+  ! OutOfMemoryError | TaskIdExhaustedError | Cancelled | Problem | TimeoutError | StalledError {
+  let mut clock = OsMonotonicClock.make()
+  let mut scheduler = LocalScheduler.make()
+  let ran = run Effect.result(scheduler.execute<i32, OutOfMemoryError | TaskIdExhaustedError | Cancelled | Problem | TimeoutError>(root())
+    |> Effect.provideMut<MonotonicClock>(&mut clock))
+  return match move ran {
+    Result<i32, OutOfMemoryError | TaskIdExhaustedError | Cancelled | Problem | TimeoutError | StalledError>.Success { value } => value
+    Result<i32, OutOfMemoryError | TaskIdExhaustedError | Cancelled | Problem | TimeoutError | StalledError>.Failure { error } => match move error {
+      StalledError {} => 42
+      _ => 100
+    }
+  }
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  return 100
+}
+
+pub fn main() -> i32 {
+  return run Effect.catchAll(program(), failed)
+}
