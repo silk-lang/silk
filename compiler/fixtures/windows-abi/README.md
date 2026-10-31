@@ -32,6 +32,9 @@ Reviewed on 2026-10-31, with immutable upstream revisions:
 - [Rust target specification at the same revision](https://github.com/rust-lang/rust/blob/2687a5023568f1e469910a54abf2e42d979d9ab4/compiler/rustc_target/src/spec/targets/x86_64_pc_windows_msvc.rs)
   confirms 64-bit pointers and the Windows data layout. Its additional baseline CPU features
   are Rust's platform policy; Silk retains its existing LLVM x86-64 baseline.
+- [Rust C integer-widening regression at the same revision](https://github.com/rust-lang/rust/blob/2687a5023568f1e469910a54abf2e42d979d9ab4/tests/ui/abi/cabi-int-widening.rs)
+  sends `-1` through an `i8` C argument and checks the widened result. It supports testing negative
+  values across the boundary, but does not by itself establish the LLVM extension attributes.
 - [Zig LLVM lowering, `738d2be9d6b6ef3ff3559130c05159ef53336224`](https://github.com/ziglang/zig/blob/738d2be9d6b6ef3ff3559130c05159ef53336224/src/codegen/llvm.zig)
   has separate Win64 return and parameter classification. Its `ccAbiPromoteInt` also selects
   narrow integer extensions on x86-64, another difference from the retained Clang fixture.
