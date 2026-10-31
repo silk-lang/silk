@@ -8,6 +8,7 @@
 //! 4. Stop a fiber and get its final outcome with [`PoolFiber.interrupt`].
 //! 5. Wait for the first of two fibers with [`PoolFiber.awaitEither`], or keep the first result
 //!    and cancel the other with [`PoolFiber.race`].
+//! 6. Bound a wait in a fiber with [`Pool.timeout`].
 //!
 //! # Details
 //! A pool fiber is a `Transferable` lazy effect, packaged with `Execution.makeTransferable`. Thus
@@ -24,6 +25,11 @@
 //! the outcome is `Cancelled`. A running fiber is cancelled the next time it parks, for example in
 //! [`Pool.yieldNow`] or [`PoolFiber.join`].
 //!
+//! Each fiber body gets its own [`PoolTask`] provider, which holds the fiber's deadlines.
+//! [`Pool.timeout`] arms one, as `Effect.timeout` does under a `Scheduler`. When it passes while
+//! the fiber is parked inside the timed effect, the pool interrupts the fiber there, and the call
+//! fails with `TimeoutError`. Idle workers sleep only until the earliest deadline.
+//!
 //! A [`Pool`] is a small `Transferable` handle that fibers capture to fork more fibers. The
 //! [`ThreadPool`] owns the threads. Dropping it stops and joins each worker, and cancels the
 //! fibers that are not finished.
@@ -33,6 +39,7 @@
 //! - [`Pool.fork`], [`PoolFiber.awaitEither`] and [`PoolFiber.race`] fail with `OutOfMemoryError`.
 //! - [`Pool.block`] and [`PoolFiber.join`] raise the typed failure of the fiber unchanged, or
 //!   `Cancelled`. [`PoolFiber.await`] returns them as data.
+//! - [`Pool.timeout`] fails with `TimeoutError` when its deadline passes first.
 //!
 //! # Gotchas
 //! - Fiber bodies, results and failures must be `Transferable` and `'static`.
@@ -40,7 +47,7 @@
 //!   call that blocks the native thread, such as [`Pool.block`], holds up a whole worker.
 //! - Call the waiting operations of [`PoolFiber`] and [`Pool.yieldNow`] only from inside a pool
 //!   fiber.
-//! - A fiber that never parks runs to the end, even after an interrupt.
+//! - A fiber that never parks runs to the end, even after an interrupt or a timeout.
 //! - The pool uses the system allocator for its own storage, not the `Allocator` of the caller.
 //!
 //! # Examples
@@ -81,6 +88,53 @@
 //!     return 1
 //!   }
 //!   return 0
+//! }
+//!
+//! effect fn failed<E>(error: E) -> i32 {
+//!   drop error
+//!   return 1
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   return run Effect.catchAll(program(), failed)
+//! }
+//! ```
+//!
+//! ## Stop a wait after one millisecond
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect, TimeoutError }
+//! import silk.core.result { Result }
+//! import silk.concurrency.execution { Execution, TransferableWake }
+//! import silk.concurrency.fiber { Cancelled }
+//! import silk.concurrency.thread_native { SpawnError }
+//! import silk.concurrency.thread_pool { Pool, PoolTask, ThreadPool }
+//!
+//! // Parks and drops its Wake, so nothing ever resumes it.
+//! effect fn forever() -> i32 {
+//!   run Execution.parkTransferable(fn(wake: TransferableWake) -> () {
+//!     drop wake
+//!     return ()
+//!   })
+//!   return 1
+//! }
+//!
+//! effect fn waitBriefly(pool: Pool) -> i32
+//!   ! OutOfMemoryError ? &mut PoolTask {
+//!   let stuck = run pool.fork(forever())
+//!   let waited = run Effect.result(Pool.timeout(stuck.join(), 1000000))
+//!   return match move waited {
+//!     Result<i32, Cancelled | TimeoutError>.Failure { error } => 0
+//!     Result<i32, Cancelled | TimeoutError>.Success { value } => 1
+//!   }
+//! }
+//!
+//! effect fn program() -> i32
+//!   ! OutOfMemoryError | SpawnError | Cancelled {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let threads = run ThreadPool.make(2) |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let pool = threads.pool()
+//!   return run pool.block(waitBriefly(pool.clone()))
 //! }
 //!
 //! effect fn failed<E>(error: E) -> i32 {
@@ -143,17 +197,21 @@
 //! @category Concurrency
 
 import silk.mem.allocator { Allocator, OutOfMemoryError }
-import silk.core.effect { Effect }
+import silk.core.effect { Effect, TimeoutError }
 import silk.concurrency.execution { Execution, TransferableExecution, TransferableWake }
 import silk.concurrency.fiber { Cancelled, Failure, Outcome, Success }
 import silk.collections.list { List }
 import silk.concurrency.thread_native { JoinHandle, NativeThread, SpawnError }
 import silk.core.option { Option }
-import silk.core.ownership { Drop }
+import silk.core.ownership { Copy, Drop }
 import silk.core.result { Result }
 import silk.concurrency.sync { Arc, Mutex, Parker, Unparker }
 import silk.concurrency.thread { Concurrent, Transferable }
+import silk.num.i64
+import silk.num.u64
 import silk.num.usize
+import silk.platform.native.clock { NativeClock }
+import silk.system.system_clock { SystemClock }
 import silk.concurrency.work_queue { Steal, Stealer, WorkDeque, Worker }
 
 // A fiber's completion. `Running` holds whoever waits for it: a parked fiber, a blocked thread, or
@@ -523,7 +581,8 @@ impl<A, E> Drop for CompletionGuard<A, E> {
 // The pool's fiber table. Slot indices are fiber ids; `next` links the ready list and the free
 // list. `ticket` changes whenever a slot's fiber goes away, so a late wake or interrupt for it
 // does nothing. `queued` is true from the ready list until a worker takes the fiber, so a fiber
-// is never on the ready list twice.
+// is never on the ready list twice. `interrupt` holds the token of a deadline that fired while a
+// worker drove the fiber, for `suspended` to deliver when it parks, or 0.
 struct Vacant {}
 struct Parked { execution: TransferableExecution<()> }
 struct Taken {}
@@ -533,13 +592,27 @@ struct Slot {
   ticket: usize,
   queued: bool,
   cancel: bool,
+  interrupt: usize,
 }
+
+// One deadline a fiber armed: `due` is a time of the OS monotonic clock in nanoseconds. Tokens grow
+// across the pool, so within one fiber an outer boundary has the smaller token.
+struct PoolDeadline {
+  due: u64,
+  id: usize,
+  ticket: usize,
+  token: usize,
+}
+
+impl Copy for PoolDeadline {}
 
 struct PoolState {
   slots: List<Slot>,
   head: usize,
   tail: usize,
   free: usize,
+  deadlines: List<PoolDeadline>,
+  nextToken: usize,
   // Which workers are asleep, or about to be, waiting for work.
   idle: List<bool>,
   shutdown: bool,
@@ -641,6 +714,169 @@ fn restore(slot: &mut Slot, task: Vacant | Parked | Taken, parked: bool) -> bool
   return parked
 }
 
+// The OS monotonic clock in nanoseconds, the timeline of the pool's deadlines.
+fn monotonicNow() -> u64 {
+  let now = run NativeClock.now(true)
+  let seconds = i64.toU64(SystemClock.seconds(&now))
+  let nanoseconds = i64.toU64(SystemClock.nanoseconds(&now))
+  return u64.saturatingAdd(u64.saturatingMultiply(seconds, 1000000000), nanoseconds)
+}
+
+// Removes the deadlines of the fiber in `id` with `ticket` whose token is above `above`.
+fn removeDeadlines(state: &mut PoolState, id: usize, ticket: usize, above: usize) -> () {
+  let mut at = List<PoolDeadline>.length(&state.deadlines)
+  while at > usize.ZERO {
+    at = at - 1
+    let entry = List<PoolDeadline>.get(&state.deadlines, at)
+    if entry.id == id && entry.ticket == ticket && entry.token > above {
+      let removed = List<PoolDeadline>.remove(&mut state.deadlines, at)
+    }
+  }
+  return ()
+}
+
+// Nanoseconds until the earliest deadline, or `u64.MAX` with none armed.
+fn untilEarliest(state: &PoolState) -> u64 {
+  let count = List<PoolDeadline>.length(&state.deadlines)
+  if count == usize.ZERO { return u64.MAX }
+  let mut earliest = u64.MAX
+  let mut at = usize.ZERO
+  while at < count {
+    let entry = List<PoolDeadline>.get(&state.deadlines, at)
+    if entry.due < earliest { earliest = entry.due }
+    at = at + 1
+  }
+  // A wait of 0 would not park, so a deadline due now waits 1 ns and fires on the next pass.
+  let wait = u64.saturatingSubtract(earliest, monotonicNow())
+  if wait == 0 { return 1 }
+  if wait == u64.MAX { return wait - 1 }
+  return wait
+}
+
+// Interrupts each fiber whose deadline has passed. The deadlines it armed later go too: their
+// boundaries are inside the one the interrupt resumes, so none of them can disarm.
+fn fireDeadlines(pool: &PoolShared, state: &mut PoolState) -> () {
+  if List<PoolDeadline>.length(&state.deadlines) == usize.ZERO { return () }
+  let now = monotonicNow()
+  let mut at = usize.ZERO
+  while at < List<PoolDeadline>.length(&state.deadlines) {
+    let entry = List<PoolDeadline>.get(&state.deadlines, at)
+    if entry.due > now {
+      at = at + 1
+    } else {
+      let fired = List<PoolDeadline>.remove(&mut state.deadlines, at)
+      removeDeadlines(&mut state.*, fired.id, fired.ticket, fired.token)
+      // Removing later entries can only shift the scan back, so restart it.
+      at = usize.ZERO
+      if current(&state.*, fired.id, fired.ticket) {
+        let slots = List<Slot>.asMutSlice(&mut state.slots)
+        if interruptSlot(&mut slots[fired.id], fired.token) {
+          wakeWorker(pool, link(&mut state.*, fired.id))
+        }
+      }
+    }
+  }
+  return ()
+}
+
+// Delivers a fired token to the fiber in `slot`. A parked fiber holds it at once; one a worker
+// drives keeps it in the slot until it parks. Returns whether the fiber must go on the ready list.
+fn interruptSlot(slot: &mut Slot, token: usize) -> bool {
+  let task = Intrinsic.replace(slot.task, Taken {})
+  return match move task {
+    Parked { execution } => interruptParked(&mut slot.*, move execution, token)
+    Vacant nothing => restore(&mut slot.*, Vacant {}, false)
+    Taken nothing => holdInterrupt(&mut slot.*, token)
+  }
+}
+
+fn interruptParked(slot: &mut Slot, execution: TransferableExecution<()>, token: usize) -> bool {
+  let mut held = move execution
+  let eligible = held.interruptHeld(token)
+  slot.task = Parked { execution: move held }
+  return eligible && !slot.queued
+}
+
+fn holdInterrupt(slot: &mut Slot, token: usize) -> bool {
+  if slot.interrupt == usize.ZERO || token < slot.interrupt { slot.interrupt = token }
+  return false
+}
+
+/// The deadlines of the calling pool fiber, which [`Pool.timeout`] arms.
+///
+/// # Details
+/// Every pool fiber gets its own provider, so its body can require `&mut PoolTask`. It works like
+/// the deadline operations of `Scheduler`: when a deadline passes while the fiber is parked inside
+/// the interruptible boundary that `Intrinsic.interruptibleEffect` opened for its token, the pool
+/// interrupts the fiber with that token. A deadline that passes while the fiber runs interrupts it
+/// at its next park inside the boundary. The pool measures time on the OS monotonic clock.
+pub service PoolTask {
+  /// Arms a deadline `howLong` nanoseconds from now for the calling fiber, and returns its token,
+  /// which is never 0. The pool removes a deadline once it fires.
+  effect fn armDeadlineAfter(howLong: u64) -> usize ? &mut PoolTask
+
+  /// Disarms a deadline the calling fiber armed. A deadline that already fired is ignored.
+  effect fn disarmDeadline(token: usize) -> () ? &mut PoolTask
+}
+
+struct PoolTaskClient {
+  pool: Arc<PoolShared>,
+  id: usize,
+  ticket: usize,
+}
+
+impl PoolTask for PoolTaskClient {
+  effect fn armDeadlineAfter(self: &mut Self, howLong: u64) -> usize {
+    return armFiberDeadline(self.pool.get(), self.id, self.ticket, howLong)
+  }
+  effect fn disarmDeadline(self: &mut Self, token: usize) -> () {
+    return disarmFiberDeadline(self.pool.get(), self.id, self.ticket, token)
+  }
+}
+
+fn armFiberDeadline(pool: &PoolShared, id: usize, ticket: usize, howLong: u64) -> usize {
+  let mut guard = pool.state.lock()
+  let state = guard.getMut()
+  let token = state.nextToken
+  // A stopped pool fires nothing, so it keeps no deadline.
+  if !current(&state.*, id, ticket) { return token }
+  if token == usize.MAX { return Intrinsic.trap("ThreadPool: the deadline tokens are exhausted") }
+  state.nextToken = token + 1
+  let entry = PoolDeadline { due: u64.saturatingAdd(monotonicNow(), howLong), id: id, ticket: ticket, token: token }
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let appended = List<PoolDeadline>.append(&mut state.deadlines, entry) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Effect.catchAll(move appended, deadlineStorageFailed)
+  // A sleeping worker may wait with no timeout, or a later one, so one of them wakes to sleep
+  // again until this deadline.
+  wakeWorker(pool, takeIdle(&mut state.*))
+  return token
+}
+
+effect fn deadlineStorageFailed(error: OutOfMemoryError) -> () {
+  return Intrinsic.trap("ThreadPool: storage for a deadline could not be allocated")
+}
+
+fn disarmFiberDeadline(pool: &PoolShared, id: usize, ticket: usize, token: usize) -> () {
+  let mut guard = pool.state.lock()
+  let state = guard.getMut()
+  let count = List<PoolDeadline>.length(&state.deadlines)
+  let mut at = usize.ZERO
+  while at < count {
+    if List<PoolDeadline>.get(&state.deadlines, at).token == token {
+      let removed = List<PoolDeadline>.remove(&mut state.deadlines, at)
+      break
+    }
+    at = at + 1
+  }
+  // A deadline that fired while the fiber ran, for the boundary it now leaves, must not reach a
+  // later park.
+  if current(&state.*, id, ticket) {
+    let slot = &mut List<Slot>.asMutSlice(&mut state.slots)[id]
+    if slot.interrupt == token { slot.interrupt = usize.ZERO }
+  }
+  return ()
+}
+
 // The readiness endpoint of every fiber: it runs on the waking thread and must not allocate, so
 // it only links the fiber's preallocated slot.
 struct TaskHook {
@@ -665,19 +901,23 @@ effect fn reserveSlot(pool: &PoolShared) -> Reserved ! OutOfMemoryError ? &mut A
     state.free = slot.next
     return Reserved { id: id, ticket: slot.ticket }
   }
-  run List<Slot>.append(&mut state.slots, Slot { task: Taken {}, next: none(), ticket: usize.ZERO, queued: false, cancel: false })
+  run List<Slot>.append(&mut state.slots, Slot { task: Taken {}, next: none(), ticket: usize.ZERO, queued: false, cancel: false, interrupt: usize.ZERO })
   return Reserved { id: List<Slot>.length(&state.slots) - 1, ticket: usize.ZERO }
 }
 
-// Puts a slot back on the free list. Its new ticket makes any late wake or interrupt inert.
+// Puts a slot back on the free list. Its new ticket makes any late wake or interrupt inert. The
+// deadlines the fiber left armed go with it, since no boundary is left to disarm them.
 fn release(state: &mut PoolState, id: usize) -> () {
   let slot = &mut List<Slot>.asMutSlice(&mut state.slots)[id]
+  let ticket = slot.ticket
   slot.task = Vacant {}
-  slot.ticket = slot.ticket + 1
+  slot.ticket = ticket + 1
   slot.queued = false
   slot.cancel = false
+  slot.interrupt = usize.ZERO
   slot.next = state.free
   state.free = id
+  removeDeadlines(&mut state.*, id, ticket, usize.ZERO)
   return ()
 }
 
@@ -704,20 +944,27 @@ fn fillSlot(pool: &PoolShared, id: usize, execution: TransferableExecution<()>) 
 effect<'static> fn runTask<
   A: 'static + Transferable,
   E: 'static + Transferable,
-  F: once Effect<'static; A ! E> + Intrinsic.Detached + Transferable
->(task: F, guard: CompletionGuard<A, E>) -> () {
-  let result = run Effect.result(move task)
+  F: once Effect<'static; A ! E ? &mut PoolTask> + Intrinsic.Detached + Transferable
+>(task: F, guard: CompletionGuard<A, E>, client: PoolTaskClient) -> () {
+  let mut provider = move client
+  let result = run Effect.result(provideTask<A, E>(move task, &mut provider))
   return match move result {
     Result<A, E>.Success { value } => complete<A, E>(guard.completion.get(), Success<A> { value: move value })
     Result<A, E>.Failure { error } => complete<A, E>(guard.completion.get(), Failure<E> { error: move error })
   }
 }
 
+// Gives the body the fiber's own `PoolTask`. A body that needs nothing arrives here widened.
+effect<'env> fn provideTask<'env, A, E>(task: once Effect<'static; A ! E ? &mut PoolTask>, client: &'env mut PoolTaskClient) -> A ! E {
+  let provided = Effect.provideMut<PoolTask>(move task, &mut client.*)
+  return run provided
+}
+
 effect<'env> fn launch<
   'env,
   A: 'static + Transferable,
   E: 'static + Transferable,
-  F: once Effect<'static; A ! E> + Intrinsic.Detached + Transferable
+  F: once Effect<'static; A ! E ? &mut PoolTask> + Intrinsic.Detached + Transferable
 >(pool: &Arc<PoolShared>, task: F) -> PoolFiber<A, E> ! OutOfMemoryError ? &mut Allocator {
   let waiting = Completion<A, E> { phase: Running { waiter: NoWaiter {} } }
   let locked = run Mutex<Completion<A, E>>.make(move waiting)
@@ -725,7 +972,8 @@ effect<'env> fn launch<
   let Reserved { id, ticket } = run reserveSlot(pool.get())
   let hook = TaskHook { pool: pool.clone(), id: id, ticket: ticket }
   let guard = CompletionGuard<A, E> { completion: completion.clone() }
-  let execution = run Execution.makeTransferable(runTask<A, E, F>(move task, move guard), move hook, ready)
+  let client = PoolTaskClient { pool: pool.clone(), id: id, ticket: ticket }
+  let execution = run Execution.makeTransferable(runTask<A, E, F>(move task, move guard, move client), move hook, ready)
   // An Initial execution may be driven directly, so the slot goes on the ready list as it is.
   fillSlot(pool.get(), id, move execution)
   return PoolFiber<A, E> { completion: move completion, pool: pool.clone(), id: id, ticket: ticket }
@@ -754,7 +1002,7 @@ impl Pool {
     'env,
     A: 'static + Transferable,
     E: 'static + Transferable,
-    F: once Effect<'static; A ! E> + Intrinsic.Detached + Transferable
+    F: once Effect<'static; A ! E ? &mut PoolTask> + Intrinsic.Detached + Transferable
   >(self: &Self, task: F) -> PoolFiber<A, E> ! OutOfMemoryError {
     let mut allocator = Allocator.systemAllocatorProvider()
     return run launch<A, E, F>(&self.shared, move task) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -772,7 +1020,7 @@ impl Pool {
     'env,
     A: 'static + Transferable,
     E: 'static + Transferable,
-    F: once Effect<'static; A ! E> + Intrinsic.Detached + Transferable
+    F: once Effect<'static; A ! E ? &mut PoolTask> + Intrinsic.Detached + Transferable
   >(self: &Self, task: F) -> A ! OutOfMemoryError | E | Cancelled {
     let fiber = run self.fork<A, E, F>(move task)
     let outcome = run awaitThread<A, E>(move fiber)
@@ -799,6 +1047,67 @@ impl Pool {
     })
     return ()
   }
+
+  /// Runs `body` in the calling fiber, and stops it with `TimeoutError` if it has not finished
+  /// `howLong` nanoseconds from now.
+  ///
+  /// # Details
+  /// It works as `Effect.timeout` does under a `Scheduler`. If the deadline passes while the fiber
+  /// is parked inside `body`, such as in a [`PoolFiber.join`] or [`Pool.yieldNow`], the pool
+  /// interrupts the fiber, and if it passes while the fiber runs, the fiber is interrupted at its
+  /// next park inside `body`. Each frame of `body` is abandoned from its park, innermost first, which
+  /// runs `Drop` hooks and non-parking finalizers. Then this call fails with `TimeoutError`. A
+  /// success or typed failure of `body` before the deadline is returned unchanged. Nested timeouts
+  /// work; the one whose deadline passes first stops. The pool measures time on the OS monotonic
+  /// clock, from this call.
+  ///
+  /// # Gotchas
+  /// - Only a pool fiber has the `PoolTask` provider it needs.
+  /// - The effect stops only at a park: code between two parks always runs to its end, and an
+  ///   effect that never parks never stops. `ensuring` finalizers inside it do not run when it
+  ///   stops.
+  /// - Fibers forked inside it keep running; interrupt them, or wait for them.
+  pub effect fn timeout<'env, A, E, ?R>(
+    body: once Effect<'env; A ! E ? R>,
+    howLong: u64
+  ) -> A ! E | TimeoutError ? R | &mut PoolTask {
+    let token = run PoolTask.armDeadlineAfter(howLong)
+    let mut slot = TimedSlot<A> { phase: TimedPending {} }
+    // A typed failure disarms the deadline before it leaves the boundary. An interrupt finds the
+    // deadline already removed by the worker that fired it.
+    let guarded = Intrinsic.catchFailure<E>(storeTimed<A, E, R>(&mut slot, move body), effect fn(error: E) -> never ! E ? &mut PoolTask {
+      run PoolTask.disarmDeadline(token)
+      fail move error
+    })
+    let completed = run Intrinsic.interruptibleEffect(token, move guarded)
+    let TimedSlot<A> { phase } = move slot
+    if !completed {
+      drop phase
+      fail TimeoutError {}
+    }
+    run PoolTask.disarmDeadline(token)
+    return match move phase {
+      TimedPending {} => missingTimedOutcome<A>()
+      TimedFinished<A> { value } => move value
+    }
+  }
+}
+
+struct TimedPending {}
+struct TimedFinished<A> { value: A }
+struct TimedSlot<A> { phase: TimedPending | TimedFinished<A> }
+
+effect<'env> fn storeTimed<'env, A: 'env, E: 'env, ?R>(
+  slot: &'env mut TimedSlot<A>,
+  body: once Effect<'env; A ! E ? R>
+) -> () ! E ? R {
+  let value = run body
+  slot.phase = TimedFinished<A> { value: move value }
+  return ()
+}
+
+fn missingTimedOutcome<A>() -> A {
+  return Intrinsic.trap("Pool.timeout: the effect completed without an outcome")
 }
 
 // Driving one fiber. The slot is `Taken` while a worker drives it; a parked fiber goes back to
@@ -825,7 +1134,9 @@ fn takeExecution(pool: &PoolShared, id: usize) -> Drive | Cancel {
     Taken nothing => unreachable<TransferableExecution<()>>()
   }
   if !slot.cancel { return Drive { execution: move execution } }
-  slot.ticket = slot.ticket + 1
+  let ticket = slot.ticket
+  slot.ticket = ticket + 1
+  removeDeadlines(&mut state.*, id, ticket, usize.ZERO)
   return Cancel { execution: move execution }
 }
 
@@ -837,14 +1148,22 @@ fn finished(owner: SlotOwner, result: ()) -> () {
 }
 
 // Stores the parked fiber. One marked for cancellation goes straight on the ready list, unless a
-// latched wake is about to put it there.
+// latched wake is about to put it there. A deadline that fired while it ran interrupts it now.
 fn suspended(owner: SlotOwner, execution: Intrinsic.Execution<()>) -> () {
   let adopted = TransferableExecution<()>.adopt(move execution)
   let pool = owner.pool.get()
   let mut guard = pool.state.lock()
   let state = guard.getMut()
   let slots = List<Slot>.asMutSlice(&mut state.slots)
-  slots[owner.id].task = Parked { execution: move adopted }
+  let token = slots[owner.id].interrupt
+  slots[owner.id].interrupt = usize.ZERO
+  let mut parked = move adopted
+  // A deadline that fired while the fiber ran latches its park, which is still registering here,
+  // so the drive post-step queues it. The pool must not link it, since it cannot be driven yet.
+  if token != usize.ZERO {
+    let latched = parked.interruptHeld(token)
+  }
+  slots[owner.id].task = Parked { execution: move parked }
   if !slots[owner.id].cancel || slots[owner.id].queued { return () }
   let worker = link(&mut state.*, owner.id)
   drop guard
@@ -915,6 +1234,7 @@ effect fn takeBatch(worker: &mut WorkerContext) -> usize ! OutOfMemoryError ? &m
   let pool = worker.pool.get()
   let mut guard = pool.state.lock()
   let state = guard.getMut()
+  fireDeadlines(pool, &mut state.*)
   let first = unlink(&mut state.*)
   if first == none() { return first }
   let mut moved = usize.ZERO
@@ -952,18 +1272,33 @@ fn steal(worker: &WorkerContext) -> usize {
 }
 
 // Marks the worker idle and parks it, unless work or shutdown arrived first. Returns whether the
-// pool is shutting down.
+// pool is shutting down. With deadlines armed, it parks only until the earliest one.
 fn sleep(worker: &WorkerContext) -> bool {
   let pool = worker.pool.get()
   let mut guard = pool.state.lock()
   let state = guard.getMut()
   if state.shutdown { return true }
+  fireDeadlines(pool, &mut state.*)
   if state.head != none() { return false }
   let flags = List<bool>.asMutSlice(&mut state.idle)
   flags[worker.index] = true
+  let wait = untilEarliest(&state.*)
   drop guard
-  worker.parker.park()
+  if wait == u64.MAX {
+    worker.parker.park()
+  } else if !worker.parker.parkTimeout(wait) {
+    clearIdle(pool, worker.index)
+  }
   return false
+}
+
+// A worker that woke on its own is no longer idle, so a later fiber wakes another worker.
+fn clearIdle(pool: &PoolShared, index: usize) -> () {
+  let mut guard = pool.state.lock()
+  let state = guard.getMut()
+  let flags = List<bool>.asMutSlice(&mut state.idle)
+  flags[index] = false
+  return ()
 }
 
 /// The owner of a pool's worker threads: a work-stealing pool of native threads that runs fibers
@@ -1013,7 +1348,16 @@ impl ThreadPool {
       run List<bool>.append(&mut idle, false)
       at = at + 1
     }
-    let state = PoolState { slots: List<Slot>.make(), head: none(), tail: none(), free: none(), idle: move idle, shutdown: false }
+    let state = PoolState {
+      slots: List<Slot>.make(),
+      head: none(),
+      tail: none(),
+      free: none(),
+      deadlines: List<PoolDeadline>.make(),
+      nextToken: usize.ONE,
+      idle: move idle,
+      shutdown: false,
+    }
     let locked = run Mutex<PoolState>.make(move state)
     let shared = run Arc<PoolShared>.make(PoolShared { state: move locked, unparkers: move unparkers })
     let mut owner = ThreadPool { handle: Pool { shared: move shared }, threads: List<JoinHandle<()>>.make() }
@@ -1122,6 +1466,7 @@ fn stop(pool: &PoolShared, threads: List<JoinHandle<()>>) -> () {
   let mut final = pool.state.lock()
   let emptied = final.getMut()
   let slots = Intrinsic.replace(emptied.slots, List<Slot>.make())
+  List<PoolDeadline>.clear(&mut emptied.deadlines)
   emptied.head = none()
   emptied.tail = none()
   emptied.free = none()
