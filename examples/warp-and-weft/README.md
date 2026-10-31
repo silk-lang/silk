@@ -38,5 +38,10 @@ and a fifth fiber draws one tracker row per step on the same kind of schedule.
 synthesizes its track on its own native thread, and the program sums the four tracks into the WAV,
 through a high-pass filter like the output stage of an 8-bit console.
 
+**In a browser.** Built with `silk build --release --target wasm32-unknown-unknown`, the same
+program runs with no host services: the screen fiber's rows and the WAV file (as base64 lines that
+start with `pcm `) reach the page through the `silk.console` import. The module is about 300 KB,
+renders the song in about 0.3 s, and its WAV is byte for byte the native one.
+
 The song itself is plain text in `main.silk`: one token per sixteenth note, with `-` to hold a
 note and `.` for silence, and one chord name per bar for the bass and the arpeggio.

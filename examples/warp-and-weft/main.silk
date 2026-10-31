@@ -8,8 +8,10 @@
 //! - `silk run -- wav song.wav` renders the song at once, with a virtual clock.
 //! - `silk run -- play` renders it, starts a player, and shows the song live on the real clock.
 //! - `silk run` checks that the arrangement is complete and exits.
+//! - Built with `--target wasm32-unknown-unknown`, it plays the song with the screen fiber drawing,
+//!   synthesizes the tracks one after the other, and sends the rows and the WAV file (as base64
+//!   `pcm` messages) to the host through `silk.console`.
 import silk.mem.allocator { Allocator, OutOfMemoryError }
-import silk.collections.bytes { Bytes }
 import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
@@ -25,22 +27,12 @@ import silk.num.u64
 import silk.num.u8
 import silk.num.f32
 import silk.num.usize
-import silk.system.filesystem { FileError, FileSystem, Path }
-import silk.system.filesystem_native { OsFileSystem }
-import silk.system.host_input { HostInput, HostInputError }
 import silk.system.insecure_random { InsecureRandom }
 import silk.system.monotonic_clock { MonotonicClock }
 import silk.system.system_clock { Instant, SystemClock }
 import silk.text.string { String }
 import silk.mem.shared { Shared }
-import silk.core.result { Result }
-import silk.concurrency.thread_native { NativeThread, SpawnError }
-import silk.concurrency.thread_pool { Pool, ThreadPool }
-import silk.io.writer { Writer, WriterError }
-import silk.io.writer_native { StdoutWriter }
-import silk.system.child_process { ChildProcess }
-import silk.system.child_process_native { OsChildProcess }
-import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.io.writer { WriterError }
 
 // ---- The song ---------------------------------------------------------------------------------
 
@@ -697,7 +689,7 @@ struct Screen {
 
 effect fn draw(screen: &mut Screen) -> ()
   ! OutOfMemoryError | WriterError
-  ? &mut Writer | &mut Allocator {
+  ? &mut Allocator {
   let stage = Shared.withMut(
     &screen.stage,
     fn(stage: &mut Stage) -> Stage {
@@ -730,29 +722,23 @@ effect fn draw(screen: &mut Screen) -> ()
   run line.append("│")
   run appendRoll(&mut line, &stage)
   run line.append("│\n")
-  run Writer.writeString(line.view())
+  run emit(line.view())
 }
 
 effect fn screen(stage: Shared<Stage>) -> ()
   ! OutOfMemoryError | WriterError
   ? &mut Scheduler | &mut MonotonicClock {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let mut out = StdoutWriter.make()
   let mut random = InsecureRandom.seeded(0)
   let mut screen = Screen { stage: move stage, row: 0 }
   let rows = usize.toU64(BARS * STEPS_PER_BAR)
-  run Writer.writeString(
+  run emit(
     "\n  \x1b[1mWarp and Weft\x1b[0m, played by four fibers in time with Schedule.fixed\n\n",
   )
-    |> Effect.provideMut<Writer>(&mut out)
-  run Writer.writeString(
-    "  bar     \x1b[95mlead\x1b[0m \x1b[96marp\x1b[0m  \x1b[93mbass\x1b[0m drums\n",
-  )
-    |> Effect.provideMut<Writer>(&mut out)
+  run emit("  bar     \x1b[95mlead\x1b[0m \x1b[96marp\x1b[0m  \x1b[93mbass\x1b[0m drums\n")
   run Effect.sleep(STEP / 4)
   run Effect.repeat(draw(&mut screen), &(Schedule.fixed(STEP) |> Schedule.limit(rows - 1)))
     |> Effect.provideMut<InsecureRandom>(&mut random)
-    |> Effect.provideMut<Writer>(&mut out)
     |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
@@ -766,8 +752,8 @@ struct Band {
 }
 
 // Forks one fiber for each instrument, all from the same origin, and waits for all four. When
-// `live`, a fifth fiber draws the screen.
-effect fn band(stage: Shared<Stage>, live: bool) -> Band
+// `drawn`, a fifth fiber draws the screen.
+effect fn band(stage: Shared<Stage>, drawn: bool) -> Band
   ! OutOfMemoryError | WriterError | TaskIdExhaustedError | Cancelled
   ? &mut Scheduler | &mut MonotonicClock {
   let origin = run MonotonicClock.now()
@@ -776,7 +762,7 @@ effect fn band(stage: Shared<Stage>, live: bool) -> Band
   let arpeggioFiber = run Fiber<Track, OutOfMemoryError>.forkChild(arpeggio(share(&gig)))
   let bassFiber = run Fiber<Track, OutOfMemoryError>.forkChild(bass(share(&gig)))
   let drumsFiber = run Fiber<Track, OutOfMemoryError>.forkChild(drums(move gig))
-  if live {
+  if drawn {
     let screenFiber = run Fiber<(), OutOfMemoryError | WriterError>.forkChild(screen(move stage))
     run screenFiber.join()
   } else {
@@ -823,25 +809,17 @@ effect fn emptyStage() -> Shared<Stage>
   )
 }
 
-// Plays the song with `live` false under a virtual clock, or with `live` true on the real clock.
-effect fn record(live: bool) -> Band
+// Plays the whole song at once under a virtual clock. When `drawn`, the screen fiber draws too.
+effect fn record(drawn: bool) -> Band
   ! OutOfMemoryError | WriterError | TaskIdExhaustedError | Cancelled | StalledError
   ? &mut Allocator {
   let stage = run emptyStage()
   let mut scheduler = LocalScheduler.make()
-  if live {
-    let mut clock = OsMonotonicClock.make()
-    return run scheduler.execute<
-      Band,
-      OutOfMemoryError | WriterError | TaskIdExhaustedError | Cancelled
-    >(band(move stage, true))
-      |> Effect.provideMut<MonotonicClock>(&mut clock)
-  }
   let mut clock = VirtualClock { mark: SystemClock.make(0, 0) }
   return run scheduler.execute<
     Band,
     OutOfMemoryError | WriterError | TaskIdExhaustedError | Cancelled
-  >(band(move stage, false))
+  >(band(move stage, drawn))
     |> Effect.provideMut<MonotonicClock>(&mut clock)
 }
 
@@ -1030,195 +1008,303 @@ effect fn wav(tracks: &List<List<f32>>, length: usize) -> List<u8>
   return move bytes
 }
 
-// ---- Mixing on the thread pool ----------------------------------------------------------------
+static if Intrinsic.targetArchitecture() == "wasm32" {
+  import silk.encoding.base64 { Base64 }
+  import silk.io.logger { LogError, Logger }
+  import silk.io.logger_console { ConsoleLogger }
+  import silk.collections.slice { Slice }
+  import silk.core.result { Result }
 
-effect fn synthesizeAlone(track: Track) -> List<f32>
-  ! OutOfMemoryError {
-  let mut allocator = Allocator.systemAllocatorProvider()
-  return run synthesize(&track, u64.toUsize(SAMPLE_RATE) * SECONDS)
-    |> Effect.provideMut<Allocator>(&mut allocator)
-}
+  // ---- Output -----------------------------------------------------------------------------------
 
-// Synthesizes the four tracks at the same time, one pool fiber each, and returns them in order.
-effect fn synthesizeAll(pool: Pool, band: Band) -> List<List<f32>>
-  ! OutOfMemoryError | Cancelled {
-  let Band { lead, arpeggio, bass, drums } = move band
-  let leadFiber = run pool.fork(synthesizeAlone(move lead))
-  let arpeggioFiber = run pool.fork(synthesizeAlone(move arpeggio))
-  let bassFiber = run pool.fork(synthesizeAlone(move bass))
-  let drumsFiber = run pool.fork(synthesizeAlone(move drums))
-  let mut allocator = Allocator.systemAllocatorProvider()
-  let mut tracks = List<List<f32>>.make()
-  run tracks.append(run leadFiber.join()) |> Effect.provideMut<Allocator>(&mut allocator)
-  run tracks.append(run arpeggioFiber.join()) |> Effect.provideMut<Allocator>(&mut allocator)
-  run tracks.append(run bassFiber.join()) |> Effect.provideMut<Allocator>(&mut allocator)
-  run tracks.append(run drumsFiber.join()) |> Effect.provideMut<Allocator>(&mut allocator)
-  return move tracks
-}
-
-effect fn mix(band: Band) -> List<u8>
-  ! OutOfMemoryError | SpawnError | Cancelled
-  ? &mut Allocator {
-  let threads = run ThreadPool.make(4)
-  let pool = threads.pool()
-  let tracks = run pool.block(synthesizeAll(pool.clone(), move band))
-  drop threads
-  return run wav(&tracks, u64.toUsize(SAMPLE_RATE) * SECONDS)
-}
-
-// ---- The program ------------------------------------------------------------------------------
-
-pub struct SongError {
-  pub message: string<'static>,
-}
-
-effect fn argument(index: usize) -> Bytes
-  ! HostInputError | OutOfMemoryError
-  ? &mut HostInput | &mut Allocator {
-  return match move run HostInput.argument(index) {
-    Option.None => Bytes.make()
-    Option.Some { value } => move value
+  // Sends `text` to the host's console, where the web page reads it.
+  effect fn emit(text: string) -> () ! WriterError {
+    let mut logger = ConsoleLogger.make()
+    run Effect.catchAll(Effect.logInfo("{text}", &.{ text: text }), ignoreLog)
+      |> Effect.provideMut<Logger>(&mut logger)
   }
-}
 
-// The absolute path of `name` in the working directory.
-effect fn hostPath(name: &[u8]) -> Bytes
-  ! HostInputError | OutOfMemoryError
-  ? &mut HostInput | &mut Allocator {
-  if name.length > 0 && name[0] == 47 {
-    return run Bytes.copy(name)
+  // Sends one part of the WAV file, as base64.
+  effect fn emitAudio(text: string) -> () {
+    let mut logger = ConsoleLogger.make()
+    run Effect.catchAll(Effect.logInfo("pcm {text}", &.{ text: text }), ignoreLog)
+      |> Effect.provideMut<Logger>(&mut logger)
   }
-  let mut path = run HostInput.workingDirectory()
-  run path.append(b"/")
-  run path.append(name)
-  return move path
-}
 
-effect fn save(band: Band, path: &Bytes) -> ()
-  ! OutOfMemoryError | SpawnError | Cancelled | FileError
-  ? &mut Allocator {
-  let bytes = run mix(move band)
-  let mut files = run OsFileSystem.make("/")
-  let target = run Path.fromBytes(Bytes.asSlice(path))
-  run FileSystem.writeFile(&target, bytes.asSlice()) |> Effect.provideMut<FileSystem>(&mut files)
-}
-
-// Plays the file at `path` with the first player this computer has. Returns false if none ran.
-fn playFile(path: Bytes) -> bool {
-  let mut allocator = Allocator.systemAllocatorProvider()
-  return run Effect.catchAll(tryPlayers(&path), cannotPlay)
-    |> Effect.provideMut<Allocator>(&mut allocator)
-}
-
-effect fn cannotPlay<E>(error: E) -> bool {
-  drop error
-  return false
-}
-
-effect fn tryPlayers(path: &Bytes) -> bool
-  ! OutOfMemoryError | FileError
-  ? &mut Allocator {
-  if run tryPlayer("/usr/bin/afplay", "", path) {
-    return true
+  effect fn ignoreLog(error: LogError) -> () {
+    drop error
+    return ()
   }
-  if run tryPlayer("/usr/bin/aplay", "-q", path) {
-    return true
-  }
-  if run tryPlayer("/usr/bin/paplay", "", path) {
-    return true
-  }
-  return run tryPlayer("/usr/bin/ffplay", "-nodisp", path)
-}
 
-effect fn tryPlayer(program: string, option: string, file: &Bytes) -> bool
-  ! OutOfMemoryError | FileError
-  ? &mut Allocator {
-  let mut processes = OsChildProcess.make()
-  let path = run Path.make(program)
-  let mut request = run ChildProcess.request(&path)
-  if String.byteLength(option) > 0 {
-    run ChildProcess.addArgument(&mut request, option)
-  }
-  if option == "-nodisp" {
-    run ChildProcess.addArgument(&mut request, "-autoexit")
-  }
-  run ChildProcess.addArgumentBytes(&mut request, Bytes.asSlice(file))
-  let outcome = run Effect.result(ChildProcess.submit(&request))
-    |> Effect.provideMut<ChildProcess>(&mut processes)
-  return match move outcome {
-    Result.Success { value } => match ChildProcess.exitCode(&value) {
-      Option.Some { value: code } => code == 0
-      Option.None => false
-    }
-    Result.Failure { error } => {
-      drop error
-      false
-    }
-  }
-}
+  // ---- The program in a browser -----------------------------------------------------------------
 
-effect fn program() -> i32
-  ! OutOfMemoryError
-    | WriterError
-    | TaskIdExhaustedError
-    | Cancelled
-    | StalledError
-    | SpawnError
-    | FileError
-    | HostInputError
-  ? &mut HostInput | &mut Allocator {
-  let mode = run argument(1)
-  let mut out = StdoutWriter.make()
-  if Bytes.asSlice(&mode) == b"wav" || Bytes.asSlice(&mode) == b"play" {
-    let name = run argument(2)
-    let path = run hostPath(
-      if name.length() > 0 {
-        Bytes.asSlice(&name)
-      } else {
-        b"warp-and-weft.wav"
-      },
-    )
-    run save(run record(false), &path)
-    if Bytes.asSlice(&mode) == b"wav" {
-      run Writer.writeString("Wrote the song.\n") |> Effect.provideMut<Writer>(&mut out)
-      return 0
-    }
-
-    // The player blocks its thread until the song ends, so it gets a thread of its own.
-    let player = run NativeThread.spawn(
-      fn() -> bool {
-        return playFile(move path)
-      },
-    )
-    let shown = run record(true)
-    drop shown
-    if !player.join() {
-      run Writer.writeString("\nNo audio player was found. Play the WAV file with any player.\n")
-        |> Effect.provideMut<Writer>(&mut out)
+  // Plays the song under the virtual clock with the screen fiber drawing, synthesizes the four
+  // tracks one after the other, and sends the WAV file to the page as base64 in `pcm` messages.
+  effect fn program() -> i32
+    ! OutOfMemoryError | WriterError | TaskIdExhaustedError | Cancelled | StalledError
+    ? &mut Allocator {
+    let band = run record(true)
+    let length = u64.toUsize(SAMPLE_RATE) * SECONDS
+    let mut tracks = List<List<f32>>.make()
+    run tracks.append(run synthesize(&band.lead, length))
+    run tracks.append(run synthesize(&band.arpeggio, length))
+    run tracks.append(run synthesize(&band.bass, length))
+    run tracks.append(run synthesize(&band.drums, length))
+    let bytes = run wav(&tracks, length)
+    // Three bytes become four characters, so each message carries 3072 bytes.
+    let mut text = List<u8>.make()
+    run text.appendRepeated(0, 4096)
+    let mut at: usize = 0
+    while at < bytes.length() {
+      let end = if at + 3072 < bytes.length() { at + 3072 } else { bytes.length() }
+      let written = match Base64.encodeInto(text.asMutSlice(), Slice.view(bytes.asSlice(), at, end - at)) {
+        Result.Success { value } => value
+        Result.Failure { error } => { drop error 0 }
+      }
+      match String.fromUtf8(Slice.view(text.asSlice(), 0, written)) {
+        Result.Success { value } => run emitAudio(value)
+        Result.Failure { error } => { drop error }
+      }
+      at = end
     }
     return 0
   }
 
-  // With no mode, play the song under the virtual clock and check what each fiber played.
-  let band = run record(false)
-  if band.lead.notes.length() != 150 || band.arpeggio.notes.length() != 776 {
+  pub fn main() -> i32 {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    return run Effect.catchAll(program(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+  }
+
+  effect fn failed<E>(error: E) -> i32 {
+    drop error
     return 1
   }
-  if band.bass.notes.length() != 216 || band.drums.notes.length() != 259 {
+} else {
+  import silk.collections.bytes { Bytes }
+  import silk.core.result { Result }
+  import silk.concurrency.thread_native { NativeThread, SpawnError }
+  import silk.concurrency.thread_pool { Pool, ThreadPool }
+  import silk.io.writer { Writer }
+  import silk.io.writer_native { StdoutWriter }
+  import silk.system.child_process { ChildProcess }
+  import silk.system.child_process_native { OsChildProcess }
+  import silk.system.filesystem { FileError, FileSystem, Path }
+  import silk.system.filesystem_native { OsFileSystem }
+  import silk.system.host_input { HostInput, HostInputError }
+  import silk.system.monotonic_clock_native { OsMonotonicClock }
+
+  // ---- Output -----------------------------------------------------------------------------------
+
+  // Writes `text` to standard output.
+  effect fn emit(text: string) -> () ! WriterError {
+    let mut out = StdoutWriter.make()
+    run Writer.writeString(text) |> Effect.provideMut<Writer>(&mut out)
+  }
+
+  // Plays the song on the real clock while the screen fiber draws it.
+  effect fn performLive() -> Band
+    ! OutOfMemoryError | WriterError | TaskIdExhaustedError | Cancelled | StalledError
+    ? &mut Allocator {
+    let stage = run emptyStage()
+    let mut scheduler = LocalScheduler.make()
+    let mut clock = OsMonotonicClock.make()
+    return run scheduler.execute<
+      Band,
+      OutOfMemoryError | WriterError | TaskIdExhaustedError | Cancelled
+    >(band(move stage, true))
+      |> Effect.provideMut<MonotonicClock>(&mut clock)
+  }
+
+  // ---- Mixing on the thread pool ----------------------------------------------------------------
+
+  effect fn synthesizeAlone(track: Track) -> List<f32>
+    ! OutOfMemoryError {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    return run synthesize(&track, u64.toUsize(SAMPLE_RATE) * SECONDS)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+  }
+
+  // Synthesizes the four tracks at the same time, one pool fiber each, and returns them in order.
+  effect fn synthesizeAll(pool: Pool, band: Band) -> List<List<f32>>
+    ! OutOfMemoryError | Cancelled {
+    let Band { lead, arpeggio, bass, drums } = move band
+    let leadFiber = run pool.fork(synthesizeAlone(move lead))
+    let arpeggioFiber = run pool.fork(synthesizeAlone(move arpeggio))
+    let bassFiber = run pool.fork(synthesizeAlone(move bass))
+    let drumsFiber = run pool.fork(synthesizeAlone(move drums))
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let mut tracks = List<List<f32>>.make()
+    run tracks.append(run leadFiber.join()) |> Effect.provideMut<Allocator>(&mut allocator)
+    run tracks.append(run arpeggioFiber.join()) |> Effect.provideMut<Allocator>(&mut allocator)
+    run tracks.append(run bassFiber.join()) |> Effect.provideMut<Allocator>(&mut allocator)
+    run tracks.append(run drumsFiber.join()) |> Effect.provideMut<Allocator>(&mut allocator)
+    return move tracks
+  }
+
+  effect fn mix(band: Band) -> List<u8>
+    ! OutOfMemoryError | SpawnError | Cancelled
+    ? &mut Allocator {
+    let threads = run ThreadPool.make(4)
+    let pool = threads.pool()
+    let tracks = run pool.block(synthesizeAll(pool.clone(), move band))
+    drop threads
+    return run wav(&tracks, u64.toUsize(SAMPLE_RATE) * SECONDS)
+  }
+
+  // ---- The program ------------------------------------------------------------------------------
+
+  pub struct SongError {
+    pub message: string<'static>,
+  }
+
+  effect fn argument(index: usize) -> Bytes
+    ! HostInputError | OutOfMemoryError
+    ? &mut HostInput | &mut Allocator {
+    return match move run HostInput.argument(index) {
+      Option.None => Bytes.make()
+      Option.Some { value } => move value
+    }
+  }
+
+  // The absolute path of `name` in the working directory.
+  effect fn hostPath(name: &[u8]) -> Bytes
+    ! HostInputError | OutOfMemoryError
+    ? &mut HostInput | &mut Allocator {
+    if name.length > 0 && name[0] == 47 {
+      return run Bytes.copy(name)
+    }
+    let mut path = run HostInput.workingDirectory()
+    run path.append(b"/")
+    run path.append(name)
+    return move path
+  }
+
+  effect fn save(band: Band, path: &Bytes) -> ()
+    ! OutOfMemoryError | SpawnError | Cancelled | FileError
+    ? &mut Allocator {
+    let bytes = run mix(move band)
+    let mut files = run OsFileSystem.make("/")
+    let target = run Path.fromBytes(Bytes.asSlice(path))
+    run FileSystem.writeFile(&target, bytes.asSlice()) |> Effect.provideMut<FileSystem>(&mut files)
+  }
+
+  // Plays the file at `path` with the first player this computer has. Returns false if none ran.
+  fn playFile(path: Bytes) -> bool {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    return run Effect.catchAll(tryPlayers(&path), cannotPlay)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+  }
+
+  effect fn cannotPlay<E>(error: E) -> bool {
+    drop error
+    return false
+  }
+
+  effect fn tryPlayers(path: &Bytes) -> bool
+    ! OutOfMemoryError | FileError
+    ? &mut Allocator {
+    if run tryPlayer("/usr/bin/afplay", "", path) {
+      return true
+    }
+    if run tryPlayer("/usr/bin/aplay", "-q", path) {
+      return true
+    }
+    if run tryPlayer("/usr/bin/paplay", "", path) {
+      return true
+    }
+    return run tryPlayer("/usr/bin/ffplay", "-nodisp", path)
+  }
+
+  effect fn tryPlayer(program: string, option: string, file: &Bytes) -> bool
+    ! OutOfMemoryError | FileError
+    ? &mut Allocator {
+    let mut processes = OsChildProcess.make()
+    let path = run Path.make(program)
+    let mut request = run ChildProcess.request(&path)
+    if String.byteLength(option) > 0 {
+      run ChildProcess.addArgument(&mut request, option)
+    }
+    if option == "-nodisp" {
+      run ChildProcess.addArgument(&mut request, "-autoexit")
+    }
+    run ChildProcess.addArgumentBytes(&mut request, Bytes.asSlice(file))
+    let outcome = run Effect.result(ChildProcess.submit(&request))
+      |> Effect.provideMut<ChildProcess>(&mut processes)
+    return match move outcome {
+      Result.Success { value } => match ChildProcess.exitCode(&value) {
+        Option.Some { value: code } => code == 0
+        Option.None => false
+      }
+      Result.Failure { error } => {
+        drop error
+        false
+      }
+    }
+  }
+
+  effect fn program() -> i32
+    ! OutOfMemoryError
+      | WriterError
+      | TaskIdExhaustedError
+      | Cancelled
+      | StalledError
+      | SpawnError
+      | FileError
+      | HostInputError
+    ? &mut HostInput | &mut Allocator {
+    let mode = run argument(1)
+    let mut out = StdoutWriter.make()
+    if Bytes.asSlice(&mode) == b"wav" || Bytes.asSlice(&mode) == b"play" {
+      let name = run argument(2)
+      let path = run hostPath(
+        if name.length() > 0 {
+          Bytes.asSlice(&name)
+        } else {
+          b"warp-and-weft.wav"
+        },
+      )
+      run save(run record(false), &path)
+      if Bytes.asSlice(&mode) == b"wav" {
+        run Writer.writeString("Wrote the song.\n") |> Effect.provideMut<Writer>(&mut out)
+        return 0
+      }
+
+      // The player blocks its thread until the song ends, so it gets a thread of its own.
+      let player = run NativeThread.spawn(
+        fn() -> bool {
+          return playFile(move path)
+        },
+      )
+      let shown = run performLive()
+      drop shown
+      if !player.join() {
+        run Writer.writeString("\nNo audio player was found. Play the WAV file with any player.\n")
+          |> Effect.provideMut<Writer>(&mut out)
+      }
+      return 0
+    }
+
+    // With no mode, play the song under the virtual clock and check what each fiber played.
+    let band = run record(false)
+    if band.lead.notes.length() != 150 || band.arpeggio.notes.length() != 776 {
+      return 1
+    }
+    if band.bass.notes.length() != 216 || band.drums.notes.length() != 259 {
+      return 1
+    }
+    run Writer.writeString("Usage: silk run -- play | silk run -- wav [file.wav]\n")
+      |> Effect.provideMut<Writer>(&mut out)
+    return 0
+  }
+
+  effect fn failed<E>(error: E) -> i32 {
+    drop error
     return 1
   }
-  run Writer.writeString("Usage: silk run -- play | silk run -- wav [file.wav]\n")
-    |> Effect.provideMut<Writer>(&mut out)
-  return 0
-}
 
-effect fn failed<E>(error: E) -> i32 {
-  drop error
-  return 1
-}
-
-pub effect fn main() -> i32
-  ? &mut HostInput {
-  let mut allocator = Allocator.systemAllocatorProvider()
-  return run Effect.catchAll(program(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+  pub effect fn main() -> i32
+    ? &mut HostInput {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    return run Effect.catchAll(program(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+  }
 }
