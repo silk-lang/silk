@@ -780,7 +780,8 @@ failure values are dropped. `Schedule.recurs(2)` makes at most three attempts. `
 a reusable effect (`mut Effect`).
 
 The waits use `MonotonicClock`, so under a task scheduler they park only the current task.
-`InsecureRandom` supplies the jitter of a jittered schedule.
+`InsecureRandom` supplies the jitter of a jittered schedule, and is required even when the
+schedule has none.
 
 #### Gotchas
 
@@ -846,8 +847,17 @@ and runs it again.
 
 #### Details
 
-A success stops the attempts. A failure that `retryable` rejects propagates at once. When
-`schedule` stops, the last failure propagates. Otherwise it behaves as [`retry`](#Effect.impl.retry).
+A success stops the attempts. A failure that `retryable` rejects propagates at once, before
+`schedule` is asked. When `schedule` stops, the last failure propagates. Earlier failure
+values are dropped. `self` must be a reusable effect (`mut Effect`).
+
+The waits use `MonotonicClock`, so under a task scheduler they park only the current task.
+`InsecureRandom` supplies the jitter of a jittered schedule, and is required even when the
+schedule has none.
+
+#### Gotchas
+
+A trap stops the attempts at once and is not retried.
 
 <a id="Effect.impl.repeat"></a>
 
@@ -873,7 +883,8 @@ The first run happens at once. `Schedule.recurs(3)` runs `self` four times. A ty
 stops the repeats and propagates. `self` must be a reusable effect (`mut Effect`).
 
 The waits use `MonotonicClock`, so under a task scheduler they park only the current task.
-`InsecureRandom` supplies the jitter of a jittered schedule.
+`InsecureRandom` supplies the jitter of a jittered schedule, and is required even when the
+schedule has none.
 
 #### Examples
 

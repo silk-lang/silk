@@ -10,7 +10,7 @@ silk run                     # check the arrangement and exit
 ```
 
 `play` uses the first of `afplay` (macOS), `aplay`, `paplay` or `ffplay` that it finds. The WAV is
-44.1 kHz, 16-bit mono, and 43 seconds long.
+44.1 kHz, 16-bit mono, and 45 seconds long: 43 seconds of song and the tail of the last crash.
 
 ## How it works
 

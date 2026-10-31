@@ -217,9 +217,15 @@ time each run takes does not move later recurrences.
 
 #### Details
 
-Before each recurrence, the delay is the time from now to the next multiple of `interval`
-since [`Schedule.start`](#Schedule.impl.start). If a run takes longer than `interval`, the next recurrence waits
-for the next multiple, so missed beats do not pile up. An `interval` of 0 recurs at once.
+Recurrence `n`, counted from 0, is due at `(n + 1) * interval` after [`Schedule.start`](#Schedule.impl.start), and
+the delay is the time from now to that beat. If a run ends after its next beat, the
+recurrence happens at the first beat that is not past, or at once when the run ends exactly
+on a beat. Thus missed beats do not pile up, and a late run does not move later beats. An
+`interval` of 0 recurs at once.
+
+#### Gotchas
+
+[`Schedule.jittered`](#Schedule.impl.jittered) moves each recurrence off its beat by the jitter.
 
 <a id="Schedule.impl.exponential"></a>
 
@@ -230,6 +236,10 @@ pub fn exponential(base: u64) -> Schedule
 ```
 
 Waits `base * 2^n` before recurrence `n`, counted from 0.
+
+#### Details
+
+The delay is computed in `f64`. A delay that is more than a `u64` can hold becomes `u64.MAX`.
 
 <a id="Schedule.impl.exponentialBy"></a>
 
@@ -335,7 +345,8 @@ Multiplies each delay of `self` by a random factor between `min` and `max`.
 
 #### Details
 
-The factor is uniform in `[min, max)`, from one `InsecureRandom.nextU64` for each delay.
+The factor is uniform in `[min, max)`, from one `InsecureRandom.nextU64` for each delay. Give
+`min` at most `max`, and both at least 0: a delay below 0 becomes 0.
 
 <a id="Schedule.impl.start"></a>
 
