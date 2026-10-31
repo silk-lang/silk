@@ -13,11 +13,19 @@ complete, validated profile can enter ordinary specialization or backend work. F
 returns diagnostics and publishes no partial profile.
 
 The canonical targets are `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`,
-`aarch64-unknown-linux-gnu`, `wasm32-unknown-unknown`, `wasm32-wasip1`, and `wasm32-wasip2`. Each has a versioned machine description
+`aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, and `wasm32-wasip2`. Each has a versioned machine description
 with architecture, operating system, ABI, object format, endianness, primitive widths and
 alignments, address spaces, stack alignment, supported CPU features and toolchain class. Target
 selection is independent of the host. Only an application edge can explicitly supply host facts
 when neither a request nor a selected project profile names a target.
+
+The Windows target uses the x86-64 instruction set, the Microsoft ABI, COFF objects and little-endian
+storage. Pointers are 64 bits with 8-byte alignment; C `long` is 32 bits with 4-byte alignment
+(LLP64). It uses the same CPU models and feature implications as the GNU x86-64 target.
+Its profile defaults to `libc = "system"`, which names the Windows system DLL ABI, and rejects
+`libc = "gnu"`. `libc = "none"` is available for objects and static archives.
+Target selection and scalar C ABI lowering are available; Windows runtime composition, linking,
+native assembly and by-value C aggregate/vector boundaries are not implemented yet.
 
 The WASI command targets use `libc = "none"`, static linking and relocation, and single threading.
 A Linux executable defaults to `relocation = "static"`: it loads at a fixed address and its code

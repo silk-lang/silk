@@ -131,8 +131,16 @@ ownership rejects another extraction. The compiler does not claim to prove what 
 The audited target description supplies primitive size, alignment, pointer facts and endianness.
 Existing external structs and arrays derive layout from those facts before LLVM lowering. Missing
 or inconsistent facts fail before use; there is no ambient-host layout fallback. C classification carries the required sign/zero-extension attributes for narrow integers on
-Darwin ARM64 and System V x86-64; GNU AAPCS64 leaves those attributes absent. LLVM consumes these
+Darwin ARM64 and System V x86-64; GNU AAPCS64 and Microsoft x86-64 leave those attributes absent. LLVM consumes these
 verified facts on foreign declarations, call sites and exported thunks.
+
+For `x86_64-pc-windows-msvc`, signed and unsigned 8-bit and 16-bit scalar arguments and results
+use bare LLVM integer lanes. The caller does not promise sign or zero extension of their upper
+register bits. C default argument promotions still apply to unnamed variadic arguments.
+The independent [Clang fixture](../compiler/fixtures/windows-abi/README.md) records the declaration,
+direct-call, callback and export signatures. This verifies scalar ABI shape; Windows foreign
+unwind handling and executable interoperability still require the Windows runtime and linker.
+By-value C structs and vectors on Windows remain unsupported and must not use the ARM64 classifier.
 
 An `extern "C" struct` can pass or return by value in direct calls, native function-pointer
 calls and exported functions. Its fields retain the C object restrictions: C scalars, raw
