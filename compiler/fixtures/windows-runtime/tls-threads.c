@@ -10,6 +10,10 @@ __declspec(dllimport) int GetExitCodeThread(HANDLE, DWORD *);
 __declspec(dllimport) int CloseHandle(HANDLE);
 void *readDiagnostic(void);
 void writeDiagnostic(void *);
+void *readOther(void);
+void writeOther(void *);
+double floatDiagnostic(double, double);
+double floatOther(double, double);
 
 static HANDLE ready;
 static HANDLE release;
@@ -17,11 +21,11 @@ static HANDLE release;
 static DWORD worker(void *unused) {
   int marker = 22;
   (void)unused;
-  if (readDiagnostic() != 0) {
+  if (readOther() != 0) {
     SetEvent(ready);
     return 7;
   }
-  writeDiagnostic(&marker);
+  writeOther(&marker);
   if (!SetEvent(ready)) return 8;
   if (WaitForSingleObject(release, 10000) != 0) return 9;
   return readDiagnostic() == &marker ? 0 : 10;
@@ -31,6 +35,7 @@ void mainCRTStartup(void) {
   int marker = 11;
   DWORD status = 99;
   if (readDiagnostic() != 0) ExitProcess(1);
+  if (floatDiagnostic(1.25, 2.5) != 3.75 || floatOther(4.25, 5.5) != 9.75) ExitProcess(13);
   writeDiagnostic(&marker);
   ready = CreateEventW(0, 1, 0, 0);
   release = CreateEventW(0, 1, 0, 0);
@@ -38,7 +43,7 @@ void mainCRTStartup(void) {
   HANDLE thread = CreateThread(0, 0, worker, 0, 0, 0);
   if (!thread) ExitProcess(3);
   if (WaitForSingleObject(ready, 10000) != 0) ExitProcess(4);
-  if (readDiagnostic() != &marker) ExitProcess(5);
+  if (readOther() != &marker) ExitProcess(5);
   if (!SetEvent(release)) ExitProcess(6);
   if (WaitForSingleObject(thread, 10000) != 0 || !GetExitCodeThread(thread, &status)) ExitProcess(11);
   if (!CloseHandle(thread) || !CloseHandle(ready) || !CloseHandle(release)) ExitProcess(12);
