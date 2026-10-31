@@ -9,6 +9,17 @@ printf 'program\tcompile\tpe-imports\texecution\n' > "$out/results.tsv"
 failed=0
 for program in hello storage; do
   source="$PWD/compiler/fixtures/windows-runtime/$program.silk"
+  # Retain actual Silk output and the helpers its unoptimized object requires. This inventory
+  # distinguishes emitted dependencies from the broader handwritten compiler-rt risk fixture.
+  if "$compiler" build "$source" -o "$out/$program.ll" --emit llvm-ir --target x86_64-pc-windows-msvc \
+      --stdlib "$PWD/stdlib" --optimization none --debug false > "$out/$program-ir.log" 2>&1 \
+      && "$SILK_TEST_CLANG" --target=x86_64-pc-windows-msvc -O0 -c "$out/$program.ll" -o "$out/$program.obj" \
+        > "$out/$program-object.log" 2>&1; then
+    llvm-nm --undefined-only "$out/$program.obj" > "$out/$program-undefined.txt"
+  else
+    cat "$out/$program-ir.log"
+    failed=1
+  fi
   if "$compiler" build "$source" -o "$out/$program.exe" --target x86_64-pc-windows-msvc \
       --stdlib "$PWD/stdlib" --clang "$SILK_TEST_CLANG" --optimization none --debug false > "$out/$program-build.log" 2>&1; then
     if llvm-readobj --file-headers --coff-imports "$out/$program.exe" > "$out/$program-pe.txt" \
