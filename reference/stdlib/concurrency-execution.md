@@ -232,6 +232,17 @@ does not park, and does not run the body. A later [`Execution.drive`](#Execution
 The Execution must still be `Initial`. Calling this operation again, or calling it after the
 Execution has been driven, parked, completed, or destroyed, is a fatal state trap.
 
+<a id="TransferableExecution.impl.interruptHeld"></a>
+
+### Method `interruptHeld`
+
+```silk
+pub fn interruptHeld(self: &mut Self, token: usize) -> bool
+```
+
+Asks this parked Execution to resume the interruptible boundary for `token`, for an owner
+that holds it under its own lock. See [`Execution.interruptHeld`](#Execution.impl.interruptHeld).
+
 <a id="Execution"></a>
 
 ## `Execution`
@@ -465,6 +476,36 @@ resumes with `false`. Wakes of the interrupted park publish nothing.
 The parked body must be inside a boundary for `token`, and `token` must not be 0. With no
 such boundary, every frame is abandoned, as when the Execution is dropped. Interrupting an
 Execution that is not dormant or eligible is a fatal state trap.
+
+<a id="Execution.impl.interruptHeld"></a>
+
+### Associated function `interruptHeld`
+
+```silk
+pub fn interruptHeld<A>(execution: &mut Intrinsic.Execution<A>, token: usize) -> bool
+```
+
+Asks a parked Execution that the caller holds under its own lock to resume the interruptible
+boundary for `token`, and returns whether the caller must now queue it.
+
+#### When to use
+
+Use it in an owner whose readiness endpoint takes the same lock, so [`interrupt`](#Execution.impl.interrupt) would
+deadlock, and which stores each parked Execution before [`drive`](#Execution.impl.drive) returns, so the park may
+still be registering.
+
+#### Details
+
+It stores the token as [`interrupt`](#Execution.impl.interrupt) does, with three differences. A dormant Execution becomes
+eligible without running its readiness endpoint, and the call returns `true`, so the caller
+queues it. A park that is still registering, as in the `onSuspend` callback of [`drive`](#Execution.impl.drive), is
+latched, so `drive` notifies the endpoint once it returns. An Execution that already holds a smaller token keeps it: with tokens that grow
+with each boundary, that is the outer one.
+
+#### Gotchas
+
+`token` must not be 0. The boundary rules of [`interrupt`](#Execution.impl.interrupt) apply. Interrupting an Execution
+that is not parked is a fatal state trap.
 
 <a id="Execution.impl.wakeTransferable"></a>
 
