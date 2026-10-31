@@ -3,7 +3,8 @@
 The compiler builds SDK-free x64 console executables with the LLVM installation selected by
 `--clang` or `SILK_CLANG`. `driver/WindowsLink.silk` ships the minimal import definitions in the
 compiler, writes them in its private build directory, and runs the sibling `llvm-dlltool`.
-Clang compiles COFF and calls the sibling `lld-link` with `/nodefaultlib`, `/subsystem:console`,
+Clang compiles COFF and selects sibling `lld-link` with `-B <LLVM-bin>` and `-fuse-ld=lld`,
+then `/nodefaultlib`, `/subsystem:console`,
 and `/entry:mainCRTStartup`. No CRT archive, allocator shim, or security cookie is supplied.
 
 The same LLVM installation compiles the embedded TLS support source. Its writable `_tls_index`
@@ -19,7 +20,9 @@ rules. The ordinary source allocator owns adopted allocations. The existing exec
 component selects `WindowsHeap` in source and keeps its frame accounting, reservation list,
 and release rules. No compiler-known standard-library actor is added.
 
-`_fltused` is a link-once data marker. Memory helpers and the x64 probe-only `__chkstk` are imported
+`_fltused` is one data marker in the support object. Diagnostic TLS and the foreign personality
+use explicit COFF COMDAT groups so separately compiled units share one definition. Memory helpers
+and the x64 probe-only `__chkstk` are imported
 from ntdll. The native toolchain proof documents the observed probe export and its support-contract
 limitation. Extended compiler-rt operations are not automatically supplied: stock LLVM's i128
 fixture still needs real security-cookie support and is not a passing arithmetic implementation.
@@ -54,7 +57,9 @@ These upstream suites were not run as Silk tests.
 
 `tls-proof.ps1` extracts the production TLS support source, compiles an LLVM definition with the
 same storage shape as `LlvmCode.activeSteps`, and drives it from separately compiled C on two
-threads. Both threads must start with null state and preserve distinct values across synchronization.
+threads. Two separately emitted units must share one state within each thread. Both threads must
+start with null state and preserve distinct values across synchronization. Floating-point operations
+in both units require the single support marker. The link runs through the production Clang flags.
 The runner inspects the PE TLS directory, object address relocations, image base relocations, and
 exact DLL imports. Without support it must fail to link on `_tls_index`; replacing TLS with a
 global must fail the worker's initial-state check. This reduced native proof passed on Windows

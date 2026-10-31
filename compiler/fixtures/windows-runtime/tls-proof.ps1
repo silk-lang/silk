@@ -52,16 +52,27 @@ $flags = @('--target=x86_64-pc-windows-msvc', '-ffreestanding', '-fno-stack-prot
 $null = Tool 'clang' ($flags + @("$out\silk-tls.c", '-o', "$out\silk-tls.obj"))
 $null = Tool 'clang' ($flags + @("$PSScriptRoot\tls-threads.c", '-o', "$out\threads.obj"))
 $null = Tool 'clang' @('--target=x86_64-pc-windows-msvc', '-O2', '-c', "$PSScriptRoot\tls-state.ll", '-o', "$out\state.obj")
+$other = (Get-Content -Raw "$PSScriptRoot\tls-state.ll").Replace('readDiagnostic', 'readOther').Replace('writeDiagnostic', 'writeOther').Replace('floatDiagnostic', 'floatOther')
+[IO.File]::WriteAllText("$out\other.ll", $other)
+$null = Tool 'clang' @('--target=x86_64-pc-windows-msvc', '-O2', '-c', "$out\other.ll", '-o', "$out\other.obj")
 $undefined = Tool 'llvm-nm' @('--undefined-only', "$out\state.obj")
 Require ($undefined -match '\b_tls_index\b') 'Fixture no longer tests the emitted TLS-index dependency'
+Require ($undefined -match '\b_fltused\b') 'Fixture no longer tests the emitted floating-point marker'
 $link = @('/nodefaultlib', '/subsystem:console', '/entry:mainCRTStartup')
-$missing = Tool 'lld-link' ($link + @("/out:$out\missing.exe", "$out\threads.obj", "$out\state.obj", "$out\kernel32.lib")) -Failure
+$missing = Tool 'lld-link' ($link + @("/out:$out\missing.exe", "$out\threads.obj", "$out\state.obj", "$out\other.obj", "$out\kernel32.lib")) -Failure
 Require ($missing -match '_tls_index') 'Absent-support control failed for a different symbol'
-$null = Tool 'lld-link' ($link + @('/include:_tls_used', "/out:$out\tls.exe", "$out\threads.obj", "$out\state.obj", "$out\silk-tls.obj", "$out\kernel32.lib"))
+# Exercise the production Clang driver flags, not only a direct LLD invocation.
+$null = Tool 'clang' @('-B', $LlvmBin, '-fuse-ld=lld', '--target=x86_64-pc-windows-msvc', '-nostdlib',
+  '-Wl,/nodefaultlib,/subsystem:console,/entry:mainCRTStartup,/include:_tls_used',
+  "$out\threads.obj", "$out\state.obj", "$out\other.obj", "$out\silk-tls.obj", "$out\kernel32.lib", '-o', "$out\tls.exe")
 $object = Tool 'llvm-readobj' @('--sections', '--symbols', '--relocations', "$out\silk-tls.obj")
 $object | Set-Content "$out\support-object.txt"
 Require ($object -match 'Name: \.tls\s' -and $object -match 'Name: \.tls\$ZZZ') 'TLS template boundary sections are absent'
 Require ($object -match 'IMAGE_REL_AMD64_ADDR64 _tls_start' -and $object -match 'IMAGE_REL_AMD64_ADDR64 _tls_end' -and $object -match 'IMAGE_REL_AMD64_ADDR64 _tls_index') 'TLS directory pointers lost their image relocations'
+Require ($object -match '(?s)Name: _tls_index\s+Value: 0\s+Section: \.data') 'Loader TLS-index slot is not writable data'
+$stateObject = Tool 'llvm-readobj' @('--sections', '--symbols', "$out\state.obj")
+$stateObject | Set-Content "$out\state-object.txt"
+Require ($stateObject -match 'IMAGE_SCN_LNK_COMDAT' -and $stateObject -match 'Selection: Any') 'Diagnostic TLS has no coalescing COMDAT'
 $pe = Tool 'llvm-readobj' @('--file-headers', '--sections', '--coff-tls-directory', '--coff-imports', '--coff-basereloc', "$out\tls.exe")
 $pe | Set-Content "$out\tls-pe.txt"
 Require ($pe -match 'TLSTableRVA: 0x[1-9A-Fa-f]' -and $pe -match 'AddressOfIndex: 0x[1-9A-Fa-f]') 'Image has no active TLS directory'
@@ -73,9 +84,12 @@ Run 'tls' 0
 $global = (Get-Content -Raw "$PSScriptRoot\tls-state.ll").Replace('thread_local global', 'global')
 [IO.File]::WriteAllText("$out\global.ll", $global)
 $null = Tool 'clang' @('--target=x86_64-pc-windows-msvc', '-O2', '-c', "$out\global.ll", '-o', "$out\global.obj")
-$null = Tool 'lld-link' ($link + @("/out:$out\global.exe", "$out\threads.obj", "$out\global.obj", "$out\kernel32.lib"))
+$globalOther = $other.Replace('thread_local global', 'global')
+[IO.File]::WriteAllText("$out\global-other.ll", $globalOther)
+$null = Tool 'clang' @('--target=x86_64-pc-windows-msvc', '-O2', '-c', "$out\global-other.ll", '-o', "$out\global-other.obj")
+$null = Tool 'lld-link' ($link + @("/out:$out\global.exe", "$out\threads.obj", "$out\global.obj", "$out\global-other.obj", "$out\silk-tls.obj", "$out\kernel32.lib"))
 Run 'global' 17
-@{ status = 'pass'; claim = 'real PE loader initializes independent zero-valued diagnostic TLS on two threads';
+@{ status = 'pass'; claim = 'two emitted units share diagnostic TLS within each thread and remain independent across two threads';
   controls = @('missing support fails on _tls_index', 'global alias exits 17');
   source = 'production WindowsLink.tlsSource'; silkExecution = 'not-checked: reduced LLVM/C loader proof';
   os = [Environment]::OSVersion.VersionString } | ConvertTo-Json | Set-Content -Encoding UTF8 "$out\results.json"
