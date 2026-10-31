@@ -2689,6 +2689,10 @@ struct Resolver {
   impliedWalks: List<ImpliedWalk>,
   impliedLookup: InternIndex,
   impliedRevision: u32,
+  // Each declaration's successful `templateBinders`, kept only while the store is never revised and
+  // no unit records its reads, when building them again reads nothing a later unit could observe.
+  templateBinderSets: List<TemplateBinders>,
+  templateBinderLookup: InternIndex,
   // The walks of the unit runs in progress whose demand path a walk may read, innermost last. Each
   // run reads only its own and drops them when it ends.
   runWalks: List<ImpliedWalk>,
@@ -2704,6 +2708,17 @@ struct Resolver {
 // the signature it read, retained so its address names that signature while the walk is kept,
 // whether a call owes the bounds, what the walk found, and the answer edges and graph records its
 // unit made, which a unit reusing the walk makes again.
+// The binders `templateBinders` built for one declaration, by module ordinal and position: its
+// owner and, per binder, its kind (0 row, 1 type, 2 lifetime), name and parameter ordinal.
+struct TemplateBinders {
+  module: usize,
+  ordinal: usize,
+  owner: Option<DeclarationId>,
+  kinds: List<u8>,
+  names: List<Bytes>,
+  ordinals: List<usize>,
+}
+
 struct ImpliedWalk {
   unitRun: usize,
   application: usize,
@@ -10233,6 +10248,35 @@ effect fn templateBinders(resolver: &mut Resolver, module: &ModuleId, ordinal: u
   List<Binder>,
   Shared<Rejection>,
 > ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if recording(&resolver.*) || recordingUnit(&resolver.*) != usize.MAX {
+    return run writtenTemplateBinders(&mut resolver.*, module, ordinal)
+  }
+  let moduleOrdinal = knownModuleOrdinal(&resolver.*, module)
+  if moduleOrdinal == usize.MAX { return run writtenTemplateBinders(&mut resolver.*, module, ordinal) }
+  let hashed = Hash.combine(Hash.mix(&Hash.seed(0), usize.toU64(moduleOrdinal)), usize.toU64(ordinal))
+  let sets = List<TemplateBinders>.asSlice(&resolver.templateBinderSets)
+  let mut at = InternIndex.first(&resolver.templateBinderLookup, hashed)
+  while at != usize.MAX {
+    if sets[at].module == moduleOrdinal && sets[at].ordinal == ordinal {
+      return Result<List<Binder>, Shared<Rejection>>.succeed(run keptTemplateBinders(&sets[at]))
+    }
+    at = InternIndex.after(&resolver.templateBinderLookup, at)
+  }
+  let built = run writtenTemplateBinders(&mut resolver.*, module, ordinal)
+  if let Result<List<Binder>, Shared<Rejection>>.Success {value} = &built {
+    if let Option<TemplateBinders>.Some {value: kept} = move run keepTemplateBinders(moduleOrdinal, ordinal, List<Binder>.asSlice(&value)) {
+      run List<TemplateBinders>.append(&mut resolver.templateBinderSets, move kept)
+      run InternIndex.record(&mut resolver.templateBinderLookup, hashed)
+    }
+  }
+  return move built
+}
+
+// The binders a declaration's written generics introduce, read from its syntax.
+effect fn writtenTemplateBinders(resolver: &mut Resolver, module: &ModuleId, ordinal: usize) -> Result<
+  List<Binder>,
+  Shared<Rejection>,
+> ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
   let mut binders = List<Binder>.make()
   let identity = run declarationAt(&mut resolver.*, module, ordinal)
   let answer = run observedDeclaration(&mut resolver.*, module, ordinal, SourceFacet.Binders)
@@ -13179,6 +13223,93 @@ effect fn roleDeclaration(
   return Result<Shared<Type>, Shared<Rejection>>.failResult(
     run reject(&resolver.*, module, RejectionCode.InvalidRequirement, parsed.span),
   )
+}
+
+// Fresh binders from a kept `TemplateBinders`, built as `writtenTemplateBinders` builds them: each
+// with its own handles, since `Shared.with` borrows a handle exclusively.
+effect fn keptTemplateBinders(kept: &TemplateBinders) -> List<Binder> ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let kinds = List<u8>.asSlice(&kept.kinds)
+  let mut binders = run List<Binder>.makeWithCapacity(kinds.length)
+  if let Option<DeclarationId>.Some {value: owner} = &kept.owner {
+    let names = List<Bytes>.asSlice(&kept.names)
+    let ordinals = List<usize>.asSlice(&kept.ordinals)
+    let mut at = usize.ZERO
+    while at < kinds.length {
+      let name = run Bytes.copy(Bytes.asSlice(&names[at]))
+      if kinds[at] == 0 {
+        run List<Binder>.append(&mut binders, Binder.Row {
+          name: move name,
+          value: RowParameter {declaration: run Shared<DeclarationId>.make(DeclarationId.copy(&owner)), ordinal: ordinals[at]},
+          bound: Option<Shared<Row>>.none(),
+        })
+      } else if kinds[at] == 1 {
+        let parameterType = run Types.intern(Type.Parameter {declaration: DeclarationId.copy(&owner), ordinal: ordinals[at]})
+        run List<Binder>.append(&mut binders, Binder.Type {name: move name, value: move parameterType})
+      } else {
+        run List<Binder>.append(&mut binders, Binder.Lifetime {
+          name: move name,
+          value: run Shared<Lifetime>.make(Lifetime.Parameter {declaration: DeclarationId.copy(&owner), ordinal: ordinals[at]}),
+        })
+      }
+      at = at + usize.ONE
+    }
+  }
+  return move binders
+}
+
+// What `keptTemplateBinders` needs to build `binders` again, or `None` when a binder is not one
+// `writtenTemplateBinders` builds.
+effect fn keepTemplateBinders(module: usize, ordinal: usize, binders: &[Binder]) -> Option<TemplateBinders> ! OutOfMemoryError ? &mut Allocator {
+  let mut kept = TemplateBinders {module: module, ordinal: ordinal, owner: Option<DeclarationId>.none(),
+    kinds: List<u8>.make(), names: List<Bytes>.make(), ordinals: List<usize>.make()}
+  let mut at = usize.ZERO
+  while at < binders.length {
+    let mut kind: u8 = 0
+    let mut position = usize.MAX
+    let mut owner = Option<DeclarationId>.none()
+    match &binders[at] {
+      Binder.Row {value, bound, ..} => {
+        if let Option<Shared<Row>>.Some {..} = &bound { return Option<TemplateBinders>.none() }
+        position = value.ordinal
+        owner = Option<DeclarationId>.some(DeclarationId.copyShared(&value.declaration))
+      }
+      Binder.Type {value, ..} => {
+        kind = 1
+        let parts = run Type.copy(&value)
+        if let Type.Parameter {declaration, ordinal: written} = move parts {
+          position = written
+          owner = Option<DeclarationId>.some(move declaration)
+        }
+      }
+      Binder.Lifetime {value, ..} => {
+        kind = 2
+        let parts = Shared<Lifetime>.with<Option<DeclarationId>>(&value, fn(node: &Lifetime) -> Option<DeclarationId> {
+          if let Lifetime.Parameter {declaration, ..} = &node.* { return Option<DeclarationId>.some(DeclarationId.copy(&declaration)) }
+          return Option<DeclarationId>.none()
+        })
+        position = Shared<Lifetime>.with<usize>(&value, fn(node: &Lifetime) -> usize {
+          if let Lifetime.Parameter {ordinal: written, ..} = &node.* { return written }
+          return usize.MAX
+        })
+        owner = move parts
+      }
+    }
+    let identity = match move owner {
+      Option<DeclarationId>.Some {value} => move value
+      Option<DeclarationId>.None => { return Option<TemplateBinders>.none() }
+    }
+    if position == usize.MAX { return Option<TemplateBinders>.none() }
+    if let Option<DeclarationId>.Some {value: known} = &kept.owner {
+      if !DeclarationId.equals(&known, &identity) { return Option<TemplateBinders>.none() }
+    } else {
+      kept.owner = Option<DeclarationId>.some(move identity)
+    }
+    run List<u8>.append(&mut kept.kinds, kind)
+    run List<Bytes>.append(&mut kept.names, run Bytes.copy(binderName(&binders[at])))
+    run List<usize>.append(&mut kept.ordinals, position)
+    at = at + usize.ONE
+  }
+  return Option<TemplateBinders>.some(move kept)
 }
 
 effect fn copyBinder(binder: &Binder) -> Binder ! OutOfMemoryError ? &mut Allocator {
@@ -88624,6 +88755,8 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       impliedWalks: List<ImpliedWalk>.make(),
       impliedLookup: InternIndex.make(),
       impliedRevision: 0,
+      templateBinderSets: List<TemplateBinders>.make(),
+      templateBinderLookup: InternIndex.make(),
       runWalks: List<ImpliedWalk>.make(),
       pathFrames: usize.ZERO,
       pathReads: usize.ZERO,
