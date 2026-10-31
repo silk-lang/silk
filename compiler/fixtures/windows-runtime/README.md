@@ -46,7 +46,10 @@ bindings must be resolved before claiming an executable. Do not mask them with C
 
 System `Allocator` requests on Windows adopt a `HeapAlloc` allocation with a `HeapFree` reclaim
 callback, including alignment padding. They decline the libc-specific in-place growth path.
-Execution-storage reservations and diagnostic pools use the same heap with their existing accounting.
+Execution-storage reservations and diagnostic pools still require the separately owned Windows
+execution-storage binding. Until that module admits Windows, `NativeDiagnostics` cannot import its
+`ExecutionStorage` type on this target. `WindowsHeap.acquire` and `WindowsHeap.release` are available
+for that binding, with the existing reservation accounting retained by its owner.
 
 ## Host contracts
 
@@ -73,13 +76,22 @@ Both paths handle partial writes and reject zero progress. Writes are not messag
 
 ## Validation limits
 
+`run-environment.ps1` builds and runs `environment-contract.c` with LLVM 22.1.8, without a CRT.
+It passed on this Windows host. The PE imports only Kernel32. This independent OS probe checks
+non-ASCII case matching against `GetEnvironmentVariableW`, ordinal no-expansion (`ß` versus `SS`),
+distinct capital/final sigma names, lone-surrogate values, and a snapshot retained across mutation.
+Mutation stays inside the short-lived probe process. Results and PE inspection are retained under
+`.scratch/windows-environment`. These assertions verify the OS premises, not Silk provider execution.
+
 The Windows-only source requires target integration before it can be type-checked and emitted.
 The portable corpus runs through existing Linux CI. No Windows execution, allocator failure
 injection, snapshot-lifetime execution, real-console readback, or Win32 child argument oracle is
 claimed solely from those portable tables. Run `hello.exe` both redirected and on a real console,
 then inspect PE imports and test the host provider before treating this slice as a Windows runtime.
 Generate `reference/stdlib` with `silk doc-reference --stdlib-root stdlib --output reference/stdlib`
-when a native Silk compiler is available. No Linux/macOS workflow changes are required here.
+when a native Silk compiler is available. Its explicit profile enumeration in
+`compiler/src/documentation/Command.silk` also needs Windows for the combined target/runtime
+reference. That compiler edit is left to integration. No Linux/macOS workflow changes are required here.
 
 ## Pinned upstream references
 
@@ -88,8 +100,9 @@ These sources inform edge cases; their implementation is not used as a test orac
 - [Zig 0.15.2 `unicode.zig`, e4cbd752][zig]: the test at line 2013 explicitly shows that adjacent
   separately encoded surrogate halves do not preserve bytes through UTF-16. Silk rejects those
   noncanonical bytes instead of silently normalizing them.
-- [Rust 1.90.0 `wtf8.rs`, 1159e78c][rust-wtf8]: `from_wide` preserves lone surrogates and combines
-  valid pairs. `push_wtf8` also combines pairs formed at concatenation boundaries.
+- [Rust 1.90.0 `wtf8.rs`, 1159e78c][rust-wtf8] and its [fixed tables][rust-wtf8-tests]: `from_wide`
+  preserves lone surrogates and combines valid pairs. `push_wtf8` also combines pairs formed at
+  concatenation boundaries. The corpus includes a lone high surrogate immediately before a valid pair.
 - [Rust Windows argument parser][rust-args] and its [fixed expectation tests][rust-args-tests]:
   argv[0] is separate, and doubled quotes inside later quoted arguments follow post-2008 MSVC rules.
 - [Rust Windows environment iterator][rust-env]: search for the separator after the first code
@@ -99,6 +112,7 @@ These sources inform edge cases; their implementation is not used as a test orac
 
 [zig]: https://github.com/ziglang/zig/blob/e4cbd752c8c05f131051f8c873cff7823177d7d3/lib/std/unicode.zig#L2013
 [rust-wtf8]: https://github.com/rust-lang/rust/blob/1159e78c4747b02ef996e55082b704c09b970588/library/std/src/sys_common/wtf8.rs
+[rust-wtf8-tests]: https://github.com/rust-lang/rust/blob/1159e78c4747b02ef996e55082b704c09b970588/library/std/src/sys_common/wtf8/tests.rs
 [rust-args]: https://github.com/rust-lang/rust/blob/1159e78c4747b02ef996e55082b704c09b970588/library/std/src/sys/args/windows.rs
 [rust-args-tests]: https://github.com/rust-lang/rust/blob/1159e78c4747b02ef996e55082b704c09b970588/library/std/src/sys/args/windows/tests.rs
 [rust-env]: https://github.com/rust-lang/rust/blob/1159e78c4747b02ef996e55082b704c09b970588/library/std/src/sys/env/windows.rs
