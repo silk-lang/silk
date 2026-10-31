@@ -1,9 +1,16 @@
 param(
-  [string]$LlvmBin = 'C:\Users\Administrator\silk-windows-tools\clang+llvm-22.1.8-x86_64-pc-windows-msvc\bin',
+  [string]$LlvmBin = "$env:USERPROFILE\silk-windows-tools\clang+llvm-22.1.8-x86_64-pc-windows-msvc\bin",
   [string]$OutputDirectory = (Join-Path $PSScriptRoot '..\..\..\.scratch\windows-providers'),
   [string]$SilkExecutable = ''
 )
 $ErrorActionPreference = 'Stop'
+function Invoke-CheckedProgram([string]$Executable) {
+  $process = Start-Process -FilePath $Executable -WindowStyle Hidden -PassThru
+  try {
+    if (!$process.WaitForExit(30000)) { $process.Kill(); throw "Program timed out: $Executable" }
+    if ($process.ExitCode -ne 0) { throw "Program exited $($process.ExitCode): $Executable" }
+  } finally { $process.Dispose() }
+}
 New-Item -ItemType Directory -Force $OutputDirectory | Out-Null
 $out = (Resolve-Path -LiteralPath $OutputDirectory).Path
 @'
@@ -42,12 +49,10 @@ if ($LASTEXITCODE -ne 0) { throw 'PE inspection failed' }
 $imports | Set-Content -LiteralPath (Join-Path $out 'pe.txt')
 $dlls = @($imports | Select-String '^  Name: (.+\.dll)$' | ForEach-Object { $_.Matches[0].Groups[1].Value.ToLowerInvariant() } | Sort-Object -Unique)
 if ($dlls.Count -ne 2 -or $dlls[0] -ne 'bcryptprimitives.dll' -or $dlls[1] -ne 'kernel32.dll') { throw "Unexpected imports: $dlls" }
-$process = Start-Process -FilePath (Join-Path $out 'contract.exe') -WindowStyle Hidden -PassThru -Wait
-if ($process.ExitCode -ne 0) { throw "OS contract failed: $($process.ExitCode)" }
+Invoke-CheckedProgram (Join-Path $out 'contract.exe')
 $silkStatus = 'not-checked: requires cross-built providers.silk with providers-contract.c companion'
 if ($SilkExecutable) {
-  $process = Start-Process -FilePath (Resolve-Path -LiteralPath $SilkExecutable).Path -WindowStyle Hidden -PassThru -Wait
-  if ($process.ExitCode -ne 0) { throw "Silk providers failed: $($process.ExitCode)" }
+  Invoke-CheckedProgram (Resolve-Path -LiteralPath $SilkExecutable).Path
   $silkStatus = 'passed'
 }
 @{

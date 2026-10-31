@@ -7,7 +7,7 @@ $artifact = (Resolve-Path -LiteralPath $ArtifactDirectory).Path
 $readobj = Join-Path $LlvmBin 'llvm-readobj.exe'
 $results = @()
 $failed = $false
-foreach ($name in @('hello', 'storage')) {
+foreach ($name in @('hello', 'storage', 'host-check', 'providers')) {
   $executable = Join-Path $artifact "$name.exe"
   if (!(Test-Path -LiteralPath $executable)) {
     $results += @{ program = $name; status = 'not-checked'; reason = 'cross-build executable missing' }
@@ -18,8 +18,25 @@ foreach ($name in @('hello', 'storage')) {
   if ($LASTEXITCODE -ne 0) { throw "llvm-readobj failed for $name" }
   $inspection | Set-Content -LiteralPath (Join-Path $artifact "$name-native-pe.txt")
   $imports = @($inspection | Select-String '^\s+Name: (.+\.dll)$' | ForEach-Object { $_.Matches[0].Groups[1].Value })
-  if ($imports.Count -eq 0 -or @($imports | Where-Object { $_ -notmatch '^(kernel32|ntdll)\.dll$' }).Count -ne 0) {
+  $allowed = '^(kernel32|ntdll)\.dll$'
+  if ($name -eq 'providers') { $allowed = '^(kernel32|ntdll|bcryptprimitives)\.dll$' }
+  if ($imports.Count -eq 0 -or @($imports | Where-Object { $_ -notmatch $allowed }).Count -ne 0) {
     throw "Unexpected or missing DLL imports for $name`: $imports"
+  }
+  if ($name -eq 'host-check' -or $name -eq 'providers') {
+    try {
+      if ($name -eq 'host-check') {
+        $detail = & (Join-Path $PSScriptRoot 'run-host.ps1') -Executable $executable
+      } else {
+        $detail = & (Join-Path $PSScriptRoot 'run-providers.ps1') -SilkExecutable $executable `
+          -LlvmBin $LlvmBin -OutputDirectory (Join-Path $artifact 'providers-native')
+      }
+      $results += @{ program = $name; status = 'pass'; imports = $imports; detail = ($detail | ConvertFrom-Json) }
+    } catch {
+      $results += @{ program = $name; status = 'fail'; imports = $imports; reason = $_.Exception.Message }
+      $failed = $true
+    }
+    continue
   }
   $start = New-Object System.Diagnostics.ProcessStartInfo
   $start.FileName = $executable
