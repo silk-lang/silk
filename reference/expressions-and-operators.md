@@ -403,8 +403,8 @@ delimiter, or statement boundary. Use `(run operation)` when the executed succes
 participate in a surrounding expression.
 
 ```silk
-return run attempt |> Effect.retry(2) // runs the transformed Effect
-return (run attempt) + 1              // adds to the executed success value
+return run attempt |> Effect.retry(&policy) // runs the transformed Effect
+return (run attempt) + 1                     // adds to the executed success value
 ```
 
 The same boundary matters inside a larger Boolean expression:
