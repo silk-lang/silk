@@ -7,7 +7,7 @@ mkdir -p "$out"
 git rev-parse HEAD > "$out/source-commit.txt"
 printf 'program\tcompile\tpe-imports\texecution\n' > "$out/results.tsv"
 failed=0
-for program in hello storage; do
+for program in hello storage host-check; do
   source="$PWD/compiler/fixtures/windows-runtime/$program.silk"
   # Retain actual Silk output and the helpers its unoptimized object requires. This inventory
   # distinguishes emitted dependencies from the broader handwritten compiler-rt risk fixture.
