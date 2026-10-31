@@ -138,8 +138,13 @@ For `x86_64-pc-windows-msvc`, signed and unsigned 8-bit and 16-bit scalar argume
 use bare LLVM integer lanes. The caller does not promise sign or zero extension of their upper
 register bits. C default argument promotions still apply to unnamed variadic arguments.
 The independent [Clang fixture](../compiler/fixtures/windows-abi/README.md) records the declaration,
-direct-call, callback and export signatures. This verifies scalar ABI shape; Windows foreign
-unwind handling and executable interoperability still require the Windows runtime and linker.
+direct-call, callback and export signatures. Windows foreign guards use the four-argument x64
+exception routine ABI: exception-record pointer, 64-bit establisher frame, context pointer and
+dispatcher-context pointer, with an `i32` disposition result. The handler terminates through
+Windows fast fail with reason `FAST_FAIL_FATAL_APP_EXIT`, without dispatching another exception.
+ELF and Mach-O keep their five-argument trap personality. All targets use a hidden coalesced
+definition. A reduced native SEH fixture verifies the Windows handler boundary.
+Full Silk executable interoperability still requires the Windows runtime and linker.
 By-value C structs and vectors on Windows remain unsupported and must not use the ARM64 classifier.
 
 An `extern "C" struct` can pass or return by value in direct calls, native function-pointer

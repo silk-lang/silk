@@ -53,3 +53,69 @@ Its [64-bit data model](https://learn.microsoft.com/en-us/windows/win32/winprog6
 specifies LLP64. These contracts and the independent C fixture determine Silk's machine facts
 and bare narrow-integer lanes. Windows aggregate/vector support remains an explicit gap instead
 of inheriting another target's rules.
+
+## Foreign personality ABI and native SEH proof
+
+`seh-personality.c` independently spells Microsoft's
+[x64 exception routine](https://learn.microsoft.com/en-us/cpp/build/exception-handling-x64?view=msvc-170).
+Clang emits `i32 (ptr, i64, ptr, ptr)`: exception record, `ULONG64 EstablisherFrame`, context,
+and dispatcher context. `seh-personality.ll` retains that independent output. Regenerate it
+from this directory with Clang 22.1.8:
+
+```sh
+clang --target=x86_64-pc-windows-msvc19.33.0 -O2 -ffreestanding -fno-stack-protector \
+  -Werror -fno-ident -fno-discard-value-names '-fdebug-compilation-dir=.' \
+  -S -emit-llvm seh-personality.c -o seh-personality.ll
+```
+
+`LlvmCode` uses this signature both for the handler definition and for foreign-guard references,
+including reclaim guards and coroutine steps. ELF and Mach-O retain the five-argument Itanium
+signature. The existing Windows scalar lowering case checks the complete emitted handler
+signature and reclaim guard; the SysV foreign-contract case checks the five-argument signature.
+These source tests require a runnable Silk compiler and have not run on this Windows host.
+
+Run the opt-in native proof from the repository root:
+
+```powershell
+& compiler/fixtures/windows-abi/check-seh.ps1
+```
+
+The runner needs the shared portable LLVM 22.1.8 installation, with no SDK or CRT. It compiles
+the C signature and fast-fail oracle, checks its emitted IR, and compiles the reduced handwritten
+`seh-guard.ll` separately from `seh-caller.c`. It verifies the handler's SEH relocation and
+symbol inventory, links with `/nodefaultlib`, and requires imports from only Kernel32
+and NTDLL. The unguarded `RaiseException` control reaches the outer C catch and exits 98;
+the guarded call must terminate through Windows fast fail (`0xC0000409`, signed exit
+-1073740791), with reason `FAST_FAIL_FATAL_APP_EXIT` (7), before that catch.
+Both observations passed on this Windows x64 host. Three additional guarded executions
+confirmed the same exit after investigating the unstable trap control.
+Commands, Clang IR, symbols, unwind records, imports and structured results remain under
+`.scratch/windows-abi-seh`.
+
+The native control exposed an unstable assumption in the first reduced toolchain proof:
+`llvm.trap` becomes `ud2`, which raises another dispatchable exception from inside SEH.
+Both four- and five-argument trap handlers produced `STATUS_ACCESS_VIOLATION` (`0xC0000005`)
+in some executions. Changing the handler to local linkage initially appeared to fix it,
+but a subsequent run reproduced the access violation. Linkage was not a valid explanation.
+Windows therefore uses the independently emitted `__fastfail(7)` instruction sequence,
+`int 0x29` with the reason in ECX. Microsoft's
+[fast-fail contract](https://learn.microsoft.com/en-us/cpp/intrinsics/fastfail?view=msvc-170)
+specifies non-continuable termination without invoking exception handlers, which prevents
+nested exception dispatch. The existing hidden `linkonce_odr` definition remains on every
+target, including Mach-O where coalescing avoids the compact-unwind personality limit.
+
+[Rust's SEH implementation](https://github.com/rust-lang/rust/blob/2687a5023568f1e469910a54abf2e42d979d9ab4/library/panic_unwind/src/seh.rs)
+uses CRT `__CxxFrameHandler3`, C++ exceptions and LLVM funclets. Silk's forbidden-unwind contract
+does not require that runtime. Rust's
+[foreign-exception test](https://github.com/rust-lang/rust/blob/2687a5023568f1e469910a54abf2e42d979d9ab4/tests/run-make/foreign-exceptions/foo.cpp)
+provides the useful outer-catch control pattern, without importing its cross-language unwinding
+policy or claiming its tests passed here.
+
+This proves a reduced SEH boundary, not the full Silk Windows foreign-unwind corpus or fatal
+observer. Runtime providers, Windows frame walking, COFF frame-table bounds, and linking remain
+separate work. Compiler-generated Windows helper dependencies are not yet inventoried because
+this host has no runnable Silk compiler. Source inspection finds an i128 load/store used for
+16-byte union copies in `LlvmCode.storePackedUnion`; it does not establish a need for i128
+arithmetic builtins. The separate no-CRT proof's synthetic i128 arithmetic inventory is not
+evidence that Silk emits those operations. No compiler-rt supply, security-cookie stub, or
+other runtime support is added here.
