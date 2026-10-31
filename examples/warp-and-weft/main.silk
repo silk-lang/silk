@@ -1,0 +1,1224 @@
+//! "Warp and Weft", an original 8-bit song played by four fibers that a Schedule keeps in time.
+//!
+//! Each instrument (lead, arpeggio, bass and drums) is its own Fiber under a LocalScheduler.
+//! `Effect.repeat` with `Schedule.fixed` steps each one through its part on its own grid, and the
+//! drum roll at the end speeds up with `Schedule.exponentialBy`. Then four pool fibers synthesize
+//! the four tracks in parallel, and the program mixes them into a WAV file.
+//!
+//! - `silk run -- wav song.wav` renders the song at once, with a virtual clock.
+//! - `silk run -- play` renders it, starts a player, and shows the song live on the real clock.
+//! - `silk run` checks that the arrangement is complete and exits.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.schedule { Schedule }
+import silk.concurrency.fiber { Cancelled, Fiber }
+import silk.concurrency.local_scheduler { LocalScheduler, StalledError }
+import silk.concurrency.scheduler { Scheduler, TaskIdExhaustedError }
+import silk.num.f64
+import silk.num.i32
+import silk.num.u32
+import silk.num.u64
+import silk.num.u8
+import silk.num.f32
+import silk.num.usize
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.filesystem_native { OsFileSystem }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.system.insecure_random { InsecureRandom }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.system_clock { Instant, SystemClock }
+import silk.text.string { String }
+import silk.mem.shared { Shared }
+import silk.core.result { Result }
+import silk.concurrency.thread_native { NativeThread, SpawnError }
+import silk.concurrency.thread_pool { Pool, ThreadPool }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StdoutWriter }
+import silk.system.child_process { ChildProcess }
+import silk.system.child_process_native { OsChildProcess }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+
+// ---- The song ---------------------------------------------------------------------------------
+
+// One step is a sixteenth note at 150 beats per minute.
+const STEP: u64 = 100ms
+
+const STEPS_PER_BAR: usize = 16
+
+const BARS: usize = 27
+
+const SAMPLE_RATE: u64 = 44100
+
+const SECONDS: usize = 45
+
+// A score is one token per step, two bars to a line: a note such as `D5`, `Bb4` or `C#6`, `-` to hold the note
+// before, or `.` for silence.
+const REST_BAR: string<'static> = ". . . . . . . . . . . . . . . ."
+
+effect fn appendVerse(steps: &mut List<i32>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run appendTokens(
+    &mut steps.*,
+    "D5 - . D5 F5 - A5 - G5 - F5 - E5 - F5 - D5 - - - - - . . Bb4 - C5 - D5 - F5 -",
+  )
+  run appendTokens(
+    &mut steps.*,
+    "C5 - . C5 F5 - A5 - C6 - A5 - G5 - F5 - E5 - - - G5 - - - E5 - D5 - C5 - E5 -",
+  )
+  run appendTokens(
+    &mut steps.*,
+    "D5 - . D5 F5 - A5 - D6 - C6 - A5 - G5 - F5 - - - D5 - F5 - Bb5 - A5 - G5 - F5 -",
+  )
+  run appendTokens(
+    &mut steps.*,
+    "A5 - G5 - F5 - C5 - F5 - G5 - A5 - C6 - Bb5 - - - A5 - - - G5 - - - E5 - . .",
+  )
+}
+
+effect fn appendBridge(steps: &mut List<i32>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run appendTokens(
+    &mut steps.*,
+    "G5 - - Bb5 - - D6 - - Bb5 - - A5 - G5 - F5 - - D5 - - F5 - - Bb5 - - A5 - - -",
+  )
+  run appendTokens(
+    &mut steps.*,
+    "A5 - - F5 - - A5 - - D6 - - C6 - A5 - C#6 - - - A5 - - - E5 - - - C#5 - E5 -",
+  )
+  run appendTokens(
+    &mut steps.*,
+    "D6 - - Bb5 - - G5 - - Bb5 - - D6 - G6 - F6 - - - D6 - - - Bb5 - C6 - D6 - F6 -",
+  )
+  run appendTokens(
+    &mut steps.*,
+    "E6 - - - D6 - - - A5 - - - F5 - A5 - C#6 - - - - - - - E6 - - - - - . .",
+  )
+}
+
+const ENDING: string<'static> = "D5 - - - - - - - - - - - - - . ."
+
+// One chord for each bar.
+const INTRO_CHORDS: string<'static> = "Dm Dm"
+
+const VERSE_CHORDS: string<'static> = "Dm Bb F C Dm Bb F C"
+
+const BRIDGE_CHORDS: string<'static> = "Gm Bb Dm A Gm Bb Dm A"
+
+const ENDING_CHORDS: string<'static> = "Dm"
+
+// Drums: `K` kick, `S` snare, `h` hi-hat, `.` nothing. The last bar before the ending is a roll.
+const GROOVE: string<'static> = "K . h . S . h . K . K h S . h ."
+
+const BUSY: string<'static> = "K . h K S . h . K . h K S . h h"
+
+const FILL: string<'static> = "K . h . S . h . K . S . S S S S"
+
+const COUNT_IN: string<'static> = "K . h . K . h . K . h . K . h ."
+
+// ---- Notes and tracks -------------------------------------------------------------------------
+
+const HOLD: i32 = -1
+
+const REST: i32 = 0
+
+const LEAD: i32 = 0
+
+const ARPEGGIO: i32 = 1
+
+const BASS: i32 = 2
+
+const DRUMS: i32 = 3
+
+const KICK: i32 = 1
+
+const SNARE: i32 = 2
+
+const HAT: i32 = 3
+
+const CRASH: i32 = 4
+
+/// One sounding note. Times are nanoseconds from the start of the song.
+struct Note {
+  start: u64,
+  length: u64,
+  // A MIDI note number for a melodic voice, or a drum sound.
+  pitch: i32,
+}
+
+impl Copy for Note {}
+
+/// The notes one instrument played.
+struct Track {
+  instrument: i32,
+  notes: List<Note>,
+}
+
+// ---- Parsing ----------------------------------------------------------------------------------
+
+effect fn appendTokens(steps: &mut List<i32>, score: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut tokens = String.split(score, " ")
+  while true {
+    match tokens.next() {
+      Option.None => {
+        return ()
+      }
+      Option.Some { value } => {
+        let token = String.trim(value)
+        if String.byteLength(token) > 0 {
+          run steps.append(pitchOf(token))
+        }
+      }
+    }
+  }
+}
+
+effect fn appendRepeated(steps: &mut List<i32>, score: string, times: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut done: usize = 0
+  while done < times {
+    run appendTokens(&mut steps.*, score)
+    done = done + 1
+  }
+}
+
+// The semitone of a note letter from C, or -1.
+fn letter(byte: u8) -> i32 {
+  return match byte {
+    67 => 0
+    68 => 2
+    69 => 4
+    70 => 5
+    71 => 7
+    65 => 9
+    66 => 11
+    _ => -1
+  }
+}
+
+// The MIDI number of a token such as `C#6`, or HOLD or REST.
+fn pitchOf(token: string) -> i32 {
+  let bytes = String.utf8Bytes(token)
+  if bytes[0] == 45 {
+    return HOLD
+  }
+  if bytes[0] == 46 {
+    return REST
+  }
+  let mut semitone = letter(bytes[0])
+  let mut at: usize = 1
+  if bytes[1] == 35 {
+    semitone = semitone + 1
+    at = 2
+  } else if bytes[1] == 98 {
+    semitone = semitone - 1
+    at = 2
+  }
+  let octave = u8.toI32(bytes[at]) - 48
+  return 12 * (octave + 1) + semitone
+}
+
+// The root semitone of a chord name such as `Bb` or `Dm`, and whether it is minor.
+struct Chord {
+  root: i32,
+  minor: bool,
+}
+
+impl Copy for Chord {}
+
+fn chordOf(name: string) -> Chord {
+  let bytes = String.utf8Bytes(name)
+  let mut root = letter(bytes[0])
+  let mut at: usize = 1
+  if bytes.length > 1 && bytes[1] == 35 {
+    root = root + 1
+    at = 2
+  } else if bytes.length > 1 && bytes[1] == 98 {
+    root = root - 1
+    at = 2
+  }
+  return Chord { root: (root + 12) % 12, minor: bytes.length > at && bytes[at] == 109 }
+}
+
+effect fn appendChords(chords: &mut List<Chord>, names: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut tokens = String.split(names, " ")
+  while true {
+    match tokens.next() {
+      Option.None => {
+        return ()
+      }
+      Option.Some { value } => {
+        if String.byteLength(value) > 0 {
+          run chords.append(chordOf(value))
+        }
+      }
+    }
+  }
+}
+
+effect fn progression() -> List<Chord>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut chords = List<Chord>.make()
+  run appendChords(&mut chords, INTRO_CHORDS)
+  run appendChords(&mut chords, VERSE_CHORDS)
+  run appendChords(&mut chords, BRIDGE_CHORDS)
+  run appendChords(&mut chords, VERSE_CHORDS)
+  run appendChords(&mut chords, ENDING_CHORDS)
+  return move chords
+}
+
+// ---- The players ------------------------------------------------------------------------------
+
+/// What each instrument plays right now, for the live screen.
+struct Stage {
+  // A pitch, or REST, for each melodic instrument, and the last drum sound for DRUMS.
+  pitches: [i32; 4],
+  // Whether the instrument started a note since the screen drew its last row.
+  onsets: [bool; 4],
+}
+
+impl Copy for Stage {}
+
+/// What every player shares: the start of the song, and the stage.
+struct Gig {
+  origin: Instant,
+  stage: Shared<Stage>,
+}
+
+fn copyOf(origin: &Instant) -> Instant {
+  return SystemClock.make(SystemClock.seconds(origin), SystemClock.nanoseconds(origin))
+}
+
+fn share(gig: &Gig) -> Gig {
+  return Gig { origin: copyOf(&gig.origin), stage: Shared<Stage>.clone(&gig.stage) }
+}
+
+fn show(gig: &Gig, instrument: i32, pitch: i32) -> () {
+  let slot = i32.toUsize(instrument)
+  Shared.withMut(
+    &gig.stage,
+    fn(stage: &mut Stage) -> () {
+      stage.pitches[slot] = pitch
+      if pitch != REST {
+        stage.onsets[slot] = true
+      }
+      return ()
+    },
+  )
+}
+
+fn sinceOrigin(origin: &Instant, now: &Instant) -> u64 {
+  let seconds = SystemClock.seconds(now) - SystemClock.seconds(origin)
+  let nanoseconds = SystemClock.nanoseconds(now) - SystemClock.nanoseconds(origin)
+  return Intrinsic.i64ToU64(seconds * 1000000000 + nanoseconds)
+}
+
+/// One melodic instrument as its Schedule steps it through its part.
+struct Player {
+  gig: Gig,
+  steps: List<i32>,
+  at: usize,
+  // The pitch that is sounding and when it started, or REST.
+  sounding: i32,
+  since: u64,
+  track: Track,
+}
+
+effect fn release(player: &mut Player, at: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if player.sounding != REST {
+    run player.track.notes.append(
+      Note { start: player.since, length: at - player.since, pitch: player.sounding },
+    )
+    player.sounding = REST
+  }
+}
+
+// One step: start, hold or stop a note.
+effect fn advance(player: &mut Player) -> ()
+  ! OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator {
+  let now = run MonotonicClock.now()
+  let at = sinceOrigin(&player.gig.origin, &now)
+  let step = player.steps.get(player.at)
+  player.at = player.at + 1
+  if step == HOLD {
+    return ()
+  }
+  run release(&mut player.*, at)
+  show(&player.gig, player.track.instrument, step)
+  if step != REST {
+    player.sounding = step
+    player.since = at
+  }
+}
+
+// Plays each of `steps` on a grid of `step`, and returns what it played.
+effect fn perform(gig: Gig, instrument: i32, steps: List<i32>, step: u64) -> Track
+  ! OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator {
+  let mut player = Player {
+    gig: move gig,
+    steps: move steps,
+    at: 0,
+    sounding: REST,
+    since: 0,
+    track: Track { instrument: instrument, notes: List<Note>.make() },
+  }
+  let mut random = InsecureRandom.seeded(0)
+  let grid = Schedule.fixed(step) |> Schedule.limit(usize.toU64(player.steps.length()) - 1)
+  run Effect.repeat(advance(&mut player), &grid) |> Effect.provideMut<InsecureRandom>(&mut random)
+  let end = run MonotonicClock.now()
+  let last = sinceOrigin(&player.gig.origin, &end) + step
+  run release(&mut player, last)
+  show(&player.gig, instrument, REST)
+  return move player.track
+}
+
+effect fn lead(gig: Gig) -> Track
+  ! OutOfMemoryError
+  ? &mut Scheduler | &mut MonotonicClock {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run playLead(move gig) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn playLead(gig: Gig) -> Track
+  ! OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator {
+  let mut steps = List<i32>.make()
+  run appendRepeated(&mut steps, REST_BAR, 2)
+  run appendVerse(&mut steps)
+  run appendBridge(&mut steps)
+  run appendVerse(&mut steps)
+  run appendTokens(&mut steps, ENDING)
+  return run perform(move gig, LEAD, move steps, STEP)
+}
+
+effect fn bass(gig: Gig) -> Track
+  ! OutOfMemoryError
+  ? &mut Scheduler | &mut MonotonicClock {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run playBass(move gig) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Eighth notes that bounce between the root and its octave, with the fifth before the next bar.
+effect fn playBass(gig: Gig) -> Track
+  ! OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator {
+  let chords = run progression()
+  let mut steps = List<i32>.make()
+  let mut bar: usize = 0
+  while bar < chords.length() {
+    let root = 38 + (chords.get(bar).root + 10) % 12
+    let pattern = [0, 12, 0, 12, 0, 12, 7, 12]
+    let mut at: usize = 0
+    while at < 8 {
+      run steps.append(root + pattern[at])
+      at = at + 1
+    }
+    bar = bar + 1
+  }
+  return run perform(move gig, BASS, move steps, STEP * 2)
+}
+
+effect fn arpeggio(gig: Gig) -> Track
+  ! OutOfMemoryError
+  ? &mut Scheduler | &mut MonotonicClock {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run playArpeggio(move gig) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Thirty-second notes up and down each chord, from the end of the intro.
+effect fn playArpeggio(gig: Gig) -> Track
+  ! OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator {
+  let chords = run progression()
+  let mut steps = List<i32>.make()
+  let mut bar: usize = 0
+  while bar < chords.length() {
+    let chord = chords.get(bar)
+    let root = 57 + (chord.root + 3) % 12
+    let third = if chord.minor {
+      3
+    } else {
+      4
+    }
+    let shape = [0, third, 7, 12, 7, third]
+    let mut at: usize = 0
+    while at < 32 {
+      if bar < 2 || bar == chords.length() - 1 && at >= 8 {
+        run steps.append(REST)
+      } else {
+        run steps.append(root + shape[at % 6])
+      }
+      at = at + 1
+    }
+    bar = bar + 1
+  }
+  return run perform(move gig, ARPEGGIO, move steps, STEP / 2)
+}
+
+effect fn drums(gig: Gig) -> Track
+  ! OutOfMemoryError
+  ? &mut Scheduler | &mut MonotonicClock {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run playDrums(move gig) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// The drummer: a groove on the step grid, then a roll whose hits come faster and faster.
+struct Drummer {
+  gig: Gig,
+  pattern: List<u8>,
+  at: usize,
+  hits: u64,
+  track: Track,
+}
+
+effect fn hit(drummer: &mut Drummer, sound: i32) -> ()
+  ! OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator {
+  let now = run MonotonicClock.now()
+  let length = if sound == CRASH {
+    1500ms
+  } else {
+    STEP
+  }
+  run drummer.track.notes.append(
+    Note { start: sinceOrigin(&drummer.gig.origin, &now), length: length, pitch: sound },
+  )
+  show(&drummer.gig, DRUMS, sound)
+}
+
+effect fn groove(drummer: &mut Drummer) -> ()
+  ! OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator {
+  let symbol = drummer.pattern.get(drummer.at)
+  drummer.at = drummer.at + 1
+  let sound = match symbol {
+    75 => KICK
+    83 => SNARE
+    104 => HAT
+    _ => REST
+  }
+  if sound != REST {
+    run hit(&mut drummer.*, sound)
+  }
+}
+
+// Each hit of the roll is a snare, and the last one is the crash on the first beat of the ending.
+effect fn roll(drummer: &mut Drummer, last: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator {
+  let sound = if drummer.hits == last {
+    CRASH
+  } else {
+    SNARE
+  }
+  drummer.hits = drummer.hits + 1
+  if sound == CRASH {
+    run hit(&mut drummer.*, KICK)
+  }
+  run hit(&mut drummer.*, sound)
+}
+
+effect fn appendPattern(pattern: &mut List<u8>, bar: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut tokens = String.split(bar, " ")
+  while true {
+    match tokens.next() {
+      Option.None => {
+        return ()
+      }
+      Option.Some { value } => {
+        if String.byteLength(value) > 0 {
+          run pattern.append(String.utf8Bytes(value)[0])
+        }
+      }
+    }
+  }
+}
+
+effect fn playDrums(gig: Gig) -> Track
+  ! OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator {
+  let mut pattern = List<u8>.make()
+  run appendPattern(&mut pattern, COUNT_IN)
+  run appendPattern(&mut pattern, FILL)
+  let mut section: usize = 0
+  while section < 3 {
+    let mut bar: usize = 0
+    while bar < 8 {
+      if section == 2 && bar == 7 {
+        return run finish(move gig, move pattern)
+      }
+      if bar == 7 {
+        run appendPattern(&mut pattern, FILL)
+      } else if section == 1 {
+        run appendPattern(&mut pattern, BUSY)
+      } else {
+        run appendPattern(&mut pattern, GROOVE)
+      }
+      bar = bar + 1
+    }
+    section = section + 1
+  }
+  return Intrinsic.trap("playDrums: the arrangement has three sections")
+}
+
+effect fn finish(gig: Gig, pattern: List<u8>) -> Track
+  ! OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator {
+  let mut drummer = Drummer {
+    gig: move gig,
+    pattern: move pattern,
+    at: 0,
+    hits: 0,
+    track: Track { instrument: DRUMS, notes: List<Note>.make() },
+  }
+  let mut random = InsecureRandom.seeded(0)
+  let steps = usize.toU64(drummer.pattern.length())
+  let grid = Schedule.fixed(STEP) |> Schedule.limit(steps - 1)
+  run Effect.repeat(groove(&mut drummer), &grid) |> Effect.provideMut<InsecureRandom>(&mut random)
+  run Effect.sleep(STEP)
+
+  // Sixteen gaps, each 0.85 times the one before, that add up to one bar.
+  let gaps: u64 = 16
+  let factor = 0.85
+  let bar = u64.toF64(STEP * 16)
+  let first = f64.toU64(bar * (1.0 - factor) / (1.0 - f64.pow(factor, u64.toF64(gaps))))
+  let faster = Schedule.exponentialBy(first, factor) |> Schedule.limit(gaps)
+  run Effect.repeat(roll(&mut drummer, gaps), &faster)
+    |> Effect.provideMut<InsecureRandom>(&mut random)
+  return move drummer.track
+}
+
+// ---- The screen -------------------------------------------------------------------------------
+
+const NAMES: string<'static> = "C C#D EbE F F#G G#A BbB "
+
+const LOW: i32 = 36
+
+const HIGH: i32 = 96
+
+effect fn appendNote(line: &mut String, pitch: i32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run line.append(String.trim(String.slice(NAMES, i32.toUsize(pitch % 12) * 2, 2)))
+  run appendDigit(&mut line.*, i32.toUsize(pitch / 12 - 1))
+}
+
+effect fn appendDigit(line: &mut String, digit: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run line.append(String.slice("0123456789", digit, 1))
+}
+
+// One tracker cell: the note when it starts, a line while it holds, and blank when silent.
+effect fn appendCell(line: &mut String, stage: &Stage, instrument: i32, color: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let slot = i32.toUsize(instrument)
+  let pitch = stage.pitches[slot]
+  run line.append(color)
+  if pitch == REST {
+    run line.append("    ")
+  } else if stage.onsets[slot] {
+    run line.append(" ")
+    run appendNote(&mut line.*, pitch)
+    if String.slice(NAMES, i32.toUsize(pitch % 12) * 2 + 1, 1) == " " {
+      run line.append(" ")
+    }
+  } else {
+    run line.append(" ── ")
+  }
+  run line.append("\x1b[0m ")
+}
+
+// A piano roll from LOW to HIGH, one column per semitone.
+effect fn appendRoll(line: &mut String, stage: &Stage) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut pitch = LOW
+  while pitch < HIGH {
+    if pitch == stage.pitches[0] {
+      run line.append("\x1b[0;1;95m█")
+    } else if pitch == stage.pitches[1] {
+      run line.append("\x1b[0;96m▓")
+    } else if pitch == stage.pitches[2] {
+      run line.append("\x1b[0;93m█")
+    } else if pitch % 12 == 0 {
+      run line.append("\x1b[0;2;37m┊")
+    } else {
+      run line.append("\x1b[0m ")
+    }
+    pitch = pitch + 1
+  }
+  run line.append("\x1b[0m")
+}
+
+effect fn appendDrum(line: &mut String, stage: &Stage) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let sound = if stage.onsets[3] {
+    stage.pitches[3]
+  } else {
+    REST
+  }
+  run line.append(
+    match sound {
+      1 => "\x1b[1;91m ● kick  "
+      2 => "\x1b[1;97m ✱ snare "
+      3 => "\x1b[2;37m · hat   "
+      4 => "\x1b[1;93m ✸ crash "
+      _ => "         "
+    },
+  )
+  run line.append("\x1b[0m")
+}
+
+/// The screen: one tracker row on each step, a little after the players move.
+struct Screen {
+  stage: Shared<Stage>,
+  row: usize,
+}
+
+effect fn draw(screen: &mut Screen) -> ()
+  ! OutOfMemoryError | WriterError
+  ? &mut Writer | &mut Allocator {
+  let stage = Shared.withMut(
+    &screen.stage,
+    fn(stage: &mut Stage) -> Stage {
+      let seen = stage.*
+      stage.onsets = [false, false, false, false]
+      return seen
+    },
+  )
+  let bar = screen.row / STEPS_PER_BAR + 1
+  let step = screen.row % STEPS_PER_BAR + 1
+  screen.row = screen.row + 1
+  let mut line = String.make()
+  run line.append(
+    if step == 1 {
+      "\x1b[1;37m"
+    } else {
+      "\x1b[2;37m"
+    },
+  )
+  run appendDigit(&mut line, bar / 10)
+  run appendDigit(&mut line, bar % 10)
+  run line.append(".")
+  run appendDigit(&mut line, step / 10)
+  run appendDigit(&mut line, step % 10)
+  run line.append("\x1b[0m │ ")
+  run appendCell(&mut line, &stage, LEAD, "\x1b[1;95m")
+  run appendCell(&mut line, &stage, ARPEGGIO, "\x1b[96m")
+  run appendCell(&mut line, &stage, BASS, "\x1b[93m")
+  run appendDrum(&mut line, &stage)
+  run line.append("│")
+  run appendRoll(&mut line, &stage)
+  run line.append("│\n")
+  run Writer.writeString(line.view())
+}
+
+effect fn screen(stage: Shared<Stage>) -> ()
+  ! OutOfMemoryError | WriterError
+  ? &mut Scheduler | &mut MonotonicClock {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut out = StdoutWriter.make()
+  let mut random = InsecureRandom.seeded(0)
+  let mut screen = Screen { stage: move stage, row: 0 }
+  let rows = usize.toU64(BARS * STEPS_PER_BAR)
+  run Writer.writeString(
+    "\n  \x1b[1mWarp and Weft\x1b[0m, played by four fibers in time with Schedule.fixed\n\n",
+  )
+    |> Effect.provideMut<Writer>(&mut out)
+  run Writer.writeString(
+    "  bar     \x1b[95mlead\x1b[0m \x1b[96marp\x1b[0m  \x1b[93mbass\x1b[0m drums\n",
+  )
+    |> Effect.provideMut<Writer>(&mut out)
+  run Effect.sleep(STEP / 4)
+  run Effect.repeat(draw(&mut screen), &(Schedule.fixed(STEP) |> Schedule.limit(rows - 1)))
+    |> Effect.provideMut<InsecureRandom>(&mut random)
+    |> Effect.provideMut<Writer>(&mut out)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// ---- The band ---------------------------------------------------------------------------------
+
+struct Band {
+  lead: Track,
+  arpeggio: Track,
+  bass: Track,
+  drums: Track,
+}
+
+// Forks one fiber for each instrument, all from the same origin, and waits for all four. When
+// `live`, a fifth fiber draws the screen.
+effect fn band(stage: Shared<Stage>, live: bool) -> Band
+  ! OutOfMemoryError | WriterError | TaskIdExhaustedError | Cancelled
+  ? &mut Scheduler | &mut MonotonicClock {
+  let origin = run MonotonicClock.now()
+  let gig = Gig { origin: move origin, stage: Shared<Stage>.clone(&stage) }
+  let leadFiber = run Fiber<Track, OutOfMemoryError>.forkChild(lead(share(&gig)))
+  let arpeggioFiber = run Fiber<Track, OutOfMemoryError>.forkChild(arpeggio(share(&gig)))
+  let bassFiber = run Fiber<Track, OutOfMemoryError>.forkChild(bass(share(&gig)))
+  let drumsFiber = run Fiber<Track, OutOfMemoryError>.forkChild(drums(move gig))
+  if live {
+    let screenFiber = run Fiber<(), OutOfMemoryError | WriterError>.forkChild(screen(move stage))
+    run screenFiber.join()
+  } else {
+    drop stage
+  }
+  return Band {
+    lead: run leadFiber.join(),
+    arpeggio: run arpeggioFiber.join(),
+    bass: run bassFiber.join(),
+    drums: run drumsFiber.join(),
+  }
+}
+
+/// A clock that jumps to each deadline at once, so the band plays the whole song instantly.
+struct VirtualClock {
+  mark: Instant,
+}
+
+impl MonotonicClock for VirtualClock {
+  effect fn now(self: &mut Self) -> Instant {
+    return copyOf(&self.mark)
+  }
+
+  effect fn getResolution(self: &mut Self) -> u64 {
+    return 1
+  }
+
+  effect fn waitUntil(self: &mut Self, when: Instant) -> () {
+    self.mark = move when
+    return ()
+  }
+
+  effect fn waitFor(self: &mut Self, howLong: u64) -> () {
+    self.mark = MonotonicClock.deadlineAfter(&self.mark, howLong)
+    return ()
+  }
+}
+
+effect fn emptyStage() -> Shared<Stage>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run Shared<Stage>.make(
+    Stage { pitches: [REST, REST, REST, REST], onsets: [false, false, false, false] },
+  )
+}
+
+// Plays the song with `live` false under a virtual clock, or with `live` true on the real clock.
+effect fn record(live: bool) -> Band
+  ! OutOfMemoryError | WriterError | TaskIdExhaustedError | Cancelled | StalledError
+  ? &mut Allocator {
+  let stage = run emptyStage()
+  let mut scheduler = LocalScheduler.make()
+  if live {
+    let mut clock = OsMonotonicClock.make()
+    return run scheduler.execute<
+      Band,
+      OutOfMemoryError | WriterError | TaskIdExhaustedError | Cancelled
+    >(band(move stage, true))
+      |> Effect.provideMut<MonotonicClock>(&mut clock)
+  }
+  let mut clock = VirtualClock { mark: SystemClock.make(0, 0) }
+  return run scheduler.execute<
+    Band,
+    OutOfMemoryError | WriterError | TaskIdExhaustedError | Cancelled
+  >(band(move stage, false))
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+}
+
+// ---- Synthesis --------------------------------------------------------------------------------
+
+fn frequency(pitch: i32) -> f64 {
+  return 440.0 * f64.pow(2.0, i32.toF64(pitch - 69) / 12.0)
+}
+
+fn sampleAt(time: u64) -> usize {
+  return u64.toUsize(time * SAMPLE_RATE / 1000000000)
+}
+
+// A pulse wave: high for `duty` of each period.
+fn pulse(phase: f64, duty: f64) -> f64 {
+  return if phase - f64.floor(phase) < duty {
+    1.0
+  } else {
+    -1.0
+  }
+}
+
+// A triangle in sixteen steps, like the triangle channel of an 8-bit console.
+fn triangle(phase: f64) -> f64 {
+  let unit = phase - f64.floor(phase)
+  let ramp = if unit < 0.5 {
+    unit * 4.0 - 1.0
+  } else {
+    3.0 - unit * 4.0
+  }
+  return f64.floor(ramp * 7.5 + 7.5) / 7.5 - 1.0
+}
+
+/// A 15-bit linear feedback shift register, the noise channel of an 8-bit console.
+struct Noise {
+  register: u32,
+  phase: f64,
+}
+
+fn noise(source: &mut Noise, rate: f64) -> f64 {
+  source.phase = source.phase + rate / 44100.0
+  while source.phase >= 1.0 {
+    let feedback = (source.register ^ u32.shiftRight(source.register, 1)) & 1
+    source.register = u32.shiftRight(source.register, 1) | u32.shiftLeft(feedback, 14)
+    source.phase = source.phase - 1.0
+  }
+  return if source.register & 1 == 1 {
+    1.0
+  } else {
+    -1.0
+  }
+}
+
+// Adds one note of a melodic voice to `samples`.
+fn voice(samples: &mut [f32], instrument: i32, note: &Note) -> () {
+  let from = sampleAt(note.start)
+  let held = sampleAt(note.length)
+  let tail: usize = 600
+  let hz = frequency(note.pitch)
+  let mut index: usize = 0
+  while index < held + tail && from + index < samples.length {
+    let seconds = usize.toF64(index) / 44100.0
+    let gate = if index < held {
+      1.0
+    } else {
+      1.0 - usize.toF64(index - held) / usize.toF64(tail)
+    }
+    let value = if instrument == LEAD {
+      // Vibrato after the attack, and a decay to a sustain level.
+      let depth = if seconds > 0.12 {
+        0.004 * f64.sin(seconds * 34.5)
+      } else {
+        0.0
+      }
+      let level = 0.55 + 0.45 * f64.exp(0.0 - seconds * 6.0)
+      0.20 * level * pulse(seconds * hz * (1.0 + depth), 0.25)
+    } else if instrument == ARPEGGIO {
+      0.07 * f64.exp(0.0 - seconds * 9.0) * pulse(seconds * hz, 0.125)
+    } else {
+      0.30 * triangle(seconds * hz)
+    }
+    samples[from + index] = samples[from + index] + f64.toF32(value * gate)
+    index = index + 1
+  }
+}
+
+// Adds one drum hit to `samples`.
+fn drum(samples: &mut [f32], note: &Note, source: &mut Noise) -> () {
+  let from = sampleAt(note.start)
+  let length = sampleAt(note.length)
+  let mut index: usize = 0
+  let mut phase = 0.0
+  while index < length && from + index < samples.length {
+    let seconds = usize.toF64(index) / 44100.0
+    let value = if note.pitch == KICK {
+      // A triangle that falls from 150 Hz to 45 Hz.
+      let hz = 45.0 + 105.0 * f64.exp(0.0 - seconds * 30.0)
+      phase = phase + hz / 44100.0
+      0.45 * f64.exp(0.0 - seconds * 14.0) * triangle(phase)
+    } else if note.pitch == SNARE {
+      0.22 * f64.exp(0.0 - seconds * 22.0) * noise(&mut source.*, 12000.0)
+    } else if note.pitch == HAT {
+      0.08 * f64.exp(0.0 - seconds * 90.0) * noise(&mut source.*, 40000.0)
+    } else {
+      0.18 * f64.exp(0.0 - seconds * 2.6) * noise(&mut source.*, 20000.0)
+    }
+    samples[from + index] = samples[from + index] + f64.toF32(value)
+    index = index + 1
+  }
+}
+
+effect fn synthesize(track: &Track, length: usize) -> List<f32>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut samples = List<f32>.make()
+  run samples.appendRepeated(f64.toF32(0.0), length)
+  let mut source = Noise { register: 1, phase: 0.0 }
+  let mut index: usize = 0
+  while index < track.notes.length() {
+    let note = track.notes.get(index)
+    if track.instrument == DRUMS {
+      drum(samples.asMutSlice(), &note, &mut source)
+    } else {
+      voice(samples.asMutSlice(), track.instrument, &note)
+    }
+    index = index + 1
+  }
+  return move samples
+}
+
+// ---- WAV --------------------------------------------------------------------------------------
+
+effect fn appendU32(bytes: &mut List<u8>, value: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run bytes.append(u32.wrappingToU8(value))
+  run bytes.append(u32.wrappingToU8(u32.shiftRight(value, 8)))
+  run bytes.append(u32.wrappingToU8(u32.shiftRight(value, 16)))
+  run bytes.append(u32.wrappingToU8(u32.shiftRight(value, 24)))
+}
+
+effect fn appendU16(bytes: &mut List<u8>, value: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run bytes.append(u32.wrappingToU8(value))
+  run bytes.append(u32.wrappingToU8(u32.shiftRight(value, 8)))
+}
+
+// A mono 16-bit PCM WAV file of the sum of `tracks`. Like the output stage of a console, a
+// high-pass filter removes the offset of the narrow pulse waves, and a soft limit stops clipping.
+effect fn wav(tracks: &List<List<f32>>, length: usize) -> List<u8>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut bytes = List<u8>.make()
+  let data = usize.toU32(length * 2)
+  run bytes.appendBytes(b"RIFF")
+  run appendU32(&mut bytes, 36 + data)
+  run bytes.appendBytes(b"WAVEfmt ")
+  run appendU32(&mut bytes, 16)
+  run appendU16(&mut bytes, 1)
+  run appendU16(&mut bytes, 1)
+  run appendU32(&mut bytes, 44100)
+  run appendU32(&mut bytes, 88200)
+  run appendU16(&mut bytes, 2)
+  run appendU16(&mut bytes, 16)
+  run bytes.appendBytes(b"data")
+  run appendU32(&mut bytes, data)
+  let mut previousIn = 0.0
+  let mut previousOut = 0.0
+  let mut index: usize = 0
+  while index < length {
+    let mut sum = 0.0
+    let mut track: usize = 0
+    while track < tracks.length() {
+      sum = sum + f32.toF64(tracks.asSlice()[track].asSlice()[index])
+      track = track + 1
+    }
+    let filtered = sum - previousIn + 0.996 * previousOut
+    previousIn = sum
+    previousOut = filtered
+    let limited = filtered / (1.0 + f64.abs(filtered) * 0.3)
+    let value = i32.wrappingToU32(f64.toI32(limited * 32000.0))
+    run appendU16(&mut bytes, value)
+    index = index + 1
+  }
+  return move bytes
+}
+
+// ---- Mixing on the thread pool ----------------------------------------------------------------
+
+effect fn synthesizeAlone(track: Track) -> List<f32>
+  ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run synthesize(&track, u64.toUsize(SAMPLE_RATE) * SECONDS)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Synthesizes the four tracks at the same time, one pool fiber each, and returns them in order.
+effect fn synthesizeAll(pool: Pool, band: Band) -> List<List<f32>>
+  ! OutOfMemoryError | Cancelled {
+  let Band { lead, arpeggio, bass, drums } = move band
+  let leadFiber = run pool.fork(synthesizeAlone(move lead))
+  let arpeggioFiber = run pool.fork(synthesizeAlone(move arpeggio))
+  let bassFiber = run pool.fork(synthesizeAlone(move bass))
+  let drumsFiber = run pool.fork(synthesizeAlone(move drums))
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut tracks = List<List<f32>>.make()
+  run tracks.append(run leadFiber.join()) |> Effect.provideMut<Allocator>(&mut allocator)
+  run tracks.append(run arpeggioFiber.join()) |> Effect.provideMut<Allocator>(&mut allocator)
+  run tracks.append(run bassFiber.join()) |> Effect.provideMut<Allocator>(&mut allocator)
+  run tracks.append(run drumsFiber.join()) |> Effect.provideMut<Allocator>(&mut allocator)
+  return move tracks
+}
+
+effect fn mix(band: Band) -> List<u8>
+  ! OutOfMemoryError | SpawnError | Cancelled
+  ? &mut Allocator {
+  let threads = run ThreadPool.make(4)
+  let pool = threads.pool()
+  let tracks = run pool.block(synthesizeAll(pool.clone(), move band))
+  drop threads
+  return run wav(&tracks, u64.toUsize(SAMPLE_RATE) * SECONDS)
+}
+
+// ---- The program ------------------------------------------------------------------------------
+
+pub struct SongError {
+  pub message: string<'static>,
+}
+
+effect fn argument(index: usize) -> Bytes
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  return match move run HostInput.argument(index) {
+    Option.None => Bytes.make()
+    Option.Some { value } => move value
+  }
+}
+
+// The absolute path of `name` in the working directory.
+effect fn hostPath(name: &[u8]) -> Bytes
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  if name.length > 0 && name[0] == 47 {
+    return run Bytes.copy(name)
+  }
+  let mut path = run HostInput.workingDirectory()
+  run path.append(b"/")
+  run path.append(name)
+  return move path
+}
+
+effect fn save(band: Band, path: &Bytes) -> ()
+  ! OutOfMemoryError | SpawnError | Cancelled | FileError
+  ? &mut Allocator {
+  let bytes = run mix(move band)
+  let mut files = run OsFileSystem.make("/")
+  let target = run Path.fromBytes(Bytes.asSlice(path))
+  run FileSystem.writeFile(&target, bytes.asSlice()) |> Effect.provideMut<FileSystem>(&mut files)
+}
+
+// Plays the file at `path` with the first player this computer has. Returns false if none ran.
+fn playFile(path: Bytes) -> bool {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(tryPlayers(&path), cannotPlay)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn cannotPlay<E>(error: E) -> bool {
+  drop error
+  return false
+}
+
+effect fn tryPlayers(path: &Bytes) -> bool
+  ! OutOfMemoryError | FileError
+  ? &mut Allocator {
+  if run tryPlayer("/usr/bin/afplay", "", path) {
+    return true
+  }
+  if run tryPlayer("/usr/bin/aplay", "-q", path) {
+    return true
+  }
+  if run tryPlayer("/usr/bin/paplay", "", path) {
+    return true
+  }
+  return run tryPlayer("/usr/bin/ffplay", "-nodisp", path)
+}
+
+effect fn tryPlayer(program: string, option: string, file: &Bytes) -> bool
+  ! OutOfMemoryError | FileError
+  ? &mut Allocator {
+  let mut processes = OsChildProcess.make()
+  let path = run Path.make(program)
+  let mut request = run ChildProcess.request(&path)
+  if String.byteLength(option) > 0 {
+    run ChildProcess.addArgument(&mut request, option)
+  }
+  if option == "-nodisp" {
+    run ChildProcess.addArgument(&mut request, "-autoexit")
+  }
+  run ChildProcess.addArgumentBytes(&mut request, Bytes.asSlice(file))
+  let outcome = run Effect.result(ChildProcess.submit(&request))
+    |> Effect.provideMut<ChildProcess>(&mut processes)
+  return match move outcome {
+    Result.Success { value } => match ChildProcess.exitCode(&value) {
+      Option.Some { value: code } => code == 0
+      Option.None => false
+    }
+    Result.Failure { error } => {
+      drop error
+      false
+    }
+  }
+}
+
+effect fn program() -> i32
+  ! OutOfMemoryError
+    | WriterError
+    | TaskIdExhaustedError
+    | Cancelled
+    | StalledError
+    | SpawnError
+    | FileError
+    | HostInputError
+  ? &mut HostInput | &mut Allocator {
+  let mode = run argument(1)
+  let mut out = StdoutWriter.make()
+  if Bytes.asSlice(&mode) == b"wav" || Bytes.asSlice(&mode) == b"play" {
+    let name = run argument(2)
+    let path = run hostPath(
+      if name.length() > 0 {
+        Bytes.asSlice(&name)
+      } else {
+        b"warp-and-weft.wav"
+      },
+    )
+    run save(run record(false), &path)
+    if Bytes.asSlice(&mode) == b"wav" {
+      run Writer.writeString("Wrote the song.\n") |> Effect.provideMut<Writer>(&mut out)
+      return 0
+    }
+
+    // The player blocks its thread until the song ends, so it gets a thread of its own.
+    let player = run NativeThread.spawn(
+      fn() -> bool {
+        return playFile(move path)
+      },
+    )
+    let shown = run record(true)
+    drop shown
+    if !player.join() {
+      run Writer.writeString("\nNo audio player was found. Play the WAV file with any player.\n")
+        |> Effect.provideMut<Writer>(&mut out)
+    }
+    return 0
+  }
+
+  // With no mode, play the song under the virtual clock and check what each fiber played.
+  let band = run record(false)
+  if band.lead.notes.length() != 150 || band.arpeggio.notes.length() != 776 {
+    return 1
+  }
+  if band.bass.notes.length() != 216 || band.drums.notes.length() != 259 {
+    return 1
+  }
+  run Writer.writeString("Usage: silk run -- play | silk run -- wav [file.wav]\n")
+    |> Effect.provideMut<Writer>(&mut out)
+  return 0
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  return 1
+}
+
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(program(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+}
