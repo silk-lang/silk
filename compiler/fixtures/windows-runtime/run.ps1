@@ -7,8 +7,9 @@ $artifact = (Resolve-Path -LiteralPath $ArtifactDirectory).Path
 $readobj = Join-Path $LlvmBin 'llvm-readobj.exe'
 $results = @()
 $failed = $false
-foreach ($name in @('hello', 'storage', 'host-check', 'providers')) {
+foreach ($name in @('hello', 'storage', 'host-check', 'providers', 'filesystem')) {
   $executable = Join-Path $artifact "$name.exe"
+  if ($name -eq 'filesystem') { $executable = Join-Path $artifact 'windows-filesystem/provider.exe' }
   if (!(Test-Path -LiteralPath $executable)) {
     $results += @{ program = $name; status = 'not-checked'; reason = 'cross-build executable missing' }
     $failed = $true
@@ -23,13 +24,18 @@ foreach ($name in @('hello', 'storage', 'host-check', 'providers')) {
   if ($imports.Count -eq 0 -or @($imports | Where-Object { $_ -notmatch $allowed }).Count -ne 0) {
     throw "Unexpected or missing DLL imports for $name`: $imports"
   }
-  if ($name -eq 'host-check' -or $name -eq 'providers') {
+  if ($name -eq 'host-check' -or $name -eq 'providers' -or $name -eq 'filesystem') {
     try {
       if ($name -eq 'host-check') {
         $detail = & (Join-Path $PSScriptRoot 'run-host.ps1') -Executable $executable
-      } else {
+      } elseif ($name -eq 'providers') {
         $detail = & (Join-Path $PSScriptRoot 'run-providers.ps1') -SilkExecutable $executable `
           -LlvmBin $LlvmBin -OutputDirectory (Join-Path $artifact 'providers-native')
+      } else {
+        $filesystemOutput = Join-Path $artifact 'filesystem-native'
+        & (Join-Path $PSScriptRoot '../windows-filesystem/run.ps1') -SilkExecutable $executable `
+          -LlvmBin $LlvmBin -OutputDirectory $filesystemOutput | Out-Host
+        $detail = Get-Content -Raw -LiteralPath (Join-Path $filesystemOutput 'results.json')
       }
       $results += @{ program = $name; status = 'pass'; imports = $imports; detail = ($detail | ConvertFrom-Json) }
     } catch {

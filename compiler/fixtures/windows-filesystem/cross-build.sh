@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Dedicated fixture only. The integration owner decides when to call it from the shared runner.
+# Native companion for the filesystem provider, invoked by the shared Windows cross-build.
 set -euo pipefail
 compiler=$1
 out=$2
@@ -27,4 +27,11 @@ MANIFEST
   --stdlib "$repo/stdlib" --clang "$clang" --optimization none --debug false \
   > "$out/provider-build.log" 2>&1 || { cat "$out/provider-build.log"; exit 1; }
 llvm-readobj --file-headers --coff-imports "$out/provider.exe" > "$out/provider-pe.txt"
+grep -q 'IMAGE_FILE_MACHINE_AMD64' "$out/provider-pe.txt"
+grep -q 'IMAGE_SUBSYSTEM_WINDOWS_CUI' "$out/provider-pe.txt"
+grep -qi 'Name: ntdll.dll' "$out/provider-pe.txt"
+if grep -i 'Name: .*\.dll' "$out/provider-pe.txt" | grep -viE 'Name: (kernel32|ntdll)\.dll'; then
+  echo 'Unexpected DLL dependency in filesystem provider' >&2
+  exit 1
+fi
 printf '%s\n' 'Built provider.exe; execution remains not-checked until run.ps1 -SilkExecutable.'

@@ -63,5 +63,11 @@ EOF
     failed=1
   fi
 done
+if bash compiler/fixtures/windows-filesystem/cross-build.sh "$compiler" "$out/windows-filesystem"; then
+  printf 'filesystem\tpass\tpass\tnot-checked: requires real Windows\n' >> "$out/results.tsv"
+else
+  printf 'filesystem\tfail\tnot-checked\tnot-checked: cross-build failed\n' >> "$out/results.tsv"
+  failed=1
+fi
 cat "$out/results.tsv"
 exit "$failed"
