@@ -171,6 +171,11 @@ Inference is positional and must produce one consistent argument for every requi
 Explicit arguments do not suppress checking: the supplied values must still satisfy the resulting
 parameter types and bounds.
 
+An Effect bound such as `F: once Effect<'static; A ! E ? &mut PoolTask>` infers `A` and `E` from an
+operand Effect whose failure or requirements the bound covers without equalling them, such as an
+Effect that requires nothing. When the success, failure, and requirement channels do not unify
+together, each is unified on its own, and the bound's proof then checks the whole contract.
+
 After explicit arguments and supplied operands have fixed a provider, one direct applied-interface
 bound may contribute the arguments from that provider's unique visible coherent conformance. For
 example, if `context: C` fixes `C = Inspection` and the only selected conformance is

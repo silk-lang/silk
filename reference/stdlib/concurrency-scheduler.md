@@ -510,6 +510,49 @@ The returned value carries the calling task's own mailbox and submission slot.
 driver has cancelled the target. Cancelling drops the target's parked Execution, which runs its
 cancel exits, and publishes `Cancelled` to the target's Fiber.
 
+<a id="Scheduler.armDeadline"></a>
+
+### Operation `armDeadline`
+
+```silk
+effect fn armDeadline(deadline: Instant) -> usize ? &mut Scheduler
+```
+
+Arms a deadline for the calling task and returns its token, which is never 0.
+
+#### Details
+
+If the deadline passes while the task is still parked inside the interruptible boundary that
+`Intrinsic.interruptibleEffect` opened for the token, the provider calls
+`Execution.interrupt` with the token, so the boundary resumes with `false`. The provider
+removes a deadline once it fires. `Effect.timeoutAt` arms one deadline per boundary.
+
+<a id="Scheduler.armDeadlineAfter"></a>
+
+### Operation `armDeadlineAfter`
+
+```silk
+effect fn armDeadlineAfter(howLong: u64) -> usize ? &mut Scheduler
+```
+
+Arms a deadline `howLong` nanoseconds after the provider next reads its clock, and returns its
+token, which is never 0.
+
+#### Details
+
+It behaves as [`armDeadline`](#Scheduler.armDeadline), but the provider measures the duration itself, so a stale
+clock reading in the calling task does not shorten it. `Effect.timeout` uses it.
+
+<a id="Scheduler.disarmDeadline"></a>
+
+### Operation `disarmDeadline`
+
+```silk
+effect fn disarmDeadline(token: usize) -> () ? &mut Scheduler
+```
+
+Disarms a deadline the calling task armed. A deadline that already fired is ignored.
+
 <a id="PendingCancellation"></a>
 
 ## `PendingCancellation`
