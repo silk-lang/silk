@@ -18,6 +18,13 @@ foreign calls, and COFF emission. The runtime composition selects `silk/platform
 `hello.silk` is the small integration program. It uses `WindowsConsole` explicitly; the POSIX
 `writer_native` locking API is not ported by this slice.
 
+Also cross-build `host-check.silk` and run `run-host.ps1 -Executable <host-check.exe>` once the
+runtime links. That fixture additionally imports `SetEnvironmentVariableW` for its child-local
+snapshot mutation check. The launcher supplies a fixed raw command line and a lone-surrogate
+environment value. It checks actual Silk argument parsing, case-insensitive raw lookup, snapshot
+stability, over-aligned storage, overflow refusal, and exact redirected output. Until it runs,
+those implementation claims remain not checked; the C OS-contract probe does not replace it.
+
 The linker owner must generate a Kernel32 import library for these exact names:
 
 ```text
@@ -91,7 +98,7 @@ then inspect PE imports and test the host provider before treating this slice as
 Generate `reference/stdlib` with `silk doc-reference --stdlib-root stdlib --output reference/stdlib`
 when a native Silk compiler is available. Its explicit profile enumeration in
 `compiler/src/documentation/Command.silk` also needs Windows for the combined target/runtime
-reference. That compiler edit is left to integration. No Linux/macOS workflow changes are required here.
+reference. The parent owns that compiler edit. No Linux/macOS workflow changes are required here.
 
 ## Pinned upstream references
 
