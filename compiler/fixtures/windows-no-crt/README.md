@@ -9,7 +9,7 @@ add a CI lane. No Windows SDK headers or import libraries are needed.
 From a 64-bit PowerShell process at the repository root:
 
 ```powershell
-& compiler/fixtures/windows-no-crt/provision.ps1
+& scripts/setup-windows-llvm.ps1
 & compiler/fixtures/windows-no-crt/run.ps1
 ```
 
