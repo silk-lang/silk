@@ -1,0 +1,513 @@
+//! Compiles a build's `[native].sources` entries into objects with Clang, cached so that a build
+//! compiles only the files whose inputs changed.
+//!
+//! # Details
+//! Each source file compiles to an object in the cache directory beside the build output
+//! ([`directoryFor`]), named by a digest of everything the compile reads besides headers: the
+//! Clang and its version, the target and profile flags, the language, include directories and
+//! flags of the entry, and the file's path and contents. Clang reports the package headers the
+//! file included (`-MMD`), and a record beside the object keeps each one's digest; the object is
+//! reused only while every recorded header still has its digest. System headers are left out:
+//! the Clang, target and platform supply in the name already decide them.
+//!
+//! The build reads every source and header through its filesystem, so the record of what a build
+//! read (driver/BuildInputs) sees an edit to any of them, and a build that changes nothing never
+//! starts Clang.
+
+import driver.HostRename
+import driver.NativeLinkInput as NativeLinkInputs {InvalidNativeLinkInput, NativeLinkInput, SourceLanguage}
+import driver.NativeToolchain
+import semantic.ContentHash {ContentHash, Stream}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.collections.bytes {Bytes}
+import silk.system.child_process {ChildProcess, ProcessError, ProcessOutcome, ProcessRequest}
+import silk.core.effect {Effect}
+import silk.system.host_input {HostInput, HostInputError}
+import silk.system.filesystem {DirectoryEntry, FileError, FileSystem, Path}
+import silk.collections.list {List}
+import silk.core.option {Option}
+import silk.core.result {Result}
+import silk.collections.slice {Slice}
+import silk.num.u64
+import silk.num.usize
+
+/// The outcome of compiling a build's sources: the inputs to link, each `Sources` entry replaced
+/// by the objects of its files, or the failed compile's status. `diagnostics` holds what Clang
+/// wrote, warnings included. `headers` is the digest of every object's header record: an object's
+/// name does not change with its headers, so a link stamp names this too.
+pub union NativeBuild {
+  Linked {pub inputs: List<NativeLinkInput>, pub diagnostics: Bytes, pub headers: ContentHash},
+  Failed {pub diagnostics: Bytes},
+}
+
+/// The object cache of the build that writes `output`: `<output>.native`.
+pub effect fn directoryFor(output: &Path) -> Path ! FileError | OutOfMemoryError ? &mut Allocator {
+  let mut named = run Bytes.copy(Path.rawBytes(output))
+  run Bytes.append(&mut named, b".native")
+  return run Path.fromBytes(Bytes.asSlice(&named))
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn appendByte(output: &mut Bytes, byte: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  let one: [u8; 1] = [byte]
+  return run Bytes.append(&mut output.*, &one)
+}
+
+fn hexDigit(value: u64) -> u8 {
+  if value < 10 { return u64.toU8(value) + 48 }
+  return u64.toU8(value) + 87
+}
+
+effect fn appendHex(output: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < 16 {
+    run appendByte(&mut output.*, hexDigit(u64.bitAnd(u64.shiftRight(value, usize.toU64((15 - at) * 4)), 15)))
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// The 32 hexadecimal digits that spell `digest`.
+effect fn hexOf(digest: ContentHash) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut text = Bytes.make()
+  run appendHex(&mut text, digest.high)
+  run appendHex(&mut text, digest.low)
+  return move text
+}
+
+// The `-x` spelling of a language.
+fn languageName(language: SourceLanguage) -> &'static [u8] {
+  return match language {
+    SourceLanguage.C => b"c"
+    SourceLanguage.ObjectiveC => b"objective-c"
+    SourceLanguage.Cxx => b"c++"
+    SourceLanguage.ObjectiveCxx => b"objective-c++"
+  }
+}
+
+// The last segment of `path`.
+fn lastSegment(path: &[u8]) -> &[u8] {
+  let mut start = path.length
+  while start > usize.ZERO && path[start - usize.ONE] != 47 { start = start - usize.ONE }
+  return Slice.view<u8>(path, start, path.length - start)
+}
+
+fn holdsStar(text: &[u8]) -> bool {
+  let mut at = usize.ZERO
+  while at < text.length {
+    if text[at] == 42 { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+/// Whether `name` matches `pattern`, where each `*` matches any run of bytes. A name that starts
+/// with `.` matches only a pattern that does.
+pub fn matches(pattern: &[u8], name: &[u8]) -> bool {
+  if name.length > usize.ZERO && name[usize.ZERO] == 46 && (pattern.length == usize.ZERO || pattern[usize.ZERO] != 46) { return false }
+  // Greedy matching that backtracks to the last `*`.
+  let mut p = usize.ZERO
+  let mut n = usize.ZERO
+  let mut star = usize.MAX
+  let mut resume = usize.ZERO
+  while n < name.length {
+    if p < pattern.length && pattern[p] == 42 {
+      star = p
+      resume = n
+      p = p + usize.ONE
+    } else if p < pattern.length && pattern[p] == name[n] {
+      p = p + usize.ONE
+      n = n + usize.ONE
+    } else if star != usize.MAX {
+      p = star + usize.ONE
+      resume = resume + usize.ONE
+      n = resume
+    } else {
+      return false
+    }
+  }
+  while p < pattern.length && pattern[p] == 42 { p = p + usize.ONE }
+  return p == pattern.length
+}
+
+// Whether `left` sorts before `right`, byte by byte.
+fn before(left: &[u8], right: &[u8]) -> bool {
+  let mut at = usize.ZERO
+  while at < left.length && at < right.length {
+    if left[at] != right[at] { return left[at] < right[at] }
+    at = at + usize.ONE
+  }
+  return left.length < right.length
+}
+
+// Fails with an entry's prefix, then `rule`.
+effect fn refuse(entry: &Bytes, rule: &[u8]) -> never ! InvalidNativeLinkInput | OutOfMemoryError ? &mut Allocator {
+  let mut detail = run Bytes.copy(Bytes.asSlice(entry))
+  run Bytes.append(&mut detail, rule)
+  fail InvalidNativeLinkInput {detail: move detail}
+}
+
+// The files `file` names: itself, or for a pattern the files of its directory whose names match
+// its last segment, in name order. A pattern that matches nothing is refused.
+effect fn expand(file: &Path, entry: &Bytes, files: &mut List<Path>) -> ()
+! FileError | InvalidNativeLinkInput | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let written = Path.rawBytes(file)
+  let pattern = lastSegment(written)
+  if !holdsStar(pattern) {
+    run List<Path>.append(&mut files.*, run Path.fromBytes(written))
+    return ()
+  }
+  let directory = run Path.fromBytes(Slice.view<u8>(written, usize.ZERO, written.length - pattern.length - usize.ONE))
+  let listed = match move run Effect.result(FileSystem.listDirectory(&directory)) {
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => {
+        drop failure
+        let mut rule = run Bytes.copy(b"cannot list ")
+        run Bytes.append(&mut rule, Path.rawBytes(&directory))
+        run Bytes.append(&mut rule, b" for the pattern ")
+        run Bytes.append(&mut rule, pattern)
+        run refuse(entry, Bytes.asSlice(&rule))
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let mut found = List<Path>.make()
+  let entries = List<DirectoryEntry>.asSlice(&listed)
+  let mut at = usize.ZERO
+  while at < entries.length {
+    // Files and links to them; a directory never compiles.
+    if entries[at].kind.code != 1 && matches(pattern, lastSegment(Path.rawBytes(&entries[at].path))) {
+      run List<Path>.append(&mut found, run Path.fromBytes(Path.rawBytes(&entries[at].path)))
+    }
+    at = at + usize.ONE
+  }
+  // Name order, by insertion into a list of positions.
+  let candidates = List<Path>.asSlice(&found)
+  let mut order = List<usize>.make()
+  let mut placed = usize.ZERO
+  while placed < candidates.length {
+    let mut slot = usize.ZERO
+    let ranked = List<usize>.asSlice(&order)
+    while slot < ranked.length && before(Path.rawBytes(&candidates[ranked[slot]]), Path.rawBytes(&candidates[placed])) { slot = slot + usize.ONE }
+    let one: [usize; 1] = [placed]
+    run List<usize>.insertSlice(&mut order, slot, &one)
+    placed = placed + usize.ONE
+  }
+  if candidates.length == usize.ZERO {
+    let mut rule = run Bytes.copy(b"the pattern ")
+    run Bytes.append(&mut rule, written)
+    run Bytes.append(&mut rule, b" matches no file")
+    run refuse(entry, Bytes.asSlice(&rule))
+  }
+  let ranked = List<usize>.asSlice(&order)
+  let mut moved = usize.ZERO
+  while moved < ranked.length {
+    run List<Path>.append(&mut files.*, run Path.fromBytes(Path.rawBytes(&candidates[ranked[moved]])))
+    moved = moved + usize.ONE
+  }
+  return ()
+}
+
+// The bytes of the file at `path`, or none when it cannot be read.
+effect fn readOptional(path: &Path) -> Option<Bytes> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  return match move run Effect.result(FileSystem.readFile(path)) {
+    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => Option<Bytes>.some(move value)
+    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => { drop failure Option<Bytes>.none() }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// The digest of the file at `path`, spelled in hexadecimal, or `missing` when it cannot be read.
+effect fn digestOf(path: &[u8]) -> Bytes ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let parsed = match move run Effect.result(Path.fromBytes(path)) {
+    Result<Path, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => { drop failure return run Bytes.copy(b"missing") }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  return match move run readOptional(&parsed) {
+    Option<Bytes>.Some {value} => run hexOf(ContentHash.of(Bytes.asSlice(&value)))
+    Option<Bytes>.None => run Bytes.copy(b"missing")
+  }
+}
+
+// Whether the header record `record` (lines of `<digest> <path>`) still holds: every header it
+// names has the digest it records.
+effect fn headersUnchanged(record: &[u8]) -> bool ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut start = usize.ZERO
+  while start < record.length {
+    let mut end = start
+    while end < record.length && record[end] != 10 { end = end + usize.ONE }
+    let line = Slice.view<u8>(record, start, end - start)
+    if line.length < usize.add(0, 34) || line[usize.add(0, 32)] != 32 { return false }
+    let digest = run digestOf(Slice.view<u8>(line, usize.add(0, 33), line.length - usize.add(0, 33)))
+    if !same(Bytes.asSlice(&digest), Slice.view<u8>(line, usize.ZERO, usize.add(0, 32))) { return false }
+    start = end + usize.ONE
+  }
+  return true
+}
+
+/// The files a Make dependency rule `rule` (as Clang's `-MMD` writes it) lists after its
+/// target, without the first, which is the source itself.
+pub effect fn dependencies(rule: &[u8]) -> List<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  let mut found = List<Bytes>.make()
+  // The target ends at the first `: `.
+  let mut at = usize.ZERO
+  while at + usize.ONE < rule.length && !(rule[at] == 58 && (rule[at + usize.ONE] == 32 || rule[at + usize.ONE] == 10)) { at = at + usize.ONE }
+  at = at + usize.ONE
+  let mut current = Bytes.make()
+  let mut listed = usize.ZERO
+  while at <= rule.length {
+    let mut separator = at == rule.length
+    if !separator {
+      let byte = rule[at]
+      if byte == 92 && at + usize.ONE < rule.length && (rule[at + usize.ONE] == 10 || rule[at + usize.ONE] == 13) {
+        // A continued line.
+        separator = true
+      } else if byte == 92 && at + usize.ONE < rule.length && rule[at + usize.ONE] == 32 {
+        run appendByte(&mut current, 32)
+        at = at + usize.ONE
+      } else if byte == 32 || byte == 9 || byte == 10 || byte == 13 {
+        separator = true
+      } else {
+        run appendByte(&mut current, byte)
+      }
+    }
+    if separator && Bytes.length(&current) > usize.ZERO {
+      if listed > usize.ZERO { run List<Bytes>.append(&mut found, move current) } else { drop current }
+      current = Bytes.make()
+      listed = listed + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return move found
+}
+
+// Compiles `source` (whose contents are `contents`) into `object` unless the cache holds it with
+// unchanged headers, and answers Clang's status: 0 when the object is ready.
+effect fn compileOne(clang: &Path, base: &[Bytes], language: SourceLanguage, include: &[Path], flags: &[Bytes], source: &Path,
+  object: &Path, record: &Path, diagnostics: &mut Bytes, headerDigests: &mut Stream) -> i32
+! FileError | ProcessError | HostInputError | OutOfMemoryError ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
+  if let Option<Bytes>.Some {value: recorded} = move run readOptional(record) {
+    let present = run FileSystem.exists(object)
+    if present {
+      let unchanged = run headersUnchanged(Bytes.asSlice(&recorded))
+      if unchanged {
+        ContentHash.append(&mut headerDigests.*, Bytes.asSlice(&recorded))
+        return 0
+      }
+    }
+  }
+  let objectBytes = Path.rawBytes(object)
+  let mut partialBytes = run Bytes.copy(objectBytes)
+  run Bytes.append(&mut partialBytes, b".partial")
+  let partial = run Path.fromBytes(Bytes.asSlice(&partialBytes))
+  let mut ruleBytes = run Bytes.copy(objectBytes)
+  run Bytes.append(&mut ruleBytes, b".d")
+  let rule = run Path.fromBytes(Bytes.asSlice(&ruleBytes))
+  let mut request = run NativeToolchain.request(clang)
+  run ChildProcess.addArgument(&mut request, "-c")
+  run ChildProcess.addArgument(&mut request, "-Wno-unused-command-line-argument")
+  let mut at = usize.ZERO
+  while at < base.length {
+    run ChildProcess.addArgumentBytes(&mut request, Bytes.asSlice(&base[at]))
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < include.length {
+    run ChildProcess.addArgument(&mut request, "-I")
+    run NativeToolchain.addPathArgument(&mut request, &include[at])
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < flags.length {
+    run ChildProcess.addArgumentBytes(&mut request, Bytes.asSlice(&flags[at]))
+    at = at + usize.ONE
+  }
+  run ChildProcess.addArgument(&mut request, "-MMD")
+  run ChildProcess.addArgument(&mut request, "-MF")
+  run NativeToolchain.addPathArgument(&mut request, &rule)
+  run ChildProcess.addArgument(&mut request, "-x")
+  run ChildProcess.addArgumentBytes(&mut request, languageName(language))
+  run NativeToolchain.addPathArgument(&mut request, source)
+  run ChildProcess.addArgument(&mut request, "-o")
+  run NativeToolchain.addPathArgument(&mut request, &partial)
+  let outcome = run ChildProcess.submit(&request)
+  run Bytes.append(&mut diagnostics.*, ChildProcess.errorBytes(&outcome))
+  let mut status: i32 = 1
+  if let Option<i32>.Some {value} = move ChildProcess.exitCode(&outcome) { status = value }
+  if status != 0 {
+    if status < 0 { status = 1 }
+    return status
+  }
+  // The headers' digests, read before the object is published so a header edited meanwhile
+  // compiles again next time.
+  let mut headers = Bytes.make()
+  if let Option<Bytes>.Some {value: written} = move run readOptional(&rule) {
+    let listed = run dependencies(Bytes.asSlice(&written))
+    let names = List<Bytes>.asSlice(&listed)
+    let mut name = usize.ZERO
+    while name < names.length {
+      let digest = run digestOf(Bytes.asSlice(&names[name]))
+      run Bytes.append(&mut headers, Bytes.asSlice(&digest))
+      run Bytes.append(&mut headers, b" ")
+      run Bytes.append(&mut headers, Bytes.asSlice(&names[name]))
+      run Bytes.append(&mut headers, b"\n")
+      name = name + usize.ONE
+    }
+    let removed = run Effect.result(FileSystem.removeFile(&rule))
+    drop removed
+  } else {
+    run Bytes.append(&mut diagnostics.*, b"silk: Clang wrote no dependency file for ")
+    run Bytes.append(&mut diagnostics.*, Path.rawBytes(source))
+    run Bytes.append(&mut diagnostics.*, b"\n")
+    return 1
+  }
+  if !run HostRename.replaceFile(&partial, object) {
+    run Bytes.append(&mut diagnostics.*, b"silk: cannot write ")
+    run Bytes.append(&mut diagnostics.*, objectBytes)
+    run Bytes.append(&mut diagnostics.*, b"\n")
+    return 1
+  }
+  run FileSystem.writeFile(record, Bytes.asSlice(&headers))
+  ContentHash.append(&mut headerDigests.*, Bytes.asSlice(&headers))
+  return 0
+}
+
+/// Compiles each `Sources` entry of `inputs` into objects in `cache` and answers the inputs with
+/// those objects in its place, in order.
+///
+/// `clang` compiles with `identity` (its version output, and anything else that decides what it
+/// writes but that `base` does not spell, such as a platform supply's file digests) and `base`,
+/// the target and profile flags every native compile of the build shares.
+pub effect fn compile(inputs: &[NativeLinkInput], cache: &Path, clang: &Path, identity: &[u8], base: &[Bytes]) -> NativeBuild
+! FileError | ProcessError | HostInputError | InvalidNativeLinkInput | OutOfMemoryError
+? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
+  run FileSystem.createDirectoriesRecursively(cache)
+  let mut shared = run Bytes.copy(b"silk-native-1\n")
+  run Bytes.append(&mut shared, Path.rawBytes(clang))
+  run Bytes.append(&mut shared, b"\n")
+  run Bytes.append(&mut shared, identity)
+  let mut at = usize.ZERO
+  while at < base.length {
+    run Bytes.append(&mut shared, b"\n")
+    run Bytes.append(&mut shared, Bytes.asSlice(&base[at]))
+    at = at + usize.ONE
+  }
+  let mut linked = List<NativeLinkInput>.make()
+  let mut kept = List<Bytes>.make()
+  let mut diagnostics = Bytes.make()
+  let mut headerDigests = ContentHash.stream()
+  at = usize.ZERO
+  while at < inputs.length {
+    match &inputs[at] {
+      NativeLinkInput.Sources {language, files, flags, include, entry} => {
+        let mut expanded = List<Path>.make()
+        let declared = List<Path>.asSlice(&files)
+        let mut file = usize.ZERO
+        while file < declared.length {
+          run expand(&declared[file], &entry, &mut expanded)
+          file = file + usize.ONE
+        }
+        // The entry's part of every object's name.
+        let mut keyed = run Bytes.copy(Bytes.asSlice(&shared))
+        run Bytes.append(&mut keyed, b"\n-x ")
+        run Bytes.append(&mut keyed, languageName(language))
+        let directories = List<Path>.asSlice(&include)
+        let mut directory = usize.ZERO
+        while directory < directories.length {
+          run Bytes.append(&mut keyed, b"\n-I ")
+          run Bytes.append(&mut keyed, Path.rawBytes(&directories[directory]))
+          directory = directory + usize.ONE
+        }
+        let written = List<Bytes>.asSlice(&flags)
+        let mut flag = usize.ZERO
+        while flag < written.length {
+          run Bytes.append(&mut keyed, b"\n")
+          run Bytes.append(&mut keyed, Bytes.asSlice(&written[flag]))
+          flag = flag + usize.ONE
+        }
+        let sources = List<Path>.asSlice(&expanded)
+        let mut source = usize.ZERO
+        while source < sources.length {
+          let contents = match move run readOptional(&sources[source]) {
+            Option<Bytes>.Some {value} => move value
+            Option<Bytes>.None => {
+              let mut rule = run Bytes.copy(b"cannot read the source file ")
+              run Bytes.append(&mut rule, Path.rawBytes(&sources[source]))
+              run refuse(&entry, Bytes.asSlice(&rule))
+            }
+          }
+          let mut stream = ContentHash.stream()
+          ContentHash.append(&mut stream, Bytes.asSlice(&keyed))
+          ContentHash.append(&mut stream, b"\n")
+          ContentHash.append(&mut stream, Path.rawBytes(&sources[source]))
+          ContentHash.append(&mut stream, b"\n")
+          ContentHash.append(&mut stream, Bytes.asSlice(&contents))
+          let name = run hexOf(ContentHash.finish(move stream))
+          let mut objectName = run Bytes.copy(Bytes.asSlice(&name))
+          run Bytes.append(&mut objectName, b".o")
+          let object = run Path.joinBytes(cache, Bytes.asSlice(&objectName))
+          let mut recordName = run Bytes.copy(Bytes.asSlice(&name))
+          run Bytes.append(&mut recordName, b".headers")
+          let record = run Path.joinBytes(cache, Bytes.asSlice(&recordName))
+          let status = run compileOne(clang, base, language, List<Path>.asSlice(&include), written, &sources[source], &object, &record,
+            &mut diagnostics, &mut headerDigests)
+          if status != 0 { return NativeBuild.Failed {diagnostics: move diagnostics} }
+          run List<Bytes>.append(&mut kept, move name)
+          run List<NativeLinkInput>.append(&mut linked, NativeLinkInputs.object(move object))
+          source = source + usize.ONE
+        }
+      }
+      _ => { run List<NativeLinkInput>.append(&mut linked, run NativeLinkInputs.copy(&inputs[at])) }
+    }
+    at = at + usize.ONE
+  }
+  run prune(cache, List<Bytes>.asSlice(&kept))
+  return NativeBuild.Linked {inputs: move linked, diagnostics: move diagnostics, headers: ContentHash.finish(move headerDigests)}
+}
+
+// Removes the files of `cache` whose names start with no digest in `kept`: objects and records an
+// earlier build made for sources that have since changed.
+effect fn prune(cache: &Path, kept: &[Bytes]) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let listed = match move run Effect.result(FileSystem.listDirectory(cache)) {
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => { drop failure return () }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let entries = List<DirectoryEntry>.asSlice(&listed)
+  let mut at = usize.ZERO
+  while at < entries.length {
+    let name = lastSegment(Path.rawBytes(&entries[at].path))
+    let mut used = false
+    if name.length >= usize.add(0, 32) {
+      let digest = Slice.view<u8>(name, usize.ZERO, usize.add(0, 32))
+      let mut keep = usize.ZERO
+      while keep < kept.length && !used {
+        used = same(digest, Bytes.asSlice(&kept[keep]))
+        keep = keep + usize.ONE
+      }
+    }
+    if !used {
+      let removed = run Effect.result(FileSystem.removeFile(&entries[at].path))
+      drop removed
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}

@@ -1191,6 +1191,37 @@ the objects and archives that use it. An input that several packages list (the s
 with the same mode, or framework) links once, at its last place. A library or object artifact
 links only its own manifest's inputs.
 
+`[native].sources` names C, Objective-C, C++ and Objective-C++ files of the package that the
+build compiles with Clang. Each entry names its files with exactly one of `c`, `objc`, `cpp` and
+`objcpp`, as a path or a list of paths relative to the manifest's directory; a `*` in a path's
+last segment matches files of that directory, in name order, and a pattern that matches nothing is
+refused. `include` lists directories of the package to search for headers, `flags` lists extra
+Clang flags, and `os` selects systems as for `link`. A package's compiled objects link ahead of its
+`link` entries and reach dependent executables the same way, so dependency sources compile by
+default; a static library artifact archives them. Flags pass an allowlist: defines (`-D`, `-U`),
+warnings (`-W`, `-w`, `-pedantic`), a language standard (`-std=`), optimization (`-O`), debug
+information (`-g`) and code generation flags (`-f`, `-m`). A flag that hands arguments to another
+tool (`-Wl,`, `-Wa,`, `-Wp,`, `-mllvm`), loads code or names a file for Clang (`-fplugin`,
+`-fpass-plugin`, profile and sanitizer lists, module files, `-I`, `-include`, `-B`, `@file`) is
+refused, naming the manifest line. Sources compile with the build's target, profile optimization,
+debug, CPU and platform-supply flags.
+
+Each file compiles to an object in `<output>.native`, named by a digest of the Clang and its
+version, those flags, the entry's language, include directories and flags, and the file's path and
+contents. Clang reports the package headers the file included (`-MMD`); the object is reused while
+each still has the digest recorded beside it, and system headers are covered by the Clang, target
+and platform supply in the name. The build reads every source and header itself, so a build that
+changes none of them reuses the executable without starting Clang, an edit to one file or header
+compiles only the objects it reaches, and `silk check` compiles nothing.
+
+```toml
+[native]
+sources = [
+  { c = "native/*.c", include = ["native/include"], flags = ["-DSHIM_VERSION=2", "-Wall"] },
+  { objc = "native/metal/*.m", flags = ["-fno-objc-arc", "-fblocks"], os = "macos" },
+]
+```
+
 `[native].function-order` names a text file below the manifest's directory that lists function
 symbols, one per line, such as `silk_1f3a9c...`; blank lines and lines starting with `#` are
 ignored. Write each symbol as the program's LLVM IR and a Linux `nm` spell it, without the leading

@@ -4,9 +4,15 @@
 //! An entry may name the operating systems it links on with `os`, a name or a list of names from
 //! `macos`, `linux`, `windows` and `wasi`: `{ framework = "Metal", os = "macos" }` links only on
 //! macOS targets, and a build for any other target skips it without refusing it.
+//!
+//! `[native].sources` entries name C, Objective-C, C++ or Objective-C++ files of the package that
+//! the build compiles with Clang ([`NativeCompile`](driver/NativeCompile)) and links as objects
+//! ahead of the package's `[native].link` entries. Their flags pass an allowlist, and their files
+//! and include directories stay inside the package.
 
 import diagnostic.JsonText
 import driver.ManifestFields
+import driver.ManifestText
 import driver.NativeToolchain
 import semantic.Target {Id as TargetId, Target}
 import silk.mem.allocator {Allocator, OutOfMemoryError}
@@ -38,6 +44,9 @@ pub effect fn invalid(detail: &[u8]) -> never ! InvalidNativeLinkInput | OutOfMe
 /// How a named library is resolved by the linker.
 pub enum Linkage { Static, Dynamic }
 
+/// The language a `[native].sources` entry's files are written in.
+pub enum SourceLanguage { C, ObjectiveC, Cxx, ObjectiveCxx }
+
 /// One typed link input. Paths are resolved against the directory of the declaring manifest.
 pub union NativeLinkInput {
   Object {path: Path},
@@ -48,6 +57,15 @@ pub union NativeLinkInput {
   LinkerScript {path: Path, entry: Bytes},
   Library {name: Bytes, linkage: Linkage, entry: Bytes},
   Framework {name: Bytes, entry: Bytes},
+  /// A `[native].sources` entry: its files, each a path or a pattern whose last segment holds `*`,
+  /// with the flags and include directories they compile with. The build compiles them into
+  /// objects before it links (`NativeCompile.compile`).
+  Sources {pub language: SourceLanguage, pub files: List<Path>, pub flags: List<Bytes>, pub include: List<Path>, pub entry: Bytes},
+}
+
+/// An object input at `path`, as a compiled source links.
+pub fn object(path: Path) -> NativeLinkInput {
+  return NativeLinkInput.Object {path: move path}
 }
 
 /// One `[native].link` entry as declared: its input and the operating systems it links on.
@@ -92,7 +110,40 @@ pub effect fn copy(self: &NativeLinkInput) -> NativeLinkInput ! OutOfMemoryError
     NativeLinkInput.LinkerScript {path, entry} => NativeLinkInput.LinkerScript {path: run copyPath(&path), entry: run Bytes.copy(Bytes.asSlice(&entry))}
     NativeLinkInput.Library {name, linkage, entry} => NativeLinkInput.Library {name: run Bytes.copy(Bytes.asSlice(&name)), linkage: linkage, entry: run Bytes.copy(Bytes.asSlice(&entry))}
     NativeLinkInput.Framework {name, entry} => NativeLinkInput.Framework {name: run Bytes.copy(Bytes.asSlice(&name)), entry: run Bytes.copy(Bytes.asSlice(&entry))}
+    NativeLinkInput.Sources {language, files, flags, include, entry} => NativeLinkInput.Sources {language: language,
+      files: run copyPaths(List<Path>.asSlice(&files)), flags: run copyTexts(List<Bytes>.asSlice(&flags)),
+      include: run copyPaths(List<Path>.asSlice(&include)), entry: run Bytes.copy(Bytes.asSlice(&entry))}
   }
+}
+
+effect fn copyPaths(paths: &[Path]) -> List<Path> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = List<Path>.make()
+  let mut at = usize.ZERO
+  while at < paths.length {
+    run List<Path>.append(&mut copied, run copyPath(&paths[at]))
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+effect fn copyTexts(texts: &[Bytes]) -> List<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = List<Bytes>.make()
+  let mut at = usize.ZERO
+  while at < texts.length {
+    run List<Bytes>.append(&mut copied, run Bytes.copy(Bytes.asSlice(&texts[at])))
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+fn samePaths(left: &[Path], right: &[Path]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if !sameText(Path.rawBytes(&left[at]), Path.rawBytes(&right[at])) { return false }
+    at = at + usize.ONE
+  }
+  return true
 }
 
 effect fn copyPath(path: &Path) -> Path ! OutOfMemoryError ? &mut Allocator {
@@ -135,6 +186,11 @@ pub fn sameInput(left: &NativeLinkInput, right: &NativeLinkInput) -> bool {
     }
     NativeLinkInput.Framework {name, entry: _} => match &right.* {
       NativeLinkInput.Framework {name: other, entry: _} => sameText(Bytes.asSlice(&name), Bytes.asSlice(&other))
+      _ => false
+    }
+    NativeLinkInput.Sources {language, files, ..} => match &right.* {
+      NativeLinkInput.Sources {language: otherLanguage, files: otherFiles, ..} => language == otherLanguage
+        && samePaths(List<Path>.asSlice(&files), List<Path>.asSlice(&otherFiles))
       _ => false
     }
   }
@@ -325,12 +381,14 @@ effect fn decode(manifest: &Path, at: usize, directory: &Path, entry: &TomlValue
   return NativeLinkInput.Framework {name: move framework, entry: run entryPrefix(manifest, at)}
 }
 
-/// Reads `[native].link` from the parsed `manifest` in `directory`, in declaration
-/// order, with the operating systems each entry links on. A refusal names the manifest, the
-/// entry's index and the rule it breaks; an entry for another system is checked all the same.
-pub effect fn read(document: &TomlValue, manifest: &Path, directory: &Path) -> List<Declared>
+/// Reads `[native].sources` and then `[native].link` from the parsed `manifest`, whose text is
+/// `text`, in `directory`, each in declaration order, with the operating systems each entry links
+/// on. A package's compiled sources come first, so the archives and libraries it links resolve
+/// their references. A refusal names the manifest, the entry and the rule it breaks; an entry for
+/// another system is checked all the same.
+pub effect fn read(document: &TomlValue, manifest: &Path, text: &[u8], directory: &Path) -> List<Declared>
 ! InvalidNativeLinkInput | OutOfMemoryError ? &mut Allocator {
-  let mut inputs = List<Declared>.make()
+  let mut inputs = run readSources(document, manifest, text, directory)
   let declared = match move ManifestFields.linkInputs(document) {
     Option<&TomlValue>.Some {value} => value
     Option<&TomlValue>.None => { return move inputs }
@@ -386,6 +444,288 @@ pub effect fn functionOrder(document: &TomlValue, manifest: &Path, directory: &P
   }
 }
 
+// The `<manifest>:<line>: [native].sources[<at>]: ` prefix that names one sources entry; the line
+// is left out when the text does not show it.
+effect fn sourcesPrefix(manifest: &Path, text: &[u8], at: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut key = run Bytes.copy(b"native.sources.")
+  run JsonText.appendDecimal(&mut key, at)
+  let line = ManifestText.keyLine(text, Bytes.asSlice(&key))
+  let mut detail = run Bytes.copy(Path.rawBytes(manifest))
+  if line > usize.ZERO {
+    run Bytes.append(&mut detail, b":")
+    run JsonText.appendDecimal(&mut detail, line)
+  }
+  run Bytes.append(&mut detail, b": [native].sources[")
+  run JsonText.appendDecimal(&mut detail, at)
+  run Bytes.append(&mut detail, b"]: ")
+  return move detail
+}
+
+// The rule every sources entry follows, for a refusal of its shape.
+fn sourcesRule() -> &'static [u8] {
+  return b"an entry names its files with exactly one of c, objc, cpp and objcpp, as a path or a list of paths, plus optional flags, include and os"
+}
+
+// The rule each sources flag follows, for its refusal.
+fn flagRule() -> &'static [u8] {
+  return b"sources take defines (-D, -U), warnings (-W, -w, -pedantic), a language standard (-std=), optimization (-O), debug information (-g) and code generation flags (-f, -m), and never a flag that loads code, reads other files or changes tools"
+}
+
+fn startsWith(text: &[u8], prefix: &[u8]) -> bool {
+  if text.length < prefix.length { return false }
+  let mut at = usize.ZERO
+  while at < prefix.length {
+    if text[at] != prefix[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// Whether a `[native].sources` flag is allowed: a define, warning, language standard,
+/// optimization level, debug information or code generation flag, written as one argument, that
+/// neither loads code nor names a file for Clang to read or write.
+pub fn allowedFlag(flag: &[u8]) -> bool {
+  if flag.length < usize.add(0, 2) || flag[usize.ZERO] != 45 { return false }
+  if startsWith(flag, b"-D") || startsWith(flag, b"-U") { return flag.length > usize.add(0, 2) }
+  if sameText(flag, b"-w") || sameText(flag, b"-pedantic") || sameText(flag, b"-pedantic-errors") { return true }
+  if startsWith(flag, b"-W") {
+    // `-Wl,`, `-Wa,` and `-Wp,` hand arguments to other tools.
+    return flag.length > usize.add(0, 2) && !(flag.length >= usize.add(0, 4) && flag[usize.add(0, 3)] == 44)
+  }
+  if startsWith(flag, b"-std=") { return flag.length > usize.add(0, 5) }
+  if startsWith(flag, b"-O") { return flag.length <= usize.add(0, 3) }
+  if startsWith(flag, b"-g") { return true }
+  if startsWith(flag, b"-m") { return !startsWith(flag, b"-mllvm") }
+  if startsWith(flag, b"-f") {
+    let refused: [&[u8]; 14] = [b"-fplugin", b"-fpass-plugin", b"-fprofile-use", b"-fprofile-instr-use", b"-fprofile-sample-use",
+      b"-fprofile-list", b"-fprofile-remapping-file", b"-fsanitize-ignorelist", b"-fsanitize-blacklist", b"-fmodules-cache-path",
+      b"-fmodule-map-file", b"-fmodule-file", b"-fprebuilt-module-path", b"-fcrash-diagnostics-dir"]
+    let mut at = usize.ZERO
+    while at < refused.length {
+      if startsWith(flag, refused[at]) { return false }
+      at = at + usize.ONE
+    }
+    return true
+  }
+  return false
+}
+
+// Fails naming sources entry `at`, then `rule`.
+effect fn refuseSources(manifest: &Path, text: &[u8], at: usize, rule: &[u8]) -> never ! InvalidNativeLinkInput | OutOfMemoryError ? &mut Allocator {
+  let mut detail = run sourcesPrefix(manifest, text, at)
+  run Bytes.append(&mut detail, rule)
+  fail InvalidNativeLinkInput {detail: move detail}
+}
+
+// The strings `value` holds: itself when it is one, else its items, which must all be strings;
+// none when it is neither, or `nonempty` and an empty list.
+effect fn texts(value: &TomlValue, nonempty: bool) -> Option<List<Bytes>> ! OutOfMemoryError ? &mut Allocator {
+  let mut found = List<Bytes>.make()
+  if let Option<string>.Some {value: written} = move Toml.asString(Option<&TomlValue>.some(value)) {
+    run List<Bytes>.append(&mut found, run Bytes.copy(String.utf8Bytes(written)))
+    return Option<List<Bytes>>.some(move found)
+  }
+  let listed = match &value.* {
+    TomlValue.Array {..} => true
+    _ => false
+  }
+  if !listed { return Option<List<Bytes>>.none() }
+  let mut item = usize.ZERO
+  while true {
+    let named = match move Toml.item(value, item) {
+      Option<&TomlValue>.Some {value: listedItem} => listedItem
+      Option<&TomlValue>.None => { break }
+    }
+    match move Toml.asString(Option<&TomlValue>.some(named)) {
+      Option<string>.Some {value: written} => { run List<Bytes>.append(&mut found, run Bytes.copy(String.utf8Bytes(written))) }
+      Option<string>.None => { return Option<List<Bytes>>.none() }
+    }
+    item = item + usize.ONE
+  }
+  if nonempty && List<Bytes>.length(&found) == usize.ZERO { return Option<List<Bytes>>.none() }
+  return Option<List<Bytes>>.some(move found)
+}
+
+// The path `written` names below `directory`; `pattern` allows a `*` in its last segment. A path
+// that leaves the package is refused, naming `key`.
+effect fn packagePath(manifest: &Path, text: &[u8], at: usize, directory: &Path, key: &[u8], written: &[u8], pattern: bool) -> Path
+! InvalidNativeLinkInput | OutOfMemoryError ? &mut Allocator {
+  let mut lastSlash = usize.MAX
+  let mut star = usize.MAX
+  let mut index = usize.ZERO
+  while index < written.length {
+    if written[index] == 47 { lastSlash = index }
+    if written[index] == 42 && star == usize.MAX { star = index }
+    index = index + usize.ONE
+  }
+  let mut misplaced = star != usize.MAX && !pattern
+  if star != usize.MAX && lastSlash != usize.MAX && star < lastSlash { misplaced = true }
+  let joined = run Effect.result(Path.joinBytes(directory, written))
+  let refusal = match move joined {
+    Result<Path, FileError | OutOfMemoryError>.Success {value} => {
+      if !misplaced && written.length > usize.ZERO { return move value }
+      drop value
+      0
+    }
+    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError refused => { drop refused 0 }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  drop refusal
+  let mut rule = run Bytes.copy(key)
+  run Bytes.append(&mut rule, b" \"")
+  run Bytes.append(&mut rule, written)
+  run Bytes.append(&mut rule, b"\" must be a relative path below the manifest's directory, without . or .. segments")
+  if pattern { run Bytes.append(&mut rule, b" and with any * in its last segment") }
+  run Bytes.append(&mut rule, b", so the package compiles only its own files")
+  run refuseSources(manifest, text, at, Bytes.asSlice(&rule))
+}
+
+// One `[native].sources` entry.
+effect fn decodeSources(manifest: &Path, text: &[u8], at: usize, directory: &Path, entry: &TomlValue) -> NativeLinkInput
+! InvalidNativeLinkInput | OutOfMemoryError ? &mut Allocator {
+  let members = match move memberCount(entry) {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => run refuseSources(manifest, text, at, b"an entry must be an inline table")
+  }
+  let keys: [string; 4] = ["c", "objc", "cpp", "objcpp"]
+  let languages: [SourceLanguage; 4] = [SourceLanguage.C, SourceLanguage.ObjectiveC, SourceLanguage.Cxx, SourceLanguage.ObjectiveCxx]
+  let mut language = SourceLanguage.C
+  let mut named = usize.ZERO
+  let mut written = Option<&TomlValue>.none()
+  let mut languageKey: &[u8] = b"c"
+  let mut key = usize.ZERO
+  while key < keys.length {
+    if let Option<&TomlValue>.Some {value} = move Toml.field(entry, keys[key]) {
+      named = named + usize.ONE
+      language = languages[key]
+      languageKey = String.utf8Bytes(keys[key])
+      written = Option<&TomlValue>.some(value)
+    }
+    key = key + usize.ONE
+  }
+  if named != usize.ONE { run refuseSources(manifest, text, at, sourcesRule()) }
+  let mut known = usize.ONE
+  let mut flags = List<Bytes>.make()
+  if let Option<&TomlValue>.Some {value} = move Toml.field(entry, "flags") {
+    known = known + usize.ONE
+    flags = match move run texts(value, false) {
+      Option<List<Bytes>>.Some {value: found} => move found
+      Option<List<Bytes>>.None => run refuseSources(manifest, text, at, b"flags must be a list of strings")
+    }
+    let listed = List<Bytes>.asSlice(&flags)
+    let mut flag = usize.ZERO
+    while flag < listed.length {
+      if !allowedFlag(Bytes.asSlice(&listed[flag])) {
+        let mut rule = run Bytes.copy(b"flag \"")
+        run Bytes.append(&mut rule, Bytes.asSlice(&listed[flag]))
+        run Bytes.append(&mut rule, b"\" is not allowed: ")
+        run Bytes.append(&mut rule, flagRule())
+        run refuseSources(manifest, text, at, Bytes.asSlice(&rule))
+      }
+      flag = flag + usize.ONE
+    }
+  }
+  let mut include = List<Path>.make()
+  if let Option<&TomlValue>.Some {value} = move Toml.field(entry, "include") {
+    known = known + usize.ONE
+    let directories = match move run texts(value, false) {
+      Option<List<Bytes>>.Some {value: found} => move found
+      Option<List<Bytes>>.None => run refuseSources(manifest, text, at, b"include must be a list of directories")
+    }
+    let listed = List<Bytes>.asSlice(&directories)
+    let mut item = usize.ZERO
+    while item < listed.length {
+      run List<Path>.append(&mut include, run packagePath(manifest, text, at, directory, b"include", Bytes.asSlice(&listed[item]), false))
+      item = item + usize.ONE
+    }
+  }
+  if let Option<&TomlValue>.Some {..} = move Toml.field(entry, "os") { known = known + usize.ONE }
+  if known != members { run refuseSources(manifest, text, at, sourcesRule()) }
+  let patterns = match move written {
+    Option<&TomlValue>.Some {value} => match move run texts(value, true) {
+      Option<List<Bytes>>.Some {value: found} => move found
+      Option<List<Bytes>>.None => run refuseSources(manifest, text, at, sourcesRule())
+    }
+    Option<&TomlValue>.None => run refuseSources(manifest, text, at, sourcesRule())
+  }
+  let mut files = List<Path>.make()
+  let listed = List<Bytes>.asSlice(&patterns)
+  let mut item = usize.ZERO
+  while item < listed.length {
+    run List<Path>.append(&mut files, run packagePath(manifest, text, at, directory, languageKey, Bytes.asSlice(&listed[item]), true))
+    item = item + usize.ONE
+  }
+  return NativeLinkInput.Sources {language: language, files: move files, flags: move flags, include: move include,
+    entry: run sourcesPrefix(manifest, text, at)}
+}
+
+// The systems sources entry `at` names in `os`, refused as a sources entry.
+effect fn sourceSystems(manifest: &Path, text: &[u8], at: usize, entry: &TomlValue) -> u8
+! InvalidNativeLinkInput | OutOfMemoryError ? &mut Allocator {
+  return match move run Effect.result(systemsOf(manifest, at, entry)) {
+    Result<u8, InvalidNativeLinkInput | OutOfMemoryError>.Success {value} => value
+    Result<u8, InvalidNativeLinkInput | OutOfMemoryError>.Failure {error} => match move error {
+      InvalidNativeLinkInput refused => { drop refused run refuseSources(manifest, text, at, systemRule()) }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// Reads `[native].sources` (see [`read`]).
+effect fn readSources(document: &TomlValue, manifest: &Path, text: &[u8], directory: &Path) -> List<Declared>
+! InvalidNativeLinkInput | OutOfMemoryError ? &mut Allocator {
+  let mut inputs = List<Declared>.make()
+  let declared = match move ManifestFields.nativeSources(document) {
+    Option<&TomlValue>.Some {value} => value
+    Option<&TomlValue>.None => { return move inputs }
+  }
+  let listed = match &declared.* {
+    TomlValue.Array {..} => true
+    _ => false
+  }
+  if !listed {
+    let mut detail = run Bytes.copy(Path.rawBytes(manifest))
+    run Bytes.append(&mut detail, b": [native].sources must be an array of inline tables")
+    fail InvalidNativeLinkInput {detail: move detail}
+  }
+  let mut at = usize.ZERO
+  while true {
+    let entry = match move Toml.item(declared, at) {
+      Option<&TomlValue>.Some {value} => value
+      Option<&TomlValue>.None => { break }
+    }
+    if let Option<usize>.None = move memberCount(entry) { run refuseSources(manifest, text, at, b"an entry must be an inline table") }
+    let systems = run sourceSystems(manifest, text, at, entry)
+    let input = run decodeSources(manifest, text, at, directory, entry)
+    run List<Declared>.append(&mut inputs, Declared {input: move input, systems: systems})
+    at = at + usize.ONE
+  }
+  return move inputs
+}
+
+/// Whether `inputs` holds a `[native].sources` entry, which the build compiles before it links.
+pub fn hasSources(inputs: &[NativeLinkInput]) -> bool {
+  let mut at = usize.ZERO
+  while at < inputs.length {
+    if let NativeLinkInput.Sources {..} = &inputs[at] { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+/// Whether every input of `inputs` is a `[native].sources` entry, which the build compiles into
+/// objects of its own cache; true for no inputs.
+pub fn onlySources(inputs: &[NativeLinkInput]) -> bool {
+  let mut at = usize.ZERO
+  while at < inputs.length {
+    if let NativeLinkInput.Sources {..} = &inputs[at] {} else { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
 /// The concrete object or archive file, for linkers that accept grouped file response inputs.
 /// Options, search directories, and named libraries have no concrete file here.
 pub fn file(self: &NativeLinkInput) -> Option<&Path> {
@@ -401,6 +741,7 @@ pub fn relocatable(self: &NativeLinkInput) -> bool {
   return match &self.* {
     NativeLinkInput.Object {..} => true
     NativeLinkInput.StaticArchive {..} => true
+    NativeLinkInput.Sources {..} => true
     _ => false
   }
 }
@@ -411,6 +752,7 @@ pub effect fn appendArchiveMember(self: &NativeLinkInput, process: &mut ProcessR
 ! FileError | InvalidNativeLinkInput | OutOfMemoryError ? &mut Allocator {
   match &self.* {
     NativeLinkInput.Object {path} => { run NativeToolchain.addPathArgument(&mut process.*, &path) }
+    NativeLinkInput.Sources {entry, ..} => run refuseEntry(&entry, b"its sources were not compiled before the archive")
     _ => run invalid(b"a static library archives only declared objects; declare an archive's objects instead")
   }
 }
@@ -468,6 +810,7 @@ pub effect fn appendArguments(self: &NativeLinkInput, target: &Target, stubbed: 
       run ChildProcess.addArgument(&mut process.*, "-framework")
       run ChildProcess.addArgumentBytes(&mut process.*, Bytes.asSlice(&name))
     }
+    NativeLinkInput.Sources {entry, ..} => run refuseEntry(&entry, b"its sources were not compiled before the link")
   }
   return ()
 }
