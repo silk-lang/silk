@@ -337,7 +337,10 @@ It includes:
 ## Platforms
 
 Native hosts are Apple Silicon macOS (`aarch64-apple-darwin`), x86-64 Linux
-(`x86_64-unknown-linux-gnu`) and ARM64 Linux (`aarch64-unknown-linux-gnu`). WebAssembly
+(`x86_64-unknown-linux-gnu`) and ARM64 Linux (`aarch64-unknown-linux-gnu`). Intel macOS
+(`x86_64-apple-darwin`) is a tier 2 output target. Any host links Linux and macOS executables
+for another of these targets when the build names a [platform supply](reference/platform-supplies.md)
+for it. WebAssembly
 (`wasm32-unknown-unknown`) is a freestanding output target. WASI commands target
 `wasm32-wasip1` (core modules) or `wasm32-wasip2` (components). Preview 2 also supports
 TCP, UDP, DNS, HTTP clients and servers, and custom WIT worlds. See the
