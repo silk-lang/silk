@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Cross-build the self-contained native corpus programs for another target with an existing N1,
-# as packages whose manifest names the target's platform supply. Writes one directory per
-# program under <output>: the executable `program`, `exit-code` and any `expected.stdout`.
+# as packages whose manifest names the target's platform supply, or none when it is empty. Writes
+# one directory per program under <output>: the executable `program`, `exit-code` and any
+# `expected.stdout`.
 #
-# usage: cross-build-corpus.sh <compiler> <target> <output> <platform-supply TOML> [programs...]
+# usage: cross-build-corpus.sh <compiler> <target> <output> <platform-supply TOML or ''> [programs...]
 # Without programs, every corpus program that needs no C units, splices, profiles, runs,
 # libraries or components and completes normally is built.
 set -euo pipefail
@@ -40,7 +41,8 @@ build() {
   local package="$work/$name"
   mkdir -p "$package" "$output/$name"
   cp "corpus/native/$name/main.silk" "$package/main.silk"
-  printf '[package]\nname = "corpus"\nversion = "0.0.0"\nsource = "."\n\n[native]\nplatform-supply = %s\n' "$supply" > "$package/silk.toml"
+  printf '[package]\nname = "corpus"\nversion = "0.0.0"\nsource = "."\n' > "$package/silk.toml"
+  if [ -n "$supply" ]; then printf '\n[native]\nplatform-supply = %s\n' "$supply" >> "$package/silk.toml"; fi
   if ! "$compiler" build "$package/main.silk" -o "$output/$name/program" --target "$target" --stdlib "$PWD/stdlib" \
     --optimization none --debug false > "$package/build.log" 2>&1; then
     echo "FAIL $name"

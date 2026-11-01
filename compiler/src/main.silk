@@ -79,6 +79,7 @@ import driver.WasmDebug as WasmDebug {LineTable}
 import driver.NativeToolchain
 import driver.WindowsLink
 import driver.DarwinLink
+import driver.LinuxLink
 import driver.CodegenCache
 import backend.Bitcode
 import backend.BitcodeText
@@ -326,13 +327,14 @@ effect fn writeDeferredTemplates(deferred: &[DeferredStaticTemplate]) -> ()
 
 // Whether `host` links an executable for `target` with `request`: its own target, freestanding
 // wasm32, which needs only Clang and its WebAssembly linker, Windows, which carries its own
-// import libraries, macOS by default, which links against Silk's own libSystem stub when no SDK
-// is found, or a Linux or macOS target whose platform supply resolves: an explicit one,
-// `SDKROOT` for macOS, or the SDK a Mac discovers for either macOS architecture.
+// import libraries, Linux, which carries its own glibc stubs (the link refuses what they cannot
+// serve), macOS by default, which links against Silk's own libSystem stub when no SDK is found,
+// or a macOS target whose platform supply resolves: an explicit one, `SDKROOT`, or the SDK a Mac
+// discovers for either macOS architecture.
 effect fn linksOn(target: &Target, host: &Target, request: &SupplyRequest) -> bool
 ! HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
   if Target.id(target) == Target.id(host) || same(Target.objectFormat(target), b"wasm")
-    || Target.id(target) == TargetId.X8664PcWindowsMsvc {
+    || Target.id(target) == TargetId.X8664PcWindowsMsvc || same(Target.operatingSystem(target), b"linux") {
     return true
   }
   // Resolution later checks that an explicit supply names this target.
@@ -1063,7 +1065,7 @@ effect fn writeError(bytes: &[u8]) -> () ! WriterError {
 /// new directory of its own beside it, renames the finished output over `output`, and removes the
 /// directory.
 effect fn compileIr(ir: &Bytes, debugInfo: &[u8], unitLines: Option<&EmissionPlan>, sources: &ModuleSources, functionNames: &FunctionNames, units: &[CodegenUnit], packs: &[BuildRecord.PackBody], output: &Path, form: Form, stage: Stage, optimization: &[u8], debug: bool, relocation: &[u8],
-  profileFlags: &[Bytes], target: &Target, supply: &Option<Supply>, linkInputs: &[NativeLinkInput], functionOrder: Option<&Path>,
+  libc: &[u8], profileFlags: &[Bytes], target: &Target, supply: &Option<Supply>, linkInputs: &[NativeLinkInput], functionOrder: Option<&Path>,
   selectedClang: &Option<Bytes>, world: &WasiTools.World, started: bool, progress: &mut Progress) -> i32
 ! FileError | ProcessError | HostInputError | InvalidNativeLinkInput | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
@@ -1075,7 +1077,7 @@ effect fn compileIr(ir: &Bytes, debugInfo: &[u8], unitLines: Option<&EmissionPla
   let use = effect fn(resource: &mut Path) -> i32
   ! FileError | ProcessError | HostInputError | InvalidNativeLinkInput | OutOfMemoryError | WriterError
   ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
-    return run compileIrIn(&resource.*, ir, debugInfo, unitLines, sources, functionNames, units, packs, output, form, stage, optimization, debug, relocation, profileFlags, target, supply,
+    return run compileIrIn(&resource.*, ir, debugInfo, unitLines, sources, functionNames, units, packs, output, form, stage, optimization, debug, relocation, libc, profileFlags, target, supply,
       linkInputs, functionOrder, selectedClang, world, started, &mut progress.*)
   }
   let release = effect fn(resource: &mut Path) -> () ? &mut FileSystem | &mut Allocator {
@@ -1141,7 +1143,7 @@ effect fn readableNames(plan: &EmissionPlan) -> FunctionNames ! OutOfMemoryError
 // Compiles as `compileIr` does, with the intermediate files in `scratch` under the output's name,
 // which Clang records in the object.
 effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: Option<&EmissionPlan>, sources: &ModuleSources, functionNames: &FunctionNames, units: &[CodegenUnit], packs: &[BuildRecord.PackBody], output: &Path, form: Form, stage: Stage, optimization: &[u8], debug: bool,
-  relocation: &[u8], profileFlags: &[Bytes], target: &Target, supply: &Option<Supply>, linkInputs: &[NativeLinkInput],
+  relocation: &[u8], libc: &[u8], profileFlags: &[Bytes], target: &Target, supply: &Option<Supply>, linkInputs: &[NativeLinkInput],
   functionOrder: Option<&Path>, selectedClang: &Option<Bytes>, world: &WasiTools.World, started: bool, progress: &mut Progress) -> i32
 ! FileError | ProcessError | HostInputError | InvalidNativeLinkInput | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
@@ -1187,6 +1189,38 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
   let linked = final && form == Form.Executable
   let windows = linked && same(Target.operatingSystem(target), b"windows")
   if windows { run WindowsLink.configure(&mut process, &clang) }
+  // A dynamically linked glibc executable that declares no link inputs and names no platform
+  // supply links against Silk's glibc 2.28 stubs and startup code (`LinuxLink`) on any host, with
+  // no sysroot, GCC installation or libgcc. Its link inputs, or a static glibc link, need the
+  // target's own libraries: the host's own on a native link, or an explicit supply's sysroot.
+  let linux = linked && same(Target.operatingSystem(target), b"linux")
+  let mut explicitSupply = false
+  if let Option<Supply>.Some {..} = &supply.* { explicitSupply = true }
+  let mut staticLink = false
+  let mut scanned = usize.ZERO
+  while scanned < profileFlags.length {
+    if same(Bytes.asSlice(&profileFlags[scanned]), b"-static") { staticLink = true }
+    scanned = scanned + usize.ONE
+  }
+  let glibcStubbed = linux && !explicitSupply && same(libc, b"gnu") && !staticLink && linkInputs.length == usize.ZERO
+  let crossTarget = Target.id(target) != Target.id(&hostTarget())
+  if linux && !explicitSupply && !glibcStubbed && crossTarget {
+    run Progress.clear(&mut progress.*)
+    run writeError(b"silk: cannot link an executable for ")
+    run writeError(Target.name(target))
+    run writeError(b" without a sysroot: ")
+    if linkInputs.length > usize.ZERO {
+      run writeError(b"its declared link inputs need the target's libraries")
+    } else if staticLink {
+      run writeError(b"a static glibc link needs the target's static libraries")
+    } else {
+      run writeError(b"only libc = \"gnu\" links without one")
+    }
+    run writeError(b".\nDeclare [native].platform-supply = { kind = \"explicit\", target = \"")
+    run writeError(Target.name(target))
+    run writeError(b"\", root = \"<sysroot>\", linker = \"<ld.lld>\" }\n")
+    return 2
+  }
   let merged = final && form == Form.Object && linkInputs.length > usize.ZERO
   let archive = final && form == Form.StaticLibrary
   // A wasm32 executable links freestanding: no libc, no entry, and the source runtime beside the IR.
@@ -1361,6 +1395,8 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
       ClangVersion.Failed {status} => { return status }
     }
   }
+  // The options that select the program's linker, with which the glibc stub libraries link too.
+  let mut stubLinker = List<Bytes>.make()
   if lld {
     let mut installed = false
     if let Option<Bytes>.Some {value: answer} = &probed {
@@ -1368,12 +1404,17 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
         let mut ldPath = run Bytes.copy(b"--ld-path=")
         run Bytes.append(&mut ldPath, Bytes.asSlice(&linker))
         run ChildProcess.addArgumentBytes(&mut process, Bytes.asSlice(&ldPath))
+        run List<Bytes>.append(&mut stubLinker, move ldPath)
         installed = true
       }
     }
     // The system linker may not order symbols, so an ordered link asks for lld on PATH instead.
-    // A cross macOS link always names lld, so Clang passes `ld64.lld` its own flags.
-    if ordered && !installed || crossDarwin { run ChildProcess.addArgument(&mut process, "-fuse-ld=lld") }
+    // A cross macOS or Linux link always names lld: Clang passes `ld64.lld` its own flags, and
+    // another host's system linker cannot link for Linux.
+    if ordered && !installed || crossDarwin || glibcStubbed && crossTarget && !installed {
+      run ChildProcess.addArgument(&mut process, "-fuse-ld=lld")
+      run List<Bytes>.append(&mut stubLinker, run Bytes.copy(b"-fuse-ld=lld"))
+    }
   }
   if ordered {
     run ChildProcess.addArgument(&mut process, "-Xlinker")
@@ -1541,6 +1582,8 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
   // Silk's libSystem stub is libc and libm too, as libSystem is on macOS.
   if linked && stubbed {
     run DarwinLink.prepare(&mut process, scratch)
+  } else if glibcStubbed {
+    run LinuxLink.configure(&mut process, Bytes.asSlice(&stem), target)
   } else if linked && !freestanding && !windows {
     run ChildProcess.addArgument(&mut process, "-lc")
     run ChildProcess.addArgument(&mut process, "-lm")
@@ -1581,6 +1624,11 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
     run appendDigest(&mut command, ContentHash.of(Bytes.asSlice(&stub)))
   }
   if let Option<ContentHash>.Some {value: headers} = &nativeHeaders { run appendDigest(&mut command, headers) }
+  // The glibc stubs and startup code are written for each link from text in the compiler.
+  if glibcStubbed {
+    run appendDigest(&mut command, ContentHash.of(String.utf8Bytes(LinuxLink.symbols())))
+    run appendDigest(&mut command, ContentHash.of(String.utf8Bytes(LinuxLink.startSource())))
+  }
   // The command names a supply's root, linker and deployment, but not the bytes of the SDK files
   // it read, so a replaced SDK at the same path relinks, natively or across hosts alike.
   if let Option<Supply>.Some {value: selected} = &supply.* {
@@ -1625,6 +1673,10 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
     }
     if freestanding { run FileSystem.writeFile(&runtimePath, WasmRuntime.source()) }
     if let Option<Bytes>.Some {value: order} = &ordering { run FileSystem.writeFile(&orderPath, Bytes.asSlice(&order)) }
+    if glibcStubbed {
+      let built = run LinuxLink.build(&clang, List<Bytes>.asSlice(&stubLinker), Bytes.asSlice(&stem), target)
+      if built != 0 { return built }
+    }
     // A Clang that cannot start fails this target, which reports as any failed target does.
     let compiled = match move run Effect.result(submitted(&process, &mut progress.*)) {
       Result<i32, ProcessError | OutOfMemoryError | WriterError>.Success {value} => value
@@ -2972,7 +3024,7 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, cacheDirectory: Opti
       if debug && split { unitLines = Option<&EmissionPlan>.some(&plan) }
       let linked = run Effect.result(compileIr(
         &text, Bytes.asSlice(&debugInfo), unitLines, &sources, &functionNames, List<CodegenUnit>.asSlice(&units), List<BuildRecord.PackBody>.asSlice(&packs), output, form, stage, Bytes.asSlice(&optimization), debug, Bytes.asSlice(&relocation),
-        List<Bytes>.asSlice(&profileFlags), &target,
+        Bytes.asSlice(&libc), List<Bytes>.asSlice(&profileFlags), &target,
         &supply, ModuleSourceFiles.nativeLinkInputs(&sources), ModuleSourceFiles.functionOrder(&sources), clang, &world, started,
         &mut progress.*,
       ))
