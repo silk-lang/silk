@@ -4033,8 +4033,47 @@ const program = Effect.gen(function* () {
   yield* escapeCheck(computing('  return 2\n'), '^$')
   yield* escapeCheck(computing('  run tick()\n  return 1\n'), 'helper\\.silk:6:3: error\\[OWN0016\\]')
   yield* escapeCheck(computing('  return 3\n'), '^$')
+  // `Source.read` and `Source.text` embed files of the package at compile time. An edit to an
+  // embedded file rebuilds with its new contents, an edit replay reruns only the units that read
+  // it, and a path outside the package or naming no file is refused.
+  const embeds = join(directory, 'embeds')
+  yield* fs.makeDirectory(join(embeds, 'src'), { recursive: true })
+  yield* fs.makeDirectory(join(embeds, 'shaders'), { recursive: true })
+  yield* fs.writeFileString(join(embeds, 'silk.toml'), '[package]\nname = "embeds"\nversion = "0.1.0"\n')
+  yield* fs.writeFile(join(embeds, 'shaders/b.bin'), new Uint8Array([1, 255, 3]))
+  const embedMain = (path: string) => 'import silk.build.source { Source }\nimport silk.num.usize\n\npub fn main() -> i32 {\n'
+    + `  let bytes = Source.read("${path}")\n  let text = Source.text("shaders/a.wgsl")\n  if bytes[1] != 255 { return 100 }\n`
+    + '  return usize.toI32(bytes.length + Intrinsic.stringByteLength(text))\n}\n'
+  const embedsExecutable = join(embeds, `build/llvm/${hostTarget}/debug/embeds`)
+  const embedBuild = Effect.fnUntraced(function* (expected: number) {
+    const built = yield* invoke(silk, ['build', '--stdlib', standardLibrary], embeds, splitEnvironment)
+    assert.equal(built.status, 0, built.stderr)
+    const ran = yield* invoke(embedsExecutable, [], embeds, splitEnvironment)
+    assert.equal(ran.status, expected, ran.stderr)
+  })
+  yield* fs.writeFileString(join(embeds, 'shaders/a.wgsl'), 'abcd')
+  yield* fs.writeFileString(join(embeds, 'src/main.silk'), embedMain('shaders/b.bin'))
+  yield* embedBuild(7)
+  yield* fs.writeFileString(join(embeds, 'shaders/a.wgsl'), 'abcdef')
+  yield* embedBuild(9)
+  yield* fs.writeFileString(
+    join(embeds, 'replay.toml'),
+    '[[edit]]\nkind = "embedded"\nmodule = "shaders/a.wgsl"\nfind = "abc"\nreplace = "abcabc"\n',
+  )
+  const replay = yield* invoke(silk, ['check', '--stdlib', standardLibrary, '--replay', 'replay.toml'], embeds, splitEnvironment)
+  assert.equal(replay.status, 0, replay.stdout + replay.stderr)
+  const unitsRun = [...(replay.stdout + replay.stderr).matchAll(/silk-replay step=[1-9]\d* .*?units-run=(\d+)/g)].map((match) => Number(match[1]))
+  assert.ok(unitsRun.length > 0 && unitsRun.every((units) => units < 10), `an embedded edit reran ${unitsRun.join(', ')} units`)
+  const refusedEmbed = Effect.fnUntraced(function* (path: string, message: RegExp) {
+    yield* fs.writeFileString(join(embeds, 'src/main.silk'), embedMain(path))
+    const built = yield* invoke(silk, ['build', '--stdlib', standardLibrary], embeds, splitEnvironment)
+    assert.notEqual(built.status, 0, 'a refused embed fails the build')
+    assert.match(built.stdout + built.stderr, message)
+  })
+  yield* refusedEmbed('shaders/missing.bin', /cannot embed "shaders\/missing\.bin": no such file in package embeds/)
+  yield* refusedEmbed('../outside.bin', /cannot embed "\.\.\/outside\.bin": the path must be relative to the package's directory/)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, exports, workspaces, silk change release/history/recovery, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, cached codegen units, build replay, check replay, object and static library artifacts and emission stages passed',
+    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, exports, workspaces, silk change release/history/recovery, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, cached codegen units, build replay, check replay, embedded files, object and static library artifacts and emission stages passed',
   )
 })
 const require = createRequire(new URL('../../package.json', import.meta.url))
