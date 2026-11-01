@@ -435,47 +435,53 @@ it.effect(
   'selects independently pinned targets and rejects mismatched coordinates or missing pins',
   () =>
     Effect.gen(function* () {
-      const f = yield* fixture()
+      const fs = yield* FileSystem.FileSystem
+      const temporary = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-target-pins-' })
       const seeds = {}
       for (const target of targets) {
         const pin = yield* candidate({
           target,
           tag: 'v1.2.3',
           sha256: hash(target),
-          sourceCommit: f.revision,
+          sourceCommit: 'b'.repeat(40),
           runId: '1',
         })
         Object.assign(seeds, pin.seeds)
       }
-      const pinPath = join(f.temporary, 'pins.json')
-      yield* f.fs.writeFileString(pinPath, yield* encodeJson({ schemaVersion: 2, seeds }))
+      const pinPath = join(temporary, 'pins.json')
+      yield* fs.writeFileString(pinPath, yield* encodeJson({ schemaVersion: 2, seeds }))
       const pin = yield* readPin(pinPath)
       for (const target of targets) {
         const selected = yield* selectSeed(pin, target)
-        assert.strictEqual(selected.asset, `silk-compiler-${target}`)
+        assert.strictEqual(selected.asset, {
+          'x86_64-unknown-linux-gnu': 'silk-compiler-x86_64-unknown-linux-gnu',
+          'aarch64-unknown-linux-gnu': 'silk-compiler-aarch64-unknown-linux-gnu',
+          'aarch64-apple-darwin': 'silk-compiler-aarch64-apple-darwin',
+          'x86_64-pc-windows-msvc': 'silk-compiler-x86_64-pc-windows-msvc.exe',
+        }[target])
         assert.strictEqual(selected.sha256, hash(target))
-        const download = join(f.temporary, `download-${target}`)
-        yield* f.fs.writeFileString(download, target)
+        const download = join(temporary, `download-${target}`)
+        yield* fs.writeFileString(download, target)
         yield* verifySeed({
           pin: pinPath,
           target,
           download,
-          destination: join(f.temporary, `installed-${target}`),
+          destination: join(temporary, `installed-${target}`),
         })
       }
       const target = targets[0]
       const arm = targets[1]
-      const swapped = join(f.temporary, 'swapped-seed')
+      const swapped = join(temporary, 'swapped-seed')
       yield* failure(
         verifySeed({
           pin: pinPath,
           target: arm,
-          download: join(f.temporary, `download-${target}`),
+          download: join(temporary, `download-${target}`),
           destination: swapped,
         }),
         /differs from pinned/,
       )
-      assert.isFalse(yield* f.fs.exists(swapped))
+      assert.isFalse(yield* fs.exists(swapped))
       yield* failure(
         selectSeed({ schemaVersion: 2, seeds: { [target]: seeds[target] } }, arm),
         /No native seed is pinned/,
@@ -485,7 +491,7 @@ it.effect(
         { [arm]: pin.seeds[target] },
         { [target]: { ...pin.seeds[target], asset: `silk-compiler-${arm}` } },
       ]) {
-        yield* f.fs.writeFileString(pinPath, yield* encodeJson({ schemaVersion: 2, seeds }))
+        yield* fs.writeFileString(pinPath, yield* encodeJson({ schemaVersion: 2, seeds }))
         yield* failure(readPin(pinPath), /at least one|key must match|asset must name/)
       }
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),

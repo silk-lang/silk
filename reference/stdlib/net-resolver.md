@@ -253,6 +253,16 @@ pub enum NativeResolverOperation
 
 The system call that failed in a native provider.
 
+<a id="NativeResolverOperation.Initialize"></a>
+
+### `Initialize`
+
+```silk
+Initialize
+```
+
+Initialize the host networking service before resolving an address.
+
 <a id="NativeResolverOperation.GetAddrInfo"></a>
 
 ### `GetAddrInfo`
@@ -875,4 +885,4 @@ most the `maxResults` of the request, and never more than 64.
 
 Category: Networking.
 
-Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`.
+Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`.

@@ -2,7 +2,7 @@
 //! `PATH`.
 //!
 //! `PATH` entries and installed commands often are links, and a command is known by its real
-//! path, so this boundary resolves them with POSIX `realpath` directly.
+//! path. This boundary uses POSIX `realpath` or Windows handle-based final-path discovery.
 
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.collections.bytes { Bytes }
@@ -16,6 +16,24 @@ import silk.collections.slice { Slice }
 import silk.text.string { InvalidUtf8 }
 import silk.num.usize
 import silk.collections.list { List }
+import silk.platform.windows.path { WindowsPath }
+static if Intrinsic.targetOperatingSystem() == "windows" { import silk.platform.windows.host_path as WindowsHostPath }
+
+/// Converts an absolute host working directory to the compiler's machine namespace.
+/// Windows preserves canonical WTF-8; Unix host bytes retain their spelling.
+pub effect fn fromHost(bytes: &[u8]) -> Path ! FileError | OutOfMemoryError ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return run WindowsPath.fromNativeBytes(bytes)
+  } else {
+    return run Path.fromBytes(bytes)
+  }
+}
+
+/// Returns a host path's parent, stopping at a Windows volume root or the Unix root.
+pub effect fn parent(path: &Path) -> Option<Path> ! OutOfMemoryError ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" { return run WindowsPath.parent(path) }
+  else { return run Path.parent(path) }
+}
 
 @foreign(noCapture: ("path", "resolved"))
 unsafe extern "C" fn realpath(path: ?[*]const u8, resolved: ?[*]mut u8) -> ?[*]mut u8
@@ -45,14 +63,18 @@ effect fn invalid() -> never ! FileError {
   fail FileSystem.error(FileSystem.pathOperation(), FileSystem.invalidPath())
 }
 
-/// Resolves one path argument lexically, as the TypeScript CLI does with `path.resolve`.
+/// Resolves one host path argument lexically against the working directory.
 ///
 /// Absolute text resolves from the root and relative text from `working`; `.` and `..`
-/// components are normalized without consulting the filesystem. Text that is not UTF-8, has an
-/// empty interior component, or climbs above the root fails with the `InvalidPath` reason.
+/// components are normalized without consulting the filesystem. Windows accepts canonical WTF-8
+/// and both separators, preserving drive/share roots. Unix accepts UTF-8. Invalid encoding, an
+/// empty interior component, or climbing above the selected root fails with `InvalidPath`.
 pub effect fn resolve(working: &Path, argument: &[u8]) -> Path
   ! FileError | OutOfMemoryError
   ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return run WindowsPath.resolveBytes(working, argument)
+  }
   let absolute = argument.length > usize.ZERO && argument[usize.ZERO] == 47
   let mut relative = argument
   if absolute {
@@ -88,7 +110,8 @@ effect fn components(path: &[u8]) -> List<[usize; 2]> ! OutOfMemoryError ? &mut 
 
 /// The path of `target` relative to the directory `base`, as the TypeScript CLI's `path.relative`
 /// spells it: `/`-separated, with `..` for each component of `base` past their common prefix, and
-/// empty when the two are the same path. Both paths are absolute and normalized.
+/// empty when the two are the same path. Both paths are absolute and normalized. On Windows,
+/// different volumes return the absolute target, and only drive prefixes compare without case.
 pub effect fn relative(base: &Path, target: &Path) -> Bytes ! OutOfMemoryError ? &mut Allocator {
   let from = Path.rawBytes(base)
   let to = Path.rawBytes(target)
@@ -97,6 +120,24 @@ pub effect fn relative(base: &Path, target: &Path) -> Bytes ! OutOfMemoryError ?
   let left = List<[usize; 2]>.asSlice(&fromParts)
   let right = List<[usize; 2]>.asSlice(&toParts)
   let mut common = usize.ZERO
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    // Only drive prefixes fold case: directories can enable case-sensitive names.
+    if from.length >= 3 && to.length >= 3 && from[2] == 58 && to[2] == 58 {
+      let mut leftDrive = from[1]
+      let mut rightDrive = to[1]
+      if leftDrive >= 97 && leftDrive <= 122 { leftDrive = leftDrive - 32 }
+      if rightDrive >= 97 && rightDrive <= 122 { rightDrive = rightDrive - 32 }
+      if leftDrive != rightDrive { return run Bytes.copy(to) }
+      common = 1
+    } else {
+      if left.length < 3 || right.length < 3 { return run Bytes.copy(to) }
+      while common < 3 {
+        if !same(Slice.view(from, left[common][0], left[common][1] - left[common][0]),
+            Slice.view(to, right[common][0], right[common][1] - right[common][0])) { return run Bytes.copy(to) }
+        common = common + 1
+      }
+    }
+  }
   while common < left.length && common < right.length
     && same(Slice.view<u8>(from, left[common][0], left[common][1] - left[common][0]),
       Slice.view<u8>(to, right[common][0], right[common][1] - right[common][0])) {
@@ -134,24 +175,46 @@ pub fn contains(value: &[u8], wanted: u8) -> bool {
   return false
 }
 
-/// The paths a bare command `name` may name, in `PATH` order: each entry of the colon-separated
-/// `searchPath` joined with `name`, where an empty entry is the working directory (`.`).
+/// Whether a command argument spells a path rather than a bare executable name.
+pub fn hasDirectory(value: &[u8]) -> bool {
+  if contains(value, 47) { return true }
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return contains(value, 92) || contains(value, 58)
+  }
+  return false
+}
+
+/// The paths a bare command `name` may name, in `PATH` order. Unix uses colon-separated entries;
+/// Windows uses semicolons, removes surrounding entry quotes, and appends `.exe` to names without
+/// an extension. An empty entry names the working directory (`.`).
 pub effect fn searchCandidates(searchPath: &[u8], name: &[u8]) -> List<Bytes>
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut candidates = List<Bytes>.make()
   let mut start = usize.ZERO
   let mut at = usize.ZERO
+  let mut delimiter: u8 = 58
+  static if Intrinsic.targetOperatingSystem() == "windows" { delimiter = 59 }
   while at <= searchPath.length {
-    if at == searchPath.length || searchPath[at] == 58 {
+    if at == searchPath.length || searchPath[at] == delimiter {
       let mut candidate = Bytes.make()
       if at == start {
         run Bytes.append(&mut candidate, b".")
       } else {
-        run Bytes.append(&mut candidate, Slice.view<u8>(searchPath, start, at - start))
+        let mut entry = Slice.view<u8>(searchPath, start, at - start)
+        static if Intrinsic.targetOperatingSystem() == "windows" {
+          if entry.length >= 2 && entry[0] == 34 && entry[entry.length - 1] == 34 {
+            entry = Slice.view(entry, 1, entry.length - 2)
+          }
+        }
+        run Bytes.append(&mut candidate, entry)
       }
       run Bytes.append(&mut candidate, b"/")
       run Bytes.append(&mut candidate, name)
+      static if Intrinsic.targetOperatingSystem() == "windows" {
+        // Native tools are executable images, never implicit command-shell scripts.
+        if !contains(name, 46) { run Bytes.append(&mut candidate, b".exe") }
+      }
       run List<Bytes>.append(&mut candidates, move candidate)
       start = at + usize.ONE
     }
@@ -169,6 +232,7 @@ fn isNull(answer: ?[*]mut u8) -> bool {
 /// The canonical path of `path` with every symbolic link resolved, or `None` when the host cannot
 /// resolve it.
 pub effect fn canonical(path: &[u8]) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" { return run WindowsHostPath.canonicalBytes(path) }
   if contains(path, 0) {
     return Option<Bytes>.none()
   }
@@ -231,7 +295,7 @@ pub effect fn exists(text: &[u8], directory: bool) -> bool ! OutOfMemoryError ? 
 }
 
 /// The first `PATH` candidate for `name` that names a regular file, with its symbolic links
-/// resolved; `searchPath` is the colon-separated `PATH` value.
+/// resolved; `searchPath` uses the host's PATH delimiter.
 pub effect fn search(searchPath: &[u8], name: &[u8]) -> Option<Bytes>
   ! OutOfMemoryError
   ? &mut FileSystem | &mut Allocator {

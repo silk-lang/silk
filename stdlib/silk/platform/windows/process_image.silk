@@ -1,0 +1,242 @@
+//! Interactive Windows process execution: inherit the terminal, environment,
+//! and working directory, wait for the image, and return its exact exit status to the shell.
+//!
+//! @category Windows platform
+
+static if Intrinsic.targetOperatingSystem() == "windows" {
+import silk.platform.windows.host_path as WindowsHostPath
+import silk.core.effect {Effect}
+import silk.core.option {Option}
+import silk.core.result {Result}
+import silk.core.ownership {Drop}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.collections.slice {Slice}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.mem.pointer {Pointer}
+import silk.platform.windows.heap {WindowsHeap}
+import silk.platform.windows.command_line {CommandLine}
+import silk.platform.windows.wtf8 {Wtf8, InvalidWtf8}
+import silk.system.filesystem {Path}
+import silk.system.host_input {HostInputError}
+import silk.num.usize
+import silk.text.string {String}
+
+extern "C" struct Startup {
+  size: u32, reserved: ?*mut u16, desktop: ?*mut u16, title: ?*mut u16,
+  x: u32, y: u32, width: u32, height: u32, columns: u32, rows: u32, fill: u32, flags: u32,
+  show: u16, reservedCount: u16, reservedBytes: ?*mut u8,
+  input: ?*mut u8, output: ?*mut u8, error: ?*mut u8, attributes: ?*mut u8,
+}
+extern "C" struct ProcessInfo { process: ?*mut u8, thread: ?*mut u8, pid: u32, tid: u32 }
+unsafe extern "C" fn GetStdHandle(which: u32) -> ?*mut u8
+unsafe extern "C" fn GetCurrentProcess() -> ?*mut u8
+unsafe extern "C" fn GetLastError() -> u32
+unsafe extern "C" fn SetLastError(code: u32) -> ()
+unsafe extern "C" fn CloseHandle(handle: ?*mut u8) -> i32
+unsafe extern "C" fn WaitForSingleObject(handle: ?*mut u8, timeout: u32) -> u32
+unsafe extern "C" fn ExitProcess(code: u32) -> ()
+@foreign(noCapture: ("target",))
+unsafe extern "C" fn DuplicateHandle(sourceProcess: ?*mut u8, source: ?*mut u8, targetProcess: ?*mut u8, target: *mut ?*mut u8, access: u32, inherit: i32, options: u32) -> i32
+@foreign(noCapture: ("size",))
+unsafe extern "C" fn InitializeProcThreadAttributeList(attributes: ?*mut u8, count: u32, flags: u32, size: *mut usize) -> i32
+unsafe extern "C" fn DeleteProcThreadAttributeList(attributes: ?*mut u8) -> ()
+unsafe extern "C" fn UpdateProcThreadAttribute(attributes: ?*mut u8, flags: u32, kind: usize, value: *mut u8, size: usize, previous: ?*mut u8, returnedSize: ?*mut usize) -> i32
+@foreign(noCapture: ("application", "command", "processSecurity", "threadSecurity", "environment", "directory", "startup", "result"))
+unsafe extern "C" fn CreateProcessW(application: ?[*]const u16, command: ?[*]mut u16, processSecurity: ?*mut u8, threadSecurity: ?*mut u8, inherit: i32, flags: u32, environment: ?[*]const u16, directory: ?[*]const u16, startup: *mut Startup, result: *mut ProcessInfo) -> i32
+@foreign(noCapture: ("code",))
+unsafe extern "C" fn GetExitCodeProcess(handle: ?*mut u8, code: *mut u32) -> i32
+@foreign(noCapture: ("name", "value"))
+unsafe extern "C" fn GetEnvironmentVariableW(name: ?[*]const u16, value: ?[*]mut u16, capacity: u32) -> u32
+@foreign(noCapture: ("name", "value"))
+unsafe extern "C" fn SetEnvironmentVariableW(name: ?[*]const u16, value: ?[*]const u16) -> i32
+@callbacks("handler")
+unsafe extern "C" fn SetConsoleCtrlHandler(handler: extern "C" fn(u32) -> i32, add: i32) -> i32
+
+struct Handle { raw: ?*mut u8 }
+impl Drop for Handle { fn drop(self: &mut Self) -> () { let ignored = unsafe CloseHandle(self.raw) } }
+struct Attributes { raw: *mut u8, initialized: bool }
+impl Drop for Attributes {
+  fn drop(self: &mut Self) -> () {
+    if self.initialized { unsafe DeleteProcThreadAttributeList(self.raw) }
+    unsafe WindowsHeap.release(self.raw)
+  }
+}
+export "C" fn silk_run_console_control(code: u32) -> i32 {
+  if code == 0 || code == 1 { return 1 }
+  return 0
+}
+struct Control { installed: bool }
+impl Drop for Control {
+  fn drop(self: &mut Self) -> () {
+    if self.installed { let ignored = unsafe SetConsoleCtrlHandler(silk_run_console_control, 0) }
+  }
+}
+
+fn nullUnits() -> ?[*]const u16 {
+  return unsafe Intrinsic.pointerRequalify<?*mut u16, ?[*]const u16>(Pointer.null<u16>())
+}
+
+effect fn text(bytes: &[u8]) -> Option<List<u16>> ! OutOfMemoryError ? &mut Allocator {
+  let mut at: usize = 0
+  while at < bytes.length { if bytes[at] == 0 { return Option<List<u16>>.none() }
+    at = at + 1 }
+  return match move run Effect.result(Wtf8.decodeBytes(bytes)) {
+    Result<List<u16>, InvalidWtf8 | OutOfMemoryError>.Success {value} => Option<List<u16>>.some(move value)
+    Result<List<u16>, InvalidWtf8 | OutOfMemoryError>.Failure {error} => match move error {
+      InvalidWtf8 invalid => Option<List<u16>>.none()
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+effect fn setEnvironment(name: &[u8], value: &[u8], overwrite: bool) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if name.length == 0 { return false }
+  let mut at: usize = 0
+  while at < name.length { if name[at] == 61 { return false }
+    at = at + 1 }
+  let mut key = match move run text(name) {
+    Option<List<u16>>.Some {value: decoded} => move decoded
+    Option<List<u16>>.None => { return false }
+  }
+  let mut content = match move run text(value) {
+    Option<List<u16>>.Some {value: decoded} => move decoded
+    Option<List<u16>>.None => { return false }
+  }
+  run List<u16>.append(&mut key, 0)
+  run List<u16>.append(&mut content, 0)
+  if !overwrite {
+    unsafe SetLastError(0)
+    let count = unsafe GetEnvironmentVariableW(Pointer.fromSlice(List<u16>.asSlice(&key)),
+      unsafe Intrinsic.pointerRequalify<?*mut u16, ?[*]mut u16>(Pointer.null<u16>()), 0)
+    if count > 0 { return true }
+    let error = unsafe GetLastError()
+    if error == 0 { return true }
+    if error != 203 { return false }
+  }
+  return unsafe SetEnvironmentVariableW(Pointer.fromSlice(List<u16>.asSlice(&key)),
+    Pointer.fromSlice(List<u16>.asSlice(&content))) != 0
+}
+
+/// Sets a live Windows environment variable from canonical WTF-8 host bytes, replacing its value.
+/// Returns false for an empty name, `=` in the name, NUL, invalid WTF-8, or an OS refusal.
+/// Allocation failure remains an Effect. Previously captured `HostInput` snapshots do not change.
+pub effect fn setVariableBytes(name: &[u8], value: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  return run setEnvironment(name, value, true)
+}
+
+/// Sets a live Windows environment variable from text, replacing its value.
+/// Returns false for an empty name, `=` in the name, NUL, or an OS refusal.
+/// Allocation failure remains an Effect. Previously captured `HostInput` snapshots do not change.
+pub effect fn setVariable(name: string, value: string) -> bool ! OutOfMemoryError ? &mut Allocator {
+  return run setEnvironment(String.utf8Bytes(name), String.utf8Bytes(value), true)
+}
+
+/// Sets a default from canonical WTF-8 host bytes, preserving an existing value, including empty.
+/// Returns false for invalid WTF-8, NUL, an empty name, `=` in the name, or an OS refusal.
+/// The presence check and update are separate calls; concurrent environment writers may race.
+pub effect fn setVariableDefaultBytes(name: &[u8], value: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  return run setEnvironment(name, value, false)
+}
+
+/// Sets a default environment variable from text, preserving an existing value, including empty.
+/// Returns false for NUL, an empty name, `=` in the name, or an OS refusal.
+/// The presence check and update are separate calls; concurrent environment writers may race.
+pub effect fn setVariableDefault(name: string, value: string) -> bool ! OutOfMemoryError ? &mut Allocator {
+  return run setEnvironment(String.utf8Bytes(name), String.utf8Bytes(value), false)
+}
+
+fn duplicate(which: u32) -> Option<Handle> {
+  let original = unsafe GetStdHandle(which)
+  if Pointer.isNull(original) || Pointer.address(original) == usize.MAX { return Option<Handle>.none() }
+  let current = unsafe GetCurrentProcess()
+  let mut copied = Pointer.null<u8>()
+  if unsafe DuplicateHandle(current, original, current, Pointer.fromMutRef(&mut copied), 0, 1, 2) == 0 { return Option<Handle>.none() }
+  return Option<Handle>.some(Handle {raw: copied})
+}
+
+/// Runs an explicit executable with inherited standard streams, environment and working directory.
+/// Returns false if setup fails. On successful launch it waits and exits with the child's DWORD.
+pub effect fn replace(program: &Path, arguments: &[Bytes]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let application = match move run WindowsHostPath.wide(program) {
+    Option<List<u16>>.Some {value} => move value
+    Option<List<u16>>.None => { return false }
+  }
+  let units = List<u16>.asSlice(&application)
+  // No shell interpretation. CreateProcess receives an executable image, never a batch script.
+  let size = units.length - 1
+  if size >= 4 && units[size - 4] == 46 {
+    let mut a = units[size - 3]
+    let mut b = units[size - 2]
+    let mut c = units[size - 1]
+    if a >= 65 && a <= 90 { a = a + 32 }
+    if b >= 65 && b <= 90 { b = b + 32 }
+    if c >= 65 && c <= 90 { c = c + 32 }
+    if (a == 98 && b == 97 && c == 116) || (a == 99 && b == 109 && c == 100) { return false }
+  }
+  let mut entries = List<u16>.make()
+  let mut at: usize = 0
+  while at < arguments.length {
+    let argument = match move run text(Bytes.asSlice(&arguments[at])) {
+      Option<List<u16>>.Some {value} => move value
+      Option<List<u16>>.None => { return false }
+    }
+    let view = List<u16>.asSlice(&argument)
+    let mut unit: usize = 0
+    while unit < view.length { run List<u16>.append(&mut entries, view[unit])
+      unit = unit + 1 }
+    run List<u16>.append(&mut entries, 0)
+    at = at + 1
+  }
+  let mut command = match move run Effect.result(CommandLine.encode(Slice.view(units, 0, size), List<u16>.asSlice(&entries))) {
+    Result<List<u16>, HostInputError | OutOfMemoryError>.Success {value} => move value
+    Result<List<u16>, HostInputError | OutOfMemoryError>.Failure {error} => match move error {
+      HostInputError invalid => { return false }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let input = match move duplicate(4294967286) { Option<Handle>.Some {value} => move value
+    Option<Handle>.None => { return false } }
+  let output = match move duplicate(4294967285) { Option<Handle>.Some {value} => move value
+    Option<Handle>.None => { return false } }
+  let errors = match move duplicate(4294967284) { Option<Handle>.Some {value} => move value
+    Option<Handle>.None => { return false } }
+  let mut handles: [?*mut u8; 3] = [input.raw, output.raw, errors.raw]
+  let mut required: usize = 0
+  let queried = unsafe InitializeProcThreadAttributeList(Pointer.null<u8>(), 1, 0, Pointer.fromMutRef(&mut required))
+  if required == 0 { return false }
+  let raw = match move Pointer.nonNullMut(WindowsHeap.acquire(required)) {
+    Option<*mut u8>.Some {value} => value
+    Option<*mut u8>.None => { fail OutOfMemoryError {} }
+  }
+  let mut attributes = Attributes {raw: raw, initialized: false}
+  if unsafe InitializeProcThreadAttributeList(raw, 1, 0, Pointer.fromMutRef(&mut required)) == 0 { return false }
+  attributes.initialized = true
+  let inherited = unsafe Intrinsic.pointerReinterpret<*mut [?*mut u8; 3], *mut u8>(Pointer.fromMutRef(&mut handles))
+  if unsafe UpdateProcThreadAttribute(raw, 0, 131074, inherited, 24, Pointer.null<u8>(), Pointer.null<usize>()) == 0 { return false }
+  let mut startup = Startup {size: 112, reserved: Pointer.null<u16>(), desktop: Pointer.null<u16>(), title: Pointer.null<u16>(),
+    x: 0, y: 0, width: 0, height: 0, columns: 0, rows: 0, fill: 0, flags: 256, show: 0, reservedCount: 0,
+    reservedBytes: Pointer.null<u8>(), input: input.raw, output: output.raw, error: errors.raw, attributes: raw}
+  let mut result = ProcessInfo {process: Pointer.null<u8>(), thread: Pointer.null<u8>(), pid: 0, tid: 0}
+  // A non-null control handler is not inherited by the child. The parent remains alive to wait
+  // while the interactive child receives Ctrl+C normally.
+  let control = Control {installed: unsafe SetConsoleCtrlHandler(silk_run_console_control, 1) != 0}
+  if unsafe CreateProcessW(Pointer.fromSlice(units), Pointer.fromMutSlice(List<u16>.asMutSlice(&mut command)),
+      Pointer.null<u8>(), Pointer.null<u8>(), 1, 524288, nullUnits(), nullUnits(),
+      Pointer.fromMutRef(&mut startup), Pointer.fromMutRef(&mut result)) == 0 { return false }
+  let process = Handle {raw: result.process}
+  let thread = Handle {raw: result.thread}
+  drop thread
+  drop attributes
+  drop input
+  drop output
+  drop errors
+  if unsafe WaitForSingleObject(process.raw, 4294967295) != 0 { Intrinsic.trap("waiting for interactive child failed") }
+  let mut code: u32 = 0
+  if unsafe GetExitCodeProcess(process.raw, Pointer.fromMutRef(&mut code)) == 0 { Intrinsic.trap("reading interactive child exit failed") }
+  drop process
+  drop control
+  unsafe ExitProcess(code)
+  Intrinsic.trap("ExitProcess returned")
+}
+}

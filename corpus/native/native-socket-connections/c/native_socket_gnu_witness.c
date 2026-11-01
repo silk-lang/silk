@@ -1,3 +1,4 @@
+#if defined(__linux__)
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -56,5 +57,6 @@ static int (*silk_shutdown_signature)(int, int) = shutdown;
 static int (*silk_poll_signature)(struct pollfd *, nfds_t, int) = poll;
 static int *(*silk_errno_signature)(void) = __errno_location;
 static int (*silk_close_signature)(int) = close;
+#endif
 #endif
 int silk_socket_gnu_witness(void) { return 42; }

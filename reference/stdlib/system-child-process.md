@@ -249,6 +249,7 @@ pub code: i32
 ```
 
 The code the child returned. Any value, including a nonzero one, is ordinary data.
+Windows preserves all 32 bits in this signed representation. A high bit does not prove a crash.
 
 <a id="Exited.output"></a>
 
@@ -839,4 +840,4 @@ standard error. An exit code other than 0 is a normal outcome.
 
 Category: System.
 
-Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`.
+Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`.

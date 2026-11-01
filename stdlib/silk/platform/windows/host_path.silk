@@ -1,0 +1,143 @@
+//! Windows host path discovery for tools. These operations intentionally resolve links
+//! in the machine namespace; they do not establish a confined filesystem root.
+//!
+//! @category Windows platform
+
+static if Intrinsic.targetOperatingSystem() == "windows" {
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.ownership { Drop }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.platform.windows.path { WindowsPath }
+import silk.platform.windows.wtf8 { Wtf8, InvalidWtf8 }
+import silk.system.filesystem { Path, FileError }
+import silk.num.u32
+import silk.num.usize
+import silk.text.string {String}
+
+@foreign(noCapture: ("name", "security"))
+unsafe extern "C" fn CreateFileW(name: ?[*]const u16, access: u32, sharing: u32, security: ?*mut u8, creation: u32, flags: u32, template: ?*mut u8) -> ?*mut u8
+unsafe extern "C" fn CloseHandle(handle: ?*mut u8) -> i32
+@foreign(noCapture: ("buffer",))
+unsafe extern "C" fn GetFinalPathNameByHandleW(handle: ?*mut u8, buffer: ?[*]mut u16, capacity: u32, flags: u32) -> u32
+@foreign(noCapture: ("buffer",))
+unsafe extern "C" fn GetModuleFileNameW(module: ?*mut u8, buffer: ?[*]mut u16, capacity: u32) -> u32
+
+struct Handle { raw: ?*mut u8 }
+impl Drop for Handle {
+  fn drop(self: &mut Self) -> () { let ignored = unsafe CloseHandle(self.raw) }
+}
+
+fn hasNul(bytes: &[u8]) -> bool {
+  let mut at: usize = 0
+  while at < bytes.length {
+    if bytes[at] == 0 { return true }
+    at = at + 1
+  }
+  return false
+}
+
+effect fn nativeInput(bytes: &[u8]) -> Bytes ! FileError | OutOfMemoryError ? &mut Allocator {
+  // Only explicit machine volume spellings are converted. A relative PATH candidate remains
+  // relative to the process working directory, which the compiler never changes.
+  if bytes.length >= 3 && bytes[0] == 47 && (bytes[2] == 58
+      || (bytes.length >= 5 && bytes[1] == 85 && bytes[2] == 78 && bytes[3] == 67 && bytes[4] == 47)) {
+    let path = run Path.fromBytes(bytes)
+    return run WindowsPath.toNativeBytes(&path)
+  }
+  return run Bytes.copy(bytes)
+}
+
+effect fn portable(units: &[u16]) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  let bytes = run Wtf8.encode(units)
+  let converted = run Effect.result(WindowsPath.fromNativeBytes(Bytes.asSlice(&bytes)))
+  return match move converted {
+    Result<Path, FileError | OutOfMemoryError>.Success {value} => Option<Bytes>.some(run Bytes.copy(Path.rawBytes(&value)))
+    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError invalid => Option<Bytes>.none()
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+effect fn terminated(bytes: &[u8]) -> Option<List<u16>> ! OutOfMemoryError ? &mut Allocator {
+  if hasNul(bytes) { return Option<List<u16>>.none() }
+  let name = match move run Effect.result(nativeInput(bytes)) {
+    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError invalid => { return Option<List<u16>>.none() }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let mut wide = match move run Effect.result(Wtf8.decodeBytes(Bytes.asSlice(&name))) {
+    Result<List<u16>, InvalidWtf8 | OutOfMemoryError>.Success {value} => move value
+    Result<List<u16>, InvalidWtf8 | OutOfMemoryError>.Failure {error} => match move error {
+      InvalidWtf8 invalid => { return Option<List<u16>>.none() }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  run List<u16>.append(&mut wide, 0)
+  return Option<List<u16>>.some(move wide)
+}
+
+/// Returns a NUL-terminated UTF-16 host name for a machine path, or None for invalid names.
+pub effect fn wide(path: &Path) -> Option<List<u16>> ! OutOfMemoryError ? &mut Allocator {
+  return run terminated(Path.rawBytes(path))
+}
+
+/// Returns a normalized machine path for an existing file or directory, following host links.
+/// Host failures and invalid names return None; allocation failure remains an Effect.
+pub effect fn canonicalBytes(bytes: &[u8]) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  let wide = match move run terminated(bytes) {
+    Option<List<u16>>.Some {value} => move value
+    Option<List<u16>>.None => { return Option<Bytes>.none() }
+  }
+  let raw = unsafe CreateFileW(Pointer.fromSlice(List<u16>.asSlice(&wide)), 0, 7,
+    Pointer.null<u8>(), 3, 33554432, Pointer.null<u8>())
+  if Pointer.isNull(raw) || Pointer.address(raw) == usize.MAX { return Option<Bytes>.none() }
+  let handle = Handle { raw: raw }
+  let mut capacity: u32 = 260
+  while capacity <= 32768 {
+    let mut buffer = List<u16>.make()
+    run List<u16>.appendRepeated(&mut buffer, 0, u32.toUsize(capacity))
+    let length = unsafe GetFinalPathNameByHandleW(handle.raw, Pointer.fromMutSlice(List<u16>.asMutSlice(&mut buffer)), capacity, 0)
+    if length == 0 { return Option<Bytes>.none() }
+    if length < capacity {
+      return run portable(Slice.view(List<u16>.asSlice(&buffer), 0, u32.toUsize(length)))
+    }
+    if length >= 32768 { return Option<Bytes>.none() }
+    capacity = length + 1
+  }
+  return Option<Bytes>.none()
+}
+
+/// Returns a canonical machine path for an existing text host path, following host links.
+/// Host failures and invalid names return None; allocation failure remains an Effect.
+pub effect fn canonical(path: string) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  return run canonicalBytes(String.utf8Bytes(path))
+}
+
+/// Finds the loaded executable through the OS, independent of argv[0] or PATH.
+/// Returns a machine path; host failure returns None.
+pub effect fn executable() -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  let mut capacity: u32 = 260
+  while capacity <= 32768 {
+    let mut buffer = List<u16>.make()
+    run List<u16>.appendRepeated(&mut buffer, 0, u32.toUsize(capacity))
+    let length = unsafe GetModuleFileNameW(Pointer.null<u8>(), Pointer.fromMutSlice(List<u16>.asMutSlice(&mut buffer)), capacity)
+    if length == 0 { return Option<Bytes>.none() }
+    if length < capacity {
+      let bytes = run Wtf8.encode(Slice.view(List<u16>.asSlice(&buffer), 0, u32.toUsize(length)))
+      return run canonicalBytes(Bytes.asSlice(&bytes))
+    }
+    if capacity == 32768 { return Option<Bytes>.none() }
+    capacity = if capacity > 16384 { 32768 } else { capacity * 2 }
+  }
+  return Option<Bytes>.none()
+}
+}

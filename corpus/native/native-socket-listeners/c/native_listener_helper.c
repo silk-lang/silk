@@ -1,4 +1,54 @@
-
+#if defined(_WIN32)
+#include <stddef.h>
+#include <stdint.h>
+typedef intptr_t silk_socket;
+typedef int socklen_t;
+typedef int ssize_t;
+struct in_addr { uint32_t s_addr; };
+struct sockaddr { uint16_t sa_family; char data[14]; };
+struct sockaddr_in { uint16_t sin_family, sin_port; struct in_addr sin_addr; char zero[8]; };
+#define AF_UNSPEC 0
+#define AF_INET 2
+#define SOCK_STREAM 1
+#define IPPROTO_TCP 6
+#define SOL_SOCKET 65535
+#define SO_RCVTIMEO 4102
+#define SO_SNDTIMEO 4101
+#define SHUT_WR 1
+#define INADDR_LOOPBACK 0x7f000001U
+#define EINTR 10004
+#define ECONNRESET 10054
+__declspec(dllimport) int WSAStartup(unsigned short, void *);
+__declspec(dllimport) int WSACleanup(void);
+__declspec(dllimport) int WSAGetLastError(void);
+__declspec(dllimport) silk_socket socket(int, int, int);
+__declspec(dllimport) int bind(silk_socket, const struct sockaddr *, int);
+__declspec(dllimport) int listen(silk_socket, int);
+__declspec(dllimport) int connect(silk_socket, const struct sockaddr *, int);
+__declspec(dllimport) int setsockopt(silk_socket, int, int, const void *, int);
+__declspec(dllimport) int send(silk_socket, const void *, int, int);
+__declspec(dllimport) int recv(silk_socket, void *, int, int);
+__declspec(dllimport) int shutdown(silk_socket, int);
+// Resolve the actual DLL functions while observing Silk's public accept/close calls.
+// Importing their normal thunks would collide with the witness definitions in COFF.
+__declspec(dllimport) void *GetModuleHandleW(const uint16_t *);
+__declspec(dllimport) void *GetProcAddress(void *, const char *);
+static void *winsock_function(const char *name) {
+  static const uint16_t library[] = {'w','s','2','_','3','2','.','d','l','l',0};
+  void *module = GetModuleHandleW(library);
+  return module == NULL ? NULL : GetProcAddress(module, name);
+}
+void *memset(void *, int, size_t);
+int memcmp(const void *, const void *, size_t);
+static uint16_t htons(uint16_t value) { return __builtin_bswap16(value); }
+static uint32_t htonl(uint32_t value) { return __builtin_bswap32(value); }
+#define errno WSAGetLastError()
+#define close closesocket
+#define read(fd, buffer, length) recv(fd, buffer, (int)(length), 0)
+#define write(fd, buffer, length) send(fd, buffer, (int)(length), 0)
+int closesocket(silk_socket);
+_Static_assert(sizeof(silk_socket) == 8 && sizeof(struct sockaddr_in) == 16, "Win64 socket address contract");
+#else
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
@@ -15,19 +65,21 @@
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
+typedef int silk_socket;
+#endif
 #if defined(__APPLE__)
 #include <dlfcn.h>
 #include <stdarg.h>
 #endif
 
 static int silk_listener_http_active = 0;
-static int silk_listener_http_accepted = -1;
-static int silk_listener_http_listener = -1;
+static silk_socket silk_listener_http_accepted = -1;
+static silk_socket silk_listener_http_listener = -1;
 static int silk_listener_http_accepts = 0;
 static int silk_listener_http_accepted_closes = 0;
 static int silk_listener_http_listener_closes = 0;
 
-static int silk_listener_http_admitted(int listener, int accepted) {
+static silk_socket silk_listener_http_admitted(silk_socket listener, silk_socket accepted) {
   if (silk_listener_http_active && accepted >= 0) {
     silk_listener_http_listener = listener;
     silk_listener_http_accepted = accepted;
@@ -36,7 +88,7 @@ static int silk_listener_http_admitted(int listener, int accepted) {
   return accepted;
 }
 
-static void silk_listener_http_closed(int fd) {
+static void silk_listener_http_closed(silk_socket fd) {
   if (!silk_listener_http_active) return;
   if (fd == silk_listener_http_accepted) silk_listener_http_accepted_closes += 1;
   if (fd == silk_listener_http_listener) silk_listener_http_listener_closes += 1;
@@ -64,12 +116,21 @@ static int silk_listener_domain = AF_UNSPEC;
 static int silk_listener_fcntls = 0;
 
 int silk_listener_loopback_available(void) {
+#if defined(_WIN32)
+  uint64_t data[51] = {0};
+  if (WSAStartup(0x202, data) != 0) return 0;
+#endif
 #if defined(__linux__)
   int fd = (int)syscall(SYS_socket, AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_TCP);
 #else
-  int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  silk_socket fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 #endif
-  if (fd < 0) return 0;
+  if (fd < 0) {
+#if defined(_WIN32)
+    WSACleanup();
+#endif
+    return 0;
+  }
   struct sockaddr_in address;
   memset(&address, 0, sizeof(address));
   address.sin_family = AF_INET;
@@ -83,6 +144,9 @@ int silk_listener_loopback_available(void) {
   int bound = bind(fd, (const struct sockaddr *)&address, sizeof(address));
   int listened = bound == 0 ? listen(fd, 1) : -1;
   (void)close(fd);
+#endif
+#if defined(_WIN32)
+  WSACleanup();
 #endif
   return bound == 0 && listened == 0 ? 1 : 0;
 }
@@ -131,6 +195,20 @@ void silk_listener_stub_mark_wait_registration(void) { silk_listener_wait_regist
 void silk_listener_stub_mark_wake_release(void) { silk_listener_wake_releases += 1; }
 void silk_listener_stub_mark_context_release(void) { silk_listener_context_releases += 1; }
 void silk_listener_stub_mark_completion(void) { silk_listener_completions += 1; }
+
+#if defined(_WIN32)
+silk_socket accept(silk_socket fd, void *address, int *length) {
+  silk_socket (*real_accept)(silk_socket, void *, int *) = winsock_function("accept");
+  if (real_accept == NULL) return -1;
+  return silk_listener_http_admitted(fd, real_accept(fd, address, length));
+}
+int closesocket(silk_socket fd) {
+  int (*real_close)(silk_socket) = winsock_function("closesocket");
+  if (real_close == NULL) return -1;
+  silk_listener_http_closed(fd);
+  return real_close(fd);
+}
+#endif
 
 #if defined(__linux__)
 static int silk_listener_scripted(void) { return silk_listener_mode >= 100; }
@@ -565,16 +643,23 @@ int silk_listener_close_nocancel(int fd) {
 }
 #endif
 
-static int silk_listener_client = -1;
+static silk_socket silk_listener_client = -1;
 
 static int silk_listener_http_connect_failed(int result) {
   if (silk_listener_client >= 0) (void)close(silk_listener_client);
   silk_listener_client = -1;
   silk_listener_http_active = 0;
+#if defined(_WIN32)
+  WSACleanup();
+#endif
   return result;
 }
 
 int silk_listener_connect_http(int port) {
+#if defined(_WIN32)
+  uint64_t data[51] = {0};
+  if (WSAStartup(0x202, data) != 0) return 1;
+#endif
   static const char request[] = "GET /native-admission HTTP/1.1\r\nHost: localhost\r\n\r\n";
   struct sockaddr_in address;
   memset(&address, 0, sizeof(address));
@@ -589,7 +674,11 @@ int silk_listener_connect_http(int port) {
   silk_listener_http_listener_closes = 0;
   silk_listener_client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (silk_listener_client < 0) return silk_listener_http_connect_failed(1);
+#if defined(_WIN32)
+  uint32_t deadline = 5000;
+#else
   struct timeval deadline = {.tv_sec = 5, .tv_usec = 0};
+#endif
   if (setsockopt(silk_listener_client, SOL_SOCKET, SO_RCVTIMEO, &deadline, sizeof(deadline)) != 0
       || setsockopt(silk_listener_client, SOL_SOCKET, SO_SNDTIMEO, &deadline, sizeof(deadline)) != 0
       || connect(silk_listener_client, (const struct sockaddr *)&address, sizeof(address)) != 0)
@@ -627,6 +716,9 @@ int silk_listener_finish_http(void) {
     && silk_listener_http_listener_closes == 0 ? 42 : 5;
   if (silk_listener_client >= 0) (void)close(silk_listener_client);
   silk_listener_client = -1;
+#if defined(_WIN32)
+  if (WSACleanup() != 0) return 7;
+#endif
   return result;
 }
 
@@ -638,26 +730,33 @@ int silk_listener_http_ownership(void) {
 }
 
 
+#if !defined(_WIN32)
 static int silk_listener_copy_path(char *output, size_t capacity, const unsigned char *path, size_t length) {
   if (path == NULL || length == 0 || length >= capacity) return 0;
   memcpy(output, path, length);
   output[length] = 0;
   return 1;
 }
+#endif
 
 int silk_listener_connect_tcp(int port) {
+#if defined(_WIN32)
+  uint64_t data[51] = {0};
+  if (WSAStartup(0x202, data) != 0) return 1;
+#endif
   struct sockaddr_in address;
   memset(&address, 0, sizeof(address));
   address.sin_family = AF_INET;
   address.sin_port = htons((uint16_t)port);
   address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   silk_listener_client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-  if (silk_listener_client < 0) return 1;
-  if (connect(silk_listener_client, (const struct sockaddr *)&address, sizeof(address)) != 0) return 2;
-  if (write(silk_listener_client, "x", 1) != 1) return 3;
+  if (silk_listener_client < 0) return silk_listener_http_connect_failed(1);
+  if (connect(silk_listener_client, (const struct sockaddr *)&address, sizeof(address)) != 0) return silk_listener_http_connect_failed(2);
+  if (write(silk_listener_client, "x", 1) != 1) return silk_listener_http_connect_failed(3);
   return 42;
 }
 
+#if !defined(_WIN32)
 int silk_listener_connect_unix(const unsigned char *path, size_t length) {
   struct sockaddr_un address;
   memset(&address, 0, sizeof(address));
@@ -670,6 +769,7 @@ int silk_listener_connect_unix(const unsigned char *path, size_t length) {
   if (write(silk_listener_client, "x", 1) != 1) return 7;
   return 42;
 }
+#endif
 
 int silk_listener_finish_client(int expected) {
   unsigned char byte = 0;
@@ -677,9 +777,13 @@ int silk_listener_finish_client(int expected) {
   if (read(silk_listener_client, &byte, 1) != 1 || byte != (unsigned char)expected) return 9;
   if (close(silk_listener_client) != 0) return 10;
   silk_listener_client = -1;
+#if defined(_WIN32)
+  if (WSACleanup() != 0) return 11;
+#endif
   return 42;
 }
 
+#if !defined(_WIN32)
 int silk_listener_path_exists(const unsigned char *path, size_t length) {
   char local[sizeof(((struct sockaddr_un *)0)->sun_path)];
   struct stat status;
@@ -693,3 +797,4 @@ int silk_listener_unlink(const unsigned char *path, size_t length) {
   if (unlink(local) == 0 || errno == ENOENT) return 42;
   return 2;
 }
+#endif

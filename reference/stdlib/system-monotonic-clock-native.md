@@ -18,9 +18,9 @@ and then waits until that deadline.
 - A wait blocks the whole thread. It does not let another fiber run.
 - A failure of the clock is a trap.
 - On Linux, the clock stops while the system sleeps, and needs glibc 2.17 or later. On macOS, it
-  counts the time of sleep.
-- [`OsMonotonicClock.make`](#OsMonotonicClock.impl.make) fails to compile on targets other than Darwin on aarch64, and Linux
-  with GNU libc on x86_64 or aarch64.
+  counts the time of sleep. Windows QPC also includes system suspend; waits round up to milliseconds.
+- [`OsMonotonicClock.make`](#OsMonotonicClock.impl.make) requires WASI, Windows x86_64 with system libraries, Darwin aarch64,
+  or GNU Linux x86_64 or aarch64.
 
 ## Examples
 ### Measure a wait
@@ -79,7 +79,7 @@ and then waits until that deadline.
   times.
 - A wait blocks the whole thread. It does not let another fiber run.
 - On Linux, the clock stops while the system sleeps, and needs glibc 2.17 or later. On macOS, it
-  counts the time of sleep.
+  counts the time of sleep. Windows QPC also includes system suspend; waits round up to milliseconds.
 
 <a id="OsMonotonicClock.impl"></a>
 
@@ -142,4 +142,4 @@ effect fn waitFor(self: &mut Self, howLong: u64) -> ()
 
 Category: System.
 
-Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`.
+Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`.

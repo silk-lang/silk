@@ -13,6 +13,7 @@ const require = createRequire(new URL('../../package.json', import.meta.url))
 /** @type {typeof import('@effect/platform-node')} */
 const { NodeServices } = await import(pathToFileURL(require.resolve('@effect/platform-node')).href)
 import * as ReleaseArchive from './ReleaseArchive.ts'
+import * as ScoopManifest from './ScoopManifest.mjs'
 
 const directory = Effect.acquireRelease(
   Effect.sync(() => mkdtempSync(join(tmpdir(), 'silk-release-'))),
@@ -198,3 +199,54 @@ it('refuses a member path that fits no ustar prefix and name split', () => {
   const unsplittable = `${'a'.repeat(160)}/${'b'.repeat(101)}`
   assert.strictEqual(ReleaseArchive.tar([{ _tag: 'Directory', path: unsplittable }]), undefined)
 })
+
+it.effect('writes Windows ZIP releases with exe names that an independent ZIP reader extracts', () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem
+    const root = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-windows-zip-' })
+    const library = join(root, 'stdlib')
+    yield* fs.makeDirectory(library)
+    yield* fs.writeFileString(join(library, 'snow-雪.silk'), 'Windows UTF-8 names\n')
+    yield* fs.writeFileString(join(root, 'compiler'), 'MZ compiler bytes\0\xff')
+    yield* fs.writeFileString(join(root, 'tool'), 'MZ tool bytes')
+    const archive = yield* ReleaseArchive.write({
+      compiler: join(root, 'compiler'), tool: join(root, 'tool'), standardLibrary: library,
+      target: 'x86_64-pc-windows-msvc', version: '1.2.3', outputDirectory: root,
+    })
+    const top = 'silk-1.2.3-x86_64-pc-windows-msvc'
+    assert.strictEqual(archive, join(root, `${top}.zip`))
+    const manifestPath = join(root, 'silk.json')
+    yield* ScoopManifest.write('1.2.3', archive, manifestPath)
+    const manifest = yield* Effect.try(() => JSON.parse(readFileSync(manifestPath, 'utf8')))
+    assert.strictEqual(manifest.version, '1.2.3')
+    assert.deepEqual(manifest.bin, ['bin/silk.exe', 'bin/silkc.exe'])
+    assert.strictEqual(manifest.architecture['64bit'].extract_dir, top)
+    assert.strictEqual(manifest.architecture['64bit'].url,
+      `https://github.com/silk-lang/silk/releases/download/v1.2.3/${top}.zip`)
+    const verified = yield* NativeProcess.execute(process.platform === 'win32' ? 'certutil.exe' : 'sha256sum',
+      process.platform === 'win32' ? ['-hashfile', archive, 'SHA256'] : [archive])
+    assert.strictEqual(verified.status, 0, verified.stderr.toString())
+    assert.ok(verified.stdout.toString().includes(manifest.architecture['64bit'].hash))
+    const expected = {
+      [`${top}/bin/silkc.exe`]: 'MZ compiler bytes\0\xff',
+      [`${top}/bin/silk.exe`]: 'MZ tool bytes',
+      [`${top}/lib/silk/stdlib/snow-雪.silk`]: 'Windows UTF-8 names\n',
+    }
+    if (process.platform === 'win32') {
+      // Windows' inbox tar is libarchive and reads ZIP, unlike GNU tar on the Linux runner.
+      for (const [member, content] of Object.entries(expected)) {
+        const result = yield* NativeProcess.execute('tar.exe', ['-xOf', archive, member])
+        assert.strictEqual(result.status, 0, result.stderr.toString())
+        assert.deepEqual(result.stdout, Buffer.from(content))
+      }
+    } else {
+      const result = yield* NativeProcess.execute('python3', ['-c',
+        'import sys,zipfile,json,base64; z=zipfile.ZipFile(sys.argv[1]); assert z.testzip() is None; print(json.dumps({i.filename:base64.b64encode(z.read(i)).decode() for i in z.infolist() if not i.is_dir()}))', archive])
+      assert.strictEqual(result.status, 0, result.stderr.toString())
+      const files = yield* Effect.try(() => JSON.parse(result.stdout.toString()))
+      assert.deepEqual(files, Object.fromEntries(Object.entries(expected).map(([name, content]) =>
+        [name, Buffer.from(content).toString('base64')],
+      )))
+    }
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+)

@@ -18,12 +18,13 @@ between them.
 descriptor, and flush does nothing. The process owns the descriptors, and the providers do not
 close them.
 
-`Writer.writeVectored` sends several slices in one `writev` system call, up to eight slices for
-each call.
+On POSIX hosts, `Writer.writeVectored` sends up to eight slices per `writev` call. Windows
+writes redirected slices in order and decodes console slices together as canonical WTF-8.
 
 WASI commands have one thread. Their standard error lock does not need host synchronization.
 
-Standard error has one lock for the whole process: the lock of the C library's `stderr` stream.
+Standard error has one lock for the whole process: a Windows critical section or the POSIX
+C library's `stderr` stream lock.
 Each `StderrWriter` write takes it for the duration of that write. `StderrWriter.lock` keeps
 it until the `LockedStderr` drops, and collects the writes in a small buffer that the caller
 lends. The lock is recursive: the thread that holds it can take it again, for example to report
@@ -34,7 +35,10 @@ from several threads controls the order itself.
 `WriterError` if a write fails. Part of the bytes can be written already.
 
 ## Gotchas
-- The providers exist on WASI, Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+- The providers exist on Windows x86_64 MSVC without a CRT, WASI, Darwin on aarch64, and Linux
+  with GNU libc on x86_64 or aarch64.
+- Windows consoles require complete canonical WTF-8 per write or concatenated vectored write;
+  redirected handles accept arbitrary bytes. No console code page changes.
 - The lock orders only writes that take it. A direct write to descriptor 2, such as one from
   `silk.platform.native.descriptor`, can come between the parts of a locked message.
 

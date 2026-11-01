@@ -9,22 +9,45 @@ import silk.system.host_input { HostInput, HostInputError }
 import silk.core.option { Option }
 import silk.text.string { String }
 import silk.num.usize
+import silk.collections.slice {Slice}
+import silk.platform.windows.path { WindowsPath }
+
+/// Copies a machine path into the spelling used by a host-tool argument.
+pub effect fn pathBytes(path: &Path) -> Bytes ! FileError | OutOfMemoryError ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return run WindowsPath.toNativeBytes(path)
+  } else {
+    return run Bytes.copy(Path.rawBytes(path))
+  }
+}
+
+/// Appends a filesystem path in the spelling the host tool accepts.
+/// Windows receives an extended native name; Unix receives the unchanged absolute path.
+pub effect fn addPathArgument(process: &mut ProcessRequest, path: &Path) -> ()
+! FileError | OutOfMemoryError ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    let native = run WindowsPath.toNativeBytes(path)
+    return run ChildProcess.addArgumentBytes(&mut process.*, Bytes.asSlice(&native))
+  } else {
+    return run ChildProcess.addArgumentBytes(&mut process.*, Path.rawBytes(path))
+  }
+}
 
 /// The Clang executable: `selected`, the `--clang` argument, when given; else `SILK_CLANG` when it
-/// is set; else the first `clang` on `PATH`. A selection with a `/` is a path, already resolved
-/// against the working directory; a bare name is searched on `PATH`, as the TypeScript CLI spawns
-/// its `--clang` value. `None` when no executable is named.
+/// is set; else the first `clang` on `PATH`. A selection containing a directory is a machine
+/// path already resolved against the working directory; a bare name is searched on `PATH`.
+/// `None` when no executable is named.
 pub effect fn compiler(selected: Option<&[u8]>) -> Option<Path>
   ! FileError | HostInputError | OutOfMemoryError
   ? &mut HostInput | &mut FileSystem | &mut Allocator {
   if let Option<&[u8]>.Some { value } = move selected {
-    if CommandPath.contains(value, 47) {
+    if CommandPath.hasDirectory(value) {
       return Option<Path>.some(run Path.fromBytes(value))
     }
     return run onPath(value)
   }
   if let Option<Bytes>.Some { value } = move run HostInput.variableNamed("SILK_CLANG") {
-    return Option<Path>.some(run Path.fromBytes(Bytes.asSlice(&value)))
+    return Option<Path>.some(run CommandPath.fromHost(Bytes.asSlice(&value)))
   }
   return run onPath(b"clang")
 }
@@ -52,44 +75,124 @@ effect fn onPath(name: &[u8]) -> Option<Path>
 /// from SDKROOT or `xcrun` discovery and the compilation passes it as `-isysroot`, so SDKROOT is
 /// not forwarded. Temporary-directory, home and locale variables retain the same explicit
 /// allowlist as the native-generation harness. Compiler flags and other tool overrides are not
-/// inherited.
+/// inherited. Windows also forwards `SystemRoot`, `USERPROFILE`, and `LOCALAPPDATA` for the OS
+/// loader and the selected tool's user directories.
 pub effect fn request(clang: &Path) -> ProcessRequest
   ! FileError | HostInputError | OutOfMemoryError
   ? &mut HostInput | &mut Allocator {
   let mut process = run ChildProcess.request(clang)
+  run standardEnvironment(&mut process)
+  return move process
+}
+
+effect fn standardEnvironment(process: &mut ProcessRequest) -> ()
+! HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
   let entries = ["PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE"]
-  let names: &[string<'static>] = &entries
+  run inheritEnvironment(&mut process.*, &entries)
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    let windows = ["SystemRoot", "USERPROFILE", "LOCALAPPDATA"]
+    run inheritEnvironment(&mut process.*, &windows)
+  }
+  return ()
+}
+
+/// Encodes NUL-delimited arguments with LLVM's Windows response-file quoting, preserving empty
+/// arguments, embedded quotes, and trailing backslashes. The result is UTF-8 host bytes.
+pub effect fn responseText(arguments: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut encoded = Bytes.make()
+  let mut at: usize = 0
+  while at < arguments.length {
+    run Bytes.append(&mut encoded, b"\"")
+    let mut slashes: usize = 0
+    while at < arguments.length && arguments[at] != 0 {
+      let byte = arguments[at]
+      if byte == 34 {
+        let mut extra: usize = 0
+        while extra <= slashes {
+          run Bytes.append(&mut encoded, b"\\")
+          extra = extra + 1
+        }
+      }
+      run Bytes.append(&mut encoded, Slice.view(arguments, at, 1))
+      if byte == 92 { slashes = slashes + 1 } else { slashes = 0 }
+      at = at + 1
+    }
+    let mut extra: usize = 0
+    while extra < slashes {
+      run Bytes.append(&mut encoded, b"\\")
+      extra = extra + 1
+    }
+    run Bytes.append(&mut encoded, b"\"\n")
+    at = at + 1
+  }
+  return move encoded
+}
+
+/// Writes a response file in the build's private scratch directory, then creates a short tool
+/// request with that directory as its working directory and the standard tool environment.
+/// Input paths must already be absolute. The file must remain present until the tool exits.
+pub effect fn responseFile(tool: &Path, file: &Path, arguments: &[u8]) -> ProcessRequest
+! FileError | HostInputError | OutOfMemoryError ? &mut FileSystem | &mut HostInput | &mut Allocator {
+  let encoded = run responseText(arguments)
+  run FileSystem.writeFile(file, Bytes.asSlice(&encoded))
+  let directory = match move run Path.parent(file) {
+    Option<Path>.Some {value} => move value
+    Option<Path>.None => run Path.root()
+  }
+  let mut process = run ChildProcess.requestWithin(tool, &directory)
+  run standardEnvironment(&mut process)
+  run ChildProcess.addArgument(&mut process, "--rsp-quoting=windows")
+  let mut reference = run Bytes.copy(b"@")
+  let native = run pathBytes(file)
+  run Bytes.append(&mut reference, Bytes.asSlice(&native))
+  run ChildProcess.addArgumentBytes(&mut process, Bytes.asSlice(&reference))
+  return move process
+}
+
+effect fn inheritEnvironment(process: &mut ProcessRequest, names: &[string<'static>]) -> ()
+  ! HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
   let mut at = usize.ZERO
   while at < names.length {
     let name = names[at]
     let captured = run HostInput.variableNamed(name)
     match move captured {
       Option<Bytes>.Some { value } => {
-        run ChildProcess.setVariableBytes(&mut process, String.utf8Bytes(name), Bytes.asSlice(&value))
+        run ChildProcess.setVariableBytes(&mut process.*, String.utf8Bytes(name), Bytes.asSlice(&value))
       }
       Option<Bytes>.None => {}
     }
     at = at + usize.ONE
   }
-  return move process
+  return ()
 }
 
 /// Starts an archiver request: `SILK_LLVM_AR`, or else the `llvm-ar` beside `clang`.
 ///
-/// The archiver reads only its arguments, so the request carries no environment. Reading the
-/// archiver beside Clang keeps one explicit LLVM installation the source of every native tool.
+/// POSIX archivers receive an empty environment. Windows archivers receive the same explicit
+/// loader and user-directory environment as Clang. Reading the archiver beside Clang keeps one
+/// explicit LLVM installation the source of every native tool.
 pub effect fn archiver(clang: &Path) -> ProcessRequest
   ! FileError | HostInputError | OutOfMemoryError
   ? &mut HostInput | &mut Allocator {
   let configured = run HostInput.variableNamed("SILK_LLVM_AR")
   if let Option<Bytes>.Some { value } = move configured {
-    let named = run Path.fromBytes(Bytes.asSlice(&value))
+    let named = run CommandPath.fromHost(Bytes.asSlice(&value))
+    static if Intrinsic.targetOperatingSystem() == "windows" { return run request(&named) }
     return run ChildProcess.request(&named)
   }
+  let beside = run companion(clang, "llvm-ar")
+  static if Intrinsic.targetOperatingSystem() == "windows" { return run request(&beside) }
+  return run ChildProcess.request(&beside)
+}
+
+/// Returns an LLVM tool beside the selected Clang executable, adding `.exe` on a Windows host.
+pub effect fn companion(clang: &Path, name: string) -> Path
+  ! FileError | OutOfMemoryError ? &mut Allocator {
   let directory = match move run Path.parent(clang) {
     Option<Path>.Some { value } => move value
     Option<Path>.None => run Path.make("/")
   }
-  let beside = run Path.join(&directory, "llvm-ar")
-  return run ChildProcess.request(&beside)
+  let mut file = run Bytes.copy(String.utf8Bytes(name))
+  static if Intrinsic.targetOperatingSystem() == "windows" { run Bytes.append(&mut file, b".exe") }
+  return run Path.joinBytes(&directory, Bytes.asSlice(&file))
 }

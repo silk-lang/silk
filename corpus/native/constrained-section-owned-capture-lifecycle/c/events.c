@@ -1,4 +1,4 @@
 #include <stdint.h>
-#include <stdio.h>
-void silk_record_event(int32_t value) { printf("%d,", value); }
-int32_t silk_finish_events(void) { puts(""); return 42; }
+#include "c-output.h"
+void silk_record_event(int32_t value) { silk_test_integer(value); silk_test_character(','); }
+int32_t silk_finish_events(void) { silk_test_line(""); return 42; }

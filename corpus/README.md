@@ -19,10 +19,19 @@ only its own directory and the files it splices.
 | `reference.silk`  | no       | The portable program, when native compilation runs a different `main.silk`.           |
 | `imports/**.silk` | no       | Further modules of the program. `imports/errors/kinds.silk` is module `errors/kinds`. |
 | `c/*.c`           | no       | C translation units compiled and linked into the program. `c/stub.c` is unit `stub`.  |
+| `windows-imports/*.def` | no | Explicit system-DLL export definitions for Windows C fixtures, built with `llvm-dlltool`. A named definition replaces that library's `dynamicLibraries` entry on Windows. |
 | `expected.stdout` | no       | The exact bytes the program writes to standard output. Absent means not checked.      |
 | `expected.stderr` | no       | The exact bytes the program writes to standard error. Absent means not checked.       |
 
 An empty `expected.stdout` asserts empty output; a missing one asserts nothing.
+For a Windows-specific trap contract, `expected.windowsStatus` names the exact unsigned
+exception status. For example, SEH foreign-unwind guards require `3221226505` (`0xC0000409`,
+fast fail), distinguishing Silk's guard from the original exception escaping unhandled.
+Other targets retain their trap contract.
+The Windows `foreign-libc-*`, pointer/libc, and libm-order fixtures explicitly import the Windows
+system CRT for their C-library contracts. These imports belong to those fixtures; ordinary Silk
+programs and the compiler retain their no-CRT link. Lifecycle-output C witnesses use direct OS
+byte output from `fixtures/c-output.h` on both Windows and Unix.
 
 ## `outcome.json`
 

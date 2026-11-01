@@ -8,8 +8,10 @@ description: Acquire owned or scoped TCP and pathname-Unix ByteDuplex connection
 `silk.net.socket_native` is the ordinary-source native transport for numeric TCP endpoints and local
 pathname-Unix sockets. `connectResolvedOwned` and `connectUnixOwned` return the authoritative
 affine `Connection`; their scoped counterparts consume that owner and lend it to one callback. The
-module is selected only for aarch64 Apple Darwin with system libc and aarch64 or x86-64 GNU/Linux
-with GNU libc. Portable, no-libc, musl, and Windows profiles do not expose it or its foreign imports.
+module is selected for aarch64 Apple Darwin with system libc, aarch64 or x86-64 GNU/Linux
+with GNU libc, and x86-64 Windows with system libraries. Portable, no-libc, and musl profiles
+do not expose it or its foreign imports. Windows supports TCP; pathname-Unix constructors
+report `FamilyUnsupported`.
 
 ## Open a local pathname connection
 
@@ -63,7 +65,7 @@ DNS is deliberately outside its deadline. One supplied absolute deadline covers 
 candidate without renewal. `Option<Instant>.none()` permits a pending operation to wait indefinitely,
 subject to the active `MonotonicClock` provider.
 
-Readiness uses zero-time `poll` followed by a positive clock wait, so a local scheduler can run peer
+Readiness uses zero-time `poll` (`WSAPoll` on Windows) followed by a positive clock wait, so a local scheduler can run peer
 tasks and cancel its timer before the socket finalizer. The interval therefore trades latency for a
 bounded idle poll rate; this first provider is not an event reactor and does not promise
 high-connection-count throughput.
@@ -80,3 +82,9 @@ attempt exhaustion, policy failures, and the responsible native operation/errno.
 `ByteDuplex`, timeout, invalid count, and closure use the canonical `ByteIoError` variants; other
 native failures retain the exact `ByteIoOperation` and errno as `Provider.code`. A checked wake-time
 overflow during byte I/O uses provider code `-1`, because `ByteIoError` has no time-range variant.
+
+Windows retains the full 64-bit `SOCKET`, acquires Winsock for each owned connection, and closes
+with `closesocket`. Nonblocking setup uses `ioctlsocket`; `SetHandleInformation` disables handle
+inheritance. The absolute deadline is checked before both configuration calls. Socket failures
+retain `WSAGetLastError` codes; inheritance failures retain `GetLastError` codes under their own
+operation. Accepted connections own a Winsock reference independently of their listener.

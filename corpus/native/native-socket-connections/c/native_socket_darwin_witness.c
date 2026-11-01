@@ -1,3 +1,4 @@
+#if defined(__APPLE__)
 
 #include <errno.h>
 #include <fcntl.h>
@@ -53,5 +54,6 @@ static int (*silk_poll_signature)(struct pollfd *, nfds_t, int) = poll;
 static int (*silk_fcntl_signature)(int, int, ...) = fcntl;
 static int *(*silk_error_signature)(void) = __error;
 static int (*silk_close_signature)(int) = silk_close_nocancel;
+#endif
 #endif
 int silk_socket_darwin_witness(void) { return 42; }

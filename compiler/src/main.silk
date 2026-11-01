@@ -32,7 +32,7 @@ import silk.core.effect {Effect}
 import silk.system.filesystem {FileError, FileSystem, Path}
 import silk.system.host_input {HostInput, HostInputError}
 import silk.core.option {Option}
-import silk.system.filesystem_native {OsFileSystem}
+import silk.system.filesystem_machine {MachineFileSystem}
 import silk.system.child_process_native {OsChildProcess}
 import silk.io.writer_native {StderrWriter, StdoutWriter}
 import silk.core.result {Result}
@@ -43,7 +43,11 @@ import silk.mem.slot {Slot}
 import silk.collections.slice {Slice}
 import silk.text.string {InvalidUtf8, String}
 import silk.num.usize
-import silk.platform.native.descriptor {NativeDescriptor}
+static if Intrinsic.targetOperatingSystem() == "windows" {
+  import silk.platform.windows.console {WindowsConsole}
+} else {
+  import silk.platform.native.descriptor {NativeDescriptor}
+}
 import silk.collections.list {List}
 import silk.concurrency.thread_native {NativeThread, SpawnError}
 import silk.io.writer {Writer, WriterError}
@@ -68,6 +72,7 @@ import driver.WasmNames as WasmNames {FunctionNames}
 import driver.WasmTrace
 import driver.WasmDebug as WasmDebug {LineTable}
 import driver.NativeToolchain
+import driver.WindowsLink
 import driver.CodegenCache
 import backend.Bitcode
 import backend.BitcodeText
@@ -145,7 +150,6 @@ import silk.num.u8
 /// A command-line contract failure before source reading begins.
 pub union ApplicationError {
   InvalidArgumentCount {pub actual: usize},
-  InvalidWorkingDirectoryEncoding,
   InvalidBuildProfile,
   InvalidPath {pub argument: Bytes},
   /// A `--stdlib` directory that is missing or holds no standard library (no `compositions.json`).
@@ -170,10 +174,6 @@ effect fn invalidCommand(command: &[u8], invalid: InvalidProjectCommand) -> neve
   let lines = run commandUsage(command)
   run Bytes.append(&mut message, Bytes.asSlice(&lines))
   fail ApplicationError.InvalidCommand {message: move message}
-}
-
-effect fn invalidWorkingDirectoryEncoding() -> never ! ApplicationError {
-  fail ApplicationError.InvalidWorkingDirectoryEncoding
 }
 
 /// One parsed command line: the source file to read and the requested artifact or dump. A test
@@ -318,7 +318,9 @@ effect fn writeDeferredTemplates(deferred: &[DeferredStaticTemplate]) -> ()
 // Whether `host` links an executable for `target`: its own target, or freestanding wasm32, which
 // needs only Clang and its WebAssembly linker.
 fn linksOn(target: &Target, host: &Target) -> bool {
+  // Windows carries its own import-library and TLS supply; Clang/LLD need no host SDK.
   return Target.id(target) == Target.id(host) || same(Target.objectFormat(target), b"wasm")
+    || Target.id(target) == TargetId.X8664PcWindowsMsvc
 }
 
 effect fn invalidBuildProfile() -> never ! ApplicationError {
@@ -670,6 +672,10 @@ effect fn lex<'source>(lexer: &mut Lexer<'source>) -> List<Token>
 static if Intrinsic.targetOperatingSystem() == "darwin" {
   fn hostTarget() -> Target {
     return Target.forId(TargetId.Aarch64AppleDarwin)
+  }
+} else static if Intrinsic.targetOperatingSystem() == "windows" {
+  fn hostTarget() -> Target {
+    return Target.forId(TargetId.X8664PcWindowsMsvc)
   }
 } else {
   static if Intrinsic.targetArchitecture() == "aarch64" {
@@ -1082,6 +1088,8 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
   let mut process = run NativeToolchain.request(&clang)
   let final = stage == Stage.Final
   let linked = final && form == Form.Executable
+  let windows = linked && same(Target.operatingSystem(target), b"windows")
+  if windows { run WindowsLink.configure(&mut process, &clang) }
   let merged = final && form == Form.Object && linkInputs.length > usize.ZERO
   let archive = final && form == Form.StaticLibrary
   // A wasm32 executable links freestanding: no libc, no entry, and the source runtime beside the IR.
@@ -1123,10 +1131,13 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
       run ChildProcess.addArgument(&mut process, "-c")
       if stage == Stage.LlvmBitcode { run ChildProcess.addArgument(&mut process, "-emit-llvm") }
     }
-    if same(relocation, b"pic") {
-      run ChildProcess.addArgument(&mut process, "-fPIC")
-    } else {
-      run ChildProcess.addArgument(&mut process, "-fno-pic")
+    // COFF x64 uses image-relative relocations; Clang rejects the ELF PIC switch.
+    if !same(Target.operatingSystem(target), b"windows") {
+      if same(relocation, b"pic") {
+        run ChildProcess.addArgument(&mut process, "-fPIC")
+      } else {
+        run ChildProcess.addArgument(&mut process, "-fno-pic")
+      }
     }
   }
   // A Linux or macOS executable places the functions its package's `[native].function-order`
@@ -1134,7 +1145,7 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
   // pages to share and ignores it.
   let darwin = same(Target.objectFormat(target), b"macho")
   let mut ordering = Option<Bytes>.none()
-  if linked && !freestanding {
+  if linked && !freestanding && !windows {
     if let Option<&Path>.Some {value: listed} = &functionOrder {
       match move run Effect.result(FileSystem.readFile(listed)) {
         Result<Bytes, FileError | OutOfMemoryError>.Success {value: written} => {
@@ -1165,6 +1176,8 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
   let orderPath = run Path.fromBytes(Bytes.asSlice(&orderBytes))
   // The flags that decide the code Clang writes, which each codegen unit's compile shares.
   let mut common = List<Bytes>.make()
+  // Split codegen units are compiled by separate Clang requests before the final link.
+  if windows { run List<Bytes>.append(&mut common, run Bytes.copy(b"--target=x86_64-pc-windows-msvc")) }
   // An ELF linker orders whole sections, so each function gets its own; Mach-O orders symbols.
   if ordered && !darwin { run List<Bytes>.append(&mut common, run Bytes.copy(b"-ffunction-sections")) }
   if same(optimization, b"speed") {
@@ -1187,23 +1200,26 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
   if let Option<Supply>.Some {value: selected} = &supply.* {
     if selected.darwin {
       run List<Bytes>.append(&mut common, run Bytes.copy(b"-isysroot"))
-      run List<Bytes>.append(&mut common, run Bytes.copy(Path.rawBytes(&selected.root)))
+      run List<Bytes>.append(&mut common, run NativeToolchain.pathBytes(&selected.root))
       let mut minimum = run Bytes.copy(b"-mmacosx-version-min=")
       run Bytes.append(&mut minimum, Bytes.asSlice(&selected.deployment))
       run List<Bytes>.append(&mut common, move minimum)
     } else {
       let mut sysroot = run Bytes.copy(b"--sysroot=")
-      run Bytes.append(&mut sysroot, Path.rawBytes(&selected.root))
+      let hostRoot = run NativeToolchain.pathBytes(&selected.root)
+      run Bytes.append(&mut sysroot, Bytes.asSlice(&hostRoot))
       run List<Bytes>.append(&mut common, move sysroot)
     }
     if let Option<Path>.Some {value: installation} = &selected.support {
       let mut gcc = run Bytes.copy(b"--gcc-install-dir=")
-      run Bytes.append(&mut gcc, Path.rawBytes(&installation))
+      let hostInstallation = run NativeToolchain.pathBytes(&installation)
+      run Bytes.append(&mut gcc, Bytes.asSlice(&hostInstallation))
       run List<Bytes>.append(&mut common, move gcc)
     }
     if let Option<Path>.Some {value: tool} = &selected.linker {
       let mut ldPath = run Bytes.copy(b"--ld-path=")
-      run Bytes.append(&mut ldPath, Path.rawBytes(&tool))
+      let hostLinker = run NativeToolchain.pathBytes(&tool)
+      run Bytes.append(&mut ldPath, Bytes.asSlice(&hostLinker))
       run List<Bytes>.append(&mut common, move ldPath)
     }
   }
@@ -1265,39 +1281,52 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
   if units.length == usize.ZERO {
     run ChildProcess.addArgument(&mut process, "-x")
     run ChildProcess.addArgument(&mut process, "ir")
-    run ChildProcess.addArgumentBytes(&mut process, Bytes.asSlice(&intermediate))
+    run NativeToolchain.addPathArgument(&mut process, &irPath)
   }
   if freestanding {
     run ChildProcess.addArgument(&mut process, "-x")
     run ChildProcess.addArgument(&mut process, "c")
-    run ChildProcess.addArgumentBytes(&mut process, Bytes.asSlice(&runtimeBytes))
+    run NativeToolchain.addPathArgument(&mut process, &runtimePath)
   }
   // Restore extension-based input kinds so declared objects and archives are not read as IR.
   run ChildProcess.addArgument(&mut process, "-x")
   run ChildProcess.addArgument(&mut process, "none")
   let linkedObjects = List<Path>.asSlice(&objects)
+  let mut indirectFiles = false
+  static if Intrinsic.targetOperatingSystem() == "windows" { indirectFiles = windows }
+  let mut fileArguments = Bytes.make()
+  let mut fileGroup: usize = 0
   flag = usize.ZERO
   while flag < linkedObjects.length {
-    run ChildProcess.addArgumentBytes(&mut process, Path.rawBytes(&linkedObjects[flag]))
+    if indirectFiles {
+      let path = run NativeToolchain.pathBytes(&linkedObjects[flag])
+      run Bytes.append(&mut fileArguments, Bytes.asSlice(&path))
+      run Bytes.append(&mut fileArguments, b"\0")
+    } else { run NativeToolchain.addPathArgument(&mut process, &linkedObjects[flag]) }
     flag = flag + usize.ONE
   }
   run ChildProcess.addArgument(&mut process, "-o")
   let mut archiver = Option<ProcessRequest>.none()
   if archive {
-    run ChildProcess.addArgumentBytes(&mut process, Bytes.asSlice(&memberBytes))
+    run NativeToolchain.addPathArgument(&mut process, &member)
     // `rcsD`: replace members, create the archive, write its symbol index, and zero member times.
     let mut request = run NativeToolchain.archiver(&clang)
     run ChildProcess.addArgument(&mut request, "rcsD")
-    run ChildProcess.addArgumentBytes(&mut request, Bytes.asSlice(&stem))
-    run ChildProcess.addArgumentBytes(&mut request, Bytes.asSlice(&memberBytes))
+    run NativeToolchain.addPathArgument(&mut request, &staged)
+    run NativeToolchain.addPathArgument(&mut request, &member)
     let mut declared = usize.ZERO
     while declared < linkInputs.length {
       run NativeLinkInputs.appendArchiveMember(&linkInputs[declared], &mut request)
       declared = declared + usize.ONE
     }
+    static if Intrinsic.targetOperatingSystem() == "windows" {
+      let tool = run Path.fromBytes(ChildProcess.program(&request))
+      let response = run Path.join(scratch, "archive.rsp")
+      request = run NativeToolchain.responseFile(&tool, &response, ChildProcess.arguments(&request))
+    }
     archiver = Option<ProcessRequest>.some(move request)
   } else {
-    run ChildProcess.addArgumentBytes(&mut process, Bytes.asSlice(&stem))
+    run NativeToolchain.addPathArgument(&mut process, &staged)
   }
   if final && !archive {
     // Declared inputs precede the C libraries so their own references to libc and libm resolve.
@@ -1306,11 +1335,31 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
       if !linked && !NativeLinkInputs.relocatable(&linkInputs[input]) {
         run NativeLinkInputs.invalid(b"an object artifact merges only declared objects and static archives")
       }
-      run NativeLinkInputs.appendArguments(&linkInputs[input], target, &mut process)
+      let mut path = Option<&Path>.none()
+      if indirectFiles {
+        path = NativeLinkInputs.file(&linkInputs[input])
+      }
+      if let Option<&Path>.Some {value} = path {
+        let native = run NativeToolchain.pathBytes(value)
+        run Bytes.append(&mut fileArguments, Bytes.asSlice(&native))
+        run Bytes.append(&mut fileArguments, b"\0")
+      } else {
+        if indirectFiles {
+          run WindowsLink.appendFiles(&mut process, scratch, Bytes.asSlice(&fileArguments), fileGroup)
+          fileArguments = Bytes.make()
+          fileGroup = fileGroup + 1
+        }
+        run NativeLinkInputs.appendArguments(&linkInputs[input], target, &mut process)
+      }
       input = input + usize.ONE
     }
   }
-  if linked && !freestanding {
+  if indirectFiles { run WindowsLink.appendFiles(&mut process, scratch, Bytes.asSlice(&fileArguments), fileGroup) }
+  if windows {
+    let prepared = run WindowsLink.prepare(&mut process, &clang, scratch)
+    if prepared != 0 { return prepared }
+  }
+  if linked && !freestanding && !windows {
     run ChildProcess.addArgument(&mut process, "-lc")
     run ChildProcess.addArgument(&mut process, "-lm")
   }
@@ -1335,7 +1384,7 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
   // stamp records. A split build's command names its cached objects; a whole module and the wasm
   // runtime source are named by their digests. Anything else read from outside the build (a
   // declared input, an archive, the wasip2 component tools) relinks every time.
-  let stamped = linked && !archive && linkInputs.length == usize.ZERO && Target.id(target) != TargetId.Wasm32Wasip2
+  let stamped = linked && !windows && !archive && linkInputs.length == usize.ZERO && Target.id(target) != TargetId.Wasm32Wasip2
   let mut command = run linkCommand(&process, Bytes.asSlice(&stem))
   if units.length == usize.ZERO { run appendDigest(&mut command, ContentHash.of(Bytes.asSlice(ir))) }
   if debugInfo.length > usize.ZERO { run appendDigest(&mut command, ContentHash.of(debugInfo)) }
@@ -1347,6 +1396,12 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
   if splitting { run Bytes.append(&mut command, b" split-debug") }
   if let Option<Bytes>.Some {value: order} = &ordering { run appendDigest(&mut command, ContentHash.of(Bytes.asSlice(&order))) }
   let unitDirectory = run CodegenCache.directoryFor(output)
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    // Keep the full arguments in the cache identity above. A split build's object paths can
+    // exceed CreateProcessW's command-line limit even when every individual path is valid.
+    let response = run Path.join(scratch, "clang.rsp")
+    process = run NativeToolchain.responseFile(&clang, &response, ChildProcess.arguments(&process))
+  }
   let use = effect fn(resource: &mut Path) -> i32
   ! FileError | ProcessError | HostInputError | OutOfMemoryError | WriterError
   ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
@@ -1740,10 +1795,10 @@ effect fn compileUnits(scratch: &Path, clang: &Path, origin: &[u8], probed: &[u8
     }
     run List<Bytes>.append(&mut command, run Bytes.copy(b"-x"))
     run List<Bytes>.append(&mut command, run Bytes.copy(b"ir"))
-    run List<Bytes>.append(&mut command, run Bytes.copy(Path.rawBytes(&ir)))
+    run List<Bytes>.append(&mut command, run NativeToolchain.pathBytes(&ir))
     run List<Bytes>.append(&mut command, run Bytes.copy(b"-o"))
     let partial = run CodegenCache.pending(&objects[missing[at]])
-    run List<Bytes>.append(&mut command, run Bytes.copy(Path.rawBytes(&partial)))
+    run List<Bytes>.append(&mut command, run NativeToolchain.pathBytes(&partial))
     let mut copied = List<Bytes>.make()
     let parts = List<Bytes>.asSlice(&command)
     let mut part = usize.ZERO
@@ -1752,8 +1807,14 @@ effect fn compileUnits(scratch: &Path, clang: &Path, origin: &[u8], probed: &[u8
       part = part + usize.ONE
     }
     run List<List<Bytes>>.append(&mut kept, move copied)
+    let mut request = run NativeToolchain.request(clang)
+    part = usize.ONE
+    while part < parts.length {
+      run ChildProcess.addArgumentBytes(&mut request, Bytes.asSlice(&parts[part]))
+      part = part + usize.ONE
+    }
     run List<CodegenCache.Job>.append(&mut jobs, CodegenCache.Job {fragments: move fragments, debug: move debug,
-      input: run Bytes.copy(Path.rawBytes(&ir)), command: move command})
+      input: run Bytes.copy(Path.rawBytes(&ir)), request: move request})
     run List<Path>.append(&mut inputs, move ir)
     at = at + usize.ONE
   }
@@ -3884,7 +3945,7 @@ effect fn reportProject(problem: &ProjectError) -> () ! WriterError {
 }
 
 // Builds `sourcePath` in the form and stage its nearest project manifest selects, as the TypeScript
-// CLI does; `stage` replaces the manifest's stage. Only the host target links an executable.
+// CLI does; `stage` replaces the manifest's stage. Cross linking requires a self-contained supply.
 //
 // The `Compiled` line shows paths relative to `working`, the directory the user named them from.
 effect fn buildSource(working: &Path, sourcePath: &Path, output: &Path, stage: Option<Stage>, standardLibrary: Option<Path>,
@@ -4324,9 +4385,17 @@ effect fn projectPlans(project: &Project, options: &ProjectOptions, fallback: &[
 // directory is the named project profile the plan builds, or else `debug`, `release` or
 // `release-with-debug` from the plan's optimization and debug information, in the form and stage the manifest selects and with the file name
 // `Projects.artifact` gives. A plan whose profile names no artifact takes the manifest's form.
-// Only the host target links an executable, and a shared library is not native yet.
+// An executable requires a supported link supply, and a shared library is not native yet.
 fn silentProgress() -> ProgressSettings {
   return ProgressSettings {display: ProgressDisplay.Off, color: false, width: 80, quiet: false, compact: false, position: 0, units: 0, timings: false}
+}
+
+effect fn progressTerminal() -> bool {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return run WindowsConsole.enableAnsi(2)
+  } else {
+    return run NativeDescriptor.isTerminal(2)
+  }
 }
 
 // How `build`, `check` and `run` report progress on standard error, from `--progress`, `--quiet`,
@@ -4344,8 +4413,11 @@ effect fn progressSettings(options: &ProjectOptions, units: usize) -> ProgressSe
   if same(Bytes.asSlice(&chosen), b"never") {
     display = ProgressDisplay.Off
   } else if same(Bytes.asSlice(&chosen), b"live") {
+    static if Intrinsic.targetOperatingSystem() == "windows" {
+      let enabled = run WindowsConsole.enableAnsi(2)
+    }
     display = ProgressDisplay.Live
-  } else if same(Bytes.asSlice(&chosen), b"auto") && run NativeDescriptor.isTerminal(2) {
+  } else if same(Bytes.asSlice(&chosen), b"auto") && run progressTerminal() {
     display = ProgressDisplay.Live
     if let Option<Bytes>.Some {value: terminal} = move run HostInput.variableNamed("TERM") {
       if same(Bytes.asSlice(&terminal), b"dumb") { display = ProgressDisplay.Plain }
@@ -4511,7 +4583,7 @@ effect fn buildProjectTarget(project: &Project, plan: ProjectPlan, standardLibra
     if finished {
       // Named from the working directory, as the `Compiled` line names its paths.
       let workingDirectory = run HostInput.workingDirectory()
-      let working = run Path.fromBytes(Bytes.asSlice(&workingDirectory))
+      let working = run CommandPath.fromHost(Bytes.asSlice(&workingDirectory))
       shown = run shownPath(&working, &path)
     }
     run Progress.finish(&mut progress, Bytes.asSlice(&shown), finished)
@@ -4531,7 +4603,7 @@ effect fn clangFor(working: &Path, configured: &Option<Bytes>) -> Option<Bytes>
 ! ApplicationError | OutOfMemoryError ? &mut Allocator {
   return match &configured.* {
     Option<Bytes>.Some {value} => {
-      if CommandPath.contains(Bytes.asSlice(&value), 47) {
+      if CommandPath.hasDirectory(Bytes.asSlice(&value)) {
         let resolved = run pathArgument(working, Bytes.asSlice(&value))
         return Option<Bytes>.some(run Bytes.copy(Path.rawBytes(&resolved)))
       }
@@ -5517,7 +5589,7 @@ effect fn debugNative(program: &Path, arguments: &[Bytes]) -> i32
   run List<Bytes>.append(&mut command, run Bytes.copy(b"-o"))
   run List<Bytes>.append(&mut command, run Bytes.copy(b"type summary add -x '^string(<.+>)?$' -F silk_string"))
   run List<Bytes>.append(&mut command, run Bytes.copy(b"--"))
-  run List<Bytes>.append(&mut command, run Bytes.copy(Path.rawBytes(program)))
+  run List<Bytes>.append(&mut command, run NativeToolchain.pathBytes(program))
   let mut at = usize.ZERO
   while at < arguments.length {
     run List<Bytes>.append(&mut command, run Bytes.copy(Bytes.asSlice(&arguments[at])))
@@ -6243,31 +6315,31 @@ effect fn program() -> i32
         configured = Option<Bytes>.some(run argumentAt(usize.add(0, 3), count))
       }
       let workingDirectory = run HostInput.workingDirectory()
-      let working = run Path.fromBytes(Bytes.asSlice(&workingDirectory))
-      let mut files = run OsFileSystem.make("/")
+      let working = run CommandPath.fromHost(Bytes.asSlice(&workingDirectory))
+      let mut files = run MachineFileSystem.make()
       let standardLibrary = run standardLibraryFor(&working, &configured)
         |> Effect.provideMut<FileSystem>(&mut files)
       let store = run GitCheckouts.store()
       return run LspCommand.runHost(move standardLibrary, move store, hostTarget())
     }
     if same(selected, b"doctest") {
-      let mut files = run OsFileSystem.make("/")
+      let mut files = run MachineFileSystem.make()
       let mut process = OsChildProcess.make()
       return run doctest()
         |> Effect.provideMut<FileSystem>(&mut files)
         |> Effect.provideMut<ChildProcess>(&mut process)
     }
     if same(selected, b"doc") || same(selected, b"doctest") || same(selected, b"doc-reference") {
-      let mut files = run OsFileSystem.make("/")
+      let mut files = run MachineFileSystem.make()
       return run DocumentationCommand.runHost(selected)
         |> Effect.provideMut<FileSystem>(&mut files)
     }
     if same(Bytes.asSlice(&value), b"format") {
       let mut diagnostics = StderrWriter.make()
-      let initialized = run Effect.result(OsFileSystem.make("/"))
+      let initialized = run Effect.result(MachineFileSystem.make())
       let mut files = match move initialized {
-        Result<OsFileSystem, OutOfMemoryError>.Success {value: provider} => move provider
-        Result<OsFileSystem, OutOfMemoryError>.Failure {error: _} => {
+        Result<MachineFileSystem, OutOfMemoryError>.Success {value: provider} => move provider
+        Result<MachineFileSystem, OutOfMemoryError>.Failure {error: _} => {
           let reported = run Effect.result(Writer.writeAll(b"silk format: cannot initialize filesystem\n")
             |> Effect.provideMut<Writer>(&mut diagnostics))
           drop reported
@@ -6284,12 +6356,8 @@ effect fn program() -> i32
   }
   let command = run request()
   let workingDirectory = run HostInput.workingDirectory()
-  let validated = match move HostInput.text(Bytes.asSlice(&workingDirectory)) {
-    Result<string, InvalidUtf8>.Success {value: _} => ()
-    Result<string, InvalidUtf8>.Failure {error: _} => run invalidWorkingDirectoryEncoding()
-  }
-  let mut files = run OsFileSystem.make("/")
-  let working = run Path.fromBytes(Bytes.asSlice(&workingDirectory))
+  let mut files = run MachineFileSystem.make()
+  let working = run CommandPath.fromHost(Bytes.asSlice(&workingDirectory))
   return match move command {
     Request.Build {source, output, stage, standardLibrary: configured, input, stats, clang} => {
       let sourcePath = run pathArgument(&working, Bytes.asSlice(&source))
@@ -6388,7 +6456,7 @@ effect fn program() -> i32
       let path = run pathArgument(&working, Bytes.asSlice(&argument))
       // A lone word that names no file and no Silk source is a mistyped command, not a dump.
       let written = Bytes.asSlice(&argument)
-      let sourceLike = CommandPath.contains(written, 47)
+      let sourceLike = CommandPath.hasDirectory(written)
         || (written.length > usize.add(0, 5) && same(Slice.view<u8>(written, written.length - usize.add(0, 5), usize.add(0, 5)), b".silk"))
       let present = run CommandPath.exists(Path.rawBytes(&path), false)
         |> Effect.provideMut<FileSystem>(&mut files)
@@ -6469,7 +6537,6 @@ effect fn report(failure: ApplicationError | InitialProfileProblem | HostInputEr
         run writeError(Bytes.asSlice(&message))
         return 2
       }
-      ApplicationError.InvalidWorkingDirectoryEncoding => run writeError(b"silk: the working directory is not UTF-8\n")
       ApplicationError.InvalidBuildProfile => run writeError(b"silk: invalid build profile\n")
       ApplicationError.InvalidPath {argument} => {
         run writeError(b"silk: invalid path argument: ")

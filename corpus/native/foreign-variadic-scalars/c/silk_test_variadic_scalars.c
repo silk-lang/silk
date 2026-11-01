@@ -1,8 +1,7 @@
 #include <float.h>
-#include <math.h>
+#include <stddef.h>
 #include <stdarg.h>
 #include <stdint.h>
-#include <stdio.h>
 
 static uint8_t storage[] = {42, 0};
 
@@ -33,14 +32,14 @@ int32_t silk_test_variadic_scalars(int32_t shape, ...) {
     } else if (shape == 1) {
         double positive_zero = va_arg(args, double);
         double negative_zero = va_arg(args, double);
-        if (positive_zero != 0.0 || signbit(positive_zero)) failed = 1;
-        if (negative_zero != 0.0 || !signbit(negative_zero)) failed = 1;
+        if (positive_zero != 0.0 || __builtin_signbit(positive_zero)) failed = 1;
+        if (negative_zero != 0.0 || !__builtin_signbit(negative_zero)) failed = 1;
         EXPECT(double, 0x1p-149);
         EXPECT(double, (double)FLT_MAX);
         EXPECT(double, 0x1p-1074);
         EXPECT(double, DBL_MAX);
         double double_negative_zero = va_arg(args, double);
-        if (double_negative_zero != 0.0 || !signbit(double_negative_zero)) failed = 1;
+        if (double_negative_zero != 0.0 || !__builtin_signbit(double_negative_zero)) failed = 1;
         EXPECT(double, 0.0);
         EXPECT(double, -0.5);
     } else {
@@ -48,6 +47,5 @@ int32_t silk_test_variadic_scalars(int32_t shape, ...) {
     }
 #undef EXPECT
     va_end(args);
-    if (failed) fprintf(stderr, "variadic scalar ABI mismatch: shape %d\n", shape);
     return failed;
 }

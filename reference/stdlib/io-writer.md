@@ -24,8 +24,9 @@ leaves it out and gets the default, one `writeAll` for each slice.
   accepted before the failure stay written.
 
 ## Gotchas
-The providers in `silk.io.writer_native` exist only on targets with a system libc (Darwin, or Linux
-with GNU libc).
+The providers in `silk.io.writer_native` exist on Windows x86_64 MSVC without a CRT, WASI,
+Darwin aarch64, and Linux x86_64 or aarch64 with GNU libc. Windows consoles require complete
+canonical WTF-8 per write or concatenated vectored write; redirected handles accept arbitrary bytes.
 
 ## Examples
 ### Write to a provider that counts bytes
@@ -242,4 +243,4 @@ Writes the UTF-8 bytes of `val`.
 
 Category: Input and output.
 
-Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`.
+Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`.

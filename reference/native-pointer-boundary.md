@@ -131,8 +131,20 @@ ownership rejects another extraction. The compiler does not claim to prove what 
 The audited target description supplies primitive size, alignment, pointer facts and endianness.
 Existing external structs and arrays derive layout from those facts before LLVM lowering. Missing
 or inconsistent facts fail before use; there is no ambient-host layout fallback. C classification carries the required sign/zero-extension attributes for narrow integers on
-Darwin ARM64 and System V x86-64; GNU AAPCS64 leaves those attributes absent. LLVM consumes these
+Darwin ARM64 and System V x86-64; GNU AAPCS64 and Microsoft x86-64 leave those attributes absent. LLVM consumes these
 verified facts on foreign declarations, call sites and exported thunks.
+
+For `x86_64-pc-windows-msvc`, signed and unsigned 8-bit and 16-bit scalar arguments and results
+use bare LLVM integer lanes. The caller does not promise sign or zero extension of their upper
+register bits. C default argument promotions still apply to unnamed variadic arguments.
+The independent [Clang fixture](../compiler/fixtures/windows-abi/README.md) records the declaration,
+direct-call, callback and export signatures. Windows foreign guards use the four-argument x64
+exception routine ABI: exception-record pointer, 64-bit establisher frame, context pointer and
+dispatcher-context pointer, with an `i32` disposition result. The handler terminates through
+Windows fast fail with reason `FAST_FAIL_FATAL_APP_EXIT`, without dispatching another exception.
+ELF and Mach-O keep their five-argument trap personality. All targets use a hidden coalesced
+definition. Native SEH controls and the shared Silk foreign-unwind corpus verify the Windows
+handler boundary, including an outer C catch that must not observe an exception crossing Silk.
 
 An `extern "C" struct` can pass or return by value in direct calls, native function-pointer
 calls and exported functions. Its fields retain the C object restrictions: C scalars, raw
@@ -144,6 +156,7 @@ the caller's object, including when the machine ABI passes an address of a calle
 | Target | Struct arguments and results |
 | --- | --- |
 | System V x86-64 | Up to two eightbytes use INTEGER and SSE registers. An argument that needs more registers than remain passes entirely in memory. Larger records use `byval` arguments and `sret` results. A record containing only one admitted SIMD vector retains that vector's register convention and feature requirement. |
+| Windows x86-64 MSVC | Records of exactly 1, 2, 4, or 8 bytes use one integer lane, including records containing floating-point fields. Other nonempty records use pointers to caller copies and `sret` results, without LLVM `byval`. Empty records, and records containing them through fields or arrays, remain unsupported at a by-value boundary. |
 | GNU and Apple ARM64 | Homogeneous aggregates of one through four floats or short vectors use vector registers. Other records up to 16 bytes use general registers. Larger arguments pass a pointer to a caller copy; indirect results use `sret` in x8. GNU homogeneous arguments retain the AAPCS64 stack alignment; Apple uses its own stack placement. |
 | wasm32 | A record containing a single scalar uses that scalar's lane. Other records use indirect arguments and results. |
 

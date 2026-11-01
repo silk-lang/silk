@@ -1,0 +1,164 @@
+//! Windows `HostInput` with owned arguments and an environment snapshot in raw canonical WTF-8.
+//!
+//! # When to use
+//! The Windows entry point supplies `WindowsHostInput` to application effects that require `HostInput`.
+//! Use `WindowsHostInput.capture` in a custom Windows runtime.
+//!
+//! @category Windows platform
+
+static if Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArchitecture() == "x86_64" && Intrinsic.targetAbi() == "msvc" && Intrinsic.profileText("libc") == "system" {
+  import silk.collections.bytes { Bytes }
+  import silk.collections.list { List }
+  import silk.collections.slice { Slice }
+  import silk.core.ownership { Drop }
+  import silk.core.option { Option }
+  import silk.mem.pointer { Pointer }
+  import silk.mem.allocator { Allocator, OutOfMemoryError }
+  import silk.system.host_input { HostInput, HostInputError }
+  import silk.platform.windows.wtf8 { Wtf8, InvalidWtf8 }
+  import silk.platform.windows.command_line { CommandLine }
+  import silk.platform.windows.environment { EnvironmentEntry }
+  import silk.num.usize
+  import silk.num.u32
+
+  unsafe extern "C" fn GetCommandLineW() -> ?[*]const u16
+  unsafe extern "C" fn GetEnvironmentStringsW() -> ?[*]mut u16
+  unsafe extern "C" fn FreeEnvironmentStringsW(block: [*]mut u16) -> i32
+  @foreign(noCapture: ("left", "right"))
+  unsafe extern "C" fn CompareStringOrdinal(left: ?[*]const u16, leftLength: i32, right: ?[*]const u16, rightLength: i32, ignoreCase: i32) -> i32
+  @foreign(noCapture: ("buffer",))
+  unsafe extern "C" fn GetCurrentDirectoryW(capacity: u32, buffer: ?[*]mut u16) -> u32
+
+  struct EnvironmentBlock { pointer: [*]mut u16 }
+  impl Drop for EnvironmentBlock {
+    fn drop(self: &mut Self) -> () {
+      let freed = unsafe FreeEnvironmentStringsW(self.pointer)
+      drop freed
+    }
+  }
+
+  unsafe fn terminatedLength(pointer: [*]const u16) -> usize {
+    let mut length: usize = 0
+    while unsafe Pointer.read(unsafe Pointer.at(pointer, length)) != 0 { length = length + 1 }
+    return length
+  }
+
+  /// Owned Windows arguments and environment entries, with case-insensitive environment lookup.
+  ///
+  /// # Details
+  ///
+  /// Arguments and environment values are canonical WTF-8 bytes; lone surrogates survive.
+  /// The snapshot does not change. Lookup uses Windows `CompareStringOrdinal` with case ignored,
+  /// and returns the first matching entry. Hidden names such as `=C:` are retained.
+  /// Working-directory queries return the current native Windows path as WTF-8, not a `Path` spelling.
+  pub struct WindowsHostInput {
+    arguments: List<Bytes>,
+    environment: List<List<u16>>,
+  }
+
+  impl WindowsHostInput {
+    /// Captures the process command line and environment, releasing the OS environment block after copying.
+    ///
+    /// # Details
+    ///
+    /// MSVC parsing preserves argument zero's special quoting rules. An empty command line gives
+    /// one empty argument. Malformed environment entries without a name/value separator are ignored.
+    ///
+    /// # Errors
+    ///
+    /// - `HostInputError` if Windows cannot supply the command line or environment.
+    /// - `OutOfMemoryError` if the owned snapshot cannot be allocated. Partial copies are released.
+    pub effect fn capture() -> WindowsHostInput ! HostInputError | OutOfMemoryError ? &mut Allocator {
+      let command = match move Pointer.nonNullMany(unsafe GetCommandLineW()) {
+        Option<[*]const u16>.Some { value } => value
+        Option<[*]const u16>.None => { fail HostInputError {} }
+      }
+      let length = unsafe terminatedLength(command)
+      let view = unsafe Pointer.borrowMany(&length, command, length)
+      let arguments = run CommandLine.parse(view)
+      let pointer = match move Pointer.nonNullManyMut(unsafe GetEnvironmentStringsW()) {
+        Option<[*]mut u16>.Some { value } => value
+        Option<[*]mut u16>.None => { fail HostInputError {} }
+      }
+      let block = EnvironmentBlock { pointer: pointer }
+      let mut environment = List<List<u16>>.make()
+      let mut offset: usize = 0
+      while unsafe Pointer.read(unsafe Pointer.at(pointer, offset)) != 0 {
+        let entry = unsafe Pointer.assumeMany(unsafe Pointer.at(pointer, offset))
+        let size = unsafe terminatedLength(entry)
+        let units = unsafe Pointer.borrowMany(&block, entry, size)
+        if let Option<usize>.Some { value: delimiter } = EnvironmentEntry.separator(units) {
+          let mut copy = List<u16>.make()
+          run List<u16>.appendSlice(&mut copy, units)
+          run List<List<u16>>.append(&mut environment, move copy)
+        }
+        offset = offset + size + 1
+      }
+      return WindowsHostInput { arguments: move arguments, environment: move environment }
+    }
+
+    effect fn argumentCount(self: &mut Self) -> usize ! HostInputError {
+      return List<Bytes>.length(&self.arguments)
+    }
+
+    effect fn argument(self: &mut Self, index: usize) -> Option<Bytes> ! HostInputError | OutOfMemoryError ? &mut Allocator {
+      let args = List<Bytes>.asSlice(&self.arguments)
+      if index >= args.length { return Option<Bytes>.none() }
+      return Option<Bytes>.some(run Bytes.copy(Bytes.asSlice(&args[index])))
+    }
+
+    effect fn variable(self: &mut Self, name: &[u8]) -> Option<Bytes> ! HostInputError | OutOfMemoryError ? &mut Allocator {
+      let decoded = run Intrinsic.catchFailure<InvalidWtf8>(Wtf8.decodeBytes(name), invalidName)
+      let key = List<u16>.asSlice(&decoded)
+      if key.length == 0 || key.length > 2147483647 { fail HostInputError {} }
+      let mut at: usize = 0
+      while at < key.length {
+        if key[at] == 0 || (key[at] == 61 && at != 0) { fail HostInputError {} }
+        at = at + 1
+      }
+      let entries = List<List<u16>>.asSlice(&self.environment)
+      at = 0
+      while at < entries.length {
+        let entry = List<u16>.asSlice(&entries[at])
+        if let Option<usize>.Some { value: end } = EnvironmentEntry.separator(entry) {
+          if end > 2147483647 { fail HostInputError {} }
+          let same = unsafe CompareStringOrdinal(Pointer.fromSlice(key), usize.toI32(key.length), Pointer.fromSlice(entry), usize.toI32(end), 1)
+          if same == 0 { fail HostInputError {} }
+          if same == 2 {
+            return Option<Bytes>.some(run Wtf8.encode(Slice.view(entry, end + 1, entry.length - end - 1)))
+          }
+        }
+        at = at + 1
+      }
+      return Option<Bytes>.none()
+    }
+
+    effect fn workingDirectory(self: &mut Self) -> Bytes ! HostInputError | OutOfMemoryError ? &mut Allocator {
+      let mut capacity = unsafe GetCurrentDirectoryW(0, unsafe Intrinsic.pointerRequalify<?*mut u16, ?[*]mut u16>(Pointer.null<u16>()))
+      let mut attempt: usize = 0
+      while capacity != 0 && attempt < 3 {
+        let mut buffer = List<u16>.make()
+        run List<u16>.appendRepeated(&mut buffer, 0, u32.toUsize(capacity))
+        let length = unsafe GetCurrentDirectoryW(capacity, Pointer.fromMutSlice(List<u16>.asMutSlice(&mut buffer)))
+        if length == 0 { fail HostInputError {} }
+        if length < capacity {
+          return run Wtf8.encode(Slice.view(List<u16>.asSlice(&buffer), 0, u32.toUsize(length)))
+        }
+        capacity = length
+        attempt = attempt + 1
+      }
+      fail HostInputError {}
+    }
+  }
+
+  effect fn invalidName(error: InvalidWtf8) -> List<u16> ! HostInputError {
+    fail HostInputError {}
+  }
+
+  impl HostInput for WindowsHostInput {
+    argumentCount: WindowsHostInput.argumentCount
+    argument: WindowsHostInput.argument
+    variable: WindowsHostInput.variable
+    workingDirectory: WindowsHostInput.workingDirectory
+  }
+}

@@ -14,6 +14,8 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 public_key=$(sed -n 2p "$root/minisign.pub")
 grep -qxF "minisign_public_key=$public_key" "$root/install.sh" ||
   { echo 'install.sh does not embed the key in minisign.pub' >&2; exit 1; }
+grep -qxF "\$SilkMinisignPublicKey = '$public_key'" "$root/install.ps1" ||
+  { echo 'install.ps1 does not embed the key in minisign.pub' >&2; exit 1; }
 
 tag=$1
 shift

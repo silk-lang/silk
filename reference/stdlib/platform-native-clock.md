@@ -16,7 +16,7 @@ when a signal interrupts the wait, so the total wait does not grow.
 ## Gotchas
 - A failed call or a bad result is a trap.
 - A wait blocks the whole thread. It does not let another fiber run.
-- A call fails to compile on targets other than WASI, Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+- A call fails to compile on targets other than WASI, Windows on x86_64, Darwin on aarch64, and GNU Linux on x86_64 or aarch64.
 
 ## Examples
 ### Read the clocks
@@ -63,7 +63,7 @@ Each read checks the result of the system.
 ### Gotchas
 - A failed call or a bad result is a trap.
 - A wait blocks the whole thread. It does not let another fiber run.
-- A call fails to compile on targets other than WASI, Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+- A call fails to compile on targets other than WASI, Windows on x86_64, Darwin on aarch64, and GNU Linux on x86_64 or aarch64.
 
 <a id="NativeClock.impl"></a>
 
@@ -116,4 +116,4 @@ A negative deadline or a failed call is a trap. The wait does not let another fi
 
 Category: Native platform.
 
-Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`.
+Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`.

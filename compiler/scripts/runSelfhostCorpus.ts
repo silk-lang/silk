@@ -4,6 +4,8 @@ import { availableParallelism, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { fileURLToPath } from 'node:url'
+import * as Data from 'effect/Data'
+import * as Effect from 'effect/Effect'
 import * as Corpus from '../../corpus/corpus.mjs'
 
 export interface Gap {
@@ -90,6 +92,7 @@ const runProcess = (
       cwd,
       env: { ...process.env, SILK_RECEIPTS: '1' },
       stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
     })
     const output = { stdout: '', stderr: '' }
     let bytes = 0
@@ -129,7 +132,7 @@ const runProcess = (
 const processFailure = (process: ProcessResult): string => {
   const error = process.error?.message
   const detail = process.stderr.trim()
-  return [error, detail, `exit=${process.status ?? 'none'} signal=${process.signal ?? 'none'}`]
+  return [error, detail, `exit=${process.status ?? 'none'} signal=${process.signal ?? 'none'}${windowsStatus(process.status)}`]
     .filter((part) => part !== undefined && part !== '')
     .join('; ')
 }
@@ -357,7 +360,7 @@ export const parseBuildDiagnostics = (
 const safeName = /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/
 
 /** The C driver the self-hosted compiler links with when `SILK_CLANG` names none. */
-export const defaultCCompiler = '/usr/bin/clang'
+export const defaultCCompiler = process.platform === 'win32' ? 'clang.exe' : '/usr/bin/clang'
 
 /**
  * Compiles each corpus C unit to an object beside the package with the C driver the compiler links
@@ -374,7 +377,10 @@ const nativeLinkInputs = async (
     writeFileSync(join(directory, `${unit}.c`), contents)
     const compiled = await runProcess(
       cCompiler,
-      ['-c', '-x', 'c', `${unit}.c`, '-O2', '-fPIC', '-fvisibility=hidden', '-o', `${unit}.o`],
+      ['-c', '-x', 'c', `${unit}.c`, '-O2',
+        '-I', fileURLToPath(new URL('../../corpus/fixtures', import.meta.url)),
+        ...(process.platform === 'win32' ? ['-ffreestanding', '-fno-stack-protector', '-funwind-tables'] : ['-fPIC', '-fvisibility=hidden']),
+        '-o', `${unit}.o`],
       buildTimeoutMs,
       directory,
     )
@@ -382,12 +388,65 @@ const nativeLinkInputs = async (
       throw new Error(`C unit ${unit}: ${processFailure(compiled)}`)
     objects.push(`{ object = ${JSON.stringify(`${unit}.o`)} }`)
   }
-  const libraries = (program.outcome.dynamicLibraries ?? []).map((library) => {
+  if (process.platform === 'win32') {
+    for (const [library, contents] of Object.entries(program.windowsImports)) {
+      if (!safeName.test(library)) throw new Error(`unsafe corpus import library name: ${library}`)
+      writeFileSync(join(directory, `${library}.def`), contents)
+      const toolDirectory = dirname(cCompiler)
+      const dlltool = toolDirectory === '.' ? 'llvm-dlltool.exe' : join(toolDirectory, 'llvm-dlltool.exe')
+      const compiled = await runProcess(dlltool, ['-m', 'i386:x86-64', '-d', `${library}.def`, '-l', `${library}.lib`], buildTimeoutMs, directory)
+      if (compiled.error !== undefined || compiled.status !== 0 || compiled.signal !== null)
+        throw new Error(`import library ${library}: ${processFailure(compiled)}`)
+      objects.push(`{ static-archive = ${JSON.stringify(`${library}.lib`)} }`)
+    }
+  }
+  const libraries = (program.outcome.dynamicLibraries ?? []).filter((library) =>
+    process.platform !== 'win32' || !(library in program.windowsImports),
+  ).map((library) => {
     if (!safeName.test(library)) throw new Error(`unsafe corpus library name: ${library}`)
     return `{ library = ${JSON.stringify(library)}, mode = "dynamic" }`
   })
   return [...objects, ...libraries]
 }
+
+// libuv can expose the DWORD as either signed or unsigned; preserve its bits in diagnostics.
+const windowsStatus = (status: number | null): string =>
+  globalThis.process.platform === 'win32' && status !== null && status >>> 30 === 3
+    ? ` ntstatus=0x${(status >>> 0).toString(16).padStart(8, '0')}`
+    : ''
+
+// Node's ignored stdio is NUL, which remains a valid writable handle. A real absent
+// Windows standard handle needs a launcher; this is the same closed-stderr invocation
+// the POSIX harness obtains with `exec 2>&-`, not a substituted runtime expectation.
+class CorpusFixtureError extends Data.TaggedError('CorpusFixtureError')<{
+  readonly reason: 'ExternalFailure'
+  readonly message: string
+  readonly cause?: unknown
+}> {}
+const buildClosedStderrLauncher = Effect.fn('SelfhostCorpus.buildClosedStderrLauncher')(function* (directory: string, cCompiler: string) {
+  const binaryDirectory = dirname(cCompiler)
+  const dlltool = binaryDirectory === '.' ? 'llvm-dlltool.exe' : join(binaryDirectory, 'llvm-dlltool.exe')
+  const definition = join(directory, 'closed-stderr.def')
+  const library = join(directory, 'closed-stderr.lib')
+  yield* Effect.try({
+    try: () => writeFileSync(definition, 'LIBRARY kernel32.dll\nEXPORTS\nGetCommandLineW\nGetStdHandle\nGetCurrentProcess\nDuplicateHandle\nCreateProcessW\nWaitForSingleObject\nGetExitCodeProcess\nCloseHandle\nExitProcess\n'),
+    catch: (cause) => new CorpusFixtureError({reason: 'ExternalFailure', message: 'Could not write closed-stderr imports', cause}),
+  })
+  const imported = yield* Effect.tryPromise({
+    try: () => runProcess(dlltool, ['-m', 'i386:x86-64', '-d', definition, '-l', library], buildTimeoutMs),
+    catch: (cause) => new CorpusFixtureError({reason: 'ExternalFailure', message: 'Could not start dlltool', cause}),
+  })
+  if (imported.error !== undefined || imported.status !== 0 || imported.signal !== null)
+    return yield* new CorpusFixtureError({reason: 'ExternalFailure', message: `closed-stderr imports: ${processFailure(imported)}`})
+  const source = fileURLToPath(new URL('../fixtures/windows-runtime/closed-stderr.c', import.meta.url))
+  const compiled = yield* Effect.tryPromise({try: () => runProcess(cCompiler, [source, library, '-O2', '-ffreestanding', '-fno-stack-protector',
+    '-nostdlib', '-fuse-ld=lld', ...(binaryDirectory === '.' ? [] : ['-B', binaryDirectory]),
+    '-Wl,/entry:mainCRTStartup', '-Wl,/subsystem:console', '-o', join(directory, 'closed-stderr.exe')], buildTimeoutMs),
+    catch: (cause) => new CorpusFixtureError({reason: 'ExternalFailure', message: 'Could not start Clang', cause}),
+  })
+  if (compiled.error !== undefined || compiled.status !== 0 || compiled.signal !== null)
+    return yield* new CorpusFixtureError({reason: 'ExternalFailure', message: `closed-stderr launcher: ${processFailure(compiled)}`})
+})
 
 interface CatalogRuntime {
   readonly targets: ReadonlyArray<string>
@@ -401,6 +460,7 @@ const hostTargets: Readonly<Record<string, { readonly target: string; readonly l
   'linux-x64': { target: 'x86_64-unknown-linux-gnu', libc: 'gnu' },
   'linux-arm64': { target: 'aarch64-unknown-linux-gnu', libc: 'gnu' },
   'darwin-arm64': { target: 'aarch64-apple-darwin', libc: 'system' },
+  'win32-x64': { target: 'x86_64-pc-windows-msvc', libc: 'system' },
 }
 
 const toml = (value: unknown): string => {
@@ -559,7 +619,9 @@ const checkRejected = async (
 
 const runExecutable = (executable: string, invocation: Corpus.Run): Promise<ProcessResult> =>
   invocation.closeStderr
-    ? runProcess(
+    ? process.platform === 'win32'
+      ? runProcess(join(dirname(executable), 'closed-stderr.exe'), [executable, ...(invocation.arguments ?? [])], runTimeoutMs)
+      : runProcess(
         'sh',
         [
           '-c',
@@ -584,13 +646,20 @@ const compareRun = (
     return `stderr: expected ${JSON.stringify(program.stderr)}, got ${JSON.stringify(run.stderr)}`
   const outcome = program.outcome.expected
   if (outcome.kind === 'trap') {
+    if (process.platform === 'win32' && outcome.windowsStatus !== undefined) {
+      if (run.signal === null && run.status !== null && run.status >>> 0 === outcome.windowsStatus) return undefined
+      return `exception: expected 0x${outcome.windowsStatus.toString(16)}, got ${run.status ?? 'none'}${windowsStatus(run.status)}`
+    }
     if (run.signal !== null || (run.status !== null && run.status !== 0)) return undefined
     return 'expected a trap or nonzero exit, got exit 0'
   }
   if (outcome.kind !== 'completes') return 'a native program must complete or trap'
-  const expected = outcome.exitCode & 0xff
-  if (run.signal !== null || run.status !== expected)
-    return `exit: expected ${expected}, got ${run.status ?? 'none'}${run.signal === null ? '' : ` (signal ${run.signal})`}`
+  // Windows preserves all 32 ExitProcess bits. In particular, an NTSTATUS crash must
+  // never become an ordinary matching exit after the POSIX eight-bit truncation.
+  const expected = process.platform === 'win32' ? outcome.exitCode >>> 0 : outcome.exitCode & 0xff
+  const actual = process.platform === 'win32' && run.status !== null ? run.status >>> 0 : run.status
+  if (run.signal !== null || actual !== expected)
+    return `exit: expected ${expected}, got ${run.status ?? 'none'}${run.signal === null ? '' : ` (signal ${run.signal})`}${windowsStatus(run.status)}`
   return undefined
 }
 
@@ -606,7 +675,10 @@ export const runCase = async (
     const expected = program.outcome.expected
     if (expected.kind === 'rejected')
       return await checkRejected(silkc, program, expected.diagnostics, directory, stdlib)
-    const executable = join(directory, 'program')
+    const outputName = process.platform === 'win32' ? 'program.exe' : 'program'
+    const executable = join(directory, outputName)
+    if (process.platform === 'win32' && program.outcome.runs?.some((run) => run.closeStderr))
+      await Effect.runPromise(buildClosedStderrLauncher(directory, cCompiler))
     const profiles = program.outcome.profiles ?? [
       { name: 'optimized', optimization: 'speed', debug: false },
     ]
@@ -619,7 +691,7 @@ export const runCase = async (
           'build',
           programModule,
           '-o',
-          'program',
+          outputName,
           '--stdlib',
           stdlib,
           '--optimization',
@@ -735,7 +807,7 @@ export const runCorpus = async (
   if (selectedSet !== undefined && programs.length !== selectedSet.size)
     throw new Error('SILK_SELFHOST_CORPUS_CASES names a program absent from nativeCorpus')
   const track = required.filter((name) => selectedSet === undefined || selectedSet.has(name))
-  const executable = silkc.includes('/') ? resolve(silkc) : silkc
+  const executable = /[/\\]/.test(silkc) ? resolve(silkc) : silkc
   const finished: Array<{ readonly result: CaseResult; readonly elapsedMs: number }> = []
   let reported = 0
   // The workers share one iterator, so each takes the next unstarted case. A timing prints once

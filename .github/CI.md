@@ -1,5 +1,39 @@
 # Running CI on a branch
 
+Selfhost also invokes `windows-release.yml` with its verified Linux N1 and immutable source
+snapshot. Linux cross-builds the first Windows compiler; `windows-2025` builds N2, verifies the
+native IR fixpoint and compiler identity, and builds the tool. Linux packages the Windows ZIP,
+and Windows extracts it and builds a new project through the bundled tool without `--stdlib`.
+This chain supplies the Windows release candidate and gates publication, while the existing
+Linux required check remains unchanged. It does not alter the pinned seed or require a Windows seed.
+The candidate asset is `silk-compiler-x86_64-pc-windows-msvc.exe`; its installable archive is
+`silk-<version>-x86_64-pc-windows-msvc.zip`.
+
+The non-required `Windows native execution` workflow runs automatically after N1 on main pushes
+and PR pushes carrying the `windows` label. It reuses the same N1, including the exact synthetic
+merge revision on a PR. If main reuses a green same-tree run, Windows consumes that run's N1 and
+recorded source revision. Neither the required Linux check nor publication depends on the full
+Windows regression lane. Label a PR before its next push to opt it in, or dispatch Selfhost with
+`inputs[windows-native]=true` for an existing branch head.
+
+Standalone dispatch can consume a successful `selfhost-native-n1` artifact from an earlier
+dispatched Selfhost run. It verifies the build receipt against that compiler's source commit,
+cross-builds the workflow revision's fixtures on Linux, and executes them on `windows-2025`.
+It also exports generated reference pages and optional replay controls without rebuilding N1:
+
+```sh
+gh api -X POST repos/silk-lang/silk/actions/workflows/windows.yml/dispatches \
+  -f ref=feature/windows-support -f 'inputs[source-run]=<selfhost run id>'
+```
+
+The workflow revision must contain the Windows cross-build and execution harness. The run records
+both the tested revision and the N1 compiler revision. A previous N1 can validate new library sources;
+compiler changes need a new N1 before their behavior is validated. Standalone dispatch refuses PR
+artifacts because their synthetic merge revision differs from the API head revision; the reusable
+Selfhost invocation supplies that exact merge revision instead. Native results are retained in `windows-native-results`,
+with unexecuted claims reported separately. This route can validate Windows even when unrelated
+Selfhost jobs fail after producing a successful N1.
+
 Selfhost CI (`.github/workflows/selfhost.yml`) runs on every push to a pull request into `main`; a
 newer push cancels the PR's older run. `main` runs it on every push and on the nightly schedule.
 A branch without a pull request into `main`, such as the head of a stack, runs it only when

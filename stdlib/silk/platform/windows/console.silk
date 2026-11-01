@@ -1,0 +1,263 @@
+//! Windows standard-output and standard-error writes without a C runtime.
+//!
+//! # When to use
+//! Provide `WindowsConsole.stdout` or `WindowsConsole.stderr` for `Writer`. Runtime reports also
+//! use `WindowsConsole.writeAll`, with selector 1 for standard output or 2 for standard error.
+//!
+//! @category Windows platform
+
+static if Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArchitecture() == "x86_64" && Intrinsic.targetAbi() == "msvc" && Intrinsic.profileText("libc") == "system" {
+  import silk.mem.pointer { Pointer }
+  import silk.collections.slice { Slice }
+  import silk.platform.windows.wtf8 { Wtf8, Wtf8Point }
+  import silk.core.option { Option }
+  import silk.io.writer { Writer, WriterError }
+  import silk.num.usize
+  import silk.num.u32
+
+  fn nextByte(prefix: &[u8], rest: &[&[u8]], part: &mut usize, offset: &mut usize) -> Option<u8> {
+    while part.* <= rest.length {
+      let mut bytes = prefix
+      if part.* != 0 { bytes = rest[part.* - 1] }
+      if offset.* < bytes.length {
+        let byte = bytes[offset.*]
+        offset.* = offset.* + 1
+        return Option<u8>.some(byte)
+      }
+      part.* = part.* + 1
+      offset.* = 0
+    }
+    return Option<u8>.none()
+  }
+
+  unsafe extern "C" fn GetStdHandle(kind: u32) -> ?*mut u8
+  @foreign(noCapture: ("mode",))
+  unsafe extern "C" fn GetConsoleMode(handle: ?*mut u8, mode: *mut u32) -> i32
+  unsafe extern "C" fn SetConsoleMode(handle: ?*mut u8, mode: u32) -> i32
+  unsafe extern "C" fn GetLastError() -> u32
+  @foreign(noCapture: ("bytes", "written", "overlapped"))
+  unsafe extern "C" fn WriteFile(handle: ?*mut u8, bytes: ?[*]const u8, count: u32, written: *mut u32, overlapped: ?*mut u8) -> i32
+  @foreign(noCapture: ("units", "written", "reserved"))
+  unsafe extern "C" fn WriteConsoleW(handle: ?*mut u8, units: ?[*]const u16, count: u32, written: *mut u32, reserved: ?*mut u8) -> i32
+
+  /// An unbuffered `Writer` for a Windows standard handle, without ownership of that handle.
+  ///
+  /// # Details
+  ///
+  /// Redirection writes bytes unchanged with `WriteFile`. A real console receives UTF-16 through
+  /// `WriteConsoleW`, independent of its output code page. Each console write requires complete canonical
+  /// WTF-8 bytes; malformed or incomplete input fails. Lone surrogates are passed as UTF-16 code units.
+  /// Flush does nothing. Writes have no inter-thread message lock and can make partial progress before failure.
+  pub struct WindowsConsole { selector: i32 }
+
+  impl WindowsConsole {
+    /// Enables ANSI escape processing on standard output (1) or standard error (2).
+    ///
+    /// # Details
+    ///
+    /// Returns false for another selector, a redirected or invalid handle, or an OS refusal.
+    /// Existing mode bits are preserved. The successful setting persists on the console handle.
+    pub effect fn enableAnsi(selector: i32) -> bool {
+      if selector != 1 && selector != 2 { return false }
+      let mut kind: u32 = 4294967285
+      if selector == 2 { kind = 4294967284 }
+      let handle = unsafe GetStdHandle(kind)
+      let mut mode: u32 = 0
+      if unsafe GetConsoleMode(handle, Pointer.fromMutRef(&mut mode)) == 0 { return false }
+      return unsafe SetConsoleMode(handle, u32.bitOr(mode, 5)) != 0
+    }
+
+    /// Returns an unbuffered standard-output writer. It does not read or change the process handle.
+    pub fn stdout() -> WindowsConsole { return WindowsConsole { selector: 1 } }
+
+    /// Returns an unbuffered standard-error writer. It does not read or change the process handle.
+    pub fn stderr() -> WindowsConsole { return WindowsConsole { selector: 2 } }
+
+    /// Writes `prefix` followed by every slice in `rest` to standard handle 1 or 2.
+    ///
+    /// # Details
+    ///
+    /// Redirected output preserves arbitrary bytes. Console output decodes the concatenation as
+    /// canonical WTF-8, including characters split across slices, without allocating. Calls can
+    /// interleave with other threads and can write a prefix before failure. Empty input succeeds.
+    /// Success sets `error` to zero; failure sets a Windows error, 6 for an invalid selector,
+    /// 1113 for invalid WTF-8, or 29 for invalid progress. No handle is closed.
+    pub effect fn writeAllGather(selector: i32, prefix: &[u8], rest: &[&[u8]], error: &mut i32) -> bool {
+      error.* = 0
+      if selector != 1 && selector != 2 { error.* = 6
+        return false }
+      let mut kind: u32 = 4294967285
+      if selector == 2 { kind = 4294967284 }
+      let handle = unsafe GetStdHandle(kind)
+      let mut mode: u32 = 0
+      if unsafe GetConsoleMode(handle, Pointer.fromMutRef(&mut mode)) == 0 {
+        if !writeFileAll(handle, prefix, &mut error.*) { return false }
+        let mut part: usize = 0
+        while part < rest.length {
+          if !writeFileAll(handle, rest[part], &mut error.*) { return false }
+          part = part + 1
+        }
+        return true
+      }
+      let mut part: usize = 0
+      let mut offset: usize = 0
+      let mut buffer: [u16; 256] = [0; 256]
+      let mut count: usize = 0
+      let mut high = false
+      while true {
+        let first = match move nextByte(prefix, rest, &mut part, &mut offset) {
+          Option<u8>.Some { value } => value
+          Option<u8>.None => { return writeConsoleAll(handle, Slice.view(&buffer, 0, count), move error) }
+        }
+        let mut bytes: [u8; 4] = [0; 4]
+        bytes[0] = first
+        let mut length: usize = 1
+        if first >= 194 && first <= 223 { length = 2 }
+        else if first >= 224 && first <= 239 { length = 3 }
+        else if first >= 240 && first <= 244 { length = 4 }
+        let mut at: usize = 1
+        while at < length {
+          bytes[at] = match move nextByte(prefix, rest, &mut part, &mut offset) {
+            Option<u8>.Some { value } => value
+            Option<u8>.None => { error.* = 1113
+              return false }
+          }
+          at = at + 1
+        }
+        let point = match move Wtf8.pointBytes(Slice.view(&bytes, 0, length), 0) {
+          Option<Wtf8Point>.Some { value } => move value
+          Option<Wtf8Point>.None => { error.* = 1113
+            return false }
+        }
+        if high && point.value >= 56320 && point.value <= 57343 {
+          error.* = 1113
+          return false
+        }
+        high = point.value >= 55296 && point.value <= 56319
+        if point.value < 65536 {
+          buffer[count] = u32.toU16(point.value)
+          count = count + 1
+        } else {
+          buffer[count] = u32.toU16(55296 + (point.value - 65536) / 1024)
+          buffer[count + 1] = u32.toU16(56320 + (point.value - 65536) % 1024)
+          count = count + 2
+        }
+        if count >= 255 {
+          if !writeConsoleAll(handle, Slice.view(&buffer, 0, count), &mut error.*) { return false }
+          count = 0
+        }
+      }
+      return true
+    }
+
+    /// Writes all bytes to standard handle 1 or 2, and returns whether all writes succeeded.
+    ///
+    /// # Details
+    ///
+    /// Redirection preserves bytes. A real console receives decoded UTF-16 without a code-page change.
+    /// Each real-console call requires complete canonical WTF-8. The operation does not allocate or close handles.
+    /// On failure, `error` receives the Windows error, 6 for an invalid selector, 1113 for invalid
+    /// WTF-8, or 29 for zero or invalid progress. Successful calls set `error` to zero.
+    ///
+    /// # Gotchas
+    ///
+    /// Some output can precede a failure. Concurrent writes can interleave. Empty input makes no host call.
+    pub effect fn writeAll(selector: i32, bytes: &[u8], error: &mut i32) -> bool {
+      error.* = 0
+      if selector != 1 && selector != 2 { error.* = 6
+        return false }
+      if bytes.length == 0 { return true }
+      let mut kind: u32 = 4294967285
+      if selector == 2 { kind = 4294967284 }
+      let handle = unsafe GetStdHandle(kind)
+      if Pointer.isNull(handle) || Pointer.address(handle) == usize.MAX {
+        error.* = 6
+        return false
+      }
+      let mut mode: u32 = 0
+      if unsafe GetConsoleMode(handle, Pointer.fromMutRef(&mut mode)) == 0 {
+        return writeFileAll(handle, bytes, move error)
+      }
+      // Validate before emitting a prefix. The buffer below never splits a surrogate pair itself.
+      let mut at: usize = 0
+      while at < bytes.length {
+        let point = match move Wtf8.pointBytes(bytes, at) {
+          Option<Wtf8Point>.Some { value } => move value
+          Option<Wtf8Point>.None => { error.* = 1113
+            return false }
+        }
+        at = point.end
+      }
+      at = 0
+      while at < bytes.length {
+        let mut buffer: [u16; 256] = [0; 256]
+        let mut count: usize = 0
+        while at < bytes.length && count < 255 {
+          let point = match move Wtf8.pointBytes(bytes, at) {
+            Option<Wtf8Point>.Some { value } => move value
+            Option<Wtf8Point>.None => { error.* = 1113
+              return false }
+          }
+          if point.value < 65536 {
+            buffer[count] = u32.toU16(point.value)
+            count = count + 1
+          } else {
+            buffer[count] = u32.toU16(55296 + (point.value - 65536) / 1024)
+            buffer[count + 1] = u32.toU16(56320 + (point.value - 65536) % 1024)
+            count = count + 2
+          }
+          at = point.end
+        }
+        if !writeConsoleAll(handle, Slice.view(&buffer, 0, count), &mut error.*) { return false }
+      }
+      return true
+    }
+  }
+
+  fn writeConsoleAll(handle: ?*mut u8, units: &[u16], error: &mut i32) -> bool {
+    let mut offset: usize = 0
+    while offset < units.length {
+      let mut written: u32 = 0
+      let view = Slice.view(units, offset, units.length - offset)
+      let result = unsafe WriteConsoleW(handle, Pointer.fromSlice(view), usize.toU32(view.length), Pointer.fromMutRef(&mut written), Pointer.null<u8>())
+      if result == 0 { error.* = u32.wrappingToI32(unsafe GetLastError())
+        return false }
+      let progress = u32.toUsize(written)
+      if progress == 0 || progress > view.length { error.* = 29
+        return false }
+      offset = offset + progress
+    }
+    return true
+  }
+
+  fn writeFileAll(handle: ?*mut u8, bytes: &[u8], error: &mut i32) -> bool {
+    let mut offset: usize = 0
+    while offset < bytes.length {
+      let mut count = bytes.length - offset
+      if count > 2147483647 { count = 2147483647 }
+      let view = Slice.view(bytes, offset, count)
+      let mut written: u32 = 0
+      let result = unsafe WriteFile(handle, Pointer.fromSlice(view), usize.toU32(count), Pointer.fromMutRef(&mut written), Pointer.null<u8>())
+      if result == 0 { error.* = u32.wrappingToI32(unsafe GetLastError())
+        return false }
+      let progress = u32.toUsize(written)
+      if progress == 0 || progress > count { error.* = 29
+        return false }
+      offset = offset + progress
+    }
+    return true
+  }
+
+  impl Writer for WindowsConsole {
+    effect fn writeAll(self: &mut Self, bytes: &[u8]) -> () ! WriterError ? &mut Writer {
+      let mut error: i32 = 0
+      if !(run WindowsConsole.writeAll(self.selector, bytes, &mut error)) { fail Writer.failure() }
+      return ()
+    }
+    effect fn flush(self: &mut Self) -> () ! WriterError ? &mut Writer { return () }
+    effect fn writeVectored(self: &mut Self, bytes: &[&[u8]]) -> () ! WriterError ? &mut Writer {
+      let mut error: i32 = 0
+      if !(run WindowsConsole.writeAllGather(self.selector, b"", bytes, &mut error)) { fail Writer.failure() }
+    }
+  }
+}

@@ -138,8 +138,8 @@ without a new `allocate` request.
 #### Details
 
 The default is false, so a provider that wraps [`Allocator.systemAllocatorProvider`](#Allocator.impl.systemAllocatorProvider) to
-count, limit or audit requests sees every growth as a new request. The system provider
-returns true, and `List` then grows its heap storage with `realloc` (#2641).
+count, limit or audit requests sees every growth as a new request. The Windows system
+provider returns false. Other system providers return true and let `List` grow with `realloc`.
 
 <a id="Allocator.impl"></a>
 
@@ -223,4 +223,4 @@ effect fn growsInPlace(self: &mut Self) -> bool ? &mut Allocator
 
 Category: Memory.
 
-Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`.
+Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`.

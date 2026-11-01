@@ -5,7 +5,7 @@ import { createRequire } from 'node:module'
 import { join, resolve, sep } from 'node:path'
 import { parseArgs } from 'node:util'
 import { pathToFileURL } from 'node:url'
-import { gzipSync } from 'node:zlib'
+import { crc32, deflateRawSync, gzipSync } from 'node:zlib'
 import * as Data from 'effect/Data'
 import * as Effect from 'effect/Effect'
 import * as FileSystem from 'effect/FileSystem'
@@ -38,7 +38,7 @@ export interface ArchiveOptions {
   readonly target: string
   /** The release version, named in the archive. */
   readonly version: string
-  /** An existing directory that receives `silk-<version>-<target>.tar.gz`. */
+  /** An existing directory that receives a Windows .zip or Unix .tar.gz archive. */
   readonly outputDirectory: string
   /** Immutable native release metadata, embedded verbatim without executing the compiler. */
   readonly snapshot?: string | undefined
@@ -107,6 +107,53 @@ export const tar = (entries: ReadonlyArray<Entry>): Uint8Array | undefined => {
   return archive
 }
 
+// ZIP32 with UTF-8 names, raw DEFLATE, no data descriptors, and a fixed DOS epoch.
+// Keeping sizes in both headers lets ordinary Windows tools and the native installer validate it.
+const zip = (entries: ReadonlyArray<Entry>): Uint8Array | undefined => {
+  if (entries.length > 0xffff) return undefined
+  const local: Array<Uint8Array> = []
+  const central: Array<Uint8Array> = []
+  let offset = 0
+  let centralSize = 0
+  for (const entry of entries) {
+    const directory = entry._tag === 'Directory'
+    const name = encoder.encode(directory ? `${entry.path}/` : entry.path)
+    if (name.length > 0xffff) return undefined
+    const input = entry._tag === 'File' ? entry.bytes : new Uint8Array(0)
+    const content = directory ? input : deflateRawSync(input, { level: 9 })
+    if (input.length > 0xffffffff || content.length > 0xffffffff) return undefined
+    const checksum = crc32(input)
+    const header = Buffer.alloc(30)
+    header.writeUInt32LE(0x04034b50, 0)
+    header.writeUInt16LE(20, 4)
+    header.writeUInt16LE(0x800, 6)
+    header.writeUInt16LE(directory ? 0 : 8, 8)
+    header.writeUInt16LE(0x21, 12)
+    header.writeUInt32LE(checksum, 14)
+    header.writeUInt32LE(content.length, 18)
+    header.writeUInt32LE(input.length, 22)
+    header.writeUInt16LE(name.length, 26)
+    const index = Buffer.alloc(46)
+    index.writeUInt32LE(0x02014b50, 0)
+    index.writeUInt16LE(20, 4)
+    index.set(header.subarray(4, 30), 6)
+    index.writeUInt32LE(directory ? 0x10 : 0, 38)
+    index.writeUInt32LE(offset, 42)
+    local.push(header, name, content)
+    central.push(index, name)
+    offset += header.length + name.length + content.length
+    centralSize += index.length + name.length
+    if (offset + centralSize + 22 > 0xffffffff) return undefined
+  }
+  const end = Buffer.alloc(22)
+  end.writeUInt32LE(0x06054b50, 0)
+  end.writeUInt16LE(entries.length, 8)
+  end.writeUInt16LE(entries.length, 10)
+  end.writeUInt32LE(centralSize, 12)
+  end.writeUInt32LE(offset, 16)
+  return Buffer.concat([...local, ...central, end])
+}
+
 // The directory and file members below `root`, as `<base>/<relative path>`, in sorted path order.
 const tree = Effect.fnUntraced(function* (root: string, base: string) {
   const fs = yield* FileSystem.FileSystem
@@ -134,11 +181,13 @@ const tree = Effect.fnUntraced(function* (root: string, base: string) {
 /** The archive's file name and top-level directory retain the exact release version. */
 export const name = (version: string, target: string) => `silk-${version}-${target}`
 
-/** Writes the target's gzip-compressed release archive and answers its path. */
+/** Writes the target's release archive: ZIP on Windows, gzip-compressed ustar elsewhere. */
 export const write = Effect.fn('ReleaseArchive.write')(function* (options: ArchiveOptions) {
   if (!isVersion(options.version))
     return yield* new ReleaseArchiveError({ message: 'Release version must be valid SemVer' })
   const fs = yield* FileSystem.FileSystem
+  const windows = options.target === 'x86_64-pc-windows-msvc'
+  const executable = windows ? '.exe' : ''
   const top = name(options.version, options.target)
   const library = yield* tree(options.standardLibrary, `${top}/lib/silk/stdlib`)
   const entries: Array<Entry> = [
@@ -146,7 +195,7 @@ export const write = Effect.fn('ReleaseArchive.write')(function* (options: Archi
     { _tag: 'Directory', path: `${top}/bin` },
     {
       _tag: 'File',
-      path: `${top}/bin/silkc`,
+      path: `${top}/bin/silkc${executable}`,
       bytes: yield* fs.readFile(options.compiler),
       executable: true,
     },
@@ -155,7 +204,7 @@ export const write = Effect.fn('ReleaseArchive.write')(function* (options: Archi
       : [
           {
             _tag: 'File' as const,
-            path: `${top}/bin/silk`,
+            path: `${top}/bin/silk${executable}`,
             bytes: yield* fs.readFile(options.tool),
             executable: true,
           },
@@ -171,14 +220,17 @@ export const write = Effect.fn('ReleaseArchive.write')(function* (options: Archi
       bytes: yield* fs.readFile(options.snapshot),
       executable: false,
     })
-  const archive = tar(entries)
-  if (archive === undefined)
-    return yield* new ReleaseArchiveError({ message: 'An archive member path is too long' })
   const compressed = yield* Effect.try({
-    try: () => gzipSync(archive, { level: 9 }),
+    try: () => {
+      if (windows) return zip(entries)
+      const archive = tar(entries)
+      return archive === undefined ? undefined : gzipSync(archive, { level: 9 })
+    },
     catch: (cause) => new ReleaseArchiveError({ message: 'Cannot compress the archive', cause }),
   })
-  const path = join(options.outputDirectory, `${top}.tar.gz`)
+  if (compressed === undefined)
+    return yield* new ReleaseArchiveError({ message: 'Archive names, sizes, or member count exceed the format limits' })
+  const path = join(options.outputDirectory, `${top}.${windows ? 'zip' : 'tar.gz'}`)
   yield* fs.writeFile(path, compressed, { flag: 'wx' })
   return path
 })

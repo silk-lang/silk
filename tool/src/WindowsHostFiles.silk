@@ -1,0 +1,135 @@
+static if Intrinsic.targetOperatingSystem() == "windows" {
+//! Windows publication, hard links, and install locking in the absolute machine namespace.
+
+import Install {HostFiles}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.core.effect {Effect}
+import silk.core.option {Option}
+import silk.core.result {Result}
+import silk.core.ownership {Drop}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.mem.pointer {Pointer}
+import silk.platform.windows.host_path as WindowsHostPath
+import silk.system.filesystem {Path, FileError}
+import silk.num.usize
+
+extern "C" struct Overlapped {internal: usize, transferred: usize, offset: u32, offsetHigh: u32, event: ?*mut u8}
+extern "C" struct IoStatus {status: usize, information: usize}
+extern "C" struct RenameInfo {flags: u32, root: ?*mut u8, length: u32, name: [u16; 32768]}
+@foreign(noCapture: ("name", "security"))
+unsafe extern "C" fn CreateFileW(name: ?[*]const u16, access: u32, sharing: u32, security: ?*mut u8, creation: u32, flags: u32, template: ?*mut u8) -> ?*mut u8
+@foreign(noCapture: ("name",))
+unsafe extern "C" fn GetFileAttributesW(name: ?[*]const u16) -> u32
+@foreign(noCapture: ("newName", "existing", "security"))
+unsafe extern "C" fn CreateHardLinkW(newName: ?[*]const u16, existing: ?[*]const u16, security: ?*mut u8) -> i32
+unsafe extern "C" fn CloseHandle(handle: ?*mut u8) -> i32
+@foreign(noCapture: ("overlapped",))
+unsafe extern "C" fn LockFileEx(handle: ?*mut u8, flags: u32, reserved: u32, low: u32, high: u32, overlapped: *mut Overlapped) -> i32
+@foreign(noCapture: ("io", "information"))
+unsafe extern "C" fn NtSetInformationFile(handle: ?*mut u8, io: *mut IoStatus, information: *mut u8, length: u32, kind: u32) -> i32
+
+struct Handle {raw: ?*mut u8}
+impl Drop for Handle {
+  fn drop(self: &mut Self) -> () {
+    if !Pointer.isNull(self.raw) { let closed = unsafe CloseHandle(self.raw) }
+  }
+}
+
+/// Host install operations in the machine namespace, with one optional held file lock.
+pub struct WindowsHostFiles {root: &'static [u8], held: Handle}
+
+impl WindowsHostFiles {
+  /// Returns a provider below a machine path root. `/` selects the whole machine namespace.
+  pub fn at(root: &'static [u8]) -> Self {
+    return WindowsHostFiles {root: root, held: Handle {raw: Pointer.null<u8>()}}
+  }
+
+  effect fn host(self: &Self, path: &Path) -> Option<List<u16>> ! OutOfMemoryError ? &mut Allocator {
+    if self.root.length == 1 && self.root[0] == 47 { return run WindowsHostPath.wide(path) }
+    let mut combined = run Bytes.copy(self.root)
+    run Bytes.append(&mut combined, Path.rawBytes(path))
+    let parsed = run Effect.result(Path.fromBytes(Bytes.asSlice(&combined)))
+    return match move parsed {
+      Result<Path, FileError | OutOfMemoryError>.Success {value} => run WindowsHostPath.wide(&value)
+      Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+        FileError invalid => Option<List<u16>>.none()
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+  }
+
+  effect fn markExecutable(self: &mut Self, path: &Path) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let name = match move run self.host(path) {
+      Option<List<u16>>.Some {value} => move value
+      Option<List<u16>>.None => { return false }
+    }
+    // Windows executes PE images without a Unix executable permission bit.
+    return unsafe GetFileAttributesW(Pointer.fromSlice(List<u16>.asSlice(&name))) != 4294967295
+  }
+
+  effect fn rename(self: &mut Self, from: &Path, to: &Path) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let source = match move run self.host(from) {
+      Option<List<u16>>.Some {value} => move value
+      Option<List<u16>>.None => { return false }
+    }
+    let target = match move run self.host(to) {
+      Option<List<u16>>.Some {value} => move value
+      Option<List<u16>>.None => { return false }
+    }
+    let raw = unsafe CreateFileW(Pointer.fromSlice(List<u16>.asSlice(&source)), 65536, 7,
+      Pointer.null<u8>(), 3, 35651584, Pointer.null<u8>())
+    if Pointer.isNull(raw) || Pointer.address(raw) == usize.MAX { return false }
+    let handle = Handle {raw: raw}
+    let destination = List<u16>.asSlice(&target)
+    let count = destination.length - 1
+    if count < 4 || count >= 32768 { return false }
+    let mut information = RenameInfo {flags: 3, root: Pointer.null<u8>(), length: usize.toU32(count * 2), name: [0; 32768]}
+    let mut at: usize = 0
+    while at < count { information.name[at] = destination[at]
+      at = at + 1 }
+    // Convert the Win32 verbatim prefix to the NT object-manager DOS-device prefix.
+    information.name[1] = 63
+    information.name[2] = 63
+    let mut io = IoStatus {status: 0, information: 0}
+    let length = 20 + information.length
+    return unsafe NtSetInformationFile(handle.raw, Pointer.fromMutRef(&mut io),
+      unsafe Intrinsic.pointerReinterpret<*mut RenameInfo, *mut u8>(Pointer.fromMutRef(&mut information)), length, 65) >= 0
+  }
+
+  effect fn hardLink(self: &mut Self, from: &Path, to: &Path) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let source = match move run self.host(from) { Option<List<u16>>.Some {value} => move value
+      Option<List<u16>>.None => { return false } }
+    let target = match move run self.host(to) { Option<List<u16>>.Some {value} => move value
+      Option<List<u16>>.None => { return false } }
+    return unsafe CreateHardLinkW(Pointer.fromSlice(List<u16>.asSlice(&target)), Pointer.fromSlice(List<u16>.asSlice(&source)), Pointer.null<u8>()) != 0
+  }
+
+  effect fn lock(self: &mut Self, path: &Path) -> bool ! OutOfMemoryError ? &mut Allocator {
+    if !Pointer.isNull(self.held.raw) { return false }
+    let name = match move run self.host(path) { Option<List<u16>>.Some {value} => move value
+      Option<List<u16>>.None => { return false } }
+    let raw = unsafe CreateFileW(Pointer.fromSlice(List<u16>.asSlice(&name)), 3221225472, 7, Pointer.null<u8>(), 4, 0, Pointer.null<u8>())
+    if Pointer.isNull(raw) || Pointer.address(raw) == usize.MAX { return false }
+    let mut owner = Handle {raw: raw}
+    let mut overlapped = Overlapped {internal: 0, transferred: 0, offset: 0, offsetHigh: 0, event: Pointer.null<u8>()}
+    if unsafe LockFileEx(raw, 2, 0, 1, 0, Pointer.fromMutRef(&mut overlapped)) == 0 { return false }
+    self.held.raw = Intrinsic.replace(owner.raw, Pointer.null<u8>())
+    return true
+  }
+
+  effect fn unlock(self: &mut Self) -> () {
+    let raw = Intrinsic.replace(self.held.raw, Pointer.null<u8>())
+    if !Pointer.isNull(raw) { let closed = unsafe CloseHandle(raw) }
+  }
+}
+
+impl HostFiles for WindowsHostFiles {
+  markExecutable: WindowsHostFiles.markExecutable
+  rename: WindowsHostFiles.rename
+  link: WindowsHostFiles.hardLink
+  lock: WindowsHostFiles.lock
+  unlock: WindowsHostFiles.unlock
+}
+
+}

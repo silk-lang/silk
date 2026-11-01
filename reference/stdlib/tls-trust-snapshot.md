@@ -46,7 +46,7 @@ pub fn main() -> i32 {
 
 Import as `TrustSnapshot` with `import silk.tls.trust_snapshot { TrustSnapshot }`.
 
-Public declarations: 7.
+Public declarations: 8.
 
 <a id="SnapshotLimits"></a>
 
@@ -198,7 +198,7 @@ The size of all anchors.
 InputBytes
 ```
 
-The size of a file that a native trust source reads.
+The total input bytes that a native trust source reads.
 
 <a id="TrustLimitKind.impl.Debug"></a>
 
@@ -344,6 +344,64 @@ effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &m
 
 Writes the name of the variant, such as `Open`.
 
+<a id="TrustStoreOperation"></a>
+
+## `TrustStoreOperation`
+
+```silk
+pub enum TrustStoreOperation
+```
+
+The certificate-store operation that failed.
+
+<a id="TrustStoreOperation.Open"></a>
+
+### `Open`
+
+```silk
+Open
+```
+
+Opening the configured store.
+
+<a id="TrustStoreOperation.Enumerate"></a>
+
+### `Enumerate`
+
+```silk
+Enumerate
+```
+
+Enumerating a certificate in the store.
+
+<a id="TrustStoreOperation.Close"></a>
+
+### `Close`
+
+```silk
+Close
+```
+
+Closing the store after enumeration.
+
+<a id="TrustStoreOperation.impl.Debug"></a>
+
+## Implementation `Debug for TrustStoreOperation`
+
+```silk
+impl Debug for TrustStoreOperation
+```
+
+<a id="TrustStoreOperation.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the store operation name.
+
 <a id="TrustSourceError"></a>
 
 ## `TrustSourceError`
@@ -453,6 +511,36 @@ pub error: FileError
 ```
 
 The file error.
+
+<a id="TrustSourceError.Store"></a>
+
+### `Store`
+
+```silk
+Store
+```
+
+A native certificate-store operation failed.
+
+<a id="TrustSourceError.Store.operation"></a>
+
+#### Field `operation`
+
+```silk
+pub operation: TrustStoreOperation
+```
+
+The operation that failed.
+
+<a id="TrustSourceError.Store.code"></a>
+
+#### Field `code`
+
+```silk
+pub code: u32
+```
+
+The native unsigned error code.
 
 <a id="TrustSourceError.impl.Debug"></a>
 
@@ -620,4 +708,4 @@ trust wider.
 
 Category: TLS and certificates.
 
-Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`.
+Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`.

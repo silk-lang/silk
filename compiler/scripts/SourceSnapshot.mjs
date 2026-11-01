@@ -404,7 +404,10 @@ export const verifySnapshot = Effect.fn('SourceSnapshot.verifySnapshot')(
       const info = yield* fs.stat(target)
       if (
         info.type !== 'File' ||
-        (info.mode & 0o777) !== Number.parseInt(file.mode.slice(3), 8) ||
+        // NTFS has no POSIX executable mode. Canonical modes remain authenticated by the
+        // archived inputs and receipt digest; native Windows files are checked by type and bytes.
+        (process.platform !== 'win32' &&
+          (info.mode & 0o777) !== Number.parseInt(file.mode.slice(3), 8)) ||
         hash(yield* fs.readFile(target)) !== file.sha256
       )
         return yield* invalid(`Snapshot bytes or mode changed: ${file.path}`)

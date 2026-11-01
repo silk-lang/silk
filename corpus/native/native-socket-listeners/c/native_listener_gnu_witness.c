@@ -1,3 +1,4 @@
+#if defined(__linux__)
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -44,5 +45,6 @@ static int (*silk_poll_signature)(struct pollfd *, nfds_t, int) = poll;
 static int (*silk_setsockopt_signature)(int, int, int, const void *, socklen_t) = setsockopt;
 static int (*silk_getsockopt_signature)(int, int, int, void *, socklen_t *) = getsockopt;
 static int (*silk_close_signature)(int) = close;
+#endif
 #endif
 int silk_listener_gnu_witness(void) { return 42; }

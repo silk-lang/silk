@@ -100,6 +100,13 @@ export const loadProgram = (kind, name) => {
       readSource(path, origin),
     ]),
   )
+  const windowsDirectory = join(directory, 'windows-imports')
+  const windowsImports = Object.fromEntries(
+    filesUnder(windowsDirectory, '.def').map((path) => [
+      relative(windowsDirectory, path).slice(0, -'.def'.length).split(sep).join('/'),
+      readFileSync(path, 'utf8'),
+    ]),
+  )
   const reference = optional('reference.silk')
   return {
     name,
@@ -107,6 +114,7 @@ export const loadProgram = (kind, name) => {
     reference: reference === undefined ? undefined : expandSplices(reference, origin),
     imports,
     cSources,
+    windowsImports,
     stdout: optional('expected.stdout'),
     stderr: optional('expected.stderr'),
     outcome,

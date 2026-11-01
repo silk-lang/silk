@@ -1,0 +1,190 @@
+# Windows entry and host input slice
+
+## Native Silk execution evidence
+
+All 12 fixtures built by Silk in [run 41260286867](https://github.com/silk-lang/silk/actions/runs/41260286867)
+passed on Windows Server 2025 build 26100: both hello profiles, storage, host input, providers,
+filesystem, processes, three thread/atomic cases, source-trap diagnostics, and stderr locking.
+Source was `1063f6105`, N1 was built from `c6b2d2f8b`; no local relinking was needed for this run.
+The retained report is `.scratch/windows-cross-41260286867/native-results.json`. It also records
+the newer console fixture as not checked because that fixture was added after this artifact.
+
+The optimized hello program from source `b01c66ee5eb497f092bd46450626889dfd3b28d7`, built
+by N1 from `32fc7293a26fd5ae3d5e282a7e193cb8bbfb9d35`, passed on Windows Server 2025
+build 26100. It printed exactly `Hello from Silk: 💩` followed by LF, returned 0, and
+produced no stderr. PE imports were Kernel32 and Ntdll only. This is actual Silk compilation,
+linking, and native execution. [Cross-build run](https://github.com/silk-lang/silk/actions/runs/41257448061).
+The local native runner report is `.scratch/windows-cross-41257448061/native-results.json`.
+
+The later [run 41259150694](https://github.com/silk-lang/silk/actions/runs/41259150694), testing
+source `943142c73` with N1 from `67fdc3016`, produced unoptimized executables too. On this
+Windows Server 2025 machine, both hello profiles, storage, host input, providers, filesystem,
+thread spawn/join, cross-thread wake, and atomic wait/notify passed actual Silk execution.
+The raw host-input check required the corrected launcher to inherit Win32 environment storage:
+.NET Framework's custom-environment encoder replaced its lone surrogate before launch.
+
+The source-trap executable exposed mismatched COFF section flags. Relinking its unchanged Silk
+objects with corrected production boundary storage restored `main.main` in the report, retaining
+the trap reason and explicit fast-fail status. See [FRAMES.md](FRAMES.md). The full native report
+is `.scratch/windows-cross-41259150694/native-results.json`; its original host-input failure is
+superseded by rerunning `run-host.ps1` successfully. The later full build above supersedes the
+remaining runtime gaps from that earlier run.
+
+## Implementation
+
+This slice adds ordinary Silk source for synchronous `mainCRTStartup`, Windows process-heap
+allocations, command-line and environment capture, and standard-handle output. It shares the
+existing `NativeReport` and diagnostic observer. It does not install OS fault handlers, support
+parking, change filesystem/process APIs, supply a CRT, or change the native seed.
+
+The portable `windows-host-codecs` corpus case supplies literal UTF-16 tables and independently
+specified output bytes. Its assertions cover argv[0] quote rules, modern MSVC quoting, slash
+parity, empty arguments, unmatched quotes, raw surrogates, NUL rejection, canonical WTF-8
+boundaries, malformed encodings, and hidden environment-name separators. The parser is never
+tested solely by parsing its own argument encoder. The encoder has independent literal output
+oracles and a native process fixture in `../windows-process`.
+
+## Integration
+
+The Windows target/ABI work must supply `x86_64-pc-windows-msvc`, `libc = "system"`, Win64
+foreign calls, and COFF emission. The runtime composition selects `silk/platform/windows/start`.
+`hello.silk` is the small integration program. It uses `WindowsConsole` explicitly. The native
+writer providers and recursive stderr lock are described in [WRITERS.md](WRITERS.md).
+
+The shared harness builds hello with both `none` and `speed` optimization. The unoptimized
+program exercises emitted diagnostic frame support and split codegen units; the optimized
+program checks the production optimization path. Both must print the same UTF-8 bytes on Windows.
+
+Also cross-build `host-check.silk` and run `run-host.ps1 -Executable <host-check.exe>` once the
+runtime links. That fixture additionally imports `SetEnvironmentVariableW` for its child-local
+snapshot mutation check. The launcher supplies a fixed raw command line and a lone-surrogate
+environment value. It checks actual Silk argument parsing, case-insensitive raw lookup, snapshot
+stability, over-aligned storage, overflow refusal, and exact redirected output. Until it runs,
+those implementation claims remain not checked; the C OS-contract probe does not replace it.
+
+The linker owner must generate a Kernel32 import library for these exact names:
+
+```text
+ExitProcess
+GetProcessHeap
+HeapAlloc
+HeapFree
+GetCommandLineW
+GetEnvironmentStringsW
+FreeEnvironmentStringsW
+CompareStringOrdinal
+GetCurrentDirectoryW
+GetStdHandle
+GetConsoleMode
+GetLastError
+WriteFile
+WriteConsoleW
+```
+
+Link COFF with `/nodefaultlib /machine:x64 /subsystem:console /entry:mainCRTStartup` and an
+`.exe` output. Inspect PE imports to reject CRT imports. LLVM-emitted memory helpers, `__chkstk`,
+and `_fltused` remain with the linker/runtime-symbol owner, as established by the no-CRT proof
+in PR #2681. Sealed compiler allocation calls lower to process-heap APIs on Windows, including
+drop glue; source declarations named `malloc`, `realloc`, or `free` retain their authored linkage.
+
+System `Allocator` requests on Windows adopt a `HeapAlloc` allocation with a `HeapFree` reclaim
+callback, including alignment padding. They decline the libc-specific in-place growth path.
+Execution-storage reservations and diagnostic pools use `WindowsHeap.acquire` and
+`WindowsHeap.release`, retaining the shared reservation accounting.
+
+## Host contracts
+
+WTF-8 stays in byte APIs. Valid pairs in UTF-16 become one scalar; lone surrogates survive.
+Raw decoding rejects adjacent separately encoded high and low surrogates, overlong encodings,
+truncation, bad continuation bytes, and values above U+10FFFF. The codec preserves NUL; host
+command-line and environment-name boundaries reject it. `HostInput.text` still rejects lone surrogates.
+
+An empty command line produces one empty argv[0]. This is explicit and differs from Rust's
+current-executable fallback. Leading space/tab gives empty argv[0]. Only space and tab separate
+arguments. No wildcard expansion, shell parsing, or `CommandLineToArgvW` substitution occurs.
+
+Environment capture owns a copy and always releases `GetEnvironmentStringsW` storage, including
+on allocation failure. A leading `=` is part of a name, so `=C:=C:\work` is split after `=C:`.
+Malformed entries without a separator are ignored. Lookup validates canonical WTF-8 and NUL,
+uses `CompareStringOrdinal(..., TRUE)`, and selects the first matching snapshot entry. This uses
+Windows' case table, not ASCII folding or a locale-sensitive language transformation. Directory
+lookup returns the native Windows spelling as raw WTF-8. `WindowsPath` converts absolute names
+to the explicit `/C:/...` and `/UNC/server/share/...` machine namespace.
+
+Console output uses `GetConsoleMode` to distinguish real consoles from redirected handles.
+Redirected output preserves arbitrary bytes with `WriteFile`. A real console requires one complete
+canonical WTF-8 sequence per write and receives UTF-16 with `WriteConsoleW`; code pages do not change.
+Both paths handle partial writes and reject zero progress. Writes are not message-locked.
+
+## Validation limits
+
+`run-environment.ps1` builds and runs `environment-contract.c` with LLVM 22.1.8, without a CRT.
+It passed on this Windows host. The PE imports only Kernel32. This independent OS probe checks
+non-ASCII case matching against `GetEnvironmentVariableW`, ordinal no-expansion (`ß` versus `SS`),
+distinct capital/final sigma names, lone-surrogate values, and a snapshot retained across mutation.
+Mutation stays inside the short-lived probe process. Results and PE inspection are retained under
+`.scratch/windows-environment`. These assertions verify the OS premises, not Silk provider execution.
+
+The Windows-only source requires target integration before it can be type-checked and emitted.
+The portable corpus runs through existing Linux CI. No Windows execution, allocator failure
+injection, snapshot-lifetime execution, real-console readback, or Win32 child argument oracle is
+claimed solely from those portable tables. Run `hello.exe` both redirected and on a real console,
+then inspect PE imports and test the host provider before treating this slice as a Windows runtime.
+Generate `reference/stdlib` with `silk doc-reference --stdlib-root stdlib --output reference/stdlib`
+when a native Silk compiler is available. Its explicit profile enumeration in
+`compiler/src/documentation/Command.silk` also needs Windows for the combined target/runtime
+reference. The parent owns that compiler edit. No Linux/macOS workflow changes are required here.
+
+## Pinned upstream references
+
+These sources inform edge cases; their implementation is not used as a test oracle at runtime.
+
+- [Zig 0.15.2 `unicode.zig`, e4cbd752][zig]: the test at line 2013 explicitly shows that adjacent
+  separately encoded surrogate halves do not preserve bytes through UTF-16. Silk rejects those
+  noncanonical bytes instead of silently normalizing them.
+- [Rust 1.90.0 `wtf8.rs`, 1159e78c][rust-wtf8] and its [fixed tables][rust-wtf8-tests]: `from_wide`
+  preserves lone surrogates and combines valid pairs. `push_wtf8` also combines pairs formed at
+  concatenation boundaries. The corpus includes a lone high surrogate immediately before a valid pair.
+- [Rust Windows argument parser][rust-args] and its [fixed expectation tests][rust-args-tests]:
+  argv[0] is separate, and doubled quotes inside later quoted arguments follow post-2008 MSVC rules.
+- [Rust Windows environment iterator][rust-env]: search for the separator after the first code
+  unit to preserve hidden names that begin with `=`.
+- [Microsoft command-line rules][ms-args], [ordinal comparison][ms-compare], and
+  [WriteConsole][ms-console] supply the host contracts.
+
+[zig]: https://github.com/ziglang/zig/blob/e4cbd752c8c05f131051f8c873cff7823177d7d3/lib/std/unicode.zig#L2013
+[rust-wtf8]: https://github.com/rust-lang/rust/blob/1159e78c4747b02ef996e55082b704c09b970588/library/std/src/sys_common/wtf8.rs
+[rust-wtf8-tests]: https://github.com/rust-lang/rust/blob/1159e78c4747b02ef996e55082b704c09b970588/library/std/src/sys_common/wtf8/tests.rs
+[rust-args]: https://github.com/rust-lang/rust/blob/1159e78c4747b02ef996e55082b704c09b970588/library/std/src/sys/args/windows.rs
+[rust-args-tests]: https://github.com/rust-lang/rust/blob/1159e78c4747b02ef996e55082b704c09b970588/library/std/src/sys/args/windows/tests.rs
+[rust-env]: https://github.com/rust-lang/rust/blob/1159e78c4747b02ef996e55082b704c09b970588/library/std/src/sys/env/windows.rs
+[ms-args]: https://learn.microsoft.com/en-us/cpp/c-language/parsing-c-command-line-arguments
+[ms-compare]: https://learn.microsoft.com/en-us/windows/win32/api/stringapiset/nf-stringapiset-comparestringordinal
+[ms-console]: https://learn.microsoft.com/en-us/windows/console/writeconsole
+
+## Compiler floating remainder support
+
+The full Windows compiler exposed LLVM-generated `fmod` and `fmodf` references in its static
+evaluator. `WindowsLink.remainderSource` supplies exact integer long division of the binary
+significands, including subnormal operands and signed zero; invalid operands produce NaN.
+Its only undefined object symbol is `_fltused`, supplied by the existing TLS support object.
+
+Run `remainder-proof.ps1` to compile that production source and compare it with the Windows UCRT
+math functions. The oracle dynamically loads UCRT only in the test; production does not link it.
+The native check passed on Server 2025 with LLVM 22.1.8: IEEE boundary cross products and 20,000
+deterministic bit-pattern pairs for each precision. This is C helper execution, not yet proof of
+the full Silk compiler's execution. The compiler-native CI job repeats it before running Silk.
+
+## Native compiler milestone
+
+On Server 2025 with LLVM 22.1.8, the cross-built compiler from `e49e68fdf` built the compiler
+sources at `851eee55f` natively. The resulting compiler built and executed Unicode hello, checked
+the compiler package, and built and ran the Windows codecs/path and resolver fixtures.
+Both compiler generations then emitted identical LLVM IR for the compiler at `851eee55f`:
+SHA-256 `e316eda9a051fde29e65dd37deb4cd78fee27d421ed5cbea1b8e3b6af8744a19`.
+Local commands and results remain under `.scratch/windows-local-n2.log`,
+`.scratch/windows-local-n2-smoke`, and `.scratch/windows-local-fixpoint.json`.
+
+`run-compiler.ps1 -SelfHost` repeats the native build, generation IR comparison and next-generation
+hello execution in CI. It uses the same checked-out source for both emissions. The source-build
+CLI requires `-o` directly after the source argument; the runner preserves that ordering.

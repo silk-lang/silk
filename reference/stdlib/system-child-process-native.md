@@ -24,7 +24,12 @@ child, so no zombie process stays.
 - A trap in the parent can leave resources open.
 - On GNU/Linux, if the child cannot start and also cannot report why, the outcome looks like an
   exit with code 127.
-- The provider exists only on Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+- The provider exists on Windows x86_64 MSVC, Darwin aarch64, and Linux with GNU libc on
+  x86_64 or aarch64. Windows needs no CRT.
+- Windows executable and working-directory paths use `/C:/...` or `/UNC/...`. Raw values use
+  canonical WTF-8. Batch files and case-insensitive duplicate environment names are refused.
+  Only standard handles are inherited. Remaining descendants are terminated when the child ends.
+  Every exit-status bit survives in the signed `i32`; high values alone do not establish a crash.
 
 ## Examples
 ### Run echo
@@ -101,6 +106,11 @@ stays.
 - A trap in the parent can leave resources open.
 - On GNU/Linux, if the child cannot start and also cannot report why, the outcome looks like
   an exit with code 127.
+- Windows paths use `/C:/...` or `/UNC/...`, and host values use canonical WTF-8. Batch files
+  and case-insensitive duplicate environment names are invalid requests. Only the three
+  standard handles are inherited; stdin receives EOF. The child runs in a kill-on-close job,
+  and any remaining descendants are terminated when it ends or capture fails. A completed
+  exit retains all 32 bits as `i32`, without inferring a crash from an NTSTATUS-shaped value.
 
 <a id="OsChildProcess.impl"></a>
 
@@ -139,4 +149,4 @@ execute: OsChildProcess.execute
 
 Category: System.
 
-Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`.
+Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`.

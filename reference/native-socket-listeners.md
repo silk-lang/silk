@@ -7,8 +7,9 @@ description: Scoped nonblocking TCP and pathname-Unix listeners with owned accep
 
 `silk.net.socket_native` creates one affine listening descriptor and admits one independently owned
 connection at a time. The actor is ordinary selected Silk source: it is available on aarch64 Darwin
-with Apple system libc and on aarch64 or x86-64 GNU/Linux with glibc. It is absent on Windows, musl,
-no-libc profiles, and WebAssembly.
+with Apple system libc, aarch64 or x86-64 GNU/Linux with glibc, and x86-64 Windows with system
+libraries. It is absent on musl, no-libc profiles, and WebAssembly. Windows listeners support
+TCP; `listenUnix` reports `FamilyUnsupported`.
 
 Use `Listener.boundAddress` after `listen` to observe the actual numeric endpoint. This matters when
 the requested port is zero: the kernel-assigned nonzero port is published only after `bind`,
@@ -128,6 +129,9 @@ listener setup distinguishes only `AddressInUse`, `PermissionDenied`, `FamilyUns
 `SystemResources`; every other listener failure retains its exact `NativeSocketOperation` and
 signed errno. In particular, connection-oriented errno values are not collapsed while creating or
 accepting a listener.
+On Windows, native socket failures retain `WSAGetLastError` values. Removing handle inheritance
+uses `SetHandleInformation` and retains its `GetLastError` value under the inheritance operation.
+Listeners and accepted connections each own a Winsock reference and a full 64-bit `SOCKET`.
 Acceptance additionally reports `Timeout`, `Closed`, `InvalidNativeAddress`, or
 `UnsupportedPeerAddress`. Once an `Accepted` value transfers, byte I/O continues to use the
 existing `ByteIoError` contract rather than widening it with listener failures.

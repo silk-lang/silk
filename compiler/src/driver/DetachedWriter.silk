@@ -10,8 +10,12 @@
 //! The copy holds an exclusive `flock` on the cache file's lock file until it exits. A writer takes
 //! that lock before it forks, so two writes of one file never overlap, and a reader waits on it
 //! ([`waitFor`]) before it reads the file, so a build never reads an older image than the last
-//! build left. A write that does not fork, such as a check's, holds the same lock. On a host
-//! without `fork` and `flock` every write runs in the process that asked for it.
+//! build left. A write that does not fork holds the same lock. Windows writes in the calling
+//! process under a synchronous `LockFileEx` byte-range lock. A detached relaunch would have to
+//! reconstruct the live semantic store before assembling its image; native measurements found
+//! reconstruction slower than the write it would defer. The opt-in measurement and its limits
+//! are recorded in `compiler/fixtures/windows-runtime/CACHE-WRITER.md`. Other hosts without these
+//! APIs also write in the process that asked for it.
 
 import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.collections.bytes {Bytes}
@@ -150,6 +154,79 @@ static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOpera
     drop held
   }
 } else {
+static if Intrinsic.targetOperatingSystem() == "windows" {
+  import silk.platform.windows.host_path as WindowsHostPath
+  import silk.collections.list {List}
+  import silk.num.usize
+
+  extern "C" struct Overlapped {
+    internal: usize, transferred: usize, offset: u32, offsetHigh: u32, event: ?*mut u8,
+  }
+  @foreign(noCapture: ("name", "security"))
+  unsafe extern "C" fn CreateFileW(name: ?[*]const u16, access: u32, sharing: u32, security: ?*mut u8, creation: u32, flags: u32, template: ?*mut u8) -> ?*mut u8
+  unsafe extern "C" fn CloseHandle(handle: ?*mut u8) -> i32
+  @foreign(noCapture: ("overlapped",))
+  unsafe extern "C" fn LockFileEx(handle: ?*mut u8, flags: u32, reserved: u32, low: u32, high: u32, overlapped: *mut Overlapped) -> i32
+  unsafe extern "C" fn ExitProcess(status: u32) -> ()
+
+  /// A cache lock held on a synchronous Windows file handle; closing the handle releases it.
+  pub struct Held { handle: ?*mut u8 }
+  impl Drop for Held {
+    fn drop(self: &mut Held) -> () { let closed = unsafe CloseHandle(self.handle) }
+  }
+
+  /// The process that owns the cache write. Windows writes synchronously under the lock here.
+  pub union Handoff {
+    /// The writer runs in another process.
+    Original,
+    /// A copied process owns the lock.
+    Copy {pub held: Held},
+    /// The calling process owns the lock and writes before returning.
+    Here {pub held: Held},
+  }
+
+  effect fn acquire(lock: &Path, write: bool) -> Option<Held> ! OutOfMemoryError ? &mut Allocator {
+    let name = match move run WindowsHostPath.wide(lock) {
+      Option<List<u16>>.Some {value} => move value
+      Option<List<u16>>.None => { return Option<Held>.none() }
+    }
+    let access: u32 = if write { 3221225472 } else { 2147483648 }
+    let creation: u32 = if write { 4 } else { 3 }
+    // Keep the lock file's identity stable: readers and writers share access, but not deletion.
+    let raw = unsafe CreateFileW(Pointer.fromSlice(List<u16>.asSlice(&name)), access, 3,
+      Pointer.null<u8>(), creation, 128, Pointer.null<u8>())
+    if Pointer.isNull(raw) || Pointer.address(raw) == usize.MAX { return Option<Held>.none() }
+    let held = Held {handle: raw}
+    let mut position = Overlapped { internal: 0, transferred: 0, offset: 0, offsetHigh: 0, event: Pointer.null<u8>() }
+    let flags: u32 = if write { 2 } else { 0 }
+    // The handle is synchronous. Omitting FAIL_IMMEDIATELY waits for the prior writer; the
+    // OVERLAPPED remains borrowed until completion and no event or pending I/O escapes.
+    if unsafe LockFileEx(raw, flags, 0, 1, 0, Pointer.fromMutRef(&mut position)) == 0 { return Option<Held>.none() }
+    return Option<Held>.some(move held)
+  }
+
+  /// Waits for an exclusive cache lock. Returns None when opening or locking the file fails.
+  pub effect fn hold(lock: &Path) -> Option<Held> ! OutOfMemoryError ? &mut Allocator {
+    return run acquire(lock, true)
+  }
+
+  /// Retains the Windows lock in this process while the cache is written.
+  pub fn handOff(held: Held) -> Handoff { return Handoff.Here {held: move held} }
+
+  /// Exits a writer process after releasing its lock.
+  pub fn finish(held: Held) -> never {
+    drop held
+    unsafe ExitProcess(0)
+    Intrinsic.trap("ExitProcess returned")
+  }
+
+  /// Waits for the cache's writer using a shared byte-range lock, then releases the reader handle.
+  /// A missing or inaccessible lock file returns immediately.
+  pub effect fn waitFor(lock: &Path) -> () ! OutOfMemoryError ? &mut Allocator {
+    let held = run acquire(lock, false)
+    drop held
+  }
+} else {
   /// The lock on one cache file's lock file; this host takes none.
   pub struct Held {}
 
@@ -182,4 +259,6 @@ static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOpera
   pub effect fn waitFor(lock: &Path) -> () ! OutOfMemoryError ? &mut Allocator {
     return ()
   }
+}
+
 }

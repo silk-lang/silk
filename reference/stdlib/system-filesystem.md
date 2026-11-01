@@ -316,6 +316,28 @@ computes the path. It does not access the file system, so it does not follow lin
   empty component such as `"a//b"`, or goes above the root.
 - `OutOfMemoryError` if the `Allocator` cannot supply the path.
 
+<a id="Path.impl.resolveBytes"></a>
+
+### Associated function `resolveBytes`
+
+```silk
+pub effect fn resolveBytes(base: &Path, relative: &[u8]) -> Path
+  ! FileError | OutOfMemoryError ? &mut Allocator
+```
+
+Resolves relative host bytes against `base` without interpreting their text encoding.
+
+#### Details
+
+`/` separates components. `.` keeps the path and `..` removes one component. Empty bytes
+and a trailing separator are accepted. Other bytes are preserved without accessing files.
+
+#### Errors
+
+- `FileError` with `InvalidPath` for a leading `/`, NUL, empty interior component, or a
+  parent component that would leave the root.
+- `OutOfMemoryError` if the result cannot be allocated.
+
 <a id="Path.impl.parent"></a>
 
 ### Method `parent`
@@ -816,7 +838,7 @@ With [`FileSystem.synchronized`](#FileSystem.impl.synchronized), the provider sy
 rename and the directory after it. This is normal file system synchronization. It does not
 protect against hardware caches that lose data at power loss.
 
-A native provider creates a new file with mode `0666` minus the process umask. The new file
+A Unix provider creates a new file with mode `0666` minus the process umask. Windows inherits permissions. The new file
 does not keep the mode, owner, ACLs, extended attributes, or hard links of the old file.
 
 #### Errors
@@ -1561,4 +1583,4 @@ The path of the directory.
 
 Category: System.
 
-Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`.
+Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`.

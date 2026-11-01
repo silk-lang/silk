@@ -117,6 +117,8 @@ struct Writer {
   fastPath: bool,
   /// The target's address width in bits.
   pointerBits: usize,
+  /// Whether coalesced definitions need explicit COFF COMDAT groups.
+  coff: bool,
   /// The function being built: each MIR local's storage address, each failure slot's context
   /// companion address (`none()` for a slot without one), and each MIR block's handle.
   slots: List<u64>,
@@ -201,13 +203,15 @@ impl Copy for CallerCopy {}
 impl Copy for DropCopy {}
 
 effect fn writerFor(target: &Target, fastPath: bool) -> Writer ! OutOfMemoryError ? &mut Allocator {
-  return run writerOfWidth(u32.toUsize(Target.pointerBits(target)), fastPath)
+  let mut writer = run writerOfWidth(u32.toUsize(Target.pointerBits(target)), fastPath)
+  writer.coff = same(Target.objectFormat(target), b"coff")
+  return move writer
 }
 
 // A writer for a target whose addresses are `pointerBits` wide; zero for declarations, which use none.
 effect fn writerOfWidth(pointerBits: usize, fastPath: bool) -> Writer ! OutOfMemoryError ? &mut Allocator {
   return Writer {module: Module.make(), located: usize.ZERO, symbol: Bytes.make(), lines: List<u64>.make(), trap: Option<TrapReport>.none(), fastPath: fastPath,
-    pointerBits: pointerBits, slots: List<u64>.make(), companions: List<u64>.make(),
+    pointerBits: pointerBits, coff: false, slots: List<u64>.make(), companions: List<u64>.make(),
     blocks: List<u64>.make(), scalars: List<bool>.make(), alignments: List<usize>.make(), copies: List<CallerCopy>.make(), dropCopies: List<DropCopy>.make(), parameters: List<u64>.make(), extras: List<u64>.make(), providers: List<u64>.make(),
     out: Bitcode.none(), failure: Bitcode.none(), context: Bitcode.none(), observer: Bitcode.none(), cause: Bitcode.none(),
     site: Bitcode.none(), transfer: Bitcode.none(), frame: Bitcode.none(), threaded: List<bool>.make(), cold: List<bool>.make(),
@@ -1020,9 +1024,10 @@ pub effect fn declarations(target: &Target, fastPath: bool) -> Bytes ! OutOfMemo
     run defineFrameReport(&mut writer, target)
     run defineStepChain(&mut writer, target)
     if unwinds(target) { run defineFrameStep(&mut writer, target) }
+    if same(Target.operatingSystem(target), b"windows") { run defineWindowsFrameWalk(&mut writer, target) }
   }
-  run defineForeignPersonality(&mut writer)
-  run defineGuardedReclaim(&mut writer)
+  run defineForeignPersonality(&mut writer, target)
+  run defineGuardedReclaim(&mut writer, target)
   return run Module.serialize(&writer.module)
 }
 
@@ -1030,7 +1035,7 @@ pub effect fn declarations(target: &Target, fastPath: bool) -> Bytes ! OutOfMemo
 // context)` calls `reclaim(context)` under the foreign personality. Allocation drop glue calls it
 // instead of guarding itself, so the glue, whose usual path is a tag check and `free`, stays
 // inlinable and the value it drops need not stay in memory (#2507).
-effect fn defineGuardedReclaim(writer: &mut Writer) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn defineGuardedReclaim(writer: &mut Writer, target: &Target) -> () ! OutOfMemoryError ? &mut Allocator {
   let void = run voidType(&mut writer.*)
   let pointer = run pointerType(&mut writer.*)
   let parameters = [pointer, pointer]
@@ -1041,7 +1046,7 @@ effect fn defineGuardedReclaim(writer: &mut Writer) -> () ! OutOfMemoryError ? &
   run Module.attributeGroup(&mut writer.*.module, Bitcode.positionFunction(), List<u64>.asSlice(&encoding))
   let attributes = run Module.endAttributes(&mut writer.*.module)
   let function = run Module.defineFunction(&mut writer.*.module, b"__silk_guarded_reclaim", ty, Bitcode.linkInternal(), attributes)
-  run guard(&mut writer.*, function)
+  run guard(&mut writer.*, target, function)
   let names = [Bitcode.plain(Bitcode.prefix(b"reclaim")), Bitcode.plain(Bitcode.prefix(b"context"))]
   run Module.beginBody(&mut writer.*.module, function, &parameters, &names)
   let entry = run Module.block(&mut writer.*.module, Bitcode.plain(Bitcode.prefix(b"entry")))
@@ -1053,26 +1058,55 @@ effect fn defineGuardedReclaim(writer: &mut Writer) -> () ! OutOfMemoryError ? &
   return run Module.endBody(&mut writer.*.module)
 }
 
-// The personality of every foreign guard: it terminates during either unwind phase. Every unit
-// defines it, as a hidden `linkonce_odr` function, so a link keeps one copy per image. Mach-O's
-// compact unwind encodes at most three personalities, and private copies count one each (#2547).
-effect fn defineForeignPersonality(writer: &mut Writer) -> () ! OutOfMemoryError ? &mut Allocator {
+// The target's handler ABI, shared by definitions and every guard reference.
+effect fn foreignPersonalitySignature(writer: &mut Writer, target: &Target) -> Signature
+! OutOfMemoryError ? &mut Allocator {
+  let mut parameters = signature()
   let int32 = run integerType(&mut writer.*, 32)
   let int64 = run integerType(&mut writer.*, 64)
   let pointer = run pointerType(&mut writer.*)
-  let parameters = [int32, int32, int64, pointer, pointer]
-  let ty = run functionType(&mut writer.*, int32, &parameters)
+  if same(Target.operatingSystem(target), b"windows") {
+    // Microsoft's x64 PEXCEPTION_ROUTINE: record, ULONG64 frame, context, dispatcher.
+    drop run addParameter(&mut parameters, pointer, Bitcode.plain(Bitcode.prefix(b"exception")))
+    drop run addParameter(&mut parameters, int64, Bitcode.plain(Bitcode.prefix(b"frame")))
+    drop run addParameter(&mut parameters, pointer, Bitcode.plain(Bitcode.prefix(b"context")))
+    drop run addParameter(&mut parameters, pointer, Bitcode.plain(Bitcode.prefix(b"dispatch")))
+  } else {
+    drop run addParameter(&mut parameters, int32, Bitcode.plain(Bitcode.prefix(b"version")))
+    drop run addParameter(&mut parameters, int32, Bitcode.plain(Bitcode.prefix(b"actions")))
+    drop run addParameter(&mut parameters, int64, Bitcode.plain(Bitcode.prefix(b"class")))
+    drop run addParameter(&mut parameters, pointer, Bitcode.plain(Bitcode.prefix(b"exception")))
+    drop run addParameter(&mut parameters, pointer, Bitcode.plain(Bitcode.prefix(b"context")))
+  }
+  return move parameters
+}
+
+// The personality terminates during either unwind phase. Every unit defines a hidden coalesced
+// function; Mach-O compact unwind permits at most three personalities (#2547).
+effect fn defineForeignPersonality(writer: &mut Writer, target: &Target) -> () ! OutOfMemoryError ? &mut Allocator {
+  let int32 = run integerType(&mut writer.*, 32)
+  let parameters = run foreignPersonalitySignature(&mut writer.*, target)
+  let ty = run functionType(&mut writer.*, int32, List<u64>.asSlice(&parameters.types))
   Module.beginAttributes(&mut writer.*.module)
   let encoding: [u64; 6] = [0, Bitcode.attrNoInline(), 0, Bitcode.attrNoUnwind(), 0, Bitcode.attrNoReturn()]
   run Module.attributeGroup(&mut writer.*.module, Bitcode.positionFunction(), &encoding)
   let attributes = run Module.endAttributes(&mut writer.*.module)
+  let windows = same(Target.operatingSystem(target), b"windows")
   let function = run Module.defineFunction(&mut writer.*.module, b"__silk_foreign_personality", ty, Bitcode.linkLinkOnceOdr(), attributes)
   Module.setHidden(&mut writer.*.module, function)
-  let names = [Bitcode.plain(Bitcode.prefix(b"version")), Bitcode.plain(Bitcode.prefix(b"actions")), Bitcode.plain(Bitcode.prefix(b"class")),
-    Bitcode.plain(Bitcode.prefix(b"exception")), Bitcode.plain(Bitcode.prefix(b"context"))]
-  run Module.beginBody(&mut writer.*.module, function, &parameters, &names)
+  if windows { Module.setComdat(&mut writer.*.module, function) }
+  run Module.beginBody(&mut writer.*.module, function, List<u64>.asSlice(&parameters.types), List<u64>.asSlice(&parameters.names))
   let entry = run Module.block(&mut writer.*.module, Bitcode.plain(Bitcode.prefix(b"entry")))
-  run trapHere(&mut writer.*)
+  if windows {
+    // A dispatchable trap inside SEH can recursively fault. __fastfail(FAST_FAIL_FATAL_APP_EXIT)
+    // terminates without invoking another exception handler; Clang emits this exact x64 boundary.
+    let void = run voidType(&mut writer.*)
+    let arguments = [run integerOf(&mut writer.*, 32, 7)]
+    let fastFailType = run functionType(&mut writer.*, void, &[int32])
+    let fastFail = run Module.inlineAssembly(&mut writer.*.module, fastFailType, b"int $$0x29", b"{cx}", 1)
+    drop run Module.call(&mut writer.*.module, fastFailType, fastFail, &arguments, 0, false)
+    run Module.unreachable(&mut writer.*.module)
+  } else { run trapHere(&mut writer.*) }
   return run Module.endBody(&mut writer.*.module)
 }
 
@@ -1200,7 +1234,11 @@ effect fn defineFatalDispatch(writer: &mut Writer, target: &Target, frames: bool
     let innermost = run loadPointer(&mut writer.*, active, word)
     let stepsSlot = run byteOffset(&mut writer.*, walk, word * 6)
     run Module.store(&mut writer.*.module, innermost, stepsSlot, usize.toU64(word), false)
-    if unwinds(target) {
+    if same(Target.operatingSystem(target), b"windows") {
+      let walkParameters = [pointer]
+      let walkArguments = [walk]
+      drop run callNamed(&mut writer.*, b"silk.diagnostic.windows.walk", void, &walkParameters, &walkArguments)
+    } else if unwinds(target) {
       let int32 = run integerType(&mut writer.*, 32)
       let stepParameters = [pointer, pointer]
       let stepType = run functionType(&mut writer.*, int32, &stepParameters)
@@ -1254,6 +1292,7 @@ fn unwinds(target: &Target) -> bool {
 // The section of the frame table, and the symbols the linker defines at its bounds.
 fn framesSection(target: &Target) -> &'static [u8] {
   if same(Target.objectFormat(target), b"macho") { return b"__DATA,__silk_frames" }
+  if same(Target.objectFormat(target), b"coff") { return b".silk$M" }
   return b"silk_frames"
 }
 
@@ -1302,10 +1341,13 @@ effect fn defineFrameStep(writer: &mut Writer, target: &Target) -> () ! OutOfMem
   let exhausted = run compareOf(&mut writer.*, Bitcode.intUgt(), count, limit)
   run branchIf(&mut writer.*, exhausted, stop, lookup)
   startBlock(&mut writer.*, lookup)
-  let startParameters = [pointer]
-  let startArguments = [context]
-  let start = run callNamed(&mut writer.*, b"_Unwind_GetRegionStart", wordTy, &startParameters, &startArguments)
-  let code = run Module.cast(&mut writer.*.module, Bitcode.castIntToPtr(), start, pointer)
+  let mut code = context
+  if !same(Target.operatingSystem(target), b"windows") {
+    let startParameters = [pointer]
+    let startArguments = [context]
+    let start = run callNamed(&mut writer.*, b"_Unwind_GetRegionStart", wordTy, &startParameters, &startArguments)
+    code = run Module.cast(&mut writer.*.module, Bitcode.castIntToPtr(), start, pointer)
+  }
   Module.setName(&mut writer.*.module, code, Bitcode.plain(Bitcode.prefix(b"code")))
   let named = run callFrameName(&mut writer.*, code)
   let stepsSlot = run byteOffset(&mut writer.*, walk, word * 6)
@@ -1342,6 +1384,81 @@ effect fn defineFrameStep(writer: &mut Writer, target: &Target) -> () ! OutOfMem
   return run Module.endBody(&mut writer.*.module)
 }
 
+// Windows unwinds the machine stack using its own function tables. Capture at most 256 physical
+// frames; the common reporter independently limits named Silk frames to 64. RUNTIME_FUNCTION's
+// BeginAddress is an image-relative u32. Subtract one from a return PC before lookup so a return
+// immediately past the caller's last instruction still belongs to that caller. Leaf frames
+// without unwind metadata have no known entry address and cannot match the exact-entry table.
+effect fn defineWindowsFrameWalk(writer: &mut Writer, target: &Target) -> () ! OutOfMemoryError ? &mut Allocator {
+  let pointer = run pointerType(&mut writer.*)
+  let word = run integerType(&mut writer.*, 64)
+  let int32 = run integerType(&mut writer.*, 32)
+  let int16 = run integerType(&mut writer.*, 16)
+  let void = run voidType(&mut writer.*)
+  let parameters = [pointer]
+  let ty = run functionType(&mut writer.*, void, &parameters)
+  let attributes = run diagnosticAttributes(&mut writer.*)
+  let function = run Module.defineFunction(&mut writer.*.module, b"silk.diagnostic.windows.walk", ty, Bitcode.linkInternal(), attributes)
+  let names = [Bitcode.plain(Bitcode.prefix(b"walk"))]
+  run Module.beginBody(&mut writer.*.module, function, &parameters, &names)
+  let walk = Bitcode.local(0)
+  let entry = run labelled(&mut writer.*, b"entry")
+  let scan = run labelled(&mut writer.*, b"scan")
+  let lookup = run labelled(&mut writer.*, b"lookup")
+  let report = run labelled(&mut writer.*, b"report")
+  let advance = run labelled(&mut writer.*, b"advance")
+  let done = run labelled(&mut writer.*, b"done")
+  startBlock(&mut writer.*, entry)
+  let array = run Module.array(&mut writer.*.module, 256, pointer)
+  let frames = run Module.alloca(&mut writer.*.module, array, 8)
+  let baseSlot = run Module.alloca(&mut writer.*.module, word, 8)
+  let zero = run Module.zero(&mut writer.*.module, word)
+  let one = run Module.int(&mut writer.*.module, word, 1)
+  let null = run nullOf(&mut writer.*)
+  let skip = run Module.int(&mut writer.*.module, int32, 1)
+  let capacity = run Module.int(&mut writer.*.module, int32, 256)
+  let captureParameters = [int32, int32, pointer, pointer]
+  let captureArguments = [skip, capacity, frames, null]
+  let captured = run callNamed(&mut writer.*, b"RtlCaptureStackBackTrace", int16, &captureParameters, &captureArguments)
+  let count = run Module.cast(&mut writer.*.module, Bitcode.castZExt(), captured, word)
+  run branch(&mut writer.*, scan)
+  startBlock(&mut writer.*, scan)
+  let following = run Module.reserve(&mut writer.*.module)
+  let incoming = [zero, entry, following, advance]
+  let index = run Module.phi(&mut writer.*.module, word, &incoming)
+  let more = run compareOf(&mut writer.*, Bitcode.intUlt(), index, count)
+  run branchIf(&mut writer.*, more, lookup, done)
+  startBlock(&mut writer.*, lookup)
+  let indices = [index]
+  let slot = run Module.gep(&mut writer.*.module, 0, pointer, frames, &indices)
+  let address = run Module.load(&mut writer.*.module, word, slot, 8, false)
+  let pc = run binaryOf(&mut writer.*, Bitcode.opSub(), address, one)
+  let lookupParameters = [word, pointer, pointer]
+  let lookupArguments = [pc, baseSlot, null]
+  let runtimeFunction = run callNamed(&mut writer.*, b"RtlLookupFunctionEntry", pointer, &lookupParameters, &lookupArguments)
+  let known = run compareOf(&mut writer.*, Bitcode.intNe(), runtimeFunction, null)
+  run branchIf(&mut writer.*, known, report, advance)
+  startBlock(&mut writer.*, report)
+  let relative = run Module.load(&mut writer.*.module, int32, runtimeFunction, 4, false)
+  let offset = run Module.cast(&mut writer.*.module, Bitcode.castZExt(), relative, word)
+  let base = run Module.load(&mut writer.*.module, word, baseSlot, 8, false)
+  let absolute = run binaryOf(&mut writer.*, Bitcode.opAdd(), base, offset)
+  let code = run Module.cast(&mut writer.*.module, Bitcode.castIntToPtr(), absolute, pointer)
+  let stepParameters = [pointer, pointer]
+  let stepArguments = [code, walk]
+  let result = run callNamed(&mut writer.*, b"silk.diagnostic.frame", int32, &stepParameters, &stepArguments)
+  let success = run Module.zero(&mut writer.*.module, int32)
+  let continuing = run compareOf(&mut writer.*, Bitcode.intEq(), result, success)
+  run branchIf(&mut writer.*, continuing, advance, done)
+  startBlock(&mut writer.*, advance)
+  let after = run binaryOf(&mut writer.*, Bitcode.opAdd(), index, one)
+  Module.bind(&mut writer.*.module, following, after)
+  run branch(&mut writer.*, scan)
+  startBlock(&mut writer.*, done)
+  run Module.retVoid(&mut writer.*.module)
+  return run Module.endBody(&mut writer.*.module)
+}
+
 // The attributes of the frame walk's helpers: never inlined, and cold.
 effect fn diagnosticAttributes(writer: &mut Writer) -> u64 ! OutOfMemoryError ? &mut Allocator {
   Module.beginAttributes(&mut writer.*.module)
@@ -1371,8 +1488,17 @@ effect fn defineFrameName(writer: &mut Writer, target: &Target) -> () ! OutOfMem
   let missing = run labelled(&mut writer.*, b"missing")
   startBlock(&mut writer.*, entry)
   let entryType = run Module.pair(&mut writer.*.module, pointer, pointer)
-  let first = run Module.declareWeakObject(&mut writer.*.module, framesStart(target), entryType)
-  let last = run Module.declareWeakObject(&mut writer.*.module, framesStop(target), entryType)
+  // COFF supplies real boundary objects in the support object. extern_weak would synthesize
+  // per-unit aliases for these names and collide when the unoptimized units are linked.
+  let mut first: u64 = 0
+  let mut last: u64 = 0
+  if same(Target.objectFormat(target), b"coff") {
+    first = run Module.declareObject(&mut writer.*.module, framesStart(target), entryType)
+    last = run Module.declareObject(&mut writer.*.module, framesStop(target), entryType)
+  } else {
+    first = run Module.declareWeakObject(&mut writer.*.module, framesStart(target), entryType)
+    last = run Module.declareWeakObject(&mut writer.*.module, framesStop(target), entryType)
+  }
   run branch(&mut writer.*, scan)
   startBlock(&mut writer.*, scan)
   let following = run Module.reserve(&mut writer.*.module)
@@ -4494,8 +4620,12 @@ fn sealedCall(callee: &Callee) -> Option<CFunction> {
 // Calls a sealed C allocator function: `memmove` and `memset` as LLVM's intrinsics, which LLVM
 // expands inline for a small or constant length, and `malloc` and `free` as plain calls. Returns
 // the result value, the destination for `memmove` and `memset`.
-effect fn emitSealedCall(writer: &mut Writer, selected: CFunction, functionTy: u64, callee: u64,
+effect fn emitSealedCall(writer: &mut Writer, target: &Target, selected: CFunction, functionTy: u64, callee: u64,
   passed: &[u64], attributes: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  if same(Target.operatingSystem(target), b"windows") &&
+    (selected == CFunction.Malloc || selected == CFunction.Free || selected == CFunction.Realloc) {
+    return run emitWindowsHeapCall(&mut writer.*, selected, passed)
+  }
   if !writer.fastPath && selected == CFunction.Memmove {
     let void = run voidType(&mut writer.*)
     let pointer = run pointerType(&mut writer.*)
@@ -4532,6 +4662,40 @@ effect fn emitSealedCall(writer: &mut Writer, selected: CFunction, functionTy: u
     return passed[0]
   }
   return run Module.call(&mut writer.*.module, functionTy, callee, passed, attributes, false)
+}
+
+// Only compiler-authenticated storage operations reach this lowering. Source foreign declarations
+// retain their declared symbols. MIR has already checked sizes and alignment; the process heap
+// supplies the raw reservation, while source allocators retain adoption and reclamation policy.
+effect fn emitWindowsHeapCall(writer: &mut Writer, selected: CFunction, passed: &[u64]) -> u64
+! OutOfMemoryError ? &mut Allocator {
+  let pointer = run pointerType(&mut writer.*)
+  let int32 = run integerType(&mut writer.*, 32)
+  let bits = writer.pointerBits
+  let word = run integerType(&mut writer.*, bits)
+  let empty: [u64; 0] = []
+  let heap = run callNamed(&mut writer.*, b"GetProcessHeap", pointer, &empty, &empty)
+  let flags = run Module.zero(&mut writer.*.module, int32)
+  if selected == CFunction.Malloc {
+    return run callNamed(&mut writer.*, b"HeapAlloc", pointer, &[pointer, int32, word], &[heap, flags, passed[0]])
+  }
+  // lowerBufferResize admits only a nonzero system context and a positive growing extent.
+  // HeapReAlloc's failure preserves that reservation; MIR publishes a new owner only on success.
+  if selected == CFunction.Realloc {
+    return run callNamed(&mut writer.*, b"HeapReAlloc", pointer, &[pointer, int32, pointer, word], &[heap, flags, passed[0], passed[1]])
+  }
+  let null = run nullOf(&mut writer.*)
+  let absent = run compareOf(&mut writer.*, Bitcode.intEq(), passed[0], null)
+  let heldName = freshName(&mut writer.*, Bitcode.prefixValue())
+  let heldBlock = run Module.newBlock(&mut writer.*.module, heldName)
+  let doneName = freshName(&mut writer.*, Bitcode.prefixValue())
+  let done = run Module.newBlock(&mut writer.*.module, doneName)
+  run branchIf(&mut writer.*, absent, done, heldBlock)
+  startBlock(&mut writer.*, heldBlock)
+  drop run callNamed(&mut writer.*, b"HeapFree", int32, &[pointer, int32, pointer], &[heap, flags, passed[0]])
+  run branch(&mut writer.*, done)
+  startBlock(&mut writer.*, done)
+  return Bitcode.none()
 }
 
 effect fn emitCCall(writer: &mut Writer, function: &MirFunction, target: &Target,
@@ -4631,7 +4795,7 @@ effect fn emitCCall(writer: &mut Writer, function: &MirFunction, target: &Target
   let attributes = run cAttributes(&mut writer.*, signature, false)
   let mut result = Bitcode.none()
   if let Option<CFunction>.Some {value: selected} = sealedCall(callee) {
-    result = run emitSealedCall(&mut writer.*, selected, functionTy, invoked, List<u64>.asSlice(&passed), attributes)
+    result = run emitSealedCall(&mut writer.*, target, selected, functionTy, invoked, List<u64>.asSlice(&passed), attributes)
   } else if guardedReclaim(function, callee) {
     if List<u64>.length(&passed) != usize.ONE || hasResult { fail Gap.relative(GapCode.ForeignAbi, &owner, span) }
     let void = run voidType(&mut writer.*)
@@ -5773,12 +5937,10 @@ effect fn guardAttributes(encoding: &mut List<u64>) -> () ! OutOfMemoryError ? &
 }
 
 // Gives the function being defined the foreign personality.
-effect fn guard(writer: &mut Writer, defined: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn guard(writer: &mut Writer, target: &Target, defined: u64) -> () ! OutOfMemoryError ? &mut Allocator {
   let int32 = run integerType(&mut writer.*, 32)
-  let int64 = run integerType(&mut writer.*, 64)
-  let pointer = run pointerType(&mut writer.*)
-  let parameters = [int32, int32, int64, pointer, pointer]
-  let ty = run functionType(&mut writer.*, int32, &parameters)
+  let parameters = run foreignPersonalitySignature(&mut writer.*, target)
+  let ty = run functionType(&mut writer.*, int32, List<u64>.asSlice(&parameters.types))
   let personality = run Module.functionRef(&mut writer.*.module, b"__silk_foreign_personality", ty)
   return Module.setPersonality(&mut writer.*.module, defined, personality)
 }
@@ -5971,7 +6133,7 @@ pub effect fn emit(
   let functionTy = run functionType(&mut writer, resultType, List<u64>.asSlice(&lanes.types))
   let attributes = run attributeList(&mut writer, &lanes)
   let defined = run Module.defineFunction(&mut writer.module, Bytes.asSlice(&writer.symbol), functionTy, Bitcode.linkExternal(), attributes)
-  if guarded { run guard(&mut writer, defined) }
+  if guarded { run guard(&mut writer, target, defined) }
   if let Option<Facts>.Some {value: facts} = &suspension.* {
     let suspended = Option<Suspended>.some(
       Suspended {facts: run Facts.copy(&facts), coroutine: run planFrame(function, target, layouts, &facts)},
@@ -6274,6 +6436,7 @@ effect fn activeSteps(writer: &mut Writer, word: usize) -> u64 ! OutOfMemoryErro
   let active = run Module.defineObject(&mut writer.*.module, b"__silk_active_steps", pointer, Bitcode.linkLinkOnceOdr(), false, null)
   Module.setHidden(&mut writer.*.module, active)
   Module.setThreadLocal(&mut writer.*.module, active, 1)
+  if writer.coff { Module.setComdat(&mut writer.*.module, active) }
   Module.setAlignment(&mut writer.*.module, active, usize.toU64(word))
   return active
 }
@@ -6559,7 +6722,7 @@ effect fn emitStep(writer: &mut Writer, function: &MirFunction, target: &Target,
   let attributes = run attributeList(&mut writer.*, &lanes)
   let name = run suffixed(symbol, b"$step")
   let defined = run Module.defineFunction(&mut writer.*.module, Bytes.asSlice(&name), ty, Bitcode.linkExternal(), attributes)
-  if guarded { run guard(&mut writer.*, defined) }
+  if guarded { run guard(&mut writer.*, target, defined) }
   run frameEntry(&mut writer.*, function, target, defined, b"$step")
   run beginFunction(&mut writer.*, defined, &lanes)
   let transfer = writer.transfer

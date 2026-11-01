@@ -29,7 +29,8 @@ or newline, has no lock, and does not allocate.
 `LogError` with code 3 if the write fails. Part of the message can be written already.
 
 ## Gotchas
-- The providers exist on WASI, Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+- The providers exist on Windows x86_64 MSVC, WASI, Darwin on aarch64, and Linux with GNU libc
+  on x86_64 or aarch64. Windows needs no CRT and automatic color enables console ANSI processing.
 - A message template for [`StderrLogger`](#StderrLogger) must not end with a newline. The logger adds one.
 - [`StderrLogger.make`](#StderrLogger.impl.make) reads the environment at the first message. A change to `NO_COLOR` after
   that has no effect on the same logger.
@@ -125,6 +126,7 @@ anything.
 On WASI, automatic color selection stays disabled because WASI does not define terminal detection.
 At the first message, the logger uses color when standard error is a terminal, `NO_COLOR` is
 not set or is empty, and `TERM` is not `dumb`. Later messages use the same answer.
+Windows also requires successful ANSI console-mode selection; redirected handles stay plain.
 
 <a id="StderrLogger.impl.withColor"></a>
 
@@ -215,4 +217,4 @@ log: StdoutLogger.writeStdout
 
 Category: Input and output.
 
-Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`, `wasm32-wasip1`, `wasm32-wasip2`.
+Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`.
