@@ -37,6 +37,17 @@ resolve links, or assert confinement. Relative paths and device namespaces are r
 impl WindowsPath
 ```
 
+<a id="WindowsPath.impl.parent"></a>
+
+### Associated function `parent`
+
+```silk
+pub effect fn parent(path: &Path) -> Option<Path> ! OutOfMemoryError ? &mut Allocator
+```
+
+Returns the parent without crossing a drive or UNC share root.
+A recognized volume root has no parent; other paths use the portable `Path.parent` rule.
+
 <a id="WindowsPath.impl.resolve"></a>
 
 ### Associated function `resolve`

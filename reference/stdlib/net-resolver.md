@@ -253,6 +253,16 @@ pub enum NativeResolverOperation
 
 The system call that failed in a native provider.
 
+<a id="NativeResolverOperation.Initialize"></a>
+
+### `Initialize`
+
+```silk
+Initialize
+```
+
+Initialize the host networking service before resolving an address.
+
 <a id="NativeResolverOperation.GetAddrInfo"></a>
 
 ### `GetAddrInfo`

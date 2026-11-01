@@ -1,6 +1,7 @@
 param(
   [Parameter(Mandatory=$true)][string]$Compiler,
   [Parameter(Mandatory=$true)][string]$OutputDirectory,
+  [switch]$SelfHost,
   [string]$LlvmBin = "$env:USERPROFILE\silk-windows-tools\clang+llvm-22.1.8-x86_64-pc-windows-msvc\bin"
 )
 $ErrorActionPreference = 'Stop'
@@ -61,7 +62,29 @@ try {
     '--stdlib', $library, '--clang', $clang, '--optimization', 'none', '--debug', 'false')
   $hello = Invoke-Checked 'execute' $program @()
   if ($hello -cne "Hello from Silk: $([char]::ConvertFromUtf32(0x1f4a9))`n") { throw 'Native-built hello output differs' }
-  $null = Invoke-Checked 'check-compiler' $compilerPath @('check', '--manifest-path', (Join-Path $root 'compiler/silk.toml'), '--stdlib', $library)
+  $null = Invoke-Checked 'check-compiler' $compilerPath @('check', '--manifest-path', (Join-Path $root 'compiler/silk.toml'), '--stdlib', $library) 600000
+  if ($SelfHost) {
+    $compilerSource = Join-Path $root 'compiler/src/main.silk'
+    $n2 = Join-Path $output 'N2.exe'
+    $buildArguments = @('build', $compilerSource, '--target', 'x86_64-pc-windows-msvc',
+      '--stdlib', $library, '--clang', $clang, '--optimization', 'speed', '--debug', 'false')
+    $null = Invoke-Checked 'build-n2' $compilerPath ($buildArguments + @('-o', $n2)) 900000
+    $nextVersion = Invoke-Checked 'n2-version' $n2 @('--version')
+    if ($nextVersion -cne $version) { throw 'Native N2 reports a different version' }
+    $producerIr = Join-Path $output 'producer.ll'
+    $nextIr = Join-Path $output 'n2.ll'
+    $null = Invoke-Checked 'producer-ir' $compilerPath ($buildArguments + @('--emit', 'llvm-ir', '-o', $producerIr)) 900000
+    $null = Invoke-Checked 'n2-ir' $n2 ($buildArguments + @('--emit', 'llvm-ir', '-o', $nextIr)) 900000
+    $producerHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $producerIr).Hash
+    $nextHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $nextIr).Hash
+    $results.Add(@{ name = 'native-fixpoint'; producerIrSha256 = $producerHash; n2IrSha256 = $nextHash })
+    if ($producerHash -cne $nextHash) { throw 'Native Windows generations emit different compiler IR' }
+    $nextProgram = Join-Path $output 'hello from n2.exe'
+    $null = Invoke-Checked 'n2-build' $n2 @('build', $source, '-o', $nextProgram,
+      '--stdlib', $library, '--clang', $clang, '--optimization', 'none', '--debug', 'false')
+    $nextHello = Invoke-Checked 'n2-execute' $nextProgram @()
+    if ($nextHello -cne $hello) { throw 'N2-built hello output differs' }
+  }
   @{ status = 'passed'; compiler = $compilerPath; checks = $results } |
     ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $output 'results.json')
 } catch {
