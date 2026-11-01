@@ -8,7 +8,7 @@ $readobj = Join-Path $LlvmBin 'llvm-readobj.exe'
 $results = @()
 $failed = $false
 foreach ($name in @('hello', 'hello-speed', 'storage', 'host-check', 'providers', 'filesystem',
-    'native-thread-spawn-join', 'native-thread-cross-wake', 'atomic-wait-notify')) {
+    'native-thread-spawn-join', 'native-thread-cross-wake', 'atomic-wait-notify', 'native-termination-source-trap')) {
   $executable = Join-Path $artifact "$name.exe"
   if ($name -eq 'filesystem') { $executable = Join-Path $artifact 'windows-filesystem/provider.exe' }
   if (!(Test-Path -LiteralPath $executable)) {
@@ -72,6 +72,13 @@ foreach ($name in @('hello', 'hello-speed', 'storage', 'host-check', 'providers'
     $expectedCode = 0
     if ($corpusThread) { $expectedCode = 42 }
     $passed = $child.ExitCode -eq $expectedCode -and $output -ceq $expected -and $errorOutput -ceq ''
+    if ($name -eq 'native-termination-source-trap') {
+      # This fixture explicitly traps. A high status from an arbitrary child is not a crash oracle.
+      $terminated = $child.ExitCode -eq -1073741795 -or $child.ExitCode -eq -1073740791
+      $passed = $terminated -and $output -ceq '' -and
+        $errorOutput.Contains('fatal trap: checked: the index is not less than the length') -and
+        $errorOutput -match '(?m)^  at .*\.main(?:[ (]|$)'
+    }
     $results += @{ program = $name; status = $(if ($passed) { 'pass' } else { 'fail' });
       exitCode = $child.ExitCode; stdout = $output; stderr = $errorOutput; imports = $imports }
     if (!$passed) { $failed = $true }
