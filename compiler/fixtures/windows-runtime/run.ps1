@@ -7,7 +7,8 @@ $artifact = (Resolve-Path -LiteralPath $ArtifactDirectory).Path
 $readobj = Join-Path $LlvmBin 'llvm-readobj.exe'
 $results = @()
 $failed = $false
-foreach ($name in @('hello', 'storage', 'host-check', 'providers', 'filesystem')) {
+foreach ($name in @('hello', 'storage', 'host-check', 'providers', 'filesystem',
+    'native-thread-spawn-join', 'native-thread-cross-wake', 'atomic-wait-notify')) {
   $executable = Join-Path $artifact "$name.exe"
   if ($name -eq 'filesystem') { $executable = Join-Path $artifact 'windows-filesystem/provider.exe' }
   if (!(Test-Path -LiteralPath $executable)) {
@@ -21,6 +22,8 @@ foreach ($name in @('hello', 'storage', 'host-check', 'providers', 'filesystem')
   $imports = @($inspection | Select-String '^\s+Name: (.+\.dll)$' | ForEach-Object { $_.Matches[0].Groups[1].Value })
   $allowed = '^(kernel32|ntdll)\.dll$'
   if ($name -eq 'providers') { $allowed = '^(kernel32|ntdll|bcryptprimitives)\.dll$' }
+  $corpusThread = $name -like 'native-thread-*' -or $name -like 'atomic-*'
+  if ($corpusThread) { $allowed = '^(kernel32|ntdll|api-ms-win-core-synch-l1-2-0)\.dll$' }
   if ($imports.Count -eq 0 -or @($imports | Where-Object { $_ -notmatch $allowed }).Count -ne 0) {
     throw "Unexpected or missing DLL imports for $name`: $imports"
   }
@@ -66,7 +69,9 @@ foreach ($name in @('hello', 'storage', 'host-check', 'providers', 'filesystem')
     $errorOutput = $stderr.GetAwaiter().GetResult()
     $expected = ''
     if ($name -eq 'hello') { $expected = "Hello from Silk: $([char]::ConvertFromUtf32(0x1f4a9))`n" }
-    $passed = $child.ExitCode -eq 0 -and $output -ceq $expected -and $errorOutput -ceq ''
+    $expectedCode = 0
+    if ($corpusThread) { $expectedCode = 42 }
+    $passed = $child.ExitCode -eq $expectedCode -and $output -ceq $expected -and $errorOutput -ceq ''
     $results += @{ program = $name; status = $(if ($passed) { 'pass' } else { 'fail' });
       exitCode = $child.ExitCode; stdout = $output; stderr = $errorOutput; imports = $imports }
     if (!$passed) { $failed = $true }

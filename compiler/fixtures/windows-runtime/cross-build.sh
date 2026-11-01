@@ -7,9 +7,15 @@ mkdir -p "$out"
 git rev-parse HEAD > "$out/source-commit.txt"
 printf 'program\tcompile\tpe-imports\texecution\n' > "$out/results.tsv"
 failed=0
-for program in hello storage host-check providers; do
+for program in hello storage host-check providers native-thread-spawn-join native-thread-cross-wake atomic-wait-notify; do
   source="$PWD/compiler/fixtures/windows-runtime/$program.silk"
   allowed_dlls='Name: (kernel32|ntdll)\.dll'
+  case "$program" in
+    native-thread-*|atomic-*)
+      source="$PWD/corpus/native/$program/main.silk"
+      allowed_dlls='Name: (kernel32|ntdll|api-ms-win-core-synch-l1-2-0)\.dll'
+      ;;
+  esac
   if [ "$program" = providers ]; then
     source="$out/providers-package"
     mkdir -p "$source/src"
