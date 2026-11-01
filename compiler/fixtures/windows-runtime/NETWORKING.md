@@ -26,4 +26,22 @@ The actual Silk fixture was built by the first native Windows compiler generatio
 Server 2025 with LLVM 22.1.8 (exit 0). This includes native localhost results, family/port checks,
 deadline refusal, no leaked Winsock reference, and preservation of an enclosing reference.
 The shared Windows cross-build and native runner include this fixture; no external DNS is needed.
-TCP/UDP socket providers and the Windows certificate store remain separate unfinished work.
+
+`socket_native` uses pointer-sized Winsock handles, nonblocking `WSASocketW`, `WSAPoll`,
+and `WSASend` for gathered writes. Each descriptor owns a scoped Winsock reference; explicit
+close releases it immediately. Accepted sockets receive their own reference before the listener
+can close. Created sockets prohibit inheritance and accepted sockets clear the inheritance flag.
+The default bind uses `SO_EXCLUSIVEADDRUSE`; explicit reuse uses Windows `SO_REUSEADDR` semantics.
+Unix-domain operations return `FamilyUnsupported`.
+
+The actual `sockets.silk` fixture passed on Server 2025 using native Silk N2 and LLVM 22.1.8.
+Its independently compiled C peer checks both client/listener directions, binary bytes, gathered
+writes with partial-write completion, write shutdown and EOF, refusal on a reserved unlistened
+port, and scoped/explicit Winsock cleanup. The original close implementation retained Winsock
+until object drop: the same fixture exited 13 before the repair and 0 afterward. The executable
+imports only Kernel32, Ntdll, and Ws2_32. Linux-target LLVM IR emission also passed.
+
+Local evidence: `.scratch/windows-sockets-native/results.json`, `imports.txt`, and the retained
+pre-fix executable. The shared cross-build and Windows runner include this fixture.
+IPv6 execution, inherited-handle inspection, and the full deadline/error matrix are not checked
+by this fixture. UDP and Windows certificate-store integration remain separate work.

@@ -7,7 +7,7 @@ mkdir -p "$out"
 git rev-parse HEAD > "$out/source-commit.txt"
 printf 'program\tcompile\tpe-imports\texecution\n' > "$out/results.tsv"
 failed=0
-for program in hello hello-speed storage host-check providers process console resolver native-thread-spawn-join native-thread-cross-wake atomic-wait-notify native-termination-source-trap stderr-locked-message; do
+for program in hello hello-speed storage host-check providers process console resolver sockets native-thread-spawn-join native-thread-cross-wake atomic-wait-notify native-termination-source-trap stderr-locked-message; do
   source="$PWD/compiler/fixtures/windows-runtime/$program.silk"
   optimization=none
   allowed_dlls='Name: (kernel32|ntdll)\.dll'
@@ -38,16 +38,28 @@ version = "0.0.0"
 silk-version = "0.0.0"
 EOF
   source="$package/src/main.silk"
-  if [ "$program" = resolver ]; then
-    printf 'LIBRARY ws2_32.dll\nEXPORTS\nWSAStartup\nWSACleanup\nWSAGetLastError\nGetAddrInfoW\nFreeAddrInfoW\nsocket\nclosesocket\n' > "$package/fixture.def"
+  if [ "$program" = resolver ] || [ "$program" = sockets ]; then
+    python3 - "$package/fixture.def" <<'PY'
+from pathlib import Path
+import re
+import sys
+import textwrap
+source = Path('compiler/src/driver/WindowsLink.silk').read_text()
+definition = re.search(r'fn winsock\(\).*?return """(.*?)"""', source, re.S)
+assert definition, 'Production Winsock imports missing'
+# The independent C oracle uses socket; production creates noninheritable WSASocketW handles.
+Path(sys.argv[1]).write_text(textwrap.dedent(definition.group(1)).strip() + '\nsocket\n')
+PY
+    printf 'LIBRARY kernel32.dll\nEXPORTS\nSetHandleInformation\n' > "$package/fixture-kernel.def"
     cat >> "$package/silk.toml" <<'EOF'
 [native]
-link = [{ object = "companion.obj" }, { static-archive = "fixture.lib" }]
+link = [{ object = "companion.obj" }, { static-archive = "fixture.lib" }, { static-archive = "fixture-kernel.lib" }]
 EOF
     if ! "$SILK_TEST_CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-stack-protector \
-        -Wall -Wextra -Werror -c compiler/fixtures/windows-runtime/resolver-contract.c -o "$package/companion.obj" \
-        || ! llvm-dlltool -m i386:x86-64 -d "$package/fixture.def" -l "$package/fixture.lib"; then
-      printf 'resolver\tfail: companion\tnot-checked\tnot-checked\n' >> "$out/results.tsv"
+        -Wall -Wextra -Werror -c "compiler/fixtures/windows-runtime/$program-contract.c" -o "$package/companion.obj" \
+        || ! llvm-dlltool -m i386:x86-64 -d "$package/fixture.def" -l "$package/fixture.lib" \
+        || ! llvm-dlltool -m i386:x86-64 -d "$package/fixture-kernel.def" -l "$package/fixture-kernel.lib"; then
+      printf '%s\tfail: companion\tnot-checked\tnot-checked\n' "$program" >> "$out/results.tsv"
       failed=1
       continue
     fi

@@ -1,7 +1,7 @@
 param(
   [Parameter(Mandatory = $true)][string]$ArtifactDirectory,
   [string]$LlvmBin = "$env:USERPROFILE\silk-windows-tools\clang+llvm-22.1.8-x86_64-pc-windows-msvc\bin",
-  [string[]]$Programs = @('hello', 'hello-speed', 'storage', 'host-check', 'providers', 'filesystem', 'process', 'process-image', 'console', 'resolver',
+  [string[]]$Programs = @('hello', 'hello-speed', 'storage', 'host-check', 'providers', 'filesystem', 'process', 'process-image', 'console', 'resolver', 'sockets',
     'native-thread-spawn-join', 'native-thread-cross-wake', 'atomic-wait-notify', 'native-termination-source-trap', 'stderr-locked-message')
 )
 $ErrorActionPreference = 'Stop'
@@ -23,7 +23,7 @@ foreach ($name in $Programs) {
   $inspection | Set-Content -LiteralPath (Join-Path $artifact "$name-native-pe.txt")
   $imports = @($inspection | Select-String '^\s+Name: (.+\.dll)$' | ForEach-Object { $_.Matches[0].Groups[1].Value })
   $allowed = '^(kernel32|ntdll)\.dll$'
-  if ($name -eq 'resolver') { $allowed = '^(kernel32|ntdll|ws2_32)\.dll$' }
+  if ($name -eq 'resolver' -or $name -eq 'sockets') { $allowed = '^(kernel32|ntdll|ws2_32)\.dll$' }
   if ($name -eq 'providers' -or $name -eq 'process' -or $name -eq 'process-image') { $allowed = '^(kernel32|ntdll|bcryptprimitives)\.dll$' }
   $corpusThread = $name -like 'native-thread-*' -or $name -like 'atomic-*'
   if ($corpusThread) { $allowed = '^(kernel32|ntdll|api-ms-win-core-synch-l1-2-0)\.dll$' }

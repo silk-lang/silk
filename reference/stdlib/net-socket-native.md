@@ -31,8 +31,9 @@ fail, `AttemptsExhausted` has the error of the last attempt.
 - Closing a Unix listener does not remove its socket file. Remove it yourself.
 - Scoped functions close the socket on return, error, and cancellation. A trap does not.
 - On Darwin, socket setup is not safe against a `fork` in another thread.
-- A call fails to compile on targets other than Darwin on aarch64, and Linux with GNU libc on
-  x86_64 or aarch64. The option types still compile.
+- Supported targets are Windows x86_64 MSVC, Darwin aarch64, and GNU/Linux x86_64 or aarch64.
+- Windows uses nonblocking Winsock TCP sockets; Unix-domain operations return `FamilyUnsupported`.
+  Each live descriptor keeps Winsock initialized. Socket handles are pointer-sized.
 
 ## Examples
 ### Connect to a local listener
@@ -817,7 +818,7 @@ The system call that failed.
 pub errno: i32
 ```
 
-The `errno` value.
+The host error code: POSIX errno, a Winsock WSA code, or a Win32 handle-configuration error.
 
 <a id="AttemptFailure.impl.Debug"></a>
 
@@ -1215,7 +1216,7 @@ The system call that failed.
 pub errno: i32
 ```
 
-The `errno` value.
+The host error code: POSIX errno, a Winsock WSA code, or a Win32 handle-configuration error.
 
 <a id="NativeSocketError.impl.Debug"></a>
 
@@ -1582,6 +1583,8 @@ pub fn make(
 ```
 
 Returns listen options.
+Windows defaults to an exclusive bind when `reuseAddress` is false. When true, Windows'
+`SO_REUSEADDR` permits binding over an existing listener, unlike Unix's usual reuse behavior.
 
 #### Errors
 `ListenOptionsError` if `kernelBacklog` is not 1 through 65535, or `pollIntervalNanoseconds`
@@ -1864,6 +1867,7 @@ It does not remove an old file at `path` before, or the file after close.
 
 ### Errors
 `InvalidBindAddress` or `PathTooLong` if `path` is not valid. `AddressInUse` if a file exists.
+Windows returns `FamilyUnsupported` for Unix-domain sockets before creating a socket.
 
 <a id="accept"></a>
 
@@ -1976,6 +1980,7 @@ Connects to the Unix socket at `path`, and returns the connection.
 
 ### Errors
 `InvalidEndpoint` if `path` is not valid. `Timeout` if `deadline` passes.
+Windows returns `FamilyUnsupported` for Unix-domain sockets before creating a socket.
 
 <a id="connectResolved"></a>
 
@@ -2028,6 +2033,7 @@ also on error or cancellation. A trap does not close it.
 - The error of `callback`.
 - `InvalidEndpoint` if `path` is not valid.
 - `Timeout` if `deadline` passes.
+- `FamilyUnsupported` on Windows, before creating a socket.
 
 <a id="Connection.impl-2"></a>
 

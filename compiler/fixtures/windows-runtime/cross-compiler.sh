@@ -58,4 +58,4 @@ PY
   --target x86_64-pc-windows-msvc --stdlib "$PWD/stdlib" --clang "$SILK_TEST_CLANG" \
   --optimization speed --debug false 2>&1 | tee "$out/build.log"
 llvm-readobj --file-headers --coff-imports "$out/silk.exe" > "$out/pe.txt"
-! grep 'Name: .*\.dll' "$out/pe.txt" | grep -viE 'Name: (kernel32|ntdll|bcryptprimitives|api-ms-win-core-synch-l1-2-0)\.dll'
+! grep 'Name: .*\.dll' "$out/pe.txt" | grep -viE 'Name: (kernel32|ntdll|bcryptprimitives|ws2_32|api-ms-win-core-synch-l1-2-0)\.dll'
