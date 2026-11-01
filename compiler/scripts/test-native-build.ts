@@ -1,7 +1,8 @@
 // One prebuilt native compiler exercises its private request/build routes together.
 import { strict as assert } from 'node:assert'
+import { createHash } from 'node:crypto'
 import { spawn, spawnSync, type SpawnSyncReturns } from 'node:child_process'
-import { existsSync, readdirSync } from 'node:fs'
+import { existsSync, readdirSync, statSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -2249,6 +2250,166 @@ const program = Effect.gen(function* () {
   const brokenSource = yield* invoke(silk, ['build', '--stdlib', standardLibrary], compiledApp, sourcesEnvironment)
   assert.equal(brokenSource.status, 1, brokenSource.stderr)
   assert.match(brokenSource.stderr, /broken\.c:1:27: error: use of undeclared identifier 'missing'/)
+  // `[native.archive.<name>]` pins an archive by URL and SHA-256; `<name>:<path>` names its files
+  // in sources and link entries. A build fetches it once into the archive store (here from a
+  // file:/// mirror), refuses a wrong digest before extracting anything, fails clearly when
+  // SILK_OFFLINE is set and it is missing, and a root or machine override replaces it.
+  const vendorArchived = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-native-archive-' })
+  for (const member of ['vend-1/include', 'vend-1/lib', 'alt/include', 'alt/lib', 'sys/native', 'app', 'home']) {
+    yield* fs.makeDirectory(join(vendorArchived, member), { recursive: true })
+  }
+  const packVendor = Effect.fnUntraced(function* (root: string, base: number) {
+    yield* fs.writeFileString(join(vendorArchived, root, 'include/vend.h'), 'int vend_base(void);\n')
+    yield* fs.writeFileString(join(vendorArchived, `${root}.c`), `int vend_base(void) { return ${base}; }\n`)
+    const vendorObject = yield* invoke(clang, ['-c', '-fPIC', `${root}.c`, '-o', `${root}.o`], vendorArchived)
+    assert.equal(vendorObject.status, 0, vendorObject.stderr)
+    const indexed = yield* invoke(join(dirname(clang), 'llvm-ar'), ['rcs', join(root, 'lib/libvend.a'), `${root}.o`], vendorArchived)
+    assert.equal(indexed.status, 0, indexed.stderr)
+  })
+  yield* packVendor('vend-1', 30)
+  yield* packVendor('alt', 50)
+  const packed = yield* invoke('tar', ['czf', 'vend.tar.gz', 'vend-1'], vendorArchived)
+  assert.equal(packed.status, 0, packed.stderr)
+  const vendDigest = createHash('sha256').update(yield* fs.readFile(join(vendorArchived, 'vend.tar.gz'))).digest('hex')
+  const sysManifest = (digest: string) =>
+    '[package]\nname = "sys"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Sys"]\n\n[native]\n'
+    + 'sources = [{ c = "native/shim.c", include = ["vend:include"] }]\nlink = [{ static-archive = "vend:lib/libvend.a" }]\n\n'
+    + `[native.archive.vend]\nurl = "file://${join(vendorArchived, 'vend.tar.gz')}"\nsha256 = "${digest}"\nstrip = 1\n`
+  yield* fs.writeFileString(join(vendorArchived, 'sys/silk.toml'), sysManifest(vendDigest))
+  yield* fs.writeFileString(join(vendorArchived, 'sys/native/shim.c'), '#include "vend.h"\nint shim_value(void) { return vend_base() + 5; }\n')
+  yield* fs.writeFileString(join(vendorArchived, 'sys/Sys.silk'), 'unsafe extern "C" fn shim_value() -> i32\n\npub fn value() -> i32 {\n  return unsafe shim_value()\n}\n')
+  const appManifest = '[package]\nname = "app"\nversion = "0.1.0"\nsource = "."\n\n[dependencies]\nsys = { path = "../sys" }\n'
+  yield* fs.writeFileString(join(vendorArchived, 'app/silk.toml'), appManifest)
+  yield* fs.writeFileString(join(vendorArchived, 'app/main.silk'), 'import sys.Sys\n\npub fn main() -> i32 {\n  return Sys.value()\n}\n')
+  const archivedApp = join(vendorArchived, 'app')
+  const vendorArchiveEnvironment = { ...process.env, SILK_CLANG: clang, SILK_HOME: join(vendorArchived, 'home') }
+  const archiveStore = join(vendorArchived, 'home/archives')
+  const archivedBuild = Effect.fnUntraced(function* (environment: Record<string, string | undefined>) {
+    return yield* invoke(silk, ['build', '--stdlib', standardLibrary], archivedApp, environment)
+  })
+  const archivedRun = Effect.fnUntraced(function* (expected: number, environment: Record<string, string | undefined> = vendorArchiveEnvironment) {
+    const vendorBuilt = yield* archivedBuild(environment)
+    assert.equal(vendorBuilt.status, 0, vendorBuilt.stderr)
+    const vendorRan = yield* invoke(join(archivedApp, `build/llvm/${hostTarget}/debug/app`), [], archivedApp, environment)
+    assert.equal(vendorRan.status, expected, vendorRan.stderr)
+  })
+  const archiveChecked = yield* invoke(silk, ['check', '--stdlib', standardLibrary], archivedApp, vendorArchiveEnvironment)
+  assert.equal(archiveChecked.status, 0, archiveChecked.stderr)
+  assert.ok(!(yield* fs.exists(archiveStore)), 'a check fetches no archive')
+  const offline = yield* archivedBuild({ ...vendorArchiveEnvironment, SILK_OFFLINE: '1' })
+  assert.equal(offline.status, 2, offline.stderr)
+  assert.match(offline.stderr, /archive vend is not in the archive store and SILK_OFFLINE is set/)
+  yield* fs.writeFileString(join(vendorArchived, 'sys/silk.toml'), sysManifest('0'.repeat(64)))
+  const mismatched = yield* archivedBuild(vendorArchiveEnvironment)
+  assert.equal(mismatched.status, 2, mismatched.stderr)
+  assert.match(mismatched.stderr, new RegExp(`archive vend from file://.* has SHA-256 ${vendDigest}, but its manifest pins 0{64}; nothing was extracted`))
+  assert.ok(!(yield* fs.exists(join(archiveStore, vendDigest))), 'a mismatched archive is never extracted')
+  yield* fs.writeFileString(join(vendorArchived, 'sys/silk.toml'), sysManifest(vendDigest))
+  yield* archivedRun(35)
+  assert.ok(yield* fs.exists(join(archiveStore, vendDigest, 'lib/libvend.a')), 'the archive is extracted below its digest, its top directory stripped')
+  yield* archivedRun(35, { ...vendorArchiveEnvironment, SILK_OFFLINE: '1' })
+  yield* fs.writeFileString(join(vendorArchived, 'app/silk.toml'), `${appManifest}\n[native.override.vend]\npath = "${join(vendorArchived, 'alt')}"\n`)
+  yield* archivedRun(55)
+  yield* fs.writeFileString(join(vendorArchived, 'app/silk.toml'), appManifest)
+  yield* fs.writeFileString(join(vendorArchived, 'home/native-overrides.toml'), '[native.override.vend]\npath = "../alt"\n')
+  yield* archivedRun(55)
+  yield* fs.remove(join(vendorArchived, 'home/native-overrides.toml'))
+  yield* archivedRun(35)
+  for (const [manifest, rule] of [
+    [sysManifest(vendDigest).replace('vend:lib', 'other:lib'), /\[native\]\.link\[0\]: static-archive other:lib\/libvend\.a: names archive other, which this manifest does not declare/],
+    [sysManifest(vendDigest).replace('[native.archive.vend]', '[native.archive.vend.targets.no-such-target]'), /include "vend:include": archive vend declares no url for target/],
+    [sysManifest(vendDigest).replace('url = "file://', 'url = "http://'), /\[native\.archive\.vend\]: url must be an https:\/\/ URL/],
+    [sysManifest('abc'), /\[native\.archive\.vend\]: sha256 must be 64 hexadecimal digits/],
+  ] as const) {
+    yield* fs.writeFileString(join(vendorArchived, 'sys/silk.toml'), manifest)
+    const refusedArchive = yield* archivedBuild(vendorArchiveEnvironment)
+    assert.equal(refusedArchive.status, 2, refusedArchive.stderr)
+    assert.match(refusedArchive.stderr, rule)
+  }
+  // `silk generate` runs the package's [[generate]] entries; `--check` changes nothing and fails
+  // on stale output, and an unchanged rerun keeps every file's inode and modification time.
+  const generated = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-generate-' })
+  const generatorManifest = (outputs: string) =>
+    `[package]\nname = "generated"\nversion = "0.1.0"\nsource = "src"\n\n[[generate]]\nrun = ["scripts/gen.sh", "parts.txt"]\noutputs = ${outputs}\n`
+  yield* fs.makeDirectory(join(generated, 'src'), { recursive: true })
+  yield* fs.makeDirectory(join(generated, 'scripts'), { recursive: true })
+  yield* fs.writeFileString(join(generated, 'src/main.silk'), 'pub fn main() -> i32 {\n  return 0\n}\n')
+  yield* fs.writeFileString(join(generated, 'silk.toml'), generatorManifest('["src/generated_value.silk", "src/generated_part_*.silk"]'))
+  yield* fs.writeFileString(
+    join(generated, 'scripts/gen.sh'),
+    '#!/bin/sh\n[ "$SILK_GENERATE" = 1 ] || exit 9\nprintf \'pub const VALUE: i32 = %s\\n\' "$(cat input.txt)" > src/generated_value.silk\n'
+      + 'for n in $(cat "$1"); do printf \'pub const PART: i32 = %s\\n\' "$n" > "src/generated_part_$n.silk"; done\n'
+      + 'echo "wrote parts"\n[ -f fail ] && exit 3\nexit 0\n',
+  )
+  yield* fs.chmod(join(generated, 'scripts/gen.sh'), 0o755)
+  yield* fs.writeFileString(join(generated, 'input.txt'), '1')
+  yield* fs.writeFileString(join(generated, 'parts.txt'), '1 2')
+  const valueFile = join(generated, 'src/generated_value.silk')
+  const generateRun = (args: ReadonlyArray<string>) => invoke(silk, ['generate', ...args], generated)
+  const firstCheck = yield* generateRun(['--check'])
+  assert.equal(firstCheck.status, 1, firstCheck.stderr)
+  assert.match(firstCheck.stderr, /src\/generated_value\.silk would be created/)
+  assert.match(firstCheck.stderr, /src\/generated_part_2\.silk would be created/)
+  assert.match(firstCheck.stderr, /run `silk generate` and commit the result/)
+  assert.equal(existsSync(valueFile), false, '--check left a generated file behind')
+  const firstGenerate = yield* generateRun([])
+  assert.equal(firstGenerate.status, 0, firstGenerate.stderr)
+  assert.match(firstGenerate.stdout, /wrote parts\n/)
+  assert.match(firstGenerate.stdout, /Created src\/generated_part_1\.silk\n/)
+  assert.match(firstGenerate.stdout, /Ran 1 generator: 3 changed, 0 unchanged\n/)
+  assert.equal(yield* fs.readFileString(valueFile), 'pub const VALUE: i32 = 1\n')
+  const stamp = (path: string) => {
+    const info = statSync(path, { bigint: true })
+    return `${info.ino}:${info.mtimeNs}`
+  }
+  const firstStamp = stamp(valueFile)
+  const rerun = yield* generateRun([])
+  assert.equal(rerun.status, 0, rerun.stderr)
+  assert.match(rerun.stdout, /Ran 1 generator: 0 changed, 3 unchanged\n/)
+  assert.equal(stamp(valueFile), firstStamp, 'an unchanged rerun replaced the generated file')
+  const currentCheck = yield* generateRun(['--check'])
+  assert.equal(currentCheck.status, 0, currentCheck.stderr)
+  assert.match(currentCheck.stdout, /Generated output is up to date \(3 files\)\n/)
+  assert.equal(stamp(valueFile), firstStamp, '--check replaced a current file')
+  yield* fs.writeFileString(join(generated, 'input.txt'), '2')
+  yield* fs.writeFileString(join(generated, 'parts.txt'), '1')
+  const staleCheck = yield* generateRun(['--check'])
+  assert.equal(staleCheck.status, 1, staleCheck.stderr)
+  assert.match(staleCheck.stderr, /src\/generated_value\.silk is stale\n/)
+  assert.match(staleCheck.stderr, /src\/generated_part_2\.silk would be removed\n/)
+  assert.equal(stamp(valueFile), firstStamp, '--check changed a stale file')
+  assert.equal(existsSync(join(generated, 'src/generated_part_2.silk')), true, '--check removed a file')
+  assert.deepEqual((yield* fs.readDirectory(join(generated, 'src'))).filter((name) => name.startsWith('.')), [], '--check left a moved-aside file')
+  yield* fs.writeFileString(join(generated, 'fail'), '')
+  const failedGenerate = yield* generateRun([])
+  assert.equal(failedGenerate.status, 1, failedGenerate.stderr)
+  assert.match(failedGenerate.stderr, /scripts\/gen\.sh parts\.txt failed with status 3; its outputs are unchanged\n/)
+  assert.equal(stamp(valueFile), firstStamp, 'a failed generator changed its outputs')
+  yield* fs.remove(join(generated, 'fail'))
+  const updated = yield* generateRun([])
+  assert.equal(updated.status, 0, updated.stderr)
+  assert.match(updated.stdout, /Updated src\/generated_value\.silk\n/)
+  assert.match(updated.stdout, /Removed src\/generated_part_2\.silk\n/)
+  assert.match(updated.stdout, /Ran 1 generator: 2 changed, 1 unchanged\n/)
+  assert.equal(yield* fs.readFileString(valueFile), 'pub const VALUE: i32 = 2\n')
+  // A declared output the command does not write fails, and nothing changes.
+  yield* fs.writeFileString(join(generated, 'silk.toml'), generatorManifest('["src/generated_value.silk", "src/missing.silk"]'))
+  const missingOutput = yield* generateRun([])
+  assert.equal(missingOutput.status, 1, missingOutput.stderr)
+  assert.match(missingOutput.stderr, /did not write its declared output src\/missing\.silk; its outputs are unchanged\n/)
+  assert.equal(yield* fs.readFileString(valueFile), 'pub const VALUE: i32 = 2\n')
+  // Outputs stay inside the package, and builds check the entries' shape too.
+  yield* fs.writeFileString(join(generated, 'silk.toml'), generatorManifest('["../outside.silk"]'))
+  const escapedGenerate = yield* generateRun([])
+  assert.equal(escapedGenerate.status, 2, escapedGenerate.stderr)
+  assert.match(escapedGenerate.stderr, /silk\.toml:\d+: \[\[generate\]\]\[0\]: output "\.\.\/outside\.silk" must be a relative path below the manifest's directory/)
+  const escapedGeneratorCheck = yield* invoke(silk, ['check', '--stdlib', standardLibrary], generated)
+  assert.notEqual(escapedGeneratorCheck.status, 0, escapedGeneratorCheck.stderr)
+  assert.match(escapedGeneratorCheck.stderr, /\[\[generate\]\]\[0\]: output "\.\.\/outside\.silk"/)
+  yield* fs.writeFileString(join(generated, 'silk.toml'), generatorManifest('["src/generated_value.silk"]').replace('outputs', 'output'))
+  const misspelledGenerate = yield* generateRun([])
+  assert.equal(misspelledGenerate.status, 2, misspelledGenerate.stderr)
+  assert.match(misspelledGenerate.stderr, /\[\[generate\]\]\[0\]: unknown key output; an entry has only run and outputs/)
   // `[native].function-order` places the functions it lists first in the executable's code, in its
   // order, and a change to the file alone links again. A path outside the package is refused.
   const ordered = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-ordered-' })
@@ -4143,7 +4304,7 @@ const program = Effect.gen(function* () {
   yield* refusedEmbed('shaders/missing.bin', /cannot embed "shaders\/missing\.bin": no such file in package embeds/)
   yield* refusedEmbed('../outside.bin', /cannot embed "\.\.\/outside\.bin": the path must be relative to the package's directory/)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, native sources, exports, workspaces, silk change release/history/recovery, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, cached codegen units, build replay, check replay, embedded files, object and static library artifacts and emission stages passed',
+    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, native sources, native archives, exports, workspaces, silk change release/history/recovery, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, cached codegen units, build replay, check replay, embedded files, object and static library artifacts and emission stages passed',
   )
 })
 const require = createRequire(new URL('../../package.json', import.meta.url))

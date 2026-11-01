@@ -1222,6 +1222,40 @@ sources = [
 ]
 ```
 
+`[native.archive.<name>]` pins a prebuilt archive, such as a vendor's SDK, by `url` and `sha256`
+(64 hexadecimal digits), either directly or per target under `targets.<target>`, with an optional
+`strip` of leading path segments. A path written `<name>:<path>` in `link` or `sources` names a
+file of that archive, so `{ static-archive = "dawn:lib/libwebgpu_dawn.a", os = "macos" }` and
+`include = ["dawn:include"]` reach Dawn without copying it into the package. Only the declaring
+manifest may name its archives, and two packages of one build may not declare the same name. A
+build for a target the archive has no `url` for refuses the reference.
+
+The URL is `https://`, or `file:///` for a local mirror. A build that links a package naming an
+archive fetches the whole file once into `$SILK_HOME/archives/<sha256>` (`~/.silk/archives` by
+default), checks its SHA-256 before reading it, and extracts it if it is gzip-compressed or plain
+tar. Extraction writes only directories and regular files, skips links, and refuses a member path
+that is absolute or holds `..`. A later build reuses the extraction while its digest matches, and
+`silk check` fetches nothing. With `SILK_OFFLINE` set, a build that needs a missing archive fails
+naming it.
+
+`[native.override.<name>] path = "<directory>"` in the root manifest, or in
+`$SILK_HOME/native-overrides.toml` on the machine, replaces archive `<name>` with that directory,
+which is never fetched; a relative path is resolved against the file that names it, and the
+machine's file wins over the root's. A dependency's overrides are ignored.
+
+```toml
+[native]
+link = [
+  { static-archive = "dawn:lib/libwebgpu_dawn.a", os = "macos" },
+  { static-archive = "dawn:lib64/libwebgpu_dawn.a", os = "linux" },
+]
+
+[native.archive.dawn.targets.aarch64-apple-darwin]
+url = "https://github.com/google/dawn/releases/download/<version>/Dawn-<commit>-macos-latest-Release.tar.gz"
+sha256 = "d4f419dcbe81de4b86e6fbf172b647f41c67820a925efca55dae3bd43248d8e2"
+strip = 1
+```
+
 `[native].function-order` names a text file below the manifest's directory that lists function
 symbols, one per line, such as `silk_1f3a9c...`; blank lines and lines starting with `#` are
 ignored. Write each symbol as the program's LLVM IR and a Linux `nm` spell it, without the leading

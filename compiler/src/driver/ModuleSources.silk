@@ -4,7 +4,7 @@ import driver.CommandPath
 import driver.EmbeddedFiles
 import driver.ImportSummaries as Summaries {ImportSummaries, Summary as ImportSummary}
 import driver.ManifestFields
-import driver.NativeLinkInput as NativeLinkInputs {Declared, InvalidNativeLinkInput, NativeLinkInput}
+import driver.NativeLinkInput as NativeLinkInputs {Archive, ArchiveContext, Declared, InvalidNativeLinkInput, NativeLinkInput}
 import driver.Packages as PackageSources {InvalidDependency, Packages}
 import semantic.ContentHash {ContentHash}
 import semantic.ExecutionStorage {Binding as StorageBinding, ExecutionStorage}
@@ -85,6 +85,8 @@ pub struct ModuleSources {
   /// The manifest's `[native].link` entries for the target, resolved against its directory, then,
   /// for an executable, those of every dependency (`linkInputs`).
   linkInputs: List<NativeLinkInput>,
+  /// The archives of the packages whose inputs it links, selected for the target.
+  archives: List<Archive>,
   /// The manifest's `[native].function-order`, resolved against its directory.
   functionOrder: Option<Path>,
   /// The root package and every package its dependencies reach (PACKAGE-002).
@@ -182,6 +184,7 @@ struct PackageRoot {
   components: Components,
   retention: List<RetentionRoot>,
   linkInputs: List<Declared>,
+  archives: List<Archive>,
   functionOrder: Option<Path>,
   packages: Packages,
 }
@@ -752,7 +755,81 @@ effect fn packageIdentity(document: &TomlValue) -> Bytes
 }
 
 // Reads the package that the manifest `contents`, read from `manifest` in `directory`, declares.
-effect fn packageRoot(manifest: &Path, directory: &Path, contents: &Bytes, executable: bool, request: &RuntimeRequest, store: Option<&Path>) -> PackageRoot
+/// What the archives of a build for `target` resolve against: the archive store beside the git
+/// checkout `store` (`$SILK_HOME/archives`), and no overrides yet.
+pub effect fn archiveContext(store: Option<&Path>, target: &[u8]) -> ArchiveContext ! FileError | OutOfMemoryError ? &mut Allocator {
+  let mut archives = Option<Path>.none()
+  if let Option<&Path>.Some {value: checkouts} = move store {
+    if let Option<Path>.Some {value: home} = move run Path.parent(checkouts) {
+      archives = Option<Path>.some(run Path.join(&home, "archives"))
+    }
+  }
+  return ArchiveContext {target: run Bytes.copy(target), store: move archives, overrides: List<NativeLinkInputs.Override>.make()}
+}
+
+// Adds the overrides of the machine's `native-overrides.toml` in the Silk home, beside the archive
+// store, to `context`.
+effect fn machineOverrides(context: &mut ArchiveContext) -> ()
+! FileError | TomlError | InvalidNativeLinkInput | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let home = match &context.store {
+    Option<Path>.Some {value} => match move run Path.parent(&value) {
+      Option<Path>.Some {value: parent} => move parent
+      Option<Path>.None => { return () }
+    }
+    Option<Path>.None => { return () }
+  }
+  let file = run Path.join(&home, "native-overrides.toml")
+  if let Option<Bytes>.Some {value: contents} = move run readOptional(&file) {
+    let document = run Toml.parse(Bytes.asSlice(&contents))
+    run NativeLinkInputs.appendOverrides(&document, &file, &home, &mut context.overrides)
+  }
+  return ()
+}
+
+// Refuses an archive name that two packages of the build both declare: one package owns each
+// native archive, so two copies of a library never link together.
+effect fn refuseSharedArchives(root: &[u8], archives: &[Archive], packages: &Packages) -> ()
+! InvalidNativeLinkInput | OutOfMemoryError ? &mut Allocator {
+  let count = PackageSources.count(packages)
+  let mut first = usize.ONE
+  while first < count {
+    run refuseShared(root, archives, PackageSources.packageIdentity(packages, first), PackageSources.archives(packages, first))
+    let mut second = first + usize.ONE
+    while second < count {
+      run refuseShared(PackageSources.packageIdentity(packages, first), PackageSources.archives(packages, first),
+        PackageSources.packageIdentity(packages, second), PackageSources.archives(packages, second))
+      second = second + usize.ONE
+    }
+    first = first + usize.ONE
+  }
+  return ()
+}
+
+// Refuses an archive name that both `mine`, of package `owner`, and `theirs`, of `other`, declare.
+effect fn refuseShared(owner: &[u8], mine: &[Archive], other: &[u8], theirs: &[Archive]) -> ()
+! InvalidNativeLinkInput | OutOfMemoryError ? &mut Allocator {
+  let mut left = usize.ZERO
+  while left < mine.length {
+    let mut right = usize.ZERO
+    while right < theirs.length {
+      if sameText(Bytes.asSlice(&mine[left].name), Bytes.asSlice(&theirs[right].name)) {
+        let mut detail = run Bytes.copy(b"archive ")
+        run Bytes.append(&mut detail, Bytes.asSlice(&mine[left].name))
+        run Bytes.append(&mut detail, b" is declared by both ")
+        run Bytes.append(&mut detail, owner)
+        run Bytes.append(&mut detail, b" and ")
+        run Bytes.append(&mut detail, other)
+        run Bytes.append(&mut detail, b"; one package owns each archive name, so two copies never link together")
+        fail InvalidNativeLinkInput {detail: move detail}
+      }
+      right = right + usize.ONE
+    }
+    left = left + usize.ONE
+  }
+  return ()
+}
+
+effect fn packageRoot(manifest: &Path, directory: &Path, contents: &Bytes, executable: bool, request: &RuntimeRequest, store: Option<&Path>, target: &[u8]) -> PackageRoot
 ! FileError | TomlError | InvalidSourceRoot | InvalidDependency | InvalidBuildComposition | InvalidNativeLinkInput | OutOfMemoryError
 ? &mut FileSystem | &mut Allocator {
   let document = run Toml.parse(Bytes.asSlice(contents))
@@ -766,16 +843,22 @@ effect fn packageRoot(manifest: &Path, directory: &Path, contents: &Bytes, execu
     components = Components.Declared {storage: run manifestStorage(composition, Bytes.asSlice(&identity))}
     retention = run manifestRetention(composition, Bytes.asSlice(&identity))
   }
-  let linkInputs = run NativeLinkInputs.read(&document, manifest, Bytes.asSlice(contents), directory)
+  // The machine's overrides win over the root's, which win over nothing; a dependency's manifest
+  // never overrides.
+  let mut context = run archiveContext(store, target)
+  run machineOverrides(&mut context)
+  run NativeLinkInputs.appendOverrides(&document, manifest, directory, &mut context.overrides)
+  let declarations = run NativeLinkInputs.read(&document, manifest, Bytes.asSlice(contents), directory, &context)
   let functionOrder = run NativeLinkInputs.functionOrder(&document, manifest, directory)
   let relative = run CommandPath.relative(directory, &selected)
-  let packages = run PackageSources.load(directory, &document, Bytes.asSlice(&identity), &selected, store)
+  let packages = run PackageSources.load(directory, &document, Bytes.asSlice(&identity), &selected, store, move context)
+  run refuseSharedArchives(Bytes.asSlice(&identity), List<Archive>.asSlice(&declarations.archives), &packages)
   return PackageRoot {directory: move selected, package: move identity, relative: move relative, runtime: move runtime,
-    components: move components, retention: move retention, linkInputs: move linkInputs, functionOrder: move functionOrder,
-    packages: move packages}
+    components: move components, retention: move retention, linkInputs: move declarations.inputs, archives: move declarations.archives,
+    functionOrder: move functionOrder, packages: move packages}
 }
 
-effect fn sourceRoot(source: &Path, executable: bool, request: &RuntimeRequest, store: Option<&Path>) -> PackageRoot
+effect fn sourceRoot(source: &Path, executable: bool, request: &RuntimeRequest, store: Option<&Path>, target: &[u8]) -> PackageRoot
 ! FileError | TomlError | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | InvalidNativeLinkInput | OutOfMemoryError
 ? &mut FileSystem | &mut Allocator {
   let parent = run Path.parent(source)
@@ -788,7 +871,7 @@ effect fn sourceRoot(source: &Path, executable: bool, request: &RuntimeRequest, 
     let manifest = run Path.join(&directory, "silk.toml")
     let contents = run readOptional(&manifest)
     if let Option<Bytes>.Some {value} = move contents {
-      return run packageRoot(&manifest, &directory, &value, executable, request, store)
+      return run packageRoot(&manifest, &directory, &value, executable, request, store, target)
     }
     let parent = run CommandPath.parent(&directory)
     if let Option<Path>.Some {value} = move parent {
@@ -830,7 +913,7 @@ effect fn logicalEntry(root: &Path, source: &Path) -> Bytes
 pub effect fn make(source: &Path, standardLibrary: Option<Path>, store: Option<&Path>, target: &[u8], libc: &[u8], executable: bool, runtime: RuntimeRequest) -> ModuleSources
 ! FileError | TomlError | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | InvalidModulePath | OutOfMemoryError
 ? &mut FileSystem | &mut Allocator {
-  let located = run sourceRoot(source, executable, &runtime, store)
+  let located = run sourceRoot(source, executable, &runtime, store, target)
   run refuseReservedModules(source, &located, &standardLibrary)
   return run assemble(source, move located, move standardLibrary, target, libc, executable, &runtime)
 }
@@ -895,7 +978,7 @@ pub effect fn makeInPackage(source: &Path, manifest: &Path, standardLibrary: Opt
     Option<Path>.None => { fail InvalidSourceRoot {} }
   }
   let contents = run FileSystem.readFile(manifest)
-  let located = run packageRoot(manifest, &directory, &contents, executable, &runtime, store)
+  let located = run packageRoot(manifest, &directory, &contents, executable, &runtime, store, target)
   run refuseReservedModules(source, &located, &standardLibrary)
   return run assemble(source, move located, move standardLibrary, target, libc, executable, &runtime)
 }
@@ -956,7 +1039,7 @@ effect fn appendLinked(listed: &mut List<NativeLinkInput>, declared: &[Declared]
 effect fn assemble(source: &Path, located: PackageRoot, standardLibrary: Option<Path>, target: &[u8], libc: &[u8], executable: bool, request: &RuntimeRequest) -> ModuleSources
 ! FileError | InvalidSourceRoot | InvalidBuildComposition | MissingStandardLibrary | InvalidModulePath | OutOfMemoryError
 ? &mut FileSystem | &mut Allocator {
-  let PackageRoot {directory: root, package, relative, runtime: declaredRuntime, components, retention, linkInputs, functionOrder, packages} = move located
+  let PackageRoot {directory: root, package, relative, runtime: declaredRuntime, components, retention, linkInputs, archives: rootArchives, functionOrder, packages} = move located
   let mut catalogDocument = Option<JsonValue>.none()
   if let Option<Path>.Some {value: directory} = &standardLibrary {
     catalogDocument = run catalog(&directory)
@@ -1009,6 +1092,26 @@ effect fn assemble(source: &Path, located: PackageRoot, standardLibrary: Option<
     }
   }
   let linkInputs = run linkedInputs(List<Declared>.asSlice(&linkInputs), &packages, target, executable)
+  // A build fetches the archives of the packages whose inputs it links.
+  let mut archives = List<Archive>.make()
+  let ownArchives = List<Archive>.asSlice(&rootArchives)
+  let mut own = usize.ZERO
+  while own < ownArchives.length {
+    run List<Archive>.append(&mut archives, run NativeLinkInputs.copyArchive(&ownArchives[own]))
+    own = own + usize.ONE
+  }
+  if executable {
+    let mut dependency = usize.ONE
+    while dependency < PackageSources.count(&packages) {
+      let theirs = PackageSources.archives(&packages, dependency)
+      let mut at = usize.ZERO
+      while at < theirs.length {
+        run List<Archive>.append(&mut archives, run NativeLinkInputs.copyArchive(&theirs[at]))
+        at = at + usize.ONE
+      }
+      dependency = dependency + usize.ONE
+    }
+  }
   let logical = run logicalEntry(&root, source)
   if SealedOperators.isPath(Bytes.asSlice(&logical)) { fail InvalidSourceRoot {} }
   let entry = run ModuleId.make(b"file", Bytes.asSlice(&package), Bytes.asSlice(&logical))
@@ -1047,6 +1150,7 @@ effect fn assemble(source: &Path, located: PackageRoot, standardLibrary: Option<
     storage: move storage,
     retention: move retention,
     linkInputs: move linkInputs,
+    archives: move archives,
     functionOrder: move functionOrder,
     packages: move packages,
     graph: move graph,
@@ -1123,6 +1227,11 @@ pub fn runtime(self: &ModuleSources) -> Option<&ModuleId> {
 /// Borrows the package's native link inputs in declaration order.
 pub fn nativeLinkInputs(self: &ModuleSources) -> &[NativeLinkInput] {
   return List<NativeLinkInput>.asSlice(&self.linkInputs)
+}
+
+/// Borrows the archives of the packages whose native inputs the build links, selected for its target.
+pub fn archives(self: &ModuleSources) -> &[Archive] {
+  return List<Archive>.asSlice(&self.archives)
 }
 
 /// Borrows the package's `[native].function-order` file, resolved against its manifest's

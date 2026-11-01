@@ -1,0 +1,221 @@
+//! `silk generate`: runs the package author's `[[generate]]` entries.
+//!
+//! An entry names a command and the files it writes:
+//!
+//! ```toml
+//! [[generate]]
+//! run = ["scripts/generate-unicode", "--pinned"]
+//! outputs = ["src/generated_tables.silk", "src/generated_*.silk"]
+//! ```
+//!
+//! The command runs in the manifest's directory with the caller's environment. A program spelled
+//! with a `/` is a path below the manifest's directory; a bare name is searched on `PATH`. Outputs are
+//! paths below the manifest's directory; a `*` in the last segment matches any run of bytes. Builds
+//! and dependents never run an entry: generated files are committed, and `silk generate --check`
+//! fails when one is stale.
+//!
+//! While a command runs, its declared outputs that already exist are moved aside. An output it then
+//! writes with the same bytes is replaced by the moved-aside original, so an unchanged rerun moves
+//! no file's modification time and invalidates nothing. `--check` restores every original and
+//! removes every new file, so it never changes the tree.
+
+import diagnostic.JsonText
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.mem.box {Box}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.core.option {Option}
+import silk.collections.slice {Slice}
+import silk.text.string {String}
+import silk.toml.value {Toml, TomlChild, Value as TomlValue}
+import silk.num.usize
+
+/// A `[[generate]]` entry the manifest refuses: the dotted key that locates it and why.
+pub struct InvalidGenerate {
+  pub key: Bytes,
+  pub detail: Bytes,
+}
+
+/// One `[[generate]]` entry: the command line and the outputs, both as written.
+pub struct Entry {
+  pub command: List<Bytes>,
+  pub outputs: List<Bytes>,
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn holds(text: &[u8], wanted: u8) -> bool {
+  let mut at = usize.ZERO
+  while at < text.length {
+    if text[at] == wanted { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn lastSegment(path: &[u8]) -> &[u8] {
+  let mut start = path.length
+  while start > usize.ZERO && path[start - usize.ONE] != 47 { start = start - usize.ONE }
+  return Slice.view<u8>(path, start, path.length - start)
+}
+
+effect fn refuse(at: usize, field: &[u8], detail: &[u8]) -> never ! InvalidGenerate | OutOfMemoryError ? &mut Allocator {
+  let mut key = run Bytes.copy(b"generate.")
+  run JsonText.appendDecimal(&mut key, at)
+  if field.length > usize.ZERO {
+    run Bytes.append(&mut key, b".")
+    run Bytes.append(&mut key, field)
+  }
+  let mut text = run Bytes.copy(b"[[generate]][")
+  run JsonText.appendDecimal(&mut text, at)
+  run Bytes.append(&mut text, b"]: ")
+  run Bytes.append(&mut text, detail)
+  fail InvalidGenerate {key: move key, detail: move text}
+}
+
+// The first key of `table` other than `run` and `outputs`.
+fn unknownKey<'a>(table: &'a TomlValue) -> Option<&'a [u8]> {
+  return match &table.* {
+    TomlValue.Table {entries, kind: _} => {
+      let boxed = Box<List<TomlChild>>.get(&entries)
+      let children = List<TomlChild>.asSlice(&boxed[0])
+      let mut at = usize.ZERO
+      while at < children.length {
+        if let TomlChild.Member {entry} = &children[at] {
+          let key = String.ownedUtf8Bytes(&entry.key)
+          if !same(key, b"run") && !same(key, b"outputs") { return Option<&'a [u8]>.some(key) }
+        }
+        at = at + usize.ONE
+      }
+      return Option<&'a [u8]>.none()
+    }
+    _ => Option<&'a [u8]>.none()
+  }
+}
+
+// The strings of the array `value`, or none when it is not a nonempty array of strings.
+effect fn strings(value: Option<&TomlValue>) -> Option<List<Bytes>> ! OutOfMemoryError ? &mut Allocator {
+  let array = match move value {
+    Option<&TomlValue>.Some {value: found} => found
+    Option<&TomlValue>.None => { return Option<List<Bytes>>.none() }
+  }
+  let listed = match &array.* {
+    TomlValue.Array {..} => true
+    _ => false
+  }
+  if !listed { return Option<List<Bytes>>.none() }
+  let mut found = List<Bytes>.make()
+  let mut item = usize.ZERO
+  while true {
+    let named = match move Toml.item(array, item) {
+      Option<&TomlValue>.Some {value: listedItem} => listedItem
+      Option<&TomlValue>.None => { break }
+    }
+    match move Toml.asString(Option<&TomlValue>.some(named)) {
+      Option<string>.Some {value: written} => { run List<Bytes>.append(&mut found, run Bytes.copy(String.utf8Bytes(written))) }
+      Option<string>.None => { return Option<List<Bytes>>.none() }
+    }
+    item = item + usize.ONE
+  }
+  if List<Bytes>.length(&found) == usize.ZERO { return Option<List<Bytes>>.none() }
+  return Option<List<Bytes>>.some(move found)
+}
+
+/// Whether `written` is a relative path below a directory: segments separated by `/`, none empty,
+/// `.` or `..`, no `\` or NUL, no drive prefix, and a `*` only in the last segment when `pattern`.
+pub fn containedPath(written: &[u8], pattern: bool) -> bool {
+  if written.length == usize.ZERO || written[usize.ZERO] == 47 { return false }
+  if written.length >= usize.add(0, 2) && written[usize.ONE] == 58 { return false }
+  let mut start = usize.ZERO
+  let mut at = usize.ZERO
+  while at <= written.length {
+    if at == written.length || written[at] == 47 {
+      let segment = Slice.view<u8>(written, start, at - start)
+      if segment.length == usize.ZERO || same(segment, b".") || same(segment, b"..") { return false }
+      if holds(segment, 42) && (!pattern || at != written.length) { return false }
+      start = at + usize.ONE
+    } else if written[at] == 92 || written[at] == 0 {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// The `[[generate]]` entries of the manifest `document`, in order; empty when it has none. An entry
+/// is a table with exactly `run`, a nonempty array of strings that starts with the program, and
+/// `outputs`, a nonempty array of contained paths.
+pub effect fn entries(document: &TomlValue) -> List<Entry> ! InvalidGenerate | OutOfMemoryError ? &mut Allocator {
+  let mut found = List<Entry>.make()
+  let declared = match move Toml.field(document, "generate") {
+    Option<&TomlValue>.Some {value} => value
+    Option<&TomlValue>.None => { return move found }
+  }
+  let listed = match &declared.* {
+    TomlValue.Array {..} => true
+    _ => false
+  }
+  if !listed {
+    let key = run Bytes.copy(b"generate")
+    fail InvalidGenerate {key: move key, detail: run Bytes.copy(b"generate must be an array of tables, written as [[generate]]")}
+  }
+  let mut at = usize.ZERO
+  while true {
+    let entry = match move Toml.item(declared, at) {
+      Option<&TomlValue>.Some {value} => value
+      Option<&TomlValue>.None => { break }
+    }
+    let table = match &entry.* {
+      TomlValue.Table {..} => true
+      _ => false
+    }
+    if !table { run refuse(at, b"", b"an entry must be a table with run and outputs") }
+    if let Option<&[u8]>.Some {value: key} = unknownKey(entry) {
+      let mut detail = run Bytes.copy(b"unknown key ")
+      run Bytes.append(&mut detail, key)
+      run Bytes.append(&mut detail, b"; an entry has only run and outputs")
+      run refuse(at, key, Bytes.asSlice(&detail))
+    }
+    let command = match move run strings(Toml.field(entry, "run")) {
+      Option<List<Bytes>>.Some {value} => move value
+      Option<List<Bytes>>.None => run refuse(at, b"run", b"run must be a nonempty array of strings: the program, then its arguments")
+    }
+    let words = List<Bytes>.asSlice(&command)
+    let program = Bytes.asSlice(&words[usize.ZERO])
+    if program.length == usize.ZERO || (holds(program, 47) && !containedPath(program, false)) {
+      run refuse(at, b"run", b"the program must be a bare name searched on PATH or a relative path below the manifest's directory, without . or .. segments")
+    }
+    let mut word = usize.ZERO
+    while word < words.length {
+      if holds(Bytes.asSlice(&words[word]), 0) { run refuse(at, b"run", b"an argument must not contain NUL") }
+      word = word + usize.ONE
+    }
+    let outputs = match move run strings(Toml.field(entry, "outputs")) {
+      Option<List<Bytes>>.Some {value} => move value
+      Option<List<Bytes>>.None => run refuse(at, b"outputs", b"outputs must be a nonempty array of paths")
+    }
+    let written = List<Bytes>.asSlice(&outputs)
+    let mut output = usize.ZERO
+    while output < written.length {
+      if !containedPath(Bytes.asSlice(&written[output]), true) {
+        let mut detail = run Bytes.copy(b"output \"")
+        run Bytes.append(&mut detail, Bytes.asSlice(&written[output]))
+        run Bytes.append(&mut detail, b"\" must be a relative path below the manifest's directory, without . or .. segments and with any * in its last segment")
+        run refuse(at, b"outputs", Bytes.asSlice(&detail))
+      }
+      output = output + usize.ONE
+    }
+    run List<Entry>.append(&mut found, Entry {command: move command, outputs: move outputs})
+    at = at + usize.ONE
+  }
+  return move found
+}
+
