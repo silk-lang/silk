@@ -72,6 +72,7 @@ static void write_byte(HANDLE h,char c) { uint32_t n=0; CHECK(WriteFile(h,&c,1,&
 static char read_byte(HANDLE h) {
   char c=0; uint32_t n=0; CHECK(SetFilePointerEx(h,0,0,0)); CHECK(ReadFile(h,&c,1,&n,0)&&n==1); return c;
 }
+#ifdef CONTRACT_MAIN
 static NTSTATUS nt_open(HANDLE parent,const WCHAR *name,uint32_t access,uint32_t sharing,uint32_t creation,uint32_t flags,HANDLE *out) {
   UNICODE_STRING text={(uint16_t)(length(name)*2),(uint16_t)(length(name)*2),name};
   OBJECT_ATTRIBUTES attributes={48,parent,&text,0,0,0}; IO_STATUS_BLOCK io={0};
@@ -85,6 +86,7 @@ static NTSTATUS rename_to(HANDLE file,HANDLE parent,const WCHAR *name,uint32_t f
 }
 static NTSTATUS dispose(HANDLE file) { uint32_t flags=3; IO_STATUS_BLOCK io={0}; return NtSetInformationFile(file,&io,&flags,4,64); }
 static uint32_t word(const uint8_t *p) { return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24; }
+#endif
 static HANDLE root;
 
 /* Also linked into the Silk integration fixture. This supplies UTF-16 names without Silk's codec. */

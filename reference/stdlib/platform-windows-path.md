@@ -37,6 +37,53 @@ resolve links, or assert confinement. Relative paths and device namespaces are r
 impl WindowsPath
 ```
 
+<a id="WindowsPath.impl.resolve"></a>
+
+### Associated function `resolve`
+
+```silk
+pub effect fn resolve(base: &Path, argument: string) -> Path
+  ! FileError | OutOfMemoryError ? &mut Allocator
+```
+
+Resolves a text host path against an absolute machine path, without accessing files.
+
+#### Details
+
+Both separators are accepted. Absolute drive, UNC, and machine paths select their volume;
+a single leading separator selects the base volume. Relative paths stay on the base volume.
+`.` and `..` are normalized, and a parent component cannot cross the volume root.
+
+#### Errors
+
+- `FileError` with `InvalidPath` for malformed paths, device names, drive-relative names,
+  empty interior components, or a parent component above the volume root.
+- `OutOfMemoryError` if the path cannot be allocated.
+
+<a id="WindowsPath.impl.resolveBytes"></a>
+
+### Associated function `resolveBytes`
+
+```silk
+pub effect fn resolveBytes(base: &Path, argument: &[u8]) -> Path
+  ! FileError | OutOfMemoryError ? &mut Allocator
+```
+
+Resolves canonical WTF-8 host bytes against an absolute machine path.
+
+#### Details
+
+Accepts absolute drive, UNC, machine, and relative paths. Both separators are accepted
+except inside an extended `\\\\?\\` name, where only backslashes are separators.
+Case and lone surrogates are preserved. `.` and `..` are normalized within one volume.
+A single leading separator selects the base volume; drive-relative names are refused.
+
+#### Errors
+
+- `FileError` with `InvalidPath` for malformed WTF-8, NUL, device paths, empty interior
+  components, invalid volume names, or a parent component above the volume root.
+- `OutOfMemoryError` if the result cannot be allocated.
+
 <a id="WindowsPath.impl.fromNative"></a>
 
 ### Associated function `fromNative`

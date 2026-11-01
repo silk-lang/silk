@@ -7,7 +7,7 @@ baseline=$3
 mkdir -p "$out"
 git rev-parse HEAD > "$out/source-commit.txt"
 git rev-parse "$baseline" > "$out/baseline-commit.txt"
-for variant in baseline feature without-encoder-body without-encoder-and-path-bodies; do
+for variant in baseline feature without-encoder-body without-encoder-and-path-bodies without-encoder-and-all-path-bodies; do
   root="$out/$variant"
   mkdir -p "$root"
   revision=HEAD
@@ -27,7 +27,7 @@ end = source.index('\n  }\n', start)
 path.write_text(source[:start] + '\n    fail OutOfMemoryError {}' + source[end:])
 PY
   fi
-  if [ "$variant" = without-encoder-and-path-bodies ]; then
+  if [[ "$variant" == without-encoder-and-*path-bodies ]]; then
     python3 - "$root/stdlib/silk/platform/windows/path.silk" <<'PY'
 from pathlib import Path
 import re
@@ -41,6 +41,20 @@ for name in ('fromNative', 'fromNativeBytes', 'toNativeBytes', 'resolve', 'resol
     end = source.index('\n  }\n', start)
     source = source[:start] + '\n    fail OutOfMemoryError {}' + source[end:]
 path.write_text(source)
+PY
+  fi
+  if [ "$variant" = without-encoder-and-all-path-bodies ]; then
+    python3 - "$root/stdlib/silk/system/filesystem.silk" <<'PY'
+from pathlib import Path
+import re
+import sys
+path = Path(sys.argv[1])
+source = path.read_text()
+matches = list(re.finditer(r'pub effect fn resolveBytes\([^)]*\)[^{]*\{', source))
+assert len(matches) == 1
+start = matches[0].end()
+end = source.index('\n  }\n', start)
+path.write_text(source[:start] + '\n    fail OutOfMemoryError {}' + source[end:])
 PY
   fi
   (

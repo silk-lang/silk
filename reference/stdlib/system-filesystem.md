@@ -316,6 +316,28 @@ computes the path. It does not access the file system, so it does not follow lin
   empty component such as `"a//b"`, or goes above the root.
 - `OutOfMemoryError` if the `Allocator` cannot supply the path.
 
+<a id="Path.impl.resolveBytes"></a>
+
+### Associated function `resolveBytes`
+
+```silk
+pub effect fn resolveBytes(base: &Path, relative: &[u8]) -> Path
+  ! FileError | OutOfMemoryError ? &mut Allocator
+```
+
+Resolves relative host bytes against `base` without interpreting their text encoding.
+
+#### Details
+
+`/` separates components. `.` keeps the path and `..` removes one component. Empty bytes
+and a trailing separator are accepted. Other bytes are preserved without accessing files.
+
+#### Errors
+
+- `FileError` with `InvalidPath` for a leading `/`, NUL, empty interior component, or a
+  parent component that would leave the root.
+- `OutOfMemoryError` if the result cannot be allocated.
+
 <a id="Path.impl.parent"></a>
 
 ### Method `parent`

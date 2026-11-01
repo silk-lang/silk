@@ -38,7 +38,16 @@ int fixture_console_end(void) {
   int same_page = GetConsoleOutputCP() == code_page;
   int restored = SetStdHandle((D)-11, original);
   int closed = CloseHandle(screen);
-  if (!good || !read || count != 16 || expected_count != 16 || !same_page || !restored || !closed) return 0;
-  for (D at = 0; at < 16; ++at) if (cells[at] != expected[at]) return 0;
-  return 1;
+  if (!good) return 10;
+  if (!read) return 11;
+  if (count != 16) return 12;
+  if (expected_count != 16) return 13;
+  if (!same_page) return 14;
+  if (!restored) return 15;
+  if (!closed) return 16;
+  // Preserve the actual and expected first differing UTF-16 cells in the process exit status.
+  // This also works when the CI runner cannot capture a hidden console's output streams.
+  for (D at = 0; at < 16; ++at)
+    if (cells[at] != expected[at]) return (int)(((D)cells[at] << 16) | expected[at]);
+  return 0;
 }
