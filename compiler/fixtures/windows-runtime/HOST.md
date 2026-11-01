@@ -15,7 +15,9 @@ only at the external tool boundary. Cache identities remain machine paths.
 The filesystem fixture from run `41262234641`, source `ccd7033c7`, passed on Windows Server 2025.
 It exercises machine routing, temporary paths, invalid and unsupported roots, host canonicalization,
 loaded-image discovery and PATH candidates. The host-independent corpus also covers volume escape,
-UNC roots and lone-surrogate resolution. Later lock/rename assertions are pending compilation.
+UNC roots and lone-surrogate resolution. The lock/rename assertions from run `41262758747`,
+source `ba9689edd`, also passed locally as an actual Silk executable, including exclusive-lock
+refusal through an independent C handle and successful locking after the Silk handle closes.
 
 HostRename uses MoveFileExW with REPLACE_EXISTING and no COPY_ALLOWED. DetachedWriter uses a
 synchronous LockFileEx lock on the first byte of a stable lock file; readers take a shared lock.
