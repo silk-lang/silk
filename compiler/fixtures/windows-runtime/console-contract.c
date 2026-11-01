@@ -7,6 +7,7 @@ __declspec(dllimport) H GetStdHandle(D);
 __declspec(dllimport) int SetStdHandle(D, H);
 __declspec(dllimport) H CreateConsoleScreenBuffer(D, D, void *, D, void *);
 __declspec(dllimport) int ReadConsoleOutputCharacterW(H, W *, D, COORD, D *);
+__declspec(dllimport) int WriteConsoleW(H, const W *, D, D *, void *);
 __declspec(dllimport) D GetConsoleOutputCP(void);
 __declspec(dllimport) int CloseHandle(H);
 static H original, screen;
@@ -21,12 +22,23 @@ int fixture_console_begin(void) {
   return 1;
 }
 int fixture_console_end(void) {
-  W cells[6] = {0}; D count = 0;
-  int read = ReadConsoleOutputCharacterW(screen, cells, 6, (COORD){0,0}, &count);
+  // Cell widths and surrogate presentation differ with the console host and font. Use the OS
+  // rendering of independently specified UTF-16 as the oracle, rather than assuming one cell
+  // per code unit. Silk must produce the same cells from its split canonical WTF-8 input.
+  static const W expected_text[] = {'A', 0x20ac, 'B', 0xd83d, 0xdca9};
+  W cells[16] = {0}, expected[16] = {0}; D count = 0, expected_count = 0, written = 0;
+  H control = CreateConsoleScreenBuffer(0xc0000000UL, 3, 0, 1, 0);
+  int good = control != (H)-1;
+  if (good) {
+    good = WriteConsoleW(control, expected_text, 5, &written, 0) && written == 5 &&
+      ReadConsoleOutputCharacterW(control, expected, 16, (COORD){0,0}, &expected_count);
+  }
+  int read = ReadConsoleOutputCharacterW(screen, cells, 16, (COORD){0,0}, &count);
+  if (control != (H)-1) good = CloseHandle(control) && good;
   int same_page = GetConsoleOutputCP() == code_page;
   int restored = SetStdHandle((D)-11, original);
   int closed = CloseHandle(screen);
-  return read && count == 6 && same_page && restored && closed &&
-    cells[0] == 'A' && cells[1] == 0x20ac && cells[2] == 'B' &&
-    cells[3] == 0xd83d && cells[4] == 0xdca9 && cells[5] == ' ';
+  if (!good || !read || count != 16 || expected_count != 16 || !same_page || !restored || !closed) return 0;
+  for (D at = 0; at < 16; ++at) if (cells[at] != expected[at]) return 0;
+  return 1;
 }

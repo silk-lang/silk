@@ -31,15 +31,20 @@ Its existing exact stdout/stderr oracle distinguishes recursive nested output, p
 the lock, gathered buffer overflow, flush, drop, and empty-buffer writes. Actual Silk execution
 passed from [run 41259800219](https://github.com/silk-lang/silk/actions/runs/41259800219), source
 `c6b2d2f8b`, compiler `943142c73`, with exact output and exit zero. The local report is
-`.scratch/windows-cross-41259800219/stderr-native-results.json`. Native console rendering and
-concurrent Silk writers remain not checked; the C oracle independently proves the host lock.
+`.scratch/windows-cross-41259800219/stderr-native-results.json`. Concurrent Silk writers remain
+not checked; the C oracle independently proves the host lock.
 
 `console.silk` and `console-contract.c` add actual console-cell readback for a BMP character and
 a supplementary scalar split across byte slices, including an empty slice. They reject malformed,
 truncated, and noncanonical surrogate-pair inputs and check the console code page is unchanged.
 `run-console.ps1` creates a new hidden console; the fixture writes a private screen buffer without
-activating it. A separately compiled C control passed the readback oracle on this host. The Silk
-version is pending cross-compilation and execution; the C control does not prove Silk conversion.
+activating it. The Silk program from run `41260814356`, source `7fdd8dc30`, passed on this Windows
+Server 2025 host. The GitHub Windows runner rejected its fixed cell-layout expectation (exit 7).
+The companion now compares cells with a separate console buffer written by C using the literal
+UTF-16 sequence `A`, U+20AC, `B`, U+1F4A9. This removes the assumption that every console host/font
+lays out those code units identically, while retaining an independent oracle for Silk's conversion.
+Relinking the unchanged Silk objects with this companion passed locally. The updated CI comparison
+is pending; the exact reason for the original runner's cell mismatch has not been observed.
 
 ## Reference comparison
 

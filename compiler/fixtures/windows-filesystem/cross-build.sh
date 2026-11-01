@@ -8,6 +8,8 @@ clang=${SILK_TEST_CLANG:-clang}
 mkdir -p "$out/package/src"
 out=$(cd "$out" && pwd)
 cp "$repo/compiler/fixtures/windows-filesystem/provider.silk" "$out/package/src/main.silk"
+mkdir -p "$out/package/src/driver"
+cp "$repo/compiler/src/driver/WindowsHostPath.silk" "$repo/compiler/src/driver/CommandPath.silk" "$out/package/src/driver/"
 "$clang" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-stack-protector \
   -c "$repo/compiler/fixtures/windows-filesystem/contract.c" -o "$out/package/contract.obj"
 llvm-dlltool -m i386:x86-64 -d "$repo/compiler/fixtures/windows-filesystem/kernel32.def" -l "$out/package/fixture-kernel32.lib"
