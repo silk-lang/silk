@@ -53,7 +53,20 @@ EOF
     fi
   fi
   if [ "$program" = process ]; then
-    printf 'LIBRARY kernel32.dll\nEXPORTS\nGetCommandLineW\nLocalFree\nGetEnvironmentVariableW\nGetStdHandle\nReadFile\nWriteFile\nGetCurrentProcess\nIsProcessInJob\nGetModuleFileNameW\nCreateProcessW\nCloseHandle\nSetEvent\nSleep\nExitProcess\n' > "$package/kernel32.def"
+    mkdir -p "$package/src/driver"
+    cp compiler/src/driver/{ProcessImage,WindowsProcessImage,WindowsHostPath}.silk "$package/src/driver/"
+    cat > "$package/host.def" <<'EOF'
+LIBRARY kernel32.dll
+EXPORTS
+GetCurrentProcess
+DuplicateHandle
+SetConsoleCtrlHandler
+GetEnvironmentVariableW
+SetLastError
+EOF
+    llvm-dlltool -m i386:x86-64 -d "$package/host.def" -l "$package/host.lib" || exit 1
+    printf '\n[native]\nlink = [{ static-archive = "host.lib" }]\n' >> "$package/silk.toml"
+    printf 'LIBRARY kernel32.dll\nEXPORTS\nGetCommandLineW\nLocalFree\nGetLastError\nSetLastError\nGetEnvironmentVariableW\nGetStdHandle\nReadFile\nWriteFile\nGetCurrentProcess\nIsProcessInJob\nGetModuleFileNameW\nCreateProcessW\nCloseHandle\nSetEvent\nSleep\nExitProcess\n' > "$package/kernel32.def"
     printf 'LIBRARY shell32.dll\nEXPORTS\nCommandLineToArgvW\n' > "$package/shell32.def"
     if ! "$SILK_TEST_CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-stack-protector \
       -Wall -Wextra -Werror -c compiler/fixtures/windows-process/provider-child.c -o "$package/child.obj" \

@@ -16,6 +16,8 @@ __declspec(dllimport) W *GetCommandLineW(void);
 __declspec(dllimport) W **CommandLineToArgvW(const W *, int *);
 __declspec(dllimport) H LocalFree(H);
 __declspec(dllimport) D GetEnvironmentVariableW(const W *, W *, D);
+__declspec(dllimport) D GetLastError(void);
+__declspec(dllimport) void SetLastError(D);
 __declspec(dllimport) H GetStdHandle(D);
 __declspec(dllimport) int ReadFile(H, void *, D, D *, void *);
 __declspec(dllimport) int WriteFile(H, const void *, D, D *, void *);
@@ -41,6 +43,30 @@ void mainCRTStartup(void) {
   if (!args) ExitProcess(10);
   if (count == 2 && equal(args[1], (const W *)L"grandchild")) { for (;;) Sleep(60000); }
   const W surrogate[] = {0xd800,0}, quote[] = {'\\','"','\\',0};
+  if (count == 5 && equal(args[1], (const W *)L"interactive")) {
+    if (!equal(args[2], (const W *)L"a b") || args[3][0] || !equal(args[4], surrogate)) ExitProcess(30);
+    LocalFree(args);
+    W inherited[32];
+    if (!GetEnvironmentVariableW((const W *)L"SILK_IMAGE_DEFAULT", inherited, 32) ||
+        !equal(inherited, (const W *)L"fallback")) ExitProcess(31);
+    SetLastError(0);
+    if (GetEnvironmentVariableW((const W *)L"SILK_IMAGE_EMPTY", inherited, 32) || GetLastError()) ExitProcess(32);
+    if (!GetEnvironmentVariableW((const W *)L"SILK_IMAGE_INHERITED", inherited, 32) ||
+        !equal(inherited, (const W *)L"parent")) ExitProcess(33);
+    static const uint8_t expected[] = "silk stdin\n";
+    uint8_t input[sizeof(expected)]; D length = 0;
+    while (length < sizeof(expected) - 1) {
+      D received = 0;
+      if (!ReadFile(GetStdHandle((D)-10), input + length, (D)sizeof(expected) - 1 - length, &received, 0) || !received) ExitProcess(34);
+      length += received;
+    }
+    for (D i = 0; i < length; ++i) if (input[i] != expected[i]) ExitProcess(35);
+    D received = 1;
+    if (!ReadFile(GetStdHandle((D)-10), input, 1, &received, 0) || received) ExitProcess(36);
+    write_all(GetStdHandle((D)-11), "interactive stdout\n", 19);
+    write_all(GetStdHandle((D)-12), "interactive stderr\n", 19);
+    ExitProcess(259);
+  }
   if (count != 5 || !equal(args[1], (const W *)L"a b") || args[2][0] ||
       !equal(args[3], surrogate) || !equal(args[4], quote)) ExitProcess(11);
   LocalFree(args);

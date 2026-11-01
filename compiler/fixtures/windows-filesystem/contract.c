@@ -9,6 +9,8 @@ typedef struct { uint32_t Length; HANDLE RootDirectory; UNICODE_STRING *ObjectNa
   uint32_t Attributes; void *SecurityDescriptor, *SecurityQualityOfService; } OBJECT_ATTRIBUTES;
 typedef struct { uintptr_t Status, Information; } IO_STATUS_BLOCK;
 typedef struct { uint32_t Flags; HANDLE RootDirectory; uint32_t FileNameLength; WCHAR FileName[255]; } RENAME_INFO;
+typedef struct { uintptr_t Internal, Transferred; uint32_t Offset, OffsetHigh; HANDLE Event; } OVERLAPPED;
+__declspec(dllimport) int LockFileEx(HANDLE, uint32_t, uint32_t, uint32_t, uint32_t, OVERLAPPED *);
 typedef struct { int64_t Allocation, Length; uint32_t Links; uint8_t DeletePending, Directory; } STANDARD_INFO;
 _Static_assert(sizeof(OBJECT_ATTRIBUTES) == 48, "OBJECT_ATTRIBUTES ABI");
 _Static_assert(sizeof(IO_STATUS_BLOCK) == 16, "IO_STATUS_BLOCK ABI");
@@ -124,6 +126,15 @@ void FsFixtureReadOnly(uint32_t enabled) { CHECK(SetFileAttributesW(path((const 
 uint32_t FsFixtureOldByte(HANDLE handle) { return (uint8_t)read_byte(handle); }
 void FsFixtureClose(HANDLE handle) { CHECK(CloseHandle(handle)); }
 uint32_t FsFixtureOutsideByte(void) { HANDLE h=win_open((const WCHAR *)L"outside\\sentinel",0x80000000,7,3,0x80); char c=read_byte(h); CHECK(CloseHandle(h)); return (uint8_t)c; }
+uint32_t FsFixtureTryCacheLock(void) {
+  HANDLE h=win_open((const WCHAR *)L"root\\compiler.lock",0xc0000000,3,4,128);
+  OVERLAPPED position={0};
+  int acquired=LockFileEx(h,3,0,1,0,&position);
+  uint32_t code=acquired?0:GetLastError();
+  CHECK(CloseHandle(h));
+  if(acquired) return 1;
+  return code==33?0:code+2;
+}
 
 #ifdef CONTRACT_MAIN
 void mainCRTStartup(void) {

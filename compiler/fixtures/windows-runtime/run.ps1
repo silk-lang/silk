@@ -7,9 +7,10 @@ $artifact = (Resolve-Path -LiteralPath $ArtifactDirectory).Path
 $readobj = Join-Path $LlvmBin 'llvm-readobj.exe'
 $results = @()
 $failed = $false
-foreach ($name in @('hello', 'hello-speed', 'storage', 'host-check', 'providers', 'filesystem', 'process', 'console',
+foreach ($name in @('hello', 'hello-speed', 'storage', 'host-check', 'providers', 'filesystem', 'process', 'process-image', 'console',
     'native-thread-spawn-join', 'native-thread-cross-wake', 'atomic-wait-notify', 'native-termination-source-trap', 'stderr-locked-message')) {
   $executable = Join-Path $artifact "$name.exe"
+  if ($name -eq 'process-image') { $executable = Join-Path $artifact 'process.exe' }
   if ($name -eq 'filesystem') { $executable = Join-Path $artifact 'windows-filesystem/provider.exe' }
   if (!(Test-Path -LiteralPath $executable)) {
     $results += @{ program = $name; status = 'not-checked'; reason = 'cross-build executable missing' }
@@ -21,7 +22,7 @@ foreach ($name in @('hello', 'hello-speed', 'storage', 'host-check', 'providers'
   $inspection | Set-Content -LiteralPath (Join-Path $artifact "$name-native-pe.txt")
   $imports = @($inspection | Select-String '^\s+Name: (.+\.dll)$' | ForEach-Object { $_.Matches[0].Groups[1].Value })
   $allowed = '^(kernel32|ntdll)\.dll$'
-  if ($name -eq 'providers' -or $name -eq 'process') { $allowed = '^(kernel32|ntdll|bcryptprimitives)\.dll$' }
+  if ($name -eq 'providers' -or $name -eq 'process' -or $name -eq 'process-image') { $allowed = '^(kernel32|ntdll|bcryptprimitives)\.dll$' }
   $corpusThread = $name -like 'native-thread-*' -or $name -like 'atomic-*'
   if ($corpusThread) { $allowed = '^(kernel32|ntdll|api-ms-win-core-synch-l1-2-0)\.dll$' }
   if ($imports.Count -eq 0 -or @($imports | Where-Object { $_ -notmatch $allowed }).Count -ne 0) {
@@ -57,16 +58,24 @@ foreach ($name in @('hello', 'hello-speed', 'storage', 'host-check', 'providers'
   $start.RedirectStandardError = $true
   $start.StandardOutputEncoding = [System.Text.Encoding]::UTF8
   $start.StandardErrorEncoding = [System.Text.Encoding]::UTF8
-  if ($name -eq 'process') {
+  if ($name -eq 'process' -or $name -eq 'process-image') {
     $oracle = Join-Path $artifact 'process-child.exe'
     if (!(Test-Path -LiteralPath $oracle)) { throw 'Process child oracle is missing' }
     $start.Arguments = '"' + $oracle + '"'
     $start.EnvironmentVariables['SILK_PARENT_ONLY'] = 'must not reach the child'
+    if ($name -eq 'process-image') {
+      $start.Arguments += ' --image'
+      $start.RedirectStandardInput = $true
+      $start.EnvironmentVariables['SILK_IMAGE_EMPTY'] = ''
+      $start.EnvironmentVariables['SILK_IMAGE_INHERITED'] = 'parent'
+      $start.EnvironmentVariables.Remove('SILK_IMAGE_DEFAULT')
+    }
   }
   $child = New-Object System.Diagnostics.Process
   $child.StartInfo = $start
   try {
     if (!$child.Start()) { throw "Cannot start $name" }
+    if ($name -eq 'process-image') { $child.StandardInput.Write("silk stdin`n"); $child.StandardInput.Close() }
     $stdout = $child.StandardOutput.ReadToEndAsync()
     $stderr = $child.StandardError.ReadToEndAsync()
     if (!$child.WaitForExit(30000)) {
@@ -80,6 +89,9 @@ foreach ($name in @('hello', 'hello-speed', 'storage', 'host-check', 'providers'
     $expectedCode = 0
     if ($corpusThread) { $expectedCode = 42 }
     $passed = $child.ExitCode -eq $expectedCode -and $output -ceq $expected -and $errorOutput -ceq ''
+    if ($name -eq 'process-image') {
+      $passed = $child.ExitCode -eq 259 -and $output -ceq "interactive stdout`n" -and $errorOutput -ceq "interactive stderr`n"
+    }
     if ($name -eq 'stderr-locked-message') {
       $corpus = Join-Path $PSScriptRoot '../../../corpus/native/stderr-locked-message'
       $expectedOut = [IO.File]::ReadAllText((Join-Path $corpus 'expected.stdout')).Replace("`r`n", "`n")
