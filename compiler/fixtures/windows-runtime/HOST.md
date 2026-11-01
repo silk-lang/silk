@@ -36,7 +36,7 @@ the Silk executable was used unchanged. A fresh combined CI execution remains pe
 
 The Windows workflow also cross-builds the full compiler and runs `run-compiler.ps1`: version,
 hello compilation through native Clang to a path containing spaces, hello execution, and checking
-the compiler's sources. `cross-compiler.sh` extracts the current production WindowsLink import
+the compiler's sources. `cross-host.sh` extracts the current production WindowsLink import
 definitions so an older N1 can link newly introduced OS calls. It restores the authored manifest
 after the build. This supplements imports only; it supplies no compiler/runtime implementation.
 Full compiler execution remains unverified until that lane succeeds.

@@ -116,7 +116,7 @@ EOF
   fi
   if [ "$program" = process ]; then
     mkdir -p "$package/src/driver"
-    cp compiler/src/driver/{ProcessImage,WindowsProcessImage,WindowsHostPath}.silk "$package/src/driver/"
+    cp compiler/src/driver/ProcessImage.silk "$package/src/driver/"
     cat > "$package/host.def" <<'EOF'
 LIBRARY kernel32.dll
 EXPORTS
