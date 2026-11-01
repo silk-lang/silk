@@ -65,6 +65,8 @@ The compiler is written in Silk and builds itself.
 
 ## Install
 
+### macOS and Linux
+
 On macOS (Apple Silicon) or Linux (x86-64 or ARM64):
 
 ```sh
@@ -94,6 +96,35 @@ mise use -g 'github:silk-lang/silk[version_prefix=v]'
 Homebrew follows the same channel as the script. mise picks stable releases only; until the first
 one exists, use `github:silk-lang/silk[version_prefix=v,prerelease=true]` to get dev releases.
 
+### Windows
+
+On Windows x86-64, run this in PowerShell:
+
+```powershell
+Invoke-RestMethod https://raw.githubusercontent.com/silk-lang/silk/main/install.ps1 | Invoke-Expression
+```
+
+The installer needs no administrator privileges. It installs `silk.exe` in
+`$env:USERPROFILE\.silk\bin` and keeps each compiler and its standard library in
+`$env:USERPROFILE\.silk\toolchains\<version>`. Set `$env:SILK_HOME` before installing to use
+another directory. It selects the latest stable release, or the latest development release
+until a stable release exists. To select a specific published release, set `$env:SILK_RELEASE`
+to its full tag before running the command.
+
+Add `%USERPROFILE%\.silk\bin` (or your custom `SILK_HOME`'s `bin` directory) to your **user Path**
+in Windows' Environment Variables settings, then open a new terminal. For the default location,
+you can also enable it in the current PowerShell session:
+
+```powershell
+$env:Path = "$env:USERPROFILE\.silk\bin;$env:Path"
+silk --version
+```
+
+Building programs requires [LLVM 22 or newer](https://github.com/llvm/llvm-project/releases),
+including Clang, LLD and `llvm-ar`. Add LLVM's `bin` directory to `PATH`, or set `$env:SILK_CLANG`
+to the full path to `clang.exe`. See [Silk on Windows](reference/windows.md) for archive
+verification, Scoop and mise installation, and the supported Windows filesystem scope.
+
 ### Silk versions
 
 A project pins its Silk version with `silk-version` in `silk.toml`, under `[package]` or
@@ -122,7 +153,8 @@ install `silk` beside its release's `silkc`, which it runs when nothing selects 
 ## Quick start
 
 ```sh
-silk init hello && cd hello
+silk init hello
+cd hello
 silk run
 ```
 
