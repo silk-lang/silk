@@ -1,6 +1,7 @@
 //! The platform supply one native link consumes, resolved as the platform-supplies reference
 //! requires: a project's explicit SDK or sysroot when it names one, else for macOS `SDKROOT` when
-//! it is set, else discovery through `xcrun` on a macOS host only.
+//! it is set, else discovery through `xcrun` on a macOS host only. An automatic macOS request
+//! that finds no SDK links against Silk's own libSystem stub (`DarwinLink`) instead.
 //!
 //! The resolved supply records what was consulted (`SDKROOT` or `DEVELOPER_DIR`, and the
 //! discovery query's result), so a later change to the ambient environment cannot change it. An
@@ -64,8 +65,12 @@ pub struct Supply {
   /// The SDK root (`-isysroot`) of a macOS target, or the sysroot (`--sysroot`) of a GNU/Linux one.
   pub root: Path,
 
-  /// Whether `root` is a macOS SDK.
+  /// Whether the supply is for macOS: an SDK at `root`, or Silk's own libSystem stub.
   pub darwin: bool,
+
+  /// Whether a macOS supply is Silk's own libSystem stub instead of an SDK. The link writes the
+  /// stub into its scratch directory and `root` names no directory.
+  pub stub: bool,
 
   /// The compiler-support installation for the target (`--gcc-install-dir`), if one is declared.
   pub support: Option<Path>,
@@ -663,6 +668,7 @@ effect fn sdk(target: &Target, root: &[u8], origin: Bytes, developerDirectory: O
   return Supply {
     root: move directory,
     darwin: true,
+    stub: false,
     support: Option<Path>.none(),
     linker: move linker,
     deployment: move requested,
@@ -670,6 +676,38 @@ effect fn sdk(target: &Target, root: &[u8], origin: Bytes, developerDirectory: O
     developerDirectory: move developerDirectory,
     version: move version,
     files: move files,
+  }
+}
+
+/// The deployment a macOS link without an SDK uses when its profile names none: the minimum
+/// current Apple SDKs admit, as an SDK-built default rises to.
+pub fn stubDeployment() -> &'static [u8] {
+  return b"12.0"
+}
+
+// The supply of a macOS link with no SDK: Silk's own libSystem stub, which the link writes. A
+// written deployment must be 11.0.0 or later; an unset one is `stubDeployment`.
+effect fn stubbed(deployment: &[u8]) -> Supply ! SupplyError | FileError | OutOfMemoryError ? &mut Allocator {
+  let mut requested = run Bytes.copy(deployment)
+  if deployment.length == usize.ZERO {
+    requested = run Bytes.copy(stubDeployment())
+  }
+  if !isVersion(Bytes.asSlice(&requested)) || compareVersions(Bytes.asSlice(&requested), defaultDeployment()) < 0 {
+    return run failure(b"DeploymentMismatch", Bytes.asSlice(&requested), b"Silk libSystem stub",
+      b"Choose a deployment of 11.0.0 or later.", b"")
+  }
+  return Supply {
+    root: run Path.make("/"),
+    darwin: true,
+    stub: true,
+    support: Option<Path>.none(),
+    linker: Option<Path>.none(),
+    // An SDK states its own version; the stub has none, so the link records the deployment.
+    version: run Bytes.copy(Bytes.asSlice(&requested)),
+    deployment: move requested,
+    origin: run Bytes.copy(b"Silk libSystem stub"),
+    developerDirectory: Option<Bytes>.none(),
+    files: List<SupplyFile>.make(),
   }
 }
 
@@ -697,7 +735,9 @@ effect fn explicitLinker(linker: &Path, files: &mut List<SupplyFile>) -> Path
 /// SDK, or the GNU/Linux sysroot and its compiler-support installation, and its linker. Otherwise
 /// a macOS SDK is `SDKROOT` when set, which must be valid and never falls back, else what `xcrun
 /// --sdk macosx --show-sdk-path` reports with `DEVELOPER_DIR` forwarded, on a macOS host only; a
-/// GNU/Linux target keeps the selected compiler's own sysroot.
+/// GNU/Linux target keeps the selected compiler's own sysroot. An automatic request for macOS on
+/// another host, or on a Mac with no `xcrun`, resolves to Silk's own libSystem stub, with the
+/// deployment 12.0 when the profile names none.
 pub effect fn resolve(target: &Target, host: &Target, libc: &[u8], deployment: &[u8], request: &Request) -> Option<Supply>
   ! SupplyError | FileError | HostInputError | OutOfMemoryError
   ? &mut HostInput | &mut FileSystem | &mut ChildProcess | &mut Allocator {
@@ -738,6 +778,7 @@ pub effect fn resolve(target: &Target, host: &Target, libc: &[u8], deployment: &
       return Option<Supply>.some(Supply {
         root: run Path.fromBytes(Path.rawBytes(&root)),
         darwin: false,
+        stub: false,
         support: move selectedSupport,
         linker: Option<Path>.some(move selectedLinker),
         deployment: Bytes.make(),
@@ -753,6 +794,10 @@ pub effect fn resolve(target: &Target, host: &Target, libc: &[u8], deployment: &
   if !darwin || same(libc, b"none") {
     return Option<Supply>.none()
   }
+  let automatic = match &request.* {
+    Request.Automatic => true
+    _ => false
+  }
   let mut origin = run Bytes.copy(b"SDKROOT")
   let mut developerDirectory = Option<Bytes>.none()
   let mut files = List<SupplyFile>.make()
@@ -761,14 +806,33 @@ pub effect fn resolve(target: &Target, host: &Target, libc: &[u8], deployment: &
     root = move value
   } else {
     // One macOS SDK serves every Darwin architecture, so a Mac discovers it for an Intel or Apple
-    // silicon target alike; another host has no `xcrun` to ask.
+    // silicon target alike; another host has no `xcrun` to ask. An automatic request then links
+    // against Silk's own libSystem stub, as does a Mac without developer tools.
     if !same(Target.operatingSystem(host), b"darwin") {
+      if automatic {
+        return Option<Supply>.some(run stubbed(deployment))
+      }
       return run failure(b"HostMismatch", Target.name(target), b"host",
         b"Provide an explicit supply for the requested target.", b"")
     }
     origin = run Bytes.copy(b"SDK discovery")
     developerDirectory = run HostInput.variableNamed("DEVELOPER_DIR")
-    root = run discover(&developerDirectory, &mut files)
+    let searched = run Effect.result(discover(&developerDirectory, &mut files))
+    root = match move searched {
+      Result<Bytes, SupplyError | FileError | HostInputError | OutOfMemoryError>.Success { value } => move value
+      Result<Bytes, SupplyError | FileError | HostInputError | OutOfMemoryError>.Failure { error } => match move error {
+        SupplyError refused => {
+          if automatic && same(refused.code, b"MissingCapability") {
+            drop refused
+            return Option<Supply>.some(run stubbed(deployment))
+          }
+          fail move refused
+        }
+        FileError unreadable => { fail move unreadable }
+        HostInputError unavailable => { fail move unavailable }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
   }
   return Option<Supply>.some(run sdk(target, Bytes.asSlice(&root), move origin, move developerDirectory, deployment, Option<Path>.none(), move files))
 }

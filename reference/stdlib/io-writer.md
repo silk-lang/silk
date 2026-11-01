@@ -25,7 +25,7 @@ leaves it out and gets the default, one `writeAll` for each slice.
 
 ## Gotchas
 The providers in `silk.io.writer_native` exist on Windows x86_64 MSVC without a CRT, WASI,
-Darwin aarch64, and Linux x86_64 or aarch64 with GNU libc. Windows consoles require complete
+Darwin x86_64 or aarch64, and Linux x86_64 or aarch64 with GNU libc. Windows consoles require complete
 canonical WTF-8 per write or concatenated vectored write; redirected handles accept arbitrary bytes.
 
 ## Examples

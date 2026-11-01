@@ -39,7 +39,7 @@ prepare.
 ## Gotchas
 - Resolution of a host name cannot stop at a deadline. A host name with a deadline fails with
   `UnsupportedDeadline` before any contact. An IP address with a deadline is accepted.
-- Windows x86_64 MSVC, Darwin aarch64, and GNU/Linux x86_64 or aarch64 are supported. On other
+- Windows x86_64 MSVC, Darwin x86_64 or aarch64, and GNU/Linux x86_64 or aarch64 are supported. On other
   targets, a call that is used fails to compile. Unused imports and [`Options`](#Options) still compile.
 
 ## Examples
@@ -586,7 +586,7 @@ connection keeps no deadline. Close it, or give it to another owner such as a po
   the socket, TLS, and the certificate check.
 
 ### Gotchas
-Only Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64, are supported. On other
+Only Darwin on x86_64 or aarch64, and Linux with GNU libc on x86_64 or aarch64, are supported. On other
 targets, a call fails to compile.
 
 <a id="admitUnixRoute"></a>
@@ -628,7 +628,7 @@ certificate against `origin`. The opening deadline is the earlier of `options.de
 another owner such as a pool.
 
 ### Gotchas
-Only Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64, are supported. On other
+Only Darwin on x86_64 or aarch64, and Linux with GNU libc on x86_64 or aarch64, are supported. On other
 targets, a call fails to compile.
 
 <a id="withConnection"></a>
@@ -667,7 +667,7 @@ fails, the connection is closed. Closing does not flush and does not send a TLS 
 - The error of the handler.
 
 ### Gotchas
-Only Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64, are supported. On other
+Only Darwin on x86_64 or aarch64, and Linux with GNU libc on x86_64 or aarch64, are supported. On other
 targets, a call fails to compile.
 
 <a id="withUnixConnection"></a>
@@ -705,7 +705,7 @@ flush and does not send a TLS close message.
 - `ExchangeError` and the error of the handler.
 
 ### Gotchas
-Only Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64, are supported. On other
+Only Darwin on x86_64 or aarch64, and Linux with GNU libc on x86_64 or aarch64, are supported. On other
 targets, a call fails to compile.
 
 <a id="withProxyRoute"></a>

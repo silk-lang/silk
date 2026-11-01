@@ -28,7 +28,7 @@ new file and rename it. A change in place can be read half way.
 ## Gotchas
 - It does not look for a default file, read environment variables, or use the trust store of the
   system (such as the macOS keychain). It does not check revocation.
-- Supported targets are Windows x86_64 MSVC, Darwin aarch64, and GNU/Linux x86_64 or aarch64.
+- Supported targets are Windows x86_64 MSVC, Darwin x86_64 or aarch64, and GNU/Linux x86_64 or aarch64.
 
 ## Examples
 ### Configure a bundle and see a load fail

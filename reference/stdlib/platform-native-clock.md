@@ -16,7 +16,7 @@ when a signal interrupts the wait, so the total wait does not grow.
 ## Gotchas
 - A failed call or a bad result is a trap.
 - A wait blocks the whole thread. It does not let another fiber run.
-- A call fails to compile on targets other than WASI, Windows on x86_64, Darwin on aarch64, and GNU Linux on x86_64 or aarch64.
+- A call fails to compile on targets other than WASI, Windows on x86_64, Darwin on x86_64 or aarch64, and GNU Linux on x86_64 or aarch64.
 
 ## Examples
 ### Read the clocks
@@ -63,7 +63,7 @@ Each read checks the result of the system.
 ### Gotchas
 - A failed call or a bad result is a trap.
 - A wait blocks the whole thread. It does not let another fiber run.
-- A call fails to compile on targets other than WASI, Windows on x86_64, Darwin on aarch64, and GNU Linux on x86_64 or aarch64.
+- A call fails to compile on targets other than WASI, Windows on x86_64, Darwin on x86_64 or aarch64, and GNU Linux on x86_64 or aarch64.
 
 <a id="NativeClock.impl"></a>
 
