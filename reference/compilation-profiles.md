@@ -12,7 +12,7 @@ complete profile additionally contains every resolved package parameter and its 
 complete, validated profile can enter ordinary specialization or backend work. Failed bootstrap
 returns diagnostics and publishes no partial profile.
 
-The canonical targets are `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`,
+The canonical targets are `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`,
 `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, and `wasm32-wasip2`. Each has a versioned machine description
 with architecture, operating system, ABI, object format, endianness, primitive widths and
 alignments, address spaces, stack alignment, supported CPU features and toolchain class. Target

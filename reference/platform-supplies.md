@@ -14,8 +14,11 @@ Managed supplies are recognized but unsupported. Resolution does not download or
 
 Darwin supplies distinguish SDK metadata, libSystem, frameworks, linker and consumed headers.
 SDKROOT, when supplied, must identify a valid SDK; otherwise discovery queries selected developer
-tools using xcrun and DEVELOPER_DIR. The SDK must admit ARM64 and the requested deployment.
-The default ARM64 deployment is 11.0.0. Resolution never raises a requested deployment silently.
+tools using xcrun and DEVELOPER_DIR, on a macOS host only. One SDK serves both macOS
+architectures, so an Apple silicon Mac discovers it for `x86_64-apple-darwin` too. The SDK must
+admit the target's architecture (`arm64` or `x86_64`) in its settings and libSystem stub, and the
+requested deployment. The default deployment is 11.0.0, raised to the SDK's minimum when a newer
+SDK drops it. Resolution never raises a written deployment.
 GNU/Linux supplies distinguish glibc libraries/scripts, startup and support objects, interpreter,
 search roots, compiler/linker and consumed headers. The selected toolchain supplies search and
 component information; explicit sysroots are inspected, not forwarded opaquely. Components from
@@ -46,6 +49,14 @@ platform baselines, real compile/link/inspection and separately compiled C fixtu
 optimized boundaries, and execution on available runners. Missing tools or skipped designated cases
 fail required lanes. LTO is not admitted by the compilation profile. Managed installation, new libc
 families, OS operation implementations and startup implementations belong to other capabilities.
+
+A host links an executable for its own target, for wasm32, for Windows, or for a Linux or macOS
+target whose supply resolves: an explicit supply naming the target, `SDKROOT` for macOS, or the
+SDK a Mac discovers. Without one the build stops before compiling and says how to declare a supply.
+Every native link passes the target triple to Clang. A Linux link uses the `ld.lld` beside Clang;
+a macOS link for another architecture or host uses `ld64.lld` and a native one Apple's `ld`. An
+explicit supply's `linker` wins over both. The link stamp covers the supply's root, linker,
+deployment and the digests of the SDK files it read, so a replaced SDK relinks.
 
 A project can pin a physical installation independently of its logical target profile:
 
