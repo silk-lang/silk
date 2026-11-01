@@ -1,5 +1,21 @@
 # Windows entry and host input slice
 
+## Native Silk execution evidence
+
+The optimized hello program from source `b01c66ee5eb497f092bd46450626889dfd3b28d7`, built
+by N1 from `32fc7293a26fd5ae3d5e282a7e193cb8bbfb9d35`, passed on Windows Server 2025
+build 26100. It printed exactly `Hello from Silk: 💩` followed by LF, returned 0, and
+produced no stderr. PE imports were Kernel32 and Ntdll only. This is actual Silk compilation,
+linking, and native execution. [Cross-build run](https://github.com/silk-lang/silk/actions/runs/41257448061).
+The local native runner report is `.scratch/windows-cross-41257448061/native-results.json`.
+
+That run did not produce the unoptimized executables: their frame-boundary weak symbols
+collided across codegen units. The replacement Windows frame walker and ordinary COFF
+boundary declarations require a new N1. Filesystem execution and the remaining native
+fixtures are not established by the hello result.
+
+## Implementation
+
 This slice adds ordinary Silk source for synchronous `mainCRTStartup`, Windows process-heap
 allocations, command-line and environment capture, and standard-handle output. It shares the
 existing `NativeReport` and diagnostic observer. It does not install OS fault handlers, support
