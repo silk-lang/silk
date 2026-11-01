@@ -1,8 +1,8 @@
 # Running CI on a branch
 
 The separate, non-required `Windows native execution` workflow consumes the
-successful `selfhost-native-n1` artifact from a Selfhost run. It verifies the build receipt,
-checks out that compiler's source commit, cross-builds the Windows fixtures on Linux, and executes
+successful `selfhost-native-n1` artifact from a dispatched Selfhost run. It verifies the build receipt
+against that compiler's source commit, cross-builds the workflow revision's Windows fixtures on Linux, and executes
 them on `windows-2025`. It also exports generated reference pages and replay controls.
 It does not rebuild N1 or change Linux/macOS gates:
 
@@ -11,8 +11,10 @@ gh api -X POST repos/silk-lang/silk/actions/workflows/windows.yml/dispatches \
   -f ref=feature/windows-support -f 'inputs[source-run]=<selfhost run id>'
 ```
 
-The source commit must contain the Windows cross-build and execution harness. Provisioning uses
-the workflow revision's setup action. Native results are retained in `windows-native-results`,
+The workflow revision must contain the Windows cross-build and execution harness. The run records
+both the tested revision and the N1 compiler revision. A previous N1 can validate new library sources;
+compiler changes need a new N1 before their behavior is validated. PR artifacts are refused because
+their synthetic merge revision differs from the run's head revision. Native results are retained in `windows-native-results`,
 with unexecuted claims reported separately. This route can validate Windows even when unrelated
 Selfhost jobs fail after producing a successful N1.
 
