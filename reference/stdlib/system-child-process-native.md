@@ -24,7 +24,7 @@ child, so no zombie process stays.
 - A trap in the parent can leave resources open.
 - On GNU/Linux, if the child cannot start and also cannot report why, the outcome looks like an
   exit with code 127.
-- The provider exists on Windows x86_64 MSVC, Darwin aarch64, and Linux with GNU libc on
+- The provider exists on Windows x86_64 MSVC, Darwin x86_64 or aarch64, and Linux with GNU libc on
   x86_64 or aarch64. Windows needs no CRT.
 - Windows executable and working-directory paths use `/C:/...` or `/UNC/...`. Raw values use
   canonical WTF-8. Batch files and case-insensitive duplicate environment names are refused.

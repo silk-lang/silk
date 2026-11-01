@@ -21,7 +21,7 @@ the system returned a count that is not valid.
 - The caller keeps the descriptor open and controls access from other threads.
 - [`NativeDescriptor.writeAll`](#NativeDescriptor.impl.writeAll) and [`NativeDescriptor.writeAllGather`](#NativeDescriptor.impl.writeAllGather) can fail after part of
   the bytes were written.
-- The module is empty on targets other than Darwin on aarch64, and Linux with GNU libc on x86_64
+- The module is empty on targets other than Darwin on x86_64 or aarch64, and Linux with GNU libc on x86_64
   or aarch64.
 
 ## Examples
@@ -125,7 +125,7 @@ system returned a count that is not valid.
 
 ### Gotchas
 - The caller keeps the descriptor open and controls access from other threads.
-- The type is empty on targets other than Darwin on aarch64, and Linux with GNU libc on x86_64
+- The type is empty on targets other than Darwin on x86_64 or aarch64, and Linux with GNU libc on x86_64
   or aarch64.
 
 <a id="NativeDescriptor.impl"></a>

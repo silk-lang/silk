@@ -15,7 +15,7 @@ The arguments and the environment come from the snapshot, so they do not change.
 directory is read from the process at each call. Each result is a new owned copy.
 
 ## Gotchas
-The provider exists only on Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+The provider exists only on Darwin on x86_64 or aarch64, and Linux with GNU libc on x86_64 or aarch64.
 
 ## Examples
 ### Read the working directory

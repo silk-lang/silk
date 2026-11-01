@@ -16,7 +16,7 @@ Each fill gets bytes from the secure random source of the system: `random_get` o
 - A failure of the source is a trap, because weak bytes are not safe. Part of the buffer can be
   changed before the trap.
 - On Linux, it needs glibc 2.25 and Linux 3.17 or later.
-- [`OsRandom.make`](#OsRandom.impl.make) fails to compile on targets other than WASI, Windows on x86_64, Darwin on aarch64, and GNU Linux on x86_64 or aarch64.
+- [`OsRandom.make`](#OsRandom.impl.make) fails to compile on targets other than WASI, Windows on x86_64, Darwin on x86_64 or aarch64, and GNU Linux on x86_64 or aarch64.
 
 ## Examples
 ### Make a random key

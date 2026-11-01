@@ -50,13 +50,22 @@ optimized boundaries, and execution on available runners. Missing tools or skipp
 fail required lanes. LTO is not admitted by the compilation profile. Managed installation, new libc
 families, OS operation implementations and startup implementations belong to other capabilities.
 
-A host links an executable for its own target, for wasm32, for Windows, or for a Linux or macOS
-target whose supply resolves: an explicit supply naming the target, `SDKROOT` for macOS, or the
-SDK a Mac discovers. Without one the build stops before compiling and says how to declare a supply.
-Every native link passes the target triple to Clang. A Linux link uses the `ld.lld` beside Clang;
-a macOS link for another architecture or host uses `ld64.lld` and a native one Apple's `ld`. An
-explicit supply's `linker` wins over both. The link stamp covers the supply's root, linker,
-deployment and the digests of the SDK files it read, so a replaced SDK relinks.
+A host links an executable for its own target, for wasm32, for Windows, for macOS, or for a Linux
+target whose supply resolves: an explicit supply naming the target. Without one the build stops
+before compiling and says how to declare a supply. Every native link passes the target triple to
+Clang. A Linux link uses the `ld.lld` beside Clang; a macOS link for another architecture or host
+uses `ld64.lld` and a native one Apple's `ld`. An explicit supply's `linker` wins over both. The
+link stamp covers the supply's root, linker, deployment and the digests of the SDK files it read,
+so a replaced SDK relinks.
+
+A macOS link needs no SDK. When an automatic request finds none (no `SDKROOT`, and no `xcrun` or a
+host that is not a Mac), the link uses Silk's own libSystem stub: a TAPI text file that names
+`/usr/lib/libSystem.B.dylib` and the symbols Silk programs bind there, for both macOS
+architectures. The compiler writes it into the link's scratch directory and links with
+`ld64.lld`, `-nostdlib` and `-lSystem` against it alone. The default deployment is then 12.0; a
+written deployment must be 11.0.0 or later. The stub's digest is part of the link stamp. It has no
+frameworks or other libraries, so a `[native].link` framework entry needs a real SDK through
+`SDKROOT` or an explicit supply. A `native` request never falls back to the stub.
 
 A project can pin a physical installation independently of its logical target profile:
 

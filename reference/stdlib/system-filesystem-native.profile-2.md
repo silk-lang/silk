@@ -59,7 +59,7 @@ with a portable reason and the native code.
   that renames those directories, changes mounts, or changes the temporary files.
 - After `writeFileAtomic` fails with a published error, the new contents are visible. Do not
   write again without a check.
-- The provider exists on WASI, Darwin aarch64, GNU/Linux x86_64 or aarch64, and Windows x86_64 with system DLLs.
+- The provider exists on WASI, Darwin x86_64 or aarch64, GNU/Linux x86_64 or aarch64, and Windows x86_64 with system DLLs.
 
 ## Examples
 ### Write and read a file in a temporary directory

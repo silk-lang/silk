@@ -23,7 +23,7 @@ fails. A host name with a deadline fails with `DeadlineUnsupported`.
 - A host name with a deadline fails with `DeadlineUnsupported` before the lookup. After
   `getaddrinfo` starts, it cannot be cancelled or limited in time or memory.
 - The lookup blocks the thread. It does not let another fiber run.
-- The supported targets are Windows x86_64 MSVC, Darwin aarch64, and GNU/Linux x86_64 or aarch64.
+- The supported targets are Windows x86_64 MSVC, Darwin x86_64 or aarch64, and GNU/Linux x86_64 or aarch64.
 
 ## Examples
 ### Use the system resolver
@@ -143,7 +143,7 @@ pub fn make() -> NativeSystemResolver
 Returns a resolver. It does no lookup.
 
 #### Gotchas
-Supported targets are Windows x86_64 MSVC, Darwin aarch64, and GNU/Linux x86_64 or aarch64.
+Supported targets are Windows x86_64 MSVC, Darwin x86_64 or aarch64, and GNU/Linux x86_64 or aarch64.
 
 <a id="NativeSystemResolver.impl.Resolver"></a>
 

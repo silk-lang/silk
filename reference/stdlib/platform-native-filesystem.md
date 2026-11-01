@@ -34,7 +34,7 @@ Each operation fails with `FileError`, with a portable reason and the native err
 ## Gotchas
 - A call that a signal interrupts is made again, except `close`, which is never repeated.
 - Other processes must not change the temporary files of an atomic write.
-- The functions exist only on Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+- The functions exist only on Darwin and on Linux with GNU libc, each on x86_64 or aarch64.
 
 Import as `NativeFileSystem` with `import silk.platform.native.filesystem { NativeFileSystem }`.
 
@@ -103,7 +103,7 @@ root. Each operation fails with `FileError`, with a portable reason and the nati
 
 ### Gotchas
 - A call that a signal interrupts is made again, except `close`, which is never repeated.
-- The functions exist only on Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+- The functions exist only on Darwin on x86_64 or aarch64, and Linux with GNU libc on x86_64 or aarch64.
 
 <a id="NativeFileSystem.impl"></a>
 

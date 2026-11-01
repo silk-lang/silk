@@ -20,7 +20,7 @@ Windows reads raw bytes through `ReadFile`; console bytes use the active input c
 ## Gotchas
 - An empty buffer returns a count of 0 without a read, also after the end of input.
 - A read waits until input arrives or ends.
-- The provider exists on WASI, Windows on x86_64, Darwin on aarch64, and GNU Linux on x86_64 or aarch64.
+- The provider exists on WASI, Windows on x86_64, Darwin on x86_64 or aarch64, and GNU Linux on x86_64 or aarch64.
 
 ## Examples
 ### Read standard input
