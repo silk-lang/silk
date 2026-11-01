@@ -18,12 +18,13 @@ between them.
 descriptor, and flush does nothing. The process owns the descriptors, and the providers do not
 close them.
 
-`Writer.writeVectored` sends several slices in one `writev` system call, up to eight slices for
-each call.
+On POSIX hosts, `Writer.writeVectored` sends up to eight slices per `writev` call. Windows
+writes redirected slices in order and decodes console slices together as canonical WTF-8.
 
 WASI commands have one thread. Their standard error lock does not need host synchronization.
 
-Standard error has one lock for the whole process: the lock of the C library's `stderr` stream.
+Standard error has one lock for the whole process: a Windows critical section or the POSIX
+C library's `stderr` stream lock.
 Each [`StderrWriter`](#StderrWriter) write takes it for the duration of that write. [`StderrWriter.lock`](#StderrWriter.impl.lock) keeps
 it until the [`LockedStderr`](#LockedStderr) drops, and collects the writes in a small buffer that the caller
 lends. The lock is recursive: the thread that holds it can take it again, for example to report
@@ -34,7 +35,10 @@ from several threads controls the order itself.
 `WriterError` if a write fails. Part of the bytes can be written already.
 
 ## Gotchas
-- The providers exist on WASI, Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+- The providers exist on Windows x86_64 MSVC without a CRT, WASI, Darwin on aarch64, and Linux
+  with GNU libc on x86_64 or aarch64.
+- Windows consoles require complete canonical WTF-8 per write or concatenated vectored write;
+  redirected handles accept arbitrary bytes. No console code page changes.
 - The lock orders only writes that take it. A direct write to descriptor 2, such as one from
   `silk.platform.native.descriptor`, can come between the parts of a locked message.
 
@@ -80,8 +84,9 @@ A `Writer` for standard output.
 
 ### Details
 It has no buffer. Each write writes all bytes to the descriptor, and flush does nothing. The
-process owns the descriptor, and the writer does not close it. `Writer.writeVectored` sends up
-to eight slices in one `writev` system call.
+process owns the handle, and the writer does not close it. POSIX vectored writes send up to
+eight slices per `writev`. Windows redirected output writes slices in order; real consoles
+decode complete canonical WTF-8 across the slices and write UTF-16 without changing code pages.
 
 ### Gotchas
 Standard output has no lock. A program that writes to it from several threads controls the
@@ -103,6 +108,9 @@ WASI commands have one thread, so their standard error lock requires no host syn
 Each write takes the standard error lock for its duration. Thus one write never comes in the
 middle of a message that another thread holds with [`StderrWriter.lock`](#StderrWriter.impl.lock). It has no buffer, and
 flush does nothing. The process owns the descriptor, and the writer does not close it.
+Windows uses a recursive critical section. Redirected output accepts arbitrary bytes; real
+consoles require complete canonical WTF-8 per write or concatenated vectored write and receive
+UTF-16 without a code-page change. A failed write can already have emitted a prefix.
 
 ### Gotchas
 The lock orders only writes that take it. A direct write to descriptor 2, such as one from
@@ -163,9 +171,9 @@ For one formatted message, [`StderrWriter.print`](#StderrWriter.impl.print) is s
 
 The call waits until no other thread holds the lock. The [`LockedStderr`](#LockedStderr) keeps the lock until
 it drops, and then writes the bytes that are left in `buffer`. A write that does not fit in
-the free part of `buffer` goes out at once, together with the buffered bytes in one system
-call. Thus a buffer of 64 bytes gives one system call for most short lines. An empty `buffer`
-gives one system call for each write.
+the free part of `buffer` goes out at once, together with the buffered bytes. POSIX hosts
+gather those bytes in one system call. Windows may use several host writes while holding
+the lock. An empty `buffer` writes each message immediately.
 
 WASI commands have one thread, so the lock requires no host synchronization.
 The lock is recursive. A second `lock` on the same thread returns at once, and its bytes go
@@ -226,8 +234,9 @@ output, provide a `Writer`. For log events, use `silk.io.logger`.
 
 The template rules are those of `silk.text.format.Format.format`, and the compiler checks them.
 The call holds the standard error lock while it formats and writes, so messages of different
-threads do not mix. It formats into a buffer of 64 bytes on the stack. Thus a short message is
-one system call, and the call does not allocate. It adds no newline.
+threads do not mix. It formats into a buffer of 64 bytes on the stack and does not allocate.
+It adds no newline. Windows consoles require complete canonical WTF-8 at each buffer flush;
+redirected handles preserve arbitrary bytes.
 
 #### Gotchas
 
@@ -262,6 +271,9 @@ A `Writer` for standard error that holds the standard error lock until it drops.
 Make one with [`StderrWriter.lock`](#StderrWriter.impl.lock). It collects writes in the buffer that the caller lent, and
 writes them when the buffer is full, on `Writer.flush`, and when it drops. A drop ignores a
 failure. Flush first to see it.
+Windows uses a recursive critical section. Its real console requires complete canonical
+WTF-8 at each flush or gathered write; redirection preserves arbitrary bytes. The lock orders
+only other writes through `StderrWriter` or `LockedStderr`, not direct host writes.
 
 <a id="LockedStderr.impl"></a>
 
@@ -386,4 +398,4 @@ effect fn writeVectored(self: &mut Self, vals: &[&[u8]]) -> () ! WriterError ? &
 
 Category: Input and output.
 
-Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`, `wasm32-wasip1`, `wasm32-wasip2`.
+Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`.

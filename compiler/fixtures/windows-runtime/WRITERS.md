@@ -29,8 +29,10 @@ also observes completed once initialization. Only Kernel32 is imported. Results 
 The shared `stderr-locked-message` corpus case is included in the Windows cross/native harness.
 Its existing exact stdout/stderr oracle distinguishes recursive nested output, plain writes under
 the lock, gathered buffer overflow, flush, drop, and empty-buffer writes. Actual Silk execution
-of this addition is not yet checked. Native console rendering and concurrent Silk writers remain
-not checked; the C oracle proves the host primitive and storage ABI, not Silk lowering.
+passed from [run 41259800219](https://github.com/silk-lang/silk/actions/runs/41259800219), source
+`c6b2d2f8b`, compiler `943142c73`, with exact output and exit zero. The local report is
+`.scratch/windows-cross-41259800219/stderr-native-results.json`. Native console rendering and
+concurrent Silk writers remain not checked; the C oracle independently proves the host lock.
 
 ## Reference comparison
 

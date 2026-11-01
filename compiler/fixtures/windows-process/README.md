@@ -37,9 +37,15 @@ check quote/backslash/empty/surrogate arguments, raw case-insensitive environmen
 parent-only variable, stdin EOF, and Job membership. The child writes 64 KiB to each pipe and
 leaves a sleeping descendant holding the pipes. The Silk fixture asserts every byte, exits 259
 and 0xc0000005, batch rejection, and duplicate-name rejection. The C child's Win64 structure
-assertions and freestanding compilation with LLVM 22.1.8 pass. The provider's Silk compilation
-and execution are not yet checked. An unrelated inheritable-handle sentinel, failed allocation
-during pending I/O, nondefault working directory, and concurrent launch remain not checked.
+assertions and freestanding compilation with LLVM 22.1.8 pass. Silk compiled the provider and
+fixture from `c6b2d2f8b` using N1 from `943142c73` in
+[run 41259800219](https://github.com/silk-lang/silk/actions/runs/41259800219). That older compiler
+lacked the new production imports. Locally linking its unchanged emitted objects with the
+current production support/import supply passed native execution with exit zero and no output.
+Evidence is `.scratch/windows-process-relink/results.json`. A fresh compiler-driven final link
+is still pending. The fixture now also checks an unrelated inheritable event cannot be signaled
+by the child; that addition is not checked yet. Failed allocation during pending I/O, nondefault
+working directory, and concurrent launch remain not checked.
 
 `run-thread.ps1` separately checks `CreateThread`'s DWORD result, argument passing, an 8 MiB
 stack reservation, wait-before-read ordering, handle closure, processor counts, zero-timeout

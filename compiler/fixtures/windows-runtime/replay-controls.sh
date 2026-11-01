@@ -7,14 +7,14 @@ baseline=$3
 mkdir -p "$out"
 git rev-parse HEAD > "$out/source-commit.txt"
 git rev-parse "$baseline" > "$out/baseline-commit.txt"
-for variant in baseline feature without-encoder-body; do
+for variant in baseline feature without-encoder-body without-encoder-and-path-bodies; do
   root="$out/$variant"
   mkdir -p "$root"
   revision=HEAD
   if [ "$variant" = baseline ]; then revision=$baseline; fi
   git archive "$revision" stdlib compiler/fixtures/stdlib-root compiler/fixtures/replay | tar -x -C "$root"
   cp "$root/compiler/fixtures/stdlib-root/"{silk.toml,stdlib_check.silk} "$root/stdlib/"
-  if [ "$variant" = without-encoder-body ]; then
+  if [[ "$variant" == without-encoder* ]]; then
     python3 - "$root/stdlib/silk/platform/windows/wtf8.silk" <<'PY'
 from pathlib import Path
 import sys
@@ -27,11 +27,27 @@ end = source.index('\n  }\n', start)
 path.write_text(source[:start] + '\n    fail OutOfMemoryError {}' + source[end:])
 PY
   fi
+  if [ "$variant" = without-encoder-and-path-bodies ]; then
+    python3 - "$root/stdlib/silk/platform/windows/path.silk" <<'PY'
+from pathlib import Path
+import re
+import sys
+path = Path(sys.argv[1])
+source = path.read_text()
+for name in ('fromNative', 'fromNativeBytes', 'toNativeBytes'):
+    matches = list(re.finditer(r'pub effect fn ' + name + r'\([^)]*\)[^{]*\{', source))
+    assert len(matches) == 1, name
+    start = matches[0].end()
+    end = source.index('\n  }\n', start)
+    source = source[:start] + '\n    fail OutOfMemoryError {}' + source[end:]
+path.write_text(source)
+PY
+  fi
   (
     cd "$root/stdlib"
     "$compiler" check --stdlib "$root/stdlib" --replay "$root/compiler/fixtures/replay/stdlib.toml" --differential
   ) > "$out/$variant.log" 2>&1
-  if [ "$variant" != without-encoder-body ]; then
+  if [ "$variant" = baseline ] || [ "$variant" = feature ]; then
     (
       cd "$root/stdlib"
       "$compiler" check --stdlib "$root/stdlib" --replay "$root/compiler/fixtures/replay/stdlib-long.toml"

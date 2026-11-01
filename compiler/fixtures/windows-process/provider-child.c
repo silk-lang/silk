@@ -24,6 +24,7 @@ __declspec(dllimport) int IsProcessInJob(H, H, int *);
 __declspec(dllimport) D GetModuleFileNameW(H, W *, D);
 __declspec(dllimport) int CreateProcessW(const W *, W *, void *, void *, int, D, void *, const W *, STARTUP *, PROCESS *);
 __declspec(dllimport) int CloseHandle(H);
+__declspec(dllimport) int SetEvent(H);
 __declspec(dllimport) void Sleep(D);
 __declspec(dllimport) __declspec(noreturn) void ExitProcess(D);
 static W executable[32768];
@@ -46,6 +47,15 @@ void mainCRTStartup(void) {
   W value[32];
   if (GetEnvironmentVariableW((const W *)L"silk_\x00e9", value, 32) != 1 || value[0] != 0xd800) ExitProcess(12);
   if (GetEnvironmentVariableW((const W *)L"SILK_PARENT_ONLY", value, 32) != 0) ExitProcess(13);
+  if (GetEnvironmentVariableW((const W *)L"SILK_PARENT_HANDLE", value, 32) != 16) ExitProcess(19);
+  uintptr_t marker = 0;
+  for (D i=0; i<16; ++i) {
+    W digit = value[i];
+    if (!((digit >= '0' && digit <= '9') || (digit >= 'a' && digit <= 'f'))) ExitProcess(19);
+    marker = marker * 16 + (digit <= '9' ? digit - '0' : digit - 'a' + 10);
+  }
+  // Parent checks its own event. Reusing the number for another child handle cannot fake that observation.
+  (void)SetEvent((H)marker);
   int in_job = 0;
   if (!IsProcessInJob(GetCurrentProcess(), 0, &in_job) || !in_job) ExitProcess(14);
   D received = 1; uint8_t byte = 99;

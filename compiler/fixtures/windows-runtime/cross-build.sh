@@ -39,7 +39,7 @@ silk-version = "0.0.0"
 EOF
   source="$package/src/main.silk"
   if [ "$program" = process ]; then
-    printf 'LIBRARY kernel32.dll\nEXPORTS\nGetCommandLineW\nLocalFree\nGetEnvironmentVariableW\nGetStdHandle\nReadFile\nWriteFile\nGetCurrentProcess\nIsProcessInJob\nGetModuleFileNameW\nCreateProcessW\nCloseHandle\nSleep\nExitProcess\n' > "$package/kernel32.def"
+    printf 'LIBRARY kernel32.dll\nEXPORTS\nGetCommandLineW\nLocalFree\nGetEnvironmentVariableW\nGetStdHandle\nReadFile\nWriteFile\nGetCurrentProcess\nIsProcessInJob\nGetModuleFileNameW\nCreateProcessW\nCloseHandle\nSetEvent\nSleep\nExitProcess\n' > "$package/kernel32.def"
     printf 'LIBRARY shell32.dll\nEXPORTS\nCommandLineToArgvW\n' > "$package/shell32.def"
     if ! "$SILK_TEST_CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-stack-protector \
       -Wall -Wextra -Werror -c compiler/fixtures/windows-process/provider-child.c -o "$package/child.obj" \

@@ -57,6 +57,24 @@ pub fn stderr() -> WindowsConsole
 
 Returns an unbuffered standard-error writer. It does not read or change the process handle.
 
+<a id="WindowsConsole.impl.writeAllGather"></a>
+
+### Associated function `writeAllGather`
+
+```silk
+pub effect fn writeAllGather(selector: i32, prefix: &[u8], rest: &[&[u8]], error: &mut i32) -> bool
+```
+
+Writes `prefix` followed by every slice in `rest` to standard handle 1 or 2.
+
+#### Details
+
+Redirected output preserves arbitrary bytes. Console output decodes the concatenation as
+canonical WTF-8, including characters split across slices, without allocating. Calls can
+interleave with other threads and can write a prefix before failure. Empty input succeeds.
+Success sets `error` to zero; failure sets a Windows error, 6 for an invalid selector,
+1113 for invalid WTF-8, or 29 for invalid progress. No handle is closed.
+
 <a id="WindowsConsole.impl.writeAll"></a>
 
 ### Associated function `writeAll`
@@ -100,6 +118,14 @@ effect fn writeAll(self: &mut Self, bytes: &[u8]) -> () ! WriterError ? &mut Wri
 
 ```silk
 effect fn flush(self: &mut Self) -> () ! WriterError ? &mut Writer
+```
+
+<a id="WindowsConsole.impl.Writer.writeVectored"></a>
+
+### Operation `writeVectored`
+
+```silk
+effect fn writeVectored(self: &mut Self, bytes: &[&[u8]]) -> () ! WriterError ? &mut Writer
 ```
 
 
