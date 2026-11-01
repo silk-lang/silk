@@ -8,7 +8,7 @@ $readobj = Join-Path $LlvmBin 'llvm-readobj.exe'
 $results = @()
 $failed = $false
 foreach ($name in @('hello', 'hello-speed', 'storage', 'host-check', 'providers', 'filesystem',
-    'native-thread-spawn-join', 'native-thread-cross-wake', 'atomic-wait-notify', 'native-termination-source-trap')) {
+    'native-thread-spawn-join', 'native-thread-cross-wake', 'atomic-wait-notify', 'native-termination-source-trap', 'stderr-locked-message')) {
   $executable = Join-Path $artifact "$name.exe"
   if ($name -eq 'filesystem') { $executable = Join-Path $artifact 'windows-filesystem/provider.exe' }
   if (!(Test-Path -LiteralPath $executable)) {
@@ -72,6 +72,12 @@ foreach ($name in @('hello', 'hello-speed', 'storage', 'host-check', 'providers'
     $expectedCode = 0
     if ($corpusThread) { $expectedCode = 42 }
     $passed = $child.ExitCode -eq $expectedCode -and $output -ceq $expected -and $errorOutput -ceq ''
+    if ($name -eq 'stderr-locked-message') {
+      $corpus = Join-Path $PSScriptRoot '../../../corpus/native/stderr-locked-message'
+      $expectedOut = [IO.File]::ReadAllText((Join-Path $corpus 'expected.stdout')).Replace("`r`n", "`n")
+      $expectedError = [IO.File]::ReadAllText((Join-Path $corpus 'expected.stderr')).Replace("`r`n", "`n")
+      $passed = $child.ExitCode -eq 0 -and $output -ceq $expectedOut -and $errorOutput -ceq $expectedError
+    }
     if ($name -eq 'native-termination-source-trap') {
       # This fixture explicitly traps. A high status from an arbitrary child is not a crash oracle.
       $terminated = $child.ExitCode -eq -1073741795 -or $child.ExitCode -eq -1073740791

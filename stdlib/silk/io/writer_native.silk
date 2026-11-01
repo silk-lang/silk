@@ -14,12 +14,13 @@
 //! descriptor, and flush does nothing. The process owns the descriptors, and the providers do not
 //! close them.
 //!
-//! `Writer.writeVectored` sends several slices in one `writev` system call, up to eight slices for
-//! each call.
+//! On POSIX hosts, `Writer.writeVectored` sends up to eight slices per `writev` call. Windows
+//! writes redirected slices in order and decodes console slices together as canonical WTF-8.
 //!
 //! WASI commands have one thread. Their standard error lock does not need host synchronization.
 //!
-//! Standard error has one lock for the whole process: the lock of the C library's `stderr` stream.
+//! Standard error has one lock for the whole process: a Windows critical section or the POSIX
+//! C library's `stderr` stream lock.
 //! Each [`StderrWriter`] write takes it for the duration of that write. [`StderrWriter.lock`] keeps
 //! it until the [`LockedStderr`] drops, and collects the writes in a small buffer that the caller
 //! lends. The lock is recursive: the thread that holds it can take it again, for example to report
@@ -30,7 +31,10 @@
 //! `WriterError` if a write fails. Part of the bytes can be written already.
 //!
 //! # Gotchas
-//! - The providers exist on WASI, Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+//! - The providers exist on Windows x86_64 MSVC without a CRT, WASI, Darwin on aarch64, and Linux
+//!   with GNU libc on x86_64 or aarch64.
+//! - Windows consoles require complete canonical WTF-8 per write or concatenated vectored write;
+//!   redirected handles accept arbitrary bytes. No console code page changes.
 //! - The lock orders only writes that take it. A direct write to descriptor 2, such as one from
 //!   `silk.platform.native.descriptor`, can come between the parts of a locked message.
 //!
@@ -62,11 +66,13 @@
 //!
 //! @category Input and output
 
-static if Intrinsic.targetOperatingSystem() == "wasi" || (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArchitecture() == "aarch64" && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+static if Intrinsic.targetOperatingSystem() == "wasi" || (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArchitecture() == "x86_64" && Intrinsic.targetAbi() == "msvc" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArchitecture() == "aarch64" && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
   import silk.core.effect { Effect }
   import silk.text.format { Format }
   static if Intrinsic.targetOperatingSystem() == "wasi" {
     import silk.platform.wasi.descriptor {WasiDescriptor as NativeDescriptor}
+  } else static if Intrinsic.targetOperatingSystem() == "windows" {
+    import silk.platform.windows.console {WindowsConsole as NativeDescriptor}
   } else {
     import silk.platform.native.descriptor {NativeDescriptor}
   }
@@ -78,6 +84,42 @@ static if Intrinsic.targetOperatingSystem() == "wasi" || (Intrinsic.targetOperat
 static if Intrinsic.targetOperatingSystem() == "wasi" {
   fn lockStandardError() -> () {}
   fn unlockStandardError() -> () {}
+} else static if Intrinsic.targetOperatingSystem() == "windows" {
+  import silk.mem.pointer { Pointer }
+  // Process-lifetime storage comes from the no-CRT support object. Policy and initialization
+  // stay here; INIT_ONCE publishes the initialized recursive critical section to all threads.
+  unsafe extern "C" static stderrOnce: *mut u8 as "__silk_stderr_once"
+  unsafe extern "C" static stderrLock: *mut u8 as "__silk_stderr_lock"
+  @foreign(noCapture: ("once", "pending", "context"))
+  unsafe extern "C" fn InitOnceBeginInitialize(once: *mut u8, flags: u32, pending: *mut i32, context: ?*mut ?*mut u8) -> i32
+  @foreign(noCapture: ("once", "context"))
+  unsafe extern "C" fn InitOnceComplete(once: *mut u8, flags: u32, context: ?*mut u8) -> i32
+  @foreign(noCapture: ("lock",))
+  unsafe extern "C" fn InitializeCriticalSectionEx(lock: *mut u8, spin: u32, flags: u32) -> i32
+  @foreign(noCapture: ("lock",))
+  unsafe extern "C" fn EnterCriticalSection(lock: *mut u8) -> ()
+  @foreign(noCapture: ("lock",))
+  unsafe extern "C" fn LeaveCriticalSection(lock: *mut u8) -> ()
+
+  fn lockStandardError() -> () {
+    let mut pending: i32 = 0
+    unsafe {
+      if InitOnceBeginInitialize(stderrOnce, 0, Pointer.fromMutRef(&mut pending), Pointer.null<?*mut u8>()) == 0 {
+        Intrinsic.trap("Windows stderr initialization failed")
+      }
+      if pending != 0 {
+        if InitializeCriticalSectionEx(stderrLock, 0, 0) == 0 {
+          let ignored = InitOnceComplete(stderrOnce, 4, Pointer.null<u8>())
+          Intrinsic.trap("Windows stderr lock initialization failed")
+        }
+        if InitOnceComplete(stderrOnce, 0, Pointer.null<u8>()) == 0 {
+          Intrinsic.trap("Windows stderr lock publication failed")
+        }
+      }
+      EnterCriticalSection(stderrLock)
+    }
+  }
+  fn unlockStandardError() -> () { unsafe { LeaveCriticalSection(stderrLock) } }
 } else {
 // The C library's `FILE`. Only its lock is used.
 extern "C" struct CStream {}
@@ -99,8 +141,9 @@ fn unlockStandardError() -> () { unsafe { return funlockfile(standardErrorStream
 ///
 /// # Details
 /// It has no buffer. Each write writes all bytes to the descriptor, and flush does nothing. The
-/// process owns the descriptor, and the writer does not close it. `Writer.writeVectored` sends up
-/// to eight slices in one `writev` system call.
+/// process owns the handle, and the writer does not close it. POSIX vectored writes send up to
+/// eight slices per `writev`. Windows redirected output writes slices in order; real consoles
+/// decode complete canonical WTF-8 across the slices and write UTF-16 without changing code pages.
 ///
 /// # Gotchas
 /// Standard output has no lock. A program that writes to it from several threads controls the
@@ -116,6 +159,9 @@ pub struct StdoutWriter {
 /// Each write takes the standard error lock for its duration. Thus one write never comes in the
 /// middle of a message that another thread holds with [`StderrWriter.lock`]. It has no buffer, and
 /// flush does nothing. The process owns the descriptor, and the writer does not close it.
+/// Windows uses a recursive critical section. Redirected output accepts arbitrary bytes; real
+/// consoles require complete canonical WTF-8 per write or concatenated vectored write and receive
+/// UTF-16 without a code-page change. A failed write can already have emitted a prefix.
 ///
 /// # Gotchas
 /// The lock orders only writes that take it. A direct write to descriptor 2, such as one from
@@ -143,9 +189,9 @@ impl StderrWriter {
   ///
   /// The call waits until no other thread holds the lock. The [`LockedStderr`] keeps the lock until
   /// it drops, and then writes the bytes that are left in `buffer`. A write that does not fit in
-  /// the free part of `buffer` goes out at once, together with the buffered bytes in one system
-  /// call. Thus a buffer of 64 bytes gives one system call for most short lines. An empty `buffer`
-  /// gives one system call for each write.
+  /// the free part of `buffer` goes out at once, together with the buffered bytes. POSIX hosts
+  /// gather those bytes in one system call. Windows may use several host writes while holding
+  /// the lock. An empty `buffer` writes each message immediately.
   ///
   /// WASI commands have one thread, so the lock requires no host synchronization.
   /// The lock is recursive. A second `lock` on the same thread returns at once, and its bytes go
@@ -202,8 +248,9 @@ impl StderrWriter {
   ///
   /// The template rules are those of `silk.text.format.Format.format`, and the compiler checks them.
   /// The call holds the standard error lock while it formats and writes, so messages of different
-  /// threads do not mix. It formats into a buffer of 64 bytes on the stack. Thus a short message is
-  /// one system call, and the call does not allocate. It adds no newline.
+  /// threads do not mix. It formats into a buffer of 64 bytes on the stack and does not allocate.
+  /// It adds no newline. Windows consoles require complete canonical WTF-8 at each buffer flush;
+  /// redirected handles preserve arbitrary bytes.
   ///
   /// # Gotchas
   ///
@@ -246,6 +293,9 @@ effect fn formatLocked<Args>(
 /// Make one with [`StderrWriter.lock`]. It collects writes in the buffer that the caller lent, and
 /// writes them when the buffer is full, on `Writer.flush`, and when it drops. A drop ignores a
 /// failure. Flush first to see it.
+/// Windows uses a recursive critical section. Its real console requires complete canonical
+/// WTF-8 at each flush or gathered write; redirection preserves arbitrary bytes. The lock orders
+/// only other writes through `StderrWriter` or `LockedStderr`, not direct host writes.
 pub struct LockedStderr<'a> {
   buffer: &'a mut [u8],
   end: usize,
