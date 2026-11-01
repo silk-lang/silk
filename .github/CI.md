@@ -1,17 +1,20 @@
 # Running CI on a branch
 
 The separate, non-required `Windows native execution` workflow consumes the
-`windows-no-crt-programs` artifact from a Selfhost dispatch with `windows-smoke=true`.
-It checks out the artifact's source commit and verifies its recorded revision before executing
-the fixtures on `windows-2025`. It does not rebuild N1 or change Linux/macOS gates:
+successful `selfhost-native-n1` artifact from a Selfhost run. It verifies the build receipt,
+checks out that compiler's source commit, cross-builds the Windows fixtures on Linux, and executes
+them on `windows-2025`. It also exports generated reference pages and replay controls.
+It does not rebuild N1 or change Linux/macOS gates:
 
 ```sh
 gh api -X POST repos/silk-lang/silk/actions/workflows/windows.yml/dispatches \
   -f ref=feature/windows-support -f 'inputs[source-run]=<selfhost run id>'
 ```
 
-The source commit must contain the Windows setup action and execution harness. Native results
-are retained in `windows-native-results`, with unexecuted claims reported separately.
+The source commit must contain the Windows cross-build and execution harness. Provisioning uses
+the workflow revision's setup action. Native results are retained in `windows-native-results`,
+with unexecuted claims reported separately. This route can validate Windows even when unrelated
+Selfhost jobs fail after producing a successful N1.
 
 Selfhost CI (`.github/workflows/selfhost.yml`) runs on every push to a pull request into `main`; a
 newer push cancels the PR's older run. `main` runs it on every push and on the nightly schedule.
