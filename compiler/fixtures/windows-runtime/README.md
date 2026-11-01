@@ -9,7 +9,8 @@ The portable `windows-host-codecs` corpus case supplies literal UTF-16 tables an
 specified output bytes. Its assertions cover argv[0] quote rules, modern MSVC quoting, slash
 parity, empty arguments, unmatched quotes, raw surrogates, NUL rejection, canonical WTF-8
 boundaries, malformed encodings, and hidden environment-name separators. The parser is never
-tested solely by parsing its own argument encoder. There is no argument encoder in this slice.
+tested solely by parsing its own argument encoder. The encoder has independent literal output
+oracles and a native process fixture in `../windows-process`.
 
 ## Integration
 
@@ -47,16 +48,13 @@ WriteConsoleW
 Link COFF with `/nodefaultlib /machine:x64 /subsystem:console /entry:mainCRTStartup` and an
 `.exe` output. Inspect PE imports to reject CRT imports. LLVM-emitted memory helpers, `__chkstk`,
 and `_fltused` remain with the linker/runtime-symbol owner, as established by the no-CRT proof
-in PR #2681. Compiler MIR still names `malloc`, `realloc`, and `free`; allocation drop glue can
-retain `free` even when an allocation has a source reclaim callback. Those compiler-owned runtime
-bindings must be resolved before claiming an executable. Do not mask them with CRT shims.
+in PR #2681. Sealed compiler allocation calls lower to process-heap APIs on Windows, including
+drop glue; source declarations named `malloc`, `realloc`, or `free` retain their authored linkage.
 
 System `Allocator` requests on Windows adopt a `HeapAlloc` allocation with a `HeapFree` reclaim
 callback, including alignment padding. They decline the libc-specific in-place growth path.
-Execution-storage reservations and diagnostic pools still require the separately owned Windows
-execution-storage binding. Until that module admits Windows, `NativeDiagnostics` cannot import its
-`ExecutionStorage` type on this target. `WindowsHeap.acquire` and `WindowsHeap.release` are available
-for that binding, with the existing reservation accounting retained by its owner.
+Execution-storage reservations and diagnostic pools use `WindowsHeap.acquire` and
+`WindowsHeap.release`, retaining the shared reservation accounting.
 
 ## Host contracts
 
@@ -74,7 +72,8 @@ on allocation failure. A leading `=` is part of a name, so `=C:=C:\work` is spli
 Malformed entries without a separator are ignored. Lookup validates canonical WTF-8 and NUL,
 uses `CompareStringOrdinal(..., TRUE)`, and selects the first matching snapshot entry. This uses
 Windows' case table, not ASCII folding or a locale-sensitive language transformation. Directory
-lookup returns the native Windows spelling as raw WTF-8. Portable `Path` spelling is deferred.
+lookup returns the native Windows spelling as raw WTF-8. `WindowsPath` converts absolute names
+to the explicit `/C:/...` and `/UNC/server/share/...` machine namespace.
 
 Console output uses `GetConsoleMode` to distinguish real consoles from redirected handles.
 Redirected output preserves arbitrary bytes with `WriteFile`. A real console requires one complete
