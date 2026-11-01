@@ -16,24 +16,27 @@ for program in hello storage host-check providers native-thread-spawn-join nativ
       allowed_dlls='Name: (kernel32|ntdll|api-ms-win-core-synch-l1-2-0)\.dll'
       ;;
   esac
-  if [ "$program" = providers ]; then
-    source="$out/providers-package"
-    mkdir -p "$source/src"
-    cp compiler/fixtures/windows-runtime/providers.silk "$source/src/main.silk"
-    printf 'LIBRARY kernel32.dll\nEXPORTS\nCreatePipe\nCloseHandle\nSetStdHandle\n' > "$source/fixture.def"
-    cat > "$source/silk.toml" <<'EOF'
+  package="$out/$program-package"
+  mkdir -p "$package/src"
+  cp "$source" "$package/src/main.silk"
+  cat > "$package/silk.toml" <<EOF
 [package]
-name = "windows-providers-fixture"
+name = "windows-$program-fixture"
 version = "0.0.0"
 silk-version = "0.0.0"
+EOF
+  source="$package/src/main.silk"
+  if [ "$program" = providers ]; then
+    printf 'LIBRARY kernel32.dll\nEXPORTS\nCreatePipe\nCloseHandle\nSetStdHandle\n' > "$package/fixture.def"
+    cat >> "$package/silk.toml" <<'EOF'
 [native]
 link = [{ object = "companion.obj" }, { static-archive = "fixture.lib" }]
 EOF
     if ! "$SILK_TEST_CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding \
         -fno-stack-protector -Wall -Wextra -Werror -DSILK_PROVIDER_COMPANION \
-        -c compiler/fixtures/windows-runtime/providers-contract.c -o "$source/companion.obj" \
+        -c compiler/fixtures/windows-runtime/providers-contract.c -o "$package/companion.obj" \
         > "$out/providers-companion.log" 2>&1 \
-        || ! llvm-dlltool -m i386:x86-64 -d "$source/fixture.def" -l "$source/fixture.lib"; then
+        || ! llvm-dlltool -m i386:x86-64 -d "$package/fixture.def" -l "$package/fixture.lib"; then
       cat "$out/providers-companion.log"
       printf 'providers\tfail: companion\tnot-checked\tnot-checked\n' >> "$out/results.tsv"
       failed=1

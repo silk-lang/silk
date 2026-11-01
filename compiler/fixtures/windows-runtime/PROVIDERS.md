@@ -48,9 +48,9 @@ silk-version = "0.0.0"
 [native]
 link = [{ object = "companion.obj" }, { static-archive = "fixture.lib" }]
 EOF
-"$compiler" build "$pkg" -o "$out/providers.ll" --emit llvm-ir \
+"$compiler" build "$pkg/src/main.silk" -o "$out/providers.ll" --emit llvm-ir \
   --target x86_64-pc-windows-msvc --stdlib "$repo/stdlib" --optimization none --debug false
-"$compiler" build "$pkg" -o "$out/providers.exe" --target x86_64-pc-windows-msvc \
+"$compiler" build "$pkg/src/main.silk" -o "$out/providers.exe" --target x86_64-pc-windows-msvc \
   --stdlib "$repo/stdlib" --clang "$SILK_TEST_CLANG" --optimization none --debug false
 llvm-readobj --file-headers --coff-imports "$out/providers.exe" > "$out/providers-pe.txt"
 ```

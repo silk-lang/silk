@@ -23,7 +23,7 @@ link = [
   { static-archive = "fixture-kernel32.lib" },
 ]
 MANIFEST
-"$compiler" build "$out/package" -o "$out/provider.exe" --target x86_64-pc-windows-msvc \
+"$compiler" build "$out/package/src/main.silk" -o "$out/provider.exe" --target x86_64-pc-windows-msvc \
   --stdlib "$repo/stdlib" --clang "$clang" --optimization none --debug false \
   > "$out/provider-build.log" 2>&1 || { cat "$out/provider-build.log"; exit 1; }
 llvm-readobj --file-headers --coff-imports "$out/provider.exe" > "$out/provider-pe.txt"
