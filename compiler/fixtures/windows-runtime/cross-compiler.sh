@@ -6,17 +6,20 @@ out=$2
 mkdir -p "$out"
 git rev-parse HEAD > "$out/source-commit.txt"
 cp compiler/silk.toml "$out/original-silk.toml"
-trap 'cp "$out/original-silk.toml" compiler/silk.toml' EXIT
+supply=$(mktemp -d "$PWD/compiler/.windows-imports.XXXXXX")
+trap 'cp "$out/original-silk.toml" compiler/silk.toml; rm -rf -- "$supply"' EXIT
 # An older N1 knows only the exports present when it was compiled. Extract the .def strings
 # from the compiler being built, without maintaining a fixture copy of the production supply.
-python3 - "$out" <<'PY'
+python3 - "$out" "$supply" <<'PY'
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import textwrap
 import tomllib
 out = Path(sys.argv[1]).resolve()
+supply = Path(sys.argv[2]).resolve()
 source = Path('compiler/src/driver/WindowsLink.silk').read_text()
 definitions = re.findall(r'fn (\w+)\(\) -> string<\x27static> \{\s*return """(.*?)"""', source, re.S)
 libraries = []
@@ -28,7 +31,9 @@ for name, content in definitions:
     path.write_text(definition)
     library = out / (name + '.lib')
     subprocess.run(['llvm-dlltool', '-m', 'i386:x86-64', '-d', str(path), '-l', str(library)], check=True)
-    libraries.append('{ static-archive = "' + library.as_posix() + '" }')
+    local = supply / library.name
+    shutil.copyfile(library, local)
+    libraries.append('{ static-archive = "' + local.relative_to(Path('compiler').resolve()).as_posix() + '" }')
 assert libraries, 'No production Windows import definitions found'
 manifest = Path('compiler/silk.toml')
 original = manifest.read_text()
