@@ -24,7 +24,12 @@ child, so no zombie process stays.
 - A trap in the parent can leave resources open.
 - On GNU/Linux, if the child cannot start and also cannot report why, the outcome looks like an
   exit with code 127.
-- The provider exists only on Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+- The provider exists on Windows x86_64 MSVC, Darwin aarch64, and Linux with GNU libc on
+  x86_64 or aarch64. Windows needs no CRT.
+- Windows executable and working-directory paths use `/C:/...` or `/UNC/...`. Raw values use
+  canonical WTF-8. Batch files and case-insensitive duplicate environment names are refused.
+  Only standard handles are inherited. Remaining descendants are terminated when the child ends.
+  Every exit-status bit survives in the signed `i32`; high values alone do not establish a crash.
 
 ## Examples
 ### Run echo
@@ -76,4 +81,4 @@ This module declares no public items.
 
 Category: System.
 
-Profiles: `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`.
+Profiles: `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`.
