@@ -1,0 +1,904 @@
+//! Line break opportunities: the Unicode Line Breaking Algorithm (UAX #14) with CSS tailoring, with
+//! data from Unicode 18.0.0.
+//!
+//! # When to use
+//! Use [`breaks`] to find where text can wrap onto a new line. Use [`breaksWithDictionary`] when the
+//! text can contain Thai, Lao, Khmer or Myanmar, which need a word dictionary.
+//!
+//! # Details
+//! [`LineOptions.make`] selects untailored UAX #14 with manual soft hyphens. The options follow the
+//! CSS Text Module Level 3 properties `line-break` (`auto`, `loose`, `normal`, `strict`,
+//! `anywhere`), `word-break` (`normal`, `break-all`, `keep-all`) and `hyphens` (`manual`, `none`),
+//! with the CSS CJK punctuation rules for Japanese and Chinese. Mandatory breaks always win.
+//! `anywhere` breaks between grapheme clusters and ignores `word-break`.
+//!
+//! The functions take a `string` and report byte offsets. The result is appended to a caller-owned
+//! list: sorted, unique, and ending with a mandatory break at the end of the text. The scan decodes
+//! each scalar once and uses constant extra storage.
+//!
+//! # Gotchas
+//! There is no automatic hyphenation. Only soft hyphens (U+00AD) give hyphenated breaks.
+//!
+//! # Examples
+//! ## Find where a sentence can wrap
+//! ```silk
+//! import silk.collections.list { List }
+//! import silk.core.effect { Effect }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.text.line_break
+//! import silk.text.line_break { BreakKind, BreakOpportunity, LineOptions }
+//!
+//! pub effect fn main() -> i32
+//!   ! OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let mut opportunities = List<BreakOpportunity>.make()
+//!   run line_break.breaks("Hello, world!\nBye", LineOptions.make(), &mut opportunities)
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   // Lines can end after "Hello, " and must end after the newline and at the end.
+//!   let offsets = opportunities.asSlice()
+//!   if offsets.length != 3 || offsets[0].offset != 7 || offsets[1].kind != BreakKind.Mandatory {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Text
+
+// Rules: https://www.unicode.org/reports/tr14/tr14-56.html and the Unicode 18
+// auxiliary/LineBreakTest.html rule listing (including corrected LB12a).
+// CSS: https://www.w3.org/TR/2026/CRD-css-text-3-20260814/#line-break-property
+// Auto with Japanese/Chinese selects Normal; explicit Normal/Loose/Strict implement CSS
+// punctuation rules. Precedence: mandatory breaks and EOF; Anywhere (extended grapheme
+// boundaries, ignoring WJ/GL and word-break, never hyphenating); otherwise UAX14 with CSS class
+// tailoring, then KeepAll suppression / optional dictionary word breaks. BreakAll preserves
+// graphemes and disables hyphenation; None suppresses SHY.
+
+import silk.text.unicode_data
+import silk.text.unicode_properties { LineBreak }
+import silk.text.utf8_scan
+import silk.text.segmentation { GraphemeCursor }
+import silk.text.string { String }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+
+/// How a line may break at a [`BreakOpportunity`].
+pub enum BreakKind {
+  /// An optional break: a line may end here.
+  Allowed,
+  /// A mandatory break: a line must end here, after a hard line break character such as LF, and at
+  /// the end of the text.
+  Mandatory,
+  /// An optional break after a soft hyphen (U+00AD). A renderer that breaks here shows a hyphen.
+  Hyphenated,
+}
+
+/// A place where a line may or must end, as [`breaks`] gives it.
+pub struct BreakOpportunity {
+  /// The byte offset where the line ends. The next line starts at this offset.
+  pub offset: usize,
+  /// Whether the break is optional, mandatory, or hyphenated.
+  pub kind: BreakKind,
+}
+
+impl Copy for BreakOpportunity {}
+
+/// The strictness of line breaking around CJK punctuation, as the CSS `line-break` property sets
+/// it.
+pub enum LineBreakMode {
+  /// The default. Untailored UAX #14, or [`LineBreakMode.Normal`] when the language is Japanese or
+  /// Chinese.
+  Auto,
+  /// The least strict rules, for narrow columns: breaks are allowed before small kana, iteration
+  /// marks, and some punctuation.
+  Loose,
+  /// The common CJK rules: breaks are allowed before small kana and the prolonged sound mark.
+  Normal,
+  /// The most strict rules: no break before small kana, iteration marks, or the prolonged sound
+  /// mark.
+  Strict,
+  /// A break is allowed between any two grapheme clusters, except before a mandatory break.
+  Anywhere,
+}
+
+/// The word breaking rules, as the CSS `word-break` property sets them.
+pub enum WordBreakMode {
+  /// The default rules: breaks between words, and between CJK characters.
+  Normal,
+  /// A break is also allowed inside words, between grapheme clusters of letters and digits.
+  BreakAll,
+  /// No break between letters and digits, also in CJK text. Breaks stay at spaces and punctuation.
+  KeepAll,
+}
+
+/// The treatment of soft hyphens (U+00AD), as the CSS `hyphens` property sets it.
+pub enum Hyphens {
+  /// A soft hyphen gives a [`BreakKind.Hyphenated`] break opportunity.
+  Manual,
+  /// A soft hyphen gives no break opportunity.
+  None,
+}
+
+/// The content language that selects language-specific line breaking rules.
+pub enum LineLanguage {
+  /// No language-specific rules.
+  Default,
+  /// Japanese: the CSS CJK punctuation rules apply.
+  Japanese,
+  /// Chinese: the CSS CJK punctuation rules apply.
+  Chinese,
+}
+
+/// The settings for [`breaks`], which follow the CSS Text Module Level 3 properties.
+///
+/// # Details
+///
+/// [`LineOptions.make`] gives the untailored UAX #14 rules with manual soft hyphens. Set the
+/// fields to tailor the rules: for example, set `language` to [`LineLanguage.Japanese`] for the
+/// CSS CJK punctuation rules.
+pub struct LineOptions {
+  /// The strictness of breaking around CJK punctuation, as CSS `line-break` sets it.
+  pub lineBreak: LineBreakMode,
+  /// The word breaking rules, as CSS `word-break` sets them.
+  pub wordBreak: WordBreakMode,
+  /// The treatment of soft hyphens, as CSS `hyphens` sets it.
+  pub hyphens: Hyphens,
+  /// The content language.
+  pub language: LineLanguage,
+}
+
+impl Copy for LineOptions {}
+
+impl LineOptions {
+  /// Returns the untailored UAX #14 settings: [`LineBreakMode.Auto`], [`WordBreakMode.Normal`],
+  /// [`Hyphens.Manual`] and [`LineLanguage.Default`].
+  pub fn make() -> Self {
+    return Self {
+      lineBreak: LineBreakMode.Auto,
+      wordBreak: WordBreakMode.Normal,
+      hyphens: Hyphens.Manual,
+      language: LineLanguage.Default,
+    }
+  }
+}
+
+/// A provider of word boundaries for scripts that do not separate words with spaces, such as Thai.
+///
+/// # When to use
+///
+/// Implement `DictionarySegmenter` to give [`breaksWithDictionary`] the word boundaries of Thai,
+/// Lao, Khmer or Myanmar text. `IcuDictionary` in `silk.text.word_dictionary` implements it with
+/// the ICU dictionaries.
+///
+/// # Details
+///
+/// The line breaker asks the provider once per text, and uses its boundaries only between two
+/// characters of the Line_Break class `SA` (South East Asian).
+pub interface DictionarySegmenter {
+  /// Appends the word boundaries of `text` to `output`, as sorted byte offsets that include 0 and
+  /// `text`'s byte length once each.
+  ///
+  /// # Details
+  ///
+  /// The caller clears `output` first. A provider must not allocate, except to grow `output`.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot grow `output`.
+  effect fn breaks(self: &Self, text: string, output: &mut List<usize>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
+}
+
+// Token flags. The low nine come from the generated lineBreakInfo table
+// (scripts/unicode/generate-unicode keeps the same layout, shifted by six class bits).
+const EAST: u16 = 1 // East_Asian_Width F, W or H
+const CURRENCY_WIDE: u16 = 2 // East_Asian_Width A, F or W
+const PI: u16 = 4 // General_Category Pi
+const PF: u16 = 8 // General_Category Pf
+const WORD: u16 = 16 // a word character for word-break: keep-all
+const EMOJI: u16 = 32 // unassigned Extended_Pictographic
+const SA: u16 = 64 // SA resolved to AL
+const CJ: u16 = 128 // CJ resolved to NS
+const ZWJ: u16 = 256 // the base or its last combining mark is ZWJ
+const EOF: u16 = 1024 // past the end of the text
+
+// One LB9 combining sequence: 16 bytes, so the three-token window stays in registers.
+struct Token {
+  start: usize,
+  cp: u32,
+  cls: LineBreak,
+  flags: u16,
+}
+
+impl Copy for Token {}
+
+impl Token {
+  @inlineAlways
+  fn eof(at: usize) -> Self {
+    return Self { start: at, cp: 0, cls: LineBreak.XX, flags: EOF }
+  }
+
+  @inlineAlways
+  fn has(self: Self, flag: u16) -> bool {
+    return (self.flags & flag) != 0
+  }
+
+  @inlineAlways
+  fn isEof(self: Self) -> bool {
+    return self.has(EOF)
+  }
+}
+
+fn hard(c: LineBreak) -> bool {
+  return c == LineBreak.BK || c == LineBreak.CR || c == LineBreak.LF || c == LineBreak.NL
+}
+
+fn alpha(c: LineBreak) -> bool {
+  return c == LineBreak.AL || c == LineBreak.HL
+}
+
+// Classes that LB23, LB25 and LB28 keep together.
+@inlineAlways
+fn joining(c: LineBreak) -> bool {
+  return alpha(c) || c == LineBreak.NU
+}
+
+// Joining classes plus ID: no rule looks at a pair of these beyond LB8a.
+@inlineAlways
+fn plain(c: LineBreak) -> bool {
+  return joining(c) || c == LineBreak.ID
+}
+
+fn hangul(c: LineBreak) -> bool {
+  return c == LineBreak.JL || c == LineBreak.JV || c == LineBreak.JT || c == LineBreak.H2
+    || c == LineBreak.H3
+}
+
+fn aksara(t: Token) -> bool {
+  return t.cls == LineBreak.AK || t.cls == LineBreak.AS || t.cp == 0x25cc
+}
+
+fn initial(c: LineBreak) -> bool {
+  return hard(c) || c == LineBreak.SP || c == LineBreak.ZW || c == LineBreak.CB || c == LineBreak.GL
+}
+
+fn initialQuote(c: LineBreak) -> bool {
+  return hard(c) || c == LineBreak.SP || c == LineBreak.ZW || c == LineBreak.OP || c == LineBreak.QU
+    || c == LineBreak.GL
+}
+
+fn finalQuote(c: LineBreak) -> bool {
+  return hard(c) || c == LineBreak.SP || c == LineBreak.GL || c == LineBreak.WJ || c == LineBreak.CL
+    || c == LineBreak.QU
+    || c == LineBreak.CP
+    || c == LineBreak.EX
+    || c == LineBreak.IS
+    || c == LineBreak.SY
+    || c == LineBreak.ZW
+}
+
+fn iteration(cp: u32) -> bool {
+  return cp == 0x3005 || cp == 0x303b || cp == 0x309d || cp == 0x309e || cp == 0x30fd
+    || cp == 0x30fe
+}
+
+fn centered(cp: u32) -> bool {
+  return cp == 0x30fb || cp == 0xff1a || cp == 0xff1b || cp == 0xff65 || cp == 0x203c
+    || cp == 0x2047
+    || cp == 0x2048
+    || cp == 0x2049
+    || cp == 0xff01
+    || cp == 0xff1f
+}
+
+fn css(options: LineOptions) -> bool {
+  return options.lineBreak != LineBreakMode.Auto || options.language != LineLanguage.Default
+}
+
+fn loose(options: LineOptions) -> bool {
+  return options.lineBreak == LineBreakMode.Loose
+}
+
+fn cjk(options: LineOptions) -> bool {
+  return options.language != LineLanguage.Default
+}
+
+// LB9 consumes CM/ZWJ once, retaining the base's *all* relevant properties.
+// The reader decodes one scalar ahead to find each sequence's end; with the
+// segmenter's three-token window, LB25 needs no rescanning or allocation.
+struct Reader<'a> {
+  text: &'a [u8],
+  at: usize,
+  upcoming: Token,
+  options: LineOptions,
+  tailored: bool,
+}
+
+impl<'a> Reader<'a> {
+  @inlineAlways
+  fn make(text: &'a [u8], at: usize, options: LineOptions) -> Self {
+    let mut reader = Self {
+      text: text,
+      at: at,
+      upcoming: Token.eof(0),
+      options: options,
+      tailored: css(options) || options.wordBreak == WordBreakMode.BreakAll,
+    }
+    reader.upcoming = reader.scalar()
+    return move reader
+  }
+
+  @inlineAlways
+  fn scalar(self: &mut Self) -> Token {
+    if self.at == self.text.length {
+      return Token.eof(self.at)
+    }
+    let start = self.at
+    let decoded = utf8_scan.decode(self.text, start)
+    self.at = decoded.next
+    let info = unicode_data.lineBreakInfo(decoded.scalar)
+    let mut cls = LineBreak.fromTableValue(info & 63)
+    let flags = u32.wrappingToU16(u32.shiftRight(info, 6))
+    if (flags & CJ) != 0 && loose(self.options) {
+      cls = LineBreak.ID
+    }
+    return Token { start: start, cp: decoded.scalar, cls: cls, flags: flags }
+  }
+
+  @inlineAlways
+  fn next(self: &mut Self) -> Token {
+    let mut token = self.upcoming
+    if token.isEof() {
+      return token
+    }
+    if token.cls == LineBreak.CM || token.cls == LineBreak.ZWJ {
+      // LB10: all properties become those of LATIN CAPITAL LETTER A.
+      token.cls = LineBreak.AL
+      token.flags = (token.flags & (SA | ZWJ)) | WORD
+    }
+
+    // One decoding site: read ahead, folding marks into bases that take them.
+    let absorbs = !hard(token.cls) && token.cls != LineBreak.SP && token.cls != LineBreak.ZW
+    while true {
+      self.upcoming = self.scalar()
+      if !absorbs || (self.upcoming.cls != LineBreak.CM && self.upcoming.cls != LineBreak.ZWJ) {
+        break
+      }
+      token.flags = (token.flags & ~ZWJ) | (self.upcoming.flags & ZWJ)
+    }
+    if self.tailored {
+      token.cls = tailor(self.options, token.cls, token.cp, token.flags)
+    }
+    return token
+  }
+
+  // The token `count` places after the one `next` would return. Only rare rules
+  // look past the pair; a fresh reader keeps this one in registers.
+  @inlineAlways
+  fn ahead(self: &Self, count: usize) -> Token {
+    return lookAhead(self.text, self.upcoming.start, self.options, count)
+  }
+}
+
+// Rare CSS and word-break tailoring of a class, out of line. It takes plain values
+// so the caller's reader can stay in registers.
+@inlineNever
+fn tailor(options: LineOptions, cls: LineBreak, cp: u32, flags: u16) -> LineBreak {
+  if css(options) {
+    if loose(options) && cls == LineBreak.NS && iteration(cp) {
+      return LineBreak.ID
+    }
+    if cjk(options) && options.lineBreak != LineBreakMode.Strict && (cp == 0x301c || cp == 0x30a0) {
+      return LineBreak.ID
+    }
+  }
+
+  // Small kana and iteration marks remain controlled by line-break, not
+  // word-break. Hangul already breaks between complete syllables.
+  if options.wordBreak == WordBreakMode.BreakAll
+    && (alpha(cls) || cls == LineBreak.NU || (flags & SA) != 0 || cls == LineBreak.AK
+      || cls == LineBreak.AP
+      || cls == LineBreak.AS) {
+    return LineBreak.ID
+  }
+  return cls
+}
+
+@inlineNever
+fn lookAhead(text: &[u8], at: usize, options: LineOptions, count: usize) -> Token {
+  let mut reader = Reader.make(text, at, options)
+  let mut token = reader.next()
+  let mut skipped: usize = 0
+  while skipped < count {
+    token = reader.next()
+    skipped = skipped + 1
+  }
+  return token
+}
+
+// Only classes survive from earlier tokens; LineBreak.XX means none (start of text).
+struct Context {
+  previous: LineBreak,
+  nonspace: LineBreak,
+  quoteInitial: bool,
+  numeric: bool,
+  previousNumeric: bool,
+  oddRegional: bool,
+}
+
+impl Context {
+  fn make() -> Self {
+    return Self {
+      previous: LineBreak.XX,
+      nonspace: LineBreak.XX,
+      quoteInitial: false,
+      numeric: false,
+      previousNumeric: false,
+      oddRegional: false,
+    }
+  }
+
+  @inlineAlways
+  fn advance(self: &mut Self, token: Token) -> () {
+    if token.cls != LineBreak.SP {
+      self.nonspace = token.cls
+      self.quoteInitial = token.cls == LineBreak.QU && token.has(PI)
+        && (self.previous == LineBreak.XX || initialQuote(self.previous))
+    }
+    self.previousNumeric = self.numeric
+    self.numeric = token.cls == LineBreak.NU
+      || ((token.cls == LineBreak.SY || token.cls == LineBreak.IS) && self.numeric)
+    if token.cls == LineBreak.RI {
+      self.oddRegional = !self.oddRegional
+    } else {
+      self.oddRegional = false
+    }
+    self.previous = token.cls
+  }
+}
+
+// `reader` is positioned after `right`; it is only peeked for the few rules that
+// look past the pair.
+// Always inlined: a call would take the loop's tokens, reader and context by
+// pointer and keep them in memory for the whole scan.
+@inlineAlways
+fn opportunity(
+  left: Token,
+  right: Token,
+  reader: &Reader,
+  before: Token,
+  context: &Context,
+  options: LineOptions,
+  dictionary: bool,
+) -> bool {
+  let a = left.cls
+  let b = right.cls
+
+  // LB4-LB12. LB9/LB10 have already folded combining sequences.
+  if a == LineBreak.CR && b == LineBreak.LF {
+    return false
+  }
+  if hard(a) {
+    return true
+  }
+  if hard(b) || b == LineBreak.SP || b == LineBreak.ZW {
+    return false
+  }
+  if context.nonspace == LineBreak.ZW {
+    return true
+  }
+  if left.has(ZWJ) || a == LineBreak.WJ || b == LineBreak.WJ || a == LineBreak.GL {
+    return false
+  }
+
+  // Unicode 18 removes BA from the LB12a exceptions.
+  if b == LineBreak.GL && a != LineBreak.SP && a != LineBreak.HY && a != LineBreak.HH {
+    return false
+  }
+  let looseCjk = loose(options) && cjk(options)
+  let beforeCentered = looseCjk && centered(right.cp)
+
+  // LB13-LB18, including space-sensitive quotation and decimal context.
+  if b == LineBreak.CL || b == LineBreak.CP || b == LineBreak.SY
+    || (b == LineBreak.EX && !beforeCentered) {
+    return false
+  }
+  if context.nonspace == LineBreak.OP || context.quoteInitial {
+    return false
+  }
+  if b == LineBreak.QU && right.has(PF) {
+    let next = reader.ahead(0)
+    if next.isEof() || finalQuote(next.cls) {
+      return false
+    }
+  }
+  if a == LineBreak.SP && b == LineBreak.IS && reader.ahead(0).cls == LineBreak.NU {
+    return true
+  }
+  if b == LineBreak.IS && !beforeCentered {
+    return false
+  }
+  if (context.nonspace == LineBreak.CL || context.nonspace == LineBreak.CP) && b == LineBreak.NS
+    && !beforeCentered {
+    return false
+  }
+  if context.nonspace == LineBreak.B2 && b == LineBreak.B2 {
+    return false
+  }
+  if a == LineBreak.SP {
+    return true
+  }
+
+  // LB19/LB19a: Pi/Pf and East Asian context are properties of the LB9 base.
+  if (b == LineBreak.QU && !right.has(PI)) || (a == LineBreak.QU && !left.has(PF)) {
+    return false
+  }
+  if b == LineBreak.QU && (!left.has(EAST) || !reader.ahead(0).has(EAST)) {
+    return false
+  }
+  if a == LineBreak.QU && (!right.has(EAST) || before.isEof() || !before.has(EAST)) {
+    return false
+  }
+  if a == LineBreak.CB || b == LineBreak.CB {
+    return true
+  }
+
+  // KeepAll wins over CSS loose punctuation-class substitutions, but not a
+  // real dictionary word boundary or explicit breaks (handled above).
+  if options.wordBreak == WordBreakMode.KeepAll && left.has(WORD) && right.has(WORD)
+    && !dictionary {
+    return false
+  }
+  if (a == LineBreak.HY || a == LineBreak.HH) && alpha(b)
+    && (before.isEof() || initial(before.cls)) {
+    return false
+  }
+  let beforeLooseHyphen = loose(options) && a == LineBreak.ID
+    && (right.cp == 0x2010 || right.cp == 0x2013)
+  if (b == LineBreak.BA || b == LineBreak.HH || b == LineBreak.HY || b == LineBreak.NS)
+    && !beforeLooseHyphen
+    && !beforeCentered {
+    return false
+  }
+  if a == LineBreak.BB {
+    return false
+  }
+  if before.cls == LineBreak.HL && (a == LineBreak.HY || a == LineBreak.HH) && b != LineBreak.HL {
+    return false
+  }
+  if a == LineBreak.SY && b == LineBreak.HL {
+    return false
+  }
+  if b == LineBreak.IN && !(loose(options) && a == LineBreak.IN) {
+    return false
+  }
+
+  // Loose CJK prefixes/postfixes alter only the applicable side of the pair.
+  let prefix = a == LineBreak.PR && !(looseCjk && left.has(CURRENCY_WIDE))
+  let postfix = b == LineBreak.PO && !(looseCjk && right.has(CURRENCY_WIDE))
+  if prefix && (b == LineBreak.ID || b == LineBreak.EB || b == LineBreak.EM) {
+    return false
+  }
+  if (a == LineBreak.ID || a == LineBreak.EB || a == LineBreak.EM) && postfix {
+    return false
+  }
+  if ((prefix || a == LineBreak.PO) && alpha(b)) || (alpha(a) && (b == LineBreak.PR || postfix)) {
+    return false
+  }
+
+  // LB25 uses a maintained NU (SY|IS)* suffix rather than scanning backwards.
+  if (postfix || b == LineBreak.PR)
+    && (context.numeric || ((a == LineBreak.CL || a == LineBreak.CP) && context.previousNumeric)) {
+    return false
+  }
+  if prefix || a == LineBreak.PO {
+    if b == LineBreak.NU {
+      return false
+    }
+    if b == LineBreak.OP {
+      let n = reader.ahead(0).cls
+      if n == LineBreak.NU || (n == LineBreak.IS && reader.ahead(1).cls == LineBreak.NU) {
+        return false
+      }
+    }
+  }
+  if b == LineBreak.NU && (a == LineBreak.HY || a == LineBreak.IS || context.numeric) {
+    return false
+  }
+  if a == LineBreak.JL
+    && (b == LineBreak.JL || b == LineBreak.JV || b == LineBreak.H2 || b == LineBreak.H3) {
+    return false
+  }
+  if (a == LineBreak.JV || a == LineBreak.H2) && (b == LineBreak.JV || b == LineBreak.JT) {
+    return false
+  }
+  if (a == LineBreak.JT || a == LineBreak.H3) && b == LineBreak.JT {
+    return false
+  }
+  if (hangul(a) && postfix) || (prefix && hangul(b)) {
+    return false
+  }
+
+  // LB28a, with U+25CC represented explicitly rather than reclassified.
+  if a == LineBreak.AP && aksara(right) {
+    return false
+  }
+  if aksara(left) && (b == LineBreak.VF || b == LineBreak.VI) {
+    return false
+  }
+  if aksara(before) && a == LineBreak.VI && (b == LineBreak.AK || right.cp == 0x25cc) {
+    return false
+  }
+  if aksara(left) && aksara(right) && reader.ahead(0).cls == LineBreak.VF {
+    return false
+  }
+  if a == LineBreak.IS && alpha(b) {
+    return false
+  }
+  if (alpha(a) || a == LineBreak.NU) && b == LineBreak.OP && !right.has(EAST) {
+    return false
+  }
+  if a == LineBreak.CP && !left.has(EAST) && (alpha(b) || b == LineBreak.NU) {
+    return false
+  }
+  if a == LineBreak.RI && b == LineBreak.RI && context.oddRegional {
+    return false
+  }
+  if (a == LineBreak.EB || left.has(EMOJI)) && b == LineBreak.EM {
+    return false
+  }
+  return true
+}
+
+// unicode_data.linePairs() is a CLASSES x CLASSES table of these decisions.
+const CLASSES: usize = 49
+
+const PAIR_RULES: u8 = 0
+
+const PAIR_KEEP: u8 = 1
+
+const PAIR_BREAK: u8 = 2
+
+// Opportunities are staged in a local buffer, so the scanning loop rarely calls out.
+const STAGED: usize = 64
+
+effect fn flush(
+  output: &mut List<BreakOpportunity>,
+  staged: &[BreakOpportunity],
+  count: usize,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run output.appendSlice(Slice.view<BreakOpportunity>(staged, 0, count))
+}
+
+effect fn append(output: &mut List<BreakOpportunity>, at: usize, kind: BreakKind) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run output.append(BreakOpportunity { offset: at, kind: kind })
+}
+
+effect fn anywhere(text: &[u8], output: &mut List<BreakOpportunity>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut cursor = GraphemeCursor.make()
+  let mut scalarAt: usize = 0
+  let mut previous = LineBreak.XX
+  while true {
+    let at = cursor.nextBytes(text)
+    while scalarAt < at {
+      let decoded = utf8_scan.decode(text, scalarAt)
+      previous = LineBreak.of(decoded.scalar)
+      scalarAt = decoded.next
+    }
+    let mut kind = BreakKind.Allowed
+    if hard(previous) || at == text.length {
+      kind = BreakKind.Mandatory
+    }
+    run append(&mut output, at, kind)
+    if at == text.length {
+      break
+    }
+  }
+}
+
+effect fn segment(
+  text: &[u8],
+  options: LineOptions,
+  dictionary: &List<usize>,
+  output: &mut List<BreakOpportunity>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if options.lineBreak == LineBreakMode.Anywhere {
+    run anywhere(text, &mut output)
+    return
+  }
+
+  // The untailored profile gets its own copy of the loop with constant options,
+  // so tailoring and dictionary state drop out of the hot loop.
+  if !css(options) && options.wordBreak == WordBreakMode.Normal
+    && dictionary.asSlice().length == 0 {
+    let untailored = LineOptions {
+      lineBreak: LineBreakMode.Auto,
+      wordBreak: WordBreakMode.Normal,
+      hyphens: options.hyphens,
+      language: LineLanguage.Default,
+    }
+    run scan(text, untailored, dictionary, &mut output, false)
+  } else {
+    run scan(text, options, dictionary, &mut output, true)
+  }
+}
+
+// `tailored` is a constant at both call sites; false promises the untailored
+// profile and no dictionary boundaries.
+@inlineAlways
+effect fn scan(
+  text: &[u8],
+  options: LineOptions,
+  dictionary: &List<usize>,
+  output: &mut List<BreakOpportunity>,
+  tailored: bool,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut graphemes = GraphemeCursor.make()
+  let mut reader = Reader.make(text, 0, options)
+  let mut left = reader.next()
+  let mut right = reader.next()
+  let mut context = Context.make()
+  let mut before = Token.eof(0)
+  let boundaries = dictionary.asSlice()
+  let mut dictionaryIndex: usize = 0
+  let mut graphemeAt: usize = 0
+  let breakAll = options.wordBreak == WordBreakMode.BreakAll
+  let suppressHyphens = options.hyphens == Hyphens.None || breakAll
+  let keepAll = options.wordBreak == WordBreakMode.KeepAll
+  let pairs = unicode_data.linePairs()
+  let mut staged: [BreakOpportunity; 64] = [
+    BreakOpportunity { offset: 0, kind: BreakKind.Allowed }; 64
+  ]
+  let mut stagedCount: usize = 0
+  while !right.isEof() {
+    context.advance(left)
+    let mut dictionaryBreak = false
+    if tailored && left.has(SA) && right.has(SA) {
+      // Boundaries are sorted, so the cursor only moves forward.
+      while dictionaryIndex < boundaries.length && boundaries[dictionaryIndex] < right.start {
+        dictionaryIndex = dictionaryIndex + 1
+      }
+      dictionaryBreak = dictionaryIndex < boundaries.length
+        && boundaries[dictionaryIndex] == right.start
+    }
+
+    // Untailored, most pairs are decided by their classes alone (generated from
+    // the rules below by text/ucd/scripts/generate-unicode). LB8a needs the ZWJ flag.
+    let mut pair = PAIR_RULES
+    if !tailored && !left.has(ZWJ) {
+      pair = pairs[left.cls.tableIndex() * CLASSES + right.cls.tableIndex()]
+    }
+
+    // LB23/LB25/LB28 join every AL/HL/NU pair. Resolve that context-independent
+    // block, spaces and pairs involving ideographs before passing five token
+    // records through the contextual rules.
+    // BreakAll has already reclassified eligible characters; SA dictionary
+    // boundaries must bypass the alphabetic no-break rule.
+    let mut allowed = false
+    if pair == PAIR_KEEP {
+      allowed = false
+    } else if pair == PAIR_BREAK {
+      allowed = true
+    } else if !dictionaryBreak && joining(left.cls) && joining(right.cls) {
+      allowed = false
+    } else if right.cls == LineBreak.SP && !hard(left.cls) {
+      // LB7.
+      allowed = false
+    } else if left.cls == LineBreak.SP && plain(right.cls) {
+      // After spaces only LB14 (OP SP*) and LB15a (initial quote SP*) can
+      // still apply to a plain class; otherwise LB18 breaks.
+      allowed = context.nonspace != LineBreak.OP && !context.quoteInitial
+    } else if !dictionaryBreak && !keepAll && !left.has(ZWJ) && plain(left.cls)
+      && plain(right.cls) {
+      // An ideograph next to a letter, digit or ideograph: once LB8a (ZWJ) and
+      // keep-all are ruled out, every rule through LB30b passes and LB31 breaks.
+      allowed = true
+    } else {
+      allowed = opportunity(left, right, &reader, before, &context, options, dictionaryBreak)
+    }
+    if breakAll {
+      while graphemeAt < right.start {
+        graphemeAt = graphemes.nextBytes(text)
+      }
+      allowed = allowed && graphemeAt == right.start
+    }
+    if left.cp == 0xad && suppressHyphens {
+      allowed = false
+    }
+    if allowed {
+      let mut kind = BreakKind.Allowed
+      if hard(left.cls) {
+        kind = BreakKind.Mandatory
+      } else if left.cp == 0xad {
+        kind = BreakKind.Hyphenated
+      }
+      staged[stagedCount] = BreakOpportunity { offset: right.start, kind: kind }
+      stagedCount = stagedCount + 1
+      if stagedCount == STAGED {
+        run flush(&mut output, &staged, stagedCount)
+        stagedCount = 0
+      }
+    }
+    before = left
+    left = right
+    right = reader.next()
+  }
+  run flush(&mut output, &staged, stagedCount)
+  run append(&mut output, text.length, BreakKind.Mandatory)
+}
+
+/// Appends the line break opportunities of `text` to `output`.
+///
+/// # When to use
+///
+/// Use `breaks` to wrap text into lines: a line can end at each [`BreakOpportunity`], and must end
+/// at each [`BreakKind.Mandatory`] one. Measure the text between opportunities to choose where to
+/// wrap.
+///
+/// # Details
+///
+/// The rules are the Unicode Line Breaking Algorithm (UAX #14) for Unicode 18.0.0, with the CSS
+/// Text Module Level 3 tailoring that `options` selects. The opportunities are sorted by offset,
+/// each offset appears once, and the last one is a mandatory break at `text`'s byte length (offset
+/// 0 for empty text). A break opportunity before a space is moved after the spaces, so lines end
+/// with their trailing spaces. The function does not clear `output`, so clear it first to reuse
+/// its storage.
+///
+/// # Errors
+///
+/// - `OutOfMemoryError` if the `Allocator` cannot grow `output`.
+///
+/// # Gotchas
+///
+/// Thai, Lao, Khmer and Myanmar text has no spaces between words, so without a dictionary each run
+/// of those characters is one unbreakable word. Use [`breaksWithDictionary`] for that text. There
+/// is no automatic hyphenation: only soft hyphens give hyphenated breaks.
+pub effect fn breaks(text: string, options: LineOptions, output: &mut List<BreakOpportunity>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let dictionary = List<usize>.make()
+  run segment(String.utf8Bytes(text), options, &dictionary, &mut output)
+}
+
+/// Appends the line break opportunities of `text` to `output`, with the word boundaries of
+/// `dictionary` for Thai, Lao, Khmer and Myanmar text.
+///
+/// # Details
+///
+/// The result is the result of [`breaks`], plus a break opportunity at each dictionary word
+/// boundary between two characters of the Line_Break class `SA` (South East Asian). The other
+/// rules keep precedence: no dictionary boundary is used next to a mark, a joiner, punctuation, or
+/// a mandatory break. With [`LineBreakMode.Anywhere`] or [`WordBreakMode.BreakAll`], the dictionary
+/// is not asked. The function does not clear `output`, so clear it first to reuse its storage.
+///
+/// # Errors
+///
+/// - `OutOfMemoryError` if the `Allocator` cannot grow `output` or the boundary list.
+pub effect fn breaksWithDictionary<D: DictionarySegmenter>(
+  text: string,
+  options: LineOptions,
+  dictionary: &D,
+  output: &mut List<BreakOpportunity>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut boundaries = List<usize>.make()
+  if options.lineBreak != LineBreakMode.Anywhere && options.wordBreak != WordBreakMode.BreakAll {
+    run DictionarySegmenter.breaks(dictionary, text, &mut boundaries)
+  }
+  run segment(String.utf8Bytes(text), options, &boundaries, &mut output)
+}

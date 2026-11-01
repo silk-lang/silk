@@ -1,0 +1,553 @@
+//! Grapheme cluster, word and sentence boundaries (UAX #29), with data from Unicode 18.0.0.
+//!
+//! # When to use
+//! Use [`graphemes`] or [`GraphemeCursor`] to find user-perceived characters, for example to move
+//! a text cursor or to truncate text. Use [`words`] for word selection and [`sentences`] for
+//! sentence selection. Use `silk.text.line_break` to find where a line can wrap.
+//!
+//! # Details
+//! The functions implement the default (untailored) rules of UAX #29 revision 49. They take a
+//! `string` and report byte offsets into it. A boundary list is appended to a caller-owned list. It
+//! is sorted and includes 0 and the text's byte length once each, even for empty text. The scans
+//! use constant extra storage and look at each scalar a bounded number of times.
+//!
+//! # Gotchas
+//! The rules are not tailored for a language. Word boundaries do not split Thai, Lao, Khmer,
+//! Myanmar, Chinese or Japanese text, and sentence boundaries do not know abbreviations.
+//!
+//! # Examples
+//! ## Count the user-perceived characters of a text
+//! ```silk
+//! import silk.collections.list { List }
+//! import silk.core.effect { Effect }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.text.segmentation
+//!
+//! pub effect fn main() -> i32
+//!   ! OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let mut boundaries = List<usize>.make()
+//!   // "e" with a combining acute accent, a family emoji joined with ZWJ, and "x".
+//!   run segmentation.graphemes("e\u{301}\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}x", &mut boundaries)
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   if boundaries.length() - 1 != 3 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Text
+
+// Rules: UAX #29 revision 49, https://www.unicode.org/reports/tr29/tr29-49.html. The packed
+// grapheme record of `unicode_data.graphemeInfo` keeps the hot loop at one table load per scalar.
+
+import silk.text.unicode { Unicode }
+import silk.text.unicode_data
+import silk.text.unicode_properties {
+  GraphemeBreak as G,
+  WordBreak as W,
+  SentenceBreak as S,
+  IndicConjunctBreak as I,
+}
+import silk.text.string { String }
+import silk.text.utf8_scan
+import silk.num.u32
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+fn graphemeControl(value: G) -> bool {
+  return value == G.Control || value == G.CR || value == G.LF
+}
+
+/// A forward cursor over the extended grapheme clusters of one text. It does not allocate.
+///
+/// # When to use
+/// Use a `GraphemeCursor` to step through user-perceived characters one at a time, without a list
+/// of boundaries. Use [`graphemes`] to get all boundaries at once.
+///
+/// # Details
+/// Make the cursor with [`GraphemeCursor.make`] and pass the same text to each call of
+/// [`GraphemeCursor.next`]. The cursor implements the default extended grapheme cluster rules of
+/// UAX #29 for Unicode 18.0.0, including the GB9c rule for Indic conjuncts and the emoji rules.
+///
+/// # Gotchas
+/// The cursor keeps only a byte offset and rule state. Passing a different text to a later call
+/// gives meaningless boundaries; it does not trap.
+pub struct GraphemeCursor {
+  at: usize,
+  started: bool,
+  previous: G,
+  oddRI: bool,
+  pictographicExtend: bool,
+  pictographicZWJ: bool,
+  linkerExtend: bool,
+}
+
+impl GraphemeCursor {
+  /// Returns a cursor at the start of a text.
+  pub fn make() -> Self {
+    return Self {
+      at: 0,
+      started: false,
+      previous: G.Other,
+      oddRI: false,
+      pictographicExtend: false,
+      pictographicZWJ: false,
+      linkerExtend: false,
+    }
+  }
+
+  /// Moves to the next extended grapheme cluster boundary in `text` and returns its byte offset.
+  ///
+  /// # Details
+  ///
+  /// The first call returns the end of the first cluster, never 0. After the last cluster, each
+  /// call returns `text`'s byte length. For empty text, each call returns 0.
+  pub fn next(self: &mut Self, text: string) -> usize {
+    return self.advance(String.utf8Bytes(text))
+  }
+
+  /// Moves to the next extended grapheme cluster boundary in the UTF-8 bytes `text` and returns
+  /// its byte offset.
+  ///
+  /// # When to use
+  ///
+  /// Use `nextBytes` in a scan that holds UTF-8 bytes rather than a `string`. Use
+  /// [`GraphemeCursor.next`] otherwise.
+  ///
+  /// # Details
+  ///
+  /// The result is the same as [`GraphemeCursor.next`] for the same text. An ill-formed byte counts
+  /// as U+FFFD and moves one byte.
+  pub fn nextBytes(self: &mut Self, text: &[u8]) -> usize {
+    return self.advance(text)
+  }
+
+  // Inlined into the package's own scanning loops.
+  @inlineAlways
+  fn advance(self: &mut Self, text: &[u8]) -> usize {
+    while self.at < text.length {
+      let at = self.at
+      let byte = text[at]
+      if byte >= 0x20 && byte < 0x7f && self.previous != G.Prepend {
+        // Printable ASCII is Other with no InCB or pictographic state, so only
+        // GB9b can join it to the previous character; GB999 breaks before it.
+        let emit = self.started
+        self.previous = G.Other
+        self.oddRI = false
+        self.pictographicExtend = false
+        self.pictographicZWJ = false
+        self.linkerExtend = false
+        self.started = true
+        self.at = at + 1
+        if emit {
+          return at
+        }
+        continue
+      }
+      let decoded = utf8_scan.decode(text, at)
+
+      // One packed lookup: Grapheme_Cluster_Break, InCB << 5, Extended_Pictographic << 7.
+      let info = unicode_data.graphemeInfo(decoded.scalar)
+      let current = G.fromTableValue(info & 31)
+      let conjunct = I.fromTableValue(u32.shiftRight(info, 5) & 3)
+      let pictographic = info >= 128
+      let mut boundary = true
+      if current == G.Other && self.previous != G.Prepend && !self.linkerExtend
+        && !self.pictographicZWJ {
+        boundary = true // Only GB4 or GB999 can apply.
+      } else if (current == G.Extend || current == G.SpacingMark)
+        && !graphemeControl(self.previous) {
+        boundary = false // GB9, GB9a: nothing before them can apply.
+      } else if self.previous == G.CR && current == G.LF {
+        boundary = false // GB3
+      } else if graphemeControl(self.previous) || graphemeControl(current) {
+        boundary = true // GB4, GB5 precede the extending rules.
+      } else if self.previous == G.L
+        && (current == G.L || current == G.V || current == G.LV || current == G.LVT) {
+        boundary = false // GB6
+      } else if (self.previous == G.LV || self.previous == G.V)
+        && (current == G.V || current == G.T) {
+        boundary = false // GB7
+      } else if (self.previous == G.LVT || self.previous == G.T) && current == G.T {
+        boundary = false // GB8
+      } else if current == G.Extend || current == G.ZWJ || current == G.SpacingMark
+        || self.previous == G.Prepend {
+        boundary = false // GB9, GB9a, GB9b
+      } else if self.linkerExtend && conjunct == I.Consonant {
+        // Unicode 18 GB9c no longer requires a consonant before the linker.
+        boundary = false
+      } else if self.pictographicZWJ && pictographic {
+        boundary = false // GB11
+      } else if self.previous == G.Regional_Indicator && current == G.Regional_Indicator
+        && self.oddRI {
+        boundary = false // GB12, GB13
+      }
+      let emit = self.started && boundary
+      self.pictographicZWJ = self.pictographicExtend && current == G.ZWJ
+      self.pictographicExtend = pictographic || (self.pictographicExtend && current == G.Extend)
+      self.linkerExtend = conjunct == I.Linker || (self.linkerExtend && conjunct == I.Extend)
+      if current == G.Regional_Indicator {
+        self.oddRI = !self.oddRI
+      } else {
+        self.oddRI = false
+      }
+      self.previous = current
+      self.started = true
+      self.at = decoded.next
+      if emit {
+        return at
+      }
+    }
+    return text.length
+  }
+}
+
+/// Returns the byte offset of the extended grapheme cluster boundary that follows `start` in
+/// `text`.
+///
+/// # Details
+///
+/// `start` must be a cluster boundary, such as 0 or a result of an earlier call. At or past the
+/// end of `text`, the result is `text`'s byte length. The function does not allocate.
+///
+/// # Gotchas
+///
+/// A `start` that is not a cluster boundary is not detected. The scan starts there as if a new
+/// cluster began, so the result can split a cluster.
+pub fn nextGrapheme(text: string, start: usize) -> usize {
+  let mut cursor = GraphemeCursor.make()
+  cursor.at = start
+  return cursor.advance(String.utf8Bytes(text))
+}
+
+/// Appends the extended grapheme cluster boundaries of `text` to `output`, as byte offsets.
+///
+/// # When to use
+///
+/// Use `graphemes` to count or split user-perceived characters, for example to move a text cursor
+/// or to truncate text without cutting an accent or an emoji from its base.
+///
+/// # Details
+///
+/// The boundaries follow the default extended grapheme cluster rules of UAX #29 for Unicode 18.0.0.
+/// They are sorted and include 0 and `text`'s byte length once each, so empty text gives one
+/// boundary, 0. The number of clusters is the number of boundaries minus 1. The function does not
+/// clear `output`, so clear it first to reuse its storage.
+///
+/// # Errors
+///
+/// - `OutOfMemoryError` if the `Allocator` cannot grow `output`.
+pub effect fn graphemes(text: string, output: &mut List<usize>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run graphemesOf(String.utf8Bytes(text), &mut output)
+}
+
+effect fn graphemesOf(text: &[u8], output: &mut List<usize>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run List<usize>.append(&mut output, 0)
+  let mut cursor = GraphemeCursor.make()
+  let mut at: usize = 0
+  while at < text.length {
+    at = cursor.advance(text)
+    run List<usize>.append(&mut output, at)
+  }
+}
+
+fn wordNewline(value: W) -> bool {
+  return value == W.CR || value == W.LF || value == W.Newline
+}
+
+fn wordIgnored(value: W) -> bool {
+  return value == W.Extend || value == W.Format || value == W.ZWJ
+}
+
+fn letter(value: W) -> bool {
+  return value == W.ALetter || value == W.Hebrew_Letter
+}
+
+fn midLetter(value: W) -> bool {
+  return value == W.MidLetter || value == W.MidNumLet || value == W.Single_Quote
+}
+
+fn midNumber(value: W) -> bool {
+  return value == W.MidNum || value == W.MidNumLet || value == W.Single_Quote
+}
+
+fn wordCore(value: W) -> bool {
+  return letter(value) || value == W.Numeric || value == W.Katakana
+}
+
+// Called only for significant punctuation. Distinct calls scan disjoint ignored runs.
+fn followingWord(text: &[u8], start: usize) -> W {
+  let mut at = start
+  while at < text.length {
+    let decoded = utf8_scan.decode(text, at)
+    let value = W.of(decoded.scalar)
+    if !wordIgnored(value) {
+      return value
+    }
+    at = decoded.next
+  }
+  return W.Other
+}
+
+fn wordBoundary(text: &[u8], next: usize, before: W, left: W, right: W, oddRI: bool) -> bool {
+  if letter(left) && letter(right) {
+    return false // WB5
+  }
+  if letter(left) && midLetter(right) && letter(followingWord(text, next)) {
+    return false // WB6
+  }
+  if letter(before) && midLetter(left) && letter(right) {
+    return false // WB7
+  }
+  if left == W.Hebrew_Letter && right == W.Single_Quote {
+    return false // WB7a
+  }
+  if left == W.Hebrew_Letter && right == W.Double_Quote
+    && followingWord(text, next) == W.Hebrew_Letter {
+    return false // WB7b
+  }
+  if before == W.Hebrew_Letter && left == W.Double_Quote && right == W.Hebrew_Letter {
+    return false // WB7c
+  }
+  if (left == W.Numeric && (right == W.Numeric || letter(right)))
+    || (letter(left) && right == W.Numeric) {
+    return false // WB8, WB9, WB10
+  }
+  if before == W.Numeric && midNumber(left) && right == W.Numeric {
+    return false // WB11
+  }
+  if left == W.Numeric && midNumber(right) && followingWord(text, next) == W.Numeric {
+    return false // WB12
+  }
+  if left == W.Katakana && right == W.Katakana {
+    return false // WB13
+  }
+  if ((wordCore(left) || left == W.ExtendNumLet) && right == W.ExtendNumLet)
+    || (left == W.ExtendNumLet && wordCore(right)) {
+    return false // WB13a, WB13b
+  }
+  return !(left == W.Regional_Indicator && right == W.Regional_Indicator && oddRI)
+}
+
+/// Appends the word boundaries of `text` to `output`, as byte offsets.
+///
+/// # When to use
+///
+/// Use `words` for double-click selection, word counts, or moving a cursor by words.
+///
+/// # Details
+///
+/// The boundaries follow the default word boundary rules of UAX #29 for Unicode 18.0.0. They are
+/// sorted and include 0 and `text`'s byte length once each, so empty text gives one boundary, 0.
+/// Spaces and punctuation are segments of their own: filter the segments that contain letters or
+/// digits to count words. The function does not clear `output`, so clear it first to reuse its
+/// storage.
+///
+/// # Errors
+///
+/// - `OutOfMemoryError` if the `Allocator` cannot grow `output`.
+///
+/// # Gotchas
+///
+/// The default rules do not split Thai, Lao, Khmer, Myanmar, Chinese or Japanese text into words.
+/// Each run of those characters stays one segment.
+pub effect fn words(text: string, output: &mut List<usize>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run wordsOf(String.utf8Bytes(text), &mut output)
+}
+
+effect fn wordsOf(text: &[u8], output: &mut List<usize>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run List<usize>.append(&mut output, 0)
+  let mut at: usize = 0
+  let mut rawPrevious = W.Other
+  let mut previous = W.Other
+  let mut before = W.Other
+  let mut oddRI = false
+  while at < text.length {
+    let decoded = utf8_scan.decode(text, at)
+    let current = W.of(decoded.scalar)
+    let ignored = wordIgnored(current)
+    let mut boundary = true
+    if rawPrevious == W.CR && current == W.LF {
+      boundary = false // WB3
+    } else if wordNewline(rawPrevious) || wordNewline(current) {
+      boundary = true // WB3a, WB3b
+    } else if rawPrevious == W.ZWJ && Unicode.isExtendedPictographic(decoded.scalar) {
+      boundary = false // WB3c is deliberately before WB4.
+    } else if rawPrevious == W.WSegSpace && current == W.WSegSpace {
+      boundary = false // WB3d does not bridge ignored characters.
+    } else if ignored {
+      boundary = false // WB4
+    } else {
+      boundary = wordBoundary(text, decoded.next, before, previous, current, oddRI)
+    }
+    if at != 0 && boundary {
+      run List<usize>.append(&mut output, at)
+    }
+    if !ignored || at == 0 || wordNewline(rawPrevious) {
+      // An ignored character immediately after sot/newline is its own base.
+      let mut significant = current
+      if ignored {
+        significant = W.Other
+      }
+      before = previous
+      previous = significant
+      if significant == W.Regional_Indicator {
+        oddRI = !oddRI
+      } else {
+        oddRI = false
+      }
+    }
+    rawPrevious = current
+    at = decoded.next
+  }
+  if text.length != 0 {
+    run List<usize>.append(&mut output, text.length)
+  }
+}
+
+fn paragraphSeparator(value: S) -> bool {
+  return value == S.CR || value == S.LF || value == S.Sep
+}
+
+fn sentenceIgnored(value: S) -> bool {
+  return value == S.Extend || value == S.Format
+}
+
+fn sentenceTerminal(value: S) -> bool {
+  return value == S.ATerm || value == S.STerm
+}
+
+// SB8's unbounded right context is cached up to the first decisive scalar.
+// Consecutive Close/Sp positions therefore never rescan the same suffix.
+fn lowerAhead(text: &[u8], start: usize, stop: &mut usize, lower: &mut bool) -> bool {
+  if start <= stop.* {
+    return lower.*
+  }
+  let mut at = start
+  while at < text.length {
+    let decoded = utf8_scan.decode(text, at)
+    let value = S.of(decoded.scalar)
+    if value == S.Lower || value == S.Upper || value == S.OLetter || paragraphSeparator(value)
+      || sentenceTerminal(value) {
+      stop.* = at
+      lower.* = value == S.Lower
+      return lower.*
+    }
+    at = decoded.next
+  }
+  stop.* = text.length
+  lower.* = false
+  return false
+}
+
+/// Appends the sentence boundaries of `text` to `output`, as byte offsets.
+///
+/// # Details
+///
+/// The boundaries follow the default sentence boundary rules of UAX #29 for Unicode 18.0.0. They
+/// are sorted and include 0 and `text`'s byte length once each, so empty text gives one boundary,
+/// 0. A sentence keeps its trailing spaces and closing punctuation. The function does not clear
+/// `output`, so clear it first to reuse its storage.
+///
+/// # Errors
+///
+/// - `OutOfMemoryError` if the `Allocator` cannot grow `output`.
+///
+/// # Gotchas
+///
+/// The default rules do not know abbreviations, so `"Mr. Smith"` has a boundary after `"Mr. "`.
+pub effect fn sentences(text: string, output: &mut List<usize>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run sentencesOf(String.utf8Bytes(text), &mut output)
+}
+
+effect fn sentencesOf(text: &[u8], output: &mut List<usize>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run List<usize>.append(&mut output, 0)
+  let mut at: usize = 0
+  let mut rawPrevious = S.Other
+  let mut previous = S.Other
+  let mut before = S.Other
+  let mut terminal = S.Other
+  let mut spaces = false
+  let mut lookaheadStop: usize = 0
+  let mut lookaheadLower = false
+  while at < text.length {
+    let decoded = utf8_scan.decode(text, at)
+    let current = S.of(decoded.scalar)
+    let ignored = sentenceIgnored(current)
+    if !sentenceTerminal(terminal) && !paragraphSeparator(rawPrevious)
+      && !sentenceTerminal(current) {
+      // Inside a sentence only SB4 and the terminal rules can break, so
+      // ordinary text just moves the significant history along (SB998).
+      // `before` is read only after an ATerm, which takes the slow path.
+      if !ignored {
+        previous = current
+      } else if at == 0 {
+        previous = S.Other
+      }
+      rawPrevious = current
+      at = decoded.next
+      continue
+    }
+    let mut boundary = false
+    if rawPrevious == S.CR && current == S.LF {
+      boundary = false // SB3
+    } else if paragraphSeparator(rawPrevious) {
+      boundary = true // SB4
+    } else if ignored {
+      boundary = false // SB5
+    } else if previous == S.ATerm && current == S.Numeric {
+      boundary = false // SB6
+    } else if (before == S.Upper || before == S.Lower) && previous == S.ATerm
+      && current == S.Upper {
+      boundary = false // SB7
+    } else if terminal == S.ATerm && lowerAhead(text, at, &mut lookaheadStop, &mut lookaheadLower) {
+      boundary = false // SB8
+    } else if sentenceTerminal(terminal) && (current == S.SContinue || sentenceTerminal(current)) {
+      boundary = false // SB8a
+    } else if sentenceTerminal(terminal)
+      && ((!spaces && current == S.Close) || current == S.Sp || paragraphSeparator(current)) {
+      boundary = false // SB9, SB10
+    } else if sentenceTerminal(terminal) {
+      boundary = true // SB11 (the ParaSep suffix is already covered by SB4).
+    }
+    if at != 0 && boundary {
+      run List<usize>.append(&mut output, at)
+    }
+    if !ignored || at == 0 || paragraphSeparator(rawPrevious) {
+      let mut significant = current
+      if ignored {
+        significant = S.Other
+      }
+      before = previous
+      previous = significant
+      if sentenceTerminal(significant) {
+        terminal = significant
+        spaces = false
+      } else if sentenceTerminal(terminal) && significant == S.Sp {
+        spaces = true
+      } else if !(sentenceTerminal(terminal) && !spaces && significant == S.Close) {
+        terminal = S.Other
+        spaces = false
+      }
+    }
+    rawPrevious = current
+    at = decoded.next
+  }
+  if text.length != 0 {
+    run List<usize>.append(&mut output, text.length)
+  }
+}
