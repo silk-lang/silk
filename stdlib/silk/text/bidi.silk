@@ -1,0 +1,1241 @@
+//! The Unicode Bidirectional Algorithm (UAX #9) for text that mixes left-to-right and right-to-left
+//! scripts, with data from Unicode 18.0.0.
+//!
+//! # When to use
+//! Use [`BidiAnalysis`] to find the direction and embedding level of each part of a text that can
+//! contain Arabic, Hebrew or other right-to-left scripts. Use [`reorder`] to put the parts of a
+//! wrapped line in visual order.
+//!
+//! # Details
+//! [`BidiAnalysis.analyze`] implements the whole algorithm of UAX #9 revision 52: explicit
+//! embeddings, overrides and isolates, overflow handling, bracket pairs (N0), and the removal of
+//! formatting characters (X9). Its results are paragraphs and level runs over the byte offsets of
+//! the text. Paragraphs without right-to-left characters, Arabic digits or explicit formatting
+//! take a fast path. [`analyzeClasses`] and [`analyzeCodepoints`] resolve one paragraph of classes
+//! or code points, for conformance tests.
+//!
+//! # Gotchas
+//! The analysis applies rule L1 only with each paragraph as one line, in
+//! [`BidiRun.unwrappedLevel`]. After you wrap a paragraph, apply rule L1 to each line yourself
+//! before [`reorder`].
+//!
+//! # Examples
+//! ## Find the right-to-left part of a text
+//! ```silk
+//! import silk.core.effect { Effect }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.text.bidi { BidiAnalysis, ParagraphDirection }
+//!
+//! pub effect fn main() -> i32
+//!   ! OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let mut analysis = BidiAnalysis.make()
+//!   // "abc " followed by the Hebrew letters alef, bet and gimel.
+//!   run analysis.analyze("abc \u{5d0}\u{5d1}\u{5d2}", ParagraphDirection.Auto)
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let runs = analysis.runs()
+//!   // The Hebrew run starts at byte 4 and has the right-to-left level 1.
+//!   if runs.length != 2 || runs[1].start != 4 || runs[1].level != 1 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Text
+
+// Unicode 18 rules: https://www.unicode.org/reports/tr9/tr9-52.html
+
+import silk.text.unicode { Unicode }
+import silk.text.unicode_properties { BidiClass, BidiPairedBracketType }
+import silk.text.string { String }
+import silk.text.utf8_scan
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.usize
+import silk.num.u8
+import silk.num.u32
+
+/// The base direction of the paragraphs of a text.
+pub enum ParagraphDirection {
+  /// Each paragraph takes the direction of its first strong character (rules P2 and P3), and is
+  /// left-to-right when it has none.
+  Auto,
+  /// Each paragraph is left-to-right, embedding level 0.
+  Ltr,
+  /// Each paragraph is right-to-left, embedding level 1.
+  Rtl,
+}
+
+/// One paragraph of a text, as [`BidiAnalysis.paragraphs`] gives it.
+///
+/// # Details
+///
+/// A paragraph ends after each paragraph separator, such as LF or U+2029 (rule P1). CR and LF each
+/// end a paragraph, so CRLF gives an empty paragraph between them.
+pub struct BidiParagraph {
+  /// The byte offset where the paragraph starts.
+  pub start: usize,
+  /// The byte offset where the paragraph ends, after its paragraph separator.
+  pub end: usize,
+  /// The paragraph embedding level: 0 for left-to-right, 1 for right-to-left.
+  pub level: u8,
+  /// True if the paragraph has a strong character outside isolates (rule P2). An
+  /// [`ParagraphDirection.Auto`] paragraph without one is left-to-right.
+  pub hasStrong: bool,
+}
+
+impl Copy for BidiParagraph {}
+
+/// A maximal range of a text with the same bidi results, as [`BidiAnalysis.runs`] gives it. A run
+/// never crosses a paragraph.
+pub struct BidiRun {
+  /// The byte offset where the run starts.
+  pub start: usize,
+  /// The byte offset where the run ends.
+  pub end: usize,
+  /// The resolved embedding level before the line rule L1. Shape the run with this level: even is
+  /// left-to-right, odd is right-to-left.
+  pub level: u8,
+  /// The level after rule L1 when the whole paragraph is one line. Trailing spaces and separators
+  /// get the paragraph level.
+  pub unwrappedLevel: u8,
+  /// True for characters that rule X9 removes: explicit formatting characters and boundary
+  /// neutrals. They keep their bytes and take the level of the preceding character.
+  pub removed: bool,
+}
+
+impl Copy for BidiRun {}
+
+struct Character {
+  original: BidiClass,
+  kind: BidiClass,
+  embedding: u8,
+  level: u8,
+  unwrapped: u8,
+  cp: u32,
+  start: usize,
+  end: usize,
+  bracket: usize,
+  matching: usize,
+  outer: usize,
+  previous: usize,
+  following: usize,
+  next: usize,
+  incoming: bool,
+}
+
+impl Copy for Character {}
+
+struct Status {
+  level: u8,
+  overrideKind: BidiClass,
+  isolate: bool
+}
+
+impl Copy for Status {}
+
+/// The per-character results of one paragraph, as [`analyzeClasses`] and [`analyzeCodepoints`]
+/// give them.
+///
+/// # When to use
+///
+/// Use a `BidiWorkspace` to resolve one paragraph of bidi classes or code points and read the level
+/// of each character, as the Unicode conformance tests do. Use [`BidiAnalysis`] for text.
+///
+/// # Details
+///
+/// The workspace keeps its storage across calls. Each analysis replaces its contents. Character
+/// `index` is the position in the input of the analysis.
+pub struct BidiWorkspace {
+  chars: List<Character>
+}
+
+impl BidiWorkspace {
+  /// Returns an empty workspace. It does not allocate.
+  pub fn make() -> Self {
+    return Self { chars: List<Character>.make() }
+  }
+
+  /// Returns the number of characters of the last analysis.
+  pub fn length(self: &Self) -> usize {
+    return self.chars.length()
+  }
+
+  /// Returns the resolved embedding level of character `index`, before the line rule L1. Traps if
+  /// `index` is not less than [`BidiWorkspace.length`].
+  pub fn level(self: &Self, index: usize) -> u8 {
+    return self.chars.get(index).level
+  }
+
+  /// Returns the level of character `index` after rule L1, with the whole paragraph as one line.
+  /// Traps if `index` is not less than [`BidiWorkspace.length`].
+  pub fn unwrappedLevel(self: &Self, index: usize) -> u8 {
+    return self.chars.get(index).unwrapped
+  }
+
+  /// Returns true if rule X9 removes character `index`: an explicit formatting character or a
+  /// boundary neutral. Traps if `index` is not less than [`BidiWorkspace.length`].
+  pub fn isRemoved(self: &Self, index: usize) -> bool {
+    return removed(self.chars.get(index).original)
+  }
+
+  /// Appends the character indices of the whole paragraph to `output` in visual order (rule L2),
+  /// with the paragraph as one line. Characters that rule X9 removes are left out.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot grow `output`.
+  pub effect fn visualOrder(self: &Self, output: &mut List<usize>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let start = output.length()
+    let mut highest: u8 = 0
+    let mut lowestOdd: u8 = 255
+    let mut index: usize = 0
+    while index < self.chars.length() {
+      let item = self.chars.get(index)
+      if !removed(item.original) {
+        run output.append(index)
+        if item.unwrapped > highest {
+          highest = item.unwrapped
+        }
+        if item.unwrapped % 2 == 1 && item.unwrapped < lowestOdd {
+          lowestOdd = item.unwrapped
+        }
+      }
+      index = index + 1
+    }
+    while highest >= lowestOdd {
+      index = start
+      while index < output.length() {
+        if self.chars.get(output.get(index)).unwrapped < highest {
+          index = index + 1
+        } else {
+          let first = index
+          while index < output.length() && self.chars.get(output.get(index)).unwrapped >= highest {
+            index = index + 1
+          }
+          reverse(&mut output, first, index)
+        }
+      }
+      highest = highest - 1
+    }
+  }
+}
+
+fn isolate(kind: BidiClass) -> bool {
+  return kind == BidiClass.LRI || kind == BidiClass.RLI || kind == BidiClass.FSI
+}
+
+fn removed(kind: BidiClass) -> bool {
+  return kind == BidiClass.LRE || kind == BidiClass.RLE || kind == BidiClass.LRO
+    || kind == BidiClass.RLO
+    || kind == BidiClass.PDF
+    || kind == BidiClass.BN
+}
+
+fn strong(kind: BidiClass) -> bool {
+  return kind == BidiClass.L || kind == BidiClass.R || kind == BidiClass.AL
+}
+
+fn neutral(kind: BidiClass) -> bool {
+  return kind == BidiClass.WS || kind == BidiClass.S || kind == BidiClass.B || kind == BidiClass.ON
+    || isolate(kind)
+    || kind == BidiClass.PDI
+}
+
+fn resettable(kind: BidiClass) -> bool {
+  return kind == BidiClass.WS || kind == BidiClass.S || kind == BidiClass.B || isolate(kind)
+    || kind == BidiClass.PDI
+    || removed(kind)
+}
+
+fn levelKind(level: u8) -> BidiClass {
+  if level % 2 == 1 {
+    return BidiClass.R
+  }
+  return BidiClass.L
+}
+
+fn surrounding(kind: BidiClass) -> BidiClass {
+  if kind == BidiClass.EN || kind == BidiClass.AN {
+    return BidiClass.R
+  }
+  return kind
+}
+
+fn higher(a: u8, b: u8) -> u8 {
+  if a > b {
+    return a
+  }
+  return b
+}
+
+effect fn appendCharacter(
+  chars: &mut List<Character>,
+  kind: BidiClass,
+  cp: u32,
+  start: usize,
+  end: usize,
+)
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run chars.append(
+    Character {
+      original: kind,
+      kind: kind,
+      embedding: 0,
+      level: 0,
+      unwrapped: 0,
+      cp: cp,
+      start: start,
+      end: end,
+      bracket: usize.MAX,
+      matching: usize.MAX,
+      outer: usize.MAX,
+      previous: usize.MAX,
+      following: usize.MAX,
+      next: usize.MAX,
+      incoming: false,
+    },
+  )
+}
+
+// Pair original isolate controls before applying any overrides. A linked
+// opener stack in the records also handles arbitrary overflow nesting.
+fn pairIsolates(chars: &mut [Character]) {
+  let mut top = usize.MAX
+  let mut index: usize = 0
+  while index < chars.length {
+    let mut item = chars[index]
+    if isolate(item.original) {
+      item.outer = top
+      top = index
+    } else if item.original == BidiClass.PDI && top != usize.MAX {
+      let mut opener = chars[top]
+      opener.matching = index
+      item.matching = top
+      chars[top] = opener
+      top = opener.outer
+    }
+    chars[index] = item
+    index = index + 1
+  }
+}
+
+fn firstStrong(chars: &[Character], start: usize, end: usize) -> BidiClass {
+  let mut index = start
+  while index < end {
+    let item = chars[index]
+    if isolate(item.original) {
+      if item.matching == usize.MAX || item.matching >= end {
+        return BidiClass.ON
+      }
+      index = item.matching + 1
+    } else {
+      if strong(item.original) {
+        return item.original
+      }
+      index = index + 1
+    }
+  }
+  return BidiClass.ON
+}
+
+fn explicitLevels(chars: &mut [Character], base: u8) {
+  // Every valid push raises the level, so 126 slots suffice for max_depth=125.
+  let mut stack: [Status; 126] = [
+    Status { level: 0, overrideKind: BidiClass.ON, isolate: false }; 126
+  ]
+  stack[0].level = base
+  let mut top: usize = 0
+  let mut overflowIsolate: usize = 0
+  let mut overflowEmbedding: usize = 0
+  let mut validIsolate: usize = 0
+  let mut index: usize = 0
+  while index < chars.length {
+    let mut item = chars[index]
+    let kind = item.original
+    item.embedding = stack[top].level
+    if kind == BidiClass.B {
+      // X8: B is outside all embeddings, overrides and isolates.
+      item.embedding = base
+    } else if kind == BidiClass.LRE || kind == BidiClass.RLE || kind == BidiClass.LRO
+      || kind == BidiClass.RLO
+      || isolate(kind) {
+      let isIsolate = isolate(kind)
+      let mut right = kind == BidiClass.RLE || kind == BidiClass.RLO || kind == BidiClass.RLI
+      if kind == BidiClass.FSI {
+        let mut end = chars.length
+        if item.matching != usize.MAX {
+          end = item.matching
+        }
+        let first = firstStrong(&chars, index + 1, end)
+        right = first == BidiClass.R || first == BidiClass.AL
+      }
+      if isIsolate && stack[top].overrideKind != BidiClass.ON {
+        item.kind = stack[top].overrideKind
+      }
+      let mut level = stack[top].level + 1
+      if (right && level % 2 == 0) || (!right && level % 2 == 1) {
+        level = level + 1
+      }
+      if level <= 125 && overflowIsolate == 0 && overflowEmbedding == 0 {
+        let mut overrideKind = BidiClass.ON
+        if kind == BidiClass.LRO {
+          overrideKind = BidiClass.L
+        }
+        if kind == BidiClass.RLO {
+          overrideKind = BidiClass.R
+        }
+        top = top + 1
+        stack[top] = Status { level: level, overrideKind: overrideKind, isolate: isIsolate }
+        if isIsolate {
+          validIsolate = validIsolate + 1
+        }
+      } else if isIsolate {
+        overflowIsolate = overflowIsolate + 1
+      } else if overflowIsolate == 0 {
+        overflowEmbedding = overflowEmbedding + 1
+      }
+    } else if kind == BidiClass.PDI {
+      if overflowIsolate > 0 {
+        overflowIsolate = overflowIsolate - 1
+      } else if validIsolate > 0 {
+        overflowEmbedding = 0
+        while !stack[top].isolate {
+          top = top - 1
+        }
+        top = top - 1
+        validIsolate = validIsolate - 1
+      }
+      item.embedding = stack[top].level
+      if stack[top].overrideKind != BidiClass.ON {
+        item.kind = stack[top].overrideKind
+      }
+    } else if kind == BidiClass.PDF {
+      if overflowIsolate == 0 {
+        if overflowEmbedding > 0 {
+          overflowEmbedding = overflowEmbedding - 1
+        } else if top > 0 && !stack[top].isolate {
+          top = top - 1
+        }
+      }
+      item.embedding = stack[top].level
+    } else if stack[top].overrideKind != BidiClass.ON {
+      item.kind = stack[top].overrideKind
+    }
+    item.level = item.embedding
+    chars[index] = item
+    index = index + 1
+  }
+}
+
+// X9 is a semantic removal only: keep source records for exact shape coverage.
+// Link level runs, then join matching isolate ends according to BD13/X10.
+fn linkSequences(chars: &mut [Character]) {
+  let mut previous = usize.MAX
+  let mut index: usize = 0
+  while index < chars.length {
+    let mut item = chars[index]
+    if !removed(item.original) {
+      item.previous = previous
+      if previous != usize.MAX {
+        let mut before = chars[previous]
+        before.following = index
+        chars[previous] = before
+      }
+      chars[index] = item
+      previous = index
+    }
+    index = index + 1
+  }
+  index = 0
+  while index < chars.length {
+    let mut item = chars[index]
+    if !removed(item.original) {
+      if item.following != usize.MAX && chars[item.following].embedding == item.embedding {
+        item.next = item.following
+      } else if isolate(item.original) && item.matching != usize.MAX {
+        item.next = item.matching
+      }
+      chars[index] = item
+      if item.next != usize.MAX {
+        let mut next = chars[item.next]
+        next.incoming = true
+        chars[item.next] = next
+      }
+    }
+    index = index + 1
+  }
+}
+
+@inlineAlways
+fn bit(kind: BidiClass) -> u32 {
+  return u32.shiftLeft(1, u8.toU32(BidiClass.value(kind)))
+}
+
+fn resolveSequence(chars: &mut [Character], first: usize, base: u8) {
+  // One walk finds the end and the classes present, so rules whose classes
+  // are absent can be skipped.
+  let mut present: u32 = 0
+  let mut last = first
+  let mut index = first
+  while index != usize.MAX {
+    present = present | bit(chars[index].kind)
+    last = index
+    index = chars[index].next
+  }
+  let embedding = chars[first].embedding
+  let mut preceding = base
+  if chars[first].previous != usize.MAX {
+    preceding = chars[chars[first].previous].embedding
+  }
+  let sos = levelKind(higher(embedding, preceding))
+  let mut following = base
+  if !isolate(chars[last].original) && chars[last].following != usize.MAX {
+    following = chars[chars[last].following].embedding
+  }
+  let eos = levelKind(higher(chars[last].embedding, following))
+
+  // W1-W3 in one pass. W1: isolate initiators and PDI do not lend their class
+  // to an NSM. W2 sees AL as the previous strong type before W3 changes it.
+  if (present & (bit(BidiClass.NSM) | bit(BidiClass.AL))) != 0 {
+    let mut previous = sos
+    let mut previousStrong = sos
+    index = first
+    while index != usize.MAX {
+      let mut kind = chars[index].kind
+      if kind == BidiClass.NSM {
+        kind = previous
+      }
+      previous = kind
+      if isolate(previous) || previous == BidiClass.PDI {
+        previous = BidiClass.ON
+      }
+      if kind == BidiClass.EN && previousStrong == BidiClass.AL {
+        kind = BidiClass.AN
+      }
+      if strong(kind) {
+        previousStrong = kind
+      }
+      if kind == BidiClass.AL {
+        kind = BidiClass.R
+      }
+      chars[index].kind = kind
+      index = chars[index].next
+    }
+    if (present & bit(BidiClass.NSM)) != 0 {
+      present = u32.MAX
+    }
+    present = present | bit(BidiClass.AN) | bit(BidiClass.R)
+  }
+  let separators = bit(BidiClass.ES) | bit(BidiClass.ET) | bit(BidiClass.CS)
+  let numbers = bit(BidiClass.EN) | bit(BidiClass.AN)
+
+  // W4: only a single separator between like numbers changes type.
+  if (present & (bit(BidiClass.ES) | bit(BidiClass.CS))) != 0 && (present & numbers) != 0 {
+    let mut previous = sos
+    index = first
+    while index != usize.MAX {
+      let kind = chars[index].kind
+      let next = chars[index].next
+      let mut nextKind = eos
+      if next != usize.MAX {
+        nextKind = chars[next].kind
+      }
+      if (kind == BidiClass.ES || kind == BidiClass.CS) && previous == BidiClass.EN
+        && nextKind == BidiClass.EN {
+        chars[index].kind = BidiClass.EN
+      } else if kind == BidiClass.CS && previous == BidiClass.AN && nextKind == BidiClass.AN {
+        chars[index].kind = BidiClass.AN
+      }
+      previous = kind
+      index = next
+    }
+  }
+
+  // W5: an entire ET run adjacent to EN becomes EN.
+  if (present & bit(BidiClass.ET)) != 0 && (present & bit(BidiClass.EN)) != 0 {
+    let mut previous = sos
+    index = first
+    while index != usize.MAX {
+      if chars[index].kind == BidiClass.ET {
+        let start = index
+        while index != usize.MAX && chars[index].kind == BidiClass.ET {
+          index = chars[index].next
+        }
+        let mut nextKind = eos
+        if index != usize.MAX {
+          nextKind = chars[index].kind
+        }
+        if previous == BidiClass.EN || nextKind == BidiClass.EN {
+          let mut at = start
+          while at != index {
+            chars[at].kind = BidiClass.EN
+            at = chars[at].next
+          }
+        }
+        previous = chars[start].kind
+      } else {
+        previous = chars[index].kind
+        index = chars[index].next
+      }
+    }
+  }
+
+  // W6 then W7 (W7 must not affect W4/W5 number recognition).
+  if (present & (separators | bit(BidiClass.EN))) != 0 {
+    let mut previousStrong = sos
+    index = first
+    while index != usize.MAX {
+      let mut kind = chars[index].kind
+      if kind == BidiClass.ES || kind == BidiClass.ET || kind == BidiClass.CS {
+        kind = BidiClass.ON
+      }
+      if kind == BidiClass.EN && previousStrong == BidiClass.L {
+        kind = BidiClass.L
+      }
+      if kind == BidiClass.L || kind == BidiClass.R {
+        previousStrong = kind
+      }
+      chars[index].kind = kind
+      index = chars[index].next
+    }
+  }
+  if (present & (bit(BidiClass.ON) | separators)) != 0 {
+    resolveBrackets(&mut chars, first, sos)
+  }
+
+  // N1/N2 resolve complete neutral sequences, including isolate formatting.
+  let neutrals = bit(BidiClass.WS) | bit(BidiClass.S) | bit(BidiClass.B) | bit(BidiClass.ON)
+    | bit(BidiClass.LRI)
+    | bit(BidiClass.RLI)
+    | bit(BidiClass.FSI)
+    | bit(BidiClass.PDI)
+    | separators
+  if (present & neutrals) != 0 {
+    let mut before = sos
+    index = first
+    while index != usize.MAX {
+      if neutral(chars[index].kind) {
+        let start = index
+        while index != usize.MAX && neutral(chars[index].kind) {
+          index = chars[index].next
+        }
+        let mut after = eos
+        if index != usize.MAX {
+          after = surrounding(chars[index].kind)
+        }
+        let mut resolved = levelKind(embedding)
+        if before == after {
+          resolved = before
+        }
+        let mut at = start
+        while at != index {
+          chars[at].kind = resolved
+          at = chars[at].next
+        }
+        before = resolved
+      } else {
+        before = surrounding(chars[index].kind)
+        index = chars[index].next
+      }
+    }
+  }
+
+  // I1, I2.
+  index = first
+  while index != usize.MAX {
+    let kind = chars[index].kind
+    let level = chars[index].embedding
+    if level % 2 == 0 {
+      if kind == BidiClass.R {
+        chars[index].level = level + 1
+      } else if kind == BidiClass.EN || kind == BidiClass.AN {
+        chars[index].level = level + 2
+      }
+    } else if kind == BidiClass.L || kind == BidiClass.EN || kind == BidiClass.AN {
+      chars[index].level = level + 1
+    }
+    index = chars[index].next
+  }
+}
+
+// BD16 treats the canonical singleton equivalents U+2329/U+232A as
+// U+3008/U+3009. These are the only nonidentity canonical bracket mappings.
+fn canonicalBracket(cp: u32) -> u32 {
+  if cp == 0x2329 {
+    return 0x3008
+  }
+  if cp == 0x232a {
+    return 0x3009
+  }
+  return cp
+}
+
+fn bracketType(chars: &mut [Character], index: usize, kind: BidiClass) {
+  let mut item = chars[index]
+  item.kind = kind
+  chars[index] = item
+  let mut next = item.next
+
+  // N0 also changes the original NSMs following either bracket, after X9.
+  while next != usize.MAX {
+    let mut mark = chars[next]
+    if mark.original != BidiClass.NSM {
+      return
+    }
+    mark.kind = kind
+    chars[next] = mark
+    next = mark.next
+  }
+}
+
+fn resolveBrackets(chars: &mut [Character], first: usize, sos: BidiClass) {
+  // BD16 bounds pending opening brackets, not the number of pairs.
+  let mut stack: [usize; 63] = [0; 63]
+  let mut depth: usize = 0
+  let mut index = first
+  while index != usize.MAX {
+    let item = chars[index]
+    if item.kind == BidiClass.ON {
+      let bracket = BidiPairedBracketType.of(item.cp)
+      if bracket == BidiPairedBracketType.Open {
+        if depth == 63 {
+          break
+        }
+        stack[depth] = index
+        depth = depth + 1
+      } else if bracket == BidiPairedBracketType.Close {
+        let key = canonicalBracket(item.cp)
+        let mut at = depth
+        while at > 0 {
+          at = at - 1
+          let mut opener = chars[stack[at]]
+          if canonicalBracket(Unicode.bidiPairedBracket(opener.cp)) == key {
+            opener.bracket = index
+            chars[stack[at]] = opener
+            depth = at
+            break
+          }
+        }
+      }
+    }
+    index = item.next
+  }
+
+  // Opening-position order is essential for nested pairs and N0c's context.
+  let embedding = levelKind(chars[first].embedding)
+  let mut opposite = BidiClass.L
+  if embedding == BidiClass.L {
+    opposite = BidiClass.R
+  }
+  let mut preceding = sos
+  index = first
+  while index != usize.MAX {
+    let item = chars[index]
+    if item.bracket != usize.MAX {
+      let mut enclosed = BidiClass.ON
+      let mut at = item.next
+      while at != item.bracket {
+        let value = chars[at]
+        let kind = surrounding(value.kind)
+        if kind == embedding {
+          enclosed = embedding
+          break
+        }
+        if kind == opposite {
+          enclosed = opposite
+        }
+        at = value.next
+      }
+      let mut resolved = BidiClass.ON
+      if enclosed == embedding {
+        resolved = embedding
+      } else if enclosed == opposite {
+        resolved = embedding
+        if preceding == opposite {
+          resolved = opposite
+        }
+      }
+      if resolved != BidiClass.ON {
+        bracketType(&mut chars, index, resolved)
+        bracketType(&mut chars, item.bracket, resolved)
+      }
+    }
+    let kind = surrounding(chars[index].kind)
+    if kind == BidiClass.L || kind == BidiClass.R {
+      preceding = kind
+    }
+    index = item.next
+  }
+}
+
+// Without explicit formatting every character has the paragraph embedding
+// level and the paragraph is one isolating run sequence (BN excluded by X9).
+fn linkPlain(chars: &mut [Character], base: u8) {
+  let mut previous = usize.MAX
+  let mut index: usize = 0
+  while index < chars.length {
+    chars[index].embedding = base
+    chars[index].level = base
+    if chars[index].original != BidiClass.BN {
+      chars[index].previous = previous
+      if previous != usize.MAX {
+        chars[previous].following = index
+        chars[previous].next = index
+        chars[index].incoming = true
+      }
+      previous = index
+    }
+    index = index + 1
+  }
+}
+
+fn resolveParagraph(chars: &mut [Character], direction: ParagraphDirection) -> u8 {
+  let mut explicit = false
+  let mut index: usize = 0
+  while index < chars.length && !explicit {
+    let kind = chars[index].original
+    explicit = isolate(kind) || kind == BidiClass.PDI || (removed(kind) && kind != BidiClass.BN)
+    index = index + 1
+  }
+  if explicit {
+    pairIsolates(&mut chars)
+  }
+  let first = firstStrong(&chars, 0, chars.length)
+  let mut base: u8 = 0
+  if direction == ParagraphDirection.Rtl
+    || (direction == ParagraphDirection.Auto && (first == BidiClass.R || first == BidiClass.AL)) {
+    base = 1
+  }
+  if explicit {
+    explicitLevels(&mut chars, base)
+    linkSequences(&mut chars)
+  } else {
+    linkPlain(&mut chars, base)
+  }
+  index = 0
+  while index < chars.length {
+    let item = chars[index]
+    if !removed(item.original) && !item.incoming {
+      resolveSequence(&mut chars, index, base)
+    }
+    index = index + 1
+  }
+
+  // X9 retains source coverage with preceding resolved affinity, as in layout.
+  let mut preceding = base
+  index = 0
+  while index < chars.length {
+    let mut item = chars[index]
+    if removed(item.original) {
+      item.level = preceding
+    } else {
+      preceding = item.level
+    }
+    chars[index] = item
+    index = index + 1
+  }
+
+  // L1 for an unwrapped paragraph. Preserve pre-L1 levels independently.
+  let mut reset = true
+  index = chars.length
+  while index > 0 {
+    index = index - 1
+    let mut item = chars[index]
+    if item.original == BidiClass.S || item.original == BidiClass.B {
+      reset = true
+    } else if !resettable(item.original) {
+      reset = false
+    }
+    item.unwrapped = item.level
+    if reset {
+      item.unwrapped = base
+    }
+    chars[index] = item
+  }
+  return base
+}
+
+// Characters that need the full algorithm. Without them, an LTR or Auto
+// paragraph resolves every character to level 0 (W7 turns EN into L).
+@inlineAlways
+fn complex(kind: BidiClass) -> bool {
+  return kind == BidiClass.R || kind == BidiClass.AL || kind == BidiClass.AN
+    || (removed(kind) && kind != BidiClass.BN)
+    || isolate(kind)
+    || kind == BidiClass.PDI
+}
+
+/// The results of the Unicode Bidirectional Algorithm (UAX #9) for one text: its paragraphs and its
+/// level runs.
+///
+/// # When to use
+///
+/// Use a `BidiAnalysis` to lay out text that can mix left-to-right and right-to-left scripts, such
+/// as English with Arabic or Hebrew. Shape each [`BidiRun`] in its direction, then order the runs
+/// of each line with [`reorder`].
+///
+/// # Details
+///
+/// [`BidiAnalysis.analyze`] fills the analysis. It implements the whole algorithm: explicit
+/// embeddings, overrides and isolates, bracket pairs, and the removal of formatting characters
+/// (X9). The runs cover the text in logical order. An analysis keeps its storage, so reuse one
+/// analysis for many texts.
+pub struct BidiAnalysis {
+  paragraphList: List<BidiParagraph>,
+  runList: List<BidiRun>,
+  workspace: BidiWorkspace,
+}
+
+impl BidiAnalysis {
+  /// Returns an empty analysis. It does not allocate.
+  pub fn make() -> Self {
+    return Self {
+      paragraphList: List<BidiParagraph>.make(),
+      runList: List<BidiRun>.make(),
+      workspace: BidiWorkspace.make(),
+    }
+  }
+
+  /// Returns the paragraphs of the last analyzed text, in order. Empty text has one empty
+  /// paragraph.
+  pub fn paragraphs(self: &Self) -> &[BidiParagraph] {
+    return self.paragraphList.asSlice()
+  }
+
+  /// Returns the runs of the last analyzed text, in logical order. They cover the whole text without
+  /// gaps.
+  pub fn runs(self: &Self) -> &[BidiRun] {
+    return self.runList.asSlice()
+  }
+
+  /// Returns the run that contains byte `offset`, or `None` at or past the end of the text.
+  pub fn runAt(self: &Self, offset: usize) -> Option<BidiRun> {
+    let runs = self.runList.asSlice()
+    let mut low: usize = 0
+    let mut high = runs.length
+    while low < high {
+      let middle = low + (high - low) / 2
+      if offset < runs[middle].end {
+        high = middle
+      } else {
+        low = middle + 1
+      }
+    }
+    if low < runs.length {
+      return Option<BidiRun>.some(runs[low])
+    }
+    return Option<BidiRun>.None
+  }
+
+  /// Returns the paragraph that contains byte `offset`, or `None` at or past the end of the text.
+  pub fn paragraphAt(self: &Self, offset: usize) -> Option<BidiParagraph> {
+    let paragraphs = self.paragraphList.asSlice()
+    let mut low: usize = 0
+    let mut high = paragraphs.length
+    while low < high {
+      let middle = low + (high - low) / 2
+      if offset < paragraphs[middle].end {
+        high = middle
+      } else {
+        low = middle + 1
+      }
+    }
+    if low < paragraphs.length {
+      return Option<BidiParagraph>.some(paragraphs[low])
+    }
+    return Option<BidiParagraph>.None
+  }
+
+  /// Replaces the results with those for `text`, with `direction` as the base direction of each
+  /// paragraph.
+  ///
+  /// # Details
+  ///
+  /// A paragraph ends after each paragraph separator; CR and LF each count (rule P1). With
+  /// [`ParagraphDirection.Auto`], each paragraph takes its own direction (rules P2 and P3).
+  /// Offsets in the results are byte offsets into `text`. The analysis keeps its storage, so a
+  /// later call allocates only when a text needs more.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot grow the storage of the analysis.
+  pub effect fn analyze(self: &mut Self, text: string, direction: ParagraphDirection) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.analyzeBytes(String.utf8Bytes(text), direction)
+  }
+
+  effect fn analyzeBytes(self: &mut Self, text: &[u8], direction: ParagraphDirection) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.paragraphList.clear()
+    self.runList.clear()
+    let mut start: usize = 0
+    while start < text.length {
+      start = run self.paragraph(text, start, direction)
+    }
+    if text.length == 0 {
+      let mut level: u8 = 0
+      if direction == ParagraphDirection.Rtl {
+        level = 1
+      }
+      run self.paragraphList.append(
+        BidiParagraph { start: 0, end: 0, level: level, hasStrong: false },
+      )
+    }
+  }
+
+  // Resolves the paragraph at `start` and returns its end.
+  effect fn paragraph(
+    self: &mut Self,
+    text: &[u8],
+    start: usize,
+    direction: ParagraphDirection,
+  ) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mark = self.runList.length()
+    let mut at = start
+    let mut plain = start
+    let mut hasStrong = false
+    let mut plainText = direction != ParagraphDirection.Rtl
+    if plainText {
+      // Fast path: without RTL, Arabic numbers or explicit formatting every
+      // character is level 0; only BN characters need their own removed runs.
+      while at < text.length {
+        let decoded = utf8_scan.decode(text, at)
+        let kind = BidiClass.of(decoded.scalar)
+        if complex(kind) {
+          plainText = false
+          break
+        }
+        if kind == BidiClass.L {
+          hasStrong = true
+        } else if kind == BidiClass.BN {
+          run self.appendRun(start, plain, at, 0, 0, false)
+          run self.appendRun(start, at, decoded.next, 0, 0, true)
+          plain = decoded.next
+        }
+        at = decoded.next
+        if kind == BidiClass.B {
+          break
+        }
+      }
+      if plainText {
+        run self.appendRun(start, plain, at, 0, 0, false)
+        run self.paragraphList.append(
+          BidiParagraph { start: start, end: at, level: 0, hasStrong: hasStrong },
+        )
+        return at
+      }
+      self.runList.truncate(mark)
+    }
+    self.workspace.chars.clear()
+    at = start
+    while at < text.length {
+      let decoded = utf8_scan.decode(text, at)
+      let kind = BidiClass.of(decoded.scalar)
+      run appendCharacter(&mut self.workspace.chars, kind, decoded.scalar, at, decoded.next)
+      at = decoded.next
+      if kind == BidiClass.B {
+        break
+      }
+    }
+    let base = resolveParagraph(self.workspace.chars.asMutSlice(), direction)
+    hasStrong = strong(
+      firstStrong(self.workspace.chars.asSlice(), 0, self.workspace.chars.length()),
+    )
+    run self.paragraphList.append(
+      BidiParagraph { start: start, end: at, level: base, hasStrong: hasStrong },
+    )
+    let mut index: usize = 0
+    while index < self.workspace.chars.length() {
+      let item = self.workspace.chars.get(index)
+      run self.appendRun(
+        start,
+        item.start,
+        item.end,
+        item.level,
+        item.unwrapped,
+        removed(item.original),
+      )
+      index = index + 1
+    }
+    return at
+  }
+
+  // Extends the last run when it matches and lies in the same paragraph.
+  effect fn appendRun(
+    self: &mut Self,
+    paragraph: usize,
+    start: usize,
+    end: usize,
+    level: u8,
+    unwrapped: u8,
+    isRemoved: bool,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if start == end {
+      return
+    }
+    let count = self.runList.length()
+    if count > 0 {
+      let mut last = self.runList.get(count - 1)
+      if last.end == start && last.start >= paragraph && last.level == level
+        && last.unwrappedLevel == unwrapped
+        && last.removed == isRemoved {
+        last.end = end
+        self.runList.set(count - 1, last)
+        return
+      }
+    }
+    run self.runList.append(
+      BidiRun {
+        start: start,
+        end: end,
+        level: level,
+        unwrappedLevel: unwrapped,
+        removed: isRemoved,
+      },
+    )
+  }
+}
+
+/// Resolves one paragraph of bidi classes into `workspace`, and returns the paragraph embedding
+/// level.
+///
+/// # When to use
+///
+/// Use `analyzeClasses` to test the algorithm against class sequences, as the Unicode `BidiTest.txt`
+/// file gives them. Use [`BidiAnalysis.analyze`] for text.
+///
+/// # Details
+///
+/// The input is one paragraph: a paragraph separator class does not start a new one. Classes have
+/// no bracket identity, so no bracket pairs are found.
+///
+/// # Errors
+///
+/// - `OutOfMemoryError` if the `Allocator` cannot grow `workspace`.
+pub effect fn analyzeClasses(
+  classes: &[BidiClass],
+  direction: ParagraphDirection,
+  workspace: &mut BidiWorkspace,
+) -> u8
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  workspace.chars.clear()
+  let mut index: usize = 0
+  while index < classes.length {
+    run appendCharacter(&mut workspace.chars, classes[index], 0, index, index + 1)
+    index = index + 1
+  }
+  return resolveParagraph(workspace.chars.asMutSlice(), direction)
+}
+
+/// Resolves one paragraph of code points into `workspace`, and returns the paragraph embedding
+/// level.
+///
+/// # When to use
+///
+/// Use `analyzeCodepoints` to test the algorithm against code point sequences, as the Unicode
+/// `BidiCharacterTest.txt` file gives them. Use [`BidiAnalysis.analyze`] for text.
+///
+/// # Details
+///
+/// The input is one paragraph: a paragraph separator does not start a new one. Bracket pairs use
+/// the Unicode paired-bracket properties.
+///
+/// # Errors
+///
+/// - `OutOfMemoryError` if the `Allocator` cannot grow `workspace`.
+pub effect fn analyzeCodepoints(
+  codepoints: &[u32],
+  direction: ParagraphDirection,
+  workspace: &mut BidiWorkspace,
+) -> u8
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  workspace.chars.clear()
+  let mut index: usize = 0
+  while index < codepoints.length {
+    let cp = codepoints[index]
+    run appendCharacter(&mut workspace.chars, BidiClass.of(cp), cp, index, index + 1)
+    index = index + 1
+  }
+  return resolveParagraph(workspace.chars.asMutSlice(), direction)
+}
+
+fn reverse(output: &mut List<usize>, start: usize, end: usize) {
+  let mut left = start
+  let mut right = end
+  while left < right {
+    right = right - 1
+    if left < right {
+      let value = output.get(left)
+      let other = output.get(right)
+      output.set(left, other)
+      output.set(right, value)
+      left = left + 1
+    }
+  }
+}
+
+/// Appends the indices of `levels` to `output` in visual order (rule L2).
+///
+/// # When to use
+///
+/// Use `reorder` for each line after wrapping: take the levels of the characters or runs of the
+/// line, apply rule L1 to them, and reorder.
+///
+/// # Details
+///
+/// `levels` holds the embedding level of each item of one line, in logical order, after rule L1.
+/// Leave out the characters that rule X9 removes. The function reverses each maximal sequence at
+/// or above each odd level, from the highest level down. It does not allocate scratch storage.
+///
+/// # Errors
+///
+/// - `OutOfMemoryError` if the `Allocator` cannot grow `output`.
+pub effect fn reorder(levels: &[u8], output: &mut List<usize>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let start = output.length()
+  let mut highest: u8 = 0
+  let mut lowestOdd: u8 = 255
+  let mut index: usize = 0
+  while index < levels.length {
+    run output.append(index)
+    let level = levels[index]
+    if level > highest {
+      highest = level
+    }
+    if level % 2 == 1 && level < lowestOdd {
+      lowestOdd = level
+    }
+    index = index + 1
+  }
+  while highest >= lowestOdd {
+    index = start
+    while index < output.length() {
+      if levels[output.get(index)] < highest {
+        index = index + 1
+      } else {
+        let first = index
+        while index < output.length() && levels[output.get(index)] >= highest {
+          index = index + 1
+        }
+        reverse(&mut output, first, index)
+      }
+    }
+    highest = highest - 1
+  }
+}

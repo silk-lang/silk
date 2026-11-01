@@ -1,0 +1,479 @@
+//! Dictionary word segmentation for Thai, Lao, Khmer and Myanmar text, for line breaking, with the
+//! dictionaries of ICU 78.1.
+//!
+//! # When to use
+//! Use [`IcuDictionary`] with `line_break.breaksWithDictionary` in `silk.text.line_break` to wrap
+//! text that can contain Thai, Lao, Khmer or Myanmar. These scripts do not separate words with
+//! spaces, so the line breaker needs a dictionary to find where a line can end.
+//!
+//! # Details
+//! The engine is a port of the dictionary break engines of ICU release 78.1 (`dictbe.cpp`), and the
+//! data is ICU's Thai, Lao, Khmer and Burmese word lists, packed as minimal tries in
+//! `silk.text.word_dictionary_thai`, `silk.text.word_dictionary_lao`,
+//! `silk.text.word_dictionary_khmer` and `silk.text.word_dictionary_myanmar`. Segmentation allocates
+//! only to grow the caller's list.
+//!
+//! # Gotchas
+//! The dictionaries add about 2.9 MB to a program that uses this module. Only import it when the
+//! text can contain these scripts.
+//!
+//! # Examples
+//! ## Wrap Thai text
+//! ```silk
+//! import silk.collections.list { List }
+//! import silk.core.effect { Effect }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.text.line_break
+//! import silk.text.line_break { BreakOpportunity, LineOptions }
+//! import silk.text.word_dictionary { IcuDictionary }
+//!
+//! pub effect fn main() -> i32
+//!   ! OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let dictionary = IcuDictionary.make()
+//!   let mut opportunities = List<BreakOpportunity>.make()
+//!   // "Thai language" without a space between the two words.
+//!   run line_break.breaksWithDictionary(
+//!     "\u{e20}\u{e32}\u{e29}\u{e32}\u{e44}\u{e17}\u{e22}",
+//!     LineOptions.make(),
+//!     &dictionary,
+//!     &mut opportunities,
+//!   )
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   // A line can end after the first word, at byte 12, and must end at the end.
+//!   let items = opportunities.asSlice()
+//!   if items.length != 2 || items[0].offset != 12 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Text
+
+// Port of PossibleWord and the four dictionary engines in icu4c/source/common/dictbe.cpp at ICU
+// commit 049e0d6a420629ac7db77256987d083a563287b5, with DictionaryMatcher prefix behavior from
+// dictionarydata.cpp. Copyright (C) 2006-2016 International Business Machines Corporation and
+// others; copyright 2016 and later Unicode, Inc. and others. ICU license: licenses/icu.txt.
+
+import silk.text.word_dictionary_thai
+import silk.text.word_dictionary_lao
+import silk.text.word_dictionary_khmer
+import silk.text.word_dictionary_myanmar
+import silk.text.unicode { Unicode }
+import silk.text.unicode_properties { LineBreak }
+import silk.text.unicode_script { Script }
+import silk.text.line_break { DictionarySegmenter }
+import silk.text.string { String }
+import silk.text.utf8_scan
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+
+/// A word segmenter for Thai, Lao, Khmer and Myanmar text, with the dictionaries and the engines of
+/// ICU 78.1.
+///
+/// # When to use
+///
+/// Pass an `IcuDictionary` to `line_break.breaksWithDictionary` in `silk.text.line_break` to wrap
+/// text that can contain Thai, Lao, Khmer or Myanmar, whose words are not separated by spaces.
+///
+/// # Details
+///
+/// The value has no fields: the dictionaries are static data, so [`IcuDictionary.make`] does not
+/// allocate. The engine is a port of the ICU dictionary break engines: an ordered three-word
+/// lookahead, the combination of unknown text with short words, the resynchronization sets of each
+/// language, marks kept with the word before them, and the Thai suffix rules.
+///
+/// # Gotchas
+///
+/// A program that uses `IcuDictionary` links about 2.9 MB of dictionary data. There is no
+/// dictionary for Chinese or Japanese.
+pub struct IcuDictionary {}
+
+impl IcuDictionary {
+  /// Returns the segmenter. It does not allocate.
+  pub fn make() -> Self {
+    return Self {}
+  }
+}
+
+struct Trie {
+  nodes: &'static [u8],
+  edges: &'static [u8],
+  root: usize,
+}
+
+fn dictionary(language: u32) -> Trie {
+  return match language {
+    1 => Trie {
+      nodes: word_dictionary_thai.nodes(),
+      edges: word_dictionary_thai.edges(),
+      root: word_dictionary_thai.root(),
+    }
+    2 => Trie {
+      nodes: word_dictionary_lao.nodes(),
+      edges: word_dictionary_lao.edges(),
+      root: word_dictionary_lao.root(),
+    }
+    3 => Trie {
+      nodes: word_dictionary_khmer.nodes(),
+      edges: word_dictionary_khmer.edges(),
+      root: word_dictionary_khmer.root(),
+    }
+    _ => Trie {
+      nodes: word_dictionary_myanmar.nodes(),
+      edges: word_dictionary_myanmar.edges(),
+      root: word_dictionary_myanmar.root(),
+    }
+  }
+}
+
+fn u16be(bytes: &[u8], at: usize) -> u32 {
+  return u32.shiftLeft(u8.toU32(bytes[at]), 8) | u8.toU32(bytes[at + 1])
+}
+
+fn u32be(bytes: &[u8], at: usize) -> usize {
+  return u32.toUsize(u32.shiftLeft(u16be(bytes, at), 16) | u16be(bytes, at + 2))
+}
+
+// Node records are (firstEdge:u32, edgeCount:u16, terminal:u8), edges are
+// (scalar:u16, child:u32), all big endian. Only generated trusted indices enter
+// these loads; text scalars are binary-searched, never used as array indices.
+fn child(trie: &Trie, node: usize, cp: u32) -> usize {
+  let record = node * 7
+  let first = u32be(trie.nodes, record)
+  let mut low: usize = 0
+  let mut high = u32.toUsize(u16be(trie.nodes, record + 4))
+  while low < high {
+    let mid = low + (high - low) / 2
+    let edge = (first + mid) * 6
+    let value = u16be(trie.edges, edge)
+    if value < cp {
+      low = mid + 1
+    } else if value > cp {
+      high = mid
+    } else {
+      return u32be(trie.edges, edge + 2)
+    }
+  }
+  return usize.MAX
+}
+
+// ICU's capacity is 20, not a heap vector. The generator verifies the maximum
+// number of nested dictionary terminals fits, so candidates are never dropped.
+struct PossibleWord {
+  offset: usize,
+  count: usize,
+  prefix: usize,
+  current: usize,
+  marked: usize,
+  ends: [usize; 20],
+  lengths: [usize; 20],
+}
+
+impl PossibleWord {
+  fn make() -> Self {
+    return Self {
+      offset: usize.MAX,
+      count: 0,
+      prefix: 0,
+      current: 0,
+      marked: 0,
+      ends: [0; 20],
+      lengths: [0; 20],
+    }
+  }
+
+  fn candidates(self: &mut Self, trie: &Trie, text: &[u8], start: usize, end: usize) -> usize {
+    if self.offset != start {
+      self.offset = start
+      self.count = 0
+      self.prefix = 0
+      let mut node = trie.root
+      let mut at = start
+      while at < end {
+        let decoded = utf8_scan.decode(text, at)
+        at = decoded.next
+
+        // ICU DictionaryMatcher includes the failed scalar in longestPrefix.
+        self.prefix = self.prefix + 1
+        let next = child(trie, node, decoded.scalar)
+        if next == usize.MAX {
+          break
+        }
+        node = next
+        if trie.nodes[node * 7 + 6] != 0 {
+          self.ends[self.count] = at
+          self.lengths[self.count] = self.prefix
+          self.count = self.count + 1
+        }
+        if u16be(trie.nodes, node * 7 + 4) == 0 {
+          break
+        }
+      }
+    }
+    if self.count > 0 {
+      self.current = self.count - 1
+      self.marked = self.current
+    }
+    return self.count
+  }
+}
+
+// Preserve ICU's ordered three-word search. A shorter first word wins when it
+// admits a second and third word; two-word successes mark the first candidate
+// while the search continues. This is deliberately not longest-match-only.
+fn select(
+  first: &mut PossibleWord,
+  second: &mut PossibleWord,
+  third: &mut PossibleWord,
+  trie: &Trie,
+  text: &[u8],
+  end: usize,
+) {
+  if first.count <= 1 || first.ends[first.current] >= end {
+    return
+  }
+  while true {
+    let secondStart = first.ends[first.current]
+    if PossibleWord.candidates(&mut second, trie, text, secondStart, end) > 0 {
+      first.marked = first.current
+      if second.ends[second.current] >= end {
+        return
+      }
+      while true {
+        let thirdStart = second.ends[second.current]
+        if PossibleWord.candidates(&mut third, trie, text, thirdStart, end) > 0 {
+          first.marked = first.current
+          return
+        }
+        if second.current == 0 {
+          break
+        }
+        second.current = second.current - 1
+      }
+    }
+    if first.current == 0 {
+      return
+    }
+    first.current = first.current - 1
+  }
+}
+
+fn language(cp: u32) -> u32 {
+  let line = LineBreak.of(cp)
+  let sa = match &line {
+    LineBreak.SA => true
+    _ => false
+  }
+  if !sa {
+    return 0
+  }
+  return match Script.of(cp).value {
+    0x54686169 => 1
+    0x4c616f6f => 2
+    0x4b686d72 => 3
+    0x4d796d72 => 4
+    _ => 0
+  }
+}
+
+fn beginWord(cp: u32, lang: u32) -> bool {
+  return match lang {
+    1 => (cp >= 0x0e01 && cp <= 0x0e2e) || (cp >= 0x0e40 && cp <= 0x0e44)
+    2 => (cp >= 0x0e81 && cp <= 0x0eae) || (cp >= 0x0edc && cp <= 0x0edd)
+      || (cp >= 0x0ec0 && cp <= 0x0ec4)
+    3 => cp >= 0x1780 && cp <= 0x17b3
+    _ => cp >= 0x1000 && cp <= 0x102a
+  }
+}
+
+fn endWord(cp: u32, lang: u32) -> bool {
+  if language(cp) != lang {
+    return false
+  }
+  return match lang {
+    1 => cp != 0x0e31 && !(cp >= 0x0e40 && cp <= 0x0e44)
+    2 => !(cp >= 0x0ec0 && cp <= 0x0ec4)
+    3 => cp != 0x17d2
+    _ => true
+  }
+}
+
+fn suffix(cp: u32) -> bool {
+  return cp == 0x0e2f || cp == 0x0e46
+}
+
+fn previous(text: &[u8], at: usize) -> u32 {
+  let mut start = at - 1
+  while start > 0 && (text[start] & 0xc0) == 0x80 {
+    start = start - 1
+  }
+  return utf8_scan.decode(text, start).scalar
+}
+
+effect fn divide(text: &[u8], start: usize, end: usize, lang: u32, output: &mut List<usize>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  // Native indexing is UTF-8. Preserve ICU's scalar guard for Thai and its
+  // native-unit guard for Lao, Khmer and Burmese (UText UTF-8 reference mode).
+  if lang == 1 {
+    let mut probe = start
+    let mut count: usize = 0
+    while probe < end && count < 4 {
+      probe = utf8_scan.decode(text, probe).next
+      count = count + 1
+    }
+    if probe >= end {
+      return
+    }
+  } else if end - start < 4 {
+    return
+  }
+  let trie = dictionary(lang)
+  let mut first = PossibleWord.make()
+  let mut second = PossibleWord.make()
+  let mut third = PossibleWord.make()
+  let mut at = start
+  while at < end {
+    let current = at
+    let mut cpLength: usize = 0
+    if PossibleWord.candidates(&mut first, &trie, text, current, end) > 0 {
+      select(&mut first, &mut second, &mut third, &trie, text, end)
+      at = first.ends[first.marked]
+      cpLength = first.lengths[first.marked]
+    }
+
+    // Unknown-word combination and resynchronization use both root length
+    // and dictionary-prefix thresholds, plus each language's begin/end sets.
+    if at < end && cpLength < 3 {
+      let count = PossibleWord.candidates(&mut second, &trie, text, at, end)
+      if count == 0 && (at == current || second.prefix < 3) {
+        while at < end {
+          let decoded = utf8_scan.decode(text, at)
+          at = decoded.next
+          if at >= end {
+            break
+          }
+          if endWord(decoded.scalar, lang) && beginWord(utf8_scan.decode(text, at).scalar, lang) {
+            if PossibleWord.candidates(&mut third, &trie, text, at, end) > 0 {
+              break
+            }
+          }
+        }
+      }
+    }
+
+    // A leading mark belongs to the word before it, even after fallback.
+    while at < end {
+      let decoded = utf8_scan.decode(text, at)
+      if !Unicode.isMark(decoded.scalar) && decoded.scalar != 0x20 {
+        break
+      }
+      at = decoded.next
+    }
+    if lang == 1 && at < end && at > current {
+      if PossibleWord.candidates(&mut second, &trie, text, at, end) == 0 {
+        let cp = utf8_scan.decode(text, at).scalar
+        if cp == 0x0e2f && !suffix(previous(text, at)) {
+          at = utf8_scan.decode(text, at).next
+        }
+        if at < end && utf8_scan.decode(text, at).scalar == 0x0e46 && previous(text, at) != 0x0e46 {
+          at = utf8_scan.decode(text, at).next
+        }
+      }
+    }
+
+    // A candidate or the unknown-word scanner always advances at least one
+    // scalar. Range end belongs to the enclosing segmenter, not this engine.
+    if at < end {
+      run List<usize>.append(&mut output, at)
+    }
+  }
+}
+
+// ICU dictbe.cpp removes the end of each dictionary range. Its enclosing
+// line.txt $ALPlus rule keeps SA and AL in one alphabetic run. In particular,
+// exiting the SA set is not itself a word boundary: same-script alphabetic
+// symbols can continue a word without belonging to the dictionary engine.
+fn alphabeticContinuation(left: u32, right: u32) -> bool {
+  if Script.of(left).value != Script.of(right).value {
+    return false
+  }
+  if language(left) != 0 {
+    let next = LineBreak.of(right)
+    return match &next {
+      LineBreak.AL => true
+      _ => false
+    }
+  }
+  if language(right) != 0 {
+    let prior = LineBreak.of(left)
+    return match &prior {
+      LineBreak.AL => true
+      _ => false
+    }
+  }
+  return false
+}
+
+impl DictionarySegmenter for IcuDictionary {
+  effect fn breaks(self: &Self, text: string, output: &mut List<usize>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run wordBoundaries(String.utf8Bytes(text), &mut output)
+  }
+}
+
+impl IcuDictionary {
+  /// Appends the dictionary word boundaries of `text` to `output`, as sorted byte offsets that
+  /// include 0 and `text`'s byte length once each.
+  ///
+  /// # Details
+  ///
+  /// Only runs of Thai, Lao, Khmer and Myanmar letters are split into words. Other text, such as
+  /// Latin words, spaces and punctuation, is not split, and a run of one script followed by
+  /// letters of the same script continues the word. The function allocates only to grow `output`.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot grow `output`.
+  ///
+  /// # Gotchas
+  ///
+  /// These are not the UAX #29 word boundaries of `silk.text.segmentation`; they are the dictionary
+  /// words that line breaking uses.
+  pub effect fn wordBreaks(self: &Self, text: string, output: &mut List<usize>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run wordBoundaries(String.utf8Bytes(text), &mut output)
+  }
+}
+
+effect fn wordBoundaries(text: &[u8], output: &mut List<usize>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run List<usize>.append(&mut output, 0)
+  let mut at: usize = 0
+
+  // Non-dictionary spans are opaque; only edges outside same-script
+  // alphabetic continuations are emitted. UAX #29 words are in silk.text.segmentation.
+  while at < text.length {
+    let start = at
+    let lang = language(utf8_scan.decode(text, at).scalar)
+    at = utf8_scan.decode(text, at).next
+    while at < text.length && language(utf8_scan.decode(text, at).scalar) == lang {
+      at = utf8_scan.decode(text, at).next
+    }
+    if lang != 0 {
+      run divide(text, start, at, lang, &mut output)
+    }
+    if at == text.length
+      || !alphabeticContinuation(previous(text, at), utf8_scan.decode(text, at).scalar) {
+      run List<usize>.append(&mut output, at)
+    }
+  }
+}
