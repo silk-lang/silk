@@ -522,3 +522,51 @@ enums from different nominal types uses the ordinary cross-enum diagnostic.
 **Evidence:** static target requirements,
 sealed target primitive requirements,
 [intrinsic catalog](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Intrinsic.ts).
+
+## Package files
+
+### STATIC-015 — `silk.build.source` embeds files of the package
+
+**Status:** Confirmed
+
+The ordinary standard-library module `silk.build.source` reads a file of the calling package during
+static evaluation:
+
+| Member              | Result            | Value                                   |
+| ------------------- | ----------------- | --------------------------------------- |
+| `Source.read(path)` | `&'static [u8]`   | The file's bytes                        |
+| `Source.text(path)` | `string<'static>` | The file's text, checked to be UTF-8    |
+
+The path is relative to the directory that holds the package's `silk.toml`, uses `/` separators and
+has no empty, `.` or `..` segment, so a package reads only its own files. Write it as a string
+literal in the call: the build finds the files each module reads from those literals and publishes
+them with its sources. Runtime code that calls `Source.read` receives the file as a constant, and a
+`static fn` can parse the file while the package compiles.
+
+```silk,ignore
+import silk.build.source { Source }
+import silk.core.static_text { StaticText }
+
+pub fn sceneShader() -> &'static [u8] {
+  return Source.read("shaders/scene.wgsl")
+}
+
+static fn composedShader() -> string<'static> {
+  return StaticText.concat(Source.text("shaders/blend.wgsl"), Source.text("shaders/compose.wgsl"))
+}
+```
+
+A read belongs to the package of the innermost calling frame outside the standard library, so a
+library's own `static fn` reads the library's files even when another package calls it. The file
+is an input of the unit that read it: editing it reruns only that unit, and an unchanged file
+leaves every cached result in place. `silk check` reads the file but runs no process.
+
+**Boundary:** The members wrap the static-only sealed primitives `Intrinsic.embed(path)` and
+`Intrinsic.embedText(path)`. An embedded file's bytes are the only static `&'static [u8]` value;
+they are not bounded by the retained-value budget, since they are read rather than computed.
+
+**Diagnostics:** A path that leaves the package, a path that names no file (including one built from
+anything but a literal at the call), and `Source.text` of a file that is not UTF-8 each stop static
+evaluation with `SEM0176` at the call.
+
+**Evidence:** [package file source actor](../stdlib/silk/build/source.silk).
