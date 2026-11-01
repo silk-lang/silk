@@ -7,7 +7,7 @@ $artifact = (Resolve-Path -LiteralPath $ArtifactDirectory).Path
 $readobj = Join-Path $LlvmBin 'llvm-readobj.exe'
 $results = @()
 $failed = $false
-foreach ($name in @('hello', 'storage', 'host-check', 'providers', 'filesystem',
+foreach ($name in @('hello', 'hello-speed', 'storage', 'host-check', 'providers', 'filesystem',
     'native-thread-spawn-join', 'native-thread-cross-wake', 'atomic-wait-notify')) {
   $executable = Join-Path $artifact "$name.exe"
   if ($name -eq 'filesystem') { $executable = Join-Path $artifact 'windows-filesystem/provider.exe' }
@@ -68,7 +68,7 @@ foreach ($name in @('hello', 'storage', 'host-check', 'providers', 'filesystem',
     $output = $stdout.GetAwaiter().GetResult()
     $errorOutput = $stderr.GetAwaiter().GetResult()
     $expected = ''
-    if ($name -eq 'hello') { $expected = "Hello from Silk: $([char]::ConvertFromUtf32(0x1f4a9))`n" }
+    if ($name -eq 'hello' -or $name -eq 'hello-speed') { $expected = "Hello from Silk: $([char]::ConvertFromUtf32(0x1f4a9))`n" }
     $expectedCode = 0
     if ($corpusThread) { $expectedCode = 42 }
     $passed = $child.ExitCode -eq $expectedCode -and $output -ceq $expected -and $errorOutput -ceq ''

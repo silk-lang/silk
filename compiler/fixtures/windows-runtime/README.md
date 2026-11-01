@@ -19,6 +19,10 @@ foreign calls, and COFF emission. The runtime composition selects `silk/platform
 `hello.silk` is the small integration program. It uses `WindowsConsole` explicitly; the POSIX
 `writer_native` locking API is not ported by this slice.
 
+The shared harness builds hello with both `none` and `speed` optimization. The unoptimized
+program exercises emitted diagnostic frame support and split codegen units; the optimized
+program checks the production optimization path. Both must print the same UTF-8 bytes on Windows.
+
 Also cross-build `host-check.silk` and run `run-host.ps1 -Executable <host-check.exe>` once the
 runtime links. That fixture additionally imports `SetEnvironmentVariableW` for its child-local
 snapshot mutation check. The launcher supplies a fixed raw command line and a lone-surrogate

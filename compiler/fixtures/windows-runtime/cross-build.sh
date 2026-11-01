@@ -7,10 +7,15 @@ mkdir -p "$out"
 git rev-parse HEAD > "$out/source-commit.txt"
 printf 'program\tcompile\tpe-imports\texecution\n' > "$out/results.tsv"
 failed=0
-for program in hello storage host-check providers native-thread-spawn-join native-thread-cross-wake atomic-wait-notify; do
+for program in hello hello-speed storage host-check providers native-thread-spawn-join native-thread-cross-wake atomic-wait-notify; do
   source="$PWD/compiler/fixtures/windows-runtime/$program.silk"
+  optimization=none
   allowed_dlls='Name: (kernel32|ntdll)\.dll'
   case "$program" in
+    hello-speed)
+      source="$PWD/compiler/fixtures/windows-runtime/hello.silk"
+      optimization=speed
+      ;;
     native-thread-*|atomic-*)
       source="$PWD/corpus/native/$program/main.silk"
       allowed_dlls='Name: (kernel32|ntdll|api-ms-win-core-synch-l1-2-0)\.dll'
@@ -47,7 +52,7 @@ EOF
   # Retain actual Silk output and the helpers its unoptimized object requires. This inventory
   # distinguishes emitted dependencies from the broader handwritten compiler-rt risk fixture.
   if "$compiler" build "$source" -o "$out/$program.ll" --emit llvm-ir --target x86_64-pc-windows-msvc \
-      --stdlib "$PWD/stdlib" --optimization none --debug false > "$out/$program-ir.log" 2>&1 \
+      --stdlib "$PWD/stdlib" --optimization "$optimization" --debug false > "$out/$program-ir.log" 2>&1 \
       && "$SILK_TEST_CLANG" --target=x86_64-pc-windows-msvc -O0 -c "$out/$program.ll" -o "$out/$program.obj" \
         > "$out/$program-object.log" 2>&1; then
     llvm-nm --undefined-only "$out/$program.obj" > "$out/$program-undefined.txt"
@@ -56,7 +61,7 @@ EOF
     failed=1
   fi
   if "$compiler" build "$source" -o "$out/$program.exe" --target x86_64-pc-windows-msvc \
-      --stdlib "$PWD/stdlib" --clang "$SILK_TEST_CLANG" --optimization none --debug false > "$out/$program-build.log" 2>&1; then
+      --stdlib "$PWD/stdlib" --clang "$SILK_TEST_CLANG" --optimization "$optimization" --debug false > "$out/$program-build.log" 2>&1; then
     if llvm-readobj --file-headers --coff-imports "$out/$program.exe" > "$out/$program-pe.txt" \
         && grep -q 'IMAGE_FILE_MACHINE_AMD64' "$out/$program-pe.txt" \
         && grep -q 'IMAGE_SUBSYSTEM_WINDOWS_CUI' "$out/$program-pe.txt" \
