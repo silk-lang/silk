@@ -62,7 +62,10 @@ void mainCRTStartup(void) {
     }
     for (D i = 0; i < length; ++i) if (input[i] != expected[i]) ExitProcess(35);
     D received = 1;
-    if (!ReadFile(GetStdHandle((D)-10), input, 1, &received, 0) || received) ExitProcess(36);
+    // Anonymous pipes report a closed writer as ERROR_BROKEN_PIPE, while regular-file EOF
+    // succeeds with zero bytes. Both are EOF, unlike another error or an unexpected byte.
+    int read = ReadFile(GetStdHandle((D)-10), input, 1, &received, 0);
+    if ((!read && GetLastError() != 109) || received) ExitProcess(36);
     write_all(GetStdHandle((D)-11), "interactive stdout\n", 19);
     write_all(GetStdHandle((D)-12), "interactive stderr\n", 19);
     ExitProcess(259);

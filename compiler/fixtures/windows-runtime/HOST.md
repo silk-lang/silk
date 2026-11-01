@@ -29,7 +29,17 @@ duplicated standard handles and an explicit handle list. It inherits the live en
 current directory, keeps the parent alive during Ctrl+C, waits, and forwards all 32 exit-code bits.
 Default environment assignment preserves existing empty variables. Missing standard handles and
 batch files are refused. The new process fixture mode independently checks stdin, stdout, stderr,
-argument parsing, inherited/default/empty environment and exit 259. Silk execution is pending.
+argument parsing, inherited/default/empty environment and exit 259. The actual Silk executable
+from run `41263604498` passed locally after correcting its C oracle to accept Windows pipe EOF
+(`ERROR_BROKEN_PIPE`) as well as zero-byte file EOF. Only the oracle child was rebuilt locally;
+the Silk executable was used unchanged. A fresh combined CI execution remains pending.
+
+The Windows workflow also cross-builds the full compiler and runs `run-compiler.ps1`: version,
+hello compilation through native Clang to a path containing spaces, hello execution, and checking
+the compiler's sources. `cross-compiler.sh` extracts the current production WindowsLink import
+definitions so an older N1 can link newly introduced OS calls. It restores the authored manifest
+after the build. This supplements imports only; it supplies no compiler/runtime implementation.
+Full compiler execution remains unverified until that lane succeeds.
 
 Pinned references:
 

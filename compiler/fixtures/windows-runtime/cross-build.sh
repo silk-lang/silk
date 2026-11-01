@@ -39,7 +39,7 @@ silk-version = "0.0.0"
 EOF
   source="$package/src/main.silk"
   if [ "$program" = console ]; then
-    printf 'LIBRARY kernel32.dll\nEXPORTS\nSetStdHandle\nCreateConsoleScreenBuffer\nReadConsoleOutputCharacterW\nGetConsoleOutputCP\n' > "$package/fixture.def"
+    printf 'LIBRARY kernel32.dll\nEXPORTS\nSetStdHandle\nSetConsoleMode\nCreateConsoleScreenBuffer\nReadConsoleOutputCharacterW\nGetConsoleOutputCP\n' > "$package/fixture.def"
     cat >> "$package/silk.toml" <<'EOF'
 [native]
 link = [{ object = "companion.obj" }, { static-archive = "fixture.lib" }]

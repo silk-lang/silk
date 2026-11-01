@@ -9,6 +9,7 @@ __declspec(dllimport) H CreateConsoleScreenBuffer(D, D, void *, D, void *);
 __declspec(dllimport) int ReadConsoleOutputCharacterW(H, W *, D, COORD, D *);
 __declspec(dllimport) int WriteConsoleW(H, const W *, D, D *, void *);
 __declspec(dllimport) D GetConsoleOutputCP(void);
+__declspec(dllimport) int GetConsoleMode(H, D *);
 __declspec(dllimport) int CloseHandle(H);
 static H original, screen;
 static D code_page;
@@ -36,6 +37,8 @@ int fixture_console_end(void) {
   int read = ReadConsoleOutputCharacterW(screen, cells, 16, (COORD){0,0}, &count);
   if (control != (H)-1) good = CloseHandle(control) && good;
   int same_page = GetConsoleOutputCP() == code_page;
+  D mode = 0;
+  int ansi = GetConsoleMode(screen, &mode) && (mode & 5) == 5;
   int restored = SetStdHandle((D)-11, original);
   int closed = CloseHandle(screen);
   if (!good) return 10;
@@ -45,6 +48,7 @@ int fixture_console_end(void) {
   if (!same_page) return 14;
   if (!restored) return 15;
   if (!closed) return 16;
+  if (!ansi) return 17;
   // Preserve the actual and expected first differing UTF-16 cells in the process exit status.
   // This also works when the CI runner cannot capture a hidden console's output streams.
   for (D at = 0; at < 16; ++at)

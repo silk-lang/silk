@@ -39,5 +39,5 @@ public static class SilkConsoleFixture {
 '@
 }
 $status = [SilkConsoleFixture]::Run((Resolve-Path -LiteralPath $Executable).Path)
-if ($status -ne 0) { throw ('Console readback exited {0} (0x{0:X8}; mismatch high16=actual, low16=expected; 10..16=API invariant)' -f $status) }
+if ($status -ne 0) { throw ('Console readback exited {0} (0x{0:X8}; mismatch high16=actual, low16=expected; 10..17=API invariant)' -f $status) }
 @{ status = 'passed'; exitCode = $status; claim = 'hidden-console fixture returned success' } | ConvertTo-Json

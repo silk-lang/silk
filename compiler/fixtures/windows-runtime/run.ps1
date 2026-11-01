@@ -1,14 +1,15 @@
 param(
   [Parameter(Mandatory = $true)][string]$ArtifactDirectory,
-  [string]$LlvmBin = "$env:USERPROFILE\silk-windows-tools\clang+llvm-22.1.8-x86_64-pc-windows-msvc\bin"
+  [string]$LlvmBin = "$env:USERPROFILE\silk-windows-tools\clang+llvm-22.1.8-x86_64-pc-windows-msvc\bin",
+  [string[]]$Programs = @('hello', 'hello-speed', 'storage', 'host-check', 'providers', 'filesystem', 'process', 'process-image', 'console',
+    'native-thread-spawn-join', 'native-thread-cross-wake', 'atomic-wait-notify', 'native-termination-source-trap', 'stderr-locked-message')
 )
 $ErrorActionPreference = 'Stop'
 $artifact = (Resolve-Path -LiteralPath $ArtifactDirectory).Path
 $readobj = Join-Path $LlvmBin 'llvm-readobj.exe'
 $results = @()
 $failed = $false
-foreach ($name in @('hello', 'hello-speed', 'storage', 'host-check', 'providers', 'filesystem', 'process', 'process-image', 'console',
-    'native-thread-spawn-join', 'native-thread-cross-wake', 'atomic-wait-notify', 'native-termination-source-trap', 'stderr-locked-message')) {
+foreach ($name in $Programs) {
   $executable = Join-Path $artifact "$name.exe"
   if ($name -eq 'process-image') { $executable = Join-Path $artifact 'process.exe' }
   if ($name -eq 'filesystem') { $executable = Join-Path $artifact 'windows-filesystem/provider.exe' }
