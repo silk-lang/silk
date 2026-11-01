@@ -76,7 +76,22 @@ machine namespace uses `/C:/work/project`; ordinary confined filesystem paths st
 Host paths preserve canonical WTF-8, including unpaired UTF-16 surrogates. Directory listings
 preserve names and case; paths are not globally lowercased.
 
-The current native filesystem provider requires local NTFS. Following reparse points inside a
-confined root, UNC and device roots, non-NTFS filesystems, and directory durability are explicit
-unsupported outcomes. Deleting a known final symlink or junction does not traverse its target.
-These restrictions are tracked separately from the validated native compiler and release chain.
+The current native filesystem provider requires local NTFS. Relative symbolic links resolve
+through retained directory handles, with `..` stopping at the provider root. Absolute symbolic
+links and junctions must name that root or a descendant, with matching component spelling except
+drive-letter case. Other absolute targets, differently spelled root aliases, and unknown reparse
+tags report `Unsupported`. Resolution stops after 40 links with `InvalidPath`.
+
+UNC and device roots, non-NTFS filesystems, and directory durability remain explicit unsupported
+outcomes. Deleting or atomically replacing a final symlink or junction acts on the link itself.
+Windows directories can be case sensitive, so blindly lowercasing names would merge distinct
+files. Path bytes retain their case; host canonicalization obtains the final path from an open
+handle. These restrictions are separate from the validated native compiler and release chain.
+
+## Compiler cache writes
+
+Windows writes semantic caches synchronously under a `LockFileEx` lock. A reader waits for an
+earlier writer before reading. The detached-relaunch experiment had to reconstruct the live
+semantic store, which took longer than assembling and writing the existing store's image.
+Windows therefore uses the synchronous fallback; it does not launch a background cache process.
+POSIX hosts retain their existing `fork` writer.

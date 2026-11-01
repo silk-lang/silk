@@ -2,7 +2,9 @@
 
 Machine paths use `/C:/...`, distinct from an OsFileSystem provider's confined `/`.
 `MachineFileSystem` selects a persistent per-drive provider, preserving its temporary-name counter.
-It currently requires local NTFS and refuses followed reparse points and UNC operations.
+It requires local NTFS. Symbolic links and junctions resolve within the selected drive through
+retained directory handles; other-drive targets, unknown reparse tags, and UNC operations are
+unsupported. See the filesystem fixture for the confined traversal contract.
 WindowsPath resolution preserves canonical WTF-8, normalizes relative components within a volume,
 and rejects drive-relative names. A relative compiler path across volumes becomes absolute.
 
@@ -21,8 +23,9 @@ refusal through an independent C handle and successful locking after the Silk ha
 
 HostRename uses MoveFileExW with REPLACE_EXISTING and no COPY_ALLOWED. DetachedWriter uses a
 synchronous LockFileEx lock on the first byte of a stable lock file; readers take a shared lock.
-The file cannot be deleted while held. Writes currently remain synchronous. The planned hidden
-writer relaunch is still outstanding, and must not be described as implemented.
+The file cannot be deleted while held. Writes remain synchronous: the plan's permitted fallback
+avoids reconstructing the live semantic store in a detached child. The native relaunch experiment
+and its measurements are in `CACHE-WRITER.md`; no detached writer mode is shipped.
 
 ProcessImage uses explicit CreateProcessW application names, the shared MSVC command encoder,
 duplicated standard handles and an explicit handle list. It inherits the live environment and
@@ -39,7 +42,9 @@ hello compilation through native Clang to a path containing spaces, hello execut
 the compiler's sources. `cross-host.sh` extracts the current production WindowsLink import
 definitions so an older N1 can link newly introduced OS calls. It restores the authored manifest
 after the build. This supplements imports only; it supplies no compiler/runtime implementation.
-Full compiler execution remains unverified until that lane succeeds.
+The native compiler, N2 IR fixpoint, tool build, ZIP packaging, and building a new project from
+that ZIP passed in Selfhost run `41279080373` on source `2e968c341`. The local response-file
+runner also passed long executable and archive links with spaces, commas, and Unicode paths.
 
 Pinned references:
 
@@ -54,5 +59,5 @@ Pinned references:
   distinguish DOS/NT volume spelling and test exact buffer-size failures. Silk resizes bounded buffers.
 
 Not checked: interactive Ctrl+C, missing-stream support, concurrent interactive launches,
-cross-volume rename refusal, lock waiter wakeup, forced allocation failures, detached relaunch,
-complete Windows compiler/tool execution, and Windows self-hosting.
+cross-volume rename refusal, lock waiter wakeup, forced allocation failures,
+forced lock-owner termination and Windows 10 behavior.

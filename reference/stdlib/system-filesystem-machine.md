@@ -27,8 +27,11 @@ The native filesystem in the absolute machine namespace.
 
 Unix paths retain their absolute spelling. Windows paths select a drive explicitly,
 such as `/C:/work/main.silk`; drive letters are case insensitive and other bytes retain
-their case and canonical WTF-8 spelling. Windows requires local NTFS and refuses followed
-reparse points, UNC roots, directory synchronization, and synchronized publication.
+their case and canonical WTF-8 spelling. Windows requires local NTFS. Relative symbolic links
+resolve inside their drive; absolute symbolic links and junctions must name that drive with
+matching spelling except drive-letter case. Unknown reparse tags, other-drive targets, UNC
+roots, directory synchronization, and synchronized publication are unsupported. Resolution
+stops after 40 links with `InvalidPath`.
 The path `/` has no Windows volume and fails with `InvalidPath`.
 Each drive retains its own temporary-name counter for the provider's lifetime.
 

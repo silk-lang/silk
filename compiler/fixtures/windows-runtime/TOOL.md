@@ -57,4 +57,7 @@ host; their Linux CI checks remain required. No timing limits were relaxed.
 
 Not checked by this slice: cross-process lock contention, interrupted installation recovery,
 all tool source-written tests on Windows, or publishing/installing a real signed Windows release.
-Release workflow assets and the PowerShell bootstrap installer still need integration.
+The release workflow now cross-builds from immutable Linux inputs, verifies the native Windows
+N2 fixpoint, packages the ZIP, and builds a new project from the extracted toolchain. All of those
+jobs passed in Selfhost run `41279080373`, source `2e968c341`. `install.ps1` implements the
+PowerShell bootstrap; the fixture lane exercises it against locally served signed release assets.

@@ -24,8 +24,10 @@ storage. Pointers are 64 bits with 8-byte alignment; C `long` is 32 bits with 4-
 (LLP64). It uses the same CPU models and feature implications as the GNU x86-64 target.
 Its profile defaults to `libc = "system"`, which names the Windows system DLL ABI, and rejects
 `libc = "gnu"`. `libc = "none"` is available for objects and static archives.
-Target selection and scalar C ABI lowering are available; Windows runtime composition, linking,
-native assembly and by-value C aggregate/vector boundaries are not implemented yet.
+The target supports no-CRT executable linking, objects and static archives, synchronous and
+asynchronous runtime compositions, and Win64 scalar, aggregate and vector C boundaries.
+See [native pointer boundaries](native-pointer-boundary.md) for aggregate layout restrictions
+and [Silk on Windows](windows.md) for host requirements and filesystem scope.
 
 The WASI command targets use `libc = "none"`, static linking and relocation, and single threading.
 A Linux executable defaults to `relocation = "static"`: it loads at a fixed address and its code
