@@ -6,6 +6,8 @@ compiler, writes them in its private build directory, and runs the sibling `llvm
 Clang compiles COFF and selects sibling `lld-link` with `-B <LLVM-bin>` and `-fuse-ld=lld`,
 then `/nodefaultlib`, `/subsystem:console`,
 and `/entry:mainCRTStartup`. No CRT archive, allocator shim, or security cookie is supplied.
+Floating remainder helpers use COFF weak definitions, so an explicitly requested foreign math
+library can supply `fmod` without colliding with the compiler's no-CRT implementation.
 
 The same LLVM installation compiles the embedded TLS support source. Its writable `_tls_index`
 starts at `TLS_OUT_OF_INDEXES`; the Windows loader writes the module index before entry. The

@@ -104,14 +104,15 @@ the normal Silk Windows runtime. It leaves shared runners/workflows untouched. O
 & compiler/fixtures/windows-filesystem/run.ps1 -SilkExecutable C:\artifacts\provider.exe
 ```
 
-The cross-build command is supplied for integration and has not been run here: this worktree
-has no executable Silk compiler. No claim about Silk diagnostics or successful code generation
-is inferred from the passing C oracle. Parent integration owns generated `reference/stdlib`
-through the combined CI artifact route and the Windows release-note changeset.
+The integrated provider has been cross-built by Silk and executed on real Windows in
+[Windows run 41271694441](https://github.com/silk-lang/silk/actions/runs/41271694441).
+The separate C oracle establishes the OS contracts; the Silk executable validates their
+integration with the language runtime. The same workflow also passes the native compiler
+fixpoint. Generated standard-library reference pages are included in the feature branch.
 
-## Required host integration
+## Host integration
 
-Add these **eight** exports to the existing `ntdll.dll` import library in `WindowsLink`:
+`WindowsLink` includes these **eight** filesystem exports in its `ntdll.dll` import library:
 
 ```text
 NtCreateFile
@@ -130,15 +131,13 @@ directory), 20 (EOF), 64 (disposition Ex), 65 (rename Ex), and volume 4/5 (devic
 All file I/O uses synchronous handles and caller-owned buffers; no pending asynchronous buffer
 can escape. Root names are counted `UNICODE_STRING` values with a `\??\` prefix.
 
-Compiler callers still requiring root/path integration include `BuildInputs.make`,
-`ExampleSource.make`, `CodegenCache`, and `SemanticCache`, which construct `OsFileSystem.make("/")`.
-Choose native volume roots separately and keep provider-relative portable paths confined.
-`HostInput.workingDirectory` supplies native WTF-8 bytes, not an automatically valid portable
-`Path`. Do not lowercase cache keys; case-sensitive NTFS directories can contain distinct
-spellings. Child processes, executable discovery, host-driver caches, seed selection, and
-Linux/macOS/performance lanes are intentionally outside this change.
+Compiler host callers use `MachineFileSystem` for absolute machine paths, with explicit
+Windows drive roots. `OsFileSystem` keeps provider-relative paths confined. Host path discovery
+converts native WTF-8 working-directory and executable names into the machine namespace.
+Cache keys are not globally lowercased: case-sensitive NTFS directories can contain distinct
+spellings. The native compiler check, build, and fixpoint exercise this integration.
 
-Remaining evidence gaps include Silk compilation/execution, unknown-tag creation, explicit
+Remaining evidence gaps include unknown-tag creation, explicit
 ACL fixtures, two simultaneous publishers, injected close
 failures, Windows 10 execution, long host roots, and unsupported-filesystem rejection on a
 non-NTFS test volume. These are not passing claims.

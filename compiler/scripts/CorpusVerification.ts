@@ -41,7 +41,7 @@ export const Manifest = Schema.Struct({
       ),
       expected: Schema.Union([
         Schema.TaggedStruct('Completes', { result: Schema.Finite }),
-        Schema.TaggedStruct('Trap', {}),
+        Schema.TaggedStruct('Trap', { windowsStatus: Schema.optionalKey(Schema.Finite) }),
         Schema.TaggedStruct('Rejected', {
           diagnostics: Schema.Array(
             Schema.Struct({ code: Schema.NonEmptyString, span: Schema.NonEmptyString }),
@@ -187,14 +187,14 @@ const manifestExpected = (
   program: Corpus.Program,
 ):
   | { readonly _tag: 'Completes'; readonly result: number }
-  | { readonly _tag: 'Trap' }
+  | { readonly _tag: 'Trap'; readonly windowsStatus?: number }
   | {
       readonly _tag: 'Rejected'
       readonly diagnostics: ReadonlyArray<Corpus.ExpectedDiagnostic>
     } => {
   const expected = program.outcome.expected
   if (expected.kind === 'completes') return { _tag: 'Completes', result: expected.exitCode }
-  if (expected.kind === 'trap') return { _tag: 'Trap' }
+  if (expected.kind === 'trap') return { _tag: 'Trap', ...(expected.windowsStatus === undefined ? {} : {windowsStatus: expected.windowsStatus}) }
   return { _tag: 'Rejected', diagnostics: expected.diagnostics }
 }
 

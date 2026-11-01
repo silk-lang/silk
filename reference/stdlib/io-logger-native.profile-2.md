@@ -29,7 +29,8 @@ or newline, has no lock, and does not allocate.
 `LogError` with code 3 if the write fails. Part of the message can be written already.
 
 ## Gotchas
-- The providers exist on WASI, Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+- The providers exist on Windows x86_64 MSVC, WASI, Darwin on aarch64, and Linux with GNU libc
+  on x86_64 or aarch64. Windows needs no CRT and automatic color enables console ANSI processing.
 - A message template for `StderrLogger` must not end with a newline. The logger adds one.
 - `StderrLogger.make` reads the environment at the first message. A change to `NO_COLOR` after
   that has no effect on the same logger.
@@ -79,4 +80,4 @@ This module declares no public items.
 
 Category: Input and output.
 
-Profiles: `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `x86_64-pc-windows-msvc`.
+Profiles: `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

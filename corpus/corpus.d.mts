@@ -36,7 +36,7 @@ export interface ExpectedDiagnostic {
 /** What running or checking a program must produce. */
 export type Expected =
   | { readonly kind: 'completes'; readonly exitCode: number }
-  | { readonly kind: 'trap' }
+  | { readonly kind: 'trap'; readonly windowsStatus?: number }
   | { readonly kind: 'rejected'; readonly diagnostics: ReadonlyArray<ExpectedDiagnostic> }
 
 /** The contents of one `outcome.json`. */
@@ -56,6 +56,8 @@ export interface Program {
   readonly reference: string | undefined
   readonly imports: Readonly<Record<string, string>>
   readonly cSources: Readonly<Record<string, string>>
+  /** Explicit system-DLL imports for Windows C fixtures, keyed by library name. */
+  readonly windowsImports: Readonly<Record<string, string>>
   readonly stdout: string | undefined
   readonly stderr: string | undefined
   readonly outcome: Outcome

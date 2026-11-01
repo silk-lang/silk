@@ -19,6 +19,7 @@ const literal: Corpus.Program = {
   reference: undefined,
   imports: {},
   cSources: {},
+  windowsImports: {},
   stdout: undefined,
   stderr: undefined,
   outcome: { schemaVersion: 1, expected: { kind: 'completes', exitCode: 42 } },
