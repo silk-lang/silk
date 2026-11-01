@@ -1,0 +1,395 @@
+//! Fetches the `[native.archive.*]` archives a build links into the archive store.
+//!
+//! # Details
+//! An archive is stored once per SHA-256 in `<store>/<sha256>`, extracted, and is complete once
+//! the marker `<store>/<sha256>.fetched` exists; a directory without one is a fetch that stopped
+//! part way and is fetched again. A fetch downloads the whole file over HTTPS (or reads a `file://`
+//! URL, as a local mirror serves it), checks its SHA-256
+//! against the manifest before reading it, and extracts a gzip-compressed or plain tar archive.
+//! Extraction writes only directories and regular files, dropping the archive's `strip` leading
+//! path segments: a member path that is absolute or holds `..` refuses the archive, and links and
+//! other special members are skipped, so nothing is written outside the archive's directory. A
+//! build fetches only the archives its inputs name, and never while `SILK_OFFLINE` is set.
+
+import driver.HostRename
+import driver.NativeLinkInput as NativeLinkInputs {Archive, NativeLinkInput}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.collections.bytes {Bytes}
+import silk.core.effect {Effect}
+import silk.compress.inflate {DecodeError, Decoder, Format as InflateFormat, Limits as InflateLimits, MEMORY_BOUND as INFLATE_MEMORY_BOUND, Progress, Status as InflateStatus}
+import silk.crypto.sha2 {Sha256}
+import silk.http.client {Http as Client, HttpError as ClientError, Request, Response}
+import silk.http.client_native {NativeHttp}
+import silk.system.filesystem {FileError, FileSystem, Path}
+import silk.system.host_input {HostInput, HostInputError}
+import silk.collections.list {List}
+import silk.core.option {Option}
+import silk.core.result {Result}
+import silk.collections.slice {Slice}
+import silk.text.string {String}
+import silk.num.u16
+import silk.num.u8
+import silk.num.usize
+
+const MAX_DOWNLOAD_BYTES: usize = 1073741824
+const MAX_EXTRACTED_BYTES: u64 = 4294967296
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn startsWith(text: &[u8], prefix: &[u8]) -> bool {
+  return text.length >= prefix.length && same(Slice.view<u8>(text, usize.ZERO, prefix.length), prefix)
+}
+
+effect fn joined(parts: &[&[u8]]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut text = Bytes.make()
+  let mut at = usize.ZERO
+  while at < parts.length {
+    run Bytes.append(&mut text, parts[at])
+    at = at + usize.ONE
+  }
+  return move text
+}
+
+fn hexDigit(value: u8) -> u8 {
+  if value < 10 { return value + 48 }
+  return value + 87
+}
+
+// The lowercase hexadecimal SHA-256 of `content`.
+effect fn sha256(content: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let digest = Sha256.hash(content)
+  let mut text = Bytes.make()
+  let mut at = usize.ZERO
+  while at < 32 {
+    let pair: [u8; 2] = [hexDigit(digest[at] / 16), hexDigit(digest[at] % 16)]
+    run Bytes.append(&mut text, &pair)
+    at = at + usize.ONE
+  }
+  return move text
+}
+
+effect fn appendDecimal(text: &mut Bytes, value: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value >= 10 { run appendDecimal(&mut text.*, value / 10) }
+  let digit: [u8; 1] = [usize.toU8(value % 10) + 48]
+  return run Bytes.append(&mut text.*, &digit)
+}
+
+// Whether any input names a file below `directory`.
+fn referenced(directory: &[u8], inputs: &[NativeLinkInput]) -> bool {
+  let mut at = usize.ZERO
+  while at < inputs.length {
+    if NativeLinkInputs.below(&inputs[at], directory) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+/// Fetches each archive of `archives` that `inputs` name and the store lacks, and answers the
+/// message of the first that cannot be, or none when all are in place.
+pub effect fn ensure(archives: &[Archive], inputs: &[NativeLinkInput]) -> Option<Bytes>
+! FileError | HostInputError | OutOfMemoryError ? &mut FileSystem | &mut HostInput | &mut Allocator {
+  let mut at = usize.ZERO
+  while at < archives.length {
+    let archive = &archives[at]
+    if Bytes.length(&archive.url) > usize.ZERO && referenced(Path.rawBytes(&archive.directory), inputs) {
+      let marker = run Path.fromBytes(Bytes.asSlice(&run joined(&[Path.rawBytes(&archive.directory), b".fetched"])))
+      let present = run Effect.result(FileSystem.exists(&marker))
+      let mut fetched = false
+      if let Result<bool, FileError>.Success {value} = move present { fetched = value }
+      if !fetched {
+        if let Option<Bytes>.Some {value: _} = move run HostInput.variableNamed("SILK_OFFLINE") {
+          return Option<Bytes>.some(run joined(&[b"archive ", Bytes.asSlice(&archive.name), b" is not in the archive store and SILK_OFFLINE is set; build once online to fetch ",
+            Bytes.asSlice(&archive.url)]))
+        }
+        if let Option<Bytes>.Some {value: failure} = move run fetch(archive, &marker) { return Option<Bytes>.some(move failure) }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return Option<Bytes>.none()
+}
+
+// Downloads, checks and extracts `archive`, then writes `marker`.
+effect fn fetch(archive: &Archive, marker: &Path) -> Option<Bytes>
+! FileError | HostInputError | OutOfMemoryError ? &mut FileSystem | &mut HostInput | &mut Allocator {
+  let name = Bytes.asSlice(&archive.name)
+  let url = Bytes.asSlice(&archive.url)
+  let body = match move run retrieve(url) {
+    Result<Bytes, Bytes>.Success {value} => move value
+    Result<Bytes, Bytes>.Failure {error} => {
+      return Option<Bytes>.some(run joined(&[b"cannot fetch archive ", name, b" from ", url, b": ", Bytes.asSlice(&error)]))
+    }
+  }
+  let digest = run sha256(Bytes.asSlice(&body))
+  if !same(Bytes.asSlice(&digest), Bytes.asSlice(&archive.sha256)) {
+    return Option<Bytes>.some(run joined(&[b"archive ", name, b" from ", url, b" has SHA-256 ", Bytes.asSlice(&digest), b", but its manifest pins ",
+      Bytes.asSlice(&archive.sha256), b"; nothing was extracted"]))
+  }
+  let mut tar = Bytes.make()
+  let content = Bytes.asSlice(&body)
+  if content.length >= usize.add(0, 2) && content[usize.ZERO] == 31 && content[usize.ONE] == 139 {
+    tar = match move run gunzip(content) {
+      Option<Bytes>.Some {value} => move value
+      Option<Bytes>.None => { return Option<Bytes>.some(run joined(&[b"archive ", name, b" is not valid gzip"])) }
+    }
+  } else if content.length > usize.add(0, 262) && same(Slice.view<u8>(content, usize.add(0, 257), usize.add(0, 5)), b"ustar") {
+    tar = run Bytes.copy(content)
+  } else {
+    return Option<Bytes>.some(run joined(&[b"archive ", name, b" is neither a gzip-compressed nor a plain tar archive"]))
+  }
+  drop body
+  let directory = &archive.directory
+  let partial = run Path.fromBytes(Bytes.asSlice(&run joined(&[Path.rawBytes(directory), b".partial"])))
+  let cleared = run Effect.result(FileSystem.removeDirectoryRecursively(&partial))
+  drop cleared
+  run FileSystem.createDirectoriesRecursively(&partial)
+  if let Option<Bytes>.Some {value: refused} = move run extract(Bytes.asSlice(&tar), &partial, archive.strip) {
+    let removed = run Effect.result(FileSystem.removeDirectoryRecursively(&partial))
+    drop removed
+    return Option<Bytes>.some(run joined(&[b"cannot extract archive ", name, b": ", Bytes.asSlice(&refused)]))
+  }
+  let stale = run Effect.result(FileSystem.removeDirectoryRecursively(directory))
+  drop stale
+  if !run HostRename.replaceFile(&partial, directory) {
+    return Option<Bytes>.some(run joined(&[b"cannot move archive ", name, b" into ", Path.rawBytes(directory)]))
+  }
+  run FileSystem.writeFile(marker, url)
+  return Option<Bytes>.none()
+}
+
+// The bytes `url` names: a `file://` URL's file, which a local mirror serves, or an HTTPS
+// download.
+effect fn retrieve(url: &[u8]) -> Result<Bytes, Bytes>
+! FileError | HostInputError | OutOfMemoryError ? &mut FileSystem | &mut HostInput | &mut Allocator {
+  if !startsWith(url, b"file://") { return run download(url) }
+  let path = run Path.fromBytes(Slice.view<u8>(url, usize.add(0, 7), url.length - usize.add(0, 7)))
+  return match move run Effect.result(FileSystem.readFile(&path)) {
+    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => Result<Bytes, Bytes>.succeed(move value)
+    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => { drop failure Result<Bytes, Bytes>.failResult(run Bytes.copy(b"the file cannot be read")) }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// The body of `url`, or why it could not be downloaded.
+effect fn download(url: &[u8]) -> Result<Bytes, Bytes> ! HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+  let address = match String.fromUtf8(url) {
+    Result.Success {value} => value
+    Result.Failure {error} => { return Result<Bytes, Bytes>.failResult(run Bytes.copy(b"the URL is not UTF-8")) }
+  }
+  let configured = run Effect.result(NativeHttp<'static>.fromEnvironment())
+  let mut http = match move configured {
+    Result<NativeHttp<'static>, ClientError | HostInputError | OutOfMemoryError>.Success {value} =>
+      value.maxBodyBytes(MAX_DOWNLOAD_BYTES).maxRedirects(8).timeoutSeconds(900).header("User-Agent", "silk-build")
+    Result<NativeHttp<'static>, ClientError | HostInputError | OutOfMemoryError>.Failure {error} => match move error {
+      ClientError failure => { return Result<Bytes, Bytes>.failResult(run Bytes.copy(String.utf8Bytes(failure.message))) }
+      HostInputError failure => { fail move failure }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let sent = run Effect.result(Client.send(Request.get(address)) |> Effect.provideMut<Client>(&mut http))
+  let response = match move sent {
+    Result<Response, ClientError | OutOfMemoryError>.Success {value} => move value
+    Result<Response, ClientError | OutOfMemoryError>.Failure {error} => match move error {
+      ClientError failure => { return Result<Bytes, Bytes>.failResult(run Bytes.copy(String.utf8Bytes(failure.message))) }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let status = u16.toUsize(response.status())
+  if status != 200 {
+    let mut message = run Bytes.copy(b"the server answered HTTP status ")
+    run appendDecimal(&mut message, status)
+    return Result<Bytes, Bytes>.failResult(move message)
+  }
+  return Result<Bytes, Bytes>.succeed(run Bytes.copy(response.body()))
+}
+
+// The tar stream inside the gzip file `data`, or none when it is not valid gzip.
+effect fn gunzip(data: &[u8]) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  let limits = InflateLimits {
+    maxInputBytes: usize.toU64(data.length),
+    maxOutputBytes: MAX_EXTRACTED_BYTES,
+    maxMembers: 1,
+    maxHeaderBytes: 65536,
+    maxMemoryBytes: INFLATE_MEMORY_BOUND,
+  }
+  let made = run Effect.result(Decoder.make(InflateFormat.Gzip, move limits))
+  let mut decoder = match move made {
+    Result<Decoder, OutOfMemoryError | DecodeError>.Success {value} => move value
+    Result<Decoder, OutOfMemoryError | DecodeError>.Failure {error} => match move error {
+      OutOfMemoryError exhausted => { fail move exhausted }
+      DecodeError invalid => { return Option<Bytes>.none() }
+    }
+  }
+  let mut output = Bytes.make()
+  let mut chunk: [u8; 65536] = [0; 65536]
+  let mut offset = usize.ZERO
+  while true {
+    let input = Slice.view<u8>(data, offset, data.length - offset)
+    let progress = match Decoder.step(&mut decoder, input, &mut chunk, true) {
+      Result<Progress, DecodeError>.Success {value} => move value
+      Result<Progress, DecodeError>.Failure {error} => { return Option<Bytes>.none() }
+    }
+    offset = offset + progress.consumed
+    run Bytes.append(&mut output, Slice.view<u8>(&chunk, usize.ZERO, progress.written))
+    if progress.status == InflateStatus.Finished { return Option<Bytes>.some(move output) }
+    if progress.consumed == usize.ZERO && progress.written == usize.ZERO { return Option<Bytes>.none() }
+  }
+  return Option<Bytes>.some(move output)
+}
+
+// The text of a NUL-terminated header field.
+fn field(header: &[u8], offset: usize, length: usize) -> &[u8] {
+  let mut end = usize.ZERO
+  while end < length && header[offset + end] != 0 { end = end + usize.ONE }
+  return Slice.view<u8>(header, offset, end)
+}
+
+// The octal (or base-256) number of a header field, or none when it holds neither.
+fn number(header: &[u8], offset: usize, length: usize) -> Option<usize> {
+  if (header[offset] & 128) != 0 {
+    let mut value = usize.ZERO
+    let mut at = usize.ONE
+    while at < length {
+      value = value * usize.add(0, 256) + u8.toUsize(header[offset + at])
+      at = at + usize.ONE
+    }
+    return Option<usize>.some(value)
+  }
+  let mut value = usize.ZERO
+  let mut at = usize.ZERO
+  while at < length && (header[offset + at] == 32 || header[offset + at] == 0) { at = at + usize.ONE }
+  while at < length && header[offset + at] >= 48 && header[offset + at] <= 55 {
+    value = value * usize.add(0, 8) + u8.toUsize(header[offset + at] - 48)
+    at = at + usize.ONE
+  }
+  return Option<usize>.some(value)
+}
+
+// Whether the header's checksum matches its bytes.
+fn checksummed(header: &[u8]) -> bool {
+  let stored = match number(header, usize.add(0, 148), usize.add(0, 8)) {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => { return false }
+  }
+  let mut sum = usize.ZERO
+  let mut at = usize.ZERO
+  while at < usize.add(0, 512) {
+    if at >= usize.add(0, 148) && at < usize.add(0, 156) { sum = sum + usize.add(0, 32) } else { sum = sum + u8.toUsize(header[at]) }
+    at = at + usize.ONE
+  }
+  return sum == stored
+}
+
+// The `path` record of a pax extended header's records, or none.
+fn paxPath(records: &[u8]) -> Option<&[u8]> {
+  let mut at = usize.ZERO
+  while at < records.length {
+    let mut space = at
+    let mut length = usize.ZERO
+    while space < records.length && records[space] >= 48 && records[space] <= 57 {
+      length = length * usize.add(0, 10) + u8.toUsize(records[space] - 48)
+      space = space + usize.ONE
+    }
+    if length == usize.ZERO || at + length > records.length || space >= records.length || records[space] != 32 { return Option<&[u8]>.none() }
+    let record = Slice.view<u8>(records, space + usize.ONE, at + length - space - usize.ONE)
+    if startsWith(record, b"path=") && record.length > usize.add(0, 6) {
+      return Option<&[u8]>.some(Slice.view<u8>(record, usize.add(0, 5), record.length - usize.add(0, 6)))
+    }
+    at = at + length
+  }
+  return Option<&[u8]>.none()
+}
+
+// The path below the archive directory that member `path` extracts to, after dropping `strip`
+// leading segments: none for a member the strip removes, or a refusal for an unsafe path.
+effect fn memberPath(path: &[u8], strip: usize) -> Result<Option<Bytes>, Bytes> ! OutOfMemoryError ? &mut Allocator {
+  if path.length > usize.ZERO && path[usize.ZERO] == 47 {
+    return Result<Option<Bytes>, Bytes>.failResult(run joined(&[b"member ", path, b" is an absolute path"]))
+  }
+  let mut kept = Bytes.make()
+  let mut segments = usize.ZERO
+  let mut start = usize.ZERO
+  while start <= path.length {
+    let mut end = start
+    while end < path.length && path[end] != 47 && path[end] != 92 { end = end + usize.ONE }
+    let segment = Slice.view<u8>(path, start, end - start)
+    if same(segment, b"..") { return Result<Option<Bytes>, Bytes>.failResult(run joined(&[b"member ", path, b" leaves the archive with .."])) }
+    if segment.length > usize.ZERO && !same(segment, b".") {
+      if segments >= strip {
+        if Bytes.length(&kept) > usize.ZERO { run Bytes.append(&mut kept, b"/") }
+        run Bytes.append(&mut kept, segment)
+      }
+      segments = segments + usize.ONE
+    }
+    start = end + usize.ONE
+  }
+  if Bytes.length(&kept) == usize.ZERO { return Result<Option<Bytes>, Bytes>.succeed(Option<Bytes>.none()) }
+  return Result<Option<Bytes>, Bytes>.succeed(Option<Bytes>.some(move kept))
+}
+
+/// Extracts the tar stream `tar` into `destination` (see the module documentation), answering why
+/// it was refused, or none.
+pub effect fn extract(tar: &[u8], destination: &Path, strip: usize) -> Option<Bytes>
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut at = usize.ZERO
+  let mut longName = Option<Bytes>.none()
+  while at + usize.add(0, 512) <= tar.length {
+    let header = Slice.view<u8>(tar, at, usize.add(0, 512))
+    if header[usize.ZERO] == 0 { return Option<Bytes>.none() }
+    if !checksummed(header) { return Option<Bytes>.some(run Bytes.copy(b"a member header has a bad checksum")) }
+    let size = match number(header, usize.add(0, 124), usize.add(0, 12)) {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => { return Option<Bytes>.some(run Bytes.copy(b"a member header has a bad size")) }
+    }
+    let start = at + usize.add(0, 512)
+    if start + size > tar.length { return Option<Bytes>.some(run Bytes.copy(b"the archive ends inside a member")) }
+    let content = Slice.view<u8>(tar, start, size)
+    at = start + (size + usize.add(0, 511)) / usize.add(0, 512) * usize.add(0, 512)
+    let kind = header[usize.add(0, 156)]
+    // A GNU long name, or a pax header's `path`, names the next member.
+    if kind == 76 {
+      longName = Option<Bytes>.some(run Bytes.copy(field(content, usize.ZERO, content.length)))
+      continue
+    }
+    if kind == 120 {
+      if let Option<&[u8]>.Some {value} = paxPath(content) { longName = Option<Bytes>.some(run Bytes.copy(value)) }
+      continue
+    }
+    if kind == 103 { continue }
+    let mut name = run Bytes.copy(field(header, usize.ZERO, usize.add(0, 100)))
+    let prefix = field(header, usize.add(0, 345), usize.add(0, 155))
+    if same(field(header, usize.add(0, 257), usize.add(0, 5)), b"ustar") && prefix.length > usize.ZERO {
+      name = run joined(&[prefix, b"/", Bytes.asSlice(&name)])
+    }
+    if let Option<Bytes>.Some {value: long} = move longName { name = move long }
+    longName = Option<Bytes>.none()
+    let file = kind == 48 || kind == 0 || kind == 55
+    let directory = kind == 53
+    if file || directory {
+      let relative = match move run memberPath(Bytes.asSlice(&name), strip) {
+        Result<Option<Bytes>, Bytes>.Success {value} => move value
+        Result<Option<Bytes>, Bytes>.Failure {error} => { return Option<Bytes>.some(move error) }
+      }
+      if let Option<Bytes>.Some {value: below} = move relative {
+        let target = run Path.joinBytes(destination, Bytes.asSlice(&below))
+        if directory {
+          run FileSystem.createDirectoriesRecursively(&target)
+        } else {
+          if let Option<Path>.Some {value: parent} = move run Path.parent(&target) { run FileSystem.createDirectoriesRecursively(&parent) }
+          run FileSystem.writeFile(&target, content)
+        }
+      }
+    }
+  }
+  return Option<Bytes>.none()
+}

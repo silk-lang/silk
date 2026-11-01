@@ -1,5 +1,6 @@
 // One prebuilt native compiler exercises its private request/build routes together.
 import { strict as assert } from 'node:assert'
+import { createHash } from 'node:crypto'
 import { spawn, spawnSync, type SpawnSyncReturns } from 'node:child_process'
 import { existsSync, readdirSync } from 'node:fs'
 import { createRequire } from 'node:module'
@@ -2249,6 +2250,82 @@ const program = Effect.gen(function* () {
   const brokenSource = yield* invoke(silk, ['build', '--stdlib', standardLibrary], compiledApp, sourcesEnvironment)
   assert.equal(brokenSource.status, 1, brokenSource.stderr)
   assert.match(brokenSource.stderr, /broken\.c:1:27: error: use of undeclared identifier 'missing'/)
+  // `[native.archive.<name>]` pins an archive by URL and SHA-256; `<name>:<path>` names its files
+  // in sources and link entries. A build fetches it once into the archive store (here from a
+  // file:/// mirror), refuses a wrong digest before extracting anything, fails clearly when
+  // SILK_OFFLINE is set and it is missing, and a root or machine override replaces it.
+  const vendorArchived = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-native-archive-' })
+  for (const member of ['vend-1/include', 'vend-1/lib', 'alt/include', 'alt/lib', 'sys/native', 'app', 'home']) {
+    yield* fs.makeDirectory(join(vendorArchived, member), { recursive: true })
+  }
+  const packVendor = Effect.fnUntraced(function* (root: string, base: number) {
+    yield* fs.writeFileString(join(vendorArchived, root, 'include/vend.h'), 'int vend_base(void);\n')
+    yield* fs.writeFileString(join(vendorArchived, `${root}.c`), `int vend_base(void) { return ${base}; }\n`)
+    const vendorObject = yield* invoke(clang, ['-c', '-fPIC', `${root}.c`, '-o', `${root}.o`], vendorArchived)
+    assert.equal(vendorObject.status, 0, vendorObject.stderr)
+    const indexed = yield* invoke(join(dirname(clang), 'llvm-ar'), ['rcs', join(root, 'lib/libvend.a'), `${root}.o`], vendorArchived)
+    assert.equal(indexed.status, 0, indexed.stderr)
+  })
+  yield* packVendor('vend-1', 30)
+  yield* packVendor('alt', 50)
+  const packed = yield* invoke('tar', ['czf', 'vend.tar.gz', 'vend-1'], vendorArchived)
+  assert.equal(packed.status, 0, packed.stderr)
+  const vendDigest = createHash('sha256').update(yield* fs.readFile(join(vendorArchived, 'vend.tar.gz'))).digest('hex')
+  const sysManifest = (digest: string) =>
+    '[package]\nname = "sys"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Sys"]\n\n[native]\n'
+    + 'sources = [{ c = "native/shim.c", include = ["vend:include"] }]\nlink = [{ static-archive = "vend:lib/libvend.a" }]\n\n'
+    + `[native.archive.vend]\nurl = "file://${join(vendorArchived, 'vend.tar.gz')}"\nsha256 = "${digest}"\nstrip = 1\n`
+  yield* fs.writeFileString(join(vendorArchived, 'sys/silk.toml'), sysManifest(vendDigest))
+  yield* fs.writeFileString(join(vendorArchived, 'sys/native/shim.c'), '#include "vend.h"\nint shim_value(void) { return vend_base() + 5; }\n')
+  yield* fs.writeFileString(join(vendorArchived, 'sys/Sys.silk'), 'unsafe extern "C" fn shim_value() -> i32\n\npub fn value() -> i32 {\n  return unsafe shim_value()\n}\n')
+  const appManifest = '[package]\nname = "app"\nversion = "0.1.0"\nsource = "."\n\n[dependencies]\nsys = { path = "../sys" }\n'
+  yield* fs.writeFileString(join(vendorArchived, 'app/silk.toml'), appManifest)
+  yield* fs.writeFileString(join(vendorArchived, 'app/main.silk'), 'import sys.Sys\n\npub fn main() -> i32 {\n  return Sys.value()\n}\n')
+  const archivedApp = join(vendorArchived, 'app')
+  const vendorArchiveEnvironment = { ...process.env, SILK_CLANG: clang, SILK_HOME: join(vendorArchived, 'home') }
+  const archiveStore = join(vendorArchived, 'home/archives')
+  const archivedBuild = Effect.fnUntraced(function* (environment: Record<string, string | undefined>) {
+    return yield* invoke(silk, ['build', '--stdlib', standardLibrary], archivedApp, environment)
+  })
+  const archivedRun = Effect.fnUntraced(function* (expected: number, environment: Record<string, string | undefined> = vendorArchiveEnvironment) {
+    const vendorBuilt = yield* archivedBuild(environment)
+    assert.equal(vendorBuilt.status, 0, vendorBuilt.stderr)
+    const vendorRan = yield* invoke(join(archivedApp, `build/llvm/${hostTarget}/debug/app`), [], archivedApp, environment)
+    assert.equal(vendorRan.status, expected, vendorRan.stderr)
+  })
+  const archiveChecked = yield* invoke(silk, ['check', '--stdlib', standardLibrary], archivedApp, vendorArchiveEnvironment)
+  assert.equal(archiveChecked.status, 0, archiveChecked.stderr)
+  assert.ok(!(yield* fs.exists(archiveStore)), 'a check fetches no archive')
+  const offline = yield* archivedBuild({ ...vendorArchiveEnvironment, SILK_OFFLINE: '1' })
+  assert.equal(offline.status, 2, offline.stderr)
+  assert.match(offline.stderr, /archive vend is not in the archive store and SILK_OFFLINE is set/)
+  yield* fs.writeFileString(join(vendorArchived, 'sys/silk.toml'), sysManifest('0'.repeat(64)))
+  const mismatched = yield* archivedBuild(vendorArchiveEnvironment)
+  assert.equal(mismatched.status, 2, mismatched.stderr)
+  assert.match(mismatched.stderr, new RegExp(`archive vend from file://.* has SHA-256 ${vendDigest}, but its manifest pins 0{64}; nothing was extracted`))
+  assert.ok(!(yield* fs.exists(join(archiveStore, vendDigest))), 'a mismatched archive is never extracted')
+  yield* fs.writeFileString(join(vendorArchived, 'sys/silk.toml'), sysManifest(vendDigest))
+  yield* archivedRun(35)
+  assert.ok(yield* fs.exists(join(archiveStore, vendDigest, 'lib/libvend.a')), 'the archive is extracted below its digest, its top directory stripped')
+  yield* archivedRun(35, { ...vendorArchiveEnvironment, SILK_OFFLINE: '1' })
+  yield* fs.writeFileString(join(vendorArchived, 'app/silk.toml'), `${appManifest}\n[native.override.vend]\npath = "${join(vendorArchived, 'alt')}"\n`)
+  yield* archivedRun(55)
+  yield* fs.writeFileString(join(vendorArchived, 'app/silk.toml'), appManifest)
+  yield* fs.writeFileString(join(vendorArchived, 'home/native-overrides.toml'), '[native.override.vend]\npath = "../alt"\n')
+  yield* archivedRun(55)
+  yield* fs.remove(join(vendorArchived, 'home/native-overrides.toml'))
+  yield* archivedRun(35)
+  for (const [manifest, rule] of [
+    [sysManifest(vendDigest).replace('vend:lib', 'other:lib'), /\[native\]\.link\[0\]: static-archive other:lib\/libvend\.a: names archive other, which this manifest does not declare/],
+    [sysManifest(vendDigest).replace('[native.archive.vend]', '[native.archive.vend.targets.no-such-target]'), /include "vend:include": archive vend declares no url for target/],
+    [sysManifest(vendDigest).replace('url = "file://', 'url = "http://'), /\[native\.archive\.vend\]: url must be an https:\/\/ URL/],
+    [sysManifest('abc'), /\[native\.archive\.vend\]: sha256 must be 64 hexadecimal digits/],
+  ] as const) {
+    yield* fs.writeFileString(join(vendorArchived, 'sys/silk.toml'), manifest)
+    const refusedArchive = yield* archivedBuild(vendorArchiveEnvironment)
+    assert.equal(refusedArchive.status, 2, refusedArchive.stderr)
+    assert.match(refusedArchive.stderr, rule)
+  }
   // `[native].function-order` places the functions it lists first in the executable's code, in its
   // order, and a change to the file alone links again. A path outside the package is refused.
   const ordered = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-ordered-' })
@@ -4143,7 +4220,7 @@ const program = Effect.gen(function* () {
   yield* refusedEmbed('shaders/missing.bin', /cannot embed "shaders\/missing\.bin": no such file in package embeds/)
   yield* refusedEmbed('../outside.bin', /cannot embed "\.\.\/outside\.bin": the path must be relative to the package's directory/)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, native sources, exports, workspaces, silk change release/history/recovery, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, cached codegen units, build replay, check replay, embedded files, object and static library artifacts and emission stages passed',
+    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, native sources, native archives, exports, workspaces, silk change release/history/recovery, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, cached codegen units, build replay, check replay, embedded files, object and static library artifacts and emission stages passed',
   )
 })
 const require = createRequire(new URL('../../package.json', import.meta.url))
