@@ -9,10 +9,19 @@ produced no stderr. PE imports were Kernel32 and Ntdll only. This is actual Silk
 linking, and native execution. [Cross-build run](https://github.com/silk-lang/silk/actions/runs/41257448061).
 The local native runner report is `.scratch/windows-cross-41257448061/native-results.json`.
 
-That run did not produce the unoptimized executables: their frame-boundary weak symbols
-collided across codegen units. The replacement Windows frame walker and ordinary COFF
-boundary declarations require a new N1. Filesystem execution and the remaining native
-fixtures are not established by the hello result.
+The later [run 41259150694](https://github.com/silk-lang/silk/actions/runs/41259150694), testing
+source `943142c73` with N1 from `67fdc3016`, produced unoptimized executables too. On this
+Windows Server 2025 machine, both hello profiles, storage, host input, providers, filesystem,
+thread spawn/join, cross-thread wake, and atomic wait/notify passed actual Silk execution.
+The raw host-input check required the corrected launcher to inherit Win32 environment storage:
+.NET Framework's custom-environment encoder replaced its lone surrogate before launch.
+
+The source-trap executable exposed mismatched COFF section flags. Relinking its unchanged Silk
+objects with corrected production boundary storage restored `main.main` in the report, retaining
+the trap reason and explicit fast-fail status. See [FRAMES.md](FRAMES.md). The full native report
+is `.scratch/windows-cross-41259150694/native-results.json`; its original host-input failure is
+superseded by rerunning `run-host.ps1` successfully. Stderr locking and child-process provider
+execution remain unverified.
 
 ## Implementation
 
@@ -32,8 +41,8 @@ oracles and a native process fixture in `../windows-process`.
 
 The Windows target/ABI work must supply `x86_64-pc-windows-msvc`, `libc = "system"`, Win64
 foreign calls, and COFF emission. The runtime composition selects `silk/platform/windows/start`.
-`hello.silk` is the small integration program. It uses `WindowsConsole` explicitly; the POSIX
-`writer_native` locking API is not ported by this slice.
+`hello.silk` is the small integration program. It uses `WindowsConsole` explicitly. The native
+writer providers and recursive stderr lock are described in [WRITERS.md](WRITERS.md).
 
 The shared harness builds hello with both `none` and `speed` optimization. The unoptimized
 program exercises emitted diagnostic frame support and split codegen units; the optimized

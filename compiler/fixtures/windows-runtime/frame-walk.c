@@ -10,7 +10,7 @@ extern const void *__start_silk_frames[2], *__stop_silk_frames[2];
 static volatile int sink;
 __declspec(noinline) static int outer(void);
 __declspec(noinline) static int inner(void);
-#pragma section(".silk$M", read)
+#pragma section(".silk$M", read, write)
 __declspec(allocate(".silk$M")) const void *outer_entry[2] = {(void *)outer, "outer"};
 __declspec(allocate(".silk$M")) const void *inner_entry[2] = {(void *)inner, "inner"};
 

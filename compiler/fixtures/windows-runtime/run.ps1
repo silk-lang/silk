@@ -7,7 +7,7 @@ $artifact = (Resolve-Path -LiteralPath $ArtifactDirectory).Path
 $readobj = Join-Path $LlvmBin 'llvm-readobj.exe'
 $results = @()
 $failed = $false
-foreach ($name in @('hello', 'hello-speed', 'storage', 'host-check', 'providers', 'filesystem',
+foreach ($name in @('hello', 'hello-speed', 'storage', 'host-check', 'providers', 'filesystem', 'process',
     'native-thread-spawn-join', 'native-thread-cross-wake', 'atomic-wait-notify', 'native-termination-source-trap', 'stderr-locked-message')) {
   $executable = Join-Path $artifact "$name.exe"
   if ($name -eq 'filesystem') { $executable = Join-Path $artifact 'windows-filesystem/provider.exe' }
@@ -21,7 +21,7 @@ foreach ($name in @('hello', 'hello-speed', 'storage', 'host-check', 'providers'
   $inspection | Set-Content -LiteralPath (Join-Path $artifact "$name-native-pe.txt")
   $imports = @($inspection | Select-String '^\s+Name: (.+\.dll)$' | ForEach-Object { $_.Matches[0].Groups[1].Value })
   $allowed = '^(kernel32|ntdll)\.dll$'
-  if ($name -eq 'providers') { $allowed = '^(kernel32|ntdll|bcryptprimitives)\.dll$' }
+  if ($name -eq 'providers' -or $name -eq 'process') { $allowed = '^(kernel32|ntdll|bcryptprimitives)\.dll$' }
   $corpusThread = $name -like 'native-thread-*' -or $name -like 'atomic-*'
   if ($corpusThread) { $allowed = '^(kernel32|ntdll|api-ms-win-core-synch-l1-2-0)\.dll$' }
   if ($imports.Count -eq 0 -or @($imports | Where-Object { $_ -notmatch $allowed }).Count -ne 0) {
@@ -55,6 +55,12 @@ foreach ($name in @('hello', 'hello-speed', 'storage', 'host-check', 'providers'
   $start.RedirectStandardError = $true
   $start.StandardOutputEncoding = [System.Text.Encoding]::UTF8
   $start.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+  if ($name -eq 'process') {
+    $oracle = Join-Path $artifact 'process-child.exe'
+    if (!(Test-Path -LiteralPath $oracle)) { throw 'Process child oracle is missing' }
+    $start.Arguments = '"' + $oracle + '"'
+    $start.EnvironmentVariables['SILK_PARENT_ONLY'] = 'must not reach the child'
+  }
   $child = New-Object System.Diagnostics.Process
   $child.StartInfo = $start
   try {

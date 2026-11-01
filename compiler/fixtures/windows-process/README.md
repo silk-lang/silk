@@ -19,10 +19,27 @@ extend the existing `windows-host-codecs` corpus case; they do not use Silk's pa
 or validate their expectations. Limit cases exercise exactly 32,767 code units including NUL and
 the first refused length. These are semantic length constraints, not performance budgets.
 
-The encoder's Silk compilation and execution remain unverified until the corpus runs. The C
-oracle is evidence for the operating-system contracts only. Captured output, inherited handle
-allowlists, Job objects, cleanup, and environment construction require further implementation and
-execution checks.
+The encoder's host-independent corpus has passed with N1 on Linux. The C oracle is evidence for
+the operating-system contracts only.
+
+`WindowsProcess.execute`, selected by `OsChildProcess`, now implements explicit application
+selection, canonical WTF-8 inputs, sorted case-insensitive environment names with duplicate
+rejection, and a double-NUL empty environment. Windows paths use the machine namespace. Batch
+files are rejected. Named output pipes use overlapped reads and manual-reset events; pending
+operations own stable heap buffers and are cancelled and completed before freeing storage.
+An explicit attribute list admits only stdin, stdout, and stderr. The child starts suspended,
+enters a kill-on-close Job, and resumes. Failure kills and waits for the child. Once the child
+exits, closing the Job terminates remaining descendants so inherited output pipes cannot keep
+capture blocked forever. A completed DWORD is reinterpreted as signed i32 without losing bits.
+
+`provider.silk` executes a separately compiled C child whose Shell32 parser and Win32 queries
+check quote/backslash/empty/surrogate arguments, raw case-insensitive environment, absence of a
+parent-only variable, stdin EOF, and Job membership. The child writes 64 KiB to each pipe and
+leaves a sleeping descendant holding the pipes. The Silk fixture asserts every byte, exits 259
+and 0xc0000005, batch rejection, and duplicate-name rejection. The C child's Win64 structure
+assertions and freestanding compilation with LLVM 22.1.8 pass. The provider's Silk compilation
+and execution are not yet checked. An unrelated inheritable-handle sentinel, failed allocation
+during pending I/O, nondefault working directory, and concurrent launch remain not checked.
 
 `run-thread.ps1` separately checks `CreateThread`'s DWORD result, argument passing, an 8 MiB
 stack reservation, wait-before-read ordering, handle closure, processor counts, zero-timeout
@@ -33,8 +50,8 @@ The production Windows branches use the existing `NativeThread` ownership and re
 Joining and dropping both wait, then close the thread handle. `Atomic.wait` rounds finite bounds
 up to milliseconds and returns a spurious wakeup when a clamped bound expires. The Windows
 cross-build reuses `native-thread-spawn-join`, `native-thread-cross-wake`, and `atomic-wait-notify`
-from the existing corpus; no Linux test root was added. Their Silk execution and forced thread
-creation failures remain unverified.
+from the existing corpus; no Linux test root was added. All three passed actual Windows execution
+from run 41259150694. Forced thread creation failures remain unverified.
 
 Pinned sources consulted:
 

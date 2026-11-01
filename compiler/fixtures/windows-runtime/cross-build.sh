@@ -7,11 +7,15 @@ mkdir -p "$out"
 git rev-parse HEAD > "$out/source-commit.txt"
 printf 'program\tcompile\tpe-imports\texecution\n' > "$out/results.tsv"
 failed=0
-for program in hello hello-speed storage host-check providers native-thread-spawn-join native-thread-cross-wake atomic-wait-notify native-termination-source-trap stderr-locked-message; do
+for program in hello hello-speed storage host-check providers process native-thread-spawn-join native-thread-cross-wake atomic-wait-notify native-termination-source-trap stderr-locked-message; do
   source="$PWD/compiler/fixtures/windows-runtime/$program.silk"
   optimization=none
   allowed_dlls='Name: (kernel32|ntdll)\.dll'
   case "$program" in
+    process)
+      source="$PWD/compiler/fixtures/windows-process/provider.silk"
+      allowed_dlls='Name: (kernel32|ntdll|bcryptprimitives)\.dll'
+      ;;
     hello-speed)
       source="$PWD/compiler/fixtures/windows-runtime/hello.silk"
       optimization=speed
@@ -34,6 +38,20 @@ version = "0.0.0"
 silk-version = "0.0.0"
 EOF
   source="$package/src/main.silk"
+  if [ "$program" = process ]; then
+    printf 'LIBRARY kernel32.dll\nEXPORTS\nGetCommandLineW\nLocalFree\nGetEnvironmentVariableW\nGetStdHandle\nReadFile\nWriteFile\nGetCurrentProcess\nIsProcessInJob\nGetModuleFileNameW\nCreateProcessW\nCloseHandle\nSleep\nExitProcess\n' > "$package/kernel32.def"
+    printf 'LIBRARY shell32.dll\nEXPORTS\nCommandLineToArgvW\n' > "$package/shell32.def"
+    if ! "$SILK_TEST_CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-stack-protector \
+      -Wall -Wextra -Werror -c compiler/fixtures/windows-process/provider-child.c -o "$package/child.obj" \
+      || ! llvm-dlltool -m i386:x86-64 -d "$package/kernel32.def" -l "$package/kernel32.lib" \
+      || ! llvm-dlltool -m i386:x86-64 -d "$package/shell32.def" -l "$package/shell32.lib" \
+      || ! lld-link /nodefaultlib /subsystem:console /entry:mainCRTStartup "$package/child.obj" \
+        "$package/kernel32.lib" "$package/shell32.lib" "/out:$out/process-child.exe"; then
+      printf 'process\tfail: child oracle\tnot-checked\tnot-checked\n' >> "$out/results.tsv"
+      failed=1
+      continue
+    fi
+  fi
   if [ "$program" = providers ]; then
     printf 'LIBRARY kernel32.dll\nEXPORTS\nCreatePipe\nCloseHandle\nSetStdHandle\n' > "$package/fixture.def"
     cat >> "$package/silk.toml" <<'EOF'

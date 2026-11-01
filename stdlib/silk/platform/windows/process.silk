@@ -1,0 +1,408 @@
+//! Direct Windows child execution with explicit inherited handles and owned process cleanup.
+//!
+//! # Details
+//! Executable and working-directory paths use the machine namespace `/C:/...` or `/UNC/...`.
+//! Arguments and environment values use canonical WTF-8. No shell or executable search runs.
+//! Output pipes use overlapped reads so either stream can fill while the other is idle.
+//!
+//! @category Windows platform
+
+static if Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArchitecture() == "x86_64" && Intrinsic.targetAbi() == "msvc" && Intrinsic.profileText("libc") == "system" {
+import silk.core.ownership { Drop, Copy }
+import silk.core.option { Option }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.mem.pointer { Pointer }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.platform.windows.heap { WindowsHeap }
+import silk.platform.windows.path { WindowsPath }
+import silk.platform.windows.wtf8 { Wtf8, InvalidWtf8 }
+import silk.platform.windows.command_line { CommandLine }
+import silk.platform.windows.environment { EnvironmentEntry }
+import silk.platform.windows.random { WindowsRandom }
+import silk.system.filesystem { Path, FileError }
+import silk.system.host_input { HostInputError }
+import silk.system.child_process { ChildProcess, ProcessRequest, ProcessOutcome, ProcessError, ProcessReason, ProcessOperation }
+import silk.num.usize
+import silk.num.u32
+import silk.num.u8
+
+extern "C" struct Security { length: u32, descriptor: ?*mut u8, inherit: i32 }
+extern "C" struct Overlapped { internal: usize, high: usize, offset: u64, event: ?*mut u8 }
+impl Copy for Overlapped {}
+extern "C" struct Startup {
+  size: u32, reserved: ?*mut u16, desktop: ?*mut u16, title: ?*mut u16,
+  x: u32, y: u32, width: u32, height: u32, columns: u32, rows: u32, fill: u32, flags: u32,
+  show: u16, reservedCount: u16, reservedBytes: ?*mut u8,
+  input: ?*mut u8, output: ?*mut u8, error: ?*mut u8, attributes: ?*mut u8,
+}
+extern "C" struct ProcessInfo { process: ?*mut u8, thread: ?*mut u8, pid: u32, tid: u32 }
+extern "C" struct JobLimits {
+  processTime: i64, jobTime: i64, flags: u32, minimum: usize, maximum: usize,
+  processes: u32, affinity: usize, priority: u32, scheduling: u32,
+  readOps: u64, writeOps: u64, otherOps: u64, readBytes: u64, writeBytes: u64, otherBytes: u64,
+  processMemory: usize, jobMemory: usize, peakProcessMemory: usize, peakJobMemory: usize,
+}
+unsafe extern "C" fn GetLastError() -> u32
+unsafe extern "C" fn CloseHandle(handle: ?*mut u8) -> i32
+unsafe extern "C" fn WaitForSingleObject(handle: ?*mut u8, timeout: u32) -> u32
+@foreign(noCapture: ("handles",))
+unsafe extern "C" fn WaitForMultipleObjects(count: u32, handles: ?[*]const ?*mut u8, all: i32, timeout: u32) -> u32
+@foreign(noCapture: ("attributes", "name"))
+unsafe extern "C" fn CreateEventW(attributes: ?*mut Security, manual: i32, signaled: i32, name: ?[*]const u16) -> ?*mut u8
+unsafe extern "C" fn ResetEvent(handle: ?*mut u8) -> i32
+@foreign(noCapture: ("name", "security"))
+unsafe extern "C" fn CreateNamedPipeW(name: ?[*]const u16, access: u32, mode: u32, instances: u32, outputSize: u32, inputSize: u32, timeout: u32, security: ?*mut Security) -> ?*mut u8
+@foreign(noCapture: ("name", "security"))
+unsafe extern "C" fn CreateFileW(name: ?[*]const u16, access: u32, share: u32, security: ?*mut Security, disposition: u32, attributes: u32, template: ?*mut u8) -> ?*mut u8
+unsafe extern "C" fn ConnectNamedPipe(handle: ?*mut u8, overlapped: *mut Overlapped) -> i32
+unsafe extern "C" fn ReadFile(handle: ?*mut u8, buffer: ?[*]mut u8, count: u32, received: ?*mut u32, overlapped: *mut Overlapped) -> i32
+@foreign(noCapture: ("received",))
+unsafe extern "C" fn GetOverlappedResult(handle: ?*mut u8, overlapped: *mut Overlapped, received: *mut u32, wait: i32) -> i32
+unsafe extern "C" fn CancelIoEx(handle: ?*mut u8, overlapped: *mut Overlapped) -> i32
+@foreign(noCapture: ("size",))
+unsafe extern "C" fn InitializeProcThreadAttributeList(attributes: ?*mut u8, count: u32, flags: u32, size: *mut usize) -> i32
+unsafe extern "C" fn DeleteProcThreadAttributeList(attributes: ?*mut u8) -> ()
+unsafe extern "C" fn UpdateProcThreadAttribute(attributes: ?*mut u8, flags: u32, kind: usize, value: *mut u8, size: usize, previous: ?*mut u8, returnedSize: ?*mut usize) -> i32
+@foreign(noCapture: ("application", "command", "processSecurity", "threadSecurity", "environment", "directory", "startup", "result"))
+unsafe extern "C" fn CreateProcessW(application: ?[*]const u16, command: ?[*]mut u16, processSecurity: ?*mut Security, threadSecurity: ?*mut Security, inherit: i32, flags: u32, environment: ?[*]const u16, directory: ?[*]const u16, startup: *mut Startup, result: *mut ProcessInfo) -> i32
+@foreign(noCapture: ("security", "name"))
+unsafe extern "C" fn CreateJobObjectW(security: ?*mut Security, name: ?[*]const u16) -> ?*mut u8
+@foreign(noCapture: ("information",))
+unsafe extern "C" fn SetInformationJobObject(job: ?*mut u8, kind: u32, information: *mut JobLimits, size: u32) -> i32
+unsafe extern "C" fn AssignProcessToJobObject(job: ?*mut u8, process: ?*mut u8) -> i32
+unsafe extern "C" fn ResumeThread(thread: ?*mut u8) -> u32
+unsafe extern "C" fn TerminateProcess(process: ?*mut u8, code: u32) -> i32
+@foreign(noCapture: ("code",))
+unsafe extern "C" fn GetExitCodeProcess(process: ?*mut u8, code: *mut u32) -> i32
+@foreign(noCapture: ("left", "right"))
+unsafe extern "C" fn CompareStringOrdinal(left: ?[*]const u16, leftLength: i32, right: ?[*]const u16, rightLength: i32, ignoreCase: i32) -> i32
+
+fn reason(code: u32) -> ProcessReason {
+  if code == 2 || code == 3 { return ChildProcess.notFound() }
+  if code == 5 || code == 32 || code == 1314 { return ChildProcess.permissionDenied() }
+  if code == 8 || code == 14 || code == 1450 { return ChildProcess.noSpace() }
+  if code == 50 || code == 120 { return ChildProcess.unsupported() }
+  if code == 87 || code == 123 || code == 193 || code == 206 || code == 1113 { return ChildProcess.invalidRequest() }
+  return ChildProcess.other()
+}
+fn nullUnits() -> ?[*]const u16 {
+  return unsafe Intrinsic.pointerRequalify<?*mut u16, ?[*]const u16>(Pointer.null<u16>())
+}
+effect fn reject(operation: ProcessOperation, code: u32) -> never ! ProcessError {
+  fail ChildProcess.failureWithCode(move operation, reason(code), u32.wrappingToI32(code))
+}
+effect fn invalid() -> never ! ProcessError {
+  fail ChildProcess.failure(ChildProcess.spawnOperation(), ChildProcess.invalidRequest())
+}
+struct Handle { raw: ?*mut u8 }
+impl Drop for Handle {
+  fn drop(self: &mut Self) -> () {
+    if !Pointer.isNull(self.raw) { let ignored = unsafe CloseHandle(self.raw) }
+  }
+}
+effect fn owned(raw: ?*mut u8) -> Handle ! ProcessError {
+  if Pointer.isNull(raw) || Pointer.address(raw) == usize.MAX {
+    return run reject(ChildProcess.spawnOperation(), unsafe GetLastError())
+  }
+  return Handle { raw: raw }
+}
+struct Memory { raw: *mut u8 }
+impl Drop for Memory { fn drop(self: &mut Self) -> () { unsafe WindowsHeap.release(self.raw) } }
+effect fn memory(size: usize) -> Memory ! OutOfMemoryError {
+  let raw = match move Pointer.nonNullMut(WindowsHeap.acquire(size)) {
+    Option<*mut u8>.Some { value } => value
+    Option<*mut u8>.None => { fail OutOfMemoryError {} }
+  }
+  return Memory { raw: raw }
+}
+struct Attributes { memory: Memory, initialized: bool }
+impl Drop for Attributes {
+  fn drop(self: &mut Self) -> () {
+    if self.initialized { unsafe DeleteProcThreadAttributeList(self.memory.raw) }
+  }
+}
+struct Child { process: Handle, job: Handle, waited: bool }
+impl Drop for Child {
+  fn drop(self: &mut Self) -> () {
+    // Closing the kill-on-close job terminates descendants even if output capture failed.
+    let job = Intrinsic.replace(self.job.raw, Pointer.null<u8>())
+    if !Pointer.isNull(job) { let ignored = unsafe CloseHandle(job) }
+    if !self.waited {
+      let stopped = unsafe TerminateProcess(self.process.raw, 1)
+      let waited = unsafe WaitForSingleObject(self.process.raw, 4294967295)
+    }
+  }
+}
+struct Pipe { reader: Handle, writer: Handle, event: Handle, storage: Memory, pending: bool, ended: bool }
+fn overlap(pipe: &Pipe) -> *mut Overlapped {
+  return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Overlapped>(pipe.storage.raw)
+}
+fn buffer(pipe: &Pipe) -> [*]mut u8 {
+  return unsafe Pointer.assumeManyMut(unsafe Pointer.atMut(unsafe Pointer.assumeManyMut(pipe.storage.raw), 32))
+}
+impl Drop for Pipe {
+  fn drop(self: &mut Self) -> () {
+    if self.pending {
+      let pointer = overlap(&self.*)
+      let cancelled = unsafe CancelIoEx(self.reader.raw, pointer)
+      let mut received: u32 = 0
+      let completed = unsafe GetOverlappedResult(self.reader.raw, pointer, Pointer.fromMutRef(&mut received), 1)
+    }
+  }
+}
+effect fn makePipe() -> Pipe ! ProcessError | OutOfMemoryError ? &mut Allocator {
+  let mut random: [u8; 16] = [0; 16]
+  run WindowsRandom.fillBytes(&mut random)
+  let mut name = run Intrinsic.catchFailure<InvalidWtf8>(Wtf8.decodeBytes(b"\\\\.\\pipe\\silk-"), badText)
+  // Fixed hexadecimal digits are UTF-16 code units; no process-global counter is needed.
+  let hex: [u16; 16] = [48,49,50,51,52,53,54,55,56,57,97,98,99,100,101,102]
+  let mut at: usize = 0
+  while at < 16 {
+    run List<u16>.append(&mut name, hex[u8.toUsize(random[at] / 16)])
+    run List<u16>.append(&mut name, hex[u8.toUsize(random[at] % 16)])
+    at = at + 1
+  }
+  run List<u16>.append(&mut name, 0)
+  let reader = run owned(unsafe CreateNamedPipeW(Pointer.fromSlice(List<u16>.asSlice(&name)), 1074266113, 8, 1, 4096, 4096, 0, Pointer.null<Security>()))
+  let mut security = Security { length: 24, descriptor: Pointer.null<u8>(), inherit: 1 }
+  let writer = run owned(unsafe CreateFileW(Pointer.fromSlice(List<u16>.asSlice(&name)), 1073741824, 0, Pointer.fromMutRef(&mut security), 3, 0, Pointer.null<u8>()))
+  let event = run owned(unsafe CreateEventW(Pointer.null<Security>(), 1, 0, nullUnits()))
+  let storage = run memory(4128)
+  let mut pipe = Pipe { reader: move reader, writer: move writer, event: move event, storage: move storage, pending: false, ended: false }
+  let pointer = overlap(&pipe)
+  unsafe Pointer.write(pointer, Overlapped { internal: 0, high: 0, offset: 0, event: pipe.event.raw })
+  if unsafe ConnectNamedPipe(pipe.reader.raw, pointer) == 0 {
+    let code = unsafe GetLastError()
+    if code == 997 {
+      pipe.pending = true
+      let mut received: u32 = 0
+      if unsafe GetOverlappedResult(pipe.reader.raw, pointer, Pointer.fromMutRef(&mut received), 1) == 0 {
+        return run reject(ChildProcess.spawnOperation(), unsafe GetLastError())
+      }
+      pipe.pending = false
+    } else if code != 535 { return run reject(ChildProcess.spawnOperation(), code) }
+  }
+  return move pipe
+}
+
+effect fn badText(error: InvalidWtf8) -> List<u16> ! ProcessError { return run invalid() }
+effect fn badCommand(error: HostInputError) -> List<u16> ! ProcessError { return run invalid() }
+effect fn badPath(error: FileError) -> Bytes ! ProcessError { return run invalid() }
+effect fn pathBytes(bytes: &[u8]) -> Bytes ! FileError | OutOfMemoryError ? &mut Allocator {
+  let path = run Path.fromBytes(bytes)
+  return run WindowsPath.toNativeBytes(&path)
+}
+effect fn widePath(bytes: &[u8]) -> List<u16> ! ProcessError | OutOfMemoryError ? &mut Allocator {
+  let path = run Intrinsic.catchFailure<FileError>(pathBytes(bytes), badPath)
+  return run Intrinsic.catchFailure<InvalidWtf8>(Wtf8.decodeBytes(Bytes.asSlice(&path)), badText)
+}
+effect fn entries(bytes: &[u8], expected: usize) -> List<u16> ! ProcessError | OutOfMemoryError ? &mut Allocator {
+  let mut count: usize = 0
+  let mut at: usize = 0
+  while at < bytes.length {
+    if bytes[at] == 0 { count = count + 1 }
+    at = at + 1
+  }
+  if count != expected || (bytes.length != 0 && bytes[bytes.length - 1] != 0) { return run invalid() }
+  return run Intrinsic.catchFailure<InvalidWtf8>(Wtf8.decodeBytes(bytes), badText)
+}
+effect fn environment(request: &ProcessRequest) -> List<u16> ! ProcessError | OutOfMemoryError ? &mut Allocator {
+  let decoded = run entries(ChildProcess.environment(request), ChildProcess.environmentCount(request))
+  let units = List<u16>.asSlice(&decoded)
+  let mut ordered = List<List<u16>>.make()
+  let mut at: usize = 0
+  while at < units.length {
+    let start = at
+    while units[at] != 0 { at = at + 1 }
+    let entry = Slice.view(units, start, at - start)
+    let delimiter = match move EnvironmentEntry.separator(entry) {
+      Option<usize>.Some { value } => value
+      Option<usize>.None => { return run invalid() }
+    }
+    if delimiter > 2147483647 { return run invalid() }
+    if entry[0] == 61 && !(delimiter == 3 && entry[2] == 58 &&
+      ((entry[1] >= 65 && entry[1] <= 90) || (entry[1] >= 97 && entry[1] <= 122))) { return run invalid() }
+    let mut position: usize = 0
+    let previous = List<List<u16>>.asSlice(&ordered)
+    while position < previous.length {
+      let other = List<u16>.asSlice(&previous[position])
+      let otherLength = Option<usize>.unwrapOr(EnvironmentEntry.separator(other), 0)
+      let comparison = unsafe CompareStringOrdinal(Pointer.fromSlice(entry), usize.toI32(delimiter), Pointer.fromSlice(other), usize.toI32(otherLength), 1)
+      if comparison == 0 { return run reject(ChildProcess.spawnOperation(), unsafe GetLastError()) }
+      if comparison == 2 { return run invalid() }
+      if comparison == 1 { break }
+      position = position + 1
+    }
+    let mut copied = List<u16>.make()
+    run List<u16>.appendSlice(&mut copied, entry)
+    run List<List<u16>>.insert(&mut ordered, position, move copied)
+    at = at + 1
+  }
+  let mut result = List<u16>.make()
+  let values = List<List<u16>>.asSlice(&ordered)
+  at = 0
+  while at < values.length {
+    run List<u16>.appendSlice(&mut result, List<u16>.asSlice(&values[at]))
+    run List<u16>.append(&mut result, 0)
+    at = at + 1
+  }
+  if values.length == 0 { run List<u16>.append(&mut result, 0) }
+  run List<u16>.append(&mut result, 0)
+  return move result
+}
+
+effect fn pump(pipe: &mut Pipe, output: &mut Bytes) -> () ! ProcessError | OutOfMemoryError ? &mut Allocator {
+  if pipe.ended { return () }
+  let pointer = overlap(&pipe.*)
+  if pipe.pending {
+    let mut received: u32 = 0
+    if unsafe GetOverlappedResult(pipe.reader.raw, pointer, Pointer.fromMutRef(&mut received), 0) == 0 {
+      let code = unsafe GetLastError()
+      if code == 996 { return () }
+      pipe.pending = false
+      if code == 109 { pipe.ended = true
+        return () }
+      return run reject(ChildProcess.captureOperation(), code)
+    }
+    pipe.pending = false
+    if received > 4096 { return run reject(ChildProcess.captureOperation(), 87) }
+    let view = unsafe Pointer.borrowMany(&pipe.*, buffer(&pipe.*), u32.toUsize(received))
+    run Bytes.append(&mut output.*, view)
+  }
+  unsafe Pointer.write(pointer, Overlapped { internal: 0, high: 0, offset: 0, event: pipe.event.raw })
+  if unsafe ResetEvent(pipe.event.raw) == 0 { return run reject(ChildProcess.captureOperation(), unsafe GetLastError()) }
+  let result = unsafe ReadFile(pipe.reader.raw, buffer(&pipe.*), 4096, Pointer.null<u32>(), pointer)
+  if result != 0 { pipe.pending = true }
+  else {
+    let code = unsafe GetLastError()
+    if code == 997 { pipe.pending = true }
+    else if code == 109 { pipe.ended = true }
+    else { return run reject(ChildProcess.captureOperation(), code) }
+  }
+}
+
+/// Direct Windows execution with a private job, explicit handle inheritance, and complete captures.
+pub struct WindowsProcess {}
+impl WindowsProcess {
+  /// Executes an absolute machine-path executable with the request's explicit arguments and environment.
+  ///
+  /// # Details
+  ///
+  /// Paths use `/C:/...` or `/UNC/...`; text arguments are not path-converted. Raw values must be
+  /// canonical WTF-8. Case-insensitive duplicate environment names and `.bat`/`.cmd` programs are
+  /// refused before launch. The child receives EOF on stdin and only its three standard handles.
+  /// It starts suspended, enters a kill-on-close job, then runs without a console window. Both
+  /// output streams drain concurrently. When the child exits, remaining descendants are terminated.
+  /// All 32 exit bits are preserved as `i32`; an NTSTATUS-shaped value alone is not classified as a crash.
+  ///
+  /// # Errors
+  ///
+  /// - `ProcessError` for invalid input or an OS spawn, wait, or capture failure.
+  /// - `OutOfMemoryError` if input or capture storage cannot be allocated.
+  ///
+  /// # Gotchas
+  ///
+  /// Blocks the calling thread. Failure after launch terminates and waits for the owned process
+  /// and cancels pending reads before freeing their storage. A trap can bypass language cleanup;
+  /// the OS still closes the job when the parent process terminates.
+  pub effect fn execute(request: &ProcessRequest) -> ProcessOutcome ! ProcessError | OutOfMemoryError ? &mut Allocator {
+    let mut application = run widePath(ChildProcess.program(request))
+    let app = List<u16>.asSlice(&application)
+    if app.length >= 4 && app[app.length - 4] == 46 {
+      let a = app[app.length - 3] | 32
+      let b = app[app.length - 2] | 32
+      let c = app[app.length - 1] | 32
+      if (a == 98 && b == 97 && c == 116) || (a == 99 && b == 109 && c == 100) { return run invalid() }
+    }
+    let arguments = run entries(ChildProcess.arguments(request), ChildProcess.argumentCount(request))
+    let mut command = run Intrinsic.catchFailure<HostInputError>(CommandLine.encode(app, List<u16>.asSlice(&arguments)), badCommand)
+    run List<u16>.append(&mut application, 0)
+    let env = run environment(request)
+    let mut directory = List<u16>.make()
+    if ChildProcess.hasWorkingDirectory(request) {
+      directory = run widePath(ChildProcess.workingDirectory(request))
+      run List<u16>.append(&mut directory, 0)
+    }
+    let mut output = run makePipe()
+    let mut errors = run makePipe()
+    let mut security = Security { length: 24, descriptor: Pointer.null<u8>(), inherit: 1 }
+    let nul: [u16; 4] = [78,85,76,0]
+    let input = run owned(unsafe CreateFileW(Pointer.fromSlice(&nul), 2147483648, 3, Pointer.fromMutRef(&mut security), 3, 0, Pointer.null<u8>()))
+    let mut inherited = [input.raw, output.writer.raw, errors.writer.raw]
+    let mut size: usize = 0
+    let query = unsafe InitializeProcThreadAttributeList(Pointer.null<u8>(), 1, 0, Pointer.fromMutRef(&mut size))
+    if query != 0 || unsafe GetLastError() != 122 || size == 0 { return run reject(ChildProcess.spawnOperation(), 87) }
+    let mut attributes = Attributes { memory: run memory(size), initialized: false }
+    if unsafe InitializeProcThreadAttributeList(attributes.memory.raw, 1, 0, Pointer.fromMutRef(&mut size)) == 0 {
+      return run reject(ChildProcess.spawnOperation(), unsafe GetLastError())
+    }
+    attributes.initialized = true
+    let handleBytes = unsafe Intrinsic.pointerReinterpret<*mut [?*mut u8; 3], *mut u8>(Pointer.fromMutRef(&mut inherited))
+    if unsafe UpdateProcThreadAttribute(attributes.memory.raw, 0, 131074, handleBytes, 24, Pointer.null<u8>(), Pointer.null<usize>()) == 0 {
+      return run reject(ChildProcess.spawnOperation(), unsafe GetLastError())
+    }
+    let job = run owned(unsafe CreateJobObjectW(Pointer.null<Security>(), nullUnits()))
+    let mut limits = JobLimits { processTime: 0, jobTime: 0, flags: 8192, minimum: 0, maximum: 0,
+      processes: 0, affinity: 0, priority: 0, scheduling: 0, readOps: 0, writeOps: 0, otherOps: 0,
+      readBytes: 0, writeBytes: 0, otherBytes: 0, processMemory: 0, jobMemory: 0, peakProcessMemory: 0, peakJobMemory: 0 }
+    if unsafe SetInformationJobObject(job.raw, 9, Pointer.fromMutRef(&mut limits), 144) == 0 {
+      return run reject(ChildProcess.spawnOperation(), unsafe GetLastError())
+    }
+    let mut startup = Startup { size: 112, reserved: Pointer.null<u16>(), desktop: Pointer.null<u16>(), title: Pointer.null<u16>(),
+      x: 0, y: 0, width: 0, height: 0, columns: 0, rows: 0, fill: 0, flags: 256, show: 0,
+      reservedCount: 0, reservedBytes: Pointer.null<u8>(), input: input.raw, output: output.writer.raw,
+      error: errors.writer.raw, attributes: attributes.memory.raw }
+    let mut information = ProcessInfo { process: Pointer.null<u8>(), thread: Pointer.null<u8>(), pid: 0, tid: 0 }
+    let mut directoryPointer = nullUnits()
+    if ChildProcess.hasWorkingDirectory(request) { directoryPointer = Pointer.fromSlice(List<u16>.asSlice(&directory)) }
+    let created = unsafe CreateProcessW(Pointer.fromSlice(List<u16>.asSlice(&application)), Pointer.fromMutSlice(List<u16>.asMutSlice(&mut command)),
+      Pointer.null<Security>(), Pointer.null<Security>(), 1, 134743044, Pointer.fromSlice(List<u16>.asSlice(&env)),
+      directoryPointer, Pointer.fromMutRef(&mut startup), Pointer.fromMutRef(&mut information))
+    if created == 0 { return run reject(ChildProcess.spawnOperation(), unsafe GetLastError()) }
+    let mut child = Child { process: Handle { raw: information.process }, job: move job, waited: false }
+    let thread = Handle { raw: information.thread }
+    if unsafe AssignProcessToJobObject(child.job.raw, child.process.raw) == 0 { return run reject(ChildProcess.spawnOperation(), unsafe GetLastError()) }
+    if unsafe ResumeThread(thread.raw) == 4294967295 { return run reject(ChildProcess.spawnOperation(), unsafe GetLastError()) }
+    drop thread
+    drop attributes
+    drop input
+    let writer = Intrinsic.replace(output.writer.raw, Pointer.null<u8>())
+    let errorWriter = Intrinsic.replace(errors.writer.raw, Pointer.null<u8>())
+    let closedOutput = unsafe CloseHandle(writer)
+    let closedError = unsafe CloseHandle(errorWriter)
+    if closedOutput == 0 || closedError == 0 { return run reject(ChildProcess.spawnOperation(), 6) }
+    let mut stdout = Bytes.make()
+    let mut stderr = Bytes.make()
+    while !child.waited || !output.ended || !errors.ended {
+      if !child.waited {
+        let state = unsafe WaitForSingleObject(child.process.raw, 0)
+        if state == 0 {
+          child.waited = true
+          let handle = Intrinsic.replace(child.job.raw, Pointer.null<u8>())
+          let closed = unsafe CloseHandle(handle)
+          if closed == 0 { return run reject(ChildProcess.waitOperation(), unsafe GetLastError()) }
+        } else if state != 258 { return run reject(ChildProcess.waitOperation(), unsafe GetLastError()) }
+      }
+      run pump(&mut output, &mut stdout)
+      run pump(&mut errors, &mut stderr)
+      let mut handles: [?*mut u8; 3] = [Pointer.null<u8>(); 3]
+      let mut count: usize = 0
+      if output.pending { handles[count] = output.event.raw
+        count = count + 1 }
+      if errors.pending { handles[count] = errors.event.raw
+        count = count + 1 }
+      if !child.waited { handles[count] = child.process.raw
+        count = count + 1 }
+      if count != 0 {
+        let state = unsafe WaitForMultipleObjects(usize.toU32(count), Pointer.fromSlice(&handles), 0, 4294967295)
+        if state >= usize.toU32(count) { return run reject(ChildProcess.waitOperation(), unsafe GetLastError()) }
+      }
+    }
+    let mut code: u32 = 0
+    if unsafe GetExitCodeProcess(child.process.raw, Pointer.fromMutRef(&mut code)) == 0 { return run reject(ChildProcess.waitOperation(), unsafe GetLastError()) }
+    return ChildProcess.exited(u32.wrappingToI32(code), move stdout, move stderr)
+  }
+}
+}

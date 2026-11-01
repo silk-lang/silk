@@ -9,7 +9,12 @@ $info.CreateNoWindow = $true
 $info.RedirectStandardOutput = $true
 $info.RedirectStandardError = $true
 $info.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false, $true)
-$info.EnvironmentVariables['SILK_' + [char]0xc9] = [string][char]0xd800
+# ProcessStartInfo serializes a custom environment through a Unicode encoder, which replaces
+# lone surrogates on .NET Framework. Inherit the raw Win32 environment instead. This mutation is
+# local to this launcher process and restored after the child, including on failure.
+$variable = 'SILK_' + [char]0xc9
+$previous = [Environment]::GetEnvironmentVariable($variable, 'Process')
+[Environment]::SetEnvironmentVariable($variable, [string][char]0xd800, 'Process')
 $child = New-Object System.Diagnostics.Process
 $child.StartInfo = $info
 try {
@@ -25,4 +30,5 @@ try {
   [pscustomobject]@{ status='passed'; claim='Silk startup arguments, raw snapshot, aligned heap and redirected UTF-8 output'; notChecked='real-console readback, parking, fault handlers' } | ConvertTo-Json
 } finally {
   $child.Dispose()
+  [Environment]::SetEnvironmentVariable($variable, $previous, 'Process')
 }

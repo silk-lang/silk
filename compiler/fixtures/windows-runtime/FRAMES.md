@@ -14,6 +14,9 @@ base. Windows builds emit neither `_Unwind_Backtrace` nor `_Unwind_GetRegionStar
 COFF orders the `.silk$A`, `.silk$M`, and `.silk$Z` contributions. The production support
 object defines start/end sentinels; each compiler unit contributes its function/name pairs
 to the middle section. ELF's implicit section-boundary symbols are not assumed on COFF.
+All three contributions have matching read/write flags. COFF splits contributions with different
+flags into separate output sections even when their base names match, which would leave every
+frame entry outside the boundary range.
 
 Run the independent OS ABI and section-ordering probe:
 
@@ -25,8 +28,15 @@ It compiles a C caller chain with a 32 KiB frame and real unwind tables, links t
 support source and imports, and verifies that both named frames are recovered in stack order.
 The control omits unwind tables and must fail the same observation with exit 13. Both passed
 on Windows Server 2025 with LLVM 22.1.8. Results and PE unwind inspection are retained in
-`.scratch/windows-frame-walk`. This proves the OS ABI and section layout; compiler-generated
-frame-walk execution remains not checked until the new N1 produces a native executable.
+`.scratch/windows-frame-walk`. The middle C contribution uses the same writable flags as Silk.
+
+Actual Silk source-trap objects from [run 41259150694](https://github.com/silk-lang/silk/actions/runs/41259150694)
+first printed only the explicit trap site. PE inspection showed two `.silk` sections: read-only
+sentinels and writable entries. Relinking those unchanged objects with matching production
+sentinels printed both `main.checked (main:3:5)` and `main.main`, with fast-fail exit `0xc0000409`.
+This validates the emitted Windows walker and establishes a pre-fix failure. The local evidence
+is `.scratch/windows-frame-relink/results.json`. A fresh compiler-driven link of the corrected
+support source remains pending.
 
 Microsoft contracts:
 
