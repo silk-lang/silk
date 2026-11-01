@@ -14,7 +14,7 @@ that it captures, and borrows nothing from the caller. Each thread runs its clos
 of one transferable `Execution` package (EXEC-010). Thus one non-generic C entry point starts
 closures of any type.
 
-Threads use `pthread_create` on Darwin and GNU libc targets, and wasi-threads on wasm32 with
+Threads use `CreateThread` on Windows, `pthread_create` on Darwin and GNU libc targets, and wasi-threads on wasm32 with
 `threading = "multi"`. A native thread gets an 8 MiB stack, the default main-thread stack on
 Darwin and Linux, so work that fits on the main thread fits on a spawned one. The platform's
 own thread default is smaller on Darwin (512 KiB). A wasm32 thread gets the 1 MiB stack its
@@ -98,7 +98,7 @@ The thread could not be created, for example because a resource limit was reache
 pub code: i32
 ```
 
-The error number `pthread_create` returned.
+The native creation error: a Win32 error on Windows, or the thread API's error on other hosts.
 
 <a id="SpawnError.impl.Debug"></a>
 
@@ -183,7 +183,7 @@ Use [`NativeThread.spawn`](#NativeThread.impl.spawn) to run independent work on 
 
 ### Details
 The closure and its result must be `Transferable`. The closure must be detached: it owns all
-that it captures, and borrows nothing from the caller. Threads use `pthread_create` on Darwin
+that it captures, and borrows nothing from the caller. Threads use `CreateThread` on Windows and `pthread_create` on Darwin
 and GNU libc targets, and wasi-threads on wasm32 with `threading = "multi"`. A native thread
 gets an 8 MiB stack, the default main-thread stack on Darwin and Linux, so work that fits on the
 main thread fits on a spawned one. A wasm32 thread gets the 1 MiB stack that its runtime gives
@@ -263,4 +263,4 @@ runtime's entry module exports the thread entry and forwards here.
 
 Category: Concurrency.
 
-Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`.
+Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`.

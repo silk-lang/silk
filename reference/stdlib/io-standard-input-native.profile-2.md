@@ -12,6 +12,7 @@ Provide `OsStandardInput` for `StandardInput` in a native program. Code that rea
 Each read reads once from the descriptor, directly into your buffer. It returns the count that
 the system returned, which can be less than the buffer. When the system reports the end of
 input, the provider remembers it. Later reads return the end without a system call.
+Windows reads raw bytes through `ReadFile`; console bytes use the active input code page.
 
 ## Errors
 `StreamReadError` if the system read fails.
@@ -19,7 +20,7 @@ input, the provider remembers it. Later reads return the end without a system ca
 ## Gotchas
 - An empty buffer returns a count of 0 without a read, also after the end of input.
 - A read waits until input arrives or ends.
-- The provider exists on WASI, Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+- The provider exists on WASI, Windows on x86_64, Darwin on aarch64, and GNU Linux on x86_64 or aarch64.
 
 ## Examples
 ### Read standard input

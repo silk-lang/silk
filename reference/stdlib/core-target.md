@@ -117,6 +117,16 @@ Linux
 
 Linux.
 
+<a id="OperatingSystem.Windows"></a>
+
+### `Windows`
+
+```silk
+Windows
+```
+
+Windows.
+
 <a id="OperatingSystem.Freestanding"></a>
 
 ### `Freestanding`
@@ -171,6 +181,16 @@ Gnu
 
 The GNU calling convention.
 
+<a id="Abi.Msvc"></a>
+
+### `Msvc`
+
+```silk
+Msvc
+```
+
+The Microsoft calling convention.
+
 <a id="Abi.Wasm"></a>
 
 ### `Wasm`
@@ -214,6 +234,16 @@ Elf
 ```
 
 ELF, the format of Linux.
+
+<a id="ObjectFormat.Coff"></a>
+
+### `Coff`
+
+```silk
+Coff
+```
+
+COFF, the object format of Windows.
 
 <a id="ObjectFormat.Wasm"></a>
 
@@ -410,4 +440,4 @@ Returns `true` if the build enables the CPU feature `value`.
 
 Category: Core.
 
-Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`.
+Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`.
