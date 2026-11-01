@@ -9,11 +9,17 @@ Linux required check remains unchanged. It does not alter the pinned seed or req
 The candidate asset is `silk-compiler-x86_64-pc-windows-msvc.exe`; its installable archive is
 `silk-<version>-x86_64-pc-windows-msvc.zip`.
 
-The separate, non-required `Windows native execution` workflow consumes the
-successful `selfhost-native-n1` artifact from a dispatched Selfhost run. It verifies the build receipt
-against that compiler's source commit, cross-builds the workflow revision's Windows fixtures on Linux, and executes
-them on `windows-2025`. It also exports generated reference pages and replay controls.
-It does not rebuild N1 or change Linux/macOS gates:
+The non-required `Windows native execution` workflow runs automatically after N1 on main pushes
+and PR pushes carrying the `windows` label. It reuses the same N1, including the exact synthetic
+merge revision on a PR. If main reuses a green same-tree run, Windows consumes that run's N1 and
+recorded source revision. Neither the required Linux check nor publication depends on the full
+Windows regression lane. Label a PR before its next push to opt it in, or dispatch Selfhost with
+`inputs[windows-native]=true` for an existing branch head.
+
+Standalone dispatch can consume a successful `selfhost-native-n1` artifact from an earlier
+dispatched Selfhost run. It verifies the build receipt against that compiler's source commit,
+cross-builds the workflow revision's fixtures on Linux, and executes them on `windows-2025`.
+It also exports generated reference pages and optional replay controls without rebuilding N1:
 
 ```sh
 gh api -X POST repos/silk-lang/silk/actions/workflows/windows.yml/dispatches \
@@ -22,8 +28,9 @@ gh api -X POST repos/silk-lang/silk/actions/workflows/windows.yml/dispatches \
 
 The workflow revision must contain the Windows cross-build and execution harness. The run records
 both the tested revision and the N1 compiler revision. A previous N1 can validate new library sources;
-compiler changes need a new N1 before their behavior is validated. PR artifacts are refused because
-their synthetic merge revision differs from the run's head revision. Native results are retained in `windows-native-results`,
+compiler changes need a new N1 before their behavior is validated. Standalone dispatch refuses PR
+artifacts because their synthetic merge revision differs from the API head revision; the reusable
+Selfhost invocation supplies that exact merge revision instead. Native results are retained in `windows-native-results`,
 with unexecuted claims reported separately. This route can validate Windows even when unrelated
 Selfhost jobs fail after producing a successful N1.
 

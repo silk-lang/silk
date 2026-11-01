@@ -62,11 +62,12 @@ fixture still needs real security-cookie support and is not a passing arithmetic
 
 ## Validation
 
-Dispatch the existing `selfhost.yml` with `release=none` and `windows-smoke=true`. The optional
-job consumes that run's verified N1 artifact, cross-builds these programs through the production
-driver, and retains their emitted LLVM IR, object helper inventory, PE import inspection, and
-per-program results. It uploads generated `doc-reference` pages separately. It adds no work or
-dependency to default Linux, macOS, or performance jobs.
+Dispatch `selfhost.yml` with `release=none` and `windows-native=true`, or dispatch `windows.yml`
+with an existing dispatched Selfhost run as `source-run`. The reusable Windows lane consumes
+the verified N1 artifact, cross-builds these programs through the production driver, and retains
+their emitted LLVM IR, object helper inventory, PE import inspection, and per-program results.
+It uploads generated `doc-reference` pages separately. Main pushes and PR pushes labelled
+`windows` select this lane automatically; Linux/macOS gates do not depend on it.
 
 Download `windows-no-crt-programs` to Windows, then run:
 
