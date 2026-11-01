@@ -13,6 +13,7 @@ const require = createRequire(new URL('../../package.json', import.meta.url))
 /** @type {typeof import('@effect/platform-node')} */
 const { NodeServices } = await import(pathToFileURL(require.resolve('@effect/platform-node')).href)
 import * as ReleaseArchive from './ReleaseArchive.ts'
+import * as ScoopManifest from './ScoopManifest.mjs'
 
 const directory = Effect.acquireRelease(
   Effect.sync(() => mkdtempSync(join(tmpdir(), 'silk-release-'))),
@@ -214,6 +215,18 @@ it.effect('writes Windows ZIP releases with exe names that an independent ZIP re
     })
     const top = 'silk-1.2.3-x86_64-pc-windows-msvc'
     assert.strictEqual(archive, join(root, `${top}.zip`))
+    const manifestPath = join(root, 'silk.json')
+    yield* ScoopManifest.write('1.2.3', archive, manifestPath)
+    const manifest = yield* Effect.try(() => JSON.parse(readFileSync(manifestPath, 'utf8')))
+    assert.strictEqual(manifest.version, '1.2.3')
+    assert.deepEqual(manifest.bin, ['bin/silk.exe', 'bin/silkc.exe'])
+    assert.strictEqual(manifest.architecture['64bit'].extract_dir, top)
+    assert.strictEqual(manifest.architecture['64bit'].url,
+      `https://github.com/silk-lang/silk/releases/download/v1.2.3/${top}.zip`)
+    const verified = yield* NativeProcess.execute(process.platform === 'win32' ? 'certutil.exe' : 'sha256sum',
+      process.platform === 'win32' ? ['-hashfile', archive, 'SHA256'] : [archive])
+    assert.strictEqual(verified.status, 0, verified.stderr.toString())
+    assert.ok(verified.stdout.toString().includes(manifest.architecture['64bit'].hash))
     const expected = {
       [`${top}/bin/silkc.exe`]: 'MZ compiler bytes\0\xff',
       [`${top}/bin/silk.exe`]: 'MZ tool bytes',
