@@ -34,7 +34,7 @@ import re
 import sys
 path = Path(sys.argv[1])
 source = path.read_text()
-for name in ('fromNative', 'fromNativeBytes', 'toNativeBytes'):
+for name in ('fromNative', 'fromNativeBytes', 'toNativeBytes', 'resolve', 'resolveBytes'):
     matches = list(re.finditer(r'pub effect fn ' + name + r'\([^)]*\)[^{]*\{', source))
     assert len(matches) == 1, name
     start = matches[0].end()
