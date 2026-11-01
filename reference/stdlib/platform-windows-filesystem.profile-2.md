@@ -7,8 +7,11 @@ Handle-relative filesystem operations for the Windows `OsFileSystem` provider.
 ## Details
 Portable paths remain relative to the provider root. Native roots use absolute drive paths,
 such as `C:\\work`. Names use canonical WTF-8 bytes and preserve lone UTF-16 surrogates.
-Each component opens without reparse traversal. Following any reparse point is currently
-`Unsupported`; listings classify symbolic links and junctions as links. Unknown tags are unsupported.
+Each component opens without kernel reparse traversal. Relative symbolic links resolve through
+retained directory handles; `..` stops at the provider root. Absolute symbolic links and junctions
+must name that native root or a descendant, with matching component spelling except drive-letter
+case. Other absolute targets and unknown tags are unsupported. At most 40 links resolve per path.
+Listings classify symbolic links and junctions as links; final removal and replacement act on the link.
 Operations require a local NTFS volume. Directory synchronization is unsupported.
 
 Import as `WindowsFileSystem` with `import silk.platform.windows.filesystem { WindowsFileSystem }`.
@@ -48,7 +51,10 @@ Strict local-NTFS operations for `OsFileSystem`, with no C runtime dependency.
 ### Details
 
 All provider error codes are signed NTSTATUS bit patterns. Logical errors have no native code.
-Handles allow read, write, and delete sharing. Reparse traversal and directory sync are unsupported.
+Handles allow read, write, and delete sharing. Relative link targets stay inside the provider root;
+parent components stop at it. Absolute symlink and junction targets must name the same native root
+or a descendant, with matching component spelling except drive-letter case. Other absolute targets,
+unknown tags, and directory synchronization are unsupported. More than 40 links fails with `InvalidPath`.
 The intended minimum is Windows 10 1809; native fixtures currently target Server 2025 build 26100.
 
 <a id="WindowsFileSystem.impl"></a>
@@ -79,9 +85,12 @@ UNC, device, verbatim, drive-relative, and slash-rooted names are rejected. Case
 pub effect fn openFile(root: &[u8], path: &[u8], writing: bool, operation: i32) -> FileHandle ! FileError
 ```
 
-Opens a regular file for reading, or creates and truncates it for writing, without following links.
+Opens a regular file for reading, or creates and truncates it for writing, following confined links.
 
-`FileError` reports native failures, invalid names, unsupported reparse traversal, or a non-file target.
+Relative link targets resolve inside the root; `..` stops there. Absolute targets must name
+the native root or a descendant with matching component spelling except drive-letter case.
+`FileError` reports native failures, invalid names, a non-file target, or `InvalidPath` after
+40 links. Other absolute targets and unknown reparse tags fail with `Unsupported`.
 
 <a id="WindowsFileSystem.impl.readFile"></a>
 
@@ -142,7 +151,9 @@ handles to the old object. No copy or delete-then-rename fallback exists. At mos
 pub effect fn inspect(root: &[u8], path: &[u8], outputKind: &mut i32, length: &mut usize, operation: i32) -> () ! FileError
 ```
 
-Returns the kind and length of a regular file or directory. Links fail with `Unsupported`.
+Returns the kind and length after resolving links inside the root, with a 40-link limit.
+Relative targets cannot leave the root. Absolute targets must match the native root spelling
+except drive-letter case; outside targets and unknown tags fail with `Unsupported`.
 
 <a id="WindowsFileSystem.impl.command"></a>
 
@@ -153,7 +164,8 @@ pub effect fn command(root: &[u8], path: &[u8], command: i32, operation: i32) ->
 ```
 
 Creates a directory (0), removes a file or link (1), or removes an empty directory (2).
-Removal acts on the opened object, preserves read-only attributes, and never traverses a link.
+Intermediate links resolve inside the root. Removal acts on the opened final object, preserves
+read-only attributes, and never follows a final link.
 Unsupported reparse tags or filesystem semantics produce `FileError` with reason `Unsupported`.
 
 <a id="WindowsFileSystem.impl.openDirectory"></a>
@@ -164,7 +176,9 @@ Unsupported reparse tags or filesystem semantics produce `FileError` with reason
 pub effect fn openDirectory(root: &[u8], path: &[u8], operation: i32) -> DirectoryHandle ! FileError
 ```
 
-Opens a directory for counted UTF-16 enumeration. Following a link fails with `Unsupported`.
+Opens a directory for counted UTF-16 enumeration, resolving at most 40 links inside the root.
+Relative targets cannot leave the root. Absolute targets must match the native root spelling
+except drive-letter case; outside targets and unknown tags fail with `Unsupported`.
 
 <a id="WindowsFileSystem.impl.next"></a>
 

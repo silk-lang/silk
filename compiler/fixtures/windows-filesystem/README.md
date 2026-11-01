@@ -3,13 +3,13 @@
 This fixture accompanies `silk.platform.windows.filesystem` and its selection in `OsFileSystem`.
 It implements reads, truncating writes, exclusive creation, metadata, byte-sorted directory
 listing, directory creation/removal, temporary directories, and buffered atomic publication.
-This is an incomplete Windows port, not complete implementation of the existing link-following
-contract.
+Relative symbolic links resolve within the provider root. Absolute symbolic links and junctions
+resolve only when their native target names that root or a descendant.
 
 The intended floor is Windows 10 1809 with local NTFS. The native oracle has passed on
 **Windows Server 2025 Datacenter Evaluation, 10.0.26100, x86-64**, with stock LLVM 22.1.8.
-The Windows 10 floor itself, other Windows versions, and the Silk provider executable are
-**not checked** in this worktree. No security, Developer Mode, or antivirus settings were changed.
+The Windows 10 floor itself and other Windows versions remain **not checked**. The Silk provider
+has compiled and executed on Server 2025. No security, Developer Mode, or antivirus settings were changed.
 
 ## Boundaries
 
@@ -27,10 +27,13 @@ The Windows 10 floor itself, other Windows versions, and the Silk provider execu
   to parent handles. Root-volume queries reject remote devices and filesystem names other
   than NTFS. Names are never lowercased; `OBJ_CASE_INSENSITIVE` is absent.
 - All opens share read, write, and delete access. Access rights depend on the operation.
-  Reparse points are opened themselves. Following **any** reparse point returns structured
-  `Unsupported`; this includes intermediate symlinks and junctions. Known final symlinks and
-  junctions can be listed as links, removed, and replaced. Unknown tags fail `Unsupported`
-  when encountered. No unknown-tag fixture has yet been executed.
+  Reparse points are opened themselves and read with `FSCTL_GET_REPARSE_POINT`. Relative target
+  components resolve through retained directory handles; `..` stops at the root. Absolute NT
+  targets must match the root's component spelling except drive-letter case. Outside targets
+  and aliases with different root spellings fail `Unsupported`. No unchecked kernel reparse
+  traversal is enabled. More than 40 links fails with `InvalidPath`. Known final links can be
+  listed, removed, and replaced without following them. Unknown tags fail `Unsupported`;
+  no unknown-tag fixture has yet been executed.
 - Directory queries use counted `FileIdExtdDirectoryInformation` records, validate bounds,
   read fields without alignment assumptions, preserve UTF-16 names through WTF-8, and report
   link tags before the directory attribute. The existing common provider sorts path bytes.
@@ -79,7 +82,7 @@ links for recursive cleanup nor changes system security. The oracle proves:
 
 `provider.silk` is the integration test. Its independent C setup creates a lone-surrogate
 filename, outside-target symlink/junction, and an old file. Assertions cover actual provider
-operations, sorted names, raw NTSTATUS sharing errors, unsupported traversal/durability,
+operations, sorted names, raw NTSTATUS sharing errors, outside-target and durability refusal,
 malformed WTF-8 and namespace rejection, retained old handles, failed-publication cleanup,
 exclusive creation, temporary directories, and nonempty-directory refusal. It is not counted
 as passing until it has compiled and executed. There are no compiler exports or hooks added
@@ -110,9 +113,19 @@ The separate C oracle establishes the OS contracts; the Silk executable validate
 integration with the language runtime. The same workflow also passes the native compiler
 fixpoint. Generated standard-library reference pages are included in the feature branch.
 
+The follow-up traversal fixture passed locally with native Silk and LLVM 22.1.8. It reads
+an absolute file symlink and an in-root junction, clamps a relative `../..` target at the root,
+follows a final link for ordinary writes, refuses exclusive creation at that link, and replaces
+the link itself during atomic publication. An outside junction remains unsupported; a relative
+escape can reach only the provider's own namespace, and the independent outside sentinel stays
+unchanged. Evidence is in `.scratch/windows-reparse-provider/native/results.json`.
+The shared `glob-scan` corpus passes literal versus wildcard traversal, dangling links, dot and
+parent targets, and a real cycle. Its adapted Windows fixture failed before the traversal change
+with exit 2 and passes afterward. Kernel handling of arbitrary reparse tags is never delegated.
+
 ## Host integration
 
-`WindowsLink` includes these **eight** filesystem exports in its `ntdll.dll` import library:
+`WindowsLink` includes these **nine** filesystem exports in its `ntdll.dll` import library:
 
 ```text
 NtCreateFile
@@ -123,6 +136,7 @@ NtSetInformationFile
 NtReadFile
 NtWriteFile
 NtQueryDirectoryFile
+NtFsControlFile
 ```
 
 The provider needs no new kernel32 export. The fixture's separate `kernel32.def` supplies its

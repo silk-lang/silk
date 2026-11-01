@@ -12,8 +12,11 @@ Provide `OsFileSystem` for `FileSystem` in a native program. Code that uses file
 `OsFileSystem.make` takes a root directory of the host. The path `/` of the provider is that
 root, not the root of the host. A path cannot leave the root: `..` is not valid in a `Path`, and
 the Unix provider resolves a symbolic link below the root inside the root. An absolute link
-target starts again at the root, and `..` in a target never goes above it. On Windows,
-an operation that must follow a reparse point fails with `Unsupported`.
+target starts again at the root, and `..` in a target never goes above it. Windows also confines
+relative link targets, holding each traversed directory open. Absolute Windows symlink and
+junction targets must name the native root or a descendant, with matching component spelling
+except drive-letter case. Other absolute targets return `Unsupported`. Both providers limit
+resolution to 40 links; a cycle fails with `InvalidPath`.
 
 The write operations are different:
 - `writeFile` creates or truncates the file, then writes. If it fails, a partial file can stay.

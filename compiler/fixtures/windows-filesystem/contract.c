@@ -103,15 +103,11 @@ uint32_t FsFixtureSetup(uint8_t *bytes,uint32_t capacity) {
   for(uint32_t i=0;i<n;++i) { CHECK(native[i]<128); bytes[i]=(uint8_t)native[i]; }
   return n;
 }
-uint32_t FsFixtureLinks(void) {
-  if (!CreateSymbolicLinkW(path((const WCHAR *)L"root\\escape"),(const WCHAR *)L"..\\outside",3)) {
-    uint32_t code=GetLastError(); if(code==1314) return code; CHECK(0);
-  }
-  CHECK(CreateSymbolicLinkW(path((const WCHAR *)L"root\\dangling"),(const WCHAR *)L"missing",2));
-  CHECK(CreateDirectoryW(path((const WCHAR *)L"root\\junction"),0));
-  HANDLE junction=win_open((const WCHAR *)L"root\\junction",0x40000000,7,3,0x02200000);
+static void make_junction(const WCHAR *name, const WCHAR *destination) {
+  CHECK(CreateDirectoryW(path(name),0));
+  HANDLE junction=win_open(name,0x40000000,7,3,0x02200000);
   /* MOUNT_POINT_REPARSE_BUFFER: substitute is a counted NT absolute path. */
-  uint8_t buffer[2048]={0}; const WCHAR *target=path((const WCHAR *)L"outside"); uint32_t n=length(target);
+  uint8_t buffer[2048]={0}; const WCHAR *target=path(destination); uint32_t n=length(target);
   CHECK(n<500); uint16_t *units=(uint16_t *)(void *)(buffer+16);
   units[0]='\\';units[1]='?';units[2]='?';units[3]='\\';
   for(uint32_t i=0;i<n;++i) units[i+4]=target[i];
@@ -120,7 +116,24 @@ uint32_t FsFixtureLinks(void) {
   buffer[10]=(uint8_t)count;buffer[11]=(uint8_t)(count>>8);
   buffer[12]=(uint8_t)(count+2);buffer[13]=(uint8_t)((count+2)>>8);
   uint32_t returned=0; CHECK(DeviceIoControl(junction,0x900a4,buffer,8+data,0,0,&returned,0)); CHECK(CloseHandle(junction));
+}
+uint32_t FsFixtureLinks(void) {
+  if (!CreateSymbolicLinkW(path((const WCHAR *)L"root\\escape"),(const WCHAR *)L"..\\outside",3)) {
+    uint32_t code=GetLastError(); if(code==1314) return code; CHECK(0);
+  }
+  CHECK(CreateSymbolicLinkW(path((const WCHAR *)L"root\\dangling"),(const WCHAR *)L"missing",2));
+  make_junction((const WCHAR *)L"root\\junction", (const WCHAR *)L"outside");
   return 0;
+}
+void FsFixtureInternalLinks(void) {
+  WCHAR target[32768]; const WCHAR *source=path((const WCHAR *)L"root\\old");
+  uint32_t n=length(source); for(uint32_t i=0;i<=n;++i) target[i]=source[i];
+  CHECK(CreateSymbolicLinkW(path((const WCHAR *)L"root\\absolute"),target,2));
+  CHECK(CreateDirectoryW(path((const WCHAR *)L"root\\inside"),0));
+  HANDLE h=win_open((const WCHAR *)L"root\\inside\\byte",0x40000000,7,1,0x80);
+  write_byte(h,'I'); CHECK(CloseHandle(h));
+  make_junction((const WCHAR *)L"root\\inner-junction", (const WCHAR *)L"root\\inside");
+  CHECK(CreateSymbolicLinkW(path((const WCHAR *)L"root\\inside\\up"),(const WCHAR *)L"..\\..\\old",2));
 }
 HANDLE FsFixtureHoldOld(void) { return win_open((const WCHAR *)L"root\\old",0x80000000,7,3,0x80); }
 HANDLE FsFixtureBlockDelete(void) { return win_open((const WCHAR *)L"root\\old",0x80000000,3,3,0x80); }

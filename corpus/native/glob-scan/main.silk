@@ -1,5 +1,5 @@
 import silk.system.glob_scan { ScanOptions, Walker, scan, scanBytes }
-import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.filesystem { FileError, FileSystem, Path, FileInfo, DirectoryInfo }
 import silk.system.filesystem_native { OsFileSystem }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.pointer { Pointer }
@@ -11,6 +11,24 @@ import silk.core.result { Result }
 import silk.io.writer_native { StderrWriter }
 import silk.num.usize
 import silk.text.string { String, InvalidUtf8 }
+static if Intrinsic.targetOperatingSystem() == "windows" {
+  import silk.platform.windows.wtf8 {Wtf8, InvalidWtf8}
+  import silk.collections.slice {Slice}
+  import silk.num.u32
+  @foreign(noCapture: ("buffer",))
+  unsafe extern "C" fn GetTempPathW(capacity: u32, buffer: ?[*]mut u16) -> u32
+  @foreign(noCapture: ("path", "target"))
+  unsafe extern "C" fn CreateSymbolicLinkW(path: ?[*]const u16, target: ?[*]const u16, flags: u32) -> u8
+  effect fn fixtureWide(bytes: &[u8]) -> List<u16> ! Failed | OutOfMemoryError ? &mut Allocator {
+    return match move run Effect.result(Wtf8.decodeBytes(bytes)) {
+      Result<List<u16>, InvalidWtf8 | OutOfMemoryError>.Success {value} => move value
+      Result<List<u16>, InvalidWtf8 | OutOfMemoryError>.Failure {error} => match move error {
+        InvalidWtf8 invalid => { fail Failed {message: "fixture link paths decode"} }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+  }
+}
 
 @foreign(noCapture: ("target", "path"))
 unsafe extern "C" fn symlink(target: ?[*]const u8, path: ?[*]const u8) -> i32
@@ -21,6 +39,17 @@ static if Intrinsic.targetOperatingSystem() == "darwin" {
   const HOST_ROOT: string = "/private/tmp"
 } else {
   const HOST_ROOT: string = "/tmp"
+}
+
+effect fn hostRoot() -> Bytes ! Failed | OutOfMemoryError ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    let mut buffer: [u16; 32768] = [0; 32768]
+    let count = unsafe GetTempPathW(32768, Pointer.fromMutSlice(&mut buffer))
+    run expect(count > 0 && count < 32768, "the fixture obtains its Windows temporary root")
+    let mut length = u32.toUsize(count)
+    if length > 3 && buffer[length - 1] == 92 { length = length - 1 }
+    return run Wtf8.encode(Slice.view(&buffer, 0, length))
+  } else { return run Bytes.copy(String.utf8Bytes(HOST_ROOT)) }
 }
 
 // A failed expectation, reported on standard error before the program exits with 1.
@@ -50,21 +79,40 @@ effect fn directory(base: &Path, name: &[u8]) -> ()
 }
 
 // Makes a symbolic link at `name` below `base` that points to `target`, through the host.
-effect fn link(base: &Path, name: &[u8], target: &[u8]) -> ()
+effect fn link(base: &Path, name: &[u8], target: &[u8], directory: bool) -> ()
   ! Failed | OutOfMemoryError
   ? &mut Allocator {
-  let mut host = run Bytes.copy(String.utf8Bytes(HOST_ROOT))
+  let mut host = run hostRoot()
   run Bytes.append(&mut host, Path.rawBytes(base))
   run Bytes.append(&mut host, b"/")
   run Bytes.append(&mut host, name)
   run Bytes.append(&mut host, b"\0")
   let mut destination = run Bytes.copy(target)
   run Bytes.append(&mut destination, b"\0")
-  let status = unsafe symlink(
-    Pointer.fromSlice(Bytes.asSlice(&destination)),
-    Pointer.fromSlice(Bytes.asSlice(&host)),
-  )
-  run expect(status == 0, "the fixture creates a symbolic link")
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    // These fixture names are ASCII; the temporary root itself is canonical WTF-8.
+    let mut native = run Bytes.copy(b"\\\\?\\")
+    run Bytes.append(&mut native, Bytes.asSlice(&host))
+    let view = Bytes.asMutSlice(&mut native)
+    let mut at: usize = 0
+    while at < view.length {
+      if view[at] == 47 { view[at] = 92 }
+      at = at + 1
+    }
+    drop view
+    let path = run fixtureWide(Bytes.asSlice(&native))
+    let value = run fixtureWide(Bytes.asSlice(&destination))
+    let mut flags: u32 = 2
+    if directory { flags = 3 }
+    let status = unsafe CreateSymbolicLinkW(Pointer.fromSlice(List<u16>.asSlice(&path)), Pointer.fromSlice(List<u16>.asSlice(&value)), flags)
+    run expect(status != 0, "the fixture creates a Windows symbolic link")
+  } else {
+    let status = unsafe symlink(
+      Pointer.fromSlice(Bytes.asSlice(&destination)),
+      Pointer.fromSlice(Bytes.asSlice(&host)),
+    )
+    run expect(status == 0, "the fixture creates a symbolic link")
+  }
 }
 
 // A file name of host bytes. APFS refuses names that are not UTF-8, so other hosts get a plain one.
@@ -123,10 +171,10 @@ effect fn cases(tree: &Path) -> ()
   run file(tree, b"root.txt")
   run file(tree, b".hidden.txt")
   run file(tree, b".secret/visible.txt")
-  run link(tree, b"link", b"a")
-  run link(tree, b"dangling", b"absent")
-  run link(tree, b"filelink", b"root.txt")
-  run link(tree, b"a/loop", b".")
+  run link(tree, b"link", b"a", true)
+  run link(tree, b"dangling", b"absent", false)
+  run link(tree, b"filelink", b"root.txt", false)
+  run link(tree, b"a/loop", b".", true)
 
   let hostName = run fixtureName()
   let raw = Bytes.asSlice(&hostName)
@@ -275,6 +323,21 @@ effect fn cases(tree: &Path) -> ()
     }
   }
   run expect(refused, "a missing base directory fails with NotFound")
+
+  let throughLoop = run collect(tree, "a/loop/*.txt", false, true)
+  run expect(List<Bytes>.length(&throughLoop) == 1 && contains(&throughLoop, b"a/loop/one.txt"),
+    "a literal directory link resolves a dot target")
+  run link(tree, b"a/up", b"../root.txt", false)
+  let throughParent = run collect(tree, "a/up", false, true)
+  run expect(List<Bytes>.length(&throughParent) == 1 && contains(&throughParent, b"a/up"),
+    "a relative link target resolves its parent component")
+  run link(tree, b"cycle", b"cycle", false)
+  let cyclePath = run Path.join(tree, "cycle")
+  let cycle = match move run Effect.result(FileSystem.stat(&cyclePath)) {
+    Result<FileInfo | DirectoryInfo, FileError>.Success {value} => false
+    Result<FileInfo | DirectoryInfo, FileError>.Failure {error} => error.reason.code == FileSystem.invalidPath().code
+  }
+  run expect(cycle, "a literal link cycle fails with InvalidPath")
 }
 
 effect fn program() -> i32
@@ -313,7 +376,8 @@ effect fn failed(error: Failed | FileError | OutOfMemoryError) -> i32 {
 effect fn withFiles() -> i32
   ! Failed | FileError | OutOfMemoryError
   ? &mut Allocator {
-  let mut files = run OsFileSystem.make(HOST_ROOT)
+  let host = run hostRoot()
+  let mut files = run OsFileSystem.makeBytes(Bytes.asSlice(&host))
   return run program() |> Effect.provideMut<FileSystem>(&mut files)
 }
 
