@@ -1,3 +1,4 @@
+#if defined(__APPLE__)
 
 #include <errno.h>
 #include <fcntl.h>
@@ -43,5 +44,6 @@ static int (*silk_setsockopt_signature)(int, int, int, const void *, socklen_t) 
 static int (*silk_getsockopt_signature)(int, int, int, void *, socklen_t *) = getsockopt;
 static int (*silk_fcntl_signature)(int, int, ...) = fcntl;
 static int (*silk_close_signature)(int) = close;
+#endif
 #endif
 int silk_listener_darwin_witness(void) { return 42; }

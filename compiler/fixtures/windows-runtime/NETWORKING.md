@@ -41,6 +41,21 @@ can close. Created sockets prohibit inheritance and accepted sockets clear the i
 The default bind uses `SO_EXCLUSIVEADDRUSE`; explicit reuse uses Windows `SO_REUSEADDR` semantics.
 Unix-domain operations return `FamilyUnsupported`.
 
+The shared `native-socket-connections` corpus now executes its lifecycle, partial-I/O, deadline,
+error, and cancellation checks with an independent Winsock witness. Synthetic SOCKET values
+exceed `UINT32_MAX`, and the C declarations preserve Win64 poll and linger layouts. Configuration
+failures retain their Winsock or Win32 codes. The existing deadline case failed with exit 142
+before the Windows configuration calls checked their deadline; it passes after checks before
+both nonblocking setup and inheritance removal. Accepted sockets use those checks too.
+
+The shared `native-socket-listeners` corpus executes real Windows loopback TCP and HTTP server
+exchanges. The C peer observes real DLL accept/close calls to verify that accepted-owner release
+closes exactly one socket while the listener remains usable, and that listener release closes it
+once. Its dynamic-lookup imports are fixture-only. `silk.http.server_native` is available on
+Windows, and Unix-domain refusal is asserted as `FamilyUnsupported`. Both socket corpus cases
+passed their configured optimized profile on Server 2025 with LLVM 22.1.8. The listener's scripted
+POSIX failure modes remain Unix coverage; Windows listener failure injection is not checked here.
+
 The actual `sockets.silk` fixture passed on Server 2025 using native Silk N2 and LLVM 22.1.8.
 Its independently compiled C peer checks both client/listener directions, binary bytes, gathered
 writes with partial-write completion, write shutdown and EOF, refusal on a reserved unlistened

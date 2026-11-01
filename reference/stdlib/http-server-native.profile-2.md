@@ -19,8 +19,8 @@ yourself.
 - The error of the handler.
 
 ## Gotchas
-The whole module exists only on Darwin on aarch64, and on Linux with GNU libc on x86_64 or
-aarch64. On other targets, an import from it fails to compile.
+The module exists on Windows x86_64 with the system runtime, Darwin aarch64, and Linux with
+GNU libc on x86_64 or aarch64. On other targets, an import from it fails to compile.
 
 Public declarations: 0.
 
@@ -28,4 +28,4 @@ This module declares no public items.
 
 Category: HTTP.
 
-Profiles: `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`.
+Profiles: `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`.
