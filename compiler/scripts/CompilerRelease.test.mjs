@@ -28,6 +28,7 @@ const {
   publish,
   releaseBody,
   releaseBodyLimit,
+  releaseInstall,
 } = await import('./CompilerRelease.mjs')
 
 const require = createRequire(new URL('../../package.json', import.meta.url))
@@ -470,14 +471,27 @@ it.effect(
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 )
 
+it('release bodies open with install commands for the exact release', () => {
+  const tag = 'v0.1.0-dev.41+b10165a17baa'
+  const body = releaseBody(repository, { commit, tag, notes: 'Short notes.' })
+  assert.isTrue(body.startsWith('## Install\n'))
+  assert.isTrue(body.endsWith('\n\nShort notes.'))
+  assert.include(body, `/install.sh | SILK_RELEASE='${tag}' sh`)
+  assert.include(body, `$env:SILK_RELEASE = '${tag}'; irm https://raw.githubusercontent.com/${repository}/main/install.ps1 | iex`)
+  assert.include(body, `/releases/download/v0.1.0-dev.41%2Bb10165a17baa/silk.json`)
+})
+
 it('release notes over the GitHub body limit keep whole leading lines and link the changes', () => {
-  const short = { commit, notes: 'Short notes.' }
-  assert.strictEqual(releaseBody(repository, short), 'Short notes.')
+  const tag = 'v0.1.0'
+  const install = releaseInstall(repository, { tag })
+  const short = { commit, tag, notes: 'Short notes.' }
+  assert.strictEqual(releaseBody(repository, short), `${install}Short notes.`)
   const line = 'A change that every prerelease since the last stable release carries.\n'
   const notes = line.repeat(Math.ceil((releaseBodyLimit * 1.2) / line.length))
-  const body = releaseBody(repository, { commit, notes })
+  const body = releaseBody(repository, { commit, tag, notes })
   assert.isAtMost(body.length, releaseBodyLimit)
-  const [kept, footer] = body.split('\n\n_Notes truncated.')
+  assert.isTrue(body.startsWith(install))
+  const [kept, footer] = body.slice(install.length).split('\n\n_Notes truncated.')
   assert.isTrue(notes.startsWith(`${kept}\n`))
   assert.include(footer, `https://github.com/${repository}/tree/${commit}/compiler/.changes`)
 })

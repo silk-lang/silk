@@ -18,11 +18,36 @@ export const managedMarker = '<!-- silk-managed-stable-release -->'
 // change since the last stable release, so they can outgrow it; the body then keeps the leading
 // whole lines and links to the full pending changes at the release commit.
 export const releaseBodyLimit = 125000
+// Every release body opens with the commands that install exactly that release.
+export const releaseInstall = (repository, metadata) => {
+  const raw = `https://raw.githubusercontent.com/${repository}/main`
+  const download = `https://github.com/${repository}/releases/download/${encodeURIComponent(metadata.tag)}`
+  return [
+    '## Install',
+    '',
+    'macOS (Apple silicon) and Linux (x86-64, ARM64):',
+    '',
+    '```sh',
+    `curl -fsSL ${raw}/install.sh | SILK_RELEASE='${metadata.tag}' sh`,
+    '```',
+    '',
+    'Windows (x86-64), in PowerShell:',
+    '',
+    '```powershell',
+    `$env:SILK_RELEASE = '${metadata.tag}'; irm ${raw}/install.ps1 | iex`,
+    '```',
+    '',
+    `With Scoop: \`scoop install ${download}/silk.json\`. Building programs needs LLVM 22 or newer (Clang, plus LLD on Windows). See [Install](https://github.com/${repository}#install) for PATH setup, Homebrew, mise and signature checks.`,
+    '',
+    '',
+  ].join('\n')
+}
 export const releaseBody = (repository, metadata) => {
-  if (metadata.notes.length <= releaseBodyLimit) return metadata.notes
+  const install = releaseInstall(repository, metadata)
+  if (install.length + metadata.notes.length <= releaseBodyLimit) return install + metadata.notes
   const footer = `\n\n_Notes truncated. Every change in this release is in [compiler/.changes](https://github.com/${repository}/tree/${metadata.commit}/compiler/.changes)._`
-  const kept = metadata.notes.slice(0, releaseBodyLimit - footer.length)
-  return kept.slice(0, kept.lastIndexOf('\n')).trimEnd() + footer
+  const kept = metadata.notes.slice(0, releaseBodyLimit - install.length - footer.length)
+  return install + kept.slice(0, kept.lastIndexOf('\n')).trimEnd() + footer
 }
 const json = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown))
 const command = Effect.fnUntraced(function* (executable, args, options = {}) {
