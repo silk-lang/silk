@@ -54,5 +54,18 @@ $preserved = (Get-FileHash -LiteralPath (Join-Path $fixtureDirectory 'previous.e
 if ($original -cne $preserved) { throw 'The retained hard link changed image bytes' }
 if ([IO.File]::ReadAllText($fixture) -cne "Windows image replacement`n") { throw 'The mapped image was not replaced' }
 $results.Add(@{name='mapped-image-replacement'; status='pass'; retainedImage=$preserved})
+$installHome = Join-Path $output 'signed installation'
+$installBin = Join-Path $installHome 'bin'
+New-Item -ItemType Directory -Force $installBin | Out-Null
+$installer = Join-Path $installBin 'silk.exe'
+Copy-Item -LiteralPath (Join-Path $ToolDirectory 'install.exe') -Destination $installer
+$original = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
+& $installer
+if ($LASTEXITCODE -ne 0) { throw "Signed ZIP installation fixture failed with $LASTEXITCODE" }
+if ([IO.File]::ReadAllText($installer) -cne "updated Windows tool`n") { throw 'Self-update did not replace the mapped tool' }
+$previous = (Get-FileHash -LiteralPath (Join-Path $installBin '.silk-previous.exe') -Algorithm SHA256).Hash
+if ($previous -cne $original) { throw 'The retained previous tool image changed' }
+if ([IO.File]::ReadAllText((Join-Path $installHome 'toolchains/1.2.3/bin/silkc.exe')) -cne "MZ fixture compiler`n") { throw 'Signed ZIP compiler bytes changed' }
+$results.Add(@{name='signed-zip-install-and-self-update'; status='pass'; retainedImage=$previous})
 $results | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $output 'results.json')
 $results | ConvertTo-Json -Depth 5

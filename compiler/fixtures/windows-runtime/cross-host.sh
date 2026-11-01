@@ -66,4 +66,7 @@ if [ "$package" = tool ]; then
   "$compiler" build tool/src/fixtures/WindowsHostFiles.silk -o "$out/host-files.exe" \
     --target x86_64-pc-windows-msvc --stdlib "$PWD/stdlib" --clang "$SILK_TEST_CLANG" \
     --optimization none --debug false 2>&1 | tee "$out/host-files-build.log"
+  "$compiler" build tool/src/fixtures/WindowsInstall.silk -o "$out/install.exe" \
+    --target x86_64-pc-windows-msvc --stdlib "$PWD/stdlib" --clang "$SILK_TEST_CLANG" \
+    --optimization none --debug false 2>&1 | tee "$out/install-build.log"
 fi

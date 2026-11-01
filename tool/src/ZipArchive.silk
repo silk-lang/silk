@@ -1,0 +1,186 @@
+//! A bounded reader for Silk's ZIP32 releases: UTF-8 names, stored or raw-DEFLATE files, and
+//! directories. Central and local headers must agree; links, encryption, descriptors, ZIP64,
+//! comments, extra fields, overlapping members, and paths outside the archive are refused.
+
+import silk.collections.bytes {Bytes}
+import silk.collections.slice {Slice}
+import silk.compress.checksum {CompressionChecksum}
+import silk.compress.inflate {Decoder, DecodeError, Format, Limits, Progress, Status, MEMORY_BOUND}
+import silk.core.effect {Effect}
+import silk.core.option {Option}
+import silk.core.result {Result}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.text.string {String}
+import silk.num.u8
+import silk.num.usize
+
+/// The reason a release ZIP was refused.
+pub enum ZipError {Truncated, InvalidDirectory, UnsupportedMember, UnsafePath, InvalidData, BadChecksum, LimitExceeded}
+
+/// One member's compressed bytes and independently checked metadata.
+pub struct ZipMember<'a> {
+  pub name: &'a [u8],
+  pub compressed: &'a [u8],
+  pub directory: bool,
+  pub deflated: bool,
+  pub length: usize,
+  pub checksum: u32,
+}
+
+/// A position in a validated single-disk ZIP32 central directory.
+pub struct ZipReader<'a> {
+  archive: &'a [u8],
+  cursor: usize,
+  central: usize,
+  end: usize,
+  local: usize,
+  remaining: usize,
+  decoded: usize,
+}
+
+const LIMIT: usize = 1073741824
+
+fn word(bytes: &[u8], at: usize) -> usize {
+  return u8.toUsize(bytes[at]) + u8.toUsize(bytes[at + 1]) * 256
+}
+fn dword(bytes: &[u8], at: usize) -> usize { return word(bytes, at) + word(bytes, at + 2) * 65536 }
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at: usize = 0
+  while at < left.length { if left[at] != right[at] { return false }
+    at = at + 1 }
+  return true
+}
+fn safe(path: &[u8], directory: bool) -> bool {
+  if path.length == 0 { return false }
+  if let Result.Failure {error} = String.fromUtf8(path) { return false }
+  let end = if directory { path.length - 1 } else { path.length }
+  let mut start: usize = 0
+  let mut at: usize = 0
+  while at <= end {
+    if at < end && (path[at] == 0 || path[at] == 92 || path[at] == 58) { return false }
+    if at == end || path[at] == 47 {
+      if at == start { return false }
+      if at - start == 1 && path[start] == 46 { return false }
+      if at - start == 2 && path[start] == 46 && path[start + 1] == 46 { return false }
+      start = at + 1
+    }
+    at = at + 1
+  }
+  return true
+}
+
+/// Opens a release ZIP, bounding compressed input and total decoded data to 1 GiB.
+pub fn reader<'a>(archive: &'a [u8]) -> Result<ZipReader<'a>, ZipError> {
+  if archive.length < 22 { return Result<ZipReader<'a>, ZipError>.failResult(ZipError.Truncated) }
+  if archive.length > LIMIT { return Result<ZipReader<'a>, ZipError>.failResult(ZipError.LimitExceeded) }
+  let end = archive.length - 22
+  if dword(archive, end) != 101010256 || word(archive, end + 4) != 0 || word(archive, end + 6) != 0
+    || word(archive, end + 8) != word(archive, end + 10) || word(archive, end + 20) != 0 {
+    return Result<ZipReader<'a>, ZipError>.failResult(ZipError.InvalidDirectory)
+  }
+  let central = dword(archive, end + 16)
+  if central > end || dword(archive, end + 12) != end - central { return Result<ZipReader<'a>, ZipError>.failResult(ZipError.InvalidDirectory) }
+  return Result<ZipReader<'a>, ZipError>.succeed(ZipReader {archive: archive, cursor: central, central: central, end: end,
+    local: 0, remaining: word(archive, end + 10), decoded: 0})
+}
+
+impl ZipReader {
+  /// Returns the next member, checking its local header, name, bounds, and non-overlap.
+  pub fn next<'a>(self: &mut ZipReader<'a>) -> Result<Option<ZipMember<'a>>, ZipError> {
+    if self.remaining == 0 {
+      if self.cursor != self.end || self.local != self.central { return Result<Option<ZipMember<'a>>, ZipError>.failResult(ZipError.InvalidDirectory) }
+      return Result<Option<ZipMember<'a>>, ZipError>.succeed(Option<ZipMember<'a>>.none())
+    }
+    let bytes = self.archive
+    let at = self.cursor
+    if at > self.end || self.end - at < 46 { return Result<Option<ZipMember<'a>>, ZipError>.failResult(ZipError.Truncated) }
+    if dword(bytes, at) != 33639248 { return Result<Option<ZipMember<'a>>, ZipError>.failResult(ZipError.InvalidDirectory) }
+    let method = word(bytes, at + 10)
+    if word(bytes, at + 4) != 20 || word(bytes, at + 6) != 20 || word(bytes, at + 8) != 2048
+      || (method != 0 && method != 8) || word(bytes, at + 30) != 0 || word(bytes, at + 32) != 0
+      || word(bytes, at + 34) != 0 || word(bytes, at + 36) != 0 {
+      return Result<Option<ZipMember<'a>>, ZipError>.failResult(ZipError.UnsupportedMember)
+    }
+    let nameLength = word(bytes, at + 28)
+    if nameLength == 0 || nameLength > self.end - at - 46 { return Result<Option<ZipMember<'a>>, ZipError>.failResult(ZipError.Truncated) }
+    let name = Slice.view(bytes, at + 46, nameLength)
+    let directory = name[nameLength - 1] == 47
+    if dword(bytes, at + 38) != (if directory { usize.add(0, 16) } else { usize.ZERO }) { return Result<Option<ZipMember<'a>>, ZipError>.failResult(ZipError.UnsupportedMember) }
+    if !safe(name, directory) { return Result<Option<ZipMember<'a>>, ZipError>.failResult(ZipError.UnsafePath) }
+    let compressed = dword(bytes, at + 20)
+    let length = dword(bytes, at + 24)
+    if directory && (length != 0 || compressed != 0 || method != 0) { return Result<Option<ZipMember<'a>>, ZipError>.failResult(ZipError.InvalidData) }
+    if length > LIMIT - self.decoded { return Result<Option<ZipMember<'a>>, ZipError>.failResult(ZipError.LimitExceeded) }
+    let local = dword(bytes, at + 42)
+    if local != self.local || local > self.central || self.central - local < 30 { return Result<Option<ZipMember<'a>>, ZipError>.failResult(ZipError.InvalidDirectory) }
+    if dword(bytes, local) != 67324752 || word(bytes, local + 4) != 20 || word(bytes, local + 6) != 2048
+      || word(bytes, local + 8) != method || dword(bytes, local + 14) != dword(bytes, at + 16)
+      || dword(bytes, local + 18) != compressed || dword(bytes, local + 22) != length
+      || word(bytes, local + 26) != nameLength || word(bytes, local + 28) != 0 {
+      return Result<Option<ZipMember<'a>>, ZipError>.failResult(ZipError.InvalidDirectory)
+    }
+    if nameLength > self.central - local - 30 { return Result<Option<ZipMember<'a>>, ZipError>.failResult(ZipError.Truncated) }
+    if !same(name, Slice.view(bytes, local + 30, nameLength)) { return Result<Option<ZipMember<'a>>, ZipError>.failResult(ZipError.InvalidDirectory) }
+    let start = local + 30 + nameLength
+    if compressed > self.central - start { return Result<Option<ZipMember<'a>>, ZipError>.failResult(ZipError.Truncated) }
+    self.cursor = at + 46 + nameLength
+    self.local = start + compressed
+    self.remaining = self.remaining - 1
+    self.decoded = self.decoded + length
+    return Result<Option<ZipMember<'a>>, ZipError>.succeed(Option<ZipMember<'a>>.some(ZipMember {
+      name: Slice.view(name, 0, if directory { nameLength - 1 } else { nameLength }),
+      compressed: Slice.view(bytes, start, compressed), directory: directory,
+      deflated: method == 8, length: length, checksum: usize.toU32(dword(bytes, at + 16)),
+    }))
+  }
+}
+
+/// Decodes one bounded member and verifies its exact length and ZIP CRC-32.
+pub effect fn content(member: &ZipMember) -> Bytes ! ZipError | OutOfMemoryError ? &mut Allocator {
+  let mut output = Bytes.make()
+  if !member.deflated {
+    if member.compressed.length != member.length { fail ZipError.InvalidData }
+    output = run Bytes.copy(member.compressed)
+  } else {
+    let made = run Effect.result(Decoder.make(Format.Raw, Limits {maxInputBytes: usize.toU64(member.compressed.length),
+      maxOutputBytes: usize.toU64(member.length), maxMembers: 1, maxHeaderBytes: 0, maxMemoryBytes: MEMORY_BOUND}))
+    let mut decoder = match move made {
+      Result<Decoder, DecodeError | OutOfMemoryError>.Success {value} => move value
+      Result<Decoder, DecodeError | OutOfMemoryError>.Failure {error} => match move error {
+        OutOfMemoryError exhausted => { fail move exhausted }
+        DecodeError invalid => { fail ZipError.InvalidData }
+      }
+    }
+    let mut offset: usize = 0
+    let mut chunk: [u8; 4096] = [0; 4096]
+    while true {
+      let progress = match Decoder.step(&mut decoder, Slice.view(member.compressed, offset, member.compressed.length - offset), &mut chunk, true) {
+        Result<Progress, DecodeError>.Success {value} => move value
+        Result<Progress, DecodeError>.Failure {error} => { fail ZipError.InvalidData }
+      }
+      offset = offset + progress.consumed
+      run Bytes.append(&mut output, Slice.view(&chunk, 0, progress.written))
+      if progress.status == Status.Finished {
+        if offset != member.compressed.length { fail ZipError.InvalidData }
+        break
+      }
+    }
+  }
+  if Bytes.length(&output) != member.length { fail ZipError.InvalidData }
+  if CompressionChecksum.crc32(Bytes.asSlice(&output)) != member.checksum { fail ZipError.BadChecksum }
+  return move output
+}
+
+/// A short description of a refused ZIP release.
+pub fn describe(error: ZipError) -> &'static [u8] {
+  return match error {
+    ZipError.Truncated => b"the ZIP archive is truncated"
+    ZipError.InvalidDirectory => b"ZIP central and local records do not agree"
+    ZipError.UnsupportedMember => b"the ZIP archive uses an unsupported member or format"
+    ZipError.UnsafePath => b"the ZIP archive contains an unsafe path"
+    ZipError.InvalidData => b"the ZIP member data is invalid"
+    ZipError.BadChecksum => b"the ZIP member checksum is invalid"
+    ZipError.LimitExceeded => b"the ZIP archive exceeds the decoded size limit"
+  }
+}
