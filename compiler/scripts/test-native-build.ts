@@ -2183,6 +2183,72 @@ const program = Effect.gen(function* () {
   const refusedDependencyInput = yield* invoke(silk, ['build', '--stdlib', standardLibrary], join(propagated, 'app'), { ...process.env, SILK_CLANG: clang })
   assert.equal(refusedDependencyInput.status, 2, refusedDependencyInput.stderr)
   assert.match(refusedDependencyInput.stderr, /invalid native link input: .*shim\/silk\.toml: \[native\]\.link\[0\]: static-archive \/tmp\/libshim\.a must be a relative path/)
+  // A library's `[native].sources` compile with Clang into cached objects that reach every
+  // executable depending on it. A build that changes nothing reuses the executable without
+  // linking; an edit to a header or to one file compiles only the files it reaches; a check
+  // compiles nothing; and a flag that loads code or a path outside the package is refused.
+  const sourcesRoot = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-native-sources-' })
+  for (const member of ['clib/native', 'clib/include', 'app']) yield* fs.makeDirectory(join(sourcesRoot, member), { recursive: true })
+  const clibManifest = (sources: string) =>
+    `[package]\nname = "clib"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Clib"]\n\n[native]\nsources = [${sources}]\n`
+  yield* fs.writeFileString(join(sourcesRoot, 'clib/silk.toml'), clibManifest('{ c = "native/*.c", include = ["include"], flags = ["-DBASE=40", "-Wall"] }'))
+  yield* fs.writeFileString(join(sourcesRoot, 'clib/include/extra.h'), '#define EXTRA 1\n')
+  yield* fs.writeFileString(join(sourcesRoot, 'clib/native/add.c'), '#include "extra.h"\nint clib_add(int a) { return a + BASE + EXTRA; }\n')
+  yield* fs.writeFileString(join(sourcesRoot, 'clib/native/two.c'), 'int clib_two(void) { return 2; }\n')
+  yield* fs.writeFileString(
+    join(sourcesRoot, 'clib/Clib.silk'),
+    'unsafe extern "C" fn clib_add(a: i32) -> i32\nunsafe extern "C" fn clib_two() -> i32\n\npub fn value() -> i32 {\n  return unsafe clib_add(unsafe clib_two())\n}\n',
+  )
+  yield* fs.writeFileString(join(sourcesRoot, 'app/silk.toml'), '[package]\nname = "app"\nversion = "0.1.0"\nsource = "."\n\n[dependencies]\nclib = { path = "../clib" }\n')
+  yield* fs.writeFileString(join(sourcesRoot, 'app/main.silk'), 'import clib.Clib\n\npub fn main() -> i32 {\n  return Clib.value()\n}\n')
+  const compiledApp = join(sourcesRoot, 'app')
+  const sourcesEnvironment = { ...process.env, SILK_CLANG: clang }
+  const nativeCache = join(compiledApp, `build/llvm/${hostTarget}/debug/app.native`)
+  const nativeObjects = Effect.fnUntraced(function* () {
+    return (yield* fs.readDirectory(nativeCache)).filter((name) => name.endsWith('.o')).sort()
+  })
+  const sourcesRun = Effect.fnUntraced(function* (expected: number) {
+    const built = yield* invoke(silk, ['build', '--stdlib', standardLibrary, '--timings'], compiledApp, sourcesEnvironment)
+    assert.equal(built.status, 0, built.stderr)
+    const ran = yield* invoke(join(compiledApp, `build/llvm/${hostTarget}/debug/app`), [], compiledApp, sourcesEnvironment)
+    assert.equal(ran.status, expected, ran.stderr)
+    return built.stdout + built.stderr
+  })
+  const sourcesChecked = yield* invoke(silk, ['check', '--stdlib', standardLibrary], compiledApp, sourcesEnvironment)
+  assert.equal(sourcesChecked.status, 0, sourcesChecked.stderr)
+  assert.ok(!(yield* fs.exists(nativeCache)), 'a check compiles no native source')
+  yield* sourcesRun(43)
+  const firstObjects = yield* nativeObjects()
+  assert.equal(firstObjects.length, 2)
+  assert.doesNotMatch(yield* sourcesRun(43), /^\s+link\s/m, 'an unchanged rebuild neither compiles nor links')
+  yield* fs.writeFileString(join(sourcesRoot, 'clib/include/extra.h'), '#define EXTRA 5\n')
+  yield* sourcesRun(47)
+  assert.deepEqual(yield* nativeObjects(), firstObjects, 'a header edit recompiles the objects in place')
+  yield* fs.writeFileString(join(sourcesRoot, 'clib/native/two.c'), 'int clib_two(void) { return 3; }\n')
+  yield* sourcesRun(48)
+  const editedNativeObjects = (yield* nativeObjects()).filter((name) => !firstObjects.includes(name))
+  assert.equal(editedNativeObjects.length, 1, `an edit to one file compiles one object, added ${editedNativeObjects.join(', ')}`)
+  for (const [sources, rule] of [
+    ['{ c = "native/*.c", flags = ["-fplugin=evil.so"] }', /clib\/silk\.toml:9: \[native\]\.sources\[0\]: flag "-fplugin=evil\.so" is not allowed/],
+    ['{ c = "native/*.c", flags = ["-Wl,-rpath,/tmp"] }', /\[native\]\.sources\[0\]: flag "-Wl,-rpath,\/tmp" is not allowed/],
+    ['{ c = "../outside.c" }', /\[native\]\.sources\[0\]: c "\.\.\/outside\.c" must be a relative path below the manifest's directory/],
+    ['{ c = "native/*.c", include = ["/usr/include"] }', /\[native\]\.sources\[0\]: include "\/usr\/include" must be a relative path/],
+    ['{ c = "native/*.c", cpp = "native/*.cc" }', /\[native\]\.sources\[0\]: an entry names its files with exactly one of c, objc, cpp and objcpp/],
+  ] as const) {
+    yield* fs.writeFileString(join(sourcesRoot, 'clib/silk.toml'), clibManifest(sources))
+    const refusedSources = yield* invoke(silk, ['build', '--stdlib', standardLibrary], compiledApp, sourcesEnvironment)
+    assert.equal(refusedSources.status, 2, refusedSources.stderr)
+    assert.match(refusedSources.stderr, rule)
+  }
+  yield* fs.writeFileString(join(sourcesRoot, 'clib/silk.toml'), clibManifest('{ c = "native/*.zz" }'))
+  const unmatched = yield* invoke(silk, ['build', '--stdlib', standardLibrary], compiledApp, sourcesEnvironment)
+  assert.equal(unmatched.status, 1, unmatched.stderr)
+  assert.match(unmatched.stderr, /\[native\]\.sources\[0\]: the pattern .*native\/\*\.zz matches no file/)
+  yield* fs.writeFileString(join(sourcesRoot, 'clib/silk.toml'), clibManifest('{ c = "native/*.c", include = ["include"], flags = ["-DBASE=40"] }'))
+  yield* fs.writeFileString(join(sourcesRoot, 'clib/native/broken.c'), 'int broken(void) { return missing; }\n')
+  const brokenSource = yield* invoke(silk, ['build', '--stdlib', standardLibrary], compiledApp, sourcesEnvironment)
+  assert.equal(brokenSource.status, 1, brokenSource.stderr)
+  assert.match(brokenSource.stderr, /broken\.c:1:27: error: use of undeclared identifier 'missing'/)
   // `[native].function-order` places the functions it lists first in the executable's code, in its
   // order, and a change to the file alone links again. A path outside the package is refused.
   const ordered = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-ordered-' })
@@ -4077,7 +4143,7 @@ const program = Effect.gen(function* () {
   yield* refusedEmbed('shaders/missing.bin', /cannot embed "shaders\/missing\.bin": no such file in package embeds/)
   yield* refusedEmbed('../outside.bin', /cannot embed "\.\.\/outside\.bin": the path must be relative to the package's directory/)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, exports, workspaces, silk change release/history/recovery, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, cached codegen units, build replay, check replay, embedded files, object and static library artifacts and emission stages passed',
+    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, native sources, exports, workspaces, silk change release/history/recovery, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, cached codegen units, build replay, check replay, embedded files, object and static library artifacts and emission stages passed',
   )
 })
 const require = createRequire(new URL('../../package.json', import.meta.url))
