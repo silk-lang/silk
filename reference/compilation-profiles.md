@@ -295,3 +295,42 @@ as it was and makes `silk generate` exit 1. A manifest it cannot use exits 2.
 
 Generated files are committed. `silk build`, `silk check` and dependents never run an entry; they
 only refuse a malformed one, naming its manifest line.
+
+## PROFILE-009 — Build plans
+
+A package that needs more than its manifest's `[native]` keys can say puts a `build.silk` beside its
+`silk.toml`. The file declares `pub const PLAN: string`, built with `silk.build.plan` from
+`Plan.empty()`:
+
+```silk,ignore
+import silk.build.plan { Plan }
+import silk.build.source { Source }
+import silk.core.static_text { StaticText }
+
+static fn plan() -> string<'static> {
+  let mut plan = Plan.empty()
+  plan = Plan.module(plan, "generated_limit", StaticText.concat("pub const LIMIT: i32 = ", Source.text("limit.txt")))
+  plan = Plan.compileC(plan, "native/shim.c")
+  plan = Plan.linkLibrary(plan, "m")
+  return plan
+}
+
+pub const PLAN: string = plan()
+```
+
+Every build and check of the package, or of a package that depends on it, first evaluates each
+package's `build.silk` on its own: a store whose only package is that file, in the package's
+directory, importing only the standard library. The constant is computed by static evaluation, so a
+plan runs no process, reaches no network and reads only the package's own files through
+`silk.build.source`. Its steps then join the package as if written there:
+
+| Step                                                      | Effect                                                       |
+| --------------------------------------------------------- | ------------------------------------------------------------ |
+| `Plan.module(plan, name, source)`                         | Module `name` of the package, at its source root             |
+| `Plan.compileC`, `compileObjectiveC`, `compileCpp`        | A `[native].sources` entry `{ c = path }` (or `objc`, `cpp`) |
+| `Plan.linkLibrary`, `linkFramework`, `linkArchive`, `linkObject` | A `[native].link` entry                               |
+
+A dependency's plan entries reach its dependents as its manifest entries do. A plan that cannot be
+evaluated, a `PLAN` that is missing or not text `silk.build.plan` writes, and a generated module
+that a file of the package also defines each refuse the build, naming `build.silk`, after the
+diagnostics of its evaluation.

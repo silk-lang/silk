@@ -2410,6 +2410,57 @@ const program = Effect.gen(function* () {
   const misspelledGenerate = yield* generateRun([])
   assert.equal(misspelledGenerate.status, 2, misspelledGenerate.stderr)
   assert.match(misspelledGenerate.stderr, /\[\[generate\]\]\[0\]: unknown key output; an entry has only run and outputs/)
+  // A library's build.silk computes a plan during static evaluation: a module generated from a
+  // package file, a C source and a system library, which reach the executable depending on it.
+  // Editing the file it reads changes the build; a plan that cannot be read, or whose module
+  // would shadow a package file, refuses the build and names build.silk.
+  const planned = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-build-plan-' })
+  for (const member of ['plib/native', 'app']) yield* fs.makeDirectory(join(planned, member), { recursive: true })
+  yield* fs.writeFileString(
+    join(planned, 'plib/silk.toml'),
+    '[package]\nname = "plib"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Plib"]\n',
+  )
+  const planScript = (body: string) =>
+    'import silk.build.plan { Plan }\nimport silk.build.source { Source }\nimport silk.core.static_text { StaticText }\n\n'
+      + `static fn plan() -> string<'static> {\n${body}}\n\npub const PLAN: string = plan()\n`
+  const workingPlan = planScript(
+    '  let mut plan = Plan.empty()\n'
+      + '  plan = Plan.module(plan, "generated_base", StaticText.concat("pub const BASE: i32 = ", Source.text("base.txt")))\n'
+      + '  plan = Plan.compileC(plan, "native/twice.c")\n'
+      + '  plan = Plan.linkLibrary(plan, "m")\n'
+      + '  return plan\n',
+  )
+  yield* fs.writeFileString(join(planned, 'plib/build.silk'), workingPlan)
+  yield* fs.writeFileString(join(planned, 'plib/base.txt'), '20\n')
+  yield* fs.writeFileString(join(planned, 'plib/native/twice.c'), 'int plib_twice(int a) { return a * 2; }\n')
+  yield* fs.writeFileString(
+    join(planned, 'plib/Plib.silk'),
+    'import generated_base\n\nunsafe extern "C" fn plib_twice(a: i32) -> i32\n\npub fn value() -> i32 {\n  return unsafe plib_twice(generated_base.BASE) + 1\n}\n',
+  )
+  yield* fs.writeFileString(join(planned, 'app/silk.toml'), '[package]\nname = "app"\nversion = "0.1.0"\nsource = "."\n\n[dependencies]\nplib = { path = "../plib" }\n')
+  yield* fs.writeFileString(join(planned, 'app/main.silk'), 'import plib.Plib\n\npub fn main() -> i32 {\n  return Plib.value()\n}\n')
+  const plannedApp = join(planned, 'app')
+  const planRun = Effect.fnUntraced(function* (expected: number) {
+    const built = yield* invoke(silk, ['build', '--stdlib', standardLibrary], plannedApp, sourcesEnvironment)
+    assert.equal(built.status, 0, built.stderr)
+    const ran = yield* invoke(join(plannedApp, `build/llvm/${hostTarget}/debug/app`), [], plannedApp, sourcesEnvironment)
+    assert.equal(ran.status, expected, ran.stderr)
+  })
+  yield* planRun(41)
+  yield* fs.writeFileString(join(planned, 'plib/base.txt'), '30\n')
+  yield* planRun(61)
+  for (const [script, rule] of [
+    ['pub const OTHER: i32 = 1\n', /plib\/build\.silk: build\.silk computes no plan: it must declare `pub const PLAN: string`/],
+    ['pub const PLAN: string = "silk-plan 2\\n"\n', /plib\/build\.silk: build\.silk computes no plan: `PLAN` is not a plan/],
+    [planScript('  return Plan.module(Plan.empty(), "a.b", "")\n'), /error\[SEM0177\] a generated module name is one path segment/],
+    [planScript('  return Plan.module(Plan.empty(), "missing", Source.text("absent.txt"))\n'), /error\[SEM0176\] .*cannot embed "absent\.txt"/],
+    [planScript('  return Plan.module(Plan.empty(), "Plib", "")\n'), /its module `Plib` would shadow the package's file .*plib\/Plib\.silk/],
+  ] as const) {
+    yield* fs.writeFileString(join(planned, 'plib/build.silk'), script)
+    const refusedPlan = yield* invoke(silk, ['build', '--stdlib', standardLibrary], plannedApp, sourcesEnvironment)
+    assert.equal(refusedPlan.status, 1, refusedPlan.stderr)
+    assert.match(refusedPlan.stderr, rule)
+  }
   // `[native].function-order` places the functions it lists first in the executable's code, in its
   // order, and a change to the file alone links again. A path outside the package is refused.
   const ordered = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-ordered-' })
