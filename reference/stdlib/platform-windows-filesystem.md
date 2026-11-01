@@ -5,14 +5,15 @@
 Handle-relative filesystem operations for the Windows `OsFileSystem` provider.
 
 ## Details
-Portable paths remain relative to the provider root. Native roots use absolute drive paths,
-such as `C:\\work`. Names use canonical WTF-8 bytes and preserve lone UTF-16 surrogates.
+Portable paths remain relative to the provider root. Native roots use absolute drive or UNC
+paths, such as `C:\\work` or `\\\\server\\share`. Names use canonical WTF-8 and preserve lone surrogates.
 Each component opens without kernel reparse traversal. Relative symbolic links resolve through
 retained directory handles; `..` stops at the provider root. Absolute symbolic links and junctions
 must name that native root or a descendant, with matching component spelling except drive-letter
 case. Other absolute targets and unknown tags are unsupported. At most 40 links resolve per path.
 Listings classify symbolic links and junctions as links; final removal and replacement act on the link.
-Operations require a local NTFS volume. Directory synchronization is unsupported.
+Operations require NTFS. Remote publication is refused before staging; deletion reports
+`Unsupported` when the server lacks POSIX disposition. Directory synchronization is unsupported.
 
 Public declarations: 0.
 

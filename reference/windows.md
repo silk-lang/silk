@@ -76,18 +76,20 @@ machine namespace uses `/C:/work/project`; ordinary confined filesystem paths st
 Host paths preserve canonical WTF-8, including unpaired UTF-16 surrogates. Directory listings
 preserve names and case; paths are not globally lowercased.
 
-The current native filesystem provider requires local NTFS. Relative symbolic links resolve
+The native filesystem provider requires NTFS. Relative symbolic links resolve
 through retained directory handles, with `..` stopping at the provider root. Absolute symbolic
 links and junctions must name that root or a descendant, with matching component spelling except
 drive-letter case. Other absolute targets, differently spelled root aliases, and unknown reparse
 tags report `Unsupported`. Resolution stops after 40 links with `InvalidPath`.
 
-UNC and device roots, non-NTFS filesystems, and directory durability remain explicit unsupported
-outcomes. Deleting or atomically replacing a final symlink or junction acts on the link itself.
-The UNC spelling is accepted by host-path conversion, but filesystem operations refuse it:
-the tested Windows SMB redirector rejected the required POSIX rename and delete information
-classes even when the share reported NTFS. The provider does not substitute legacy operations
-with different sharing and retained-handle behavior.
+UNC roots use `/UNC/server/share/...` in the machine namespace and `\\server\share` as a
+confined provider's native root. Reads, writes, exclusive creation, stat, directory creation, and
+listing are supported. Remote atomic publication reports `Unsupported` before staging, and
+deletion requires the server's POSIX disposition support. The tested Windows SMB redirector
+rejected those rename/delete classes even though it reported NTFS; the provider does not
+substitute legacy operations with different sharing and retained-handle behavior.
+Device roots, non-NTFS filesystems, and directory durability remain explicit unsupported outcomes.
+Deleting or atomically replacing a final symlink or junction acts on the link itself.
 Windows directories can be case sensitive, so blindly lowercasing names would merge distinct
 files. Path bytes retain their case; host canonicalization obtains the final path from an open
 handle. These restrictions are separate from the validated native compiler and release chain.

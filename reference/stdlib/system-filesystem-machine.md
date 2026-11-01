@@ -6,7 +6,7 @@ A filesystem provider for absolute paths in the host machine namespace.
 
 ## When to use
 Use `MachineFileSystem` in host tools that must access more than one directory.
-Unix paths use `/...`; Windows drive paths use `/C:/...`. This provider is not confined
+Unix paths use `/...`; Windows paths use `/C:/...` or `/UNC/server/share/...`. This provider is not confined
 to an application directory. Use `OsFileSystem` for a confined root instead.
 
 Import as `MachineFileSystem` with `import silk.system.filesystem_machine { MachineFileSystem }`.
@@ -25,15 +25,16 @@ The native filesystem in the absolute machine namespace.
 
 ### Details
 
-Unix paths retain their absolute spelling. Windows paths select a drive explicitly,
-such as `/C:/work/main.silk`; drive letters are case insensitive and other bytes retain
-their case and canonical WTF-8 spelling. Windows requires local NTFS. Relative symbolic links
-resolve inside their drive; absolute symbolic links and junctions must name that drive with
-matching spelling except drive-letter case. Unknown reparse tags, other-drive targets, UNC
-roots, directory synchronization, and synchronized publication are unsupported. Resolution
-stops after 40 links with `InvalidPath`.
+Unix paths retain their absolute spelling. Windows paths select a drive or UNC share,
+such as `/C:/work/main.silk` or `/UNC/server/share/main.silk`; drive letters are case insensitive
+and other bytes retain their case and canonical WTF-8 spelling. Windows requires NTFS.
+Relative symbolic links resolve inside their drive or share; absolute links must name that root
+with matching spelling except drive-letter case. Unknown reparse tags and other-root targets
+are unsupported. Resolution stops after 40 links with `InvalidPath`. Remote atomic publication,
+directory synchronization, and synchronized publication are unsupported; deletion requires
+the server's POSIX disposition support. Ordinary UNC reads, writes, creation, and listing are supported.
 The path `/` has no Windows volume and fails with `InvalidPath`.
-Each drive retains its own temporary-name counter for the provider's lifetime.
+Each drive or share retains its own temporary-name counter for the provider's lifetime.
 
 <a id="MachineFileSystem.impl"></a>
 

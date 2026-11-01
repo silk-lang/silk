@@ -34,9 +34,11 @@ not promise that data survives a power loss.
 
 On WASI, roots name preopened guest directories. The host controls rights, file permissions, and synchronization support.
 
-On Windows, roots are normalized absolute drive paths, such as `C:\work`, separate from portable `Path` values.
-Root bytes and path bytes must be canonical WTF-8. UNC and device roots are unsupported.
-The provider requires local NTFS, preserves case, and inherits permissions for new files.
+On Windows, roots are normalized absolute drive or UNC paths, such as `C:\work` or `\\server\share`, separate from portable `Path` values.
+Root bytes and path bytes must be canonical WTF-8. Device roots are unsupported.
+The provider requires NTFS, preserves case, and inherits permissions for new files.
+UNC supports ordinary reads, writes, creation, inspection, and listing. Remote atomic publication is
+refused before staging; deletion requires server support for POSIX disposition and otherwise fails.
 Buffered publication uses one handle rename; create-only publication never replaces an existing entry.
 Known final links can be listed, removed, or replaced. Unknown reparse tags are unsupported.
 Directory synchronization and synchronized publication fail with `Unsupported` before publication.
@@ -174,14 +176,15 @@ pub effect fn make(root: string) -> OsFileSystem ! OutOfMemoryError ? &mut Alloc
 ```
 
 Returns a provider with a copy of the text `root` as its root directory. It does not open the directory.
-Unix roots include `"/tmp"`. Windows roots use normalized absolute drive paths, such as `"C:\\work"`.
+Unix roots include `"/tmp"`. Windows roots use normalized absolute drive or UNC paths, such as `"C:\\work"` or `"\\\\server\\share"`.
 
 #### Errors
 `OutOfMemoryError` if the copy cannot be allocated.
 
 #### Gotchas
 `root` must be an absolute host path, not empty, with no NUL. Other values trap.
-Windows rejects UNC, device, verbatim, slash-rooted, and drive-relative paths, plus empty, `.` or `..` components.
+Windows rejects device, verbatim, slash-rooted, and drive-relative paths, plus empty, `.` or `..` components.
+UNC requires both a server and a share. Remote publication is unsupported; deletion needs POSIX server support.
 A Windows root uses backslashes and has no trailing separator, except at the drive root.
 
 <a id="OsFileSystem.impl.makeBytes"></a>
@@ -205,8 +208,9 @@ Use it for a root that you got from the host as bytes, such as the working direc
 
 #### Gotchas
 `root` must be an absolute host path, not empty, with no NUL. Other values trap.
-Windows requires a normalized absolute drive path with backslashes, such as `C:\work`.
-UNC, device, verbatim, slash-rooted, and drive-relative roots are rejected, as are noncanonical WTF-8 bytes.
+Windows requires a normalized absolute drive or UNC path with backslashes, such as `C:\work` or `\\server\share`.
+Device, verbatim, slash-rooted, and drive-relative roots are rejected, as are noncanonical WTF-8 bytes.
+UNC requires both a server and a share. Remote publication is unsupported; deletion needs POSIX server support.
 Empty, `.` and `..` components and trailing separators are rejected, except the separator at the drive root.
 
 <a id="OsFileSystem.impl.FileSystem"></a>

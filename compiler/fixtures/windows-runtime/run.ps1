@@ -46,6 +46,7 @@ foreach ($name in $Programs) {
       } else {
         $filesystemOutput = Join-Path $artifact 'filesystem-native'
         & (Join-Path $PSScriptRoot '../windows-filesystem/run.ps1') -SilkExecutable $executable `
+          -UncSilkExecutable (Join-Path $artifact 'windows-filesystem/unc-provider.exe') `
           -LlvmBin $LlvmBin -OutputDirectory $filesystemOutput | Out-Host
         $detail = Get-Content -Raw -LiteralPath (Join-Path $filesystemOutput 'results.json')
       }

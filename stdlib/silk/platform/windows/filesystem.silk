@@ -1,14 +1,15 @@
 //! Handle-relative filesystem operations for the Windows `OsFileSystem` provider.
 //!
 //! # Details
-//! Portable paths remain relative to the provider root. Native roots use absolute drive paths,
-//! such as `C:\\work`. Names use canonical WTF-8 bytes and preserve lone UTF-16 surrogates.
+//! Portable paths remain relative to the provider root. Native roots use absolute drive or UNC
+//! paths, such as `C:\\work` or `\\\\server\\share`. Names use canonical WTF-8 and preserve lone surrogates.
 //! Each component opens without kernel reparse traversal. Relative symbolic links resolve through
 //! retained directory handles; `..` stops at the provider root. Absolute symbolic links and junctions
 //! must name that native root or a descendant, with matching component spelling except drive-letter
 //! case. Other absolute targets and unknown tags are unsupported. At most 40 links resolve per path.
 //! Listings classify symbolic links and junctions as links; final removal and replacement act on the link.
-//! Operations require a local NTFS volume. Directory synchronization is unsupported.
+//! Operations require NTFS. Remote publication is refused before staging; deletion reports
+//! `Unsupported` when the server lacks POSIX disposition. Directory synchronization is unsupported.
 //!
 //! @category Windows platform
 
@@ -198,13 +199,13 @@ effect fn requireKind(raw: ?*mut u8, expected: i32, operation: i32) -> () ! File
 fn word(bytes: &[u8], offset: usize) -> u32 {
   return u8.toU32(bytes[offset]) + u8.toU32(bytes[offset + 1]) * 256 + u8.toU32(bytes[offset + 2]) * 65536 + u8.toU32(bytes[offset + 3]) * 16777216
 }
-effect fn localNtfs(raw: ?*mut u8, operation: i32) -> () ! FileError {
+effect fn ntfs(raw: ?*mut u8, operation: i32) -> () ! FileError {
   let mut storage: [u64; 16] = [0; 16]
   let pointer = unsafe Intrinsic.pointerReinterpret<*mut u64, *mut u8>(Pointer.fromMutRef(&mut storage[0]))
   let mut io = emptyIo()
   run strictStatus(unsafe NtQueryVolumeInformationFile(raw, Pointer.fromMutRef(&mut io), pointer, 128, 4), operation)
   let device = unsafe Pointer.borrowMany(&storage, unsafe Pointer.assumeMany(pointer), 8)
-  if word(device, 0) != 7 || (word(device, 4) & 16) != 0 { return run logical(operation, FileSystem.unsupported()) }
+  if word(device, 0) != 7 { return run logical(operation, FileSystem.unsupported()) }
   drop device
   run strictStatus(unsafe NtQueryVolumeInformationFile(raw, Pointer.fromMutRef(&mut io), pointer, 128, 5), operation)
   if io.information < 20 { return run logical(operation, FileSystem.unsupported()) }
@@ -213,23 +214,40 @@ effect fn localNtfs(raw: ?*mut u8, operation: i32) -> () ! FileError {
     return run logical(operation, FileSystem.unsupported())
   }
 }
+
+// SMB can report NTFS while refusing POSIX rename/delete. Refuse publication before staging;
+// ordinary reads, writes, creation, and inspection do not require those information classes.
+effect fn localPublication(raw: ?*mut u8, operation: i32) -> () ! FileError {
+  let mut device: [u32; 2] = [0, 0]
+  let mut io = emptyIo()
+  let pointer = unsafe Intrinsic.pointerReinterpret<*mut u32, *mut u8>(Pointer.fromMutRef(&mut device[0]))
+  run strictStatus(unsafe NtQueryVolumeInformationFile(raw, Pointer.fromMutRef(&mut io), pointer, 8, 4), operation)
+  if (device[1] & 16) != 0 { return run logical(operation, FileSystem.unsupported()) }
+}
 effect fn rootHandle(root: &[u8], operation: i32) -> Handle ! FileError {
   if !WindowsFileSystem.validRootBytes(root) { return run logical(operation, FileSystem.invalidPath()) }
   // Counted NT names avoid Win32 normalization and the MAX_PATH boundary.
   let units = run wide(root, operation)
   let mut buffer: [u16; 32767] = [0; 32767]
   let view = List<u16>.asSlice(&units)
-  if view.length > 32763 { return run logical(operation, FileSystem.tooLarge()) }
+  let remote = root[0] == 92
+  let prefix: usize = if remote { 8 } else { 4 }
+  let skipped: usize = if remote { 2 } else { 0 }
+  if view.length > 32767 - prefix + skipped { return run logical(operation, FileSystem.tooLarge()) }
   buffer[0] = 92
   buffer[1] = 63
   buffer[2] = 63
   buffer[3] = 92
-  let mut at: usize = 0
-  while at < view.length { buffer[4 + at] = view[at]
+  if remote { buffer[4] = 85
+    buffer[5] = 78
+    buffer[6] = 67
+    buffer[7] = 92 }
+  let mut at = skipped
+  while at < view.length { buffer[prefix + at - skipped] = view[at]
     at = at + 1 }
-  let result = run openAt(Pointer.null<u8>(), Slice.view(&buffer, 0, view.length + 4), 128, 1, 1, operation)
+  let result = run openAt(Pointer.null<u8>(), Slice.view(&buffer, 0, view.length + prefix - skipped), 128, 1, 1, operation)
   run requireKind(result.raw, 1, operation)
-  run localNtfs(result.raw, operation)
+  run ntfs(result.raw, operation)
   return move result
 }
 struct LinkTarget { path: Bytes, absolute: bool }
@@ -268,22 +286,28 @@ effect fn linkTarget(handle: &Handle, root: &[u8], operation: i32) -> LinkTarget
   if !canonical(text) { return run logical(operation, FileSystem.invalidPath()) }
   let mut start: usize = 0
   if absolute {
-    if text.length < root.length + 4 || text[0] != 92 || text[1] != 63 || text[2] != 63 || text[3] != 92 {
+    let remote = root[0] == 92
+    let prefix: usize = if remote { 8 } else { 4 }
+    let skipped: usize = if remote { 2 } else { 0 }
+    if text.length < root.length + prefix - skipped || text[0] != 92 || text[1] != 63 || text[2] != 63 || text[3] != 92 {
       return run logical(operation, FileSystem.unsupported())
     }
-    let mut at: usize = 0
+    if remote && (text[4] != 85 || text[5] != 78 || text[6] != 67 || text[7] != 92) {
+      return run logical(operation, FileSystem.unsupported())
+    }
+    let mut at = skipped
     while at < root.length {
-      let mut actual = text[at + 4]
+      let mut actual = text[at + prefix - skipped]
       let mut expected = root[at]
       // Drive letters are case-insensitive; other components retain their exact spelling.
-      if at == 0 {
+      if !remote && at == 0 {
         if actual >= 97 && actual <= 122 { actual = actual - 32 }
         if expected >= 97 && expected <= 122 { expected = expected - 32 }
       }
       if actual != expected { return run logical(operation, FileSystem.unsupported()) }
       at = at + 1
     }
-    start = root.length + 4
+    start = root.length + prefix - skipped
     if start < text.length && root[root.length - 1] != 92 {
       if text[start] != 92 { return run logical(operation, FileSystem.unsupported()) }
       start = start + 1
@@ -477,6 +501,7 @@ fn stageAlias(name: &[u8], destination: &[u16]) -> bool {
   return true
 }
 effect fn publish(owner: &mut Publication, bytes: &[u8], policy: i32, counter: &mut u64) -> () ! FileError {
+  run localPublication(owner.parent.handle.raw, 10)
   if policy == 0 {
     // Type validation only; the single rename below decides replacement atomically.
     let inspected = run Effect.result(openAt(owner.parent.handle.raw, List<u16>.asSlice(&owner.parent.name), 128, 1, 0, 10))
@@ -538,7 +563,7 @@ effect fn rejectAtomic(error: FileError) -> never ! AtomicWriteError {
   fail AtomicWriteError { published: false, cause: move error, cleanupError: Option<FileError>.none(), stagingName: Bytes.make() }
 }
 
-/// Strict local-NTFS operations for `OsFileSystem`, with no C runtime dependency.
+/// Handle-relative NTFS operations for `OsFileSystem`, with no C runtime dependency.
 ///
 /// # Details
 ///
@@ -547,29 +572,40 @@ effect fn rejectAtomic(error: FileError) -> never ! AtomicWriteError {
 /// parent components stop at it. Absolute symlink and junction targets must name the same native root
 /// or a descendant, with matching component spelling except drive-letter case. Other absolute targets,
 /// unknown tags, and directory synchronization are unsupported. More than 40 links fails with `InvalidPath`.
+/// UNC roots support ordinary reads, writes, creation, inspection, and listing. Remote atomic publication
+/// is refused before staging; deletion requires the server's POSIX disposition support and otherwise fails.
 /// The intended minimum is Windows 10 1809; native fixtures currently target Server 2025 build 26100.
 pub struct WindowsFileSystem {}
 impl WindowsFileSystem {
-  /// Returns whether bytes are a canonical WTF-8 absolute drive path with normalized backslash components.
+  /// Returns whether bytes are a canonical WTF-8 absolute drive or server/share UNC path with normalized backslash components.
   ///
-  /// UNC, device, verbatim, drive-relative, and slash-rooted names are rejected. Case is preserved.
+  /// Device, verbatim, drive-relative, and slash-rooted names are rejected. UNC requires a server and share.
+  /// Case is preserved; empty, `.` and `..` components and trailing separators except drive roots are rejected.
   pub fn validRootBytes(root: &[u8]) -> bool {
     if root.length < 3 || !canonical(root) { return false }
-    if !((root[0] >= 65 && root[0] <= 90) || (root[0] >= 97 && root[0] <= 122)) { return false }
-    if root[1] != 58 || root[2] != 92 { return false }
-    if root.length == 3 { return true }
     let mut start: usize = 3
-    let mut at: usize = 3
+    let remote = root[0] == 92 && root[1] == 92
+    if remote {
+      if root[2] == 63 || root[2] == 46 { return false }
+      start = 2
+    } else {
+      if !((root[0] >= 65 && root[0] <= 90) || (root[0] >= 97 && root[0] <= 122)) { return false }
+      if root[1] != 58 || root[2] != 92 { return false }
+      if root.length == 3 { return true }
+    }
+    let mut parts: usize = 0
+    let mut at = start
     while at <= root.length {
       let mut boundary = at == root.length
       if at < root.length { boundary = root[at] == 92 }
       if boundary {
         if !component(Slice.view(root, start, at - start)) { return false }
+        parts = parts + 1
         start = at + 1
       }
       at = at + 1
     }
-    return true
+    return !remote || parts >= 2
   }
 
   /// Opens a regular file for reading, or creates and truncates it for writing, following confined links.
@@ -623,6 +659,7 @@ impl WindowsFileSystem {
     return run finish(move primary)
   }
   /// Publishes complete bytes through one handle rename: policy 0 replaces, and policy 1 creates only.
+  /// Remote volumes fail with `Unsupported` before a staging file is created.
   ///
   /// # Details
   ///

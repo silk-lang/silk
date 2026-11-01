@@ -2,9 +2,11 @@
 
 Machine paths use `/C:/...`, distinct from an OsFileSystem provider's confined `/`.
 `MachineFileSystem` selects a persistent per-drive provider, preserving its temporary-name counter.
-It requires local NTFS. Symbolic links and junctions resolve within the selected drive through
-retained directory handles; other-drive targets, unknown reparse tags, and UNC operations are
-unsupported. See the filesystem fixture for the confined traversal contract.
+It requires NTFS. Drive and UNC share roots retain their own provider and temporary-name counter.
+Symbolic links and junctions resolve within the selected root through retained directory handles;
+other-root targets and unknown reparse tags are unsupported. UNC reads, writes, creation, stat,
+and listing are supported. Remote atomic publication is refused before staging, and deletion
+requires server POSIX disposition support. See the filesystem fixture for the complete contract.
 WindowsPath resolution preserves canonical WTF-8, normalizes relative components within a volume,
 and rejects drive-relative names. A relative compiler path across volumes becomes absolute.
 

@@ -39,4 +39,13 @@ if grep -i 'Name: .*\.dll' "$out/provider-pe.txt" | grep -viE 'Name: (kernel32|n
   echo 'Unexpected DLL dependency in filesystem provider' >&2
   exit 1
 fi
-printf '%s\n' 'Built provider.exe; execution remains not-checked until run.ps1 -SilkExecutable.'
+cp "$repo/compiler/fixtures/windows-filesystem/unc-provider.silk" "$out/package/src/main.silk"
+"$compiler" build "$out/package/src/main.silk" -o "$out/unc-provider.exe" --target x86_64-pc-windows-msvc \
+  --stdlib "$repo/stdlib" --clang "$clang" --optimization none --debug false \
+  > "$out/unc-provider-build.log" 2>&1 || { cat "$out/unc-provider-build.log"; exit 1; }
+llvm-readobj --file-headers --coff-imports "$out/unc-provider.exe" > "$out/unc-provider-pe.txt"
+if grep -i 'Name: .*\.dll' "$out/unc-provider-pe.txt" | grep -viE 'Name: (kernel32|ntdll)\.dll'; then
+  echo 'Unexpected DLL dependency in UNC filesystem provider' >&2
+  exit 1
+fi
+printf '%s\n' 'Built provider.exe and unc-provider.exe; native execution remains not-checked.'

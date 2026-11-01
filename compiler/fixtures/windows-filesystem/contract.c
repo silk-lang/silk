@@ -147,6 +147,17 @@ uint32_t FsFixtureSetup(uint8_t *bytes,uint32_t capacity) {
   for(uint32_t i=0;i<n;++i) { CHECK(native[i]<128); bytes[i]=(uint8_t)native[i]; }
   return n;
 }
+uint32_t FsFixtureUncRoot(uint8_t *bytes,uint32_t capacity) {
+  const char prefix[]="\\\\localhost\\";
+  uint32_t p=(uint32_t)sizeof(prefix)-1,at=0;
+  CHECK(base_len>3&&base[1]==':'&&capacity>p+base_len+6);
+  for(;at<p;++at) bytes[at]=(uint8_t)prefix[at];
+  bytes[at++]=(uint8_t)base[0];bytes[at++]='$';
+  for(uint32_t i=2;i<base_len;++i) {CHECK(base[i]<128);bytes[at++]=(uint8_t)base[i];}
+  const char suffix[]="\\root";
+  for(uint32_t i=0;i<sizeof(suffix)-1;++i) bytes[at++]=(uint8_t)suffix[i];
+  return at;
+}
 static void make_junction(const WCHAR *name, const WCHAR *destination) {
   CHECK(CreateDirectoryW(path(name),0));
   HANDLE junction=win_open(name,0x40000000,7,3,0x02200000);

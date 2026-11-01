@@ -34,9 +34,11 @@ not promise that data survives a power loss.
 
 On WASI, roots name preopened guest directories. The host controls rights, file permissions, and synchronization support.
 
-On Windows, roots are normalized absolute drive paths, such as `C:\work`, separate from portable `Path` values.
-Root bytes and path bytes must be canonical WTF-8. UNC and device roots are unsupported.
-The provider requires local NTFS, preserves case, and inherits permissions for new files.
+On Windows, roots are normalized absolute drive or UNC paths, such as `C:\work` or `\\server\share`, separate from portable `Path` values.
+Root bytes and path bytes must be canonical WTF-8. Device roots are unsupported.
+The provider requires NTFS, preserves case, and inherits permissions for new files.
+UNC supports ordinary reads, writes, creation, inspection, and listing. Remote atomic publication is
+refused before staging; deletion requires server support for POSIX disposition and otherwise fails.
 Buffered publication uses one handle rename; create-only publication never replaces an existing entry.
 Known final links can be listed, removed, or replaced. Unknown reparse tags are unsupported.
 Directory synchronization and synchronized publication fail with `Unsupported` before publication.

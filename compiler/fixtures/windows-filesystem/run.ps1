@@ -2,6 +2,7 @@ param(
   [string]$LlvmBin = "$env:USERPROFILE\silk-windows-tools\clang+llvm-22.1.8-x86_64-pc-windows-msvc\bin",
   [string]$OutputDirectory = "$PSScriptRoot\..\..\..\.scratch\windows-filesystem",
   [string]$SilkExecutable = '',
+  [string]$UncSilkExecutable = '',
   [switch]$ProbeUnc
 )
 $ErrorActionPreference = 'Stop'
@@ -46,7 +47,7 @@ function Run-Case([string]$Executable, [string]$Name) {
 }
 Run-Case "$out\contract.exe" 'contract'
 $results = @(@{ status = 'pass'; claim = 'independent NT filesystem contracts on local NTFS'; evidence = 'contract.stdout.txt' })
-if ($ProbeUnc) {
+if ($ProbeUnc -or $UncSilkExecutable) {
   Invoke-Tool 'clang' @('--target=x86_64-pc-windows-msvc', '-O2', '-ffreestanding', '-fno-stack-protector', '-Wall', '-Wextra', '-Werror', '-DREMOTE_CONTRACT_MAIN', '-c', "$PSScriptRoot\contract.c", '-o', "$out\unc.obj")
   Invoke-Tool 'lld-link' @('/nologo', '/nodefaultlib', '/machine:x64', '/subsystem:console', '/entry:mainCRTStartup', "/out:$out\unc.exe", "$out\unc.obj", "$out\kernel32.lib", "$out\ntdll.lib")
   Run-Case "$out\unc.exe" 'unc-capabilities'
@@ -58,6 +59,10 @@ if ($SilkExecutable) {
 } else {
   Write-Output 'NOT-CHECKED: Silk provider execution; pass -SilkExecutable with the cross-linked provider fixture.'
   $results += @{ status = 'not-checked'; claim = 'Silk filesystem provider integration'; reason = 'No cross-linked provider executable supplied.' }
+}
+if ($UncSilkExecutable) {
+  Run-Case (Resolve-Path -LiteralPath $UncSilkExecutable).Path 'unc-provider'
+  $results += @{ status = 'pass'; claim = 'Silk UNC read/write/create/stat/list routing and mutation refusal'; evidence = 'unc-provider.stdout.txt' }
 }
 $results += @{ status = 'not-checked'; claim = 'Windows 10 minimum, non-NTFS rejection, ACLs, unknown reparse tags, concurrent publication, injected close failures'; reason = 'Not covered by this focused native fixture.' }
 $results | ConvertTo-Json | Set-Content -Encoding UTF8 "$out\results.json"

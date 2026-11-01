@@ -5,14 +5,15 @@
 Handle-relative filesystem operations for the Windows `OsFileSystem` provider.
 
 ## Details
-Portable paths remain relative to the provider root. Native roots use absolute drive paths,
-such as `C:\\work`. Names use canonical WTF-8 bytes and preserve lone UTF-16 surrogates.
+Portable paths remain relative to the provider root. Native roots use absolute drive or UNC
+paths, such as `C:\\work` or `\\\\server\\share`. Names use canonical WTF-8 and preserve lone surrogates.
 Each component opens without kernel reparse traversal. Relative symbolic links resolve through
 retained directory handles; `..` stops at the provider root. Absolute symbolic links and junctions
 must name that native root or a descendant, with matching component spelling except drive-letter
 case. Other absolute targets and unknown tags are unsupported. At most 40 links resolve per path.
 Listings classify symbolic links and junctions as links; final removal and replacement act on the link.
-Operations require a local NTFS volume. Directory synchronization is unsupported.
+Operations require NTFS. Remote publication is refused before staging; deletion reports
+`Unsupported` when the server lacks POSIX disposition. Directory synchronization is unsupported.
 
 Import as `WindowsFileSystem` with `import silk.platform.windows.filesystem { WindowsFileSystem }`.
 
@@ -46,7 +47,7 @@ An owned directory handle with one pending counted name. Drop closes it once.
 pub struct WindowsFileSystem
 ```
 
-Strict local-NTFS operations for `OsFileSystem`, with no C runtime dependency.
+Handle-relative NTFS operations for `OsFileSystem`, with no C runtime dependency.
 
 ### Details
 
@@ -55,6 +56,8 @@ Handles allow read, write, and delete sharing. Relative link targets stay inside
 parent components stop at it. Absolute symlink and junction targets must name the same native root
 or a descendant, with matching component spelling except drive-letter case. Other absolute targets,
 unknown tags, and directory synchronization are unsupported. More than 40 links fails with `InvalidPath`.
+UNC roots support ordinary reads, writes, creation, inspection, and listing. Remote atomic publication
+is refused before staging; deletion requires the server's POSIX disposition support and otherwise fails.
 The intended minimum is Windows 10 1809; native fixtures currently target Server 2025 build 26100.
 
 <a id="WindowsFileSystem.impl"></a>
@@ -73,9 +76,10 @@ impl WindowsFileSystem
 pub fn validRootBytes(root: &[u8]) -> bool
 ```
 
-Returns whether bytes are a canonical WTF-8 absolute drive path with normalized backslash components.
+Returns whether bytes are a canonical WTF-8 absolute drive or server/share UNC path with normalized backslash components.
 
-UNC, device, verbatim, drive-relative, and slash-rooted names are rejected. Case is preserved.
+Device, verbatim, drive-relative, and slash-rooted names are rejected. UNC requires a server and share.
+Case is preserved; empty, `.` and `..` components and trailing separators except drive roots are rejected.
 
 <a id="WindowsFileSystem.impl.openFile"></a>
 
@@ -132,6 +136,7 @@ pub effect fn writeFileAtomic(root: &[u8], path: &[u8], bytes: &[u8], policy: i3
 ```
 
 Publishes complete bytes through one handle rename: policy 0 replaces, and policy 1 creates only.
+Remote volumes fail with `Unsupported` before a staging file is created.
 
 #### Details
 

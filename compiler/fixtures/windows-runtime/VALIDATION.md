@@ -51,10 +51,12 @@ handles, signed installation, and source-generated executable behavior.
 
 ## Deliberate limits
 
-- Filesystem roots require local NTFS. Confined symbolic links and junctions are supported;
-  UNC/device/non-NTFS roots, unknown reparse tags, and directory durability are unsupported.
-  The optional SMB probe records why NTFS naming alone does not establish the required rename
-  and delete contracts. No weaker fallback is used.
+- Filesystem roots require NTFS. Confined symbolic links and junctions are supported. The
+  subsequent UNC fixture passes reads, writes, creation, stat, and listing through both providers
+  (`.scratch/windows-filesystem-combined-unc/results.json`). Remote atomic publication is refused
+  before staging; deletion needs server POSIX disposition support. Device/non-NTFS roots,
+  unknown reparse tags, and directory durability are unsupported. The SMB probe establishes
+  why NTFS naming alone does not establish rename/delete contracts. No weaker fallback is used.
 - Windows semantic cache writes are synchronous. `CACHE-WRITER.md` records the real detached
   reconstruction experiment supporting the plan's permitted fallback.
 - Windows ARM64 and DLL output are outside this target. Windows 10 has not been validated.

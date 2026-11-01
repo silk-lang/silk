@@ -6,17 +6,18 @@ listing, directory creation/removal, temporary directories, and buffered atomic 
 Relative symbolic links resolve within the provider root. Absolute symbolic links and junctions
 resolve only when their native target names that root or a descendant.
 
-The intended floor is Windows 10 1809 with local NTFS. The native oracle has passed on
+The intended floor is Windows 10 1809 with NTFS. The native oracle has passed on
 **Windows Server 2025 Datacenter Evaluation, 10.0.26100, x86-64**, with stock LLVM 22.1.8.
 The Windows 10 floor itself and other Windows versions remain **not checked**. The Silk provider
 has compiled and executed on Server 2025. No security, Developer Mode, or antivirus settings were changed.
 
 ## Boundaries
 
-- `Path("/")` still means the provider root. `OsFileSystem.make("C:\\work")` supplies a
+- `Path("/")` still means the provider root. `OsFileSystem.make("C:\\work")` or a UNC
+  `OsFileSystem.make("\\\\server\\share")` supplies a
   separate host root. `makeBytes` accepts canonical WTF-8; it never converts raw host values
   to a UTF-8 `string`. Invalid constructor roots trap, consistent with the existing constructor.
-- Roots use normalized absolute drive paths, with backslash separators. UNC, device, verbatim,
+- Roots use normalized absolute drive or server/share UNC paths, with backslash separators. Device, verbatim,
   volume-GUID, drive-relative and slash-rooted inputs are rejected. Native-root normalization,
   drive selection, and translation from compiler host paths are supplied by `WindowsPath` and
   `MachineFileSystem`; their fixtures cover the native compiler boundary.
@@ -25,8 +26,9 @@ has compiled and executed on Server 2025. No security, Developer Mode, or antivi
   fail with `InvalidPath`. Trailing dots/spaces use counted NT-name semantics, not Win32 trimming.
 - The root and its ancestors are trusted, as in the existing provider. Each operation opens
   and holds the root and traverses below it with one-component `NtCreateFile` calls relative
-  to parent handles. Root-volume queries reject remote devices and filesystem names other
-  than NTFS. Names are never lowercased; `OBJ_CASE_INSENSITIVE` is absent.
+  to parent handles. Root-volume queries reject filesystem names other than NTFS. Remote roots
+  permit ordinary operations; atomic publication is refused before staging, and deletion requires
+  POSIX server support. Names are never lowercased; `OBJ_CASE_INSENSITIVE` is absent.
 - All opens share read, write, and delete access. Access rights depend on the operation.
   Reparse points are opened themselves and read with `FSCTL_GET_REPARSE_POINT`. Relative target
   components resolve through retained directory handles; `..` stops at the root. Absolute NT
@@ -83,12 +85,12 @@ links for recursive cleanup nor changes system security. The oracle proves:
 
 ## UNC capability boundary
 
-The host-path codec accepts `/UNC/server/share/...`, but this provider deliberately refuses
-remote roots. On Windows Server 2025 build 26100, a localhost administrative share reported
+The host-path codec and machine provider route `/UNC/server/share/...` to a retained share
+provider. On Windows Server 2025 build 26100, a localhost administrative share reported
 NTFS and accepted root-relative reads and writes, yet both class-65 POSIX rename modes and
 class-64 POSIX delete returned `STATUS_INVALID_PARAMETER` (`0xc000000d`). The same operations
-pass on the local volume. Removing the remote-volume check would therefore break the retained
-handle and atomic-publication contract; legacy rename/delete are not equivalent substitutes.
+pass on the local volume. Remote publication is therefore refused before staging. Deletion
+reports `Unsupported` when the server refuses POSIX disposition; legacy operations are not substitutes.
 
 The existing C fixture includes an opt-in observation mode:
 
@@ -102,9 +104,18 @@ reported unsupported outcome. The runner records native statuses as observations
 provider coverage or a claim about every SMB server. Local evidence is retained in
 `.scratch/windows-filesystem-unc-evidence/unc-capabilities.stdout.txt` and `results.json`.
 
-Supporting UNC requires a separately established filesystem contract or a demonstrated server
-capability; NTFS naming alone is insufficient. Non-NTFS and remote provider behavior remain
-unsupported in this feature, rather than being silently downgraded.
+`unc-provider.silk` exercises actual UNC read/write, exclusive-create collision, truncation, stat,
+directory creation, listing with machine paths, and repeated machine-share routing. It also checks
+that refused publication leaves both the old file and directory entries unchanged, and refused
+deletion leaves its file readable. The confined and machine-wide providers both passed on this
+host; `.scratch/windows-filesystem-combined-unc/results.json` retains the combined result.
+The same fixture compiled against the pre-change stdlib traps at `OsFileSystem.makeBytes` with
+exit `0xc0000409` and `invalid native Windows root`; the current provider exits zero.
+The control is retained in `.scratch/windows-unc-before-run.log`.
+The cross-build creates `unc-provider.exe`; pass it as `-UncSilkExecutable` to `run.ps1`.
+The shared Windows runner includes this proof and treats inaccessible administrative shares as
+an unsupported fixture failure, never as passing UNC coverage. Remote symbolic-link behavior,
+different SMB servers, and non-NTFS servers remain not checked.
 
 `provider.silk` is the integration test. Its independent C setup creates a lone-surrogate
 filename, outside-target symlink/junction, and an old file. Assertions cover actual provider
