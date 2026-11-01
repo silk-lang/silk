@@ -37,6 +37,21 @@ Flush does nothing. Writes have no inter-thread message lock and can make partia
 impl WindowsConsole
 ```
 
+<a id="WindowsConsole.impl.enableAnsi"></a>
+
+### Associated function `enableAnsi`
+
+```silk
+pub effect fn enableAnsi(selector: i32) -> bool
+```
+
+Enables ANSI escape processing on standard output (1) or standard error (2).
+
+#### Details
+
+Returns false for another selector, a redirected or invalid handle, or an OS refusal.
+Existing mode bits are preserved. The successful setting persists on the console handle.
+
 <a id="WindowsConsole.impl.stdout"></a>
 
 ### Associated function `stdout`

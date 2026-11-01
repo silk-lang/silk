@@ -1059,7 +1059,8 @@ vector = { git = "https://github.com/example/gpu.git", rev = "ef2771662340150914
 ```
 
 `silk build`, `check`, `test` and `run` fetch each missing commit with the `git` on `PATH` into
-`$SILK_HOME/git/<commit>` (`$HOME/.silk/git` when `SILK_HOME` is unset), once; later builds read
+`$SILK_HOME/git/<commit>` (`$HOME/.silk/git` when `SILK_HOME` is unset, or
+`$USERPROFILE/.silk/git` on Windows), once; later builds read
 that checkout without the network. The commit fixes the package's whole dependency graph: a package
 read from a checkout may depend by `path` only on packages in the same repository, and on other git
 dependencies by commit. Because a commit hash names the same files forever, no lock file is
