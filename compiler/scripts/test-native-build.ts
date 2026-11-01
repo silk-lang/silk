@@ -2,7 +2,7 @@
 import { strict as assert } from 'node:assert'
 import { createHash } from 'node:crypto'
 import { spawn, spawnSync, type SpawnSyncReturns } from 'node:child_process'
-import { existsSync, readdirSync } from 'node:fs'
+import { existsSync, readdirSync, statSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -2326,6 +2326,90 @@ const program = Effect.gen(function* () {
     assert.equal(refusedArchive.status, 2, refusedArchive.stderr)
     assert.match(refusedArchive.stderr, rule)
   }
+  // `silk generate` runs the package's [[generate]] entries; `--check` changes nothing and fails
+  // on stale output, and an unchanged rerun keeps every file's inode and modification time.
+  const generated = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-generate-' })
+  const generatorManifest = (outputs: string) =>
+    `[package]\nname = "generated"\nversion = "0.1.0"\nsource = "src"\n\n[[generate]]\nrun = ["scripts/gen.sh", "parts.txt"]\noutputs = ${outputs}\n`
+  yield* fs.makeDirectory(join(generated, 'src'), { recursive: true })
+  yield* fs.makeDirectory(join(generated, 'scripts'), { recursive: true })
+  yield* fs.writeFileString(join(generated, 'src/main.silk'), 'pub fn main() -> i32 {\n  return 0\n}\n')
+  yield* fs.writeFileString(join(generated, 'silk.toml'), generatorManifest('["src/generated_value.silk", "src/generated_part_*.silk"]'))
+  yield* fs.writeFileString(
+    join(generated, 'scripts/gen.sh'),
+    '#!/bin/sh\n[ "$SILK_GENERATE" = 1 ] || exit 9\nprintf \'pub const VALUE: i32 = %s\\n\' "$(cat input.txt)" > src/generated_value.silk\n'
+      + 'for n in $(cat "$1"); do printf \'pub const PART: i32 = %s\\n\' "$n" > "src/generated_part_$n.silk"; done\n'
+      + 'echo "wrote parts"\n[ -f fail ] && exit 3\nexit 0\n',
+  )
+  yield* fs.chmod(join(generated, 'scripts/gen.sh'), 0o755)
+  yield* fs.writeFileString(join(generated, 'input.txt'), '1')
+  yield* fs.writeFileString(join(generated, 'parts.txt'), '1 2')
+  const valueFile = join(generated, 'src/generated_value.silk')
+  const generateRun = (args: ReadonlyArray<string>) => invoke(silk, ['generate', ...args], generated)
+  const firstCheck = yield* generateRun(['--check'])
+  assert.equal(firstCheck.status, 1, firstCheck.stderr)
+  assert.match(firstCheck.stderr, /src\/generated_value\.silk would be created/)
+  assert.match(firstCheck.stderr, /src\/generated_part_2\.silk would be created/)
+  assert.match(firstCheck.stderr, /run `silk generate` and commit the result/)
+  assert.equal(existsSync(valueFile), false, '--check left a generated file behind')
+  const firstGenerate = yield* generateRun([])
+  assert.equal(firstGenerate.status, 0, firstGenerate.stderr)
+  assert.match(firstGenerate.stdout, /wrote parts\n/)
+  assert.match(firstGenerate.stdout, /Created src\/generated_part_1\.silk\n/)
+  assert.match(firstGenerate.stdout, /Ran 1 generator: 3 changed, 0 unchanged\n/)
+  assert.equal(yield* fs.readFileString(valueFile), 'pub const VALUE: i32 = 1\n')
+  const stamp = (path: string) => {
+    const info = statSync(path, { bigint: true })
+    return `${info.ino}:${info.mtimeNs}`
+  }
+  const firstStamp = stamp(valueFile)
+  const rerun = yield* generateRun([])
+  assert.equal(rerun.status, 0, rerun.stderr)
+  assert.match(rerun.stdout, /Ran 1 generator: 0 changed, 3 unchanged\n/)
+  assert.equal(stamp(valueFile), firstStamp, 'an unchanged rerun replaced the generated file')
+  const currentCheck = yield* generateRun(['--check'])
+  assert.equal(currentCheck.status, 0, currentCheck.stderr)
+  assert.match(currentCheck.stdout, /Generated output is up to date \(3 files\)\n/)
+  assert.equal(stamp(valueFile), firstStamp, '--check replaced a current file')
+  yield* fs.writeFileString(join(generated, 'input.txt'), '2')
+  yield* fs.writeFileString(join(generated, 'parts.txt'), '1')
+  const staleCheck = yield* generateRun(['--check'])
+  assert.equal(staleCheck.status, 1, staleCheck.stderr)
+  assert.match(staleCheck.stderr, /src\/generated_value\.silk is stale\n/)
+  assert.match(staleCheck.stderr, /src\/generated_part_2\.silk would be removed\n/)
+  assert.equal(stamp(valueFile), firstStamp, '--check changed a stale file')
+  assert.equal(existsSync(join(generated, 'src/generated_part_2.silk')), true, '--check removed a file')
+  assert.deepEqual((yield* fs.readDirectory(join(generated, 'src'))).filter((name) => name.startsWith('.')), [], '--check left a moved-aside file')
+  yield* fs.writeFileString(join(generated, 'fail'), '')
+  const failedGenerate = yield* generateRun([])
+  assert.equal(failedGenerate.status, 1, failedGenerate.stderr)
+  assert.match(failedGenerate.stderr, /scripts\/gen\.sh parts\.txt failed with status 3; its outputs are unchanged\n/)
+  assert.equal(stamp(valueFile), firstStamp, 'a failed generator changed its outputs')
+  yield* fs.remove(join(generated, 'fail'))
+  const updated = yield* generateRun([])
+  assert.equal(updated.status, 0, updated.stderr)
+  assert.match(updated.stdout, /Updated src\/generated_value\.silk\n/)
+  assert.match(updated.stdout, /Removed src\/generated_part_2\.silk\n/)
+  assert.match(updated.stdout, /Ran 1 generator: 2 changed, 1 unchanged\n/)
+  assert.equal(yield* fs.readFileString(valueFile), 'pub const VALUE: i32 = 2\n')
+  // A declared output the command does not write fails, and nothing changes.
+  yield* fs.writeFileString(join(generated, 'silk.toml'), generatorManifest('["src/generated_value.silk", "src/missing.silk"]'))
+  const missingOutput = yield* generateRun([])
+  assert.equal(missingOutput.status, 1, missingOutput.stderr)
+  assert.match(missingOutput.stderr, /did not write its declared output src\/missing\.silk; its outputs are unchanged\n/)
+  assert.equal(yield* fs.readFileString(valueFile), 'pub const VALUE: i32 = 2\n')
+  // Outputs stay inside the package, and builds check the entries' shape too.
+  yield* fs.writeFileString(join(generated, 'silk.toml'), generatorManifest('["../outside.silk"]'))
+  const escapedGenerate = yield* generateRun([])
+  assert.equal(escapedGenerate.status, 2, escapedGenerate.stderr)
+  assert.match(escapedGenerate.stderr, /silk\.toml:\d+: \[\[generate\]\]\[0\]: output "\.\.\/outside\.silk" must be a relative path below the manifest's directory/)
+  const escapedGeneratorCheck = yield* invoke(silk, ['check', '--stdlib', standardLibrary], generated)
+  assert.notEqual(escapedGeneratorCheck.status, 0, escapedGeneratorCheck.stderr)
+  assert.match(escapedGeneratorCheck.stderr, /\[\[generate\]\]\[0\]: output "\.\.\/outside\.silk"/)
+  yield* fs.writeFileString(join(generated, 'silk.toml'), generatorManifest('["src/generated_value.silk"]').replace('outputs', 'output'))
+  const misspelledGenerate = yield* generateRun([])
+  assert.equal(misspelledGenerate.status, 2, misspelledGenerate.stderr)
+  assert.match(misspelledGenerate.stderr, /\[\[generate\]\]\[0\]: unknown key output; an entry has only run and outputs/)
   // `[native].function-order` places the functions it lists first in the executable's code, in its
   // order, and a change to the file alone links again. A path outside the package is refused.
   const ordered = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-ordered-' })

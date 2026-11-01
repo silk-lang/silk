@@ -1,0 +1,550 @@
+//! Running `[[generate]]` entries for `silk generate`; [`Generate`](driver.Generate) reads them.
+
+import diagnostic.JsonText
+import driver.CommandPath
+import driver.Generate as Generators {Entry}
+import driver.HostRename
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.collections.bytes {Bytes}
+import silk.system.child_process {ChildProcess, ProcessError, ProcessOutcome, ProcessRequest}
+import silk.core.effect {Effect}
+import silk.system.host_input {HostInput, HostInputError}
+import silk.system.filesystem {DirectoryEntry, FileError, FileSystem, Path}
+import silk.collections.list {List}
+import silk.core.option {Option}
+import silk.mem.pointer {Pointer}
+import silk.core.result {Result}
+import silk.collections.slice {Slice}
+import silk.text.string {String}
+import silk.num.i32
+import silk.num.usize
+
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  unsafe extern "C" fn _NSGetEnviron() -> *const ?[*]const ?[*]const u8
+  unsafe fn environmentVector() -> ?[*]const ?[*]const u8 {
+    unsafe { return Pointer.read(_NSGetEnviron()) }
+  }
+} else static if Intrinsic.targetOperatingSystem() != "windows" {
+  unsafe extern "C" static processEnvironment: ?[*]const ?[*]const u8 as "environ"
+  unsafe fn environmentVector() -> ?[*]const ?[*]const u8 {
+    unsafe { return processEnvironment }
+  }
+}
+
+// Declared exactly as the standard library declares it, since two declarations of one C symbol must agree.
+unsafe extern "C" fn strlen(text: [*]const u8) -> usize
+
+/// What `silk generate` printed and its status: 0 when every entry ran (and, for `--check`, every
+/// output was current), 1 when a command failed or an output was stale.
+pub struct Outcome {
+  pub status: i32,
+  pub output: Bytes,
+  pub errors: Bytes,
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn holds(text: &[u8], wanted: u8) -> bool {
+  let mut at = usize.ZERO
+  while at < text.length {
+    if text[at] == wanted { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn lastSegment(path: &[u8]) -> &[u8] {
+  let mut start = path.length
+  while start > usize.ZERO && path[start - usize.ONE] != 47 { start = start - usize.ONE }
+  return Slice.view<u8>(path, start, path.length - start)
+}
+
+/// Whether `name` matches `pattern`, where each `*` matches any run of bytes. A name that starts
+/// with `.` matches only a pattern that does, so moved-aside originals never match.
+pub fn matches(pattern: &[u8], name: &[u8]) -> bool {
+  if name.length > usize.ZERO && name[usize.ZERO] == 46 && (pattern.length == usize.ZERO || pattern[usize.ZERO] != 46) { return false }
+  let mut p = usize.ZERO
+  let mut n = usize.ZERO
+  let mut star = usize.MAX
+  let mut resume = usize.ZERO
+  while n < name.length {
+    if p < pattern.length && pattern[p] == 42 {
+      star = p
+      resume = n
+      p = p + usize.ONE
+    } else if p < pattern.length && pattern[p] == name[n] {
+      p = p + usize.ONE
+      n = n + usize.ONE
+    } else if star != usize.MAX {
+      p = star + usize.ONE
+      resume = resume + usize.ONE
+      n = resume
+    } else {
+      return false
+    }
+  }
+  while p < pattern.length && pattern[p] == 42 { p = p + usize.ONE }
+  return p == pattern.length
+}
+
+// Whether a file (not a directory) is at `path`.
+effect fn isFile(path: &Path) -> bool ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  return run CommandPath.exists(Path.rawBytes(path), false)
+}
+
+fn listed(paths: &[Path], wanted: &[u8]) -> bool {
+  let mut at = usize.ZERO
+  while at < paths.length {
+    if same(Path.rawBytes(&paths[at]), wanted) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// The files the outputs `written` name below `directory` now, without repeats.
+effect fn present(directory: &Path, written: &[Bytes]) -> List<Path> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut found = List<Path>.make()
+  let mut at = usize.ZERO
+  while at < written.length {
+    let output = Bytes.asSlice(&written[at])
+    let pattern = lastSegment(output)
+    if !holds(pattern, 42) {
+      let path = run joined(directory, output)
+      let exists = run isFile(&path)
+      if exists && !listed(List<Path>.asSlice(&found), Path.rawBytes(&path)) {
+        run List<Path>.append(&mut found, move path)
+      }
+    } else {
+      let mut parent = run pathFrom(Path.rawBytes(directory))
+      if pattern.length < output.length {
+        parent = run joined(directory, Slice.view<u8>(output, usize.ZERO, output.length - pattern.length - usize.ONE))
+      }
+      let children = match move run Effect.result(FileSystem.listDirectory(&parent)) {
+        Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success {value} => move value
+        Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Failure {error} => match move error {
+          FileError failure => { drop failure List<DirectoryEntry>.make() }
+          OutOfMemoryError exhausted => { fail move exhausted }
+        }
+      }
+      let entries = List<DirectoryEntry>.asSlice(&children)
+      let mut child = usize.ZERO
+      while child < entries.length {
+        let path = Path.rawBytes(&entries[child].path)
+        if entries[child].kind.code != 1 && matches(pattern, lastSegment(path)) && !listed(List<Path>.asSlice(&found), path) {
+          run List<Path>.append(&mut found, run pathFrom(path))
+        }
+        child = child + usize.ONE
+      }
+    }
+    at = at + usize.ONE
+  }
+  return move found
+}
+
+// `text` as a path; it is always a valid one here.
+effect fn pathFrom(text: &[u8]) -> Path ! OutOfMemoryError ? &mut Allocator {
+  return match move run Effect.result(Path.fromBytes(text)) {
+    Result<Path, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => { drop failure Intrinsic.trap("generate path") }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+effect fn joined(directory: &Path, relative: &[u8]) -> Path ! OutOfMemoryError ? &mut Allocator {
+  let mut text = run Bytes.copy(Path.rawBytes(directory))
+  run Bytes.append(&mut text, b"/")
+  run Bytes.append(&mut text, relative)
+  return match move run Effect.result(Path.fromBytes(Bytes.asSlice(&text))) {
+    Result<Path, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      // Entries were checked to be plain relative paths, and the directory is a valid path.
+      FileError failure => { drop failure Intrinsic.trap("generate output path") }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// Where the original of `path` waits while its command runs: `.<name>.silk-generate` beside it.
+effect fn stashOf(path: &Path) -> Path ! OutOfMemoryError ? &mut Allocator {
+  let text = Path.rawBytes(path)
+  let name = lastSegment(text)
+  let mut aside = run Bytes.copy(Slice.view<u8>(text, usize.ZERO, text.length - name.length))
+  run Bytes.append(&mut aside, b".")
+  run Bytes.append(&mut aside, name)
+  run Bytes.append(&mut aside, b".silk-generate")
+  return match move run Effect.result(Path.fromBytes(Bytes.asSlice(&aside))) {
+    Result<Path, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => { drop failure Intrinsic.trap("generate stash path") }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+effect fn readOptional(path: &Path) -> Option<Bytes> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  return match move run Effect.result(FileSystem.readFile(path)) {
+    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => Option<Bytes>.some(move value)
+    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => { drop failure Option<Bytes>.none() }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+effect fn removeQuietly(path: &Path) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  match move run Effect.result(FileSystem.removeFile(path)) {
+    Result<(), FileError>.Success {value: _} => {}
+    Result<(), FileError>.Failure {error} => { drop error }
+  }
+  return ()
+}
+
+// Adds the caller's environment to `request`. Windows passes on the variables a generator usually
+// needs; other hosts pass on every variable.
+effect fn inherit(request: &mut ProcessRequest) -> () ! HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    let names: [string; 24] = ["PATH", "PATHEXT", "SystemRoot", "SystemDrive", "WINDIR", "COMSPEC", "TEMP", "TMP",
+      "USERPROFILE", "USERNAME", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "ProgramData", "ProgramFiles",
+      "ProgramFiles(x86)", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "OS", "CARGO", "CARGO_HOME", "RUSTUP_HOME", "SILK_HOME"]
+    let mut at = usize.ZERO
+    while at < names.length {
+      if let Option<Bytes>.Some {value} = move run HostInput.variableNamed(names[at]) {
+        run ChildProcess.setVariableBytes(&mut request.*, String.utf8Bytes(names[at]), Bytes.asSlice(&value))
+      }
+      at = at + usize.ONE
+    }
+    return ()
+  } else {
+    let environment = match move Pointer.nonNullMany(unsafe environmentVector()) {
+      Option<[*]const ?[*]const u8>.Some {value} => value
+      Option<[*]const ?[*]const u8>.None => { return () }
+    }
+    let mut index = usize.ZERO
+    while true {
+      let entry = match move Pointer.nonNullMany(unsafe Pointer.read(unsafe Pointer.at(environment, index))) {
+        Option<[*]const u8>.Some {value} => value
+        Option<[*]const u8>.None => { break }
+      }
+      let length = unsafe strlen(entry)
+      let anchor = length
+      let text = unsafe Pointer.borrowMany<usize, u8>(&anchor, entry, length)
+      let mut equals = usize.ZERO
+      while equals < text.length && text[equals] != 61 { equals = equals + usize.ONE }
+      if equals > usize.ZERO && equals < text.length {
+        run ChildProcess.setVariableBytes(&mut request.*, Slice.view<u8>(text, usize.ZERO, equals),
+          Slice.view<u8>(text, equals + usize.ONE, text.length - equals - usize.ONE))
+      }
+      index = index + usize.ONE
+    }
+    return ()
+  }
+}
+
+// The program `written` names: a path below `directory` when it holds a `/`, else the first file of
+// that name on `PATH`.
+effect fn program(directory: &Path, written: &[u8]) -> Option<Path> ! HostInputError | OutOfMemoryError ? &mut FileSystem | &mut HostInput | &mut Allocator {
+  if holds(written, 47) {
+    let path = run joined(directory, written)
+    if run isFile(&path) { return Option<Path>.some(move path) }
+    return Option<Path>.none()
+  }
+  let searched = match move run HostInput.variableNamed("PATH") {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => { return Option<Path>.none() }
+  }
+  let candidates = run CommandPath.searchCandidates(Bytes.asSlice(&searched), written)
+  let listedCandidates = List<Bytes>.asSlice(&candidates)
+  let mut at = usize.ZERO
+  while at < listedCandidates.length {
+    if run CommandPath.exists(Bytes.asSlice(&listedCandidates[at]), false) {
+      if let Option<Path>.Some {value} = move run CommandPath.pathOf(Bytes.asSlice(&listedCandidates[at])) {
+        return Option<Path>.some(move value)
+      }
+    }
+    at = at + usize.ONE
+  }
+  return Option<Path>.none()
+}
+
+// The command line `words` as one line for a message.
+effect fn spelled(words: &[Bytes]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut line = Bytes.make()
+  let mut at = usize.ZERO
+  while at < words.length {
+    if at > usize.ZERO { run Bytes.append(&mut line, b" ") }
+    run Bytes.append(&mut line, Bytes.asSlice(&words[at]))
+    at = at + usize.ONE
+  }
+  return move line
+}
+
+// Puts every original back and removes every file the command created, for a failed command.
+effect fn restore(before: &[Path], directory: &Path, written: &[Bytes]) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let after = run present(directory, written)
+  let created = List<Path>.asSlice(&after)
+  let mut at = usize.ZERO
+  while at < created.length {
+    if !listed(before, Path.rawBytes(&created[at])) { run removeQuietly(&created[at]) }
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < before.length {
+    let aside = run stashOf(&before[at])
+    let restored = run HostRename.replaceFile(&aside, &before[at])
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Appends `path` as `shown` sees it, relative to `working` when below it.
+effect fn appendShown(out: &mut Bytes, working: &Path, path: &Path) -> () ! OutOfMemoryError ? &mut Allocator {
+  let base = Path.rawBytes(working)
+  let text = Path.rawBytes(path)
+  if text.length > base.length + usize.ONE && same(Slice.view<u8>(text, usize.ZERO, base.length), base) && text[base.length] == 47 {
+    run Bytes.append(&mut out.*, Slice.view<u8>(text, base.length + usize.ONE, text.length - base.length - usize.ONE))
+    return ()
+  }
+  run Bytes.append(&mut out.*, text)
+  return ()
+}
+
+// Counts of one run, added up across entries.
+struct Tally {
+  changed: usize,
+  unchanged: usize,
+  stale: usize,
+}
+
+// Runs entry `index` of the manifest at `manifest`. Answers false when the command could not start,
+// failed or did not write a declared output; its outputs are then as they were.
+effect fn runEntry(manifest: &Path, directory: &Path, index: usize, entry: &Entry, check: bool, working: &Path, tally: &mut Tally, outcome: &mut Outcome) -> bool
+! HostInputError | OutOfMemoryError ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
+  let words = List<Bytes>.asSlice(&entry.command)
+  let written = List<Bytes>.asSlice(&entry.outputs)
+  let line = run spelled(words)
+  let found = match move run program(directory, Bytes.asSlice(&words[usize.ZERO])) {
+    Option<Path>.Some {value} => move value
+    Option<Path>.None => {
+      run Bytes.append(&mut outcome.errors, b"silk: ")
+      run appendShown(&mut outcome.errors, working, manifest)
+      run Bytes.append(&mut outcome.errors, b": [[generate]][")
+      run JsonText.appendDecimal(&mut outcome.errors, index)
+      run Bytes.append(&mut outcome.errors, b"]: cannot find the program ")
+      run Bytes.append(&mut outcome.errors, Bytes.asSlice(&words[usize.ZERO]))
+      if holds(Bytes.asSlice(&words[usize.ZERO]), 47) {
+        run Bytes.append(&mut outcome.errors, b" below the manifest's directory\n")
+      } else {
+        run Bytes.append(&mut outcome.errors, b" on PATH\n")
+      }
+      return false
+    }
+  }
+  // Move every existing output aside, so the command writes fresh files.
+  let originals = run present(directory, written)
+  let before = List<Path>.asSlice(&originals)
+  let mut moved = usize.ZERO
+  while moved < before.length {
+    let aside = run stashOf(&before[moved])
+    if !run HostRename.replaceFile(&before[moved], &aside) {
+      run restore(Slice.view<Path>(before, usize.ZERO, moved), directory, written)
+      run Bytes.append(&mut outcome.errors, b"silk: cannot move ")
+      run appendShown(&mut outcome.errors, working, &before[moved])
+      run Bytes.append(&mut outcome.errors, b" aside while its generator runs\n")
+      return false
+    }
+    moved = moved + usize.ONE
+  }
+  let mut request = run ChildProcess.requestWithin(&found, directory)
+  let mut word = usize.ONE
+  while word < words.length {
+    run ChildProcess.addArgumentBytes(&mut request, Bytes.asSlice(&words[word]))
+    word = word + usize.ONE
+  }
+  run inherit(&mut request)
+  run ChildProcess.setVariable(&mut request, "SILK_GENERATE", "1")
+  let ran = match move run Effect.result(ChildProcess.submit(&request)) {
+    Result<ProcessOutcome, ProcessError | OutOfMemoryError>.Success {value} => Option<ProcessOutcome>.some(move value)
+    Result<ProcessOutcome, ProcessError | OutOfMemoryError>.Failure {error} => match move error {
+      ProcessError unstarted => { drop unstarted Option<ProcessOutcome>.none() }
+      OutOfMemoryError exhausted => {
+        run restore(before, directory, written)
+        fail move exhausted
+      }
+    }
+  }
+  let finished = match move ran {
+    Option<ProcessOutcome>.Some {value} => move value
+    Option<ProcessOutcome>.None => {
+      run restore(before, directory, written)
+      run Bytes.append(&mut outcome.errors, b"silk: cannot start ")
+      run Bytes.append(&mut outcome.errors, Bytes.asSlice(&line))
+      run Bytes.append(&mut outcome.errors, b"\n")
+      return false
+    }
+  }
+  run Bytes.append(&mut outcome.output, ChildProcess.outputBytes(&finished))
+  run Bytes.append(&mut outcome.errors, ChildProcess.errorBytes(&finished))
+  let mut succeeded = false
+  if let Option<i32>.Some {value} = move ChildProcess.exitCode(&finished) { succeeded = value == 0 }
+  if !succeeded {
+    run restore(before, directory, written)
+    run Bytes.append(&mut outcome.errors, b"silk: ")
+    run Bytes.append(&mut outcome.errors, Bytes.asSlice(&line))
+    run Bytes.append(&mut outcome.errors, b" failed")
+    if let Option<i32>.Some {value} = move ChildProcess.exitCode(&finished) {
+      run Bytes.append(&mut outcome.errors, b" with status ")
+      if value >= 0 { run JsonText.appendDecimal(&mut outcome.errors, i32.toUsize(value)) } else { run Bytes.append(&mut outcome.errors, b"-1") }
+    }
+    run Bytes.append(&mut outcome.errors, b"; its outputs are unchanged\n")
+    return false
+  }
+  // Every output written without a `*` must exist now.
+  let mut at = usize.ZERO
+  while at < written.length {
+    let output = Bytes.asSlice(&written[at])
+    if !holds(lastSegment(output), 42) {
+      let path = run joined(directory, output)
+      if !run isFile(&path) {
+        run restore(before, directory, written)
+        run Bytes.append(&mut outcome.errors, b"silk: ")
+        run Bytes.append(&mut outcome.errors, Bytes.asSlice(&line))
+        run Bytes.append(&mut outcome.errors, b" did not write its declared output ")
+        run appendShown(&mut outcome.errors, working, &path)
+        run Bytes.append(&mut outcome.errors, b"; its outputs are unchanged\n")
+        return false
+      }
+    }
+    at = at + usize.ONE
+  }
+  let produced = run present(directory, written)
+  let after = List<Path>.asSlice(&produced)
+  // Originals: kept when the bytes match, else replaced (or, for `--check`, reported and kept).
+  at = usize.ZERO
+  while at < before.length {
+    let aside = run stashOf(&before[at])
+    let original = run readOptional(&aside)
+    let mut current = Option<Bytes>.none()
+    if listed(after, Path.rawBytes(&before[at])) { current = run readOptional(&before[at]) }
+    let mut equal = false
+    if let Option<Bytes>.Some {value: old} = &original {
+      let previous = Bytes.asSlice(&old)
+      if let Option<Bytes>.Some {value: fresh} = &current {
+        let written = Bytes.asSlice(&fresh)
+        equal = same(previous, written)
+      }
+    }
+    if equal || check {
+      let restored = run HostRename.replaceFile(&aside, &before[at])
+    } else {
+      run removeQuietly(&aside)
+    }
+    if equal {
+      tally.unchanged = tally.unchanged + usize.ONE
+    } else if check {
+      tally.stale = tally.stale + usize.ONE
+      run Bytes.append(&mut outcome.errors, b"silk: ")
+      run appendShown(&mut outcome.errors, working, &before[at])
+      match &current {
+        Option<Bytes>.Some {value: _} => { run Bytes.append(&mut outcome.errors, b" is stale\n") }
+        Option<Bytes>.None => { run Bytes.append(&mut outcome.errors, b" would be removed\n") }
+      }
+    } else {
+      tally.changed = tally.changed + usize.ONE
+      match &current {
+        Option<Bytes>.Some {value: _} => { run Bytes.append(&mut outcome.output, b"Updated ") }
+        Option<Bytes>.None => { run Bytes.append(&mut outcome.output, b"Removed ") }
+      }
+      run appendShown(&mut outcome.output, working, &before[at])
+      run Bytes.append(&mut outcome.output, b"\n")
+    }
+    at = at + usize.ONE
+  }
+  // Files the command created.
+  at = usize.ZERO
+  while at < after.length {
+    if !listed(before, Path.rawBytes(&after[at])) {
+      if check {
+        run removeQuietly(&after[at])
+        tally.stale = tally.stale + usize.ONE
+        run Bytes.append(&mut outcome.errors, b"silk: ")
+        run appendShown(&mut outcome.errors, working, &after[at])
+        run Bytes.append(&mut outcome.errors, b" would be created\n")
+      } else {
+        tally.changed = tally.changed + usize.ONE
+        run Bytes.append(&mut outcome.output, b"Created ")
+        run appendShown(&mut outcome.output, working, &after[at])
+        run Bytes.append(&mut outcome.output, b"\n")
+      }
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// One manifest whose entries to run: its path and its parsed entries.
+pub struct Declared {
+  pub manifest: Path,
+  pub entries: List<Entry>,
+}
+
+/// Runs the entries of each manifest of `declared` in order, stopping at the first that fails.
+/// With `check`, nothing changes and the status is 1 when an output is stale.
+pub effect fn generate(declared: &[Declared], check: bool, working: &Path) -> Outcome
+! HostInputError | OutOfMemoryError ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
+  let mut outcome = Outcome {status: 0, output: Bytes.make(), errors: Bytes.make()}
+  let mut tally = Tally {changed: usize.ZERO, unchanged: usize.ZERO, stale: usize.ZERO}
+  let mut ran = usize.ZERO
+  let mut at = usize.ZERO
+  while at < declared.length {
+    let directory = match move run Path.parent(&declared[at].manifest) {
+      Option<Path>.Some {value} => move value
+      Option<Path>.None => run Path.root()
+    }
+    let listedEntries = List<Entry>.asSlice(&declared[at].entries)
+    let mut index = usize.ZERO
+    while index < listedEntries.length {
+      if !run runEntry(&declared[at].manifest, &directory, index, &listedEntries[index], check, working, &mut tally, &mut outcome) {
+        outcome.status = 1
+        return move outcome
+      }
+      ran = ran + usize.ONE
+      index = index + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  if ran == usize.ZERO {
+    run Bytes.append(&mut outcome.output, b"No [[generate]] entries to run\n")
+    return move outcome
+  }
+  if check {
+    if tally.stale > usize.ZERO {
+      outcome.status = 1
+      run Bytes.append(&mut outcome.errors, b"silk: generated output is stale; run `silk generate` and commit the result\n")
+      return move outcome
+    }
+    run Bytes.append(&mut outcome.output, b"Generated output is up to date (")
+    run JsonText.appendDecimal(&mut outcome.output, tally.unchanged)
+    run Bytes.append(&mut outcome.output, b" files)\n")
+    return move outcome
+  }
+  run Bytes.append(&mut outcome.output, b"Ran ")
+  run JsonText.appendDecimal(&mut outcome.output, ran)
+  run Bytes.append(&mut outcome.output, b" generator")
+  if ran != usize.ONE { run Bytes.append(&mut outcome.output, b"s") }
+  run Bytes.append(&mut outcome.output, b": ")
+  run JsonText.appendDecimal(&mut outcome.output, tally.changed)
+  run Bytes.append(&mut outcome.output, b" changed, ")
+  run JsonText.appendDecimal(&mut outcome.output, tally.unchanged)
+  run Bytes.append(&mut outcome.output, b" unchanged\n")
+  return move outcome
+}

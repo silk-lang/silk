@@ -264,3 +264,34 @@ Both variables are part of the build fingerprint, and the profile's content hash
 object's cache key, so changing either the variable or the profile rebuilds the objects. The
 profile describes one build of the program: regenerate it after changing the source or the
 compiler.
+
+## PROFILE-008 — Generated source
+
+A package author declares each generator as a `[[generate]]` entry in the package manifest or the
+workspace manifest. `run` is the command line: the program, then its arguments. A program spelled
+with a `/` is a path below the manifest's directory; a bare name is searched on `PATH`. `outputs`
+lists the files it writes, as paths below the manifest's directory; a `*` in the last segment
+matches any run of bytes.
+
+```toml
+[[generate]]
+run = ["scripts/generate-unicode", "--pinned"]
+outputs = ["src/generated_tables.silk", "src/generated_*.silk"]
+```
+
+`silk generate [--check] [--manifest-path <path>]` runs the located manifest's entries in order
+and then, for a workspace, each member's. A command runs in its manifest's directory with the
+caller's environment plus `SILK_GENERATE=1` (Windows passes on the common system, user and Cargo
+variables). While it runs, its declared outputs that already exist are moved aside to
+`.<name>.silk-generate` beside them. An output it then writes with the same bytes gets the
+original file back, so an unchanged rerun keeps every file's identity and modification time and
+invalidates no build cache. The command prints `Created`, `Updated` or `Removed` for each output
+that changed.
+
+`--check` restores every original and removes every new file, so it never changes the tree, and
+exits 1 naming each output that is stale, would be created or would be removed. A command that
+fails or exits nonzero, or does not write an output declared without a `*`, leaves every output
+as it was and makes `silk generate` exit 1. A manifest it cannot use exits 2.
+
+Generated files are committed. `silk build`, `silk check` and dependents never run an entry; they
+only refuse a malformed one, naming its manifest line.
