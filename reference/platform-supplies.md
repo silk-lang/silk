@@ -50,13 +50,11 @@ optimized boundaries, and execution on available runners. Missing tools or skipp
 fail required lanes. LTO is not admitted by the compilation profile. Managed installation, new libc
 families, OS operation implementations and startup implementations belong to other capabilities.
 
-A host links an executable for its own target, for wasm32, for Windows, for macOS, or for a Linux
-target whose supply resolves: an explicit supply naming the target. Without one the build stops
-before compiling and says how to declare a supply. Every native link passes the target triple to
-Clang. A Linux link uses the `ld.lld` beside Clang; a macOS link for another architecture or host
-uses `ld64.lld` and a native one Apple's `ld`. An explicit supply's `linker` wins over both. The
-link stamp covers the supply's root, linker, deployment and the digests of the SDK files it read,
-so a replaced SDK relinks.
+A host links an executable for its own target, for wasm32, for Windows, for macOS, or for
+GNU/Linux. Every native link passes the target triple to Clang. A Linux link uses the `ld.lld`
+beside Clang; a macOS link for another architecture or host uses `ld64.lld` and a native one
+Apple's `ld`. An explicit supply's `linker` wins over both. The link stamp covers the supply's
+root, linker, deployment and the digests of the SDK files it read, so a replaced SDK relinks.
 
 A macOS link needs no SDK. When an automatic request finds none (no `SDKROOT`, and no `xcrun` or a
 host that is not a Mac), the link uses Silk's own libSystem stub: a TAPI text file that names
@@ -66,6 +64,18 @@ architectures. The compiler writes it into the link's scratch directory and link
 written deployment must be 11.0.0 or later. The stub's digest is part of the link stamp. It has no
 frameworks or other libraries, so a `[native].link` framework entry needs a real SDK through
 `SDKROOT` or an explicit supply. A `native` request never falls back to the stub.
+
+A dynamically linked `libc = "gnu"` executable needs no sysroot on any host. Unless an explicit
+supply is declared, the compiler writes stub shared libraries for glibc 2.28 (`libc.so.6`,
+`libpthread.so.0`, `libm.so.6`, `libdl.so.2`, and the `libgcc_s.so.1` unwinder entries trap
+reports use) with their symbol versions, plus its own `_start`, and links with `-nostdlib`,
+`ld.lld` and the target's interpreter. Atomics are compiled inline, since no libgcc is linked. The
+program runs on glibc 2.28 or later. The stubs define only what glibc 2.28 exports, so the
+standard library reads file metadata through the `newfstatat` system call and starts a child in a
+working directory with `fork`. A link with declared link inputs or `-static` still needs the
+target's libraries: natively the host toolchain supplies them, and a cross link without an
+explicit supply stops and says how to declare one. The link stamp covers the digest of the stub
+table and startup source.
 
 A project can pin a physical installation independently of its logical target profile:
 
