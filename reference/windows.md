@@ -84,6 +84,10 @@ tags report `Unsupported`. Resolution stops after 40 links with `InvalidPath`.
 
 UNC and device roots, non-NTFS filesystems, and directory durability remain explicit unsupported
 outcomes. Deleting or atomically replacing a final symlink or junction acts on the link itself.
+The UNC spelling is accepted by host-path conversion, but filesystem operations refuse it:
+the tested Windows SMB redirector rejected the required POSIX rename and delete information
+classes even when the share reported NTFS. The provider does not substitute legacy operations
+with different sharing and retained-handle behavior.
 Windows directories can be case sensitive, so blindly lowercasing names would merge distinct
 files. Path bytes retain their case; host canonicalization obtains the final path from an open
 handle. These restrictions are separate from the validated native compiler and release chain.

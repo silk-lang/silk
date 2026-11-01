@@ -72,7 +72,7 @@ static void write_byte(HANDLE h,char c) { uint32_t n=0; CHECK(WriteFile(h,&c,1,&
 static char read_byte(HANDLE h) {
   char c=0; uint32_t n=0; CHECK(SetFilePointerEx(h,0,0,0)); CHECK(ReadFile(h,&c,1,&n,0)&&n==1); return c;
 }
-#ifdef CONTRACT_MAIN
+#if defined(CONTRACT_MAIN) || defined(REMOTE_CONTRACT_MAIN)
 static NTSTATUS nt_open(HANDLE parent,const WCHAR *name,uint32_t access,uint32_t sharing,uint32_t creation,uint32_t flags,HANDLE *out) {
   UNICODE_STRING text={(uint16_t)(length(name)*2),(uint16_t)(length(name)*2),name};
   OBJECT_ATTRIBUTES attributes={48,parent,&text,0,0,0}; IO_STATUS_BLOCK io={0};
@@ -85,7 +85,51 @@ static NTSTATUS rename_to(HANDLE file,HANDLE parent,const WCHAR *name,uint32_t f
   return NtSetInformationFile(file,&io,&info,20+info.FileNameLength,65);
 }
 static NTSTATUS dispose(HANDLE file) { uint32_t flags=3; IO_STATUS_BLOCK io={0}; return NtSetInformationFile(file,&io,&flags,4,64); }
+#ifdef CONTRACT_MAIN
 static uint32_t word(const uint8_t *p) { return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24; }
+#endif
+#endif
+
+#ifdef REMOTE_CONTRACT_MAIN
+/* Opt-in capability observation through the localhost administrative share. It changes no
+   share or security configuration and writes only into the runner's fresh scratch directory. */
+static void report_status(const char *name,uint32_t value) {
+  char output[10]; report(name);
+  for(unsigned i=0;i<8;++i) output[i]="0123456789abcdef"[(value>>(28-i*4))&15];
+  output[8]='\n';output[9]=0;report(output);
+}
+void mainCRTStartup(void) {
+  WCHAR cwd[32768],unc[32768];
+  uint32_t n=GetCurrentDirectoryW(32768,cwd);
+  CHECK(n>3&&n<32700&&cwd[1]==':');
+  const WCHAR *prefix=(const WCHAR *)L"\\??\\UNC\\localhost\\";
+  unsigned p=length(prefix),at=0;
+  for(;at<p;++at) unc[at]=prefix[at];
+  unc[at++]=cwd[0];unc[at++]='$';
+  for(unsigned i=2;i<=n;++i) unc[at++]=cwd[i];
+  HANDLE directory=0;
+  NTSTATUS status=nt_open(0,unc,129,7,1,1,&directory);
+  report_status("root NTSTATUS=",(uint32_t)status);
+  if(status!=0) {
+    report("UNSUPPORTED UNC probe: localhost administrative share inaccessible\n"); ExitProcess(77);
+  }
+  IO_STATUS_BLOCK io={0}; uint32_t volume[128]={0};
+  CHECK(NtQueryVolumeInformationFile(directory,&io,volume,sizeof(volume),4)==0);
+  report_status("device type=",volume[0]);report_status("device characteristics=",volume[1]);
+  CHECK(NtQueryVolumeInformationFile(directory,&io,volume,sizeof(volume),5)==0);
+  CHECK(volume[2]==8&&volume[3]==0x0054004e&&volume[4]==0x00530046);
+  HANDLE old=0,stage=0;
+  CHECK(nt_open(directory,(const WCHAR *)L"old",131,7,2,64,&old)==0);
+  CHECK(NtWriteFile(old,0,0,0,&io,"A",1,0,0)==0&&io.Information==1);
+  CHECK(nt_open(directory,(const WCHAR *)L"stage",131|0x10000,7,2,64,&stage)==0);
+  CHECK(NtWriteFile(stage,0,0,0,&io,"B",1,0,0)==0&&io.Information==1);
+  report_status("POSIX create-only rename NTSTATUS=",(uint32_t)rename_to(stage,directory,(const WCHAR *)L"old",2));
+  report_status("POSIX replace rename NTSTATUS=",(uint32_t)rename_to(stage,directory,(const WCHAR *)L"old",3));
+  report_status("POSIX dispose NTSTATUS=",(uint32_t)dispose(stage));
+  CHECK(NtClose(stage)==0&&NtClose(old)==0&&NtClose(directory)==0);
+  report("OBSERVED remote NTFS capabilities; no provider parity assertion\n");
+  ExitProcess(0);
+}
 #endif
 static HANDLE root;
 

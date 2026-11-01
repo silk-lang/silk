@@ -18,7 +18,8 @@ has compiled and executed on Server 2025. No security, Developer Mode, or antivi
   to a UTF-8 `string`. Invalid constructor roots trap, consistent with the existing constructor.
 - Roots use normalized absolute drive paths, with backslash separators. UNC, device, verbatim,
   volume-GUID, drive-relative and slash-rooted inputs are rejected. Native-root normalization,
-  drive selection, and translation from compiler host paths remain integration work.
+  drive selection, and translation from compiler host paths are supplied by `WindowsPath` and
+  `MachineFileSystem`; their fixtures cover the native compiler boundary.
 - Portable components cannot contain backslashes or colons. Every component is validated as
   canonical WTF-8 before conversion. Malformed bytes and separately encoded surrogate pairs
   fail with `InvalidPath`. Trailing dots/spaces use counted NT-name semantics, not Win32 trimming.
@@ -79,6 +80,31 @@ links for recursive cleanup nor changes system security. The oracle proves:
 - dangling and directory symlink replacement affecting the link itself;
 - directory record layout, counted lone-surrogate names, and distinct directory/link kinds.
 - per-directory case sensitivity retaining distinct `Name` and `name` files.
+
+## UNC capability boundary
+
+The host-path codec accepts `/UNC/server/share/...`, but this provider deliberately refuses
+remote roots. On Windows Server 2025 build 26100, a localhost administrative share reported
+NTFS and accepted root-relative reads and writes, yet both class-65 POSIX rename modes and
+class-64 POSIX delete returned `STATUS_INVALID_PARAMETER` (`0xc000000d`). The same operations
+pass on the local volume. Removing the remote-volume check would therefore break the retained
+handle and atomic-publication contract; legacy rename/delete are not equivalent substitutes.
+
+The existing C fixture includes an opt-in observation mode:
+
+```powershell
+& compiler/fixtures/windows-filesystem/run.ps1 -ProbeUnc
+```
+
+It uses the existing localhost administrative share and creates objects only in its new scratch
+directory. It does not create shares or alter security settings. An unavailable share is a
+reported unsupported outcome. The runner records native statuses as observations, not passing
+provider coverage or a claim about every SMB server. Local evidence is retained in
+`.scratch/windows-filesystem-unc-evidence/unc-capabilities.stdout.txt` and `results.json`.
+
+Supporting UNC requires a separately established filesystem contract or a demonstrated server
+capability; NTFS naming alone is insufficient. Non-NTFS and remote provider behavior remain
+unsupported in this feature, rather than being silently downgraded.
 
 `provider.silk` is the integration test. Its independent C setup creates a lone-surrogate
 filename, outside-target symlink/junction, and an old file. Assertions cover actual provider
