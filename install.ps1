@@ -22,7 +22,10 @@ function Test-SilkTag([string]$Tag) {
 function Get-SilkApi([string]$Path) {
   $headers = @{ Accept = 'application/vnd.github+json'; 'User-Agent' = 'silk-windows-installer' }
   if ($env:GITHUB_TOKEN) { $headers.Authorization = "Bearer $env:GITHUB_TOKEN" }
-  Invoke-RestMethod -Uri "https://api.github.com/repos/silk-lang/silk/$Path" -Headers $headers
+  # Invoke-RestMethod emits a JSON array as one pipeline object. Enumerate it on return
+  # so callers collecting a release page receive releases, not a nested array.
+  $response = Invoke-RestMethod -Uri "https://api.github.com/repos/silk-lang/silk/$Path" -Headers $headers
+  return $response
 }
 
 function Get-SilkRelease([string]$Requested, [string]$Channel) {
