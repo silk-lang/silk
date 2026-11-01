@@ -471,7 +471,7 @@ pub fn main() -> i32 {
   static for variant in Reflect.variants<Shape>() {
     let static count = fieldCount(variant)
     static if count == 0 { total = total + area(Reflect.makeVariant(variant, ())) }
-    static if count == 1 { total = total + area(Reflect.makeVariant(variant, (two,))) }
+    static if count == 1 { total = total + area(Reflect.makeVariant(variant, .(two))) }
     static if count == 2 { total = total + area(Reflect.makeVariant(variant, (three, four))) }
   }
   // 0 + 12 + 12

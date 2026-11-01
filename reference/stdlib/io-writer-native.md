@@ -198,7 +198,7 @@ effect fn report(count: i32) -> ()
   ! WriterError
   ? &mut Writer {
   run Writer.writeString("worker: ")
-  run Format.format("{} jobs left", &(count,))
+  run Format.format("{} jobs left", &.(count))
   return run Writer.writeString("\n")
 }
 
@@ -251,7 +251,7 @@ import silk.io.writer_native { StderrWriter }
 
 pub fn main() -> i32 {
   let width = 80
-  StderrWriter.print("width = {}\n", &(width,))
+  StderrWriter.print("width = {}\n", &.(width))
   return 0
 }
 ```

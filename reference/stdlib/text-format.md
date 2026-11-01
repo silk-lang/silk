@@ -1840,7 +1840,7 @@ and as a field that [`Format.debugFields`](#Format.impl.debugFields) writes. An 
 [`Format.debug`](#Format.impl.debug) and a `T: Debug` bound still need a `Debug` implementation, so an array or an
 anonymous tuple cannot be passed to `Format.debug` or held in an `Option` or a `List` that
 writes its `Debug` form. Pass it as a `{:?}` argument instead, as
-`Format.format("{:?}", &(values, ))`, or write a slice of an array with `&values`.
+`Format.format("{:?}", &.(values))`, or write a slice of an array with `&values`.
 
 <a id="Debug.debug"></a>
 
