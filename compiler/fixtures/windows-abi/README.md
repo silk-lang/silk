@@ -1,4 +1,4 @@
-# Win64 scalar C ABI oracle
+# Win64 C ABI oracles
 
 `scalars.c` is a header-free, independent C fixture. `scalars.ll` was emitted by stock Clang
 22.1.8, LLVM revision `ca7933e47d3a3451d81e72ac174dcb5aa28b59d1`, on Windows x86-64.
@@ -18,8 +18,31 @@ The explicit MSVC environment version keeps the oracle independent of Clang's ho
 Silk's canonical target name is `x86_64-pc-windows-msvc`.
 `SemanticLoweringCases.win64NarrowCDeclarationsCallsCallbacksAndExportsStayBare` checks Silk IR
 against these signatures. Existing SysV and GNU ARM64 cases retain their distinct extension rules.
-This fixture does not prove Windows runtime entry, linking, SEH unwinding, or aggregate/vector ABI
-support. It requires neither Windows SDK headers nor a C runtime.
+This scalar fixture requires neither Windows SDK headers nor a C runtime.
+
+`aggregates.c` and the independently emitted `aggregates.ll` establish the Win64 record and
+vector rules. Regenerate with the scalar command above, substituting `aggregates.c` and
+`aggregates.ll`. Records of exactly 1, 2, 4, or 8 bytes use integer lanes; a single `float`
+field still uses `i32`. Other nonempty records use caller copies and `sret`, without LLVM
+`byval`. A struct containing one vector is still a record and uses this indirect rule.
+
+LLVM vector arguments stay vector-typed. LLVM lowers them to aligned caller copies passed by
+pointer, while results use vector registers. Replacing those LLVM parameters with pointers
+would apply lowering twice. Clang's assembly for `vector_identity` loads from RCX into XMM0;
+`call_copies` puts its vector in an aligned local before passing its address to `consume`.
+Silk admits 128-, 256-, and 512-bit vectors with SSE2, AVX, and AVX-512F respectively.
+
+Clang's empty MS C record extension has size 4; Silk's empty records have size zero. Empty
+by-value records, including records containing them through fields or arrays, remain an explicit
+ABI gap rather than silently using incompatible offsets.
+`win64CRecordsAndVectorsUseTheirOwnCallingConvention` checks the independent signatures in the
+existing semantic test root. The shared `foreign-struct-values`, `foreign-struct-vectors`,
+`foreign-c-layout-lifetime`, `foreign-nullable-callback`, and `simd-c-vectors` corpus cases
+provide separately compiled C witnesses for execution, callbacks, exports, and caller copies.
+All five passed on Windows Server 2025 with a compiler built from this implementation and
+Clang 22.1.8; `.scratch/windows-corpus-abi.log` records the focused run. The Win64 scalar and
+positive record/vector lowering assertions also passed natively. Local timings are diagnostic;
+Linux CI checks their required timing budget.
 
 ## Upstream comparison
 
@@ -51,8 +74,7 @@ specifies right-justified integer arguments whose upper bits the callee can igno
 unused return bits. It also specifies 16-byte stack alignment and distinct aggregate rules.
 Its [64-bit data model](https://learn.microsoft.com/en-us/windows/win32/winprog64/abstract-data-models)
 specifies LLP64. These contracts and the independent C fixture determine Silk's machine facts
-and bare narrow-integer lanes. Windows aggregate/vector support remains an explicit gap instead
-of inheriting another target's rules.
+and bare narrow-integer lanes. The Win64 record classifier is separate from SysV and ARM64.
 
 ## Foreign personality ABI and native SEH proof
 
@@ -72,7 +94,7 @@ clang --target=x86_64-pc-windows-msvc19.33.0 -O2 -ffreestanding -fno-stack-prote
 including reclaim guards and coroutine steps. ELF and Mach-O retain the five-argument Itanium
 signature. The existing Windows scalar lowering case checks the complete emitted handler
 signature and reclaim guard; the SysV foreign-contract case checks the five-argument signature.
-These source tests require a runnable Silk compiler and have not run on this Windows host.
+These source tests run in the existing semantic lowering root.
 
 Run the opt-in native proof from the repository root:
 
@@ -111,11 +133,9 @@ does not require that runtime. Rust's
 provides the useful outer-catch control pattern, without importing its cross-language unwinding
 policy or claiming its tests passed here.
 
-This proves a reduced SEH boundary, not the full Silk Windows foreign-unwind corpus or fatal
-observer. Runtime providers, Windows frame walking, COFF frame-table bounds, and linking remain
-separate work. Compiler-generated Windows helper dependencies are not yet inventoried because
-this host has no runnable Silk compiler. Source inspection finds an i128 load/store used for
-16-byte union copies in `LlvmCode.storePackedUnion`; it does not establish a need for i128
-arithmetic builtins. The separate no-CRT proof's synthetic i128 arithmetic inventory is not
-evidence that Silk emits those operations. No compiler-rt supply, security-cookie stub, or
-other runtime support is added here.
+The shared `foreign-direct-forbidden-unwind`, `foreign-indirect-forbidden-unwind`, and `foreign-callback-forbidden-unwind`
+fixtures additionally execute real Silk boundaries with an exact fast-fail status requirement.
+The C-only outer-catch control distinguishes the guard from an escaped exception. Their C
+objects need `-funwind-tables`: without unwind tables, an exception can terminate before
+reaching the control's catch and falsely look like a working guard. Runtime frame walking and
+helper inventories have separate fixtures under `windows-runtime`.

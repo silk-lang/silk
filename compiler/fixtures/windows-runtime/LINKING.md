@@ -9,6 +9,37 @@ and `/entry:mainCRTStartup`. No CRT archive, allocator shim, or security cookie 
 Floating remainder helpers use COFF weak definitions, so an explicitly requested foreign math
 library can supply `fmod` without colliding with the compiler's no-CRT implementation.
 
+On a Windows host the final Clang request uses a private UTF-8 response file with LLVM's
+Windows quoting mode. This preserves spaces, quotes, trailing backslashes, and non-ASCII paths
+while avoiding CreateProcessW's 32,767 UTF-16-unit command limit. Cross-target link caches retain
+the arguments before encoding the Clang request. The native compiler runner links 400 independent
+empty COFF inputs from paths containing spaces, a comma, and a non-ASCII character,
+then executes the result. The old direct command fails this control before Clang can run.
+
+Ordered groups of object/archive inputs go directly to LLD in their own Windows-quoted response
+files. Clang 22's [`Command::writeResponseFile`](https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/clang/lib/Driver/Job.cpp)
+doubles every backslash when it creates a linker response file. That corrupts `\\?\...`
+extended paths under LLD's default Windows parser; an independent 400-object Clang invocation
+reproduced this without Silk. Clang runs in the private scratch directory, so `-Wl,@link-inputs-N.rsp`
+needs no directory spelling and cannot split a comma in a path. The explicit response file
+preserves extended paths and avoids that automatic writer. LLVM archiver requests use response
+files as well. The native runner also archives those 400 inputs with a Silk export, then checks
+all 401 members and that export with LLVM tools. COFF compilation omits the ELF `-fPIC` flag.
+
+On Windows Server 2025 with LLVM 22.1.8, both the executable and archive checks passed,
+as did the original unoptimized compiler build. The six shared C aggregate, vector, and
+resolver corpus cases passed in debug and optimized builds. The earlier compiler fails the
+long-command control before launching Clang; the driver-only response fix reaches Clang but
+fails when its automatic linker response file corrupts extended paths.
+
+The response format follows LLVM 22.1.8's
+[`TokenizeWindowsCommandLine`](https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/llvm/lib/Support/CommandLine.cpp)
+contract. Rust's pinned
+[`linker command handling`](https://github.com/rust-lang/rust/blob/2687a5023568f1e469910a54abf2e42d979d9ab4/compiler/rustc_codegen_ssa/src/back/link.rs)
+also uses response files to handle command-line limits; this does not require adopting Rust's
+CRT or linker policy. The independent failure was an unoptimized native Silk compiler build
+with 347 object paths totaling more than 36,000 characters before other linker arguments.
+
 The same LLVM installation compiles the embedded TLS support source. Its writable `_tls_index`
 starts at `TLS_OUT_OF_INDEXES`; the Windows loader writes the module index before entry. The
 `.tls` and `.tls$ZZZ` sentinels bound LLVM's static TLS definitions. `_tls_used` contains relocated

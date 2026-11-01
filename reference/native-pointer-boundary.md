@@ -143,9 +143,8 @@ exception routine ABI: exception-record pointer, 64-bit establisher frame, conte
 dispatcher-context pointer, with an `i32` disposition result. The handler terminates through
 Windows fast fail with reason `FAST_FAIL_FATAL_APP_EXIT`, without dispatching another exception.
 ELF and Mach-O keep their five-argument trap personality. All targets use a hidden coalesced
-definition. A reduced native SEH fixture verifies the Windows handler boundary.
-Full Silk executable interoperability still requires the Windows runtime and linker.
-By-value C structs and vectors on Windows remain unsupported and must not use the ARM64 classifier.
+definition. Native SEH controls and the shared Silk foreign-unwind corpus verify the Windows
+handler boundary, including an outer C catch that must not observe an exception crossing Silk.
 
 An `extern "C" struct` can pass or return by value in direct calls, native function-pointer
 calls and exported functions. Its fields retain the C object restrictions: C scalars, raw
@@ -157,6 +156,7 @@ the caller's object, including when the machine ABI passes an address of a calle
 | Target | Struct arguments and results |
 | --- | --- |
 | System V x86-64 | Up to two eightbytes use INTEGER and SSE registers. An argument that needs more registers than remain passes entirely in memory. Larger records use `byval` arguments and `sret` results. A record containing only one admitted SIMD vector retains that vector's register convention and feature requirement. |
+| Windows x86-64 MSVC | Records of exactly 1, 2, 4, or 8 bytes use one integer lane, including records containing floating-point fields. Other nonempty records use pointers to caller copies and `sret` results, without LLVM `byval`. Empty records, and records containing them through fields or arrays, remain unsupported at a by-value boundary. |
 | GNU and Apple ARM64 | Homogeneous aggregates of one through four floats or short vectors use vector registers. Other records up to 16 bytes use general registers. Larger arguments pass a pointer to a caller copy; indirect results use `sret` in x8. GNU homogeneous arguments retain the AAPCS64 stack alignment; Apple uses its own stack placement. |
 | wasm32 | A record containing a single scalar uses that scalar's lane. Other records use indirect arguments and results. |
 

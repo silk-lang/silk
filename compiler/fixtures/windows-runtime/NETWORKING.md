@@ -6,6 +6,13 @@ Windows AF_INET6 is 23 and AI_NUMERICSERV is 8. Returned lists are freed before 
 its Winsock reference. The existing result limit, family filtering, deduplication, and refusal of
 blocking DNS deadlines are unchanged.
 
+The shared `network-address-resolution` corpus also runs on Windows in debug and optimized
+profiles. Its independent C witness replaces `GetAddrInfoW` and `FreeAddrInfoW`, checks UTF-16
+arguments and the Win64 structure offsets, and drives the same malformed-list, limit, family,
+deduplication, deadline, and ownership assertions as the Unix witness. The error assertion
+requires a direct Winsock result with no fabricated `errno`; Unix retains its EAI_SYSTEM/errno
+pair. Both profiles passed locally with LLVM 22.1.8 (`.scratch/windows-corpus-resolver.log`).
+
 References inspected:
 
 - [Rust 1.90 Windows sockets](https://github.com/rust-lang/rust/blob/1159e78c4747b02ef996e55082b704c09b970588/library/std/src/sys/net/connection/socket/windows.rs):

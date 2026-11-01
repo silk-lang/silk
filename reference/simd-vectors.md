@@ -361,7 +361,7 @@ attribute.
 
 **Evidence:** `corpus/native/simd-function-features`, `corpus/invalid/simd-function-features-invalid`.
 
-## SIMD-010 — A vector crosses the C boundary in one vector register
+## SIMD-010 — A vector crosses the C boundary with the target's C convention
 
 **Status:** Confirmed
 
@@ -373,7 +373,9 @@ export "C" fn add(a: simd<i32, 4>, b: simd<i32, 4>) -> simd<i32, 4> { return a +
 A `simd<T, N>` with integer or floating-point lanes of a fixed width (not `isize` or `usize`) may
 be a parameter or result of an `extern "C"` or `export "C"` function. It crosses the boundary the
 way the target's C compilers pass the vector type of the same lanes, such as `__m128`,
-`float32x4_t`, `v128_t` or a GNU `vector_size` type: in one vector register.
+`float32x4_t`, `v128_t` or a GNU `vector_size` type. Windows x86-64 arguments use aligned
+caller copies passed by pointer, and results use vector registers. Other supported targets use
+one vector register in both directions. LLVM vector-typed lanes implement both conventions.
 
 | Target | Widths | CPU feature the profile selects |
 | --- | --- | --- |
@@ -387,8 +389,8 @@ way the target's C compilers pass the vector type of the same lanes, such as `__
 profile decides the register, not the function: a function compiled with `@features` (SIMD-009) passes
 vectors to C like the rest of the program. A C static may hold a vector.
 
-**Diagnostics:** A vector in an imported C signature whose width the target's C ABI does not pass
-in a vector register, or that needs a CPU feature the profile does not select, reports `SEM0244`
+**Diagnostics:** A vector in an imported C signature whose width the target's C ABI does not admit,
+or that needs a CPU feature the profile does not select, reports `SEM0244`
 at the call. The same vector in an exported signature reports the `c-abi-vector` gap.
 
 **Current compiler:** Aligned.
