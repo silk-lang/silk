@@ -18,9 +18,11 @@ export const targets = [
   'x86_64-unknown-linux-gnu',
   'aarch64-unknown-linux-gnu',
   'aarch64-apple-darwin',
+  'x86_64-pc-windows-msvc',
 ]
 export const TargetSchema = Schema.Literals(targets)
-export const seedAsset = (target) => `silk-compiler-${target}`
+export const seedAsset = (target) =>
+  `silk-compiler-${target}${target === 'x86_64-pc-windows-msvc' ? '.exe' : ''}`
 const Hex = (length) => Schema.String.check(Schema.isPattern(new RegExp(`^[a-f0-9]{${length}}$`)))
 // Compiler releases and frozen-bootstrap native seeds have distinct publication namespaces.
 const isSeedTag = (tag) =>

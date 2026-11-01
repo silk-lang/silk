@@ -2,10 +2,11 @@ param(
   [Parameter(Mandatory=$true)][string]$Compiler,
   [Parameter(Mandatory=$true)][string]$OutputDirectory,
   [switch]$SelfHost,
+  [string]$SourceRoot = (Join-Path $PSScriptRoot '../../..'),
   [string]$LlvmBin = "$env:USERPROFILE\silk-windows-tools\clang+llvm-22.1.8-x86_64-pc-windows-msvc\bin"
 )
 $ErrorActionPreference = 'Stop'
-$root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '../../..')).Path
+$root = (Resolve-Path -LiteralPath $SourceRoot).Path
 $compilerPath = (Resolve-Path -LiteralPath $Compiler).Path
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 $output = (Resolve-Path -LiteralPath $OutputDirectory).Path

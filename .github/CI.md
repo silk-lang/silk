@@ -1,5 +1,14 @@
 # Running CI on a branch
 
+Selfhost also invokes `windows-release.yml` with its verified Linux N1 and immutable source
+snapshot. Linux cross-builds the first Windows compiler; `windows-2025` builds N2, verifies the
+native IR fixpoint and compiler identity, and builds the tool. Linux packages the Windows ZIP,
+and Windows extracts it and builds a new project through the bundled tool without `--stdlib`.
+This chain supplies the Windows release candidate and gates publication, while the existing
+Linux required check remains unchanged. It does not alter the pinned seed or require a Windows seed.
+The candidate asset is `silk-compiler-x86_64-pc-windows-msvc.exe`; its installable archive is
+`silk-<version>-x86_64-pc-windows-msvc.zip`.
+
 The separate, non-required `Windows native execution` workflow consumes the
 successful `selfhost-native-n1` artifact from a dispatched Selfhost run. It verifies the build receipt
 against that compiler's source commit, cross-builds the workflow revision's Windows fixtures on Linux, and executes
