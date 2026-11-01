@@ -1,7 +1,7 @@
 param(
   [Parameter(Mandatory = $true)][string]$ArtifactDirectory,
   [string]$LlvmBin = "$env:USERPROFILE\silk-windows-tools\clang+llvm-22.1.8-x86_64-pc-windows-msvc\bin",
-  [string[]]$Programs = @('hello', 'hello-speed', 'storage', 'host-check', 'providers', 'filesystem', 'process', 'process-image', 'console', 'resolver', 'sockets',
+  [string[]]$Programs = @('hello', 'hello-speed', 'storage', 'host-check', 'providers', 'filesystem', 'process', 'process-image', 'console', 'resolver', 'sockets', 'trust', 'https',
     'native-thread-spawn-join', 'native-thread-cross-wake', 'atomic-wait-notify', 'native-termination-source-trap', 'stderr-locked-message')
 )
 $ErrorActionPreference = 'Stop'
@@ -24,15 +24,19 @@ foreach ($name in $Programs) {
   $imports = @($inspection | Select-String '^\s+Name: (.+\.dll)$' | ForEach-Object { $_.Matches[0].Groups[1].Value })
   $allowed = '^(kernel32|ntdll)\.dll$'
   if ($name -eq 'resolver' -or $name -eq 'sockets') { $allowed = '^(kernel32|ntdll|ws2_32)\.dll$' }
+  if ($name -eq 'trust') { $allowed = '^(kernel32|ntdll|crypt32)\.dll$' }
+  if ($name -eq 'https') { $allowed = '^(kernel32|ntdll|ws2_32|crypt32|bcryptprimitives)\.dll$' }
   if ($name -eq 'providers' -or $name -eq 'process' -or $name -eq 'process-image') { $allowed = '^(kernel32|ntdll|bcryptprimitives)\.dll$' }
   $corpusThread = $name -like 'native-thread-*' -or $name -like 'atomic-*'
   if ($corpusThread) { $allowed = '^(kernel32|ntdll|api-ms-win-core-synch-l1-2-0)\.dll$' }
   if ($imports.Count -eq 0 -or @($imports | Where-Object { $_ -notmatch $allowed }).Count -ne 0) {
     throw "Unexpected or missing DLL imports for $name`: $imports"
   }
-  if ($name -eq 'host-check' -or $name -eq 'providers' -or $name -eq 'filesystem' -or $name -eq 'console') {
+  if ($name -eq 'host-check' -or $name -eq 'providers' -or $name -eq 'filesystem' -or $name -eq 'console' -or $name -eq 'https') {
     try {
-      if ($name -eq 'console') {
+      if ($name -eq 'https') {
+        $detail = & (Join-Path $PSScriptRoot 'run-https.ps1') -Executable $executable -OutputDirectory (Join-Path $artifact 'https-native')
+      } elseif ($name -eq 'console') {
         $detail = & (Join-Path $PSScriptRoot 'run-console.ps1') -Executable $executable
       } elseif ($name -eq 'host-check') {
         $detail = & (Join-Path $PSScriptRoot 'run-host.ps1') -Executable $executable

@@ -7,7 +7,7 @@ mkdir -p "$out"
 git rev-parse HEAD > "$out/source-commit.txt"
 printf 'program\tcompile\tpe-imports\texecution\n' > "$out/results.tsv"
 failed=0
-for program in hello hello-speed storage host-check providers process console resolver sockets native-thread-spawn-join native-thread-cross-wake atomic-wait-notify native-termination-source-trap stderr-locked-message; do
+for program in hello hello-speed storage host-check providers process console resolver sockets trust https native-thread-spawn-join native-thread-cross-wake atomic-wait-notify native-termination-source-trap stderr-locked-message; do
   source="$PWD/compiler/fixtures/windows-runtime/$program.silk"
   optimization=none
   allowed_dlls='Name: (kernel32|ntdll)\.dll'
@@ -38,7 +38,30 @@ version = "0.0.0"
 silk-version = "0.0.0"
 EOF
   source="$package/src/main.silk"
-  if [ "$program" = resolver ] || [ "$program" = sockets ]; then
+  if [ "$program" = trust ] || [ "$program" = https ]; then
+    python3 - "$package/crypt32.def" <<'PY'
+from pathlib import Path
+import re
+import sys
+import textwrap
+source = Path('compiler/src/driver/WindowsLink.silk').read_text()
+definition = re.search(r'fn crypt32\(\).*?return """(.*?)"""', source, re.S)
+assert definition, 'Production Crypt32 imports missing'
+Path(sys.argv[1]).write_text(textwrap.dedent(definition.group(1)).strip() + '\n')
+PY
+    llvm-dlltool -m i386:x86-64 -d "$package/crypt32.def" -l "$package/crypt32.lib" || exit 1
+  fi
+  if [ "$program" = trust ]; then
+    printf '\n[native]\nlink = [{ object = "companion.obj" }, { static-archive = "crypt32.lib" }]\n' >> "$package/silk.toml"
+    if ! "$SILK_TEST_CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-stack-protector \
+        -Wall -Wextra -Werror -c compiler/fixtures/windows-runtime/trust-contract.c -o "$package/companion.obj"; then
+      printf 'trust\tfail: companion\tnot-checked\tnot-checked\n' >> "$out/results.tsv"
+      failed=1
+      continue
+    fi
+    allowed_dlls='Name: (kernel32|ntdll|crypt32)\.dll'
+  fi
+  if [ "$program" = resolver ] || [ "$program" = sockets ] || [ "$program" = https ]; then
     python3 - "$package/fixture.def" <<'PY'
 from pathlib import Path
 import re
@@ -51,19 +74,31 @@ assert definition, 'Production Winsock imports missing'
 Path(sys.argv[1]).write_text(textwrap.dedent(definition.group(1)).strip() + '\nsocket\n')
 PY
     printf 'LIBRARY kernel32.dll\nEXPORTS\nSetHandleInformation\n' > "$package/fixture-kernel.def"
-    cat >> "$package/silk.toml" <<'EOF'
+    if [ "$program" = https ]; then
+      cat >> "$package/silk.toml" <<'EOF'
+[native]
+link = [{ static-archive = "fixture.lib" }, { static-archive = "fixture-kernel.lib" }, { static-archive = "crypt32.lib" }]
+EOF
+    else
+      cat >> "$package/silk.toml" <<'EOF'
 [native]
 link = [{ object = "companion.obj" }, { static-archive = "fixture.lib" }, { static-archive = "fixture-kernel.lib" }]
 EOF
-    if ! "$SILK_TEST_CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-stack-protector \
-        -Wall -Wextra -Werror -c "compiler/fixtures/windows-runtime/$program-contract.c" -o "$package/companion.obj" \
-        || ! llvm-dlltool -m i386:x86-64 -d "$package/fixture.def" -l "$package/fixture.lib" \
+      if ! "$SILK_TEST_CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-stack-protector \
+          -Wall -Wextra -Werror -c "compiler/fixtures/windows-runtime/$program-contract.c" -o "$package/companion.obj"; then
+        printf '%s\tfail: companion\tnot-checked\tnot-checked\n' "$program" >> "$out/results.tsv"
+        failed=1
+        continue
+      fi
+    fi
+    if ! llvm-dlltool -m i386:x86-64 -d "$package/fixture.def" -l "$package/fixture.lib" \
         || ! llvm-dlltool -m i386:x86-64 -d "$package/fixture-kernel.def" -l "$package/fixture-kernel.lib"; then
       printf '%s\tfail: companion\tnot-checked\tnot-checked\n' "$program" >> "$out/results.tsv"
       failed=1
       continue
     fi
     allowed_dlls='Name: (kernel32|ntdll|ws2_32)\.dll'
+    if [ "$program" = https ]; then allowed_dlls='Name: (kernel32|ntdll|ws2_32|crypt32|bcryptprimitives)\.dll'; fi
   fi
   if [ "$program" = console ]; then
     printf 'LIBRARY kernel32.dll\nEXPORTS\nSetStdHandle\nSetConsoleMode\nCreateConsoleScreenBuffer\nReadConsoleOutputCharacterW\nGetConsoleOutputCP\n' > "$package/fixture.def"

@@ -44,4 +44,40 @@ imports only Kernel32, Ntdll, and Ws2_32. Linux-target LLVM IR emission also pas
 Local evidence: `.scratch/windows-sockets-native/results.json`, `imports.txt`, and the retained
 pre-fix executable. The shared cross-build and Windows runner include this fixture.
 IPv6 execution, inherited-handle inspection, and the full deadline/error matrix are not checked
-by this fixture. UDP and Windows certificate-store integration remain separate work.
+by this fixture. UDP remains separate work.
+
+`WindowsRootTrustSource` reads the current user's logical `ROOT` store with Crypt32, including
+machine roots exposed by that store. It opens read-only, bounds total input/DER bytes and counts,
+owns every certificate in the returned snapshot, and releases both enumeration contexts and
+the store on failure. A malformed certificate fails the complete load. This is an import of
+certificate anchors, not a reimplementation of Windows chain policy: store properties,
+disallowed-store entries, automatic root updates, and revocation are not imported.
+
+The pinned [Zig ROOT-store implementation](https://github.com/ziglang/zig/blob/e4cbd752c8c05f131051f8c873cff7823177d7d3/lib/std/crypto/Certificate/Bundle.zig#L133)
+also enumerates the logical ROOT store and copies DER. Silk additionally checks enumeration's
+terminal error and owns the outstanding context during early failure. Microsoft documents that
+[`CertEnumCertificatesInStore`](https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-certenumcertificatesinstore)
+consumes its previous context even on failure; only `CRYPT_E_NOT_FOUND` ends this enumeration.
+The [system-store provider](https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-certopenstore)
+uses `CURRENT_USER | OPEN_EXISTING | READONLY`. Rust's standard library has no TLS trust provider;
+the socket ownership comparison above does not establish certificate policy.
+
+The actual `trust.silk` fixture passed against the machine's real store. Its C oracle independently
+enumerates Crypt32 and checks the count and every exact DER value. It also checks the anchor limit
+and that a prior snapshot remains valid after a failed load. PE imports are Kernel32, Ntdll,
+and Crypt32. Local evidence is in `.scratch/windows-trust-native/`.
+
+`NativeHttp` now uses this ROOT provider by default on Windows. An explicit PEM bundle or
+`SSL_CERT_FILE` replaces it; relative environment paths resolve against the native working
+directory. The same HTTP, TLS, certificate, and socket implementations handle the request.
+`run-https.ps1` creates a temporary CA and a separate server certificate, without modifying any
+system store, then starts an independent local OpenSSL TLS 1.3 server. The actual Silk fixture
+passed an HTTP request through both an absolute Windows PEM path and relative `SSL_CERT_FILE`.
+The default system roots reject that unrelated issuer with the structured `NoIssuer` reason.
+An initial fixture with a CA certificate as its leaf was correctly rejected with
+`InvalidBasicConstraints`; it was replaced with a correctly constrained leaf.
+
+Local HTTPS evidence: `.scratch/windows-https-native/server/results.json`, build and server logs.
+The same fixture also emits Linux LLVM IR successfully. Shared cross-build and native runners
+include both trust fixtures. Windows certificate-store mutation during enumeration, forced
+Crypt32 failures, and native execution of this HTTPS fixture on Linux are not checked here.

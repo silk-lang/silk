@@ -12,7 +12,8 @@ that requires `? &mut Http` then sends real requests over sockets and TLS.
 The provider has its own clocks, random source, and trust store, so you give only an allocator.
 The defaults are a deadline of 30 seconds for each request, a response body of at most 16 MiB,
 up to 10 redirects, and the PEM bundle of the platform for HTTPS: `/etc/ssl/cert.pem` on macOS
-and `/etc/ssl/certs/ca-certificates.crt` on Linux. `NativeHttp.fromEnvironment` uses the file
+and `/etc/ssl/certs/ca-certificates.crt` on Linux, or the logical Windows `ROOT` store.
+`NativeHttp.fromEnvironment` uses the file
 in `SSL_CERT_FILE` when it is set, and the proxies in `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`,
 and `NO_PROXY`. Each request opens a new HTTP/1.1 connection and sends `Accept-Encoding:
 identity`, so the body arrives as the server sent it.
@@ -26,6 +27,8 @@ from HTTPS to HTTP fails. A redirect to another origin does not send `Authorizat
 The deadline covers the TLS handshake and the HTTP exchange, but not the name lookup and the TCP
 connect. The macOS keychain is not used, only the PEM bundle. `NativeHttp.make` reads no
 environment variables, so it never uses a proxy. Only `http://` proxies are supported.
+Windows imports root certificates rather than the Windows chain-engine policy; revocation,
+store usage properties, and disallowed-store entries are not imported.
 
 ## Examples
 ### Set up the client
@@ -77,4 +80,4 @@ This module declares no public items.
 
 Category: HTTP.
 
-Profiles: `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`.
+Profiles: `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`.

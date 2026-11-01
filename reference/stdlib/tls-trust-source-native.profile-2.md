@@ -8,6 +8,8 @@ A native `TrustSource` provider that loads trust anchors from one PEM file.
 Provide `NativeFileTrustSource` for `TrustSource` when your program uses one PEM bundle of CA
 certificates, for example `/etc/ssl/certs/ca-certificates.crt` on Debian or `/etc/ssl/cert.pem`
 on macOS.
+On Windows, configure a normalized native drive root such as `C:\certs` and a portable
+path beneath it. Local NTFS and the Windows filesystem provider restrictions apply.
 
 ## Details
 `NativeFileTrustSource.make` copies the root directory and the path. It does no I/O. Each
@@ -26,7 +28,7 @@ new file and rename it. A change in place can be read half way.
 ## Gotchas
 - It does not look for a default file, read environment variables, or use the trust store of the
   system (such as the macOS keychain). It does not check revocation.
-- The provider exists only on Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+- Supported targets are Windows x86_64 MSVC, Darwin aarch64, and GNU/Linux x86_64 or aarch64.
 
 ## Examples
 ### Configure a bundle and see a load fail
@@ -81,4 +83,4 @@ This module declares no public items.
 
 Category: TLS and certificates.
 
-Profiles: `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`.
+Profiles: `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`.

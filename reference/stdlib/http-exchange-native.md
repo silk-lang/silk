@@ -39,7 +39,7 @@ prepare.
 ## Gotchas
 - Resolution of a host name cannot stop at a deadline. A host name with a deadline fails with
   `UnsupportedDeadline` before any contact. An IP address with a deadline is accepted.
-- Only Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64, are supported. On other
+- Windows x86_64 MSVC, Darwin aarch64, and GNU/Linux x86_64 or aarch64 are supported. On other
   targets, a call that is used fails to compile. Unused imports and [`Options`](#Options) still compile.
 
 ## Examples

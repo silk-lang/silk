@@ -8,6 +8,8 @@ A native `TrustSource` provider that loads trust anchors from one PEM file.
 Provide [`NativeFileTrustSource`](#NativeFileTrustSource) for `TrustSource` when your program uses one PEM bundle of CA
 certificates, for example `/etc/ssl/certs/ca-certificates.crt` on Debian or `/etc/ssl/cert.pem`
 on macOS.
+On Windows, configure a normalized native drive root such as `C:\certs` and a portable
+path beneath it. Local NTFS and the Windows filesystem provider restrictions apply.
 
 ## Details
 [`NativeFileTrustSource.make`](#NativeFileTrustSource.impl.make) copies the root directory and the path. It does no I/O. Each
@@ -26,7 +28,7 @@ new file and rename it. A change in place can be read half way.
 ## Gotchas
 - It does not look for a default file, read environment variables, or use the trust store of the
   system (such as the macOS keychain). It does not check revocation.
-- The provider exists only on Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+- Supported targets are Windows x86_64 MSVC, Darwin aarch64, and GNU/Linux x86_64 or aarch64.
 
 ## Examples
 ### Configure a bundle and see a load fail
@@ -88,7 +90,8 @@ pub struct NativeFileTrustSource
 ```
 
 A `TrustSource` provider that owns a root directory and a path to a PEM file below it. It does
-not cache snapshots.
+not cache snapshots. On Windows, the root is a normalized native drive path, such as `C:\certs`;
+local NTFS and the Windows filesystem provider restrictions apply.
 
 ### When to use
 Provide it for `TrustSource` when your program uses one PEM bundle of CA certificates, for
@@ -104,7 +107,7 @@ file, write a new file and rename it. A change in place can be read half way.
 ### Gotchas
 - It does not look for a default file, read environment variables, or use the trust store of
   the system (such as the macOS keychain). It does not check revocation.
-- The provider exists only on Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+- Supported targets are Windows x86_64 MSVC, Darwin aarch64, and GNU/Linux x86_64 or aarch64.
 
 <a id="NativeFileTrustSource.impl"></a>
 
@@ -128,6 +131,8 @@ pub effect fn make(
 ```
 
 Returns a provider for the PEM file at `path` below `root`. It does no I/O.
+Windows roots are normalized native drive paths such as `C:\certs`; the file must be on
+local NTFS without reparse traversal. Unix roots use absolute slash paths.
 
 #### Errors
 - `TrustSourceError` with `InvalidConfiguration` if `root` is empty, is not absolute, or has
@@ -153,4 +158,4 @@ load: NativeFileTrustSource.loadCurrent
 
 Category: TLS and certificates.
 
-Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`.
+Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`.

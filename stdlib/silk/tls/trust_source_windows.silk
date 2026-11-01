@@ -1,0 +1,158 @@
+//! A `TrustSource` provider for the current user's Windows `ROOT` certificate store.
+//!
+//! # When to use
+//!
+//! Provide `WindowsRootTrustSource` explicitly when a TLS client should trust certificates in
+//! the Windows logical `ROOT` store, including machine roots exposed through that store.
+//!
+//! # Details
+//!
+//! Each load opens the existing store read-only, copies every certificate, and closes the store.
+//! Snapshots own their certificates. Enumeration order is unspecified, and the store may change
+//! during enumeration. A malformed certificate fails the whole load; none are silently skipped.
+//!
+//! # Gotchas
+//!
+//! This imports certificate anchors, not Windows chain-engine policy. It does not import store
+//! properties, usage restrictions, the disallowed store, revocation policy, or automatic root
+//! updates. Silk's TLS verifier checks the resulting chain. The provider is available on Windows
+//! x86_64 MSVC and is never installed implicitly.
+//!
+//! @category TLS and certificates
+
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.collections.list {List}
+import silk.core.ownership {Copy, Drop}
+import silk.core.result {Result}
+import silk.mem.pointer {Pointer}
+import silk.tls.certificate {Certificate, DecodeError}
+import silk.tls.trust_anchor {TrustAnchor}
+import silk.tls.trust_snapshot {TrustLoadLimits, TrustSnapshot, TrustSourceError, TrustLimitKind, TrustStoreOperation}
+import silk.tls.trust_source {TrustSource}
+import silk.num.u32
+
+static if Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArchitecture() == "x86_64" && Intrinsic.targetAbi() == "msvc" {
+  extern "C" struct CertificateContext {
+    encoding: u32,
+    bytes: [*]const u8,
+    length: u32,
+    information: ?*const u8,
+    store: ?*mut u8,
+  }
+  impl Copy for CertificateContext {}
+
+  // CERT_STORE_PROV_SYSTEM_W is the pointer-valued identifier 10, passed in a Win64 register.
+  @foreign(noCapture: ("name",))
+  unsafe extern "C" fn CertOpenStore(provider: usize, encoding: u32, cryptography: usize,
+    flags: u32, name: ?[*]const u16) -> ?*mut u8
+  unsafe extern "C" fn CertCloseStore(store: ?*mut u8, flags: u32) -> i32
+  unsafe extern "C" fn CertEnumCertificatesInStore(store: ?*mut u8,
+    previous: ?*const CertificateContext) -> ?*const CertificateContext
+  unsafe extern "C" fn CertFreeCertificateContext(context: ?*const CertificateContext) -> i32
+  unsafe extern "C" fn GetLastError() -> u32
+
+  struct StoreOwner { raw: ?*mut u8 }
+  impl Drop for StoreOwner {
+    fn drop(self: &mut Self) -> () {
+      if !Pointer.isNull(self.raw) { let ignored = unsafe CertCloseStore(self.raw, 0) }
+    }
+  }
+  struct ContextOwner { raw: ?*const CertificateContext }
+  impl Drop for ContextOwner {
+    fn drop(self: &mut Self) -> () {
+      if !Pointer.isNull(self.raw) { let ignored = unsafe CertFreeCertificateContext(self.raw) }
+    }
+  }
+}
+
+/// A `TrustSource` that reads the current user's logical Windows `ROOT` certificate store.
+///
+/// # Details
+///
+/// Each load opens the existing store read-only and copies every certificate into an owned
+/// snapshot. Machine roots visible in that logical store are included. No snapshot is cached.
+/// Input bytes, DER bytes, certificate counts, and anchor limits apply to the whole enumeration.
+/// A malformed certificate or native store failure fails the entire load.
+///
+/// # Gotchas
+///
+/// Windows x86_64 MSVC only. This imports certificates, not Windows chain-engine policy, store
+/// properties, usage restrictions, disallowed-store entries, revocation, or automatic updates.
+/// Enumeration is not atomic against external store changes. Provide this source explicitly;
+/// no default trust source is installed.
+pub struct WindowsRootTrustSource {}
+
+impl WindowsRootTrustSource {
+  /// Returns a provider for the Windows logical `ROOT` store without opening it.
+  ///
+  /// The provider reads the current user's store at each load, including machine roots visible
+  /// through it. It is available only on Windows x86_64 MSVC.
+  pub fn make() -> Self {
+    static if Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArchitecture() == "x86_64" && Intrinsic.targetAbi() == "msvc" {
+      return WindowsRootTrustSource {}
+    } else { compileError("WindowsRootTrustSource requires Windows x86_64 MSVC") }
+  }
+
+  effect fn loadCurrent(self: &mut Self, limits: TrustLoadLimits) -> TrustSnapshot
+  ! TrustSourceError | OutOfMemoryError ? &mut Allocator {
+    static if Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArchitecture() == "x86_64" && Intrinsic.targetAbi() == "msvc" {
+      let name: [u16; 5] = [82, 79, 79, 84, 0]
+      // CURRENT_USER | OPEN_EXISTING | READONLY.
+      let handle = unsafe CertOpenStore(10, 0, 0, 114688, Pointer.fromSlice(&name))
+      if Pointer.isNull(handle) {
+        fail TrustSourceError.Store {operation: TrustStoreOperation.Open, code: unsafe GetLastError()}
+      }
+      let mut store = StoreOwner {raw: handle}
+      let mut context = ContextOwner {raw: Pointer.null<CertificateContext>()}
+      let mut anchors = List<TrustAnchor>.make()
+      let mut total: usize = 0
+      while true {
+        // Enumeration consumes the previous context even when it returns null.
+        context.raw = unsafe CertEnumCertificatesInStore(store.raw, context.raw)
+        if Pointer.isNull(context.raw) {
+          let code = unsafe GetLastError()
+          if code != 2148081668 {
+            fail TrustSourceError.Store {operation: TrustStoreOperation.Enumerate, code: code}
+          }
+          break
+        }
+        if List<TrustAnchor>.length(&anchors) >= limits.snapshot.anchors {
+          fail TrustSourceError.LimitExceeded {kind: TrustLimitKind.AnchorCount, limit: limits.snapshot.anchors}
+        }
+        if List<TrustAnchor>.length(&anchors) >= limits.decode.certificates {
+          fail TrustSourceError.LimitExceeded {kind: TrustLimitKind.AnchorCount, limit: limits.decode.certificates}
+        }
+        let pointer = unsafe Intrinsic.pointerRequalify<?*const CertificateContext, *const CertificateContext>(context.raw)
+        let entry = unsafe Pointer.read(pointer)
+        let length = u32.toUsize(entry.length)
+        if length > limits.decode.inputBytes - total {
+          fail TrustSourceError.LimitExceeded {kind: TrustLimitKind.InputBytes, limit: limits.decode.inputBytes}
+        }
+        if length > limits.decode.totalDerBytes - total {
+          fail TrustSourceError.LimitExceeded {kind: TrustLimitKind.EncodedBytes, limit: limits.decode.totalDerBytes}
+        }
+        if length > limits.snapshot.encodedBytes - total {
+          fail TrustSourceError.LimitExceeded {kind: TrustLimitKind.EncodedBytes, limit: limits.snapshot.encodedBytes}
+        }
+        let bytes = unsafe Pointer.borrowMany(&context, entry.bytes, length)
+        let decoded = run Certificate.decodeDer(bytes, limits.decode)
+        let certificate = match move decoded {
+          Result<Certificate, DecodeError>.Success {value} => move value
+          Result<Certificate, DecodeError>.Failure {error} => { fail TrustSourceError.Decode {error: move error} }
+        }
+        let appended = run List<TrustAnchor>.append(&mut anchors, TrustAnchor.fromCertificate(move certificate))
+        total = total + length
+      }
+      let raw = Intrinsic.replace(store.raw, Pointer.null<u8>())
+      if unsafe CertCloseStore(raw, 0) == 0 {
+        fail TrustSourceError.Store {operation: TrustStoreOperation.Close, code: unsafe GetLastError()}
+      }
+      return match move TrustSnapshot.fromAnchors(move anchors, limits.snapshot) {
+        Result<TrustSnapshot, TrustSourceError>.Success {value} => move value
+        Result<TrustSnapshot, TrustSourceError>.Failure {error} => { fail move error }
+      }
+    } else { compileError("WindowsRootTrustSource requires Windows x86_64 MSVC") }
+  }
+}
+
+impl TrustSource for WindowsRootTrustSource { load: WindowsRootTrustSource.loadCurrent }
