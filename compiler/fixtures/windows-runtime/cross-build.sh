@@ -7,7 +7,7 @@ mkdir -p "$out"
 git rev-parse HEAD > "$out/source-commit.txt"
 printf 'program\tcompile\tpe-imports\texecution\n' > "$out/results.tsv"
 failed=0
-for program in hello hello-speed storage host-check providers process native-thread-spawn-join native-thread-cross-wake atomic-wait-notify native-termination-source-trap stderr-locked-message; do
+for program in hello hello-speed storage host-check providers process console native-thread-spawn-join native-thread-cross-wake atomic-wait-notify native-termination-source-trap stderr-locked-message; do
   source="$PWD/compiler/fixtures/windows-runtime/$program.silk"
   optimization=none
   allowed_dlls='Name: (kernel32|ntdll)\.dll'
@@ -38,6 +38,20 @@ version = "0.0.0"
 silk-version = "0.0.0"
 EOF
   source="$package/src/main.silk"
+  if [ "$program" = console ]; then
+    printf 'LIBRARY kernel32.dll\nEXPORTS\nSetStdHandle\nCreateConsoleScreenBuffer\nReadConsoleOutputCharacterW\nGetConsoleOutputCP\n' > "$package/fixture.def"
+    cat >> "$package/silk.toml" <<'EOF'
+[native]
+link = [{ object = "companion.obj" }, { static-archive = "fixture.lib" }]
+EOF
+    if ! "$SILK_TEST_CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-stack-protector \
+        -Wall -Wextra -Werror -c compiler/fixtures/windows-runtime/console-contract.c -o "$package/companion.obj" \
+        || ! llvm-dlltool -m i386:x86-64 -d "$package/fixture.def" -l "$package/fixture.lib"; then
+      printf 'console\tfail: console oracle\tnot-checked\tnot-checked\n' >> "$out/results.tsv"
+      failed=1
+      continue
+    fi
+  fi
   if [ "$program" = process ]; then
     printf 'LIBRARY kernel32.dll\nEXPORTS\nGetCommandLineW\nLocalFree\nGetEnvironmentVariableW\nGetStdHandle\nReadFile\nWriteFile\nGetCurrentProcess\nIsProcessInJob\nGetModuleFileNameW\nCreateProcessW\nCloseHandle\nSetEvent\nSleep\nExitProcess\n' > "$package/kernel32.def"
     printf 'LIBRARY shell32.dll\nEXPORTS\nCommandLineToArgvW\n' > "$package/shell32.def"

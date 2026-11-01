@@ -35,8 +35,8 @@ first printed only the explicit trap site. PE inspection showed two `.silk` sect
 sentinels and writable entries. Relinking those unchanged objects with matching production
 sentinels printed both `main.checked (main:3:5)` and `main.main`, with fast-fail exit `0xc0000409`.
 This validates the emitted Windows walker and establishes a pre-fix failure. The local evidence
-is `.scratch/windows-frame-relink/results.json`. A fresh compiler-driven link of the corrected
-support source remains pending.
+is `.scratch/windows-frame-relink/results.json`. A fresh compiler-driven link and native run of
+source `1063f6105` with N1 from `c6b2d2f8b` also passed, in run 41260286867.
 
 Microsoft contracts:
 

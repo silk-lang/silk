@@ -42,10 +42,11 @@ fixture from `c6b2d2f8b` using N1 from `943142c73` in
 [run 41259800219](https://github.com/silk-lang/silk/actions/runs/41259800219). That older compiler
 lacked the new production imports. Locally linking its unchanged emitted objects with the
 current production support/import supply passed native execution with exit zero and no output.
-Evidence is `.scratch/windows-process-relink/results.json`. A fresh compiler-driven final link
-is still pending. The fixture now also checks an unrelated inheritable event cannot be signaled
-by the child; that addition is not checked yet. Failed allocation during pending I/O, nondefault
-working directory, and concurrent launch remain not checked.
+Evidence is `.scratch/windows-process-relink/results.json`. The later run 41260286867 built and
+linked source `1063f6105` using N1 from `c6b2d2f8b`; native execution passed without relinking.
+That run also passed the added assertion that the child cannot signal an unrelated inheritable
+parent event. Failed allocation during pending I/O, nondefault working directory, and concurrent
+launch remain not checked.
 
 `run-thread.ps1` separately checks `CreateThread`'s DWORD result, argument passing, an 8 MiB
 stack reservation, wait-before-read ordering, handle closure, processor counts, zero-timeout

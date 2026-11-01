@@ -2,6 +2,13 @@
 
 ## Native Silk execution evidence
 
+All 12 fixtures built by Silk in [run 41260286867](https://github.com/silk-lang/silk/actions/runs/41260286867)
+passed on Windows Server 2025 build 26100: both hello profiles, storage, host input, providers,
+filesystem, processes, three thread/atomic cases, source-trap diagnostics, and stderr locking.
+Source was `1063f6105`, N1 was built from `c6b2d2f8b`; no local relinking was needed for this run.
+The retained report is `.scratch/windows-cross-41260286867/native-results.json`. It also records
+the newer console fixture as not checked because that fixture was added after this artifact.
+
 The optimized hello program from source `b01c66ee5eb497f092bd46450626889dfd3b28d7`, built
 by N1 from `32fc7293a26fd5ae3d5e282a7e193cb8bbfb9d35`, passed on Windows Server 2025
 build 26100. It printed exactly `Hello from Silk: 💩` followed by LF, returned 0, and
@@ -20,8 +27,8 @@ The source-trap executable exposed mismatched COFF section flags. Relinking its 
 objects with corrected production boundary storage restored `main.main` in the report, retaining
 the trap reason and explicit fast-fail status. See [FRAMES.md](FRAMES.md). The full native report
 is `.scratch/windows-cross-41259150694/native-results.json`; its original host-input failure is
-superseded by rerunning `run-host.ps1` successfully. Stderr locking and child-process provider
-execution remain unverified.
+superseded by rerunning `run-host.ps1` successfully. The later full build above supersedes the
+remaining runtime gaps from that earlier run.
 
 ## Implementation
 

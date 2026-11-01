@@ -7,7 +7,7 @@ $artifact = (Resolve-Path -LiteralPath $ArtifactDirectory).Path
 $readobj = Join-Path $LlvmBin 'llvm-readobj.exe'
 $results = @()
 $failed = $false
-foreach ($name in @('hello', 'hello-speed', 'storage', 'host-check', 'providers', 'filesystem', 'process',
+foreach ($name in @('hello', 'hello-speed', 'storage', 'host-check', 'providers', 'filesystem', 'process', 'console',
     'native-thread-spawn-join', 'native-thread-cross-wake', 'atomic-wait-notify', 'native-termination-source-trap', 'stderr-locked-message')) {
   $executable = Join-Path $artifact "$name.exe"
   if ($name -eq 'filesystem') { $executable = Join-Path $artifact 'windows-filesystem/provider.exe' }
@@ -27,9 +27,11 @@ foreach ($name in @('hello', 'hello-speed', 'storage', 'host-check', 'providers'
   if ($imports.Count -eq 0 -or @($imports | Where-Object { $_ -notmatch $allowed }).Count -ne 0) {
     throw "Unexpected or missing DLL imports for $name`: $imports"
   }
-  if ($name -eq 'host-check' -or $name -eq 'providers' -or $name -eq 'filesystem') {
+  if ($name -eq 'host-check' -or $name -eq 'providers' -or $name -eq 'filesystem' -or $name -eq 'console') {
     try {
-      if ($name -eq 'host-check') {
+      if ($name -eq 'console') {
+        $detail = & (Join-Path $PSScriptRoot 'run-console.ps1') -Executable $executable
+      } elseif ($name -eq 'host-check') {
         $detail = & (Join-Path $PSScriptRoot 'run-host.ps1') -Executable $executable
       } elseif ($name -eq 'providers') {
         $detail = & (Join-Path $PSScriptRoot 'run-providers.ps1') -SilkExecutable $executable `

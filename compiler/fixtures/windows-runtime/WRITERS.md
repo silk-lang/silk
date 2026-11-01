@@ -34,6 +34,13 @@ passed from [run 41259800219](https://github.com/silk-lang/silk/actions/runs/412
 `.scratch/windows-cross-41259800219/stderr-native-results.json`. Native console rendering and
 concurrent Silk writers remain not checked; the C oracle independently proves the host lock.
 
+`console.silk` and `console-contract.c` add actual console-cell readback for a BMP character and
+a supplementary scalar split across byte slices, including an empty slice. They reject malformed,
+truncated, and noncanonical surrogate-pair inputs and check the console code page is unchanged.
+`run-console.ps1` creates a new hidden console; the fixture writes a private screen buffer without
+activating it. A separately compiled C control passed the readback oracle on this host. The Silk
+version is pending cross-compilation and execution; the C control does not prove Silk conversion.
+
 ## Reference comparison
 
 [Rust's pinned Windows stdio implementation](https://github.com/rust-lang/rust/blob/1159e78c4747b02ef996e55082b704c09b970588/library/std/src/sys/stdio/windows.rs#L102)
