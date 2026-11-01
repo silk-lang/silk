@@ -49,7 +49,11 @@ try {
   $version = Invoke-Checked 'version' $compilerPath @('--version')
   if ([string]::IsNullOrWhiteSpace($version)) { throw 'Compiler version was empty' }
   $library = Join-Path $root 'stdlib'
-  $source = Join-Path $PSScriptRoot 'hello.silk'
+  $package = Join-Path $output 'hello package'
+  New-Item -ItemType Directory -Force -Path (Join-Path $package 'src') | Out-Null
+  [IO.File]::WriteAllText((Join-Path $package 'silk.toml'), "[package]`nname = `"windows-compiler-smoke`"`nversion = `"0.0.0`"`nsilk-version = `"0.0.0`"`n")
+  $source = Join-Path $package 'src/main.silk'
+  Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'hello.silk') -Destination $source
   $clang = Join-Path $LlvmBin 'clang.exe'
   # Spaces test the compiler's own path conversion and Clang process quoting at the real boundary.
   $program = Join-Path $output 'hello from windows.exe'
@@ -57,7 +61,7 @@ try {
     '--stdlib', $library, '--clang', $clang, '--optimization', 'none', '--debug', 'false')
   $hello = Invoke-Checked 'execute' $program @()
   if ($hello -cne "Hello from Silk: $([char]::ConvertFromUtf32(0x1f4a9))`n") { throw 'Native-built hello output differs' }
-  $null = Invoke-Checked 'check-compiler' $compilerPath @('check', (Join-Path $root 'compiler/src/main.silk'), '--stdlib', $library)
+  $null = Invoke-Checked 'check-compiler' $compilerPath @('check', '--manifest-path', (Join-Path $root 'compiler/silk.toml'), '--stdlib', $library)
   @{ status = 'passed'; compiler = $compilerPath; checks = $results } |
     ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $output 'results.json')
 } catch {

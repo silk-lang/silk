@@ -43,8 +43,11 @@ int fixture_console_end(void) {
   int closed = CloseHandle(screen);
   if (!good) return 10;
   if (!read) return 11;
-  if (count != 16) return 12;
-  if (expected_count != 16) return 13;
+  // ReadConsoleOutputCharacterW can report fewer UTF-16 units than requested when console
+  // cells contain a wide character. Require the same complete readback as the independent
+  // UTF-16 control, rather than assuming one returned unit per requested cell.
+  if (count != expected_count) return 12;
+  if (expected_count < 5 || expected_count > 16) return 13;
   if (!same_page) return 14;
   if (!restored) return 15;
   if (!closed) return 16;

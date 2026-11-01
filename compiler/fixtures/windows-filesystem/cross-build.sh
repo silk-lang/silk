@@ -11,6 +11,8 @@ cp "$repo/compiler/fixtures/windows-filesystem/provider.silk" "$out/package/src/
 mkdir -p "$out/package/src/driver"
 cp "$repo/compiler/src/driver/WindowsHostPath.silk" "$repo/compiler/src/driver/CommandPath.silk" "$out/package/src/driver/"
 cp "$repo/compiler/src/driver/HostRename.silk" "$repo/compiler/src/driver/DetachedWriter.silk" "$out/package/src/driver/"
+mkdir -p "$out/package/src/documentation"
+cp "$repo/compiler/src/documentation/Publication.silk" "$out/package/src/documentation/"
 "$clang" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-stack-protector \
   -c "$repo/compiler/fixtures/windows-filesystem/contract.c" -o "$out/package/contract.obj"
 llvm-dlltool -m i386:x86-64 -d "$repo/compiler/fixtures/windows-filesystem/kernel32.def" -l "$out/package/fixture-kernel32.lib"

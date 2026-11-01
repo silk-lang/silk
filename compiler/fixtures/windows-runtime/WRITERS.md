@@ -43,8 +43,11 @@ Server 2025 host. The GitHub Windows runner rejected its fixed cell-layout expec
 The companion now compares cells with a separate console buffer written by C using the literal
 UTF-16 sequence `A`, U+20AC, `B`, U+1F4A9. This removes the assumption that every console host/font
 lays out those code units identically, while retaining an independent oracle for Silk's conversion.
-Relinking the unchanged Silk objects with this companion passed locally. The updated CI comparison
-is pending; the exact reason for the original runner's cell mismatch has not been observed.
+Relinking the unchanged Silk objects with this companion passed locally. Instrumented run
+`41263604498` identified the remaining CI failure: ReadConsoleOutputCharacterW succeeded but
+returned a count other than 16. The companion now compares its returned count with the C control's
+count and requires enough units to cover the full literal. It still compares all initialized cells.
+The corrected CI comparison is pending; the precise count on that earlier runner was not retained.
 
 ## Reference comparison
 
