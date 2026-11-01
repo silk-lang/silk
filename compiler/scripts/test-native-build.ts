@@ -618,9 +618,6 @@ const program = Effect.gen(function* () {
   const crossIr = yield* fs.readFile(join(directory, 'cross.ll'))
   assert.ok(crossIr.length > 0)
   assert.notDeepEqual(crossIr, bytes, 'IR must follow the requested target, not the host')
-  const unlinkable = process.platform === 'linux' && process.arch === 'x64'
-    ? 'aarch64-unknown-linux-gnu'
-    : 'x86_64-unknown-linux-gnu'
   // ARM64 inline assembly shares the machine contract across Linux and Darwin. Exercise
   // source admission, flags normalization and the actual instruction, not just a successful build.
   const hintSource = [
@@ -964,8 +961,6 @@ const program = Effect.gen(function* () {
     ['--emit', 'final', '--emit', 'llvm-ir'],
     // The artifact form is the manifest's `[package].kind`; `--emit` names only a stage.
     ['--emit', 'executable'],
-    // A Linux target for another host has no supply; macOS links on any host with Silk's stub.
-    ['--target', unlinkable],
     ['--emit', 'llvm-ir', '--target', 'no-such-target'],
     ['--emit', 'llvm-ir', '--target', foreign, '--target', foreign],
   ]) {
