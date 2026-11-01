@@ -66,15 +66,15 @@ try {
   if ($SelfHost) {
     $compilerSource = Join-Path $root 'compiler/src/main.silk'
     $n2 = Join-Path $output 'N2.exe'
-    $buildArguments = @('build', $compilerSource, '--target', 'x86_64-pc-windows-msvc',
+    $buildArguments = @('--target', 'x86_64-pc-windows-msvc',
       '--stdlib', $library, '--clang', $clang, '--optimization', 'speed', '--debug', 'false')
-    $null = Invoke-Checked 'build-n2' $compilerPath ($buildArguments + @('-o', $n2)) 900000
+    $null = Invoke-Checked 'build-n2' $compilerPath (@('build', $compilerSource, '-o', $n2) + $buildArguments) 900000
     $nextVersion = Invoke-Checked 'n2-version' $n2 @('--version')
     if ($nextVersion -cne $version) { throw 'Native N2 reports a different version' }
     $producerIr = Join-Path $output 'producer.ll'
     $nextIr = Join-Path $output 'n2.ll'
-    $null = Invoke-Checked 'producer-ir' $compilerPath ($buildArguments + @('--emit', 'llvm-ir', '-o', $producerIr)) 900000
-    $null = Invoke-Checked 'n2-ir' $n2 ($buildArguments + @('--emit', 'llvm-ir', '-o', $nextIr)) 900000
+    $null = Invoke-Checked 'producer-ir' $compilerPath (@('build', $compilerSource, '-o', $producerIr, '--emit', 'llvm-ir') + $buildArguments) 900000
+    $null = Invoke-Checked 'n2-ir' $n2 (@('build', $compilerSource, '-o', $nextIr, '--emit', 'llvm-ir') + $buildArguments) 900000
     $producerHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $producerIr).Hash
     $nextHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $nextIr).Hash
     $results.Add(@{ name = 'native-fixpoint'; producerIrSha256 = $producerHash; n2IrSha256 = $nextHash })

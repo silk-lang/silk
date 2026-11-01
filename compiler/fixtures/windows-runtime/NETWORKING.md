@@ -22,6 +22,8 @@ separate Winsock owner. The independently compiled C companion probes initializa
 and closing a socket: no reference may leak after a lookup, and a nested lookup must not release
 the caller's reference. It does not implement DNS or supply resolver results.
 
-Status: source compilation and actual Silk resolver execution are not yet checked. The shared
-Windows cross-build and native runner include this fixture; no external DNS or network is needed.
+The actual Silk fixture was built by the first native Windows compiler generation and passed on
+Server 2025 with LLVM 22.1.8 (exit 0). This includes native localhost results, family/port checks,
+deadline refusal, no leaked Winsock reference, and preservation of an enclosing reference.
+The shared Windows cross-build and native runner include this fixture; no external DNS is needed.
 TCP/UDP socket providers and the Windows certificate store remain separate unfinished work.

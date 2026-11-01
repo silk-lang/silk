@@ -174,3 +174,17 @@ math functions. The oracle dynamically loads UCRT only in the test; production d
 The native check passed on Server 2025 with LLVM 22.1.8: IEEE boundary cross products and 20,000
 deterministic bit-pattern pairs for each precision. This is C helper execution, not yet proof of
 the full Silk compiler's execution. The compiler-native CI job repeats it before running Silk.
+
+## Native compiler milestone
+
+On Server 2025 with LLVM 22.1.8, the cross-built compiler from `e49e68fdf` built the compiler
+sources at `851eee55f` natively. The resulting compiler built and executed Unicode hello, checked
+the compiler package, and built and ran the Windows codecs/path and resolver fixtures.
+Both compiler generations then emitted identical LLVM IR for the compiler at `851eee55f`:
+SHA-256 `e316eda9a051fde29e65dd37deb4cd78fee27d421ed5cbea1b8e3b6af8744a19`.
+Local commands and results remain under `.scratch/windows-local-n2.log`,
+`.scratch/windows-local-n2-smoke`, and `.scratch/windows-local-fixpoint.json`.
+
+`run-compiler.ps1 -SelfHost` repeats the native build, generation IR comparison and next-generation
+hello execution in CI. It uses the same checked-out source for both emissions. The source-build
+CLI requires `-o` directly after the source argument; the runner preserves that ordering.
