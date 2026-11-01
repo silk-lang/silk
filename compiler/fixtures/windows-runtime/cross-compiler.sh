@@ -13,6 +13,7 @@ trap 'cp "$out/original-silk.toml" compiler/silk.toml; rm -rf -- "$supply"' EXIT
 python3 - "$out" "$supply" <<'PY'
 from pathlib import Path
 import re
+import os
 import shutil
 import subprocess
 import sys
@@ -35,6 +36,19 @@ for name, content in definitions:
     shutil.copyfile(library, local)
     libraries.append('{ static-archive = "' + local.relative_to(Path('compiler').resolve()).as_posix() + '" }')
 assert libraries, 'No production Windows import definitions found'
+# The source compiler also uses frem, which an older N1 did not yet supply on Windows.
+# Build the current production implementation; this is the same source NativeToolchain uses.
+math = re.search(r'pub fn remainderSource\(\).*?return """(.*?)"""', source, re.S)
+assert math, 'No production floating remainder source found'
+math_source = out / 'silk-remainder.c'
+math_source.write_text(textwrap.dedent(math.group(1)))
+math_object = supply / 'silk-remainder.obj'
+subprocess.run([os.environ['SILK_TEST_CLANG'], '--target=x86_64-pc-windows-msvc',
+                '-ffreestanding', '-fno-stack-protector', '-c', str(math_source),
+                '-o', str(math_object)], check=True)
+math_archive = supply / 'silk-remainder.lib'
+subprocess.run(['llvm-ar', 'rcs', str(math_archive), str(math_object)], check=True)
+libraries.append('{ static-archive = "' + math_archive.relative_to(Path('compiler').resolve()).as_posix() + '" }')
 manifest = Path('compiler/silk.toml')
 original = manifest.read_text()
 assert 'native' not in tomllib.loads(original), 'Preserve newly authored native configuration explicitly'

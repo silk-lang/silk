@@ -161,3 +161,16 @@ These sources inform edge cases; their implementation is not used as a test orac
 [ms-args]: https://learn.microsoft.com/en-us/cpp/c-language/parsing-c-command-line-arguments
 [ms-compare]: https://learn.microsoft.com/en-us/windows/win32/api/stringapiset/nf-stringapiset-comparestringordinal
 [ms-console]: https://learn.microsoft.com/en-us/windows/console/writeconsole
+
+## Compiler floating remainder support
+
+The full Windows compiler exposed LLVM-generated `fmod` and `fmodf` references in its static
+evaluator. `WindowsLink.remainderSource` supplies exact integer long division of the binary
+significands, including subnormal operands and signed zero; invalid operands produce NaN.
+Its only undefined object symbol is `_fltused`, supplied by the existing TLS support object.
+
+Run `remainder-proof.ps1` to compile that production source and compare it with the Windows UCRT
+math functions. The oracle dynamically loads UCRT only in the test; production does not link it.
+The native check passed on Server 2025 with LLVM 22.1.8: IEEE boundary cross products and 20,000
+deterministic bit-pattern pairs for each precision. This is C helper execution, not yet proof of
+the full Silk compiler's execution. The compiler-native CI job repeats it before running Silk.
