@@ -1169,14 +1169,27 @@ Apple frameworks. Paths are resolved relative to the manifest and may not escape
 name with a path separator, whitespace, NUL, or leading `-` is rejected. Arbitrary linker flags
 stay out of source and manifest.
 
+An entry may add `os`, one of `"macos"`, `"linux"`, `"windows"` and `"wasi"` or a list of them.
+A build for another operating system skips the entry instead of refusing it, so one manifest
+declares each platform's libraries and frameworks.
+
 ```toml
 [native]
 link = [
   { search-path = "vendor/lib" },
   { library = "m", mode = "dynamic" },
   { static-archive = "vendor/libsupport.a" },
+  { framework = "Metal", os = "macos" },
+  { library = "stdc++", mode = "dynamic", os = ["linux", "wasi"] },
 ]
 ```
+
+A library's `[native].link` reaches every executable that depends on it, directly or through other
+packages, so the executable's manifest repeats none of it. The executable's own inputs come first,
+then each dependency's, with every package before the packages it depends on, so an archive follows
+the objects and archives that use it. An input that several packages list (the same file, library
+with the same mode, or framework) links once, at its last place. A library or object artifact
+links only its own manifest's inputs.
 
 `[native].function-order` names a text file below the manifest's directory that lists function
 symbols, one per line, such as `silk_1f3a9c...`; blank lines and lines starting with `#` are

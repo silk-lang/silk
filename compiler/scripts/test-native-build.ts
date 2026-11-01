@@ -2112,6 +2112,73 @@ const program = Effect.gen(function* () {
     assert.match(refusedInput.stderr, /silk: invalid native link input: .*silk\.toml: /)
     assert.match(refusedInput.stderr, rule)
   }
+  // An entry's `os` keeps it to those systems: elsewhere it is skipped, not refused.
+  const otherSystem = hostTarget.includes('apple-darwin') ? 'linux' : 'macos'
+  yield* fs.writeFileString(
+    join(unpackaged, 'silk.toml'),
+    `[package]\nname = "linked"\nversion = "0.1.0"\nsource = "."\n[native]\nlink = [{ framework = "Security", os = "${otherSystem}" }, { library = "nosuchlibrary", mode = "dynamic", os = ["${otherSystem}", "windows"] }]\n`,
+  )
+  const skippedInput = yield* invoke(silk, ['build', '--stdlib', standardLibrary], unpackaged, { ...process.env, SILK_CLANG: clang })
+  assert.equal(skippedInput.status, 0, skippedInput.stderr)
+  for (const [entry, rule] of [
+    ['{ library = "m", mode = "dynamic", os = "beos" }', /\[native\]\.link\[0\]: os must be one of "macos", "linux", "windows" and "wasi"/],
+    ['{ library = "m", mode = "dynamic", os = [] }', /\[native\]\.link\[0\]: os must be one of/],
+    ['{ os = "linux" }', /\[native\]\.link\[0\]: an entry is exactly one/],
+  ] as const) {
+    yield* fs.writeFileString(
+      join(unpackaged, 'silk.toml'),
+      `[package]\nname = "linked"\nversion = "0.1.0"\nsource = "."\n[native]\nlink = [${entry}]\n`,
+    )
+    const refusedSystem = yield* invoke(silk, ['build', '--stdlib', standardLibrary], unpackaged, { ...process.env, SILK_CLANG: clang })
+    assert.equal(refusedSystem.status, 1, refusedSystem.stderr)
+    assert.match(refusedSystem.stderr, rule)
+  }
+  // A library's `[native].link` reaches every executable that depends on it, after the
+  // executable's own inputs, so the executable's manifest repeats none of it.
+  const propagated = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-propagated-' })
+  for (const member of ['shim', 'middle', 'app']) yield* fs.makeDirectory(join(propagated, member), { recursive: true })
+  yield* fs.writeFileString(join(propagated, 'shim/offset.c'), 'int shim_offset(void) { return 3; }\n')
+  const shimObject = yield* invoke(clang, ['-c', '-fPIC', 'offset.c', '-o', 'offset.o'], join(propagated, 'shim'))
+  assert.equal(shimObject.status, 0, shimObject.stderr)
+  const shimArchive = yield* invoke(join(dirname(clang), 'llvm-ar'), ['rcs', 'libshim.a', 'offset.o'], join(propagated, 'shim'))
+  assert.equal(shimArchive.status, 0, shimArchive.stderr)
+  const shimManifest = (link: string) =>
+    `[package]\nname = "shim"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Shim"]\n\n[native]\nlink = [${link}]\n`
+  yield* fs.writeFileString(
+    join(propagated, 'shim/silk.toml'),
+    shimManifest(`{ static-archive = "libshim.a" }, { framework = "Security", os = "${otherSystem}" }`),
+  )
+  yield* fs.writeFileString(
+    join(propagated, 'shim/Shim.silk'),
+    'unsafe extern "C" fn shim_offset() -> i32\n\npub fn offset() -> i32 {\n  return unsafe shim_offset()\n}\n',
+  )
+  // A package between the executable and the library reaches it too, and an input two packages
+  // list links once.
+  yield* fs.writeFileString(
+    join(propagated, 'middle/silk.toml'),
+    '[package]\nname = "middle"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Middle"]\n\n[dependencies]\nshim = { path = "../shim" }\n',
+  )
+  yield* fs.writeFileString(
+    join(propagated, 'middle/Middle.silk'),
+    'import shim.Shim\n\npub fn doubled() -> i32 {\n  return Shim.offset() * 2\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(propagated, 'app/silk.toml'),
+    '[package]\nname = "app"\nversion = "0.1.0"\nsource = "."\n\n[dependencies]\nmiddle = { path = "../middle" }\nshim = { path = "../shim" }\n',
+  )
+  yield* fs.writeFileString(
+    join(propagated, 'app/main.silk'),
+    'import middle.Middle\nimport shim.Shim\n\npub fn main() -> i32 {\n  return Middle.doubled() + Shim.offset()\n}\n',
+  )
+  for (const round of [1, 2]) {
+    const linkedApp = yield* invoke(silk, ['run', '--quiet', '--stdlib', standardLibrary], join(propagated, 'app'), { ...process.env, SILK_CLANG: clang })
+    assert.equal(linkedApp.status, 9, `round ${round}: ${linkedApp.stderr}`)
+  }
+  // A dependency's refused entry names its own manifest and the dependency.
+  yield* fs.writeFileString(join(propagated, 'shim/silk.toml'), shimManifest('{ static-archive = "/tmp/libshim.a" }'))
+  const refusedDependencyInput = yield* invoke(silk, ['build', '--stdlib', standardLibrary], join(propagated, 'app'), { ...process.env, SILK_CLANG: clang })
+  assert.equal(refusedDependencyInput.status, 2, refusedDependencyInput.stderr)
+  assert.match(refusedDependencyInput.stderr, /invalid native link input: .*shim\/silk\.toml: \[native\]\.link\[0\]: static-archive \/tmp\/libshim\.a must be a relative path/)
   // `[native].function-order` places the functions it lists first in the executable's code, in its
   // order, and a change to the file alone links again. A path outside the package is refused.
   const ordered = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-ordered-' })
