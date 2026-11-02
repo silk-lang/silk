@@ -362,6 +362,38 @@ statements, and declarations remain independently parseable.
 **Evidence:** anonymous callable syntax specification,
 anonymous formatting specification.
 
+### LAMBDA-SYNTAX-001 — Lambdas write parameters between bars
+
+**Status:** Confirmed
+
+A lambda lists its parameters between `|` bars, each with an optional `: Type`, and is followed by
+its body. An expression body returns its value; a braced block is an ordinary body. `->` writes the
+result type, as in a function, and then requires a block.
+
+```silk
+fn forms() {
+  let increment = |value: i32| value + 1
+  let double: fn(i32) -> i32 = |value| {
+    let twice = value * 2
+    return twice
+  }
+  let explicit = |value: i32| -> i32 { return value * 3 }
+  let none: fn() -> i32 = || 7
+}
+```
+
+`||` is a lambda without parameters. A parameter may be written `mut name`. Parameter types use the
+single-type forms; parenthesize a union. Types the lambda omits come from its context under
+[ANON-CALLABLE-002](functions-callables-and-control-flow.md#anon-callable-002--a-lambda-takes-omitted-types-from-where-it-is-used).
+
+**Boundary:** The `fn(...)` anonymous form of
+[ANON-SYNTAX-001](#anon-syntax-001--anonymous-callable-expressions-write-a-complete-callable-contract)
+is unchanged. A lambda cannot be prefixed with `effect`.
+
+**Diagnostics:** A missing closing bar or body receives a local parser diagnostic.
+
+**Evidence:** anonymous callable syntax specification.
+
 ## Operator precedence and dispatch
 
 ### OP-001 — Operator precedence and associativity are fixed

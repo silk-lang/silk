@@ -584,10 +584,11 @@ imports, overload sets, or documentation as named functions. Writing a structura
 does not merge distinct occurrences or erase their targets and environments into a universal
 closure representation or ABI.
 
-**Boundary:** The callable's written contract must be complete. An expected callable type may check
-compatibility and contribute ordinary surrounding generic constraints, but it does not infer a
+**Boundary:** The `fn(...)` form's written contract must be complete. An expected callable type may
+check compatibility and contribute ordinary surrounding generic constraints, but it does not infer a
 missing parameter, result, failure, or requirement annotation and does not rewrite a conflicting
-annotation. Anonymous callables cannot declare independent type parameters, name themselves, refer
+annotation. The lambda form leaves types to its context instead
+([ANON-CALLABLE-002](#anon-callable-002--a-lambda-takes-omitted-types-from-where-it-is-used)). Anonymous callables cannot declare independent type parameters, name themselves, refer
 to themselves recursively, carry declaration modifiers, or participate in overloads. An anonymous
 body may be nested inside another anonymous body or an `effect` block, at any depth; it sees every
 binder of the enclosing function: its lifetime, type and row parameters and `Self`. Invocation mode
@@ -603,6 +604,51 @@ modifier, or overload use receives a semantic diagnostic at that unsupported con
 anonymous semantic-fact specification,
 anonymous generic-contract specification,
 anonymous backend specification.
+
+### ANON-CALLABLE-002 — A lambda takes omitted types from where it is used
+
+**Status:** Confirmed
+
+A lambda is an anonymous callable that may omit its parameter types and its result type. Each
+omitted parameter type is the corresponding parameter type of the callable the context expects:
+an annotated binding, a call parameter, or a pipeline target. An omitted result is the expected
+result when the context fixes it, and otherwise the join of what the body returns.
+
+```silk
+fn apply(transform: fn(i32) -> i32, value: i32) -> i32 {
+  return transform(value)
+}
+
+fn applyTwice<T>(mut transform: mut fn(T) -> T, value: T) -> T {
+  let first = transform(move value)
+  return transform(move first)
+}
+
+fn examples(offset: i32) -> i32 {
+  let a = apply(|value| value + offset, 40)
+  let b = applyTwice(|value| value + 1, 40)
+  let positive: fn(i32) -> bool = |value| value > 0
+  if positive(a) { return a + b }
+  return 0
+}
+```
+
+In a generic call, a lambda whose parameter types use binders the call has not inferred yet is
+checked after the call's other arguments, so `applyTwice(|value| value + 1, 40)` types `value` as
+`i32` from `40`. A lambda is otherwise an anonymous callable under
+[ANON-CALLABLE-001](#anon-callable-001--an-anonymous-callable-has-one-exact-source-identity-and-explicit-contract):
+it has its own source identity, captures, and invocation mode, and its signature is fixed by the
+check of its enclosing body. Inference adds no work to code that does not use lambdas.
+
+**Boundary:** A lambda's inferred types must be nameable in a signature: a type that names a loan of
+the enclosing body or a binder the enclosing call is still inferring cannot be inferred. A lambda
+cannot be `effect`; write `effect fn(...)` for an effectful anonymous callable, for example as the
+argument of `Effect.flatMap`.
+
+**Diagnostics:** A parameter or result type the context cannot supply reports `SEM0252` at the
+parameter or lambda; writing the type, as in `|value: i32|`, resolves it.
+
+**Evidence:** anonymous callable value specification.
 
 ### PIPE-001 — A pipeline invokes one unary callable after evaluating its left value
 
