@@ -13,6 +13,8 @@ import driver.ModuleSources as ModuleSourceFiles {
   ModuleSources,
 }
 import driver.NativeLinkInput { InvalidNativeLinkInput, PlannedNative }
+import driver.ToolSandbox
+import driver.ToolStep as ToolSteps { Ran as ToolRun }
 import driver.Packages { InvalidDependency }
 import semantic.ExecutionStorage { ExecutionStorage }
 import semantic.FinalProfile { FinalProfile, Problem as ProfileProblem }
@@ -48,6 +50,12 @@ import silk.core.result { Result }
 import silk.collections.slice { Slice }
 import silk.mem.shared { Shared }
 import silk.toml.scanner { TomlError }
+import silk.toml.value { Toml, Value as TomlValue }
+import silk.system.child_process { ChildProcess }
+import silk.io.writer_native { StderrWriter }
+import silk.io.writer { Writer }
+import silk.core.effect { Effect }
+import silk.text.string { String }
 import silk.num.usize
 
 /// A program ready for semantic analysis.
@@ -135,7 +143,7 @@ pub effect fn open(
     | Cycle
     | RevisionMismatch
     | OutOfMemoryError
-  ? &mut FileSystem | &mut Allocator | &mut Types {
+  ? &mut FileSystem | &mut ChildProcess | &mut Allocator | &mut Types {
   let target = Target.forId(Target.id(InitialProfile.target(profile)))
   let libc = match move InitialProfile.text(profile, b"libc") {
     Option<&[u8]>.Some { value } => run Bytes.copy(value)
@@ -181,6 +189,11 @@ pub effect fn open(
     let mut generated = List<Plan>.make()
     let mut owners = List<Bytes>.make()
     let mut native = false
+    let policy = run toolPolicy(&manifestPath)
+    let rootDirectory = match move run Path.parent(&manifestPath) {
+      Option<Path>.Some { value } => move value
+      Option<Path>.None => { fail InvalidSourceRoot {} }
+    }
     let mut at = usize.ZERO
     while at < ModuleSourceFiles.packageCount(&sources) {
       let directory = ModuleSourceFiles.packageDirectoryAt(&sources, at)
@@ -196,7 +209,26 @@ pub effect fn open(
           Bytes.asSlice(&libc)
         )
         match move evaluated {
-          Evaluated.Planned { plan } => {
+          Evaluated.Planned { plan: evaluatedPlan } => {
+            let mut plan = move evaluatedPlan
+            let refusedTools = run runTools(
+              &mut plan,
+              ModuleSourceFiles.packageIdentityAt(&sources, at),
+              at == usize.ZERO,
+              directory,
+              &rootDirectory,
+              &policy
+            )
+            if let Option<Bytes>.Some { value: toolReason } = move refusedTools {
+              let empty = Semantic.oneShot(run ModuleSourceFiles.revision(&sources), Target.forId(Target.id(&target)), Option<FinalProfile>.none())
+              return Opened.PlanRefused {
+                sources: move sources,
+                store: move empty,
+                rejection: Option<Shared<Rejection>>.none(),
+                file: run Bytes.copy(Path.rawBytes(&buildFile)),
+                reason: move toolReason,
+              }
+            }
             // A generated module never shadows a file of the package.
             let root = ModuleSourceFiles.packageSourceRootAt(&sources, at)
             let modules = List<BuildPlans.Generated>.asSlice(&plan.modules)
@@ -279,6 +311,134 @@ pub effect fn open(
     run ModuleSourceFiles.aliasRoot(&mut sources, value)
   }
   return run analyze(move sources, profile, move bindings, testing, revisable, move summaries, target)
+}
+
+// What the root manifest's `[build]` table lets tool steps do: the dependencies whose steps run
+// (`tools`), and whether steps run without a sandbox on a host that has none (`unsandboxed-tools`).
+struct ToolPolicy {
+  allowed: List<Bytes>,
+  unsandboxed: bool,
+}
+
+effect fn toolPolicy(manifest: &Path) -> ToolPolicy ! FileError | TomlError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let text = run FileSystem.readFile(manifest)
+  let document = run Toml.parse(Bytes.asSlice(&text))
+  let mut policy = ToolPolicy { allowed: List<Bytes>.make(), unsandboxed: false }
+  if let Option<&TomlValue>.Some { value: listed } = move Toml.fieldAt(Toml.field(&document, "build"), "tools") {
+    let mut item = usize.ZERO
+    while true {
+      let named = match move Toml.item(listed, item) {
+        Option<&TomlValue>.Some { value } => value
+        Option<&TomlValue>.None => { break }
+      }
+      if let Option<string>.Some { value: name } = move Toml.asString(Option<&TomlValue>.some(named)) {
+        run List<Bytes>.append(&mut policy.allowed, run Bytes.copy(String.utf8Bytes(name)))
+      }
+      item = item + usize.ONE
+    }
+  }
+  if let Option<&TomlValue>.Some { value: flag } = move Toml.fieldAt(Toml.field(&document, "build"), "unsandboxed-tools") {
+    if let TomlValue.Boolean { value } = &flag.* { policy.unsandboxed = value }
+  }
+  return move policy
+}
+
+// The name of the package `identity` (`name@version`).
+fn packageName(identity: &[u8]) -> &[u8] {
+  let mut at = usize.ZERO
+  while at < identity.length && identity[at] != 64 { at = at + usize.ONE }
+  return Slice.view<u8>(identity, usize.ZERO, at)
+}
+
+effect fn warn(line: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut stderr = StderrWriter.make()
+  let written = run Effect.result(Writer.writeAll(line) |> Effect.provideMut<Writer>(&mut stderr))
+  drop written
+}
+
+// Runs the tool steps of the plan of package `identity` in `directory` (the root package when
+// `root`) below `<rootDirectory>/build/tools/<name>/<step>`, and adds the modules they produce to
+// `plan.modules`. Answers why they cannot run, if they cannot.
+effect fn runTools(plan: &mut Plan, identity: &[u8], root: bool, directory: &Path, rootDirectory: &Path, policy: &ToolPolicy) -> Option<Bytes>
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut ChildProcess | &mut Allocator {
+  let tools = List<BuildPlans.Tool>.asSlice(&plan.tools)
+  let produced = List<BuildPlans.ToolModule>.asSlice(&plan.toolModules)
+  if tools.length == usize.ZERO && produced.length == usize.ZERO { return Option<Bytes>.none() }
+  let name = packageName(identity)
+  let mut allowed = root
+  let listed = List<Bytes>.asSlice(&policy.allowed)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if same(Bytes.asSlice(&listed[at]), name) { allowed = true }
+    at = at + usize.ONE
+  }
+  if !allowed {
+    let mut reason = run Bytes.copy(b"its tool steps run only when the root manifest lists \"")
+    run Bytes.append(&mut reason, name)
+    run Bytes.append(&mut reason, b"\" in [build].tools")
+    return Option<Bytes>.some(move reason)
+  }
+  let mut compiler = Option<Path>.none()
+  if ToolSandbox.supported() { compiler = run ToolSteps.compiler() }
+  let mut sandboxed = false
+  if let Option<Path>.Some { value: _ } = &compiler { sandboxed = true }
+  if !sandboxed && !policy.unsandboxed {
+    return Option<Bytes>.some(run Bytes.copy(b"this host has no sandbox for build tools (Linux 6.7 with Landlock); set [build].unsandboxed-tools = true in the root manifest to run them without one"))
+  }
+  let outputs = run Path.joinBytes(rootDirectory, b"build/tools")
+  let mut packageOutputs = run Path.joinBytes(&outputs, name)
+  at = usize.ZERO
+  while at < tools.length {
+    if !sandboxed {
+      let mut line = run Bytes.copy(b"silk: warning: running build tool `")
+      run Bytes.append(&mut line, Bytes.asSlice(&tools[at].name))
+      run Bytes.append(&mut line, b"` of ")
+      run Bytes.append(&mut line, name)
+      run Bytes.append(&mut line, b" without a sandbox ([build].unsandboxed-tools)\n")
+      run warn(Bytes.asSlice(&line))
+    }
+    let stepOutput = run Path.joinBytes(&packageOutputs, Bytes.asSlice(&tools[at].name))
+    let mut sandbox = Option<&Path>.none()
+    if let Option<Path>.Some { value } = &compiler { sandbox = Option<&Path>.some(&value) }
+    match move run ToolSteps.execute(&tools[at], directory, &stepOutput, move sandbox) {
+      ToolRun.Current => {}
+      ToolRun.Refused { reason } => { return Option<Bytes>.some(move reason) }
+    }
+    at = at + usize.ONE
+  }
+  let mut modules = List<BuildPlans.Generated>.make()
+  at = usize.ZERO
+  while at < produced.length {
+    let mut found = false
+    let mut step = usize.ZERO
+    while step < tools.length {
+      if same(Bytes.asSlice(&tools[step].name), Bytes.asSlice(&produced[at].step)) {
+        if ToolSteps.declares(List<Bytes>.asSlice(&tools[step].outputs), Bytes.asSlice(&produced[at].output)) { found = true }
+      }
+      step = step + usize.ONE
+    }
+    if !found {
+      let mut reason = run Bytes.copy(b"its module `")
+      run Bytes.append(&mut reason, Bytes.asSlice(&produced[at].name))
+      run Bytes.append(&mut reason, b"` names an output that no tool step declares")
+      return Option<Bytes>.some(move reason)
+    }
+    let stepOutput = run Path.joinBytes(&packageOutputs, Bytes.asSlice(&produced[at].step))
+    let file = run Path.joinBytes(&stepOutput, Bytes.asSlice(&produced[at].output))
+    run List<BuildPlans.Generated>.append(&mut modules, BuildPlans.Generated {
+      name: run Bytes.copy(Bytes.asSlice(&produced[at].name)),
+      source: run FileSystem.readFile(&file),
+    })
+    at = at + usize.ONE
+  }
+  let mut moved = move modules
+  while true {
+    match move List<BuildPlans.Generated>.pop(&mut moved) {
+      Option<BuildPlans.Generated>.Some { value } => run List<BuildPlans.Generated>.append(&mut plan.modules, move value)
+      Option<BuildPlans.Generated>.None => { break }
+    }
+  }
+  return Option<Bytes>.none()
 }
 
 // A copy of the standard library directory.

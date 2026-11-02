@@ -153,6 +153,94 @@ pub static fn linkArchive(plan: string, path: string) -> string<'static>
 Returns `plan` linking the static archive at `path`, relative to the package directory, as a
 `[native].link` entry `{ static-archive = path }` does.
 
+<a id="Plan.impl.tool"></a>
+
+### Associated function `tool`
+
+```silk
+pub static fn tool(plan: string, name: string, program: string) -> string<'static>
+```
+
+Returns `plan` with a tool step `name` that runs the package's program at `program`, relative
+to the package directory, while the package builds.
+
+#### Details
+
+Add the step's arguments, inputs and outputs with [`Plan.toolArgument`](#Plan.impl.toolArgument),
+[`Plan.toolInput`](#Plan.impl.toolInput) and [`Plan.toolOutput`](#Plan.impl.toolOutput), each right after this call or another of them.
+The step runs in an operating-system sandbox: it reads only the system's programs and
+libraries, the program and its declared inputs, writes only its own output directory, which
+is its working directory, and opens no TCP connection. It runs again only when the program,
+its arguments or an input changes. A dependency's steps run only when the root manifest lists
+the dependency in `[build].tools`.
+
+#### Gotchas
+
+`name` is one module path segment, such as `tables`; any other name is a compile error. A
+host without a sandbox refuses the step unless the root manifest sets
+`[build].unsandboxed-tools = true`.
+
+<a id="Plan.impl.toolArgument"></a>
+
+### Associated function `toolArgument`
+
+```silk
+pub static fn toolArgument(plan: string, text: string) -> string<'static>
+```
+
+Returns `plan` with `text` as the next argument of its last tool step.
+
+#### Gotchas
+
+It follows a [`Plan.tool`](#Plan.impl.tool) call; without one, the plan is refused. `text` cannot hold a line
+break.
+
+<a id="Plan.impl.toolInput"></a>
+
+### Associated function `toolInput`
+
+```silk
+pub static fn toolInput(plan: string, path: string) -> string<'static>
+```
+
+Returns `plan` letting its last tool step read the file or directory at `path`, relative to
+the package directory. A change to that file runs the step again.
+
+#### Gotchas
+
+It follows a [`Plan.tool`](#Plan.impl.tool) call; without one, the plan is refused.
+
+<a id="Plan.impl.toolOutput"></a>
+
+### Associated function `toolOutput`
+
+```silk
+pub static fn toolOutput(plan: string, path: string) -> string<'static>
+```
+
+Returns `plan` declaring that its last tool step writes the file at `path`, relative to the
+step's output directory. A step that does not write it fails the build.
+
+#### Gotchas
+
+It follows a [`Plan.tool`](#Plan.impl.tool) call; without one, the plan is refused.
+
+<a id="Plan.impl.toolModule"></a>
+
+### Associated function `toolModule`
+
+```silk
+pub static fn toolModule(plan: string, name: string, step: string, path: string) -> string<'static>
+```
+
+Returns `plan` with module `name` of the package whose source is the output `path` of its
+tool step `step`, as if the package had the file `<name>.silk` in its source root.
+
+#### Gotchas
+
+`name` is one module path segment; a name that the package's own files also define is a
+compile error. `path` must be one of the step's declared outputs.
+
 <a id="Plan.impl.linkObject"></a>
 
 ### Associated function `linkObject`
