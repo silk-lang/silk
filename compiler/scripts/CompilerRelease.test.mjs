@@ -223,6 +223,10 @@ it('rerun equivalence ignores receipt timing but retains source, compiler and IR
       fixpoint: { producerIrSha256: 'different', outputIrSha256: 'different' },
     }),
   )
+  const pins = (runId) =>
+    Buffer.from(JSON.stringify({ schemaVersion: 2, seeds: { target: { sha256: 'binary', runId } } }))
+  for (const name of ['native-seed.json', 'release-targets.json'])
+    assert.strictEqual(assetIdentity(name, pins('1')), assetIdentity(name, pins('2')))
   assert.notStrictEqual(
     assetIdentity('changes-snapshot.toml', Buffer.from('old')),
     assetIdentity('changes-snapshot.toml', Buffer.from('new')),

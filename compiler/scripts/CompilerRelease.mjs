@@ -284,7 +284,7 @@ export const maintain = Effect.fn('CompilerRelease.maintain')(function* ({ repos
 
 /** Timing/runner/run-id fields are observational; all source, compiler and IR identities are immutable. */
 export const assetIdentity = (name, bytes) => {
-  if (name === 'native-seed.json') {
+  if (name === 'native-seed.json' || name === 'release-targets.json') {
     const value = JSON.parse(Buffer.from(bytes).toString())
     return JSON.stringify(
       Object.fromEntries(

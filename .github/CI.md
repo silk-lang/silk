@@ -99,5 +99,5 @@ LLVM publishes no Intel macOS Clang, and `macos-15-intel` runs the archive nativ
 LLVM. Publication signs and publishes the cross-built archives only after every verification
 passes; each target's receipt and seed candidate come from its verification.
 
-Only the x86-64 Linux seed in `compiler/native-seed.json` builds anything; the other entries are
-unused by CI. Changing the pin is a separate, explicit decision.
+`compiler/native-seed.json` pins only the x86-64 Linux seed: every other target's compiler is
+cross-built from it. Changing the pin is a separate, explicit decision.
