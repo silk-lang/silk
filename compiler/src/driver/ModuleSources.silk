@@ -4,6 +4,7 @@ import driver.CommandPath
 import driver.EmbeddedFiles
 import driver.ImportSummaries as Summaries {ImportSummaries, Summary as ImportSummary}
 import driver.ManifestFields
+import hir.Unused as UnusedBindings {Unused}
 import driver.NativeLinkInput as NativeLinkInputs {Archive, ArchiveContext, Declared, InvalidNativeLinkInput, NativeLinkInput, PlannedNative}
 import driver.Packages as PackageSources {InvalidDependency, Packages}
 import semantic.ContentHash {ContentHash}
@@ -15,7 +16,8 @@ import semantic.PackageGraph {PackageGraph, StandardRole}
 import semantic.Retention {Root as RetentionRoot}
 import semantic.SealedOperators
 import semantic.Target {Target}
-import semantic.Semantic {Semantic}
+import semantic.Rejection {Rejection}
+import semantic.Semantic as Semantics {Semantic}
 import semantic.SourceUnit {Parsed, SourceUnit}
 import semantic.SourceIndex {Event, EventKind}
 import semantic.SourceRevision {Observation, Revision}
@@ -23,6 +25,7 @@ import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.collections.bytes {Bytes}
 import silk.core.effect {Effect}
 import silk.mem.box {Box}
+import silk.mem.shared {Shared}
 import silk.system.filesystem {DirectoryEntry, FileError, FileSystem, Path}
 import silk.json.scanner {JsonError}
 import silk.json.value {Json, JsonChild, Value as JsonValue}
@@ -106,6 +109,9 @@ pub struct ModuleSources {
   claimFree: List<ModuleId>,
   // The digest of each module the last load read with summaries, for `parsedDigests`.
   digests: List<LoadedDigest>,
+  // The bindings nothing names in each module the last load read that has any, for
+  // `unusedWarnings`.
+  unused: List<ModuleUnused>,
   /// The modules packages' `build.silk` plans generate (driver/BuildPlan).
   generated: List<GeneratedModule>,
 }
@@ -120,6 +126,12 @@ struct GeneratedModule {
 struct LoadedDigest {
   module: ModuleId,
   digest: ContentHash,
+}
+
+// The bindings nothing names in one module.
+struct ModuleUnused {
+  module: ModuleId,
+  found: List<Unused>,
 }
 
 // A file `preload` parses ahead on a thread of its own: the position of its module among those
@@ -1201,6 +1213,7 @@ effect fn assemble(source: &Path, located: PackageRoot, standardLibrary: Option<
     parsed: List<SourceUnit>.make(),
     summaries: Option<ImportSummaries>.none(),
     digests: List<LoadedDigest>.make(),
+    unused: List<ModuleUnused>.make(),
     generated: List<GeneratedModule>.make(),
     claimFree: List<ModuleId>.make(),
     listings: List<Listing>.make(),
@@ -1853,6 +1866,7 @@ pub effect fn preload(self: &mut ModuleSources, roots: &[ModuleId]) -> ()
   List<SourceUnit>.clear(&mut self.parsed)
   List<ModuleId>.clear(&mut self.claimFree)
   List<LoadedDigest>.clear(&mut self.digests)
+  self.unused = List<ModuleUnused>.make()
   // A file the last build's store parsed is parsed again ahead, on threads of their own, while
   // this load reads and parses the rest (see `ImportSummaries.wasParsed`).
   let mut ahead = List<ParseJob>.make()
@@ -1897,6 +1911,10 @@ pub effect fn preload(self: &mut ModuleSources, roots: &[ModuleId]) -> ()
         Option<ImportSummary>.None => run parsedSummary(&mut self.*, &module, move bytes, digest, List<Bytes>.asSlice(&sealedNames))
       }
       if !summary.claims { run List<ModuleId>.append(&mut self.claimFree, ModuleId.copy(&module)) }
+      if List<Unused>.length(&summary.unused) > usize.ZERO {
+        let found = run Summaries.copyUnused(List<Unused>.asSlice(&summary.unused))
+        run List<ModuleUnused>.append(&mut self.unused, ModuleUnused {module: ModuleId.copy(&module), found: move found})
+      }
       if summary.sealed {
         // The path is fixed and compiler-owned; sourceLocation never consults the project tree.
         run List<ModuleId>.append(&mut pending, run PackageGraph.target(&self.graph, &module, SealedOperators.path()))
@@ -2087,13 +2105,14 @@ effect fn parsedSummary(self: &mut ModuleSources, module: &ModuleId, bytes: Byte
   let mut paths = run ModuleIndex.importPaths(&index, &unit)
   run EmbeddedFiles.append(&unit.authored, &mut paths)
   let claims = Semantic.claimsForeignSymbols(&unit.authored, &index)
+  let unused = run UnusedBindings.find(&unit.authored)
   if let Option<ImportSummaries>.Some {value: summaries} = &mut self.summaries {
     if SourceUnit.diagnosticCount(&unit) == usize.ZERO {
-      run Summaries.add(&mut summaries, digest, sealed, claims, List<Bytes>.asSlice(&paths))
+      run Summaries.add(&mut summaries, digest, sealed, claims, List<Bytes>.asSlice(&paths), List<Unused>.asSlice(&unused))
     }
   }
   run List<SourceUnit>.append(&mut self.parsed, move unit)
-  return ImportSummary {digest: digest, sealed: sealed, claims: claims, paths: move paths}
+  return ImportSummary {digest: digest, sealed: sealed, claims: claims, paths: move paths, unused: move unused}
 }
 
 /// Lets `preload` take a file's imports from `summaries` instead of parsing it, and record the
@@ -2111,6 +2130,27 @@ pub fn takeSummaries(self: &mut ModuleSources) -> Option<ImportSummaries> {
 /// `offerClaimFree`.
 pub fn takeClaimFree(self: &mut ModuleSources) -> List<ModuleId> {
   return Intrinsic.replace(self.claimFree, List<ModuleId>.make())
+}
+
+/// The unused-binding warnings (MOD0007, SEM0255) of each of `modules` the last load read, module
+/// by module in the order given. A file's come from its summary when its bytes are unchanged, so
+/// a warm load reports them without parsing it.
+pub effect fn unusedWarnings(self: &ModuleSources, modules: &[ModuleId]) -> List<Shared<Rejection>> ! OutOfMemoryError ? &mut Allocator {
+  let mut warnings = List<Shared<Rejection>>.make()
+  let recorded = List<ModuleUnused>.asSlice(&self.unused)
+  let mut at = usize.ZERO
+  while at < modules.length {
+    let mut index = usize.ZERO
+    while index < recorded.length {
+      if ModuleId.equals(&recorded[index].module, &modules[at]) {
+        run Semantics.appendUnusedWarnings(&mut warnings, &modules[at], List<Unused>.asSlice(&recorded[index].found))
+        break
+      }
+      index = index + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return move warnings
 }
 
 /// Takes the units `preload` parsed, for a store's `offerParsed`.

@@ -61,7 +61,7 @@ pub effect fn main() -> i32
       }
       return 0
     }
-    Result<String, ParseError>.Failure { error: _ } => 1
+    Result<String, ParseError>.Failure {..} => 1
   }
 }
 ```

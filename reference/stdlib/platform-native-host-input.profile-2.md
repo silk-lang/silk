@@ -45,7 +45,7 @@ effect fn program() -> i32
   let mut empty: [u8; 0] = []
   let missing = NativeHostInput.variable(&inputs, b"SILK_DOC_NOT_SET", &mut empty)
   match move missing {
-    Option.Some { value: _ } => {
+    Option.Some {..} => {
       return 1
     }
     Option.None => {}

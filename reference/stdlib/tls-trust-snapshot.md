@@ -39,7 +39,7 @@ pub fn main() -> i32 {
       }
       return 0
     }
-    Result<TrustSnapshot, TrustSourceError>.Failure { error: _ } => 1
+    Result<TrustSnapshot, TrustSourceError>.Failure {..} => 1
   }
 }
 ```

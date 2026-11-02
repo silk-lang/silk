@@ -63,7 +63,7 @@ pub effect fn main() -> i32
       }
       return 0
     }
-    Result<Progress, DecodeError>.Failure { error: _ } => 1
+    Result<Progress, DecodeError>.Failure {..} => 1
   }
 }
 ```

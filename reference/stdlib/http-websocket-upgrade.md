@@ -94,19 +94,19 @@ effect fn program() -> i32
   let wire = b"GET /chat HTTP/1.1\r\nHost: server.example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: chat, superchat\r\nSec-WebSocket-Version: 13\r\n\r\n"
   let parsed = match move run parseRequest(&wire, headLimits()) {
     Result<ParsedRequest, ParseError>.Success { value } => move value
-    Result<ParsedRequest, ParseError>.Failure { error: _ } => {
+    Result<ParsedRequest, ParseError>.Failure {..} => {
       return 1
     }
   }
   let head = match RequestParser.head(&parsed.parser) {
     Result<RequestHead, ParseError>.Success { value } => value
-    Result<RequestHead, ParseError>.Failure { error: _ } => {
+    Result<RequestHead, ParseError>.Failure {..} => {
       return 1
     }
   }
   let offer = match move inspect(&head, Limits.defaults()) {
     Result<Offer, UpgradeError>.Success { value } => move value
-    Result<Offer, UpgradeError>.Failure { error: _ } => {
+    Result<Offer, UpgradeError>.Failure {..} => {
       return 1
     }
   }
@@ -125,7 +125,7 @@ effect fn program() -> i32
   let mut accept: [u8; 28] = [0; 28]
   let written = match move offer.acceptInto(&mut accept) {
     Result<usize, UpgradeError>.Success { value } => value
-    Result<usize, UpgradeError>.Failure { error: _ } => {
+    Result<usize, UpgradeError>.Failure {..} => {
       return 1
     }
   }
@@ -137,7 +137,7 @@ effect fn program() -> i32
   let mut again: [u8; 28] = [0; 28]
   let direct = match move acceptInto(b"dGhlIHNhbXBsZSBub25jZQ==", &mut again) {
     Result<usize, UpgradeError>.Success { value } => value
-    Result<usize, UpgradeError>.Failure { error: _ } => {
+    Result<usize, UpgradeError>.Failure {..} => {
       return 1
     }
   }
@@ -149,18 +149,18 @@ effect fn program() -> i32
   let old = b"GET /chat HTTP/1.1\r\nHost: server.example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 8\r\n\r\n"
   let oldParsed = match move run parseRequest(&old, headLimits()) {
     Result<ParsedRequest, ParseError>.Success { value } => move value
-    Result<ParsedRequest, ParseError>.Failure { error: _ } => {
+    Result<ParsedRequest, ParseError>.Failure {..} => {
       return 1
     }
   }
   let oldHead = match RequestParser.head(&oldParsed.parser) {
     Result<RequestHead, ParseError>.Success { value } => value
-    Result<RequestHead, ParseError>.Failure { error: _ } => {
+    Result<RequestHead, ParseError>.Failure {..} => {
       return 1
     }
   }
   return match move inspect(&oldHead, Limits.defaults()) {
-    Result<Offer, UpgradeError>.Success { value: _ } => 1
+    Result<Offer, UpgradeError>.Success {..} => 1
     Result<Offer, UpgradeError>.Failure { error } => {
       if rejectionStatus(&error) != 426 {
         return 1

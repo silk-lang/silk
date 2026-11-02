@@ -108,7 +108,7 @@ effect fn program() -> i32
   ! ResolverError | OutOfMemoryError {
   let host = match Host.parse("example.com") {
     Result<Host, AddressError>.Success { value } => value
-    Result<Host, AddressError>.Failure { error: _ } => {
+    Result<Host, AddressError>.Failure {..} => {
       return 1
     }
   }
@@ -120,7 +120,7 @@ effect fn program() -> i32
     Option<Instant>.none(),
   ) {
     Result<ResolveRequest, ResolverError>.Success { value } => move value
-    Result<ResolveRequest, ResolverError>.Failure { error: _ } => {
+    Result<ResolveRequest, ResolverError>.Failure {..} => {
       return 1
     }
   }

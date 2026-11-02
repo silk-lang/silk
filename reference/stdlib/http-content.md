@@ -59,19 +59,19 @@ effect fn program() -> i32
   let wire = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 28\r\n\r\n"
   let parsed = match run parseResponse(&wire, limits.head) {
     Result<ParsedResponse, ParseError>.Success { value } => move value
-    Result<ParsedResponse, ParseError>.Failure { error: _ } => {
+    Result<ParsedResponse, ParseError>.Failure {..} => {
       return 1
     }
   }
   let head = match ResponseParser.head(&parsed.parser) {
     Result<ResponseHead, ParseError>.Success { value } => value
-    Result<ResponseHead, ParseError>.Failure { error: _ } => {
+    Result<ResponseHead, ParseError>.Failure {..} => {
       return 1
     }
   }
   let context = match ResponseContext.make(head, Method.get(), TrailerPolicy.defaultPolicy()) {
     Result<ResponseContext, BodyError>.Success { value } => move value
-    Result<ResponseContext, BodyError>.Failure { error: _ } => {
+    Result<ResponseContext, BodyError>.Failure {..} => {
       return 1
     }
   }
@@ -83,7 +83,7 @@ effect fn program() -> i32
     move options.contentLimits
   ) {
     Result<CodingPlan, ContentError>.Success { value } => move value
-    Result<CodingPlan, ContentError>.Failure { error: _ } => {
+    Result<CodingPlan, ContentError>.Failure {..} => {
       return 1
     }
   }
@@ -139,7 +139,7 @@ effect fn program() -> i32
     let rest = Slice.view<u8>(&body, offset, body.length - offset)
     let step = match Decoder.step(&mut decoder, rest, &mut chunk, true) {
       Result<DecodeProgress, DecodeFailure>.Success { value } => move value
-      Result<DecodeProgress, DecodeFailure>.Failure { error: _ } => {
+      Result<DecodeProgress, DecodeFailure>.Failure {..} => {
         return 1
       }
     }

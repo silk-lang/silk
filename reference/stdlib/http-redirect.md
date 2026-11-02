@@ -64,7 +64,7 @@ import silk.uri.reference { ParseError }
 fn status(code: u16) -> Status {
   return match Status.fromCode(code) {
     Result<Status, ValueError>.Success { value } => value
-    Result<Status, ValueError>.Failure { error: _ } => {
+    Result<Status, ValueError>.Failure {..} => {
       Intrinsic.trap("unexpected failure")
       return status(code)
     }
@@ -74,14 +74,14 @@ fn status(code: u16) -> Status {
 fn origin(text: string<'static>) -> Origin {
   let uri = match Uri.parse(text) {
     Result<Uri, ParseError>.Success { value } => value
-    Result<Uri, ParseError>.Failure { error: _ } => {
+    Result<Uri, ParseError>.Failure {..} => {
       Intrinsic.trap("unexpected failure")
       return origin(text)
     }
   }
   return match Origin.fromUri(&uri) {
     Result<Origin, OriginError>.Success { value } => value
-    Result<Origin, OriginError>.Failure { error: _ } => {
+    Result<Origin, OriginError>.Failure {..} => {
       Intrinsic.trap("unexpected failure")
       return origin(text)
     }
@@ -101,7 +101,7 @@ pub fn main() -> i32 {
     NameList.empty(),
   ) {
     Result<Policy, RedirectError>.Success { value } => move value
-    Result<Policy, RedirectError>.Failure { error: _ } => {
+    Result<Policy, RedirectError>.Failure {..} => {
       return 1
     }
   }
@@ -109,7 +109,7 @@ pub fn main() -> i32 {
   // 303 is a redirect. It changes POST to GET and drops the body.
   let decision = match statusDecision(&policy, status(303), 0) {
     Result<StatusDecision, RedirectError>.Success { value } => value
-    Result<StatusDecision, RedirectError>.Failure { error: _ } => {
+    Result<StatusDecision, RedirectError>.Failure {..} => {
       return 1
     }
   }
@@ -133,7 +133,7 @@ pub fn main() -> i32 {
     0,
     status(302),
   ) {
-    Result<bool, RedirectError>.Success { value: _ } => false
+    Result<bool, RedirectError>.Success {..} => false
     Result<bool, RedirectError>.Failure { error } => match error.reason {
       RedirectReason.DowngradeDenied => true
       _ => false
