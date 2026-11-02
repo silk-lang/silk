@@ -52,18 +52,23 @@ families, OS operation implementations and startup implementations belong to oth
 
 A host links an executable for its own target, for wasm32, for Windows, for macOS, or for
 GNU/Linux. Every native link passes the target triple to Clang. A Linux link uses the `ld.lld`
-beside Clang; a macOS link for another architecture or host uses `ld64.lld` and a native one
-Apple's `ld`. An explicit supply's `linker` wins over both. The link stamp covers the supply's
+beside Clang; a macOS link against Silk's libSystem stub, or for another architecture or host,
+uses `ld64.lld`, and a native one against an SDK Apple's `ld`. A Windows link passes `/Brepro`, so
+its image carries a content hash in place of the link time. An explicit supply's `linker` wins over both. The link stamp covers the supply's
 root, linker, deployment and the digests of the SDK files it read, so a replaced SDK relinks.
 
-A macOS link needs no SDK. When an automatic request finds none (no `SDKROOT`, and no `xcrun` or a
-host that is not a Mac), the link uses Silk's own libSystem stub: a TAPI text file that names
+A macOS link needs no SDK. An automatic request without `SDKROOT` uses Silk's own libSystem stub
+on every host, a Mac included, unless the link declares inputs (objects, archives, libraries,
+frameworks or C sources): those need the SDK a Mac discovers through `xcrun`, and only on another
+host, or a Mac with no `xcrun`, do they fall back to the stub. A program therefore links to the
+same bytes on every host, as a GNU/Linux program does. The stub is a TAPI text file that names
 `/usr/lib/libSystem.B.dylib` and the symbols Silk programs bind there, for both macOS
 architectures. The compiler writes it into the link's scratch directory and links with
 `ld64.lld`, `-nostdlib` and `-lSystem` against it alone. The default deployment is then 12.0; a
 written deployment must be 11.0.0 or later. The stub's digest is part of the link stamp. It has no
 frameworks or other libraries, so a `[native].link` framework entry needs a real SDK through
-`SDKROOT` or an explicit supply. A `native` request never falls back to the stub.
+`SDKROOT`, a `native` request or an explicit supply. A `native` request always discovers the SDK
+and never falls back to the stub.
 
 A dynamically linked `libc = "gnu"` executable needs no sysroot on any host. Unless an explicit
 supply is declared, the compiler writes stub shared libraries for glibc 2.28 (`libc.so.6`,

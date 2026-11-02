@@ -154,13 +154,15 @@ os=$(uname -s)
 arch=$(uname -m)
 case "$os" in
   Darwin)
-    # A shell under Rosetta reports x86_64 on an Apple silicon Mac.
+    # A shell under Rosetta reports x86_64 on an Apple silicon Mac, which gets the arm64 build;
+    # only a real Intel Mac gets the Intel one.
     if [ "$arch" = x86_64 ] && [ "$(sysctl -n sysctl.proc_translated 2> /dev/null || echo 0)" = 1 ]; then
       arch=arm64
     fi
     case "$arch" in
       arm64 | aarch64) target=aarch64-apple-darwin ;;
-      *) fail "Silk has no build for Intel Macs yet" ;;
+      x86_64) target=x86_64-apple-darwin ;;
+      *) fail "Silk has no build for macOS on $arch yet" ;;
     esac
     ;;
   Linux)
