@@ -57,7 +57,7 @@ pub effect fn main() -> i32
         return 1
       }
     }
-    Result<OutputProgress, RecordError>.Failure { error: _ } => {
+    Result<OutputProgress, RecordError>.Failure {..} => {
       return 1
     }
   }
@@ -71,13 +71,13 @@ pub effect fn main() -> i32
         return 1
       }
     }
-    Result<InputProgress, RecordError>.Failure { error: _ } => {
+    Result<InputProgress, RecordError>.Failure {..} => {
       return 1
     }
   }
   match TlsRecordSender.ackWritten(&mut sender, length) {
-    Result<(), RecordError>.Success { value: _ } => {}
-    Result<(), RecordError>.Failure { error: _ } => {
+    Result<(), RecordError>.Success {..} => {}
+    Result<(), RecordError>.Failure {..} => {
       return 1
     }
   }
@@ -89,7 +89,7 @@ pub effect fn main() -> i32
       }
       return 0
     }
-    Result<usize, RecordError>.Failure { error: _ } => 1
+    Result<usize, RecordError>.Failure {..} => 1
   }
 }
 ```

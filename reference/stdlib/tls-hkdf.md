@@ -34,7 +34,7 @@ pub fn main() -> i32 {
   let secret: [u8; 32] = [7; 32]
   let fromMessages = match TlsHkdfSha256.deriveSecret(&secret, b"derived", b"") {
     Result<[u8; 32], LabelError>.Success { value } => value
-    Result<[u8; 32], LabelError>.Failure { error: _ } => {
+    Result<[u8; 32], LabelError>.Failure {..} => {
       return 1
     }
   }
@@ -43,7 +43,7 @@ pub fn main() -> i32 {
   let emptyHash = Sha256.hash(b"")
   let fromHash = match TlsHkdfSha256.deriveSecretFromHash(&secret, b"derived", &emptyHash) {
     Result<[u8; 32], LabelError>.Success { value } => value
-    Result<[u8; 32], LabelError>.Failure { error: _ } => {
+    Result<[u8; 32], LabelError>.Failure {..} => {
       return 1
     }
   }

@@ -37,12 +37,12 @@ import silk.uri.reference { ParseError, UriReference }
 pub fn main() -> i32 {
   let reference = match UriReference.parse("/search?q=silk#results") {
     Result<UriReference, ParseError>.Success { value } => value
-    Result<UriReference, ParseError>.Failure { error: _ } => {
+    Result<UriReference, ParseError>.Failure {..} => {
       return 1
     }
   }
   let relative = match UriReference.scheme(&reference) {
-    Option<string>.Some { value: _ } => false
+    Option<string>.Some {..} => false
     Option<string>.None => true
   }
   let query = UriReference.query(&reference) |> Option<string>.unwrapOr("")
@@ -67,7 +67,7 @@ pub fn main() -> i32 {
       }
       return 0
     }
-    Result<UriReference, ParseError>.Success { value: _ } => 1
+    Result<UriReference, ParseError>.Success {..} => 1
   }
 }
 ```

@@ -74,7 +74,7 @@ effect fn program() -> i32
   let parsed = run parseResponse(&wire, limits()) |> Effect.provideMut<Allocator>(&mut allocator)
   let result = match move parsed {
     Result<ParsedResponse, ParseError>.Success { value } => move value
-    Result<ParsedResponse, ParseError>.Failure { error: _ } => {
+    Result<ParsedResponse, ParseError>.Failure {..} => {
       return 1
     }
   }
@@ -85,7 +85,7 @@ effect fn program() -> i32
   }
   let head = match ResponseParser.head(&result.parser) {
     Result<ResponseHead, ParseError>.Success { value } => value
-    Result<ResponseHead, ParseError>.Failure { error: _ } => {
+    Result<ResponseHead, ParseError>.Failure {..} => {
       return 1
     }
   }

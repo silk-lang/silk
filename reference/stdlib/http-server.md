@@ -203,20 +203,20 @@ effect<'call> fn handleRequest<
   ? &mut Allocator | &mut MonotonicClock {
   let length = match move Header.make("Content-Length", b"5", valueLimits()) {
     Result.Success { value } => value
-    Result.Failure { error: _ } => {
+    Result.Failure {..} => {
       return 1
     }
   }
   let entries: [Header<'static>; 1] = [length]
   let headers = match move Headers.make(&entries, valueLimits()) {
     Result.Success { value } => value
-    Result.Failure { error: _ } => {
+    Result.Failure {..} => {
       return 1
     }
   }
   let status = match move Status.fromCode(200) {
     Result.Success { value } => value
-    Result.Failure { error: _ } => {
+    Result.Failure {..} => {
       return 1
     }
   }
@@ -228,7 +228,7 @@ effect<'call> fn handleRequest<
     valueLimits(),
   ) {
     Result.Success { value } => move value
-    Result.Failure { error: _ } => {
+    Result.Failure {..} => {
       return 1
     }
   }

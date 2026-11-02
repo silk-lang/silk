@@ -193,7 +193,7 @@ effect<'call> fn chat<'call, 'channel: 'call, 'transport: 'channel>(
     &mut message,
     Option<Instant>.none()
   ) {
-    Event.PeerClose { data: _ } => 0
+    Event.PeerClose {..} => 0
     _ => 1
   }
 }
@@ -223,7 +223,7 @@ effect<'call> fn handleRequest<
   )
   return match move outcome {
     Outcome.Upgraded { value } => value
-    Outcome.Rejected { status: _ } => 1
+    Outcome.Rejected {..} => 1
   }
 }
 

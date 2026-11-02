@@ -53,7 +53,7 @@ pub effect fn main() -> i32
       }
       return 0
     }
-    Result<ZstdProgress, ZstdError>.Failure { error: _ } => 1
+    Result<ZstdProgress, ZstdError>.Failure {..} => 1
   }
 }
 ```

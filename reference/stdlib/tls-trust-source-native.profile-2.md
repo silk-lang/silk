@@ -55,7 +55,7 @@ effect fn program() -> i32
   let loaded = run Effect.result(TrustSource.load(TrustLoadLimits.defaults()))
     |> Effect.provideMut<TrustSource>(&mut source)
   return match move loaded {
-    Result.Success { value: _ } => 1
+    Result.Success {..} => 1
     Result.Failure { error: failure } => match move failure {
       TrustSourceError.File { operation: _, error: cause } => {
         drop cause

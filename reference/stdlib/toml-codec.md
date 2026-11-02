@@ -41,7 +41,7 @@ fn port(document: &Value) -> i32 {
   return match Toml.field(document, "port") {
     Option<&Value>.Some { value } => match TomlCodec.decodeOne<i32>(value) {
       Result<i32, TomlError>.Success { value: number } => number
-      Result<i32, TomlError>.Failure { error: _ } => 0
+      Result<i32, TomlError>.Failure {..} => 0
     }
     Option<&Value>.None => 0
   }

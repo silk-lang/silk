@@ -70,7 +70,7 @@ pub effect fn main() -> i32
   let mut random = ExampleRandom { next: 1 }
   let reference = match HttpsIdentity.reference(OriginHost<'static>.Dns { bytes: b"example.com" }) {
     Result<ReferenceIdentity, IdentityError>.Success { value } => value
-    Result<ReferenceIdentity, IdentityError>.Failure { error: _ } => {
+    Result<ReferenceIdentity, IdentityError>.Failure {..} => {
       return 1
     }
   }
@@ -78,7 +78,7 @@ pub effect fn main() -> i32
   // An empty snapshot trusts no server. Real programs load CA certificates.
   let trust = match TrustSnapshot.fromAnchors(List<TrustAnchor>.make(), SnapshotLimits.defaults()) {
     Result<TrustSnapshot, TrustSourceError>.Success { value } => move value
-    Result<TrustSnapshot, TrustSourceError>.Failure { error: _ } => {
+    Result<TrustSnapshot, TrustSourceError>.Failure {..} => {
       return 1
     }
   }
@@ -92,7 +92,7 @@ pub effect fn main() -> i32
     |> Effect.provideMut<Allocator>(&mut allocator)
   let mut client = match move made {
     Result<Client, TlsError>.Success { value } => move value
-    Result<Client, TlsError>.Failure { error: _ } => {
+    Result<Client, TlsError>.Failure {..} => {
       return 1
     }
   }
@@ -103,8 +103,8 @@ pub effect fn main() -> i32
     return 1
   }
   return match Client.ackWritten(&mut client, length) {
-    Result<Progress, TlsError>.Success { value: _ } => 0
-    Result<Progress, TlsError>.Failure { error: _ } => 1
+    Result<Progress, TlsError>.Success {..} => 0
+    Result<Progress, TlsError>.Failure {..} => 1
   }
 }
 ```

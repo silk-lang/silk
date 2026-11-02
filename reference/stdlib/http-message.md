@@ -46,7 +46,7 @@ fn limits() -> Limits {
 pub fn main() -> i32 {
   let status = match Status.fromCode(404) {
     Result<Status, ValueError>.Success { value } => value
-    Result<Status, ValueError>.Failure { error: _ } => {
+    Result<Status, ValueError>.Failure {..} => {
       return 1
     }
   }
@@ -55,14 +55,14 @@ pub fn main() -> i32 {
   }
   let header = match Header.make("Content-Type", b"text/plain", limits()) {
     Result<Header, ValueError>.Success { value } => value
-    Result<Header, ValueError>.Failure { error: _ } => {
+    Result<Header, ValueError>.Failure {..} => {
       return 1
     }
   }
   let entries = [header]
   let headers = match Headers.make(&entries, limits()) {
     Result<Headers, ValueError>.Success { value } => value
-    Result<Headers, ValueError>.Failure { error: _ } => {
+    Result<Headers, ValueError>.Failure {..} => {
       return 1
     }
   }
@@ -75,7 +75,7 @@ pub fn main() -> i32 {
     limits(),
   ) {
     Result<ResponseHead, ValueError>.Success { value } => move value
-    Result<ResponseHead, ValueError>.Failure { error: _ } => {
+    Result<ResponseHead, ValueError>.Failure {..} => {
       return 1
     }
   }
@@ -85,7 +85,7 @@ pub fn main() -> i32 {
 
   // A value with a line break fails.
   let bad = match Header.make("X-Note", b"a\r\nb", limits()) {
-    Result<Header, ValueError>.Success { value: _ } => false
+    Result<Header, ValueError>.Success {..} => false
     Result<Header, ValueError>.Failure { error } => error.offset == 1
   }
   if !bad {
