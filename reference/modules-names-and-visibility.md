@@ -203,9 +203,10 @@ An import also does not implicitly re-export names or activate unlisted methods,
 overloads, or runtime providers. Interface-conformance availability is defined with interface and
 specialization rules rather than by runtime import side effects.
 
-**Diagnostics:** A valid but unused import is not a compiler error. Tooling may report a removable
-unused-import warning. Invalid bindings retain their import or name-resolution diagnostics even
-when no runtime expression uses them.
+**Diagnostics:** A valid but unused import is not a compiler error. The compiler reports it as the
+`MOD0007` warning described under [Unused import warnings](#unused-import-warnings). Invalid
+bindings retain their import or name-resolution diagnostics even when no runtime expression uses
+them.
 
 **Evidence:** behavior-neutral imports,
 module semantic surface.
@@ -1210,19 +1211,19 @@ fixtures, tests, and generated documentation use the same explicit-import model.
 
 Selective public imports are explicit re-exports; ordinary imports remain private.
 
-## Unused import tooling
+## Unused import warnings
 
-The language server reports `LSP0004` on each valid namespace or selected-member import binding that
-has no semantic use in its module. Aliases are tracked as authored bindings, so using one alias does
-not make another alias used. Explicitly published members and semantic references in module
-conditions are uses. Qualified access uses the namespace binding rather than an independent
-direct selector with the same declaration and spelling. Import declarations, comments, recovered
-syntax, and matching text are not uses.
+`silk check`, `silk build` and the language server report the `MOD0007` warning on each namespace or
+selected-member binding of a module-private import that no name in its module spells. Aliases are
+separate bindings, so using one alias does not make another alias used. A name counts as a use
+wherever it is written outside import declarations, in a type, an expression, a qualified path or
+a module condition, except an identifier that resolves to a local binding of the same spelling.
+Import declarations and comments are not uses. A `pub import` publishes its bindings and is never
+reported, and neither is a binding whose name starts with `_`, such as an import kept only to load
+a module of test cases: `import hir.UnusedCases as _cases`.
 
-The **Remove unused import** quick fix removes only the selector and its owned delimiter, or removes
-the whole declaration when it is the final binding. In a hybrid import, it can instead remove only
-the namespace alias or selected-member clause. The fix is omitted when comment or trivia ownership
-is ambiguous. Code actions reacquire the same binding and plan from the exact accepted document
-version before returning an edit, so changed documents cannot receive stale offsets. This is a
-tooling warning: it does not affect compiler diagnostics, lowering, code generation, or command
-success. Imports themselves have no runtime behavior.
+A warning does not reject the program: the command still succeeds, and its exit status is the
+one it would have without the warning. Only the root package's modules are reported, a module with
+syntax errors reports none, `silk build` reports them only when the build succeeds, and a binding
+inside an error's span, such as an import of a missing module, reports only the error. The language server marks the binding unnecessary, which editors
+show faded. Imports themselves have no runtime behavior.
