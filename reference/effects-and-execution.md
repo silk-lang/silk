@@ -22,6 +22,29 @@ pub fn main() -> i32 {
 **Boundary:** An ordinary function call executes immediately and returns its declared result rather
 than constructing an Effect.
 
+Invoking a callable value yields what its target yields: an `effect fn` target constructs its Effect,
+and an ordinary target whose result is an Effect executes and returns that Effect. A contract such as
+`fn(i32) -> Effect<'static; i32>` accepts either target, and `run f(x)` runs the Effect either one
+yields. The Effect keeps its target's exact representation, as a direct call of that target would.
+
+```silk
+import silk.core.effect { Effect }
+
+effect fn next(value: i32) -> i32 { return value + 1 }
+fn later(value: i32) -> Effect<i32> { return next(value) }
+
+effect fn twice(f: fn(i32) -> Effect<'static; i32>) -> i32 {
+  let first = run f(1)
+  return run f(first)
+}
+
+pub fn main() -> i32 {
+  let a = run twice(next)
+  let b = run twice(later)
+  return a + b
+}
+```
+
 **Diagnostics:** Calling an effect function is not itself an error. Using its `Effect<A>` result in
 a context that requires `A` must produce a type-mismatch diagnostic naming both types at the use
 site. Returning it from a body whose contract requires `A` produces `SEM0129`. Ignoring the Effect

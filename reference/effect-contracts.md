@@ -297,7 +297,8 @@ fn choose(flag: bool) -> Effect<i32> {
 ```
 
 `choose` has one structural result contract even though its two return paths construct different
-Effects. The compiler retains a finite hidden variant, or an equivalent static representation, that
+Effects. Every function with a body, named or a literal such as `fn(flag: bool) -> Effect<i32> { ... }`,
+joins its returned Effects this way. The compiler retains a finite hidden variant, or an equivalent static representation, that
 can run and clean up the selected construction correctly. Forming the join does not run either
 Effect.
 

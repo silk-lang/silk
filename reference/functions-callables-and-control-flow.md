@@ -657,9 +657,13 @@ effect fn chained() -> i32 {
 }
 ```
 
+A lambda without `effect` whose body returns an Effect is an ordinary function that returns that
+Effect, so `|value| next(value)` continues `next(1)` exactly as the `effect` lambda above does. Both
+satisfy the same `fn(i32) -> Effect<i32>` contract, and running either result runs `next(value)`
+([EFF-001](effects-and-execution.md#eff-001--calling-an-effect-function-constructs-an-effect)).
+
 **Boundary:** A lambda's inferred types must be nameable in a signature: a type that names a loan of
-the enclosing body or a binder the enclosing call is still inferring cannot be inferred. A lambda that
-returns an Effect value without being `effect` is not supported yet; write an `effect` lambda.
+the enclosing body or a binder the enclosing call is still inferring cannot be inferred.
 
 **Diagnostics:** A parameter or result type the context cannot supply reports `SEM0252` at the
 parameter or lambda; writing the type, as in `|value: i32|`, resolves it.
