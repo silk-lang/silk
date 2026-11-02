@@ -42,7 +42,7 @@ import silk.system.system_clock { Instant, SystemClock }
 fn request(name: string, deadline: Option<Instant>) -> Option<ResolveRequest> {
   let host = match Host.parse(name) {
     Result<Host, AddressError>.Success { value } => value
-    Result<Host, AddressError>.Failure { error: _ } => {
+    Result<Host, AddressError>.Failure {..} => {
       return Option<ResolveRequest>.none()
     }
   }
@@ -50,7 +50,7 @@ fn request(name: string, deadline: Option<Instant>) -> Option<ResolveRequest> {
     Result<ResolveRequest, ResolverError>.Success { value } => Option<ResolveRequest>.some(
       move value
     )
-    Result<ResolveRequest, ResolverError>.Failure { error: _ } => Option<ResolveRequest>.none()
+    Result<ResolveRequest, ResolverError>.Failure {..} => Option<ResolveRequest>.none()
   }
 }
 
@@ -85,7 +85,7 @@ pub fn main() -> i32 {
     |> Effect.provideMut<MonotonicClock>(&mut clock)
     |> Effect.provideMut<Allocator>(&mut allocator)
   return match move attempted {
-    Result.Success { value: _ } => 1
+    Result.Success {..} => 1
     Result.Failure { error } => match move error {
       ResolverError.DeadlineUnsupported => 0
       _ => 1

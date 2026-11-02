@@ -33,7 +33,7 @@ import silk.uri.reference { ParseError }
 pub fn main() -> i32 {
   let uri = match Uri.parse("https://ada@example.com:8443/docs?page=2#intro") {
     Result<Uri, ParseError>.Success { value } => value
-    Result<Uri, ParseError>.Failure { error: _ } => {
+    Result<Uri, ParseError>.Failure {..} => {
       return 1
     }
   }
@@ -60,13 +60,13 @@ pub effect fn main() -> i32
   let mut allocator = Allocator.systemAllocatorProvider()
   let base = match Uri.parse("https://example.com/docs/guide/intro.html") {
     Result<Uri, ParseError>.Success { value } => value
-    Result<Uri, ParseError>.Failure { error: _ } => {
+    Result<Uri, ParseError>.Failure {..} => {
       return 1
     }
   }
   let link = match UriReference.parse("../img/logo.png") {
     Result<UriReference, ParseError>.Success { value } => value
-    Result<UriReference, ParseError>.Failure { error: _ } => {
+    Result<UriReference, ParseError>.Failure {..} => {
       return 1
     }
   }
@@ -79,7 +79,7 @@ pub effect fn main() -> i32
       }
       return 0
     }
-    Result<OwnedUri, ParseError>.Failure { error: _ } => 1
+    Result<OwnedUri, ParseError>.Failure {..} => 1
   }
 }
 ```

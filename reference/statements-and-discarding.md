@@ -52,3 +52,26 @@ When the operand is an owned place, `drop place` performs cleanup on its live re
 a partial aggregate. It ends that place's ownership and skips components already moved away.
 This differs from passing `move place` to an ordinary function, which requires a complete value.
 Active loans and whole-value user `Drop` boundaries still apply; a second drop is use after move.
+
+## STMT-002 — A local binding nothing reads is a warning
+
+**Status:** Confirmed
+
+`silk check`, `silk build` and the language server report the `SEM0252` warning at a `let` or
+`const` name, a `static for` name, or a name a pattern binds, when no identifier in its scope names
+it. Assigning to the binding counts as naming it. Parameters are not reported, because an
+implementation must accept every parameter its interface or service declares.
+
+```silk,ignore
+pub fn main() -> i32 {
+  let unused = 1
+  return 0
+}
+```
+
+A name that starts with `_` is never reported, so `let _guard = lock()` keeps a value alive to the
+end of its block without a warning. To discard a result at once, write `drop` instead (STMT-001).
+
+**Diagnostics:** `SEM0252` is a warning: the command still succeeds. Only the root package's
+modules are reported, a module with syntax errors reports none, `silk build` reports them only when
+the build succeeds, and the language server marks the name unnecessary, which editors show faded.

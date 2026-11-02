@@ -56,20 +56,20 @@ import silk.uri.reference { ParseError }
 fn origin(text: string<'static>) -> Option<Origin> {
   let uri = match Uri.parse(text) {
     Result<Uri, ParseError>.Success { value } => value
-    Result<Uri, ParseError>.Failure { error: _ } => {
+    Result<Uri, ParseError>.Failure {..} => {
       return Option<Origin>.none()
     }
   }
   return match Origin.fromUri(&uri) {
     Result<Origin, OriginError>.Success { value } => Option<Origin>.some(value)
-    Result<Origin, OriginError>.Failure { error: _ } => Option<Origin>.none()
+    Result<Origin, OriginError>.Failure {..} => Option<Origin>.none()
   }
 }
 
 fn passes(checked: Result<(), NativeExchangeError>) -> bool {
   return match move checked {
-    Result.Success { value: _ } => true
-    Result.Failure { error: _ } => false
+    Result.Success {..} => true
+    Result.Failure {..} => false
   }
 }
 
@@ -96,7 +96,7 @@ pub fn main() -> i32 {
   // The resolver cannot stop at a deadline, so a host name with a deadline fails.
   options.deadline = Option<Instant>.some(SystemClock.make(5, 0))
   let rejected = match move preflight(&named, &options) {
-    Result.Success { value: _ } => false
+    Result.Success {..} => false
     Result.Failure { error } => match move error {
       NativeExchangeError.UnsupportedDeadline => true
       _ => false

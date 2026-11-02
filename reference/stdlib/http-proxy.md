@@ -55,14 +55,14 @@ import silk.uri.reference { ParseError }
 fn origin(text: string<'static>) -> Origin {
   let uri = match Uri.parse(text) {
     Result<Uri, ParseError>.Success { value } => value
-    Result<Uri, ParseError>.Failure { error: _ } => {
+    Result<Uri, ParseError>.Failure {..} => {
       Intrinsic.trap("unexpected failure")
       return origin(text)
     }
   }
   return match Origin.fromUri(&uri) {
     Result<Origin, OriginError>.Success { value } => value
-    Result<Origin, OriginError>.Failure { error: _ } => {
+    Result<Origin, OriginError>.Failure {..} => {
       Intrinsic.trap("unexpected failure")
       return origin(text)
     }
@@ -75,14 +75,14 @@ effect fn program() -> i32
   // The token is the Base64 of "user:pass".
   let auth = match run ProxyAuth.preparedBasic(ProxyAuthContextId.make(1), b"dXNlcjpwYXNz") {
     Result<ProxyAuth, ProxyError>.Success { value } => move value
-    Result<ProxyAuth, ProxyError>.Failure { error: _ } => {
+    Result<ProxyAuth, ProxyError>.Failure {..} => {
       return 1
     }
   }
   let local = [origin("http://localhost:8080")]
   let bypass = match run BypassPolicy.copy(&local) {
     Result<BypassPolicy, ProxyError>.Success { value } => move value
-    Result<BypassPolicy, ProxyError>.Failure { error: _ } => {
+    Result<BypassPolicy, ProxyError>.Failure {..} => {
       return 1
     }
   }
@@ -94,7 +94,7 @@ effect fn program() -> i32
     4096,
   ) {
     Result<ProxyConfig, ProxyError>.Success { value } => move value
-    Result<ProxyConfig, ProxyError>.Failure { error: _ } => {
+    Result<ProxyConfig, ProxyError>.Failure {..} => {
       return 1
     }
   }

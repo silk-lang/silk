@@ -234,8 +234,8 @@ pub fn main() -> i32 {
     0xd8
   ]
   match EcdsaP384Sha384.verify(&publicKey, b"hello", &signature) {
-    Result<(), P384SignatureError>.Success { value: _ } => {}
-    Result<(), P384SignatureError>.Failure { error: _ } => {
+    Result<(), P384SignatureError>.Success {..} => {}
+    Result<(), P384SignatureError>.Failure {..} => {
       return 1
     }
   }
