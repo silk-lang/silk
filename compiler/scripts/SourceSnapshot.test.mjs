@@ -457,6 +457,7 @@ it.effect(
           'x86_64-unknown-linux-gnu': 'silk-compiler-x86_64-unknown-linux-gnu',
           'aarch64-unknown-linux-gnu': 'silk-compiler-aarch64-unknown-linux-gnu',
           'aarch64-apple-darwin': 'silk-compiler-aarch64-apple-darwin',
+          'x86_64-apple-darwin': 'silk-compiler-x86_64-apple-darwin',
           'x86_64-pc-windows-msvc': 'silk-compiler-x86_64-pc-windows-msvc.exe',
         }[target])
         assert.strictEqual(selected.sha256, hash(target))

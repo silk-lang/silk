@@ -1,14 +1,5 @@
 # Running CI on a branch
 
-Selfhost also invokes `windows-release.yml` with its verified Linux N1 and immutable source
-snapshot. Linux cross-builds the first Windows compiler; `windows-2025` builds N2, verifies the
-native IR fixpoint and compiler identity, and builds the tool. Linux packages the Windows ZIP,
-and Windows extracts it and builds a new project through the bundled tool without `--stdlib`.
-This chain supplies the Windows release candidate and gates publication, while the existing
-Linux required check remains unchanged. It does not alter the pinned seed or require a Windows seed.
-The candidate asset is `silk-compiler-x86_64-pc-windows-msvc.exe`; its installable archive is
-`silk-<version>-x86_64-pc-windows-msvc.zip`.
-
 The non-required `Windows native execution` workflow runs automatically after N1 on main pushes
 and PR pushes carrying the `windows` label. It reuses the same N1, including the exact synthetic
 merge revision on a PR. If main reuses a green same-tree run, Windows consumes that run's N1 and
@@ -86,3 +77,27 @@ run instead of cancelling it, so cancel a run you no longer need:
 ```sh
 gh api -X POST repos/silk-lang/silk/actions/runs/<run id>/cancel
 ```
+
+## Release archives
+
+Every release archive is built on one Linux runner. After the N2 fixpoint, Selfhost invokes
+`release-cross.yml` with the verified Linux N1, the immutable source snapshot and the profile the
+Linux N2 trained on. Its `cross` job runs `.github/scripts/release-build.sh` with N1 for each of
+`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`,
+`x86_64-apple-darwin` and `x86_64-pc-windows-msvc`, with no SDK or sysroot: Linux and macOS links
+use Silk's own glibc and libSystem stubs, Windows links its own import libraries. Every compiler
+but Windows is optimized by that one profile, since the emitted IR names no target. The job packs
+`silk-<version>-<target>.tar.gz` (a ZIP for Windows) with `ReleaseArchive.ts`.
+
+Each target's runner then only verifies: it unpacks its archive and runs `release-build.sh` again
+with the archive's compiler (`windows-release.ps1` on Windows), and the compiler and tool it
+builds must be the cross-built bytes, and the compiler's IR the IR N1 emitted on Linux. A
+difference is a determinism bug in the compiler or its link: fix it, never compare around it. The
+runner then smokes the archive and runs the corpus with the release compiler (x86-64 Linux runs it
+with N1 in the corpus job). `x86_64-apple-darwin` rebuilds on `macos-15` under Rosetta, because
+LLVM publishes no Intel macOS Clang, and `macos-15-intel` runs the archive natively with Homebrew's
+LLVM. Publication signs and publishes the cross-built archives only after every verification
+passes; each target's receipt and seed candidate come from its verification.
+
+Only the x86-64 Linux seed in `compiler/native-seed.json` builds anything; the other entries are
+unused by CI. Changing the pin is a separate, explicit decision.
