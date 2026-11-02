@@ -395,7 +395,7 @@ The descriptor event flags.
 pub unsafe extern "C" fn args_get(
     argv: ?[*]mut ?[*]mut u8,
     buffer: ?[*]mut u8
-  ) -> u32 as "silk_wasi_args_get"
+  ) -> u32 as "wasi_snapshot_preview1#args_get"
 ```
 
 Calls WASI `args_get` with the Preview 1 ABI.
@@ -412,7 +412,7 @@ All pointers must address the buffers and structures that the WASI specification
 pub unsafe extern "C" fn args_sizes_get(
     count: *mut u32,
     size: *mut u32
-  ) -> u32 as "silk_wasi_args_sizes_get"
+  ) -> u32 as "wasi_snapshot_preview1#args_sizes_get"
 ```
 
 Calls WASI `args_sizes_get` with the Preview 1 ABI.
@@ -429,7 +429,7 @@ All pointers must address the buffers and structures that the WASI specification
 pub unsafe extern "C" fn environ_get(
     environ: ?[*]mut ?[*]mut u8,
     buffer: ?[*]mut u8
-  ) -> u32 as "silk_wasi_environ_get"
+  ) -> u32 as "wasi_snapshot_preview1#environ_get"
 ```
 
 Calls WASI `environ_get` with the Preview 1 ABI.
@@ -446,7 +446,7 @@ All pointers must address the buffers and structures that the WASI specification
 pub unsafe extern "C" fn environ_sizes_get(
     count: *mut u32,
     size: *mut u32
-  ) -> u32 as "silk_wasi_environ_sizes_get"
+  ) -> u32 as "wasi_snapshot_preview1#environ_sizes_get"
 ```
 
 Calls WASI `environ_sizes_get` with the Preview 1 ABI.
@@ -463,7 +463,7 @@ All pointers must address the buffers and structures that the WASI specification
 pub unsafe extern "C" fn clock_res_get(
     clock: u32,
     resolution: *mut u64
-  ) -> u32 as "silk_wasi_clock_res_get"
+  ) -> u32 as "wasi_snapshot_preview1#clock_res_get"
 ```
 
 Calls WASI `clock_res_get` with the Preview 1 ABI.
@@ -481,7 +481,7 @@ pub unsafe extern "C" fn clock_time_get(
     clock: u32,
     precision: u64,
     time: *mut u64
-  ) -> u32 as "silk_wasi_clock_time_get"
+  ) -> u32 as "wasi_snapshot_preview1#clock_time_get"
 ```
 
 Calls WASI `clock_time_get` with the Preview 1 ABI.
@@ -499,7 +499,7 @@ pub unsafe extern "C" fn fd_advise(
     offset: u64,
     length: u64,
     advice: u32
-  ) -> u32 as "silk_wasi_fd_advise"
+  ) -> u32 as "wasi_snapshot_preview1#fd_advise"
 ```
 
 Calls WASI `fd_advise` with the Preview 1 ABI.
@@ -516,7 +516,7 @@ pub unsafe extern "C" fn fd_allocate(
     fd: u32,
     offset: u64,
     length: u64
-  ) -> u32 as "silk_wasi_fd_allocate"
+  ) -> u32 as "wasi_snapshot_preview1#fd_allocate"
 ```
 
 Calls WASI `fd_allocate` with the Preview 1 ABI.
@@ -529,7 +529,7 @@ All pointers must address the buffers and structures that the WASI specification
 ## `fd_close`
 
 ```silk
-pub unsafe extern "C" fn fd_close(fd: u32) -> u32 as "silk_wasi_fd_close"
+pub unsafe extern "C" fn fd_close(fd: u32) -> u32 as "wasi_snapshot_preview1#fd_close"
 ```
 
 Calls WASI `fd_close` with the Preview 1 ABI.
@@ -542,7 +542,7 @@ All pointers must address the buffers and structures that the WASI specification
 ## `fd_datasync`
 
 ```silk
-pub unsafe extern "C" fn fd_datasync(fd: u32) -> u32 as "silk_wasi_fd_datasync"
+pub unsafe extern "C" fn fd_datasync(fd: u32) -> u32 as "wasi_snapshot_preview1#fd_datasync"
 ```
 
 Calls WASI `fd_datasync` with the Preview 1 ABI.
@@ -559,7 +559,7 @@ All pointers must address the buffers and structures that the WASI specification
 pub unsafe extern "C" fn fd_fdstat_get(
     fd: u32,
     stat: *mut FdStat
-  ) -> u32 as "silk_wasi_fd_fdstat_get"
+  ) -> u32 as "wasi_snapshot_preview1#fd_fdstat_get"
 ```
 
 Calls WASI `fd_fdstat_get` with the Preview 1 ABI.
@@ -575,7 +575,7 @@ All pointers must address the buffers and structures that the WASI specification
 pub unsafe extern "C" fn fd_fdstat_set_flags(
     fd: u32,
     flags: u32
-  ) -> u32 as "silk_wasi_fd_fdstat_set_flags"
+  ) -> u32 as "wasi_snapshot_preview1#fd_fdstat_set_flags"
 ```
 
 Calls WASI `fd_fdstat_set_flags` with the Preview 1 ABI.
@@ -592,7 +592,7 @@ pub unsafe extern "C" fn fd_fdstat_set_rights(
     fd: u32,
     base: u64,
     inheriting: u64
-  ) -> u32 as "silk_wasi_fd_fdstat_set_rights"
+  ) -> u32 as "wasi_snapshot_preview1#fd_fdstat_set_rights"
 ```
 
 Calls WASI `fd_fdstat_set_rights` with the Preview 1 ABI.
@@ -609,7 +609,7 @@ All pointers must address the buffers and structures that the WASI specification
 pub unsafe extern "C" fn fd_filestat_get(
     fd: u32,
     stat: *mut FileStat
-  ) -> u32 as "silk_wasi_fd_filestat_get"
+  ) -> u32 as "wasi_snapshot_preview1#fd_filestat_get"
 ```
 
 Calls WASI `fd_filestat_get` with the Preview 1 ABI.
@@ -625,7 +625,7 @@ All pointers must address the buffers and structures that the WASI specification
 pub unsafe extern "C" fn fd_filestat_set_size(
     fd: u32,
     size: u64
-  ) -> u32 as "silk_wasi_fd_filestat_set_size"
+  ) -> u32 as "wasi_snapshot_preview1#fd_filestat_set_size"
 ```
 
 Calls WASI `fd_filestat_set_size` with the Preview 1 ABI.
@@ -643,7 +643,7 @@ pub unsafe extern "C" fn fd_filestat_set_times(
     access: u64,
     modified: u64,
     flags: u32
-  ) -> u32 as "silk_wasi_fd_filestat_set_times"
+  ) -> u32 as "wasi_snapshot_preview1#fd_filestat_set_times"
 ```
 
 Calls WASI `fd_filestat_set_times` with the Preview 1 ABI.
@@ -663,7 +663,7 @@ pub unsafe extern "C" fn fd_pread(
     count: u32,
     offset: u64,
     read: *mut u32
-  ) -> u32 as "silk_wasi_fd_pread"
+  ) -> u32 as "wasi_snapshot_preview1#fd_pread"
 ```
 
 Calls WASI `fd_pread` with the Preview 1 ABI.
@@ -680,7 +680,7 @@ All pointers must address the buffers and structures that the WASI specification
 pub unsafe extern "C" fn fd_prestat_get(
     fd: u32,
     stat: *mut Prestat
-  ) -> u32 as "silk_wasi_fd_prestat_get"
+  ) -> u32 as "wasi_snapshot_preview1#fd_prestat_get"
 ```
 
 Calls WASI `fd_prestat_get` with the Preview 1 ABI.
@@ -698,7 +698,7 @@ pub unsafe extern "C" fn fd_prestat_dir_name(
     fd: u32,
     path: ?[*]mut u8,
     length: u32
-  ) -> u32 as "silk_wasi_fd_prestat_dir_name"
+  ) -> u32 as "wasi_snapshot_preview1#fd_prestat_dir_name"
 ```
 
 Calls WASI `fd_prestat_dir_name` with the Preview 1 ABI.
@@ -718,7 +718,7 @@ pub unsafe extern "C" fn fd_pwrite(
     count: u32,
     offset: u64,
     written: *mut u32
-  ) -> u32 as "silk_wasi_fd_pwrite"
+  ) -> u32 as "wasi_snapshot_preview1#fd_pwrite"
 ```
 
 Calls WASI `fd_pwrite` with the Preview 1 ABI.
@@ -737,7 +737,7 @@ pub unsafe extern "C" fn fd_read(
     vectors: ?[*]const IoVector,
     count: u32,
     read: *mut u32
-  ) -> u32 as "silk_wasi_fd_read"
+  ) -> u32 as "wasi_snapshot_preview1#fd_read"
 ```
 
 Calls WASI `fd_read` with the Preview 1 ABI.
@@ -757,7 +757,7 @@ pub unsafe extern "C" fn fd_readdir(
     length: u32,
     cookie: u64,
     used: *mut u32
-  ) -> u32 as "silk_wasi_fd_readdir"
+  ) -> u32 as "wasi_snapshot_preview1#fd_readdir"
 ```
 
 Calls WASI `fd_readdir` with the Preview 1 ABI.
@@ -770,7 +770,7 @@ All pointers must address the buffers and structures that the WASI specification
 ## `fd_renumber`
 
 ```silk
-pub unsafe extern "C" fn fd_renumber(from: u32, to: u32) -> u32 as "silk_wasi_fd_renumber"
+pub unsafe extern "C" fn fd_renumber(from: u32, to: u32) -> u32 as "wasi_snapshot_preview1#fd_renumber"
 ```
 
 Calls WASI `fd_renumber` with the Preview 1 ABI.
@@ -789,7 +789,7 @@ pub unsafe extern "C" fn fd_seek(
     offset: i64,
     whence: u32,
     position: *mut u64
-  ) -> u32 as "silk_wasi_fd_seek"
+  ) -> u32 as "wasi_snapshot_preview1#fd_seek"
 ```
 
 Calls WASI `fd_seek` with the Preview 1 ABI.
@@ -802,7 +802,7 @@ All pointers must address the buffers and structures that the WASI specification
 ## `fd_sync`
 
 ```silk
-pub unsafe extern "C" fn fd_sync(fd: u32) -> u32 as "silk_wasi_fd_sync"
+pub unsafe extern "C" fn fd_sync(fd: u32) -> u32 as "wasi_snapshot_preview1#fd_sync"
 ```
 
 Calls WASI `fd_sync` with the Preview 1 ABI.
@@ -819,7 +819,7 @@ All pointers must address the buffers and structures that the WASI specification
 pub unsafe extern "C" fn fd_tell(
     fd: u32,
     position: *mut u64
-  ) -> u32 as "silk_wasi_fd_tell"
+  ) -> u32 as "wasi_snapshot_preview1#fd_tell"
 ```
 
 Calls WASI `fd_tell` with the Preview 1 ABI.
@@ -838,7 +838,7 @@ pub unsafe extern "C" fn fd_write(
     vectors: ?[*]const ConstIoVector,
     count: u32,
     written: *mut u32
-  ) -> u32 as "silk_wasi_fd_write"
+  ) -> u32 as "wasi_snapshot_preview1#fd_write"
 ```
 
 Calls WASI `fd_write` with the Preview 1 ABI.
@@ -856,7 +856,7 @@ pub unsafe extern "C" fn path_create_directory(
     fd: u32,
     path: ?[*]const u8,
     length: u32
-  ) -> u32 as "silk_wasi_path_create_directory"
+  ) -> u32 as "wasi_snapshot_preview1#path_create_directory"
 ```
 
 Calls WASI `path_create_directory` with the Preview 1 ABI.
@@ -876,7 +876,7 @@ pub unsafe extern "C" fn path_filestat_get(
     path: ?[*]const u8,
     length: u32,
     stat: *mut FileStat
-  ) -> u32 as "silk_wasi_path_filestat_get"
+  ) -> u32 as "wasi_snapshot_preview1#path_filestat_get"
 ```
 
 Calls WASI `path_filestat_get` with the Preview 1 ABI.
@@ -898,7 +898,7 @@ pub unsafe extern "C" fn path_filestat_set_times(
     access: u64,
     modified: u64,
     flags: u32
-  ) -> u32 as "silk_wasi_path_filestat_set_times"
+  ) -> u32 as "wasi_snapshot_preview1#path_filestat_set_times"
 ```
 
 Calls WASI `path_filestat_set_times` with the Preview 1 ABI.
@@ -920,7 +920,7 @@ pub unsafe extern "C" fn path_link(
     newfd: u32,
     newpath: ?[*]const u8,
     newlength: u32
-  ) -> u32 as "silk_wasi_path_link"
+  ) -> u32 as "wasi_snapshot_preview1#path_link"
 ```
 
 Calls WASI `path_link` with the Preview 1 ABI.
@@ -944,7 +944,7 @@ pub unsafe extern "C" fn path_open(
     inheriting: u64,
     descriptorFlags: u32,
     opened: *mut u32
-  ) -> u32 as "silk_wasi_path_open"
+  ) -> u32 as "wasi_snapshot_preview1#path_open"
 ```
 
 Calls WASI `path_open` with the Preview 1 ABI.
@@ -969,7 +969,7 @@ pub unsafe extern "C" fn path_readlink(
     buffer: ?[*]mut u8,
     capacity: u32,
     used: *mut u32
-  ) -> u32 as "silk_wasi_path_readlink"
+  ) -> u32 as "wasi_snapshot_preview1#path_readlink"
 ```
 
 Calls WASI `path_readlink` with the Preview 1 ABI.
@@ -987,7 +987,7 @@ pub unsafe extern "C" fn path_remove_directory(
     fd: u32,
     path: ?[*]const u8,
     length: u32
-  ) -> u32 as "silk_wasi_path_remove_directory"
+  ) -> u32 as "wasi_snapshot_preview1#path_remove_directory"
 ```
 
 Calls WASI `path_remove_directory` with the Preview 1 ABI.
@@ -1008,7 +1008,7 @@ pub unsafe extern "C" fn path_rename(
     newfd: u32,
     newpath: ?[*]const u8,
     newlength: u32
-  ) -> u32 as "silk_wasi_path_rename"
+  ) -> u32 as "wasi_snapshot_preview1#path_rename"
 ```
 
 Calls WASI `path_rename` with the Preview 1 ABI.
@@ -1028,7 +1028,7 @@ pub unsafe extern "C" fn path_symlink(
     fd: u32,
     newpath: ?[*]const u8,
     newlength: u32
-  ) -> u32 as "silk_wasi_path_symlink"
+  ) -> u32 as "wasi_snapshot_preview1#path_symlink"
 ```
 
 Calls WASI `path_symlink` with the Preview 1 ABI.
@@ -1046,7 +1046,7 @@ pub unsafe extern "C" fn path_unlink_file(
     fd: u32,
     path: ?[*]const u8,
     length: u32
-  ) -> u32 as "silk_wasi_path_unlink_file"
+  ) -> u32 as "wasi_snapshot_preview1#path_unlink_file"
 ```
 
 Calls WASI `path_unlink_file` with the Preview 1 ABI.
@@ -1069,7 +1069,7 @@ pub unsafe extern "C" fn poll_oneoff(
     events: ?[*]mut Event,
     count: u32,
     received: *mut u32
-  ) -> u32 as "silk_wasi_poll_oneoff"
+  ) -> u32 as "wasi_snapshot_preview1#poll_oneoff"
 ```
 
 Calls WASI `poll_oneoff` with the Preview 1 ABI.
@@ -1082,7 +1082,7 @@ All pointers must address the buffers and structures that the WASI specification
 ## `proc_exit`
 
 ```silk
-pub unsafe extern "C" fn proc_exit(code: u32) -> () as "silk_wasi_proc_exit"
+pub unsafe extern "C" fn proc_exit(code: u32) -> () as "wasi_snapshot_preview1#proc_exit"
 ```
 
 Calls WASI `proc_exit` with the Preview 1 ABI.
@@ -1096,7 +1096,7 @@ This call terminates the process without resource cleanup.
 ## `proc_raise`
 
 ```silk
-pub unsafe extern "C" fn proc_raise(signal: u32) -> u32 as "silk_wasi_proc_raise"
+pub unsafe extern "C" fn proc_raise(signal: u32) -> u32 as "wasi_snapshot_preview1#proc_raise"
 ```
 
 Calls WASI `proc_raise` with the Preview 1 ABI.
@@ -1113,7 +1113,7 @@ All pointers must address the buffers and structures that the WASI specification
 pub unsafe extern "C" fn random_get(
     buffer: ?[*]mut u8,
     length: u32
-  ) -> u32 as "silk_wasi_random_get"
+  ) -> u32 as "wasi_snapshot_preview1#random_get"
 ```
 
 Calls WASI `random_get` with the Preview 1 ABI.
@@ -1126,7 +1126,7 @@ All pointers must address the buffers and structures that the WASI specification
 ## `sched_yield`
 
 ```silk
-pub unsafe extern "C" fn sched_yield() -> u32 as "silk_wasi_sched_yield"
+pub unsafe extern "C" fn sched_yield() -> u32 as "wasi_snapshot_preview1#sched_yield"
 ```
 
 Calls WASI `sched_yield` with the Preview 1 ABI.
@@ -1144,7 +1144,7 @@ pub unsafe extern "C" fn sock_accept(
     fd: u32,
     flags: u32,
     accepted: *mut u32
-  ) -> u32 as "silk_wasi_sock_accept"
+  ) -> u32 as "wasi_snapshot_preview1#sock_accept"
 ```
 
 Calls WASI `sock_accept` with the Preview 1 ABI.
@@ -1169,7 +1169,7 @@ pub unsafe extern "C" fn sock_recv(
     flags: u32,
     received: *mut u32,
     resultFlags: *mut u16
-  ) -> u32 as "silk_wasi_sock_recv"
+  ) -> u32 as "wasi_snapshot_preview1#sock_recv"
 ```
 
 Calls WASI `sock_recv` with the Preview 1 ABI.
@@ -1189,7 +1189,7 @@ pub unsafe extern "C" fn sock_send(
     count: u32,
     flags: u32,
     sent: *mut u32
-  ) -> u32 as "silk_wasi_sock_send"
+  ) -> u32 as "wasi_snapshot_preview1#sock_send"
 ```
 
 Calls WASI `sock_send` with the Preview 1 ABI.
@@ -1202,7 +1202,7 @@ All pointers must address the buffers and structures that the WASI specification
 ## `sock_shutdown`
 
 ```silk
-pub unsafe extern "C" fn sock_shutdown(fd: u32, how: u32) -> u32 as "silk_wasi_sock_shutdown"
+pub unsafe extern "C" fn sock_shutdown(fd: u32, how: u32) -> u32 as "wasi_snapshot_preview1#sock_shutdown"
 ```
 
 Calls WASI `sock_shutdown` with the Preview 1 ABI.
