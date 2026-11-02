@@ -1812,7 +1812,7 @@ const program = Effect.gen(function* () {
     ["tuplefields", "tuple Range(i32, i32)\n\npub fn main() -> i32 {\n  let r = Range { 0: 3, 1: 10 }\n  return 0\n}\n", /error\[PAR0010\] A tuple's elements have no field names; build it by position, as in `Pair\(first, second\)`\n/],
     ["ternary", "pub fn main() -> i32 {\n  let c = true\n  let x = c ? 1 : 2\n  return x\n}\n", /error\[PAR0010\] Silk has no `c \? a : b`; write an `if` with a final `else` as the value, as in `if c \{ a \} else \{ b \}`\n/],
     ["matchthroughborrow", "union Status {\n  Open,\n  Done { day: u32 },\n}\n\nfn mark(status: &Status) -> i32 {\n  return match status.* {\n    Status.Open => 0\n    Status.Done { .. } => 1\n  }\n}\n\npub fn main() -> i32 {\n  let s = Status.Open\n  return mark(&s)\n}\n", /error\[OWN0003\] `match status\.\*` would move `status\.\*` out of a borrow, which cannot give it away; write `match &status\.\*` to look at it\n/],
-    ["fieldless", templateUse('StderrWriter.print("{}\\n", &5)'), /error\[SEM0177\] a template with placeholders takes its values as fields, such as `&\.\{name: value\}`, `&\(a, b\)`, or `&\(a,\)` for one value; these arguments have no fields\n/],
+    ["fieldless", templateUse('StderrWriter.print("{}\\n", &5)'), /error\[SEM0177\] a template with placeholders takes its values as fields, such as `&\.\{name: value\}`, `&\(a, b\)`, or `&\.\(a\)` for one value; these arguments have no fields\n/],
   ]
   for (const [name, source, expected] of [...lendCases, ...patternCases, ...staticCases, ...interopCases, ...templateCases]) {
     yield* fs.makeDirectory(join(directory, `${name}/src`), { recursive: true })

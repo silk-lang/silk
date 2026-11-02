@@ -896,12 +896,14 @@ Tuple positions do not create `_0`-style source fields. Consequently `Point {_0:
 invalid, labeled tuples are not a separate language form, and positional projection cannot select
 a same-spelled record field.
 
-### TUPLE-002 — Parenthesized commas distinguish tuples from grouping and unit
+### TUPLE-002 — Commas or a leading dot distinguish tuples from grouping and unit
 
 **Status:** Confirmed
 
-`(first, second)` is a tuple literal, `(only,)` is a one-element tuple literal, `(value)` is a
-grouped expression, and `()` is unit. When an independently known expected type is a named tuple,
+`(first, second)` is a tuple literal, `(value)` is a grouped expression, and `()` is unit. A
+leading dot makes a tuple of any length: `.(only)` is a one-element tuple literal with no trailing
+comma, `.(first, second)` equals `(first, second)`, and `.()` is unit. The older `(only,)` spelling
+still parses. When an independently known expected type is a named tuple,
 the literal constructs that type. Otherwise the literal occurrence creates one anonymous nominal
 positional aggregate.
 
