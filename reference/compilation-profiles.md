@@ -334,3 +334,44 @@ A dependency's plan entries reach its dependents as its manifest entries do. A p
 evaluated, a `PLAN` that is missing or not text `silk.build.plan` writes, and a generated module
 that a file of the package also defines each refuse the build, naming `build.silk`, after the
 diagnostics of its evaluation.
+
+## PROFILE-010 — Build tools
+
+A plan can run a program of the package as a tool step, for a job that needs a real program, such
+as a code generator:
+
+```silk,ignore
+static fn plan() -> string<'static> {
+  let mut plan = Plan.empty()
+  plan = Plan.tool(plan, "gen", "tools/gen.sh")
+  plan = Plan.toolArgument(plan, "tables.txt")
+  plan = Plan.toolInput(plan, "tables.txt")
+  plan = Plan.toolOutput(plan, "tables.silk")
+  plan = Plan.toolModule(plan, "generated_tables", "gen", "tables.silk")
+  return plan
+}
+```
+
+The step runs before the package is analyzed, with its output directory
+`<root>/build/tools/<package>/<step>` as its working directory, `HOME` and `TMPDIR` inside it,
+`SILK_TOOL=1`, `SILK_PACKAGE_DIR` naming the package directory and `PATH` naming the system's
+program directories. It starts from an empty output directory, must exit 0 and must write every
+declared output; otherwise the build is refused, naming `build.silk`, with what the step printed.
+Its key digests its program, arguments, inputs and outputs, so a build that changes none of them
+does not run it again. `Plan.toolModule` serves one of its outputs as a module of the package.
+
+The root package's steps always run. A dependency's steps run only when the root manifest lists
+the dependency by name:
+
+```toml
+[build]
+tools = ["tables"]
+```
+
+A step runs in an operating-system sandbox. On Linux 6.7 or newer it runs under Landlock: it reads
+and runs only files below `/usr`, `/bin`, `/lib`, `/lib64`, `/etc`, `/dev` and `/proc`, its program
+and its declared inputs, writes only its output directory, and can neither bind nor connect a TCP
+socket; where the kernel allows an unprivileged user namespace, it also has no network interface
+but loopback. Any other host has no sandbox, and refuses tool steps unless the root manifest sets
+`[build].unsandboxed-tools = true`; each build that then runs a step prints a warning naming it.
+`SILK_NO_TOOL_SANDBOX` set makes a host behave as one without a sandbox.

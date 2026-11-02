@@ -1,0 +1,209 @@
+//! The operating-system sandbox a `build.silk` tool step runs in (driver/ToolStep).
+//!
+//! The build starts the compiler itself as `silkc sandbox-exec --read <path>... --write <path>...
+//! -- <program> <argument>...`. That process restricts itself and then replaces itself with the
+//! program, so the program and everything it starts inherit the restriction and nothing in the
+//! compiler that started it runs restricted.
+//!
+//! On Linux the restriction is Landlock: the process may read and run files only below the
+//! `--read` paths and write only below the `--write` paths, and may neither bind nor connect a TCP
+//! socket. When the kernel lets an unprivileged process make a user namespace, it also moves into
+//! a new network namespace, which has no interface but loopback. Landlock needs ABI 4 (Linux 6.7)
+//! for the TCP rules; an older kernel, and every other host, has no sandbox here.
+
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.mem.pointer {Pointer}
+import silk.num.usize
+import silk.num.u64
+import silk.num.i32
+import silk.num.i64
+
+static if Intrinsic.targetOperatingSystem() == "linux" {
+  @foreign(noCapture: ("path",))
+  unsafe extern "C" fn open(path: ?[*]const u8, flags: i32, ...) -> i32
+  unsafe extern "C" fn close(fd: i32) -> i32
+  unsafe extern "C" fn dup2(from: i32, to: i32) -> i32
+  unsafe extern "C" fn syscall(number: i64, ...) -> i64
+  unsafe extern "C" fn prctl(option: i32, ...) -> i32
+  unsafe extern "C" fn unshare(flags: i32) -> i32
+  unsafe extern "C" fn execve(path: ?[*]const u8, arguments: ?[*]const ?[*]const u8, environment: ?[*]const ?[*]const u8) -> i32
+  @foreign(noCapture: ("buffer",))
+  unsafe extern "C" fn write(fd: i32, buffer: ?[*]const u8, count: usize) -> isize
+  @foreign(noCapture: ("name",))
+  unsafe extern "C" fn getenv(name: ?[*]const u8) -> ?[*]const u8
+  unsafe extern "C" static processEnvironment: ?[*]const ?[*]const u8 as "environ"
+
+  // The Landlock system calls share their numbers on x86_64 and arm64.
+  const CREATE_RULESET: i64 = 444
+  const ADD_RULE: i64 = 445
+  const RESTRICT_SELF: i64 = 446
+  const PATH_ONLY: i32 = 2097152
+  const CLOSE_ON_EXEC: i32 = 524288
+  const NO_NEW_PRIVILEGES: i32 = 38
+  const NEW_USER: i32 = 268435456
+  const NEW_NETWORK: i32 = 1073741824
+  const RULE_PATH_BENEATH: u64 = 1
+  // LANDLOCK_ACCESS_FS_EXECUTE | READ_FILE | READ_DIR.
+  const READ_ACCESS: u64 = 13
+  // LANDLOCK_ACCESS_NET_BIND_TCP | CONNECT_TCP.
+  const TCP_ACCESS: u64 = 3
+
+  /// Whether this host can run a tool step sandboxed. `SILK_NO_TOOL_SANDBOX` set makes it answer
+  /// no, as a host without a sandbox would.
+  pub fn supported() -> bool {
+    let disabled = unsafe getenv(Pointer.fromSlice<u8>(b"SILK_NO_TOOL_SANDBOX\0"))
+    if !Pointer.isNullMany<u8>(disabled) { return false }
+    return abi() >= 4
+  }
+
+  fn abi() -> i64 {
+    // LANDLOCK_CREATE_RULESET_VERSION asks for the ABI without creating a ruleset.
+    unsafe {
+      return syscall(CREATE_RULESET, Pointer.null<u8>(), usize.ZERO, 1)
+    }
+  }
+
+  // The filesystem rights the kernel's ABI `version` can handle.
+  fn handledAccess(version: i64) -> u64 {
+    if version >= 5 { return 65535 }
+    if version >= 3 { return 32767 }
+    if version >= 2 { return 16383 }
+    return 8191
+  }
+
+  // `value` written little-endian at `at` of `bytes`.
+  fn store(bytes: &mut [u8], at: usize, value: u64) -> () {
+    let mut rest = value
+    let mut index = usize.ZERO
+    while index < usize.add(0, 8) {
+      bytes[at + index] = u64.wrappingToU8(rest % 256)
+      rest = rest / 256
+      index = index + usize.ONE
+    }
+    return ()
+  }
+
+  // The rights of `access` that apply to a file.
+  fn fileRights(access: u64) -> u64 {
+    let mut rights: u64 = 0
+    let mut bit: u64 = 1
+    let mut rest = access
+    while rest > 0 {
+      if rest % 2 == 1 && (bit == 1 || bit == 2 || bit == 4 || bit == 16384 || bit == 32768) {
+        rights = rights + bit
+      }
+      rest = rest / 2
+      bit = bit * 2
+    }
+    return rights
+  }
+
+  fn report(message: &[u8]) -> () {
+    let written = unsafe write(2, Pointer.fromSlice<u8>(message), message.length)
+    return ()
+  }
+
+  // Grants `access` below the NUL-terminated `path` in `ruleset`; a path that does not exist grants
+  // nothing.
+  fn allow(ruleset: i32, path: &[u8], access: u64) -> bool {
+    let fd = unsafe open(Pointer.fromSlice<u8>(path), PATH_ONLY + CLOSE_ON_EXEC)
+    if fd < 0 { return true }
+    let mut attribute: [u8; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    store(&mut attribute, usize.ZERO, access)
+    let mut descriptor = i32.wrappingToU64(fd)
+    let mut index = usize.ZERO
+    while index < usize.add(0, 4) {
+      attribute[usize.add(0, 8) + index] = u64.wrappingToU8(descriptor % 256)
+      descriptor = descriptor / 256
+      index = index + usize.ONE
+    }
+    let mut added = unsafe syscall(ADD_RULE, ruleset, RULE_PATH_BENEATH, Pointer.fromSlice<u8>(&attribute), 0)
+    if added != 0 {
+      // A file, rather than a directory, takes only the rights that apply to files: EXECUTE,
+      // WRITE_FILE, READ_FILE, TRUNCATE and IOCTL_DEV.
+      store(&mut attribute, usize.ZERO, fileRights(access))
+      added = unsafe syscall(ADD_RULE, ruleset, RULE_PATH_BENEATH, Pointer.fromSlice<u8>(&attribute), 0)
+    }
+    let closed = unsafe close(fd)
+    return added == 0
+  }
+
+  /// Restricts this process to reading `readable` and writing `writable` (NUL-terminated paths)
+  /// with no TCP, then runs `program` with `arguments` (each NUL-terminated, the program first) in
+  /// place of it. Answers the status to exit with when that fails.
+  pub effect fn enter(readable: &[Bytes], writable: &[Bytes], program: &Bytes, arguments: &[Bytes]) -> i32 ! OutOfMemoryError ? &mut Allocator {
+    let version = abi()
+    if version < 4 {
+      report(b"silk: this host has no sandbox for build tools (Landlock ABI 4, Linux 6.7)\n")
+      return 126
+    }
+    // A tool's standard output joins the build's diagnostics.
+    let joined = unsafe dup2(2, 1)
+    // Best effort: no network interface at all. Landlock still refuses TCP without it.
+    let isolated = unsafe unshare(NEW_USER + NEW_NETWORK)
+    let fileAccess = handledAccess(version)
+    let mut attribute: [u8; 24] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    store(&mut attribute, usize.ZERO, fileAccess)
+    store(&mut attribute, usize.add(0, 8), TCP_ACCESS)
+    let mut size = usize.add(0, 16)
+    if version >= 6 {
+      // LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET | SIGNAL: no reaching processes outside the sandbox.
+      store(&mut attribute, usize.add(0, 16), 3)
+      size = usize.add(0, 24)
+    }
+    let created = unsafe syscall(CREATE_RULESET, Pointer.fromSlice<u8>(&attribute), size, 0)
+    if created < 0 {
+      report(b"silk: cannot create the build tool sandbox\n")
+      return 126
+    }
+    let ruleset = i64.wrappingToI32(created)
+    let mut at = usize.ZERO
+    while at < readable.length {
+      if !allow(ruleset, Bytes.asSlice(&readable[at]), READ_ACCESS) {
+        report(b"silk: cannot add a readable path to the build tool sandbox\n")
+        return 126
+      }
+      at = at + usize.ONE
+    }
+    at = usize.ZERO
+    while at < writable.length {
+      if !allow(ruleset, Bytes.asSlice(&writable[at]), fileAccess) {
+        report(b"silk: cannot add a writable path to the build tool sandbox\n")
+        return 126
+      }
+      at = at + usize.ONE
+    }
+    let private = unsafe prctl(NO_NEW_PRIVILEGES, 1, 0, 0, 0)
+    let restricted = unsafe syscall(RESTRICT_SELF, ruleset, 0)
+    if private != 0 || restricted != 0 {
+      report(b"silk: cannot enter the build tool sandbox\n")
+      return 126
+    }
+    let mut vector = List<?[*]const u8>.make()
+    at = usize.ZERO
+    while at < arguments.length {
+      run List<?[*]const u8>.append(&mut vector, Pointer.fromSlice<u8>(Bytes.asSlice(&arguments[at])))
+      at = at + usize.ONE
+    }
+    unsafe {
+      run List<?[*]const u8>.append(&mut vector, Intrinsic.pointerRequalify<?*mut u8, ?[*]const u8>(Pointer.null<u8>()))
+    }
+    unsafe {
+      let started = execve(Pointer.fromSlice<u8>(Bytes.asSlice(program)), Pointer.fromSlice<?[*]const u8>(List<?[*]const u8>.asSlice(&vector)), processEnvironment)
+    }
+    report(b"silk: cannot start the build tool\n")
+    return 127
+  }
+} else {
+  /// Whether this host can run a tool step sandboxed.
+  pub fn supported() -> bool {
+    return false
+  }
+
+  /// Restricts this process and runs `program` in place of it; this host has no sandbox.
+  pub effect fn enter(readable: &[Bytes], writable: &[Bytes], program: &Bytes, arguments: &[Bytes]) -> i32 ! OutOfMemoryError ? &mut Allocator {
+    return 126
+  }
+}

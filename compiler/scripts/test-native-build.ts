@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto'
 import { spawn, spawnSync, type SpawnSyncReturns } from 'node:child_process'
 import { existsSync, readdirSync, statSync } from 'node:fs'
 import { createRequire } from 'node:module'
+import { release } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import * as Config from 'effect/Config'
@@ -2460,6 +2461,95 @@ const program = Effect.gen(function* () {
     const refusedPlan = yield* invoke(silk, ['build', '--stdlib', standardLibrary], plannedApp, sourcesEnvironment)
     assert.equal(refusedPlan.status, 1, refusedPlan.stderr)
     assert.match(refusedPlan.stderr, rule)
+  }
+  // A plan's tool step runs a program of the package that writes declared outputs, and a module can
+  // be served from one. A dependency's steps run only when the root lists it in [build].tools. On
+  // Linux 6.7 or newer the step runs under Landlock, which refuses writes outside its output
+  // directory, reads outside its inputs and the system, and TCP. An unchanged rerun does not run
+  // it; a host without a sandbox refuses it unless the root sets [build].unsandboxed-tools, and
+  // then warns on every build.
+  const [kernelMajor, kernelMinor] = release().split('.').map(Number)
+  const landlockNet = process.platform === 'linux' && (kernelMajor > 6 || (kernelMajor === 6 && kernelMinor >= 7))
+  const tooled = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-build-tool-' })
+  for (const member of ['tlib/tools', 'app']) yield* fs.makeDirectory(join(tooled, member), { recursive: true })
+  yield* fs.writeFileString(
+    join(tooled, 'tlib/silk.toml'),
+    '[package]\nname = "tlib"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Tlib"]\n',
+  )
+  yield* fs.writeFileString(
+    join(tooled, 'tlib/build.silk'),
+    planScript(
+      '  let mut plan = Plan.empty()\n'
+        + '  plan = Plan.tool(plan, "gen", "tools/gen.sh")\n'
+        + '  plan = Plan.toolArgument(plan, "base.txt")\n'
+        + '  plan = Plan.toolInput(plan, "base.txt")\n'
+        + '  plan = Plan.toolOutput(plan, "generated.silk")\n'
+        + '  plan = Plan.toolModule(plan, "generated_base", "gen", "generated.silk")\n'
+        + '  return plan\n',
+    ),
+  )
+  const toolScript = (extra: string) =>
+    `#!/bin/sh\n[ "$SILK_TOOL" = 1 ] || exit 9\n${extra}printf 'pub const BASE: i32 = %s\\n' "$(cat "$SILK_PACKAGE_DIR/$1")" > generated.silk\n`
+  const writeTool = (extra: string) =>
+    fs.writeFileString(join(tooled, 'tlib/tools/gen.sh'), toolScript(extra)).pipe(Effect.andThen(fs.chmod(join(tooled, 'tlib/tools/gen.sh'), 0o755)))
+  yield* writeTool('')
+  yield* fs.writeFileString(join(tooled, 'tlib/base.txt'), '20')
+  yield* fs.writeFileString(join(tooled, 'tlib/Tlib.silk'), 'import generated_base\n\npub fn value() -> i32 {\n  return generated_base.BASE + 1\n}\n')
+  const toolApp = join(tooled, 'app')
+  const toolManifest = (build: string) =>
+    `[package]\nname = "app"\nversion = "0.1.0"\nsource = "."\n\n[dependencies]\ntlib = { path = "../tlib" }\n${build}`
+  yield* fs.writeFileString(join(toolApp, 'silk.toml'), toolManifest(''))
+  yield* fs.writeFileString(join(toolApp, 'main.silk'), 'import tlib.Tlib\n\npub fn main() -> i32 {\n  return Tlib.value()\n}\n')
+  const stepBuild = (environment: Record<string, string> = {}) =>
+    invoke(silk, ['build', '--stdlib', standardLibrary], toolApp, { ...sourcesEnvironment, ...environment })
+  const unlisted = yield* stepBuild()
+  assert.equal(unlisted.status, 1, unlisted.stderr)
+  assert.match(unlisted.stderr, /tlib\/build\.silk: build\.silk computes no plan: its tool steps run only when the root manifest lists "tlib" in \[build\]\.tools/)
+  yield* fs.writeFileString(join(toolApp, 'silk.toml'), toolManifest('\n[build]\ntools = ["tlib"]\n'))
+  const generatedFile = join(toolApp, 'build/tools/tlib/gen/generated.silk')
+  const generatedStamp = () => {
+    const info = statSync(generatedFile, { bigint: true })
+    return `${info.ino}:${info.mtimeNs}`
+  }
+  const toolRun = Effect.fnUntraced(function* (expected: number, environment: Record<string, string> = {}) {
+    const built = yield* stepBuild(environment)
+    assert.equal(built.status, 0, built.stderr)
+    const ran = yield* invoke(join(toolApp, `build/llvm/${hostTarget}/debug/app`), [], toolApp, sourcesEnvironment)
+    assert.equal(ran.status, expected, ran.stderr)
+    return built.stderr
+  })
+  if (landlockNet) {
+    yield* toolRun(21)
+    const firstGenerated = generatedStamp()
+    yield* toolRun(21)
+    assert.equal(generatedStamp(), firstGenerated, 'an unchanged rerun ran the tool again')
+    yield* fs.writeFileString(join(tooled, 'tlib/base.txt'), '30')
+    yield* toolRun(31)
+    assert.notEqual(generatedStamp(), firstGenerated, 'an edited input did not run the tool again')
+    for (const [extra, rule] of [
+      ['echo pwned > "$SILK_PACKAGE_DIR/pwned" || exit 3\n', /its tool step `gen` failed with status 3:\n.*pwned: Permission denied/],
+      ['cat "$SILK_PACKAGE_DIR/silk.toml" > /dev/null || exit 4\n', /its tool step `gen` failed with status 4/],
+      ['python3 -I -c "import socket; socket.create_connection((\'127.0.0.1\', 9), timeout=3)" 2>&1 | grep -q PermissionError && exit 5\n', /its tool step `gen` failed with status 5/],
+    ] as const) {
+      yield* writeTool(extra)
+      const escapedTool = yield* stepBuild()
+      assert.equal(escapedTool.status, 1, escapedTool.stderr)
+      assert.match(escapedTool.stderr, rule)
+    }
+    assert.equal(existsSync(join(tooled, 'tlib/pwned')), false, 'a sandboxed tool wrote outside its output directory')
+    yield* writeTool('exit 0\n')
+    const silent = yield* stepBuild()
+    assert.equal(silent.status, 1, silent.stderr)
+    assert.match(silent.stderr, /did not write its declared output generated\.silk/)
+    yield* writeTool('')
+  }
+  const unsandboxedHost = yield* stepBuild({ SILK_NO_TOOL_SANDBOX: '1' })
+  assert.equal(unsandboxedHost.status, 1, unsandboxedHost.stderr)
+  assert.match(unsandboxedHost.stderr, /this host has no sandbox for build tools .*set \[build\]\.unsandboxed-tools = true/)
+  yield* fs.writeFileString(join(toolApp, 'silk.toml'), toolManifest('\n[build]\ntools = ["tlib"]\nunsandboxed-tools = true\n'))
+  for (let round = 0; round < 2; round += 1) {
+    const stderr = yield* toolRun(landlockNet ? 31 : 21, { SILK_NO_TOOL_SANDBOX: '1' })
+    assert.match(stderr, /silk: warning: running build tool `gen` of tlib without a sandbox \(\[build\]\.unsandboxed-tools\)/)
   }
   // `[native].function-order` places the functions it lists first in the executable's code, in its
   // order, and a change to the file alone links again. A path outside the package is refused.
