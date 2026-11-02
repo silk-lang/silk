@@ -29,7 +29,7 @@ Run one area with `node --test integration/new-user/workspace.test.mjs`.
 
 `HTTPS_PROXY` and `GITHUB_TOKEN` pass through to the installer.
 
-A mirror holds one `v<version>/` folder per release, with the release's assets: `silk-<version>-<target>.tar.gz`, its `.minisig`, `native-seed.json` and `changes-snapshot.toml`.
+A mirror holds one `v<version>/` folder per release, with the release's assets: `silk-<version>-<target>.tar.gz`, its `.minisig` and `changes-snapshot.toml`.
 
 ## The docs check on its own
 

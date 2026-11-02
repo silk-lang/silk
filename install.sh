@@ -7,8 +7,8 @@
 # Compiler releases are tagged `v<version>`, with one `silk-<version>-<target>.tar.gz` per target.
 # Auto selection prefers stable and uses dev only before a stable release exists.
 # SILK_CHANNEL=dev follows published dev snapshots; drafts and bootstrap seeds are excluded.
-# The compiler's SHA-256, reported version and embedded change snapshot are checked before
-# installing it as the toolchain `$SILK_HOME/toolchains/<version>` (`SILK_HOME` defaults to
+# The archive's signature, the compiler's reported version and the embedded change snapshot are
+# checked before installing it as the toolchain `$SILK_HOME/toolchains/<version>` (`SILK_HOME` defaults to
 # `~/.silk`), and `settings.toml` makes it the default. The release's compiler is `bin/silkc`; its
 # `bin/silk`, the silk tool, is installed as `$SILK_HOME/bin/silk`, and runs the version a project's
 # `silk-version` pins inside it and the default outside. Other versions stay installed;
@@ -142,14 +142,6 @@ select_dev() {
   fail "$repo has no published dev compiler release"
 }
 
-sha256() {
-  if command -v sha256sum > /dev/null 2>&1; then
-    sha256sum "$1" | cut -d' ' -f1
-  else
-    shasum -a 256 "$1" | cut -d' ' -f1
-  fi
-}
-
 os=$(uname -s)
 arch=$(uname -m)
 case "$os" in
@@ -230,15 +222,6 @@ compiler=bin/silkc
 [ -f "$tmp/unpacked/$top/$compiler" ] && [ -d "$tmp/unpacked/$top/lib/silk/stdlib" ] ||
   fail "$archive does not hold bin/silkc and lib/silk/stdlib"
 
-# Every compiler release publishes a verified per-target pin; never silently skip verification.
-curl -fsSL -o "$tmp/native-seed.json" \
-  "https://github.com/$repo/releases/download/$release_path/native-seed.json" ||
-  fail "cannot download native-seed.json for $release"
-expected=$(tr -d ' \t\r\n' < "$tmp/native-seed.json" | grep -o "\"$target\":{[^}]*}" |
-  grep -o '"sha256":"[0-9a-f]*"' | cut -d'"' -f4) || true
-[ -n "$expected" ] || fail "native-seed.json of $release names no compiler for $target"
-actual=$(sha256 "$tmp/unpacked/$top/$compiler")
-[ "$actual" = "$expected" ] || fail "$compiler has SHA-256 $actual, but $release names $expected"
 [ "$("$tmp/unpacked/$top/$compiler" --version)" = "silk v$version" ] ||
   fail "the compiler does not report the requested version $version"
 [ -f "$tmp/unpacked/$top/lib/silk/changes-snapshot.toml" ] ||

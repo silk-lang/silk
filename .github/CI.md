@@ -100,4 +100,6 @@ LLVM. Publication signs and publishes the cross-built archives only after every 
 passes; each target's receipt and seed candidate come from its verification.
 
 `compiler/native-seed.json` pins only the x86-64 Linux seed: every other target's compiler is
-cross-built from it. Changing the pin is a separate, explicit decision.
+cross-built from it. Changing the pin is a separate, explicit decision. A release's own
+`native-seed.json` names every target's compiler; a pin bump keeps only its x86-64 Linux entry.
+The installers do not read it: they trust the archive's minisign signature.

@@ -78,7 +78,7 @@ The tool reads two things from a manifest: the root `silk-version`, and the rele
 `silk use` downloads `silk-<version>-<target>.tar.gz` and its `.minisig` from the GitHub release,
 or from `$SILK_TOOLCHAIN_MIRROR/v<version>/` when set. Installation needs a valid signature by the
 release key with the trusted comment `silk v<version> <archive>`, and a compiler (`bin/silkc`, or
-`bin/silk` in earlier releases) whose SHA-256 matches the release's `native-seed.json`. The archive
+`bin/silk` in earlier releases). The signature covers every byte of the archive, compiler included. The archive
 is unpacked into a hidden staging directory under `toolchains/` and renamed into place, so an
 interrupted install leaves nothing half written. The toolchain keeps no copy of the tool.
 Installs hold an `flock` on `$SILK_HOME/.install.lock`, so two concurrent installs of a release

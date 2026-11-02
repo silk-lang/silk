@@ -25,8 +25,7 @@ is sent only to the GitHub API.
 Before running downloaded code, the installer verifies the ZIP's SHA-256 against GitHub's
 asset metadata. If `minisign` is installed, it also requires a valid release-key signature and
 the exact trusted release comment. When GitHub supplies no digest, minisign verification is
-required. The extracted compiler must match `native-seed.json`, report the selected version,
-and carry a change snapshot identical to the published snapshot.
+required. The extracted compiler must report the selected version and carry a change snapshot identical to the published snapshot.
 
 `silk use <version>` installs additional signed toolchains. `silk update self` updates the
 tool and always checks the archive's minisign signature. On Windows, self-update retains
