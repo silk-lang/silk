@@ -265,6 +265,14 @@ object's cache key, so changing either the variable or the profile rebuilds the 
 profile describes one build of the program: regenerate it after changing the source or the
 compiler.
 
+`SILK_CODEGEN_UNITS=<n>` splits an optimized (`speed`) native executable into at most `n` codegen
+units, which Clang optimizes on separate threads; an unoptimized build already splits by module.
+The units follow the call graph: a function that only one group of functions calls joins that
+group, and every unit keeps its own internal copy of each small function and each function that
+asks to be inlined that it calls. A call that still crosses units is not inlined, so a split
+program runs a few percent slower and its code is larger. The variable is part of the build
+fingerprint; without it, or with `1`, the program stays one module.
+
 ## PROFILE-008 — Generated source
 
 A package author declares each generator as a `[[generate]]` entry in the package manifest or the

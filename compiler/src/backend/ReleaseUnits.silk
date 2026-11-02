@@ -1,0 +1,416 @@
+//! The codegen units an optimized executable splits into when `SILK_CODEGEN_UNITS` asks for more
+//! than one, so Clang optimizes them on several threads at once.
+//!
+//! An optimized build otherwise compiles the whole program as one module, and Clang's `-O2` then
+//! runs on one thread: a large program spends most of its build there. Splitting costs speed where
+//! a call crosses units, since Clang inlines only what a unit holds. So the units follow the call
+//! graph: a function that only one group of functions calls joins that group, and each unit keeps
+//! its own internal copy of every small function and every function that asks to be inlined that
+//! it calls. A function another unit calls stays external; every other content-named function a
+//! unit defines is internal, as in a whole-program module (`Bitcode.compileUnit`).
+import backend.Bitcode
+import backend.CodegenUnits {CodegenUnit}
+import semantic.ContentHash {ContentHash}
+import semantic.InternIndex {InternIndex}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.collections.slice {Slice}
+import silk.core.option {Option}
+import silk.num.u64
+import silk.num.usize
+
+// Linkages a definition may have in more than one unit.
+fn duplicable(linkage: u64) -> bool {
+  return linkage == Bitcode.linkInternal() || linkage == Bitcode.linkPrivate() || linkage == Bitcode.linkLinkOnceOdr()
+}
+
+// The fragment bytes below which every unit that calls a function keeps its own copy. Clang
+// inlines most functions this small, so a call across units would cost the inlining.
+fn localBytes() -> usize { return 16384 }
+
+/// Splits the whole program's `fragments`, as an optimized build assembles them, into at most
+/// `count` units, or into none when they hold too little to split.
+pub effect fn partition(fragments: &[u8], count: usize) -> List<CodegenUnit> ! OutOfMemoryError ? &mut Allocator {
+  // The fragments every unit holds: declarations and the target's duplicable definitions.
+  let mut shared = Bytes.make()
+  // The names shared fragments use, which every unit then calls.
+  let mut sharedUses = List<Bytes>.make()
+  // Each node: a fragment that defines something only one unit may define, or a content-named
+  // function any unit may copy.
+  let mut starts = List<usize>.make()
+  let mut ends = List<usize>.make()
+  let mut copyable = List<bool>.make()
+  // Every name a node uses, as a run per node.
+  let mut uses = List<Bytes>.make()
+  let mut useStarts = List<usize>.make()
+  // The names nodes define, with the node of each.
+  let mut defined = List<Bytes>.make()
+  let mut definer = List<usize>.make()
+  let mut lookup = InternIndex.make()
+  let mut contentNames = List<bool>.make()
+  let mut at = usize.ZERO
+  while at < fragments.length {
+    let end = Bitcode.fragmentEnd(fragments, at)
+    let fragment = Slice.view<u8>(fragments, at, end - at)
+    let named = run Bitcode.globalsOf(fragment)
+    let names = List<Bitcode.Named>.asSlice(&named)
+    let mut node = false
+    let mut copies = true
+    let mut index = usize.ZERO
+    while index < names.length {
+      if names[index].defined {
+        let content = names[index].function && Bitcode.isContentSymbol(Bytes.asSlice(&names[index].name))
+        if !duplicable(names[index].linkage) || content { node = true }
+        if !content && !duplicable(names[index].linkage) { copies = false }
+      }
+      index = index + usize.ONE
+    }
+    if node {
+      let own = List<usize>.length(&starts)
+      run List<usize>.append(&mut starts, at)
+      run List<usize>.append(&mut ends, end)
+      run List<bool>.append(&mut copyable, copies)
+      run List<usize>.append(&mut useStarts, List<Bytes>.length(&uses))
+      index = usize.ZERO
+      while index < names.length {
+        if names[index].defined {
+          if !duplicable(names[index].linkage) || names[index].function {
+            run InternIndex.record(&mut lookup, InternIndex.hashBytes(0, Bytes.asSlice(&names[index].name)))
+            run List<Bytes>.append(&mut defined, run Bytes.copy(Bytes.asSlice(&names[index].name)))
+            run List<usize>.append(&mut definer, own)
+            run List<bool>.append(&mut contentNames, names[index].function && Bitcode.isContentSymbol(Bytes.asSlice(&names[index].name)))
+          }
+        } else {
+          run List<Bytes>.append(&mut uses, run Bytes.copy(Bytes.asSlice(&names[index].name)))
+        }
+        index = index + usize.ONE
+      }
+    } else {
+      run Bytes.append(&mut shared, fragment)
+      index = usize.ZERO
+      while index < names.length {
+        if names[index].placeholder { run List<Bytes>.append(&mut sharedUses, run Bytes.copy(Bytes.asSlice(&names[index].name))) }
+        index = index + usize.ONE
+      }
+    }
+    at = end
+  }
+  let nodes = List<usize>.length(&starts)
+  run List<usize>.append(&mut useStarts, List<Bytes>.length(&uses))
+  if count <= usize.ONE || nodes < count * 4 { return List<CodegenUnit>.make() }
+  // The nodes each node calls.
+  let mut edges = List<usize>.make()
+  let mut edgeStarts = List<usize>.make()
+  let mut node = usize.ZERO
+  while node < nodes {
+    run List<usize>.append(&mut edgeStarts, List<usize>.length(&edges))
+    let mut use = List<usize>.get(&useStarts, node)
+    while use < List<usize>.get(&useStarts, node + usize.ONE) {
+      let target = definerOf(List<Bytes>.asSlice(&defined), List<usize>.asSlice(&definer), &lookup, Bytes.asSlice(&List<Bytes>.asSlice(&uses)[use]))
+      if target != usize.MAX && target != node { run List<usize>.append(&mut edges, target) }
+      use = use + usize.ONE
+    }
+    node = node + usize.ONE
+  }
+  run List<usize>.append(&mut edgeStarts, List<usize>.length(&edges))
+  // Whether every unit that calls a node keeps its own copy.
+  let mut local = List<bool>.make()
+  node = usize.ZERO
+  while node < nodes {
+    let size = List<usize>.get(&ends, node) - List<usize>.get(&starts, node)
+    let mut copied = false
+    if List<bool>.get(&copyable, node) {
+      copied = size <= localBytes()
+      if !copied {
+        let fragment = Slice.view<u8>(fragments, List<usize>.get(&starts, node), size)
+        copied = run Bitcode.definesInlineHint(fragment)
+      }
+    }
+    run List<bool>.append(&mut local, copied)
+    node = node + usize.ONE
+  }
+  // Each node's callers.
+  let mut callerCounts = run List<usize>.makeWithCapacity(nodes + usize.ONE)
+  node = usize.ZERO
+  while node <= nodes {
+    run List<usize>.append(&mut callerCounts, usize.ZERO)
+    node = node + usize.ONE
+  }
+  let edgeSlice = List<usize>.asSlice(&edges)
+  let mut edge = usize.ZERO
+  while edge < edgeSlice.length {
+    let counted = List<usize>.get(&callerCounts, edgeSlice[edge] + usize.ONE) + usize.ONE
+    List<usize>.set(&mut callerCounts, edgeSlice[edge] + usize.ONE, counted)
+    edge = edge + usize.ONE
+  }
+  node = usize.ZERO
+  while node < nodes {
+    let running = List<usize>.get(&callerCounts, node + usize.ONE) + List<usize>.get(&callerCounts, node)
+    List<usize>.set(&mut callerCounts, node + usize.ONE, running)
+    node = node + usize.ONE
+  }
+  let mut callers = run List<usize>.makeWithCapacity(edgeSlice.length)
+  let mut filled = run List<usize>.makeWithCapacity(nodes)
+  edge = usize.ZERO
+  while edge < edgeSlice.length {
+    run List<usize>.append(&mut callers, usize.ZERO)
+    edge = edge + usize.ONE
+  }
+  node = usize.ZERO
+  while node < nodes {
+    run List<usize>.append(&mut filled, List<usize>.get(&callerCounts, node))
+    node = node + usize.ONE
+  }
+  node = usize.ZERO
+  while node < nodes {
+    edge = List<usize>.get(&edgeStarts, node)
+    while edge < List<usize>.get(&edgeStarts, node + usize.ONE) {
+      let callee = edgeSlice[edge]
+      let slot = List<usize>.get(&filled, callee)
+      List<usize>.set(&mut callers, slot, node)
+      List<usize>.set(&mut filled, callee, slot + usize.ONE)
+      edge = edge + usize.ONE
+    }
+    node = node + usize.ONE
+  }
+  // Group the non-local nodes: a node whose callers, seen through the local copies they call it
+  // from, all belong to one group joins that group, until no node moves.
+  let mut parent = run List<usize>.makeWithCapacity(nodes)
+  node = usize.ZERO
+  while node < nodes {
+    run List<usize>.append(&mut parent, node)
+    node = node + usize.ONE
+  }
+  let mut seen = run List<usize>.makeWithCapacity(nodes)
+  node = usize.ZERO
+  while node < nodes {
+    run List<usize>.append(&mut seen, usize.MAX)
+    node = node + usize.ONE
+  }
+  let mut stack = List<usize>.make()
+  let mut changed = true
+  let mut rounds = usize.ZERO
+  while changed && rounds < 16 {
+    changed = false
+    rounds = rounds + usize.ONE
+    node = usize.ZERO
+    while node < nodes {
+      if !List<bool>.get(&local, node) && List<bool>.get(&copyable, node) && List<usize>.get(&parent, node) == node {
+        // The one group every caller belongs to, or MAX for none or several.
+        let mut group = usize.MAX
+        let mut several = false
+        List<usize>.clear(&mut stack)
+        run List<usize>.append(&mut stack, node)
+        List<usize>.set(&mut seen, node, node + rounds * nodes)
+        while !several && List<usize>.length(&stack) > usize.ZERO {
+          let current = popLast(&mut stack)
+          let mut caller = List<usize>.get(&callerCounts, current)
+          while caller < List<usize>.get(&callerCounts, current + usize.ONE) {
+            let from = List<usize>.get(&callers, caller)
+            if List<usize>.get(&seen, from) != node + rounds * nodes {
+              List<usize>.set(&mut seen, from, node + rounds * nodes)
+              if List<bool>.get(&local, from) {
+                run List<usize>.append(&mut stack, from)
+              } else {
+                let root = rootOf(List<usize>.asSlice(&parent), from)
+                if root != node {
+                  if group == usize.MAX { group = root } else if group != root { several = true }
+                }
+              }
+            }
+            caller = caller + usize.ONE
+          }
+        }
+        if !several && group != usize.MAX {
+          List<usize>.set(&mut parent, node, group)
+          changed = true
+        }
+      }
+      node = node + usize.ONE
+    }
+  }
+  // Each group's size, then the groups placed largest first on the unit with the least so far.
+  let mut groupSize = run List<usize>.makeWithCapacity(nodes)
+  node = usize.ZERO
+  while node < nodes {
+    run List<usize>.append(&mut groupSize, usize.ZERO)
+    node = node + usize.ONE
+  }
+  node = usize.ZERO
+  while node < nodes {
+    if !List<bool>.get(&local, node) {
+      let root = rootOf(List<usize>.asSlice(&parent), node)
+      let grown = List<usize>.get(&groupSize, root) + List<usize>.get(&ends, node) - List<usize>.get(&starts, node)
+      List<usize>.set(&mut groupSize, root, grown)
+    }
+    node = node + usize.ONE
+  }
+  let mut keys = List<u64>.make()
+  node = usize.ZERO
+  while node < nodes {
+    let size = List<usize>.get(&groupSize, node)
+    if size > usize.ZERO { run List<u64>.append(&mut keys, usize.toU64(size) * 16777216 + usize.toU64(node)) }
+    node = node + usize.ONE
+  }
+  run List<u64>.sort(&mut keys)
+  let mut loads = run List<usize>.makeWithCapacity(count)
+  let mut unit = usize.ZERO
+  while unit < count {
+    run List<usize>.append(&mut loads, usize.ZERO)
+    unit = unit + usize.ONE
+  }
+  // The unit of each group root.
+  let mut groupUnit = run List<usize>.makeWithCapacity(nodes)
+  node = usize.ZERO
+  while node < nodes {
+    run List<usize>.append(&mut groupUnit, usize.MAX)
+    node = node + usize.ONE
+  }
+  let ordered = List<u64>.asSlice(&keys)
+  let mut rank = ordered.length
+  while rank > usize.ZERO {
+    rank = rank - usize.ONE
+    let root = u64.toUsize(u64.bitAnd(ordered[rank], 16777215))
+    let mut least = usize.ZERO
+    unit = usize.ONE
+    while unit < count {
+      if List<usize>.get(&loads, unit) < List<usize>.get(&loads, least) { least = unit }
+      unit = unit + usize.ONE
+    }
+    List<usize>.set(&mut groupUnit, root, least)
+    let loaded = List<usize>.get(&loads, least) + List<usize>.get(&groupSize, root)
+    List<usize>.set(&mut loads, least, loaded)
+  }
+  // The unit owning each non-local node.
+  let mut owner = run List<usize>.makeWithCapacity(nodes)
+  node = usize.ZERO
+  while node < nodes {
+    let mut placed = usize.MAX
+    if !List<bool>.get(&local, node) { placed = List<usize>.get(&groupUnit, rootOf(List<usize>.asSlice(&parent), node)) }
+    run List<usize>.append(&mut owner, placed)
+    node = node + usize.ONE
+  }
+  // A node another unit calls is exported. The shared fragments are in every unit.
+  let mut exported = run List<bool>.makeWithCapacity(nodes)
+  node = usize.ZERO
+  while node < nodes {
+    run List<bool>.append(&mut exported, false)
+    node = node + usize.ONE
+  }
+  let sharedSlice = List<Bytes>.asSlice(&sharedUses)
+  let mut use = usize.ZERO
+  while use < sharedSlice.length {
+    let target = definerOf(List<Bytes>.asSlice(&defined), List<usize>.asSlice(&definer), &lookup, Bytes.asSlice(&sharedSlice[use]))
+    if target != usize.MAX && !List<bool>.get(&local, target) { List<bool>.set(&mut exported, target, true) }
+    use = use + usize.ONE
+  }
+  // Each unit's members: its own nodes and the local nodes they reach.
+  let mut member = run List<usize>.makeWithCapacity(nodes)
+  node = usize.ZERO
+  while node < nodes {
+    run List<usize>.append(&mut member, usize.MAX)
+    node = node + usize.ONE
+  }
+  let mut units = List<CodegenUnit>.make()
+  unit = usize.ZERO
+  while unit < count {
+    List<usize>.clear(&mut stack)
+    node = usize.ZERO
+    while node < nodes {
+      if List<usize>.get(&owner, node) == unit {
+        List<usize>.set(&mut member, node, unit)
+        run List<usize>.append(&mut stack, node)
+      }
+      node = node + usize.ONE
+    }
+    while List<usize>.length(&stack) > usize.ZERO {
+      let current = popLast(&mut stack)
+      edge = List<usize>.get(&edgeStarts, current)
+      while edge < List<usize>.get(&edgeStarts, current + usize.ONE) {
+        let callee = edgeSlice[edge]
+        if List<bool>.get(&local, callee) {
+          if List<usize>.get(&member, callee) != unit {
+            List<usize>.set(&mut member, callee, unit)
+            run List<usize>.append(&mut stack, callee)
+          }
+        } else if List<usize>.get(&owner, callee) != unit {
+          List<bool>.set(&mut exported, callee, true)
+        }
+        edge = edge + usize.ONE
+      }
+    }
+    let mut body = Bytes.make()
+    node = usize.ZERO
+    while node < nodes {
+      if List<usize>.get(&member, node) == unit {
+        run Bytes.append(&mut body, Slice.view<u8>(fragments, List<usize>.get(&starts, node), List<usize>.get(&ends, node) - List<usize>.get(&starts, node)))
+      }
+      node = node + usize.ONE
+    }
+    run List<CodegenUnit>.append(&mut units, CodegenUnit {head: Bytes.make(), body: move body, digest: ContentHash {high: 0, low: 0}, stored: false,
+      exports: Option<Bytes>.none()})
+    unit = unit + usize.ONE
+  }
+  // The exports of each unit, now that every unit's calls are known, and each unit's digest.
+  let definedSlice = List<Bytes>.asSlice(&defined)
+  let mut result = List<CodegenUnit>.make()
+  let mut built = List<CodegenUnit>.asMutSlice(&mut units)
+  unit = usize.ZERO
+  while unit < built.length {
+    let mut exports = Bytes.make()
+    let mut name = usize.ZERO
+    while name < definedSlice.length {
+      let owning = List<usize>.get(&definer, name)
+      if List<bool>.get(&contentNames, name) && List<usize>.get(&owner, owning) == unit && List<bool>.get(&exported, owning) {
+        run Bytes.append(&mut exports, Bytes.asSlice(&definedSlice[name]))
+        run Bytes.append(&mut exports, b"\n")
+      }
+      name = name + usize.ONE
+    }
+    if Bytes.length(&built[unit].body) > usize.ZERO {
+      let mut keyed = run Bytes.copy(Bytes.asSlice(&shared))
+      run Bytes.append(&mut keyed, Bytes.asSlice(&built[unit].body))
+      run Bytes.append(&mut keyed, b"\nexports\n")
+      run Bytes.append(&mut keyed, Bytes.asSlice(&exports))
+      let head = run Bytes.copy(Bytes.asSlice(&shared))
+      run List<CodegenUnit>.append(&mut result, CodegenUnit {head: move head, body: Intrinsic.replace(built[unit].body, Bytes.make()),
+        digest: ContentHash.of(Bytes.asSlice(&keyed)), stored: false, exports: Option<Bytes>.some(move exports)})
+    }
+    unit = unit + usize.ONE
+  }
+  return move result
+}
+
+// The node that defines `name`, or MAX when no node does.
+fn definerOf(defined: &[Bytes], definer: &[usize], lookup: &InternIndex, name: &[u8]) -> usize {
+  let mut found = InternIndex.first(lookup, InternIndex.hashBytes(0, name))
+  while found != usize.MAX {
+    if same(Bytes.asSlice(&defined[found]), name) { return definer[found] }
+    found = InternIndex.after(lookup, found)
+  }
+  return usize.MAX
+}
+
+fn popLast(stack: &mut List<usize>) -> usize {
+  return match List<usize>.pop(&mut stack.*) {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => usize.MAX
+  }
+}
+
+fn rootOf(parent: &[usize], node: usize) -> usize {
+  let mut current = node
+  while parent[current] != current { current = parent[current] }
+  return current
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
