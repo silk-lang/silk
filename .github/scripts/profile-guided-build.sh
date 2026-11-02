@@ -6,6 +6,7 @@
 # the code OUTPUT is built from, and OUTPUT is still checked like any other build of SOURCE.
 #
 # usage: profile-guided-build.sh WORKDIR PRODUCER WORKSPACE SOURCE OUTPUT [BUILD_ARGS...]
+# OUTPUT `-` stops after training: the profile is WORKDIR/compiler.profdata.
 # SILK_CLANG names the Clang to build with, and llvm-profdata must sit beside it. WORKSPACE is the
 # source tree holding compiler/ and stdlib/; it is copied, never written. WORKDIR must not exist.
 set -euo pipefail
@@ -45,4 +46,4 @@ LLVM_PROFILE_FILE="$workdir/profiles/emit-%p.profraw" \
   "$workdir/instrumented" build "$source" -o "$workdir/training.ll" --emit llvm-ir "$@"
 "$profdata" merge -o "$workdir/compiler.profdata" "$workdir"/profiles/*.profraw
 
-SILK_CLANG="$workdir/clang-use" "$producer" build "$source" -o "$output" "$@"
+if [ "$output" != - ]; then SILK_CLANG="$workdir/clang-use" "$producer" build "$source" -o "$output" "$@"; fi

@@ -185,6 +185,6 @@ SHA-256 `e316eda9a051fde29e65dd37deb4cd78fee27d421ed5cbea1b8e3b6af8744a19`.
 Local commands and results remain under `.scratch/windows-local-n2.log`,
 `.scratch/windows-local-n2-smoke`, and `.scratch/windows-local-fixpoint.json`.
 
-`run-compiler.ps1 -SelfHost` repeats the native build, generation IR comparison and next-generation
-hello execution in CI. It uses the same checked-out source for both emissions. The source-build
-CLI requires `-o` directly after the source argument; the runner preserves that ordering.
+In CI the release check (`.github/scripts/windows-release.ps1`) has the release compiler emit its
+own IR, which must equal N1's, and rebuild the silk tool byte for byte. The source-build CLI
+requires `-o` directly after the source argument; the runners preserve that ordering.

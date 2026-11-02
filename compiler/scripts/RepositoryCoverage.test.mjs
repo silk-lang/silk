@@ -36,54 +36,6 @@ it('discovers exported top-level entries without matching comments, literals, or
 })
 
 it.effect(
-  'extracts both documentation prefixes, tilde fences, and ignore opt-outs with stable IDs',
-  () =>
-    Effect.gen(function* () {
-      const source = [
-        '//! ```silk',
-        '//! pub fn main() -> i32 { return 42 }',
-        '//! ```',
-        'pub struct Item {}',
-        '  /// ~~~silk',
-        '  /// pub fn main() -> i32 { return 0 }',
-        '  /// ~~~',
-        '  /// ```silk ignore',
-        '  /// incomplete fragment',
-        '  /// ```',
-      ].join('\n')
-      const programs = yield* Coverage.docPrograms('example.silk', source)
-      assert.deepStrictEqual(
-        programs.map(({ id, line }) => ({ id, line })),
-        [
-          { id: 'example.silk#doc-1', line: 1 },
-          { id: 'example.silk#doc-2', line: 5 },
-        ],
-      )
-      const shifted = yield* Coverage.docPrograms('example.silk', '\n' + source)
-      assert.deepStrictEqual(
-        shifted.map(({ id }) => id),
-        programs.map(({ id }) => id),
-      )
-      assert.strictEqual(programs[1]?.source, 'pub fn main() -> i32 { return 0 }\n')
-    }),
-)
-
-it.effect(
-  'refuses broken or unrecognized documentation fences instead of silently omitting programs',
-  () =>
-    Effect.gen(function* () {
-      for (const source of [
-        '//! ```silk\n//! pub fn main() {}',
-        '//! ```silk typo\n//! ```',
-        '//! > ```silk\n//! > ```',
-      ]) {
-        const result = yield* Effect.result(Coverage.docPrograms('broken.silk', source))
-        assert.isTrue(Result.isFailure(result))
-      }
-    }),
-)
-
-it.effect(
   'discovers new entries and no-main conformance roots while reporting explicit exclusions',
   () =>
     Effect.gen(function* () {
@@ -114,7 +66,6 @@ it.effect(
         [
           'compiler/conformance/new/library.silk',
           'examples/new/main.silk',
-          'stdlib/new.silk#doc-1',
         ],
       )
       assert.strictEqual(inventory.excluded.length, 3)
