@@ -55,8 +55,9 @@ const scan = (path) => {
     const renamed = /\bas "([^"]+)"\s*$/.exec(text.slice(match.index, end))
     const symbol = renamed ? renamed[1] : match[2]
     // Windows API names start with a capital letter; the wasm32 runtime's imports with `silk_wasm_`;
-    // only Darwin's variant names, such as `fstat$INODE64`, carry a `$`.
-    if (/^[A-Z]/.test(symbol) || symbol.startsWith('silk_wasm_') || symbol.includes('$') || otherBranches.has(symbol) || defined.has(symbol)) continue
+    // WebAssembly host imports name their module before a `#`; only Darwin's variant names, such as
+    // `fstat$INODE64`, carry a `$`.
+    if (/^[A-Z]/.test(symbol) || symbol.startsWith('silk_wasm_') || symbol.includes('#') || symbol.includes('$') || otherBranches.has(symbol) || defined.has(symbol)) continue
     missing.push(`${name}: ${symbol}`)
   }
 }
