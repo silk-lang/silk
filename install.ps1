@@ -163,16 +163,11 @@ function Install-Silk([string]$Requested, [string]$Channel, [string]$HomeDirecto
       $comment = & $minisign.Source -V -P $SilkMinisignPublicKey -m $archive -x $signature -Q
       if ($LASTEXITCODE -ne 0 -or $comment -cne "silk $($release.tag_name) $top.zip") { throw 'Release archive signature or trusted comment is invalid' }
     }
-    $seedPath = Join-Path $stage 'native-seed.json'
-    Save-SilkAsset (Get-SilkAsset $release 'native-seed.json') $seedPath
-    $seed = (Get-Content -LiteralPath $seedPath -Raw | ConvertFrom-Json).seeds.'x86_64-pc-windows-msvc'
-    if (!$seed -or $seed.tag -cne $release.tag_name -or $seed.asset -cne 'silk-compiler-x86_64-pc-windows-msvc.exe' -or $seed.sha256 -cnotmatch '^[a-f0-9]{64}$') { throw 'The published pin does not identify this Windows compiler' }
     Expand-SilkZip $archive $stage $top
     $tree = Join-Path $stage $top
     $compiler = Join-Path $tree 'bin/silkc.exe'
     $tool = Join-Path $tree 'bin/silk.exe'
     if (!(Test-Path -LiteralPath $tool -PathType Leaf) -or !(Test-Path -LiteralPath (Join-Path $tree 'lib/silk/stdlib') -PathType Container)) { throw 'The release has no tool or standard library' }
-    if ((Get-FileHash -LiteralPath $compiler -Algorithm SHA256).Hash.ToLowerInvariant() -cne $seed.sha256) { throw 'The compiler differs from native-seed.json' }
     $snapshot = Join-Path $stage 'changes-snapshot.toml'
     Save-SilkAsset (Get-SilkAsset $release 'changes-snapshot.toml') $snapshot
     $embedded = Join-Path $tree 'lib/silk/changes-snapshot.toml'

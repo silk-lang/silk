@@ -39,7 +39,7 @@ repeats native command and mapped-image assertions; Windows CI uploads its resul
 Windows release archives use ZIP32, UTF-8 names and raw DEFLATE. The native reader checks central
 and local records, paths, member CRCs, exact decoded lengths, duplicate names and a 1 GiB total
 decoded limit. It refuses links, encrypted members, data descriptors and ZIP64. Signature and
-trusted-comment verification precede decoding; the compiler must match `native-seed.json`.
+trusted-comment verification precede decoding.
 Install and update use `.exe` names. Unix releases retain gzip-compressed ustar.
 
 `WindowsInstall.silk` uses an independently encoded, Ed25519/BLAKE2b-signed test release. Native

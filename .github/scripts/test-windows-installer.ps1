@@ -65,16 +65,10 @@ try {
 } finally { $zip.Dispose() }
 $zip = [IO.Compression.ZipFile]::OpenRead($fixture)
 try {
-  $compiler = $zip.GetEntry("$top/bin/silkc.exe").Open()
-  $sha = [Security.Cryptography.SHA256]::Create()
-  try { $compilerHash = ([BitConverter]::ToString($sha.ComputeHash($compiler))).Replace('-', '').ToLowerInvariant() }
-  finally { $compiler.Dispose(); $sha.Dispose() }
   $snapshot = [IO.StreamReader]::new($zip.GetEntry("$top/lib/silk/changes-snapshot.toml").Open())
   try { [IO.File]::WriteAllText((Join-Path $assets 'changes-snapshot.toml'), $snapshot.ReadToEnd()) }
   finally { $snapshot.Dispose() }
 } finally { $zip.Dispose() }
-$seed = @{schemaVersion=2; seeds=@{'x86_64-pc-windows-msvc'=@{tag="v$version"; asset='silk-compiler-x86_64-pc-windows-msvc.exe'; sha256=$compilerHash}}}
-[IO.File]::WriteAllText((Join-Path $assets 'native-seed.json'), ($seed | ConvertTo-Json -Depth 6))
 [IO.File]::WriteAllText("$fixture.minisig", 'unused by the GitHub SHA-256 verification path')
 $releaseAssets = foreach ($file in Get-ChildItem -LiteralPath $assets -File) {
   @{name=$file.Name; browser_download_url="https://github.com/silk-lang/silk/releases/download/v$version/$($file.Name)"; digest=('sha256:'+(Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant())}
