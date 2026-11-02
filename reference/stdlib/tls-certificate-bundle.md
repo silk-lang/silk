@@ -45,7 +45,7 @@ pub effect fn main() -> i32
       }
       return 0
     }
-    Result<CertificateBundle, DecodeError>.Success { value: _ } => 1
+    Result<CertificateBundle, DecodeError>.Success {..} => 1
   }
 }
 ```

@@ -37,7 +37,7 @@ pub fn main() -> i32 {
   let mut encoded: [u8; 8] = [0; 8]
   let written = match Base64.encodeInto(&mut encoded, b"Hi!?") {
     Result<usize, Base64Error>.Success { value } => value
-    Result<usize, Base64Error>.Failure { error: _ } => {
+    Result<usize, Base64Error>.Failure {..} => {
       return 1
     }
   }
@@ -53,7 +53,7 @@ pub fn main() -> i32 {
       }
       return 0
     }
-    Result<usize, Base64Error>.Failure { error: _ } => 1
+    Result<usize, Base64Error>.Failure {..} => 1
   }
 }
 ```
@@ -74,7 +74,7 @@ pub fn main() -> i32 {
       }
       return 0
     }
-    Result<usize, Base64Error>.Success { value: _ } => 1
+    Result<usize, Base64Error>.Success {..} => 1
   }
 }
 ```

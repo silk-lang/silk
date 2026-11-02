@@ -33,8 +33,8 @@ import silk.toml.scanner { TomlError, TomlScanner, TomlToken }
 pub fn main() -> i32 {
   let mut scanner = TomlScanner.make(b"name = \"Ada\"\nyear = 1815\n")
   match TomlScanner.validate(&mut scanner) {
-    Result<bool, TomlError>.Success { value: _ } => {}
-    Result<bool, TomlError>.Failure { error: _ } => {
+    Result<bool, TomlError>.Success {..} => {}
+    Result<bool, TomlError>.Failure {..} => {
       return 1
     }
   }
@@ -49,7 +49,7 @@ pub fn main() -> i32 {
         TomlToken.Newline => {
           atLineStart = true
         }
-        TomlToken.Text { span: _ } => {
+        TomlToken.Text {..} => {
           if atLineStart {
             keys = keys + 1
           }
@@ -59,7 +59,7 @@ pub fn main() -> i32 {
           atLineStart = false
         }
       }
-      Result<TomlToken, TomlError>.Failure { error: _ } => {
+      Result<TomlToken, TomlError>.Failure {..} => {
         return 1
       }
     }

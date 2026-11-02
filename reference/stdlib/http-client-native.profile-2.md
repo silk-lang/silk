@@ -47,7 +47,7 @@ effect fn check() -> i32
   // A scheme other than http or https fails before any connection.
   let sent = run Effect.result(Http.send(Request.get("ftp://example.com/version")))
   return match move sent {
-    Result.Success { value: _ } => 1
+    Result.Success {..} => 1
     Result.Failure { error } => match move error {
       HttpError failure => {
         if failure.kind == HttpErrorKind.InvalidUrl {

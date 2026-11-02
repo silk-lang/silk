@@ -102,20 +102,20 @@ effect fn program() -> i32
     |> Effect.provideMut<Allocator>(&mut allocator)
   let result = match move parsed {
     Result<ParsedResponse, ParseError>.Success { value } => move value
-    Result<ParsedResponse, ParseError>.Failure { error: _ } => {
+    Result<ParsedResponse, ParseError>.Failure {..} => {
       return 1
     }
   }
   let head = match ResponseParser.head(&result.parser) {
     Result<ResponseHead, ParseError>.Success { value } => value
-    Result<ResponseHead, ParseError>.Failure { error: _ } => {
+    Result<ResponseHead, ParseError>.Failure {..} => {
       return 1
     }
   }
   let get = Method.get()
   let selection = match selectResponse(head, &get, TrailerPolicy.defaultPolicy()) {
     Result<Selection, BodyError>.Success { value } => move value
-    Result<Selection, BodyError>.Failure { error: _ } => {
+    Result<Selection, BodyError>.Failure {..} => {
       return 1
     }
   }
@@ -130,7 +130,7 @@ effect fn program() -> i32
     |> Effect.provideMut<Allocator>(&mut allocator)
   let mut decoder = match move made {
     Result<Decoder, BodyError>.Success { value } => move value
-    Result<Decoder, BodyError>.Failure { error: _ } => {
+    Result<Decoder, BodyError>.Failure {..} => {
       return 1
     }
   }
@@ -140,7 +140,7 @@ effect fn program() -> i32
   let mut payload: [u8; 16] = [0; 16]
   let progress = match Decoder.step(&mut decoder, body, &mut payload, true) {
     Result<Progress, BodyError>.Success { value } => move value
-    Result<Progress, BodyError>.Failure { error: _ } => {
+    Result<Progress, BodyError>.Failure {..} => {
       return 1
     }
   }

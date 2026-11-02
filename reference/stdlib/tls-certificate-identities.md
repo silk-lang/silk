@@ -54,7 +54,7 @@ pub fn main() -> i32 {
         _ => 1
       }
     }
-    Result<SanDecodeSummary, SanDecodeError>.Failure { error: _ } => 1
+    Result<SanDecodeSummary, SanDecodeError>.Failure {..} => 1
   }
 }
 ```

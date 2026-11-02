@@ -50,7 +50,7 @@ pub fn main() -> i32 {
     OriginHost<'static>.Dns { bytes: b"API.example.com" }
   ) {
     Result<ReferenceIdentity, IdentityError>.Success { value } => value
-    Result<ReferenceIdentity, IdentityError>.Failure { error: _ } => {
+    Result<ReferenceIdentity, IdentityError>.Failure {..} => {
       return 1
     }
   }
@@ -67,7 +67,7 @@ pub fn main() -> i32 {
       }
       return 0
     }
-    Result<IdentityMatch, IdentityError>.Failure { error: _ } => 1
+    Result<IdentityMatch, IdentityError>.Failure {..} => 1
   }
 }
 ```

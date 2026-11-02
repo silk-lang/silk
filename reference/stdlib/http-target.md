@@ -36,7 +36,7 @@ pub fn main() -> i32 {
   let get = Method.get()
   let target = match RequestTarget.parse(&get, "/search?q=silk", 8192) {
     Result<RequestTarget, ValueError>.Success { value } => value
-    Result<RequestTarget, ValueError>.Failure { error: _ } => {
+    Result<RequestTarget, ValueError>.Failure {..} => {
       return 1
     }
   }
@@ -48,7 +48,7 @@ pub fn main() -> i32 {
   let connect = Method.connect()
   let tunnel = match RequestTarget.parse(&connect, "example.com:443", 8192) {
     Result<RequestTarget, ValueError>.Success { value } => value
-    Result<RequestTarget, ValueError>.Failure { error: _ } => {
+    Result<RequestTarget, ValueError>.Failure {..} => {
       return 1
     }
   }
@@ -64,7 +64,7 @@ pub fn main() -> i32 {
 
   // Only OPTIONS can use "*".
   let mismatch = match RequestTarget.parse(&get, "*", 8192) {
-    Result<RequestTarget, ValueError>.Success { value: _ } => false
+    Result<RequestTarget, ValueError>.Success {..} => false
     Result<RequestTarget, ValueError>.Failure { error } => match error.reason {
       ValueReason.MethodTargetMismatch => true
       _ => false
