@@ -274,7 +274,8 @@ admit a mapping that the equivalent ordinary interface would reject.
 
 **Boundary:** No feature may branch on `service` merely to give its operations different variance,
 failure or requirement subsumption, receiver adaptation, generic inference, dispatch behavior, or
-implementation syntax. A feature needing one of those behaviors must define it for interfaces in
+implementation syntax. The one exception is the `self` receiver of SERV-012, which only spells the
+operation's own requirement entry and leaves the operation contract unchanged. A feature needing one of those behaviors must define it for interfaces in
 general or justify a dependency-boundary operation that leaves the interface contract unchanged.
 
 This rule does not permit an ordinary interface in a requirement row. Dependency eligibility is the
@@ -738,3 +739,53 @@ that conforms to no required key does. Diagnostics and types name the service, `
 `standardOptionIsARequirementKey` and `partialSourcePremisesAndNeverProvidersDecideProvision`
 semantic conformance cases, `optional-service-provision` and `optional-service-plain-provider`
 corpus programs.
+
+## SERV-012 — A service operation's `self` receiver is its own requirement
+
+**Status:** Confirmed
+
+A service operation reaches its provider through the Effect environment. It declares the access it
+needs with a leading `self` receiver, written as the implementation writes it:
+
+```silk
+service Random {
+  effect fn next(self: &Self) -> u32
+}
+
+struct Always42 {}
+
+impl Random for Always42 {
+  effect fn next(self: &Self) -> u32 {
+    return 42
+  }
+}
+
+effect fn roll() -> u32 ? &Random {
+  return run Random.next()
+}
+```
+
+`self: &Self` is exactly the requirement entry `&Random`, and `self: &mut Self` is `&mut Random`,
+in the default role. The receiver is not an operand: `Random.next()` takes no argument, and its
+caller must provide the entry like any other requirement. The two spellings are interchangeable,
+so `effect fn next() -> u32 ? &Random` declares the same operation. An operation may write further
+requirements after `?`; writing its own service there again with a different access is the
+`SEM0233` conflict of any row.
+
+An implementation receives the provider first, as `self: &Self` or `self: &mut Self`, and need not
+repeat the service in its row.
+
+**Boundary:** The receiver form applies to a non-generic service, with no lifetime or role on the
+reference. A default body has no `self` binding; it reaches the provider by calling the service's
+operations. In an `interface`, `self: &Self` remains an ordinary operand.
+
+**Diagnostics:** A qualified call of a service operation that names neither a receiver nor its own
+service reports `SEM0253`, since no provider can be selected; a receiver written in a form that
+cannot be reached yet reports the same code with its second template. An implementation that
+leaves out the receiver reports `SEM0083` and names the `self` parameter to add.
+
+**Current compiler:** Aligned. Lowering turns the receiver into the requirement entry, so checking,
+witness matching and dispatch see one form.
+
+**Evidence:** `service-operation-receivers` corpus program, `service-call-without-receiver` and
+`service-impl-missing-receiver` invalid corpus programs.
