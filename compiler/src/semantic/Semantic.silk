@@ -253,6 +253,7 @@ import semantic.Rejection {
   RejectionCode,
   RelatedSite,
   WitnessProblem,
+  warns as rejectionWarns,
 }
 import semantic.ScalarEnum
 import semantic.ScalarEnum {
@@ -2888,6 +2889,8 @@ pub struct Semantic {
   query: Query<Answer, NoRejection>,
   deferredTemplates: List<DeferredStaticTemplate>,
   uncheckedRoot: List<UncheckedBody>,
+  // The warnings the last build's declaration check found; they do not refuse the build.
+  buildWarnings: List<Shared<Rejection>>,
   // The last completed sweep of each module and the last escape checks in a revisable store, by
   // their `ModuleCheck` units.
   moduleMemos: List<ModuleCheckMemo>,
@@ -33914,6 +33917,185 @@ effect fn serviceOperationTarget(
     explicit: move written.arguments, explicitSlots: move written.slots, prefixOwner: move written.owner, prefixLifetimes: written.lifetimes, scopeArguments: move scopeArguments,
     inferOwner: inferOwner, explicitSyntax: syntax.generics.present,
   }})
+}
+
+// Warns (SEM0254) at each `&mut S` entry of a function's written row whose body runs Effects that
+// need `S` only with shared access. A body whose runs leave a row parameter or subtraction open
+// may need more than it shows, so it is not judged; an entry no run needs at all is left alone.
+// A contract operation's default body is not judged: its row is the operation's, not its own.
+effect fn unneededMutableRequirements(resolver: &mut Resolver, module: &ModuleId, declaration: &DeclarationCheck,
+  signature: &Shared<Result<Answer, NoRejection>>, body: &Shared<Result<Answer, NoRejection>>, into: &mut List<Shared<Rejection>>)
+-> () ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let owners = DeclarationId.ownerCount(&declaration.identity)
+  if owners > usize.ONE {
+    let parent = DeclarationId.ownerKind(&declaration.identity, owners - 2)
+    if parent == OwnerKind.Service || parent == OwnerKind.Interface { return () }
+  }
+  let declared = run signatureRequirements(signature)
+  let written = run Row.entryList(&declared)
+  let entries = List<Requirement>.asSlice(&written)
+  let mut mutable = false
+  let mut at = usize.ZERO
+  while at < entries.length {
+    if entries[at].access == Access.Mutable { mutable = true }
+    at = at + usize.ONE
+  }
+  if !mutable { return () }
+  let typed = match move Shared<Result<Answer, NoRejection>>.with<Option<Shared<TypedBody>>>(body, answerTypedBody) {
+    Option<Shared<TypedBody>>.Some {value} => move value
+    Option<Shared<TypedBody>>.None => { return () }
+  }
+  // The requirement rows of every `run` in the body.
+  let count = Shared<TypedBody>.with<usize>(&typed, fn(value: &TypedBody) -> usize { return TypedBody.nodeSlice(value).length })
+  let mut used = List<Requirement>.make()
+  let mut node = usize.ZERO
+  while node < count {
+    let row = Shared<TypedBody>.with<Option<Shared<Row>>>(&typed, fn(value: &TypedBody) -> Option<Shared<Row>> {
+      return runRequirements(TypedBody.nodeSlice(value), node)
+    })
+    if let Option<Shared<Row>>.Some {value: needed} = move row {
+      if Shared<Row>.with<bool>(&needed, rowIsOpen) { return () }
+      let listed = run Row.entryList(&needed)
+      let needs = List<Requirement>.asSlice(&listed)
+      let mut each = usize.ZERO
+      while each < needs.length {
+        run List<Requirement>.append(&mut used, Requirement.copy(&needs[each]))
+        each = each + usize.ONE
+      }
+    }
+    node = node + usize.ONE
+  }
+  let needs = List<Requirement>.asSlice(&used)
+  at = usize.ZERO
+  while at < entries.length {
+    if entries[at].access == Access.Mutable {
+      let mut shared = false
+      let mut exclusive = false
+      let mut each = usize.ZERO
+      while each < needs.length {
+        if run sameRequirementKey(&entries[at], &needs[each]) {
+          shared = true
+          if needs[each].access == Access.Mutable { exclusive = true }
+        }
+        each = each + usize.ONE
+      }
+      if shared && !exclusive {
+        run List<Shared<Rejection>>.append(&mut into.*, run unneededMutableWarning(&mut resolver.*, module, declaration, &entries[at]))
+      }
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+fn rejectionCodeOf(value: &Rejection) -> RejectionCode { return value.code }
+
+// The requirement row of the Effect the `run` at `node` runs, when `node` is a `run`.
+fn runRequirements(nodes: &[BodyNode], node: usize) -> Option<Shared<Row>> {
+  if let BodyNodeKind.Expression {form: BodyExpression.Run {value, ..}, ..} = &nodes[node].kind {
+    if value.index < nodes.length {
+      if let BodyNodeKind.Expression {ty, ..} = &nodes[value.index].kind {
+        return match move Shared<Type>.with<Option<EffectChannels>>(&ty, effectChannels) {
+          Option<EffectChannels>.Some {value: channels} => Option<Shared<Row>>.some(Shared<Row>.clone(&channels.requirements))
+          Option<EffectChannels>.None => Option<Shared<Row>>.none()
+        }
+      }
+    }
+  }
+  return Option<Shared<Row>>.none()
+}
+
+// Whether two requirements name one service-role key, whatever their access.
+effect fn sameRequirementKey(left: &Requirement, right: &Requirement) -> bool ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  if !run Type.equalsShared(&left.capability, &right.capability) { return false }
+  return match &left.roleType {
+    Option<Shared<Type>>.Some {value: leftRole} => match &right.roleType {
+      Option<Shared<Type>>.Some {value: rightRole} => run Type.equalsShared(&leftRole, &rightRole)
+      Option<Shared<Type>>.None => false
+    }
+    Option<Shared<Type>>.None => match &right.roleType {
+      Option<Shared<Type>>.Some {..} => false
+      Option<Shared<Type>>.None => true
+    }
+  }
+}
+
+// SEM0254 for the written `&mut` entry `entry`, at the row member that spells it when one does.
+effect fn unneededMutableWarning(resolver: &mut Resolver, module: &ModuleId, declaration: &DeclarationCheck, entry: &Requirement)
+-> Shared<Rejection> ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut named = Bytes.make()
+  if let Option<Bytes>.Some {value: text} = move run TypeText.displayElided(&entry.capability, module) {
+    named = run unqualified(move text)
+  }
+  let mut span = declaration.span
+  if let Option<Span>.Some {value} = move run mutableEntrySpan(&mut resolver.*, module, declaration.ordinal, Bytes.asSlice(&named)) {
+    span = value
+  }
+  let mut diagnostic = run makeRejection(RejectionCode.UnneededMutableRequirement, module, span)
+  run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"service"), value: move named})
+  return run Shared<Rejection>.make(move diagnostic)
+}
+
+// The span of the written `&mut` row member of declaration `ordinal` whose capability is spelled
+// `service`, compared by its last path segment and without type arguments.
+effect fn mutableEntrySpan(resolver: &mut Resolver, module: &ModuleId, ordinal: usize, spelled: &[u8]) -> Option<Span>
+! Cycle | OutOfMemoryError ? &mut Allocator {
+  let written = match move run signatureSyntax(&mut resolver.*, module, ordinal) {
+    Option<WrittenSignature>.Some {value} => move value
+    Option<WrittenSignature>.None => { return Option<Span>.none() }
+  }
+  if !written.requirements.present { return Option<Span>.none() }
+  let wanted = baseName(spelled)
+  let row = match move run typeNode(&mut resolver.*, module, written.requirements.id) {
+    Option<HeaderSyntax>.Some {value} => move value
+    Option<HeaderSyntax>.None => { return Option<Span>.none() }
+  }
+  if let Node.RequirementRow {members} = row.header {
+    let mut at = usize.ZERO
+    while at < members.length {
+      if let Option<HirId>.Some {value: memberId} = move run typeChild(&mut resolver.*, module, members, at) {
+        if let Option<HeaderSyntax>.Some {value: member} = move run typeNode(&mut resolver.*, module, memberId) {
+          if let Node.Requirement {access, capability, ..} = member.header {
+            if access == Access.Mutable {
+              if let Option<Bytes>.Some {value: name} = move run capabilityName(&mut resolver.*, module, capability) {
+                if same(Bytes.asSlice(&name), wanted) { return Option<Span>.some(member.span) }
+              }
+            }
+          }
+        }
+      }
+      at = at + usize.ONE
+    }
+  }
+  return Option<Span>.none()
+}
+
+// The last path segment naming a written capability, through one type application.
+effect fn capabilityName(resolver: &mut Resolver, module: &ModuleId, capability: HirId) -> Option<Bytes>
+! Cycle | OutOfMemoryError ? &mut Allocator {
+  let mut target = capability
+  if let Option<HeaderSyntax>.Some {value} = move run typeNode(&mut resolver.*, module, capability) {
+    if let Node.AppliedType {target: applied, ..} = value.header { target = applied }
+  }
+  if let Option<HeaderSyntax>.Some {value} = move run typeNode(&mut resolver.*, module, target) {
+    if let Node.NamedType {path: written, ..} = value.header {
+      let parsed = run path(&mut resolver.*, module, written)
+      let segments = List<Bytes>.asSlice(&parsed.segments)
+      if parsed.valid && segments.length > usize.ZERO {
+        return Option<Bytes>.some(run Bytes.copy(Bytes.asSlice(&segments[segments.length - usize.ONE])))
+      }
+    }
+  }
+  return Option<Bytes>.none()
+}
+
+// `text` up to its first `<`, after its last `.`: `Sink` for `io.Sink<i32>`.
+fn baseName(text: &[u8]) -> &[u8] {
+  let mut end = usize.ZERO
+  while end < text.length && text[end] != 60 { end = end + usize.ONE }
+  let mut start = end
+  while start > usize.ZERO && text[start - usize.ONE] != 46 && text[start - usize.ONE] != 47 { start = start - usize.ONE }
+  return Slice.view<u8>(text, start, end - start)
 }
 
 // A qualified service operation call that cannot obtain its provider (SEM0253), for an operation
@@ -89809,6 +89991,7 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
     query: Query<Answer, NoRejection>.make(),
     deferredTemplates: List<DeferredStaticTemplate>.make(),
     uncheckedRoot: List<UncheckedBody>.make(),
+    buildWarnings: List<Shared<Rejection>>.make(),
     moduleMemos: List<ModuleCheckMemo>.make(),
     escapeMemos: List<EscapeMemo>.make(),
     declarationMemos: List<DeclarationMemo>.make(),
@@ -92202,6 +92385,7 @@ impl Semantic {
             &signature
           )
           run appendCheckedAnswer(&mut sweep.rejections, &mut sweep.gaps, &mut self.query, &declaration.identity, &body)
+          run unneededMutableRequirements(&mut self.resolver, module, declaration, &signature, &body, &mut sweep.rejections)
           // Only a concrete body's sweep status is the status of the instance a build reaches.
           // An open template is checked abstractly and a deferred one not at all here, while
           // the instances a build reaches are checked in their own right. An open template no
@@ -92505,6 +92689,12 @@ impl Semantic {
   /// instances, so an unreached unchecked body is visible here alone.
   pub fn uncheckedRootBodies(self: &Self) -> &[UncheckedBody] {
     return List<UncheckedBody>.asSlice(&self.uncheckedRoot)
+  }
+
+  /// The warnings the last build's declaration check found, in check order. A build refused for
+  /// an error reports that error instead.
+  pub fn checkedBuildWarnings(self: &Self) -> &[Shared<Rejection>] {
+    return List<Shared<Rejection>>.asSlice(&self.buildWarnings)
   }
 
   // Checks OWN0016 using a MIR-only closure. No declaration added here becomes an emission root.
@@ -94621,6 +94811,22 @@ impl Semantic {
     }
     run Progress.begin(&mut self.resolver.progress, ProgressPhase.Check, checked.length)
     let mut checked = run Semantic.checkDeclarations(&mut self.*, &mut request.*, checked, &exempt)
+    // Warnings leave the build going; they are reported beside its output.
+    let mut refusals = List<Shared<Rejection>>.make()
+    let mut warnings = List<Shared<Rejection>>.make()
+    let listed = List<Shared<Rejection>>.asSlice(&checked.rejections)
+    let mut listedAt = usize.ZERO
+    while listedAt < listed.length {
+      let code = Shared<Rejection>.with<RejectionCode>(&listed[listedAt], rejectionCodeOf)
+      if rejectionWarns(code) {
+        run List<Shared<Rejection>>.append(&mut warnings, Shared<Rejection>.clone(&listed[listedAt]))
+      } else {
+        run List<Shared<Rejection>>.append(&mut refusals, Shared<Rejection>.clone(&listed[listedAt]))
+      }
+      listedAt = listedAt + usize.ONE
+    }
+    checked.rejections = move refusals
+    self.buildWarnings = move warnings
     // A syntax error, even one the parser recovered from, rejects the build before any emission.
     let mut syntax = run Semantic.syntaxRejections(&self.*)
     if List<Shared<Rejection>>.length(&syntax) > usize.ZERO {
