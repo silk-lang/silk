@@ -414,7 +414,12 @@ const program = Effect.gen(function* () {
   const unknown = yield* diagnosticsFor(session, uri, 8, [])
   assert.deepEqual(
     unknown.diagnostics.map(({ range, code }) => ({ line: range.start.line, code })),
-    [{ line: 13, code: 'SEM0006' }],
+    // The unused locals are warnings published beside the error.
+    [
+      { line: 13, code: 'SEM0006' },
+      { line: 12, code: 'SEM0252' },
+      { line: 13, code: 'SEM0252' },
+    ],
     JSON.stringify(unknown),
   )
   const afterError = { textDocument: { uri }, position: { line: 14, character: 12 } }
