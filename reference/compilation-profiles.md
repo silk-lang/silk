@@ -372,6 +372,9 @@ A step runs in an operating-system sandbox. On Linux 6.7 or newer it runs under 
 and runs only files below `/usr`, `/bin`, `/lib`, `/lib64`, `/etc`, `/dev` and `/proc`, its program
 and its declared inputs, writes only its output directory, and can neither bind nor connect a TCP
 socket; where the kernel allows an unprivileged user namespace, it also has no network interface
-but loopback. Any other host has no sandbox, and refuses tool steps unless the root manifest sets
+but loopback. On macOS it runs through `sandbox-exec` with a profile that denies everything but
+running programs, reading the system directories, its program and its inputs, and reading and
+writing its output directory, so it has no network at all. Any other host has no sandbox, and
+refuses tool steps unless the root manifest sets
 `[build].unsandboxed-tools = true`; each build that then runs a step prints a warning naming it.
 `SILK_NO_TOOL_SANDBOX` set makes a host behave as one without a sandbox.
