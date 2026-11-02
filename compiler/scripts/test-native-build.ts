@@ -1175,7 +1175,8 @@ const program = Effect.gen(function* () {
     casing.stderr,
     /^src\/main\.silk:1:8: error\[MOD0001\] Unknown module util\.math\n  note: did you mean `util\.Math`\? Module paths match file names exactly, including letter case$/m,
   )
-  // Unused bindings are warnings: `check` and `build` report them and still succeed.
+  // Unused bindings are warnings: `check` and `build` report them and still succeed. Each command
+  // runs twice, so the second, warm run reports the warnings of a module it does not parse again.
   yield* fs.makeDirectory(join(directory, 'unused/src'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'unused/silk.toml'),
@@ -1183,14 +1184,19 @@ const program = Effect.gen(function* () {
   )
   yield* fs.writeFileString(
     join(directory, 'unused/src/main.silk'),
-    'import silk.num.usize\n\npub fn main() -> i32 {\n  let idle = 1\n  let _kept = 2\n  return 0\n}\n',
+    'import helper { value }\n\npub fn main() -> i32 {\n  let idle = 1\n  let _kept = 2\n  return value()\n}\n',
   )
-  for (const command of ['check', 'build']) {
+  yield* fs.writeFileString(
+    join(directory, 'unused/src/helper.silk'),
+    'import silk.num.usize\n\npub fn value() -> i32 {\n  let spare = 1\n  return 0\n}\n',
+  )
+  for (const command of ['check', 'check', 'build', 'build']) {
     const unused = yield* invoke(silk, [command, '--stdlib', standardLibrary, ...(command === 'build' ? ['--clang', clang] : [])],
       join(directory, 'unused'))
     assert.equal(unused.status, 0, unused.stderr)
     assert.match(unused.stderr, /^src\/main\.silk:4:7: warning\[SEM0255\] `idle` is never used/m)
-    assert.match(unused.stderr, /^src\/main\.silk:1:17: warning\[MOD0007\] Import `usize` is never used/m)
+    assert.match(unused.stderr, /^src\/helper\.silk:4:7: warning\[SEM0255\] `spare` is never used/m)
+    assert.match(unused.stderr, /^src\/helper\.silk:1:17: warning\[MOD0007\] Import `usize` is never used/m)
     assert.doesNotMatch(unused.stderr, /_kept/)
   }
   // A package that cannot be loaded ends its load row as failed and still names itself on its

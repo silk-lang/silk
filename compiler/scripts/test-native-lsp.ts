@@ -417,8 +417,8 @@ const program = Effect.gen(function* () {
     // The unused locals are warnings published beside the error.
     [
       { line: 13, code: 'SEM0006' },
-      { line: 12, code: 'SEM0252' },
-      { line: 13, code: 'SEM0252' },
+      { line: 12, code: 'SEM0255' },
+      { line: 13, code: 'SEM0255' },
     ],
     JSON.stringify(unknown),
   )
