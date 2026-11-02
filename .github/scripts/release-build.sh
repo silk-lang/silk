@@ -2,8 +2,7 @@
 # Builds one target's release binaries from an exact source snapshot: the compiler as `silkc` and
 # the silk tool as `silk` (`.exe` on Windows), and the compiler's LLVM IR as `compiler.ll`, all
 # with the release profile. The Linux release job runs it with N1 for every target; each target's
-# own runner then runs it again with the compiler it produced, and the binaries must be the same
-# bytes. Everything that reaches the bytes is fixed here: the flags, the output names (a link
+# runner then checks the result with release-check.sh. Everything that reaches the bytes is fixed here: the flags, the output names (a link
 # records them), the profile and the platform supply (`SDKROOT` is ignored, so a Mac links against
 # Silk's libSystem stub as Linux does).
 #

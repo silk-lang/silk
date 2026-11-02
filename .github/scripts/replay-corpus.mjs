@@ -1,5 +1,7 @@
 #!/usr/bin/env node
-// Runs `silk check --replay --differential` on every native and invalid corpus program.
+// Runs `silk check --replay --differential` on every invalid corpus program and every native one
+// with imports: the programs whose diagnostics or module graph a replay can get wrong. A
+// single-module program that checks clean has nothing a trivia edit can invalidate differently.
 //
 // Usage: node replay-corpus.mjs <silk> <corpus> <work> <stdlib>
 //
@@ -23,7 +25,9 @@ mkdirSync(work, { recursive: true });
 const programs = [];
 for (const kind of ['native', 'invalid']) {
   for (const name of readdirSync(join(corpus, kind)).sort()) {
-    if (statSync(join(corpus, kind, name)).isDirectory()) programs.push({ kind, name });
+    if (!statSync(join(corpus, kind, name)).isDirectory()) continue;
+    if (kind === 'native' && !existsSync(join(corpus, kind, name, 'imports'))) continue;
+    programs.push({ kind, name });
   }
 }
 
@@ -79,3 +83,8 @@ await Promise.all(Array.from({ length: availableParallelism() }, worker));
 console.log(`\n${JSON.stringify(counts)}`);
 for (const program of failed) console.error(`\n${program.kind}/${program.name}:\n${program.output}`);
 if (failed.length > 0) process.exit(1);
+// A replay that broke for every program would otherwise count them all as refused.
+if ((counts.ok ?? 0) < programs.length / 2) {
+  console.error(`only ${counts.ok ?? 0} of ${programs.length} programs replayed`);
+  process.exit(1);
+}

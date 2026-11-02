@@ -62,12 +62,9 @@ fixture still needs real security-cookie support and is not a passing arithmetic
 
 ## Validation
 
-Dispatch `selfhost.yml` with `release=none` and `windows-native=true`, or dispatch `windows.yml`
-with an existing dispatched Selfhost run as `source-run`. The reusable Windows lane consumes
-the verified N1 artifact, cross-builds these programs through the production driver, and retains
-their emitted LLVM IR, object helper inventory, PE import inspection, and per-program results.
-It uploads generated `doc-reference` pages separately. Main pushes and PR pushes labelled
-`windows` select this lane automatically; Linux/macOS gates do not depend on it.
+Every Selfhost run cross-builds these programs with N1 on Linux in `release-cross.yml` and runs
+them on `windows-2025` in its `verify-windows` job, which gates the merge like every other target.
+On failure it uploads the per-program results.
 
 Download `windows-no-crt-programs` to Windows, then run:
 

@@ -55,70 +55,6 @@ export const hasMain = (source: string) => {
   return false
 }
 
-/** Flat, source-owned /// and //! fences; unsupported markup fails discovery rather than vanishing. */
-export const docPrograms = Effect.fn('RepositoryCoverage.docPrograms')(function* (
-  path: string,
-  source: string,
-): Effect.fn.Return<Array<Program>, CoverageError> {
-  const programs: Array<Program> = []
-  let fence:
-    | {
-        marker: string
-        length: number
-        prefix: string
-        line: number
-        active: boolean
-        body: Array<string>
-      }
-    | undefined
-  for (const [index, line] of source.split(/\r?\n/).entries()) {
-    const comment = /^\s*(\/\/[/!])(?: ?)(.*)$/.exec(line)
-    if (comment === null) {
-      if (fence !== undefined)
-        return yield* invalid(`Unclosed documentation fence: ${path}:${fence.line}`)
-      continue
-    }
-    const text = comment[2] ?? ''
-    if (fence !== undefined) {
-      if (comment[1] !== fence.prefix)
-        return yield* invalid(`Mixed documentation comment prefixes: ${path}:${index + 1}`)
-      if (new RegExp(`^ {0,3}${fence.marker}{${fence.length},}\\s*$`).test(text)) {
-        if (fence.active)
-          programs.push({
-            id: `${path}#doc-${programs.length + 1}`,
-            path,
-            line: fence.line,
-            source: fence.body.join('\n') + '\n',
-          })
-        fence = undefined
-      } else fence.body.push(text)
-      continue
-    }
-    const opening = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(text)
-    if (opening !== null) {
-      const marker = opening[1] ?? ''
-      const info = (opening[2] ?? '').trim().split(/\s+/)
-      if (info[0] === 'silk' && info.slice(1).some((attribute) => attribute !== 'ignore'))
-        return yield* invalid(`Unknown documentation fence attribute: ${path}:${index + 1}`)
-      fence = {
-        marker: marker[0] ?? '`',
-        length: marker.length,
-        prefix: comment[1] ?? '//!',
-        line: index + 1,
-        active: info[0] === 'silk' && !info.includes('ignore'),
-        body: [],
-      }
-    } else if (/(?:`{3,}|~{3,})silk\b/.test(text)) {
-      return yield* invalid(
-        `Nested documentation fence needs a discovery rule: ${path}:${index + 1}`,
-      )
-    }
-  }
-  if (fence !== undefined)
-    return yield* invalid(`Unclosed documentation fence: ${path}:${fence.line}`)
-  return programs
-})
-
 export const exclusion = (path: string) => {
   if (path.startsWith('compiler/src/'))
     return 'Compiler implementation and source cases; covered by self-build and native-cases.'
@@ -165,10 +101,9 @@ export const discover = Effect.fn('RepositoryCoverage.discover')(function* (
     const reason = exclusion(path)
     if (reason !== undefined) excluded.push({ path, reason })
     else if (path.startsWith('stdlib/')) {
-      programs.push(...(yield* docPrograms(path, source)))
       excluded.push({
         path,
-        reason: 'Library module; active documentation examples are discovered separately.',
+        reason: 'Library module; doctest builds and runs its documentation examples.',
       })
     } else if (corpus.has(hash(source)))
       excluded.push({
