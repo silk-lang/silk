@@ -22,6 +22,7 @@ static if (Intrinsic.targetOperatingSystem() == "darwin" && (Intrinsic.targetArc
   import silk.mem.pointer {Pointer}
   import silk.collections.bytes {Bytes}
   import silk.collections.list {List}
+  import silk.collections.slice {Slice}
   import silk.mem.allocator {Allocator, OutOfMemoryError}
   import silk.system.child_process {
     ChildProcess,
@@ -394,14 +395,107 @@ static if (Intrinsic.targetOperatingSystem() == "darwin" && (Intrinsic.targetArc
     ) -> i32
     @foreign(noCapture: ("value",))
     unsafe extern "C" fn posix_spawn_file_actions_addclose(value: *mut ActionsHandle, fd: i32) -> i32
-    // glibc 2.34 and later; it closes every descriptor from `low` up in the child.
-    @foreign(noCapture: ("value",))
-    unsafe extern "C" fn posix_spawn_file_actions_addclosefrom_np(value: *mut ActionsHandle, low: i32) -> i32
-    @foreign(noCapture: ("value", "path"))
-    unsafe extern "C" fn posix_spawn_file_actions_addchdir_np(
-      value: *mut ActionsHandle,
-      path: ?[*]const u8,
-    ) -> i32
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      @foreign(noCapture: ("value", "path"))
+      unsafe extern "C" fn posix_spawn_file_actions_addchdir_np(
+        value: *mut ActionsHandle,
+        path: ?[*]const u8,
+      ) -> i32
+    } else {
+      // GNU libc adds `posix_spawn_file_actions_addchdir_np` in 2.29 and
+      // `posix_spawn_file_actions_addclosefrom_np` in 2.34, after Silk's glibc 2.28 baseline. A
+      // child with a working directory starts with `fork` instead (`launchForked`), and one
+      // started by `posix_spawn` inherits only the close-on-exec descriptors Silk opens and any
+      // descriptor the parent itself inherited open.
+      unsafe extern "C" fn fork() -> i32
+      unsafe extern "C" fn dup2(from: i32, to: i32) -> i32
+      @foreign(noCapture: ("path",))
+      unsafe extern "C" fn chdir(path: ?[*]const u8) -> i32
+      // Declared as the compiler's tool sandbox declares it: one C symbol has one signature.
+      unsafe extern "C" fn execve(
+        path: ?[*]const u8,
+        arguments: ?[*]const ?[*]const u8,
+        environment: ?[*]const ?[*]const u8,
+      ) -> i32
+      unsafe extern "C" fn syscall(number: i64, ...) -> i64
+      unsafe extern "C" fn _exit(status: i32) -> ()
+      // `close_range(first, ~0U, CLOSE_RANGE_CLOEXEC)` has the same number on x86-64 and AArch64.
+      const CLOSE_RANGE: i64 = 436
+      const CLOSE_RANGE_CLOEXEC: i64 = 4
+      const FIRST_INHERITED: i64 = 3
+      const LAST_DESCRIPTOR: i64 = 4294967295
+      // The child of `launchForked`: it never returns. It moves the standard descriptors into
+      // place, marks every other descriptor close-on-exec, changes directory and runs the program.
+      // On a failure it writes `errno` to `report` and exits with status 127. Between `fork` and
+      // `execve` a child of a multi-threaded parent may only make async-signal-safe calls, so this
+      // allocates nothing.
+      unsafe fn startForked(
+        input: i32,
+        output: i32,
+        errors: i32,
+        report: i32,
+        program: ?[*]const u8,
+        arguments: ?[*]const ?[*]const u8,
+        environment: ?[*]const ?[*]const u8,
+        directory: ?[*]const u8,
+      ) -> () {
+        let mut failed = unsafe dup2(input, 0) < 0 || unsafe dup2(output, 1) < 0 || unsafe dup2(errors, 2) < 0
+        if !failed {
+          // Kernels before 5.11 refuse the flag; their children inherit only close-on-exec
+          // descriptors from Silk code.
+          let marked = unsafe syscall(CLOSE_RANGE, FIRST_INHERITED, LAST_DESCRIPTOR, CLOSE_RANGE_CLOEXEC)
+          failed = unsafe chdir(directory) != 0
+        }
+        if !failed {
+          let ignored = unsafe execve(program, arguments, environment)
+        }
+        let code: [i32; 1] = [unsafe currentError()]
+        let written = unsafe write(report, unsafe Intrinsic.pointerReinterpret<?[*]const i32, ?[*]const u8>(Pointer.fromSlice<i32>(&code)), 4)
+        unsafe _exit(127)
+      }
+      // Starts a child with `fork`, for a working directory, which `posix_spawn` cannot change
+      // before glibc 2.29. A start failure in the child arrives through a pipe.
+      effect fn launchForked(
+        input: &Descriptor,
+        output: &Descriptor,
+        errors: &Descriptor,
+        program: ?[*]const u8,
+        arguments: ?[*]const ?[*]const u8,
+        environment: ?[*]const ?[*]const u8,
+        directory: ?[*]const u8,
+      ) -> Child ! ProcessError {
+        let report = run makePipe()
+        let mut reader = move report.input
+        let writer = move report.output
+        let pid = unsafe fork()
+        if pid < 0 {
+          return run reject(ChildProcess.spawnOperation(), unsafe currentError())
+        }
+        if pid == 0 {
+          unsafe startForked(input.fd, output.fd, errors.fd, writer.fd, program, arguments, environment, directory)
+        }
+        let mut child = Child {pid: pid}
+        run closeOwned(move writer, ChildProcess.spawnOperation())
+        let mut code: [u8; 4] = [0, 0, 0, 0]
+        let mut received: usize = 0
+        while received < 4 {
+          let remaining = Slice.viewMut<u8>(&mut code, received, 4 - received)
+          let count = unsafe read(reader.fd, Pointer.fromMutSlice<u8>(move remaining), 4 - received)
+          if count == 0 { break }
+          if count < 0 {
+            let error = unsafe currentError()
+            if error != 4 { return run reject(ChildProcess.spawnOperation(), error) }
+          } else {
+            received = received + isize.toUsize(count)
+          }
+        }
+        if received == 0 { return move child }
+        let status = run reap(&mut child)
+        // `errno` values are small and positive, so its little-endian bytes add up without overflow.
+        let failure = u8.toI32(code[0]) + u8.toI32(code[1]) * 256 + u8.toI32(code[2]) * 65536 + u8.toI32(code[3]) * 16777216
+        return run reject(ChildProcess.spawnOperation(), failure)
+      }
+    }
     @foreign(noCapture: ("value",))
     unsafe extern "C" fn posix_spawnattr_init(value: *mut AttributesHandle) -> i32
     @foreign(noCapture: ("value",))
@@ -452,8 +546,8 @@ static if (Intrinsic.targetOperatingSystem() == "darwin" && (Intrinsic.targetArc
         return run reject(ChildProcess.spawnOperation(), code)
       }
       let mut result = Attributes {handle: move value}
-      // `POSIX_SPAWN_CLOEXEC_DEFAULT` keeps every other descriptor out of the child; Linux closes
-      // them with a file action instead (see `launch`).
+      // `POSIX_SPAWN_CLOEXEC_DEFAULT` keeps every other descriptor out of the child. Linux has no
+      // such flag; a forked child marks them close-on-exec itself (see `startForked`).
       static if Intrinsic.targetOperatingSystem() == "darwin" {
         let flags = unsafe posix_spawnattr_setflags(
           Pointer.fromMutRef<AttributesHandle>(&mut result.handle),
@@ -497,21 +591,18 @@ static if (Intrinsic.targetOperatingSystem() == "darwin" && (Intrinsic.targetArc
       run addDescriptor(&mut actions, output.fd, 1)
       run addDescriptor(&mut actions, errors.fd, 2)
       static if Intrinsic.targetOperatingSystem() == "linux" {
-        let closed = unsafe posix_spawn_file_actions_addclosefrom_np(
-          Pointer.fromMutRef<ActionsHandle>(&mut actions.handle),
-          3,
-        )
-        if closed != 0 {
-          return run reject(ChildProcess.spawnOperation(), closed)
+        if Pointer.isNullMany<u8>(directory) == false {
+          return run launchForked(input, output, errors, program, arguments, environment, directory)
         }
-      }
-      if Pointer.isNullMany<u8>(directory) == false {
-        let changed = unsafe posix_spawn_file_actions_addchdir_np(
-          Pointer.fromMutRef<ActionsHandle>(&mut actions.handle),
-          directory,
-        )
-        if changed != 0 {
-          return run reject(ChildProcess.spawnOperation(), changed)
+      } else {
+        if Pointer.isNullMany<u8>(directory) == false {
+          let changed = unsafe posix_spawn_file_actions_addchdir_np(
+            Pointer.fromMutRef<ActionsHandle>(&mut actions.handle),
+            directory,
+          )
+          if changed != 0 {
+            return run reject(ChildProcess.spawnOperation(), changed)
+          }
         }
       }
       let mut pid = -1
