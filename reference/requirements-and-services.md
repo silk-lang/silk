@@ -789,3 +789,32 @@ witness matching and dispatch see one form.
 
 **Evidence:** `service-operation-receivers` corpus program, `service-call-without-receiver` and
 `service-impl-missing-receiver` invalid corpus programs.
+
+## SERV-013 — A `&mut` requirement only read is a warning
+
+**Status:** Confirmed
+
+`silk check`, `silk build` and the language server report the `SEM0254` warning at an `&mut S`
+entry of a function's requirement row when every `run` in its body that needs `S` in that role
+needs only `&S`. The row then asks callers for more access than the body uses, so writing `&S`
+lets them provide the service through a shared borrow.
+
+```silk,ignore
+service Random {
+  effect fn next(self: &Self) -> u32
+}
+
+effect fn roll() -> u32 ? &mut Random {
+  return run Random.next()
+}
+```
+
+**Boundary:** Only rows a function declares are checked; service and interface operations are
+not, since their access is the contract implementations follow. An entry no `run` needs is not
+reported, and a body that runs an Effect with an open row is not checked.
+
+**Diagnostics:** `SEM0254` is a warning: the command still succeeds.
+
+**Current compiler:** Aligned.
+
+**Evidence:** `LspCases` publishes `SEM0254` for an `&mut` entry the body only reads.
