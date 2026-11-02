@@ -1179,6 +1179,24 @@ const program = Effect.gen(function* () {
     casing.stderr,
     /^src\/main\.silk:1:8: error\[MOD0001\] Unknown module util\.math\n  note: did you mean `util\.Math`\? Module paths match file names exactly, including letter case$/m,
   )
+  // Unused bindings are warnings: `check` and `build` report them and still succeed.
+  yield* fs.makeDirectory(join(directory, 'unused/src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'unused/silk.toml'),
+    '[package]\nname = "unused"\nversion = "0.1.0"\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'unused/src/main.silk'),
+    'import silk.num.usize\n\npub fn main() -> i32 {\n  let idle = 1\n  let _kept = 2\n  return 0\n}\n',
+  )
+  for (const command of ['check', 'build']) {
+    const unused = yield* invoke(silk, [command, '--stdlib', standardLibrary, ...(command === 'build' ? ['--clang', clang] : [])],
+      join(directory, 'unused'))
+    assert.equal(unused.status, 0, unused.stderr)
+    assert.match(unused.stderr, /^src\/main\.silk:4:7: warning\[SEM0252\] `idle` is never used/m)
+    assert.match(unused.stderr, /^src\/main\.silk:1:17: warning\[MOD0007\] Import `usize` is never used/m)
+    assert.doesNotMatch(unused.stderr, /_kept/)
+  }
   // A package that cannot be loaded ends its load row as failed and still names itself on its
   // final line.
   yield* fs.makeDirectory(join(directory, 'unexported/src'), { recursive: true })
