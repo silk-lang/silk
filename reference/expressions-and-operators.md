@@ -388,7 +388,7 @@ single-type forms; parenthesize a union. Types the lambda omits come from its co
 
 **Boundary:** The `fn(...)` anonymous form of
 [ANON-SYNTAX-001](#anon-syntax-001--anonymous-callable-expressions-write-a-complete-callable-contract)
-is unchanged. A lambda cannot be prefixed with `effect`.
+is unchanged. `effect` before the bars, `effect |value| ...`, writes an `effect` lambda.
 
 **Diagnostics:** A missing closing bar or body receives a local parser diagnostic.
 

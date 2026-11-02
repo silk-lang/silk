@@ -640,10 +640,26 @@ checked after the call's other arguments, so `applyTwice(|value| value + 1, 40)`
 it has its own source identity, captures, and invocation mode, and its signature is fixed by the
 check of its enclosing body. Inference adds no work to code that does not use lambdas.
 
+An `effect` lambda, `effect |value| ...`, is an anonymous `effect fn`. When it omits its result, its
+success, failure, and requirements are those of the Effect the context expects when the context
+fixes them, and otherwise they are derived from its body as for an `effect {}` block
+([RETURN-002](#return-002--an-effect-block-derives-its-contract-from-every-reachable-terminal)).
+
+```silk
+import silk.core.effect { Effect }
+
+effect fn next(value: i32) -> i32 {
+  return value + 1
+}
+
+effect fn chained() -> i32 {
+  return run next(1) |> Effect.flatMap(effect |value| run next(value))
+}
+```
+
 **Boundary:** A lambda's inferred types must be nameable in a signature: a type that names a loan of
-the enclosing body or a binder the enclosing call is still inferring cannot be inferred. A lambda
-cannot be `effect`; write `effect fn(...)` for an effectful anonymous callable, for example as the
-argument of `Effect.flatMap`.
+the enclosing body or a binder the enclosing call is still inferring cannot be inferred. A lambda that
+returns an Effect value without being `effect` is not supported yet; write an `effect` lambda.
 
 **Diagnostics:** A parameter or result type the context cannot supply reports `SEM0252` at the
 parameter or lambda; writing the type, as in `|value: i32|`, resolves it.
