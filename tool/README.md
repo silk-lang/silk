@@ -62,10 +62,13 @@ the tool prints a note naming both manifests and runs the workspace's version.
 
 When nothing selects a version, or the selected one is not installed, the tool exits with status 3
 and names the command that fixes it, unless `SILK_AUTO_INSTALL=1` or `auto-install = true`
-installs it first. For `lsp`, so editors that only spawn the server do not see it crash, the tool
-instead serves a language server with no capabilities that answers `initialize`, shows the message
-as an error, and exits on `exit`. A pin the tool cannot read, such as syntax from a newer manifest
-format, is a configuration error naming `silk update self`; the tool never guesses what it means.
+installs it first. For `lsp`, a missing toolchain or a failed automatic install instead answers
+`initialize` with a JSON-RPC error (`code: -32000`) containing the failure reason and
+`data: { "retry": false }`. It never reports successful initialization or advertises capabilities.
+Other requests receive ServerNotInitialized (`-32002`); the process exits with status 1 on `exit`
+or EOF. Fix the reported problem, then restart the language server. A pin the tool cannot read,
+such as syntax from a newer manifest format, is a configuration error naming `silk update self`;
+the tool never guesses what it means.
 
 The tool reads two things from a manifest: the root `silk-version`, and the release settings
 `silk change` will use. Manifest changes for the compiler never need a tool update.
