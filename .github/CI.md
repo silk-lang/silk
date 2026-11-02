@@ -80,9 +80,10 @@ gh api -X POST repos/silk-lang/silk/actions/runs/<run id>/cancel
 
 ## Release archives
 
-Every release archive is built on one Linux runner. After the N2 fixpoint, Selfhost invokes
+Every release archive is built on Linux. After the N2 fixpoint, Selfhost invokes
 `release-cross.yml` with the verified Linux N1, the immutable source snapshot and the profile the
-Linux N2 trained on. Its `cross` job runs `.github/scripts/release-build.sh` with N1 for each of
+Linux N2 trained on. Its `cross` matrix runs `.github/scripts/release-build.sh` with N1, one job per
+target, for each of
 `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`,
 `x86_64-apple-darwin` and `x86_64-pc-windows-msvc`, with no SDK or sysroot: Linux and macOS links
 use Silk's own glibc and libSystem stubs, Windows links its own import libraries. Every compiler
@@ -95,8 +96,8 @@ builds must be the cross-built bytes, and the compiler's IR the IR N1 emitted on
 difference is a determinism bug in the compiler or its link: fix it, never compare around it. The
 runner then smokes the archive and runs the corpus with the release compiler (x86-64 Linux runs it
 with N1 in the corpus job). `x86_64-apple-darwin` rebuilds on `macos-15` under Rosetta, because
-LLVM publishes no Intel macOS Clang, and `macos-15-intel` runs the archive natively with Homebrew's
-LLVM. Publication signs and publishes the cross-built archives only after every verification
+LLVM publishes no Intel macOS Clang, and `macos-15-intel` runs the archive and the self-contained
+corpus natively with Homebrew's LLVM. Publication signs and publishes the cross-built archives only after every verification
 passes; each target's receipt and seed candidate come from its verification.
 
 `compiler/native-seed.json` pins only the x86-64 Linux seed: every other target's compiler is
