@@ -6,7 +6,7 @@
 
 import documentation.MarkdownInline as MarkdownInline { Symbol }
 import hir.Directive as Directive
-import hir.Hir { Access, HirId, Module, Multiplicity, Node, OwnerKind }
+import hir.Hir { Access, CallableMode, HirId, Module, Multiplicity, Node, OwnerKind }
 import lexer.Span { Span }
 import lsp.Names as Names { CallAt, DirectiveAt, Inferred, Introduced, IntroducedAt, NameAt, Named, Place, Site, Typed }
 import semantic.DeclarationId { DeclarationId }
@@ -16,7 +16,9 @@ import semantic.Query { Cycle }
 import semantic.Semantic { Dependency, Semantic, StaticPort }
 import semantic.SourceIndex { AuthoredCursor, IndexedSource, RevisionMismatch }
 import semantic.SourceUnit { SourceUnit }
-import semantic.Type { Argument, Type }
+import semantic.CallableSchema { CallableSchema as SectionSchema }
+import semantic.CallableWitness { CallableWitness }
+import semantic.Type { AnonymousOccurrence, Argument, Requirement, Row, RowParameter, RowSubtraction, Type }
 import semantic.TypeText
 import semantic.Types { Types }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
@@ -546,8 +548,10 @@ fn slice(text: &[u8], span: Span) -> &[u8] {
   return Slice.view<u8>(text, start, end - start)
 }
 
-// Appends how an editor shows `ty`: short nominal names, references without their lifetimes, and
-// type parameters by their written names.
+// Appends how an editor shows `ty`: short nominal names, references and Effects without their
+// lifetimes, and type parameters by their written names. Every type has a spelling, so a hover or
+// an inlay hint never shows a placeholder: a value whose exact type is compiler-internal, such as
+// a closure or a composed Effect, is shown by the contract it is used through.
 effect fn spell(store: &mut Semantic, ty: &Shared<Type>, output: &mut Bytes) -> ()
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
@@ -576,12 +580,8 @@ effect fn spell(store: &mut Semantic, ty: &Shared<Type>, output: &mut Bytes) -> 
         run Bytes.append(&mut output.*, b">")
       }
     }
-    Type.Parameter { declaration, ordinal } => {
-      match move run binderName(&mut store.*, &declaration, ordinal) {
-        Option<Bytes>.Some { value } => run Bytes.append(&mut output.*, Bytes.asSlice(&value))
-        Option<Bytes>.None => run Bytes.append(&mut output.*, b"_")
-      }
-    }
+    Type.OpaqueRepresentation { contract, .. } => run spell(&mut store.*, &contract, &mut output.*)
+    Type.Parameter { declaration, ordinal } => run spellBinder(&mut store.*, &declaration, ordinal, &mut output.*)
     Type.String { .. } => run Bytes.append(&mut output.*, b"string")
     Type.Reference { referent, access, .. } => {
       run Bytes.append(&mut output.*, b"&")
@@ -615,6 +615,13 @@ effect fn spell(store: &mut Semantic, ty: &Shared<Type>, output: &mut Bytes) -> 
       }
       run spell(&mut store.*, &pointee, &mut output.*)
     }
+    Type.ForeignFunction { signature, nullable, .. } => {
+      if nullable {
+        run Bytes.append(&mut output.*, b"?")
+      }
+      run Bytes.append(&mut output.*, b"extern \"C\" ")
+      run spell(&mut store.*, &signature, &mut output.*)
+    }
     Type.Array { element, extent } => {
       run Bytes.append(&mut output.*, b"[")
       run spell(&mut store.*, &element, &mut output.*)
@@ -622,8 +629,64 @@ effect fn spell(store: &mut Semantic, ty: &Shared<Type>, output: &mut Bytes) -> 
       run Bytes.append(&mut output.*, Bytes.asSlice(&extent))
       run Bytes.append(&mut output.*, b"]")
     }
+    Type.Vector { element, lanes } => {
+      let mask = Shared<Type>.with<bool>(&element, fn(lane: &Type) -> bool {
+        return match &lane.* {
+          Type.Primitive { name } => sameText(Bytes.asSlice(&name), b"bool")
+          _ => false
+        }
+      })
+      if mask {
+        run Bytes.append(&mut output.*, b"mask<")
+      } else {
+        run Bytes.append(&mut output.*, b"simd<")
+        run spell(&mut store.*, &element, &mut output.*)
+        run Bytes.append(&mut output.*, b", ")
+      }
+      run Bytes.append(&mut output.*, Bytes.asSlice(&lanes))
+      run Bytes.append(&mut output.*, b">")
+    }
+    Type.Anonymous { occurrence, members } => {
+      let positional = AnonymousOccurrence.isPositional(&occurrence)
+      let listed = List<Shared<Type>>.asSlice(&members)
+      if positional {
+        run Bytes.append(&mut output.*, b"(")
+      } else {
+        run Bytes.append(&mut output.*, b".{ ")
+      }
+      let mut at = usize.ZERO
+      while at < listed.length {
+        if at > usize.ZERO {
+          run Bytes.append(&mut output.*, b", ")
+        }
+        if !positional {
+          run Bytes.append(&mut output.*, Bytes.asSlice(&run TypeText.anonymousLabel(&occurrence, at)))
+          run Bytes.append(&mut output.*, b": ")
+        }
+        run spell(&mut store.*, &listed[at], &mut output.*)
+        at = at + usize.ONE
+      }
+      if positional {
+        if listed.length == usize.ONE {
+          run Bytes.append(&mut output.*, b",")
+        }
+        run Bytes.append(&mut output.*, b")")
+      } else if listed.length == usize.ZERO {
+        run Bytes.append(&mut output.*, b"}")
+      } else {
+        run Bytes.append(&mut output.*, b" }")
+      }
+    }
+    Type.TypeDescriptor { owner } => {
+      run Bytes.append(&mut output.*, b"Intrinsic.Type<")
+      run spell(&mut store.*, &owner, &mut output.*)
+      run Bytes.append(&mut output.*, b">")
+    }
     Type.Union { members } => {
       let listed = List<Shared<Type>>.asSlice(&members)
+      if listed.length == usize.ZERO {
+        run Bytes.append(&mut output.*, b"never")
+      }
       let mut at = usize.ZERO
       while at < listed.length {
         if at > usize.ZERO {
@@ -633,7 +696,18 @@ effect fn spell(store: &mut Semantic, ty: &Shared<Type>, output: &mut Bytes) -> 
         at = at + usize.ONE
       }
     }
-    Type.Callable { parameters, result, .. } => {
+    Type.Without { source, removed } => {
+      run Bytes.append(&mut output.*, b"Without<")
+      run spell(&mut store.*, &source, &mut output.*)
+      run Bytes.append(&mut output.*, b", ")
+      run spell(&mut store.*, &removed, &mut output.*)
+      run Bytes.append(&mut output.*, b">")
+    }
+    Type.Callable { mode, isUnsafe, parameters, result, .. } => {
+      run spellMode(mode, &mut output.*)
+      if isUnsafe {
+        run Bytes.append(&mut output.*, b"unsafe ")
+      }
       run Bytes.append(&mut output.*, b"fn(")
       let listed = List<Shared<Type>>.asSlice(&parameters)
       let mut at = usize.ZERO
@@ -647,15 +721,151 @@ effect fn spell(store: &mut Semantic, ty: &Shared<Type>, output: &mut Bytes) -> 
       run Bytes.append(&mut output.*, b") -> ")
       run spell(&mut store.*, &result, &mut output.*)
     }
-    // A closure, a function value or a staged call is shown by the signature it is called with.
+    Type.Effect { mode, success, failure, requirements, .. } => {
+      run spellMode(mode, &mut output.*)
+      run Bytes.append(&mut output.*, b"Effect<")
+      run spell(&mut store.*, &success, &mut output.*)
+      if !Shared<Type>.with<bool>(&failure, Type.isNever) {
+        run Bytes.append(&mut output.*, b" ! ")
+        run spell(&mut store.*, &failure, &mut output.*)
+      }
+      if !rowEmpty(&requirements) {
+        run Bytes.append(&mut output.*, b" ? ")
+        run spellRow(&mut store.*, &requirements, &mut output.*)
+      }
+      run Bytes.append(&mut output.*, b">")
+    }
+    // A closure, a function value, a staged call or a composed Effect is shown by the contract it
+    // is called or run through.
     Type.CallableValue { contract, .. } => run spell(&mut store.*, &contract, &mut output.*)
+    Type.CallableSchema { schema, .. } => {
+      let contract = Shared<SectionSchema>.with<Shared<Type>>(&schema, fn(value: &SectionSchema) -> Shared<Type> {
+        return Shared<Type>.clone(&value.contract)
+      })
+      run spell(&mut store.*, &contract, &mut output.*)
+    }
     Type.CallableStage { contract, .. } => run spell(&mut store.*, &contract, &mut output.*)
     Type.CallableResult { contract, .. } => run spell(&mut store.*, &contract, &mut output.*)
     Type.CallableOrigin { contract, .. } => run spell(&mut store.*, &contract, &mut output.*)
+    Type.CallableWitnessResult { witness } => {
+      let contract = Shared<CallableWitness>.with<Shared<Type>>(&witness, fn(value: &CallableWitness) -> Shared<Type> {
+        return Shared<Type>.clone(&value.contract)
+      })
+      run spell(&mut store.*, &contract, &mut output.*)
+    }
     Type.CallableView { contract, .. } => run spell(&mut store.*, &contract, &mut output.*)
-    _ => run Bytes.append(&mut output.*, b"_")
+    Type.EffectComposite { contract, .. } => run spell(&mut store.*, &contract, &mut output.*)
+    Type.EffectJoin { contract, .. } => run spell(&mut store.*, &contract, &mut output.*)
   }
   return ()
+}
+
+// Appends the access a callable or an Effect is used with: nothing for shared use.
+effect fn spellMode(mode: CallableMode, output: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  if mode == CallableMode.Mutable {
+    run Bytes.append(&mut output.*, b"mut ")
+  } else if mode == CallableMode.Once {
+    run Bytes.append(&mut output.*, b"once ")
+  }
+  return ()
+}
+
+// Appends the written name of a type parameter, or `_` when its declaration is not loaded.
+effect fn spellBinder(store: &mut Semantic, declaration: &DeclarationId, ordinal: usize, output: &mut Bytes) -> ()
+  ! Cycle | OutOfMemoryError
+  ? &mut Allocator {
+  match move run binderName(&mut store.*, declaration, ordinal) {
+    Option<Bytes>.Some { value } => run Bytes.append(&mut output.*, Bytes.asSlice(&value))
+    Option<Bytes>.None => run Bytes.append(&mut output.*, b"_")
+  }
+  return ()
+}
+
+// Whether a requirement row has no entries, parameters or subtractions.
+fn rowEmpty(row: &Shared<Row>) -> bool {
+  return Shared<Row>.with<bool>(row, fn(value: &Row) -> bool {
+    return List<Requirement>.length(&value.entries) == usize.ZERO && List<RowParameter>.length(&value.parameters) == usize.ZERO
+      && List<RowSubtraction>.length(&value.subtractions) == usize.ZERO
+  })
+}
+
+// Appends a requirement row as written after `?`: each service with its access and role, then
+// each row parameter by name, then each undecided `Without<source, removed>`, joined by ` | `.
+effect fn spellRow(store: &mut Semantic, row: &Shared<Row>, output: &mut Bytes) -> ()
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let mut first = true
+  let entries = run Row.entryList(row)
+  let listed = List<Requirement>.asSlice(&entries)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if !first {
+      run Bytes.append(&mut output.*, b" | ")
+    }
+    first = false
+    run Bytes.append(&mut output.*, b"&")
+    if listed[at].access == Access.Mutable {
+      run Bytes.append(&mut output.*, b"mut ")
+    }
+    run spell(&mut store.*, &listed[at].capability, &mut output.*)
+    if let Option<Shared<Type>>.Some { value: named } = &listed[at].roleType {
+      run Bytes.append(&mut output.*, b" at ")
+      run spell(&mut store.*, &named, &mut output.*)
+    }
+    at = at + usize.ONE
+  }
+  let parameters = Shared<Row>.with<usize>(row, fn(value: &Row) -> usize {
+    return List<RowParameter>.length(&value.parameters)
+  })
+  at = usize.ZERO
+  while at < parameters {
+    let parameter = Shared<Row>.with<RowParameter>(row, fn(value: &Row) -> RowParameter {
+      let found = &List<RowParameter>.asSlice(&value.parameters)[at]
+      return RowParameter { declaration: Shared<DeclarationId>.clone(&found.declaration), ordinal: found.ordinal }
+    })
+    if !first {
+      run Bytes.append(&mut output.*, b" | ")
+    }
+    first = false
+    let declaration = DeclarationId.copyShared(&parameter.declaration)
+    run spellBinder(&mut store.*, &declaration, parameter.ordinal, &mut output.*)
+    at = at + usize.ONE
+  }
+  let subtractions = Shared<Row>.with<usize>(row, fn(value: &Row) -> usize {
+    return List<RowSubtraction>.length(&value.subtractions)
+  })
+  at = usize.ZERO
+  while at < subtractions {
+    let subtraction = Shared<Row>.with<RowSubtraction>(row, fn(value: &Row) -> RowSubtraction {
+      let found = &List<RowSubtraction>.asSlice(&value.subtractions)[at]
+      return RowSubtraction { source: Shared<Row>.clone(&found.source), removed: Shared<Row>.clone(&found.removed) }
+    })
+    if !first {
+      run Bytes.append(&mut output.*, b" | ")
+    }
+    first = false
+    run Bytes.append(&mut output.*, b"Without<")
+    run spellRow(&mut store.*, &subtraction.source, &mut output.*)
+    run Bytes.append(&mut output.*, b", ")
+    run spellRow(&mut store.*, &subtraction.removed, &mut output.*)
+    run Bytes.append(&mut output.*, b">")
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+fn sameText(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
 }
 
 // The written name of the type parameter at `ordinal` in `declaration`'s binder list: its
