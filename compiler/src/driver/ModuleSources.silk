@@ -1738,6 +1738,17 @@ effect fn readModule(self: &mut ModuleSources, module: &ModuleId) -> Option<Byte
   return move content
 }
 
+/// Reads `module`'s current source: its file, or else the source a `build.silk` plan generates
+/// for it; none when it has neither.
+pub effect fn moduleText(self: &ModuleSources, module: &ModuleId) -> Option<Bytes>
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let location = run sourceLocation(self, module)
+  if let Option<Path>.Some {value} = &location.path {
+    if let Option<Bytes>.Some {value: content} = move run readOptional(&value) { return Option<Bytes>.some(move content) }
+  }
+  return run generatedSource(self, module)
+}
+
 // The source a `build.silk` plan generates as `module`, if any.
 effect fn generatedSource(self: &ModuleSources, module: &ModuleId) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
   let listed = List<GeneratedModule>.asSlice(&self.generated)
@@ -2258,4 +2269,210 @@ pub fn missedModule(self: &ModuleSources, events: &[Event]) -> usize {
     at = at + usize.ONE
   }
   return usize.MAX
+}
+
+/// One way an import path can go on: a module file it can end at, or a directory it can go on
+/// through.
+pub struct ImportStep {
+  /// The segment, such as `mem` or `allocator`.
+  pub name: Bytes,
+  /// The module the path names when it ends at this segment; none for a directory, which names
+  /// one only through its barrel.
+  pub module: Option<ModuleId>,
+  /// Whether the segment is a directory, after which the path can go on.
+  pub directory: bool,
+}
+
+/// What an import path can go on with after its written segments.
+pub struct ImportListing {
+  /// The segments that can follow, in listing order.
+  pub steps: List<ImportStep>,
+  /// The barrel module `mod.silk` of the directory the written path names, which the path
+  /// itself imports; none when the directory has none.
+  pub barrel: Option<ModuleId>,
+}
+
+/// The segments an import path written in `importer` can go on with after `written`, its segments
+/// joined by `/` such as `silk/mem`, or empty before the first segment.
+///
+/// # Details
+///
+/// The written path names the directory that an import of a module below it reads
+/// ([`PackageGraph.target`]), so a standard-library path lists the library and a path that starts
+/// with a dependency name lists that dependency's source root. Each source file named by an
+/// identifier is a step to the module it holds, when `importer` may import that module
+/// (PACKAGE-006), and each directory named by an identifier is a step to go on through. Modules a
+/// `build.silk` plan generates there are steps too. Before the first segment, each dependency name
+/// of `importer`'s package and `silk`, when the build reads a standard library, are directories as
+/// well. A directory that cannot be listed gives no steps.
+pub effect fn importListing(self: &ModuleSources, importer: &ModuleId, written: &[u8]) -> ImportListing
+! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut listing = ImportListing {steps: List<ImportStep>.make(), barrel: Option<ModuleId>.none()}
+  if written.length == usize.ZERO {
+    let owner = run ModuleId.copyPackage(importer)
+    let names = run PackageGraph.dependencyNames(&self.graph, Bytes.asSlice(&owner))
+    let listed = List<Bytes>.asSlice(&names)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      run List<ImportStep>.append(&mut listing.steps, ImportStep {name: run Bytes.copy(Bytes.asSlice(&listed[at])), module: Option<ModuleId>.none(), directory: true})
+      at = at + usize.ONE
+    }
+    if let Option<Path>.Some {..} = &self.standardLibrary {
+      run List<ImportStep>.append(&mut listing.steps, ImportStep {name: run Bytes.copy(b"silk"), module: Option<ModuleId>.none(), directory: true})
+    }
+  }
+  let mut probe = run Bytes.copy(written)
+  if written.length > usize.ZERO { run Bytes.append(&mut probe, b"/") }
+  run Bytes.append(&mut probe, b"mod.silk")
+  let anchor = match move run Effect.result(PackageGraph.target(&self.graph, importer, Bytes.asSlice(&probe))) {
+    Result<ModuleId, InvalidModulePath | OutOfMemoryError>.Success {value} => move value
+    Result<ModuleId, InvalidModulePath | OutOfMemoryError>.Failure {error} => match move error {
+      InvalidModulePath {} => { return move listing }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let anchorPath = run ModuleId.copyPath(&anchor)
+  // The written directory as a logical path prefix, such as `mem/`, in the anchor's package.
+  let prefix = Slice.view<u8>(Bytes.asSlice(&anchorPath), usize.ZERO, Bytes.length(&anchorPath) - b"mod.silk".length)
+  let located = match move run Effect.result(sourceLocation(self, &anchor)) {
+    Result<SourceLocation, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<SourceLocation, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => {
+        drop failure
+        return move listing
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  if let Option<Path>.Some {value: file} = &located.path {
+    let raw = Path.rawBytes(&file)
+    let directory = Slice.view<u8>(raw, usize.ZERO, raw.length - b"/mod.silk".length)
+    let children = run listedChildren(directory)
+    let listed = List<Child>.asSlice(&children)
+    let mut child = usize.ZERO
+    while child < listed.length {
+      let name = Bytes.asSlice(&listed[child].name)
+      if listed[child].directory {
+        if identifier(name) && !stepped(List<ImportStep>.asSlice(&listing.steps), name) {
+          run List<ImportStep>.append(&mut listing.steps, ImportStep {name: run Bytes.copy(name), module: Option<ModuleId>.none(), directory: true})
+        }
+      } else if sameText(name, b"mod.silk") {
+        if run PackageGraph.exported(&self.graph, importer, &anchor) {
+          listing.barrel = Option<ModuleId>.some(ModuleId.copy(&anchor))
+        }
+      } else if name.length > b".silk".length && endsWith(name, b".silk") {
+        let stem = Slice.view<u8>(name, usize.ZERO, name.length - b".silk".length)
+        run appendModuleStep(self, &mut listing, importer, &anchor, prefix, stem)
+      }
+      child = child + usize.ONE
+    }
+  }
+  // Generated modules have no file; they sit directly below the package's source root.
+  let package = run ModuleId.copyPackage(&anchor)
+  let generated = List<GeneratedModule>.asSlice(&self.generated)
+  let mut at = usize.ZERO
+  while at < generated.length {
+    let path = Bytes.asSlice(&generated[at].path)
+    if sameText(Bytes.asSlice(&generated[at].package), Bytes.asSlice(&package)) && startsWith(path, prefix)
+      && !holdsSlash(Slice.view<u8>(path, prefix.length, path.length - prefix.length)) && endsWith(path, b".silk") {
+      let stem = Slice.view<u8>(path, prefix.length, path.length - prefix.length - b".silk".length)
+      run appendModuleStep(self, &mut listing, importer, &anchor, prefix, stem)
+    }
+    at = at + usize.ONE
+  }
+  return move listing
+}
+
+// Appends the step to the module file `stem` below `prefix`, in the package of `anchor`, when it
+// is named by an identifier, not yet listed, and `importer` may import it.
+effect fn appendModuleStep(self: &ModuleSources, listing: &mut ImportListing, importer: &ModuleId, anchor: &ModuleId, prefix: &[u8], stem: &[u8]) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  if !identifier(stem) { return () }
+  let mut path = run Bytes.copy(prefix)
+  run Bytes.append(&mut path, stem)
+  run Bytes.append(&mut path, b".silk")
+  let module = match move run Effect.result(ModuleId.sibling(anchor, Bytes.asSlice(&path))) {
+    Result<ModuleId, InvalidModulePath | OutOfMemoryError>.Success {value} => move value
+    Result<ModuleId, InvalidModulePath | OutOfMemoryError>.Failure {error} => match move error {
+      InvalidModulePath {} => { return () }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  if !run PackageGraph.exported(&self.graph, importer, &module) { return () }
+  let steps = List<ImportStep>.asMutSlice(&mut listing.steps)
+  let mut at = usize.ZERO
+  while at < steps.length {
+    if sameText(Bytes.asSlice(&steps[at].name), stem) {
+      // A directory of the same name: the path can end here or go on.
+      if let Option<ModuleId>.None = &steps[at].module { steps[at].module = Option<ModuleId>.some(move module) }
+      return ()
+    }
+    at = at + usize.ONE
+  }
+  run List<ImportStep>.append(&mut listing.steps, ImportStep {name: run Bytes.copy(stem), module: Option<ModuleId>.some(move module), directory: false})
+  return ()
+}
+
+// One child of a listed directory: its name and whether it is a directory itself.
+struct Child {
+  name: Bytes,
+  directory: bool,
+}
+
+// The children of `directory`; empty when it cannot be listed.
+effect fn listedChildren(directory: &[u8]) -> List<Child>
+! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut found = List<Child>.make()
+  let path = match move run Effect.result(Path.fromBytes(directory)) {
+    Result<Path, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => {
+        drop failure
+        return move found
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let children = match move run Effect.result(FileSystem.listDirectory(&path)) {
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => {
+        drop failure
+        return move found
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let listed = List<DirectoryEntry>.asSlice(&children)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    run List<Child>.append(&mut found, Child {
+      name: run Bytes.copy(lastComponent(Path.rawBytes(&listed[at].path))),
+      directory: listed[at].kind.code == FileSystem.directory().code,
+    })
+    at = at + usize.ONE
+  }
+  return move found
+}
+
+fn stepped(steps: &[ImportStep], name: &[u8]) -> bool {
+  let mut at = usize.ZERO
+  while at < steps.length {
+    if sameText(Bytes.asSlice(&steps[at].name), name) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn endsWith(text: &[u8], suffix: &[u8]) -> bool {
+  return text.length >= suffix.length && sameText(Slice.view<u8>(text, text.length - suffix.length, suffix.length), suffix)
+}
+
+fn holdsSlash(text: &[u8]) -> bool {
+  let mut at = usize.ZERO
+  while at < text.length {
+    if text[at] == 47 { return true }
+    at = at + usize.ONE
+  }
+  return false
 }

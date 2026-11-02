@@ -35,6 +35,7 @@ import driver.Packages { InvalidDependency }
 import lexer.Span { Span }
 import lexer.Lexer { Lexer }
 import lexer.Token as Tokens { Token, TokenKind }
+import lsp.AutoImport as AutoImports { Exports, Insertion, Offer, OpenText }
 import lsp.Completion as Completions { Item }
 import lsp.Features { Edit, Lines }
 import lsp.Message { Change, PositionEncoding }
@@ -170,6 +171,9 @@ struct Package {
   // the store had run when it last wrote the file.
   cache: Option<CacheFile>,
   saved: usize,
+
+  // What the modules the package's imports can name declare, for import fixes.
+  exports: Exports,
 }
 
 /// The open documents and the packages they belong to.
@@ -285,6 +289,7 @@ impl Workspace {
     while package < packages.length {
       if let Option<ModuleId>.Some { value: module } = move run readerModule(&packages[package], Bytes.asSlice(&path)) {
         run Sources.reread(&mut packages[package].sources, &module, Bytes.asSlice(&documents[at].text))
+        packages[package].exports.forget(&module)
         packages[package].stale = true
       }
       package = package + usize.ONE
@@ -706,8 +711,9 @@ impl Workspace {
     }
   }
 
-  /// The completions at `position` of the open document at `uri`: the members of the receiver
-  /// before a `.`, or else the names in scope, that start with the identifier being typed.
+  /// The completions at `position` of the open document at `uri` that start with the identifier
+  /// being typed: the next segment of an import header's path, the members of the receiver before
+  /// a `.`, or else the names in scope.
   pub effect fn completion(self: &mut Self, uri: &[u8], position: Position, encoding: PositionEncoding) -> List<Item>
     ! OutOfMemoryError
     ? &mut FileSystem | &mut Allocator | &mut Types {
@@ -725,6 +731,9 @@ impl Workspace {
     }
     let prefix = Slice.view<u8>(text, start, offset - start)
     let package = &mut List<Package>.asMutSlice(&mut self.packages)[document.package]
+    if let Option<Bytes>.Some { value: written } = move run Completions.importPathAt(text, start) {
+      return run Completions.importSegments(&package.sources, &module, Bytes.asSlice(&written), prefix)
+    }
     let mut attempted = Result<List<Item>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success { value: List<Item>.make() }
     if start > usize.ZERO && text[start - usize.ONE] == '.' {
       attempted = run Effect.result(Completions.members(&mut package.store, &module, text, start - usize.ONE, prefix))
@@ -740,6 +749,74 @@ impl Workspace {
         _ => List<Item>.make()
       }
     }
+  }
+
+  /// The imports that would bring the name at `position` of the open document at `uri` into
+  /// scope, when its module's check found nothing of that name: one fix for each module the
+  /// document's imports can name that declares it public.
+  pub effect fn importFixes(self: &mut Self, uri: &[u8], position: Position, encoding: PositionEncoding) -> List<Fix>
+    ! OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator {
+    let mut fixes = List<Fix>.make()
+    let at = run subject(&mut self.*, uri)
+    if at == usize.MAX {
+      return move fixes
+    }
+    let documents = List<Document>.asSlice(&self.documents)
+    let document = &documents[at]
+    let module = moduleOf(document)
+    let text = Bytes.asSlice(&document.text)
+    let offset = offsetOf(text, position, encoding)
+    let mut start = offset
+    while start > usize.ZERO && Completions.identifierByte(text[start - usize.ONE]) {
+      start = start - usize.ONE
+    }
+    let mut end = offset
+    while end < text.length && Completions.identifierByte(text[end]) {
+      end = end + usize.ONE
+    }
+    if start == end {
+      return move fixes
+    }
+    let name = Slice.view<u8>(text, start, end - start)
+    let package = &mut List<Package>.asMutSlice(&mut self.packages)[document.package]
+    if !run unresolved(&package.*, &module, Span { start: start, end: end }) {
+      return move fixes
+    }
+    let mut open = List<OpenText>.make()
+    let mut other = usize.ZERO
+    while other < documents.length {
+      if documents[other].package == document.package {
+        if let Option<ModuleId>.Some { value: opened } = &documents[other].module {
+          run List<OpenText>.append(&mut open, OpenText { module: ModuleId.copy(&opened), text: run Bytes.copy(Bytes.asSlice(&documents[other].text)) })
+        }
+      }
+      other = other + usize.ONE
+    }
+    let offers = run package.exports.offers(&package.sources, &module, name, List<OpenText>.asSlice(&open))
+    let listed = List<Offer>.asSlice(&offers)
+    if listed.length == usize.ZERO {
+      return move fixes
+    }
+    let unit = run SourceUnit.parse(&module, usize.ZERO, run Bytes.copy(text))
+    let lines = run Lines.make(text)
+    let mut index = usize.ZERO
+    while index < listed.length {
+      let path = Bytes.asSlice(&listed[index].path)
+      if let Option<Insertion>.Some { value: insertion } = move run AutoImports.insertion(&unit, path, name) {
+        let mut title = run Bytes.copy(b"Import `")
+        run Bytes.append(&mut title, name)
+        run Bytes.append(&mut title, b"` from `")
+        run Bytes.append(&mut title, path)
+        run Bytes.append(&mut title, b"`")
+        let place = lines.position(text, insertion.offset, encoding)
+        let mut edits = List<Edit>.make()
+        run List<Edit>.append(&mut edits, Edit { start: place, end: place, text: move insertion.text })
+        run List<Fix>.append(&mut fixes, Fix { title: move title, change: Changed { uri: run Bytes.copy(uri), edits: move edits } })
+      }
+      index = index + usize.ONE
+    }
+    return move fixes
   }
 
   /// Every place the package of the open document at `uri` names what the name at `position`
@@ -911,6 +988,12 @@ pub struct Location {
 pub struct Changed {
   pub uri: Bytes,
   pub edits: List<Edit>,
+}
+
+/// A code action that edits one document: its title and its edits.
+pub struct Fix {
+  pub title: Bytes,
+  pub change: Changed,
 }
 
 /// A declaration a workspace symbol search found: its name, its SymbolKind number and where its
@@ -1488,6 +1571,26 @@ effect fn markLocations(dirty: &mut List<ModuleId>, rejections: &[Shared<Rejecti
   return ()
 }
 
+// Whether a current check of `package` found no declaration for the name written at `name` in
+// `module`.
+effect fn unresolved(package: &Package, module: &ModuleId, name: Span) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let located = run locatedIn(package, module)
+  let listed = List<Shared<Rejection>>.asSlice(&located)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let site = siteOf(&listed[at])
+    let unknown = site.code == RejectionCode.UnknownName || site.code == RejectionCode.UnknownFunction
+      || site.code == RejectionCode.UnknownType || site.code == RejectionCode.UnknownActor
+    if unknown && site.span.start <= name.start && name.end <= site.span.end {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
 // The distinct rejections located in `module`, from every current check of `package`.
 effect fn locatedIn(package: &Package, module: &ModuleId) -> List<Shared<Rejection>>
   ! OutOfMemoryError
@@ -1826,6 +1929,7 @@ effect fn openPackage(path: &[u8], standardLibrary: &Option<Path>, checkouts: &O
           shown: List<ModuleId>.make(),
           cache: move cache,
           saved: usize.ZERO,
+          exports: AutoImports.make(),
         }
       )
     }
@@ -1849,6 +1953,7 @@ effect fn openPackage(path: &[u8], standardLibrary: &Option<Path>, checkouts: &O
           shown: List<ModuleId>.make(),
           cache: Option<CacheFile>.none(),
           saved: usize.ZERO,
+          exports: AutoImports.make(),
         }
       )
     }

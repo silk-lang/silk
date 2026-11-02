@@ -1,0 +1,376 @@
+//! Imports that bring an unresolved name into scope.
+//!
+//! The modules an import of a document can name are found by walking import paths the way
+//! completion lists them, from the first segment down (`ModuleSources.importListing`). A module
+//! offers a name when it declares it public at its top level. What a module declares is read from
+//! its open document's text when it has one, and otherwise from its file once, kept until the file
+//! is saved again.
+//!
+//! The edit adds the name to the member list of an import that already names the module, or else
+//! writes a new import after the document's last import, or after its module comment when it has
+//! no import.
+
+import driver.ModuleSources as Sources { ImportStep, ModuleSources }
+import hir.Hir { HirId, Module, Node }
+import semantic.ModuleId { ModuleId }
+import semantic.ModuleIndex { CandidateKind, ModuleIndex }
+import semantic.SourceUnit { SourceUnit }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.system.filesystem { FileError, FileSystem }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.collections.slice { Slice }
+import silk.num.usize
+
+// How deep below its first segment an import path is walked.
+const DEPTH: usize = 8
+
+/// What the modules one package's imports can name declare, read as they are needed.
+pub struct Exports {
+  modules: List<Declared>,
+
+  // Whether `modules` lists every module the walk reaches; a saved file may add one.
+  walked: bool,
+}
+
+// One module an import can name: its identity, the dotted path an import writes for it, and the
+// names it declares public, once read.
+struct Declared {
+  module: ModuleId,
+  path: Bytes,
+  names: Option<List<Bytes>>,
+}
+
+/// The text of one open document, which wins over its module's file.
+pub struct OpenText {
+  pub module: ModuleId,
+  pub text: Bytes,
+}
+
+/// A module that declares a name public: the dotted path an import writes for it.
+pub struct Offer {
+  pub path: Bytes,
+}
+
+/// Text to insert at a byte offset of the document.
+pub struct Insertion {
+  pub offset: usize,
+  pub text: Bytes,
+}
+
+/// Nothing read yet.
+pub fn make() -> Exports {
+  return Exports { modules: List<Declared>.make(), walked: false }
+}
+
+impl Exports {
+  /// Forgets what `module` declares, and which modules exist, as when its file is saved.
+  pub fn forget(self: &mut Self, module: &ModuleId) -> () {
+    self.walked = false
+    let modules = List<Declared>.asMutSlice(&mut self.modules)
+    let mut at = usize.ZERO
+    while at < modules.length {
+      if ModuleId.equals(&modules[at].module, module) {
+        modules[at].names = Option<List<Bytes>>.none()
+      }
+      at = at + usize.ONE
+    }
+    return ()
+  }
+
+  /// The modules an import written in `importer` can name, other than `importer` itself, that
+  /// declare `name` public at their top level, by the paths their imports write.
+  pub effect fn offers(self: &mut Self, sources: &ModuleSources, importer: &ModuleId, name: &[u8], open: &[OpenText]) -> List<Offer>
+    ! OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator {
+    if !self.walked {
+      run walk(&mut self.*, sources, importer)
+      self.walked = true
+    }
+    let mut offers = List<Offer>.make()
+    let modules = List<Declared>.asMutSlice(&mut self.modules)
+    let mut at = usize.ZERO
+    while at < modules.length {
+      if !ModuleId.equals(&modules[at].module, importer) {
+        let opened = openedText(open, &modules[at].module)
+        let mut declares = false
+        if let Option<&[u8]>.Some { value: text } = move opened {
+          let names = run publicNames(&modules[at].module, run Bytes.copy(text))
+          declares = holds(List<Bytes>.asSlice(&names), name)
+        } else {
+          if let Option<List<Bytes>>.None = &modules[at].names {
+            modules[at].names = Option<List<Bytes>>.some(run fileNames(sources, &modules[at].module))
+          }
+          if let Option<List<Bytes>>.Some { value: names } = &modules[at].names {
+            declares = holds(List<Bytes>.asSlice(&names), name)
+          }
+        }
+        if declares {
+          run List<Offer>.append(&mut offers, Offer { path: run Bytes.copy(Bytes.asSlice(&modules[at].path)) })
+        }
+      }
+      at = at + usize.ONE
+    }
+    return move offers
+  }
+}
+
+// Lists every module an import of `importer` can name, keeping what is already read of those
+// listed before.
+effect fn walk(exports: &mut Exports, sources: &ModuleSources, importer: &ModuleId) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let mut found = List<Declared>.make()
+  // Written paths still to list, their segments joined by `/`, and how deep each is.
+  let mut pending = List<Bytes>.make()
+  let mut depths = List<usize>.make()
+  run List<Bytes>.append(&mut pending, Bytes.make())
+  run List<usize>.append(&mut depths, usize.ZERO)
+  let mut next = usize.ZERO
+  while next < List<Bytes>.length(&pending) {
+    let written = run Bytes.copy(Bytes.asSlice(&List<Bytes>.asSlice(&pending)[next]))
+    let depth = List<usize>.asSlice(&depths)[next]
+    next = next + usize.ONE
+    let listing = run Sources.importListing(sources, importer, Bytes.asSlice(&written))
+    if let Option<ModuleId>.Some { value: barrel } = &listing.barrel {
+      run record(&mut found, &mut exports.*, &barrel, Bytes.asSlice(&written))
+    }
+    let steps = List<ImportStep>.asSlice(&listing.steps)
+    let mut at = usize.ZERO
+    while at < steps.length {
+      let mut path = run Bytes.copy(Bytes.asSlice(&written))
+      if Bytes.length(&path) > usize.ZERO {
+        run Bytes.append(&mut path, b"/")
+      }
+      run Bytes.append(&mut path, Bytes.asSlice(&steps[at].name))
+      if let Option<ModuleId>.Some { value: module } = &steps[at].module {
+        run record(&mut found, &mut exports.*, &module, Bytes.asSlice(&path))
+      }
+      if steps[at].directory && depth < DEPTH {
+        run List<Bytes>.append(&mut pending, move path)
+        run List<usize>.append(&mut depths, depth + usize.ONE)
+      }
+      at = at + usize.ONE
+    }
+  }
+  exports.modules = move found
+  return ()
+}
+
+// Adds `module`, written `path` with its segments joined by `/`, to `found` once, with what
+// `exports` already read of it.
+effect fn record(found: &mut List<Declared>, exports: &mut Exports, module: &ModuleId, path: &[u8]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let listed = List<Declared>.asSlice(&found.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if ModuleId.equals(&listed[at].module, module) {
+      return ()
+    }
+    at = at + usize.ONE
+  }
+  let mut names = Option<List<Bytes>>.none()
+  let known = List<Declared>.asMutSlice(&mut exports.modules)
+  at = usize.ZERO
+  while at < known.length {
+    if ModuleId.equals(&known[at].module, module) {
+      names = Intrinsic.replace(known[at].names, Option<List<Bytes>>.none())
+    }
+    at = at + usize.ONE
+  }
+  let mut dotted = run Bytes.copy(path)
+  let bytes = Bytes.asMutSlice(&mut dotted)
+  at = usize.ZERO
+  while at < bytes.length {
+    if bytes[at] == 47 {
+      bytes[at] = 46
+    }
+    at = at + usize.ONE
+  }
+  run List<Declared>.append(&mut found.*, Declared { module: ModuleId.copy(module), path: move dotted, names: move names })
+  return ()
+}
+
+// The names `module`'s file declares public; none when it cannot be read.
+effect fn fileNames(sources: &ModuleSources, module: &ModuleId) -> List<Bytes>
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let read = run Effect.result(Sources.moduleText(sources, module))
+  let source = match move read {
+    Result<Option<Bytes>, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Option<Bytes>, FileError | OutOfMemoryError>.Failure { error } => match move error {
+      FileError failure => {
+        drop failure
+        return List<Bytes>.make()
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+  if let Option<Bytes>.Some { value } = move source {
+    return run publicNames(module, move value)
+  }
+  return List<Bytes>.make()
+}
+
+// The names `source`, as `module`, declares public at its top level.
+effect fn publicNames(module: &ModuleId, source: Bytes) -> List<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let unit = run SourceUnit.parse(module, usize.ZERO, move source)
+  let index = run ModuleIndex.build(&unit, false)
+  let candidates = ModuleIndex.listCandidates(&index)
+  let mut names = List<Bytes>.make()
+  let mut at = usize.ZERO
+  while at < candidates.length {
+    if candidates[at].isPublic && candidates[at].kind == CandidateKind.Declaration {
+      run List<Bytes>.append(&mut names, run Bytes.copy(Bytes.asSlice(&candidates[at].name)))
+    }
+    at = at + usize.ONE
+  }
+  return move names
+}
+
+fn openedText<'a>(open: &'a [OpenText], module: &ModuleId) -> Option<&'a [u8]> {
+  let mut at = usize.ZERO
+  while at < open.length {
+    if ModuleId.equals(&open[at].module, module) {
+      return Option<&'a [u8]>.some(Bytes.asSlice(&open[at].text))
+    }
+    at = at + usize.ONE
+  }
+  return Option<&'a [u8]>.none()
+}
+
+/// Where to write `name` so that `unit`'s module imports it from the module written `path`: into
+/// the member list of an import of that path, or as a new import. None when an import of the path
+/// selects no members, since adding a list would stop it naming the module.
+pub effect fn insertion(unit: &SourceUnit, path: &[u8], name: &[u8]) -> Option<Insertion>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let hir = &unit.authored
+  let text = SourceUnit.bytes(unit)
+  let index = run ModuleIndex.build(unit, false)
+  let declarations = ModuleIndex.listDeclarations(&index)
+  let mut last = usize.MAX
+  let mut at = usize.ZERO
+  while at < declarations.length {
+    if let Node.ImportHeader { path: written, members, .. } = Module.node(hir, declarations[at].header) {
+      last = Module.span(hir, declarations[at].header).end
+      if spells(hir, written, path) {
+        if !members.present {
+          return Option<Insertion>.none()
+        }
+        let header = Module.span(hir, declarations[at].header)
+        if members.range.length == usize.ZERO {
+          // `{}`: the name goes just inside the brace.
+          let mut brace = header.end
+          while brace > header.start && text[brace - usize.ONE] != 125 {
+            brace = brace - usize.ONE
+          }
+          if brace > header.start {
+            brace = brace - usize.ONE
+          }
+          return Option<Insertion>.some(Insertion { offset: brace, text: run Bytes.copy(name) })
+        }
+        let closing = Module.child(hir, members.range, members.range.length - usize.ONE)
+        let mut written = run Bytes.copy(b", ")
+        run Bytes.append(&mut written, name)
+        return Option<Insertion>.some(Insertion { offset: Module.span(hir, closing).end, text: move written })
+      }
+    }
+    at = at + usize.ONE
+  }
+  let mut line = run Bytes.copy(b"import ")
+  run Bytes.append(&mut line, path)
+  run Bytes.append(&mut line, b" { ")
+  run Bytes.append(&mut line, name)
+  run Bytes.append(&mut line, b" }")
+  if last != usize.MAX {
+    let mut written = run Bytes.copy(b"\n")
+    run Bytes.append(&mut written, Bytes.asSlice(&line))
+    return Option<Insertion>.some(Insertion { offset: last, text: move written })
+  }
+  // No import yet: after the module comment and a blank line, or first with one after it.
+  let after = moduleCommentEnd(text)
+  if after == usize.ZERO {
+    run Bytes.append(&mut line, b"\n\n")
+    return Option<Insertion>.some(Insertion { offset: usize.ZERO, text: move line })
+  }
+  let mut written = run Bytes.copy(b"\n")
+  run Bytes.append(&mut written, Bytes.asSlice(&line))
+  run Bytes.append(&mut written, b"\n")
+  return Option<Insertion>.some(Insertion { offset: after, text: move written })
+}
+
+// The offset just after the leading lines of `text` that start with `//!`.
+fn moduleCommentEnd(text: &[u8]) -> usize {
+  let mut at = usize.ZERO
+  while at + 3 <= text.length && text[at] == 47 && text[at + usize.ONE] == 47 && text[at + 2] == 33 {
+    while at < text.length && text[at] != 10 {
+      at = at + usize.ONE
+    }
+    if at < text.length {
+      at = at + usize.ONE
+    }
+  }
+  return at
+}
+
+// Whether the import path `written` spells `path`, its segments joined by `.`.
+fn spells(hir: &Module, written: HirId, path: &[u8]) -> bool {
+  if let Node.Path { segments } = Module.node(hir, written) {
+    let mut offset = usize.ZERO
+    let mut at = usize.ZERO
+    while at < segments.length {
+      if at > usize.ZERO {
+        if offset >= path.length || path[offset] != 46 {
+          return false
+        }
+        offset = offset + usize.ONE
+      }
+      if let Node.Name { text } = Module.node(hir, Module.child(hir, segments, at)) {
+        let segment = Module.text(hir, text)
+        if offset + segment.length > path.length || !same(Slice.view<u8>(path, offset, segment.length), segment) {
+          return false
+        }
+        offset = offset + segment.length
+      } else {
+        return false
+      }
+      at = at + usize.ONE
+    }
+    return offset == path.length
+  }
+  return false
+}
+
+fn holds(names: &[Bytes], name: &[u8]) -> bool {
+  let mut at = usize.ZERO
+  while at < names.length {
+    if same(Bytes.asSlice(&names[at]), name) {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
