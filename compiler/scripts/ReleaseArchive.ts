@@ -155,7 +155,7 @@ const zip = (entries: ReadonlyArray<Entry>): Uint8Array | undefined => {
 }
 
 // The directory and file members below `root`, as `<base>/<relative path>`, in sorted path order.
-const tree = Effect.fnUntraced(function* (root: string, base: string) {
+export const tree = Effect.fnUntraced(function* (root: string, base: string) {
   const fs = yield* FileSystem.FileSystem
   const entries: Array<Entry> = [{ _tag: 'Directory', path: base }]
   const paths = [...(yield* fs.readDirectory(root, { recursive: true }))].sort()
