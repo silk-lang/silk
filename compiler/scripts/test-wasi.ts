@@ -95,6 +95,23 @@ const program = Effect.gen(function* () {
     assert.equal(ran.status, 0, ran.stderr.toString())
     assert.equal(ran.stdout.toString(), 'gather:ab\nwasi services passed\n')
     assert.equal(ran.stderr.toString(), 'wasi stderr\n')
+    // A project build keeps its translated bodies, and an edit runs the edited body, not a cached one.
+    const project = Effect.fnUntraced(function* (status: number) {
+      yield* fs.writeFileString(
+        join(directory, 'main.silk'),
+        `fn status() -> i32 { return ${status} }\npub fn main() -> i32 { return status() }\n`,
+      )
+      const rebuilt = yield* invoke(compiler, ['build', '--target', 'wasm32-wasip1', '--backend', 'direct', '--stdlib', join(repo, 'stdlib')], {
+        env: { ...env, SILK_CLANG: '/nonexistent' },
+      })
+      assert.equal(rebuilt.status, 0, rebuilt.stderr.toString())
+      const built = join(directory, 'build/llvm/wasm32-wasip1/debug/wasi-test')
+      assert.ok(yield* fs.exists(`${built}.units/code`), 'the build keeps its code cache')
+      const exited = yield* invoke(wasmtime, ['run', built])
+      assert.equal(exited.status, status, exited.stderr.toString())
+    })
+    yield* project(3)
+    yield* project(4)
   }
   for (const target of ['wasm32-wasip1', 'wasm32-wasip2']) {
     yield* fs.writeFileString(join(directory, 'main.silk'), source)

@@ -80,8 +80,9 @@ import driver.LinuxLink
 import driver.CodegenCache
 import backend.Bitcode
 import backend.BitcodeText
-import backend.WasmCode {Unsupported}
-import driver.WasmLink
+import backend.WasmCode {Translated, Unsupported}
+import driver.WasmLink as WasmLink {Linked}
+import driver.WasmCodeCache {CodeCache}
 import backend.Bitcode {DebugFunction, DebugInfo, MarkedFunction, Module as BitcodeModule}
 import backend.Mir as MirNames
 import driver.InstalledCompiler
@@ -2751,21 +2752,73 @@ effect fn wasmProfileFlags(flags: &mut List<Bytes>, profile: &InitialProfile, ma
 
 // Links the program `text` with the direct backend and writes the module to `output`, or refuses
 // what it cannot build yet; answers the build's status.
-effect fn linkDirect(text: &Bytes, output: &Path, target: &Target, form: Form, stage: Stage, maxMemory: u64, heading: &Option<Bytes>,
-  headed: &mut bool, progress: &mut Progress) -> i32 ! FileError | WriterError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+effect fn linkDirect(text: &Bytes, output: &Path, target: &Target, form: Form, stage: Stage, maxMemory: u64, compiler: &Option<Bytes>,
+  functionNames: &FunctionNames, plan: &EmissionPlan, sources: &ModuleSources, heading: &Option<Bytes>, headed: &mut bool, progress: &mut Progress) -> i32 ! FileError | WriterError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
   if form != Form.Executable || stage != Stage.Final || Target.id(target) == TargetId.Wasm32Wasip2 {
     run writeHeaded(heading, &mut headed.*, b"silk: the direct backend builds wasm32-unknown-unknown and wasm32-wasip1 executables only; use --backend llvm for this output\n", &mut progress.*)
     return 2
   }
   let _linking = Profiler.zone(b"linkDirect")
-  let module = run Bitcode.programModule(Bytes.asSlice(text))
+  // The link reads each body from its own fragment.
+  let module = run Bitcode.programDeclarations(Bytes.asSlice(text))
   let wasi = same(Target.operatingSystem(target), b"wasi")
-  match move run Effect.result(WasmLink.link(&module, wasi, maxMemory)) {
-    Result<Bytes, Unsupported | OutOfMemoryError>.Success {value} => {
-      run FileSystem.writeFile(output, Bytes.asSlice(&value))
+  // The code cache in the output's cache directory (`WasmCodeCache`), kept only by a compiler
+  // that knows its own identity.
+  let units = run CodegenCache.directoryFor(output)
+  let cacheFile = run Path.joinBytes(&units, b"code")
+  let mut previous = CodeCache.make()
+  if let Option<Bytes>.Some {value: identity} = &compiler.* {
+    match move run Effect.result(FileSystem.readFile(&cacheFile)) {
+      Result<Bytes, FileError | OutOfMemoryError>.Success {value} => {
+        previous = run CodeCache.decode(Bytes.asSlice(&value), Bytes.asSlice(&identity))
+      }
+      Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+        FileError missing => { drop missing }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+  }
+  // A debug build names its functions as the source does (`WasmNames`).
+  let named = FunctionNames.length(functionNames) > usize.ZERO
+  match move run Effect.result(WasmLink.link(Bytes.asSlice(text), &module, &previous, wasi, maxMemory, named)) {
+    Result<Linked, Unsupported | OutOfMemoryError>.Success {value} => {
+      let mut module = move value.output
+      if named {
+        if let Option<Bytes>.Some {value: renamed} = move run WasmNames.rename(Bytes.asSlice(&module), functionNames) { module = move renamed }
+      }
+      // A debug browser module maps its code to the source in `<output>.map` (`WasmDebug`), as
+      // the LLVM backend's does.
+      if named && Target.id(target) == TargetId.Wasm32UnknownUnknown {
+        let outputName = Path.rawBytes(output)
+        let mut nameStart = outputName.length
+        while nameStart > usize.ZERO && outputName[nameStart - usize.ONE] != 47 { nameStart = nameStart - usize.ONE }
+        let mut mapName = run Bytes.copy(Slice.view<u8>(outputName, nameStart, outputName.length - nameStart))
+        run Bytes.append(&mut mapName, b".map")
+        let mut mapPath = run Bytes.copy(outputName)
+        run Bytes.append(&mut mapPath, b".map")
+        let map = run directSourceMap(List<u64>.asSlice(&value.lines), value.cache.allBodies(), plan, sources)
+        run FileSystem.writeFile(&run Path.fromBytes(Bytes.asSlice(&mapPath)), Bytes.asSlice(&map))
+        run WasmDebug.appendMapUrl(&mut module, Bytes.asSlice(&mapName))
+      }
+      // An unchanged module is left alone, so a build that changes nothing writes nothing.
+      if value.translated > usize.ZERO || !run holds(output, Bytes.asSlice(&module)) {
+        run FileSystem.writeFile(output, Bytes.asSlice(&module))
+      }
+      if let Option<Bytes>.Some {value: identity} = &compiler.* {
+        if value.translated > usize.ZERO || previous.fragments() != value.cache.fragments() {
+          let created = run Effect.result(FileSystem.createDirectoriesRecursively(&units))
+          drop created
+          run FileSystem.writeFile(&cacheFile, Bytes.asSlice(&run CodeCache.encode(&value.cache, Bytes.asSlice(&identity))))
+        }
+      }
+      // The link reads nothing outside the build, so the build can be recorded for reuse
+      // (`recordBuild`), and no other backend's stamp stays to describe this output.
+      let mut command = run Bytes.copy(b"silk direct link ")
+      run Bytes.append(&mut command, Target.name(target))
+      run CodegenCache.recordLink(&units, Bytes.asSlice(&command), output)
       return 0
     }
-    Result<Bytes, Unsupported | OutOfMemoryError>.Failure {error} => match move error {
+    Result<Linked, Unsupported | OutOfMemoryError>.Failure {error} => match move error {
       Unsupported refused => {
         let mut message = run Bytes.copy(b"silk: the direct backend cannot build this program yet: ")
         run Bytes.append(&mut message, Bytes.asSlice(&refused.detail))
@@ -2776,6 +2829,55 @@ effect fn linkDirect(text: &Bytes, output: &Path, target: &Target, form: Form, s
       OutOfMemoryError exhausted => { fail move exhausted }
     }
   }
+}
+
+// The source map of a direct link's `lines` (`WasmLink.Linked`): each body's places in the file of
+// the module that declares it, with each file's text.
+effect fn directSourceMap(lines: &[u64], bodies: &[Translated], plan: &EmissionPlan, sources: &ModuleSources) -> Bytes
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut table = LineTable.make()
+  let mut modules = List<ModuleId>.make()
+  let mut files = List<usize>.make()
+  // The source of the body each row is in, found once per body.
+  let mut lastBody = u64.MAX
+  let mut source = usize.MAX
+  let mut at = usize.ZERO
+  while at + 2 < lines.length {
+    if lines[at + usize.ONE] != lastBody {
+      lastBody = lines[at + usize.ONE]
+      source = usize.MAX
+      let identity = EmissionPlan.identityOfSymbol(plan, Bytes.asSlice(&bodies[u64.toUsize(lastBody)].symbol))
+      if identity != usize.MAX {
+        let owner = DeclarationId.moduleId(EmissionPlan.identityDeclaration(plan, identity))
+        let known = List<ModuleId>.asSlice(&modules)
+        let mut file = usize.ZERO
+        while file < known.length && !ModuleId.equals(&known[file], owner) { file = file + usize.ONE }
+        if file == known.length {
+          let location = run ModuleSourceFiles.sourceLocation(sources, owner)
+          let mut path = Bytes.make()
+          if let Option<Path>.Some {value: found} = &location.path { path = run Bytes.copy(Path.rawBytes(&found)) }
+          run List<ModuleId>.append(&mut modules, ModuleId.copy(owner))
+          run List<usize>.append(&mut files, run LineTable.addSource(&mut table, Bytes.asSlice(&path)))
+        }
+        source = List<usize>.get(&files, file)
+      }
+    }
+    let place = lines[at + 2]
+    if source == usize.MAX || place == 0 {
+      run LineTable.addRow(&mut table, u64.toUsize(lines[at]), usize.ZERO, usize.ZERO, usize.ZERO)
+    } else {
+      run LineTable.addRow(&mut table, u64.toUsize(lines[at]), source, u64.toUsize(u64.shiftRight(place, 24)), u64.toUsize(place & 16777215))
+    }
+    at = at + 3
+  }
+  let mut contents = List<Option<Bytes>>.make()
+  let paths = LineTable.paths(&table)
+  at = usize.ZERO
+  while at < paths.length {
+    run List<Option<Bytes>>.append(&mut contents, run readable(Bytes.asSlice(&paths[at])))
+    at = at + usize.ONE
+  }
+  return run WasmDebug.sourceMap(&table, List<Option<Bytes>>.asSlice(&contents))
 }
 
 // Gives up `value` without dropping it, for a process about to exit: what it owns is left for the
@@ -3050,9 +3152,10 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, cacheDirectory: Opti
       if debug && stage == Stage.Final && form == Form.Executable && same(Target.objectFormat(&target), b"wasm") {
         functionNames = run readableNames(&plan)
       }
-      // A debug build of the whole program also carries line tables.
+      // A debug build of the whole program also carries line tables, which the direct backend
+      // does not write.
       let mut debugInfo = Bytes.make()
-      if debug && !split && stage != Stage.LlvmIr {
+      if debug && !split && stage != Stage.LlvmIr && !direct {
         let module = run Bitcode.programModule(Bytes.asSlice(&text))
         debugInfo = run debugInfoOf(&plan, &sources, &module, !same(Bytes.asSlice(&optimization), b"none"))
       }
@@ -3071,7 +3174,7 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, cacheDirectory: Opti
         return Compiled.Finished {status: 0}
       }
       if direct {
-        let directStatus = run linkDirect(&text, output, &target, form, stage, directLimit, heading, &mut headed, &mut progress.*)
+        let directStatus = run linkDirect(&text, output, &target, form, stage, directLimit, &compiler, &functionNames, &plan, &sources, heading, &mut headed, &mut progress.*)
         if directStatus == 0 && receipts { run reportCompiled(display, sourcePath, output, &target, EmissionPlan.symbolCount(&plan), b"direct") }
         return Compiled.Finished {status: directStatus}
       }
