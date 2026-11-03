@@ -1,7 +1,11 @@
-//! The direct backend's link: lays out a whole program's `Bitcode.Module` as one WebAssembly
-//! module, without Clang or `wasm-ld`.
+//! The direct backend's link: lays out a whole program as one WebAssembly module, without Clang
+//! or `wasm-ld`.
 //!
 //! # Details
+//! Each fragment's bodies are translated alone (`WasmCode.translate`), or taken from the last
+//! link's code cache when the fragment's bytes did not change (`WasmCodeCache`). The program's
+//! merged declarations place every global, and the link writes each relocation a body left.
+//!
 //! The layout matches what `wasm-ld` makes of the same program, so the stdlib's wasm support
 //! modules need no second form:
 //!
@@ -16,7 +20,11 @@
 import backend.Bitcode
 import backend.Bitcode {Module}
 import backend.WasmCode
-import backend.WasmCode {Placement, Translated, Unsupported}
+import backend.WasmCode {Placement, Relocation, RelocationKind, Translated, Unsupported, Value}
+import driver.WasmCodeCache
+import driver.WasmCodeCache {CodeCache}
+import semantic.ContentHash {ContentHash}
+import semantic.InternIndex {InternIndex}
 import backend.WasmModule
 import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.collections.bytes {Bytes}
@@ -118,25 +126,31 @@ struct Import {
   name: Bytes,
 }
 
-/// Links `module`, a whole program, as a WebAssembly module. `wasi` exports `_start` as the entry
-/// instead of `main`; `maxMemory` bounds the memory in bytes, or is zero for no bound.
-pub effect fn link(module: &Module, wasi: bool, maxMemory: u64) -> Bytes ! Unsupported | OutOfMemoryError ? &mut Allocator {
+/// What a link made: the module's bytes, the code cache for the next link, and how many
+/// fragments it translated rather than reused.
+pub struct Linked {
+  pub output: Bytes,
+  pub cache: CodeCache,
+  pub translated: usize,
+  /// Where the code comes from, by module offset: triples of the offset, the body in the cache's
+  /// `allBodies` and the source place, `line << 24 | column`, or zero where a body starts and no
+  /// place is known yet.
+  pub lines: List<u64>,
+}
+
+/// Links the program `fragments`, whose merged module is `module`, as a WebAssembly module. A
+/// fragment `previous` holds is not translated again. `wasi` exports `_start` as the entry instead
+/// of `main`; `maxMemory` bounds the memory in bytes, or is zero for no bound. `named` adds a
+/// `name` section naming each function by its symbol, as `wasm-ld` does.
+pub effect fn link(fragments: &[u8], module: &Module, previous: &CodeCache, wasi: bool, maxMemory: u64, named: bool) -> Linked
+! Unsupported | OutOfMemoryError ? &mut Allocator {
   let globals = module.globalCount()
   let mut placement = run Placement.make(globals)
-  // Each defined function's body.
-  let mut bodyOf = run List<usize>.makeWithCapacity(globals)
-  run List<usize>.appendRepeated(&mut bodyOf, usize.MAX, globals)
-  let mut body = usize.ZERO
-  while body < module.bodyCount() {
-    let global = module.bodyGlobal(body)
-    if List<usize>.get(&bodyOf, global) == usize.MAX { List<usize>.set(&mut bodyOf, global, body) }
-    body = body + usize.ONE
-  }
   // Imports first: every function without a body that names a wasm import.
   let mut imports = List<Import>.make()
   let mut global = usize.ZERO
   while global < globals {
-    if module.isFunction(global) && List<usize>.get(&bodyOf, global) == usize.MAX && !startsWith(module.globalName(global), b"llvm.") {
+    if module.isFunction(global) && !module.isDefined(global) && !startsWith(module.globalName(global), b"llvm.") {
       let importModule = run functionAttribute(module, global, b"wasm-import-module")
       let importName = run functionAttribute(module, global, b"wasm-import-name")
       if Bytes.length(&importModule) > usize.ZERO && Bytes.length(&importName) > usize.ZERO {
@@ -147,20 +161,47 @@ pub effect fn link(module: &Module, wasi: bool, maxMemory: u64) -> Bytes ! Unsup
     global = global + usize.ONE
   }
   let importCount = List<Import>.length(&imports)
-  // Then the bodies, in order.
-  let mut defined = List<usize>.make()
-  body = usize.ZERO
-  while body < module.bodyCount() {
-    let owner = module.bodyGlobal(body)
-    if List<usize>.get(&bodyOf, owner) == body {
-      List<usize>.set(&mut placement.functions, owner, importCount + List<usize>.length(&defined))
-      run List<usize>.append(&mut defined, body)
+  // Then each fragment's bodies, in order, translated or reused. A function two fragments define
+  // keeps its first body, as the merge does.
+  let mut cache = CodeCache.make()
+  let mut translated = usize.ZERO
+  let mut at = usize.ZERO
+  while at < fragments.length {
+    let end = Bitcode.fragmentEnd(fragments, at)
+    let hash = ContentHash.of(Slice.view<u8>(fragments, at, end - at))
+    let reused = previous.find(hash)
+    run CodeCache.start(&mut cache, hash)
+    if reused != usize.MAX {
+      let kept = previous.bodiesOf(reused)
+      let mut body = usize.ZERO
+      while body < kept.length {
+        run CodeCache.append(&mut cache, run WasmCodeCache.copy(&kept[body]))
+        body = body + usize.ONE
+      }
+      at = end
+    } else {
+      let fragment = run Module.read(fragments, &mut at)
+      let mut body = usize.ZERO
+      while body < fragment.bodyCount() {
+        run CodeCache.append(&mut cache, run WasmCode.translate(&fragment, body))
+        body = body + usize.ONE
+      }
+      translated = translated + usize.ONE
     }
-    body = body + usize.ONE
   }
-  placement.fmod = module.find(b"fmod")
-  placement.fmodf = module.find(b"fmodf")
-  placement.multiply = module.find(b"__multi3")
+  let bodies = cache.allBodies()
+  let mut defined = List<usize>.make()
+  let mut owners = List<usize>.make()
+  at = usize.ZERO
+  while at < bodies.length {
+    let owner = module.find(Bytes.asSlice(&bodies[at].symbol))
+    if owner != usize.MAX && List<usize>.get(&placement.functions, owner) == usize.MAX {
+      List<usize>.set(&mut placement.functions, owner, importCount + List<usize>.length(&defined))
+      run List<usize>.append(&mut defined, at)
+      run List<usize>.append(&mut owners, owner)
+    }
+    at = at + usize.ONE
+  }
   // The data: the frame table's entries together, then every other defined object.
   let mut cursor = stackTop()
   let mut framesStart = u64.MAX
@@ -220,33 +261,217 @@ pub effect fn link(module: &Module, wasi: bool, maxMemory: u64) -> Bytes ! Unsup
     }
     global = global + usize.ONE
   }
-  // The code.
-  let listedBodies = List<usize>.asSlice(&defined)
-  let mut entries = run List<Translated>.makeWithCapacity(listedBodies.length)
-  let mut at = usize.ZERO
-  while at < listedBodies.length {
-    run List<Translated>.append(&mut entries, run WasmCode.translate(module, listedBodies[at], &mut placement))
-    at = at + usize.ONE
-  }
+  // The function types: the imports', then each body's as the code names them.
+  let mut types = Types {encodings: List<Bytes>.make(), lookup: InternIndex.make()}
   let mut importTypes = List<usize>.make()
   let listedImports = List<Import>.asSlice(&imports)
   at = usize.ZERO
   while at < listedImports.length {
     let importGlobal = listedImports[at].global
     let signature = run WasmCode.signatureOf(module, module.globalType(importGlobal), module.globalName(importGlobal))
-    run List<usize>.append(&mut importTypes, run Placement.typeIndex(&mut placement, Bytes.asSlice(&signature)))
+    run List<usize>.append(&mut importTypes, run types.index(Bytes.asSlice(&signature)))
     at = at + usize.ONE
   }
-  return run assemble(module, &placement, listedImports, List<usize>.asSlice(&importTypes), listedBodies, List<Translated>.asSlice(&entries),
-    &image, dataEnd, wasi, maxMemory)
+  // The code, each relocation filled in. A call to a weak function nothing defines calls a stub
+  // that traps, as `wasm-ld` makes it.
+  let mut stubs = Stubs {globals: List<usize>.make(), first: importCount + List<usize>.length(&defined)}
+  let listed = List<usize>.asSlice(&defined)
+  // Triples of an entry, an offset in it and a source place, turned into module offsets once the
+  // code section is laid out.
+  let mut rows = List<u64>.make()
+  let mut entries = run List<Bytes>.makeWithCapacity(listed.length)
+  let mut typeIndices = run List<usize>.makeWithCapacity(listed.length)
+  at = usize.ZERO
+  while at < listed.length {
+    let body = &bodies[listed[at]]
+    run List<usize>.append(&mut typeIndices, run types.index(Bytes.asSlice(&List<Bytes>.asSlice(&body.signatures)[body.signature])))
+    // A body's code has no known place until its first location.
+    run List<u64>.append(&mut rows, usize.toU64(at))
+    run List<u64>.append(&mut rows, 0)
+    run List<u64>.append(&mut rows, 0)
+    run List<Bytes>.append(&mut entries, run relocated(module, body, &mut placement, &mut types, &mut stubs, &mut rows, at))
+    at = at + usize.ONE
+  }
+  let stubbed = List<usize>.asSlice(&stubs.globals)
+  at = usize.ZERO
+  while at < stubbed.length {
+    let signature = run WasmCode.signatureOf(module, module.globalType(stubbed[at]), module.globalName(stubbed[at]))
+    run List<usize>.append(&mut typeIndices, run types.index(Bytes.asSlice(&signature)))
+    run List<Bytes>.append(&mut entries, run Bytes.copy(&[0, WasmModule.opUnreachable(), WasmModule.opEnd()]))
+    at = at + usize.ONE
+  }
+  let mut starts = List<usize>.make()
+  let mut output = run assemble(module, &placement, List<Bytes>.asSlice(&types.encodings), listedImports, List<usize>.asSlice(&importTypes),
+    List<usize>.asSlice(&owners), List<usize>.asSlice(&typeIndices), List<Bytes>.asSlice(&entries), &image, dataEnd, wasi, maxMemory, &mut starts)
+  // Rows from entry offsets to module offsets, each body's from its entry's start.
+  let mut lines = run List<u64>.makeWithCapacity(List<u64>.length(&rows))
+  let triples = List<u64>.asSlice(&rows)
+  let startOf = List<usize>.asSlice(&starts)
+  let mut row = usize.ZERO
+  while row < triples.length {
+    let entry = u64.toUsize(triples[row])
+    run List<u64>.append(&mut lines, usize.toU64(startOf[entry]) + triples[row + usize.ONE])
+    run List<u64>.append(&mut lines, usize.toU64(listed[entry]))
+    run List<u64>.append(&mut lines, triples[row + 2])
+    row = row + 3
+  }
+  if named {
+    // Function names, by index: the imports, the bodies, then the stubs.
+    let mut functions = Bytes.make()
+    run WasmModule.index(&mut functions, listedImports.length + listed.length + stubbed.length)
+    let mut index = usize.ZERO
+    at = usize.ZERO
+    while at < listedImports.length {
+      run WasmModule.index(&mut functions, index)
+      run WasmModule.name(&mut functions, module.globalName(listedImports[at].global))
+      index = index + usize.ONE
+      at = at + usize.ONE
+    }
+    at = usize.ZERO
+    while at < listed.length {
+      run WasmModule.index(&mut functions, index)
+      run WasmModule.name(&mut functions, Bytes.asSlice(&bodies[listed[at]].symbol))
+      index = index + usize.ONE
+      at = at + usize.ONE
+    }
+    at = usize.ZERO
+    while at < stubbed.length {
+      run WasmModule.index(&mut functions, index)
+      run WasmModule.name(&mut functions, module.globalName(stubbed[at]))
+      index = index + usize.ONE
+      at = at + usize.ONE
+    }
+    let mut names = Bytes.make()
+    run WasmModule.name(&mut names, b"name")
+    run WasmModule.byte(&mut names, 1)
+    run WasmModule.index(&mut names, Bytes.length(&functions))
+    run Bytes.append(&mut names, Bytes.asSlice(&functions))
+    run WasmModule.section(&mut output, 0, &names)
+  }
+  return Linked {output: move output, cache: move cache, translated: translated, lines: move lines}
 }
 
-effect fn assemble(module: &Module, placement: &Placement, imports: &[Import], importTypes: &[usize], bodies: &[usize], entries: &[Translated],
-  image: &Bytes, dataEnd: u64, wasi: bool, maxMemory: u64) -> Bytes ! Unsupported | OutOfMemoryError ? &mut Allocator {
+/// The interned function types: each one's encoding, `0x60`, parameters and results.
+struct Types {
+  encodings: List<Bytes>,
+  lookup: InternIndex,
+}
+
+impl Types {
+  /// The index of the function type encoded as `encoding`, interning it on first use.
+  effect fn index(self: &mut Self, encoding: &[u8]) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let hash = InternIndex.hashBytes(0, encoding)
+    let mut at = InternIndex.first(&self.lookup, hash)
+    while at != usize.MAX {
+      if same(Bytes.asSlice(&List<Bytes>.asSlice(&self.encodings)[at]), encoding) { return at }
+      at = InternIndex.after(&self.lookup, at)
+    }
+    let index = List<Bytes>.length(&self.encodings)
+    run List<Bytes>.append(&mut self.encodings, run Bytes.copy(encoding))
+    run InternIndex.record(&mut self.lookup, hash)
+    return index
+  }
+}
+
+/// The weak functions nothing defines that the code calls, numbered from `first`.
+struct Stubs {
+  globals: List<usize>,
+  first: usize,
+}
+
+// The function index a call to global `global` of `module` reaches.
+effect fn callee(module: &Module, global: usize, placement: &mut Placement, stubs: &mut Stubs, symbol: &[u8]) -> usize
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let index = List<usize>.get(&placement.functions, global)
+  if index != usize.MAX { return index }
+  if module.isFunction(global) && module.globalLinkage(global) == Bitcode.linkExternWeak() {
+    let stub = stubs.first + List<usize>.length(&stubs.globals)
+    run List<usize>.append(&mut stubs.globals, global)
+    List<usize>.set(&mut placement.functions, global, stub)
+    return stub
+  }
+  let mut what = run Bytes.copy(b"a call to the undefined function ")
+  run Bytes.append(&mut what, module.globalName(global))
+  return run WasmCode.unsupported(Bytes.asSlice(&what), symbol)
+}
+
+// `body`'s code entry with each relocation's immediate written in.
+// Appends to `rows`, as triples of `index`, an offset in the entry and a source place, where each
+// of the body's locations lands.
+effect fn relocated(module: &Module, body: &Translated, placement: &mut Placement, types: &mut Types, stubs: &mut Stubs, rows: &mut List<u64>,
+  index: usize) -> Bytes
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let symbol = Bytes.asSlice(&body.symbol)
+  // Each symbol's global, found once.
+  let names = List<Bytes>.asSlice(&body.symbols)
+  let mut targets = run List<usize>.makeWithCapacity(names.length)
+  let mut at = usize.ZERO
+  while at < names.length {
+    let found = module.find(Bytes.asSlice(&names[at]))
+    if found == usize.MAX {
+      let mut what = run Bytes.copy(b"a reference to the undefined global ")
+      run Bytes.append(&mut what, Bytes.asSlice(&names[at]))
+      run WasmCode.unsupported(Bytes.asSlice(&what), symbol)
+    }
+    run List<usize>.append(&mut targets, found)
+    at = at + usize.ONE
+  }
+  let entry = Bytes.asSlice(&body.entry)
+  let relocations = List<Relocation>.asSlice(&body.relocations)
+  let mut out = run Bytes.makeWithCapacity(entry.length + relocations.length * 3)
+  let locations = List<u64>.asSlice(&body.locations)
+  let mut located = usize.ZERO
+  let mut copied = usize.ZERO
+  at = usize.ZERO
+  while at < relocations.length {
+    let relocation = relocations[at]
+    run placeRows(&mut rows.*, index, locations, &mut located, relocation.offset, Bytes.length(&out), copied)
+    run Bytes.append(&mut out, Slice.view<u8>(entry, copied, relocation.offset - copied))
+    copied = relocation.offset
+    match relocation.kind {
+      RelocationKind.Call => {
+        run WasmModule.index(&mut out, run callee(module, List<usize>.get(&targets, relocation.target), &mut placement.*, &mut stubs.*, symbol))
+      }
+      RelocationKind.Signature => {
+        run WasmModule.index(&mut out, run types.index(Bytes.asSlice(&List<Bytes>.asSlice(&body.signatures)[relocation.target])))
+      }
+      RelocationKind.Address => {
+        let value = Value {bits: relocation.addend, global: List<usize>.get(&targets, relocation.target)}
+        let mut low = run WasmCode.resolvedBits(module, value, &mut placement.*, symbol)
+        if (low & 2147483648) != 0 { low = low | 18446744069414584320 }
+        run WasmModule.signed(&mut out, low)
+      }
+      RelocationKind.WideAddress => {
+        let value = Value {bits: relocation.addend, global: List<usize>.get(&targets, relocation.target)}
+        run WasmModule.signed(&mut out, run WasmCode.resolvedBits(module, value, &mut placement.*, symbol))
+      }
+    }
+    at = at + usize.ONE
+  }
+  run placeRows(&mut rows.*, index, locations, &mut located, entry.length, Bytes.length(&out), copied)
+  run Bytes.append(&mut out, Slice.view<u8>(entry, copied, entry.length - copied))
+  return move out
+}
+
+// Appends a row for each location from `located` up to entry offset `limit`, where the entry's
+// bytes from `copied` land in the output from `written`.
+effect fn placeRows(rows: &mut List<u64>, index: usize, locations: &[u64], located: &mut usize, limit: usize, written: usize, copied: usize) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  while located.* + usize.ONE < locations.length && locations[located.*] <= usize.toU64(limit) {
+    run List<u64>.append(&mut rows.*, usize.toU64(index))
+    run List<u64>.append(&mut rows.*, usize.toU64(written) + locations[located.*] - usize.toU64(copied))
+    run List<u64>.append(&mut rows.*, locations[located.* + usize.ONE])
+    located.* = located.* + 2
+  }
+  return ()
+}
+
+effect fn assemble(module: &Module, placement: &Placement, types: &[Bytes], imports: &[Import], importTypes: &[usize], owners: &[usize],
+  typeIndices: &[usize], entries: &[Bytes], image: &Bytes, dataEnd: u64, wasi: bool, maxMemory: u64, starts: &mut List<usize>) -> Bytes
+! Unsupported | OutOfMemoryError ? &mut Allocator {
   let mut out = Bytes.make()
   run WasmModule.header(&mut out)
   // Types.
-  let types = List<Bytes>.asSlice(&placement.types)
   let mut section = Bytes.make()
   run WasmModule.index(&mut section, types.length)
   let mut at = usize.ZERO
@@ -274,7 +499,7 @@ effect fn assemble(module: &Module, placement: &Placement, imports: &[Import], i
   run WasmModule.index(&mut section, entries.length)
   at = usize.ZERO
   while at < entries.length {
-    run WasmModule.index(&mut section, entries[at].typeIndex)
+    run WasmModule.index(&mut section, typeIndices[at])
     at = at + usize.ONE
   }
   run WasmModule.section(&mut out, WasmModule.functionSection(), &section)
@@ -320,8 +545,8 @@ effect fn assemble(module: &Module, placement: &Placement, imports: &[Import], i
   let mut entryName: &[u8] = b"main"
   if wasi { entryName = b"_start" }
   at = usize.ZERO
-  while at < bodies.length {
-    let global = module.bodyGlobal(bodies[at])
+  while at < owners.length {
+    let global = owners[at]
     let mut exported = run functionAttribute(module, global, b"wasm-export-name")
     if Bytes.length(&exported) == usize.ZERO && same(module.globalName(global), entryName) { exported = run Bytes.copy(entryName) }
     if Bytes.length(&exported) > usize.ZERO && !listed(List<Bytes>.asSlice(&exportNames), Bytes.asSlice(&exported)) {
@@ -356,11 +581,20 @@ effect fn assemble(module: &Module, placement: &Placement, imports: &[Import], i
   run WasmModule.index(&mut section, entries.length)
   at = usize.ZERO
   while at < entries.length {
-    run WasmModule.index(&mut section, Bytes.length(&entries[at].entry))
-    run Bytes.append(&mut section, Bytes.asSlice(&entries[at].entry))
+    run WasmModule.index(&mut section, Bytes.length(&entries[at]))
+    run List<usize>.append(&mut starts.*, Bytes.length(&section))
+    run Bytes.append(&mut section, Bytes.asSlice(&entries[at]))
     at = at + usize.ONE
   }
   run WasmModule.section(&mut out, WasmModule.codeSection(), &section)
+  // Each entry's start, from its offset in the section to its offset in the module.
+  let payload = Bytes.length(&out) - Bytes.length(&section)
+  let placed = List<usize>.asMutSlice(&mut starts.*)
+  at = usize.ZERO
+  while at < placed.length {
+    placed[at] = placed[at] + payload
+    at = at + usize.ONE
+  }
   // The data, without its trailing zeros, which fresh memory already holds.
   let bytes = Bytes.asSlice(image)
   let mut used = bytes.length
