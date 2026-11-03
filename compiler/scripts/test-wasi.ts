@@ -78,13 +78,14 @@ const program = Effect.gen(function* () {
       { env: environment },
     )
   })
-  // The direct backend builds the same command without Clang, and it runs the same.
-  {
+  // The direct backend builds the same command without Clang, as a core module or a component,
+  // and it runs the same.
+  for (const target of ['wasm32-wasip1', 'wasm32-wasip2']) {
     yield* fs.writeFileString(join(directory, 'main.silk'), source)
-    const output = join(directory, 'direct.wasm')
-    const built = yield* build('wasm32-wasip1', output, ['--backend', 'direct'], { ...env, SILK_CLANG: '/nonexistent' })
+    const output = join(directory, `direct-${target}.wasm`)
+    const built = yield* build(target, output, ['--backend', 'direct'], { ...env, SILK_CLANG: '/nonexistent' })
     assert.equal(built.status, 0, built.stderr.toString())
-    assert.match(built.stdout.toString(), /\(direct, wasm32-wasip1, /)
+    assert.match(built.stdout.toString(), new RegExp(`\\(direct, ${target}, `))
     const valid = yield* invoke(wasmTools, ['validate', output])
     assert.equal(valid.status, 0, valid.stderr.toString())
     const ran = yield* invoke(
@@ -95,6 +96,8 @@ const program = Effect.gen(function* () {
     assert.equal(ran.status, 0, ran.stderr.toString())
     assert.equal(ran.stdout.toString(), 'gather:ab\nwasi services passed\n')
     assert.equal(ran.stderr.toString(), 'wasi stderr\n')
+  }
+  {
     // A project build keeps its translated bodies, and an edit runs the edited body, not a cached one.
     const project = Effect.fnUntraced(function* (status: number) {
       yield* fs.writeFileString(
