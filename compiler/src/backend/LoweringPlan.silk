@@ -1,0 +1,776 @@
+//! The lowering decisions every code generator shares: how a value is represented, which lanes a
+//! parameter travels in, where a field or element lives, and which locals hold a function's
+//! hidden addresses. `LlvmCode` and the direct Wasm backend read them from here, so the two agree
+//! on memory layout and calling shape byte for byte.
+
+import semantic.Types {Types}
+import backend.InstanceKey {InstanceKey}
+import backend.Layout {Abi, Field, Layout, Metrics, Sequence, Slice as SliceFacts, Storage, Tagged as TaggedFacts}
+import backend.TypeLayouts {TypeLayouts}
+import backend.Gap {Code as GapCode, Gap}
+import backend.Mir {Local, LocalKind, MirFunction, Place, Projection}
+import semantic.SourceLocations {Location}
+import semantic.Target {Target}
+import semantic.Type {Type}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.collections.bytes {Bytes}
+import silk.core.ownership {Copy}
+import silk.mem.shared {Shared}
+import silk.core.option {Option}
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.collections.list {List}
+
+fn same(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length { return false }
+  let mut at = usize.ZERO
+  while at < a.length {
+    if a[at] != b[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+pub struct Representation {
+  pub aggregate: bool,
+  pub size: usize,
+  pub bits: usize,
+  pub signed: bool,
+  pub unit: bool,
+  pub pointer: bool,
+  pub floating: bool,
+  /// The lane count of a SIMD vector or mask, whose `bits` are one lane's; zero for a scalar.
+  pub lanes: usize,
+  /// A union aggregate's alignment, which lets a 16-byte union copy as one integer; zero for
+  /// any other value.
+  pub unionAlignment: usize,
+}
+
+impl Copy for Representation {}
+
+pub fn scalar(ty: &Shared<Type>, target: &Target) -> Representation {
+  return Shared<Type>.with<Representation>(
+    ty,
+    fn(value: &Type) -> Representation {
+      return match & value.* {
+        Type.Reference {..} => Representation {aggregate: false, size: usize.ZERO,
+          bits: u32.toUsize(Target.pointerBits(target)),
+          signed: false,
+          unit: false,
+          pointer: true,
+          floating: false,
+          lanes: usize.ZERO,
+          unionAlignment: usize.ZERO,
+        }
+        Type.ForeignFunction {..} => Representation {aggregate: false, size: usize.ZERO,
+          bits: u32.toUsize(Target.pointerBits(target)), signed: false, unit: false, pointer: true, floating: false, lanes: usize.ZERO, unionAlignment: usize.ZERO}
+        Type.Pointer {..} => Representation {aggregate: false, size: usize.ZERO,
+          bits: u32.toUsize(Target.pointerBits(target)),
+          signed: false,
+          unit: false,
+          pointer: true,
+          floating: false,
+          lanes: usize.ZERO,
+          unionAlignment: usize.ZERO,
+        }
+        Type.Unit => Representation {aggregate: false, size: usize.ZERO, bits: usize.ZERO, signed: false, unit: true, pointer: false, floating: false, lanes: usize.ZERO, unionAlignment: usize.ZERO}
+        // A vector is its lane's representation repeated; a mask's lane is `i1`.
+        Type.Vector {element, lanes} => {
+          let mut lane = scalar(&element, target)
+          lane.lanes = match move Type.extentValue(Bytes.asSlice(&lanes)) {
+            Option<usize>.Some {value: count} => count
+            Option<usize>.None => usize.ZERO
+          }
+          return lane
+        }
+        Type.Primitive {name} => {
+          let word = Bytes.asSlice(&name)
+          if same(word, b"bool") {
+            return Representation {aggregate: false, size: usize.ZERO, bits: usize.ONE, signed: false, unit: false, pointer: false, floating: false, lanes: usize.ZERO, unionAlignment: usize.ZERO}
+          }
+          let mut signed = false
+          if word.length > usize.ZERO && word[usize.ZERO] == 105 {
+            signed = true
+          }
+          let mut bits = usize.ZERO
+          if same(word, b"i8") || same(word, b"u8") {
+            bits = 8
+          }
+          if same(word, b"i16") || same(word, b"u16") {
+            bits = 16
+          }
+          if same(word, b"i32") || same(word, b"u32") || same(word, b"char") {
+            bits = 32
+          }
+          if same(word, b"i64") || same(word, b"u64") {
+            bits = 64
+          }
+          if same(word, b"isize") || same(word, b"usize") {
+            bits = u32.toUsize(Target.pointerBits(target))
+          }
+          let floating = same(word, b"f32") || same(word, b"f64")
+          if same(word, b"f32") {
+            bits = 32
+          }
+          if same(word, b"f64") {
+            bits = 64
+          }
+          return Representation {aggregate: false, size: usize.ZERO,
+            bits: bits,
+            signed: signed,
+            unit: false,
+            pointer: false,
+            floating: floating,
+          lanes: usize.ZERO,
+          unionAlignment: usize.ZERO,
+        }
+        }
+        _ => Representation {aggregate: false, size: usize.ZERO, bits: usize.ZERO, signed: false, unit: false, pointer: false, floating: false, lanes: usize.ZERO, unionAlignment: usize.ZERO}
+      }
+    },
+  )
+}
+
+pub fn pointerRepresentation(target: &Target) -> Representation {
+  return Representation {aggregate: false, size: usize.ZERO, bits: u32.toUsize(Target.pointerBits(target)),
+    signed: false, unit: false, pointer: true, floating: false, lanes: usize.ZERO, unionAlignment: usize.ZERO}
+}
+
+pub fn booleanRepresentation() -> Representation {
+  return Representation {aggregate: false, size: usize.ZERO, bits: usize.ONE, signed: false, unit: false, pointer: false, floating: false, lanes: usize.ZERO, unionAlignment: usize.ZERO}
+}
+
+pub fn integerRepresentation(bits: usize, signed: bool) -> Representation {
+  return Representation {aggregate: false, size: usize.ZERO, bits: bits, signed: signed, unit: false, pointer: false, floating: false, lanes: usize.ZERO, unionAlignment: usize.ZERO}
+}
+
+pub struct Pointee {
+  pub ty: Shared<Type>,
+  pub alignment: Option<u64>,
+}
+
+pub effect fn layoutOf(layouts: &TypeLayouts, ty: &Shared<Type>, function: &MirFunction, span: Location) -> Metrics
+! Gap | OutOfMemoryError
+? &mut Allocator | &mut Types {
+  let at = run TypeLayouts.firstMatching(layouts, ty)
+  if at != usize.MAX {
+    let listed = TypeLayouts.list(layouts)
+    return Shared<Layout>.with<Metrics>(&listed[at].layout, Layout.metrics)
+  }
+  let owner = InstanceKey.identity(&function.key)
+  fail Gap.relative(GapCode.ScalarLayout, &owner, span)
+}
+
+// Whether a vector or mask crosses a Silk function boundary through memory: a vector wider than
+// 128 bits or a mask of more than 16 lanes. LLVM passes those in different registers with and
+// without AVX or AVX-512, and a function written with `features` calls and is called by functions
+// compiled without them, so their address is passed instead (SIMD-009).
+pub fn passedIndirectly(kind: Representation) -> bool {
+  return kind.lanes != usize.ZERO && (kind.lanes > 16 || kind.bits * kind.lanes > 128)
+}
+
+// The parameter index whose caller-provided storage `local` uses as its own slot, so the value is
+// not copied on entry: a parameter of an ordinary Silk definition passed by address. The callee
+// owns that storage for the call (`exclusiveParameter`), so it may also write and drop it there.
+pub fn ownedParameter(function: &MirFunction, local: &Local, facts: Metrics, kind: Representation) -> Option<usize> {
+  if cExport(function) || !exclusiveParameter(facts, kind) { return Option<usize>.none() }
+  return match &local.kind {
+    LocalKind.Parameter {index} => Option<usize>.some(index)
+    _ => Option<usize>.none()
+  }
+}
+
+// Whether the result local's slot is the caller's `%out`, so `emitReturn` copies nothing: an
+// ordinary definition (not a C export) whose result travels by address. The caller passes a
+// fresh temporary as the destination, so `%out` aliases nothing the body reads, and a failed
+// call's success slot is never read, so a fallible definition writes there too.
+pub fn resultInOut(function: &MirFunction, kind: Representation) -> bool {
+  return !cExport(function) && (kind.aggregate || passedIndirectly(kind))
+}
+
+// Whether a Silk definition marks a parameter's address `noalias`. A parameter passed by address
+// names storage the caller gives the call: MIR passes a fresh temporary snapshot of the argument,
+// or a place the call moves out of, and never reads it afterwards, so nothing else reads or writes
+// it until the callee returns. Without the mark LLVM must assume a store through another pointer, such as a
+// field written into the callee's destination, can change the argument, and keeps an extra copy.
+pub fn exclusiveParameter(facts: Metrics, lane: Representation) -> bool {
+  return facts.abi == Abi.Indirect || passedIndirectly(lane)
+}
+
+// The scalar a by-address record parameter travels as instead (#2469): a record whose only
+// field is a pointer, integer or float of the record's whole size, or such a record, passes as
+// that field. The callee stores it into a slot of its own on entry. A C export's own parameters
+// follow the C ABI instead, so its definition never asks.
+effect fn unwrappedParameter(layouts: &TypeLayouts, ty: &Shared<Type>, facts: Metrics,
+  function: &MirFunction, span: Location) -> Option<Shared<Type>> ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if facts.abi != Abi.Indirect || facts.tagged { return Option<Shared<Type>>.none() }
+  let mut current = Shared<Type>.clone(ty)
+  let mut depth = usize.ZERO
+  while depth < 8 {
+    let at = run TypeLayouts.firstMatching(layouts, &current)
+    if at == usize.MAX { return Option<Shared<Type>>.none() }
+    let listed = TypeLayouts.list(layouts)
+    if Shared<Layout>.with<usize>(&listed[at].layout, Layout.fieldCount) != usize.ONE { return Option<Shared<Type>>.none() }
+    let selected = Shared<Layout>.with<Option<Field>>(&listed[at].layout,
+      fn(layout: &Layout) -> Option<Field> { return Layout.fieldAt(layout, usize.ZERO) },
+    )
+    let field = match move selected {
+      Option<Field>.Some {value} => move value
+      Option<Field>.None => { return Option<Shared<Type>>.none() }
+    }
+    if field.offset != usize.ZERO { return Option<Shared<Type>>.none() }
+    let inner = run layoutOf(layouts, &field.ty, function, span)
+    if inner.size != facts.size || inner.tagged { return Option<Shared<Type>>.none() }
+    if inner.abi == Abi.Pointer || inner.abi == Abi.Integer || inner.abi == Abi.Floating {
+      return Option<Shared<Type>>.some(move field.ty)
+    }
+    if inner.abi != Abi.Indirect { return Option<Shared<Type>>.none() }
+    current = move field.ty
+    depth = depth + usize.ONE
+  }
+  return Option<Shared<Type>>.none()
+}
+
+// The lane an unwrapped parameter's field travels in.
+effect fn unwrappedLane(layouts: &TypeLayouts, field: &Shared<Type>, target: &Target,
+  function: &MirFunction, span: Location) -> Representation ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let facts = run layoutOf(layouts, field, function, span)
+  return storageRepresentation(field, target, facts)
+}
+
+// The lanes a by-address record parameter travels in instead of its address (#2469, #2530): a
+// record wrapping one scalar of its whole size passes as that scalar (`field`, stored as a value
+// of its type); any other record of at most 32 bytes whose storage is at most four pointers,
+// integers, floats and bools (a slice counts as its address and length) passes them as one lane
+// each, at their offsets. A tagged record, an empty one and any other keep their address (`count`
+// zero).
+pub struct ParameterLanes {
+  pub count: usize,
+  pub field: Option<Shared<Type>>,
+  pub lanes: [Representation; 4],
+  pub offsets: [usize; 4],
+}
+
+// One scalar of a record's storage for `parameterLanes`, at its offset in the record; an `opaque`
+// span is storage no lane carries.
+struct StorageLeaf {
+  pub offset: usize,
+  pub size: usize,
+  pub lane: Representation,
+  pub opaque: bool,
+}
+
+impl Copy for StorageLeaf {}
+
+pub effect fn parameterLanes(layouts: &TypeLayouts, ty: &Shared<Type>, facts: Metrics, target: &Target,
+  function: &MirFunction, span: Location) -> ParameterLanes ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let unit = integerRepresentation(usize.ZERO, false)
+  let mut split = ParameterLanes {count: usize.ZERO, field: Option<Shared<Type>>.none(), lanes: [unit, unit, unit, unit],
+    offsets: [usize.ZERO, usize.ZERO, usize.ZERO, usize.ZERO]}
+  if let Option<Shared<Type>>.Some {value: field} = run unwrappedParameter(layouts, ty, facts, function, span) {
+    split.lanes[0] = run unwrappedLane(layouts, &field, target, function, span)
+    split.count = usize.ONE
+    split.field = Option<Shared<Type>>.some(move field)
+    return move split
+  }
+  if facts.abi != Abi.Indirect || facts.tagged || facts.size == usize.ZERO || facts.size > 32 { return move split }
+  let mut leaves = List<StorageLeaf>.make()
+  run collectLeaves(layouts, ty, usize.ZERO, target, function, span, usize.ZERO, &mut leaves)
+  let listed = List<StorageLeaf>.asSlice(&leaves)
+  if listed.length == usize.ZERO || listed.length > 4 { return move split }
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if listed[at].opaque { return move split }
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < listed.length {
+    split.lanes[at] = listed[at].lane
+    split.offsets[at] = listed[at].offset
+    at = at + usize.ONE
+  }
+  split.count = listed.length
+  return move split
+}
+
+// Appends the scalars of `ty`'s storage at `base` to `leaves`, in offset order.
+effect fn collectLeaves(layouts: &TypeLayouts, ty: &Shared<Type>, base: usize, target: &Target, function: &MirFunction,
+  span: Location, depth: usize, leaves: &mut List<StorageLeaf>) -> () ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if List<StorageLeaf>.length(&leaves.*) > 4 { return () }
+  let facts = run layoutOf(layouts, ty, function, span)
+  if facts.size == usize.ZERO { return () }
+  if !facts.tagged && (facts.abi == Abi.Pointer || facts.abi == Abi.Integer || facts.abi == Abi.Floating) {
+    let mut lane = storageRepresentation(ty, target, facts)
+    // A bool travels as its byte.
+    if lane.bits == usize.ONE && facts.size == usize.ONE && !lane.floating && !lane.pointer { lane = integerRepresentation(8, false) }
+    let plain = !lane.aggregate && !lane.unit && lane.lanes == usize.ZERO && lane.bits == facts.size * 8
+    run List<StorageLeaf>.append(&mut leaves.*, StorageLeaf {offset: base, size: facts.size, lane: lane, opaque: !plain})
+    return ()
+  }
+  if facts.abi == Abi.Indirect && !facts.tagged && depth < 8 {
+    let at = run TypeLayouts.firstMatching(layouts, ty)
+    if at != usize.MAX {
+      let listed = TypeLayouts.list(layouts)
+      // A slice is its element address and then its length.
+      let length = Shared<Layout>.with<usize>(&listed[at].layout, fn(layout: &Layout) -> usize {
+        if let Storage.Slice {lengthOffset, ..} = &layout.storage { return lengthOffset }
+        return usize.MAX
+      })
+      if length != usize.MAX {
+        let word = u32.toUsize(Target.pointerBits(target)) / 8
+        run List<StorageLeaf>.append(&mut leaves.*, StorageLeaf {offset: base, size: word, lane: pointerRepresentation(target), opaque: false})
+        run List<StorageLeaf>.append(&mut leaves.*, StorageLeaf {offset: base + length, size: word,
+          lane: integerRepresentation(word * 8, false), opaque: false})
+        return ()
+      }
+      let count = Shared<Layout>.with<usize>(&listed[at].layout, Layout.fieldCount)
+      if count > usize.ZERO && count <= 4 {
+        let mut index = usize.ZERO
+        while index < count {
+          let field = run fieldFact(layouts, ty, index, function, span)
+          run collectLeaves(layouts, &field.ty, base + field.offset, target, function, span, depth + usize.ONE, &mut leaves.*)
+          index = index + usize.ONE
+        }
+        return ()
+      }
+    }
+  }
+  run List<StorageLeaf>.append(&mut leaves.*, StorageLeaf {offset: base, size: facts.size, lane: integerRepresentation(8, false),
+    opaque: true})
+  return ()
+}
+
+// Whether `function` is a C export shim, whose lanes follow the C ABI instead (SIMD-010).
+pub fn cExport(function: &MirFunction) -> bool {
+  return match &function.key { InstanceKey.Export {..} => true _ => false }
+}
+
+pub fn storageRepresentation(ty: &Shared<Type>, target: &Target, facts: Metrics) -> Representation {
+  if facts.abi == Abi.Indirect {
+    let mut unionAlignment = usize.ZERO
+    if facts.tagged { unionAlignment = facts.alignment }
+    return Representation {aggregate: true, size: facts.size, bits: usize.ZERO,
+      signed: false, unit: false, pointer: false, floating: false, lanes: usize.ZERO,
+      unionAlignment: unionAlignment}
+  }
+  let written = scalar(ty, target)
+  // A nominal integer (a scalar enum) is spelled from its neutral layout, never its declaration.
+  if facts.abi == Abi.Integer && written.bits == usize.ZERO {
+    return Representation {aggregate: false, size: usize.ZERO, bits: facts.size * 8,
+      signed: false, unit: false, pointer: false, floating: false, lanes: usize.ZERO, unionAlignment: usize.ZERO}
+  }
+  return written
+}
+
+pub effect fn fieldFact(layouts: &TypeLayouts, ty: &Shared<Type>, index: usize,
+  function: &MirFunction, span: Location) -> Field ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let listed = TypeLayouts.list(layouts)
+  let mut at = run TypeLayouts.firstMatching(layouts, ty)
+  while at != usize.MAX {
+    let selected = Shared<Layout>.with<Option<Field>>(&listed[at].layout,
+      fn(layout: &Layout) -> Option<Field> { return Layout.fieldAt(layout, index) },
+    )
+    if let Option<Field>.Some {value} = move selected { return move value }
+    at = run TypeLayouts.nextMatching(layouts, at, ty)
+  }
+  let owner = InstanceKey.identity(&function.key)
+  fail Gap.relative(GapCode.PlaceProjection, &owner, span)
+}
+
+pub effect fn sequenceFact(layouts: &TypeLayouts, ty: &Shared<Type>, function: &MirFunction,
+  span: Location) -> Sequence ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let listed = TypeLayouts.list(layouts)
+  let mut at = run TypeLayouts.firstMatching(layouts, ty)
+  while at != usize.MAX {
+    let selected = Shared<Layout>.with<Option<Sequence>>(&listed[at].layout,
+      fn(layout: &Layout) -> Option<Sequence> { return Layout.sequenceFacts(layout) },
+    )
+    if let Option<Sequence>.Some {value} = move selected { return move value }
+    at = run TypeLayouts.nextMatching(layouts, at, ty)
+  }
+  let owner = InstanceKey.identity(&function.key)
+  fail Gap.relative(GapCode.IndexProjection, &owner, span)
+}
+
+pub struct IndexFacts {
+  pub element: Shared<Type>,
+  pub stride: usize,
+  pub borrowed: bool,
+}
+
+fn indexFacts(layout: &Layout) -> Option<IndexFacts> {
+  if let Option<Sequence>.Some {value: array} = move Layout.sequenceFacts(layout) {
+    return Option<IndexFacts>.some(IndexFacts {element: move array.element, stride: array.stride, borrowed: false})
+  }
+  if let Option<SliceFacts>.Some {value: slice} = move Layout.sliceFacts(layout) {
+    return Option<IndexFacts>.some(IndexFacts {element: move slice.element, stride: slice.stride, borrowed: true})
+  }
+  return Option<IndexFacts>.none()
+}
+
+pub effect fn indexedFact(layouts: &TypeLayouts, ty: &Shared<Type>, function: &MirFunction,
+  span: Location) -> IndexFacts ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let listed = TypeLayouts.list(layouts)
+  let mut at = run TypeLayouts.firstMatching(layouts, ty)
+  while at != usize.MAX {
+    let selected = Shared<Layout>.with<Option<IndexFacts>>(&listed[at].layout, indexFacts)
+    if let Option<IndexFacts>.Some {value} = move selected { return move value }
+    at = run TypeLayouts.nextMatching(layouts, at, ty)
+  }
+  let owner = InstanceKey.identity(&function.key)
+  fail Gap.relative(GapCode.IndexProjection, &owner, span)
+}
+
+pub effect fn sliceFact(layouts: &TypeLayouts, ty: &Shared<Type>, function: &MirFunction,
+  span: Location) -> SliceFacts ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let listed = TypeLayouts.list(layouts)
+  let mut at = run TypeLayouts.firstMatching(layouts, ty)
+  while at != usize.MAX {
+    let selected = Shared<Layout>.with<Option<SliceFacts>>(&listed[at].layout, Layout.sliceFacts)
+    if let Option<SliceFacts>.Some {value} = move selected { return move value }
+    at = run TypeLayouts.nextMatching(layouts, at, ty)
+  }
+  let owner = InstanceKey.identity(&function.key)
+  fail Gap.relative(GapCode.SliceLayout, &owner, span)
+}
+
+pub effect fn taggedFact(layouts: &TypeLayouts, ty: &Shared<Type>, function: &MirFunction,
+  span: Location) -> TaggedFacts ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let listed = TypeLayouts.list(layouts)
+  let mut at = run TypeLayouts.firstMatching(layouts, ty)
+  while at != usize.MAX {
+    let selected = Shared<Layout>.with<Option<TaggedFacts>>(&listed[at].layout, Layout.taggedFacts)
+    if let Option<TaggedFacts>.Some {value} = move selected { return move value }
+    at = run TypeLayouts.nextMatching(layouts, at, ty)
+  }
+  let owner = InstanceKey.identity(&function.key)
+  fail Gap.relative(GapCode.UnionForm, &owner, span)
+}
+
+pub effect fn variantFieldFact(layouts: &TypeLayouts, ty: &Shared<Type>, variant: usize, field: usize,
+  function: &MirFunction, span: Location) -> Field ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let listed = TypeLayouts.list(layouts)
+  let mut at = run TypeLayouts.firstMatching(layouts, ty)
+  while at != usize.MAX {
+    let selected = Shared<Layout>.with<Option<Field>>(&listed[at].layout, fn(layout: &Layout) -> Option<Field> {
+      return Layout.variantField(layout, variant, field)
+    })
+    if let Option<Field>.Some {value} = move selected { return move value }
+    at = run TypeLayouts.nextMatching(layouts, at, ty)
+  }
+  let owner = InstanceKey.identity(&function.key)
+  fail Gap.relative(GapCode.UnionForm, &owner, span)
+}
+
+pub fn tagRepresentation(facts: TaggedFacts) -> Representation {
+  return Representation {aggregate: false, size: usize.ZERO, bits: facts.tagSize * 8,
+    signed: false, unit: false, pointer: false, floating: false, lanes: usize.ZERO, unionAlignment: usize.ZERO}
+}
+
+// Layout alignments are powers of two. Offsets reduce the base guarantee without inventing one.
+pub fn offsetAlignment(alignment: usize, offset: usize) -> usize {
+  let mut guarantee = alignment
+  while guarantee > usize.ONE && usize.remainder(offset, guarantee) != usize.ZERO {
+    guarantee = guarantee / 2
+  }
+  return guarantee
+}
+
+fn copiedAlignment(written: &Option<u64>) -> Option<u64> {
+  return match & written.* {
+    Option<u64>.Some {value: declaredAlignment} => Option<u64>.some(declaredAlignment)
+    Option<u64>.None => Option<u64>.none()
+  }
+}
+
+// Returns what a reference or pointer type points at, absent for any other type.
+fn pointeeOf(ty: &Shared<Type>) -> Option<Pointee> {
+  return Shared<Type>.with<Option<Pointee>>(
+    ty,
+    fn(value: &Type) -> Option<Pointee> {
+      return match & value.* {
+        Type.Reference {referent, ..} => Option<Pointee>.some(
+          Pointee {ty: Shared<Type>.clone(&referent), alignment: Option<u64>.none()},
+        )
+        Type.Pointer {pointee, alignment: written, ..} => Option<Pointee>.some(
+          Pointee {ty: Shared<Type>.clone(&pointee), alignment: copiedAlignment(&written)},
+        )
+        _ => Option<Pointee>.none()
+      }
+    },
+  )
+}
+
+// Returns what a dereferenced place points at, or rejects a place that is not a reference or pointer.
+pub effect fn pointeeOrGap(function: &MirFunction, ty: &Shared<Type>, span: Location) -> Pointee
+! Gap | OutOfMemoryError
+? &mut Allocator {
+  let pointee = pointeeOf(ty)
+  let selected = match move pointee {
+    Option<Pointee>.Some {value} => move value
+    Option<Pointee>.None => {
+      let owner = InstanceKey.identity(&function.key)
+      fail Gap.relative(GapCode.PlaceProjection, &owner, span)
+    }
+  }
+  return move selected
+}
+
+/// The `Provider` locals of a function in requirement-key order.
+pub fn providerLocalAt(function: &MirFunction, index: usize) -> usize {
+  let locals = List<Local>.asSlice(&function.locals)
+  let mut at = usize.ZERO
+  while at < locals.length {
+    let found = match &locals[at].kind { LocalKind.Provider {index: own} => own == index _ => false }
+    if found { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+/// The hidden `Observer` (0), `Cause` (1) or `Site` (2) local, or `usize.MAX` when the program
+/// does not observe diagnostics (failure observer note N1, N2).
+pub fn diagnosticLocal(function: &MirFunction, wanted: usize) -> usize {
+  let locals = List<Local>.asSlice(&function.locals)
+  let mut at = usize.ZERO
+  while at < locals.length {
+    let kind = match &locals[at].kind {
+      LocalKind.Observer => usize.ZERO
+      LocalKind.Cause => usize.ONE
+      LocalKind.Site => 2
+      _ => usize.MAX
+    }
+    if kind == wanted { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+/// The `Failure` local of a fallible function, or `usize.MAX` when it cannot fail.
+pub fn failureLocal(function: &MirFunction) -> usize {
+  let locals = List<Local>.asSlice(&function.locals)
+  let mut at = usize.ZERO
+  while at < locals.length {
+    let failure = match &locals[at].kind { LocalKind.Failure => true _ => false }
+    if failure { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+/// The number of hidden provider addresses `function` takes (D2).
+pub fn providerCount(function: &MirFunction) -> usize {
+  let mut count = usize.ZERO
+  while providerLocalAt(function, count) != usize.MAX { count = count + usize.ONE }
+  return count
+}
+
+/// One lane of a Silk function's calling shape. A definition takes its parameters, and a call
+/// passes its arguments, in the order a `Shape` lists them.
+pub union Lane {
+  /// A coroutine `$enter`'s transfer record.
+  Transfer,
+  /// Written parameter `index`, in as many lanes as its representation splits into.
+  Parameter {pub index: usize},
+  /// Hidden provider address `index`, in requirement-key order (D2).
+  Provider {pub index: usize},
+  /// The current observer, selected cause and entry site addresses (N1, N2).
+  Observer,
+  Cause,
+  Site,
+  /// The result's address: the caller's destination for a result that travels by address.
+  Result,
+  /// The failure out-address of a fallible function (D3).
+  Failure,
+  /// The failure slot's context companion, in a program that observes diagnostics (N3).
+  Context,
+}
+
+impl Copy for Lane {}
+
+/// The order of a function's lanes.
+pub struct Shape {
+  pub lanes: List<Lane>,
+}
+
+/// What a function's calling shape depends on: its written parameter count, its provider count,
+/// and whether it observes diagnostics and can fail. A call reads them from its operands, a
+/// definition from its locals (`callable`).
+pub struct Callable {
+  pub parameters: usize,
+  pub providers: usize,
+  pub observed: bool,
+  pub fallible: bool,
+}
+
+impl Copy for Callable {}
+
+/// The calling facts of the definition `function`.
+pub fn callable(function: &MirFunction) -> Callable {
+  return Callable {parameters: List<Shared<Type>>.length(&function.parameters), providers: providerCount(function),
+    observed: diagnosticLocal(function, usize.ZERO) != usize.MAX, fallible: failureLocal(function) != usize.MAX}
+}
+
+/// The shape of an ordinary definition and of a call to it: a result that travels by address
+/// (`outward`) first when the function cannot fail, the written parameters, the providers, the
+/// observer, cause and site of an observed function, then a fallible function's result, failure
+/// and context addresses.
+pub effect fn ordinaryShape(facts: Callable, outward: bool) -> Shape ! OutOfMemoryError ? &mut Allocator {
+  let mut lanes = List<Lane>.make()
+  if outward && !facts.fallible { run List<Lane>.append(&mut lanes, Lane.Result) }
+  run appendWritten(&mut lanes, facts)
+  if facts.fallible {
+    run List<Lane>.append(&mut lanes, Lane.Result)
+    run appendFailure(&mut lanes, facts)
+  }
+  return Shape {lanes: move lanes}
+}
+
+/// The shape of a coroutine's `$enter`: the transfer record, the written parameters, the
+/// providers and the observer, cause and site of an observed function, then the result address
+/// when it `takes` one, and a fallible function's failure and context addresses.
+pub effect fn enterShape(facts: Callable, takes: bool) -> Shape ! OutOfMemoryError ? &mut Allocator {
+  let mut lanes = List<Lane>.make()
+  run List<Lane>.append(&mut lanes, Lane.Transfer)
+  run appendWritten(&mut lanes, facts)
+  if takes { run List<Lane>.append(&mut lanes, Lane.Result) }
+  if facts.fallible { run appendFailure(&mut lanes, facts) }
+  return Shape {lanes: move lanes}
+}
+
+// Appends the written parameters, the providers, and the diagnostics of an observed function.
+effect fn appendWritten(lanes: &mut List<Lane>, facts: Callable) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < facts.parameters {
+    run List<Lane>.append(&mut lanes.*, Lane.Parameter {index: at})
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < facts.providers {
+    run List<Lane>.append(&mut lanes.*, Lane.Provider {index: at})
+    at = at + usize.ONE
+  }
+  if facts.observed {
+    run List<Lane>.append(&mut lanes.*, Lane.Observer)
+    run List<Lane>.append(&mut lanes.*, Lane.Cause)
+    run List<Lane>.append(&mut lanes.*, Lane.Site)
+  }
+  return ()
+}
+
+// Appends the failure address and, in an observed function, its context.
+effect fn appendFailure(lanes: &mut List<Lane>, facts: Callable) -> () ! OutOfMemoryError ? &mut Allocator {
+  run List<Lane>.append(&mut lanes.*, Lane.Failure)
+  if facts.observed { run List<Lane>.append(&mut lanes.*, Lane.Context) }
+  return ()
+}
+
+// Field `index` of `ty`, whose own layout must be known, as projecting it reads it.
+effect fn memberFact(layouts: &TypeLayouts, ty: &Shared<Type>, index: usize,
+  function: &MirFunction, span: Location) -> Field ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let field = run fieldFact(layouts, ty, index, function, span)
+  drop run layoutOf(layouts, &field.ty, function, span)
+  return move field
+}
+
+/// One step from a place's root slot to its address.
+pub union Step {
+  /// Reads the pointer stored at the current address, which is `alignment`-aligned.
+  Load {pub alignment: usize},
+  /// Adds `offset` bytes to reach a record field or a constant element.
+  Member {pub offset: usize},
+  /// Adds `offset` bytes to reach a union variant's field or its payload.
+  Variant {pub offset: usize},
+  /// Adds `index * stride` bytes, where `index` is the value of the projection-free local `local`.
+  Index {pub local: usize, pub stride: usize},
+}
+
+impl Copy for Step {}
+
+/// How to address a place: the steps from its root local's slot, then the type, alignment and
+/// representation of what it names.
+pub struct PlacePath {
+  pub steps: List<Step>,
+  pub ty: Shared<Type>,
+  pub alignment: usize,
+  pub representation: Representation,
+}
+
+/// The path to `place`, whose root slot is `rootAlignment`-aligned, or `usize.MAX` to read the
+/// alignment from the root local's layout.
+pub effect fn placePath(function: &MirFunction, target: &Target, layouts: &TypeLayouts, place: &Place,
+  rootAlignment: usize) -> PlacePath ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let locals = List<Local>.asSlice(&function.locals)
+  let owner = InstanceKey.identity(&function.key)
+  let span = locals[place.local].origin.location
+  let mut ty = Shared<Type>.clone(&locals[place.local].ty)
+  let mut alignment = rootAlignment
+  if alignment == usize.MAX {
+    let rootLayout = run layoutOf(layouts, &ty, function, span)
+    alignment = rootLayout.alignment
+  }
+  let mut steps = List<Step>.make()
+  let projections = List<Projection>.asSlice(&place.projections)
+  let mut at = usize.ZERO
+  while at < projections.length {
+    match & projections[at] {
+      Projection.Deref => {
+        let selected = run pointeeOrGap(function, &ty, span)
+        run List<Step>.append(&mut steps, Step.Load {alignment: alignment})
+        ty = move selected.ty
+        let referentLayout = run layoutOf(layouts, &ty, function, span)
+        alignment = match move selected.alignment {
+          Option<u64>.Some {value} => u64.toUsize(value)
+          Option<u64>.None => referentLayout.alignment
+        }
+      }
+      Projection.Field {index} => {
+        drop run layoutOf(layouts, &ty, function, span)
+        let field = run memberFact(layouts, &ty, index, function, span)
+        run List<Step>.append(&mut steps, Step.Member {offset: field.offset})
+        alignment = offsetAlignment(alignment, field.offset)
+        ty = move field.ty
+      }
+      Projection.Index {local} => {
+        let sequence = run indexedFact(layouts, &ty, function, span)
+        if sequence.borrowed {
+          run List<Step>.append(&mut steps, Step.Load {alignment: alignment})
+          let elementLayout = run layoutOf(layouts, &sequence.element, function, span)
+          alignment = elementLayout.alignment
+        }
+        run List<Step>.append(&mut steps, Step.Index {local: local, stride: sequence.stride})
+        alignment = offsetAlignment(alignment, sequence.stride)
+        ty = move sequence.element
+      }
+      Projection.VariantField {variant, field} => {
+        let selected = run variantFieldFact(layouts, &ty, variant, field, function, span)
+        run List<Step>.append(&mut steps, Step.Variant {offset: selected.offset})
+        alignment = offsetAlignment(alignment, selected.offset)
+        ty = move selected.ty
+      }
+      Projection.Payload {ty: member, ..} => {
+        let facts = run taggedFact(layouts, &ty, function, span)
+        run List<Step>.append(&mut steps, Step.Variant {offset: facts.payloadOffset})
+        alignment = offsetAlignment(alignment, facts.payloadOffset)
+        ty = Shared<Type>.clone(&member)
+      }
+      Projection.ConstIndex {index} => {
+        let sequence = run sequenceFact(layouts, &ty, function, span)
+        if index >= sequence.count { fail Gap.relative(GapCode.IndexProjection, &owner, span) }
+        drop run layoutOf(layouts, &ty, function, span)
+        let element = run memberFact(layouts, &ty, index, function, span)
+        run List<Step>.append(&mut steps, Step.Member {offset: element.offset})
+        alignment = offsetAlignment(alignment, element.offset)
+        ty = move element.ty
+      }
+    }
+    at = at + usize.ONE
+  }
+  let finalLayout = run layoutOf(layouts, &ty, function, span)
+  let kind = storageRepresentation(&ty, target, finalLayout)
+  if !kind.unit && !kind.aggregate && kind.bits == usize.ZERO {
+    fail Gap.relative(GapCode.ScalarLayout, &owner, span)
+  }
+  return PlacePath {steps: move steps, ty: move ty, alignment: alignment, representation: kind}
+}
