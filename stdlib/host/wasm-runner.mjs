@@ -1,4 +1,4 @@
-// Runs a Silk wasm32 module: `node wasm-runner.mjs program.wasm` exits with the status `main`
+// Runs a Silk wasm32 or wasm64 module: `node wasm-runner.mjs program.wasm` exits with the status `main`
 // returns. A module built with `threading = "multi"` imports one shared memory and the
 // wasi-threads `thread-spawn`; this runner creates that memory, runs `main` in a Worker, and
 // starts every thread as another Worker that instantiates the same module on the same memory.
@@ -50,7 +50,7 @@ const importedMemory = (bytes) => {
           const flags = bytes[cursor.at++]
           const initial = readUnsigned(bytes, cursor)
           const maximum = flags & 1 ? readUnsigned(bytes, cursor) : undefined
-          return { initial, maximum, shared: (flags & 2) !== 0 }
+          return { initial, maximum, shared: (flags & 2) !== 0, wide: (flags & 4) !== 0 }
         }
         if (kind === 0) readUnsigned(bytes, cursor)
         else if (kind === 1) {
@@ -68,6 +68,23 @@ const importedMemory = (bytes) => {
   return undefined
 }
 
+// Whether the module's memory is a 64-bit one (`memory64`), imported or its own.
+const wideMemory = (bytes) => {
+  const imported = importedMemory(bytes)
+  if (imported !== undefined) return imported.wide
+  const cursor = { at: 8 }
+  while (cursor.at < bytes.length) {
+    const id = bytes[cursor.at++]
+    const size = readUnsigned(bytes, cursor)
+    if (id === 5) {
+      readUnsigned(bytes, cursor)
+      return (bytes[cursor.at] & 4) !== 0
+    }
+    cursor.at += size
+  }
+  return false
+}
+
 /** A Silk program stopped by a trap, with the report the program wrote. */
 export class SilkError extends Error {
   constructor(report, cause) {
@@ -79,9 +96,12 @@ export class SilkError extends Error {
   }
 }
 
+// A `usize` the module passes: a number from a wasm32 module, a BigInt from a wasm64 one.
+const word = (value) => (typeof value === 'bigint' ? Number(value) : value >>> 0)
+
 const reportLength = (instance) => {
   const length = instance.exports.silk_report_length
-  return typeof length === 'function' ? length() >>> 0 : 0
+  return typeof length === 'function' ? word(length()) : 0
 }
 
 // The report text `instance` wrote after its first `from` bytes.
@@ -91,7 +111,7 @@ const readReport = (instance, from) => {
   const end = reportLength(instance)
   if (typeof address !== 'function' || !(memory instanceof WebAssembly.Memory) || end <= from) return ''
   // A shared memory's view must be copied before it is decoded.
-  const view = new Uint8Array(memory.buffer, (address() >>> 0) + from, end - from).slice()
+  const view = new Uint8Array(memory.buffer, word(address()) + from, end - from).slice()
   return new TextDecoder().decode(view)
 }
 
@@ -129,7 +149,7 @@ const runRole = (data, post) => {
   // A message's parts, copied out of memory, until the part that ends it.
   let parts = []
   const log = (level, address, length, more) => {
-    parts.push(new Uint8Array(reading.exports.memory.buffer, address >>> 0, length >>> 0).slice())
+    parts.push(new Uint8Array(reading.exports.memory.buffer, word(address), word(length)).slice())
     if (more) return
     const joined = new Uint8Array(parts.reduce((total, part) => total + part.length, 0))
     let at = 0
@@ -148,7 +168,10 @@ const runRole = (data, post) => {
   const before = reportLength(reading)
   try {
     if (data.role === 'main') {
-      const status = instance.exports.main()
+      // LLVM gives a `main` without parameters the C parameters `argc` and `argv`, which a
+      // wasm64 module's engine converts from a BigInt.
+      const main = instance.exports.main
+      const status = main.length === 2 ? main(0, data.wide ? 0n : 0) : main()
       post({ kind: 'exit', status, report: readReport(reading, before) })
     } else {
       instance.exports.wasi_thread_start(data.thread, data.argument)
@@ -165,6 +188,7 @@ const runRole = (data, post) => {
 export const runWasm = async (bytes, options = {}) => {
   const module = await WebAssembly.compile(bytes)
   const limits = importedMemory(bytes)
+  const wide = wideMemory(bytes)
   const memory =
     limits === undefined
       ? undefined
@@ -183,7 +207,7 @@ export const runWasm = async (bytes, options = {}) => {
       settle(value)
     }
     const start = async (role) => {
-      const data = { ...role, module, memory, threads, parallelism }
+      const data = { ...role, module, memory, threads, parallelism, wide }
       const worker = await createWorker(workerUrl, data)
       workers.add(worker)
       listen(worker, (message) => {

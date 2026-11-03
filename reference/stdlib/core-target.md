@@ -73,6 +73,16 @@ Wasm32
 
 32-bit WebAssembly.
 
+<a id="Arch.Wasm64"></a>
+
+### `Wasm64`
+
+```silk
+Wasm64
+```
+
+64-bit WebAssembly (`memory64`).
+
 <a id="Arch.X86_64"></a>
 
 ### `X86_64`
@@ -440,4 +450,4 @@ Returns `true` if the build enables the CPU feature `value`.
 
 Category: Core.
 
-Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`.
+Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`, `wasm64-unknown-unknown`.

@@ -107,4 +107,4 @@ log: ConsoleLogger.writeConsole
 
 Category: Input and output.
 
-Profiles: `wasm32-unknown-unknown`.
+Profiles: `wasm32-unknown-unknown`, `wasm64-unknown-unknown`.
