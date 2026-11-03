@@ -1838,6 +1838,24 @@ pub fn connectionPhase(self: &Self) -> ConnectionPhase
 
 Returns the state of the connection.
 
+<a id="Accepted.impl.intoConnection"></a>
+
+### Method `intoConnection`
+
+```silk
+pub fn intoConnection(self: Self) -> Connection
+```
+
+Takes the connection out of `self`, and returns it.
+
+#### When to use
+Use it to keep a connection open past one callback, such as a client served across the
+frames of an event loop. Use [`withAccepted`](#withAccepted) when one callback serves the whole connection.
+
+#### Details
+Read [`peer`](#Accepted.impl.peer) first if you need the client address: it goes with `self`. Close the connection
+with `Connection.close` to see a close error. Dropping it closes it too, and ignores the error.
+
 <a id="listen"></a>
 
 ## `listen`

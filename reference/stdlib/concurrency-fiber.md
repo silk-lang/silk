@@ -10,6 +10,7 @@ Fibers: handles to child tasks, with typed outcomes and one observer each.
 | [`forkChild`](#Fiber.impl.forkChild) | Start structured child work under the current `Scheduler` |
 | [`join`](#Fiber.impl.join) | Wait for a child, and raise its failure in the current effect |
 | [`await`](#Fiber.impl.await) | Wait for a child, and get success, failure or cancellation as data |
+| [`isFinished`](#Fiber.impl.isFinished) | Check whether a child finished, without waiting |
 | [`interrupt`](#Fiber.impl.interrupt) | Cancel a child that is still running, and get its final outcome |
 | [`awaitEither`](#Fiber.impl.awaitEither) | Wait for the first of two children, and keep the other running |
 | [`race`](#Fiber.impl.race) | Take the result of whichever of two children finishes first, and cancel the other |
@@ -300,6 +301,32 @@ Consumes a Fiber and returns its success, typed failure, or cancellation as data
 
 A terminal Fiber returns immediately. A pending Fiber parks the current Execution and installs
 exactly one Wake. Observation and resumption allocate no storage.
+
+<a id="Fiber.impl.isFinished"></a>
+
+### Method `isFinished`
+
+```silk
+pub fn isFinished(self: &Self) -> bool
+```
+
+Whether the task has finished, by success, typed failure, or cancellation.
+
+#### When to use
+
+Use `isFinished` in a loop that must not park on one child, such as an event loop that starts
+work on Fibers and checks once per frame which of them finished. [`await`](#Fiber.impl.await) or [`join`](#Fiber.impl.join) on a
+finished Fiber returns at once, without parking.
+
+#### Details
+
+`isFinished` never parks, allocates no storage, and does not observe the outcome: the Fiber
+can still be awaited, joined, interrupted, or dropped.
+
+#### Gotchas
+
+A child runs only when the scheduler drives it, so a loop that checks must also park now and
+then, for example with [`yieldNow`](#Fiber.impl.yieldNow) or a wait for a timer, or its children never finish.
 
 <a id="Fiber.impl.interrupt"></a>
 
