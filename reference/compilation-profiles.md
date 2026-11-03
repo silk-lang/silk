@@ -205,8 +205,8 @@ against the parameter's declared type. A profile's `config` holds override-tier 
 that names no `target` builds for the host. Profile fields are kebab-case (`code-model`,
 `max-memory`); the earlier `codeModel`, `maxMemory` and `bindings` are refused, naming the current
 spelling. A profile's `backend` (`--backend` on the command line) picks the code generator: `llvm`, the
-default, or `direct`, which writes `wasm32-unknown-unknown` and `wasm32-wasip1` executables itself, without
-Clang. `--profile-input` JSON keeps `codeModel`, `maxMemory` and tagged `bindings`. Without a table
+default, or `direct`, which writes wasm32 executables itself, without Clang. A `wasm32-wasip2`
+component still needs wasm-tools and the Preview 1 adapter, as with `llvm`. `--profile-input` JSON keeps `codeModel`, `maxMemory` and tagged `bindings`. Without a table
 of that name, `dev` (unoptimized, with debug information) and `release` (optimized, without it) are
 built-in profiles for the host. A complete request override replaces project profile selection. CLI `--profile`
 and LSP profile-name settings select a project profile; `--profile-input` and its LSP equivalent
