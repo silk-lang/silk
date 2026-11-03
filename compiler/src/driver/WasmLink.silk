@@ -16,6 +16,11 @@
 //!   `silk_frames` lie together between `__start_silk_frames` and `__stop_silk_frames`.
 //! - The module exports `memory`, every function `LlvmCode` marks `wasm-export-name`, and the
 //!   entry: `_start` on WASI, `main` otherwise.
+//! - A threaded module (`threading = "multi"`) imports one shared memory as `env.memory` instead.
+//!   Its data is a passive segment that the start function `__wasm_init_memory` copies in once,
+//!   for the first instance; later instances wait for that copy. Thread-local objects form a
+//!   block of their own: the main thread's copy lies in the data, which `__tls_base` (global 1)
+//!   starts at, and `__wasm_init_tls` fills a new thread's copy from a second passive segment.
 
 import backend.Bitcode
 import backend.Bitcode {Module}
@@ -27,6 +32,7 @@ import semantic.ContentHash {ContentHash}
 import semantic.InternIndex {InternIndex}
 import backend.WasmModule
 import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.core.ownership {Copy}
 import silk.collections.bytes {Bytes}
 import silk.collections.list {List}
 import silk.collections.slice {Slice}
@@ -126,6 +132,30 @@ struct Import {
   name: Bytes,
 }
 
+/// How a link lays the module out.
+pub struct Options {
+  /// Export `_start` as the entry instead of `main`.
+  pub wasi: bool,
+  /// The memory's bound in bytes, or zero for none; a threaded module's is 1 GiB without one.
+  pub maxMemory: u64,
+  /// Add a `name` section naming each function by its symbol, as `wasm-ld` does.
+  pub named: bool,
+  /// Share the memory between threads, as above.
+  pub threaded: bool,
+}
+
+impl Copy for Options {}
+
+/// The threaded layout's parts: the thread-local template, the main thread's block, the word the
+/// start function's copy claims, and the functions the link writes.
+struct Shared {
+  threaded: bool,
+  template: Bytes,
+  mainBlock: u64,
+  flag: u64,
+  initMemory: usize,
+}
+
 /// What a link made: the module's bytes, the code cache for the next link, and how many
 /// fragments it translated rather than reused.
 pub struct Linked {
@@ -138,12 +168,16 @@ pub struct Linked {
   pub lines: List<u64>,
 }
 
-/// Links the program `fragments`, whose merged module is `module`, as a WebAssembly module. A
-/// fragment `previous` holds is not translated again. `wasi` exports `_start` as the entry instead
-/// of `main`; `maxMemory` bounds the memory in bytes, or is zero for no bound. `named` adds a
-/// `name` section naming each function by its symbol, as `wasm-ld` does.
-pub effect fn link(fragments: &[u8], module: &Module, previous: &CodeCache, wasi: bool, maxMemory: u64, named: bool) -> Linked
+/// Links the program `fragments`, whose merged module is `module`, as a WebAssembly module laid
+/// out by `options`. A fragment `previous` holds is not translated again; `previous` must come
+/// from a link with the same `threaded`.
+pub effect fn link(fragments: &[u8], module: &Module, previous: &CodeCache, options: Options) -> Linked
 ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let wasi = options.wasi
+  let named = options.named
+  let threaded = options.threaded
+  let mut maxMemory = options.maxMemory
+  if threaded && maxMemory == 0 { maxMemory = 1073741824 }
   let globals = module.globalCount()
   let mut placement = run Placement.make(globals)
   // Imports first: every function without a body that names a wasm import.
@@ -183,7 +217,7 @@ pub effect fn link(fragments: &[u8], module: &Module, previous: &CodeCache, wasi
       let fragment = run Module.read(fragments, &mut at)
       let mut body = usize.ZERO
       while body < fragment.bodyCount() {
-        run CodeCache.append(&mut cache, run WasmCode.translate(&fragment, body))
+        run CodeCache.append(&mut cache, run WasmCode.translate(&fragment, body, threaded))
         body = body + usize.ONE
       }
       translated = translated + usize.ONE
@@ -202,7 +236,25 @@ pub effect fn link(fragments: &[u8], module: &Module, previous: &CodeCache, wasi
     }
     at = at + usize.ONE
   }
-  // The data: the frame table's entries together, then every other defined object.
+  // A threaded module's own functions follow the bodies: `__wasm_init_tls`, when the code calls
+  // it, then the start function.
+  let mut written = importCount + List<usize>.length(&defined)
+  let mut initTls = usize.MAX
+  let mut initMemory = usize.MAX
+  if threaded {
+    let initializer = module.find(b"__wasm_init_tls")
+    if initializer != usize.MAX && List<usize>.get(&placement.functions, initializer) == usize.MAX {
+      List<usize>.set(&mut placement.functions, initializer, written)
+      initTls = written
+      written = written + usize.ONE
+    }
+    initMemory = written
+    written = written + usize.ONE
+  }
+  // The data: the frame table's entries together, then every other defined object. A threaded
+  // module's thread-local objects are placed in their own block, at offsets from its start.
+  let mut tlsSize: u64 = 0
+  let mut tlsAlign: u64 = 1
   let mut cursor = stackTop()
   let mut framesStart = u64.MAX
   let mut framesEnd = u64.MAX
@@ -218,7 +270,14 @@ pub effect fn link(fragments: &[u8], module: &Module, previous: &CodeCache, wasi
           framed = same(module.sectionName(section), b"silk_frames")
           metadata = same(module.sectionName(section), b"llvm.metadata")
         }
-        if !metadata && (framed == (pass == usize.ZERO)) {
+        let local = threaded && module.globalThreadLocal(global) != 0
+        if local && pass == usize.ZERO {
+          let alignment = objectAlignment(module, global)
+          if alignment > tlsAlign { tlsAlign = alignment }
+          tlsSize = alignUp(tlsSize, alignment)
+          List<u64>.set(&mut placement.addresses, global, tlsSize)
+          tlsSize = tlsSize + WasmCode.sizeOf(module, module.globalType(global))
+        } else if !local && !metadata && (framed == (pass == usize.ZERO)) {
           cursor = alignUp(cursor, objectAlignment(module, global))
           if framed && framesStart == u64.MAX { framesStart = cursor }
           List<u64>.set(&mut placement.addresses, global, cursor)
@@ -234,6 +293,16 @@ pub effect fn link(fragments: &[u8], module: &Module, previous: &CodeCache, wasi
     framesStart = stackTop()
     framesEnd = stackTop()
   }
+  // The main thread's thread-local block, then the start function's word, last so the data
+  // segment's copy never covers it.
+  let mut mainBlock: u64 = 0
+  let mut flag: u64 = 0
+  if threaded {
+    mainBlock = alignUp(cursor, tlsAlign)
+    cursor = alignUp(mainBlock + tlsSize, 4)
+    flag = cursor
+    cursor = cursor + 4
+  }
   let dataEnd = alignUp(cursor, 16)
   // The symbols the link defines, and weak objects nothing defines.
   global = usize.ZERO
@@ -245,21 +314,46 @@ pub effect fn link(fragments: &[u8], module: &Module, previous: &CodeCache, wasi
       else if same(name, b"__heap_base") || same(name, b"__data_end") { List<u64>.set(&mut placement.addresses, global, dataEnd) }
       else if module.globalLinkage(global) == Bitcode.linkExternWeak() { List<u64>.set(&mut placement.addresses, global, 0) }
     }
+    // The thread-local block's size and alignment are the values of their intrinsics.
+    if module.isFunction(global) && startsWith(module.globalName(global), b"llvm.wasm.tls.size") {
+      List<u64>.set(&mut placement.addresses, global, tlsSize)
+    }
+    if module.isFunction(global) && startsWith(module.globalName(global), b"llvm.wasm.tls.align") {
+      List<u64>.set(&mut placement.addresses, global, tlsAlign)
+    }
     global = global + usize.ONE
   }
-  // The data image, from `stackTop()`.
+  // The data image, from `stackTop()`, and the thread-local template.
   let mut image = run Bytes.zeroed(u64.toUsize(dataEnd - stackTop()))
+  let mut template = run Bytes.zeroed(u64.toUsize(tlsSize))
   global = usize.ZERO
   while global < globals {
     let address = List<u64>.get(&placement.addresses, global)
-    if !module.isFunction(global) && module.isDefined(global) && address != u64.MAX && address >= stackTop() {
+    let local = threaded && module.globalThreadLocal(global) != 0
+    if !module.isFunction(global) && module.isDefined(global) && address != u64.MAX && (local || address >= stackTop()) {
       let initializer = module.globalInitializer(global)
       if initializer != Bitcode.none() {
-        run WasmCode.writeConstant(module, initializer, module.globalType(global), &mut image, u64.toUsize(address - stackTop()), &mut placement,
-          module.globalName(global))
+        if local {
+          run WasmCode.writeConstant(module, initializer, module.globalType(global), &mut template, u64.toUsize(address), &mut placement,
+            module.globalName(global))
+        } else {
+          run WasmCode.writeConstant(module, initializer, module.globalType(global), &mut image, u64.toUsize(address - stackTop()), &mut placement,
+            module.globalName(global))
+        }
       }
     }
     global = global + usize.ONE
+  }
+  // The main thread's block starts as the template.
+  if threaded {
+    let slots = Bytes.asMutSlice(&mut image)
+    let source = Bytes.asSlice(&template)
+    let base = u64.toUsize(mainBlock - stackTop())
+    let mut byte = usize.ZERO
+    while byte < source.length {
+      slots[base + byte] = source[byte]
+      byte = byte + usize.ONE
+    }
   }
   // The function types: the imports', then each body's as the code names them.
   let mut types = Types {encodings: List<Bytes>.make(), lookup: InternIndex.make()}
@@ -274,7 +368,7 @@ pub effect fn link(fragments: &[u8], module: &Module, previous: &CodeCache, wasi
   }
   // The code, each relocation filled in. A call to a weak function nothing defines calls a stub
   // that traps, as `wasm-ld` makes it.
-  let mut stubs = Stubs {globals: List<usize>.make(), first: importCount + List<usize>.length(&defined)}
+  let mut stubs = Stubs {globals: List<usize>.make(), first: written}
   let listed = List<usize>.asSlice(&defined)
   // Triples of an entry, an offset in it and a source place, turned into module offsets once the
   // code section is laid out.
@@ -292,6 +386,17 @@ pub effect fn link(fragments: &[u8], module: &Module, previous: &CodeCache, wasi
     run List<Bytes>.append(&mut entries, run relocated(module, body, &mut placement, &mut types, &mut stubs, &mut rows, at))
     at = at + usize.ONE
   }
+  // The threaded module's own functions.
+  let mut imageUsed = Bytes.length(&image)
+  while imageUsed > usize.ZERO && Bytes.asSlice(&image)[imageUsed - usize.ONE] == 0 { imageUsed = imageUsed - usize.ONE }
+  if initTls != usize.MAX {
+    run List<usize>.append(&mut typeIndices, run types.index(&[0x60, 1, WasmModule.i32Type(), 0]))
+    run List<Bytes>.append(&mut entries, run initTlsEntry(tlsSize))
+  }
+  if initMemory != usize.MAX {
+    run List<usize>.append(&mut typeIndices, run types.index(&[0x60, 0, 0]))
+    run List<Bytes>.append(&mut entries, run initMemoryEntry(flag, imageUsed))
+  }
   let stubbed = List<usize>.asSlice(&stubs.globals)
   at = usize.ZERO
   while at < stubbed.length {
@@ -301,8 +406,9 @@ pub effect fn link(fragments: &[u8], module: &Module, previous: &CodeCache, wasi
     at = at + usize.ONE
   }
   let mut starts = List<usize>.make()
+  let shared = Shared {threaded: threaded, template: move template, mainBlock: mainBlock, flag: flag, initMemory: initMemory}
   let mut output = run assemble(module, &placement, List<Bytes>.asSlice(&types.encodings), listedImports, List<usize>.asSlice(&importTypes),
-    List<usize>.asSlice(&owners), List<usize>.asSlice(&typeIndices), List<Bytes>.asSlice(&entries), &image, dataEnd, wasi, maxMemory, &mut starts)
+    List<usize>.asSlice(&owners), List<usize>.asSlice(&typeIndices), List<Bytes>.asSlice(&entries), &image, dataEnd, wasi, maxMemory, &shared, &mut starts)
   // Rows from entry offsets to module offsets, each body's from its entry's start.
   let mut lines = run List<u64>.makeWithCapacity(List<u64>.length(&rows))
   let triples = List<u64>.asSlice(&rows)
@@ -318,7 +424,10 @@ pub effect fn link(fragments: &[u8], module: &Module, previous: &CodeCache, wasi
   if named {
     // Function names, by index: the imports, the bodies, then the stubs.
     let mut functions = Bytes.make()
-    run WasmModule.index(&mut functions, listedImports.length + listed.length + stubbed.length)
+    let mut own = usize.ZERO
+    if initTls != usize.MAX { own = own + usize.ONE }
+    if initMemory != usize.MAX { own = own + usize.ONE }
+    run WasmModule.index(&mut functions, listedImports.length + listed.length + own + stubbed.length)
     let mut index = usize.ZERO
     at = usize.ZERO
     while at < listedImports.length {
@@ -333,6 +442,16 @@ pub effect fn link(fragments: &[u8], module: &Module, previous: &CodeCache, wasi
       run WasmModule.name(&mut functions, Bytes.asSlice(&bodies[listed[at]].symbol))
       index = index + usize.ONE
       at = at + usize.ONE
+    }
+    if initTls != usize.MAX {
+      run WasmModule.index(&mut functions, index)
+      run WasmModule.name(&mut functions, b"__wasm_init_tls")
+      index = index + usize.ONE
+    }
+    if initMemory != usize.MAX {
+      run WasmModule.index(&mut functions, index)
+      run WasmModule.name(&mut functions, b"__wasm_init_memory")
+      index = index + usize.ONE
     }
     at = usize.ZERO
     while at < stubbed.length {
@@ -349,6 +468,78 @@ pub effect fn link(fragments: &[u8], module: &Module, previous: &CodeCache, wasi
     run WasmModule.section(&mut output, 0, &names)
   }
   return Linked {output: move output, cache: move cache, translated: translated, lines: move lines}
+}
+
+// The `0xFE` atomic access `code` to the `i32` at the constant address on the stack.
+effect fn atomicWord(out: &mut Bytes, code: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  run WasmModule.prefixed(&mut out.*, 0xFE, code)
+  run WasmModule.index(&mut out.*, 2)
+  return run WasmModule.unsigned(&mut out.*, 0)
+}
+
+// `__wasm_init_tls(block)`: `__tls_base` becomes `block`, which takes a copy of the thread-local
+// template, segment 1.
+effect fn initTlsEntry(tlsSize: u64) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut out = Bytes.make()
+  run WasmModule.index(&mut out, usize.ZERO)
+  run WasmModule.localGet(&mut out, usize.ZERO)
+  run WasmModule.globalSet(&mut out, usize.ONE)
+  run WasmModule.localGet(&mut out, usize.ZERO)
+  run WasmModule.i32Const(&mut out, 0)
+  run WasmModule.i32Const(&mut out, tlsSize)
+  run WasmModule.prefixed(&mut out, 0xFC, 8)
+  run WasmModule.index(&mut out, usize.ONE)
+  run WasmModule.byte(&mut out, 0)
+  run WasmModule.op(&mut out, WasmModule.opEnd())
+  return move out
+}
+
+// `__wasm_init_memory`, every instance's start function, as `wasm-ld` writes it: the instance that
+// moves the word at `flag` from 0 to 1 copies the data segment's `used` bytes in, sets the word to
+// 2 and wakes the others; an instance that finds 1 waits for 2. Each then drops the segment.
+effect fn initMemoryEntry(flag: u64, used: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut out = Bytes.make()
+  run WasmModule.index(&mut out, usize.ZERO)
+  run WasmModule.structured(&mut out, WasmModule.opBlock())
+  run WasmModule.structured(&mut out, WasmModule.opBlock())
+  run WasmModule.structured(&mut out, WasmModule.opBlock())
+  run WasmModule.i32Const(&mut out, flag)
+  run WasmModule.i32Const(&mut out, 0)
+  run WasmModule.i32Const(&mut out, 1)
+  run atomicWord(&mut out, 0x48)
+  // br_table 0 1 2: 0 copies, 1 waits, 2 is done.
+  run WasmModule.op(&mut out, 0x0E)
+  run WasmModule.index(&mut out, 2)
+  run WasmModule.index(&mut out, usize.ZERO)
+  run WasmModule.index(&mut out, usize.ONE)
+  run WasmModule.index(&mut out, 2)
+  run WasmModule.op(&mut out, WasmModule.opEnd())
+  run WasmModule.i32Const(&mut out, stackTop())
+  run WasmModule.i32Const(&mut out, 0)
+  run WasmModule.i32Const(&mut out, usize.toU64(used))
+  run WasmModule.prefixed(&mut out, 0xFC, 8)
+  run WasmModule.index(&mut out, usize.ZERO)
+  run WasmModule.byte(&mut out, 0)
+  run WasmModule.i32Const(&mut out, flag)
+  run WasmModule.i32Const(&mut out, 2)
+  run atomicWord(&mut out, 0x17)
+  run WasmModule.i32Const(&mut out, flag)
+  run WasmModule.i32Const(&mut out, u64.MAX)
+  run atomicWord(&mut out, 0x00)
+  run WasmModule.op(&mut out, WasmModule.opDrop())
+  run WasmModule.op(&mut out, WasmModule.opBr())
+  run WasmModule.index(&mut out, usize.ONE)
+  run WasmModule.op(&mut out, WasmModule.opEnd())
+  run WasmModule.i32Const(&mut out, flag)
+  run WasmModule.i32Const(&mut out, 1)
+  run WasmModule.i64Const(&mut out, u64.MAX)
+  run atomicWord(&mut out, 0x01)
+  run WasmModule.op(&mut out, WasmModule.opDrop())
+  run WasmModule.op(&mut out, WasmModule.opEnd())
+  run WasmModule.prefixed(&mut out, 0xFC, 9)
+  run WasmModule.index(&mut out, usize.ZERO)
+  run WasmModule.op(&mut out, WasmModule.opEnd())
+  return move out
 }
 
 /// The interned function types: each one's encoding, `0x60`, parameters and results.
@@ -467,7 +658,7 @@ effect fn placeRows(rows: &mut List<u64>, index: usize, locations: &[u64], locat
 }
 
 effect fn assemble(module: &Module, placement: &Placement, types: &[Bytes], imports: &[Import], importTypes: &[usize], owners: &[usize],
-  typeIndices: &[usize], entries: &[Bytes], image: &Bytes, dataEnd: u64, wasi: bool, maxMemory: u64, starts: &mut List<usize>) -> Bytes
+  typeIndices: &[usize], entries: &[Bytes], image: &Bytes, dataEnd: u64, wasi: bool, maxMemory: u64, shared: &Shared, starts: &mut List<usize>) -> Bytes
 ! Unsupported | OutOfMemoryError ? &mut Allocator {
   let mut out = Bytes.make()
   run WasmModule.header(&mut out)
@@ -480,10 +671,16 @@ effect fn assemble(module: &Module, placement: &Placement, types: &[Bytes], impo
     at = at + usize.ONE
   }
   run WasmModule.section(&mut out, WasmModule.typeSection(), &section)
-  // Imports.
-  if imports.length > usize.ZERO {
+  // Imports: the functions, then a threaded module's shared memory, bounded as a shared memory
+  // must be.
+  let pages = (dataEnd + 65535) / 65536
+  let mut limit = maxMemory / 65536
+  if limit < pages { limit = pages }
+  if imports.length > usize.ZERO || shared.threaded {
     section = Bytes.make()
-    run WasmModule.index(&mut section, imports.length)
+    let mut count = imports.length
+    if shared.threaded { count = count + usize.ONE }
+    run WasmModule.index(&mut section, count)
     at = usize.ZERO
     while at < imports.length {
       run WasmModule.name(&mut section, Bytes.asSlice(&imports[at].module))
@@ -491,6 +688,14 @@ effect fn assemble(module: &Module, placement: &Placement, types: &[Bytes], impo
       run WasmModule.byte(&mut section, 0)
       run WasmModule.index(&mut section, importTypes[at])
       at = at + usize.ONE
+    }
+    if shared.threaded {
+      run WasmModule.name(&mut section, b"env")
+      run WasmModule.name(&mut section, b"memory")
+      run WasmModule.byte(&mut section, 2)
+      run WasmModule.byte(&mut section, 3)
+      run WasmModule.unsigned(&mut section, pages)
+      run WasmModule.unsigned(&mut section, limit)
     }
     run WasmModule.section(&mut out, WasmModule.importSection(), &section)
   }
@@ -513,35 +718,42 @@ effect fn assemble(module: &Module, placement: &Placement, types: &[Bytes], impo
   run WasmModule.index(&mut section, table.length + usize.ONE)
   run WasmModule.section(&mut out, WasmModule.tableSection(), &section)
   // Memory: enough pages for the data, growing up to `maxMemory`.
-  section = Bytes.make()
-  run WasmModule.index(&mut section, usize.ONE)
-  let pages = (dataEnd + 65535) / 65536
-  if maxMemory == 0 {
-    run WasmModule.byte(&mut section, 0)
-    run WasmModule.unsigned(&mut section, pages)
-  } else {
-    let mut limit = maxMemory / 65536
-    if limit < pages { limit = pages }
-    run WasmModule.byte(&mut section, 1)
-    run WasmModule.unsigned(&mut section, pages)
-    run WasmModule.unsigned(&mut section, limit)
+  if !shared.threaded {
+    section = Bytes.make()
+    run WasmModule.index(&mut section, usize.ONE)
+    if maxMemory == 0 {
+      run WasmModule.byte(&mut section, 0)
+      run WasmModule.unsigned(&mut section, pages)
+    } else {
+      run WasmModule.byte(&mut section, 1)
+      run WasmModule.unsigned(&mut section, pages)
+      run WasmModule.unsigned(&mut section, limit)
+    }
+    run WasmModule.section(&mut out, WasmModule.memorySection(), &section)
   }
-  run WasmModule.section(&mut out, WasmModule.memorySection(), &section)
-  // `__stack_pointer`.
+  // `__stack_pointer`, then a threaded module's `__tls_base`, the main thread's block.
   section = Bytes.make()
-  run WasmModule.index(&mut section, usize.ONE)
+  if shared.threaded { run WasmModule.index(&mut section, 2) } else { run WasmModule.index(&mut section, usize.ONE) }
   run WasmModule.byte(&mut section, WasmModule.i32Type())
   run WasmModule.byte(&mut section, 1)
   run WasmModule.i32Const(&mut section, stackTop())
   run WasmModule.op(&mut section, WasmModule.opEnd())
+  if shared.threaded {
+    run WasmModule.byte(&mut section, WasmModule.i32Type())
+    run WasmModule.byte(&mut section, 1)
+    run WasmModule.i32Const(&mut section, shared.mainBlock)
+    run WasmModule.op(&mut section, WasmModule.opEnd())
+  }
   run WasmModule.section(&mut out, WasmModule.globalSection(), &section)
   // Exports.
   let mut exports = Bytes.make()
   let mut exportNames = List<Bytes>.make()
-  run WasmModule.name(&mut exports, b"memory")
-  run WasmModule.byte(&mut exports, 2)
-  run WasmModule.index(&mut exports, usize.ZERO)
-  run List<Bytes>.append(&mut exportNames, run Bytes.copy(b"memory"))
+  if !shared.threaded {
+    run WasmModule.name(&mut exports, b"memory")
+    run WasmModule.byte(&mut exports, 2)
+    run WasmModule.index(&mut exports, usize.ZERO)
+    run List<Bytes>.append(&mut exportNames, run Bytes.copy(b"memory"))
+  }
   let mut entryName: &[u8] = b"main"
   if wasi { entryName = b"_start" }
   at = usize.ZERO
@@ -561,6 +773,11 @@ effect fn assemble(module: &Module, placement: &Placement, types: &[Bytes], impo
   run WasmModule.index(&mut section, List<Bytes>.length(&exportNames))
   run Bytes.append(&mut section, Bytes.asSlice(&exports))
   run WasmModule.section(&mut out, WasmModule.exportSection(), &section)
+  if shared.threaded {
+    section = Bytes.make()
+    run WasmModule.index(&mut section, shared.initMemory)
+    run WasmModule.section(&mut out, 8, &section)
+  }
   // The table's functions, from slot 1.
   if table.length > usize.ZERO {
     section = Bytes.make()
@@ -575,6 +792,12 @@ effect fn assemble(module: &Module, placement: &Placement, types: &[Bytes], impo
       at = at + usize.ONE
     }
     run WasmModule.section(&mut out, WasmModule.elementSection(), &section)
+  }
+  // A threaded module's two passive segments, which its code names.
+  if shared.threaded {
+    section = Bytes.make()
+    run WasmModule.index(&mut section, 2)
+    run WasmModule.section(&mut out, WasmModule.dataCountSection(), &section)
   }
   // The code.
   section = Bytes.make()
@@ -599,7 +822,17 @@ effect fn assemble(module: &Module, placement: &Placement, types: &[Bytes], impo
   let bytes = Bytes.asSlice(image)
   let mut used = bytes.length
   while used > usize.ZERO && bytes[used - usize.ONE] == 0 { used = used - usize.ONE }
-  if used > usize.ZERO {
+  if shared.threaded {
+    section = Bytes.make()
+    run WasmModule.index(&mut section, 2)
+    run WasmModule.byte(&mut section, 1)
+    run WasmModule.index(&mut section, used)
+    run Bytes.append(&mut section, Slice.view<u8>(bytes, usize.ZERO, used))
+    run WasmModule.byte(&mut section, 1)
+    run WasmModule.index(&mut section, Bytes.length(&shared.template))
+    run Bytes.append(&mut section, Bytes.asSlice(&shared.template))
+    run WasmModule.section(&mut out, WasmModule.dataSection(), &section)
+  } else if used > usize.ZERO {
     section = Bytes.make()
     run WasmModule.index(&mut section, usize.ONE)
     run WasmModule.byte(&mut section, 0)

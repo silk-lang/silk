@@ -2789,6 +2789,28 @@ const program = Effect.gen(function* () {
     process.env,
   )
   assert.equal(threadedRun.status, 42, threadedRun.stderr)
+  // The direct backend links the same shared memory itself, and its threads run the same.
+  const direct = yield* invoke(
+    silk,
+    ['build', '--manifest-path', join('threads', 'silk.toml'), '--profile', 'web', '--backend', 'direct', '--stdlib', standardLibrary],
+    directory,
+    { ...process.env, SILK_CLANG: '/nonexistent' },
+  )
+  assert.equal(direct.status, 0, direct.stderr)
+  const directModule = new WebAssembly.Module(yield* fs.readFile(threadedPath))
+  assert.deepEqual(
+    WebAssembly.Module.imports(directModule)
+      .map((entry) => `${entry.module}.${entry.name}`)
+      .sort(),
+    ['env.memory', 'wasi.thread-spawn'],
+  )
+  const directRun = yield* invoke(
+    process.execPath,
+    [join(standardLibrary, 'host/wasm-runner.mjs'), threadedPath],
+    directory,
+    process.env,
+  )
+  assert.equal(directRun.status, 42, directRun.stderr)
   // Freed memory is reused: 100 threads with 1 MiB stacks and repeated list growth fit in 64 MiB.
   const churn = join(directory, 'churn')
   yield* fs.makeDirectory(churn, { recursive: true })

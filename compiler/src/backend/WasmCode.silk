@@ -654,6 +654,9 @@ struct Function {
   /// The element a lane-wise vector operation is translating, or `usize.MAX` outside one: values
   /// then push and store only that element's lanes, and emitters see element types.
   focus: usize,
+  /// Whether the module shares its memory between threads: atomics are then the memory's own,
+  /// and a thread-local object lies at its offset from `__tls_base`, global 1.
+  threaded: bool,
 }
 
 // Marks the code emitted next as coming from source place `place`, unless it is unknown or the
@@ -723,6 +726,15 @@ effect fn pushConstant(function: &mut Function, module: &Module, value: Value, w
     return run WasmModule.i32Const(&mut function.*.code, value.bits)
   }
   let target = run globalSymbol(&mut function.*, module, value.global)
+  if function.threaded && module.globalThreadLocal(value.global) != 0 {
+    // Each thread's copy lies at the object's offset in the thread-local block from `__tls_base`.
+    run WasmModule.globalGet(&mut function.*.code, usize.ONE)
+    run emit(&mut function.*, 0x41)
+    run relocate(&mut function.*, RelocationKind.Address, target, value.bits)
+    run emit(&mut function.*, 0x6A)
+    if wide { run emit(&mut function.*, 0xAD) }
+    return ()
+  }
   if wide {
     run emit(&mut function.*, 0x42)
     return run relocate(&mut function.*, RelocationKind.WideAddress, target, value.bits)
@@ -758,8 +770,8 @@ pub struct Translated {
   pub locations: List<u64>,
 }
 
-/// Translates body `body` of `module`.
-pub effect fn translate(module: &Module, body: usize) -> Translated
+/// Translates body `body` of `module`, for a module whose memory threads share when `threaded`.
+pub effect fn translate(module: &Module, body: usize, threaded: bool) -> Translated
 ! Unsupported | OutOfMemoryError ? &mut Allocator {
   let global = module.bodyGlobal(body)
   let symbol = module.globalName(global)
@@ -800,7 +812,7 @@ pub effect fn translate(module: &Module, body: usize) -> Translated
   }
   let mut function = Function {code: Bytes.make(), locals: List<u8>.make(), parameters: usize.ZERO, values: List<usize>.make(),
     frame: usize.MAX, saved: usize.MAX, entryEnd: usize.ZERO, symbol: run Bytes.copy(symbol), relocations: List<Relocation>.make(),
-    symbols: List<Bytes>.make(), signatures: List<Bytes>.make(), symbolOf: List<usize>.make(), locations: List<u64>.make(), focus: usize.MAX}
+    symbols: List<Bytes>.make(), signatures: List<Bytes>.make(), symbolOf: List<usize>.make(), locations: List<u64>.make(), focus: usize.MAX, threaded: threaded}
   run List<usize>.appendRepeated(&mut function.symbolOf, usize.MAX, module.globalCount())
   let own = run signatureIndex(&mut function, Bytes.asSlice(&signature))
   if List<Block>.length(&blocks) > usize.ZERO {
@@ -1716,6 +1728,12 @@ effect fn emitInstruction(function: &mut Function, module: &Module, body: usize,
     if staticCount(module, operand(words, record, 2)) != u64.MAX && record.header < function.entryEnd { return () }
     return run dynamicAlloca(&mut function.*, module, body, words, record)
   }
+  if function.threaded && code == Bitcode.instructionLoadAtomic() {
+    return run emitAtomicLoad(&mut function.*, module, body, words, record)
+  }
+  if function.threaded && code == Bitcode.instructionStoreAtomic() {
+    return run emitAtomicStore(&mut function.*, module, body, words, record)
+  }
   if code == Bitcode.instructionLoad() || code == Bitcode.instructionLoadAtomic() {
     let ty = operand(words, record, usize.ONE)
     run loadValue(&mut function.*, module, body, operand(words, record, usize.ZERO), ty)
@@ -1780,7 +1798,13 @@ effect fn emitInstruction(function: &mut Function, module: &Module, body: usize,
   if code == Bitcode.instructionCompareExchange() {
     return run emitCompareExchange(&mut function.*, module, body, words, record)
   }
-  if code == Bitcode.instructionFence() { return () }
+  if code == Bitcode.instructionFence() {
+    if function.threaded {
+      run WasmModule.prefixed(&mut function.*.code, 0xFE, 3)
+      return run WasmModule.byte(&mut function.*.code, 0)
+    }
+    return ()
+  }
   if code == Bitcode.instructionLandingPad() {
     // Never reached: the wasm target does not unwind. Its value lanes keep their zero.
     return ()
@@ -2701,6 +2725,9 @@ effect fn emitCall(function: &mut Function, module: &Module, body: usize, words:
   if Bitcode.isGlobal(callee) && startsWith(module.globalName(Bitcode.referenceIndex(callee)), b"llvm.") {
     return run emitIntrinsic(&mut function.*, module, body, words, record, Bitcode.referenceIndex(callee), first)
   }
+  if Bitcode.isConstant(callee) && module.constantCode(callee) == Bitcode.constantInlineAssembly() {
+    return run emitInlineAssembly(&mut function.*, module, body, words, record, callee, first)
+  }
   if module.typeCode(functionType) == Bitcode.typeVariadicFunction() { run unsupported(b"a variadic call", Bytes.asSlice(&function.symbol)) }
   let mut argument = first
   while argument < operandCount(record) {
@@ -2768,6 +2795,17 @@ effect fn emitIntrinsic(function: &mut Function, module: &Module, body: usize, w
     let value = operand(words, record, first)
     run pushValue(&mut function.*, module, body, value)
     run emit(&mut function.*, pick(0x91, 0x9F, scalarType(module, elementType(module, module.typeIn(body, value))) == WasmModule.f64Type()))
+    return run storeResult(&mut function.*, module, body, record)
+  }
+  if startsWith(name, b"wasm.tls.size") || startsWith(name, b"wasm.tls.align") {
+    // The link places the thread-local block, so these resolve as the intrinsic's own value.
+    let target = run globalSymbol(&mut function.*, module, global)
+    run emit(&mut function.*, 0x41)
+    run relocate(&mut function.*, RelocationKind.Address, target, 0)
+    return run storeResult(&mut function.*, module, body, record)
+  }
+  if startsWith(name, b"wasm.tls.base") {
+    run WasmModule.globalGet(&mut function.*.code, usize.ONE)
     return run storeResult(&mut function.*, module, body, record)
   }
   if startsWith(name, b"frameaddress") {
@@ -3204,27 +3242,59 @@ effect fn emitSaturating(function: &mut Function, module: &Module, body: usize, 
   return run storeResult(&mut function.*, module, body, record)
 }
 
-// Atomics. Without shared memory nothing runs between a load and a store, so a read-modify-write
-// is the two plainly.
+// Atomics. In a module whose memory threads share, each is the memory's own atomic access, and
+// an operation wasm has no instruction for loops on a compare-exchange. Otherwise nothing runs
+// between a load and a store, so a read-modify-write is the two plainly.
 
-effect fn emitReadModifyWrite(function: &mut Function, module: &Module, body: usize, words: &[u64], record: Record) -> ()
-! Unsupported | OutOfMemoryError ? &mut Allocator {
-  let pointer = operand(words, record, usize.ZERO)
-  let value = operand(words, record, usize.ONE)
-  let op = operand(words, record, 2)
-  let ty = module.typeIn(body, value)
-  if laneCount(module, ty) != usize.ONE || module.typeCode(ty) != Bitcode.typeInteger() && module.typeCode(ty) != Bitcode.typePointer() {
-    run unsupported(b"an atomic operation on this type", Bytes.asSlice(&function.symbol))
+// The `0xFE` code of an atomic access to a `ty` in the group whose 32-bit form is `base`: each
+// group lists the 32-bit form, the 64-bit one, then the narrow ones of 8 and 16 bits on `i32`.
+fn atomicCode(module: &Module, ty: u64, base: u64) -> u64 {
+  let size = storeSizeOf(module, ty)
+  if scalarType(module, ty) == WasmModule.i64Type() {
+    if size == 8 { return base + 1 }
+    return u64.MAX
   }
-  let bits = widthOf(module, ty)
+  if size == 4 { return base }
+  if size == 1 { return base + 2 }
+  if size == 2 { return base + 3 }
+  return u64.MAX
+}
+
+// Atomic access `code` of a `ty`, aligned to its size as wasm requires, at offset zero.
+effect fn atomicAccess(function: &mut Function, module: &Module, ty: u64, code: u64) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if code == u64.MAX { run unsupported(b"an atomic access of this type", Bytes.asSlice(&function.symbol)) }
+  run WasmModule.prefixed(&mut function.*.code, 0xFE, code)
+  let size = storeSizeOf(module, ty)
+  let mut exponent = usize.ZERO
+  while u64.shiftLeft(1, usize.toU64(exponent)) < size { exponent = exponent + usize.ONE }
+  run WasmModule.index(&mut function.*.code, exponent)
+  return run WasmModule.unsigned(&mut function.*.code, 0)
+}
+
+effect fn emitAtomicLoad(function: &mut Function, module: &Module, body: usize, words: &[u64], record: Record) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let ty = operand(words, record, usize.ONE)
+  run pushValue(&mut function.*, module, body, operand(words, record, usize.ZERO))
+  run atomicAccess(&mut function.*, module, ty, atomicCode(module, ty, 0x10))
+  return run storeResult(&mut function.*, module, body, record)
+}
+
+effect fn emitAtomicStore(function: &mut Function, module: &Module, body: usize, words: &[u64], record: Record) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let value = operand(words, record, usize.ONE)
+  let ty = module.typeIn(body, value)
+  run pushValue(&mut function.*, module, body, operand(words, record, usize.ZERO))
+  run pushValue(&mut function.*, module, body, value)
+  return run atomicAccess(&mut function.*, module, ty, atomicCode(module, ty, 0x17))
+}
+
+// Pushes what read-modify-write `op` stores: its result on the old value in local `old` and
+// `value`.
+effect fn pushModified(function: &mut Function, module: &Module, body: usize, op: u64, old: usize, value: u64, bits: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
   let isWide = wide(bits)
-  run loadValue(&mut function.*, module, body, pointer, ty)
-  run storeResult(&mut function.*, module, body, record)
-  let old = List<usize>.get(&function.values, record.value)
-  run pushValue(&mut function.*, module, body, pointer)
-  if op == Bitcode.rmwXchg() {
-    run pushValue(&mut function.*, module, body, value)
-  } else if op == Bitcode.rmwMax() || op == Bitcode.rmwMin() || op == Bitcode.rmwUMax() || op == Bitcode.rmwUMin() {
+  if op == Bitcode.rmwXchg() { return run pushValue(&mut function.*, module, body, value) }
+  if op == Bitcode.rmwMax() || op == Bitcode.rmwMin() || op == Bitcode.rmwUMax() || op == Bitcode.rmwUMin() {
     let signed = op == Bitcode.rmwMax() || op == Bitcode.rmwMin()
     run WasmModule.localGet(&mut function.*.code, old)
     run pushValue(&mut function.*, module, body, value)
@@ -3236,22 +3306,72 @@ effect fn emitReadModifyWrite(function: &mut Function, module: &Module, body: us
     if op == Bitcode.rmwMin() { code = 0x48 }
     if op == Bitcode.rmwUMin() { code = 0x49 }
     run intCompare(&mut function.*, code, isWide)
-    run emit(&mut function.*, WasmModule.opSelect())
-  } else {
-    run WasmModule.localGet(&mut function.*.code, old)
-    run pushValue(&mut function.*, module, body, value)
-    if op == Bitcode.rmwAdd() { run intOp(&mut function.*, 0x6A, isWide) }
-    else if op == Bitcode.rmwSub() { run intOp(&mut function.*, 0x6B, isWide) }
-    else if op == Bitcode.rmwAnd() || op == Bitcode.rmwNand() { run intOp(&mut function.*, 0x71, isWide) }
-    else if op == Bitcode.rmwOr() { run intOp(&mut function.*, 0x72, isWide) }
-    else if op == Bitcode.rmwXor() { run intOp(&mut function.*, 0x73, isWide) }
-    else { run unsupported(b"an atomic operation", Bytes.asSlice(&function.symbol)) }
-    if op == Bitcode.rmwNand() {
-      run pushInt(&mut function.*, bits, u64.MAX)
-      run intOp(&mut function.*, 0x73, isWide)
-    }
-    run normalize(&mut function.*, bits)
+    return run emit(&mut function.*, WasmModule.opSelect())
   }
+  run WasmModule.localGet(&mut function.*.code, old)
+  run pushValue(&mut function.*, module, body, value)
+  if op == Bitcode.rmwAdd() { run intOp(&mut function.*, 0x6A, isWide) }
+  else if op == Bitcode.rmwSub() { run intOp(&mut function.*, 0x6B, isWide) }
+  else if op == Bitcode.rmwAnd() || op == Bitcode.rmwNand() { run intOp(&mut function.*, 0x71, isWide) }
+  else if op == Bitcode.rmwOr() { run intOp(&mut function.*, 0x72, isWide) }
+  else if op == Bitcode.rmwXor() { run intOp(&mut function.*, 0x73, isWide) }
+  else { run unsupported(b"an atomic operation", Bytes.asSlice(&function.symbol)) }
+  if op == Bitcode.rmwNand() {
+    run pushInt(&mut function.*, bits, u64.MAX)
+    run intOp(&mut function.*, 0x73, isWide)
+  }
+  return run normalize(&mut function.*, bits)
+}
+
+// The `0xFE` group of read-modify-write `op`, or `u64.MAX` when wasm has none.
+fn rmwGroup(op: u64) -> u64 {
+  if op == Bitcode.rmwAdd() { return 0x1E }
+  if op == Bitcode.rmwSub() { return 0x25 }
+  if op == Bitcode.rmwAnd() { return 0x2C }
+  if op == Bitcode.rmwOr() { return 0x33 }
+  if op == Bitcode.rmwXor() { return 0x3A }
+  if op == Bitcode.rmwXchg() { return 0x41 }
+  return u64.MAX
+}
+
+effect fn emitReadModifyWrite(function: &mut Function, module: &Module, body: usize, words: &[u64], record: Record) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let pointer = operand(words, record, usize.ZERO)
+  let value = operand(words, record, usize.ONE)
+  let op = operand(words, record, 2)
+  let ty = module.typeIn(body, value)
+  if laneCount(module, ty) != usize.ONE || module.typeCode(ty) != Bitcode.typeInteger() && module.typeCode(ty) != Bitcode.typePointer() {
+    run unsupported(b"an atomic operation on this type", Bytes.asSlice(&function.symbol))
+  }
+  let bits = widthOf(module, ty)
+  let old = List<usize>.get(&function.values, record.value)
+  if function.threaded {
+    let group = rmwGroup(op)
+    if group != u64.MAX {
+      run pushValue(&mut function.*, module, body, pointer)
+      run pushValue(&mut function.*, module, body, value)
+      run atomicAccess(&mut function.*, module, ty, atomicCode(module, ty, group))
+      return run storeResult(&mut function.*, module, body, record)
+    }
+    // Load, compute, and store only if the value is still the one loaded; else again.
+    run emitStructured(&mut function.*, WasmModule.opLoop())
+    run pushValue(&mut function.*, module, body, pointer)
+    run atomicAccess(&mut function.*, module, ty, atomicCode(module, ty, 0x10))
+    run WasmModule.localSet(&mut function.*.code, old)
+    run pushValue(&mut function.*, module, body, pointer)
+    run WasmModule.localGet(&mut function.*.code, old)
+    run pushModified(&mut function.*, module, body, op, old, value, bits)
+    run atomicAccess(&mut function.*, module, ty, atomicCode(module, ty, 0x48))
+    run WasmModule.localGet(&mut function.*.code, old)
+    run intCompare(&mut function.*, 0x47, wide(bits))
+    run emit(&mut function.*, WasmModule.opBrIf())
+    run WasmModule.index(&mut function.*.code, usize.ZERO)
+    return run emit(&mut function.*, WasmModule.opEnd())
+  }
+  run loadValue(&mut function.*, module, body, pointer, ty)
+  run storeResult(&mut function.*, module, body, record)
+  run pushValue(&mut function.*, module, body, pointer)
+  run pushModified(&mut function.*, module, body, op, old, value, bits)
   let code = storeCode(module, ty)
   if code == 0 { run unsupported(b"an atomic operation of this width", Bytes.asSlice(&function.symbol)) }
   return run WasmModule.memoryAccess(&mut function.*.code, code, usize.ZERO, 0)
@@ -3266,6 +3386,16 @@ effect fn emitCompareExchange(function: &mut Function, module: &Module, body: us
   let code = storeCode(module, ty)
   if laneCount(module, ty) != usize.ONE || code == 0 { run unsupported(b"a compare-exchange of this type", Bytes.asSlice(&function.symbol)) }
   let first = List<usize>.get(&function.values, record.value)
+  if function.threaded {
+    run pushValue(&mut function.*, module, body, pointer)
+    run pushValue(&mut function.*, module, body, expected)
+    run pushValue(&mut function.*, module, body, replacement)
+    run atomicAccess(&mut function.*, module, ty, atomicCode(module, ty, 0x48))
+    run WasmModule.localTee(&mut function.*.code, first)
+    run pushValue(&mut function.*, module, body, expected)
+    run intCompare(&mut function.*, 0x46, scalarType(module, ty) == WasmModule.i64Type())
+    return run WasmModule.localSet(&mut function.*.code, first + usize.ONE)
+  }
   run loadValue(&mut function.*, module, body, pointer, ty)
   run WasmModule.localTee(&mut function.*.code, first)
   run pushValue(&mut function.*, module, body, expected)
@@ -3276,4 +3406,81 @@ effect fn emitCompareExchange(function: &mut Function, module: &Module, body: us
   run pushValue(&mut function.*, module, body, replacement)
   run WasmModule.memoryAccess(&mut function.*.code, code, usize.ZERO, 0)
   return run emit(&mut function.*, WasmModule.opEnd())
+}
+
+// Inline assembly
+
+// The text of inline-assembly constant `callee`'s template: its items are the function type, the
+// flags, the template's length and bytes, then the constraints'.
+effect fn assemblyText(module: &Module, callee: u64) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let length = u64.toUsize(module.constantItem(callee, 2))
+  let mut text = Bytes.make()
+  let mut at = usize.ZERO
+  while at < length {
+    run Bytes.append(&mut text, &[u64.wrappingToU8(module.constantItem(callee, 3 + at))])
+    at = at + usize.ONE
+  }
+  return move text
+}
+
+// The wasm global inline assembly names: `__stack_pointer`, or `__tls_base` in a threaded module.
+fn assemblyGlobal(function: &Function, name: &[u8]) -> usize {
+  if same(name, b"__stack_pointer") { return usize.ZERO }
+  if function.threaded && same(name, b"__tls_base") { return usize.ONE }
+  return usize.MAX
+}
+
+fn isSpace(byte: u8) -> bool { return byte == 32 || byte == 9 }
+
+// An inline-assembly call: its template's lines of wasm text, each `local.get $N` pushing operand
+// `N`, and `global.get` or `global.set` naming a global the link defines.
+effect fn emitInlineAssembly(function: &mut Function, module: &Module, body: usize, words: &[u64], record: Record, callee: u64, first: usize) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if record.value != usize.MAX && List<usize>.get(&function.values, record.value) != usize.MAX {
+    run unsupported(b"inline assembly with a result", Bytes.asSlice(&function.symbol))
+  }
+  let text = run assemblyText(module, callee)
+  let bytes = Bytes.asSlice(&text)
+  let mut start = usize.ZERO
+  while start < bytes.length {
+    let mut end = start
+    while end < bytes.length && bytes[end] != 10 { end = end + usize.ONE }
+    let mut from = start
+    while from < end && isSpace(bytes[from]) { from = from + usize.ONE }
+    let mut split = from
+    while split < end && !isSpace(bytes[split]) { split = split + usize.ONE }
+    let mut argument = split
+    while argument < end && isSpace(bytes[argument]) { argument = argument + usize.ONE }
+    let mut until = end
+    while until > argument && isSpace(bytes[until - usize.ONE]) { until = until - usize.ONE }
+    let mnemonic = Slice.view<u8>(bytes, from, split - from)
+    let named = Slice.view<u8>(bytes, argument, until - argument)
+    let mut done = mnemonic.length == usize.ZERO
+    if same(mnemonic, b"local.get") && named.length > usize.ONE && named[0] == 36 {
+      let mut index = usize.ZERO
+      let mut digit = usize.ONE
+      while digit < named.length {
+        index = index * 10 + u8.toUsize(named[digit] - 48)
+        digit = digit + usize.ONE
+      }
+      if first + index < operandCount(record) {
+        run pushValue(&mut function.*, module, body, operand(words, record, first + index))
+        done = true
+      }
+    } else if same(mnemonic, b"global.get") || same(mnemonic, b"global.set") {
+      let global = assemblyGlobal(&function.*, named)
+      if global != usize.MAX {
+        if same(mnemonic, b"global.get") { run WasmModule.globalGet(&mut function.*.code, global) } else { run WasmModule.globalSet(&mut function.*.code, global) }
+        done = true
+      }
+    }
+    if !done {
+      let mut what = run Bytes.copy(b"the inline assembly `")
+      run Bytes.append(&mut what, Slice.view<u8>(bytes, from, until - from))
+      run Bytes.append(&mut what, b"`")
+      run unsupported(Bytes.asSlice(&what), Bytes.asSlice(&function.symbol))
+    }
+    start = end + usize.ONE
+  }
+  return ()
 }
