@@ -1,0 +1,2528 @@
+//! WebAssembly function bodies for the direct backend, translated from the instance fragments
+//! `LlvmCode` builds.
+//!
+//! # Details
+//! Both backends share one MIR lowering: `LlvmCode` turns each instance into records in a
+//! `Bitcode.Module`, and the LLVM backend encodes them as bitcode for Clang. This module reads the
+//! same records and writes WebAssembly instead, so what a program does, its traps, its failure
+//! paths and its C ABI, cannot differ between the two backends.
+//!
+//! The translation is an instruction selector for the records an unoptimized (`fastPath`) build
+//! makes, with no optimizer:
+//!
+//! - Every SSA value is a wasm local. An integer narrower than its container (`i1`, `i8`, `i16`, or
+//!   `i33` to `i63`) is kept zero-extended, so equality and unsigned operations need no extension;
+//!   signed ones sign-extend first and mask after.
+//! - `i128` travels as two `i64` lanes, and a structure as its fields' lanes, so an overflow
+//!   intrinsic's `{ iN, i1 }` is two locals.
+//! - An `alloca` is a slot in a frame on the linear-memory stack under the `__stack_pointer`
+//!   global, which the prologue moves down and every return restores.
+//! - Control flow is made structured by Ramsey's "Beyond Relooper" algorithm over the dominator
+//!   tree in reverse postorder; a `phi` becomes copies on its incoming edges.
+//!
+//! Every global is already placed when a body is translated (`Placement`): the link lays out the
+//! data and numbers the functions first, so addresses and indices are written as constants.
+
+import backend.Bitcode
+import backend.Bitcode {Module}
+import backend.WasmModule
+import semantic.InternIndex {InternIndex}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.collections.bytes {Bytes}
+import silk.core.ownership {Copy}
+import silk.collections.slice {Slice}
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.collections.list {List}
+
+/// A record the direct backend cannot lower, such as a SIMD vector or inline assembly, described
+/// for the build's refusal.
+pub struct Unsupported {
+  pub detail: Bytes,
+}
+
+/// Where each global of the program module lives, which the link decides before translating any
+/// body, and the function types and table slots bodies add as they are translated.
+pub struct Placement {
+  /// Per global: the function index of a function, or `usize.MAX`.
+  pub functions: List<usize>,
+  /// Per global: the address of an object, or `u64.MAX`.
+  pub addresses: List<u64>,
+  /// Per global: the table slot of a function whose address is taken, or `usize.MAX`.
+  pub slots: List<usize>,
+  /// The function index in each table slot from 1; slot 0 stays null.
+  pub table: List<usize>,
+  /// The interned function types: each one's encoding, `0x60`, parameters and results.
+  pub types: List<Bytes>,
+  typeLookup: InternIndex,
+  /// The global of `fmod` and `fmodf`, which `frem` calls, or `usize.MAX`.
+  pub fmod: usize,
+  pub fmodf: usize,
+  /// The global of `__multi3`, which an `i128` product calls, or `usize.MAX`.
+  pub multiply: usize,
+}
+
+impl Placement {
+  /// A placement of `globals` globals, none placed yet.
+  pub effect fn make(globals: usize) -> Placement ! OutOfMemoryError ? &mut Allocator {
+    let mut functions = run List<usize>.makeWithCapacity(globals)
+    run List<usize>.appendRepeated(&mut functions, usize.MAX, globals)
+    let mut addresses = run List<u64>.makeWithCapacity(globals)
+    run List<u64>.appendRepeated(&mut addresses, u64.MAX, globals)
+    let mut slots = run List<usize>.makeWithCapacity(globals)
+    run List<usize>.appendRepeated(&mut slots, usize.MAX, globals)
+    return Placement {functions: move functions, addresses: move addresses, slots: move slots, table: List<usize>.make(),
+      types: List<Bytes>.make(), typeLookup: InternIndex.make(), fmod: usize.MAX, fmodf: usize.MAX, multiply: usize.MAX}
+  }
+
+  /// The index of the function type encoded as `encoding`, interning it on first use.
+  pub effect fn typeIndex(self: &mut Self, encoding: &[u8]) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let hash = InternIndex.hashBytes(0, encoding)
+    let mut at = InternIndex.first(&self.typeLookup, hash)
+    while at != usize.MAX {
+      if same(Bytes.asSlice(&List<Bytes>.asSlice(&self.types)[at]), encoding) { return at }
+      at = InternIndex.after(&self.typeLookup, at)
+    }
+    let index = List<Bytes>.length(&self.types)
+    run List<Bytes>.append(&mut self.types, run Bytes.copy(encoding))
+    run InternIndex.record(&mut self.typeLookup, hash)
+    return index
+  }
+
+  /// The table slot of the function global `global`, giving it one on first use.
+  pub effect fn slot(self: &mut Self, global: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let existing = List<usize>.get(&self.slots, global)
+    if existing != usize.MAX { return existing }
+    let slot = List<usize>.length(&self.table) + usize.ONE
+    run List<usize>.append(&mut self.table, List<usize>.get(&self.functions, global))
+    List<usize>.set(&mut self.slots, global, slot)
+    return slot
+  }
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn startsWith(text: &[u8], prefix: &[u8]) -> bool {
+  return text.length >= prefix.length && same(Slice.view<u8>(text, usize.ZERO, prefix.length), prefix)
+}
+
+effect fn unsupported(what: &[u8], symbol: &[u8]) -> never ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let mut detail = run Bytes.copy(what)
+  run Bytes.append(&mut detail, b" in ")
+  run Bytes.append(&mut detail, symbol)
+  fail Unsupported {detail: move detail}
+}
+
+// Types and layout.
+
+/// Whether `ty` is an integer type.
+fn isInteger(module: &Module, ty: u64) -> bool { return module.typeCode(ty) == Bitcode.typeInteger() }
+
+/// The width of an integer type, or 32 for a pointer.
+fn widthOf(module: &Module, ty: u64) -> u64 {
+  if module.typeCode(ty) == Bitcode.typePointer() { return 32 }
+  return module.typeItem(ty, usize.ZERO)
+}
+
+/// Whether `ty` is a scalar of one wasm lane: an integer of at most 64 bits, a pointer or a
+/// floating type.
+fn isScalar(module: &Module, ty: u64) -> bool {
+  let code = module.typeCode(ty)
+  if code == Bitcode.typeInteger() { return module.typeItem(ty, usize.ZERO) <= 64 }
+  return code == Bitcode.typePointer() || code == Bitcode.typeFloat() || code == Bitcode.typeDouble()
+}
+
+/// The wasm value type of a one-lane scalar.
+fn scalarType(module: &Module, ty: u64) -> u8 {
+  let code = module.typeCode(ty)
+  if code == Bitcode.typeFloat() { return WasmModule.f32Type() }
+  if code == Bitcode.typeDouble() { return WasmModule.f64Type() }
+  if code == Bitcode.typeInteger() && module.typeItem(ty, usize.ZERO) > 32 { return WasmModule.i64Type() }
+  return WasmModule.i32Type()
+}
+
+/// Appends the wasm value types `ty` travels in: one lane for a scalar, two `i64` lanes for an
+/// `i128`, each field's lanes for a structure or an array, and none for `void`.
+pub effect fn appendLanes(module: &Module, ty: u64, out: &mut List<u8>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let code = module.typeCode(ty)
+  if code == Bitcode.typeVoid() { return true }
+  if isScalar(module, ty) {
+    run List<u8>.append(&mut out.*, scalarType(module, ty))
+    return true
+  }
+  if code == Bitcode.typeInteger() && module.typeItem(ty, usize.ZERO) == 128 {
+    run List<u8>.append(&mut out.*, WasmModule.i64Type())
+    run List<u8>.append(&mut out.*, WasmModule.i64Type())
+    return true
+  }
+  if code == Bitcode.typeStruct() || code == Bitcode.typePackedStruct() {
+    let count = module.typeItems(ty)
+    let mut at = usize.ZERO
+    while at < count {
+      if !run appendLanes(module, module.typeItem(ty, at), &mut out.*) { return false }
+      at = at + usize.ONE
+    }
+    return true
+  }
+  if code == Bitcode.typeArray() {
+    let count = u64.toUsize(module.typeItem(ty, usize.ZERO))
+    if count > 64 { return false }
+    let element = module.typeItem(ty, usize.ONE)
+    let mut at = usize.ZERO
+    while at < count {
+      if !run appendLanes(module, element, &mut out.*) { return false }
+      at = at + usize.ONE
+    }
+    return true
+  }
+  return false
+}
+
+/// The number of lanes `ty` travels in.
+fn laneCount(module: &Module, ty: u64) -> usize {
+  let code = module.typeCode(ty)
+  if code == Bitcode.typeVoid() { return usize.ZERO }
+  if isScalar(module, ty) { return usize.ONE }
+  if code == Bitcode.typeInteger() { return 2 }
+  if code == Bitcode.typeStruct() || code == Bitcode.typePackedStruct() {
+    let count = module.typeItems(ty)
+    let mut total = usize.ZERO
+    let mut at = usize.ZERO
+    while at < count {
+      total = total + laneCount(module, module.typeItem(ty, at))
+      at = at + usize.ONE
+    }
+    return total
+  }
+  if code == Bitcode.typeArray() {
+    return u64.toUsize(module.typeItem(ty, usize.ZERO)) * laneCount(module, module.typeItem(ty, usize.ONE))
+  }
+  return usize.ZERO
+}
+
+/// The byte alignment of `ty` in wasm32's data layout.
+pub fn alignmentOf(module: &Module, ty: u64) -> u64 {
+  let code = module.typeCode(ty)
+  if code == Bitcode.typeInteger() {
+    let bits = module.typeItem(ty, usize.ZERO)
+    if bits <= 8 { return 1 }
+    if bits <= 16 { return 2 }
+    if bits <= 32 { return 4 }
+    if bits <= 64 { return 8 }
+    return 16
+  }
+  if code == Bitcode.typePointer() || code == Bitcode.typeFloat() { return 4 }
+  if code == Bitcode.typeDouble() { return 8 }
+  if code == Bitcode.typePackedStruct() { return 1 }
+  if code == Bitcode.typeStruct() {
+    let mut largest: u64 = 1
+    let count = module.typeItems(ty)
+    let mut at = usize.ZERO
+    while at < count {
+      let field = alignmentOf(module, module.typeItem(ty, at))
+      if field > largest { largest = field }
+      at = at + usize.ONE
+    }
+    return largest
+  }
+  if code == Bitcode.typeArray() { return alignmentOf(module, module.typeItem(ty, usize.ONE)) }
+  if code == Bitcode.typeVector() { return 16 }
+  return 1
+}
+
+fn alignUp(value: u64, alignment: u64) -> u64 {
+  if alignment <= 1 { return value }
+  return (value + alignment - 1) / alignment * alignment
+}
+
+/// The bytes a store of `ty` writes.
+pub fn storeSizeOf(module: &Module, ty: u64) -> u64 {
+  let code = module.typeCode(ty)
+  if code == Bitcode.typeInteger() { return (module.typeItem(ty, usize.ZERO) + 7) / 8 }
+  if code == Bitcode.typePointer() || code == Bitcode.typeFloat() { return 4 }
+  if code == Bitcode.typeDouble() { return 8 }
+  return sizeOf(module, ty)
+}
+
+/// The bytes `ty` occupies in memory, its store size rounded up to its alignment.
+pub fn sizeOf(module: &Module, ty: u64) -> u64 {
+  let code = module.typeCode(ty)
+  if code == Bitcode.typeStruct() || code == Bitcode.typePackedStruct() {
+    let packed = code == Bitcode.typePackedStruct()
+    let count = module.typeItems(ty)
+    let mut offset: u64 = 0
+    let mut at = usize.ZERO
+    while at < count {
+      let field = module.typeItem(ty, at)
+      if !packed { offset = alignUp(offset, alignmentOf(module, field)) }
+      offset = offset + sizeOf(module, field)
+      at = at + usize.ONE
+    }
+    return alignUp(offset, alignmentOf(module, ty))
+  }
+  if code == Bitcode.typeArray() || code == Bitcode.typeVector() {
+    return module.typeItem(ty, usize.ZERO) * sizeOf(module, module.typeItem(ty, usize.ONE))
+  }
+  if code == Bitcode.typeVoid() { return 0 }
+  return alignUp(storeSizeOf(module, ty), alignmentOf(module, ty))
+}
+
+/// The offset of field `index` of the structure `ty`.
+pub fn fieldOffset(module: &Module, ty: u64, index: usize) -> u64 {
+  let packed = module.typeCode(ty) == Bitcode.typePackedStruct()
+  let mut offset: u64 = 0
+  let mut at = usize.ZERO
+  while at <= index {
+    let field = module.typeItem(ty, at)
+    if !packed { offset = alignUp(offset, alignmentOf(module, field)) }
+    if at == index { return offset }
+    offset = offset + sizeOf(module, field)
+    at = at + usize.ONE
+  }
+  return offset
+}
+
+/// One scalar leaf of a value in memory: its byte offset and scalar type.
+struct Leaf {
+  offset: u64,
+  ty: u64,
+}
+
+impl Copy for Leaf {}
+
+// Appends the scalar leaves of `ty` stored at `offset`, in lane order; an `i128` is one leaf.
+effect fn appendLeaves(module: &Module, ty: u64, offset: u64, out: &mut List<Leaf>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let code = module.typeCode(ty)
+  if code == Bitcode.typeStruct() || code == Bitcode.typePackedStruct() {
+    let count = module.typeItems(ty)
+    let mut at = usize.ZERO
+    while at < count {
+      run appendLeaves(module, module.typeItem(ty, at), offset + fieldOffset(module, ty, at), &mut out.*)
+      at = at + usize.ONE
+    }
+    return ()
+  }
+  if code == Bitcode.typeArray() {
+    let element = module.typeItem(ty, usize.ONE)
+    let stride = sizeOf(module, element)
+    let count = module.typeItem(ty, usize.ZERO)
+    let mut at: u64 = 0
+    while at < count {
+      run appendLeaves(module, element, offset + at * stride, &mut out.*)
+      at = at + 1
+    }
+    return ()
+  }
+  if code == Bitcode.typeVoid() { return () }
+  return run List<Leaf>.append(&mut out.*, Leaf {offset: offset, ty: ty})
+}
+
+/// The wasm function type of LLVM function type `ty`: `0x60`, its parameters' lanes, then its
+/// result's lanes.
+pub effect fn signatureOf(module: &Module, ty: u64, symbol: &[u8]) -> Bytes ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let mut parameters = List<u8>.make()
+  let count = module.typeItems(ty)
+  let mut at = usize.ONE
+  while at < count {
+    if !run appendLanes(module, module.typeItem(ty, at), &mut parameters) { run unsupported(b"a parameter type", symbol) }
+    at = at + usize.ONE
+  }
+  let mut results = List<u8>.make()
+  if !run appendLanes(module, module.typeItem(ty, usize.ZERO), &mut results) { run unsupported(b"a result type", symbol) }
+  let mut encoding = Bytes.make()
+  run WasmModule.byte(&mut encoding, 0x60)
+  run WasmModule.index(&mut encoding, List<u8>.length(&parameters))
+  run Bytes.append(&mut encoding, List<u8>.asSlice(&parameters))
+  run WasmModule.index(&mut encoding, List<u8>.length(&results))
+  run Bytes.append(&mut encoding, List<u8>.asSlice(&results))
+  return move encoding
+}
+
+// Constants.
+
+/// The value of a scalar constant or global reference: an integer's low `bits`, a floating
+/// constant's bits, an object's address or a function's table slot, or a constant expression
+/// over them.
+pub effect fn constantBits(module: &Module, reference: u64, placement: &mut Placement, symbol: &[u8]) -> u64
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if Bitcode.isGlobal(reference) {
+    let global = Bitcode.referenceIndex(reference)
+    if List<usize>.get(&placement.functions, global) != usize.MAX {
+      return usize.toU64(run Placement.slot(&mut placement.*, global))
+    }
+    let address = List<u64>.get(&placement.addresses, global)
+    if address == u64.MAX {
+      let mut what = run Bytes.copy(b"a reference to the undefined global ")
+      run Bytes.append(&mut what, module.globalName(global))
+      run unsupported(Bytes.asSlice(&what), symbol)
+    }
+    return address
+  }
+  let code = module.constantCode(reference)
+  let ty = module.constantType(reference)
+  if code == Bitcode.constantNull() || code == Bitcode.constantUndef() || code == Bitcode.constantPoison() { return 0 }
+  if code == Bitcode.constantInteger() {
+    return masked(Bitcode.signedValue(module.constantItem(reference, usize.ZERO)), widthOf(module, ty))
+  }
+  if code == Bitcode.constantFloat() { return module.constantItem(reference, usize.ZERO) }
+  if code == Bitcode.constantCast() {
+    let operation = module.constantItem(reference, usize.ZERO)
+    let inner = run constantBits(module, module.constantItem(reference, 2), &mut placement, symbol)
+    if operation == Bitcode.castPtrToInt() || operation == Bitcode.castIntToPtr() || operation == Bitcode.castBitcast()
+      || operation == Bitcode.castZExt() || operation == Bitcode.castTrunc() {
+      return masked(inner, widthOf(module, ty))
+    }
+    run unsupported(b"a constant cast", symbol)
+  }
+  if code == Bitcode.constantGep() || code == Bitcode.constantInboundsGep() {
+    // Items: the source type, then type and value pairs: the base, then each index.
+    let items = module.constantItems(reference)
+    let mut current = module.constantItem(reference, usize.ZERO)
+    let mut address = run constantBits(module, module.constantItem(reference, 2), &mut placement, symbol)
+    let mut at: usize = 3
+    let mut first = true
+    while at + usize.ONE < items {
+      let index = module.constantItem(reference, at + usize.ONE)
+      let value = Bitcode.signExtend(run constantBits(module, index, &mut placement, symbol), widthOf(module, module.constantType(index)))
+      if first {
+        address = u64.wrappingAdd(address, u64.wrappingMultiply(value, sizeOf(module, current)))
+        first = false
+      } else if module.typeCode(current) == Bitcode.typeStruct() || module.typeCode(current) == Bitcode.typePackedStruct() {
+        address = address + fieldOffset(module, current, u64.toUsize(value))
+        current = module.typeItem(current, u64.toUsize(value))
+      } else {
+        current = module.typeItem(current, usize.ONE)
+        address = u64.wrappingAdd(address, u64.wrappingMultiply(value, sizeOf(module, current)))
+      }
+      at = at + 2
+    }
+    return address & 4294967295
+  }
+  return run unsupported(b"a constant expression", symbol)
+}
+
+/// `value`'s low `bits` bits.
+fn masked(value: u64, bits: u64) -> u64 {
+  if bits >= 64 { return value }
+  return value & (u64.shiftLeft(1, bits) - 1)
+}
+
+/// Writes constant `reference` of type `ty` into `image` at `offset`, as wasm32 lays it out.
+pub effect fn writeConstant(module: &Module, reference: u64, ty: u64, image: &mut Bytes, offset: usize, placement: &mut Placement,
+  symbol: &[u8]) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if Bitcode.isGlobal(reference) {
+    return writeLittle(&mut image.*, offset, run constantBits(module, reference, &mut placement, symbol), 4)
+  }
+  let code = module.constantCode(reference)
+  if code == Bitcode.constantNull() || code == Bitcode.constantUndef() || code == Bitcode.constantPoison() { return () }
+  let typeCode = module.typeCode(ty)
+  if code == Bitcode.constantString() || code == Bitcode.constantCString() {
+    let items = module.constantItems(reference)
+    let slots = Bytes.asMutSlice(&mut image.*)
+    let mut at = usize.ZERO
+    while at < items {
+      slots[offset + at] = u64.wrappingToU8(module.constantItem(reference, at))
+      at = at + usize.ONE
+    }
+    return ()
+  }
+  if code == Bitcode.constantAggregate() {
+    let items = module.constantItems(reference)
+    let mut at = usize.ZERO
+    while at < items {
+      let element = module.constantItem(reference, at)
+      if typeCode == Bitcode.typeStruct() || typeCode == Bitcode.typePackedStruct() {
+        run writeConstant(module, element, module.typeItem(ty, at), &mut image.*, offset + u64.toUsize(fieldOffset(module, ty, at)), &mut placement, symbol)
+      } else {
+        let elementType = module.typeItem(ty, usize.ONE)
+        let stride = u64.toUsize(sizeOf(module, elementType))
+        run writeConstant(module, element, elementType, &mut image.*, offset + at * stride, &mut placement, symbol)
+      }
+      at = at + usize.ONE
+    }
+    return ()
+  }
+  if typeCode == Bitcode.typeInteger() && module.typeItem(ty, usize.ZERO) > 64 {
+    // A wide integer constant holds a sign-extended 64-bit value.
+    let low = Bitcode.signedValue(module.constantItem(reference, usize.ZERO))
+    writeLittle(&mut image.*, offset, low, 8)
+    let mut high: u64 = 0
+    if (low & 9223372036854775808) != 0 { high = u64.MAX }
+    return writeLittle(&mut image.*, offset + 8, high, u64.toUsize(storeSizeOf(module, ty)) - 8)
+  }
+  let bits = run constantBits(module, reference, &mut placement, symbol)
+  return writeLittle(&mut image.*, offset, bits, u64.toUsize(storeSizeOf(module, ty)))
+}
+
+fn writeLittle(image: &mut Bytes, offset: usize, value: u64, size: usize) -> () {
+  let slots = Bytes.asMutSlice(&mut image.*)
+  let mut rest = value
+  let mut at = usize.ZERO
+  while at < size {
+    slots[offset + at] = u64.wrappingToU8(rest & 255)
+    rest = u64.shiftRight(rest, 8)
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Records.
+
+/// One instruction record of a body.
+struct Record {
+  /// The index of its header word.
+  header: usize,
+  /// Its operand words, `[start, end)`.
+  start: usize,
+  end: usize,
+  code: u64,
+  /// The local value it defines, or `usize.MAX`.
+  value: usize,
+}
+
+impl Copy for Record {}
+
+/// One basic block: its records `[first, last]`, the last being its terminator.
+struct Block {
+  first: usize,
+  last: usize,
+}
+
+impl Copy for Block {}
+
+fn operand(words: &[u64], record: Record, item: usize) -> u64 { return Bitcode.wordPayload(words[record.start + item]) }
+
+fn operandCount(record: Record) -> usize { return record.end - record.start }
+
+fn isTerminator(code: u64) -> bool {
+  return code == Bitcode.instructionReturn() || code == Bitcode.instructionBranch() || code == Bitcode.instructionSwitch()
+    || code == Bitcode.instructionIndirectBranch() || code == Bitcode.instructionInvoke() || code == Bitcode.instructionUnreachable()
+    || code == Bitcode.instructionResume()
+}
+
+// The structured-control-flow context: what each enclosing label is.
+fn labelBlock() -> u8 { return 0 }
+fn labelLoop() -> u8 { return 1 }
+fn labelIf() -> u8 { return 2 }
+
+struct Label {
+  kind: u8,
+  block: usize,
+}
+
+impl Copy for Label {}
+
+// Pending structuring work, run from the top of a stack.
+fn actionTree() -> u8 { return 0 }
+fn actionWithin() -> u8 { return 1 }
+fn actionBody() -> u8 { return 2 }
+fn actionBranch() -> u8 { return 3 }
+fn actionEndBlock() -> u8 { return 4 }
+fn actionEndLoop() -> u8 { return 5 }
+fn actionElse() -> u8 { return 6 }
+fn actionEndIf() -> u8 { return 7 }
+fn actionEndCase() -> u8 { return 8 }
+fn actionCase() -> u8 { return 9 }
+
+struct Action {
+  kind: u8,
+  first: usize,
+  second: usize,
+}
+
+impl Copy for Action {}
+
+/// One function being translated.
+struct Function {
+  code: Bytes,
+  /// The value type of each declared local after the parameters.
+  locals: List<u8>,
+  parameters: usize,
+  /// Per local value: its first wasm local, or `usize.MAX` for a value without lanes.
+  values: List<usize>,
+  /// The frame base and the stack pointer at entry, or `usize.MAX` for a function with no frame.
+  frame: usize,
+  saved: usize,
+  /// The header index after the entry block's last record: an `alloca` before it is in the frame.
+  entryEnd: usize,
+  symbol: Bytes,
+}
+
+effect fn addLocal(function: &mut Function, ty: u8) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let index = function.parameters + List<u8>.length(&function.locals)
+  run List<u8>.append(&mut function.*.locals, ty)
+  return index
+}
+
+effect fn emit(function: &mut Function, code: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run WasmModule.op(&mut function.*.code, code)
+}
+
+/// The translation of one body: its type index and its code entry, the locals then the
+/// instructions, without the entry's size prefix.
+pub struct Translated {
+  pub typeIndex: usize,
+  pub entry: Bytes,
+}
+
+/// Translates body `body` of `module`.
+pub effect fn translate(module: &Module, body: usize, placement: &mut Placement) -> Translated
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let global = module.bodyGlobal(body)
+  let symbol = module.globalName(global)
+  let functionType = module.globalType(global)
+  let signature = run signatureOf(module, functionType, symbol)
+  let typeIndex = run Placement.typeIndex(&mut placement.*, Bytes.asSlice(&signature))
+  let words = module.bodyWords(body)
+  let arguments = module.bodyArguments(body)
+  // The records and blocks.
+  let mut records = List<Record>.make()
+  let mut blocks = List<Block>.make()
+  let mut next = arguments
+  let mut blockStart = usize.ZERO
+  let mut cursor = usize.ZERO
+  while cursor < words.length {
+    let header = words[cursor]
+    let mut end = cursor + usize.ONE
+    while end < words.length && Bitcode.wordTag(words[end]) != 5 { end = end + usize.ONE }
+    let code = Bitcode.headerCode(header)
+    if code == Bitcode.markerLocation() || code == Bitcode.markerVariable() {
+      cursor = end
+      continue
+    }
+    let mut value = usize.MAX
+    if Bitcode.headerDefinesValue(header) {
+      value = next
+      next = next + usize.ONE
+    }
+    run List<Record>.append(&mut records, Record {header: cursor, start: cursor + usize.ONE, end: end, code: code, value: value})
+    if isTerminator(code) {
+      run List<Block>.append(&mut blocks, Block {first: blockStart, last: List<Record>.length(&records) - usize.ONE})
+      blockStart = List<Record>.length(&records)
+    }
+    cursor = end
+  }
+  let mut function = Function {code: Bytes.make(), locals: List<u8>.make(), parameters: usize.ZERO, values: List<usize>.make(),
+    frame: usize.MAX, saved: usize.MAX, entryEnd: usize.ZERO, symbol: run Bytes.copy(symbol)}
+  if List<Block>.length(&blocks) > usize.ZERO {
+    function.entryEnd = List<Record>.get(&records, List<Block>.get(&blocks, usize.ZERO).last).end
+  }
+  // Parameters, then a local per value lane.
+  let mut lanes = List<u8>.make()
+  let mut at = usize.ZERO
+  while at < arguments {
+    run List<usize>.append(&mut function.values, List<u8>.length(&lanes))
+    if !run appendLanes(module, module.bodyLocalType(body, at), &mut lanes) { run unsupported(b"a parameter type", symbol) }
+    at = at + usize.ONE
+  }
+  function.parameters = List<u8>.length(&lanes)
+  let listed = List<Record>.asSlice(&records)
+  at = usize.ZERO
+  while at < listed.length {
+    if listed[at].value != usize.MAX {
+      let ty = module.bodyLocalType(body, listed[at].value)
+      let mut valueLanes = List<u8>.make()
+      if listed[at].code == Bitcode.instructionAlloca() {
+        run List<u8>.append(&mut valueLanes, WasmModule.i32Type())
+      } else if !run appendLanes(module, ty, &mut valueLanes) {
+        run unsupported(b"a value type", symbol)
+      }
+      let lanesOf = List<u8>.asSlice(&valueLanes)
+      if lanesOf.length == usize.ZERO {
+        run List<usize>.append(&mut function.values, usize.MAX)
+      } else {
+        run List<usize>.append(&mut function.values, function.parameters + List<u8>.length(&function.locals))
+        run List<u8>.appendSlice(&mut function.locals, lanesOf)
+      }
+    }
+    at = at + usize.ONE
+  }
+  run prologue(&mut function, module, body, words, listed, List<Block>.asSlice(&blocks))
+  run structure(&mut function, module, body, words, listed, List<Block>.asSlice(&blocks), &mut placement)
+  // The code entry: the locals as runs of one type, then the code.
+  let mut entry = Bytes.make()
+  let declared = List<u8>.asSlice(&function.locals)
+  let mut runs = usize.ZERO
+  at = usize.ZERO
+  while at < declared.length {
+    if at == usize.ZERO || declared[at] != declared[at - usize.ONE] { runs = runs + usize.ONE }
+    at = at + usize.ONE
+  }
+  run WasmModule.index(&mut entry, runs)
+  at = usize.ZERO
+  while at < declared.length {
+    let mut until = at
+    while until < declared.length && declared[until] == declared[at] { until = until + usize.ONE }
+    run WasmModule.index(&mut entry, until - at)
+    run WasmModule.byte(&mut entry, declared[at])
+    at = until
+  }
+  run Bytes.append(&mut entry, Bytes.asSlice(&function.code))
+  run WasmModule.op(&mut entry, WasmModule.opEnd())
+  return Translated {typeIndex: typeIndex, entry: move entry}
+}
+
+// The frame: each entry-block `alloca` gets a fixed slot below the stack pointer at entry, and the
+// prologue writes each slot's address to its value's local. An `alloca` outside the entry block, or
+// with a count that is not constant, moves the stack pointer where it runs (`dynamicAlloca`).
+effect fn prologue(function: &mut Function, module: &Module, body: usize, words: &[u64], records: &[Record], blocks: &[Block]) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let mut offsets = List<u64>.make()
+  let mut placed = List<usize>.make()
+  let mut size: u64 = 0
+  let mut needed = false
+  let mut at = usize.ZERO
+  while at < records.length {
+    let record = records[at]
+    if record.code == Bitcode.instructionAlloca() {
+      needed = true
+      let inEntry = blocks.length > usize.ZERO && at <= blocks[usize.ZERO].last
+      let count = operand(words, record, 2)
+      if inEntry && staticCount(module, count) != u64.MAX {
+        let ty = operand(words, record, usize.ZERO)
+        let alignment = allocaAlignment(module, words, record)
+        let bytes = sizeOf(module, ty) * staticCount(module, count)
+        size = alignUp(size, alignment)
+        run List<u64>.append(&mut offsets, size)
+        run List<usize>.append(&mut placed, at)
+        size = size + bytes
+      }
+    }
+    if record.code == Bitcode.instructionCall() && callsNamed(module, words, record, b"llvm.frameaddress") { needed = true }
+    at = at + usize.ONE
+  }
+  if !needed { return () }
+  let frameSize = alignUp(size, 16)
+  function.saved = run addLocal(&mut function.*, WasmModule.i32Type())
+  function.frame = run addLocal(&mut function.*, WasmModule.i32Type())
+  let code = &mut function.*.code
+  run WasmModule.globalGet(&mut code.*, usize.ZERO)
+  run WasmModule.localTee(&mut code.*, function.saved)
+  run WasmModule.i32Const(&mut code.*, frameSize)
+  run WasmModule.op(&mut code.*, 0x6B)
+  run WasmModule.localTee(&mut code.*, function.frame)
+  run WasmModule.globalSet(&mut code.*, usize.ZERO)
+  let slots = List<usize>.asSlice(&placed)
+  let offsetsOf = List<u64>.asSlice(&offsets)
+  at = usize.ZERO
+  while at < slots.length {
+    let local = List<usize>.get(&function.values, records[slots[at]].value)
+    run WasmModule.localGet(&mut function.*.code, function.frame)
+    if offsetsOf[at] != 0 {
+      run WasmModule.i32Const(&mut function.*.code, offsetsOf[at])
+      run WasmModule.op(&mut function.*.code, 0x6A)
+    }
+    run WasmModule.localSet(&mut function.*.code, local)
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// The count of an `alloca` whose count is a constant, or `u64.MAX`.
+fn staticCount(module: &Module, count: u64) -> u64 {
+  if !Bitcode.isConstant(count) { return u64.MAX }
+  if module.constantCode(count) == Bitcode.constantInteger() { return Bitcode.signedValue(module.constantItem(count, usize.ZERO)) }
+  if module.constantCode(count) == Bitcode.constantNull() { return 0 }
+  return u64.MAX
+}
+
+fn allocaAlignment(module: &Module, words: &[u64], record: Record) -> u64 {
+  let packed = operand(words, record, 3)
+  let code = (packed & 31) | u64.shiftLeft(u64.shiftRight(packed, 8), 5)
+  if code == 0 { return alignmentOf(module, operand(words, record, usize.ZERO)) }
+  return u64.shiftLeft(1, code - 1)
+}
+
+// Whether the `call` record calls a declared function whose name starts with `prefix`.
+fn callsNamed(module: &Module, words: &[u64], record: Record, prefix: &[u8]) -> bool {
+  let callee = operand(words, record, calleeAt(words, record))
+  return Bitcode.isGlobal(callee) && startsWith(module.globalName(Bitcode.referenceIndex(callee)), prefix)
+}
+
+// The operand index of a call record's callee: after its attributes, flags, optional math flags
+// and function type.
+fn calleeAt(words: &[u64], record: Record) -> usize {
+  let flags = operand(words, record, usize.ONE)
+  if record.code == Bitcode.instructionInvoke() { return 5 }
+  if (flags & 131072) != 0 { return 4 }
+  return 3
+}
+
+// Control flow.
+
+struct Graph {
+  /// Per block: its successors' positions, as `[start, end)` into `edges`.
+  successorStart: List<usize>,
+  edges: List<usize>,
+  /// Per block: its reverse postorder number, or `usize.MAX` when unreachable.
+  order: List<usize>,
+  /// The blocks in reverse postorder.
+  sequence: List<usize>,
+  /// Per block: its immediate dominator.
+  dominator: List<usize>,
+  /// Per block: whether it is a loop header, and whether it is a merge node (two or more forward
+  /// in-edges).
+  header: List<bool>,
+  merge: List<bool>,
+  /// Per block: its dominator-tree children that are merge nodes, highest reverse postorder first,
+  /// as `[start, end)` into `children`.
+  childStart: List<usize>,
+  children: List<usize>,
+}
+
+effect fn successors(module: &Module, words: &[u64], record: Record, out: &mut List<usize>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let code = record.code
+  if code == Bitcode.instructionBranch() {
+    run List<usize>.append(&mut out.*, u64.toUsize(operand(words, record, usize.ZERO)))
+    if operandCount(record) > usize.ONE { run List<usize>.append(&mut out.*, u64.toUsize(operand(words, record, usize.ONE))) }
+    return ()
+  }
+  if code == Bitcode.instructionSwitch() {
+    run List<usize>.append(&mut out.*, u64.toUsize(operand(words, record, 2)))
+    let mut at: usize = 3
+    while at + usize.ONE < operandCount(record) {
+      run List<usize>.append(&mut out.*, u64.toUsize(operand(words, record, at + usize.ONE)))
+      at = at + 2
+    }
+    return ()
+  }
+  // An invoke continues normally: the wasm target never unwinds into its landing pad.
+  if code == Bitcode.instructionInvoke() {
+    return run List<usize>.append(&mut out.*, u64.toUsize(operand(words, record, 2)))
+  }
+  return ()
+}
+
+effect fn graphOf(module: &Module, words: &[u64], records: &[Record], blocks: &[Block], symbol: &[u8]) -> Graph
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let count = blocks.length
+  let mut successorStart = run List<usize>.makeWithCapacity(count + usize.ONE)
+  let mut edges = List<usize>.make()
+  let mut at = usize.ZERO
+  while at < count {
+    run List<usize>.append(&mut successorStart, List<usize>.length(&edges))
+    run successors(module, words, records[blocks[at].last], &mut edges)
+    at = at + usize.ONE
+  }
+  run List<usize>.append(&mut successorStart, List<usize>.length(&edges))
+  let starts = List<usize>.asSlice(&successorStart)
+  let targets = List<usize>.asSlice(&edges)
+  // Postorder by an explicit depth-first walk.
+  let mut visited = run List<bool>.makeWithCapacity(count)
+  run List<bool>.appendRepeated(&mut visited, false, count)
+  let mut postorder = List<usize>.make()
+  let mut stack = List<usize>.make()
+  let mut cursor = List<usize>.make()
+  run List<usize>.append(&mut stack, usize.ZERO)
+  run List<usize>.append(&mut cursor, starts[usize.ZERO])
+  List<bool>.set(&mut visited, usize.ZERO, true)
+  while List<usize>.length(&stack) > usize.ZERO {
+    let top = List<usize>.length(&stack) - usize.ONE
+    let block = List<usize>.get(&stack, top)
+    let position = List<usize>.get(&cursor, top)
+    if position < starts[block + usize.ONE] {
+      List<usize>.set(&mut cursor, top, position + usize.ONE)
+      let target = targets[position]
+      if !List<bool>.get(&visited, target) {
+        List<bool>.set(&mut visited, target, true)
+        run List<usize>.append(&mut stack, target)
+        run List<usize>.append(&mut cursor, starts[target])
+      }
+    } else {
+      run List<usize>.append(&mut postorder, block)
+      drop List<usize>.pop(&mut stack)
+      drop List<usize>.pop(&mut cursor)
+    }
+  }
+  let reached = List<usize>.length(&postorder)
+  let mut order = run List<usize>.makeWithCapacity(count)
+  run List<usize>.appendRepeated(&mut order, usize.MAX, count)
+  let mut sequence = run List<usize>.makeWithCapacity(reached)
+  at = usize.ZERO
+  while at < reached {
+    let block = List<usize>.get(&postorder, reached - usize.ONE - at)
+    List<usize>.set(&mut order, block, at)
+    run List<usize>.append(&mut sequence, block)
+    at = at + usize.ONE
+  }
+  // Predecessors of reachable blocks, as edges `[from, to]`.
+  let mut predecessorStart = run List<usize>.makeWithCapacity(count + usize.ONE)
+  let mut predecessors = List<usize>.make()
+  let mut inCount = run List<usize>.makeWithCapacity(count)
+  run List<usize>.appendRepeated(&mut inCount, usize.ZERO, count)
+  at = usize.ZERO
+  while at < count {
+    if List<usize>.get(&order, at) != usize.MAX {
+      let mut edge = starts[at]
+      while edge < starts[at + usize.ONE] {
+        let counted = List<usize>.get(&inCount, targets[edge]) + usize.ONE
+        List<usize>.set(&mut inCount, targets[edge], counted)
+        edge = edge + usize.ONE
+      }
+    }
+    at = at + usize.ONE
+  }
+  let mut total = usize.ZERO
+  at = usize.ZERO
+  while at < count {
+    run List<usize>.append(&mut predecessorStart, total)
+    total = total + List<usize>.get(&inCount, at)
+    at = at + usize.ONE
+  }
+  run List<usize>.append(&mut predecessorStart, total)
+  run List<usize>.appendRepeated(&mut predecessors, usize.ZERO, total)
+  let mut filled = run List<usize>.makeWithCapacity(count)
+  run List<usize>.appendRepeated(&mut filled, usize.ZERO, count)
+  at = usize.ZERO
+  while at < count {
+    if List<usize>.get(&order, at) != usize.MAX {
+      let mut edge = starts[at]
+      while edge < starts[at + usize.ONE] {
+        let target = targets[edge]
+        let slot = List<usize>.get(&predecessorStart, target) + List<usize>.get(&filled, target)
+        List<usize>.set(&mut predecessors, slot, at)
+        let done = List<usize>.get(&filled, target) + usize.ONE
+        List<usize>.set(&mut filled, target, done)
+        edge = edge + usize.ONE
+      }
+    }
+    at = at + usize.ONE
+  }
+  // Immediate dominators (Cooper, Harvey and Kennedy), over reverse postorder numbers.
+  let mut dominator = run List<usize>.makeWithCapacity(count)
+  run List<usize>.appendRepeated(&mut dominator, usize.MAX, count)
+  List<usize>.set(&mut dominator, usize.ZERO, usize.ZERO)
+  let mut changed = true
+  while changed {
+    changed = false
+    let mut step = usize.ONE
+    while step < reached {
+      let block = List<usize>.get(&sequence, step)
+      let mut chosen = usize.MAX
+      let mut edge = List<usize>.get(&predecessorStart, block)
+      while edge < List<usize>.get(&predecessorStart, block + usize.ONE) {
+        let from = List<usize>.get(&predecessors, edge)
+        if List<usize>.get(&dominator, from) != usize.MAX {
+          if chosen == usize.MAX {
+            chosen = from
+          } else {
+            chosen = intersect(List<usize>.asSlice(&dominator), List<usize>.asSlice(&order), from, chosen)
+          }
+        }
+        edge = edge + usize.ONE
+      }
+      if chosen != List<usize>.get(&dominator, block) {
+        List<usize>.set(&mut dominator, block, chosen)
+        changed = true
+      }
+      step = step + usize.ONE
+    }
+  }
+  // Loop headers, merge nodes, and the check that every loop is entered at its header.
+  let mut header = run List<bool>.makeWithCapacity(count)
+  run List<bool>.appendRepeated(&mut header, false, count)
+  let mut merge = run List<bool>.makeWithCapacity(count)
+  run List<bool>.appendRepeated(&mut merge, false, count)
+  at = usize.ZERO
+  while at < count {
+    let mine = List<usize>.get(&order, at)
+    if mine != usize.MAX {
+      let mut forward = usize.ZERO
+      let mut edge = List<usize>.get(&predecessorStart, at)
+      while edge < List<usize>.get(&predecessorStart, at + usize.ONE) {
+        let from = List<usize>.get(&predecessors, edge)
+        if List<usize>.get(&order, from) >= mine {
+          List<bool>.set(&mut header, at, true)
+          if !dominates(List<usize>.asSlice(&dominator), List<usize>.asSlice(&order), at, from) {
+            run unsupported(b"irreducible control flow", symbol)
+          }
+        } else {
+          forward = forward + usize.ONE
+        }
+        edge = edge + usize.ONE
+      }
+      if forward > usize.ONE { List<bool>.set(&mut merge, at, true) }
+    }
+    at = at + usize.ONE
+  }
+  // Merge children per block, highest reverse postorder first.
+  let mut childCount = run List<usize>.makeWithCapacity(count)
+  run List<usize>.appendRepeated(&mut childCount, usize.ZERO, count)
+  at = usize.ONE
+  while at < reached {
+    let block = List<usize>.get(&sequence, at)
+    if List<bool>.get(&merge, block) {
+      let parent = List<usize>.get(&dominator, block)
+      let counted = List<usize>.get(&childCount, parent) + usize.ONE
+      List<usize>.set(&mut childCount, parent, counted)
+    }
+    at = at + usize.ONE
+  }
+  let mut childStart = run List<usize>.makeWithCapacity(count + usize.ONE)
+  total = usize.ZERO
+  at = usize.ZERO
+  while at < count {
+    run List<usize>.append(&mut childStart, total)
+    total = total + List<usize>.get(&childCount, at)
+    at = at + usize.ONE
+  }
+  run List<usize>.append(&mut childStart, total)
+  let mut children = List<usize>.make()
+  run List<usize>.appendRepeated(&mut children, usize.ZERO, total)
+  let mut placedChildren = run List<usize>.makeWithCapacity(count)
+  run List<usize>.appendRepeated(&mut placedChildren, usize.ZERO, count)
+  // Walking reverse postorder backwards lists each block's children highest first.
+  at = reached
+  while at > usize.ONE {
+    at = at - usize.ONE
+    let block = List<usize>.get(&sequence, at)
+    if List<bool>.get(&merge, block) {
+      let parent = List<usize>.get(&dominator, block)
+      let slot = List<usize>.get(&childStart, parent) + List<usize>.get(&placedChildren, parent)
+      List<usize>.set(&mut children, slot, block)
+      let done = List<usize>.get(&placedChildren, parent) + usize.ONE
+      List<usize>.set(&mut placedChildren, parent, done)
+    }
+  }
+  return Graph {successorStart: move successorStart, edges: move edges, order: move order, sequence: move sequence,
+    dominator: move dominator, header: move header, merge: move merge, childStart: move childStart, children: move children}
+}
+
+fn intersect(dominator: &[usize], order: &[usize], left: usize, right: usize) -> usize {
+  let mut first = left
+  let mut second = right
+  while first != second {
+    while order[first] > order[second] { first = dominator[first] }
+    while order[second] > order[first] { second = dominator[second] }
+  }
+  return first
+}
+
+// Whether block `above` dominates block `below`.
+fn dominates(dominator: &[usize], order: &[usize], above: usize, below: usize) -> bool {
+  let mut at = below
+  while true {
+    if at == above { return true }
+    if at == usize.ZERO || order[at] <= order[above] { return false }
+    at = dominator[at]
+  }
+  return false
+}
+
+// Emits the function's blocks as structured code (Ramsey, "Beyond Relooper", ICFP 2022): each
+// block's dominator-tree subtree in one walk, a loop around a loop header's subtree, and a
+// `block` before each merge child, so a forward branch to it leaves that `block`.
+effect fn structure(function: &mut Function, module: &Module, body: usize, words: &[u64], records: &[Record], blocks: &[Block],
+  placement: &mut Placement) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let graph = run graphOf(module, words, records, blocks, Bytes.asSlice(&function.symbol))
+  let mut labels = List<Label>.make()
+  let mut actions = List<Action>.make()
+  run List<Action>.append(&mut actions, Action {kind: actionTree(), first: usize.ZERO, second: usize.ZERO})
+  while List<Action>.length(&actions) > usize.ZERO {
+    let action = List<Action>.get(&actions, List<Action>.length(&actions) - usize.ONE)
+    drop List<Action>.pop(&mut actions)
+    let block = action.first
+    if action.kind == actionTree() {
+      if List<bool>.get(&graph.header, block) {
+        run emitStructured(&mut function.*, WasmModule.opLoop())
+        run List<Label>.append(&mut labels, Label {kind: labelLoop(), block: block})
+        run List<Action>.append(&mut actions, Action {kind: actionEndLoop(), first: block, second: usize.ZERO})
+      }
+      run List<Action>.append(&mut actions, Action {kind: actionWithin(), first: block, second: usize.ZERO})
+    } else if action.kind == actionWithin() {
+      let start = List<usize>.get(&graph.childStart, block)
+      let end = List<usize>.get(&graph.childStart, block + usize.ONE)
+      if start + action.second >= end {
+        run List<Action>.append(&mut actions, Action {kind: actionBody(), first: block, second: usize.ZERO})
+      } else {
+        let child = List<usize>.get(&graph.children, start + action.second)
+        run emitStructured(&mut function.*, WasmModule.opBlock())
+        run List<Label>.append(&mut labels, Label {kind: labelBlock(), block: child})
+        run List<Action>.append(&mut actions, Action {kind: actionTree(), first: child, second: usize.ZERO})
+        run List<Action>.append(&mut actions, Action {kind: actionEndBlock(), first: child, second: usize.ZERO})
+        run List<Action>.append(&mut actions, Action {kind: actionWithin(), first: block, second: action.second + usize.ONE})
+      }
+    } else if action.kind == actionBody() {
+      run emitBlock(&mut function.*, module, body, words, records, blocks[block], &mut placement)
+      run terminate(&mut function.*, module, body, words, records[blocks[block].last], block, &mut actions, &mut labels, &mut placement)
+    } else if action.kind == actionBranch() {
+      let target = action.second
+      run phiCopies(&mut function.*, module, body, words, records, blocks[target], block, &mut placement)
+      let from = List<usize>.get(&graph.order, block)
+      let to = List<usize>.get(&graph.order, target)
+      if to <= from {
+        run branchTo(&mut function.*, List<Label>.asSlice(&labels), labelLoop(), target)
+      } else if List<bool>.get(&graph.merge, target) {
+        run branchTo(&mut function.*, List<Label>.asSlice(&labels), labelBlock(), target)
+      } else {
+        run List<Action>.append(&mut actions, Action {kind: actionTree(), first: target, second: usize.ZERO})
+      }
+    } else if action.kind == actionEndBlock() {
+      run emit(&mut function.*, WasmModule.opEnd())
+      drop List<Label>.pop(&mut labels)
+    } else if action.kind == actionEndLoop() {
+      run emit(&mut function.*, WasmModule.opEnd())
+      drop List<Label>.pop(&mut labels)
+      run emit(&mut function.*, WasmModule.opUnreachable())
+    } else if action.kind == actionElse() {
+      run emit(&mut function.*, WasmModule.opElse())
+    } else if action.kind == actionEndIf() {
+      run emit(&mut function.*, WasmModule.opEnd())
+      drop List<Label>.pop(&mut labels)
+      run emit(&mut function.*, WasmModule.opUnreachable())
+    } else if action.kind == actionEndCase() {
+      run emit(&mut function.*, WasmModule.opEnd())
+      drop List<Label>.pop(&mut labels)
+    } else if action.kind == actionCase() {
+      // The test of switch case `second` of block `first`, opening its `if`.
+      let record = records[blocks[block].last]
+      let ty = module.typeIn(body, operand(words, record, usize.ONE))
+      run pushValue(&mut function.*, module, body, operand(words, record, usize.ONE), &mut placement)
+      run pushValue(&mut function.*, module, body, operand(words, record, 3 + action.second * 2), &mut placement)
+      if scalarType(module, ty) == WasmModule.i64Type() { run emit(&mut function.*, 0x51) } else { run emit(&mut function.*, 0x46) }
+      run emitStructured(&mut function.*, WasmModule.opIf())
+      run List<Label>.append(&mut labels, Label {kind: labelIf(), block: usize.MAX})
+    }
+  }
+  return run emit(&mut function.*, WasmModule.opUnreachable())
+}
+
+effect fn emitStructured(function: &mut Function, code: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run WasmModule.structured(&mut function.*.code, code)
+}
+
+// `br` to the label of `kind` that `block` opened.
+effect fn branchTo(function: &mut Function, labels: &[Label], kind: u8, block: usize) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let mut depth = usize.ZERO
+  let mut at = labels.length
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    if labels[at].kind == kind && labels[at].block == block {
+      return run WasmModule.opIndex(&mut function.*.code, WasmModule.opBr(), depth)
+    }
+    depth = depth + usize.ONE
+  }
+  return run unsupported(b"a branch to a block outside its structure", Bytes.asSlice(&function.symbol))
+}
+
+// Queues the structured form of a block's terminator: its branches, in the order they run.
+effect fn terminate(function: &mut Function, module: &Module, body: usize, words: &[u64], record: Record, block: usize,
+  actions: &mut List<Action>, labels: &mut List<Label>, placement: &mut Placement) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let code = record.code
+  if code == Bitcode.instructionBranch() {
+    if operandCount(record) == usize.ONE {
+      return run List<Action>.append(&mut actions.*, Action {kind: actionBranch(), first: block, second: u64.toUsize(operand(words, record, usize.ZERO))})
+    }
+    run pushValue(&mut function.*, module, body, operand(words, record, 2), &mut placement)
+    run emitStructured(&mut function.*, WasmModule.opIf())
+    // The `if` is a label until `actionEndIf` closes it, so branches inside it count it.
+    run List<Label>.append(&mut labels.*, Label {kind: labelIf(), block: usize.MAX})
+    run List<Action>.append(&mut actions.*, Action {kind: actionEndIf(), first: block, second: usize.ZERO})
+    run List<Action>.append(&mut actions.*, Action {kind: actionBranch(), first: block, second: u64.toUsize(operand(words, record, usize.ONE))})
+    run List<Action>.append(&mut actions.*, Action {kind: actionElse(), first: block, second: usize.ZERO})
+    run List<Action>.append(&mut actions.*, Action {kind: actionBranch(), first: block, second: u64.toUsize(operand(words, record, usize.ZERO))})
+    return ()
+  }
+  if code == Bitcode.instructionSwitch() {
+    run List<Action>.append(&mut actions.*, Action {kind: actionBranch(), first: block, second: u64.toUsize(operand(words, record, 2))})
+    let cases = (operandCount(record) - 3) / 2
+    let mut at = cases
+    while at > usize.ZERO {
+      at = at - usize.ONE
+      run List<Action>.append(&mut actions.*, Action {kind: actionEndCase(), first: block, second: at})
+      run List<Action>.append(&mut actions.*, Action {kind: actionBranch(), first: block, second: u64.toUsize(operand(words, record, 4 + at * 2))})
+      run List<Action>.append(&mut actions.*, Action {kind: actionCase(), first: block, second: at})
+    }
+    return ()
+  }
+  if code == Bitcode.instructionInvoke() {
+    run emitCall(&mut function.*, module, body, words, record, &mut placement)
+    return run List<Action>.append(&mut actions.*, Action {kind: actionBranch(), first: block, second: u64.toUsize(operand(words, record, 2))})
+  }
+  if code == Bitcode.instructionReturn() {
+    run epilogue(&mut function.*)
+    if operandCount(record) > usize.ZERO { run pushValue(&mut function.*, module, body, operand(words, record, usize.ZERO), &mut placement) }
+    return run emit(&mut function.*, WasmModule.opReturn())
+  }
+  if code == Bitcode.instructionUnreachable() || code == Bitcode.instructionResume() {
+    return run emit(&mut function.*, WasmModule.opUnreachable())
+  }
+  return run unsupported(b"an indirect branch", Bytes.asSlice(&function.symbol))
+}
+
+// Restores the stack pointer the prologue moved.
+effect fn epilogue(function: &mut Function) -> () ! OutOfMemoryError ? &mut Allocator {
+  if function.saved == usize.MAX { return () }
+  run WasmModule.localGet(&mut function.*.code, function.saved)
+  return run WasmModule.globalSet(&mut function.*.code, usize.ZERO)
+}
+
+// The copies a branch from block `from` to `target` makes into `target`'s `phi` values: every
+// incoming value first, then every store, so the copies read the values before any is replaced.
+effect fn phiCopies(function: &mut Function, module: &Module, body: usize, words: &[u64], records: &[Record], target: Block, from: usize,
+  placement: &mut Placement) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let mut at = target.first
+  let mut phis = List<usize>.make()
+  while at <= target.last && records[at].code == Bitcode.instructionPhi() {
+    let record = records[at]
+    let mut item: usize = 1
+    while item + usize.ONE < operandCount(record) {
+      if u64.toUsize(operand(words, record, item + usize.ONE)) == from {
+        run pushValue(&mut function.*, module, body, operand(words, record, item), &mut placement)
+        run List<usize>.append(&mut phis, at)
+        break
+      }
+      item = item + 2
+    }
+    at = at + usize.ONE
+  }
+  let listed = List<usize>.asSlice(&phis)
+  let mut index = listed.length
+  while index > usize.ZERO {
+    index = index - usize.ONE
+    run storeResult(&mut function.*, module, body, records[listed[index]])
+  }
+  return ()
+}
+
+// Pops a record's result lanes into its value's locals, last lane first.
+effect fn storeResult(function: &mut Function, module: &Module, body: usize, record: Record) -> () ! OutOfMemoryError ? &mut Allocator {
+  if record.value == usize.MAX { return () }
+  let first = List<usize>.get(&function.values, record.value)
+  if first == usize.MAX { return () }
+  let count = laneCount(module, module.bodyLocalType(body, record.value))
+  let mut at = count
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    run WasmModule.localSet(&mut function.*.code, first + at)
+  }
+  return ()
+}
+
+// Values.
+
+// Pushes every lane of value `reference`.
+effect fn pushValue(function: &mut Function, module: &Module, body: usize, reference: u64, placement: &mut Placement) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let ty = module.typeIn(body, reference)
+  let count = laneCount(module, ty)
+  let mut at = usize.ZERO
+  while at < count {
+    run pushLane(&mut function.*, module, body, reference, at, &mut placement)
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Pushes lane `lane` of value `reference`.
+effect fn pushLane(function: &mut Function, module: &Module, body: usize, reference: u64, lane: usize, placement: &mut Placement) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if Bitcode.isLocal(reference) {
+    let first = List<usize>.get(&function.values, Bitcode.referenceIndex(reference))
+    return run WasmModule.localGet(&mut function.*.code, first + lane)
+  }
+  if Bitcode.isGlobal(reference) {
+    let bits = run constantBits(module, reference, &mut placement, Bytes.asSlice(&function.symbol))
+    return run WasmModule.i32Const(&mut function.*.code, bits)
+  }
+  let ty = module.constantType(reference)
+  return run pushConstantLane(&mut function.*, module, reference, ty, lane, &mut placement)
+}
+
+// Pushes lane `lane` of the constant `reference` of type `ty`.
+effect fn pushConstantLane(function: &mut Function, module: &Module, reference: u64, ty: u64, lane: usize, placement: &mut Placement) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let symbol = Bytes.asSlice(&function.symbol)
+  if Bitcode.isGlobal(reference) {
+    return run WasmModule.i32Const(&mut function.*.code, run constantBits(module, reference, &mut placement, symbol))
+  }
+  let code = module.constantCode(reference)
+  let typeCode = module.typeCode(ty)
+  if typeCode == Bitcode.typeStruct() || typeCode == Bitcode.typePackedStruct() || typeCode == Bitcode.typeArray() {
+    // Find the element holding the lane.
+    let count = module.typeItems(ty)
+    let mut elements = count
+    if typeCode == Bitcode.typeArray() { elements = u64.toUsize(module.typeItem(ty, usize.ZERO)) }
+    let mut skipped = usize.ZERO
+    let mut at = usize.ZERO
+    while at < elements {
+      let mut elementType = module.typeItem(ty, usize.ONE)
+      if typeCode != Bitcode.typeArray() { elementType = module.typeItem(ty, at) }
+      let lanes = laneCount(module, elementType)
+      if lane < skipped + lanes {
+        if code == Bitcode.constantAggregate() {
+          return run pushConstantLane(&mut function.*, module, module.constantItem(reference, at), elementType, lane - skipped, &mut placement)
+        }
+        if code == Bitcode.constantString() || code == Bitcode.constantCString() {
+          // A string's items are its bytes.
+          let mut byte: u64 = 0
+          if at < module.constantItems(reference) { byte = module.constantItem(reference, at) }
+          return run WasmModule.i32Const(&mut function.*.code, byte)
+        }
+        return run pushZero(&mut function.*, module, elementType, lane - skipped)
+      }
+      skipped = skipped + lanes
+      at = at + usize.ONE
+    }
+    return run unsupported(b"a constant lane", symbol)
+  }
+  if typeCode == Bitcode.typeInteger() && module.typeItem(ty, usize.ZERO) > 64 {
+    let mut low: u64 = 0
+    if code == Bitcode.constantInteger() { low = Bitcode.signedValue(module.constantItem(reference, usize.ZERO)) }
+    if lane == usize.ZERO { return run WasmModule.i64Const(&mut function.*.code, low) }
+    if (low & 9223372036854775808) != 0 { return run WasmModule.i64Const(&mut function.*.code, u64.MAX) }
+    return run WasmModule.i64Const(&mut function.*.code, 0)
+  }
+  let bits = run constantBits(module, reference, &mut placement, symbol)
+  return run pushBits(&mut function.*, module, ty, bits)
+}
+
+// Pushes the scalar of type `ty` whose bits are `bits`.
+effect fn pushBits(function: &mut Function, module: &Module, ty: u64, bits: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let lane = scalarType(module, ty)
+  if lane == WasmModule.f32Type() { return run WasmModule.f32Const(&mut function.*.code, bits) }
+  if lane == WasmModule.f64Type() { return run WasmModule.f64Const(&mut function.*.code, bits) }
+  if lane == WasmModule.i64Type() { return run WasmModule.i64Const(&mut function.*.code, bits) }
+  return run WasmModule.i32Const(&mut function.*.code, bits)
+}
+
+// Pushes a zero for lane `lane` of type `ty`.
+effect fn pushZero(function: &mut Function, module: &Module, ty: u64, lane: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut lanes = List<u8>.make()
+  drop run appendLanes(module, ty, &mut lanes)
+  let kind = List<u8>.get(&lanes, lane)
+  if kind == WasmModule.f32Type() { return run WasmModule.f32Const(&mut function.*.code, 0) }
+  if kind == WasmModule.f64Type() { return run WasmModule.f64Const(&mut function.*.code, 0) }
+  if kind == WasmModule.i64Type() { return run WasmModule.i64Const(&mut function.*.code, 0) }
+  return run WasmModule.i32Const(&mut function.*.code, 0)
+}
+
+// Integer helpers. A value of width `bits` narrower than its container is zero-extended.
+
+fn wide(bits: u64) -> bool { return bits > 32 }
+
+// Masks the value on the stack to its low `bits` bits, when it is narrower than its container.
+effect fn normalize(function: &mut Function, bits: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if bits == 32 || bits == 64 { return () }
+  if wide(bits) {
+    run WasmModule.i64Const(&mut function.*.code, masked(u64.MAX, bits))
+    return run emit(&mut function.*, 0x83)
+  }
+  run WasmModule.i32Const(&mut function.*.code, masked(u64.MAX, bits))
+  return run emit(&mut function.*, 0x71)
+}
+
+// Sign-extends the value on the stack from its low `bits` bits to its whole container.
+effect fn signExtend(function: &mut Function, bits: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if bits == 32 || bits == 64 { return () }
+  if wide(bits) {
+    run WasmModule.i64Const(&mut function.*.code, 64 - bits)
+    run emit(&mut function.*, 0x86)
+    run WasmModule.i64Const(&mut function.*.code, 64 - bits)
+    return run emit(&mut function.*, 0x87)
+  }
+  if bits == 8 { return run emit(&mut function.*, 0xC0) }
+  if bits == 16 { return run emit(&mut function.*, 0xC1) }
+  run WasmModule.i32Const(&mut function.*.code, 32 - bits)
+  run emit(&mut function.*, 0x74)
+  run WasmModule.i32Const(&mut function.*.code, 32 - bits)
+  return run emit(&mut function.*, 0x75)
+}
+
+// Pushes integer value `reference` sign-extended to its container.
+effect fn pushSigned(function: &mut Function, module: &Module, body: usize, reference: u64, placement: &mut Placement) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  run pushValue(&mut function.*, module, body, reference, &mut placement)
+  return run signExtend(&mut function.*, widthOf(module, module.typeIn(body, reference)))
+}
+
+// The opcode of an `i32` operation, or its `i64` form `wide` places after it.
+fn pick(narrow: u8, wideCode: u8, isWide: bool) -> u8 {
+  if isWide { return wideCode }
+  return narrow
+}
+
+// Instructions.
+
+effect fn emitBlock(function: &mut Function, module: &Module, body: usize, words: &[u64], records: &[Record], block: Block,
+  placement: &mut Placement) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let mut at = block.first
+  while at < block.last {
+    let record = records[at]
+    if record.code != Bitcode.instructionPhi() {
+      run emitInstruction(&mut function.*, module, body, words, record, &mut placement)
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn emitInstruction(function: &mut Function, module: &Module, body: usize, words: &[u64], record: Record, placement: &mut Placement) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let code = record.code
+  if code == Bitcode.instructionAlloca() {
+    // An entry-block slot's address was written by the prologue.
+    if staticCount(module, operand(words, record, 2)) != u64.MAX && record.header < function.entryEnd { return () }
+    return run dynamicAlloca(&mut function.*, module, body, words, record, &mut placement)
+  }
+  if code == Bitcode.instructionLoad() || code == Bitcode.instructionLoadAtomic() {
+    let ty = operand(words, record, usize.ONE)
+    run loadValue(&mut function.*, module, body, operand(words, record, usize.ZERO), ty, &mut placement)
+    return run storeResult(&mut function.*, module, body, record)
+  }
+  if code == Bitcode.instructionStore() || code == Bitcode.instructionStoreAtomic() {
+    return run storeValue(&mut function.*, module, body, operand(words, record, usize.ZERO), operand(words, record, usize.ONE), &mut placement)
+  }
+  if code == Bitcode.instructionGep() {
+    run emitGep(&mut function.*, module, body, words, record, &mut placement)
+    return run storeResult(&mut function.*, module, body, record)
+  }
+  if code == Bitcode.instructionBinary() {
+    run emitBinary(&mut function.*, module, body, operand(words, record, usize.ZERO), operand(words, record, usize.ONE),
+      operand(words, record, 2), &mut placement)
+    return run storeResult(&mut function.*, module, body, record)
+  }
+  if code == Bitcode.instructionCast() {
+    run emitCast(&mut function.*, module, body, operand(words, record, usize.ZERO), operand(words, record, usize.ONE),
+      operand(words, record, 2), &mut placement)
+    return run storeResult(&mut function.*, module, body, record)
+  }
+  if code == Bitcode.instructionCompare() {
+    run emitCompare(&mut function.*, module, body, operand(words, record, usize.ZERO), operand(words, record, usize.ONE),
+      operand(words, record, 2), &mut placement)
+    return run storeResult(&mut function.*, module, body, record)
+  }
+  if code == Bitcode.instructionSelect() {
+    let chosen = operand(words, record, usize.ZERO)
+    let otherwise = operand(words, record, usize.ONE)
+    let condition = operand(words, record, 2)
+    let count = laneCount(module, module.typeIn(body, chosen))
+    let mut lane = usize.ZERO
+    while lane < count {
+      run pushLane(&mut function.*, module, body, chosen, lane, &mut placement)
+      run pushLane(&mut function.*, module, body, otherwise, lane, &mut placement)
+      run pushValue(&mut function.*, module, body, condition, &mut placement)
+      run emit(&mut function.*, WasmModule.opSelect())
+      lane = lane + usize.ONE
+    }
+    return run storeResult(&mut function.*, module, body, record)
+  }
+  if code == Bitcode.instructionExtractValue() || code == Bitcode.instructionInsertValue() {
+    return run emitAggregate(&mut function.*, module, body, words, record, &mut placement)
+  }
+  if code == Bitcode.instructionFreeze() {
+    run pushValue(&mut function.*, module, body, operand(words, record, usize.ZERO), &mut placement)
+    return run storeResult(&mut function.*, module, body, record)
+  }
+  if code == Bitcode.instructionUnary() {
+    let value = operand(words, record, usize.ZERO)
+    run pushValue(&mut function.*, module, body, value, &mut placement)
+    run emit(&mut function.*, pick(0x8C, 0x9A, scalarType(module, module.typeIn(body, value)) == WasmModule.f64Type()))
+    return run storeResult(&mut function.*, module, body, record)
+  }
+  if code == Bitcode.instructionCall() {
+    return run emitCall(&mut function.*, module, body, words, record, &mut placement)
+  }
+  if code == Bitcode.instructionAtomicRmw() {
+    return run emitReadModifyWrite(&mut function.*, module, body, words, record, &mut placement)
+  }
+  if code == Bitcode.instructionCompareExchange() {
+    return run emitCompareExchange(&mut function.*, module, body, words, record, &mut placement)
+  }
+  if code == Bitcode.instructionFence() { return () }
+  if code == Bitcode.instructionLandingPad() {
+    // Never reached: the wasm target does not unwind. Its value lanes keep their zero.
+    return ()
+  }
+  let mut what = run Bytes.copy(b"instruction record ")
+  run appendDecimal(&mut what, code)
+  return run unsupported(Bytes.asSlice(&what), Bytes.asSlice(&function.symbol))
+}
+
+effect fn appendDecimal(text: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value >= 10 { run appendDecimal(&mut text.*, value / 10) }
+  return run Bytes.append(&mut text.*, &[u64.toU8(48 + value % 10)])
+}
+
+// An `alloca` the prologue did not place: the stack pointer moves down by its size, aligned, and
+// the function's return restores it.
+effect fn dynamicAlloca(function: &mut Function, module: &Module, body: usize, words: &[u64], record: Record, placement: &mut Placement) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let ty = operand(words, record, usize.ZERO)
+  let count = operand(words, record, 2)
+  let alignment = allocaAlignment(module, words, record)
+  run WasmModule.globalGet(&mut function.*.code, usize.ZERO)
+  run pushValue(&mut function.*, module, body, count, &mut placement)
+  if wide(widthOf(module, module.typeIn(body, count))) { run emit(&mut function.*, 0xA7) }
+  run WasmModule.i32Const(&mut function.*.code, sizeOf(module, ty))
+  run emit(&mut function.*, 0x6C)
+  run emit(&mut function.*, 0x6B)
+  let mut mask = alignment
+  if mask < 16 { mask = 16 }
+  run WasmModule.i32Const(&mut function.*.code, u64.wrappingSubtract(0, mask))
+  run emit(&mut function.*, 0x71)
+  let local = List<usize>.get(&function.values, record.value)
+  run WasmModule.localTee(&mut function.*.code, local)
+  return run WasmModule.globalSet(&mut function.*.code, usize.ZERO)
+}
+
+// Integer operation codes: the `i32` form, and the `i64` one a fixed distance after it.
+effect fn intOp(function: &mut Function, narrow: u8, isWide: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  if isWide { return run emit(&mut function.*, narrow + 0x12) }
+  return run emit(&mut function.*, narrow)
+}
+
+effect fn intCompare(function: &mut Function, narrow: u8, isWide: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  if isWide { return run emit(&mut function.*, narrow + 0x0B) }
+  return run emit(&mut function.*, narrow)
+}
+
+// Pushes the integer constant `value` in the container of an integer `bits` wide.
+effect fn pushInt(function: &mut Function, bits: u64, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if wide(bits) { return run WasmModule.i64Const(&mut function.*.code, value) }
+  return run WasmModule.i32Const(&mut function.*.code, value)
+}
+
+// Pushes integer value `reference` as an `i64`, sign- or zero-extended from its width.
+effect fn pushExtended(function: &mut Function, module: &Module, body: usize, reference: u64, signed: bool, placement: &mut Placement) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let bits = widthOf(module, module.typeIn(body, reference))
+  if signed { run pushSigned(&mut function.*, module, body, reference, &mut placement) } else { run pushValue(&mut function.*, module, body, reference, &mut placement) }
+  if wide(bits) { return () }
+  if signed { return run emit(&mut function.*, 0xAC) }
+  return run emit(&mut function.*, 0xAD)
+}
+
+// Memory.
+
+// The load and store codes of a scalar leaf of `ty`, or zero when wasm has no such access.
+fn loadCode(module: &Module, ty: u64) -> u8 {
+  let lane = scalarType(module, ty)
+  if lane == WasmModule.f32Type() { return 0x2A }
+  if lane == WasmModule.f64Type() { return 0x2B }
+  let size = storeSizeOf(module, ty)
+  if lane == WasmModule.i64Type() {
+    if size == 8 { return 0x29 }
+    return 0
+  }
+  if size == 1 { return 0x2D }
+  if size == 2 { return 0x2F }
+  if size == 4 { return 0x28 }
+  return 0
+}
+
+fn storeCode(module: &Module, ty: u64) -> u8 {
+  let lane = scalarType(module, ty)
+  if lane == WasmModule.f32Type() { return 0x38 }
+  if lane == WasmModule.f64Type() { return 0x39 }
+  let size = storeSizeOf(module, ty)
+  if lane == WasmModule.i64Type() {
+    if size == 8 { return 0x37 }
+    return 0
+  }
+  if size == 1 { return 0x3A }
+  if size == 2 { return 0x3B }
+  if size == 4 { return 0x36 }
+  return 0
+}
+
+fn isWideInteger(module: &Module, ty: u64) -> bool {
+  return module.typeCode(ty) == Bitcode.typeInteger() && module.typeItem(ty, usize.ZERO) > 64
+}
+
+// Pushes every lane of the `ty` stored at `pointer`.
+effect fn loadValue(function: &mut Function, module: &Module, body: usize, pointer: u64, ty: u64, placement: &mut Placement) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let mut leaves = List<Leaf>.make()
+  run appendLeaves(module, ty, 0, &mut leaves)
+  let listed = List<Leaf>.asSlice(&leaves)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let leaf = listed[at]
+    if isWideInteger(module, leaf.ty) {
+      if module.typeItem(leaf.ty, usize.ZERO) != 128 { run unsupported(b"a wide integer load", Bytes.asSlice(&function.symbol)) }
+      run pushValue(&mut function.*, module, body, pointer, &mut placement)
+      run WasmModule.memoryAccess(&mut function.*.code, 0x29, usize.ZERO, leaf.offset)
+      run pushValue(&mut function.*, module, body, pointer, &mut placement)
+      run WasmModule.memoryAccess(&mut function.*.code, 0x29, usize.ZERO, leaf.offset + 8)
+    } else {
+      let code = loadCode(module, leaf.ty)
+      if code == 0 { run unsupported(b"a load of this type", Bytes.asSlice(&function.symbol)) }
+      run pushValue(&mut function.*, module, body, pointer, &mut placement)
+      run WasmModule.memoryAccess(&mut function.*.code, code, usize.ZERO, leaf.offset)
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Stores every lane of `value` at `pointer`.
+effect fn storeValue(function: &mut Function, module: &Module, body: usize, pointer: u64, value: u64, placement: &mut Placement) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let mut leaves = List<Leaf>.make()
+  run appendLeaves(module, module.typeIn(body, value), 0, &mut leaves)
+  let listed = List<Leaf>.asSlice(&leaves)
+  let mut lane = usize.ZERO
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let leaf = listed[at]
+    if isWideInteger(module, leaf.ty) {
+      if module.typeItem(leaf.ty, usize.ZERO) != 128 { run unsupported(b"a wide integer store", Bytes.asSlice(&function.symbol)) }
+      run pushValue(&mut function.*, module, body, pointer, &mut placement)
+      run pushLane(&mut function.*, module, body, value, lane, &mut placement)
+      run WasmModule.memoryAccess(&mut function.*.code, 0x37, usize.ZERO, leaf.offset)
+      run pushValue(&mut function.*, module, body, pointer, &mut placement)
+      run pushLane(&mut function.*, module, body, value, lane + usize.ONE, &mut placement)
+      run WasmModule.memoryAccess(&mut function.*.code, 0x37, usize.ZERO, leaf.offset + 8)
+      lane = lane + 2
+    } else {
+      let code = storeCode(module, leaf.ty)
+      if code == 0 { run unsupported(b"a store of this type", Bytes.asSlice(&function.symbol)) }
+      run pushValue(&mut function.*, module, body, pointer, &mut placement)
+      run pushLane(&mut function.*, module, body, value, lane, &mut placement)
+      run WasmModule.memoryAccess(&mut function.*.code, code, usize.ZERO, leaf.offset)
+      lane = lane + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// `getelementptr`: the base plus each index times its stride, constant parts folded into one
+// offset.
+effect fn emitGep(function: &mut Function, module: &Module, body: usize, words: &[u64], record: Record, placement: &mut Placement) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let mut current = operand(words, record, usize.ONE)
+  run pushValue(&mut function.*, module, body, operand(words, record, 2), &mut placement)
+  let mut constant: u64 = 0
+  let mut at: usize = 3
+  while at < operandCount(record) {
+    let index = operand(words, record, at)
+    let bits = widthOf(module, module.typeIn(body, index))
+    let mut stride: u64 = 0
+    if at == 3 {
+      stride = sizeOf(module, current)
+    } else if module.typeCode(current) == Bitcode.typeStruct() || module.typeCode(current) == Bitcode.typePackedStruct() {
+      let field = u64.toUsize(run constantBits(module, index, &mut placement, Bytes.asSlice(&function.symbol)))
+      constant = u64.wrappingAdd(constant, fieldOffset(module, current, field))
+      current = module.typeItem(current, field)
+      at = at + usize.ONE
+      continue
+    } else {
+      current = module.typeItem(current, usize.ONE)
+      stride = sizeOf(module, current)
+    }
+    if Bitcode.isConstant(index) {
+      let value = Bitcode.signExtend(run constantBits(module, index, &mut placement, Bytes.asSlice(&function.symbol)), bits)
+      constant = u64.wrappingAdd(constant, u64.wrappingMultiply(value, stride))
+    } else {
+      run pushSigned(&mut function.*, module, body, index, &mut placement)
+      if wide(bits) { run emit(&mut function.*, 0xA7) }
+      if stride != 1 {
+        run WasmModule.i32Const(&mut function.*.code, stride)
+        run emit(&mut function.*, 0x6C)
+      }
+      run emit(&mut function.*, 0x6A)
+    }
+    at = at + usize.ONE
+  }
+  if (constant & 4294967295) != 0 {
+    run WasmModule.i32Const(&mut function.*.code, constant)
+    run emit(&mut function.*, 0x6A)
+  }
+  return ()
+}
+
+// Arithmetic.
+
+effect fn emitBinary(function: &mut Function, module: &Module, body: usize, left: u64, right: u64, op: u64, placement: &mut Placement) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let ty = module.typeIn(body, left)
+  let code = module.typeCode(ty)
+  if code == Bitcode.typeFloat() || code == Bitcode.typeDouble() {
+    let double = code == Bitcode.typeDouble()
+    run pushValue(&mut function.*, module, body, left, &mut placement)
+    run pushValue(&mut function.*, module, body, right, &mut placement)
+    if op == Bitcode.opSRem() || op == Bitcode.opURem() {
+      let mut callee = placement.fmodf
+      if double { callee = placement.fmod }
+      if callee == usize.MAX || List<usize>.get(&placement.functions, callee) == usize.MAX {
+        run unsupported(b"a floating remainder without fmod", Bytes.asSlice(&function.symbol))
+      }
+      return run WasmModule.opIndex(&mut function.*.code, WasmModule.opCall(), List<usize>.get(&placement.functions, callee))
+    }
+    let mut base: u8 = 0x92
+    if double { base = 0xA0 }
+    if op == Bitcode.opAdd() { return run emit(&mut function.*, base) }
+    if op == Bitcode.opSub() { return run emit(&mut function.*, base + 1) }
+    if op == Bitcode.opMul() { return run emit(&mut function.*, base + 2) }
+    return run emit(&mut function.*, base + 3)
+  }
+  if code != Bitcode.typeInteger() { run unsupported(b"a binary operation on this type", Bytes.asSlice(&function.symbol)) }
+  let bits = module.typeItem(ty, usize.ZERO)
+  if bits > 64 { return run emitWideBinary(&mut function.*, module, body, left, right, op, &mut placement) }
+  let isWide = wide(bits)
+  if op == Bitcode.opSDiv() || op == Bitcode.opSRem() || op == Bitcode.opAShr() {
+    run pushSigned(&mut function.*, module, body, left, &mut placement)
+    if op == Bitcode.opAShr() { run pushValue(&mut function.*, module, body, right, &mut placement) } else { run pushSigned(&mut function.*, module, body, right, &mut placement) }
+    if op == Bitcode.opSDiv() { run intOp(&mut function.*, 0x6D, isWide) }
+    if op == Bitcode.opSRem() { run intOp(&mut function.*, 0x6F, isWide) }
+    if op == Bitcode.opAShr() { run intOp(&mut function.*, 0x75, isWide) }
+    return run normalize(&mut function.*, bits)
+  }
+  run pushValue(&mut function.*, module, body, left, &mut placement)
+  run pushValue(&mut function.*, module, body, right, &mut placement)
+  if op == Bitcode.opAdd() { run intOp(&mut function.*, 0x6A, isWide) }
+  else if op == Bitcode.opSub() { run intOp(&mut function.*, 0x6B, isWide) }
+  else if op == Bitcode.opMul() { run intOp(&mut function.*, 0x6C, isWide) }
+  else if op == Bitcode.opUDiv() { return run intOp(&mut function.*, 0x6E, isWide) }
+  else if op == Bitcode.opURem() { return run intOp(&mut function.*, 0x70, isWide) }
+  else if op == Bitcode.opShl() { run intOp(&mut function.*, 0x74, isWide) }
+  else if op == Bitcode.opLShr() { return run intOp(&mut function.*, 0x76, isWide) }
+  else if op == Bitcode.opAnd() { return run intOp(&mut function.*, 0x71, isWide) }
+  else if op == Bitcode.opOr() { return run intOp(&mut function.*, 0x72, isWide) }
+  else if op == Bitcode.opXor() { return run intOp(&mut function.*, 0x73, isWide) }
+  else { run unsupported(b"a binary operation", Bytes.asSlice(&function.symbol)) }
+  return run normalize(&mut function.*, bits)
+}
+
+// A binary operation on an `i128`, as two `i64` lanes, low first.
+effect fn emitWideBinary(function: &mut Function, module: &Module, body: usize, left: u64, right: u64, op: u64, placement: &mut Placement) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if widthOf(module, module.typeIn(body, left)) != 128 { run unsupported(b"an integer wider than 64 bits", Bytes.asSlice(&function.symbol)) }
+  if op == Bitcode.opAnd() || op == Bitcode.opOr() || op == Bitcode.opXor() {
+    let mut code: u8 = 0x83
+    if op == Bitcode.opOr() { code = 0x84 }
+    if op == Bitcode.opXor() { code = 0x85 }
+    run pushLane(&mut function.*, module, body, left, usize.ZERO, &mut placement)
+    run pushLane(&mut function.*, module, body, right, usize.ZERO, &mut placement)
+    run emit(&mut function.*, code)
+    run pushLane(&mut function.*, module, body, left, usize.ONE, &mut placement)
+    run pushLane(&mut function.*, module, body, right, usize.ONE, &mut placement)
+    return run emit(&mut function.*, code)
+  }
+  if op == Bitcode.opAdd() || op == Bitcode.opSub() {
+    let low = run addLocal(&mut function.*, WasmModule.i64Type())
+    run pushLane(&mut function.*, module, body, left, usize.ZERO, &mut placement)
+    run pushLane(&mut function.*, module, body, right, usize.ZERO, &mut placement)
+    if op == Bitcode.opAdd() { run emit(&mut function.*, 0x7C) } else { run emit(&mut function.*, 0x7D) }
+    run WasmModule.localTee(&mut function.*.code, low)
+    // The high lane, with the carry or borrow of the low one.
+    run pushLane(&mut function.*, module, body, left, usize.ONE, &mut placement)
+    run pushLane(&mut function.*, module, body, right, usize.ONE, &mut placement)
+    if op == Bitcode.opAdd() {
+      run emit(&mut function.*, 0x7C)
+      run WasmModule.localGet(&mut function.*.code, low)
+      run pushLane(&mut function.*, module, body, left, usize.ZERO, &mut placement)
+      run emit(&mut function.*, 0x54)
+      run emit(&mut function.*, 0xAD)
+      return run emit(&mut function.*, 0x7C)
+    }
+    run emit(&mut function.*, 0x7D)
+    run pushLane(&mut function.*, module, body, left, usize.ZERO, &mut placement)
+    run pushLane(&mut function.*, module, body, right, usize.ZERO, &mut placement)
+    run emit(&mut function.*, 0x54)
+    run emit(&mut function.*, 0xAD)
+    return run emit(&mut function.*, 0x7D)
+  }
+  if op == Bitcode.opMul() {
+    // `__multi3(result, leftLow, leftHigh, rightLow, rightHigh)` writes the product to a scratch
+    // slot below the stack pointer.
+    if placement.multiply == usize.MAX || List<usize>.get(&placement.functions, placement.multiply) == usize.MAX {
+      run unsupported(b"a 128-bit product without __multi3", Bytes.asSlice(&function.symbol))
+    }
+    let slot = run addLocal(&mut function.*, WasmModule.i32Type())
+    run WasmModule.globalGet(&mut function.*.code, usize.ZERO)
+    run WasmModule.i32Const(&mut function.*.code, 16)
+    run emit(&mut function.*, 0x6B)
+    run WasmModule.localTee(&mut function.*.code, slot)
+    run WasmModule.globalSet(&mut function.*.code, usize.ZERO)
+    run WasmModule.localGet(&mut function.*.code, slot)
+    run pushValue(&mut function.*, module, body, left, &mut placement)
+    run pushValue(&mut function.*, module, body, right, &mut placement)
+    run WasmModule.opIndex(&mut function.*.code, WasmModule.opCall(), List<usize>.get(&placement.functions, placement.multiply))
+    run WasmModule.localGet(&mut function.*.code, slot)
+    run WasmModule.memoryAccess(&mut function.*.code, 0x29, usize.ZERO, 0)
+    run WasmModule.localGet(&mut function.*.code, slot)
+    run WasmModule.memoryAccess(&mut function.*.code, 0x29, usize.ZERO, 8)
+    run WasmModule.localGet(&mut function.*.code, slot)
+    run WasmModule.i32Const(&mut function.*.code, 16)
+    run emit(&mut function.*, 0x6A)
+    return run WasmModule.globalSet(&mut function.*.code, usize.ZERO)
+  }
+  if op == Bitcode.opShl() || op == Bitcode.opLShr() || op == Bitcode.opAShr() {
+    return run emitWideShift(&mut function.*, module, body, left, right, op, &mut placement)
+  }
+  return run unsupported(b"a 128-bit division", Bytes.asSlice(&function.symbol))
+}
+
+// A shift of an `i128` by `amount` modulo 128: for an amount `n` under 64, each lane takes the
+// bits the other gives up; from 64 on, one lane moves whole into the other.
+effect fn emitWideShift(function: &mut Function, module: &Module, body: usize, value: u64, amount: u64, op: u64, placement: &mut Placement) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let low = run addLocal(&mut function.*, WasmModule.i64Type())
+  let high = run addLocal(&mut function.*, WasmModule.i64Type())
+  let count = run addLocal(&mut function.*, WasmModule.i64Type())
+  let large = run addLocal(&mut function.*, WasmModule.i32Type())
+  run pushLane(&mut function.*, module, body, value, usize.ZERO, &mut placement)
+  run WasmModule.localSet(&mut function.*.code, low)
+  run pushLane(&mut function.*, module, body, value, usize.ONE, &mut placement)
+  run WasmModule.localSet(&mut function.*.code, high)
+  run pushLane(&mut function.*, module, body, amount, usize.ZERO, &mut placement)
+  run WasmModule.i64Const(&mut function.*.code, 127)
+  run emit(&mut function.*, 0x83)
+  run WasmModule.localTee(&mut function.*.code, count)
+  run WasmModule.i64Const(&mut function.*.code, 64)
+  run emit(&mut function.*, 0x5A)
+  run WasmModule.localSet(&mut function.*.code, large)
+  if op == Bitcode.opShl() {
+    // Low: n < 64 ? low << n : 0.
+    run WasmModule.localGet(&mut function.*.code, low)
+    run WasmModule.localGet(&mut function.*.code, count)
+    run emit(&mut function.*, 0x86)
+    run WasmModule.i64Const(&mut function.*.code, 0)
+    run WasmModule.localGet(&mut function.*.code, large)
+    run emit(&mut function.*, 0x1B)
+    // High: n < 64 ? high << n | (low >> 1) >> (63 - n) : low << (n - 64).
+    run WasmModule.localGet(&mut function.*.code, high)
+    run WasmModule.localGet(&mut function.*.code, count)
+    run emit(&mut function.*, 0x86)
+    run WasmModule.localGet(&mut function.*.code, low)
+    run WasmModule.i64Const(&mut function.*.code, 1)
+    run emit(&mut function.*, 0x88)
+    run WasmModule.i64Const(&mut function.*.code, 63)
+    run WasmModule.localGet(&mut function.*.code, count)
+    run emit(&mut function.*, 0x7D)
+    run emit(&mut function.*, 0x88)
+    run emit(&mut function.*, 0x84)
+    run WasmModule.localGet(&mut function.*.code, low)
+    run WasmModule.localGet(&mut function.*.code, count)
+    run emit(&mut function.*, 0x86)
+    run WasmModule.localGet(&mut function.*.code, large)
+    run emit(&mut function.*, 0x1B)
+    run emit(&mut function.*, 0x1B)
+    return ()
+  }
+  let mut shift: u8 = 0x88
+  if op == Bitcode.opAShr() { shift = 0x87 }
+  // Low: n < 64 ? low >> n | (high << 1) << (63 - n) : high >> (n - 64).
+  run WasmModule.localGet(&mut function.*.code, high)
+  run WasmModule.localGet(&mut function.*.code, count)
+  run emit(&mut function.*, shift)
+  run WasmModule.localGet(&mut function.*.code, low)
+  run WasmModule.localGet(&mut function.*.code, count)
+  run emit(&mut function.*, 0x88)
+  run WasmModule.localGet(&mut function.*.code, high)
+  run WasmModule.i64Const(&mut function.*.code, 1)
+  run emit(&mut function.*, 0x86)
+  run WasmModule.i64Const(&mut function.*.code, 63)
+  run WasmModule.localGet(&mut function.*.code, count)
+  run emit(&mut function.*, 0x7D)
+  run emit(&mut function.*, 0x86)
+  run emit(&mut function.*, 0x84)
+  run WasmModule.localGet(&mut function.*.code, large)
+  run emit(&mut function.*, 0x1B)
+  // High: n < 64 ? high >> n : the sign fill or zero.
+  run WasmModule.localGet(&mut function.*.code, high)
+  run WasmModule.localGet(&mut function.*.code, count)
+  run emit(&mut function.*, shift)
+  if op == Bitcode.opAShr() {
+    run WasmModule.localGet(&mut function.*.code, high)
+    run WasmModule.i64Const(&mut function.*.code, 63)
+    run emit(&mut function.*, 0x87)
+  } else {
+    run WasmModule.i64Const(&mut function.*.code, 0)
+  }
+  run WasmModule.localGet(&mut function.*.code, large)
+  run emit(&mut function.*, 0x1B)
+  return ()
+}
+
+effect fn emitCast(function: &mut Function, module: &Module, body: usize, value: u64, destination: u64, op: u64, placement: &mut Placement) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let source = module.typeIn(body, value)
+  let sourceLane = scalarType(module, source)
+  let destinationLane = scalarType(module, destination)
+  if op == Bitcode.castTrunc() {
+    run pushLane(&mut function.*, module, body, value, usize.ZERO, &mut placement)
+    if (sourceLane == WasmModule.i64Type() || isWideInteger(module, source)) && destinationLane == WasmModule.i32Type() { run emit(&mut function.*, 0xA7) }
+    return run normalize(&mut function.*, widthOf(module, destination))
+  }
+  if op == Bitcode.castZExt() || op == Bitcode.castSExt() {
+    let signed = op == Bitcode.castSExt()
+    if isWideInteger(module, destination) {
+      let low = run addLocal(&mut function.*, WasmModule.i64Type())
+      run pushExtended(&mut function.*, module, body, value, signed, &mut placement)
+      run WasmModule.localTee(&mut function.*.code, low)
+      if signed {
+        run WasmModule.localGet(&mut function.*.code, low)
+        run WasmModule.i64Const(&mut function.*.code, 63)
+        return run emit(&mut function.*, 0x87)
+      }
+      return run WasmModule.i64Const(&mut function.*.code, 0)
+    }
+    if signed { run pushSigned(&mut function.*, module, body, value, &mut placement) } else { run pushValue(&mut function.*, module, body, value, &mut placement) }
+    if sourceLane == WasmModule.i32Type() && destinationLane == WasmModule.i64Type() {
+      if signed { run emit(&mut function.*, 0xAC) } else { run emit(&mut function.*, 0xAD) }
+    }
+    if signed { return run normalize(&mut function.*, widthOf(module, destination)) }
+    return ()
+  }
+  if op == Bitcode.castFPToSI() || op == Bitcode.castFPToUI() {
+    run pushValue(&mut function.*, module, body, value, &mut placement)
+    let bits = widthOf(module, destination)
+    // A narrow result converts through `i32`, signed, then keeps its low bits.
+    let mut code: u64 = 0
+    if op == Bitcode.castFPToUI() && (bits == 32 || bits == 64) { code = 1 }
+    if sourceLane == WasmModule.f64Type() { code = code + 2 }
+    if wide(bits) { code = code + 4 }
+    run WasmModule.prefixed(&mut function.*.code, 0xFC, code)
+    return run normalize(&mut function.*, bits)
+  }
+  if op == Bitcode.castSIToFP() || op == Bitcode.castUIToFP() {
+    let signed = op == Bitcode.castSIToFP()
+    if signed { run pushSigned(&mut function.*, module, body, value, &mut placement) } else { run pushValue(&mut function.*, module, body, value, &mut placement) }
+    let mut code: u8 = 0xB2
+    if destinationLane == WasmModule.f64Type() { code = 0xB7 }
+    if !signed { code = code + 1 }
+    if sourceLane == WasmModule.i64Type() { code = code + 2 }
+    return run emit(&mut function.*, code)
+  }
+  if op == Bitcode.castFPTrunc() {
+    run pushValue(&mut function.*, module, body, value, &mut placement)
+    return run emit(&mut function.*, 0xB6)
+  }
+  if op == Bitcode.castFPExt() {
+    run pushValue(&mut function.*, module, body, value, &mut placement)
+    return run emit(&mut function.*, 0xBB)
+  }
+  if op == Bitcode.castPtrToInt() {
+    run pushValue(&mut function.*, module, body, value, &mut placement)
+    if destinationLane == WasmModule.i64Type() { return run emit(&mut function.*, 0xAD) }
+    return run normalize(&mut function.*, widthOf(module, destination))
+  }
+  if op == Bitcode.castIntToPtr() {
+    run pushValue(&mut function.*, module, body, value, &mut placement)
+    if sourceLane == WasmModule.i64Type() { return run emit(&mut function.*, 0xA7) }
+    return ()
+  }
+  if op == Bitcode.castBitcast() {
+    if laneCount(module, source) != usize.ONE { run unsupported(b"a bitcast of this type", Bytes.asSlice(&function.symbol)) }
+    run pushValue(&mut function.*, module, body, value, &mut placement)
+    if sourceLane == destinationLane { return () }
+    if sourceLane == WasmModule.f32Type() { return run emit(&mut function.*, 0xBC) }
+    if sourceLane == WasmModule.f64Type() { return run emit(&mut function.*, 0xBD) }
+    if destinationLane == WasmModule.f32Type() { return run emit(&mut function.*, 0xBE) }
+    if destinationLane == WasmModule.f64Type() { return run emit(&mut function.*, 0xBF) }
+  }
+  return run unsupported(b"a cast", Bytes.asSlice(&function.symbol))
+}
+
+effect fn emitCompare(function: &mut Function, module: &Module, body: usize, left: u64, right: u64, predicate: u64, placement: &mut Placement) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let ty = module.typeIn(body, left)
+  if predicate < 32 { return run emitFloatCompare(&mut function.*, module, body, left, right, predicate, &mut placement) }
+  if isWideInteger(module, ty) { return run emitWideCompare(&mut function.*, module, body, left, right, predicate, &mut placement) }
+  if laneCount(module, ty) != usize.ONE { run unsupported(b"a comparison of this type", Bytes.asSlice(&function.symbol)) }
+  let isWide = scalarType(module, ty) == WasmModule.i64Type()
+  let signed = predicate >= Bitcode.intSgt()
+  if signed {
+    run pushSigned(&mut function.*, module, body, left, &mut placement)
+    run pushSigned(&mut function.*, module, body, right, &mut placement)
+  } else {
+    run pushValue(&mut function.*, module, body, left, &mut placement)
+    run pushValue(&mut function.*, module, body, right, &mut placement)
+  }
+  return run intCompare(&mut function.*, integerCompareCode(predicate), isWide)
+}
+
+// The `i32` comparison code of integer predicate `predicate`.
+fn integerCompareCode(predicate: u64) -> u8 {
+  if predicate == Bitcode.intEq() { return 0x46 }
+  if predicate == Bitcode.intNe() { return 0x47 }
+  if predicate == Bitcode.intUgt() { return 0x4B }
+  if predicate == Bitcode.intUge() { return 0x4F }
+  if predicate == Bitcode.intUlt() { return 0x49 }
+  if predicate == Bitcode.intUle() { return 0x4D }
+  if predicate == Bitcode.intSgt() { return 0x4A }
+  if predicate == Bitcode.intSge() { return 0x4E }
+  if predicate == Bitcode.intSlt() { return 0x48 }
+  return 0x4C
+}
+
+// An `i128` comparison: equality lane by lane, and an order decided by the high lanes unless they
+// are equal.
+effect fn emitWideCompare(function: &mut Function, module: &Module, body: usize, left: u64, right: u64, predicate: u64, placement: &mut Placement) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if predicate == Bitcode.intEq() || predicate == Bitcode.intNe() {
+    run pushLane(&mut function.*, module, body, left, usize.ZERO, &mut placement)
+    run pushLane(&mut function.*, module, body, right, usize.ZERO, &mut placement)
+    run emit(&mut function.*, 0x85)
+    run pushLane(&mut function.*, module, body, left, usize.ONE, &mut placement)
+    run pushLane(&mut function.*, module, body, right, usize.ONE, &mut placement)
+    run emit(&mut function.*, 0x85)
+    run emit(&mut function.*, 0x84)
+    if predicate == Bitcode.intEq() { return run emit(&mut function.*, 0x50) }
+    run WasmModule.i64Const(&mut function.*.code, 0)
+    return run emit(&mut function.*, 0x52)
+  }
+  // high != high ? high <pred> high : low <unsigned pred> low.
+  let mut unsignedPredicate = predicate
+  if predicate >= Bitcode.intSgt() { unsignedPredicate = predicate - 4 }
+  run pushLane(&mut function.*, module, body, left, usize.ONE, &mut placement)
+  run pushLane(&mut function.*, module, body, right, usize.ONE, &mut placement)
+  run intCompare(&mut function.*, integerCompareCode(predicate), true)
+  run pushLane(&mut function.*, module, body, left, usize.ZERO, &mut placement)
+  run pushLane(&mut function.*, module, body, right, usize.ZERO, &mut placement)
+  run intCompare(&mut function.*, integerCompareCode(unsignedPredicate), true)
+  run pushLane(&mut function.*, module, body, left, usize.ONE, &mut placement)
+  run pushLane(&mut function.*, module, body, right, usize.ONE, &mut placement)
+  run emit(&mut function.*, 0x52)
+  return run emit(&mut function.*, WasmModule.opSelect())
+}
+
+// A floating comparison. An ordered predicate is wasm's own; an unordered one is the negation of
+// the opposite ordered one.
+effect fn emitFloatCompare(function: &mut Function, module: &Module, body: usize, left: u64, right: u64, predicate: u64, placement: &mut Placement) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let double = scalarType(module, module.typeIn(body, left)) == WasmModule.f64Type()
+  let mut base: u8 = 0x5B
+  if double { base = 0x61 }
+  // Offsets from `eq`: ne 1, lt 2, gt 3, le 4, ge 5.
+  if predicate == Bitcode.floatFalse() || predicate == Bitcode.floatTrue() {
+    return run WasmModule.i32Const(&mut function.*.code, predicate / 15)
+  }
+  if predicate == Bitcode.floatOrd() || predicate == Bitcode.floatUno() {
+    run pushValue(&mut function.*, module, body, left, &mut placement)
+    run pushValue(&mut function.*, module, body, left, &mut placement)
+    run emit(&mut function.*, base)
+    run pushValue(&mut function.*, module, body, right, &mut placement)
+    run pushValue(&mut function.*, module, body, right, &mut placement)
+    run emit(&mut function.*, base)
+    run emit(&mut function.*, 0x71)
+    if predicate == Bitcode.floatUno() { return run emit(&mut function.*, 0x45) }
+    return ()
+  }
+  if predicate == Bitcode.floatOne() || predicate == Bitcode.floatUeq() {
+    run pushValue(&mut function.*, module, body, left, &mut placement)
+    run pushValue(&mut function.*, module, body, right, &mut placement)
+    run emit(&mut function.*, base + 2)
+    run pushValue(&mut function.*, module, body, left, &mut placement)
+    run pushValue(&mut function.*, module, body, right, &mut placement)
+    run emit(&mut function.*, base + 3)
+    run emit(&mut function.*, 0x72)
+    if predicate == Bitcode.floatUeq() { return run emit(&mut function.*, 0x45) }
+    return ()
+  }
+  run pushValue(&mut function.*, module, body, left, &mut placement)
+  run pushValue(&mut function.*, module, body, right, &mut placement)
+  if predicate == Bitcode.floatOeq() { return run emit(&mut function.*, base) }
+  if predicate == Bitcode.floatUne() { return run emit(&mut function.*, base + 1) }
+  if predicate == Bitcode.floatOlt() { return run emit(&mut function.*, base + 2) }
+  if predicate == Bitcode.floatOgt() { return run emit(&mut function.*, base + 3) }
+  if predicate == Bitcode.floatOle() { return run emit(&mut function.*, base + 4) }
+  if predicate == Bitcode.floatOge() { return run emit(&mut function.*, base + 5) }
+  // ult = !oge, ugt = !ole, ule = !ogt, uge = !olt.
+  if predicate == Bitcode.floatUlt() { run emit(&mut function.*, base + 5) }
+  if predicate == Bitcode.floatUgt() { run emit(&mut function.*, base + 4) }
+  if predicate == Bitcode.floatUle() { run emit(&mut function.*, base + 3) }
+  if predicate == Bitcode.floatUge() { run emit(&mut function.*, base + 2) }
+  return run emit(&mut function.*, 0x45)
+}
+
+// Aggregates.
+
+// The first lane and type of the member an `extractvalue` or `insertvalue` names, from operand
+// `from` on.
+struct Member {
+  lane: usize,
+  ty: u64,
+}
+
+impl Copy for Member {}
+
+fn memberOf(module: &Module, ty: u64, words: &[u64], record: Record, from: usize) -> Member {
+  let mut current = ty
+  let mut lane = usize.ZERO
+  let mut at = from
+  while at < operandCount(record) {
+    let index = u64.toUsize(operand(words, record, at))
+    let code = module.typeCode(current)
+    if code == Bitcode.typeStruct() || code == Bitcode.typePackedStruct() {
+      let mut field = usize.ZERO
+      while field < index {
+        lane = lane + laneCount(module, module.typeItem(current, field))
+        field = field + usize.ONE
+      }
+      current = module.typeItem(current, index)
+    } else {
+      current = module.typeItem(current, usize.ONE)
+      lane = lane + index * laneCount(module, current)
+    }
+    at = at + usize.ONE
+  }
+  return Member {lane: lane, ty: current}
+}
+
+effect fn emitAggregate(function: &mut Function, module: &Module, body: usize, words: &[u64], record: Record, placement: &mut Placement) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let aggregate = operand(words, record, usize.ZERO)
+  let ty = module.typeIn(body, aggregate)
+  if record.code == Bitcode.instructionExtractValue() {
+    let member = memberOf(module, ty, words, record, usize.ONE)
+    let count = laneCount(module, member.ty)
+    let mut lane = usize.ZERO
+    while lane < count {
+      run pushLane(&mut function.*, module, body, aggregate, member.lane + lane, &mut placement)
+      lane = lane + usize.ONE
+    }
+    return run storeResult(&mut function.*, module, body, record)
+  }
+  let element = operand(words, record, usize.ONE)
+  let member = memberOf(module, ty, words, record, 2)
+  let inserted = laneCount(module, member.ty)
+  let total = laneCount(module, ty)
+  let mut lane = usize.ZERO
+  while lane < total {
+    if lane >= member.lane && lane < member.lane + inserted {
+      run pushLane(&mut function.*, module, body, element, lane - member.lane, &mut placement)
+    } else {
+      run pushLane(&mut function.*, module, body, aggregate, lane, &mut placement)
+    }
+    lane = lane + usize.ONE
+  }
+  return run storeResult(&mut function.*, module, body, record)
+}
+
+// Calls.
+
+effect fn emitCall(function: &mut Function, module: &Module, body: usize, words: &[u64], record: Record, placement: &mut Placement) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let at = calleeAt(words, record)
+  let callee = operand(words, record, at)
+  let functionType = operand(words, record, at - usize.ONE)
+  let first = at + usize.ONE
+  if Bitcode.isGlobal(callee) && startsWith(module.globalName(Bitcode.referenceIndex(callee)), b"llvm.") {
+    return run emitIntrinsic(&mut function.*, module, body, words, record, Bitcode.referenceIndex(callee), first, &mut placement)
+  }
+  if module.typeCode(functionType) == Bitcode.typeVariadicFunction() { run unsupported(b"a variadic call", Bytes.asSlice(&function.symbol)) }
+  let mut argument = first
+  while argument < operandCount(record) {
+    run pushValue(&mut function.*, module, body, operand(words, record, argument), &mut placement)
+    argument = argument + usize.ONE
+  }
+  if Bitcode.isGlobal(callee) && List<usize>.get(&placement.functions, Bitcode.referenceIndex(callee)) != usize.MAX {
+    run WasmModule.opIndex(&mut function.*.code, WasmModule.opCall(), List<usize>.get(&placement.functions, Bitcode.referenceIndex(callee)))
+  } else {
+    if Bitcode.isGlobal(callee) && List<u64>.get(&placement.addresses, Bitcode.referenceIndex(callee)) == u64.MAX {
+      let mut what = run Bytes.copy(b"a call to the undefined function ")
+      run Bytes.append(&mut what, module.globalName(Bitcode.referenceIndex(callee)))
+      run unsupported(Bytes.asSlice(&what), Bytes.asSlice(&function.symbol))
+    }
+    run pushValue(&mut function.*, module, body, callee, &mut placement)
+    let signature = run signatureOf(module, functionType, Bytes.asSlice(&function.symbol))
+    let typeIndex = run Placement.typeIndex(&mut placement.*, Bytes.asSlice(&signature))
+    run WasmModule.opIndex(&mut function.*.code, WasmModule.opCallIndirect(), typeIndex)
+    run WasmModule.index(&mut function.*.code, usize.ZERO)
+  }
+  return run storeResult(&mut function.*, module, body, record)
+}
+
+// The `llvm.*` intrinsics `LlvmCode` calls, inlined.
+effect fn emitIntrinsic(function: &mut Function, module: &Module, body: usize, words: &[u64], record: Record, global: usize, first: usize,
+  placement: &mut Placement) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let fullName = module.globalName(global)
+  let name = Slice.view<u8>(fullName, 5, fullName.length - 5)
+  let count = operandCount(record) - first
+  if startsWith(name, b"lifetime.") || startsWith(name, b"assume") || startsWith(name, b"dbg.") || startsWith(name, b"donothing") { return () }
+  if startsWith(name, b"trap") { return run emit(&mut function.*, WasmModule.opUnreachable()) }
+  if startsWith(name, b"expect.") {
+    run pushValue(&mut function.*, module, body, operand(words, record, first), &mut placement)
+    return run storeResult(&mut function.*, module, body, record)
+  }
+  if startsWith(name, b"memcpy.") || startsWith(name, b"memmove.") || startsWith(name, b"memset.") {
+    run pushValue(&mut function.*, module, body, operand(words, record, first), &mut placement)
+    run pushValue(&mut function.*, module, body, operand(words, record, first + usize.ONE), &mut placement)
+    let length = operand(words, record, first + 2)
+    run pushValue(&mut function.*, module, body, length, &mut placement)
+    if scalarType(module, module.typeIn(body, length)) == WasmModule.i64Type() { run emit(&mut function.*, 0xA7) }
+    if startsWith(name, b"memset.") {
+      run WasmModule.prefixed(&mut function.*.code, 0xFC, 11)
+      return run WasmModule.byte(&mut function.*.code, 0)
+    }
+    run WasmModule.prefixed(&mut function.*.code, 0xFC, 10)
+    run WasmModule.byte(&mut function.*.code, 0)
+    return run WasmModule.byte(&mut function.*.code, 0)
+  }
+  if startsWith(name, b"sqrt.") {
+    let value = operand(words, record, first)
+    run pushValue(&mut function.*, module, body, value, &mut placement)
+    run emit(&mut function.*, pick(0x91, 0x9F, scalarType(module, module.typeIn(body, value)) == WasmModule.f64Type()))
+    return run storeResult(&mut function.*, module, body, record)
+  }
+  if startsWith(name, b"frameaddress") {
+    if function.frame == usize.MAX { run WasmModule.globalGet(&mut function.*.code, usize.ZERO) } else { run WasmModule.localGet(&mut function.*.code, function.frame) }
+    return run storeResult(&mut function.*, module, body, record)
+  }
+  if startsWith(name, b"wasm.memory.size") {
+    run WasmModule.op(&mut function.*.code, 0x3F)
+    run WasmModule.byte(&mut function.*.code, 0)
+    return run storeResult(&mut function.*, module, body, record)
+  }
+  if startsWith(name, b"wasm.memory.grow") {
+    run pushValue(&mut function.*, module, body, operand(words, record, first + usize.ONE), &mut placement)
+    run WasmModule.op(&mut function.*.code, 0x40)
+    run WasmModule.byte(&mut function.*.code, 0)
+    return run storeResult(&mut function.*, module, body, record)
+  }
+  if startsWith(name, b"wasm.memory.atomic.") {
+    let mut argument = first
+    while argument < operandCount(record) {
+      run pushValue(&mut function.*, module, body, operand(words, record, argument), &mut placement)
+      argument = argument + usize.ONE
+    }
+    let mut code: u64 = 0
+    if startsWith(name, b"wasm.memory.atomic.wait32") { code = 1 }
+    run WasmModule.prefixed(&mut function.*.code, 0xFE, code)
+    run WasmModule.index(&mut function.*.code, 2)
+    run WasmModule.index(&mut function.*.code, usize.ZERO)
+    return run storeResult(&mut function.*, module, body, record)
+  }
+  if startsWith(name, b"fshl.") || startsWith(name, b"fshr.") {
+    return run emitRotate(&mut function.*, module, body, words, record, first, startsWith(name, b"fshl."), &mut placement)
+  }
+  if count == 2 && name.length > 4 && (name[0] == 115 || name[0] == 117) {
+    let signed = name[0] == 115
+    let rest = Slice.view<u8>(name, usize.ONE, name.length - usize.ONE)
+    let left = operand(words, record, first)
+    let right = operand(words, record, first + usize.ONE)
+    let mut op: u64 = u64.MAX
+    if startsWith(rest, b"add.") { op = Bitcode.opAdd() }
+    if startsWith(rest, b"sub.") { op = Bitcode.opSub() }
+    if startsWith(rest, b"mul.") { op = Bitcode.opMul() }
+    if op != u64.MAX && startsWith(Slice.view<u8>(rest, 4, rest.length - 4), b"with.overflow.") {
+      return run emitOverflow(&mut function.*, module, body, record, left, right, op, signed, &mut placement)
+    }
+    if op != u64.MAX && startsWith(Slice.view<u8>(rest, 4, rest.length - 4), b"sat.") {
+      return run emitSaturating(&mut function.*, module, body, record, left, right, op, signed, &mut placement)
+    }
+  }
+  let mut what = run Bytes.copy(b"the intrinsic ")
+  run Bytes.append(&mut what, fullName)
+  return run unsupported(Bytes.asSlice(&what), Bytes.asSlice(&function.symbol))
+}
+
+// `fshl(a, a, n)` and `fshr(a, a, n)`: rotates, the only funnel shifts `LlvmCode` makes.
+effect fn emitRotate(function: &mut Function, module: &Module, body: usize, words: &[u64], record: Record, first: usize, toLeft: bool,
+  placement: &mut Placement) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let value = operand(words, record, first)
+  let amount = operand(words, record, first + 2)
+  if operand(words, record, first + usize.ONE) != value { run unsupported(b"a funnel shift of two values", Bytes.asSlice(&function.symbol)) }
+  let bits = widthOf(module, module.typeIn(body, value))
+  if bits == 32 || bits == 64 {
+    run pushValue(&mut function.*, module, body, value, &mut placement)
+    run pushValue(&mut function.*, module, body, amount, &mut placement)
+    if toLeft { run intOp(&mut function.*, 0x77, bits == 64) } else { run intOp(&mut function.*, 0x78, bits == 64) }
+    return run storeResult(&mut function.*, module, body, record)
+  }
+  if wide(bits) { run unsupported(b"a rotate of this width", Bytes.asSlice(&function.symbol)) }
+  // (a << s | a >> (w - s) % w) masked to w bits, with s = n % w, for a left rotate.
+  let shift = run addLocal(&mut function.*, WasmModule.i32Type())
+  run pushValue(&mut function.*, module, body, amount, &mut placement)
+  run WasmModule.i32Const(&mut function.*.code, bits)
+  run emit(&mut function.*, 0x70)
+  run WasmModule.localSet(&mut function.*.code, shift)
+  let mut near: u8 = 0x74
+  let mut far: u8 = 0x76
+  if !toLeft {
+    near = 0x76
+    far = 0x74
+  }
+  run pushValue(&mut function.*, module, body, value, &mut placement)
+  run WasmModule.localGet(&mut function.*.code, shift)
+  run emit(&mut function.*, near)
+  run pushValue(&mut function.*, module, body, value, &mut placement)
+  run WasmModule.i32Const(&mut function.*.code, bits)
+  run WasmModule.localGet(&mut function.*.code, shift)
+  run emit(&mut function.*, 0x6B)
+  run WasmModule.i32Const(&mut function.*.code, bits)
+  run emit(&mut function.*, 0x70)
+  run emit(&mut function.*, far)
+  run emit(&mut function.*, 0x72)
+  run normalize(&mut function.*, bits)
+  return run storeResult(&mut function.*, module, body, record)
+}
+
+// Applies binary `op` to the two `i64` values on the stack.
+effect fn wideOp(function: &mut Function, op: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if op == Bitcode.opAdd() { return run emit(&mut function.*, 0x7C) }
+  if op == Bitcode.opSub() { return run emit(&mut function.*, 0x7D) }
+  return run emit(&mut function.*, 0x7E)
+}
+
+// `{s,u}{add,sub,mul}.with.overflow`: the wrapped result and whether the exact one did not fit.
+// Under 64 bits the exact result is computed in `i64`; at 64 bits the overflow is derived from
+// the operands and the wrapped result.
+effect fn emitOverflow(function: &mut Function, module: &Module, body: usize, record: Record, left: u64, right: u64, op: u64, signed: bool,
+  placement: &mut Placement) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let bits = widthOf(module, module.typeIn(body, left))
+  let first = List<usize>.get(&function.values, record.value)
+  if bits > 64 || (op == Bitcode.opMul() && bits > 32 && bits < 64) { run unsupported(b"an overflow check of this width", Bytes.asSlice(&function.symbol)) }
+  if bits < 64 {
+    let exact = run addLocal(&mut function.*, WasmModule.i64Type())
+    run pushExtended(&mut function.*, module, body, left, signed, &mut placement)
+    run pushExtended(&mut function.*, module, body, right, signed, &mut placement)
+    run wideOp(&mut function.*, op)
+    run WasmModule.localTee(&mut function.*.code, exact)
+    if !wide(bits) { run emit(&mut function.*, 0xA7) }
+    run normalize(&mut function.*, bits)
+    run WasmModule.localSet(&mut function.*.code, first)
+    if signed {
+      run WasmModule.localGet(&mut function.*.code, exact)
+      run WasmModule.i64Const(&mut function.*.code, 64 - bits)
+      run emit(&mut function.*, 0x86)
+      run WasmModule.i64Const(&mut function.*.code, 64 - bits)
+      run emit(&mut function.*, 0x87)
+      run WasmModule.localGet(&mut function.*.code, exact)
+      run emit(&mut function.*, 0x52)
+    } else {
+      run WasmModule.localGet(&mut function.*.code, exact)
+      run WasmModule.i64Const(&mut function.*.code, bits)
+      run emit(&mut function.*, 0x88)
+      run WasmModule.i64Const(&mut function.*.code, 0)
+      run emit(&mut function.*, 0x52)
+    }
+    return run WasmModule.localSet(&mut function.*.code, first + usize.ONE)
+  }
+  let result = first
+  run pushValue(&mut function.*, module, body, left, &mut placement)
+  run pushValue(&mut function.*, module, body, right, &mut placement)
+  run wideOp(&mut function.*, op)
+  run WasmModule.localSet(&mut function.*.code, result)
+  if op == Bitcode.opMul() {
+    if signed {
+      // The product overflowed when a is -1 and b is the least value, or a is neither 0 nor -1
+      // and r / a is not b; the divisor is 1 where it would be 0 or -1.
+      let divisor = run addLocal(&mut function.*, WasmModule.i64Type())
+      run WasmModule.i64Const(&mut function.*.code, 1)
+      run pushValue(&mut function.*, module, body, left, &mut placement)
+      run pushValue(&mut function.*, module, body, left, &mut placement)
+      run emit(&mut function.*, 0x50)
+      run pushValue(&mut function.*, module, body, left, &mut placement)
+      run WasmModule.i64Const(&mut function.*.code, u64.MAX)
+      run emit(&mut function.*, 0x51)
+      run emit(&mut function.*, 0x72)
+      run emit(&mut function.*, WasmModule.opSelect())
+      run WasmModule.localSet(&mut function.*.code, divisor)
+      run pushValue(&mut function.*, module, body, left, &mut placement)
+      run WasmModule.i64Const(&mut function.*.code, u64.MAX)
+      run emit(&mut function.*, 0x51)
+      run pushValue(&mut function.*, module, body, right, &mut placement)
+      run WasmModule.i64Const(&mut function.*.code, 9223372036854775808)
+      run emit(&mut function.*, 0x51)
+      run emit(&mut function.*, 0x71)
+      run pushValue(&mut function.*, module, body, left, &mut placement)
+      run WasmModule.i64Const(&mut function.*.code, 0)
+      run emit(&mut function.*, 0x52)
+      run pushValue(&mut function.*, module, body, left, &mut placement)
+      run WasmModule.i64Const(&mut function.*.code, u64.MAX)
+      run emit(&mut function.*, 0x52)
+      run emit(&mut function.*, 0x71)
+      run WasmModule.localGet(&mut function.*.code, result)
+      run WasmModule.localGet(&mut function.*.code, divisor)
+      run emit(&mut function.*, 0x7F)
+      run pushValue(&mut function.*, module, body, right, &mut placement)
+      run emit(&mut function.*, 0x52)
+      run emit(&mut function.*, 0x71)
+      run emit(&mut function.*, 0x72)
+    } else {
+      // a > MAX / b, with b replaced by 1 when it is 0.
+      run pushValue(&mut function.*, module, body, left, &mut placement)
+      run WasmModule.i64Const(&mut function.*.code, u64.MAX)
+      run pushValue(&mut function.*, module, body, right, &mut placement)
+      run pushValue(&mut function.*, module, body, right, &mut placement)
+      run emit(&mut function.*, 0x50)
+      run emit(&mut function.*, 0xAD)
+      run emit(&mut function.*, 0x84)
+      run emit(&mut function.*, 0x80)
+      run emit(&mut function.*, 0x56)
+    }
+  } else if signed {
+    // Add: the result's sign differs from both operands'; subtract: the operands' signs differ
+    // and the result's differs from the left one's.
+    run pushValue(&mut function.*, module, body, left, &mut placement)
+    if op == Bitcode.opAdd() { run WasmModule.localGet(&mut function.*.code, result) } else { run pushValue(&mut function.*, module, body, right, &mut placement) }
+    run emit(&mut function.*, 0x85)
+    if op == Bitcode.opAdd() { run pushValue(&mut function.*, module, body, right, &mut placement) } else { run pushValue(&mut function.*, module, body, left, &mut placement) }
+    run WasmModule.localGet(&mut function.*.code, result)
+    run emit(&mut function.*, 0x85)
+    run emit(&mut function.*, 0x83)
+    run WasmModule.i64Const(&mut function.*.code, 0)
+    run emit(&mut function.*, 0x53)
+  } else if op == Bitcode.opAdd() {
+    run WasmModule.localGet(&mut function.*.code, result)
+    run pushValue(&mut function.*, module, body, left, &mut placement)
+    run emit(&mut function.*, 0x54)
+  } else {
+    run pushValue(&mut function.*, module, body, left, &mut placement)
+    run pushValue(&mut function.*, module, body, right, &mut placement)
+    run emit(&mut function.*, 0x54)
+  }
+  return run WasmModule.localSet(&mut function.*.code, first + usize.ONE)
+}
+
+// `{s,u}{add,sub}.sat`: the exact result clamped to the type's range.
+effect fn emitSaturating(function: &mut Function, module: &Module, body: usize, record: Record, left: u64, right: u64, op: u64, signed: bool,
+  placement: &mut Placement) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let bits = widthOf(module, module.typeIn(body, left))
+  if op == Bitcode.opMul() || bits > 64 { run unsupported(b"a saturating operation of this kind", Bytes.asSlice(&function.symbol)) }
+  let exact = run addLocal(&mut function.*, WasmModule.i64Type())
+  if bits < 64 {
+    let mut lowest: u64 = 0
+    let mut highest: u64 = masked(u64.MAX, bits)
+    if signed {
+      lowest = u64.wrappingSubtract(0, u64.shiftLeft(1, bits - 1))
+      highest = u64.shiftLeft(1, bits - 1) - 1
+    }
+    run pushExtended(&mut function.*, module, body, left, signed, &mut placement)
+    run pushExtended(&mut function.*, module, body, right, signed, &mut placement)
+    run wideOp(&mut function.*, op)
+    run WasmModule.localSet(&mut function.*.code, exact)
+    run WasmModule.i64Const(&mut function.*.code, highest)
+    run WasmModule.localGet(&mut function.*.code, exact)
+    run WasmModule.localGet(&mut function.*.code, exact)
+    run WasmModule.i64Const(&mut function.*.code, highest)
+    run emit(&mut function.*, 0x55)
+    run emit(&mut function.*, WasmModule.opSelect())
+    run WasmModule.localSet(&mut function.*.code, exact)
+    run WasmModule.i64Const(&mut function.*.code, lowest)
+    run WasmModule.localGet(&mut function.*.code, exact)
+    run WasmModule.localGet(&mut function.*.code, exact)
+    run WasmModule.i64Const(&mut function.*.code, lowest)
+    run emit(&mut function.*, 0x53)
+    run emit(&mut function.*, WasmModule.opSelect())
+    if !wide(bits) { run emit(&mut function.*, 0xA7) }
+    run normalize(&mut function.*, bits)
+    return run storeResult(&mut function.*, module, body, record)
+  }
+  // 64 bits: the bound, the wrapped result, then whether it overflowed.
+  if signed {
+    run pushValue(&mut function.*, module, body, left, &mut placement)
+    run WasmModule.i64Const(&mut function.*.code, 63)
+    run emit(&mut function.*, 0x87)
+    run WasmModule.i64Const(&mut function.*.code, 9223372036854775807)
+    run emit(&mut function.*, 0x85)
+  } else if op == Bitcode.opAdd() {
+    run WasmModule.i64Const(&mut function.*.code, u64.MAX)
+  } else {
+    run WasmModule.i64Const(&mut function.*.code, 0)
+  }
+  run pushValue(&mut function.*, module, body, left, &mut placement)
+  run pushValue(&mut function.*, module, body, right, &mut placement)
+  run wideOp(&mut function.*, op)
+  run WasmModule.localTee(&mut function.*.code, exact)
+  if signed {
+    run pushValue(&mut function.*, module, body, left, &mut placement)
+    if op == Bitcode.opAdd() { run WasmModule.localGet(&mut function.*.code, exact) } else { run pushValue(&mut function.*, module, body, right, &mut placement) }
+    run emit(&mut function.*, 0x85)
+    if op == Bitcode.opAdd() { run pushValue(&mut function.*, module, body, right, &mut placement) } else { run pushValue(&mut function.*, module, body, left, &mut placement) }
+    run WasmModule.localGet(&mut function.*.code, exact)
+    run emit(&mut function.*, 0x85)
+    run emit(&mut function.*, 0x83)
+    run WasmModule.i64Const(&mut function.*.code, 0)
+    run emit(&mut function.*, 0x53)
+  } else if op == Bitcode.opAdd() {
+    run WasmModule.localGet(&mut function.*.code, exact)
+    run pushValue(&mut function.*, module, body, left, &mut placement)
+    run emit(&mut function.*, 0x54)
+  } else {
+    run pushValue(&mut function.*, module, body, left, &mut placement)
+    run pushValue(&mut function.*, module, body, right, &mut placement)
+    run emit(&mut function.*, 0x54)
+  }
+  run emit(&mut function.*, WasmModule.opSelect())
+  return run storeResult(&mut function.*, module, body, record)
+}
+
+// Atomics. Without shared memory nothing runs between a load and a store, so a read-modify-write
+// is the two plainly.
+
+effect fn emitReadModifyWrite(function: &mut Function, module: &Module, body: usize, words: &[u64], record: Record, placement: &mut Placement) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let pointer = operand(words, record, usize.ZERO)
+  let value = operand(words, record, usize.ONE)
+  let op = operand(words, record, 2)
+  let ty = module.typeIn(body, value)
+  if laneCount(module, ty) != usize.ONE || module.typeCode(ty) != Bitcode.typeInteger() && module.typeCode(ty) != Bitcode.typePointer() {
+    run unsupported(b"an atomic operation on this type", Bytes.asSlice(&function.symbol))
+  }
+  let bits = widthOf(module, ty)
+  let isWide = wide(bits)
+  run loadValue(&mut function.*, module, body, pointer, ty, &mut placement)
+  run storeResult(&mut function.*, module, body, record)
+  let old = List<usize>.get(&function.values, record.value)
+  run pushValue(&mut function.*, module, body, pointer, &mut placement)
+  if op == Bitcode.rmwXchg() {
+    run pushValue(&mut function.*, module, body, value, &mut placement)
+  } else if op == Bitcode.rmwMax() || op == Bitcode.rmwMin() || op == Bitcode.rmwUMax() || op == Bitcode.rmwUMin() {
+    let signed = op == Bitcode.rmwMax() || op == Bitcode.rmwMin()
+    run WasmModule.localGet(&mut function.*.code, old)
+    run pushValue(&mut function.*, module, body, value, &mut placement)
+    run WasmModule.localGet(&mut function.*.code, old)
+    if signed { run signExtend(&mut function.*, bits) }
+    if signed { run pushSigned(&mut function.*, module, body, value, &mut placement) } else { run pushValue(&mut function.*, module, body, value, &mut placement) }
+    let mut code: u8 = 0x4B
+    if op == Bitcode.rmwMax() { code = 0x4A }
+    if op == Bitcode.rmwMin() { code = 0x48 }
+    if op == Bitcode.rmwUMin() { code = 0x49 }
+    run intCompare(&mut function.*, code, isWide)
+    run emit(&mut function.*, WasmModule.opSelect())
+  } else {
+    run WasmModule.localGet(&mut function.*.code, old)
+    run pushValue(&mut function.*, module, body, value, &mut placement)
+    if op == Bitcode.rmwAdd() { run intOp(&mut function.*, 0x6A, isWide) }
+    else if op == Bitcode.rmwSub() { run intOp(&mut function.*, 0x6B, isWide) }
+    else if op == Bitcode.rmwAnd() || op == Bitcode.rmwNand() { run intOp(&mut function.*, 0x71, isWide) }
+    else if op == Bitcode.rmwOr() { run intOp(&mut function.*, 0x72, isWide) }
+    else if op == Bitcode.rmwXor() { run intOp(&mut function.*, 0x73, isWide) }
+    else { run unsupported(b"an atomic operation", Bytes.asSlice(&function.symbol)) }
+    if op == Bitcode.rmwNand() {
+      run pushInt(&mut function.*, bits, u64.MAX)
+      run intOp(&mut function.*, 0x73, isWide)
+    }
+    run normalize(&mut function.*, bits)
+  }
+  let code = storeCode(module, ty)
+  if code == 0 { run unsupported(b"an atomic operation of this width", Bytes.asSlice(&function.symbol)) }
+  return run WasmModule.memoryAccess(&mut function.*.code, code, usize.ZERO, 0)
+}
+
+effect fn emitCompareExchange(function: &mut Function, module: &Module, body: usize, words: &[u64], record: Record, placement: &mut Placement) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let pointer = operand(words, record, usize.ZERO)
+  let expected = operand(words, record, usize.ONE)
+  let replacement = operand(words, record, 2)
+  let ty = module.typeIn(body, expected)
+  let code = storeCode(module, ty)
+  if laneCount(module, ty) != usize.ONE || code == 0 { run unsupported(b"a compare-exchange of this type", Bytes.asSlice(&function.symbol)) }
+  let first = List<usize>.get(&function.values, record.value)
+  run loadValue(&mut function.*, module, body, pointer, ty, &mut placement)
+  run WasmModule.localTee(&mut function.*.code, first)
+  run pushValue(&mut function.*, module, body, expected, &mut placement)
+  run intCompare(&mut function.*, 0x46, scalarType(module, ty) == WasmModule.i64Type())
+  run WasmModule.localTee(&mut function.*.code, first + usize.ONE)
+  run emitStructured(&mut function.*, WasmModule.opIf())
+  run pushValue(&mut function.*, module, body, pointer, &mut placement)
+  run pushValue(&mut function.*, module, body, replacement, &mut placement)
+  run WasmModule.memoryAccess(&mut function.*.code, code, usize.ZERO, 0)
+  return run emit(&mut function.*, WasmModule.opEnd())
+}
