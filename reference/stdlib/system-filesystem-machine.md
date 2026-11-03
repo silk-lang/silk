@@ -157,4 +157,4 @@ createTemporaryDirectory: MachineFileSystem.createTemporaryDirectory
 
 Category: System.
 
-Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`.
+Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`.
