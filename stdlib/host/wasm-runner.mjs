@@ -189,11 +189,14 @@ export const runWasm = async (bytes, options = {}) => {
   const module = await WebAssembly.compile(bytes)
   const limits = importedMemory(bytes)
   const wide = wideMemory(bytes)
+  // A shared memory starts at its maximum. V8 tells other workers about a grow late, so a thread
+  // that reaches newly grown pages through a pointer another thread just published can trap out of
+  // bounds before its own view catches up. The pages are committed only as they are touched.
   const memory =
     limits === undefined
       ? undefined
       : new WebAssembly.Memory({
-          initial: limits.initial,
+          initial: limits.shared && limits.maximum !== undefined ? limits.maximum : limits.initial,
           maximum: limits.maximum,
           shared: limits.shared,
         })

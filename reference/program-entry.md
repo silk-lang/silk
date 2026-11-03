@@ -98,7 +98,7 @@ zero-parameter C `main` returning `i32`. `silk build --target wasm32-unknown-unk
 module freestanding on any host: no libc and no start function, the compiler's C runtime beside the
 program, and exports for exactly the C exports source names plus the linear memory. A
 multi-threaded profile instead imports a shared memory and also exports `wasi_thread_start`
-(THREAD-009 in [thread properties](thread-properties.md)). `wasm64-unknown-unknown` links the
+(THREAD-009 in [thread properties](thread-properties.md)). A host should create that memory at its declared maximum: V8 shows a grow to other workers late, so a thread that follows a pointer into newly grown pages can trap out of bounds, and `stdlib/host/wasm-runner.mjs` does so. `wasm64-unknown-unknown` links the
 same way with a 64-bit memory (`memory64`): pointers and `usize` are 64 bits, the function table
 stays 32-bit, and it has no threads. Its engine must support memory64, as Node 24 does. Raw Linux startup instead selects its
 source `_start`, reads the validated initial stack, calls the application, and terminates through
