@@ -2939,6 +2939,29 @@ const program = Effect.gen(function* () {
     process.env,
   )
   assert.equal(arenaRun.status, 42, arenaRun.stderr)
+  // The same program in a 64-bit memory, through LLVM and through the direct backend without
+  // Clang, runs the same.
+  yield* fs.writeFileString(
+    join(arena, 'silk.toml'),
+    '[package]\nname = "arena"\nversion = "0.0.0"\nsilk-version = "0.0.0"\nsource = "."\n' +
+      '\n[profiles.web64]\ntarget = "wasm64-unknown-unknown"\n',
+  )
+  for (const backend of ['llvm', 'direct']) {
+    const wideBuild = yield* invoke(
+      silk,
+      ['build', '--manifest-path', join('arena', 'silk.toml'), '--profile', 'web64', '--backend', backend, '--stdlib', standardLibrary],
+      directory,
+      { ...process.env, SILK_CLANG: backend === 'llvm' ? clang : '/nonexistent' },
+    )
+    assert.equal(wideBuild.status, 0, wideBuild.stderr)
+    const wideRun = yield* invoke(
+      process.execPath,
+      [join(standardLibrary, 'host/wasm-runner.mjs'), join(arena, 'build/llvm/wasm64-unknown-unknown/web64/arena')],
+      directory,
+      process.env,
+    )
+    assert.equal(wideRun.status, 42, `${backend}: ${wideRun.stderr}`)
+  }
   // A profile's CPU features, large code model and static link reach Clang.
   const argumentLog = join(directory, 'clang-arguments')
   const recorder = join(directory, 'clang-recorder')

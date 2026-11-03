@@ -92,4 +92,4 @@ Waits for the thread behind `handle` to finish, then releases its stack and reco
 
 Category: Native platform.
 
-Profiles: `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`.
+Profiles: `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `wasm64-unknown-unknown`.

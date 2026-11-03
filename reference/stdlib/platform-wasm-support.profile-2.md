@@ -27,4 +27,4 @@ This module declares no public items.
 
 Category: Native platform.
 
-Profiles: `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`.
+Profiles: `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `wasm64-unknown-unknown`.
