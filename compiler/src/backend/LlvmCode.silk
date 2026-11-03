@@ -3605,6 +3605,7 @@ effect fn emitScalarRvalue(
       return Value {scalar: pointerRepresentation(target),
         value: run callNamed(&mut writer.*, b"llvm.frameaddress.p0", pointer, &parameters, &arguments)}
     }
+    Rvalue.Wasm {primitive, operands} => run emitWasm(&mut writer.*, function, target, layouts, primitive, &operands, span)
     // A dynamic `alloca` outside the entry block: LLVM releases it when the function returns. The
     // byte count traps when it does not fit the target word.
     Rvalue.StackAllocate {count, element} => {
@@ -5002,6 +5003,7 @@ effect fn emitForeignStaticRead(
   foreign: &[CAbi.Signature],
   destination: &Place,
   declaration: &Shared<DeclarationId>,
+  address: bool,
   span: Location,
 ) -> () ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
   let index = foreignSignatureIndex(foreign, declaration)
@@ -5012,6 +5014,10 @@ effect fn emitForeignStaticRead(
   let output = run emitPlace(&mut writer.*, function, target, layouts, destination)
   let ty = run cLaneType(&mut writer.*, &foreign[index].result, &foreign[index].declaration, &foreign[index].source)
   let symbol = run Module.objectRef(&mut writer.*.module, Bytes.asSlice(&foreign[index].symbol), ty)
+  if address {
+    let pointer = Value {scalar: pointerRepresentation(target), value: symbol}
+    return run storeValue(&mut writer.*, &output, &pointer)
+  }
   let object = Address {
     ty: Shared<Type>.clone(&output.ty),
     value: symbol,
@@ -5076,8 +5082,8 @@ effect fn emitBlock(
             let callback = run Module.functionRef(&mut writer.*.module, Bytes.asSlice(&symbol), ty)
             run storeOf(&mut writer.*, callback, address.value, usize.ZERO)
           }
-          Rvalue.ForeignStatic {declaration} => {
-            run emitForeignStaticRead(&mut writer.*, function, target, layouts, foreign, &destination, &declaration, origin.location)
+          Rvalue.ForeignStatic {declaration, address} => {
+            run emitForeignStaticRead(&mut writer.*, function, target, layouts, foreign, &destination, &declaration, address, origin.location)
           }
           _ => {
             let report = run trapReport(&writer.*, function, target, origin)
@@ -5971,6 +5977,7 @@ pub effect fn emit(
   identities: &[InstanceIdentity],
   suspension: &Option<Facts>,
   fastPath: bool,
+  hostExport: bool,
 ) -> Bytes ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
   // The lookup index lives only while this instance's code is built.
   let indexed = run TypeLayouts.copyOf(supplied)
@@ -6096,10 +6103,11 @@ pub effect fn emit(
     if observed { writer.context = run addParameter(&mut lanes, pointer, hiddenName(b"context")) }
   }
   let mut functionAttributes = List<u64>.make()
-  // A WebAssembly module exports exactly the C exports source names, under their symbols. `main`
-  // is the exception: the wasm backend renames a `main` without arguments and defines `main` as a
+  // A WebAssembly module exports exactly the C exports source names, under their symbols, except
+  // the target support module's, which only the link resolves (`hostExport`). `main` is the other
+  // exception: the wasm backend renames a `main` without arguments and defines `main` as a
   // wrapper, so the attribute would export both; the final link exports the wrapper instead.
-  if exported && same(Target.objectFormat(target), b"wasm") && !same(Bytes.asSlice(&writer.symbol), b"main") {
+  if exported && hostExport && same(Target.objectFormat(target), b"wasm") && !same(Bytes.asSlice(&writer.symbol), b"main") {
     run appendStringAttribute(&mut functionAttributes, b"wasm-export-name", Bytes.asSlice(&writer.symbol))
   }
   // A function written with `features` compiles for them; LLVM inlines callees compiled for fewer
@@ -6181,7 +6189,89 @@ pub effect fn emit(
   run Module.endBody(&mut writer.module)
   run defineTables(&mut writer, functionTy, defined)
   run frameEntry(&mut writer, function, target, defined, b"")
+  if exported && same(Target.objectFormat(target), b"wasm") && same(Bytes.asSlice(&writer.symbol), threadEntrySymbol()) {
+    run defineThreadStart(&mut writer, defined, functionTy)
+  }
   return run Module.serialize(&writer.module)
+}
+
+// The symbol of the wasm32 entry module's thread entry, which `wasi_thread_start` calls.
+fn threadEntrySymbol() -> &'static [u8] {
+  return b"silk_wasm_thread_entry_v1"
+}
+
+// wasi-threads' `wasi_thread_start(thread, handle)`, defined beside the entry module's thread entry.
+// The host calls it on a new instance whose `__stack_pointer` still holds the main thread's initial
+// value, so it keeps no frame: before any call it moves `__stack_pointer` to the stack top that the
+// handle's first word holds, then calls the entry with the handle. The entry returns the word that
+// marks the thread done, which this sets to 1 before waking the joiner. The joiner may release the
+// stack once it sees the word, and nothing after the store touches the stack.
+effect fn defineThreadStart(writer: &mut Writer, entry: u64, entryType: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let void = run voidType(&mut writer.*)
+  let pointer = run pointerType(&mut writer.*)
+  let int32 = run integerType(&mut writer.*, 32)
+  let parameters = [int32, pointer]
+  let ty = run functionType(&mut writer.*, void, &parameters)
+  let mut encoding = List<u64>.make()
+  run List<u64>.append(&mut encoding, 0)
+  run List<u64>.append(&mut encoding, Bitcode.attrNoUnwind())
+  run appendStringAttribute(&mut encoding, b"wasm-export-name", b"wasi_thread_start")
+  Module.beginAttributes(&mut writer.*.module)
+  run Module.attributeGroup(&mut writer.*.module, Bitcode.positionFunction(), List<u64>.asSlice(&encoding))
+  let attributes = run Module.endAttributes(&mut writer.*.module)
+  let function = run Module.defineFunction(&mut writer.*.module, b"wasi_thread_start", ty, Bitcode.linkExternal(), attributes)
+  let names = [Bitcode.plain(Bitcode.prefix(b"thread")), Bitcode.plain(Bitcode.prefix(b"handle"))]
+  run Module.beginBody(&mut writer.*.module, function, &parameters, &names)
+  let _entry = run Module.block(&mut writer.*.module, Bitcode.plain(Bitcode.prefix(b"entry")))
+  let handle = Bitcode.local(1)
+  let top = run loadPointer(&mut writer.*, handle, 4)
+  let moveParameters = [pointer]
+  let moveType = run functionType(&mut writer.*, void, &moveParameters)
+  let relocate = run Module.inlineAssembly(&mut writer.*.module, moveType, b"local.get $0\nglobal.set __stack_pointer", b"r,~{memory}", 1)
+  let moveArguments = [top]
+  drop run Module.call(&mut writer.*.module, moveType, relocate, &moveArguments, 0, false)
+  let entryArguments = [handle]
+  let done = run Module.call(&mut writer.*.module, entryType, entry, &entryArguments, 0, false)
+  let one = run integerOf(&mut writer.*, 32, 1)
+  run Module.storeAtomic(&mut writer.*.module, one, done, 4, Bitcode.orderSequential())
+  let notifyParameters = [pointer, int32]
+  let notifyArguments = [done, run integerOf(&mut writer.*, 32, 4294967295)]
+  drop run callNamed(&mut writer.*, b"llvm.wasm.memory.atomic.notify", int32, &notifyParameters, &notifyArguments)
+  run Module.retVoid(&mut writer.*.module)
+  return run Module.endBody(&mut writer.*.module)
+}
+
+// One WebAssembly memory instruction. The memory index is 0, the module's one linear memory.
+// Each result is an `i32`, which is `usize` and `u32` on wasm32: growth reports failure as -1,
+// `usize.MAX`, and a wait reports 0 when woken, 1 when the word differed and 2 on timeout.
+effect fn emitWasm(writer: &mut Writer, function: &MirFunction, target: &Target, layouts: &TypeLayouts,
+  primitive: IntrinsicPrimitive, operands: &List<Operand>, span: Location) -> Value
+! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if !same(Target.objectFormat(target), b"wasm") {
+    let owner = InstanceKey.identity(&function.key)
+    fail Gap.relative(GapCode.IntrinsicMember, &owner, span)
+  }
+  let int32 = run integerType(&mut writer.*, 32)
+  let mut parameters = List<u64>.make()
+  let mut arguments = List<u64>.make()
+  let mut name: &'static [u8] = b"llvm.wasm.memory.size.i32"
+  if primitive == IntrinsicPrimitive.WasmMemoryGrow { name = b"llvm.wasm.memory.grow.i32" }
+  if primitive == IntrinsicPrimitive.WasmAtomicWait32 { name = b"llvm.wasm.memory.atomic.wait32" }
+  if primitive == IntrinsicPrimitive.WasmAtomicNotify { name = b"llvm.wasm.memory.atomic.notify" }
+  if primitive == IntrinsicPrimitive.WasmMemorySize || primitive == IntrinsicPrimitive.WasmMemoryGrow {
+    run List<u64>.append(&mut parameters, int32)
+    run List<u64>.append(&mut arguments, run integerOf(&mut writer.*, 32, 0))
+  }
+  let listed = List<Operand>.asSlice(operands)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let lowered = run emitOperand(&mut writer.*, function, target, layouts, &listed[at])
+    run List<u64>.append(&mut parameters, run typeOf(&mut writer.*, lowered.scalar))
+    run List<u64>.append(&mut arguments, lowered.value)
+    at = at + usize.ONE
+  }
+  return Value {scalar: lengthRepresentation(target),
+    value: run callNamed(&mut writer.*, name, int32, List<u64>.asSlice(&parameters), List<u64>.asSlice(&arguments))}
 }
 
 // Makes the handles of `count` MIR blocks, named `b<i>`.

@@ -712,7 +712,7 @@ const program = Effect.gen(function* () {
   )
   assert.notEqual(wasmHint.status, 0, 'Wasm must not admit native CPU hints')
   assert.match(wasmHint.stderr, /SEM0214/)
-  // wasm32 links freestanding on any host, with the compiler's own C runtime and no host imports.
+  // wasm32 links freestanding on any host, with no C runtime and no host imports.
   const wasm = yield* invoke(
     silk,
     [...argumentsFor('program.wasm'), '--target', 'wasm32-unknown-unknown'],
@@ -720,7 +720,6 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(wasm.status, 0, wasm.stderr)
-  assert.equal(yield* fs.exists(join(directory, 'program.wasm.silk-runtime.c')), false)
   const wasmModule = new WebAssembly.Module(yield* fs.readFile(join(directory, 'program.wasm')))
   assert.deepEqual(WebAssembly.Module.imports(wasmModule), [])
   assert.deepEqual(
