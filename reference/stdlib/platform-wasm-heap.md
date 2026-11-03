@@ -12,7 +12,8 @@ a module without host services exports its report through `WasmHeap.report`. App
 ## Details
 The heap starts at the linker's `__heap_base` and grows with `memory.grow`. Its first bytes hold
 the heap's own state, which a fresh linear memory already holds as zeros: the top chunk, the
-lock, the report's length, the bin map, the bins and the report buffer. Chunks follow.
+lock, the report's length, the bin map, the bins and the report buffer. Chunks follow. The
+initial memory may end inside the state, so each entry first grows the memory to cover it.
 
 Each chunk is a 16-byte header and a payload aligned to 16. A header holds the size of the chunk
 before it while that one is free, then the chunk's own size with two flags, so a release
