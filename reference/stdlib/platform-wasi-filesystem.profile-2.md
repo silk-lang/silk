@@ -55,6 +55,18 @@ Each path is normalized and remains below the root without symbolic-link travers
 impl WasiFileSystem
 ```
 
+<a id="WasiFileSystem.impl.rename"></a>
+
+### Associated function `rename`
+
+```silk
+pub effect fn rename(root: &[u8], from: &[u8], to: &[u8]) -> ()
+      ! FileError
+```
+
+Renames `from` to `to` below `root` in one step, replacing a file at `to`. Both paths stay
+below the root, as every other path here does.
+
 <a id="WasiFileSystem.impl.openFile"></a>
 
 ### Associated function `openFile`

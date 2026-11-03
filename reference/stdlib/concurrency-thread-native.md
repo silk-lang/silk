@@ -21,7 +21,8 @@ own thread default is smaller on Darwin (512 KiB). A wasm32 thread gets the 1 Mi
 runtime gives every thread.
 
 ## Errors
-[`SpawnError`](#SpawnError) if the system cannot make the thread. `OutOfMemoryError` if the start or result
+[`SpawnError`](#SpawnError) if the system cannot make the thread, which a single-threaded wasm32 profile never
+can (code 58, `ENOTSUP`). `OutOfMemoryError` if the start or result
 storage cannot be allocated.
 
 ## Gotchas
@@ -187,7 +188,8 @@ that it captures, and borrows nothing from the caller. Threads use `CreateThread
 and GNU libc targets, and wasi-threads on wasm32 with `threading = "multi"`. A native thread
 gets an 8 MiB stack, the default main-thread stack on Darwin and Linux, so work that fits on the
 main thread fits on a spawned one. A wasm32 thread gets the 1 MiB stack that its runtime gives
-every thread.
+every thread. A single-threaded wasm32 profile has one processor and refuses each spawn with
+[`SpawnError`](#SpawnError).
 
 ### Gotchas
 A fatal trap on any thread ends the whole process.
