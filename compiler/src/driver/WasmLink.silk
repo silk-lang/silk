@@ -1,0 +1,388 @@
+//! The direct backend's link: lays out a whole program's `Bitcode.Module` as one WebAssembly
+//! module, without Clang or `wasm-ld`.
+//!
+//! # Details
+//! The layout matches what `wasm-ld` makes of the same program, so the stdlib's wasm support
+//! modules need no second form:
+//!
+//! - Functions are numbered imports first, then each body in the module's order. A function
+//!   whose address is taken gets a slot in table 0, from 1, so a null function pointer traps.
+//! - Linear memory holds the stack first, from 16 up to 1 MiB, which `__stack_pointer` (global 0)
+//!   starts at, then the data, then the heap from `__heap_base`. The objects of section
+//!   `silk_frames` lie together between `__start_silk_frames` and `__stop_silk_frames`.
+//! - The module exports `memory`, every function `LlvmCode` marks `wasm-export-name`, and the
+//!   entry: `_start` on WASI, `main` otherwise.
+
+import backend.Bitcode
+import backend.Bitcode {Module}
+import backend.WasmCode
+import backend.WasmCode {Placement, Translated, Unsupported}
+import backend.WasmModule
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.collections.slice {Slice}
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn startsWith(text: &[u8], prefix: &[u8]) -> bool {
+  return text.length >= prefix.length && same(Slice.view<u8>(text, usize.ZERO, prefix.length), prefix)
+}
+
+/// Where the stack ends and the data starts.
+fn stackTop() -> u64 { return 1048576 }
+
+fn alignUp(value: u64, alignment: u64) -> u64 {
+  if alignment <= 1 { return value }
+  return (value + alignment - 1) / alignment * alignment
+}
+
+/// The string attribute `key` at the function position of global `global`'s attributes, if any.
+effect fn functionAttribute(module: &Module, global: usize, key: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let list = module.globalAttributes(global)
+  if list == 0 { return Bytes.make() }
+  let groups = module.listGroups(list)
+  let mut at = usize.ZERO
+  while at < groups.length {
+    if module.groupPosition(groups[at]) == Bitcode.positionFunction() {
+      let found = run stringAttribute(module.groupEncoding(groups[at]), key)
+      if Bytes.length(&found) > usize.ZERO { return move found }
+    }
+    at = at + usize.ONE
+  }
+  return Bytes.make()
+}
+
+// The value of string attribute `key` in a group encoding: runs of `[0, kind]`, `[1, kind,
+// value]`, `[6, kind, type]`, `[3, key..., 0]` and `[4, key..., 0, value..., 0]`.
+effect fn stringAttribute(encoding: &[u64], key: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < encoding.length {
+    let kind = encoding[at]
+    if kind == 0 {
+      at = at + 2
+    } else if kind == 1 || kind == 5 || kind == 6 {
+      at = at + 3
+    } else if kind == 3 || kind == 4 {
+      let mut cursor = at + usize.ONE
+      let keyStart = cursor
+      while cursor < encoding.length && encoding[cursor] != 0 { cursor = cursor + usize.ONE }
+      let keyEnd = cursor
+      cursor = cursor + usize.ONE
+      let mut value = Bytes.make()
+      if kind == 4 {
+        while cursor < encoding.length && encoding[cursor] != 0 {
+          run Bytes.append(&mut value, &[u64.toU8(encoding[cursor])])
+          cursor = cursor + usize.ONE
+        }
+        cursor = cursor + usize.ONE
+      }
+      if keyEnd - keyStart == key.length {
+        let mut matches = true
+        let mut index = usize.ZERO
+        while index < key.length {
+          if encoding[keyStart + index] != u8.toU64(key[index]) { matches = false }
+          index = index + usize.ONE
+        }
+        if matches { return move value }
+      }
+      at = cursor
+    } else {
+      return Bytes.make()
+    }
+  }
+  return Bytes.make()
+}
+
+/// The byte alignment of object `global`: its explicit one, or its type's.
+fn objectAlignment(module: &Module, global: usize) -> u64 {
+  let code = module.globalAlignment(global)
+  if code == 0 { return WasmCode.alignmentOf(module, module.globalType(global)) }
+  return u64.shiftLeft(1, code - 1)
+}
+
+struct Import {
+  global: usize,
+  module: Bytes,
+  name: Bytes,
+}
+
+/// Links `module`, a whole program, as a WebAssembly module. `wasi` exports `_start` as the entry
+/// instead of `main`; `maxMemory` bounds the memory in bytes, or is zero for no bound.
+pub effect fn link(module: &Module, wasi: bool, maxMemory: u64) -> Bytes ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let globals = module.globalCount()
+  let mut placement = run Placement.make(globals)
+  // Each defined function's body.
+  let mut bodyOf = run List<usize>.makeWithCapacity(globals)
+  run List<usize>.appendRepeated(&mut bodyOf, usize.MAX, globals)
+  let mut body = usize.ZERO
+  while body < module.bodyCount() {
+    let global = module.bodyGlobal(body)
+    if List<usize>.get(&bodyOf, global) == usize.MAX { List<usize>.set(&mut bodyOf, global, body) }
+    body = body + usize.ONE
+  }
+  // Imports first: every function without a body that names a wasm import.
+  let mut imports = List<Import>.make()
+  let mut global = usize.ZERO
+  while global < globals {
+    if module.isFunction(global) && List<usize>.get(&bodyOf, global) == usize.MAX && !startsWith(module.globalName(global), b"llvm.") {
+      let importModule = run functionAttribute(module, global, b"wasm-import-module")
+      let importName = run functionAttribute(module, global, b"wasm-import-name")
+      if Bytes.length(&importModule) > usize.ZERO && Bytes.length(&importName) > usize.ZERO {
+        List<usize>.set(&mut placement.functions, global, List<Import>.length(&imports))
+        run List<Import>.append(&mut imports, Import {global: global, module: move importModule, name: move importName})
+      }
+    }
+    global = global + usize.ONE
+  }
+  let importCount = List<Import>.length(&imports)
+  // Then the bodies, in order.
+  let mut defined = List<usize>.make()
+  body = usize.ZERO
+  while body < module.bodyCount() {
+    let owner = module.bodyGlobal(body)
+    if List<usize>.get(&bodyOf, owner) == body {
+      List<usize>.set(&mut placement.functions, owner, importCount + List<usize>.length(&defined))
+      run List<usize>.append(&mut defined, body)
+    }
+    body = body + usize.ONE
+  }
+  placement.fmod = module.find(b"fmod")
+  placement.fmodf = module.find(b"fmodf")
+  placement.multiply = module.find(b"__multi3")
+  // The data: the frame table's entries together, then every other defined object.
+  let mut cursor = stackTop()
+  let mut framesStart = u64.MAX
+  let mut framesEnd = u64.MAX
+  let mut pass = usize.ZERO
+  while pass < 2 {
+    global = usize.ZERO
+    while global < globals {
+      if !module.isFunction(global) && module.isDefined(global) && !startsWith(module.globalName(global), b"llvm.") {
+        let section = module.globalSection(global)
+        let mut framed = false
+        let mut metadata = false
+        if section != 0 {
+          framed = same(module.sectionName(section), b"silk_frames")
+          metadata = same(module.sectionName(section), b"llvm.metadata")
+        }
+        if !metadata && (framed == (pass == usize.ZERO)) {
+          cursor = alignUp(cursor, objectAlignment(module, global))
+          if framed && framesStart == u64.MAX { framesStart = cursor }
+          List<u64>.set(&mut placement.addresses, global, cursor)
+          cursor = cursor + WasmCode.sizeOf(module, module.globalType(global))
+          if framed { framesEnd = cursor }
+        }
+      }
+      global = global + usize.ONE
+    }
+    pass = pass + usize.ONE
+  }
+  if framesStart == u64.MAX {
+    framesStart = stackTop()
+    framesEnd = stackTop()
+  }
+  let dataEnd = alignUp(cursor, 16)
+  // The symbols the link defines, and weak objects nothing defines.
+  global = usize.ZERO
+  while global < globals {
+    if !module.isFunction(global) && !module.isDefined(global) {
+      let name = module.globalName(global)
+      if same(name, b"__start_silk_frames") { List<u64>.set(&mut placement.addresses, global, framesStart) }
+      else if same(name, b"__stop_silk_frames") { List<u64>.set(&mut placement.addresses, global, framesEnd) }
+      else if same(name, b"__heap_base") || same(name, b"__data_end") { List<u64>.set(&mut placement.addresses, global, dataEnd) }
+      else if module.globalLinkage(global) == Bitcode.linkExternWeak() { List<u64>.set(&mut placement.addresses, global, 0) }
+    }
+    global = global + usize.ONE
+  }
+  // The data image, from `stackTop()`.
+  let mut image = run Bytes.zeroed(u64.toUsize(dataEnd - stackTop()))
+  global = usize.ZERO
+  while global < globals {
+    let address = List<u64>.get(&placement.addresses, global)
+    if !module.isFunction(global) && module.isDefined(global) && address != u64.MAX && address >= stackTop() {
+      let initializer = module.globalInitializer(global)
+      if initializer != Bitcode.none() {
+        run WasmCode.writeConstant(module, initializer, module.globalType(global), &mut image, u64.toUsize(address - stackTop()), &mut placement,
+          module.globalName(global))
+      }
+    }
+    global = global + usize.ONE
+  }
+  // The code.
+  let listedBodies = List<usize>.asSlice(&defined)
+  let mut entries = run List<Translated>.makeWithCapacity(listedBodies.length)
+  let mut at = usize.ZERO
+  while at < listedBodies.length {
+    run List<Translated>.append(&mut entries, run WasmCode.translate(module, listedBodies[at], &mut placement))
+    at = at + usize.ONE
+  }
+  let mut importTypes = List<usize>.make()
+  let listedImports = List<Import>.asSlice(&imports)
+  at = usize.ZERO
+  while at < listedImports.length {
+    let importGlobal = listedImports[at].global
+    let signature = run WasmCode.signatureOf(module, module.globalType(importGlobal), module.globalName(importGlobal))
+    run List<usize>.append(&mut importTypes, run Placement.typeIndex(&mut placement, Bytes.asSlice(&signature)))
+    at = at + usize.ONE
+  }
+  return run assemble(module, &placement, listedImports, List<usize>.asSlice(&importTypes), listedBodies, List<Translated>.asSlice(&entries),
+    &image, dataEnd, wasi, maxMemory)
+}
+
+effect fn assemble(module: &Module, placement: &Placement, imports: &[Import], importTypes: &[usize], bodies: &[usize], entries: &[Translated],
+  image: &Bytes, dataEnd: u64, wasi: bool, maxMemory: u64) -> Bytes ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let mut out = Bytes.make()
+  run WasmModule.header(&mut out)
+  // Types.
+  let types = List<Bytes>.asSlice(&placement.types)
+  let mut section = Bytes.make()
+  run WasmModule.index(&mut section, types.length)
+  let mut at = usize.ZERO
+  while at < types.length {
+    run Bytes.append(&mut section, Bytes.asSlice(&types[at]))
+    at = at + usize.ONE
+  }
+  run WasmModule.section(&mut out, WasmModule.typeSection(), &section)
+  // Imports.
+  if imports.length > usize.ZERO {
+    section = Bytes.make()
+    run WasmModule.index(&mut section, imports.length)
+    at = usize.ZERO
+    while at < imports.length {
+      run WasmModule.name(&mut section, Bytes.asSlice(&imports[at].module))
+      run WasmModule.name(&mut section, Bytes.asSlice(&imports[at].name))
+      run WasmModule.byte(&mut section, 0)
+      run WasmModule.index(&mut section, importTypes[at])
+      at = at + usize.ONE
+    }
+    run WasmModule.section(&mut out, WasmModule.importSection(), &section)
+  }
+  // Functions.
+  section = Bytes.make()
+  run WasmModule.index(&mut section, entries.length)
+  at = usize.ZERO
+  while at < entries.length {
+    run WasmModule.index(&mut section, entries[at].typeIndex)
+    at = at + usize.ONE
+  }
+  run WasmModule.section(&mut out, WasmModule.functionSection(), &section)
+  // The table, with slot 0 null.
+  let table = List<usize>.asSlice(&placement.table)
+  section = Bytes.make()
+  run WasmModule.index(&mut section, usize.ONE)
+  run WasmModule.byte(&mut section, WasmModule.funcrefType())
+  run WasmModule.byte(&mut section, 1)
+  run WasmModule.index(&mut section, table.length + usize.ONE)
+  run WasmModule.index(&mut section, table.length + usize.ONE)
+  run WasmModule.section(&mut out, WasmModule.tableSection(), &section)
+  // Memory: enough pages for the data, growing up to `maxMemory`.
+  section = Bytes.make()
+  run WasmModule.index(&mut section, usize.ONE)
+  let pages = (dataEnd + 65535) / 65536
+  if maxMemory == 0 {
+    run WasmModule.byte(&mut section, 0)
+    run WasmModule.unsigned(&mut section, pages)
+  } else {
+    let mut limit = maxMemory / 65536
+    if limit < pages { limit = pages }
+    run WasmModule.byte(&mut section, 1)
+    run WasmModule.unsigned(&mut section, pages)
+    run WasmModule.unsigned(&mut section, limit)
+  }
+  run WasmModule.section(&mut out, WasmModule.memorySection(), &section)
+  // `__stack_pointer`.
+  section = Bytes.make()
+  run WasmModule.index(&mut section, usize.ONE)
+  run WasmModule.byte(&mut section, WasmModule.i32Type())
+  run WasmModule.byte(&mut section, 1)
+  run WasmModule.i32Const(&mut section, stackTop())
+  run WasmModule.op(&mut section, WasmModule.opEnd())
+  run WasmModule.section(&mut out, WasmModule.globalSection(), &section)
+  // Exports.
+  let mut exports = Bytes.make()
+  let mut exportNames = List<Bytes>.make()
+  run WasmModule.name(&mut exports, b"memory")
+  run WasmModule.byte(&mut exports, 2)
+  run WasmModule.index(&mut exports, usize.ZERO)
+  run List<Bytes>.append(&mut exportNames, run Bytes.copy(b"memory"))
+  let mut entryName: &[u8] = b"main"
+  if wasi { entryName = b"_start" }
+  at = usize.ZERO
+  while at < bodies.length {
+    let global = module.bodyGlobal(bodies[at])
+    let mut exported = run functionAttribute(module, global, b"wasm-export-name")
+    if Bytes.length(&exported) == usize.ZERO && same(module.globalName(global), entryName) { exported = run Bytes.copy(entryName) }
+    if Bytes.length(&exported) > usize.ZERO && !listed(List<Bytes>.asSlice(&exportNames), Bytes.asSlice(&exported)) {
+      run WasmModule.name(&mut exports, Bytes.asSlice(&exported))
+      run WasmModule.byte(&mut exports, 0)
+      run WasmModule.index(&mut exports, List<usize>.get(&placement.functions, global))
+      run List<Bytes>.append(&mut exportNames, move exported)
+    }
+    at = at + usize.ONE
+  }
+  section = Bytes.make()
+  run WasmModule.index(&mut section, List<Bytes>.length(&exportNames))
+  run Bytes.append(&mut section, Bytes.asSlice(&exports))
+  run WasmModule.section(&mut out, WasmModule.exportSection(), &section)
+  // The table's functions, from slot 1.
+  if table.length > usize.ZERO {
+    section = Bytes.make()
+    run WasmModule.index(&mut section, usize.ONE)
+    run WasmModule.byte(&mut section, 0)
+    run WasmModule.i32Const(&mut section, 1)
+    run WasmModule.op(&mut section, WasmModule.opEnd())
+    run WasmModule.index(&mut section, table.length)
+    at = usize.ZERO
+    while at < table.length {
+      run WasmModule.index(&mut section, table[at])
+      at = at + usize.ONE
+    }
+    run WasmModule.section(&mut out, WasmModule.elementSection(), &section)
+  }
+  // The code.
+  section = Bytes.make()
+  run WasmModule.index(&mut section, entries.length)
+  at = usize.ZERO
+  while at < entries.length {
+    run WasmModule.index(&mut section, Bytes.length(&entries[at].entry))
+    run Bytes.append(&mut section, Bytes.asSlice(&entries[at].entry))
+    at = at + usize.ONE
+  }
+  run WasmModule.section(&mut out, WasmModule.codeSection(), &section)
+  // The data, without its trailing zeros, which fresh memory already holds.
+  let bytes = Bytes.asSlice(image)
+  let mut used = bytes.length
+  while used > usize.ZERO && bytes[used - usize.ONE] == 0 { used = used - usize.ONE }
+  if used > usize.ZERO {
+    section = Bytes.make()
+    run WasmModule.index(&mut section, usize.ONE)
+    run WasmModule.byte(&mut section, 0)
+    run WasmModule.i32Const(&mut section, stackTop())
+    run WasmModule.op(&mut section, WasmModule.opEnd())
+    run WasmModule.index(&mut section, used)
+    run Bytes.append(&mut section, Slice.view<u8>(bytes, usize.ZERO, used))
+    run WasmModule.section(&mut out, WasmModule.dataSection(), &section)
+  }
+  return move out
+}
+
+fn listed(names: &[Bytes], name: &[u8]) -> bool {
+  let mut at = usize.ZERO
+  while at < names.length {
+    if same(Bytes.asSlice(&names[at]), name) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}

@@ -192,7 +192,7 @@ The sealed `Intrinsic` namespace exposes static-only `targetArchitecture`, `targ
 queried through static-only `profileText(key: string) -> string`, `profileFlag(key: string) -> bool`
 and `profileContains(key: string, value: string) -> bool`. Keys are closed compiler-owned domain
 names: text keys are `target` (the canonical target name), `cpu`, `deployment`, `libc`, `artifact`, `entry-kind`, `entry-name`, `link`, `code-model`,
-`relocation`, `optimization`, `safety`, `threading`, `unwind`, `runtime-kind`, `runtime-name`; flag key is `debug`;
+`relocation`, `optimization`, `safety`, `threading`, `unwind`, `runtime-kind`, `runtime-name`, `backend`; flag key is `debug`;
 set keys are `cpu-features` and `sanitizers`. Invalid keys are structured static diagnostics.
 Ordinary Silk wrappers own nominal domain enums and ergonomic operations. Package parameters are
 read by declaration identity, not through arbitrary library-field key lookup. No ordinal target
@@ -204,7 +204,9 @@ module's path and the parameter's name (`main.limit = 42`) and written as plain 
 against the parameter's declared type. A profile's `config` holds override-tier values. A profile
 that names no `target` builds for the host. Profile fields are kebab-case (`code-model`,
 `max-memory`); the earlier `codeModel`, `maxMemory` and `bindings` are refused, naming the current
-spelling. `--profile-input` JSON keeps `codeModel`, `maxMemory` and tagged `bindings`. Without a table
+spelling. A profile's `backend` (`--backend` on the command line) picks the code generator: `llvm`, the
+default, or `direct`, which writes `wasm32-unknown-unknown` and `wasm32-wasip1` executables itself, without
+Clang. `--profile-input` JSON keeps `codeModel`, `maxMemory` and tagged `bindings`. Without a table
 of that name, `dev` (unoptimized, with debug information) and `release` (optimized, without it) are
 built-in profiles for the host. A complete request override replaces project profile selection. CLI `--profile`
 and LSP profile-name settings select a project profile; `--profile-input` and its LSP equivalent
