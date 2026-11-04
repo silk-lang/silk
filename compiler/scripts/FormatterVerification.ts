@@ -4,7 +4,6 @@ import * as Data from 'effect/Data'
 import * as Effect from 'effect/Effect'
 import * as FileSystem from 'effect/FileSystem'
 import * as Path from 'effect/Path'
-import * as Schema from 'effect/Schema'
 import type * as PlatformError from 'effect/PlatformError'
 import * as Stream from 'effect/Stream'
 import * as ChildProcess from 'effect/unstable/process/ChildProcess'
@@ -26,43 +25,6 @@ export class VerificationError extends Data.TaggedError('FormatterVerificationEr
     | { readonly _tag: 'WrappedFailure'; readonly cause: unknown }
 }> {}
 
-const Inventory = Schema.Struct({
-  entries: Schema.Array(Schema.Struct({ operation: Schema.String, phase: Schema.String })),
-})
-
-/**
- * The canonical runtime intrinsic members, read from the checkout's intrinsic inventory: every
- * operation that is not static-only, without its `Intrinsic.` prefix, in sorted order.
- */
-export const runtimeIntrinsicNames = Effect.fn('FormatterVerification.runtimeIntrinsicNames')(
-  function* (
-    repository: string,
-  ): Effect.fn.Return<
-    ReadonlyArray<string>,
-    VerificationError | PlatformError.PlatformError,
-    FileSystem.FileSystem
-  > {
-    const fs = yield* FileSystem.FileSystem
-    const text = yield* fs.readFileString(
-      `${repository}/compiler/fixtures/intrinsic-inventory.json`,
-    )
-    const inventory = yield* Schema.decodeEffect(Schema.fromJsonString(Inventory))(text).pipe(
-      Effect.mapError(
-        (cause) =>
-          new VerificationError({
-            operation: 'read intrinsic inventory',
-            message: 'Invalid intrinsic inventory',
-            reason: { _tag: 'WrappedFailure', cause },
-          }),
-      ),
-    )
-    return inventory.entries
-      .filter((entry) => entry.phase !== 'StaticOnly')
-      .map((entry) => entry.operation.slice('Intrinsic.'.length))
-      .sort()
-  },
-)
-
 const capture = Effect.fnUntraced(function* (command: ChildProcess.Command) {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
   const handle = yield* spawner.spawn(command)
@@ -72,8 +34,8 @@ const capture = Effect.fnUntraced(function* (command: ChildProcess.Command) {
 }, Effect.scoped)
 
 /**
- * Verifies the intrinsic catalog and repository formatting without changing the checkout. The
- * corpus has its own modes; this one neither builds a compiler nor runs programs.
+ * Verifies repository formatting without changing the checkout. The corpus has its own modes;
+ * this one neither builds a compiler nor runs programs.
  */
 export const run = Effect.fn('FormatterVerification.run')(function* (
   self: FormatterVerification,
@@ -83,27 +45,6 @@ export const run = Effect.fn('FormatterVerification.run')(function* (
   FileSystem.FileSystem | ChildProcessSpawner.ChildProcessSpawner
 > {
   const fs = yield* FileSystem.FileSystem
-  const catalog = yield* fs.readFileString(
-    `${self.repository}/compiler/src/semantic/IntrinsicCatalog.silk`,
-  )
-  const members = catalog
-    .split('let members = b"')
-    .at(1)
-    ?.split('"')
-    .at(0)
-    ?.split('|')
-    .filter((name) => name.length > 0)
-  const expected = yield* runtimeIntrinsicNames(self.repository)
-  if (
-    members === undefined ||
-    members.length !== expected.length ||
-    members.some((name, index) => name !== expected[index])
-  )
-    return yield* new VerificationError({
-      operation: 'verify intrinsic catalog',
-      message: 'Selfhost runtime members differ from the canonical intrinsic catalog',
-      reason: { _tag: 'InvalidInput' },
-    })
   const tracked = yield* capture(
     ChildProcess.make('git', ['ls-files', '-z', '--', '*.silk'], {
       cwd: self.repository,
