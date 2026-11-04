@@ -1297,8 +1297,9 @@ calling convention and external linkage, emits the fatal unwind guard, and recor
 
 Native artifacts retain direct external symbols for the linker. LLVM-to-Wasm admits direct calls
 with scalar and address-space-zero pointer lanes and leaves their symbols undefined for final
-linkage; C statics, variadic tails and callback lanes stay unavailable there, under the same
-reachability rule as
+linkage. A variadic tail goes in a block on the linear-memory stack whose address follows the fixed
+arguments, as the WebAssembly C ABI lays it out. C statics and callback lanes stay unavailable
+there, under the same reachability rule as
 [TARGET-001](#target-001--intrinsic-availability-is-checked-only-for-the-selected-executable-closure).
 
 Parsing, importing, indexing, or retaining an uncalled foreign declaration does not reject a
@@ -1318,7 +1319,7 @@ does not suggest catching a failure or adding an unsafe block.
 
 **Current compiler:** Aligned. The executable origin collects reachable foreign calls beside
 intrinsic calls. LLVM emission declares their C ABI symbols and records deterministic metadata;
-LLVM-to-Wasm rejects a reachable C static, variadic tail or callback lane before emission.
+LLVM-to-Wasm rejects a reachable C static or callback lane before emission.
 
 **Evidence:** foreign function specification,
 [C ABI classification](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/CAbi.ts).

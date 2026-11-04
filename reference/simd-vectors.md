@@ -391,7 +391,7 @@ vectors to C like the rest of the program. A C static may hold a vector.
 
 **Diagnostics:** A vector in an imported C signature whose width the target's C ABI does not admit,
 or that needs a CPU feature the profile does not select, reports `SEM0244`
-at the call. The same vector in an exported signature reports the `c-abi-vector` gap.
+at the call, and at the declaration of an exported signature.
 
 **Current compiler:** Aligned.
 

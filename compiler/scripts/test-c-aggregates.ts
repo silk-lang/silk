@@ -71,5 +71,49 @@ const program = Effect.gen(function* () {
     })
     yield* Console.log(`C aggregate conformance: wasm32 ${profile.name} passed`)
   }
+  // A C variadic tail goes in a block on the linear-memory stack whose address follows the fixed
+  // arguments. LLVM lays it out against Clang's C callee; the direct backend lays out the same
+  // block, which a host import reads.
+  const variadic = join(repo, 'corpus/native/foreign-variadic-scalars')
+  yield* fs.copyFile(join(variadic, 'main.silk'), join(directory, 'variadic.silk'))
+  yield* fs.copyFile(join(variadic, 'c/silk_test_variadic_scalars.c'), join(directory, 'variadic.c'))
+  // The manifest links `struct_values.o`, so the variadic C object takes that name.
+  yield* invoke(clang, ['--target=wasm32-unknown-unknown', '-ffreestanding', '-O2', '-c', 'variadic.c', '-o', 'struct_values.o'])
+  yield* invoke(compiler, ['build', 'variadic.silk', '-o', 'variadic.wasm', '--target', 'wasm32-unknown-unknown', '--stdlib', join(repo, 'stdlib')])
+  const variadicBytes = yield* fs.readFile(join(directory, 'variadic.wasm'))
+  yield* Effect.try(() => {
+    const instance = new WebAssembly.Instance(new WebAssembly.Module(variadicBytes), {})
+    const entry = instance.exports.main
+    if (typeof entry !== 'function') throw new Error('missing variadic entry')
+    assert.equal(entry(), 42, 'C variadic scalars on wasm32')
+  })
+  yield* fs.writeFileString(
+    join(directory, 'host.silk'),
+    'unsafe extern "C" fn sum(count: i32, ...) -> i64 as "env#sum"\n' +
+      'pub fn main() -> i32 {\n' +
+      '  let small: i8 = -3\n  let big: i64 = 5000000000\n  let half: f32 = 2.5\n' +
+      '  if unsafe sum(4, small, big, half, 9) != 5000000008 { return 1 }\n' +
+      '  return 42\n}\n',
+  )
+  for (const backend of ['llvm', 'direct']) {
+    yield* invoke(compiler, ['build', 'host.silk', '-o', `host-${backend}.wasm`, '--target', 'wasm32-unknown-unknown', '--backend', backend, '--stdlib', join(repo, 'stdlib')])
+    const hostBytes = yield* fs.readFile(join(directory, `host-${backend}.wasm`))
+    yield* Effect.try(() => {
+      let memory: WebAssembly.Memory | undefined
+      const sum = (count: number, block: number) => {
+        assert.equal(count, 4)
+        const view = new DataView(memory!.buffer)
+        // Each argument at its own alignment: the promoted `i8`, `i64`, promoted `f32` and `i32`.
+        return BigInt(view.getInt32(block, true)) + view.getBigInt64(block + 8, true) +
+          BigInt(Math.floor(view.getFloat64(block + 16, true))) + BigInt(view.getInt32(block + 24, true))
+      }
+      const instance = new WebAssembly.Instance(new WebAssembly.Module(hostBytes), { env: { sum } })
+      memory = instance.exports.memory as WebAssembly.Memory
+      const entry = instance.exports.main
+      if (typeof entry !== 'function') throw new Error('missing host variadic entry')
+      assert.equal(entry(), 42, `${backend}: the variadic block a host import reads`)
+    })
+  }
+  yield* Console.log('C variadic calls: wasm32 llvm and direct passed')
 })
 await Effect.runPromise(program.pipe(Effect.scoped, Effect.provide(NodeServices.layer)))
