@@ -988,14 +988,16 @@ fn take(box: Box) -> Payload {
 ```
 
 Pattern bindings in a guarded consuming arm remain provisional until the guard succeeds. A guard
-may inspect them but cannot move, drop, or otherwise consume them, because a later arm must still be
-able to receive the unchanged payload when the guard is false.
+is a test: it may inspect them and any other place, but it cannot move, drop, or assign a place
+declared outside it, because a later arm must still be able to receive the unchanged payload and
+owners when the guard is false. A store through a reference and a temporary or local the guard
+itself creates are not restricted.
 
 **Boundary:** Complete consuming destructuring is not a partial move under OWN-004. The source owner
 has already entered the match, and exactly one selected arm receives or cleans each active field.
 
-**Diagnostics:** Escaping an affine binding from a borrowed pattern reports `OWN0006`. Consuming a
-provisional guarded binding reports `OWN0008`. A later use of the complete consumed scrutinee reports
+**Diagnostics:** Escaping an affine binding from a borrowed pattern reports `OWN0006`. Moving,
+dropping or assigning a place declared outside a guard, inside the guard, reports `OWN0008`. A later use of the complete consumed scrutinee reports
 `OWN0001`.
 
 **Evidence:** ownership specification,

@@ -1045,8 +1045,9 @@ a member exhaustive.
 members or nominal variant paths. An unreachable arm reports `SEM0043`. Scalar enums use the more
 specific coverage codes:
 `SEM0158` for missing members, `SEM0159` for a duplicate unguarded member, and `SEM0160` for an arm
-after `_`. A non-boolean guard reports `SEM0045`. Consuming a provisional guard binding reports
-`OWN0008` because later arms may still need the unchanged payload.
+after `_`. A non-boolean guard reports `SEM0045`. A guard that moves, drops or assigns a place
+declared outside it, a provisional binding included, reports `OWN0008` because later arms may
+still need the unchanged payload and owners.
 
 **Evidence:** exhaustive matching specification,
 coverage tests.
