@@ -459,7 +459,7 @@ All pointers must address the buffers and structures that the WASI specification
 ## `clock_res_get`
 
 ```silk
-@foreign(noCapture: ("resolution",))
+@foreign(noCapture: .("resolution"))
 pub unsafe extern "C" fn clock_res_get(
     clock: u32,
     resolution: *mut u64
@@ -476,7 +476,7 @@ All pointers must address the buffers and structures that the WASI specification
 ## `clock_time_get`
 
 ```silk
-@foreign(noCapture: ("time",))
+@foreign(noCapture: .("time"))
 pub unsafe extern "C" fn clock_time_get(
     clock: u32,
     precision: u64,
@@ -555,7 +555,7 @@ All pointers must address the buffers and structures that the WASI specification
 ## `fd_fdstat_get`
 
 ```silk
-@foreign(noCapture: ("stat",))
+@foreign(noCapture: .("stat"))
 pub unsafe extern "C" fn fd_fdstat_get(
     fd: u32,
     stat: *mut FdStat
@@ -605,7 +605,7 @@ All pointers must address the buffers and structures that the WASI specification
 ## `fd_filestat_get`
 
 ```silk
-@foreign(noCapture: ("stat",))
+@foreign(noCapture: .("stat"))
 pub unsafe extern "C" fn fd_filestat_get(
     fd: u32,
     stat: *mut FileStat
@@ -676,7 +676,7 @@ All pointers must address the buffers and structures that the WASI specification
 ## `fd_prestat_get`
 
 ```silk
-@foreign(noCapture: ("stat",))
+@foreign(noCapture: .("stat"))
 pub unsafe extern "C" fn fd_prestat_get(
     fd: u32,
     stat: *mut Prestat
@@ -693,7 +693,7 @@ All pointers must address the buffers and structures that the WASI specification
 ## `fd_prestat_dir_name`
 
 ```silk
-@foreign(noCapture: ("path",))
+@foreign(noCapture: .("path"))
 pub unsafe extern "C" fn fd_prestat_dir_name(
     fd: u32,
     path: ?[*]mut u8,
@@ -783,7 +783,7 @@ All pointers must address the buffers and structures that the WASI specification
 ## `fd_seek`
 
 ```silk
-@foreign(noCapture: ("position",))
+@foreign(noCapture: .("position"))
 pub unsafe extern "C" fn fd_seek(
     fd: u32,
     offset: i64,
@@ -815,7 +815,7 @@ All pointers must address the buffers and structures that the WASI specification
 ## `fd_tell`
 
 ```silk
-@foreign(noCapture: ("position",))
+@foreign(noCapture: .("position"))
 pub unsafe extern "C" fn fd_tell(
     fd: u32,
     position: *mut u64
@@ -851,7 +851,7 @@ All pointers must address the buffers and structures that the WASI specification
 ## `path_create_directory`
 
 ```silk
-@foreign(noCapture: ("path",))
+@foreign(noCapture: .("path"))
 pub unsafe extern "C" fn path_create_directory(
     fd: u32,
     path: ?[*]const u8,
@@ -889,7 +889,7 @@ All pointers must address the buffers and structures that the WASI specification
 ## `path_filestat_set_times`
 
 ```silk
-@foreign(noCapture: ("path",))
+@foreign(noCapture: .("path"))
 pub unsafe extern "C" fn path_filestat_set_times(
     fd: u32,
     lookup: u32,
@@ -982,7 +982,7 @@ All pointers must address the buffers and structures that the WASI specification
 ## `path_remove_directory`
 
 ```silk
-@foreign(noCapture: ("path",))
+@foreign(noCapture: .("path"))
 pub unsafe extern "C" fn path_remove_directory(
     fd: u32,
     path: ?[*]const u8,
@@ -1041,7 +1041,7 @@ All pointers must address the buffers and structures that the WASI specification
 ## `path_unlink_file`
 
 ```silk
-@foreign(noCapture: ("path",))
+@foreign(noCapture: .("path"))
 pub unsafe extern "C" fn path_unlink_file(
     fd: u32,
     path: ?[*]const u8,
@@ -1109,7 +1109,7 @@ All pointers must address the buffers and structures that the WASI specification
 ## `random_get`
 
 ```silk
-@foreign(noCapture: ("buffer",))
+@foreign(noCapture: .("buffer"))
 pub unsafe extern "C" fn random_get(
     buffer: ?[*]mut u8,
     length: u32
@@ -1139,7 +1139,7 @@ All pointers must address the buffers and structures that the WASI specification
 ## `sock_accept`
 
 ```silk
-@foreign(noCapture: ("accepted",))
+@foreign(noCapture: .("accepted"))
 pub unsafe extern "C" fn sock_accept(
     fd: u32,
     flags: u32,

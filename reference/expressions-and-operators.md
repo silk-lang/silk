@@ -1134,8 +1134,8 @@ an index or projection computation.
 
 **Diagnostics:** A compound-assignment spelling receives one parser diagnostic, PAR0010, at the
 operator, naming the `x = x + 1` form. The same code reports a postfix `x++` or `x--`, a
-`for ... in` loop, a `var` binding, and a `c ? a : b` conditional, each once with its Silk
-spelling. No semantic compound-assignment operation is synthesized.
+`for ... in` loop, a `var` binding, a `c ? a : b` conditional, and a one-element tuple written
+`(a,)` instead of `.(a)`, each once with its Silk spelling. No semantic compound-assignment operation is synthesized.
 
 **Evidence:** [assignment parser](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Parser.ts),
 [operator vocabulary](https://github.com/silk-lang/silk/blob/bbab200c9fb9c17c1611436cb031f45f4d0e8fb7/bootstrap/packages/compiler/src/Operator.ts).

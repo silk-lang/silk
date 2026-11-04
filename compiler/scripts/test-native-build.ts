@@ -679,11 +679,11 @@ const program = Effect.gen(function* () {
   // lane shapes, operand references, overlaps and contradictory effects still fail before Clang.
   const rejectedAssembly = [
     ['reserved output', 'u64', 'mov $0, #0', '={x18}', '', 'none', true, '()'],
-    ['reserved input', '()', 'yield', '{x18}', '', 'none', true, '(word,)'],
+    ['reserved input', '()', 'yield', '{x18}', '', 'none', true, '.(word)'],
     ...['x18', 'x19', 'x29', 'x30', 'sp', 'rax'].map((register) =>
       [`clobber ${register}`, '()', 'yield', '', register, 'none', true, '()'] as const),
     ['overlapping clobber', 'u64', 'mov $0, #0', '={x0}', 'x0', 'none', true, '()'],
-    ['invalid operand lane', '()', 'yield', '{x0}', '', 'none', true, '(narrow,)'],
+    ['invalid operand lane', '()', 'yield', '{x0}', '', 'none', true, '.(narrow)'],
     ['missing operand', '()', 'yield', '{x0}', '', 'none', true, '()'],
     ['unknown operand reference', '()', 'mov $0, #0', '', '', 'none', true, '()'],
     ['unobservable write', '()', 'yield', '', '', 'write', false, '()'],
@@ -1790,8 +1790,8 @@ const program = Effect.gen(function* () {
   const templateCases: Array<[string, string, RegExp]> = [
     ["lonebrace", templateUse('StderrWriter.print("} {name}\\n", &.{ name: "Ada" })'), /error\[SEM0177\] a lone `\}` in a template must be written `\}\}`, which writes one `\}`\n/],
     ["widthtext", templateUse('StderrWriter.print("{name:>w$}\\n", &.{ name: "Ada", w: "x" })'), /error\[SEM0121\] A width or precision read from a field, as in `\{name:w\$\}`, needs an integer, and this field is `string<'static>`\n/],
-    ["radixtext", templateUse('StderrWriter.print("{:x}\\n", &("Ada",))'), /error\[SEM0121\] A `\{:x\}`, `\{:X\}`, `\{:o\}`, or `\{:b\}` placeholder needs an integer, and this value is `string<'static>`\n/],
-    ["exponentint", templateUse('StderrWriter.print("{:e}\\n", &(5,))'), /error\[SEM0121\] A `\{:e\}` or `\{:E\}` placeholder needs a float, and this value is `i32`\n/],
+    ["radixtext", templateUse('StderrWriter.print("{:x}\\n", &.("Ada"))'), /error\[SEM0121\] A `\{:x\}`, `\{:X\}`, `\{:o\}`, or `\{:b\}` placeholder needs an integer, and this value is `string<'static>`\n/],
+    ["exponentint", templateUse('StderrWriter.print("{:e}\\n", &.(5))'), /error\[SEM0121\] A `\{:e\}` or `\{:E\}` placeholder needs a float, and this value is `i32`\n/],
     ["unborrowed", templateUse('StderrWriter.print("{}\\n", 5)'), /error\[SEM0012\] This parameter takes a borrow, and this argument is i32; write `&` before it\n/],
     ["surrogate", "pub fn main() -> i32 {\n  let s = \"\\u{D800}\"\n  return 0\n}\n", /error\[SEM0085\] Invalid static literal: `\\u\{D800\}` is a UTF-16 surrogate, which is not a Unicode scalar value\n/],
     ["abovescalar", "pub fn main() -> i32 {\n  let c = '\\u{110000}'\n  return 0\n}\n", /error\[SEM0085\] Invalid static literal: `\\u\{110000\}` is above `\\u\{10FFFF\}`, the largest Unicode scalar value\n/],

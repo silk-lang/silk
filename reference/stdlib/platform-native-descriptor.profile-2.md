@@ -58,7 +58,7 @@ Public declarations: 5.
 ## `read`
 
 ```silk
-@foreign(noCapture: ("buffer",))
+@foreign(noCapture: .("buffer"))
 pub unsafe extern "C" fn read(fd: i32, buffer: ?[*]mut u8, count: usize) -> isize
 ```
 
@@ -73,7 +73,7 @@ error code at once.
 ## `write`
 
 ```silk
-@foreign(noCapture: ("buffer",))
+@foreign(noCapture: .("buffer"))
 pub unsafe extern "C" fn write(fd: i32, buffer: ?[*]const u8, count: usize) -> isize
 ```
 

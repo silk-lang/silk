@@ -901,9 +901,9 @@ a same-spelled record field.
 **Status:** Confirmed
 
 `(first, second)` is a tuple literal, `(value)` is a grouped expression, and `()` is unit. A
-leading dot makes a tuple of any length: `.(only)` is a one-element tuple literal with no trailing
-comma, `.(first, second)` equals `(first, second)`, and `.()` is unit. The older `(only,)` spelling
-still parses. When an independently known expected type is a named tuple,
+leading dot makes a tuple of any length: `.(only)` is the one-element tuple literal,
+`.(first, second)` equals `(first, second)`, and `.()` is unit. `(only,)` is not a tuple spelling:
+it reports PAR0010, naming `.(only)`. When an independently known expected type is a named tuple,
 the literal constructs that type. Otherwise the literal occurrence creates one anonymous nominal
 positional aggregate.
 

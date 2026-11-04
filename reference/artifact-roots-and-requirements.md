@@ -148,7 +148,7 @@ compatible constraints: linkage must agree, version bounds intersect, and altern
 A build choice must satisfy that intersection. Final linking needs explicit physical bindings until
 the separate supply resolver is available. Physical input lists preserve order and duplicates.
 
-**Example:** Two requirements admitting alternatives `( "system", "custom" )` and `( "custom", )`
+**Example:** Two requirements admitting alternatives `( "system", "custom" )` and `.("custom")`
 merge to `custom`. Their source locations both remain visible in plan inspection.
 
 **Boundary:** Static and dynamic hard requirements for the same library conflict. Empty alternative
