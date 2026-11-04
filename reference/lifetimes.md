@@ -119,9 +119,11 @@ impl lifetime and retains it in the operation contracts. It has the same relatio
 explicitly bound `impl<'data, A: Copy> ... for SliceStream<'data, A>`. Ordinary type arguments,
 bounds and conformance selection are unchanged; `Self` still denotes that fixed applied owner.
 
-Local type annotations instead infer body-scoped lifetimes from their uses and cleanup. A lifetime
-an annotation, a literal's type arguments or a call's generic arguments write is fixed, even when an
-argument beside it is inferred. For example, `PairWith<'a> {view: &src.t, extra: 1}` keeps its
+Inside a body, every omitted lifetime is a fresh region of that body, inferred from its uses and
+cleanup: in a local annotation, a literal's or constructor's type arguments (also through an alias),
+and a call's explicit generic arguments, as in `maybeWith<&Entry>(42)` or
+`Intrinsic.executionDrive<i32, &mut i32, C, S>(...)`. A lifetime an annotation, a literal's type
+arguments or a call's generic arguments write is fixed, even when an argument beside it is inferred. For example, `PairWith<'a> {view: &src.t, extra: 1}` keeps its
 borrow for `'a`. Public
 relationships never depend on return bodies, setter histories, or which constructor happened to
 initialize a field.

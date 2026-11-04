@@ -246,7 +246,7 @@ callable specification,
 
 `receiver.member(args)` calls the inherent receiver method `member` of the receiver's nominal
 type. It names the same statically selected member as `Type.member(receiver, args)` and
-`receiver |> Type.member(args)`: no callable value is created, nothing is dispatched at run time,
+`receiver |> Type.member(args)` (PIPE-001): no callable value is created, nothing is dispatched at run time,
 and the three spellings share one contract, one declaration, and one rename.
 
 ```silk
@@ -670,13 +670,15 @@ parameter or lambda; writing the type, as in `|value: i32|`, resolves it.
 
 **Evidence:** anonymous callable value specification.
 
-### PIPE-001 — A pipeline invokes one unary callable after evaluating its left value
+### PIPE-001 — A pipeline into a call is that call with the left value first
 
 **Status:** Confirmed
 
-`value |> operation` evaluates the completed left expression exactly once, then evaluates the right
-expression as a unary callable and invokes it with the left value. Pipelines associate left to
-right.
+`value |> f(args)` is the call `f(value, args)`, for every callee form: a function, a qualified
+member, an interface operation, or a receiver call, so `value |> recv.method(args)` is
+`recv.method(value, args)`. Any other right side, such as a function name, a binding, or a grouped
+expression, is a callable value the pipeline invokes with the left value: `value |> f` is `f(value)`.
+Pipelines associate left to right.
 
 ```silk
 fn add(left: i32, right: i32) -> i32 { return left + right }
@@ -687,27 +689,18 @@ pub fn main() -> i32 {
 }
 ```
 
-The expression groups as `(2 |> add(3)) |> multiply(4)` and produces `20`.
+The expression groups as `(2 |> add(3)) |> multiply(4)`, which is `multiply(add(2, 3), 4)`, and
+produces `20`.
 
-The pipeline does not insert an argument into syntax. `add(3)` is first an ordinary section waiting
-for `left`; the pipeline then invokes that callable with `2`.
+The call is checked, evaluated, and owned exactly as the direct call it spells: the left value is its
+first argument, so it is evaluated before the written arguments, and its ownership is that of the
+callee's first parameter. To invoke the callable a call returns, group it: `value |> (make(1))`.
 
-The left expression may be an explicit `&` or `&mut` borrow when the callable expects a borrowed
-view. A result follows the callable's declared or deterministically elided lifetime relationships,
-just as in an equivalent direct call. Supplied arguments and retained captures preserve their
-concrete loans; structural callable contracts do not require inspecting a hidden implementation.
+The left expression may be an explicit `&` or `&mut` borrow when the callee expects a borrowed view.
 
-**Boundary:** The right side may be a function item, section, binding, grouped expression, or any
-other compatible unary callable. An applied interface operation such as
-`Encodable<u32>.encode` is completed by the pipeline's left operand and is equivalent to the direct
-static call `Encodable<u32>.encode(left)`. The pipeline does not perform method lookup, open a
-namespace, import a name, infer an interface application from the result, or change the callable's
-ownership contract.
-
-**Diagnostics:** A non-callable right expression reports `SEM0075`. A callable with incompatible
-arity, parameter type, result use, or invocation mode reports the corresponding callable or
-argument diagnostic. Invalid transfer or borrowing of the left value reports its ordinary ownership
-diagnostic.
+**Diagnostics:** A non-callable right expression reports `SEM0075`. A call with the wrong number or
+type of arguments reports the same diagnostic as the direct call. Invalid transfer or borrowing of
+the left value reports its ordinary ownership diagnostic.
 
 **Evidence:** operator pipeline specification,
 pipeline elaboration tests,

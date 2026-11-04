@@ -1108,10 +1108,9 @@ The explicit `move` consumes `token` exactly once. A pipeline into a borrowed le
 similarly provide the appropriate explicit borrow. Pipeline syntax does not add, remove, or infer an
 ownership conversion.
 
-A returned borrowed view carries the same source root through a pipeline as through a direct call.
-For an exact callable section, that source may be either the newly supplied leading argument or one
-known trailing capture. An opaque callable contract does not guess which captured value backs the
-result.
+A returned borrowed view carries the same source root through a pipeline as through the direct call
+it spells. For a callable value, that source may be either the newly supplied leading argument or one
+known capture. An opaque callable contract does not guess which captured value backs the result.
 
 **Boundary:** The left expression evaluates before the callable or leading-argument section on the
 right is constructed or accessed. Pipelines associate left-to-right, and each stage applies the
