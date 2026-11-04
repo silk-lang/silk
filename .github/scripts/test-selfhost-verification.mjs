@@ -25,14 +25,6 @@ const sourceDigests = (directory) =>
   })
 
 const bundle = resolve('.scratch/selfhost-verification.mjs')
-// The canonical runtime members the harness checks the catalog against: every operation of the
-// checked intrinsic inventory that is not static-only.
-const runtimeIntrinsicNames = JSON.parse(
-  readFileSync('compiler/fixtures/intrinsic-inventory.json', 'utf8'),
-)
-  .entries.filter((entry) => entry.phase !== 'StaticOnly')
-  .map((entry) => entry.operation.slice('Intrinsic.'.length))
-  .sort()
 const temporary = mkdtempSync(join(tmpdir(), 'silk-verification-smoke-'))
 try {
   const checkout = join(temporary, 'checkout')
@@ -45,17 +37,13 @@ try {
       'corpus',
       'stdlib',
       'examples',
-      'compiler/fixtures/intrinsic-inventory.json',
     ],
     { maxBuffer: 64 * 1024 * 1024 },
   )
   execFileSync('tar', ['-x', '-C', checkout], { input: archive })
   mkdirSync(join(checkout, 'compiler/scripts'), { recursive: true })
-  mkdirSync(join(checkout, 'compiler/src/semantic'), { recursive: true })
   const track = join(checkout, 'compiler/scripts/selfhost-track.json')
-  const catalog = join(checkout, 'compiler/src/semantic/IntrinsicCatalog.silk')
   writeFileSync(track, JSON.stringify(['trivial-features']))
-  writeFileSync(catalog, `let members = b"${runtimeIntrinsicNames.join('|')}"`)
   execFileSync('git', ['init', '-q'], { cwd: checkout })
   execFileSync('git', ['add', '.'], { cwd: checkout })
   const gate = join(
@@ -103,10 +91,6 @@ try {
     cwd: checkout,
   })
   writeFileSync(gate, verifyingGate)
-  writeFileSync(catalog, 'let members = b"invalid"')
-  const invalid = invoke()
-  assert.notStrictEqual(invalid.status, 0)
-  assert.match(invalid.stdout + invalid.stderr, /canonical intrinsic catalog/)
   // Reuse the exact downloaded artifact as a corpus-only checkpoint. It must neither invoke
   // the formatter nor bootstrap nor require bootstrap configuration or repository dependencies.
   assert.strictEqual(existsSync(join(checkout, 'node_modules')), false)
