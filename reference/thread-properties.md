@@ -353,6 +353,10 @@ The standard library ships a host for Node and browsers in `stdlib/host/wasm-run
 `node wasm-runner.mjs program` exits with the status `main` returns, and `runWasm(bytes)` resolves
 to it. `main` runs in a Worker, not on the host's own thread, because a browser's main thread may
 not block in `memory.atomic.wait32`; the top-level thread creates every thread's Worker.
+A thread's instance starts with the main thread's `__stack_pointer`, whose frames are live on the
+shared memory, so a host calls no export on it before `wasi_thread_start`, which moves the stack
+pointer to the thread's own stack first. Only the host knows when an instance is new, so this is a
+host rule; the runner reads a thread's report offset on the spawning thread instead.
 
 **Boundary:** Every thread allocates through the runtime's one heap, serialized by one lock that
 waits with `memory.atomic.wait32`. Joining a thread returns its stack and record to that heap; a
