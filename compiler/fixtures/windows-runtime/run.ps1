@@ -25,11 +25,11 @@ foreach ($name in $Programs) {
   $allowed = '^(kernel32|ntdll)\.dll$'
   if ($name -eq 'resolver' -or $name -eq 'sockets') { $allowed = '^(kernel32|ntdll|ws2_32)\.dll$' }
   if ($name -eq 'trust') { $allowed = '^(kernel32|ntdll|crypt32)\.dll$' }
-  if ($name -eq 'https') { $allowed = '^(kernel32|ntdll|ws2_32|crypt32|bcryptprimitives)\.dll$' }
+  if ($name -eq 'https') { $allowed = '^(kernel32|ntdll|ws2_32|crypt32|bcryptprimitives|api-ms-win-core-synch-l1-2-0)\.dll$' }
   if ($name -eq 'providers' -or $name -eq 'process' -or $name -eq 'process-image') { $allowed = '^(kernel32|ntdll|bcryptprimitives)\.dll$' }
   $corpusThread = $name -like 'native-thread-*' -or $name -like 'atomic-*'
   if ($corpusThread) { $allowed = '^(kernel32|ntdll|api-ms-win-core-synch-l1-2-0)\.dll$' }
-  if ($name -eq 'websocket-relay') { $allowed = '^(kernel32|ntdll|ws2_32|bcryptprimitives)\.dll$' }
+  if ($name -eq 'websocket-relay') { $allowed = '^(kernel32|ntdll|ws2_32|bcryptprimitives|api-ms-win-core-synch-l1-2-0)\.dll$' }
   if ($imports.Count -eq 0 -or @($imports | Where-Object { $_ -notmatch $allowed }).Count -ne 0) {
     throw "Unexpected or missing DLL imports for $name`: $imports"
   }
