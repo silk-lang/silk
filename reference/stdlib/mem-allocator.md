@@ -141,6 +141,54 @@ The default is false, so a provider that wraps [`Allocator.systemAllocatorProvid
 count, limit or audit requests sees every growth as a new request. The Windows system
 provider returns false. Other system providers return true and let `List` grow with `realloc`.
 
+<a id="Allocator.takeBlock"></a>
+
+### Operation `takeBlock`
+
+```silk
+unsafe effect fn takeBlock(layout: Layout) -> ?*mut u8 ? &mut Allocator
+```
+
+Returns a block of at least `layout.bytes` bytes, aligned to `layout.alignment`, that the
+provider keeps ready, or null when it has none.
+
+#### When to use
+
+Use it on a hot path that makes many small cells and knows how its provider frees them,
+before falling back to [`Allocator.allocate`](#Allocator.allocate) on null.
+
+#### Details
+
+The default returns null. A pooling provider can hand out a free block here without the
+owner record of an `Intrinsic.Allocation`.
+
+#### Gotchas
+
+The block is uninitialized and has no owner. The caller must return it the way its
+provider documents; dropping the pointer leaks the block.
+
+#### Examples
+##### The system provider keeps no blocks ready
+```silk
+import silk.mem.allocator { Allocator }
+import silk.mem.layout { Layout }
+import silk.mem.pointer { Pointer }
+import silk.core.effect { Effect }
+
+effect fn ready() -> bool ? &mut Allocator {
+  let block = run unsafe Allocator.takeBlock(Layout { bytes: 32, alignment: 16 })
+  return !Pointer.isNull<u8>(block)
+}
+
+pub fn main() -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  if run ready() |> Effect.provideMut<Allocator>(&mut allocator) {
+    return 1
+  }
+  return 0
+}
+```
+
 <a id="Allocator.impl"></a>
 
 ## Implementation `Allocator`
