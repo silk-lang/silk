@@ -602,8 +602,9 @@ string type diagnostics.
 **Status:** Confirmed
 
 A `const` declaration requires a type annotation. Its type is `bool`, `char`, a supported integer
-or floating-point primitive, `string`, the byte view `&'static [u8]`, a fixed array of such types,
-or a nominal type whose value static evaluation admits: a scalar enum or a cleanup-free struct
+or floating-point primitive, `string`, the byte view `&[u8]` (always `'static` in a constant, as
+`string` is), a fixed array of such types, or a nominal type whose value static evaluation
+admits: a scalar enum or a cleanup-free struct
 ([STATIC-005](static-evaluation.md#static-005--static-values-are-reusable-data-not-observable-compile-time-storage)).
 Its initializer is a statically evaluated expression that must produce exactly the declared type
 for the selected target. Constants do not infer their type.
@@ -614,7 +615,7 @@ const ratio: f64 = 1.5
 const enabled: bool = true
 const separator: char = ','
 const pattern: string = r"\d+"
-const magic: &'static [u8] = b"\x00asm"
+const magic: &[u8] = b"\x00asm"
 const squares: [u32; 4] = [0, 1, 4, 9]
 
 struct Point {
