@@ -324,8 +324,8 @@ Returns the variant, including the NCS and reserved variants of Nil and Max.
 pub fn version(self: &Self) -> Option<u8>
 ```
 
-Returns the version nibble for the RFC variant, including reserved version numbers.
-Otherwise, returns `None`.
+Returns the version nibble of an RFC-variant UUID, including reserved version numbers, or
+`None` for another variant.
 
 <a id="Uuid.impl.parse"></a>
 
@@ -565,8 +565,7 @@ uniqueness policy.
 pub fn gregorianTimestamp(self: &Self) -> Option<u64>
 ```
 
-Returns Gregorian 100-nanosecond ticks for RFC versions 1 and 6.
-Otherwise, returns `None`.
+Returns Gregorian 100-nanosecond ticks for RFC versions 1 and 6, or `None` otherwise.
 
 Version 2 cannot recover the original timestamp because its low 32 bits hold the local
 identifier.
@@ -579,8 +578,7 @@ identifier.
 pub fn unixMilliseconds(self: &Self) -> Option<u64>
 ```
 
-Returns the Unix millisecond timestamp for RFC version 7.
-Otherwise, returns `None`.
+Returns the Unix millisecond timestamp for RFC version 7, or `None` otherwise.
 
 <a id="Uuid.impl.clockSequence"></a>
 
@@ -603,8 +601,7 @@ Other versions and variants return `None`.
 pub fn node(self: &Self) -> Option<[u8; 6]>
 ```
 
-Returns the network-order node for RFC versions 1, 2, and 6.
-Otherwise, returns `None`.
+Returns the network-order node for RFC versions 1, 2, and 6, or `None` otherwise.
 
 <a id="Uuid.impl.localId"></a>
 
@@ -614,8 +611,7 @@ Otherwise, returns `None`.
 pub fn localId(self: &Self) -> Option<u32>
 ```
 
-Returns the local identifier for RFC version 2.
-Otherwise, returns `None`.
+Returns the local identifier for RFC version 2, or `None` otherwise.
 
 <a id="Uuid.impl.localDomain"></a>
 
@@ -625,8 +621,8 @@ Otherwise, returns `None`.
 pub fn localDomain(self: &Self) -> Option<u8>
 ```
 
-Returns the local domain byte for RFC version 2, including unknown domains.
-Otherwise, returns `None`.
+Returns the local domain byte for RFC version 2, including unknown domains, or `None`
+otherwise.
 
 <a id="Uuid.impl.toV6"></a>
 
@@ -637,7 +633,7 @@ pub fn toV6(self: &Self) -> Option<Self>
 ```
 
 Converts RFC version 1 to version 6 without changing its timestamp, sequence, or node.
-Otherwise, returns `None`.
+Returns `None` for a UUID that is not RFC version 1.
 
 <a id="Uuid.impl.toV1"></a>
 
@@ -648,7 +644,7 @@ pub fn toV1(self: &Self) -> Option<Self>
 ```
 
 Converts RFC version 6 to version 1 without changing its timestamp, sequence, or node.
-Otherwise, returns `None`.
+Returns `None` for a UUID that is not RFC version 6.
 
 <a id="Uuid.impl.Equal"></a>
 

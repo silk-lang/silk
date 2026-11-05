@@ -1509,6 +1509,7 @@ Creates the directory `path` and each missing parent. Existing directories are k
 
 - `FileError` with reason `WrongType` if a component is a regular file, or another reason from
   the provider.
+- `OutOfMemoryError` if the `Allocator` cannot supply the path of a parent directory.
 
 #### Gotchas
 
