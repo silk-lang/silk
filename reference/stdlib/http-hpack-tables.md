@@ -14,7 +14,8 @@ Public declarations: 3.
 pub fn field(index: usize) -> Field<'static>
 ```
 
-Returns the RFC 7541 static field at a one-based index from 1 through 61. Other indices return an empty field.
+Returns the RFC 7541 static field at a one-based index from 1 through 61. Other indices return
+an empty field.
 
 <a id="next"></a>
 
@@ -34,7 +35,8 @@ Returns the child of a valid Huffman trie node for one input bit.
 pub fn symbol(node: usize) -> usize
 ```
 
-Returns a byte symbol, 256 for EOS, or 257 for an internal node. The node must be a valid trie index.
+Returns a byte symbol, 256 for EOS, or 257 for an internal node. The node must be a valid trie
+index.
 
 
 Category: HTTP.

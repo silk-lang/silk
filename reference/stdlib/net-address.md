@@ -6,9 +6,9 @@ IP addresses, ports, endpoints, and the host of a URI, as checked values that do
 
 ## When to use
 Use [`Host.parse`](#Host.impl.parse) on the host of a URI. It returns a domain name, an IPv4 address, or an IPv6
-address. Give the result to `silk.net.resolver` to get endpoints, and keep it to check the identity
-of an HTTPS server. Use [`Ipv4Address`](#Ipv4Address), [`Ipv6Address`](#Ipv6Address), [`Port`](#Port), and [`Endpoint`](#Endpoint) when you
-already have a numeric address.
+address. Give the result to `silk.net.resolver` to get endpoints, and keep it to check the
+identity of an HTTPS server. Use [`Ipv4Address`](#Ipv4Address), [`Ipv6Address`](#Ipv6Address), [`Port`](#Port), and [`Endpoint`](#Endpoint)
+when you already have a numeric address.
 
 ## Details
 Addresses store their bytes in network order. A [`DomainHost`](#DomainHost) keeps the spelling of its input
@@ -1207,8 +1207,8 @@ Parses the host part of a URI.
 #### Details
 `[...]` is parsed as IPv6, decimal dotted text is parsed as IPv4, and all other text as a
 domain name. Give only the host, without user information or a port. The result does not
-allocate. Give it to `silk.net.resolver` to get endpoints, and keep it to check the identity of
-an HTTPS server.
+allocate. Give it to `silk.net.resolver` to get endpoints, and keep it to check the identity
+of an HTTPS server.
 
 #### Errors
 - [`AddressError`](#AddressError) with the rule that failed and the byte offset where it failed.
@@ -1235,8 +1235,8 @@ Use it for a host that you have as bytes, such as the host of a URI you parsed. 
 #### Details
 `[...]` is parsed as IPv6, decimal dotted text is parsed as IPv4, and all other text as a
 domain name. Give only the host, without user information or a port. The result does not
-allocate. Give it to `silk.net.resolver` to get endpoints, and keep it to check the identity of
-an HTTPS server.
+allocate. Give it to `silk.net.resolver` to get endpoints, and keep it to check the identity
+of an HTTPS server.
 
 #### Errors
 - [`AddressError`](#AddressError) with the rule that failed and the byte offset where it failed.

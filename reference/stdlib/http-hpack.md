@@ -4,10 +4,10 @@
 
 HTTP/2 field compression as defined by RFC 7541.
 
-Keep one [`Decoder`](#Decoder) for received fields and one [`Encoder`](#Encoder) for sent fields. Each field block uses
-the table left by the previous block. Field names and values are wire bytes, without UTF-8 conversion.
-Decoding accepts every representation, including Huffman strings. Encoding uses indexed fields
-and literal strings, with dynamic indexing only when the field is not sensitive.
+Keep one [`Decoder`](#Decoder) for received fields and one [`Encoder`](#Encoder) for sent fields. Each field block
+uses the table left by the previous block. Field names and values are wire bytes, without UTF-8
+conversion. Decoding accepts every representation, including Huffman strings. Encoding uses
+indexed fields and literal strings, with dynamic indexing only when the field is not sensitive.
 
 Import as `Decoder` with `import silk.http.hpack { Decoder }`.
 
@@ -204,7 +204,8 @@ The byte limit counts name bytes, value bytes, and 32 bytes for each field.
 pub fn setMaximum(self: &mut Self, maximum: usize) -> ()
 ```
 
-Applies an acknowledged SETTINGS_HEADER_TABLE_SIZE. A reduction requires the next block to update its table.
+Applies an acknowledged SETTINGS_HEADER_TABLE_SIZE. A reduction requires the next block to
+update its table.
 
 <a id="Decoder.impl.decode"></a>
 

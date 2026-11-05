@@ -7,7 +7,8 @@ The TLS 1.3 key schedule functions `HKDF-Expand-Label` and `Derive-Secret` (RFC 
 
 ## When to use
 Use [`TlsHkdfSha256`](#TlsHkdfSha256) or [`TlsHkdfSha384`](#TlsHkdfSha384) to derive TLS 1.3 secrets, keys, and IVs, or keys for
-a protocol that reuses the TLS key schedule, such as QUIC. For other uses, use `silk.crypto.hkdf`.
+a protocol that reuses the TLS key schedule, such as QUIC. For other uses, use
+`silk.crypto.hkdf`.
 
 ## Details
 [`TlsHkdfSha256.expandLabel`](#TlsHkdfSha256.impl.expandLabel) adds the prefix `tls13 ` to the label and fills the output.

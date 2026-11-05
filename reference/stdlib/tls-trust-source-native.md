@@ -7,8 +7,7 @@ A native `TrustSource` provider that loads trust anchors from one PEM file.
 ## When to use
 Provide [`NativeFileTrustSource`](#NativeFileTrustSource) for `TrustSource` when your program uses one PEM bundle of CA
 certificates, for example `/etc/ssl/certs/ca-certificates.crt` on Debian or `/etc/ssl/cert.pem`
-on macOS.
-On Windows, configure a normalized native drive root such as `C:\certs` and a portable
+on macOS. On Windows, configure a normalized native drive root such as `C:\certs` and a portable
 path beneath it. Local NTFS and the Windows filesystem provider restrictions apply.
 
 ## Details
@@ -18,8 +17,8 @@ path beneath it. Local NTFS and the Windows filesystem provider restrictions app
 fails the load. Each snapshot owns its anchors.
 
 The path is opened below the root without following symbolic links, as in
-`silk.platform.native.filesystem`. Trust the root and its parent directories. To change the file, write a
-new file and rename it. A change in place can be read half way.
+`silk.platform.native.filesystem`. Trust the root and its parent directories. To change the
+file, write a new file and rename it. A change in place can be read half way.
 
 ## Errors
 `TrustSourceError` for bad configuration, a file error, a file over the input limit, or bad PEM.
@@ -28,7 +27,8 @@ new file and rename it. A change in place can be read half way.
 ## Gotchas
 - It does not look for a default file, read environment variables, or use the trust store of the
   system (such as the macOS keychain). It does not check revocation.
-- Supported targets are Windows x86_64 MSVC, Darwin x86_64 or aarch64, and GNU/Linux x86_64 or aarch64.
+- Supported targets are Windows x86_64 MSVC, Darwin x86_64 or aarch64, and GNU/Linux x86_64 or
+  aarch64.
 
 ## Examples
 ### Configure a bundle and see a load fail
@@ -90,8 +90,8 @@ pub struct NativeFileTrustSource
 ```
 
 A `TrustSource` provider that owns a root directory and a path to a PEM file below it. It does
-not cache snapshots. On Windows, the root is a normalized native drive path, such as `C:\certs`;
-local NTFS and the Windows filesystem provider restrictions apply.
+not cache snapshots. On Windows, the root is a normalized native drive path, such as
+`C:\certs`; local NTFS and the Windows filesystem provider restrictions apply.
 
 ### When to use
 Provide it for `TrustSource` when your program uses one PEM bundle of CA certificates, for
@@ -107,7 +107,8 @@ file, write a new file and rename it. A change in place can be read half way.
 ### Gotchas
 - It does not look for a default file, read environment variables, or use the trust store of
   the system (such as the macOS keychain). It does not check revocation.
-- Supported targets are Windows x86_64 MSVC, Darwin x86_64 or aarch64, and GNU/Linux x86_64 or aarch64.
+- Supported targets are Windows x86_64 MSVC, Darwin x86_64 or aarch64, and GNU/Linux x86_64 or
+  aarch64.
 
 <a id="NativeFileTrustSource.impl"></a>
 

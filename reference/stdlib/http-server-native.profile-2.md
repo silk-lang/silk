@@ -5,8 +5,8 @@
 Accepts native socket connections and serves each one with `silk.http.server`.
 
 ## When to use
-Make a listener with `silk.net.socket_native`, then call `serveNext` in a loop. Each call accepts
-one connection and serves it with your `ConnectionHandler` until the handler returns.
+Make a listener with `silk.net.socket_native`, then call `serveNext` in a loop. Each call
+accepts one connection and serves it with your `ConnectionHandler` until the handler returns.
 
 ## Details
 `serveNext` serves one connection at a time, on the calling task. This module has no queue,

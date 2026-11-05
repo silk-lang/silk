@@ -1082,9 +1082,9 @@ handshake. For a file with more than one certificate, use `silk.tls.certificate_
 
 The accessors return slices of the DER, such as [`Certificate.subjectDer`](#Certificate.impl.subjectDer), and decoded values,
 such as [`Certificate.notAfter`](#Certificate.impl.notAfter). Nothing is normalized: names, algorithms, and extensions keep
-their original bytes.
-The accessors borrow the certificate. Unknown algorithms, duplicate extensions, and other values
-that a validator can reject stay available, so that `silk.tls.certificate_profile` can check them.
+their original bytes. The accessors borrow the certificate. Unknown algorithms, duplicate
+extensions, and other values that a validator can reject stay available, so that
+`silk.tls.certificate_profile` can check them.
 
 ### Gotchas
 
