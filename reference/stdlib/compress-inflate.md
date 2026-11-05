@@ -30,7 +30,8 @@ consumed.
 ## Gotchas
 Output is not verified until `Finished`, because the checksum comes at the end. If a step fails,
 discard all output of the stream. A failed decoder rejects each later step with `InvalidUse`
-until you call [`Decoder.reset`](#Decoder.impl.reset). Zlib streams with a preset dictionary are not supported.
+until you call [`Decoder.reset`](#Decoder.impl.reset). A zlib stream with a preset dictionary, or a raw stream made
+with one, needs [`Decoder.setDictionary`](#Decoder.impl.setDictionary) before the first step.
 
 ## Examples
 ### Decode a stored DEFLATE block
@@ -119,8 +120,8 @@ One raw DEFLATE stream (RFC 1951) with no header or checksum.
 Zlib
 ```
 
-One zlib stream (RFC 1950): a 2-byte header, DEFLATE data, and an Adler-32 checksum. A preset
-dictionary is not supported.
+One zlib stream (RFC 1950): a 2-byte header, an optional dictionary id, DEFLATE data, and an
+Adler-32 checksum.
 
 <a id="Format.Gzip"></a>
 
@@ -308,15 +309,25 @@ UnsupportedMethod
 
 The header names a compression method that is not DEFLATE.
 
-<a id="ErrorKind.UnsupportedDictionary"></a>
+<a id="ErrorKind.MissingDictionary"></a>
 
-### `UnsupportedDictionary`
+### `MissingDictionary`
 
 ```silk
-UnsupportedDictionary
+MissingDictionary
 ```
 
-The zlib header asks for a preset dictionary.
+The zlib header names a preset dictionary, and [`Decoder.setDictionary`](#Decoder.impl.setDictionary) loaded none.
+
+<a id="ErrorKind.DictionaryMismatch"></a>
+
+### `DictionaryMismatch`
+
+```silk
+DictionaryMismatch
+```
+
+The zlib header names a preset dictionary whose Adler-32 is not that of the loaded one.
 
 <a id="ErrorKind.InvalidBlock"></a>
 
@@ -545,8 +556,8 @@ progress. After a failure, each step fails with `InvalidUse`. [`Decoder.reset`](
 stream with the same storage.
 
 ### Gotchas
-Output is not verified until `Finished`, because the checksum comes at the end. Zlib streams
-with a preset dictionary are not supported.
+Output is not verified until `Finished`, because the checksum comes at the end. A stream made
+with a preset dictionary needs [`Decoder.setDictionary`](#Decoder.impl.setDictionary) before the first step.
 
 <a id="Decoder.impl"></a>
 
@@ -595,6 +606,26 @@ counters and the final-input state start again, and the first member counts at o
 
 #### Gotchas
 It does not erase the earlier output or the history storage.
+
+<a id="Decoder.impl.setDictionary"></a>
+
+### Method `setDictionary`
+
+```silk
+pub fn setDictionary(self: &mut Self, dictionary: &[u8]) -> Result<(), DecodeError>
+```
+
+Loads `dictionary` as the history that the stream can refer to, before the first step, as
+zlib's `inflateSetDictionary` does.
+
+#### Details
+Only the last 32 KiB are kept. A raw stream can then refer to the dictionary at once. A zlib
+stream can refer to it only if its header names the dictionary by its Adler-32; a zlib stream
+without a dictionary id decodes as if none was loaded. It does not allocate.
+
+#### Errors
+`InvalidUse` with gzip, after the first step, or after a dictionary was loaded for this
+stream. The decoder does not change.
 
 <a id="Decoder.impl.step"></a>
 
