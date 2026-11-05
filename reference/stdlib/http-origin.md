@@ -12,8 +12,8 @@ the origin, and for HTTPS checks the server certificate against the host. Use
 ## Details
 An `Origin` has no path, and does not allocate. A missing port becomes 80 for `http` and `ws`,
 and 443 for `https` and `wss`. [`Origin.authorityInto`](#Origin.impl.authorityInto) writes a lowercase domain, the canonical
-IP text, and the port only when it is not the default. A `Host` field that you give never changes the host that TLS
-checks.
+IP text, and the port only when it is not the default. A `Host` field that you give never
+changes the host that TLS checks.
 
 ## Errors
 - [`OriginError`](#OriginError) if the scheme is not `http`, `https`, `ws`, or `wss`, the URI has user

@@ -5,9 +5,9 @@
 Native WebSocket clients and split sessions over TCP and TLS.
 
 ## When to use
-Call [`connect`](#connect) to open a client session to a `ws` or `wss` URI. Call [`split`](#split) on a session over
-a `NativeTransport`, from [`connect`](#connect) or from `acceptOwned` of `silk.http.websocket_upgrade`, so
-that one fiber reads while other fibers send.
+Call [`connect`](#connect) to open a client session to a `ws` or `wss` URI. Call [`split`](#split) on a session
+over a `NativeTransport`, from [`connect`](#connect) or from `acceptOwned` of
+`silk.http.websocket_upgrade`, so that one fiber reads while other fibers send.
 
 ## Details
 [`connect`](#connect) opens the connection with `acquireOwned` of `silk.http.exchange_native`, then calls
@@ -77,6 +77,7 @@ client session.
 - `NativeExchangeError`, `ResolverError`, `NativeSocketError`, `ConnectionError`, and
   `IdentityError` from the connection, as for `acquireOwned`.
 - [`HandshakeError`](./http-websocket-client.md#HandshakeError), `ExchangeError`, `RequestError`, and `StreamError` from the handshake.
+- `OutOfMemoryError` if a buffer cannot grow.
 
 <a id="split"></a>
 
