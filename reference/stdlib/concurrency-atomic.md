@@ -16,8 +16,8 @@ The model is the C++20 model: an acquire load that reads a release store makes e
 before that store visible after the load.
 
 [`Atomic.wait`](#Atomic.impl.wait), [`Atomic.notifyOne`](#Atomic.impl.notifyOne) and [`Atomic.notifyAll`](#Atomic.impl.notifyAll) are a futex: a thread sleeps
-until the value at an address changes. They work on Darwin on x86_64 or aarch64, Linux with GNU
-libc on x86_64 or aarch64, and wasm32.
+until the value at an address changes. They work on Windows x86_64 MSVC, Darwin on x86_64 or
+aarch64, Linux with GNU libc on x86_64 or aarch64, and WebAssembly.
 
 ## Gotchas
 - A plain access that races with any other access to the same location is undefined behavior,
@@ -441,7 +441,7 @@ The comparison and the sleep are one atomic step against [`Atomic.notifyOne`](#A
 so check the condition again in a loop.
 
 It works on Windows x86_64 MSVC, Darwin on x86_64 or aarch64, Linux with GNU libc on x86_64 or
-aarch64, and wasm32. Windows rounds finite bounds up to milliseconds. A bound above the
+aarch64, and WebAssembly. Windows rounds finite bounds up to milliseconds. A bound above the
 largest finite Windows wait is clamped; its expiry is a spurious wakeup, not a reported
 timeout.
 
@@ -467,7 +467,7 @@ Wakes at least one thread blocked in [`Atomic.wait`](#Atomic.impl.wait) on `poin
 
 Store the new value before the notify. A waiter that has not yet slept sees the changed value
 and does not sleep, so the wakeup is never lost. It works on Windows x86_64 MSVC, Darwin on
-x86_64 or aarch64, Linux with GNU libc on x86_64 or aarch64, and wasm32.
+x86_64 or aarch64, Linux with GNU libc on x86_64 or aarch64, and WebAssembly.
 
 #### Safety
 
@@ -487,7 +487,7 @@ Wakes every thread blocked in [`Atomic.wait`](#Atomic.impl.wait) on `pointer`.
 
 Store the new value before the notify. A waiter that has not yet slept sees the changed value
 and does not sleep, so the wakeup is never lost. It works on Windows x86_64 MSVC, Darwin on
-x86_64 or aarch64, Linux with GNU libc on x86_64 or aarch64, and wasm32.
+x86_64 or aarch64, Linux with GNU libc on x86_64 or aarch64, and WebAssembly.
 
 #### Safety
 
