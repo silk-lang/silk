@@ -347,6 +347,8 @@ pub enum ConnectionPhase {
   Ready,
   /// An exchange is running.
   Active,
+  /// The server switched protocols. Take the transport with [`intoUpgraded`].
+  Upgraded,
   /// The connection cannot run more exchanges.
   Closed,
 }
@@ -366,6 +368,9 @@ pub enum ExchangePhase {
   Response,
   /// A `CONNECT` succeeded. Call [`withTunnel`].
   Tunnel,
+  /// The server sent 101 Switching Protocols to a request with `Upgrade`. Check the head, return
+  /// from the callback, then call [`intoUpgraded`].
+  Upgraded,
   /// The request and the response are complete.
   Finished,
   /// The exchange stopped. No more steps are possible.
@@ -540,7 +545,8 @@ pub union ExchangeError {
   LimitExceeded,
   /// The connection ended before a complete response head.
   TruncatedHead,
-  /// The server sent 101 Switching Protocols, which this module does not support.
+  /// The server sent 101 Switching Protocols to a request without `Upgrade` and `Connection:
+  /// upgrade`.
   UnsupportedUpgrade,
   /// The deadline of `Require100` passed without 100 Continue.
   ContinueTimeout,
@@ -2450,6 +2456,9 @@ pub effect fn withExchange<'exchange, 'callback, P, A, E, ?R>(
   let release = effect fn(owned: &mut Exchange<'exchange, P>) -> () {
     if owned.callbackSucceeded && owned.phaseValue == ExchangePhase.Finished && owned.reusable {
       owned.connection.phaseValue = ConnectionPhase.Ready
+    } else if owned.callbackSucceeded && owned.phaseValue == ExchangePhase.Upgraded {
+      owned.connection.phaseValue = ConnectionPhase.Upgraded
+      Encoder.abandon(&mut owned.encoder)
     } else {
       owned.connection.phaseValue = ConnectionPhase.Closed
       Encoder.abandon(&mut owned.encoder)
@@ -2715,7 +2724,19 @@ where
   let status = head.status()
   let code = Status.code(&status)
   if code == 101 {
-    fail ExchangeError.UnsupportedUpgrade
+    let asked = match move RequestParser.head(&exchange.connection.requestParser) {
+      Result.Failure {error} => {
+        fail ExchangeError.Head {error: move error}
+      }
+      Result.Success {value} => requestsUpgrade(value)
+    }
+    if !asked || head.version() != Version.Http11 {
+      fail ExchangeError.UnsupportedUpgrade
+    }
+    drop head
+    exchange.reusable = false
+    exchange.phaseValue = ExchangePhase.Upgraded
+    return code
   }
   if code < 200 {
     if exchange.informationalCount >= exchange.connection.limits.maxInformationalResponses {
@@ -2801,7 +2822,8 @@ where
   return code
 }
 
-/// Reads response heads until one is not 1xx, and returns its status.
+/// Reads response heads until one is not 1xx or is 101 Switching Protocols, and returns its
+/// status.
 ///
 /// # Details
 /// It does not copy the head and does not read the body. Get the head with [`Exchange.head`].
@@ -2812,7 +2834,7 @@ where
   &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
   while true {
     let code = run receive(&mut exchange.*)
-    if code >= 200 {
+    if code >= 200 || code == 101 {
       return code
     }
   }
@@ -3303,6 +3325,30 @@ fn requestCloses(head: RequestHead) -> bool {
   return fieldsClose(&mut fields)
 }
 
+fn requestsUpgrade(head: RequestHead) -> bool {
+  if head.version() != Version.Http11 {
+    return false
+  }
+  let mut tokens = head.fields()
+  if !fieldsHaveToken(&mut tokens, b"upgrade") {
+    return false
+  }
+  let mut fields = head.fields()
+  while true {
+    match move HeaderIterator.next(&mut fields) {
+      Option.None => {
+        return false
+      }
+      Option.Some {value} => {
+        if asciiEqual(String.utf8Bytes(Header.name(&value)), b"upgrade") {
+          return true
+        }
+      }
+    }
+  }
+  return false
+}
+
 fn fieldsClose(fields: &mut HeaderIterator) -> bool {
   return fieldsHaveToken(&mut fields.*, b"close")
 }
@@ -3494,6 +3540,72 @@ where
     written = written + count
   }
   return ()
+}
+
+/// The transport of a connection after 101 Switching Protocols, with the bytes the server sent
+/// after the response head.
+pub struct Upgraded<P> {
+  /// The transport. You own it now, and close it when you are done.
+  pub transport: P,
+  /// The bytes that came after the 101 response head. They belong to the new protocol.
+  pub buffered: Bytes,
+}
+
+/// Takes the transport out of a connection whose exchange got 101 Switching Protocols.
+///
+/// # Details
+/// The connection must be in the `Upgraded` phase, so the exchange callback must have returned
+/// after [`receive`] gave 101. Other phases fail with `InvalidState` and close the transport, and
+/// so does `OutOfMemoryError` when the buffered bytes cannot be copied.
+pub effect fn intoUpgraded<P>(connection: Connection<P>) -> Upgraded<P>
+! ExchangeError | OutOfMemoryError
+? &mut Allocator
+where &mut P provides &HttpTransport from &mut HttpTransport {
+  let Connection<P> {
+    transport,
+    origin,
+    version,
+    overallDeadline,
+    input,
+    start,
+    end,
+    eof,
+    scratch,
+    requestParser,
+    responseParser,
+    parserUsed,
+    limits,
+    phaseValue,
+    closeAuthority,
+    requests,
+  } = move connection
+  drop origin
+  drop overallDeadline
+  drop scratch
+  drop requestParser
+  drop responseParser
+  drop version
+  drop eof
+  drop parserUsed
+  drop limits
+  drop requests
+  let mut provider = move transport
+  if phaseValue != ConnectionPhase.Upgraded || closeAuthority != CloseAuthority.Armed {
+    if closeAuthority == CloseAuthority.Armed {
+      run closeProvider<P>(&mut provider)
+    }
+    fail ExchangeError.InvalidState
+  }
+  let rest = Slice.view<u8>(Bytes.asSlice(&input), start, end - start)
+  let copied = run Effect.result(Bytes.copy(rest))
+  drop rest
+  return match move copied {
+    Result.Success {value} => Upgraded<P> {transport: move provider, buffered: move value}
+    Result.Failure {error} => {
+      run closeProvider<P>(&mut provider)
+      fail move error
+    }
+  }
 }
 
 /// The connection after a successful `CONNECT`. Reads first return the bytes that came after the

@@ -1,0 +1,519 @@
+//! The client side of the WebSocket opening handshake (RFC 6455, version 13).
+//!
+//! # When to use
+//! Call [`handshake`] on a connection from `silk.http.exchange` to open a WebSocket session for a
+//! `ws` or `wss` URI. `connect` of `silk.http.websocket_native` opens the connection for you. Then
+//! use the [`WebSocket`] of `silk.http.websocket_stream`, or split it for fibers.
+//!
+//! # Details
+//! [`handshake`] sends `GET` with `Upgrade: websocket`, a fresh `Sec-WebSocket-Key` from `Random`,
+//! version 13, and the subprotocols you offer. It accepts only a 101 response with
+//! `Upgrade: websocket`, `Connection: upgrade`, and the right `Sec-WebSocket-Accept`. Bytes that the
+//! server sent after the 101 head go to the session.
+//!
+//! # Errors
+//! - [`HandshakeError`] if the server answered with another status or a wrong 101 response.
+//! - `ExchangeError`, `RequestError`, and `StreamError` from the request and the session.
+//!
+//! # Gotchas
+//! - The connection is used up: after an error it is closed.
+//! - Extensions such as `permessage-deflate` are not offered, so a response with one fails.
+//!
+//! # Examples
+//! ## Open a session over a scripted transport
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.collections.bytes { Bytes }
+//! import silk.collections.list { List }
+//! import silk.core.effect { Effect }
+//! import silk.core.option { Option }
+import silk.core.ownership { Copy }
+//! import silk.core.result { Result }
+//! import silk.io.byte_duplex { ByteDuplex, ReadTransfer }
+//! import silk.io.memory_byte_duplex { MemoryByteDuplex, MemoryReadEvent, MemoryWriteAction, MemoryWriteEvent }
+//! import silk.http.exchange as Client
+//! import silk.http.exchange { ExchangeError, Limits }
+//! import silk.http.headers { Headers }
+//! import silk.http.message { Header, ValueError, Version }
+//! import silk.http.origin { Origin, OriginError }
+//! import silk.http.request { RequestError }
+//! import silk.http.transport { HttpTransport, TransportError }
+//! import silk.http.websocket { Event }
+//! import silk.http.websocket_client { ClientOptions, HandshakeError, Opened, handshake }
+//! import silk.http.websocket_stream { StreamError }
+//! import silk.system.monotonic_clock { MonotonicClock }
+//! import silk.system.monotonic_clock_native { OsMonotonicClock }
+//! import silk.system.random { Random }
+//! import silk.system.system_clock { Instant, SystemClock }
+//! import silk.uri.reference { ParseError }
+//! import silk.uri.uri { Uri }
+//!
+//! // A transport that owns a memory duplex, so the session can own it.
+//! struct Scripted {
+//!   memory: MemoryByteDuplex,
+//! }
+//!
+//! impl HttpTransport for Scripted {
+//!   effect fn readSomeRaw(self: &mut Self, output: &mut [u8], deadline: Option<Instant>) -> ReadTransfer
+//!     ! TransportError | OutOfMemoryError
+//!     ? &mut MonotonicClock | &mut Allocator | &mut Random {
+//!     let attempted = run Effect.result(ByteDuplex.readSome(&mut output, move deadline))
+//!       |> Effect.provideMut<ByteDuplex>(&mut self.memory)
+//!     return match move attempted {
+//!       Result.Success {value} => move value
+//!       Result.Failure {error} => { fail TransportError.Plain {error: move error} }
+//!     }
+//!   }
+//!
+//!   effect fn writeSomeRaw(self: &mut Self, input: &[u8], deadline: Option<Instant>) -> usize
+//!     ! TransportError | OutOfMemoryError
+//!     ? &mut MonotonicClock | &mut Allocator | &mut Random {
+//!     let attempted = run Effect.result(ByteDuplex.writeSome(input, move deadline))
+//!       |> Effect.provideMut<ByteDuplex>(&mut self.memory)
+//!     return match move attempted {
+//!       Result.Success {value} => value
+//!       Result.Failure {error} => { fail TransportError.Plain {error: move error} }
+//!     }
+//!   }
+//!
+//!   effect fn flush(self: &mut Self, deadline: Option<Instant>) -> ()
+//!     ! TransportError | OutOfMemoryError
+//!     ? &mut MonotonicClock | &mut Allocator | &mut Random {
+//!     drop deadline
+//!     return ()
+//!   }
+//!
+//!   effect fn close(self: &mut Self) -> () ! TransportError {
+//!     return ()
+//!   }
+//! }
+//!
+//! // Always returns zero bytes, so the key is `AAAAAAAAAAAAAAAAAAAAAA==`.
+//! struct ZeroRandom {}
+//!
+//! impl Random for ZeroRandom {
+//!   effect fn fillBytes(self: &mut Self, output: &mut [u8]) -> () {
+//!     let mut index: usize = 0
+//!     while index < output.length {
+//!       output[index] = 0
+//!       index = index + 1
+//!     }
+//!     return ()
+//!   }
+//! }
+//!
+//! effect fn program() -> i32
+//!   ! HandshakeError | ExchangeError | RequestError | StreamError | OutOfMemoryError
+//!   ? &mut Allocator | &mut MonotonicClock | &mut Random {
+//!   let uri = match Uri.parse("ws://example.com/chat") {
+//!     Result<Uri, ParseError>.Success {value} => value
+//!     Result<Uri, ParseError>.Failure {..} => { return 1 }
+//!   }
+//!   let origin = match Origin.fromUri(&uri) {
+//!     Result<Origin, OriginError>.Success {value} => value
+//!     Result<Origin, OriginError>.Failure {..} => { return 2 }
+//!   }
+//!   // The 101 response, then a Text frame "hi" from the server.
+//!   let response = run Bytes.copy(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ICX+Yqv66kxgM0FcWaLWlFLwTAI=\r\n\r\n\x81\x02hi")
+//!   let mut reads = List<MemoryReadEvent>.make()
+//!   run reads.append(MemoryReadEvent.Data {readyAt: SystemClock.make(0, 0), bytes: move response})
+//!   let mut writes = List<MemoryWriteEvent>.make()
+//!   run writes.append(MemoryWriteEvent {readyAt: SystemClock.make(0, 0), action: MemoryWriteAction.Accept {count: 4096}})
+//!   let memory = run MemoryByteDuplex.make(move reads, move writes, 4096, 4, Option<i32>.none())
+//!   let connection = run Client.makeOwned(
+//!     Scripted {memory: move memory},
+//!     origin,
+//!     Version.Http11,
+//!     Limits.defaults(),
+//!     Option<Instant>.none(),
+//!   )
+//!   let entries: [Header<'static>; 0] = []
+//!   let headers = match Headers.make(&entries, Limits.defaults().head.values) {
+//!     Result<Headers, ValueError>.Success {value} => value
+//!     Result<Headers, ValueError>.Failure {..} => { return 3 }
+//!   }
+//!   let opened = run handshake(move connection, &uri, &headers, ClientOptions.defaults())
+//!   let Opened<Scripted> {socket, protocol} = move opened
+//!   if Bytes.length(&protocol) != 0 { return 4 }
+//!   let mut session = move socket
+//!   match run session.readEvent(Option<Instant>.none()) {
+//!     Event.Text {..} => {
+//!       if session.messageText() != "hi" { return 5 }
+//!     }
+//!     _ => { return 6 }
+//!   }
+//!   return 0
+//! }
+//!
+//! effect fn failed<E>(error: E) -> i32 {
+//!   drop error
+//!   return 1
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let mut clock = OsMonotonicClock.make()
+//!   let mut random = ZeroRandom {}
+//!   return run Effect.catchAll(program(), failed)
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!     |> Effect.provideMut<MonotonicClock>(&mut clock)
+//!     |> Effect.provideMut<Random>(&mut random)
+//! }
+//! ```
+//!
+//! @category Networking
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.crypto.sha1 { Sha1 }
+import silk.encoding.base64 { Base64 }
+import silk.http.exchange as Client
+import silk.http.exchange { Connection, Exchange, ExchangeError, Limits, RequestOptions, Upgraded, intoUpgraded }
+import silk.http.head { HeaderIterator, ResponseHead }
+import silk.http.headers { Headers, Limits as ValueLimits }
+import silk.http.message { Header, Method, ValueError, Version }
+import silk.http.request { BodyMode, HeaderPolicy, PreparedRequest, RequestError, fromUri }
+import silk.http.transport { HttpTransport }
+import silk.http.websocket { Role }
+import silk.http.websocket_stream { Options, StreamError, WebSocket }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.random { Random }
+import silk.system.system_clock { Instant, SystemClock }
+import silk.text.format { Debug, Format, Formatter }
+import silk.io.writer { Writer, WriterError }
+import silk.text.string { String }
+import silk.uri.uri { Uri }
+import silk.num.usize
+
+/// Why the server's answer is not a valid WebSocket handshake.
+pub union HandshakeError {
+  /// The server answered with this status instead of 101.
+  Status {
+    /// The status code.
+    pub code: u16,
+  },
+  /// The 101 response has no `Upgrade: websocket` or no `Connection: upgrade`.
+  Upgrade,
+  /// `Sec-WebSocket-Accept` is missing, repeated, or does not match the key.
+  Accept,
+  /// The server selected a subprotocol that was not offered, or sent more than one.
+  Protocol,
+  /// The server selected an extension. None are offered.
+  Extension,
+}
+
+impl Copy for HandshakeError {}
+
+impl Debug for HandshakeError {
+  /// Writes the variant and its fields, such as `Status { code: 404 }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      HandshakeError.Status {code} => {
+        let mut record = run Format.debugRecord("Status", &mut formatter)
+        run Format.debugField(&mut record, "code", &code, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      HandshakeError.Upgrade => run Format.write(&mut formatter, b"Upgrade")
+      HandshakeError.Accept => run Format.write(&mut formatter, b"Accept")
+      HandshakeError.Protocol => run Format.write(&mut formatter, b"Protocol")
+      HandshakeError.Extension => run Format.write(&mut formatter, b"Extension")
+    }
+  }
+}
+
+/// The options of [`handshake`].
+pub struct ClientOptions<'value> {
+  /// The options of the session.
+  pub stream: Options,
+  /// The subprotocols to offer, as the value of `Sec-WebSocket-Protocol`, such as `chat, v2`. With
+  /// `None`, no subprotocol is offered.
+  pub protocols: Option<&'value [u8]>,
+  /// The deadline of the handshake on the `MonotonicClock`, or `None`.
+  pub deadline: Option<Instant>,
+}
+
+impl<'value> ClientOptions<'value> {
+  /// Returns the default options: default session options, no subprotocol, and no deadline.
+  pub fn defaults() -> ClientOptions<'value> {
+    return ClientOptions<'value> {
+      stream: Options.defaults(),
+      protocols: Option<&'value [u8]>.none(),
+      deadline: Option<Instant>.none(),
+    }
+  }
+}
+
+/// An open client session and the subprotocol that the server selected.
+pub struct Opened<P> {
+  /// The session.
+  pub socket: WebSocket<P>,
+  /// The selected subprotocol, or empty when the server selected none.
+  pub protocol: Bytes,
+}
+
+/// Sends the opening handshake for `uri` on `connection`, checks the answer, and returns the open
+/// session.
+///
+/// # Details
+/// `uri` is a `ws`, `wss`, `http`, or `https` URI of the origin of `connection`. `headers` are sent
+/// too, for example `Origin` or `Cookie`. They cannot hold the fields that the handshake makes.
+///
+/// # Errors
+/// - [`HandshakeError`] if the server did not accept the handshake.
+/// - `RequestError` if the request cannot be made, for example for a conflicting field.
+/// - `ExchangeError` if the exchange fails or the deadline passes.
+/// - `StreamError` if the session options are not valid.
+///
+/// The connection is closed after any error.
+pub effect fn handshake<'value, P>(
+  connection: Connection<P>,
+  uri: &Uri<'value>,
+  headers: &Headers<'value>,
+  options: ClientOptions<'value>,
+) -> Opened<P>
+! HandshakeError | ExchangeError | RequestError | StreamError | OutOfMemoryError
+? &mut MonotonicClock | &mut Allocator | &mut Random
+where
+  &mut P provides &HttpTransport from &mut HttpTransport,
+  &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
+  let mut owned = move connection
+  let attempted = run Effect.result(requestUpgrade(&mut owned, uri, headers, &options))
+  let protocol = match move attempted {
+    Result.Success {value} => move value
+    Result.Failure {error} => {
+      let closed = run Effect.result(Client.close(&mut owned))
+      drop closed
+      return match move error {
+        HandshakeError cause => { fail cause }
+        ExchangeError cause => { fail move cause }
+        RequestError cause => { fail move cause }
+        OutOfMemoryError allocation => { fail move allocation }
+      }
+    }
+  }
+  let upgraded = run Effect.result(intoUpgraded(move owned))
+  let opened: Upgraded<P> = match move upgraded {
+    Result.Success {value} => move value
+    Result.Failure {error} => {
+      drop protocol
+      return match move error {
+        ExchangeError cause => { fail move cause }
+        OutOfMemoryError allocation => { fail move allocation }
+      }
+    }
+  }
+  let Upgraded<P> {transport, buffered} = move opened
+  let socket = run WebSocket.make(move transport, Role.Client, options.stream, Bytes.asSlice(&buffered))
+  return Opened<P> {socket: move socket, protocol: move protocol}
+}
+
+// Runs the exchange of the handshake, and returns the selected subprotocol.
+effect fn requestUpgrade<'value, P>(
+  connection: &mut Connection<P>,
+  uri: &Uri<'value>,
+  headers: &Headers<'value>,
+  options: &ClientOptions<'value>,
+) -> Bytes
+! HandshakeError | ExchangeError | RequestError | OutOfMemoryError
+? &mut MonotonicClock | &mut Allocator | &mut Random
+where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
+  let mut nonce: [u8; 16] = [0; 16]
+  run Random.fillBytes(&mut nonce)
+  let mut key: [u8; 24] = [0; 24]
+  if let Result.Failure {error} = move Base64.encodeInto(&mut key, &nonce) {
+    drop error
+    return Intrinsic.trap("WebSocket: a 16 byte key always fits 24 Base64 bytes")
+  }
+  let expected = acceptFor(&key)
+  let limits = Limits.defaults().head.values
+  let mut entries = List<Header>.make()
+  let mut fields = headers.iter()
+  while true {
+    match move fields.next() {
+      Option.None => { break }
+      Option.Some {value} => { run entries.append(value) }
+    }
+  }
+  run entries.append(run header("Sec-WebSocket-Key", &key, limits))
+  run entries.append(run header("Sec-WebSocket-Version", b"13", limits))
+  if let Option.Some {value: offered} = options.protocols {
+    run entries.append(run header("Sec-WebSocket-Protocol", offered, limits))
+  }
+  let all = match move Headers.make(entries.asSlice(), limits) {
+    Result.Success {value} => value
+    Result.Failure {error} => { fail RequestError.Value {error: move error} }
+  }
+  let mut policy = HeaderPolicy.defaults()
+  policy.upgrade = Option<&[u8]>.some(b"websocket")
+  let request = run fromUri(uri, Version.Http11, Method.get(), &all, &policy, BodyMode.Empty, false, limits, 8192, 1024)
+  let mut requestOptions = RequestOptions.defaults()
+  requestOptions.deadline = copyDeadline(&options.deadline)
+  let offered = options.protocols
+  let exchange = effect fn(exchange: &mut Exchange<P>) -> Bytes
+  ! HandshakeError | ExchangeError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator | &mut Random {
+    run Client.send(&mut exchange.*)
+    let empty: [Header<'static>; 0] = []
+    let trailers = match Headers.make(&empty, limits) {
+      Result.Success {value} => value
+      Result.Failure {..} => Intrinsic.trap("WebSocket: empty trailers are always valid")
+    }
+    run Client.finishRequest(&mut exchange.*, &trailers)
+    let status = run Client.receiveFinal(&mut exchange.*)
+    if status != 101 {
+      fail HandshakeError.Status {code: status}
+    }
+    let head = run exchange.head()
+    return run checkResponse(&head, &expected, offered)
+  }
+  return run Client.withExchange(&mut connection.*, &request, move requestOptions, move exchange)
+}
+
+effect fn header<'a>(name: string<'a>, value: &'a [u8], limits: ValueLimits) -> Header<'a> ! RequestError {
+  return match move Header.make(name, value, limits) {
+    Result.Success {value: made} => made
+    Result.Failure {error} => { fail RequestError.Value {error: move error} }
+  }
+}
+
+// Returns the `Sec-WebSocket-Accept` value for `key`.
+fn acceptFor(key: &[u8]) -> [u8; 28] {
+  let mut hash = Sha1.make()
+  hash.update(key)
+  hash.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+  let digest = hash.finish()
+  let mut accept: [u8; 28] = [0; 28]
+  if let Result.Failure {error} = move Base64.encodeInto(&mut accept, &digest) {
+    drop error
+    return Intrinsic.trap("WebSocket: a 20 byte digest always fits 28 Base64 bytes")
+  }
+  return accept
+}
+
+// Checks the fields of the 101 response, and returns a copy of the selected subprotocol.
+effect fn checkResponse(head: &ResponseHead, expected: &[u8; 28], offered: Option<&[u8]>) -> Bytes
+! HandshakeError | OutOfMemoryError
+? &mut Allocator {
+  let mut upgrade = false
+  let mut connection = false
+  let mut accepts = usize.ZERO
+  let mut accepted = false
+  let mut protocols = usize.ZERO
+  let mut selected = Bytes.make()
+  let mut fields = head.fields()
+  while true {
+    match move fields.next() {
+      Option.None => { break }
+      Option.Some {value} => {
+        let name = String.utf8Bytes(value.name())
+        let content = trim(value.value())
+        if folded(name, b"upgrade") {
+          upgrade = folded(content, b"websocket")
+        } else if folded(name, b"connection") {
+          if hasToken(content, b"upgrade") { connection = true }
+        } else if folded(name, b"sec-websocket-accept") {
+          accepts = accepts + usize.ONE
+          accepted = same(content, expected)
+        } else if folded(name, b"sec-websocket-extensions") {
+          fail HandshakeError.Extension
+        } else if folded(name, b"sec-websocket-protocol") {
+          protocols = protocols + usize.ONE
+          Bytes.clear(&mut selected)
+          run Bytes.append(&mut selected, content)
+        }
+      }
+    }
+  }
+  if !upgrade || !connection {
+    fail HandshakeError.Upgrade
+  }
+  if accepts != usize.ONE || !accepted {
+    fail HandshakeError.Accept
+  }
+  if protocols > usize.ONE {
+    fail HandshakeError.Protocol
+  }
+  if protocols == usize.ONE {
+    let list = match offered {
+      Option.None => { fail HandshakeError.Protocol }
+      Option.Some {value} => value
+    }
+    if !hasExactToken(list, Bytes.asSlice(&selected)) {
+      fail HandshakeError.Protocol
+    }
+  }
+  return move selected
+}
+
+fn copyDeadline(value: &Option<Instant>) -> Option<Instant> {
+  return match &value.* {
+    Option.None => Option<Instant>.none()
+    Option.Some {value: present} => Option<Instant>.some(
+      SystemClock.make(SystemClock.seconds(&present), SystemClock.nanoseconds(&present)),
+    )
+  }
+}
+
+fn lower(byte: u8) -> u8 {
+  if byte >= 65 && byte <= 90 { return byte + 32 }
+  return byte
+}
+
+// Compares ASCII bytes without case.
+fn folded(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut index = usize.ZERO
+  while index < left.length {
+    if lower(left[index]) != lower(right[index]) { return false }
+    index = index + usize.ONE
+  }
+  return true
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut index = usize.ZERO
+  while index < left.length {
+    if left[index] != right[index] { return false }
+    index = index + usize.ONE
+  }
+  return true
+}
+
+fn space(byte: u8) -> bool { return byte == 32 || byte == 9 }
+
+fn trim(bytes: &[u8]) -> &[u8] {
+  let mut start = usize.ZERO
+  let mut end = bytes.length
+  while start < end && space(bytes[start]) { start = start + usize.ONE }
+  while end > start && space(bytes[end - usize.ONE]) { end = end - usize.ONE }
+  return Slice.view<u8>(bytes, start, end - start)
+}
+
+// Whether the comma list `list` has `token`, without case.
+fn hasToken(list: &[u8], token: &[u8]) -> bool {
+  return findToken(list, token, true)
+}
+
+// Whether the comma list `list` has `token` with the same case.
+fn hasExactToken(list: &[u8], token: &[u8]) -> bool {
+  return findToken(list, token, false)
+}
+
+fn findToken(list: &[u8], token: &[u8], ignoreCase: bool) -> bool {
+  let mut start = usize.ZERO
+  while start <= list.length {
+    let mut end = start
+    while end < list.length && list[end] != 44 { end = end + usize.ONE }
+    let item = trim(Slice.view<u8>(list, start, end - start))
+    if ignoreCase && folded(item, token) { return true }
+    if !ignoreCase && same(item, token) { return true }
+    start = end + usize.ONE
+  }
+  return false
+}
