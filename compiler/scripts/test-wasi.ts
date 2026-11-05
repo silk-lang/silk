@@ -108,7 +108,7 @@ const program = Effect.gen(function* () {
         env: { ...env, SILK_CLANG: '/nonexistent' },
       })
       assert.equal(rebuilt.status, 0, rebuilt.stderr.toString())
-      const built = join(directory, 'build/llvm/wasm32-wasip1/debug/wasi-test')
+      const built = join(directory, 'build/direct/wasm32-wasip1/debug/wasi-test')
       assert.ok(yield* fs.exists(`${built}.units/code`), 'the build keeps its code cache')
       const exited = yield* invoke(wasmtime, ['run', built])
       assert.equal(exited.status, status, exited.stderr.toString())

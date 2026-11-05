@@ -2797,7 +2797,9 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: '/nonexistent' },
   )
   assert.equal(direct.status, 0, direct.stderr)
-  const directModule = new WebAssembly.Module(yield* fs.readFile(threadedPath))
+  // Each backend keeps its own output directory.
+  const directPath = join(threads, 'build/direct/wasm32-unknown-unknown/web/threads')
+  const directModule = new WebAssembly.Module(yield* fs.readFile(directPath))
   assert.deepEqual(
     WebAssembly.Module.imports(directModule)
       .map((entry) => `${entry.module}.${entry.name}`)
@@ -2806,7 +2808,7 @@ const program = Effect.gen(function* () {
   )
   const directRun = yield* invoke(
     process.execPath,
-    [join(standardLibrary, 'host/wasm-runner.mjs'), threadedPath],
+    [join(standardLibrary, 'host/wasm-runner.mjs'), directPath],
     directory,
     process.env,
   )
@@ -2968,7 +2970,7 @@ const program = Effect.gen(function* () {
     assert.equal(wideBuild.status, 0, wideBuild.stderr)
     const wideRun = yield* invoke(
       process.execPath,
-      [join(standardLibrary, 'host/wasm-runner.mjs'), join(arena, 'build/llvm/wasm64-unknown-unknown/web64/arena')],
+      [join(standardLibrary, 'host/wasm-runner.mjs'), join(arena, `build/${backend}/wasm64-unknown-unknown/web64/arena`)],
       directory,
       process.env,
     )

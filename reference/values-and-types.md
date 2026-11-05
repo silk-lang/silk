@@ -543,7 +543,8 @@ conversion and engine tests.
 
 `string` is a Copy immutable view of valid UTF-8, distinct from every scalar and from `&[u8]`.
 An ordinary text literal has type `string<'static>`. A byte-string literal has type
-`&[u8]` and preserves exact bytes.
+`&[u8]` and preserves exact bytes. Both are static values, so a constant, or a struct field or
+array element of one, can hold either.
 
 ```silk
 fn greeting() -> string {
@@ -601,8 +602,8 @@ string type diagnostics.
 **Status:** Confirmed
 
 A `const` declaration requires a type annotation. Its type is `bool`, `char`, a supported integer
-or floating-point primitive, `string`, a fixed array of such types, or a nominal type whose value
-static evaluation admits: a scalar enum or a cleanup-free struct
+or floating-point primitive, `string`, the byte view `&'static [u8]`, a fixed array of such types,
+or a nominal type whose value static evaluation admits: a scalar enum or a cleanup-free struct
 ([STATIC-005](static-evaluation.md#static-005--static-values-are-reusable-data-not-observable-compile-time-storage)).
 Its initializer is a statically evaluated expression that must produce exactly the declared type
 for the selected target. Constants do not infer their type.
@@ -613,6 +614,7 @@ const ratio: f64 = 1.5
 const enabled: bool = true
 const separator: char = ','
 const pattern: string = r"\d+"
+const magic: &'static [u8] = b"\x00asm"
 const squares: [u32; 4] = [0, 1, 4, 9]
 
 struct Point {
@@ -630,8 +632,8 @@ type, embedded with no runtime initializer, call, or cleanup. Reading a constant
 a constant reads as part of that value. A constant has no address of its own: it cannot be
 assigned or mutably borrowed, and whether two reads share storage is unobservable.
 
-**Boundary:** Type inference, Drop types, owners of allocated memory, references, raw pointers,
-tuples, records, unions, generic parameters, ordinary function calls, Effects, service
+**Boundary:** Type inference, Drop types, owners of allocated memory, references other than
+`&'static [u8]`, raw pointers, tuples, records, unions, generic parameters, ordinary function calls, Effects, service
 requirements, unsafe operations, and observable allocations are unavailable in constant
 initialization. A wrong result type, dependency cycle, selected-target range failure, or static
 evaluation failure exposes no usable constant value.
