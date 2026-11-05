@@ -241,12 +241,13 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     secureProxy: Option<ProxyConfig>,
     plainProxy: Option<ProxyConfig>,
     noProxy: Bytes,
-    idle: List<IdleConnection>,
+    idle: List<Box<IdleConnection>>,
     concurrencyValue: usize,
   }
 
   // A direct connection that finished its last exchange and stayed open, kept for the next request
-  // to the same origin. The client keeps up to `MAX_IDLE` of them.
+  // to the same origin. The client keeps up to `MAX_IDLE` of them, each boxed: a TLS connection
+  // holds kilobytes of record state, and a box moves as one pointer between the pool and a task.
   struct IdleConnection {
     origin: Origin,
     connection: Connection<NativeTransport>,
@@ -291,7 +292,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
         secureProxy: Option<ProxyConfig>.none(),
         plainProxy: Option<ProxyConfig>.none(),
         noProxy: Bytes.make(),
-        idle: List<IdleConnection>.make(),
+        idle: List<Box<IdleConnection>>.make(),
         concurrencyValue: DEFAULT_CONCURRENCY,
       }
     }
@@ -1146,14 +1147,14 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     // every reused request.
     let mut slot = Option<usize>.none()
     let mut found = usize.MAX
-    let pool = List<IdleConnection>.asSlice(&client.idle)
+    let pool = List<Box<IdleConnection>>.asSlice(&client.idle)
     let mut scan = usize.ZERO
     while scan < pool.length {
-      if Origin.equals(&pool[scan].origin, &origin) { found = scan }
+      if Origin.equals(&Box<IdleConnection>.get(&pool[scan])[usize.ZERO].origin, &origin) { found = scan }
       scan = scan + usize.ONE
     }
     if found != usize.MAX {
-      if method.idempotent() || ExchangeNative.reusable(&pool[found].connection) {
+      if method.idempotent() || ExchangeNative.reusable(&Box<IdleConnection>.get(&pool[found])[usize.ZERO].connection) {
         slot = Option<usize>.some(found)
       } else {
         run discard(&mut client.idle, found)
@@ -1196,7 +1197,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   // exchange afterwards stays there; any other is closed. A new connection to an origin past
   // `MAX_IDLE` replaces the oldest one.
   effect fn exchangeKept(
-    idle: &mut List<IdleConnection>,
+    idle: &mut List<Box<IdleConnection>>,
     slot: Option<usize>,
     origin: Origin,
     options: &Options,
@@ -1229,11 +1230,12 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       trust = Option<TrustSnapshot>.some(run TrustSource.load(options.trust))
     }
     let connection = run ExchangeNative.acquireOwned(origin, copyOptions(options), limits, move trust, Option<Instant>.none())
-    if List<IdleConnection>.length(&idle.*) >= MAX_IDLE {
+    if List<Box<IdleConnection>>.length(&idle.*) >= MAX_IDLE {
       run discard(&mut idle.*, usize.ZERO)
     }
-    run List<IdleConnection>.append(&mut idle.*, IdleConnection {origin: origin, connection: move connection})
-    let index = List<IdleConnection>.length(&idle.*) - usize.ONE
+    let boxed = run Box<IdleConnection>.make(IdleConnection {origin: origin, connection: move connection})
+    run List<Box<IdleConnection>>.append(&mut idle.*, move boxed)
+    let index = List<Box<IdleConnection>>.length(&idle.*) - usize.ONE
     let result = run Effect.result(exchangeIdle(&mut idle.*, index, exchange))
     return match move result {
       Result.Success {value} => {
@@ -1267,18 +1269,19 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   }
 
   // Runs one exchange on the connection at `index` in `idle`.
-  effect fn exchangeIdle(idle: &mut List<IdleConnection>, index: usize, exchange: Direct) -> Received
+  effect fn exchangeIdle(idle: &mut List<Box<IdleConnection>>, index: usize, exchange: Direct) -> Received
   ! HttpError | ExchangeError | OutOfMemoryError
   ? &mut Allocator | &mut MonotonicClock | &mut Random {
-    let kept = List<IdleConnection>.asMutSlice(&mut idle.*)
-    return run exchangeOn(&mut kept[index].connection, exchange.request, exchange.body, exchange.deadline, exchange.maxBody)
+    let kept = List<Box<IdleConnection>>.asMutSlice(&mut idle.*)
+    let open = &mut Box<IdleConnection>.getMut(&mut kept[index])[usize.ZERO]
+    return run exchangeOn(&mut open.connection, exchange.request, exchange.body, exchange.deadline, exchange.maxBody)
   }
 
   // Keeps the connection at `index` for the next request when it can run another exchange, and
   // closes it otherwise.
-  effect fn settle(idle: &mut List<IdleConnection>, index: usize) -> () {
-    let kept = List<IdleConnection>.asSlice(&idle.*)
-    let eligible = match Exchange.reuseEligibility<NativeTransport>(&kept[index].connection) {
+  effect fn settle(idle: &mut List<Box<IdleConnection>>, index: usize) -> () {
+    let kept = List<Box<IdleConnection>>.asSlice(&idle.*)
+    let eligible = match Exchange.reuseEligibility<NativeTransport>(&Box<IdleConnection>.get(&kept[index])[usize.ZERO].connection) {
       ReuseEligibility.Eligible => true
       _ => false
     }
@@ -1289,9 +1292,9 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   }
 
   // Closes the connection at `index` and removes it from `idle`.
-  effect fn discard(idle: &mut List<IdleConnection>, index: usize) -> () {
-    let mut removed = List<IdleConnection>.remove(&mut idle.*, index)
-    let closed = run Effect.result(Exchange.close(&mut removed.connection))
+  effect fn discard(idle: &mut List<Box<IdleConnection>>, index: usize) -> () {
+    let mut removed = List<Box<IdleConnection>>.remove(&mut idle.*, index)
+    let closed = run Effect.result(Exchange.close(&mut Box<IdleConnection>.getMut(&mut removed)[usize.ZERO].connection))
     drop closed
     drop removed
     return ()
@@ -1539,13 +1542,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     if List<Box<PendingJob>>.length(&jobs) == usize.ZERO {
       return List<Result<Received, HttpError | OutOfMemoryError>>.make()
     }
-    let mut idle = List<Box<IdleConnection>>.make()
-    while true {
-      match List<IdleConnection>.pop(&mut client.idle) {
-        Option.None => { break }
-        Option.Some {value} => run List<Box<IdleConnection>>.append(&mut idle, run Box<IdleConnection>.make(move value))
-      }
-    }
+    let idle = Intrinsic.replace(client.idle, List<Box<IdleConnection>>.make())
     let mut scheduler = LocalScheduler.make()
     let outcome = run Effect.result(scheduler.execute<Round, OutOfMemoryError | TaskIdExhaustedError | Cancelled>(
       runJobs(move jobs, move idle, client.concurrencyValue),
@@ -1560,14 +1557,9 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       }
     }
     let Round {results, idle: kept} = move round
-    let mut open = move kept
-    while true {
-      match List<Box<IdleConnection>>.pop(&mut open) {
-        Option.None => { break }
-        Option.Some {value} => run List<IdleConnection>.append(&mut client.idle, Box<IdleConnection>.into(move value))
-      }
-    }
-    while List<IdleConnection>.length(&client.idle) > MAX_IDLE {
+    let previous = Intrinsic.replace(client.idle, move kept)
+    drop previous
+    while List<Box<IdleConnection>>.length(&client.idle) > MAX_IDLE {
       run discard(&mut client.idle, usize.ZERO)
     }
     return move results
@@ -1746,21 +1738,17 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   }
 
   effect fn closeIdle(stale: Box<IdleConnection>) -> () ? &mut MonotonicClock {
-    let mut closing = Box<IdleConnection>.into(move stale)
-    let closed = run Effect.result(Exchange.close(&mut closing.connection))
+    let mut closing = move stale
+    let closed = run Effect.result(Exchange.close(&mut Box<IdleConnection>.getMut(&mut closing)[usize.ZERO].connection))
     drop closed
   }
 
   // One task of a round. Its clock parks only this task while the socket waits.
   effect fn runJob(job: Job) -> JobOutcome ? &mut MonotonicClock {
     let mut allocator = Allocator.systemAllocatorProvider()
-    let mut idle = List<IdleConnection>.make()
+    let mut idle = List<Box<IdleConnection>>.make()
     let received = run Effect.result(jobExchange(&mut idle, move job) |> Effect.provideMut<Allocator>(&mut allocator))
-    let mut kept = Option<Box<IdleConnection>>.none()
-    if let Option.Some {value} = List<IdleConnection>.pop(&mut idle) {
-      let boxed = run Effect.result(Box<IdleConnection>.make(move value) |> Effect.provideMut<Allocator>(&mut allocator))
-      if let Result.Success {value: open} = move boxed { kept = Option<Box<IdleConnection>>.some(move open) }
-    }
+    let kept = List<Box<IdleConnection>>.pop(&mut idle)
     return JobOutcome {received: move received, kept: move kept}
   }
 
@@ -1782,13 +1770,13 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
 
   impl TrustSource for JobTrust { load: JobTrust.loadFor }
 
-  effect fn jobExchange(idle: &mut List<IdleConnection>, job: Job) -> Received
+  effect fn jobExchange(idle: &mut List<Box<IdleConnection>>, job: Job) -> Received
   ! HttpError | OutOfMemoryError
   ? &mut Allocator | &mut MonotonicClock {
     let Job {pending: boxed, connection} = move job
     let mut slot = Option<usize>.none()
     if let Option.Some {value} = move connection {
-      run List<IdleConnection>.append(&mut idle.*, Box<IdleConnection>.into(move value))
+      run List<Box<IdleConnection>>.append(&mut idle.*, move value)
       slot = Option<usize>.some(usize.ZERO)
     }
     let pending = move boxed
