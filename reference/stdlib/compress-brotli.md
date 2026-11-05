@@ -522,7 +522,9 @@ pub effect fn make(limits: BrotliLimits) -> Self
 
 Returns a decoder that uses `limits`, with storage from the ambient `Allocator`.
 
-It allocates the window and the workspace. [`Brotli.step`](#Brotli.impl.step) does not allocate.
+It allocates the window and the workspace. [`Brotli.step`](#Brotli.impl.step) does not allocate. Both come from
+`Allocator.allocateZeroed`, so with the system allocator a large window takes memory only as
+the stream fills it.
 
 #### Errors
 - [`BrotliError`](#BrotliError) with `WorkspaceLimit` if `workspaceBytes` is too small for the fixed state,
