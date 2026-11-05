@@ -87,6 +87,7 @@ import silk.num.u64
 import silk.num.u8
 import silk.num.usize
 import silk.collections.list { List }
+import silk.collections.bytes { Bytes }
 import silk.io.writer { Writer, WriterError }
 import silk.core.effect { Effect }
 import silk.collections.slice { Slice }
@@ -1251,4 +1252,688 @@ fn inputError(reason: JsonReason, offset: usize) -> JsonError {
     required: Option<usize>.none(),
     available: Option<usize>.none(),
   }
+}
+
+/// A parsed JSON document kept in two flat buffers: one record for each value, in source order,
+/// and the decoded text of every string and key.
+///
+/// # When to use
+///
+/// Use it to read a document. Parsing allocates about two buffers in all, instead of one for each
+/// string, array, and object as [`Json.parse`] does, and dropping it frees only those buffers. Use
+/// a [`Value`] tree when you need to build or change a document; [`JsonDocument.toValue`] makes one.
+///
+/// # Details
+///
+/// A value is named by a [`JsonNode`], a position in its document. An array record is followed by
+/// its elements, and an object record by each key and its value, so a node's children are the
+/// records after it. Each array and object knows where its last child ends, so skipping a value is
+/// one step.
+///
+/// # Gotchas
+///
+/// A `JsonNode` is only meaningful with the document that returned it. With another document it
+/// names some other value or traps.
+///
+/// # Examples
+/// ## Read fields of a parsed document
+/// ```silk
+/// import silk.mem.allocator { Allocator, OutOfMemoryError }
+/// import silk.core.effect { Effect }
+/// import silk.core.option { Option }
+/// import silk.json.scanner { JsonError }
+/// import silk.json.value { JsonDocument, JsonNode }
+///
+/// effect fn read() -> i32 ! JsonError | OutOfMemoryError ? &mut Allocator {
+///   let document = run JsonDocument.parse(b"{\"name\":\"Ada\",\"tags\":[1,2,3]}")
+///   let root = JsonDocument.root(&document)
+///   let tags = match JsonDocument.field(&document, root, "tags") {
+///     Option<JsonNode>.Some { value } => value
+///     Option<JsonNode>.None => { return 1 }
+///   }
+///   if JsonDocument.length(&document, tags) != 3 {
+///     return 2
+///   }
+///   let name = match JsonDocument.field(&document, root, "name") {
+///     Option<JsonNode>.Some { value } => value
+///     Option<JsonNode>.None => { return 3 }
+///   }
+///   return match JsonDocument.asString(&document, name) {
+///     Option<string>.Some { value } => if value == "Ada" { 0 } else { 4 }
+///     Option<string>.None => 4
+///   }
+/// }
+///
+/// effect fn program() -> i32 ! JsonError | OutOfMemoryError {
+///   let mut allocator = Allocator.systemAllocatorProvider()
+///   return run read() |> Effect.provideMut<Allocator>(&mut allocator)
+/// }
+///
+/// effect fn failed(error: JsonError | OutOfMemoryError) -> i32 {
+///   return 5
+/// }
+///
+/// pub fn main() -> i32 {
+///   return run Effect.catchAll(program(), failed)
+/// }
+/// ```
+pub struct JsonDocument {
+  slots: List<DocumentSlot>,
+  text: Bytes,
+}
+
+/// One value in a [`JsonDocument`]: its position in the document.
+pub struct JsonNode {
+  index: usize,
+}
+
+impl Copy for JsonNode {}
+
+/// The kind of a value in a [`JsonDocument`].
+pub enum JsonKind {
+  /// JSON `null`.
+  Null,
+  /// JSON `true` or `false`.
+  Bool,
+  /// A JSON number.
+  Number,
+  /// A JSON string.
+  String,
+  /// A JSON array.
+  Array,
+  /// A JSON object.
+  Object,
+}
+
+/// One member of an object in a [`JsonDocument`]: the node of its key, which is a string, and the
+/// node of its value.
+pub struct JsonMember {
+  /// The key, a string node.
+  pub key: JsonNode,
+  /// The value.
+  pub value: JsonNode,
+}
+
+impl Copy for JsonMember {}
+
+/// The elements of an array in a [`JsonDocument`], in source order. [`JsonDocument.items`] makes it.
+pub struct JsonItems {
+  position: usize,
+  end: usize,
+}
+
+/// The members of an object in a [`JsonDocument`], in source order. [`JsonDocument.members`] makes
+/// it.
+pub struct JsonMembers {
+  position: usize,
+  end: usize,
+}
+
+impl JsonItems {
+  /// Returns the next element, or an absent option after the last one. `document` must be the one
+  /// that made these items.
+  pub fn next(self: &mut Self, document: &JsonDocument) -> Option<JsonNode> {
+    if self.position >= self.end { return Option<JsonNode>.none() }
+    let node = JsonNode { index: self.position }
+    self.position = slotEnd(&document.slots, self.position)
+    return Option<JsonNode>.some(node)
+  }
+}
+
+impl JsonMembers {
+  /// Returns the next member, or an absent option after the last one. `document` must be the one
+  /// that made these members.
+  pub fn next(self: &mut Self, document: &JsonDocument) -> Option<JsonMember> {
+    if self.position >= self.end { return Option<JsonMember>.none() }
+    let key = self.position
+    self.position = slotEnd(&document.slots, key + usize.ONE)
+    return Option<JsonMember>.some(JsonMember { key: JsonNode { index: key }, value: JsonNode { index: key + usize.ONE } })
+  }
+}
+
+impl JsonDocument {
+  /// Parses `bytes` as one complete JSON document.
+  ///
+  /// # Details
+  ///
+  /// Parsing is strict (RFC 8259), with the same rules and errors as [`Json.parse`]: no comments,
+  /// no trailing commas, no duplicate keys, nesting at most 64 deep, and nothing after the value.
+  /// String escapes are decoded when the document is parsed, and numbers are converted to a
+  /// [`JsonNumber`].
+  ///
+  /// # Errors
+  ///
+  /// - `JsonError` if `bytes` is not one valid JSON value, with the reason and offset that
+  ///   [`Json.parse`] reports.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the buffers.
+  pub effect fn parse(bytes: &[u8]) -> JsonDocument ! JsonError | OutOfMemoryError ? &mut Allocator {
+    let mut cursor = TreeCursor { index: usize.ZERO, depth: usize.ZERO, failed: false }
+    let mut document = JsonDocument { slots: List<DocumentSlot>.make(), text: Bytes.make() }
+    // A value takes at least 2 bytes of the text but for a lone digit, and the decoded strings are
+    // never longer than the text.
+    run List<DocumentSlot>.reserve(&mut document.slots, bytes.length / 8 + 4)
+    run Bytes.reserve(&mut document.text, bytes.length / 2)
+    // The hashes of the keys of each object being parsed, for the duplicate check.
+    let mut keys = List<u64>.make()
+    run documentItem(bytes, &mut cursor, &mut document, &mut keys)
+    if !cursor.failed && JsonSyntax.skipWhitespace(bytes, cursor.index) == bytes.length {
+      return move document
+    }
+    drop document
+    // The scanner path reports the error where it is.
+    let tree = run parseScanned(bytes)
+    return run JsonDocument.fromValue(&tree)
+  }
+
+  /// Returns a document that holds a copy of `value`.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the buffers.
+  pub effect fn fromValue(value: &Value) -> JsonDocument ! OutOfMemoryError ? &mut Allocator {
+    let mut document = JsonDocument { slots: List<DocumentSlot>.make(), text: Bytes.make() }
+    run copyValue(&mut document, value)
+    return move document
+  }
+
+  /// Returns the node of the whole document.
+  pub fn root(self: &Self) -> JsonNode {
+    return JsonNode { index: usize.ZERO }
+  }
+
+  /// Returns the kind of `node`.
+  pub fn kind(self: &Self, node: JsonNode) -> JsonKind {
+    let kind = slotKind(&self.slots, node.index)
+    if kind == SLOT_NULL { return JsonKind.Null }
+    if kind <= SLOT_TRUE { return JsonKind.Bool }
+    if kind <= SLOT_FLOAT { return JsonKind.Number }
+    if kind == SLOT_STRING { return JsonKind.String }
+    if kind == SLOT_ARRAY { return JsonKind.Array }
+    return JsonKind.Object
+  }
+
+  /// Returns the value of a boolean. Returns an absent option if `node` is not a boolean.
+  pub fn asBool(self: &Self, node: JsonNode) -> Option<bool> {
+    let kind = slotKind(&self.slots, node.index)
+    if kind == SLOT_FALSE { return Option<bool>.some(false) }
+    if kind == SLOT_TRUE { return Option<bool>.some(true) }
+    return Option<bool>.none()
+  }
+
+  /// Returns the value of a number. Returns an absent option if `node` is not a number.
+  pub fn asNumber(self: &Self, node: JsonNode) -> Option<JsonNumber> {
+    let slot = List<DocumentSlot>.get(&self.slots, node.index)
+    let kind = u64.bitAnd(slot.info, 255)
+    if kind == SLOT_INTEGER { return Option<JsonNumber>.some(JsonNumber.Integer { value: u64.wrappingToI64(slot.payload) }) }
+    if kind == SLOT_UNSIGNED { return Option<JsonNumber>.some(JsonNumber.Unsigned { value: slot.payload }) }
+    if kind == SLOT_FLOAT { return Option<JsonNumber>.some(JsonNumber.Float { value: f64.fromBits(slot.payload) }) }
+    return Option<JsonNumber>.none()
+  }
+
+  /// Returns the text of a string, with escapes decoded. Returns an absent option if `node` is not
+  /// a string. The text is borrowed from the document.
+  pub fn asString<'a>(self: &'a Self, node: JsonNode) -> Option<string<'a>> {
+    let slot = List<DocumentSlot>.get(&self.slots, node.index)
+    if u64.bitAnd(slot.info, 255) != SLOT_STRING { return Option<string<'a>>.none() }
+    return Option<string<'a>>.some(slotText(&self.*, slot))
+  }
+
+  /// Returns the number of elements of an array or members of an object, or 0 for any other value.
+  pub fn length(self: &Self, node: JsonNode) -> usize {
+    let slot = List<DocumentSlot>.get(&self.slots, node.index)
+    let kind = u64.bitAnd(slot.info, 255)
+    if kind != SLOT_ARRAY && kind != SLOT_OBJECT { return usize.ZERO }
+    return u64.toUsize(u64.shiftRight(slot.info, 8))
+  }
+
+  /// Returns the elements of an array, or no elements if `node` is not an array.
+  pub fn items(self: &Self, node: JsonNode) -> JsonItems {
+    let slot = List<DocumentSlot>.get(&self.slots, node.index)
+    if u64.bitAnd(slot.info, 255) != SLOT_ARRAY { return JsonItems { position: usize.ZERO, end: usize.ZERO } }
+    return JsonItems { position: node.index + usize.ONE, end: u64.toUsize(slot.payload) }
+  }
+
+  /// Returns the members of an object, or no members if `node` is not an object.
+  pub fn members(self: &Self, node: JsonNode) -> JsonMembers {
+    let slot = List<DocumentSlot>.get(&self.slots, node.index)
+    if u64.bitAnd(slot.info, 255) != SLOT_OBJECT { return JsonMembers { position: usize.ZERO, end: usize.ZERO } }
+    return JsonMembers { position: node.index + usize.ONE, end: u64.toUsize(slot.payload) }
+  }
+
+  /// Returns the value of member `key` of an object. Returns an absent option if `node` is not an
+  /// object or has no such key.
+  pub fn field(self: &Self, node: JsonNode, key: string) -> Option<JsonNode> {
+    let mut members = JsonDocument.members(self, node)
+    while true {
+      match JsonMembers.next(&mut members, self) {
+        Option<JsonMember>.Some { value } => {
+          let text = slotText(self, List<DocumentSlot>.get(&self.slots, value.key.index))
+          if text == key { return Option<JsonNode>.some(value.value) }
+        }
+        Option<JsonMember>.None => { break }
+      }
+    }
+    return Option<JsonNode>.none()
+  }
+
+  /// Returns a [`Value`] tree that holds a copy of `node` and everything in it.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the tree.
+  pub effect fn toValue(self: &Self, node: JsonNode) -> Value ! OutOfMemoryError ? &mut Allocator {
+    let slot = List<DocumentSlot>.get(&self.slots, node.index)
+    let kind = u64.bitAnd(slot.info, 255)
+    if kind == SLOT_ARRAY {
+      let mut values = run List<Value>.makeWithCapacity(u64.toUsize(u64.shiftRight(slot.info, 8)))
+      let mut items = JsonDocument.items(self, node)
+      while true {
+        match JsonItems.next(&mut items, self) {
+          Option<JsonNode>.Some { value } => run List<Value>.append(&mut values, run JsonDocument.toValue(self, value))
+          Option<JsonNode>.None => { break }
+        }
+      }
+      return Value.Array { values: move values }
+    }
+    if kind == SLOT_OBJECT {
+      let mut entries = run List<JsonEntry>.makeWithCapacity(u64.toUsize(u64.shiftRight(slot.info, 8)))
+      let mut members = JsonDocument.members(self, node)
+      while true {
+        match JsonMembers.next(&mut members, self) {
+          Option<JsonMember>.Some { value } => {
+            let keySlot = List<DocumentSlot>.get(&self.slots, value.key.index)
+            let key = unsafe String.fromBytesUnchecked(run Bytes.copy(String.utf8Bytes(slotText(self, keySlot))))
+            run List<JsonEntry>.append(&mut entries, JsonEntry { key: move key, value: run JsonDocument.toValue(self, value.value) })
+          }
+          Option<JsonMember>.None => { break }
+        }
+      }
+      return Value.Object { entries: move entries }
+    }
+    if kind == SLOT_STRING {
+      let text = unsafe String.fromBytesUnchecked(run Bytes.copy(String.utf8Bytes(slotText(self, slot))))
+      return Value.String { text: move text }
+    }
+    if kind == SLOT_NULL { return Value.Null }
+    if kind == SLOT_FALSE { return Value.Bool { value: false } }
+    if kind == SLOT_TRUE { return Value.Bool { value: true } }
+    return match JsonDocument.asNumber(self, node) {
+      Option<JsonNumber>.Some { value } => Value.Number { value: value }
+      Option<JsonNumber>.None => Value.Null
+    }
+  }
+
+  /// Writes the document as compact JSON to the `Writer`. It does not flush the `Writer`.
+  ///
+  /// # Errors
+  ///
+  /// - `JsonError` with reason `InvalidNumber` for a float that is not finite, which only
+  ///   [`JsonDocument.fromValue`] can store.
+  /// - `WriterError` if the `Writer` fails.
+  ///
+  /// # Gotchas
+  ///
+  /// The text goes to the `Writer` in pieces of up to 4 KiB. After a failure, the `Writer` holds
+  /// only the pieces passed to it before the failure.
+  pub effect fn write(self: &Self) -> () ! JsonError | WriterError ? &mut Writer {
+    let options = JsonOptions.compact()
+    return run JsonDocument.writeWith(self, &options)
+  }
+
+  /// Writes the document as JSON to the `Writer`, with the indentation and depth limit of
+  /// `options`. It does not flush the `Writer`.
+  ///
+  /// # Errors
+  ///
+  /// - `JsonError` if the nesting is deeper than the limit in `options`, or with reason
+  ///   `InvalidNumber` for a float that is not finite.
+  /// - `WriterError` if the `Writer` fails.
+  pub effect fn writeWith(self: &Self, options: &JsonOptions) -> () ! JsonError | WriterError ? &mut Writer {
+    let mut buffer = OutputBuffer { bytes: [0; 4096], length: usize.ZERO }
+    run writeSlot(self, usize.ZERO, options, &mut buffer)
+    return run flushOutput(&mut buffer)
+  }
+}
+
+// One value of a `JsonDocument`. The low byte of `info` is the kind; above it is the byte length of
+// a string or the child count of an array or object. `payload` is a number's bits, the offset of a
+// string in the text, or the index after an array's or object's last child.
+struct DocumentSlot {
+  info: u64,
+  payload: u64,
+}
+
+impl Copy for DocumentSlot {}
+
+const SLOT_NULL: u64 = 0
+const SLOT_FALSE: u64 = 1
+const SLOT_TRUE: u64 = 2
+const SLOT_INTEGER: u64 = 3
+const SLOT_UNSIGNED: u64 = 4
+const SLOT_FLOAT: u64 = 5
+const SLOT_STRING: u64 = 6
+const SLOT_ARRAY: u64 = 7
+const SLOT_OBJECT: u64 = 8
+
+fn slotKind(slots: &List<DocumentSlot>, index: usize) -> u64 {
+  return u64.bitAnd(List<DocumentSlot>.get(slots, index).info, 255)
+}
+
+// The index after the value at `index` and everything in it.
+@inlineAlways
+fn slotEnd(slots: &List<DocumentSlot>, index: usize) -> usize {
+  let slot = List<DocumentSlot>.get(slots, index)
+  let kind = u64.bitAnd(slot.info, 255)
+  if kind == SLOT_ARRAY || kind == SLOT_OBJECT { return u64.toUsize(slot.payload) }
+  return index + usize.ONE
+}
+
+fn slotText<'a>(document: &'a JsonDocument, slot: DocumentSlot) -> string<'a> {
+  let bytes = Slice.view<u8>(Bytes.asSlice(&document.text), u64.toUsize(slot.payload), u64.toUsize(u64.shiftRight(slot.info, 8)))
+  // Every string was checked as UTF-8 or decoded from an escape when it was stored.
+  return unsafe Intrinsic.stringFromUtf8Unchecked(bytes)
+}
+
+@inlineAlways
+effect fn pushSlot(document: &mut JsonDocument, kind: u64, count: usize, payload: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run List<DocumentSlot>.append(&mut document.slots,
+    DocumentSlot { info: u64.bitOr(kind, u64.shiftLeft(usize.toU64(count), 8)), payload: payload })
+}
+
+// Parses the value that starts after whitespace at `cursor.index` onto the end of `document`, and
+// moves `cursor.index` after it. Sets `cursor.failed` at anything that is not valid JSON.
+effect fn documentItem(bytes: &[u8], cursor: &mut TreeCursor, document: &mut JsonDocument, keys: &mut List<u64>)
+  -> () ! JsonError | OutOfMemoryError ? &mut Allocator {
+  let at = JsonSyntax.skipWhitespace(bytes, cursor.index)
+  if at >= bytes.length { return markFailed(&mut cursor.*) }
+  let byte = bytes[at]
+  if byte == 34 { return run documentString(bytes, &mut cursor.*, &mut document.*, at) }
+  if byte == 45 || (byte >= 48 && byte <= 57) {
+    let number = run treeNumber(bytes, &mut cursor.*, at)
+    if cursor.failed { return () }
+    return match number {
+      JsonNumber.Integer { value } => run pushSlot(&mut document.*, SLOT_INTEGER, usize.ZERO, i64.wrappingToU64(value))
+      JsonNumber.Unsigned { value } => run pushSlot(&mut document.*, SLOT_UNSIGNED, usize.ZERO, value)
+      JsonNumber.Float { value } => run pushSlot(&mut document.*, SLOT_FLOAT, usize.ZERO, f64.toBits(value))
+    }
+  }
+  if byte == 91 { return run documentArray(bytes, &mut cursor.*, &mut document.*, &mut keys.*, at + usize.ONE) }
+  if byte == 123 { return run documentObject(bytes, &mut cursor.*, &mut document.*, &mut keys.*, at + usize.ONE) }
+  if byte == 116 && wordAt(bytes, at, b"true") {
+    cursor.index = at + 4
+    return run pushSlot(&mut document.*, SLOT_TRUE, usize.ZERO, 0)
+  }
+  if byte == 102 && wordAt(bytes, at, b"false") {
+    cursor.index = at + 5
+    return run pushSlot(&mut document.*, SLOT_FALSE, usize.ZERO, 0)
+  }
+  if byte == 110 && wordAt(bytes, at, b"null") {
+    cursor.index = at + 4
+    return run pushSlot(&mut document.*, SLOT_NULL, usize.ZERO, 0)
+  }
+  return markFailed(&mut cursor.*)
+}
+
+// Appends the string whose quote is at `at` to the text and a record for it to the slots.
+effect fn documentString(bytes: &[u8], cursor: &mut TreeCursor, document: &mut JsonDocument, at: usize)
+  -> () ! JsonError | OutOfMemoryError ? &mut Allocator {
+  let mut escaped = false
+  let after = JsonSyntax.stringEnd(bytes, at + usize.ONE, &mut escaped)
+  if after == usize.ZERO { return markFailed(&mut cursor.*) }
+  cursor.index = after
+  let start = Bytes.length(&document.text)
+  run JsonText.decodeInto(&mut document.text, Slice.view<u8>(bytes, at, after - at), at, escaped)
+  let length = Bytes.length(&document.text) - start
+  return run pushSlot(&mut document.*, SLOT_STRING, length, usize.toU64(start))
+}
+
+// Parses the rest of the array whose `[` is before `start`.
+effect fn documentArray(bytes: &[u8], cursor: &mut TreeCursor, document: &mut JsonDocument, keys: &mut List<u64>, start: usize)
+  -> () ! JsonError | OutOfMemoryError ? &mut Allocator {
+  if cursor.depth == MAX_DEPTH { return markFailed(&mut cursor.*) }
+  let open = List<DocumentSlot>.length(&document.slots)
+  run pushSlot(&mut document.*, SLOT_ARRAY, usize.ZERO, usize.toU64(open + usize.ONE))
+  let mut at = JsonSyntax.skipWhitespace(bytes, start)
+  if at < bytes.length && bytes[at] == 93 {
+    cursor.index = at + usize.ONE
+    return ()
+  }
+  cursor.depth = cursor.depth + usize.ONE
+  cursor.index = at
+  let mut count = usize.ZERO
+  while true {
+    run documentItem(bytes, &mut cursor.*, &mut document.*, &mut keys.*)
+    if cursor.failed { return () }
+    count = count + usize.ONE
+    at = JsonSyntax.skipWhitespace(bytes, cursor.index)
+    if at >= bytes.length { break }
+    let byte = bytes[at]
+    cursor.index = at + usize.ONE
+    if byte == 93 {
+      cursor.depth = cursor.depth - usize.ONE
+      return closeSlot(&mut document.*, open, SLOT_ARRAY, count)
+    }
+    if byte != 44 { break }
+  }
+  return markFailed(&mut cursor.*)
+}
+
+// Parses the rest of the object whose `{` is before `start`.
+effect fn documentObject(bytes: &[u8], cursor: &mut TreeCursor, document: &mut JsonDocument, keys: &mut List<u64>, start: usize)
+  -> () ! JsonError | OutOfMemoryError ? &mut Allocator {
+  if cursor.depth == MAX_DEPTH { return markFailed(&mut cursor.*) }
+  let open = List<DocumentSlot>.length(&document.slots)
+  run pushSlot(&mut document.*, SLOT_OBJECT, usize.ZERO, usize.toU64(open + usize.ONE))
+  let mut at = JsonSyntax.skipWhitespace(bytes, start)
+  if at < bytes.length && bytes[at] == 125 {
+    cursor.index = at + usize.ONE
+    return ()
+  }
+  cursor.depth = cursor.depth + usize.ONE
+  let mut count = usize.ZERO
+  let mut seen: [u64; 4] = [0, 0, 0, 0]
+  let base = List<u64>.length(&keys.*)
+  while true {
+    if at >= bytes.length || bytes[at] != 34 { break }
+    let key = List<DocumentSlot>.length(&document.slots)
+    run documentString(bytes, &mut cursor.*, &mut document.*, at)
+    if cursor.failed { return () }
+    // A key can only repeat an earlier one with the same bit in `seen`, so most keys skip the scan.
+    // A key can only repeat an earlier one with the same hash, and then with the same bit in
+    // `seen`, so most keys skip the scan and nearly all the rest skip the comparison of bytes.
+    let hash = keyHash(&document.*, key)
+    let bit = u64.shiftRight(hash, 56)
+    let word = u64.toUsize(u64.shiftRight(bit, 6))
+    let mask = u64.shiftLeft(1, u64.bitAnd(bit, 63))
+    if u64.bitAnd(seen[word], mask) != 0 && sameHash(&keys.*, base, hash)
+      && repeatedKey(&document.*, open + usize.ONE, key) {
+      break
+    }
+    seen[word] = u64.bitOr(seen[word], mask)
+    run List<u64>.append(&mut keys.*, hash)
+    at = JsonSyntax.skipWhitespace(bytes, cursor.index)
+    if at >= bytes.length || bytes[at] != 58 { break }
+    cursor.index = at + usize.ONE
+    run documentItem(bytes, &mut cursor.*, &mut document.*, &mut keys.*)
+    if cursor.failed { return () }
+    count = count + usize.ONE
+    at = JsonSyntax.skipWhitespace(bytes, cursor.index)
+    if at >= bytes.length { break }
+    let byte = bytes[at]
+    cursor.index = at + usize.ONE
+    if byte == 125 {
+      cursor.depth = cursor.depth - usize.ONE
+      List<u64>.truncate(&mut keys.*, base)
+      return closeSlot(&mut document.*, open, SLOT_OBJECT, count)
+    }
+    if byte != 44 { break }
+    at = JsonSyntax.skipWhitespace(bytes, cursor.index)
+  }
+  return markFailed(&mut cursor.*)
+}
+
+// Records the child count and the end of the array or object at `open`.
+fn closeSlot(document: &mut JsonDocument, open: usize, kind: u64, count: usize) -> () {
+  let end = List<DocumentSlot>.length(&document.slots)
+  List<DocumentSlot>.set(&mut document.slots, open,
+    DocumentSlot { info: u64.bitOr(kind, u64.shiftLeft(usize.toU64(count), 8)), payload: usize.toU64(end) })
+}
+
+// A hash of the key at `key`, from its length and its first and last 8 bytes.
+@inlineAlways
+fn keyHash(document: &JsonDocument, key: usize) -> u64 {
+  let slot = List<DocumentSlot>.get(&document.slots, key)
+  let size = u64.toUsize(u64.shiftRight(slot.info, 8))
+  let start = u64.toUsize(slot.payload)
+  let all = Bytes.asSlice(&document.text)
+  let text = Slice.view<u8>(all, start, size)
+  let mut mixed = usize.toU64(size)
+  if size >= 8 {
+    mixed = u64.bitXor(mixed, u64.bitXor(littleWord(text, usize.ZERO), u64.rotateLeft(littleWord(text, size - 8), 29)))
+  } else if size > usize.ZERO && start + size >= 8 {
+    // The word that ends with the key, with the bytes before it shifted out.
+    mixed = u64.bitXor(mixed, u64.shiftLeft(u64.shiftRight(littleWord(all, start + size - 8), usize.toU64((8 - size) * 8)), 8))
+  } else {
+    let mut index = usize.ZERO
+    while index < size {
+      mixed = u64.bitXor(mixed, u64.shiftLeft(u8.toU64(text[index]), usize.toU64(index * 8 + 8)))
+      index = index + usize.ONE
+    }
+  }
+  let product = u64.wrappingMultiply(mixed, 11400714819323198485)
+  return u64.bitXor(product, u64.shiftRight(product, 29))
+}
+
+// The 8 bytes at `at` as a little-endian word.
+@inlineAlways
+fn littleWord(bytes: &[u8], at: usize) -> u64 {
+  let lanes = Slice.view<u8>(bytes, at, 8)
+  let mut word: u64 = 0
+  let mut lane = usize.ZERO
+  while lane < 8 {
+    word = u64.bitOr(word, u64.shiftLeft(u8.toU64(lanes[lane]), usize.toU64(lane * 8)))
+    lane = lane + usize.ONE
+  }
+  return word
+}
+
+// `true` if a hash from `base` on in `keys` is `hash`.
+fn sameHash(keys: &List<u64>, base: usize, hash: u64) -> bool {
+  let hashes = List<u64>.asSlice(keys)
+  let mut index = base
+  while index < hashes.length {
+    if hashes[index] == hash { return true }
+    index = index + usize.ONE
+  }
+  return false
+}
+
+// `true` if a key of the object whose first key is at `first` repeats the key at `key`.
+fn repeatedKey(document: &JsonDocument, first: usize, key: usize) -> bool {
+  let text = slotText(document, List<DocumentSlot>.get(&document.slots, key))
+  let mut index = first
+  while index < key {
+    if slotText(document, List<DocumentSlot>.get(&document.slots, index)) == text { return true }
+    index = slotEnd(&document.slots, index + usize.ONE)
+  }
+  return false
+}
+
+// Appends `value` and everything in it to `document`.
+effect fn copyValue(document: &mut JsonDocument, value: &Value) -> () ! OutOfMemoryError ? &mut Allocator {
+  match &value.* {
+    Value.Null => run pushSlot(&mut document.*, SLOT_NULL, usize.ZERO, 0)
+    Value.Bool { value: flag } => {
+      if flag { run pushSlot(&mut document.*, SLOT_TRUE, usize.ZERO, 0) } else { run pushSlot(&mut document.*, SLOT_FALSE, usize.ZERO, 0) }
+    }
+    Value.Number { value: number } => match number {
+      JsonNumber.Integer { value: integer } => run pushSlot(&mut document.*, SLOT_INTEGER, usize.ZERO, i64.wrappingToU64(integer))
+      JsonNumber.Unsigned { value: integer } => run pushSlot(&mut document.*, SLOT_UNSIGNED, usize.ZERO, integer)
+      JsonNumber.Float { value: float } => run pushSlot(&mut document.*, SLOT_FLOAT, usize.ZERO, f64.toBits(float))
+    }
+    Value.String { text } => run copyText(&mut document.*, String.view(&text))
+    Value.Array { values } => {
+      let open = List<DocumentSlot>.length(&document.slots)
+      run pushSlot(&mut document.*, SLOT_ARRAY, usize.ZERO, 0)
+      let items = List<Value>.asSlice(&values)
+      let mut index = usize.ZERO
+      while index < items.length {
+        run copyValue(&mut document.*, &items[index])
+        index = index + usize.ONE
+      }
+      closeSlot(&mut document.*, open, SLOT_ARRAY, items.length)
+    }
+    Value.Object { entries } => {
+      let open = List<DocumentSlot>.length(&document.slots)
+      run pushSlot(&mut document.*, SLOT_OBJECT, usize.ZERO, 0)
+      let members = List<JsonEntry>.asSlice(&entries)
+      let mut index = usize.ZERO
+      while index < members.length {
+        run copyText(&mut document.*, String.view(&members[index].key))
+        run copyValue(&mut document.*, &members[index].value)
+        index = index + usize.ONE
+      }
+      closeSlot(&mut document.*, open, SLOT_OBJECT, members.length)
+    }
+  }
+}
+
+effect fn copyText(document: &mut JsonDocument, text: string) -> () ! OutOfMemoryError ? &mut Allocator {
+  let start = Bytes.length(&document.text)
+  run Bytes.append(&mut document.text, String.utf8Bytes(text))
+  return run pushSlot(&mut document.*, SLOT_STRING, String.byteLength(text), usize.toU64(start))
+}
+
+// Writes the value at `index` of `document`, as `writeNode` writes a `Value`.
+effect fn writeSlot(document: &JsonDocument, index: usize, options: &JsonOptions, buffer: &mut OutputBuffer)
+  -> () ! JsonError | WriterError ? &mut Writer {
+  let slot = List<DocumentSlot>.get(&document.slots, index)
+  let kind = u64.bitAnd(slot.info, 255)
+  if kind == SLOT_ARRAY {
+    let child = run JsonOptions.child(options)
+    let end = u64.toUsize(slot.payload)
+    run literalOutput(&mut buffer, b"[")
+    let mut at = index + usize.ONE
+    while at < end {
+      run separatorOutput(&mut buffer, &child, at == index + usize.ONE)
+      run writeSlot(document, at, &child, &mut buffer)
+      at = slotEnd(&document.slots, at)
+    }
+    if end != index + usize.ONE { run lineOutput(&mut buffer, options) }
+    return run literalOutput(&mut buffer, b"]")
+  }
+  if kind == SLOT_OBJECT {
+    let child = run JsonOptions.child(options)
+    let end = u64.toUsize(slot.payload)
+    run literalOutput(&mut buffer, b"{")
+    let mut at = index + usize.ONE
+    while at < end {
+      run separatorOutput(&mut buffer, &child, at == index + usize.ONE)
+      run stringOutput(&mut buffer, slotText(document, List<DocumentSlot>.get(&document.slots, at)))
+      run colonOutput(&mut buffer, &child)
+      run writeSlot(document, at + usize.ONE, &child, &mut buffer)
+      at = slotEnd(&document.slots, at + usize.ONE)
+    }
+    if end != index + usize.ONE { run lineOutput(&mut buffer, options) }
+    return run literalOutput(&mut buffer, b"}")
+  }
+  if kind == SLOT_STRING { return run stringOutput(&mut buffer, slotText(document, slot)) }
+  if kind == SLOT_NULL { return run literalOutput(&mut buffer, b"null") }
+  if kind == SLOT_FALSE { return run literalOutput(&mut buffer, b"false") }
+  if kind == SLOT_TRUE { return run literalOutput(&mut buffer, b"true") }
+  run reserveOutput(&mut buffer, NUMBER_ROOM)
+  if kind == SLOT_INTEGER {
+    buffer.length = Format.writeI64Display(u64.wrappingToI64(slot.payload), &mut buffer.bytes, buffer.length)
+    return ()
+  }
+  if kind == SLOT_UNSIGNED {
+    buffer.length = Format.writeU64Display(slot.payload, &mut buffer.bytes, buffer.length)
+    return ()
+  }
+  let float = f64.fromBits(slot.payload)
+  // `writeFloat` reports the error for a value that JSON cannot hold.
+  if !f64.isFinite(float) {
+    return run JsonOutput.writeFloat(float) |> Effect.provideMut<Writer>(&mut buffer)
+  }
+  buffer.length = Format.writeF64Debug(float, &mut buffer.bytes, buffer.length)
 }

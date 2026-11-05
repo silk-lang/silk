@@ -6,8 +6,8 @@ Compute HMAC tags (RFC 2104) with SHA-256 or SHA-384.
 
 ## When to use
 Use [`HmacSha256`](#HmacSha256) or [`HmacSha384`](#HmacSha384) to prove that a message comes from someone who has a shared
-secret key and was not changed, for example to sign a webhook or a cookie. Use `silk.crypto.hkdf` to
-derive keys, and `silk.crypto.sha2` for a hash without a key.
+secret key and was not changed, for example to sign a webhook or a cookie. Use
+`silk.crypto.hkdf` to derive keys, and `silk.crypto.sha2` for a hash without a key.
 
 ## Details
 [`HmacSha256.authenticate`](#HmacSha256.impl.authenticate) returns the tag of one message. For a message that arrives in parts,

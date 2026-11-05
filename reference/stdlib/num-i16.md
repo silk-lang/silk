@@ -33,8 +33,8 @@ reinterprets bits.
 complement form. For zero, both zero counts return [`BITS`](#BITS).
 
 [`parse`](#parse) reads decimal text. A leading `-` is valid, and a leading `+` is not valid. To write a
-value as text, use `silk.text.format.Format.display` or `Format.displayWith` with a `Writer`. Neither
-needs an `Allocator`.
+value as text, use `silk.text.format.Format.display` or `Format.displayWith` with a `Writer`.
+Neither needs an `Allocator`.
 
 ## Gotchas
 [`MIN`](#MIN) cannot be represented as a positive i16, so ordinary [`negate`](#negate) traps for that value.
@@ -887,7 +887,8 @@ not skip spaces and does not accept digit separators.
 - `ParseError` with reason `silk.text.format.NotANumber` if `text` is empty, starts with `+`,
   contains a byte that is not a digit, or has bytes after the number. `offset` gives the byte
   position where the read stopped.
-- `ParseError` with reason `silk.text.format.OutOfRange` if the number is outside the range of `i16`.
+- `ParseError` with reason `silk.text.format.OutOfRange` if the number is outside the range of
+  `i16`.
 
 
 Category: Numbers.

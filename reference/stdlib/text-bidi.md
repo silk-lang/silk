@@ -387,8 +387,8 @@ paragraph.
 pub fn runs(self: &Self) -> &[BidiRun]
 ```
 
-Returns the runs of the last analyzed text, in logical order. They cover the whole text without
-gaps.
+Returns the runs of the last analyzed text, in logical order. They cover the whole text
+without gaps.
 
 <a id="BidiAnalysis.impl.runAt"></a>
 
@@ -453,8 +453,8 @@ level.
 
 ### When to use
 
-Use `analyzeClasses` to test the algorithm against class sequences, as the Unicode `BidiTest.txt`
-file gives them. Use [`BidiAnalysis.analyze`](#BidiAnalysis.impl.analyze) for text.
+Use `analyzeClasses` to test the algorithm against class sequences, as the Unicode
+`BidiTest.txt` file gives them. Use [`BidiAnalysis.analyze`](#BidiAnalysis.impl.analyze) for text.
 
 ### Details
 

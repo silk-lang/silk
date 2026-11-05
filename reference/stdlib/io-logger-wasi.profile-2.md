@@ -65,7 +65,8 @@ A `Logger` provider that passes each formatted message, its level and a fixed co
 
 ### Details
 
-A message longer than 512 bytes is passed as several records, in order, each ending on a whole character.
+A message longer than 512 bytes is passed as several records, in order, each ending on a whole
+character.
 
 <a id="WasiLogger.impl"></a>
 

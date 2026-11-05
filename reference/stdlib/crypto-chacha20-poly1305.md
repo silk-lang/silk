@@ -21,8 +21,8 @@ is correct.
 
 ## Gotchas
 The same key and nonce must never encrypt two messages. If they do, an attacker can recover the
-XOR of the two plaintexts and forge tags. Use a counter, or 12 random bytes from `silk.system.random`
-for a small number of messages per key.
+XOR of the two plaintexts and forge tags. Use a counter, or 12 random bytes from
+`silk.system.random` for a small number of messages per key.
 
 Authentication does not stop replay. The source code avoids branches on secret data, but the
 module cannot promise constant time on every compiler and target, or that secrets are erased.
@@ -221,8 +221,8 @@ The first failure in this order is returned:
 #### Gotchas
 Use a new nonce for each message under the same key. The function does not make one. If the
 same key and nonce encrypt two messages, an attacker can recover the XOR of the two plaintexts
-and forge tags. Use a counter, or 12 random bytes from `silk.system.random` for a small number of
-messages per key.
+and forge tags. Use a counter, or 12 random bytes from `silk.system.random` for a small number
+of messages per key.
 
 <a id="ChaCha20Poly1305.impl.open"></a>
 

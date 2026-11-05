@@ -5,8 +5,8 @@
 Direct Linux system calls for programs built with no libc.
 
 ## When to use
-Use [`RawLinux`](#RawLinux) only in a raw Linux runtime, such as `silk.platform.linux.start`. A hosted program uses
-the libc providers (the `*_native` modules and `silk.platform.native`) instead.
+Use [`RawLinux`](#RawLinux) only in a raw Linux runtime, such as `silk.platform.linux.start`. A hosted
+program uses the libc providers (the `*_native` modules and `silk.platform.native`) instead.
 
 ## Details
 The module exists only on Linux on x86_64 or aarch64, with the `libc` profile set to `none`. The
@@ -41,8 +41,8 @@ The scope for raw Linux kernel operations on the selected target, for programs b
 libc.
 
 ### When to use
-Use it only in a raw Linux runtime, such as `silk.platform.linux.start`. A hosted program uses the libc
-providers (the `*_native` modules and `silk.platform.native`) instead.
+Use it only in a raw Linux runtime, such as `silk.platform.linux.start`. A hosted program uses
+the libc providers (the `*_native` modules and `silk.platform.native`) instead.
 
 ### Details
 It exists only on Linux on x86_64 or aarch64, with the `libc` profile set to `none`. A call

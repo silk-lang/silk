@@ -21,8 +21,8 @@ input is marked final, all of it is consumed, and each frame is complete.
 ## Errors
 - `OutOfMemoryError` from [`Zstd.make`](#Zstd.impl.make) if the `Allocator` fails.
 - [`ZstdError`](#ZstdError) if the configuration is not valid, the data is not valid, a limit is exceeded,
-  or the calls do not follow the rules of [`Zstd.step`](#Zstd.impl.step). `reason` gives the cause and `offset`
-  the input position.
+  or a call after the final input does not give exactly the input that is not consumed yet.
+  `reason` gives the cause and `offset` the input position.
 
 ## Gotchas
 Output is not verified until `Finished`, because a checksum or a truncated frame can fail later.

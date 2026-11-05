@@ -6,9 +6,9 @@ Key agreement (ECDH), and ECDSA signing and verification on the NIST P-256 curve
 
 ## When to use
 Use [`P256`](#P256) for an ECDH key exchange where a protocol needs P-256, such as a TLS 1.3 key share
-`secp256r1`. For a new design, `silk.crypto.x25519` is simpler. Use [`EcdsaP256Sha256`](#EcdsaP256Sha256) to verify an
-ECDSA signature with SHA-256, for example the signature of a certificate or a JSON Web Token
-with `ES256`.
+`secp256r1`. For a new design, `silk.crypto.x25519` is simpler. Use [`EcdsaP256Sha256`](#EcdsaP256Sha256) to
+verify an ECDSA signature with SHA-256, for example the signature of a certificate or a JSON Web
+Token with `ES256`.
 
 ## Details
 Public keys are 65 bytes in uncompressed SEC1 form: `0x04`, then the X and Y coordinates, each
@@ -22,9 +22,9 @@ allocates. This module cannot sign.
 
 ## Gotchas
 A valid signature proves only that the holder of the private key signed the message. It does not
-prove that you can trust the key. To check a certificate chain, use the `silk.tls.trust_*` modules.
-The key exchange does not authenticate the peer. Pass the shared secret through `silk.crypto.hkdf`
-before you use it as a key. The secret is not erased when it is dropped.
+prove that you can trust the key. To check a certificate chain, use the `silk.tls.trust_*`
+modules. The key exchange does not authenticate the peer. Pass the shared secret through
+`silk.crypto.hkdf` before you use it as a key. The secret is not erased when it is dropped.
 
 ## Examples
 ### Agree on a shared secret
@@ -331,8 +331,8 @@ uncompressed SEC1 form: `0x04`, then the X and Y coordinates, each 32 bytes big-
 are 32 bytes big-endian. Nothing allocates.
 
 ### Gotchas
-The key exchange does not authenticate the peer. Pass the shared secret through `silk.crypto.hkdf`
-before you use it as a key. The secret is not erased when it is dropped.
+The key exchange does not authenticate the peer. Pass the shared secret through
+`silk.crypto.hkdf` before you use it as a key. The secret is not erased when it is dropped.
 
 <a id="P256.impl"></a>
 
@@ -524,7 +524,8 @@ TLS. Nothing allocates.
 
 ### Gotchas
 A valid signature proves only that the holder of the private key signed the message. It does not
-prove that you can trust the key. To check a certificate chain, use the `silk.tls.trust_*` modules.
+prove that you can trust the key. To check a certificate chain, use the `silk.tls.trust_*`
+modules.
 
 <a id="EcdsaP256Sha256.impl"></a>
 

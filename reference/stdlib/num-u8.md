@@ -846,10 +846,11 @@ accept digit separators.
 
 ### Errors
 
-- `ParseError` with reason `silk.text.format.NotANumber` if `text` is empty, has a sign, contains a
-  byte that is not a digit, or has bytes after the number. `offset` gives the byte position
-  where the read stopped.
-- `ParseError` with reason `silk.text.format.OutOfRange` if the number is outside the range of `u8`.
+- `ParseError` with reason `silk.text.format.NotANumber` if `text` is empty, has a sign,
+  contains a byte that is not a digit, or has bytes after the number. `offset` gives the byte
+  position where the read stopped.
+- `ParseError` with reason `silk.text.format.OutOfRange` if the number is outside the range of
+  `u8`.
 
 
 Category: Numbers.

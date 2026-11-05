@@ -6,8 +6,8 @@ Line break opportunities: the Unicode Line Breaking Algorithm (UAX #14) with CSS
 data from Unicode 18.0.0.
 
 ## When to use
-Use [`breaks`](#breaks) to find where text can wrap onto a new line. Use [`breaksWithDictionary`](#breaksWithDictionary) when the
-text can contain Thai, Lao, Khmer or Myanmar, which need a word dictionary.
+Use [`breaks`](#breaks) to find where text can wrap onto a new line. Use [`breaksWithDictionary`](#breaksWithDictionary) when
+the text can contain Thai, Lao, Khmer or Myanmar, which need a word dictionary.
 
 ## Details
 [`LineOptions.make`](#LineOptions.impl.make) selects untailored UAX #14 with manual soft hyphens. The options follow the

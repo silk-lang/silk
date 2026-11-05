@@ -6,8 +6,8 @@ The `TrustSource` effect: where a program gets its trust anchors.
 
 ## When to use
 Require [`TrustSource`](#TrustSource) in code that needs trust anchors, such as a TLS client, so that the
-caller chooses where they come from. Provide `silk.tls.trust_source_memory` for anchors in memory,
-or a native provider for the CA files of the system.
+caller chooses where they come from. Provide `silk.tls.trust_source_memory` for anchors in
+memory, or a native provider for the CA files of the system.
 
 ## Details
 Each [`TrustSource.load`](#TrustSource.load) returns a new `TrustSnapshot` that the caller owns. It stays valid

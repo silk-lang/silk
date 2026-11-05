@@ -37,10 +37,10 @@ An HTTP/1.0 request can be answered with an HTTP/1.0 or an HTTP/1.1 response hea
 allows; the response is not chunked, and the connection closes after it unless it is kept alive.
 
 A request that the server cannot read gets a bare response with no body before the error is
-returned and the connection closes: 400 for a malformed head or body framing, 413 for a body over
-the limits, 414 for a target over `maxTargetBytes`, 431 for header fields over the limits, 501
-for a transfer coding other than chunked, and 505 for a version other than HTTP/1.0 or HTTP/1.1.
-Nothing is sent when the input ends early.
+returned and the connection closes: 400 for a malformed head or body framing, 413 for a body
+over the limits, 414 for a target over `maxTargetBytes`, 431 for header fields over the limits,
+501 for a transfer coding other than chunked, and 505 for a version other than HTTP/1.0 or
+HTTP/1.1. Nothing is sent when the input ends early.
 
 ## Errors
 [`ServerError`](#ServerError) keeps the cause from the lower layer: the head parser, the body framing, the
@@ -1607,7 +1607,10 @@ pub effect fn writeAll(
 Writes all of `input` to the body, and returns the progress.
 
 #### Errors
-As [`ResponseWriter.writeSome`](#ResponseWriter.impl.writeSome). `Output` includes the bytes of earlier steps of this call.
+- `Body` if the bytes go over the declared `ContentLength`.
+- `Output` if the transport fails. The progress includes the bytes of earlier steps of this
+  call.
+- `InvalidState` if the response is finished.
 
 <a id="ResponseWriter.impl.finish"></a>
 

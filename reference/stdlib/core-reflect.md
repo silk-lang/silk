@@ -211,8 +211,9 @@ Use the result as the sequence of a `static for`. Each element has the type
 #### Gotchas
 
 The list contains only the `pub` fields, even when the caller is the module that declares
-`Owner`, because visibility is judged from `silk/core/reflect`. Call `Intrinsic.reflectFields<Owner>()`
-directly to list the fields that the calling module can see.
+`Owner`, because visibility is judged from `silk/core/reflect`. Call
+`Intrinsic.reflectFields<Owner>()` directly to list the fields that the calling module can
+see.
 
 <a id="Reflect.impl.typeKind"></a>
 
@@ -416,9 +417,9 @@ field, and the kind [`variantFieldKind`](#variantFieldKind). A unit variant has 
 
 #### Gotchas
 
-The list contains only the `pub` fields, because visibility is judged from `silk/core/reflect`.
-A field descriptor of a variant cannot be given to [`Reflect.borrowField`](#Reflect.impl.borrowField), because the
-union holds the field only while that variant is active.
+The list contains only the `pub` fields, because visibility is judged from
+`silk/core/reflect`. A field descriptor of a variant cannot be given to
+[`Reflect.borrowField`](#Reflect.impl.borrowField), because the union holds the field only while that variant is active.
 
 <a id="Reflect.impl.makeVariant"></a>
 

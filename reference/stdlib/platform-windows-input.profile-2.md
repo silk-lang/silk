@@ -44,9 +44,10 @@ Reads once into the buffer and returns success, capturing a Win32 error on failu
 
 Empty buffers make no host call. Each other read resolves the current standard handle and
 requests at most 4,294,967,295 bytes. Successful zero-byte reads and broken pipes report
-zero bytes with no error, including `ERROR_HANDLE_EOF`. A message-pipe partial read reports its received prefix. The
-count is zero on failure, and error is zero for an invalid host count. The handle is never
-closed. Console bytes use the active input code page; no text decoding is performed.
+zero bytes with no error, including `ERROR_HANDLE_EOF`. A message-pipe partial read reports
+its received prefix. The count is zero on failure, and error is zero for an invalid host
+count. The handle is never closed. Console bytes use the active input code page; no text
+decoding is performed.
 
 
 Category: Windows platform.

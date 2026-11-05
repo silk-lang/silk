@@ -5,9 +5,10 @@
 Owned UDP sockets and complete datagrams through WASI Preview 2.
 
 ## Details
-A socket owns its incoming and outgoing datagram streams and drops them before the socket.
-The host controls network access. Datagram boundaries are preserved; receive returns the whole
-payload, and send returns only after the host accepts the datagram. Deadlines use the supplied clock.
+A socket owns its incoming and outgoing datagram streams and drops them before the socket. The
+host controls network access. Datagram boundaries are preserved; receive returns the whole
+payload, and send returns only after the host accepts the datagram. Deadlines use the supplied
+clock.
 
 Import as `UdpSocket` with `import silk.net.datagram_wasi { UdpSocket }`.
 

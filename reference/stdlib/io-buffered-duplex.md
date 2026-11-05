@@ -512,8 +512,7 @@ Sends all pending bytes to the transport and then flushes the transport.
 
 It sends pending bytes in order, one time each. When it returns, [`BufferedDuplex.pending`](#BufferedDuplex.impl.pending) is
 0. `deadline` is an absolute time on the active `MonotonicClock`. `Option.none()` means no
-   time
-limit. It applies to each transport operation.
+time limit. It applies to each transport operation.
 
 #### Errors
 
@@ -548,8 +547,7 @@ Use it as the last write operation of the session. The end of the scope does not
 
 It sends pending bytes in order, one time each. When it returns, [`BufferedDuplex.pending`](#BufferedDuplex.impl.pending) is
 0. `deadline` is an absolute time on the active `MonotonicClock`. `Option.none()` means no
-   time
-limit. It applies to each transport operation.
+time limit. It applies to each transport operation.
 
 #### Errors
 

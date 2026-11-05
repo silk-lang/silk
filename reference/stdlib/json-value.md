@@ -73,7 +73,7 @@ pub effect fn main() -> i32
 
 Import as `Json` with `import silk.json.value { Json }`.
 
-Public declarations: 4.
+Public declarations: 10.
 
 <a id="JsonEntry"></a>
 
@@ -671,6 +671,453 @@ impl Deserialize for Value
 effect fn deserialize(scanner: &mut JsonScanner)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
+
+<a id="JsonDocument"></a>
+
+## `JsonDocument`
+
+```silk
+pub struct JsonDocument
+```
+
+A parsed JSON document kept in two flat buffers: one record for each value, in source order,
+and the decoded text of every string and key.
+
+### When to use
+
+Use it to read a document. Parsing allocates about two buffers in all, instead of one for each
+string, array, and object as [`Json.parse`](#Json.impl.parse) does, and dropping it frees only those buffers. Use
+a [`Value`](#Value) tree when you need to build or change a document; [`JsonDocument.toValue`](#JsonDocument.impl.toValue) makes one.
+
+### Details
+
+A value is named by a [`JsonNode`](#JsonNode), a position in its document. An array record is followed by
+its elements, and an object record by each key and its value, so a node's children are the
+records after it. Each array and object knows where its last child ends, so skipping a value is
+one step.
+
+### Gotchas
+
+A `JsonNode` is only meaningful with the document that returned it. With another document it
+names some other value or traps.
+
+### Examples
+#### Read fields of a parsed document
+```silk
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.json.scanner { JsonError }
+import silk.json.value { JsonDocument, JsonNode }
+
+effect fn read() -> i32 ! JsonError | OutOfMemoryError ? &mut Allocator {
+  let document = run JsonDocument.parse(b"{\"name\":\"Ada\",\"tags\":[1,2,3]}")
+  let root = JsonDocument.root(&document)
+  let tags = match JsonDocument.field(&document, root, "tags") {
+    Option<JsonNode>.Some { value } => value
+    Option<JsonNode>.None => { return 1 }
+  }
+  if JsonDocument.length(&document, tags) != 3 {
+    return 2
+  }
+  let name = match JsonDocument.field(&document, root, "name") {
+    Option<JsonNode>.Some { value } => value
+    Option<JsonNode>.None => { return 3 }
+  }
+  return match JsonDocument.asString(&document, name) {
+    Option<string>.Some { value } => if value == "Ada" { 0 } else { 4 }
+    Option<string>.None => 4
+  }
+}
+
+effect fn program() -> i32 ! JsonError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run read() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn failed(error: JsonError | OutOfMemoryError) -> i32 {
+  return 5
+}
+
+pub fn main() -> i32 {
+  return run Effect.catchAll(program(), failed)
+}
+```
+
+<a id="JsonNode"></a>
+
+## `JsonNode`
+
+```silk
+pub struct JsonNode
+```
+
+One value in a [`JsonDocument`](#JsonDocument): its position in the document.
+
+<a id="JsonNode.impl.Copy"></a>
+
+## Implementation `Copy for JsonNode`
+
+```silk
+impl Copy for JsonNode
+```
+
+<a id="JsonKind"></a>
+
+## `JsonKind`
+
+```silk
+pub enum JsonKind
+```
+
+The kind of a value in a [`JsonDocument`](#JsonDocument).
+
+<a id="JsonKind.Null"></a>
+
+### `Null`
+
+```silk
+Null
+```
+
+JSON `null`.
+
+<a id="JsonKind.Bool"></a>
+
+### `Bool`
+
+```silk
+Bool
+```
+
+JSON `true` or `false`.
+
+<a id="JsonKind.Number"></a>
+
+### `Number`
+
+```silk
+Number
+```
+
+A JSON number.
+
+<a id="JsonKind.String"></a>
+
+### `String`
+
+```silk
+String
+```
+
+A JSON string.
+
+<a id="JsonKind.Array"></a>
+
+### `Array`
+
+```silk
+Array
+```
+
+A JSON array.
+
+<a id="JsonKind.Object"></a>
+
+### `Object`
+
+```silk
+Object
+```
+
+A JSON object.
+
+<a id="JsonMember"></a>
+
+## `JsonMember`
+
+```silk
+pub struct JsonMember
+```
+
+One member of an object in a [`JsonDocument`](#JsonDocument): the node of its key, which is a string, and the
+node of its value.
+
+<a id="JsonMember.key"></a>
+
+### Field `key`
+
+```silk
+pub key: JsonNode
+```
+
+The key, a string node.
+
+<a id="JsonMember.value"></a>
+
+### Field `value`
+
+```silk
+pub value: JsonNode
+```
+
+The value.
+
+<a id="JsonMember.impl.Copy"></a>
+
+## Implementation `Copy for JsonMember`
+
+```silk
+impl Copy for JsonMember
+```
+
+<a id="JsonItems"></a>
+
+## `JsonItems`
+
+```silk
+pub struct JsonItems
+```
+
+The elements of an array in a [`JsonDocument`](#JsonDocument), in source order. [`JsonDocument.items`](#JsonDocument.impl.items) makes it.
+
+<a id="JsonMembers"></a>
+
+## `JsonMembers`
+
+```silk
+pub struct JsonMembers
+```
+
+The members of an object in a [`JsonDocument`](#JsonDocument), in source order. [`JsonDocument.members`](#JsonDocument.impl.members) makes
+it.
+
+<a id="JsonItems.impl"></a>
+
+## Implementation `JsonItems`
+
+```silk
+impl JsonItems
+```
+
+<a id="JsonItems.impl.next"></a>
+
+### Method `next`
+
+```silk
+pub fn next(self: &mut Self, document: &JsonDocument) -> Option<JsonNode>
+```
+
+Returns the next element, or an absent option after the last one. `document` must be the one
+that made these items.
+
+<a id="JsonMembers.impl"></a>
+
+## Implementation `JsonMembers`
+
+```silk
+impl JsonMembers
+```
+
+<a id="JsonMembers.impl.next"></a>
+
+### Method `next`
+
+```silk
+pub fn next(self: &mut Self, document: &JsonDocument) -> Option<JsonMember>
+```
+
+Returns the next member, or an absent option after the last one. `document` must be the one
+that made these members.
+
+<a id="JsonDocument.impl"></a>
+
+## Implementation `JsonDocument`
+
+```silk
+impl JsonDocument
+```
+
+<a id="JsonDocument.impl.parse"></a>
+
+### Associated function `parse`
+
+```silk
+pub effect fn parse(bytes: &[u8]) -> JsonDocument ! JsonError | OutOfMemoryError ? &mut Allocator
+```
+
+Parses `bytes` as one complete JSON document.
+
+#### Details
+
+Parsing is strict (RFC 8259), with the same rules and errors as [`Json.parse`](#Json.impl.parse): no comments,
+no trailing commas, no duplicate keys, nesting at most 64 deep, and nothing after the value.
+String escapes are decoded when the document is parsed, and numbers are converted to a
+[`JsonNumber`](#JsonNumber).
+
+#### Errors
+
+- `JsonError` if `bytes` is not one valid JSON value, with the reason and offset that
+  [`Json.parse`](#Json.impl.parse) reports.
+- `OutOfMemoryError` if the `Allocator` cannot supply the buffers.
+
+<a id="JsonDocument.impl.fromValue"></a>
+
+### Associated function `fromValue`
+
+```silk
+pub effect fn fromValue(value: &Value) -> JsonDocument ! OutOfMemoryError ? &mut Allocator
+```
+
+Returns a document that holds a copy of `value`.
+
+#### Errors
+
+- `OutOfMemoryError` if the `Allocator` cannot supply the buffers.
+
+<a id="JsonDocument.impl.root"></a>
+
+### Method `root`
+
+```silk
+pub fn root(self: &Self) -> JsonNode
+```
+
+Returns the node of the whole document.
+
+<a id="JsonDocument.impl.kind"></a>
+
+### Method `kind`
+
+```silk
+pub fn kind(self: &Self, node: JsonNode) -> JsonKind
+```
+
+Returns the kind of `node`.
+
+<a id="JsonDocument.impl.asBool"></a>
+
+### Method `asBool`
+
+```silk
+pub fn asBool(self: &Self, node: JsonNode) -> Option<bool>
+```
+
+Returns the value of a boolean. Returns an absent option if `node` is not a boolean.
+
+<a id="JsonDocument.impl.asNumber"></a>
+
+### Method `asNumber`
+
+```silk
+pub fn asNumber(self: &Self, node: JsonNode) -> Option<JsonNumber>
+```
+
+Returns the value of a number. Returns an absent option if `node` is not a number.
+
+<a id="JsonDocument.impl.asString"></a>
+
+### Method `asString`
+
+```silk
+pub fn asString<'a>(self: &'a Self, node: JsonNode) -> Option<string<'a>>
+```
+
+Returns the text of a string, with escapes decoded. Returns an absent option if `node` is not
+a string. The text is borrowed from the document.
+
+<a id="JsonDocument.impl.length"></a>
+
+### Method `length`
+
+```silk
+pub fn length(self: &Self, node: JsonNode) -> usize
+```
+
+Returns the number of elements of an array or members of an object, or 0 for any other value.
+
+<a id="JsonDocument.impl.items"></a>
+
+### Method `items`
+
+```silk
+pub fn items(self: &Self, node: JsonNode) -> JsonItems
+```
+
+Returns the elements of an array, or no elements if `node` is not an array.
+
+<a id="JsonDocument.impl.members"></a>
+
+### Method `members`
+
+```silk
+pub fn members(self: &Self, node: JsonNode) -> JsonMembers
+```
+
+Returns the members of an object, or no members if `node` is not an object.
+
+<a id="JsonDocument.impl.field"></a>
+
+### Method `field`
+
+```silk
+pub fn field(self: &Self, node: JsonNode, key: string) -> Option<JsonNode>
+```
+
+Returns the value of member `key` of an object. Returns an absent option if `node` is not an
+object or has no such key.
+
+<a id="JsonDocument.impl.toValue"></a>
+
+### Method `toValue`
+
+```silk
+pub effect fn toValue(self: &Self, node: JsonNode) -> Value ! OutOfMemoryError ? &mut Allocator
+```
+
+Returns a [`Value`](#Value) tree that holds a copy of `node` and everything in it.
+
+#### Errors
+
+- `OutOfMemoryError` if the `Allocator` cannot supply the tree.
+
+<a id="JsonDocument.impl.write"></a>
+
+### Method `write`
+
+```silk
+pub effect fn write(self: &Self) -> () ! JsonError | WriterError ? &mut Writer
+```
+
+Writes the document as compact JSON to the `Writer`. It does not flush the `Writer`.
+
+#### Errors
+
+- `JsonError` with reason `InvalidNumber` for a float that is not finite, which only
+  [`JsonDocument.fromValue`](#JsonDocument.impl.fromValue) can store.
+- `WriterError` if the `Writer` fails.
+
+#### Gotchas
+
+The text goes to the `Writer` in pieces of up to 4 KiB. After a failure, the `Writer` holds
+only the pieces passed to it before the failure.
+
+<a id="JsonDocument.impl.writeWith"></a>
+
+### Method `writeWith`
+
+```silk
+pub effect fn writeWith(self: &Self, options: &JsonOptions) -> () ! JsonError | WriterError ? &mut Writer
+```
+
+Writes the document as JSON to the `Writer`, with the indentation and depth limit of
+`options`. It does not flush the `Writer`.
+
+#### Errors
+
+- `JsonError` if the nesting is deeper than the limit in `options`, or with reason
+  `InvalidNumber` for a float that is not finite.
+- `WriterError` if the `Writer` fails.
 
 
 Category: Data formats.

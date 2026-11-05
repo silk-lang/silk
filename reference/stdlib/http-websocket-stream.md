@@ -11,8 +11,8 @@ Then call [`WebSocket.readEvent`](#WebSocket.impl.readEvent) in a loop, and answ
 handshake and make the session for you.
 
 When one fiber must wait for messages while other fibers send, split the session with
-[`fromHalves`](#fromHalves). The [`ReadHalf`](#ReadHalf) reads and answers Pings and Closes, and each [`WriteHalf`](#WriteHalf) (clone it
-for each fiber) sends. Writes from several fibers are sent one at a time, never mixed.
+[`fromHalves`](#fromHalves). The [`ReadHalf`](#ReadHalf) reads and answers Pings and Closes, and each [`WriteHalf`](#WriteHalf)
+(clone it for each fiber) sends. Writes from several fibers are sent one at a time, never mixed.
 
 ## Details
 A session reads into its own buffer, and keeps the bytes that came after a frame for the next
@@ -352,6 +352,7 @@ A Ping is answered and a Close is answered before the call returns. The message 
 #### Errors
 - `Protocol` for a frame that breaks a rule, or when the session is `Closed`.
 - `Io` if the transport fails or `deadline` passes, `Truncated` if it ends before a Close.
+- `OutOfMemoryError` if a buffer cannot grow.
 
 <a id="WebSocket.impl.writeText"></a>
 
@@ -369,6 +370,7 @@ Sends `text` as one Text frame, and flushes it.
 
 #### Errors
 `Protocol` if the session is not open, `Io` if the transport fails or `deadline` passes.
+`OutOfMemoryError` if a buffer cannot grow.
 
 <a id="WebSocket.impl.writeBinary"></a>
 
@@ -386,6 +388,7 @@ Sends `bytes` as one Binary frame, and flushes it.
 
 #### Errors
 `Protocol` if the session is not open, `Io` if the transport fails or `deadline` passes.
+`OutOfMemoryError` if a buffer cannot grow.
 
 <a id="WebSocket.impl.writeFragment"></a>
 
@@ -410,6 +413,7 @@ and `fin` marks the last one.
 
 #### Errors
 `Protocol` if the session is not open, `Io` if the transport fails or `deadline` passes.
+`OutOfMemoryError` if a buffer cannot grow.
 
 <a id="WebSocket.impl.writePing"></a>
 
@@ -428,6 +432,7 @@ Sends a Ping with `payload` (at most 125 bytes), and flushes it.
 #### Errors
 `Protocol` if the session is not open or the payload is too large, `Io` if the transport
 fails or `deadline` passes.
+`OutOfMemoryError` if a buffer cannot grow.
 
 <a id="WebSocket.impl.sendClose"></a>
 
@@ -449,6 +454,7 @@ this side already sent Close.
 
 #### Errors
 `Protocol` if the session failed, `Io` if the transport fails or `deadline` passes.
+`OutOfMemoryError` if a buffer cannot grow.
 
 <a id="TransportHalves"></a>
 
@@ -488,7 +494,8 @@ The half that writes.
 pub struct Parts
 ```
 
-The state of a session without its transport, from [`WebSocket.detach`](#WebSocket.impl.detach). Give it to [`fromHalves`](#fromHalves).
+The state of a session without its transport, from [`WebSocket.detach`](#WebSocket.impl.detach). Give it to
+[`fromHalves`](#fromHalves).
 
 <a id="Detached"></a>
 
@@ -546,8 +553,8 @@ Takes the session apart, to split its transport and then call [`fromHalves`](#fr
 pub struct Split<R, W>
 ```
 
-A split session: the [`ReadHalf`](#ReadHalf) for one fiber, and a [`WriteHalf`](#WriteHalf) to clone for each fiber that
-sends.
+A split session: the [`ReadHalf`](#ReadHalf) for one fiber, and a [`WriteHalf`](#WriteHalf) to clone for each fiber
+that sends.
 
 <a id="Split.reader"></a>
 
@@ -591,7 +598,8 @@ at once when no [`WriteHalf`](#WriteHalf) is sending, or else the writer that se
 pub struct WriteHalf<W>
 ```
 
-A sending handle of a split session. Clone it with [`WriteHalf.clone`](#WriteHalf.impl.clone) for each fiber that sends.
+A sending handle of a split session. Clone it with [`WriteHalf.clone`](#WriteHalf.impl.clone) for each fiber that
+sends.
 
 ### Details
 Each send waits until no other writer is sending, so frames are never mixed. A Close from the
@@ -677,6 +685,7 @@ the frame that is being sent. The message of a `Text` or `Binary` event is in
 #### Errors
 - `Protocol` for a frame that breaks a rule, or when the session is `Closed`.
 - `Io` if the transport fails or `deadline` passes, `Truncated` if it ends before a Close.
+- `OutOfMemoryError` if a buffer cannot grow.
 
 <a id="WriteHalf.impl"></a>
 
@@ -725,6 +734,7 @@ Sends `text` as one Text frame, and flushes it. It waits while another writer se
 
 #### Errors
 `Protocol` if the session is not open, `Io` if the transport fails or `deadline` passes.
+`OutOfMemoryError` if a buffer cannot grow.
 
 <a id="WriteHalf.impl.writeBinary"></a>
 
@@ -742,6 +752,7 @@ Sends `bytes` as one Binary frame, and flushes it. It waits while another writer
 
 #### Errors
 `Protocol` if the session is not open, `Io` if the transport fails or `deadline` passes.
+`OutOfMemoryError` if a buffer cannot grow.
 
 <a id="WriteHalf.impl.writePing"></a>
 
@@ -760,6 +771,7 @@ Sends a Ping with `payload` (at most 125 bytes), and flushes it.
 #### Errors
 `Protocol` if the session is not open or the payload is too large, `Io` if the transport
 fails or `deadline` passes.
+`OutOfMemoryError` if a buffer cannot grow.
 
 <a id="WriteHalf.impl.sendClose"></a>
 
@@ -781,6 +793,7 @@ this side already sent Close.
 
 #### Errors
 `Protocol` if the session failed, `Io` if the transport fails or `deadline` passes.
+`OutOfMemoryError` if a buffer cannot grow.
 
 
 Category: HTTP.

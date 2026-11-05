@@ -383,13 +383,13 @@ of `input`.
 
 #### Details
 
-If `input` fits in the free part of the buffer, this function copies it. If it is shorter
-than the whole buffer, this function sends the pending bytes in one `Writer.writeAll`
-call and then copies `input`. Otherwise it does not copy: it sends the pending bytes and then
-`input` in one `Writer.writeVectored` call, and the buffer is empty after it. If no bytes are
-pending, it sends `input` in one `Writer.writeAll` call. Thus the result is the length of
-`input` in every case. A provider such as `silk.io.writer_native.StdoutWriter` sends a vectored write
-in one system call.
+If `input` fits in the free part of the buffer, this function copies it. If it is shorter than
+the whole buffer, this function sends the pending bytes in one `Writer.writeAll` call and then
+copies `input`. Otherwise it does not copy: it sends the pending bytes and then `input` in one
+`Writer.writeVectored` call, and the buffer is empty after it. If no bytes are pending, it
+sends `input` in one `Writer.writeAll` call. Thus the result is the length of `input` in every
+case. A provider such as `silk.io.writer_native.StdoutWriter` sends a vectored write in one
+system call.
 
 #### Errors
 
@@ -417,11 +417,10 @@ Use `writeAllWriter` to buffer many small writes to a `Writer`, such as standard
 
 #### Details
 
-When this function returns, the buffer owns all of `input`, or the `Writer` already has
-them. The `Writer` does not necessarily have the buffered bytes yet. Call
-[`BufferedOutput.flushWriter`](#BufferedOutput.impl.flushWriter) to send them. An `input` as long as the buffer or longer goes to
-the `Writer` without a copy, after the pending bytes, in one
-`Writer.writeVectored` call.
+When this function returns, the buffer owns all of `input`, or the `Writer` already has them.
+The `Writer` does not necessarily have the buffered bytes yet. Call
+[`BufferedOutput.flushWriter`](#BufferedOutput.impl.flushWriter) to send them. An `input` as long as the buffer or longer goes
+to the `Writer` without a copy, after the pending bytes, in one `Writer.writeVectored` call.
 
 #### Errors
 
@@ -469,19 +468,18 @@ A `Writer` that owns a destination `Writer` and collects small writes into large
 ### When to use
 
 Use `BufferedWriter` when code that requires `&mut Writer` makes many small writes, such as
-field-by-field output, and each write to the destination has a cost, such as a system call.
-Wrap the destination, such as `silk.io.writer_native.StdoutWriter`, with [`BufferedWriter.make`](#BufferedWriter.impl.make) and
-provide the result as the `Writer`. Use [`BufferedOutput`](#BufferedOutput) when the caller keeps the
-destination itself or writes to a `ByteDuplex`.
+field-by-field output, and each write to the destination has a cost, such as a system call. Wrap
+the destination, such as `silk.io.writer_native.StdoutWriter`, with [`BufferedWriter.make`](#BufferedWriter.impl.make) and
+provide the result as the `Writer`. Use [`BufferedOutput`](#BufferedOutput) when the caller keeps the destination
+itself or writes to a `ByteDuplex`.
 
 ### Details
 
 `Writer.writeAll` copies small writes into the buffer and sends them when it is full, so the
-destination gets one write per fill. A write as long as the buffer or longer goes to the destination
-after the pending bytes, without a copy.
-`Writer.flush` sends the pending bytes and then flushes the destination. A failed write or
-flush of the destination makes the buffer terminal, as for [`BufferedOutput`](#BufferedOutput). Each later
-write or flush fails with a [`WriterError`](./io-writer.md#WriterError).
+destination gets one write per fill. A write as long as the buffer or longer goes to the
+destination after the pending bytes, without a copy. `Writer.flush` sends the pending bytes and
+then flushes the destination. A failed write or flush of the destination makes the buffer
+terminal, as for [`BufferedOutput`](#BufferedOutput). Each later write or flush fails with a [`WriterError`](./io-writer.md#WriterError).
 
 ### Gotchas
 

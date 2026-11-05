@@ -6,14 +6,15 @@ Handle-relative filesystem operations for the Windows `OsFileSystem` provider.
 
 ## Details
 Portable paths remain relative to the provider root. Native roots use absolute drive or UNC
-paths, such as `C:\\work` or `\\\\server\\share`. Names use canonical WTF-8 and preserve lone surrogates.
-Each component opens without kernel reparse traversal. Relative symbolic links resolve through
-retained directory handles; `..` stops at the provider root. Absolute symbolic links and junctions
-must name that native root or a descendant, with matching component spelling except drive-letter
-case. Other absolute targets and unknown tags are unsupported. At most 40 links resolve per path.
-Listings classify symbolic links and junctions as links; final removal and replacement act on the link.
-Operations require NTFS. Remote publication is refused before staging; deletion reports
-`Unsupported` when the server lacks POSIX disposition. Directory synchronization is unsupported.
+paths, such as `C:\\work` or `\\\\server\\share`. Names use canonical WTF-8 and preserve lone
+surrogates. Each component opens without kernel reparse traversal. Relative symbolic links
+resolve through retained directory handles; `..` stops at the provider root. Absolute symbolic
+links and junctions must name that native root or a descendant, with matching component spelling
+except drive-letter case. Other absolute targets and unknown tags are unsupported. At most 40
+links resolve per path. Listings classify symbolic links and junctions as links; final removal
+and replacement act on the link. Operations require NTFS. Remote publication is refused before
+staging; deletion reports `Unsupported` when the server lacks POSIX disposition. Directory
+synchronization is unsupported.
 
 Import as `WindowsFileSystem` with `import silk.platform.windows.filesystem { WindowsFileSystem }`.
 
@@ -52,13 +53,14 @@ Handle-relative NTFS operations for `OsFileSystem`, with no C runtime dependency
 ### Details
 
 All provider error codes are signed NTSTATUS bit patterns. Logical errors have no native code.
-Handles allow read, write, and delete sharing. Relative link targets stay inside the provider root;
-parent components stop at it. Absolute symlink and junction targets must name the same native root
-or a descendant, with matching component spelling except drive-letter case. Other absolute targets,
-unknown tags, and directory synchronization are unsupported. More than 40 links fails with `InvalidPath`.
-UNC roots support ordinary reads, writes, creation, inspection, and listing. Remote atomic publication
-is refused before staging; deletion requires the server's POSIX disposition support and otherwise fails.
-The intended minimum is Windows 10 1809; native fixtures currently target Server 2025 build 26100.
+Handles allow read, write, and delete sharing. Relative link targets stay inside the provider
+root; parent components stop at it. Absolute symlink and junction targets must name the same
+native root or a descendant, with matching component spelling except drive-letter case. Other
+absolute targets, unknown tags, and directory synchronization are unsupported. More than 40
+links fails with `InvalidPath`. UNC roots support ordinary reads, writes, creation, inspection,
+and listing. Remote atomic publication is refused before staging; deletion requires the server's
+POSIX disposition support and otherwise fails. The intended minimum is Windows 10 1809; native
+fixtures currently target Server 2025 build 26100.
 
 <a id="WindowsFileSystem.impl"></a>
 
@@ -76,10 +78,12 @@ impl WindowsFileSystem
 pub fn validRootBytes(root: &[u8]) -> bool
 ```
 
-Returns whether bytes are a canonical WTF-8 absolute drive or server/share UNC path with normalized backslash components.
+Returns whether bytes are a canonical WTF-8 absolute drive or server/share UNC path with
+normalized backslash components.
 
-Device, verbatim, drive-relative, and slash-rooted names are rejected. UNC requires a server and share.
-Case is preserved; empty, `.` and `..` components and trailing separators except drive roots are rejected.
+Device, verbatim, drive-relative, and slash-rooted names are rejected. UNC requires a server
+and share. Case is preserved; empty, `.` and `..` components and trailing separators except
+drive roots are rejected.
 
 <a id="WindowsFileSystem.impl.openFile"></a>
 
@@ -89,7 +93,8 @@ Case is preserved; empty, `.` and `..` components and trailing separators except
 pub effect fn openFile(root: &[u8], path: &[u8], writing: bool, operation: i32) -> FileHandle ! FileError
 ```
 
-Opens a regular file for reading, or creates and truncates it for writing, following confined links.
+Opens a regular file for reading, or creates and truncates it for writing, following confined
+links.
 
 Relative link targets resolve inside the root; `..` stops there. Absolute targets must name
 the native root or a descendant with matching component spelling except drive-letter case.
@@ -104,7 +109,8 @@ the native root or a descendant with matching component spelling except drive-le
 pub effect fn readFile(handle: &mut FileHandle, output: &mut [u8], operation: i32) -> usize ! FileError
 ```
 
-Reads bytes from the current position, returning zero at EOF. Native failures produce `FileError`.
+Reads bytes from the current position, returning zero at EOF. Native failures produce
+`FileError`.
 
 <a id="WindowsFileSystem.impl.writeFile"></a>
 
@@ -135,17 +141,19 @@ A later `FileError` leaves the partial file in place.
 pub effect fn writeFileAtomic(root: &[u8], path: &[u8], bytes: &[u8], policy: i32, durability: i32, counter: &mut u64) -> () ! AtomicWriteError
 ```
 
-Publishes complete bytes through one handle rename: policy 0 replaces, and policy 1 creates only.
-Remote volumes fail with `Unsupported` before a staging file is created.
+Publishes complete bytes through one handle rename: policy 0 replaces, and policy 1 creates
+only. Remote volumes fail with `Unsupported` before a staging file is created.
 
 #### Details
 
-An existing destination blocks create-only publication atomically. Replacement preserves existing
-handles to the old object. No copy or delete-then-rename fallback exists. At most 128 names are tried.
+An existing destination blocks create-only publication atomically. Replacement preserves
+existing handles to the old object. No copy or delete-then-rename fallback exists. At most 128
+names are tried.
 
 #### Errors
 
-- `AtomicWriteError` reports the first failure, publication state, and any failed temporary cleanup.
+- `AtomicWriteError` reports the first failure, publication state, and any failed temporary
+  cleanup.
 - A nonzero durability or unknown policy fails with `Unsupported` before any file is created.
 
 <a id="WindowsFileSystem.impl.inspect"></a>
@@ -170,8 +178,8 @@ pub effect fn command(root: &[u8], path: &[u8], command: i32, operation: i32) ->
 
 Creates a directory (0), removes a file or link (1), or removes an empty directory (2).
 Intermediate links resolve inside the root. Removal acts on the opened final object, preserves
-read-only attributes, and never follows a final link.
-Unsupported reparse tags or filesystem semantics produce `FileError` with reason `Unsupported`.
+read-only attributes, and never follows a final link. Unsupported reparse tags or filesystem
+semantics produce `FileError` with reason `Unsupported`.
 
 <a id="WindowsFileSystem.impl.openDirectory"></a>
 
@@ -193,8 +201,9 @@ except drive-letter case; outside targets and unknown tags fail with `Unsupporte
 pub effect fn next(handle: &mut DirectoryHandle, output: &mut [u8], count: &mut usize, required: &mut usize, outputKind: &mut i32, operation: i32) -> bool ! FileError
 ```
 
-Copies the next WTF-8 name and kind (file 0, directory 1, link 2), or reports required capacity.
-A successful zero-length result means EOF. Unknown tags and malformed records fail with `FileError`.
+Copies the next WTF-8 name and kind (file 0, directory 1, link 2), or reports required
+capacity. A successful zero-length result means EOF. Unknown tags and malformed records fail
+with `FileError`.
 
 <a id="WindowsFileSystem.impl.createUnique"></a>
 
@@ -204,9 +213,10 @@ A successful zero-length result means EOF. Unknown tags and malformed records fa
 pub effect fn createUnique(root: &[u8], path: &[u8], prefix: &[u8], counter: &mut u64, output: &mut [u8], count: &mut usize, required: &mut usize, operation: i32) -> bool ! FileError
 ```
 
-Creates a unique directory below `path`, or reports required output capacity without creating anything.
-Names use `prefix`, a hyphen, and 16 hexadecimal digits. Only name collisions retry, at most 128 times.
-Invalid names, unsupported traversal, and native failures produce `FileError`.
+Creates a unique directory below `path`, or reports required output capacity without creating
+anything. Names use `prefix`, a hyphen, and 16 hexadecimal digits. Only name collisions retry,
+at most 128 times. Invalid names, unsupported traversal, and native failures produce
+`FileError`.
 
 <a id="WindowsFileSystem.impl.syncDirectory"></a>
 
@@ -216,7 +226,8 @@ Invalid names, unsupported traversal, and native failures produce `FileError`.
 pub effect fn syncDirectory(root: &[u8], path: &[u8]) -> () ! FileError
 ```
 
-Fails with `Unsupported`; no Windows directory-durability primitive is established for this provider.
+Fails with `Unsupported`; no Windows directory-durability primitive is established for this
+provider.
 
 <a id="WindowsFileSystem.impl.closeFile"></a>
 

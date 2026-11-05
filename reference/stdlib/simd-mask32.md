@@ -88,8 +88,8 @@ Returns whether lane `index` of `mask` is set. Traps when `index` is [`LANES`](#
 pub fn insert(mask: mask<32>, index: usize, set: bool) -> mask<32>
 ```
 
-Returns `mask` with lane `index` set when `set` is true and clear otherwise. Traps when `index` is
-[`LANES`](#LANES) or more.
+Returns `mask` with lane `index` set when `set` is true and clear otherwise. Traps when `index`
+is [`LANES`](#LANES) or more.
 
 <a id="any"></a>
 

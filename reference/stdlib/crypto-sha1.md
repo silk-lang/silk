@@ -6,8 +6,8 @@ Compute SHA-1 digests (20 bytes) for old protocols and file formats.
 
 ## When to use
 Use [`Sha1`](#Sha1) only when an existing format needs SHA-1, such as a Git object ID or the WebSocket
-handshake. For new designs, use SHA-256 from `silk.crypto.sha2` or SHA-3 from `silk.crypto.sha3`. For the keys
-of a hash map, use `silk.collections.hash`.
+handshake. For new designs, use SHA-256 from `silk.crypto.sha2` or SHA-3 from
+`silk.crypto.sha3`. For the keys of a hash map, use `silk.collections.hash`.
 
 ## Details
 [`Sha1.hash`](#Sha1.impl.hash) returns the digest of one slice. For a message that arrives in parts, call

@@ -6,9 +6,9 @@ Parse a URI or a relative reference (RFC 3986) and read its components without a
 
 ## When to use
 Use [`UriReference.parse`](#UriReference.impl.parse) for text that can be relative, such as an HTML `href`, a redirect
-`Location`, or a request target like `/search?q=silk`. Use `silk.uri.uri` when the text must have a
-scheme. To change components or build a reference, use `silk.uri.components`. To decode the
-escapes in a component, use `silk.uri.percent`.
+`Location`, or a request target like `/search?q=silk`. Use `silk.uri.uri` when the text must
+have a scheme. To change components or build a reference, use `silk.uri.components`. To decode
+the escapes in a component, use `silk.uri.percent`.
 
 ## Details
 [`UriReference.parse`](#UriReference.impl.parse) checks the generic syntax of RFC 3986 and returns a view that borrows the

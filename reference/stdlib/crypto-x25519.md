@@ -156,8 +156,8 @@ secrets are 32 bytes, little-endian. Nothing allocates.
 ### Gotchas
 The exchange does not tell you who the other side is. An attacker in the middle can run one
 exchange with each side. Authenticate the exchange, for example with a certificate signature.
-Derive the real keys from the shared secret with `silk.crypto.hkdf`. The key is not erased when it is
-dropped.
+Derive the real keys from the shared secret with `silk.crypto.hkdf`. The key is not erased when
+it is dropped.
 
 <a id="X25519.impl"></a>
 
@@ -230,8 +230,8 @@ point that is not on the curve.
 The key pair is consumed also when it fails.
 
 #### Gotchas
-Pass the result through a key derivation function such as `silk.crypto.hkdf` before you use it as a
-key.
+Pass the result through a key derivation function such as `silk.crypto.hkdf` before you use it
+as a key.
 
 <a id="X25519Base"></a>
 

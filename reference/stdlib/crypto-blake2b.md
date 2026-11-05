@@ -6,8 +6,8 @@ Portable BLAKE2b-512 state for the unkeyed 64-byte cryptographic digest of RFC 7
 
 ## When to use
 Use [`Blake2b512`](#Blake2b512) where a format names BLAKE2b with a 64-byte digest, such as prehashed
-minisign signatures. Use `silk.crypto.sha2` where a protocol names SHA-2. Use `silk.collections.hash` only for
-collection keys. It is not a cryptographic hash.
+minisign signatures. Use `silk.crypto.sha2` where a protocol names SHA-2. Use
+`silk.collections.hash` only for collection keys. It is not a cryptographic hash.
 
 ## Details
 The state supports incremental input through `update`, consuming finalization through `finish`,
@@ -51,8 +51,8 @@ An incremental unkeyed BLAKE2b state with a 64-byte digest (RFC 7693).
 ### When to use
 
 Use it where a format names BLAKE2b with a 64-byte digest, such as prehashed minisign
-signatures. Use `silk.crypto.sha2` where a protocol names SHA-2. Use `silk.collections.hash` only for collection
-keys. It is not a cryptographic hash.
+signatures. Use `silk.crypto.sha2` where a protocol names SHA-2. Use `silk.collections.hash`
+only for collection keys. It is not a cryptographic hash.
 
 ### Details
 

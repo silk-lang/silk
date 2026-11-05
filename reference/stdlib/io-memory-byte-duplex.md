@@ -5,10 +5,10 @@
 A scripted `ByteDuplex` transport in memory, for tests of protocol code.
 
 ## When to use
-Use [`MemoryByteDuplex`](#MemoryByteDuplex) to test code that uses `silk.io.byte_duplex.ByteDuplex` without a network.
-A script controls what each read returns, how many bytes each write accepts, and when failures
-happen. After the test, check the bytes that the code wrote with [`MemoryByteDuplex.outbound`](#MemoryByteDuplex.impl.outbound)
-and the order of operations with [`MemoryByteDuplex.audit`](#MemoryByteDuplex.impl.audit).
+Use [`MemoryByteDuplex`](#MemoryByteDuplex) to test code that uses `silk.io.byte_duplex.ByteDuplex` without a
+network. A script controls what each read returns, how many bytes each write accepts, and when
+failures happen. After the test, check the bytes that the code wrote with
+[`MemoryByteDuplex.outbound`](#MemoryByteDuplex.impl.outbound) and the order of operations with [`MemoryByteDuplex.audit`](#MemoryByteDuplex.impl.audit).
 
 ## Details
 [`MemoryByteDuplex.make`](#MemoryByteDuplex.impl.make) takes the read events, the write events, and the sizes of the output
@@ -461,10 +461,10 @@ A scripted `ByteDuplex` transport in memory, for tests of protocol code. Make on
 [`MemoryByteDuplex.make`](#MemoryByteDuplex.impl.make) and provide it as `ByteDuplex`.
 
 ### When to use
-Use it to test code that uses `silk.io.byte_duplex.ByteDuplex` without a network. A script controls
-what each read returns, how many bytes each write accepts, and when failures happen. After the
-test, check the bytes that the code wrote with [`MemoryByteDuplex.outbound`](#MemoryByteDuplex.impl.outbound) and the order of
-operations with [`MemoryByteDuplex.audit`](#MemoryByteDuplex.impl.audit).
+Use it to test code that uses `silk.io.byte_duplex.ByteDuplex` without a network. A script
+controls what each read returns, how many bytes each write accepts, and when failures happen.
+After the test, check the bytes that the code wrote with [`MemoryByteDuplex.outbound`](#MemoryByteDuplex.impl.outbound) and the
+order of operations with [`MemoryByteDuplex.audit`](#MemoryByteDuplex.impl.audit).
 
 ### Details
 [`MemoryByteDuplex.make`](#MemoryByteDuplex.impl.make) allocates everything one time. The operations do not allocate.

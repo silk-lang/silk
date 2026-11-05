@@ -7,7 +7,8 @@ The `Logger` effect: log messages with a level, a template, and values.
 ## When to use
 Require `&mut Logger` in code that logs, and call `Effect.logInfo`, `Effect.logWarning`, and the
 other `Effect.log...` functions. The program decides where the messages go when it provides the
-logger: `silk.io.logger_native.StderrLogger` for a native program, or [`InMemoryLogger`](#InMemoryLogger) in a test.
+logger: `silk.io.logger_native.StderrLogger` for a native program, or [`InMemoryLogger`](#InMemoryLogger) in a
+test.
 
 ## Details
 Each call has a [`LogLevel`](#LogLevel), a template that is known at compile time, and a borrowed tuple or
@@ -158,13 +159,14 @@ The effect that receives log messages with a level, a template, and values.
 
 Require `&mut Logger` in code that logs, and call `Effect.logInfo`, `Effect.logWarning`, and the
 other `Effect.log...` functions. The program decides where the messages go when it provides the
-logger: `silk.io.logger_native.StderrLogger` for a native program, or [`InMemoryLogger`](#InMemoryLogger) in a test.
+logger: `silk.io.logger_native.StderrLogger` for a native program, or [`InMemoryLogger`](#InMemoryLogger) in a
+test.
 
 ### Details
 
 The caller does not need a `Writer` or an `Allocator`. A provider implements `log`. It formats
-the message with the rules of `silk.text.format` and decides where it goes and what decoration it
-gets, such as a newline or a timestamp.
+the message with the rules of `silk.text.format` and decides where it goes and what decoration
+it gets, such as a newline or a timestamp.
 
 <a id="Logger.log"></a>
 
@@ -182,8 +184,8 @@ Formats `template` with `args` and logs it at `level`.
 
 #### Details
 
-The template rules are those of `silk.text.format.Format.format`, and the compiler checks them. The
-call adds no newline, level label, or timestamp. The provider can add them.
+The template rules are those of `silk.text.format.Format.format`, and the compiler checks
+them. The call adds no newline, level label, or timestamp. The provider can add them.
 
 #### Errors
 

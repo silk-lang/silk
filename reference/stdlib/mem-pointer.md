@@ -387,7 +387,8 @@ Drops the `T` at `pointer` in place and leaves the storage uninitialized.
 #### When to use
 
 Use `dropInPlace` to destroy a value whose storage is released next, such as a heap cell. It
-runs the drop on the pointee directly. `drop Pointer.take(pointer)` copies the value out first.
+runs the drop on the pointee directly. `drop Pointer.take(pointer)` copies the value out
+first.
 
 #### Gotchas
 

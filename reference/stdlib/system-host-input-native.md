@@ -6,16 +6,17 @@ The native provider of the `HostInput` effect: command-line arguments, environme
 working directory.
 
 ## When to use
-A native `main` that requires `&mut HostInput` gets this provider from `silk.platform.native.start`. To
-make one yourself, capture a `NativeHostInput` from `silk.platform.native.host_input`, and pass it to
-[`OsHostInput.make`](#OsHostInput.impl.make).
+A native `main` that requires `&mut HostInput` gets this provider from
+`silk.platform.native.start`. To make one yourself, capture a `NativeHostInput` from
+`silk.platform.native.host_input`, and pass it to [`OsHostInput.make`](#OsHostInput.impl.make).
 
 ## Details
 The arguments and the environment come from the snapshot, so they do not change. The working
 directory is read from the process at each call. Each result is a new owned copy.
 
 ## Gotchas
-The provider exists only on Darwin on x86_64 or aarch64, and Linux with GNU libc on x86_64 or aarch64.
+The provider exists only on Darwin on x86_64 or aarch64, and Linux with GNU libc on x86_64 or
+aarch64.
 
 ## Examples
 ### Read the working directory

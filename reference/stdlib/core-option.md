@@ -183,6 +183,42 @@ impl<T: Copy> Copy for Option<T>
 
 An `Option` of a `Copy` type is `Copy`, so a struct with an `Option` field can be `Copy` too.
 
+<a id="Option.impl.Equal"></a>
+
+## Implementation `Equal for Option<T>`
+
+```silk
+impl<T: Equal> Equal for Option<T>
+```
+
+Two options are equal when both are absent, or both are present with equal values, so
+`&found == &Option<string>.some("Ada")` tests for one present value.
+
+### Examples
+
+```silk
+import silk.core.option { Option }
+
+fn isAda(found: Option<string>) -> bool {
+  return &found == &Option<string>.some("Ada")
+}
+
+pub fn main() -> i32 {
+  if !isAda(Option<string>.some("Ada")) || isAda(Option<string>.some("Bo")) || isAda(Option<string>.none()) {
+    return 1
+  }
+  return 0
+}
+```
+
+<a id="Option.impl.Equal.equals"></a>
+
+### Operation `equals`
+
+```silk
+fn equals(left: &Self, right: &Self) -> bool
+```
+
 <a id="Option.impl"></a>
 
 ## Implementation `Option<T>`

@@ -6,7 +6,8 @@ Hash sets that own their elements, with deterministic seeded hashing.
 
 ## When to use
 Use [`HashSet`](#HashSet) to test membership fast, or to keep one copy of each value. The element type
-must implement `silk.collections.hash.HashKey`. Use `silk.collections.list.List` when order or duplicate values matter.
+must implement `silk.collections.hash.HashKey`. Use `silk.collections.list.List` when order or
+duplicate values matter.
 
 ## Details
 [`HashSet.make`](#HashSet.impl.make) does not allocate. The first insert allocates eight buckets.
@@ -109,7 +110,8 @@ A hash set that owns unique elements, with deterministic seeded hashing.
 ### When to use
 
 Use it to test membership fast, or to keep one copy of each value. The element type must
-implement `silk.collections.hash.HashKey`. Use `silk.collections.list.List` when order or duplicate values matter.
+implement `silk.collections.hash.HashKey`. Use `silk.collections.list.List` when order or
+duplicate values matter.
 
 ### Details
 
@@ -242,8 +244,7 @@ If the buckets already hold `additional` more elements under three quarters of t
 count, this function does nothing. Otherwise, it rebuilds the table once, with the smallest
 bucket count, doubling from the current one or from 8, that holds the length plus `additional`
 elements. The rebuild also reclaims the buckets of removed elements. The length does not
-change. An
-`additional` of 0 does nothing.
+change. An `additional` of 0 does nothing.
 
 #### Errors
 

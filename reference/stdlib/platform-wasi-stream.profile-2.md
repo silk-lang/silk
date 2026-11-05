@@ -6,7 +6,8 @@ Owned Preview 2 input and output streams with partial transfers and deadlines.
 
 ## Details
 Stream owners close their resource on drop. Operations use WASI polling and the supplied
-monotonic clock. The parent resource, such as a TCP socket or HTTP body, must outlive its streams.
+monotonic clock. The parent resource, such as a TCP socket or HTTP body, must outlive its
+streams.
 
 Import as `wasi_stream` with `import silk.platform.wasi.stream as wasi_stream`.
 
