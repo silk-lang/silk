@@ -27,13 +27,19 @@
 //!
 //! # Errors
 //! - [`ServerError`] for a configuration that is not valid, an alert from the client, a protocol
-//!   error, no shared parameters, a limit, or a call in the wrong state. An error from a call after
+//!   error, no shared parameters, a client certificate that [`ClientAuth`] rejects, a limit, or a
+//!   call in the wrong state. An error from a call after
 //!   [`Server.make`] is permanent for the server.
 //! - `OutOfMemoryError` if the `Allocator` fails.
 //!
+//! With [`ClientAuth`] `Request`, the server sends a CertificateRequest, checks the client's
+//! CertificateVerify with its leaf's key, and validates the client's chain against your trust
+//! anchors for the `ClientAuth` purpose. [`Server.clientCertificateStatus`] and
+//! [`Server.clientCertificates`] tell you the result.
+//!
 //! # Gotchas
-//! The server does not ask for client certificates, and it does not support PSK, session tickets,
-//! or 0-RTT data. A client that sends early data fails with `BadRecordMac`. The server sends no
+//! The server does not support PSK, session tickets, or 0-RTT data. It does not ask for `ed25519`
+//! client signatures, because the certificate profile admits no Ed25519 client keys. A client that sends early data fails with `BadRecordMac`. The server sends no
 //! alert when it fails, so close the transport. Dropping the server does not send `close_notify`.
 //! Call [`Server.closeWrite`] first. Secrets are not erased.
 //!
@@ -48,6 +54,7 @@
 //! import silk.tls.client { AlpnConfig }
 //! import silk.tls.server {
 //!   CertificateDer,
+//!   ClientAuth,
 //!   GroupPolicy,
 //!   Server,
 //!   ServerConfig,
@@ -85,6 +92,7 @@
 //!     certificates: Slice.view<CertificateDer<'static>>(&chain, 0, 0),
 //!     alpn: AlpnConfig.defaults(),
 //!     groups: GroupPolicy.defaults(),
+//!     clientAuth: ClientAuth<'static>.Off,
 //!     limits: ServerLimits.defaults(),
 //!   }
 //!   let made = run Server.make(&config, ServerKey.EcdsaP256 { key: move key })
@@ -101,6 +109,19 @@
 
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.tls.certificate { Certificate, DecodeError, DecodeLimits }
+import silk.tls.certificate_path {
+  CertificatePath,
+  ValidatedPath,
+  ValidationError,
+  ValidationLimits,
+  ValidationReason,
+}
+import silk.tls.certificate_profile { CertificatePurpose }
+import silk.tls.signature { HandshakeSignature, SignatureFailure }
+import silk.tls.trust_anchor { TrustAnchor }
+import silk.tls.trust_snapshot { SnapshotLimits, TrustSnapshot, TrustSourceError }
+import silk.system.system_clock { Instant, SystemClock }
+import silk.collections.list { List }
 import silk.tls.client { AlpnConfig }
 import silk.text.format { Debug, Format, Formatter }
 import silk.crypto.hkdf { HkdfSha256, HkdfSha384 }
@@ -247,8 +268,16 @@ pub struct ServerLimits {
   pub certificates: usize,
   /// Maximum aggregate DER bytes in the configured chain.
   pub certificateBytes: usize,
-  /// Strict decoder policy for the configured leaf certificate.
+  /// Strict decoder policy for the configured leaf certificate and each client certificate.
   pub certificateDecode: DecodeLimits,
+  /// Maximum certificate count in a client's chain, at most 16.
+  pub clientCertificates: usize,
+  /// Maximum aggregate DER bytes in a client's chain.
+  pub clientCertificateBytes: usize,
+  /// Limits for the copy of [`ClientAuth`]'s trust anchors.
+  pub clientTrust: SnapshotLimits,
+  /// Limits for validating a client's chain.
+  pub clientValidation: ValidationLimits,
 }
 
 impl Copy for ServerLimits {}
@@ -266,6 +295,10 @@ impl ServerLimits {
       certificates: 16,
       certificateBytes: 262144,
       certificateDecode: DecodeLimits.defaults(),
+      clientCertificates: 16,
+      clientCertificateBytes: 262144,
+      clientTrust: SnapshotLimits.defaults(),
+      clientValidation: ValidationLimits.defaults(),
     }
   }
 }
@@ -279,8 +312,69 @@ pub struct ServerConfig<'a> {
   pub alpn: AlpnConfig<'a>,
   /// The key exchange groups that the server allows.
   pub groups: GroupPolicy,
+  /// Whether the server asks for a client certificate, and how it checks one.
+  pub clientAuth: ClientAuth<'a>,
   /// Finite connection limits.
   pub limits: ServerLimits,
+}
+
+/// Whether a [`Server`] asks the client for a certificate, in [`ServerConfig.clientAuth`].
+pub union ClientAuth<'a> {
+  /// The server does not ask for a client certificate.
+  Off,
+  /// The server sends a CertificateRequest. When the client sends a chain, the server checks its
+  /// CertificateVerify with the leaf's key, and validates the chain against `trust` at
+  /// `validationTime` for the `ClientAuth` purpose.
+  Request {
+    /// The anchors that a client chain must lead to. [`Server.make`] copies them.
+    pub trust: &'a TrustSnapshot,
+    /// The time at which certificate dates are checked.
+    pub validationTime: &'a Instant,
+    /// Whether a client that sends no certificate fails with `ClientCertificateRequired`.
+    pub required: bool,
+    /// Whether a chain that does not validate fails with `UntrustedClientCertificate`. Otherwise
+    /// the handshake completes, and [`Server.clientCertificateStatus`] gives `Untrusted`.
+    pub rejectUntrusted: bool,
+  },
+}
+
+impl<'a> Copy for ClientAuth<'a> {}
+
+/// What the server knows about the client's certificate, from
+/// [`Server.clientCertificateStatus`].
+pub union ClientCertificateStatus {
+  /// The server does not ask for a client certificate.
+  NotRequested,
+  /// The client has not sent its Certificate message yet.
+  Pending,
+  /// The client sent no certificate.
+  Absent,
+  /// The chain validated, and the client signed CertificateVerify with the leaf's key.
+  Trusted,
+  /// The client signed CertificateVerify with the leaf's key, but the chain did not validate.
+  Untrusted {
+    /// Why the chain did not validate.
+    pub error: ValidationError,
+  },
+}
+
+impl Debug for ClientCertificateStatus {
+  /// Writes the name of the variant and its fields, such as `Untrusted { ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      ClientCertificateStatus.NotRequested => run Format.write(&mut formatter, b"NotRequested")
+      ClientCertificateStatus.Pending => run Format.write(&mut formatter, b"Pending")
+      ClientCertificateStatus.Absent => run Format.write(&mut formatter, b"Absent")
+      ClientCertificateStatus.Trusted => run Format.write(&mut formatter, b"Trusted")
+      ClientCertificateStatus.Untrusted { error } => {
+        let mut record = run Format.debugRecord("Untrusted", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+    }
+  }
 }
 
 /// The next action or observable connection event of a [`Server`], in [`ServerProgress.demand`].
@@ -368,6 +462,8 @@ pub enum ServerProtocolReason {
   CompatibilityCcs,
   /// A KeyUpdate or other post-handshake message is not valid.
   PostHandshake,
+  /// A client Certificate or CertificateVerify message has invalid framing.
+  ClientCertificate,
   /// The server reached an impossible private transition.
   InternalState,
 }
@@ -392,6 +488,10 @@ impl Debug for ServerProtocolReason {
       )
       ServerProtocolReason.CompatibilityCcs => run Format.write(&mut formatter, b"CompatibilityCcs")
       ServerProtocolReason.PostHandshake => run Format.write(&mut formatter, b"PostHandshake")
+      ServerProtocolReason.ClientCertificate => run Format.write(
+        &mut formatter,
+        b"ClientCertificate",
+      )
       ServerProtocolReason.InternalState => run Format.write(&mut formatter, b"InternalState")
     }
   }
@@ -443,6 +543,12 @@ pub enum ServerLimitKind {
   CertificateBytes,
   /// One ALPN protocol or list.
   Alpn,
+  /// Client certificate count.
+  ClientCertificates,
+  /// Client certificate DER bytes.
+  ClientCertificateBytes,
+  /// Trust anchors for client certificates.
+  ClientTrust,
 }
 
 impl Debug for ServerLimitKind {
@@ -463,6 +569,12 @@ impl Debug for ServerLimitKind {
       ServerLimitKind.Certificates => run Format.write(&mut formatter, b"Certificates")
       ServerLimitKind.CertificateBytes => run Format.write(&mut formatter, b"CertificateBytes")
       ServerLimitKind.Alpn => run Format.write(&mut formatter, b"Alpn")
+      ServerLimitKind.ClientCertificates => run Format.write(&mut formatter, b"ClientCertificates")
+      ServerLimitKind.ClientCertificateBytes => run Format.write(
+        &mut formatter,
+        b"ClientCertificateBytes",
+      )
+      ServerLimitKind.ClientTrust => run Format.write(&mut formatter, b"ClientTrust")
     }
   }
 }
@@ -527,6 +639,24 @@ pub union ServerError {
   /// The client's ALPN offer shares no protocol with the server, or the server requires ALPN and
   /// the client sent none.
   NoApplicationProtocol,
+  /// The server requires a client certificate, and the client sent none.
+  ClientCertificateRequired,
+  /// A client certificate did not decode.
+  ClientCertificateDecode {
+    /// The decoder failure.
+    pub error: DecodeError,
+  },
+  /// The client's CertificateVerify did not verify with its leaf's key.
+  ClientCertificateVerify {
+    /// The signature failure.
+    pub error: SignatureFailure,
+  },
+  /// The client's chain did not validate, and [`ClientAuth`] rejects such chains.
+  /// [`Server.clientCertificateStatus`] gives the full validation error.
+  UntrustedClientCertificate {
+    /// Why the chain did not validate.
+    pub reason: ValidationReason,
+  },
 }
 
 impl Copy for ServerError {}
@@ -588,6 +718,25 @@ impl Debug for ServerError {
         &mut formatter,
         b"NoApplicationProtocol",
       )
+      ServerError.ClientCertificateRequired => run Format.write(
+        &mut formatter,
+        b"ClientCertificateRequired",
+      )
+      ServerError.ClientCertificateDecode { error } => {
+        let mut record = run Format.debugRecord("ClientCertificateDecode", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      ServerError.ClientCertificateVerify { error } => {
+        let mut record = run Format.debugRecord("ClientCertificateVerify", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      ServerError.UntrustedClientCertificate { reason } => {
+        let mut record = run Format.debugRecord("UntrustedClientCertificate", &mut formatter)
+        run Format.debugField(&mut record, "reason", &reason, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
     }
   }
 }
@@ -597,8 +746,16 @@ enum ServerState {
   HelloRetryPending,
   AwaitRetryClientHello,
   ServerFlightPending,
+  AwaitClientCertificate,
+  AwaitClientCertificateVerify,
   AwaitClientFinished,
   Traffic,
+}
+
+enum ClientAuthMode {
+  Off,
+  Optional,
+  Required,
 }
 
 enum PendingKind {
@@ -689,7 +846,12 @@ pub struct Server {
   clientHandshakeSecret: [u8; 48],
   serverHandshakeSecret: [u8; 48],
   masterSecret: [u8; 48],
-  expectedFinished: [u8; 48],
+  clientAuthMode: ClientAuthMode,
+  rejectUntrusted: bool,
+  clientTrust: TrustSnapshot,
+  clientValidationTime: Instant,
+  clientChain: List<Certificate>,
+  clientStatus: ClientCertificateStatus,
   sender: TlsRecordSender,
   receiver: TlsRecordReceiver,
   handshake: Intrinsic.RawBuffer<u8>,
@@ -809,6 +971,14 @@ impl Server {
       index = index + usize.ONE
     }
 
+    let copied = run copyClientAuth(config.clientAuth, limits.clientTrust)
+    let clientAuth = match move copied {
+      Result<ClientAuthCopy, ServerError>.Failure { error } => {
+        return Result<Server, ServerError>.failResult(error)
+      }
+      Result<ClientAuthCopy, ServerError>.Success { value } => move value
+    }
+
     let alpnLength = alpnPayloadLength(config.alpn)
     let mut alpn = run allocateBytes(nonzero(alpnLength))
     let mut alpnOffsets = zeroUsize16()
@@ -859,7 +1029,12 @@ impl Server {
         clientHandshakeSecret: zero48(),
         serverHandshakeSecret: zero48(),
         masterSecret: zero48(),
-        expectedFinished: zero48(),
+        clientAuthMode: clientAuth.mode,
+        rejectUntrusted: clientAuth.rejectUntrusted,
+        clientTrust: move clientAuth.trust,
+        clientValidationTime: move clientAuth.validationTime,
+        clientChain: List<Certificate>.make(),
+        clientStatus: move clientAuth.status,
         sender: move sender,
         receiver: move receiver,
         handshake: move handshake,
@@ -946,6 +1121,18 @@ impl Server {
   /// Returns whether the server sent a HelloRetryRequest in this handshake.
   pub fn retried(self: &Self) -> bool {
     return self.helloRetried
+  }
+
+  /// Returns what the server knows about the client's certificate. After `HandshakeComplete` it is
+  /// `NotRequested`, `Absent`, `Trusted`, or `Untrusted`.
+  pub fn clientCertificateStatus<'a>(self: &'a Self) -> &'a ClientCertificateStatus {
+    return &self.clientStatus
+  }
+
+  /// Returns the client's certificates, leaf first, as the client sent them. It is empty until the
+  /// client's Certificate message arrives, and when the client sent none.
+  pub fn clientCertificates<'a>(self: &'a Self) -> &'a [Certificate] {
+    return List<Certificate>.asSlice(&self.clientChain)
   }
 
   /// Returns whether the client sent `close_notify`. Plaintext that came before it can still be
@@ -1259,6 +1446,71 @@ fn limitError(kind: ServerLimitKind, limit: usize) -> Option<ServerError> {
   return Option<ServerError>.some(ServerError.LimitExceeded { kind: kind, limit: limit })
 }
 
+struct ClientAuthCopy {
+  mode: ClientAuthMode,
+  rejectUntrusted: bool,
+  trust: TrustSnapshot,
+  validationTime: Instant,
+  status: ClientCertificateStatus,
+}
+
+effect fn copyClientAuth<'a>(auth: ClientAuth<'a>, limits: SnapshotLimits) -> Result<
+  ClientAuthCopy,
+  ServerError
+>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match auth {
+    ClientAuth<'a>.Off => {
+      let empty = TrustSnapshot.fromAnchors(List<TrustAnchor>.make(), limits)
+      let trust = match move empty {
+        Result<TrustSnapshot, TrustSourceError>.Failure { .. } => {
+          return limitFailure<ClientAuthCopy>(ServerLimitKind.ClientTrust, limits.anchors)
+        }
+        Result<TrustSnapshot, TrustSourceError>.Success { value } => move value
+      }
+      return Result<ClientAuthCopy, ServerError>.succeed(
+        ClientAuthCopy {
+          mode: ClientAuthMode.Off,
+          rejectUntrusted: false,
+          trust: move trust,
+          validationTime: SystemClock.make(0, 0),
+          status: ClientCertificateStatus.NotRequested,
+        },
+      )
+    }
+    ClientAuth<'a>.Request { trust, validationTime, required, rejectUntrusted } => {
+      let copied = run TrustSnapshot.copy(trust, limits)
+      let owned = match move copied {
+        Result<TrustSnapshot, TrustSourceError>.Failure { .. } => {
+          return limitFailure<ClientAuthCopy>(ServerLimitKind.ClientTrust, limits.anchors)
+        }
+        Result<TrustSnapshot, TrustSourceError>.Success { value } => move value
+      }
+      let mut mode = ClientAuthMode.Optional
+      if required {
+        mode = ClientAuthMode.Required
+      }
+      return Result<ClientAuthCopy, ServerError>.succeed(
+        ClientAuthCopy {
+          mode: mode,
+          rejectUntrusted: rejectUntrusted,
+          trust: move owned,
+          validationTime: SystemClock.make(
+            SystemClock.seconds(validationTime),
+            SystemClock.nanoseconds(validationTime),
+          ),
+          status: ClientCertificateStatus.Pending,
+        },
+      )
+    }
+  }
+}
+
+fn limitFailure<T>(kind: ServerLimitKind, limit: usize) -> Result<T, ServerError> {
+  return Result<T, ServerError>.failResult(ServerError.LimitExceeded { kind: kind, limit: limit })
+}
+
 fn validateLimits(limits: ServerLimits) -> Option<ServerError> {
   if limits.handshakeBodyBytes < 64 || limits.handshakeBodyBytes > 16777215 {
     return limitError(ServerLimitKind.HandshakeBodyBytes, limits.handshakeBodyBytes)
@@ -1277,6 +1529,12 @@ fn validateLimits(limits: ServerLimits) -> Option<ServerError> {
   }
   if limits.certificateBytes == 0 || limits.certificateBytes > 16777215 {
     return limitError(ServerLimitKind.CertificateBytes, limits.certificateBytes)
+  }
+  if limits.clientCertificates == 0 || limits.clientCertificates > CERTIFICATE_LIMIT {
+    return limitError(ServerLimitKind.ClientCertificates, limits.clientCertificates)
+  }
+  if limits.clientCertificateBytes == 0 || limits.clientCertificateBytes > 16777215 {
+    return limitError(ServerLimitKind.ClientCertificateBytes, limits.clientCertificateBytes)
   }
   return Option<ServerError>.none()
 }
@@ -1612,7 +1870,11 @@ fn completePending(server: &mut Server) -> Result<(), ServerError> {
     if let Result<(), ServerError>.Failure { error } = recordUnit(move replaced) {
       return failure(error)
     }
-    server.state = ServerState.AwaitClientFinished
+    if server.clientAuthMode == ClientAuthMode.Off {
+      server.state = ServerState.AwaitClientFinished
+    } else {
+      server.state = ServerState.AwaitClientCertificate
+    }
     return ok()
   }
   if kind == PendingKind.KeyUpdate {
@@ -1856,6 +2118,8 @@ fn countEmptyRecord(server: &mut Server) -> Result<(), ServerError> {
 fn compatibilityWindow(state: ServerState) -> bool {
   return state == ServerState.HelloRetryPending || state == ServerState.AwaitRetryClientHello
     || state == ServerState.ServerFlightPending
+    || state == ServerState.AwaitClientCertificate
+    || state == ServerState.AwaitClientCertificateVerify
     || state == ServerState.AwaitClientFinished
 }
 
@@ -1946,6 +2210,12 @@ effect fn dispatchHandshake(
   }
   if server.state == ServerState.AwaitRetryClientHello && messageType == 1 {
     return run handleClientHello(&mut server.*, messageLength, true)
+  }
+  if server.state == ServerState.AwaitClientCertificate && messageType == 11 {
+    return run handleClientCertificate(&mut server.*, messageLength)
+  }
+  if server.state == ServerState.AwaitClientCertificateVerify && messageType == 15 {
+    return handleClientCertificateVerify(&mut server.*, messageLength)
   }
   if server.state == ServerState.AwaitClientFinished && messageType == 20 {
     return handleClientFinished(&mut server.*, messageLength)
@@ -2926,6 +3196,25 @@ effect fn buildFlight(server: &mut Server) -> Result<(), ServerError>
   setU24(&mut server.flight, start + usize.ONE, cursor - start - HANDSHAKE_HEADER_LENGTH)
   updateTranscriptFlight(&mut server.*, start, cursor - start)
 
+  // CertificateRequest, with an empty context and the schemes that `HandshakeSignature` verifies
+  // for keys that the certificate profile admits.
+  if server.clientAuthMode != ClientAuthMode.Off {
+    let requestStart = cursor
+    putU8(&mut server.flight, &mut cursor, 13)
+    putU24(&mut server.flight, &mut cursor, 1 + 2 + 4 + 2 + 2 * CLIENT_SCHEMES.length)
+    putU8(&mut server.flight, &mut cursor, 0)
+    putU16(&mut server.flight, &mut cursor, 4 + 2 + 2 * CLIENT_SCHEMES.length)
+    putU16(&mut server.flight, &mut cursor, 13)
+    putU16(&mut server.flight, &mut cursor, 2 + 2 * CLIENT_SCHEMES.length)
+    putU16(&mut server.flight, &mut cursor, 2 * CLIENT_SCHEMES.length)
+    let mut schemeIndex = usize.ZERO
+    while schemeIndex < CLIENT_SCHEMES.length {
+      putU16(&mut server.flight, &mut cursor, CLIENT_SCHEMES[schemeIndex])
+      schemeIndex = schemeIndex + usize.ONE
+    }
+    updateTranscriptFlight(&mut server.*, requestStart, cursor - requestStart)
+  }
+
   // Certificate, with an empty request context and the configured chain.
   let certificateStart = cursor
   let chainLength = server.chainLength
@@ -3001,16 +3290,8 @@ effect fn buildFlight(server: &mut Server) -> Result<(), ServerError>
     }
     Result<[u8; 48], ServerError>.Success { value } => value
   }
-  let clientSecret = server.clientHandshakeSecret
-  let expected = match finishedData(length, &clientSecret, &finalHash) {
-    Result<[u8; 48], ServerError>.Failure { error } => {
-      return failure(error)
-    }
-    Result<[u8; 48], ServerError>.Success { value } => value
-  }
   server.clientTrafficSecret = clientTraffic
   server.serverTrafficSecret = serverTraffic
-  server.expectedFinished = expected
   return ok()
 }
 
@@ -3084,6 +3365,173 @@ effect fn rsaFailed(error: RsaError) -> Result<usize, ServerError> {
   return Result<usize, ServerError>.failResult(ServerError.RsaSignature { error: error })
 }
 
+// The signature schemes that a client certificate may sign CertificateVerify with:
+// ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384, and rsa_pss_rsae_sha256/384/512. The certificate
+// profile admits no Ed25519 keys, so the server does not ask for ed25519.
+const CLIENT_SCHEMES: [usize; 5] = [1027, 1283, 2052, 2053, 2054]
+
+effect fn handleClientCertificate(server: &mut Server, messageLength: usize) -> Result<
+  (),
+  ServerError
+>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if messageLength < 8 {
+    return violation(ServerProtocolReason.ClientCertificate)
+  }
+
+  // The request context must be empty, as the CertificateRequest's was.
+  if readU8Raw(&server.handshake, 4) != 0 {
+    return violation(ServerProtocolReason.ClientCertificate)
+  }
+  let listLength = readU24Raw(&server.handshake, 5)
+  if listLength + 8 != messageLength {
+    return violation(ServerProtocolReason.ClientCertificate)
+  }
+  let limits = server.limits
+  let mut cursor: usize = 8
+  let mut total = usize.ZERO
+  while cursor < messageLength {
+    if messageLength - cursor < 5 {
+      return violation(ServerProtocolReason.ClientCertificate)
+    }
+    let derLength = readU24Raw(&server.handshake, cursor)
+    cursor = cursor + 3
+    if derLength == 0 || derLength > messageLength - cursor - 2 {
+      return violation(ServerProtocolReason.ClientCertificate)
+    }
+    if List<Certificate>.length(&server.clientChain) >= limits.clientCertificates {
+      return failure(
+        ServerError.LimitExceeded {
+          kind: ServerLimitKind.ClientCertificates,
+          limit: limits.clientCertificates,
+        },
+      )
+    }
+    if derLength > limits.clientCertificateBytes - total {
+      return failure(
+        ServerError.LimitExceeded {
+          kind: ServerLimitKind.ClientCertificateBytes,
+          limit: limits.clientCertificateBytes,
+        },
+      )
+    }
+
+    // `cursor + derLength + 2 <= messageLength`, within the complete message in `handshake`.
+    let der = unsafe RawBuffer.view<u8>(&server.handshake, cursor, derLength)
+    let decoded = run Certificate.decodeDer(der, limits.certificateDecode)
+    let certificate = match move decoded {
+      Result<Certificate, DecodeError>.Failure { error } => {
+        return failure(ServerError.ClientCertificateDecode { error: error })
+      }
+      Result<Certificate, DecodeError>.Success { value } => move value
+    }
+    run List<Certificate>.append(&mut server.clientChain, move certificate)
+    total = total + derLength
+    cursor = cursor + derLength
+    let extensionLength = readU16Raw(&server.handshake, cursor)
+    cursor = cursor + 2
+    if extensionLength > limits.extensionBytes {
+      return failure(
+        ServerError.LimitExceeded {
+          kind: ServerLimitKind.ExtensionBytes,
+          limit: limits.extensionBytes,
+        },
+      )
+    }
+    if extensionLength > messageLength - cursor {
+      return violation(ServerProtocolReason.ClientCertificate)
+    }
+    cursor = cursor + extensionLength
+  }
+  updateTranscriptHandshake(&mut server.*, messageLength)
+
+  let certificates = List<Certificate>.asSlice(&server.clientChain)
+  if certificates.length == 0 {
+    if server.clientAuthMode == ClientAuthMode.Required {
+      return failure(ServerError.ClientCertificateRequired)
+    }
+    server.clientStatus = ClientCertificateStatus.Absent
+    server.state = ServerState.AwaitClientFinished
+    return ok()
+  }
+  let anchors = TrustSnapshot.anchors(&server.clientTrust)
+  let intermediates = Slice.view<Certificate>(certificates, 1, certificates.length - 1)
+  let validated = run CertificatePath.validate(
+    &certificates[0],
+    intermediates,
+    anchors,
+    &server.clientValidationTime,
+    CertificatePurpose.ClientAuth,
+    limits.clientValidation,
+  )
+  let status = match move validated {
+    Result<ValidatedPath, ValidationError>.Success { .. } => ClientCertificateStatus.Trusted
+    Result<ValidatedPath, ValidationError>.Failure { error } => {
+      if server.rejectUntrusted {
+        return failure(ServerError.UntrustedClientCertificate { reason: error.reason })
+      }
+      ClientCertificateStatus.Untrusted { error: move error }
+    }
+  }
+  server.clientStatus = move status
+  server.state = ServerState.AwaitClientCertificateVerify
+  return ok()
+}
+
+fn handleClientCertificateVerify(server: &mut Server, messageLength: usize) -> Result<
+  (),
+  ServerError
+> {
+  if messageLength < 8 {
+    return violation(ServerProtocolReason.ClientCertificate)
+  }
+  let scheme = readU16Raw(&server.handshake, 4)
+  let signatureLength = readU16Raw(&server.handshake, 6)
+  if signatureLength == 0 || signatureLength + 8 != messageLength {
+    return violation(ServerProtocolReason.ClientCertificate)
+  }
+  let mut offered = false
+  let mut index = usize.ZERO
+  while index < CLIENT_SCHEMES.length {
+    if CLIENT_SCHEMES[index] == scheme {
+      offered = true
+    }
+    index = index + usize.ONE
+  }
+  if !offered {
+    return failure(
+      ServerError.ClientCertificateVerify { error: SignatureFailure.UnsupportedScheme },
+    )
+  }
+
+  // The signed content: 64 spaces, the context, a zero byte, and the transcript hash through the
+  // client's Certificate. It is at most 146 bytes of `scratch`.
+  let hash = transcriptHash(&server.*)
+  let context = b"TLS 1.3, client CertificateVerify"
+  let mut contentLength = usize.ZERO
+  RawBuffer.fill(&mut server.scratch, 0, 64, 32)
+  contentLength = 64
+  putSlice(&mut server.scratch, &mut contentLength, context)
+  putU8(&mut server.scratch, &mut contentLength, 0)
+  putSlice(&mut server.scratch, &mut contentLength, Slice.view<u8>(&hash, 0, server.secretLength))
+
+  // The block above wrote every byte of `scratch[0..contentLength]`, and
+  // `8 + signatureLength == messageLength` keeps the signature within the complete message.
+  let content = unsafe RawBuffer.view<u8>(&server.scratch, 0, contentLength)
+  let signature = unsafe RawBuffer.view<u8>(&server.handshake, 8, signatureLength)
+  let certificates = List<Certificate>.asSlice(&server.clientChain)
+  let verified = HandshakeSignature.verify(&certificates[0], scheme, content, signature)
+  drop content
+  drop signature
+  if let Result<(), SignatureFailure>.Failure { error } = move verified {
+    return failure(ServerError.ClientCertificateVerify { error: error })
+  }
+  updateTranscriptHandshake(&mut server.*, messageLength)
+  server.state = ServerState.AwaitClientFinished
+  return ok()
+}
+
 fn handleClientFinished(server: &mut Server, messageLength: usize) -> Result<(), ServerError> {
   let length = server.secretLength
   if messageLength != HANDSHAKE_HEADER_LENGTH + length || messageLength != server.handshakeLength {
@@ -3091,8 +3539,14 @@ fn handleClientFinished(server: &mut Server, messageLength: usize) -> Result<(),
   }
 
   // `messageLength == HANDSHAKE_HEADER_LENGTH + length == handshakeLength`, within the capacity.
+  let clientSecret = server.clientHandshakeSecret
+  let expected = match finishedData(length, &clientSecret, &transcriptHash(&server.*)) {
+    Result<[u8; 48], ServerError>.Failure { error } => {
+      return failure(error)
+    }
+    Result<[u8; 48], ServerError>.Success { value } => value
+  }
   let supplied = unsafe RawBuffer.view<u8>(&server.handshake, HANDSHAKE_HEADER_LENGTH, length)
-  let expected = server.expectedFinished
   if !constantWorkEqual(supplied, secretView(&expected, length)) {
     return failure(ServerError.Finished)
   }

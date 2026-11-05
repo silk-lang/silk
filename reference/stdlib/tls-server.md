@@ -31,13 +31,19 @@ server takes no input while output is pending. [`ServerLimits`](#ServerLimits) b
 
 ## Errors
 - [`ServerError`](#ServerError) for a configuration that is not valid, an alert from the client, a protocol
-  error, no shared parameters, a limit, or a call in the wrong state. An error from a call after
+  error, no shared parameters, a client certificate that [`ClientAuth`](#ClientAuth) rejects, a limit, or a
+  call in the wrong state. An error from a call after
   [`Server.make`](#Server.impl.make) is permanent for the server.
 - `OutOfMemoryError` if the `Allocator` fails.
 
+With [`ClientAuth`](#ClientAuth) `Request`, the server sends a CertificateRequest, checks the client's
+CertificateVerify with its leaf's key, and validates the client's chain against your trust
+anchors for the `ClientAuth` purpose. [`Server.clientCertificateStatus`](#Server.impl.clientCertificateStatus) and
+[`Server.clientCertificates`](#Server.impl.clientCertificates) tell you the result.
+
 ## Gotchas
-The server does not ask for client certificates, and it does not support PSK, session tickets,
-or 0-RTT data. A client that sends early data fails with `BadRecordMac`. The server sends no
+The server does not support PSK, session tickets, or 0-RTT data. It does not ask for `ed25519`
+client signatures, because the certificate profile admits no Ed25519 client keys. A client that sends early data fails with `BadRecordMac`. The server sends no
 alert when it fails, so close the transport. Dropping the server does not send `close_notify`.
 Call [`Server.closeWrite`](#Server.impl.closeWrite) first. Secrets are not erased.
 
@@ -52,6 +58,7 @@ import silk.crypto.p256 { P256 }
 import silk.tls.client { AlpnConfig }
 import silk.tls.server {
   CertificateDer,
+  ClientAuth,
   GroupPolicy,
   Server,
   ServerConfig,
@@ -89,6 +96,7 @@ pub effect fn main() -> i32
     certificates: Slice.view<CertificateDer<'static>>(&chain, 0, 0),
     alpn: AlpnConfig.defaults(),
     groups: GroupPolicy.defaults(),
+    clientAuth: ClientAuth<'static>.Off,
     limits: ServerLimits.defaults(),
   }
   let made = run Server.make(&config, ServerKey.EcdsaP256 { key: move key })
@@ -103,7 +111,7 @@ pub effect fn main() -> i32
 
 Import as `Server` with `import silk.tls.server { Server }`.
 
-Public declarations: 14.
+Public declarations: 16.
 
 <a id="ServerGroup"></a>
 
@@ -449,7 +457,47 @@ Maximum aggregate DER bytes in the configured chain.
 pub certificateDecode: DecodeLimits
 ```
 
-Strict decoder policy for the configured leaf certificate.
+Strict decoder policy for the configured leaf certificate and each client certificate.
+
+<a id="ServerLimits.clientCertificates"></a>
+
+### Field `clientCertificates`
+
+```silk
+pub clientCertificates: usize
+```
+
+Maximum certificate count in a client's chain, at most 16.
+
+<a id="ServerLimits.clientCertificateBytes"></a>
+
+### Field `clientCertificateBytes`
+
+```silk
+pub clientCertificateBytes: usize
+```
+
+Maximum aggregate DER bytes in a client's chain.
+
+<a id="ServerLimits.clientTrust"></a>
+
+### Field `clientTrust`
+
+```silk
+pub clientTrust: SnapshotLimits
+```
+
+Limits for the copy of [`ClientAuth`](#ClientAuth)'s trust anchors.
+
+<a id="ServerLimits.clientValidation"></a>
+
+### Field `clientValidation`
+
+```silk
+pub clientValidation: ValidationLimits
+```
+
+Limits for validating a client's chain.
 
 <a id="ServerLimits.impl.Copy"></a>
 
@@ -518,6 +566,16 @@ pub groups: GroupPolicy
 
 The key exchange groups that the server allows.
 
+<a id="ServerConfig.clientAuth"></a>
+
+### Field `clientAuth`
+
+```silk
+pub clientAuth: ClientAuth<'a>
+```
+
+Whether the server asks for a client certificate, and how it checks one.
+
 <a id="ServerConfig.limits"></a>
 
 ### Field `limits`
@@ -527,6 +585,178 @@ pub limits: ServerLimits
 ```
 
 Finite connection limits.
+
+<a id="ClientAuth"></a>
+
+## `ClientAuth`
+
+```silk
+pub union ClientAuth<'a>
+```
+
+Whether a [`Server`](#Server) asks the client for a certificate, in [`ServerConfig.clientAuth`](#ServerConfig.clientAuth).
+
+<a id="ClientAuth.Off"></a>
+
+### `Off`
+
+```silk
+Off
+```
+
+The server does not ask for a client certificate.
+
+<a id="ClientAuth.Request"></a>
+
+### `Request`
+
+```silk
+Request
+```
+
+The server sends a CertificateRequest. When the client sends a chain, the server checks its
+CertificateVerify with the leaf's key, and validates the chain against `trust` at
+`validationTime` for the `ClientAuth` purpose.
+
+<a id="ClientAuth.Request.trust"></a>
+
+#### Field `trust`
+
+```silk
+pub trust: &'a TrustSnapshot
+```
+
+The anchors that a client chain must lead to. [`Server.make`](#Server.impl.make) copies them.
+
+<a id="ClientAuth.Request.validationTime"></a>
+
+#### Field `validationTime`
+
+```silk
+pub validationTime: &'a Instant
+```
+
+The time at which certificate dates are checked.
+
+<a id="ClientAuth.Request.required"></a>
+
+#### Field `required`
+
+```silk
+pub required: bool
+```
+
+Whether a client that sends no certificate fails with `ClientCertificateRequired`.
+
+<a id="ClientAuth.Request.rejectUntrusted"></a>
+
+#### Field `rejectUntrusted`
+
+```silk
+pub rejectUntrusted: bool
+```
+
+Whether a chain that does not validate fails with `UntrustedClientCertificate`. Otherwise
+the handshake completes, and [`Server.clientCertificateStatus`](#Server.impl.clientCertificateStatus) gives `Untrusted`.
+
+<a id="ClientAuth.impl.Copy"></a>
+
+## Implementation `Copy for ClientAuth<'a>`
+
+```silk
+impl<'a> Copy for ClientAuth<'a>
+```
+
+<a id="ClientCertificateStatus"></a>
+
+## `ClientCertificateStatus`
+
+```silk
+pub union ClientCertificateStatus
+```
+
+What the server knows about the client's certificate, from
+[`Server.clientCertificateStatus`](#Server.impl.clientCertificateStatus).
+
+<a id="ClientCertificateStatus.NotRequested"></a>
+
+### `NotRequested`
+
+```silk
+NotRequested
+```
+
+The server does not ask for a client certificate.
+
+<a id="ClientCertificateStatus.Pending"></a>
+
+### `Pending`
+
+```silk
+Pending
+```
+
+The client has not sent its Certificate message yet.
+
+<a id="ClientCertificateStatus.Absent"></a>
+
+### `Absent`
+
+```silk
+Absent
+```
+
+The client sent no certificate.
+
+<a id="ClientCertificateStatus.Trusted"></a>
+
+### `Trusted`
+
+```silk
+Trusted
+```
+
+The chain validated, and the client signed CertificateVerify with the leaf's key.
+
+<a id="ClientCertificateStatus.Untrusted"></a>
+
+### `Untrusted`
+
+```silk
+Untrusted
+```
+
+The client signed CertificateVerify with the leaf's key, but the chain did not validate.
+
+<a id="ClientCertificateStatus.Untrusted.error"></a>
+
+#### Field `error`
+
+```silk
+pub error: ValidationError
+```
+
+Why the chain did not validate.
+
+<a id="ClientCertificateStatus.impl.Debug"></a>
+
+## Implementation `Debug for ClientCertificateStatus`
+
+```silk
+impl Debug for ClientCertificateStatus
+```
+
+<a id="ClientCertificateStatus.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `Untrusted { ... }`.
 
 <a id="ServerDemand"></a>
 
@@ -847,6 +1077,16 @@ PostHandshake
 
 A KeyUpdate or other post-handshake message is not valid.
 
+<a id="ServerProtocolReason.ClientCertificate"></a>
+
+### `ClientCertificate`
+
+```silk
+ClientCertificate
+```
+
+A client Certificate or CertificateVerify message has invalid framing.
+
 <a id="ServerProtocolReason.InternalState"></a>
 
 ### `InternalState`
@@ -1046,6 +1286,36 @@ Alpn
 ```
 
 One ALPN protocol or list.
+
+<a id="ServerLimitKind.ClientCertificates"></a>
+
+### `ClientCertificates`
+
+```silk
+ClientCertificates
+```
+
+Client certificate count.
+
+<a id="ServerLimitKind.ClientCertificateBytes"></a>
+
+### `ClientCertificateBytes`
+
+```silk
+ClientCertificateBytes
+```
+
+Client certificate DER bytes.
+
+<a id="ServerLimitKind.ClientTrust"></a>
+
+### `ClientTrust`
+
+```silk
+ClientTrust
+```
+
+Trust anchors for client certificates.
 
 <a id="ServerLimitKind.impl.Debug"></a>
 
@@ -1320,6 +1590,77 @@ NoApplicationProtocol
 The client's ALPN offer shares no protocol with the server, or the server requires ALPN and
 the client sent none.
 
+<a id="ServerError.ClientCertificateRequired"></a>
+
+### `ClientCertificateRequired`
+
+```silk
+ClientCertificateRequired
+```
+
+The server requires a client certificate, and the client sent none.
+
+<a id="ServerError.ClientCertificateDecode"></a>
+
+### `ClientCertificateDecode`
+
+```silk
+ClientCertificateDecode
+```
+
+A client certificate did not decode.
+
+<a id="ServerError.ClientCertificateDecode.error"></a>
+
+#### Field `error`
+
+```silk
+pub error: DecodeError
+```
+
+The decoder failure.
+
+<a id="ServerError.ClientCertificateVerify"></a>
+
+### `ClientCertificateVerify`
+
+```silk
+ClientCertificateVerify
+```
+
+The client's CertificateVerify did not verify with its leaf's key.
+
+<a id="ServerError.ClientCertificateVerify.error"></a>
+
+#### Field `error`
+
+```silk
+pub error: SignatureFailure
+```
+
+The signature failure.
+
+<a id="ServerError.UntrustedClientCertificate"></a>
+
+### `UntrustedClientCertificate`
+
+```silk
+UntrustedClientCertificate
+```
+
+The client's chain did not validate, and [`ClientAuth`](#ClientAuth) rejects such chains.
+[`Server.clientCertificateStatus`](#Server.impl.clientCertificateStatus) gives the full validation error.
+
+<a id="ServerError.UntrustedClientCertificate.reason"></a>
+
+#### Field `reason`
+
+```silk
+pub reason: ValidationReason
+```
+
+Why the chain did not validate.
+
 <a id="ServerError.impl.Copy"></a>
 
 ## Implementation `Copy for ServerError`
@@ -1466,6 +1807,28 @@ pub fn retried(self: &Self) -> bool
 ```
 
 Returns whether the server sent a HelloRetryRequest in this handshake.
+
+<a id="Server.impl.clientCertificateStatus"></a>
+
+### Method `clientCertificateStatus`
+
+```silk
+pub fn clientCertificateStatus<'a>(self: &'a Self) -> &'a ClientCertificateStatus
+```
+
+Returns what the server knows about the client's certificate. After `HandshakeComplete` it is
+`NotRequested`, `Absent`, `Trusted`, or `Untrusted`.
+
+<a id="Server.impl.clientCertificates"></a>
+
+### Method `clientCertificates`
+
+```silk
+pub fn clientCertificates<'a>(self: &'a Self) -> &'a [Certificate]
+```
+
+Returns the client's certificates, leaf first, as the client sent them. It is empty until the
+client's Certificate message arrives, and when the client sent none.
 
 <a id="Server.impl.closeNotified"></a>
 

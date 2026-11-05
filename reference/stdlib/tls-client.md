@@ -111,7 +111,7 @@ pub effect fn main() -> i32
 
 Import as `Client` with `import silk.tls.client { Client }`.
 
-Public declarations: 15.
+Public declarations: 14.
 
 <a id="NamedGroup"></a>
 
@@ -1127,94 +1127,6 @@ effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &m
 
 Writes the name of the variant and its fields, such as `Decode { ... }`.
 
-<a id="CertificateVerifyFailure"></a>
-
-## `CertificateVerifyFailure`
-
-```silk
-pub union CertificateVerifyFailure
-```
-
-A server CertificateVerify failure with its selected signature implementation.
-
-<a id="CertificateVerifyFailure.Ecdsa"></a>
-
-### `Ecdsa`
-
-```silk
-Ecdsa
-```
-
-ECDSA-P256/SHA-256 verification failed.
-
-<a id="CertificateVerifyFailure.Ecdsa.error"></a>
-
-#### Field `error`
-
-```silk
-pub error: P256SignatureError
-```
-
-The exact primitive failure.
-
-<a id="CertificateVerifyFailure.EcdsaP384"></a>
-
-### `EcdsaP384`
-
-```silk
-EcdsaP384
-```
-
-ECDSA-P384/SHA-384 verification failed.
-
-<a id="CertificateVerifyFailure.EcdsaP384.error"></a>
-
-#### Field `error`
-
-```silk
-pub error: P384SignatureError
-```
-
-The exact primitive failure.
-
-<a id="CertificateVerifyFailure.Rsa"></a>
-
-### `Rsa`
-
-```silk
-Rsa
-```
-
-RSA-PSS-RSAE/SHA-256 verification failed.
-
-<a id="CertificateVerifyFailure.Rsa.error"></a>
-
-#### Field `error`
-
-```silk
-pub error: RsaError
-```
-
-The exact primitive failure.
-
-<a id="CertificateVerifyFailure.impl.Debug"></a>
-
-## Implementation `Debug for CertificateVerifyFailure`
-
-```silk
-impl Debug for CertificateVerifyFailure
-```
-
-<a id="CertificateVerifyFailure.impl.Debug.debug"></a>
-
-### Operation `debug`
-
-```silk
-effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
-```
-
-Writes the name of the variant and its fields, such as `Ecdsa { ... }`.
-
 <a id="TlsError"></a>
 
 ## `TlsError`
@@ -1351,7 +1263,7 @@ Server CertificateVerify did not authenticate the transcript with the selected l
 #### Field `error`
 
 ```silk
-pub error: CertificateVerifyFailure
+pub error: SignatureFailure
 ```
 
 The exact selected primitive failure.
@@ -1483,14 +1395,6 @@ effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &m
 ```
 
 Writes the name of the variant and its fields, such as `PeerAlert { ... }`.
-
-<a id="CertificateVerifyFailure.impl.Copy"></a>
-
-## Implementation `Copy for CertificateVerifyFailure`
-
-```silk
-impl Copy for CertificateVerifyFailure
-```
 
 <a id="Authentication"></a>
 
