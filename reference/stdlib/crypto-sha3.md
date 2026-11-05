@@ -358,6 +358,16 @@ fn digestLength(self: &Self) -> usize
 
 Returns 28, the SHA3-224 digest length in bytes.
 
+<a id="Sha3_224.impl.Digest.objectIdentifier"></a>
+
+### Operation `objectIdentifier`
+
+```silk
+fn objectIdentifier(self: &Self) -> &[u8]
+```
+
+Returns the content bytes of the SHA3-224 object identifier, 2.16.840.1.101.3.4.2.7.
+
 <a id="Sha3_224.impl.Digest.copy"></a>
 
 ### Operation `copy`
@@ -425,6 +435,16 @@ fn digestLength(self: &Self) -> usize
 ```
 
 Returns 32, the SHA3-256 digest length in bytes.
+
+<a id="Sha3_256.impl.Digest.objectIdentifier"></a>
+
+### Operation `objectIdentifier`
+
+```silk
+fn objectIdentifier(self: &Self) -> &[u8]
+```
+
+Returns the content bytes of the SHA3-256 object identifier, 2.16.840.1.101.3.4.2.8.
 
 <a id="Sha3_256.impl.Digest.copy"></a>
 
@@ -494,6 +514,16 @@ fn digestLength(self: &Self) -> usize
 
 Returns 48, the SHA3-384 digest length in bytes.
 
+<a id="Sha3_384.impl.Digest.objectIdentifier"></a>
+
+### Operation `objectIdentifier`
+
+```silk
+fn objectIdentifier(self: &Self) -> &[u8]
+```
+
+Returns the content bytes of the SHA3-384 object identifier, 2.16.840.1.101.3.4.2.9.
+
 <a id="Sha3_384.impl.Digest.copy"></a>
 
 ### Operation `copy`
@@ -561,6 +591,16 @@ fn digestLength(self: &Self) -> usize
 ```
 
 Returns 64, the SHA3-512 digest length in bytes.
+
+<a id="Sha3_512.impl.Digest.objectIdentifier"></a>
+
+### Operation `objectIdentifier`
+
+```silk
+fn objectIdentifier(self: &Self) -> &[u8]
+```
+
+Returns the content bytes of the SHA3-512 object identifier, 2.16.840.1.101.3.4.2.10.
 
 <a id="Sha3_512.impl.Digest.copy"></a>
 

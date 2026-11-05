@@ -560,6 +560,16 @@ fn digestLength(self: &Self) -> usize
 
 Returns 28, the SHA-224 digest length in bytes.
 
+<a id="Sha224.impl.Digest.objectIdentifier"></a>
+
+### Operation `objectIdentifier`
+
+```silk
+fn objectIdentifier(self: &Self) -> &[u8]
+```
+
+Returns the content bytes of the SHA-224 object identifier, 2.16.840.1.101.3.4.2.4.
+
 <a id="Sha224.impl.Digest.copy"></a>
 
 ### Operation `copy`
@@ -627,6 +637,16 @@ fn digestLength(self: &Self) -> usize
 ```
 
 Returns 32, the SHA-256 digest length in bytes.
+
+<a id="Sha256.impl.Digest.objectIdentifier"></a>
+
+### Operation `objectIdentifier`
+
+```silk
+fn objectIdentifier(self: &Self) -> &[u8]
+```
+
+Returns the content bytes of the SHA-256 object identifier, 2.16.840.1.101.3.4.2.1.
 
 <a id="Sha256.impl.Digest.copy"></a>
 
@@ -696,6 +716,16 @@ fn digestLength(self: &Self) -> usize
 
 Returns 48, the SHA-384 digest length in bytes.
 
+<a id="Sha384.impl.Digest.objectIdentifier"></a>
+
+### Operation `objectIdentifier`
+
+```silk
+fn objectIdentifier(self: &Self) -> &[u8]
+```
+
+Returns the content bytes of the SHA-384 object identifier, 2.16.840.1.101.3.4.2.2.
+
 <a id="Sha384.impl.Digest.copy"></a>
 
 ### Operation `copy`
@@ -763,6 +793,16 @@ fn digestLength(self: &Self) -> usize
 ```
 
 Returns 64, the SHA-512 digest length in bytes.
+
+<a id="Sha512.impl.Digest.objectIdentifier"></a>
+
+### Operation `objectIdentifier`
+
+```silk
+fn objectIdentifier(self: &Self) -> &[u8]
+```
+
+Returns the content bytes of the SHA-512 object identifier, 2.16.840.1.101.3.4.2.3.
 
 <a id="Sha512.impl.Digest.copy"></a>
 
@@ -832,6 +872,16 @@ fn digestLength(self: &Self) -> usize
 
 Returns 28, the SHA-512/224 digest length in bytes.
 
+<a id="Sha512_224.impl.Digest.objectIdentifier"></a>
+
+### Operation `objectIdentifier`
+
+```silk
+fn objectIdentifier(self: &Self) -> &[u8]
+```
+
+Returns the content bytes of the SHA-512/224 object identifier, 2.16.840.1.101.3.4.2.5.
+
 <a id="Sha512_224.impl.Digest.copy"></a>
 
 ### Operation `copy`
@@ -899,6 +949,16 @@ fn digestLength(self: &Self) -> usize
 ```
 
 Returns 32, the SHA-512/256 digest length in bytes.
+
+<a id="Sha512_256.impl.Digest.objectIdentifier"></a>
+
+### Operation `objectIdentifier`
+
+```silk
+fn objectIdentifier(self: &Self) -> &[u8]
+```
+
+Returns the content bytes of the SHA-512/256 object identifier, 2.16.840.1.101.3.4.2.6.
 
 <a id="Sha512_256.impl.Digest.copy"></a>
 
