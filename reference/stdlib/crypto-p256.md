@@ -241,7 +241,7 @@ pub fn main() -> i32 {
 
 Import as `P256` with `import silk.crypto.p256 { P256 }`.
 
-Public declarations: 4.
+Public declarations: 5.
 
 <a id="P256Error"></a>
 
@@ -606,6 +606,63 @@ must be `id-ecPublicKey` with the curve `secp256r1`, and the signature algorithm
 
 #### Gotchas
 It checks only this one signature. It does not check the chain, the dates, or the names.
+
+<a id="P256SigningKey"></a>
+
+## `P256SigningKey`
+
+```silk
+pub struct P256SigningKey
+```
+
+A P-256 private key ready to sign many messages fast, with a table of base point multiples.
+
+### When to use
+Use it when one key signs often, such as the CertificateVerify signature of a TLS server. For a
+single signature, [`EcdsaP256Sha256.sign`](#EcdsaP256Sha256.impl.sign) needs no allocation.
+
+### Details
+[`P256SigningKey.make`](#P256SigningKey.impl.make) computes 960 multiples of the base point once, about 60 KiB. Each
+signature then needs 64 point additions instead of 256 doublings and 64 additions, and gives
+the same bytes as [`EcdsaP256Sha256.sign`](#EcdsaP256Sha256.impl.sign).
+
+### Gotchas
+The secret is not erased when the key is dropped.
+
+<a id="P256SigningKey.impl"></a>
+
+## Implementation `P256SigningKey`
+
+```silk
+impl P256SigningKey
+```
+
+<a id="P256SigningKey.impl.make"></a>
+
+### Associated function `make`
+
+```silk
+pub effect fn make(key: &P256) -> P256SigningKey ! OutOfMemoryError ? &mut Allocator
+```
+
+Returns the signing key for the private key `key`.
+
+#### Errors
+- `OutOfMemoryError` if the table cannot be allocated.
+
+<a id="P256SigningKey.impl.sign"></a>
+
+### Method `sign`
+
+```silk
+pub fn sign(self: &Self, message: &[u8], output: &mut [u8; 72]) -> Result<usize, P256SignatureError>
+```
+
+Signs `message` as [`EcdsaP256Sha256.sign`](#EcdsaP256Sha256.impl.sign) does, and writes the DER signature to the start of
+`output`. Returns the length of the signature.
+
+#### Errors
+- `InvalidLength` if `message` is longer than SHA-256 allows.
 
 
 Category: Cryptography.

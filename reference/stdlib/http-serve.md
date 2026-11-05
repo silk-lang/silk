@@ -6,9 +6,9 @@ A fast HTTP/1.1 server: write one handler function, and serve it on every core.
 
 ## When to use
 Use this module to answer HTTP requests with little code and high throughput. Write a handler
-that reads a [`Request`](#Request) and writes a [`Response`](#Response), then call [`Server.serve`](#Server.impl.serve). Use
-`Router` to send each method and path to its own handler. For streaming bodies, upgrades or
-full control of the connection, use `silk.http.server` instead.
+that reads a [`Request`](#Request) and writes a [`Response`](#Response), then call [`Server.serve`](#Server.impl.serve), or
+[`Server.serveTls`](#Server.impl.serveTls) for HTTPS. For streaming bodies, upgrades or full control of the
+connection, use `silk.http.server` instead.
 
 ## Details
 [`Server.serve`](#Server.impl.serve) runs the `silk.net.tcp_server` engine: one event loop for each worker thread,
@@ -50,23 +50,27 @@ server answers `500 Internal Server Error` and closes that connection.
 ```silk,no_run
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
-import silk.http.serve { Request, Response, Server }
+import silk.http.serve { Handler, Request, Response, Server }
 
-effect fn hello(request: &Request, response: &mut Response) -> () ! OutOfMemoryError ? &mut Allocator {
-  if request.path() == "/" {
-    run response.text("Hello, World!")
-    return ()
+struct Hello {}
+
+impl Handler for Hello {
+  effect fn handle(self: &Self, request: &Request, response: &mut Response) -> () ! OutOfMemoryError ? &mut Allocator {
+    if request.path() == "/" {
+      run response.text("Hello, World!")
+      return ()
+    }
+    response.status(404)
+    run response.text("Not found")
   }
-  response.status(404)
-  run response.text("Not found")
 }
 
 effect fn failed<E>(error: E) -> i32 { drop error return 1 }
 
 pub fn main() -> i32 {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let served = Server.make(8080).serve(hello)
-  return run Effect.catchAll(Effect.map(served, fn(done: ()) -> i32 { return 0 }), failed)
+  let served = Server.make(8080).serve(Hello {})
+  return run Effect.catchAll(Effect.map(move served, fn(done: ()) -> i32 { return 0 }), failed)
     |> Effect.provideMut<Allocator>(&mut allocator)
 }
 ```
