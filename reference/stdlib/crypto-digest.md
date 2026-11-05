@@ -95,6 +95,17 @@ fn digestLength(self: &Self) -> usize
 
 Returns the number of bytes that [`Digest.finishInto`](#Digest.finishInto) writes, such as 32 for SHA-256.
 
+<a id="Digest.objectIdentifier"></a>
+
+### Operation `objectIdentifier`
+
+```silk
+fn objectIdentifier(self: &Self) -> &[u8]
+```
+
+Returns the content bytes of the DER object identifier that names the hash, without the tag
+and length. Signature formats such as PKCS #1 v1.5 and X.509 name the hash with it.
+
 <a id="Digest.update"></a>
 
 ### Operation `update`
