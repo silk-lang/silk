@@ -633,6 +633,18 @@ pub effect fn main() -> i32
 }
 ```
 
+<a id="List.impl.appendSliceWithinCapacity"></a>
+
+### Method `appendSliceWithinCapacity`
+
+```silk
+pub fn appendSliceWithinCapacity<T: Copy>(self: &mut Self, values: &[T]) -> bool
+```
+
+Adds a copy of each element of `values` at the end, in order, if the capacity has room for all
+of them, and returns `true`. Returns `false` and changes nothing otherwise. It never
+allocates.
+
 <a id="List.impl.appendRepeated"></a>
 
 ### Method `appendRepeated`

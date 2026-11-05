@@ -107,7 +107,7 @@ pub fn main() -> i32 {
 
 Import as `RequestParser` with `import silk.http.head { RequestParser }`.
 
-Public declarations: 22.
+Public declarations: 24.
 
 <a id="Limits"></a>
 
@@ -1069,6 +1069,45 @@ pub progress: Progress
 How many bytes the head used. The bytes after it, such as the body, start at
 `progress.consumed`.
 
+<a id="WrittenRequest"></a>
+
+## `WrittenRequest`
+
+```silk
+pub struct WrittenRequest
+```
+
+A request head written by [`writeRequest`](#writeRequest). It keeps where each part starts, so
+[`WrittenRequest.head`](#WrittenRequest.impl.head) reads it back without parsing it. It owns its memory.
+
+<a id="WrittenRequest.impl"></a>
+
+## Implementation `WrittenRequest`
+
+```silk
+impl WrittenRequest
+```
+
+<a id="WrittenRequest.impl.bytes"></a>
+
+### Method `bytes`
+
+```silk
+pub fn bytes<'owner>(self: &'owner Self) -> &'owner [u8]
+```
+
+Returns the written bytes, ending with the empty line.
+
+<a id="WrittenRequest.impl.head"></a>
+
+### Method `head`
+
+```silk
+pub fn head<'owner>(self: &'owner Self) -> RequestHead<'owner>
+```
+
+Returns the head as a parser would return it for the same bytes.
+
 <a id="RequestParser.impl"></a>
 
 ## Implementation `RequestParser`
@@ -1147,6 +1186,22 @@ pub fn reset(self: &mut Self) -> Result<(), ParseError>
 
 Makes the parser ready for a new head, and keeps its memory. You cannot call it while you
 borrow a head from the parser.
+
+<a id="RequestParser.impl.load"></a>
+
+### Method `load`
+
+```silk
+pub fn load(self: &mut Self, head: RequestHead) -> Result<(), ParseError>
+```
+
+Takes `head` as if its bytes had been fed, so the parser holds a copy of it. Use it for a head
+that is already parsed or written, such as one from [`WrittenRequest.head`](#WrittenRequest.impl.head). Only the limits
+of this parser are checked, because the head already follows the rules.
+
+#### Errors
+- `InvalidState` if the parser has bytes or a head. Call `reset` first.
+- `LimitExceeded` if the head is over a limit of this parser. The parser stays empty.
 
 <a id="ResponseParser.impl"></a>
 
@@ -1505,6 +1560,26 @@ pub fn writeRequestInto<'value>(
 
 Writes `head` with single spaces and CRLF line endings, and the empty line at the end, to the
 start of `output`. Returns the length. If `output` is too small, it writes nothing.
+
+<a id="writeRequest"></a>
+
+## `writeRequest`
+
+```silk
+pub effect fn writeRequest<'value>(
+  head: &ValueRequestHead<'value>,
+  limits: ValueLimits,
+  maxBytes: usize,
+) -> Result<WrittenRequest, ValueError> ! OutOfMemoryError ? &mut Allocator
+```
+
+Writes `head` like [`writeRequestInto`](#writeRequestInto) into new memory of its exact size, and keeps where each
+part starts.
+
+### Errors
+- `LimitExceeded` if the head exceeds `limits`.
+- `OutputTooSmall` if the head is longer than `maxBytes`. Nothing is allocated.
+- `OutOfMemoryError` if the `Allocator` fails.
 
 <a id="writeResponseInto"></a>
 

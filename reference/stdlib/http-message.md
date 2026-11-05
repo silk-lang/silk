@@ -97,7 +97,7 @@ pub fn main() -> i32 {
 
 Import as `Version` with `import silk.http.message { Version }`.
 
-Public declarations: 13.
+Public declarations: 14.
 
 <a id="ValueComponent"></a>
 
@@ -1095,6 +1095,17 @@ pub fn value(self: &Self) -> &'value [u8]
 ```
 
 Returns the field value bytes.
+
+<a id="isTokenByte"></a>
+
+## `isTokenByte`
+
+```silk
+pub fn isTokenByte(value: u8) -> bool
+```
+
+Returns `true` if `value` is a byte of a token, such as a method or a field name: a letter, a
+digit, or one of ``!#$%&'*+-.^_`|~``.
 
 <a id="RequestHead"></a>
 

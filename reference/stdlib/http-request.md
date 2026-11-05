@@ -692,6 +692,16 @@ pub fn bytes<'a>(self: &'a Self) -> &'a [u8]
 
 Returns the bytes of the head, ending with the empty line.
 
+<a id="PreparedRequest.impl.head"></a>
+
+### Method `head`
+
+```silk
+pub fn head<'a>(self: &'a Self) -> WrittenHead<'a>
+```
+
+Returns the head, read back from its bytes without parsing them.
+
 <a id="PreparedRequest.impl.origin"></a>
 
 ### Method `origin`

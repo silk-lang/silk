@@ -108,6 +108,7 @@ import silk.collections.bytes { Bytes }
 import silk.text.format { Debug, Format, Formatter }
 import silk.http.message {
   Header,
+  isTokenByte,
   LimitKind as ValueLimitKind,
   Method,
   OwnedRequestHead,
@@ -567,6 +568,39 @@ pub struct ParsedResponse {
   pub progress: Progress,
 }
 
+/// A request head written by [`writeRequest`]. It keeps where each part starts, so
+/// [`WrittenRequest.head`] reads it back without parsing it. It owns its memory.
+pub struct WrittenRequest {
+  storage: Bytes,
+  records: List<FieldRecord>,
+  limitsValue: ValueLimits,
+  versionValue: Version,
+  methodLength: usize,
+  targetStart: usize,
+  targetLength: usize,
+  fieldCountValue: usize,
+}
+
+impl WrittenRequest {
+  /// Returns the written bytes, ending with the empty line.
+  pub fn bytes<'owner>(self: &'owner Self) -> &'owner [u8] { return Bytes.asSlice(&self.storage) }
+
+  /// Returns the head as a parser would return it for the same bytes.
+  pub fn head<'owner>(self: &'owner Self) -> RequestHead<'owner> {
+    return RequestHead<'owner> {
+      bytes: Bytes.asSlice(&self.storage),
+      records: List<FieldRecord>.asSlice(&self.records),
+      limitsValue: self.limitsValue,
+      versionValue: self.versionValue,
+      methodStart: usize.ZERO,
+      methodLength: self.methodLength,
+      targetStart: self.targetStart,
+      targetLength: self.targetLength,
+      fieldCountValue: self.fieldCountValue,
+    }
+  }
+}
+
 impl RequestParser {
   /// Returns a parser, and allocates all its memory.
   ///
@@ -632,6 +666,17 @@ impl RequestParser {
   /// Makes the parser ready for a new head, and keeps its memory. You cannot call it while you
   /// borrow a head from the parser.
   pub fn reset(self: &mut Self) -> Result<(), ParseError> { return resetCore(&mut self.core) }
+
+  /// Takes `head` as if its bytes had been fed, so the parser holds a copy of it. Use it for a head
+  /// that is already parsed or written, such as one from [`WrittenRequest.head`]. Only the limits
+  /// of this parser are checked, because the head already follows the rules.
+  ///
+  /// # Errors
+  /// - `InvalidState` if the parser has bytes or a head. Call `reset` first.
+  /// - `LimitExceeded` if the head is over a limit of this parser. The parser stays empty.
+  pub fn load(self: &mut Self, head: RequestHead) -> Result<(), ParseError> {
+    return loadCore(&mut self.core, head)
+  }
 }
 
 impl ResponseParser {
@@ -1022,6 +1067,89 @@ pub fn writeRequestInto<'value>(
   return Result<usize, ValueError>.succeed(cursor + 2)
 }
 
+/// Writes `head` like [`writeRequestInto`] into new memory of its exact size, and keeps where each
+/// part starts.
+///
+/// # Errors
+/// - `LimitExceeded` if the head exceeds `limits`.
+/// - `OutputTooSmall` if the head is longer than `maxBytes`. Nothing is allocated.
+/// - `OutOfMemoryError` if the `Allocator` fails.
+pub effect fn writeRequest<'value>(
+  head: &ValueRequestHead<'value>,
+  limits: ValueLimits,
+  maxBytes: usize,
+) -> Result<WrittenRequest, ValueError> ! OutOfMemoryError ? &mut Allocator {
+  let required = match move requestSerializedSize(head, limits) {
+    Result<usize, ValueError>.Failure {error} => {
+      return Result<WrittenRequest, ValueError>.failResult(move error)
+    }
+    Result<usize, ValueError>.Success {value} => value
+  }
+  if required > maxBytes {
+    return Result<WrittenRequest, ValueError>.failResult(valueOutputTooSmall(required, maxBytes))
+  }
+  let methodValue = ValueRequestHead.method(head)
+  let targetValue = ValueRequestHead.target(head)
+  let versionValue = ValueRequestHead.version(head)
+  let headers = ValueRequestHead.headers(head)
+  let method = String.utf8Bytes(Method.format(&methodValue))
+  let target = String.utf8Bytes(RequestTarget.format(targetValue))
+  let mut storage = run Bytes.zeroed(required)
+  let mut records = run List<FieldRecord>.makeWithCapacity(Headers.count(&headers))
+  let output = Bytes.asMutSlice(&mut storage)
+  let mut cursor = writeSlice(&mut output, usize.ZERO, method)
+  output[cursor] = 32
+  cursor = cursor + usize.ONE
+  let targetStart = cursor
+  cursor = writeSlice(&mut output, cursor, target)
+  output[cursor] = 32
+  cursor = cursor + usize.ONE
+  cursor = writeSlice(&mut output, cursor, String.utf8Bytes(Version.format(&versionValue)))
+  output[cursor] = 13
+  output[cursor + usize.ONE] = 10
+  cursor = cursor + 2
+  let mut iterator = Headers.iter(&headers)
+  let mut done = false
+  while !done {
+    match move ValueHeaderIterator.next(&mut iterator) {
+      Option<Header<'value>>.None => { done = true }
+      Option<Header<'value>>.Some {value: header} => {
+        let name = String.utf8Bytes(Header.name(&header))
+        let value = Header.value(&header)
+        let nameStart = cursor
+        cursor = writeSlice(&mut output, cursor, name)
+        output[cursor] = 58
+        output[cursor + usize.ONE] = 32
+        cursor = cursor + 2
+        let valueStart = cursor
+        cursor = writeSlice(&mut output, cursor, value)
+        output[cursor] = 13
+        output[cursor + usize.ONE] = 10
+        cursor = cursor + 2
+        let _stored = List<FieldRecord>.appendWithinCapacity(&mut records, FieldRecord {
+          nameStart: nameStart,
+          nameLength: name.length,
+          valueStart: valueStart,
+          valueLength: value.length,
+        })
+      }
+    }
+  }
+  output[cursor] = 13
+  output[cursor + usize.ONE] = 10
+  drop output
+  return Result<WrittenRequest, ValueError>.succeed(WrittenRequest {
+    storage: move storage,
+    records: move records,
+    limitsValue: limits,
+    versionValue: versionValue,
+    methodLength: method.length,
+    targetStart: targetStart,
+    targetLength: target.length,
+    fieldCountValue: Headers.count(&headers),
+  })
+}
+
 /// Writes `head` with single spaces and CRLF line endings, and the empty line at the end, to the
 /// start of `output`. Returns the length. If `output` is too small, it writes nothing.
 pub fn writeResponseInto<'value>(
@@ -1219,18 +1347,29 @@ fn feedValueRun(core: &mut ParserCore, input: &[u8], start: usize) -> usize {
   let mut end = start
   let mut first = usize.MAX
   let mut last = usize.MAX
+  // CR, LF, and every other control byte but HTAB end the run.
   while end < input.length {
     let byte = input[end]
-    if byte == 13 || byte == 10 { break }
-    if byte != 9 && (byte < 32 || byte == 127) { break }
-    if byte != 32 && byte != 9 {
-      if first == usize.MAX { first = end }
-      last = end
+    if byte < 32 {
+      if byte != 9 { break }
+    } else if byte == 127 {
+      break
     }
     end = end + usize.ONE
   }
   let span = end - start
   if span == usize.ZERO { return usize.ZERO }
+  let mut scan = start
+  while scan < end && (input[scan] == 32 || input[scan] == 9) {
+    scan = scan + usize.ONE
+  }
+  if scan < end {
+    first = scan
+    last = end - usize.ONE
+    while input[last] == 32 || input[last] == 9 {
+      last = last - usize.ONE
+    }
+  }
   let length = match move usize.checkedAdd(core.length, span) {
     Option<usize>.None => { return usize.ZERO }
     Option<usize>.Some {value} => value
@@ -1259,11 +1398,7 @@ fn feedValueRun(core: &mut ParserCore, input: &[u8], start: usize) -> usize {
     Option<usize>.Some {value} => value
   }
   if aggregate > core.limits.values.maxFieldBytes { return usize.ZERO }
-  let mut index = start
-  while index < end {
-    let _stored = Bytes.appendWithinCapacity(&mut core.storage, input[index])
-    index = index + usize.ONE
-  }
+  let _stored = Bytes.appendSliceWithinCapacity(&mut core.storage, Slice.view<u8>(input, start, span))
   core.length = length
   core.fieldValueLength = valueLength
   core.fieldPendingOws = pending
@@ -1276,7 +1411,7 @@ fn feedValueRun(core: &mut ParserCore, input: &[u8], start: usize) -> usize {
 // run would break a rule or a limit.
 fn feedNameRun(core: &mut ParserCore, input: &[u8], start: usize) -> usize {
   let mut end = start
-  while end < input.length && tokenByte(input[end]) {
+  while end < input.length && isTokenByte(input[end]) {
     end = end + usize.ONE
   }
   let span = end - start
@@ -1295,11 +1430,7 @@ fn feedNameRun(core: &mut ParserCore, input: &[u8], start: usize) -> usize {
     Option<usize>.Some {value} => value
   }
   if aggregate > core.limits.values.maxFieldBytes { return usize.ZERO }
-  let mut index = start
-  while index < end {
-    let _stored = Bytes.appendWithinCapacity(&mut core.storage, input[index])
-    index = index + usize.ONE
-  }
+  let _stored = Bytes.appendSliceWithinCapacity(&mut core.storage, Slice.view<u8>(input, start, span))
   core.length = length
   core.fieldNameLength = nameLength
   return span
@@ -1401,7 +1532,7 @@ fn validateRequestLineByte(core: &mut ParserCore, byte: u8) -> Result<(), ParseE
         core.componentLength = usize.ZERO
         return Result<(), ParseError>.succeed(())
       }
-      if !tokenByte(byte) {
+      if !isTokenByte(byte) {
         return Result<(), ParseError>.failResult(parseError(
           ParseReason.InvalidMethod,
           ParseComponent.Method,
@@ -1623,7 +1754,7 @@ fn validateFieldByte(core: &mut ParserCore, byte: u8) -> Result<(), ParseError> 
         Option<usize>.some(core.fieldCount),
       ))
     }
-    if !tokenByte(byte) {
+    if !isTokenByte(byte) {
       return Result<(), ParseError>.failResult(parseError(
         ParseReason.InvalidFieldName,
         ParseComponent.HeaderName,
@@ -1845,7 +1976,7 @@ fn validateRequestLine(core: &mut ParserCore, length: usize) -> Result<(), Parse
   let versionLength = end - versionStart
   index = start
   while index < firstSpace {
-    if !tokenByte(bytes[index]) {
+    if !isTokenByte(bytes[index]) {
       return Result<(), ParseError>.failResult(parseError(
         ParseReason.InvalidMethod,
         ParseComponent.Method,
@@ -2083,7 +2214,7 @@ fn validateFieldLine(core: &mut ParserCore, length: usize) -> Result<(), ParseEr
         Option<usize>.some(core.fieldCount),
       ))
     }
-    if !tokenByte(byte) {
+    if !isTokenByte(byte) {
       return Result<(), ParseError>.failResult(parseError(
         ParseReason.InvalidFieldName,
         ParseComponent.HeaderName,
@@ -2435,14 +2566,6 @@ fn asciiText<'value>(bytes: &'value [u8]) -> string<'value> {
   unsafe { return String.fromUtf8Unchecked(bytes) }
 }
 
-fn tokenByte(value: u8) -> bool {
-  if value >= 65 && value <= 90 { return true }
-  if value >= 97 && value <= 122 { return true }
-  if value >= 48 && value <= 57 { return true }
-  return value == 33 || value == 35 || value == 36 || value == 37 || value == 38
-    || value == 39 || value == 42 || value == 43 || value == 45 || value == 46
-    || value == 94 || value == 95 || value == 96 || value == 124 || value == 126
-}
 
 fn isHostName(name: &[u8]) -> bool {
   if name.length != 4 { return false }
@@ -2569,6 +2692,125 @@ fn storedFailure(core: &ParserCore) -> Option<ParseError> {
     offset: core.failureOffset,
     fieldIndex: move field,
   })
+}
+
+fn loadCore(core: &mut ParserCore, head: RequestHead) -> Result<(), ParseError> {
+  if core.state != ParserState.Active || core.length != usize.ZERO {
+    return Result<(), ParseError>.failResult(stateError(core.length))
+  }
+  let bytes = head.bytes
+  let limits = core.limits
+  if bytes.length > limits.maxHeadBytes {
+    return Result<(), ParseError>.failResult(limitParseError(
+      ParseLimitKind.HeadBytes,
+      limits.maxHeadBytes,
+      bytes.length,
+      ParseComponent.Parser,
+      limits.maxHeadBytes,
+      Option<usize>.none(),
+    ))
+  }
+  if head.methodLength > limits.values.maxMethodBytes {
+    return Result<(), ParseError>.failResult(limitParseError(
+      ParseLimitKind.MethodBytes,
+      limits.values.maxMethodBytes,
+      head.methodLength,
+      ParseComponent.Method,
+      head.methodStart,
+      Option<usize>.none(),
+    ))
+  }
+  if head.targetLength > limits.values.maxTargetBytes {
+    return Result<(), ParseError>.failResult(limitParseError(
+      ParseLimitKind.TargetBytes,
+      limits.values.maxTargetBytes,
+      head.targetLength,
+      ParseComponent.Target,
+      head.targetStart,
+      Option<usize>.none(),
+    ))
+  }
+  if head.fieldCountValue > limits.values.maxFields {
+    return Result<(), ParseError>.failResult(limitParseError(
+      ParseLimitKind.Fields,
+      limits.values.maxFields,
+      head.fieldCountValue,
+      ParseComponent.HeaderName,
+      usize.ZERO,
+      Option<usize>.some(limits.values.maxFields),
+    ))
+  }
+  // Each line ends where the next one starts; the last field line ends before the empty line.
+  let headEnd = bytes.length - 2
+  let mut lineStart = usize.ZERO
+  let mut fieldBytes = usize.ZERO
+  let mut index = usize.ZERO
+  while index <= head.fieldCountValue {
+    let lineEnd = if index < head.fieldCountValue { head.records[index].nameStart } else { headEnd }
+    let lineLength = lineEnd - lineStart
+    let lineLimit = if index == usize.ZERO { limits.maxStartLineBytes } else { limits.maxFieldLineBytes }
+    if lineLength > lineLimit {
+      return Result<(), ParseError>.failResult(limitParseError(
+        if index == usize.ZERO { ParseLimitKind.StartLineBytes } else { ParseLimitKind.FieldLineBytes },
+        lineLimit,
+        lineLength,
+        if index == usize.ZERO { ParseComponent.StartLine } else { ParseComponent.HeaderValue },
+        lineStart,
+        if index == usize.ZERO { Option<usize>.none() } else { Option<usize>.some(index - usize.ONE) },
+      ))
+    }
+    if index < head.fieldCountValue {
+      let record = head.records[index]
+      if record.nameLength > limits.values.maxNameBytes {
+        return Result<(), ParseError>.failResult(limitParseError(
+          ParseLimitKind.NameBytes,
+          limits.values.maxNameBytes,
+          record.nameLength,
+          ParseComponent.HeaderName,
+          record.nameStart,
+          Option<usize>.some(index),
+        ))
+      }
+      if record.valueLength > limits.values.maxValueBytes {
+        return Result<(), ParseError>.failResult(limitParseError(
+          ParseLimitKind.ValueBytes,
+          limits.values.maxValueBytes,
+          record.valueLength,
+          ParseComponent.HeaderValue,
+          record.valueStart,
+          Option<usize>.some(index),
+        ))
+      }
+      fieldBytes = fieldBytes + record.nameLength + record.valueLength
+      if fieldBytes > limits.values.maxFieldBytes {
+        return Result<(), ParseError>.failResult(limitParseError(
+          ParseLimitKind.FieldBytes,
+          limits.values.maxFieldBytes,
+          fieldBytes,
+          ParseComponent.HeaderValue,
+          record.valueStart,
+          Option<usize>.some(index),
+        ))
+      }
+    }
+    lineStart = lineEnd
+    index = index + usize.ONE
+  }
+  let _stored = Bytes.appendSliceWithinCapacity(&mut core.storage, bytes)
+  let records = Slice.view<FieldRecord>(head.records, usize.ZERO, head.fieldCountValue)
+  let _recorded = List<FieldRecord>.appendSliceWithinCapacity(&mut core.records, records)
+  core.length = bytes.length
+  core.lineStart = bytes.length
+  core.phase = Phase.Fields
+  core.fieldCount = head.fieldCountValue
+  core.fieldBytes = fieldBytes
+  core.versionValue = head.versionValue
+  core.methodStart = head.methodStart
+  core.methodLength = head.methodLength
+  core.targetStart = head.targetStart
+  core.targetLength = head.targetLength
+  core.state = ParserState.Complete
+  return Result<(), ParseError>.succeed(())
 }
 
 fn resetCore(core: &mut ParserCore) -> Result<(), ParseError> {
@@ -2777,56 +3019,51 @@ effect fn copyResponseValues<'value>(
   return run ValueResponseHead.copy(&shared, limits)
 }
 
+// A typed head already follows the rules of its parts, because `Method.parse`,
+// `RequestTarget.parse`, `Header.make`, and the head's `make` check them when the values are
+// made. Writing a head checks only the `limits` of the output, which can be smaller.
 fn validateRequestForSerialization<'value>(
   head: &ValueRequestHead<'value>,
   limits: ValueLimits,
 ) -> Result<(), ValueError> {
-  let methodText = Method.format(&ValueRequestHead.method(head))
-  let method = match move Method.parse(methodText, limits.maxMethodBytes) {
-    Result<Method<'value>, ValueError>.Failure {error} => {
-      return Result<(), ValueError>.failResult(move error)
-    }
-    Result<Method<'value>, ValueError>.Success {value} => value
+  let method = String.byteLength(Method.format(&ValueRequestHead.method(head)))
+  if method > limits.maxMethodBytes {
+    return Result<(), ValueError>.failResult(valueLimitError(
+      ValueComponent.Method,
+      ValueLimitKind.MethodBytes,
+      limits.maxMethodBytes,
+      method,
+    ))
   }
-  let targetText = RequestTarget.format(ValueRequestHead.target(head))
-  let target = match move RequestTarget.parse(&method, targetText, limits.maxTargetBytes) {
-    Result<RequestTarget<'value>, ValueError>.Failure {error} => {
-      return Result<(), ValueError>.failResult(move error)
-    }
-    Result<RequestTarget<'value>, ValueError>.Success {value} => value
+  let target = String.byteLength(RequestTarget.format(ValueRequestHead.target(head)))
+  if target > limits.maxTargetBytes {
+    return Result<(), ValueError>.failResult(valueLimitError(
+      ValueComponent.Target,
+      ValueLimitKind.TargetBytes,
+      limits.maxTargetBytes,
+      target,
+    ))
   }
   let headers = ValueRequestHead.headers(head)
-  let validFields = validateHeaders(&headers, limits)
-  if let Result<(), ValueError>.Failure {error} = move validFields {
-    return Result<(), ValueError>.failResult(move error)
-  }
-  let made = ValueRequestHead.make(ValueRequestHead.version(head), method, target, headers)
-  return match move made {
-    Result<ValueRequestHead<'value>, ValueError>.Failure {error} => Result<(), ValueError>.failResult(move error)
-    Result<ValueRequestHead<'value>, ValueError>.Success {..} => Result<(), ValueError>.succeed(())
-  }
+  return validateHeaders(&headers, limits)
 }
 
 fn validateResponseForSerialization<'value>(
   head: &ValueResponseHead<'value>,
   limits: ValueLimits,
 ) -> Result<(), ValueError> {
+  if let Option<&[u8]>.Some {value: reason} = ValueResponseHead.reason(head) {
+    if reason.length > limits.maxValueBytes {
+      return Result<(), ValueError>.failResult(valueLimitError(
+        ValueComponent.ReasonPhrase,
+        ValueLimitKind.ValueBytes,
+        limits.maxValueBytes,
+        reason.length,
+      ))
+    }
+  }
   let headers = ValueResponseHead.headers(head)
-  let validFields = validateHeaders(&headers, limits)
-  if let Result<(), ValueError>.Failure {error} = move validFields {
-    return Result<(), ValueError>.failResult(move error)
-  }
-  let made = ValueResponseHead.make(
-    ValueResponseHead.version(head),
-    ValueResponseHead.status(head),
-    ValueResponseHead.reason(head),
-    headers,
-    limits,
-  )
-  return match move made {
-    Result<ValueResponseHead<'value>, ValueError>.Failure {error} => Result<(), ValueError>.failResult(move error)
-    Result<ValueResponseHead<'value>, ValueError>.Success {..} => Result<(), ValueError>.succeed(())
-  }
+  return validateHeaders(&headers, limits)
 }
 
 fn validateHeaders<'value>(headers: &Headers<'value>, limits: ValueLimits) -> Result<(), ValueError> {
@@ -2852,9 +3089,23 @@ fn validateHeaders<'value>(headers: &Headers<'value>, limits: ValueLimits) -> Re
     match move ValueHeaderIterator.next(&mut iterator) {
       Option<Header<'value>>.None => { done = true }
       Option<Header<'value>>.Some {value: header} => {
-        let made = Header.make(Header.name(&header), Header.value(&header), limits)
-        if let Result<Header<'value>, ValueError>.Failure {error} = move made {
-          return Result<(), ValueError>.failResult(move error)
+        let name = String.byteLength(Header.name(&header))
+        if name > limits.maxNameBytes {
+          return Result<(), ValueError>.failResult(valueLimitError(
+            ValueComponent.HeaderName,
+            ValueLimitKind.NameBytes,
+            limits.maxNameBytes,
+            name,
+          ))
+        }
+        let value = Header.value(&header).length
+        if value > limits.maxValueBytes {
+          return Result<(), ValueError>.failResult(valueLimitError(
+            ValueComponent.HeaderValue,
+            ValueLimitKind.ValueBytes,
+            limits.maxValueBytes,
+            value,
+          ))
         }
       }
     }
