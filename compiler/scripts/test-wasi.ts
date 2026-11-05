@@ -134,7 +134,7 @@ const program = Effect.gen(function* () {
     assert.match(refused.stderr.toString(), /--emit wasm-text needs a wasm32 or wasm64 executable/)
   }
   {
-    // A project build keeps its translated bodies, and an edit runs the edited body, not a cached one.
+    // A project build reuses its emitted fragments, and an edit runs the edited body, not a cached one.
     const project = Effect.fnUntraced(function* (status: number) {
       yield* fs.writeFileString(
         join(directory, 'main.silk'),
@@ -145,7 +145,6 @@ const program = Effect.gen(function* () {
       })
       assert.equal(rebuilt.status, 0, rebuilt.stderr.toString())
       const built = join(directory, 'build/direct/wasm32-wasip1/debug/wasi-test')
-      assert.ok(yield* fs.exists(`${built}.units/code`), 'the build keeps its code cache')
       const exited = yield* invoke(wasmtime, ['run', built])
       assert.equal(exited.status, status, exited.stderr.toString())
     })
