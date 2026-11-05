@@ -3,8 +3,11 @@
 //! # When to use
 //! In an `silk.http.server` request callback, call [`withUpgrade`] with a [`DecisionHandler`]. The
 //! handler looks at the [`Offer`] and returns a [`Decision`]: accept, maybe with a subprotocol, or
-//! reject with a status. After an accept, your callback gets the channel for WebSocket frames, for
-//! example through `silk.http.websocket_server`.
+//! reject with a status. After an accept, your callback gets the channel. Make a session over it
+//! with [`channelTransport`] and `WebSocket.make` of `silk.http.websocket_stream`.
+//!
+//! For a connection that a listener accepted, call [`acceptOwned`]. It answers the handshake and
+//! returns a session that owns the transport, so you can split it for fibers.
 //!
 //! Use [`inspect`] and [`acceptInto`] alone to check a handshake without a server.
 //!
@@ -182,11 +185,17 @@
 import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.encoding.base64 {Base64}
 import silk.io.buffered_duplex {BufferedDuplex}
-import silk.io.byte_duplex {ByteDuplex}
+import silk.io.buffered_input {BufferError}
+import silk.io.byte_duplex {ByteDuplex, ByteIoError, ByteIoOperation, ReadTransfer}
+import silk.http.transport {HttpTransport, TransportError}
+import silk.system.random {Random}
+import silk.collections.bytes {Bytes}
+import silk.http.websocket {Role}
+import silk.http.websocket_stream {Options, StreamError, WebSocket}
 import silk.core.effect {Effect}
 import silk.text.format {Debug, Format, Formatter}
 import silk.http.message {Header, Version, Status, ResponseHead, OwnedResponseHead, ValueError}
-import silk.http.head {RequestHead, responseSerializedSize}
+import silk.http.head {Limits as HeadLimits, ProgressState, RequestHead, RequestParser, responseSerializedSize, writeResponseInto}
 import silk.http.headers {Headers}
 import silk.http.headers as HttpHeaders
 import silk.http.server {Request, ServerError}
@@ -200,7 +209,7 @@ import silk.core.result {Result}
 import silk.crypto.sha1 {Sha1}
 import silk.collections.slice {Slice}
 import silk.text.string {String}
-import silk.system.system_clock {Instant}
+import silk.system.system_clock {Instant, SystemClock}
 import silk.num.usize
 import silk.collections.list {List}
 import silk.io.writer {Writer, WriterError}
@@ -1101,6 +1110,15 @@ where &'transport mut P provides &ByteDuplex from &mut ByteDuplex | &mut Monoton
   let requestHead = run request.head()
   let responseVersion = requestHead.version()
   drop requestHead
+  let plan = run rejectionPlan(error, responseVersion, limits)
+  let view = plan.response.view()
+  return run HttpServer.reject(&mut request.*, &view, move deadline)
+}
+
+// The response for a handshake error: the status of `rejectionStatus`, and the version for 426.
+effect fn rejectionPlan(error: &UpgradeError, responseVersion: Version, limits: Limits) -> ResponsePlan
+! UpgradeError | OutOfMemoryError
+? &mut Allocator {
   let code = rejectionStatus(error)
   let mut count: usize = 2
   let mut payload: usize = 30
@@ -1119,9 +1137,7 @@ where &'transport mut P provides &ByteDuplex from &mut ByteDuplex | &mut Monoton
   let response = run take(
     ResponseHead.make(responseVersion, status, Option<&[u8]>.none(), headers, valueLimits),
   )
-  let plan = run copyPlan(&response, limits, false)
-  let view = plan.response.view()
-  return run HttpServer.reject(&mut request.*, &view, move deadline)
+  return run copyPlan(&response, limits, false)
 }
 
 effect fn planDecision<'head, 'config>(
@@ -1436,5 +1452,285 @@ effect fn multiply(left: usize, right: usize) -> usize ! UpgradeError {
       fail UpgradeError.Limit {kind: LimitKind.SizeOverflow}
     }
     Option.Some {value} => value
+  }
+}
+
+/// The upgraded channel of [`withUpgrade`] as a transport, so that a `WebSocket` of
+/// `silk.http.websocket_stream` can run over it. Make it with [`channelTransport`].
+pub struct ChannelTransport<'channel, 'transport, P> {
+  channel: &'channel mut BufferedDuplex<'transport, P>,
+}
+
+/// Returns `channel` as a transport. Bytes that the client sent after the request head come first.
+pub fn channelTransport<'channel, 'transport, P>(
+  channel: &'channel mut BufferedDuplex<'transport, P>,
+) -> ChannelTransport<'channel, 'transport, P> {
+  return ChannelTransport<'channel, 'transport, P> {channel: move channel}
+}
+
+impl<'channel, 'transport, P> ChannelTransport<'channel, 'transport, P> {
+  effect fn read(self: &mut Self, output: &mut [u8], deadline: Option<Instant>) -> ReadTransfer
+  ! TransportError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator | &mut Random
+  where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock {
+    let attempted = run Effect.result(self.channel.readSome(move output, move deadline))
+    return match move attempted {
+      Result.Success {value} => move value
+      Result.Failure {error} => { fail bufferFailure(move error, ByteIoOperation.Read) }
+    }
+  }
+  effect fn write(self: &mut Self, input: &[u8], deadline: Option<Instant>) -> usize
+  ! TransportError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator | &mut Random
+  where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock {
+    let attempted = run Effect.result(self.channel.writeSome(input, move deadline))
+    return match move attempted {
+      Result.Success {value} => value
+      Result.Failure {error} => { fail bufferFailure(move error, ByteIoOperation.Write) }
+    }
+  }
+  effect fn flushOutput(self: &mut Self, deadline: Option<Instant>) -> ()
+  ! TransportError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator | &mut Random
+  where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock {
+    let attempted = run Effect.result(self.channel.flush(move deadline))
+    return match move attempted {
+      Result.Success {value} => move value
+      Result.Failure {error} => { fail bufferFailure(move error, ByteIoOperation.Flush) }
+    }
+  }
+  effect fn closeChannel(self: &mut Self) -> () ! TransportError
+  where &mut P provides &ByteDuplex from &mut ByteDuplex {
+    let attempted = run Effect.result(self.channel.close())
+    return match move attempted {
+      Result.Success {value} => move value
+      Result.Failure {error} => { fail TransportError.Plain {error: move error} }
+    }
+  }
+}
+
+impl<'channel, 'transport, P> HttpTransport for ChannelTransport<'channel, 'transport, P>
+where
+  &mut P provides &ByteDuplex from &mut ByteDuplex,
+  &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock {
+  readSomeRaw: ChannelTransport.read
+  writeSomeRaw: ChannelTransport.write
+  flush: ChannelTransport.flushOutput
+  close: ChannelTransport.closeChannel
+}
+
+fn bufferFailure(error: BufferError, operation: ByteIoOperation) -> TransportError {
+  return match move error {
+    BufferError.ReadFailed {error: cause, ..} => TransportError.Plain {error: move cause}
+    BufferError.WriteFailed {error: cause, ..} => TransportError.Plain {error: move cause}
+    _ => TransportError.Plain {error: ByteDuplex.closed(operation)}
+  }
+}
+
+/// The result of [`acceptOwned`].
+pub union Accepted<P> {
+  /// The 101 response was sent. The session is open.
+  Upgraded {
+    /// The session, which owns the transport.
+    pub socket: WebSocket<P>,
+    /// The selected subprotocol, or empty.
+    pub protocol: Bytes,
+  },
+  /// The request was not a valid handshake, or the decision was `Reject`. The response was sent and
+  /// the transport was closed.
+  Rejected {
+    /// The status that was sent.
+    pub status: u16,
+  },
+}
+
+/// Reads a handshake request from `transport`, asks `handler`, and answers. After an accept, it
+/// returns a server session that owns `transport`.
+///
+/// # When to use
+/// Use it for a connection that a listener accepted, when the session must outlive one callback,
+/// for example to split it for fibers. Inside `silk.http.server`, use [`withUpgrade`] instead.
+///
+/// # Details
+/// `head` limits the request head. A request that is not a valid handshake gets the response of
+/// [`reject`]. Bytes that the client sent after the head go to the session.
+///
+/// # Errors
+/// - [`UpgradeError`] if the decision cannot make a valid response. The transport is closed.
+/// - `StreamError` if the transport fails or ends before the head, or `options` is not valid.
+/// - The errors of the handler.
+pub effect fn acceptOwned<D, ?R, P, H: DecisionHandler<D ? R>>(
+  transport: P,
+  head: HeadLimits,
+  limits: Limits,
+  options: Options,
+  handler: H,
+  deadline: Option<Instant>,
+) -> Accepted<P>
+! D | UpgradeError | StreamError | OutOfMemoryError
+? R | &mut Allocator | &mut MonotonicClock | &mut Random
+where
+  &mut P provides &HttpTransport from &mut HttpTransport,
+  &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
+  let mut provider = move transport
+  let attempted = run Effect.result(answerOwned<D, R, P, H>(&mut provider, head, limits, &handler, &deadline))
+  let answered = match move attempted {
+    Result.Success {value} => move value
+    Result.Failure {error} => {
+      run closeOwned<P>(&mut provider)
+      fail move error
+    }
+  }
+  drop handler
+  let Answer {status, protocol, rest} = move answered
+  if status != 101 {
+    run closeOwned<P>(&mut provider)
+    return Accepted<P>.Rejected {status: status}
+  }
+  let socket = run WebSocket.make(move provider, Role.Server, options, Bytes.asSlice(&rest))
+  return Accepted<P>.Upgraded {socket: move socket, protocol: move protocol}
+}
+
+struct Answer {
+  status: u16,
+  protocol: Bytes,
+  rest: Bytes,
+}
+
+// Reads the request head, sends the response, and returns its status with the bytes after the head.
+effect fn answerOwned<D, ?R, P, H: DecisionHandler<D ? R>>(
+  provider: &mut P,
+  head: HeadLimits,
+  limits: Limits,
+  handler: &H,
+  deadline: &Option<Instant>,
+) -> Answer
+! D | UpgradeError | StreamError | OutOfMemoryError
+? R | &mut Allocator | &mut MonotonicClock | &mut Random
+where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
+  let mut parser = match move run RequestParser.make(head) {
+    Result.Success {value} => move value
+    Result.Failure {error} => {
+      drop error
+      fail UpgradeError.Limit {kind: LimitKind.OwnedBytes}
+    }
+  }
+  let mut input = run Bytes.zeroed(head.maxHeadBytes)
+  let mut start = usize.ZERO
+  let mut end = usize.ZERO
+  while true {
+    let all = Bytes.asSlice(&input)
+    let pending = Slice.view<u8>(all, start, end - start)
+    let fed = parser.feed(pending, false)
+    drop pending
+    drop all
+    let progress = match move fed {
+      Result.Success {value} => value
+      Result.Failure {error} => {
+        drop error
+        return run respondOwned(&mut provider.*, run rejectionPlan(&UpgradeError.Validation {reason: ValidationReason.Request}, Version.Http11, limits), Bytes.make(), Bytes.make(), limits, deadline)
+      }
+    }
+    start = start + progress.consumed
+    if progress.state == ProgressState.Complete { break }
+    if end == Bytes.length(&input) {
+      return run respondOwned(&mut provider.*, run rejectionPlan(&UpgradeError.Validation {reason: ValidationReason.Request}, Version.Http11, limits), Bytes.make(), Bytes.make(), limits, deadline)
+    }
+    let capacity = Bytes.length(&input)
+    let space = Slice.viewMut<u8>(&mut Bytes.asMutSlice(&mut input), end, capacity - end)
+    let read = run Effect.result(HttpTransport.readSome(&mut space, copyDeadline(deadline)) |> Effect.provideMut<HttpTransport>(&mut provider.*))
+    drop space
+    match move read {
+      Result.Success {value} => match move value {
+        ReadTransfer.Data {count} => { end = end + count }
+        ReadTransfer.End => { fail StreamError.Truncated }
+      }
+      Result.Failure {error} => { return run transportFailed(move error) }
+    }
+  }
+  let rest = run Bytes.copy(Slice.view<u8>(Bytes.asSlice(&input), start, end - start))
+  let request = match move parser.head() {
+    Result.Success {value} => value
+    Result.Failure {error} => {
+      drop error
+      fail UpgradeError.Validation {reason: ValidationReason.Request}
+    }
+  }
+  let offer = match move inspect(&request, limits) {
+    Result.Success {value} => move value
+    Result.Failure {error} => {
+      let plan = run rejectionPlan(&error, Version.Http11, limits)
+      return run respondOwned(&mut provider.*, move plan, Bytes.make(), move rest, limits, deadline)
+    }
+  }
+  let decision = run DecisionHandler.decide(handler, &offer)
+  let mut protocol = Bytes.make()
+  if let Decision.Accept {protocol: Option.Some {value}, ..} = &decision {
+    run Bytes.append(&mut protocol, String.utf8Bytes(value))
+  }
+  let plan = run planDecision(&offer, move decision, limits)
+  drop offer
+  drop request
+  return run respondOwned(&mut provider.*, move plan, move protocol, move rest, limits, deadline)
+}
+
+// Writes the response of `plan`, and returns its status.
+effect fn respondOwned<P>(
+  provider: &mut P,
+  plan: ResponsePlan,
+  protocol: Bytes,
+  rest: Bytes,
+  limits: Limits,
+  deadline: &Option<Instant>,
+) -> Answer
+! StreamError | OutOfMemoryError
+? &mut Allocator | &mut MonotonicClock | &mut Random
+where &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
+  let view = plan.response.view()
+  let status = view.status()
+  let code = status.code()
+  let mut bytes = run Bytes.zeroed(limits.maxResponseBytes)
+  let written = match move writeResponseInto(&view, &mut Bytes.asMutSlice(&mut bytes), httpLimits(limits)) {
+    Result.Success {value} => value
+    Result.Failure {..} => Intrinsic.trap("WebSocket: a checked response is always written")
+  }
+  let mut sent = usize.ZERO
+  while sent < written {
+    let part = Slice.view<u8>(Bytes.asSlice(&bytes), sent, written - sent)
+    let attempted = run Effect.result(HttpTransport.writeSome(part, copyDeadline(deadline)) |> Effect.provideMut<HttpTransport>(&mut provider.*))
+    drop part
+    match move attempted {
+      Result.Success {value} => { sent = sent + value }
+      Result.Failure {error} => { return run transportFailed(move error) }
+    }
+  }
+  let flushed = run Effect.result(HttpTransport.flush(copyDeadline(deadline)) |> Effect.provideMut<HttpTransport>(&mut provider.*))
+  if let Result.Failure {error} = move flushed { return run transportFailed(move error) }
+  if !plan.accepted {
+    return Answer {status: code, protocol: Bytes.make(), rest: move rest}
+  }
+  return Answer {status: 101, protocol: move protocol, rest: move rest}
+}
+
+effect fn transportFailed(error: TransportError | OutOfMemoryError) -> never ! StreamError | OutOfMemoryError {
+  return match move error {
+    TransportError cause => { fail StreamError.Transport {error: move cause} }
+    OutOfMemoryError allocation => { fail move allocation }
+  }
+}
+
+effect fn closeOwned<P>(provider: &mut P) -> ()
+where &mut P provides &HttpTransport from &mut HttpTransport {
+  let closed = run Effect.result(HttpTransport.close() |> Effect.provideMut<HttpTransport>(&mut provider.*))
+  drop closed
+  return ()
+}
+
+fn copyDeadline(value: &Option<Instant>) -> Option<Instant> {
+  return match &value.* {
+    Option.None => Option<Instant>.none()
+    Option.Some {value: present} => Option<Instant>.some(
+      SystemClock.make(SystemClock.seconds(&present), SystemClock.nanoseconds(&present)),
+    )
   }
 }

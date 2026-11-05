@@ -1,0 +1,341 @@
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.num.u8
+import silk.num.u16
+import silk.num.usize
+import silk.http.websocket {
+  CloseData,
+  Decoder,
+  Event,
+  Limits,
+  MessageKind,
+  Opcode,
+  PeerCloseData,
+  ProtocolReason,
+  Received,
+  Role,
+  Session,
+  State,
+  WebSocketError,
+  appendFrame,
+  closeCodeOf
+}
+
+fn key() -> Option<[u8; 4]> {
+  return Option<[u8; 4]>.some([55, 250, 33, 61])
+}
+
+fn unmasked() -> Option<[u8; 4]> {
+  return Option<[u8; 4]>.none()
+}
+
+effect fn server() -> Session ! WebSocketError {
+  return match move Session.make(Role.Server, Limits.defaults(), 0) {
+    Result.Success {value} => move value
+    Result.Failure {error} => { fail move error }
+  }
+}
+
+effect fn client() -> Session ! WebSocketError {
+  return match move Session.make(Role.Client, Limits.defaults(), 7) {
+    Result.Success {value} => move value
+    Result.Failure {error} => { fail move error }
+  }
+}
+
+// Feeds `wire` one byte at a time and returns the first event, with how many bytes it used.
+effect fn trickle(session: &mut Session, wire: &[u8], output: &mut Bytes) -> Received
+! WebSocketError | OutOfMemoryError
+? &mut Allocator {
+  let mut used = usize.ZERO
+  while used < wire.length {
+    let one = Slice.view<u8>(wire, used, 1)
+    let received = run session.receive(one, &mut output.*)
+    used = used + received.consumed
+    if let Option.Some {..} = received.event {
+      return Received {consumed: used, event: received.event}
+    }
+  }
+  return Received {consumed: used, event: Option<Event>.none()}
+}
+
+// A masked, fragmented Text message with a Ping between the fragments and a code point split
+// across them, fed one byte at a time.
+effect fn fragmentsAndPing() -> i32 ! WebSocketError | OutOfMemoryError ? &mut Allocator {
+  let mut wire = Bytes.make()
+  // "hé" is 104, 195, 169: the fragment ends inside "é".
+  run appendFrame(&mut wire, Opcode.Text, false, b"h\xc3", key())
+  run appendFrame(&mut wire, Opcode.Ping, true, b"tick", key())
+  run appendFrame(&mut wire, Opcode.Continuation, true, b"\xa9!", key())
+  let mut session = run server()
+  let mut output = Bytes.make()
+  let first = run trickle(&mut session, Bytes.asSlice(&wire), &mut output)
+  match first.event {
+    Option.Some {value: Event.Ping {payload}} => {
+      if payload.asSlice() != b"tick" { return 1 }
+    }
+    _ => { return 2 }
+  }
+  // The Pong is unmasked: 0x8A, length 4, then the payload.
+  let pong = Bytes.asSlice(&output)
+  if pong.length != 6 || pong[0] != 138 || pong[1] != 4 || pong[2] != 116 { return 3 }
+  let rest = Slice.view<u8>(Bytes.asSlice(&wire), first.consumed, Bytes.length(&wire) - first.consumed)
+  let second = run trickle(&mut session, rest, &mut output)
+  match second.event {
+    Option.Some {value: Event.Text {length}} => {
+      if length != 4 || session.messageText() != "hé!" { return 4 }
+    }
+    _ => { return 5 }
+  }
+  if second.consumed != rest.length { return 6 }
+  return 0
+}
+
+// The three length encodings, in one input, decoded by a client from unmasked server frames.
+effect fn lengths() -> i32 ! WebSocketError | OutOfMemoryError ? &mut Allocator {
+  let sevens: [u8; 200] = [7; 200]
+  let nines: [u8; 200] = [9; 200]
+  let mut big = Bytes.make()
+  run Bytes.append(&mut big, &sevens)
+  let mut huge = Bytes.make()
+  let mut index = 0
+  while index < 350 {
+    run Bytes.append(&mut huge, &nines)
+    index = index + 1
+  }
+  let mut wire = Bytes.make()
+  run appendFrame(&mut wire, Opcode.Binary, true, b"aaa", unmasked())
+  run appendFrame(&mut wire, Opcode.Binary, true, Bytes.asSlice(&big), unmasked())
+  run appendFrame(&mut wire, Opcode.Binary, true, Bytes.asSlice(&huge), unmasked())
+  let mut session = run client()
+  let mut output = Bytes.make()
+  let all = Bytes.asSlice(&wire)
+  let mut offset = usize.ZERO
+  let expected: [usize; 3] = [3, 200, 70000]
+  let mut count: usize = 0
+  while count < 3 {
+    let rest = Slice.view<u8>(all, offset, all.length - offset)
+    let received = run session.receive(rest, &mut output)
+    offset = offset + received.consumed
+    match received.event {
+      Option.Some {value: Event.Binary {length}} => {
+        if length != expected[count] { return 10 }
+        let message = session.message()
+        if message[length - 1] != message[0] { return 20 }
+      }
+      _ => { return 30 }
+    }
+    count = count + 1
+  }
+  if offset != all.length || Bytes.length(&output) != usize.ZERO { return 40 }
+  return 0
+}
+
+// A client masks every frame with a fresh key, and a server reads it back.
+effect fn clientToServer() -> i32 ! WebSocketError | OutOfMemoryError ? &mut Allocator {
+  let mut sender = run client()
+  let mut wire = Bytes.make()
+  run sender.sendText("one", &mut wire)
+  run sender.sendText("one", &mut wire)
+  let frames = Bytes.asSlice(&wire)
+  if frames.length != 18 || u8bit(frames[1]) != 131 { return 1 }
+  // Two masks for the same text differ, and so do the masked payloads.
+  if frames[2] == frames[11] && frames[3] == frames[12] && frames[4] == frames[13] { return 2 }
+  run sender.sendFragment(MessageKind.Binary, b"ab", false, &mut wire)
+  let order = run Effect.result(sender.sendText("no", &mut wire))
+  match move order {
+    Result.Failure {error} => match move error {
+      WebSocketError.FragmentOrder => {}
+      _ => { return 3 }
+    }
+    _ => { return 3 }
+  }
+  run sender.sendFragment(MessageKind.Binary, b"cd", true, &mut wire)
+  let mut receiver = run server()
+  let mut output = Bytes.make()
+  let mut offset = usize.ZERO
+  let mut texts = 0
+  let mut binaries = 0
+  while offset < Bytes.length(&wire) {
+    let all = Bytes.asSlice(&wire)
+    let rest = Slice.view<u8>(all, offset, all.length - offset)
+    let received = run receiver.receive(rest, &mut output)
+    offset = offset + received.consumed
+    match received.event {
+      Option.Some {value: Event.Text {..}} => {
+        if receiver.messageText() != "one" { return 4 }
+        texts = texts + 1
+      }
+      Option.Some {value: Event.Binary {..}} => {
+        if receiver.message() != b"abcd" { return 5 }
+        binaries = binaries + 1
+      }
+      _ => { return 6 }
+    }
+  }
+  if texts != 2 || binaries != 1 { return 7 }
+  return 0
+}
+
+fn u8bit(value: u8) -> u8 { return value }
+
+// A Close from the client is echoed with its code, and the session is closed.
+effect fn closeHandshake() -> i32 ! WebSocketError | OutOfMemoryError ? &mut Allocator {
+  let mut wire = Bytes.make()
+  let mut peer = run client()
+  let data = match move CloseData.make(4000, "bye") {
+    Result.Success {value} => move value
+    Result.Failure {error} => { fail move error }
+  }
+  run peer.sendClose(Option<CloseData>.some(data), &mut wire)
+  if peer.state() != State.CloseSent { return 1 }
+  let mut session = run server()
+  let mut output = Bytes.make()
+  let received = run session.receive(Bytes.asSlice(&wire), &mut output)
+  match received.event {
+    Option.Some {value: Event.Close {data: PeerCloseData.Present {code, reason}}} => {
+      if code != 4000 || reason.asSlice() != b"bye" { return 2 }
+    }
+    _ => { return 3 }
+  }
+  if session.state() != State.Closed { return 4 }
+  let reply = Bytes.asSlice(&output)
+  if reply.length != 4 || reply[0] != 136 || reply[2] != 15 || reply[3] != 160 { return 5 }
+  // The client gets the reply and is closed too, with no answer of its own.
+  let mut answer = Bytes.make()
+  let back = run peer.receive(reply, &mut answer)
+  match back.event {
+    Option.Some {value: Event.Close {..}} => {}
+    _ => { return 6 }
+  }
+  if peer.state() != State.Closed || Bytes.length(&answer) != usize.ZERO { return 7 }
+  let late = run Effect.result(session.sendText("late", &mut output))
+  return match move late {
+    Result.Failure {error} => match move error {
+      WebSocketError.InvalidState {state} => if state == State.Closed { 0 } else { 8 }
+      _ => 8
+    }
+    _ => 8
+  }
+}
+
+// Each bad frame fails the session with its rule, and the server answers with a Close of the
+// matching code.
+effect fn rejected(wire: &[u8], side: Role) -> u16 ! OutOfMemoryError ? &mut Allocator {
+  let made = Session.make(side, Limits {maxMessageBytes: 8}, 3)
+  let mut session = match move made {
+    Result.Success {value} => move value
+    Result.Failure {error} => {
+      drop error
+      return 0
+    }
+  }
+  let mut output = Bytes.make()
+  let attempted = run Effect.result(session.receive(wire, &mut output))
+  let code = match move attempted {
+    Result.Success {..} => u16.MIN
+    Result.Failure {error} => match move error {
+      WebSocketError cause => closeCodeOf(&cause)
+      OutOfMemoryError allocation => {
+        fail move allocation
+      }
+    }
+  }
+  if session.state() != State.Failed { return 1 }
+  let reply = Bytes.asSlice(&output)
+  if reply.length < 4 { return 2 }
+  let sent = u16.bitOr(u16.shiftLeft(u8.toU16(reply[reply.length - 2]), 8), u8.toU16(reply[reply.length - 1]))
+  if sent != code { return 3 }
+  return code
+}
+
+effect fn reason(wire: &[u8], side: Role) -> Option<ProtocolReason> ! OutOfMemoryError ? &mut Allocator {
+  let made = Decoder.make(side, Limits {maxMessageBytes: 8})
+  let mut decoder = match move made {
+    Result.Success {value} => move value
+    Result.Failure {error} => {
+      drop error
+      return Option<ProtocolReason>.none()
+    }
+  }
+  let mut offset = usize.ZERO
+  while offset < wire.length {
+    let rest = Slice.view<u8>(wire, offset, wire.length - offset)
+    let attempted = run Effect.result(decoder.feed(rest))
+    match move attempted {
+      Result.Failure {error} => {
+        return match move error {
+          WebSocketError.ProtocolError {reason} => Option<ProtocolReason>.some(reason)
+          OutOfMemoryError allocation => {
+            fail move allocation
+          }
+          _ => Option<ProtocolReason>.none()
+        }
+      }
+      Result.Success {value} => {
+        offset = offset + value.consumed
+      }
+    }
+  }
+  return Option<ProtocolReason>.none()
+}
+
+effect fn expectReason(wire: &[u8], side: Role, expected: ProtocolReason) -> bool ! OutOfMemoryError ? &mut Allocator {
+  return match run reason(wire, side) {
+    Option.Some {value} => value == expected
+    Option.None => false
+  }
+}
+
+effect fn violations() -> i32 ! OutOfMemoryError ? &mut Allocator {
+  // An unmasked client frame, and a masked server frame.
+  if !(run expectReason(b"\x81\x00", Role.Server, ProtocolReason.MaskRequired)) { return 1 }
+  if !(run expectReason(b"\x81\x80\x00\x00\x00\x00", Role.Client, ProtocolReason.MaskForbidden)) { return 2 }
+  if !(run expectReason(b"\xc1\x00", Role.Client, ProtocolReason.Rsv)) { return 3 }
+  if !(run expectReason(b"\x83\x00", Role.Client, ProtocolReason.ReservedOpcode)) { return 4 }
+  if !(run expectReason(b"\x82\x7e\x00\x05", Role.Client, ProtocolReason.NonMinimalLength)) { return 5 }
+  if !(run expectReason(b"\x82\x7f\x80\x00\x00\x00\x00\x00\x00\x00", Role.Client, ProtocolReason.LengthHighBit)) { return 6 }
+  if !(run expectReason(b"\x09\x00", Role.Client, ProtocolReason.ControlFragmented)) { return 7 }
+  if !(run expectReason(b"\x89\x7e\x00\x7e", Role.Client, ProtocolReason.ControlTooLarge)) { return 8 }
+  if !(run expectReason(b"\x80\x00", Role.Client, ProtocolReason.UnexpectedContinuation)) { return 9 }
+  if !(run expectReason(b"\x01\x01a\x81\x00", Role.Client, ProtocolReason.ExpectedContinuation)) { return 10 }
+  if !(run expectReason(b"\x88\x01\x03", Role.Client, ProtocolReason.ClosePayloadLength)) { return 11 }
+  if !(run expectReason(b"\x88\x02\x03\xed", Role.Client, ProtocolReason.CloseCode)) { return 12 }
+  if !(run expectReason(b"\x88\x00\x81\x00", Role.Client, ProtocolReason.FrameAfterClose)) { return 13 }
+  // The Close codes of the errors.
+  if (run rejected(b"\x81\x00", Role.Server)) != 1002 { return 14 }
+  if (run rejected(b"\x81\x82\x00\x00\x00\x00\xc3\x28", Role.Server)) != 1007 { return 15 }
+  if (run rejected(b"\x82\x89\x00\x00\x00\x00", Role.Server)) != 1009 { return 16 }
+  // A Text message that ends in the middle of a code point.
+  if (run rejected(b"\x81\x81\x00\x00\x00\x00\xc3", Role.Server)) != 1007 { return 17 }
+  return 0
+}
+
+effect fn program() -> i32 ! WebSocketError | OutOfMemoryError ? &mut Allocator {
+  let fragments = run fragmentsAndPing()
+  if fragments != 0 { return 100 + fragments }
+  let sizes = run lengths()
+  if sizes != 0 { return 150 + sizes }
+  let masking = run clientToServer()
+  if masking != 0 { return 200 + masking }
+  let close = run closeHandshake()
+  if close != 0 { return 210 + close }
+  let rules = run violations()
+  if rules != 0 { return 220 + rules }
+  return 42
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  return 99
+}
+
+pub fn main() -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(program(), failed)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}

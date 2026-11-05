@@ -116,7 +116,7 @@ pub fn main() -> i32 {
 
 Import as `HttpExchangeNative` with `import silk.http.exchange_native as HttpExchangeNative`.
 
-Public declarations: 17.
+Public declarations: 18.
 
 <a id="NativeRoute"></a>
 
@@ -353,6 +353,17 @@ pub maximumAttempts: usize
 
 The maximum number of connection attempts. It is 1 through 1024.
 
+<a id="Options.readinessWait"></a>
+
+### Field `readinessWait`
+
+```silk
+pub readinessWait: ReadinessWait
+```
+
+How the socket waits when it is not ready. `Kernel` blocks the thread, so use it only with a
+clock that blocks the thread too.
+
 <a id="Options.deadline"></a>
 
 ### Field `deadline`
@@ -423,8 +434,8 @@ pub fn defaults() -> Options
 
 Returns the default settings.
 
-They are: 16 addresses, any family, Nagle on, a 1 ms poll interval, 64 attempts, no deadline,
-30 seconds for the handshake, and `OptionalHttp11`.
+They are: 16 addresses, any family, Nagle on, a 1 ms poll interval, waits with the clock, 64
+attempts, no deadline, 30 seconds for the handshake, and `OptionalHttp11`.
 
 <a id="NativeTransport"></a>
 
@@ -745,6 +756,36 @@ connection and to the `CONNECT` exchange.
 - `NativeExchangeError.TrustRequired` if the origin uses `https` and `preparedTrust` is none.
 - The errors of resolution, the socket, TLS, and the handler.
 
+<a id="NativeTransportHalves"></a>
+
+## `NativeTransportHalves`
+
+```silk
+pub struct NativeTransportHalves
+```
+
+The two halves of a [`NativeTransport`](#NativeTransport), from [`NativeTransport.split`](#NativeTransport.impl.split).
+
+<a id="NativeTransportHalves.reader"></a>
+
+### Field `reader`
+
+```silk
+pub reader: NativeTransport
+```
+
+The half to read from.
+
+<a id="NativeTransportHalves.writer"></a>
+
+### Field `writer`
+
+```silk
+pub writer: NativeTransport
+```
+
+The half to write to.
+
 <a id="NativeTransport.impl"></a>
 
 ## Implementation `NativeTransport`
@@ -762,6 +803,38 @@ pub fn route(self: &Self) -> NativeRoute
 ```
 
 Returns the route of the transport.
+
+<a id="NativeTransport.impl.plain"></a>
+
+### Associated function `plain`
+
+```silk
+pub fn plain(connection: NativeConnection) -> NativeTransport
+```
+
+Returns a transport over a plain socket, for example one that a listener accepted.
+
+<a id="NativeTransport.impl.split"></a>
+
+### Method `split`
+
+```silk
+pub effect fn split(self: Self) -> NativeTransportHalves ! OutOfMemoryError ? &mut Allocator
+```
+
+Splits the transport into a half to read from and a half to write to, so that one fiber can
+wait for input while another one writes. A TLS transport is split too.
+
+#### Details
+Use `reader` only to read and `writer` only to write. With TLS, records that the reader must
+answer, such as a key update, go out with the next write. The socket closes when both halves
+are closed or dropped.
+
+#### Errors
+`OutOfMemoryError` if the shared state cannot be allocated.
+
+#### Gotchas
+A half cannot be split again. That traps.
 
 <a id="NativeTransport.impl.HttpTransport"></a>
 

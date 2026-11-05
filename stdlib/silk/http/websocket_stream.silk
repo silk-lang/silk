@@ -1,0 +1,1009 @@
+//! WebSocket sessions over a byte duplex, for clients and servers, with a split form for fibers.
+//!
+//! # When to use
+//! After an opening handshake, make a [`WebSocket`] around the connection with [`WebSocket.make`].
+//! Then call [`WebSocket.readEvent`] in a loop, and answer with [`WebSocket.writeText`] or
+//! [`WebSocket.writeBinary`]. `silk.http.websocket_client` and `silk.http.websocket_upgrade` do the
+//! handshake and make the session for you.
+//!
+//! When one fiber must wait for messages while other fibers send, split the session with
+//! [`fromHalves`]. The [`ReadHalf`] reads and answers Pings and Closes, and each [`WriteHalf`] (clone it
+//! for each fiber) sends. Writes from several fibers are sent one at a time, never mixed.
+//!
+//! # Details
+//! A session reads into its own buffer, and keeps the bytes that came after a frame for the next
+//! call. Each `readEvent` returns one complete event:
+//! - `Text` and `Binary`: the message is in [`WebSocket.message`] until the next `readEvent`.
+//! - `Ping`: the Pong was already sent.
+//! - `Pong`: the payload of a Pong.
+//! - `Close`: the peer sent Close. The answer Close was already sent, and the session is `Closed`.
+//!   Close the connection.
+//!
+//! A frame that breaks a rule fails the call with `Protocol`. Before that, the session sends a
+//! Close with the code of the error. Every later call fails.
+//!
+//! # Errors
+//! [`StreamError`] keeps the frame error or the transport error. `OutOfMemoryError` if a buffer
+//! cannot grow.
+//!
+//! # Gotchas
+//! - A deadline applies to one call. A read that passes its deadline fails the session, as any
+//!   transport error does.
+//! - The session does not close the transport. Close it when the session is `Closed` or failed.
+//!
+//! # Examples
+//! ## Answer a message over a memory duplex
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.collections.bytes { Bytes }
+//! import silk.collections.list { List }
+//! import silk.core.effect { Effect }
+//! import silk.core.option { Option }
+//! import silk.io.memory_byte_duplex { MemoryByteDuplex, MemoryReadEvent, MemoryWriteAction, MemoryWriteEvent }
+//! import silk.system.monotonic_clock { MonotonicClock }
+//! import silk.system.monotonic_clock_native { OsMonotonicClock }
+//! import silk.system.random { Random }
+//! import silk.system.random_native { OsRandom }
+//! import silk.system.system_clock { Instant, SystemClock }
+//! import silk.http.transport as Transport
+//! import silk.http.websocket { Event, Opcode, Role, appendFrame }
+//! import silk.http.websocket_stream { Options, StreamError, WebSocket }
+//!
+//! effect fn program() -> i32
+//!   ! StreamError | OutOfMemoryError
+//!   ? &mut Allocator | &mut MonotonicClock | &mut Random {
+//!   // The client sends one masked Text frame, and the server accepts all writes.
+//!   let mut wire = Bytes.make()
+//!   run appendFrame(&mut wire, Opcode.Text, true, b"ping", Option<[u8; 4]>.some([9, 8, 7, 6]))
+//!   let mut reads = List<MemoryReadEvent>.make()
+//!   run reads.append(MemoryReadEvent.Data {readyAt: SystemClock.make(0, 0), bytes: move wire})
+//!   let mut writes = List<MemoryWriteEvent>.make()
+//!   run writes.append(MemoryWriteEvent {
+//!     readyAt: SystemClock.make(0, 0),
+//!     action: MemoryWriteAction.Accept {count: 64},
+//!   })
+//!   let mut memory = run MemoryByteDuplex.make(move reads, move writes, 64, 8, Option<i32>.none())
+//!
+//!   let mut socket = run WebSocket.make(Transport.plain(&mut memory), Role.Server, Options.defaults(), b"")
+//!   match run socket.readEvent(Option<Instant>.none()) {
+//!     Event.Text {..} => {
+//!       if socket.messageText() != "ping" { return 1 }
+//!     }
+//!     _ => { return 2 }
+//!   }
+//!   run socket.writeText("pong", Option<Instant>.none())
+//!   drop socket
+//!   // An unmasked Text frame: 0x81, length 4, then "pong".
+//!   if memory.outbound() != b"\x81\x04pong" { return 3 }
+//!   return 0
+//! }
+//!
+//! effect fn failed<E>(error: E) -> i32 {
+//!   drop error
+//!   return 1
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let mut clock = OsMonotonicClock.make()
+//!   let mut random = OsRandom.make()
+//!   return run Effect.catchAll(program(), failed)
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!     |> Effect.provideMut<MonotonicClock>(&mut clock)
+//!     |> Effect.provideMut<Random>(&mut random)
+//! }
+//! ```
+//!
+//! @category HTTP
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.concurrency.channel { Channel, Receiver, Sender, TryReceive, TrySend }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.http.websocket { CloseData, Event, Limits, MessageKind, Role, Session, State, WebSocketError }
+import silk.http.transport { HttpTransport, TransportError }
+import silk.io.byte_duplex { ReadTransfer }
+import silk.system.random { Random }
+import silk.mem.shared { Shared }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.system_clock { Instant, SystemClock }
+import silk.text.format { Debug, Format, Formatter }
+import silk.io.writer { Writer, WriterError }
+import silk.num.u64
+import silk.num.usize
+
+/// The error of a session over a byte duplex.
+pub union StreamError {
+  /// A frame or state rule failed. See `WebSocketError` of `silk.http.websocket`.
+  Protocol {
+    /// The rule that failed.
+    pub error: WebSocketError,
+  },
+  /// The transport failed, or a deadline passed.
+  Transport {
+    /// The transport error.
+    pub error: TransportError,
+  },
+  /// The transport ended before the Close of the peer.
+  Truncated,
+  /// An earlier transport error or truncation ended the session.
+  PreviousFailure,
+}
+
+impl Debug for StreamError {
+  /// Writes the variant and its fields, such as `Io { error: ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      StreamError.Protocol {error} => {
+        let mut record = run Format.debugRecord("Protocol", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      StreamError.Transport {error} => {
+        let mut record = run Format.debugRecord("Transport", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      StreamError.Truncated => run Format.write(&mut formatter, b"Truncated")
+      StreamError.PreviousFailure => run Format.write(&mut formatter, b"PreviousFailure")
+    }
+  }
+}
+
+/// The options of a session.
+pub struct Options {
+  /// The frame and message limits.
+  pub limits: Limits,
+  /// The size of one read from the transport. It is more than zero.
+  pub readCapacity: usize,
+}
+
+impl Copy for Options {}
+
+impl Options {
+  /// Returns the default options: the default limits and reads of 16384 bytes.
+  pub fn defaults() -> Options {
+    return Options {limits: Limits.defaults(), readCapacity: 16384}
+  }
+}
+
+/// A WebSocket session that owns its transport `P`.
+///
+/// # Details
+/// Make it with [`WebSocket.make`] after the opening handshake. `P` must provide `HttpTransport`,
+/// as `NativeTransport` of `silk.http.exchange_native` does for a socket or a TLS connection.
+pub struct WebSocket<P> {
+  provider: P,
+  core: Core,
+}
+
+// The receive side: the codec, the bytes that were read and not used, and the failure flag. A
+// split session keeps the codec in its link instead, so `session` is `None` there.
+struct Core {
+  side: Role,
+  limits: Limits,
+  seed: u64,
+  session: Option<Session>,
+  input: Bytes,
+  start: usize,
+  end: usize,
+  readCapacity: usize,
+  output: Bytes,
+  failed: bool,
+}
+
+impl<P> WebSocket<P> {
+  /// Returns an open session for `role` over `transport`.
+  ///
+  /// # Details
+  /// `buffered` holds bytes that were read with the handshake and come before any later read. A
+  /// client draws the seed of its mask keys from `Random`.
+  ///
+  /// # Errors
+  /// `Protocol` with `InvalidLimits` if `maxMessageBytes` or `readCapacity` is zero.
+  /// `OutOfMemoryError` if the buffers cannot be allocated.
+  pub effect fn make(
+    transport: P,
+    side: Role,
+    options: Options,
+    buffered: &[u8],
+  ) -> WebSocket<P> ! StreamError | OutOfMemoryError ? &mut Allocator | &mut Random {
+    let seed = run Random.nextU64()
+    let core = run makeCore(side, options, buffered, seed)
+    return WebSocket<P> {provider: move transport, core: move core}
+  }
+
+  /// Returns the state of the session.
+  pub fn state(self: &Self) -> State {
+    return match &self.core.session {
+      Option.Some {value} => value.state()
+      Option.None => State.Failed
+    }
+  }
+
+  /// Returns the last Text or Binary message. It is valid until the next `readEvent`.
+  pub fn message<'socket>(self: &'socket Self) -> &'socket [u8] {
+    return match &self.core.session {
+      Option.Some {value} => value.message()
+      Option.None => Slice.view<u8>(Bytes.asSlice(&self.core.input), usize.ZERO, usize.ZERO)
+    }
+  }
+
+  /// Returns the last Text message as text. It is empty after a Binary message.
+  pub fn messageText<'socket>(self: &'socket Self) -> string<'socket> {
+    return match &self.core.session {
+      Option.Some {value} => value.messageText()
+      Option.None => ""
+    }
+  }
+
+  /// Returns the transport, to close it or to look at it.
+  pub fn transport<'socket>(self: &'socket mut Self) -> &'socket mut P {
+    return &mut self.provider
+  }
+
+  /// Reads frames until one event is complete, and returns it.
+  ///
+  /// # Details
+  /// A Ping is answered and a Close is answered before the call returns. The message of a `Text` or
+  /// `Binary` event is in [`WebSocket.message`].
+  ///
+  /// # Errors
+  /// - `Protocol` for a frame that breaks a rule, or when the session is `Closed`.
+  /// - `Io` if the transport fails or `deadline` passes, `Truncated` if it ends before a Close.
+  pub effect fn readEvent(self: &mut Self, deadline: Option<Instant>) -> Event
+  ! StreamError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock | &mut Random
+  where
+    &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
+    run requireUsable(&self.core)
+    while true {
+      let decoded = run Effect.result(decodeBuffered(&mut self.core))
+      let found = match move decoded {
+        Result.Success {value} => move value
+        Result.Failure {error} => {
+          run flushOutput(&mut self.provider, &mut self.core, copyDeadline(&deadline))
+          return match move error {
+            StreamError cause => { fail move cause }
+            OutOfMemoryError allocation => { fail move allocation }
+          }
+        }
+      }
+      run flushOutput(&mut self.provider, &mut self.core, copyDeadline(&deadline))
+      if let Option.Some {value} = move found { return move value }
+      run fillInput(&mut self.provider, &mut self.core, copyDeadline(&deadline))
+    }
+    fail StreamError.Truncated
+  }
+
+  /// Sends `text` as one Text frame, and flushes it.
+  ///
+  /// # Errors
+  /// `Protocol` if the session is not open, `Io` if the transport fails or `deadline` passes.
+  pub effect fn writeText(self: &mut Self, text: string, deadline: Option<Instant>) -> ()
+  ! StreamError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock | &mut Random
+  where
+    &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
+    run requireUsable(&self.core)
+    let mut session = takeSession(&mut self.core)
+    let encoded = run Effect.result(session.sendText(text, &mut self.core.output))
+    return run finishSend(&mut self.provider, &mut self.core, move session, move encoded, move deadline)
+  }
+
+  /// Sends `bytes` as one Binary frame, and flushes it.
+  ///
+  /// # Errors
+  /// `Protocol` if the session is not open, `Io` if the transport fails or `deadline` passes.
+  pub effect fn writeBinary(self: &mut Self, bytes: &[u8], deadline: Option<Instant>) -> ()
+  ! StreamError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock | &mut Random
+  where
+    &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
+    run requireUsable(&self.core)
+    let mut session = takeSession(&mut self.core)
+    let encoded = run Effect.result(session.sendBinary(bytes, &mut self.core.output))
+    return run finishSend(&mut self.provider, &mut self.core, move session, move encoded, move deadline)
+  }
+
+  /// Sends one fragment of a message, and flushes it. `kind` counts only for the first fragment,
+  /// and `fin` marks the last one.
+  ///
+  /// # Errors
+  /// `Protocol` if the session is not open, `Io` if the transport fails or `deadline` passes.
+  pub effect fn writeFragment(
+    self: &mut Self,
+    kind: MessageKind,
+    payload: &[u8],
+    fin: bool,
+    deadline: Option<Instant>,
+  ) -> ()
+  ! StreamError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock | &mut Random
+  where
+    &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
+    run requireUsable(&self.core)
+    let mut session = takeSession(&mut self.core)
+    let encoded = run Effect.result(session.sendFragment(kind, payload, fin, &mut self.core.output))
+    return run finishSend(&mut self.provider, &mut self.core, move session, move encoded, move deadline)
+  }
+
+  /// Sends a Ping with `payload` (at most 125 bytes), and flushes it.
+  ///
+  /// # Errors
+  /// `Protocol` if the session is not open or the payload is too large, `Io` if the transport
+  /// fails or `deadline` passes.
+  pub effect fn writePing(self: &mut Self, payload: &[u8], deadline: Option<Instant>) -> ()
+  ! StreamError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock | &mut Random
+  where
+    &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
+    run requireUsable(&self.core)
+    let mut session = takeSession(&mut self.core)
+    let encoded = run Effect.result(session.sendPing(payload, &mut self.core.output))
+    return run finishSend(&mut self.provider, &mut self.core, move session, move encoded, move deadline)
+  }
+
+  /// Sends a Close, and flushes it. Then read with `readEvent` until the `Close` event of the peer.
+  ///
+  /// # Details
+  /// `data` gives the code and reason. With `None`, the Close has no payload. It does nothing if
+  /// this side already sent Close.
+  ///
+  /// # Errors
+  /// `Protocol` if the session failed, `Io` if the transport fails or `deadline` passes.
+  pub effect fn sendClose(self: &mut Self, data: Option<CloseData>, deadline: Option<Instant>) -> ()
+  ! StreamError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock | &mut Random
+  where
+    &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
+    run requireUsable(&self.core)
+    let mut session = takeSession(&mut self.core)
+    let encoded = run Effect.result(session.sendClose(move data, &mut self.core.output))
+    return run finishSend(&mut self.provider, &mut self.core, move session, move encoded, move deadline)
+  }
+}
+
+effect fn makeCore(side: Role, options: Options, buffered: &[u8], seed: u64) -> Core
+! StreamError | OutOfMemoryError
+? &mut Allocator {
+  if options.readCapacity == usize.ZERO {
+    fail StreamError.Protocol {error: WebSocketError.InvalidLimits}
+  }
+  let session = match move Session.make(side, options.limits, seed) {
+    Result.Success {value} => move value
+    Result.Failure {error} => { fail StreamError.Protocol {error: error} }
+  }
+  let mut capacity = options.readCapacity
+  if buffered.length > capacity { capacity = buffered.length }
+  let mut input = run Bytes.zeroed(capacity)
+  Slice.copyInto<u8>(&mut Bytes.asMutSlice(&mut input), usize.ZERO, buffered)
+  return Core {
+    side: side,
+    limits: options.limits,
+    seed: seed,
+    session: Option<Session>.some(move session),
+    input: move input,
+    start: usize.ZERO,
+    end: buffered.length,
+    readCapacity: options.readCapacity,
+    output: Bytes.make(),
+    failed: false,
+  }
+}
+
+effect fn requireUsable(core: &Core) -> () ! StreamError {
+  if core.failed { fail StreamError.PreviousFailure }
+  return ()
+}
+
+fn takeSession(core: &mut Core) -> Session {
+  return match move Intrinsic.replace(core.session, Option<Session>.none()) {
+    Option.Some {value} => move value
+    Option.None => Intrinsic.trap("WebSocket: the session is in use")
+  }
+}
+
+fn restoreSession(core: &mut Core, session: Session) -> () {
+  let previous = Intrinsic.replace(core.session, Option<Session>.some(move session))
+  drop previous
+  return ()
+}
+
+// Decodes the buffered input until an event, and keeps the rest. `None` means more input is needed.
+effect fn decodeBuffered(core: &mut Core) -> Option<Event>
+! StreamError | OutOfMemoryError
+? &mut Allocator {
+  let mut session = takeSession(&mut core.*)
+  let all = Bytes.asSlice(&core.input)
+  let pending = Slice.view<u8>(all, core.start, core.end - core.start)
+  let attempted = run Effect.result(session.receive(pending, &mut core.output))
+  drop pending
+  drop all
+  restoreSession(&mut core.*, move session)
+  let received = match move attempted {
+    Result.Success {value} => value
+    Result.Failure {error} => {
+      return match move error {
+        WebSocketError cause => { fail StreamError.Protocol {error: cause} }
+        OutOfMemoryError allocation => { fail move allocation }
+      }
+    }
+  }
+  core.start = core.start + received.consumed
+  if core.start == core.end {
+    core.start = usize.ZERO
+    core.end = usize.ZERO
+  }
+  return received.event
+}
+
+// Reads more input after the bytes that are kept.
+effect fn fillInput<P>(transport: &mut P, core: &mut Core, deadline: Option<Instant>) -> ()
+! StreamError | OutOfMemoryError
+? &mut Allocator | &mut MonotonicClock | &mut Random
+where
+  &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
+  if core.start != usize.ZERO {
+    // Move the kept bytes to the front.
+    let kept = core.end - core.start
+    let all = Bytes.asMutSlice(&mut core.input)
+    let mut index = usize.ZERO
+    while index < kept {
+      all[index] = all[core.start + index]
+      index = index + usize.ONE
+    }
+    drop all
+    core.start = usize.ZERO
+    core.end = kept
+  }
+  let capacity = Bytes.length(&core.input)
+  if core.end == capacity {
+    // A partial frame header or control frame never fills the buffer, because the codec takes
+    // every byte that it is given.
+    return Intrinsic.trap("WebSocket: the input buffer is full")
+  }
+  let all = Bytes.asMutSlice(&mut core.input)
+  let space = Slice.viewMut<u8>(&mut all, core.end, capacity - core.end)
+  let attempted = run Effect.result(
+    HttpTransport.readSome(&mut space, move deadline) |> Effect.provideMut<HttpTransport>(&mut transport.*),
+  )
+  drop space
+  drop all
+  return match move attempted {
+    Result.Success {value} => match move value {
+      ReadTransfer.Data {count} => {
+        core.end = core.end + count
+        return ()
+      }
+      ReadTransfer.End => {
+        core.failed = true
+        fail StreamError.Truncated
+      }
+    }
+    Result.Failure {error} => {
+      core.failed = true
+      return run streamFailure(move error)
+    }
+  }
+}
+
+// Writes and flushes the output that the codec appended, if any.
+effect fn flushOutput<P>(transport: &mut P, core: &mut Core, deadline: Option<Instant>) -> ()
+! StreamError | OutOfMemoryError
+? &mut Allocator | &mut MonotonicClock | &mut Random
+where
+  &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
+  if Bytes.length(&core.output) == usize.ZERO { return () }
+  let written = run Effect.result(writeAll<P>(&mut transport.*, Bytes.asSlice(&core.output), move deadline))
+  Bytes.clear(&mut core.output)
+  if let Result.Failure {error} = move written {
+    core.failed = true
+    return run streamFailure(move error)
+  }
+  return ()
+}
+
+effect fn writeAll<P>(transport: &mut P, bytes: &[u8], deadline: Option<Instant>) -> ()
+! TransportError | OutOfMemoryError
+? &mut Allocator | &mut MonotonicClock | &mut Random
+where
+  &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
+  let mut written = usize.ZERO
+  while written < bytes.length {
+    let rest = Slice.view<u8>(bytes, written, bytes.length - written)
+    let count = run HttpTransport.writeSome(rest, copyDeadline(&deadline))
+      |> Effect.provideMut<HttpTransport>(&mut transport.*)
+    drop rest
+    written = written + count
+  }
+  return run HttpTransport.flush(move deadline) |> Effect.provideMut<HttpTransport>(&mut transport.*)
+}
+
+effect fn finishSend<P>(
+  transport: &mut P,
+  core: &mut Core,
+  session: Session,
+  encoded: Result<(), WebSocketError | OutOfMemoryError>,
+  deadline: Option<Instant>,
+) -> ()
+! StreamError | OutOfMemoryError
+? &mut Allocator | &mut MonotonicClock | &mut Random
+where
+  &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
+  restoreSession(&mut core.*, move session)
+  match move encoded {
+    Result.Success {..} => {}
+    Result.Failure {error} => {
+      Bytes.clear(&mut core.output)
+      return match move error {
+        WebSocketError cause => { fail StreamError.Protocol {error: cause} }
+        OutOfMemoryError allocation => { fail move allocation }
+      }
+    }
+  }
+  return run flushOutput<P>(&mut transport.*, &mut core.*, move deadline)
+}
+
+effect fn streamFailure(error: TransportError | OutOfMemoryError) -> never ! StreamError | OutOfMemoryError {
+  return match move error {
+    TransportError cause => { fail StreamError.Transport {error: move cause} }
+    OutOfMemoryError allocation => { fail move allocation }
+  }
+}
+
+fn copyDeadline(value: &Option<Instant>) -> Option<Instant> {
+  return match &value.* {
+    Option.None => Option<Instant>.none()
+    Option.Some {value: present} => Option<Instant>.some(
+      SystemClock.make(SystemClock.seconds(&present), SystemClock.nanoseconds(&present)),
+    )
+  }
+}
+
+/// The two halves of a transport, for [`fromHalves`].
+pub struct TransportHalves<R, W> {
+  /// The half that reads.
+  pub reader: R,
+  /// The half that writes.
+  pub writer: W,
+}
+
+/// The state of a session without its transport, from [`WebSocket.detach`]. Give it to [`fromHalves`].
+pub struct Parts {
+  core: Core,
+}
+
+/// A session and its transport, taken apart by [`WebSocket.detach`].
+pub struct Detached<P> {
+  /// The transport.
+  pub transport: P,
+  /// The rest of the session.
+  pub parts: Parts,
+}
+
+impl<P> WebSocket<P> {
+  /// Takes the session apart, to split its transport and then call [`fromHalves`].
+  pub fn detach(self: Self) -> Detached<P> {
+    let WebSocket<P> {provider, core} = move self
+    return Detached<P> {transport: move provider, parts: Parts {core: move core}}
+  }
+}
+
+/// A split session: the [`ReadHalf`] for one fiber, and a [`WriteHalf`] to clone for each fiber that
+/// sends.
+pub struct Split<R, W> {
+  /// The half that reads.
+  pub reader: ReadHalf<R, W>,
+  /// The half that sends.
+  pub writer: WriteHalf<W>,
+}
+
+// The send side, shared by the reader and every writer. The session is taken out only for work
+// that does not park.
+struct Link {
+  session: Option<Session>,
+  pending: Bytes,
+  closeSent: bool,
+  failed: bool,
+}
+
+// The write half goes through a channel of one value: a writer receives it, writes, and sends it
+// back. The reader takes it only when it is there.
+struct Lock<W> {
+  sender: Sender<W>,
+  receiver: Receiver<W>,
+}
+
+/// The receiving half of a split session. One fiber reads with it.
+///
+/// # Details
+/// [`ReadHalf.readEvent`] answers a Ping with a Pong and a Close with a Close. It sends the answer
+/// at once when no [`WriteHalf`] is sending, or else the writer that sends sends it next.
+pub struct ReadHalf<R, W> {
+  provider: R,
+  core: Core,
+  link: Shared<Link>,
+  lock: Lock<W>,
+}
+
+/// A sending handle of a split session. Clone it with [`WriteHalf.clone`] for each fiber that sends.
+///
+/// # Details
+/// Each send waits until no other writer is sending, so frames are never mixed. A Close from the
+/// peer, or a failure of the reader, makes later sends fail.
+pub struct WriteHalf<W> {
+  link: Shared<Link>,
+  lock: Lock<W>,
+}
+
+/// Makes a split session from the halves of a transport and the [`Parts`] of a session.
+///
+/// # When to use
+/// Call it with the halves of the transport that [`WebSocket.detach`] gave you, for example from
+/// `Connection.split` of `silk.net.socket_native`.
+///
+/// # Errors
+/// `OutOfMemoryError` if the shared state cannot be allocated.
+pub effect fn fromHalves<R, W>(halves: TransportHalves<R, W>, parts: Parts) -> Split<R, W>
+! OutOfMemoryError
+? &mut Allocator {
+  let TransportHalves<R, W> {reader, writer} = move halves
+  let Parts {core} = move parts
+  let mut receiving = move core
+  // The send side gets its own codec state, with a mask generator that differs from the reader's.
+  let made = Session.make(receiving.side, receiving.limits, u64.bitXor(receiving.seed, 11400714819323198485))
+  let mut sendSession = match move made {
+    Result.Success {value} => move value
+    Result.Failure {..} => Intrinsic.trap("WebSocket: the limits were checked when the session was made")
+  }
+  let receivingState = match &receiving.session {
+    Option.Some {value} => value.state()
+    Option.None => State.Failed
+  }
+  sendSession.advance(receivingState)
+  let link = run Shared<Link>.make(Link {
+    session: Option<Session>.some(move sendSession),
+    pending: Bytes.make(),
+    closeSent: false,
+    failed: false,
+  })
+  let channel = run Channel<W>.make(1)
+  let Channel<W> {sender, receiver} = move channel
+  match sender.trySend(move writer) {
+    TrySend.Sent => {}
+    TrySend.Full {value} => { drop value }
+    TrySend.Closed {value} => { drop value }
+  }
+  let writerLock = Lock<W> {sender: run sender.clone(), receiver: run receiver.clone()}
+  return Split<R, W> {
+    reader: ReadHalf<R, W> {
+      provider: move reader,
+      core: move receiving,
+      link: Shared<Link>.clone(&link),
+      lock: Lock<W> {sender: move sender, receiver: move receiver},
+    },
+    writer: WriteHalf<W> {link: move link, lock: move writerLock},
+  }
+}
+
+impl<R, W> ReadHalf<R, W> {
+  /// Returns the state of the receive side.
+  pub fn state(self: &Self) -> State {
+    return match &self.core.session {
+      Option.Some {value} => value.state()
+      Option.None => State.Failed
+    }
+  }
+
+  /// Returns the last Text or Binary message. It is valid until the next `readEvent`.
+  pub fn message<'reader>(self: &'reader Self) -> &'reader [u8] {
+    return match &self.core.session {
+      Option.Some {value} => value.message()
+      Option.None => Slice.view<u8>(Bytes.asSlice(&self.core.input), usize.ZERO, usize.ZERO)
+    }
+  }
+
+  /// Returns the last Text message as text. It is empty after a Binary message.
+  pub fn messageText<'reader>(self: &'reader Self) -> string<'reader> {
+    return match &self.core.session {
+      Option.Some {value} => value.messageText()
+      Option.None => ""
+    }
+  }
+
+  /// Reads frames until one event is complete, and returns it.
+  ///
+  /// # Details
+  /// A Ping is answered and a Close is answered: at once if no writer is sending, else right after
+  /// the frame that is being sent. The message of a `Text` or `Binary` event is in
+  /// [`ReadHalf.message`]. `deadline` applies to the reads and to the answers this call sends.
+  ///
+  /// # Errors
+  /// - `Protocol` for a frame that breaks a rule, or when the session is `Closed`.
+  /// - `Io` if the transport fails or `deadline` passes, `Truncated` if it ends before a Close.
+  pub effect fn readEvent(self: &mut Self, deadline: Option<Instant>) -> Event
+  ! StreamError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock | &mut Random
+  where
+    &mut R provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
+    &mut W provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
+    run requireUsable(&self.core)
+    while true {
+      if Shared.withMut(&self.link, readCloseSent) {
+        let mut session = takeSession(&mut self.core)
+        session.advance(State.CloseSent)
+        restoreSession(&mut self.core, move session)
+      }
+      let decoded = run Effect.result(decodeBuffered(&mut self.core))
+      let state = self.state()
+      Shared.withMut(&self.link, advanceLink(state))
+      run self.queueReplies()
+      run self.sendQueued(copyDeadline(&deadline))
+      let found = match move decoded {
+        Result.Success {value} => move value
+        Result.Failure {error} => {
+          return match move error {
+            StreamError cause => { fail move cause }
+            OutOfMemoryError allocation => { fail move allocation }
+          }
+        }
+      }
+      if let Option.Some {value} = move found { return move value }
+      let filled = run Effect.result(fillInput<R>(&mut self.provider, &mut self.core, copyDeadline(&deadline)))
+      if let Result.Failure {error} = move filled {
+        Shared.withMut(&self.link, failLink)
+        fail move error
+      }
+    }
+    fail StreamError.Truncated
+  }
+
+  // Moves the answers that the codec appended into the shared queue.
+  effect fn queueReplies(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    if Bytes.length(&self.core.output) == usize.ZERO { return () }
+    let mut pending = Shared.withMut(&self.link, takePending)
+    let appended = run Effect.result(Bytes.append(&mut pending, Bytes.asSlice(&self.core.output)))
+    Shared.withMut(&self.link, restorePending(move pending))
+    Bytes.clear(&mut self.core.output)
+    if let Result.Failure {error} = move appended { fail move error }
+    return ()
+  }
+
+  // Sends the queued answers if no writer is sending. Else the writer that sends sends them.
+  effect fn sendQueued(self: &mut Self, deadline: Option<Instant>) -> ()
+  ! StreamError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock | &mut Random
+  where
+    &mut W provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
+    if !Shared.withMut(&self.link, hasPending) { return () }
+    let taken = self.lock.receiver.tryReceive()
+    return match move taken {
+      TryReceive.Received {value} => {
+        let mut half = move value
+        let sent = run Effect.result(writeQueued<W>(&mut half, &self.link, move deadline))
+        release<W>(&self.lock, move half)
+        if let Result.Failure {error} = move sent {
+          Shared.withMut(&self.link, failLink)
+          return run streamFailure(move error)
+        }
+        return ()
+      }
+      TryReceive.Empty => ()
+      TryReceive.Closed => ()
+    }
+  }
+}
+
+impl<W> WriteHalf<W> {
+  /// Returns another handle to the same session, for another fiber.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the handle cannot be allocated.
+  pub effect fn clone(self: &Self) -> WriteHalf<W> ! OutOfMemoryError ? &mut Allocator {
+    let sender = run self.lock.sender.clone()
+    let receiver = run self.lock.receiver.clone()
+    return WriteHalf<W> {
+      link: Shared<Link>.clone(&self.link),
+      lock: Lock<W> {sender: move sender, receiver: move receiver},
+    }
+  }
+
+  /// Returns the state of the send side.
+  pub fn state(self: &Self) -> State {
+    return Shared.withMut(&self.link, readLinkState)
+  }
+
+  /// Sends `text` as one Text frame, and flushes it. It waits while another writer sends.
+  ///
+  /// # Errors
+  /// `Protocol` if the session is not open, `Io` if the transport fails or `deadline` passes.
+  pub effect fn writeText(self: &Self, text: string, deadline: Option<Instant>) -> ()
+  ! StreamError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock | &mut Random
+  where
+    &mut W provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
+    let mut frame = Bytes.make()
+    let mut session = run self.takeLinked()
+    let encoded = run Effect.result(session.sendText(text, &mut frame))
+    return run self.send(move session, move encoded, move frame, move deadline)
+  }
+
+  /// Sends `bytes` as one Binary frame, and flushes it. It waits while another writer sends.
+  ///
+  /// # Errors
+  /// `Protocol` if the session is not open, `Io` if the transport fails or `deadline` passes.
+  pub effect fn writeBinary(self: &Self, bytes: &[u8], deadline: Option<Instant>) -> ()
+  ! StreamError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock | &mut Random
+  where
+    &mut W provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
+    let mut frame = Bytes.make()
+    let mut session = run self.takeLinked()
+    let encoded = run Effect.result(session.sendBinary(bytes, &mut frame))
+    return run self.send(move session, move encoded, move frame, move deadline)
+  }
+
+  /// Sends a Ping with `payload` (at most 125 bytes), and flushes it.
+  ///
+  /// # Errors
+  /// `Protocol` if the session is not open or the payload is too large, `Io` if the transport
+  /// fails or `deadline` passes.
+  pub effect fn writePing(self: &Self, payload: &[u8], deadline: Option<Instant>) -> ()
+  ! StreamError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock | &mut Random
+  where
+    &mut W provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
+    let mut frame = Bytes.make()
+    let mut session = run self.takeLinked()
+    let encoded = run Effect.result(session.sendPing(payload, &mut frame))
+    return run self.send(move session, move encoded, move frame, move deadline)
+  }
+
+  /// Sends a Close, and flushes it. The reader then reads until the `Close` event of the peer.
+  ///
+  /// # Details
+  /// `data` gives the code and reason. With `None`, the Close has no payload. It does nothing if
+  /// this side already sent Close.
+  ///
+  /// # Errors
+  /// `Protocol` if the session failed, `Io` if the transport fails or `deadline` passes.
+  pub effect fn sendClose(self: &Self, data: Option<CloseData>, deadline: Option<Instant>) -> ()
+  ! StreamError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock | &mut Random
+  where
+    &mut W provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
+    let mut frame = Bytes.make()
+    let mut session = run self.takeLinked()
+    let encoded = run Effect.result(session.sendClose(move data, &mut frame))
+    if session.state() == State.CloseSent { Shared.withMut(&self.link, markCloseSent) }
+    return run self.send(move session, move encoded, move frame, move deadline)
+  }
+
+  effect fn takeLinked(self: &Self) -> Session ! StreamError {
+    if Shared.withMut(&self.link, readFailed) { fail StreamError.PreviousFailure }
+    return Shared.withMut(&self.link, takeLinkSession)
+  }
+
+  // Puts the codec back, then waits for the write half and writes the queued answers and `frame`.
+  effect fn send(
+    self: &Self,
+    session: Session,
+    encoded: Result<(), WebSocketError | OutOfMemoryError>,
+    frame: Bytes,
+    deadline: Option<Instant>,
+  ) -> ()
+  ! StreamError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock | &mut Random
+  where
+    &mut W provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
+    Shared.withMut(&self.link, restoreLinkSession(move session))
+    match move encoded {
+      Result.Success {..} => {}
+      Result.Failure {error} => {
+        return match move error {
+          WebSocketError cause => { fail StreamError.Protocol {error: cause} }
+          OutOfMemoryError allocation => { fail move allocation }
+        }
+      }
+    }
+    let mut half = match run self.lock.receiver.receive() {
+      Option.Some {value} => move value
+      Option.None => { fail StreamError.PreviousFailure }
+    }
+    // The frame goes after the answers that the reader queued before it.
+    let queued = run Effect.result(writeQueued<W>(&mut half, &self.link, copyDeadline(&deadline)))
+    let written = match move queued {
+      Result.Success {..} => run Effect.result(writeAll<W>(&mut half, Bytes.asSlice(&frame), copyDeadline(&deadline)))
+      Result.Failure {error} => Result<(), TransportError | OutOfMemoryError>.failResult(move error)
+    }
+    let after = match move written {
+      Result.Success {..} => run Effect.result(writeQueued<W>(&mut half, &self.link, move deadline))
+      Result.Failure {error} => Result<(), TransportError | OutOfMemoryError>.failResult(move error)
+    }
+    release<W>(&self.lock, move half)
+    if let Result.Failure {error} = move after {
+      Shared.withMut(&self.link, failLink)
+      return run streamFailure(move error)
+    }
+    return ()
+  }
+}
+
+// Writes the queued answers until the queue is empty. The reader can add to it while this waits.
+effect fn writeQueued<W>(half: &mut W, link: &Shared<Link>, deadline: Option<Instant>) -> ()
+! TransportError | OutOfMemoryError
+? &mut Allocator | &mut MonotonicClock | &mut Random
+where
+  &mut W provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
+  while Shared.withMut(&link.*, hasPending) {
+    let bytes = Shared.withMut(&link.*, takePending)
+    run writeAll<W>(&mut half.*, Bytes.asSlice(&bytes), copyDeadline(&deadline))
+  }
+  return ()
+}
+
+fn release<W>(lock: &Lock<W>, half: W) -> () {
+  return match lock.sender.trySend(move half) {
+    TrySend.Sent => ()
+    TrySend.Full {value} => { drop value }
+    TrySend.Closed {value} => { drop value }
+  }
+}
+
+fn readCloseSent(link: &mut Link) -> bool { return link.closeSent }
+
+fn markCloseSent(link: &mut Link) -> () {
+  link.closeSent = true
+  return ()
+}
+
+fn readFailed(link: &mut Link) -> bool { return link.failed }
+
+fn failLink(link: &mut Link) -> () {
+  link.failed = true
+  if let Option.Some {value} = &mut link.session { value.advance(State.Failed) }
+  return ()
+}
+
+fn advanceLink(link: &mut Link, state: State) -> () {
+  if let Option.Some {value} = &mut link.session { value.advance(state) }
+  return ()
+}
+
+fn readLinkState(link: &mut Link) -> State {
+  if link.failed { return State.Failed }
+  return match &link.session {
+    Option.Some {value} => value.state()
+    Option.None => State.Open
+  }
+}
+
+fn hasPending(link: &mut Link) -> bool { return Bytes.length(&link.pending) != usize.ZERO }
+
+fn takePending(link: &mut Link) -> Bytes {
+  return Intrinsic.replace(link.pending, Bytes.make())
+}
+
+fn restorePending(link: &mut Link, pending: Bytes) -> () {
+  let previous = Intrinsic.replace(link.pending, move pending)
+  drop previous
+  return ()
+}
+
+fn takeLinkSession(link: &mut Link) -> Session {
+  return match move Intrinsic.replace(link.session, Option<Session>.none()) {
+    Option.Some {value} => move value
+    Option.None => Intrinsic.trap("WebSocket: the session is in use")
+  }
+}
+
+fn restoreLinkSession(link: &mut Link, session: Session) -> () {
+  let previous = Intrinsic.replace(link.session, Option<Session>.some(move session))
+  drop previous
+  return ()
+}

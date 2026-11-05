@@ -15,9 +15,10 @@ A [`Connection`](#Connection) provides `ByteDuplex`, so `silk.http.exchange`, `s
 `silk.io.buffered_duplex` can use it.
 
 ## Details
-All sockets are nonblocking. When a socket is not ready, the operation waits in `poll` for up
-to the poll interval, and goes on as soon as the socket is ready. Between waits it checks the
-deadline with `MonotonicClock`. So an idle wait costs about one check for each interval. One deadline covers all attempts of one connect or accept.
+All sockets are nonblocking. When a socket is not ready, the operation waits for the poll
+interval with `MonotonicClock`, then tries again. So an idle wait costs about one check for each
+interval. With `ReadinessWait.Kernel` in the options, it waits in the kernel `poll` instead and
+goes on as soon as the socket is ready. One deadline covers all attempts of one connect or accept.
 
 A connect tries the endpoints in their order, until one connects or the attempt limit is
 reached. A flush means that the kernel accepted the bytes, not that the peer got them.
@@ -142,7 +143,7 @@ pub fn main() -> i32 {
 
 Import as `NativeSocket` with `import silk.net.socket_native { NativeSocket }`.
 
-Public declarations: 33.
+Public declarations: 35.
 
 <a id="ConnectionPhase"></a>
 
@@ -1246,6 +1247,40 @@ pub struct NativeSocket
 
 An empty marker type for this module.
 
+<a id="ReadinessWait"></a>
+
+## `ReadinessWait`
+
+```silk
+pub union ReadinessWait
+```
+
+How a socket that is not ready waits for the next try.
+
+<a id="ReadinessWait.Clock"></a>
+
+### `Clock`
+
+```silk
+Clock
+```
+
+Waits one poll interval with `MonotonicClock`, then tries again. This works with every clock
+provider, such as a task scheduler whose waits pause only one task. A reply that comes during
+the interval waits until the interval ends.
+
+<a id="ReadinessWait.Kernel"></a>
+
+### `Kernel`
+
+```silk
+Kernel
+```
+
+Waits in the kernel `poll` for up to one poll interval, and goes on as soon as the socket is
+ready. It checks the deadline with `MonotonicClock` between waits. It blocks the thread, so
+use it only with a clock that blocks the thread too, such as `OsMonotonicClock`.
+
 <a id="ConnectOptions"></a>
 
 ## `ConnectOptions`
@@ -1254,7 +1289,7 @@ An empty marker type for this module.
 pub struct ConnectOptions
 ```
 
-The settings of a connect: Nagle, the poll interval, and the attempt limit.
+The settings of a connect: Nagle, the poll interval, how to wait, and the attempt limit.
 
 <a id="ListenOptions"></a>
 
@@ -1264,7 +1299,8 @@ The settings of a connect: Nagle, the poll interval, and the attempt limit.
 pub struct ListenOptions
 ```
 
-The settings of a listener: the backlog, address reuse, and the poll interval of accept.
+The settings of a listener: the backlog, address reuse, and the poll interval and wait of
+accept. Accepted connections use the same poll interval and wait.
 
 <a id="UnixSocketPath"></a>
 
@@ -1440,6 +1476,14 @@ impl Copy for AttemptFailure
 impl Copy for NativeSocketError
 ```
 
+<a id="ReadinessWait.impl.Copy"></a>
+
+## Implementation `Copy for ReadinessWait`
+
+```silk
+impl Copy for ReadinessWait
+```
+
 <a id="ConnectOptions.impl.Copy"></a>
 
 ## Implementation `Copy for ConnectOptions`
@@ -1530,7 +1574,18 @@ Returns connect options.
 pub fn defaults() -> ConnectOptions
 ```
 
-Returns the default connect options: Nagle on, a 1 ms poll interval, and 64 attempts.
+Returns the default connect options: Nagle on, a 1 ms poll interval, waits with the clock,
+and 64 attempts.
+
+<a id="ConnectOptions.impl.withReadinessWait"></a>
+
+### Method `withReadinessWait`
+
+```silk
+pub fn withReadinessWait(self: &Self, wait: ReadinessWait) -> ConnectOptions
+```
+
+Returns these options with `wait` as the way to wait for readiness.
 
 <a id="ConnectOptions.impl.noDelay"></a>
 
@@ -1561,6 +1616,16 @@ pub fn maxAttempts(self: &Self) -> usize
 ```
 
 Returns the attempt limit.
+
+<a id="ConnectOptions.impl.readinessWait"></a>
+
+### Method `readinessWait`
+
+```silk
+pub fn readinessWait(self: &Self) -> ReadinessWait
+```
+
+Returns how a socket that is not ready waits.
 
 <a id="ListenOptions.impl"></a>
 
@@ -1598,8 +1663,28 @@ is not 1 through 1000000000.
 pub fn defaults() -> ListenOptions
 ```
 
-Returns the default listen options: a backlog of 128, no address reuse, and a 1 ms poll
-interval.
+Returns the default listen options: a backlog of 128, no address reuse, a 1 ms poll
+interval, and waits with the clock.
+
+<a id="ListenOptions.impl.withReadinessWait"></a>
+
+### Method `withReadinessWait`
+
+```silk
+pub fn withReadinessWait(self: &Self, wait: ReadinessWait) -> ListenOptions
+```
+
+Returns these options with `wait` as the way to wait for readiness.
+
+<a id="ListenOptions.impl.readinessWait"></a>
+
+### Method `readinessWait`
+
+```silk
+pub fn readinessWait(self: &Self) -> ReadinessWait
+```
+
+Returns how accept and accepted connections wait when they are not ready.
 
 <a id="ListenOptions.impl.kernelBacklog"></a>
 
@@ -1661,9 +1746,9 @@ An open socket connection. It provides `ByteDuplex`, so `silk.http.exchange`,
 `silk.http.server`, and `silk.io.buffered_duplex` can use it.
 
 ### Details
-The socket is nonblocking. When it is not ready, an operation waits in `poll` for up to the poll
-interval and goes on as soon as the socket is ready, and checks the deadline with
-`MonotonicClock` between waits. A flush means that the kernel accepted the bytes, not that the peer got them.
+The socket is nonblocking. When it is not ready, an operation waits for the poll interval with
+`MonotonicClock`, then tries again. So an idle wait costs about one check for each interval. A
+flush means that the kernel accepted the bytes, not that the peer got them.
 
 <a id="Listener"></a>
 
@@ -1742,6 +1827,36 @@ effect<'call> fn use<'call>(
 
 Serves the connection in `view`, with `context`.
 
+<a id="ConnectionHalves"></a>
+
+## `ConnectionHalves`
+
+```silk
+pub struct ConnectionHalves
+```
+
+The two halves of a connection, from [`Connection.split`](#Connection.impl.split).
+
+<a id="ConnectionHalves.reader"></a>
+
+### Field `reader`
+
+```silk
+pub reader: Connection
+```
+
+The half to read from.
+
+<a id="ConnectionHalves.writer"></a>
+
+### Field `writer`
+
+```silk
+pub writer: Connection
+```
+
+The half to write to.
+
 <a id="Connection.impl"></a>
 
 ## Implementation `Connection`
@@ -1770,6 +1885,26 @@ pub fn idle(self: &Self) -> bool
 
 Returns true when the connection is open and the peer has sent nothing and not closed it,
 so a new request can go out on it. It does not wait.
+
+<a id="Connection.impl.split"></a>
+
+### Method `split`
+
+```silk
+pub effect fn split(self: Self) -> ConnectionHalves ! OutOfMemoryError ? &mut Allocator
+```
+
+Splits the connection into a half to read from and a half to write to, so that one fiber can
+wait for input while another one writes.
+
+#### Details
+Both halves are connections on the same socket, and each keeps its own state. Use `reader`
+only to read and `writer` only to write. `ByteDuplex.shutdownWrite` on `writer` closes the
+write direction of the socket. Closing or dropping a half releases it; the socket closes when
+both halves are closed or dropped.
+
+#### Errors
+`OutOfMemoryError` if the shared socket cannot be allocated. The connection is then closed.
 
 <a id="Connection.impl.close"></a>
 

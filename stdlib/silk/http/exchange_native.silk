@@ -151,7 +151,7 @@ import silk.core.result {Result}
 import silk.text.string {String}
 import silk.system.system_clock {Instant, SystemClock}
 import silk.tls.client {AlpnProtocol, AlpnConfig, ClientConfig, ClientLimits, TlsError}
-import silk.tls.connection as Tls {OwnedConnection, ConnectionError, ConnectionOptions}
+import silk.tls.connection as Tls {DetachedConnection, Halves as TlsHalves, OwnedConnection, ConnectionError, ConnectionOptions}
 import silk.tls.trust_source {TrustSource}
 import silk.tls.trust_snapshot {TrustLoadLimits, TrustSourceError, TrustSnapshot}
 import silk.collections.slice {Slice}
@@ -437,6 +437,7 @@ fn proxySettings(options: &Options, limits: Limits) -> RouteSettings {
 import silk.net.resolver_native {NativeSystemResolver}
 import silk.net.socket_native as Sockets {
   Connection as NativeConnection,
+  ConnectionHalves as NativeConnectionHalves,
   ConnectOptions,
   NativeSocketError,
   ReadinessWait,
@@ -446,6 +447,8 @@ import silk.io.writer {Writer, WriterError}
 union State {
   Plain {connection: NativeConnection},
   Secured {connection: OwnedConnection<NativeConnection>},
+  SecuredReader {half: Tls.ReadHalf<NativeConnection>},
+  SecuredWriter {half: Tls.WriteHalf<NativeConnection>},
 }
 
 /// The transport of a native HTTP connection. It owns its socket or TLS connection.
@@ -1660,10 +1663,70 @@ fn unavailable<A>() -> A {
   return Intrinsic.trap("HTTP exchange: a native connection part was missing where it had just been stored")
 }
 
+/// The two halves of a [`NativeTransport`], from [`NativeTransport.split`].
+pub struct NativeTransportHalves {
+  /// The half to read from.
+  pub reader: NativeTransport,
+  /// The half to write to.
+  pub writer: NativeTransport,
+}
+
 impl NativeTransport {
   /// Returns the route of the transport.
   pub fn route(self: &Self) -> NativeRoute {
     return self.routeValue
+  }
+
+  /// Returns a transport over a plain socket, for example one that a listener accepted.
+  pub fn plain(connection: NativeConnection) -> NativeTransport {
+    return NativeTransport {
+      state: State.Plain {connection: move connection},
+      terminal: false,
+      routeValue: directRoute(),
+    }
+  }
+
+  /// Splits the transport into a half to read from and a half to write to, so that one fiber can
+  /// wait for input while another one writes. A TLS transport is split too.
+  ///
+  /// # Details
+  /// Use `reader` only to read and `writer` only to write. With TLS, records that the reader must
+  /// answer, such as a key update, go out with the next write. The socket closes when both halves
+  /// are closed or dropped.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the shared state cannot be allocated.
+  ///
+  /// # Gotchas
+  /// A half cannot be split again. That traps.
+  pub effect fn split(self: Self) -> NativeTransportHalves ! OutOfMemoryError ? &mut Allocator {
+    let NativeTransport {state, terminal, routeValue} = move self
+    return match move state {
+      State.Plain {connection} => {
+        let NativeConnectionHalves {reader, writer} = run connection.split()
+        return NativeTransportHalves {
+          reader: NativeTransport {state: State.Plain {connection: move reader}, terminal: terminal, routeValue: routeValue},
+          writer: NativeTransport {state: State.Plain {connection: move writer}, terminal: terminal, routeValue: routeValue},
+        }
+      }
+      State.Secured {connection} => {
+        let DetachedConnection<NativeConnection> {provider, session} = connection.detach()
+        let NativeConnectionHalves {reader: socketReader, writer: socketWriter} = run provider.split()
+        let TlsHalves<NativeConnection, NativeConnection> {reader, writer} = run session.split(move socketReader, move socketWriter)
+        return NativeTransportHalves {
+          reader: NativeTransport {state: State.SecuredReader {half: move reader}, terminal: terminal, routeValue: routeValue},
+          writer: NativeTransport {state: State.SecuredWriter {half: move writer}, terminal: terminal, routeValue: routeValue},
+        }
+      }
+      State.SecuredReader {half} => {
+        drop half
+        return Intrinsic.trap("NativeTransport: a half cannot be split again")
+      }
+      State.SecuredWriter {half} => {
+        drop half
+        return Intrinsic.trap("NativeTransport: a half cannot be split again")
+      }
+    }
   }
   effect fn read(self: &mut Self, output: &mut [u8], deadline: Option<Instant>) -> ReadTransfer
   ! TransportError | OutOfMemoryError
@@ -1678,14 +1741,19 @@ impl NativeTransport {
       }
       return match &mut self.state {
         State.Plain {connection} => {
-          let mut adapter = Transport.plain<NativeConnection>(&mut connection)
-          return run HttpTransport.readSome(move output, move deadline)
-            |> Effect.provideMut<HttpTransport>(&mut adapter)
+          let attempted = run Effect.result(ByteDuplex.readSome(move output, move deadline) |> Effect.provideMut<ByteDuplex>(&mut connection))
+          return run plainResult<ReadTransfer>(move attempted)
         }
         State.Secured {connection} => {
-          let mut adapter = Transport.secured<NativeConnection>(&mut connection)
-          return run HttpTransport.readSome(move output, move deadline)
-            |> Effect.provideMut<HttpTransport>(&mut adapter)
+          let attempted = run Effect.result(OwnedConnection.readSome(&mut connection, move output, move deadline))
+          return run securedResult<ReadTransfer>(move attempted)
+        }
+        State.SecuredReader {half} => {
+          let attempted = run Effect.result(half.readSome(move output, move deadline))
+          return run securedResult<ReadTransfer>(move attempted)
+        }
+        State.SecuredWriter {..} => {
+          fail TransportError.Plain {error: ByteDuplex.closed(ByteIoOperation.Read)}
         }
       }
     } else {
@@ -1705,14 +1773,19 @@ impl NativeTransport {
       }
       return match &mut self.state {
         State.Plain {connection} => {
-          let mut adapter = Transport.plain<NativeConnection>(&mut connection)
-          return run HttpTransport.writeSome(move input, move deadline)
-            |> Effect.provideMut<HttpTransport>(&mut adapter)
+          let attempted = run Effect.result(ByteDuplex.writeSome(move input, move deadline) |> Effect.provideMut<ByteDuplex>(&mut connection))
+          return run plainResult<usize>(move attempted)
         }
         State.Secured {connection} => {
-          let mut adapter = Transport.secured<NativeConnection>(&mut connection)
-          return run HttpTransport.writeSome(move input, move deadline)
-            |> Effect.provideMut<HttpTransport>(&mut adapter)
+          let attempted = run Effect.result(OwnedConnection.writeSome(&mut connection, move input, move deadline))
+          return run securedResult<usize>(move attempted)
+        }
+        State.SecuredWriter {half} => {
+          let attempted = run Effect.result(half.writeSome(move input, move deadline))
+          return run securedResult<usize>(move attempted)
+        }
+        State.SecuredReader {..} => {
+          fail TransportError.Plain {error: ByteDuplex.closed(ByteIoOperation.Write)}
         }
       }
     } else {
@@ -1732,15 +1805,18 @@ impl NativeTransport {
       }
       return match &mut self.state {
         State.Plain {connection} => {
-          let mut adapter = Transport.plain<NativeConnection>(&mut connection)
-          return run HttpTransport.flush(move deadline)
-            |> Effect.provideMut<HttpTransport>(&mut adapter)
+          let attempted = run Effect.result(ByteDuplex.flush(move deadline) |> Effect.provideMut<ByteDuplex>(&mut connection))
+          return run plainResult<()>(move attempted)
         }
         State.Secured {connection} => {
-          let mut adapter = Transport.secured<NativeConnection>(&mut connection)
-          return run HttpTransport.flush(move deadline)
-            |> Effect.provideMut<HttpTransport>(&mut adapter)
+          let attempted = run Effect.result(OwnedConnection.flush(&mut connection, move deadline))
+          return run securedResult<()>(move attempted)
         }
+        State.SecuredWriter {half} => {
+          let attempted = run Effect.result(half.flush(move deadline))
+          return run securedResult<()>(move attempted)
+        }
+        State.SecuredReader {..} => ()
       }
     } else {
       compileError("Native HTTP acquisition requires a supported Windows, Darwin, or GNU libc profile")
@@ -1767,9 +1843,47 @@ impl NativeTransport {
           return run HttpTransport.close()
             |> Effect.provideMut<HttpTransport>(&mut adapter)
         }
+        State.SecuredReader {half} => {
+          let attempted = run Effect.result(half.close())
+          if let Result.Failure {error} = move attempted {
+            fail TransportError.Secured {error: move error}
+          }
+          return ()
+        }
+        State.SecuredWriter {half} => {
+          let attempted = run Effect.result(half.close())
+          if let Result.Failure {error} = move attempted {
+            fail TransportError.Secured {error: move error}
+          }
+          return ()
+        }
       }
     } else {
       compileError("Native HTTP acquisition requires a supported Windows, Darwin, or GNU libc profile")
+    }
+  }
+}
+
+effect fn plainResult<A>(result: Result<A, ByteIoError>) -> A ! TransportError {
+  return match move result {
+    Result.Success {value} => move value
+    Result.Failure {error} => {
+      fail TransportError.Plain {error: move error}
+    }
+  }
+}
+
+effect fn securedResult<A>(result: Result<A, ConnectionError | OutOfMemoryError>) -> A
+! TransportError | OutOfMemoryError {
+  return match move result {
+    Result.Success {value} => move value
+    Result.Failure {error} => match move error {
+      ConnectionError cause => {
+        fail TransportError.Secured {error: move cause}
+      }
+      OutOfMemoryError allocation => {
+        fail move allocation
+      }
     }
   }
 }
@@ -2152,5 +2266,8 @@ pub fn reusable(connection: &Connection<NativeTransport>) -> bool {
   return match &transport.state {
     State.Plain {connection: socket} => socket.idle()
     State.Secured {connection: secured} => secured.socket().idle()
+    // A split half belongs to a WebSocket session, never to a reusable HTTP exchange.
+    State.SecuredReader {..} => false
+    State.SecuredWriter {..} => false
   }
 }
