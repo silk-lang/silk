@@ -1691,8 +1691,25 @@ access, or another member property. A lexical borrow cannot become an owned unio
 never makes it detached. Requirement rows remain capability rows rather than value unions.
 
 Generic unions normalize again after monomorphic substitution. If `A | B` specializes with both
-parameters equal to `i32`, the instance carries `i32`, not two indistinguishable tags. TIR retains
-the authored mapping and MIR deterministically recomputes the concrete mapping and canonical order.
+parameters equal to `i32`, the instance carries `i32`, not two indistinguishable tags. Realizing an
+opaque result normalizes the same way. TIR retains the authored mapping and MIR recomputes, from
+the instance's canonical members, where each authored member is stored: as the whole value when
+the instance normalized to it, under one tag, or spread over several tags when the member is itself
+a union at the instance. Authored members that land on the same storage are one member, so the
+first matching arm takes it.
+
+```silk
+fn side<T, U>(value: T | U) -> i32 {
+  return match move value { T _ => 1 U _ => 2 }
+}
+fn kind<T>(value: T | End) -> i32 {
+  return match move value { T _ => 1 End _ => 2 }
+}
+```
+
+`side<Token, Token>` always answers 1. `kind<Token | bool>` stores `Token | bool | End` with three
+tags, and the `T` arm takes both `Token` and `bool`; a `T t` binding narrows the value to its own
+`Token | bool`.
 
 **Diagnostics:** An unresolved or otherwise unavailable member reports that member's ordinary type
 diagnostic. A borrow or bare executable contract reports `SEM0039` because it has no detached finite
