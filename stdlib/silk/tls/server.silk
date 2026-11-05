@@ -46,10 +46,12 @@ import silk.crypto.hkdf { HkdfSha256 }
 import silk.crypto.hmac { HmacSha256 }
 import silk.crypto.p256 { P256, P256SigningKey }
 import silk.crypto.sha2 { Sha256 }
-import silk.crypto.x25519 { X25519 }
+import silk.crypto.x25519 { X25519, X25519Base }
 import silk.encoding.base64 { Base64 }
 import silk.system.random { Random }
 import silk.system.random_native { OsRandom }
+import silk.system.system_clock { SystemClock }
+import silk.system.system_clock_native { OsSystemClock }
 import silk.tls.hkdf { TlsHkdfSha256 }
 import silk.net.tcp_server { Protocol, Received, Verdict }
 import silk.text.format { Debug, Format, Formatter }
@@ -57,6 +59,7 @@ import silk.io.writer { Writer, WriterError }
 import silk.num.u8
 import silk.num.u16
 import silk.num.u64
+import silk.num.i64
 import silk.num.usize
 
 /// Why [`TlsServerConfig.fromPem`] cannot use its input.
@@ -86,11 +89,19 @@ impl Debug for TlsConfigError {
 /// The certificate chain and the private key of a server.
 ///
 /// # Details
-/// The chain is kept as the body of a TLS `Certificate` message, ready to send. One config serves
-/// every connection and every thread.
+/// The chain is kept as the body of a TLS `Certificate` message, ready to send. The config also
+/// keeps tables of base point multiples for the signing key and the X25519 key shares, about 120
+/// KiB, and a random key for session tickets. One config serves every connection and every thread.
+///
+/// After each handshake the server sends one session ticket, valid for 2 hours. A client that
+/// comes back with it resumes with a new X25519 exchange but without the certificate and its
+/// signature. Tickets are encrypted with the config's key, so they stop working when the config
+/// is made again, for example after a restart.
 pub struct TlsServerConfig {
   certificateMessage: Bytes,
   signingKey: P256SigningKey,
+  keyShareBase: X25519Base,
+  ticketKey: [u8; 32],
 }
 
 impl TlsServerConfig {
@@ -137,7 +148,16 @@ impl TlsServerConfig {
       }
     }
     let signingKey = run P256SigningKey.make(&key)
-    return TlsServerConfig { certificateMessage: move message, signingKey: move signingKey }
+    let keyShareBase = run X25519Base.make()
+    let mut ticketKey: [u8; 32] = [0; 32]
+    let mut os = OsRandom.make()
+    run Random.fillBytes(&mut ticketKey) |> Effect.provideMut<Random>(&mut os)
+    return TlsServerConfig {
+      certificateMessage: move message,
+      signingKey: move signingKey,
+      keyShareBase: move keyShareBase,
+      ticketKey: ticketKey,
+    }
   }
 }
 
@@ -369,6 +389,7 @@ pub struct TlsServer {
   read: Direction,
   write: Direction,
   clientHandshakeSecret: [u8; 32],
+  master: [u8; 32],
   clientApplicationSecret: [u8; 32],
   serverApplicationSecret: [u8; 32],
   handshake: List<u8>,
@@ -389,6 +410,7 @@ impl TlsServer {
       read: plainDirection(),
       write: plainDirection(),
       clientHandshakeSecret: [0; 32],
+      master: [0; 32],
       clientApplicationSecret: [0; 32],
       serverApplicationSecret: [0; 32],
       handshake: List<u8>.make(),
@@ -580,7 +602,7 @@ impl TlsServer {
           if kind != 1 { 10 } else { run self.clientHello(config, bytes, &mut output.*) }
         }
         Phase.ExpectFinished => {
-          if kind != 20 { 10 } else { self.clientFinished(bytes) }
+          if kind != 20 { 10 } else { run self.clientFinished(config, bytes, &mut output.*) }
         }
         Phase.Open => {
           if kind == 24 { run self.keyUpdate(bytes, &mut output.*) }
@@ -629,6 +651,9 @@ impl TlsServer {
     let mut hasKeyShare = false
     let mut alpnOffered = false
     let mut http11 = false
+    let mut dheMode = false
+    let mut pskStart: usize = 0
+    let mut pskLength: usize = 0
     while at + 4 <= body.length {
       let extension = readU16(body, at)
       let length = readU16(body, at + 2)
@@ -669,6 +694,17 @@ impl TlsServer {
           }
           shareAt = shareAt + 4 + keyLength
         }
+      } else if extension == 45 {
+        let mut modeAt: usize = 1
+        while modeAt < data.length {
+          if data[modeAt] == 1 { dheMode = true }
+          modeAt = modeAt + 1
+        }
+      } else if extension == 41 {
+        // pre_shared_key must be the last extension.
+        if start + length != body.length { return 47 }
+        pskStart = start
+        pskLength = length
       } else if extension == 16 {
         alpnOffered = true
         if data.length >= 2 {
@@ -685,15 +721,48 @@ impl TlsServer {
     }
     if !tls13 { return 70 }
     if !chacha && !aes { return 40 }
-    if !ecdsa || !hasKeyShare { return 40 }
+    if !hasKeyShare { return 40 }
     if alpnOffered && !http11 { return 120 }
+    let zeros: [u8; 32] = [0; 32]
+    let emptyHash = Sha256.hash(&[])
+    // Resumption: the first offered ticket, if it opens, with a binder over the ClientHello up to
+    // the binders.
+    let mut psk: [u8; 32] = [0; 32]
+    let mut resumed = false
+    if pskLength > 0 && dheMode {
+      let offered = Slice.view<u8>(body, pskStart, pskLength)
+      if offered.length < 2 { return 50 }
+      let identitiesLength = readU16(offered, 0)
+      if identitiesLength < 7 || 2 + identitiesLength + 2 > offered.length { return 50 }
+      let ticketLength = readU16(offered, 2)
+      if 4 + ticketLength + 4 > 2 + identitiesLength { return 50 }
+      let opened = run openTicket(config, Slice.view<u8>(offered, 4, ticketLength))
+      if let Option.Some { value: secret } = move opened {
+        let bindersAt = 2 + identitiesLength
+        if readU16(offered, bindersAt) < 33 || u8.toUsize(offered[bindersAt + 2]) != 32 || bindersAt + 35 > offered.length { return 50 }
+        let partialHash = Sha256.hash(Slice.view<u8>(message, 0, 4 + pskStart + bindersAt))
+        let earlyPsk = HkdfSha256.extract(&zeros, &secret)
+        let binderKey = deriveFromHash(&earlyPsk, b"res binder", &emptyHash)
+        let expected = finishedMac(&binderKey, &partialHash)
+        let mut difference: u8 = 0
+        let mut index: usize = 0
+        while index < 32 {
+          difference = u8.bitOr(difference, u8.bitXor(expected[index], offered[bindersAt + 3 + index]))
+          index = index + 1
+        }
+        if difference != 0 { return 51 }
+        psk = secret
+        resumed = true
+      }
+    }
+    if !resumed && !ecdsa { return 40 }
     self.selectedAlpn = http11
     self.suite = if chacha { Suite.ChaCha20Poly1305 } else { Suite.Aes128Gcm }
     // Key exchange.
     let mut random: [u8; 32] = [0; 32]
     let mut os = OsRandom.make()
     run Random.fillBytes(&mut random) |> Effect.provideMut<Random>(&mut os)
-    let ephemeral = run X25519.generate() |> Effect.provideMut<Random>(&mut os)
+    let ephemeral = run X25519.generateWith(&config.keyShareBase) |> Effect.provideMut<Random>(&mut os)
     let publicKey = ephemeral.publicKey()
     let shared = match ephemeral.agree(&keyShare) {
       Result.Success { value } => value
@@ -708,9 +777,11 @@ impl TlsServer {
     run List.appendBytes(&mut hello, Slice.view<u8>(body, sessionStart, sessionLength))
     let suiteCode: u16 = if self.suite == Suite.ChaCha20Poly1305 { 4867 } else { 4865 }
     run List.appendBytes(&mut hello, &[u16.toU8(u16.shiftRight(suiteCode, 8)), u16.toU8(u16.bitAnd(suiteCode, 255)), 0])
-    // Extensions: supported_versions and key_share.
-    run List.appendBytes(&mut hello, &[0, 46, 0, 43, 0, 2, 3, 4, 0, 51, 0, 36, 0, 29, 0, 32])
+    // Extensions: supported_versions, key_share and, when resuming, pre_shared_key.
+    let extensionsSize: u8 = if resumed { 52 } else { 46 }
+    run List.appendBytes(&mut hello, &[0, extensionsSize, 0, 43, 0, 2, 3, 4, 0, 51, 0, 36, 0, 29, 0, 32])
     run List.appendBytes(&mut hello, &publicKey)
+    if resumed { run List.appendBytes(&mut hello, &[0, 41, 0, 2, 0, 0]) }
     let helloLength = List.length(&hello) - 4
     let header = List.asMutSlice(&mut hello)
     header[1] = usize.toU8(helloLength / 65536)
@@ -723,9 +794,7 @@ impl TlsServer {
     // A compatibility ChangeCipherSpec, so middleboxes see a resumed TLS 1.2 session.
     run List.appendBytes(&mut output.*, &[20, 3, 3, 0, 1, 1])
     // The handshake secrets.
-    let zeros: [u8; 32] = [0; 32]
-    let early = HkdfSha256.extract(&zeros, &zeros)
-    let emptyHash = Sha256.hash(&[])
+    let early = HkdfSha256.extract(&zeros, &psk)
     let derived = deriveFromHash(&early, b"derived", &emptyHash)
     let handshakeSecret = HkdfSha256.extract(&derived, &shared)
     let helloHash = self.transcript.checkpoint()
@@ -741,28 +810,32 @@ impl TlsServer {
     } else {
       run List.appendBytes(&mut flight, &[8, 0, 0, 2, 0, 0])
     }
-    let certificate = Bytes.asSlice(&config.certificateMessage)
-    run List.append(&mut flight, 11)
-    run List.appendBytes(&mut flight, &[usize.toU8(certificate.length / 65536), usize.toU8(certificate.length / 256 % 256), usize.toU8(certificate.length % 256)])
-    run List.appendBytes(&mut flight, certificate)
-    self.transcript.update(List.asSlice(&flight))
-    let certificateHash = self.transcript.checkpoint()
-    let mut signed = List<u8>.make()
-    run List.appendRepeated(&mut signed, 32, 64)
-    run List.appendBytes(&mut signed, b"TLS 1.3, server CertificateVerify")
-    run List.append(&mut signed, 0)
-    run List.appendBytes(&mut signed, &certificateHash)
-    let mut signature: [u8; 72] = [0; 72]
-    let signatureLength = match config.signingKey.sign(List.asSlice(&signed), &mut signature) {
-      Result.Success { value } => value
-      Result.Failure { error } => { drop error return 80 }
+    if resumed {
+      self.transcript.update(List.asSlice(&flight))
+    } else {
+      let certificate = Bytes.asSlice(&config.certificateMessage)
+      run List.append(&mut flight, 11)
+      run List.appendBytes(&mut flight, &[usize.toU8(certificate.length / 65536), usize.toU8(certificate.length / 256 % 256), usize.toU8(certificate.length % 256)])
+      run List.appendBytes(&mut flight, certificate)
+      self.transcript.update(List.asSlice(&flight))
+      let certificateHash = self.transcript.checkpoint()
+      let mut signed = List<u8>.make()
+      run List.appendRepeated(&mut signed, 32, 64)
+      run List.appendBytes(&mut signed, b"TLS 1.3, server CertificateVerify")
+      run List.append(&mut signed, 0)
+      run List.appendBytes(&mut signed, &certificateHash)
+      let mut signature: [u8; 72] = [0; 72]
+      let signatureLength = match config.signingKey.sign(List.asSlice(&signed), &mut signature) {
+        Result.Success { value } => value
+        Result.Failure { error } => { drop error return 80 }
+      }
+      let verifyStart = List.length(&flight)
+      let verifyLength = signatureLength + 4
+      run List.appendBytes(&mut flight, &[15, 0, usize.toU8(verifyLength / 256), usize.toU8(verifyLength % 256), 4, 3,
+        usize.toU8(signatureLength / 256), usize.toU8(signatureLength % 256)])
+      run List.appendBytes(&mut flight, Slice.view<u8>(&signature, 0, signatureLength))
+      self.transcript.update(Slice.view<u8>(List.asSlice(&flight), verifyStart, List.length(&flight) - verifyStart))
     }
-    let verifyStart = List.length(&flight)
-    let verifyLength = signatureLength + 4
-    run List.appendBytes(&mut flight, &[15, 0, usize.toU8(verifyLength / 256), usize.toU8(verifyLength % 256), 4, 3,
-      usize.toU8(signatureLength / 256), usize.toU8(signatureLength % 256)])
-    run List.appendBytes(&mut flight, Slice.view<u8>(&signature, 0, signatureLength))
-    self.transcript.update(Slice.view<u8>(List.asSlice(&flight), verifyStart, List.length(&flight) - verifyStart))
     let finishedHash = self.transcript.checkpoint()
     let verifyData = finishedMac(&serverHandshakeSecret, &finishedHash)
     let finishedStart = List.length(&flight)
@@ -782,6 +855,7 @@ impl TlsServer {
     let serverFinishedHash = self.transcript.checkpoint()
     let derivedAgain = deriveFromHash(&handshakeSecret, b"derived", &emptyHash)
     let master = HkdfSha256.extract(&derivedAgain, &zeros)
+    self.master = master
     self.clientApplicationSecret = deriveFromHash(&master, b"c ap traffic", &serverFinishedHash)
     self.serverApplicationSecret = deriveFromHash(&master, b"s ap traffic", &serverFinishedHash)
     self.write = trafficKeys(self.suite, &self.serverApplicationSecret)
@@ -789,7 +863,8 @@ impl TlsServer {
     return 0
   }
 
-  fn clientFinished(self: &mut Self, message: &[u8]) -> u8 {
+  effect fn clientFinished(self: &mut Self, config: &TlsServerConfig, message: &[u8], output: &mut List<u8>) -> u8
+  ! OutOfMemoryError ? &mut Allocator {
     if message.length != 36 { return 50 }
     let expected = finishedMac(&self.clientHandshakeSecret, &self.transcript.checkpoint())
     let mut difference: u8 = 0
@@ -802,6 +877,49 @@ impl TlsServer {
     self.transcript.update(message)
     self.read = trafficKeys(self.suite, &self.clientApplicationSecret)
     self.phase = Phase.Open
+    // One session ticket, with the PSK for ticket nonce 0.
+    let resumption = deriveFromHash(&self.master, b"res master", &self.transcript.checkpoint())
+    let mut secret: [u8; 32] = [0; 32]
+    match TlsHkdfSha256.expandLabel(&resumption, b"resumption", &[0], &mut secret) {
+      Result.Success { value } => value
+      Result.Failure { error } => { drop error }
+    }
+    let mut os = OsRandom.make()
+    let mut random: [u8; 16] = [0; 16]
+    run Random.fillBytes(&mut random) |> Effect.provideMut<Random>(&mut os)
+    let mut clock = OsSystemClock.make()
+    let now = run SystemClock.now() |> Effect.provideMut<SystemClock>(&mut clock)
+    let mut plain: [u8; 48] = [0; 48]
+    plain[0] = 1
+    writeU64(&mut plain, 4, i64.wrappingToU64(SystemClock.seconds(&now)))
+    let mut copied: usize = 0
+    while copied < 32 {
+      plain[16 + copied] = secret[copied]
+      copied = copied + 1
+    }
+    let mut ticket: [u8; 76] = [0; 76]
+    copied = 0
+    while copied < 12 {
+      ticket[copied] = random[copied]
+      copied = copied + 1
+    }
+    let mut tag: [u8; 16] = [0; 16]
+    let sealed = ChaCha20Poly1305.seal(&config.ticketKey, Slice.view<u8>(&random, 0, 12), &[], &plain,
+      Slice.viewMut<u8>(&mut ticket, 12, 48), &mut tag)
+    drop sealed
+    copied = 0
+    while copied < 16 {
+      ticket[60 + copied] = tag[copied]
+      copied = copied + 1
+    }
+    let mut ticketMessage = List<u8>.make()
+    // Lifetime 7200 seconds, an age offset, nonce 0, the ticket and no extensions.
+    run List.appendBytes(&mut ticketMessage, &[4, 0, 0, 90, 0, 0, 28, 32])
+    run List.appendBytes(&mut ticketMessage, Slice.view<u8>(&random, 12, 4))
+    run List.appendBytes(&mut ticketMessage, &[1, 0, 0, 76])
+    run List.appendBytes(&mut ticketMessage, &ticket)
+    run List.appendBytes(&mut ticketMessage, &[0, 0])
+    run self.sealRecord(List.asSlice(&ticketMessage), 22, &mut output.*)
     return 0
   }
 
@@ -816,6 +934,51 @@ impl TlsServer {
     }
     return 0
   }
+}
+
+const TICKET_SECONDS: u64 = 7200
+
+// Returns the PSK in `ticket` if it opens with the config's key and is younger than its lifetime.
+effect fn openTicket(config: &TlsServerConfig, ticket: &[u8]) -> Option<[u8; 32]> {
+  if ticket.length != 76 { return Option<[u8; 32]>.none() }
+  let mut plain: [u8; 48] = [0; 48]
+  let opened = match ChaCha20Poly1305.open(&config.ticketKey, Slice.view<u8>(ticket, 0, 12), &[],
+    Slice.view<u8>(ticket, 12, 48), Slice.view<u8>(ticket, 60, 16), &mut plain) {
+    Result.Success { value: _ } => true
+    Result.Failure { error } => { drop error false }
+  }
+  if !opened || plain[0] != 1 { return Option<[u8; 32]>.none() }
+  let mut clock = OsSystemClock.make()
+  let now = run SystemClock.now() |> Effect.provideMut<SystemClock>(&mut clock)
+  let issued = readU64(&plain, 4)
+  let current = i64.wrappingToU64(SystemClock.seconds(&now))
+  if current < issued || current - issued > TICKET_SECONDS { return Option<[u8; 32]>.none() }
+  let mut secret: [u8; 32] = [0; 32]
+  let mut index: usize = 0
+  while index < 32 {
+    secret[index] = plain[16 + index]
+    index = index + 1
+  }
+  return Option<[u8; 32]>.some(secret)
+}
+
+fn writeU64(target: &mut [u8], at: usize, value: u64) -> () {
+  let mut index: usize = 0
+  while index < 8 {
+    target[at + index] = u64.toU8(u64.bitAnd(u64.shiftRight(value, usize.toU64(56 - index * 8)), 255))
+    index = index + 1
+  }
+  return ()
+}
+
+fn readU64(data: &[u8], at: usize) -> u64 {
+  let mut value: u64 = 0
+  let mut index: usize = 0
+  while index < 8 {
+    value = u64.bitOr(u64.shiftLeft(value, 8), u8.toU64(data[at + index]))
+    index = index + 1
+  }
+  return value
 }
 
 fn readU16(data: &[u8], at: usize) -> usize {

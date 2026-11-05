@@ -73,7 +73,7 @@ pub fn main() -> i32 {
 
 Import as `X25519` with `import silk.crypto.x25519 { X25519 }`.
 
-Public declarations: 2.
+Public declarations: 3.
 
 <a id="X25519Error"></a>
 
@@ -232,6 +232,82 @@ The key pair is consumed also when it fails.
 #### Gotchas
 Pass the result through a key derivation function such as `silk.crypto.hkdf` before you use it as a
 key.
+
+<a id="X25519Base"></a>
+
+## `X25519Base`
+
+```silk
+pub struct X25519Base
+```
+
+A table of multiples of the X25519 base point that makes new key pairs about four times faster.
+
+### When to use
+Use it when one program makes many key pairs, such as a TLS server that makes one for each
+handshake. For one key pair, [`X25519.generate`](#X25519.impl.generate) needs no table.
+
+### Details
+[`X25519Base.make`](#X25519Base.impl.make) computes 512 points on the equivalent Edwards curve once, about 60 KiB. A
+key pair from [`X25519.generateWith`](#X25519.impl.generateWith) then needs 64 point additions instead of 255 ladder steps,
+and gets the same public key as [`X25519.generate`](#X25519.impl.generate) would for the same secret. The table holds
+no secret, so threads and connections can share it.
+
+<a id="X25519Base.impl"></a>
+
+## Implementation `X25519Base`
+
+```silk
+impl X25519Base
+```
+
+<a id="X25519Base.impl.make"></a>
+
+### Associated function `make`
+
+```silk
+pub effect fn make() -> X25519Base ! OutOfMemoryError ? &mut Allocator
+```
+
+Computes the table.
+
+#### Errors
+- `OutOfMemoryError` if the table cannot be allocated.
+
+<a id="X25519.impl-2"></a>
+
+## Implementation `X25519`
+
+```silk
+impl X25519
+```
+
+<a id="X25519.impl.fromSecretWith"></a>
+
+### Associated function `fromSecretWith`
+
+```silk
+pub fn fromSecretWith(bytes: &[u8], base: &X25519Base) -> Result<X25519, X25519Error>
+```
+
+Returns the key pair for the 32-byte secret `bytes`, after RFC 7748 clamping, with the public
+key computed from `base`. It gives the same key pair as [`X25519.fromSecret`](#X25519.impl.fromSecret).
+
+#### Errors
+- `InvalidScalarLength` if `bytes` is not 32 bytes.
+
+<a id="X25519.impl.generateWith"></a>
+
+### Associated function `generateWith`
+
+```silk
+pub effect fn generateWith(base: &X25519Base) -> X25519 ? &mut Random
+```
+
+Returns a new key pair with a secret from 32 bytes of the ambient `Random`, with the public key
+computed from `base`.
+
+The `Random` provider must be cryptographically secure. If it fails, the program stops.
 
 
 Category: Cryptography.

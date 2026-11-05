@@ -115,8 +115,14 @@ pub struct TlsServerConfig
 The certificate chain and the private key of a server.
 
 ### Details
-The chain is kept as the body of a TLS `Certificate` message, ready to send. One config serves
-every connection and every thread.
+The chain is kept as the body of a TLS `Certificate` message, ready to send. The config also
+keeps tables of base point multiples for the signing key and the X25519 key shares, about 120
+KiB, and a random key for session tickets. One config serves every connection and every thread.
+
+After each handshake the server sends one session ticket, valid for 2 hours. A client that
+comes back with it resumes with a new X25519 exchange but without the certificate and its
+signature. Tickets are encrypted with the config's key, so they stop working when the config
+is made again, for example after a restart.
 
 <a id="TlsServerConfig.impl"></a>
 

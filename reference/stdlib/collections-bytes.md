@@ -152,8 +152,8 @@ A `length` of 0 returns an empty value and does not allocate.
 pub fn appendWithinCapacity(self: &mut Self, value: u8) -> bool
 ```
 
-Adds `value` at the end if the capacity has room, without allocating. Returns `false` when
-the value is full. See [`List.appendWithinCapacity`](./collections-list.md#List.impl.appendWithinCapacity).
+Adds `value` at the end if the capacity has room, and returns `true`. Returns `false` and
+changes nothing when the capacity is full. It never allocates.
 
 <a id="Bytes.impl.length"></a>
 
