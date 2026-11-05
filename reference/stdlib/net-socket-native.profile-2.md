@@ -2444,14 +2444,16 @@ pub effect fn finishConnect(self: &mut Self) -> ConnectProgress ! NativeSocketEr
 Checks a connect from [`startConnect`](#startConnect) or [`startConnectUnix`](#startConnectUnix), without waiting.
 
 #### Details
-Call it when the socket is writable. It returns `Connected` and sets the phase to `Open`
-when the connect finished, and `InProgress` while it goes on. It returns `Connected` for a
+Call it when the socket is writable. It polls the socket once with no timeout, then
+returns `Connected` and sets the phase to `Open` when the connect finished, and
+`InProgress` while it goes on. It returns `Connected` for a
 connection that is already open.
 
 #### Errors
 The error of the failed connect, such as `ConnectionRefused` or `NetworkUnreachable`, or
-`NativeFailure` with operation `Connect` and the errno. The connection stays `Connecting`:
-close it after you remove it from your readiness queue. `Closed` if it is closed.
+`NativeFailure` with operation `Connect` or `Poll` and the errno. The connection stays
+`Connecting`: close it after you remove it from your readiness queue. `Closed` if it is
+closed.
 
 <a id="Connection.impl.tryRead"></a>
 
