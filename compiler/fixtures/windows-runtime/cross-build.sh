@@ -7,7 +7,7 @@ mkdir -p "$out"
 git rev-parse HEAD > "$out/source-commit.txt"
 printf 'program\tcompile\tpe-imports\texecution\n' > "$out/results.tsv"
 failed=0
-for program in hello hello-speed storage host-check providers process console resolver sockets trust https native-thread-spawn-join native-thread-cross-wake atomic-wait-notify native-termination-source-trap stderr-locked-message; do
+for program in hello hello-speed storage host-check providers process console resolver sockets trust https native-thread-spawn-join native-thread-cross-wake atomic-wait-notify native-termination-source-trap stderr-locked-message websocket-relay; do
   source="$PWD/compiler/fixtures/windows-runtime/$program.silk"
   optimization=none
   allowed_dlls='Name: (kernel32|ntdll)\.dll'
@@ -22,6 +22,10 @@ for program in hello hello-speed storage host-check providers process console re
       ;;
     native-termination-source-trap|stderr-locked-message)
       source="$PWD/corpus/native/$program/main.silk"
+      ;;
+    websocket-relay)
+      source="$PWD/corpus/native/$program/main.silk"
+      allowed_dlls='Name: (kernel32|ntdll|ws2_32|bcryptprimitives|api-ms-win-core-synch-l1-2-0)\.dll'
       ;;
     native-thread-*|atomic-*)
       source="$PWD/corpus/native/$program/main.silk"
@@ -98,7 +102,7 @@ EOF
       continue
     fi
     allowed_dlls='Name: (kernel32|ntdll|ws2_32)\.dll'
-    if [ "$program" = https ]; then allowed_dlls='Name: (kernel32|ntdll|ws2_32|crypt32|bcryptprimitives)\.dll'; fi
+    if [ "$program" = https ]; then allowed_dlls='Name: (kernel32|ntdll|ws2_32|crypt32|bcryptprimitives|api-ms-win-core-synch-l1-2-0)\.dll'; fi
   fi
   if [ "$program" = console ]; then
     printf 'LIBRARY kernel32.dll\nEXPORTS\nSetStdHandle\nSetConsoleMode\nCreateConsoleScreenBuffer\nReadConsoleOutputCharacterW\nGetConsoleOutputCP\n' > "$package/fixture.def"

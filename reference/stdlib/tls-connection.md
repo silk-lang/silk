@@ -178,7 +178,7 @@ pub fn main() -> i32 {
 
 Import as `OwnedConnection` with `import silk.tls.connection { OwnedConnection }`.
 
-Public declarations: 6.
+Public declarations: 11.
 
 <a id="ConnectionPhase"></a>
 
@@ -596,6 +596,301 @@ returns, fails, or is cancelled. Errors from that close are ignored. Call
 - `E` from the callback.
 - [`ConnectionError`](#ConnectionError) if the handshake fails or times out.
 - `OutOfMemoryError` if the `Allocator` fails.
+
+<a id="DetachedConnection"></a>
+
+## `DetachedConnection`
+
+```silk
+pub struct DetachedConnection<P>
+```
+
+A TLS connection taken apart by [`OwnedConnection.detach`](#OwnedConnection.impl.detach): the transport, and the TLS state to
+give to [`DetachedSession.split`](#DetachedSession.impl.split) with the two halves of that transport.
+
+<a id="DetachedConnection.provider"></a>
+
+### Field `provider`
+
+```silk
+pub provider: P
+```
+
+The transport.
+
+<a id="DetachedConnection.session"></a>
+
+### Field `session`
+
+```silk
+pub session: DetachedSession
+```
+
+The TLS state.
+
+<a id="DetachedSession"></a>
+
+## `DetachedSession`
+
+```silk
+pub struct DetachedSession
+```
+
+The TLS state of a detached connection. Give it to [`DetachedSession.split`](#DetachedSession.impl.split).
+
+<a id="OwnedConnection.impl-2"></a>
+
+## Implementation `OwnedConnection<P>`
+
+```silk
+impl<P> OwnedConnection<P>
+```
+
+<a id="OwnedConnection.impl.detach"></a>
+
+### Method `detach`
+
+```silk
+pub fn detach(self: Self) -> DetachedConnection<P>
+```
+
+Takes the connection apart, so that you can split its transport and then call
+[`DetachedSession.split`](#DetachedSession.impl.split). It does no I/O.
+
+<a id="Halves"></a>
+
+## `Halves`
+
+```silk
+pub struct Halves<R, W>
+```
+
+The halves of a split TLS connection.
+
+<a id="Halves.reader"></a>
+
+### Field `reader`
+
+```silk
+pub reader: ReadHalf<R>
+```
+
+The half that reads, for one fiber.
+
+<a id="Halves.writer"></a>
+
+### Field `writer`
+
+```silk
+pub writer: WriteHalf<W>
+```
+
+The half that writes, for one fiber at a time.
+
+<a id="ReadHalf"></a>
+
+## `ReadHalf`
+
+```silk
+pub struct ReadHalf<P>
+```
+
+The reading half of a split TLS connection. It reads from its own transport half.
+
+### Details
+TLS records that the reader must answer, such as a key update, are sent with the next write of
+the [`WriteHalf`](#WriteHalf).
+
+<a id="WriteHalf"></a>
+
+## `WriteHalf`
+
+```silk
+pub struct WriteHalf<P>
+```
+
+The writing half of a split TLS connection. It writes to its own transport half.
+
+<a id="DetachedSession.impl"></a>
+
+## Implementation `DetachedSession`
+
+```silk
+impl DetachedSession
+```
+
+<a id="DetachedSession.impl.split"></a>
+
+### Method `split`
+
+```silk
+pub effect fn split<R, W>(self: Self, reader: R, writer: W) -> Halves<R, W>
+  ! OutOfMemoryError
+  ? &mut Allocator
+```
+
+Joins the TLS state with the two halves of its transport, for example from `Connection.split`
+of `silk.net.socket_native`. Bytes that were read and not decrypted go to the reader.
+
+#### Errors
+`OutOfMemoryError` if the shared state cannot be allocated.
+
+<a id="ReadHalf.impl"></a>
+
+## Implementation `ReadHalf<P>`
+
+```silk
+impl<P> ReadHalf<P>
+```
+
+<a id="ReadHalf.impl.phase"></a>
+
+### Method `phase`
+
+```silk
+pub fn phase(self: &Self) -> ConnectionPhase
+```
+
+Returns the current [`ConnectionPhase`](#ConnectionPhase), shared by both halves.
+
+<a id="ReadHalf.impl.transport"></a>
+
+### Method `transport`
+
+```silk
+pub fn transport<'half>(self: &'half Self) -> &'half P
+```
+
+Returns the transport half, to look at it.
+
+<a id="ReadHalf.impl.readSome"></a>
+
+### Method `readSome`
+
+```silk
+pub effect fn readSome(self: &mut Self, output: &mut [u8], deadline: Option<Instant>) -> ReadTransfer
+  ! ConnectionError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator | &mut Random
+  where
+    &mut P provides &ByteDuplex from &mut ByteDuplex,
+    &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+```
+
+Reads decrypted application data into `output`, and returns how many bytes it read, or the
+end of input after `close_notify`.
+
+#### Errors
+The errors of [`OwnedConnection.readSome`](#OwnedConnection.impl.readSome). After an error, both halves fail.
+
+<a id="ReadHalf.impl.close"></a>
+
+### Method `close`
+
+```silk
+pub effect fn close(self: &mut Self) -> ()
+  ! ConnectionError
+  ? Without<&mut ByteDuplex, ByteDuplex>
+  where &mut P provides &ByteDuplex from &mut ByteDuplex
+```
+
+Closes the transport half at once.
+
+#### Errors
+`Io` if the transport fails to close.
+
+<a id="WriteHalf.impl"></a>
+
+## Implementation `WriteHalf<P>`
+
+```silk
+impl<P> WriteHalf<P>
+```
+
+<a id="WriteHalf.impl.phase"></a>
+
+### Method `phase`
+
+```silk
+pub fn phase(self: &Self) -> ConnectionPhase
+```
+
+Returns the current [`ConnectionPhase`](#ConnectionPhase), shared by both halves.
+
+<a id="WriteHalf.impl.transport"></a>
+
+### Method `transport`
+
+```silk
+pub fn transport<'half>(self: &'half Self) -> &'half P
+```
+
+Returns the transport half, to look at it.
+
+<a id="WriteHalf.impl.writeSome"></a>
+
+### Method `writeSome`
+
+```silk
+pub effect fn writeSome(self: &mut Self, input: &[u8], deadline: Option<Instant>) -> usize
+  ! ConnectionError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator
+  where
+    &mut P provides &ByteDuplex from &mut ByteDuplex,
+    &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+```
+
+Encrypts and sends a prefix of `input`, and returns how many bytes it sent. It first sends
+the TLS records that the reader queued.
+
+#### Errors
+The errors of [`OwnedConnection.writeSome`](#OwnedConnection.impl.writeSome). After an error, both halves fail.
+
+<a id="WriteHalf.impl.flush"></a>
+
+### Method `flush`
+
+```silk
+pub effect fn flush(self: &mut Self, deadline: Option<Instant>) -> ()
+  ! ConnectionError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator
+  where
+    &mut P provides &ByteDuplex from &mut ByteDuplex,
+    &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+```
+
+Sends the TLS records that are waiting, then flushes the transport half.
+
+<a id="WriteHalf.impl.shutdownWrite"></a>
+
+### Method `shutdownWrite`
+
+```silk
+pub effect fn shutdownWrite(self: &mut Self, deadline: Option<Instant>) -> ()
+  ! ConnectionError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator
+  where
+    &mut P provides &ByteDuplex from &mut ByteDuplex,
+    &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+```
+
+Sends `close_notify`, flushes, and closes the write direction of the transport half. The
+reader can still read.
+
+<a id="WriteHalf.impl.close"></a>
+
+### Method `close`
+
+```silk
+pub effect fn close(self: &mut Self) -> ()
+  ! ConnectionError
+  ? Without<&mut ByteDuplex, ByteDuplex>
+  where &mut P provides &ByteDuplex from &mut ByteDuplex
+```
+
+Closes the transport half at once, without `close_notify`.
+
+#### Errors
+`Io` if the transport fails to close.
 
 
 Category: TLS and certificates.

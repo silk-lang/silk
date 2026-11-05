@@ -10,14 +10,14 @@ the origin, and for HTTPS checks the server certificate against the host. Use
 [`Origin.authorityInto`](#Origin.impl.authorityInto) to write the `Host` value.
 
 ## Details
-An `Origin` has no path, and does not allocate. A missing port becomes 80 for `http` and 443 for
-`https`. [`Origin.authorityInto`](#Origin.impl.authorityInto) writes a lowercase domain, the canonical IP text, and the port
-only when it is not the default. A `Host` field that you give never changes the host that TLS
+An `Origin` has no path, and does not allocate. A missing port becomes 80 for `http` and `ws`,
+and 443 for `https` and `wss`. [`Origin.authorityInto`](#Origin.impl.authorityInto) writes a lowercase domain, the canonical
+IP text, and the port only when it is not the default. A `Host` field that you give never changes the host that TLS
 checks.
 
 ## Errors
-- [`OriginError`](#OriginError) if the scheme is not `http` or `https`, the URI has user information, or the
-  host or port is not valid.
+- [`OriginError`](#OriginError) if the scheme is not `http`, `https`, `ws`, or `wss`, the URI has user
+  information, or the host or port is not valid.
 
 ## Examples
 ### Get the origin of a URL
@@ -203,11 +203,12 @@ Returns the origin for `host` and `port`. `secure` selects HTTPS. Port 0 returns
 pub fn fromUri(uri: &Uri) -> Result<Origin, OriginError>
 ```
 
-Returns the origin of an `http` or `https` URI.
+Returns the origin of an `http`, `https`, `ws`, or `wss` URI.
 
 #### Details
-A missing port becomes 80 for `http` and 443 for `https`. The path, query, and fragment are
-ignored. User information returns `UserInfo`.
+`ws` and `wss` are the WebSocket names of `http` and `https`. A missing port becomes 80 for
+`http` and `ws`, and 443 for `https` and `wss`. The path, query, and fragment are ignored.
+User information returns `UserInfo`.
 
 <a id="Origin.impl.host"></a>
 

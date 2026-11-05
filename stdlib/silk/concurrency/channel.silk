@@ -1,0 +1,550 @@
+//! Bounded channels that pass values between fibers on one thread.
+//!
+//! # When to use
+//! Use [`Channel.make`] when one fiber must wake another one with data, for example to pass each
+//! new message of one connection to the fibers that serve the other connections. [`Sender.send`]
+//! waits while the channel is full, and [`Receiver.receive`] waits while it is empty.
+//!
+//! # Details
+//! A channel holds at most `capacity` values, in order. It allocates its storage one time, in
+//! [`Channel.make`]. Later operations do not allocate, except to remember a waiting fiber.
+//!
+//! [`Sender`] and [`Receiver`] handles can be cloned, so several fibers can send and receive. Each
+//! value goes to one receiver. The channel closes when [`Sender.close`] or [`Receiver.close`] is
+//! called, when every `Sender` is dropped, or when every `Receiver` is dropped. After the close,
+//! sends fail and give the value back, and receives return the values that are left, then `None`.
+//!
+//! A waiting fiber parks its `Execution`, so the channel works under any scheduler that drives
+//! fibers, such as `silk.concurrency.local_scheduler`.
+//!
+//! # Errors
+//! `OutOfMemoryError` if [`Channel.make`] cannot allocate, or if a fiber cannot be added to the
+//! list of waiting fibers.
+//!
+//! # Gotchas
+//! - Handles stay on the thread that made them. For threads, use `silk.concurrency.sync`.
+//! - A fiber that waits is woken each time the channel changes, and checks again. This is cheap for
+//!   a few waiting fibers, not for thousands of them on one channel.
+//!
+//! # Examples
+//! ## Pass values from one fiber to another
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.core.option { Option }
+//! import silk.core.result { Result }
+//! import silk.concurrency.channel { Channel, Sender }
+//! import silk.concurrency.fiber { Cancelled, Fiber }
+//! import silk.concurrency.local_scheduler { LocalScheduler, StalledError }
+//! import silk.concurrency.scheduler { Scheduler, TaskIdExhaustedError }
+//! import silk.system.monotonic_clock { MonotonicClock }
+//! import silk.system.monotonic_clock_native { OsMonotonicClock }
+//!
+//! effect fn produce(sender: Sender<i32>) -> i32 {
+//!   let mut value = 1
+//!   while value <= 3 {
+//!     // Waits while the channel is full.
+//!     match run sender.send(value) {
+//!       Result.Success {..} => {}
+//!       Result.Failure {..} => { return 1 }
+//!     }
+//!     value = value + 1
+//!   }
+//!   // Dropping the last Sender closes the channel.
+//!   drop sender
+//!   return 0
+//! }
+//!
+//! effect fn root() -> i32
+//!   ! OutOfMemoryError | TaskIdExhaustedError | Cancelled
+//!   ? &mut Scheduler | &mut MonotonicClock {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   // Room for one value, so the producer waits until each value is received.
+//!   let channel = run Channel<i32>.make(1)
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let Channel<i32> {sender, receiver} = move channel
+//!   let producer = run Fiber<i32, never>.forkChild(produce(move sender))
+//!   let mut total = 0
+//!   while true {
+//!     match run receiver.receive() {
+//!       Option.Some {value} => { total = total + value }
+//!       Option.None => { break }
+//!     }
+//!   }
+//!   let produced = run producer.join()
+//!   if produced != 0 || total != 6 { return 1 }
+//!   return 0
+//! }
+//!
+//! effect fn program() -> i32
+//!   ! OutOfMemoryError | TaskIdExhaustedError | Cancelled | StalledError {
+//!   let mut clock = OsMonotonicClock.make()
+//!   let mut scheduler = LocalScheduler.make()
+//!   return run scheduler.execute<i32, OutOfMemoryError | TaskIdExhaustedError | Cancelled>(root())
+//!     |> Effect.provideMut<MonotonicClock>(&mut clock)
+//! }
+//!
+//! effect fn failed<E>(error: E) -> i32 {
+//!   drop error
+//!   return 1
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   return run Effect.catchAll(program(), failed)
+//! }
+//! ```
+//!
+//! @category Concurrency
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.concurrency.execution { Execution, Wake }
+import silk.core.option { Option }
+import silk.core.ownership { Drop }
+import silk.core.result { Result }
+import silk.mem.shared { Shared }
+import silk.num.usize
+
+struct State<T> {
+  slots: List<Option<T>>,
+  head: usize,
+  count: usize,
+  senders: usize,
+  receivers: usize,
+  closed: bool,
+  waiters: Option<Shared<WaitNode>>,
+}
+
+// The waiting place of one handle. It is in the list of waiters of its channel while `linked`.
+struct WaitNode {
+  wake: Option<Wake>,
+  next: Option<Shared<WaitNode>>,
+  linked: bool,
+}
+
+/// The two ends of a new channel, from [`Channel.make`].
+pub struct Channel<T> {
+  /// The end that sends values.
+  pub sender: Sender<T>,
+  /// The end that receives values.
+  pub receiver: Receiver<T>,
+}
+
+/// The sending end of a channel. Clone it to send from several fibers.
+///
+/// # Gotchas
+/// One handle waits for one fiber at a time. Give each fiber its own clone: a second fiber that
+/// waits on the same handle checks again at each turn of the scheduler instead of parking.
+pub struct Sender<T> {
+  state: Shared<State<T>>,
+  node: Shared<WaitNode>,
+}
+
+/// The receiving end of a channel. Clone it to receive in several fibers. Each value goes to one
+/// receiver.
+///
+/// # Gotchas
+/// One handle waits for one fiber at a time. Give each fiber its own clone: a second fiber that
+/// waits on the same handle checks again at each turn of the scheduler instead of parking.
+pub struct Receiver<T> {
+  state: Shared<State<T>>,
+  node: Shared<WaitNode>,
+}
+
+/// The result of [`Sender.trySend`].
+pub union TrySend<T> {
+  /// The value is in the channel.
+  Sent,
+  /// The channel is full. The value is given back.
+  Full {
+    /// The value that was not sent.
+    pub value: T,
+  },
+  /// The channel is closed. The value is given back.
+  Closed {
+    /// The value that was not sent.
+    pub value: T,
+  },
+}
+
+/// The result of [`Receiver.tryReceive`].
+pub union TryReceive<T> {
+  /// The oldest value of the channel.
+  Received {
+    /// The value.
+    pub value: T,
+  },
+  /// The channel is empty and open.
+  Empty,
+  /// The channel is empty and closed. No value will come.
+  Closed,
+}
+
+impl<T> Channel<T> {
+  /// Returns a new open channel that holds at most `capacity` values.
+  ///
+  /// # Details
+  /// A `capacity` of zero is taken as one.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the storage cannot be allocated.
+  pub effect<'env> fn make<'env>(capacity: usize) -> Channel<T> ! OutOfMemoryError ? &mut Allocator {
+    let mut size = capacity
+    if size == usize.ZERO { size = usize.ONE }
+    let mut slots = run List<Option<T>>.makeWithCapacity(size)
+    let mut index = usize.ZERO
+    while index < size {
+      run slots.append(Option<T>.none())
+      index = index + usize.ONE
+    }
+    let state = run Shared<State<T>>.make(State<T> {
+      slots: move slots,
+      head: usize.ZERO,
+      count: usize.ZERO,
+      senders: usize.ONE,
+      receivers: usize.ONE,
+      closed: false,
+      waiters: Option<Shared<WaitNode>>.none(),
+    })
+    let senderNode = run makeNode()
+    let receiverNode = run makeNode()
+    let other = Shared<State<T>>.clone(&state)
+    return Channel<T> {
+      sender: Sender<T> {state: move state, node: move senderNode},
+      receiver: Receiver<T> {state: move other, node: move receiverNode},
+    }
+  }
+}
+
+impl<T> Sender<T> {
+  /// Returns another sender for the same channel.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the waiting place of the new handle cannot be allocated.
+  pub effect fn clone(self: &Self) -> Sender<T> ! OutOfMemoryError ? &mut Allocator {
+    let node = run makeNode()
+    Shared.withMut(&self.state, addSender)
+    return Sender<T> {state: Shared<State<T>>.clone(&self.state), node: move node}
+  }
+
+  /// Puts `value` in the channel, and waits while the channel is full.
+  ///
+  /// # Details
+  /// It returns `Failure` with the value if the channel is closed, also while it waits.
+  pub effect fn send(self: &Self, item: T) -> Result<(), T> {
+    let mut pending = move item
+    while true {
+      let attempted = push<T>(&self.state, move pending)
+      match move attempted {
+        TrySend.Sent => { return Result<(), T>.succeed(()) }
+        TrySend.Closed {value} => { return Result<(), T>.failResult(move value) }
+        TrySend.Full {value} => { pending = move value }
+      }
+      run waitForChange<T>(&self.state, &self.node)
+    }
+    return Result<(), T>.failResult(move pending)
+  }
+
+  /// Puts `value` in the channel if there is room. It does not wait.
+  pub fn trySend(self: &Self, value: T) -> TrySend<T> {
+    return push<T>(&self.state, move value)
+  }
+
+  /// Closes the channel for all handles. Values that are already in it can still be received.
+  pub fn close(self: &Self) -> () {
+    return close<T>(&self.state)
+  }
+
+  /// Returns whether the channel is closed.
+  pub fn isClosed(self: &Self) -> bool {
+    return Shared.withMut(&self.state, readClosed)
+  }
+}
+
+impl<T> Receiver<T> {
+  /// Returns another receiver for the same channel.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the waiting place of the new handle cannot be allocated.
+  pub effect fn clone(self: &Self) -> Receiver<T> ! OutOfMemoryError ? &mut Allocator {
+    let node = run makeNode()
+    Shared.withMut(&self.state, addReceiver)
+    return Receiver<T> {state: Shared<State<T>>.clone(&self.state), node: move node}
+  }
+
+  /// Returns the oldest value, and waits while the channel is empty and open. Returns `None` when
+  /// the channel is empty and closed.
+  pub effect fn receive(self: &Self) -> Option<T> {
+    while true {
+      let attempted = pop<T>(&self.state)
+      match move attempted {
+        TryReceive.Received {value} => { return Option<T>.some(move value) }
+        TryReceive.Closed => { return Option<T>.none() }
+        TryReceive.Empty => {}
+      }
+      run waitForChange<T>(&self.state, &self.node)
+    }
+    return Option<T>.none()
+  }
+
+  /// Returns the oldest value if there is one. It does not wait.
+  pub fn tryReceive(self: &Self) -> TryReceive<T> {
+    return pop<T>(&self.state)
+  }
+
+  /// Closes the channel for all handles. Values that are already in it can still be received.
+  pub fn close(self: &Self) -> () {
+    return close<T>(&self.state)
+  }
+
+  /// Returns how many values the channel holds now.
+  pub fn length(self: &Self) -> usize {
+    return Shared.withMut(&self.state, readCount)
+  }
+}
+
+impl<T> Drop for Sender<T> {
+  fn drop(self: &mut Sender<T>) -> () {
+    let last = Shared.withMut(&self.state, removeSender)
+    if last { close<T>(&self.state) }
+    return ()
+  }
+}
+
+impl<T> Drop for Receiver<T> {
+  fn drop(self: &mut Receiver<T>) -> () {
+    let last = Shared.withMut(&self.state, removeReceiver)
+    if last { close<T>(&self.state) }
+    return ()
+  }
+}
+
+effect fn makeNode() -> Shared<WaitNode> ! OutOfMemoryError ? &mut Allocator {
+  return run Shared<WaitNode>.make(WaitNode {
+    wake: Option<Wake>.none(),
+    next: Option<Shared<WaitNode>>.none(),
+    linked: false,
+  })
+}
+
+fn addSender<T>(state: &mut State<T>) -> () {
+  state.senders = state.senders + usize.ONE
+  return ()
+}
+
+fn addReceiver<T>(state: &mut State<T>) -> () {
+  state.receivers = state.receivers + usize.ONE
+  return ()
+}
+
+fn removeSender<T>(state: &mut State<T>) -> bool {
+  state.senders = state.senders - usize.ONE
+  return state.senders == usize.ZERO
+}
+
+fn removeReceiver<T>(state: &mut State<T>) -> bool {
+  state.receivers = state.receivers - usize.ONE
+  return state.receivers == usize.ZERO
+}
+
+fn readClosed<T>(state: &mut State<T>) -> bool {
+  return state.closed
+}
+
+fn readCount<T>(state: &mut State<T>) -> usize {
+  return state.count
+}
+
+struct Pushed<T> {
+  outcome: TrySend<T>,
+  waiters: Option<Shared<WaitNode>>,
+}
+
+fn pushValue<T>(state: &mut State<T>, value: T) -> Pushed<T> {
+  if state.closed {
+    return Pushed<T> {outcome: TrySend<T>.Closed {value: move value}, waiters: Option<Shared<WaitNode>>.none()}
+  }
+  let capacity = state.slots.length()
+  if state.count == capacity {
+    return Pushed<T> {outcome: TrySend<T>.Full {value: move value}, waiters: Option<Shared<WaitNode>>.none()}
+  }
+  let index = (state.head + state.count) % capacity
+  state.slots.set(index, Option<T>.some(move value))
+  state.count = state.count + usize.ONE
+  return Pushed<T> {outcome: TrySend<T>.Sent, waiters: takeHead<T>(&mut state.*)}
+}
+
+fn push<T>(state: &Shared<State<T>>, value: T) -> TrySend<T> {
+  let Pushed<T> {outcome, waiters} = Shared.withMut(&state.*, pushValue<T>(move value))
+  wakeAll(move waiters)
+  return move outcome
+}
+
+struct Popped<T> {
+  outcome: TryReceive<T>,
+  waiters: Option<Shared<WaitNode>>,
+}
+
+fn popValue<T>(state: &mut State<T>) -> Popped<T> {
+  if state.count == usize.ZERO {
+    if state.closed {
+      return Popped<T> {outcome: TryReceive<T>.Closed, waiters: Option<Shared<WaitNode>>.none()}
+    }
+    return Popped<T> {outcome: TryReceive<T>.Empty, waiters: Option<Shared<WaitNode>>.none()}
+  }
+  let slots = state.slots.asMutSlice()
+  let taken = Intrinsic.replace(slots[state.head], Option<T>.none())
+  drop slots
+  state.head = (state.head + usize.ONE) % state.slots.length()
+  state.count = state.count - usize.ONE
+  let waiters = takeHead<T>(&mut state.*)
+  return match move taken {
+    Option.Some {value} => Popped<T> {outcome: TryReceive<T>.Received {value: move value}, waiters: move waiters}
+    Option.None => Popped<T> {outcome: TryReceive<T>.Empty, waiters: move waiters}
+  }
+}
+
+fn pop<T>(state: &Shared<State<T>>) -> TryReceive<T> {
+  let Popped<T> {outcome, waiters} = Shared.withMut(&state.*, popValue)
+  wakeAll(move waiters)
+  return move outcome
+}
+
+fn markClosed<T>(state: &mut State<T>) -> Option<Shared<WaitNode>> {
+  if state.closed { return Option<Shared<WaitNode>>.none() }
+  state.closed = true
+  return takeHead<T>(&mut state.*)
+}
+
+fn close<T>(state: &Shared<State<T>>) -> () {
+  let waiters = Shared.withMut(&state.*, markClosed)
+  return wakeAll(move waiters)
+}
+
+struct Unlinked {
+  wake: Option<Wake>,
+  next: Option<Shared<WaitNode>>,
+}
+
+fn unlinkNode(node: &mut WaitNode) -> Unlinked {
+  node.linked = false
+  return Unlinked {
+    wake: Intrinsic.replace(node.wake, Option<Wake>.none()),
+    next: Intrinsic.replace(node.next, Option<Shared<WaitNode>>.none()),
+  }
+}
+
+// Wakes every fiber of a list that was taken from the channel. Each one checks the channel again.
+fn wakeAll(waiters: Option<Shared<WaitNode>>) -> () {
+  let mut current = move waiters
+  while true {
+    match move current {
+      Option.Some {value} => {
+        let Unlinked {wake, next} = Shared.withMut(&value, unlinkNode)
+        drop value
+        if let Option.Some {value: ready} = move wake { Execution.wake(move ready) }
+        current = move next
+      }
+      Option.None => { break }
+    }
+  }
+  return ()
+}
+
+enum NodeUse {
+  // Not in the list: link it and park.
+  Link,
+  // In the list with no fiber: a fiber that waited here was cancelled. Park in its place.
+  Reuse,
+  // Another fiber waits on this handle.
+  Busy,
+}
+
+fn inspectNode(node: &mut WaitNode) -> NodeUse {
+  if !node.linked { return NodeUse.Link }
+  return match &node.wake {
+    Option.None => NodeUse.Reuse
+    Option.Some {..} => NodeUse.Busy
+  }
+}
+
+fn takeHead<T>(state: &mut State<T>) -> Option<Shared<WaitNode>> {
+  return Intrinsic.replace(state.waiters, Option<Shared<WaitNode>>.none())
+}
+
+fn setHead<T>(state: &mut State<T>, head: Shared<WaitNode>) -> () {
+  let previous = Intrinsic.replace(state.waiters, Option<Shared<WaitNode>>.some(move head))
+  drop previous
+  return ()
+}
+
+fn linkNode(node: &mut WaitNode, next: Option<Shared<WaitNode>>, wake: Wake) -> () {
+  let previousNext = Intrinsic.replace(node.next, move next)
+  drop previousNext
+  let previousWake = Intrinsic.replace(node.wake, Option<Wake>.some(move wake))
+  drop previousWake
+  node.linked = true
+  return ()
+}
+
+fn storeWake(node: &mut WaitNode, wake: Wake) -> () {
+  let previous = Intrinsic.replace(node.wake, Option<Wake>.some(move wake))
+  drop previous
+  return ()
+}
+
+fn clearWake(node: &mut WaitNode, marker: ()) -> () {
+  drop marker
+  let previous = Intrinsic.replace(node.wake, Option<Wake>.none())
+  drop previous
+  return ()
+}
+
+// Clears the Wake of its node when the fiber resumes or is cancelled, so that a later waiter on
+// the same handle can take the place.
+struct WaitGuard {
+  node: Shared<WaitNode>,
+}
+
+impl Drop for WaitGuard {
+  fn drop(self: &mut WaitGuard) -> () {
+    Shared.withMut(&self.node, clearWake(()))
+    return ()
+  }
+}
+
+fn registerLinked<T>(wake: Wake, state: Shared<State<T>>, node: Shared<WaitNode>) -> WaitGuard {
+  let next = Shared.withMut(&state, takeHead)
+  Shared.withMut(&node, linkNode(move next, move wake))
+  Shared.withMut(&state, setHead<T>(Shared<WaitNode>.clone(&node)))
+  drop state
+  return WaitGuard {node: move node}
+}
+
+fn registerReused(wake: Wake, node: Shared<WaitNode>) -> WaitGuard {
+  Shared.withMut(&node, storeWake(move wake))
+  return WaitGuard {node: move node}
+}
+
+struct YieldGuard {}
+
+fn registerYield(wake: Wake) -> YieldGuard {
+  Execution.wake(move wake)
+  return YieldGuard {}
+}
+
+// Parks the current fiber until the next change of the channel. The caller checks again after it
+// returns, because another fiber may have used the change first.
+effect fn waitForChange<T>(state: &Shared<State<T>>, node: &Shared<WaitNode>) -> () {
+  return match Shared.withMut(&node.*, inspectNode) {
+    NodeUse.Link => {
+      let registration = registerLinked<T>(Shared<State<T>>.clone(&state.*), Shared<WaitNode>.clone(&node.*))
+      return run Execution.park(move registration)
+    }
+    NodeUse.Reuse => {
+      let registration = registerReused(Shared<WaitNode>.clone(&node.*))
+      return run Execution.park(move registration)
+    }
+    NodeUse.Busy => run Execution.park(registerYield)
+  }
+}

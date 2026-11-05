@@ -195,6 +195,7 @@ import silk.tls.client {
   TlsError,
 }
 import silk.tls.trust_snapshot {TrustSnapshot}
+import silk.concurrency.sync {Arc, Mutex}
 import silk.num.u64
 import silk.num.usize
 import silk.io.writer {Writer, WriterError}
@@ -1137,4 +1138,509 @@ effect fn checkHandshakeDeadlineOption(connection: &mut ConnectionState, deadlin
     Option<Instant>.None => ()
     Option<Instant>.Some {value} => run checkHandshakeDeadline(move connection, &value)
   }
+}
+
+/// A TLS connection taken apart by [`OwnedConnection.detach`]: the transport, and the TLS state to
+/// give to [`DetachedSession.split`] with the two halves of that transport.
+pub struct DetachedConnection<P> {
+  /// The transport.
+  pub provider: P,
+  /// The TLS state.
+  pub session: DetachedSession,
+}
+
+/// The TLS state of a detached connection. Give it to [`DetachedSession.split`].
+pub struct DetachedSession {
+  state: ConnectionState,
+}
+
+impl<P> OwnedConnection<P> {
+  /// Takes the connection apart, so that you can split its transport and then call
+  /// [`DetachedSession.split`]. It does no I/O.
+  pub fn detach(self: Self) -> DetachedConnection<P> {
+    let OwnedConnection<P> {state, provider, provenance} = move self
+    drop provenance
+    return DetachedConnection<P> {provider: move provider, session: DetachedSession {state: move state}}
+  }
+}
+
+/// The halves of a split TLS connection.
+pub struct Halves<R, W> {
+  /// The half that reads, for one fiber.
+  pub reader: ReadHalf<R>,
+  /// The half that writes, for one fiber at a time.
+  pub writer: WriteHalf<W>,
+}
+
+// The client state, shared by both halves. It is taken out only for work that does not park.
+struct SplitState {
+  client: Option<Client>,
+  phaseValue: ConnectionPhase,
+}
+
+/// The reading half of a split TLS connection. It reads from its own transport half.
+///
+/// # Details
+/// TLS records that the reader must answer, such as a key update, are sent with the next write of
+/// the [`WriteHalf`].
+pub struct ReadHalf<P> {
+  shared: Arc<Mutex<SplitState>>,
+  provider: P,
+  input: Bytes,
+  inputOffset: usize,
+  inputLength: usize,
+}
+
+/// The writing half of a split TLS connection. It writes to its own transport half.
+pub struct WriteHalf<P> {
+  shared: Arc<Mutex<SplitState>>,
+  provider: P,
+  output: Bytes,
+}
+
+impl DetachedSession {
+  /// Joins the TLS state with the two halves of its transport, for example from `Connection.split`
+  /// of `silk.net.socket_native`. Bytes that were read and not decrypted go to the reader.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the shared state cannot be allocated.
+  pub effect fn split<R, W>(self: Self, reader: R, writer: W) -> Halves<R, W>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+    let DetachedSession {state} = move self
+    let ConnectionState {client, input, inputOffset, inputLength, phaseValue} = move state
+    let lock = run Mutex<SplitState>.make(SplitState {
+      client: Option<Client>.some(move client),
+      phaseValue: phaseValue,
+    })
+    let shared = run Arc<Mutex<SplitState>>.make(move lock)
+    return Halves<R, W> {
+      reader: ReadHalf<R> {
+        shared: shared.clone(),
+        provider: move reader,
+        input: move input,
+        inputOffset: inputOffset,
+        inputLength: inputLength,
+      },
+      writer: WriteHalf<W> {shared: move shared, provider: move writer, output: Bytes.make()},
+    }
+  }
+}
+
+impl<P> ReadHalf<P> {
+  /// Returns the current [`ConnectionPhase`], shared by both halves.
+  pub fn phase(self: &Self) -> ConnectionPhase {
+    return withSplit(&self.shared, readSplitPhase)
+  }
+
+  /// Returns the transport half, to look at it.
+  pub fn transport<'half>(self: &'half Self) -> &'half P {
+    return &self.provider
+  }
+
+  /// Reads decrypted application data into `output`, and returns how many bytes it read, or the
+  /// end of input after `close_notify`.
+  ///
+  /// # Errors
+  /// The errors of [`OwnedConnection.readSome`]. After an error, both halves fail.
+  pub effect fn readSome(self: &mut Self, output: &mut [u8], deadline: Option<Instant>) -> ReadTransfer
+  ! ConnectionError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator | &mut Random
+  where
+    &mut P provides &ByteDuplex from &mut ByteDuplex,
+    &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock {
+    let phase = self.phase()
+    if phase == ConnectionPhase.Invalid || phase == ConnectionPhase.Closed {
+      fail connectionIo(ByteDuplex.closed(ByteIoOperation.Read))
+    }
+    if output.length == usize.ZERO {
+      return ReadTransfer.Data {count: usize.ZERO}
+    }
+    while true {
+      let mut client = takeClient(&self.shared)
+      let read = client.readPlaintext(&mut output)
+      let ended = client.closeNotified()
+      withSplit(&self.shared, restoreSplitClient(move client))
+      let progress = run self.require(move read)
+      if progress.written > usize.ZERO {
+        return ReadTransfer.Data {count: progress.written}
+      }
+      if ended {
+        withSplit(&self.shared, markPeerEnded)
+        return ReadTransfer.End
+      }
+      if self.inputOffset < self.inputLength {
+        run self.feedBuffered()
+      } else {
+        run self.receive(copyDeadline(&deadline))
+      }
+    }
+    return ReadTransfer.End
+  }
+
+  /// Closes the transport half at once.
+  ///
+  /// # Errors
+  /// `Io` if the transport fails to close.
+  pub effect fn close(self: &mut Self) -> ()
+  ! ConnectionError
+  ? Without<&mut ByteDuplex, ByteDuplex>
+  where &mut P provides &ByteDuplex from &mut ByteDuplex {
+    let attempted = run Effect.result(ByteDuplex.close() |> Effect.provideMut<ByteDuplex>(&mut self.provider))
+    return match move attempted {
+      Result<(), ByteIoError>.Success {value} => move value
+      Result<(), ByteIoError>.Failure {error} => {
+        fail connectionIo(move error)
+      }
+    }
+  }
+
+  effect fn require(self: &mut Self, result: Result<Progress, TlsError>) -> Progress ! ConnectionError {
+    return match move result {
+      Result<Progress, TlsError>.Success {value} => move value
+      Result<Progress, TlsError>.Failure {error} => {
+        withSplit(&self.shared, markSplitInvalid)
+        fail connectionTls(move error)
+      }
+    }
+  }
+
+  // Gives the bytes that were read to the client. It does not park while the client is out.
+  effect fn feedBuffered(self: &mut Self) -> ()
+  ! ConnectionError | OutOfMemoryError
+  ? &mut Allocator | &mut Random {
+    let available = Slice.view<u8>(
+      Bytes.asSlice(&self.input),
+      self.inputOffset,
+      self.inputLength - self.inputOffset,
+    )
+    let limit = available.length
+    let mut client = takeClient(&self.shared)
+    let fed = run Effect.result(client.feedInput(available))
+    drop available
+    withSplit(&self.shared, restoreSplitClient(move client))
+    let result = match move fed {
+      Result.Success {value} => move value
+      Result.Failure {error} => {
+        withSplit(&self.shared, markSplitInvalid)
+        fail move error
+      }
+    }
+    let progress = run self.require(move result)
+    if progress.consumed > limit {
+      withSplit(&self.shared, markSplitInvalid)
+      fail connectionIo(ByteDuplex.invalidTransferCount(ByteIoOperation.Read, progress.consumed, limit))
+    }
+    self.inputOffset = self.inputOffset + progress.consumed
+    if self.inputOffset == self.inputLength {
+      self.inputOffset = usize.ZERO
+      self.inputLength = usize.ZERO
+    }
+    return ()
+  }
+
+  // Reads more TLS records from the transport half.
+  effect fn receive(self: &mut Self, deadline: Option<Instant>) -> ()
+  ! ConnectionError
+  ? &mut MonotonicClock
+  where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock {
+    let attempted = run Effect.result(
+      transportRead(Bytes.asMutSlice(&mut self.input), move deadline, false)
+        |> Effect.provideMut<ByteDuplex>(&mut self.provider),
+    )
+    let transfer = match move attempted {
+      Result.Success {value} => move value
+      Result.Failure {error} => {
+        withSplit(&self.shared, markSplitInvalid)
+        fail move error
+      }
+    }
+    match move transfer {
+      ReadTransfer.Data {count} => {
+        let limit = Bytes.length(&self.input)
+        if count == usize.ZERO || count > limit {
+          withSplit(&self.shared, markSplitInvalid)
+          fail connectionIo(ByteDuplex.invalidTransferCount(ByteIoOperation.Read, count, limit))
+        }
+        self.inputOffset = usize.ZERO
+        self.inputLength = count
+      }
+      ReadTransfer.End => {
+        let mut client = takeClient(&self.shared)
+        let ended = client.endInput()
+        withSplit(&self.shared, restoreSplitClient(move client))
+        let progress = run self.require(move ended)
+        drop progress
+      }
+    }
+    return ()
+  }
+}
+
+impl<P> WriteHalf<P> {
+  /// Returns the current [`ConnectionPhase`], shared by both halves.
+  pub fn phase(self: &Self) -> ConnectionPhase {
+    return withSplit(&self.shared, readSplitPhase)
+  }
+
+  /// Returns the transport half, to look at it.
+  pub fn transport<'half>(self: &'half Self) -> &'half P {
+    return &self.provider
+  }
+
+  /// Encrypts and sends a prefix of `input`, and returns how many bytes it sent. It first sends
+  /// the TLS records that the reader queued.
+  ///
+  /// # Errors
+  /// The errors of [`OwnedConnection.writeSome`]. After an error, both halves fail.
+  pub effect fn writeSome(self: &mut Self, input: &[u8], deadline: Option<Instant>) -> usize
+  ! ConnectionError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator
+  where
+    &mut P provides &ByteDuplex from &mut ByteDuplex,
+    &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock {
+    if self.phase() != ConnectionPhase.Open {
+      fail connectionIo(ByteDuplex.closed(ByteIoOperation.Write))
+    }
+    if input.length == usize.ZERO {
+      return usize.ZERO
+    }
+    while true {
+      let mut client = takeClient(&self.shared)
+      let written = client.writePlaintext(input)
+      let collected = run Effect.result(collectOutput(&mut client, &mut self.output))
+      withSplit(&self.shared, restoreSplitClient(move client))
+      let progress = run self.require(move written)
+      run self.requireCollected(move collected)
+      run self.sendCollected(copyDeadline(&deadline))
+      if progress.consumed > input.length {
+        withSplit(&self.shared, markSplitInvalid)
+        fail connectionIo(ByteDuplex.invalidTransferCount(ByteIoOperation.Write, progress.consumed, input.length))
+      }
+      if progress.consumed > usize.ZERO {
+        return progress.consumed
+      }
+      match progress.demand {
+        Demand.NeedOutput => {}
+        Demand.PeerClosed => {
+          fail connectionIo(ByteDuplex.closed(ByteIoOperation.Write))
+        }
+        Demand.Closed => {
+          fail connectionIo(ByteDuplex.closed(ByteIoOperation.Write))
+        }
+        _ => {
+          fail connectionTls(TlsError.InvalidState {operation: ClientOperation.WritePlaintext})
+        }
+      }
+    }
+    return usize.ZERO
+  }
+
+  /// Sends the TLS records that are waiting, then flushes the transport half.
+  pub effect fn flush(self: &mut Self, deadline: Option<Instant>) -> ()
+  ! ConnectionError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator
+  where
+    &mut P provides &ByteDuplex from &mut ByteDuplex,
+    &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock {
+    let phase = self.phase()
+    if phase == ConnectionPhase.Invalid || phase == ConnectionPhase.Closed {
+      fail connectionIo(ByteDuplex.closed(ByteIoOperation.Flush))
+    }
+    run self.collectPending()
+    run self.sendCollected(copyDeadline(&deadline))
+    return run requireSplitIo(&self.shared, ByteDuplex.flush(move deadline) |> Effect.provideMut<ByteDuplex>(&mut self.provider))
+  }
+
+  /// Sends `close_notify`, flushes, and closes the write direction of the transport half. The
+  /// reader can still read.
+  pub effect fn shutdownWrite(self: &mut Self, deadline: Option<Instant>) -> ()
+  ! ConnectionError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator
+  where
+    &mut P provides &ByteDuplex from &mut ByteDuplex,
+    &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock {
+    let phase = self.phase()
+    if phase == ConnectionPhase.Invalid || phase == ConnectionPhase.Closed {
+      fail connectionIo(ByteDuplex.closed(ByteIoOperation.ShutdownWrite))
+    }
+    if phase == ConnectionPhase.WriteShutdown {
+      return ()
+    }
+    let mut client = takeClient(&self.shared)
+    let closing = client.closeWrite()
+    withSplit(&self.shared, restoreSplitClient(move client))
+    let progress = run self.require(move closing)
+    drop progress
+    run self.collectPending()
+    run self.sendCollected(copyDeadline(&deadline))
+    run requireSplitIo(&self.shared, ByteDuplex.flush(copyDeadline(&deadline)) |> Effect.provideMut<ByteDuplex>(&mut self.provider))
+    run requireSplitIo(&self.shared, ByteDuplex.shutdownWrite(move deadline) |> Effect.provideMut<ByteDuplex>(&mut self.provider))
+    withSplit(&self.shared, markWriteShutdown)
+    return ()
+  }
+
+  /// Closes the transport half at once, without `close_notify`.
+  ///
+  /// # Errors
+  /// `Io` if the transport fails to close.
+  pub effect fn close(self: &mut Self) -> ()
+  ! ConnectionError
+  ? Without<&mut ByteDuplex, ByteDuplex>
+  where &mut P provides &ByteDuplex from &mut ByteDuplex {
+    let attempted = run Effect.result(ByteDuplex.close() |> Effect.provideMut<ByteDuplex>(&mut self.provider))
+    return match move attempted {
+      Result<(), ByteIoError>.Success {value} => move value
+      Result<(), ByteIoError>.Failure {error} => {
+        fail connectionIo(move error)
+      }
+    }
+  }
+
+  effect fn require(self: &mut Self, result: Result<Progress, TlsError>) -> Progress ! ConnectionError {
+    return match move result {
+      Result<Progress, TlsError>.Success {value} => move value
+      Result<Progress, TlsError>.Failure {error} => {
+        withSplit(&self.shared, markSplitInvalid)
+        fail connectionTls(move error)
+      }
+    }
+  }
+
+  effect fn requireCollected(self: &mut Self, result: Result<(), TlsError | OutOfMemoryError>) -> ()
+  ! ConnectionError | OutOfMemoryError {
+    return match move result {
+      Result.Success {value} => move value
+      Result.Failure {error} => {
+        withSplit(&self.shared, markSplitInvalid)
+        return match move error {
+          TlsError cause => { fail connectionTls(move cause) }
+          OutOfMemoryError allocation => { fail move allocation }
+        }
+      }
+    }
+  }
+
+  // Moves the records that the client queued, also those the reader caused, into `output`.
+  effect fn collectPending(self: &mut Self) -> () ! ConnectionError | OutOfMemoryError ? &mut Allocator {
+    let mut client = takeClient(&self.shared)
+    let collected = run Effect.result(collectOutput(&mut client, &mut self.output))
+    withSplit(&self.shared, restoreSplitClient(move client))
+    return run self.requireCollected(move collected)
+  }
+
+  // Sends `output` to the transport half. Only this half sends, so records keep their order.
+  effect fn sendCollected(self: &mut Self, deadline: Option<Instant>) -> ()
+  ! ConnectionError
+  ? &mut MonotonicClock
+  where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock {
+    let mut sent = usize.ZERO
+    let total = Bytes.length(&self.output)
+    while sent < total {
+      let rest = Slice.view<u8>(Bytes.asSlice(&self.output), sent, total - sent)
+      let attempted = run Effect.result(
+        transportWrite(rest, copyDeadline(&deadline), false) |> Effect.provideMut<ByteDuplex>(&mut self.provider),
+      )
+      drop rest
+      let count = match move attempted {
+        Result.Success {value} => value
+        Result.Failure {error} => {
+          Bytes.clear(&mut self.output)
+          withSplit(&self.shared, markSplitInvalid)
+          fail move error
+        }
+      }
+      if count == usize.ZERO || count > total - sent {
+        Bytes.clear(&mut self.output)
+        withSplit(&self.shared, markSplitInvalid)
+        fail connectionIo(ByteDuplex.invalidTransferCount(ByteIoOperation.Write, count, total - sent))
+      }
+      sent = sent + count
+    }
+    Bytes.clear(&mut self.output)
+    return ()
+  }
+
+}
+
+// Copies the pending TLS output into `output` and acknowledges it. The caller sends `output` next,
+// before any later record, so the order on the wire stays the same.
+effect fn collectOutput(client: &mut Client, output: &mut Bytes) -> () ! TlsError | OutOfMemoryError ? &mut Allocator {
+  let pending = client.pendingOutput()
+  let count = pending.length
+  if count == usize.ZERO {
+    return ()
+  }
+  run Bytes.append(&mut output.*, pending)
+  drop pending
+  let acknowledged = client.ackWritten(count)
+  if let Result<Progress, TlsError>.Failure {error} = move acknowledged {
+    fail move error
+  }
+  return ()
+}
+
+effect<'env> fn requireSplitIo<'env, ?R>(shared: &Arc<Mutex<SplitState>>, operation: once Effect<'env; () ! ByteIoError ? R>) -> ()
+! ConnectionError
+? R {
+  let attempted = run Effect.result(move operation)
+  return match move attempted {
+    Result.Success {value} => move value
+    Result.Failure {error} => {
+      withSplit(&shared.*, markSplitInvalid)
+      fail connectionIo(move error)
+    }
+  }
+}
+
+// The halves may run on different threads. Each use of the shared state is short and does not park.
+fn withSplit<A>(shared: &Arc<Mutex<SplitState>>, use: once fn(&mut SplitState) -> A) -> A {
+  let mut guard = shared.get().lock()
+  let result = use(guard.getMut())
+  drop guard
+  return move result
+}
+
+// Takes the client for one operation. If the other half holds it on another thread, waits until
+// that half puts it back.
+fn takeClient(shared: &Arc<Mutex<SplitState>>) -> Client {
+  while true {
+    let mut guard = shared.get().lock()
+    let state = guard.getMut()
+    let taken = Intrinsic.replace(state.client, Option<Client>.none())
+    drop guard
+    if let Option.Some {value} = move taken { return move value }
+  }
+  return Intrinsic.trap("TLS: the client of a split connection is in use")
+}
+
+fn readSplitPhase(state: &mut SplitState) -> ConnectionPhase {
+  return state.phaseValue
+}
+
+fn markSplitInvalid(state: &mut SplitState) -> () {
+  if state.phaseValue != ConnectionPhase.Closed {
+    state.phaseValue = ConnectionPhase.Invalid
+  }
+  return ()
+}
+
+fn markPeerEnded(state: &mut SplitState) -> () {
+  if state.phaseValue == ConnectionPhase.Open {
+    state.phaseValue = ConnectionPhase.PeerEnded
+  }
+  return ()
+}
+
+fn markWriteShutdown(state: &mut SplitState) -> () {
+  if state.phaseValue == ConnectionPhase.Open || state.phaseValue == ConnectionPhase.PeerEnded {
+    state.phaseValue = ConnectionPhase.WriteShutdown
+  }
+  return ()
+}
+
+fn restoreSplitClient(state: &mut SplitState, client: Client) -> () {
+  let previous = Intrinsic.replace(state.client, Option<Client>.some(move client))
+  drop previous
+  return ()
 }

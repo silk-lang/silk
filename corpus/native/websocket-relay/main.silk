@@ -1,0 +1,264 @@
+// A server accepts two WebSocket clients and forwards each client's message to the other. All four
+// sessions are split, so every reader waits while the writers send. Then each client closes, and
+// the server reader answers the Close for its writer.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.concurrency.channel { Channel, Sender }
+import silk.concurrency.fiber { Cancelled, Fiber }
+import silk.concurrency.thread { Transferable }
+import silk.concurrency.local_scheduler { LocalScheduler, StalledError }
+import silk.concurrency.scheduler { Scheduler, TaskIdExhaustedError }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.net.socket_native { BoundAddress, ConnectOptions, Connection, ListenOptions, NativeSocketError, accept, connectResolvedOwned, listen }
+import silk.net.address { Endpoint, IpAddress, Ipv4Address, Port }
+import silk.http.exchange as Client
+import silk.http.exchange { ExchangeError, Limits as ExchangeLimits }
+import silk.http.headers { Headers }
+import silk.http.message { Header, ValueError, Version }
+import silk.http.origin { Origin, OriginError }
+import silk.http.request { RequestError }
+import silk.http.websocket { CloseData, Event }
+import silk.http.websocket_client { ClientOptions, HandshakeError, Opened, handshake }
+import silk.http.websocket_stream { Options, ReadHalf, Split, StreamError, WebSocket, WriteHalf }
+import silk.http.websocket_upgrade { Accepted, Decision, DecisionHandler, Limits, Offer, UpgradeError, acceptOwned }
+import silk.http.exchange_native { NativeExchangeError, NativeTransport, NativeTransportHalves, Options as NativeOptions }
+import silk.http.websocket_native { connect, split }
+import silk.collections.bytes { Bytes }
+import silk.text.string { String }
+import silk.num.u16
+import silk.net.resolver { ResolverError }
+import silk.tls.connection { ConnectionError }
+import silk.tls.https_identity { IdentityError }
+import silk.tls.trust_snapshot { TrustSnapshot }
+import silk.system.system_clock { Instant, SystemClock }
+import silk.system.system_clock_native { OsSystemClock }
+import silk.system.random { Random }
+import silk.system.random_native { OsRandom }
+import silk.uri.reference { ParseError }
+import silk.uri.uri { Uri }
+
+struct AcceptAll {}
+
+impl DecisionHandler<never ? never> for AcceptAll {
+  effect<'call> fn decide<'call, 'head: 'call>(handler: &'call Self, offer: &'call Offer<'head>) -> Decision<'call> {
+    return Decision<'call>.Accept {protocol: Option<string<'call>>.none(), headers: Option<Headers<'call>>.none(), extensions: false}
+  }
+}
+
+// The halves of a native transport can move to another thread, as a whole transport can.
+fn transferable<T: Transferable>(value: T) -> T { return move value }
+
+fn crossThreads(halves: NativeTransportHalves) -> NativeTransportHalves {
+  let NativeTransportHalves {reader, writer} = move halves
+  return NativeTransportHalves {reader: transferable(move reader), writer: transferable(move writer)}
+}
+
+fn loopback() -> Endpoint {
+  return Endpoint.make(IpAddress.V4 {value: Ipv4Address.fromOctets([127, 0, 0, 1])}, Port.fromU16(0))
+}
+
+type Socket = WebSocket<NativeTransport>
+type Errors = OriginError | NativeExchangeError | ResolverError | ConnectionError | IdentityError | NativeSocketError | UpgradeError | HandshakeError | ExchangeError | RequestError | StreamError | OutOfMemoryError
+
+// Accepts one connection and answers its handshake.
+effect fn serve(connection: Connection) -> Socket ! UpgradeError | StreamError | OutOfMemoryError ? &mut MonotonicClock {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut random = OsRandom.make()
+  let accepted = run acceptOwned(NativeTransport.plain(move connection), ExchangeLimits.defaults().head, Limits.defaults(), Options.defaults(), AcceptAll {}, Option<Instant>.none())
+    |> Effect.provideMut<Allocator>(&mut allocator) |> Effect.provideMut<Random>(&mut random)
+  return match move accepted {
+    Accepted.Upgraded {socket, ..} => move socket
+    Accepted.Rejected {..} => { fail StreamError.Truncated }
+  }
+}
+
+// Client A uses a connection that the test opened, through `handshake`.
+effect fn open(connection: Connection) -> Socket ! HandshakeError | ExchangeError | RequestError | StreamError | OutOfMemoryError ? &mut MonotonicClock | &mut Allocator | &mut Random {
+  let uri = match Uri.parse("ws://127.0.0.1/chat") {
+    Result<Uri, ParseError>.Success {value} => value
+    Result<Uri, ParseError>.Failure {..} => { fail StreamError.Truncated }
+  }
+  let origin = match Origin.fromUri(&uri) {
+    Result<Origin, OriginError>.Success {value} => value
+    Result<Origin, OriginError>.Failure {..} => { fail StreamError.Truncated }
+  }
+  let client = run Client.makeOwned(NativeTransport.plain(move connection), origin, Version.Http11, ExchangeLimits.defaults(), Option<Instant>.none())
+  let entries: [Header<'static>; 0] = []
+  let headers = match Headers.make(&entries, ExchangeLimits.defaults().head.values) {
+    Result<Headers, ValueError>.Success {value} => value
+    Result<Headers, ValueError>.Failure {..} => { fail StreamError.Truncated }
+  }
+  let opened = run handshake(move client, &uri, &headers, ClientOptions.defaults())
+  let Opened<NativeTransport> {socket, protocol} = move opened
+  drop protocol
+  return move socket
+}
+
+effect fn appendDigits(text: &mut Bytes, value: u16) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value >= 10 { run appendDigits(&mut text.*, value / 10) }
+  let digit: [u8; 1] = [u16.toU8(value % 10) + 48]
+  run Bytes.append(&mut text.*, &digit)
+  return ()
+}
+
+// Client B opens its own connection with `connect`.
+effect fn openB(port: u16) -> Socket ! Errors ? &mut MonotonicClock {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut random = OsRandom.make()
+  let mut wall = OsSystemClock.make()
+  let mut text = run Bytes.copy(b"ws://127.0.0.1:") |> Effect.provideMut<Allocator>(&mut allocator)
+  run appendDigits(&mut text, port) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Bytes.append(&mut text, b"/chat") |> Effect.provideMut<Allocator>(&mut allocator)
+  let source = match String.fromUtf8(Bytes.asSlice(&text)) {
+    Result.Success {value} => value
+    Result.Failure {..} => { fail StreamError.Truncated }
+  }
+  let uri = match Uri.parse(source) {
+    Result<Uri, ParseError>.Success {value} => value
+    Result<Uri, ParseError>.Failure {..} => { fail StreamError.Truncated }
+  }
+  let entries: [Header<'static>; 0] = []
+  let headers = match Headers.make(&entries, ExchangeLimits.defaults().head.values) {
+    Result<Headers, ValueError>.Success {value} => value
+    Result<Headers, ValueError>.Failure {..} => { fail StreamError.Truncated }
+  }
+  let opened = run connect(&uri, &headers, ClientOptions.defaults(), NativeOptions.defaults(), Option<TrustSnapshot>.none())
+    |> Effect.provideMut<Allocator>(&mut allocator) |> Effect.provideMut<Random>(&mut random) |> Effect.provideMut<SystemClock>(&mut wall)
+  let Opened<NativeTransport> {socket, protocol} = move opened
+  drop protocol
+  return move socket
+}
+
+// Forwards each text from `reader` to `writer` until the peer closes, and returns the count.
+effect fn forward(reader: ReadHalf<NativeTransport, NativeTransport>, writer: WriteHalf<NativeTransport>) -> i32 ! StreamError | OutOfMemoryError ? &mut MonotonicClock {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut random = OsRandom.make()
+  let mut owned = move reader
+  let mut count = 0
+  while true {
+    let event = run owned.readEvent(Option<Instant>.none()) |> Effect.provideMut<Allocator>(&mut allocator) |> Effect.provideMut<Random>(&mut random)
+    match event {
+      Event.Text {..} => {
+        run writer.writeText(owned.messageText(), Option<Instant>.none()) |> Effect.provideMut<Allocator>(&mut allocator) |> Effect.provideMut<Random>(&mut random)
+        count = count + 1
+      }
+      Event.Close {..} => { return count }
+      _ => { return 100 }
+    }
+  }
+  return 100
+}
+
+// Reads one text and checks it, reports it on `received`, then waits for the answer to the Close
+// that the writer sends.
+effect fn expect(reader: ReadHalf<NativeTransport, NativeTransport>, text: string<'static>, received: Sender<i32>) -> i32 ! StreamError | OutOfMemoryError ? &mut MonotonicClock {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut random = OsRandom.make()
+  let mut owned = move reader
+  let event = run owned.readEvent(Option<Instant>.none()) |> Effect.provideMut<Allocator>(&mut allocator) |> Effect.provideMut<Random>(&mut random)
+  match event {
+    Event.Text {..} => {
+      if owned.messageText() != text { return 2 }
+    }
+    _ => { return 1 }
+  }
+  drop run received.send(0)
+  let closing = run owned.readEvent(Option<Instant>.none()) |> Effect.provideMut<Allocator>(&mut allocator) |> Effect.provideMut<Random>(&mut random)
+  return match closing {
+    Event.Close {..} => 0
+    _ => 3
+  }
+}
+
+effect fn root() -> i32 ! Errors | TaskIdExhaustedError | Cancelled ? &mut Scheduler | &mut MonotonicClock {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut random = OsRandom.make()
+  let mut listener = run listen(loopback(), ListenOptions.defaults())
+  let bound = match listener.boundAddress() {
+    BoundAddress.Tcp {endpoint} => endpoint
+    _ => { return 1 }
+  }
+  // Client A connects and shakes hands while the server answers in a fiber.
+  let a = run connectResolvedOwned(&[bound], ConnectOptions.defaults(), Option<Instant>.none())
+  let acceptedA = run accept(&mut listener, Option<Instant>.none())
+  let serverA = run Fiber<Socket, UpgradeError | StreamError | OutOfMemoryError>.forkChild(serve(acceptedA.intoConnection()))
+  let clientA = run open(move a) |> Effect.provideMut<Allocator>(&mut allocator) |> Effect.provideMut<Random>(&mut random)
+  let socketA = run serverA.join()
+  // Client B opens its own connection with `connect` in a fiber, while the server accepts it.
+  let clientOpen = run Fiber<Socket, Errors>.forkChild(openB(bound.port().value()))
+  let acceptedB = run accept(&mut listener, Option<Instant>.none())
+  let socketB = run serve(acceptedB.intoConnection())
+  let clientB = run clientOpen.join()
+
+  let Split<NativeTransport, NativeTransport> {reader: serverReaderA, writer: serverWriterA} = run split(move socketA) |> Effect.provideMut<Allocator>(&mut allocator)
+  let Split<NativeTransport, NativeTransport> {reader: serverReaderB, writer: serverWriterB} = run split(move socketB) |> Effect.provideMut<Allocator>(&mut allocator)
+  let Split<NativeTransport, NativeTransport> {reader: clientReaderA, writer: clientWriterA} = run split(move clientA) |> Effect.provideMut<Allocator>(&mut allocator)
+  let Split<NativeTransport, NativeTransport> {reader: clientReaderB, writer: clientWriterB} = run split(move clientB) |> Effect.provideMut<Allocator>(&mut allocator)
+
+  // All four readers wait at once. The server forwards each message to the other client.
+  let forwardA = run Fiber<i32, StreamError | OutOfMemoryError>.forkChild(forward(move serverReaderA, move serverWriterB))
+  let forwardB = run Fiber<i32, StreamError | OutOfMemoryError>.forkChild(forward(move serverReaderB, move serverWriterA))
+  let channel = run Channel<i32>.make(2) |> Effect.provideMut<Allocator>(&mut allocator)
+  let Channel<i32> {sender, receiver} = move channel
+  let senderA = run sender.clone() |> Effect.provideMut<Allocator>(&mut allocator)
+  let readA = run Fiber<i32, StreamError | OutOfMemoryError>.forkChild(expect(move clientReaderA, "from b", move senderA))
+  let readB = run Fiber<i32, StreamError | OutOfMemoryError>.forkChild(expect(move clientReaderB, "from a", move sender))
+  run Fiber.yieldNow()
+  run clientWriterA.writeText("from a", Option<Instant>.none()) |> Effect.provideMut<Allocator>(&mut allocator) |> Effect.provideMut<Random>(&mut random)
+  run clientWriterB.writeText("from b", Option<Instant>.none()) |> Effect.provideMut<Allocator>(&mut allocator) |> Effect.provideMut<Random>(&mut random)
+  // Both clients close once both messages arrived, so no forward races a Close. The server reader
+  // answers each Close.
+  drop run receiver.receive()
+  drop run receiver.receive()
+  run clientWriterA.sendClose(Option<CloseData>.none(), Option<Instant>.none()) |> Effect.provideMut<Allocator>(&mut allocator) |> Effect.provideMut<Random>(&mut random)
+  run clientWriterB.sendClose(Option<CloseData>.none(), Option<Instant>.none()) |> Effect.provideMut<Allocator>(&mut allocator) |> Effect.provideMut<Random>(&mut random)
+  if (run forwardA.join()) != 1 { return 3 }
+  if (run forwardB.join()) != 1 { return 4 }
+  if (run readA.join()) != 0 { return 5 }
+  if (run readB.join()) != 0 { return 6 }
+  return 42
+}
+
+effect fn program() -> i32 ! Errors | TaskIdExhaustedError | Cancelled | StalledError {
+  let mut clock = OsMonotonicClock.make()
+  let mut scheduler = LocalScheduler.make()
+  return run scheduler.execute<i32, Errors | TaskIdExhaustedError | Cancelled>(root())
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+}
+
+// Each kind of failure exits with its own code, so a failure on one platform names its cause.
+fn streamCode(error: StreamError) -> i32 {
+  return match move error {
+    StreamError.Protocol {..} => 70
+    StreamError.Transport {..} => 71
+    StreamError.Truncated => 72
+    StreamError.PreviousFailure => 73
+  }
+}
+
+pub fn main() -> i32 {
+  let attempted = run Effect.result(program())
+  return match move attempted {
+    Result.Success {value} => value
+    Result.Failure {error} => match move error {
+      OriginError _ => 80
+      NativeExchangeError _ => 81
+      ResolverError _ => 82
+      ConnectionError _ => 83
+      IdentityError _ => 84
+      NativeSocketError _ => 85
+      UpgradeError _ => 86
+      HandshakeError _ => 87
+      ExchangeError _ => 88
+      RequestError _ => 89
+      StreamError cause => streamCode(move cause)
+      OutOfMemoryError _ => 94
+      TaskIdExhaustedError _ => 95
+      Cancelled _ => 96
+      StalledError _ => 97
+    }
+  }
+}

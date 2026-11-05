@@ -142,7 +142,7 @@ pub fn main() -> i32 {
 
 Import as `NativeSocket` with `import silk.net.socket_native { NativeSocket }`.
 
-Public declarations: 33.
+Public declarations: 34.
 
 <a id="ConnectionPhase"></a>
 
@@ -1742,6 +1742,36 @@ effect<'call> fn use<'call>(
 
 Serves the connection in `view`, with `context`.
 
+<a id="ConnectionHalves"></a>
+
+## `ConnectionHalves`
+
+```silk
+pub struct ConnectionHalves
+```
+
+The two halves of a connection, from [`Connection.split`](#Connection.impl.split).
+
+<a id="ConnectionHalves.reader"></a>
+
+### Field `reader`
+
+```silk
+pub reader: Connection
+```
+
+The half to read from.
+
+<a id="ConnectionHalves.writer"></a>
+
+### Field `writer`
+
+```silk
+pub writer: Connection
+```
+
+The half to write to.
+
 <a id="Connection.impl"></a>
 
 ## Implementation `Connection`
@@ -1759,6 +1789,26 @@ pub fn phase(self: &Self) -> ConnectionPhase
 ```
 
 Returns the state of the connection.
+
+<a id="Connection.impl.split"></a>
+
+### Method `split`
+
+```silk
+pub effect fn split(self: Self) -> ConnectionHalves ! OutOfMemoryError ? &mut Allocator
+```
+
+Splits the connection into a half to read from and a half to write to, so that one fiber can
+wait for input while another one writes.
+
+#### Details
+Both halves are connections on the same socket, and each keeps its own state. Use `reader`
+only to read and `writer` only to write. `ByteDuplex.shutdownWrite` on `writer` closes the
+write direction of the socket. Closing or dropping a half releases it; the socket closes when
+both halves are closed or dropped.
+
+#### Errors
+`OutOfMemoryError` if the shared socket cannot be allocated. The connection is then closed.
 
 <a id="Connection.impl.close"></a>
 
