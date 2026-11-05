@@ -74,7 +74,7 @@ import silk.num.f32
 import silk.num.f64
 import silk.text.format { Format, ParseError }
 import silk.json.output { JsonOptions, JsonOutput }
-import silk.json.scanner { JsonError, JsonReason, JsonScanner, JsonToken }
+import silk.json.scanner { JsonError, JsonReason, JsonScanner, JsonSyntax, JsonToken, MAX_DEPTH }
 import silk.json.codec { Decode, Deserialize, JsonCodec, Serialize }
 import silk.json.text { JsonText }
 import silk.core.option { Option }
@@ -82,11 +82,17 @@ import silk.core.ownership { Copy }
 import silk.core.result { Result }
 import silk.text.string { String }
 import silk.num.i64
+import silk.num.u32
 import silk.num.u64
 import silk.num.u8
 import silk.num.usize
 import silk.collections.list { List }
 import silk.io.writer { Writer, WriterError }
+import silk.core.effect { Effect }
+import silk.collections.slice { Slice }
+import silk.simd.simd
+import silk.simd.mask16
+import silk.simd.u8x16
 
 /// One key and value of a JSON object.
 pub struct JsonEntry {
@@ -191,15 +197,14 @@ impl Json {
   ///   nesting is deeper than 64, or if content follows the value. The partial tree is dropped.
   /// - `OutOfMemoryError` if the `Allocator` cannot supply the tree.
   pub effect fn parse(bytes: &[u8]) -> Value ! JsonError | OutOfMemoryError ? &mut Allocator {
-    let mut scanner = JsonScanner.make(bytes)
+    let mut cursor = TreeCursor { index: usize.ZERO, depth: usize.ZERO, failed: false }
     let mut scratch = Scratch { values: List<Value>.make(), entries: List<JsonEntry>.make() }
-    let first = run nextToken(&mut scanner)
-    let document = run parseValue(&mut scanner, &mut scratch, first, bytes.length)
-    let tail = run nextToken(&mut scanner)
-    match move tail {
-      JsonToken.EndOfInput => { return move document }
-      _ => { fail inputError(JsonReason.TrailingContent, bytes.length) }
+    let document = run treeValue(bytes, &mut cursor, &mut scratch)
+    if !cursor.failed && JsonSyntax.skipWhitespace(bytes, cursor.index) == bytes.length {
+      return move document
     }
+    drop document
+    return run parseScanned(bytes)
   }
 
   /// Reads `bytes` as one complete JSON document of type `T`. It does not allocate.
@@ -341,7 +346,12 @@ impl Json {
   /// # Errors
   ///
   /// - `JsonError` if the nesting is deeper than 64.
-  /// - `WriterError` if the `Writer` fails. Bytes that it accepted before the failure stay written.
+  /// - `WriterError` if the `Writer` fails.
+  ///
+  /// # Gotchas
+  ///
+  /// The text goes to the `Writer` in pieces of up to 4 KiB. After a failure, the `Writer` holds
+  /// only the pieces passed to it before the failure.
   pub effect fn write(document: &Value) -> () ! JsonError | WriterError ? &mut Writer {
     let options = JsonOptions.compact()
     return run Json.writeWith(document, &options)
@@ -353,10 +363,17 @@ impl Json {
   /// # Errors
   ///
   /// - `JsonError` if the nesting is deeper than the limit in `options`.
-  /// - `WriterError` if the `Writer` fails. Bytes that it accepted before the failure stay written.
+  /// - `WriterError` if the `Writer` fails.
+  ///
+  /// # Gotchas
+  ///
+  /// The text goes to the `Writer` in pieces of up to 4 KiB. After a failure, the `Writer` holds
+  /// only the pieces passed to it before the failure.
   pub effect fn writeWith(document: &Value, options: &JsonOptions)
     -> () ! JsonError | WriterError ? &mut Writer {
-    return run writeNode(document, options)
+    let mut buffer = OutputBuffer { bytes: [0; 4096], length: usize.ZERO }
+    run writeNode(document, options, &mut buffer)
+    return run flushOutput(&mut buffer)
   }
 
   /// Returns the value of member `key` of an object. Returns an absent option if `self` is not an
@@ -478,6 +495,21 @@ impl Deserialize for Value {
     let end = JsonScanner.length(&scanner.*)
     let mut scratch = Scratch { values: List<Value>.make(), entries: List<JsonEntry>.make() }
     return run parseValue(&mut scanner.*, &mut scratch, first, end)
+  }
+}
+
+
+// Parses `bytes` token by token with `JsonScanner`, which checks the grammar and reports the first
+// error where it is. `Json.parse` uses it only for documents that its own parser rejects.
+effect fn parseScanned(bytes: &[u8]) -> Value ! JsonError | OutOfMemoryError ? &mut Allocator {
+  let mut scanner = JsonScanner.make(bytes)
+  let mut scratch = Scratch { values: List<Value>.make(), entries: List<JsonEntry>.make() }
+  let first = run nextToken(&mut scanner)
+  let document = run parseValue(&mut scanner, &mut scratch, first, bytes.length)
+  let tail = run nextToken(&mut scanner)
+  match move tail {
+    JsonToken.EndOfInput => { return move document }
+    _ => { fail inputError(JsonReason.TrailingContent, bytes.length) }
   }
 }
 
@@ -670,47 +702,544 @@ fn containsKey(entries: &List<JsonEntry>, from: usize, key: string) -> bool {
   return false
 }
 
-effect fn writeNode(document: &Value, options: &JsonOptions)
+// Where the tree parser of `Json.parse` is in the document. `failed` is set when the parser finds
+// anything that is not valid JSON, and the parser then returns at once without a useful value.
+struct TreeCursor {
+  index: usize,
+  depth: usize,
+  failed: bool,
+}
+
+// `true` if the bytes of `bytes` at `at` are `word`.
+fn wordAt(bytes: &[u8], at: usize, word: &[u8]) -> bool {
+  if bytes.length - at < word.length { return false }
+  let mut index = usize.ZERO
+  while index < word.length {
+    if bytes[at + index] != word[index] { return false }
+    index = index + usize.ONE
+  }
+  return true
+}
+
+// Parses the value that starts after whitespace at `cursor.index`, and moves `cursor.index` after it.
+effect fn treeValue(bytes: &[u8], cursor: &mut TreeCursor, scratch: &mut Scratch)
+  -> Value ! JsonError | OutOfMemoryError ? &mut Allocator {
+  run treeItem(bytes, &mut cursor.*, &mut scratch.*)
+  if cursor.failed { return Value.Null }
+  return match List<Value>.pop(&mut scratch.values) {
+    Option<Value>.Some { value } => move value
+    Option<Value>.None => Value.Null
+  }
+}
+
+// Parses the value that starts after whitespace at `cursor.index` onto the end of `scratch.values`,
+// and moves `cursor.index` after it. Each kind of value is built in its place in the list, so
+// nothing reads it back through a copy just after it is written. `treeMember` has the same cases.
+effect fn treeItem(bytes: &[u8], cursor: &mut TreeCursor, scratch: &mut Scratch)
+  -> () ! JsonError | OutOfMemoryError ? &mut Allocator {
+  let at = JsonSyntax.skipWhitespace(bytes, cursor.index)
+  if at >= bytes.length { return markFailed(&mut cursor.*) }
+  let byte = bytes[at]
+  if byte == 34 {
+    let text = run treeString(bytes, &mut cursor.*, at)
+    if cursor.failed { return () }
+    return run List<Value>.append(&mut scratch.values, Value.String { text: move text })
+  }
+  if byte == 45 || (byte >= 48 && byte <= 57) {
+    let number = run treeNumber(bytes, &mut cursor.*, at)
+    if cursor.failed { return () }
+    return run List<Value>.append(&mut scratch.values, Value.Number { value: number })
+  }
+  if byte == 91 {
+    let values = run treeArray(bytes, &mut cursor.*, &mut scratch.*, at + usize.ONE)
+    if cursor.failed { return () }
+    return run List<Value>.append(&mut scratch.values, Value.Array { values: move values })
+  }
+  if byte == 123 {
+    let entries = run treeObject(bytes, &mut cursor.*, &mut scratch.*, at + usize.ONE)
+    if cursor.failed { return () }
+    return run List<Value>.append(&mut scratch.values, Value.Object { entries: move entries })
+  }
+  if byte == 116 && wordAt(bytes, at, b"true") {
+    cursor.index = at + 4
+    return run List<Value>.append(&mut scratch.values, Value.Bool { value: true })
+  }
+  if byte == 102 && wordAt(bytes, at, b"false") {
+    cursor.index = at + 5
+    return run List<Value>.append(&mut scratch.values, Value.Bool { value: false })
+  }
+  if byte == 110 && wordAt(bytes, at, b"null") {
+    cursor.index = at + 4
+    return run List<Value>.append(&mut scratch.values, Value.Null)
+  }
+  return markFailed(&mut cursor.*)
+}
+
+// Parses the value at `at`, after whitespace, as the member `key` onto the end of
+// `scratch.entries`, and moves `cursor.index` after it. The cases are those of `treeItem`.
+effect fn treeMember(bytes: &[u8], cursor: &mut TreeCursor, scratch: &mut Scratch, at: usize, key: String)
+  -> () ! JsonError | OutOfMemoryError ? &mut Allocator {
+  let byte = bytes[at]
+  if byte == 34 {
+    let text = run treeString(bytes, &mut cursor.*, at)
+    if cursor.failed { return () }
+    return run List<JsonEntry>.append(&mut scratch.entries,
+      JsonEntry { key: move key, value: Value.String { text: move text } })
+  }
+  if byte == 45 || (byte >= 48 && byte <= 57) {
+    let number = run treeNumber(bytes, &mut cursor.*, at)
+    if cursor.failed { return () }
+    return run List<JsonEntry>.append(&mut scratch.entries,
+      JsonEntry { key: move key, value: Value.Number { value: number } })
+  }
+  if byte == 91 {
+    let values = run treeArray(bytes, &mut cursor.*, &mut scratch.*, at + usize.ONE)
+    if cursor.failed { return () }
+    return run List<JsonEntry>.append(&mut scratch.entries,
+      JsonEntry { key: move key, value: Value.Array { values: move values } })
+  }
+  if byte == 123 {
+    let entries = run treeObject(bytes, &mut cursor.*, &mut scratch.*, at + usize.ONE)
+    if cursor.failed { return () }
+    return run List<JsonEntry>.append(&mut scratch.entries,
+      JsonEntry { key: move key, value: Value.Object { entries: move entries } })
+  }
+  if byte == 116 && wordAt(bytes, at, b"true") {
+    cursor.index = at + 4
+    return run List<JsonEntry>.append(&mut scratch.entries, JsonEntry { key: move key, value: Value.Bool { value: true } })
+  }
+  if byte == 102 && wordAt(bytes, at, b"false") {
+    cursor.index = at + 5
+    return run List<JsonEntry>.append(&mut scratch.entries, JsonEntry { key: move key, value: Value.Bool { value: false } })
+  }
+  if byte == 110 && wordAt(bytes, at, b"null") {
+    cursor.index = at + 4
+    return run List<JsonEntry>.append(&mut scratch.entries, JsonEntry { key: move key, value: Value.Null })
+  }
+  return markFailed(&mut cursor.*)
+}
+
+// The decoded string whose quote is at `at`, with `cursor.index` moved after it. Sets
+// `cursor.failed` instead when the string does not end, and the result is then empty.
+@inlineAlways
+effect fn treeString(bytes: &[u8], cursor: &mut TreeCursor, at: usize)
+  -> String ! JsonError | OutOfMemoryError ? &mut Allocator {
+  let mut escaped = false
+  let after = JsonSyntax.stringEnd(bytes, at + usize.ONE, &mut escaped)
+  if after == usize.ZERO {
+    markFailed(&mut cursor.*)
+    return String.make()
+  }
+  cursor.index = after
+  let decoded = run JsonText.decode(Slice.view<u8>(bytes, at, after - at), at, escaped)
+  return unsafe String.fromBytesUnchecked(move decoded)
+}
+
+fn markFailed(cursor: &mut TreeCursor) -> () {
+  cursor.failed = true
+}
+
+// Appends the decimal digits from `at` on to `significand`, wrapping past 20 digits, and returns
+// the index after them. Reads 8 bytes at a time: the digits before the first other byte are
+// converted as one word.
+@inlineAlways
+fn digitRun(bytes: &[u8], at: usize, significand: &mut u64) -> usize {
+  let mut index = at
+  while index + 8 <= bytes.length {
+    let lanes = Slice.view<u8>(bytes, index, 8)
+    let mut word: u64 = 0
+    let mut lane = usize.ZERO
+    while lane < 8 {
+      word = u64.bitOr(word, u64.shiftLeft(u8.toU64(lanes[lane]), usize.toU64(lane * 8)))
+      lane = lane + usize.ONE
+    }
+    // A byte is a digit when its high nibble is 3 and adding 6 keeps it there. A carry out of a
+    // byte that is not a digit only reaches the bytes after it.
+    let high = u64.bitXor(u64.bitAnd(word, 0xF0F0F0F0F0F0F0F0), 0x3030303030303030)
+    let carried = u64.bitXor(u64.bitAnd(u64.wrappingAdd(word, 0x0606060606060606), 0xF0F0F0F0F0F0F0F0),
+      0x3030303030303030)
+    let stops = u64.bitOr(high, carried)
+    if stops == 0 {
+      significand.* = u64.wrappingAdd(u64.wrappingMultiply(significand.*, 100000000), eightDigitValue(word))
+      index = index + 8
+    } else {
+      let count = u64.toUsize(u64.shiftRight(u32.toU64(u64.trailingZeros(stops)), 3))
+      if count != usize.ZERO {
+        // Moving the digits to the top of the word and filling below with zero digits.
+        let shift = usize.toU64(64 - count * 8)
+        let aligned = u64.bitOr(u64.shiftLeft(word, shift), u64.shiftRight(0x3030303030303030, 64 - shift))
+        significand.* = u64.wrappingAdd(u64.wrappingMultiply(significand.*, SMALL_POWERS_OF_TEN[count]),
+          eightDigitValue(aligned))
+      }
+      return index + count
+    }
+  }
+  while index < bytes.length {
+    let digit = u8.wrappingSubtract(bytes[index], 48)
+    if digit > 9 { break }
+    significand.* = u64.wrappingAdd(u64.wrappingMultiply(significand.*, 10), u8.toU64(digit))
+    index = index + usize.ONE
+  }
+  return index
+}
+
+const SMALL_POWERS_OF_TEN: [u64; 8] = [1, 10, 100, 1000, 10000, 100000, 1000000, 10000000]
+
+// The value of the 8 ASCII digits of `word`, the first digit in the lowest byte. Pairs, then
+// quads, then the whole are combined with multiplies; no lane overflows into the next.
+@inlineAlways
+fn eightDigitValue(word: u64) -> u64 {
+  let digits = u64.wrappingSubtract(word, 0x3030303030303030)
+  let pairs = u64.wrappingAdd(u64.wrappingMultiply(digits, 10), u64.shiftRight(digits, 8))
+  let low = u64.wrappingMultiply(u64.bitAnd(pairs, 0x000000FF000000FF), 4294967296000100)
+  let high = u64.wrappingMultiply(u64.bitAnd(u64.shiftRight(pairs, 16), 0x000000FF000000FF), 42949672960001)
+  return u64.shiftRight(u64.wrappingAdd(low, high), 32)
+}
+
+// The number at `at`, with `cursor.index` moved after it. Sets `cursor.failed` instead when it is
+// not valid, and the result is then any number.
+@inlineAlways
+effect fn treeNumber(bytes: &[u8], cursor: &mut TreeCursor, at: usize) -> JsonNumber ! JsonError {
+  let mut index = at
+  let negative = bytes[index] == 45
+  if negative { index = index + usize.ONE }
+  let digitsStart = index
+  let mut significand: u64 = 0
+  if index < bytes.length && bytes[index] == 48 {
+    index = index + usize.ONE
+  } else {
+    index = digitRun(bytes, index, &mut significand)
+    if index == digitsStart { return numberFailed(&mut cursor.*) }
+  }
+  let mut digitCount = index - digitsStart
+  let mut fractionCount = usize.ZERO
+  let mut float = false
+  if index < bytes.length && bytes[index] == 46 {
+    index = index + usize.ONE
+    let fractionStart = index
+    index = digitRun(bytes, index, &mut significand)
+    fractionCount = index - fractionStart
+    if fractionCount == usize.ZERO { return numberFailed(&mut cursor.*) }
+    digitCount = digitCount + fractionCount
+    float = true
+  }
+  let mut exponent: i64 = 0
+  if index < bytes.length && (bytes[index] == 101 || bytes[index] == 69) {
+    index = index + usize.ONE
+    let mut exponentNegative = false
+    if index < bytes.length && (bytes[index] == 43 || bytes[index] == 45) {
+      exponentNegative = bytes[index] == 45
+      index = index + usize.ONE
+    }
+    let exponentStart = index
+    while index < bytes.length {
+      let digit = u8.wrappingSubtract(bytes[index], 48)
+      if digit > 9 { break }
+      // Any larger exponent is far outside `f64` already, and the cap keeps it from overflowing.
+      if exponent < 1000000000000 { exponent = exponent * 10 + u8.toI64(digit) }
+      index = index + usize.ONE
+    }
+    if index == exponentStart { return numberFailed(&mut cursor.*) }
+    if exponentNegative { exponent = -exponent }
+    float = true
+  }
+  cursor.index = index
+  if digitCount > 19 {
+    // The scanner checks what follows the number before it converts it, so the errors match.
+    if JsonSyntax.numberEnd(bytes, at) != index { return numberFailed(&mut cursor.*) }
+    return run convertNumber(Slice.view<u8>(bytes, at, index - at), at)
+  }
+  if !float {
+    if !negative {
+      if significand <= 9223372036854775807 {
+        return JsonNumber.Integer { value: u64.toI64(significand) }
+      }
+      return JsonNumber.Unsigned { value: significand }
+    }
+    if significand != 0 && significand <= 9223372036854775807 {
+      return JsonNumber.Integer { value: 0 - u64.toI64(significand) }
+    }
+    if significand == 9223372036854775808 {
+      return JsonNumber.Integer { value: i64.MIN }
+    }
+  }
+  let mut value = Format.f64FromDecimal(significand, exponent - usize.toI64(fractionCount))
+  // The scanner path reports the error, after it checks what follows the number.
+  if !f64.isFinite(value) { return numberFailed(&mut cursor.*) }
+  if negative { value = -value }
+  return JsonNumber.Float { value: value }
+}
+
+fn numberFailed(cursor: &mut TreeCursor) -> JsonNumber {
+  cursor.failed = true
+  return JsonNumber.Integer { value: 0 }
+}
+
+// Parses the rest of the array whose `[` is before `start` and returns its elements. Sets
+// `cursor.failed` instead when it is not valid, and the result is then empty.
+effect fn treeArray(bytes: &[u8], cursor: &mut TreeCursor, scratch: &mut Scratch, start: usize)
+  -> List<Value> ! JsonError | OutOfMemoryError ? &mut Allocator {
+  if cursor.depth == MAX_DEPTH { return failedList<Value>(&mut cursor.*) }
+  let mut at = JsonSyntax.skipWhitespace(bytes, start)
+  if at < bytes.length && bytes[at] == 93 {
+    cursor.index = at + usize.ONE
+    return List<Value>.make()
+  }
+  cursor.depth = cursor.depth + usize.ONE
+  cursor.index = at
+  let mark = List<Value>.length(&scratch.values)
+  while true {
+    run treeItem(bytes, &mut cursor.*, &mut scratch.*)
+    if cursor.failed { return List<Value>.make() }
+    at = JsonSyntax.skipWhitespace(bytes, cursor.index)
+    if at >= bytes.length { break }
+    let byte = bytes[at]
+    cursor.index = at + usize.ONE
+    if byte == 93 {
+      cursor.depth = cursor.depth - usize.ONE
+      return run List<Value>.splitOff(&mut scratch.values, mark)
+    }
+    if byte != 44 { break }
+  }
+  return failedList<Value>(&mut cursor.*)
+}
+
+// Parses the rest of the object whose `{` is before `start` and returns its members. Sets
+// `cursor.failed` instead when it is not valid, and the result is then empty.
+effect fn treeObject(bytes: &[u8], cursor: &mut TreeCursor, scratch: &mut Scratch, start: usize)
+  -> List<JsonEntry> ! JsonError | OutOfMemoryError ? &mut Allocator {
+  if cursor.depth == MAX_DEPTH { return failedList<JsonEntry>(&mut cursor.*) }
+  let mut at = JsonSyntax.skipWhitespace(bytes, start)
+  if at < bytes.length && bytes[at] == 125 {
+    cursor.index = at + usize.ONE
+    return List<JsonEntry>.make()
+  }
+  cursor.depth = cursor.depth + usize.ONE
+  let mark = List<JsonEntry>.length(&scratch.entries)
+  while true {
+    if at >= bytes.length || bytes[at] != 34 { break }
+    let mut escaped = false
+    let after = JsonSyntax.stringEnd(bytes, at + usize.ONE, &mut escaped)
+    if after == usize.ZERO { break }
+    let decoded = run JsonText.decode(Slice.view<u8>(bytes, at, after - at), at, escaped)
+    let key = unsafe String.fromBytesUnchecked(move decoded)
+    if containsKey(&scratch.entries, mark, String.view(&key)) { break }
+    at = JsonSyntax.skipWhitespace(bytes, after)
+    if at >= bytes.length || bytes[at] != 58 { break }
+    at = JsonSyntax.skipWhitespace(bytes, at + usize.ONE)
+    if at >= bytes.length { break }
+    run treeMember(bytes, &mut cursor.*, &mut scratch.*, at, move key)
+    if cursor.failed { return List<JsonEntry>.make() }
+    at = JsonSyntax.skipWhitespace(bytes, cursor.index)
+    if at >= bytes.length { break }
+    let byte = bytes[at]
+    cursor.index = at + usize.ONE
+    if byte == 125 {
+      cursor.depth = cursor.depth - usize.ONE
+      return run List<JsonEntry>.splitOff(&mut scratch.entries, mark)
+    }
+    if byte != 44 { break }
+    at = JsonSyntax.skipWhitespace(bytes, cursor.index)
+  }
+  return failedList<JsonEntry>(&mut cursor.*)
+}
+
+fn failedList<T>(cursor: &mut TreeCursor) -> List<T> {
+  cursor.failed = true
+  return List<T>.make()
+}
+
+// The writer collects output here and passes it to the ambient `Writer` in large pieces, so that
+// each comma, bracket, and number costs a copy instead of a `Writer` call.
+struct OutputBuffer {
+  bytes: [u8; 4096],
+  length: usize,
+}
+
+const OUTPUT_CAPACITY: usize = 4096
+
+effect fn outputWrite(self: &mut OutputBuffer, values: &[u8]) -> () ! WriterError {
+  if values.length > OUTPUT_CAPACITY - self.length { fail Writer.failure() }
+  Slice.copyInto<u8>(&mut self.bytes, self.length, values)
+  self.length = self.length + values.length
+}
+
+effect fn outputFlush(self: &mut OutputBuffer) -> () ! WriterError { return () }
+
+impl Writer for OutputBuffer {
+  writeAll: OutputBuffer.outputWrite
+  flush: OutputBuffer.outputFlush
+}
+
+effect fn flushOutput(buffer: &mut OutputBuffer) -> () ! WriterError ? &mut Writer {
+  if buffer.length == usize.ZERO { return () }
+  run Writer.writeAll(Slice.view<u8>(&buffer.bytes, usize.ZERO, buffer.length))
+  buffer.length = usize.ZERO
+}
+
+// Makes room for `size` more bytes, which is at most `OUTPUT_CAPACITY`.
+@inlineAlways
+effect fn reserveOutput(buffer: &mut OutputBuffer, size: usize) -> () ! WriterError ? &mut Writer {
+  if size > OUTPUT_CAPACITY - buffer.length { run flushOutput(&mut buffer) }
+}
+
+// Appends one byte that `reserveOutput` made room for.
+@inlineAlways
+fn pushOutput(buffer: &mut OutputBuffer, byte: u8) -> () {
+  buffer.bytes[buffer.length] = byte
+  buffer.length = buffer.length + usize.ONE
+}
+
+@inlineAlways
+effect fn literalOutput(buffer: &mut OutputBuffer, text: &[u8]) -> () ! WriterError ? &mut Writer {
+  run reserveOutput(&mut buffer, text.length)
+  Slice.copyInto<u8>(&mut buffer.bytes, buffer.length, text)
+  buffer.length = buffer.length + text.length
+}
+
+// An escaped byte takes at most 6 bytes, so a string of up to this many bytes always fits in an
+// empty buffer with its quotes.
+const BUFFERED_STRING_LIMIT: usize = 680
+
+effect fn stringOutput(buffer: &mut OutputBuffer, text: string) -> () ! WriterError ? &mut Writer {
+  let size = String.byteLength(text)
+  if size > BUFFERED_STRING_LIMIT {
+    run flushOutput(&mut buffer)
+    return run JsonOutput.writeString(text)
+  }
+  run reserveOutput(&mut buffer, size * 6 + 2)
+  if plainStringOutput(&mut buffer, String.utf8Bytes(text)) { return () }
+  return run JsonOutput.writeString(text) |> Effect.provideMut<Writer>(&mut buffer)
+}
+
+// Appends `bytes` in quotes if none of them needs an escape, and returns `true`. Otherwise
+// appends nothing and returns `false`. `reserveOutput` made room for the text.
+@inlineAlways
+fn plainStringOutput(buffer: &mut OutputBuffer, bytes: &[u8]) -> bool {
+  let start = buffer.length
+  pushOutput(&mut buffer, 34)
+  let mut index = usize.ZERO
+  static if simd.hardware() {
+    let quote = u8x16.splat(34)
+    let backslash = u8x16.splat(92)
+    let space = u8x16.splat(32)
+    // Each block of 16 is stored whole. When it holds a byte to escape, the bytes after that
+    // byte are written over or left past the end of the output.
+    while index + 16 <= bytes.length {
+      let lanes = u8x16.load(bytes, index)
+      u8x16.store(&mut buffer.bytes, buffer.length, lanes)
+      let stops = u8x16.lanesEqual(lanes, quote) | u8x16.lanesEqual(lanes, backslash) |
+        u8x16.lanesLess(lanes, space)
+      if mask16.any(stops) {
+        buffer.length = start
+        return false
+      }
+      buffer.length = buffer.length + 16
+      index = index + 16
+    }
+  }
+  while index < bytes.length {
+    let byte = bytes[index]
+    if byte == 34 || byte == 92 || byte < 32 {
+      buffer.length = start
+      return false
+    }
+    pushOutput(&mut buffer, byte)
+    index = index + usize.ONE
+  }
+  pushOutput(&mut buffer, 34)
+  return true
+}
+
+// Compact output, the common case, stays inline in the loops of `writeNode`.
+@inlineAlways
+effect fn separatorOutput(buffer: &mut OutputBuffer, options: &JsonOptions, first: bool)
+  -> () ! WriterError ? &mut Writer {
+  if options.indent == usize.ZERO {
+    if !first {
+      run reserveOutput(&mut buffer, usize.ONE)
+      pushOutput(&mut buffer, 44)
+    }
+    return ()
+  }
+  return run indentedSeparatorOutput(&mut buffer, options, first)
+}
+
+effect fn indentedSeparatorOutput(buffer: &mut OutputBuffer, options: &JsonOptions, first: bool)
+  -> () ! WriterError ? &mut Writer {
+  run flushOutput(&mut buffer)
+  return run JsonOutput.separator(options, first)
+}
+
+effect fn lineOutput(buffer: &mut OutputBuffer, options: &JsonOptions) -> () ! WriterError ? &mut Writer {
+  if options.indent == usize.ZERO { return () }
+  run flushOutput(&mut buffer)
+  return run JsonOutput.line(options)
+}
+
+effect fn colonOutput(buffer: &mut OutputBuffer, options: &JsonOptions) -> () ! WriterError ? &mut Writer {
+  run reserveOutput(&mut buffer, 2)
+  pushOutput(&mut buffer, 58)
+  if options.indent != usize.ZERO { pushOutput(&mut buffer, 32) }
+}
+
+// The longest number text: 20 digits and a sign for an integer, 24 bytes for a float.
+const NUMBER_ROOM: usize = 32
+
+effect fn writeNode(document: &Value, options: &JsonOptions, buffer: &mut OutputBuffer)
   -> () ! JsonError | WriterError ? &mut Writer {
   return match &document.* {
-    Value.Null => run Writer.writeAll(b"null")
+    Value.Null => run literalOutput(&mut buffer, b"null")
     Value.Bool { value } => {
-      if value { return run Writer.writeAll(b"true") }
-      return run Writer.writeAll(b"false")
+      if value { return run literalOutput(&mut buffer, b"true") }
+      return run literalOutput(&mut buffer, b"false")
     }
-    Value.Number { value } => match value {
-      JsonNumber.Integer { value: integer } => run Format.display<i64>(&integer)
-      JsonNumber.Unsigned { value: integer } => run Format.display<u64>(&integer)
-      JsonNumber.Float { value: float } => run JsonOutput.writeFloat(float)
+    Value.Number { value } => {
+      run reserveOutput(&mut buffer, NUMBER_ROOM)
+      return match value {
+        JsonNumber.Integer { value: integer } => {
+          buffer.length = Format.writeI64Display(integer, &mut buffer.bytes, buffer.length)
+        }
+        JsonNumber.Unsigned { value: integer } => {
+          buffer.length = Format.writeU64Display(integer, &mut buffer.bytes, buffer.length)
+        }
+        JsonNumber.Float { value: float } => {
+          // `writeFloat` reports the error for a value that JSON cannot hold.
+          if !f64.isFinite(float) {
+            return run JsonOutput.writeFloat(float) |> Effect.provideMut<Writer>(&mut buffer)
+          }
+          buffer.length = Format.writeF64Debug(float, &mut buffer.bytes, buffer.length)
+        }
+      }
     }
-    Value.String { text } => run JsonOutput.writeString(String.view(&text))
+    Value.String { text } => run stringOutput(&mut buffer, String.view(&text))
     Value.Array { values } => {
       let child = run JsonOptions.child(options)
       let items = List<Value>.asSlice(&values)
-      run Writer.writeAll(b"[")
+      run literalOutput(&mut buffer, b"[")
       let mut index = usize.ZERO
       while index < items.length {
-        run JsonOutput.separator(&child, index == usize.ZERO)
-        run writeNode(&items[index], &child)
+        run separatorOutput(&mut buffer, &child, index == usize.ZERO)
+        run writeNode(&items[index], &child, &mut buffer)
         index = index + usize.ONE
       }
-      if items.length != usize.ZERO { run JsonOutput.line(options) }
-      return run Writer.writeAll(b"]")
+      if items.length != usize.ZERO { run lineOutput(&mut buffer, options) }
+      return run literalOutput(&mut buffer, b"]")
     }
     Value.Object { entries } => {
       let child = run JsonOptions.child(options)
       let members = List<JsonEntry>.asSlice(&entries)
-      run Writer.writeAll(b"{")
+      run literalOutput(&mut buffer, b"{")
       let mut index = usize.ZERO
       while index < members.length {
-        run JsonOutput.separator(&child, index == usize.ZERO)
-        run JsonOutput.writeString(String.view(&members[index].key))
-        run JsonOutput.colon(&child)
-        run writeNode(&members[index].value, &child)
+        run separatorOutput(&mut buffer, &child, index == usize.ZERO)
+        run stringOutput(&mut buffer, String.view(&members[index].key))
+        run colonOutput(&mut buffer, &child)
+        run writeNode(&members[index].value, &child, &mut buffer)
         index = index + usize.ONE
       }
-      if members.length != usize.ZERO { run JsonOutput.line(options) }
-      return run Writer.writeAll(b"}")
+      if members.length != usize.ZERO { run lineOutput(&mut buffer, options) }
+      return run literalOutput(&mut buffer, b"}")
     }
   }
 }

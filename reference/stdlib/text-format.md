@@ -1027,6 +1027,94 @@ the same sign. The result does not depend on floating-point arithmetic of the ta
 `NaN`, `Infinity`, and `inf` are not accepted, so the output of `Display` for a value that is
 not finite does not parse back.
 
+<a id="Format.impl.f64FromDecimal"></a>
+
+### Associated function `f64FromDecimal`
+
+```silk
+pub fn f64FromDecimal(significand: u64, exponent10: i64) -> f64
+```
+
+Returns the `f64` nearest to `significand` times ten to the power `exponent10`, with ties to
+even.
+
+#### When to use
+
+Use it in a parser that has already read the digits of a decimal number, such as a JSON
+parser, so that the text is not read a second time. Use [`Format.f64Value`](#Format.impl.f64Value) to read the text.
+
+#### Details
+
+The result is the same as `f64Value` gives for the digits of `significand` followed by
+`e` and `exponent10`. A value too large for `f64` becomes infinity, and a value too small
+becomes zero. The result does not depend on floating-point arithmetic of the target.
+
+<a id="Format.impl.writeU64Display"></a>
+
+### Associated function `writeU64Display`
+
+```silk
+pub fn writeU64Display(value: u64, bytes: &mut [u8], at: usize) -> usize
+```
+
+Writes the text that `Display` writes for `value` with no options into `bytes` at `at`, and
+returns the index after it.
+
+#### When to use
+
+Use it in an encoder that collects its output in a byte buffer, such as a JSON writer, to skip
+the `Formatter` and the `Writer` call for each number.
+
+#### Gotchas
+
+Traps if fewer than 20 bytes of `bytes` follow `at`.
+
+<a id="Format.impl.writeI64Display"></a>
+
+### Associated function `writeI64Display`
+
+```silk
+pub fn writeI64Display(value: i64, bytes: &mut [u8], at: usize) -> usize
+```
+
+Writes the text that `Display` writes for `value` with no options into `bytes` at `at`, and
+returns the index after it. A negative value starts with `-`.
+
+#### When to use
+
+Use it in an encoder that collects its output in a byte buffer, such as a JSON writer, to skip
+the `Formatter` and the `Writer` call for each number.
+
+#### Gotchas
+
+Traps if fewer than 20 bytes of `bytes` follow `at`.
+
+<a id="Format.impl.writeF64Debug"></a>
+
+### Associated function `writeF64Debug`
+
+```silk
+pub fn writeF64Debug(value: f64, bytes: &mut [u8], at: usize) -> usize
+```
+
+Writes the text that `Debug` writes for `value` with no options into `bytes` at `at`, and
+returns the index after it.
+
+#### When to use
+
+Use it in an encoder that collects its output in a byte buffer, such as a JSON writer, to skip
+the `Formatter` and the `Writer` call for each number.
+
+#### Details
+
+The text is the shortest decimal that parses back to the same bits, and a whole number ends in
+`.0`, as `1.0` and `-0.0`. `NaN` writes `NaN`, and infinity writes `Infinity` or `-Infinity`.
+The text is at most 25 bytes long.
+
+#### Gotchas
+
+Traps if fewer than 25 bytes of `bytes` follow `at`.
+
 <a id="Format.impl.f32Value"></a>
 
 ### Associated function `f32Value`
