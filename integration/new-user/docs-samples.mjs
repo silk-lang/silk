@@ -14,20 +14,28 @@ import { cpus } from 'node:os'
 import { join, relative } from 'node:path'
 import { freshHome, install, read, sharedHome, silk, userEnv, write } from './lib.mjs'
 
+// Programs that need more than the page's labelled files: a C object, a running server, another
+// package made with `silk add` or fetched from git, or a library with no `main`. The scenario tests
+// cover these flows. Each entry names its page and a line of the sample's source, not a line
+// number, so the entry still finds the sample after the page around it changes.
+const contextual = [
+  ['reference/26-unsafe-code-and-c-interop.md', 'unsafe extern "C" fn scale(values: simd<f32, 4>, factor: f32) -> simd<f32, 4>', 'links a C object built by hand'],
+  ['projects/08-build-outputs-and-native-linking.md', 'unsafe extern "C" fn scale(value: i32) -> i32', 'links a C object built by hand'],
+  ['projects/04-dependencies.md', 'import text_utils.lib { countSpaces }', 'needs the text-utils package from `silk add`'],
+  ['projects/04-dependencies.md', 'import vector.length { length }', 'needs the vector package from a git dependency'],
+  ['tools/05-writing-documentation.md', '/// The area of `rect`, in square units.', 'a library module, shown for its doc comments'],
+  ['tools/06-doc-tests-and-reference-generation.md', '/// import shapes.Circle { circumference }', 'a library module, shown for its doc tests'],
+  ['guides/09-http-client.md', 'effect fn session() -> ()', 'talks to a local HTTP server'],
+  ['guides/16-testing-with-providers.md', 'pub effect fn main() -> () ! FileError | OutOfMemoryError | ByteIoError | LogError | NativeSocketError {', 'a test module beside the package'],
+]
+
+// Why `sample` needs more than the page shows, or undefined when it runs on its own.
+export function context(sample) {
+  return contextual.find(([page, line]) => sample.id.startsWith(`${page}:`) && sample.source.split('\n').some((text) => text.trim() === line))?.[2]
+}
+
 // Sections a reader follows. content/std is generated from the stdlib's own doc comments, which
 // `silk doctest --stdlib` already covers.
-// Programs that need more than the page's labelled files: a C object, a running server, another
-// package made with `silk add`, or a library with no `main`. The scenario tests cover these flows.
-const contextual = new Map([
-  ['reference/26-unsafe-code-and-c-interop.md:323', 'links a C object built by hand'],
-  ['projects/08-build-outputs-and-native-linking.md:157', 'links a C object built by hand'],
-  ['projects/04-dependencies.md:42', 'needs the text-utils package from `silk add`'],
-  ['tools/05-writing-documentation.md:88', 'a library module, shown for its doc comments'],
-  ['tools/06-doc-tests-and-reference-generation.md:87', 'a library module, shown for its doc tests'],
-  ['guides/09-http-client.md:21', 'talks to a local HTTP server'],
-  ['guides/16-testing-with-providers.md:112', 'a test module beside the package'],
-])
-
 const sections = ['get-started', 'book', 'reference', 'projects', 'tools', 'guides', 'appendix']
 
 export function fences(markdown) {
@@ -166,7 +174,8 @@ export function errorLines(text) {
 }
 
 async function check(h, sample, index) {
-  if (contextual.has(sample.id)) return { ...sample, outcome: 'needs-context', detail: contextual.get(sample.id) }
+  const needs = context(sample)
+  if (needs !== undefined) return { ...sample, outcome: 'needs-context', detail: needs }
   const result = await checkSample(h, sample, index)
   // Pages should show code as `silk format` writes it. Only programs that check are formatted.
   if (['checked', 'ran', 'output-matches'].includes(result.outcome)) {
