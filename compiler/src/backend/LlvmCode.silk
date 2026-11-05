@@ -21,6 +21,7 @@ import backend.LoweringPlan {
   Callable,
   Lane,
   Step,
+  CopyLeaves,
   ParameterLanes,
   Representation,
   booleanRepresentation,
@@ -33,6 +34,7 @@ import backend.LoweringPlan {
   layoutOf,
   offsetAlignment,
   ownedParameter,
+  copyLeaves,
   parameterLanes,
   passedIndirectly,
   pointerRepresentation,
@@ -3181,14 +3183,79 @@ effect fn emitScalarRvalue(
   }
 }
 
+// Stores a scalar, or copies an aggregate as bytes; `storeCopy` copies a small record by fields.
 effect fn storeValue(writer: &mut Writer, address: &Address, value: &Value) -> ()
 ! OutOfMemoryError ? &mut Allocator {
-  return run storeCopy(&mut writer.*, address, value, false)
+  return run storeBytes(&mut writer.*, address, value, false)
 }
 
-// `distinct` says the value's bytes never overlap the address, so a fast-path function may copy an
-// aggregate with `llvm.memcpy` (see `Writer.fastPath`).
-effect fn storeCopy(writer: &mut Writer, address: &Address, value: &Value, distinct: bool) -> ()
+// Stores `value` at `address`; an aggregate value is the address of its bytes. A small record
+// copies field by field (`copyLeaves`), any other aggregate as bytes (`storeBytes`). `distinct`
+// says the value's bytes never overlap the address, so a fast-path function may copy an aggregate
+// with `llvm.memcpy` (see `Writer.fastPath`). A fast-path function keeps the byte copy, which is
+// one call where the fields would be many instructions.
+effect fn storeCopy(writer: &mut Writer, function: &MirFunction, target: &Target, layouts: &TypeLayouts,
+  address: &Address, value: &Value, distinct: bool) -> () ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if address.representation.aggregate && address.representation.unionAlignment == usize.ZERO && !writer.fastPath {
+    let facts = run layoutOf(layouts, &address.ty, function, Location.generated())
+    // An injected member's slot names the union's type (`emitAssign`), whose size differs.
+    if facts.size == address.representation.size {
+      let plan = run copyLeaves(layouts, &address.ty, facts, target, function, Location.generated())
+      if plan.count != usize.ZERO { return run storeLeaves(&mut writer.*, address, value, facts.alignment, &plan) }
+    }
+  }
+  return run storeBytes(&mut writer.*, address, value, distinct)
+}
+
+// Copies a record by its fields (`copyLeaves`): every field is loaded before any is stored, so
+// overlapping places stay correct. Both places hold the record, so the source has its alignment.
+// Two adjacent 8-byte integers or floats move as one i128, which LLVM splits back into two word
+// moves: as two loads and stores, the SLP vectorizer would merge them into the 16-byte vector move
+// the field copy avoids (see `storePackedUnion`). Pointers keep their own type, which a vector of
+// one integer and one pointer cannot hold, so their provenance survives the copy.
+effect fn storeLeaves(writer: &mut Writer, address: &Address, value: &Value, alignment: usize, plan: &CopyLeaves) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let wide = integerRepresentation(128, false)
+  let mut lanes = plan.lanes
+  let mut offsets = plan.offsets
+  let mut count = usize.ZERO
+  let mut at = usize.ZERO
+  while at < plan.count {
+    lanes[count] = plan.lanes[at]
+    offsets[count] = plan.offsets[at]
+    if at + usize.ONE < plan.count && pairedWord(plan.lanes[at]) && pairedWord(plan.lanes[at + usize.ONE])
+      && plan.offsets[at + usize.ONE] == plan.offsets[at] + 8 {
+      lanes[count] = wide
+      at = at + usize.ONE
+    }
+    count = count + usize.ONE
+    at = at + usize.ONE
+  }
+  let mut loaded: [u64; 8] = [0, 0, 0, 0, 0, 0, 0, 0]
+  at = usize.ZERO
+  while at < count {
+    let mut source = value.value
+    if offsets[at] != usize.ZERO { source = run byteOffset(&mut writer.*, value.value, offsets[at]) }
+    loaded[at] = run loadOf(&mut writer.*, lanes[at], source, offsetAlignment(alignment, offsets[at]))
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < count {
+    let mut destination = address.value
+    if offsets[at] != usize.ZERO { destination = run byteOffset(&mut writer.*, address.value, offsets[at]) }
+    run storeOf(&mut writer.*, loaded[at], destination, offsetAlignment(address.alignment, offsets[at]))
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Whether a field copy pairs `lane` with an adjacent one into an i128 (`storeLeaves`).
+fn pairedWord(lane: Representation) -> bool {
+  return !lane.pointer && lane.bits == 64
+}
+
+// Stores a scalar, or copies an aggregate's bytes.
+effect fn storeBytes(writer: &mut Writer, address: &Address, value: &Value, distinct: bool) -> ()
 ! OutOfMemoryError ? &mut Allocator {
   if address.representation.unit { return () }
   // Source and destination may overlap, as when a member is injected into a slot of its own place.
@@ -3360,7 +3427,7 @@ effect fn emitAssign(
       let selectedField = run projectField(&mut writer.*, function, target, layouts,
         &address, operands[fieldAt].index, span)
       let operand = run emitOperand(&mut writer.*, function, target, layouts, &operands[fieldAt].value)
-      run storeCopy(&mut writer.*, &selectedField, &operand, separate(destination, &operands[fieldAt].value, ordinary))
+      run storeCopy(&mut writer.*, function, target, layouts, &selectedField, &operand, separate(destination, &operands[fieldAt].value, ordinary))
       fieldAt = fieldAt + usize.ONE
     }
     return ()
@@ -3381,7 +3448,7 @@ effect fn emitAssign(
     let whole = run layoutOf(layouts, &address.ty, function, span)
     let room = whole.size - facts.payloadOffset
     if run storeWidened(&mut writer.*, &slot, &operand, room) { return () }
-    run storeCopy(&mut writer.*, &slot, &operand, separate(destination, &member, ordinary))
+    run storeCopy(&mut writer.*, function, target, layouts, &slot, &operand, separate(destination, &member, ordinary))
     return ()
   }
   if let Rvalue.Variant {tag, fields} = &value.* {
@@ -3404,7 +3471,7 @@ effect fn emitAssign(
         widened = run storeWidened(&mut writer.*, &slot, &operand, room)
       }
       if !widened {
-        run storeCopy(&mut writer.*, &slot, &operand, separate(destination, &operands[fieldAt].value, ordinary))
+        run storeCopy(&mut writer.*, function, target, layouts, &slot, &operand, separate(destination, &operands[fieldAt].value, ordinary))
       }
       fieldAt = fieldAt + usize.ONE
     }
@@ -3443,7 +3510,7 @@ effect fn emitAssign(
     Rvalue.Use {value: used} => separate(destination, &used, ordinary)
     _ => false
   }
-  run storeCopy(&mut writer.*, &address, &selected, distinct)
+  run storeCopy(&mut writer.*, function, target, layouts, &address, &selected, distinct)
   return ()
 }
 
@@ -3531,13 +3598,13 @@ effect fn emitReturn(
   if fallible {
     let output = Address {ty: Shared<Type>.clone(&function.result), value: writer.out,
       alignment: resultLayout.alignment, representation: kind}
-    run storeCopy(&mut writer.*, &output, &value, true)
+    run storeCopy(&mut writer.*, function, target, layouts, &output, &value, true)
     return run returnStatus(&mut writer.*, false)
   }
   if kind.aggregate || (!cExport(function) && passedIndirectly(kind)) {
     let output = Address {ty: Shared<Type>.clone(&function.result), value: writer.out,
       alignment: resultLayout.alignment, representation: kind}
-    run storeCopy(&mut writer.*, &output, &value, true)
+    run storeCopy(&mut writer.*, function, target, layouts, &output, &value, true)
     return run Module.retVoid(&mut writer.*.module)
   }
   return run Module.ret(&mut writer.*.module, value.value)
@@ -3681,7 +3748,7 @@ effect fn emitFail(writer: &mut Writer, function: &MirFunction, target: &Target,
     let value = run emitOperand(&mut writer.*, function, target, layouts, &failed)
     let output = Address {ty: Shared<Type>.clone(&locals[local].ty), value: writer.failure,
       alignment: failureLayout.alignment, representation: kind}
-    run storeCopy(&mut writer.*, &output, &value, true)
+    run storeCopy(&mut writer.*, function, target, layouts, &output, &value, true)
   }
   return run returnStatus(&mut writer.*, true)
 }
@@ -4387,7 +4454,7 @@ effect fn emitForeignStaticRead(
     representation: output.representation,
   }
   let value = run loadAddress(&mut writer.*, &object)
-  return run storeValue(&mut writer.*, &output, &value)
+  return run storeCopy(&mut writer.*, function, target, layouts, &output, &value, false)
 }
 
 // A placeholder function type for a symbol used only as an address.
@@ -4921,7 +4988,7 @@ effect fn emitEntrySlots(
     }
     let address = Address {ty: Shared<Type>.clone(&parameters[local]), value: slot,
       alignment: parameterLayout.alignment, representation: kind}
-    run storeCopy(&mut writer.*, &address, &Value {scalar: kind, value: input}, true)
+    run storeCopy(&mut writer.*, function, target, layouts, &address, &Value {scalar: kind, value: input}, true)
     local = local + usize.ONE
   }
   return run emitHiddenStores(&mut writer.*, function)
@@ -6152,7 +6219,7 @@ effect fn emitEnter(writer: &mut Writer, function: &MirFunction, target: &Target
       }
       let address = Address {ty: Shared<Type>.clone(&parameters[at]), value: slot,
         alignment: offsetAlignment(stepping.coroutine.alignment, offset), representation: kind}
-      run storeValue(&mut writer.*, &address, &Value {scalar: kind, value: input})
+      run storeCopy(&mut writer.*, function, target, layouts, &address, &Value {scalar: kind, value: input}, false)
     }
     at = at + usize.ONE
   }
@@ -6380,7 +6447,7 @@ effect fn emitStepReturn(writer: &mut Writer, function: &MirFunction, target: &T
     let value = run emitOperand(&mut writer.*, function, target, layouts, &returned)
     let output = Address {ty: Shared<Type>.clone(&function.result), value: writer.out,
       alignment: resultLayout.alignment, representation: kind}
-    run storeValue(&mut writer.*, &output, &value)
+    run storeCopy(&mut writer.*, function, target, layouts, &output, &value, false)
   }
   let mut failed = Option<bool>.none()
   if failureLocal(function) != usize.MAX { failed = Option<bool>.some(false) }
@@ -6403,7 +6470,7 @@ effect fn emitStepFail(writer: &mut Writer, function: &MirFunction, target: &Tar
     let value = run emitOperand(&mut writer.*, function, target, layouts, &failedValue)
     let output = Address {ty: Shared<Type>.clone(&locals[local].ty), value: writer.failure,
       alignment: failureLayout.alignment, representation: kind}
-    run storeValue(&mut writer.*, &output, &value)
+    run storeCopy(&mut writer.*, function, target, layouts, &output, &value, false)
   }
   return run emitPop(&mut writer.*, target, stepping, Option<bool>.some(true))
 }
