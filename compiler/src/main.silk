@@ -3137,7 +3137,9 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, cacheDirectory: Opti
   let mut cache = Option<CacheFile>.none()
   if let Option<&Path>.Some {value: directory} = &cacheDirectory {
     if let Option<Bytes>.Some {value: stamped} = &compiler {
-      cache = run SemanticCache.openPrefetched(&mut store, &request, directory, Bytes.asSlice(&stamped), false, true, move prefetched)
+      let none = List<Path>.make()
+      cache = run SemanticCache.openPrefetched(&mut store, &request, directory, Bytes.asSlice(&stamped), false, true, move prefetched,
+        List<Path>.asSlice(&none))
     }
   }
   let selectedRuntime: Option<&ModuleId> = match &runtime {
@@ -5446,6 +5448,24 @@ effect fn writeDiagnostics(target: &Target, json: bool, diagnostics: &Bytes, pro
 // module and the imports of every reached one. Diagnostics go to standard error in `format`,
 // after a `[<target>]` header in the human format, as the TypeScript `silk check` writes them.
 // The status is 0, 1 when a declaration is rejected, or 2 for an unsupported construct.
+// The cache directories of the packages `project` depends on directly, below its output
+// directory, which a workspace shares among its members. A dependency's check sweeps the packages
+// it depends on, so its own image holds theirs.
+effect fn dependencyCaches(project: &Project, sources: &ModuleSources) -> List<Path> ! OutOfMemoryError ? &mut Allocator {
+  let graph = run ModuleSourceFiles.packageGraph(sources)
+  let names = run PackageGraph.directDependencies(&graph, ModuleSourceFiles.entry(sources))
+  let listed = List<Bytes>.asSlice(&names)
+  let mut directories = List<Path>.make()
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if let Option<Path>.Some {value} = move run SemanticCache.directory(Projects.outputDirectory(project), Bytes.asSlice(&listed[at])) {
+      run List<Path>.append(&mut directories, move value)
+    }
+    at = at + usize.ONE
+  }
+  return move directories
+}
+
 effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Option<Path>, json: bool, roots: bool, abandon: bool, settings: &ProgressSettings) -> ProjectArtifact
 ! ApplicationError | InitialProfileProblem | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
@@ -5496,7 +5516,9 @@ effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Op
   let mut cache = Option<CacheFile>.none()
   if let Option<Bytes>.Some {value: stamped} = &compiler {
     if let Option<Path>.Some {value: directory} = &cacheHome {
-      cache = run SemanticCache.openPrefetched(&mut store, &request, &directory, Bytes.asSlice(&stamped), false, false, move prefetched)
+      let dependencies = run dependencyCaches(project, &sources)
+      cache = run SemanticCache.openPrefetched(&mut store, &request, &directory, Bytes.asSlice(&stamped), false, false, move prefetched,
+        List<Path>.asSlice(&dependencies))
     }
   }
   let mut status = 0
@@ -6134,6 +6156,7 @@ effect fn checkProject(working: &Path, command: CheckCommand) -> i32
     }
   }
   let projects = List<Project>.asSlice(&selection.projects)
+  let order = run dependencyOrder(projects)
   // JSON diagnostics share standard error, so a JSON check reports no progress.
   let mut settings = silentProgress()
   let mut replaying = false
@@ -6145,7 +6168,15 @@ effect fn checkProject(working: &Path, command: CheckCommand) -> i32
   let mut at = usize.ZERO
   while at < projects.length {
     if selection.members { settings.position = at + usize.ONE }
-    let checked = run memberStatus(run Effect.result(checkOne(&projects[at], &options, &standardLibrary, json, roots, &settings, &edits, differential, at + usize.ONE == projects.length)))
+    let member = List<usize>.get(&order, at)
+    // Each member interns its own applications: no type outlives its check, so a long workspace
+    // check does not keep every earlier member's keys.
+    let mut memberTypes = TypeTable.make()
+    let checked = run memberStatus(run Effect.result(checkOne(&projects[member], &options, &standardLibrary, json, roots, &settings, &edits, differential, at + usize.ONE == projects.length)
+      |> Effect.provideMut<Types>(&mut memberTypes)))
+    drop memberTypes
+    // The member's store is gone; hand its free pages back before the next member allocates.
+    HeapRelease.release()
     if checked == 0 { succeeded = succeeded + usize.ONE }
     status = worse(status, checked)
     at = at + usize.ONE
@@ -6155,6 +6186,51 @@ effect fn checkProject(working: &Path, command: CheckCommand) -> i32
 }
 
 // Checks one project's planned compilations, as `checkProject` does for each selected project.
+// The order a check visits `projects`: each after the selected packages it depends on, and
+// otherwise as listed, so a package checked for the first time finds the caches its
+// dependencies' checks just wrote (`dependencyCaches`).
+effect fn dependencyOrder(projects: &[Project]) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
+  let mut order = List<usize>.make()
+  let mut state = List<usize>.make()
+  run List<usize>.appendRepeated(&mut state, usize.ZERO, projects.length)
+  let mut at = usize.ZERO
+  while at < projects.length {
+    run visitInOrder(projects, at, &mut state, &mut order)
+    at = at + usize.ONE
+  }
+  return move order
+}
+
+// Appends `at` to `order` after the projects it depends on; `state` marks each project unseen
+// (0), being visited (1) or placed (2), so a dependency cycle keeps the listed order.
+effect fn visitInOrder(projects: &[Project], at: usize, state: &mut List<usize>, order: &mut List<usize>) -> () ! OutOfMemoryError ? &mut Allocator {
+  if List<usize>.get(&state.*, at) != usize.ZERO { return () }
+  List<usize>.set(&mut state.*, at, usize.ONE)
+  // A manifest that no longer parses orders as listed; its own check reports it.
+  let parsed = match move run Effect.result(Projects.document(&projects[at])) {
+    Result<TomlValue, TomlError | OutOfMemoryError>.Success {value} => Option<TomlValue>.some(move value)
+    Result<TomlValue, TomlError | OutOfMemoryError>.Failure {error} => match move error {
+      TomlError failure => {
+        drop failure
+        Option<TomlValue>.none()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  if let Option<TomlValue>.Some {value: document} = &parsed {
+    let mut other = usize.ZERO
+    while other < projects.length {
+      let name = run dependencyName(Projects.name(&projects[other]))
+      if other != at && hasDependency(&document, Bytes.asSlice(&name)) {
+        run visitInOrder(projects, other, &mut state.*, &mut order.*)
+      }
+      other = other + usize.ONE
+    }
+  }
+  List<usize>.set(&mut state.*, at, 2)
+  run List<usize>.append(&mut order.*, at)
+}
+
 effect fn checkOne(project: &Project, options: &ProjectOptions, standardLibrary: &Option<Path>, json: bool, roots: bool, packages: &ProgressSettings, edits: &Option<List<Edit>>, differential: bool, last: bool) -> i32
 ! ApplicationError | InitialProfileProblem | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types | &mut Writer {
