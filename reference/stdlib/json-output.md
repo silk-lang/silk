@@ -188,6 +188,22 @@ number.
   `"NaN"` or `"01"`. Nothing is written.
 - `WriterError` if the `Writer` fails. Bytes that it accepted before the failure stay written.
 
+<a id="JsonOutput.impl.writeFloat"></a>
+
+### Associated function `writeFloat`
+
+```silk
+pub effect fn writeFloat(value: f64) -> () ! JsonError | WriterError ? &mut Writer
+```
+
+Writes `value` as a JSON number: the shortest decimal that reads back as the same `f64`, with
+`.0` added when that decimal has no fraction and no exponent, so it reads back as a float.
+
+#### Errors
+
+- `JsonError` with reason `InvalidNumber` if `value` is not finite. Nothing is written.
+- `WriterError` if the `Writer` fails. Bytes that it accepted before the failure stay written.
+
 <a id="JsonOutput.impl.separator"></a>
 
 ### Associated function `separator`
