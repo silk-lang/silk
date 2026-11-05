@@ -16,8 +16,8 @@ Fibers: handles to child tasks, with typed outcomes and one observer each.
 | [`race`](#Fiber.impl.race) | Take the result of whichever of two children finishes first, and cancel the other |
 | [`yieldNow`](#Fiber.impl.yieldNow) | Let other ready tasks run before the current task continues |
 
-Run the root program with `silk.concurrency.local_scheduler`, which provides the `Scheduler` service.
-For fibers that run in parallel on native threads, use `silk.concurrency.thread_pool`.
+Run the root program with `silk.concurrency.local_scheduler`, which provides the `Scheduler`
+service. For fibers that run in parallel on native threads, use `silk.concurrency.thread_pool`.
 
 ## Details
 A [`Fiber`](#Fiber) has one completion observer. [`await`](#Fiber.impl.await) and [`join`](#Fiber.impl.join) consume the Fiber, so a Fiber
@@ -381,9 +381,9 @@ should then be cancelled.
 
 #### Details
 
-If both tasks had already finished before the call, `self` wins. The other Fiber is returned unobserved and still
-running, so the caller can await, interrupt, or drop it. Like [`await`](#Fiber.impl.await), a failure or a
-cancellation of the winner is data in its `Outcome`.
+If both tasks had already finished before the call, `self` wins. The other Fiber is returned
+unobserved and still running, so the caller can await, interrupt, or drop it. Like [`await`](#Fiber.impl.await),
+a failure or a cancellation of the winner is data in its `Outcome`.
 
 <a id="Fiber.impl.race"></a>
 

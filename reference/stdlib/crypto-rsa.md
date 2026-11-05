@@ -21,8 +21,8 @@ functions hash the message, so give the message, not its digest.
 
 ## Gotchas
 A valid signature proves only that the holder of the private key signed the message. It does not
-prove that you can trust the key. To check a certificate chain, use the `silk.tls.trust_*` modules.
-Keys with an exponent other than 65537, or shorter than 2048 bits, are rejected.
+prove that you can trust the key. To check a certificate chain, use the `silk.tls.trust_*`
+modules. Keys with an exponent other than 65537, or shorter than 2048 bits, are rejected.
 
 ## Examples
 ### Reject a key outside the profile
@@ -232,9 +232,9 @@ pub fn fromCertificateKey(algorithmDer: &[u8], keyDer: &[u8], unusedBits: u8) ->
 
 Returns the key in the `subjectPublicKeyInfo` of a certificate.
 
-Pass the algorithm DER, the BIT STRING bytes, and the unused-bit count from `silk.tls.certificate`
-as they are. The algorithm must be `rsaEncryption` with no parameters or NULL. The key must
-pass the same checks as [`RsaPublicKey.fromComponents`](#RsaPublicKey.impl.fromComponents).
+Pass the algorithm DER, the BIT STRING bytes, and the unused-bit count from
+`silk.tls.certificate` as they are. The algorithm must be `rsaEncryption` with no parameters
+or NULL. The key must pass the same checks as [`RsaPublicKey.fromComponents`](#RsaPublicKey.impl.fromComponents).
 
 #### Errors
 - `InvalidEncoding` if the DER is not valid.

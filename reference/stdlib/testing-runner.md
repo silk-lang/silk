@@ -23,8 +23,8 @@ The host passes these options. Each takes one value:
 The runner checks the complete plan before any test body runs.
 
 On a native target, a failed test's report goes to standard output under the test's name: the
-message of a failed expectation, an unhandled error, or a fatal trap, with the call path that led
-to it.
+message of a failed expectation, an unhandled error, or a fatal trap, with the call path that
+led to it.
 
 With `--silk-test-progress`, the runner writes a progress record (see `silk.testing.exchange`)
 before each test body runs, and removes the file when every test has finished. If the file

@@ -14,9 +14,9 @@ provide `InMemoryLogger` instead.
 ## Details
 `StderrLogger` writes one line for each message: the level, a colon and a space, the formatted
 message, and a newline, such as `warning: disk 91% full`. It holds the standard error lock of
-`silk.io.writer_native` for the whole line, so lines of different threads do not mix. It formats into a
-buffer of 64 bytes on the stack. Thus a short line is one system call, and the logger does not
-allocate.
+`silk.io.writer_native` for the whole line, so lines of different threads do not mix. It formats
+into a buffer of 64 bytes on the stack. Thus a short line is one system call, and the logger
+does not allocate.
 
 `StderrLogger.make` colors the level name when standard error is a terminal, the `NO_COLOR`
 environment variable is not set or is empty, and `TERM` is not `dumb`. It checks once, at the
@@ -29,8 +29,9 @@ or newline, has no lock, and does not allocate.
 `LogError` with code 3 if the write fails. Part of the message can be written already.
 
 ## Gotchas
-- The providers exist on Windows x86_64 MSVC, WASI, Darwin on x86_64 or aarch64, and Linux with GNU libc
-  on x86_64 or aarch64. Windows needs no CRT and automatic color enables console ANSI processing.
+- The providers exist on Windows x86_64 MSVC, WASI, Darwin on x86_64 or aarch64, and Linux with
+  GNU libc on x86_64 or aarch64. Windows needs no CRT and automatic color enables console ANSI
+  processing.
 - A message template for `StderrLogger` must not end with a newline. The logger adds one.
 - `StderrLogger.make` reads the environment at the first message. A change to `NO_COLOR` after
   that has no effect on the same logger.

@@ -5,17 +5,18 @@
 UUID values and constructors for versions 1 through 8, with RFC 9562 byte order.
 
 ## When to use
-Use [`Uuid.v4`](#Uuid.impl.v4) for random identifiers and [`Uuid.v7`](#Uuid.impl.v7) for identifiers ordered by Unix milliseconds.
-Use [`Uuid.v3`](#Uuid.impl.v3) or [`Uuid.v5`](#Uuid.impl.v5) for names in an existing namespace.
+Use [`Uuid.v4`](#Uuid.impl.v4) for random identifiers and [`Uuid.v7`](#Uuid.impl.v7) for identifiers ordered by Unix
+milliseconds. Use [`Uuid.v3`](#Uuid.impl.v3) or [`Uuid.v5`](#Uuid.impl.v5) for names in an existing namespace.
 
 ## Details
-Values store 16 bytes in network order. Parsing preserves every bit, including unknown versions and variants.
-Constructors set the RFC variant. Version 2 uses the legacy DCE Security layout, outside RFC 9562.
-Operations do not allocate. `formatInto` returns a borrowed text view into the supplied buffer.
+Values store 16 bytes in network order. Parsing preserves every bit, including unknown versions
+and variants. Constructors set the RFC variant. Version 2 uses the legacy DCE Security layout,
+outside RFC 9562. Operations do not allocate. `formatInto` returns a borrowed text view into the
+supplied buffer.
 
 ## Gotchas
-UUIDs are identifiers, not secrets or authorization tokens. Name hashes do not resist deliberate collisions.
-Time-based constructors do not persist a clock sequence or enforce monotonicity.
+UUIDs are identifiers, not secrets or authorization tokens. Name hashes do not resist deliberate
+collisions. Time-based constructors do not persist a clock sequence or enforce monotonicity.
 
 ## Examples
 ### Create a stable identifier for a DNS name
@@ -40,7 +41,8 @@ pub fn main() -> i32 {
 ```
 
 ## See also
-[RFC 9562](https://www.rfc-editor.org/rfc/rfc9562.html) defines the UUID layouts and namespace rules.
+[RFC 9562](https://www.rfc-editor.org/rfc/rfc9562.html) defines the UUID layouts and namespace
+rules.
 
 Import as `Uuid` with `import silk.encoding.uuid { Uuid }`.
 
@@ -56,7 +58,8 @@ pub struct Uuid
 
 A UUID as 16 bytes in network order. All bit patterns, including Nil and Max, are representable.
 
-Equality and ordering compare the unsigned bytes in network order. Version 1 is not ordered by time.
+Equality and ordering compare the unsigned bytes in network order. Version 1 is not ordered by
+time.
 
 <a id="UuidError"></a>
 
@@ -260,7 +263,8 @@ Returns the standard ISO OID namespace. Names use canonical OID text chosen by t
 pub fn namespaceX500() -> Self
 ```
 
-Returns the standard X.500 distinguished-name namespace. The caller chooses the canonical name encoding.
+Returns the standard X.500 distinguished-name namespace. The caller chooses the canonical name
+encoding.
 
 <a id="Uuid.impl.fromBytes"></a>
 
@@ -320,8 +324,8 @@ Returns the variant, including the NCS and reserved variants of Nil and Max.
 pub fn version(self: &Self) -> Option<u8>
 ```
 
-Returns the version nibble for the RFC variant, including reserved version numbers.
-Otherwise, returns `None`.
+Returns the version nibble of an RFC-variant UUID, including reserved version numbers, or
+`None` for another variant.
 
 <a id="Uuid.impl.parse"></a>
 
@@ -333,8 +337,8 @@ pub fn parse(text: string) -> Result<Self, UuidError>
 
 Parses exactly 36 hexadecimal characters with hyphens at positions 8, 13, 18, and 23.
 
-Uppercase and lowercase digits are accepted. Whitespace, braces, and URN prefixes return `InvalidText`.
-All versions and variants are preserved, including Nil and Max.
+Uppercase and lowercase digits are accepted. Whitespace, braces, and URN prefixes return
+`InvalidText`. All versions and variants are preserved, including Nil and Max.
 
 <a id="Uuid.impl.parseBytes"></a>
 
@@ -346,7 +350,8 @@ pub fn parseBytes(text: &[u8]) -> Result<Self, UuidError>
 
 Parses the 36-byte ASCII UUID form, accepting both hex cases and preserving every bit.
 
-Invalid length, hex digits, or hyphen positions return `InvalidText`. Whitespace and prefixes are rejected.
+Invalid length, hex digits, or hyphen positions return `InvalidText`. Whitespace and prefixes
+are rejected.
 
 <a id="Uuid.impl.parseUrn"></a>
 
@@ -392,10 +397,12 @@ Writes lowercase `urn:uuid:` text and returns a view of the first 45 output byte
 pub fn v1(timestamp: u64, clockSequence: u16, node: [u8; 6]) -> Result<Self, UuidError>
 ```
 
-Constructs version 1 from 100-nanosecond ticks since 1582-10-15, a 14-bit sequence, and a network-order node.
+Constructs version 1 from 100-nanosecond ticks since 1582-10-15, a 14-bit sequence, and a
+network-order node.
 
-Oversized timestamp or sequence fields return their range error. The caller must prevent repeated field combinations.
-Persist the sequence across restarts and change it when the clock moves backwards. For random nodes, set bit 0 of the first byte.
+Oversized timestamp or sequence fields return their range error. The caller must prevent
+repeated field combinations. Persist the sequence across restarts and change it when the clock
+moves backwards. For random nodes, set bit 0 of the first byte.
 
 <a id="Uuid.impl.v6"></a>
 
@@ -405,10 +412,12 @@ Persist the sequence across restarts and change it when the clock moves backward
 pub fn v6(timestamp: u64, clockSequence: u16, node: [u8; 6]) -> Result<Self, UuidError>
 ```
 
-Constructs version 6 from 100-nanosecond ticks since 1582-10-15, a 14-bit sequence, and a network-order node.
+Constructs version 6 from 100-nanosecond ticks since 1582-10-15, a 14-bit sequence, and a
+network-order node.
 
-Oversized timestamp or sequence fields return their range error. The caller must prevent repeated field combinations.
-Persist the sequence across restarts and change it when the clock moves backwards. For random nodes, set bit 0 of the first byte.
+Oversized timestamp or sequence fields return their range error. The caller must prevent
+repeated field combinations. Persist the sequence across restarts and change it when the clock
+moves backwards. For random nodes, set bit 0 of the first byte.
 
 <a id="Uuid.impl.v2"></a>
 
@@ -426,9 +435,10 @@ pub fn v2(
 
 Constructs a legacy DCE version 2 UUID with a local identifier and domain 0, 1, or 2.
 
-The timestamp uses Gregorian 100-nanosecond ticks. Its low 32 bits are replaced by the identifier.
-The sequence has only 6 bits. The caller must prevent repeats within each approximately 429-second timestamp interval.
-Invalid timestamp, sequence, or domain fields return the corresponding `UuidError`.
+The timestamp uses Gregorian 100-nanosecond ticks. Its low 32 bits are replaced by the
+identifier. The sequence has only 6 bits. The caller must prevent repeats within each
+approximately 429-second timestamp interval. Invalid timestamp, sequence, or domain fields
+return the corresponding `UuidError`.
 
 <a id="Uuid.impl.v3"></a>
 
@@ -474,7 +484,8 @@ No case folding or Unicode normalization occurs. SHA-1 does not resist deliberat
 pub fn v5Bytes(namespace: &Self, name: &[u8]) -> Self
 ```
 
-Returns version 5 from SHA-1 of network-order namespace bytes followed by the exact name bytes.
+Returns version 5 from SHA-1 of network-order namespace bytes followed by the exact name
+bytes.
 
 The caller selects the canonical encoding. SHA-1 does not resist deliberate collisions.
 
@@ -487,7 +498,8 @@ pub effect fn v4() -> Self
     ? &mut Random
 ```
 
-Returns version 4 using 16 bytes from `Random`, retaining 122 random bits after version and variant substitution.
+Returns version 4 using 16 bytes from `Random`, retaining 122 random bits after version and
+variant substitution.
 
 <a id="Uuid.impl.v4FromRandom"></a>
 
@@ -497,7 +509,8 @@ Returns version 4 using 16 bytes from `Random`, retaining 122 random bits after 
 pub fn v4FromRandom(random: [u8; 16]) -> Self
 ```
 
-Constructs version 4 from 16 caller-supplied random bytes, overwriting only version and variant bits.
+Constructs version 4 from 16 caller-supplied random bytes, overwriting only version and
+variant bits.
 
 The caller must supply fresh cryptographically secure randomness for each identifier.
 
@@ -512,8 +525,9 @@ pub effect fn v7(unixMilliseconds: u64) -> Result<Self, UuidError>
 
 Returns version 7 with a 48-bit Unix millisecond timestamp and 74 bits from `Random`.
 
-An oversized timestamp returns `TimestampOutOfRange` before reading randomness.
-Calls within one millisecond are randomly ordered. Clock rollback can produce values smaller than earlier values.
+An oversized timestamp returns `TimestampOutOfRange` before reading randomness. Calls within
+one millisecond are randomly ordered. Clock rollback can produce values smaller than earlier
+values.
 
 <a id="Uuid.impl.v7FromRandom"></a>
 
@@ -525,9 +539,9 @@ pub fn v7FromRandom(unixMilliseconds: u64, random: [u8; 10]) -> Result<Self, Uui
 
 Constructs version 7 from Unix milliseconds and 10 random bytes, retaining 74 random bits.
 
-An oversized timestamp returns `TimestampOutOfRange`. The caller supplies fresh secure randomness for each identifier.
-The version replaces the first random byte's high nibble.
-The variant replaces the third byte's two high bits.
+An oversized timestamp returns `TimestampOutOfRange`. The caller supplies fresh secure
+randomness for each identifier. The version replaces the first random byte's high nibble. The
+variant replaces the third byte's two high bits.
 
 <a id="Uuid.impl.v8"></a>
 
@@ -537,9 +551,11 @@ The variant replaces the third byte's two high bits.
 pub fn v8(custom: [u8; 16]) -> Self
 ```
 
-Constructs version 8 from application-defined bytes, overwriting only the version and variant bits.
+Constructs version 8 from application-defined bytes, overwriting only the version and variant
+bits.
 
-The remaining 122 bits have no standard interpretation. The caller defines their encoding and uniqueness policy.
+The remaining 122 bits have no standard interpretation. The caller defines their encoding and
+uniqueness policy.
 
 <a id="Uuid.impl.gregorianTimestamp"></a>
 
@@ -549,10 +565,10 @@ The remaining 122 bits have no standard interpretation. The caller defines their
 pub fn gregorianTimestamp(self: &Self) -> Option<u64>
 ```
 
-Returns Gregorian 100-nanosecond ticks for RFC versions 1 and 6.
-Otherwise, returns `None`.
+Returns Gregorian 100-nanosecond ticks for RFC versions 1 and 6, or `None` otherwise.
 
-Version 2 cannot recover the original timestamp because its low 32 bits hold the local identifier.
+Version 2 cannot recover the original timestamp because its low 32 bits hold the local
+identifier.
 
 <a id="Uuid.impl.unixMilliseconds"></a>
 
@@ -562,8 +578,7 @@ Version 2 cannot recover the original timestamp because its low 32 bits hold the
 pub fn unixMilliseconds(self: &Self) -> Option<u64>
 ```
 
-Returns the Unix millisecond timestamp for RFC version 7.
-Otherwise, returns `None`.
+Returns the Unix millisecond timestamp for RFC version 7, or `None` otherwise.
 
 <a id="Uuid.impl.clockSequence"></a>
 
@@ -573,7 +588,8 @@ Otherwise, returns `None`.
 pub fn clockSequence(self: &Self) -> Option<u16>
 ```
 
-Returns the 14-bit clock sequence for RFC versions 1 and 6, or the 6-bit sequence for version 2.
+Returns the 14-bit clock sequence for RFC versions 1 and 6, or the 6-bit sequence for version
+2.
 
 Other versions and variants return `None`.
 
@@ -585,8 +601,7 @@ Other versions and variants return `None`.
 pub fn node(self: &Self) -> Option<[u8; 6]>
 ```
 
-Returns the network-order node for RFC versions 1, 2, and 6.
-Otherwise, returns `None`.
+Returns the network-order node for RFC versions 1, 2, and 6, or `None` otherwise.
 
 <a id="Uuid.impl.localId"></a>
 
@@ -596,8 +611,7 @@ Otherwise, returns `None`.
 pub fn localId(self: &Self) -> Option<u32>
 ```
 
-Returns the local identifier for RFC version 2.
-Otherwise, returns `None`.
+Returns the local identifier for RFC version 2, or `None` otherwise.
 
 <a id="Uuid.impl.localDomain"></a>
 
@@ -607,8 +621,8 @@ Otherwise, returns `None`.
 pub fn localDomain(self: &Self) -> Option<u8>
 ```
 
-Returns the local domain byte for RFC version 2, including unknown domains.
-Otherwise, returns `None`.
+Returns the local domain byte for RFC version 2, including unknown domains, or `None`
+otherwise.
 
 <a id="Uuid.impl.toV6"></a>
 
@@ -619,7 +633,7 @@ pub fn toV6(self: &Self) -> Option<Self>
 ```
 
 Converts RFC version 1 to version 6 without changing its timestamp, sequence, or node.
-Otherwise, returns `None`.
+Returns `None` for a UUID that is not RFC version 1.
 
 <a id="Uuid.impl.toV1"></a>
 
@@ -630,7 +644,7 @@ pub fn toV1(self: &Self) -> Option<Self>
 ```
 
 Converts RFC version 6 to version 1 without changing its timestamp, sequence, or node.
-Otherwise, returns `None`.
+Returns `None` for a UUID that is not RFC version 6.
 
 <a id="Uuid.impl.Equal"></a>
 

@@ -12,10 +12,11 @@ provide a fake that returns a fixed time.
 Each call reads the real-time clock of the system. A failure of the clock is a trap.
 
 ## Gotchas
-- This clock can go back when the system time is set. Use `silk.system.monotonic_clock_native` to measure
-  durations.
+- This clock can go back when the system time is set. Use `silk.system.monotonic_clock_native`
+  to measure durations.
 - On Linux, it needs glibc 2.17 or later.
-- The provider exists on WASI, Windows on x86_64, Darwin on x86_64 or aarch64, and GNU Linux on x86_64 or aarch64.
+- The provider exists on WASI, Windows on x86_64, Darwin on x86_64 or aarch64, and GNU Linux on
+  x86_64 or aarch64.
 
 ## Examples
 ### Read the time

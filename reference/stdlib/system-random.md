@@ -7,7 +7,8 @@ The `Random` effect: random bytes that are safe for secrets.
 ## When to use
 Require `&mut Random` for anything that an attacker must not guess: keys, nonces, tokens,
 passwords, and session IDs. The program provides a cryptographically secure random number
-generator. For simulations, games, and tests that must repeat, use `silk.system.insecure_random`.
+generator. For simulations, games, and tests that must repeat, use
+`silk.system.insecure_random`.
 
 ## Details
 A provider implements one operation, [`Random.fillBytes`](#Random.fillBytes), that fills a slice.

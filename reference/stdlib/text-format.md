@@ -143,8 +143,8 @@ pub fn main() -> i32 {
 
 ## See also
 - `silk.io.writer` for the `Writer` effect that receives the output.
-- `silk.io.writer_native` for `StdoutWriter` and `StderrWriter`, which write to standard output and
-  standard error.
+- `silk.io.writer_native` for `StdoutWriter` and `StderrWriter`, which write to standard output
+  and standard error.
 
 Import as `Format` with `import silk.text.format { Format }`.
 
@@ -2724,7 +2724,7 @@ impl<'a, T: Debug> Debug for &'a [T]
 effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-Writes the `Debug` form of each element, as `[1, 2, 3]`. See [`Format.debugList`](#Format.impl.debugList).
+Writes the `Debug` form of each element, as `[1, 2, 3]`. An empty slice writes `[]`.
 
 <a id="a.impl.Debug-2"></a>
 
@@ -2742,7 +2742,7 @@ impl<'a, T: Debug> Debug for &'a mut [T]
 effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-Writes the `Debug` form of each element, as `[1, 2, 3]`. See [`Format.debugList`](#Format.impl.debugList).
+Writes the `Debug` form of each element, as `[1, 2, 3]`. An empty slice writes `[]`.
 
 <a id="List.impl.Debug"></a>
 

@@ -6,7 +6,8 @@ The provider protocol that prepares child Fibers and publishes them atomically.
 
 ## When to use
 Implement [`Scheduler`](#Scheduler) to supply the task policy for `Fiber.forkChild`. Application code uses
-the Fiber operations and a provider such as `silk.concurrency.local_scheduler`, not this protocol.
+the Fiber operations and a provider such as `silk.concurrency.local_scheduler`, not this
+protocol.
 
 ## Details
 A fork has two steps:
@@ -507,8 +508,8 @@ Prepares a request to cancel one task, for the calling task to submit.
 
 The returned value carries the calling task's own mailbox and submission slot.
 `Fiber.interrupt` submits it after the exclusive service dispatch ends, and parks until the
-driver has cancelled the target. Cancelling drops the target's parked Execution, which runs its
-cancel exits, and publishes `Cancelled` to the target's Fiber.
+driver has cancelled the target. Cancelling drops the target's parked Execution, which runs
+its cancel exits, and publishes `Cancelled` to the target's Fiber.
 
 <a id="Scheduler.armDeadline"></a>
 

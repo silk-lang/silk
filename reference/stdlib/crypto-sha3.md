@@ -5,8 +5,8 @@
 Compute SHA-3 digests: SHA3-224, SHA3-256, SHA3-384, and SHA3-512 (FIPS 202).
 
 ## When to use
-Use these types when a protocol names SHA-3. For a general cryptographic hash, `silk.crypto.sha2` is
-more common. Use `silk.collections.hash` for the keys of a hash map.
+Use these types when a protocol names SHA-3. For a general cryptographic hash,
+`silk.crypto.sha2` is more common. Use `silk.collections.hash` for the keys of a hash map.
 
 ## Details
 [`Sha3_224`](#Sha3_224), [`Sha3_256`](#Sha3_256), [`Sha3_384`](#Sha3_384), and [`Sha3_512`](#Sha3_512) return 28, 32, 48, and 64 bytes. Each

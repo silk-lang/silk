@@ -5,8 +5,8 @@
 Windows `HostInput` with owned arguments and an environment snapshot in raw canonical WTF-8.
 
 ## When to use
-The Windows entry point supplies `WindowsHostInput` to application effects that require `HostInput`.
-Use `WindowsHostInput.capture` in a custom Windows runtime.
+The Windows entry point supplies `WindowsHostInput` to application effects that require
+`HostInput`. Use `WindowsHostInput.capture` in a custom Windows runtime.
 
 Import as `WindowsHostInput` with `import silk.platform.windows.host_input { WindowsHostInput }`.
 
@@ -24,10 +24,10 @@ Owned Windows arguments and environment entries, with case-insensitive environme
 
 ### Details
 
-Arguments and environment values are canonical WTF-8 bytes; lone surrogates survive.
-The snapshot does not change. Lookup uses Windows `CompareStringOrdinal` with case ignored,
-and returns the first matching entry. Hidden names such as `=C:` are retained.
-Working-directory queries return the current native Windows path as WTF-8, not a `Path` spelling.
+Arguments and environment values are canonical WTF-8 bytes; lone surrogates survive. The
+snapshot does not change. Lookup uses Windows `CompareStringOrdinal` with case ignored, and
+returns the first matching entry. Hidden names such as `=C:` are retained. Working-directory
+queries return the current native Windows path as WTF-8, not a `Path` spelling.
 
 <a id="WindowsHostInput.impl"></a>
 
@@ -45,12 +45,14 @@ impl WindowsHostInput
 pub effect fn capture() -> WindowsHostInput ! HostInputError | OutOfMemoryError ? &mut Allocator
 ```
 
-Captures the process command line and environment, releasing the OS environment block after copying.
+Captures the process command line and environment, releasing the OS environment block after
+copying.
 
 #### Details
 
 MSVC parsing preserves argument zero's special quoting rules. An empty command line gives
-one empty argument. Malformed environment entries without a name/value separator are ignored.
+one empty argument. Malformed environment entries without a name/value separator are
+ignored.
 
 #### Errors
 

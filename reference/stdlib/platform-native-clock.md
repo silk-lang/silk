@@ -5,9 +5,9 @@
 Direct calls to the clocks of the system, for the native clock providers.
 
 ## When to use
-`silk.system.system_clock_native` and `silk.system.monotonic_clock_native` use [`NativeClock`](#NativeClock). Application code uses
-those providers through the `SystemClock` and `MonotonicClock` effects, so a test can replace
-them.
+`silk.system.system_clock_native` and `silk.system.monotonic_clock_native` use [`NativeClock`](#NativeClock).
+Application code uses those providers through the `SystemClock` and `MonotonicClock` effects, so
+a test can replace them.
 
 ## Details
 Each read checks the result of the system. [`NativeClock.waitUntil`](#NativeClock.impl.waitUntil) keeps the same deadline
@@ -16,7 +16,8 @@ when a signal interrupts the wait, so the total wait does not grow.
 ## Gotchas
 - A failed call or a bad result is a trap.
 - A wait blocks the whole thread. It does not let another fiber run.
-- A call fails to compile on targets other than WASI, Windows on x86_64, Darwin on x86_64 or aarch64, and GNU Linux on x86_64 or aarch64.
+- A call fails to compile on targets other than WASI, Windows on x86_64, Darwin on x86_64 or
+  aarch64, and GNU Linux on x86_64 or aarch64.
 
 ## Examples
 ### Read the clocks
@@ -54,8 +55,9 @@ pub struct NativeClock
 The functions that read the system clocks and wait, for the native clock providers.
 
 ### When to use
-`silk.system.system_clock_native` and `silk.system.monotonic_clock_native` use it. Application code uses those
-providers through the `SystemClock` and `MonotonicClock` effects, so a test can replace them.
+`silk.system.system_clock_native` and `silk.system.monotonic_clock_native` use it. Application
+code uses those providers through the `SystemClock` and `MonotonicClock` effects, so a test can
+replace them.
 
 ### Details
 Each read checks the result of the system.
@@ -63,7 +65,8 @@ Each read checks the result of the system.
 ### Gotchas
 - A failed call or a bad result is a trap.
 - A wait blocks the whole thread. It does not let another fiber run.
-- A call fails to compile on targets other than WASI, Windows on x86_64, Darwin on x86_64 or aarch64, and GNU Linux on x86_64 or aarch64.
+- A call fails to compile on targets other than WASI, Windows on x86_64, Darwin on x86_64 or
+  aarch64, and GNU Linux on x86_64 or aarch64.
 
 <a id="NativeClock.impl"></a>
 

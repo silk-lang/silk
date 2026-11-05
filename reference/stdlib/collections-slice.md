@@ -57,8 +57,9 @@ Element types whose slices [`Slice.asBytes`](#Slice.impl.asBytes) and [`Slice.as
 ### Details
 
 Every primitive integer type and `f32` and `f64` conform. These types have no padding bytes, and
-every bit pattern of their size is a valid value, so any byte can be read from them or written to
-them. `bool` and `char` do not conform, because most bit patterns are not valid values of them.
+every bit pattern of their size is a valid value, so any byte can be read from them or written
+to them. `bool` and `char` do not conform, because most bit patterns are not valid values of
+them.
 
 ### Gotchas
 
@@ -198,9 +199,9 @@ type's own conversion instead.
 
 #### Details
 
-`T` conforms to [`ByteView`](#ByteView): every primitive integer type, `f32`, and `f64` do. The result has
-`values.length` times the size of `T` bytes and lives as long as `values`. The call does not
-copy or allocate.
+`T` conforms to [`ByteView`](#ByteView): every primitive integer type, `f32`, and `f64` do. The result
+has `values.length` times the size of `T` bytes and lives as long as `values`. The call does
+not copy or allocate.
 
 #### Gotchas
 

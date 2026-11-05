@@ -1000,8 +1000,8 @@ The pieces of a text between occurrences of a separator, read one at a time. Mak
 ### Details
 
 Each piece is a `string` view of the text that was split, with its lifetime. Read the pieces
-with [`Split.next`](#Split.impl.next), or take everything not yet read with [`Split.remainder`](#Split.impl.remainder). A `Split` does not
-allocate. It is `Copy`, so a copy reads the remaining pieces again on its own.
+with [`Split.next`](#Split.impl.next), or take everything not yet read with [`Split.remainder`](#Split.impl.remainder). A `Split` does
+not allocate. It is `Copy`, so a copy reads the remaining pieces again on its own.
 
 <a id="Split.impl.Copy"></a>
 

@@ -155,8 +155,8 @@ The caller proves that `pointer` addresses [`LANES`](#LANES) writable lanes alig
 pub fn lanesEqual(left: simd<f32, 8>, right: simd<f32, 8>) -> mask<8>
 ```
 
-Returns a mask with lane `i` set where lane `i` of `left` is equal to lane `i` of `right`. A comparison with a
-NaN lane is false.
+Returns a mask with lane `i` set where lane `i` of `left` is equal to lane `i` of `right`. A
+comparison with a NaN lane is false.
 
 <a id="lanesNotEqual"></a>
 
@@ -166,8 +166,8 @@ NaN lane is false.
 pub fn lanesNotEqual(left: simd<f32, 8>, right: simd<f32, 8>) -> mask<8>
 ```
 
-Returns a mask with lane `i` set where lane `i` of `left` is not equal to lane `i` of `right`. A NaN lane is
-not equal to any lane.
+Returns a mask with lane `i` set where lane `i` of `left` is not equal to lane `i` of `right`. A
+NaN lane is not equal to any lane.
 
 <a id="lanesLess"></a>
 
@@ -177,8 +177,8 @@ not equal to any lane.
 pub fn lanesLess(left: simd<f32, 8>, right: simd<f32, 8>) -> mask<8>
 ```
 
-Returns a mask with lane `i` set where lane `i` of `left` is less than lane `i` of `right`. A comparison with a
-NaN lane is false.
+Returns a mask with lane `i` set where lane `i` of `left` is less than lane `i` of `right`. A
+comparison with a NaN lane is false.
 
 <a id="lanesLessOrEqual"></a>
 
@@ -188,8 +188,8 @@ NaN lane is false.
 pub fn lanesLessOrEqual(left: simd<f32, 8>, right: simd<f32, 8>) -> mask<8>
 ```
 
-Returns a mask with lane `i` set where lane `i` of `left` is less than or equal to lane `i` of `right`. A comparison with a
-NaN lane is false.
+Returns a mask with lane `i` set where lane `i` of `left` is less than or equal to lane `i` of
+`right`. A comparison with a NaN lane is false.
 
 <a id="lanesGreater"></a>
 
@@ -199,8 +199,8 @@ NaN lane is false.
 pub fn lanesGreater(left: simd<f32, 8>, right: simd<f32, 8>) -> mask<8>
 ```
 
-Returns a mask with lane `i` set where lane `i` of `left` is greater than lane `i` of `right`. A comparison with a
-NaN lane is false.
+Returns a mask with lane `i` set where lane `i` of `left` is greater than lane `i` of `right`. A
+comparison with a NaN lane is false.
 
 <a id="lanesGreaterOrEqual"></a>
 
@@ -210,8 +210,8 @@ NaN lane is false.
 pub fn lanesGreaterOrEqual(left: simd<f32, 8>, right: simd<f32, 8>) -> mask<8>
 ```
 
-Returns a mask with lane `i` set where lane `i` of `left` is greater than or equal to lane `i` of `right`. A comparison with a
-NaN lane is false.
+Returns a mask with lane `i` set where lane `i` of `left` is greater than or equal to lane `i`
+of `right`. A comparison with a NaN lane is false.
 
 <a id="select"></a>
 

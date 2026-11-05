@@ -6,7 +6,8 @@ Initialization-state changes for one element slot of raw storage.
 
 ## When to use
 Use these operations with `silk.mem.raw_buffer` when you implement a container. Application code
-uses an initialized collection such as `silk.collections.list.List`, which tracks the slot states for you.
+uses an initialized collection such as `silk.collections.list.List`, which tracks the slot
+states for you.
 
 ## Details
 A slot is uninitialized or initialized. [`Slot.write`](#Slot.impl.write) changes an uninitialized slot to
@@ -64,8 +65,9 @@ The owner type of the slot operations. It has no fields and is never constructed
 
 ### Details
 
-`import silk.mem.slot { Slot }` gives access to `Slot.write` and the other operations. This struct
-is not the builtin `Slot<'storage, T>` place type that `silk.mem.raw_buffer.RawBuffer.slot` returns.
+`import silk.mem.slot { Slot }` gives access to `Slot.write` and the other operations. This
+struct is not the builtin `Slot<'storage, T>` place type that
+`silk.mem.raw_buffer.RawBuffer.slot` returns.
 
 A slot is uninitialized or initialized, and does not record its state. The container must keep
 its own record of which slots are initialized. Each operation consumes the slot selection, so

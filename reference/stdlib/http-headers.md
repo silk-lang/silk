@@ -5,8 +5,8 @@
 An ordered list of HTTP header fields, with lookup by name, copies, and formatting.
 
 ## When to use
-Use [`Headers.make`](#Headers.impl.make) to put `Header` values from `silk.http.message` in a list without a copy. Use
-[`Headers.copy`](#Headers.impl.copy) when the list must live longer than its fields. Look up fields with
+Use [`Headers.make`](#Headers.impl.make) to put `Header` values from `silk.http.message` in a list without a copy.
+Use [`Headers.copy`](#Headers.impl.copy) when the list must live longer than its fields. Look up fields with
 [`Headers.getFirst`](#Headers.impl.getFirst), [`Headers.getUnique`](#Headers.impl.getUnique), or [`Headers.getAll`](#Headers.impl.getAll).
 
 ## Details
@@ -204,8 +204,8 @@ An ordered list of header fields that borrows its fields.
 
 ### When to use
 
-Use [`Headers.make`](#Headers.impl.make) to put `Header` values from `silk.http.message` in a list without a copy. Use
-[`Headers.copy`](#Headers.impl.copy) when the list must live longer than its fields. Look up fields with
+Use [`Headers.make`](#Headers.impl.make) to put `Header` values from `silk.http.message` in a list without a copy.
+Use [`Headers.copy`](#Headers.impl.copy) when the list must live longer than its fields. Look up fields with
 [`Headers.getFirst`](#Headers.impl.getFirst), [`Headers.getUnique`](#Headers.impl.getUnique), or [`Headers.getAll`](#Headers.impl.getAll).
 
 ### Details

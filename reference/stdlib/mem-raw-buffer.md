@@ -5,14 +5,14 @@
 Typed raw storage made from an allocation, for code that implements containers.
 
 ## When to use
-Application code uses `silk.collections.list.List`, `silk.collections.bytes.Bytes`, or `silk.mem.box.Box`. Use `RawBuffer`
-only when you implement a container that keeps its own record of capacity and of which slots are
-initialized.
+Application code uses `silk.collections.list.List`, `silk.collections.bytes.Bytes`, or
+`silk.mem.box.Box`. Use `RawBuffer` only when you implement a container that keeps its own
+record of capacity and of which slots are initialized.
 
 ## Details
 A `RawBuffer<T>` holds one allocation and a count of `T` slots. It does not record which slots
-are initialized. Use [`RawBuffer.slot`](#RawBuffer.impl.slot) with the `silk.mem.slot` operations to change one slot, and
-[`RawBuffer.copy`](#RawBuffer.impl.copy), [`RawBuffer.view`](#RawBuffer.impl.view), and [`RawBuffer.viewMut`](#RawBuffer.impl.viewMut) to work on ranges.
+are initialized. Use [`RawBuffer.slot`](#RawBuffer.impl.slot) with the `silk.mem.slot` operations to change one slot,
+and [`RawBuffer.copy`](#RawBuffer.impl.copy), [`RawBuffer.view`](#RawBuffer.impl.view), and [`RawBuffer.viewMut`](#RawBuffer.impl.viewMut) to work on ranges.
 
 [`RawBuffer.slot`](#RawBuffer.impl.slot) and [`RawBuffer.fill`](#RawBuffer.impl.fill) check the count and trap outside it. The `unsafe`
 operations do not check.
@@ -64,9 +64,9 @@ The owner type of the raw buffer operations. It has no fields and is never const
 
 ### When to use
 
-Application code uses `silk.collections.list.List`, `silk.collections.bytes.Bytes`, or `silk.mem.box.Box`. Use these
-operations only when you implement a container that keeps its own record of capacity and of
-which slots are initialized.
+Application code uses `silk.collections.list.List`, `silk.collections.bytes.Bytes`, or
+`silk.mem.box.Box`. Use these operations only when you implement a container that keeps its own
+record of capacity and of which slots are initialized.
 
 ### Details
 

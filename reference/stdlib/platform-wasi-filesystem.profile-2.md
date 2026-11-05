@@ -5,12 +5,14 @@
 Descriptor-relative file operations within WASI preopened directories.
 
 ## When to use
-`OsFileSystem` selects these operations on WASI. Applications use the portable `FileSystem` service.
+`OsFileSystem` selects these operations on WASI. Applications use the portable `FileSystem`
+service.
 
 ## Details
-Every path component is opened without symbolic-link traversal. The host enforces preopen rights.
-Guest paths resolve against the longest matching preopen. A preopen named `.` represents `/`.
-Errors retain WASI errno values. Internal allocation failures become `FileError` with reason `NoSpace`.
+Every path component is opened without symbolic-link traversal. The host enforces preopen
+rights. Guest paths resolve against the longest matching preopen. A preopen named `.` represents
+`/`. Errors retain WASI errno values. Internal allocation failures become `FileError` with
+reason `NoSpace`.
 
 Import as `WasiFileSystem` with `import silk.platform.wasi.filesystem { WasiFileSystem }`.
 
@@ -108,19 +110,19 @@ one step.
 
 #### Details
 `policy` 0 replaces with `renameat`. The path can be absent, a regular file, or a symbolic
-link, which is replaced itself. A directory or another kind fails with `WrongType`. `policy` 1
-creates with `linkat`, and fails with `AlreadyExists` if any entry exists.
+link, which is replaced itself. A directory or another kind fails with `WrongType`. `policy`
+1 creates with `linkat`, and fails with `AlreadyExists` if any entry exists.
 
-The temporary name is created with `O_EXCL`. At most 128 names are tried. The temporary entry
-is removed through the open directory, not by its path again.
+The temporary name is created with `O_EXCL`. At most 128 names are tried. The temporary
+entry is removed through the open directory, not by its path again.
 
 `durability` 0 does not sync. `durability` 1 calls `fsync` on the file before it is visible,
 then on the directory after. An unsupported policy or sync fails.
 
 #### Errors
-`AtomicWriteError` has the first error and whether the new contents are visible. A failed sync
-or close of the directory reports that they are visible. A temporary entry that cannot be
-removed is reported separately with its name.
+`AtomicWriteError` has the first error and whether the new contents are visible. A failed
+sync or close of the directory reports that they are visible. A temporary entry that cannot
+be removed is reported separately with its name.
 
 <a id="WasiFileSystem.impl.syncDirectory"></a>
 
@@ -236,9 +238,9 @@ pub effect fn createUnique(
       ! FileError
 ```
 
-Creates a directory in `path` named `prefix`, `-`, and 16 hex digits of `counter`, and returns
-true. It tries at most 128 names. If the name does not fit in `output`, it returns false and
-writes the needed size to `required`.
+Creates a directory in `path` named `prefix`, `-`, and 16 hex digits of `counter`, and
+returns true. It tries at most 128 names. If the name does not fit in `output`, it returns
+false and writes the needed size to `required`.
 
 <a id="WasiFileSystem.impl.closeFile"></a>
 

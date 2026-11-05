@@ -5,8 +5,8 @@
 Windows `HostInput` with owned arguments and an environment snapshot in raw canonical WTF-8.
 
 ## When to use
-The Windows entry point supplies `WindowsHostInput` to application effects that require `HostInput`.
-Use `WindowsHostInput.capture` in a custom Windows runtime.
+The Windows entry point supplies `WindowsHostInput` to application effects that require
+`HostInput`. Use `WindowsHostInput.capture` in a custom Windows runtime.
 
 Public declarations: 0.
 

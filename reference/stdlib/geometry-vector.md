@@ -13,9 +13,9 @@ point gives a vector, and a point plus a vector gives a point.
 A vector is a `Copy` struct with public fields, generic over its number type `T`. The operators
 `+`, `-`, unary `-`, `* T`, and `/ T` work lane by lane when `T` has them, and `==` compares
 every field when `T: Equal`. `f32 * Vector2<f32>` and `f64 * Vector2<f64>` (and the `Vector3`
-forms) scale from the left. Methods appear only when `T` has the operations they need: `dot`
-needs addition and multiplication, and `length` and `normalize` need
-`silk.num.numeric.Float`.
+forms) scale from the left. Methods appear only when `T` has the operations they need:
+[`Vector2.dot`](#Vector2.impl.dot) needs addition and multiplication, and [`Vector2.length`](#Vector2.impl.length) and
+[`Vector2.normalize`](#Vector2.impl.normalize) need `silk.num.numeric.Float`.
 
 The types add no runtime cost: a generic vector operation compiles to the same code as the same
 arithmetic written on separate fields.

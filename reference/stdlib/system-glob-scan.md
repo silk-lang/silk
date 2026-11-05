@@ -283,7 +283,10 @@ Returns every match the scan has not returned yet, in unspecified order, as
 
 #### Errors
 
-- The errors of [`Walker.next`](#Walker.impl.next).
+- `FileError` if the provider refuses to look up or list an entry the scan reaches, for
+  example with `PermissionDenied`. An entry that is missing or is not a directory matches
+  nothing instead.
+- `OutOfMemoryError` if the `Allocator` cannot supply a listing or a result.
 
 <a id="scan"></a>
 

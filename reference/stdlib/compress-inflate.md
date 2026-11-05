@@ -23,8 +23,9 @@ consumed.
 
 ## Errors
 - `OutOfMemoryError` from [`Decoder.make`](#Decoder.impl.make) if the `Allocator` fails.
-- [`DecodeError`](#DecodeError) if the data is not valid, a limit is too small, or the calls do not follow the
-  rules of [`Decoder.step`](#Decoder.impl.step). Its `kind` tells you the cause.
+- [`DecodeError`](#DecodeError) if the data is not valid, a limit is too small, or a call after the final
+  input does not give exactly the input that is not consumed yet. Its `kind` tells you the
+  cause.
 
 ## Gotchas
 Output is not verified until `Finished`, because the checksum comes at the end. If a step fails,
@@ -385,7 +386,8 @@ The size in a gzip trailer is not the size of the decoded member.
 InvalidUse
 ```
 
-The decoder failed before, or a call broke the rules of [`Decoder.step`](#Decoder.impl.step) about final input.
+The decoder failed before, or a call after the final input did not set `finalInput` and give
+exactly the input that is not consumed yet.
 
 <a id="ErrorKind.InputLimit"></a>
 
