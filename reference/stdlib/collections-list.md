@@ -288,24 +288,6 @@ in proportion to their number. `T` does not need to be `Copy`.
 
 If `index` is more than [`List.length`](#List.impl.length), the program traps.
 
-<a id="List.impl.get"></a>
-
-### Method `get`
-
-```silk
-pub fn get<T: Copy>(self: &Self, index: usize) -> T
-```
-
-Returns a copy of the element at position `index`.
-
-#### When to use
-
-Use `get` when `T` is `Copy`. Use [`List.asSlice`](#List.impl.asSlice) to borrow an element that is not `Copy`.
-
-#### Gotchas
-
-If `index` is not less than [`List.length`](#List.impl.length), the program traps.
-
 <a id="List.impl.pop"></a>
 
 ### Method `pop`
@@ -486,12 +468,46 @@ storage for exactly the length. The length does not change.
 - `OutOfMemoryError` if the `Allocator` cannot supply the new storage. The list does not
   change. An empty list never fails.
 
+<a id="List.impl-2"></a>
+
+## Implementation `List<T>`
+
+```silk
+impl<T: Copy> List<T>
+```
+
+<a id="List.impl.get"></a>
+
+### Method `get`
+
+```silk
+pub fn get(self: &Self, index: usize) -> T
+```
+
+Returns a copy of the element at position `index`.
+
+#### When to use
+
+Use `get` when `T` is `Copy`. Use [`List.asSlice`](#List.impl.asSlice) to borrow an element that is not `Copy`.
+
+#### Gotchas
+
+If `index` is not less than [`List.length`](#List.impl.length), the program traps.
+
+<a id="List.impl-3"></a>
+
+## Implementation `List<T>`
+
+```silk
+impl<T: Order> List<T>
+```
+
 <a id="List.impl.sort"></a>
 
 ### Method `sort`
 
 ```silk
-pub effect fn sort<T: Order>(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator
+pub effect fn sort(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator
 ```
 
 Sorts the elements in place, in ascending order of the `Order` conformance of `T`.
@@ -512,7 +528,7 @@ works for elements that are not `Copy`. It allocates temporary storage from the 
 ### Method `binarySearch`
 
 ```silk
-pub fn binarySearch<T: Order>(self: &Self, target: T) -> Option<usize>
+pub fn binarySearch(self: &Self, target: T) -> Option<usize>
 ```
 
 Returns the position of an element equal to `target` in a sorted list, or `None` if no element
@@ -545,7 +561,7 @@ impl<T> Drop for List<T>
 fn drop(self: &mut List<T>) -> ()
 ```
 
-<a id="List.impl-2"></a>
+<a id="List.impl-4"></a>
 
 ## Implementation `List<T>`
 
@@ -576,12 +592,20 @@ faster than one [`List.append`](#List.impl.append) for each byte. [`List.appendS
 - `OutOfMemoryError` if the `Allocator` cannot supply the new storage. The list does not
   change.
 
+<a id="List.impl-5"></a>
+
+## Implementation `List<T>`
+
+```silk
+impl<T: Copy> List<T>
+```
+
 <a id="List.impl.appendSlice"></a>
 
 ### Method `appendSlice`
 
 ```silk
-pub effect fn appendSlice<T: Copy>(self: &mut Self, values: &[T]) -> ()
+pub effect fn appendSlice(self: &mut Self, values: &[T]) -> ()
   ! OutOfMemoryError
   ? &mut Allocator
 ```
@@ -622,7 +646,7 @@ pub effect fn main() -> i32
 ### Method `appendRepeated`
 
 ```silk
-pub effect fn appendRepeated<T: Copy>(self: &mut Self, value: T, count: usize) -> ()
+pub effect fn appendRepeated(self: &mut Self, value: T, count: usize) -> ()
   ! OutOfMemoryError
   ? &mut Allocator
 ```
@@ -663,7 +687,7 @@ pub effect fn main() -> i32
 ### Method `insertSlice`
 
 ```silk
-pub effect fn insertSlice<T: Copy>(self: &mut Self, index: usize, values: &[T]) -> ()
+pub effect fn insertSlice(self: &mut Self, index: usize, values: &[T]) -> ()
   ! OutOfMemoryError
   ? &mut Allocator
 ```
@@ -712,7 +736,7 @@ pub effect fn main() -> i32
 ### Method `insertRepeated`
 
 ```silk
-pub effect fn insertRepeated<T: Copy>(self: &mut Self, index: usize, value: T, count: usize) -> ()
+pub effect fn insertRepeated(self: &mut Self, index: usize, value: T, count: usize) -> ()
   ! OutOfMemoryError
   ? &mut Allocator
 ```

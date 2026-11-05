@@ -1725,11 +1725,14 @@ A parameter introduced only by a bound would create indistinguishable witnesses 
 An inherent head still names the whole family of its owner (`impl<T: Float> Vector2<T>`, never
 `impl Vector2<f64>`), takes interface, sealed-property and outlives bounds but no callable bound or
 `where` clause, and no head bounds arbitrary constructed types. Bounds never make two inherent
-members distinct: one name declared in two blocks is a duplicate member whatever their bounds.
+members distinct: one name declared in two blocks is a duplicate member whatever their bounds. A
+member never restates an owner parameter to add bounds for itself alone: one spelling names one
+binder in a scope, as in interface members, so the bounded member goes in a bounded block.
 
 **Diagnostics:** An undetermined parameter reports an unconstrained-impl-parameter diagnostic at
 its declaration. A witness `where` constraint the head and operation do not state reports `SEM0083`
 at the mapping, and a `where` clause or callable bound on an inherent head reports `SEM0194`. A
+member parameter that restates an owner parameter reports `SEM0050` at the restated binder. A
 call to an inherent member whose block bound does not hold reports `SEM0121` at the call. A bound
 whose provider does not occur inside the conformance provider reports the non-descending
 requirement described by IMPL-008. Invalid operations inside the body retain their ordinary
