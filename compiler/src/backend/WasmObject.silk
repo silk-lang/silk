@@ -1,0 +1,468 @@
+//! The direct backend's object fragments: what `WasmLower` makes of one instance, or of the
+//! program's shared definitions, and what `WasmLink` lays out as one WebAssembly module.
+//!
+//! # Details
+//! A fragment holds finished function bodies (`Translated`), data objects, and the declarations
+//! the link needs to resolve what they name: wasm imports, weak functions and weak objects. Every
+//! function index, type index, object address and table slot a body or an object needs is left to
+//! a relocation by symbol, so a fragment depends on nothing but its own instance, and the build's
+//! semantic cache keeps it as it keeps any other emitted text.
+//!
+//! A fragment is the magic word `0x6F777300`, its length as a little-endian `u32` counting both,
+//! then its entries, each a tag byte and its fields. Program text is fragments back to back.
+
+import backend.WasmModule
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.collections.bytes {Bytes}
+import silk.core.ownership {Copy}
+import silk.collections.slice {Slice}
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.collections.list {List}
+
+/// A construct the direct backend cannot lower yet, such as a 128-bit division, described for the
+/// build's refusal.
+pub struct Unsupported {
+  pub detail: Bytes,
+}
+
+/// Fails with `what` in the definition `symbol` as an `Unsupported` refusal.
+pub effect fn unsupported(what: &[u8], symbol: &[u8]) -> never ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let mut detail = run Bytes.copy(what)
+  run Bytes.append(&mut detail, b" in ")
+  run Bytes.append(&mut detail, symbol)
+  fail Unsupported {detail: move detail}
+}
+
+/// What the link writes into a body's code at one relocation.
+pub enum RelocationKind {
+  /// A `call`'s unsigned function index of the symbol.
+  Call,
+  /// A `call_indirect`'s unsigned type index of the signature.
+  Signature,
+  /// An `i32.const`'s signed value of the symbol plus the addend, wrapped to 32 bits: a
+  /// function's table slot or an object's address.
+  Address,
+  /// The same value as an `i64.const`'s.
+  WideAddress,
+}
+
+/// One immediate a body leaves out of its code: it belongs at `offset` in the entry. `target`
+/// indexes the body's `symbols`, or its `signatures` for `Signature`.
+pub struct Relocation {
+  pub offset: usize,
+  pub kind: RelocationKind,
+  pub target: usize,
+  pub addend: u64,
+}
+
+impl Copy for Relocation {}
+
+/// One finished function body: its code entry, the locals then the instructions, without the
+/// entry's size prefix, and what the link fills in.
+pub struct Translated {
+  /// The function the body defines.
+  pub symbol: Bytes,
+  /// The body's own type, in `signatures`.
+  pub signature: usize,
+  pub entry: Bytes,
+  /// The immediates `entry` leaves out, in offset order.
+  pub relocations: List<Relocation>,
+  pub symbols: List<Bytes>,
+  pub signatures: List<Bytes>,
+  /// Pairs of an offset in `entry` and the source place, `line << 24 | column`, its code comes
+  /// from, by offset; empty in a build without line tables.
+  pub locations: List<u64>,
+}
+
+/// A defined function: its body, and the name the module exports it under, or empty.
+pub struct Function {
+  pub body: Translated,
+  pub exported: Bytes,
+}
+
+/// A function without a body that the host provides as the wasm import `module`.`name`.
+pub struct Import {
+  pub symbol: Bytes,
+  pub signature: Bytes,
+  pub module: Bytes,
+  pub name: Bytes,
+}
+
+/// A weak function declaration: a call to it reaches a stub that traps when nothing defines it.
+pub struct Weak {
+  pub symbol: Bytes,
+  pub signature: Bytes,
+}
+
+/// One address word in an object's image: the address of `symbol` plus `addend`, `size` bytes
+/// wide, at `offset`.
+pub struct Pointer {
+  pub offset: usize,
+  pub symbol: Bytes,
+  pub addend: u64,
+  pub size: usize,
+}
+
+/// A data object: its image, which its `pointers` complete, and where the link places it. A
+/// `framed` object is a frame table entry, laid out with the others between
+/// `__start_silk_frames` and `__stop_silk_frames`; a `local` one is thread-local.
+pub struct Object {
+  pub symbol: Bytes,
+  pub alignment: u64,
+  pub image: Bytes,
+  pub pointers: List<Pointer>,
+  pub framed: bool,
+  pub local: bool,
+}
+
+/// One fragment's entries.
+pub struct Fragment {
+  pub functions: List<Function>,
+  pub imports: List<Import>,
+  pub weak: List<Weak>,
+  pub objects: List<Object>,
+  /// Objects declared weak: the link resolves an undefined one to address zero.
+  pub weakObjects: List<Bytes>,
+  /// Definitions the backend refused, with the reason: a link that needs one refuses the build.
+  pub refused: List<Bytes>,
+  /// C objects declared without a definition, which only the build's checks read: the link
+  /// resolves a symbol only to a definition.
+  pub declaredObjects: List<Bytes>,
+}
+
+fn magic() -> u64 { return 0x6F777300 }
+
+fn tagFunction() -> u8 { return 1 }
+fn tagImport() -> u8 { return 2 }
+fn tagWeak() -> u8 { return 3 }
+fn tagObject() -> u8 { return 4 }
+fn tagWeakObject() -> u8 { return 5 }
+fn tagRefused() -> u8 { return 6 }
+fn tagDeclaredObject() -> u8 { return 7 }
+
+impl Fragment {
+  /// A fragment holding nothing.
+  pub fn make() -> Fragment {
+    return Fragment {functions: List<Function>.make(), imports: List<Import>.make(), weak: List<Weak>.make(), objects: List<Object>.make(),
+      weakObjects: List<Bytes>.make(), refused: List<Bytes>.make(), declaredObjects: List<Bytes>.make()}
+  }
+
+  /// The fragment's bytes.
+  pub effect fn encode(self: &Self) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+    let mut out = Bytes.make()
+    run WasmModule.littleEndian(&mut out, magic(), 4)
+    run WasmModule.littleEndian(&mut out, 0, 4)
+    let functions = List<Function>.asSlice(&self.functions)
+    let mut at = usize.ZERO
+    while at < functions.length {
+      run WasmModule.byte(&mut out, tagFunction())
+      run encodeBody(&mut out, &functions[at].body)
+      run WasmModule.name(&mut out, Bytes.asSlice(&functions[at].exported))
+      at = at + usize.ONE
+    }
+    let imports = List<Import>.asSlice(&self.imports)
+    at = usize.ZERO
+    while at < imports.length {
+      run WasmModule.byte(&mut out, tagImport())
+      run WasmModule.name(&mut out, Bytes.asSlice(&imports[at].symbol))
+      run WasmModule.name(&mut out, Bytes.asSlice(&imports[at].signature))
+      run WasmModule.name(&mut out, Bytes.asSlice(&imports[at].module))
+      run WasmModule.name(&mut out, Bytes.asSlice(&imports[at].name))
+      at = at + usize.ONE
+    }
+    let weak = List<Weak>.asSlice(&self.weak)
+    at = usize.ZERO
+    while at < weak.length {
+      run WasmModule.byte(&mut out, tagWeak())
+      run WasmModule.name(&mut out, Bytes.asSlice(&weak[at].symbol))
+      run WasmModule.name(&mut out, Bytes.asSlice(&weak[at].signature))
+      at = at + usize.ONE
+    }
+    let objects = List<Object>.asSlice(&self.objects)
+    at = usize.ZERO
+    while at < objects.length {
+      let object = &objects[at]
+      run WasmModule.byte(&mut out, tagObject())
+      run WasmModule.name(&mut out, Bytes.asSlice(&object.symbol))
+      run WasmModule.unsigned(&mut out, object.alignment)
+      let mut flags: u8 = 0
+      if object.framed { flags = flags | 1 }
+      if object.local { flags = flags | 2 }
+      run WasmModule.byte(&mut out, flags)
+      run WasmModule.name(&mut out, Bytes.asSlice(&object.image))
+      let pointers = List<Pointer>.asSlice(&object.pointers)
+      run WasmModule.index(&mut out, pointers.length)
+      let mut pointer = usize.ZERO
+      while pointer < pointers.length {
+        run WasmModule.index(&mut out, pointers[pointer].offset)
+        run WasmModule.name(&mut out, Bytes.asSlice(&pointers[pointer].symbol))
+        run WasmModule.unsigned(&mut out, pointers[pointer].addend)
+        run WasmModule.index(&mut out, pointers[pointer].size)
+        pointer = pointer + usize.ONE
+      }
+      at = at + usize.ONE
+    }
+    let weakObjects = List<Bytes>.asSlice(&self.weakObjects)
+    at = usize.ZERO
+    while at < weakObjects.length {
+      run WasmModule.byte(&mut out, tagWeakObject())
+      run WasmModule.name(&mut out, Bytes.asSlice(&weakObjects[at]))
+      at = at + usize.ONE
+    }
+    let refused = List<Bytes>.asSlice(&self.refused)
+    at = usize.ZERO
+    while at < refused.length {
+      run WasmModule.byte(&mut out, tagRefused())
+      run WasmModule.name(&mut out, Bytes.asSlice(&refused[at]))
+      at = at + usize.ONE
+    }
+    let declared = List<Bytes>.asSlice(&self.declaredObjects)
+    at = usize.ZERO
+    while at < declared.length {
+      run WasmModule.byte(&mut out, tagDeclaredObject())
+      run WasmModule.name(&mut out, Bytes.asSlice(&declared[at]))
+      at = at + usize.ONE
+    }
+    let length = Bytes.length(&out)
+    let slots = Bytes.asMutSlice(&mut out)
+    let mut byte = usize.ZERO
+    while byte < 4 {
+      slots[4 + byte] = u64.wrappingToU8(u64.shiftRight(usize.toU64(length), usize.toU64(byte) * 8) & 255)
+      byte = byte + usize.ONE
+    }
+    return move out
+  }
+
+  /// Appends the entries of every fragment in `text`, which fragments wrote back to back, in order.
+  /// Bytes that are not whole fragments are a compiler bug and stop the read.
+  pub effect fn readAll(text: &[u8], into: &mut Fragment) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut at = usize.ZERO
+    while at + 8 <= text.length {
+      let start = at
+      if readLittle(text, at, 4) != magic() { return () }
+      let end = start + u64.toUsize(readLittle(text, at + 4, 4))
+      if end > text.length || end < start + 8 { return () }
+      let bytes = Slice.view<u8>(text, usize.ZERO, end)
+      at = start + 8
+      while at < end {
+        let tag = bytes[at]
+        at = at + usize.ONE
+        if tag == tagFunction() {
+          let body = run decodeBody(bytes, &mut at)
+          let exported = run Bytes.copy(readName(bytes, &mut at))
+          run List<Function>.append(&mut into.*.functions, Function {body: move body, exported: move exported})
+        } else if tag == tagImport() {
+          let symbol = run Bytes.copy(readName(bytes, &mut at))
+          let signature = run Bytes.copy(readName(bytes, &mut at))
+          let module = run Bytes.copy(readName(bytes, &mut at))
+          let name = run Bytes.copy(readName(bytes, &mut at))
+          run List<Import>.append(&mut into.*.imports, Import {symbol: move symbol, signature: move signature, module: move module, name: move name})
+        } else if tag == tagWeak() {
+          let symbol = run Bytes.copy(readName(bytes, &mut at))
+          let signature = run Bytes.copy(readName(bytes, &mut at))
+          run List<Weak>.append(&mut into.*.weak, Weak {symbol: move symbol, signature: move signature})
+        } else if tag == tagObject() {
+          let symbol = run Bytes.copy(readName(bytes, &mut at))
+          let alignment = readUnsigned(bytes, &mut at)
+          let mut flags: u8 = 0
+          if at < bytes.length { flags = bytes[at] }
+          at = at + usize.ONE
+          let image = run Bytes.copy(readName(bytes, &mut at))
+          let count = readCount(bytes, &mut at)
+          let mut pointers = run List<Pointer>.makeWithCapacity(count)
+          let mut pointer = usize.ZERO
+          while pointer < count && at <= bytes.length {
+            let offset = readCount(bytes, &mut at)
+            let target = run Bytes.copy(readName(bytes, &mut at))
+            let addend = readUnsigned(bytes, &mut at)
+            let size = readCount(bytes, &mut at)
+            run List<Pointer>.append(&mut pointers, Pointer {offset: offset, symbol: move target, addend: addend, size: size})
+            pointer = pointer + usize.ONE
+          }
+          run List<Object>.append(&mut into.*.objects, Object {symbol: move symbol, alignment: alignment, image: move image,
+            pointers: move pointers, framed: (flags & 1) != 0, local: (flags & 2) != 0})
+        } else if tag == tagWeakObject() {
+          run List<Bytes>.append(&mut into.*.weakObjects, run Bytes.copy(readName(bytes, &mut at)))
+        } else if tag == tagRefused() {
+          run List<Bytes>.append(&mut into.*.refused, run Bytes.copy(readName(bytes, &mut at)))
+        } else if tag == tagDeclaredObject() {
+          run List<Bytes>.append(&mut into.*.declaredObjects, run Bytes.copy(readName(bytes, &mut at)))
+        } else {
+          return ()
+        }
+        if at > end { return () }
+      }
+      at = end
+    }
+    return ()
+  }
+}
+
+/// Whether the fragments in `text` declare `symbol` as a C object.
+pub effect fn declaresObject(text: &[u8], symbol: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut read = Fragment.make()
+  run Fragment.readAll(text, &mut read)
+  let declared = List<Bytes>.asSlice(&read.declaredObjects)
+  let mut at = usize.ZERO
+  while at < declared.length {
+    let name = Bytes.asSlice(&declared[at])
+    if name.length == symbol.length {
+      let mut index = usize.ZERO
+      while index < name.length && name[index] == symbol[index] { index = index + usize.ONE }
+      if index == name.length { return true }
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn readLittle(bytes: &[u8], at: usize, size: usize) -> u64 {
+  let mut value: u64 = 0
+  let mut index = size
+  while index > usize.ZERO {
+    index = index - usize.ONE
+    value = u64.shiftLeft(value, 8) | u8.toU64(bytes[at + index])
+  }
+  return value
+}
+
+/// The wasm function type `0x60`, the `parameters` lane types, then the `results` ones.
+pub effect fn signature(parameters: &[u8], results: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut encoding = Bytes.make()
+  run WasmModule.byte(&mut encoding, 0x60)
+  run WasmModule.index(&mut encoding, parameters.length)
+  run Bytes.append(&mut encoding, parameters)
+  run WasmModule.index(&mut encoding, results.length)
+  run Bytes.append(&mut encoding, results)
+  return move encoding
+}
+
+// The readers below leave `at` past the end of `bytes` once they run out, and answer zero.
+
+pub fn readUnsigned(bytes: &[u8], at: &mut usize) -> u64 {
+  let mut value: u64 = 0
+  let mut shift: u64 = 0
+  while at.* < bytes.length && shift < 64 {
+    let byte = bytes[at.*]
+    at.* = at.* + usize.ONE
+    value = value | u64.shiftLeft(u8.toU64(byte & 127), shift)
+    if (byte & 128) == 0 { return value }
+    shift = shift + 7
+  }
+  at.* = bytes.length + usize.ONE
+  return 0
+}
+
+/// A count or index, which cannot exceed the bytes left.
+pub fn readCount(bytes: &[u8], at: &mut usize) -> usize {
+  let value = readUnsigned(bytes, &mut at.*)
+  if at.* > bytes.length || value > usize.toU64(bytes.length) {
+    at.* = bytes.length + usize.ONE
+    return usize.ZERO
+  }
+  return u64.toUsize(value)
+}
+
+pub fn readName<'a>(bytes: &'a [u8], at: &mut usize) -> &'a [u8] {
+  let length = readCount(bytes, &mut at.*)
+  if at.* > bytes.length || bytes.length - at.* < length {
+    at.* = bytes.length + usize.ONE
+    return Slice.view<u8>(bytes, usize.ZERO, usize.ZERO)
+  }
+  let name = Slice.view<u8>(bytes, at.*, length)
+  at.* = at.* + length
+  return name
+}
+
+effect fn readNames(bytes: &[u8], at: &mut usize) -> List<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  let count = readCount(bytes, &mut at.*)
+  let mut names = run List<Bytes>.makeWithCapacity(count)
+  let mut index = usize.ZERO
+  while index < count && at.* <= bytes.length {
+    run List<Bytes>.append(&mut names, run Bytes.copy(readName(bytes, &mut at.*)))
+    index = index + usize.ONE
+  }
+  return move names
+}
+
+/// Reads one body `encodeBody` wrote at `at`.
+pub effect fn decodeBody(bytes: &[u8], at: &mut usize) -> Translated ! OutOfMemoryError ? &mut Allocator {
+  let symbol = run Bytes.copy(readName(bytes, &mut at.*))
+  let signature = readCount(bytes, &mut at.*)
+  let entry = run Bytes.copy(readName(bytes, &mut at.*))
+  let count = readCount(bytes, &mut at.*)
+  let mut relocations = run List<Relocation>.makeWithCapacity(count)
+  let mut index = usize.ZERO
+  while index < count && at.* <= bytes.length {
+    let offset = readCount(bytes, &mut at.*)
+    let code = readUnsigned(bytes, &mut at.*)
+    let target = readCount(bytes, &mut at.*)
+    let addend = readUnsigned(bytes, &mut at.*)
+    let mut kind = RelocationKind.Call
+    if code == 1 { kind = RelocationKind.Signature }
+    else if code == 2 { kind = RelocationKind.Address }
+    else if code == 3 { kind = RelocationKind.WideAddress }
+    else if code != 0 { at.* = bytes.length + usize.ONE }
+    run List<Relocation>.append(&mut relocations, Relocation {offset: offset, kind: kind, target: target, addend: addend})
+    index = index + usize.ONE
+  }
+  let symbols = run readNames(bytes, &mut at.*)
+  let signatures = run readNames(bytes, &mut at.*)
+  let places = readCount(bytes, &mut at.*)
+  let mut locations = run List<u64>.makeWithCapacity(places)
+  index = usize.ZERO
+  while index < places && at.* <= bytes.length {
+    run List<u64>.append(&mut locations, readUnsigned(bytes, &mut at.*))
+    index = index + usize.ONE
+  }
+  return Translated {symbol: move symbol, signature: signature, entry: move entry, relocations: move relocations,
+    symbols: move symbols, signatures: move signatures, locations: move locations}
+}
+
+/// Writes `body`: its symbol, signature, entry, relocations, symbols, signatures and locations.
+pub effect fn encodeBody(out: &mut Bytes, body: &Translated) -> () ! OutOfMemoryError ? &mut Allocator {
+  run WasmModule.name(&mut out.*, Bytes.asSlice(&body.symbol))
+  run WasmModule.index(&mut out.*, body.signature)
+  run WasmModule.name(&mut out.*, Bytes.asSlice(&body.entry))
+  let relocations = List<Relocation>.asSlice(&body.relocations)
+  run WasmModule.index(&mut out.*, relocations.length)
+  let mut at = usize.ZERO
+  while at < relocations.length {
+    run WasmModule.index(&mut out.*, relocations[at].offset)
+    run WasmModule.byte(&mut out.*, kindCode(relocations[at].kind))
+    run WasmModule.index(&mut out.*, relocations[at].target)
+    run WasmModule.unsigned(&mut out.*, relocations[at].addend)
+    at = at + usize.ONE
+  }
+  run encodeNames(&mut out.*, List<Bytes>.asSlice(&body.symbols))
+  run encodeNames(&mut out.*, List<Bytes>.asSlice(&body.signatures))
+  let locations = List<u64>.asSlice(&body.locations)
+  run WasmModule.index(&mut out.*, locations.length)
+  at = usize.ZERO
+  while at < locations.length {
+    run WasmModule.unsigned(&mut out.*, locations[at])
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn encodeNames(out: &mut Bytes, names: &[Bytes]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run WasmModule.index(&mut out.*, names.length)
+  let mut at = usize.ZERO
+  while at < names.length {
+    run WasmModule.name(&mut out.*, Bytes.asSlice(&names[at]))
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+fn kindCode(kind: RelocationKind) -> u8 {
+  return match kind {
+    RelocationKind.Call => 0
+    RelocationKind.Signature => 1
+    RelocationKind.Address => 2
+    RelocationKind.WideAddress => 3
+  }
+}
