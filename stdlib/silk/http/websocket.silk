@@ -1,0 +1,1362 @@
+//! WebSocket frames (RFC 6455) for clients and servers, without I/O.
+//!
+//! # When to use
+//! Use [`Session`] when you move the bytes yourself, for example in an event loop: give it the
+//! bytes that you read with [`Session.receive`], and write the bytes that it appends to your output
+//! buffer. For a session over a byte duplex that does the reads and writes, use
+//! `silk.http.websocket_stream`. [`Decoder`] and [`appendFrame`] are the lower layer, for
+//! programs that handle the protocol rules themselves.
+//!
+//! # Details
+//! Both roles use the same code. The only difference is the masking direction: a client masks
+//! every frame with a new 4-byte key, and a server masks none. A [`Session`] or [`Decoder`] of the
+//! server role fails on an unmasked frame, and one of the client role fails on a masked frame.
+//!
+//! [`Session.receive`] reads frames until one event is complete:
+//! - `Text` and `Binary` give a complete message. Fragmented messages are joined, and Text is
+//!   checked as UTF-8 as it arrives. Get the bytes with [`Session.message`].
+//! - `Ping` was answered: the Pong is in your output buffer.
+//! - `Pong` gives the payload of a Pong.
+//! - `Close` means that the peer sent Close. If you had not sent Close, the answer Close is in your
+//!   output buffer. The session is then `Closed`: write the output, then close the connection.
+//!
+//! When a peer frame breaks a rule, [`Session.receive`] appends a Close with the code of the error
+//! (1002, 1007 or 1009, see [`closeCodeOf`]) to your output, the session becomes `Failed`, and the
+//! call fails. Write the output, then close the connection.
+//!
+//! # Errors
+//! [`WebSocketError`] tells which rule, limit or state check failed. `OutOfMemoryError` if a
+//! message buffer cannot grow.
+//!
+//! # Gotchas
+//! - Extensions such as `permessage-deflate` are not supported. A frame with a reserved bit fails.
+//! - A message is joined in memory, up to `maxMessageBytes`. The buffer grows as frames arrive.
+//! - The mask keys of a client come from a generator seeded by [`Session.make`]. Give it a seed
+//!   from `silk.system.random`.
+//!
+//! # Examples
+//! ## Answer a message from a client
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.collections.bytes { Bytes }
+//! import silk.core.effect { Effect }
+//! import silk.core.option { Option }
+//! import silk.core.result { Result }
+//! import silk.http.websocket { Event, Limits, Role, Session, WebSocketError, appendFrame, Opcode }
+//!
+//! effect fn program() -> i32 ! WebSocketError | OutOfMemoryError ? &mut Allocator {
+//!   // A masked Text frame "Hi", as a client sends it.
+//!   let mut wire = Bytes.make()
+//!   run appendFrame(&mut wire, Opcode.Text, true, b"Hi", Option<[u8; 4]>.some([1, 2, 3, 4]))
+//!
+//!   let mut session = match move Session.make(Role.Server, Limits.defaults(), 0) {
+//!     Result.Success {value} => move value
+//!     Result.Failure {error} => { fail move error }
+//!   }
+//!   let mut output = Bytes.make()
+//!   let received = run session.receive(Bytes.asSlice(&wire), &mut output)
+//!   if received.consumed != Bytes.length(&wire) { return 1 }
+//!   match received.event {
+//!     Option.Some {value: Event.Text {length}} => {
+//!       if length != 2 || session.message()[1] != 105 { return 2 }
+//!     }
+//!     _ => { return 3 }
+//!   }
+//!   // The reply is an unmasked Text frame in `output`.
+//!   run session.sendText("Hello", &mut output)
+//!   if Bytes.length(&output) != 7 { return 4 }
+//!   return 0
+//! }
+//!
+//! effect fn failed<E>(error: E) -> i32 {
+//!   drop error
+//!   return 1
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   return run Effect.catchAll(program(), failed)
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//! }
+//! ```
+//!
+//! @category Networking
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.text.format { Debug, Format, Formatter }
+import silk.text.string { InvalidUtf8, String }
+import silk.io.writer { Writer, WriterError }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u64
+import silk.num.usize
+
+/// The side of a connection.
+pub enum Role {
+  /// The side that opened the connection. It masks its frames.
+  Client,
+  /// The side that accepted the connection. It does not mask its frames.
+  Server,
+}
+
+
+impl Debug for Role {
+  /// Writes the name of the variant, such as `Client`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      Role.Client => run Format.write(&mut formatter, b"Client")
+      Role.Server => run Format.write(&mut formatter, b"Server")
+    }
+  }
+}
+
+/// The kind of a frame.
+pub enum Opcode {
+  /// A later fragment of a message (0).
+  Continuation,
+  /// The first frame of a Text message (1).
+  Text,
+  /// The first frame of a Binary message (2).
+  Binary,
+  /// A Close (8).
+  Close,
+  /// A Ping (9).
+  Ping,
+  /// A Pong (10).
+  Pong,
+}
+
+
+impl Debug for Opcode {
+  /// Writes the name of the variant, such as `Text`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      Opcode.Continuation => run Format.write(&mut formatter, b"Continuation")
+      Opcode.Text => run Format.write(&mut formatter, b"Text")
+      Opcode.Binary => run Format.write(&mut formatter, b"Binary")
+      Opcode.Close => run Format.write(&mut formatter, b"Close")
+      Opcode.Ping => run Format.write(&mut formatter, b"Ping")
+      Opcode.Pong => run Format.write(&mut formatter, b"Pong")
+    }
+  }
+}
+
+/// The limits of a session or decoder.
+pub struct Limits {
+  /// The maximum length of one message, all fragments together. It is more than zero.
+  pub maxMessageBytes: usize,
+}
+
+impl Copy for Limits {}
+
+impl Limits {
+  /// Returns the default limits: messages of at most 1048576 bytes.
+  pub fn defaults() -> Limits {
+    return Limits {maxMessageBytes: 1048576}
+  }
+}
+
+/// The frame rule that a peer broke. The Close for it has code 1002.
+pub enum ProtocolReason {
+  /// A client frame is not masked.
+  MaskRequired,
+  /// A server frame is masked.
+  MaskForbidden,
+  /// A reserved bit is set.
+  Rsv,
+  /// The opcode is reserved.
+  ReservedOpcode,
+  /// The length uses more bytes than necessary.
+  NonMinimalLength,
+  /// The highest bit of a 64-bit length is set.
+  LengthHighBit,
+  /// A control frame has more than 125 bytes.
+  ControlTooLarge,
+  /// A control frame is not final.
+  ControlFragmented,
+  /// A Continuation frame came with no message to continue.
+  UnexpectedContinuation,
+  /// A Text or Binary frame came before the last fragment of the previous message.
+  ExpectedContinuation,
+  /// A Close frame has a payload of exactly one byte.
+  ClosePayloadLength,
+  /// A Close frame has a code that is not allowed.
+  CloseCode,
+  /// A frame came after the Close of the peer.
+  FrameAfterClose,
+}
+
+
+impl Debug for ProtocolReason {
+  /// Writes the name of the variant, such as `MaskRequired`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      ProtocolReason.MaskRequired => run Format.write(&mut formatter, b"MaskRequired")
+      ProtocolReason.MaskForbidden => run Format.write(&mut formatter, b"MaskForbidden")
+      ProtocolReason.Rsv => run Format.write(&mut formatter, b"Rsv")
+      ProtocolReason.ReservedOpcode => run Format.write(&mut formatter, b"ReservedOpcode")
+      ProtocolReason.NonMinimalLength => run Format.write(&mut formatter, b"NonMinimalLength")
+      ProtocolReason.LengthHighBit => run Format.write(&mut formatter, b"LengthHighBit")
+      ProtocolReason.ControlTooLarge => run Format.write(&mut formatter, b"ControlTooLarge")
+      ProtocolReason.ControlFragmented => run Format.write(&mut formatter, b"ControlFragmented")
+      ProtocolReason.UnexpectedContinuation => run Format.write(&mut formatter, b"UnexpectedContinuation")
+      ProtocolReason.ExpectedContinuation => run Format.write(&mut formatter, b"ExpectedContinuation")
+      ProtocolReason.ClosePayloadLength => run Format.write(&mut formatter, b"ClosePayloadLength")
+      ProtocolReason.CloseCode => run Format.write(&mut formatter, b"CloseCode")
+      ProtocolReason.FrameAfterClose => run Format.write(&mut formatter, b"FrameAfterClose")
+    }
+  }
+}
+
+/// The text that is not valid UTF-8. The Close for it has code 1007.
+pub enum Utf8Component {
+  /// A Text message.
+  Text,
+  /// The reason of a Close frame.
+  CloseReason,
+}
+
+
+impl Debug for Utf8Component {
+  /// Writes the name of the variant, such as `Text`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      Utf8Component.Text => run Format.write(&mut formatter, b"Text")
+      Utf8Component.CloseReason => run Format.write(&mut formatter, b"CloseReason")
+    }
+  }
+}
+
+/// The rule of [`CloseData.make`] that failed.
+pub enum CloseDataReason {
+  /// The code is not allowed in a Close that you send.
+  Code,
+  /// The reason has more than 123 bytes.
+  ReasonTooLarge,
+}
+
+
+impl Debug for CloseDataReason {
+  /// Writes the name of the variant, such as `Code`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      CloseDataReason.Code => run Format.write(&mut formatter, b"Code")
+      CloseDataReason.ReasonTooLarge => run Format.write(&mut formatter, b"ReasonTooLarge")
+    }
+  }
+}
+
+/// The state of a [`Session`].
+pub enum State {
+  /// Messages can be sent and received.
+  Open,
+  /// This side sent Close and waits for the Close of the peer. Frames are still received.
+  CloseSent,
+  /// Both sides sent Close. Write the output that is left, then close the connection.
+  Closed,
+  /// A rule or limit check failed. Write the output that is left, then close the connection.
+  Failed,
+}
+
+
+impl Debug for State {
+  /// Writes the name of the variant, such as `Open`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      State.Open => run Format.write(&mut formatter, b"Open")
+      State.CloseSent => run Format.write(&mut formatter, b"CloseSent")
+      State.Closed => run Format.write(&mut formatter, b"Closed")
+      State.Failed => run Format.write(&mut formatter, b"Failed")
+    }
+  }
+}
+
+/// The error of a WebSocket operation.
+///
+/// # Details
+/// [`closeCodeOf`] gives the Close code that a peer error gets: 1002 for `ProtocolError`, 1007 for
+/// `InvalidUtf8`, and 1009 for `MessageTooLarge`.
+pub union WebSocketError {
+  /// `maxMessageBytes` is zero.
+  InvalidLimits,
+  /// The operation is not allowed in the state of the session.
+  InvalidState {
+    /// The state.
+    pub state: State,
+  },
+  /// An earlier error ended the session or decoder.
+  PreviousFailure,
+  /// A message is longer than `maxMessageBytes`.
+  MessageTooLarge {
+    /// The length of the message so far, with the frame that broke the limit.
+    pub length: u64,
+    /// The value of `maxMessageBytes`.
+    pub allowed: usize,
+  },
+  /// A peer frame broke a rule of RFC 6455.
+  ProtocolError {
+    /// The rule.
+    pub reason: ProtocolReason,
+  },
+  /// The Close data that you gave is not valid.
+  InvalidCloseData {
+    /// The rule.
+    pub reason: CloseDataReason,
+  },
+  /// Text is not valid UTF-8.
+  InvalidUtf8 {
+    /// The text that failed.
+    pub component: Utf8Component,
+  },
+  /// A Ping or Pong payload that you gave has more than 125 bytes.
+  ControlPayloadTooLarge {
+    /// The length of the payload.
+    pub length: usize,
+  },
+  /// A fragment does not continue the message that you are sending, or a message starts before the
+  /// last fragment of the previous one.
+  FragmentOrder,
+}
+
+impl Copy for WebSocketError {}
+
+impl Debug for WebSocketError {
+  /// Writes the variant and its fields, such as `MessageTooLarge { length: 70000, allowed: 65536 }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      WebSocketError.InvalidLimits => run Format.write(&mut formatter, b"InvalidLimits")
+      WebSocketError.InvalidState {state} => {
+        let mut record = run Format.debugRecord("InvalidState", &mut formatter)
+        run Format.debugField(&mut record, "state", &state, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      WebSocketError.PreviousFailure => run Format.write(&mut formatter, b"PreviousFailure")
+      WebSocketError.MessageTooLarge {length, allowed} => {
+        let mut record = run Format.debugRecord("MessageTooLarge", &mut formatter)
+        run Format.debugField(&mut record, "length", &length, &mut formatter)
+        run Format.debugField(&mut record, "allowed", &allowed, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      WebSocketError.ProtocolError {reason} => {
+        let mut record = run Format.debugRecord("ProtocolError", &mut formatter)
+        run Format.debugField(&mut record, "reason", &reason, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      WebSocketError.InvalidCloseData {reason} => {
+        let mut record = run Format.debugRecord("InvalidCloseData", &mut formatter)
+        run Format.debugField(&mut record, "reason", &reason, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      WebSocketError.InvalidUtf8 {component} => {
+        let mut record = run Format.debugRecord("InvalidUtf8", &mut formatter)
+        run Format.debugField(&mut record, "component", &component, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      WebSocketError.ControlPayloadTooLarge {length} => {
+        let mut record = run Format.debugRecord("ControlPayloadTooLarge", &mut formatter)
+        run Format.debugField(&mut record, "length", &length, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      WebSocketError.FragmentOrder => run Format.write(&mut formatter, b"FragmentOrder")
+    }
+  }
+}
+
+/// Returns the Close code for a peer error: 1002 for `ProtocolError`, 1007 for `InvalidUtf8`,
+/// 1009 for `MessageTooLarge`, and 1011 for any other error.
+pub fn closeCodeOf(error: &WebSocketError) -> u16 {
+  return match &error.* {
+    WebSocketError.ProtocolError {..} => 1002
+    WebSocketError.InvalidUtf8 {..} => 1007
+    WebSocketError.MessageTooLarge {..} => 1009
+    _ => 1011
+  }
+}
+
+/// The payload of a Ping or Pong, at most 125 bytes.
+pub struct ControlPayload {
+  bytes: [u8; 125],
+  length: usize,
+}
+
+impl Copy for ControlPayload {}
+
+impl ControlPayload {
+  /// Returns a copy of `bytes` as a payload.
+  ///
+  /// # Errors
+  /// `ControlPayloadTooLarge` if `bytes` has more than 125 bytes.
+  pub fn make(bytes: &[u8]) -> Result<ControlPayload, WebSocketError> {
+    if bytes.length > 125 {
+      return Result<ControlPayload, WebSocketError>.failResult(
+        WebSocketError.ControlPayloadTooLarge {length: bytes.length},
+      )
+    }
+    let mut payload = ControlPayload {bytes: emptyControl(), length: bytes.length}
+    Slice.copyInto<u8>(&mut payload.bytes, usize.ZERO, bytes)
+    return Result<ControlPayload, WebSocketError>.succeed(payload)
+  }
+
+  /// Returns the payload bytes.
+  pub fn asSlice<'payload>(self: &'payload Self) -> &'payload [u8] {
+    return Slice.view<u8>(&self.bytes, usize.ZERO, self.length)
+  }
+}
+
+/// The reason of a Close frame: valid UTF-8, at most 123 bytes.
+pub struct CloseReason {
+  bytes: [u8; 123],
+  length: usize,
+}
+
+impl Copy for CloseReason {}
+
+impl CloseReason {
+  /// Returns the reason bytes. They are valid UTF-8.
+  pub fn asSlice<'reason>(self: &'reason Self) -> &'reason [u8] {
+    return Slice.view<u8>(&self.bytes, usize.ZERO, self.length)
+  }
+}
+
+/// The code and reason of a Close frame that you send. Make it with [`CloseData.make`].
+pub struct CloseData {
+  codeValue: u16,
+  reasonValue: CloseReason,
+}
+
+impl Copy for CloseData {}
+
+impl CloseData {
+  /// Returns Close data with `code` and a copy of `reason`.
+  ///
+  /// # Errors
+  /// - `InvalidCloseData` with `Code` if `code` is not allowed. Allowed codes are 1000 through
+  ///   1003, 1007 through 1014 except 1010 and 1012 through 1014 for a client, and 3000 through
+  ///   4999. This function allows 1000 through 1003, 1007 through 1011, and 3000 through 4999.
+  /// - `InvalidCloseData` with `ReasonTooLarge` if `reason` has more than 123 bytes.
+  pub fn make(code: u16, reason: string) -> Result<CloseData, WebSocketError> {
+    if !sendableCloseCode(code) {
+      return Result<CloseData, WebSocketError>.failResult(WebSocketError.InvalidCloseData {
+        reason: CloseDataReason.Code,
+      })
+    }
+    let bytes = String.utf8Bytes(reason)
+    if bytes.length > 123 {
+      return Result<CloseData, WebSocketError>.failResult(WebSocketError.InvalidCloseData {
+        reason: CloseDataReason.ReasonTooLarge,
+      })
+    }
+    let mut stored = CloseReason {bytes: emptyCloseReason(), length: bytes.length}
+    Slice.copyInto<u8>(&mut stored.bytes, usize.ZERO, bytes)
+    return Result<CloseData, WebSocketError>.succeed(CloseData {
+      codeValue: code,
+      reasonValue: stored,
+    })
+  }
+
+  /// Returns the code.
+  pub fn code(self: &Self) -> u16 { return self.codeValue }
+
+  /// Returns the reason.
+  pub fn reason<'data>(self: &'data Self) -> &'data CloseReason { return &self.reasonValue }
+}
+
+/// The code and reason in the Close of the peer.
+pub union PeerCloseData {
+  /// The Close had no payload. RFC 6455 reports this as code 1005.
+  Absent,
+  /// The Close had a code and a reason.
+  Present {
+    /// The code.
+    pub code: u16,
+    /// The reason. It can be empty.
+    pub reason: CloseReason,
+  },
+}
+
+impl Copy for PeerCloseData {}
+
+/// One complete event from the peer.
+pub union Event {
+  /// A Text message of `length` bytes, valid UTF-8. Get it with [`Session.message`] or
+  /// [`Decoder.message`] before the next call that receives.
+  Text {
+    /// The length of the message.
+    pub length: usize,
+  },
+  /// A Binary message of `length` bytes. Get it with [`Session.message`] or [`Decoder.message`]
+  /// before the next call that receives.
+  Binary {
+    /// The length of the message.
+    pub length: usize,
+  },
+  /// A Ping. A [`Session`] already put the Pong in the output.
+  Ping {
+    /// The payload.
+    pub payload: ControlPayload,
+  },
+  /// A Pong.
+  Pong {
+    /// The payload.
+    pub payload: ControlPayload,
+  },
+  /// The Close of the peer.
+  Close {
+    /// The code and reason of the peer.
+    pub data: PeerCloseData,
+  },
+}
+
+impl Copy for Event {}
+
+/// The result of one receive call.
+pub struct Received {
+  /// How many input bytes were used. Give the rest again in the next call.
+  pub consumed: usize,
+  /// The event that is complete, if any. With `None`, all input was used and more is needed.
+  pub event: Option<Event>,
+}
+
+impl Copy for Received {}
+
+struct Utf8State {
+  remaining: usize,
+  minimum: u8,
+  maximum: u8,
+}
+
+impl Copy for Utf8State {}
+
+enum Phase {
+  Header,
+  Payload,
+}
+
+
+/// Splits bytes into frames and checks them, for one role. It does not answer Pings or Closes:
+/// [`Session`] does that.
+///
+/// # Details
+/// [`Decoder.feed`] keeps a partial frame between calls. Fragments of a message are joined in an
+/// internal buffer, up to `maxMessageBytes`. Control frames can come between fragments.
+pub struct Decoder {
+  roleValue: Role,
+  limits: Limits,
+  phase: Phase,
+  header: [u8; 14],
+  headerHave: usize,
+  headerNeed: usize,
+  opcode: Opcode,
+  fin: bool,
+  masked: bool,
+  mask: [u8; 4],
+  maskOffset: usize,
+  remaining: u64,
+  control: [u8; 125],
+  controlLength: usize,
+  buffer: Bytes,
+  messageOpen: bool,
+  messageText: bool,
+  messageReady: bool,
+  utf8: Utf8State,
+  closed: bool,
+  failed: bool,
+}
+
+impl Decoder {
+  /// Returns a decoder for frames that a peer of `role` sends to you. A server decodes with
+  /// `Role.Client` frames: give the role of this side, and it checks the masking of the peer.
+  ///
+  /// # Errors
+  /// `InvalidLimits` if `maxMessageBytes` is zero.
+  pub fn make(side: Role, limits: Limits) -> Result<Decoder, WebSocketError> {
+    if limits.maxMessageBytes == usize.ZERO {
+      return Result<Decoder, WebSocketError>.failResult(WebSocketError.InvalidLimits)
+    }
+    return Result<Decoder, WebSocketError>.succeed(Decoder {
+      roleValue: side,
+      limits: limits,
+      phase: Phase.Header,
+      header: emptyHeader(),
+      headerHave: usize.ZERO,
+      headerNeed: 2,
+      opcode: Opcode.Text,
+      fin: false,
+      masked: false,
+      mask: [0, 0, 0, 0],
+      maskOffset: usize.ZERO,
+      remaining: u64.MIN,
+      control: emptyControl(),
+      controlLength: usize.ZERO,
+      buffer: Bytes.make(),
+      messageOpen: false,
+      messageText: false,
+      messageReady: false,
+      utf8: utf8Start(),
+      closed: false,
+      failed: false,
+    })
+  }
+
+  /// Returns the last complete Text or Binary message. It is empty before the first one, and it is
+  /// cleared by the next [`Decoder.feed`].
+  pub fn message<'decoder>(self: &'decoder Self) -> &'decoder [u8] {
+    if !self.messageReady { return Slice.view<u8>(Bytes.asSlice(&self.buffer), usize.ZERO, usize.ZERO) }
+    return Bytes.asSlice(&self.buffer)
+  }
+
+  /// Reads frames from `input` until one event is complete or the input is used.
+  ///
+  /// # Details
+  /// The message of the previous `Text` or `Binary` event is cleared first. After a `Close`
+  /// event, any later frame fails with `FrameAfterClose`.
+  ///
+  /// # Errors
+  /// `ProtocolError`, `MessageTooLarge` or `InvalidUtf8` for a bad frame, and `PreviousFailure`
+  /// after one of them. `OutOfMemoryError` if the message buffer cannot grow.
+  pub effect fn feed(self: &mut Self, input: &[u8]) -> Received
+  ! WebSocketError | OutOfMemoryError
+  ? &mut Allocator {
+    if self.failed { fail WebSocketError.PreviousFailure }
+    if self.messageReady {
+      Bytes.clear(&mut self.buffer)
+      self.messageReady = false
+    }
+    let attempted = run Effect.result(feedCore(&mut self.*, input))
+    return match move attempted {
+      Result.Success {value} => move value
+      Result.Failure {error} => {
+        self.failed = true
+        return match move error {
+          WebSocketError cause => { fail move cause }
+          OutOfMemoryError allocation => { fail move allocation }
+        }
+      }
+    }
+  }
+}
+
+effect fn feedCore(decoder: &mut Decoder, input: &[u8]) -> Received
+! WebSocketError | OutOfMemoryError
+? &mut Allocator {
+  let mut used = usize.ZERO
+  while true {
+    if decoder.phase == Phase.Header {
+      while decoder.headerHave < decoder.headerNeed && used < input.length {
+        decoder.header[decoder.headerHave] = input[used]
+        decoder.headerHave = decoder.headerHave + usize.ONE
+        used = used + usize.ONE
+        if decoder.headerHave == 2 {
+          decoder.headerNeed = headerLength(&decoder.header)
+        }
+      }
+      if decoder.headerHave < decoder.headerNeed {
+        return Received {consumed: used, event: Option<Event>.none()}
+      }
+      run beginFrame(&mut decoder.*)
+      decoder.phase = Phase.Payload
+    }
+    // Payload phase.
+    let available = usize.toU64(input.length - used)
+    let mut take = decoder.remaining
+    if available < take { take = available }
+    let count = u64.toUsize(take)
+    if count != usize.ZERO {
+      let chunk = Slice.view<u8>(input, used, count)
+      run acceptPayload(&mut decoder.*, chunk)
+      drop chunk
+      used = used + count
+      decoder.remaining = decoder.remaining - take
+    }
+    if decoder.remaining != u64.MIN {
+      return Received {consumed: used, event: Option<Event>.none()}
+    }
+    decoder.phase = Phase.Header
+    decoder.headerHave = usize.ZERO
+    decoder.headerNeed = 2
+    let finished = run finishFrame(&mut decoder.*)
+    if let Option.Some {value} = finished {
+      return Received {consumed: used, event: Option<Event>.some(value)}
+    }
+    if used == input.length && decoder.phase == Phase.Header {
+      return Received {consumed: used, event: Option<Event>.none()}
+    }
+  }
+  return Received {consumed: used, event: Option<Event>.none()}
+}
+
+fn headerLength(header: &[u8; 14]) -> usize {
+  let mut length: usize = 2
+  let code = u8.bitAnd(header[1], 127)
+  if code == 126 { length = length + 2 }
+  if code == 127 { length = length + 8 }
+  if u8.bitAnd(header[1], 128) != 0 { length = length + 4 }
+  return length
+}
+
+effect fn protocolError(reason: ProtocolReason) -> never ! WebSocketError {
+  fail WebSocketError.ProtocolError {reason: reason}
+}
+
+effect fn beginFrame(decoder: &mut Decoder) -> () ! WebSocketError | OutOfMemoryError ? &mut Allocator {
+  if decoder.closed { run protocolError(ProtocolReason.FrameAfterClose) }
+  let first = decoder.header[0]
+  let second = decoder.header[1]
+  if u8.bitAnd(first, 112) != 0 { run protocolError(ProtocolReason.Rsv) }
+  let opcode = match u8.bitAnd(first, 15) {
+    0 => Opcode.Continuation
+    1 => Opcode.Text
+    2 => Opcode.Binary
+    8 => Opcode.Close
+    9 => Opcode.Ping
+    10 => Opcode.Pong
+    _ => run protocolError(ProtocolReason.ReservedOpcode)
+  }
+  let fin = u8.bitAnd(first, 128) != 0
+  let masked = u8.bitAnd(second, 128) != 0
+  match decoder.roleValue {
+    Role.Server => { if !masked { run protocolError(ProtocolReason.MaskRequired) } }
+    Role.Client => { if masked { run protocolError(ProtocolReason.MaskForbidden) } }
+  }
+  let code = u8.bitAnd(second, 127)
+  let mut offset: usize = 2
+  let mut length = u8.toU64(code)
+  if code == 126 {
+    length = decodeWide(&decoder.header, 2, 2)
+    offset = 4
+    if length < 126 { run protocolError(ProtocolReason.NonMinimalLength) }
+  } else if code == 127 {
+    length = decodeWide(&decoder.header, 2, 8)
+    offset = 10
+    if u64.bitAnd(length, u64.shiftLeft(1, 63)) != u64.MIN {
+      run protocolError(ProtocolReason.LengthHighBit)
+    }
+    if length <= 65535 { run protocolError(ProtocolReason.NonMinimalLength) }
+  }
+  let control = opcode == Opcode.Close || opcode == Opcode.Ping || opcode == Opcode.Pong
+  if control {
+    if length > 125 { run protocolError(ProtocolReason.ControlTooLarge) }
+    if !fin { run protocolError(ProtocolReason.ControlFragmented) }
+    decoder.controlLength = usize.ZERO
+  } else if opcode == Opcode.Continuation {
+    if !decoder.messageOpen { run protocolError(ProtocolReason.UnexpectedContinuation) }
+  } else {
+    if decoder.messageOpen { run protocolError(ProtocolReason.ExpectedContinuation) }
+    decoder.messageOpen = true
+    decoder.messageText = opcode == Opcode.Text
+    decoder.utf8 = utf8Start()
+  }
+  if !control {
+    let total = usize.toU64(Bytes.length(&decoder.buffer))
+    let allowed = usize.toU64(decoder.limits.maxMessageBytes)
+    if length > allowed || total > allowed - length {
+      let mut reported = u64.MAX
+      if length <= u64.MAX - total { reported = total + length }
+      fail WebSocketError.MessageTooLarge {
+        length: reported,
+        allowed: decoder.limits.maxMessageBytes,
+      }
+    }
+    run Bytes.reserve(&mut decoder.buffer, u64.toUsize(length))
+  }
+  if masked {
+    decoder.mask = [
+      decoder.header[offset],
+      decoder.header[offset + 1],
+      decoder.header[offset + 2],
+      decoder.header[offset + 3],
+    ]
+  }
+  decoder.opcode = opcode
+  decoder.fin = fin
+  decoder.masked = masked
+  decoder.maskOffset = usize.ZERO
+  decoder.remaining = length
+  return ()
+}
+
+effect fn acceptPayload(decoder: &mut Decoder, chunk: &[u8]) -> ()
+! WebSocketError | OutOfMemoryError
+? &mut Allocator {
+  let control = decoder.opcode == Opcode.Close || decoder.opcode == Opcode.Ping || decoder.opcode == Opcode.Pong
+  if control {
+    let start = decoder.controlLength
+    Slice.copyInto<u8>(&mut decoder.control, start, chunk)
+    let target = Slice.viewMut<u8>(&mut decoder.control, start, chunk.length)
+    if decoder.masked { applyMask(&mut target, &decoder.mask, decoder.maskOffset) }
+    drop target
+    decoder.controlLength = start + chunk.length
+  } else {
+    let start = Bytes.length(&decoder.buffer)
+    run Bytes.append(&mut decoder.buffer, chunk)
+    let all = Bytes.asMutSlice(&mut decoder.buffer)
+    let target = Slice.viewMut<u8>(&mut all, start, chunk.length)
+    if decoder.masked { applyMask(&mut target, &decoder.mask, decoder.maskOffset) }
+    if decoder.messageText {
+      if !acceptUtf8(&mut decoder.utf8, &target) {
+        fail WebSocketError.InvalidUtf8 {component: Utf8Component.Text}
+      }
+    }
+    drop target
+    drop all
+  }
+  decoder.maskOffset = (decoder.maskOffset + chunk.length) % 4
+  return ()
+}
+
+effect fn finishFrame(decoder: &mut Decoder) -> Option<Event> ! WebSocketError {
+  return match decoder.opcode {
+    Opcode.Ping => Option<Event>.some(Event.Ping {payload: controlPayload(&decoder.*)})
+    Opcode.Pong => Option<Event>.some(Event.Pong {payload: controlPayload(&decoder.*)})
+    Opcode.Close => {
+      let data = run peerCloseData(&decoder.*)
+      decoder.closed = true
+      return Option<Event>.some(Event.Close {data: data})
+    }
+    _ => {
+      if !decoder.fin { return Option<Event>.none() }
+      if decoder.messageText && decoder.utf8.remaining != usize.ZERO {
+        fail WebSocketError.InvalidUtf8 {component: Utf8Component.Text}
+      }
+      decoder.messageOpen = false
+      decoder.messageReady = true
+      let length = Bytes.length(&decoder.buffer)
+      if decoder.messageText { return Option<Event>.some(Event.Text {length: length}) }
+      return Option<Event>.some(Event.Binary {length: length})
+    }
+  }
+}
+
+fn controlPayload(decoder: &Decoder) -> ControlPayload {
+  return ControlPayload {bytes: decoder.control, length: decoder.controlLength}
+}
+
+effect fn peerCloseData(decoder: &Decoder) -> PeerCloseData ! WebSocketError {
+  let length = decoder.controlLength
+  if length == usize.ZERO { return PeerCloseData.Absent }
+  if length == usize.ONE { run protocolError(ProtocolReason.ClosePayloadLength) }
+  let code = u16.bitOr(u16.shiftLeft(u8.toU16(decoder.control[0]), 8), u8.toU16(decoder.control[1]))
+  if !receivableCloseCode(code) { run protocolError(ProtocolReason.CloseCode) }
+  let mut reason = CloseReason {bytes: emptyCloseReason(), length: length - 2}
+  let source = Slice.view<u8>(&decoder.control, 2, length - 2)
+  Slice.copyInto<u8>(&mut reason.bytes, usize.ZERO, source)
+  let mut state = utf8Start()
+  if !acceptUtf8(&mut state, source) || state.remaining != usize.ZERO {
+    fail WebSocketError.InvalidUtf8 {component: Utf8Component.CloseReason}
+  }
+  drop source
+  return PeerCloseData.Present {code: code, reason: reason}
+}
+
+/// Appends one frame to `output`.
+///
+/// # Details
+/// With a `mask` key, the payload is masked with it, as a client must do. Without one, the frame
+/// is not masked, as a server must do. `fin` marks the last frame of a message. This function does
+/// not check the order of fragments or the length of control payloads: [`Session`] does.
+///
+/// # Errors
+/// `OutOfMemoryError` if `output` cannot grow.
+pub effect fn appendFrame(
+  output: &mut Bytes,
+  opcode: Opcode,
+  fin: bool,
+  payload: &[u8],
+  mask: Option<[u8; 4]>,
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut header = emptyHeader()
+  let mut first = opcodeValue(opcode)
+  if fin { first = u8.bitOr(first, 128) }
+  header[0] = first
+  let length = payload.length
+  let mut size: usize = 2
+  if length <= 125 {
+    header[1] = usize.toU8(length)
+  } else if length <= 65535 {
+    header[1] = 126
+    header[2] = usize.toU8(length / 256)
+    header[3] = usize.toU8(length % 256)
+    size = 4
+  } else {
+    header[1] = 127
+    let wide = usize.toU64(length)
+    let mut index = usize.ZERO
+    while index < 8 {
+      let shift = usize.toU64((7 - index) * 8)
+      header[2 + index] = u64.toU8(u64.bitAnd(u64.shiftRight(wide, shift), 255))
+      index = index + usize.ONE
+    }
+    size = 10
+  }
+  let mut key: [u8; 4] = [0, 0, 0, 0]
+  let masked = match mask {
+    Option.Some {value} => {
+      key = value
+      true
+    }
+    Option.None => false
+  }
+  if masked {
+    header[1] = u8.bitOr(header[1], 128)
+    header[size] = key[0]
+    header[size + 1] = key[1]
+    header[size + 2] = key[2]
+    header[size + 3] = key[3]
+    size = size + 4
+  }
+  run Bytes.reserve(&mut output.*, size + length)
+  run Bytes.append(&mut output.*, Slice.view<u8>(&header, usize.ZERO, size))
+  let start = Bytes.length(&output.*)
+  run Bytes.append(&mut output.*, payload)
+  if masked {
+    let all = Bytes.asMutSlice(&mut output.*)
+    let target = Slice.viewMut<u8>(&mut all, start, length)
+    applyMask(&mut target, &key, usize.ZERO)
+  }
+  return ()
+}
+
+/// The kind of a message that you send in fragments with [`Session.sendFragment`].
+pub enum MessageKind {
+  /// A Text message. Each fragment must be valid UTF-8 on its own, so that the message is too.
+  Text,
+  /// A Binary message.
+  Binary,
+}
+
+
+/// A WebSocket session without I/O: it receives bytes, and appends the frames to send to an output
+/// buffer.
+///
+/// # Details
+/// [`Session.receive`] answers a Ping with a Pong and a Close with a Close, in the output. The
+/// send functions append one frame each. Write the output to the connection in the order it was
+/// appended. When the state is `Closed` or `Failed`, write the output that is left and close the
+/// connection.
+pub struct Session {
+  roleValue: Role,
+  decoder: Decoder,
+  stateValue: State,
+  sending: bool,
+  generator: [u64; 4],
+}
+
+impl Session {
+  /// Returns an open session for `role`. `seed` seeds the mask keys of a client: give it a value
+  /// from `silk.system.random`. A server ignores it.
+  ///
+  /// # Errors
+  /// `InvalidLimits` if `maxMessageBytes` is zero.
+  pub fn make(side: Role, limits: Limits, seed: u64) -> Result<Session, WebSocketError> {
+    let decoder = match move Decoder.make(side, limits) {
+      Result.Success {value} => move value
+      Result.Failure {error} => {
+        return Result<Session, WebSocketError>.failResult(move error)
+      }
+    }
+    let mut mixer = seed
+    let first = splitMix(&mut mixer)
+    let second = splitMix(&mut mixer)
+    let third = splitMix(&mut mixer)
+    let fourth = splitMix(&mut mixer)
+    return Result<Session, WebSocketError>.succeed(Session {
+      roleValue: side,
+      decoder: move decoder,
+      stateValue: State.Open,
+      sending: false,
+      generator: [first, second, third, fourth],
+    })
+  }
+
+  /// Returns the role.
+  pub fn side(self: &Self) -> Role { return self.roleValue }
+
+  /// Returns the state.
+  pub fn state(self: &Self) -> State { return self.stateValue }
+
+  /// Returns the last complete Text or Binary message. It is valid until the next
+  /// [`Session.receive`].
+  pub fn message<'session>(self: &'session Self) -> &'session [u8] {
+    return self.decoder.message()
+  }
+
+  /// Returns the last complete Text message as text. It is empty if the last message was Binary.
+  pub fn messageText<'session>(self: &'session Self) -> string<'session> {
+    if !self.decoder.messageText { return "" }
+    return match String.fromUtf8(self.decoder.message()) {
+      Result.Success {value} => value
+      Result.Failure {..} => ""
+    }
+  }
+
+  /// Reads frames from `input` until one event is complete or the input is used, and appends the
+  /// frames that answer the peer to `output`.
+  ///
+  /// # Details
+  /// - A Ping is answered with a Pong, unless this side already sent Close.
+  /// - A Close is answered with a Close that has the same code, unless this side already sent
+  ///   Close. The state becomes `Closed`.
+  /// - A peer error appends a Close with [`closeCodeOf`] the error, unless this side already sent
+  ///   Close. The state becomes `Failed`.
+  ///
+  /// # Errors
+  /// - `InvalidState` if the state is `Closed`.
+  /// - `ProtocolError`, `MessageTooLarge` or `InvalidUtf8` for a bad frame, `PreviousFailure` if the
+  ///   state is `Failed`.
+  /// - `OutOfMemoryError` if a buffer cannot grow.
+  pub effect fn receive(self: &mut Self, input: &[u8], output: &mut Bytes) -> Received
+  ! WebSocketError | OutOfMemoryError
+  ? &mut Allocator {
+    match self.stateValue {
+      State.Closed => { fail WebSocketError.InvalidState {state: State.Closed} }
+      State.Failed => { fail WebSocketError.PreviousFailure }
+      _ => {}
+    }
+    let attempted = run Effect.result(self.decoder.feed(input))
+    let received = match move attempted {
+      Result.Success {value} => move value
+      Result.Failure {error} => {
+        return match move error {
+          WebSocketError cause => {
+            if self.stateValue == State.Open {
+              let reply = closePayload(closeCodeOf(&cause))
+              let mask = self.nextMask()
+              run appendFrame(&mut output.*, Opcode.Close, true, Slice.view<u8>(&reply, usize.ZERO, 2), mask)
+            }
+            self.stateValue = State.Failed
+            fail move cause
+          }
+          OutOfMemoryError allocation => {
+            self.stateValue = State.Failed
+            fail move allocation
+          }
+        }
+      }
+    }
+    match received.event {
+      Option.Some {value: Event.Ping {payload}} => {
+        if self.stateValue == State.Open {
+          let mask = self.nextMask()
+          run appendFrame(&mut output.*, Opcode.Pong, true, payload.asSlice(), mask)
+        }
+      }
+      Option.Some {value: Event.Close {data}} => {
+        if self.stateValue == State.Open {
+          let mask = self.nextMask()
+          match data {
+            PeerCloseData.Absent => {
+              run appendFrame(&mut output.*, Opcode.Close, true, Slice.view<u8>(&emptyHeader(), usize.ZERO, usize.ZERO), mask)
+            }
+            PeerCloseData.Present {code, reason: _} => {
+              let reply = closePayload(echoCloseCode(code))
+              run appendFrame(&mut output.*, Opcode.Close, true, Slice.view<u8>(&reply, usize.ZERO, 2), mask)
+            }
+          }
+        }
+        self.stateValue = State.Closed
+      }
+      _ => {}
+    }
+    return received
+  }
+
+  /// Appends `text` as one Text frame.
+  ///
+  /// # Errors
+  /// `InvalidState` if the state is not `Open`, `FragmentOrder` while a fragmented message is being
+  /// sent, `MessageTooLarge` is never raised for sending. `OutOfMemoryError` if `output` cannot
+  /// grow.
+  pub effect fn sendText(self: &mut Self, text: string, output: &mut Bytes) -> ()
+  ! WebSocketError | OutOfMemoryError
+  ? &mut Allocator {
+    run self.requireMessageStart()
+    let mask = self.nextMask()
+    return run appendFrame(&mut output.*, Opcode.Text, true, String.utf8Bytes(text), mask)
+  }
+
+  /// Appends `bytes` as one Binary frame.
+  ///
+  /// # Errors
+  /// `InvalidState` if the state is not `Open`, `FragmentOrder` while a fragmented message is being
+  /// sent. `OutOfMemoryError` if `output` cannot grow.
+  pub effect fn sendBinary(self: &mut Self, bytes: &[u8], output: &mut Bytes) -> ()
+  ! WebSocketError | OutOfMemoryError
+  ? &mut Allocator {
+    run self.requireMessageStart()
+    let mask = self.nextMask()
+    return run appendFrame(&mut output.*, Opcode.Binary, true, bytes, mask)
+  }
+
+  /// Appends one fragment of a message. `kind` gives the kind of the message, and is checked only
+  /// on the first fragment. `fin` marks the last fragment.
+  ///
+  /// # Details
+  /// Control frames ([`Session.sendPing`], [`Session.sendClose`]) can go between fragments. A Text
+  /// fragment must be complete UTF-8, because it is text.
+  ///
+  /// # Errors
+  /// `InvalidState` if the state is not `Open`. `OutOfMemoryError` if `output` cannot grow.
+  pub effect fn sendFragment(
+    self: &mut Self,
+    kind: MessageKind,
+    payload: &[u8],
+    fin: bool,
+    output: &mut Bytes,
+  ) -> ()
+  ! WebSocketError | OutOfMemoryError
+  ? &mut Allocator {
+    run self.requireOpen()
+    let mut opcode = Opcode.Continuation
+    if !self.sending {
+      opcode = match kind {
+        MessageKind.Text => Opcode.Text
+        MessageKind.Binary => Opcode.Binary
+      }
+    }
+    self.sending = !fin
+    let mask = self.nextMask()
+    return run appendFrame(&mut output.*, opcode, fin, payload, mask)
+  }
+
+  /// Appends a Ping with `payload`.
+  ///
+  /// # Errors
+  /// `InvalidState` if the state is not `Open`, `ControlPayloadTooLarge` if `payload` has more than
+  /// 125 bytes. `OutOfMemoryError` if `output` cannot grow.
+  pub effect fn sendPing(self: &mut Self, payload: &[u8], output: &mut Bytes) -> ()
+  ! WebSocketError | OutOfMemoryError
+  ? &mut Allocator {
+    run self.requireOpen()
+    if payload.length > 125 { fail WebSocketError.ControlPayloadTooLarge {length: payload.length} }
+    let mask = self.nextMask()
+    return run appendFrame(&mut output.*, Opcode.Ping, true, payload, mask)
+  }
+
+  /// Appends a Pong with `payload`, for example as a heartbeat. A Ping from the peer is answered
+  /// by [`Session.receive`], so you do not need this for that.
+  ///
+  /// # Errors
+  /// `InvalidState` if the state is not `Open`, `ControlPayloadTooLarge` if `payload` has more than
+  /// 125 bytes. `OutOfMemoryError` if `output` cannot grow.
+  pub effect fn sendPong(self: &mut Self, payload: &[u8], output: &mut Bytes) -> ()
+  ! WebSocketError | OutOfMemoryError
+  ? &mut Allocator {
+    run self.requireOpen()
+    if payload.length > 125 { fail WebSocketError.ControlPayloadTooLarge {length: payload.length} }
+    let mask = self.nextMask()
+    return run appendFrame(&mut output.*, Opcode.Pong, true, payload, mask)
+  }
+
+  /// Appends a Close. The state becomes `CloseSent`, and then `Closed` when the Close of the peer
+  /// arrives.
+  ///
+  /// # Details
+  /// `data` gives the code and reason. With `None`, the Close has no payload. If the state is
+  /// already `CloseSent` or `Closed`, it does nothing.
+  ///
+  /// # Errors
+  /// `PreviousFailure` if the state is `Failed`. `OutOfMemoryError` if `output` cannot grow.
+  pub effect fn sendClose(self: &mut Self, data: Option<CloseData>, output: &mut Bytes) -> ()
+  ! WebSocketError | OutOfMemoryError
+  ? &mut Allocator {
+    match self.stateValue {
+      State.Failed => { fail WebSocketError.PreviousFailure }
+      State.Open => {}
+      _ => { return () }
+    }
+    let mut payload = emptyControl()
+    let mut length = usize.ZERO
+    if let Option.Some {value} = data {
+      payload[0] = u16.toU8(value.codeValue / 256)
+      payload[1] = u16.toU8(value.codeValue % 256)
+      let reason = value.reasonValue.asSlice()
+      Slice.copyInto<u8>(&mut payload, 2, reason)
+      length = 2 + reason.length
+    }
+    let mask = self.nextMask()
+    run appendFrame(&mut output.*, Opcode.Close, true, Slice.view<u8>(&payload, usize.ZERO, length), mask)
+    self.stateValue = State.CloseSent
+    return ()
+  }
+
+  effect fn requireOpen(self: &Self) -> () ! WebSocketError {
+    return match self.stateValue {
+      State.Open => ()
+      State.Failed => { fail WebSocketError.PreviousFailure }
+      State other => { fail WebSocketError.InvalidState {state: other} }
+    }
+  }
+
+  effect fn requireMessageStart(self: &Self) -> () ! WebSocketError {
+    run self.requireOpen()
+    if self.sending { fail WebSocketError.FragmentOrder }
+    return ()
+  }
+
+  fn nextMask(self: &mut Self) -> Option<[u8; 4]> {
+    if self.roleValue == Role.Server { return Option<[u8; 4]>.none() }
+    let word = nextRandom(&mut self.generator)
+    return Option<[u8; 4]>.some([
+      u64.toU8(u64.bitAnd(word, 255)),
+      u64.toU8(u64.bitAnd(u64.shiftRight(word, 8), 255)),
+      u64.toU8(u64.bitAnd(u64.shiftRight(word, 16), 255)),
+      u64.toU8(u64.bitAnd(u64.shiftRight(word, 24), 255)),
+    ])
+  }
+}
+
+// SplitMix64, to spread the seed over the generator state.
+fn splitMix(state: &mut u64) -> u64 {
+  state.* = u64.wrappingAdd(state.*, 11400714819323198485)
+  let mut value = state.*
+  value = u64.wrappingMultiply(u64.bitXor(value, u64.shiftRight(value, 30)), 13787848793156543929)
+  value = u64.wrappingMultiply(u64.bitXor(value, u64.shiftRight(value, 27)), 10723151780598845931)
+  return u64.bitXor(value, u64.shiftRight(value, 31))
+}
+
+// xoshiro256**: the mask keys need to be hard to guess for a peer, not secret.
+fn nextRandom(state: &mut [u64; 4]) -> u64 {
+  let result = u64.wrappingMultiply(rotateLeft(u64.wrappingMultiply(state[1], 5), 7), 9)
+  let shifted = u64.shiftLeft(state[1], 17)
+  state[2] = u64.bitXor(state[2], state[0])
+  state[3] = u64.bitXor(state[3], state[1])
+  state[1] = u64.bitXor(state[1], state[2])
+  state[0] = u64.bitXor(state[0], state[3])
+  state[2] = u64.bitXor(state[2], shifted)
+  state[3] = rotateLeft(state[3], 45)
+  return result
+}
+
+fn rotateLeft(value: u64, count: u64) -> u64 {
+  return u64.bitOr(u64.shiftLeft(value, count), u64.shiftRight(value, 64 - count))
+}
+
+fn opcodeValue(opcode: Opcode) -> u8 {
+  return match opcode {
+    Opcode.Continuation => 0
+    Opcode.Text => 1
+    Opcode.Binary => 2
+    Opcode.Close => 8
+    Opcode.Ping => 9
+    Opcode.Pong => 10
+  }
+}
+
+fn closePayload(code: u16) -> [u8; 2] {
+  return [u16.toU8(code / 256), u16.toU8(code % 256)]
+}
+
+// The code of the answer Close: the code of the peer, or 1000 for a code that only the peer may send.
+fn echoCloseCode(code: u16) -> u16 {
+  if sendableCloseCode(code) { return code }
+  return 1000
+}
+
+fn receivableCloseCode(code: u16) -> bool {
+  if code >= 3000 && code <= 4999 { return true }
+  if code >= 1000 && code <= 1003 { return true }
+  return code >= 1007 && code <= 1014
+}
+
+fn sendableCloseCode(code: u16) -> bool {
+  if code >= 3000 && code <= 4999 { return true }
+  if code >= 1000 && code <= 1003 { return true }
+  return code >= 1007 && code <= 1011 && code != 1010
+}
+
+fn decodeWide(bytes: &[u8; 14], offset: usize, length: usize) -> u64 {
+  let mut value = u64.MIN
+  let mut index = usize.ZERO
+  while index < length {
+    value = u64.bitOr(u64.shiftLeft(value, 8), u8.toU64(bytes[offset + index]))
+    index = index + usize.ONE
+  }
+  return value
+}
+
+fn applyMask(output: &mut [u8], mask: &[u8; 4], offset: usize) -> () {
+  let mut index = usize.ZERO
+  while index < output.length {
+    output[index] = u8.bitXor(output[index], mask[(offset + index) % 4])
+    index = index + usize.ONE
+  }
+  return ()
+}
+
+fn acceptUtf8(state: &mut Utf8State, bytes: &[u8]) -> bool {
+  let mut index = usize.ZERO
+  while index < bytes.length {
+    if !acceptUtf8Byte(&mut state.*, bytes[index]) { return false }
+    index = index + usize.ONE
+  }
+  return true
+}
+
+fn acceptUtf8Byte(state: &mut Utf8State, byte: u8) -> bool {
+  if state.remaining == usize.ZERO {
+    if byte <= 127 { return true }
+    if byte >= 194 && byte <= 223 {
+      state.remaining = 1
+      state.minimum = 128
+      state.maximum = 191
+    } else if byte == 224 {
+      state.remaining = 2
+      state.minimum = 160
+      state.maximum = 191
+    } else if byte >= 225 && byte <= 236 {
+      state.remaining = 2
+      state.minimum = 128
+      state.maximum = 191
+    } else if byte == 237 {
+      state.remaining = 2
+      state.minimum = 128
+      state.maximum = 159
+    } else if byte >= 238 && byte <= 239 {
+      state.remaining = 2
+      state.minimum = 128
+      state.maximum = 191
+    } else if byte == 240 {
+      state.remaining = 3
+      state.minimum = 144
+      state.maximum = 191
+    } else if byte >= 241 && byte <= 243 {
+      state.remaining = 3
+      state.minimum = 128
+      state.maximum = 191
+    } else if byte == 244 {
+      state.remaining = 3
+      state.minimum = 128
+      state.maximum = 143
+    } else {
+      return false
+    }
+  } else {
+    if byte < state.minimum || byte > state.maximum { return false }
+    state.remaining = state.remaining - usize.ONE
+    state.minimum = 128
+    state.maximum = 191
+  }
+  return true
+}
+
+fn utf8Start() -> Utf8State {
+  return Utf8State {remaining: usize.ZERO, minimum: 128, maximum: 191}
+}
+
+fn emptyHeader() -> [u8; 14] {
+  return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+}
+
+fn emptyControl() -> [u8; 125] {
+  return [0; 125]
+}
+
+fn emptyCloseReason() -> [u8; 123] {
+  return [0; 123]
+}
