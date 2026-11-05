@@ -604,11 +604,13 @@ struct Pending {
   owners: usize,
 }
 
-// One drop a function exit performs: a cleanup node's value, behind the node's flag when its
-// state is Maybe, or a pending temporary (`node` is then usize.MAX).
+// One drop a function exit performs: a cleanup node's value in one state (live, or the flag that
+// answers), an open union as exit plan `plan` records its subtree, or a pending temporary (`node`
+// is then usize.MAX).
 struct ExitDrop {
   node: usize,
-  guarded: bool,
+  state: usize,
+  plan: usize,
   temporary: usize,
 }
 
@@ -652,79 +654,52 @@ struct LoopTargets {
   // Owners and temporaries created before the loop; `break` and `continue` drop only later ones.
   owners: usize,
   temporaries: usize,
-  // The owner states every iteration starts from; each edge back to `repeat` must agree with them.
-  entry: List<OwnerSnapshot>,
+  // Each cleanup node's state at the loop header (`loopHeads`), which every edge back to `repeat`
+  // writes or keeps.
+  heads: List<usize>,
   // The owner states on each edge into `exit`, joined when the loop ends.
   exits: List<Arrival>,
 }
 
-// The cleanup state of one owned local on the current path (MIR core shape §4).
-enum OwnerState {
-  Live,
-  Moved,
-  // Live on some incoming paths only; the owner's drop flag holds the answer at runtime.
-  Maybe,
-  // An active union joined from arrivals that kept it compact and arrivals that partitioned it.
-  // The node's flag holds whether the whole union is live; otherwise the union's runtime tag
-  // selects the joined partition, whose children are dropped under their own flags.
-  Alternatives,
-}
-
-// A persistent, authenticated cleanup partition. Its path is the actual storage path, and its
-// children are a complete, ordered partition supplied by prepared drop-glue evidence. Nodes and
-// flags survive branch restoration; snapshots record only the frontier's path-dependent state.
+// One complete partition of a cleanup node's storage: the children of a nominal value or array
+// (`tag` is usize.MAX), or of one member or variant tag of a union.
 struct CleanupPartition {
+  tag: usize,
   children: List<usize>,
 }
 
+// One node of an owner's move-path tree: the actual storage path of a whole owner or of a part a
+// partial consuming site reaches, with the glue that cleans it whole.
 struct CleanupNode {
   place: Place,
   ty: Shared<Type>,
   glue: Option<InstanceKey>,
-  children: List<usize>,
-  alternatives: List<CleanupPartition>,
-  expanded: bool,
-  // A union partition is valid only on the path that authenticated its active member/variant.
-  active: bool,
-  flag: usize,
-  // An active union's canonical member or variant count, which sizes its runtime tag.
+  partitions: List<CleanupPartition>,
+  // A union's canonical member or variant count, which sizes its runtime tag; zero otherwise.
   tags: usize,
-  // The partitions an Alternatives join tracks: 0 is `children`, k + 1 is `alternatives[k]`.
-  joined: List<usize>,
+  // The node's drop flag (`nodeFlag`), or usize.MAX.
+  flag: usize,
 }
 
-struct ComponentState {
-  node: usize,
-  state: OwnerState,
-  // The outermost complete subtree transferred away on any incoming path, or MAX. Refining its
-  // cleanup does not authorize a field write inside that missing ancestor (OWN-005).
-  missing: usize,
-}
-
-impl Copy for ComponentState {}
-
-// One lexical owner, in acquisition order. Expanding its frontier never acquires another owner.
+// One lexical owner, in acquisition order, and the root of its move-path tree.
 struct Owner {
   local: usize,
   path: List<Projection>,
   subject: usize,
   ty: Shared<Type>,
   root: usize,
-  components: List<ComponentState>,
-  // Whole termination is distinct from partial exhaustion: a write below a missing whole owner
-  // cannot initialize its ancestor (OWN-005). Cleanup flags are not initialization permission.
-  ended: bool,
 }
 
+// The owners a path holds and the state of every cleanup node on it.
 struct OwnerSnapshot {
-  components: List<ComponentState>,
-  ended: bool,
+  owners: usize,
+  states: List<usize>,
 }
 
 // One edge into a join: its source block and the owner states on that edge.
 struct Arrival {
   block: usize,
-  states: List<OwnerSnapshot>,
+  states: OwnerSnapshot,
 }
 
 // What a consuming site leaves without an owner.
@@ -837,7 +812,8 @@ pub struct ProviderDrop {
 pub union RunPlan {
   /// The Effect's own runner: a construction's target with its stored arguments, or an Effect
   /// block's instance with the environment.
-  Runner {pub target: CallTarget, pub success: Shared<Type>, pub failure: Shared<Type>},
+  /// `partDrop` is the part's type when a loaned run leaves an owning callable for it to drop.
+  Runner {pub target: CallTarget, pub success: Shared<Type>, pub failure: Shared<Type>, pub partDrop: Option<Shared<Type>>},
   /// Runs part 0. A failure in `selector` runs the handler stored in part 1 with that failure;
   /// every other failure is residual.
   Catch {
@@ -850,6 +826,8 @@ pub union RunPlan {
     pub handlerFailure: Shared<Type>,
     /// The handler part's type when it owns cleanup; only the selected path consumes it.
     pub handlerDrop: Option<Shared<Type>>,
+    /// Whether the handler is invoked by loan, so the selected path also drops it after the call.
+    pub handlerKept: bool,
   },
   /// Runs part 0, then the `() ! never` finalizer stored in part 1 on both exits. A failure waits
   /// in a temporary while the finalizer runs, then continues to the enclosing sink.
@@ -880,9 +858,15 @@ pub union RunPlan {
     pub useFailure: Shared<Type>,
     /// The failure's type when it owns cleanup; a frame cancelled while it waits drops it.
     pub useFailureDrop: Option<Shared<Type>>,
+    /// The use part's type when a loaned invocation leaves an owning callable to drop after it.
+    pub useDrop: Option<Shared<Type>>,
     pub release: CallTarget,
+    /// The release part's type when a loaned invocation leaves an owning callable to drop after it.
+    pub releaseDrop: Option<Shared<Type>>,
     pub releaseSuccess: Shared<Type>,
     pub releaseFailure: Shared<Type>,
+    /// The release failure's type when it owns cleanup; a cancelled frame drops that failure.
+    pub releaseFailureDrop: Option<Shared<Type>>,
     /// The resource's type when it owns cleanup.
     pub resourceDrop: Option<Shared<Type>>,
     /// Whether this run owes the release's NonParking proof: no `Intrinsic.NonParking` premise of
@@ -1024,6 +1008,10 @@ struct Builder {
   // The cleanup stack: owned locals in acquisition order, and where each open scope starts.
   owners: List<Owner>,
   cleanup: List<CleanupNode>,
+  // Each cleanup node's state on the current path (`liveState`, `movedState` or its flag).
+  states: List<usize>,
+  // The states each open union's exit drop reads (`exitPlan`).
+  dropPlans: List<List<usize>>,
   scopes: List<usize>,
   // Owned rvalues used only as places; they live until the end of their full expression.
   temporaries: List<Pending>,
@@ -1767,7 +1755,7 @@ effect fn dropPlace(builder: &mut Builder, destination: Place, ty: &Shared<Type>
   }
   let glue = match move keyed {
     Option<InstanceKey>.Some {value} => move value
-    Option<InstanceKey>.None => { return run unsupported(owner, origin, GapCode.Cleanup) }
+    Option<InstanceKey>.None => { return run unsupported(owner, origin, GapCode.OpenInstance) }
   }
   return run dropPrepared(&mut builder.*, move destination, move glue, origin)
 }
@@ -1931,33 +1919,164 @@ fn bindingOwnerIndex(builder: &Builder, subject: usize, node: usize, steps: usiz
   return usize.MAX
 }
 
-effect fn copyComponents(states: &List<ComponentState>) -> List<ComponentState>
-! OutOfMemoryError ? &mut Allocator {
-  let listed = List<ComponentState>.asSlice(states)
-  let mut copied = run List<ComponentState>.makeWithCapacity(listed.length)
+// Drop elaboration (MIR core shape §4). Each owner has a move-path tree of cleanup nodes, built
+// when it is acquired, and each node has one state on the current path: live, moved, or the drop
+// flag whose runtime value answers for the paths that joined here. A drop then reads the states of
+// the node's subtree, wherever control came from.
+
+// The state of a node whose storage is initialized on every path here.
+fn liveState() -> usize { return usize.MAX }
+
+// The state of a node whose storage holds nothing to clean on every path here.
+fn movedState() -> usize { return usize.MAX - usize.ONE }
+
+// What `uniformState` answers when a subtree's nodes disagree: its drop opens into its children.
+fn mixedState() -> usize { return usize.MAX - 2 }
+
+fn nodeState(builder: &Builder, node: usize) -> usize {
+  return List<usize>.asSlice(&builder.states)[node]
+}
+
+fn setNodeState(builder: &mut Builder, node: usize, state: usize) -> () {
+  let mut states = List<usize>.asMutSlice(&mut builder.*.states)
+  states[node] = state
+  return ()
+}
+
+// The states a drop reads: the current path's, or those recorded for exit plan `plan`.
+fn stateSource(builder: &Builder, plan: usize) -> &[usize] {
+  if plan == usize.MAX { return List<usize>.asSlice(&builder.states) }
+  return List<usize>.asSlice(&List<List<usize>>.asSlice(&builder.dropPlans)[plan])
+}
+
+// The one state every node of `node`'s subtree has in `states`, or `mixedState()`.
+fn uniformState(builder: &Builder, states: &[usize], node: usize) -> usize {
+  let own = states[node]
+  let nodes = List<CleanupNode>.asSlice(&builder.cleanup)
+  let partitions = List<CleanupPartition>.asSlice(&nodes[node].partitions)
+  let mut partition = usize.ZERO
+  while partition < partitions.length {
+    let children = List<usize>.asSlice(&partitions[partition].children)
+    let mut child = usize.ZERO
+    while child < children.length {
+      if uniformState(builder, states, children[child]) != own { return mixedState() }
+      child = child + usize.ONE
+    }
+    partition = partition + usize.ONE
+  }
+  return own
+}
+
+// The nodes of `node`'s subtree, `node` first and every child after its parent.
+effect fn subtree(builder: &Builder, node: usize) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
+  let nodes = List<CleanupNode>.asSlice(&builder.cleanup)
+  let mut found = List<usize>.make()
+  run List<usize>.append(&mut found, node)
+  let mut at = usize.ZERO
+  while at < List<usize>.length(&found) {
+    let current = List<usize>.asSlice(&found)[at]
+    let partitions = List<CleanupPartition>.asSlice(&nodes[current].partitions)
+    let mut partition = usize.ZERO
+    while partition < partitions.length {
+      let children = List<usize>.asSlice(&partitions[partition].children)
+      let mut child = usize.ZERO
+      while child < children.length {
+        run List<usize>.append(&mut found, children[child])
+        child = child + usize.ONE
+      }
+      partition = partition + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return move found
+}
+
+// Gives every node of `node`'s subtree state `state`: a move ends all of it, and a store of a
+// whole value initializes all of it.
+effect fn settleSubtree(builder: &mut Builder, node: usize, state: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let found = run subtree(&builder.*, node)
+  let listed = List<usize>.asSlice(&found)
+  let mut states = List<usize>.asMutSlice(&mut builder.*.states)
   let mut at = usize.ZERO
   while at < listed.length {
-    run List<ComponentState>.append(&mut copied, ComponentState {node: listed[at].node, state: listed[at].state, missing: listed[at].missing})
+    states[listed[at]] = state
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// A whole transfer ends every node of the owner.
+effect fn moveOwner(builder: &mut Builder, index: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let root = List<Owner>.asSlice(&builder.owners)[index].root
+  return run settleSubtree(&mut builder.*, root, movedState())
+}
+
+// Whether owner `index` may have been transferred whole on some path here.
+fn ownerEnded(builder: &Builder, index: usize) -> bool {
+  let root = List<Owner>.asSlice(&builder.owners)[index].root
+  return nodeState(builder, root) != liveState()
+}
+
+// Which cleanup nodes belong to an owner that is still acquired.
+effect fn liveNodes(builder: &Builder) -> List<bool> ! OutOfMemoryError ? &mut Allocator {
+  let count = List<CleanupNode>.length(&builder.cleanup)
+  let mut alive = run List<bool>.makeWithCapacity(count)
+  run List<bool>.appendRepeated(&mut alive, false, count)
+  let owners = List<Owner>.asSlice(&builder.owners)
+  let mut index = usize.ZERO
+  while index < owners.length {
+    let found = run subtree(builder, owners[index].root)
+    let listed = List<usize>.asSlice(&found)
+    let mut marked = List<bool>.asMutSlice(&mut alive)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      marked[listed[at]] = true
+      at = at + usize.ONE
+    }
+    index = index + usize.ONE
+  }
+  return move alive
+}
+
+// The one drop flag of `node`, created on first use. Every join and loop header that leaves the
+// node's state path-dependent writes this flag on its incoming edges, so a state names at most
+// this one flag and an edge never reads a flag it also writes.
+effect fn nodeFlag(builder: &mut Builder, node: usize, origin: Origin) -> usize ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let nodes = List<CleanupNode>.asSlice(&builder.cleanup)
+  let existing = nodes[node].flag
+  if existing != usize.MAX { return existing }
+  let stored = run copyPlace(&nodes[node].place)
+  let flag = List<Local>.length(&builder.function.locals)
+  let boolean = run Types.intern(Type.Primitive {name: run Bytes.copy(b"bool")})
+  run List<Local>.append(&mut builder.*.function.locals, Local {ty: move boolean,
+    kind: LocalKind.DropFlag {local: stored.local, path: move stored.projections}, origin: origin})
+  let mut mutable = List<CleanupNode>.asMutSlice(&mut builder.*.cleanup)
+  mutable[node].flag = flag
+  return flag
+}
+
+// The value a flag takes on an edge whose state for the node is the constant `state`.
+fn stateValue(state: usize) -> Operand {
+  return Operand.Boolean {value: state == liveState()}
+}
+
+// Flag writes belong to the actual incoming edge, including copies when a Maybe parent is split.
+effect fn flagOnEdge(builder: &mut Builder, edge: usize, flag: usize, value: Operand, origin: Origin) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let mut blocks = List<Block>.asMutSlice(&mut builder.*.function.blocks)
+  return run List<Statement>.append(&mut blocks[edge].statements,
+    Statement.Assign {destination: place(flag), value: Rvalue.Use {value: move value}, origin: origin})
+}
+
+effect fn copyIndices(values: &List<usize>) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
+  let listed = List<usize>.asSlice(values)
+  let mut copied = run List<usize>.makeWithCapacity(listed.length)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    run List<usize>.append(&mut copied, listed[at])
     at = at + usize.ONE
   }
   return move copied
-}
-
-effect fn copyOwnerComponents(builder: &Builder, index: usize) -> List<ComponentState>
-! OutOfMemoryError ? &mut Allocator {
-  let owners = List<Owner>.asSlice(&builder.owners)
-  return run copyComponents(&owners[index].components)
-}
-
-fn ownerComponentCount(builder: &Builder, index: usize) -> usize {
-  let owners = List<Owner>.asSlice(&builder.owners)
-  return List<ComponentState>.length(&owners[index].components)
-}
-
-fn ownerComponent(builder: &Builder, index: usize, position: usize) -> ComponentState {
-  let owners = List<Owner>.asSlice(&builder.owners)
-  let components = List<ComponentState>.asSlice(&owners[index].components)
-  return components[position]
 }
 
 effect fn copyCleanupPath(builder: &Builder, node: usize) -> List<Projection>
@@ -1966,7 +2085,7 @@ effect fn copyCleanupPath(builder: &Builder, node: usize) -> List<Projection>
   return run copyProjectionPath(&nodes[node].place.projections)
 }
 
-effect fn newOwner(builder: &mut Builder, local: usize, path: List<Projection>, subject: usize, ty: &Shared<Type>) -> ()
+effect fn newOwner(builder: &mut Builder, local: usize, path: List<Projection>, subject: usize, ty: &Shared<Type>) -> usize
 ! CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
   let mut stored = place(local)
   let listed = List<Projection>.asSlice(&path)
@@ -1982,138 +2101,128 @@ effect fn newOwner(builder: &mut Builder, local: usize, path: List<Projection>, 
     Result<Option<InstanceKey>, CanonicalizationFailure>.Success {value: canonicalGlue} => move canonicalGlue
     Result<Option<InstanceKey>, CanonicalizationFailure>.Failure {error: reason} => { fail move reason }
   }
-  run List<CleanupNode>.append(&mut builder.*.cleanup, CleanupNode {place: move stored,
-    ty: Shared<Type>.clone(ty), glue: move glue, children: List<usize>.make(), alternatives: List<CleanupPartition>.make(), expanded: false, active: false, flag: usize.MAX,
-      tags: usize.ZERO, joined: List<usize>.make()})
-  let mut components = List<ComponentState>.make()
-  run List<ComponentState>.append(&mut components, ComponentState {node: root, state: OwnerState.Live, missing: usize.MAX})
-  return run List<Owner>.append(&mut builder.*.owners, Owner {local: local, path: move path, subject: subject,
-    ty: Shared<Type>.clone(ty), root: root, components: move components, ended: false})
+  run List<CleanupNode>.append(&mut builder.*.cleanup, CleanupNode {place: move stored, ty: Shared<Type>.clone(ty), glue: move glue,
+    partitions: List<CleanupPartition>.make(), tags: usize.ZERO, flag: usize.MAX})
+  run List<usize>.append(&mut builder.*.states, liveState())
+  let index = List<Owner>.length(&builder.owners)
+  run List<Owner>.append(&mut builder.*.owners, Owner {local: local, path: move path, subject: subject, ty: Shared<Type>.clone(ty),
+    root: root})
+  return index
 }
 
 // A local whose value needs cleanup becomes a live owner of the innermost scope.
 effect fn acquire(builder: &mut Builder, local: usize, ty: &Shared<Type>, needed: bool) -> () ! CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
   if !needed { return () }
-  return run newOwner(&mut builder.*, local, List<Projection>.make(), usize.MAX, ty)
+  let index = run newOwner(&mut builder.*, local, List<Projection>.make(), usize.MAX, ty)
+  // Typed-body local `k` is MIR local `k + 1`; a temporary matches no consuming site.
+  let mut typed = usize.MAX
+  if local != usize.ZERO { typed = local - usize.ONE }
+  return run expandOwner(&mut builder.*, index, typed, usize.MAX)
 }
 
-// Every independent component has its own stable flag and its actual projected destination.
-effect fn componentFlag(builder: &mut Builder, node: usize, origin: Origin) -> usize ! OutOfMemoryError ? &mut Allocator | &mut Types {
-  let nodes = List<CleanupNode>.asSlice(&builder.cleanup)
-  let existing = nodes[node].flag
-  if existing != usize.MAX { return existing }
-  let stored = run copyPlace(&nodes[node].place)
-  let flag = List<Local>.length(&builder.function.locals)
-  let boolean = run Types.intern(Type.Primitive {name: run Bytes.copy(b"bool")})
-  run List<Local>.append(&mut builder.*.function.locals, Local {ty: move boolean,
-    kind: LocalKind.DropFlag {local: stored.local, path: move stored.projections}, origin: origin})
-  let mut mutable = List<CleanupNode>.asMutSlice(&mut builder.*.cleanup)
-  mutable[node].flag = flag
-  return flag
-}
-
-// Flag writes belong to the actual incoming edge, including copies when a Maybe parent is split.
-effect fn flagOnEdge(builder: &mut Builder, edge: usize, flag: usize, value: Operand, origin: Origin) -> ()
-! OutOfMemoryError ? &mut Allocator {
-  let mut blocks = List<Block>.asMutSlice(&mut builder.*.function.blocks)
-  return run List<Statement>.append(&mut blocks[edge].statements,
-    Statement.Assign {destination: place(flag), value: Rvalue.Use {value: move value}, origin: origin})
-}
-
-effect fn componentTransition(builder: &mut Builder, owner: usize, position: usize, state: OwnerState, missing: usize, origin: Origin) -> ()
-! OutOfMemoryError ? &mut Allocator {
-  if !builder.live { return () }
-  let component = ownerComponent(&builder.*, owner, position)
-  let node = component.node
-  let flag = List<CleanupNode>.asSlice(&builder.cleanup)[node].flag
-  let mut owners = List<Owner>.asMutSlice(&mut builder.*.owners)
-  let mut components = List<ComponentState>.asMutSlice(&mut owners[owner].components)
-  components[position].state = state
-  components[position].missing = missing
-  if flag == usize.MAX { return () }
-  return run assign(&mut builder.*, place(flag), Rvalue.Use {value: Operand.Boolean {value: state == OwnerState.Live}}, origin)
-}
-
-// Whole termination ends every component; partial exhaustion never takes this path.
-effect fn markMoved(builder: &mut Builder, index: usize, origin: Origin) -> () ! OutOfMemoryError ? &mut Allocator {
+// Builds owner `index`'s move-path tree before anything moves. Every partial consuming site of
+// the body whose place lies strictly inside the owner (rooted at typed local `local`, or at match
+// subject node `subject`) splits each node on its path into the complete children of that node's
+// level, so a later move, store or drop finds its node however control reached it.
+effect fn expandOwner(builder: &mut Builder, index: usize, local: usize, subject: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let count = List<Remainder>.length(&builder.remainders)
+  let depth = ownerDepth(&builder.*, index)
   let root = List<Owner>.asSlice(&builder.owners)[index].root
-  let count = ownerComponentCount(&builder.*, index)
-  let mut at = usize.ZERO
-  while at < count {
-    run componentTransition(&mut builder.*, index, at, OwnerState.Moved, root, origin)
-    at = at + usize.ONE
-  }
-  let flag = List<CleanupNode>.asSlice(&builder.cleanup)[root].flag
-  if flag != usize.MAX && builder.live {
-    run assign(&mut builder.*, place(flag), Rvalue.Use {value: Operand.Boolean {value: false}}, origin)
-  }
-  let mut components = List<ComponentState>.make()
-  run List<ComponentState>.append(&mut components, ComponentState {node: root, state: OwnerState.Moved, missing: root})
-  let mut owners = List<Owner>.asMutSlice(&mut builder.*.owners)
-  owners[index].components = move components
-  owners[index].ended = true
-  return ()
-}
-
-// Expand one snapshot only using a complete prepared partition. A compact live union does not
-// authenticate an active member merely because another branch selected that member.
-// A join keeps a compact active union compact (`keepActive`): joinAlternatives then reconciles
-// it with arrivals that partitioned it. Any other normalization refuses to split it.
-effect fn expandState(builder: &mut Builder, node: usize, state: OwnerState, missing: usize, edge: usize, keepActive: bool,
-  output: &mut List<ComponentState>, origin: Origin) -> () ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
-  let nodes = List<CleanupNode>.asSlice(&builder.cleanup)
-  if !nodes[node].expanded || state == OwnerState.Alternatives {
-    return run List<ComponentState>.append(&mut output.*, ComponentState {node: node, state: state, missing: missing})
-  }
-  if nodes[node].active && state != OwnerState.Moved {
-    if keepActive {
-      return run List<ComponentState>.append(&mut output.*, ComponentState {node: node, state: state, missing: missing})
-    }
-    let identity = InstanceKey.identity(&builder.function.key)
-    return run unsupported(&identity, origin, GapCode.Cleanup)
-  }
-  let children = run copyIndices(&nodes[node].children)
-  let parentFlag = nodes[node].flag
-  let listed = List<usize>.asSlice(&children)
-  let mut at = usize.ZERO
-  while at < listed.length {
-    if state == OwnerState.Maybe {
-      if parentFlag == usize.MAX {
-        let identity = InstanceKey.identity(&builder.function.key)
-        return run unsupported(&identity, origin, GapCode.Cleanup)
+  let mut remainder = usize.ZERO
+  while remainder < count {
+    let remainders = List<Remainder>.asSlice(&builder.remainders)
+    let site = &remainders[remainder]
+    let rooted = (local != usize.MAX && site.local == local) || (subject != usize.MAX && site.subject == subject)
+    let steps = List<Projection>.length(&site.steps)
+    let owned = rooted && steps > depth
+      && prefixPath(List<Projection>.asSlice(&List<Owner>.asSlice(&builder.owners)[index].path), List<Projection>.asSlice(&site.steps))
+    if owned {
+      let mut node = root
+      let mut at = depth
+      while node != usize.MAX && at < steps {
+        node = run partitionChild(&mut builder.*, node, remainder, at)
+        at = at + usize.ONE
       }
-      let childFlag = run componentFlag(&mut builder.*, listed[at], origin)
-      run flagOnEdge(&mut builder.*, edge, childFlag, Operand.Copy {place: place(parentFlag)}, origin)
     }
-    run expandState(&mut builder.*, listed[at], state, missing, edge, keepActive, &mut output.*, origin)
-    at = at + usize.ONE
+    remainder = remainder + usize.ONE
   }
   return ()
 }
 
-effect fn normalizedComponents(builder: &mut Builder, states: &List<ComponentState>, edge: usize, keepActive: bool, origin: Origin)
-  -> List<ComponentState> ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
-  let listed = List<ComponentState>.asSlice(states)
-  let mut output = List<ComponentState>.make()
+// The child of `node` that remainder `remainder`'s step at `depth` selects. The node's partition
+// for that step is created on first use: one complete partition of a nominal value or array, and
+// one per member or variant tag of a union. A runtime index or a level with a Drop hook selects no
+// tracked child; the ownership check rejects a partial move through either.
+effect fn partitionChild(builder: &mut Builder, node: usize, remainder: usize, depth: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let remainders = List<Remainder>.asSlice(&builder.remainders)
+  let level = &List<RemainderLevel>.asSlice(&remainders[remainder].levels)[depth]
+  let step = run copyProjection(&List<Projection>.asSlice(&remainders[remainder].steps)[depth])
+  if runtimeIndex(&step) || level.hooked { return usize.MAX }
+  let mut tags = usize.ZERO
+  match &level.children {
+    GlueChildren.Members {count, ..} => { tags = count }
+    GlueChildren.Variants {count, ..} => { tags = count }
+    _ => {}
+  }
+  let mut tag = usize.MAX
+  if tags != usize.ZERO {
+    tag = match &step {
+      Projection.Payload {index, ..} => index
+      Projection.VariantField {variant, ..} => variant
+      _ => usize.MAX
+    }
+  }
+  let mut found = usize.MAX
+  let existing = List<CleanupPartition>.asSlice(&List<CleanupNode>.asSlice(&builder.cleanup)[node].partitions)
   let mut at = usize.ZERO
-  while at < listed.length {
-    run expandState(&mut builder.*, listed[at].node, listed[at].state, listed[at].missing, edge, keepActive, &mut output, origin)
+  while at < existing.length {
+    if existing[at].tag == tag { found = at }
     at = at + usize.ONE
   }
-  return move output
+  if found == usize.MAX {
+    found = existing.length
+    let parent = run copyPlace(&List<CleanupNode>.asSlice(&builder.cleanup)[node].place)
+    let inherited = nodeState(&builder.*, node)
+    let children = run remainderChildren(&builder.*, remainder, depth)
+    let listed = List<GlueChild>.asSlice(&children)
+    let mut created = run List<usize>.makeWithCapacity(listed.length)
+    let mut child = usize.ZERO
+    while child < listed.length {
+      let mut stored = run copyPlace(&parent)
+      run List<Projection>.append(&mut stored.projections, run childStep(&builder.*, remainder, depth, &listed[child]))
+      run List<usize>.append(&mut created, List<CleanupNode>.length(&builder.cleanup))
+      run List<CleanupNode>.append(&mut builder.*.cleanup, CleanupNode {place: move stored, ty: Shared<Type>.clone(&listed[child].ty),
+        glue: Option<InstanceKey>.some(InstanceKey.copy(&listed[child].glue)), partitions: List<CleanupPartition>.make(),
+        tags: usize.ZERO, flag: usize.MAX})
+      run List<usize>.append(&mut builder.*.states, inherited)
+      child = child + usize.ONE
+    }
+    let mut mutable = List<CleanupNode>.asMutSlice(&mut builder.*.cleanup)
+    mutable[node].tags = tags
+    run List<CleanupPartition>.append(&mut mutable[node].partitions, CleanupPartition {tag: tag, children: move created})
+  }
+  let nodes = List<CleanupNode>.asSlice(&builder.cleanup)
+  let children = List<usize>.asSlice(&List<CleanupPartition>.asSlice(&nodes[node].partitions)[found].children)
+  at = usize.ZERO
+  while at < children.length {
+    let path = List<Projection>.asSlice(&nodes[children[at]].place.projections)
+    if path.length != usize.ZERO && sameProjection(&path[path.length - usize.ONE], &step) { return children[at] }
+    at = at + usize.ONE
+  }
+  return usize.MAX
 }
 
-effect fn normalizeOwner(builder: &mut Builder, index: usize, origin: Origin) -> () ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
-  let saved = run copyOwnerComponents(&builder.*, index)
-  let edge = builder.current
-  let normalized = run normalizedComponents(&mut builder.*, &saved, edge, false, origin)
-  let mut owners = List<Owner>.asMutSlice(&mut builder.*.owners)
-  owners[index].components = move normalized
-  return ()
+// The node of owner `index` at the path consuming site `remainder` moves.
+fn releasedNode(builder: &Builder, index: usize, remainder: usize) -> usize {
+  if index == usize.MAX || remainder == usize.MAX { return CompilerBug.panic(b"a partial move reached MIR without its owner's remainder") }
+  let remainders = List<Remainder>.asSlice(&builder.remainders)
+  let root = List<Owner>.asSlice(&builder.owners)[index].root
+  let found = componentPathNode(builder, root, List<Projection>.asSlice(&remainders[remainder].steps))
+  if found == usize.MAX { return CompilerBug.panic(b"a partial move reached MIR outside its owner's move-path tree") }
+  return found
 }
 
-// Applies a consuming site's authenticated whole/subtree transfer, never treating a cleanup flag
-// as permission to read or move a conditionally initialized value.
+// Applies a consuming site's whole or partial transfer to the states of its owner's nodes.
 effect fn applyRelease(builder: &mut Builder, release: &Release, needed: bool, origin: Origin) -> ()
 ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
   let mut index = usize.MAX
@@ -2122,7 +2231,7 @@ effect fn applyRelease(builder: &mut Builder, release: &Release, needed: bool, o
     Release.Value => { return () }
     Release.Whole {local} => {
       let whole = ownerIndex(&builder.*, local)
-      if whole != usize.MAX { run markMoved(&mut builder.*, whole, origin) }
+      if whole != usize.MAX { run moveOwner(&mut builder.*, whole) }
       return ()
     }
     Release.Partial {local, node} => {
@@ -2133,12 +2242,12 @@ effect fn applyRelease(builder: &mut Builder, release: &Release, needed: bool, o
     Release.Binding {subject, node, steps} => {
       if !needed { return () }
       index = bindingOwnerIndex(&builder.*, subject, node, steps)
-      if index != usize.MAX && ownerDepth(&builder.*, index) == steps { return run markMoved(&mut builder.*, index, origin) }
+      if index != usize.MAX && ownerDepth(&builder.*, index) == steps { return run moveOwner(&mut builder.*, index) }
       site = node
     }
   }
-  let remainder = remainderIndex(&builder.*, site)
-  return run releaseComponentPath(&mut builder.*, index, remainder, origin)
+  let node = releasedNode(&builder.*, index, remainderIndex(&builder.*, site))
+  return run settleSubtree(&mut builder.*, node, movedState())
 }
 
 fn remainderIndex(builder: &Builder, node: usize) -> usize {
@@ -2151,66 +2260,23 @@ fn remainderIndex(builder: &Builder, node: usize) -> usize {
   return usize.MAX
 }
 
-// Whether a level of remainder `remainder` from depth `from` on, inside the owner it is a hole of,
-// has a Drop hook.
-fn remainderHooked(builder: &Builder, remainder: usize, from: usize) -> bool {
-  let remainders = List<Remainder>.asSlice(&builder.remainders)
-  let levels = List<RemainderLevel>.asSlice(&remainders[remainder].levels)
-  let mut at = from
-  while at < levels.length {
-    if levels[at].hooked { return true }
-    at = at + usize.ONE
-  }
-  return false
+// A copy of the current path's owner states, which branch restoration and joins read back.
+effect fn ownerStates(builder: &Builder) -> OwnerSnapshot ! OutOfMemoryError ? &mut Allocator {
+  return OwnerSnapshot {owners: List<Owner>.length(&builder.owners), states: run copyIndices(&builder.states)}
 }
 
-effect fn copyIndices(values: &List<usize>) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
-  let listed = List<usize>.asSlice(values)
-  let mut copied = run List<usize>.makeWithCapacity(listed.length)
-  let mut at = usize.ZERO
-  while at < listed.length {
-    run List<usize>.append(&mut copied, listed[at])
-    at = at + usize.ONE
-  }
-  return move copied
+effect fn copyStates(states: &OwnerSnapshot) -> OwnerSnapshot ! OutOfMemoryError ? &mut Allocator {
+  return OwnerSnapshot {owners: states.owners, states: run copyIndices(&states.states)}
 }
 
-effect fn ownerStates(builder: &Builder) -> List<OwnerSnapshot> ! OutOfMemoryError ? &mut Allocator {
-  let owners = List<Owner>.asSlice(&builder.owners)
-  let mut states = run List<OwnerSnapshot>.makeWithCapacity(owners.length)
-  let mut at = usize.ZERO
-  while at < owners.length {
-    run List<OwnerSnapshot>.append(&mut states, OwnerSnapshot {
-      components: run copyComponents(&owners[at].components), ended: owners[at].ended})
-    at = at + usize.ONE
-  }
-  return move states
-}
-
-effect fn copyStates(states: &List<OwnerSnapshot>) -> List<OwnerSnapshot> ! OutOfMemoryError ? &mut Allocator {
-  let listed = List<OwnerSnapshot>.asSlice(states)
-  let mut copied = run List<OwnerSnapshot>.makeWithCapacity(listed.length)
-  let mut at = usize.ZERO
-  while at < listed.length {
-    run List<OwnerSnapshot>.append(&mut copied, OwnerSnapshot {
-      components: run copyComponents(&listed[at].components), ended: listed[at].ended})
-    at = at + usize.ONE
-  }
-  return move copied
-}
-
-// The proof tree and its stable flags survive restoration; only path-dependent liveness changes.
-effect fn restoreOwners(builder: &mut Builder, states: &List<OwnerSnapshot>) -> () ! OutOfMemoryError ? &mut Allocator {
-  let saved = List<OwnerSnapshot>.asSlice(states)
-  truncateOwners(&mut builder.*, saved.length)
-  let mut at = usize.ZERO
-  while at < saved.length {
-    let components = run copyComponents(&saved[at].components)
-    let mut owners = List<Owner>.asMutSlice(&mut builder.*.owners)
-    owners[at].components = move components
-    owners[at].ended = saved[at].ended
-    at = at + usize.ONE
-  }
+// The move-path trees and their flags survive restoration; only the path-dependent states change.
+// A node created after the snapshot belongs to an owner the restored path no longer holds.
+effect fn restoreOwners(builder: &mut Builder, states: &OwnerSnapshot) -> () ! OutOfMemoryError ? &mut Allocator {
+  truncateOwners(&mut builder.*, states.owners)
+  let mut restored = run copyIndices(&states.states)
+  let missing = List<CleanupNode>.length(&builder.cleanup) - List<usize>.length(&restored)
+  run List<usize>.appendRepeated(&mut restored, movedState(), missing)
+  builder.states = move restored
   return ()
 }
 
@@ -2218,71 +2284,252 @@ effect fn arrival(builder: &Builder) -> Arrival ! OutOfMemoryError ? &mut Alloca
   return Arrival {block: builder.current, states: run ownerStates(builder)}
 }
 
-effect fn flagLoopOwners(builder: &mut Builder, origin: Origin) -> () ! OutOfMemoryError ? &mut Allocator | &mut Types {
-  let count = List<Owner>.length(&builder.owners)
-  let mut index = usize.ZERO
-  while index < count {
-    let size = ownerComponentCount(&builder.*, index)
-    let mut at = usize.ZERO
-    while at < size {
-      let component = ownerComponent(&builder.*, index, at)
-      let node = component.node
-      if component.state == OwnerState.Moved {
-        let flag = run componentFlag(&mut builder.*, node, origin)
-        run assign(&mut builder.*, place(flag), Rvalue.Use {value: Operand.Boolean {value: false}}, origin)
-        let mut owners = List<Owner>.asMutSlice(&mut builder.*.owners)
-        let mut components = List<ComponentState>.asMutSlice(&mut owners[index].components)
-        components[at].state = OwnerState.Maybe
-      }
+// Joins the incoming edges' states node by node. A node whose arrivals disagree takes its flag,
+// which each disagreeing edge writes; an edge whose state already is that flag writes nothing.
+effect fn joinOwners(builder: &mut Builder, arrivals: &[Arrival], origin: Origin) -> () ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if arrivals.length == usize.ZERO { return () }
+  if arrivals.length == usize.ONE { return run restoreOwners(&mut builder.*, &arrivals[usize.ZERO].states) }
+  let alive = run liveNodes(&builder.*)
+  let count = List<CleanupNode>.length(&builder.cleanup)
+  let mut joined = run List<usize>.makeWithCapacity(count)
+  let mut node = usize.ZERO
+  while node < count {
+    if !List<bool>.asSlice(&alive)[node] {
+      run List<usize>.append(&mut joined, movedState())
+      node = node + usize.ONE
+      continue
+    }
+    let first = arrivalState(&arrivals[usize.ZERO], node)
+    let mut same = true
+    let mut at = usize.ONE
+    while at < arrivals.length {
+      if arrivalState(&arrivals[at], node) != first { same = false }
       at = at + usize.ONE
     }
-    index = index + usize.ONE
+    if same {
+      run List<usize>.append(&mut joined, first)
+    } else {
+      let flag = run nodeFlag(&mut builder.*, node, origin)
+      at = usize.ZERO
+      while at < arrivals.length {
+        let state = arrivalState(&arrivals[at], node)
+        if state != flag { run flagOnEdge(&mut builder.*, arrivals[at].block, flag, stateValue(state), origin) }
+        at = at + usize.ONE
+      }
+      run List<usize>.append(&mut joined, flag)
+    }
+    node = node + usize.ONE
   }
+  builder.states = move joined
   return ()
 }
 
-fn sameFrontier(left: &List<ComponentState>, right: &List<ComponentState>, backEdge: bool) -> bool {
-  let first = List<ComponentState>.asSlice(left)
-  let second = List<ComponentState>.asSlice(right)
-  if first.length != second.length { return false }
+// The state of `node` on an incoming edge. A node of an owner the join still holds existed when
+// the edge was recorded, since owners are acquired in scopes the join encloses.
+fn arrivalState(arrival: &Arrival, node: usize) -> usize {
+  let states = List<usize>.asSlice(&arrival.states.states)
+  if node >= states.length { return CompilerBug.panic(b"a join edge was recorded before an owner the join holds") }
+  return states[node]
+}
+
+// Whether the current path's states are still those of `states`.
+fn sameStates(builder: &Builder, states: &OwnerSnapshot) -> bool {
+  let current = List<usize>.asSlice(&builder.states)
+  let saved = List<usize>.asSlice(&states.states)
   let mut at = usize.ZERO
-  while at < first.length {
-    if first[at].node != second[at].node { return false }
-    if !(backEdge && second[at].state == OwnerState.Maybe) {
-      if first[at].state != second[at].state || first[at].missing != second[at].missing { return false }
-    }
+  let nodes = List<CleanupNode>.asSlice(&builder.cleanup)
+  while at < saved.length {
+    // A loop inside the guard keeps a moved node moved under its flag.
+    if current[at] != saved[at] && !(saved[at] == movedState() && current[at] == nodes[at].flag) { return false }
     at = at + usize.ONE
   }
   return true
 }
 
-// Changed loop/guard partition domains remain a boundary; no liveness flag proves availability.
-effect fn checkBackEdge(builder: &Builder, entry: &List<OwnerSnapshot>, origin: Origin) -> () ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
-  let expected = List<OwnerSnapshot>.asSlice(entry)
-  let owners = List<Owner>.asSlice(&builder.owners)
-  let mut index = usize.ZERO
-  while index < expected.length {
-    if !sameFrontier(&owners[index].components, &expected[index].components, true) {
-      let owner = InstanceKey.identity(&builder.function.key)
-      return run unsupported(&owner, origin, GapCode.Cleanup)
+// Opens a loop header. A node live on entry stays live on every back edge (the ownership check
+// rejects a move that a later iteration would see, OWN0005); a moved node of a source place may
+// become live again in the body, so its header state is its flag, written on the entry edge here and on each back
+// edge by `repeatLoop`. The result lists each node's header state, or `mixedState()` for a node no
+// owner holds; no node's state is ever mixed, so the two cannot be confused.
+effect fn loopHeads(builder: &mut Builder, origin: Origin) -> List<usize> ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let alive = run liveNodes(&builder.*)
+  let count = List<CleanupNode>.length(&builder.cleanup)
+  let mut heads = run List<usize>.makeWithCapacity(count)
+  let mut node = usize.ZERO
+  while node < count {
+    let mut head = mixedState()
+    if List<bool>.asSlice(&alive)[node] {
+      let state = nodeState(&builder.*, node)
+      head = state
+      if state == movedState() && refillable(&builder.*, node) {
+        head = run nodeFlag(&mut builder.*, node, origin)
+        if builder.live { run assign(&mut builder.*, place(head), Rvalue.Use {value: stateValue(state)}, origin) }
+        setNodeState(&mut builder.*, node, head)
+      }
     }
-    index = index + usize.ONE
+    run List<usize>.append(&mut heads, head)
+    node = node + usize.ONE
+  }
+  return move heads
+}
+
+// Whether a moved node can become live again: only source can store into a place, and a
+// temporary is written once, so a temporary's moved part stays moved and needs no loop flag.
+fn refillable(builder: &Builder, node: usize) -> bool {
+  let local = List<CleanupNode>.asSlice(&builder.cleanup)[node].place.local
+  return match &List<Local>.asSlice(&builder.function.locals)[local].kind {
+    LocalKind.Temp => false
+    _ => true
+  }
+}
+
+// Ends the current block's path as a back edge to a loop header with states `heads`.
+effect fn repeatLoop(builder: &mut Builder, heads: &List<usize>, origin: Origin) -> () ! OutOfMemoryError ? &mut Allocator {
+  let listed = List<usize>.asSlice(heads)
+  let mut node = usize.ZERO
+  while node < listed.length {
+    let head = listed[node]
+    let state = nodeState(&builder.*, node)
+    if head == liveState() && state != liveState() { return CompilerBug.panic(b"a loop back edge ends an owner that is live on entry") }
+    if head == movedState() && state != movedState() { return CompilerBug.panic(b"a loop back edge refills a temporary's moved part") }
+    if head != mixedState() && head != liveState() && head != movedState() && state != head {
+      run assign(&mut builder.*, place(head), Rvalue.Use {value: stateValue(state)}, origin)
+    }
+    node = node + usize.ONE
   }
   return ()
 }
 
-effect fn checkUnchanged(builder: &Builder, entry: &List<OwnerSnapshot>, origin: Origin) -> () ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
-  let expected = List<OwnerSnapshot>.asSlice(entry)
-  let owners = List<Owner>.asSlice(&builder.owners)
-  let mut index = usize.ZERO
-  while index < expected.length {
-    if owners[index].ended != expected[index].ended || !sameFrontier(&owners[index].components, &expected[index].components, false) {
-      let owner = InstanceKey.identity(&builder.function.key)
-      return run unsupported(&owner, origin, GapCode.Cleanup)
+// Drops what `node`'s subtree still owns, on the current path (plan usize.MAX) or as recorded by
+// exit plan `plan`: its whole value when every node is live, nothing when every node is moved, its
+// whole value under the flag every node shares, and otherwise each child of its partition in turn.
+// An open union first selects the partition of its active member or variant by its runtime tag;
+// a tag no partial move reached keeps the union's own state.
+effect fn elaborate(builder: &mut Builder, node: usize, plan: usize, origin: Origin) -> ()
+! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if !builder.live { return () }
+  let state = uniformState(&builder.*, stateSource(&builder.*, plan), node)
+  if state != mixedState() { return run dropNodeAs(&mut builder.*, node, state, origin) }
+  let tags = List<CleanupNode>.asSlice(&builder.cleanup)[node].tags
+  if tags == usize.ZERO {
+    let children = run partitionChildren(&builder.*, node, usize.ZERO)
+    let listed = List<usize>.asSlice(&children)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      run elaborate(&mut builder.*, listed[at], plan, origin)
+      at = at + usize.ONE
     }
-    index = index + usize.ONE
+    return ()
   }
+  // A payload moved on every path here proves its member or variant is the active one.
+  let proven = run provenPartition(&builder.*, stateSource(&builder.*, plan), node)
+  if proven != usize.MAX {
+    let children = run partitionChildren(&builder.*, node, proven)
+    let listed = List<usize>.asSlice(&children)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      run elaborate(&mut builder.*, listed[at], plan, origin)
+      at = at + usize.ONE
+    }
+    return ()
+  }
+  let own = stateSource(&builder.*, plan)[node]
+  let stored = run copyPlace(&List<CleanupNode>.asSlice(&builder.cleanup)[node].place)
+  let tagType = run Layout.tagType(tags)
+  let read = run temporary(&mut builder.*, &tagType, origin)
+  run assign(&mut builder.*, place(read), Rvalue.Discriminant {place: move stored}, origin)
+  let count = List<CleanupPartition>.length(&List<CleanupNode>.asSlice(&builder.cleanup)[node].partitions)
+  let after = run block(&mut builder.*, origin)
+  let otherwise = run block(&mut builder.*, origin)
+  let mut cases = List<SwitchCase>.make()
+  let mut targets = List<usize>.make()
+  let mut at = usize.ZERO
+  while at < count {
+    let tag = List<CleanupPartition>.asSlice(&List<CleanupNode>.asSlice(&builder.cleanup)[node].partitions)[at].tag
+    let target = run block(&mut builder.*, origin)
+    run List<usize>.append(&mut targets, target)
+    run List<SwitchCase>.append(&mut cases, SwitchCase {decimal: run Type.extentText(tag), negative: false, target: target})
+    at = at + usize.ONE
+  }
+  terminate(&mut builder.*, Terminator.Switch {value: Operand.Copy {place: place(read)}, cases: move cases, otherwise: otherwise, origin: origin})
+  at = usize.ZERO
+  while at < count {
+    resume(&mut builder.*, List<usize>.asSlice(&targets)[at])
+    let children = run partitionChildren(&builder.*, node, at)
+    let listed = List<usize>.asSlice(&children)
+    let mut child = usize.ZERO
+    while child < listed.length {
+      run elaborate(&mut builder.*, listed[child], plan, origin)
+      child = child + usize.ONE
+    }
+    terminate(&mut builder.*, Terminator.Goto {target: after, origin: origin})
+    at = at + usize.ONE
+  }
+  resume(&mut builder.*, otherwise)
+  run dropNodeAs(&mut builder.*, node, own, origin)
+  terminate(&mut builder.*, Terminator.Goto {target: after, origin: origin})
+  resume(&mut builder.*, after)
   return ()
+}
+
+// The partition of union `node` holding a node that `states` records as moved, or usize.MAX. Only
+// the active member's payload can be moved, so that partition is the one present.
+effect fn provenPartition(builder: &Builder, states: &[usize], node: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let count = List<CleanupPartition>.length(&List<CleanupNode>.asSlice(&builder.cleanup)[node].partitions)
+  let mut partition = usize.ZERO
+  while partition < count {
+    let children = run partitionChildren(builder, node, partition)
+    let listed = List<usize>.asSlice(&children)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      let found = run subtree(builder, listed[at])
+      let reached = List<usize>.asSlice(&found)
+      let mut position = usize.ZERO
+      while position < reached.length {
+        if states[reached[position]] == movedState() { return partition }
+        position = position + usize.ONE
+      }
+      at = at + usize.ONE
+    }
+    partition = partition + usize.ONE
+  }
+  return usize.MAX
+}
+
+effect fn partitionChildren(builder: &Builder, node: usize, partition: usize) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
+  let nodes = List<CleanupNode>.asSlice(&builder.cleanup)
+  return run copyIndices(&List<CleanupPartition>.asSlice(&nodes[node].partitions)[partition].children)
+}
+
+// Drops `node`'s whole value in one state: through its glue when live, under the flag that holds
+// its answer, or not at all when moved. Only an owner of an open abstract type has no glue.
+effect fn dropNodeAs(builder: &mut Builder, node: usize, state: usize, origin: Origin) -> ()
+! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
+  if state == movedState() || !builder.live { return () }
+  let nodes = List<CleanupNode>.asSlice(&builder.cleanup)
+  let stored = run copyPlace(&nodes[node].place)
+  let glue = match &nodes[node].glue {
+    Option<InstanceKey>.Some {value} => InstanceKey.copy(&value)
+    Option<InstanceKey>.None => {
+      let identity = InstanceKey.identity(&builder.function.key)
+      return run unsupported(&identity, origin, GapCode.OpenInstance)
+    }
+  }
+  if state == liveState() { return run dropPrepared(&mut builder.*, move stored, move glue, origin) }
+  let dropping = run block(&mut builder.*, origin)
+  let after = run block(&mut builder.*, origin)
+  terminate(&mut builder.*, Terminator.Branch {condition: Operand.Copy {place: place(state)}, thenBlock: dropping, elseBlock: after, origin: origin})
+  resume(&mut builder.*, dropping)
+  run dropPrepared(&mut builder.*, move stored, move glue, origin)
+  terminate(&mut builder.*, Terminator.Goto {target: after, origin: origin})
+  resume(&mut builder.*, after)
+  return ()
+}
+
+// Lexical owners are dropped in acquisition order, each by elaborating its move-path tree.
+effect fn dropOwner(builder: &mut Builder, index: usize, origin: Origin) -> () ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let root = List<Owner>.asSlice(&builder.owners)[index].root
+  return run elaborate(&mut builder.*, root, usize.MAX, origin)
 }
 
 // Ends the temporaries created since `pending` on the current path.
@@ -2302,520 +2549,44 @@ effect fn settledCondition(builder: &mut Builder, condition: Operand, pending: u
   return Operand.Copy {place: place(copied)}
 }
 
-fn outerMissing(builder: &Builder, first: usize, second: usize) -> usize {
-  if first == usize.MAX { return second }
-  if second == usize.MAX { return first }
-  let nodes = List<CleanupNode>.asSlice(&builder.cleanup)
-  if List<Projection>.length(&nodes[first].place.projections) <= List<Projection>.length(&nodes[second].place.projections) { return first }
-  return second
-}
-
+// The node of the tree under `node` whose place is exactly `path`, or usize.MAX.
 fn componentPathNode(builder: &Builder, node: usize, path: &[Projection]) -> usize {
   let nodes = List<CleanupNode>.asSlice(&builder.cleanup)
   let actual = List<Projection>.asSlice(&nodes[node].place.projections)
   if !prefixPath(actual, path) { return usize.MAX }
   if actual.length == path.length { return node }
-  let children = List<usize>.asSlice(&nodes[node].children)
-  let mut at = usize.ZERO
-  while at < children.length {
-    let found = componentPathNode(builder, children[at], path)
-    if found != usize.MAX { return found }
-    at = at + usize.ONE
-  }
-  let alternatives = List<CleanupPartition>.asSlice(&nodes[node].alternatives)
-  at = usize.ZERO
-  while at < alternatives.length {
-    let nested = List<usize>.asSlice(&alternatives[at].children)
+  let partitions = List<CleanupPartition>.asSlice(&nodes[node].partitions)
+  let mut partition = usize.ZERO
+  while partition < partitions.length {
+    let children = List<usize>.asSlice(&partitions[partition].children)
     let mut child = usize.ZERO
-    while child < nested.length {
-      let found = componentPathNode(builder, nested[child], path)
+    while child < children.length {
+      let found = componentPathNode(builder, children[child], path)
       if found != usize.MAX { return found }
       child = child + usize.ONE
     }
-    at = at + usize.ONE
+    partition = partition + usize.ONE
   }
   return usize.MAX
 }
 
-// Whether every arrival lists the same components for owner `index`, in the same order.
-fn sharedFrontier(arrivals: &[Arrival], index: usize) -> bool {
-  let firstStates = List<OwnerSnapshot>.asSlice(&arrivals[usize.ZERO].states)
-  let first = List<ComponentState>.asSlice(&firstStates[index].components)
-  let mut at = usize.ONE
-  while at < arrivals.length {
-    let otherStates = List<OwnerSnapshot>.asSlice(&arrivals[at].states)
-    let other = List<ComponentState>.asSlice(&otherStates[index].components)
-    if other.length != first.length { return false }
-    let mut position = usize.ZERO
-    while position < first.length {
-      if other[position].node != first[position].node { return false }
-      position = position + usize.ONE
-    }
-    at = at + usize.ONE
-  }
-  return true
-}
-
-fn listedIndex(values: &[usize], value: usize) -> bool {
-  let mut at = usize.ZERO
-  while at < values.length {
-    if values[at] == value { return true }
-    at = at + usize.ONE
-  }
-  return false
-}
-
-// Whether `node` lies strictly inside `ancestor`'s storage.
-fn strictDescendant(builder: &Builder, ancestor: usize, node: usize) -> bool {
+// The deepest node under `node` whose place is a prefix of `path`.
+fn containingNode(builder: &Builder, node: usize, path: &[Projection]) -> usize {
   let nodes = List<CleanupNode>.asSlice(&builder.cleanup)
-  let outer = &nodes[ancestor].place
-  let inner = &nodes[node].place
-  let outerPath = List<Projection>.asSlice(&outer.projections)
-  let innerPath = List<Projection>.asSlice(&inner.projections)
-  return outer.local == inner.local && outerPath.length < innerPath.length && prefixPath(outerPath, innerPath)
-}
-
-// The children of partition `ordinal` of `node`: 0 is its first partition, k + 1 its alternative k.
-effect fn partitionChildren(builder: &Builder, node: usize, ordinal: usize) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
-  let nodes = List<CleanupNode>.asSlice(&builder.cleanup)
-  if ordinal == usize.ZERO { return run copyIndices(&nodes[node].children) }
-  let alternatives = List<CleanupPartition>.asSlice(&nodes[node].alternatives)
-  return run copyIndices(&alternatives[ordinal - usize.ONE].children)
-}
-
-fn partitionCount(builder: &Builder, node: usize) -> usize {
-  let nodes = List<CleanupNode>.asSlice(&builder.cleanup)
-  return List<CleanupPartition>.length(&nodes[node].alternatives) + usize.ONE
-}
-
-// The partition whose children are exactly `found`, or MAX.
-effect fn matchingPartition(builder: &Builder, node: usize, found: &[usize]) -> usize ! OutOfMemoryError ? &mut Allocator {
-  let count = partitionCount(builder, node)
-  let mut ordinal = usize.ZERO
-  while ordinal < count {
-    let children = run partitionChildren(builder, node, ordinal)
-    let listed = List<usize>.asSlice(&children)
-    let mut same = listed.length == found.length && listed.length != usize.ZERO
-    let mut at = usize.ZERO
-    while same && at < found.length {
-      same = listedIndex(listed, found[at])
-      at = at + usize.ONE
-    }
-    if same { return ordinal }
-    ordinal = ordinal + usize.ONE
-  }
-  return usize.MAX
-}
-
-// An active union that some arrivals keep compact while others partition it, or that arrivals
-// partition differently, joins as one Alternatives component (OWN-004, OWN-008). The union's own
-// flag, present only when some arrival kept it compact, holds whether the whole union is live, and
-// each child of every joined partition has its own flag, false on every arrival that did
-// not authenticate that partition. A partition is reached only on the path that authenticated its
-// member or variant, so cleanup selects it by the union's runtime tag (dropAlternatives).
-effect fn joinAlternatives(builder: &mut Builder, arrivals: &[Arrival], incoming: &mut List<OwnerSnapshot>, origin: Origin)
--> () ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
-  let mut candidates = List<usize>.make()
-  let count = List<CleanupNode>.length(&builder.cleanup)
-  let mut node = usize.ZERO
-  while node < count {
-    let nodes = List<CleanupNode>.asSlice(&builder.cleanup)
-    if nodes[node].active && nodes[node].expanded && partitionedElsewhere(&builder.*, &incoming.*, node) {
-      let disagree = run arrivalsDisagree(&builder.*, &incoming.*, node)
-      if disagree { run List<usize>.append(&mut candidates, node) }
-    }
-    node = node + usize.ONE
-  }
-  let listed = List<usize>.asSlice(&candidates)
-  let mut at = usize.ZERO
-  while at < listed.length {
-    run joinAlternative(&mut builder.*, arrivals, &mut incoming.*, listed[at], origin)
-    at = at + usize.ONE
-  }
-  return ()
-}
-
-// Whether some arrival keeps `node` compact, or two arrivals partition it differently.
-effect fn arrivalsDisagree(builder: &Builder, incoming: &List<OwnerSnapshot>, node: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
-  let snapshots = List<OwnerSnapshot>.asSlice(incoming)
-  let mut first = usize.MAX
-  let mut edge = usize.ZERO
-  while edge < snapshots.length {
-    let components = List<ComponentState>.asSlice(&snapshots[edge].components)
-    let mut found = List<usize>.make()
-    let mut at = usize.ZERO
-    while at < components.length {
-      if components[at].node == node && components[at].state != OwnerState.Moved { return true }
-      if strictDescendant(builder, node, components[at].node) { run List<usize>.append(&mut found, components[at].node) }
-      at = at + usize.ONE
-    }
-    if List<usize>.length(&found) != usize.ZERO {
-      let ordinal = run matchingPartition(builder, node, List<usize>.asSlice(&found))
-      if first == usize.MAX { first = ordinal } else if ordinal != first { return true }
-    }
-    edge = edge + usize.ONE
-  }
-  return false
-}
-
-fn partitionedElsewhere(builder: &Builder, incoming: &List<OwnerSnapshot>, node: usize) -> bool {
-  let snapshots = List<OwnerSnapshot>.asSlice(incoming)
-  let mut edge = usize.ZERO
-  while edge < snapshots.length {
-    let components = List<ComponentState>.asSlice(&snapshots[edge].components)
-    let mut at = usize.ZERO
-    while at < components.length {
-      if strictDescendant(builder, node, components[at].node) { return true }
-      at = at + usize.ONE
-    }
-    edge = edge + usize.ONE
-  }
-  return false
-}
-
-effect fn joinAlternative(builder: &mut Builder, arrivals: &[Arrival], incoming: &mut List<OwnerSnapshot>, node: usize, origin: Origin)
--> () ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
-  let identity = InstanceKey.identity(&builder.function.key)
-  let edges = List<OwnerSnapshot>.length(&incoming.*)
-  // Per arrival: the partition it authenticated, or MAX when it keeps the union compact.
-  let mut selected = List<usize>.make()
-  let mut whole = false
-  let mut partitions = List<usize>.make()
-  let mut edge = usize.ZERO
-  while edge < edges {
-    let arrived = List<OwnerSnapshot>.asSlice(&incoming.*)
-    let listed = run copyComponents(&arrived[edge].components)
-    let components = List<ComponentState>.asSlice(&listed)
-    let mut compact = false
-    let mut found = List<usize>.make()
-    let mut at = usize.ZERO
-    while at < components.length {
-      if components[at].node == node {
-        // A repeated Alternatives join would need flag writes on arrivals it already joined.
-        if components[at].state == OwnerState.Alternatives { return run unsupported(&identity, origin, GapCode.Cleanup) }
-        compact = true
-      } else if strictDescendant(&builder.*, node, components[at].node) {
-        run List<usize>.append(&mut found, components[at].node)
-      }
-      at = at + usize.ONE
-    }
-    if compact {
-      whole = true
-      run List<usize>.append(&mut selected, usize.MAX)
-    } else {
-      let ordinal = run matchingPartition(&builder.*, node, List<usize>.asSlice(&found))
-      // Only one directly partitioned level is joined; a nested partition keeps the gap.
-      if ordinal == usize.MAX { return run unsupported(&identity, origin, GapCode.Cleanup) }
-      if !listedIndex(List<usize>.asSlice(&partitions), ordinal) { run List<usize>.append(&mut partitions, ordinal) }
-      run List<usize>.append(&mut selected, ordinal)
-    }
-    edge = edge + usize.ONE
-  }
-  if List<CleanupNode>.asSlice(&builder.cleanup)[node].tags == usize.ZERO { return run unsupported(&identity, origin, GapCode.Cleanup) }
-  let mut wholeFlag = usize.MAX
-  if whole { wholeFlag = run componentFlag(&mut builder.*, node, origin) }
-  edge = usize.ZERO
-  while edge < edges {
-    let block = arrivals[edge].block
-    let chosen = List<usize>.asSlice(&selected)[edge]
-    let arrived = List<OwnerSnapshot>.asSlice(&incoming.*)
-    let listed = run copyComponents(&arrived[edge].components)
-    let components = List<ComponentState>.asSlice(&listed)
-    let mut missing = usize.MAX
-    let mut scan = usize.ZERO
-    while scan < components.length {
-      if components[scan].node == node || strictDescendant(&builder.*, node, components[scan].node) {
-        missing = outerMissing(&builder.*, missing, components[scan].missing)
-      }
-      scan = scan + usize.ONE
-    }
-    let mut rebuilt = List<ComponentState>.make()
-    let mut placed = false
-    let mut at = usize.ZERO
-    while at < components.length {
-      let current = components[at]
-      let inside = current.node == node || strictDescendant(&builder.*, node, current.node)
-      if !inside {
-        run List<ComponentState>.append(&mut rebuilt, current)
-        at = at + usize.ONE
-        continue
-      }
-      if current.node == node {
-        // A Maybe union's existing flag already holds whether the whole union is live here.
-        if current.state != OwnerState.Maybe {
-          run flagOnEdge(&mut builder.*, block, wholeFlag, Operand.Boolean {value: current.state == OwnerState.Live}, origin)
-        }
-      } else {
-        let childFlag = run componentFlag(&mut builder.*, current.node, origin)
-        if current.state != OwnerState.Maybe {
-          run flagOnEdge(&mut builder.*, block, childFlag, Operand.Boolean {value: current.state == OwnerState.Live}, origin)
-        }
-      }
-      if !placed {
-        run List<ComponentState>.append(&mut rebuilt, ComponentState {node: node, state: OwnerState.Alternatives, missing: missing})
-        placed = true
-      }
-      at = at + usize.ONE
-    }
-    if chosen != usize.MAX && whole {
-      run flagOnEdge(&mut builder.*, block, wholeFlag, Operand.Boolean {value: false}, origin)
-    }
-    // Every joined partition this arrival did not authenticate holds no live child here.
-    let count = List<usize>.length(&partitions)
-    let mut other = usize.ZERO
-    while other < count {
-      let ordinal = List<usize>.asSlice(&partitions)[other]
-      if ordinal != chosen {
-        let children = run partitionChildren(&builder.*, node, ordinal)
-        let listedChildren = List<usize>.asSlice(&children)
-        let mut child = usize.ZERO
-        while child < listedChildren.length {
-          let childFlag = run componentFlag(&mut builder.*, listedChildren[child], origin)
-          run flagOnEdge(&mut builder.*, block, childFlag, Operand.Boolean {value: false}, origin)
-          child = child + usize.ONE
-        }
-      }
-      other = other + usize.ONE
-    }
-    let mut snapshots = List<OwnerSnapshot>.asMutSlice(&mut incoming.*)
-    snapshots[edge].components = move rebuilt
-    edge = edge + usize.ONE
-  }
-  let mut nodes = List<CleanupNode>.asMutSlice(&mut builder.*.cleanup)
-  nodes[node].joined = move partitions
-  return ()
-}
-
-// Reconcile actual canonical component domains before comparing liveness. Incoming Maybe
-// parents initialize independent child flags on their own edges, never on the joined path.
-effect fn joinOwners(builder: &mut Builder, arrivals: &[Arrival], origin: Origin) -> () ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
-  if arrivals.length == usize.ZERO { return () }
-  if arrivals.length == usize.ONE { return run restoreOwners(&mut builder.*, &arrivals[usize.ZERO].states) }
-  let count = List<Owner>.length(&builder.owners)
-  let mut index = usize.ZERO
-  while index < count {
-    let mut complete = true
-    let mut edge = usize.ZERO
-    while edge < arrivals.length {
-      let snapshots = List<OwnerSnapshot>.asSlice(&arrivals[edge].states)
-      let saved = &snapshots[index]
-      if saved.ended || !allComponentsLive(&saved.components) { complete = false }
-      edge = edge + usize.ONE
-    }
-    if complete {
-      // Every incoming value is complete, so the compact root is canonical even when separately
-      // authenticated arms used different active partitions. No child liveness is inferred here.
-      let root = List<Owner>.asSlice(&builder.owners)[index].root
-      let mut components = List<ComponentState>.make()
-      run List<ComponentState>.append(&mut components, ComponentState {node: root, state: OwnerState.Live, missing: usize.MAX})
-      let mut owners = List<Owner>.asMutSlice(&mut builder.*.owners)
-      owners[index].components = move components
-      owners[index].ended = false
-      index = index + usize.ONE
-      continue
-    }
-    // Arrivals that already share one frontier join component by component. Normalizing them
-    // would only split a component, and a compact active union splits only by claiming a member.
-    let shared = sharedFrontier(arrivals, index)
-    let mut incoming = List<OwnerSnapshot>.make()
-    let mut ended = false
-    let mut at = usize.ZERO
-    while at < arrivals.length {
-      let snapshots = List<OwnerSnapshot>.asSlice(&arrivals[at].states)
-      let saved = &snapshots[index]
-      let mut components = List<ComponentState>.make()
-      if shared {
-        components = run copyComponents(&saved.components)
-      } else {
-        components = run normalizedComponents(&mut builder.*, &saved.components, arrivals[at].block, true, origin)
-      }
-      if saved.ended { ended = true }
-      run List<OwnerSnapshot>.append(&mut incoming, OwnerSnapshot {components: move components, ended: saved.ended})
-      at = at + usize.ONE
-    }
-    run joinAlternatives(&mut builder.*, arrivals, &mut incoming, origin)
-    let snapshots = List<OwnerSnapshot>.asSlice(&incoming)
-    let first = List<ComponentState>.asSlice(&snapshots[usize.ZERO].components)
-    at = usize.ONE
-    while at < arrivals.length {
-      let other = List<ComponentState>.asSlice(&snapshots[at].components)
-      if other.length != first.length {
-        let identity = InstanceKey.identity(&builder.function.key)
-        return run unsupported(&identity, origin, GapCode.Cleanup)
-      }
-      at = at + usize.ONE
-    }
-    let mut joined = List<ComponentState>.make()
-    let mut position = usize.ZERO
-    while position < first.length {
-      let node = first[position].node
-      let initial = first[position].state
-      let mut missing = first[position].missing
-      let mut same = true
-      at = usize.ONE
-      while at < arrivals.length {
-        let other = List<ComponentState>.asSlice(&snapshots[at].components)
-        if other.length != first.length || other[position].node != node {
-          let identity = InstanceKey.identity(&builder.function.key)
-          return run unsupported(&identity, origin, GapCode.Cleanup)
-        }
-        if other[position].state != initial { same = false }
-        missing = outerMissing(&builder.*, missing, other[position].missing)
-        at = at + usize.ONE
-      }
-      let mut state = initial
-      if !same {
-        let flag = run componentFlag(&mut builder.*, node, origin)
-        at = usize.ZERO
-        while at < arrivals.length {
-          let actual = List<ComponentState>.asSlice(&snapshots[at].components)[position].state
-          if actual != OwnerState.Maybe {
-            run flagOnEdge(&mut builder.*, arrivals[at].block, flag, Operand.Boolean {value: actual == OwnerState.Live}, origin)
-          }
-          at = at + usize.ONE
-        }
-        state = OwnerState.Maybe
-      }
-      // A Maybe answer must have exact edge definitions, never an uninitialized sentinel flag.
-      if state == OwnerState.Maybe && List<CleanupNode>.asSlice(&builder.cleanup)[node].flag == usize.MAX {
-        let identity = InstanceKey.identity(&builder.function.key)
-        return run unsupported(&identity, origin, GapCode.Cleanup)
-      }
-      run List<ComponentState>.append(&mut joined, ComponentState {node: node, state: state, missing: missing})
-      position = position + usize.ONE
-    }
-    let mut owners = List<Owner>.asMutSlice(&mut builder.*.owners)
-    owners[index].components = move joined
-    owners[index].ended = ended
-    index = index + usize.ONE
-  }
-  return ()
-}
-
-effect fn dropComponent(builder: &mut Builder, component: &ComponentState, origin: Origin) -> () ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
-  if component.state == OwnerState.Moved { return () }
-  if component.state == OwnerState.Alternatives { return run dropAlternatives(&mut builder.*, component.node, origin) }
-  let nodes = List<CleanupNode>.asSlice(&builder.cleanup)
-  let stored = run copyPlace(&nodes[component.node].place)
-  let glue = match &nodes[component.node].glue {
-    Option<InstanceKey>.Some {value} => InstanceKey.copy(&value)
-    _ => {
-      let identity = InstanceKey.identity(&builder.function.key)
-      return run unsupported(&identity, origin, GapCode.Cleanup)
-    }
-  }
-  let flag = nodes[component.node].flag
-  if component.state == OwnerState.Live { return run dropPrepared(&mut builder.*, move stored, move glue, origin) }
-  if flag == usize.MAX {
-    let identity = InstanceKey.identity(&builder.function.key)
-    return run unsupported(&identity, origin, GapCode.Cleanup)
-  }
-  let dropping = run block(&mut builder.*, origin)
-  let after = run block(&mut builder.*, origin)
-  terminate(&mut builder.*, Terminator.Branch {condition: Operand.Copy {place: place(flag)}, thenBlock: dropping, elseBlock: after, origin: origin})
-  resume(&mut builder.*, dropping)
-  run dropPrepared(&mut builder.*, move stored, move glue, origin)
-  terminate(&mut builder.*, Terminator.Goto {target: after, origin: origin})
-  resume(&mut builder.*, after)
-  return ()
-}
-
-// The member or variant tag partition `ordinal` of an active union authenticated, or MAX.
-effect fn partitionTag(builder: &Builder, node: usize, ordinal: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
-  let children = run partitionChildren(builder, node, ordinal)
-  let listed = List<usize>.asSlice(&children)
-  if listed.length == usize.ZERO { return usize.MAX }
-  let nodes = List<CleanupNode>.asSlice(&builder.cleanup)
-  let path = List<Projection>.asSlice(&nodes[listed[usize.ZERO]].place.projections)
-  if path.length == usize.ZERO { return usize.MAX }
-  return match &path[path.length - usize.ONE] {
-    Projection.VariantField {variant, ..} => variant
-    Projection.Payload {index, ..} => index
-    _ => usize.MAX
-  }
-}
-
-// Drops an Alternatives union: its whole glue when its flag holds the whole union live, otherwise
-// the joined partition its runtime tag selects, each child under its own flag. Only the arrival
-// that authenticated a partition leaves its children live, so the tag cannot select stale ones.
-effect fn dropAlternatives(builder: &mut Builder, node: usize, origin: Origin) -> () ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
-  let identity = InstanceKey.identity(&builder.function.key)
-  let nodes = List<CleanupNode>.asSlice(&builder.cleanup)
-  let stored = run copyPlace(&nodes[node].place)
-  let wholeFlag = nodes[node].flag
-  let tags = nodes[node].tags
-  let partitions = run copyIndices(&nodes[node].joined)
-  let glue = match &nodes[node].glue {
-    Option<InstanceKey>.Some {value} => InstanceKey.copy(&value)
-    _ => { return run unsupported(&identity, origin, GapCode.Cleanup) }
-  }
-  let after = run block(&mut builder.*, origin)
-  if wholeFlag != usize.MAX {
-    let dropping = run block(&mut builder.*, origin)
-    let partitioned = run block(&mut builder.*, origin)
-    terminate(&mut builder.*, Terminator.Branch {condition: Operand.Copy {place: place(wholeFlag)}, thenBlock: dropping, elseBlock: partitioned, origin: origin})
-    resume(&mut builder.*, dropping)
-    run dropPrepared(&mut builder.*, run copyPlace(&stored), move glue, origin)
-    terminate(&mut builder.*, Terminator.Goto {target: after, origin: origin})
-    resume(&mut builder.*, partitioned)
-  } else {
-    drop glue
-  }
-  let tagType = run Layout.tagType(tags)
-  let read = run temporary(&mut builder.*, &tagType, origin)
-  run assign(&mut builder.*, place(read), Rvalue.Discriminant {place: move stored}, origin)
-  let listed = List<usize>.asSlice(&partitions)
-  let mut cases = List<SwitchCase>.make()
-  let mut targets = List<usize>.make()
-  let mut at = usize.ZERO
-  while at < listed.length {
-    let tag = run partitionTag(&builder.*, node, listed[at])
-    if tag == usize.MAX { return run unsupported(&identity, origin, GapCode.Cleanup) }
-    let target = run block(&mut builder.*, origin)
-    run List<usize>.append(&mut targets, target)
-    run List<SwitchCase>.append(&mut cases, SwitchCase {decimal: run Type.extentText(tag), negative: false, target: target})
-    at = at + usize.ONE
-  }
-  terminate(&mut builder.*, Terminator.Switch {value: Operand.Copy {place: place(read)}, cases: move cases, otherwise: after, origin: origin})
-  at = usize.ZERO
-  while at < listed.length {
-    resume(&mut builder.*, List<usize>.asSlice(&targets)[at])
-    let children = run partitionChildren(&builder.*, node, listed[at])
-    let childList = List<usize>.asSlice(&children)
+  let partitions = List<CleanupPartition>.asSlice(&nodes[node].partitions)
+  let mut partition = usize.ZERO
+  while partition < partitions.length {
+    let children = List<usize>.asSlice(&partitions[partition].children)
     let mut child = usize.ZERO
-    while child < childList.length {
-      let component = ComponentState {node: childList[child], state: OwnerState.Maybe, missing: usize.MAX}
-      run dropComponent(&mut builder.*, &component, origin)
+    while child < children.length {
+      if prefixPath(List<Projection>.asSlice(&nodes[children[child]].place.projections), path) {
+        return containingNode(builder, children[child], path)
+      }
       child = child + usize.ONE
     }
-    terminate(&mut builder.*, Terminator.Goto {target: after, origin: origin})
-    at = at + usize.ONE
+    partition = partition + usize.ONE
   }
-  resume(&mut builder.*, after)
-  return ()
-}
-
-// Lexical owners are still dropped in acquisition order; their authenticated frontier is in
-// declaration/ascending-element order, including every path-dependent remaining obligation.
-effect fn dropOwner(builder: &mut Builder, index: usize, origin: Origin) -> () ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
-  let owners = List<Owner>.asSlice(&builder.owners)
-  // A complete frontier may use the exact root glue, including a compact union whose active
-  // member is selected by its glue. Partial frontiers never pass missing storage to root glue.
-  if !owners[index].ended && allComponentsLive(&owners[index].components) {
-    let complete = ComponentState {node: owners[index].root, state: OwnerState.Live, missing: usize.MAX}
-    return run dropComponent(&mut builder.*, &complete, origin)
-  }
-  // Each frontier component is one whole subtree in one state, so its own glue, under its flag
-  // when Maybe, drops exactly what its expansion would. Expanding is not needed and would refuse
-  // a Maybe active union component; it would also rewrite the frontier other paths continue with.
-  let components = run copyOwnerComponents(&builder.*, index)
-  let listed = List<ComponentState>.asSlice(&components)
-  let mut at = usize.ZERO
-  while at < listed.length {
-    run dropComponent(&mut builder.*, &listed[at], origin)
-    at = at + usize.ONE
-  }
-  return ()
+  return node
 }
 
 fn runtimeIndex(step: &Projection) -> bool {
@@ -2847,13 +2618,6 @@ pub effect fn copyProjection(value: &Projection) -> Projection ! OutOfMemoryErro
     Projection.ConstIndex {index} => Projection.ConstIndex {index: index}
     Projection.Deref => Projection.Deref
   }
-}
-
-// Whether consuming path `remainder`'s step at `depth` selects the same child as `other`.
-fn stepMatches(builder: &Builder, remainder: usize, depth: usize, other: &Projection) -> bool {
-  let remainders = List<Remainder>.asSlice(&builder.remainders)
-  let steps = List<Projection>.asSlice(&remainders[remainder].steps)
-  return sameProjection(&steps[depth], other)
 }
 
 effect fn copyChildList(children: &List<GlueChild>) -> List<GlueChild> ! OutOfMemoryError ? &mut Allocator {
@@ -2934,196 +2698,6 @@ fn prefixPath(first: &[Projection], second: &[Projection]) -> bool {
   return true
 }
 
-// Equality includes the actual projection and exact prepared glue, never an authored site ID.
-effect fn samePartition(builder: &Builder, parent: &Place, existing: &List<usize>, children: &[GlueChild],
-  remainder: usize, depth: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
-  let prior = List<usize>.asSlice(existing)
-  if prior.length != children.length { return false }
-  let nodes = List<CleanupNode>.asSlice(&builder.cleanup)
-  let mut at = usize.ZERO
-  while at < children.length {
-    let mut stored = run copyPlace(parent)
-    run List<Projection>.append(&mut stored.projections, run childStep(builder, remainder, depth, &children[at]))
-    let actual = &nodes[prior[at]].place
-    if stored.local != actual.local || List<Projection>.length(&stored.projections) != List<Projection>.length(&actual.projections)
-      || !prefixPath(List<Projection>.asSlice(&stored.projections), List<Projection>.asSlice(&actual.projections)) { return false }
-    let mut sameGlue = false
-    if let Option<InstanceKey>.Some {value: priorGlue} = &nodes[prior[at]].glue {
-      sameGlue = run InstanceKey.sameApplication(&priorGlue, &children[at].glue)
-    }
-    if !sameGlue { return false }
-    at = at + usize.ONE
-  }
-  return true
-}
-
-// Nominal/array partitions have one canonical domain. Separate known active union alternatives
-// may be authenticated in separate arms, but none authorizes refining an unknown Live snapshot.
-effect fn partitionComponent(builder: &mut Builder, node: usize, remainder: usize, depth: usize, origin: Origin)
-  -> List<usize> ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
-  let children = run remainderChildren(&builder.*, remainder, depth)
-  let listed = List<GlueChild>.asSlice(&children)
-  let nodes = List<CleanupNode>.asSlice(&builder.cleanup)
-  let parent = run copyPlace(&nodes[node].place)
-  let expanded = nodes[node].expanded
-  let existing = run copyIndices(&nodes[node].children)
-  let mut active = false
-  let mut tags = usize.ZERO
-  let remainders = List<Remainder>.asSlice(&builder.remainders)
-  let levels = List<RemainderLevel>.asSlice(&remainders[remainder].levels)
-  match &levels[depth].children {
-    GlueChildren.Members {count, ..} => {
-      active = true
-      tags = count
-    }
-    GlueChildren.Variants {count, ..} => {
-      active = true
-      tags = count
-    }
-    _ => {}
-  }
-  if expanded {
-    if active != nodes[node].active {
-      let identity = InstanceKey.identity(&builder.function.key)
-      return run unsupported(&identity, origin, GapCode.Cleanup)
-    }
-    if run samePartition(&builder.*, &parent, &existing, listed, remainder, depth) { return move existing }
-    if !active {
-      let identity = InstanceKey.identity(&builder.function.key)
-      return run unsupported(&identity, origin, GapCode.Cleanup)
-    }
-    let alternatives = List<CleanupPartition>.asSlice(&nodes[node].alternatives)
-    let mut at = usize.ZERO
-    while at < alternatives.length {
-      if run samePartition(&builder.*, &parent, &alternatives[at].children, listed, remainder, depth) {
-        return run copyIndices(&alternatives[at].children)
-      }
-      at = at + usize.ONE
-    }
-  }
-  let mut selected = List<usize>.make()
-  let mut at = usize.ZERO
-  while at < listed.length {
-    let mut stored = run copyPlace(&parent)
-    run List<Projection>.append(&mut stored.projections, run childStep(&builder.*, remainder, depth, &listed[at]))
-    let child = List<CleanupNode>.length(&builder.cleanup)
-    run List<CleanupNode>.append(&mut builder.*.cleanup, CleanupNode {place: move stored,
-      ty: Shared<Type>.clone(&listed[at].ty), glue: Option<InstanceKey>.some(InstanceKey.copy(&listed[at].glue)),
-      children: List<usize>.make(), alternatives: List<CleanupPartition>.make(), expanded: false, active: false, flag: usize.MAX,
-      tags: usize.ZERO, joined: List<usize>.make()})
-    run List<usize>.append(&mut selected, child)
-    at = at + usize.ONE
-  }
-  let retained = run copyIndices(&selected)
-  let mut mutable = List<CleanupNode>.asMutSlice(&mut builder.*.cleanup)
-  if expanded {
-    run List<CleanupPartition>.append(&mut mutable[node].alternatives, CleanupPartition {children: move retained})
-  } else {
-    mutable[node].children = move retained
-    mutable[node].expanded = true
-    mutable[node].active = active
-    mutable[node].tags = tags
-  }
-  return move selected
-}
-
-// Whether owner `index` keeps an Alternatives union on or around `target`. Its partitions are
-// selected only by the runtime tag at cleanup, so no static refinement may split or replace it.
-effect fn alternativesOverlap(builder: &Builder, index: usize, target: &[Projection]) -> bool ! OutOfMemoryError ? &mut Allocator {
-  let saved = run copyOwnerComponents(builder, index)
-  let listed = List<ComponentState>.asSlice(&saved)
-  let mut at = usize.ZERO
-  while at < listed.length {
-    if listed[at].state == OwnerState.Alternatives {
-      let path = run copyCleanupPath(builder, listed[at].node)
-      let actual = List<Projection>.asSlice(&path)
-      if prefixPath(actual, target) || prefixPath(target, actual) { return true }
-    }
-    at = at + usize.ONE
-  }
-  return false
-}
-
-// Refine the leaf containing this actual selected path. Its prepared path itself authenticates
-// an active union partition; unrelated compact snapshots never inherit that active proof.
-effect fn exposeComponentPath(builder: &mut Builder, index: usize, remainder: usize, origin: Origin) -> ()
-! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
-  let identity = InstanceKey.identity(&builder.function.key)
-  if index == usize.MAX || remainder == usize.MAX || remainderHooked(&builder.*, remainder, ownerDepth(&builder.*, index)) {
-    return run unsupported(&identity, origin, GapCode.Cleanup)
-  }
-  let remainders = List<Remainder>.asSlice(&builder.remainders)
-  let target = run copyProjectionPath(&remainders[remainder].steps)
-  if run alternativesOverlap(&builder.*, index, List<Projection>.asSlice(&target)) {
-    return run unsupported(&identity, origin, GapCode.Cleanup)
-  }
-  let length = List<Projection>.length(&target)
-  let mut again = true
-  while again {
-    again = false
-    let saved = run copyOwnerComponents(&builder.*, index)
-    let listed = List<ComponentState>.asSlice(&saved)
-    let mut replacement = List<ComponentState>.make()
-    let mut at = usize.ZERO
-    while at < listed.length {
-      let node = listed[at].node
-      let actual = run copyCleanupPath(&builder.*, node)
-      let depth = List<Projection>.length(&actual)
-      if depth < length && prefixPath(List<Projection>.asSlice(&actual), List<Projection>.asSlice(&target)) {
-        if listed[at].state != OwnerState.Live { return run unsupported(&identity, origin, GapCode.Cleanup) }
-        let children = run partitionComponent(&mut builder.*, node, remainder, depth, origin)
-        let childList = List<usize>.asSlice(&children)
-        let mut child = usize.ZERO
-        while child < childList.length {
-          run List<ComponentState>.append(&mut replacement, ComponentState {node: childList[child], state: listed[at].state, missing: listed[at].missing})
-          child = child + usize.ONE
-        }
-        again = true
-      } else {
-        run List<ComponentState>.append(&mut replacement, ComponentState {node: node, state: listed[at].state, missing: listed[at].missing})
-      }
-      at = at + usize.ONE
-    }
-    let mut owners = List<Owner>.asMutSlice(&mut builder.*.owners)
-    owners[index].components = move replacement
-  }
-  return ()
-}
-
-effect fn releaseComponentPath(builder: &mut Builder, index: usize, remainder: usize, origin: Origin) -> ()
-! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
-  run exposeComponentPath(&mut builder.*, index, remainder, origin)
-  let remainders = List<Remainder>.asSlice(&builder.remainders)
-  let target = run copyProjectionPath(&remainders[remainder].steps)
-  let root = List<Owner>.asSlice(&builder.owners)[index].root
-  let missing = componentPathNode(&builder.*, root, List<Projection>.asSlice(&target))
-  if missing == usize.MAX {
-    let identity = InstanceKey.identity(&builder.function.key)
-    return run unsupported(&identity, origin, GapCode.Cleanup)
-  }
-  let saved = run copyOwnerComponents(&builder.*, index)
-  let listed = List<ComponentState>.asSlice(&saved)
-  let mut found = false
-  let mut at = usize.ZERO
-  while at < listed.length {
-    let actual = run copyCleanupPath(&builder.*, listed[at].node)
-    if prefixPath(List<Projection>.asSlice(&target), List<Projection>.asSlice(&actual)) {
-      if listed[at].state != OwnerState.Live {
-        let identity = InstanceKey.identity(&builder.function.key)
-        return run unsupported(&identity, origin, GapCode.Cleanup)
-      }
-      found = true
-      run componentTransition(&mut builder.*, index, at, OwnerState.Moved, missing, origin)
-    }
-    at = at + usize.ONE
-  }
-  if !found {
-    let identity = InstanceKey.identity(&builder.function.key)
-    return run unsupported(&identity, origin, GapCode.Cleanup)
-  }
-  return ()
-}
-
 effect fn copyProjectionPath(path: &List<Projection>) -> List<Projection> ! OutOfMemoryError ? &mut Allocator {
   let listed = List<Projection>.asSlice(path)
   let mut copied = run List<Projection>.makeWithCapacity(listed.length)
@@ -3135,143 +2709,46 @@ effect fn copyProjectionPath(path: &List<Projection>) -> List<Projection> ! OutO
   return move copied
 }
 
-fn replacementLosesActive(builder: &Builder, node: usize, written: &[Projection]) -> bool {
-  let nodes = List<CleanupNode>.asSlice(&builder.cleanup)
-  if nodes[node].active && prefixPath(written, List<Projection>.asSlice(&nodes[node].place.projections)) { return true }
-  let children = List<usize>.asSlice(&nodes[node].children)
-  let mut at = usize.ZERO
-  while at < children.length {
-    if replacementLosesActive(builder, children[at], written) { return true }
-    at = at + usize.ONE
-  }
-  let alternatives = List<CleanupPartition>.asSlice(&nodes[node].alternatives)
-  at = usize.ZERO
-  while at < alternatives.length {
-    let nested = List<usize>.asSlice(&alternatives[at].children)
-    let mut child = usize.ZERO
-    while child < nested.length {
-      if replacementLosesActive(builder, nested[child], written) { return true }
-      child = child + usize.ONE
-    }
-    at = at + usize.ONE
-  }
-  return false
+// Whether consuming path `remainder`'s step at `depth` selects the same child as `other`.
+fn stepMatches(builder: &Builder, remainder: usize, depth: usize, other: &Projection) -> bool {
+  let remainders = List<Remainder>.asSlice(&builder.remainders)
+  let steps = List<Projection>.asSlice(&remainders[remainder].steps)
+  return sameProjection(&steps[depth], other)
 }
 
-fn allComponentsLive(states: &List<ComponentState>) -> bool {
-  let listed = List<ComponentState>.asSlice(states)
-  let mut at = usize.ZERO
-  while at < listed.length {
-    if listed[at].state != OwnerState.Live { return false }
-    at = at + usize.ONE
-  }
-  return true
-}
-
-fn completeOwner(builder: &Builder, index: usize) -> bool {
-  if index == usize.MAX { return false }
-  let owners = List<Owner>.asSlice(&builder.owners)
-  return !owners[index].ended && allComponentsLive(&owners[index].components)
-}
-
-// Drop the old initialized contents of a subtree; a complete replacement makes precisely those
-// components live after the store. A write inside a wholly missing ancestor remains unsupported.
-effect fn replacedComponents(builder: &mut Builder, index: usize, destination: &Place, ty: &Shared<Type>, origin: Origin)
-  -> List<usize> ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
+// Ends the value a store into `destination` replaces, and returns the node the store initializes,
+// or usize.MAX. A store of a tracked node elaborates that node's drop; a store inside one live node
+// drops the old value through its own glue and leaves the node live. A place no owner holds is
+// replaced as one complete value.
+effect fn replaceOld(builder: &mut Builder, index: usize, destination: &Place, ty: &Shared<Type>, origin: Origin) -> usize
+! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
   let identity = InstanceKey.identity(&builder.function.key)
-  let mut selected = List<usize>.make()
   if index == usize.MAX {
     run dropPlace(&mut builder.*, run copyPlace(destination), ty, &identity, origin)
-    return move selected
-  }
-  let whole = List<Projection>.length(&destination.projections) == ownerDepth(&builder.*, index)
-  if whole {
-    run dropOwner(&mut builder.*, index, origin)
-    return move selected
-  }
-  if completeOwner(&builder.*, index) {
-    run dropPlace(&mut builder.*, run copyPlace(destination), ty, &identity, origin)
-    return move selected
+    return usize.MAX
   }
   let root = List<Owner>.asSlice(&builder.owners)[index].root
-  if replacementLosesActive(&builder.*, root, List<Projection>.asSlice(&destination.projections)) {
-    return run unsupported(&identity, origin, GapCode.Cleanup)
-  }
-  if !whole && List<Owner>.asSlice(&builder.owners)[index].ended { return run unsupported(&identity, origin, GapCode.Cleanup) }
-  if run alternativesOverlap(&builder.*, index, List<Projection>.asSlice(&destination.projections)) {
-    return run unsupported(&identity, origin, GapCode.Cleanup)
-  }
-  run normalizeOwner(&mut builder.*, index, origin)
-  let saved = run copyOwnerComponents(&builder.*, index)
-  let listed = List<ComponentState>.asSlice(&saved)
   let written = List<Projection>.asSlice(&destination.projections)
-  let nodes = List<CleanupNode>.asSlice(&builder.cleanup)
-  let mut at = usize.ZERO
-  while at < listed.length {
-    let missing = listed[at].missing
-    if missing != usize.MAX {
-      let absent = List<Projection>.asSlice(&nodes[missing].place.projections)
-      if absent.length < written.length && prefixPath(absent, written) {
-        return run unsupported(&identity, origin, GapCode.Cleanup)
-      }
-    }
-    at = at + usize.ONE
+  let node = containingNode(&builder.*, root, written)
+  if List<Projection>.length(&List<CleanupNode>.asSlice(&builder.cleanup)[node].place.projections) == written.length {
+    run elaborate(&mut builder.*, node, usize.MAX, origin)
+    return node
   }
-  at = usize.ZERO
-  while at < listed.length {
-    let node = listed[at].node
-    let path = run copyCleanupPath(&builder.*, node)
-    let actual = List<Projection>.asSlice(&path)
-    if prefixPath(written, actual) {
-      run dropComponent(&mut builder.*, &listed[at], origin)
-      run List<usize>.append(&mut selected, at)
-    } else if prefixPath(actual, written) {
-      if listed[at].state != OwnerState.Live { return run unsupported(&identity, origin, GapCode.Cleanup) }
-      // The intact ancestor remains intact after replacing this one complete initialized child.
-      run dropPlace(&mut builder.*, run copyPlace(destination), ty, &identity, origin)
-      return move selected
-    } else {
-      // A dynamic element could alias any partial element. No flag decides which element it is.
-      let mut shared = usize.ZERO
-      while shared < actual.length && shared < written.length && sameProjection(&actual[shared], &written[shared]) {
-        shared = shared + usize.ONE
-      }
-      if shared < written.length && runtimeIndex(&written[shared]) { return run unsupported(&identity, origin, GapCode.Cleanup) }
-    }
-    at = at + usize.ONE
+  // A union's partitions cover only the tags partial moves reached; any other tag is its own state.
+  let mut state = nodeState(&builder.*, node)
+  if List<CleanupNode>.asSlice(&builder.cleanup)[node].tags == usize.ZERO {
+    state = uniformState(&builder.*, List<usize>.asSlice(&builder.states), node)
   }
-  if !whole && List<usize>.length(&selected) == usize.ZERO {
-    return run unsupported(&identity, origin, GapCode.Cleanup)
-  }
-  return move selected
+  // The ownership check rejects a store into storage that may hold no value (OWN0001).
+  if state != liveState() { return CompilerBug.panic(b"a store reached MIR inside storage that may hold no value") }
+  run dropPlace(&mut builder.*, run copyPlace(destination), ty, &identity, origin)
+  return usize.MAX
 }
 
-effect fn refilledComponents(builder: &mut Builder, index: usize, selected: &List<usize>, whole: bool, origin: Origin) -> ()
-! OutOfMemoryError ? &mut Allocator {
-  if index == usize.MAX { return () }
-  if whole {
-    // A whole installed value, or a subtree replacement within an intact owner, leaves a
-    // complete owner. Refine its compact frontier again only with applicable closed authority;
-    // a replacement never preserves stale active-union child metadata.
-    let root = List<Owner>.asSlice(&builder.owners)[index].root
-    let flag = List<CleanupNode>.asSlice(&builder.cleanup)[root].flag
-    if flag != usize.MAX {
-      run assign(&mut builder.*, place(flag), Rvalue.Use {value: Operand.Boolean {value: true}}, origin)
-    }
-    let mut components = List<ComponentState>.make()
-    run List<ComponentState>.append(&mut components, ComponentState {node: root, state: OwnerState.Live, missing: usize.MAX})
-    let mut owners = List<Owner>.asMutSlice(&mut builder.*.owners)
-    owners[index].components = move components
-    owners[index].ended = false
-    return ()
-  }
-  let positions = List<usize>.asSlice(selected)
-  let mut at = usize.ZERO
-  while at < positions.length {
-    run componentTransition(&mut builder.*, index, positions[at], OwnerState.Live, usize.MAX, origin)
-    at = at + usize.ONE
-  }
-  return ()
+// After a store, the node it initialized is live, with all its parts.
+effect fn refill(builder: &mut Builder, node: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if node == usize.MAX { return () }
+  return run settleSubtree(&mut builder.*, node, liveState())
 }
 
 effect fn dropReleased(builder: &mut Builder, release: &Release, storage: Place, ty: &Shared<Type>, needed: bool, origin: Origin)
@@ -3297,43 +2774,15 @@ effect fn dropReleased(builder: &mut Builder, release: &Release, storage: Place,
   }
   if !needed { return run applyRelease(&mut builder.*, release, false, origin) }
   if index == usize.MAX {
+    if !whole { return CompilerBug.panic(b"a partial drop reached MIR without its owner") }
     let identity = InstanceKey.identity(&builder.function.key)
-    if !whole { return run unsupported(&identity, origin, GapCode.Cleanup) }
     return run dropPlace(&mut builder.*, move storage, ty, &identity, origin)
   }
-  if whole {
-    run dropOwner(&mut builder.*, index, origin)
-    return run markMoved(&mut builder.*, index, origin)
-  }
-  let remainder = remainderIndex(&builder.*, site)
-  run exposeComponentPath(&mut builder.*, index, remainder, origin)
-  let remainders = List<Remainder>.asSlice(&builder.remainders)
-  let target = run copyProjectionPath(&remainders[remainder].steps)
-  let root = List<Owner>.asSlice(&builder.owners)[index].root
-  let missing = componentPathNode(&builder.*, root, List<Projection>.asSlice(&target))
-  if missing == usize.MAX {
-    let identity = InstanceKey.identity(&builder.function.key)
-    return run unsupported(&identity, origin, GapCode.Cleanup)
-  }
-  let saved = run copyOwnerComponents(&builder.*, index)
-  let listed = List<ComponentState>.asSlice(&saved)
-  let mut found = false
-  let mut at = usize.ZERO
-  while at < listed.length {
-    let path = run copyCleanupPath(&builder.*, listed[at].node)
-    let actual = List<Projection>.asSlice(&path)
-    if prefixPath(List<Projection>.asSlice(&target), actual) {
-      found = true
-      run dropComponent(&mut builder.*, &listed[at], origin)
-      run componentTransition(&mut builder.*, index, at, OwnerState.Moved, missing, origin)
-    }
-    at = at + usize.ONE
-  }
-  if !found {
-    let identity = InstanceKey.identity(&builder.function.key)
-    return run unsupported(&identity, origin, GapCode.Cleanup)
-  }
-  return ()
+  drop storage
+  let mut node = List<Owner>.asSlice(&builder.owners)[index].root
+  if !whole { node = releasedNode(&builder.*, index, remainderIndex(&builder.*, site)) }
+  run elaborate(&mut builder.*, node, usize.MAX, origin)
+  return run settleSubtree(&mut builder.*, node, movedState())
 }
 
 // Drops owners `from..` innermost first, in reverse acquisition order (CLEANUP-002).
@@ -3407,43 +2856,77 @@ effect fn exitTo(builder: &mut Builder, owners: usize, temporaries: usize, origi
 }
 
 // The drops `exitTo(builder, 0, 0, ..)` would emit, in the same order: every temporary and owner,
-// innermost first, each owner as its complete root or as its live and Maybe components.
-effect fn exitDrops(builder: &Builder) -> List<ExitDrop> ! OutOfMemoryError ? &mut Allocator {
+// innermost first, each owner's tree elaborated as `elaborate` would. An open union's drop reads
+// its subtree's states from an exit plan, so exits that leave it in the same states share it.
+effect fn exitDrops(builder: &mut Builder) -> List<ExitDrop> ! OutOfMemoryError ? &mut Allocator {
   let mut drops = List<ExitDrop>.make()
-  let owners = List<Owner>.asSlice(&builder.owners)
-  let pending = List<Pending>.asSlice(&builder.temporaries)
-  let mut held = owners.length
-  let mut at = pending.length
+  let mut held = List<Owner>.length(&builder.owners)
+  let mut at = List<Pending>.length(&builder.temporaries)
   while held > usize.ZERO || at > usize.ZERO {
     let mut temporaryNext = false
     if at > usize.ZERO {
-      temporaryNext = held == usize.ZERO || pending[at - usize.ONE].owners >= held
+      temporaryNext = held == usize.ZERO || List<Pending>.asSlice(&builder.temporaries)[at - usize.ONE].owners >= held
     }
     if temporaryNext {
       at = at - usize.ONE
-      run List<ExitDrop>.append(&mut drops, ExitDrop {node: usize.MAX, guarded: false, temporary: pending[at].local})
+      let local = List<Pending>.asSlice(&builder.temporaries)[at].local
+      run List<ExitDrop>.append(&mut drops, ExitDrop {node: usize.MAX, state: liveState(), plan: usize.MAX, temporary: local})
     } else {
       held = held - usize.ONE
-      if !owners[held].ended && allComponentsLive(&owners[held].components) {
-        run List<ExitDrop>.append(&mut drops, ExitDrop {node: owners[held].root, guarded: false, temporary: usize.MAX})
-      } else {
-        let components = List<ComponentState>.asSlice(&owners[held].components)
-        let mut position = usize.ZERO
-        while position < components.length {
-          if components[position].state != OwnerState.Moved {
-            run List<ExitDrop>.append(&mut drops, ExitDrop {node: components[position].node,
-              guarded: components[position].state == OwnerState.Maybe, temporary: usize.MAX})
-          }
-          position = position + usize.ONE
-        }
-      }
+      let root = List<Owner>.asSlice(&builder.owners)[held].root
+      run appendExitDrops(&mut builder.*, root, &mut drops)
     }
   }
   return move drops
 }
 
+effect fn appendExitDrops(builder: &mut Builder, node: usize, drops: &mut List<ExitDrop>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let state = uniformState(&builder.*, List<usize>.asSlice(&builder.states), node)
+  if state == movedState() { return () }
+  if state != mixedState() {
+    return run List<ExitDrop>.append(&mut drops.*, ExitDrop {node: node, state: state, plan: usize.MAX, temporary: usize.MAX})
+  }
+  if List<CleanupNode>.asSlice(&builder.cleanup)[node].tags == usize.ZERO {
+    let children = run partitionChildren(&builder.*, node, usize.ZERO)
+    let listed = List<usize>.asSlice(&children)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      run appendExitDrops(&mut builder.*, listed[at], &mut drops.*)
+      at = at + usize.ONE
+    }
+    return ()
+  }
+  let plan = run exitPlan(&mut builder.*, node)
+  return run List<ExitDrop>.append(&mut drops.*, ExitDrop {node: node, state: mixedState(), plan: plan, temporary: usize.MAX})
+}
+
+// The exit plan recording the current states of `node`'s subtree, shared with an earlier plan
+// that recorded the same states.
+effect fn exitPlan(builder: &mut Builder, node: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let found = run subtree(&builder.*, node)
+  let listed = List<usize>.asSlice(&found)
+  let current = List<usize>.asSlice(&builder.states)
+  let plans = List<List<usize>>.asSlice(&builder.dropPlans)
+  let mut plan = usize.ZERO
+  while plan < plans.length {
+    let recorded = List<usize>.asSlice(&plans[plan])
+    let mut same = true
+    let mut at = usize.ZERO
+    while same && at < listed.length {
+      same = listed[at] < recorded.length && recorded[listed[at]] == current[listed[at]]
+      at = at + usize.ONE
+    }
+    if same { return plan }
+    plan = plan + usize.ONE
+  }
+  let next = plans.length
+  let recorded = run copyIndices(&builder.states)
+  run List<List<usize>>.append(&mut builder.*.dropPlans, move recorded)
+  return next
+}
+
 fn sameExitDrop(left: ExitDrop, right: ExitDrop) -> bool {
-  return left.node == right.node && left.guarded == right.guarded && left.temporary == right.temporary
+  return left.node == right.node && left.state == right.state && left.plan == right.plan && left.temporary == right.temporary
 }
 
 fn exitTerminator(kind: ExitKind, origin: Origin) -> Terminator {
@@ -3472,7 +2955,7 @@ effect fn exitRoot(builder: &mut Builder, kind: ExitKind, origin: Origin) -> usi
     if steps[at].next == usize.MAX && steps[at].kind == kind { return at }
     at = at + usize.ONE
   }
-  return run exitStep(&mut builder.*, usize.MAX, ExitDrop {node: usize.MAX, guarded: false, temporary: usize.MAX}, kind, origin)
+  return run exitStep(&mut builder.*, usize.MAX, ExitDrop {node: usize.MAX, state: usize.MAX, plan: usize.MAX, temporary: usize.MAX}, kind, origin)
 }
 
 // The existing step after `parent` that performs `wanted`, or usize.MAX.
@@ -3487,32 +2970,17 @@ fn exitChild(builder: &Builder, parent: usize, wanted: ExitDrop) -> usize {
   return usize.MAX
 }
 
-// Emits `wanted` into the current block; a Maybe drop runs only when the node's flag holds, and
-// emission continues in the join after it.
+// Emits `wanted` into the current block: a temporary through its glue, a node in its one state,
+// or an open union as its exit plan elaborates it. Emission continues in the join after it.
 effect fn emitExitDrop(builder: &mut Builder, wanted: ExitDrop, origin: Origin) -> ()
 ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
-  let identity = InstanceKey.identity(&builder.function.key)
   if wanted.temporary != usize.MAX {
+    let identity = InstanceKey.identity(&builder.function.key)
     let ty = localType(&builder.*, wanted.temporary)
     return run dropPlace(&mut builder.*, place(wanted.temporary), &ty, &identity, origin)
   }
-  let nodes = List<CleanupNode>.asSlice(&builder.cleanup)
-  let stored = run copyPlace(&nodes[wanted.node].place)
-  let glue = match &nodes[wanted.node].glue {
-    Option<InstanceKey>.Some {value} => InstanceKey.copy(&value)
-    _ => { return run unsupported(&identity, origin, GapCode.Cleanup) }
-  }
-  if !wanted.guarded { return run dropPrepared(&mut builder.*, move stored, move glue, origin) }
-  let flag = nodes[wanted.node].flag
-  if flag == usize.MAX { return run unsupported(&identity, origin, GapCode.Cleanup) }
-  let dropping = run block(&mut builder.*, origin)
-  let after = run block(&mut builder.*, origin)
-  terminate(&mut builder.*, Terminator.Branch {condition: Operand.Copy {place: place(flag)}, thenBlock: dropping, elseBlock: after, origin: origin})
-  resume(&mut builder.*, dropping)
-  run dropPrepared(&mut builder.*, move stored, move glue, origin)
-  terminate(&mut builder.*, Terminator.Goto {target: after, origin: origin})
-  resume(&mut builder.*, after)
-  return ()
+  if wanted.plan != usize.MAX { return run elaborate(&mut builder.*, wanted.node, wanted.plan, origin) }
+  return run dropNodeAs(&mut builder.*, wanted.node, wanted.state, origin)
 }
 
 // Leaves the function from the current block, then returns, fails or abandons, dropping exactly what
@@ -3521,20 +2989,20 @@ effect fn emitExitDrop(builder: &mut Builder, wanted: ExitDrop, origin: Origin) 
 effect fn leaveFunction(builder: &mut Builder, kind: ExitKind, origin: Origin) -> ()
 ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
   if !builder.live { return () }
-  let drops = run exitDrops(&builder.*)
+  let drops = run exitDrops(&mut builder.*)
   let listed = List<ExitDrop>.asSlice(&drops)
   if listed.length == usize.ZERO {
     terminate(&mut builder.*, exitTerminator(kind, origin))
     return ()
   }
-  // A cleanup gap is reported at the exit that needs the drop, as inline cleanup would.
+  // An owner of an open abstract type is reported at the exit that needs its drop, as inline
+  // cleanup would.
   let identity = InstanceKey.identity(&builder.function.key)
   let nodes = List<CleanupNode>.asSlice(&builder.cleanup)
   let mut at = usize.ZERO
   while at < listed.length {
     if listed[at].temporary == usize.MAX {
-      if let Option<InstanceKey>.None = &nodes[listed[at].node].glue { return run unsupported(&identity, origin, GapCode.Cleanup) }
-      if listed[at].guarded && nodes[listed[at].node].flag == usize.MAX { return run unsupported(&identity, origin, GapCode.Cleanup) }
+      if let Option<InstanceKey>.None = &nodes[listed[at].node].glue { return run unsupported(&identity, origin, GapCode.OpenInstance) }
     }
     at = at + usize.ONE
   }
@@ -4133,7 +3601,7 @@ effect fn callCallee(builder: &mut Builder, foreign: Option<Shared<DeclarationId
     run List<Shared<DeclarationId>>.append(&mut builder.*.function.externs, Shared<DeclarationId>.clone(&callee))
     let tails = match move variadicArguments {
       Option<Shared<List<CAbi.VariadicArgument>>>.Some {value: supplied} => run CAbi.copySharedVariadic(&supplied)
-      Option<Shared<List<CAbi.VariadicArgument>>>.None => { return run unsupported(owner, origin, GapCode.CAbiVariadic) }
+      Option<Shared<List<CAbi.VariadicArgument>>>.None => { return CompilerBug.panic(b"a C call reached MIR without the variadic tails its check classified") }
     }
     return Callee.Extern {declaration: move callee, variadicArguments: move tails}
   }
@@ -5062,7 +4530,7 @@ effect fn readOwner(builder: &Builder, body: &Shared<TypedBody>, read: BodyNodeI
   let mut at = owners.length
   while at > usize.ZERO {
     at = at - usize.ONE
-    if owners[at].subject == subject.index && !owners[at].ended {
+    if owners[at].subject == subject.index && !ownerEnded(builder, at) {
       let held = List<Projection>.asSlice(&owners[at].path)
       if held.length == wanted.length {
         let mut same = true
@@ -5216,7 +4684,7 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
     View.Local {index, ty, origin} => {
       // The same holds for a whole live local owner (OWN-002).
       let held = ownerIndex(&builder.*, index + usize.ONE)
-      if held != usize.MAX && !List<Owner>.asSlice(&builder.owners)[held].ended {
+      if held != usize.MAX && !ownerEnded(&builder.*, held) {
         return run unsupported(&owner, origin, GapCode.OwnedBindingRead)
       }
       let output = run temporary(&mut builder.*, &ty, origin)
@@ -6513,15 +5981,13 @@ effect fn bindArm(builder: &mut Builder, body: &Shared<TypedBody>, node: BodyNod
     }
     if List<Projection>.length(&path) == usize.ZERO {
       // A whole-value binding takes the complete subject.
-      run markMoved(&mut builder.*, scrutinee, origin)
+      run moveOwner(&mut builder.*, scrutinee)
     } else {
-      let remainder = remainderIndex(&builder.*, declared.index)
-      if remainder == usize.MAX || remainderHooked(&builder.*, remainder, usize.ZERO) {
-        return run unsupported(&owner, origin, GapCode.Cleanup)
-      }
-      run releaseComponentPath(&mut builder.*, scrutinee, remainder, origin)
+      let taken = releasedNode(&builder.*, scrutinee, remainderIndex(&builder.*, declared.index))
+      run settleSubtree(&mut builder.*, taken, movedState())
     }
-    run newOwner(&mut builder.*, local, move path, subject.index, &ty)
+    let bound = run newOwner(&mut builder.*, local, move path, subject.index, &ty)
+    run expandOwner(&mut builder.*, bound, usize.MAX, subject.index)
   }
   return ()
 }
@@ -6616,7 +6082,11 @@ effect fn lowerMatch(
     if !declaring { run openScope(&mut builder.*) }
     let before = List<Owner>.length(&builder.owners)
     run acquire(&mut builder.*, scrutinee.local, &subjectType, needed)
-    if List<Owner>.length(&builder.owners) > before { scrutineeOwner = before }
+    if List<Owner>.length(&builder.owners) > before {
+      scrutineeOwner = before
+      // The subject's parts that arm bindings and partial moves take are its move-path tree.
+      run expandOwner(&mut builder.*, scrutineeOwner, usize.MAX, subject.index)
+    }
   }
   let mut switched = scrutinee.local
   if tags != usize.ZERO {
@@ -6721,7 +6191,9 @@ effect fn lowerMatch(
         // A guard's temporaries end before it selects the arm or resumes dispatch.
         let guardPending = List<Pending>.length(&builder.temporaries)
         let evaluated = run expression(&mut builder.*, body, hir, condition)
-        run checkUnchanged(&builder.*, &entryStates, nodeOrigin(body, condition))
+        // The ownership check keeps a guard from moving, dropping or storing a place declared
+        // outside it (OWN0008), so a failed guard resumes dispatch with the arm's entry states.
+        if !sameStates(&builder.*, &entryStates) { return CompilerBug.panic(b"a match guard changed an owner's state") }
         let passed = run settledCondition(&mut builder.*, move evaluated, guardPending, armOrigin)
         terminate(&mut builder.*, Terminator.Branch {condition: move passed, thenBlock: resultBlock, elseBlock: fallback, origin: armOrigin})
       } else {
@@ -6737,7 +6209,7 @@ effect fn lowerMatch(
       run bindArm(&mut builder.*, body, node, at, subject, scrutineeOwner, armOrigin)
       if selecting {
         run dropOwner(&mut builder.*, scrutineeOwner, armOrigin)
-        run markMoved(&mut builder.*, scrutineeOwner, armOrigin)
+        run moveOwner(&mut builder.*, scrutineeOwner)
       }
     }
     // A block arm runs as statements; a transfer inside it leaves the arm without reaching the join.
@@ -6749,9 +6221,6 @@ effect fn lowerMatch(
       if builder.live {
         let armPending = List<Pending>.length(&builder.temporaries)
         let value = run expression(&mut builder.*, body, hir, produced)
-        if List<Pending>.length(&builder.temporaries) > armPending && Shared<Type>.with<bool>(ty, Type.holdsView) {
-          return run unsupported(&owner, armOrigin, GapCode.Cleanup)
-        }
         if valued && builder.live {
           run assign(&mut builder.*, place(output), Rvalue.Use {value: move value}, armOrigin)
         } else {
@@ -6766,10 +6235,6 @@ effect fn lowerMatch(
       // An arm's temporaries end with the arm, after its value is stored.
       let armPending = List<Pending>.length(&builder.temporaries)
       let value = run expression(&mut builder.*, body, hir, result)
-      // A borrowing result could still view an arm temporary after the arm ends; that is not lowered.
-      if List<Pending>.length(&builder.temporaries) > armPending && Shared<Type>.with<bool>(ty, Type.holdsView) {
-        return run unsupported(&owner, armOrigin, GapCode.Cleanup)
-      }
       if valued && builder.live {
         run assign(&mut builder.*, place(output), Rvalue.Use {value: move value}, armOrigin)
       } else {
@@ -6783,7 +6248,7 @@ effect fn lowerMatch(
       if !declaring { run dropOwnersFrom(&mut builder.*, bindingOwners, armOrigin) }
       if scrutineeOwner != usize.MAX && !selecting {
         run dropOwner(&mut builder.*, scrutineeOwner, armOrigin)
-        run markMoved(&mut builder.*, scrutineeOwner, armOrigin)
+        run moveOwner(&mut builder.*, scrutineeOwner)
       }
     }
     if !declaring { truncateOwners(&mut builder.*, bindingOwners) }
@@ -7631,7 +7096,7 @@ effect fn lowerExecutionPackage(builder: &mut Builder, body: &Shared<TypedBody>,
   let glue = match move run InstanceKey.dropGlue(&package, &sourceOwner) {
     Result<Option<InstanceKey>, CanonicalizationFailure>.Success {value: canonicalGlue} => match move canonicalGlue {
       Option<InstanceKey>.Some {value} => move value
-      Option<InstanceKey>.None => { return run unsupported(&owner, origin, GapCode.Cleanup) }
+      Option<InstanceKey>.None => { return run unsupported(&owner, origin, GapCode.OpenInstance) }
     }
     Result<Option<InstanceKey>, CanonicalizationFailure>.Failure {error: reason} => { fail move reason }
   }
@@ -7762,7 +7227,7 @@ effect fn helperBuilder(creator: &Builder, key: InstanceKey, result: &Shared<Typ
       locals: move locals, blocks: List<Block>.make(), references: List<Reference>.make(), externs: List<Shared<DeclarationId>>.make(),
       observes: false, contexts: List<ContextText>.make(), traps: List<TrapSite>.make(), suspension: Option<Origin>.none(), parks: Option<Origin>.none(), releasesPackages: false, nonParking: List<NonParkingRun>.make(), cancels: List<Cancel>.make(), accesses: List<SharedAccess>.make(), escapes: List<EscapeSite>.make(), features: Bytes.make(), inlining: Inlining.Default, optimizeSize: false, frame: Bytes.make(), lines: List<u64>.make(), variables: List<Variable>.make()},
     current: usize.ZERO, live: true, loops: List<LoopTargets>.make(), scrutinees: List<Scrutinee>.make(),
-    owners: List<Owner>.make(), cleanup: List<CleanupNode>.make(), scopes: List<usize>.make(), temporaries: List<Pending>.make(),
+    owners: List<Owner>.make(), cleanup: List<CleanupNode>.make(), states: List<usize>.make(), dropPlans: List<List<usize>>.make(), scopes: List<usize>.make(), temporaries: List<Pending>.make(),
     remainders: List<Remainder>.make(), needs: CleanupNeeds {locals: List<bool>.make(), nodes: List<bool>.make()},
     failure: usize.MAX, plans: List<NodePlan>.make(), storage: List<StoragePlan>.make(), carriers: List<CarrierPlan>.make(),
     providers: List<usize>.make(), diagnostics: move diagnostics, sites: Option<SiteText>.none(), anchor: Anchor.copy(&creator.anchor),
@@ -9256,9 +8721,9 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
   sink: &FailureSink, bound: &mut List<BoundPlace>, origin: Origin) -> () ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
   let owner = InstanceKey.identity(&builder.function.key)
   match &steps[step] {
-    RunPlan.Runner {target, success, failure} => {
-      run planCall(&mut builder.*, &target, environment, List<Operand>.make(), &success, &failure, output, sink,
-        List<BoundPlace>.asSlice(&bound.*), origin, usize.MAX)
+    RunPlan.Runner {target, success, failure, partDrop} => {
+      run callAndDrop(&mut builder.*, &target, environment, List<Operand>.make(), &success, &failure, output, sink,
+        List<BoundPlace>.asSlice(&bound.*), origin, usize.MAX, &partDrop)
     }
     RunPlan.Join {arms, tagged} => {
       let listed = List<JoinArm>.asSlice(&arms)
@@ -9405,7 +8870,9 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
       run dropUnused(&mut builder.*, &callbackPart, &callbackDrop, origin)
       run dropUnused(&mut builder.*, &statePart, &stateDrop, origin)
     }
-    RunPlan.Catch {selector, inner, innerFailure, handler, handlerSuccess, handlerFailure, handlerDrop} => {
+    RunPlan.Catch {selector, inner, innerFailure, handler, handlerSuccess, handlerFailure, handlerDrop, handlerKept} => {
+      let mut keptDrop = Option<Shared<Type>>.none()
+      if handlerKept { keptDrop = copyOptionalType(&handlerDrop) }
       // The protected Effect fails into a temporary of its own failure type; the edge selects.
       let caught = run temporary(&mut builder.*, &innerFailure, origin)
       let selecting = run block(&mut builder.*, origin)
@@ -9440,8 +8907,8 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
             argument = Operand.Move {place: place(widened)}
           }
           let outer = run selectCause(&mut builder.*, caught, origin)
-          run planCall(&mut builder.*, &handler, &handlerPart, run singleOperand(move argument),
-            &handlerSuccess, &handlerFailure, output, sink, List<BoundPlace>.asSlice(&bound.*), origin, caught)
+          run callAndDrop(&mut builder.*, &handler, &handlerPart, run singleOperand(move argument),
+            &handlerSuccess, &handlerFailure, output, sink, List<BoundPlace>.asSlice(&bound.*), origin, caught, &keptDrop)
           drop swapDiagnostics(&mut builder.*, move outer)
           terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
           resume(&mut builder.*, joined)
@@ -9483,8 +8950,8 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
             argument = Operand.Move {place: place(injected)}
           }
           let outer = run selectCause(&mut builder.*, caught, origin)
-          run planCall(&mut builder.*, &handler, &handlerPart, run singleOperand(move argument), &handlerSuccess, &handlerFailure,
-            output, sink, List<BoundPlace>.asSlice(&bound.*), origin, caught)
+          run callAndDrop(&mut builder.*, &handler, &handlerPart, run singleOperand(move argument), &handlerSuccess, &handlerFailure,
+            output, sink, List<BoundPlace>.asSlice(&bound.*), origin, caught, &keptDrop)
           drop swapDiagnostics(&mut builder.*, move outer)
           terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
         } else {
@@ -9534,7 +9001,8 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
       run deliverFailure(&mut builder.*, caught, &innerFailure, sink, origin)
       resume(&mut builder.*, joined)
     }
-    RunPlan.UseRelease {lent, use, useSuccess, useFailure, useFailureDrop, release, releaseSuccess, releaseFailure, resourceDrop, owed,
+    RunPlan.UseRelease {lent, use, useSuccess, useFailure, useFailureDrop, useDrop, release, releaseDrop, releaseSuccess, releaseFailure,
+      releaseFailureDrop, resourceDrop, owed,
       resourceOwed} => {
       // Invoking the release runs the Effect it returns in the same call. The run then drops the
       // resource, within the same NonParking scope.
@@ -9554,29 +9022,29 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
       let used = run singleOperand(Operand.Copy {place: place(borrowed)})
       if Shared<Type>.with<bool>(&useFailure, neverType) {
         run openCancelScope(&mut builder.*)
-        run planCall(&mut builder.*, &use, &usePart, move used, &useSuccess, &useFailure, output, sink,
-          List<BoundPlace>.asSlice(&bound.*), origin, usize.MAX)
+        run callAndDrop(&mut builder.*, &use, &usePart, move used, &useSuccess, &useFailure, output, sink,
+          List<BoundPlace>.asSlice(&bound.*), origin, usize.MAX, &useDrop)
         run releaseOnCancel(&mut builder.*, &release, &releasePart, &resource, &lent, &releaseSuccess, &releaseFailure,
-          &resourceDrop, List<BoundPlace>.asSlice(&bound.*), origin)
+          &releaseFailureDrop, &releaseDrop, &resourceDrop, List<BoundPlace>.asSlice(&bound.*), origin)
         return run releaseOnce(&mut builder.*, &release, &releasePart, &resource, &lent, &releaseSuccess, &releaseFailure,
-          &resourceDrop, List<BoundPlace>.asSlice(&bound.*), origin)
+          &releaseDrop, &resourceDrop, List<BoundPlace>.asSlice(&bound.*), &FailureSink.Propagate, origin)
       }
       let caught = run temporary(&mut builder.*, &useFailure, origin)
       let failing = run block(&mut builder.*, origin)
       let joined = run block(&mut builder.*, origin)
       run openCancelScope(&mut builder.*)
-      run planCall(&mut builder.*, &use, &usePart, move used, &useSuccess, &useFailure, output,
-        &FailureSink.Catch {temp: caught, block: failing}, List<BoundPlace>.asSlice(&bound.*), origin, usize.MAX)
+      run callAndDrop(&mut builder.*, &use, &usePart, move used, &useSuccess, &useFailure, output,
+        &FailureSink.Catch {temp: caught, block: failing}, List<BoundPlace>.asSlice(&bound.*), origin, usize.MAX, &useDrop)
       run releaseOnCancel(&mut builder.*, &release, &releasePart, &resource, &lent, &releaseSuccess, &releaseFailure,
-        &resourceDrop, List<BoundPlace>.asSlice(&bound.*), origin)
-      run releaseOnce(&mut builder.*, &release, &releasePart, &resource, &lent, &releaseSuccess, &releaseFailure, &resourceDrop,
-        List<BoundPlace>.asSlice(&bound.*), origin)
+        &releaseFailureDrop, &releaseDrop, &resourceDrop, List<BoundPlace>.asSlice(&bound.*), origin)
+      run releaseOnce(&mut builder.*, &release, &releasePart, &resource, &lent, &releaseSuccess, &releaseFailure, &releaseDrop, &resourceDrop,
+        List<BoundPlace>.asSlice(&bound.*), &FailureSink.Propagate, origin)
       terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
       resume(&mut builder.*, failing)
       run List<HeldFailure>.append(&mut builder.*.held, HeldFailure {slot: caught, cleanup: copyOptionalType(&useFailureDrop),
         depth: List<CancelScope>.length(&builder.cancelScopes)})
-      run releaseOnce(&mut builder.*, &release, &releasePart, &resource, &lent, &releaseSuccess, &releaseFailure, &resourceDrop,
-        List<BoundPlace>.asSlice(&bound.*), origin)
+      run releaseOnce(&mut builder.*, &release, &releasePart, &resource, &lent, &releaseSuccess, &releaseFailure, &releaseDrop, &resourceDrop,
+        List<BoundPlace>.asSlice(&bound.*), &FailureSink.Propagate, origin)
       drop List<HeldFailure>.pop(&mut builder.*.held)
       run deliverFailure(&mut builder.*, caught, &useFailure, sink, origin)
       resume(&mut builder.*, joined)
@@ -9599,7 +9067,10 @@ effect fn oweNonParking(builder: &mut Builder, key: &InstanceKey, origin: Origin
 effect fn planCallees(steps: &[RunPlan], step: usize, callees: &mut List<InstanceKey>, glues: &mut List<Shared<Type>>) -> ()
 ! OutOfMemoryError ? &mut Allocator {
   match &steps[step] {
-    RunPlan.Runner {target, ..} => { run List<InstanceKey>.append(&mut callees.*, InstanceKey.copy(&target.key)) }
+    RunPlan.Runner {target, partDrop, ..} => {
+      run List<InstanceKey>.append(&mut callees.*, InstanceKey.copy(&target.key))
+      run appendDrop(&mut glues.*, &partDrop)
+    }
     RunPlan.Catch {inner, handler, handlerDrop, ..} => {
       run planCallees(steps, inner, &mut callees.*, &mut glues.*)
       run List<InstanceKey>.append(&mut callees.*, InstanceKey.copy(&handler.key))
@@ -9610,9 +9081,11 @@ effect fn planCallees(steps: &[RunPlan], step: usize, callees: &mut List<Instanc
       run planCallees(steps, finalizer, &mut callees.*, &mut glues.*)
       run appendDrop(&mut glues.*, &finalizerDrop)
     }
-    RunPlan.UseRelease {use, release, resourceDrop, ..} => {
+    RunPlan.UseRelease {use, release, useDrop, releaseDrop, resourceDrop, ..} => {
       run List<InstanceKey>.append(&mut callees.*, InstanceKey.copy(&use.key))
       run List<InstanceKey>.append(&mut callees.*, InstanceKey.copy(&release.key))
+      run appendDrop(&mut glues.*, &useDrop)
+      run appendDrop(&mut glues.*, &releaseDrop)
       run appendDrop(&mut glues.*, &resourceDrop)
     }
     RunPlan.Bind {inner, providerDrop} => {
@@ -9691,32 +9164,74 @@ effect fn finalizeOnCancel(builder: &mut Builder, steps: &[RunPlan], step: usize
   return ()
 }
 
-// Closes the innermost cancel scope, releasing and dropping the resource in its landing. A
-// release that can fail has nowhere to deliver its failure from a cancelled frame.
+// Closes the innermost cancel scope, releasing and dropping the resource in its landing. The frame
+// is already cancelled, so a failure the release raises there is dropped and the cancel goes on.
 effect fn releaseOnCancel(builder: &mut Builder, release: &CallTarget, part: &Place, resource: &Place, lent: &Shared<Type>,
-  success: &Shared<Type>, failure: &Shared<Type>, resourceDrop: &Option<Shared<Type>>, bound: &[BoundPlace], origin: Origin) -> ()
-! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
+  success: &Shared<Type>, failure: &Shared<Type>, failureDrop: &Option<Shared<Type>>, releaseDrop: &Option<Shared<Type>>,
+  resourceDrop: &Option<Shared<Type>>, bound: &[BoundPlace], origin: Origin) -> () ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
   if let Option<Landing>.Some {value: landing} = move closeCancelScope(&mut builder.*) {
-    if !Shared<Type>.with<bool>(failure, neverType) {
-      let owner = InstanceKey.identity(&builder.function.key)
-      return run unsupported(&owner, origin, GapCode.Cleanup)
+    if Shared<Type>.with<bool>(failure, neverType) {
+      run releaseOnce(&mut builder.*, release, part, resource, lent, success, failure, releaseDrop, resourceDrop, bound,
+        &FailureSink.Propagate, origin)
+    } else {
+      let caught = run temporary(&mut builder.*, failure, origin)
+      let discarded = run block(&mut builder.*, origin)
+      let released = run block(&mut builder.*, origin)
+      run releaseOnce(&mut builder.*, release, part, resource, lent, success, failure, releaseDrop, resourceDrop, bound,
+        &FailureSink.Catch {temp: caught, block: discarded}, origin)
+      terminate(&mut builder.*, Terminator.Goto {target: released, origin: origin})
+      resume(&mut builder.*, discarded)
+      run dropUnused(&mut builder.*, &place(caught), failureDrop, origin)
+      run dropUnused(&mut builder.*, resource, resourceDrop, origin)
+      terminate(&mut builder.*, Terminator.Goto {target: released, origin: origin})
+      resume(&mut builder.*, released)
     }
-    run releaseOnce(&mut builder.*, release, part, resource, lent, success, failure, resourceDrop, bound, origin)
     run closeLanding(&mut builder.*, move landing, origin)
   }
   return ()
 }
 
-// Lends the resource afresh to `release`, runs the Effect it returns, then drops the resource.
+// Lends the resource afresh to `release`, runs the Effect it returns, then drops the resource. A
+// failure goes to `sink` before the resource is dropped.
 effect fn releaseOnce(builder: &mut Builder, release: &CallTarget, part: &Place, resource: &Place, lent: &Shared<Type>,
-  success: &Shared<Type>, failure: &Shared<Type>, resourceDrop: &Option<Shared<Type>>, bound: &[BoundPlace], origin: Origin) -> ()
+  success: &Shared<Type>, failure: &Shared<Type>, releaseDrop: &Option<Shared<Type>>, resourceDrop: &Option<Shared<Type>>,
+  bound: &[BoundPlace], sink: &FailureSink, origin: Origin) -> ()
 ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
   let borrowed = run temporary(&mut builder.*, lent, origin)
   run assign(&mut builder.*, place(borrowed), Rvalue.Ref {access: Access.Mutable, place: run copyPlace(resource)}, origin)
   let done = run temporary(&mut builder.*, success, origin)
-  run planCall(&mut builder.*, release, part, run singleOperand(Operand.Copy {place: place(borrowed)}), success, failure, done,
-    &FailureSink.Propagate, bound, origin, usize.MAX)
+  run callAndDrop(&mut builder.*, release, part, run singleOperand(Operand.Copy {place: place(borrowed)}), success, failure, done,
+    sink, bound, origin, usize.MAX, releaseDrop)
   return run dropUnused(&mut builder.*, resource, resourceDrop, origin)
+}
+
+// Calls `target` on `part`. A loaned invocation leaves an owning callable in place, so when
+// `partDrop` names its type the part is dropped after the call on every exit, cancel included.
+effect fn callAndDrop(builder: &mut Builder, target: &CallTarget, part: &Place, written: List<Operand>, success: &Shared<Type>,
+  failure: &Shared<Type>, output: usize, sink: &FailureSink, bound: &[BoundPlace], origin: Origin, releasing: usize,
+  partDrop: &Option<Shared<Type>>) -> () ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if let Option<Shared<Type>>.None = &partDrop.* {
+    return run planCall(&mut builder.*, target, part, move written, success, failure, output, sink, bound, origin, releasing)
+  }
+  run openCancelScope(&mut builder.*)
+  if Shared<Type>.with<bool>(failure, neverType) {
+    run planCall(&mut builder.*, target, part, move written, success, failure, output, sink, bound, origin, releasing)
+    run dropOnCancel(&mut builder.*, part, partDrop, origin)
+    return run dropUnused(&mut builder.*, part, partDrop, origin)
+  }
+  let caught = run temporary(&mut builder.*, failure, origin)
+  let failing = run block(&mut builder.*, origin)
+  let joined = run block(&mut builder.*, origin)
+  run planCall(&mut builder.*, target, part, move written, success, failure, output, &FailureSink.Catch {temp: caught, block: failing},
+    bound, origin, releasing)
+  run dropOnCancel(&mut builder.*, part, partDrop, origin)
+  run dropUnused(&mut builder.*, part, partDrop, origin)
+  terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
+  resume(&mut builder.*, failing)
+  run dropUnused(&mut builder.*, part, partDrop, origin)
+  run deliverFailure(&mut builder.*, caught, failure, sink, origin)
+  resume(&mut builder.*, joined)
+  return ()
 }
 
 // One provider address: this function's own provider, or a binding's stored provider (D2).
@@ -10551,17 +10066,15 @@ effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &
       let assigned = run expression(&mut builder.*, body, hir, value)
       if !builder.live { return () }
       let root = placeOwnerIndex(&builder.*, &destination)
-      let complete = completeOwner(&builder.*, root)
       let targetType = run instanceNodeType(&builder.*, body, target)
-      let mut selected = List<usize>.make()
-      let whole = root != usize.MAX && List<Projection>.length(&destination.projections) == ownerDepth(&builder.*, root)
+      let mut initialized = usize.MAX
       if let Option<Shared<Type>>.Some {value: replaced} = move targetType {
         if CleanupNeeds.node(&builder.needs, target.index) {
-          selected = run replacedComponents(&mut builder.*, root, &destination, &replaced, origin)
+          initialized = run replaceOld(&mut builder.*, root, &destination, &replaced, origin)
         }
       }
       run assign(&mut builder.*, move destination, Rvalue.Use {value: move assigned}, origin)
-      run refilledComponents(&mut builder.*, root, &selected, whole || complete, origin)
+      run refill(&mut builder.*, initialized)
     }
     View.Prefix {..} => {
       run discard(&mut builder.*, body, hir, id)
@@ -10621,10 +10134,10 @@ effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &
       let replaced = ownerIndex(&builder.*, index + usize.ONE)
       let ty = localType(&builder.*, index + usize.ONE)
       let destination = place(index + usize.ONE)
-      let mut selected = List<usize>.make()
-      if replaced != usize.MAX { selected = run replacedComponents(&mut builder.*, replaced, &destination, &ty, origin) }
+      let mut initialized = usize.MAX
+      if replaced != usize.MAX { initialized = run replaceOld(&mut builder.*, replaced, &destination, &ty, origin) }
       run assign(&mut builder.*, move destination, Rvalue.Use {value: move assigned}, origin)
-      run refilledComponents(&mut builder.*, replaced, &selected, true, origin)
+      run refill(&mut builder.*, initialized)
     }
     View.Return {value, origin} => {
       // The returned value moves out before every scope the return leaves is dropped.
@@ -10682,8 +10195,7 @@ effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &
       let header = run block(&mut builder.*, origin)
       let loopBlock = run block(&mut builder.*, origin)
       let exit = run block(&mut builder.*, origin)
-      run flagLoopOwners(&mut builder.*, origin)
-      let entry = run ownerStates(&builder.*)
+      let heads = run loopHeads(&mut builder.*, origin)
       terminate(&mut builder.*, Terminator.Goto {target: header, origin: origin})
       resume(&mut builder.*, header)
       let evaluated = run expression(&mut builder.*, body, hir, condition)
@@ -10703,14 +10215,14 @@ effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &
       )
       let ownersBefore = List<Owner>.length(&builder.owners)
       let temporariesBefore = List<Pending>.length(&builder.temporaries)
-      let iteration = run copyStates(&entry)
+      let iteration = run copyIndices(&heads)
       run List<LoopTargets>.append(&mut builder.*.loops, LoopTargets {
-        exit: exit, repeat: header, owners: ownersBefore, temporaries: temporariesBefore, entry: move iteration, exits: move exits,
+        exit: exit, repeat: header, owners: ownersBefore, temporaries: temporariesBefore, heads: move iteration, exits: move exits,
       })
       resume(&mut builder.*, loopBlock)
       run statement(&mut builder.*, body, hir, loopBody)
       if builder.live {
-        run checkBackEdge(&builder.*, &entry, origin)
+        run repeatLoop(&mut builder.*, &heads, origin)
         terminate(&mut builder.*, Terminator.Goto {target: header, origin: origin})
       }
       let finished = match move List<LoopTargets>.pop(&mut builder.*.loops) {
@@ -10784,8 +10296,8 @@ effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &
       let pendingBefore = loops[innermost].temporaries
       run exitTo(&mut builder.*, kept, pendingBefore, origin)
       let targets = List<LoopTargets>.asSlice(&builder.loops)
-      let entry = run copyStates(&targets[innermost].entry)
-      run checkBackEdge(&builder.*, &entry, origin)
+      let heads = run copyIndices(&targets[innermost].heads)
+      run repeatLoop(&mut builder.*, &heads, origin)
       terminate(&mut builder.*, Terminator.Goto {target: repeat, origin: origin})
     }
     View.Block {count, node: blockNode, origin} => {
@@ -11283,6 +10795,8 @@ impl MirFunction {
       scrutinees: List<Scrutinee>.make(),
       owners: List<Owner>.make(),
       cleanup: List<CleanupNode>.make(),
+      states: List<usize>.make(),
+      dropPlans: List<List<usize>>.make(),
       scopes: List<usize>.make(),
       temporaries: List<Pending>.make(),
       exits: List<ExitStep>.make(),

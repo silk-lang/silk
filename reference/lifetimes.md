@@ -253,7 +253,8 @@ outlives obligations. The intersection introduces no additional binder or runtim
 `Effect.useReleaseNonParking` uses this result contract for both callbacks. It disposes the use
 Effect and ends its loan before creating the release loan; neither callback may export the resource
 loan as an outcome. Release remains non-parking and runs during cancellation with the original
-outcome preserved.
+outcome preserved. A cancelled frame has nowhere to deliver a release failure, so that failure is
+dropped and the cancellation continues.
 
 **Boundary:** Nested quantified callable signatures and unconstrained higher-rank inference are
 unsupported. A callback cannot store a fresh invocation borrow into longer-lived surrounding
