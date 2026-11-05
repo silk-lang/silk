@@ -119,6 +119,7 @@ import silk.http.transport {HttpTransport, TransportError}
 import silk.tls.https_identity {IdentityError}
 import silk.collections.list {List}
 import silk.mem.box {Box}
+import silk.mem.shared {Shared}
 import silk.system.monotonic_clock {MonotonicClock}
 import silk.concurrency.fiber {Cancelled, Fiber}
 import silk.concurrency.local_scheduler {LocalScheduler, StalledError}
@@ -1581,46 +1582,154 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     return run collectJobs(move jobs, move idle, limit) |> Effect.provideMut<Allocator>(&mut allocator)
   }
 
+  // The work of one round, shared by its worker tasks on the round's thread.
+  struct RoundState {
+    // The jobs not yet taken, last job first, so that `pop` takes them in order.
+    waiting: List<Indexed>,
+    // Its capacity has room for every connection the jobs give back, so a worker adds one without
+    // allocating.
+    pool: List<Box<IdleConnection>>,
+    results: List<Option<Result<Received, HttpError | OutOfMemoryError>>>,
+  }
+
+  struct Indexed {
+    index: usize,
+    pending: Box<PendingJob>,
+  }
+
+  struct Taken {
+    index: usize,
+    job: Job,
+    closing: Option<Box<IdleConnection>>,
+  }
+
+  struct Finished {
+    results: List<Option<Result<Received, HttpError | OutOfMemoryError>>>,
+    idle: List<Box<IdleConnection>>,
+  }
+
+  union Checkout {
+    Fresh,
+    Reuse {connection: Box<IdleConnection>},
+    Close {connection: Box<IdleConnection>},
+  }
+
+  // Runs the jobs on at most `limit` worker tasks. Each worker takes the next job, and gives its
+  // connection back when the job ends, so a later job to the same origin reuses it. A task per
+  // worker, not per job, keeps the task setup out of the cost of each request.
   effect fn collectJobs(jobs: List<Box<PendingJob>>, idle: List<Box<IdleConnection>>, limit: usize) -> Round
   ! OutOfMemoryError | TaskIdExhaustedError | Cancelled
   ? &mut Scheduler | &mut MonotonicClock | &mut Allocator {
+    let count = List<Box<PendingJob>>.length(&jobs)
     let mut pool = move idle
+    run List<Box<IdleConnection>>.reserveExact(&mut pool, count)
     let mut queued = move jobs
-    // Reverse the jobs, so that `pop` takes them in order.
-    let mut waiting = List<Box<PendingJob>>.make()
-    run List<Box<PendingJob>>.reserveExact(&mut waiting, List<Box<PendingJob>>.length(&queued))
+    let mut waiting = List<Indexed>.make()
+    run List<Indexed>.reserveExact(&mut waiting, count)
+    let mut index = count
     while true {
       match List<Box<PendingJob>>.pop(&mut queued) {
         Option.None => { break }
-        Option.Some {value} => run List<Box<PendingJob>>.append(&mut waiting, move value)
-      }
-    }
-    let mut running = List<Fiber<JobOutcome, never>>.make()
-    let mut results = List<Result<Received, HttpError | OutOfMemoryError>>.make()
-    while true {
-      while List<Fiber<JobOutcome, never>>.length(&running) < limit {
-        let pending = match List<Box<PendingJob>>.pop(&mut waiting) {
-          Option.None => { break }
-          Option.Some {value} => move value
+        Option.Some {value} => {
+          index = index - usize.ONE
+          let _added = List<Indexed>.appendWithinCapacity(&mut waiting, Indexed {index: index, pending: move value})
         }
-        let connection = run checkout(&mut pool, &Box<PendingJob>.get(&pending)[usize.ZERO])
-        let fiber = run Fiber<JobOutcome, never>.forkChild(runJob(Job {pending: move pending, connection: move connection}))
-        run List<Fiber<JobOutcome, never>>.append(&mut running, move fiber)
       }
-      if List<Fiber<JobOutcome, never>>.length(&running) == usize.ZERO { break }
-      let oldest = List<Fiber<JobOutcome, never>>.remove(&mut running, usize.ZERO)
-      let JobOutcome {received, kept} = move run oldest.join()
-      if let Option.Some {value} = move kept {
-        run List<Box<IdleConnection>>.append(&mut pool, move value)
-      }
-      run List<Result<Received, HttpError | OutOfMemoryError>>.append(&mut results, move received)
     }
-    return Round {results: move results, idle: move pool}
+    let mut slots = List<Option<Result<Received, HttpError | OutOfMemoryError>>>.make()
+    run List<Option<Result<Received, HttpError | OutOfMemoryError>>>.reserveExact(&mut slots, count)
+    while List<Option<Result<Received, HttpError | OutOfMemoryError>>>.length(&slots) < count {
+      let _added = List<Option<Result<Received, HttpError | OutOfMemoryError>>>.appendWithinCapacity(
+        &mut slots,
+        Option<Result<Received, HttpError | OutOfMemoryError>>.none(),
+      )
+    }
+    let state = run Shared<RoundState>.make(RoundState {waiting: move waiting, pool: move pool, results: move slots})
+    let mut workers = limit
+    if count < workers { workers = count }
+    let mut running = List<Fiber<(), never>>.make()
+    run List<Fiber<(), never>>.reserveExact(&mut running, workers)
+    while List<Fiber<(), never>>.length(&running) < workers {
+      let fiber = run Fiber<(), never>.forkChild(roundWorker(Shared<RoundState>.clone(&state)))
+      let _added = List<Fiber<(), never>>.appendWithinCapacity(&mut running, move fiber)
+    }
+    while true {
+      match List<Fiber<(), never>>.pop(&mut running) {
+        Option.None => { break }
+        Option.Some {value} => run value.join()
+      }
+    }
+    let Finished {results: filled, idle: kept} = Shared<RoundState>.withMut<Finished>(&state, finishRound)
+    let mut slotsDone = move filled
+    drop state
+    let mut results = List<Result<Received, HttpError | OutOfMemoryError>>.make()
+    run List<Result<Received, HttpError | OutOfMemoryError>>.reserveExact(&mut results, count)
+    let entries = List<Option<Result<Received, HttpError | OutOfMemoryError>>>.asMutSlice(&mut slotsDone)
+    let mut at = usize.ZERO
+    while at < entries.length {
+      match Intrinsic.replace(entries[at], Option<Result<Received, HttpError | OutOfMemoryError>>.none()) {
+        Option.None => Intrinsic.trap("sendAll: a request of the round has no result")
+        Option.Some {value} => {
+          let _added = List<Result<Received, HttpError | OutOfMemoryError>>.appendWithinCapacity(&mut results, move value)
+        }
+      }
+      at = at + usize.ONE
+    }
+    return Round {results: move results, idle: move kept}
+  }
+
+  // One worker task of a round. Its clock parks only this task while the socket waits.
+  effect fn roundWorker(state: Shared<RoundState>) -> () ? &mut Scheduler | &mut MonotonicClock {
+    while true {
+      let taken = match Shared<RoundState>.withMut<Option<Taken>>(&state, takeJob) {
+        Option.None => { break }
+        Option.Some {value} => move value
+      }
+      let Taken {index, job, closing} = move taken
+      if let Option.Some {value} = move closing { run closeIdle(move value) }
+      let outcome = run runJob(move job)
+      Shared<RoundState>.withMut<()>(&state, storeOutcome(index, move outcome))
+    }
+    return ()
+  }
+
+  fn takeJob(state: &mut RoundState) -> Option<Taken> {
+    let Indexed {index, pending} = match List<Indexed>.pop(&mut state.waiting) {
+      Option.None => { return Option<Taken>.none() }
+      Option.Some {value} => move value
+    }
+    let mut connection = Option<Box<IdleConnection>>.none()
+    let mut closing = Option<Box<IdleConnection>>.none()
+    match move pick(&mut state.pool, &Box<PendingJob>.get(&pending)[usize.ZERO]) {
+      Checkout.Fresh => {}
+      Checkout.Reuse {connection: open} => { connection = Option<Box<IdleConnection>>.some(move open) }
+      Checkout.Close {connection: stale} => { closing = Option<Box<IdleConnection>>.some(move stale) }
+    }
+    return Option<Taken>.some(Taken {index: index, job: Job {pending: move pending, connection: move connection}, closing: move closing})
+  }
+
+  fn storeOutcome(state: &mut RoundState, index: usize, outcome: JobOutcome) -> () {
+    let JobOutcome {received, kept} = move outcome
+    if let Option.Some {value} = move kept {
+      let _added = List<Box<IdleConnection>>.appendWithinCapacity(&mut state.pool, move value)
+    }
+    List<Option<Result<Received, HttpError | OutOfMemoryError>>>.set(
+      &mut state.results,
+      index,
+      Option<Result<Received, HttpError | OutOfMemoryError>>.some(move received),
+    )
+  }
+
+  fn finishRound(state: &mut RoundState) -> Finished {
+    return Finished {
+      results: Intrinsic.replace(state.results, List<Option<Result<Received, HttpError | OutOfMemoryError>>>.make()),
+      idle: Intrinsic.replace(state.pool, List<Box<IdleConnection>>.make()),
+    }
   }
 
   // Takes the newest idle connection to the origin of `job` out of `pool`. A request that is not
-  // idempotent uses it only when the server has not closed it.
-  effect fn checkout(pool: &mut List<Box<IdleConnection>>, job: &PendingJob) -> Option<Box<IdleConnection>> {
+  // idempotent uses it only when the server has not closed it; otherwise the caller closes it.
+  fn pick(pool: &mut List<Box<IdleConnection>>, job: &PendingJob) -> Checkout {
     let kept = List<Box<IdleConnection>>.asSlice(&pool.*)
     let mut found = usize.MAX
     let mut scan = usize.ZERO
@@ -1628,17 +1737,18 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       if Origin.equals(&Box<IdleConnection>.get(&kept[scan])[usize.ZERO].origin, &job.origin) { found = scan }
       scan = scan + usize.ONE
     }
-    if found == usize.MAX { return Option<Box<IdleConnection>>.none() }
+    if found == usize.MAX { return Checkout.Fresh }
     let usable = job.idempotent || ExchangeNative.reusable(&Box<IdleConnection>.get(&kept[found])[usize.ZERO].connection)
     drop kept
     let taken = List<Box<IdleConnection>>.remove(&mut pool.*, found)
-    if !usable {
-      let mut closing = Box<IdleConnection>.into(move taken)
-      let closed = run Effect.result(Exchange.close(&mut closing.connection))
-      drop closed
-      return Option<Box<IdleConnection>>.none()
-    }
-    return Option<Box<IdleConnection>>.some(move taken)
+    if !usable { return Checkout.Close {connection: move taken} }
+    return Checkout.Reuse {connection: move taken}
+  }
+
+  effect fn closeIdle(stale: Box<IdleConnection>) -> () ? &mut MonotonicClock {
+    let mut closing = Box<IdleConnection>.into(move stale)
+    let closed = run Effect.result(Exchange.close(&mut closing.connection))
+    drop closed
   }
 
   // One task of a round. Its clock parks only this task while the socket waits.
