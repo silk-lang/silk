@@ -1,0 +1,633 @@
+//! Wait for many native descriptors at once: one blocking call reports which ones are readable or
+//! writable, and another thread can wake the wait.
+//!
+//! # When to use
+//! Use a [`Reactor`] to build an event loop, such as the loop of a JavaScript runtime or a network
+//! server, that serves many sockets, pipes, or terminals on one thread. Register each descriptor
+//! with [`Reactor.register`] and a token of your choice, then call [`Reactor.wait`] in a loop. Give
+//! a [`Waker`] to other threads, so that they can end a wait, for example after they finished work
+//! for the loop.
+//!
+//! # Details
+//! The reactor uses `epoll` on Linux and `kqueue` on Darwin. Readiness is level-triggered: a
+//! descriptor that stays readable is reported by each wait, until you read all its data or change
+//! its [`Interest`]. The reactor never reads, writes, or closes your descriptors.
+//!
+//! [`Reactor.make`] opens the kernel queue and the wake source. A [`Waker`] shares them with the
+//! reactor, so they stay open until the reactor and every waker are dropped. Many wakes before one
+//! wait end that wait one time.
+//!
+//! # Errors
+//! Each operation fails with [`ReactorError`]: the [`ReactorOperation`] and the native error code.
+//!
+//! # Gotchas
+//! - Deregister a descriptor before you close it. On Linux, a closed descriptor that another
+//!   descriptor still refers to, such as after `dup`, stays registered.
+//! - On Darwin, readable and writable readiness come as two events with the same token.
+//! - A token must not be [`WAKE_TOKEN`]. The reactor uses it for the wake source.
+//! - The module is empty on targets other than Darwin on x86_64 or aarch64, and Linux with GNU libc
+//!   on x86_64 or aarch64.
+//!
+//! # Examples
+//! ## Wake a wait from the same thread
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.core.option { Option }
+//! import silk.core.result { Result }
+//! import silk.io.reactor { ReadyEvent, Reactor, ReactorError }
+//!
+//! effect fn program() -> i32 ! ReactorError | OutOfMemoryError ? &mut Allocator {
+//!   let mut reactor = run Reactor.make()
+//!   let waker = Reactor.waker(&reactor)
+//!   run waker.wake()
+//!
+//!   // The wake ends the wait at once, and it is not reported as an event.
+//!   let mut events = [ReadyEvent.empty(), ReadyEvent.empty()]
+//!   let count = run reactor.wait(&mut events, Option<u64>.some(1000000000))
+//!   if count != 0 {
+//!     return 1
+//!   }
+//!
+//!   // With no wake and no descriptor, a zero timeout returns at once.
+//!   let none = run reactor.wait(&mut events, Option<u64>.some(0))
+//!   if none != 0 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//!
+//! pub effect fn main() -> i32 {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let result = run Effect.result(program()) |> Effect.provideMut<Allocator>(&mut allocator)
+//!   return match move result {
+//!     Result<i32, ReactorError | OutOfMemoryError>.Success { value } => value
+//!     Result<i32, ReactorError | OutOfMemoryError>.Failure { .. } => 1
+//!   }
+//! }
+//! ```
+//!
+//! @category Input and output
+
+static if (Intrinsic.targetOperatingSystem() == "darwin" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64") && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.concurrency.sync { Arc }
+import silk.concurrency.thread { Concurrent, Transferable }
+import silk.core.option { Option }
+import silk.core.ownership { Copy, Drop }
+import silk.num.i32
+import silk.num.i64
+import silk.num.isize
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+/// The operation of a [`Reactor`] or [`Waker`] that failed.
+pub enum ReactorOperation {
+  /// Opening the kernel queue or the wake source, in [`Reactor.make`].
+  Create,
+  /// Adding a descriptor, in [`Reactor.register`].
+  Register,
+  /// Changing the interest of a descriptor, in [`Reactor.modify`].
+  Modify,
+  /// Removing a descriptor, in [`Reactor.deregister`].
+  Deregister,
+  /// Waiting for events, in [`Reactor.wait`].
+  Wait,
+  /// Signaling the wake source, in [`Waker.wake`].
+  Wake,
+}
+
+/// A failed reactor operation: which one, and the native error code.
+///
+/// # Details
+/// `code` is the `errno` value of the failed system call, such as 9 (`EBADF`) for a descriptor that
+/// is not open, or 17 (`EEXIST`) for a descriptor that is already registered on Linux.
+pub struct ReactorError {
+  /// The operation that failed.
+  pub operation: ReactorOperation,
+  /// The native error code.
+  pub code: i32,
+}
+
+/// The readiness that a registered descriptor reports.
+///
+/// # Details
+/// Make one with [`Interest.readOnly`], [`Interest.writeOnly`], or [`Interest.both`]. An interest
+/// with neither flag keeps the descriptor registered but reports only errors and hangups on Linux,
+/// and nothing on Darwin.
+pub struct Interest {
+  /// Report the descriptor when a read would not block.
+  pub readable: bool,
+  /// Report the descriptor when a write would not block.
+  pub writable: bool,
+}
+
+impl Copy for Interest {}
+
+impl Interest {
+  /// Returns an interest in reads only.
+  pub fn readOnly() -> Interest { return Interest { readable: true, writable: false } }
+  /// Returns an interest in writes only.
+  pub fn writeOnly() -> Interest { return Interest { readable: false, writable: true } }
+  /// Returns an interest in reads and writes.
+  pub fn both() -> Interest { return Interest { readable: true, writable: true } }
+}
+
+/// One descriptor that [`Reactor.wait`] found ready.
+///
+/// # Details
+/// `token` is the value given to [`Reactor.register`]. More than one flag can be set. `hangup`
+/// means that the peer closed its side, or the pipe has no writer; data that was sent before can
+/// still be readable. `error` means that the descriptor has a pending error: read it with the
+/// operation that you do next, such as a read or `getsockopt(SO_ERROR)`.
+pub struct ReadyEvent {
+  /// The token of the descriptor.
+  pub token: u64,
+  /// A read would not block.
+  pub readable: bool,
+  /// A write would not block.
+  pub writable: bool,
+  /// The peer closed its side.
+  pub hangup: bool,
+  /// The descriptor has a pending error.
+  pub error: bool,
+}
+
+impl Copy for ReadyEvent {}
+
+impl ReadyEvent {
+  /// Returns an event with token 0 and no flags, to fill an event buffer before a wait.
+  pub fn empty() -> ReadyEvent {
+    return ReadyEvent { token: 0, readable: false, writable: false, hangup: false, error: false }
+  }
+}
+
+// The kernel queue and the wake source. The reactor and each waker share one `Handles`, so the
+// descriptors close when the last of them is dropped.
+struct Handles {
+  queue: i32,
+  // The eventfd on Linux. Darwin wakes through an EVFILT_USER filter on the queue, and keeps -1.
+  wake: i32,
+}
+
+impl Transferable for Handles {}
+impl Concurrent for Handles {}
+
+impl Drop for Handles {
+  fn drop(self: &mut Handles) -> () {
+    if self.wake >= 0 { let _closed = unsafe close(self.wake) }
+    if self.queue >= 0 { let _closed = unsafe close(self.queue) }
+    return ()
+  }
+}
+
+/// A set of registered descriptors, and the wait for their readiness.
+///
+/// # Details
+/// The reactor uses `epoll` on Linux and `kqueue` on Darwin. Readiness is level-triggered: a
+/// descriptor that stays readable is reported by each wait. The reactor never reads, writes, or
+/// closes your descriptors. Dropping the reactor closes the kernel queue when no [`Waker`] is left.
+///
+/// # Gotchas
+/// - Deregister a descriptor before you close it.
+/// - On Darwin, readable and writable readiness come as two events with the same token.
+/// - Use one reactor on one thread at a time. Other threads use a [`Waker`].
+pub struct Reactor {
+  handles: Arc<Handles>,
+}
+
+impl Transferable for Reactor {}
+
+/// A handle that ends a [`Reactor.wait`] from any thread.
+///
+/// # Details
+/// [`Waker.wake`] makes the current or the next wait of its reactor return. Many wakes before one
+/// wait end that wait one time. A waker keeps the kernel queue of its reactor open, also after the
+/// reactor is dropped; a wake then has no effect.
+pub struct Waker {
+  handles: Arc<Handles>,
+}
+
+impl Transferable for Waker {}
+impl Concurrent for Waker {}
+
+impl Waker {
+  /// Makes the current or the next wait of the reactor return.
+  ///
+  /// # Errors
+  /// [`ReactorError`] with operation `Wake` if the wake source cannot be signaled.
+  pub effect fn wake(self: &Self) -> () ! ReactorError {
+    let handles = self.handles.get()
+    let code = unsafe signalWake(handles.queue, handles.wake)
+    if code != 0 { fail ReactorError { operation: ReactorOperation.Wake, code: code } }
+    return ()
+  }
+
+  /// Returns another waker for the same reactor.
+  pub fn clone(self: &Self) -> Waker {
+    return Waker { handles: self.handles.clone() }
+  }
+}
+
+/// The token that a [`Reactor`] keeps for its wake source. Do not register a descriptor with it.
+pub const WAKE_TOKEN: u64 = 18446744073709551615
+
+impl Reactor {
+  /// Opens a new kernel queue and wake source, with no registered descriptors.
+  ///
+  /// # Details
+  /// The descriptors are close-on-exec, so a child process does not get them.
+  ///
+  /// # Errors
+  /// - [`ReactorError`] with operation `Create` if the system cannot open the queue or the wake
+  ///   source, for example when the process has too many open descriptors.
+  /// - `OutOfMemoryError` if the shared state cannot be allocated.
+  pub effect fn make() -> Reactor ! ReactorError | OutOfMemoryError ? &mut Allocator {
+    let mut queue: i32 = -1
+    let mut wake: i32 = -1
+    let code = unsafe openHandles(&mut queue, &mut wake)
+    let handles = Handles { queue: queue, wake: wake }
+    if code != 0 { fail ReactorError { operation: ReactorOperation.Create, code: code } }
+    let shared = run Arc<Handles>.make(move handles)
+    return Reactor { handles: move shared }
+  }
+
+  /// Returns a [`Waker`] that ends a wait of this reactor from any thread.
+  pub fn waker(self: &Self) -> Waker {
+    return Waker { handles: self.handles.clone() }
+  }
+
+  /// Adds the descriptor `fd` with `token`, and reports it when it matches `interest`.
+  ///
+  /// # Details
+  /// The reactor does not take ownership of `fd`. Each event of `fd` carries `token`.
+  ///
+  /// # Errors
+  /// [`ReactorError`] with operation `Register`, for example with code 9 (`EBADF`) if `fd` is not
+  /// open, or 17 (`EEXIST`) on Linux if `fd` is already registered. A token equal to
+  /// [`WAKE_TOKEN`] fails with code 22 (`EINVAL`).
+  pub effect fn register(self: &mut Self, fd: i32, token: u64, interest: Interest) -> () ! ReactorError {
+    if token == WAKE_TOKEN { fail ReactorError { operation: ReactorOperation.Register, code: 22 } }
+    let code = unsafe change(self.handles.get().queue, fd, token, interest, true)
+    if code != 0 { fail ReactorError { operation: ReactorOperation.Register, code: code } }
+    return ()
+  }
+
+  /// Changes the token and the interest of the registered descriptor `fd`.
+  ///
+  /// # Errors
+  /// [`ReactorError`] with operation `Modify`, for example with code 2 (`ENOENT`) on Linux if `fd`
+  /// is not registered. A token equal to [`WAKE_TOKEN`] fails with code 22 (`EINVAL`).
+  pub effect fn modify(self: &mut Self, fd: i32, token: u64, interest: Interest) -> () ! ReactorError {
+    if token == WAKE_TOKEN { fail ReactorError { operation: ReactorOperation.Modify, code: 22 } }
+    let code = unsafe change(self.handles.get().queue, fd, token, interest, false)
+    if code != 0 { fail ReactorError { operation: ReactorOperation.Modify, code: code } }
+    return ()
+  }
+
+  /// Removes the descriptor `fd`. Later waits do not report it.
+  ///
+  /// # Errors
+  /// [`ReactorError`] with operation `Deregister`, for example with code 2 (`ENOENT`) if `fd` is
+  /// not registered.
+  pub effect fn deregister(self: &mut Self, fd: i32) -> () ! ReactorError {
+    let code = unsafe remove(self.handles.get().queue, fd)
+    if code != 0 { fail ReactorError { operation: ReactorOperation.Deregister, code: code } }
+    return ()
+  }
+
+  /// Waits until a registered descriptor is ready, a [`Waker`] wakes the reactor, or the timeout
+  /// passes. Writes the ready descriptors to the start of `events`, and returns their number.
+  ///
+  /// # Details
+  /// `timeout` is in nanoseconds. `none` waits with no limit, and `some(0)` checks once and does
+  /// not block. On Linux, a timeout is rounded up to whole milliseconds. A wake ends the wait and
+  /// is not written to `events`, so a wait can return 0 before the timeout. A signal that interrupts
+  /// the wait also returns 0. At most `events.length` events are returned; the others stay for the
+  /// next wait.
+  ///
+  /// # Errors
+  /// [`ReactorError`] with operation `Wait` if the system call fails for a reason other than a
+  /// signal.
+  pub effect fn wait(self: &mut Self, events: &mut [ReadyEvent], timeout: Option<u64>) -> usize ! ReactorError {
+    let handles = self.handles.get()
+    let mut count: usize = 0
+    let code = unsafe waitEvents(handles.queue, handles.wake, move events, timeout, &mut count)
+    if code != 0 { fail ReactorError { operation: ReactorOperation.Wait, code: code } }
+    return count
+  }
+}
+
+unsafe extern "C" fn close(fd: i32) -> i32
+
+// The batch size of one kernel wait. A wait reads at most this many raw events.
+const BATCH: usize = 64
+
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  unsafe extern "C" fn __error() -> *mut i32
+  unsafe fn currentError() -> i32 { unsafe { return Pointer.read<i32>(__error()) } }
+
+  // The C `struct kevent` of 64-bit Darwin.
+  extern "C" struct KernelEvent {
+    ident: usize,
+    filter: i16,
+    flags: u16,
+    fflags: u32,
+    data: isize,
+    udata: usize,
+  }
+  impl Copy for KernelEvent {}
+  extern "C" struct TimeSpec { seconds: i64, nanoseconds: i64 }
+  impl Copy for TimeSpec {}
+
+  unsafe extern "C" fn kqueue() -> i32
+  @foreign(noCapture: .("changes", "events", "timeout"))
+  unsafe extern "C" fn kevent(queue: i32, changes: ?[*]const KernelEvent, changeCount: i32, events: ?[*]mut KernelEvent, eventCount: i32, timeout: ?*const TimeSpec) -> i32
+  unsafe extern "C" fn fcntl(fd: i32, command: i32, ...) -> i32
+
+  const FILTER_READ: i16 = -1
+  const FILTER_WRITE: i16 = -2
+  const FILTER_USER: i16 = -10
+  const ADD: u16 = 1
+  const DELETE: u16 = 2
+  const ENABLE: u16 = 4
+  const DISABLE: u16 = 8
+  const CLEAR: u16 = 32
+  const RECEIPT: u16 = 64
+  const ERROR: u16 = 16384
+  const END: u16 = 32768
+  const NOTE_TRIGGER: u32 = 16777216
+  const F_SETFD: i32 = 2
+  const FD_CLOEXEC: i32 = 1
+
+  fn kernelEvent(ident: usize, filter: i16, flags: u16, fflags: u32, udata: usize) -> KernelEvent {
+    return KernelEvent { ident: ident, filter: filter, flags: flags, fflags: fflags, data: 0, udata: udata }
+  }
+
+  // Applies `changes` and reads no events. Returns 0 or the native error code.
+  unsafe fn submit(queue: i32, changes: &[KernelEvent]) -> i32 {
+    let mut none: [KernelEvent; 0] = []
+    if unsafe kevent(queue, Pointer.fromSlice<KernelEvent>(changes), usize.toI32(changes.length), Pointer.fromMutSlice<KernelEvent>(&mut none), 0, Pointer.null<TimeSpec>()) < 0 {
+      return unsafe currentError()
+    }
+    return 0
+  }
+
+  unsafe fn openHandles(queue: &mut i32, wake: &mut i32) -> i32 {
+    let opened = unsafe kqueue()
+    if opened < 0 { return unsafe currentError() }
+    queue.* = opened
+    if unsafe fcntl(opened, F_SETFD, FD_CLOEXEC) < 0 { return unsafe currentError() }
+    let user = [kernelEvent(0, FILTER_USER, ADD | CLEAR, 0, 0)]
+    return unsafe submit(opened, &user)
+  }
+
+  unsafe fn signalWake(queue: i32, wake: i32) -> i32 {
+    let trigger = [kernelEvent(0, FILTER_USER, 0, NOTE_TRIGGER, 0)]
+    return unsafe submit(queue, &trigger)
+  }
+
+  // Applies the read and write filters of `interest` with receipts, so that each change reports
+  // its own result. A filter that `interest` does not want is added disabled, so the descriptor
+  // stays registered with no interest, as with `epoll`. A failure to add a disabled filter is not
+  // an error: some descriptors, such as the read end of a pipe whose writer is closed, refuse it.
+  unsafe fn change(queue: i32, fd: i32, token: u64, interest: Interest, _adding: bool) -> i32 {
+    if fd < 0 { return 9 }
+    let ident = i32.toUsize(fd)
+    let udata = u64.toUsize(token)
+    let readFlags = if interest.readable { ADD | ENABLE | RECEIPT } else { ADD | DISABLE | RECEIPT }
+    let writeFlags = if interest.writable { ADD | ENABLE | RECEIPT } else { ADD | DISABLE | RECEIPT }
+    let changes = [kernelEvent(ident, FILTER_READ, readFlags, 0, udata), kernelEvent(ident, FILTER_WRITE, writeFlags, 0, udata)]
+    let mut receipts = [kernelEvent(0, 0, 0, 0, 0), kernelEvent(0, 0, 0, 0, 0)]
+    let count = unsafe kevent(queue, Pointer.fromSlice<KernelEvent>(&changes), 2, Pointer.fromMutSlice<KernelEvent>(&mut receipts), 2, Pointer.null<TimeSpec>())
+    if count < 0 { return unsafe currentError() }
+    let mut index: usize = 0
+    while index < i32.toUsize(count) {
+      let receipt = receipts[index]
+      if (receipt.flags & ERROR) != 0 && receipt.data != 0 {
+        let wanted = if receipt.filter == FILTER_READ { interest.readable } else { interest.writable }
+        if wanted { return isize.toI32(receipt.data) }
+      }
+      index = index + 1
+    }
+    return 0
+  }
+
+  unsafe fn remove(queue: i32, fd: i32) -> i32 {
+    if fd < 0 { return 9 }
+    let ident = i32.toUsize(fd)
+    let changes = [kernelEvent(ident, FILTER_READ, DELETE | RECEIPT, 0, 0), kernelEvent(ident, FILTER_WRITE, DELETE | RECEIPT, 0, 0)]
+    let mut receipts = [kernelEvent(0, 0, 0, 0, 0), kernelEvent(0, 0, 0, 0, 0)]
+    let count = unsafe kevent(queue, Pointer.fromSlice<KernelEvent>(&changes), 2, Pointer.fromMutSlice<KernelEvent>(&mut receipts), 2, Pointer.null<TimeSpec>())
+    if count < 0 { return unsafe currentError() }
+    // The descriptor counts as registered when at least one filter was deleted.
+    let mut missing: usize = 0
+    let mut index: usize = 0
+    while index < i32.toUsize(count) {
+      let receipt = receipts[index]
+      if (receipt.flags & ERROR) != 0 && receipt.data != 0 {
+        let failed = isize.toI32(receipt.data)
+        if failed != 2 { return failed }
+        missing = missing + 1
+      }
+      index = index + 1
+    }
+    if missing == 2 { return 2 }
+    return 0
+  }
+
+  unsafe fn waitEvents(queue: i32, wake: i32, events: &mut [ReadyEvent], timeout: Option<u64>, count: &mut usize) -> i32 {
+    count.* = 0
+    let mut raw: [KernelEvent; 64] = [kernelEvent(0, 0, 0, 0, 0); 64]
+    let mut capacity = events.length
+    if capacity > BATCH { capacity = BATCH }
+    // A wake must still end a wait for an empty buffer, so ask for at least one raw event.
+    let mut asked = capacity
+    if asked == 0 { asked = 1 }
+    let nothing: [KernelEvent; 0] = []
+    let changes = Pointer.fromSlice<KernelEvent>(&nothing)
+    let output = Pointer.fromMutSlice<KernelEvent>(&mut raw)
+    let received = match timeout {
+      Option<u64>.Some { value } => {
+        let span = TimeSpec { seconds: u64.toI64(value / 1000000000), nanoseconds: u64.toI64(value % 1000000000) }
+        unsafe kevent(queue, changes, 0, output, usize.toI32(asked), Pointer.fromRef<TimeSpec>(&span))
+      }
+      Option<u64>.None => unsafe kevent(queue, changes, 0, output, usize.toI32(asked), Pointer.null<TimeSpec>())
+    }
+    if received < 0 {
+      let code = unsafe currentError()
+      if code == 4 { return 0 }
+      return code
+    }
+    let mut written: usize = 0
+    let mut index: usize = 0
+    while index < i32.toUsize(received) {
+      let item = raw[index]
+      if item.filter != FILTER_USER && written < capacity {
+        let failed = (item.flags & ERROR) != 0
+        events[written] = ReadyEvent {
+          token: usize.toU64(item.udata),
+          readable: item.filter == FILTER_READ && !failed,
+          writable: item.filter == FILTER_WRITE && !failed,
+          hangup: (item.flags & END) != 0,
+          error: failed || ((item.flags & END) != 0 && item.fflags != 0),
+        }
+        written = written + 1
+      }
+      index = index + 1
+    }
+    count.* = written
+    return 0
+  }
+} else {
+  unsafe extern "C" fn __errno_location() -> *mut i32
+  unsafe fn currentError() -> i32 { unsafe { return Pointer.read<i32>(__errno_location()) } }
+
+  // The C `struct epoll_event`. It is packed on x86_64, so the 64-bit data is two 32-bit halves
+  // there; aarch64 aligns the data to 8 bytes.
+  static if Intrinsic.targetArchitecture() == "x86_64" {
+    extern "C" struct PollEvent { events: u32, low: u32, high: u32 }
+    impl Copy for PollEvent {}
+    fn pollEvent(events: u32, token: u64) -> PollEvent {
+      return PollEvent { events: events, low: u64.toU32(token & 4294967295), high: u64.toU32(u64.shiftRight(token, 32)) }
+    }
+    fn pollToken(event: &PollEvent) -> u64 {
+      return u32.toU64(event.low) | u64.shiftLeft(u32.toU64(event.high), 32)
+    }
+  } else {
+    extern "C" struct PollEvent { events: u32, padding: u32, data: u64 }
+    impl Copy for PollEvent {}
+    fn pollEvent(events: u32, token: u64) -> PollEvent {
+      return PollEvent { events: events, padding: 0, data: token }
+    }
+    fn pollToken(event: &PollEvent) -> u64 { return event.data }
+  }
+
+  unsafe extern "C" fn epoll_create1(flags: i32) -> i32
+  @foreign(noCapture: .("event"))
+  unsafe extern "C" fn epoll_ctl(queue: i32, operation: i32, fd: i32, event: ?*const PollEvent) -> i32
+  @foreign(noCapture: .("events"))
+  unsafe extern "C" fn epoll_wait(queue: i32, events: ?[*]mut PollEvent, count: i32, timeout: i32) -> i32
+  unsafe extern "C" fn eventfd(initial: u32, flags: i32) -> i32
+  @foreign(noCapture: .("buffer"))
+  unsafe extern "C" fn read(fd: i32, buffer: ?[*]mut u8, count: usize) -> isize
+  @foreign(noCapture: .("buffer"))
+  unsafe extern "C" fn write(fd: i32, buffer: ?[*]const u8, count: usize) -> isize
+
+  const CLOEXEC: i32 = 524288
+  const NONBLOCK: i32 = 2048
+  const CONTROL_ADD: i32 = 1
+  const CONTROL_DELETE: i32 = 2
+  const CONTROL_MODIFY: i32 = 3
+  const POLL_IN: u32 = 1
+  const POLL_OUT: u32 = 4
+  const POLL_ERROR: u32 = 8
+  const POLL_HANGUP: u32 = 16
+  const POLL_READ_HANGUP: u32 = 8192
+
+  fn mask(interest: Interest) -> u32 {
+    let mut bits = POLL_READ_HANGUP
+    if interest.readable { bits = bits | POLL_IN }
+    if interest.writable { bits = bits | POLL_OUT }
+    return bits
+  }
+
+  unsafe fn openHandles(queue: &mut i32, wake: &mut i32) -> i32 {
+    let opened = unsafe epoll_create1(CLOEXEC)
+    if opened < 0 { return unsafe currentError() }
+    queue.* = opened
+    let source = unsafe eventfd(0, CLOEXEC | NONBLOCK)
+    if source < 0 { return unsafe currentError() }
+    wake.* = source
+    let event = pollEvent(POLL_IN, WAKE_TOKEN)
+    if unsafe epoll_ctl(opened, CONTROL_ADD, source, Pointer.fromRef<PollEvent>(&event)) < 0 {
+      return unsafe currentError()
+    }
+    return 0
+  }
+
+  unsafe fn signalWake(queue: i32, wake: i32) -> i32 {
+    let one: [u8; 8] = [1, 0, 0, 0, 0, 0, 0, 0]
+    while true {
+      let written = unsafe write(wake, Pointer.fromSlice<u8>(&one), 8)
+      if written >= 0 { return 0 }
+      let code = unsafe currentError()
+      // EAGAIN: the counter is full, so a wake is already pending.
+      if code == 11 { return 0 }
+      if code != 4 { return code }
+    }
+    return 0
+  }
+
+  unsafe fn drainWake(wake: i32) -> () {
+    let mut value: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0]
+    let _read = unsafe read(wake, Pointer.fromMutSlice<u8>(&mut value), 8)
+    return ()
+  }
+
+  unsafe fn change(queue: i32, fd: i32, token: u64, interest: Interest, adding: bool) -> i32 {
+    let event = pollEvent(mask(interest), token)
+    let operation = if adding { CONTROL_ADD } else { CONTROL_MODIFY }
+    if unsafe epoll_ctl(queue, operation, fd, Pointer.fromRef<PollEvent>(&event)) < 0 { return unsafe currentError() }
+    return 0
+  }
+
+  unsafe fn remove(queue: i32, fd: i32) -> i32 {
+    if unsafe epoll_ctl(queue, CONTROL_DELETE, fd, Pointer.null<PollEvent>()) < 0 { return unsafe currentError() }
+    return 0
+  }
+
+  // Milliseconds for epoll_wait: -1 waits with no limit, and a partial millisecond rounds up.
+  fn milliseconds(timeout: Option<u64>) -> i32 {
+    return match timeout {
+      Option<u64>.Some { value } => {
+        let whole = value / 1000000
+        let rounded = if value % 1000000 != 0 { whole + 1 } else { whole }
+        if rounded > 2147483647 { 2147483647 } else { u64.toI32(rounded) }
+      }
+      Option<u64>.None => -1
+    }
+  }
+
+  unsafe fn waitEvents(queue: i32, wake: i32, events: &mut [ReadyEvent], timeout: Option<u64>, count: &mut usize) -> i32 {
+    count.* = 0
+    let mut raw: [PollEvent; 64] = [pollEvent(0, 0); 64]
+    let mut capacity = events.length
+    if capacity > BATCH { capacity = BATCH }
+    // A wake must still end a wait for an empty buffer, so ask for at least one raw event.
+    let mut asked = capacity
+    if asked == 0 { asked = 1 }
+    let received = unsafe epoll_wait(queue, Pointer.fromMutSlice<PollEvent>(&mut raw), usize.toI32(asked), milliseconds(timeout))
+    if received < 0 {
+      let code = unsafe currentError()
+      if code == 4 { return 0 }
+      return code
+    }
+    let mut written: usize = 0
+    let mut index: usize = 0
+    while index < i32.toUsize(received) {
+      let item = raw[index]
+      let token = pollToken(&item)
+      if token == WAKE_TOKEN {
+        unsafe drainWake(wake)
+      } else {
+        if written < capacity {
+          events[written] = ReadyEvent {
+            token: token,
+            readable: (item.events & POLL_IN) != 0,
+            writable: (item.events & POLL_OUT) != 0,
+            hangup: (item.events & (POLL_HANGUP | POLL_READ_HANGUP)) != 0,
+            error: (item.events & POLL_ERROR) != 0,
+          }
+          written = written + 1
+        }
+      }
+      index = index + 1
+    }
+    count.* = written
+    return 0
+  }
+}
+}

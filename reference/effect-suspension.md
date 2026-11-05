@@ -415,8 +415,19 @@ effect fn allocate(
   })
 }
 
+effect fn allocateZeroed(
+  self: &mut SuspendingAllocator,
+  layout: Layout
+) -> Intrinsic.Allocation ! OutOfMemoryError {
+  let mut system = Allocator.systemAllocatorProvider()
+  return run Effect.suspend(effect {
+    return run Allocator.allocateZeroed(move layout) |> Effect.provideMut<Allocator>(&mut system)
+  })
+}
+
 impl Allocator for SuspendingAllocator {
   allocate: SuspendingAllocator.allocate
+  allocateZeroed: SuspendingAllocator.allocateZeroed
   unsafe effect fn takeBlock(self: &mut Self, layout: Layout) -> ?*mut u8 { drop layout return Pointer.null<u8>() }
 }
 ```

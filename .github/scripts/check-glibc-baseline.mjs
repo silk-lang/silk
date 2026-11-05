@@ -24,6 +24,7 @@ const otherBranches = new Set([
   // Darwin
   '__error', '_NSGetEnviron', '__stderrp', '__ulock_wait', '__ulock_wake', 'arc4random_buf',
   'close$NOCANCEL', 'sysctlbyname', 'fstat', 'fstatat', 'posix_spawn_file_actions_addchdir_np',
+  'kqueue', 'kevent', 'stat', 'lstat', 'fcopyfile', 'clonefile',
   // Windows
   'closesocket', 'ioctlsocket', '__silk_stderr_lock', '__silk_stderr_once',
   // The Tracy profiler, which a profiling build links as a declared input.
