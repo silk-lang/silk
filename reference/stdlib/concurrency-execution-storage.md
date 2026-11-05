@@ -9,9 +9,13 @@ The compiler and the runtime use this module through its C exports. Application 
 call it.
 
 ## Details
-Each [`ExecutionStorage`](#ExecutionStorage) state owns its limit, its accounting and its reservations. There is no
-shared counter and no environment lookup. Allocation and release use the declared allocator of
-the selected target.
+Each [`ExecutionStorage`](#ExecutionStorage) state owns its limit, its accounting and its frames. There is no
+shared counter and no environment lookup. A state is a stack: frames are carved one after
+another from segments, and released in reverse order, so a callee's frame sits right after its
+caller's and costs no allocation of its own. The first segment, one page, comes with the
+state; a frame that does not fit starts a segment four times the size of the last, which stays
+for reuse once it empties. Compiled code carves most frames itself from the state's window
+without calling the state. Segments use the declared allocator of the selected target.
 
 ## Errors
 [`ExecutionStorage.make`](#ExecutionStorage.impl.make) fails with `OutOfMemoryError`. [`ExecutionStorage.acquire`](#ExecutionStorage.impl.acquire) returns
@@ -20,6 +24,7 @@ null when a frame does not fit in the limit or cannot be allocated.
 ## Gotchas
 - Raw frame access is unsafe. A frame is valid only until it is released or its state is
   destroyed.
+- Frames are released last first; releasing any other frame corrupts the state.
 - One state needs exclusive use. Independent states can use a concurrent host allocator.
 
 Import as `ExecutionStorage` with `import silk.concurrency.execution_storage { ExecutionStorage }`.
@@ -72,8 +77,9 @@ Creates an independent state whose frame reservations can charge at most `limit`
 
 #### Details
 
-Charges include each reservation header and alignment padding. The fixed state allocation
-is excluded. Refusal acquires no state and reports OutOfMemoryError.
+Charges include each frame's offset word and alignment padding. The state allocation,
+which holds the first segment, is excluded. Refusal acquires no state and reports
+OutOfMemoryError.
 
 <a id="ExecutionStorage.impl.used"></a>
 
@@ -109,11 +115,12 @@ null.
 pub unsafe fn release(self: &mut ExecutionStorage, frame: ?*mut u8) -> ()
 ```
 
-Releases one frame acquired from this state and removes its charge.
+Releases the frame this state acquired last and removes its charge.
 
 #### Gotchas
 
-The caller must finish semantic cleanup and stop every access before releasing the frame.
+Frames are released in reverse acquisition order: `frame` must be the live frame acquired
+last. The caller must finish semantic cleanup and stop every access before releasing it.
 
 
 Category: Concurrency.

@@ -267,7 +267,12 @@ runtime trap according to the program-termination rules.
 [execution-storage requirements](independent-execution.md#exec-001--construction-is-lazy-explicit-and-caller-funded).
 
 The selected component binds `create`, `acquire`, `release` and `destroy` to ordinary
-source C exports. Bindings are demand-driven: an unused catalog entry does not load
+source C exports. A state begins with two words, a window: a cursor and an end. Compiled code
+carves a frame no more aligned than a word from the window when it fits, moving the cursor past
+the frame, and moves the cursor back to the frame when it releases it; any other frame comes from
+`acquire` and goes back through `release`. The component keeps the cursor word-aligned and the
+end within its limit, and a component that wants every frame through `acquire` keeps the cursor
+and the end equal. Bindings are demand-driven: an unused catalog entry does not load
 its provider. Each transient driver or owned Execution has an independent state.
 State is acquired lazily on first frame allocation, preserved across parking and
 consumed after frame cleanup on completion or cancellation. An unstarted Execution

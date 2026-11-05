@@ -6,9 +6,17 @@
 //! directly; every such call is a suspension point. Its ordinary symbol drives a transfer record:
 //! `$enter` pushes the instance's frame from the selected execution storage, and the driver runs the
 //! `$step` of the frame on top until no frame remains. A step returns 0 when its frame completed and
-//! was released, 1 when it pushed the frame of the callee at one of its points, and 2 when it
-//! relinquished its execution package: its frames stay in the package's own transfer record and the
-//! package's start continues them at the next drive.
+//! was released, 1 when a frame above its own waits for the driver, and 2 when it relinquished its
+//! execution package: its frames stay in the package's own transfer record and the package's start
+//! continues them at the next drive.
+//!
+//! A point whose callee can call back into the caller, a recursive cycle of suspendable instances,
+//! pushes its callee's frame, saves its state and returns 1, so every recursive cycle gives the
+//! machine stack back to the driver once per turn (SUSP-003). Every other point pushes the callee's
+//! frame and runs its step directly, as an ordinary call: when that step completes, the caller
+//! continues in place with its locals where they were, and only a step that returns 1 or 2 makes
+//! the caller save its state and return the same code. Machine stack then grows with the longest
+//! chain of suspendable calls that repeats no instance, as it does for ordinary calls.
 //!
 //! Dropping a relinquished package cancels its frames top-down. A step that finds its package
 //! destroyed restores its point's state and runs that point's cancel exit, which drops every owner
@@ -54,6 +62,9 @@ import silk.collections.list {List}
 pub struct Facts {
   /// Its direct callees that are themselves suspendable, in first-call order.
   pub callees: List<InstanceKey>,
+  /// Per callee, whether it can call back into this instance: a recursive cycle of suspendable
+  /// instances, whose calls transfer through the driver (SUSP-003).
+  pub cyclic: List<bool>,
   /// The C symbols of the selected execution-storage operations.
   pub create: Bytes,
   pub acquire: Bytes,
@@ -99,6 +110,8 @@ pub struct Coroutine {
 
 impl Facts {
   pub effect fn copy(self: &Self) -> Facts ! OutOfMemoryError ? &mut Allocator {
+    let mut cyclic = List<bool>.make()
+    run List<bool>.appendSlice(&mut cyclic, List<bool>.asSlice(&self.cyclic))
     let mut callees = List<InstanceKey>.make()
     let listed = List<InstanceKey>.asSlice(&self.callees)
     let mut at = usize.ZERO
@@ -108,11 +121,25 @@ impl Facts {
     }
     return Facts {
       callees: move callees,
+      cyclic: move cyclic,
       create: run Bytes.copy(Bytes.asSlice(&self.create)),
       acquire: run Bytes.copy(Bytes.asSlice(&self.acquire)),
       release: run Bytes.copy(Bytes.asSlice(&self.release)),
       destroy: run Bytes.copy(Bytes.asSlice(&self.destroy)),
     }
+  }
+
+  /// Whether a call to `key` is a suspension point whose callee's frame transfers through the
+  /// driver because the callee can call back into this instance.
+  pub effect fn transfers(self: &Self, key: &InstanceKey) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let listed = List<InstanceKey>.asSlice(&self.callees)
+    let cyclic = List<bool>.asSlice(&self.cyclic)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      if run InstanceKey.sameApplication(&listed[at], key) { return at < cyclic.length && cyclic[at] }
+      at = at + usize.ONE
+    }
+    return false
   }
 
   /// Whether a call to `key` is a suspension point.
@@ -130,9 +157,17 @@ impl Facts {
     let left = List<InstanceKey>.asSlice(&self.callees)
     let right = List<InstanceKey>.asSlice(&other.callees)
     if left.length != right.length { return false }
+    let leftCyclic = List<bool>.asSlice(&self.cyclic)
+    let rightCyclic = List<bool>.asSlice(&other.cyclic)
+    if leftCyclic.length != rightCyclic.length { return false }
     let mut at = usize.ZERO
     while at < left.length {
       if !run InstanceKey.sameApplication(&left[at], &right[at]) { return false }
+      at = at + usize.ONE
+    }
+    at = usize.ZERO
+    while at < leftCyclic.length {
+      if leftCyclic[at] != rightCyclic[at] { return false }
       at = at + usize.ONE
     }
     return same(Bytes.asSlice(&self.create), Bytes.asSlice(&other.create))
@@ -403,6 +438,104 @@ effect fn liveness(function: &MirFunction, words: usize) -> List<u64> ! OutOfMem
   return move live
 }
 
+// Whether a store to `place` writes storage of its root local, rather than storage its root
+// addresses.
+fn writesRoot(place: &Place) -> bool {
+  let steps = List<Projection>.asSlice(&place.projections)
+  if steps.length == usize.ZERO { return true }
+  return match &steps[usize.ZERO] { Projection.Deref => false _ => true }
+}
+
+fn markWritten(sets: &mut List<u64>, base: usize, place: &Place) -> () {
+  if writesRoot(place) { mark(List<u64>.asMutSlice(&mut sets.*), base, place.local) }
+}
+
+// The locals some path has written by the end of each block, `words` words per block: a local no
+// path has written holds nothing a resume state needs. The parameters, provider addresses and
+// diagnostic addresses hold their values from entry.
+effect fn assigned(function: &MirFunction, words: usize) -> List<u64> ! OutOfMemoryError ? &mut Allocator {
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let locals = List<Local>.asSlice(&function.locals)
+  let mut writes = run zeros(blocks.length * words)
+  let mut edges = List<List<usize>>.make()
+  let mut block = usize.ZERO
+  while block < blocks.length {
+    let base = block * words
+    let statements = List<Statement>.asSlice(&blocks[block].statements)
+    let mut at = usize.ZERO
+    while at < statements.length {
+      match &statements[at] {
+        Statement.Assign {destination, ..} => markWritten(&mut writes, base, &destination)
+        Statement.FailureContext {destination, ..} => markWritten(&mut writes, base, &destination)
+        _ => {}
+      }
+      at = at + usize.ONE
+    }
+    if let Terminator.Call {destination, failure, ..} = &blocks[block].terminator {
+      markWritten(&mut writes, base, &destination)
+      if let Option<FailureEdge>.Some {value: edge} = &failure { markWritten(&mut writes, base, &edge.destination) }
+    }
+    run List<List<usize>>.append(&mut edges, run MirFunction.successors(function, block))
+    block = block + usize.ONE
+  }
+  let mut entry = run zeros(words)
+  let mut local = usize.ZERO
+  while local < locals.length {
+    let initial = match &locals[local].kind {
+      LocalKind.Parameter {..} => true
+      LocalKind.Provider {..} => true
+      LocalKind.Observer => true
+      LocalKind.Cause => true
+      LocalKind.Site => true
+      _ => false
+    }
+    if initial { mark(List<u64>.asMutSlice(&mut entry), usize.ZERO, local) }
+    local = local + usize.ONE
+  }
+  // Forward union to a fixed point: a block's entry set gains each predecessor's exit set.
+  let mut entries = run zeros(blocks.length * words)
+  let mut index = usize.ZERO
+  while index < words && blocks.length > usize.ZERO {
+    let seeded = List<u64>.asMutSlice(&mut entries)
+    seeded[index] = List<u64>.asSlice(&entry)[index]
+    index = index + usize.ONE
+  }
+  let mut exits = run zeros(blocks.length * words)
+  let following = List<List<usize>>.asSlice(&edges)
+  let mut changed = true
+  while changed {
+    changed = false
+    block = usize.ZERO
+    while block < blocks.length {
+      index = usize.ZERO
+      while index < words {
+        let at = block * words + index
+        let out = u64.bitOr(List<u64>.asSlice(&entries)[at], List<u64>.asSlice(&writes)[at])
+        if List<u64>.asSlice(&exits)[at] != out {
+          let leaving = List<u64>.asMutSlice(&mut exits)
+          leaving[at] = out
+          changed = true
+        }
+        let targets = List<usize>.asSlice(&following[block])
+        let mut edge = usize.ZERO
+        while edge < targets.length {
+          let to = targets[edge] * words + index
+          let merged = u64.bitOr(List<u64>.asSlice(&entries)[to], out)
+          if List<u64>.asSlice(&entries)[to] != merged {
+            let entering = List<u64>.asMutSlice(&mut entries)
+            entering[to] = merged
+            changed = true
+          }
+          edge = edge + usize.ONE
+        }
+        index = index + usize.ONE
+      }
+      block = block + usize.ONE
+    }
+  }
+  return move exits
+}
+
 // Locals whose address a reference or raw pointer can carry, and the places the callee of a point
 // writes after its caller's step returned.
 effect fn residentLocals(function: &MirFunction, points: &[bool], words: usize) -> List<u64>
@@ -570,6 +703,31 @@ effect fn panicAt(prefix: &[u8], function: &MirFunction, index: usize, suffix: &
   return CompilerBug.panic(Bytes.asSlice(&reason))
 }
 
+// The locals the point ending `block` saves: live on entry to a successor and written on some
+// path to the point. A local no path has written yet holds nothing to restore.
+effect fn savedAfter(function: &MirFunction, block: usize, entries: &[u64], exits: &[u64], words: usize) -> List<u64>
+! OutOfMemoryError ? &mut Allocator {
+  let mut after = run zeros(words)
+  let targets = run MirFunction.successors(function, block)
+  let listed = List<usize>.asSlice(&targets)
+  let merged = List<u64>.asMutSlice(&mut after)
+  let mut target = usize.ZERO
+  while target < listed.length {
+    let mut index = usize.ZERO
+    while index < words {
+      merged[index] = u64.bitOr(merged[index], entries[listed[target] * words + index])
+      index = index + usize.ONE
+    }
+    target = target + usize.ONE
+  }
+  let mut index = usize.ZERO
+  while index < words {
+    merged[index] = u64.bitAnd(merged[index], exits[block * words + index])
+    index = index + usize.ONE
+  }
+  return move after
+}
+
 // Packs the saved locals of one state from `base`; returns the state and its end offset.
 struct Packed {
   state: State,
@@ -594,8 +752,8 @@ effect fn pack(extents: &[Extent], live: &[u64], resident: &[u64], base: usize) 
 
 impl Coroutine {
   /// The frame header: its parent frame at offset 0, its step function and resume state, then the
-  /// caller's result, failure and context addresses, the observer, cause and entry site, and one
-  /// address per provider.
+  /// caller's result, failure and context addresses, the observer, cause and entry site, whether
+  /// the frame was carved inline, and one address per provider.
   pub fn resumeOffset(word: usize) -> usize { return word }
   pub fn stateOffset(word: usize) -> usize { return word * 2 }
   pub fn outOffset(word: usize) -> usize { return word * 3 }
@@ -604,7 +762,10 @@ impl Coroutine {
   pub fn observerOffset(word: usize) -> usize { return word * 6 }
   pub fn causeOffset(word: usize) -> usize { return word * 7 }
   pub fn siteOffset(word: usize) -> usize { return word * 8 }
-  pub fn providerOffset(word: usize, index: usize) -> usize { return word * (9 + index) }
+  /// Whether the frame was carved from its storage state's window, which its release restores, or
+  /// was acquired from the state: non-null for a carved frame.
+  pub fn carvedOffset(word: usize) -> usize { return word * 9 }
+  pub fn providerOffset(word: usize, index: usize) -> usize { return word * (10 + index) }
 
   /// The four-word transfer record: the lazily created storage state at offset 0, the top frame,
   /// whether the frame that completed last failed, and the execution package that owns the record,
@@ -622,7 +783,28 @@ impl Coroutine {
     companions: &[usize], word: usize) -> Coroutine ! OutOfMemoryError ? &mut Allocator {
     let count = extents.length
     let words = count / 64 + usize.ONE
-    let resident = run residentLocals(function, points, words)
+    let mut resident = run residentLocals(function, points, words)
+    let live = run liveness(function, words)
+    let entries = List<u64>.asSlice(&live)
+    let written = run assigned(function, words)
+    let exits = List<u64>.asSlice(&written)
+    let blocks = List<Block>.asSlice(&function.blocks)
+    // A saved local wider than two words lives in the frame instead: it already lives in memory,
+    // so a save and a restore at every point would only copy it twice.
+    let mut block = usize.ZERO
+    while block < blocks.length {
+      if points[block] {
+        let after = run savedAfter(function, block, entries, exits, words)
+        let mut local = usize.ZERO
+        while local < count {
+          if isSet(List<u64>.asSlice(&after), usize.ZERO, local) && extents[local].size > word * 2 {
+            mark(List<u64>.asMutSlice(&mut resident), usize.ZERO, local)
+          }
+          local = local + usize.ONE
+        }
+      }
+      block = block + usize.ONE
+    }
     let resided = List<u64>.asSlice(&resident)
     let mut alignment = word
     let mut offset = Coroutine.providerOffset(word, providers)
@@ -664,30 +846,15 @@ impl Coroutine {
     let Packed {state: initial, end: initialEnd} = move start
     if initialEnd > end { end = initialEnd }
     run List<State>.append(&mut states, move initial)
-    let live = run liveness(function, words)
-    let entries = List<u64>.asSlice(&live)
     let unassigned = liveFlag(List<Local>.asSlice(&function.locals), entries)
     if unassigned != usize.MAX {
       return run panicAt(b"SuspensionOwnership: drop flag local ", function, unassigned, b" is read before it is assigned")
     }
-    let blocks = List<Block>.asSlice(&function.blocks)
     let mut pointBlocks = List<usize>.make()
-    let mut block = usize.ZERO
+    block = usize.ZERO
     while block < blocks.length {
       if points[block] {
-        let mut after = run zeros(words)
-        let targets = run MirFunction.successors(function, block)
-        let listed = List<usize>.asSlice(&targets)
-        let mut target = usize.ZERO
-        while target < listed.length {
-          let mut index = usize.ZERO
-          let merged = List<u64>.asMutSlice(&mut after)
-          while index < words {
-            merged[index] = u64.bitOr(merged[index], entries[listed[target] * words + index])
-            index = index + usize.ONE
-          }
-          target = target + usize.ONE
-        }
+        let after = run savedAfter(function, block, entries, exits, words)
         run requireFlagStorage(function, extents, List<u64>.asSlice(&after), resided)
         let resumed = run pack(extents, List<u64>.asSlice(&after), resided, base)
         let Packed {state: saved, end: savedEnd} = move resumed

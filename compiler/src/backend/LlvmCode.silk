@@ -168,6 +168,9 @@ struct Writer {
   site: u64,
   transfer: u64,
   frame: u64,
+  /// A step's own step record in an unoptimized build (`stepRecord`), which its direct callee steps
+  /// run published in; `none()` otherwise.
+  steps: u64,
   /// Per MIR block, whether its switch dispatches through a table of block addresses, and the
   /// tables the function being built uses, defined once its blocks have positions.
   threaded: List<bool>,
@@ -231,7 +234,7 @@ effect fn writerOfWidth(pointerBits: usize, fastPath: bool) -> Writer ! OutOfMem
     pointerBits: pointerBits, coff: false, slots: List<u64>.make(), companions: List<u64>.make(),
     blocks: List<u64>.make(), scalars: List<bool>.make(), alignments: List<usize>.make(), copies: List<CallerCopy>.make(), dropCopies: List<DropCopy>.make(), parameters: List<u64>.make(), extras: List<u64>.make(), providers: List<u64>.make(),
     out: Bitcode.none(), failure: Bitcode.none(), context: Bitcode.none(), observer: Bitcode.none(), cause: Bitcode.none(),
-    site: Bitcode.none(), transfer: Bitcode.none(), frame: Bitcode.none(), threaded: List<bool>.make(), cold: List<bool>.make(),
+    site: Bitcode.none(), transfer: Bitcode.none(), frame: Bitcode.none(), steps: Bitcode.none(), threaded: List<bool>.make(), cold: List<bool>.make(),
     direct: List<usize>.make(), bound: List<bool>.make(), tables: List<JumpTable>.make()}
 }
 
@@ -1568,10 +1571,12 @@ effect fn callFrameReport(writer: &mut Writer, walk: u64, named: u64) -> () ! Ou
 
 // `silk.diagnostic.chain(walk)` reports the suspended callers of the frame the walk's innermost
 // unchained step record holds, parent by parent (`defineFrameReport`), then moves the walk to the
-// record's outer one. Only the frame chain knows these callers: each one's step returned when it
-// pushed its callee, and a frame resumed later runs from its driver. The chain ends at the bottom
-// frame, or after `frameLimit` frames. On a native target, the bottom frame is left out: its own
-// driver steps the record, and the unwinder meets that driver, which bears the frame's name.
+// record's outer one. Only the frame chain knows these callers: each one's step returned when it or
+// a callee it stepped directly gave the machine stack back to the driver, and a frame resumed later
+// runs from its driver. The chain ends at the bottom frame, before the frame the outer record
+// steps, which is on the machine stack, or after `frameLimit` frames. On a native target, the
+// bottom frame is left out: its own driver steps the record, and the unwinder meets that driver,
+// which bears the frame's name.
 effect fn defineStepChain(writer: &mut Writer, target: &Target) -> () ! OutOfMemoryError ? &mut Allocator {
   let word = wordSize(target)
   let bits = word * 8
@@ -1602,18 +1607,34 @@ effect fn defineStepChain(writer: &mut Writer, target: &Target) -> () ! OutOfMem
   let outer = run loadWordAt(&mut writer.*, steps, word)
   run Module.store(&mut writer.*.module, outer, stepsSlot, usize.toU64(word), false)
   let caller = run loadPointer(&mut writer.*, top, word)
+  // The frames up to the one the outer record steps are suspended callers. A step runs its direct
+  // callee's step published in its own record, so that callee's caller is the outer record's frame,
+  // which the walk reports itself.
+  let enclosing = run labelled(&mut writer.*, b"enclosing")
+  let begin = run labelled(&mut writer.*, b"begin")
+  let nested = run compareOf(&mut writer.*, Bitcode.intNe(), outer, null)
+  run branchIf(&mut writer.*, nested, enclosing, begin)
+  startBlock(&mut writer.*, enclosing)
+  let outerTop = run loadPointer(&mut writer.*, outer, word)
+  run branch(&mut writer.*, begin)
+  startBlock(&mut writer.*, begin)
+  let stopIncoming = [null, stepped, outerTop, enclosing]
+  let stop = run Module.phi(&mut writer.*.module, pointer, &stopIncoming)
+  Module.setName(&mut writer.*.module, stop, Bitcode.plain(Bitcode.prefix(b"stop")))
   run branch(&mut writer.*, parents)
   startBlock(&mut writer.*, parents)
   let following = run Module.reserve(&mut writer.*.module)
-  let frameIncoming = [caller, stepped, following, report]
+  let frameIncoming = [caller, begin, following, report]
   let frame = run Module.phi(&mut writer.*.module, pointer, &frameIncoming)
   Module.setName(&mut writer.*.module, frame, Bitcode.plain(Bitcode.prefix(b"frame")))
   let zero = run Module.zero(&mut writer.*.module, wordTy)
   let walked = run Module.reserve(&mut writer.*.module)
-  let depthIncoming = [zero, stepped, walked, report]
+  let depthIncoming = [zero, begin, walked, report]
   let depth = run Module.phi(&mut writer.*.module, wordTy, &depthIncoming)
   Module.setName(&mut writer.*.module, depth, Bitcode.plain(Bitcode.prefix(b"depth")))
-  let ended = run compareOf(&mut writer.*, Bitcode.intEq(), frame, null)
+  let absent = run compareOf(&mut writer.*, Bitcode.intEq(), frame, null)
+  let reached = run compareOf(&mut writer.*, Bitcode.intEq(), frame, stop)
+  let ended = run binaryOf(&mut writer.*, Bitcode.opOr(), absent, reached)
   run branchIf(&mut writer.*, ended, done, check)
   startBlock(&mut writer.*, check)
   let parent = run loadPointer(&mut writer.*, frame, word)
@@ -4528,8 +4549,10 @@ effect fn emitBlock(
       }
       if state != usize.MAX {
         if let Option<Suspended>.Some {value: stepping} = &suspended.* {
-          run emitSuspendingCall(&mut writer.*, function, target, layouts, identities, &stepping, state, &callee,
-            &arguments, &providers, &diagnostics, &destination, &failure, origin.location)
+          let mut transfers = false
+          if let Callee.Instance {key} = &callee { transfers = run Facts.transfers(&stepping.facts, &key) }
+          run emitSuspendingCall(&mut writer.*, function, target, layouts, identities, &stepping, state, transfers,
+            &callee, &arguments, &providers, &diagnostics, &destination, normal, &failure, origin.location)
         }
       } else {
         let binding = directBinding(&writer.*, index)
@@ -5878,6 +5901,12 @@ effect fn stepType(writer: &mut Writer) -> u64 ! OutOfMemoryError ? &mut Allocat
 // build, `steps` is the driver's step record (`stepRecord`), which the step runs published in.
 effect fn stepTop(writer: &mut Writer, transfer: u64, top: u64, steps: u64, word: usize) -> u64 ! OutOfMemoryError ? &mut Allocator {
   let resume = run loadWordAt(&mut writer.*, top, Coroutine.resumeOffset(word))
+  return run stepFrame(&mut writer.*, resume, transfer, top, steps, word)
+}
+
+// Runs `resume`, the step of `top`, as `stepTop` does.
+effect fn stepFrame(writer: &mut Writer, resume: u64, transfer: u64, top: u64, steps: u64, word: usize) -> u64
+! OutOfMemoryError ? &mut Allocator {
   let ty = run stepType(&mut writer.*)
   let arguments = [transfer, top]
   if steps == Bitcode.none() { return run Module.call(&mut writer.*.module, ty, resume, &arguments, 0, false) }
@@ -6086,17 +6115,54 @@ effect fn emitEnter(writer: &mut Writer, function: &MirFunction, target: &Target
   let wordTy = run wordType(&mut writer.*)
   let size = run wordOf(&mut writer.*, stepping.coroutine.size)
   let alignment = run wordOf(&mut writer.*, stepping.coroutine.alignment)
+  let null = run nullOf(&mut writer.*)
+  let start = run labelled(&mut writer.*, b"start")
+  let provide = run labelled(&mut writer.*, b"provide")
+  let provided = run labelled(&mut writer.*, b"provided")
+  // A frame no more aligned than a word is carved from the state's window when it fits: the
+  // window's word-aligned cursor moves past it, and its release moves the cursor back.
+  let mut carvedIncoming = List<u64>.make()
+  let mut frameIncoming = List<u64>.make()
+  if stepping.coroutine.alignment <= word {
+    let cursor = run loadPointer(&mut writer.*, state, usize.ZERO)
+    let end = run loadWordAt(&mut writer.*, state, word)
+    let low = run Module.cast(&mut writer.*.module, Bitcode.castPtrToInt(), cursor, wordTy)
+    let high = run Module.cast(&mut writer.*.module, Bitcode.castPtrToInt(), end, wordTy)
+    let room = run binaryOf(&mut writer.*, Bitcode.opSub(), high, low)
+    let fits = run compareOf(&mut writer.*, Bitcode.intUle(), size, room)
+    let carve = run labelled(&mut writer.*, b"carve")
+    run branchExpecting(&mut writer.*, fits, true, carve, provide)
+    startBlock(&mut writer.*, carve)
+    let moved = run byteOffset(&mut writer.*, cursor, stepping.coroutine.size)
+    run storeOf(&mut writer.*, moved, state, usize.ZERO)
+    run branch(&mut writer.*, start)
+    run List<u64>.append(&mut frameIncoming, cursor)
+    run List<u64>.append(&mut frameIncoming, carve)
+    run List<u64>.append(&mut carvedIncoming, cursor)
+    run List<u64>.append(&mut carvedIncoming, carve)
+  } else {
+    run branch(&mut writer.*, provide)
+  }
+  startBlock(&mut writer.*, provide)
   let acquireParameters = [pointer, wordTy, wordTy]
   let acquireArguments = [state, size, alignment]
-  let frame = run callNamed(&mut writer.*, Bytes.asSlice(&stepping.facts.acquire), pointer, &acquireParameters, &acquireArguments)
-  Module.setName(&mut writer.*.module, frame, hiddenName(b"frame"))
-  writer.frame = frame
-  let absent = run isNull(&mut writer.*, frame)
-  let start = run labelled(&mut writer.*, b"start")
-  run branchIf(&mut writer.*, absent, exhausted, start)
+  let acquired = run callNamed(&mut writer.*, Bytes.asSlice(&stepping.facts.acquire), pointer, &acquireParameters, &acquireArguments)
+  let absent = run isNull(&mut writer.*, acquired)
+  run branchIf(&mut writer.*, absent, exhausted, provided)
   startBlock(&mut writer.*, exhausted)
   run trapHere(&mut writer.*)
+  startBlock(&mut writer.*, provided)
+  run branch(&mut writer.*, start)
+  run List<u64>.append(&mut frameIncoming, acquired)
+  run List<u64>.append(&mut frameIncoming, provided)
+  run List<u64>.append(&mut carvedIncoming, null)
+  run List<u64>.append(&mut carvedIncoming, provided)
   startBlock(&mut writer.*, start)
+  let frame = run Module.phi(&mut writer.*.module, pointer, List<u64>.asSlice(&frameIncoming))
+  let carved = run Module.phi(&mut writer.*.module, pointer, List<u64>.asSlice(&carvedIncoming))
+  Module.setName(&mut writer.*.module, frame, hiddenName(b"frame"))
+  writer.frame = frame
+  run storeWordAt(&mut writer.*, carved, frame, Coroutine.carvedOffset(word))
   let parent = run loadWordAt(&mut writer.*, transfer, Coroutine.transferTop(word))
   run storeOf(&mut writer.*, parent, frame, usize.ZERO)
   let stepTy = run stepType(&mut writer.*)
@@ -6210,6 +6276,7 @@ effect fn emitStep(writer: &mut Writer, function: &MirFunction, target: &Target,
   startBlock(&mut writer.*, entry)
   run emitSlots(&mut writer.*, function, target, layouts, suspended)
   run emitCCopySlots(&mut writer.*, function, target, layouts, foreign)
+  writer.steps = run stepRecord(&mut writer.*, word)
   let observed = diagnosticLocal(function, usize.ZERO) != usize.MAX
   let fallible = failureLocal(function) != usize.MAX
   if run takesResult(function, target, layouts) { writer.out = run loadHidden(&mut writer.*, hiddenName(b"out"), Coroutine.outOffset(word)) }
@@ -6230,17 +6297,12 @@ effect fn emitStep(writer: &mut Writer, function: &MirFunction, target: &Target,
   }
   let stateAddress = run byteOffset(&mut writer.*, frame, Coroutine.stateOffset(word))
   let state = run Module.load(&mut writer.*.module, int32, stateAddress, 0, false)
-  // A frame whose package was dropped while relinquished cancels from its point (`Destroyed`), as
-  // does one whose package holds an interrupt request: its cancel exit resumes the boundary the
-  // request names, or abandons the frame for its caller's.
-  let package = run loadWordAt(&mut writer.*, transfer, Coroutine.transferPackage(word))
-  let null = run nullOf(&mut writer.*)
-  let owned = run compareOf(&mut writer.*, Bitcode.intNe(), package, null)
   let probe = run labelled(&mut writer.*, b"probe")
   let dispatch = run labelled(&mut writer.*, b"dispatch")
   let cancelling = run labelled(&mut writer.*, b"cancelling")
   let invalid = run labelled(&mut writer.*, b"invalid")
   let start = run labelled(&mut writer.*, b"start")
+  let resumed = run labelled(&mut writer.*, b"resumed")
   let mut resumes = List<u64>.make()
   let mut cancels = List<u64>.make()
   let mut point = usize.ONE
@@ -6249,6 +6311,18 @@ effect fn emitStep(writer: &mut Writer, function: &MirFunction, target: &Target,
     run List<u64>.append(&mut cancels, run labelledNumber(&mut writer.*, b"cancel", point))
     point = point + usize.ONE
   }
+  // A fresh frame starts its body: its caller is running, so its package is neither dropped nor
+  // interrupted.
+  let initial = run integerOf(&mut writer.*, 32, 0)
+  let fresh = run compareOf(&mut writer.*, Bitcode.intEq(), state, initial)
+  run branchIf(&mut writer.*, fresh, start, resumed)
+  startBlock(&mut writer.*, resumed)
+  // A frame whose package was dropped while relinquished cancels from its point (`Destroyed`), as
+  // does one whose package holds an interrupt request: its cancel exit resumes the boundary the
+  // request names, or abandons the frame for its caller's.
+  let package = run loadWordAt(&mut writer.*, transfer, Coroutine.transferPackage(word))
+  let null = run nullOf(&mut writer.*)
+  let owned = run compareOf(&mut writer.*, Bitcode.intNe(), package, null)
   run branchIf(&mut writer.*, owned, probe, dispatch)
   startBlock(&mut writer.*, probe)
   let activation = run byteOffset(&mut writer.*, package, Coroutine.packageActivation(word))
@@ -6273,8 +6347,6 @@ effect fn emitStep(writer: &mut Writer, function: &MirFunction, target: &Target,
   run Module.switch(&mut writer.*.module, state, invalid, List<u64>.asSlice(&table))
   startBlock(&mut writer.*, dispatch)
   List<u64>.clear(&mut table)
-  run List<u64>.append(&mut table, run integerOf(&mut writer.*, 32, 0))
-  run List<u64>.append(&mut table, start)
   point = usize.ONE
   while point < states.length {
     run List<u64>.append(&mut table, run integerOf(&mut writer.*, 32, usize.toU64(point)))
@@ -6363,9 +6435,24 @@ effect fn emitPop(writer: &mut Writer, target: &Target, stepping: &Suspended, fa
   let state = run loadPointer(&mut writer.*, transfer, usize.ZERO)
   let void = run voidType(&mut writer.*)
   let pointer = run pointerType(&mut writer.*)
+  // A carved frame returns the window's cursor to itself; an acquired one goes back to the state.
+  let carved = run loadWordAt(&mut writer.*, frame, Coroutine.carvedOffset(word))
+  let acquiredFrame = run isNull(&mut writer.*, carved)
+  // A step pops at each of its returns, so these blocks are numbered apart.
+  let number = Module.fresh(&mut writer.*.module)
+  let restore = run Module.newBlock(&mut writer.*.module, Bitcode.named(Bitcode.prefix(b"restore"), number))
+  let returning = run Module.newBlock(&mut writer.*.module, Bitcode.named(Bitcode.prefix(b"returning"), number))
+  let completed = run Module.newBlock(&mut writer.*.module, Bitcode.named(Bitcode.prefix(b"done"), number))
+  run branchExpecting(&mut writer.*, acquiredFrame, false, returning, restore)
+  startBlock(&mut writer.*, restore)
+  run storeOf(&mut writer.*, frame, state, usize.ZERO)
+  run branch(&mut writer.*, completed)
+  startBlock(&mut writer.*, returning)
   let parameters = [pointer, pointer]
   let arguments = [state, frame]
   let _none = run callNamed(&mut writer.*, Bytes.asSlice(&stepping.facts.release), void, &parameters, &arguments)
+  run branch(&mut writer.*, completed)
+  startBlock(&mut writer.*, completed)
   let done = run integerOf(&mut writer.*, 32, 0)
   return run Module.ret(&mut writer.*.module, done)
 }
@@ -6437,8 +6524,11 @@ effect fn emitRelinquish(writer: &mut Writer, target: &Target, stepping: &Suspen
   return run Module.ret(&mut writer.*.module, parked)
 }
 
-// A call at a suspension point saves the locals its resume state restores, pushes the callee's
-// frame with the call's operands, and returns to the driver, which runs the callee next.
+// A call at a suspension point pushes the callee's frame with the call's operands. To a callee that
+// can call back into the caller (`transfers`), it saves the locals its resume state restores and
+// returns to the driver, which runs the callee next. Otherwise it runs the callee's step directly: a completed
+// callee continues the caller in place at the call's normal or failure edge, and any other step
+// code makes the caller save its state and return that code (`backend.Coroutine`).
 effect fn emitSuspendingCall(
   writer: &mut Writer,
   function: &MirFunction,
@@ -6447,11 +6537,13 @@ effect fn emitSuspendingCall(
   identities: &[InstanceIdentity],
   stepping: &Suspended,
   state: usize,
+  transfers: bool,
   callee: &Callee,
   arguments: &List<Operand>,
   providers: &List<Operand>,
   diagnostics: &Option<Diagnostics>,
   destination: &Place,
+  normal: usize,
   failure: &Option<FailureEdge>,
   span: Location,
 ) -> () ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
@@ -6496,7 +6588,7 @@ effect fn emitSuspendingCall(
   if let Option<Diagnostics>.Some {value: observed} = &diagnostics.* {
     run appendDiagnostics(&mut writer.*, function, target, layouts, &observed, &mut passed)
   }
-  run suspendAt(&mut writer.*, target, stepping, state)
+  if transfers { run suspendAt(&mut writer.*, target, stepping, state) }
   let fallible = failed != Bitcode.none()
   if fallible || !output.representation.unit { run List<u64>.append(&mut passed, output.value) }
   if fallible {
@@ -6504,8 +6596,38 @@ effect fn emitSuspendingCall(
     if context != Bitcode.none() { run List<u64>.append(&mut passed, context) }
   }
   run callSuffixed(&mut writer.*, Bytes.asSlice(&symbol), b"$enter", List<u64>.asSlice(&passed))
-  let pushed = run integerOf(&mut writer.*, 32, 1)
-  return run Module.ret(&mut writer.*.module, pushed)
+  if transfers {
+    let pushed = run integerOf(&mut writer.*, 32, 1)
+    return run Module.ret(&mut writer.*.module, pushed)
+  }
+  let word = wordSize(target)
+  let transfer = writer.transfer
+  let top = run loadWordAt(&mut writer.*, transfer, Coroutine.transferTop(word))
+  let stepTy = run stepType(&mut writer.*)
+  let stepName = run suffixed(Bytes.asSlice(&symbol), b"$step")
+  let step = run Module.functionRef(&mut writer.*.module, Bytes.asSlice(&stepName), stepTy)
+  let steps = writer.steps
+  let code = run stepFrame(&mut writer.*, step, transfer, top, steps, word)
+  let done = run integerOf(&mut writer.*, 32, 0)
+  let completed = run compareOf(&mut writer.*, Bitcode.intEq(), code, done)
+  let saving = run labelledNumber(&mut writer.*, b"saving", state)
+  let continuing = run labelledNumber(&mut writer.*, b"completed", state)
+  run branchExpecting(&mut writer.*, completed, true, continuing, saving)
+  startBlock(&mut writer.*, saving)
+  run suspendAt(&mut writer.*, target, stepping, state)
+  run Module.ret(&mut writer.*.module, code)
+  startBlock(&mut writer.*, continuing)
+  let onSuccess = blockAt(&writer.*, normal)
+  if let Option<FailureEdge>.Some {value: edge} = &failure.* {
+    let flagAddress = run byteOffset(&mut writer.*, transfer, Coroutine.transferFailed(word))
+    let byte = run integerType(&mut writer.*, 8)
+    let flag = run Module.load(&mut writer.*.module, byte, flagAddress, 0, false)
+    let zero = run integerOf(&mut writer.*, 8, 0)
+    let taken = run compareOf(&mut writer.*, Bitcode.intNe(), flag, zero)
+    let onFailure = blockAt(&writer.*, edge.target)
+    return run branchUnlikely(&mut writer.*, taken, onFailure, onSuccess)
+  }
+  return run branch(&mut writer.*, onSuccess)
 }
 
 /// One deduplicated declaration candidate owned by an instance answer; `text` is its fragment.
