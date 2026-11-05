@@ -12,8 +12,8 @@ use the [`WebSocket`](./http-websocket-stream.md#WebSocket) of `silk.http.websoc
 ## Details
 [`handshake`](#handshake) sends `GET` with `Upgrade: websocket`, a fresh `Sec-WebSocket-Key` from `Random`,
 version 13, and the subprotocols you offer. It accepts only a 101 response with
-`Upgrade: websocket`, `Connection: upgrade`, and the right `Sec-WebSocket-Accept`. Bytes that the
-server sent after the 101 head go to the session.
+`Upgrade: websocket`, `Connection: upgrade`, and the right `Sec-WebSocket-Accept`. Bytes that
+the server sent after the 101 head go to the session.
 
 ## Errors
 - [`HandshakeError`](#HandshakeError) if the server answered with another status or a wrong 101 response.
@@ -383,6 +383,7 @@ too, for example `Origin` or `Cookie`. They cannot hold the fields that the hand
 - `RequestError` if the request cannot be made, for example for a conflicting field.
 - `ExchangeError` if the exchange fails or the deadline passes.
 - `StreamError` if the session options are not valid.
+- `OutOfMemoryError` if a buffer cannot grow.
 
 The connection is closed after any error.
 
