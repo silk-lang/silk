@@ -80,6 +80,9 @@ import backend.Layout {
 import backend.TypeLayouts {TypeLayouts}
 import backend.LlvmCode
 import backend.LlvmCode {ObjectConstant}
+import backend.WasmLower
+import backend.WasmLower {Declaration as WasmDeclaration, ObjectConstant as WasmConstant}
+import backend.WasmObject
 import semantic.CallableWitness
 import semantic.CallableWitness {CallableWitness as WitnessRecipe, OperandLoan as WitnessLoan}
 import semantic.Specialization {
@@ -2633,6 +2636,10 @@ struct Resolver {
   codegenUnits: bool,
   // Whether LLVM text is shaped for an unoptimized compile (`LlvmCode.Writer.fastPath`).
   fastPathIr: bool,
+  // Whether instances lower to wasm fragments for the direct backend (`WasmLower`) instead of
+  // LLVM text, and whether its memory is shared between threads.
+  direct: bool,
+  threads: bool,
   // Whether lowered functions carry their source lines (`MirFunction.lines`) for line tables.
   lineTables: bool,
   // Whether an assembled module is split into packs for a cache to store beside its image
@@ -80659,6 +80666,64 @@ effect fn observeLlvmGap(resolver: &mut Resolver, subject: usize) -> ()
   return run Graph.record(&mut resolver.graph, unit, Dependee.UnitResult {unit: producer})
 }
 
+// One instance's text: LLVM text, or for the direct backend a wasm fragment (`WasmLower`).
+effect fn emitInstance(resolver: &Resolver, function: &MirFunction, input: &EmissionInputs, hostExport: bool) -> Bytes
+! BackendGap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if resolver.direct {
+    return run WasmLower.emit(
+      function,
+      &resolver.target,
+      List<TypeLayout>.asSlice(&input.layouts),
+      List<CAbi.Signature>.asSlice(&input.foreign),
+      List<InstanceIdentity>.asSlice(&input.identities),
+      &input.suspension,
+      resolver.threads,
+      hostExport,
+    )
+  }
+  return run LlvmCode.emit(
+    function,
+    &resolver.target,
+    List<TypeLayout>.asSlice(&input.layouts),
+    List<CAbi.Signature>.asSlice(&input.foreign),
+    List<InstanceIdentity>.asSlice(&input.identities),
+    &input.suspension,
+    resolver.fastPathIr,
+    hostExport,
+  )
+}
+
+// The declarations of the C symbols `foreign`, in the backend's text.
+effect fn foreignDeclarationsFor(resolver: &Resolver, foreign: &[CAbi.Signature]) -> List<LlvmCode.Declaration>
+! BackendGap | OutOfMemoryError ? &mut Allocator {
+  if !resolver.direct { return run LlvmCode.foreignDeclarations(foreign) }
+  let declared = run WasmLower.foreignDeclarations(&resolver.target, foreign)
+  let entries = List<WasmDeclaration>.asSlice(&declared)
+  let mut converted = run List<LlvmCode.Declaration>.makeWithCapacity(entries.length)
+  let mut at = usize.ZERO
+  while at < entries.length {
+    run List<LlvmCode.Declaration>.append(&mut converted, LlvmCode.Declaration {
+      contract: run Bytes.copy(Bytes.asSlice(&entries[at].contract)),
+      symbol: run Bytes.copy(Bytes.asSlice(&entries[at].symbol)),
+      text: run Bytes.copy(Bytes.asSlice(&entries[at].text)),
+    })
+    at = at + usize.ONE
+  }
+  return move converted
+}
+
+// The definition of the exported C object `signature` initialized to `constant`, in the
+// backend's text.
+effect fn exportedObjectFor(resolver: &Resolver, signature: &CAbi.Signature, constant: &ObjectConstant) -> Bytes
+! BackendGap | OutOfMemoryError ? &mut Allocator {
+  if !resolver.direct { return run LlvmCode.exportedObject(signature, constant) }
+  let converted = match &constant.* {
+    ObjectConstant.Integer {negative, magnitude} => WasmConstant.Integer {negative: negative, magnitude: magnitude}
+    ObjectConstant.Float {bits, single} => WasmConstant.Float {bits: bits, single: single}
+  }
+  return run WasmLower.exportedObject(&resolver.target, signature, &converted)
+}
+
 // Pure query over a complete immutable content subject. Its dependency ledger records the
 // prepared MIR/layout/signature facts; its validity follows from content, not source revisions.
 effect fn resolveLlvmText(resolver: &mut Resolver, key: Key) -> Answer
@@ -80684,18 +80749,7 @@ effect fn resolveLlvmText(resolver: &mut Resolver, key: Key) -> Answer
       linkAt = linkAt + usize.ONE
     }
   }
-  let emitted = run Effect.result(
-    LlvmCode.emit(
-      function,
-      &resolver.target,
-      List<TypeLayout>.asSlice(&input.layouts),
-      List<CAbi.Signature>.asSlice(&input.foreign),
-      List<InstanceIdentity>.asSlice(&input.identities),
-      &input.suspension,
-      resolver.fastPathIr,
-      hostExport,
-    ),
-  )
+  let emitted = run Effect.result(emitInstance(&resolver.*, function, input, hostExport))
   let text = match move emitted {
     Result<Bytes, BackendGap | OutOfMemoryError>.Success {value} => move value
     Result<Bytes, BackendGap | OutOfMemoryError>.Failure {error} => match move error {
@@ -80714,9 +80768,7 @@ effect fn resolveLlvmText(resolver: &mut Resolver, key: Key) -> Answer
       }
     }
   }
-  let foreign = run Effect.result(
-    LlvmCode.foreignDeclarations(List<CAbi.Signature>.asSlice(&input.foreign)),
-  )
+  let foreign = run Effect.result(foreignDeclarationsFor(&resolver.*, List<CAbi.Signature>.asSlice(&input.foreign)))
   let declarations = match move foreign {
     Result<List<LlvmCode.Declaration>, BackendGap | OutOfMemoryError>.Success {value} => move value
     Result<List<LlvmCode.Declaration>, BackendGap | OutOfMemoryError>.Failure {error} => match move error {
@@ -91019,6 +91071,8 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       llvmValues: List<InstanceDefinition>.make(),
       codegenUnits: false,
       fastPathIr: false,
+      direct: false,
+      threads: false,
       lineTables: false,
       packing: false,
       offeredBodies: List<BuildRecord.PackBody>.make(),
@@ -92584,6 +92638,14 @@ impl Semantic {
   /// under one choice is never adopted under the other.
   pub fn selectFastPathIr(self: &mut Self, unoptimized: bool) -> () {
     self.resolver.fastPathIr = unoptimized
+  }
+
+  /// Selects whether instances lower to wasm fragments for the direct backend (`WasmLower`)
+  /// instead of LLVM text, and whether that module's memory is shared between threads
+  /// (`threads`). The cache keeps one image per profile, as for `selectFastPathIr`.
+  pub fn selectDirect(self: &mut Self, direct: bool, threads: bool) -> () {
+    self.resolver.direct = direct
+    self.resolver.threads = direct && threads
   }
 
   /// Selects whether lowered functions carry the line and column of each position their location
@@ -96355,7 +96417,7 @@ impl Semantic {
     }
     let mut signatures = List<CAbi.Signature>.make()
     run List<CAbi.Signature>.append(&mut signatures, move signature)
-    let printed = run Effect.result(LlvmCode.foreignDeclarations(List<CAbi.Signature>.asSlice(&signatures)))
+    let printed = run Effect.result(foreignDeclarationsFor(&self.resolver, List<CAbi.Signature>.asSlice(&signatures)))
     match move printed {
       Result<List<LlvmCode.Declaration>, BackendGap | OutOfMemoryError>.Success {value} => {
         let entries = List<LlvmCode.Declaration>.asSlice(&value)
@@ -96439,7 +96501,7 @@ impl Semantic {
           OutOfMemoryError {} => { fail OutOfMemoryError {} }
         }
       }
-      let defined = run Effect.result(LlvmCode.exportedObject(&signature, &constant))
+      let defined = run Effect.result(exportedObjectFor(&self.resolver, &signature, &constant))
       let definition = match move defined {
         Result<Bytes, BackendGap | OutOfMemoryError>.Success {value: objectText} => move objectText
         Result<Bytes, BackendGap | OutOfMemoryError>.Failure {error} => match move error {
@@ -96453,7 +96515,7 @@ impl Semantic {
       let symbol = run Bytes.copy(Bytes.asSlice(&signature.symbol))
       let mut signatures = List<CAbi.Signature>.make()
       run List<CAbi.Signature>.append(&mut signatures, move signature)
-      let printed = run Effect.result(LlvmCode.foreignDeclarations(List<CAbi.Signature>.asSlice(&signatures)))
+      let printed = run Effect.result(foreignDeclarationsFor(&self.resolver, List<CAbi.Signature>.asSlice(&signatures)))
       let mut external = Bytes.make()
       match move printed {
         Result<List<LlvmCode.Declaration>, BackendGap | OutOfMemoryError>.Success {value: listed} => {
@@ -99471,7 +99533,8 @@ effect fn boundDeclarations(resolver: &Resolver, plan: &EmissionPlan, foreign: &
     at = at + usize.ONE
     let symbol = Bytes.asSlice(&entry.symbol)
     let text = Bytes.asSlice(&entry.text)
-    let global = !Bitcode.namesFunction(text, symbol)
+    let mut global = false
+    if resolver.direct { global = run WasmObject.declaresObject(text, symbol) } else { global = !Bitcode.namesFunction(text, symbol) }
     let mut bound = false
     let mut object = usize.ZERO
     while object < objects.length {
@@ -99542,7 +99605,9 @@ effect fn assembleEmissionChecked(
       return refusedBuild(run reject(resolver, module, RejectionCode.ForeignSymbolConflict, span))
     }
   }
-  let mut text = run LlvmCode.declarations(&resolver.target, resolver.fastPathIr)
+  let mut text = Bytes.make()
+  if resolver.direct { text = run WasmLower.declarations(&resolver.target, resolver.threads) }
+  else { text = run LlvmCode.declarations(&resolver.target, resolver.fastPathIr) }
   run appendEmissionDeclarations(&mut text, &bound)
   let header = run Bytes.copy(Bytes.asSlice(&text))
   let objects = List<ExportedObject>.asSlice(&resolver.exportedObjects)
@@ -99564,8 +99629,9 @@ effect fn assembleEmissionChecked(
     &mut text,
     whole,
   )
+  // The direct backend's link drops no definition, so it needs no list of the retained ones.
   let mut retained = Bytes.make()
-  run appendRetained(&plan, roots, &mut retained)
+  if !resolver.direct { run appendRetained(&plan, roots, &mut retained) }
   if whole { run Bytes.append(&mut text, Bytes.asSlice(&retained)) }
   let mut units = List<CodegenUnit>.make()
   if resolver.codegenUnits || resolver.packing {
