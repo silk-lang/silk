@@ -662,7 +662,7 @@ pub effect fn main() -> i32
 ### Method `appendSliceWithinCapacity`
 
 ```silk
-pub fn appendSliceWithinCapacity<T: Copy>(self: &mut Self, values: &[T]) -> bool
+pub fn appendSliceWithinCapacity(self: &mut Self, values: &[T]) -> bool
 ```
 
 Adds a copy of each element of `values` at the end, in order, if the capacity has room for all
