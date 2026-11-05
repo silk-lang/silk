@@ -124,6 +124,64 @@ effect fn allocate(layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError ? 
 
 Returns one allocation for `layout`, or fails with no partial storage.
 
+<a id="Allocator.allocateZeroed"></a>
+
+### Operation `allocateZeroed`
+
+```silk
+effect fn allocateZeroed(layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError ? &mut Allocator
+```
+
+Returns one allocation for `layout` whose bytes all start as zero, or fails with no partial
+storage.
+
+#### When to use
+
+Use it for large tables that must start as zero, such as caches whose empty entries are zero
+bytes, in place of `allocate` followed by a fill.
+
+#### Details
+
+Every provider answers it. The system provider asks the process heap for zeroed storage
+(`calloc`, or `HeapAlloc` with `HEAP_ZERO_MEMORY` on Windows), which returns fresh pages from
+the operating system without writing them, so pages that are never touched cost nothing. A
+provider that hands out reused storage writes the zeros itself. A provider that wraps another
+one forwards the request so the zeros stay free.
+
+#### Errors
+
+- [`OutOfMemoryError`](#OutOfMemoryError) when the allocator cannot supply the storage.
+
+#### Examples
+##### A zeroed table of counters
+```silk
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.layout { Layout }
+import silk.mem.raw_buffer { RawBuffer }
+import silk.core.effect { Effect }
+
+effect fn first() -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let allocation = run Allocator.allocateZeroed(Layout { bytes: 4096 * 8, alignment: 8 })
+  let counters = unsafe RawBuffer.from<u64>(move allocation, 4096)
+  return unsafe RawBuffer.read<u64>(&counters, 4095)
+}
+
+effect fn program() -> i32 ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let value = run first() |> Effect.provideMut<Allocator>(&mut allocator)
+  if value != 0 { return 1 }
+  return 0
+}
+
+effect fn outOfMemory(error: OutOfMemoryError) -> i32 {
+  return 1
+}
+
+pub fn main() -> i32 {
+  return run Effect.catchAll(program(), outOfMemory)
+}
+```
+
 <a id="Allocator.growsInPlace"></a>
 
 ### Operation `growsInPlace`
@@ -245,6 +303,14 @@ The process-heap provider for [`Allocator`](#Allocator). It has no state.
 impl SystemAllocator
 ```
 
+<a id="SystemAllocator.impl-2"></a>
+
+## Implementation `SystemAllocator`
+
+```silk
+impl SystemAllocator
+```
+
 <a id="SystemAllocator.impl.Allocator"></a>
 
 ## Implementation `Allocator for SystemAllocator`
@@ -259,6 +325,14 @@ impl Allocator for SystemAllocator
 
 ```silk
 allocate: SystemAllocator.systemAllocate
+```
+
+<a id="SystemAllocator.impl.Allocator.allocateZeroed"></a>
+
+### Operation `allocateZeroed`
+
+```silk
+allocateZeroed: SystemAllocator.systemAllocateZeroed
 ```
 
 <a id="SystemAllocator.impl.Allocator.growsInPlace"></a>
