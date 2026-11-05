@@ -338,6 +338,61 @@ the last element without a move of other elements.
 
 If `index` is not less than [`List.length`](#List.impl.length), the program traps.
 
+<a id="List.impl.splitOff"></a>
+
+### Method `splitOff`
+
+```silk
+pub effect fn splitOff(self: &mut Self, at: usize) -> List<T> ! OutOfMemoryError ? &mut Allocator
+```
+
+Moves the elements from position `at` to the end into a new list, and returns it.
+
+#### When to use
+
+Use `splitOff` to hand the last elements of a work list to their owner, such as the children
+of a tree node that a parser collected on one shared stack.
+
+#### Details
+
+The new list has exactly the moved elements as its capacity, and one allocation. The length of
+this list becomes `at`, and its capacity does not change. The elements move without a copy of
+each one and are never dropped. If `at` is the length, the new list is empty and nothing is
+allocated.
+
+#### Errors
+
+- `OutOfMemoryError` if the `Allocator` cannot supply the new storage. This list does not
+  change.
+
+#### Gotchas
+
+If `at` is more than [`List.length`](#List.impl.length), the program traps.
+
+#### Examples
+```silk
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.collections.list { List }
+
+effect fn split() -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut values = List<i32>.make()
+  run List<i32>.appendSlice(&mut values, &[1, 2, 3, 4])
+  let tail = run List<i32>.splitOff(&mut values, 1)
+  return List<i32>.length(&values) == 1 && List<i32>.length(&tail) == 3
+    && List<i32>.capacity(&tail) == 3 && List<i32>.get(&tail, 0) == 2
+}
+
+pub effect fn main() -> i32
+  ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  if !run split() |> Effect.provideMut<Allocator>(&mut allocator) {
+    return 1
+  }
+  return 0
+}
+```
+
 <a id="List.impl.clear"></a>
 
 ### Method `clear`

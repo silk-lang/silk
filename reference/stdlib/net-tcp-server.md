@@ -15,18 +15,15 @@ Each worker thread has its own listener socket on the same address, with `SO_REU
 own `epoll` instance. The kernel spreads new connections over the listeners. A worker accepts,
 reads, calls the protocol and writes on its own thread, so workers share nothing.
 
-When bytes arrive, the engine calls [`Protocol.receive`](#Protocol.receive) with all bytes that were not consumed
-yet. The protocol consumes a prefix, appends its answer to the output, and says whether the
-connection stays open. The engine sends the output at once, and waits for the socket when the
-kernel cannot take it all.
+For each connection, the engine keeps an input buffer and an output buffer. When bytes arrive, it
+calls [`Protocol.receive`](#Protocol.receive) with all bytes that were not consumed yet. The protocol consumes a
+prefix, appends its answer to the output buffer, and says whether the connection stays open.
+The engine sends the output at once, and waits for the socket when the kernel cannot take it
+all.
 
-Each worker reads into one shared buffer of 64 KiB (at most `maxInputBytes`), and the protocol
-writes into one shared output list. Only bytes that are left over, a partial request or output
-that the kernel did not take, move into a buffer of the connection, which is freed when it
-drains. So an idle connection holds no buffer. A connection buffer starts at `readBufferBytes`.
-When it is full and the protocol consumed nothing, it doubles, up to `maxInputBytes`. A protocol
-that needs more than that closes the connection itself first, with an answer such as
-`413 Content Too Large`.
+The input buffer starts at `readBufferBytes`. When it is full and the protocol consumed nothing,
+it doubles, up to `maxInputBytes`. A protocol that needs more than that closes the connection
+itself first, with an answer such as `413 Content Too Large`.
 
 A connection that sends nothing for `idleTimeoutSeconds` is closed.
 
@@ -214,7 +211,7 @@ The kernel backlog of each listener.
 pub readBufferBytes: usize
 ```
 
-The first size of the input buffer of a connection that has a partial request.
+The first size of the input buffer of a connection.
 
 <a id="TcpServerOptions.maxInputBytes"></a>
 
