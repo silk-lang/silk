@@ -1746,6 +1746,31 @@ const program = Effect.gen(function* () {
     kindless.stderr,
     /^Skipping geo: its root module \(\[package\]\.main\) is missing\n {2}help: its source root has lib\.silk; a library sets `kind = "library"` and `exports = \["lib"\]` under \[package\]$/m,
   )
+  // A member's first check adopts its dependency's semantic cache, and what changed in the
+  // dependency since that cache was written is checked again: the stale result is not reused.
+  yield* fs.makeDirectory(join(directory, 'adopt/core/src'), { recursive: true })
+  yield* fs.makeDirectory(join(directory, 'adopt/app/src'), { recursive: true })
+  yield* fs.writeFileString(join(directory, 'adopt/silk.toml'), '[workspace]\nmembers = ["core", "app"]\n')
+  yield* fs.writeFileString(
+    join(directory, 'adopt/core/silk.toml'),
+    '[package]\nname = "adoptcore"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\n',
+  )
+  yield* fs.writeFileString(join(directory, 'adopt/core/src/lib.silk'), 'pub fn size() -> i64 {\n  return 2\n}\n')
+  yield* fs.writeFileString(
+    join(directory, 'adopt/app/silk.toml'),
+    '[package]\nname = "adoptapp"\nversion = "0.1.0"\n\n[dependencies]\nadoptcore = { path = "../core" }\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'adopt/app/src/main.silk'),
+    'import adoptcore.lib { size }\n\npub fn main() -> i32 {\n  let n: i64 = size()\n  return 0\n}\n',
+  )
+  const coreChecked = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(directory, 'adopt/core'))
+  assert.equal(coreChecked.status, 0, coreChecked.stderr)
+  assert.ok(yield* fs.exists(join(directory, 'adopt/build/cache/adoptcore')), 'the library check leaves its cache in the workspace output')
+  yield* fs.writeFileString(join(directory, 'adopt/core/src/lib.silk'), 'pub fn size() -> bool {\n  return true\n}\n')
+  const adoptedCheck = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(directory, 'adopt/app'))
+  assert.equal(adoptedCheck.status, 1, adoptedCheck.stderr)
+  assert.match(adoptedCheck.stderr, /app\/src\/main\.silk:4:\d+: error\[/)
   // A `mut fn` binding is lent to each call it is passed to, so it stays usable afterwards, and one
   // call cannot be lent it twice. Callable diagnostics name the binding and the fix.
   // Match and pattern mistakes are one diagnostic each, naming the fix or the types involved.
