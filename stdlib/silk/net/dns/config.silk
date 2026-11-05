@@ -1,0 +1,369 @@
+//! Read the DNS client settings of a system: name servers, search domains and query options.
+//!
+//! # When to use
+//! Use [`ResolverConfig.load`] to read `/etc/resolv.conf` through the `FileSystem` service, or
+//! [`ResolverConfig.parse`] for text that you already have. Give the result to
+//! `silk.net.dns.query.Exchange` to send queries.
+//!
+//! # Details
+//! The rules are those of `resolv.conf(5)` on Linux and macOS:
+//!
+//! - `nameserver ADDRESS` adds an IPv4 or IPv6 server on port 53. A zone suffix such as `%eth0` is
+//!   removed.
+//! - `domain NAME` and `search NAME...` set the search list. The last one in the file wins.
+//! - `options` sets `ndots:N` (at most 15), `timeout:N` in seconds (at most 30), `attempts:N` (at most
+//!   5), `rotate`, `edns0` and `use-vc`. Other options are ignored.
+//! - A line that starts with `#` or `;` is a comment. Lines that cannot be read are ignored.
+//!
+//! When the text names no server, the result has `127.0.0.1` port 53, as the C library does.
+//!
+//! # Gotchas
+//! [`ResolverConfig.load`] does not read the `LOCALDOMAIN` and `RES_OPTIONS` environment variables,
+//! and Windows keeps its settings elsewhere. On Windows, make a configuration with
+//! [`ResolverConfig.make`].
+//!
+//! @category Networking
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.text.string { String }
+import silk.net.address { AddressError, Endpoint, IpAddress, Ipv4Address, Ipv6Address, Port }
+import silk.net.dns.message { MessageError, Name }
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.num.isize
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+
+/// The settings of a DNS client.
+pub struct ResolverConfig {
+  /// The name servers, in the order to try them.
+  pub servers: List<Endpoint>,
+  /// The domains to add to a relative name, in order.
+  pub search: List<Name>,
+  /// A name with at least this many dots is tried as an absolute name first. The default is 1.
+  pub ndots: usize,
+  /// How long to wait for the first answer from one server, in nanoseconds. The default is 5
+  /// seconds.
+  pub timeout: u64,
+  /// How many times to try the whole list of servers. The default is 2.
+  pub attempts: usize,
+  /// Start each query at the next server, to spread the load, instead of at the first one.
+  pub rotate: bool,
+  /// Send queries with an EDNS(0) record, so that UDP answers can be longer than 512 bytes.
+  pub edns: bool,
+  /// Send queries over TCP, not UDP.
+  pub useTcp: bool,
+}
+
+/// The default timeout, 5 seconds in nanoseconds.
+pub const DEFAULT_TIMEOUT: u64 = 5000000000
+
+/// The default number of attempts.
+pub const DEFAULT_ATTEMPTS: usize = 2
+
+/// The default `ndots` value.
+pub const DEFAULT_NDOTS: usize = 1
+
+/// The port of DNS servers.
+pub const DNS_PORT: u16 = 53
+
+fn isSpace(byte: u8) -> bool {
+  return byte == 32 || byte == 9 || byte == 13 || byte == 11 || byte == 12
+}
+
+// The next word of `line` at `at` or after, as start and end offsets in `bounds`. Returns `false` at
+// the end of the line.
+fn nextWord(line: &[u8], at: &mut usize, bounds: &mut [usize; 2]) -> bool {
+  while at.* < line.length && isSpace(line[at.*]) {
+    at.* = at.* + 1
+  }
+  if at.* >= line.length {
+    return false
+  }
+  bounds[0] = at.*
+  while at.* < line.length && !isSpace(line[at.*]) {
+    at.* = at.* + 1
+  }
+  bounds[1] = at.*
+  return true
+}
+
+fn equalText(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut index: usize = 0
+  while index < left.length {
+    if left[index] != right[index] {
+      return false
+    }
+    index = index + 1
+  }
+  return true
+}
+
+// The decimal value after `prefix` in `word`, capped at `maximum`, or -1 if `word` does not have the
+// prefix and a number.
+fn optionValue(word: &[u8], prefix: &[u8], maximum: usize) -> isize {
+  if word.length <= prefix.length {
+    return -1
+  }
+  if !equalText(Slice.view<u8>(word, 0, prefix.length), prefix) {
+    return -1
+  }
+  let mut value: usize = 0
+  let mut index = prefix.length
+  while index < word.length {
+    let byte = word[index]
+    if byte < 48 || byte > 57 {
+      return -1
+    }
+    if value < maximum {
+      value = value * 10 + u8.toUsize(byte - 48)
+    }
+    index = index + 1
+  }
+  if value > maximum {
+    value = maximum
+  }
+  return usize.toIsize(value)
+}
+
+fn parseServer(word: &[u8]) -> Result<IpAddress, AddressError> {
+  let mut end = word.length
+  let mut index: usize = 0
+  while index < word.length {
+    if word[index] == 37 {
+      end = index
+      break
+    }
+    index = index + 1
+  }
+  let text = Slice.view<u8>(word, 0, end)
+  return match Ipv4Address.parseBytes(text) {
+    Result<Ipv4Address, AddressError>.Success { value } => Result<IpAddress, AddressError>.succeed(
+      IpAddress.V4 { value: value },
+    )
+    Result<Ipv4Address, AddressError>.Failure { .. } => match Ipv6Address.parseBytes(text) {
+      Result<Ipv6Address, AddressError>.Success { value } => Result<
+        IpAddress,
+        AddressError
+      >.succeed(IpAddress.V6 { value: value })
+      Result<Ipv6Address, AddressError>.Failure { error } => Result<
+        IpAddress,
+        AddressError
+      >.failResult(error)
+    }
+  }
+}
+
+impl ResolverConfig {
+  /// Returns a configuration with `servers` and the default options: no search domains, `ndots` 1, a
+  /// 5 second timeout, 2 attempts, and UDP queries without EDNS.
+  pub fn make(servers: List<Endpoint>) -> ResolverConfig {
+    return ResolverConfig {
+      servers: move servers,
+      search: List<Name>.make(),
+      ndots: DEFAULT_NDOTS,
+      timeout: DEFAULT_TIMEOUT,
+      attempts: DEFAULT_ATTEMPTS,
+      rotate: false,
+      edns: false,
+      useTcp: false,
+    }
+  }
+
+  /// Reads the text of a `resolv.conf` file.
+  ///
+  /// # Details
+  /// `nameserver`, `domain`, `search` and `options` lines are read as `resolv.conf(5)` describes.
+  /// Lines that cannot be read, and unknown options, are ignored, as the C library does. When the
+  /// text names no server, the result has `127.0.0.1` port 53.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the lists.
+  pub effect fn parse(text: &[u8]) -> ResolverConfig
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut config = ResolverConfig.make(List<Endpoint>.make())
+    let mut lineStart: usize = 0
+    while lineStart < text.length {
+      let mut lineEnd = lineStart
+      while lineEnd < text.length && text[lineEnd] != 10 {
+        lineEnd = lineEnd + 1
+      }
+      let line = Slice.view<u8>(text, lineStart, lineEnd - lineStart)
+      run readLine(&mut config, line)
+      lineStart = lineEnd + 1
+    }
+    if List<Endpoint>.length(&config.servers) == 0 {
+      let loopback = IpAddress.V4 { value: Ipv4Address.fromOctets([127, 0, 0, 1]) }
+      run List<Endpoint>.append(
+        &mut config.servers,
+        Endpoint.make(loopback, Port.fromU16(DNS_PORT)),
+      )
+    }
+    return move config
+  }
+
+  /// Reads `/etc/resolv.conf` with the `FileSystem` service.
+  ///
+  /// # Details
+  /// The file is read with [`ResolverConfig.parse`]. When the file does not exist, the result is the
+  /// default configuration with the server `127.0.0.1` port 53, as the C library does.
+  ///
+  /// # Errors
+  /// - `FileError` if the file exists but cannot be read.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the contents or the lists.
+  pub effect fn load() -> ResolverConfig
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator {
+    let path = match run Effect.result(Path.make("/etc/resolv.conf")) {
+      Result<Path, FileError | OutOfMemoryError>.Success { value } => move value
+      Result<Path, FileError | OutOfMemoryError>.Failure { error } => {
+        fail move error
+      }
+    }
+    let read = run Effect.result(FileSystem.readFile(&path))
+    return match move read {
+      Result<Bytes, FileError | OutOfMemoryError>.Success { value } => run ResolverConfig.parse(
+        Bytes.asSlice(&value),
+      )
+      Result<Bytes, FileError | OutOfMemoryError>.Failure { error } => {
+        let missing = match &error {
+          FileError { reason, .. } => reason.code == FileSystem.reasonCode(FileSystem.notFound())
+          OutOfMemoryError {} => false
+        }
+        if !missing {
+          fail move error
+        }
+        return run ResolverConfig.parse(b"")
+      }
+    }
+  }
+
+  /// Returns the names to try for `name`, in order, after the rules of the search list.
+  ///
+  /// # Details
+  /// An absolute name, written with a final dot, is tried alone. Otherwise a name with at least
+  /// `ndots` dots is tried as it is first, then with each search domain. A name with fewer dots is
+  /// tried with each search domain first, then as it is. A candidate that would be longer than 255
+  /// bytes is left out.
+  ///
+  /// # Errors
+  /// - `MessageError` if `name` is not a valid name in text form.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the list.
+  pub effect fn candidates(self: &Self, name: string) -> List<Name>
+    ! MessageError | OutOfMemoryError
+    ? &mut Allocator {
+    let text = String.utf8Bytes(name)
+    let parsed = match Name.parseBytes(text) {
+      Result<Name, MessageError>.Success { value } => value
+      Result<Name, MessageError>.Failure { error } => {
+        fail error
+      }
+    }
+    let mut result = List<Name>.make()
+    if text.length > 0 && text[text.length - 1] == 46
+      && (text.length < 2 || text[text.length - 2] != 92) {
+      run List<Name>.append(&mut result, parsed)
+      return move result
+    }
+    let dots = Name.labelCount(&parsed) - 1
+    let asIs = Name.labelCount(&parsed) > 0 && dots >= self.ndots
+    if asIs || List<Name>.length(&self.search) == 0 {
+      run List<Name>.append(&mut result, parsed)
+    }
+    let domains = List<Name>.asSlice(&self.search)
+    let mut index: usize = 0
+    while index < domains.length {
+      match Name.join(&parsed, &domains[index]) {
+        Result<Name, MessageError>.Success { value } => run List<Name>.append(&mut result, value)
+        Result<Name, MessageError>.Failure { .. } => {}
+      }
+      index = index + 1
+    }
+    if !asIs && domains.length > 0 {
+      run List<Name>.append(&mut result, parsed)
+    }
+    return move result
+  }
+}
+
+effect fn readLine(config: &mut ResolverConfig, line: &[u8]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut at: usize = 0
+  let mut bounds: [usize; 2] = [0, 0]
+  if !nextWord(line, &mut at, &mut bounds) {
+    return ()
+  }
+  if line[bounds[0]] == 35 || line[bounds[0]] == 59 {
+    return ()
+  }
+  let keyword = Slice.view<u8>(line, bounds[0], bounds[1] - bounds[0])
+  if equalText(keyword, b"nameserver") {
+    if !nextWord(line, &mut at, &mut bounds) {
+      return ()
+    }
+    match parseServer(Slice.view<u8>(line, bounds[0], bounds[1] - bounds[0])) {
+      Result<IpAddress, AddressError>.Success { value } => {
+        run List<Endpoint>.append(&mut config.servers, Endpoint.make(value, Port.fromU16(DNS_PORT)))
+      }
+      Result<IpAddress, AddressError>.Failure { .. } => {}
+    }
+    return ()
+  }
+  if equalText(keyword, b"domain") || equalText(keyword, b"search") {
+    let mut domains = List<Name>.make()
+    while nextWord(line, &mut at, &mut bounds) {
+      let word = Slice.view<u8>(line, bounds[0], bounds[1] - bounds[0])
+      if word[0] == 35 || word[0] == 59 {
+        break
+      }
+      match Name.parseBytes(word) {
+        Result<Name, MessageError>.Success { value } => {
+          if !Name.isRoot(&value) {
+            run List<Name>.append(&mut domains, value)
+          }
+        }
+        Result<Name, MessageError>.Failure { .. } => {}
+      }
+      if equalText(keyword, b"domain") {
+        break
+      }
+    }
+    config.search = move domains
+    return ()
+  }
+  if equalText(keyword, b"options") {
+    while nextWord(line, &mut at, &mut bounds) {
+      let word = Slice.view<u8>(line, bounds[0], bounds[1] - bounds[0])
+      if equalText(word, b"rotate") {
+        config.rotate = true
+      } else if equalText(word, b"edns0") {
+        config.edns = true
+      } else if equalText(word, b"use-vc") || equalText(word, b"usevc") {
+        config.useTcp = true
+      } else {
+        let ndots = optionValue(word, b"ndots:", 15)
+        if ndots >= 0 {
+          config.ndots = isize.toUsize(ndots)
+        }
+        let timeout = optionValue(word, b"timeout:", 30)
+        if timeout >= 1 {
+          config.timeout = usize.toU64(isize.toUsize(timeout)) * 1000000000
+        }
+        let attempts = optionValue(word, b"attempts:", 5)
+        if attempts >= 1 {
+          config.attempts = isize.toUsize(attempts)
+        }
+      }
+    }
+  }
+}
