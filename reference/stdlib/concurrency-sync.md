@@ -27,8 +27,8 @@ it computed when that allocation was new. Handles and guards only copy those poi
 write to state that other threads can see is atomic or done under the lock.
 
 ## Gotchas
-- These types need the same targets as [`Atomic.wait`](./concurrency-atomic.md#Atomic.impl.wait): Darwin on x86_64 or aarch64, Linux with GNU libc
-  on x86_64 or aarch64, and wasm32.
+- These types need the same targets as [`Atomic.wait`](./concurrency-atomic.md#Atomic.impl.wait): Darwin on x86_64 or aarch64, Linux with
+  GNU libc on x86_64 or aarch64, and wasm32.
 - An `Arc<T>` gives only shared borrows. Change the value through a `Mutex` or atomics. Unlike
   `Shared<T>`, `Arc<T>` does not detect reentrant access.
 - A reference cycle of `Arc` handles leaks.
@@ -151,8 +151,8 @@ every handle lets its thread read the value.
 
 - It gives only shared borrows. Unlike `Shared<T>`, it does not detect reentrant access.
 - A reference cycle of `Arc` handles leaks.
-- These types need the same targets as `Atomic.wait`: Darwin on x86_64 or aarch64, Linux with GNU libc on
-x86_64 or aarch64, and wasm32.
+- These types need the same targets as `Atomic.wait`: Darwin on x86_64 or aarch64, Linux with
+  GNU libc on x86_64 or aarch64, and wasm32.
 
 <a id="Arc.impl.Transferable"></a>
 
@@ -259,8 +259,8 @@ system and does not spin.
 ### Gotchas
 
 - Locking a mutex again on the thread that holds it deadlocks.
-- These types need the same targets as `Atomic.wait`: Darwin on x86_64 or aarch64, Linux with GNU libc on
-x86_64 or aarch64, and wasm32.
+- These types need the same targets as `Atomic.wait`: Darwin on x86_64 or aarch64, Linux with
+  GNU libc on x86_64 or aarch64, and wasm32.
 
 <a id="Mutex.impl.Transferable"></a>
 
@@ -528,8 +528,8 @@ wake it.
 
 ### Gotchas
 - `park` can also return with no token. Check your own condition again in a loop.
-- These types need the same targets as `Atomic.wait`: Darwin on x86_64 or aarch64, Linux with GNU libc on
-x86_64 or aarch64, and wasm32.
+- These types need the same targets as `Atomic.wait`: Darwin on x86_64 or aarch64, Linux with
+  GNU libc on x86_64 or aarch64, and wasm32.
 
 <a id="Unparker"></a>
 

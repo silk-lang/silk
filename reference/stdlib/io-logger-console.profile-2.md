@@ -30,7 +30,8 @@ None. A host cannot refuse a message.
 
 ## Gotchas
 - The provider exists only on `wasm32-unknown-unknown`.
-- A host that instantiates the module itself supplies `silk.console`, or the instantiation fails.
+- A host that instantiates the module itself supplies `silk.console`, or the instantiation
+  fails.
 - The logger adds no level, timestamp, or newline. The console shows the level by its method.
 
 ## Examples

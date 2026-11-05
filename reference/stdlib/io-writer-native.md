@@ -35,8 +35,8 @@ from several threads controls the order itself.
 `WriterError` if a write fails. Part of the bytes can be written already.
 
 ## Gotchas
-- The providers exist on Windows x86_64 MSVC without a CRT, WASI, Darwin on x86_64 or aarch64, and Linux
-  with GNU libc on x86_64 or aarch64.
+- The providers exist on Windows x86_64 MSVC without a CRT, WASI, Darwin on x86_64 or aarch64,
+  and Linux with GNU libc on x86_64 or aarch64.
 - Windows consoles require complete canonical WTF-8 per write or concatenated vectored write;
   redirected handles accept arbitrary bytes. No console code page changes.
 - The lock orders only writes that take it. A direct write to descriptor 2, such as one from
@@ -232,11 +232,11 @@ output, provide a `Writer`. For log events, use `silk.io.logger`.
 
 #### Details
 
-The template rules are those of `silk.text.format.Format.format`, and the compiler checks them.
-The call holds the standard error lock while it formats and writes, so messages of different
-threads do not mix. It formats into a buffer of 64 bytes on the stack and does not allocate.
-It adds no newline. Windows consoles require complete canonical WTF-8 at each buffer flush;
-redirected handles preserve arbitrary bytes.
+The template rules are those of `silk.text.format.Format.format`, and the compiler checks
+them. The call holds the standard error lock while it formats and writes, so messages of
+different threads do not mix. It formats into a buffer of 64 bytes on the stack and does not
+allocate. It adds no newline. Windows consoles require complete canonical WTF-8 at each buffer
+flush; redirected handles preserve arbitrary bytes.
 
 #### Gotchas
 

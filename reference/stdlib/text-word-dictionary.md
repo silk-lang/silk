@@ -14,8 +14,8 @@ spaces, so the line breaker needs a dictionary to find where a line can end.
 The engine is a port of the dictionary break engines of ICU release 78.1 (`dictbe.cpp`), and the
 data is ICU's Thai, Lao, Khmer and Burmese word lists, packed as minimal tries in
 `silk.text.word_dictionary_thai`, `silk.text.word_dictionary_lao`,
-`silk.text.word_dictionary_khmer` and `silk.text.word_dictionary_myanmar`. Segmentation allocates
-only to grow the caller's list.
+`silk.text.word_dictionary_khmer` and `silk.text.word_dictionary_myanmar`. Segmentation
+allocates only to grow the caller's list.
 
 ## Gotchas
 The dictionaries add about 2.9 MB to a program that uses this module. Only import it when the

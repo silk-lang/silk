@@ -5,8 +5,8 @@
 Runs a child process with the system calls, for the native `ChildProcess` provider.
 
 ## When to use
-`silk.system.child_process_native` uses [`NativeProcess.execute`](#NativeProcess.impl.execute). Application code uses the `ChildProcess`
-effect from `silk.system.child_process` instead.
+`silk.system.child_process_native` uses [`NativeProcess.execute`](#NativeProcess.impl.execute). Application code uses the
+`ChildProcess` effect from `silk.system.child_process` instead.
 
 ## Details
 Each call owns its descriptors, its copies of the request, and its child. If a step fails after

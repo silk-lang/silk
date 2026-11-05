@@ -6,14 +6,16 @@ Growable lists that own their elements, with stable sorting and binary search.
 
 ## When to use
 Use [`List`](#List) when the number of elements is known only at runtime, or the sequence must grow.
-Use a fixed array `[T; N]` when the length is part of the type. Use `silk.collections.bytes.Bytes` for a
-block of bytes that does not grow.
+Use a fixed array `[T; N]` when the length is part of the type. Use
+`silk.collections.bytes.Bytes` for a block of bytes that does not grow.
 
 ## Details
 [`List.make`](#List.impl.make) does not allocate. The first growth allocates space for four elements, and each
 later growth doubles the capacity. Use [`List.reserve`](#List.impl.reserve) or [`List.reserveExact`](#List.impl.reserveExact) to allocate
-before a sequence of appends. Growth copies the elements into new storage before it releases the
-old storage. Thus a failed [`List.append`](#List.impl.append) or [`List.reserve`](#List.impl.reserve) leaves the list unchanged.
+before a sequence of appends. When the `Allocator` lets storage grow in place, as the system
+allocator does outside Windows, growth first tries to extend the storage. Otherwise it copies
+the elements into new storage before it releases the old storage. Thus a failed [`List.append`](#List.impl.append)
+or [`List.reserve`](#List.impl.reserve) leaves the list unchanged.
 
 [`List.remove`](#List.impl.remove), [`List.clear`](#List.impl.clear), and [`List.truncate`](#List.impl.truncate) drop the elements that they remove and
 keep the capacity. Dropping a list drops each element and then releases the storage.
@@ -101,11 +103,13 @@ list is affine. Copy it element by element if a second list is necessary.
 [`List.make`](#List.impl.make) does not allocate. The first growth allocates space for four elements, and each
 later growth doubles the capacity. Use [`List.makeWithCapacity`](#List.impl.makeWithCapacity) to create a list with its
 storage in one call, or [`List.reserve`](#List.impl.reserve) and [`List.reserveExact`](#List.impl.reserveExact) to allocate before a sequence
-of appends. Growth copies the elements into new storage before it releases the old storage, so a
-failed [`List.append`](#List.impl.append) or [`List.reserve`](#List.impl.reserve) leaves the list unchanged. [`List.remove`](#List.impl.remove),
-[`List.clear`](#List.impl.clear), and [`List.truncate`](#List.impl.truncate) drop the elements that they remove and keep the capacity,
-so a list cleared in a loop reuses its storage. [`List.clearAndFree`](#List.impl.clearAndFree) also releases the storage,
-and [`List.shrinkToFit`](#List.impl.shrinkToFit) releases only the capacity beyond the length.
+of appends. When the `Allocator` lets storage grow in place, as the system allocator does
+outside Windows, growth first tries to extend the storage. Otherwise it copies the elements into
+new storage before it releases the old storage, so a failed [`List.append`](#List.impl.append) or [`List.reserve`](#List.impl.reserve)
+leaves the list unchanged. [`List.remove`](#List.impl.remove), [`List.clear`](#List.impl.clear), and [`List.truncate`](#List.impl.truncate) drop the
+elements that they remove and keep the capacity, so a list cleared in a loop reuses its storage.
+[`List.clearAndFree`](#List.impl.clearAndFree) also releases the storage, and [`List.shrinkToFit`](#List.impl.shrinkToFit) releases only the
+capacity beyond the length.
 
 [`List.sort`](#List.impl.sort) is stable, works for elements that are not `Copy`, and allocates temporary
 storage. [`List.binarySearch`](#List.impl.binarySearch) needs a sorted list and returns the lowest index of equal

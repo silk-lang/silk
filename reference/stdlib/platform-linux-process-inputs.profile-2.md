@@ -5,8 +5,8 @@
 The arguments, environment and page size of a raw Linux process, read from the initial stack.
 
 ## When to use
-Call [`ProcessInputs.decode`](#ProcessInputs.impl.decode) once at a raw process entry, as `silk.platform.linux.start` does. The
-application then gets a `&ProcessInputs`.
+Call [`ProcessInputs.decode`](#ProcessInputs.impl.decode) once at a raw process entry, as `silk.platform.linux.start` does.
+The application then gets a `&ProcessInputs`.
 
 ## Details
 The kernel puts `argc`, the `argv` and `envp` vectors, and the auxiliary vector on the stack.

@@ -5,8 +5,9 @@
 Compress bytes as raw DEFLATE, zlib, or gzip with a bounded LZ77 match table.
 
 ## When to use
-Use [`Deflate.encode`](#Deflate.impl.encode) to produce `.gz` files, zlib payloads, or raw DEFLATE streams.
-Select the container with `silk.compress.inflate.Format`. Use `silk.compress.inflate.Decoder` to decode them.
+Use [`Deflate.encode`](#Deflate.impl.encode) to produce `.gz` files, zlib payloads, or raw DEFLATE streams. Select the
+container with `silk.compress.inflate.Format`. Use `silk.compress.inflate.Decoder` to decode
+them.
 
 ## Details
 The encoder uses a 32 KiB history window and fixed Huffman codes. It emits deterministic
@@ -108,12 +109,12 @@ pub effect fn encode(input: &[u8], output: &mut [u8], format: Format) -> usize
 Compresses all of `input` into the start of `output` and returns the encoded length.
 
 #### Details
-Choose raw DEFLATE, zlib, or gzip with `silk.compress.inflate.Format`. Uses fixed Huffman codes,
-a 32 KiB match window, and one candidate per input position. It allocates exactly 32768
+Choose raw DEFLATE, zlib, or gzip with `silk.compress.inflate.Format`. Uses fixed Huffman
+codes, a 32 KiB match window, and one candidate per input position. It allocates exactly 32768
 `usize` entries through the ambient allocator, excluding allocator overhead. Output is
-deterministic: gzip uses timestamp zero, no optional fields, and OS byte 255. Checksums
-and the gzip size trailer are included. No compression levels or preset dictionary are used.
-Input and output must not overlap, as enforced by their shared and exclusive borrows.
+deterministic: gzip uses timestamp zero, no optional fields, and OS byte 255. Checksums and
+the gzip size trailer are included. No compression levels or preset dictionary are used. Input
+and output must not overlap, as enforced by their shared and exclusive borrows.
 
 #### Errors
 `EncodeError` means the output buffer filled; discard its partial stream. It never occurs when

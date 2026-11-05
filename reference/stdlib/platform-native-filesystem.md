@@ -5,8 +5,8 @@
 The system calls for files and directories, for the native `FileSystem` provider.
 
 ## When to use
-`silk.system.filesystem_native` uses [`NativeFileSystem`](#NativeFileSystem). Application code uses the `FileSystem` effect
-from `silk.system.filesystem` instead.
+`silk.system.filesystem_native` uses [`NativeFileSystem`](#NativeFileSystem). Application code uses the
+`FileSystem` effect from `silk.system.filesystem` instead.
 
 ## Details
 Each operation starts at the root directory and opens each part of the path relative to its
@@ -103,7 +103,8 @@ root. Each operation fails with `FileError`, with a portable reason and the nati
 
 ### Gotchas
 - A call that a signal interrupts is made again, except `close`, which is never repeated.
-- The functions exist only on Darwin on x86_64 or aarch64, and Linux with GNU libc on x86_64 or aarch64.
+- The functions exist only on Darwin on x86_64 or aarch64, and Linux with GNU libc on x86_64 or
+  aarch64.
 
 <a id="NativeFileSystem.impl"></a>
 

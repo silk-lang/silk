@@ -22,8 +22,8 @@ correct.
 
 ## Gotchas
 The same key and nonce must never encrypt two messages. If they do, an attacker can recover the
-XOR of the two plaintexts and forge tags. Use a counter, or 12 random bytes from `silk.system.random`
-for a small number of messages per key.
+XOR of the two plaintexts and forge tags. Use a counter, or 12 random bytes from
+`silk.system.random` for a small number of messages per key.
 
 Authentication does not stop replay: an attacker can send an old valid message again. The
 functions do not erase their copies of the key.
@@ -260,9 +260,9 @@ All checks come before the first write. On an error, `ciphertext` and `tag` do n
 
 #### Gotchas
 Use a new nonce for each message under the same key. The function does not make one. If the
-same key and nonce encrypt two messages, an attacker can recover the XOR of the two
-plaintexts and forge tags. Use a counter, or 12 random bytes from `silk.system.random` for a small
-number of messages per key. The function does not erase its copy of the key.
+same key and nonce encrypt two messages, an attacker can recover the XOR of the two plaintexts
+and forge tags. Use a counter, or 12 random bytes from `silk.system.random` for a small number
+of messages per key. The function does not erase its copy of the key.
 
 <a id="AesGcm.impl.open"></a>
 

@@ -5,9 +5,9 @@
 A filesystem provider for absolute paths in the host machine namespace.
 
 ## When to use
-Use `MachineFileSystem` in host tools that must access more than one directory.
-Unix paths use `/...`; Windows paths use `/C:/...` or `/UNC/server/share/...`. This provider is not confined
-to an application directory. Use `OsFileSystem` for a confined root instead.
+Use `MachineFileSystem` in host tools that must access more than one directory. Unix paths use
+`/...`; Windows paths use `/C:/...` or `/UNC/server/share/...`. This provider is not confined to
+an application directory. Use `OsFileSystem` for a confined root instead.
 
 Public declarations: 0.
 

@@ -5,8 +5,9 @@
 Hash maps that own their keys and values, with deterministic seeded hashing.
 
 ## When to use
-Use [`HashMap`](#HashMap) to find a value by a key. The key type must implement `silk.collections.hash.HashKey`. Use
-`silk.collections.list.List` when the order of insertion matters, or when the code finds values by position.
+Use [`HashMap`](#HashMap) to find a value by a key. The key type must implement
+`silk.collections.hash.HashKey`. Use `silk.collections.list.List` when the order of insertion
+matters, or when the code finds values by position.
 
 ## Details
 [`HashMap.make`](#HashMap.impl.make) does not allocate. The first insert allocates eight buckets.
@@ -107,9 +108,9 @@ A hash map that owns unique keys and their values, with deterministic seeded has
 
 ### When to use
 
-Use it to find a value by a key. The key type must implement `silk.collections.hash.HashKey`. Use
-`silk.collections.list.List` when the order of insertion matters, or when the code finds values by
-position.
+Use it to find a value by a key. The key type must implement `silk.collections.hash.HashKey`.
+Use `silk.collections.list.List` when the order of insertion matters, or when the code finds
+values by position.
 
 ### Details
 
@@ -243,8 +244,7 @@ If the buckets already hold `additional` more entries under three quarters of th
 count, this function does nothing. Otherwise, it rebuilds the table once, with the smallest
 bucket count, doubling from the current one or from 8, that holds the length plus `additional`
 entries. The rebuild also reclaims the buckets of removed entries. The length does not change.
-An
-`additional` of 0 does nothing.
+An `additional` of 0 does nothing.
 
 #### Errors
 

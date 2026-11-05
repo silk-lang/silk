@@ -107,7 +107,8 @@ Converts an absolute Windows text path to `/C:/...` or `/UNC/server/share/...`.
 
 #### Errors
 
-- `FileError` with `InvalidPath` for relative paths, device namespaces, or non-normalized components.
+- `FileError` with `InvalidPath` for relative paths, device namespaces, or non-normalized
+  components.
 - `OutOfMemoryError` if the path cannot be allocated.
 
 <a id="WindowsPath.impl.fromNativeBytes"></a>

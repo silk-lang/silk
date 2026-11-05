@@ -5,8 +5,8 @@
 The default start code of a native program: it calls your `main` and returns its status.
 
 ## When to use
-The compiler uses this runtime for native programs on Darwin on x86_64 or aarch64, and Linux with GNU libc
-on x86_64 or aarch64. You do not call it.
+The compiler uses this runtime for native programs on Darwin on x86_64 or aarch64, and Linux
+with GNU libc on x86_64 or aarch64. You do not call it.
 
 ## Details
 `main` can return one of these:

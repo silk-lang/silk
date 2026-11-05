@@ -8,8 +8,8 @@ in static evaluation.
 ## When to use
 Use [`Compilation`](#Compilation) to select code for the build request, for example with `static if`. Use
 [`Compilation.safety`](#Compilation.impl.safety) to select checked or unchecked library code, and
-[`Compilation.threading`](#Compilation.impl.threading) to select single-thread or multi-thread code. Use `silk.core.target` for
-facts about the machine, such as the architecture and the pointer width.
+[`Compilation.threading`](#Compilation.impl.threading) to select single-thread or multi-thread code. Use `silk.core.target`
+for facts about the machine, such as the architecture and the pointer width.
 
 ## Details
 Each value comes from the compilation profile, which is fixed before specialization. The values

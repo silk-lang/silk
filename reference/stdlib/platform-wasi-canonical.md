@@ -9,8 +9,8 @@ The standard library's catalog names this module as a `wasm32-wasip2` support mo
 component exports `cabi_realloc`, whatever its runtime. Applications do not call it.
 
 ## Details
-The canonical ABI and the command adapter allocate through `cabi_realloc`, so their storage stays
-in the program's heap; a separate `memory.grow` allocator would overlap it.
+The canonical ABI and the command adapter allocate through `cabi_realloc`, so their storage
+stays in the program's heap; a separate `memory.grow` allocator would overlap it.
 
 Public declarations: 0.
 

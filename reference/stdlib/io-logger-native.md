@@ -14,9 +14,9 @@ provide `InMemoryLogger` instead.
 ## Details
 [`StderrLogger`](#StderrLogger) writes one line for each message: the level, a colon and a space, the formatted
 message, and a newline, such as `warning: disk 91% full`. It holds the standard error lock of
-`silk.io.writer_native` for the whole line, so lines of different threads do not mix. It formats into a
-buffer of 64 bytes on the stack. Thus a short line is one system call, and the logger does not
-allocate.
+`silk.io.writer_native` for the whole line, so lines of different threads do not mix. It formats
+into a buffer of 64 bytes on the stack. Thus a short line is one system call, and the logger
+does not allocate.
 
 [`StderrLogger.make`](#StderrLogger.impl.make) colors the level name when standard error is a terminal, the `NO_COLOR`
 environment variable is not set or is empty, and `TERM` is not `dumb`. It checks once, at the
@@ -29,8 +29,9 @@ or newline, has no lock, and does not allocate.
 `LogError` with code 3 if the write fails. Part of the message can be written already.
 
 ## Gotchas
-- The providers exist on Windows x86_64 MSVC, WASI, Darwin on x86_64 or aarch64, and Linux with GNU libc
-  on x86_64 or aarch64. Windows needs no CRT and automatic color enables console ANSI processing.
+- The providers exist on Windows x86_64 MSVC, WASI, Darwin on x86_64 or aarch64, and Linux with
+  GNU libc on x86_64 or aarch64. Windows needs no CRT and automatic color enables console ANSI
+  processing.
 - A message template for [`StderrLogger`](#StderrLogger) must not end with a newline. The logger adds one.
 - [`StderrLogger.make`](#StderrLogger.impl.make) reads the environment at the first message. A change to `NO_COLOR` after
   that has no effect on the same logger.
@@ -92,8 +93,8 @@ A `Logger` provider that writes one line for each message to standard error, wit
 
 Each line is the level name (`trace`, `debug`, `info`, `warning`, or `error`), a colon and a
 space, the formatted message, and a newline. The logger holds the standard error lock of
-`silk.io.writer_native` for the whole line. Thus lines of different threads do not mix, also with
-`StderrWriter` writes. The logger does not allocate.
+`silk.io.writer_native` for the whole line. Thus lines of different threads do not mix, also
+with `StderrWriter` writes. The logger does not allocate.
 
 With color, the level name has an ANSI color: `error` bold red, `warning` bold yellow, `info`
 green, `debug` blue, and `trace` cyan. The message has no color.
@@ -123,10 +124,11 @@ anything.
 
 #### Details
 
-On WASI, automatic color selection stays disabled because WASI does not define terminal detection.
-At the first message, the logger uses color when standard error is a terminal, `NO_COLOR` is
-not set or is empty, and `TERM` is not `dumb`. Later messages use the same answer.
-Windows also requires successful ANSI console-mode selection; redirected handles stay plain.
+On WASI, automatic color selection stays disabled because WASI does not define terminal
+detection. At the first message, the logger uses color when standard error is a terminal,
+`NO_COLOR` is not set or is empty, and `TERM` is not `dumb`. Later messages use the same
+answer. Windows also requires successful ANSI console-mode selection; redirected handles stay
+plain.
 
 <a id="StderrLogger.impl.withColor"></a>
 
