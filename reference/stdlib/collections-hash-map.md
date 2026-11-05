@@ -222,33 +222,6 @@ pub fn occupiedAt(self: &Self, index: usize) -> bool
 Returns `true` if the bucket at `index` holds an entry. Returns `false` for an index out of
 range.
 
-<a id="HashMap.impl.withMut"></a>
-
-### Method `withMut`
-
-```silk
-pub fn withMut<K: HashKey, F: once fn(&mut V) -> () + Intrinsic.NonParking
-  >(self: &mut Self, key: K, use: F) -> bool
-```
-
-Calls `use` one time with an exclusive borrow of the value for the key equal to `key`. Returns
-`false` and does not call `use` if there is no such key.
-
-#### When to use
-
-Use `withMut` to change a value in place, such as to increment a counter, when the value type
-is not `Copy`.
-
-#### Details
-
-This function does not allocate and does not grow the map. It consumes `key`. The stored key,
-the length, and the bucket count do not change. `use` returns `()`, so it cannot keep the
-borrow.
-
-#### Gotchas
-
-`use` must be `Intrinsic.NonParking`. It cannot suspend.
-
 <a id="HashMap.impl.reserve"></a>
 
 ### Method `reserve`
@@ -400,6 +373,33 @@ no such entry.
 
 The caller owns the returned value. The stored key is dropped. This function consumes `key`.
 It does not allocate.
+
+<a id="HashMap.impl.withMut"></a>
+
+### Method `withMut`
+
+```silk
+pub fn withMut<F: once fn(&mut V) -> () + Intrinsic.NonParking
+  >(self: &mut Self, key: K, use: F) -> bool
+```
+
+Calls `use` one time with an exclusive borrow of the value for the key equal to `key`. Returns
+`false` and does not call `use` if there is no such key.
+
+#### When to use
+
+Use `withMut` to change a value in place, such as to increment a counter, when the value type
+is not `Copy`.
+
+#### Details
+
+This function does not allocate and does not grow the map. It consumes `key`. The stored key,
+the length, and the bucket count do not change. `use` returns `()`, so it cannot keep the
+borrow.
+
+#### Gotchas
+
+`use` must be `Intrinsic.NonParking`. It cannot suspend.
 
 <a id="HashMap.impl-3"></a>
 
