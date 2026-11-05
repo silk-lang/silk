@@ -1,0 +1,394 @@
+//! Ask DNS servers questions from a native program, with system UDP and TCP sockets.
+//!
+//! # When to use
+//! Use a [`NativeDnsClient`] to look up any record type, such as MX or TXT, in a program without an
+//! event loop. It blocks the thread until the answer comes or the last try ends. To use your own
+//! sockets or loop, drive a `silk.net.dns.query.Exchange` instead. To turn a host name into
+//! addresses with the system rules, such as `/etc/hosts`, use `silk.net.resolver_native`.
+//!
+//! # Details
+//! [`NativeDnsClient.query`] drives an `Exchange` with the servers and options of a
+//! `ResolverConfig`. Each server gets its own connected UDP socket, so the system drops datagrams
+//! that come from another address. A TCP try opens a new connection with `silk.net.socket_native`.
+//! Query identifiers come from the `Random` service.
+//!
+//! # Examples
+//! ## Ask a test server
+//! This program starts no server, so the query fails with `Unreachable` or `Timeout`.
+//!
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.collections.list { List }
+//! import silk.core.effect { Effect }
+//! import silk.core.result { Result }
+//! import silk.net.address { Endpoint, IpAddress, Ipv4Address, Port }
+//! import silk.net.dns.client_native { NativeDnsClient }
+//! import silk.net.dns.config { ResolverConfig }
+//! import silk.net.dns.message { CLASS_IN, MessageError, Name, Question, TYPE_A }
+//! import silk.net.dns.query { QueryError, Reply }
+//! import silk.system.monotonic_clock { MonotonicClock }
+//! import silk.system.monotonic_clock_native { OsMonotonicClock }
+//! import silk.system.random { Random }
+//! import silk.system.random_native { OsRandom }
+//!
+//! effect fn program() -> i32
+//!   ! MessageError | OutOfMemoryError
+//!   ? &mut Allocator | &mut MonotonicClock | &mut Random {
+//!   let mut servers = List<Endpoint>.make()
+//!   let loopback = IpAddress.V4 { value: Ipv4Address.fromOctets([127, 0, 0, 1]) }
+//!   run List<Endpoint>.append(&mut servers, Endpoint.make(loopback, Port.fromU16(9)))
+//!   let mut config = ResolverConfig.make(move servers)
+//!   config.timeout = 100000000
+//!   config.attempts = 1
+//!   let name = match Name.parse("example.com") {
+//!     Result<Name, MessageError>.Success { value } => value
+//!     Result<Name, MessageError>.Failure {..} => {
+//!       return 1
+//!     }
+//!   }
+//!   let mut client = NativeDnsClient.make(move config)
+//!   let result = run Effect.result(NativeDnsClient.query(
+//!     &mut client,
+//!     Question { name: name, kind: TYPE_A, class: CLASS_IN },
+//!   ))
+//!   return match move result {
+//!     Result<Reply, QueryError | MessageError | OutOfMemoryError>.Success {..} => 1
+//!     Result<Reply, QueryError | MessageError | OutOfMemoryError>.Failure {..} => 0
+//!   }
+//! }
+//!
+//! effect fn failed<E>(error: E) -> i32 {
+//!   drop error
+//!   return 1
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let mut clock = OsMonotonicClock.make()
+//!   let mut random = OsRandom.make()
+//!   return run Effect.catchAll(program(), failed)
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!     |> Effect.provideMut<MonotonicClock>(&mut clock)
+//!     |> Effect.provideMut<Random>(&mut random)
+//! }
+//! ```
+//!
+//! @category Networking
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.collections.slice { Slice }
+import silk.io.byte_duplex { ByteDuplex, ByteIoError, ReadTransfer }
+import silk.net.address { Endpoint, IpAddress }
+import silk.net.datagram_native {
+  DatagramError,
+  DatagramOperation,
+  Family,
+  NativeUdpSocket,
+  Received,
+  Sent,
+  waitAny
+}
+import silk.net.dns.config { ResolverConfig }
+import silk.net.dns.message { MessageError, Question }
+import silk.net.dns.query { Exchange, QueryError, Receipt, Reply, Step, Transport }
+import silk.net.socket_native {
+  ConnectOptions,
+  Connection,
+  NativeSocketError,
+  connectResolvedOwned
+}
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.random { Random }
+import silk.system.system_clock { Instant, SystemClock }
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+
+/// A blocking DNS client for native programs.
+///
+/// # Details
+/// The client keeps its `ResolverConfig`. With the `rotate` option, each query starts at the next
+/// server.
+pub struct NativeDnsClient {
+  configValue: ResolverConfig,
+  next: usize,
+}
+
+// The UDP sockets of the servers asked so far: `sockets[i]` is connected to server `owners[i]`.
+struct ServerSockets {
+  sockets: List<NativeUdpSocket>,
+  owners: List<usize>,
+}
+
+impl NativeDnsClient {
+  /// Returns a client for `config`.
+  pub fn make(config: ResolverConfig) -> NativeDnsClient {
+    return NativeDnsClient { configValue: move config, next: 0 }
+  }
+
+  /// Returns the configuration of the client.
+  pub fn config(self: &Self) -> &ResolverConfig {
+    return &self.configValue
+  }
+
+  /// Asks `question` and returns the answer.
+  ///
+  /// # Details
+  /// The reply can have any response code other than SERVFAIL, NOTIMP, REFUSED and FORMERR, such as
+  /// `RCODE_NAME_ERROR` for a name that does not exist. Check `reply.message.header.responseCode`.
+  /// A server that cannot be reached, because a socket cannot be opened or a send fails, is skipped.
+  ///
+  /// # Errors
+  /// - `QueryError` if no server answered: `Timeout`, `NoServers`, or the last problem that a
+  ///   server reported.
+  /// - `MessageError` if the question does not fit in a message.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the packets or the reply.
+  pub effect fn query(self: &mut Self, question: Question) -> Reply
+    ! QueryError | MessageError | OutOfMemoryError
+    ? &mut Allocator | &mut MonotonicClock | &mut Random {
+    let random = run Random.nextU64()
+    let id = u64.toU16(random % 65536)
+    let first = self.next
+    if self.configValue.rotate {
+      self.next = self.next + 1
+    }
+    let mut exchange = run Exchange.make(&self.configValue, question, id, first)
+    let mut sockets = ServerSockets {
+      sockets: List<NativeUdpSocket>.make(),
+      owners: List<usize>.make(),
+    }
+    let mut buffer = run Bytes.zeroed(65535)
+    let mut tcp = Option<usize>.none()
+    while true {
+      let now = run MonotonicClock.now()
+      match Exchange.poll(&mut exchange, &now) {
+        Step.Done => {
+          break
+        }
+        Step.Send { server, endpoint, transport } => {
+          if transport == Transport.Tcp {
+            tcp = Option<usize>.some(server)
+          } else {
+            let sent = run Effect.result(
+              sendUdp(&mut sockets, server, endpoint, Exchange.packet(&exchange, Transport.Udp)),
+            )
+            match move sent {
+              Result<(), DatagramError | OutOfMemoryError>.Success { .. } => {}
+              Result<(), DatagramError | OutOfMemoryError>.Failure { error } => match move error {
+                DatagramError failure => {
+                  drop failure
+                  Exchange.transportFailed(&mut exchange, server, Transport.Udp)
+                }
+                OutOfMemoryError {} => {
+                  fail OutOfMemoryError {}
+                }
+              }
+            }
+          }
+        }
+        Step.Wait { until } => {
+          let pending = Intrinsic.replace(tcp, Option<usize>.none())
+          match move pending {
+            Option<usize>.Some { value: server } => {
+              run askTcp(&mut exchange, server, move until)
+            }
+            Option<usize>.None => {
+              run awaitUdp(&mut exchange, &mut sockets, &mut buffer, move until)
+            }
+          }
+        }
+      }
+    }
+    return match Exchange.finish(move exchange) {
+      Result<Reply, QueryError>.Success { value } => move value
+      Result<Reply, QueryError>.Failure { error } => {
+        fail error
+      }
+    }
+  }
+}
+
+effect fn sendUdp(
+  sockets: &mut ServerSockets,
+  server: usize,
+  endpoint: Endpoint,
+  packet: &[u8],
+) -> ()
+  ! DatagramError | OutOfMemoryError
+  ? &mut Allocator {
+  let owners = List<usize>.asSlice(&sockets.owners)
+  let mut index: usize = 0
+  while index < owners.length && owners[index] != server {
+    index = index + 1
+  }
+  if index == owners.length {
+    let mut family = Family.V6
+    if IpAddress.isV4(&Endpoint.address(&endpoint)) {
+      family = Family.V4
+    }
+    let mut socket = run NativeUdpSocket.open(family)
+    run NativeUdpSocket.connect(&mut socket, endpoint)
+    run List<NativeUdpSocket>.append(&mut sockets.sockets, move socket)
+    run List<usize>.append(&mut sockets.owners, server)
+  }
+  let socket = &mut List<NativeUdpSocket>.asMutSlice(&mut sockets.sockets)[index]
+  match run NativeUdpSocket.send(&mut socket.*, packet) {
+    Sent.Count { .. } => {}
+
+    // A full send buffer on a new socket is a local failure: skip the server.
+    Sent.WouldBlock => {
+      fail DatagramError.NativeFailure { operation: DatagramOperation.Send, code: 0 }
+    }
+  }
+}
+
+// Waits for UDP answers until `until`, and gives each one to the exchange.
+effect fn awaitUdp(
+  exchange: &mut Exchange,
+  sockets: &mut ServerSockets,
+  buffer: &mut Bytes,
+  until: Instant,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock {
+  let count = List<NativeUdpSocket>.length(&sockets.sockets)
+  if count == 0 {
+    run MonotonicClock.waitUntil(move until)
+    return ()
+  }
+  let ready = run Effect.result(
+    waitAny(List<NativeUdpSocket>.asSlice(&sockets.sockets), move until),
+  )
+  match move ready {
+    Result<bool, DatagramError | OutOfMemoryError>.Success { value } => {
+      if !value {
+        return ()
+      }
+    }
+    Result<bool, DatagramError | OutOfMemoryError>.Failure { error } => match move error {
+      // The wait failed: let the exchange time the try out.
+      DatagramError failure => {
+        drop failure
+        return ()
+      }
+      OutOfMemoryError {} => {
+        fail OutOfMemoryError {}
+      }
+    }
+  }
+  let mut index: usize = 0
+  while index < count {
+    let server = List<usize>.get(&sockets.owners, index)
+    let socket = &mut List<NativeUdpSocket>.asMutSlice(&mut sockets.sockets)[index]
+    while true {
+      let received = run Effect.result(
+        NativeUdpSocket.receive(&mut socket.*, Bytes.asMutSlice(&mut buffer.*)),
+      )
+      match move received {
+        Result<Received, DatagramError>.Success { value } => match move value {
+          Received.WouldBlock => {
+            break
+          }
+          Received.Datagram { count: size, .. } => {
+            let data = Slice.view<u8>(Bytes.asSlice(&buffer.*), 0, size)
+            let receipt = run Exchange.receive(&mut exchange.*, server, Transport.Udp, data)
+            if receipt == Receipt.Answer {
+              return ()
+            }
+          }
+        }
+        Result<Received, DatagramError>.Failure { .. } => {
+          Exchange.transportFailed(&mut exchange.*, server, Transport.Udp)
+          break
+        }
+      }
+    }
+    index = index + 1
+  }
+}
+
+fn copyInstant(value: &Instant) -> Instant {
+  return SystemClock.make(SystemClock.seconds(value), SystemClock.nanoseconds(value))
+}
+
+// Asks over a new TCP connection to `server`, with `until` as the deadline of the whole try.
+effect fn askTcp(exchange: &mut Exchange, server: usize, until: Instant) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock {
+  let result = run Effect.result(tcpRoundTrip(&exchange.*, server, move until))
+  match move result {
+    Result<Bytes, NativeSocketError | ByteIoError | OutOfMemoryError>.Success { value } => {
+      let _receipt = run Exchange.receive(
+        &mut exchange.*,
+        server,
+        Transport.Tcp,
+        Bytes.asSlice(&value),
+      )
+    }
+    Result<Bytes, NativeSocketError | ByteIoError | OutOfMemoryError>.Failure {
+      error
+    } => match move error {
+      OutOfMemoryError {} => {
+        fail OutOfMemoryError {}
+      }
+      _ => Exchange.transportFailed(&mut exchange.*, server, Transport.Tcp)
+    }
+  }
+}
+
+effect fn tcpRoundTrip(exchange: &Exchange, server: usize, until: Instant) -> Bytes
+  ! NativeSocketError | ByteIoError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock {
+  let endpoint = Exchange.endpoint(exchange, server)
+  let targets = [endpoint]
+  let mut connection = run connectResolvedOwned(
+    &targets,
+    ConnectOptions.defaults(),
+    Option<Instant>.some(copyInstant(&until)),
+  )
+  let packet = Exchange.packet(exchange, Transport.Tcp)
+  let mut written: usize = 0
+  while written < packet.length {
+    written = written
+      + run ByteDuplex.writeSome(
+        Slice.view<u8>(packet, written, packet.length - written),
+        Option<Instant>.some(copyInstant(&until)),
+      )
+        |> Effect.provideMut<ByteDuplex>(&mut connection)
+  }
+  let mut prefix = run Bytes.zeroed(2)
+  run readExactly(&mut connection, &mut prefix, &until)
+  let length = u8.toUsize(Bytes.asSlice(&prefix)[0]) * 256 + u8.toUsize(Bytes.asSlice(&prefix)[1])
+  let mut message = run Bytes.zeroed(length)
+  run readExactly(&mut connection, &mut message, &until)
+  run Connection.close(&mut connection)
+  return move message
+}
+
+// Fills all of `output` from `connection`.
+effect fn readExactly(connection: &mut Connection, output: &mut Bytes, until: &Instant) -> ()
+  ! ByteIoError | NativeSocketError
+  ? &mut MonotonicClock {
+  let mut filled: usize = 0
+  let total = Bytes.length(&output.*)
+  while filled < total {
+    let transfer = run ByteDuplex.readSome(
+      Slice.viewMut<u8>(Bytes.asMutSlice(&mut output.*), filled, total - filled),
+      Option<Instant>.some(copyInstant(until)),
+    )
+      |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+    match move transfer {
+      ReadTransfer.Data { count } => {
+        filled = filled + count
+      }
+      ReadTransfer.End => {
+        fail NativeSocketError.Closed
+      }
+    }
+  }
+}

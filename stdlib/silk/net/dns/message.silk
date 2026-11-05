@@ -1,0 +1,1527 @@
+//! Read and write DNS messages in the wire format of RFC 1035.
+//!
+//! # When to use
+//! Use this module to make a query, to read the response of a DNS server, or to write a response,
+//! for example in a test server. [`Message.query`] makes a query, [`Message.encode`] writes any
+//! message, and [`Message.parse`] reads one.
+//!
+//! # Details
+//! A [`Name`] holds a domain name in wire form, without compression, in a fixed buffer. It does not
+//! allocate. [`RecordData`] has a variant for each record type that `node:dns` reads: A, AAAA, NS,
+//! CNAME, PTR, MX, TXT, SRV, SOA, NAPTR, CAA and TLSA. Other types keep their raw data in
+//! `RecordData.Unknown`. An EDNS(0) OPT record (RFC 6891) is read into [`Message`] field `edns`, not
+//! into the additional records.
+//!
+//! [`Message.parse`] follows compression pointers, but only to earlier bytes, so it cannot loop.
+//! [`Message.encode`] compresses the names of the questions and of the owner names, and the names in
+//! NS, CNAME, PTR, MX and SOA data. It does not compress the names of other types, as RFC 3597
+//! requires.
+//!
+//! # Errors
+//! - [`MessageError`] with a [`MessageReason`] and the byte offset where the problem is.
+//! - `OutOfMemoryError` if the `Allocator` cannot supply the lists or the bytes.
+//!
+//! # Gotchas
+//! Names compare without case for ASCII letters only, as RFC 4343 requires. A name in text form
+//! uses the escapes of RFC 1035 section 5.1: `\.` for a dot in a label, `\\` for a backslash, and
+//! `\DDD` for any byte in decimal.
+//!
+//! # Examples
+//! ## Write a query and read it back
+//!
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.collections.bytes { Bytes }
+//! import silk.core.effect { Effect }
+//! import silk.core.option { Option }
+//! import silk.core.result { Result }
+//! import silk.net.dns.message { CLASS_IN, Message, MessageError, Name, Question, TYPE_AAAA }
+//! import silk.collections.list { List }
+//!
+//! effect fn program() -> i32
+//!   ! MessageError | OutOfMemoryError
+//!   ? &mut Allocator {
+//!   let name = match Name.parse("example.com") {
+//!     Result<Name, MessageError>.Success { value } => value
+//!     Result<Name, MessageError>.Failure {..} => {
+//!       return 1
+//!     }
+//!   }
+//!   let question = Question { name: name, kind: TYPE_AAAA, class: CLASS_IN }
+//!   let query = run Message.query(4660, question, Option<u16>.some(1232))
+//!   let mut wire = Bytes.make()
+//!   run Message.encode(&query, &mut wire)
+//!   let parsed = run Message.parse(Bytes.asSlice(&wire))
+//!   if parsed.header.id != 4660 || !parsed.header.recursionDesired {
+//!     return 1
+//!   }
+//!   let questions = List<Question>.asSlice(&parsed.questions)
+//!   if questions.length != 1 || questions[0].kind != TYPE_AAAA {
+//!     return 1
+//!   }
+//!   if !Name.equals(&questions[0].name, &name) {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//!
+//! effect fn failed<E>(error: E) -> i32 {
+//!   drop error
+//!   return 1
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   return run Effect.catchAll(program(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+//! }
+//! ```
+//!
+//! @category Networking
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.text.format { Debug, Format, Formatter }
+import silk.io.writer { Writer, WriterError }
+import silk.core.ownership { Copy }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.collections.slice { Slice }
+import silk.text.string { String }
+import silk.net.address { DomainHost, Ipv4Address, Ipv6Address }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.usize
+
+/// An IPv4 address, code 1.
+pub const TYPE_A: u16 = 1
+
+/// An authoritative name server, code 2.
+pub const TYPE_NS: u16 = 2
+
+/// The canonical name of an alias, code 5.
+pub const TYPE_CNAME: u16 = 5
+
+/// The start of a zone of authority, code 6.
+pub const TYPE_SOA: u16 = 6
+
+/// A domain name pointer, such as a reverse lookup result, code 12.
+pub const TYPE_PTR: u16 = 12
+
+/// A mail exchange, code 15.
+pub const TYPE_MX: u16 = 15
+
+/// Text strings, code 16.
+pub const TYPE_TXT: u16 = 16
+
+/// An IPv6 address, code 28.
+pub const TYPE_AAAA: u16 = 28
+
+/// A service location (RFC 2782), code 33.
+pub const TYPE_SRV: u16 = 33
+
+/// A naming authority pointer (RFC 3403), code 35.
+pub const TYPE_NAPTR: u16 = 35
+
+/// The EDNS(0) pseudo-record (RFC 6891), code 41.
+pub const TYPE_OPT: u16 = 41
+
+/// A TLS certificate association (RFC 6698), code 52.
+pub const TYPE_TLSA: u16 = 52
+
+/// A question for all records of a name, code 255.
+pub const TYPE_ANY: u16 = 255
+
+/// A certification authority authorization (RFC 8659), code 257.
+pub const TYPE_CAA: u16 = 257
+
+/// The Internet, code 1.
+pub const CLASS_IN: u16 = 1
+
+/// Chaos, code 3.
+pub const CLASS_CH: u16 = 3
+
+/// Hesiod, code 4.
+pub const CLASS_HS: u16 = 4
+
+/// A question for any class, code 255.
+pub const CLASS_ANY: u16 = 255
+
+/// No error, code 0.
+pub const RCODE_NO_ERROR: u16 = 0
+
+/// The server could not read the query, code 1.
+pub const RCODE_FORMAT_ERROR: u16 = 1
+
+/// The server failed to process the query, code 2.
+pub const RCODE_SERVER_FAILURE: u16 = 2
+
+/// The name does not exist, code 3. Also known as NXDOMAIN.
+pub const RCODE_NAME_ERROR: u16 = 3
+
+/// The server does not support this kind of query, code 4.
+pub const RCODE_NOT_IMPLEMENTED: u16 = 4
+
+/// The server refuses to answer, code 5.
+pub const RCODE_REFUSED: u16 = 5
+
+/// The server does not support the EDNS version of the query, code 16.
+pub const RCODE_BAD_VERSION: u16 = 16
+
+/// A standard query, code 0.
+pub const OPCODE_QUERY: u8 = 0
+
+/// A server status request, code 2.
+pub const OPCODE_STATUS: u8 = 2
+
+/// A zone change notification (RFC 1996), code 4.
+pub const OPCODE_NOTIFY: u8 = 4
+
+/// A dynamic update (RFC 2136), code 5.
+pub const OPCODE_UPDATE: u8 = 5
+
+/// The problem that [`MessageError`] reports.
+pub enum MessageReason {
+  /// The message ends inside a field.
+  Truncated,
+  /// A label length byte uses the reserved forms `01` or `10` in its top two bits.
+  ReservedLabel,
+  /// A compression pointer does not point to an earlier byte.
+  ForwardPointer,
+  /// A label in text form is longer than 63 bytes.
+  LabelTooLong,
+  /// A name is longer than 255 bytes in wire form.
+  NameTooLong,
+  /// A name in text form has an empty label, as in `a..b`.
+  EmptyLabel,
+  /// A name in text form has a `\` that is not followed by a byte, or by a decimal escape from
+  /// `\000` to `\255`.
+  InvalidEscape,
+  /// The data of a record has the wrong length for its type.
+  BadRecordLength,
+  /// The message has more than one OPT record, or an OPT record that is not in the additional
+  /// section or not owned by the root name.
+  BadOpt,
+  /// A count does not fit its 16-bit field, or a message is longer than 65535 bytes.
+  TooLarge,
+  /// A character string is longer than 255 bytes.
+  StringTooLong,
+  /// A response code does not fit 12 bits, or one above 15 is written without EDNS.
+  BadResponseCode,
+}
+
+impl Debug for MessageReason {
+  /// Writes the name of the variant, such as `Truncated`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      MessageReason.Truncated => run Format.write(&mut formatter, b"Truncated")
+      MessageReason.ReservedLabel => run Format.write(&mut formatter, b"ReservedLabel")
+      MessageReason.ForwardPointer => run Format.write(&mut formatter, b"ForwardPointer")
+      MessageReason.LabelTooLong => run Format.write(&mut formatter, b"LabelTooLong")
+      MessageReason.NameTooLong => run Format.write(&mut formatter, b"NameTooLong")
+      MessageReason.EmptyLabel => run Format.write(&mut formatter, b"EmptyLabel")
+      MessageReason.InvalidEscape => run Format.write(&mut formatter, b"InvalidEscape")
+      MessageReason.BadRecordLength => run Format.write(&mut formatter, b"BadRecordLength")
+      MessageReason.BadOpt => run Format.write(&mut formatter, b"BadOpt")
+      MessageReason.TooLarge => run Format.write(&mut formatter, b"TooLarge")
+      MessageReason.StringTooLong => run Format.write(&mut formatter, b"StringTooLong")
+      MessageReason.BadResponseCode => run Format.write(&mut formatter, b"BadResponseCode")
+    }
+  }
+}
+
+/// A DNS message or a name that cannot be read or written.
+pub struct MessageError {
+  /// The problem.
+  pub reason: MessageReason,
+  /// The byte offset of the problem: in the message for wire data, or in the text for a name in text
+  /// form. When writing, the offset is the length of the output that was written before the problem.
+  pub offset: usize,
+}
+
+impl Copy for MessageError {}
+
+impl Debug for MessageError {
+  /// Writes the fields, as `MessageError { reason: ..., offset: ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return run Format.debugFields(self, "MessageError", &mut formatter)
+  }
+}
+
+fn problem(reason: MessageReason, offset: usize) -> MessageError {
+  return MessageError { reason: reason, offset: offset }
+}
+
+/// A domain name in wire form: a list of labels, each with its length byte, and a zero byte at the
+/// end.
+///
+/// # Details
+/// A name holds at most 255 bytes in wire form, in a fixed buffer, so it does not allocate. A label
+/// can hold any byte, not only letters, digits and hyphens. Names compare without case for the ASCII
+/// letters only.
+pub struct Name {
+  wireValue: [u8; 255],
+  lengthValue: usize,
+}
+
+impl Copy for Name {}
+
+fn foldByte(value: u8) -> u8 {
+  if value >= 65 && value <= 90 {
+    return value + 32
+  }
+  return value
+}
+
+fn emptyWire() -> [u8; 255] {
+  return [0; 255]
+}
+
+fn isDecimal(value: u8) -> bool {
+  return value >= 48 && value <= 57
+}
+
+impl Name {
+  /// Returns the root name, which has no labels. Its text form is `.`.
+  pub fn root() -> Name {
+    return Name { wireValue: emptyWire(), lengthValue: 1 }
+  }
+
+  /// Parses a name in text form, such as `example.com` or `example.com.`.
+  ///
+  /// # Details
+  /// A final dot is optional, and the name is always absolute. `.` and the empty text give the root
+  /// name. Use `\.` for a dot in a label, `\\` for a backslash, and `\DDD` for any byte, with three
+  /// decimal digits.
+  ///
+  /// # Errors
+  /// - `EmptyLabel` for two dots in a row, or a dot at the start of a name that is not the root.
+  /// - `LabelTooLong` for a label of more than 63 bytes.
+  /// - `NameTooLong` if the name has more than 255 bytes in wire form.
+  /// - `InvalidEscape` for a `\` at the end, or a decimal escape above 255.
+  pub fn parse(text: string) -> Result<Name, MessageError> {
+    return Name.parseBytes(String.utf8Bytes(text))
+  }
+
+  /// Parses a name in text form from bytes.
+  ///
+  /// # When to use
+  /// Use it for a name that you have as bytes, for example a line of a configuration file. For a
+  /// `string`, use [`Name.parse`].
+  ///
+  /// # Details
+  /// A final dot is optional, and the name is always absolute. `.` and empty input give the root
+  /// name. Use `\.` for a dot in a label, `\\` for a backslash, and `\DDD` for any byte, with three
+  /// decimal digits.
+  ///
+  /// # Errors
+  /// - `EmptyLabel` for two dots in a row, or a dot at the start of a name that is not the root.
+  /// - `LabelTooLong` for a label of more than 63 bytes.
+  /// - `NameTooLong` if the name has more than 255 bytes in wire form.
+  /// - `InvalidEscape` for a `\` at the end, or a decimal escape above 255.
+  pub fn parseBytes(text: &[u8]) -> Result<Name, MessageError> {
+    let mut wire = emptyWire()
+    if text.length == 0 || (text.length == 1 && text[0] == 46) {
+      return Result<Name, MessageError>.succeed(Name { wireValue: wire, lengthValue: 1 })
+    }
+
+    // `labelAt` is the position of the length byte of the label being read.
+    let mut labelAt: usize = 0
+    let mut length: usize = 1
+    let mut at: usize = 0
+    while at < text.length {
+      let byte = text[at]
+      if byte == 46 {
+        let labelLength = length - labelAt - 1
+        if labelLength == 0 {
+          return Result<Name, MessageError>.failResult(problem(MessageReason.EmptyLabel, at))
+        }
+        wire[labelAt] = usize.toU8(labelLength)
+        labelAt = length
+        length = length + 1
+        if length > 255 {
+          return Result<Name, MessageError>.failResult(problem(MessageReason.NameTooLong, at))
+        }
+        at = at + 1
+        continue
+      }
+      let mut value = byte
+      let start = at
+      if byte == 92 {
+        if at + 1 >= text.length {
+          return Result<Name, MessageError>.failResult(problem(MessageReason.InvalidEscape, at))
+        }
+        if isDecimal(text[at + 1]) {
+          if at + 3 >= text.length {
+            return Result<Name, MessageError>.failResult(problem(MessageReason.InvalidEscape, at))
+          }
+          if !isDecimal(text[at + 2]) || !isDecimal(text[at + 3]) {
+            return Result<Name, MessageError>.failResult(problem(MessageReason.InvalidEscape, at))
+          }
+          let decimal = u8.toUsize(text[at + 1] - 48) * 100 + u8.toUsize(text[at + 2] - 48) * 10
+            + u8.toUsize(text[at + 3] - 48)
+          if decimal > 255 {
+            return Result<Name, MessageError>.failResult(problem(MessageReason.InvalidEscape, at))
+          }
+          value = usize.toU8(decimal)
+          at = at + 4
+        } else {
+          value = text[at + 1]
+          at = at + 2
+        }
+      } else {
+        at = at + 1
+      }
+      if length - labelAt - 1 >= 63 {
+        return Result<Name, MessageError>.failResult(problem(MessageReason.LabelTooLong, start))
+      }
+      if length >= 254 {
+        return Result<Name, MessageError>.failResult(problem(MessageReason.NameTooLong, start))
+      }
+      wire[length] = value
+      length = length + 1
+    }
+    let lastLength = length - labelAt - 1
+    if lastLength == 0 {
+      // The text ended with a dot: the zero byte at `labelAt` ends the name.
+      return Result<Name, MessageError>.succeed(Name { wireValue: wire, lengthValue: length })
+    }
+    wire[labelAt] = usize.toU8(lastLength)
+    wire[length] = 0
+    return Result<Name, MessageError>.succeed(Name { wireValue: wire, lengthValue: length + 1 })
+  }
+
+  /// Returns the name of a checked domain host, such as one from `silk.net.address.Host.parse`.
+  pub fn fromDomain(host: &DomainHost) -> Name {
+    return match Name.parseBytes(DomainHost.bytes(host)) {
+      Result<Name, MessageError>.Success { value } => value
+
+      // A domain host has only letters, digits, hyphens and dots, at most 253 bytes, and labels of
+      // 1 to 63 bytes, so it is always a valid name.
+      Result<Name, MessageError>.Failure { .. } => Intrinsic.trap(
+        "Name.fromDomain: invalid domain host",
+      )
+    }
+  }
+
+  /// Returns the name for the reverse lookup of an IPv4 address, such as
+  /// `4.3.2.1.in-addr.arpa` for `1.2.3.4`.
+  pub fn reverseIpv4(address: &Ipv4Address) -> Name {
+    let octets = Ipv4Address.octets(address)
+    let mut wire = emptyWire()
+    let mut length: usize = 0
+    let mut index: usize = 4
+    while index > 0 {
+      index = index - 1
+      let value = octets[index]
+      let start = length
+      length = length + 1
+      if value >= 100 {
+        wire[length] = 48 + value / 100
+        length = length + 1
+      }
+      if value >= 10 {
+        wire[length] = 48 + (value / 10) % 10
+        length = length + 1
+      }
+      wire[length] = 48 + value % 10
+      length = length + 1
+      wire[start] = usize.toU8(length - start - 1)
+    }
+    let suffix = b"\x07in-addr\x04arpa\x00"
+    let mut at: usize = 0
+    while at < suffix.length {
+      wire[length] = suffix[at]
+      length = length + 1
+      at = at + 1
+    }
+    return Name { wireValue: wire, lengthValue: length }
+  }
+
+  /// Returns the name for the reverse lookup of an IPv6 address: its 32 hex digits from the last one
+  /// to the first, then `ip6.arpa`, as RFC 3596 defines.
+  pub fn reverseIpv6(address: &Ipv6Address) -> Name {
+    let octets = Ipv6Address.octets(address)
+    let digits = b"0123456789abcdef"
+    let mut wire = emptyWire()
+    let mut length: usize = 0
+    let mut index: usize = 16
+    while index > 0 {
+      index = index - 1
+      let value = octets[index]
+      wire[length] = 1
+      wire[length + 1] = digits[u8.toUsize(value % 16)]
+      wire[length + 2] = 1
+      wire[length + 3] = digits[u8.toUsize(value / 16)]
+      length = length + 4
+    }
+    let suffix = b"\x03ip6\x04arpa\x00"
+    let mut at: usize = 0
+    while at < suffix.length {
+      wire[length] = suffix[at]
+      length = length + 1
+      at = at + 1
+    }
+    return Name { wireValue: wire, lengthValue: length }
+  }
+
+  /// Returns the name in wire form, with the zero byte at the end and without compression.
+  pub fn wire<'a>(self: &'a Self) -> &'a [u8] {
+    return Slice.view<u8>(&self.wireValue, 0, self.lengthValue)
+  }
+
+  /// Returns the number of labels. The root name has 0.
+  pub fn labelCount(self: &Self) -> usize {
+    let mut count: usize = 0
+    let mut at: usize = 0
+    while self.wireValue[at] != 0 {
+      at = at + u8.toUsize(self.wireValue[at]) + 1
+      count = count + 1
+    }
+    return count
+  }
+
+  /// Returns `true` if this is the root name.
+  pub fn isRoot(self: &Self) -> bool {
+    return self.lengthValue == 1
+  }
+
+  /// Returns `true` if the names are equal. ASCII letters compare without case, so `Example.COM`
+  /// equals `example.com`.
+  pub fn equals(self: &Self, other: &Self) -> bool {
+    if self.lengthValue != other.lengthValue {
+      return false
+    }
+    let mut at: usize = 0
+    while at < self.lengthValue {
+      if foldByte(self.wireValue[at]) != foldByte(other.wireValue[at]) {
+        return false
+      }
+      at = at + 1
+    }
+    return true
+  }
+
+  /// Returns this name followed by the labels of `suffix`, such as `www.example.com` for `www` and
+  /// `example.com`.
+  ///
+  /// # When to use
+  /// Use it to add a search domain to a relative name.
+  ///
+  /// # Errors
+  /// - `NameTooLong` if the result has more than 255 bytes in wire form. The offset is 0.
+  pub fn join(self: &Self, suffix: &Name) -> Result<Name, MessageError> {
+    let total = self.lengthValue - 1 + suffix.lengthValue
+    if total > 255 {
+      return Result<Name, MessageError>.failResult(problem(MessageReason.NameTooLong, 0))
+    }
+    let mut wire = self.wireValue
+    let mut at: usize = 0
+    while at < suffix.lengthValue {
+      wire[self.lengthValue - 1 + at] = suffix.wireValue[at]
+      at = at + 1
+    }
+    return Result<Name, MessageError>.succeed(Name { wireValue: wire, lengthValue: total })
+  }
+
+  /// Appends the name in text form to `output`, without a final dot. The root name is `.`.
+  ///
+  /// # Details
+  /// A dot or a backslash in a label is written as `\.` or `\\`. A byte that is not a printable ASCII
+  /// character, or a space, is written as `\DDD` in decimal. [`Name.parse`] reads the text back to the
+  /// same name.
+  pub effect fn appendText(self: &Self, output: &mut Bytes) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.lengthValue == 1 {
+      run Bytes.append(&mut output.*, b".")
+      return ()
+    }
+    let mut at: usize = 0
+    while self.wireValue[at] != 0 {
+      if at != 0 {
+        run Bytes.append(&mut output.*, b".")
+      }
+      let end = at + 1 + u8.toUsize(self.wireValue[at])
+      let mut index = at + 1
+      while index < end {
+        let byte = self.wireValue[index]
+        if byte == 46 || byte == 92 {
+          let escaped: [u8; 2] = [92, byte]
+          run Bytes.append(&mut output.*, &escaped)
+        } else if byte <= 32 || byte >= 127 {
+          let escaped: [u8; 4] = [92, 48 + byte / 100, 48 + (byte / 10) % 10, 48 + byte % 10]
+          run Bytes.append(&mut output.*, &escaped)
+        } else {
+          let plain = [byte]
+          run Bytes.append(&mut output.*, &plain)
+        }
+        index = index + 1
+      }
+      at = end
+    }
+  }
+}
+
+/// One question of a message: a name, a record type and a class.
+pub struct Question {
+  /// The name to look up.
+  pub name: Name,
+  /// The record type, such as [`TYPE_A`].
+  pub kind: u16,
+  /// The class, usually [`CLASS_IN`].
+  pub class: u16,
+}
+
+impl Copy for Question {}
+
+impl Question {
+  /// Returns `true` if the questions have equal names, types and classes. Names compare without case.
+  pub fn equals(self: &Self, other: &Self) -> bool {
+    return self.kind == other.kind && self.class == other.class
+      && Name.equals(&self.name, &other.name)
+  }
+}
+
+/// The data of a resource record, by type.
+pub union RecordData {
+  /// An IPv4 address.
+  A {
+    /// The address.
+    pub address: Ipv4Address,
+  },
+  /// An IPv6 address.
+  Aaaa {
+    /// The address.
+    pub address: Ipv6Address,
+  },
+  /// An authoritative name server.
+  Ns {
+    /// The name of the server.
+    pub server: Name,
+  },
+  /// The canonical name of the owner, which is an alias.
+  Cname {
+    /// The canonical name.
+    pub target: Name,
+  },
+  /// A domain name pointer, such as the result of a reverse lookup.
+  Ptr {
+    /// The name that the record points to.
+    pub target: Name,
+  },
+  /// A mail exchange.
+  Mx {
+    /// The preference. A lower value is preferred.
+    pub preference: u16,
+    /// The name of the mail server.
+    pub exchange: Name,
+  },
+  /// Text, as one or more character strings of at most 255 bytes each.
+  Txt {
+    /// The strings, in order. The bytes are not always UTF-8.
+    pub strings: List<Bytes>,
+  },
+  /// A service location (RFC 2782).
+  Srv {
+    /// The priority. A lower value is tried first.
+    pub priority: u16,
+    /// The relative weight among targets of the same priority.
+    pub weight: u16,
+    /// The port of the service.
+    pub port: u16,
+    /// The name of the host of the service.
+    pub target: Name,
+  },
+  /// The start of a zone of authority.
+  Soa {
+    /// The name of the primary name server of the zone.
+    pub primary: Name,
+    /// The mailbox of the person responsible for the zone, in name form.
+    pub mailbox: Name,
+    /// The version of the zone.
+    pub serial: u32,
+    /// The seconds between refreshes of a secondary server.
+    pub refresh: u32,
+    /// The seconds before a failed refresh is tried again.
+    pub retry: u32,
+    /// The seconds after which a secondary server stops answering for the zone.
+    pub expire: u32,
+    /// The seconds to cache a negative answer (RFC 2308).
+    pub minimum: u32,
+  },
+  /// A naming authority pointer (RFC 3403).
+  Naptr {
+    /// The order. A lower value is processed first.
+    pub order: u16,
+    /// The preference among records of the same order.
+    pub preference: u16,
+    /// The flags string.
+    pub flags: Bytes,
+    /// The service string.
+    pub services: Bytes,
+    /// The substitution expression.
+    pub regexp: Bytes,
+    /// The next name to look up.
+    pub replacement: Name,
+  },
+  /// A TLS certificate association (RFC 6698).
+  Tlsa {
+    /// The certificate usage.
+    pub usage: u8,
+    /// The part of the certificate to match.
+    pub selector: u8,
+    /// How the data is matched.
+    pub matchingType: u8,
+    /// The certificate association data.
+    pub data: Bytes,
+  },
+  /// A certification authority authorization (RFC 8659).
+  Caa {
+    /// The flags. Bit 128 is the critical flag.
+    pub flags: u8,
+    /// The property tag, such as `issue`.
+    pub tag: Bytes,
+    /// The property value.
+    pub value: Bytes,
+  },
+  /// A record of another type, with its data as it is on the wire.
+  Unknown {
+    /// The record type.
+    pub kind: u16,
+    /// The data. Names in it can be compressed and then point into the message.
+    pub data: Bytes,
+  },
+}
+
+impl RecordData {
+  /// Returns the record type of the data, such as [`TYPE_A`] for `RecordData.A`.
+  pub fn kind(self: &Self) -> u16 {
+    return match &self.* {
+      RecordData.A { .. } => TYPE_A
+      RecordData.Aaaa { .. } => TYPE_AAAA
+      RecordData.Ns { .. } => TYPE_NS
+      RecordData.Cname { .. } => TYPE_CNAME
+      RecordData.Ptr { .. } => TYPE_PTR
+      RecordData.Mx { .. } => TYPE_MX
+      RecordData.Txt { .. } => TYPE_TXT
+      RecordData.Srv { .. } => TYPE_SRV
+      RecordData.Soa { .. } => TYPE_SOA
+      RecordData.Naptr { .. } => TYPE_NAPTR
+      RecordData.Tlsa { .. } => TYPE_TLSA
+      RecordData.Caa { .. } => TYPE_CAA
+      RecordData.Unknown { kind, .. } => kind
+    }
+  }
+}
+
+/// A resource record: an owner name, a class, a time to live, and typed data.
+pub struct Record {
+  /// The name that owns the record.
+  pub name: Name,
+  /// The class, usually [`CLASS_IN`].
+  pub class: u16,
+  /// The seconds that the record can be cached.
+  pub ttl: u32,
+  /// The data. Its variant gives the record type.
+  pub data: RecordData,
+}
+
+/// One option of an EDNS(0) OPT record.
+pub struct EdnsOption {
+  /// The option code, such as 10 for a cookie (RFC 7873).
+  pub code: u16,
+  /// The option data.
+  pub data: Bytes,
+}
+
+/// The EDNS(0) information of a message (RFC 6891), from its OPT record.
+pub struct Edns {
+  /// The largest UDP payload, in bytes, that the sender can receive.
+  pub udpPayloadSize: u16,
+  /// The EDNS version. Only version 0 is defined.
+  pub version: u8,
+  /// The DO bit: the sender can read DNSSEC records.
+  pub dnssecOk: bool,
+  /// The options, in order.
+  pub options: List<EdnsOption>,
+}
+
+impl Edns {
+  /// Returns version 0 with `udpPayloadSize`, the DO bit off, and no options.
+  pub fn make(udpPayloadSize: u16) -> Edns {
+    return Edns {
+      udpPayloadSize: udpPayloadSize,
+      version: 0,
+      dnssecOk: false,
+      options: List<EdnsOption>.make(),
+    }
+  }
+}
+
+/// The fixed header of a message, without the section counts.
+pub struct Header {
+  /// The identifier that a response copies from its query.
+  pub id: u16,
+  /// The QR bit: `true` for a response, `false` for a query.
+  pub response: bool,
+  /// The operation, such as [`OPCODE_QUERY`]. It uses 4 bits.
+  pub opcode: u8,
+  /// The AA bit: the server is an authority for the name.
+  pub authoritative: bool,
+  /// The TC bit: the message was cut short to fit a UDP datagram.
+  pub truncated: bool,
+  /// The RD bit: the client asks for recursion.
+  pub recursionDesired: bool,
+  /// The RA bit: the server can recurse.
+  pub recursionAvailable: bool,
+  /// The AD bit: the server checked the DNSSEC data (RFC 4035).
+  pub authenticData: bool,
+  /// The CD bit: the client does not want DNSSEC checks (RFC 4035).
+  pub checkingDisabled: bool,
+  /// The response code, such as [`RCODE_NAME_ERROR`]. With EDNS it has 12 bits: the upper 8
+  /// bits are in the OPT record.
+  pub responseCode: u16,
+}
+
+impl Copy for Header {}
+
+fn readU16(input: &[u8], at: usize) -> u16 {
+  return u8.toU16(input[at]) * 256 + u8.toU16(input[at + 1])
+}
+
+fn readU32(input: &[u8], at: usize) -> u32 {
+  return u8.toU32(input[at]) * 16777216 + u8.toU32(input[at + 1]) * 65536
+    + u8.toU32(input[at + 2]) * 256
+    + u8.toU32(input[at + 3])
+}
+
+impl Header {
+  /// Returns the header of a query with `id`, with the RD bit on and all other bits off.
+  pub fn query(id: u16) -> Header {
+    return Header {
+      id: id,
+      response: false,
+      opcode: OPCODE_QUERY,
+      authoritative: false,
+      truncated: false,
+      recursionDesired: true,
+      recursionAvailable: false,
+      authenticData: false,
+      checkingDisabled: false,
+      responseCode: RCODE_NO_ERROR,
+    }
+  }
+
+  /// Reads the 12-byte header at the start of `input`.
+  ///
+  /// # When to use
+  /// Use it to check the identifier or the TC bit of a datagram before you read the whole message.
+  ///
+  /// # Details
+  /// The response code is the 4-bit code of the header only. [`Message.parse`] adds the extended bits
+  /// of the OPT record.
+  ///
+  /// # Errors
+  /// - `Truncated` if `input` has fewer than 12 bytes.
+  pub fn read(input: &[u8]) -> Result<Header, MessageError> {
+    if input.length < 12 {
+      return Result<Header, MessageError>.failResult(problem(MessageReason.Truncated, input.length))
+    }
+    let high = input[2]
+    let low = input[3]
+    return Result<Header, MessageError>.succeed(
+      Header {
+        id: readU16(input, 0),
+        response: high >= 128,
+        opcode: (high / 8) % 16,
+        authoritative: (high / 4) % 2 == 1,
+        truncated: (high / 2) % 2 == 1,
+        recursionDesired: high % 2 == 1,
+        recursionAvailable: low >= 128,
+        authenticData: (low / 32) % 2 == 1,
+        checkingDisabled: (low / 16) % 2 == 1,
+        responseCode: u8.toU16(low % 16),
+      },
+    )
+  }
+}
+
+/// A DNS message: a header, four sections of questions and records, and optional EDNS information.
+pub struct Message {
+  /// The header.
+  pub header: Header,
+  /// The question section.
+  pub questions: List<Question>,
+  /// The answer section.
+  pub answers: List<Record>,
+  /// The authority section.
+  pub authorities: List<Record>,
+  /// The additional section, without the OPT record.
+  pub additionals: List<Record>,
+  /// The EDNS information. [`Message.encode`] writes it as an OPT record at the end of the additional
+  /// section.
+  pub edns: Option<Edns>,
+}
+
+// Reads a name at `cursor`, and moves `cursor` past the name as it is in the message, that is past
+// its first compression pointer.
+effect fn readName(input: &[u8], cursor: &mut usize) -> Name
+  ! MessageError {
+  let mut wire = emptyWire()
+  let mut length: usize = 0
+  let mut at = cursor.*
+  let mut jumped = false
+
+  // Every pointer must go to an earlier byte than the previous one, so the loop ends.
+  let mut limit = at
+  while true {
+    if at >= input.length {
+      fail problem(MessageReason.Truncated, at)
+    }
+    let byte = input[at]
+    if byte >= 192 {
+      if at + 1 >= input.length {
+        fail problem(MessageReason.Truncated, at)
+      }
+      let target = u8.toUsize(byte - 192) * 256 + u8.toUsize(input[at + 1])
+      if target >= limit {
+        fail problem(MessageReason.ForwardPointer, at)
+      }
+      if !jumped {
+        cursor.* = at + 2
+        jumped = true
+      }
+      limit = target
+      at = target
+      continue
+    }
+    if byte >= 64 {
+      fail problem(MessageReason.ReservedLabel, at)
+    }
+    let size = u8.toUsize(byte)
+    if length + size + 1 > 255 {
+      fail problem(MessageReason.NameTooLong, at)
+    }
+    if at + 1 + size > input.length {
+      fail problem(MessageReason.Truncated, at)
+    }
+    let mut index: usize = 0
+    while index <= size {
+      wire[length + index] = input[at + index]
+      index = index + 1
+    }
+    length = length + size + 1
+    at = at + size + 1
+    if size == 0 {
+      break
+    }
+  }
+  if !jumped {
+    cursor.* = at
+  }
+  return Name { wireValue: wire, lengthValue: length }
+}
+
+effect fn need(input: &[u8], at: usize, count: usize, end: usize) -> ()
+  ! MessageError {
+  if at + count > end || at + count > input.length {
+    fail problem(MessageReason.Truncated, at)
+  }
+}
+
+effect fn readString(input: &[u8], cursor: &mut usize, end: usize) -> Bytes
+  ! MessageError | OutOfMemoryError
+  ? &mut Allocator {
+  run need(input, cursor.*, 1, end)
+  let size = u8.toUsize(input[cursor.*])
+  run need(input, cursor.* + 1, size, end)
+  let value = run Bytes.copy(Slice.view<u8>(input, cursor.* + 1, size))
+  cursor.* = cursor.* + 1 + size
+  return move value
+}
+
+effect fn readDataName(input: &[u8], cursor: &mut usize, end: usize) -> Name
+  ! MessageError {
+  let name = run readName(input, &mut cursor.*)
+  if cursor.* > end {
+    fail problem(MessageReason.BadRecordLength, end)
+  }
+  return name
+}
+
+effect fn readData(input: &[u8], kind: u16, start: usize, size: usize) -> RecordData
+  ! MessageError | OutOfMemoryError
+  ? &mut Allocator {
+  let end = start + size
+  let mut cursor = start
+  if kind == TYPE_A {
+    if size != 4 {
+      fail problem(MessageReason.BadRecordLength, start)
+    }
+    return RecordData.A {
+      address: Ipv4Address.fromOctets(
+        [input[start], input[start + 1], input[start + 2], input[start + 3]],
+      ),
+    }
+  }
+  if kind == TYPE_AAAA {
+    if size != 16 {
+      fail problem(MessageReason.BadRecordLength, start)
+    }
+    let mut octets: [u8; 16] = [0; 16]
+    let mut index: usize = 0
+    while index < 16 {
+      octets[index] = input[start + index]
+      index = index + 1
+    }
+    return RecordData.Aaaa { address: Ipv6Address.fromOctets(octets) }
+  }
+  let mut data = RecordData.Unknown { kind: kind, data: Bytes.make() }
+  if kind == TYPE_NS {
+    data = RecordData.Ns { server: run readDataName(input, &mut cursor, end) }
+  } else if kind == TYPE_CNAME {
+    data = RecordData.Cname { target: run readDataName(input, &mut cursor, end) }
+  } else if kind == TYPE_PTR {
+    data = RecordData.Ptr { target: run readDataName(input, &mut cursor, end) }
+  } else if kind == TYPE_MX {
+    run need(input, cursor, 2, end)
+    let preference = readU16(input, cursor)
+    cursor = cursor + 2
+    data = RecordData.Mx {
+      preference: preference,
+      exchange: run readDataName(input, &mut cursor, end),
+    }
+  } else if kind == TYPE_TXT {
+    let mut strings = List<Bytes>.make()
+    if size == 0 {
+      fail problem(MessageReason.BadRecordLength, start)
+    }
+    while cursor < end {
+      let value = run readString(input, &mut cursor, end)
+      run List<Bytes>.append(&mut strings, move value)
+    }
+    data = RecordData.Txt { strings: move strings }
+  } else if kind == TYPE_SRV {
+    run need(input, cursor, 6, end)
+    let priority = readU16(input, cursor)
+    let weight = readU16(input, cursor + 2)
+    let port = readU16(input, cursor + 4)
+    cursor = cursor + 6
+    data = RecordData.Srv {
+      priority: priority,
+      weight: weight,
+      port: port,
+      target: run readDataName(input, &mut cursor, end),
+    }
+  } else if kind == TYPE_SOA {
+    let primary = run readDataName(input, &mut cursor, end)
+    let mailbox = run readDataName(input, &mut cursor, end)
+    run need(input, cursor, 20, end)
+    data = RecordData.Soa {
+      primary: primary,
+      mailbox: mailbox,
+      serial: readU32(input, cursor),
+      refresh: readU32(input, cursor + 4),
+      retry: readU32(input, cursor + 8),
+      expire: readU32(input, cursor + 12),
+      minimum: readU32(input, cursor + 16),
+    }
+    cursor = cursor + 20
+  } else if kind == TYPE_NAPTR {
+    run need(input, cursor, 4, end)
+    let order = readU16(input, cursor)
+    let preference = readU16(input, cursor + 2)
+    cursor = cursor + 4
+    let flags = run readString(input, &mut cursor, end)
+    let services = run readString(input, &mut cursor, end)
+    let regexp = run readString(input, &mut cursor, end)
+    let replacement = run readDataName(input, &mut cursor, end)
+    data = RecordData.Naptr {
+      order: order,
+      preference: preference,
+      flags: move flags,
+      services: move services,
+      regexp: move regexp,
+      replacement: replacement,
+    }
+  } else if kind == TYPE_TLSA {
+    run need(input, cursor, 3, end)
+    let association = run Bytes.copy(Slice.view<u8>(input, cursor + 3, size - 3))
+    data = RecordData.Tlsa {
+      usage: input[cursor],
+      selector: input[cursor + 1],
+      matchingType: input[cursor + 2],
+      data: move association,
+    }
+    cursor = end
+  } else if kind == TYPE_CAA {
+    run need(input, cursor, 2, end)
+    let flags = input[cursor]
+    cursor = cursor + 1
+    let tag = run readString(input, &mut cursor, end)
+    let value = run Bytes.copy(Slice.view<u8>(input, cursor, end - cursor))
+    data = RecordData.Caa { flags: flags, tag: move tag, value: move value }
+    cursor = end
+  } else {
+    let raw = run Bytes.copy(Slice.view<u8>(input, start, size))
+    data = RecordData.Unknown { kind: kind, data: move raw }
+    cursor = end
+  }
+  if cursor != end {
+    fail problem(MessageReason.BadRecordLength, start)
+  }
+  return move data
+}
+
+// The section that a record is read into.
+enum Section {
+  Answer,
+  Authority,
+  Additional,
+}
+
+impl Message {
+  /// Returns a message with `header` and empty sections, without EDNS.
+  pub fn make(header: Header) -> Message {
+    return Message {
+      header: header,
+      questions: List<Question>.make(),
+      answers: List<Record>.make(),
+      authorities: List<Record>.make(),
+      additionals: List<Record>.make(),
+      edns: Option<Edns>.none(),
+    }
+  }
+
+  /// Returns a standard query for `question`, with the RD bit on.
+  ///
+  /// # Details
+  /// With `udpPayloadSize`, the query has an EDNS(0) OPT record that tells the server the largest UDP
+  /// response the client accepts. 1232 bytes is a size that avoids IP fragmentation on most networks.
+  /// Without it, a UDP response has at most 512 bytes.
+  pub effect fn query(id: u16, question: Question, udpPayloadSize: Option<u16>) -> Message
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut message = Message.make(Header.query(id))
+    message.edns = match move udpPayloadSize {
+      Option<u16>.None => Option<Edns>.none()
+      Option<u16>.Some { value } => Option<Edns>.some(Edns.make(value))
+    }
+    run List<Question>.append(&mut message.questions, question)
+    return move message
+  }
+
+  /// Reads a whole message.
+  ///
+  /// # Details
+  /// The input must be one message, as in one UDP datagram, or one TCP message without its two-byte
+  /// length prefix. Bytes after the last record are ignored. An OPT record in the additional section
+  /// is read into `edns`, and its extended response code bits are added to the header.
+  ///
+  /// # Errors
+  /// - [`MessageError`] if the message is cut short, has a bad name or record, or has a bad OPT
+  ///   record. The offset is the position of the problem in `input`.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the sections.
+  pub effect fn parse(input: &[u8]) -> Message
+    ! MessageError | OutOfMemoryError
+    ? &mut Allocator {
+    let header = match Header.read(input) {
+      Result<Header, MessageError>.Success { value } => value
+      Result<Header, MessageError>.Failure { error } => {
+        fail error
+      }
+    }
+    let mut message = Message.make(header)
+    let questionCount = readU16(input, 4)
+    let answerCount = readU16(input, 6)
+    let authorityCount = readU16(input, 8)
+    let additionalCount = readU16(input, 10)
+    let mut cursor: usize = 12
+    let mut index: u16 = 0
+    while index < questionCount {
+      let name = run readName(input, &mut cursor)
+      run need(input, cursor, 4, input.length)
+      let question = Question {
+        name: name,
+        kind: readU16(input, cursor),
+        class: readU16(input, cursor + 2),
+      }
+      cursor = cursor + 4
+      run List<Question>.append(&mut message.questions, question)
+      index = index + 1
+    }
+    run readSection(input, &mut cursor, answerCount, Section.Answer, &mut message)
+    run readSection(input, &mut cursor, authorityCount, Section.Authority, &mut message)
+    run readSection(input, &mut cursor, additionalCount, Section.Additional, &mut message)
+    return move message
+  }
+
+  /// Writes the message in wire form at the end of `output`.
+  ///
+  /// # Details
+  /// Names are compressed where RFC 3597 allows it. When `edns` is set, an OPT record is written at
+  /// the end of the additional section, with the upper bits of the response code. The output is one
+  /// UDP payload; for TCP, write the two-byte length first.
+  ///
+  /// # Errors
+  /// - `TooLarge` if a section has more than 65535 entries, or the message is longer than 65535
+  ///   bytes.
+  /// - `StringTooLong` if a TXT, NAPTR or CAA string is longer than 255 bytes.
+  /// - `BadRecordLength` if the data of an `Unknown` record is longer than 65535 bytes.
+  /// - `BadResponseCode` if the response code is above 4095, or above 15 without `edns`.
+  /// - `OutOfMemoryError` if the `Allocator` cannot grow `output`.
+  ///
+  /// # Gotchas
+  /// On an error, `output` can hold part of the message. Truncate it to its old length to undo.
+  pub effect fn encode(self: &Self, output: &mut Bytes) -> ()
+    ! MessageError | OutOfMemoryError
+    ? &mut Allocator {
+    let base = Bytes.length(&output.*)
+    let mut writer = Encoder { base: base, offsets: List<usize>.make() }
+    let header = self.header
+    let hasEdns = Option<Edns>.isSome(&self.edns)
+    if header.responseCode > 4095 || (header.responseCode > 15 && !hasEdns) {
+      fail problem(MessageReason.BadResponseCode, 0)
+    }
+    let mut high = header.opcode % 16 * 8
+    if header.response {
+      high = high + 128
+    }
+    if header.authoritative {
+      high = high + 4
+    }
+    if header.truncated {
+      high = high + 2
+    }
+    if header.recursionDesired {
+      high = high + 1
+    }
+    let mut low = u16.toU8(header.responseCode % 16)
+    if header.recursionAvailable {
+      low = low + 128
+    }
+    if header.authenticData {
+      low = low + 32
+    }
+    if header.checkingDisabled {
+      low = low + 16
+    }
+    let mut additionalCount = List<Record>.length(&self.additionals)
+    if hasEdns {
+      additionalCount = additionalCount + 1
+    }
+    run writeU16(&mut output.*, header.id)
+    let flags = [high, low]
+    run Bytes.append(&mut output.*, &flags)
+    run writeCount(&mut output.*, List<Question>.length(&self.questions))
+    run writeCount(&mut output.*, List<Record>.length(&self.answers))
+    run writeCount(&mut output.*, List<Record>.length(&self.authorities))
+    run writeCount(&mut output.*, additionalCount)
+    let questions = List<Question>.asSlice(&self.questions)
+    let mut index: usize = 0
+    while index < questions.length {
+      run Encoder.name(&mut writer, &mut output.*, &questions[index].name, true)
+      run writeU16(&mut output.*, questions[index].kind)
+      run writeU16(&mut output.*, questions[index].class)
+      index = index + 1
+    }
+    run writeRecords(&mut writer, &mut output.*, List<Record>.asSlice(&self.answers))
+    run writeRecords(&mut writer, &mut output.*, List<Record>.asSlice(&self.authorities))
+    run writeRecords(&mut writer, &mut output.*, List<Record>.asSlice(&self.additionals))
+    match &self.edns {
+      Option<Edns>.None => {}
+      Option<Edns>.Some { value: edns } => {
+        let root: [u8; 1] = [0]
+        run Bytes.append(&mut output.*, &root)
+        run writeU16(&mut output.*, TYPE_OPT)
+        run writeU16(&mut output.*, edns.udpPayloadSize)
+        let mut extended: [u8; 4] = [u16.toU8(header.responseCode / 16), edns.version, 0, 0]
+        if edns.dnssecOk {
+          extended[2] = 128
+        }
+        run Bytes.append(&mut output.*, &extended)
+        let lengthAt = Bytes.length(&output.*)
+        run writeU16(&mut output.*, 0)
+        let options = List<EdnsOption>.asSlice(&edns.options)
+        let mut at: usize = 0
+        while at < options.length {
+          if Bytes.length(&options[at].data) > 65535 {
+            fail problem(MessageReason.BadRecordLength, Bytes.length(&output.*) - base)
+          }
+          run writeU16(&mut output.*, options[at].code)
+          run writeU16(&mut output.*, usize.toU16(Bytes.length(&options[at].data)))
+          run Bytes.append(&mut output.*, Bytes.asSlice(&options[at].data))
+          at = at + 1
+        }
+        run patchLength(&mut output.*, lengthAt, base)
+      }
+    }
+    if Bytes.length(&output.*) - base > 65535 {
+      fail problem(MessageReason.TooLarge, Bytes.length(&output.*) - base)
+    }
+  }
+}
+
+effect fn readSection(
+  input: &[u8],
+  cursor: &mut usize,
+  count: u16,
+  section: Section,
+  message: &mut Message,
+) -> ()
+  ! MessageError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut index: u16 = 0
+  while index < count {
+    let start = cursor.*
+    let name = run readName(input, &mut cursor.*)
+    run need(input, cursor.*, 10, input.length)
+    let kind = readU16(input, cursor.*)
+    let class = readU16(input, cursor.* + 2)
+    let ttl = readU32(input, cursor.* + 4)
+    let size = u16.toUsize(readU16(input, cursor.* + 8))
+    let dataAt = cursor.* + 10
+    run need(input, dataAt, size, input.length)
+    cursor.* = dataAt + size
+    index = index + 1
+    if kind == TYPE_OPT {
+      let isAdditional = match section {
+        Section.Additional => true
+        _ => false
+      }
+      if !isAdditional || !Name.isRoot(&name) || Option<Edns>.isSome(&message.edns) {
+        fail problem(MessageReason.BadOpt, start)
+      }
+      let mut edns = Edns.make(class)
+      edns.version = u32.toU8((ttl / 65536) % 256)
+      edns.dnssecOk = (ttl / 32768) % 2 == 1
+      message.header.responseCode = message.header.responseCode + u32.toU16(ttl / 16777216) * 16
+      let mut at = dataAt
+      while at < dataAt + size {
+        run need(input, at, 4, dataAt + size)
+        let code = readU16(input, at)
+        let length = u16.toUsize(readU16(input, at + 2))
+        run need(input, at + 4, length, dataAt + size)
+        let data = run Bytes.copy(Slice.view<u8>(input, at + 4, length))
+        run List<EdnsOption>.append(&mut edns.options, EdnsOption { code: code, data: move data })
+        at = at + 4 + length
+      }
+      message.edns = Option<Edns>.some(move edns)
+      continue
+    }
+    let data = run readData(input, kind, dataAt, size)
+    let record = Record { name: name, class: class, ttl: ttl, data: move data }
+    match section {
+      Section.Answer => run List<Record>.append(&mut message.answers, move record)
+      Section.Authority => run List<Record>.append(&mut message.authorities, move record)
+      Section.Additional => run List<Record>.append(&mut message.additionals, move record)
+    }
+  }
+}
+
+// The state of one `Message.encode` call: where the message starts in the output, and where each
+// written name suffix starts, for compression.
+struct Encoder {
+  base: usize,
+  offsets: List<usize>,
+}
+
+effect fn writeU16(output: &mut Bytes, value: u16) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let bytes = [u16.toU8(value / 256), u16.toU8(value % 256)]
+  run Bytes.append(&mut output.*, &bytes)
+}
+
+effect fn writeU32(output: &mut Bytes, value: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let bytes = [
+    u32.toU8(value / 16777216),
+    u32.toU8((value / 65536) % 256),
+    u32.toU8((value / 256) % 256),
+    u32.toU8(value % 256),
+  ]
+  run Bytes.append(&mut output.*, &bytes)
+}
+
+effect fn writeCount(output: &mut Bytes, count: usize) -> ()
+  ! MessageError | OutOfMemoryError
+  ? &mut Allocator {
+  if count > 65535 {
+    fail problem(MessageReason.TooLarge, Bytes.length(&output.*))
+  }
+  run writeU16(&mut output.*, usize.toU16(count))
+}
+
+effect fn writeString(output: &mut Bytes, value: &[u8], base: usize) -> ()
+  ! MessageError | OutOfMemoryError
+  ? &mut Allocator {
+  if value.length > 255 {
+    fail problem(MessageReason.StringTooLong, Bytes.length(&output.*) - base)
+  }
+  let size = [usize.toU8(value.length)]
+  run Bytes.append(&mut output.*, &size)
+  run Bytes.append(&mut output.*, value)
+}
+
+// Writes the length of the record data that starts after the two bytes at `lengthAt`.
+effect fn patchLength(output: &mut Bytes, lengthAt: usize, base: usize) -> ()
+  ! MessageError {
+  let size = Bytes.length(&output.*) - lengthAt - 2
+  if size > 65535 {
+    fail problem(MessageReason.TooLarge, lengthAt - base)
+  }
+  let bytes = Bytes.asMutSlice(&mut output.*)
+  bytes[lengthAt] = usize.toU8(size / 256)
+  bytes[lengthAt + 1] = usize.toU8(size % 256)
+}
+
+// Returns `true` if the name in `message` at `at`, with its pointers followed, equals the wire name
+// suffix `suffix`, without case.
+fn suffixAt(message: &[u8], at: usize, suffix: &[u8]) -> bool {
+  let mut position = at
+  let mut index: usize = 0
+  while true {
+    let byte = message[position]
+    if byte >= 192 {
+      position = u8.toUsize(byte - 192) * 256 + u8.toUsize(message[position + 1])
+      continue
+    }
+    if byte != suffix[index] {
+      return false
+    }
+    if byte == 0 {
+      return true
+    }
+    let size = u8.toUsize(byte)
+    let mut offset: usize = 1
+    while offset <= size {
+      if foldByte(message[position + offset]) != foldByte(suffix[index + offset]) {
+        return false
+      }
+      offset = offset + 1
+    }
+    position = position + size + 1
+    index = index + size + 1
+  }
+  return false
+}
+
+impl Encoder {
+  // Writes `name`, as a pointer to an earlier copy of its longest known suffix when `compress` is on.
+  // Each new suffix that starts within the first 16384 bytes of the message is remembered.
+  effect fn name(self: &mut Self, output: &mut Bytes, name: &Name, compress: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let wire = Name.wire(name)
+    let mut at: usize = 0
+    while wire[at] != 0 {
+      let suffix = Slice.view<u8>(wire, at, wire.length - at)
+      if compress {
+        let written = Slice.view<u8>(
+          Bytes.asSlice(&output.*),
+          self.base,
+          Bytes.length(&output.*) - self.base,
+        )
+        let offsets = List<usize>.asSlice(&self.offsets)
+        let mut index: usize = 0
+        while index < offsets.length {
+          if suffixAt(written, offsets[index], suffix) {
+            let pointer = [usize.toU8(192 + offsets[index] / 256), usize.toU8(offsets[index] % 256)]
+            run Bytes.append(&mut output.*, &pointer)
+            return ()
+          }
+          index = index + 1
+        }
+      }
+      let position = Bytes.length(&output.*) - self.base
+      if position < 16384 {
+        run List<usize>.append(&mut self.offsets, position)
+      }
+      let size = u8.toUsize(wire[at])
+      run Bytes.append(&mut output.*, Slice.view<u8>(wire, at, size + 1))
+      at = at + size + 1
+    }
+    let root: [u8; 1] = [0]
+    run Bytes.append(&mut output.*, &root)
+  }
+}
+
+effect fn writeRecords(writer: &mut Encoder, output: &mut Bytes, records: &[Record]) -> ()
+  ! MessageError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut index: usize = 0
+  while index < records.length {
+    let record = &records[index]
+    run Encoder.name(&mut writer.*, &mut output.*, &record.name, true)
+    run writeU16(&mut output.*, RecordData.kind(&record.data))
+    run writeU16(&mut output.*, record.class)
+    run writeU32(&mut output.*, record.ttl)
+    let lengthAt = Bytes.length(&output.*)
+    run writeU16(&mut output.*, 0)
+    let base = writer.base
+    match &record.data {
+      RecordData.A { address } => run Bytes.append(&mut output.*, &Ipv4Address.octets(&address))
+      RecordData.Aaaa { address } => run Bytes.append(&mut output.*, &Ipv6Address.octets(&address))
+      RecordData.Ns { server } => run Encoder.name(&mut writer.*, &mut output.*, &server, true)
+      RecordData.Cname { target } => run Encoder.name(&mut writer.*, &mut output.*, &target, true)
+      RecordData.Ptr { target } => run Encoder.name(&mut writer.*, &mut output.*, &target, true)
+      RecordData.Mx { preference, exchange } => {
+        run writeU16(&mut output.*, preference)
+        run Encoder.name(&mut writer.*, &mut output.*, &exchange, true)
+      }
+      RecordData.Txt { strings } => {
+        let values = List<Bytes>.asSlice(&strings)
+        let mut at: usize = 0
+        while at < values.length {
+          run writeString(&mut output.*, Bytes.asSlice(&values[at]), base)
+          at = at + 1
+        }
+      }
+      RecordData.Srv { priority, weight, port, target } => {
+        run writeU16(&mut output.*, priority)
+        run writeU16(&mut output.*, weight)
+        run writeU16(&mut output.*, port)
+        run Encoder.name(&mut writer.*, &mut output.*, &target, false)
+      }
+      RecordData.Soa { primary, mailbox, serial, refresh, retry, expire, minimum } => {
+        run Encoder.name(&mut writer.*, &mut output.*, &primary, true)
+        run Encoder.name(&mut writer.*, &mut output.*, &mailbox, true)
+        run writeU32(&mut output.*, serial)
+        run writeU32(&mut output.*, refresh)
+        run writeU32(&mut output.*, retry)
+        run writeU32(&mut output.*, expire)
+        run writeU32(&mut output.*, minimum)
+      }
+      RecordData.Naptr { order, preference, flags, services, regexp, replacement } => {
+        run writeU16(&mut output.*, order)
+        run writeU16(&mut output.*, preference)
+        run writeString(&mut output.*, Bytes.asSlice(&flags), base)
+        run writeString(&mut output.*, Bytes.asSlice(&services), base)
+        run writeString(&mut output.*, Bytes.asSlice(&regexp), base)
+        run Encoder.name(&mut writer.*, &mut output.*, &replacement, false)
+      }
+      RecordData.Tlsa { usage, selector, matchingType, data } => {
+        let fields = [usage, selector, matchingType]
+        run Bytes.append(&mut output.*, &fields)
+        run Bytes.append(&mut output.*, Bytes.asSlice(&data))
+      }
+      RecordData.Caa { flags, tag, value } => {
+        let flag = [flags]
+        run Bytes.append(&mut output.*, &flag)
+        run writeString(&mut output.*, Bytes.asSlice(&tag), base)
+        run Bytes.append(&mut output.*, Bytes.asSlice(&value))
+      }
+      RecordData.Unknown { data, .. } => run Bytes.append(&mut output.*, Bytes.asSlice(&data))
+    }
+    run patchLength(&mut output.*, lengthAt, base)
+    index = index + 1
+  }
+}

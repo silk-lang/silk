@@ -45,6 +45,21 @@ one byte.
 
 Release a successful result exactly once with `WindowsHeap.release`, after all access ends.
 
+<a id="WindowsHeap.impl.acquireZeroed"></a>
+
+### Associated function `acquireZeroed`
+
+```silk
+pub fn acquireZeroed(size: usize) -> ?*mut u8
+```
+
+Returns storage aligned to 16 bytes whose bytes all start as zero, or null on failure. A
+zero size allocates one byte.
+
+#### Gotchas
+
+Release a successful result exactly once with `WindowsHeap.release`, after all access ends.
+
 <a id="WindowsHeap.impl.release"></a>
 
 ### Associated function `release`
@@ -69,6 +84,22 @@ pub effect fn allocate(layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryErro
 ```
 
 Returns owned storage for `layout`, including alignments greater than 16 bytes.
+
+#### Errors
+
+- `OutOfMemoryError` if alignment is invalid, size arithmetic overflows, or the heap refuses
+  storage.
+
+<a id="WindowsHeap.impl.allocateZeroed"></a>
+
+### Associated function `allocateZeroed`
+
+```silk
+pub effect fn allocateZeroed(layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError
+```
+
+Returns owned storage for `layout` whose bytes all start as zero, including alignments
+greater than 16 bytes.
 
 #### Errors
 

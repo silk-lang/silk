@@ -1,0 +1,328 @@
+//! Derive keys from passwords with scrypt (RFC 7914), a memory-hard function.
+//!
+//! # When to use
+//! Use [`Scrypt.derive`] to hash a password for storage or to turn a password into an encryption
+//! key, or when a format names scrypt, such as `crypto.scrypt` in Node.js. Use
+//! `silk.crypto.pbkdf2` when a format names PBKDF2.
+//!
+//! # Details
+//! The cost `N` (a power of two above 1), the block size `r`, and the parallelism `p` set the work.
+//! scrypt allocates 128 * `r` * (`N` + `p` + 2) bytes through the ambient `Allocator`, which
+//! [`Scrypt.memoryLength`] returns before the call, and frees them before it returns. Common
+//! settings are `N` = 16384, `r` = 8, `p` = 1, which use 16 MiB. The output can have any length up
+//! to (2^32 - 1) * 32 bytes.
+//!
+//! # Errors
+//! [`Scrypt.derive`] fails with a [`ScryptError`] for parameters that RFC 7914 does not allow, and
+//! with `OutOfMemoryError` when the allocator cannot supply the memory. On an error `output` does
+//! not change.
+//!
+//! # Gotchas
+//! The memory grows with `N` and `r`, so parameters that an attacker controls can exhaust memory.
+//! Check [`Scrypt.memoryLength`] against a limit first, as Node.js does with `maxmem`. The function
+//! does not erase the password or its memory.
+//!
+//! # Examples
+//! ## Derive a key
+//! ```silk
+//! import silk.crypto.scrypt { Scrypt, ScryptError }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//!
+//! effect fn derive() -> i32 ! OutOfMemoryError | ScryptError ? &mut Allocator {
+//!   let mut key: [u8; 64] = [0; 64]
+//!   run Scrypt.derive(b"password", b"NaCl", 1024, 8, 16, &mut key)
+//!   // RFC 7914 section 12: this key starts with fdbabe1c.
+//!   if key[0] != 0xfd || key[1] != 0xba || key[2] != 0xbe || key[3] != 0x1c {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//!
+//! pub effect fn main() -> i32 ! OutOfMemoryError | ScryptError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   return run derive() |> Effect.provideMut<Allocator>(&mut allocator)
+//! }
+//! ```
+//!
+//! @category Cryptography
+
+import silk.text.format { Debug, Format, Formatter }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.crypto.pbkdf2 { Pbkdf2, Pbkdf2Error }
+import silk.crypto.sha2 { Sha256 }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.io.writer { Writer, WriterError }
+
+/// The reason that [`Scrypt.derive`] rejected its parameters. The output does not change.
+pub union ScryptError {
+  /// The cost `N` is not a power of two above 1, or it is not below 2^(16 * `r`).
+  InvalidCost,
+  /// The block size `r` is 0, or `r` * `p` is not below 2^30.
+  InvalidBlockSize,
+  /// The parallelism `p` is 0, or above (2^32 - 1) * 32 / (128 * `r`).
+  InvalidParallelism,
+  /// The output is longer than (2^32 - 1) * 32 bytes, or the memory does not fit in an address.
+  OutputTooLong,
+}
+
+impl Debug for ScryptError {
+  /// Writes the name of the variant, such as `InvalidCost`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      ScryptError.InvalidCost => run Format.write(&mut formatter, b"InvalidCost")
+      ScryptError.InvalidBlockSize => run Format.write(&mut formatter, b"InvalidBlockSize")
+      ScryptError.InvalidParallelism => run Format.write(&mut formatter, b"InvalidParallelism")
+      ScryptError.OutputTooLong => run Format.write(&mut formatter, b"OutputTooLong")
+    }
+  }
+}
+
+/// Functions that derive keys from passwords with scrypt (RFC 7914).
+///
+/// # When to use
+///
+/// Use [`Scrypt.derive`] to hash a password for storage or to derive a key from a password. Check
+/// [`Scrypt.memoryLength`] first when the parameters come from outside the program.
+pub struct Scrypt {}
+
+impl Scrypt {
+  /// Returns the number of bytes that [`Scrypt.derive`] allocates for cost `cost`, block size
+  /// `blockSize`, and parallelism `parallelism`: 128 * `r` * (`N` + `p` + 2).
+  ///
+  /// Returns `None` if the product does not fit in a `u64`. It does not check the other
+  /// parameter rules.
+  pub fn memoryLength(cost: u64, blockSize: u32, parallelism: u32) -> Option<u64> {
+    let blocks = u64.checkedAdd(cost, u32.toU64(parallelism) + 2)
+    if let Option.Some { value } = blocks {
+      if let Option.Some { value: words } = u64.checkedMultiply(value, u32.toU64(blockSize)) {
+        return u64.checkedMultiply(words, 128)
+      }
+    }
+    return Option<u64>.none()
+  }
+
+  /// Fills `output` with the scrypt key of `password` and `salt` for cost `cost` (`N`), block size
+  /// `blockSize` (`r`), and parallelism `parallelism` (`p`).
+  ///
+  /// Any password and salt length is valid, also 0. A shorter output is a prefix of a longer one.
+  /// It allocates [`Scrypt.memoryLength`] bytes through the ambient `Allocator` and frees them
+  /// before it returns.
+  ///
+  /// # Errors
+  ///
+  /// On an error, `output` does not change.
+  ///
+  /// - `ScryptError.InvalidCost` if `cost` is not a power of two above 1, or not below
+  ///   2^(16 * `blockSize`).
+  /// - `ScryptError.InvalidBlockSize` if `blockSize` is 0 or `blockSize` * `parallelism` is not
+  ///   below 2^30.
+  /// - `ScryptError.InvalidParallelism` if `parallelism` is 0 or above
+  ///   (2^32 - 1) * 32 / (128 * `blockSize`).
+  /// - `ScryptError.OutputTooLong` if `output` is longer than (2^32 - 1) * 32 bytes, or the memory
+  ///   does not fit in an address.
+  /// - `OutOfMemoryError` if the allocator cannot supply the memory.
+  ///
+  /// # Gotchas
+  ///
+  /// The memory and time grow with `cost` and `blockSize`. The function does not erase the
+  /// password or its memory.
+  pub effect fn derive(
+    password: &[u8],
+    salt: &[u8],
+    cost: u64,
+    blockSize: u32,
+    parallelism: u32,
+    output: &mut [u8],
+  ) -> ()
+    ! OutOfMemoryError | ScryptError
+    ? &mut Allocator {
+    if blockSize == 0
+      || u64.wrappingMultiply(u32.toU64(blockSize), u32.toU64(parallelism)) >= 1073741824 {
+      fail ScryptError.InvalidBlockSize
+    }
+    if cost < 2 || u64.bitAnd(cost, cost - 1) != 0 {
+      fail ScryptError.InvalidCost
+    }
+
+    // N < 2^(128 * r / 8): only blocks of fewer than four 128-byte units restrict a u64 cost.
+    if blockSize < 4 && u64.shiftRight(cost, u32.toU64(16 * blockSize)) != 0 {
+      fail ScryptError.InvalidCost
+    }
+    if parallelism == 0 || u32.toU64(parallelism) * 128 * u32.toU64(blockSize) > 137438953440 {
+      fail ScryptError.InvalidParallelism
+    }
+    if usize.toU64(output.length) > 137438953440 {
+      fail ScryptError.OutputTooLong
+    }
+    let words = 32 * u32.toUsize(blockSize)
+    let mixed = Scrypt.memoryLength(cost, blockSize, parallelism)
+    if let Option.Some { value } = mixed {
+      if value > usize.toU64(usize.MAX) {
+        fail ScryptError.OutputTooLong
+      }
+    } else {
+      fail ScryptError.OutputTooLong
+    }
+    let count = u64.toUsize(cost)
+    let mut blocks = List<u8>.make()
+    run List<u8>.appendRepeated(&mut blocks, 0, 4 * words * u32.toUsize(parallelism))
+    let mut table = List<u32>.make()
+    run List<u32>.appendRepeated(&mut table, 0, words * count + 2 * words)
+    expand(password, salt, List<u8>.asMutSlice(&mut blocks))
+    let mut lane: usize = 0
+    while lane < u32.toUsize(parallelism) {
+      mix(
+        List<u8>.asMutSlice(&mut blocks),
+        lane * 4 * words,
+        words,
+        count,
+        List<u32>.asMutSlice(&mut table),
+      )
+      lane = lane + 1
+    }
+    expand(password, List<u8>.asSlice(&blocks), move output)
+  }
+}
+
+// PBKDF2-HMAC-SHA-256 with one iteration, which cannot fail for the lengths scrypt admits.
+fn expand(password: &[u8], salt: &[u8], output: &mut [u8]) -> () {
+  if let Result.Failure { error: _ } = Pbkdf2.derive<Sha256>(password, salt, 1, move output) {
+    Intrinsic.trap("Scrypt: PBKDF2 lengths were checked")
+  }
+}
+
+fn load(bytes: &[u8], offset: usize) -> u32 {
+  return u32.bitOr(
+    u32.bitOr(u8.toU32(bytes[offset]), u32.shiftLeft(u8.toU32(bytes[offset + 1]), 8)),
+    u32.bitOr(
+      u32.shiftLeft(u8.toU32(bytes[offset + 2]), 16),
+      u32.shiftLeft(u8.toU32(bytes[offset + 3]), 24),
+    ),
+  )
+}
+
+fn store(bytes: &mut [u8], offset: usize, value: u32) -> () {
+  bytes[offset] = u32.toU8(u32.bitAnd(value, 255))
+  bytes[offset + 1] = u32.toU8(u32.bitAnd(u32.shiftRight(value, 8), 255))
+  bytes[offset + 2] = u32.toU8(u32.bitAnd(u32.shiftRight(value, 16), 255))
+  bytes[offset + 3] = u32.toU8(u32.shiftRight(value, 24))
+}
+
+fn quarter(x: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) -> () {
+  x[b] = u32.bitXor(x[b], u32.rotateLeft(u32.wrappingAdd(x[a], x[d]), 7))
+  x[c] = u32.bitXor(x[c], u32.rotateLeft(u32.wrappingAdd(x[b], x[a]), 9))
+  x[d] = u32.bitXor(x[d], u32.rotateLeft(u32.wrappingAdd(x[c], x[b]), 13))
+  x[a] = u32.bitXor(x[a], u32.rotateLeft(u32.wrappingAdd(x[d], x[c]), 18))
+}
+
+// Salsa20/8 core of RFC 7914 section 3 on `block`, in place.
+fn salsa(block: &mut [u32; 16]) -> () {
+  let mut x = block.*
+  let mut round: usize = 0
+  while round < 4 {
+    quarter(&mut x, 0, 4, 8, 12)
+    quarter(&mut x, 5, 9, 13, 1)
+    quarter(&mut x, 10, 14, 2, 6)
+    quarter(&mut x, 15, 3, 7, 11)
+    quarter(&mut x, 0, 1, 2, 3)
+    quarter(&mut x, 5, 6, 7, 4)
+    quarter(&mut x, 10, 11, 8, 9)
+    quarter(&mut x, 15, 12, 13, 14)
+    round = round + 1
+  }
+  let mut index: usize = 0
+  while index < 16 {
+    block[index] = u32.wrappingAdd(block[index], x[index])
+    index = index + 1
+  }
+}
+
+// scryptBlockMix of RFC 7914 section 4: mixes the `words` words at `from` in `table` into the
+// `words` words at `to`. The even 64-byte blocks of the result go first, then the odd ones.
+fn blockMix(table: &mut [u32], from: usize, to: usize, words: usize) -> () {
+  let mut x: [u32; 16] = [0; 16]
+  let mut index: usize = 0
+  while index < 16 {
+    x[index] = table[from + words - 16 + index]
+    index = index + 1
+  }
+  let half = words / 2
+  let mut block: usize = 0
+  while block < words / 16 {
+    index = 0
+    while index < 16 {
+      x[index] = u32.bitXor(x[index], table[from + block * 16 + index])
+      index = index + 1
+    }
+    salsa(&mut x)
+    let target = to + (block % 2) * half + (block / 2) * 16
+    index = 0
+    while index < 16 {
+      table[target + index] = x[index]
+      index = index + 1
+    }
+    block = block + 1
+  }
+}
+
+// scryptROMix of RFC 7914 section 5 on the block of `words` words at byte `offset` of `blocks`.
+// `table` holds `count` blocks of V followed by the two working blocks X and Y.
+fn mix(blocks: &mut [u8], offset: usize, words: usize, count: usize, table: &mut [u32]) -> () {
+  let x = count * words
+  let y = x + words
+  let mut index: usize = 0
+  while index < words {
+    table[x + index] = load(&blocks, offset + index * 4)
+    index = index + 1
+  }
+  let mut step: usize = 0
+  while step < count {
+    index = 0
+    while index < words {
+      table[step * words + index] = table[x + index]
+      index = index + 1
+    }
+    blockMix(&mut table, x, y, words)
+    index = 0
+    while index < words {
+      table[x + index] = table[y + index]
+      index = index + 1
+    }
+    step = step + 1
+  }
+  let mask = usize.toU64(count - 1)
+  step = 0
+  while step < count {
+    // Integerify: the first 64 bits of the last 64-byte block, reduced modulo the power of two.
+    let low = u32.toU64(table[x + words - 16])
+    let high = u32.toU64(table[x + words - 15])
+    let selected = u64.toUsize(u64.bitAnd(u64.bitOr(low, u64.shiftLeft(high, 32)), mask))
+    index = 0
+    while index < words {
+      table[x + index] = u32.bitXor(table[x + index], table[selected * words + index])
+      index = index + 1
+    }
+    blockMix(&mut table, x, y, words)
+    index = 0
+    while index < words {
+      table[x + index] = table[y + index]
+      index = index + 1
+    }
+    step = step + 1
+  }
+  index = 0
+  while index < words {
+    store(&mut blocks, offset + index * 4, table[x + index])
+    index = index + 1
+  }
+}
