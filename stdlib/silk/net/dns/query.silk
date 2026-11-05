@@ -1,0 +1,509 @@
+//! Send one DNS question to the servers of a configuration, with retries and TCP fallback, without
+//! doing any input or output.
+//!
+//! # When to use
+//! Use an [`Exchange`] to drive a query from your own sockets and timers, for example in an event
+//! loop. For a plain native program, `silk.net.dns.client_native` drives an `Exchange` with system
+//! sockets.
+//!
+//! # Details
+//! Make an exchange with [`Exchange.make`], then loop:
+//!
+//! 1. Call [`Exchange.poll`] with the time of a `MonotonicClock`.
+//! 2. For `Step.Send`, send [`Exchange.packet`] to the server of the step: as one UDP datagram, or on
+//!    a new TCP connection, where the packet already has its two-byte length.
+//! 3. For `Step.Wait`, wait for a reply or until the time of the step, whichever is first. Give each
+//!    UDP datagram from a server, and each whole TCP message, to [`Exchange.receive`]. Tell
+//!    [`Exchange.transportFailed`] when a send fails or a TCP connection breaks.
+//! 4. For `Step.Done`, call [`Exchange.finish`] for the result.
+//!
+//! The exchange tries each server in turn, for `attempts` rounds. It waits `timeout` for each server
+//! in the first round, and doubles the wait in each later round, up to 8 times `timeout`. A reply with
+//! the TC bit is asked again over TCP from the same server. A server that answers SERVFAIL, NOTIMP or
+//! REFUSED is skipped at once. A FORMERR answer to a query with EDNS is asked again without EDNS.
+//! A late UDP answer from a server that was asked before is accepted.
+//!
+//! # Gotchas
+//! The exchange checks the identifier and the question of each reply, but it cannot see where a
+//! datagram came from. Use one connected UDP socket for each server, or check the source address
+//! yourself, and give only datagrams from a server of the configuration.
+//!
+//! @category Networking
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.text.format { Debug, Format, Formatter }
+import silk.io.writer { Writer, WriterError }
+import silk.core.ownership { Copy }
+import silk.net.address { Endpoint }
+import silk.net.dns.config { ResolverConfig }
+import silk.net.dns.message {
+  Header,
+  Message,
+  MessageError,
+  MessageReason,
+  Question,
+  RCODE_FORMAT_ERROR,
+  RCODE_NOT_IMPLEMENTED,
+  RCODE_REFUSED,
+  RCODE_SERVER_FAILURE,
+}
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.system_clock { Instant, SystemClock }
+import silk.num.u16
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+
+/// The UDP payload size that queries with EDNS announce: 1232 bytes, which avoids IP fragmentation on
+/// most networks.
+pub const EDNS_PAYLOAD_SIZE: u16 = 1232
+
+/// How a packet goes to a server.
+pub enum Transport {
+  /// One UDP datagram.
+  Udp,
+  /// A TCP connection. The packet starts with its length in two bytes.
+  Tcp,
+}
+
+
+impl Debug for Transport {
+  /// Writes the name of the variant, such as `Udp`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      Transport.Udp => run Format.write(&mut formatter, b"Udp")
+      Transport.Tcp => run Format.write(&mut formatter, b"Tcp")
+    }
+  }
+}
+
+/// What the owner of an [`Exchange`] must do next.
+pub union Step {
+  /// Send [`Exchange.packet`] for `transport` to `endpoint`, then call [`Exchange.poll`] again.
+  Send {
+    /// The position of the server in the configuration.
+    pub server: usize,
+    /// The address of the server.
+    pub endpoint: Endpoint,
+    /// How to send the packet.
+    pub transport: Transport,
+  },
+  /// Wait for a reply until `until`, then call [`Exchange.poll`] again.
+  Wait {
+    /// The time on the `MonotonicClock` at which the current try ends.
+    pub until: Instant,
+  },
+  /// The exchange has a result. Call [`Exchange.finish`].
+  Done,
+}
+
+/// A query that failed.
+pub union QueryError {
+  /// The configuration has no servers.
+  NoServers,
+  /// No server answered before the last try ended.
+  Timeout,
+  /// The last server that answered refused the query, with SERVFAIL, NOTIMP, REFUSED or FORMERR.
+  Rejected {
+    /// The response code, such as `RCODE_SERVER_FAILURE`.
+    pub responseCode: u16,
+    /// The position of the server in the configuration.
+    pub server: usize,
+  },
+  /// The last server that answered over TCP sent a message that cannot be read, or that does not
+  /// answer the question.
+  BadResponse {
+    /// The problem in the message.
+    pub reason: MessageReason,
+    /// The position of the server in the configuration.
+    pub server: usize,
+  },
+  /// A send to the last server failed, or its TCP connection broke, as [`Exchange.transportFailed`] reported.
+  Unreachable {
+    /// The position of the server in the configuration.
+    pub server: usize,
+  },
+}
+
+impl Copy for QueryError {}
+
+impl Debug for QueryError {
+  /// Writes the name of the variant and its fields, such as `Rejected { ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      QueryError.NoServers => run Format.write(&mut formatter, b"NoServers")
+      QueryError.Timeout => run Format.write(&mut formatter, b"Timeout")
+      QueryError.Rejected { responseCode, server } => {
+        let mut record = run Format.debugRecord("Rejected", &mut formatter)
+        run Format.debugField(&mut record, "responseCode", &responseCode, &mut formatter)
+        run Format.debugField(&mut record, "server", &server, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      QueryError.BadResponse { reason, server } => {
+        let mut record = run Format.debugRecord("BadResponse", &mut formatter)
+        run Format.debugField(&mut record, "reason", &reason, &mut formatter)
+        run Format.debugField(&mut record, "server", &server, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      QueryError.Unreachable { server } => {
+        let mut record = run Format.debugRecord("Unreachable", &mut formatter)
+        run Format.debugField(&mut record, "server", &server, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+    }
+  }
+}
+
+/// The answer to a query.
+pub struct Reply {
+  /// The message that the server sent.
+  pub message: Message,
+  /// The message as it was on the wire, without the TCP length.
+  pub bytes: Bytes,
+  /// The position of the server in the configuration.
+  pub server: usize,
+  /// How the message came.
+  pub transport: Transport,
+}
+
+/// What [`Exchange.receive`] did with a message.
+pub enum Receipt {
+  /// The message answers the query. [`Exchange.poll`] now returns `Step.Done`.
+  Answer,
+  /// The message made the exchange retry: over TCP, without EDNS, or at the next server.
+  Retry,
+  /// The message is not for this query, or came when no reply was expected from that server. It
+  /// changed nothing.
+  Ignored,
+}
+
+
+// Where the exchange is.
+union Phase {
+  // The next try must be sent.
+  Ready,
+  // A query was sent to `server` and waits for an answer until `until`.
+  Waiting { server: usize, transport: Transport, until: Instant },
+  // The result is ready.
+  Finished,
+}
+
+/// One question sent to the servers of a configuration. See the module documentation for the
+/// protocol.
+pub struct Exchange {
+  servers: List<Endpoint>,
+  // `true` for each server that was sent a UDP query, whose late answer is accepted.
+  askedUdp: List<bool>,
+  question: Question,
+  id: u16,
+  timeout: u64,
+  attempts: usize,
+  first: usize,
+  // Tries made so far: the server of the current try is `(first + tries) % servers.length`, in round
+  // `tries / servers.length`.
+  tries: usize,
+  edns: bool,
+  // A transport to use for the next try instead of the configured one, after a TC answer.
+  tcpServer: Option<usize>,
+  useTcp: bool,
+  udpPacket: Bytes,
+  tcpPacket: Bytes,
+  phase: Phase,
+  reply: Option<Reply>,
+  problem: Option<QueryError>,
+}
+
+fn reached(now: &Instant, deadline: &Instant) -> bool {
+  let nowSeconds = SystemClock.seconds(now)
+  let deadlineSeconds = SystemClock.seconds(deadline)
+  if nowSeconds != deadlineSeconds { return nowSeconds > deadlineSeconds }
+  return SystemClock.nanoseconds(now) >= SystemClock.nanoseconds(deadline)
+}
+
+fn copyInstant(value: &Instant) -> Instant {
+  return SystemClock.make(SystemClock.seconds(value), SystemClock.nanoseconds(value))
+}
+
+effect fn encodePackets(self: &mut Exchange) -> () ! MessageError | OutOfMemoryError ? &mut Allocator {
+  let mut size = Option<u16>.none()
+  if self.edns { size = Option<u16>.some(EDNS_PAYLOAD_SIZE) }
+  let query = run Message.query(self.id, self.question, move size)
+  Bytes.clear(&mut self.udpPacket)
+  run Message.encode(&query, &mut self.udpPacket)
+  Bytes.clear(&mut self.tcpPacket)
+  let length = Bytes.length(&self.udpPacket)
+  let prefix = [usize.toU8(length / 256), usize.toU8(length % 256)]
+  run Bytes.append(&mut self.tcpPacket, &prefix)
+  run Bytes.append(&mut self.tcpPacket, Bytes.asSlice(&self.udpPacket))
+}
+
+impl Exchange {
+  /// Returns an exchange that asks `question` with the identifier `id`.
+  ///
+  /// # Details
+  /// The exchange uses the servers, `timeout`, `attempts`, `edns` and `useTcp` of `config`, and starts
+  /// at server `first`, modulo the number of servers. To follow the `rotate` option, give a different
+  /// `first` to each query. Take `id` from a `Random` provider, so that an attacker cannot guess it.
+  ///
+  /// # Errors
+  /// - `MessageError` if the query does not fit in a message, which happens only for a wrong class
+  ///   or type.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the packets.
+  pub effect fn make(config: &ResolverConfig, question: Question, id: u16, first: usize) -> Exchange
+    ! MessageError | OutOfMemoryError
+    ? &mut Allocator {
+    let servers = List<Endpoint>.asSlice(&config.servers)
+    let mut ownServers = run List<Endpoint>.makeWithCapacity(servers.length)
+    let mut asked = run List<bool>.makeWithCapacity(servers.length)
+    let mut index: usize = 0
+    while index < servers.length {
+      run List<Endpoint>.append(&mut ownServers, servers[index])
+      run List<bool>.append(&mut asked, false)
+      index = index + 1
+    }
+    let mut start: usize = 0
+    if servers.length > 0 { start = first % servers.length }
+    let mut attempts = config.attempts
+    if attempts == 0 { attempts = 1 }
+    let mut exchange = Exchange {
+      servers: move ownServers,
+      askedUdp: move asked,
+      question: question,
+      id: id,
+      timeout: config.timeout,
+      attempts: attempts,
+      first: start,
+      tries: 0,
+      edns: config.edns,
+      tcpServer: Option<usize>.none(),
+      useTcp: config.useTcp,
+      udpPacket: Bytes.make(),
+      tcpPacket: Bytes.make(),
+      phase: Phase.Ready,
+      reply: Option<Reply>.none(),
+      problem: Option<QueryError>.none(),
+    }
+    if servers.length == 0 {
+      exchange.problem = Option<QueryError>.some(QueryError.NoServers)
+      exchange.phase = Phase.Finished
+    }
+    run encodePackets(&mut exchange)
+    return move exchange
+  }
+
+  /// Returns the identifier of the query.
+  pub fn id(self: &Self) -> u16 { return self.id }
+
+  /// Returns the packet to send for `transport`: one DNS message for UDP, or the message after its
+  /// two-byte length for TCP.
+  pub fn packet(self: &Self, transport: Transport) -> &[u8] {
+    return match transport {
+      Transport.Udp => Bytes.asSlice(&self.udpPacket)
+      Transport.Tcp => Bytes.asSlice(&self.tcpPacket)
+    }
+  }
+
+  /// Returns the next thing to do at the time `now` of a `MonotonicClock`.
+  ///
+  /// # Details
+  /// `Step.Send` starts a try, and the next call returns `Step.Wait` with the end of that try. When
+  /// `now` reaches the end, the exchange moves to the next server and returns `Step.Send` again. After
+  /// the last try it returns `Step.Done`, and [`Exchange.finish`] gives `QueryError.Timeout` or the
+  /// last problem a server reported.
+  pub fn poll(self: &mut Self, now: &Instant) -> Step {
+    while true {
+      match &self.phase {
+        Phase.Finished => { return Step.Done }
+        Phase.Waiting { until, .. } => {
+          if !reached(now, &until) {
+            return Step.Wait { until: copyInstant(&until) }
+          }
+        }
+        Phase.Ready => {
+          let count = List<Endpoint>.length(&self.servers)
+          let round = self.tries / count
+          let mut transport = Transport.Udp
+          let mut server = (self.first + self.tries) % count
+          match &self.tcpServer {
+            Option<usize>.Some { value } => {
+              server = value
+              transport = Transport.Tcp
+            }
+            Option<usize>.None => {
+              if self.useTcp { transport = Transport.Tcp }
+            }
+          }
+          let mut factor: u64 = 1
+          let mut doubled: usize = 0
+          while doubled < round && factor < 8 {
+            factor = factor * 2
+            doubled = doubled + 1
+          }
+          let until = MonotonicClock.deadlineAfter(now, self.timeout * factor)
+          if transport == Transport.Udp {
+            List<bool>.set(&mut self.askedUdp, server, true)
+          }
+          self.phase = Phase.Waiting { server: server, transport: transport, until: move until }
+          return Step.Send { server: server, endpoint: List<Endpoint>.get(&self.servers, server), transport: transport }
+        }
+      }
+      // The current try has timed out.
+      self.problem = Option<QueryError>.some(QueryError.Timeout)
+      advance(&mut self.*)
+    }
+    return Step.Done
+  }
+
+  /// Gives the exchange a message from server `server`: one UDP datagram, or one TCP message without
+  /// its two-byte length.
+  ///
+  /// # Details
+  /// A message with another identifier or question is ignored, as is a UDP message from a server that
+  /// was not asked over UDP, or a TCP message when no TCP answer is expected from that server. A UDP
+  /// message that cannot be read is ignored too, because anyone can send one. A TCP message that
+  /// cannot be read makes the exchange move to the next server.
+  ///
+  /// # Errors
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the message or new packets.
+  pub effect fn receive(self: &mut Self, server: usize, transport: Transport, bytes: &[u8]) -> Receipt
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut current = false
+    match &self.phase {
+      Phase.Finished => { return Receipt.Ignored }
+      Phase.Ready => {}
+      Phase.Waiting { server: waiting, transport: kind, .. } => {
+        current = waiting == server && kind == transport
+      }
+    }
+    if server >= List<Endpoint>.length(&self.servers) { return Receipt.Ignored }
+    let expected = match transport {
+      Transport.Udp => List<bool>.get(&self.askedUdp, server)
+      Transport.Tcp => current
+    }
+    if !expected { return Receipt.Ignored }
+    let header = match Header.read(bytes) {
+      Result<Header, MessageError>.Success { value } => value
+      Result<Header, MessageError>.Failure { error } => {
+        return run rejectMessage(&mut self.*, server, transport, error.reason)
+      }
+    }
+    if header.id != self.id || !header.response {
+      return run rejectMessage(&mut self.*, server, transport, MessageReason.Truncated)
+    }
+    let parsed = run Effect.result(Message.parse(bytes))
+    let message = match move parsed {
+      Result<Message, MessageError | OutOfMemoryError>.Success { value } => move value
+      Result<Message, MessageError | OutOfMemoryError>.Failure { error } => match move error {
+        MessageError { reason, .. } => {
+          return run rejectMessage(&mut self.*, server, transport, reason)
+        }
+        OutOfMemoryError {} => { fail OutOfMemoryError {} }
+      }
+    }
+    let questions = List<Question>.asSlice(&message.questions)
+    if questions.length != 1 || !Question.equals(&questions[0], &self.question) {
+      return run rejectMessage(&mut self.*, server, transport, MessageReason.Truncated)
+    }
+    let code = message.header.responseCode
+    if message.header.truncated && transport == Transport.Udp {
+      self.tcpServer = Option<usize>.some(server)
+      self.phase = Phase.Ready
+      return Receipt.Retry
+    }
+    if code == RCODE_FORMAT_ERROR && self.edns {
+      self.edns = false
+      match run Effect.result(encodePackets(&mut self.*)) {
+        Result<(), MessageError | OutOfMemoryError>.Success {..} => {}
+        Result<(), MessageError | OutOfMemoryError>.Failure { error } => match move error {
+          // The query was encoded once with EDNS, so it fits without it.
+          MessageError {..} => Intrinsic.trap("Exchange.receive: the query no longer encodes")
+          OutOfMemoryError {} => { fail OutOfMemoryError {} }
+        }
+      }
+      self.tcpServer = Option<usize>.none()
+      if transport == Transport.Tcp { self.tcpServer = Option<usize>.some(server) }
+      self.phase = Phase.Ready
+      return Receipt.Retry
+    }
+    if code == RCODE_SERVER_FAILURE || code == RCODE_NOT_IMPLEMENTED || code == RCODE_REFUSED
+      || code == RCODE_FORMAT_ERROR {
+      self.problem = Option<QueryError>.some(QueryError.Rejected { responseCode: code, server: server })
+      if current { advance(&mut self.*) }
+      return Receipt.Retry
+    }
+    let raw = run Bytes.copy(bytes)
+    self.reply = Option<Reply>.some(Reply { message: move message, bytes: move raw, server: server, transport: transport })
+    self.phase = Phase.Finished
+    return Receipt.Answer
+  }
+
+  /// Tells the exchange that sending to `server` with `transport` failed, or that its TCP connection
+  /// broke before a whole answer came.
+  ///
+  /// # Details
+  /// If the current try uses that server and transport, the exchange moves to the next server at
+  /// once. Otherwise nothing changes.
+  pub fn transportFailed(self: &mut Self, server: usize, transport: Transport) -> () {
+    let current = match &self.phase {
+      Phase.Waiting { server: waiting, transport: kind, .. } => waiting == server && kind == transport
+      _ => false
+    }
+    if !current { return () }
+    self.problem = Option<QueryError>.some(QueryError.Unreachable { server: server })
+    advance(&mut self.*)
+  }
+
+  /// Returns `true` once [`Exchange.poll`] returns `Step.Done`.
+  pub fn isDone(self: &Self) -> bool {
+    return match &self.phase {
+      Phase.Finished => true
+      _ => false
+    }
+  }
+
+  /// Returns the result: the reply, or why there is none.
+  ///
+  /// # Details
+  /// A reply can have any response code other than SERVFAIL, NOTIMP, REFUSED and FORMERR, such as
+  /// `RCODE_NAME_ERROR` for a name that does not exist. Check `reply.message.header.responseCode`.
+  ///
+  /// # Errors
+  /// - `QueryError.Timeout` if the exchange is not done, or no server answered in time.
+  /// - The last problem that a server reported, if no server answered.
+  pub fn finish(self: Self) -> Result<Reply, QueryError> {
+    let Exchange { reply, problem, .. } = move self
+    return match move reply {
+      Option<Reply>.Some { value } => Result<Reply, QueryError>.succeed(move value)
+      Option<Reply>.None => match move problem {
+        Option<QueryError>.Some { value } => Result<Reply, QueryError>.failResult(value)
+        Option<QueryError>.None => Result<Reply, QueryError>.failResult(QueryError.Timeout)
+      }
+    }
+  }
+}
+
+// Moves to the next try, or finishes after the last one.
+fn advance(self: &mut Exchange) -> () {
+  self.tcpServer = Option<usize>.none()
+  self.tries = self.tries + 1
+  if self.tries >= self.attempts * List<Endpoint>.length(&self.servers) {
+    self.phase = Phase.Finished
+  } else {
+    self.phase = Phase.Ready
+  }
+}
+
+// Handles a message that is not a usable answer. Over UDP it is ignored; over TCP, from the current
+// server, it ends the try.
+effect fn rejectMessage(self: &mut Exchange, server: usize, transport: Transport, reason: MessageReason) -> Receipt {
+  if transport == Transport.Udp { return Receipt.Ignored }
+  self.problem = Option<QueryError>.some(QueryError.BadResponse { reason: reason, server: server })
+  advance(&mut self.*)
+  return Receipt.Retry
+}
