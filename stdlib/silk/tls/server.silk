@@ -1,0 +1,981 @@
+//! A TLS 1.3 server state machine over byte buffers that you drive, with an ECDSA P-256
+//! certificate.
+//!
+//! # When to use
+//! Use it to serve TLS from an event loop, such as the HTTPS mode of `silk.http.serve`. Load the
+//! certificate chain and the private key one time with [`TlsServerConfig.fromPem`]. Then make one
+//! [`TlsServer`] for each connection, pass received bytes to [`TlsServer.receive`], and encrypt
+//! application data with [`TlsServer.seal`].
+//!
+//! # Details
+//! The server speaks TLS 1.3 only (RFC 8446), with the cipher suites TLS_CHACHA20_POLY1305_SHA256
+//! and TLS_AES_128_GCM_SHA256, the key exchange group X25519, and the signature algorithm
+//! `ecdsa_secp256r1_sha256`. It picks ChaCha20-Poly1305 unless the client offers only AES-128-GCM.
+//! When the client offers ALPN with `http/1.1`, the server selects it.
+//!
+//! [`TlsServer.receive`] consumes complete records from the input. It appends the records it
+//! answers with to the output, and the decrypted application data to the plaintext list. It reads
+//! a client `KeyUpdate` and answers a request for one. A `close_notify` alert sets the status to
+//! `Closed`.
+//!
+//! # Errors
+//! - [`TlsConfigError`] from [`TlsServerConfig.fromPem`] for a PEM text that it cannot use.
+//! - A protocol error from the client makes [`TlsServer.receive`] append an alert to the output and
+//!   return the `Failed` status with the alert. The connection cannot be used after that.
+//! - `OutOfMemoryError` if a buffer cannot grow.
+//!
+//! # Gotchas
+//! - No client certificates, session resumption, 0-RTT, or HelloRetryRequest: a client that sends
+//!   no X25519 key share gets a `handshake_failure` alert.
+//! - The server does not check its own certificate chain. Give the leaf certificate first.
+//! - Secrets are not erased.
+//!
+//! @category TLS and certificates
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.ownership { Copy }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.crypto.aes_gcm { AesGcm }
+import silk.crypto.chacha20_poly1305 { ChaCha20Poly1305 }
+import silk.crypto.hkdf { HkdfSha256 }
+import silk.crypto.hmac { HmacSha256 }
+import silk.crypto.p256 { EcdsaP256Sha256, P256 }
+import silk.crypto.sha2 { Sha256 }
+import silk.crypto.x25519 { X25519 }
+import silk.encoding.base64 { Base64 }
+import silk.system.random { Random }
+import silk.system.random_native { OsRandom }
+import silk.tls.hkdf { TlsHkdfSha256 }
+import silk.net.tcp_server { Protocol, Received, Verdict }
+import silk.text.format { Debug, Format, Formatter }
+import silk.io.writer { Writer, WriterError }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u64
+import silk.num.usize
+
+/// Why [`TlsServerConfig.fromPem`] cannot use its input.
+pub enum TlsConfigError {
+  /// The certificate text holds no `CERTIFICATE` block.
+  NoCertificate,
+  /// A PEM block is malformed, or its base64 is not valid.
+  InvalidPem,
+  /// The key text holds no `PRIVATE KEY` or `EC PRIVATE KEY` block with a P-256 key.
+  UnsupportedKey,
+  /// The certificate chain is larger than one TLS message can carry.
+  ChainTooLarge,
+}
+
+impl Debug for TlsConfigError {
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    let name = match self.* {
+      TlsConfigError.NoCertificate => "NoCertificate"
+      TlsConfigError.InvalidPem => "InvalidPem"
+      TlsConfigError.UnsupportedKey => "UnsupportedKey"
+      TlsConfigError.ChainTooLarge => "ChainTooLarge"
+    }
+    return run Writer.writeString(name)
+  }
+}
+
+/// The certificate chain and the private key of a server.
+///
+/// # Details
+/// The chain is kept as the body of a TLS `Certificate` message, ready to send. One config serves
+/// every connection and every thread.
+pub struct TlsServerConfig {
+  certificateMessage: Bytes,
+  secret: [u8; 32],
+}
+
+impl TlsServerConfig {
+  /// Reads the certificate chain from the `CERTIFICATE` blocks of `certificates`, leaf first, and
+  /// the P-256 private key from the first `PRIVATE KEY` (PKCS #8) or `EC PRIVATE KEY` (SEC 1)
+  /// block of `privateKey`.
+  ///
+  /// # Errors
+  /// - `NoCertificate`, `InvalidPem`, `UnsupportedKey` or `ChainTooLarge` for input it cannot use.
+  /// - `OutOfMemoryError` if the chain cannot be stored.
+  pub effect fn fromPem(certificates: &[u8], privateKey: &[u8]) -> TlsServerConfig
+  ! TlsConfigError | OutOfMemoryError ? &mut Allocator {
+    // The Certificate message body: an empty request context, then the list of entries.
+    let mut entries = Bytes.make()
+    let mut count: usize = 0
+    let mut offset: usize = 0
+    while true {
+      let found = findBlock(certificates, offset, b"CERTIFICATE")
+      let block = match move found {
+        Option.None => { break }
+        Option.Some { value } => value
+      }
+      offset = block.end
+      let der = run decodeBlock(certificates, &block)
+      let length = Bytes.length(&der)
+      run appendU24(&mut entries, length)
+      run Bytes.append(&mut entries, Bytes.asSlice(&der))
+      // No per-certificate extensions.
+      run Bytes.append(&mut entries, &[0, 0])
+      count = count + 1
+    }
+    if count == 0 { fail TlsConfigError.NoCertificate }
+    if Bytes.length(&entries) > 65000 { fail TlsConfigError.ChainTooLarge }
+    let mut message = Bytes.make()
+    run Bytes.append(&mut message, &[0])
+    run appendU24(&mut message, Bytes.length(&entries))
+    run Bytes.append(&mut message, Bytes.asSlice(&entries))
+    let secret = run readPrivateKey(privateKey)
+    return TlsServerConfig { certificateMessage: move message, secret: secret }
+  }
+}
+
+struct PemBlock {
+  bodyStart: usize,
+  bodyEnd: usize,
+  end: usize,
+}
+
+impl Copy for PemBlock {}
+
+// Finds the next `-----BEGIN label-----` block at or after `offset`.
+fn findBlock(text: &[u8], offset: usize, label: &[u8]) -> Option<PemBlock> {
+  let begin = b"-----BEGIN "
+  let close = b"-----END "
+  let mut at = offset
+  while at + begin.length + label.length + 5 <= text.length {
+    if startsAt(text, at, begin) && startsAt(text, at + begin.length, label)
+      && startsAt(text, at + begin.length + label.length, b"-----") {
+      let bodyStart = at + begin.length + label.length + 5
+      let mut cursor = bodyStart
+      while cursor + close.length <= text.length {
+        if startsAt(text, cursor, close) {
+          let mut end = cursor + close.length
+          while end < text.length && text[end] != 10 { end = end + 1 }
+          return Option<PemBlock>.some(PemBlock { bodyStart: bodyStart, bodyEnd: cursor, end: end })
+        }
+        cursor = cursor + 1
+      }
+      return Option<PemBlock>.none()
+    }
+    at = at + 1
+  }
+  return Option<PemBlock>.none()
+}
+
+fn startsAt(text: &[u8], at: usize, prefix: &[u8]) -> bool {
+  if at + prefix.length > text.length { return false }
+  let mut index: usize = 0
+  while index < prefix.length {
+    if text[at + index] != prefix[index] { return false }
+    index = index + 1
+  }
+  return true
+}
+
+// Decodes the base64 body of `block`, skipping line breaks and spaces.
+effect fn decodeBlock(text: &[u8], block: &PemBlock) -> Bytes ! TlsConfigError | OutOfMemoryError ? &mut Allocator {
+  let mut compact = Bytes.make()
+  let mut at = block.bodyStart
+  while at < block.bodyEnd {
+    let byte = text[at]
+    if byte != 10 && byte != 13 && byte != 32 && byte != 9 { run Bytes.append(&mut compact, &[byte]) }
+    at = at + 1
+  }
+  let mut decoded = run Bytes.zeroed(Bytes.length(&compact))
+  let written = Base64.decodeInto(Bytes.asMutSlice(&mut decoded), Bytes.asSlice(&compact))
+  let length = match move written {
+    Result.Success { value } => value
+    Result.Failure { error } => { drop error fail TlsConfigError.InvalidPem }
+  }
+  Bytes.truncate(&mut decoded, length)
+  return move decoded
+}
+
+// One DER element: its tag and the range of its contents.
+struct Element {
+  tag: u8,
+  start: usize,
+  end: usize,
+}
+
+impl Copy for Element {}
+
+fn element(der: &[u8], at: usize) -> Option<Element> {
+  if at + 2 > der.length { return Option<Element>.none() }
+  let tag = der[at]
+  let first = der[at + 1]
+  let mut start = at + 2
+  let mut length: usize = 0
+  if first < 128 {
+    length = u8.toUsize(first)
+  } else {
+    let count = u8.toUsize(first - 128)
+    if count == 0 || count > 3 || start + count > der.length { return Option<Element>.none() }
+    let mut index: usize = 0
+    while index < count {
+      length = length * 256 + u8.toUsize(der[start + index])
+      index = index + 1
+    }
+    start = start + count
+  }
+  if start + length > der.length { return Option<Element>.none() }
+  return Option<Element>.some(Element { tag: tag, start: start, end: start + length })
+}
+
+// Reads the private key of an `ECPrivateKey` (SEC 1): SEQUENCE { INTEGER 1, OCTET STRING key, ... }.
+fn ecPrivateKey(der: &[u8], at: usize) -> Option<[u8; 32]> {
+  let sequence = match element(der, at) { Option.None => { return Option<[u8; 32]>.none() } Option.Some { value } => value }
+  if sequence.tag != 48 { return Option<[u8; 32]>.none() }
+  let version = match element(der, sequence.start) { Option.None => { return Option<[u8; 32]>.none() } Option.Some { value } => value }
+  if version.tag != 2 || version.end - version.start != 1 || der[version.start] != 1 { return Option<[u8; 32]>.none() }
+  let key = match element(der, version.end) { Option.None => { return Option<[u8; 32]>.none() } Option.Some { value } => value }
+  if key.tag != 4 || key.end - key.start != 32 { return Option<[u8; 32]>.none() }
+  let mut secret: [u8; 32] = [0; 32]
+  let mut index: usize = 0
+  while index < 32 {
+    secret[index] = der[key.start + index]
+    index = index + 1
+  }
+  return Option<[u8; 32]>.some(secret)
+}
+
+// The DER of the OID 1.2.840.10045.3.1.7 (prime256v1).
+fn isP256Curve(der: &[u8], value: &Element) -> bool {
+  let oid: [u8; 8] = [42, 134, 72, 206, 61, 3, 1, 7]
+  if value.tag != 6 || value.end - value.start != 8 { return false }
+  let mut index: usize = 0
+  while index < 8 {
+    if der[value.start + index] != oid[index] { return false }
+    index = index + 1
+  }
+  return true
+}
+
+effect fn readPrivateKey(text: &[u8]) -> [u8; 32] ! TlsConfigError | OutOfMemoryError ? &mut Allocator {
+  match findBlock(text, 0, b"EC PRIVATE KEY") {
+    Option.Some { value } => {
+      let der = run decodeBlock(text, &value)
+      return match ecPrivateKey(Bytes.asSlice(&der), 0) {
+        Option.Some { value: secret } => run checkedSecret(secret)
+        Option.None => { fail TlsConfigError.UnsupportedKey }
+      }
+    }
+    Option.None => {}
+  }
+  let block = match findBlock(text, 0, b"PRIVATE KEY") {
+    Option.Some { value } => value
+    Option.None => { fail TlsConfigError.UnsupportedKey }
+  }
+  let der = run decodeBlock(text, &block)
+  let bytes = Bytes.asSlice(&der)
+  // PrivateKeyInfo: SEQUENCE { INTEGER 0, SEQUENCE { OID ecPublicKey, OID curve }, OCTET STRING }.
+  let outer = match element(bytes, 0) { Option.None => { fail TlsConfigError.UnsupportedKey } Option.Some { value } => value }
+  let version = match element(bytes, outer.start) { Option.None => { fail TlsConfigError.UnsupportedKey } Option.Some { value } => value }
+  let algorithm = match element(bytes, version.end) { Option.None => { fail TlsConfigError.UnsupportedKey } Option.Some { value } => value }
+  if outer.tag != 48 || version.tag != 2 || algorithm.tag != 48 { fail TlsConfigError.UnsupportedKey }
+  let kind = match element(bytes, algorithm.start) { Option.None => { fail TlsConfigError.UnsupportedKey } Option.Some { value } => value }
+  let curve = match element(bytes, kind.end) { Option.None => { fail TlsConfigError.UnsupportedKey } Option.Some { value } => value }
+  if !isP256Curve(bytes, &curve) { fail TlsConfigError.UnsupportedKey }
+  let wrapped = match element(bytes, algorithm.end) { Option.None => { fail TlsConfigError.UnsupportedKey } Option.Some { value } => value }
+  if wrapped.tag != 4 { fail TlsConfigError.UnsupportedKey }
+  return match ecPrivateKey(bytes, wrapped.start) {
+    Option.Some { value: secret } => run checkedSecret(secret)
+    Option.None => { fail TlsConfigError.UnsupportedKey }
+  }
+}
+
+effect fn checkedSecret(secret: [u8; 32]) -> [u8; 32] ! TlsConfigError {
+  return match P256.fromBytes(&secret) {
+    Result.Success { value } => { drop value secret }
+    Result.Failure { error } => { drop error fail TlsConfigError.UnsupportedKey }
+  }
+}
+
+effect fn appendU24(output: &mut Bytes, value: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  run Bytes.append(&mut output.*, &[usize.toU8(value / 65536 % 256), usize.toU8(value / 256 % 256), usize.toU8(value % 256)])
+  return ()
+}
+
+/// The phase of a [`TlsServer`].
+pub enum TlsStatus {
+  /// The handshake is not finished. Application data cannot be sent yet.
+  Handshaking,
+  /// The handshake is finished. [`TlsServer.seal`] can send application data.
+  Open,
+  /// The client sent `close_notify`. No more data comes.
+  Closed,
+  /// The connection failed. The output holds the alert, if one could be sent.
+  Failed,
+}
+
+/// The answer of [`TlsServer.receive`].
+pub struct TlsProgress {
+  /// The number of input bytes that were used. They hold whole records only.
+  pub consumed: usize,
+  /// The phase after the call.
+  pub status: TlsStatus,
+  /// The alert description that was sent or received when the status is `Failed`, such as 40 for
+  /// `handshake_failure`.
+  pub alert: u8,
+}
+
+impl Copy for TlsProgress {}
+
+enum Suite {
+  None,
+  ChaCha20Poly1305,
+  Aes128Gcm,
+}
+
+// The key, IV and sequence number of one direction.
+struct Direction {
+  key: [u8; 32],
+  iv: [u8; 12],
+  sequence: u64,
+  protected: bool,
+}
+
+impl Copy for Direction {}
+
+fn plainDirection() -> Direction {
+  return Direction { key: [0; 32], iv: [0; 12], sequence: 0, protected: false }
+}
+
+enum Phase {
+  ExpectClientHello,
+  ExpectFinished,
+  Open,
+  Closed,
+  Failed,
+}
+
+/// The TLS 1.3 server side of one connection.
+pub struct TlsServer {
+  phase: Phase,
+  suite: Suite,
+  transcript: Sha256,
+  read: Direction,
+  write: Direction,
+  clientHandshakeSecret: [u8; 32],
+  clientApplicationSecret: [u8; 32],
+  serverApplicationSecret: [u8; 32],
+  handshake: List<u8>,
+  record: List<u8>,
+  selectedAlpn: bool,
+  ignoredChangeCipherSpec: bool,
+}
+
+const MAX_RECORD: usize = 16384
+
+impl TlsServer {
+  /// Returns a server that waits for the ClientHello.
+  pub fn make() -> TlsServer {
+    return TlsServer {
+      phase: Phase.ExpectClientHello,
+      suite: Suite.None,
+      transcript: Sha256.make(),
+      read: plainDirection(),
+      write: plainDirection(),
+      clientHandshakeSecret: [0; 32],
+      clientApplicationSecret: [0; 32],
+      serverApplicationSecret: [0; 32],
+      handshake: List<u8>.make(),
+      record: List<u8>.make(),
+      selectedAlpn: false,
+      ignoredChangeCipherSpec: false,
+    }
+  }
+
+  /// Returns the phase.
+  pub fn status(self: &Self) -> TlsStatus {
+    return match self.phase {
+      Phase.ExpectClientHello => TlsStatus.Handshaking
+      Phase.ExpectFinished => TlsStatus.Handshaking
+      Phase.Open => TlsStatus.Open
+      Phase.Closed => TlsStatus.Closed
+      Phase.Failed => TlsStatus.Failed
+    }
+  }
+
+  /// Returns whether ALPN selected `http/1.1`.
+  pub fn selectedHttp11(self: &Self) -> bool { return self.selectedAlpn }
+
+  /// Consumes the complete records at the start of `input`.
+  ///
+  /// # Details
+  /// It appends its answers, such as the server handshake flight, to `output`, and the decrypted
+  /// application data to `plaintext`. It decrypts in place, so it changes `input`.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if a buffer cannot grow. Protocol errors are a `Failed` status.
+  pub effect fn receive(
+    self: &mut Self,
+    config: &TlsServerConfig,
+    input: &mut [u8],
+    output: &mut List<u8>,
+    plaintext: &mut List<u8>,
+  ) -> TlsProgress ! OutOfMemoryError ? &mut Allocator {
+    let mut consumed: usize = 0
+    while consumed + 5 <= input.length {
+      if self.phase == Phase.Failed || self.phase == Phase.Closed { break }
+      let kind = input[consumed]
+      let length = u8.toUsize(input[consumed + 3]) * 256 + u8.toUsize(input[consumed + 4])
+      if length > MAX_RECORD + 256 { return run self.failWith(&mut output.*, 22, consumed) }
+      if consumed + 5 + length > input.length { break }
+      let header = Slice.view<u8>(&input, consumed, 5)
+      let mut aad: [u8; 5] = [header[0], header[1], header[2], header[3], header[4]]
+      consumed = consumed + 5
+      let body = Slice.viewMut<u8>(&mut input, consumed, length)
+      consumed = consumed + length
+      if kind == 20 && !self.ignoredChangeCipherSpec && self.phase != Phase.Open {
+        // A compatibility ChangeCipherSpec is ignored (RFC 8446, appendix D.4).
+        self.ignoredChangeCipherSpec = true
+        drop body
+        continue
+      }
+      if !self.read.protected {
+        if kind == 21 { return run self.alertReceived(&body, consumed) }
+        if kind != 22 { return run self.failWith(&mut output.*, 10, consumed) }
+        run List.appendBytes(&mut self.handshake, &body)
+      } else {
+        if kind != 23 { return run self.failWith(&mut output.*, 10, consumed) }
+        if length < 17 { return run self.failWith(&mut output.*, 50, consumed) }
+        // Decrypt into the record scratch, then dispatch on the inner content type.
+        List.clear(&mut self.record)
+        run List.appendRepeated(&mut self.record, 0, length - 16)
+        let opened = openRecord(self.suite, &self.read, &aad, Slice.view<u8>(&body, 0, length - 16),
+          Slice.view<u8>(&body, length - 16, 16), List.asMutSlice(&mut self.record))
+        drop aad
+        if !opened { return run self.failWith(&mut output.*, 20, consumed) }
+        self.read.sequence = self.read.sequence + 1
+        let mut end = length - 16
+        let inner = List.asSlice(&self.record)
+        while end > 0 && inner[end - 1] == 0 { end = end - 1 }
+        if end == 0 { return run self.failWith(&mut output.*, 10, consumed) }
+        let innerType = inner[end - 1]
+        let content = Slice.view<u8>(inner, 0, end - 1)
+        if innerType == 23 {
+          if self.phase != Phase.Open { return run self.failWith(&mut output.*, 10, consumed) }
+          run List.appendBytes(&mut plaintext.*, content)
+          continue
+        }
+        if innerType == 21 {
+          let mut alert: [u8; 2] = [0, 0]
+          if content.length >= 2 { alert = [content[0], content[1]] }
+          return run self.alertReceived(&alert, consumed)
+        }
+        if innerType != 22 { return run self.failWith(&mut output.*, 10, consumed) }
+        let copied = run Bytes.copy(content)
+        run List.appendBytes(&mut self.handshake, Bytes.asSlice(&copied))
+      }
+      let failed = run self.processHandshake(config, &mut output.*)
+      if failed != 0 { return run self.failWith(&mut output.*, failed, consumed) }
+    }
+    return TlsProgress { consumed: consumed, status: self.status(), alert: 0 }
+  }
+
+  /// Encrypts `data` as application data records, and appends them to `output`.
+  ///
+  /// # Details
+  /// Each record holds at most 16 KiB. Nothing is sent before the handshake is finished.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if `output` cannot grow.
+  pub effect fn seal(self: &mut Self, data: &[u8], output: &mut List<u8>) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.phase != Phase.Open { return () }
+    let mut at: usize = 0
+    while at < data.length {
+      let remaining = data.length - at
+      let step = if remaining > MAX_RECORD { MAX_RECORD } else { remaining }
+      run self.sealRecord(Slice.view<u8>(data, at, step), 23, &mut output.*)
+      at = at + step
+    }
+    return ()
+  }
+
+  /// Appends a `close_notify` alert to `output`.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if `output` cannot grow.
+  pub effect fn close(self: &mut Self, output: &mut List<u8>) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.phase == Phase.Open {
+      run self.sealRecord(&[1, 0], 21, &mut output.*)
+    }
+    self.phase = Phase.Closed
+    return ()
+  }
+
+  // Protects one record of `content` with the write keys, and appends it to `output`.
+  effect fn sealRecord(self: &mut Self, content: &[u8], kind: u8, output: &mut List<u8>) -> () ! OutOfMemoryError ? &mut Allocator {
+    List.clear(&mut self.record)
+    run List.appendBytes(&mut self.record, content)
+    run List.append(&mut self.record, kind)
+    let innerLength = content.length + 1
+    let recordLength = innerLength + 16
+    let header: [u8; 5] = [23, 3, 3, usize.toU8(recordLength / 256), usize.toU8(recordLength % 256)]
+    let start = List.length(&output.*)
+    run List.appendBytes(&mut output.*, &header)
+    run List.appendRepeated(&mut output.*, 0, recordLength)
+    let target = Slice.viewMut<u8>(List.asMutSlice(&mut output.*), start + 5, recordLength)
+    sealInto(self.suite, &self.write, &header, List.asSlice(&self.record), move target)
+    self.write.sequence = self.write.sequence + 1
+    return ()
+  }
+
+  effect fn alertReceived(self: &mut Self, alert: &[u8], consumed: usize) -> TlsProgress {
+    if alert.length >= 2 && alert[1] == 0 {
+      self.phase = Phase.Closed
+      return TlsProgress { consumed: consumed, status: TlsStatus.Closed, alert: 0 }
+    }
+    self.phase = Phase.Failed
+    let description = if alert.length >= 2 { alert[1] } else { 0 }
+    return TlsProgress { consumed: consumed, status: TlsStatus.Failed, alert: description }
+  }
+
+  // Sends a fatal alert, with the keys in use, and fails.
+  effect fn failWith(self: &mut Self, output: &mut List<u8>, description: u8, consumed: usize) -> TlsProgress
+  ! OutOfMemoryError ? &mut Allocator {
+    if self.write.protected {
+      run self.sealRecord(&[2, description], 21, &mut output.*)
+    } else {
+      run List.appendBytes(&mut output.*, &[21, 3, 3, 0, 2, 2, description])
+    }
+    self.phase = Phase.Failed
+    return TlsProgress { consumed: consumed, status: TlsStatus.Failed, alert: description }
+  }
+
+  // Handles each complete handshake message in the buffer. Returns 0, or the alert to send.
+  effect fn processHandshake(self: &mut Self, config: &TlsServerConfig, output: &mut List<u8>) -> u8
+  ! OutOfMemoryError ? &mut Allocator {
+    while List.length(&self.handshake) >= 4 {
+      let buffer = List.asSlice(&self.handshake)
+      let kind = buffer[0]
+      let length = u8.toUsize(buffer[1]) * 65536 + u8.toUsize(buffer[2]) * 256 + u8.toUsize(buffer[3])
+      if length > 65536 { return 22 }
+      if List.length(&self.handshake) < 4 + length { return 0 }
+      let message = run Bytes.copy(Slice.view<u8>(buffer, 0, 4 + length))
+      let rest = List.length(&self.handshake) - 4 - length
+      let mut moved: usize = 0
+      let storage = List.asMutSlice(&mut self.handshake)
+      while moved < rest {
+        storage[moved] = storage[4 + length + moved]
+        moved = moved + 1
+      }
+      List.truncate(&mut self.handshake, rest)
+      let bytes = Bytes.asSlice(&message)
+      let failed: u8 = match self.phase {
+        Phase.ExpectClientHello => {
+          if kind != 1 { 10 } else { run self.clientHello(config, bytes, &mut output.*) }
+        }
+        Phase.ExpectFinished => {
+          if kind != 20 { 10 } else { self.clientFinished(bytes) }
+        }
+        Phase.Open => {
+          if kind == 24 { run self.keyUpdate(bytes, &mut output.*) }
+          else if kind == 4 { 0 }
+          else { 10 }
+        }
+        _ => 10
+      }
+      if failed != 0 { return failed }
+    }
+    return 0
+  }
+
+  // Reads the ClientHello, and sends ServerHello and the encrypted server flight.
+  effect fn clientHello(self: &mut Self, config: &TlsServerConfig, message: &[u8], output: &mut List<u8>) -> u8
+  ! OutOfMemoryError ? &mut Allocator {
+    let body = Slice.view<u8>(message, 4, message.length - 4)
+    if body.length < 38 { return 50 }
+    let mut at: usize = 34
+    let sessionLength = u8.toUsize(body[at])
+    if sessionLength > 32 || at + 1 + sessionLength + 2 > body.length { return 50 }
+    let sessionStart = at + 1
+    at = sessionStart + sessionLength
+    let suitesLength = readU16(body, at)
+    at = at + 2
+    if suitesLength % 2 != 0 || at + suitesLength + 1 > body.length { return 50 }
+    let mut chacha = false
+    let mut aes = false
+    let mut index: usize = 0
+    while index < suitesLength {
+      let suite = readU16(body, at + index)
+      if suite == 4867 { chacha = true }
+      if suite == 4865 { aes = true }
+      index = index + 2
+    }
+    at = at + suitesLength
+    let compressionLength = u8.toUsize(body[at])
+    at = at + 1 + compressionLength
+    if at + 2 > body.length { return 50 }
+    let extensionsLength = readU16(body, at)
+    at = at + 2
+    if at + extensionsLength != body.length { return 50 }
+    let mut tls13 = false
+    let mut ecdsa = false
+    let mut keyShare: [u8; 32] = [0; 32]
+    let mut hasKeyShare = false
+    let mut alpnOffered = false
+    let mut http11 = false
+    while at + 4 <= body.length {
+      let extension = readU16(body, at)
+      let length = readU16(body, at + 2)
+      let start = at + 4
+      if start + length > body.length { return 50 }
+      let data = Slice.view<u8>(body, start, length)
+      if extension == 43 {
+        if data.length < 1 { return 50 }
+        let mut versionAt: usize = 1
+        while versionAt + 1 < data.length && versionAt <= u8.toUsize(data[0]) {
+          if readU16(data, versionAt) == 772 { tls13 = true }
+          versionAt = versionAt + 2
+        }
+      } else if extension == 13 {
+        if data.length < 2 { return 50 }
+        let listLength = readU16(data, 0)
+        let mut schemeAt: usize = 2
+        while schemeAt + 1 < data.length && schemeAt < 2 + listLength {
+          if readU16(data, schemeAt) == 1027 { ecdsa = true }
+          schemeAt = schemeAt + 2
+        }
+      } else if extension == 51 {
+        if data.length < 2 { return 50 }
+        let sharesLength = readU16(data, 0)
+        if 2 + sharesLength != data.length { return 50 }
+        let mut shareAt: usize = 2
+        while shareAt + 4 <= data.length {
+          let group = readU16(data, shareAt)
+          let keyLength = readU16(data, shareAt + 2)
+          if shareAt + 4 + keyLength > data.length { return 50 }
+          if group == 29 && keyLength == 32 && !hasKeyShare {
+            let mut copied: usize = 0
+            while copied < 32 {
+              keyShare[copied] = data[shareAt + 4 + copied]
+              copied = copied + 1
+            }
+            hasKeyShare = true
+          }
+          shareAt = shareAt + 4 + keyLength
+        }
+      } else if extension == 16 {
+        alpnOffered = true
+        if data.length >= 2 {
+          let mut nameAt: usize = 2
+          while nameAt < data.length {
+            let nameLength = u8.toUsize(data[nameAt])
+            if nameAt + 1 + nameLength > data.length { return 50 }
+            if nameLength == 8 && startsAt(data, nameAt + 1, b"http/1.1") { http11 = true }
+            nameAt = nameAt + 1 + nameLength
+          }
+        }
+      }
+      at = start + length
+    }
+    if !tls13 { return 70 }
+    if !chacha && !aes { return 40 }
+    if !ecdsa || !hasKeyShare { return 40 }
+    if alpnOffered && !http11 { return 120 }
+    self.selectedAlpn = http11
+    self.suite = if chacha { Suite.ChaCha20Poly1305 } else { Suite.Aes128Gcm }
+    // Key exchange.
+    let mut random: [u8; 32] = [0; 32]
+    let mut os = OsRandom.make()
+    run Random.fillBytes(&mut random) |> Effect.provideMut<Random>(&mut os)
+    let ephemeral = run X25519.generate() |> Effect.provideMut<Random>(&mut os)
+    let publicKey = ephemeral.publicKey()
+    let shared = match ephemeral.agree(&keyShare) {
+      Result.Success { value } => value
+      Result.Failure { error } => { drop error return 47 }
+    }
+    self.transcript.update(message)
+    // ServerHello.
+    let mut hello = List<u8>.make()
+    run List.appendBytes(&mut hello, &[2, 0, 0, 0, 3, 3])
+    run List.appendBytes(&mut hello, &random)
+    run List.append(&mut hello, usize.toU8(sessionLength))
+    run List.appendBytes(&mut hello, Slice.view<u8>(body, sessionStart, sessionLength))
+    let suiteCode: u16 = if self.suite == Suite.ChaCha20Poly1305 { 4867 } else { 4865 }
+    run List.appendBytes(&mut hello, &[u16.toU8(u16.shiftRight(suiteCode, 8)), u16.toU8(u16.bitAnd(suiteCode, 255)), 0])
+    // Extensions: supported_versions and key_share.
+    run List.appendBytes(&mut hello, &[0, 46, 0, 43, 0, 2, 3, 4, 0, 51, 0, 36, 0, 29, 0, 32])
+    run List.appendBytes(&mut hello, &publicKey)
+    let helloLength = List.length(&hello) - 4
+    let header = List.asMutSlice(&mut hello)
+    header[1] = usize.toU8(helloLength / 65536)
+    header[2] = usize.toU8(helloLength / 256 % 256)
+    header[3] = usize.toU8(helloLength % 256)
+    self.transcript.update(List.asSlice(&hello))
+    let helloRecordLength = List.length(&hello)
+    run List.appendBytes(&mut output.*, &[22, 3, 3, usize.toU8(helloRecordLength / 256), usize.toU8(helloRecordLength % 256)])
+    run List.appendBytes(&mut output.*, List.asSlice(&hello))
+    // A compatibility ChangeCipherSpec, so middleboxes see a resumed TLS 1.2 session.
+    run List.appendBytes(&mut output.*, &[20, 3, 3, 0, 1, 1])
+    // The handshake secrets.
+    let zeros: [u8; 32] = [0; 32]
+    let early = HkdfSha256.extract(&zeros, &zeros)
+    let emptyHash = Sha256.hash(&[])
+    let derived = deriveFromHash(&early, b"derived", &emptyHash)
+    let handshakeSecret = HkdfSha256.extract(&derived, &shared)
+    let helloHash = self.transcript.checkpoint()
+    self.clientHandshakeSecret = deriveFromHash(&handshakeSecret, b"c hs traffic", &helloHash)
+    let serverHandshakeSecret = deriveFromHash(&handshakeSecret, b"s hs traffic", &helloHash)
+    self.read = trafficKeys(self.suite, &self.clientHandshakeSecret)
+    self.write = trafficKeys(self.suite, &serverHandshakeSecret)
+    // EncryptedExtensions, Certificate, CertificateVerify and Finished, in one flight.
+    let mut flight = List<u8>.make()
+    if http11 {
+      run List.appendBytes(&mut flight, &[8, 0, 0, 17, 0, 15, 0, 16, 0, 11, 0, 9, 8])
+      run List.appendBytes(&mut flight, b"http/1.1")
+    } else {
+      run List.appendBytes(&mut flight, &[8, 0, 0, 2, 0, 0])
+    }
+    let certificate = Bytes.asSlice(&config.certificateMessage)
+    run List.append(&mut flight, 11)
+    run List.appendBytes(&mut flight, &[usize.toU8(certificate.length / 65536), usize.toU8(certificate.length / 256 % 256), usize.toU8(certificate.length % 256)])
+    run List.appendBytes(&mut flight, certificate)
+    self.transcript.update(List.asSlice(&flight))
+    let certificateHash = self.transcript.checkpoint()
+    let mut signed = List<u8>.make()
+    run List.appendRepeated(&mut signed, 32, 64)
+    run List.appendBytes(&mut signed, b"TLS 1.3, server CertificateVerify")
+    run List.append(&mut signed, 0)
+    run List.appendBytes(&mut signed, &certificateHash)
+    let mut signature: [u8; 72] = [0; 72]
+    let signatureLength = match EcdsaP256Sha256.sign(&config.secret, List.asSlice(&signed), &mut signature) {
+      Result.Success { value } => value
+      Result.Failure { error } => { drop error return 80 }
+    }
+    let verifyStart = List.length(&flight)
+    let verifyLength = signatureLength + 4
+    run List.appendBytes(&mut flight, &[15, 0, usize.toU8(verifyLength / 256), usize.toU8(verifyLength % 256), 4, 3,
+      usize.toU8(signatureLength / 256), usize.toU8(signatureLength % 256)])
+    run List.appendBytes(&mut flight, Slice.view<u8>(&signature, 0, signatureLength))
+    self.transcript.update(Slice.view<u8>(List.asSlice(&flight), verifyStart, List.length(&flight) - verifyStart))
+    let finishedHash = self.transcript.checkpoint()
+    let verifyData = finishedMac(&serverHandshakeSecret, &finishedHash)
+    let finishedStart = List.length(&flight)
+    run List.appendBytes(&mut flight, &[20, 0, 0, 32])
+    run List.appendBytes(&mut flight, &verifyData)
+    self.transcript.update(Slice.view<u8>(List.asSlice(&flight), finishedStart, 36))
+    let mut at2: usize = 0
+    let total = List.length(&flight)
+    while at2 < total {
+      let remaining = total - at2
+      let step = if remaining > MAX_RECORD { MAX_RECORD } else { remaining }
+      let piece = run Bytes.copy(Slice.view<u8>(List.asSlice(&flight), at2, step))
+      run self.sealRecord(Bytes.asSlice(&piece), 22, &mut output.*)
+      at2 = at2 + step
+    }
+    // The application secrets, from the transcript up to the server Finished.
+    let serverFinishedHash = self.transcript.checkpoint()
+    let derivedAgain = deriveFromHash(&handshakeSecret, b"derived", &emptyHash)
+    let master = HkdfSha256.extract(&derivedAgain, &zeros)
+    self.clientApplicationSecret = deriveFromHash(&master, b"c ap traffic", &serverFinishedHash)
+    self.serverApplicationSecret = deriveFromHash(&master, b"s ap traffic", &serverFinishedHash)
+    self.write = trafficKeys(self.suite, &self.serverApplicationSecret)
+    self.phase = Phase.ExpectFinished
+    return 0
+  }
+
+  fn clientFinished(self: &mut Self, message: &[u8]) -> u8 {
+    if message.length != 36 { return 50 }
+    let expected = finishedMac(&self.clientHandshakeSecret, &self.transcript.checkpoint())
+    let mut difference: u8 = 0
+    let mut index: usize = 0
+    while index < 32 {
+      difference = u8.bitOr(difference, u8.bitXor(expected[index], message[4 + index]))
+      index = index + 1
+    }
+    if difference != 0 { return 51 }
+    self.transcript.update(message)
+    self.read = trafficKeys(self.suite, &self.clientApplicationSecret)
+    self.phase = Phase.Open
+    return 0
+  }
+
+  effect fn keyUpdate(self: &mut Self, message: &[u8], output: &mut List<u8>) -> u8 ! OutOfMemoryError ? &mut Allocator {
+    if message.length != 5 || message[4] > 1 { return 50 }
+    self.clientApplicationSecret = nextSecret(&self.clientApplicationSecret)
+    self.read = trafficKeys(self.suite, &self.clientApplicationSecret)
+    if message[4] == 1 {
+      run self.sealRecord(&[24, 0, 0, 1, 0], 22, &mut output.*)
+      self.serverApplicationSecret = nextSecret(&self.serverApplicationSecret)
+      self.write = trafficKeys(self.suite, &self.serverApplicationSecret)
+    }
+    return 0
+  }
+}
+
+fn readU16(data: &[u8], at: usize) -> usize {
+  return u8.toUsize(data[at]) * 256 + u8.toUsize(data[at + 1])
+}
+
+fn deriveFromHash(secret: &([u8; 32]), label: &[u8], hash: &([u8; 32])) -> [u8; 32] {
+  return match TlsHkdfSha256.deriveSecretFromHash(secret, label, hash) {
+    Result.Success { value } => value
+    Result.Failure { error } => {
+      drop error
+      let zero: [u8; 32] = [0; 32]
+      zero
+    }
+  }
+}
+
+fn expandInto(secret: &([u8; 32]), label: &[u8], output: &mut [u8]) -> () {
+  match TlsHkdfSha256.expandLabel(secret, label, &[], move output) {
+    Result.Success { value } => value
+    Result.Failure { error } => { drop error }
+  }
+  return ()
+}
+
+fn nextSecret(secret: &([u8; 32])) -> [u8; 32] {
+  let mut next: [u8; 32] = [0; 32]
+  expandInto(secret, b"traffic upd", &mut next)
+  return next
+}
+
+fn finishedMac(secret: &([u8; 32]), hash: &([u8; 32])) -> [u8; 32] {
+  let mut key: [u8; 32] = [0; 32]
+  expandInto(secret, b"finished", &mut key)
+  return HmacSha256.authenticate(&key, hash)
+}
+
+fn trafficKeys(suite: Suite, secret: &([u8; 32])) -> Direction {
+  let mut direction = Direction { key: [0; 32], iv: [0; 12], sequence: 0, protected: true }
+  let keyLength: usize = if suite == Suite.ChaCha20Poly1305 { 32 } else { 16 }
+  expandInto(secret, b"key", Slice.viewMut<u8>(&mut direction.key, 0, keyLength))
+  expandInto(secret, b"iv", &mut direction.iv)
+  return direction
+}
+
+fn nonceOf(direction: &Direction) -> [u8; 12] {
+  let mut nonce = direction.iv
+  let mut index: usize = 0
+  while index < 8 {
+    let shift = usize.toU64(56 - index * 8)
+    let byte = u64.toU8(u64.bitAnd(u64.shiftRight(direction.sequence, shift), 255))
+    nonce[4 + index] = u8.bitXor(nonce[4 + index], byte)
+    index = index + 1
+  }
+  return nonce
+}
+
+fn keyOf(suite: Suite, direction: &Direction) -> &[u8] {
+  let length: usize = if suite == Suite.ChaCha20Poly1305 { 32 } else { 16 }
+  return Slice.view<u8>(&direction.key, 0, length)
+}
+
+// Encrypts `inner` into `target`: the ciphertext, then the 16-byte tag.
+fn sealInto(suite: Suite, direction: &Direction, header: &([u8; 5]), inner: &[u8], target: &mut [u8]) -> () {
+  let nonce = nonceOf(direction)
+  let length = inner.length
+  let mut tag: [u8; 16] = [0; 16]
+  if suite == Suite.ChaCha20Poly1305 {
+    let sealed = ChaCha20Poly1305.seal(keyOf(suite, direction), &nonce, header, inner,
+      Slice.viewMut<u8>(&mut target, 0, length), &mut tag)
+    drop sealed
+  } else {
+    let sealed = AesGcm.seal(keyOf(suite, direction), &nonce, header, inner,
+      Slice.viewMut<u8>(&mut target, 0, length), &mut tag)
+    drop sealed
+  }
+  let mut index: usize = 0
+  while index < 16 {
+    target[length + index] = tag[index]
+    index = index + 1
+  }
+  return ()
+}
+
+fn openRecord(suite: Suite, direction: &Direction, header: &([u8; 5]), ciphertext: &[u8], tag: &[u8], plaintext: &mut [u8]) -> bool {
+  let nonce = nonceOf(direction)
+  if suite == Suite.ChaCha20Poly1305 {
+    return match ChaCha20Poly1305.open(keyOf(suite, direction), &nonce, header, ciphertext, tag, move plaintext) {
+      Result.Success { value: _ } => true
+      Result.Failure { error } => { drop error false }
+    }
+  }
+  return match AesGcm.open(keyOf(suite, direction), &nonce, header, ciphertext, tag, move plaintext) {
+    Result.Success { value: _ } => true
+    Result.Failure { error } => { drop error false }
+  }
+}
+
+/// A `silk.net.tcp_server` protocol that serves TLS 1.3 and runs `inner` over the decrypted bytes.
+///
+/// # Details
+/// For each connection it makes a [`TlsServer`] and the state of `inner`. Bytes that arrive are
+/// decrypted and given to `inner`, and what `inner` writes is encrypted. When `inner` closes the
+/// connection, the server sends `close_notify` first.
+pub struct TlsProtocol<P> {
+  config: TlsServerConfig,
+  inner: P,
+}
+
+impl<P> TlsProtocol<P> {
+  /// Returns a protocol that serves `inner` over TLS with `config`.
+  pub fn make(config: TlsServerConfig, inner: P) -> TlsProtocol<P> {
+    return TlsProtocol<P> { config: move config, inner: move inner }
+  }
+}
+
+/// The state of one connection of a [`TlsProtocol`].
+pub struct TlsSession<S> {
+  tls: TlsServer,
+  inner: S,
+  received: List<u8>,
+  sent: List<u8>,
+}
+
+impl<S, P: Protocol<S>> Protocol<TlsSession<S>> for TlsProtocol<P> {
+  effect fn open(self: &Self) -> TlsSession<S> ! OutOfMemoryError ? &mut Allocator {
+    let inner = run Protocol<S>.open(&self.inner)
+    return TlsSession<S> { tls: TlsServer.make(), inner: move inner, received: List<u8>.make(), sent: List<u8>.make() }
+  }
+
+  effect fn receive(
+    self: &Self,
+    state: &mut TlsSession<S>,
+    input: &mut [u8],
+    ended: bool,
+    output: &mut List<u8>,
+  ) -> Received ! OutOfMemoryError ? &mut Allocator {
+    let total = input.length
+    let progress = run state.tls.receive(&self.config, &mut input, &mut output.*, &mut state.received)
+    if progress.status == TlsStatus.Failed { return Received { consumed: total, verdict: Verdict.Close } }
+    let closed = progress.status == TlsStatus.Closed
+    if List.length(&state.received) > 0 {
+      let pending = List.length(&state.received)
+      let answer = run Protocol<S>.receive(&self.inner, &mut state.inner, List.asMutSlice(&mut state.received), ended || closed, &mut state.sent)
+      let used = if answer.consumed > pending { pending } else { answer.consumed }
+      if used > 0 {
+        let rest = pending - used
+        let storage = List.asMutSlice(&mut state.received)
+        let mut moved: usize = 0
+        while moved < rest {
+          storage[moved] = storage[used + moved]
+          moved = moved + 1
+        }
+        List.truncate(&mut state.received, rest)
+      }
+      if List.length(&state.sent) > 0 {
+        run state.tls.seal(List.asSlice(&state.sent), &mut output.*)
+        List.clear(&mut state.sent)
+      }
+      if answer.verdict == Verdict.Close {
+        run state.tls.close(&mut output.*)
+        return Received { consumed: total, verdict: Verdict.Close }
+      }
+    }
+    if closed {
+      run state.tls.close(&mut output.*)
+      return Received { consumed: total, verdict: Verdict.Close }
+    }
+    return Received { consumed: progress.consumed, verdict: Verdict.KeepOpen }
+  }
+}
