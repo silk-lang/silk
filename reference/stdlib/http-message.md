@@ -1008,6 +1008,17 @@ pub fn class(self: &Self) -> StatusClass
 
 Returns the class, from the first digit of the code.
 
+<a id="Status.impl.reasonPhrase"></a>
+
+### Method `reasonPhrase`
+
+```silk
+pub fn reasonPhrase(self: &Self) -> Option<&'static [u8]>
+```
+
+Returns the reason phrase that RFC 9110 gives the code, such as `Not Found` for 404. Returns
+`None` for a code that has no phrase in this list.
+
 <a id="Header"></a>
 
 ## `Header`

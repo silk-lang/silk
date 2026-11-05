@@ -1290,6 +1290,16 @@ borrow a head from the parser.
 impl<'owner> RequestHead<'owner>
 ```
 
+<a id="RequestHead.impl.headBytes"></a>
+
+### Method `headBytes`
+
+```silk
+pub fn headBytes(self: &Self) -> &'owner [u8]
+```
+
+Returns the bytes of the head, from the request line through the empty line that ends it.
+
 <a id="RequestHead.impl.version"></a>
 
 ### Method `version`
