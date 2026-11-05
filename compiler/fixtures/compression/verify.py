@@ -12,7 +12,7 @@ CASES = [(0, 0), (1, 0), (2, 1), (3, 0), (257, 1), (258, 0), (259, 0),
 
 SOURCE = '''import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.core.effect {Effect}
-import silk.compress.deflate {Deflate, EncodeError}
+import silk.compress.deflate {EncodeError, Encoder, Options}
 import silk.compress.inflate {Format}
 import silk.collections.list {List}
 import silk.io.writer_native {StdoutWriter}
@@ -21,7 +21,7 @@ import silk.collections.slice {Slice}
 import silk.num.u32
 import silk.num.usize
 
-effect fn emit(size: usize, mode: usize, format: Format) -> ()
+effect fn emit(size: usize, mode: usize, format: Format, level: u32) -> ()
 ! OutOfMemoryError | EncodeError | WriterError ? &mut Allocator {
   let mut input = List<u8>.make()
   let mut output = List<u8>.make()
@@ -47,7 +47,7 @@ effect fn emit(size: usize, mode: usize, format: Format) -> ()
   }
   index = 0
   while index < size * 2 + 32 { run List<u8>.append(&mut output, 0) index = index + 1 }
-  let encoded = run Deflate.encode(List<u8>.asSlice(&input), List<u8>.asMutSlice(&mut output), format)
+  let encoded = run Encoder.encode(List<u8>.asSlice(&input), List<u8>.asMutSlice(&mut output), format, Options.make(level))
   let count = usize.toU32(encoded)
   let prefix: [u8; 4] = [u32.toU8(u32.bitAnd(count, 255)), u32.toU8(u32.bitAnd(u32.shiftRight(count, 8), 255)), u32.toU8(u32.bitAnd(u32.shiftRight(count, 16), 255)), u32.toU8(u32.shiftRight(count, 24))]
   let mut stdout = StdoutWriter.make()
@@ -87,8 +87,8 @@ def main():
     args = parser.parse_args()
     source = SOURCE
     for container in ('Raw', 'Zlib', 'Gzip'):
-        for size, mode in CASES:
-            source += f'  run emit({size}, {mode}, Format.{container}) |> Effect.provideMut<Allocator>(&mut allocator)\n'
+        for index, (size, mode) in enumerate(CASES):
+            source += f'  run emit({size}, {mode}, Format.{container}, {index % 10}) |> Effect.provideMut<Allocator>(&mut allocator)\n'
     source += '  return 0\n}\n'
     with tempfile.TemporaryDirectory(prefix='silk-compression-') as directory:
         project = Path(directory)
