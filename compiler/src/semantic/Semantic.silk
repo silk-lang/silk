@@ -6226,12 +6226,61 @@ effect fn relocatedStaticRejection(module: &ModuleId, rejected: Shared<Rejection
   return run rejectionAtCall(module, span, move rejected)
 }
 
+// Whether every argument of `application` and of its scopes is a lifetime, and none is static.
+fn regionArgumentsOnly(application: &Application) -> bool {
+  if List<StaticSlot>.length(&application.statics) != usize.ZERO || !lifetimesOnly(List<Argument>.asSlice(&application.arguments)) {
+    return false
+  }
+  let scopes = List<ScopeBinding>.asSlice(&application.scopes)
+  let mut at = usize.ZERO
+  while at < scopes.length {
+    if List<StaticSlot>.length(&scopes[at].statics) != usize.ZERO || !lifetimesOnly(List<Argument>.asSlice(&scopes[at].arguments)) {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn lifetimesOnly(arguments: &[Argument]) -> bool {
+  let mut at = usize.ZERO
+  while at < arguments.length {
+    let lifetime = match &arguments[at] { Argument.Lifetime {..} => true _ => false }
+    if !lifetime { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Whether `instance` runs one body whatever requests it: a function applied to no type, row or
+// static arguments and no providers, only regions, whose every pattern runs one definition
+// (`internBackendInstance`).
+fn callerIndependent(instance: &InstanceKey) -> bool {
+  let application = match move InstanceKey.application(instance) {
+    Option<Shared<Application>>.Some {value} => move value
+    Option<Shared<Application>>.None => { return false }
+  }
+  if !Shared<Application>.with<bool>(&application, regionArgumentsOnly) { return false }
+  return match move InstanceKey.providers(instance) {
+    Option<Shared<List<ProviderEntry>>>.Some {value} => Shared<List<ProviderEntry>>.with<bool>(&value,
+      fn(listed: &List<ProviderEntry>) -> bool { return List<ProviderEntry>.length(listed) == usize.ZERO })
+    Option<Shared<List<ProviderEntry>>>.None => true
+  }
+}
+
 // A rejection that the body of an instance reported in a module owned elsewhere, by the toolchain
 // or another package, located instead at the call in `module` that requested the instance, with
 // the original site related. A rejection in the requester's own package stays where it is, as
-// does one requested from a module owned elsewhere or from no authored call.
-effect fn requestedRejection(module: &ModuleId, span: Span, rejected: Shared<Rejection>) -> Shared<Rejection>
+// does one requested from a module owned elsewhere or from no authored call. The body of an
+// `independent` instance (`callerIndependent`) refuses the same for every caller, so its refusals
+// are its module's own errors and stay at their sites, as that module's own check reports them;
+// only a `compileError` it selects, which the module writes for its callers, moves to the call.
+effect fn requestedRejection(module: &ModuleId, span: Span, rejected: Shared<Rejection>, independent: bool) -> Shared<Rejection>
 ! OutOfMemoryError ? &mut Allocator {
+  let selected = Shared<Rejection>.with<bool>(&rejected, fn(value: &Rejection) -> bool {
+    return value.code == RejectionCode.SelectedCompileError
+  })
+  if independent && !selected { return move rejected }
   let foreign = Shared<Rejection>.with<bool>(&rejected, fn(value: &Rejection) -> bool {
     return !ModuleId.samePackage(&value.module, module) || (toolchainModule(&value.module) && !toolchainModule(module))
   })
@@ -6276,12 +6325,13 @@ effect fn copySharedArguments(rejected: &Shared<Rejection>, diagnostic: &mut Rej
 }
 
 // Relocates each rejection of `found` from `start` on with `requestedRejection`.
-effect fn relocateRequested(found: &mut List<Shared<Rejection>>, start: usize, module: &ModuleId, span: Span) -> ()
+effect fn relocateRequested(found: &mut List<Shared<Rejection>>, start: usize, module: &ModuleId, span: Span,
+  independent: bool) -> ()
 ! OutOfMemoryError ? &mut Allocator {
   let mut at = start
   while at < List<Shared<Rejection>>.length(&found.*) {
     let original = Shared<Rejection>.clone(&List<Shared<Rejection>>.asSlice(&found.*)[at])
-    let relocated = run requestedRejection(module, span, move original)
+    let relocated = run requestedRejection(module, span, move original, independent)
     let mut listed = List<Shared<Rejection>>.asMutSlice(&mut found.*)
     listed[at] = move relocated
     at = at + usize.ONE
@@ -37996,6 +38046,19 @@ effect fn checkReceiverCall<'scope>(
   }
   let fieldSelection = run selectedRecordField(&mut resolver.*, &mut owner.*, &mut dependencies.*,
     module, &provider, Bytes.asSlice(&member), memberSpan)
+  let fieldNamed = match &fieldSelection {
+    Result<Option<CheckedRecordMember>, Shared<Rejection>>.Success {value: Option<CheckedRecordMember>.None} => false
+    _ => true
+  }
+  // A field and an inherent member of one name are the owner's own collision (SEM0195), so a call
+  // of that name reports the collision rather than whichever of the two answers first.
+  if fieldNamed {
+    let colliding = run rejectedInherentMember(&mut resolver.*, &mut owner.*, &mut dependencies.*, &provider,
+      Bytes.asSlice(&member), memberSpan)
+    if let Option<Shared<Rejection>>.Some {value} = move colliding {
+      return Result<BodyNodeId, Shared<Rejection>>.failResult(move value)
+    }
+  }
   match move fieldSelection {
     Result<Option<CheckedRecordMember>, Shared<Rejection>>.Success {value: Option<CheckedRecordMember>.Some {..}} => {
       if staticBody { return run bodyRejection(&resolver.*, module, RejectionCode.StaticPhaseViolation, span) }
@@ -38599,6 +38662,25 @@ fn firstParameterBorrows(hir: &Module, contract: HirId, typeName: &[u8]) -> bool
     }
   }
   return false
+}
+
+// The rejection of `provider`'s inherent member `name`, such as one that collides with a field
+// (SEM0195); none when the owner has no such member or publishes it.
+effect fn rejectedInherentMember(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut List<Dependency>, provider: &Shared<Type>, name: &[u8], span: Span) -> Option<Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let moduleOrdinal = declaringModuleOrdinal(&resolver.*, provider)
+  if moduleOrdinal == usize.MAX { return Option<Shared<Rejection>>.none() }
+  let declared = resolvedModule(&resolver.*, moduleOrdinal)
+  let ownerOrdinal = match move run ordinalOfProvider(&mut resolver.*, &declared, provider) {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => { return Option<Shared<Rejection>>.none() }
+  }
+  let key = run inherentMemberKey(&mut resolver.*, moduleOrdinal, ownerOrdinal, name)
+  let listed = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, key, span)
+  let lookup = Shared<Result<Answer, NoRejection>>.with<InherentLookup>(&listed,
+    fn(answer: &Result<Answer, NoRejection>) -> InherentLookup { return projectedMember(answer) })
+  return move lookup.rejected
 }
 
 effect fn selectedRecordField(
@@ -93922,9 +94004,10 @@ impl Semantic {
       )
       let reportedBefore = List<Shared<Rejection>>.length(&result.rejections)
       run appendCheckedAnswer(&mut result.rejections, &mut result.gaps, &mut self.query, &identity, &answer)
-      // A refusal inside a toolchain body reached from user code belongs at the user's call.
+      // A refusal inside a toolchain body reached from user code belongs at the user's call,
+      // unless the body is the same for every caller.
       let site = requestSite(&entered.requester, &entered.module, entered.span)
-      run relocateRequested(&mut result.rejections, reportedBefore, &site.module, site.span)
+      run relocateRequested(&mut result.rejections, reportedBefore, &site.module, site.span, callerIndependent(&instance))
       let index = Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&answer, answerMirIndex)
       if let Option<usize>.Some { value } = move index {
         let anchor = run instanceAnchor(&mut self.resolver, &instance)
@@ -96601,9 +96684,11 @@ impl Semantic {
             continue
           }
           // A refusal inside a toolchain body this build reached from user code, such as a
-          // template or conformance failure of a `Format.format` specialization, belongs at the call.
+          // template or conformance failure of a `Format.format` specialization, belongs at the
+          // call, unless the body is the same for every caller.
           let site = requestSite(&entered.requester, &entered.module, entered.span)
-          run List<Shared<Rejection>>.append(&mut refusals, run requestedRejection(&site.module, site.span, move value))
+          run List<Shared<Rejection>>.append(&mut refusals, run requestedRejection(&site.module, site.span, move value,
+            callerIndependent(&instance)))
         }
         if refused.length > usize.ZERO {
           continue
@@ -98643,7 +98728,7 @@ impl Semantic {
     let identity = DeclarationId.copyShared(&InstanceKey.identity(instance))
     run appendCheckedAnswer(&mut result.rejections, &mut result.gaps, &mut self.query, &identity, &answer)
     let requested = requestSite(&site.requester, &site.entered, site.span)
-    run relocateRequested(&mut result.rejections, reportedBefore, &requested.module, requested.span)
+    run relocateRequested(&mut result.rejections, reportedBefore, &requested.module, requested.span, callerIndependent(instance))
     return true
   }
 
