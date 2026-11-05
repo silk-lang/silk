@@ -36,6 +36,7 @@ import backend.LoweringPlan {
   passedIndirectly,
   pointerRepresentation,
   providerLocalAt,
+  packedResult,
   resultInOut,
   scalar,
   sliceFact,
@@ -160,6 +161,9 @@ struct Writer {
   extras: List<u64>,
   providers: List<u64>,
   out: u64,
+  /// The register type an ordinary definition returns its 8- or 16-byte aggregate result as
+  /// (`packedResult`), `none()` otherwise. `out` is then the definition's own slot for it.
+  packed: u64,
   failure: u64,
   context: u64,
   observer: u64,
@@ -229,7 +233,7 @@ effect fn writerOfWidth(pointerBits: usize, fastPath: bool) -> Writer ! OutOfMem
   return Writer {module: Module.make(), located: usize.ZERO, symbol: Bytes.make(), lines: List<u64>.make(), trap: Option<TrapReport>.none(), observerLocal: usize.MAX, causeLocal: usize.MAX, siteLocal: usize.MAX, fastPath: fastPath,
     pointerBits: pointerBits, coff: false, slots: List<u64>.make(), companions: List<u64>.make(),
     blocks: List<u64>.make(), scalars: List<bool>.make(), alignments: List<usize>.make(), copies: List<CallerCopy>.make(), dropCopies: List<DropCopy>.make(), parameters: List<u64>.make(), extras: List<u64>.make(), providers: List<u64>.make(),
-    out: Bitcode.none(), failure: Bitcode.none(), context: Bitcode.none(), observer: Bitcode.none(), cause: Bitcode.none(),
+    out: Bitcode.none(), packed: Bitcode.none(), failure: Bitcode.none(), context: Bitcode.none(), observer: Bitcode.none(), cause: Bitcode.none(),
     site: Bitcode.none(), transfer: Bitcode.none(), frame: Bitcode.none(), threaded: List<bool>.make(), cold: List<bool>.make(),
     direct: List<usize>.make(), bound: List<bool>.make(), tables: List<JumpTable>.make()}
 }
@@ -255,6 +259,7 @@ fn resetFunction(writer: &mut Writer) -> () {
   List<u64>.clear(&mut writer.*.extras)
   List<u64>.clear(&mut writer.*.providers)
   writer.out = Bitcode.none()
+  writer.packed = Bitcode.none()
   writer.failure = Bitcode.none()
   writer.context = Bitcode.none()
   writer.observer = Bitcode.none()
@@ -291,6 +296,25 @@ effect fn pointerType(writer: &mut Writer) -> u64 ! OutOfMemoryError ? &mut Allo
 
 effect fn voidType(writer: &mut Writer) -> u64 ! OutOfMemoryError ? &mut Allocator {
   return run Module.void(&mut writer.*.module)
+}
+
+// The register type of an aggregate result `packedResult` lets travel in registers: one `i64`
+// for 8 bytes, `{ i64, i64 }` for 16 (silk#2489).
+effect fn packedType(writer: &mut Writer, kind: Representation) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let word = run integerType(&mut writer.*, 64)
+  if kind.size == 8 { return word }
+  let fields = [word, word]
+  return run Module.structure(&mut writer.*.module, &fields)
+}
+
+// Gives a definition whose result is packed (`writer.packed`) its own result slot, in the entry
+// block: the body writes the result there as it would to a caller's `%out`, and the return loads it.
+effect fn packedSlot(writer: &mut Writer, kind: Representation, alignment: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if writer.packed == Bitcode.none() { return () }
+  let bytes = run integerType(&mut writer.*, 8)
+  let slot = run Module.array(&mut writer.*.module, kind.size, bytes)
+  writer.out = run Module.alloca(&mut writer.*.module, slot, usize.toU64(alignment))
+  Module.setName(&mut writer.*.module, writer.out, hiddenName(b"out"))
 }
 
 // The target word, an integer as wide as an address.
@@ -3524,6 +3548,10 @@ effect fn emitReturn(
   // The result local already lives in the caller's out-slot (`resultInOut`).
   if writer.out != Bitcode.none() && resultInOut(function, kind) {
     if fallible { return run returnStatus(&mut writer.*, false) }
+    if writer.packed != Bitcode.none() {
+      let packed = run Module.load(&mut writer.*.module, writer.packed, writer.out, usize.toU64(resultLayout.alignment), false)
+      return run Module.ret(&mut writer.*.module, packed)
+    }
     return run Module.retVoid(&mut writer.*.module)
   }
   let value = run emitOperand(&mut writer.*, function, target, layouts, &returned)
@@ -4279,11 +4307,15 @@ effect fn emitCallInner(
     index = index + usize.ONE
   }
   // A wide vector result is written through the caller's address like an aggregate (SIMD-009).
-  let outward = kind.aggregate || passedIndirectly(kind)
+  let mut outward = kind.aggregate || passedIndirectly(kind)
+  let packed = !fallible && packedResult(kind, writer.fastPath)
+  if packed { outward = false }
   let pointer = run pointerType(&mut writer.*)
   let mut resultType = run voidType(&mut writer.*)
   let mut extended = false
-  if fallible {
+  if packed {
+    resultType = run packedType(&mut writer.*, kind)
+  } else if fallible {
     resultType = run integerType(&mut writer.*, usize.ONE)
     extended = writer.fastPath
   } else if !outward {
@@ -4344,7 +4376,9 @@ effect fn emitCallInner(
     let onSuccess = blockAt(&writer.*, normal)
     return run branchUnlikely(&mut writer.*, returned, onFailure, onSuccess)
   }
-  if !kind.unit && !outward {
+  if packed {
+    run Module.store(&mut writer.*.module, returned, output.value, usize.toU64(output.alignment), false)
+  } else if !kind.unit && !outward {
     run storeValue(&mut writer.*, &output, &Value {scalar: kind, value: returned})
   }
   let next = blockAt(&writer.*, normal)
@@ -5373,6 +5407,11 @@ pub effect fn emit(
   let mut lanes = signature()
   let mut resultType = run voidType(&mut writer)
   let mut outward = result.aggregate || passedIndirectly(result)
+  if !exported && !fallible && packedResult(result, fastPath) {
+    outward = false
+    resultType = run packedType(&mut writer, result)
+    writer.packed = resultType
+  }
   if let Option<CAbi.Lane>.Some {value: returned} = &cResult {
     outward = returned.passing == CPassing.Indirect
     let owner = InstanceKey.identity(&function.key)
@@ -5384,7 +5423,7 @@ pub effect fn emit(
   } else if fallible {
     resultType = run integerType(&mut writer, usize.ONE)
     if fastPath { run addAttributes(&mut lanes, Bitcode.positionResult(), &[0, Bitcode.attrZeroExt()]) }
-  } else if !outward {
+  } else if !outward && writer.packed == Bitcode.none() {
     resultType = run typeOf(&mut writer, result)
     if extendedFlag(&writer, result) { run addAttributes(&mut lanes, Bitcode.positionResult(), &[0, Bitcode.attrZeroExt()]) }
   }
@@ -5543,6 +5582,7 @@ pub effect fn emit(
     let handle = blockAt(&writer, at)
     startBlock(&mut writer, handle)
     if at == usize.ZERO {
+      run packedSlot(&mut writer, result, resultFacts.alignment)
       run emitEntrySlots(&mut writer, function, target, layouts, foreign)
       // An unoptimized compile never reads lifetime markers, so a fast-path function plans none.
       if !fastPath {
@@ -5972,6 +6012,7 @@ effect fn emitDriver(writer: &mut Writer, function: &MirFunction, target: &Targe
   let failed = run byteOffset(&mut writer.*, transfer, Coroutine.transferFailed(word))
   let clear = run integerOf(&mut writer.*, 8, 0)
   run storeOf(&mut writer.*, clear, failed, usize.ZERO)
+  run packedSlot(&mut writer.*, result, resultFacts.alignment)
   let mut out = Bitcode.none()
   if fallible || result.aggregate || passedIndirectly(result) { out = writer.out }
   else if !result.unit {
@@ -6001,6 +6042,10 @@ effect fn emitDriver(writer: &mut Writer, function: &MirFunction, target: &Targe
     let zero = run integerOf(&mut writer.*, 8, 0)
     let status = run compareOf(&mut writer.*, Bitcode.intNe(), flag, zero)
     return run Module.ret(&mut writer.*.module, status)
+  }
+  if writer.packed != Bitcode.none() {
+    let packed = run Module.load(&mut writer.*.module, writer.packed, out, usize.toU64(resultFacts.alignment), false)
+    return run Module.ret(&mut writer.*.module, packed)
   }
   if result.aggregate || result.unit || passedIndirectly(result) { return run Module.retVoid(&mut writer.*.module) }
   let value = run loadOf(&mut writer.*, result, out, resultFacts.alignment)
