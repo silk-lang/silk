@@ -139,6 +139,8 @@
 //! @category Networking
 
 import silk.io.byte_duplex {ByteDuplex, ByteIoError, ByteIoOperation, ReadTransfer}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.mem.shared {Shared}
 import silk.core.effect {Effect}
 import silk.text.format {Debug, Format, Formatter}
 import silk.num.i16
@@ -1236,13 +1238,15 @@ unsafe extern "C" fn send(fd: SocketHandle, buffer: ?[*]const u8, length: usize,
 }
 unsafe extern "C" fn shutdown(fd: SocketHandle, how: i32) -> i32
 
-struct Descriptor { fd: SocketHandle, session: Option<SocketSession> }
+// `owner` is false for the halves of a split connection: they share the owning Descriptor through
+// `Connection.keep`, which closes the socket when the last half is gone.
+struct Descriptor { fd: SocketHandle, session: Option<SocketSession>, owner: bool }
 
 impl Drop for Descriptor {
   fn drop(self: &mut Descriptor) -> () {
   static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArchitecture() == "x86_64" && Intrinsic.targetAbi() == "msvc" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "darwin" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64") && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
       let fd = Intrinsic.replace(self.fd, invalidSocket())
-      if fd != invalidSocket() { let _ignored = unsafe closeSocket(fd) }
+      if fd != invalidSocket() && self.owner { let _ignored = unsafe closeSocket(fd) }
 
   } else {
     compileError("NativeSocket requires a supported Windows, Darwin, or GNU libc profile")
@@ -1262,6 +1266,7 @@ pub struct Connection {
   phaseValue: ConnectionPhase,
   readEnded: bool,
   options: ConnectOptions,
+  keep: Option<Shared<Descriptor>>,
 }
 
 /// A listening socket and its local address.
@@ -1304,9 +1309,50 @@ struct AcceptedUsingOwner<C> {
   context: Option<C>,
 }
 
+/// The two halves of a connection, from [`Connection.split`].
+pub struct ConnectionHalves {
+  /// The half to read from.
+  pub reader: Connection,
+  /// The half to write to.
+  pub writer: Connection,
+}
+
 impl Connection {
   /// Returns the state of the connection.
   pub fn phase(self: &Self) -> ConnectionPhase { return self.phaseValue }
+
+  /// Splits the connection into a half to read from and a half to write to, so that one fiber can
+  /// wait for input while another one writes.
+  ///
+  /// # Details
+  /// Both halves are connections on the same socket, and each keeps its own state. Use `reader`
+  /// only to read and `writer` only to write. `ByteDuplex.shutdownWrite` on `writer` closes the
+  /// write direction of the socket. Closing or dropping a half releases it; the socket closes when
+  /// both halves are closed or dropped.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the shared socket cannot be allocated. The connection is then closed.
+  pub effect fn split(self: Self) -> ConnectionHalves ! OutOfMemoryError ? &mut Allocator {
+    let Connection {descriptor, phaseValue, readEnded, options, keep} = move self
+    let fd = descriptor.fd
+    let shared = run Shared<Descriptor>.make(move descriptor)
+    let reader = Connection {
+      descriptor: Descriptor {fd: fd, session: Option<SocketSession>.none(), owner: false},
+      phaseValue: phaseValue,
+      readEnded: readEnded,
+      options: options,
+      keep: Option<Shared<Descriptor>>.some(Shared<Descriptor>.clone(&shared)),
+    }
+    let writer = Connection {
+      descriptor: Descriptor {fd: fd, session: Option<SocketSession>.none(), owner: false},
+      phaseValue: phaseValue,
+      readEnded: readEnded,
+      options: options,
+      keep: Option<Shared<Descriptor>>.some(move shared),
+    }
+    drop keep
+    return ConnectionHalves {reader: move reader, writer: move writer}
+  }
 
   /// Closes the connection. A second call does nothing.
   ///
@@ -1317,6 +1363,12 @@ impl Connection {
       self.phaseValue = ConnectionPhase.Closed
       self.readEnded = true
       if fd == invalidSocket() { return () }
+      if !self.descriptor.owner {
+        // A half of a split connection: the socket closes when the other half is gone too.
+        let kept = Intrinsic.replace(self.keep, Option<Shared<Descriptor>>.none())
+        drop kept
+        return ()
+      }
       let status = unsafe closeSocket(fd)
       let code = if status == 0 { 0 } else { unsafe currentError() }
       let session = Intrinsic.replace(self.descriptor.session, Option<SocketSession>.none())
@@ -1758,7 +1810,7 @@ effect fn makeConnectionDescriptor(
   let session = run socketSession()
   let fd = unsafe socket(family, socketType(), protocol)
   if fd == invalidSocket() { return run reject(NativeSocketOperation.Socket, unsafe currentError()) }
-  let descriptor = Descriptor {fd: fd, session: Option<SocketSession>.some(move session)}
+  let descriptor = Descriptor {fd: fd, session: Option<SocketSession>.some(move session), owner: true}
   run configureConnectionSocket(&descriptor, tcp, options, deadline)
   return move descriptor
 }
@@ -1823,6 +1875,7 @@ effect fn connectOwned<T>(
     phaseValue: ConnectionPhase.Connecting,
     readEnded: false,
     options: options,
+    keep: Option<Shared<Descriptor>>.none(),
   }
   run checkConnectDeadline(deadline)
   attempts.* = attempts.* + usize.ONE
@@ -2218,7 +2271,7 @@ effect fn makeListenerDescriptor(family: i32, tcp: bool, options: &ListenOptions
   let session = run socketSession()
   let fd = unsafe socket(family, socketType(), protocol)
   if fd == invalidSocket() { return run rejectListener(NativeSocketOperation.Socket, unsafe currentError()) }
-  let descriptor = Descriptor {fd: fd, session: Option<SocketSession>.some(move session)}
+  let descriptor = Descriptor {fd: fd, session: Option<SocketSession>.some(move session), owner: true}
   run configureListenerDescriptorFlags(&descriptor)
   if options.reuseAddressValue {
     run setListenerInteger(descriptor.fd, nativeSocketLevel(), nativeSocketReuseAddress(), 1)
@@ -2592,7 +2645,7 @@ pub effect fn accept(
         Pointer.fromMutRef<u32>(&mut length),
       )
       if fd != invalidSocket() {
-        let descriptor = Descriptor {fd: fd, session: Option<SocketSession>.some(move session)}
+        let descriptor = Descriptor {fd: fd, session: Option<SocketSession>.some(move session), owner: true}
         let unixListener = match & listener.boundValue {
           BoundAddress.Unix {..} => true
           _ => false
@@ -2610,6 +2663,7 @@ pub effect fn accept(
             phaseValue: ConnectionPhase.Open,
             readEnded: false,
             options: connectionOptions,
+            keep: Option<Shared<Descriptor>>.none(),
           },
           peerValue: move peer,
         }
