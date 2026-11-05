@@ -221,98 +221,6 @@ pub fn occupiedAt(self: &Self, index: usize) -> bool
 Returns `true` if the bucket at `index` holds an element. Returns `false` for an index out of
 range.
 
-<a id="HashSet.impl.insert"></a>
-
-### Method `insert`
-
-```silk
-pub effect<'env> fn insert<T: HashKey + 'env, 'env>(
-    self: &mut Self,
-    value: T
-  ) -> bool ! OutOfMemoryError ? &mut Allocator
-```
-
-Adds `value` to the set. Returns `true` if the set already held an equal element, or `false`
-if `value` is new.
-
-#### Details
-
-If an equal element is already present, the set does not change and drops `value`. The set
-keeps the element that it already held.
-
-#### Errors
-
-- `OutOfMemoryError` if the table must grow and the `Allocator` cannot supply the storage. The
-  set does not change.
-
-<a id="HashSet.impl.contains"></a>
-
-### Method `contains`
-
-```silk
-pub fn contains<T: HashKey>(self: &Self, value: T) -> bool
-```
-
-Returns `true` if the set holds an element equal to `value`.
-
-#### Details
-
-This function consumes `value`. It does not change the set.
-
-<a id="HashSet.impl.indexOf"></a>
-
-### Method `indexOf`
-
-```silk
-pub fn indexOf<T: HashKey>(self: &Self, value: T) -> Option<usize>
-```
-
-Returns the bucket index of the element equal to `value`, or `None` if there is no such
-element.
-
-#### When to use
-
-Use `indexOf` to find an element without a copy or a move, for example when the element type
-is not `Copy`.
-
-#### Details
-
-This function consumes `value`. It does not change the set.
-
-<a id="HashSet.impl.remove"></a>
-
-### Method `remove`
-
-```silk
-pub fn remove<T: HashKey>(self: &mut Self, value: T) -> Option<T>
-```
-
-Removes the element equal to `value` and returns the stored element. Returns `None` if there
-is no such element.
-
-#### Details
-
-The caller owns the returned element. This function consumes `value`. It does not allocate.
-
-<a id="HashSet.impl.elementAt"></a>
-
-### Method `elementAt`
-
-```silk
-pub fn elementAt<T: Copy>(self: &Self, index: usize) -> T
-```
-
-Returns a copy of the element in the bucket at `index`.
-
-#### When to use
-
-Use `elementAt` with [`HashSet.occupiedAt`](#HashSet.impl.occupiedAt) to visit each element in bucket order.
-
-#### Gotchas
-
-The element type must be `Copy`. If `index` is out of range or the bucket is empty, the
-program traps.
-
 <a id="HashSet.impl.reserve"></a>
 
 ### Method `reserve`
@@ -380,6 +288,114 @@ Use `clearAndFree` when the set stays alive but its storage is no longer needed.
 
 This function does not allocate and does not need an `Allocator`. The next insert allocates
 eight buckets again, as on a set from [`HashSet.make`](#HashSet.impl.make). The seed does not change.
+
+<a id="HashSet.impl-2"></a>
+
+## Implementation `HashSet<T>`
+
+```silk
+impl<T: HashKey> HashSet<T>
+```
+
+<a id="HashSet.impl.insert"></a>
+
+### Method `insert`
+
+```silk
+pub effect<'env> fn insert<'env>(
+    self: &mut Self,
+    value: T
+  ) -> bool ! OutOfMemoryError ? &mut Allocator
+```
+
+Adds `value` to the set. Returns `true` if the set already held an equal element, or `false`
+if `value` is new.
+
+#### Details
+
+If an equal element is already present, the set does not change and drops `value`. The set
+keeps the element that it already held.
+
+#### Errors
+
+- `OutOfMemoryError` if the table must grow and the `Allocator` cannot supply the storage. The
+  set does not change.
+
+<a id="HashSet.impl.contains"></a>
+
+### Method `contains`
+
+```silk
+pub fn contains(self: &Self, value: T) -> bool
+```
+
+Returns `true` if the set holds an element equal to `value`.
+
+#### Details
+
+This function consumes `value`. It does not change the set.
+
+<a id="HashSet.impl.indexOf"></a>
+
+### Method `indexOf`
+
+```silk
+pub fn indexOf(self: &Self, value: T) -> Option<usize>
+```
+
+Returns the bucket index of the element equal to `value`, or `None` if there is no such
+element.
+
+#### When to use
+
+Use `indexOf` to find an element without a copy or a move, for example when the element type
+is not `Copy`.
+
+#### Details
+
+This function consumes `value`. It does not change the set.
+
+<a id="HashSet.impl.remove"></a>
+
+### Method `remove`
+
+```silk
+pub fn remove(self: &mut Self, value: T) -> Option<T>
+```
+
+Removes the element equal to `value` and returns the stored element. Returns `None` if there
+is no such element.
+
+#### Details
+
+The caller owns the returned element. This function consumes `value`. It does not allocate.
+
+<a id="HashSet.impl-3"></a>
+
+## Implementation `HashSet<T>`
+
+```silk
+impl<T: Copy> HashSet<T>
+```
+
+<a id="HashSet.impl.elementAt"></a>
+
+### Method `elementAt`
+
+```silk
+pub fn elementAt(self: &Self, index: usize) -> T
+```
+
+Returns a copy of the element in the bucket at `index`.
+
+#### When to use
+
+Use `elementAt` with [`HashSet.occupiedAt`](#HashSet.impl.occupiedAt) to visit each element in bucket order.
+
+#### Gotchas
+
+The element type must be `Copy`. If `index` is out of range or the bucket is empty, the
+program traps.
 
 <a id="HashSet.impl.Drop"></a>
 

@@ -85,7 +85,7 @@ Owned storage that holds one valid `T`. [`Initialized.into`](#Initialized.impl.i
 ## Implementation `Uninitialized<T>`
 
 ```silk
-impl<T> Uninitialized<T>
+impl<T: Copy> Uninitialized<T>
 ```
 
 <a id="Uninitialized.impl.make"></a>
@@ -93,7 +93,7 @@ impl<T> Uninitialized<T>
 ### Associated function `make`
 
 ```silk
-pub effect fn make<T: Copy>() -> Uninitialized<T> ! OutOfMemoryError ? &mut Allocator
+pub effect fn make() -> Uninitialized<T> ! OutOfMemoryError ? &mut Allocator
 ```
 
 Allocates storage for one `T`. It does not write a value.
@@ -107,7 +107,7 @@ Allocates storage for one `T`. It does not write a value.
 ### Method `address`
 
 ```silk
-pub fn address<T: Copy>(self: &mut Self) -> *mut T
+pub fn address(self: &mut Self) -> *mut T
 ```
 
 Returns the address of the storage, to pass to a foreign function. It does not read or write
@@ -123,7 +123,7 @@ The address does not keep the storage alive. The foreign function must finish wi
 ### Method `initialize`
 
 ```silk
-pub fn initialize<T: Copy>(self: Self, value: T) -> Initialized<T>
+pub fn initialize(self: Self, value: T) -> Initialized<T>
 ```
 
 Writes `value` into the storage and returns the initialized state.
@@ -133,7 +133,7 @@ Writes `value` into the storage and returns the initialized state.
 ### Method `assumeInitialized`
 
 ```silk
-pub unsafe fn assumeInitialized<T: Copy>(self: Self) -> Initialized<T>
+pub unsafe fn assumeInitialized(self: Self) -> Initialized<T>
 ```
 
 Returns the initialized state after foreign code wrote the value.
@@ -149,7 +149,7 @@ that were not written, or a value that is not valid for `T`, such as a `bool` ot
 ## Implementation `Initialized<T>`
 
 ```silk
-impl<T> Initialized<T>
+impl<T: Copy> Initialized<T>
 ```
 
 <a id="Initialized.impl.into"></a>
@@ -157,7 +157,7 @@ impl<T> Initialized<T>
 ### Method `into`
 
 ```silk
-pub fn into<T: Copy>(self: Self) -> T
+pub fn into(self: Self) -> T
 ```
 
 Returns the value and releases the storage.
