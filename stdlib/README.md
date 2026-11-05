@@ -27,9 +27,10 @@ and accepts concatenated streams and padding. Its supported block checks are non
 CRC-64, and SHA-256. Other XZ filters are reported as unsupported, matching the reference's scope.
 The existing DEFLATE and Zstandard decoders provide incremental decoding.
 
-Zstandard encoding covers levels 1 to 22 with hash-chain matching, Huffman literals, and FSE or
-predefined sequence tables, in steps with flushes, an optional checksum, and the content size. Its
-frames decode with the reference `zstd`, but are not the same bytes that it writes.
+Zstandard encoding covers levels 1 to 22 with the reference `zstd` parameters and match strategies
+(hash tables, lazy hash chains, binary trees, and the optimal parser), in steps with flushes, an
+optional checksum, and the content size. Its frames decode with the reference `zstd` and are
+within about 1% of its size at each level, but are not the same bytes that it writes.
 
 The shared native corpus includes independent liblzma fixtures and malformed-input cases.
 Regenerate them with `python compiler/fixtures/compression/generate.py` from the repository root.

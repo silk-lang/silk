@@ -10,10 +10,13 @@ steps and with fixed memory. Use [`ZstdEncoder.encode`](#ZstdEncoder.impl.encode
 with `silk.compress.zstd.Zstd`.
 
 ## Details
-The encoder finds matches with hash chains over a window of up to 128 MiB, greedily for low
-levels and lazily for higher ones. It codes literals with Huffman codes and sequences with
-FSE tables made for each block, or the predefined tables when those are smaller. A block that
-does not shrink is stored raw, and a block of one repeated byte is stored as RLE.
+Each level uses the parameters and match strategy of the reference `zstd` for large inputs:
+one hash table for levels 1 and 2, two hash tables for 3 and 4, lazy matching over hash chains
+for 5 to 12, a binary tree with lazy matching for 13 to 15, and a binary tree with an optimal
+parser that prices literals and sequences for 16 to 22. The window grows from 512 KiB at level
+1 to 128 MiB at level 22. Literals use Huffman codes, and sequences use FSE tables made for each
+block, or the predefined tables when those are smaller. A block that does not shrink is stored
+raw, and a block of one repeated byte is stored as RLE.
 [`ZstdEncoder.make`](#ZstdEncoder.impl.make) allocates all storage one time. Later calls do not allocate and do not
 keep a borrow of your buffers. The output is deterministic but is not the same bytes that the
 reference `zstd` writes.
@@ -374,8 +377,8 @@ pub fn make(level: u32) -> ZstdOptions
 ```
 
 Returns options for `level` with the window of the reference `zstd` for that level (512 KiB
-for level 1, 1 MiB for 2, 2 MiB for 3 to 5, 4 MiB for 6 to 12, and 8 MiB above), no checksum,
-and the content size recorded when known.
+for level 1, 1 MiB for 2, 2 MiB for 3 to 8, 4 MiB for 9 to 16, 8 MiB for 17 to 19, and 32,
+64, and 128 MiB for 20, 21, and 22), no checksum, and the content size recorded when known.
 
 <a id="ZstdEncoder"></a>
 
@@ -395,7 +398,8 @@ storage.
 
 ### Details
 [`ZstdEncoder.make`](#ZstdEncoder.impl.make) allocates all storage one time: twice the window, the hash and chain
-tables (up to 16 MiB each for the highest levels), and about 640 KiB of block buffers. Later
+tables (64 KiB together at level 1, 640 MiB at level 22, and smaller when the window is), about
+640 KiB of block buffers, and 160 KiB more for the optimal parser of levels 16 to 22. Later
 calls do not allocate and do not keep a borrow of your buffers, so you can move the encoder
 between threads between calls.
 
