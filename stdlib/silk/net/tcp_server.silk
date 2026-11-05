@@ -408,6 +408,9 @@ static if Intrinsic.targetOperatingSystem() == "linux"
       return ()
     }
     let mut events: [EpollEvent; 512] = [epollEvent(0, 0, 0); 512]
+    // One read buffer and one output list for the whole worker; see `serveInput`.
+    let mut scratch = run Bytes.zeroed(scratchBytes(&options))
+    let mut shared = List<u8>.make()
     let mut slots = List<Slot<S>>.make()
     let mut free = List<u32>.make()
     let mut now = unsafe time(Pointer.null<i64>())
@@ -436,7 +439,7 @@ static if Intrinsic.targetOperatingSystem() == "linux"
         let mut open = true
         if u32.bitAnd(event.events, u32.bitOr(EPOLLIN, u32.bitOr(EPOLLRDHUP, u32.bitOr(EPOLLHUP, EPOLLERR)))) != 0 {
           slot.lastActive = now
-          open = run serveInput<S, P>(&mut slot, protocol.get(), &options)
+          open = run serveInput<S, P>(&mut slot, protocol.get(), &options, &mut scratch, &mut shared)
         }
         if open && u32.bitAnd(event.events, EPOLLOUT) != 0 { open = flush<S>(&mut slot) }
         if !open { run release<S>(&mut slot, &mut free, index) }
@@ -477,7 +480,8 @@ static if Intrinsic.targetOperatingSystem() == "linux"
       let one: i32 = 1
       let _delay = unsafe setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, Pointer.fromRef<i32>(&one), 4)
       let state = run Protocol<S>.open(protocol)
-      let input = run Bytes.zeroed(options.readBufferBytes)
+      // A connection gets its own input buffer only when bytes are left over; see `serveInput`.
+      let input = Bytes.make()
       let mut index: usize = 0
       let mut generation: u32 = 0
       match List.pop(&mut free.*) {
@@ -531,9 +535,73 @@ static if Intrinsic.targetOperatingSystem() == "linux"
     return ()
   }
 
+  // The size of the read buffer that a worker shares: 64 KiB, but not over `maxInputBytes` and not
+  // under `readBufferBytes`.
+  fn scratchBytes(options: &TcpServerOptions) -> usize {
+    let mut size: usize = 65536
+    if size > options.maxInputBytes { size = options.maxInputBytes }
+    if size < options.readBufferBytes { size = options.readBufferBytes }
+    return size
+  }
+
   // Reads until the socket is empty, runs the protocol, and sends. Returns false to close.
-  effect fn serveInput<S, P: Protocol<S>>(slot: &mut Slot<S>, protocol: &P, options: &TcpServerOptions) -> bool
+  //
+  // A connection with no pending input reads into the worker's `scratch` buffer, and one with no
+  // pending output lets the protocol write into the worker's `shared` list. Only bytes that are
+  // left over, a partial request or output that the socket did not take, move into the
+  // connection's own buffers. So an idle connection holds no buffer.
+  effect fn serveInput<S, P: Protocol<S>>(
+    slot: &mut Slot<S>,
+    protocol: &P,
+    options: &TcpServerOptions,
+    scratch: &mut Bytes,
+    shared: &mut List<u8>,
+  ) -> bool
   ! OutOfMemoryError ? &mut Allocator {
+    if slot.end == slot.start && !slot.closing {
+      let capacity = Bytes.length(&scratch.*)
+      let mut got: isize = 0
+      while true {
+        got = unsafe readSocket(slot.fd, Pointer.fromMutSlice<u8>(Bytes.asMutSlice(&mut scratch.*)), capacity)
+        if got >= 0 { break }
+        let code = lastError()
+        if code == INTERRUPTED { continue }
+        if code == AGAIN { return true }
+        return false
+      }
+      if got == 0 {
+        if List.length(&slot.output) == slot.sent { return false }
+        slot.closing = true
+        return flush<S>(&mut slot.*)
+      }
+      let length = isize.toUsize(got)
+      if length < capacity {
+        // A short read means the socket is empty: serve straight from the shared buffer.
+        let input = Slice.viewMut<u8>(Bytes.asMutSlice(&mut scratch.*), 0, length)
+        let pendingOutput = List.length(&slot.output) != 0
+        let received = match &mut slot.state {
+          Option.Some { value } => {
+            if pendingOutput {
+              run Protocol<S>.receive(protocol, &mut value, move input, false, &mut slot.output)
+            } else {
+              run Protocol<S>.receive(protocol, &mut value, move input, false, &mut shared.*)
+            }
+          }
+          Option.None => Received { consumed: length, verdict: Verdict.Close }
+        }
+        let consumed = if received.consumed > length { length } else { received.consumed }
+        if consumed < length {
+          let left = Slice.view<u8>(Bytes.asSlice(&scratch.*), consumed, length - consumed)
+          run keepInput<S>(&mut slot.*, left, options)
+        }
+        if received.verdict == Verdict.Close { slot.closing = true }
+        if pendingOutput { return flush<S>(&mut slot.*) }
+        return run flushShared<S>(&mut slot.*, &mut shared.*)
+      }
+      // The buffer is full, so the socket may hold more: keep the bytes and read on below.
+      let all = Slice.view<u8>(Bytes.asSlice(&scratch.*), 0, length)
+      run keepInput<S>(&mut slot.*, all, options)
+    }
     let mut ended = false
     while true {
       let capacity = Bytes.length(&slot.input)
@@ -553,15 +621,7 @@ static if Intrinsic.targetOperatingSystem() == "linux"
             // The protocol cannot make progress within the limit.
             return false
           }
-          let mut grown = capacity * 2
-          if grown > options.maxInputBytes { grown = options.maxInputBytes }
-          run Bytes.reserveExact(&mut slot.input, grown - capacity)
-          let zeros: [u8; 64] = [0; 64]
-          while Bytes.length(&slot.input) < grown {
-            let room = grown - Bytes.length(&slot.input)
-            let step = if room < 64 { room } else { 64 }
-            run Bytes.append(&mut slot.input, Slice.view<u8>(&zeros, 0, step))
-          }
+          run growInput<S>(&mut slot.*, capacity * 2, options)
         }
         continue
       }
@@ -590,14 +650,78 @@ static if Intrinsic.targetOperatingSystem() == "linux"
       let consumed = if received.consumed > length { length } else { received.consumed }
       slot.start = slot.start + consumed
       if slot.start == slot.end {
+        // Nothing is pending: give the buffer back, so the idle connection holds none.
         slot.start = 0
         slot.end = 0
+        slot.input = Bytes.make()
       }
       if received.verdict == Verdict.Close { slot.closing = true }
     }
     if ended && List.length(&slot.output) == slot.sent { return false }
     if ended { slot.closing = true }
     return flush<S>(&mut slot.*)
+  }
+
+  // Makes the input buffer of `slot` at least `wanted` bytes (and at least `readBufferBytes`, at
+  // most `maxInputBytes`), keeping its bytes.
+  effect fn growInput<S>(slot: &mut Slot<S>, wanted: usize, options: &TcpServerOptions) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+    let capacity = Bytes.length(&slot.input)
+    let mut grown = wanted
+    if grown < options.readBufferBytes { grown = options.readBufferBytes }
+    if grown > options.maxInputBytes { grown = options.maxInputBytes }
+    if grown <= capacity { return () }
+    run Bytes.reserveExact(&mut slot.input, grown - capacity)
+    let zeros: [u8; 64] = [0; 64]
+    while Bytes.length(&slot.input) < grown {
+      let room = grown - Bytes.length(&slot.input)
+      let step = if room < 64 { room } else { 64 }
+      run Bytes.append(&mut slot.input, Slice.view<u8>(&zeros, 0, step))
+    }
+    return ()
+  }
+
+  // Copies `left` into the input buffer of `slot`, which holds no pending bytes.
+  effect fn keepInput<S>(slot: &mut Slot<S>, left: &[u8], options: &TcpServerOptions) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+    run growInput<S>(&mut slot.*, left.length, options)
+    let storage = Bytes.asMutSlice(&mut slot.input)
+    let mut index: usize = 0
+    while index < left.length {
+      storage[index] = left[index]
+      index = index + 1
+    }
+    slot.start = 0
+    slot.end = left.length
+    return ()
+  }
+
+  // Sends the output in the worker's `shared` list, keeps what the socket did not take in the
+  // connection's own list, and clears `shared`. Returns false to close.
+  effect fn flushShared<S>(slot: &mut Slot<S>, shared: &mut List<u8>) -> bool
+  ! OutOfMemoryError ? &mut Allocator {
+    let total = List.length(&shared.*)
+    let mut sent: usize = 0
+    while sent < total {
+      let data = Slice.view<u8>(List.asSlice(&shared.*), sent, total - sent)
+      let wrote = unsafe sendSocket(slot.fd, Pointer.fromSlice<u8>(data), total - sent, MSG_NOSIGNAL)
+      if wrote < 0 {
+        let code = lastError()
+        if code == INTERRUPTED { continue }
+        if code == AGAIN { break }
+        List.clear(&mut shared.*)
+        return false
+      }
+      sent = sent + isize.toUsize(wrote)
+    }
+    if sent < total {
+      run List.appendBytes(&mut slot.output, Slice.view<u8>(List.asSlice(&shared.*), sent, total - sent))
+      slot.sent = 0
+      List.clear(&mut shared.*)
+      return true
+    }
+    List.clear(&mut shared.*)
+    return !slot.closing
   }
 
   // Sends the buffered output. Returns false to close.
@@ -614,7 +738,8 @@ static if Intrinsic.targetOperatingSystem() == "linux"
       }
       slot.sent = slot.sent + isize.toUsize(wrote)
     }
-    List.clear(&mut slot.output)
+    // Everything went out: give the list back, so the idle connection holds none.
+    List.clearAndFree(&mut slot.output)
     slot.sent = 0
     return !slot.closing
   }
