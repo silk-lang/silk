@@ -116,7 +116,7 @@ pub fn main() -> i32 {
 
 Import as `HttpExchangeNative` with `import silk.http.exchange_native as HttpExchangeNative`.
 
-Public declarations: 17.
+Public declarations: 18.
 
 <a id="NativeRoute"></a>
 
@@ -333,16 +333,6 @@ pub noDelay: bool
 
 Whether to disable Nagle's algorithm on the socket.
 
-<a id="Options.pollIntervalNanoseconds"></a>
-
-### Field `pollIntervalNanoseconds`
-
-```silk
-pub pollIntervalNanoseconds: u64
-```
-
-The time between checks while a socket connects. It is 1 nanosecond through 1 second.
-
 <a id="Options.maximumAttempts"></a>
 
 ### Field `maximumAttempts`
@@ -423,8 +413,8 @@ pub fn defaults() -> Options
 
 Returns the default settings.
 
-They are: 16 addresses, any family, Nagle on, a 1 ms poll interval, 64 attempts, no deadline,
-30 seconds for the handshake, and `OptionalHttp11`.
+They are: 16 addresses, any family, Nagle on, 64 attempts, no deadline, 30 seconds for the
+handshake, and `OptionalHttp11`.
 
 <a id="NativeTransport"></a>
 
