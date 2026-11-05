@@ -107,7 +107,7 @@ pub fn main() -> i32 {
 
 Import as `RequestParser` with `import silk.http.head { RequestParser }`.
 
-Public declarations: 24.
+Public declarations: 25.
 
 <a id="Limits"></a>
 
@@ -1577,6 +1577,36 @@ Writes `head` like [`writeRequestInto`](#writeRequestInto) into new memory of it
 part starts.
 
 ### Errors
+- `LimitExceeded` if the head exceeds `limits`.
+- `OutputTooSmall` if the head is longer than `maxBytes`. Nothing is allocated.
+- `OutOfMemoryError` if the `Allocator` fails.
+
+<a id="writeRequestWith"></a>
+
+## `writeRequestWith`
+
+```silk
+pub effect fn writeRequestWith<'value>(
+  version: Version,
+  method: Method<'value>,
+  target: RequestTarget<'value>,
+  headers: &Headers<'value>,
+  extra: &[Header<'value>],
+  limits: ValueLimits,
+  maxBytes: usize,
+) -> Result<WrittenRequest, ValueError> ! OutOfMemoryError ? &mut Allocator
+```
+
+Writes a request head from its parts like [`writeRequest`](#writeRequest), with the fields of `headers` first
+and then the fields of `extra`, without making a request head first.
+
+### Details
+It checks the target against the method, and the parts against `limits`. Unlike
+`RequestHead.make`, it does not check the `Host` field: the caller adds the one `Host` field
+that the request needs.
+
+### Errors
+- `MethodTargetMismatch` if the target form does not fit the method.
 - `LimitExceeded` if the head exceeds `limits`.
 - `OutputTooSmall` if the head is longer than `maxBytes`. Nothing is allocated.
 - `OutOfMemoryError` if the `Allocator` fails.

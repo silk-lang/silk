@@ -432,6 +432,38 @@ pub fn ownedBytes(self: &Self) -> usize
 
 Returns the memory that this copy uses, in bytes, as counted against `maxOwnedBytes`.
 
+<a id="OwnedHeaders.impl.withCapacity"></a>
+
+### Associated function `withCapacity`
+
+```silk
+pub effect fn withCapacity(count: usize, fieldBytes: usize) -> OwnedHeaders ! OutOfMemoryError ? &mut Allocator
+```
+
+Makes an empty list with room for `count` fields that have `fieldBytes` name and value bytes
+in all. Add the fields with [`OwnedHeaders.appendUnchecked`](#OwnedHeaders.impl.appendUnchecked).
+
+#### Errors
+- `OutOfMemoryError` if the `Allocator` fails.
+
+<a id="OwnedHeaders.impl.appendUnchecked"></a>
+
+### Method `appendUnchecked`
+
+```silk
+pub unsafe effect fn appendUnchecked(self: &mut Self, name: &[u8], value: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Adds a field at the end, without checking it.
+
+#### Details
+This function is `unsafe`. The field must follow the rules of `Header.make`, such as a value
+without CR or LF, and the limits that the list is used with. A field that breaks them can split
+the message it is written into.
+
+#### Errors
+- `OutOfMemoryError` if the `Allocator` fails.
+
 <a id="HeaderIterator"></a>
 
 ## `HeaderIterator`

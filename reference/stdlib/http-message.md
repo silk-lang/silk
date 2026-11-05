@@ -1401,6 +1401,28 @@ pub fn view<'value>(self: &'value Self) -> ResponseHead<'value>
 
 Returns the head as a [`ResponseHead`](#ResponseHead) that borrows this value.
 
+<a id="OwnedResponseHead.impl.make"></a>
+
+### Associated function `make`
+
+```silk
+pub effect fn make(
+    version: Version,
+    status: Status,
+    reason: &[u8],
+    headers: OwnedHeaders,
+    limits: Limits,
+  ) -> Result<OwnedResponseHead, ValueError> ! OutOfMemoryError ? &mut Allocator
+```
+
+Makes an owned head from its parts, and keeps `headers` without copying them.
+
+#### Errors
+- `InvalidValueByte` if `reason` has a control byte.
+- `LimitExceeded` if `reason` is longer than `maxValueBytes`, or the head uses more memory than
+  `maxOwnedBytes`.
+- `OutOfMemoryError` if the `Allocator` fails.
+
 
 Category: HTTP.
 
