@@ -512,6 +512,414 @@ Returns the 32-byte SHA-512/256 digest of `bytes`.
 #### Gotchas
 The program traps if `bytes` is longer than 2^128 - 1 bits.
 
+<a id="Sha224.impl.Digest"></a>
+
+## Implementation `Digest for Sha224`
+
+```silk
+impl Digest for Sha224
+```
+
+<a id="Sha224.impl.Digest.make"></a>
+
+### Operation `make`
+
+```silk
+make: Sha224.make
+```
+
+Returns a SHA-224 state for an empty message.
+
+<a id="Sha224.impl.Digest.update"></a>
+
+### Operation `update`
+
+```silk
+update: Sha224.update
+```
+
+Adds `bytes` to the end of the message.
+
+<a id="Sha224.impl.Digest.blockLength"></a>
+
+### Operation `blockLength`
+
+```silk
+fn blockLength(self: &Self) -> usize
+```
+
+Returns 64, the SHA-224 block length in bytes.
+
+<a id="Sha224.impl.Digest.digestLength"></a>
+
+### Operation `digestLength`
+
+```silk
+fn digestLength(self: &Self) -> usize
+```
+
+Returns 28, the SHA-224 digest length in bytes.
+
+<a id="Sha224.impl.Digest.copy"></a>
+
+### Operation `copy`
+
+```silk
+fn copy(self: &Self) -> Self
+```
+
+Returns an independent copy of the state.
+
+<a id="Sha224.impl.Digest.finishInto"></a>
+
+### Operation `finishInto`
+
+```silk
+fn finishInto(self: Self, output: &mut [u8]) -> ()
+```
+
+Writes the 28-byte SHA-224 digest to the start of `output` and consumes the state.
+
+<a id="Sha256.impl.Digest"></a>
+
+## Implementation `Digest for Sha256`
+
+```silk
+impl Digest for Sha256
+```
+
+<a id="Sha256.impl.Digest.make"></a>
+
+### Operation `make`
+
+```silk
+make: Sha256.make
+```
+
+Returns a SHA-256 state for an empty message.
+
+<a id="Sha256.impl.Digest.update"></a>
+
+### Operation `update`
+
+```silk
+update: Sha256.update
+```
+
+Adds `bytes` to the end of the message.
+
+<a id="Sha256.impl.Digest.blockLength"></a>
+
+### Operation `blockLength`
+
+```silk
+fn blockLength(self: &Self) -> usize
+```
+
+Returns 64, the SHA-256 block length in bytes.
+
+<a id="Sha256.impl.Digest.digestLength"></a>
+
+### Operation `digestLength`
+
+```silk
+fn digestLength(self: &Self) -> usize
+```
+
+Returns 32, the SHA-256 digest length in bytes.
+
+<a id="Sha256.impl.Digest.copy"></a>
+
+### Operation `copy`
+
+```silk
+fn copy(self: &Self) -> Self
+```
+
+Returns an independent copy of the state.
+
+<a id="Sha256.impl.Digest.finishInto"></a>
+
+### Operation `finishInto`
+
+```silk
+fn finishInto(self: Self, output: &mut [u8]) -> ()
+```
+
+Writes the 32-byte SHA-256 digest to the start of `output` and consumes the state.
+
+<a id="Sha384.impl.Digest"></a>
+
+## Implementation `Digest for Sha384`
+
+```silk
+impl Digest for Sha384
+```
+
+<a id="Sha384.impl.Digest.make"></a>
+
+### Operation `make`
+
+```silk
+make: Sha384.make
+```
+
+Returns a SHA-384 state for an empty message.
+
+<a id="Sha384.impl.Digest.update"></a>
+
+### Operation `update`
+
+```silk
+update: Sha384.update
+```
+
+Adds `bytes` to the end of the message.
+
+<a id="Sha384.impl.Digest.blockLength"></a>
+
+### Operation `blockLength`
+
+```silk
+fn blockLength(self: &Self) -> usize
+```
+
+Returns 128, the SHA-384 block length in bytes.
+
+<a id="Sha384.impl.Digest.digestLength"></a>
+
+### Operation `digestLength`
+
+```silk
+fn digestLength(self: &Self) -> usize
+```
+
+Returns 48, the SHA-384 digest length in bytes.
+
+<a id="Sha384.impl.Digest.copy"></a>
+
+### Operation `copy`
+
+```silk
+fn copy(self: &Self) -> Self
+```
+
+Returns an independent copy of the state.
+
+<a id="Sha384.impl.Digest.finishInto"></a>
+
+### Operation `finishInto`
+
+```silk
+fn finishInto(self: Self, output: &mut [u8]) -> ()
+```
+
+Writes the 48-byte SHA-384 digest to the start of `output` and consumes the state.
+
+<a id="Sha512.impl.Digest"></a>
+
+## Implementation `Digest for Sha512`
+
+```silk
+impl Digest for Sha512
+```
+
+<a id="Sha512.impl.Digest.make"></a>
+
+### Operation `make`
+
+```silk
+make: Sha512.make
+```
+
+Returns a SHA-512 state for an empty message.
+
+<a id="Sha512.impl.Digest.update"></a>
+
+### Operation `update`
+
+```silk
+update: Sha512.update
+```
+
+Adds `bytes` to the end of the message.
+
+<a id="Sha512.impl.Digest.blockLength"></a>
+
+### Operation `blockLength`
+
+```silk
+fn blockLength(self: &Self) -> usize
+```
+
+Returns 128, the SHA-512 block length in bytes.
+
+<a id="Sha512.impl.Digest.digestLength"></a>
+
+### Operation `digestLength`
+
+```silk
+fn digestLength(self: &Self) -> usize
+```
+
+Returns 64, the SHA-512 digest length in bytes.
+
+<a id="Sha512.impl.Digest.copy"></a>
+
+### Operation `copy`
+
+```silk
+fn copy(self: &Self) -> Self
+```
+
+Returns an independent copy of the state.
+
+<a id="Sha512.impl.Digest.finishInto"></a>
+
+### Operation `finishInto`
+
+```silk
+fn finishInto(self: Self, output: &mut [u8]) -> ()
+```
+
+Writes the 64-byte SHA-512 digest to the start of `output` and consumes the state.
+
+<a id="Sha512_224.impl.Digest"></a>
+
+## Implementation `Digest for Sha512_224`
+
+```silk
+impl Digest for Sha512_224
+```
+
+<a id="Sha512_224.impl.Digest.make"></a>
+
+### Operation `make`
+
+```silk
+make: Sha512_224.make
+```
+
+Returns a SHA-512/224 state for an empty message.
+
+<a id="Sha512_224.impl.Digest.update"></a>
+
+### Operation `update`
+
+```silk
+update: Sha512_224.update
+```
+
+Adds `bytes` to the end of the message.
+
+<a id="Sha512_224.impl.Digest.blockLength"></a>
+
+### Operation `blockLength`
+
+```silk
+fn blockLength(self: &Self) -> usize
+```
+
+Returns 128, the SHA-512/224 block length in bytes.
+
+<a id="Sha512_224.impl.Digest.digestLength"></a>
+
+### Operation `digestLength`
+
+```silk
+fn digestLength(self: &Self) -> usize
+```
+
+Returns 28, the SHA-512/224 digest length in bytes.
+
+<a id="Sha512_224.impl.Digest.copy"></a>
+
+### Operation `copy`
+
+```silk
+fn copy(self: &Self) -> Self
+```
+
+Returns an independent copy of the state.
+
+<a id="Sha512_224.impl.Digest.finishInto"></a>
+
+### Operation `finishInto`
+
+```silk
+fn finishInto(self: Self, output: &mut [u8]) -> ()
+```
+
+Writes the 28-byte SHA-512/224 digest to the start of `output` and consumes the state.
+
+<a id="Sha512_256.impl.Digest"></a>
+
+## Implementation `Digest for Sha512_256`
+
+```silk
+impl Digest for Sha512_256
+```
+
+<a id="Sha512_256.impl.Digest.make"></a>
+
+### Operation `make`
+
+```silk
+make: Sha512_256.make
+```
+
+Returns a SHA-512/256 state for an empty message.
+
+<a id="Sha512_256.impl.Digest.update"></a>
+
+### Operation `update`
+
+```silk
+update: Sha512_256.update
+```
+
+Adds `bytes` to the end of the message.
+
+<a id="Sha512_256.impl.Digest.blockLength"></a>
+
+### Operation `blockLength`
+
+```silk
+fn blockLength(self: &Self) -> usize
+```
+
+Returns 128, the SHA-512/256 block length in bytes.
+
+<a id="Sha512_256.impl.Digest.digestLength"></a>
+
+### Operation `digestLength`
+
+```silk
+fn digestLength(self: &Self) -> usize
+```
+
+Returns 32, the SHA-512/256 digest length in bytes.
+
+<a id="Sha512_256.impl.Digest.copy"></a>
+
+### Operation `copy`
+
+```silk
+fn copy(self: &Self) -> Self
+```
+
+Returns an independent copy of the state.
+
+<a id="Sha512_256.impl.Digest.finishInto"></a>
+
+### Operation `finishInto`
+
+```silk
+fn finishInto(self: Self, output: &mut [u8]) -> ()
+```
+
+Writes the 32-byte SHA-512/256 digest to the start of `output` and consumes the state.
+
 
 Category: Cryptography.
 
