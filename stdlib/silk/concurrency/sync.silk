@@ -1,8 +1,9 @@
-//! Shared ownership, locks and thread parking for values that several native threads use.
+//! Shared ownership, locks, condition variables and thread parking for values that several native threads use.
 //!
 //! # When to use
 //! - [`Arc`] gives several threads ownership of one value.
 //! - [`Mutex`] lets them change the value one thread at a time.
+//! - [`Condition`] lets threads sleep until another thread changes the value under a [`Mutex`].
 //! - [`Parker`] puts a thread to sleep until another thread wakes it.
 //!
 //! # Details
@@ -12,6 +13,8 @@
 //! [`Mutex`] is a futex lock on [`Atomic.wait`] and [`Atomic.notifyOne`]. An uncontended lock or
 //! unlock is one atomic operation. A contended lock sleeps in the operating system and does not
 //! spin.
+//!
+//! [`Condition`] is a futex sequence counter. Its waits unlock the mutex, sleep, and lock it again.
 //!
 //! [`Parker`] holds one wakeup token. Thus an unpark that comes before the park is not lost.
 //!
@@ -288,11 +291,7 @@ impl<T> Mutex<T> {
 
   /// Waits until the lock is free, takes it, and returns the guard that releases it.
   pub fn lock<'a>(self: &'a Self) -> MutexGuard<'a, T> {
-    if unsafe acquired(self.word, unlocked, locked) { return MutexGuard<'a, T> { mutex: self } }
-    // Mark the lock contended, so the holder's unlock wakes a sleeper, then sleep until it is free.
-    while unsafe Atomic.swap<u32>(self.word, contended, MemoryOrder.Acquire) != unlocked {
-      let _woken = unsafe Atomic.wait(self.word, contended, Option<u64>.none())
-    }
+    unsafe lockWord(self.word)
     return MutexGuard<'a, T> { mutex: self }
   }
 
@@ -303,6 +302,25 @@ impl<T> Mutex<T> {
     }
     return Option<MutexGuard<'a, T>>.none()
   }
+}
+
+// Takes the lock on `word`, sleeping while another thread holds it.
+unsafe fn lockWord(word: *mut u32) -> () {
+  if unsafe acquired(word, unlocked, locked) { return () }
+  // Mark the lock contended, so the holder's unlock wakes a sleeper, then sleep until it is free.
+  while unsafe Atomic.swap<u32>(word, contended, MemoryOrder.Acquire) != unlocked {
+    let _woken = unsafe Atomic.wait(word, contended, Option<u64>.none())
+  }
+  return ()
+}
+
+// Releases the lock on `word` that this thread holds, and wakes a sleeper if one may wait.
+unsafe fn unlockWord(word: *mut u32) -> () {
+  // Release orders this thread's writes before the next holder's acquire.
+  if unsafe Atomic.swap<u32>(word, unlocked, MemoryOrder.Release) == contended {
+    unsafe Atomic.notifyOne(word)
+  }
+  return ()
 }
 
 unsafe fn acquired(word: *mut u32, expected: u32, desired: u32) -> bool {
@@ -342,10 +360,99 @@ impl<'a, T> MutexGuard<'a, T> {
 
 impl<'a, T> Drop for MutexGuard<'a, T> {
   fn drop(self: &mut MutexGuard<'a, T>) -> () {
-    // Release orders this thread's writes before the next holder's acquire.
-    if unsafe Atomic.swap<u32>(self.mutex.word, unlocked, MemoryOrder.Release) == contended {
-      unsafe Atomic.notifyOne(self.mutex.word)
-    }
+    unsafe unlockWord(self.mutex.word)
+    return ()
+  }
+}
+
+struct ConditionState {
+  sequence: u32,
+}
+
+/// A condition variable: threads sleep on it until another thread changes shared state under a
+/// [`Mutex`] and notifies them.
+///
+/// # Details
+/// [`wait`] and [`waitTimeout`] take the guard of a locked [`Mutex`] by `&mut`. They unlock that
+/// mutex, sleep until a notify, and lock it again before they return, so the guard is valid
+/// throughout. A notify that comes after a waiter unlocked the mutex, and before it slept, still
+/// wakes it. [`notifyOne`] wakes at least one waiter and [`notifyAll`] wakes every waiter. A
+/// notify with no waiter does nothing. `Condition` is `Transferable` and `Concurrent`; share one by
+/// putting it in an [`Arc`], next to the mutex its waiters use. It is a futex sequence counter: a
+/// notify is one atomic add plus a wake call, and a waiter sleeps in the operating system.
+///
+/// # Gotchas
+/// - A wait can also return with no notify. Check your own condition again in a loop, under the lock.
+/// - A notify wakes only threads already waiting. Change the shared state under the lock before
+///   notifying, and check it before waiting, so a wakeup is never needed for a change that came first.
+/// - These types need the same targets as `Atomic.wait`: Darwin on x86_64 or aarch64, Linux with
+///   GNU libc on x86_64 or aarch64, and wasm32.
+pub struct Condition {
+  cell: *mut Pinned<ConditionState>,
+  sequence: *mut u32,
+}
+
+impl Transferable for Condition {}
+impl Concurrent for Condition {}
+
+impl Condition {
+  /// Makes a condition variable with no waiters.
+  pub effect fn make() -> Condition ! OutOfMemoryError ? &mut Allocator {
+    let cell = run pin<ConditionState>(ConditionState { sequence: 0 })
+    let mut anchor = ()
+    let state = unsafe fresh<ConditionState>(&mut anchor, cell)
+    return Condition { cell: cell, sequence: Pointer.fromMutRef(&mut state.sequence) }
+  }
+
+  /// Unlocks `guard`'s mutex, sleeps until a notify, and locks the mutex again.
+  ///
+  /// # Gotchas
+  /// It can also return with no notify. Check your own condition again in a loop.
+  pub fn wait<'a, T>(self: &Self, guard: &mut MutexGuard<'a, T>) -> () {
+    let _notified = self.sleep(guard.mutex, Option<u64>.none())
+    return ()
+  }
+
+  /// Unlocks `guard`'s mutex, sleeps until a notify or until `timeout` nanoseconds pass, and locks
+  /// the mutex again. Returns `false` only when the timeout ended the wait.
+  ///
+  /// # Gotchas
+  /// It can also return `true` with no notify. Check your own condition again in a loop.
+  pub fn waitTimeout<'a, T>(self: &Self, guard: &mut MutexGuard<'a, T>, timeout: u64) -> bool {
+    return self.sleep(guard.mutex, Option<u64>.some(timeout))
+  }
+
+  /// Wakes at least one thread waiting on this condition, if any is.
+  pub fn notifyOne(self: &Self) -> () {
+    // Relaxed suffices: the waiter relocks the mutex, which orders the state change for it.
+    let _previous = unsafe Atomic.fetchAdd<u32>(self.sequence, 1, MemoryOrder.Relaxed)
+    unsafe Atomic.notifyOne(self.sequence)
+    return ()
+  }
+
+  /// Wakes every thread waiting on this condition.
+  pub fn notifyAll(self: &Self) -> () {
+    let _previous = unsafe Atomic.fetchAdd<u32>(self.sequence, 1, MemoryOrder.Relaxed)
+    unsafe Atomic.notifyAll(self.sequence)
+    return ()
+  }
+
+  // The caller holds `mutex`; it is held again when this returns.
+  fn sleep<T>(self: &Self, mutex: &Mutex<T>, timeout: Option<u64>) -> bool {
+    // Read the sequence before unlocking: a notify after the unlock changes it, so the wait
+    // below returns at once instead of missing that notify.
+    let observed = unsafe Atomic.load<u32>(self.sequence, MemoryOrder.Relaxed)
+    unsafe unlockWord(mutex.word)
+    let woken = unsafe Atomic.wait(self.sequence, observed, move timeout)
+    unsafe lockWord(mutex.word)
+    return woken
+  }
+}
+
+impl Drop for Condition {
+  fn drop(self: &mut Condition) -> () {
+    // A wait borrows the condition, so no thread waits on it here.
+    unsafe unpin<ConditionState>(self.cell)
     return ()
   }
 }
