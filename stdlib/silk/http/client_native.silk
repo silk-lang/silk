@@ -11,8 +11,10 @@
 //! and `/etc/ssl/certs/ca-certificates.crt` on Linux, or the logical Windows `ROOT` store.
 //! [`NativeHttp.fromEnvironment`] uses the file
 //! in `SSL_CERT_FILE` when it is set, and the proxies in `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`,
-//! and `NO_PROXY`. Each request opens a new HTTP/1.1 connection and sends `Accept-Encoding:
-//! identity`, so the body arrives as the server sent it.
+//! and `NO_PROXY`. Requests use HTTP/1.1 and send `Accept-Encoding: identity`, so the body
+//! arrives as the server sent it. A direct connection stays open after a response and the next
+//! request to the same origin reuses it. The client keeps one for each of up to 8 origins, and a new
+//! origin past that closes the oldest.
 //!
 //! Redirects follow the Fetch standard. After 303, and after 301 or 302 for a POST, the client
 //! sends a GET without a body. After 307 and 308, it sends the same method and body. A redirect
@@ -171,6 +173,8 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   pub const DEFAULT_MAX_BODY_BYTES: usize = 16777216
   /// The default number of redirects followed.
   pub const DEFAULT_MAX_REDIRECTS: usize = 10
+  // The most origins that keep an idle connection at once.
+  const MAX_IDLE: usize = 8
   /// The maximum number of headers that [`NativeHttp.header`] adds.
   pub const MAX_DEFAULT_HEADERS: usize = 16
 
@@ -194,9 +198,9 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   /// allocator. The defaults are a deadline of 30 seconds for each request, a response body of at
   /// most 16 MiB, up to 10 redirects, and the PEM bundle of the platform for HTTPS:
   /// `/etc/ssl/cert.pem` on macOS and `/etc/ssl/certs/ca-certificates.crt` on Linux, or the logical
-  /// Windows `ROOT` certificate store. Each request
-  /// opens a new HTTP/1.1 connection and sends `Accept-Encoding: identity`, so the body arrives as
-  /// the server sent it.
+  /// Windows `ROOT` certificate store. Requests use HTTP/1.1 and send `Accept-Encoding: identity`,
+  /// so the body arrives as the server sent it. The next request to an origin reuses its open
+  /// connection, for up to 8 origins.
   ///
   /// Redirects follow the Fetch standard. After 303, and after 301 or 302 for a POST, the client
   /// sends a GET without a body. After 307 and 308, it sends the same method and body. A redirect
@@ -226,11 +230,11 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     secureProxy: Option<ProxyConfig>,
     plainProxy: Option<ProxyConfig>,
     noProxy: Bytes,
-    idle: Option<IdleConnection>,
+    idle: List<IdleConnection>,
   }
 
   // A direct connection that finished its last exchange and stayed open, kept for the next request
-  // to the same origin.
+  // to the same origin. The client keeps one for each of up to `MAX_IDLE` origins.
   struct IdleConnection {
     origin: Origin,
     connection: Connection<NativeTransport>,
@@ -275,7 +279,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
         secureProxy: Option<ProxyConfig>.none(),
         plainProxy: Option<ProxyConfig>.none(),
         noProxy: Bytes.make(),
-        idle: Option<IdleConnection>.none(),
+        idle: List<IdleConnection>.make(),
       }
     }
 
@@ -1081,17 +1085,23 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     // An idempotent request skips the check that the server has not closed the connection:
     // `exchangeKept` sends it again on a new connection if it did, which saves a system call on
     // every reused request.
-    let mut reuse = false
-    let mut stale = false
-    if let Option.Some {value: kept} = &client.idle {
-      reuse = Origin.equals(&kept.origin, &origin) && (method.idempotent() || ExchangeNative.reusable(&kept.connection))
-      stale = !reuse
+    let mut slot = Option<usize>.none()
+    let mut found = usize.MAX
+    let pool = List<IdleConnection>.asSlice(&client.idle)
+    let mut scan = usize.ZERO
+    while scan < pool.length {
+      if Origin.equals(&pool[scan].origin, &origin) { found = scan }
+      scan = scan + usize.ONE
     }
-    if stale {
-      run discard(&mut client.idle)
+    if found != usize.MAX {
+      if method.idempotent() || ExchangeNative.reusable(&pool[found].connection) {
+        slot = Option<usize>.some(found)
+      } else {
+        run discard(&mut client.idle, found)
+      }
     }
     let exchange = Direct {request: &prepared, body: payload, deadline: &deadline, maxBody: settings.maxBody, idempotent: method.idempotent()}
-    let outcome = run Effect.result(exchangeKept(&mut client.idle, reuse, origin, move options, limits, exchange)
+    let outcome = run Effect.result(exchangeKept(&mut client.idle, slot, origin, move options, limits, exchange)
       |> Effect.provideMut<TrustSource>(&mut trust)
       |> Effect.provideMut<SystemClock>(&mut wall)
       |> Effect.provideMut<MonotonicClock>(&mut client.clock)
@@ -1114,14 +1124,15 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
 
   impl<'r> Copy for Direct<'r> {}
 
-  // Sends one request on the idle connection when `reuse` is true, or on a new connection. When a
-  // reused connection fails because the server closed it, an idempotent request goes once more on a
-  // new connection, since the server may have closed it while idle. The connection stays in `idle`
-  // while it runs, so it is not copied on each request. A connection that can run another exchange
-  // afterwards stays there; any other is closed.
+  // Sends one request on the idle connection at `slot`, or on a new connection when it is none.
+  // When a reused connection fails because the server closed it, an idempotent request goes once
+  // more on a new connection, since the server may have closed it while idle. The connection stays
+  // in `idle` while it runs, so it is not copied on each request. A connection that can run another
+  // exchange afterwards stays there; any other is closed. A new connection to an origin past
+  // `MAX_IDLE` replaces the oldest one.
   effect fn exchangeKept(
-    idle: &mut Option<IdleConnection>,
-    reuse: bool,
+    idle: &mut List<IdleConnection>,
+    slot: Option<usize>,
     origin: Origin,
     options: Options,
     limits: Limits,
@@ -1129,15 +1140,15 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   ) -> Received
   ! HttpError | ExchangeError | NativeExchangeError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError
   ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random | &mut TrustSource {
-    if reuse {
-      let attempt = run Effect.result(exchangeIdle(&mut idle.*, exchange))
+    if let Option.Some {value: index} = slot {
+      let attempt = run Effect.result(exchangeIdle(&mut idle.*, index, exchange))
       match move attempt {
         Result.Success {value: received} => {
-          run settle(&mut idle.*)
+          run settle(&mut idle.*, index)
           return move received
         }
         Result.Failure {error} => {
-          run discard(&mut idle.*)
+          run discard(&mut idle.*, index)
           match move error {
             ExchangeError failure => {
               if !exchange.idempotent || !closedByPeer(&failure) { fail move failure }
@@ -1153,53 +1164,52 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       trust = Option<TrustSnapshot>.some(run TrustSource.load(options.trust))
     }
     let connection = run ExchangeNative.acquireOwned(origin, move options, limits, move trust, Option<Instant>.none())
-    idle.* = Option<IdleConnection>.some(IdleConnection {origin: origin, connection: move connection})
-    let result = run Effect.result(exchangeIdle(&mut idle.*, exchange))
+    if List<IdleConnection>.length(&idle.*) >= MAX_IDLE {
+      run discard(&mut idle.*, usize.ZERO)
+    }
+    run List<IdleConnection>.append(&mut idle.*, IdleConnection {origin: origin, connection: move connection})
+    let index = List<IdleConnection>.length(&idle.*) - usize.ONE
+    let result = run Effect.result(exchangeIdle(&mut idle.*, index, exchange))
     return match move result {
       Result.Success {value} => {
-        run settle(&mut idle.*)
+        run settle(&mut idle.*, index)
         return move value
       }
       Result.Failure {error} => {
-        run discard(&mut idle.*)
+        run discard(&mut idle.*, index)
         fail move error
       }
     }
   }
 
-  // Runs one exchange on the connection in `idle`.
-  effect fn exchangeIdle(idle: &mut Option<IdleConnection>, exchange: Direct) -> Received
+  // Runs one exchange on the connection at `index` in `idle`.
+  effect fn exchangeIdle(idle: &mut List<IdleConnection>, index: usize, exchange: Direct) -> Received
   ! HttpError | ExchangeError | OutOfMemoryError
   ? &mut Allocator | &mut MonotonicClock | &mut Random {
-    if let Option.Some {value: kept} = &mut idle.* {
-      return run exchangeOn(&mut kept.connection, exchange.request, exchange.body, exchange.deadline, exchange.maxBody)
-    }
-    fail HttpError.make(HttpErrorKind.Connect, "The connection is not open.")
+    let kept = List<IdleConnection>.asMutSlice(&mut idle.*)
+    return run exchangeOn(&mut kept[index].connection, exchange.request, exchange.body, exchange.deadline, exchange.maxBody)
   }
 
-  // Keeps the connection in `idle` for the next request when it can run another exchange, and
+  // Keeps the connection at `index` for the next request when it can run another exchange, and
   // closes it otherwise.
-  effect fn settle(idle: &mut Option<IdleConnection>) -> () {
-    let mut eligible = false
-    if let Option.Some {value: kept} = &idle.* {
-      eligible = match Exchange.reuseEligibility<NativeTransport>(&kept.connection) {
-        ReuseEligibility.Eligible => true
-        _ => false
-      }
+  effect fn settle(idle: &mut List<IdleConnection>, index: usize) -> () {
+    let kept = List<IdleConnection>.asSlice(&idle.*)
+    let eligible = match Exchange.reuseEligibility<NativeTransport>(&kept[index].connection) {
+      ReuseEligibility.Eligible => true
+      _ => false
     }
     if !eligible {
-      run discard(&mut idle.*)
+      run discard(&mut idle.*, index)
     }
     return ()
   }
 
-  // Closes the connection in `idle`, if there is one, and leaves `idle` empty.
-  effect fn discard(idle: &mut Option<IdleConnection>) -> () {
-    if let Option.Some {value: kept} = &mut idle.* {
-      let closed = run Effect.result(Exchange.close(&mut kept.connection))
-      drop closed
-    }
-    idle.* = Option<IdleConnection>.none()
+  // Closes the connection at `index` and removes it from `idle`.
+  effect fn discard(idle: &mut List<IdleConnection>, index: usize) -> () {
+    let mut removed = List<IdleConnection>.remove(&mut idle.*, index)
+    let closed = run Effect.result(Exchange.close(&mut removed.connection))
+    drop closed
+    drop removed
     return ()
   }
 

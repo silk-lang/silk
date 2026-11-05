@@ -15,8 +15,10 @@ up to 10 redirects, and the PEM bundle of the platform for HTTPS: `/etc/ssl/cert
 and `/etc/ssl/certs/ca-certificates.crt` on Linux, or the logical Windows `ROOT` store.
 `NativeHttp.fromEnvironment` uses the file
 in `SSL_CERT_FILE` when it is set, and the proxies in `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`,
-and `NO_PROXY`. Each request opens a new HTTP/1.1 connection and sends `Accept-Encoding:
-identity`, so the body arrives as the server sent it.
+and `NO_PROXY`. Requests use HTTP/1.1 and send `Accept-Encoding: identity`, so the body
+arrives as the server sent it. A direct connection stays open after a response and the next
+request to the same origin reuses it. The client keeps one for each of up to 8 origins, and a new
+origin past that closes the oldest.
 
 Redirects follow the Fetch standard. After 303, and after 301 or 302 for a POST, the client
 sends a GET without a body. After 307 and 308, it sends the same method and body. A redirect
