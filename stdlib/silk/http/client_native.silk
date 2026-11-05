@@ -1672,6 +1672,19 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
 
   // One worker task of a round. Its clock parks only this task while the socket waits.
   effect fn roundWorker(state: Shared<RoundState>) -> () ? &mut Scheduler | &mut MonotonicClock {
+    // The services that do not depend on the request are given once for all the jobs of this
+    // task, so a request does not pay for a provider layer of each.
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let mut wall = OsSystemClock.make()
+    let mut random = OsRandom.make()
+    return run workJobs(move state)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+      |> Effect.provideMut<SystemClock>(&mut wall)
+      |> Effect.provideMut<Random>(&mut random)
+  }
+
+  effect fn workJobs(state: Shared<RoundState>) -> ()
+  ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random {
     while true {
       let taken = match Shared<RoundState>.withMut<Option<Taken>>(&state, takeJob) {
         Option.None => { break }
@@ -1744,10 +1757,9 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   }
 
   // One task of a round. Its clock parks only this task while the socket waits.
-  effect fn runJob(job: Job) -> JobOutcome ? &mut MonotonicClock {
-    let mut allocator = Allocator.systemAllocatorProvider()
+  effect fn runJob(job: Job) -> JobOutcome ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random {
     let mut idle = List<Box<IdleConnection>>.make()
-    let received = run Effect.result(jobExchange(&mut idle, move job) |> Effect.provideMut<Allocator>(&mut allocator))
+    let received = run jobExchange(&mut idle, move job)
     let kept = List<Box<IdleConnection>>.pop(&mut idle)
     return JobOutcome {received: move received, kept: move kept}
   }
@@ -1770,43 +1782,58 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
 
   impl TrustSource for JobTrust { load: JobTrust.loadFor }
 
-  effect fn jobExchange(idle: &mut List<Box<IdleConnection>>, job: Job) -> Received
+  struct JobSetup {
+    pending: Box<PendingJob>,
+    slot: Option<usize>,
+    trust: JobTrust,
+  }
+
+  // Puts the kept connection of a job in `idle` and makes the trust source of its origin.
+  effect fn setUpJob(idle: &mut List<Box<IdleConnection>>, job: Job) -> JobSetup
   ! HttpError | OutOfMemoryError
-  ? &mut Allocator | &mut MonotonicClock {
-    let Job {pending: boxed, connection} = move job
+  ? &mut Allocator {
+    let Job {pending, connection} = move job
     let mut slot = Option<usize>.none()
     if let Option.Some {value} = move connection {
       run List<Box<IdleConnection>>.append(&mut idle.*, move value)
       slot = Option<usize>.some(usize.ZERO)
     }
-    let pending = move boxed
-    let job = &Box<PendingJob>.get(&pending)[usize.ZERO]
     // A plain HTTP origin never loads trust, so it does not make a trust source.
     let mut trust = JobTrust.Plain
-    if Origin.secure(&job.origin) { trust = JobTrust.Configured {provider: run trustOf(&job.trust)} }
+    let secure = Origin.secure(&Box<PendingJob>.get(&pending)[usize.ZERO].origin)
+    if secure { trust = JobTrust.Configured {provider: run trustOf(&Box<PendingJob>.get(&pending)[usize.ZERO].trust)} }
+    return JobSetup {pending: move pending, slot: slot, trust: move trust}
+  }
+
+  // A failure is returned rather than raised, so that the job does not wrap this in a result.
+  effect fn jobExchange(idle: &mut List<Box<IdleConnection>>, job: Job) -> Result<Received, HttpError | OutOfMemoryError>
+  ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random {
+    let JobSetup {pending, slot, trust: chosen} = match move run Effect.result(setUpJob(&mut idle.*, move job)) {
+      Result.Success {value} => move value
+      Result.Failure {error} => { return Result<Received, HttpError | OutOfMemoryError>.failResult(move error) }
+    }
+    let mut trust = move chosen
+    let job = &Box<PendingJob>.get(&pending)[usize.ZERO]
     let now = run MonotonicClock.now()
     let deadline = MonotonicClock.deadlineAfter(&now, job.timeoutNanoseconds)
-    let mut wall = OsSystemClock.make()
-    let mut random = OsRandom.make()
     let exchange = Direct {request: &job.request, body: Bytes.asSlice(&job.body), deadline: &deadline, maxBody: job.maxBody, idempotent: job.idempotent}
     let outcome = run Effect.result(exchangeKept(&mut idle.*, slot, job.origin, &job.options, job.limits, exchange)
-      |> Effect.provideMut<TrustSource>(&mut trust)
-      |> Effect.provideMut<SystemClock>(&mut wall)
-      |> Effect.provideMut<Random>(&mut random))
-    return match move outcome {
-      Result.Success {value} => move value
+      |> Effect.provideMut<TrustSource>(&mut trust))
+    let failure: HttpError | OutOfMemoryError = match move outcome {
+      Result.Success {value} => { return Result<Received, HttpError | OutOfMemoryError>.succeed(move value) }
       Result.Failure {error} => match move error {
-        HttpError failure => { fail move failure }
-        OutOfMemoryError exhausted => { fail move exhausted }
-        ExchangeError failure => run classify(move failure)
-        NativeExchangeError failure => run classify(move failure)
-        ResolverError failure => run classify(move failure)
-        NativeSocketError failure => run classify(move failure)
-        ConnectionError failure => run classify(move failure)
-        IdentityError failure => run classify(move failure)
-        TrustSourceError failure => run classify(move failure)
+        HttpError failure => move failure
+        OutOfMemoryError exhausted => move exhausted
+        ExchangeError failure => httpErrorOf(move failure)
+        NativeExchangeError failure => httpErrorOf(move failure)
+        ResolverError failure => httpErrorOf(move failure)
+        NativeSocketError failure => httpErrorOf(move failure)
+        ConnectionError failure => httpErrorOf(move failure)
+        IdentityError failure => httpErrorOf(move failure)
+        TrustSourceError failure => httpErrorOf(move failure)
       }
     }
+    return Result<Received, HttpError | OutOfMemoryError>.failResult(move failure)
   }
 
   enum Slot {
@@ -2073,10 +2100,15 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   }
 
   effect fn classify(error: ProxyError | RequestError | ExchangeError | NativeExchangeError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError) -> never ! HttpError {
+    fail httpErrorOf(move error)
+  }
+
+  // The HTTP error of a failure from a lower layer.
+  fn httpErrorOf(error: ProxyError | RequestError | ExchangeError | NativeExchangeError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError) -> HttpError {
     return match move error {
       ProxyError failure => match move failure {
         ProxyError.ProxyAuthenticationRequired {response} => {
-          fail HttpError {
+          return HttpError {
             kind: HttpErrorKind.Connect,
             message: "The proxy requires authentication; put the credentials in the proxy URL.",
             status: Option<u16>.some(statusOf(&response)),
@@ -2084,45 +2116,45 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
           }
         }
         ProxyError.ProxyRejected {response} => {
-          fail HttpError {
+          return HttpError {
             kind: HttpErrorKind.Connect,
             message: "The proxy refused to open a tunnel to the server.",
             status: Option<u16>.some(statusOf(&response)),
             cause: HttpCause.None,
           }
         }
-        _ => { fail HttpError.make(HttpErrorKind.Connect, "The proxy answer is not valid.") }
+        _ => { return HttpError.make(HttpErrorKind.Connect, "The proxy answer is not valid.") }
       }
       RequestError failure => {
-        fail HttpError.caused(HttpErrorKind.InvalidRequest, "Could not prepare the request.", HttpCause.Request {error: move failure})
+        return HttpError.caused(HttpErrorKind.InvalidRequest, "Could not prepare the request.", HttpCause.Request {error: move failure})
       }
       ExchangeError failure => {
         if exchangeTimedOut(&failure) {
-          fail HttpError.caused(HttpErrorKind.Timeout, "The request deadline passed.", HttpCause.Exchange {error: move failure})
+          return HttpError.caused(HttpErrorKind.Timeout, "The request deadline passed.", HttpCause.Exchange {error: move failure})
         }
-        fail HttpError.caused(HttpErrorKind.Protocol, "The HTTP exchange failed.", HttpCause.Exchange {error: move failure})
+        return HttpError.caused(HttpErrorKind.Protocol, "The HTTP exchange failed.", HttpCause.Exchange {error: move failure})
       }
       NativeExchangeError failure => match move failure {
         NativeExchangeError.AlpnMismatch {error: connection} => {
-          fail HttpError.caused(HttpErrorKind.Tls, "The server did not agree to HTTP/1.1.", HttpCause.Tls {error: move connection})
+          return HttpError.caused(HttpErrorKind.Tls, "The server did not agree to HTTP/1.1.", HttpCause.Tls {error: move connection})
         }
-        _ => { fail HttpError.make(HttpErrorKind.Connect, "Could not open the connection.") }
+        _ => { return HttpError.make(HttpErrorKind.Connect, "Could not open the connection.") }
       }
       ResolverError failure => {
-        fail HttpError.caused(HttpErrorKind.Connect, "Could not resolve the host name.", HttpCause.Resolver {error: move failure})
+        return HttpError.caused(HttpErrorKind.Connect, "Could not resolve the host name.", HttpCause.Resolver {error: move failure})
       }
-      NativeSocketError _failure => { fail HttpError.make(HttpErrorKind.Connect, "Could not connect to the server.") }
+      NativeSocketError _failure => { return HttpError.make(HttpErrorKind.Connect, "Could not connect to the server.") }
       ConnectionError failure => match & failure {
         ConnectionError.HandshakeTimeout => {
-          fail HttpError.caused(HttpErrorKind.Timeout, "The TLS handshake did not finish before the deadline.", HttpCause.Tls {error: move failure})
+          return HttpError.caused(HttpErrorKind.Timeout, "The TLS handshake did not finish before the deadline.", HttpCause.Tls {error: move failure})
         }
-        _ => { fail HttpError.caused(HttpErrorKind.Tls, tlsMessage(&failure), HttpCause.Tls {error: move failure}) }
+        _ => { return HttpError.caused(HttpErrorKind.Tls, tlsMessage(&failure), HttpCause.Tls {error: move failure}) }
       }
       IdentityError failure => {
-        fail HttpError.caused(HttpErrorKind.Tls, "The server name cannot be checked against its certificate.", HttpCause.Identity {error: move failure})
+        return HttpError.caused(HttpErrorKind.Tls, "The server name cannot be checked against its certificate.", HttpCause.Identity {error: move failure})
       }
       TrustSourceError failure => {
-        fail HttpError.caused(HttpErrorKind.Tls, "Could not load the trust source.", HttpCause.Trust {error: move failure})
+        return HttpError.caused(HttpErrorKind.Tls, "Could not load the trust source.", HttpCause.Trust {error: move failure})
       }
     }
   }
