@@ -773,6 +773,17 @@ pub fn equals(self: &Self, other: &Method) -> bool
 
 Returns `true` if the two methods have the same spelling. Case matters.
 
+<a id="Method.impl.idempotent"></a>
+
+### Method `idempotent`
+
+```silk
+pub fn idempotent(self: &Self) -> bool
+```
+
+Returns true for the methods that RFC 9110 defines as idempotent: `GET`, `HEAD`, `OPTIONS`,
+`TRACE`, `PUT`, and `DELETE`. Sending one of these again has the same effect as sending it once.
+
 <a id="Method.impl.get"></a>
 
 ### Associated function `get`

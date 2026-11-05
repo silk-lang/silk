@@ -84,6 +84,7 @@ import silk.http.client {Field, Http, HttpCause, HttpError, HttpErrorKind, Reque
 import silk.http.exchange as Exchange
 import silk.http.exchange {
   Connection,
+  ReuseEligibility,
   ConnectionHandler,
   ContinuePolicy,
   Exchange as Live,
@@ -117,6 +118,7 @@ import silk.tls.https_identity {IdentityError}
 import silk.collections.list {List}
 import silk.system.monotonic_clock {MonotonicClock}
 import silk.core.option {Option}
+import silk.core.ownership {Copy}
 import silk.system.random {Random}
 import silk.net.resolver {ResolverError}
 import silk.core.result {Result}
@@ -223,6 +225,14 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     secureProxy: Option<ProxyConfig>,
     plainProxy: Option<ProxyConfig>,
     noProxy: Bytes,
+    idle: Option<IdleConnection>,
+  }
+
+  // A direct connection that finished its last exchange and stayed open, kept for the next request
+  // to the same origin.
+  struct IdleConnection {
+    origin: Origin,
+    connection: Connection<NativeTransport>,
   }
 
   impl<'config> NativeHttp<'config> {
@@ -264,6 +274,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
         secureProxy: Option<ProxyConfig>.none(),
         plainProxy: Option<ProxyConfig>.none(),
         noProxy: Bytes.make(),
+        idle: Option<IdleConnection>.none(),
       }
     }
 
@@ -454,7 +465,6 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
 
   fn limitsFor(maxBody: usize) -> Limits {
     let mut selected = Limits.defaults()
-    selected.maxRequests = usize.ONE
     // Leave room above the caller's limit so the client reports TooLarge before framing does.
     let room = usize.toU64(maxBody) + u64.toU64(65536)
     if room > selected.responseBody.maxPayloadBytes {
@@ -739,34 +749,27 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     return true
   }
 
-  struct Handler<'b> {
-    request: PreparedRequest,
-    body: &'b [u8],
-    deadline: Instant,
+  // Runs one exchange of `request` on a direct connection and reads the whole response.
+  effect fn exchangeOn(
+    connection: &mut Connection<NativeTransport>,
+    request: &PreparedRequest,
+    body: &[u8],
+    deadline: &Instant,
     maxBody: usize,
-  }
-
-  impl<'b> ConnectionHandler<
-    NativeTransport,
-    Received,
-    HttpError | ExchangeError | OutOfMemoryError
-    ? &mut Allocator | &mut MonotonicClock | &mut Random
-  > for Handler<'b> {
-    effect<'call> fn handle<'call>(handler: Self, connection: &'call mut Connection<NativeTransport>) -> Received
+  ) -> Received
+  ! HttpError | ExchangeError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock | &mut Random {
+    let until = SystemClock.make(SystemClock.seconds(deadline), SystemClock.nanoseconds(deadline))
+    let options = RequestOptions {deadline: Option<Instant>.some(move until), continuePolicy: ContinuePolicy.Disabled}
+    let callback = effect fn(exchange: &mut Live<NativeTransport>) -> Received
     ! HttpError | ExchangeError | OutOfMemoryError
     ? &mut Allocator | &mut MonotonicClock | &mut Random {
-      let Handler<'b> {request, body, deadline, maxBody} = move handler
-      let options = RequestOptions {deadline: Option<Instant>.some(move deadline), continuePolicy: ContinuePolicy.Disabled}
-      let callback = effect fn(exchange: &mut Live<NativeTransport>) -> Received
-      ! HttpError | ExchangeError | OutOfMemoryError
-      ? &mut Allocator | &mut MonotonicClock | &mut Random {
-        return run exchangeBody(&mut exchange.*, body, maxBody)
-      }
-      return run Exchange.withExchange(&mut connection.*, &request, move options, move callback)
+      return run exchangeBody(&mut exchange.*, body, maxBody)
     }
+    return run Exchange.withExchange(&mut connection.*, request, move options, move callback)
   }
 
-  // The same exchange as Handler, over a connection from withProxyRoute.
+  // The same exchange as exchangeOn, over a connection from withProxyRoute.
   struct RouteBody<'b> {
     request: PreparedRequest,
     body: &'b [u8],
@@ -1020,8 +1023,20 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
         Result.Failure {error} => { fail move error }
       }
     }
-    let handler = Handler {request: move prepared, body: payload, deadline: move deadline, maxBody: settings.maxBody}
-    let outcome = run Effect.result(ExchangeNative.withConnection(origin, move options, limits, move handler)
+    let kept = Intrinsic.replace(client.idle, Option<IdleConnection>.none())
+    let mut reused = Option<Connection<NativeTransport>>.none()
+    if let Option.Some {value: previous} = move kept {
+      let IdleConnection {origin: keptOrigin, connection: keptConnection} = move previous
+      let mut held = move keptConnection
+      if Origin.equals(&keptOrigin, &origin) && ExchangeNative.reusable(&held) {
+        reused = Option<Connection<NativeTransport>>.some(move held)
+      } else {
+        let closed = run Effect.result(Exchange.close(&mut held))
+        drop closed
+      }
+    }
+    let exchange = Direct {request: &prepared, body: payload, deadline: &deadline, maxBody: settings.maxBody, idempotent: method.idempotent()}
+    let outcome = run Effect.result(exchangeKept(&mut client.idle, origin, move options, limits, move reused, exchange)
       |> Effect.provideMut<TrustSource>(&mut trust)
       |> Effect.provideMut<SystemClock>(&mut wall)
       |> Effect.provideMut<MonotonicClock>(&mut client.clock)
@@ -1030,6 +1045,99 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     return match move outcome {
       Result.Success {value} => move value
       Result.Failure {error} => { fail move error }
+    }
+  }
+
+  // One request on a direct connection, borrowed so that it can be sent again.
+  struct Direct<'r> {
+    request: &'r PreparedRequest,
+    body: &'r [u8],
+    deadline: &'r Instant,
+    maxBody: usize,
+    idempotent: bool,
+  }
+
+  impl<'r> Copy for Direct<'r> {}
+
+  // Sends one request on `reused`, or on a new connection when it is none. When a reused connection
+  // fails because the server closed it, an idempotent request goes once more on a new connection,
+  // since the server may have closed it while idle. A connection that can run another exchange
+  // afterwards goes back to `idle`; any other is closed.
+  effect fn exchangeKept(
+    idle: &mut Option<IdleConnection>,
+    origin: Origin,
+    options: Options,
+    limits: Limits,
+    reused: Option<Connection<NativeTransport>>,
+    exchange: Direct,
+  ) -> Received
+  ! HttpError | ExchangeError | NativeExchangeError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random | &mut TrustSource {
+    if let Option.Some {value} = move reused {
+      let mut connection = move value
+      let attempt = run Effect.result(exchangeOn(&mut connection, exchange.request, exchange.body, exchange.deadline, exchange.maxBody))
+      match move attempt {
+        Result.Success {value: received} => {
+          run keep(&mut idle.*, origin, move connection)
+          return move received
+        }
+        Result.Failure {error} => {
+          let closed = run Effect.result(Exchange.close(&mut connection))
+          drop closed
+          match move error {
+            ExchangeError failure => {
+              if !exchange.idempotent || !closedByPeer(&failure) { fail move failure }
+            }
+            HttpError failure => { fail move failure }
+            OutOfMemoryError failure => { fail move failure }
+          }
+        }
+      }
+    }
+    let mut trust = Option<TrustSnapshot>.none()
+    if Origin.secure(&origin) {
+      trust = Option<TrustSnapshot>.some(run TrustSource.load(options.trust))
+    }
+    let mut connection = run ExchangeNative.acquireOwned(origin, move options, limits, move trust, Option<Instant>.none())
+    let result = run Effect.result(exchangeOn(&mut connection, exchange.request, exchange.body, exchange.deadline, exchange.maxBody))
+    return match move result {
+      Result.Success {value} => {
+        run keep(&mut idle.*, origin, move connection)
+        return move value
+      }
+      Result.Failure {error} => {
+        let closed = run Effect.result(Exchange.close(&mut connection))
+        drop closed
+        fail move error
+      }
+    }
+  }
+
+  // Keeps `connection` for the next request when it can run another exchange, and closes it
+  // otherwise.
+  effect fn keep(idle: &mut Option<IdleConnection>, origin: Origin, connection: Connection<NativeTransport>) -> () {
+    let eligible = match Exchange.reuseEligibility<NativeTransport>(&connection) {
+      ReuseEligibility.Eligible => true
+      _ => false
+    }
+    if eligible {
+      idle.* = Option<IdleConnection>.some(IdleConnection {origin: origin, connection: move connection})
+      return ()
+    }
+    let mut closing = move connection
+    let closed = run Effect.result(Exchange.close(&mut closing))
+    drop closed
+    return ()
+  }
+
+  // Whether the exchange failed because the peer closed or reset the connection before the
+  // response head arrived.
+  fn closedByPeer(error: &ExchangeError) -> bool {
+    return match & error.* {
+      ExchangeError.Transport {..} => true
+      ExchangeError.Output {..} => true
+      ExchangeError.TruncatedHead => true
+      _ => false
     }
   }
 

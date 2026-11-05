@@ -409,6 +409,16 @@ pub fn phase(self: &Self) -> ConnectionPhase
 
 Returns the current [`ConnectionPhase`](#ConnectionPhase).
 
+<a id="OwnedConnection.impl.socket"></a>
+
+### Method `socket`
+
+```silk
+pub fn socket(self: &Self) -> &P
+```
+
+Returns the transport under TLS. Use it to look at the socket, such as its readiness.
+
 <a id="OwnedConnection.impl.authentication"></a>
 
 ### Method `authentication`

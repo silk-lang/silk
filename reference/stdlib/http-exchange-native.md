@@ -116,7 +116,7 @@ pub fn main() -> i32 {
 
 Import as `HttpExchangeNative` with `import silk.http.exchange_native as HttpExchangeNative`.
 
-Public declarations: 16.
+Public declarations: 17.
 
 <a id="NativeRoute"></a>
 
@@ -929,6 +929,21 @@ pub fn route(connection: &Connection<NativeTransport>) -> NativeRoute
 ```
 
 Returns the route of a native connection.
+
+<a id="reusable"></a>
+
+## `reusable`
+
+```silk
+pub fn reusable(connection: &Connection<NativeTransport>) -> bool
+```
+
+Returns true when another request can go out on `connection`: it passes `reuseEligibility`,
+and the peer has not sent anything or closed it since.
+
+### Details
+It looks at the socket without waiting. The peer can still close the connection right after
+the check, so a request on a reused connection can fail where a new one would not.
 
 
 Category: HTTP.

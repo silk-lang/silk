@@ -261,6 +261,22 @@ space for four elements, and each later growth doubles the capacity.
 - `OutOfMemoryError` if the `Allocator` cannot supply the new storage. The list does not
   change.
 
+<a id="List.impl.appendWithinCapacity"></a>
+
+### Method `appendWithinCapacity`
+
+```silk
+pub fn appendWithinCapacity(self: &mut Self, value: T) -> bool
+```
+
+Adds `value` at the end of the list if the capacity has room, without allocating. Returns
+`false`, and drops `value`, when the list is full.
+
+#### When to use
+
+Use it in code that must not allocate, after [`List.reserveExact`](#List.impl.reserveExact) made the room, such as a
+parser that fills a buffer of fixed size.
+
 <a id="List.impl.insert"></a>
 
 ### Method `insert`

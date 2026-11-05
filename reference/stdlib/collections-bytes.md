@@ -144,6 +144,17 @@ A `length` of 0 returns an empty value and does not allocate.
 
 - `OutOfMemoryError` if the `Allocator` cannot supply the storage.
 
+<a id="Bytes.impl.appendWithinCapacity"></a>
+
+### Method `appendWithinCapacity`
+
+```silk
+pub fn appendWithinCapacity(self: &mut Self, value: u8) -> bool
+```
+
+Adds `value` at the end if the capacity has room, without allocating. Returns `false` when
+the value is full. See [`List.appendWithinCapacity`](./collections-list.md#List.impl.appendWithinCapacity).
+
 <a id="Bytes.impl.length"></a>
 
 ### Method `length`

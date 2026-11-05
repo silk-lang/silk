@@ -15,9 +15,9 @@ A [`Connection`](#Connection) provides `ByteDuplex`, so `silk.http.exchange`, `s
 `silk.io.buffered_duplex` can use it.
 
 ## Details
-All sockets are nonblocking. When a socket is not ready, the operation waits for the poll
-interval with `MonotonicClock`, then tries again. So an idle wait costs about one check for each
-interval. One deadline covers all attempts of one connect or accept.
+All sockets are nonblocking. When a socket is not ready, the operation waits in `poll` for up
+to the poll interval, and goes on as soon as the socket is ready. Between waits it checks the
+deadline with `MonotonicClock`. So an idle wait costs about one check for each interval. One deadline covers all attempts of one connect or accept.
 
 A connect tries the endpoints in their order, until one connects or the attempt limit is
 reached. A flush means that the kernel accepted the bytes, not that the peer got them.
@@ -1661,9 +1661,9 @@ An open socket connection. It provides `ByteDuplex`, so `silk.http.exchange`,
 `silk.http.server`, and `silk.io.buffered_duplex` can use it.
 
 ### Details
-The socket is nonblocking. When it is not ready, an operation waits for the poll interval with
-`MonotonicClock`, then tries again. So an idle wait costs about one check for each interval. A
-flush means that the kernel accepted the bytes, not that the peer got them.
+The socket is nonblocking. When it is not ready, an operation waits in `poll` for up to the poll
+interval and goes on as soon as the socket is ready, and checks the deadline with
+`MonotonicClock` between waits. A flush means that the kernel accepted the bytes, not that the peer got them.
 
 <a id="Listener"></a>
 
@@ -1759,6 +1759,17 @@ pub fn phase(self: &Self) -> ConnectionPhase
 ```
 
 Returns the state of the connection.
+
+<a id="Connection.impl.idle"></a>
+
+### Method `idle`
+
+```silk
+pub fn idle(self: &Self) -> bool
+```
+
+Returns true when the connection is open and the peer has sent nothing and not closed it,
+so a new request can go out on it. It does not wait.
 
 <a id="Connection.impl.close"></a>
 
