@@ -78,6 +78,28 @@ If `escaped` is `false`, the text is copied without a scan for escapes.
   `InvalidEscape` for an escape that is not valid.
 - `OutOfMemoryError` if the `Allocator` cannot supply the text.
 
+<a id="JsonText.impl.decodeInto"></a>
+
+### Associated function `decodeInto`
+
+```silk
+pub effect fn decodeInto(output: &mut Bytes, raw: &[u8], offset: usize, escaped: bool)
+    -> () ! JsonError | OutOfMemoryError ? &mut Allocator
+```
+
+Appends the text of the quoted string token `raw` to `output`, with escapes decoded, as
+[`JsonText.decode`](#JsonText.impl.decode) returns it.
+
+#### When to use
+
+Use it to collect many strings in one buffer instead of one allocation each.
+
+#### Errors
+
+- `JsonError` with reason `UnterminatedString` if `raw` is shorter than two bytes, or
+  `InvalidEscape` for an escape that is not valid. `output` may then hold part of the text.
+- `OutOfMemoryError` if the `Allocator` cannot supply the text.
+
 
 Category: Data formats.
 
