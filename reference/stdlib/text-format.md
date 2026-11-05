@@ -1027,6 +1027,28 @@ the same sign. The result does not depend on floating-point arithmetic of the ta
 `NaN`, `Infinity`, and `inf` are not accepted, so the output of `Display` for a value that is
 not finite does not parse back.
 
+<a id="Format.impl.f64FromDecimal"></a>
+
+### Associated function `f64FromDecimal`
+
+```silk
+pub fn f64FromDecimal(significand: u64, exponent10: i64) -> f64
+```
+
+Returns the `f64` nearest to `significand` times ten to the power `exponent10`, with ties to
+even.
+
+#### When to use
+
+Use it in a parser that has already read the digits of a decimal number, such as a JSON
+parser, so that the text is not read a second time. Use [`Format.f64Value`](#Format.impl.f64Value) to read the text.
+
+#### Details
+
+The result is the same as `f64Value` gives for the digits of `significand` followed by
+`e` and `exponent10`. A value too large for `f64` becomes infinity, and a value too small
+becomes zero. The result does not depend on floating-point arithmetic of the target.
+
 <a id="Format.impl.f32Value"></a>
 
 ### Associated function `f32Value`
