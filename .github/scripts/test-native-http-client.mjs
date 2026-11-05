@@ -159,9 +159,10 @@ try {
     no_proxy: '',
   })
   assert.equal(result.status, 0, JSON.stringify(result))
-  // The client keeps one idle connection for each origin, so a redirect to the other server and
-  // back reuses the first connection to the main server.
-  assert.ok(opened.main <= 4 && opened.other <= 2, JSON.stringify(opened))
+  // Sequential requests reuse an idle connection, so a redirect to the other server and back
+  // reuses the first connection to the main server. The four requests of `sendAll` run at once and
+  // open up to four more.
+  assert.ok(opened.main <= 8 && opened.other <= 2, JSON.stringify(opened))
   console.log('Native silk.http.client conformance passed')
 } finally {
   for (const timer of timers) clearTimeout(timer)

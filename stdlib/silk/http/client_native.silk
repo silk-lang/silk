@@ -119,6 +119,9 @@ import silk.http.transport {HttpTransport, TransportError}
 import silk.tls.https_identity {IdentityError}
 import silk.collections.list {List}
 import silk.system.monotonic_clock {MonotonicClock}
+import silk.concurrency.fiber {Cancelled, Fiber}
+import silk.concurrency.local_scheduler {LocalScheduler, StalledError}
+import silk.concurrency.scheduler {Scheduler, TaskIdExhaustedError}
 import silk.core.option {Option}
 import silk.core.ownership {Copy}
 import silk.system.random {Random}
@@ -164,7 +167,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   } else { type ConfiguredTrust = NativeFileTrustSource }
   import silk.system.monotonic_clock_native {OsMonotonicClock}
   import silk.system.random_native {OsRandom}
-  import silk.net.socket_native {NativeSocketError, ReadinessWait}
+  import silk.net.socket_native {NativeSocketError}
   import silk.system.system_clock_native {OsSystemClock}
 
   /// The default deadline for one request, in seconds.
@@ -173,8 +176,11 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   pub const DEFAULT_MAX_BODY_BYTES: usize = 16777216
   /// The default number of redirects followed.
   pub const DEFAULT_MAX_REDIRECTS: usize = 10
-  // The most origins that keep an idle connection at once.
-  const MAX_IDLE: usize = 8
+  // The most idle connections the client keeps open at once. An origin can have several, so that
+  // concurrent requests reuse them.
+  const MAX_IDLE: usize = 64
+  /// The default number of requests that [`Http.sendAll`] runs at the same time.
+  pub const DEFAULT_CONCURRENCY: usize = 32
   /// The maximum number of headers that [`NativeHttp.header`] adds.
   pub const MAX_DEFAULT_HEADERS: usize = 16
 
@@ -199,8 +205,12 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   /// most 16 MiB, up to 10 redirects, and the PEM bundle of the platform for HTTPS:
   /// `/etc/ssl/cert.pem` on macOS and `/etc/ssl/certs/ca-certificates.crt` on Linux, or the logical
   /// Windows `ROOT` certificate store. Requests use HTTP/1.1 and send `Accept-Encoding: identity`,
-  /// so the body arrives as the server sent it. The next request to an origin reuses its open
-  /// connection, for up to 8 origins.
+  /// so the body arrives as the server sent it. The next request to an origin reuses an open
+  /// connection to it. The client keeps up to 64 open connections, several for one origin when
+  /// requests ran at the same time.
+  ///
+  /// [`Http.sendAll`] runs up to 32 requests at the same time on one thread, each on its own
+  /// connection. Set the number with [`NativeHttp.withConcurrency`].
   ///
   /// Redirects follow the Fetch standard. After 303, and after 301 or 302 for a POST, the client
   /// sends a GET without a body. After 307 and 308, it sends the same method and body. A redirect
@@ -231,10 +241,11 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     plainProxy: Option<ProxyConfig>,
     noProxy: Bytes,
     idle: List<IdleConnection>,
+    concurrencyValue: usize,
   }
 
   // A direct connection that finished its last exchange and stayed open, kept for the next request
-  // to the same origin. The client keeps one for each of up to `MAX_IDLE` origins.
+  // to the same origin. The client keeps up to `MAX_IDLE` of them.
   struct IdleConnection {
     origin: Origin,
     connection: Connection<NativeTransport>,
@@ -280,6 +291,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
         plainProxy: Option<ProxyConfig>.none(),
         noProxy: Bytes.make(),
         idle: List<IdleConnection>.make(),
+        concurrencyValue: DEFAULT_CONCURRENCY,
       }
     }
 
@@ -401,6 +413,14 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       return move next
     }
 
+    /// Sets how many requests [`Http.sendAll`] runs at the same time. A value of 0 counts as 1.
+    pub fn withConcurrency(self: Self, limit: usize) -> NativeHttp<'config> {
+      let mut next = move self
+      next.concurrencyValue = limit
+      if limit == usize.ZERO { next.concurrencyValue = usize.ONE }
+      return move next
+    }
+
     /// Makes each final response with a status outside 200 to 299 fail with a `Status` error.
     pub fn failOnStatus(self: Self) -> NativeHttp<'config> {
       let mut next = move self
@@ -483,22 +503,44 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
 
   effect fn ensureTrust(client: &mut NativeHttp) -> () ! HttpError | OutOfMemoryError ? &mut Allocator {
     if let Option.Some {..} = &client.trust { return () }
+    let plan = run trustPlan(&client.*)
+    client.trust = Option<ConfiguredTrust>.some(run trustOf(&plan))
+  }
+
+  // What a task of `sendAll` needs to make its own trust source.
+  union TrustPlan {
+    // The logical Windows ROOT store.
+    Root,
+    // The PEM bundle at this path.
+    Bundle {path: Bytes},
+  }
+
+  effect fn trustPlan(client: &NativeHttp) -> TrustPlan ! OutOfMemoryError ? &mut Allocator {
     static if Intrinsic.targetOperatingSystem() == "windows" {
-      if let TrustChoice.Platform = &client.trustChoice {
-        client.trust = Option<ConfiguredTrust>.some(ConfiguredTrust.Root {provider: WindowsRootTrustSource.make()})
-        return ()
+      if let TrustChoice.Platform = &client.trustChoice { return TrustPlan.Root }
+    }
+    let path = match & client.trustChoice {
+      TrustChoice.Platform => run Bytes.copy(platformBundle())
+      TrustChoice.Borrowed {path} => run Bytes.copy(String.utf8Bytes(path))
+      TrustChoice.Owned {path} => run Bytes.copy(Bytes.asSlice(&path))
+    }
+    return TrustPlan.Bundle {path: move path}
+  }
+
+  effect fn trustOf(plan: &TrustPlan) -> ConfiguredTrust ! HttpError | OutOfMemoryError ? &mut Allocator {
+    let configured = match & plan.* {
+      TrustPlan.Root => {
+        static if Intrinsic.targetOperatingSystem() == "windows" {
+          return ConfiguredTrust.Root {provider: WindowsRootTrustSource.make()}
+        } else { fail HttpError.make(HttpErrorKind.Tls, "The platform trust store exists only on Windows.") }
       }
+      TrustPlan.Bundle {path} => run Effect.result(trustAt(Bytes.asSlice(&path)))
     }
-    let configured = match & client.trustChoice {
-      TrustChoice.Platform => run Effect.result(trustAt(platformBundle()))
-      TrustChoice.Borrowed {path} => run Effect.result(trustAt(String.utf8Bytes(path)))
-      TrustChoice.Owned {path} => run Effect.result(trustAt(Bytes.asSlice(&path)))
-    }
-    match move configured {
+    return match move configured {
       Result.Success {value} => {
         static if Intrinsic.targetOperatingSystem() == "windows" {
-          client.trust = Option<ConfiguredTrust>.some(ConfiguredTrust.File {provider: move value})
-        } else { client.trust = Option<ConfiguredTrust>.some(move value) }
+          return ConfiguredTrust.File {provider: move value}
+        } else { return move value }
       }
       Result.Failure {error} => match move error {
         HttpError failure => { fail move failure }
@@ -954,7 +996,8 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     withBody: bool,
     credentials: bool,
     settings: &Settings,
-  ) -> Received
+    defer: bool,
+  ) -> Attempted
   ! HttpError | ProxyError | RequestError | ExchangeError | NativeExchangeError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError
   ? &mut Allocator {
     let uri = match move Uri.parse(url) {
@@ -1060,9 +1103,6 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     let deadline = MonotonicClock.deadlineAfter(&now, nanoseconds)
     let mut options = Options.defaults()
     options.handshakeNanoseconds = nanoseconds
-    // The client waits with its own `OsMonotonicClock`, which blocks the thread anyway, so a
-    // reply wakes the wait at once instead of after the poll interval.
-    options.readinessWait = ReadinessWait.Kernel
     let payload = Slice.view<u8>(request.bodyBytes(), usize.ZERO, payloadLength)
     let taken = Intrinsic.replace(client.trust, Option<ConfiguredTrust>.none())
     let mut trust = match move taken {
@@ -1078,9 +1118,25 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
         |> Effect.provideMut<Random>(&mut client.random))
       client.trust = Option<ConfiguredTrust>.some(move trust)
       return match move result {
-        Result.Success {value} => move value
+        Result.Success {value} => Attempted.Done {received: move value}
         Result.Failure {error} => { fail move error }
       }
+    }
+    if defer {
+      client.trust = Option<ConfiguredTrust>.some(move trust)
+      drop deadline
+      let plan = run trustPlan(&client.*)
+      return Attempted.Deferred {job: PendingJob {
+        request: move prepared,
+        body: run Bytes.copy(payload),
+        timeoutNanoseconds: nanoseconds,
+        maxBody: settings.maxBody,
+        idempotent: method.idempotent(),
+        origin: origin,
+        options: move options,
+        limits: limits,
+        trust: move plan,
+      }}
     }
     // An idempotent request skips the check that the server has not closed the connection:
     // `exchangeKept` sends it again on a new connection if it did, which saves a system call on
@@ -1108,9 +1164,15 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       |> Effect.provideMut<Random>(&mut client.random))
     client.trust = Option<ConfiguredTrust>.some(move trust)
     return match move outcome {
-      Result.Success {value} => move value
+      Result.Success {value} => Attempted.Done {received: move value}
       Result.Failure {error} => { fail move error }
     }
+  }
+
+  // The result of one hop: the response, or a direct request that a task of `sendAll` sends.
+  union Attempted {
+    Done {received: Received},
+    Deferred {job: PendingJob},
   }
 
   // One request on a direct connection, borrowed so that it can be sent again.
@@ -1242,6 +1304,351 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     return run ExchangeNative.withProxyRoute(route, move options, limits, move snapshot, move handler)
   }
 
+  // A direct request that a task of `sendAll` sends. It owns all its data, so that the task does
+  // not borrow from the caller.
+  struct PendingJob {
+    request: PreparedRequest,
+    body: Bytes,
+    timeoutNanoseconds: u64,
+    maxBody: usize,
+    idempotent: bool,
+    origin: Origin,
+    options: Options,
+    limits: Limits,
+    trust: TrustPlan,
+  }
+
+  // A job with the idle connection it reuses, if one was open to its origin.
+  struct Job {
+    pending: PendingJob,
+    connection: Option<IdleConnection>,
+  }
+
+  // What a task gives back: its response or failure, and its connection if it stays open.
+  struct JobOutcome {
+    received: Result<Received, HttpError | OutOfMemoryError>,
+    kept: Option<IdleConnection>,
+  }
+
+  // The results of one round of jobs, in job order, and the connections that stayed open.
+  struct Round {
+    results: List<Result<Received, HttpError | OutOfMemoryError>>,
+    idle: List<IdleConnection>,
+  }
+
+  // One request of `sendAll` and where it is.
+  union Progress {
+    // It needs another hop.
+    Going {hop: Hop},
+    // It has finished.
+    Finished {result: Result<Response, HttpError>},
+  }
+
+  // Sends `requests` and returns their results in the same order. Each round sends the current hop
+  // of each unfinished request: direct requests run as tasks of a local scheduler, at most
+  // `concurrencyValue` at once, and proxied requests run one by one. A redirect goes to the next
+  // round.
+  effect fn sendConcurrent(client: &mut NativeHttp, requests: List<Request>) -> List<Result<Response, HttpError>>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+    let all = List<Request>.asSlice(&requests)
+    let mut progress = List<Progress>.make()
+    run List<Progress>.reserveExact(&mut progress, all.length)
+    let mut index = usize.ZERO
+    while index < all.length {
+      let begun = run Effect.result(begin(&client.*, &all[index]))
+      let next = match move begun {
+        Result.Success {value} => Progress.Going {hop: move value}
+        Result.Failure {error} => match move error {
+          HttpError failure => Progress.Finished {result: Result<Response, HttpError>.failResult(move failure)}
+          OutOfMemoryError exhausted => { fail move exhausted }
+        }
+      }
+      run List<Progress>.append(&mut progress, move next)
+      index = index + usize.ONE
+    }
+    while true {
+      let mut jobs = List<PendingJob>.make()
+      let mut owners = List<usize>.make()
+      let states = List<Progress>.asMutSlice(&mut progress)
+      index = usize.ZERO
+      while index < states.length {
+        let mut finished = Option<Result<Response, HttpError>>.none()
+        if let Progress.Going {hop} = &mut states[index] {
+          let attempted = run Effect.result(stepHop(&mut client.*, &all[index], &mut hop))
+          match move attempted {
+            Result.Success {value} => match move value {
+              Stepped.Again => {}
+              Stepped.Final {response} => { finished = Option<Result<Response, HttpError>>.some(Result<Response, HttpError>.succeed(move response)) }
+              Stepped.Queued {job} => {
+                run List<PendingJob>.append(&mut jobs, move job)
+                run List<usize>.append(&mut owners, index)
+              }
+            }
+            Result.Failure {error} => match move error {
+              HttpError failure => { finished = Option<Result<Response, HttpError>>.some(Result<Response, HttpError>.failResult(move failure)) }
+              OutOfMemoryError exhausted => { fail move exhausted }
+            }
+          }
+        }
+        if let Option.Some {value} = move finished {
+          states[index] = Progress.Finished {result: move value}
+        }
+        index = index + usize.ONE
+      }
+      drop states
+      if List<PendingJob>.length(&jobs) == usize.ZERO && !anyGoing(List<Progress>.asSlice(&progress)) { break }
+      let mut results = run runRound(&mut client.*, move jobs)
+      // The results come in job order; take them from the end.
+      let settled = List<Progress>.asMutSlice(&mut progress)
+      let indices = List<usize>.asSlice(&owners)
+      let mut position = indices.length
+      while position > usize.ZERO {
+        position = position - usize.ONE
+        let owner = indices[position]
+        let result = match List<Result<Received, HttpError | OutOfMemoryError>>.pop(&mut results) {
+          Option.Some {value} => move value
+          Option.None => Intrinsic.trap("sendAll: a round returned fewer results than jobs")
+        }
+        let mut finished = Option<Result<Response, HttpError>>.none()
+        if let Progress.Going {hop} = &mut settled[owner] {
+          let advanced = match move result {
+            Result.Success {value: received} => run Effect.result(advance(client.failOnStatusValue, &mut hop, move received))
+            Result.Failure {error} => match move error {
+              HttpError failure => Result<Option<Response>, HttpError | OutOfMemoryError>.failResult(move failure)
+              OutOfMemoryError exhausted => { fail move exhausted }
+            }
+          }
+          match move advanced {
+            Result.Success {value} => {
+              if let Option.Some {value: response} = move value {
+                finished = Option<Result<Response, HttpError>>.some(Result<Response, HttpError>.succeed(move response))
+              }
+            }
+            Result.Failure {error} => match move error {
+              HttpError failure => { finished = Option<Result<Response, HttpError>>.some(Result<Response, HttpError>.failResult(move failure)) }
+              OutOfMemoryError exhausted => { fail move exhausted }
+            }
+          }
+        }
+        if let Option.Some {value} = move finished {
+          settled[owner] = Progress.Finished {result: move value}
+        }
+      }
+    }
+    drop all
+    // Take the results from the end, then reverse them into request order.
+    let mut reversed = List<Result<Response, HttpError>>.make()
+    run List<Result<Response, HttpError>>.reserveExact(&mut reversed, List<Progress>.length(&progress))
+    while true {
+      match List<Progress>.pop(&mut progress) {
+        Option.None => { break }
+        Option.Some {value} => match move value {
+          Progress.Finished {result} => run List<Result<Response, HttpError>>.append(&mut reversed, move result)
+          Progress.Going {..} => Intrinsic.trap("sendAll: a request did not finish")
+        }
+      }
+    }
+    let mut ordered = List<Result<Response, HttpError>>.make()
+    run List<Result<Response, HttpError>>.reserveExact(&mut ordered, List<Result<Response, HttpError>>.length(&reversed))
+    while true {
+      match List<Result<Response, HttpError>>.pop(&mut reversed) {
+        Option.None => { break }
+        Option.Some {value} => run List<Result<Response, HttpError>>.append(&mut ordered, move value)
+      }
+    }
+    return move ordered
+  }
+
+  fn anyGoing(states: &[Progress]) -> bool {
+    let mut index = usize.ZERO
+    while index < states.length {
+      if let Progress.Going {..} = &states[index] { return true }
+      index = index + usize.ONE
+    }
+    return false
+  }
+
+  // What one step of a request did.
+  union Stepped {
+    // A proxied hop redirected; the request needs another hop.
+    Again,
+    // The request has its final response.
+    Final {response: Response},
+    // The hop is a direct request for this round.
+    Queued {job: PendingJob},
+  }
+
+  effect fn stepHop(client: &mut NativeHttp, request: &Request, hop: &mut Hop) -> Stepped
+  ! HttpError | OutOfMemoryError
+  ? &mut Allocator {
+    let attempted = run Effect.result(attemptHop(&mut client.*, request, &hop.*, true))
+    let received = match move attempted {
+      Result.Success {value} => match move value {
+        Attempted.Deferred {job} => { return Stepped.Queued {job: move job} }
+        Attempted.Done {received} => move received
+      }
+      Result.Failure {error} => match move error {
+        HttpError failure => { fail move failure }
+        OutOfMemoryError exhausted => { fail move exhausted }
+        ProxyError failure => run classify(move failure)
+        RequestError failure => run classify(move failure)
+        ExchangeError failure => run classify(move failure)
+        NativeExchangeError failure => run classify(move failure)
+        ResolverError failure => run classify(move failure)
+        NativeSocketError failure => run classify(move failure)
+        ConnectionError failure => run classify(move failure)
+        IdentityError failure => run classify(move failure)
+        TrustSourceError failure => run classify(move failure)
+      }
+    }
+    return match move run advance(client.failOnStatusValue, &mut hop.*, move received) {
+      Option.Some {value} => Stepped.Final {response: move value}
+      Option.None => Stepped.Again
+    }
+  }
+
+  // Runs `jobs` as tasks of a local scheduler that waits on the client's clock. The client's idle
+  // connections go to the tasks and come back after.
+  effect fn runRound(client: &mut NativeHttp, jobs: List<PendingJob>) -> List<Result<Received, HttpError | OutOfMemoryError>>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+    if List<PendingJob>.length(&jobs) == usize.ZERO {
+      return List<Result<Received, HttpError | OutOfMemoryError>>.make()
+    }
+    let idle = Intrinsic.replace(client.idle, List<IdleConnection>.make())
+    let mut scheduler = LocalScheduler.make()
+    let outcome = run Effect.result(scheduler.execute<Round, OutOfMemoryError | TaskIdExhaustedError | Cancelled>(
+      runJobs(move jobs, move idle, client.concurrencyValue),
+    ) |> Effect.provideMut<MonotonicClock>(&mut client.clock))
+    let round = match move outcome {
+      Result.Success {value} => move value
+      Result.Failure {error} => match move error {
+        OutOfMemoryError exhausted => { fail move exhausted }
+        TaskIdExhaustedError _exhausted => Intrinsic.trap("sendAll: the scheduler ran out of task identities")
+        Cancelled _cancelled => Intrinsic.trap("sendAll: a request task was cancelled")
+        StalledError _stalled => Intrinsic.trap("sendAll: the request tasks stalled")
+      }
+    }
+    let Round {results, idle: kept} = move round
+    client.idle = move kept
+    while List<IdleConnection>.length(&client.idle) > MAX_IDLE {
+      run discard(&mut client.idle, usize.ZERO)
+    }
+    return move results
+  }
+
+  // The root task of a round. It keeps up to `limit` tasks running and collects them in job order.
+  // A task that finishes gives its connection back, so a later job to the same origin reuses it.
+  effect fn runJobs(jobs: List<PendingJob>, idle: List<IdleConnection>, limit: usize) -> Round
+  ! OutOfMemoryError | TaskIdExhaustedError | Cancelled
+  ? &mut Scheduler | &mut MonotonicClock {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    return run collectJobs(move jobs, move idle, limit) |> Effect.provideMut<Allocator>(&mut allocator)
+  }
+
+  effect fn collectJobs(jobs: List<PendingJob>, idle: List<IdleConnection>, limit: usize) -> Round
+  ! OutOfMemoryError | TaskIdExhaustedError | Cancelled
+  ? &mut Scheduler | &mut MonotonicClock | &mut Allocator {
+    let mut pool = move idle
+    let mut queued = move jobs
+    // Reverse the jobs, so that `pop` takes them in order.
+    let mut waiting = List<PendingJob>.make()
+    run List<PendingJob>.reserveExact(&mut waiting, List<PendingJob>.length(&queued))
+    while true {
+      match List<PendingJob>.pop(&mut queued) {
+        Option.None => { break }
+        Option.Some {value} => run List<PendingJob>.append(&mut waiting, move value)
+      }
+    }
+    let mut running = List<Fiber<JobOutcome, never>>.make()
+    let mut results = List<Result<Received, HttpError | OutOfMemoryError>>.make()
+    while true {
+      while List<Fiber<JobOutcome, never>>.length(&running) < limit {
+        let pending = match List<PendingJob>.pop(&mut waiting) {
+          Option.None => { break }
+          Option.Some {value} => move value
+        }
+        let connection = run checkout(&mut pool, &pending)
+        let fiber = run Fiber<JobOutcome, never>.forkChild(runJob(Job {pending: move pending, connection: move connection}))
+        run List<Fiber<JobOutcome, never>>.append(&mut running, move fiber)
+      }
+      if List<Fiber<JobOutcome, never>>.length(&running) == usize.ZERO { break }
+      let oldest = List<Fiber<JobOutcome, never>>.remove(&mut running, usize.ZERO)
+      let JobOutcome {received, kept} = move run oldest.join()
+      if let Option.Some {value} = move kept {
+        run List<IdleConnection>.append(&mut pool, move value)
+      }
+      run List<Result<Received, HttpError | OutOfMemoryError>>.append(&mut results, move received)
+    }
+    return Round {results: move results, idle: move pool}
+  }
+
+  // Takes the newest idle connection to the origin of `job` out of `pool`. A request that is not
+  // idempotent uses it only when the server has not closed it.
+  effect fn checkout(pool: &mut List<IdleConnection>, job: &PendingJob) -> Option<IdleConnection> {
+    let kept = List<IdleConnection>.asSlice(&pool.*)
+    let mut found = usize.MAX
+    let mut scan = usize.ZERO
+    while scan < kept.length {
+      if Origin.equals(&kept[scan].origin, &job.origin) { found = scan }
+      scan = scan + usize.ONE
+    }
+    if found == usize.MAX { return Option<IdleConnection>.none() }
+    if !job.idempotent && !ExchangeNative.reusable(&kept[found].connection) {
+      drop kept
+      run discard(&mut pool.*, found)
+      return Option<IdleConnection>.none()
+    }
+    drop kept
+    return Option<IdleConnection>.some(List<IdleConnection>.remove(&mut pool.*, found))
+  }
+
+  // One task of a round. Its clock parks only this task while the socket waits.
+  effect fn runJob(job: Job) -> JobOutcome ? &mut MonotonicClock {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let mut idle = List<IdleConnection>.make()
+    let received = run Effect.result(jobExchange(&mut idle, move job) |> Effect.provideMut<Allocator>(&mut allocator))
+    let kept = List<IdleConnection>.pop(&mut idle)
+    return JobOutcome {received: move received, kept: move kept}
+  }
+
+  effect fn jobExchange(idle: &mut List<IdleConnection>, job: Job) -> Received
+  ! HttpError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock {
+    let Job {pending, connection} = move job
+    let PendingJob {request, body, timeoutNanoseconds, maxBody, idempotent, origin, options, limits, trust: plan} = move pending
+    let mut slot = Option<usize>.none()
+    if let Option.Some {value} = move connection {
+      run List<IdleConnection>.append(&mut idle.*, move value)
+      slot = Option<usize>.some(usize.ZERO)
+    }
+    let mut trust = run trustOf(&plan)
+    let now = run MonotonicClock.now()
+    let deadline = MonotonicClock.deadlineAfter(&now, timeoutNanoseconds)
+    let mut wall = OsSystemClock.make()
+    let mut random = OsRandom.make()
+    let exchange = Direct {request: &request, body: Bytes.asSlice(&body), deadline: &deadline, maxBody: maxBody, idempotent: idempotent}
+    let outcome = run Effect.result(exchangeKept(&mut idle.*, slot, origin, move options, limits, exchange)
+      |> Effect.provideMut<TrustSource>(&mut trust)
+      |> Effect.provideMut<SystemClock>(&mut wall)
+      |> Effect.provideMut<Random>(&mut random))
+    return match move outcome {
+      Result.Success {value} => move value
+      Result.Failure {error} => match move error {
+        HttpError failure => { fail move failure }
+        OutOfMemoryError exhausted => { fail move exhausted }
+        ExchangeError failure => run classify(move failure)
+        NativeExchangeError failure => run classify(move failure)
+        ResolverError failure => run classify(move failure)
+        NativeSocketError failure => run classify(move failure)
+        ConnectionError failure => run classify(move failure)
+        IdentityError failure => run classify(move failure)
+        TrustSourceError failure => run classify(move failure)
+      }
+    }
+  }
+
   enum Slot {
     UserAgent,
     Accept,
@@ -1275,9 +1682,18 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     run List<Header<'r>>.append(&mut entries.*, header)
   }
 
-  effect fn follow(client: &mut NativeHttp, request: Request) -> Response
-  ! HttpError | ProxyError | RequestError | ExchangeError | NativeExchangeError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError
-  ? &mut Allocator {
+  // The state of one request while it follows redirects.
+  struct Hop {
+    settings: Settings,
+    bearer: Bytes,
+    current: String,
+    method: Method<'static>,
+    withBody: bool,
+    credentials: bool,
+    hops: usize,
+  }
+
+  effect fn begin(client: &NativeHttp, request: &Request) -> Hop ! HttpError | OutOfMemoryError ? &mut Allocator {
     let settings = Settings {
       timeoutSeconds: Option<u64>.unwrapOr(request.timeout(), client.timeoutValue),
       maxBody: Option<usize>.unwrapOr(request.maxBody(), client.maxBodyValue),
@@ -1291,40 +1707,74 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       run Bytes.append(&mut bearer, b"Bearer ")
       run Bytes.append(&mut bearer, String.utf8Bytes(token))
     }
+    let current = run request.resolveUrl(client.baseValue)
+    return Hop {
+      settings: move settings,
+      bearer: move bearer,
+      current: move current,
+      method: request.method(),
+      withBody: request.hasBody(),
+      credentials: true,
+      hops: usize.ZERO,
+    }
+  }
+
+  // Sends the current hop of `request`. With `defer`, a direct request is returned as a job.
+  effect fn attemptHop(client: &mut NativeHttp, request: &Request, hop: &Hop, defer: bool) -> Attempted
+  ! HttpError | ProxyError | RequestError | ExchangeError | NativeExchangeError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError
+  ? &mut Allocator {
     let defaultValues = client.headerValues
     let defaults = Slice.view<Field>(&defaultValues, usize.ZERO, client.headerCount)
-    let mut current = run request.resolveUrl(client.baseValue)
-    let mut method = request.method()
-    let mut withBody = request.hasBody()
-    let mut credentials = true
-    let mut hops = usize.ZERO
+    return run attempt(&mut client.*, defaults, hop.method, String.view(&hop.current), request, Bytes.asSlice(&hop.bearer), hop.withBody, hop.credentials, &hop.settings, defer)
+  }
+
+  // Takes the response of the current hop. It returns the final response, or none after it moved
+  // `hop` to the redirect target.
+  effect fn advance(failOnStatus: bool, hop: &mut Hop, received: Received) -> Option<Response>
+  ! HttpError | OutOfMemoryError
+  ? &mut Allocator {
+    let Received {status, head, body, location} = move received
+    let target = match move location {
+      Option.None => {
+        let url = Intrinsic.replace(hop.current, String.make())
+        return Option<Response>.some(run finish(failOnStatus, status, move head, move body, move url))
+      }
+      Option.Some {value} => move value
+    }
+    if hop.settings.redirects == usize.ZERO {
+      drop target
+      let url = Intrinsic.replace(hop.current, String.make())
+      return Option<Response>.some(run finish(failOnStatus, status, move head, move body, move url))
+    }
+    drop head
+    drop body
+    if hop.hops == hop.settings.redirects { fail redirectFailure("The request exceeded its redirect limit.") }
+    let next = run resolveRedirect(String.view(&hop.current), String.view(&target), &mut hop.credentials)
+    if status == 303 && !Method.equals(&hop.method, &Method.head()) {
+      hop.method = Method.get()
+      hop.withBody = false
+    }
+    if (status == 301 || status == 302) && Method.equals(&hop.method, &Method.post()) {
+      hop.method = Method.get()
+      hop.withBody = false
+    }
+    hop.current = move next
+    hop.hops = hop.hops + usize.ONE
+    return Option<Response>.none()
+  }
+
+  effect fn follow(client: &mut NativeHttp, request: Request) -> Response
+  ! HttpError | ProxyError | RequestError | ExchangeError | NativeExchangeError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError
+  ? &mut Allocator {
+    let mut hop = run begin(&client.*, &request)
     while true {
-      let received = run attempt(&mut client.*, defaults, method, String.view(&current), &request, Bytes.asSlice(&bearer), withBody, credentials, &settings)
-      let Received {status, head, body, location} = move received
-      let target = match move location {
-        Option.None => {
-          return run finish(client.failOnStatusValue, status, move head, move body, move current)
-        }
-        Option.Some {value} => move value
+      let received = match move run attemptHop(&mut client.*, &request, &hop, false) {
+        Attempted.Done {received} => move received
+        Attempted.Deferred {..} => { fail redirectFailure("The request was deferred outside sendAll.") }
       }
-      if settings.redirects == usize.ZERO {
-        drop target
-        return run finish(client.failOnStatusValue, status, move head, move body, move current)
+      if let Option.Some {value} = move run advance(client.failOnStatusValue, &mut hop, move received) {
+        return move value
       }
-      drop head
-      drop body
-      if hops == settings.redirects { fail redirectFailure("The request exceeded its redirect limit.") }
-      let next = run resolveRedirect(String.view(&current), String.view(&target), &mut credentials)
-      if status == 303 && !Method.equals(&method, &Method.head()) {
-        method = Method.get()
-        withBody = false
-      }
-      if (status == 301 || status == 302) && Method.equals(&method, &Method.post()) {
-        method = Method.get()
-        withBody = false
-      }
-      current = move next
-      hops = hops + usize.ONE
     }
     fail redirectFailure("The redirect loop ended unexpectedly.")
   }
@@ -1518,6 +1968,17 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   }
 
   impl<'config> Http for NativeHttp<'config> {
+    effect fn sendAll(self: &mut Self, requests: List<Request>) -> List<Result<Response, HttpError>>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+      let mut noProxy = true
+      if let Option.Some {..} = &self.secureProxy { noProxy = false }
+      if let Option.Some {..} = &self.plainProxy { noProxy = false }
+      if self.concurrencyValue > usize.ONE && List<Request>.length(&requests) > usize.ONE && noProxy {
+        return run sendConcurrent(&mut self.*, move requests)
+      }
+      return run Http.sendEach(move requests) |> Effect.provideMut<Http>(&mut self.*)
+    }
     effect fn send(self: &mut Self, request: Request) -> Response ! HttpError | OutOfMemoryError ? &mut Allocator {
       let outcome = run Effect.result(follow(&mut self.*, move request))
       return match move outcome {

@@ -6,7 +6,8 @@ The `MonotonicClock` effect: time that never goes back, for durations, timeouts,
 
 ## When to use
 Require `&mut MonotonicClock` to measure how long something takes, to compute a deadline, or to
-wait. Use `silk.system.system_clock` when you need the date and time of day.
+wait, for a time or for a socket. Use `silk.system.system_clock` when you need the date and time
+of day.
 
 ## Details
 [`MonotonicClock.now`](#MonotonicClock.now) returns an [`Instant`](./system-system-clock.md#Instant) from an origin that is not specified, such as the
@@ -15,6 +16,10 @@ deadline has a meaning only for the clock that made it.
 
 Durations are `u64` nanoseconds. A duration literal such as `300ms` has this type.
 [`MonotonicClock.deadlineAfter`](#MonotonicClock.impl.deadlineAfter) adds a duration to a mark.
+
+[`MonotonicClock.waitReady`](#MonotonicClock.waitReady) waits until a socket in a slice of [`ReadyWatch`](#ReadyWatch) is ready, or a
+mark is reached. All socket waits go through it, so the provider decides how a wait happens: the
+native clock blocks the thread in `poll`, and a task scheduler parks only the task.
 
 ## Gotchas
 `Instant` is also the type of system time. The compiler cannot stop you from mixing marks of
@@ -27,46 +32,11 @@ traps, because this effect has no error type.
 ### Use a test clock that moves forward without sleeping
 ```silk
 import silk.core.effect { Effect }
-import silk.system.monotonic_clock { MonotonicClock }
-import silk.system.system_clock { Instant, SystemClock }
-
-struct VirtualClock {
-  mark: Instant,
-}
-
-impl MonotonicClock for VirtualClock {
-  effect fn now(self: &mut Self) -> Instant {
-    return SystemClock.make(SystemClock.seconds(&self.mark), SystemClock.nanoseconds(&self.mark))
-  }
-
-  effect fn getResolution(self: &mut Self) -> u64 {
-    return 1
-  }
-
-  effect fn waitUntil(self: &mut Self, when: Instant) -> () {
-    self.mark = move when
-    return ()
-  }
-
-  effect fn waitFor(self: &mut Self, howLong: u64) -> () {
-    self.mark = MonotonicClock.deadlineAfter(&self.mark, howLong)
-    return ()
-  }
-}
-
-pub fn main() -> i32 {
-  let mut clock = VirtualClock { mark: SystemClock.make(0, 900000000) }
-  run MonotonicClock.waitFor(300ms) |> Effect.provideMut<MonotonicClock>(&mut clock)
-  if SystemClock.seconds(&clock.mark) != 1 || SystemClock.nanoseconds(&clock.mark) != 200000000 {
-    return 1
-  }
-  return 0
-}
-```
+import silk.core.option { Option }
 
 Import as `MonotonicClock` with `import silk.system.monotonic_clock { MonotonicClock }`.
 
-Public declarations: 1.
+Public declarations: 2.
 
 <a id="MonotonicClock"></a>
 
@@ -87,7 +57,7 @@ wait. Use `silk.system.system_clock` when you need the date and time of day.
 
 [`MonotonicClock.now`](#MonotonicClock.now) returns an `Instant` from an origin that is not specified, such as the
 start of the computer. Durations are `u64` nanoseconds. A duration literal such as `300ms` has
-this type. /// A provider implements all four operations on one timeline. Exclusive access lets
+this type. A provider implements all five operations on one timeline. Exclusive access lets
 a test provider move its own time forward and record waits.
 
 ### Gotchas
@@ -148,6 +118,28 @@ Returns when at least `howLong` nanoseconds have passed on the clock.
 A duration of 0 can return at once. If the deadline does not fit in an `Instant`, the provider
 traps.
 
+<a id="MonotonicClock.waitReady"></a>
+
+### Operation `waitReady`
+
+```silk
+effect fn waitReady(watch: &mut [ReadyWatch], until: Option<Instant>) -> usize ? &mut MonotonicClock
+```
+
+Returns when a handle in `watch` is ready, or when the clock reaches `until`, and returns how
+many handles are ready.
+
+#### Details
+
+The provider first clears the events of each watch, then sets the events that came. A return
+of 0 means that `until` was reached. With `until` of `None`, it waits until a handle is ready.
+With an empty `watch`, it waits until `until`, as [`waitUntil`](#MonotonicClock.waitUntil) does.
+
+#### Gotchas
+
+The native provider blocks the calling thread in one `poll`. A task scheduler parks only the
+task. An empty `watch` with `until` of `None` would wait forever, so it traps.
+
 <a id="MonotonicClock.impl"></a>
 
 ## Implementation `MonotonicClock`
@@ -180,7 +172,188 @@ Every `u64` duration works when the result fits in an `Instant`.
 It traps if the seconds of the result do not fit in `i64`. Use `start` from the same clock
 that will use the deadline.
 
+<a id="ReadyWatch"></a>
 
-Category: System.
+## `ReadyWatch`
+
+```silk
+pub extern "C" struct ReadyWatch
+```
+
+One operating system handle that [`MonotonicClock.waitReady`](#MonotonicClock.waitReady) watches: the events to wait for,
+and the events that came.
+
+### When to use
+
+Make one with [`ReadyWatch.forRead`](#ReadyWatch.impl.forRead) or [`ReadyWatch.forWrite`](#ReadyWatch.impl.forWrite) for a socket that is not ready,
+and give a slice of them to `waitReady`. After the wait, ask each watch what came.
+
+### Details
+
+The layout is the C `struct pollfd` of the target, so the native provider polls the slice in
+place. A handle is a file descriptor, or a socket on Windows.
+
+### Gotchas
+
+[`ReadyWatch.hungUp`](#ReadyWatch.impl.hungUp), [`ReadyWatch.failed`](#ReadyWatch.impl.failed) and [`ReadyWatch.invalid`](#ReadyWatch.impl.invalid) can be set even
+though the watch did not ask for them. The next read or write on the handle tells the error.
+
+<a id="ReadyWatch.impl.Copy"></a>
+
+## Implementation `Copy for ReadyWatch`
+
+```silk
+impl Copy for ReadyWatch
+```
+
+<a id="ReadyWatch.impl"></a>
+
+## Implementation `ReadyWatch`
+
+```silk
+impl ReadyWatch
+```
+
+<a id="ReadyWatch.impl.forRead"></a>
+
+### Associated function `forRead`
+
+```silk
+pub fn forRead(handle: usize) -> ReadyWatch
+```
+
+Returns a watch that waits until `handle` can be read, or has reached its end.
+
+<a id="ReadyWatch.impl.forWrite"></a>
+
+### Associated function `forWrite`
+
+```silk
+pub fn forWrite(handle: usize) -> ReadyWatch
+```
+
+Returns a watch that waits until `handle` can be written.
+
+<a id="ReadyWatch.impl.handle"></a>
+
+### Method `handle`
+
+```silk
+pub fn handle(self: &Self) -> usize
+```
+
+Returns the handle that the watch waits for.
+
+<a id="ReadyWatch.impl.wantsRead"></a>
+
+### Method `wantsRead`
+
+```silk
+pub fn wantsRead(self: &Self) -> bool
+```
+
+Returns whether the watch waits for reading.
+
+<a id="ReadyWatch.impl.wantsWrite"></a>
+
+### Method `wantsWrite`
+
+```silk
+pub fn wantsWrite(self: &Self) -> bool
+```
+
+Returns whether the watch waits for writing.
+
+<a id="ReadyWatch.impl.isReady"></a>
+
+### Method `isReady`
+
+```silk
+pub fn isReady(self: &Self) -> bool
+```
+
+Returns whether any event came in the last wait.
+
+<a id="ReadyWatch.impl.canRead"></a>
+
+### Method `canRead`
+
+```silk
+pub fn canRead(self: &Self) -> bool
+```
+
+Returns whether the handle can be read.
+
+<a id="ReadyWatch.impl.canWrite"></a>
+
+### Method `canWrite`
+
+```silk
+pub fn canWrite(self: &Self) -> bool
+```
+
+Returns whether the handle can be written.
+
+<a id="ReadyWatch.impl.hungUp"></a>
+
+### Method `hungUp`
+
+```silk
+pub fn hungUp(self: &Self) -> bool
+```
+
+Returns whether the peer closed the connection.
+
+<a id="ReadyWatch.impl.failed"></a>
+
+### Method `failed`
+
+```silk
+pub fn failed(self: &Self) -> bool
+```
+
+Returns whether the handle has a pending error.
+
+<a id="ReadyWatch.impl.invalid"></a>
+
+### Method `invalid`
+
+```silk
+pub fn invalid(self: &Self) -> bool
+```
+
+Returns whether the handle is not open.
+
+<a id="ReadyWatch.impl.clear"></a>
+
+### Method `clear`
+
+```silk
+pub fn clear(self: &mut Self) -> ()
+```
+
+Clears the events, before a new wait.
+
+<a id="ReadyWatch.impl.markReady"></a>
+
+### Method `markReady`
+
+```silk
+pub fn markReady(self: &mut Self) -> ()
+```
+
+Marks the events that the watch asked for as come. A test clock uses it to report readiness.
+
+<a id="ReadyWatch.impl.takeEvents"></a>
+
+### Method `takeEvents`
+
+```silk
+pub fn takeEvents(self: &mut Self, source: &ReadyWatch) -> ()
+```
+
+Copies the events of `source` into this watch. A scheduler uses it to hand back the result of
+a wait that it forwarded.
+
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`, `wasm64-unknown-unknown`.

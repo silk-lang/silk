@@ -113,6 +113,31 @@ If a signal interrupts the wait, it waits again for the same deadline.
 #### Gotchas
 A negative deadline or a failed call is a trap. The wait does not let another fiber run.
 
+<a id="NativeClock.impl.waitReady"></a>
+
+### Associated function `waitReady`
+
+```silk
+pub effect fn waitReady(watch: &mut [ReadyWatch], until: Option<Instant>) -> usize
+```
+
+Waits in one `poll` until a handle in `watch` is ready or the monotonic clock reaches
+`until`, and returns how many handles are ready.
+
+It clears the events of each watch first. An empty `watch` waits until `until`. A signal that
+interrupts the poll does not end the wait. WASI has no handles to poll, so a watch there traps.
+
+<a id="NativeClock.impl.pollNow"></a>
+
+### Associated function `pollNow`
+
+```silk
+pub fn pollNow(watch: &mut [ReadyWatch]) -> usize
+```
+
+Polls `watch` once without waiting, and returns how many handles are ready. A test clock uses
+it to see real sockets while it moves its own time.
+
 
 Category: Native platform.
 

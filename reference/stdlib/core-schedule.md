@@ -40,9 +40,10 @@ Durations are `u64` nanoseconds, so a duration literal such as `250ms` works.
 ### Repeat on a fixed beat
 ```silk
 import silk.core.effect { Effect }
+import silk.core.option { Option }
 import silk.core.schedule { Schedule }
 import silk.system.insecure_random { InsecureRandom }
-import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock { MonotonicClock, ReadyWatch }
 import silk.system.system_clock { Instant, SystemClock }
 
 struct TestClock {
@@ -66,6 +67,16 @@ impl MonotonicClock for TestClock {
   effect fn waitFor(self: &mut Self, howLong: u64) -> () {
     self.mark = MonotonicClock.deadlineAfter(&self.mark, howLong)
     return ()
+  }
+  effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Instant>) -> usize {
+    if watch.length > 0 { Intrinsic.trap("this clock has no handles to watch") }
+    match move until {
+      Option<Instant>.None => {}
+      Option<Instant>.Some {value: when} => {
+        self.mark = move when
+      }
+    }
+    return 0
   }
 }
 

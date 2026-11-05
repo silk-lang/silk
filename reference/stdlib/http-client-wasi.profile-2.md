@@ -62,6 +62,16 @@ impl Http for WasiHttp
 effect fn send(self: &mut Self, request: Request) -> Response ! HttpError | OutOfMemoryError ? &mut Allocator
 ```
 
+<a id="WasiHttp.impl.Http.sendAll"></a>
+
+### Operation `sendAll`
+
+```silk
+effect fn sendAll(self: &mut Self, requests: List<Request>) -> List<Result<Response, HttpError>>
+    ! OutOfMemoryError
+    ? &mut Allocator
+```
+
 
 Category: HTTP.
 

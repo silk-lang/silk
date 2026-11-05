@@ -333,16 +333,6 @@ pub noDelay: bool
 
 Whether to disable Nagle's algorithm on the socket.
 
-<a id="Options.pollIntervalNanoseconds"></a>
-
-### Field `pollIntervalNanoseconds`
-
-```silk
-pub pollIntervalNanoseconds: u64
-```
-
-The time between checks while a socket connects. It is 1 nanosecond through 1 second.
-
 <a id="Options.maximumAttempts"></a>
 
 ### Field `maximumAttempts`
@@ -352,17 +342,6 @@ pub maximumAttempts: usize
 ```
 
 The maximum number of connection attempts. It is 1 through 1024.
-
-<a id="Options.readinessWait"></a>
-
-### Field `readinessWait`
-
-```silk
-pub readinessWait: ReadinessWait
-```
-
-How the socket waits when it is not ready. `Kernel` blocks the thread, so use it only with a
-clock that blocks the thread too.
 
 <a id="Options.deadline"></a>
 
@@ -434,8 +413,8 @@ pub fn defaults() -> Options
 
 Returns the default settings.
 
-They are: 16 addresses, any family, Nagle on, a 1 ms poll interval, waits with the clock, 64
-attempts, no deadline, 30 seconds for the handshake, and `OptionalHttp11`.
+They are: 16 addresses, any family, Nagle on, 64 attempts, no deadline, 30 seconds for the
+handshake, and `OptionalHttp11`.
 
 <a id="NativeTransport"></a>
 

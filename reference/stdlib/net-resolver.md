@@ -34,7 +34,7 @@ removed from the result.
 ```silk
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
-import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock { MonotonicClock, ReadyWatch }
 import silk.net.address {
   AddressError,
   DomainHost,
@@ -101,6 +101,16 @@ impl MonotonicClock for FixedMonotonic {
   effect fn waitFor(self: &mut Self, howLong: u64) -> () {
     drop howLong
     return ()
+  }
+  effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Instant>) -> usize {
+    if watch.length > 0 { Intrinsic.trap("this clock has no handles to watch") }
+    match move until {
+      Option<Instant>.None => {}
+      Option<Instant>.Some {value: when} => {
+        drop when
+      }
+    }
+    return 0
   }
 }
 

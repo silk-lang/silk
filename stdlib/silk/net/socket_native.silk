@@ -11,10 +11,10 @@
 //! `silk.io.buffered_duplex` can use it.
 //!
 //! # Details
-//! All sockets are nonblocking. When a socket is not ready, the operation waits for the poll
-//! interval with `MonotonicClock`, then tries again. So an idle wait costs about one check for each
-//! interval. With `ReadinessWait.Kernel` in the options, it waits in the kernel `poll` instead and
-//! goes on as soon as the socket is ready. One deadline covers all attempts of one connect or accept.
+//! All sockets are nonblocking. When a socket is not ready, the operation waits with
+//! `MonotonicClock.waitReady` until the socket is ready or the deadline passes. The native clock
+//! waits in the kernel `poll` and goes on as soon as the socket is ready; a task scheduler parks
+//! only the task. One deadline covers all attempts of one connect or accept.
 //!
 //! A connect tries the endpoints in their order, until one connects or the attempt limit is
 //! reached. A flush means that the kernel accepted the bytes, not that the peer got them.
@@ -149,7 +149,7 @@ import silk.num.i16
 import silk.num.i32
 import silk.num.i64
 import silk.num.isize
-import silk.system.monotonic_clock {MonotonicClock}
+import silk.system.monotonic_clock {MonotonicClock, ReadyWatch}
 import silk.net.address {Endpoint, IpAddress, Ipv4Address, Ipv6Address, Port}
 import silk.core.option {Option}
 import silk.core.ownership {Copy, Drop}
@@ -317,8 +317,6 @@ pub enum ListenerPhase {
 pub enum ListenOptionsReason {
   /// The backlog is not 1 through 65535.
   KernelBacklog,
-  /// The poll interval is not 1 nanosecond through 1 second.
-  PollInterval,
 }
 
 impl Debug for ListenOptionsReason {
@@ -326,7 +324,6 @@ impl Debug for ListenOptionsReason {
   effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
     return match &self.* {
       ListenOptionsReason.KernelBacklog => run Format.write(&mut formatter, b"KernelBacklog")
-      ListenOptionsReason.PollInterval => run Format.write(&mut formatter, b"PollInterval")
     }
   }
 }
@@ -372,17 +369,14 @@ impl Debug for InvalidBindReason {
 
 /// The [`ConnectOptions`] value that is not valid.
 pub enum ConnectOptionsReason {
-  /// The poll interval is not 1 nanosecond through 1 second.
-  PollInterval,
   /// The attempt limit is not 1 through 1024.
   MaxAttempts,
 }
 
 impl Debug for ConnectOptionsReason {
-  /// Writes the name of the variant, such as `PollInterval`.
+  /// Writes the name of the variant, such as `MaxAttempts`.
   effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
     return match &self.* {
-      ConnectOptionsReason.PollInterval => run Format.write(&mut formatter, b"PollInterval")
       ConnectOptionsReason.MaxAttempts => run Format.write(&mut formatter, b"MaxAttempts")
     }
   }
@@ -628,33 +622,16 @@ impl Debug for NativeSocketError {
 /// An empty marker type for this module.
 pub struct NativeSocket {}
 
-/// How a socket that is not ready waits for the next try.
-pub union ReadinessWait {
-  /// Waits one poll interval with `MonotonicClock`, then tries again. This works with every clock
-  /// provider, such as a task scheduler whose waits pause only one task. A reply that comes during
-  /// the interval waits until the interval ends.
-  Clock,
-  /// Waits in the kernel `poll` for up to one poll interval, and goes on as soon as the socket is
-  /// ready. It checks the deadline with `MonotonicClock` between waits. It blocks the thread, so
-  /// use it only with a clock that blocks the thread too, such as `OsMonotonicClock`.
-  Kernel,
-}
-
-/// The settings of a connect: Nagle, the poll interval, how to wait, and the attempt limit.
+/// The settings of a connect: Nagle and the attempt limit.
 pub struct ConnectOptions {
   noDelayValue: bool,
-  pollIntervalNanoseconds: u64,
   maxAttemptsValue: usize,
-  readinessWaitValue: ReadinessWait,
 }
 
-/// The settings of a listener: the backlog, address reuse, and the poll interval and wait of
-/// accept. Accepted connections use the same poll interval and wait.
+/// The settings of a listener: the backlog and address reuse.
 pub struct ListenOptions {
   kernelBacklogValue: usize,
   reuseAddressValue: bool,
-  pollIntervalNanoseconds: u64,
-  readinessWaitValue: ReadinessWait,
 }
 
 /// A copy of a Unix socket path, at most 108 bytes.
@@ -705,7 +682,6 @@ pub union PeerAddress {
 impl Copy for ConnectOptionsError {}
 impl Copy for AttemptFailure {}
 impl Copy for NativeSocketError {}
-impl Copy for ReadinessWait {}
 impl Copy for ConnectOptions {}
 impl Copy for ListenOptionsError {}
 impl Copy for ListenOptions {}
@@ -718,19 +694,8 @@ impl ConnectOptions {
   /// Returns connect options.
   ///
   /// # Errors
-  /// `ConnectOptionsError` if `pollIntervalNanoseconds` is not 1 through 1000000000, or
-  /// `maxAttempts` is not 1 through 1024.
-  pub fn make(
-    noDelay: bool,
-    pollIntervalNanoseconds: u64,
-    maxAttempts: usize,
-  ) -> Result<ConnectOptions, ConnectOptionsError> {
-    if pollIntervalNanoseconds == 0 || pollIntervalNanoseconds > 1000000000 {
-      return Result<ConnectOptions, ConnectOptionsError>.failResult(ConnectOptionsError {
-        reason: ConnectOptionsReason.PollInterval,
-        value: pollIntervalNanoseconds,
-      })
-    }
+  /// `ConnectOptionsError` if `maxAttempts` is not 1 through 1024.
+  pub fn make(noDelay: bool, maxAttempts: usize) -> Result<ConnectOptions, ConnectOptionsError> {
     if maxAttempts == usize.ZERO || maxAttempts > 1024 {
       return Result<ConnectOptions, ConnectOptionsError>.failResult(ConnectOptionsError {
         reason: ConnectOptionsReason.MaxAttempts,
@@ -739,38 +704,19 @@ impl ConnectOptions {
     }
     return Result<ConnectOptions, ConnectOptionsError>.succeed(ConnectOptions {
       noDelayValue: noDelay,
-      pollIntervalNanoseconds: pollIntervalNanoseconds,
       maxAttemptsValue: maxAttempts,
-      readinessWaitValue: ReadinessWait.Clock,
     })
   }
 
-  /// Returns the default connect options: Nagle on, a 1 ms poll interval, waits with the clock,
-  /// and 64 attempts.
+  /// Returns the default connect options: Nagle on, and 64 attempts.
   pub fn defaults() -> ConnectOptions {
-    return ConnectOptions {
-      noDelayValue: false,
-      pollIntervalNanoseconds: 1000000,
-      maxAttemptsValue: 64,
-      readinessWaitValue: ReadinessWait.Clock,
-    }
-  }
-
-  /// Returns these options with `wait` as the way to wait for readiness.
-  pub fn withReadinessWait(self: &Self, wait: ReadinessWait) -> ConnectOptions {
-    let mut changed = self.*
-    changed.readinessWaitValue = wait
-    return changed
+    return ConnectOptions {noDelayValue: false, maxAttemptsValue: 64}
   }
 
   /// Returns whether Nagle is off (`TCP_NODELAY`).
   pub fn noDelay(self: &Self) -> bool { return self.noDelayValue }
-  /// Returns the poll interval, in nanoseconds.
-  pub fn pollInterval(self: &Self) -> u64 { return self.pollIntervalNanoseconds }
   /// Returns the attempt limit.
   pub fn maxAttempts(self: &Self) -> usize { return self.maxAttemptsValue }
-  /// Returns how a socket that is not ready waits.
-  pub fn readinessWait(self: &Self) -> ReadinessWait { return self.readinessWaitValue }
 }
 
 impl ListenOptions {
@@ -779,60 +725,29 @@ impl ListenOptions {
   /// `SO_REUSEADDR` permits binding over an existing listener, unlike Unix's usual reuse behavior.
   ///
   /// # Errors
-  /// `ListenOptionsError` if `kernelBacklog` is not 1 through 65535, or `pollIntervalNanoseconds`
-  /// is not 1 through 1000000000.
-  pub fn make(
-    kernelBacklog: usize,
-    reuseAddress: bool,
-    pollIntervalNanoseconds: u64,
-  ) -> Result<ListenOptions, ListenOptionsError> {
+  /// `ListenOptionsError` if `kernelBacklog` is not 1 through 65535.
+  pub fn make(kernelBacklog: usize, reuseAddress: bool) -> Result<ListenOptions, ListenOptionsError> {
     if kernelBacklog == usize.ZERO || kernelBacklog > 65535 {
       return Result<ListenOptions, ListenOptionsError>.failResult(ListenOptionsError {
         reason: ListenOptionsReason.KernelBacklog,
         value: usize.toU64(kernelBacklog),
       })
     }
-    if pollIntervalNanoseconds == 0 || pollIntervalNanoseconds > 1000000000 {
-      return Result<ListenOptions, ListenOptionsError>.failResult(ListenOptionsError {
-        reason: ListenOptionsReason.PollInterval,
-        value: pollIntervalNanoseconds,
-      })
-    }
     return Result<ListenOptions, ListenOptionsError>.succeed(ListenOptions {
       kernelBacklogValue: kernelBacklog,
       reuseAddressValue: reuseAddress,
-      pollIntervalNanoseconds: pollIntervalNanoseconds,
-      readinessWaitValue: ReadinessWait.Clock,
     })
   }
 
-  /// Returns the default listen options: a backlog of 128, no address reuse, a 1 ms poll
-  /// interval, and waits with the clock.
+  /// Returns the default listen options: a backlog of 128, and no address reuse.
   pub fn defaults() -> ListenOptions {
-    return ListenOptions {
-      kernelBacklogValue: 128,
-      reuseAddressValue: false,
-      pollIntervalNanoseconds: 1000000,
-      readinessWaitValue: ReadinessWait.Clock,
-    }
+    return ListenOptions {kernelBacklogValue: 128, reuseAddressValue: false}
   }
-
-  /// Returns these options with `wait` as the way to wait for readiness.
-  pub fn withReadinessWait(self: &Self, wait: ReadinessWait) -> ListenOptions {
-    let mut changed = self.*
-    changed.readinessWaitValue = wait
-    return changed
-  }
-
-  /// Returns how accept and accepted connections wait when they are not ready.
-  pub fn readinessWait(self: &Self) -> ReadinessWait { return self.readinessWaitValue }
 
   /// Returns the backlog of the kernel.
   pub fn kernelBacklog(self: &Self) -> usize { return self.kernelBacklogValue }
   /// Returns whether the listener sets `SO_REUSEADDR`.
   pub fn reuseAddress(self: &Self) -> bool { return self.reuseAddressValue }
-  /// Returns the poll interval of accept, in nanoseconds.
-  pub fn pollInterval(self: &Self) -> u64 { return self.pollIntervalNanoseconds }
 }
 
 impl UnixSocketPath {
@@ -1601,16 +1516,18 @@ effect fn checkConnectDeadline(deadline: &Option<Instant>) -> ()
   return ()
 }
 
-effect fn waitConnect(options: &ConnectOptions, deadline: &Option<Instant>) -> ()
+// The pause before a connect attempt is tried again after a failure that may pass, such as a
+// signal: 1 ms, or less when the deadline is nearer.
+const RETRY_PAUSE_NANOSECONDS: u64 = 1000000
+
+effect fn waitConnect(deadline: &Option<Instant>) -> ()
 ! NativeSocketError
 ? &mut MonotonicClock {
-  // The kernel poll already waited.
-  if inKernel(options.readinessWaitValue) { return run checkConnectDeadline(deadline) }
   let before = run MonotonicClock.now()
   if let Option<Instant>.Some {value: limit} = &deadline.* {
     if reached(&before, &limit) { fail NativeSocketError.Timeout }
   }
-  let made = nextWake(&before, deadline, options.pollIntervalNanoseconds)
+  let made = nextWake(&before, deadline, RETRY_PAUSE_NANOSECONDS)
   let wake = match move made {
     Result<Instant, ()>.Failure {..} => { fail NativeSocketError.TimeRangeError }
     Result<Instant, ()>.Success {value} => move value
@@ -1623,6 +1540,25 @@ effect fn waitConnect(options: &ConnectOptions, deadline: &Option<Instant>) -> (
   return ()
 }
 
+// Waits until `fd` can be read (or written, with `write`), or the deadline passes, and returns the
+// watch with the events that came. No events means that the deadline passed.
+effect fn awaitHandle(fd: SocketHandle, write: bool, deadline: &Option<Instant>) -> ReadyWatch
+? &mut MonotonicClock {
+  let handle = handleValue(fd)
+  let mut watch = [ReadyWatch.forRead(handle)]
+  if write { watch[0] = ReadyWatch.forWrite(handle) }
+  let until = match &deadline.* {
+    Option<Instant>.None => Option<Instant>.none()
+    Option<Instant>.Some {value} => Option<Instant>.some(copyInstant(&value))
+  }
+  let _ready = run MonotonicClock.waitReady(&mut watch, move until)
+  return watch[0]
+}
+
+fn handleValue(fd: SocketHandle) -> usize {
+  static if Intrinsic.targetOperatingSystem() == "windows" { return fd } else { return i32.toUsize(fd) }
+}
+
 effect fn checkIoDeadline(
   deadline: &Option<Instant>,
   operation: ByteIoOperation,
@@ -1630,32 +1566,6 @@ effect fn checkIoDeadline(
   if let Option<Instant>.Some {value: limit} = &deadline.* {
     let now = run MonotonicClock.now()
     if reached(&now, &limit) { fail ByteDuplex.timeout(move operation) }
-  }
-  return ()
-}
-
-effect fn waitIo(
-  options: &ConnectOptions,
-  deadline: &Option<Instant>,
-  operation: ByteIoOperation,
-) -> () ! ByteIoError ? &mut MonotonicClock {
-  // The kernel poll already waited.
-  if inKernel(options.readinessWaitValue) { return run checkIoDeadline(deadline, move operation) }
-  let before = run MonotonicClock.now()
-  if let Option<Instant>.Some {value: limit} = &deadline.* {
-    if reached(&before, &limit) { fail ByteDuplex.timeout(move operation) }
-  }
-  let made = nextWake(&before, deadline, options.pollIntervalNanoseconds)
-  let wake = match move made {
-    Result<Instant, ()>.Failure {..} => {
-      fail ByteDuplex.provider(move operation, -1)
-    }
-    Result<Instant, ()>.Success {value} => move value
-  }
-  run MonotonicClock.waitUntil(move wake)
-  let after = run MonotonicClock.now()
-  if let Option<Instant>.Some {value: limit} = &deadline.* {
-    if reached(&after, &limit) { fail ByteDuplex.timeout(move operation) }
   }
   return ()
 }
@@ -1886,20 +1796,6 @@ union PollOutcome {
   Failed {code: i32},
 }
 
-fn inKernel(wait: ReadinessWait) -> bool {
-  return match wait {
-    ReadinessWait.Kernel => true
-    ReadinessWait.Clock => false
-  }
-}
-
-// The time that one poll waits in the kernel, in whole milliseconds: 0 for the clock wait, and the
-// poll interval rounded up for the kernel wait.
-fn pollTimeout(wait: ReadinessWait, intervalNanoseconds: u64) -> i32 {
-  if !inKernel(wait) { return 0 }
-  return u64.toI32((intervalNanoseconds + 999999) / 1000000)
-}
-
 // Waits up to `timeout` milliseconds for `requested`, and returns as soon as the socket is ready.
 // Zero events means that the time passed.
 fn pollOnce(fd: SocketHandle, requested: i16, timeout: i32) -> PollOutcome {
@@ -1975,38 +1871,26 @@ effect fn connectOwned<T>(
   }
   while true {
     run checkConnectDeadline(deadline)
-    let observed = pollOnce(
-      owner.descriptor.fd,
-      WRITABLE,
-      pollTimeout(options.readinessWaitValue, options.pollIntervalNanoseconds),
-    )
-    match move observed {
-      PollOutcome.Interrupted => { run waitConnect(&options, deadline) }
-      PollOutcome.Failed {code} => { return run reject(NativeSocketOperation.Poll, code) }
-      PollOutcome.Ready {events} => {
-        if hasEvent(events, INVALID_POLL) {
-          return run reject(NativeSocketOperation.Poll, INVALID_DESCRIPTOR)
+    let watch = run awaitHandle(owner.descriptor.fd, true, deadline)
+    if watch.invalid() {
+      return run reject(NativeSocketOperation.Poll, INVALID_DESCRIPTOR)
+    }
+    run checkConnectDeadline(deadline)
+    if watch.isReady() {
+      let completion = socketError(owner.descriptor.fd)
+      match move completion {
+        SocketErrorOutcome.Failed {code} => {
+          return run reject(NativeSocketOperation.GetSocketOption, code)
         }
-        if events == 0 {
-          run waitConnect(&options, deadline)
-        } else {
-          run checkConnectDeadline(deadline)
-          let completion = socketError(owner.descriptor.fd)
-          match move completion {
-            SocketErrorOutcome.Failed {code} => {
-              return run reject(NativeSocketOperation.GetSocketOption, code)
-            }
-            SocketErrorOutcome.Value {code} => {
-              if code == 0 {
-                owner.phaseValue = ConnectionPhase.Open
-                return move owner
-              }
-              if code == nativeInProgress() || code == nativeAgain() {
-                run waitConnect(&options, deadline)
-              } else {
-                return run reject(NativeSocketOperation.Connect, code)
-              }
-            }
+        SocketErrorOutcome.Value {code} => {
+          if code == 0 {
+            owner.phaseValue = ConnectionPhase.Open
+            return move owner
+          }
+          if code == nativeInProgress() || code == nativeAgain() {
+            run waitConnect(deadline)
+          } else {
+            return run reject(NativeSocketOperation.Connect, code)
           }
         }
       }
@@ -2137,7 +2021,7 @@ effect fn acquireResolved(
           if attempts >= options.maxAttemptsValue {
             fail NativeSocketError.AttemptsExhausted {attempted: attempts, last: move last}
           }
-          run waitConnect(&options, deadline)
+          run waitConnect(deadline)
         } else {
           let candidate = candidateFailure(error)
           match move candidate {
@@ -2289,7 +2173,7 @@ effect fn acquireUnix(
         if attempts >= options.maxAttemptsValue {
           fail NativeSocketError.AttemptsExhausted {attempted: attempts, last: move last}
         }
-        run waitConnect(&options, deadline)
+        run waitConnect(deadline)
       }
     }
   }
@@ -2630,28 +2514,6 @@ fn retryableAccept(code: i32, tcp: bool) -> bool {
   return false
 }
 
-effect fn waitAccept(listener: &Listener, deadline: &Option<Instant>) -> ()
-! NativeSocketError
-? &mut MonotonicClock {
-  // The kernel poll already waited.
-  if inKernel(listener.options.readinessWaitValue) { return run checkConnectDeadline(deadline) }
-  let before = run MonotonicClock.now()
-  if let Option<Instant>.Some {value: limit} = &deadline.* {
-    if reached(&before, &limit) { fail NativeSocketError.Timeout }
-  }
-  let made = nextWake(&before, deadline, listener.options.pollIntervalNanoseconds)
-  let wake = match move made {
-    Result<Instant, ()>.Failure {..} => { fail NativeSocketError.TimeRangeError }
-    Result<Instant, ()>.Success {value} => move value
-  }
-  run MonotonicClock.waitUntil(move wake)
-  let after = run MonotonicClock.now()
-  if let Option<Instant>.Some {value: limit} = &deadline.* {
-    if reached(&after, &limit) { fail NativeSocketError.Timeout }
-  }
-  return ()
-}
-
 unsafe effect fn decodePeer(
   storage: &SockAddrStorage,
   length: usize,
@@ -2720,7 +2582,6 @@ pub effect fn accept(
       BoundAddress.Tcp {..} => true
       _ => false
     }
-    let mut followedImmediateReadiness = false
     while true {
       run checkConnectDeadline(&deadline)
       let mut storage = zeroStorage()
@@ -2737,12 +2598,7 @@ pub effect fn accept(
           BoundAddress.Unix {..} => true
           _ => false
         }
-        let connectionOptions = ConnectOptions {
-          noDelayValue: false,
-          pollIntervalNanoseconds: listener.options.pollIntervalNanoseconds,
-          maxAttemptsValue: usize.ONE,
-          readinessWaitValue: listener.options.readinessWaitValue,
-        }
+        let connectionOptions = ConnectOptions {noDelayValue: false, maxAttemptsValue: usize.ONE}
         run configureAcceptedSocket(&descriptor, tcp, &connectionOptions, &deadline)
         let peer = run unsafe decodePeer(&storage, u32.toUsize(length), unixListener)
         return Accepted {
@@ -2760,45 +2616,28 @@ pub effect fn accept(
       if !retryableAccept(code, tcp) {
         return run rejectListener(NativeSocketOperation.Accept, code)
       }
-      if code == nativeAgain() && !followedImmediateReadiness {
+      if code == nativeAgain() {
         run checkConnectDeadline(&deadline)
-        let observed = pollOnce(
-          listener.descriptor.fd,
-          READABLE,
-          pollTimeout(listener.options.readinessWaitValue, listener.options.pollIntervalNanoseconds),
-        )
-        match move observed {
-          PollOutcome.Interrupted => {}
-          PollOutcome.Failed {code: pollCode} => {
-            return run rejectListener(NativeSocketOperation.Poll, pollCode)
-          }
-          PollOutcome.Ready {events} => {
-            if hasEvent(events, INVALID_POLL) {
-              return run rejectListener(NativeSocketOperation.Poll, INVALID_DESCRIPTOR)
+        let watch = run awaitHandle(listener.descriptor.fd, false, &deadline)
+        if watch.invalid() {
+          return run rejectListener(NativeSocketOperation.Poll, INVALID_DESCRIPTOR)
+        }
+        if watch.failed() {
+          run checkConnectDeadline(&deadline)
+          let detail = socketError(listener.descriptor.fd)
+          match move detail {
+            SocketErrorOutcome.Failed {code: detailCode} => {
+              return run rejectListener(NativeSocketOperation.GetSocketOption, detailCode)
             }
-            if hasEvent(events, POLL_ERROR) {
-              run checkConnectDeadline(&deadline)
-              let detail = socketError(listener.descriptor.fd)
-              match move detail {
-                SocketErrorOutcome.Failed {code: detailCode} => {
-                  return run rejectListener(NativeSocketOperation.GetSocketOption, detailCode)
-                }
-                SocketErrorOutcome.Value {code: detailCode} => {
-                  if detailCode != 0 {
-                    return run rejectListener(NativeSocketOperation.Accept, detailCode)
-                  }
-                }
+            SocketErrorOutcome.Value {code: detailCode} => {
+              if detailCode != 0 {
+                return run rejectListener(NativeSocketOperation.Accept, detailCode)
               }
-            }
-            if hasEvent(events, READABLE) {
-              followedImmediateReadiness = true
-              continue
             }
           }
         }
+        run checkConnectDeadline(&deadline)
       }
-      followedImmediateReadiness = false
-      run waitAccept(&listener.*, &deadline)
     }
     fail NativeSocketError.NativeFailure {operation: NativeSocketOperation.Accept, errno: 0}
   } else {
@@ -3061,11 +2900,6 @@ effect fn failInvalidTransfer(
   fail ByteDuplex.invalidTransferCount(move operation, count, limit)
 }
 
-enum ReadinessOutcome {
-  Immediate,
-  Waited,
-}
-
 effect fn readSocketError(
   connection: &mut Connection,
   deadline: &Option<Instant>,
@@ -3098,43 +2932,28 @@ effect fn writeSocketError(
   }
 }
 
+// Waits until the connection can be read (or written, with `write`), or the deadline passes. A
+// pending error or a closed socket fails. A hangup ends the wait for a read, so the read sees the
+// end; for a write it fails with a broken pipe.
 effect fn readiness(
   connection: &mut Connection,
-  requested: i16,
-  allowHangup: bool,
+  write: bool,
   deadline: &Option<Instant>,
   operation: ByteIoOperation,
-) -> ReadinessOutcome ! ByteIoError ? &mut MonotonicClock {
-  let observed = pollOnce(
-    connection.descriptor.fd,
-    requested,
-    pollTimeout(connection.options.readinessWaitValue, connection.options.pollIntervalNanoseconds),
-  )
-  return match move observed {
-    PollOutcome.Interrupted => {
-      run waitIo(&connection.options, deadline, move operation)
-      return ReadinessOutcome.Waited
-    }
-    PollOutcome.Failed {code} => {
-      return run failProvider(&mut connection.*, move operation, code)
-    }
-    PollOutcome.Ready {events} => {
-      if hasEvent(events, INVALID_POLL) {
-        return run failProvider(&mut connection.*, move operation, INVALID_DESCRIPTOR)
-      }
-      if hasEvent(events, POLL_ERROR) {
-        if allowHangup { return run readSocketError(&mut connection.*, deadline) }
-        return run writeSocketError(&mut connection.*, deadline)
-      }
-      if hasEvent(events, HANGUP) {
-        if allowHangup { return ReadinessOutcome.Immediate }
-        return run failProvider(&mut connection.*, move operation, BROKEN_PIPE)
-      }
-      if hasEvent(events, requested) { return ReadinessOutcome.Immediate }
-      run waitIo(&connection.options, deadline, move operation)
-      return ReadinessOutcome.Waited
-    }
+) -> () ! ByteIoError ? &mut MonotonicClock {
+  let watch = run awaitHandle(connection.descriptor.fd, write, deadline)
+  if !watch.isReady() { return run checkIoDeadline(deadline, move operation) }
+  if watch.invalid() {
+    return run failProvider(&mut connection.*, move operation, INVALID_DESCRIPTOR)
   }
+  if watch.failed() {
+    if !write { return run readSocketError(&mut connection.*, deadline) }
+    return run writeSocketError(&mut connection.*, deadline)
+  }
+  if watch.hungUp() && write {
+    return run failProvider(&mut connection.*, move operation, BROKEN_PIPE)
+  }
+  return ()
 }
 
 impl Connection {
@@ -3152,7 +2971,6 @@ unsafe effect fn readConnection(
     let mut requested = output.length
     if requested > maxTransfer() { requested = maxTransfer() }
     let pointer = Pointer.fromMutSlice<u8>(move output)
-    let mut followedImmediateReadiness = false
     while true {
       run checkIoDeadline(&deadline, ByteIoOperation.Read)
       let transferred = unsafe recv(connection.descriptor.fd, pointer, requested, 0)
@@ -3173,28 +2991,12 @@ unsafe effect fn readConnection(
         return ReadTransfer.End
       }
       let code = unsafe currentError()
-      if code == INTERRUPTED {
-        followedImmediateReadiness = false
-        run waitIo(&connection.options, &deadline, ByteIoOperation.Read)
-      } else {
-        if code == nativeAgain() {
-          if followedImmediateReadiness {
-            followedImmediateReadiness = false
-            run waitIo(&connection.options, &deadline, ByteIoOperation.Read)
-          } else {
-            run checkIoDeadline(&deadline, ByteIoOperation.Read)
-            let available = run readiness(
-              &mut connection.*,
-              READABLE,
-              true,
-              &deadline,
-              ByteIoOperation.Read,
-            )
-            followedImmediateReadiness = available == ReadinessOutcome.Immediate
-          }
-        } else {
+      if code != INTERRUPTED {
+        if code != nativeAgain() {
           return run failProvider(&mut connection.*, ByteIoOperation.Read, code)
         }
+        run checkIoDeadline(&deadline, ByteIoOperation.Read)
+        run readiness(&mut connection.*, false, &deadline, ByteIoOperation.Read)
       }
     }
     return ReadTransfer.End
@@ -3255,7 +3057,6 @@ unsafe effect fn sendParts(
     index = index + 1
   }
   if used == 0 { return usize.ZERO }
-  let mut followedImmediateReadiness = false
   while true {
     run checkIoDeadline(&deadline, ByteIoOperation.Write)
     let transferred = unsafe sendVectors(connection.descriptor.fd, &vectors, used)
@@ -3280,28 +3081,12 @@ unsafe effect fn sendParts(
       )
     }
     let code = unsafe currentError()
-    if code == INTERRUPTED {
-      followedImmediateReadiness = false
-      run waitIo(&connection.options, &deadline, ByteIoOperation.Write)
-    } else {
-      if code == nativeAgain() {
-        if followedImmediateReadiness {
-          followedImmediateReadiness = false
-          run waitIo(&connection.options, &deadline, ByteIoOperation.Write)
-        } else {
-          run checkIoDeadline(&deadline, ByteIoOperation.Write)
-          let available = run readiness(
-            &mut connection.*,
-            WRITABLE,
-            false,
-            &deadline,
-            ByteIoOperation.Write,
-          )
-          followedImmediateReadiness = available == ReadinessOutcome.Immediate
-        }
-      } else {
+    if code != INTERRUPTED {
+      if code != nativeAgain() {
         return run failProvider(&mut connection.*, ByteIoOperation.Write, code)
       }
+      run checkIoDeadline(&deadline, ByteIoOperation.Write)
+      run readiness(&mut connection.*, true, &deadline, ByteIoOperation.Write)
     }
   }
   return usize.ZERO
@@ -3339,9 +3124,7 @@ unsafe effect fn shutdownConnection(
         return ()
       }
       let code = unsafe currentError()
-      if code == INTERRUPTED {
-        run waitIo(&connection.options, &deadline, ByteIoOperation.ShutdownWrite)
-      } else {
+      if code != INTERRUPTED {
         if code == nativeNotConnected() {
           let closed = run Effect.result(Connection.close(&mut connection.*))
           drop closed
