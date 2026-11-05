@@ -13,13 +13,13 @@ use `silk.json.scanner`.
 
 ## Details
 Parsing is strict (RFC 8259): no comments, no trailing commas, and no duplicate keys in an
-object. Arrays and objects keep the order of the source. A number keeps its source text and is
-converted only when you call [`Json.asI32`](#Json.impl.asI32) or a similar function. String escapes are decoded
-when the document is parsed. If parsing fails, everything that was built is released.
+object. Arrays and objects keep the order of the source. Numbers and string escapes are converted
+when the document is parsed: an integer that fits in `i64` or `u64` stays exact, and any other
+number becomes the nearest `f64`. If parsing fails, everything that was built is released.
 
 ## Errors
-- `JsonError` if the input is not valid JSON, has a duplicate key, nests deeper than `MAX_DEPTH`
-  (64), or has content after the value. `offset` gives the position.
+- `JsonError` if the input is not valid JSON, has a duplicate key, has a number too large for a
+  finite `f64`, nests deeper than `MAX_DEPTH` (64), or has content after the value. `offset` gives the position.
 - `OutOfMemoryError` if the `Allocator` cannot supply the tree.
 - `WriterError` from the write functions if the `Writer` fails.
 
@@ -105,59 +105,93 @@ pub value: Value
 
 The value.
 
-<a id="JsonChild"></a>
+<a id="JsonNumber"></a>
 
-## `JsonChild`
+## `JsonNumber`
 
 ```silk
-pub union JsonChild
+pub union JsonNumber
 ```
 
-One element of an array or one member of an object.
+A JSON number, converted to the type that holds it exactly when there is one.
 
 ### Details
 
-Arrays and objects use the same storage type, so nested arrays and objects drop in the same way.
+An integer written without a fraction or an exponent is `Integer` if it fits in `i64` and
+`Unsigned` if it is larger but fits in `u64`. Any other number is `Float`, rounded to the nearest
+`f64` with ties to even. `1.0` and `1e3` are floats.
 
-<a id="JsonChild.Item"></a>
+### Gotchas
 
-### `Item`
+`Json.write` fails with `InvalidNumber` for a `Float` that is not finite.
+
+<a id="JsonNumber.Integer"></a>
+
+### `Integer`
 
 ```silk
-Item
+Integer
 ```
 
-An array element.
+An integer that fits in `i64`.
 
-<a id="JsonChild.Item.value"></a>
+<a id="JsonNumber.Integer.value"></a>
 
 #### Field `value`
 
 ```silk
-pub value: Value
+pub value: i64
 ```
 
-The element.
+The value.
 
-<a id="JsonChild.Member"></a>
+<a id="JsonNumber.Unsigned"></a>
 
-### `Member`
+### `Unsigned`
 
 ```silk
-Member
+Unsigned
 ```
 
-An object member.
+An integer more than `i64.MAX` that fits in `u64`.
 
-<a id="JsonChild.Member.entry"></a>
+<a id="JsonNumber.Unsigned.value"></a>
 
-#### Field `entry`
+#### Field `value`
 
 ```silk
-pub entry: JsonEntry
+pub value: u64
 ```
 
-The key and the value.
+The value.
+
+<a id="JsonNumber.Float"></a>
+
+### `Float`
+
+```silk
+Float
+```
+
+A number with a fraction or an exponent, or an integer too large for `u64`.
+
+<a id="JsonNumber.Float.value"></a>
+
+#### Field `value`
+
+```silk
+pub value: f64
+```
+
+The nearest `f64`.
+
+<a id="JsonNumber.impl.Copy"></a>
+
+## Implementation `Copy for JsonNumber`
+
+```silk
+impl Copy for JsonNumber
+```
 
 <a id="Value"></a>
 
@@ -172,8 +206,8 @@ One JSON value: null, a boolean, a number, a string, an array, or an object.
 ### Details
 
 A `Value` owns all of its children. Use `match` to get the kind, or the `Json.as...` functions
-to read a field of a known kind. Arrays and objects keep the order of the source. A number keeps
-its source text and is converted only when you call [`Json.asI32`](#Json.impl.asI32) or a similar function.
+to read a field of a known kind. Arrays and objects keep the order of the source. A number is
+converted when the document is parsed, as a [`JsonNumber`](#JsonNumber).
 
 ### Gotchas
 
@@ -217,17 +251,17 @@ The boolean value.
 Number
 ```
 
-A JSON number, kept as its source text.
+A JSON number.
 
-<a id="Value.Number.text"></a>
+<a id="Value.Number.value"></a>
 
-#### Field `text`
+#### Field `value`
 
 ```silk
-pub text: String
+pub value: JsonNumber
 ```
 
-The number as it was written in the source, such as `"-1.5e3"`.
+The number, converted when the document was parsed.
 
 <a id="Value.String"></a>
 
@@ -264,10 +298,10 @@ A JSON array.
 #### Field `values`
 
 ```silk
-pub values: Box<List<JsonChild>>
+pub values: List<Value>
 ```
 
-The elements in source order. Each is a `JsonChild.Item`.
+The elements in source order.
 
 <a id="Value.Object"></a>
 
@@ -284,10 +318,10 @@ A JSON object.
 #### Field `entries`
 
 ```silk
-pub entries: Box<List<JsonChild>>
+pub entries: List<JsonEntry>
 ```
 
-The members in source order. Each is a `JsonChild.Member`.
+The members in source order.
 
 <a id="Json"></a>
 
@@ -531,8 +565,8 @@ Use it to read nested fields in a chain: `Json.field(&doc, "user") |> Json.field
 pub fn asI32(self: Option<&Value>) -> Option<i32>
 ```
 
-Returns the number as `i32`. Returns an absent option if the value is absent, is not a number,
-is not written as a plain integer (`1.0` and `1e3` are not), or does not fit in `i32`.
+Returns the number as `i32`. Returns an absent option if the value is absent, is not an
+integer (`1.0` and `1e3` are not), or does not fit in `i32`.
 
 <a id="Json.impl.asI64"></a>
 
@@ -542,8 +576,8 @@ is not written as a plain integer (`1.0` and `1e3` are not), or does not fit in 
 pub fn asI64(self: Option<&Value>) -> Option<i64>
 ```
 
-Returns the number as `i64`. Returns an absent option if the value is absent, is not a number,
-is not written as a plain integer (`1.0` and `1e3` are not), or does not fit in `i64`.
+Returns the number as `i64`. Returns an absent option if the value is absent, is not an
+integer (`1.0` and `1e3` are not), or does not fit in `i64`.
 
 <a id="Json.impl.asU64"></a>
 
@@ -553,8 +587,8 @@ is not written as a plain integer (`1.0` and `1e3` are not), or does not fit in 
 pub fn asU64(self: Option<&Value>) -> Option<u64>
 ```
 
-Returns the number as `u64`. Returns an absent option if the value is absent, is not a number,
-is not written as a plain integer (`1.0` and `1e3` are not), or does not fit in `u64`.
+Returns the number as `u64`. Returns an absent option if the value is absent, is not an
+integer (`1.0` and `1e3` are not), or does not fit in `u64`.
 
 <a id="Json.impl.asF64"></a>
 
@@ -565,7 +599,7 @@ pub fn asF64(self: Option<&Value>) -> Option<f64>
 ```
 
 Returns the number as `f64`, rounded to the nearest value. Returns an absent option if the
-value is absent, is not a number, or is too large for a finite `f64`.
+value is absent, is not a number, or is not finite.
 
 <a id="Json.impl.asF32"></a>
 
@@ -577,6 +611,11 @@ pub fn asF32(self: Option<&Value>) -> Option<f32>
 
 Returns the number as `f32`, rounded to the nearest value. Returns an absent option if the
 value is absent, is not a number, or is too large for a finite `f32`.
+
+#### Gotchas
+
+A `Float` was already rounded to `f64` when the document was parsed, so it is rounded two
+times.
 
 <a id="Json.impl.asString"></a>
 

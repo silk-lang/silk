@@ -183,16 +183,6 @@ DuplicateKey
 
 An object has the same key two times.
 
-<a id="JsonReason.InvalidValue"></a>
-
-### `InvalidValue`
-
-```silk
-InvalidValue
-```
-
-A value in a tree has a child of the wrong kind.
-
 <a id="JsonReason.TypeMismatch"></a>
 
 ### `TypeMismatch`
