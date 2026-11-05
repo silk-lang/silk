@@ -2,7 +2,7 @@ param(
   [Parameter(Mandatory = $true)][string]$ArtifactDirectory,
   [string]$LlvmBin = "$env:USERPROFILE\silk-windows-tools\clang+llvm-22.1.8-x86_64-pc-windows-msvc\bin",
   [string[]]$Programs = @('hello', 'hello-speed', 'storage', 'host-check', 'providers', 'filesystem', 'process', 'process-image', 'console', 'resolver', 'sockets', 'trust', 'https',
-    'native-thread-spawn-join', 'native-thread-cross-wake', 'atomic-wait-notify', 'native-termination-source-trap', 'stderr-locked-message')
+    'native-thread-spawn-join', 'native-thread-cross-wake', 'atomic-wait-notify', 'native-termination-source-trap', 'stderr-locked-message', 'websocket-relay')
 )
 $ErrorActionPreference = 'Stop'
 $artifact = (Resolve-Path -LiteralPath $ArtifactDirectory).Path
@@ -29,6 +29,7 @@ foreach ($name in $Programs) {
   if ($name -eq 'providers' -or $name -eq 'process' -or $name -eq 'process-image') { $allowed = '^(kernel32|ntdll|bcryptprimitives)\.dll$' }
   $corpusThread = $name -like 'native-thread-*' -or $name -like 'atomic-*'
   if ($corpusThread) { $allowed = '^(kernel32|ntdll|api-ms-win-core-synch-l1-2-0)\.dll$' }
+  if ($name -eq 'websocket-relay') { $allowed = '^(kernel32|ntdll|ws2_32|bcryptprimitives)\.dll$' }
   if ($imports.Count -eq 0 -or @($imports | Where-Object { $_ -notmatch $allowed }).Count -ne 0) {
     throw "Unexpected or missing DLL imports for $name`: $imports"
   }
@@ -94,7 +95,7 @@ foreach ($name in $Programs) {
     $expected = ''
     if ($name -eq 'hello' -or $name -eq 'hello-speed') { $expected = "Hello from Silk: $([char]::ConvertFromUtf32(0x1f4a9))`n" }
     $expectedCode = 0
-    if ($corpusThread) { $expectedCode = 42 }
+    if ($corpusThread -or $name -eq 'websocket-relay') { $expectedCode = 42 }
     $passed = $child.ExitCode -eq $expectedCode -and $output -ceq $expected -and $errorOutput -ceq ''
     if ($name -eq 'process-image') {
       $passed = $child.ExitCode -eq 259 -and $output -ceq "interactive stdout`n" -and $errorOutput -ceq "interactive stderr`n"

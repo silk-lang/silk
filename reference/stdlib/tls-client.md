@@ -1679,6 +1679,17 @@ pub fn pendingOutput<'a>(self: &'a Self) -> &'a [u8]
 Returns the TLS output to send to the server. After you send some of it, call
 [`Client.ackWritten`](#Client.impl.ackWritten).
 
+<a id="Client.impl.closeNotified"></a>
+
+### Method `closeNotified`
+
+```silk
+pub fn closeNotified(self: &Self) -> bool
+```
+
+Returns whether the server sent `close_notify`. Plaintext that came before it can still be
+read.
+
 <a id="Client.impl.authentication"></a>
 
 ### Method `authentication`

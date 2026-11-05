@@ -7,8 +7,11 @@ The server side of the WebSocket opening handshake (RFC 6455, version 13).
 ## When to use
 In an `silk.http.server` request callback, call [`withUpgrade`](#withUpgrade) with a [`DecisionHandler`](#DecisionHandler). The
 handler looks at the [`Offer`](#Offer) and returns a [`Decision`](#Decision): accept, maybe with a subprotocol, or
-reject with a status. After an accept, your callback gets the channel for WebSocket frames, for
-example through `silk.http.websocket_server`.
+reject with a status. After an accept, your callback gets the channel. Make a session over it
+with [`channelTransport`](#channelTransport) and `WebSocket.make` of `silk.http.websocket_stream`.
+
+For a connection that a listener accepted, call [`acceptOwned`](#acceptOwned). It answers the handshake and
+returns a session that owns the transport, so you can split it for fibers.
 
 Use [`inspect`](#inspect) and [`acceptInto`](#acceptInto) alone to check a handshake without a server.
 
@@ -183,7 +186,7 @@ pub fn main() -> i32 {
 
 Import as `WebSocketUpgrade` with `import silk.http.websocket_upgrade as WebSocketUpgrade`.
 
-Public declarations: 14.
+Public declarations: 18.
 
 <a id="Limits"></a>
 
@@ -1077,6 +1080,177 @@ Sends the response for a handshake error, with no body.
 ### Details
 It sends the status of [`rejectionStatus`](#rejectionStatus). For `UnsupportedVersion`, it also sends
 `Sec-WebSocket-Version: 13`. Call it only before a 101 response starts.
+
+<a id="ChannelTransport"></a>
+
+## `ChannelTransport`
+
+```silk
+pub struct ChannelTransport<'channel, 'transport, P>
+```
+
+The upgraded channel of [`withUpgrade`](#withUpgrade) as a transport, so that a `WebSocket` of
+`silk.http.websocket_stream` can run over it. Make it with [`channelTransport`](#channelTransport).
+
+<a id="channelTransport"></a>
+
+## `channelTransport`
+
+```silk
+pub fn channelTransport<'channel, 'transport, P>(
+  channel: &'channel mut BufferedDuplex<'transport, P>,
+) -> ChannelTransport<'channel, 'transport, P>
+```
+
+Returns `channel` as a transport. Bytes that the client sent after the request head come first.
+
+<a id="ChannelTransport.impl"></a>
+
+## Implementation `ChannelTransport<'channel, 'transport, P>`
+
+```silk
+impl<'channel, 'transport, P> ChannelTransport<'channel, 'transport, P>
+```
+
+<a id="ChannelTransport.impl.HttpTransport"></a>
+
+## Implementation `HttpTransport for ChannelTransport<'channel, 'transport, P>`
+
+```silk
+impl<'channel, 'transport, P> HttpTransport for ChannelTransport<'channel, 'transport, P>
+where
+  &mut P provides &ByteDuplex from &mut ByteDuplex,
+  &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
+```
+
+<a id="ChannelTransport.impl.HttpTransport.readSomeRaw"></a>
+
+### Operation `readSomeRaw`
+
+```silk
+readSomeRaw: ChannelTransport.read
+```
+
+<a id="ChannelTransport.impl.HttpTransport.writeSomeRaw"></a>
+
+### Operation `writeSomeRaw`
+
+```silk
+writeSomeRaw: ChannelTransport.write
+```
+
+<a id="ChannelTransport.impl.HttpTransport.flush"></a>
+
+### Operation `flush`
+
+```silk
+flush: ChannelTransport.flushOutput
+```
+
+<a id="ChannelTransport.impl.HttpTransport.close"></a>
+
+### Operation `close`
+
+```silk
+close: ChannelTransport.closeChannel
+```
+
+<a id="Accepted"></a>
+
+## `Accepted`
+
+```silk
+pub union Accepted<P>
+```
+
+The result of [`acceptOwned`](#acceptOwned).
+
+<a id="Accepted.Upgraded"></a>
+
+### `Upgraded`
+
+```silk
+Upgraded
+```
+
+The 101 response was sent. The session is open.
+
+<a id="Accepted.Upgraded.socket"></a>
+
+#### Field `socket`
+
+```silk
+pub socket: WebSocket<P>
+```
+
+The session, which owns the transport.
+
+<a id="Accepted.Upgraded.protocol"></a>
+
+#### Field `protocol`
+
+```silk
+pub protocol: Bytes
+```
+
+The selected subprotocol, or empty.
+
+<a id="Accepted.Rejected"></a>
+
+### `Rejected`
+
+```silk
+Rejected
+```
+
+The request was not a valid handshake, or the decision was `Reject`. The response was sent and
+the transport was closed.
+
+<a id="Accepted.Rejected.status"></a>
+
+#### Field `status`
+
+```silk
+pub status: u16
+```
+
+The status that was sent.
+
+<a id="acceptOwned"></a>
+
+## `acceptOwned`
+
+```silk
+pub effect fn acceptOwned<D, ?R, P, H: DecisionHandler<D ? R>>(
+  transport: P,
+  head: HeadLimits,
+  limits: Limits,
+  options: Options,
+  handler: H,
+  deadline: Option<Instant>,
+) -> Accepted<P>
+! D | UpgradeError | StreamError | OutOfMemoryError
+? R | &mut Allocator | &mut MonotonicClock | &mut Random
+where
+  &mut P provides &HttpTransport from &mut HttpTransport,
+  &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
+```
+
+Reads a handshake request from `transport`, asks `handler`, and answers. After an accept, it
+returns a server session that owns `transport`.
+
+### When to use
+Use it for a connection that a listener accepted, when the session must outlive one callback,
+for example to split it for fibers. Inside `silk.http.server`, use [`withUpgrade`](#withUpgrade) instead.
+
+### Details
+`head` limits the request head. A request that is not a valid handshake gets the response of
+[`reject`](#reject). Bytes that the client sent after the head go to the session.
+
+### Errors
+- [`UpgradeError`](#UpgradeError) if the decision cannot make a valid response. The transport is closed.
+- `StreamError` if the transport fails or ends before the head, or `options` is not valid.
+- The errors of the handler.
 
 
 Category: HTTP.

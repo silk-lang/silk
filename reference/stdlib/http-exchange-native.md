@@ -116,7 +116,7 @@ pub fn main() -> i32 {
 
 Import as `HttpExchangeNative` with `import silk.http.exchange_native as HttpExchangeNative`.
 
-Public declarations: 16.
+Public declarations: 17.
 
 <a id="NativeRoute"></a>
 
@@ -745,6 +745,36 @@ connection and to the `CONNECT` exchange.
 - `NativeExchangeError.TrustRequired` if the origin uses `https` and `preparedTrust` is none.
 - The errors of resolution, the socket, TLS, and the handler.
 
+<a id="NativeTransportHalves"></a>
+
+## `NativeTransportHalves`
+
+```silk
+pub struct NativeTransportHalves
+```
+
+The two halves of a [`NativeTransport`](#NativeTransport), from [`NativeTransport.split`](#NativeTransport.impl.split).
+
+<a id="NativeTransportHalves.reader"></a>
+
+### Field `reader`
+
+```silk
+pub reader: NativeTransport
+```
+
+The half to read from.
+
+<a id="NativeTransportHalves.writer"></a>
+
+### Field `writer`
+
+```silk
+pub writer: NativeTransport
+```
+
+The half to write to.
+
 <a id="NativeTransport.impl"></a>
 
 ## Implementation `NativeTransport`
@@ -762,6 +792,38 @@ pub fn route(self: &Self) -> NativeRoute
 ```
 
 Returns the route of the transport.
+
+<a id="NativeTransport.impl.plain"></a>
+
+### Associated function `plain`
+
+```silk
+pub fn plain(connection: NativeConnection) -> NativeTransport
+```
+
+Returns a transport over a plain socket, for example one that a listener accepted.
+
+<a id="NativeTransport.impl.split"></a>
+
+### Method `split`
+
+```silk
+pub effect fn split(self: Self) -> NativeTransportHalves ! OutOfMemoryError ? &mut Allocator
+```
+
+Splits the transport into a half to read from and a half to write to, so that one fiber can
+wait for input while another one writes. A TLS transport is split too.
+
+#### Details
+Use `reader` only to read and `writer` only to write. With TLS, records that the reader must
+answer, such as a key update, go out with the next write. The socket closes when both halves
+are closed or dropped.
+
+#### Errors
+`OutOfMemoryError` if the shared state cannot be allocated.
+
+#### Gotchas
+A half cannot be split again. That traps.
 
 <a id="NativeTransport.impl.HttpTransport"></a>
 
