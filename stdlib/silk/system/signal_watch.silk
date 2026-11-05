@@ -1,0 +1,450 @@
+//! Receive process signals, such as an interrupt or a terminal resize, through a descriptor that an
+//! event loop can watch.
+//!
+//! # When to use
+//! Use a [`SignalWatch`] when a signal must become an event of your loop instead of ending the
+//! process, as for `process.on("SIGINT")` in a JavaScript runtime. Add each signal with
+//! [`SignalWatch.add`], register [`SignalWatch.descriptor`] with a reactor, such as
+//! `silk.io.reactor`, for reads, and call [`SignalWatch.read`] when it is readable.
+//!
+//! # Details
+//! While a signal is in the watch, its default action does not happen: the signal only makes the
+//! descriptor readable. [`SignalWatch.remove`] and dropping the watch give each signal back its
+//! earlier behavior. A signal that arrives more than one time before a read is reported one time.
+//!
+//! The watch uses `signalfd` on Linux and a kqueue with `EVFILT_SIGNAL` filters on Darwin. The
+//! descriptor is nonblocking and close-on-exec.
+//!
+//! # Errors
+//! Each operation fails with [`SignalError`]: the [`SignalOperation`] and the native error code.
+//!
+//! # Gotchas
+//! - Keep one watch for each signal in a process. Two watches of one signal take its arrivals
+//!   from each other.
+//! - On Linux, the watch blocks its signals in the thread that adds them, and threads that start
+//!   later inherit the block. Open the watch and add its signals on the main thread before the
+//!   program starts other threads: a thread that started earlier still gets the signal with its
+//!   default action.
+//! - On Darwin, the watch sets a signal whose default action ends or stops the process to be
+//!   ignored while it is in the watch. A child started with `posix_spawn` or `exec` gets that
+//!   ignored setting unless the starter resets it, as `silk.system.subprocess` does.
+//! - `SIGKILL` and `SIGSTOP` cannot be watched.
+//! - The module is empty on targets other than Darwin on x86_64 or aarch64, and Linux with GNU libc
+//!   on x86_64 or aarch64.
+//!
+//! # Examples
+//! ## Receive a signal that the process sends to itself
+//! ```silk
+//! import silk.core.effect { Effect }
+//! import silk.core.result { Result }
+//! import silk.system.signal_watch { SignalError, SignalWatch }
+//!
+//! unsafe extern "C" fn getpid() -> i32
+//! unsafe extern "C" fn kill(pid: i32, signal: i32) -> i32
+//!
+//! effect fn program() -> i32 ! SignalError {
+//!   let mut watch = run SignalWatch.open()
+//!   // SIGUSR1 ends the process by default; in the watch it only makes the descriptor readable.
+//!   let user = SignalWatch.userOne()
+//!   run watch.add(user)
+//!   if unsafe kill(unsafe getpid(), user) != 0 { return 1 }
+//!   let mut received: [i32; 4] = [0; 4]
+//!   let count = run watch.read(&mut received)
+//!   if count != 1 || received[0] != user { return 1 }
+//!   // Nothing more arrived, so a read does not block and returns 0.
+//!   let more = run watch.read(&mut received)
+//!   if more != 0 { return 1 }
+//!   run watch.remove(user)
+//!   return 0
+//! }
+//!
+//! pub effect fn main() -> i32 {
+//!   return match run Effect.result(program()) {
+//!     Result<i32, SignalError>.Success { value } => value
+//!     Result<i32, SignalError>.Failure { .. } => 1
+//!   }
+//! }
+//! ```
+//!
+//! @category System
+
+static if (Intrinsic.targetOperatingSystem() == "darwin" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64") && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+import silk.mem.pointer { Pointer }
+import silk.core.ownership { Copy, Drop }
+import silk.num.i32
+import silk.num.i64
+import silk.num.isize
+import silk.num.u8
+import silk.num.u64
+import silk.num.usize
+
+/// The operation of a [`SignalWatch`] that failed.
+pub enum SignalOperation {
+  /// Opening the descriptor, in [`SignalWatch.open`].
+  Open,
+  /// Adding a signal, in [`SignalWatch.add`].
+  Add,
+  /// Removing a signal, in [`SignalWatch.remove`].
+  Remove,
+  /// Reading the signals that arrived, in [`SignalWatch.read`].
+  Read,
+}
+
+/// A failed [`SignalWatch`] operation: which one, and the native error code.
+///
+/// # Details
+/// `code` is the `errno` value of the failed system call, such as 22 (`EINVAL`) for a signal number
+/// that cannot be watched, or 24 (`EMFILE`) when the process has too many open descriptors.
+pub struct SignalError {
+  /// The operation that failed.
+  pub operation: SignalOperation,
+  /// The native error code.
+  pub code: i32,
+}
+
+/// A descriptor that becomes readable when one of its signals arrives.
+///
+/// # Details
+/// While a signal is in the watch, its default action does not happen. The descriptor is
+/// nonblocking and close-on-exec. Dropping the watch removes each of its signals, which gives each
+/// one back its earlier behavior, and closes the descriptor.
+///
+/// # Gotchas
+/// - Keep one watch for each signal in a process.
+/// - On Linux, add signals on the main thread before other threads start. A thread that started
+///   earlier still gets the signal with its default action.
+/// - On Darwin, a signal whose default action ends or stops the process is set to be ignored while
+///   it is in the watch, and a child started by `exec` alone inherits that.
+pub struct SignalWatch {
+  fd: i32,
+  // Bit `n - 1` is set for each signal `n` in the watch.
+  signals: u64,
+  // Darwin keeps the earlier action of each signal it set to be ignored, by signal number.
+  saved: [SavedAction; SLOTS],
+}
+
+impl Drop for SignalWatch {
+  fn drop(self: &mut SignalWatch) -> () {
+    let mut number: i32 = 1
+    while number <= HIGHEST {
+      if (self.signals & bit(number)) != 0 { let _removed = unsafe self.release(number) }
+      number = number + 1
+    }
+    let fd = Intrinsic.replace(self.fd, -1)
+    if fd >= 0 { let _closed = unsafe close(fd) }
+    return ()
+  }
+}
+
+impl SignalWatch {
+  /// Opens a watch with no signals.
+  ///
+  /// # Errors
+  /// [`SignalError`] with operation `Open` if the descriptor cannot be opened, for example with
+  /// code 24 (`EMFILE`).
+  pub effect fn open() -> SignalWatch ! SignalError {
+    let mut fd: i32 = -1
+    let code = unsafe openDescriptor(&mut fd)
+    let watch = SignalWatch { fd: fd, signals: 0, saved: [emptySaved(); SLOTS] }
+    if code != 0 { fail SignalError { operation: SignalOperation.Open, code: code } }
+    return move watch
+  }
+
+  /// Returns the descriptor to register for reads. The watch keeps owning it.
+  pub fn descriptor(self: &Self) -> i32 { return self.fd }
+
+  /// Adds `signal`: from now on it makes the descriptor readable instead of taking its default
+  /// action. Adding a signal that is in the watch does nothing.
+  ///
+  /// # Errors
+  /// [`SignalError`] with operation `Add`, with code 22 (`EINVAL`) for `SIGKILL`, `SIGSTOP`, or a
+  /// number that is not a signal of the system: 1 to 64 on Linux, 1 to 31 on Darwin.
+  pub effect fn add(self: &mut Self, signal: i32) -> () ! SignalError {
+    if !watchable(signal) { fail SignalError { operation: SignalOperation.Add, code: 22 } }
+    if (self.signals & bit(signal)) != 0 { return () }
+    let code = unsafe self.acquire(signal)
+    if code != 0 { fail SignalError { operation: SignalOperation.Add, code: code } }
+    return ()
+  }
+
+  /// Removes `signal`, and gives it back its behavior from before [`SignalWatch.add`]. Removing a
+  /// signal that is not in the watch does nothing.
+  ///
+  /// # Details
+  /// An arrival of `signal` that was not read yet is discarded.
+  ///
+  /// # Errors
+  /// [`SignalError`] with operation `Remove` if the system refuses the change, or with code 22
+  /// (`EINVAL`) for a number that is not a signal of the system.
+  pub effect fn remove(self: &mut Self, signal: i32) -> () ! SignalError {
+    if signal < 1 || signal > HIGHEST { fail SignalError { operation: SignalOperation.Remove, code: 22 } }
+    if (self.signals & bit(signal)) == 0 { return () }
+    let code = unsafe self.release(signal)
+    if code != 0 { fail SignalError { operation: SignalOperation.Remove, code: code } }
+    return ()
+  }
+
+  /// Returns whether `signal` is in the watch.
+  pub fn contains(self: &Self, signal: i32) -> bool {
+    if signal < 1 || signal > HIGHEST { return false }
+    return (self.signals & bit(signal)) != 0
+  }
+
+  /// Writes the signals that arrived since the last read to the start of `signals`, and returns
+  /// their number. It never blocks: with no arrival, it returns 0.
+  ///
+  /// # Details
+  /// A signal that arrived more than one time is written one time. At most `signals.length`
+  /// signals are written; the others stay for the next read.
+  ///
+  /// # Errors
+  /// [`SignalError`] with operation `Read` if the system call fails.
+  pub effect fn read(self: &mut Self, signals: &mut [i32]) -> usize ! SignalError {
+    let mut count: usize = 0
+    let code = unsafe readSignals(self.fd, move signals, &mut count)
+    if code != 0 { fail SignalError { operation: SignalOperation.Read, code: code } }
+    return count
+  }
+
+  /// Returns the number of `SIGHUP`, sent when the terminal closes.
+  pub fn hangup() -> i32 { return 1 }
+  /// Returns the number of `SIGINT`, sent by Control-C.
+  pub fn interrupt() -> i32 { return 2 }
+  /// Returns the number of `SIGQUIT`, sent by Control-Backslash.
+  pub fn quit() -> i32 { return 3 }
+  /// Returns the number of `SIGTERM`, the polite request to end.
+  pub fn terminate() -> i32 { return 15 }
+  /// Returns the number of `SIGUSR1`.
+  pub fn userOne() -> i32 { return USER_ONE }
+  /// Returns the number of `SIGUSR2`.
+  pub fn userTwo() -> i32 { return USER_TWO }
+  /// Returns the number of `SIGCHLD`, sent when a child process ends or stops.
+  pub fn child() -> i32 { return CHILD }
+  /// Returns the number of `SIGWINCH`, sent when the terminal changes its size.
+  pub fn windowChange() -> i32 { return 28 }
+  /// Returns the number of `SIGPIPE`, sent by a write to a pipe or socket with no reader.
+  pub fn brokenPipe() -> i32 { return 13 }
+
+  // Puts `signal` in the watch. Returns 0 or the native error code.
+  unsafe fn acquire(self: &mut Self, signal: i32) -> i32 {
+    let code = unsafe watchSignal(self.fd, self.signals | bit(signal), signal, &mut self.saved[i32.toUsize(signal)])
+    if code == 0 { self.signals = self.signals | bit(signal) }
+    return code
+  }
+
+  // Takes `signal` out of the watch. Returns 0 or the native error code.
+  unsafe fn release(self: &mut Self, signal: i32) -> i32 {
+    let remaining = self.signals & ~bit(signal)
+    let code = unsafe unwatchSignal(self.fd, remaining, signal, &self.saved[i32.toUsize(signal)])
+    if code == 0 { self.signals = remaining }
+    return code
+  }
+}
+
+fn bit(signal: i32) -> u64 { return u64.shiftLeft(1, i32.toU64(signal - 1)) }
+
+fn watchable(signal: i32) -> bool {
+  return signal >= 1 && signal <= HIGHEST && signal != 9 && signal != STOP
+}
+
+unsafe extern "C" fn close(fd: i32) -> i32
+@foreign(noCapture: .("buffer"))
+unsafe extern "C" fn read(fd: i32, buffer: ?[*]mut u8, count: usize) -> isize
+unsafe extern "C" fn fcntl(fd: i32, command: i32, ...) -> i32
+
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  unsafe extern "C" fn __error() -> *mut i32
+  unsafe fn currentError() -> i32 { unsafe { return Pointer.read<i32>(__error()) } }
+
+  const HIGHEST: i32 = 31
+  const SLOTS: usize = 32
+  const STOP: i32 = 17
+  const USER_ONE: i32 = 30
+  const USER_TWO: i32 = 31
+  const CHILD: i32 = 20
+
+  // The C `struct sigaction` of Darwin, with the handler as a word: 1 is `SIG_IGN`.
+  extern "C" struct SavedAction { handler: usize, mask: u32, flags: i32 }
+  impl Copy for SavedAction {}
+  fn emptySaved() -> SavedAction { return SavedAction { handler: 0, mask: 0, flags: 0 } }
+  // Declared without a foreign contract, as `silk.platform.native.start` declares it: one C symbol
+  // has one signature.
+  unsafe extern "C" fn sigaction(signal: i32, action: ?*const SavedAction, previous: ?*mut SavedAction) -> i32
+
+  import silk.platform.native.kqueue { ADD, DELETE, FILTER_SIGNAL, KernelEvent, TimeSpec, kevent, kqueue }
+  const F_SETFD: i32 = 2
+  const FD_CLOEXEC: i32 = 1
+  const BATCH: usize = 32
+
+  fn signalEvent(signal: i32, flags: u16) -> KernelEvent {
+    return KernelEvent { ident: i32.toUsize(signal), filter: FILTER_SIGNAL, flags: flags, fflags: 0, data: 0, udata: 0 }
+  }
+
+  // Signals whose default action is to do nothing, or to continue: they keep their action.
+  fn quietByDefault(signal: i32) -> bool {
+    // SIGURG, SIGCONT, SIGCHLD, SIGWINCH, SIGINFO.
+    return signal == 16 || signal == 19 || signal == 20 || signal == 28 || signal == 29
+  }
+
+  unsafe fn submit(queue: i32, change: KernelEvent) -> i32 {
+    let changes = [change]
+    let mut none: [KernelEvent; 0] = []
+    if unsafe kevent(queue, Pointer.fromSlice<KernelEvent>(&changes), 1, Pointer.fromMutSlice<KernelEvent>(&mut none), 0, Pointer.null<TimeSpec>()) < 0 {
+      return unsafe currentError()
+    }
+    return 0
+  }
+
+  unsafe fn openDescriptor(fd: &mut i32) -> i32 {
+    let queue = unsafe kqueue()
+    if queue < 0 { return unsafe currentError() }
+    fd.* = queue
+    if unsafe fcntl(queue, F_SETFD, FD_CLOEXEC) < 0 { return unsafe currentError() }
+    return 0
+  }
+
+  // The filter records every arrival, also of an ignored signal, so the default action is
+  // switched off by ignoring the signal.
+  unsafe fn watchSignal(fd: i32, signals: u64, signal: i32, saved: &mut SavedAction) -> i32 {
+    let added = unsafe submit(fd, signalEvent(signal, ADD))
+    if added != 0 { return added }
+    if quietByDefault(signal) { return 0 }
+    let ignore = SavedAction { handler: 1, mask: 0, flags: 0 }
+    if unsafe sigaction(signal, Pointer.fromRef<SavedAction>(&ignore), Pointer.fromMutRef<SavedAction>(&mut saved.*)) != 0 {
+      let error = unsafe currentError()
+      let _removed = unsafe submit(fd, signalEvent(signal, DELETE))
+      return error
+    }
+    return 0
+  }
+
+  unsafe fn unwatchSignal(fd: i32, signals: u64, signal: i32, saved: &SavedAction) -> i32 {
+    if !quietByDefault(signal) {
+      if unsafe sigaction(signal, Pointer.fromRef<SavedAction>(&saved.*), Pointer.null<SavedAction>()) != 0 {
+        return unsafe currentError()
+      }
+    }
+    return unsafe submit(fd, signalEvent(signal, DELETE))
+  }
+
+  unsafe fn readSignals(fd: i32, signals: &mut [i32], count: &mut usize) -> i32 {
+    count.* = 0
+    if signals.length == 0 { return 0 }
+    let mut raw: [KernelEvent; 32] = [signalEvent(0, 0); 32]
+    let mut asked = signals.length
+    if asked > BATCH { asked = BATCH }
+    let nothing: [KernelEvent; 0] = []
+    let zero = TimeSpec { seconds: 0, nanoseconds: 0 }
+    while true {
+      let received = unsafe kevent(fd, Pointer.fromSlice<KernelEvent>(&nothing), 0, Pointer.fromMutSlice<KernelEvent>(&mut raw), usize.toI32(asked), Pointer.fromRef<TimeSpec>(&zero))
+      if received >= 0 {
+        let mut index: usize = 0
+        while index < i32.toUsize(received) {
+          signals[index] = usize.toI32(raw[index].ident)
+          index = index + 1
+        }
+        count.* = i32.toUsize(received)
+        return 0
+      }
+      let code = unsafe currentError()
+      if code != 4 { return code }
+    }
+    return 0
+  }
+} else {
+  unsafe extern "C" fn __errno_location() -> *mut i32
+  unsafe fn currentError() -> i32 { unsafe { return Pointer.read<i32>(__errno_location()) } }
+
+  const HIGHEST: i32 = 64
+  const SLOTS: usize = 65
+  const STOP: i32 = 19
+  const USER_ONE: i32 = 10
+  const USER_TWO: i32 = 12
+  const CHILD: i32 = 17
+
+  // Linux needs no saved action: the signal is blocked, not ignored.
+  struct SavedAction {}
+  impl Copy for SavedAction {}
+  fn emptySaved() -> SavedAction { return SavedAction {} }
+
+  // glibc's `sigset_t` is 1024 bits; the kernel reads the first 64.
+  extern "C" struct SignalSet { words: [u64; 16] }
+  fn signalSet(bits: u64) -> SignalSet {
+    let mut set = SignalSet { words: [0; 16] }
+    set.words[0] = bits
+    return move set
+  }
+  extern "C" struct TimeSpec { seconds: i64, nanoseconds: i64 }
+  @foreign(noCapture: .("mask"))
+  unsafe extern "C" fn signalfd(fd: i32, mask: *const SignalSet, flags: i32) -> i32
+  @foreign(noCapture: .("set", "previous"))
+  unsafe extern "C" fn pthread_sigmask(how: i32, set: ?*const SignalSet, previous: ?*mut SignalSet) -> i32
+  @foreign(noCapture: .("set", "information", "timeout"))
+  unsafe extern "C" fn sigtimedwait(set: *const SignalSet, information: ?*mut u8, timeout: *const TimeSpec) -> i32
+  const CLOEXEC: i32 = 524288
+  const NONBLOCK: i32 = 2048
+  const BLOCK: i32 = 0
+  const UNBLOCK: i32 = 1
+  // One `struct signalfd_siginfo` is 128 bytes, and starts with the signal number as a `u32`.
+  const RECORD: usize = 128
+  const BATCH: usize = 16
+
+  unsafe fn openDescriptor(fd: &mut i32) -> i32 {
+    let empty = signalSet(0)
+    let opened = unsafe signalfd(-1, Pointer.fromRef<SignalSet>(&empty), CLOEXEC | NONBLOCK)
+    if opened < 0 { return unsafe currentError() }
+    fd.* = opened
+    return 0
+  }
+
+  // Blocks the signal, so it stays pending for the descriptor instead of taking its action.
+  unsafe fn watchSignal(fd: i32, signals: u64, signal: i32, saved: &mut SavedAction) -> i32 {
+    let one = signalSet(bit(signal))
+    let blocked = unsafe pthread_sigmask(BLOCK, Pointer.fromRef<SignalSet>(&one), Pointer.null<SignalSet>())
+    if blocked != 0 { return blocked }
+    let all = signalSet(signals)
+    if unsafe signalfd(fd, Pointer.fromRef<SignalSet>(&all), 0) < 0 {
+      let error = unsafe currentError()
+      let _unblocked = unsafe pthread_sigmask(UNBLOCK, Pointer.fromRef<SignalSet>(&one), Pointer.null<SignalSet>())
+      return error
+    }
+    return 0
+  }
+
+  // Discards a pending arrival first, so unblocking does not run the default action for it.
+  unsafe fn unwatchSignal(fd: i32, signals: u64, signal: i32, saved: &SavedAction) -> i32 {
+    let rest = signalSet(signals)
+    if unsafe signalfd(fd, Pointer.fromRef<SignalSet>(&rest), 0) < 0 { return unsafe currentError() }
+    let one = signalSet(bit(signal))
+    let zero = TimeSpec { seconds: 0, nanoseconds: 0 }
+    while unsafe sigtimedwait(Pointer.fromRef<SignalSet>(&one), Pointer.null<u8>(), Pointer.fromRef<TimeSpec>(&zero)) == signal {}
+    return unsafe pthread_sigmask(UNBLOCK, Pointer.fromRef<SignalSet>(&one), Pointer.null<SignalSet>())
+  }
+
+  unsafe fn readSignals(fd: i32, signals: &mut [i32], count: &mut usize) -> i32 {
+    count.* = 0
+    let mut asked = signals.length
+    if asked > BATCH { asked = BATCH }
+    if asked == 0 { return 0 }
+    let mut raw: [u8; 2048] = [0; 2048]
+    while true {
+      let received = unsafe read(fd, Pointer.fromMutSlice<u8>(&mut raw), asked * RECORD)
+      if received >= 0 {
+        let records = isize.toUsize(received) / RECORD
+        let mut index: usize = 0
+        while index < records {
+          let at = index * RECORD
+          signals[index] = u8.toI32(raw[at]) | (u8.toI32(raw[at + 1]) * 256)
+          index = index + 1
+        }
+        count.* = records
+        return 0
+      }
+      let code = unsafe currentError()
+      if code == 11 { return 0 }
+      if code != 4 { return code }
+    }
+    return 0
+  }
+}
+}
