@@ -1,0 +1,3149 @@
+//! One WebAssembly function body under construction, for the direct backend's MIR lowering
+//! (`WasmLower`).
+//!
+//! # Details
+//! The lowering builds a body as basic blocks of straight-line code, each ended by a jump, a
+//! branch, a switch, a return or a trap, over values it names by handle:
+//!
+//! - A value is a wasm local, a constant, an address the link fills in, or a frame slot. An
+//!   integer narrower than its container (`i1`, `i8`, `i16`, or `i33` to `i63`) is kept
+//!   zero-extended, so equality and unsigned operations need no extension; signed ones
+//!   sign-extend first and mask after. An `i128` is two `i64` lanes, low first, and a vector one
+//!   lane, or two, per element.
+//! - A frame slot lies in a frame on the linear-memory stack under the `__stack_pointer` global,
+//!   which the prologue moves down and every return restores.
+//! - `finish` makes the control flow structured by Ramsey's "Beyond Relooper" algorithm over the
+//!   dominator tree in reverse postorder, or a dispatch loop when the graph is irreducible.
+//!
+//! Every function index, type index, object address and table slot a body needs is left out of
+//! its code and named by a `Relocation` the link fills in, so a body depends on nothing but its
+//! own instance.
+
+import CompilerBug
+import backend.WasmModule
+import backend.WasmObject
+import backend.WasmObject {Relocation, RelocationKind, Translated, Unsupported}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.collections.bytes {Bytes}
+import silk.core.ownership {Copy}
+import silk.collections.slice {Slice}
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.collections.list {List}
+
+/// The kind of a value: what its lanes are.
+pub struct Kind {
+  /// The wasm type of each lane: `i32`, `i64`, `f32` or `f64`; zero for a value without lanes.
+  pub lane: u8,
+  /// An integer's width in bits, an address's being the memory's, or a float's.
+  pub bits: usize,
+  /// A vector's element count, or zero for a scalar.
+  pub elements: usize,
+  pub floating: bool,
+}
+
+impl Copy for Kind {}
+
+impl Kind {
+  /// The kind of a value without lanes.
+  pub fn unit() -> Kind { return Kind {lane: 0, bits: usize.ZERO, elements: usize.ZERO, floating: false} }
+
+  /// An integer `bits` wide.
+  pub fn integer(bits: usize) -> Kind {
+    let mut lane = WasmModule.i32Type()
+    if bits > 32 { lane = WasmModule.i64Type() }
+    return Kind {lane: lane, bits: bits, elements: usize.ZERO, floating: false}
+  }
+
+  /// A `bool`, an `i1`.
+  pub fn flag() -> Kind { return Kind.integer(usize.ONE) }
+
+  /// A float `bits` wide.
+  pub fn float(bits: usize) -> Kind {
+    let mut lane = WasmModule.f32Type()
+    if bits > 32 { lane = WasmModule.f64Type() }
+    return Kind {lane: lane, bits: bits, elements: usize.ZERO, floating: true}
+  }
+
+  /// A vector of `count` `element`s.
+  pub fn vector(element: Kind, count: usize) -> Kind {
+    return Kind {lane: element.lane, bits: element.bits, elements: count, floating: element.floating}
+  }
+
+  /// One element of a vector, or a scalar itself.
+  pub fn element(self: Self) -> Kind {
+    return Kind {lane: self.lane, bits: self.bits, elements: usize.ZERO, floating: self.floating}
+  }
+
+  /// Whether the value has no lanes.
+  pub fn isUnit(self: Self) -> bool { return self.lane == 0 }
+
+  /// The lanes of one element: two for an `i128`, one otherwise.
+  pub fn parts(self: Self) -> usize {
+    if self.lane == 0 { return usize.ZERO }
+    if self.bits > 64 { return 2 }
+    return usize.ONE
+  }
+
+  /// The elements of a vector, or one for a scalar.
+  pub fn count(self: Self) -> usize {
+    if self.elements == usize.ZERO { return usize.ONE }
+    return self.elements
+  }
+
+  /// Every lane of the value.
+  pub fn lanes(self: Self) -> usize { return self.parts() * self.count() }
+
+  /// The bytes one element occupies in memory: a `bool`'s byte, or the store size.
+  pub fn elementBytes(self: Self) -> usize {
+    if self.bits <= 8 { return usize.ONE }
+    return (self.bits + 7) / 8
+  }
+
+  /// The bytes a store of the whole value writes: a vector of `bool`s is packed bits.
+  pub fn storeSize(self: Self) -> usize {
+    if self.lane == 0 { return usize.ZERO }
+    if self.elements == usize.ZERO { return self.elementBytes() }
+    if self.bits % 8 != usize.ZERO { return (self.elements * self.bits + 7) / 8 }
+    return self.elements * self.elementBytes()
+  }
+}
+
+/// A unit value's handle: it has no lanes.
+pub fn none() -> u64 { return u64.MAX }
+
+// Value forms.
+fn formLocal() -> u8 { return 0 }
+fn formConstant() -> u8 { return 1 }
+fn formSymbol() -> u8 { return 2 }
+fn formFrame() -> u8 { return 3 }
+fn formLocalSymbol() -> u8 { return 4 }
+
+/// One value: its kind and where its lanes are.
+struct Slot {
+  kind: Kind,
+  form: u8,
+  /// The first wasm local of a local value, or the frame base local of a frame slot.
+  local: usize,
+  /// A constant's bits, an `i128`'s low lane, or the addend of an address.
+  low: u64,
+  /// An `i128` constant's high lane.
+  high: u64,
+  /// The index in the body's symbols of an address.
+  symbol: usize,
+}
+
+impl Copy for Slot {}
+
+/// Straight-line code and what it leaves to the link.
+struct Emission {
+  code: Bytes,
+  relocations: List<Relocation>,
+  /// Pairs of an offset in `code` and a source place, by offset.
+  locations: List<u64>,
+}
+
+fn emission() -> Emission {
+  return Emission {code: Bytes.make(), relocations: List<Relocation>.make(), locations: List<u64>.make()}
+}
+
+// How a block ends.
+fn exitNone() -> u8 { return 0 }
+fn exitJump() -> u8 { return 1 }
+fn exitBranch() -> u8 { return 2 }
+fn exitSwitch() -> u8 { return 3 }
+fn exitReturn() -> u8 { return 4 }
+fn exitTrap() -> u8 { return 5 }
+
+/// One basic block: its code, `[start, end)` of the body's straight-line code, with its
+/// relocations and locations, and its exit.
+struct Piece {
+  started: bool,
+  start: usize,
+  end: usize,
+  relocationStart: usize,
+  relocationEnd: usize,
+  locationStart: usize,
+  locationEnd: usize,
+  exit: u8,
+  /// A branch's condition, a switch's value or a return's value.
+  value: u64,
+  /// A jump's target, or a branch's when the condition holds, or a switch's default.
+  first: usize,
+  /// A branch's target when the condition does not hold.
+  second: usize,
+  /// A switch's cases: pairs of a value's bits and its target.
+  cases: List<u64>,
+  /// The source place of the exit.
+  place: u64,
+}
+
+/// A body under construction.
+pub struct Body {
+  symbol: Bytes,
+  /// Addresses are `i64`: the memory is a 64-bit one.
+  wide: bool,
+  /// The memory is shared between threads.
+  threaded: bool,
+  parameters: List<u8>,
+  results: List<u8>,
+  /// The lane types of the declared locals after the parameters.
+  locals: List<u8>,
+  slots: List<Slot>,
+  pieces: List<Piece>,
+  /// The block code is going into, the first block started, or `usize.MAX`.
+  current: usize,
+  entry: usize,
+  straight: Emission,
+  symbols: List<Bytes>,
+  signatures: List<Bytes>,
+  /// The frame: its size so far, its base local and the stack pointer at entry, or `usize.MAX`
+  /// before anything needs one.
+  frameSize: u64,
+  frame: usize,
+  saved: usize,
+  /// The source place of the code emitted next.
+  place: u64,
+}
+
+impl Body {
+  /// A body defining `symbol`, for a memory whose addresses are 64-bit when `wide` and which
+  /// threads share when `threaded`.
+  pub effect fn make(symbol: &[u8], wide: bool, threaded: bool) -> Body ! OutOfMemoryError ? &mut Allocator {
+    return Body {symbol: run Bytes.copy(symbol), wide: wide, threaded: threaded, parameters: List<u8>.make(), results: List<u8>.make(),
+      locals: List<u8>.make(), slots: List<Slot>.make(), pieces: List<Piece>.make(), current: usize.MAX, entry: usize.MAX,
+      straight: emission(), symbols: List<Bytes>.make(), signatures: List<Bytes>.make(), frameSize: 0, frame: usize.MAX,
+      saved: usize.MAX, place: 0}
+  }
+
+  /// The symbol the body defines.
+  pub fn name(self: &Self) -> &[u8] { return Bytes.asSlice(&self.symbol) }
+
+  /// The kind of an address.
+  pub fn address(self: &Self) -> Kind {
+    if self.wide { return Kind.integer(64) }
+    return Kind.integer(32)
+  }
+
+  /// Whether addresses are 64-bit.
+  pub fn wideAddresses(self: &Self) -> bool { return self.wide }
+
+  /// Whether the memory is shared between threads.
+  pub fn isThreaded(self: &Self) -> bool { return self.threaded }
+
+  /// Adds a parameter of `kind` after the others; answers its value.
+  pub effect fn parameter(self: &mut Self, kind: Kind) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    if List<u8>.length(&self.locals) != usize.ZERO { return CompilerBug.panic(b"WasmBody: a parameter after a local") }
+    let first = List<u8>.length(&self.parameters)
+    let lanes = kind.lanes()
+    let mut at = usize.ZERO
+    while at < lanes {
+      run List<u8>.append(&mut self.parameters, kind.lane)
+      at = at + usize.ONE
+    }
+    if lanes == usize.ZERO { return none() }
+    return run addSlot(&mut self.*, Slot {kind: kind, form: formLocal(), local: first, low: 0, high: 0, symbol: usize.ZERO})
+  }
+
+  /// Sets the body's result to a value of `kind`; a unit result returns nothing.
+  pub effect fn result(self: &mut Self, kind: Kind) -> () ! OutOfMemoryError ? &mut Allocator {
+    List<u8>.clear(&mut self.results)
+    let lanes = kind.lanes()
+    let mut at = usize.ZERO
+    while at < lanes {
+      run List<u8>.append(&mut self.results, kind.lane)
+      at = at + usize.ONE
+    }
+    return ()
+  }
+
+  /// The kind of value `value`.
+  pub fn kindOf(self: &Self, value: u64) -> Kind {
+    if value == none() { return Kind.unit() }
+    return List<Slot>.get(&self.slots, u64.toUsize(value)).kind
+  }
+
+  /// Whether `value` is a constant, and its bits when it is.
+  pub fn isConstant(self: &Self, value: u64) -> bool {
+    if value == none() { return false }
+    return List<Slot>.get(&self.slots, u64.toUsize(value)).form == formConstant()
+  }
+
+  pub fn constantBits(self: &Self, value: u64) -> u64 {
+    return List<Slot>.get(&self.slots, u64.toUsize(value)).low
+  }
+}
+
+effect fn addSlot(body: &mut Body, slot: Slot) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let index = List<Slot>.length(&body.slots)
+  run List<Slot>.append(&mut body.*.slots, slot)
+  return usize.toU64(index)
+}
+
+effect fn addLocal(body: &mut Body, ty: u8) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let index = List<u8>.length(&body.parameters) + List<u8>.length(&body.locals)
+  run List<u8>.append(&mut body.*.locals, ty)
+  return index
+}
+
+// A new value of `kind` in fresh locals.
+effect fn fresh(body: &mut Body, kind: Kind) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let lanes = kind.lanes()
+  if lanes == usize.ZERO { return none() }
+  let first = List<u8>.length(&body.parameters) + List<u8>.length(&body.locals)
+  let mut at = usize.ZERO
+  while at < lanes {
+    run List<u8>.append(&mut body.*.locals, kind.lane)
+    at = at + usize.ONE
+  }
+  return run addSlot(&mut body.*, Slot {kind: kind, form: formLocal(), local: first, low: 0, high: 0, symbol: usize.ZERO})
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// `value`'s low `bits` bits.
+pub fn masked(value: u64, bits: usize) -> u64 {
+  if bits >= 64 { return value }
+  return value & (u64.shiftLeft(1, usize.toU64(bits)) - 1)
+}
+
+fn alignUp(value: u64, alignment: u64) -> u64 {
+  if alignment <= 1 { return value }
+  return (value + alignment - 1) / alignment * alignment
+}
+
+/// The bits of the `float` nearest below the `double` whose bits are `double`, as a conversion
+/// of a constant truncates them.
+pub fn singleBits(double: u64) -> u64 {
+  let sign = u64.shiftLeft(u64.shiftRight(double, 63), 31)
+  let exponent = u64.bitAnd(u64.shiftRight(double, 52), 2047)
+  let mantissa = u64.bitAnd(double, 4503599627370495)
+  if exponent == 2047 {
+    let mut kept = u64.shiftRight(mantissa, 29)
+    if mantissa != 0 && kept == 0 { kept = 1 }
+    return u64.bitOr(sign, u64.bitOr(2139095040, kept))
+  }
+  if exponent == 0 { return sign }
+  if exponent > 896 {
+    return u64.bitOr(sign, u64.bitOr(u64.shiftLeft(exponent - 896, 23), u64.shiftRight(mantissa, 29)))
+  }
+  // A subnormal single.
+  let shift = 29 + (897 - exponent)
+  if shift >= 64 { return sign }
+  return u64.bitOr(sign, u64.shiftRight(u64.bitOr(mantissa, 4503599627370496), shift))
+}
+
+// Code.
+
+effect fn op(out: &mut Emission, code: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run WasmModule.op(&mut out.*.code, code)
+}
+
+effect fn relocate(out: &mut Emission, kind: RelocationKind, target: usize, addend: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let offset = Bytes.length(&out.code)
+  return run List<Relocation>.append(&mut out.*.relocations, Relocation {offset: offset, kind: kind, target: target, addend: addend})
+}
+
+// Marks the code emitted next as coming from source place `place`, unless it is unknown or the
+// current one.
+effect fn locateIn(out: &mut Emission, place: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let count = List<u64>.length(&out.locations)
+  if place == 0 || (count > usize.ZERO && List<u64>.get(&out.locations, count - usize.ONE) == place) { return () }
+  let offset = usize.toU64(Bytes.length(&out.code))
+  if count > usize.ZERO && List<u64>.get(&out.locations, count - 2) == offset {
+    return List<u64>.set(&mut out.*.locations, count - usize.ONE, place)
+  }
+  run List<u64>.append(&mut out.*.locations, offset)
+  return run List<u64>.append(&mut out.*.locations, place)
+}
+
+effect fn emit(body: &mut Body, code: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run WasmModule.op(&mut body.*.straight.code, code)
+}
+
+effect fn emitPrefixed(body: &mut Body, prefix: u8, code: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run WasmModule.prefixed(&mut body.*.straight.code, prefix, code)
+}
+
+effect fn emitIndex(body: &mut Body, value: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run WasmModule.index(&mut body.*.straight.code, value)
+}
+
+effect fn localGet(body: &mut Body, local: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run WasmModule.localGet(&mut body.*.straight.code, local)
+}
+
+effect fn localSet(body: &mut Body, local: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run WasmModule.localSet(&mut body.*.straight.code, local)
+}
+
+effect fn localTee(body: &mut Body, local: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run WasmModule.localTee(&mut body.*.straight.code, local)
+}
+
+effect fn i32Const(body: &mut Body, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run WasmModule.i32Const(&mut body.*.straight.code, value)
+}
+
+effect fn i64Const(body: &mut Body, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run WasmModule.i64Const(&mut body.*.straight.code, value)
+}
+
+// Pushes the address-sized constant `value`.
+effect fn addressConst(body: &mut Body, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if body.wide { return run i64Const(&mut body.*, value) }
+  return run i32Const(&mut body.*, value)
+}
+
+// The opcode of the `i32` integer instruction `narrow` for addresses: `narrow` itself, or its
+// `i64` counterpart in a 64-bit memory.
+fn addressCodeOf(wide: bool, narrow: u8) -> u8 {
+  if !wide { return narrow }
+  // Arithmetic and bitwise operations: `i32.add` 0x6A to `i32.rotr` 0x78 pair with 0x7C on.
+  if narrow >= 0x6A && narrow <= 0x78 { return narrow + 0x12 }
+  // Tests and comparisons: `i32.eqz` 0x45 to `i32.ge_u` 0x4F pair with 0x50 on.
+  if narrow >= 0x45 && narrow <= 0x4F { return narrow + 0x0B }
+  return narrow
+}
+
+effect fn addressOp(body: &mut Body, narrow: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  let code = addressCodeOf(body.wide, narrow)
+  return run emit(&mut body.*, code)
+}
+
+// The index in the body's symbols of `name`, adding it on first use.
+effect fn symbolIndex(body: &mut Body, name: &[u8]) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let listed = List<Bytes>.asSlice(&body.symbols)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if same(Bytes.asSlice(&listed[at]), name) { return at }
+    at = at + usize.ONE
+  }
+  let index = listed.length
+  run List<Bytes>.append(&mut body.*.symbols, run Bytes.copy(name))
+  return index
+}
+
+// The index in the body's signatures of the function type encoded as `encoding`.
+effect fn signatureIndex(body: &mut Body, encoding: &[u8]) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let listed = List<Bytes>.asSlice(&body.signatures)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if same(Bytes.asSlice(&listed[at]), encoding) { return at }
+    at = at + usize.ONE
+  }
+  let index = listed.length
+  run List<Bytes>.append(&mut body.*.signatures, run Bytes.copy(encoding))
+  return index
+}
+
+// Values.
+
+/// The constant `bits` of `kind`, every element `bits` for a vector. An `i128`'s high lane is the
+/// sign of `bits`; a float's bits are binary64 and narrow to a `float`'s.
+pub effect fn constant(body: &mut Body, kind: Kind, bits: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  if kind.isUnit() { return none() }
+  let mut low = bits
+  let mut high: u64 = 0
+  if kind.floating {
+    if kind.bits == 32 { low = singleBits(bits) }
+  } else if kind.bits > 64 {
+    if (bits & 9223372036854775808) != 0 { high = u64.MAX }
+  } else {
+    low = masked(bits, kind.bits)
+  }
+  return run addSlot(&mut body.*, Slot {kind: kind, form: formConstant(), local: usize.ZERO, low: low, high: high, symbol: usize.ZERO})
+}
+
+/// The `i128` constant whose lanes are `low` and `high`.
+pub effect fn wideConstant(body: &mut Body, low: u64, high: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  return run addSlot(&mut body.*, Slot {kind: Kind.integer(128), form: formConstant(), local: usize.ZERO, low: low, high: high, symbol: usize.ZERO})
+}
+
+/// The integer constant `value`, `bits` wide.
+pub effect fn integer(body: &mut Body, bits: usize, value: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  return run constant(&mut body.*, Kind.integer(bits), value)
+}
+
+/// The address-sized constant `value`.
+pub effect fn word(body: &mut Body, value: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let kind = body.address()
+  return run constant(&mut body.*, kind, value)
+}
+
+/// The `bool` constant `value`.
+pub effect fn flag(body: &mut Body, value: bool) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  if value { return run constant(&mut body.*, Kind.flag(), 1) }
+  return run constant(&mut body.*, Kind.flag(), 0)
+}
+
+/// The address of `symbol` plus `addend`: an object's, or a function's table slot. A threaded
+/// module's thread-local object, `local`, lies at its offset from `__tls_base`.
+pub effect fn symbolAddress(body: &mut Body, symbol: &[u8], addend: u64, local: bool) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let index = run symbolIndex(&mut body.*, symbol)
+  let mut form = formSymbol()
+  if local && body.threaded { form = formLocalSymbol() }
+  let kind = body.address()
+  return run addSlot(&mut body.*, Slot {kind: kind, form: form, local: usize.ZERO, low: addend, high: 0, symbol: index})
+}
+
+/// A new variable of `kind`, which `assign` sets; it starts zero.
+pub effect fn variable(body: &mut Body, kind: Kind) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  return run fresh(&mut body.*, kind)
+}
+
+/// Sets `variable` to `value`, which has its kind.
+pub effect fn assign(body: &mut Body, variable: u64, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if variable == none() { return () }
+  run push(&mut body.*, value)
+  return run pop(&mut body.*, variable)
+}
+
+/// A copy of `value` that later assignments do not change.
+pub effect fn copy(body: &mut Body, value: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let kind = body.kindOf(value)
+  let copied = run fresh(&mut body.*, kind)
+  run assign(&mut body.*, copied, value)
+  return copied
+}
+
+// Pushes lane `lane` of `slot` into `out`.
+effect fn pushSlot(out: &mut Emission, slot: Slot, lane: usize, wide: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  if slot.form == formLocal() { return run WasmModule.localGet(&mut out.*.code, slot.local + lane) }
+  if slot.form == formConstant() {
+    if slot.kind.bits > 64 && !slot.kind.floating {
+      if lane % 2 == usize.ONE { return run WasmModule.i64Const(&mut out.*.code, slot.high) }
+      return run WasmModule.i64Const(&mut out.*.code, slot.low)
+    }
+    let ty = slot.kind.lane
+    if ty == WasmModule.f32Type() { return run WasmModule.f32Const(&mut out.*.code, slot.low) }
+    if ty == WasmModule.f64Type() { return run WasmModule.f64Const(&mut out.*.code, slot.low) }
+    if ty == WasmModule.i64Type() { return run WasmModule.i64Const(&mut out.*.code, slot.low) }
+    return run WasmModule.i32Const(&mut out.*.code, slot.low)
+  }
+  if slot.form == formFrame() {
+    run WasmModule.localGet(&mut out.*.code, slot.local)
+    if slot.low != 0 {
+      if wide { run WasmModule.i64Const(&mut out.*.code, slot.low) } else { run WasmModule.i32Const(&mut out.*.code, slot.low) }
+      run op(&mut out.*, addressCodeOf(wide, 0x6A))
+    }
+    return ()
+  }
+  if slot.form == formLocalSymbol() {
+    // Each thread's copy lies at the object's offset in the thread-local block from `__tls_base`.
+    run WasmModule.globalGet(&mut out.*.code, usize.ONE)
+    run op(&mut out.*, 0x41)
+    run relocate(&mut out.*, RelocationKind.Address, slot.symbol, slot.low)
+    return run op(&mut out.*, 0x6A)
+  }
+  if wide {
+    run op(&mut out.*, 0x42)
+    return run relocate(&mut out.*, RelocationKind.WideAddress, slot.symbol, slot.low)
+  }
+  run op(&mut out.*, 0x41)
+  return run relocate(&mut out.*, RelocationKind.Address, slot.symbol, slot.low)
+}
+
+// Pushes lane `lane` of `value`.
+effect fn pushLane(body: &mut Body, value: u64, lane: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let slot = List<Slot>.get(&body.slots, u64.toUsize(value))
+  let wide = body.wide
+  return run pushSlot(&mut body.*.straight, slot, lane, wide)
+}
+
+// Pushes every lane of `value`.
+effect fn push(body: &mut Body, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value == none() { return () }
+  let lanes = body.kindOf(value).lanes()
+  let mut at = usize.ZERO
+  while at < lanes {
+    run pushLane(&mut body.*, value, at)
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Pushes lane `part` of element `element` of `value`; a scalar has one element, every element
+// of a vector is the same element of a splat condition.
+effect fn pushPart(body: &mut Body, value: u64, element: usize, part: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let kind = body.kindOf(value)
+  let mut chosen = element
+  if kind.elements == usize.ZERO { chosen = usize.ZERO }
+  return run pushLane(&mut body.*, value, chosen * kind.parts() + part)
+}
+
+// Pushes the lanes of element `element` of `value`.
+effect fn pushElement(body: &mut Body, value: u64, element: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let parts = body.kindOf(value).parts()
+  let mut part = usize.ZERO
+  while part < parts {
+    run pushPart(&mut body.*, value, element, part)
+    part = part + usize.ONE
+  }
+  return ()
+}
+
+// Pops every lane of local value `value`, last lane first.
+effect fn pop(body: &mut Body, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value == none() { return () }
+  let slot = List<Slot>.get(&body.slots, u64.toUsize(value))
+  let mut at = slot.kind.lanes()
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    run localSet(&mut body.*, slot.local + at)
+  }
+  return ()
+}
+
+// Pops the lanes of element `element` of local value `value`.
+effect fn popElement(body: &mut Body, value: u64, element: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let slot = List<Slot>.get(&body.slots, u64.toUsize(value))
+  let parts = slot.kind.parts()
+  let mut part = parts
+  while part > usize.ZERO {
+    part = part - usize.ONE
+    run localSet(&mut body.*, slot.local + element * parts + part)
+  }
+  return ()
+}
+
+// The local of lane `part` of element `element` of local value `value`.
+fn localOf(body: &Body, value: u64, element: usize, part: usize) -> usize {
+  let slot = List<Slot>.get(&body.slots, u64.toUsize(value))
+  return slot.local + element * slot.kind.parts() + part
+}
+
+// Integer helpers. A value of width `bits` narrower than its container is zero-extended.
+
+fn isWide(bits: usize) -> bool { return bits > 32 }
+
+fn widthFor(wide: bool) -> usize {
+  if wide { return 64 }
+  return 32
+}
+
+// Integer operation codes: the `i32` form, and the `i64` one a fixed distance after it.
+effect fn intOp(body: &mut Body, narrow: u8, wide: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  if wide { return run emit(&mut body.*, narrow + 0x12) }
+  return run emit(&mut body.*, narrow)
+}
+
+effect fn intCompare(body: &mut Body, narrow: u8, wide: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  if wide { return run emit(&mut body.*, narrow + 0x0B) }
+  return run emit(&mut body.*, narrow)
+}
+
+// Pushes the integer constant `value` in the container of an integer `bits` wide.
+effect fn pushInt(body: &mut Body, bits: usize, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if isWide(bits) { return run i64Const(&mut body.*, value) }
+  return run i32Const(&mut body.*, value)
+}
+
+// Masks the value on the stack to its low `bits` bits, when it is narrower than its container.
+effect fn normalize(body: &mut Body, bits: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if bits == 32 || bits == 64 || bits > 64 { return () }
+  if isWide(bits) {
+    run i64Const(&mut body.*, masked(u64.MAX, bits))
+    return run emit(&mut body.*, 0x83)
+  }
+  run i32Const(&mut body.*, masked(u64.MAX, bits))
+  return run emit(&mut body.*, 0x71)
+}
+
+// Sign-extends the value on the stack from its low `bits` bits to its whole container.
+effect fn signExtend(body: &mut Body, bits: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if bits == 32 || bits == 64 { return () }
+  if isWide(bits) {
+    run i64Const(&mut body.*, usize.toU64(64 - bits))
+    run emit(&mut body.*, 0x86)
+    run i64Const(&mut body.*, usize.toU64(64 - bits))
+    return run emit(&mut body.*, 0x87)
+  }
+  if bits == 8 { return run emit(&mut body.*, 0xC0) }
+  if bits == 16 { return run emit(&mut body.*, 0xC1) }
+  run i32Const(&mut body.*, usize.toU64(32 - bits))
+  run emit(&mut body.*, 0x74)
+  run i32Const(&mut body.*, usize.toU64(32 - bits))
+  return run emit(&mut body.*, 0x75)
+}
+
+// Pushes element `element` of integer `value` sign-extended to its container.
+effect fn pushSigned(body: &mut Body, value: u64, element: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  run pushPart(&mut body.*, value, element, usize.ZERO)
+  let width = body.kindOf(value).bits
+  return run signExtend(&mut body.*, width)
+}
+
+// Pushes element `element` of integer `value` as an `i64`, sign- or zero-extended from its width.
+effect fn pushExtended(body: &mut Body, value: u64, element: usize, signed: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  let bits = body.kindOf(value).bits
+  if signed { run pushSigned(&mut body.*, value, element) } else { run pushPart(&mut body.*, value, element, usize.ZERO) }
+  if isWide(bits) { return () }
+  if signed { return run emit(&mut body.*, 0xAC) }
+  return run emit(&mut body.*, 0xAD)
+}
+
+// Pushes integer `value` in an address's container: wrapped to `i32`, or zero-extended to `i64`.
+effect fn pushAddressSized(body: &mut Body, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let bits = body.kindOf(value).bits
+  if body.wide { return run pushExtended(&mut body.*, value, usize.ZERO, false) }
+  run pushPart(&mut body.*, value, usize.ZERO, usize.ZERO)
+  if isWide(bits) { run emit(&mut body.*, 0xA7) }
+  return ()
+}
+
+fn pick(narrow: u8, wideCode: u8, wide: bool) -> u8 {
+  if wide { return wideCode }
+  return narrow
+}
+
+/// Marks the code emitted next as coming from source place `place`, `line << 24 | column`.
+pub effect fn locate(body: &mut Body, place: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  body.place = place
+  return run locateIn(&mut body.*.straight, place)
+}
+
+// Arithmetic.
+
+/// A binary operation.
+pub enum Binary { Add, Sub, Mul, UDiv, SDiv, URem, SRem, Shl, LShr, AShr, And, Or, Xor }
+
+/// `left op right`, element by element. On floats `UDiv` and `SDiv` divide and `URem` and `SRem`
+/// are C's `fmod`.
+pub effect fn binary(body: &mut Body, operation: Binary, left: u64, right: u64) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let kind = body.kindOf(left)
+  let result = run fresh(&mut body.*, kind)
+  let count = kind.count()
+  let mut element = usize.ZERO
+  while element < count {
+    run binaryElement(&mut body.*, operation, kind.element(), left, right, element)
+    run popElement(&mut body.*, result, element)
+    element = element + usize.ONE
+  }
+  return result
+}
+
+effect fn binaryElement(body: &mut Body, operation: Binary, kind: Kind, left: u64, right: u64, element: usize) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if kind.floating {
+    let double = kind.bits == 64
+    run pushPart(&mut body.*, left, element, usize.ZERO)
+    run pushPart(&mut body.*, right, element, usize.ZERO)
+    if operation == Binary.SRem || operation == Binary.URem {
+      let mut callee: &[u8] = b"fmodf"
+      if double { callee = b"fmod" }
+      return run callSymbol(&mut body.*, callee)
+    }
+    let mut base: u8 = 0x92
+    if double { base = 0xA0 }
+    if operation == Binary.Add { return run emit(&mut body.*, base) }
+    if operation == Binary.Sub { return run emit(&mut body.*, base + 1) }
+    if operation == Binary.Mul { return run emit(&mut body.*, base + 2) }
+    return run emit(&mut body.*, base + 3)
+  }
+  let bits = kind.bits
+  if bits > 64 { return run wideBinary(&mut body.*, operation, left, right, element) }
+  let wide = isWide(bits)
+  if operation == Binary.SDiv || operation == Binary.SRem || operation == Binary.AShr {
+    run pushSigned(&mut body.*, left, element)
+    if operation == Binary.AShr { run pushPart(&mut body.*, right, element, usize.ZERO) } else { run pushSigned(&mut body.*, right, element) }
+    if operation == Binary.SDiv { run intOp(&mut body.*, 0x6D, wide) }
+    if operation == Binary.SRem { run intOp(&mut body.*, 0x6F, wide) }
+    if operation == Binary.AShr { run intOp(&mut body.*, 0x75, wide) }
+    return run normalize(&mut body.*, bits)
+  }
+  run pushPart(&mut body.*, left, element, usize.ZERO)
+  run pushPart(&mut body.*, right, element, usize.ZERO)
+  if operation == Binary.Add { run intOp(&mut body.*, 0x6A, wide) }
+  else if operation == Binary.Sub { run intOp(&mut body.*, 0x6B, wide) }
+  else if operation == Binary.Mul { run intOp(&mut body.*, 0x6C, wide) }
+  else if operation == Binary.UDiv { return run intOp(&mut body.*, 0x6E, wide) }
+  else if operation == Binary.URem { return run intOp(&mut body.*, 0x70, wide) }
+  else if operation == Binary.Shl { run intOp(&mut body.*, 0x74, wide) }
+  else if operation == Binary.LShr { return run intOp(&mut body.*, 0x76, wide) }
+  else if operation == Binary.And { return run intOp(&mut body.*, 0x71, wide) }
+  else if operation == Binary.Or { return run intOp(&mut body.*, 0x72, wide) }
+  else { return run intOp(&mut body.*, 0x73, wide) }
+  return run normalize(&mut body.*, bits)
+}
+
+// A binary operation on an `i128`, as two `i64` lanes, low first.
+effect fn wideBinary(body: &mut Body, operation: Binary, left: u64, right: u64, element: usize) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if body.kindOf(left).bits != 128 { run WasmObject.unsupported(b"an integer wider than 64 bits", Bytes.asSlice(&body.symbol)) }
+  if operation == Binary.And || operation == Binary.Or || operation == Binary.Xor {
+    let mut code: u8 = 0x83
+    if operation == Binary.Or { code = 0x84 }
+    if operation == Binary.Xor { code = 0x85 }
+    run pushPart(&mut body.*, left, element, usize.ZERO)
+    run pushPart(&mut body.*, right, element, usize.ZERO)
+    run emit(&mut body.*, code)
+    run pushPart(&mut body.*, left, element, usize.ONE)
+    run pushPart(&mut body.*, right, element, usize.ONE)
+    return run emit(&mut body.*, code)
+  }
+  if operation == Binary.Add || operation == Binary.Sub {
+    let low = run addLocal(&mut body.*, WasmModule.i64Type())
+    run pushPart(&mut body.*, left, element, usize.ZERO)
+    run pushPart(&mut body.*, right, element, usize.ZERO)
+    if operation == Binary.Add { run emit(&mut body.*, 0x7C) } else { run emit(&mut body.*, 0x7D) }
+    run localTee(&mut body.*, low)
+    // The high lane, with the carry or borrow of the low one.
+    run pushPart(&mut body.*, left, element, usize.ONE)
+    run pushPart(&mut body.*, right, element, usize.ONE)
+    if operation == Binary.Add {
+      run emit(&mut body.*, 0x7C)
+      run localGet(&mut body.*, low)
+      run pushPart(&mut body.*, left, element, usize.ZERO)
+      run emit(&mut body.*, 0x54)
+      run emit(&mut body.*, 0xAD)
+      return run emit(&mut body.*, 0x7C)
+    }
+    run emit(&mut body.*, 0x7D)
+    run pushPart(&mut body.*, left, element, usize.ZERO)
+    run pushPart(&mut body.*, right, element, usize.ZERO)
+    run emit(&mut body.*, 0x54)
+    run emit(&mut body.*, 0xAD)
+    return run emit(&mut body.*, 0x7D)
+  }
+  if operation == Binary.Mul {
+    // `__multi3(result, leftLow, leftHigh, rightLow, rightHigh)` writes the product to a scratch
+    // slot below the stack pointer.
+    let addressLane = body.address().lane
+    let scratch = run addLocal(&mut body.*, addressLane)
+    run WasmModule.globalGet(&mut body.*.straight.code, usize.ZERO)
+    run addressConst(&mut body.*, 16)
+    run addressOp(&mut body.*, 0x6B)
+    run localTee(&mut body.*, scratch)
+    run WasmModule.globalSet(&mut body.*.straight.code, usize.ZERO)
+    run localGet(&mut body.*, scratch)
+    run pushElement(&mut body.*, left, element)
+    run pushElement(&mut body.*, right, element)
+    run callSymbol(&mut body.*, b"__multi3")
+    run localGet(&mut body.*, scratch)
+    run WasmModule.memoryAccess(&mut body.*.straight.code, 0x29, usize.ZERO, 0)
+    run localGet(&mut body.*, scratch)
+    run WasmModule.memoryAccess(&mut body.*.straight.code, 0x29, usize.ZERO, 8)
+    run localGet(&mut body.*, scratch)
+    run addressConst(&mut body.*, 16)
+    run addressOp(&mut body.*, 0x6A)
+    return run WasmModule.globalSet(&mut body.*.straight.code, usize.ZERO)
+  }
+  if operation == Binary.Shl || operation == Binary.LShr || operation == Binary.AShr {
+    return run wideShift(&mut body.*, operation, left, right, element)
+  }
+  return run WasmObject.unsupported(b"a 128-bit division", Bytes.asSlice(&body.symbol))
+}
+
+// A shift of an `i128` by `amount` modulo 128: for an amount `n` under 64, each lane takes the
+// bits the other gives up; from 64 on, one lane moves whole into the other.
+effect fn wideShift(body: &mut Body, operation: Binary, value: u64, amount: u64, element: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let low = run addLocal(&mut body.*, WasmModule.i64Type())
+  let high = run addLocal(&mut body.*, WasmModule.i64Type())
+  let count = run addLocal(&mut body.*, WasmModule.i64Type())
+  let large = run addLocal(&mut body.*, WasmModule.i32Type())
+  run pushPart(&mut body.*, value, element, usize.ZERO)
+  run localSet(&mut body.*, low)
+  run pushPart(&mut body.*, value, element, usize.ONE)
+  run localSet(&mut body.*, high)
+  run pushPart(&mut body.*, amount, element, usize.ZERO)
+  run i64Const(&mut body.*, 127)
+  run emit(&mut body.*, 0x83)
+  run localTee(&mut body.*, count)
+  run i64Const(&mut body.*, 64)
+  run emit(&mut body.*, 0x5A)
+  run localSet(&mut body.*, large)
+  if operation == Binary.Shl {
+    // Low: n < 64 ? low << n : 0.
+    run localGet(&mut body.*, low)
+    run localGet(&mut body.*, count)
+    run emit(&mut body.*, 0x86)
+    run i64Const(&mut body.*, 0)
+    run localGet(&mut body.*, large)
+    run emit(&mut body.*, 0x1B)
+    // High: n < 64 ? high << n | (low >> 1) >> (63 - n) : low << (n - 64).
+    run localGet(&mut body.*, high)
+    run localGet(&mut body.*, count)
+    run emit(&mut body.*, 0x86)
+    run localGet(&mut body.*, low)
+    run i64Const(&mut body.*, 1)
+    run emit(&mut body.*, 0x88)
+    run i64Const(&mut body.*, 63)
+    run localGet(&mut body.*, count)
+    run emit(&mut body.*, 0x7D)
+    run emit(&mut body.*, 0x88)
+    run emit(&mut body.*, 0x84)
+    run localGet(&mut body.*, low)
+    run localGet(&mut body.*, count)
+    run emit(&mut body.*, 0x86)
+    run localGet(&mut body.*, large)
+    run emit(&mut body.*, 0x1B)
+    return run emit(&mut body.*, 0x1B)
+  }
+  let mut shift: u8 = 0x88
+  if operation == Binary.AShr { shift = 0x87 }
+  // Low: n < 64 ? low >> n | (high << 1) << (63 - n) : high >> (n - 64).
+  run localGet(&mut body.*, high)
+  run localGet(&mut body.*, count)
+  run emit(&mut body.*, shift)
+  run localGet(&mut body.*, low)
+  run localGet(&mut body.*, count)
+  run emit(&mut body.*, 0x88)
+  run localGet(&mut body.*, high)
+  run i64Const(&mut body.*, 1)
+  run emit(&mut body.*, 0x86)
+  run i64Const(&mut body.*, 63)
+  run localGet(&mut body.*, count)
+  run emit(&mut body.*, 0x7D)
+  run emit(&mut body.*, 0x86)
+  run emit(&mut body.*, 0x84)
+  run localGet(&mut body.*, large)
+  run emit(&mut body.*, 0x1B)
+  // High: n < 64 ? high >> n : the sign fill or zero.
+  run localGet(&mut body.*, high)
+  run localGet(&mut body.*, count)
+  run emit(&mut body.*, shift)
+  if operation == Binary.AShr {
+    run localGet(&mut body.*, high)
+    run i64Const(&mut body.*, 63)
+    run emit(&mut body.*, 0x87)
+  } else {
+    run i64Const(&mut body.*, 0)
+  }
+  run localGet(&mut body.*, large)
+  return run emit(&mut body.*, 0x1B)
+}
+
+/// `-value` of a float, element by element.
+pub effect fn negate(body: &mut Body, value: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let kind = body.kindOf(value)
+  let result = run fresh(&mut body.*, kind)
+  let count = kind.count()
+  let mut element = usize.ZERO
+  while element < count {
+    run pushPart(&mut body.*, value, element, usize.ZERO)
+    run emit(&mut body.*, pick(0x8C, 0x9A, kind.bits == 64))
+    run popElement(&mut body.*, result, element)
+    element = element + usize.ONE
+  }
+  return result
+}
+
+/// A comparison predicate: integers' equality, unsigned and signed orders, and floats' ordered
+/// (`O`) and unordered (`U`) ones.
+pub enum Predicate { Eq, Ne, Ugt, Uge, Ult, Ule, Sgt, Sge, Slt, Sle, Oeq, One, Ogt, Oge, Olt, Ole, Ord, Ueq, Une, Ugtf, Ugef, Ultf, Ulef, Uno }
+
+/// `left predicate right`, element by element: a `bool`, or a vector of them.
+pub effect fn compare(body: &mut Body, predicate: Predicate, left: u64, right: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let kind = body.kindOf(left)
+  let result = run fresh(&mut body.*, Kind.vector(Kind.flag(), kind.elements))
+  let count = kind.count()
+  let mut element = usize.ZERO
+  while element < count {
+    run compareElement(&mut body.*, predicate, kind.element(), left, right, element)
+    run popElement(&mut body.*, result, element)
+    element = element + usize.ONE
+  }
+  return result
+}
+
+// The `i32` comparison code of integer predicate `predicate`.
+fn integerCompareCode(predicate: Predicate) -> u8 {
+  if predicate == Predicate.Eq { return 0x46 }
+  if predicate == Predicate.Ne { return 0x47 }
+  if predicate == Predicate.Ugt { return 0x4B }
+  if predicate == Predicate.Uge { return 0x4F }
+  if predicate == Predicate.Ult { return 0x49 }
+  if predicate == Predicate.Ule { return 0x4D }
+  if predicate == Predicate.Sgt { return 0x4A }
+  if predicate == Predicate.Sge { return 0x4E }
+  if predicate == Predicate.Slt { return 0x48 }
+  return 0x4C
+}
+
+fn signedPredicate(predicate: Predicate) -> bool {
+  return predicate == Predicate.Sgt || predicate == Predicate.Sge || predicate == Predicate.Slt || predicate == Predicate.Sle
+}
+
+fn unsignedOf(predicate: Predicate) -> Predicate {
+  if predicate == Predicate.Sgt { return Predicate.Ugt }
+  if predicate == Predicate.Sge { return Predicate.Uge }
+  if predicate == Predicate.Slt { return Predicate.Ult }
+  if predicate == Predicate.Sle { return Predicate.Ule }
+  return predicate
+}
+
+fn floatPredicate(predicate: Predicate) -> bool {
+  return !(predicate == Predicate.Eq || predicate == Predicate.Ne || predicate == Predicate.Ugt || predicate == Predicate.Uge
+    || predicate == Predicate.Ult || predicate == Predicate.Ule || signedPredicate(predicate))
+}
+
+effect fn compareElement(body: &mut Body, predicate: Predicate, kind: Kind, left: u64, right: u64, element: usize) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  if floatPredicate(predicate) { return run floatCompare(&mut body.*, predicate, kind, left, right, element) }
+  if kind.bits > 64 {
+    if predicate == Predicate.Eq || predicate == Predicate.Ne {
+      run pushPart(&mut body.*, left, element, usize.ZERO)
+      run pushPart(&mut body.*, right, element, usize.ZERO)
+      run emit(&mut body.*, 0x85)
+      run pushPart(&mut body.*, left, element, usize.ONE)
+      run pushPart(&mut body.*, right, element, usize.ONE)
+      run emit(&mut body.*, 0x85)
+      run emit(&mut body.*, 0x84)
+      if predicate == Predicate.Eq { return run emit(&mut body.*, 0x50) }
+      run i64Const(&mut body.*, 0)
+      return run emit(&mut body.*, 0x52)
+    }
+    // high != high ? high <pred> high : low <unsigned pred> low.
+    run pushPart(&mut body.*, left, element, usize.ONE)
+    run pushPart(&mut body.*, right, element, usize.ONE)
+    run intCompare(&mut body.*, integerCompareCode(predicate), true)
+    run pushPart(&mut body.*, left, element, usize.ZERO)
+    run pushPart(&mut body.*, right, element, usize.ZERO)
+    run intCompare(&mut body.*, integerCompareCode(unsignedOf(predicate)), true)
+    run pushPart(&mut body.*, left, element, usize.ONE)
+    run pushPart(&mut body.*, right, element, usize.ONE)
+    run emit(&mut body.*, 0x52)
+    return run emit(&mut body.*, WasmModule.opSelect())
+  }
+  let wide = kind.lane == WasmModule.i64Type()
+  if signedPredicate(predicate) {
+    run pushSigned(&mut body.*, left, element)
+    run pushSigned(&mut body.*, right, element)
+  } else {
+    run pushPart(&mut body.*, left, element, usize.ZERO)
+    run pushPart(&mut body.*, right, element, usize.ZERO)
+  }
+  return run intCompare(&mut body.*, integerCompareCode(predicate), wide)
+}
+
+// A floating comparison. An ordered predicate is wasm's own; an unordered one is the negation of
+// the opposite ordered one.
+effect fn floatCompare(body: &mut Body, predicate: Predicate, kind: Kind, left: u64, right: u64, element: usize) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let mut base: u8 = 0x5B
+  if kind.bits == 64 { base = 0x61 }
+  // Offsets from `eq`: ne 1, lt 2, gt 3, le 4, ge 5.
+  if predicate == Predicate.Ord || predicate == Predicate.Uno {
+    run pushPart(&mut body.*, left, element, usize.ZERO)
+    run pushPart(&mut body.*, left, element, usize.ZERO)
+    run emit(&mut body.*, base)
+    run pushPart(&mut body.*, right, element, usize.ZERO)
+    run pushPart(&mut body.*, right, element, usize.ZERO)
+    run emit(&mut body.*, base)
+    run emit(&mut body.*, 0x71)
+    if predicate == Predicate.Uno { return run emit(&mut body.*, 0x45) }
+    return ()
+  }
+  if predicate == Predicate.One || predicate == Predicate.Ueq {
+    run pushPart(&mut body.*, left, element, usize.ZERO)
+    run pushPart(&mut body.*, right, element, usize.ZERO)
+    run emit(&mut body.*, base + 2)
+    run pushPart(&mut body.*, left, element, usize.ZERO)
+    run pushPart(&mut body.*, right, element, usize.ZERO)
+    run emit(&mut body.*, base + 3)
+    run emit(&mut body.*, 0x72)
+    if predicate == Predicate.Ueq { return run emit(&mut body.*, 0x45) }
+    return ()
+  }
+  run pushPart(&mut body.*, left, element, usize.ZERO)
+  run pushPart(&mut body.*, right, element, usize.ZERO)
+  if predicate == Predicate.Oeq { return run emit(&mut body.*, base) }
+  if predicate == Predicate.Une { return run emit(&mut body.*, base + 1) }
+  if predicate == Predicate.Olt { return run emit(&mut body.*, base + 2) }
+  if predicate == Predicate.Ogt { return run emit(&mut body.*, base + 3) }
+  if predicate == Predicate.Ole { return run emit(&mut body.*, base + 4) }
+  if predicate == Predicate.Oge { return run emit(&mut body.*, base + 5) }
+  // ult = !oge, ugt = !ole, ule = !ogt, uge = !olt.
+  if predicate == Predicate.Ultf { run emit(&mut body.*, base + 5) }
+  if predicate == Predicate.Ugtf { run emit(&mut body.*, base + 4) }
+  if predicate == Predicate.Ulef { run emit(&mut body.*, base + 3) }
+  if predicate == Predicate.Ugef { run emit(&mut body.*, base + 2) }
+  return run emit(&mut body.*, 0x45)
+}
+
+/// `condition ? chosen : otherwise`, element by element when `condition` is a vector.
+pub effect fn select(body: &mut Body, condition: u64, chosen: u64, otherwise: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let kind = body.kindOf(chosen)
+  let result = run fresh(&mut body.*, kind)
+  let count = kind.count()
+  let parts = kind.parts()
+  let mut element = usize.ZERO
+  while element < count {
+    let mut part = usize.ZERO
+    while part < parts {
+      run pushPart(&mut body.*, chosen, element, part)
+      run pushPart(&mut body.*, otherwise, element, part)
+      run pushPart(&mut body.*, condition, element, usize.ZERO)
+      run emit(&mut body.*, WasmModule.opSelect())
+      part = part + usize.ONE
+    }
+    run popElement(&mut body.*, result, element)
+    element = element + usize.ONE
+  }
+  return result
+}
+
+/// A conversion.
+pub enum Cast { Trunc, ZExt, SExt, FPToSI, FPToUI, SIToFP, UIToFP, FPTrunc, FPExt, Bitcast, IntToPtr, PtrToInt }
+
+/// `value` converted to `output`, element by element. An address is an integer as wide as the
+/// memory's, so a pointer cast is a `ZExt` or a `Trunc`, or nothing.
+pub effect fn cast(body: &mut Body, operation: Cast, value: u64, output: Kind) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let source = body.kindOf(value)
+  if operation == Cast.IntToPtr || operation == Cast.PtrToInt { return run resize(&mut body.*, value, output.bits, false) }
+  if operation == Cast.Bitcast && source.lanes() != output.lanes() {
+    return run vectorBitcast(&mut body.*, value, output)
+  }
+  let result = run fresh(&mut body.*, output)
+  let count = output.count()
+  let mut element = usize.ZERO
+  while element < count {
+    run castElement(&mut body.*, operation, value, source.element(), output.element(), element)
+    run popElement(&mut body.*, result, element)
+    element = element + usize.ONE
+  }
+  return result
+}
+
+/// `value` as an integer of `bits`: truncated, zero-extended or kept.
+pub effect fn resize(body: &mut Body, value: u64, bits: usize, signed: bool) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let kind = body.kindOf(value)
+  if kind.bits == bits { return value }
+  let output = Kind.vector(Kind.integer(bits), kind.elements)
+  if kind.bits > bits { return run cast(&mut body.*, Cast.Trunc, value, output) }
+  if signed { return run cast(&mut body.*, Cast.SExt, value, output) }
+  return run cast(&mut body.*, Cast.ZExt, value, output)
+}
+
+effect fn castElement(body: &mut Body, operation: Cast, value: u64, source: Kind, destination: Kind, element: usize) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let sourceLane = source.lane
+  let destinationLane = destination.lane
+  if operation == Cast.Trunc {
+    run pushPart(&mut body.*, value, element, usize.ZERO)
+    if destination.bits > 64 { return run pushPart(&mut body.*, value, element, usize.ONE) }
+    if sourceLane == WasmModule.i64Type() && destinationLane == WasmModule.i32Type() { run emit(&mut body.*, 0xA7) }
+    return run normalize(&mut body.*, destination.bits)
+  }
+  if operation == Cast.ZExt || operation == Cast.SExt {
+    let signed = operation == Cast.SExt
+    if destination.bits > 64 {
+      let low = run addLocal(&mut body.*, WasmModule.i64Type())
+      run pushExtended(&mut body.*, value, element, signed)
+      run localTee(&mut body.*, low)
+      if signed {
+        run localGet(&mut body.*, low)
+        run i64Const(&mut body.*, 63)
+        return run emit(&mut body.*, 0x87)
+      }
+      return run i64Const(&mut body.*, 0)
+    }
+    if signed { run pushSigned(&mut body.*, value, element) } else { run pushPart(&mut body.*, value, element, usize.ZERO) }
+    if sourceLane == WasmModule.i32Type() && destinationLane == WasmModule.i64Type() {
+      if signed { run emit(&mut body.*, 0xAC) } else { run emit(&mut body.*, 0xAD) }
+    }
+    if signed { return run normalize(&mut body.*, destination.bits) }
+    return ()
+  }
+  if operation == Cast.FPToSI || operation == Cast.FPToUI {
+    run pushPart(&mut body.*, value, element, usize.ZERO)
+    let bits = destination.bits
+    if bits > 64 { run WasmObject.unsupported(b"a float conversion to a 128-bit integer", Bytes.asSlice(&body.symbol)) }
+    // A narrow result converts through `i32`, signed, then keeps its low bits.
+    let mut code: u64 = 0
+    if operation == Cast.FPToUI && (bits == 32 || bits == 64) { code = 1 }
+    if sourceLane == WasmModule.f64Type() { code = code + 2 }
+    if isWide(bits) { code = code + 4 }
+    run emitPrefixed(&mut body.*, 0xFC, code)
+    return run normalize(&mut body.*, bits)
+  }
+  if operation == Cast.SIToFP || operation == Cast.UIToFP {
+    if source.bits > 64 { run WasmObject.unsupported(b"a 128-bit integer conversion to a float", Bytes.asSlice(&body.symbol)) }
+    let signed = operation == Cast.SIToFP
+    if signed { run pushSigned(&mut body.*, value, element) } else { run pushPart(&mut body.*, value, element, usize.ZERO) }
+    let mut code: u8 = 0xB2
+    if destinationLane == WasmModule.f64Type() { code = 0xB7 }
+    if !signed { code = code + 1 }
+    if sourceLane == WasmModule.i64Type() { code = code + 2 }
+    return run emit(&mut body.*, code)
+  }
+  if operation == Cast.FPTrunc {
+    run pushPart(&mut body.*, value, element, usize.ZERO)
+    return run emit(&mut body.*, 0xB6)
+  }
+  if operation == Cast.FPExt {
+    run pushPart(&mut body.*, value, element, usize.ZERO)
+    return run emit(&mut body.*, 0xBB)
+  }
+  // A bitcast between scalars of one lane each.
+  if source.bits > 64 || destination.bits > 64 {
+    let parts = source.parts()
+    let mut part = usize.ZERO
+    while part < parts {
+      run pushPart(&mut body.*, value, element, part)
+      part = part + usize.ONE
+    }
+    return ()
+  }
+  run pushPart(&mut body.*, value, element, usize.ZERO)
+  if sourceLane == destinationLane { return () }
+  if sourceLane == WasmModule.f32Type() { return run emit(&mut body.*, 0xBC) }
+  if sourceLane == WasmModule.f64Type() { return run emit(&mut body.*, 0xBD) }
+  if destinationLane == WasmModule.f32Type() { return run emit(&mut body.*, 0xBE) }
+  return run emit(&mut body.*, 0xBF)
+}
+
+// A bitcast that changes the lanes, to or from a vector: the value stored below the stack
+// pointer, then loaded as the other kind. Nothing runs between the two, so the bytes are free.
+effect fn vectorBitcast(body: &mut Body, value: u64, output: Kind) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let mut size = body.kindOf(value).storeSize()
+  if output.storeSize() > size { size = output.storeSize() }
+  let addressKind = body.address()
+  let scratch = run fresh(&mut body.*, addressKind)
+  run WasmModule.globalGet(&mut body.*.straight.code, usize.ZERO)
+  run addressConst(&mut body.*, alignUp(usize.toU64(size), 16))
+  run addressOp(&mut body.*, 0x6B)
+  run pop(&mut body.*, scratch)
+  run store(&mut body.*, value, scratch, 0)
+  return run load(&mut body.*, output, scratch, 0)
+}
+
+// Memory.
+
+// The load code of a scalar element of `kind` stored in `size` bytes, or zero for none.
+fn loadCode(kind: Kind, size: usize) -> u8 {
+  if kind.lane == WasmModule.f32Type() { return 0x2A }
+  if kind.lane == WasmModule.f64Type() { return 0x2B }
+  if kind.lane == WasmModule.i64Type() {
+    if size == 8 { return 0x29 }
+    if size == 4 { return 0x35 }
+    if size == 2 { return 0x33 }
+    if size == 1 { return 0x31 }
+    return 0
+  }
+  if size == 1 { return 0x2D }
+  if size == 2 { return 0x2F }
+  if size == 4 { return 0x28 }
+  return 0
+}
+
+fn storeCode(kind: Kind, size: usize) -> u8 {
+  if kind.lane == WasmModule.f32Type() { return 0x38 }
+  if kind.lane == WasmModule.f64Type() { return 0x39 }
+  if kind.lane == WasmModule.i64Type() {
+    if size == 8 { return 0x37 }
+    if size == 4 { return 0x3E }
+    if size == 2 { return 0x3D }
+    if size == 1 { return 0x3C }
+    return 0
+  }
+  if size == 1 { return 0x3A }
+  if size == 2 { return 0x3B }
+  if size == 4 { return 0x36 }
+  return 0
+}
+
+/// The `kind` value stored `offset` bytes past `address`. A `bool` is a byte, and a vector of
+/// `bool`s packed bits, element `i` at bit `i`.
+pub effect fn load(body: &mut Body, kind: Kind, address: u64, offset: u64) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let result = run fresh(&mut body.*, kind)
+  if kind.isUnit() { return result }
+  if kind.elements != usize.ZERO && kind.bits % 8 != usize.ZERO {
+    // One integer, then each element's bits shifted down.
+    let size = kind.storeSize()
+    let wide = size > 4
+    if size > 8 { run WasmObject.unsupported(b"a load of this vector", Bytes.asSlice(&body.symbol)) }
+    let mut packedKind = Kind.integer(32)
+    if wide { packedKind = Kind.integer(64) }
+    let packed = run addLocal(&mut body.*, packedKind.lane)
+    run pushAddressOf(&mut body.*, address)
+    run WasmModule.memoryAccess(&mut body.*.straight.code, loadCode(packedKind, size), usize.ZERO, offset)
+    run localSet(&mut body.*, packed)
+    let mut element = usize.ZERO
+    while element < kind.elements {
+      run localGet(&mut body.*, packed)
+      run pushInt(&mut body.*, widthFor(wide), usize.toU64(element * kind.bits))
+      run intOp(&mut body.*, 0x76, wide)
+      run pushInt(&mut body.*, widthFor(wide), masked(u64.MAX, kind.bits))
+      run intOp(&mut body.*, 0x71, wide)
+      if wide { run emit(&mut body.*, 0xA7) }
+      let target = localOf(&body.*, result, element, usize.ZERO)
+      run localSet(&mut body.*, target)
+      element = element + usize.ONE
+    }
+    return result
+  }
+  let element = kind.element()
+  let stride = element.elementBytes()
+  let count = kind.count()
+  let mut at = usize.ZERO
+  while at < count {
+    let place = offset + usize.toU64(at * stride)
+    if element.bits > 64 {
+      run pushAddressOf(&mut body.*, address)
+      run WasmModule.memoryAccess(&mut body.*.straight.code, 0x29, usize.ZERO, place)
+      run pushAddressOf(&mut body.*, address)
+      run WasmModule.memoryAccess(&mut body.*.straight.code, 0x29, usize.ZERO, place + 8)
+    } else {
+      let code = loadCode(element, stride)
+      if code == 0 { run WasmObject.unsupported(b"a load of this type", Bytes.asSlice(&body.symbol)) }
+      run pushAddressOf(&mut body.*, address)
+      run WasmModule.memoryAccess(&mut body.*.straight.code, code, usize.ZERO, place)
+      // A stored `bool` is a byte that holds 0 or 1; any other width keeps its own bits.
+      if element.bits != stride * 8 && element.bits != usize.ONE { run normalize(&mut body.*, element.bits) }
+    }
+    run popElement(&mut body.*, result, at)
+    at = at + usize.ONE
+  }
+  return result
+}
+
+// Pushes `address`, an address value.
+effect fn pushAddressOf(body: &mut Body, address: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run pushLane(&mut body.*, address, usize.ZERO)
+}
+
+/// Stores `value` `offset` bytes past `address`, as `load` reads it.
+pub effect fn store(body: &mut Body, value: u64, address: u64, offset: u64) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let kind = body.kindOf(value)
+  if kind.isUnit() { return () }
+  if kind.elements != usize.ZERO && kind.bits % 8 != usize.ZERO {
+    // Each element's bits shifted into place, joined into one integer.
+    let size = kind.storeSize()
+    let wide = size > 4
+    if size > 8 { run WasmObject.unsupported(b"a store of this vector", Bytes.asSlice(&body.symbol)) }
+    let mut packedKind = Kind.integer(32)
+    if wide { packedKind = Kind.integer(64) }
+    run pushAddressOf(&mut body.*, address)
+    run pushInt(&mut body.*, widthFor(wide), 0)
+    let mut element = usize.ZERO
+    while element < kind.elements {
+      run pushPart(&mut body.*, value, element, usize.ZERO)
+      if wide { run emit(&mut body.*, 0xAD) }
+      run pushInt(&mut body.*, widthFor(wide), usize.toU64(element * kind.bits))
+      run intOp(&mut body.*, 0x74, wide)
+      run intOp(&mut body.*, 0x72, wide)
+      element = element + usize.ONE
+    }
+    return run WasmModule.memoryAccess(&mut body.*.straight.code, storeCode(packedKind, size), usize.ZERO, offset)
+  }
+  let element = kind.element()
+  let stride = element.elementBytes()
+  let count = kind.count()
+  let mut at = usize.ZERO
+  while at < count {
+    let place = offset + usize.toU64(at * stride)
+    if element.bits > 64 {
+      run pushAddressOf(&mut body.*, address)
+      run pushPart(&mut body.*, value, at, usize.ZERO)
+      run WasmModule.memoryAccess(&mut body.*.straight.code, 0x37, usize.ZERO, place)
+      run pushAddressOf(&mut body.*, address)
+      run pushPart(&mut body.*, value, at, usize.ONE)
+      run WasmModule.memoryAccess(&mut body.*.straight.code, 0x37, usize.ZERO, place + 8)
+    } else {
+      let code = storeCode(element, stride)
+      if code == 0 { run WasmObject.unsupported(b"a store of this type", Bytes.asSlice(&body.symbol)) }
+      run pushAddressOf(&mut body.*, address)
+      run pushPart(&mut body.*, value, at, usize.ZERO)
+      run WasmModule.memoryAccess(&mut body.*.straight.code, code, usize.ZERO, place)
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+/// The address `offset` bytes past `base`.
+pub effect fn offset(body: &mut Body, base: u64, offset: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  if offset == 0 { return base }
+  let slot = List<Slot>.get(&body.slots, u64.toUsize(base))
+  // A constant address, a symbol's or a frame slot's folds the offset in.
+  if slot.form == formSymbol() || slot.form == formFrame() || slot.form == formLocalSymbol() || slot.form == formConstant() {
+    let mut moved = slot
+    moved.low = u64.wrappingAdd(slot.low, offset)
+    if slot.form == formConstant() { moved.low = masked(moved.low, slot.kind.bits) }
+    return run addSlot(&mut body.*, moved)
+  }
+  let kind = body.address()
+  let result = run fresh(&mut body.*, kind)
+  run pushAddressOf(&mut body.*, base)
+  run addressConst(&mut body.*, offset)
+  run addressOp(&mut body.*, 0x6A)
+  run pop(&mut body.*, result)
+  return result
+}
+
+/// The address `index` bytes past `base`, for an integer `index` as wide as an address.
+pub effect fn indexed(body: &mut Body, base: u64, index: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let kind = body.address()
+  let result = run fresh(&mut body.*, kind)
+  run pushAddressOf(&mut body.*, base)
+  run pushAddressSized(&mut body.*, index)
+  run addressOp(&mut body.*, 0x6A)
+  run pop(&mut body.*, result)
+  return result
+}
+
+/// Copies `size` bytes from `source` to `destination`; the two may overlap.
+pub effect fn copyBytes(body: &mut Body, destination: u64, source: u64, size: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  run pushAddressOf(&mut body.*, destination)
+  run pushAddressOf(&mut body.*, source)
+  run addressConst(&mut body.*, size)
+  run emitPrefixed(&mut body.*, 0xFC, 10)
+  run WasmModule.byte(&mut body.*.straight.code, 0)
+  return run WasmModule.byte(&mut body.*.straight.code, 0)
+}
+
+/// Copies `size` bytes, an address-sized value, from `source` to `destination`.
+pub effect fn copyCounted(body: &mut Body, destination: u64, source: u64, size: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  run pushAddressOf(&mut body.*, destination)
+  run pushAddressOf(&mut body.*, source)
+  run pushAddressSized(&mut body.*, size)
+  run emitPrefixed(&mut body.*, 0xFC, 10)
+  run WasmModule.byte(&mut body.*.straight.code, 0)
+  return run WasmModule.byte(&mut body.*.straight.code, 0)
+}
+
+/// Sets `size` bytes at `destination` to `byte`.
+pub effect fn fill(body: &mut Body, destination: u64, byte: u8, size: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  run pushAddressOf(&mut body.*, destination)
+  run i32Const(&mut body.*, u8.toU64(byte))
+  run addressConst(&mut body.*, size)
+  run emitPrefixed(&mut body.*, 0xFC, 11)
+  return run WasmModule.byte(&mut body.*.straight.code, 0)
+}
+
+/// Sets `size` bytes, an address-sized value, at `destination` to the low byte of `value`.
+pub effect fn fillCounted(body: &mut Body, destination: u64, value: u64, size: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  run pushAddressOf(&mut body.*, destination)
+  run pushPart(&mut body.*, value, usize.ZERO, usize.ZERO)
+  run pushAddressSized(&mut body.*, size)
+  run emitPrefixed(&mut body.*, 0xFC, 11)
+  return run WasmModule.byte(&mut body.*.straight.code, 0)
+}
+
+// The frame.
+
+/// A slot of `size` bytes aligned to `alignment` in the function's frame.
+pub effect fn slot(body: &mut Body, size: u64, alignment: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  run needFrame(&mut body.*)
+  body.frameSize = alignUp(body.frameSize, alignment)
+  let at = body.frameSize
+  body.frameSize = body.frameSize + size
+  let kind = body.address()
+  let frame = body.frame
+  return run addSlot(&mut body.*, Slot {kind: kind, form: formFrame(), local: frame, low: at, high: 0, symbol: usize.ZERO})
+}
+
+effect fn needFrame(body: &mut Body) -> () ! OutOfMemoryError ? &mut Allocator {
+  if body.frame != usize.MAX { return () }
+  let lane = body.address().lane
+  body.saved = run addLocal(&mut body.*, lane)
+  body.frame = run addLocal(&mut body.*, lane)
+  return ()
+}
+
+/// The address of the function's frame, which every call made while it runs lies below.
+pub effect fn frameAddress(body: &mut Body) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  run needFrame(&mut body.*)
+  let kind = body.address()
+  let frame = body.frame
+  return run addSlot(&mut body.*, Slot {kind: kind, form: formFrame(), local: frame, low: 0, high: 0, symbol: usize.ZERO})
+}
+
+/// `count` bytes, an address-sized value, below the stack pointer, aligned to at least 16; the
+/// function's return gives them back.
+pub effect fn dynamicSlot(body: &mut Body, count: u64, alignment: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  run needFrame(&mut body.*)
+  let kind = body.address()
+  let result = run fresh(&mut body.*, kind)
+  run WasmModule.globalGet(&mut body.*.straight.code, usize.ZERO)
+  run pushAddressSized(&mut body.*, count)
+  run addressOp(&mut body.*, 0x6B)
+  let mut mask = alignment
+  if mask < 16 { mask = 16 }
+  run addressConst(&mut body.*, u64.wrappingSubtract(0, mask))
+  run addressOp(&mut body.*, 0x71)
+  let target = localOf(&body.*, result, usize.ZERO, usize.ZERO)
+  run localTee(&mut body.*, target)
+  run WasmModule.globalSet(&mut body.*.straight.code, usize.ZERO)
+  return result
+}
+
+/// The global `index` of the module: 0 is `__stack_pointer`, 1 a threaded module's `__tls_base`.
+pub effect fn globalGet(body: &mut Body, index: usize, kind: Kind) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let result = run fresh(&mut body.*, kind)
+  run WasmModule.globalGet(&mut body.*.straight.code, index)
+  run pop(&mut body.*, result)
+  return result
+}
+
+/// Sets the module's global `index` to `value`.
+pub effect fn globalSet(body: &mut Body, index: usize, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  run push(&mut body.*, value)
+  return run WasmModule.globalSet(&mut body.*.straight.code, index)
+}
+
+// Calls.
+
+// The lane types of `values`.
+effect fn appendLaneTypes(body: &Body, values: &[u64], out: &mut List<u8>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < values.length {
+    let kind = body.kindOf(values[at])
+    let lanes = kind.lanes()
+    let mut lane = usize.ZERO
+    while lane < lanes {
+      run List<u8>.append(&mut out.*, kind.lane)
+      lane = lane + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+/// The wasm type of a function over `parameters` returning `result`.
+pub effect fn signatureOf(parameters: &[Kind], result: Kind) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut lanes = List<u8>.make()
+  let mut at = usize.ZERO
+  while at < parameters.length {
+    let lanesOf = parameters[at].lanes()
+    let mut lane = usize.ZERO
+    while lane < lanesOf {
+      run List<u8>.append(&mut lanes, parameters[at].lane)
+      lane = lane + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  let mut results = List<u8>.make()
+  let resultLanes = result.lanes()
+  at = usize.ZERO
+  while at < resultLanes {
+    run List<u8>.append(&mut results, result.lane)
+    at = at + usize.ONE
+  }
+  return run WasmObject.signature(List<u8>.asSlice(&lanes), List<u8>.asSlice(&results))
+}
+
+// `call` of the function `symbol`, with its arguments pushed.
+effect fn callSymbol(body: &mut Body, symbol: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let target = run symbolIndex(&mut body.*, symbol)
+  run emit(&mut body.*, WasmModule.opCall())
+  return run relocate(&mut body.*.straight, RelocationKind.Call, target, 0)
+}
+
+/// Calls the function `symbol` with `arguments`; answers its `result`.
+pub effect fn call(body: &mut Body, symbol: &[u8], arguments: &[u64], result: Kind) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < arguments.length {
+    run push(&mut body.*, arguments[at])
+    at = at + usize.ONE
+  }
+  run callSymbol(&mut body.*, symbol)
+  let value = run fresh(&mut body.*, result)
+  run pop(&mut body.*, value)
+  return value
+}
+
+/// Calls the function at address `callee`, its table slot, with `arguments`; answers its
+/// `result`.
+pub effect fn callIndirect(body: &mut Body, callee: u64, arguments: &[u64], result: Kind) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let mut lanes = List<u8>.make()
+  run appendLaneTypes(&body.*, arguments, &mut lanes)
+  let mut results = List<u8>.make()
+  let resultLanes = result.lanes()
+  let mut at = usize.ZERO
+  while at < resultLanes {
+    run List<u8>.append(&mut results, result.lane)
+    at = at + usize.ONE
+  }
+  let signature = run WasmObject.signature(List<u8>.asSlice(&lanes), List<u8>.asSlice(&results))
+  at = usize.ZERO
+  while at < arguments.length {
+    run push(&mut body.*, arguments[at])
+    at = at + usize.ONE
+  }
+  run pushLane(&mut body.*, callee, usize.ZERO)
+  // The table stays 32-bit in a 64-bit memory: a function's address is its table index.
+  if body.wide { run emit(&mut body.*, 0xA7) }
+  let target = run signatureIndex(&mut body.*, Bytes.asSlice(&signature))
+  run emit(&mut body.*, WasmModule.opCallIndirect())
+  run relocate(&mut body.*.straight, RelocationKind.Signature, target, 0)
+  run emitIndex(&mut body.*, usize.ZERO)
+  let value = run fresh(&mut body.*, result)
+  run pop(&mut body.*, value)
+  return value
+}
+
+/// Calls the variadic C function `symbol` with its `fixed` arguments and its variadic `tail`: the
+/// WebAssembly C ABI stores the tail in a block on the linear-memory stack, each argument at its
+/// own alignment, and passes the block's address after the fixed arguments.
+pub effect fn callVariadic(body: &mut Body, symbol: &[u8], fixed: &[u64], tail: &[u64], result: Kind) -> u64
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let mut offsets = List<u64>.make()
+  let mut size: u64 = 0
+  let mut at = usize.ZERO
+  while at < tail.length {
+    let kind = body.kindOf(tail[at])
+    let bytes = usize.toU64(kind.storeSize())
+    let mut alignment = bytes
+    if alignment > 16 { alignment = 16 }
+    size = alignUp(size, alignment)
+    run List<u64>.append(&mut offsets, size)
+    size = size + bytes
+    at = at + usize.ONE
+  }
+  let kind = body.address()
+  let saved = run globalGet(&mut body.*, usize.ZERO, kind)
+  let block = run fresh(&mut body.*, kind)
+  run push(&mut body.*, saved)
+  run addressConst(&mut body.*, alignUp(size, 16))
+  run addressOp(&mut body.*, 0x6B)
+  let target = localOf(&body.*, block, usize.ZERO, usize.ZERO)
+  run localTee(&mut body.*, target)
+  run WasmModule.globalSet(&mut body.*.straight.code, usize.ZERO)
+  at = usize.ZERO
+  while at < tail.length {
+    run store(&mut body.*, tail[at], block, List<u64>.get(&offsets, at))
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < fixed.length {
+    run push(&mut body.*, fixed[at])
+    at = at + usize.ONE
+  }
+  run push(&mut body.*, block)
+  run callSymbol(&mut body.*, symbol)
+  let value = run fresh(&mut body.*, result)
+  run pop(&mut body.*, value)
+  // The block is the caller's until the call returns.
+  run globalSet(&mut body.*, usize.ZERO, saved)
+  return value
+}
+
+// Intrinsics.
+
+/// The wrapped result of `operation`, `Add`, `Sub` or `Mul`, and whether the exact result did
+/// not fit, as `{s,u}{add,sub,mul}.with.overflow`.
+pub struct Checked {
+  pub value: u64,
+  pub overflow: u64,
+}
+
+impl Copy for Checked {}
+
+/// `left operation right` with its overflow flag. Under 64 bits the exact result is computed in
+/// `i64`; at 64 bits the overflow is derived from the operands and the wrapped result.
+pub effect fn overflowing(body: &mut Body, operation: Binary, signed: bool, left: u64, right: u64) -> Checked
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let kind = body.kindOf(left)
+  let bits = kind.bits
+  if bits > 64 || (operation == Binary.Mul && bits > 32 && bits < 64) {
+    run WasmObject.unsupported(b"an overflow check of this width", Bytes.asSlice(&body.symbol))
+  }
+  // A vector's check is each element's, with a flag per element.
+  if kind.elements != usize.ZERO {
+    let zero = run constant(&mut body.*, kind.element(), 0)
+    let clear = run constant(&mut body.*, Kind.flag(), 0)
+    let mut values = run splat(&mut body.*, zero, kind.elements)
+    let mut flags = run splat(&mut body.*, clear, kind.elements)
+    let mut at = usize.ZERO
+    while at < kind.elements {
+      let index = run constant(&mut body.*, Kind.integer(32), usize.toU64(at))
+      let leftElement = run extractElement(&mut body.*, left, index)
+      let rightElement = run extractElement(&mut body.*, right, index)
+      let checked = run overflowing(&mut body.*, operation, signed, leftElement, rightElement)
+      values = run insertElement(&mut body.*, values, checked.value, index)
+      flags = run insertElement(&mut body.*, flags, checked.overflow, index)
+      at = at + usize.ONE
+    }
+    return Checked {value: values, overflow: flags}
+  }
+  let result = run fresh(&mut body.*, kind)
+  let flagged = run fresh(&mut body.*, Kind.flag())
+  let first = localOf(&body.*, result, usize.ZERO, usize.ZERO)
+  let flag = localOf(&body.*, flagged, usize.ZERO, usize.ZERO)
+  if bits < 64 {
+    let exact = run addLocal(&mut body.*, WasmModule.i64Type())
+    run pushExtended(&mut body.*, left, usize.ZERO, signed)
+    run pushExtended(&mut body.*, right, usize.ZERO, signed)
+    run wideOp(&mut body.*, operation)
+    run localTee(&mut body.*, exact)
+    if !isWide(bits) { run emit(&mut body.*, 0xA7) }
+    run normalize(&mut body.*, bits)
+    run localSet(&mut body.*, first)
+    if signed {
+      run localGet(&mut body.*, exact)
+      run i64Const(&mut body.*, usize.toU64(64 - bits))
+      run emit(&mut body.*, 0x86)
+      run i64Const(&mut body.*, usize.toU64(64 - bits))
+      run emit(&mut body.*, 0x87)
+      run localGet(&mut body.*, exact)
+      run emit(&mut body.*, 0x52)
+    } else {
+      run localGet(&mut body.*, exact)
+      run i64Const(&mut body.*, usize.toU64(bits))
+      run emit(&mut body.*, 0x88)
+      run i64Const(&mut body.*, 0)
+      run emit(&mut body.*, 0x52)
+    }
+    run localSet(&mut body.*, flag)
+    return Checked {value: result, overflow: flagged}
+  }
+  run push(&mut body.*, left)
+  run push(&mut body.*, right)
+  run wideOp(&mut body.*, operation)
+  run localSet(&mut body.*, first)
+  if operation == Binary.Mul {
+    if signed {
+      // The product overflowed when a is -1 and b is the least value, or a is neither 0 nor -1
+      // and r / a is not b; the divisor is 1 where it would be 0 or -1.
+      let divisor = run addLocal(&mut body.*, WasmModule.i64Type())
+      run i64Const(&mut body.*, 1)
+      run push(&mut body.*, left)
+      run push(&mut body.*, left)
+      run emit(&mut body.*, 0x50)
+      run push(&mut body.*, left)
+      run i64Const(&mut body.*, u64.MAX)
+      run emit(&mut body.*, 0x51)
+      run emit(&mut body.*, 0x72)
+      run emit(&mut body.*, WasmModule.opSelect())
+      run localSet(&mut body.*, divisor)
+      run push(&mut body.*, left)
+      run i64Const(&mut body.*, u64.MAX)
+      run emit(&mut body.*, 0x51)
+      run push(&mut body.*, right)
+      run i64Const(&mut body.*, 9223372036854775808)
+      run emit(&mut body.*, 0x51)
+      run emit(&mut body.*, 0x71)
+      run push(&mut body.*, left)
+      run i64Const(&mut body.*, 0)
+      run emit(&mut body.*, 0x52)
+      run push(&mut body.*, left)
+      run i64Const(&mut body.*, u64.MAX)
+      run emit(&mut body.*, 0x52)
+      run emit(&mut body.*, 0x71)
+      run localGet(&mut body.*, first)
+      run localGet(&mut body.*, divisor)
+      run emit(&mut body.*, 0x7F)
+      run push(&mut body.*, right)
+      run emit(&mut body.*, 0x52)
+      run emit(&mut body.*, 0x71)
+      run emit(&mut body.*, 0x72)
+    } else {
+      // a > MAX / b, with b replaced by 1 when it is 0.
+      run push(&mut body.*, left)
+      run i64Const(&mut body.*, u64.MAX)
+      run push(&mut body.*, right)
+      run push(&mut body.*, right)
+      run emit(&mut body.*, 0x50)
+      run emit(&mut body.*, 0xAD)
+      run emit(&mut body.*, 0x84)
+      run emit(&mut body.*, 0x80)
+      run emit(&mut body.*, 0x56)
+    }
+  } else if signed {
+    // Add: the result's sign differs from both operands'; subtract: the operands' signs differ
+    // and the result's differs from the left one's.
+    run push(&mut body.*, left)
+    if operation == Binary.Add { run localGet(&mut body.*, first) } else { run push(&mut body.*, right) }
+    run emit(&mut body.*, 0x85)
+    if operation == Binary.Add { run push(&mut body.*, right) } else { run push(&mut body.*, left) }
+    run localGet(&mut body.*, first)
+    run emit(&mut body.*, 0x85)
+    run emit(&mut body.*, 0x83)
+    run i64Const(&mut body.*, 0)
+    run emit(&mut body.*, 0x53)
+  } else if operation == Binary.Add {
+    run localGet(&mut body.*, first)
+    run push(&mut body.*, left)
+    run emit(&mut body.*, 0x54)
+  } else {
+    run push(&mut body.*, left)
+    run push(&mut body.*, right)
+    run emit(&mut body.*, 0x54)
+  }
+  run localSet(&mut body.*, flag)
+  return Checked {value: result, overflow: flagged}
+}
+
+// Applies `operation` to the two `i64` values on the stack.
+effect fn wideOp(body: &mut Body, operation: Binary) -> () ! OutOfMemoryError ? &mut Allocator {
+  if operation == Binary.Add { return run emit(&mut body.*, 0x7C) }
+  if operation == Binary.Sub { return run emit(&mut body.*, 0x7D) }
+  return run emit(&mut body.*, 0x7E)
+}
+
+/// `left operation right`, `Add` or `Sub`, clamped to the type's range, element by element.
+pub effect fn saturating(body: &mut Body, operation: Binary, signed: bool, left: u64, right: u64) -> u64
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let kind = body.kindOf(left)
+  let bits = kind.bits
+  if operation == Binary.Mul || bits > 64 { run WasmObject.unsupported(b"a saturating operation of this kind", Bytes.asSlice(&body.symbol)) }
+  let result = run fresh(&mut body.*, kind)
+  let count = kind.count()
+  let mut element = usize.ZERO
+  while element < count {
+    run saturatingElement(&mut body.*, operation, signed, bits, left, right, element)
+    run popElement(&mut body.*, result, element)
+    element = element + usize.ONE
+  }
+  return result
+}
+
+effect fn saturatingElement(body: &mut Body, operation: Binary, signed: bool, bits: usize, left: u64, right: u64, element: usize) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let exact = run addLocal(&mut body.*, WasmModule.i64Type())
+  if bits < 64 {
+    let mut lowest: u64 = 0
+    let mut highest: u64 = masked(u64.MAX, bits)
+    if signed {
+      lowest = u64.wrappingSubtract(0, u64.shiftLeft(1, usize.toU64(bits) - 1))
+      highest = u64.shiftLeft(1, usize.toU64(bits) - 1) - 1
+    }
+    run pushExtended(&mut body.*, left, element, signed)
+    run pushExtended(&mut body.*, right, element, signed)
+    run wideOp(&mut body.*, operation)
+    run localSet(&mut body.*, exact)
+    // max(lowest, min(highest, exact)), signed, since the exact result may be negative: the bound
+    // when the exact result passes it, else the exact result.
+    run i64Const(&mut body.*, highest)
+    run localGet(&mut body.*, exact)
+    run localGet(&mut body.*, exact)
+    run i64Const(&mut body.*, highest)
+    run emit(&mut body.*, 0x55)
+    run emit(&mut body.*, WasmModule.opSelect())
+    run localSet(&mut body.*, exact)
+    run i64Const(&mut body.*, lowest)
+    run localGet(&mut body.*, exact)
+    run localGet(&mut body.*, exact)
+    run i64Const(&mut body.*, lowest)
+    run emit(&mut body.*, 0x53)
+    run emit(&mut body.*, WasmModule.opSelect())
+    if !isWide(bits) { run emit(&mut body.*, 0xA7) }
+    return run normalize(&mut body.*, bits)
+  }
+  // At 64 bits the wrapped result is replaced by the bound its overflow passed.
+  run pushPart(&mut body.*, left, element, usize.ZERO)
+  run pushPart(&mut body.*, right, element, usize.ZERO)
+  run wideOp(&mut body.*, operation)
+  run localSet(&mut body.*, exact)
+  if signed {
+    // The bound has the left operand's sign: MAX when it is not negative, MIN otherwise.
+    run pushPart(&mut body.*, left, element, usize.ZERO)
+    run i64Const(&mut body.*, 63)
+    run emit(&mut body.*, 0x87)
+    run i64Const(&mut body.*, 9223372036854775807)
+    run emit(&mut body.*, 0x85)
+    run localGet(&mut body.*, exact)
+    // Overflow: add, the result's sign differs from both operands'; subtract, the operands'
+    // signs differ and the result's differs from the left one's.
+    run pushPart(&mut body.*, left, element, usize.ZERO)
+    if operation == Binary.Add { run localGet(&mut body.*, exact) } else { run pushPart(&mut body.*, right, element, usize.ZERO) }
+    run emit(&mut body.*, 0x85)
+    if operation == Binary.Add { run pushPart(&mut body.*, right, element, usize.ZERO) } else { run pushPart(&mut body.*, left, element, usize.ZERO) }
+    run localGet(&mut body.*, exact)
+    run emit(&mut body.*, 0x85)
+    run emit(&mut body.*, 0x83)
+    run i64Const(&mut body.*, 0)
+    run emit(&mut body.*, 0x53)
+    return run emit(&mut body.*, WasmModule.opSelect())
+  }
+  if operation == Binary.Add {
+    run i64Const(&mut body.*, u64.MAX)
+    run localGet(&mut body.*, exact)
+    run localGet(&mut body.*, exact)
+    run pushPart(&mut body.*, left, element, usize.ZERO)
+    run emit(&mut body.*, 0x54)
+    return run emit(&mut body.*, WasmModule.opSelect())
+  }
+  run i64Const(&mut body.*, 0)
+  run localGet(&mut body.*, exact)
+  run pushPart(&mut body.*, left, element, usize.ZERO)
+  run pushPart(&mut body.*, right, element, usize.ZERO)
+  run emit(&mut body.*, 0x54)
+  return run emit(&mut body.*, WasmModule.opSelect())
+}
+
+/// `value` rotated left (or right) by `amount` modulo its width, element by element.
+pub effect fn rotate(body: &mut Body, toLeft: bool, value: u64, amount: u64) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let kind = body.kindOf(value)
+  let bits = kind.bits
+  if bits > 64 || (isWide(bits) && bits != 64) { run WasmObject.unsupported(b"a rotate of this width", Bytes.asSlice(&body.symbol)) }
+  let result = run fresh(&mut body.*, kind)
+  let count = kind.count()
+  let mut element = usize.ZERO
+  while element < count {
+    if bits == 32 || bits == 64 {
+      run pushPart(&mut body.*, value, element, usize.ZERO)
+      run pushPart(&mut body.*, amount, element, usize.ZERO)
+      if toLeft { run intOp(&mut body.*, 0x77, bits == 64) } else { run intOp(&mut body.*, 0x78, bits == 64) }
+    } else {
+      // (a << s | a >> (w - s) % w) masked to w bits, with s = n % w, for a left rotate.
+      let shift = run addLocal(&mut body.*, WasmModule.i32Type())
+      run pushPart(&mut body.*, amount, element, usize.ZERO)
+      run i32Const(&mut body.*, usize.toU64(bits))
+      run emit(&mut body.*, 0x70)
+      run localSet(&mut body.*, shift)
+      let mut near: u8 = 0x74
+      let mut far: u8 = 0x76
+      if !toLeft {
+        near = 0x76
+        far = 0x74
+      }
+      run pushPart(&mut body.*, value, element, usize.ZERO)
+      run localGet(&mut body.*, shift)
+      run emit(&mut body.*, near)
+      run pushPart(&mut body.*, value, element, usize.ZERO)
+      run i32Const(&mut body.*, usize.toU64(bits))
+      run localGet(&mut body.*, shift)
+      run emit(&mut body.*, 0x6B)
+      run i32Const(&mut body.*, usize.toU64(bits))
+      run emit(&mut body.*, 0x70)
+      run emit(&mut body.*, far)
+      run emit(&mut body.*, 0x72)
+      run normalize(&mut body.*, bits)
+    }
+    run popElement(&mut body.*, result, element)
+    element = element + usize.ONE
+  }
+  return result
+}
+
+/// A bit count.
+pub enum Count { Ones, LeadingZeros, TrailingZeros }
+
+/// The bits of `value` `which` counts, element by element; a zero's count is the width.
+pub effect fn countBits(body: &mut Body, which: Count, value: u64) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let kind = body.kindOf(value)
+  let bits = kind.bits
+  if bits > 64 { run WasmObject.unsupported(b"a bit count of this width", Bytes.asSlice(&body.symbol)) }
+  let wide = isWide(bits)
+  let container = widthFor(wide)
+  let result = run fresh(&mut body.*, kind)
+  let count = kind.count()
+  let mut element = usize.ZERO
+  while element < count {
+    run pushPart(&mut body.*, value, element, usize.ZERO)
+    if which == Count.Ones {
+      run intOp(&mut body.*, 0x69, wide)
+    } else if which == Count.TrailingZeros {
+      // A bit just above the width makes a zero count the width.
+      if bits != container {
+        run pushInt(&mut body.*, container, u64.shiftLeft(1, usize.toU64(bits)))
+        run intOp(&mut body.*, 0x72, wide)
+      }
+      run intOp(&mut body.*, 0x68, wide)
+    } else {
+      run intOp(&mut body.*, 0x67, wide)
+      if bits != container {
+        run pushInt(&mut body.*, container, usize.toU64(container - bits))
+        run intOp(&mut body.*, 0x6B, wide)
+      }
+    }
+    run popElement(&mut body.*, result, element)
+    element = element + usize.ONE
+  }
+  return result
+}
+
+/// An extreme of two values.
+pub enum Extreme { SignedMinimum, SignedMaximum, UnsignedMinimum, UnsignedMaximum, FloatMinimum, FloatMaximum }
+
+/// The smaller or larger of `left` and `right`, element by element. A float's are IEEE 754
+/// minimum and maximum: NaN propagates, and -0 is below +0.
+pub effect fn extreme(body: &mut Body, which: Extreme, left: u64, right: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let kind = body.kindOf(left)
+  let result = run fresh(&mut body.*, kind)
+  let count = kind.count()
+  let mut element = usize.ZERO
+  while element < count {
+    if which == Extreme.FloatMinimum || which == Extreme.FloatMaximum {
+      run pushPart(&mut body.*, left, element, usize.ZERO)
+      run pushPart(&mut body.*, right, element, usize.ZERO)
+      let mut code: u8 = 0x96
+      if kind.bits == 64 { code = 0xA4 }
+      if which == Extreme.FloatMaximum { code = code + 1 }
+      run emit(&mut body.*, code)
+    } else {
+      run pushPart(&mut body.*, left, element, usize.ZERO)
+      run pushPart(&mut body.*, right, element, usize.ZERO)
+      let mut predicate = Predicate.Ult
+      if which == Extreme.UnsignedMaximum { predicate = Predicate.Ugt }
+      if which == Extreme.SignedMinimum { predicate = Predicate.Slt }
+      if which == Extreme.SignedMaximum { predicate = Predicate.Sgt }
+      run compareElement(&mut body.*, predicate, kind.element(), left, right, element)
+      run emit(&mut body.*, WasmModule.opSelect())
+    }
+    run popElement(&mut body.*, result, element)
+    element = element + usize.ONE
+  }
+  return result
+}
+
+/// `left * right + addend` rounded once, as C's `fma`, element by element.
+pub effect fn fusedMultiplyAdd(body: &mut Body, left: u64, right: u64, addend: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let kind = body.kindOf(left)
+  let result = run fresh(&mut body.*, kind)
+  let count = kind.count()
+  let mut element = usize.ZERO
+  while element < count {
+    run pushPart(&mut body.*, left, element, usize.ZERO)
+    run pushPart(&mut body.*, right, element, usize.ZERO)
+    run pushPart(&mut body.*, addend, element, usize.ZERO)
+    let mut callee: &[u8] = b"fmaf"
+    if kind.bits == 64 { callee = b"fma" }
+    run callSymbol(&mut body.*, callee)
+    run popElement(&mut body.*, result, element)
+    element = element + usize.ONE
+  }
+  return result
+}
+
+/// The square root of a float, element by element.
+pub effect fn squareRoot(body: &mut Body, value: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let kind = body.kindOf(value)
+  let result = run fresh(&mut body.*, kind)
+  let count = kind.count()
+  let mut element = usize.ZERO
+  while element < count {
+    run pushPart(&mut body.*, value, element, usize.ZERO)
+    run emit(&mut body.*, pick(0x91, 0x9F, kind.bits == 64))
+    run popElement(&mut body.*, result, element)
+    element = element + usize.ONE
+  }
+  return result
+}
+
+/// A fold of a vector's elements.
+pub enum Reduction { Add, Mul, And, Or, Xor, SignedMinimum, SignedMaximum, UnsignedMinimum, UnsignedMaximum, FloatAdd, FloatMul, FloatMinimum, FloatMaximum }
+
+/// The elements of `vector` folded in order by `which`, from `start` for a float sum or product
+/// when it is not `none()`.
+pub effect fn reduce(body: &mut Body, which: Reduction, vector: u64, start: u64) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let kind = body.kindOf(vector)
+  let element = kind.element()
+  let elements = kind.elements
+  let result = run fresh(&mut body.*, element)
+  if element.floating {
+    let mut code: u8 = 0
+    if which == Reduction.FloatAdd { code = 0x92 }
+    if which == Reduction.FloatMul { code = 0x94 }
+    if which == Reduction.FloatMinimum { code = 0x96 }
+    if which == Reduction.FloatMaximum { code = 0x97 }
+    if code == 0 { run WasmObject.unsupported(b"a floating reduction of this kind", Bytes.asSlice(&body.symbol)) }
+    if element.bits == 64 { code = code + 0x0E }
+    let mut at = usize.ZERO
+    if start != none() {
+      run push(&mut body.*, start)
+    } else {
+      run pushPart(&mut body.*, vector, usize.ZERO, usize.ZERO)
+      at = usize.ONE
+    }
+    while at < elements {
+      run pushPart(&mut body.*, vector, at, usize.ZERO)
+      run emit(&mut body.*, code)
+      at = at + usize.ONE
+    }
+    run pop(&mut body.*, result)
+    return result
+  }
+  let bits = element.bits
+  if bits > 64 { run WasmObject.unsupported(b"a reduction of this width", Bytes.asSlice(&body.symbol)) }
+  let wide = isWide(bits)
+  let best = localOf(&body.*, result, usize.ZERO, usize.ZERO)
+  if which == Reduction.SignedMinimum || which == Reduction.SignedMaximum || which == Reduction.UnsignedMinimum || which == Reduction.UnsignedMaximum {
+    // The running extreme, replaced by each element beyond it.
+    let mut predicate = Predicate.Ult
+    if which == Reduction.SignedMinimum { predicate = Predicate.Slt }
+    if which == Reduction.SignedMaximum { predicate = Predicate.Sgt }
+    if which == Reduction.UnsignedMaximum { predicate = Predicate.Ugt }
+    let signed = signedPredicate(predicate)
+    let next = run addLocal(&mut body.*, element.lane)
+    run pushPart(&mut body.*, vector, usize.ZERO, usize.ZERO)
+    run localSet(&mut body.*, best)
+    let mut at = usize.ONE
+    while at < elements {
+      run pushPart(&mut body.*, vector, at, usize.ZERO)
+      run localTee(&mut body.*, next)
+      run localGet(&mut body.*, best)
+      run localGet(&mut body.*, next)
+      if signed { run signExtend(&mut body.*, bits) }
+      run localGet(&mut body.*, best)
+      if signed { run signExtend(&mut body.*, bits) }
+      run intCompare(&mut body.*, integerCompareCode(predicate), wide)
+      run emit(&mut body.*, WasmModule.opSelect())
+      run localSet(&mut body.*, best)
+      at = at + usize.ONE
+    }
+    return result
+  }
+  let mut code: u8 = 0x6A
+  if which == Reduction.Mul { code = 0x6C }
+  if which == Reduction.And { code = 0x71 }
+  if which == Reduction.Or { code = 0x72 }
+  if which == Reduction.Xor { code = 0x73 }
+  run pushPart(&mut body.*, vector, usize.ZERO, usize.ZERO)
+  let mut at = usize.ONE
+  while at < elements {
+    run pushPart(&mut body.*, vector, at, usize.ZERO)
+    run intOp(&mut body.*, code, wide)
+    at = at + usize.ONE
+  }
+  run normalize(&mut body.*, bits)
+  run pop(&mut body.*, result)
+  return result
+}
+
+/// The vector of `vector`'s elements followed by `other`'s, picked by `mask`: each result element
+/// is the one its mask entry numbers, or zero for `u64.MAX`.
+pub effect fn shuffle(body: &mut Body, vector: u64, other: u64, mask: &[u64]) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let kind = body.kindOf(vector)
+  let result = run fresh(&mut body.*, Kind.vector(kind.element(), mask.length))
+  let first = usize.toU64(kind.elements)
+  let mut at = usize.ZERO
+  while at < mask.length {
+    let picked = mask[at]
+    if picked == u64.MAX {
+      run pushZeroElement(&mut body.*, kind.element())
+    } else if picked < first {
+      run pushElement(&mut body.*, vector, u64.toUsize(picked))
+    } else {
+      run pushElement(&mut body.*, other, u64.toUsize(picked - first))
+    }
+    run popElement(&mut body.*, result, at)
+    at = at + usize.ONE
+  }
+  return result
+}
+
+effect fn pushZeroElement(body: &mut Body, kind: Kind) -> () ! OutOfMemoryError ? &mut Allocator {
+  let parts = kind.parts()
+  let mut part = usize.ZERO
+  while part < parts {
+    if kind.lane == WasmModule.f32Type() { run WasmModule.f32Const(&mut body.*.straight.code, 0) }
+    else if kind.lane == WasmModule.f64Type() { run WasmModule.f64Const(&mut body.*.straight.code, 0) }
+    else if kind.lane == WasmModule.i64Type() { run i64Const(&mut body.*, 0) }
+    else { run i32Const(&mut body.*, 0) }
+    part = part + usize.ONE
+  }
+  return ()
+}
+
+/// Element `index` of `vector`, a constant or an integer value; an index out of range gives zero.
+pub effect fn extractElement(body: &mut Body, vector: u64, index: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let kind = body.kindOf(vector)
+  let element = kind.element()
+  let result = run fresh(&mut body.*, element)
+  let elements = kind.elements
+  if body.isConstant(index) {
+    let at = u64.toUsize(body.constantBits(index))
+    if at < elements { run pushElement(&mut body.*, vector, at) } else { run pushZeroElement(&mut body.*, element) }
+    run pop(&mut body.*, result)
+    return result
+  }
+  // A chain of selects over every element.
+  let parts = element.parts()
+  let mut part = usize.ZERO
+  while part < parts {
+    let chosen = localOf(&body.*, result, usize.ZERO, part)
+    run pushPart(&mut body.*, vector, usize.ZERO, part)
+    run localSet(&mut body.*, chosen)
+    let mut at = usize.ONE
+    while at < elements {
+      run pushPart(&mut body.*, vector, at, part)
+      run localGet(&mut body.*, chosen)
+      run pushIndexIs(&mut body.*, index, at)
+      run emit(&mut body.*, WasmModule.opSelect())
+      run localSet(&mut body.*, chosen)
+      at = at + usize.ONE
+    }
+    part = part + usize.ONE
+  }
+  return result
+}
+
+// Pushes whether the integer `index` is `at`.
+effect fn pushIndexIs(body: &mut Body, index: u64, at: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let wide = isWide(body.kindOf(index).bits)
+  run pushPart(&mut body.*, index, usize.ZERO, usize.ZERO)
+  run pushInt(&mut body.*, widthFor(wide), usize.toU64(at))
+  return run intCompare(&mut body.*, 0x46, wide)
+}
+
+/// `vector` with element `index` replaced by `inserted`.
+pub effect fn insertElement(body: &mut Body, vector: u64, inserted: u64, index: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let kind = body.kindOf(vector)
+  let result = run fresh(&mut body.*, kind)
+  let elements = kind.elements
+  let parts = kind.parts()
+  let mut constant = usize.MAX
+  if body.isConstant(index) { constant = u64.toUsize(body.constantBits(index)) }
+  let mut at = usize.ZERO
+  while at < elements {
+    let mut part = usize.ZERO
+    while part < parts {
+      if body.isConstant(index) {
+        if at == constant { run pushPart(&mut body.*, inserted, usize.ZERO, part) } else { run pushPart(&mut body.*, vector, at, part) }
+      } else {
+        run pushPart(&mut body.*, inserted, usize.ZERO, part)
+        run pushPart(&mut body.*, vector, at, part)
+        run pushIndexIs(&mut body.*, index, at)
+        run emit(&mut body.*, WasmModule.opSelect())
+      }
+      part = part + usize.ONE
+    }
+    run popElement(&mut body.*, result, at)
+    at = at + usize.ONE
+  }
+  return result
+}
+
+/// A vector of `count` elements, each `value`.
+pub effect fn splat(body: &mut Body, value: u64, count: usize) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let kind = body.kindOf(value)
+  let result = run fresh(&mut body.*, Kind.vector(kind, count))
+  let mut at = usize.ZERO
+  while at < count {
+    run pushElement(&mut body.*, value, usize.ZERO)
+    run popElement(&mut body.*, result, at)
+    at = at + usize.ONE
+  }
+  return result
+}
+
+/// The vector of the scalars `values`, in order.
+pub effect fn gather(body: &mut Body, values: &[u64]) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let kind = body.kindOf(values[usize.ZERO])
+  let result = run fresh(&mut body.*, Kind.vector(kind, values.length))
+  let mut at = usize.ZERO
+  while at < values.length {
+    run pushElement(&mut body.*, values[at], usize.ZERO)
+    run popElement(&mut body.*, result, at)
+    at = at + usize.ONE
+  }
+  return result
+}
+
+// WebAssembly's own instructions.
+
+/// The memory's size in pages, an address-sized integer.
+pub effect fn memorySize(body: &mut Body) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let kind = body.address()
+  let result = run fresh(&mut body.*, kind)
+  run emit(&mut body.*, 0x3F)
+  run WasmModule.byte(&mut body.*.straight.code, 0)
+  run pop(&mut body.*, result)
+  return result
+}
+
+/// Grows the memory by `pages`, an address-sized integer; answers the old size, or all ones.
+pub effect fn memoryGrow(body: &mut Body, pages: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let kind = body.address()
+  let result = run fresh(&mut body.*, kind)
+  run push(&mut body.*, pages)
+  run emit(&mut body.*, 0x40)
+  run WasmModule.byte(&mut body.*.straight.code, 0)
+  run pop(&mut body.*, result)
+  return result
+}
+
+/// `memory.atomic.wait32(address, expected, timeout)`: 0 when woken, 1 when the word differed, 2
+/// on timeout.
+pub effect fn atomicWait(body: &mut Body, address: u64, expected: u64, timeout: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let result = run fresh(&mut body.*, Kind.integer(32))
+  run push(&mut body.*, address)
+  run push(&mut body.*, expected)
+  run push(&mut body.*, timeout)
+  run emitPrefixed(&mut body.*, 0xFE, 1)
+  run emitIndex(&mut body.*, 2)
+  run emitIndex(&mut body.*, usize.ZERO)
+  run pop(&mut body.*, result)
+  return result
+}
+
+/// `memory.atomic.notify(address, count)`: how many waiters it woke.
+pub effect fn atomicNotify(body: &mut Body, address: u64, count: u64) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let result = run fresh(&mut body.*, Kind.integer(32))
+  run push(&mut body.*, address)
+  run push(&mut body.*, count)
+  run emitPrefixed(&mut body.*, 0xFE, 0)
+  run emitIndex(&mut body.*, 2)
+  run emitIndex(&mut body.*, usize.ZERO)
+  run pop(&mut body.*, result)
+  return result
+}
+
+/// A value the link knows only once it lays out the module, such as the thread-local block's
+/// size (`__tls_size`) or alignment (`__tls_align`): the address it gives `symbol`.
+pub effect fn linkConstant(body: &mut Body, symbol: &[u8]) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let index = run symbolIndex(&mut body.*, symbol)
+  let result = run fresh(&mut body.*, Kind.integer(32))
+  run emit(&mut body.*, 0x41)
+  run relocate(&mut body.*.straight, RelocationKind.Address, index, 0)
+  run pop(&mut body.*, result)
+  return result
+}
+
+// Atomics. In a module whose memory threads do not share, an atomic access is an ordinary one.
+
+// The `0xFE` code of an atomic access to an integer of `size` bytes: `base` for an `i32` one,
+// then the `i64` form and the narrow forms after it.
+fn atomicCode(kind: Kind, size: usize, base: u64) -> u64 {
+  let wide = kind.lane == WasmModule.i64Type()
+  if base == 0x10 {
+    // load: i32 0x10, i64 0x11, i32.load8_u 0x12, i32.load16_u 0x13, i64.load8_u 0x14,
+    // i64.load16_u 0x15, i64.load32_u 0x16.
+    if size == 4 && !wide { return 0x10 }
+    if size == 8 { return 0x11 }
+    if size == 1 { if wide { return 0x14 } return 0x12 }
+    if size == 2 { if wide { return 0x15 } return 0x13 }
+    return 0x16
+  }
+  // The store, read-modify-write and compare-exchange groups follow the load's layout.
+  if size == 4 && !wide { return base }
+  if size == 8 { return base + 1 }
+  if size == 1 { if wide { return base + 4 } return base + 2 }
+  if size == 2 { if wide { return base + 5 } return base + 3 }
+  return base + 6
+}
+
+effect fn atomicAccess(body: &mut Body, code: u64, size: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitPrefixed(&mut body.*, 0xFE, code)
+  let mut alignment = usize.ZERO
+  if size == 2 { alignment = usize.ONE }
+  if size == 4 { alignment = 2 }
+  if size == 8 { alignment = 3 }
+  run emitIndex(&mut body.*, alignment)
+  return run emitIndex(&mut body.*, usize.ZERO)
+}
+
+/// An atomic load of the integer `kind` at `address`.
+pub effect fn atomicLoad(body: &mut Body, kind: Kind, address: u64) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if !body.threaded { return run load(&mut body.*, kind, address, 0) }
+  let result = run fresh(&mut body.*, kind)
+  run pushAddressOf(&mut body.*, address)
+  run atomicAccess(&mut body.*, atomicCode(kind, kind.elementBytes(), 0x10), kind.elementBytes())
+  run pop(&mut body.*, result)
+  return result
+}
+
+/// An atomic store of `value` at `address`.
+pub effect fn atomicStore(body: &mut Body, value: u64, address: u64) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if !body.threaded { return run store(&mut body.*, value, address, 0) }
+  let kind = body.kindOf(value)
+  run pushAddressOf(&mut body.*, address)
+  run push(&mut body.*, value)
+  return run atomicAccess(&mut body.*, atomicCode(kind, kind.elementBytes(), 0x17), kind.elementBytes())
+}
+
+/// A read-modify-write operation.
+pub enum Modify { Exchange, Add, Sub, And, Or, Xor, SignedMinimum, SignedMaximum, UnsignedMinimum, UnsignedMaximum }
+
+/// Applies `which` with `value` to the integer at `address` atomically; answers the old value.
+pub effect fn atomicModify(body: &mut Body, which: Modify, address: u64, value: u64) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let kind = body.kindOf(value)
+  let size = kind.elementBytes()
+  let old = run load(&mut body.*, kind, address, 0)
+  if body.threaded && which != Modify.SignedMinimum && which != Modify.SignedMaximum && which != Modify.UnsignedMinimum
+    && which != Modify.UnsignedMaximum {
+    // wasm's own: add 0x1E, sub 0x25, and 0x2C, or 0x33, xor 0x3A, xchg 0x41.
+    let mut base: u64 = 0x41
+    if which == Modify.Add { base = 0x1E }
+    if which == Modify.Sub { base = 0x25 }
+    if which == Modify.And { base = 0x2C }
+    if which == Modify.Or { base = 0x33 }
+    if which == Modify.Xor { base = 0x3A }
+    run pushAddressOf(&mut body.*, address)
+    run push(&mut body.*, value)
+    run atomicAccess(&mut body.*, atomicCode(kind, size, base), size)
+    run pop(&mut body.*, old)
+    return old
+  }
+  let modified = run modifiedValue(&mut body.*, which, old, value)
+  if !body.threaded {
+    run store(&mut body.*, modified, address, 0)
+    return old
+  }
+  // A minimum or maximum retries a compare-exchange until no other thread wrote between.
+  let retry = run newBlock(&mut body.*)
+  let done = run newBlock(&mut body.*)
+  let current = run variable(&mut body.*, kind)
+  run assign(&mut body.*, current, old)
+  run jump(&mut body.*, retry)
+  run startBlock(&mut body.*, retry)
+  let next = run modifiedValue(&mut body.*, which, current, value)
+  let seen = run compareExchangeValue(&mut body.*, address, current, next)
+  let changed = run compare(&mut body.*, Predicate.Ne, seen, current)
+  run assign(&mut body.*, current, seen)
+  run branchIf(&mut body.*, changed, retry, done)
+  run startBlock(&mut body.*, done)
+  return current
+}
+
+effect fn modifiedValue(body: &mut Body, which: Modify, old: u64, value: u64) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if which == Modify.Exchange { return value }
+  if which == Modify.Add { return run binary(&mut body.*, Binary.Add, old, value) }
+  if which == Modify.Sub { return run binary(&mut body.*, Binary.Sub, old, value) }
+  if which == Modify.And { return run binary(&mut body.*, Binary.And, old, value) }
+  if which == Modify.Or { return run binary(&mut body.*, Binary.Or, old, value) }
+  if which == Modify.Xor { return run binary(&mut body.*, Binary.Xor, old, value) }
+  if which == Modify.SignedMinimum { return run extreme(&mut body.*, Extreme.SignedMinimum, old, value) }
+  if which == Modify.SignedMaximum { return run extreme(&mut body.*, Extreme.SignedMaximum, old, value) }
+  if which == Modify.UnsignedMinimum { return run extreme(&mut body.*, Extreme.UnsignedMinimum, old, value) }
+  return run extreme(&mut body.*, Extreme.UnsignedMaximum, old, value)
+}
+
+// The old value of a compare-exchange at `address` of `expected` for `replacement`.
+effect fn compareExchangeValue(body: &mut Body, address: u64, expected: u64, replacement: u64) -> u64 ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let kind = body.kindOf(expected)
+  let size = kind.elementBytes()
+  let old = run fresh(&mut body.*, kind)
+  run pushAddressOf(&mut body.*, address)
+  run push(&mut body.*, expected)
+  run push(&mut body.*, replacement)
+  run atomicAccess(&mut body.*, atomicCode(kind, size, 0x48), size)
+  run pop(&mut body.*, old)
+  return old
+}
+
+/// Replaces the integer at `address` by `replacement` when it holds `expected`, atomically;
+/// answers the old value and whether it was replaced.
+pub effect fn compareExchange(body: &mut Body, address: u64, expected: u64, replacement: u64) -> Checked ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if body.threaded {
+    let old = run compareExchangeValue(&mut body.*, address, expected, replacement)
+    let swapped = run compare(&mut body.*, Predicate.Eq, old, expected)
+    return Checked {value: old, overflow: swapped}
+  }
+  let kind = body.kindOf(expected)
+  let old = run load(&mut body.*, kind, address, 0)
+  let swapped = run compare(&mut body.*, Predicate.Eq, old, expected)
+  let stored = run select(&mut body.*, swapped, replacement, old)
+  run store(&mut body.*, stored, address, 0)
+  return Checked {value: old, overflow: swapped}
+}
+
+/// A fence, which only a module whose memory threads share needs.
+pub effect fn fence(body: &mut Body) -> () ! OutOfMemoryError ? &mut Allocator {
+  if !body.threaded { return () }
+  run emitPrefixed(&mut body.*, 0xFE, 3)
+  return run WasmModule.byte(&mut body.*.straight.code, 0)
+}
+
+// Control flow.
+
+/// A new block, which `startBlock` later fills.
+pub effect fn newBlock(body: &mut Body) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let index = List<Piece>.length(&body.pieces)
+  run List<Piece>.append(&mut body.*.pieces, Piece {started: false, start: usize.ZERO, end: usize.ZERO, relocationStart: usize.ZERO,
+    relocationEnd: usize.ZERO, locationStart: usize.ZERO, locationEnd: usize.ZERO, exit: exitNone(), value: none(), first: usize.ZERO,
+    second: usize.ZERO, cases: List<u64>.make(), place: 0})
+  return index
+}
+
+/// Starts filling block `block`, which ends the one before; the first block started is the
+/// body's entry. A block is filled once.
+pub effect fn startBlock(body: &mut Body, block: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  run closeCurrent(&mut body.*)
+  let start = Bytes.length(&body.straight.code)
+  let relocations = List<Relocation>.length(&body.straight.relocations)
+  let locations = List<u64>.length(&body.straight.locations)
+  let pieces = List<Piece>.asMutSlice(&mut body.*.pieces)
+  if pieces[block].started { return CompilerBug.panic(b"WasmBody: a block started twice") }
+  pieces[block].started = true
+  pieces[block].start = start
+  pieces[block].relocationStart = relocations
+  pieces[block].locationStart = locations
+  body.current = block
+  if body.entry == usize.MAX { body.entry = block }
+  // The block's first code keeps the place the code before it had.
+  let place = body.place
+  return run locateIn(&mut body.*.straight, place)
+}
+
+// Ends the current block's code where the straight-line code is now.
+effect fn closeCurrent(body: &mut Body) -> () ! OutOfMemoryError ? &mut Allocator {
+  if body.current == usize.MAX { return () }
+  let end = Bytes.length(&body.straight.code)
+  let relocations = List<Relocation>.length(&body.straight.relocations)
+  let locations = List<u64>.length(&body.straight.locations)
+  let current = body.current
+  let pieces = List<Piece>.asMutSlice(&mut body.*.pieces)
+  pieces[current].end = end
+  pieces[current].relocationEnd = relocations
+  pieces[current].locationEnd = locations
+  body.current = usize.MAX
+  return ()
+}
+
+effect fn setExit(body: &mut Body, exit: u8, value: u64, first: usize, second: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let current = body.current
+  if current == usize.MAX { return CompilerBug.panic(b"WasmBody: an exit outside a block") }
+  let place = body.place
+  let pieces = List<Piece>.asMutSlice(&mut body.*.pieces)
+  pieces[current].exit = exit
+  pieces[current].value = value
+  pieces[current].first = first
+  pieces[current].second = second
+  pieces[current].place = place
+  return run closeCurrent(&mut body.*)
+}
+
+/// Ends the current block with a jump to `target`.
+pub effect fn jump(body: &mut Body, target: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run setExit(&mut body.*, exitJump(), none(), target, usize.ZERO)
+}
+
+/// Ends the current block with a branch to `onTrue` when `condition` holds, else to `onFalse`.
+pub effect fn branchIf(body: &mut Body, condition: u64, onTrue: usize, onFalse: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if onTrue == onFalse { return run jump(&mut body.*, onTrue) }
+  return run setExit(&mut body.*, exitBranch(), condition, onTrue, onFalse)
+}
+
+/// Ends the current block with a switch on the integer `value`: to the target of the case pair
+/// in `cases`, its bits then its block, that `value` equals, else to `otherwise`.
+pub effect fn switch(body: &mut Body, value: u64, cases: &[u64], otherwise: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let current = body.current
+  if current == usize.MAX { return CompilerBug.panic(b"WasmBody: an exit outside a block") }
+  let pieces = List<Piece>.asMutSlice(&mut body.*.pieces)
+  run List<u64>.appendSlice(&mut pieces[current].cases, cases)
+  return run setExit(&mut body.*, exitSwitch(), value, otherwise, usize.ZERO)
+}
+
+/// Ends the current block by returning `value`, or nothing for `none()`.
+pub effect fn ret(body: &mut Body, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run setExit(&mut body.*, exitReturn(), value, usize.ZERO, usize.ZERO)
+}
+
+/// Ends the current block with a trap.
+pub effect fn trap(body: &mut Body) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run setExit(&mut body.*, exitTrap(), none(), usize.ZERO, usize.ZERO)
+}
+
+/// Whether the body is filling a block: the last one has not ended.
+pub fn isOpen(body: &Body) -> bool { return body.current != usize.MAX }
+
+// Structuring.
+
+fn labelBlock() -> u8 { return 0 }
+fn labelLoop() -> u8 { return 1 }
+fn labelIf() -> u8 { return 2 }
+
+struct Label {
+  kind: u8,
+  block: usize,
+}
+
+impl Copy for Label {}
+
+// Pending structuring work, run from the top of a stack.
+fn actionTree() -> u8 { return 0 }
+fn actionWithin() -> u8 { return 1 }
+fn actionBody() -> u8 { return 2 }
+fn actionBranch() -> u8 { return 3 }
+fn actionEndBlock() -> u8 { return 4 }
+fn actionEndLoop() -> u8 { return 5 }
+fn actionElse() -> u8 { return 6 }
+fn actionEndIf() -> u8 { return 7 }
+fn actionEndCase() -> u8 { return 8 }
+fn actionCase() -> u8 { return 9 }
+
+struct Action {
+  kind: u8,
+  first: usize,
+  second: usize,
+}
+
+impl Copy for Action {}
+
+/// The control flow graph over the blocks, numbered with the entry first (`order` maps a node to
+/// its block).
+struct Graph {
+  /// Per node: its successors, as `[start, end)` into `edges`.
+  successorStart: List<usize>,
+  edges: List<usize>,
+  /// Per node: its reverse postorder number, or `usize.MAX` when unreachable.
+  order: List<usize>,
+  /// The nodes in reverse postorder.
+  sequence: List<usize>,
+  /// Per node: its immediate dominator.
+  dominator: List<usize>,
+  /// Per node: whether it is a loop header, and whether it is a merge node (two or more forward
+  /// in-edges).
+  header: List<bool>,
+  merge: List<bool>,
+  /// Per node: its dominator-tree children that are merge nodes, highest reverse postorder
+  /// first, as `[start, end)` into `children`.
+  childStart: List<usize>,
+  children: List<usize>,
+  /// Whether some loop is entered other than at its header, which leaves the nodes to a
+  /// dispatch loop.
+  irreducible: bool,
+}
+
+// Node `node`'s block, and block `block`'s node: the entry swaps places with block 0.
+fn blockOfNode(entry: usize, node: usize) -> usize {
+  if node == usize.ZERO { return entry }
+  if node == entry { return usize.ZERO }
+  return node
+}
+
+effect fn successors(piece: &Piece, entry: usize, out: &mut List<usize>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let exit = piece.exit
+  if exit == exitJump() { return run List<usize>.append(&mut out.*, blockOfNode(entry, piece.first)) }
+  if exit == exitBranch() {
+    run List<usize>.append(&mut out.*, blockOfNode(entry, piece.first))
+    return run List<usize>.append(&mut out.*, blockOfNode(entry, piece.second))
+  }
+  if exit == exitSwitch() {
+    run List<usize>.append(&mut out.*, blockOfNode(entry, piece.first))
+    let cases = List<u64>.asSlice(&piece.cases)
+    let mut at = usize.ZERO
+    while at + usize.ONE < cases.length {
+      run List<usize>.append(&mut out.*, blockOfNode(entry, u64.toUsize(cases[at + usize.ONE])))
+      at = at + 2
+    }
+  }
+  return ()
+}
+
+effect fn graphOf(body: &Body) -> Graph ! OutOfMemoryError ? &mut Allocator {
+  let pieces = List<Piece>.asSlice(&body.pieces)
+  let count = pieces.length
+  let entry = body.entry
+  let mut successorStart = run List<usize>.makeWithCapacity(count + usize.ONE)
+  let mut edges = List<usize>.make()
+  let mut at = usize.ZERO
+  while at < count {
+    run List<usize>.append(&mut successorStart, List<usize>.length(&edges))
+    run successors(&pieces[blockOfNode(entry, at)], entry, &mut edges)
+    at = at + usize.ONE
+  }
+  run List<usize>.append(&mut successorStart, List<usize>.length(&edges))
+  let starts = List<usize>.asSlice(&successorStart)
+  let targets = List<usize>.asSlice(&edges)
+  // Postorder by an explicit depth-first walk.
+  let mut visited = run List<bool>.makeWithCapacity(count)
+  run List<bool>.appendRepeated(&mut visited, false, count)
+  let mut postorder = List<usize>.make()
+  let mut stack = List<usize>.make()
+  let mut cursor = List<usize>.make()
+  run List<usize>.append(&mut stack, usize.ZERO)
+  run List<usize>.append(&mut cursor, starts[usize.ZERO])
+  List<bool>.set(&mut visited, usize.ZERO, true)
+  while List<usize>.length(&stack) > usize.ZERO {
+    let top = List<usize>.length(&stack) - usize.ONE
+    let node = List<usize>.get(&stack, top)
+    let position = List<usize>.get(&cursor, top)
+    if position < starts[node + usize.ONE] {
+      List<usize>.set(&mut cursor, top, position + usize.ONE)
+      let target = targets[position]
+      if !List<bool>.get(&visited, target) {
+        List<bool>.set(&mut visited, target, true)
+        run List<usize>.append(&mut stack, target)
+        run List<usize>.append(&mut cursor, starts[target])
+      }
+    } else {
+      run List<usize>.append(&mut postorder, node)
+      drop List<usize>.pop(&mut stack)
+      drop List<usize>.pop(&mut cursor)
+    }
+  }
+  let reached = List<usize>.length(&postorder)
+  let mut order = run List<usize>.makeWithCapacity(count)
+  run List<usize>.appendRepeated(&mut order, usize.MAX, count)
+  let mut sequence = run List<usize>.makeWithCapacity(reached)
+  at = usize.ZERO
+  while at < reached {
+    let node = List<usize>.get(&postorder, reached - usize.ONE - at)
+    List<usize>.set(&mut order, node, at)
+    run List<usize>.append(&mut sequence, node)
+    at = at + usize.ONE
+  }
+  // Predecessors of reachable nodes.
+  let mut predecessorStart = run List<usize>.makeWithCapacity(count + usize.ONE)
+  let mut predecessors = List<usize>.make()
+  let mut inCount = run List<usize>.makeWithCapacity(count)
+  run List<usize>.appendRepeated(&mut inCount, usize.ZERO, count)
+  at = usize.ZERO
+  while at < count {
+    if List<usize>.get(&order, at) != usize.MAX {
+      let mut edge = starts[at]
+      while edge < starts[at + usize.ONE] {
+        let counted = List<usize>.get(&inCount, targets[edge]) + usize.ONE
+        List<usize>.set(&mut inCount, targets[edge], counted)
+        edge = edge + usize.ONE
+      }
+    }
+    at = at + usize.ONE
+  }
+  let mut total = usize.ZERO
+  at = usize.ZERO
+  while at < count {
+    run List<usize>.append(&mut predecessorStart, total)
+    total = total + List<usize>.get(&inCount, at)
+    at = at + usize.ONE
+  }
+  run List<usize>.append(&mut predecessorStart, total)
+  run List<usize>.appendRepeated(&mut predecessors, usize.ZERO, total)
+  let mut filled = run List<usize>.makeWithCapacity(count)
+  run List<usize>.appendRepeated(&mut filled, usize.ZERO, count)
+  at = usize.ZERO
+  while at < count {
+    if List<usize>.get(&order, at) != usize.MAX {
+      let mut edge = starts[at]
+      while edge < starts[at + usize.ONE] {
+        let target = targets[edge]
+        let slot = List<usize>.get(&predecessorStart, target) + List<usize>.get(&filled, target)
+        List<usize>.set(&mut predecessors, slot, at)
+        let done = List<usize>.get(&filled, target) + usize.ONE
+        List<usize>.set(&mut filled, target, done)
+        edge = edge + usize.ONE
+      }
+    }
+    at = at + usize.ONE
+  }
+  // Immediate dominators (Cooper, Harvey and Kennedy), over reverse postorder numbers.
+  let mut dominator = run List<usize>.makeWithCapacity(count)
+  run List<usize>.appendRepeated(&mut dominator, usize.MAX, count)
+  List<usize>.set(&mut dominator, usize.ZERO, usize.ZERO)
+  let mut changed = true
+  while changed {
+    changed = false
+    let mut step = usize.ONE
+    while step < reached {
+      let node = List<usize>.get(&sequence, step)
+      let mut chosen = usize.MAX
+      let mut edge = List<usize>.get(&predecessorStart, node)
+      while edge < List<usize>.get(&predecessorStart, node + usize.ONE) {
+        let from = List<usize>.get(&predecessors, edge)
+        if List<usize>.get(&dominator, from) != usize.MAX {
+          if chosen == usize.MAX {
+            chosen = from
+          } else {
+            chosen = intersect(List<usize>.asSlice(&dominator), List<usize>.asSlice(&order), from, chosen)
+          }
+        }
+        edge = edge + usize.ONE
+      }
+      if chosen != List<usize>.get(&dominator, node) {
+        List<usize>.set(&mut dominator, node, chosen)
+        changed = true
+      }
+      step = step + usize.ONE
+    }
+  }
+  // Loop headers, merge nodes, and the check that every loop is entered at its header.
+  let mut irreducible = false
+  let mut header = run List<bool>.makeWithCapacity(count)
+  run List<bool>.appendRepeated(&mut header, false, count)
+  let mut merge = run List<bool>.makeWithCapacity(count)
+  run List<bool>.appendRepeated(&mut merge, false, count)
+  at = usize.ZERO
+  while at < count {
+    let mine = List<usize>.get(&order, at)
+    if mine != usize.MAX {
+      let mut forward = usize.ZERO
+      let mut edge = List<usize>.get(&predecessorStart, at)
+      while edge < List<usize>.get(&predecessorStart, at + usize.ONE) {
+        let from = List<usize>.get(&predecessors, edge)
+        if List<usize>.get(&order, from) >= mine {
+          List<bool>.set(&mut header, at, true)
+          if !dominates(List<usize>.asSlice(&dominator), List<usize>.asSlice(&order), at, from) {
+            irreducible = true
+          }
+        } else {
+          forward = forward + usize.ONE
+        }
+        edge = edge + usize.ONE
+      }
+      if forward > usize.ONE { List<bool>.set(&mut merge, at, true) }
+    }
+    at = at + usize.ONE
+  }
+  // Merge children per node, highest reverse postorder first.
+  let mut childCount = run List<usize>.makeWithCapacity(count)
+  run List<usize>.appendRepeated(&mut childCount, usize.ZERO, count)
+  at = usize.ONE
+  while at < reached {
+    let node = List<usize>.get(&sequence, at)
+    if List<bool>.get(&merge, node) {
+      let parent = List<usize>.get(&dominator, node)
+      let counted = List<usize>.get(&childCount, parent) + usize.ONE
+      List<usize>.set(&mut childCount, parent, counted)
+    }
+    at = at + usize.ONE
+  }
+  let mut childStart = run List<usize>.makeWithCapacity(count + usize.ONE)
+  total = usize.ZERO
+  at = usize.ZERO
+  while at < count {
+    run List<usize>.append(&mut childStart, total)
+    total = total + List<usize>.get(&childCount, at)
+    at = at + usize.ONE
+  }
+  run List<usize>.append(&mut childStart, total)
+  let mut children = List<usize>.make()
+  run List<usize>.appendRepeated(&mut children, usize.ZERO, total)
+  let mut placedChildren = run List<usize>.makeWithCapacity(count)
+  run List<usize>.appendRepeated(&mut placedChildren, usize.ZERO, count)
+  // Walking reverse postorder backwards lists each node's children highest first.
+  at = reached
+  while at > usize.ONE {
+    at = at - usize.ONE
+    let node = List<usize>.get(&sequence, at)
+    if List<bool>.get(&merge, node) {
+      let parent = List<usize>.get(&dominator, node)
+      let slot = List<usize>.get(&childStart, parent) + List<usize>.get(&placedChildren, parent)
+      List<usize>.set(&mut children, slot, node)
+      let done = List<usize>.get(&placedChildren, parent) + usize.ONE
+      List<usize>.set(&mut placedChildren, parent, done)
+    }
+  }
+  return Graph {successorStart: move successorStart, edges: move edges, order: move order, sequence: move sequence,
+    dominator: move dominator, header: move header, merge: move merge, childStart: move childStart, children: move children,
+    irreducible: irreducible}
+}
+
+fn intersect(dominator: &[usize], order: &[usize], left: usize, right: usize) -> usize {
+  let mut first = left
+  let mut second = right
+  while first != second {
+    while order[first] > order[second] { first = dominator[first] }
+    while order[second] > order[first] { second = dominator[second] }
+  }
+  return first
+}
+
+// Whether node `above` dominates node `below`.
+fn dominates(dominator: &[usize], order: &[usize], above: usize, below: usize) -> bool {
+  let mut at = below
+  while true {
+    if at == above { return true }
+    if at == usize.ZERO || order[at] <= order[above] { return false }
+    at = dominator[at]
+  }
+  return false
+}
+
+/// The finished body: the prologue, then its blocks as structured code.
+pub effect fn finish(body: &mut Body) -> Translated ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  run closeCurrent(&mut body.*)
+  let mut out = emission()
+  // The frame: the stack pointer moves down by the frame's size, aligned, and every return
+  // restores it.
+  if body.frame != usize.MAX {
+    run WasmModule.globalGet(&mut out.code, usize.ZERO)
+    run WasmModule.localTee(&mut out.code, body.saved)
+    if body.wide { run WasmModule.i64Const(&mut out.code, alignUp(body.frameSize, 16)) } else { run WasmModule.i32Const(&mut out.code, alignUp(body.frameSize, 16)) }
+    run op(&mut out, addressCodeOf(body.wide, 0x6B))
+    run WasmModule.localTee(&mut out.code, body.frame)
+    run WasmModule.globalSet(&mut out.code, usize.ZERO)
+  }
+  if body.entry != usize.MAX {
+    if run structure(&body.*, &mut out) { run dispatchLocal(&mut body.*) }
+  } else {
+    run op(&mut out, WasmModule.opUnreachable())
+  }
+  // The code entry: the locals as runs of one type, then the code.
+  let mut entry = Bytes.make()
+  let declared = List<u8>.asSlice(&body.locals)
+  let mut runs = usize.ZERO
+  let mut at = usize.ZERO
+  while at < declared.length {
+    if at == usize.ZERO || declared[at] != declared[at - usize.ONE] { runs = runs + usize.ONE }
+    at = at + usize.ONE
+  }
+  run WasmModule.index(&mut entry, runs)
+  at = usize.ZERO
+  while at < declared.length {
+    let mut until = at
+    while until < declared.length && declared[until] == declared[at] { until = until + usize.ONE }
+    run WasmModule.index(&mut entry, until - at)
+    run WasmModule.byte(&mut entry, declared[at])
+    at = until
+  }
+  // The relocations and locations move with the code behind the locals.
+  let shift = Bytes.length(&entry)
+  let mut relocations = move out.relocations
+  let moved = List<Relocation>.asMutSlice(&mut relocations)
+  at = usize.ZERO
+  while at < moved.length {
+    moved[at].offset = moved[at].offset + shift
+    at = at + usize.ONE
+  }
+  let mut locations = move out.locations
+  let places = List<u64>.asMutSlice(&mut locations)
+  at = usize.ZERO
+  while at < places.length {
+    places[at] = places[at] + usize.toU64(shift)
+    at = at + 2
+  }
+  run Bytes.append(&mut entry, Bytes.asSlice(&out.code))
+  run WasmModule.op(&mut entry, WasmModule.opEnd())
+  let signature = run WasmObject.signature(List<u8>.asSlice(&body.parameters), List<u8>.asSlice(&body.results))
+  let own = run signatureIndex(&mut body.*, Bytes.asSlice(&signature))
+  let mut symbols = List<Bytes>.make()
+  let mut signatures = List<Bytes>.make()
+  run copyNames(List<Bytes>.asSlice(&body.symbols), &mut symbols)
+  run copyNames(List<Bytes>.asSlice(&body.signatures), &mut signatures)
+  return Translated {symbol: run Bytes.copy(Bytes.asSlice(&body.symbol)), signature: own, entry: move entry, relocations: move relocations,
+    symbols: move symbols, signatures: move signatures, locations: move locations}
+}
+
+effect fn copyNames(names: &[Bytes], out: &mut List<Bytes>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < names.length {
+    run List<Bytes>.append(&mut out.*, run Bytes.copy(Bytes.asSlice(&names[at])))
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Emits the body's blocks as structured code (Ramsey, "Beyond Relooper", ICFP 2022): each node's
+// dominator-tree subtree in one walk, a loop around a loop header's subtree, and a `block` before
+// each merge child, so a forward branch to it leaves that `block`.
+effect fn structure(body: &Body, out: &mut Emission) -> bool ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let graph = run graphOf(body)
+  let mut labels = List<Label>.make()
+  let mut actions = List<Action>.make()
+  if !graph.irreducible {
+    run List<Action>.append(&mut actions, Action {kind: actionTree(), first: usize.ZERO, second: usize.ZERO})
+    run drain(body, &mut out.*, &graph, &mut labels, &mut actions, usize.MAX)
+    run op(&mut out.*, WasmModule.opUnreachable())
+    return false
+  }
+  // An irreducible graph runs as a dispatch loop: `next` holds the reverse postorder number of the
+  // node to run, a `br_table` enters it, and every branch sets `next` and restarts the loop. The
+  // local is the last one, which `finish` declares.
+  let next = List<u8>.length(&body.parameters) + List<u8>.length(&body.locals)
+  let count = List<usize>.length(&graph.sequence)
+  run WasmModule.structured(&mut out.*.code, WasmModule.opLoop())
+  run List<Label>.append(&mut labels, Label {kind: labelLoop(), block: usize.MAX})
+  let mut at = count
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    run WasmModule.structured(&mut out.*.code, WasmModule.opBlock())
+    run List<Label>.append(&mut labels, Label {kind: labelBlock(), block: at})
+  }
+  run WasmModule.localGet(&mut out.*.code, next)
+  run WasmModule.opIndex(&mut out.*.code, 0x0E, count)
+  at = usize.ZERO
+  while at < count {
+    run WasmModule.index(&mut out.*.code, at)
+    at = at + usize.ONE
+  }
+  run WasmModule.index(&mut out.*.code, count - usize.ONE)
+  at = usize.ZERO
+  while at < count {
+    run op(&mut out.*, WasmModule.opEnd())
+    drop List<Label>.pop(&mut labels)
+    run List<Action>.append(&mut actions, Action {kind: actionBody(), first: List<usize>.get(&graph.sequence, at), second: usize.ZERO})
+    run drain(body, &mut out.*, &graph, &mut labels, &mut actions, next)
+    at = at + usize.ONE
+  }
+  run op(&mut out.*, WasmModule.opEnd())
+  run op(&mut out.*, WasmModule.opUnreachable())
+  return true
+}
+
+// Declares the dispatch loop's local, which `structure` took as the next one.
+effect fn dispatchLocal(body: &mut Body) -> () ! OutOfMemoryError ? &mut Allocator {
+  drop run addLocal(&mut body.*, WasmModule.i32Type())
+  return ()
+}
+
+// Copies node `node`'s code into `out`, with its relocations and locations.
+effect fn copyPiece(body: &Body, out: &mut Emission, node: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let piece = &List<Piece>.asSlice(&body.pieces)[blockOfNode(body.entry, node)]
+  if !piece.started { return () }
+  let base = Bytes.length(&out.code)
+  let code = Bytes.asSlice(&body.straight.code)
+  let relocations = List<Relocation>.asSlice(&body.straight.relocations)
+  let mut at = piece.relocationStart
+  while at < piece.relocationEnd {
+    let relocation = relocations[at]
+    run List<Relocation>.append(&mut out.*.relocations, Relocation {offset: relocation.offset - piece.start + base, kind: relocation.kind,
+      target: relocation.target, addend: relocation.addend})
+    at = at + usize.ONE
+  }
+  let locations = List<u64>.asSlice(&body.straight.locations)
+  at = piece.locationStart
+  while at + usize.ONE < piece.locationEnd {
+    let offset = u64.toUsize(locations[at]) - piece.start + base
+    let count = List<u64>.length(&out.locations)
+    if count >= 2 && List<u64>.get(&out.locations, count - 2) == usize.toU64(offset) {
+      List<u64>.set(&mut out.*.locations, count - usize.ONE, locations[at + usize.ONE])
+    } else if !(count >= 2 && List<u64>.get(&out.locations, count - usize.ONE) == locations[at + usize.ONE]) {
+      run List<u64>.append(&mut out.*.locations, usize.toU64(offset))
+      run List<u64>.append(&mut out.*.locations, locations[at + usize.ONE])
+    }
+    at = at + 2
+  }
+  return run Bytes.append(&mut out.*.code, Slice.view<u8>(code, piece.start, piece.end - piece.start))
+}
+
+// Pushes lane `lane` of `value` into `out`.
+effect fn pushInto(body: &Body, out: &mut Emission, value: u64, lane: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let slot = List<Slot>.get(&body.slots, u64.toUsize(value))
+  return run pushSlot(&mut out.*, slot, lane, body.wide)
+}
+
+// Runs the queued structuring actions until none is left. With a `dispatch` local, a branch sets
+// it to its target's number and restarts the dispatch loop instead.
+effect fn drain(body: &Body, out: &mut Emission, graph: &Graph, labels: &mut List<Label>, actions: &mut List<Action>, dispatch: usize) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let pieces = List<Piece>.asSlice(&body.pieces)
+  while List<Action>.length(&actions.*) > usize.ZERO {
+    let action = List<Action>.get(&actions.*, List<Action>.length(&actions.*) - usize.ONE)
+    drop List<Action>.pop(&mut actions.*)
+    let node = action.first
+    if action.kind == actionBranch() && dispatch != usize.MAX {
+      let target = action.second
+      run WasmModule.i32Const(&mut out.*.code, usize.toU64(List<usize>.get(&graph.order, target)))
+      run WasmModule.localSet(&mut out.*.code, dispatch)
+      run branchTo(body, &mut out.*, List<Label>.asSlice(&labels.*), labelLoop(), usize.MAX)
+    } else if action.kind == actionTree() {
+      if List<bool>.get(&graph.header, node) {
+        run WasmModule.structured(&mut out.*.code, WasmModule.opLoop())
+        run List<Label>.append(&mut labels.*, Label {kind: labelLoop(), block: node})
+        run List<Action>.append(&mut actions.*, Action {kind: actionEndLoop(), first: node, second: usize.ZERO})
+      }
+      run List<Action>.append(&mut actions.*, Action {kind: actionWithin(), first: node, second: usize.ZERO})
+    } else if action.kind == actionWithin() {
+      let start = List<usize>.get(&graph.childStart, node)
+      let end = List<usize>.get(&graph.childStart, node + usize.ONE)
+      if start + action.second >= end {
+        run List<Action>.append(&mut actions.*, Action {kind: actionBody(), first: node, second: usize.ZERO})
+      } else {
+        let child = List<usize>.get(&graph.children, start + action.second)
+        run WasmModule.structured(&mut out.*.code, WasmModule.opBlock())
+        run List<Label>.append(&mut labels.*, Label {kind: labelBlock(), block: child})
+        run List<Action>.append(&mut actions.*, Action {kind: actionTree(), first: child, second: usize.ZERO})
+        run List<Action>.append(&mut actions.*, Action {kind: actionEndBlock(), first: child, second: usize.ZERO})
+        run List<Action>.append(&mut actions.*, Action {kind: actionWithin(), first: node, second: action.second + usize.ONE})
+      }
+    } else if action.kind == actionBody() {
+      run copyPiece(body, &mut out.*, node)
+      let piece = &pieces[blockOfNode(body.entry, node)]
+      run locateIn(&mut out.*, piece.place)
+      run terminate(body, &mut out.*, piece, node, &mut actions.*, &mut labels.*)
+    } else if action.kind == actionBranch() {
+      let target = action.second
+      let from = List<usize>.get(&graph.order, node)
+      let to = List<usize>.get(&graph.order, target)
+      if to <= from {
+        run branchTo(body, &mut out.*, List<Label>.asSlice(&labels.*), labelLoop(), target)
+      } else if List<bool>.get(&graph.merge, target) {
+        run branchTo(body, &mut out.*, List<Label>.asSlice(&labels.*), labelBlock(), target)
+      } else {
+        run List<Action>.append(&mut actions.*, Action {kind: actionTree(), first: target, second: usize.ZERO})
+      }
+    } else if action.kind == actionEndBlock() {
+      run op(&mut out.*, WasmModule.opEnd())
+      drop List<Label>.pop(&mut labels.*)
+    } else if action.kind == actionEndLoop() {
+      run op(&mut out.*, WasmModule.opEnd())
+      drop List<Label>.pop(&mut labels.*)
+      run op(&mut out.*, WasmModule.opUnreachable())
+    } else if action.kind == actionElse() {
+      run op(&mut out.*, WasmModule.opElse())
+    } else if action.kind == actionEndIf() {
+      run op(&mut out.*, WasmModule.opEnd())
+      drop List<Label>.pop(&mut labels.*)
+      run op(&mut out.*, WasmModule.opUnreachable())
+    } else if action.kind == actionEndCase() {
+      run op(&mut out.*, WasmModule.opEnd())
+      drop List<Label>.pop(&mut labels.*)
+    } else if action.kind == actionCase() {
+      // The test of switch case `second` of node `first`, opening its `if`.
+      let piece = &pieces[blockOfNode(body.entry, node)]
+      let kind = body.kindOf(piece.value)
+      run pushInto(body, &mut out.*, piece.value, usize.ZERO)
+      let bits = List<u64>.get(&piece.cases, action.second * 2)
+      if kind.lane == WasmModule.i64Type() {
+        run WasmModule.i64Const(&mut out.*.code, bits)
+        run op(&mut out.*, 0x51)
+      } else {
+        run WasmModule.i32Const(&mut out.*.code, bits)
+        run op(&mut out.*, 0x46)
+      }
+      run WasmModule.structured(&mut out.*.code, WasmModule.opIf())
+      run List<Label>.append(&mut labels.*, Label {kind: labelIf(), block: usize.MAX})
+    }
+  }
+  return ()
+}
+
+// `br` to the label of `kind` that `node` opened.
+effect fn branchTo(body: &Body, out: &mut Emission, labels: &[Label], kind: u8, node: usize) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let mut depth = usize.ZERO
+  let mut at = labels.length
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    if labels[at].kind == kind && labels[at].block == node {
+      return run WasmModule.opIndex(&mut out.*.code, WasmModule.opBr(), depth)
+    }
+    depth = depth + usize.ONE
+  }
+  return run WasmObject.unsupported(b"a branch to a block outside its structure", Bytes.asSlice(&body.symbol))
+}
+
+// Queues the structured form of a node's exit: its branches, in the order they run.
+effect fn terminate(body: &Body, out: &mut Emission, piece: &Piece, node: usize, actions: &mut List<Action>, labels: &mut List<Label>) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let exit = piece.exit
+  let entry = body.entry
+  if exit == exitJump() {
+    return run List<Action>.append(&mut actions.*, Action {kind: actionBranch(), first: node, second: blockOfNode(entry, piece.first)})
+  }
+  if exit == exitBranch() {
+    run pushInto(body, &mut out.*, piece.value, usize.ZERO)
+    run WasmModule.structured(&mut out.*.code, WasmModule.opIf())
+    // The `if` is a label until `actionEndIf` closes it, so branches inside it count it.
+    run List<Label>.append(&mut labels.*, Label {kind: labelIf(), block: usize.MAX})
+    run List<Action>.append(&mut actions.*, Action {kind: actionEndIf(), first: node, second: usize.ZERO})
+    run List<Action>.append(&mut actions.*, Action {kind: actionBranch(), first: node, second: blockOfNode(entry, piece.second)})
+    run List<Action>.append(&mut actions.*, Action {kind: actionElse(), first: node, second: usize.ZERO})
+    run List<Action>.append(&mut actions.*, Action {kind: actionBranch(), first: node, second: blockOfNode(entry, piece.first)})
+    return ()
+  }
+  if exit == exitSwitch() {
+    run List<Action>.append(&mut actions.*, Action {kind: actionBranch(), first: node, second: blockOfNode(entry, piece.first)})
+    let cases = List<u64>.length(&piece.cases) / 2
+    let mut at = cases
+    while at > usize.ZERO {
+      at = at - usize.ONE
+      run List<Action>.append(&mut actions.*, Action {kind: actionEndCase(), first: node, second: at})
+      run List<Action>.append(&mut actions.*, Action {kind: actionBranch(), first: node,
+        second: blockOfNode(entry, u64.toUsize(List<u64>.get(&piece.cases, at * 2 + usize.ONE)))})
+      run List<Action>.append(&mut actions.*, Action {kind: actionCase(), first: node, second: at})
+    }
+    return ()
+  }
+  if exit == exitReturn() {
+    if body.frame != usize.MAX {
+      run WasmModule.localGet(&mut out.*.code, body.saved)
+      run WasmModule.globalSet(&mut out.*.code, usize.ZERO)
+    }
+    if piece.value != none() {
+      let lanes = body.kindOf(piece.value).lanes()
+      let mut lane = usize.ZERO
+      while lane < lanes {
+        run pushInto(body, &mut out.*, piece.value, lane)
+        lane = lane + usize.ONE
+      }
+    }
+    return run op(&mut out.*, WasmModule.opReturn())
+  }
+  return run op(&mut out.*, WasmModule.opUnreachable())
+}
