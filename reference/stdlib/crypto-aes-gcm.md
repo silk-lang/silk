@@ -15,6 +15,10 @@ and the tag is 16 bytes. The tag is separate from the ciphertext ("detached"), s
 both. The associated data (`aad`) is authenticated but not encrypted. Use it for headers that
 must stay readable. The ciphertext has the same length as the plaintext. Nothing allocates.
 
+For data that arrives in parts, such as a stream or a Node.js `createCipheriv` call, use
+[`AesGcmEncryptor`](#AesGcmEncryptor) and [`AesGcmDecryptor`](#AesGcmDecryptor). They take the message in any split, give the same
+result, accept nonces of any nonzero length, and can write a truncated tag.
+
 ## Errors
 The functions return an [`AesGcmError`](#AesGcmError). All checks come before the first write, and on any
 error the output buffers do not change. [`AesGcm.open`](#AesGcm.impl.open) writes no plaintext unless the tag is
@@ -97,7 +101,7 @@ pub fn main() -> i32 {
 
 Import as `AesGcm` with `import silk.crypto.aes_gcm { AesGcm }`.
 
-Public declarations: 2.
+Public declarations: 4.
 
 <a id="AesGcmError"></a>
 
@@ -302,6 +306,199 @@ All checks come before the first write. On an error, `plaintext` does not change
 #### Gotchas
 Authentication does not stop replay: an attacker can send an old valid message again. The
 function does not erase its copy of the key.
+
+<a id="AesGcmEncryptor"></a>
+
+## `AesGcmEncryptor`
+
+```silk
+pub struct AesGcmEncryptor
+```
+
+A streaming AES-GCM encryptor (NIST SP 800-38D) for a message that arrives in parts.
+
+### When to use
+
+Use it when the message does not fit in one buffer, or to implement an API that encrypts in
+steps, such as `createCipheriv("aes-256-gcm")` in Node.js. For a message in one slice, use
+[`AesGcm.seal`](#AesGcm.impl.seal).
+
+### Details
+
+Make one with [`AesGcmEncryptor.make`](#AesGcmEncryptor.impl.make) and the associated data, give the message with
+[`AesGcmEncryptor.update`](#AesGcmEncryptor.impl.update), then call [`AesGcmEncryptor.finish`](#AesGcmEncryptor.impl.finish) for the tag. Any split of the
+message gives the same ciphertext and tag as [`AesGcm.seal`](#AesGcm.impl.seal). The key is 16, 24, or 32 bytes.
+The nonce can have any nonzero length: a 12-byte nonce is used directly, and other lengths are
+hashed as NIST SP 800-38D section 7.1 says. Nothing allocates.
+
+### Gotchas
+
+The same key and nonce must never encrypt two messages. Prefer 12-byte nonces, which are the
+only length that [`AesGcm.seal`](#AesGcm.impl.seal) takes. The value holds key material and is not erased when it
+is dropped.
+
+<a id="AesGcmEncryptor.impl"></a>
+
+## Implementation `AesGcmEncryptor`
+
+```silk
+impl AesGcmEncryptor
+```
+
+<a id="AesGcmEncryptor.impl.make"></a>
+
+### Associated function `make`
+
+```silk
+pub fn make(key: &[u8], nonce: &[u8], aad: &[u8]) -> Result<AesGcmEncryptor, AesGcmError>
+```
+
+Returns an encryptor for `key` and `nonce` that authenticates the associated data `aad`.
+
+`aad` is authenticated but not encrypted. Use it for headers that must stay readable. The
+encryptor copies what it needs and does not borrow the arguments.
+
+#### Errors
+
+- `InvalidKeyLength` if `key` is not 16, 24, or 32 bytes.
+- `InvalidNonceLength` if `nonce` is empty or longer than 2^61 - 1 bytes.
+- `LimitExceeded` if `aad` is longer than 2^61 - 1 bytes.
+
+<a id="AesGcmEncryptor.impl.update"></a>
+
+### Method `update`
+
+```silk
+pub fn update(self: &mut Self, plaintext: &[u8], ciphertext: &mut [u8]) -> Result<
+    (),
+    AesGcmError
+  >
+```
+
+Encrypts `plaintext` into the first `plaintext.length` bytes of `ciphertext`.
+
+The bytes of `ciphertext` after them do not change. The buffers must not overlap.
+
+#### Errors
+
+On an error the state and `ciphertext` do not change.
+
+- `OutputTooSmall` if `ciphertext` is shorter than `plaintext`.
+- `LimitExceeded` if the message grows past 2^36 - 32 bytes.
+
+<a id="AesGcmEncryptor.impl.finish"></a>
+
+### Method `finish`
+
+```silk
+pub fn finish(self: Self, tag: &mut [u8]) -> Result<(), AesGcmError>
+```
+
+Writes the authentication tag to `tag` and consumes the state.
+
+`tag` is 16 bytes for the full tag, or 4, 8, 12, 13, 14, or 15 bytes for a prefix of it, as
+NIST SP 800-38D allows. Shorter tags are easier to forge.
+
+#### Errors
+
+- `InvalidTagLength` if `tag` has another length. `tag` does not change.
+
+<a id="AesGcmDecryptor"></a>
+
+## `AesGcmDecryptor`
+
+```silk
+pub struct AesGcmDecryptor
+```
+
+A streaming AES-GCM decryptor (NIST SP 800-38D) for a ciphertext that arrives in parts.
+
+### When to use
+
+Use it when the ciphertext does not fit in one buffer, or to implement an API that decrypts in
+steps, such as `createDecipheriv("aes-256-gcm")` in Node.js. For a ciphertext in one slice, use
+[`AesGcm.open`](#AesGcm.impl.open), which writes no plaintext unless the tag is correct.
+
+### Details
+
+Make one with [`AesGcmDecryptor.make`](#AesGcmDecryptor.impl.make) and the associated data, give the ciphertext with
+[`AesGcmDecryptor.update`](#AesGcmDecryptor.impl.update), then call [`AesGcmDecryptor.finish`](#AesGcmDecryptor.impl.finish) with the received tag. The key
+is 16, 24, or 32 bytes. The nonce can have any nonzero length. Nothing allocates.
+
+### Gotchas
+
+[`AesGcmDecryptor.update`](#AesGcmDecryptor.impl.update) writes plaintext before the tag is checked. Do not use or release
+that plaintext until [`AesGcmDecryptor.finish`](#AesGcmDecryptor.impl.finish) succeeds. The value holds key material and is
+not erased when it is dropped.
+
+<a id="AesGcmDecryptor.impl"></a>
+
+## Implementation `AesGcmDecryptor`
+
+```silk
+impl AesGcmDecryptor
+```
+
+<a id="AesGcmDecryptor.impl.make"></a>
+
+### Associated function `make`
+
+```silk
+pub fn make(key: &[u8], nonce: &[u8], aad: &[u8]) -> Result<AesGcmDecryptor, AesGcmError>
+```
+
+Returns a decryptor for `key` and `nonce` that authenticates the associated data `aad`.
+
+`aad` must be the same bytes that the encryptor got. The decryptor copies what it needs and
+does not borrow the arguments.
+
+#### Errors
+
+- `InvalidKeyLength` if `key` is not 16, 24, or 32 bytes.
+- `InvalidNonceLength` if `nonce` is empty or longer than 2^61 - 1 bytes.
+- `LimitExceeded` if `aad` is longer than 2^61 - 1 bytes.
+
+<a id="AesGcmDecryptor.impl.update"></a>
+
+### Method `update`
+
+```silk
+pub fn update(self: &mut Self, ciphertext: &[u8], plaintext: &mut [u8]) -> Result<
+    (),
+    AesGcmError
+  >
+```
+
+Decrypts `ciphertext` into the first `ciphertext.length` bytes of `plaintext`.
+
+The plaintext is not authenticated until [`AesGcmDecryptor.finish`](#AesGcmDecryptor.impl.finish) succeeds. The bytes of
+`plaintext` after the written ones do not change. The buffers must not overlap.
+
+#### Errors
+
+On an error the state and `plaintext` do not change.
+
+- `OutputTooSmall` if `plaintext` is shorter than `ciphertext`.
+- `LimitExceeded` if the ciphertext grows past 2^36 - 32 bytes.
+
+<a id="AesGcmDecryptor.impl.finish"></a>
+
+### Method `finish`
+
+```silk
+pub fn finish(self: Self, tag: &[u8]) -> Result<(), AesGcmError>
+```
+
+Checks the received `tag` and consumes the state.
+
+`tag` is the full 16-byte tag or a 4, 8, 12, 13, 14, or 15-byte prefix of it. The comparison
+takes the same time wherever the bytes differ.
+
+#### Errors
+
+- `AuthenticationFailed` if the tag is not correct for the key, nonce, associated data, and
+  ciphertext. Discard all plaintext that [`AesGcmDecryptor.update`](#AesGcmDecryptor.impl.update) wrote.
+- `InvalidTagLength` if `tag` has another length.
 
 
 Category: Cryptography.
