@@ -21,8 +21,8 @@ Every call returns at once. Nothing in this module waits for the child:
 - `ExitWatch.open` gives a descriptor that becomes readable when the child ends: a pidfd on
   Linux, and a kqueue with an `EVFILT_PROC` filter on Darwin. Register it with a reactor, such
   as `silk.io.reactor`, next to the pipes.
-- `Subprocess.tryWait` collects the exit status of an ended child, or returns `none` if the
-  child still runs.
+- `ExitWatch.collect` collects the exit status once the exit descriptor is readable.
+  `Subprocess.tryWait` collects it if the child has ended, or returns `none` if it still runs.
 
 The child starts with every signal unblocked, and with the default action for every signal that
 can be caught, so a signal that the parent blocks or ignores reaches the child normally.
@@ -32,7 +32,7 @@ Each operation fails with `SubprocessError`: the `SubprocessOperation` and the n
 code, such as 2 (`ENOENT`) when the program does not exist.
 
 ## Gotchas
-- Call `Subprocess.tryWait` after the child ends, or the child stays a zombie process.
+- Collect the status after the child ends, or the child stays a zombie process.
 - Collect the status of a child in one place only. A second `waitpid` for the same child, from
   other code, takes the status away.
 - A program is a path. This module does not search `PATH`.
@@ -82,10 +82,7 @@ effect fn program() -> i32 ! FileError | SubprocessError | OutOfMemoryError ? &m
   // Wait for the exit descriptor; a real program registers it with a reactor instead.
   let mut watched = [PollFd { fd: watch.descriptor(), events: 1, revents: 0 }]
   let _ready = unsafe poll(Pointer.fromMutSlice<PollFd>(&mut watched), 1, -1)
-  let status = match run Subprocess.tryWait(child.pid()) {
-    Option<ExitStatus>.Some { value } => value
-    Option<ExitStatus>.None => { return 1 }
-  }
+  let status = run watch.collect()
 
   // echo has ended, so its output is in the socket.
   let mut bytes: [u8; 8] = [0; 8]
