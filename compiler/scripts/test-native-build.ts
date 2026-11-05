@@ -2774,6 +2774,33 @@ const program = Effect.gen(function* () {
     tooOld.stderr,
     /^silk: Silk builds need Clang 22 or newer, but \S+clang-18 \(from SILK_CLANG\) is Clang 18; set SILK_CLANG or pass --clang the path of a newer Clang$/m,
   )
+  // Clang 22 miscompiles AVX-512 mask code (llvm/llvm-project#198220), so a profile with avx512vl
+  // and avx512dq needs Clang 23.
+  const twentyTwo = join(directory, 'clang-22')
+  yield* fs.writeFileString(
+    twentyTwo,
+    `#!/bin/sh\nif [ "$1" = --version ]; then echo 'clang version 22.1.8'; exit 0; fi\nexec ${quote(clang)} "$@"\n`,
+  )
+  yield* fs.chmod(twentyTwo, 0o755)
+  const masks = join(directory, 'masks')
+  yield* fs.makeDirectory(masks, { recursive: true })
+  yield* fs.writeFileString(
+    join(masks, 'silk.toml'),
+    '[package]\nname = "masks"\nversion = "0.0.0"\nsilk-version = "0.0.0"\nsource = "."\n' +
+      '\n[profiles.avx]\ntarget = "x86_64-unknown-linux-gnu"\ncpu = { features = ["avx512vl", "avx512dq"] }\n',
+  )
+  yield* fs.writeFileString(join(masks, 'main.silk'), 'pub fn main() -> i32 { return 0 }\n')
+  const maskRefused = yield* invoke(
+    silk,
+    ['build', '--manifest-path', join('masks', 'silk.toml'), '--profile', 'avx', '--stdlib', standardLibrary],
+    directory,
+    { ...process.env, SILK_CLANG: twentyTwo },
+  )
+  assert.equal(maskRefused.status, 2, maskRefused.stderr)
+  assert.match(
+    maskRefused.stderr,
+    /^silk: builds with avx512vl and avx512dq or avx512bw need Clang 23 or newer, but \S+clang-22 \(from SILK_CLANG\) is Clang 22; set SILK_CLANG or pass --clang the path of a newer Clang$/m,
+  )
   const threadedPath = join(threads, 'build/llvm/wasm32-unknown-unknown/web/threads')
   const threadedModule = new WebAssembly.Module(yield* fs.readFile(threadedPath))
   assert.deepEqual(
