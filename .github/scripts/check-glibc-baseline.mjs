@@ -26,6 +26,7 @@ const otherBranches = new Set([
   'close$NOCANCEL', 'sysctlbyname', 'fstat', 'fstatat', 'posix_spawn_file_actions_addchdir_np',
   'mach_task_self_', 'mach_host_self', 'mach_thread_self', 'mach_port_deallocate', 'host_statistics64',
   'host_processor_info', 'vm_deallocate', 'task_info', 'thread_info', '_NSGetExecutablePath',
+  'kqueue', 'kevent', 'stat', 'lstat', 'fcopyfile', 'clonefile',
   // Windows
   'closesocket', 'ioctlsocket', '__silk_stderr_lock', '__silk_stderr_once',
   // The Tracy profiler, which a profiling build links as a declared input.
