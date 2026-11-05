@@ -412,6 +412,7 @@ effect fn allocate(
 
 impl Allocator for SuspendingAllocator {
   allocate: SuspendingAllocator.allocate
+  unsafe effect fn takeBlock(self: &mut Self, layout: Layout) -> ?*mut u8 { drop layout return Pointer.null<u8>() }
 }
 ```
 
