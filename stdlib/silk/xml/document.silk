@@ -1,0 +1,3103 @@
+//! Parse an XML 1.0 document into an owned, namespace-aware tree of elements, text, comments, and
+//! processing instructions.
+//!
+//! # When to use
+//! Use [`XmlDocument.parse`] to read a complete XML document, such as an SVG image, a feed, or a
+//! configuration file, from bytes. Use [`XmlDocument.parseWithLimits`] to lower the resource limits
+//! for input that you do not trust. Walk the tree from [`XmlDocument.root`] with
+//! [`XmlDocument.firstChild`] and [`XmlDocument.nextSibling`], read names with
+//! [`XmlDocument.localName`] and [`XmlDocument.namespaceUri`], and read attributes with
+//! [`XmlDocument.attribute`]. Use [`XmlPseudoAttributes.parse`] to read the pseudo-attributes of an
+//! `xml-stylesheet` processing instruction.
+//!
+//! # Details
+//! The parser follows XML 1.0 (Fifth Edition) and Namespaces in XML 1.0, and does not validate.
+//! It accepts UTF-8 and UTF-16 input, with or without a byte order mark, and checks the encoding
+//! declaration. It reads the internal DTD subset: general and parameter entities, attribute
+//! defaults, and ID attributes. It never fetches an external subset or an external entity. It skips
+//! their content, and [`XmlDocument.skippedExternalContent`] reports that it did.
+//!
+//! All nodes live in one arena in the document and are addressed by [`XmlNodeId`]. The document
+//! stores names, namespace URIs, text, and attribute values as normalized UTF-8, and the accessors
+//! return `string` views that borrow the document. Line ends are normalized to `\n`, character and
+//! entity references are replaced, and attribute values are normalized as XML requires. CDATA
+//! sections become text nodes. Comments, processing instructions, namespace declarations, and
+//! attributes in foreign namespaces are kept.
+//!
+//! # Errors
+//! - `XmlError` if the input is not well-formed, breaks a namespace rule, or exceeds an
+//!   [`XmlLimits`] bound. `reason` names the problem and `offset` gives its position. No partial
+//!   document is returned.
+//! - `OutOfMemoryError` if the `Allocator` cannot supply the document.
+//!
+//! # Gotchas
+//! An `XmlError` offset counts bytes of the decoded UTF-8 text with normalized line ends, not bytes
+//! of the input, except for an encoding error, whose offset counts input bytes. For UTF-16 input or
+//! input with `\r\n` line ends, the two differ.
+//!
+//! # Examples
+//! ## Count the children of the root that have an `id` attribute
+//! ```silk
+//! import silk.core.effect { Effect }
+//! import silk.core.option { Option }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.xml.document { XmlDocument, XmlError, XmlNodeId, XmlNodeKind }
+//!
+//! pub effect fn main() -> i32
+//!   ! XmlError | OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let source = b"<list><item id='a'/><item/><item id='c'>text</item></list>"
+//!   let document = run XmlDocument.parse(source) |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let mut count = 0
+//!   let mut child = document.firstChild(document.root())
+//!   while let Option<XmlNodeId>.Some { value } = child {
+//!     if document.kind(value) == XmlNodeKind.Element && document.attribute(value, "", "id").isSome() {
+//!       count = count + 1
+//!     }
+//!     child = document.nextSibling(value)
+//!   }
+//!   if count != 2 || document.localName(document.root()) != "list" {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! ## Read a namespaced attribute
+//! ```silk
+//! import silk.core.effect { Effect }
+//! import silk.core.option { Option }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.xml.document { XmlDocument, XmlError }
+//!
+//! pub effect fn main() -> i32
+//!   ! XmlError | OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let source = b"<svg xmlns='http://www.w3.org/2000/svg' xmlns:x='http://www.w3.org/1999/xlink' x:href='#a'/>"
+//!   let document = run XmlDocument.parse(source) |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let root = document.root()
+//!   let href = document.attribute(root, "http://www.w3.org/1999/xlink", "href")
+//!     |> Option<string>.unwrapOr("")
+//!   if href != "#a" || document.namespaceUri(root) != "http://www.w3.org/2000/svg" {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! # See also
+//! Use `silk.json.value` for JSON and `silk.toml.value` for TOML.
+//!
+//! @category Data formats
+import silk.core.ownership { Copy }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.option { Option }
+import silk.text.string { String }
+import silk.text.format { Debug, Format, Formatter }
+import silk.io.writer { Writer, WriterError }
+import silk.num.u8
+import silk.simd.u8x16
+import silk.simd.mask16
+import silk.num.usize
+import silk.num.u32
+
+/// The reason that XML input was rejected, carried by [`XmlError`].
+pub enum XmlReason {
+  /// The input is not valid UTF-8 or UTF-16, or the encoding declaration names an encoding that
+  /// the input does not use.
+  Encoding,
+  /// A character that XML does not allow, such as a control character, appears in the document
+  /// or is produced by a character reference.
+  InvalidCharacter,
+  /// A name, such as an element, attribute, entity, or target name, does not match the XML `Name`
+  /// production, or a namespace-aware name has more than one colon.
+  InvalidName,
+  /// The input ends inside markup, such as an unclosed tag, comment, or quoted value.
+  UnexpectedEnd,
+  /// Markup does not match the XML grammar, such as a missing `=` or quote, or a `<` in an
+  /// attribute value.
+  Syntax,
+  /// The XML declaration or a markup declaration in the DTD is malformed.
+  Declaration,
+  /// The document has content after the root element that is not a comment, a processing
+  /// instruction, or white space.
+  Structure,
+  /// An end tag does not have the name of the element that it closes.
+  MismatchedTag,
+  /// An element has two attributes with the same qualified name or the same namespace URI and
+  /// local name, or a pseudo-attribute appears two times.
+  DuplicateAttribute,
+  /// A prefix is not declared, or a declaration binds the reserved `xml` or `xmlns` prefix or
+  /// namespace URI incorrectly.
+  Namespace,
+  /// A reference names an entity that is not declared, in a document where XML requires the
+  /// declaration.
+  UndeclaredEntity,
+  /// An entity refers to itself, directly or through other entities.
+  RecursiveEntity,
+  /// An attribute value refers to an external entity.
+  ExternalEntityInAttribute,
+  /// Content refers to an unparsed entity, which is declared with `NDATA`.
+  UnparsedEntity,
+  /// The replacement text of an entity starts or ends an element or other markup that the entity
+  /// does not also close or open.
+  EntityBoundary,
+  /// The input exceeds a bound of the [`XmlLimits`] that the parse used.
+  Limit,
+}
+
+impl Debug for XmlReason {
+  /// Writes the name of the variant, such as `MismatchedTag`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      XmlReason.Encoding => run Format.write(&mut formatter, b"Encoding")
+      XmlReason.InvalidCharacter => run Format.write(&mut formatter, b"InvalidCharacter")
+      XmlReason.InvalidName => run Format.write(&mut formatter, b"InvalidName")
+      XmlReason.UnexpectedEnd => run Format.write(&mut formatter, b"UnexpectedEnd")
+      XmlReason.Syntax => run Format.write(&mut formatter, b"Syntax")
+      XmlReason.Declaration => run Format.write(&mut formatter, b"Declaration")
+      XmlReason.Structure => run Format.write(&mut formatter, b"Structure")
+      XmlReason.MismatchedTag => run Format.write(&mut formatter, b"MismatchedTag")
+      XmlReason.DuplicateAttribute => run Format.write(&mut formatter, b"DuplicateAttribute")
+      XmlReason.Namespace => run Format.write(&mut formatter, b"Namespace")
+      XmlReason.UndeclaredEntity => run Format.write(&mut formatter, b"UndeclaredEntity")
+      XmlReason.RecursiveEntity => run Format.write(&mut formatter, b"RecursiveEntity")
+      XmlReason.ExternalEntityInAttribute => run Format.write(
+        &mut formatter,
+        b"ExternalEntityInAttribute",
+      )
+      XmlReason.UnparsedEntity => run Format.write(&mut formatter, b"UnparsedEntity")
+      XmlReason.EntityBoundary => run Format.write(&mut formatter, b"EntityBoundary")
+      XmlReason.Limit => run Format.write(&mut formatter, b"Limit")
+    }
+  }
+}
+
+/// The failure of an XML parse: what was wrong, and where.
+///
+/// # Details
+///
+/// `offset` counts bytes of the decoded UTF-8 text with normalized line ends, except for an
+/// [`XmlReason.Encoding`] failure, where it counts bytes of the input. An error that is found
+/// in the replacement text of an entity gives the offset of the reference or the declaration that
+/// contains it.
+pub struct XmlError {
+  /// The reason that the input was rejected.
+  pub reason: XmlReason,
+  /// The byte position of the problem.
+  pub offset: usize,
+}
+
+impl Copy for XmlError {}
+
+impl Debug for XmlError {
+  /// Writes the fields, as `XmlError { reason: ..., offset: ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return run Format.debugFields(self, "XmlError", &mut formatter)
+  }
+}
+
+/// The resource bounds of one XML parse.
+///
+/// # When to use
+///
+/// Use [`XmlLimits.make`] for the defaults, which suit untrusted input, and lower a field before
+/// you pass the limits to [`XmlDocument.parseWithLimits`] or [`XmlPseudoAttributes.parse`].
+///
+/// # Details
+///
+/// When the input exceeds a bound, the parse fails with [`XmlReason.Limit`] and returns no
+/// document.
+///
+/// # Gotchas
+///
+/// `maxDepth` and `maxEntityDepth` can only lower the hard ceilings of 256 and 32. A larger value
+/// has no effect.
+pub struct XmlLimits {
+  /// The largest input, in bytes. The default is 16 MiB.
+  pub maxInputBytes: usize,
+  /// The largest total of retained UTF-8 for names, namespace URIs, text, and values. The default
+  /// is 64 MiB.
+  pub maxStorageBytes: usize,
+  /// The largest total of bytes that entity references and character references can add, which
+  /// bounds entity expansion attacks. The default is 8 MiB.
+  pub maxExpandedBytes: usize,
+  /// The largest number of nodes in the document. The default is one million.
+  pub maxNodes: usize,
+  /// The largest number of attributes in the document, and of attribute defaults in the DTD. The
+  /// default is one million.
+  pub maxAttributes: usize,
+  /// The largest number of markup declarations in the DTD. The default is one million.
+  pub maxDeclarations: usize,
+  /// The deepest element nesting. The default is 256, which is also the ceiling.
+  pub maxDepth: usize,
+  /// The deepest nesting of entity references. The default is 32, which is also the ceiling.
+  pub maxEntityDepth: usize,
+}
+
+impl Copy for XmlLimits {}
+
+impl XmlLimits {
+  /// Returns the default limits: 16 MiB of input, 64 MiB of retained text, 8 MiB of entity
+  /// expansion, one million nodes, attributes, and declarations, element depth 256, and entity
+  /// depth 32.
+  ///
+  /// # When to use
+  ///
+  /// Use the result as it is for [`XmlDocument.parseWithLimits`], or lower one field first to
+  /// tighten one bound.
+  pub fn make() -> XmlLimits {
+    return XmlLimits {
+      maxInputBytes: 16777216,
+      maxStorageBytes: 67108864,
+      maxExpandedBytes: 8388608,
+      maxNodes: 1000000,
+      maxAttributes: 1000000,
+      maxDeclarations: 1000000,
+      maxDepth: 256,
+      maxEntityDepth: 32,
+    }
+  }
+}
+
+/// The position of one node in the arena of an [`XmlDocument`].
+///
+/// # Gotchas
+///
+/// An id is meaningful only for the document that produced it. The accessors of
+/// [`XmlDocument`] return empty or absent results for an id that is out of range.
+pub struct XmlNodeId {
+  /// The index of the node in [`XmlDocument.nodes`].
+  pub index: usize
+}
+
+impl Copy for XmlNodeId {}
+
+/// The kind of one node of an [`XmlDocument`].
+pub enum XmlNodeKind {
+  /// An element, with a name, attributes, and children.
+  Element,
+  /// Character data, from text or a CDATA section, with references replaced.
+  Text,
+  /// A comment. Its text is the content between `<!--` and `-->`.
+  Comment,
+  /// A processing instruction. Its local name is the target and its text is the content after
+  /// the target.
+  ProcessingInstruction
+}
+
+struct Span {
+  start: usize,
+  end: usize
+}
+
+impl Copy for Span {}
+
+fn empty() -> Span {
+  return Span { start: 0, end: 0 }
+}
+
+struct Name {
+  qualified: Span,
+  local: Span,
+  uri: Span
+}
+
+impl Copy for Name {}
+
+/// One attribute of an element of an [`XmlDocument`], read with the attribute functions of the
+/// document.
+///
+/// # Details
+///
+/// The value is a handle into the document that produced it. Pass it to
+/// [`XmlDocument.attributeLocalName`], [`XmlDocument.attributeNamespaceUri`],
+/// [`XmlDocument.attributeValue`], or [`XmlDocument.attributeIsId`] of that document.
+pub struct XmlAttribute {
+  name: usize,
+  value: Span,
+  isId: bool,
+}
+
+impl Copy for XmlAttribute {}
+
+/// One node in the arena of an [`XmlDocument`]: its kind, its parent, and private links to its
+/// name, value, attributes, and children.
+pub struct XmlNode {
+  /// The kind of the node.
+  pub kind: XmlNodeKind,
+  /// The element that contains the node, or `None` for the root element and for comments and
+  /// processing instructions outside it.
+  pub parent: Option<XmlNodeId>,
+  name: usize,
+  value: Span,
+  attributes: Span,
+  first: Option<XmlNodeId>,
+  last: Option<XmlNodeId>,
+  next: Option<XmlNodeId>,
+}
+
+impl Copy for XmlNode {}
+
+/// The byte encoding of the input of an [`XmlDocument`].
+pub enum XmlEncoding {
+  /// UTF-8, with or without a byte order mark.
+  Utf8,
+  /// UTF-16 little-endian.
+  Utf16Le,
+  /// UTF-16 big-endian.
+  Utf16Be
+}
+
+/// A parsed XML document: an arena of nodes and the UTF-8 text of their names and values.
+///
+/// # When to use
+///
+/// Use [`XmlDocument.parse`] or [`XmlDocument.parseWithLimits`] to make one. Walk it from
+/// [`XmlDocument.root`] with [`XmlDocument.firstChild`] and [`XmlDocument.nextSibling`], or visit
+/// every node in document order with [`XmlDocument.nodes`].
+///
+/// # Details
+///
+/// Every name, namespace URI, text, and attribute value is a `string` view that borrows the
+/// document, so none of them can outlive it. Namespace prefixes are resolved: every element and
+/// attribute has a local name and a namespace URI, which is empty for no namespace. Nodes are
+/// stored in document order.
+pub struct XmlDocument {
+  storage: Bytes,
+  arena: List<XmlNode>,
+  names: List<Name>,
+  // nameKey of each entry in names, checked before comparing bytes.
+  nameKeys: List<u32>,
+  // Open-addressed index of names by nameKey: name id + 1 per slot, 0 when empty. Its length
+  // is a power of two over twice the name count (see indexName).
+  nameSlots: List<u32>,
+  attrs: List<XmlAttribute>,
+  rootId: XmlNodeId,
+  skippedExternal: bool,
+  sourceEncoding: XmlEncoding,
+}
+
+impl XmlDocument {
+  /// Parses `data` as a complete XML document with the default [`XmlLimits`].
+  ///
+  /// # When to use
+  ///
+  /// Use this function for input of ordinary size. Use [`XmlDocument.parseWithLimits`] to set
+  /// tighter bounds.
+  ///
+  /// # Details
+  ///
+  /// `data` is UTF-8 or UTF-16. A byte order mark, or the first character `<`, selects the
+  /// encoding. The parse reads the internal DTD subset and never fetches external content. The
+  /// defaults allow 16 MiB of input, 64 MiB of retained text, 8 MiB of entity expansion, one
+  /// million nodes, attributes, and declarations, element depth 256, and entity depth 32.
+  ///
+  /// # Errors
+  ///
+  /// - `XmlError` if `data` is not a well-formed, namespace-well-formed XML 1.0 document or
+  ///   exceeds a default limit. `reason` gives the cause and `offset` the position. No document is
+  ///   returned.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the document.
+  pub effect fn parse(data: &[u8]) -> XmlDocument
+    ! XmlError | OutOfMemoryError
+    ? &mut Allocator {
+    let limits = XmlLimits.make()
+    return run XmlDocument.parseWithLimits(data, &limits)
+  }
+
+  /// Parses `data` as a complete XML document, within the bounds of `limits`.
+  ///
+  /// # When to use
+  ///
+  /// Use this function for untrusted input where the default bounds of [`XmlDocument.parse`] are
+  /// too large, such as an upload size limit.
+  ///
+  /// # Details
+  ///
+  /// `data` is UTF-8 or UTF-16. A byte order mark, or the first character `<`, selects the
+  /// encoding. The parse reads the internal DTD subset and never fetches external content.
+  ///
+  /// # Errors
+  ///
+  /// - `XmlError` with [`XmlReason.Limit`] if the input exceeds a bound of `limits`.
+  /// - `XmlError` with another kind if `data` is not a well-formed, namespace-well-formed XML 1.0
+  ///   document. `offset` gives the position. No document is returned.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the document.
+  ///
+  /// # Gotchas
+  ///
+  /// `maxDepth` and `maxEntityDepth` can only lower the hard ceilings of 256 and 32.
+  pub effect fn parseWithLimits(data: &[u8], limits: &XmlLimits) -> XmlDocument
+    ! XmlError | OutOfMemoryError
+    ? &mut Allocator {
+    return run parseDocument(data, limits)
+  }
+
+  /// Returns the byte encoding of the input: UTF-8 or UTF-16 with its byte order.
+  ///
+  /// # Details
+  ///
+  /// The text that the document returns is always UTF-8. The encoding only describes the input.
+  pub fn encoding(self: &XmlDocument) -> XmlEncoding {
+    return self.sourceEncoding
+  }
+
+  /// Returns the id of the root element.
+  pub fn root(self: &XmlDocument) -> XmlNodeId {
+    return self.rootId
+  }
+
+  /// Returns every node of the document in document order, indexed by [`XmlNodeId`].
+  ///
+  /// # When to use
+  ///
+  /// Use this function to visit every node without walking the tree, or to read the
+  /// [`XmlNodeKind`] and parent of a node.
+  ///
+  /// # Details
+  ///
+  /// The node at index `id.index` is the node with that id. A node comes after its parent and
+  /// before its next sibling. The slice includes comments and processing instructions outside the
+  /// root element.
+  pub fn nodes(self: &XmlDocument) -> &[XmlNode] {
+    return List<XmlNode>.asSlice(&self.arena)
+  }
+
+  /// Returns the kind of node `id`, or [`XmlNodeKind.Text`] if `id` is out of range.
+  pub fn kind(self: &XmlDocument, id: XmlNodeId) -> XmlNodeKind {
+    if id.index >= List<XmlNode>.length(&self.arena) {
+      return XmlNodeKind.Text
+    }
+    return List<XmlNode>.get(&self.arena, id.index).kind
+  }
+
+  /// Returns the parent element of node `id`, or `None` for the root element, for a node outside
+  /// it, and for an id that is out of range.
+  pub fn parent(self: &XmlDocument, id: XmlNodeId) -> Option<XmlNodeId> {
+    if id.index >= List<XmlNode>.length(&self.arena) {
+      return Option<XmlNodeId>.None
+    }
+    return List<XmlNode>.get(&self.arena, id.index).parent
+  }
+
+  /// Returns `true` if the document declares an external DTD subset or an external entity whose
+  /// content the parse skipped.
+  ///
+  /// # When to use
+  ///
+  /// Use this function to tell if the document can depend on declarations that the parse did not
+  /// read, such as an entity or an attribute default in an external subset.
+  ///
+  /// # Details
+  ///
+  /// The parser never fetches external content. A reference to a skipped external entity in
+  /// content produces no node.
+  pub fn skippedExternalContent(self: &XmlDocument) -> bool {
+    return self.skippedExternal
+  }
+
+  /// Returns the first child of node `id`, or `None` if it has no children or `id` is out of
+  /// range.
+  ///
+  /// # Details
+  ///
+  /// Only elements have children. The children are elements, text, comments, and processing
+  /// instructions, in document order.
+  pub fn firstChild(self: &XmlDocument, id: XmlNodeId) -> Option<XmlNodeId> {
+    if id.index >= List<XmlNode>.length(&self.arena) {
+      return Option<XmlNodeId>.None
+    }
+    return List<XmlNode>.get(&self.arena, id.index).first
+  }
+
+  /// Returns the node after `id` that has the same parent, or `None` if `id` is the last child or
+  /// out of range.
+  ///
+  /// # Gotchas
+  ///
+  /// The root element and the comments and processing instructions outside it have no parent and
+  /// are not linked as siblings. Read them with [`XmlDocument.nodes`].
+  pub fn nextSibling(self: &XmlDocument, id: XmlNodeId) -> Option<XmlNodeId> {
+    if id.index >= List<XmlNode>.length(&self.arena) {
+      return Option<XmlNodeId>.None
+    }
+    return List<XmlNode>.get(&self.arena, id.index).next
+  }
+
+  /// Returns the local name of element `id`, without its prefix, or the target of processing
+  /// instruction `id`.
+  ///
+  /// # Details
+  ///
+  /// The result is empty for text, for comments, and for an id that is out of range. It borrows
+  /// the document.
+  pub fn localName<'a>(self: &'a XmlDocument, id: XmlNodeId) -> string<'a> {
+    if id.index >= List<XmlNode>.length(&self.arena) {
+      return ""
+    }
+    let n = List<XmlNode>.get(&self.arena, id.index).name
+    return text(&self.storage, List<Name>.get(&self.names, n).local)
+  }
+
+  /// Returns the name of element `id` as it is written in the source, with its prefix, or the
+  /// target of processing instruction `id`.
+  ///
+  /// # When to use
+  ///
+  /// Use this function to report a name to a person. Compare names with
+  /// [`XmlDocument.localName`] and [`XmlDocument.namespaceUri`], because the prefix of a namespace
+  /// can change between documents.
+  ///
+  /// # Details
+  ///
+  /// The result is empty for text, for comments, and for an id that is out of range. It borrows
+  /// the document.
+  pub fn qualifiedName<'a>(self: &'a XmlDocument, id: XmlNodeId) -> string<'a> {
+    if id.index >= List<XmlNode>.length(&self.arena) {
+      return ""
+    }
+    let n = List<XmlNode>.get(&self.arena, id.index).name
+    return text(&self.storage, List<Name>.get(&self.names, n).qualified)
+  }
+
+  /// Returns the namespace URI of element `id`, or an empty string if the element is in no
+  /// namespace.
+  ///
+  /// # Details
+  ///
+  /// The URI comes from the prefix of the element, or from the default namespace in scope for an
+  /// unprefixed element. The result is empty for other node kinds and for an id that is out of
+  /// range. It borrows the document.
+  pub fn namespaceUri<'a>(self: &'a XmlDocument, id: XmlNodeId) -> string<'a> {
+    if id.index >= List<XmlNode>.length(&self.arena) {
+      return ""
+    }
+    let n = List<XmlNode>.get(&self.arena, id.index).name
+    return text(&self.storage, List<Name>.get(&self.names, n).uri)
+  }
+
+  /// Returns the text of a text, comment, or processing instruction node.
+  ///
+  /// # Details
+  ///
+  /// For a text node, the result has references replaced and line ends normalized to `\n`. For a
+  /// processing instruction, it is the content after the target and its white space. The result is
+  /// empty for an element and for an id that is out of range. It borrows the document.
+  ///
+  /// # Gotchas
+  ///
+  /// The text of an element is in its child text nodes. Adjacent text, CDATA sections, and
+  /// references can form more than one text node.
+  pub fn text<'a>(self: &'a XmlDocument, id: XmlNodeId) -> string<'a> {
+    if id.index >= List<XmlNode>.length(&self.arena) {
+      return ""
+    }
+    return text(&self.storage, List<XmlNode>.get(&self.arena, id.index).value)
+  }
+
+  /// Returns the number of bytes of UTF-8 that the document holds for names, namespace URIs,
+  /// text, and attribute values.
+  ///
+  /// # Details
+  ///
+  /// The count includes values that [`XmlDocument.setAttribute`] replaced, until
+  /// [`XmlDocument.restore`] drops them.
+  pub fn byteLength(self: &XmlDocument) -> usize {
+    return Bytes.length(&self.storage)
+  }
+
+  /// Returns the number of attributes on all elements of the document, including attributes that
+  /// come from DTD defaults.
+  pub fn attributeCount(self: &XmlDocument) -> usize {
+    return List<XmlAttribute>.length(&self.attrs)
+  }
+
+  /// Returns the attributes of element `id` in source order, followed by the attributes that come
+  /// from DTD defaults.
+  ///
+  /// # Details
+  ///
+  /// The result includes namespace declarations, such as `xmlns` and `xmlns:x`, whose namespace
+  /// URI is `http://www.w3.org/2000/xmlns/`. It is empty for other node kinds and for an id that is
+  /// out of range.
+  pub fn attributes(self: &XmlDocument, id: XmlNodeId) -> &[XmlAttribute] {
+    if id.index >= List<XmlNode>.length(&self.arena) {
+      return &[]
+    }
+    let span = List<XmlNode>.get(&self.arena, id.index).attributes
+    return Slice.view<XmlAttribute>(
+      List<XmlAttribute>.asSlice(&self.attrs),
+      span.start,
+      span.end - span.start,
+    )
+  }
+
+  /// Returns the local name of `attr`, without its prefix.
+  ///
+  /// # Details
+  ///
+  /// `attr` must come from [`XmlDocument.attributes`] of this document. The result is empty for an
+  /// attribute of another document that is out of range. It borrows the document.
+  pub fn attributeLocalName<'a>(self: &'a XmlDocument, attr: XmlAttribute) -> string<'a> {
+    if attr.name >= List<Name>.length(&self.names) {
+      return ""
+    }
+    return text(&self.storage, List<Name>.get(&self.names, attr.name).local)
+  }
+
+  /// Returns the namespace URI of `attr`, or an empty string if it has no prefix.
+  ///
+  /// # Details
+  ///
+  /// An unprefixed attribute is in no namespace, even when a default namespace is in scope.
+  /// `attr` must come from [`XmlDocument.attributes`] of this document. The result borrows the
+  /// document.
+  pub fn attributeNamespaceUri<'a>(self: &'a XmlDocument, attr: XmlAttribute) -> string<'a> {
+    if attr.name >= List<Name>.length(&self.names) {
+      return ""
+    }
+    return text(&self.storage, List<Name>.get(&self.names, attr.name).uri)
+  }
+
+  /// Returns the name of `attr` as it is written in the source, with its prefix.
+  ///
+  /// # Details
+  ///
+  /// `attr` must come from [`XmlDocument.attributes`] of this document. The result borrows the
+  /// document.
+  pub fn attributeQualifiedName<'a>(self: &'a XmlDocument, attr: XmlAttribute) -> string<'a> {
+    if attr.name >= List<Name>.length(&self.names) {
+      return ""
+    }
+    return text(&self.storage, List<Name>.get(&self.names, attr.name).qualified)
+  }
+
+  /// Returns the normalized value of `attr`.
+  ///
+  /// # Details
+  ///
+  /// References are replaced and white space is normalized as XML requires, including the extra
+  /// collapsing for attributes that the DTD declares with a type other than `CDATA`. `attr` must
+  /// come from [`XmlDocument.attributes`] of this document. The result borrows the document.
+  pub fn attributeValue<'a>(self: &'a XmlDocument, attr: XmlAttribute) -> string<'a> {
+    if attr.value.end > Bytes.length(&self.storage) {
+      return ""
+    }
+    return text(&self.storage, attr.value)
+  }
+
+  /// Returns `true` if the DTD declares `attr` with type `ID`.
+  ///
+  /// # Details
+  ///
+  /// The `xml:id` attribute is an ID only when the DTD declares it. `attr` must come from
+  /// [`XmlDocument.attributes`] of this document.
+  pub fn attributeIsId(self: &XmlDocument, attr: XmlAttribute) -> bool {
+    return attr.name < List<Name>.length(&self.names) && attr.isId
+  }
+
+  /// Returns the value of the attribute of element `id` with local name `localName` in namespace
+  /// `namespaceUri`, or `None` if the element does not have it.
+  ///
+  /// # Details
+  ///
+  /// Pass an empty `namespaceUri` for an unprefixed attribute. The match uses the resolved
+  /// namespace URI, not the prefix in the source. The result borrows the document.
+  pub fn attribute<'a>(
+    self: &'a XmlDocument,
+    id: XmlNodeId,
+    namespaceUri: string,
+    localName: string,
+  ) -> Option<string<'a>> {
+    let uri = String.utf8Bytes(namespaceUri)
+    let local = String.utf8Bytes(localName)
+    let attrs = XmlDocument.attributes(self, id)
+    let mut i: usize = 0
+    while i < attrs.length {
+      let name = List<Name>.get(&self.names, attrs[i].name)
+      if name.local.end - name.local.start == local.length
+        && name.uri.end - name.uri.start == uri.length
+        && same(view(&self.storage, name.local), local)
+        && same(view(&self.storage, name.uri), uri) {
+        return Option<string>.some(text(&self.storage, attrs[i].value))
+      }
+      i = i + 1
+    }
+    return Option<string>.None
+  }
+}
+
+impl XmlDocument {
+  /// Sets the attribute of element `id` with local name `localName` in namespace `namespaceUri`
+  /// to `value`, and adds the attribute if the element does not have it.
+  ///
+  /// # When to use
+  ///
+  /// Use this function to apply computed values, such as animated attributes, to a parsed
+  /// document. Take an [`XmlSnapshot`] with [`XmlDocument.snapshot`] first and put it back with
+  /// [`XmlDocument.restore`] to undo the changes.
+  ///
+  /// # Details
+  ///
+  /// A new attribute has no prefix, so its qualified name is `localName`, and it is not an ID.
+  /// Changing an attribute does not change which attributes are IDs. Nothing happens if `id` is
+  /// not an element.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot store the value. The attributes of the
+  ///   element can be unchanged or already changed.
+  ///
+  /// # Gotchas
+  ///
+  /// The replaced value stays in the storage of the document, so repeated calls make the
+  /// document grow. [`XmlDocument.restore`] drops the replaced values.
+  pub effect fn setAttribute(
+    self: &mut XmlDocument,
+    id: XmlNodeId,
+    namespaceUri: string,
+    localName: string,
+    value: string,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let uri = String.utf8Bytes(namespaceUri)
+    let local = String.utf8Bytes(localName)
+    if id.index >= List<XmlNode>.length(&self.arena)
+      || List<XmlNode>.get(&self.arena, id.index).kind != XmlNodeKind.Element {
+      return
+    }
+    let start = Bytes.length(&self.storage)
+    run Bytes.append(&mut self.storage, String.utf8Bytes(value))
+    let span = Span { start: start, end: Bytes.length(&self.storage) }
+    let owned = List<XmlNode>.get(&self.arena, id.index).attributes
+    let mut i = owned.start
+    while i < owned.end {
+      let name = List<Name>.get(&self.names, List<XmlAttribute>.get(&self.attrs, i).name)
+      if same(view(&self.storage, name.uri), uri) && same(view(&self.storage, name.local), local) {
+        let attrs = List<XmlAttribute>.asMutSlice(&mut self.attrs)
+        attrs[i].value = span
+        return
+      }
+      i = i + 1
+    }
+    let uriStart = Bytes.length(&self.storage)
+    run Bytes.append(&mut self.storage, uri)
+    let localStart = Bytes.length(&self.storage)
+    run Bytes.append(&mut self.storage, local)
+    let localSpan = Span { start: localStart, end: Bytes.length(&self.storage) }
+    let name = run intern(
+      &mut self.*,
+      Name {
+        qualified: localSpan,
+        local: localSpan,
+        uri: Span { start: uriStart, end: localStart },
+      },
+    )
+
+    // An element's attributes are contiguous, so they move to the end with the new one.
+    let moved = List<XmlAttribute>.length(&self.attrs)
+    i = owned.start
+    while i < owned.end {
+      let copy = List<XmlAttribute>.get(&self.attrs, i)
+      run List<XmlAttribute>.append(&mut self.attrs, copy)
+      i = i + 1
+    }
+    run List<XmlAttribute>.append(
+      &mut self.attrs,
+      XmlAttribute { name: name, value: span, isId: false },
+    )
+    let end = List<XmlAttribute>.length(&self.attrs)
+    let nodes = List<XmlNode>.asMutSlice(&mut self.arena)
+    nodes[id.index].attributes = Span { start: moved, end: end }
+  }
+}
+
+/// The attribute state of an [`XmlDocument`] at one moment, taken with [`XmlDocument.snapshot`]
+/// and put back with [`XmlDocument.restore`].
+///
+/// # When to use
+///
+/// Use a snapshot when you apply values with [`XmlDocument.setAttribute`] many times, such as once
+/// for each frame of an animation. Restore the snapshot before each round, so that rounds do not
+/// see each other's values and the document does not grow with the number of rounds.
+///
+/// # Details
+///
+/// A snapshot owns a copy of the attribute list of the document. It does not borrow the document.
+pub struct XmlSnapshot {
+  storage: usize,
+  names: usize,
+  nodes: usize,
+  attrs: List<XmlAttribute>,
+  spans: List<Span>,
+  slots: List<u32>,
+}
+
+impl XmlDocument {
+  /// Returns an [`XmlSnapshot`] of the current attributes of every element.
+  ///
+  /// # Details
+  ///
+  /// The snapshot copies the attribute list, so it costs memory proportional to the number of
+  /// attributes and nodes. Pass it to [`XmlDocument.restore`] to undo later calls to
+  /// [`XmlDocument.setAttribute`].
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the copy. The document does not
+  ///   change.
+  pub effect fn snapshot(self: &XmlDocument) -> XmlSnapshot
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut attrs = run List<XmlAttribute>.makeWithCapacity(List<XmlAttribute>.length(&self.attrs))
+    run attrs.appendSlice(List<XmlAttribute>.asSlice(&self.attrs))
+    let nodes = List<XmlNode>.asSlice(&self.arena)
+    let mut spans = run List<Span>.makeWithCapacity(nodes.length)
+    let mut i: usize = 0
+    while i < nodes.length {
+      run spans.append(nodes[i].attributes)
+      i = i + 1
+    }
+    let mut slots = run List<u32>.makeWithCapacity(List<u32>.length(&self.nameSlots))
+    run slots.appendSlice(List<u32>.asSlice(&self.nameSlots))
+    return XmlSnapshot {
+      storage: Bytes.length(&self.storage),
+      names: List<Name>.length(&self.names),
+      nodes: nodes.length,
+      attrs: move attrs,
+      spans: move spans,
+      slots: move slots,
+    }
+  }
+
+  /// Puts back the attributes recorded in `snapshot`, and drops every attribute value and name
+  /// that [`XmlDocument.setAttribute`] stored since. Returns `false`, with no change, if
+  /// `snapshot` cannot come from this document.
+  ///
+  /// # Details
+  ///
+  /// The storage of the document shrinks back to its size when the snapshot was taken. A snapshot
+  /// can be restored any number of times.
+  ///
+  /// # Errors
+  ///
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the restored lists. The document can
+  ///   be partly restored. Restore the snapshot again to finish.
+  ///
+  /// # Gotchas
+  ///
+  /// The check compares sizes only. A snapshot of another document with the same number of nodes
+  /// and no more storage passes the check and gives that document's attributes to this one.
+  pub effect fn restore(self: &mut XmlDocument, snapshot: &XmlSnapshot) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if snapshot.nodes != List<XmlNode>.length(&self.arena)
+      || snapshot.storage > Bytes.length(&self.storage)
+      || snapshot.names > List<Name>.length(&self.names) {
+      return false
+    }
+    Bytes.truncate(&mut self.storage, snapshot.storage)
+    List<Name>.truncate(&mut self.names, snapshot.names)
+    List<u32>.truncate(&mut self.nameKeys, snapshot.names)
+    List<u32>.clear(&mut self.nameSlots)
+    run List<u32>.appendSlice(&mut self.nameSlots, List<u32>.asSlice(&snapshot.slots))
+    List<XmlAttribute>.clear(&mut self.attrs)
+    run List<XmlAttribute>.appendSlice(&mut self.attrs, List<XmlAttribute>.asSlice(&snapshot.attrs))
+    let nodes = List<XmlNode>.asMutSlice(&mut self.arena)
+    let spans = List<Span>.asSlice(&snapshot.spans)
+    let mut i: usize = 0
+    while i < nodes.length {
+      nodes[i].attributes = spans[i]
+      i = i + 1
+    }
+    return true
+  }
+}
+
+fn view(bytes: &Bytes, span: Span) -> &[u8] {
+  return Slice.view<u8>(Bytes.asSlice(bytes), span.start, span.end - span.start)
+}
+
+// Storage holds only decoded, checked UTF-8 and whole `string` values, and every span starts and
+// ends on a character boundary.
+fn text(bytes: &Bytes, span: Span) -> string {
+  return unsafe String.fromUtf8Unchecked(view(bytes, span))
+}
+
+fn same(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn space(c: u8) -> bool {
+  return c == 32 || c == 9 || c == 10 || c == 13
+}
+
+fn xmlChar(c: u32) -> bool {
+  return c == 9 || c == 10 || c == 13 || (c >= 32 && c <= 55295) || (c >= 57344 && c <= 65533)
+    || (c >= 65536 && c <= 1114111)
+}
+
+@inlineAlways
+effect fn appendBounded(out: &mut Bytes, value: &[u8], limit: usize, offset: usize) -> ()
+  ! XmlError | OutOfMemoryError
+  ? &mut Allocator {
+  if Bytes.length(&out.*) > limit || value.length > limit - Bytes.length(&out.*) {
+    fail XmlError { offset: offset, reason: XmlReason.Limit }
+  }
+  run Bytes.append(&mut out.*, value)
+}
+
+effect fn scalar(out: &mut Bytes, c: u32, limit: usize, offset: usize) -> ()
+  ! XmlError | OutOfMemoryError
+  ? &mut Allocator {
+  if !xmlChar(c) {
+    fail XmlError { offset: offset, reason: XmlReason.InvalidCharacter }
+  }
+  if c < 128 {
+    run appendBounded(&mut out.*, &[u32.toU8(c)], limit, offset)
+  } else if c < 2048 {
+    run appendBounded(&mut out.*, &[u32.toU8(192 + c / 64), u32.toU8(128 + c % 64)], limit, offset)
+  } else if c < 65536 {
+    run appendBounded(
+      &mut out.*,
+      &[u32.toU8(224 + c / 4096), u32.toU8(128 + c / 64 % 64), u32.toU8(128 + c % 64)],
+      limit,
+      offset,
+    )
+  } else {
+    run appendBounded(
+      &mut out.*,
+      &[
+        u32.toU8(240 + c / 262144),
+        u32.toU8(128 + c / 4096 % 64),
+        u32.toU8(128 + c / 64 % 64),
+        u32.toU8(128 + c % 64),
+      ],
+      limit,
+      offset,
+    )
+  }
+}
+
+struct Reader<'a> {
+  data: &'a [u8],
+  pos: usize,
+  origin: usize
+}
+
+// Callers pass short literals; the first byte rejects most positions before the compare.
+@inlineAlways
+fn at<'a>(r: &Reader<'a>, text: &[u8]) -> bool {
+  return text.length <= r.data.length - r.pos && (text.length == 0 || r.data[r.pos] == text[0])
+    && same(Slice.view<u8>(r.data, r.pos, (r.pos + text.length) - (r.pos)), text)
+}
+
+@inlineAlways
+fn take<'a>(r: &mut Reader<'a>, text: &[u8]) -> bool {
+  if !at(&r.*, text) {
+    return false
+  }
+  r.pos = r.pos + text.length
+  return true
+}
+
+fn whitespace<'a>(r: &mut Reader<'a>) -> bool {
+  let start = r.pos
+  while r.pos < r.data.length && space(r.data[r.pos]) {
+    r.pos = r.pos + 1
+  }
+  return start != r.pos
+}
+
+fn offset<'a>(r: &Reader<'a>) -> usize {
+  if r.origin != 0 {
+    return r.origin
+  }
+  return r.pos
+}
+
+effect fn require<'a>(r: &mut Reader<'a>, text: &[u8]) -> ()
+  ! XmlError {
+  if !take(&mut r.*, text) {
+    fail XmlError { offset: offset(&r.*), reason: XmlReason.Syntax }
+  }
+}
+
+effect fn requireSpace<'a>(r: &mut Reader<'a>) -> ()
+  ! XmlError {
+  if !whitespace(&mut r.*) {
+    fail XmlError { offset: offset(&r.*), reason: XmlReason.Syntax }
+  }
+}
+
+struct Codepoint {
+  value: u32,
+  length: usize
+}
+
+effect fn utf8(data: &[u8], pos: usize) -> Codepoint
+  ! XmlError {
+  if pos >= data.length {
+    fail XmlError { offset: pos, reason: XmlReason.UnexpectedEnd }
+  }
+  let first = data[pos]
+  if first < 128 {
+    return Codepoint { value: u8.toU32(first), length: 1 }
+  }
+  let mut n: usize = 0
+  let mut c: u32 = 0
+  let mut minimum: u32 = 0
+  if first >= 194 && first <= 223 {
+    n = 2
+    c = u8.toU32(first - 192)
+    minimum = 128
+  } else if first >= 224 && first <= 239 {
+    n = 3
+    c = u8.toU32(first - 224)
+    minimum = 2048
+  } else if first >= 240 && first <= 244 {
+    n = 4
+    c = u8.toU32(first - 240)
+    minimum = 65536
+  } else {
+    fail XmlError { offset: pos, reason: XmlReason.Encoding }
+  }
+  if n > data.length - pos {
+    fail XmlError { offset: pos, reason: XmlReason.Encoding }
+  }
+  let mut i: usize = 1
+  while i < n {
+    let b = data[pos + i]
+    if b < 128 || b > 191 {
+      fail XmlError { offset: pos + i, reason: XmlReason.Encoding }
+    }
+    c = c * 64 + u8.toU32(b - 128)
+    i = i + 1
+  }
+  if c < minimum || c > 1114111 || (c >= 55296 && c <= 57343) {
+    fail XmlError { offset: pos, reason: XmlReason.Encoding }
+  }
+  return Codepoint { value: c, length: n }
+}
+
+fn unit(data: &[u8], pos: usize, little: bool) -> u32 {
+  if little {
+    return u8.toU32(data[pos]) + u8.toU32(data[pos + 1]) * 256
+  }
+  return u8.toU32(data[pos]) * 256 + u8.toU32(data[pos + 1])
+}
+
+struct Decoded {
+  bytes: Bytes,
+  encoding: u8
+}
+
+effect fn decode(data: &[u8], limits: &XmlLimits) -> Decoded
+  ! XmlError | OutOfMemoryError
+  ? &mut Allocator {
+  if data.length > limits.maxInputBytes {
+    fail XmlError { offset: 0, reason: XmlReason.Limit }
+  }
+  let mut encoding: u8 = 0
+  let mut pos: usize = 0
+  if data.length >= 2 {
+    if data[0] == 255 && data[1] == 254 {
+      encoding = 1
+      pos = 2
+    } else if data[0] == 254 && data[1] == 255 {
+      encoding = 2
+      pos = 2
+    } else if data[0] == 0 && data[1] == 60 {
+      encoding = 2
+    } else if data[0] == 60 && data[1] == 0 {
+      encoding = 1
+    }
+  }
+  if data.length >= 3 && data[0] == 239 && data[1] == 187 && data[2] == 191 {
+    pos = 3
+  }
+  let mut out = Bytes.make()
+  let mut cr = false
+  while pos < data.length {
+    if encoding == 0 && data[pos] >= 32 && data[pos] < 128 {
+      let start = pos
+
+      // Sixteen bytes at a time while all are printable ASCII: 32 to 127 is below 96 after
+      // subtracting 32 with wraparound.
+      while pos + 16 <= data.length {
+        let outside = u8x16.lanesGreaterOrEqual(
+          u8x16.wrappingSubtract(u8x16.load(data, pos), u8x16.splat(32)),
+          u8x16.splat(96),
+        )
+        if mask16.any(outside) {
+          pos = pos + mask16.firstSet(outside)
+          break
+        }
+        pos = pos + 16
+      }
+      while pos < data.length && data[pos] >= 32 && data[pos] < 128 {
+        pos = pos + 1
+      }
+      run appendBounded(
+        &mut out,
+        Slice.view<u8>(data, start, pos - start),
+        limits.maxStorageBytes,
+        start,
+      )
+      cr = false
+      continue
+    }
+    let start = pos
+    let mut c: u32 = 0
+    if encoding == 0 {
+      let cp = run utf8(data, pos)
+      c = cp.value
+      pos = pos + cp.length
+    } else {
+      if data.length - pos < 2 {
+        fail XmlError { offset: pos, reason: XmlReason.Encoding }
+      }
+      c = unit(data, pos, encoding == 1)
+      pos = pos + 2
+      if c >= 55296 && c <= 56319 {
+        if data.length - pos < 2 {
+          fail XmlError { offset: start, reason: XmlReason.Encoding }
+        }
+        let low = unit(data, pos, encoding == 1)
+        if low < 56320 || low > 57343 {
+          fail XmlError { offset: pos, reason: XmlReason.Encoding }
+        }
+        pos = pos + 2
+        c = 65536 + (c - 55296) * 1024 + low - 56320
+      } else if c >= 56320 && c <= 57343 {
+        fail XmlError { offset: start, reason: XmlReason.Encoding }
+      }
+    }
+    if !xmlChar(c) {
+      fail XmlError { offset: start, reason: XmlReason.InvalidCharacter }
+    }
+    if c == 10 && cr {
+      cr = false
+      continue
+    }
+    cr = c == 13
+    if cr {
+      c = 10
+    }
+    run scalar(&mut out, c, limits.maxStorageBytes, start)
+  }
+  return Decoded { bytes: move out, encoding: encoding }
+}
+
+fn nameStart(c: u32) -> bool {
+  return c == 58 || c == 95 || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+    || (c >= 192 && c <= 214)
+    || (c >= 216 && c <= 246)
+    || (c >= 248 && c <= 767)
+    || (c >= 880 && c <= 893)
+    || (c >= 895 && c <= 8191)
+    || (c >= 8204 && c <= 8205)
+    || (c >= 8304 && c <= 8591)
+    || (c >= 11264 && c <= 12271)
+    || (c >= 12289 && c <= 55295)
+    || (c >= 63744 && c <= 64975)
+    || (c >= 65008 && c <= 65533)
+    || (c >= 65536 && c <= 983039)
+}
+
+fn nameChar(c: u32) -> bool {
+  return nameStart(c) || c == 45 || c == 46 || (c >= 48 && c <= 57) || c == 183
+    || (c >= 768 && c <= 879)
+    || (c >= 8255 && c <= 8256)
+}
+
+fn asciiNameChar(c: u8) -> bool {
+  return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 45 && c <= 58) && c != 47 || c == 95
+}
+
+effect fn name<'a>(r: &mut Reader<'a>) -> Span
+  ! XmlError {
+  let mut colon = false
+  return run scanName(&mut r.*, &mut colon)
+}
+
+// Reads a name, noting whether it has a colon (only ASCII bytes can be one).
+effect fn scanName<'a>(r: &mut Reader<'a>, colon: &mut bool) -> Span
+  ! XmlError {
+  let start = r.pos
+  if r.pos == r.data.length {
+    fail XmlError { offset: offset(&r.*), reason: XmlReason.UnexpectedEnd }
+  }
+  let lead = r.data[r.pos]
+  if lead < 128 {
+    if !nameStart(u8.toU32(lead)) {
+      fail XmlError { offset: offset(&r.*), reason: XmlReason.InvalidName }
+    }
+    r.pos = r.pos + 1
+  } else {
+    let first = run utf8(r.data, r.pos)
+    if !nameStart(first.value) {
+      fail XmlError { offset: offset(&r.*), reason: XmlReason.InvalidName }
+    }
+    r.pos = r.pos + first.length
+  }
+  while r.pos < r.data.length {
+    let byte = r.data[r.pos]
+    if byte < 128 {
+      if asciiNameChar(byte) {
+        if byte == 58 {
+          colon.* = true
+        }
+        r.pos = r.pos + 1
+        continue
+      }
+      break
+    }
+    let cp = run utf8(r.data, r.pos)
+    if !nameChar(cp.value) {
+      break
+    }
+    r.pos = r.pos + cp.length
+  }
+  return Span { start: start, end: r.pos }
+}
+
+effect fn qualifiedName<'a>(r: &mut Reader<'a>) -> Span
+  ! XmlError {
+  let span = run name(&mut r.*)
+  drop run localOffset(Slice.view<u8>(r.data, span.start, span.end - span.start), offset(&r.*))
+  return span
+}
+
+struct Prefixed {
+  span: Span,
+  local: usize,
+}
+
+// A qualified name and its local part's offset in it (0 when unprefixed), checked once.
+effect fn prefixedName<'a>(r: &mut Reader<'a>) -> Prefixed
+  ! XmlError {
+  let mut colon = false
+  let span = run scanName(&mut r.*, &mut colon)
+  if !colon && r.data[span.start] != 58 {
+    return Prefixed { span: span, local: 0 }
+  }
+  let local = run localOffset(
+    Slice.view<u8>(r.data, span.start, span.end - span.start),
+    offset(&r.*),
+  )
+  return Prefixed { span: span, local: local }
+}
+
+// The local part's offset in a qualified name that has already been checked.
+fn checkedLocal(data: &[u8]) -> usize {
+  let mut i: usize = 0
+  while i < data.length {
+    if data[i] == 58 {
+      return i + 1
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+effect fn ncname<'a>(r: &mut Reader<'a>) -> Span
+  ! XmlError {
+  let span = run name(&mut r.*)
+  let mut i = span.start
+  while i < span.end {
+    if r.data[i] == 58 {
+      fail XmlError { offset: offset(&r.*), reason: XmlReason.Namespace }
+    }
+    i = i + 1
+  }
+  return span
+}
+
+effect fn localOffset(data: &[u8], at: usize) -> usize
+  ! XmlError {
+  let mut local: usize = 0
+  let mut i: usize = 0
+  while i < data.length {
+    if data[i] == 58 {
+      if local != 0 || i == 0 || i + 1 == data.length {
+        fail XmlError { offset: at, reason: XmlReason.Namespace }
+      }
+      local = i + 1
+      let first = run utf8(data, local)
+      if !nameStart(first.value) || first.value == 58 {
+        fail XmlError { offset: at, reason: XmlReason.Namespace }
+      }
+    }
+    i = i + 1
+  }
+  return local
+}
+
+effect fn quoted<'a>(r: &mut Reader<'a>) -> Span
+  ! XmlError {
+  if r.pos == r.data.length || (r.data[r.pos] != 39 && r.data[r.pos] != 34) {
+    fail XmlError { offset: offset(&r.*), reason: XmlReason.Syntax }
+  }
+  let quote = r.data[r.pos]
+  r.pos = r.pos + 1
+  let start = r.pos
+  while r.pos + 16 <= r.data.length {
+    let found = u8x16.lanesEqual(u8x16.load(r.data, r.pos), u8x16.splat(quote))
+    if mask16.any(found) {
+      r.pos = r.pos + mask16.firstSet(found)
+      break
+    }
+    r.pos = r.pos + 16
+  }
+  while r.pos < r.data.length && r.data[r.pos] != quote {
+    r.pos = r.pos + 1
+  }
+  if r.pos == r.data.length {
+    fail XmlError { offset: offset(&r.*), reason: XmlReason.UnexpectedEnd }
+  }
+  let result = Span { start: start, end: r.pos }
+  r.pos = r.pos + 1
+  return result
+}
+
+@inlineAlways
+effect fn store(out: &mut Bytes, text: &[u8], limits: &XmlLimits, at: usize) -> Span
+  ! XmlError | OutOfMemoryError
+  ? &mut Allocator {
+  let start = Bytes.length(&out.*)
+  run appendBounded(&mut out.*, text, limits.maxStorageBytes, at)
+  return Span { start: start, end: Bytes.length(&out.*) }
+}
+
+struct Entity {
+  name: Span,
+  value: Span,
+  parameter: bool,
+  external: bool,
+  unparsed: bool
+}
+
+impl Copy for Entity {}
+
+enum AttributeType {
+  Cdata,
+  Tokenized,
+  Id
+}
+
+struct DefaultAttribute {
+  element: Span,
+  name: Span,
+  value: Span,
+  hasDefault: bool,
+  kind: AttributeType,
+}
+
+impl Copy for DefaultAttribute {}
+
+struct Dtd {
+  storage: Bytes,
+  entities: List<Entity>,
+  defaults: List<DefaultAttribute>,
+  external: bool,
+  skipped: bool,
+  standalone: bool,
+  // XML 4.1 WFC Entity Declared: any parameter entity reference in the internal subset
+  // turns an undeclared entity into a validity error unless standalone='yes'.
+  parameterReference: bool,
+  expanded: usize,
+  declarations: usize,
+}
+
+fn entity(dtd: &Dtd, key: &[u8], parameter: bool) -> Option<Entity> {
+  let entries = List<Entity>.asSlice(&dtd.entities)
+  let mut i: usize = 0
+  while i < entries.length {
+    if entries[i].parameter == parameter && same(view(&dtd.storage, entries[i].name), key) {
+      return Option<Entity>.some(entries[i])
+    }
+    i = i + 1
+  }
+  return Option<Entity>.None
+}
+
+effect fn charge(total: &mut usize, count: usize, limits: &XmlLimits, at: usize) -> ()
+  ! XmlError {
+  if total.* > limits.maxExpandedBytes || count > limits.maxExpandedBytes - total.* {
+    fail XmlError { offset: at, reason: XmlReason.Limit }
+  }
+  total.* = total.* + count
+}
+
+effect fn reference<'a>(r: &mut Reader<'a>) -> u32
+  ! XmlError {
+  run require(&mut r.*, b"&#")
+  let hex = take(&mut r.*, b"x")
+  let mut base: u32 = 10
+  if hex {
+    base = 16
+  }
+  let start = r.pos
+  let mut value: u32 = 0
+  while r.pos < r.data.length && r.data[r.pos] != 59 {
+    let c = r.data[r.pos]
+    let mut digit: u32 = 100
+    if c >= 48 && c <= 57 {
+      digit = u8.toU32(c - 48)
+    } else if hex && c >= 65 && c <= 70 {
+      digit = u8.toU32(c - 65) + 10
+    } else if hex && c >= 97 && c <= 102 {
+      digit = u8.toU32(c - 97) + 10
+    }
+    if digit >= base || value > (1114111 - digit) / base {
+      fail XmlError { offset: offset(&r.*), reason: XmlReason.InvalidCharacter }
+    }
+    value = value * base + digit
+    r.pos = r.pos + 1
+  }
+  if start == r.pos || !xmlChar(value) {
+    fail XmlError { offset: offset(&r.*), reason: XmlReason.InvalidCharacter }
+  }
+  run require(&mut r.*, b";")
+  return value
+}
+
+fn predefined(key: &[u8]) -> u32 {
+  if same(key, b"lt") {
+    return 60
+  }
+  if same(key, b"gt") {
+    return 62
+  }
+  if same(key, b"amp") {
+    return 38
+  }
+  if same(key, b"apos") {
+    return 39
+  }
+  if same(key, b"quot") {
+    return 34
+  }
+  return 0
+}
+
+struct PseudoAttribute {
+  name: Span,
+  value: Span
+}
+
+/// The pseudo-attributes of an `xml-stylesheet` processing instruction, such as `href` and
+/// `type`, read with [`XmlPseudoAttributes.parse`].
+///
+/// # Details
+///
+/// The set owns the decoded names and values. Look one up with [`XmlPseudoAttributes.get`].
+pub struct XmlPseudoAttributes {
+  storage: Bytes,
+  entries: List<PseudoAttribute>
+}
+
+impl XmlPseudoAttributes {
+  /// Returns the decoded value of pseudo-attribute `name`, or `None` if the set does not have it.
+  ///
+  /// # Details
+  ///
+  /// Names are compared exactly, with case. The result borrows the set.
+  pub fn get<'a>(self: &'a XmlPseudoAttributes, name: string) -> Option<string<'a>> {
+    let wanted = String.utf8Bytes(name)
+    let entries = List<PseudoAttribute>.asSlice(&self.entries)
+    let mut i: usize = 0
+    while i < entries.length {
+      if same(view(&self.storage, entries[i].name), wanted) {
+        return Option<string>.some(text(&self.storage, entries[i].value))
+      }
+      i = i + 1
+    }
+    return Option<string>.None
+  }
+
+  /// Parses `data`, the text of an `xml-stylesheet` processing instruction, as pseudo-attributes.
+  ///
+  /// # When to use
+  ///
+  /// Use this function on the result of [`XmlDocument.text`] for a processing instruction whose
+  /// target is `xml-stylesheet`, to read the `href`, `type`, `media`, and other values that link
+  /// a style sheet to the document.
+  ///
+  /// # Details
+  ///
+  /// The grammar is that of
+  /// [Associating Style Sheets with XML documents, Second Edition](https://www.w3.org/TR/xml-stylesheet/).
+  /// Each pseudo-attribute is an XML name, `=`, and a quoted value. Only character references and
+  /// the five predefined entity references are replaced, and white space in values is not
+  /// normalized. `limits` bounds the length of `data` (`maxInputBytes`), the stored names and
+  /// values (`maxStorageBytes`), the number of pseudo-attributes (`maxAttributes`), and the bytes
+  /// that references add (`maxExpandedBytes`).
+  ///
+  /// # Errors
+  ///
+  /// - `XmlError` with [`XmlReason.DuplicateAttribute`] if a name appears two times.
+  /// - `XmlError` with [`XmlReason.UndeclaredEntity`] for a reference to another entity.
+  /// - `XmlError` with [`XmlReason.Limit`] if `data` exceeds a bound of `limits`.
+  /// - `XmlError` with another kind if `data` does not match the grammar. `offset` counts bytes of
+  ///   `data`.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the set.
+  pub effect fn parse(data: string, limits: &XmlLimits) -> XmlPseudoAttributes
+    ! XmlError | OutOfMemoryError
+    ? &mut Allocator {
+    return run parsePseudoAttributes(String.utf8Bytes(data), limits)
+  }
+}
+
+fn findPseudoAttribute(set: &XmlPseudoAttributes, name: &[u8]) -> bool {
+  let entries = List<PseudoAttribute>.asSlice(&set.entries)
+  let mut i: usize = 0
+  while i < entries.length {
+    if same(view(&set.storage, entries[i].name), name) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// https://www.w3.org/TR/2010/REC-xml-stylesheet-20101028/#pseudo-attributes
+effect fn parsePseudoAttributes(data: &[u8], limits: &XmlLimits) -> XmlPseudoAttributes
+  ! XmlError | OutOfMemoryError
+  ? &mut Allocator {
+  if data.length > limits.maxInputBytes {
+    fail XmlError { offset: 0, reason: XmlReason.Limit }
+  }
+  let mut result = XmlPseudoAttributes {
+    storage: Bytes.make(),
+    entries: List<PseudoAttribute>.make(),
+  }
+  let mut r = Reader { data: data, pos: 0, origin: 0 }
+  let mut expanded: usize = 0
+  drop whitespace(&mut r)
+  while r.pos < data.length {
+    if List<PseudoAttribute>.length(&result.entries) >= limits.maxAttributes {
+      fail XmlError { offset: r.pos, reason: XmlReason.Limit }
+    }
+    let key = run name(&mut r)
+    let keyBytes = Slice.view<u8>(data, key.start, key.end - key.start)
+    if findPseudoAttribute(&result, keyBytes) {
+      fail XmlError { offset: key.start, reason: XmlReason.DuplicateAttribute }
+    }
+    drop whitespace(&mut r)
+    run require(&mut r, b"=")
+    drop whitespace(&mut r)
+    let raw = run quoted(&mut r)
+    let storedName = run store(&mut result.storage, keyBytes, limits, key.start)
+    let start = Bytes.length(&result.storage)
+    let mut part = Reader {
+      data: Slice.view<u8>(data, raw.start, raw.end - raw.start),
+      pos: 0,
+      origin: raw.start,
+    }
+    while part.pos < part.data.length {
+      if at(&part, b"&") {
+        let referenceAt = raw.start + part.pos
+        let mut c: u32 = 0
+        if at(&part, b"&#") {
+          c = run reference(&mut part)
+        } else {
+          run require(&mut part, b"&")
+          let entityName = run name(&mut part)
+          run require(&mut part, b";")
+          c = predefined(
+            Slice.view<u8>(part.data, entityName.start, entityName.end - entityName.start),
+          )
+          if c == 0 {
+            fail XmlError { offset: referenceAt, reason: XmlReason.UndeclaredEntity }
+          }
+        }
+        let before = Bytes.length(&result.storage)
+        run scalar(&mut result.storage, c, limits.maxStorageBytes, referenceAt)
+        run charge(&mut expanded, Bytes.length(&result.storage) - before, limits, referenceAt)
+      } else {
+        let begin = part.pos
+        while part.pos < part.data.length && part.data[part.pos] != 38 {
+          if part.data[part.pos] == 60 {
+            fail XmlError { offset: raw.start + part.pos, reason: XmlReason.Syntax }
+          }
+          let cp = run utf8(part.data, part.pos)
+          if !xmlChar(cp.value) {
+            fail XmlError { offset: raw.start + part.pos, reason: XmlReason.InvalidCharacter }
+          }
+          part.pos = part.pos + cp.length
+        }
+        run appendBounded(
+          &mut result.storage,
+          Slice.view<u8>(part.data, begin, part.pos - begin),
+          limits.maxStorageBytes,
+          raw.start + begin,
+        )
+      }
+    }
+    run List<PseudoAttribute>.append(
+      &mut result.entries,
+      PseudoAttribute {
+        name: storedName,
+        value: Span { start: start, end: Bytes.length(&result.storage) },
+      },
+    )
+    if r.pos < data.length {
+      run requireSpace(&mut r)
+    }
+  }
+  return move result
+}
+
+effect fn entityValue<'a>(r: &mut Reader<'a>, limits: &XmlLimits) -> Bytes
+  ! XmlError | OutOfMemoryError
+  ? &mut Allocator {
+  let span = run quoted(&mut r.*)
+  let mut part = Reader {
+    data: Slice.view<u8>(r.data, span.start, span.end - span.start),
+    pos: 0,
+    origin: offset(&r.*),
+  }
+  let mut out = Bytes.make()
+  while part.pos < part.data.length {
+    if at(&part, b"%") {
+      fail XmlError { offset: offset(&r.*), reason: XmlReason.Declaration }
+    }
+    if at(&part, b"&#") {
+      let c = run reference(&mut part)
+      run scalar(&mut out, c, limits.maxStorageBytes, offset(&r.*))
+    } else if take(&mut part, b"&") {
+      let start = part.pos - 1
+      drop run ncname(&mut part)
+      run require(&mut part, b";")
+      run appendBounded(
+        &mut out,
+        Slice.view<u8>(part.data, start, part.pos - start),
+        limits.maxStorageBytes,
+        offset(&r.*),
+      )
+    } else {
+      let start = part.pos
+      while part.pos < part.data.length && part.data[part.pos] != 38 && part.data[part.pos] != 37 {
+        part.pos = part.pos + 1
+      }
+      run appendBounded(
+        &mut out,
+        Slice.view<u8>(part.data, start, part.pos - start),
+        limits.maxStorageBytes,
+        offset(&r.*),
+      )
+    }
+  }
+  return move out
+}
+
+fn pubid(c: u8) -> bool {
+  return c == 32 || c == 13 || c == 10 || (c >= 97 && c <= 122) || (c >= 65 && c <= 90)
+    || (c >= 48 && c <= 57)
+    || c == 45
+    || c == 39
+    || c == 40
+    || c == 41
+    || c == 43
+    || c == 44
+    || c == 46
+    || c == 47
+    || c == 58
+    || c == 61
+    || c == 63
+    || c == 59
+    || c == 33
+    || c == 42
+    || c == 35
+    || c == 64
+    || c == 36
+    || c == 95
+    || c == 37
+}
+
+effect fn externalId<'a>(r: &mut Reader<'a>, notation: bool) -> ()
+  ! XmlError {
+  if take(&mut r.*, b"SYSTEM") {
+    run requireSpace(&mut r.*)
+    drop run quoted(&mut r.*)
+    return ()
+  }
+  run require(&mut r.*, b"PUBLIC")
+  run requireSpace(&mut r.*)
+  let id = run quoted(&mut r.*)
+  let mut i = id.start
+  while i < id.end {
+    if !pubid(r.data[i]) {
+      fail XmlError { offset: offset(&r.*), reason: XmlReason.Declaration }
+    }
+    i = i + 1
+  }
+  let separated = whitespace(&mut r.*)
+  if notation && !at(&r.*, b"'") && !at(&r.*, b"\"") {
+    return ()
+  }
+  if !separated {
+    fail XmlError { offset: offset(&r.*), reason: XmlReason.Syntax }
+  }
+  drop run quoted(&mut r.*)
+}
+
+effect fn comment<'a>(r: &mut Reader<'a>) -> Span
+  ! XmlError {
+  run require(&mut r.*, b"<!--")
+  let start = r.pos
+  while r.pos < r.data.length {
+    if at(&r.*, b"--") {
+      let end = r.pos
+      run require(&mut r.*, b"-->")
+      return Span { start: start, end: end }
+    }
+    r.pos = r.pos + 1
+  }
+  fail XmlError { offset: offset(&r.*), reason: XmlReason.UnexpectedEnd }
+}
+
+fn asciiXml(data: &[u8]) -> bool {
+  return data.length == 3 && (data[0] == 120 || data[0] == 88) && (data[1] == 109 || data[1] == 77)
+    && (data[2] == 108 || data[2] == 76)
+}
+
+struct Pi {
+  target: Span,
+  value: Span
+}
+
+effect fn pi<'a>(r: &mut Reader<'a>) -> Pi
+  ! XmlError {
+  run require(&mut r.*, b"<?")
+  let target = run ncname(&mut r.*)
+  if asciiXml(Slice.view<u8>(r.data, target.start, target.end - target.start)) {
+    fail XmlError { offset: offset(&r.*), reason: XmlReason.Declaration }
+  }
+  let separated = whitespace(&mut r.*)
+  let start = r.pos
+  if !separated && !at(&r.*, b"?>") {
+    fail XmlError { offset: offset(&r.*), reason: XmlReason.Syntax }
+  }
+  while r.pos < r.data.length {
+    let end = r.pos
+    if take(&mut r.*, b"?>") {
+      return Pi { target: target, value: Span { start: start, end: end } }
+    }
+    r.pos = r.pos + 1
+  }
+  fail XmlError { offset: offset(&r.*), reason: XmlReason.UnexpectedEnd }
+}
+
+effect fn dtdEntity<'a>(dtd: &mut Dtd, r: &mut Reader<'a>, limits: &XmlLimits) -> ()
+  ! XmlError | OutOfMemoryError
+  ? &mut Allocator {
+  run require(&mut r.*, b"<!ENTITY")
+  run requireSpace(&mut r.*)
+  let parameter = take(&mut r.*, b"%")
+  if parameter {
+    run requireSpace(&mut r.*)
+  }
+  let key = run ncname(&mut r.*)
+  run requireSpace(&mut r.*)
+  let mut value = Bytes.make()
+  let mut external = false
+  let mut unparsed = false
+  if at(&r.*, b"'") || at(&r.*, b"\"") {
+    value = run entityValue(&mut r.*, limits)
+  } else {
+    external = true
+    run externalId(&mut r.*, false)
+  }
+  let separated = whitespace(&mut r.*)
+  if external && !parameter && take(&mut r.*, b"NDATA") {
+    if !separated {
+      fail XmlError { offset: offset(&r.*), reason: XmlReason.Syntax }
+    }
+    run requireSpace(&mut r.*)
+    drop run ncname(&mut r.*)
+    unparsed = true
+    drop whitespace(&mut r.*)
+  }
+  run require(&mut r.*, b">")
+  let keyBytes = Slice.view<u8>(r.data, key.start, key.end - key.start)
+  if !parameter && predefined(keyBytes) != 0 {
+    let expected = predefined(keyBytes)
+    let bytes = Bytes.asSlice(&value)
+    let validLiteral = bytes.length == 1 && u8.toU32(bytes[0]) == expected && expected != 38
+      && expected != 60
+    let mut refReader = Reader { data: bytes, pos: 0, origin: offset(&r.*) }
+    let mut validReference = false
+    if at(&refReader, b"&#") {
+      let decoded = run reference(&mut refReader)
+      validReference = decoded == expected && refReader.pos == bytes.length
+    }
+    if external || (!validLiteral && !validReference) {
+      fail XmlError { offset: offset(&r.*), reason: XmlReason.Declaration }
+    }
+  }
+  if dtd.skipped && !dtd.standalone {
+    return ()
+  }
+  if let Option<Entity>.Some { value: previous } = entity(&dtd.*, keyBytes, parameter) {
+    return ()
+  }
+  let storedName = run store(&mut dtd.storage, keyBytes, limits, offset(&r.*))
+  let storedValue = run store(&mut dtd.storage, Bytes.asSlice(&value), limits, offset(&r.*))
+  run List<Entity>.append(
+    &mut dtd.entities,
+    Entity {
+      name: storedName,
+      value: storedValue,
+      parameter: parameter,
+      external: external,
+      unparsed: unparsed,
+    },
+  )
+}
+
+effect fn nmtoken<'a>(r: &mut Reader<'a>) -> ()
+  ! XmlError {
+  let start = r.pos
+  while r.pos < r.data.length {
+    let cp = run utf8(r.data, r.pos)
+    if !nameChar(cp.value) {
+      break
+    }
+    r.pos = r.pos + cp.length
+  }
+  if start == r.pos {
+    fail XmlError { offset: offset(&r.*), reason: XmlReason.InvalidName }
+  }
+}
+
+effect fn enumeration<'a>(r: &mut Reader<'a>, names: bool) -> ()
+  ! XmlError {
+  run require(&mut r.*, b"(")
+  drop whitespace(&mut r.*)
+  if names {
+    drop run ncname(&mut r.*)
+  } else {
+    run nmtoken(&mut r.*)
+  }
+  drop whitespace(&mut r.*)
+  while take(&mut r.*, b"|") {
+    drop whitespace(&mut r.*)
+    if names {
+      drop run ncname(&mut r.*)
+    } else {
+      run nmtoken(&mut r.*)
+    }
+    drop whitespace(&mut r.*)
+  }
+  run require(&mut r.*, b")")
+}
+
+effect fn attlist<'a>(dtd: &mut Dtd, r: &mut Reader<'a>, limits: &XmlLimits) -> ()
+  ! XmlError | OutOfMemoryError
+  ? &mut Allocator {
+  run require(&mut r.*, b"<!ATTLIST")
+  run requireSpace(&mut r.*)
+  let elementName = run qualifiedName(&mut r.*)
+  while true {
+    let separated = whitespace(&mut r.*)
+    if take(&mut r.*, b">") {
+      return ()
+    }
+    if !separated {
+      fail XmlError { offset: offset(&r.*), reason: XmlReason.Syntax }
+    }
+    let attributeName = run qualifiedName(&mut r.*)
+    run requireSpace(&mut r.*)
+    let mut attributeKind = AttributeType.Tokenized
+    if take(&mut r.*, b"CDATA") {
+      attributeKind = AttributeType.Cdata
+    } else if take(&mut r.*, b"NOTATION") {
+      run requireSpace(&mut r.*)
+      run enumeration(&mut r.*, true)
+    } else if at(&r.*, b"(") {
+      run enumeration(&mut r.*, false)
+    } else {
+      let kind = run name(&mut r.*)
+      let k = Slice.view<u8>(r.data, kind.start, kind.end - kind.start)
+      if !same(k, b"ID") && !same(k, b"IDREF") && !same(k, b"IDREFS") && !same(k, b"ENTITY")
+        && !same(k, b"ENTITIES")
+        && !same(k, b"NMTOKEN")
+        && !same(k, b"NMTOKENS") {
+        fail XmlError { offset: offset(&r.*), reason: XmlReason.Declaration }
+      }
+      if same(k, b"ID") {
+        attributeKind = AttributeType.Id
+      }
+    }
+    run requireSpace(&mut r.*)
+    let mut hasDefault = true
+    let mut value = empty()
+    if take(&mut r.*, b"#REQUIRED") || take(&mut r.*, b"#IMPLIED") {
+      hasDefault = false
+    } else {
+      if take(&mut r.*, b"#FIXED") {
+        run requireSpace(&mut r.*)
+      }
+      value = run quoted(&mut r.*)
+      let mut i = value.start
+      while i < value.end {
+        if r.data[i] == 60 {
+          fail XmlError { offset: offset(&r.*), reason: XmlReason.Declaration }
+        }
+        i = i + 1
+      }
+      let mut normalized = Bytes.make()
+      let mut attrReader = Reader {
+        data: Slice.view<u8>(r.data, value.start, value.end - value.start),
+        pos: 0,
+        origin: offset(&r.*),
+      }
+      let mut expanded = dtd.expanded
+      run attributeText(&dtd.*, &mut attrReader, &mut normalized, &mut expanded, limits, 0)
+      dtd.expanded = expanded
+    }
+    if !dtd.skipped || dtd.standalone {
+      if List<DefaultAttribute>.length(&dtd.defaults) >= limits.maxAttributes {
+        fail XmlError { offset: offset(&r.*), reason: XmlReason.Limit }
+      }
+      let e = run store(
+        &mut dtd.storage,
+        Slice.view<u8>(r.data, elementName.start, elementName.end - elementName.start),
+        limits,
+        offset(&r.*),
+      )
+      let n = run store(
+        &mut dtd.storage,
+        Slice.view<u8>(r.data, attributeName.start, attributeName.end - attributeName.start),
+        limits,
+        offset(&r.*),
+      )
+      let v = run store(
+        &mut dtd.storage,
+        Slice.view<u8>(r.data, value.start, value.end - value.start),
+        limits,
+        offset(&r.*),
+      )
+      run List<DefaultAttribute>.append(
+        &mut dtd.defaults,
+        DefaultAttribute {
+          element: e,
+          name: n,
+          value: v,
+          hasDefault: hasDefault,
+          kind: attributeKind,
+        },
+      )
+    }
+  }
+}
+
+effect fn contentParticle<'a>(r: &mut Reader<'a>, depth: usize) -> ()
+  ! XmlError {
+  if depth >= 256 {
+    fail XmlError { offset: offset(&r.*), reason: XmlReason.Limit }
+  }
+  if take(&mut r.*, b"(") {
+    drop whitespace(&mut r.*)
+    run contentParticle(&mut r.*, depth + 1)
+    drop whitespace(&mut r.*)
+    let mut separator: u8 = 0
+    while at(&r.*, b"|") || at(&r.*, b",") {
+      let next = r.data[r.pos]
+      if separator != 0 && separator != next {
+        fail XmlError { offset: offset(&r.*), reason: XmlReason.Declaration }
+      }
+      separator = next
+      r.pos = r.pos + 1
+      drop whitespace(&mut r.*)
+      run contentParticle(&mut r.*, depth + 1)
+      drop whitespace(&mut r.*)
+    }
+    run require(&mut r.*, b")")
+  } else {
+    drop run qualifiedName(&mut r.*)
+  }
+  if at(&r.*, b"?") || at(&r.*, b"*") || at(&r.*, b"+") {
+    r.pos = r.pos + 1
+  }
+}
+
+effect fn elementDeclaration<'a>(r: &mut Reader<'a>) -> ()
+  ! XmlError {
+  run require(&mut r.*, b"<!ELEMENT")
+  run requireSpace(&mut r.*)
+  drop run qualifiedName(&mut r.*)
+  run requireSpace(&mut r.*)
+  if !take(&mut r.*, b"EMPTY") && !take(&mut r.*, b"ANY") {
+    let saved = r.pos
+    run require(&mut r.*, b"(")
+    drop whitespace(&mut r.*)
+    if take(&mut r.*, b"#PCDATA") {
+      drop whitespace(&mut r.*)
+      let mut named = false
+      while take(&mut r.*, b"|") {
+        named = true
+        drop whitespace(&mut r.*)
+        drop run qualifiedName(&mut r.*)
+        drop whitespace(&mut r.*)
+      }
+      run require(&mut r.*, b")")
+      if named {
+        run require(&mut r.*, b"*")
+      } else {
+        drop take(&mut r.*, b"*")
+      }
+    } else {
+      r.pos = saved
+      run contentParticle(&mut r.*, 0)
+    }
+  }
+  drop whitespace(&mut r.*)
+  run require(&mut r.*, b">")
+}
+
+effect fn subset<'a>(
+  dtd: &mut Dtd,
+  r: &mut Reader<'a>,
+  limits: &XmlLimits,
+  depth: usize,
+  nested: bool,
+) -> ()
+  ! XmlError | OutOfMemoryError
+  ? &mut Allocator {
+  while r.pos < r.data.length {
+    drop whitespace(&mut r.*)
+    if !nested && at(&r.*, b"]") {
+      return ()
+    }
+    if r.pos == r.data.length {
+      break
+    }
+    if at(&r.*, b"<!--") {
+      drop run comment(&mut r.*)
+    } else if at(&r.*, b"<?") {
+      drop run pi(&mut r.*)
+    } else if take(&mut r.*, b"%") {
+      dtd.parameterReference = true
+      let key = run ncname(&mut r.*)
+      run require(&mut r.*, b";")
+      if depth >= limits.maxEntityDepth || depth >= 32 {
+        fail XmlError { offset: offset(&r.*), reason: XmlReason.RecursiveEntity }
+      }
+      let found = entity(&dtd.*, Slice.view<u8>(r.data, key.start, key.end - key.start), true)
+      match &found {
+        Option<Entity>.Some { value: ent } => {
+          if ent.external {
+            dtd.skipped = true
+          } else {
+            run charge(&mut dtd.expanded, ent.value.end - ent.value.start, limits, offset(&r.*))
+            let replacement = run Bytes.copy(view(&dtd.storage, ent.value))
+            let mut part = Reader {
+              data: Bytes.asSlice(&replacement),
+              pos: 0,
+              origin: offset(&r.*),
+            }
+            run subset(&mut dtd.*, &mut part, limits, depth + 1, true)
+          }
+        }
+        Option<Entity>.None => {
+          if dtd.standalone || (!dtd.external && !dtd.skipped && !dtd.parameterReference) {
+            fail XmlError { offset: offset(&r.*), reason: XmlReason.UndeclaredEntity }
+          }
+          dtd.skipped = true
+        }
+      }
+    } else {
+      if dtd.declarations >= limits.maxDeclarations {
+        fail XmlError { offset: offset(&r.*), reason: XmlReason.Limit }
+      }
+      dtd.declarations = dtd.declarations + 1
+      if at(&r.*, b"<!ENTITY") {
+        run dtdEntity(&mut dtd.*, &mut r.*, limits)
+      } else if at(&r.*, b"<!ATTLIST") {
+        run attlist(&mut dtd.*, &mut r.*, limits)
+      } else if at(&r.*, b"<!ELEMENT") {
+        run elementDeclaration(&mut r.*)
+      } else if take(&mut r.*, b"<!NOTATION") {
+        run requireSpace(&mut r.*)
+        drop run ncname(&mut r.*)
+        run requireSpace(&mut r.*)
+        run externalId(&mut r.*, true)
+        drop whitespace(&mut r.*)
+        run require(&mut r.*, b">")
+      } else {
+        fail XmlError { offset: offset(&r.*), reason: XmlReason.Declaration }
+      }
+    }
+  }
+  if !nested {
+    fail XmlError { offset: offset(&r.*), reason: XmlReason.UnexpectedEnd }
+  }
+}
+
+effect fn doctype<'a>(dtd: &mut Dtd, r: &mut Reader<'a>, limits: &XmlLimits) -> ()
+  ! XmlError | OutOfMemoryError
+  ? &mut Allocator {
+  run require(&mut r.*, b"<!DOCTYPE")
+  run requireSpace(&mut r.*)
+  drop run qualifiedName(&mut r.*)
+  let separated = whitespace(&mut r.*)
+  if at(&r.*, b"SYSTEM") || at(&r.*, b"PUBLIC") {
+    if !separated {
+      fail XmlError { offset: offset(&r.*), reason: XmlReason.Syntax }
+    }
+    run externalId(&mut r.*, false)
+    dtd.external = true
+    drop whitespace(&mut r.*)
+  }
+  if take(&mut r.*, b"[") {
+    run subset(&mut dtd.*, &mut r.*, limits, 0, false)
+    run require(&mut r.*, b"]")
+    drop whitespace(&mut r.*)
+  }
+  run require(&mut r.*, b">")
+}
+
+effect fn attributeText<'a>(
+  dtd: &Dtd,
+  r: &mut Reader<'a>,
+  out: &mut Bytes,
+  total: &mut usize,
+  limits: &XmlLimits,
+  depth: usize,
+) -> ()
+  ! XmlError | OutOfMemoryError
+  ? &mut Allocator {
+  while r.pos < r.data.length {
+    let byte = r.data[r.pos]
+    if byte == 60 {
+      fail XmlError { offset: offset(&r.*), reason: XmlReason.Syntax }
+    }
+    if byte == 38 && at(&r.*, b"&#") {
+      let c = run reference(&mut r.*)
+      run scalar(&mut out.*, c, limits.maxStorageBytes, offset(&r.*))
+    } else if take(&mut r.*, b"&") {
+      let key = run ncname(&mut r.*)
+      run require(&mut r.*, b";")
+      let keyBytes = Slice.view<u8>(r.data, key.start, key.end - key.start)
+      let builtin = predefined(keyBytes)
+      if builtin != 0 {
+        run scalar(&mut out.*, builtin, limits.maxStorageBytes, offset(&r.*))
+      } else {
+        let found = entity(&dtd.*, keyBytes, false)
+        match &found {
+          Option<Entity>.None => {
+            if dtd.standalone || (!dtd.external && !dtd.skipped && !dtd.parameterReference) {
+              fail XmlError { offset: offset(&r.*), reason: XmlReason.UndeclaredEntity }
+            }
+          }
+          Option<Entity>.Some { value: ent } => {
+            if ent.external {
+              fail XmlError { offset: offset(&r.*), reason: XmlReason.ExternalEntityInAttribute }
+            }
+            if depth >= limits.maxEntityDepth || depth >= 32 {
+              fail XmlError { offset: offset(&r.*), reason: XmlReason.RecursiveEntity }
+            }
+            run charge(&mut total.*, ent.value.end - ent.value.start, limits, offset(&r.*))
+            let mut part = Reader {
+              data: view(&dtd.storage, ent.value),
+              pos: 0,
+              origin: offset(&r.*),
+            }
+            run attributeText(&dtd.*, &mut part, &mut out.*, &mut total.*, limits, depth + 1)
+          }
+        }
+      }
+    } else if byte != 32 && space(byte) {
+      run appendBounded(&mut out.*, b" ", limits.maxStorageBytes, offset(&r.*))
+      r.pos = r.pos + 1
+    } else {
+      // Spaces already normalized stay in the run, so path data appends once.
+      let start = r.pos
+      while r.pos < r.data.length && r.data[r.pos] != 38 && r.data[r.pos] != 60
+        && (r.data[r.pos] == 32 || !space(r.data[r.pos])) {
+        r.pos = r.pos + 1
+      }
+      run appendBounded(
+        &mut out.*,
+        Slice.view<u8>(r.data, start, r.pos - start),
+        limits.maxStorageBytes,
+        offset(&r.*),
+      )
+    }
+  }
+}
+
+fn collapse(out: &mut Bytes) -> () {
+  let mut bytes = Bytes.asMutSlice(&mut out.*)
+  let mut read: usize = 0
+  let mut write: usize = 0
+  let mut pending = false
+  while read < bytes.length {
+    let c = bytes[read]
+    if c == 32 {
+      pending = write != 0
+    } else {
+      if pending {
+        bytes[write] = 32
+        write = write + 1
+      }
+      bytes[write] = c
+      write = write + 1
+      pending = false
+    }
+    read = read + 1
+  }
+  drop bytes
+  Bytes.truncate(&mut out.*, write)
+}
+
+struct Binding {
+  prefix: Span,
+  uri: Span
+}
+
+impl Copy for Binding {}
+
+struct RawAttribute {
+  qualified: Span,
+  local: usize,
+  value: Span,
+  isId: bool,
+}
+
+impl Copy for RawAttribute {}
+
+struct Parser {
+  doc: XmlDocument,
+  bindings: List<Binding>,
+  expanded: usize,
+  limits: XmlLimits,
+  xmlUri: Span,
+  xmlnsUri: Span,
+}
+
+fn named(qualified: Span, local: usize) -> Name {
+  return Name {
+    qualified: qualified,
+    local: Span { start: qualified.start + local, end: qualified.end },
+    uri: empty(),
+  }
+}
+
+effect fn resolve(p: &Parser, qualified: Span, local: usize, attribute: bool, at: usize) -> Name
+  ! XmlError {
+  let mut n = named(qualified, local)
+  if same(view(&p.doc.storage, qualified), b"xmlns") && attribute {
+    n.uri = p.xmlnsUri
+    return n
+  }
+  let prefixed = n.local.start != qualified.start
+  let mut prefix = empty()
+  if prefixed {
+    prefix = Span { start: qualified.start, end: n.local.start - 1 }
+  }
+  if same(view(&p.doc.storage, prefix), b"xmlns") {
+    if !attribute {
+      fail XmlError { offset: at, reason: XmlReason.Namespace }
+    }
+    n.uri = p.xmlnsUri
+    return n
+  }
+  if !prefixed && attribute {
+    return n
+  }
+  let mut i = List<Binding>.length(&p.bindings)
+  while i > 0 {
+    i = i - 1
+    let binding = List<Binding>.get(&p.bindings, i)
+    if same(view(&p.doc.storage, binding.prefix), view(&p.doc.storage, prefix)) {
+      n.uri = binding.uri
+      return n
+    }
+  }
+  if prefixed {
+    fail XmlError { offset: at, reason: XmlReason.Namespace }
+  }
+  return n
+}
+
+fn nameKey(qualified: &[u8], uri: &[u8]) -> u32 {
+  let mut h: u32 = 2166136261 ^ usize.toU32(uri.length)
+  let mut i: usize = 0
+  while i < qualified.length {
+    h = u32.wrappingMultiply(h ^ u8.toU32(qualified[i]), 16777619)
+    i = i + 1
+  }
+  return h
+}
+
+effect fn intern(doc: &mut XmlDocument, n: Name) -> usize
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let key = nameKey(view(&doc.storage, n.qualified), view(&doc.storage, n.uri))
+  let keys = List<u32>.asSlice(&doc.nameKeys)
+  let names = List<Name>.asSlice(&doc.names)
+  let slots = List<u32>.asSlice(&doc.nameSlots)
+  if slots.length != 0 {
+    let mask = slots.length - 1
+    let mut at = u32.toUsize(key) & mask
+    while slots[at] != 0 {
+      let i = u32.toUsize(slots[at]) - 1
+      if keys[i] == key {
+        let old = names[i]
+
+        // Names in one namespace usually share its binding's stored URI span.
+        if same(view(&doc.storage, old.qualified), view(&doc.storage, n.qualified))
+          && ((old.uri.start == n.uri.start && old.uri.end == n.uri.end)
+            || same(view(&doc.storage, old.uri), view(&doc.storage, n.uri))) {
+          return i
+        }
+      }
+      at = (at + 1) & mask
+    }
+  }
+  drop keys
+  drop names
+  drop slots
+  let id = List<Name>.length(&doc.names)
+  run List<Name>.append(&mut doc.names, n)
+  run List<u32>.append(&mut doc.nameKeys, key)
+  run indexName(&mut doc.*, id)
+  return id
+}
+
+// Adds name `id` to nameSlots, first doubling the table (and reindexing) when it would pass
+// half full.
+effect fn indexName(doc: &mut XmlDocument, id: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let count = List<Name>.length(&doc.names)
+  if count * 2 > List<u32>.length(&doc.nameSlots) {
+    let mut size: usize = 64
+    while size < count * 4 {
+      size = size * 2
+    }
+    List<u32>.clear(&mut doc.nameSlots)
+    run List<u32>.appendRepeated(&mut doc.nameSlots, 0, size)
+    let mut i: usize = 0
+    while i < count {
+      place(&mut doc.*, i)
+      i = i + 1
+    }
+    return ()
+  }
+  place(&mut doc.*, id)
+}
+
+fn place(doc: &mut XmlDocument, id: usize) -> () {
+  let mut slots = List<u32>.asMutSlice(&mut doc.nameSlots)
+  let mask = slots.length - 1
+  let mut at = u32.toUsize(List<u32>.asSlice(&doc.nameKeys)[id]) & mask
+  while slots[at] != 0 {
+    at = (at + 1) & mask
+  }
+  slots[at] = usize.toU32(id + 1)
+}
+
+effect fn addNode(
+  p: &mut Parser,
+  kind: XmlNodeKind,
+  parent: Option<XmlNodeId>,
+  nameId: usize,
+  value: Span,
+  attrs: Span,
+  at: usize,
+) -> XmlNodeId
+  ! XmlError | OutOfMemoryError
+  ? &mut Allocator {
+  let id = XmlNodeId { index: List<XmlNode>.length(&p.doc.arena) }
+  if id.index >= p.limits.maxNodes {
+    fail XmlError { offset: at, reason: XmlReason.Limit }
+  }
+  run List<XmlNode>.append(
+    &mut p.doc.arena,
+    XmlNode {
+      kind: kind,
+      parent: parent,
+      name: nameId,
+      value: value,
+      attributes: attrs,
+      first: Option<XmlNodeId>.None,
+      last: Option<XmlNodeId>.None,
+      next: Option<XmlNodeId>.None,
+    },
+  )
+  match &parent {
+    Option<XmlNodeId>.Some { value: parentId } => {
+      let mut node = List<XmlNode>.get(&p.doc.arena, parentId.index)
+      match &node.last {
+        Option<XmlNodeId>.Some { value: previous } => {
+          let mut sibling = List<XmlNode>.get(&p.doc.arena, previous.index)
+          sibling.next = Option<XmlNodeId>.some(id)
+          List<XmlNode>.set(&mut p.doc.arena, previous.index, sibling)
+        }
+        Option<XmlNodeId>.None => {
+          node.first = Option<XmlNodeId>.some(id)
+        }
+      }
+      node.last = Option<XmlNodeId>.some(id)
+      List<XmlNode>.set(&mut p.doc.arena, parentId.index, node)
+    }
+    Option<XmlNodeId>.None => {}
+  }
+  return id
+}
+
+effect fn textNode(p: &mut Parser, parent: Option<XmlNodeId>, text: &[u8], at: usize) -> ()
+  ! XmlError | OutOfMemoryError
+  ? &mut Allocator {
+  if text.length == 0 {
+    return ()
+  }
+  let span = run store(&mut p.doc.storage, text, &p.limits, at)
+  drop run addNode(&mut p.*, XmlNodeKind.Text, parent, 0, span, empty(), at)
+}
+
+effect fn miscellaneous<'a>(p: &mut Parser, r: &mut Reader<'a>, parent: Option<XmlNodeId>) -> bool
+  ! XmlError | OutOfMemoryError
+  ? &mut Allocator {
+  let atOffset = offset(&r.*)
+  if at(&r.*, b"<!--") {
+    let span = run comment(&mut r.*)
+    let value = run store(
+      &mut p.doc.storage,
+      Slice.view<u8>(r.data, span.start, span.end - span.start),
+      &p.limits,
+      atOffset,
+    )
+    drop run addNode(&mut p.*, XmlNodeKind.Comment, parent, 0, value, empty(), atOffset)
+    return true
+  }
+  if at(&r.*, b"<?") {
+    let instruction = run pi(&mut r.*)
+    let target = run store(
+      &mut p.doc.storage,
+      Slice.view<u8>(
+        r.data,
+        instruction.target.start,
+        instruction.target.end - instruction.target.start,
+      ),
+      &p.limits,
+      atOffset,
+    )
+    let n = Name { qualified: target, local: target, uri: empty() }
+    let id = run intern(&mut p.doc, n)
+    let value = run store(
+      &mut p.doc.storage,
+      Slice.view<u8>(
+        r.data,
+        instruction.value.start,
+        instruction.value.end - instruction.value.start,
+      ),
+      &p.limits,
+      atOffset,
+    )
+    drop run addNode(
+      &mut p.*,
+      XmlNodeKind.ProcessingInstruction,
+      parent,
+      id,
+      value,
+      empty(),
+      atOffset,
+    )
+    return true
+  }
+  return false
+}
+
+fn attributeType(dtd: &Dtd, element: &[u8], attr: &[u8]) -> AttributeType {
+  let declarations = List<DefaultAttribute>.asSlice(&dtd.defaults)
+  let mut i: usize = 0
+  while i < declarations.length {
+    let d = declarations[i]
+    if same(view(&dtd.storage, d.element), element) && same(view(&dtd.storage, d.name), attr) {
+      return d.kind
+    }
+    i = i + 1
+  }
+  return AttributeType.Cdata
+}
+
+// True when attribute-value normalization leaves the value unchanged: no
+// references, no markup and no whitespace other than spaces.
+fn plainAttribute(value: &[u8]) -> bool {
+  let mut i: usize = 0
+
+  // Skip sixteen bytes at a time while none is a control byte up to 13, `&` or `<`; the
+  // bytewise loop decides any block that has one.
+  while i + 16 <= value.length {
+    let v = u8x16.load(value, i)
+    if mask16.any(u8x16.lanesLess(v, u8x16.splat(14)))
+      || mask16.any(u8x16.lanesEqual(v, u8x16.splat(38)))
+      || mask16.any(u8x16.lanesEqual(v, u8x16.splat(60))) {
+      break
+    }
+    i = i + 16
+  }
+  while i < value.length {
+    let c = value[i]
+    if c < 32 {
+      if c == 9 || c == 10 || c == 13 {
+        return false
+      }
+    } else if c == 38 || c == 60 {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+effect fn rawAttribute(
+  p: &mut Parser,
+  dtd: &Dtd,
+  attrs: &mut List<RawAttribute>,
+  key: &[u8],
+  local: usize,
+  value: &[u8],
+  kind: AttributeType,
+  at: usize,
+) -> ()
+  ! XmlError | OutOfMemoryError
+  ? &mut Allocator {
+  if List<RawAttribute>.length(&attrs.*) >= p.limits.maxAttributes {
+    fail XmlError { offset: at, reason: XmlReason.Limit }
+  }
+  let existing = List<RawAttribute>.asSlice(&attrs.*)
+  let mut i: usize = 0
+  while i < existing.length {
+    if existing[i].qualified.end - existing[i].qualified.start == key.length
+      && same(view(&p.doc.storage, existing[i].qualified), key) {
+      fail XmlError { offset: at, reason: XmlReason.DuplicateAttribute }
+    }
+    i = i + 1
+  }
+  drop existing
+  if kind == AttributeType.Cdata && plainAttribute(value) {
+    // Nothing to normalize: the value is stored as written.
+    if value.length > p.limits.maxStorageBytes {
+      fail XmlError {
+        offset: offset(&Reader { data: value, pos: value.length, origin: at }),
+        reason: XmlReason.Limit,
+      }
+    }
+    let q = run store(&mut p.doc.storage, key, &p.limits, at)
+    let v = run store(&mut p.doc.storage, value, &p.limits, at)
+    run List<RawAttribute>.append(
+      &mut attrs.*,
+      RawAttribute { qualified: q, local: local, value: v, isId: false },
+    )
+    return ()
+  }
+  let mut normalized = Bytes.make()
+  let mut r = Reader { data: value, pos: 0, origin: at }
+  run attributeText(&dtd.*, &mut r, &mut normalized, &mut p.expanded, &p.limits, 0)
+  if kind != AttributeType.Cdata {
+    collapse(&mut normalized)
+  }
+  let q = run store(&mut p.doc.storage, key, &p.limits, at)
+  let v = run store(&mut p.doc.storage, Bytes.asSlice(&normalized), &p.limits, at)
+  run List<RawAttribute>.append(
+    &mut attrs.*,
+    RawAttribute { qualified: q, local: local, value: v, isId: kind == AttributeType.Id },
+  )
+}
+
+effect fn defaultAttributes(
+  p: &mut Parser,
+  dtd: &Dtd,
+  attrs: &mut List<RawAttribute>,
+  element: &[u8],
+  at: usize,
+) -> ()
+  ! XmlError | OutOfMemoryError
+  ? &mut Allocator {
+  let defaults = List<DefaultAttribute>.asSlice(&dtd.defaults)
+  let mut i: usize = 0
+  while i < defaults.length {
+    let d = defaults[i]
+    if d.hasDefault && same(view(&dtd.storage, d.element), element) {
+      let key = view(&dtd.storage, d.name)
+      let mut found = false
+      let mut j: usize = 0
+      while j < i {
+        let earlier = defaults[j]
+        if same(view(&dtd.storage, earlier.element), element)
+          && same(view(&dtd.storage, earlier.name), key) {
+          found = true
+        }
+        j = j + 1
+      }
+      let raw = List<RawAttribute>.asSlice(&attrs.*)
+      j = 0
+      while j < raw.length {
+        if same(view(&p.doc.storage, raw[j].qualified), key) {
+          found = true
+        }
+        j = j + 1
+      }
+      drop raw
+      if !found {
+        run rawAttribute(
+          &mut p.*,
+          dtd,
+          &mut attrs.*,
+          key,
+          checkedLocal(key),
+          view(&dtd.storage, d.value),
+          d.kind,
+          at,
+        )
+      }
+    }
+    i = i + 1
+  }
+}
+
+effect fn bindNamespaces(p: &mut Parser, attrs: &[RawAttribute], at: usize) -> ()
+  ! XmlError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut i: usize = 0
+  while i < attrs.length {
+    let attr = attrs[i]
+    let n = named(attr.qualified, attr.local)
+    let mut declaration = same(view(&p.doc.storage, attr.qualified), b"xmlns")
+    let mut prefix = empty()
+    if n.local.start != attr.qualified.start {
+      let lead = Span { start: attr.qualified.start, end: n.local.start - 1 }
+      if same(view(&p.doc.storage, lead), b"xmlns") {
+        declaration = true
+        prefix = n.local
+      }
+    }
+    if declaration {
+      let key = view(&p.doc.storage, prefix)
+      let uri = view(&p.doc.storage, attr.value)
+      let xmlPrefix = same(key, b"xml")
+      let xmlUri = same(uri, view(&p.doc.storage, p.xmlUri))
+      if same(key, b"xmlns") || xmlPrefix != xmlUri || same(uri, view(&p.doc.storage, p.xmlnsUri))
+        || (key.length != 0 && uri.length == 0) {
+        fail XmlError { offset: at, reason: XmlReason.Namespace }
+      }
+      run List<Binding>.append(&mut p.bindings, Binding { prefix: prefix, uri: attr.value })
+    }
+    i = i + 1
+  }
+}
+
+effect fn element<'a>(
+  p: &mut Parser,
+  dtd: &Dtd,
+  r: &mut Reader<'a>,
+  parent: Option<XmlNodeId>,
+  depth: usize,
+  entityDepth: usize,
+) -> XmlNodeId
+  ! XmlError | OutOfMemoryError
+  ? &mut Allocator {
+  if depth >= p.limits.maxDepth || depth >= 256 {
+    fail XmlError { offset: offset(&r.*), reason: XmlReason.Limit }
+  }
+  let start = offset(&r.*)
+  run require(&mut r.*, b"<")
+  let prefixed = run prefixedName(&mut r.*)
+  let elementName = prefixed.span
+  let mut raw = List<RawAttribute>.make()
+  let mut closed = false
+  while true {
+    let separated = whitespace(&mut r.*)
+    if take(&mut r.*, b"/>") {
+      closed = true
+      break
+    }
+    if take(&mut r.*, b">") {
+      break
+    }
+    if !separated {
+      fail XmlError { offset: offset(&r.*), reason: XmlReason.Syntax }
+    }
+    let keyName = run prefixedName(&mut r.*)
+    let key = keyName.span
+    drop whitespace(&mut r.*)
+    run require(&mut r.*, b"=")
+    drop whitespace(&mut r.*)
+    let value = run quoted(&mut r.*)
+    let keyBytes = Slice.view<u8>(r.data, key.start, key.end - key.start)
+    let attributeKind = attributeType(
+      dtd,
+      Slice.view<u8>(r.data, elementName.start, elementName.end - elementName.start),
+      keyBytes,
+    )
+    run rawAttribute(
+      &mut p.*,
+      dtd,
+      &mut raw,
+      keyBytes,
+      keyName.local,
+      Slice.view<u8>(r.data, value.start, value.end - value.start),
+      attributeKind,
+      start,
+    )
+  }
+  run defaultAttributes(
+    &mut p.*,
+    dtd,
+    &mut raw,
+    Slice.view<u8>(r.data, elementName.start, elementName.end - elementName.start),
+    start,
+  )
+  let bindingCount = List<Binding>.length(&p.bindings)
+  run bindNamespaces(&mut p.*, List<RawAttribute>.asSlice(&raw), start)
+  let q = run store(
+    &mut p.doc.storage,
+    Slice.view<u8>(r.data, elementName.start, elementName.end - elementName.start),
+    &p.limits,
+    start,
+  )
+  let expandedName = run resolve(&p.*, q, prefixed.local, false, start)
+  let nameId = run intern(&mut p.doc, expandedName)
+  let attrStart = List<XmlAttribute>.length(&p.doc.attrs)
+  let attrs = List<RawAttribute>.asSlice(&raw)
+  let mut i: usize = 0
+  while i < attrs.length {
+    if List<XmlAttribute>.length(&p.doc.attrs) >= p.limits.maxAttributes {
+      fail XmlError { offset: start, reason: XmlReason.Limit }
+    }
+    let n = run resolve(&p.*, attrs[i].qualified, attrs[i].local, true, start)
+    let mut j = attrStart
+    while j < List<XmlAttribute>.length(&p.doc.attrs) {
+      let old = List<Name>.get(&p.doc.names, List<XmlAttribute>.get(&p.doc.attrs, j).name)
+
+      // Lengths first: most attribute pairs differ in local-name length.
+      if old.local.end - old.local.start == n.local.end - n.local.start
+        && same(view(&p.doc.storage, old.local), view(&p.doc.storage, n.local))
+        && same(view(&p.doc.storage, old.uri), view(&p.doc.storage, n.uri)) {
+        fail XmlError { offset: start, reason: XmlReason.DuplicateAttribute }
+      }
+      j = j + 1
+    }
+    let attrName = run intern(&mut p.doc, n)
+    run List<XmlAttribute>.append(
+      &mut p.doc.attrs,
+      XmlAttribute { name: attrName, value: attrs[i].value, isId: attrs[i].isId },
+    )
+    i = i + 1
+  }
+  let attrEnd = List<XmlAttribute>.length(&p.doc.attrs)
+  let id = run addNode(
+    &mut p.*,
+    XmlNodeKind.Element,
+    parent,
+    nameId,
+    empty(),
+    Span { start: attrStart, end: attrEnd },
+    start,
+  )
+  if !closed {
+    run content(&mut p.*, dtd, &mut r.*, id, depth + 1, entityDepth, false)
+    run require(&mut r.*, b"</")
+    let endName = run qualifiedName(&mut r.*)
+    if !same(
+      Slice.view<u8>(r.data, elementName.start, elementName.end - elementName.start),
+      Slice.view<u8>(r.data, endName.start, endName.end - endName.start),
+    ) {
+      fail XmlError { offset: offset(&r.*), reason: XmlReason.MismatchedTag }
+    }
+    drop whitespace(&mut r.*)
+    run require(&mut r.*, b">")
+  }
+  List<Binding>.truncate(&mut p.bindings, bindingCount)
+  return id
+}
+
+effect fn content<'a>(
+  p: &mut Parser,
+  dtd: &Dtd,
+  r: &mut Reader<'a>,
+  parent: XmlNodeId,
+  depth: usize,
+  entityDepth: usize,
+  replacement: bool,
+) -> ()
+  ! XmlError | OutOfMemoryError
+  ? &mut Allocator {
+  let parentRef = Option<XmlNodeId>.some(parent)
+  while r.pos < r.data.length {
+    let start = offset(&r.*)
+    let lead = r.data[r.pos]
+    if lead != 60 && lead != 38 {
+      let begin = r.pos
+      while r.pos < r.data.length && r.data[r.pos] != 60 && r.data[r.pos] != 38 {
+        if r.data[r.pos] == 93 && at(&r.*, b"]]>") {
+          fail XmlError { offset: offset(&r.*), reason: XmlReason.Syntax }
+        }
+        r.pos = r.pos + 1
+      }
+      run textNode(&mut p.*, parentRef, Slice.view<u8>(r.data, begin, r.pos - begin), start)
+      continue
+    }
+    if at(&r.*, b"</") {
+      if replacement {
+        fail XmlError { offset: start, reason: XmlReason.EntityBoundary }
+      }
+      return ()
+    }
+    if run miscellaneous(&mut p.*, &mut r.*, parentRef) {
+      continue
+    }
+    if take(&mut r.*, b"<![CDATA[") {
+      let begin = r.pos
+      while r.pos < r.data.length && !at(&r.*, b"]]>") {
+        r.pos = r.pos + 1
+      }
+      let end = r.pos
+      run require(&mut r.*, b"]]>")
+      run textNode(&mut p.*, parentRef, Slice.view<u8>(r.data, begin, end - begin), start)
+    } else if at(&r.*, b"<") {
+      drop run element(&mut p.*, dtd, &mut r.*, parentRef, depth, entityDepth)
+    } else if at(&r.*, b"&#") {
+      let c = run reference(&mut r.*)
+      let begin = Bytes.length(&p.doc.storage)
+      run scalar(&mut p.doc.storage, c, p.limits.maxStorageBytes, start)
+      let value = Span { start: begin, end: Bytes.length(&p.doc.storage) }
+      drop run addNode(&mut p.*, XmlNodeKind.Text, parentRef, 0, value, empty(), start)
+    } else if take(&mut r.*, b"&") {
+      let key = run ncname(&mut r.*)
+      run require(&mut r.*, b";")
+      let keyBytes = Slice.view<u8>(r.data, key.start, key.end - key.start)
+      let builtin = predefined(keyBytes)
+      if builtin != 0 {
+        let byte = [u32.toU8(builtin)]
+        run textNode(&mut p.*, parentRef, &byte, start)
+      } else {
+        let found = entity(&dtd.*, keyBytes, false)
+        match &found {
+          Option<Entity>.None => {
+            if dtd.standalone || (!dtd.external && !dtd.skipped && !dtd.parameterReference) {
+              fail XmlError { offset: start, reason: XmlReason.UndeclaredEntity }
+            }
+          }
+          Option<Entity>.Some { value: ent } => {
+            if ent.unparsed {
+              fail XmlError { offset: start, reason: XmlReason.UnparsedEntity }
+            }
+            if ent.external {
+              p.doc.skippedExternal = true
+            }
+            if !ent.external {
+              if entityDepth >= p.limits.maxEntityDepth || entityDepth >= 32 {
+                fail XmlError { offset: start, reason: XmlReason.RecursiveEntity }
+              }
+              run charge(&mut p.expanded, ent.value.end - ent.value.start, &p.limits, start)
+              let mut part = Reader { data: view(&dtd.storage, ent.value), pos: 0, origin: start }
+              run content(&mut p.*, dtd, &mut part, parent, depth, entityDepth + 1, true)
+            }
+          }
+        }
+      }
+    }
+  }
+  if !replacement {
+    fail XmlError { offset: offset(&r.*), reason: XmlReason.UnexpectedEnd }
+  }
+}
+
+fn foldedSame(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    let mut c = a[i]
+    if c >= 65 && c <= 90 {
+      c = c + 32
+    }
+    if c != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// XML 1.0 Fifth Edition [26] VersionNum ::= '1.' [0-9]+; 2.8 processes any 1.x
+// document as 1.0.
+fn versionNumber(value: &[u8]) -> bool {
+  if value.length < 3 || value[0] != 49 || value[1] != 46 {
+    return false
+  }
+  let mut i: usize = 2
+  while i < value.length {
+    if value[i] < 48 || value[i] > 57 {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+effect fn declaration<'a>(r: &mut Reader<'a>, encoding: u8) -> bool
+  ! XmlError {
+  run require(&mut r.*, b"<?xml")
+  run requireSpace(&mut r.*)
+  run require(&mut r.*, b"version")
+  drop whitespace(&mut r.*)
+  run require(&mut r.*, b"=")
+  drop whitespace(&mut r.*)
+  let version = run quoted(&mut r.*)
+  if !versionNumber(Slice.view<u8>(r.data, version.start, version.end - version.start)) {
+    fail XmlError { offset: offset(&r.*), reason: XmlReason.Declaration }
+  }
+  let mut separated = whitespace(&mut r.*)
+  if take(&mut r.*, b"encoding") {
+    if !separated {
+      fail XmlError { offset: offset(&r.*), reason: XmlReason.Declaration }
+    }
+    drop whitespace(&mut r.*)
+    run require(&mut r.*, b"=")
+    drop whitespace(&mut r.*)
+    let value = run quoted(&mut r.*)
+    let label = Slice.view<u8>(r.data, value.start, value.end - value.start)
+    let valid = (encoding == 0 && foldedSame(label, b"utf-8"))
+      || (encoding != 0 && foldedSame(label, b"utf-16"))
+      || (encoding == 1 && foldedSame(label, b"utf-16le"))
+      || (encoding == 2 && foldedSame(label, b"utf-16be"))
+    if !valid {
+      fail XmlError { offset: offset(&r.*), reason: XmlReason.Encoding }
+    }
+    separated = whitespace(&mut r.*)
+  }
+  let mut standalone = false
+  if take(&mut r.*, b"standalone") {
+    if !separated {
+      fail XmlError { offset: offset(&r.*), reason: XmlReason.Declaration }
+    }
+    drop whitespace(&mut r.*)
+    run require(&mut r.*, b"=")
+    drop whitespace(&mut r.*)
+    let value = run quoted(&mut r.*)
+    let label = Slice.view<u8>(r.data, value.start, value.end - value.start)
+    if same(label, b"yes") {
+      standalone = true
+    } else if !same(label, b"no") {
+      fail XmlError { offset: offset(&r.*), reason: XmlReason.Declaration }
+    }
+    drop whitespace(&mut r.*)
+  }
+  run require(&mut r.*, b"?>")
+  return standalone
+}
+
+effect fn parseDocument(data: &[u8], limits: &XmlLimits) -> XmlDocument
+  ! XmlError | OutOfMemoryError
+  ? &mut Allocator {
+  let decoded = run decode(data, limits)
+  let mut r = Reader { data: Bytes.asSlice(&decoded.bytes), pos: 0, origin: 0 }
+  let mut dtd = Dtd {
+    storage: Bytes.make(),
+    entities: List<Entity>.make(),
+    defaults: List<DefaultAttribute>.make(),
+    external: false,
+    skipped: false,
+    standalone: false,
+    parameterReference: false,
+    expanded: 0,
+    declarations: 0,
+  }
+  if at(&r, b"<?xml") && r.data.length > 5 && space(r.data[5]) {
+    dtd.standalone = run declaration(&mut r, decoded.encoding)
+  }
+  let mut sourceEncoding = XmlEncoding.Utf8
+  if decoded.encoding == 1 {
+    sourceEncoding = XmlEncoding.Utf16Le
+  } else if decoded.encoding == 2 {
+    sourceEncoding = XmlEncoding.Utf16Be
+  }
+
+  // Stored text never outgrows the input without entity expansion; markup takes a few
+  // dozen bytes per node and a dozen or so per attribute. Starting there keeps these
+  // lists from copying themselves while doubling.
+  let size = r.data.length
+  let mut doc = XmlDocument {
+    storage: run Bytes.makeWithCapacity(size),
+    arena: run List<XmlNode>.makeWithCapacity(size / 32),
+    names: List<Name>.make(),
+    nameKeys: List<u32>.make(),
+    nameSlots: List<u32>.make(),
+    attrs: run List<XmlAttribute>.makeWithCapacity(size / 16),
+    rootId: XmlNodeId { index: 0 },
+    skippedExternal: false,
+    sourceEncoding: sourceEncoding,
+  }
+  run List<Name>.append(&mut doc.names, Name { qualified: empty(), local: empty(), uri: empty() })
+  run List<u32>.append(&mut doc.nameKeys, nameKey(b"", b""))
+  run indexName(&mut doc, 0)
+  let xmlUri = run store(&mut doc.storage, b"http://www.w3.org/XML/1998/namespace", limits, 0)
+  let xmlnsUri = run store(&mut doc.storage, b"http://www.w3.org/2000/xmlns/", limits, 0)
+  let xmlPrefix = run store(&mut doc.storage, b"xml", limits, 0)
+  let mut p = Parser {
+    doc: move doc,
+    bindings: List<Binding>.make(),
+    expanded: 0,
+    limits: limits.*,
+    xmlUri: xmlUri,
+    xmlnsUri: xmlnsUri,
+  }
+  run List<Binding>.append(&mut p.bindings, Binding { prefix: xmlPrefix, uri: xmlUri })
+  let mut hasDoctype = false
+  while true {
+    drop whitespace(&mut r)
+    if run miscellaneous(&mut p, &mut r, Option<XmlNodeId>.None) {
+      continue
+    }
+    if at(&r, b"<!DOCTYPE") && !hasDoctype {
+      hasDoctype = true
+      run doctype(&mut dtd, &mut r, limits)
+      continue
+    }
+    break
+  }
+  p.expanded = dtd.expanded
+  p.doc.skippedExternal = dtd.external || dtd.skipped
+  let root = run element(&mut p, &dtd, &mut r, Option<XmlNodeId>.None, 0, 0)
+  p.doc.rootId = root
+  while true {
+    drop whitespace(&mut r)
+    if r.pos == r.data.length {
+      break
+    }
+    if !(run miscellaneous(&mut p, &mut r, Option<XmlNodeId>.None)) {
+      fail XmlError { offset: offset(&r), reason: XmlReason.Structure }
+    }
+  }
+  return move p.doc
+}
