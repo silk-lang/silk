@@ -97,6 +97,42 @@ const program = Effect.gen(function* () {
     assert.equal(ran.stdout.toString(), 'gather:ab\nwasi services passed\n')
     assert.equal(ran.stderr.toString(), 'wasi stderr\n')
   }
+  // `--emit wasm-text` prints the module each backend links, debug names and all, as text that
+  // wasm-tools reads back to the same module once custom sections are stripped from both.
+  yield* fs.writeFileString(join(directory, 'main.silk'), source)
+  for (const backend of ['direct', 'llvm']) {
+    const binary = join(directory, `text-${backend}.wasm`)
+    const printed = join(directory, `text-${backend}.wat`)
+    const options = ['--backend', backend, '--debug', 'true']
+    const linked = yield* build('wasm32-wasip1', binary, options)
+    assert.equal(linked.status, 0, linked.stderr.toString())
+    const environment = backend === 'direct' ? { ...env, SILK_CLANG: '/nonexistent' } : env
+    const emitted = yield* build('wasm32-wasip1', printed, [...options, '--emit', 'wasm-text'], environment)
+    assert.equal(emitted.status, 0, emitted.stderr.toString())
+    const text = yield* fs.readFileString(printed)
+    // wasm-ld names the module after its output file.
+    assert.match(text, /^\(module( \$\S+)?\n/)
+    assert.match(text, /\(func \$main\.\w+ \(;\d+;\) \(type \d+\)/, 'a debug build names its functions after the source')
+    const reparsed = join(directory, `text-${backend}.reparsed.wasm`)
+    const parsed = yield* invoke(wasmTools, ['parse', printed, '-o', reparsed])
+    assert.equal(parsed.status, 0, parsed.stderr.toString())
+    const stripped = Effect.fnUntraced(function* (module: string) {
+      const bare = `${module}.stripped`
+      const strip = yield* invoke(wasmTools, ['strip', '--all', module, '-o', bare])
+      assert.equal(strip.status, 0, strip.stderr.toString())
+      const shown = yield* invoke(wasmTools, ['print', bare])
+      assert.equal(shown.status, 0, shown.stderr.toString())
+      return shown.stdout.toString()
+    })
+    assert.equal(yield* stripped(reparsed), yield* stripped(binary), `the ${backend} module's text reads back to the module`)
+  }
+  {
+    // A non-wasm target has no module to print.
+    const refused = yield* invoke(compiler, ['build', 'main.silk', '-o', join(directory, 'native.wat'), '--emit', 'wasm-text',
+      '--stdlib', join(repo, 'stdlib')])
+    assert.equal(refused.status, 2, refused.stderr.toString())
+    assert.match(refused.stderr.toString(), /--emit wasm-text needs a wasm32 or wasm64 executable/)
+  }
   {
     // A project build keeps its translated bodies, and an edit runs the edited body, not a cached one.
     const project = Effect.fnUntraced(function* (status: number) {
