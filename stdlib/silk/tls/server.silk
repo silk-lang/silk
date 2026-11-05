@@ -12,8 +12,9 @@
 //! ChaCha20-Poly1305, AES-128-GCM, and AES-256-GCM. It selects the key exchange group from
 //! X25519, P-256, and P-384 in that order, limited by your [`GroupPolicy`]. If the client sent no
 //! key share for an allowed group that it supports, the server sends one HelloRetryRequest. The
-//! server signs CertificateVerify with an ECDSA P-256 or P-384 key ([`ServerKey`]) and checks the
-//! client's Finished message.
+//! server signs CertificateVerify with the leaf's ECDSA P-256, ECDSA P-384, Ed25519, or RSA key
+//! ([`ServerKey`]), using a scheme that the client offers, and checks the client's Finished
+//! message. An RSA key signs with RSA-PSS, preferring SHA-256, then SHA-384, then SHA-512.
 //!
 //! The server reads the client's SNI name, which you get from [`Server.serverName`], and selects an
 //! ALPN protocol from your [`AlpnConfig`] in your preference order. It handles KeyUpdate in both
@@ -109,10 +110,14 @@ import silk.core.option { Option }
 import silk.core.ownership { Copy }
 import silk.crypto.p256 { EcdsaP256, P256, P256Error }
 import silk.crypto.p384 { EcdsaP384, P384, P384Error }
+import silk.crypto.ed25519 { Ed25519PrivateKey }
+import silk.crypto.digest { Digest }
+import silk.crypto.rsa { RsaError, RsaPrivateKey, RsaPublicKey }
+import silk.core.effect { Effect }
 import silk.system.random { Random }
 import silk.mem.raw_buffer { RawBuffer }
 import silk.core.result { Result }
-import silk.crypto.sha2 { Sha256, Sha384 }
+import silk.crypto.sha2 { Sha256, Sha384, Sha512 }
 import silk.collections.slice { Slice }
 import silk.tls.hkdf { LabelError, TlsHkdfSha256, TlsHkdfSha384 }
 import silk.tls.record {
@@ -144,7 +149,9 @@ const SERVER_NAME_LIMIT: usize = 255
 
 const SCRATCH_LENGTH: usize = 512
 
-const FLIGHT_OVERHEAD: usize = 512
+const FLIGHT_OVERHEAD: usize = 1536
+
+const SIGNATURE_LIMIT: usize = 1024
 
 /// A key exchange group that the server can select.
 pub enum ServerGroup {
@@ -207,6 +214,17 @@ pub union ServerKey {
   EcdsaP384 {
     /// The private key.
     pub key: P384,
+  },
+  /// An Ed25519 key, used with the `ed25519` scheme.
+  Ed25519 {
+    /// The private key.
+    pub key: Ed25519PrivateKey,
+  },
+  /// An RSA key for an `rsaEncryption` certificate, used with the `rsa_pss_rsae_sha256`,
+  /// `rsa_pss_rsae_sha384`, or `rsa_pss_rsae_sha512` scheme, in that order of preference.
+  RsaPss {
+    /// The private key.
+    pub key: RsaPrivateKey,
   },
 }
 
@@ -480,6 +498,12 @@ pub union ServerError {
   },
   /// The client's key share is not a valid public key.
   InvalidKeyShare,
+  /// The RSA key could not sign CertificateVerify, for example because it is too small for the
+  /// scheme.
+  RsaSignature {
+    /// The RSA failure.
+    pub error: RsaError,
+  },
   /// The client's Finished did not authenticate the transcript.
   Finished,
   /// A finite resource budget was exceeded.
@@ -540,6 +564,11 @@ impl Debug for ServerError {
         return run Format.debugFinish(record, &mut formatter)
       }
       ServerError.InvalidKeyShare => run Format.write(&mut formatter, b"InvalidKeyShare")
+      ServerError.RsaSignature { error } => {
+        let mut record = run Format.debugRecord("RsaSignature", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
       ServerError.Finished => run Format.write(&mut formatter, b"Finished")
       ServerError.LimitExceeded { kind, limit } => {
         let mut record = run Format.debugRecord("LimitExceeded", &mut formatter)
@@ -599,8 +628,7 @@ struct ParsedClientHello {
   shareP256: usize,
   shareP384: usize,
   hasShares: bool,
-  schemeP256: bool,
-  schemeP384: bool,
+  schemes: usize,
   hasSchemes: bool,
   nameOffset: usize,
   nameLength: usize,
@@ -634,6 +662,7 @@ pub struct Server {
   state: ServerState,
   limits: ServerLimits,
   key: ServerKey,
+  scheme: usize,
   groups: GroupPolicy,
   chain: Intrinsic.RawBuffer<u8>,
   chainLength: usize,
@@ -760,11 +789,9 @@ impl Server {
       }
       Result<Certificate, DecodeError>.Success { value } => move value
     }
-    let leafKey = Certificate.publicKey(&leaf)
-    if leafKey.unusedBits != 0 || !keyMatches(&key, leafKey.bytes) {
+    if !keyMatches(&key, &leaf) {
       return Result<Server, ServerError>.failResult(ServerError.KeyMismatch)
     }
-    drop leafKey
     drop leaf
 
     let mut chain = run allocateBytes(chainLength)
@@ -805,6 +832,7 @@ impl Server {
         state: ServerState.AwaitClientHello,
         limits: limits,
         key: move key,
+        scheme: 0,
         groups: config.groups,
         chain: move chain,
         chainLength: chainLength,
@@ -1334,15 +1362,46 @@ fn copyAlpn<'a>(
   }
 }
 
-fn keyMatches(key: &ServerKey, certificateKey: &[u8]) -> bool {
+// The DER AlgorithmIdentifier of each certificate key type that a `ServerKey` signs for:
+// id-ecPublicKey with secp256r1 or secp384r1 (RFC 5480), and id-Ed25519 (RFC 8410).
+const P256_ALGORITHM: &'static [u8] = b"\x30\x13\x06\x07\x2a\x86\x48\xce\x3d\x02\x01\x06\x08\x2a\x86\x48\xce\x3d\x03\x01\x07"
+
+const P384_ALGORITHM: &'static [u8] = b"\x30\x10\x06\x07\x2a\x86\x48\xce\x3d\x02\x01\x06\x05\x2b\x81\x04\x00\x22"
+
+const ED25519_ALGORITHM: &'static [u8] = b"\x30\x05\x06\x03\x2b\x65\x70"
+
+fn keyMatches(key: &ServerKey, leaf: &Certificate) -> bool {
+  let leafKey = Certificate.publicKey(leaf)
+  if leafKey.unusedBits != 0 {
+    return false
+  }
+  let algorithm = Certificate.publicKeyAlgorithm(leaf)
   return match &key.* {
     ServerKey.EcdsaP256 { key: secret } => {
       let publicKey = P256.publicKey(&secret)
-      return sameBytes(&publicKey, certificateKey)
+      return sameBytes(algorithm.der, P256_ALGORITHM) && sameBytes(&publicKey, leafKey.bytes)
     }
     ServerKey.EcdsaP384 { key: secret } => {
       let publicKey = P384.publicKey(&secret)
-      return sameBytes(&publicKey, certificateKey)
+      return sameBytes(algorithm.der, P384_ALGORITHM) && sameBytes(&publicKey, leafKey.bytes)
+    }
+    ServerKey.Ed25519 { key: secret } => {
+      let publicKey = secret.publicKey()
+      return sameBytes(algorithm.der, ED25519_ALGORITHM) && sameBytes(&publicKey, leafKey.bytes)
+    }
+    ServerKey.RsaPss { key: secret } => {
+      return match RsaPublicKey.fromCertificateKey(
+        algorithm.der,
+        leafKey.bytes,
+        leafKey.unusedBits,
+      ) {
+        Result<RsaPublicKey, RsaError>.Failure { .. } => false
+        Result<RsaPublicKey, RsaError>.Success { value: certified } => {
+          let own = secret.publicKey()
+          return certified.modulus().equals(&own.modulus())
+            && certified.exponent().equals(&own.exponent())
+        }
+      }
     }
   }
 }
@@ -1994,18 +2053,56 @@ fn groupAt(index: usize) -> ServerGroup {
   return ServerGroup.P384
 }
 
-fn keyOffersScheme(key: &ServerKey, parsed: &ParsedClientHello) -> bool {
-  return match &key.* {
-    ServerKey.EcdsaP256 { .. } => parsed.schemeP256
-    ServerKey.EcdsaP384 { .. } => parsed.schemeP384
+fn schemeBit(code: usize) -> usize {
+  if code == 1027 {
+    return 1
   }
+  if code == 1283 {
+    return 2
+  }
+  if code == 2052 {
+    return 4
+  }
+  if code == 2053 {
+    return 8
+  }
+  if code == 2054 {
+    return 16
+  }
+  if code == 2055 {
+    return 32
+  }
+  return 0
 }
 
-fn keyScheme(key: &ServerKey) -> usize {
-  return match &key.* {
-    ServerKey.EcdsaP256 { .. } => 1027
-    ServerKey.EcdsaP384 { .. } => 1283
+// The signature scheme for `key` that the client accepts, or 0 when there is none.
+fn chooseScheme(key: &ServerKey, schemes: usize) -> usize {
+  let mut candidates: [usize; 3] = [0, 0, 0]
+  match &key.* {
+    ServerKey.EcdsaP256 { .. } => {
+      candidates[0] = 1027
+    }
+    ServerKey.EcdsaP384 { .. } => {
+      candidates[0] = 1283
+    }
+    ServerKey.Ed25519 { .. } => {
+      candidates[0] = 2055
+    }
+    ServerKey.RsaPss { .. } => {
+      candidates[0] = 2052
+      candidates[1] = 2053
+      candidates[2] = 2054
+    }
   }
+  let mut index = usize.ZERO
+  while index < 3 {
+    let code = candidates[index]
+    if code != 0 && usize.bitAnd(schemes, schemeBit(code)) != 0 {
+      return code
+    }
+    index = index + usize.ONE
+  }
+  return 0
 }
 
 effect fn handleClientHello(server: &mut Server, messageLength: usize, retry: bool) -> Result<
@@ -2030,9 +2127,11 @@ effect fn handleClientHello(server: &mut Server, messageLength: usize, retry: bo
   if !parsed.hasGroups || !parsed.hasShares || !parsed.hasSchemes {
     return violation(ServerProtocolReason.Extension)
   }
-  if !keyOffersScheme(&server.key, &parsed) {
+  let scheme = chooseScheme(&server.key, parsed.schemes)
+  if scheme == 0 {
     return failure(ServerError.Negotiation { failure: NegotiationFailure.SignatureScheme })
   }
+  server.scheme = scheme
   if retry {
     if !parsed.offersSelectedSuite || shareOffset(&parsed, server.selectedGroup) == 0 {
       return violation(ServerProtocolReason.HelloRetryRequest)
@@ -2186,8 +2285,7 @@ fn emptyParsed() -> ParsedClientHello {
     shareP256: 0,
     shareP384: 0,
     hasShares: false,
-    schemeP256: false,
-    schemeP384: false,
+    schemes: 0,
     hasSchemes: false,
     nameOffset: 0,
     nameLength: 0,
@@ -2390,12 +2488,7 @@ fn parseSchemes(
   let mut cursor = start + 2
   while cursor < start + length {
     let code = readU16Raw(buffer, cursor)
-    if code == 1027 {
-      parsed.schemeP256 = true
-    }
-    if code == 1283 {
-      parsed.schemeP384 = true
-    }
+    parsed.schemes = usize.bitOr(parsed.schemes, schemeBit(code))
     cursor = cursor + 2
   }
   parsed.hasSchemes = true
@@ -2763,7 +2856,7 @@ effect fn queueServerHello(server: &mut Server, offset: usize) -> Result<(), Ser
   if let Result<(), ServerError>.Failure { error } = recordUnit(move replaced) {
     return failure(error)
   }
-  return buildFlight(&mut server.*)
+  return run buildFlight(&mut server.*)
 }
 
 fn deriveHandshakeSecrets(server: &mut Server, shared: &[u8]) -> Result<(), ServerError> {
@@ -2804,7 +2897,8 @@ fn deriveHandshakeSecrets(server: &mut Server, shared: &[u8]) -> Result<(), Serv
   return ok()
 }
 
-fn buildFlight(server: &mut Server) -> Result<(), ServerError> {
+effect fn buildFlight(server: &mut Server) -> Result<(), ServerError>
+  ? &mut Random {
   let length = server.secretLength
   let mut cursor = usize.ZERO
 
@@ -2855,16 +2949,22 @@ fn buildFlight(server: &mut Server) -> Result<(), ServerError> {
   putSlice(&mut server.scratch, &mut contentLength, context)
   putU8(&mut server.scratch, &mut contentLength, 0)
   putSlice(&mut server.scratch, &mut contentLength, Slice.view<u8>(&hash, 0, length))
-  let mut signature: [u8; 104] = [0; 104]
+  let mut signature: [u8; 1024] = [0; 1024]
 
   // The block above wrote every byte of `scratch[0..contentLength]`, at most 146 bytes.
   let content = unsafe RawBuffer.view<u8>(&server.scratch, 0, contentLength)
-  let signatureLength = signContent(&server.key, content, &mut signature)
+  let signed = run signContent(&server.key, server.scheme, content, &mut signature)
   drop content
+  let signatureLength = match move signed {
+    Result<usize, ServerError>.Failure { error } => {
+      return failure(error)
+    }
+    Result<usize, ServerError>.Success { value } => value
+  }
   let verifyStart = cursor
   putU8(&mut server.flight, &mut cursor, 15)
   putU24(&mut server.flight, &mut cursor, signatureLength + 4)
-  putU16(&mut server.flight, &mut cursor, keyScheme(&server.key))
+  putU16(&mut server.flight, &mut cursor, server.scheme)
   putU16(&mut server.flight, &mut cursor, signatureLength)
   putSlice(&mut server.flight, &mut cursor, Slice.view<u8>(&signature, 0, signatureLength))
   updateTranscriptFlight(&mut server.*, verifyStart, cursor - verifyStart)
@@ -2914,17 +3014,74 @@ fn buildFlight(server: &mut Server) -> Result<(), ServerError> {
   return ok()
 }
 
-fn signContent(key: &ServerKey, content: &[u8], output: &mut [u8]) -> usize {
+// Signs `content` with `key` under `scheme`, writes the signature to the start of `output`, which
+// holds `SIGNATURE_LIMIT` bytes, and returns its length.
+effect fn signContent(key: &ServerKey, scheme: usize, content: &[u8], output: &mut [u8]) -> Result<
+  usize,
+  ServerError
+>
+  ? &mut Random {
   return match &key.* {
     ServerKey.EcdsaP256 { key: secret } => {
       let raw = secret.sign<Sha256>(content)
-      return EcdsaP256.toDer(&raw, move output)
+      return Result<usize, ServerError>.succeed(EcdsaP256.toDer(&raw, move output))
     }
     ServerKey.EcdsaP384 { key: secret } => {
       let raw = secret.sign<Sha384>(content)
-      return EcdsaP384.toDer(&raw, move output)
+      return Result<usize, ServerError>.succeed(EcdsaP384.toDer(&raw, move output))
+    }
+    ServerKey.Ed25519 { key: secret } => {
+      let signature = secret.sign(content)
+      copyInto(move output, &signature)
+      return Result<usize, ServerError>.succeed(64)
+    }
+    ServerKey.RsaPss { key: secret } => {
+      let width = secret.publicKey().byteLength()
+      if width > SIGNATURE_LIMIT {
+        return Result<usize, ServerError>.failResult(
+          ServerError.RsaSignature { error: RsaError.InvalidLength },
+        )
+      }
+      let view = Slice.viewMut<u8>(move output, 0, width)
+      if scheme == 2054 {
+        let digest = Sha512.hash(content)
+        return run rsaSignPss<Sha512>(&secret, &digest, 64, move view)
+      }
+      if scheme == 2053 {
+        let digest = Sha384.hash(content)
+        return run rsaSignPss<Sha384>(&secret, &digest, 48, move view)
+      }
+      let digest = Sha256.hash(content)
+      return run rsaSignPss<Sha256>(&secret, &digest, 32, move view)
     }
   }
+}
+
+effect fn rsaSignPss<H: Digest>(
+  key: &RsaPrivateKey,
+  digest: &[u8],
+  saltLength: usize,
+  output: &mut [u8],
+) -> Result<usize, ServerError>
+  ? &mut Random {
+  return run Effect.catchAll(rsaSignedLength<H>(key, digest, saltLength, move output), rsaFailed)
+}
+
+effect fn rsaSignedLength<H: Digest>(
+  key: &RsaPrivateKey,
+  digest: &[u8],
+  saltLength: usize,
+  output: &mut [u8],
+) -> Result<usize, ServerError>
+  ! RsaError
+  ? &mut Random {
+  let width = output.length
+  run key.signPss<H>(digest, saltLength, move output)
+  return Result<usize, ServerError>.succeed(width)
+}
+
+effect fn rsaFailed(error: RsaError) -> Result<usize, ServerError> {
+  return Result<usize, ServerError>.failResult(ServerError.RsaSignature { error: error })
 }
 
 fn handleClientFinished(server: &mut Server, messageLength: usize) -> Result<(), ServerError> {

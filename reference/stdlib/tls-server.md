@@ -16,8 +16,9 @@ The server supports TLS 1.3 only. It selects the first cipher suite in the clien
 ChaCha20-Poly1305, AES-128-GCM, and AES-256-GCM. It selects the key exchange group from
 X25519, P-256, and P-384 in that order, limited by your [`GroupPolicy`](#GroupPolicy). If the client sent no
 key share for an allowed group that it supports, the server sends one HelloRetryRequest. The
-server signs CertificateVerify with an ECDSA P-256 or P-384 key ([`ServerKey`](#ServerKey)) and checks the
-client's Finished message.
+server signs CertificateVerify with the leaf's ECDSA P-256, ECDSA P-384, Ed25519, or RSA key
+([`ServerKey`](#ServerKey)), using a scheme that the client offers, and checks the client's Finished
+message. An RSA key signs with RSA-PSS, preferring SHA-256, then SHA-384, then SHA-512.
 
 The server reads the client's SNI name, which you get from [`Server.serverName`](#Server.impl.serverName), and selects an
 ALPN protocol from your [`AlpnConfig`](./tls-client.md#AlpnConfig) in your preference order. It handles KeyUpdate in both
@@ -304,6 +305,47 @@ An ECDSA P-384 key, used with the `ecdsa_secp384r1_sha384` scheme.
 
 ```silk
 pub key: P384
+```
+
+The private key.
+
+<a id="ServerKey.Ed25519"></a>
+
+### `Ed25519`
+
+```silk
+Ed25519
+```
+
+An Ed25519 key, used with the `ed25519` scheme.
+
+<a id="ServerKey.Ed25519.key"></a>
+
+#### Field `key`
+
+```silk
+pub key: Ed25519PrivateKey
+```
+
+The private key.
+
+<a id="ServerKey.RsaPss"></a>
+
+### `RsaPss`
+
+```silk
+RsaPss
+```
+
+An RSA key for an `rsaEncryption` certificate, used with the `rsa_pss_rsae_sha256`,
+`rsa_pss_rsae_sha384`, or `rsa_pss_rsae_sha512` scheme, in that order of preference.
+
+<a id="ServerKey.RsaPss.key"></a>
+
+#### Field `key`
+
+```silk
+pub key: RsaPrivateKey
 ```
 
 The private key.
@@ -1155,6 +1197,27 @@ InvalidKeyShare
 ```
 
 The client's key share is not a valid public key.
+
+<a id="ServerError.RsaSignature"></a>
+
+### `RsaSignature`
+
+```silk
+RsaSignature
+```
+
+The RSA key could not sign CertificateVerify, for example because it is too small for the
+scheme.
+
+<a id="ServerError.RsaSignature.error"></a>
+
+#### Field `error`
+
+```silk
+pub error: RsaError
+```
+
+The RSA failure.
 
 <a id="ServerError.Finished"></a>
 
