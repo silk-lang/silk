@@ -10,7 +10,7 @@ Public API documentation lives in the `//!` and `///` comments of the Silk sourc
 ## Compression
 
 The compression modules cover the formats in Zig's `lib/std/compress` (reference commit
-`738d2be9d6b6ef3ff3559130c05159ef53336224`):
+`738d2be9d6b6ef3ff3559130c05159ef53336224`), and Brotli:
 
 | Format | Encode | Decode |
 | --- | --- | --- |
@@ -19,6 +19,7 @@ The compression modules cover the formats in Zig's `lib/std/compress` (reference
 | Raw LZMA2 | — | `silk.compress.lzma2.Lzma2.decode` |
 | XZ (`.xz`, single LZMA2 filter per block) | — | `silk.compress.xz.Xz.decode` |
 | Zstandard | — | `silk.compress.zstd.Zstd` |
+| Brotli | — | `silk.compress.brotli.Brotli` |
 
 DEFLATE encoding uses LZ77 matches and fixed Huffman codes with raw, zlib, or deterministic gzip
 framing. LZMA, LZMA2, and XZ decode complete input buffers into caller-owned output buffers, with
@@ -26,6 +27,11 @@ explicit `silk.compress.limits.DecodeLimits`. XZ verifies block checks, index re
 and accepts concatenated streams and padding. Its supported block checks are none, CRC-32,
 CRC-64, and SHA-256. Other XZ filters are reported as unsupported, matching the reference's scope.
 The existing DEFLATE and Zstandard decoders provide incremental decoding.
+
+The Brotli decoder covers all of RFC 7932, including the static dictionary and its word
+transforms, and decodes incrementally into a window it allocates once. Regenerate its dictionary
+and transform tables with `scripts/brotli/generate-tables`, which fetches checksum-pinned sources
+from google/brotli.
 
 The shared native corpus includes independent liblzma fixtures and malformed-input cases.
 Regenerate them with `python compiler/fixtures/compression/generate.py` from the repository root.

@@ -1,0 +1,2834 @@
+//! Decompress Brotli data (RFC 7932) in steps, with fixed memory and limits that you set.
+//!
+//! # When to use
+//! Use [`Brotli`] to read `.br` files or HTTP bodies with `Content-Encoding: br`. Make a decoder
+//! with [`Brotli.make`], and call [`Brotli.step`] until it returns `Finished`. Call
+//! [`Brotli.reset`] to decode another stream with the same storage. This module does not
+//! compress.
+//!
+//! # Details
+//! The decoder supports all of RFC 7932: compressed, uncompressed, and metadata meta-blocks, all
+//! context modes, and the static dictionary with its 121 word transforms. [`Brotli.make`] allocates
+//! all storage one time: the history window and the space for prefix code tables. [`Brotli.step`]
+//! does not allocate and keeps no borrow of your buffers, so you can move the decoder between
+//! threads between calls.
+//!
+//! A Brotli stream ends itself. The decoder returns `Finished` when the last meta-block is decoded
+//! and all output is written, and it leaves the bytes after the stream unconsumed.
+//!
+//! # Errors
+//! - `OutOfMemoryError` from [`Brotli.make`] if the `Allocator` fails.
+//! - [`BrotliError`] if the configuration is not valid, the data is not valid, a limit is
+//!   exceeded, or a call after the final input does not give exactly the input that is not consumed
+//!   yet. `reason` gives the cause and `offset` the input position.
+//!
+//! # Gotchas
+//! The window holds `windowBytes` rounded down to a power of two. A stream can declare a larger
+//! window than that and still decode, as long as no back-reference reaches further than the window
+//! holds. A failure is permanent until [`Brotli.reset`].
+//!
+//! # Examples
+//! ## Decode a short stream
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.core.result { Result }
+//! import silk.compress.brotli { Brotli, BrotliError, BrotliLimits, BrotliProgress, BrotliStatus }
+//!
+//! pub effect fn main() -> i32
+//!   ! BrotliError | OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let mut decoder = run Brotli.make(BrotliLimits.make())
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!
+//!   // The reference encoder's output for "hi": one uncompressed meta-block and an empty last one.
+//!   let input = b"\x8b\x00\x80hi\x03"
+//!   let mut output: [u8; 16] = [0; 16]
+//!   return match Brotli.step(&mut decoder, &input, &mut output, true) {
+//!     Result<BrotliProgress, BrotliError>.Success { value } => {
+//!       if value.status != BrotliStatus.Finished || value.written != 2 || output[0] != 104
+//!         || output[1] != 105 {
+//!         return 1
+//!       }
+//!       return 0
+//!     }
+//!     Result<BrotliProgress, BrotliError>.Failure {..} => 1
+//!   }
+//! }
+//! ```
+//!
+//! @category Data formats
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.format { Debug, Format, Formatter }
+import silk.mem.layout { Layout }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.result { Result }
+import silk.compress.brotli_tables
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.i64
+import silk.num.usize
+import silk.io.writer { Writer, WriterError }
+
+/// The resource limits for one stream. [`BrotliLimits.make`] gives defaults.
+pub struct BrotliLimits {
+  /// The maximum number of input bytes to consume.
+  pub inputBytes: u64,
+  /// The maximum number of decoded bytes.
+  pub outputBytes: u64,
+  /// The size of the history window that [`Brotli.make`] allocates, rounded down to a power of two
+  /// and capped at 16 MiB, the largest window of the format. It must not be 0. A back-reference
+  /// further than the window fails with `WindowLimit`.
+  pub windowBytes: usize,
+  /// The storage budget other than the window: decoder state, context maps, and the space for the
+  /// prefix code tables of one meta-block. If it is too small for the fixed part, [`Brotli.make`]
+  /// fails with `WorkspaceLimit`, and if a meta-block needs more table space than it leaves, the
+  /// step fails with `WorkspaceLimit`.
+  pub workspaceBytes: usize,
+}
+
+impl BrotliLimits {
+  /// Returns default limits: 64 MiB of input, 256 MiB of output, a 16 MiB window, and a 3 MiB
+  /// workspace. These decode any valid stream within the input and output limits.
+  pub fn make() -> Self {
+    return BrotliLimits {
+      inputBytes: 67108864,
+      outputBytes: 268435456,
+      windowBytes: 16777216,
+      workspaceBytes: 3145728,
+    }
+  }
+}
+
+/// What the decoder needs after a successful step.
+pub enum BrotliStatus {
+  /// All given input is consumed. Call again with more input, or with `finalInput` set if there is
+  /// no more.
+  NeedInput,
+  /// The output buffer is full. Call again with an output buffer that is not empty, and the input
+  /// that was not consumed.
+  NeedOutput,
+  /// The stream is complete and all of its output is written. The bytes after it are not consumed.
+  Finished,
+}
+
+/// The result of one successful step.
+pub struct BrotliProgress {
+  /// The number of input bytes that this call consumed. Give only the rest of the input on the next
+  /// call.
+  pub consumed: usize,
+  /// The number of output bytes that this call wrote. Only this prefix of the output changed.
+  pub written: usize,
+  /// What the decoder needs next.
+  pub status: BrotliStatus,
+}
+
+/// The cause of a [`BrotliError`].
+pub enum BrotliReason {
+  /// No failure. The decoder uses it internally. A returned error never has it.
+  None,
+  /// The window size is 0, or the storage sizes do not fit in `usize`.
+  InvalidConfiguration,
+  /// A call changes the final input after it was set, or uses a decoder that lost its storage.
+  InvalidState,
+  /// The stream header asks for a window size that RFC 7932 does not define.
+  WindowBits,
+  /// A meta-block header is not valid: a reserved bit is set, a length has an extra zero nibble or
+  /// byte, or padding bits are not zero.
+  Header,
+  /// A prefix code is not valid: a symbol is out of range or repeated, a code is incomplete or
+  /// oversubscribed, or a repeat runs past the alphabet.
+  PrefixCode,
+  /// A context map has a run of zeros past its end.
+  ContextMap,
+  /// The commands of a meta-block produce more bytes than its length.
+  BlockLength,
+  /// A distance is 0 or less, or too large.
+  Distance,
+  /// A static dictionary reference has a length with no words, or a transform that does not exist.
+  Dictionary,
+  /// The final input ends before the stream is complete.
+  Truncated,
+  /// The consumed input would go over [`BrotliLimits.inputBytes`].
+  InputLimit,
+  /// The decoded output would go over [`BrotliLimits.outputBytes`].
+  OutputLimit,
+  /// A back-reference reaches further than the window that [`Brotli.make`] allocated.
+  WindowLimit,
+  /// [`BrotliLimits.workspaceBytes`] is too small for the decoder state or for the prefix code
+  /// tables of a meta-block.
+  WorkspaceLimit,
+}
+
+impl Debug for BrotliReason {
+  /// Writes the name of the variant, such as `None`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      BrotliReason.None => run Format.write(&mut formatter, b"None")
+      BrotliReason.InvalidConfiguration => run Format.write(&mut formatter, b"InvalidConfiguration")
+      BrotliReason.InvalidState => run Format.write(&mut formatter, b"InvalidState")
+      BrotliReason.WindowBits => run Format.write(&mut formatter, b"WindowBits")
+      BrotliReason.Header => run Format.write(&mut formatter, b"Header")
+      BrotliReason.PrefixCode => run Format.write(&mut formatter, b"PrefixCode")
+      BrotliReason.ContextMap => run Format.write(&mut formatter, b"ContextMap")
+      BrotliReason.BlockLength => run Format.write(&mut formatter, b"BlockLength")
+      BrotliReason.Distance => run Format.write(&mut formatter, b"Distance")
+      BrotliReason.Dictionary => run Format.write(&mut formatter, b"Dictionary")
+      BrotliReason.Truncated => run Format.write(&mut formatter, b"Truncated")
+      BrotliReason.InputLimit => run Format.write(&mut formatter, b"InputLimit")
+      BrotliReason.OutputLimit => run Format.write(&mut formatter, b"OutputLimit")
+      BrotliReason.WindowLimit => run Format.write(&mut formatter, b"WindowLimit")
+      BrotliReason.WorkspaceLimit => run Format.write(&mut formatter, b"WorkspaceLimit")
+    }
+  }
+}
+
+/// A decoding failure. It is permanent until [`Brotli.reset`].
+///
+/// Each later call returns the same `reason` and `offset` with no progress. The output that earlier
+/// calls wrote is not valid.
+pub struct BrotliError {
+  /// The cause of the failure.
+  pub reason: BrotliReason,
+  /// The input position where the decoder found the problem, counted from the start of the stream.
+  pub offset: u64,
+  /// The number of input bytes that this call consumed before it failed.
+  pub consumed: usize,
+  /// The number of output bytes that this call wrote before it failed.
+  pub written: usize,
+}
+
+impl Debug for BrotliError {
+  /// Writes the fields, as `BrotliError { reason: ..., offset: ..., ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return run Format.debugFields(self, "BrotliError", &mut formatter)
+  }
+}
+
+/// A Brotli decoder for one stream at a time. It owns all its storage.
+///
+/// # When to use
+/// Use it to read `.br` files or HTTP bodies with `Content-Encoding: br`. Make a decoder with
+/// [`Brotli.make`], call [`Brotli.step`] until it returns `Finished`, and call [`Brotli.reset`] to
+/// decode another stream.
+///
+/// # Details
+/// [`Brotli.make`] allocates the window and the table space one time. [`Brotli.step`] does not
+/// allocate and keeps no borrow of your buffers, so you can move the decoder between threads
+/// between calls.
+///
+/// # Gotchas
+/// A failure is permanent until [`Brotli.reset`]. Output that the stream wrote before a failure is
+/// not valid.
+pub struct Brotli {
+  limits: BrotliLimits,
+  ring: List<u8>,
+  ringSize: usize,
+  ringMask: usize,
+  pool: List<u32>,
+  poolUsed: usize,
+  literalOffsets: List<u32>,
+  commandOffsets: List<u32>,
+  distanceOffsets: List<u32>,
+  typeTrees: List<u32>,
+  countTrees: List<u32>,
+  mapTree: List<u32>,
+  lengthTree: List<u32>,
+  maps: List<u8>,
+  modes: List<u8>,
+  lengths: List<u8>,
+  sorted: List<u32>,
+  treeCounts: [u32; 16],
+  treeUsed: usize,
+  codeLengthLengths: [u8; 18],
+  word: [u8; 64],
+  wordLength: usize,
+  wordIndex: usize,
+  acc: u64,
+  count: u32,
+  position: usize,
+  written: usize,
+  phase: u32,
+  maxBackward: u64,
+  last: bool,
+  remaining: u32,
+  types: [u32; 3],
+  blockType: [u32; 3],
+  previousType: [u32; 3],
+  blockLength: [u32; 3],
+  category: u32,
+  postfix: u32,
+  direct: u32,
+  distanceAlphabet: u32,
+  literalTreeCount: u32,
+  distanceTreeCount: u32,
+  group: u32,
+  groupTree: u32,
+  contextMode: usize,
+  literalMapBase: usize,
+  distanceMapBase: usize,
+  commandBase: usize,
+  insertCode: u32,
+  copyCode: u32,
+  implicitDistance: bool,
+  insertRemaining: u32,
+  copyLength: u32,
+  copyRemaining: u32,
+  copyDistance: u64,
+  distances: [u32; 4],
+  last1: u8,
+  last2: u8,
+  produced: u64,
+  flushed: u64,
+  treePhase: u32,
+  treeAlphabet: u32,
+  treeDestination: u32,
+  treeBase: usize,
+  treeIndex: usize,
+  treeSpace: i64,
+  treeCodes: u32,
+  treePrevious: u32,
+  treeRepeat: u32,
+  treeRepeatLength: u32,
+  mapPhase: u32,
+  mapBase: usize,
+  mapSize: usize,
+  mapTrees: u32,
+  mapRle: u32,
+  mapIndex: usize,
+  totalInput: u64,
+  finalKnown: bool,
+  finalOffset: u64,
+  reason: BrotliReason,
+  errorOffset: u64,
+}
+
+// Step outcomes.
+const GO: u32 = 0
+
+const NEED_INPUT: u32 = 1
+
+const NEED_OUTPUT: u32 = 2
+
+const FAILED: u32 = 3
+
+const DONE: u32 = 4
+
+// `decodeSymbol` returns it when the bits on hand do not hold the whole code.
+const NEED: u32 = 4294967295
+
+const PHASE_WINDOW: u32 = 0
+
+const PHASE_HEADER: u32 = 1
+
+const PHASE_METADATA: u32 = 2
+
+const PHASE_UNCOMPRESSED: u32 = 3
+
+const PHASE_TYPES: u32 = 4
+
+const PHASE_TYPE_TREE: u32 = 5
+
+const PHASE_COUNT_TREE: u32 = 6
+
+const PHASE_FIRST_COUNT: u32 = 7
+
+const PHASE_DISTANCE_PARAMETERS: u32 = 8
+
+const PHASE_MODES: u32 = 9
+
+const PHASE_LITERAL_TREE_COUNT: u32 = 10
+
+const PHASE_LITERAL_MAP: u32 = 11
+
+const PHASE_DISTANCE_TREE_COUNT: u32 = 12
+
+const PHASE_DISTANCE_MAP: u32 = 13
+
+const PHASE_GROUPS: u32 = 14
+
+const PHASE_COMMAND: u32 = 15
+
+const PHASE_COMMAND_EXTRA: u32 = 16
+
+const PHASE_LITERALS: u32 = 17
+
+const PHASE_DISTANCE: u32 = 18
+
+const PHASE_COPY: u32 = 19
+
+const PHASE_WORD: u32 = 20
+
+const PHASE_BLOCK_DONE: u32 = 21
+
+const PHASE_FLUSH_END: u32 = 22
+
+const PHASE_FINISHED: u32 = 23
+
+const TREE_START: u32 = 0
+
+const TREE_LENGTHS: u32 = 1
+
+const TREE_SYMBOLS: u32 = 2
+
+const MAP_START: u32 = 0
+
+const MAP_TREE: u32 = 1
+
+const MAP_VALUES: u32 = 2
+
+const MAP_TRANSFORM: u32 = 3
+
+// Where `finishTree` puts a table: 0 to 2 for block type codes, 3 to 5 for block count codes.
+const DEST_MAP: u32 = 6
+
+const DEST_POOL: u32 = 7
+
+const TYPE_TREE_SIZE: usize = 662
+
+const COUNT_TREE_SIZE: usize = 402
+
+const MAP_TREE_SIZE: usize = 662
+
+const DISTANCE_MAP_BASE: usize = 16384
+
+const MAPS_SIZE: usize = 17408
+
+const MAX_ALPHABET: usize = 704
+
+// The table space of the worst meta-block: 256 trees each of literals (630 entries), commands
+// (1080), and distances (920), with the reference's bound for 8-bit root tables.
+const WORST_POOL: usize = 673280
+
+const MAX_WINDOW: usize = 16777216
+
+const MAX_ALLOWED_DISTANCE: u64 = 2147483644
+
+// Table sizes for 8-bit root tables, by `(alphabet + 31) / 32` (huffman.h).
+const MAX_TABLE_SIZES: [u32; 23] = [
+  256,
+  402,
+  436,
+  468,
+  500,
+  534,
+  566,
+  598,
+  630,
+  662,
+  694,
+  726,
+  758,
+  790,
+  822,
+  854,
+  886,
+  920,
+  952,
+  984,
+  1016,
+  1048,
+  1080,
+]
+
+const BLOCK_LENGTH_BASE: [u32; 26] = [
+  1,
+  5,
+  9,
+  13,
+  17,
+  25,
+  33,
+  41,
+  49,
+  65,
+  81,
+  97,
+  113,
+  145,
+  177,
+  209,
+  241,
+  305,
+  369,
+  497,
+  753,
+  1265,
+  2289,
+  4337,
+  8433,
+  16625,
+]
+
+const BLOCK_LENGTH_EXTRA: [u32; 26] = [
+  2,
+  2,
+  2,
+  2,
+  3,
+  3,
+  3,
+  3,
+  4,
+  4,
+  4,
+  4,
+  5,
+  5,
+  5,
+  5,
+  6,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  24,
+]
+
+const INSERT_BASE: [u32; 24] = [
+  0,
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  8,
+  10,
+  14,
+  18,
+  26,
+  34,
+  50,
+  66,
+  98,
+  130,
+  194,
+  322,
+  578,
+  1090,
+  2114,
+  6210,
+  22594,
+]
+
+const INSERT_EXTRA: [u32; 24] = [
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  1,
+  1,
+  2,
+  2,
+  3,
+  3,
+  4,
+  4,
+  5,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10,
+  12,
+  14,
+  24,
+]
+
+const COPY_BASE: [u32; 24] = [
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10,
+  12,
+  14,
+  18,
+  22,
+  30,
+  38,
+  54,
+  70,
+  102,
+  134,
+  198,
+  326,
+  582,
+  1094,
+  2118,
+]
+
+const COPY_EXTRA: [u32; 24] = [
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  1,
+  1,
+  2,
+  2,
+  3,
+  3,
+  4,
+  4,
+  5,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10,
+  24,
+]
+
+// The first insert and copy length codes of each 64-symbol cell of the command alphabet.
+const CELL_INSERT: [u32; 11] = [0, 0, 0, 0, 8, 8, 0, 16, 8, 16, 16]
+
+const CELL_COPY: [u32; 11] = [0, 8, 0, 8, 0, 8, 16, 0, 16, 8, 16]
+
+const CODE_LENGTH_ORDER: [usize; 18] = [
+  1,
+  2,
+  3,
+  4,
+  0,
+  5,
+  17,
+  6,
+  16,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+]
+
+// The fixed prefix code of the code length code lengths, by the next 4 bits.
+const LENGTH_PREFIX_BITS: [u32; 16] = [2, 2, 2, 3, 2, 2, 2, 4, 2, 2, 2, 3, 2, 2, 2, 4]
+
+const LENGTH_PREFIX_VALUE: [u32; 16] = [0, 4, 3, 2, 0, 4, 3, 1, 0, 4, 3, 2, 0, 4, 3, 5]
+
+// Distance code 4 to 9 and 10 to 15 add these to the last and the second last distance.
+const DISTANCE_DELTAS: [i64; 6] = [-1, 1, -2, 2, -3, 3]
+
+impl Brotli {
+  /// Returns a decoder that uses `limits`, with storage from the ambient `Allocator`.
+  ///
+  /// It allocates the window and the workspace. [`Brotli.step`] does not allocate.
+  ///
+  /// # Errors
+  /// - [`BrotliError`] with `WorkspaceLimit` if `workspaceBytes` is too small for the fixed state,
+  ///   or with `InvalidConfiguration` if `windowBytes` is 0. These checks come before the
+  ///   allocation.
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn make(limits: BrotliLimits) -> Self
+    ! BrotliError | OutOfMemoryError
+    ? &mut Allocator {
+    let fixed = Layout.of<Brotli>().bytes
+      + 4 * (768 + 3 * TYPE_TREE_SIZE + 3 * COUNT_TREE_SIZE + MAP_TREE_SIZE + 256 + MAX_ALPHABET)
+      + MAPS_SIZE
+      + 256
+      + MAX_ALPHABET
+    if limits.workspaceBytes < fixed {
+      fail initialError(BrotliReason.WorkspaceLimit)
+    }
+    if limits.windowBytes == 0 {
+      fail initialError(BrotliReason.InvalidConfiguration)
+    }
+    let mut ringSize: usize = 1
+    while ringSize * 2 <= limits.windowBytes && ringSize < MAX_WINDOW {
+      ringSize = ringSize * 2
+    }
+    let mut poolSize = (limits.workspaceBytes - fixed) / 4
+    if poolSize > WORST_POOL {
+      poolSize = WORST_POOL
+    }
+    let mut ring = List<u8>.make()
+    run List<u8>.appendRepeated(&mut ring, 0, ringSize)
+    let mut pool = List<u32>.make()
+    run List<u32>.appendRepeated(&mut pool, 0, poolSize)
+    let mut literalOffsets = List<u32>.make()
+    run List<u32>.appendRepeated(&mut literalOffsets, 0, 256)
+    let mut commandOffsets = List<u32>.make()
+    run List<u32>.appendRepeated(&mut commandOffsets, 0, 256)
+    let mut distanceOffsets = List<u32>.make()
+    run List<u32>.appendRepeated(&mut distanceOffsets, 0, 256)
+    let mut typeTrees = List<u32>.make()
+    run List<u32>.appendRepeated(&mut typeTrees, 0, 3 * TYPE_TREE_SIZE)
+    let mut countTrees = List<u32>.make()
+    run List<u32>.appendRepeated(&mut countTrees, 0, 3 * COUNT_TREE_SIZE)
+    let mut mapTree = List<u32>.make()
+    run List<u32>.appendRepeated(&mut mapTree, 0, MAP_TREE_SIZE)
+    let mut lengthTree = List<u32>.make()
+    run List<u32>.appendRepeated(&mut lengthTree, 0, 256)
+    let mut maps = List<u8>.make()
+    run List<u8>.appendRepeated(&mut maps, 0, MAPS_SIZE)
+    let mut modes = List<u8>.make()
+    run List<u8>.appendRepeated(&mut modes, 0, 256)
+    let mut lengths = List<u8>.make()
+    run List<u8>.appendRepeated(&mut lengths, 0, MAX_ALPHABET)
+    let mut sorted = List<u32>.make()
+    run List<u32>.appendRepeated(&mut sorted, 0, MAX_ALPHABET)
+    let mut decoder = Brotli {
+      limits: move limits,
+      ring: move ring,
+      ringSize: ringSize,
+      ringMask: ringSize - 1,
+      pool: move pool,
+      poolUsed: 0,
+      literalOffsets: move literalOffsets,
+      commandOffsets: move commandOffsets,
+      distanceOffsets: move distanceOffsets,
+      typeTrees: move typeTrees,
+      countTrees: move countTrees,
+      mapTree: move mapTree,
+      lengthTree: move lengthTree,
+      maps: move maps,
+      modes: move modes,
+      lengths: move lengths,
+      sorted: move sorted,
+      treeCounts: [0; 16],
+      treeUsed: 0,
+      codeLengthLengths: [0; 18],
+      word: [0; 64],
+      wordLength: 0,
+      wordIndex: 0,
+      acc: 0,
+      count: 0,
+      position: 0,
+      written: 0,
+      phase: PHASE_WINDOW,
+      maxBackward: 0,
+      last: false,
+      remaining: 0,
+      types: [1, 1, 1],
+      blockType: [0, 0, 0],
+      previousType: [1, 1, 1],
+      blockLength: [0, 0, 0],
+      category: 0,
+      postfix: 0,
+      direct: 0,
+      distanceAlphabet: 0,
+      literalTreeCount: 0,
+      distanceTreeCount: 0,
+      group: 0,
+      groupTree: 0,
+      contextMode: 0,
+      literalMapBase: 0,
+      distanceMapBase: 0,
+      commandBase: 0,
+      insertCode: 0,
+      copyCode: 0,
+      implicitDistance: false,
+      insertRemaining: 0,
+      copyLength: 0,
+      copyRemaining: 0,
+      copyDistance: 0,
+      distances: [4, 11, 15, 16],
+      last1: 0,
+      last2: 0,
+      produced: 0,
+      flushed: 0,
+      treePhase: TREE_START,
+      treeAlphabet: 0,
+      treeDestination: 0,
+      treeBase: 0,
+      treeIndex: 0,
+      treeSpace: 0,
+      treeCodes: 0,
+      treePrevious: 0,
+      treeRepeat: 0,
+      treeRepeatLength: 0,
+      mapPhase: MAP_START,
+      mapBase: 0,
+      mapSize: 0,
+      mapTrees: 0,
+      mapRle: 0,
+      mapIndex: 0,
+      totalInput: 0,
+      finalKnown: false,
+      finalOffset: 0,
+      reason: BrotliReason.None,
+      errorOffset: 0,
+    }
+    Brotli.reset(&mut decoder)
+    return move decoder
+  }
+
+  /// Starts a new stream with the same limits and storage. It does not allocate. It drops the state
+  /// of the current stream and a failure.
+  pub fn reset(self: &mut Self) -> () {
+    self.poolUsed = 0
+    self.wordLength = 0
+    self.wordIndex = 0
+    self.acc = 0
+    self.count = 0
+    self.position = 0
+    self.written = 0
+    self.phase = PHASE_WINDOW
+    self.maxBackward = 0
+    self.last = false
+    self.remaining = 0
+    self.distances = [4, 11, 15, 16]
+    self.last1 = 0
+    self.last2 = 0
+    self.produced = 0
+    self.flushed = 0
+    self.treePhase = TREE_START
+    self.mapPhase = MAP_START
+    self.totalInput = 0
+    self.finalKnown = false
+    self.finalOffset = 0
+    self.reason = BrotliReason.None
+    self.errorOffset = 0
+  }
+
+  /// Decodes from `input` into `output` and returns how much it consumed and wrote.
+  ///
+  /// On the next call, give only the input after the consumed prefix, and use only the written
+  /// prefix of the output. Set `finalInput` when `input` holds all remaining data. After that, each
+  /// call must set `finalInput` and give exactly the input that is not consumed yet. `NeedOutput`
+  /// with an empty output makes no progress. After `Finished`, each call returns `Finished` and
+  /// consumes nothing.
+  ///
+  /// # Errors
+  /// - [`BrotliError`] if the data is not valid, a [`BrotliLimits`] value would be exceeded, the
+  ///   final input ends early (`Truncated`), or the call changes the final input (`InvalidState`).
+  ///
+  /// # Gotchas
+  /// A failure is permanent until [`Brotli.reset`].
+  pub fn step(self: &mut Self, input: &[u8], output: &mut [u8], finalInput: bool) -> Result<
+    BrotliProgress,
+    BrotliError,
+  > {
+    self.position = 0
+    self.written = 0
+    if self.reason != BrotliReason.None {
+      return failed(&self)
+    }
+    if self.phase == PHASE_FINISHED {
+      return progressed(&self, BrotliStatus.Finished)
+    }
+    let available = usize.toU64(input.length)
+    if self.finalKnown {
+      if !finalInput || available != self.finalOffset - self.totalInput {
+        return stop(&mut self, BrotliReason.InvalidState)
+      }
+    } else if finalInput {
+      self.finalKnown = true
+      self.finalOffset = self.totalInput + available
+    }
+    let mut allowed = input.length
+    let budget = self.limits.inputBytes - self.totalInput
+    if available > budget {
+      allowed = u64.toUsize(budget)
+    }
+    let outcome = decodeLoop(&mut self, Slice.view<u8>(input, 0, allowed), &mut output)
+    flush(&mut self, &mut output)
+    if outcome == FAILED {
+      return record(&mut self)
+    }
+    if outcome == NEED_INPUT {
+      if allowed < input.length {
+        return stop(&mut self, BrotliReason.InputLimit)
+      }
+      if finalInput {
+        return stop(&mut self, BrotliReason.Truncated)
+      }
+    }
+    if outcome != NEED_INPUT {
+      giveBack(&mut self)
+    }
+    self.totalInput = self.totalInput + usize.toU64(self.position)
+    if outcome == DONE {
+      return progressed(&self, BrotliStatus.Finished)
+    }
+    if outcome == NEED_OUTPUT || self.flushed != self.produced {
+      return progressed(&self, BrotliStatus.NeedOutput)
+    }
+    return progressed(&self, BrotliStatus.NeedInput)
+  }
+}
+
+fn initialError(reason: BrotliReason) -> BrotliError {
+  return BrotliError { reason: move reason, offset: 0, consumed: 0, written: 0 }
+}
+
+fn progressed(state: &Brotli, status: BrotliStatus) -> Result<BrotliProgress, BrotliError> {
+  return Result<BrotliProgress, BrotliError>.succeed(
+    BrotliProgress { consumed: state.position, written: state.written, status: move status },
+  )
+}
+
+fn failed(state: &Brotli) -> Result<BrotliProgress, BrotliError> {
+  return Result<BrotliProgress, BrotliError>.failResult(
+    BrotliError {
+      reason: state.reason,
+      offset: state.errorOffset,
+      consumed: state.position,
+      written: state.written,
+    },
+  )
+}
+
+// Records a failure at the current input position and returns it.
+fn stop(state: &mut Brotli, reason: BrotliReason) -> Result<BrotliProgress, BrotliError> {
+  state.reason = reason
+  return record(&mut state)
+}
+
+// Returns the recorded failure, with the current input position as its offset.
+fn record(state: &mut Brotli) -> Result<BrotliProgress, BrotliError> {
+  state.errorOffset = state.totalInput + usize.toU64(state.position)
+  state.totalInput = state.totalInput + usize.toU64(state.position)
+  return failed(&state)
+}
+
+fn fault(state: &mut Brotli, reason: BrotliReason) -> u32 {
+  state.reason = reason
+  return FAILED
+}
+
+// Returns the whole bytes of the bit buffer to the caller, who gives them again on the next call.
+// They are the last bytes that this call consumed. A step that needs more input keeps them, since
+// the unit it is reading needs all of them, so the bytes after the end of the stream are never
+// consumed.
+fn giveBack(state: &mut Brotli) -> () {
+  let mut whole = u32.toUsize(state.count / 8)
+  if whole > state.position {
+    whole = state.position
+  }
+  state.position = state.position - whole
+  state.count = state.count - usize.toU32(whole) * 8
+  if state.count < 64 {
+    state.acc = state.acc & lowMask(state.count)
+  }
+}
+
+// Returns a mask of the low `bits` bits, for `bits` below 64.
+@inlineAlways
+fn lowMask(bits: u32) -> u64 {
+  return u64.shiftLeft(1, u32.toU64(bits)) - 1
+}
+
+// Returns `width` bits of `acc` from bit `shift`.
+@inlineAlways
+fn bitsAt(acc: u64, shift: u32, width: u32) -> u32 {
+  return u64.wrappingToU32(u64.shiftRight(acc, u32.toU64(shift)) & lowMask(width))
+}
+
+// Fills the bit buffer to at least 57 bits, or with all of the input.
+@inlineAlways
+fn fill(state: &mut Brotli, input: &[u8]) -> () {
+  if state.count > 56 {
+    return ()
+  }
+  if input.length - state.position >= 8 {
+    let take = (63 - state.count) / 8
+    let word = u64.shiftLeft(load64(input, state.position), u32.toU64(state.count))
+    state.count = state.count + take * 8
+    state.acc = state.acc | (word & lowMask(state.count))
+    state.position = state.position + u32.toUsize(take)
+    return ()
+  }
+  while state.count <= 56 && state.position < input.length {
+    state.acc = state.acc | u64.shiftLeft(u8.toU64(input[state.position]), u32.toU64(state.count))
+    state.count = state.count + 8
+    state.position = state.position + 1
+  }
+}
+
+// Reads 8 bytes at `at` as a little-endian word, with one bounds check.
+@inlineAlways
+fn load64(buffer: &[u8], at: usize) -> u64 {
+  let bytes = Slice.view<u8>(buffer, at, 8)
+  return u8.toU64(bytes[0]) | u64.shiftLeft(u8.toU64(bytes[1]), 8)
+    | u64.shiftLeft(u8.toU64(bytes[2]), 16)
+    | u64.shiftLeft(u8.toU64(bytes[3]), 24)
+    | u64.shiftLeft(u8.toU64(bytes[4]), 32)
+    | u64.shiftLeft(u8.toU64(bytes[5]), 40)
+    | u64.shiftLeft(u8.toU64(bytes[6]), 48)
+    | u64.shiftLeft(u8.toU64(bytes[7]), 56)
+}
+
+// Writes `value` as 8 little-endian bytes at `at`, with one bounds check.
+@inlineAlways
+fn store64(buffer: &mut [u8], at: usize, value: u64) -> () {
+  let bytes = Slice.viewMut<u8>(move buffer, at, 8)
+  bytes[0] = u64.wrappingToU8(value)
+  bytes[1] = u64.wrappingToU8(u64.shiftRight(value, 8))
+  bytes[2] = u64.wrappingToU8(u64.shiftRight(value, 16))
+  bytes[3] = u64.wrappingToU8(u64.shiftRight(value, 24))
+  bytes[4] = u64.wrappingToU8(u64.shiftRight(value, 32))
+  bytes[5] = u64.wrappingToU8(u64.shiftRight(value, 40))
+  bytes[6] = u64.wrappingToU8(u64.shiftRight(value, 48))
+  bytes[7] = u64.wrappingToU8(u64.shiftRight(value, 56))
+}
+
+// Copies 8 bytes from `from` to `to` in `ring`. The ranges may overlap only if `to` is at least 8
+// bytes after `from`.
+@inlineAlways
+fn move8(ring: &mut List<u8>, to: usize, from: usize) -> () {
+  let value = load64(List<u8>.asSlice(&ring), from)
+  store64(List<u8>.asMutSlice(&mut ring), to, value)
+}
+
+@inlineAlways
+fn dropBits(state: &mut Brotli, bits: u32) -> () {
+  state.acc = u64.shiftRight(state.acc, u32.toU64(bits))
+  state.count = state.count - bits
+}
+
+// Skips to the next byte boundary and returns whether the skipped bits were all zero.
+fn align(state: &mut Brotli) -> bool {
+  let bits = state.count % 8
+  let padding = bitsAt(state.acc, 0, bits)
+  dropBits(&mut state, bits)
+  return padding == 0
+}
+
+// Looks up the code at the bottom of `acc` in the table at `base`. Returns `symbol << 8 | length`,
+// or `NEED` when the code is longer than the `count` bits on hand. The bits above `count` are zero,
+// so a code that fits is found correctly.
+@inlineAlways
+fn decodeSymbol(table: &[u32], base: usize, acc: u64, count: u32) -> u32 {
+  let entry = table[base + u64.wrappingToUsize(acc & 255)]
+  let bits = entry & 255
+  if bits <= 8 {
+    if bits > count {
+      return NEED
+    }
+    return u32.shiftLeft(u32.shiftRight(entry, 16), 8) | bits
+  }
+  let index = u32.toUsize(u32.shiftRight(entry, 16)) + u32.toUsize(bitsAt(acc, 8, bits - 8))
+  let sub = table[base + index]
+  let length = 8 + (sub & 255)
+  if length > count {
+    return NEED
+  }
+  return u32.shiftLeft(u32.shiftRight(sub, 16), 8) | length
+}
+
+// Reads a number from 0 to 255 in the variable-length code of NBLTYPES and NTREES. Returns
+// `value << 8 | length`, or `NEED`.
+fn varLength(acc: u64, count: u32) -> u32 {
+  if count < 1 {
+    return NEED
+  }
+  if bitsAt(acc, 0, 1) == 0 {
+    return 1
+  }
+  if count < 4 {
+    return NEED
+  }
+  let width = bitsAt(acc, 1, 3)
+  if width == 0 {
+    return u32.shiftLeft(1, 8) | 4
+  }
+  if count < 4 + width {
+    return NEED
+  }
+  let value = u32.shiftLeft(1, width) + bitsAt(acc, 4, width)
+  return u32.shiftLeft(value, 8) | (4 + width)
+}
+
+fn decodeLoop(state: &mut Brotli, input: &[u8], output: &mut [u8]) -> u32 {
+  while true {
+    let phase = state.phase
+    let mut outcome = GO
+    if phase == PHASE_LITERALS {
+      outcome = literals(&mut state, input, &mut output)
+    } else if phase == PHASE_COMMAND {
+      fastCommands(&mut state, input)
+      if state.phase == PHASE_COMMAND {
+        outcome = command(&mut state, input)
+      }
+    } else if phase == PHASE_COMMAND_EXTRA {
+      outcome = commandExtra(&mut state, input)
+    } else if phase == PHASE_DISTANCE {
+      outcome = distance(&mut state, input)
+    } else if phase == PHASE_COPY {
+      outcome = copy(&mut state, &mut output)
+    } else if phase == PHASE_WORD {
+      outcome = emitWord(&mut state, &mut output)
+    } else if phase == PHASE_WINDOW {
+      outcome = windowBits(&mut state, input)
+    } else if phase == PHASE_HEADER {
+      outcome = header(&mut state, input)
+    } else if phase == PHASE_METADATA {
+      outcome = metadata(&mut state, input)
+    } else if phase == PHASE_UNCOMPRESSED {
+      outcome = uncompressed(&mut state, input, &mut output)
+    } else if phase == PHASE_TYPES {
+      outcome = blockTypes(&mut state, input)
+    } else if phase == PHASE_TYPE_TREE {
+      outcome = readTree(&mut state, input)
+      if outcome == GO {
+        let destination = 3 + state.category
+        startTree(&mut state, 26, destination)
+        state.phase = PHASE_COUNT_TREE
+      }
+    } else if phase == PHASE_COUNT_TREE {
+      outcome = readTree(&mut state, input)
+      if outcome == GO {
+        state.phase = PHASE_FIRST_COUNT
+      }
+    } else if phase == PHASE_FIRST_COUNT {
+      outcome = firstCount(&mut state, input)
+    } else if phase == PHASE_DISTANCE_PARAMETERS {
+      outcome = distanceParameters(&mut state, input)
+    } else if phase == PHASE_MODES {
+      outcome = contextModes(&mut state, input)
+    } else if phase == PHASE_LITERAL_TREE_COUNT {
+      outcome = treeCount(&mut state, input, 0)
+    } else if phase == PHASE_LITERAL_MAP {
+      outcome = readMap(&mut state, input)
+      if outcome == GO {
+        state.phase = PHASE_DISTANCE_TREE_COUNT
+      }
+    } else if phase == PHASE_DISTANCE_TREE_COUNT {
+      outcome = treeCount(&mut state, input, 2)
+    } else if phase == PHASE_DISTANCE_MAP {
+      outcome = readMap(&mut state, input)
+      if outcome == GO {
+        startGroups(&mut state)
+      }
+    } else if phase == PHASE_GROUPS {
+      outcome = groups(&mut state, input)
+    } else if phase == PHASE_BLOCK_DONE {
+      outcome = blockDone(&mut state)
+    } else if phase == PHASE_FLUSH_END {
+      flush(&mut state, &mut output)
+      if state.flushed != state.produced {
+        return NEED_OUTPUT
+      }
+      state.phase = PHASE_FINISHED
+      return DONE
+    } else {
+      return DONE
+    }
+    if outcome != GO {
+      return outcome
+    }
+  }
+  return GO
+}
+
+fn windowBits(state: &mut Brotli, input: &[u8]) -> u32 {
+  fill(&mut state, input)
+  let acc = state.acc
+  if state.count < 1 {
+    return NEED_INPUT
+  }
+  let mut bits: u32 = 16
+  if bitsAt(acc, 0, 1) == 0 {
+    dropBits(&mut state, 1)
+  } else {
+    if state.count < 4 {
+      return NEED_INPUT
+    }
+    let high = bitsAt(acc, 1, 3)
+    if high != 0 {
+      bits = 17 + high
+      dropBits(&mut state, 4)
+    } else {
+      if state.count < 7 {
+        return NEED_INPUT
+      }
+      let low = bitsAt(acc, 4, 3)
+      if low == 1 {
+        return fault(&mut state, BrotliReason.WindowBits)
+      }
+      bits = 17
+      if low != 0 {
+        bits = 8 + low
+      }
+      dropBits(&mut state, 7)
+    }
+  }
+  state.maxBackward = u64.shiftLeft(1, u32.toU64(bits)) - 16
+  state.phase = PHASE_HEADER
+  return GO
+}
+
+fn header(state: &mut Brotli, input: &[u8]) -> u32 {
+  fill(&mut state, input)
+  let acc = state.acc
+  let count = state.count
+  if count < 1 {
+    return NEED_INPUT
+  }
+  let last = bitsAt(acc, 0, 1) == 1
+  let mut at: u32 = 1
+  if last {
+    if count < 2 {
+      return NEED_INPUT
+    }
+    if bitsAt(acc, 1, 1) == 1 {
+      dropBits(&mut state, 2)
+      state.last = true
+      state.remaining = 0
+      state.phase = PHASE_BLOCK_DONE
+      return GO
+    }
+    at = 2
+  }
+  if count < at + 2 {
+    return NEED_INPUT
+  }
+  let nibbles = bitsAt(acc, at, 2)
+  at = at + 2
+  if nibbles == 3 {
+    if count < at + 3 {
+      return NEED_INPUT
+    }
+    if bitsAt(acc, at, 1) != 0 {
+      return fault(&mut state, BrotliReason.Header)
+    }
+    let bytes = bitsAt(acc, at + 1, 2)
+    at = at + 3
+    if count < at + bytes * 8 {
+      return NEED_INPUT
+    }
+    let mut size: u32 = 0
+    let mut index: u32 = 0
+    while index < bytes {
+      let byte = bitsAt(acc, at + index * 8, 8)
+      if index + 1 == bytes && bytes > 1 && byte == 0 {
+        return fault(&mut state, BrotliReason.Header)
+      }
+      size = size | u32.shiftLeft(byte, index * 8)
+      index = index + 1
+    }
+    if bytes > 0 {
+      size = size + 1
+    }
+    dropBits(&mut state, at + bytes * 8)
+    if !align(&mut state) {
+      return fault(&mut state, BrotliReason.Header)
+    }
+    state.last = last
+    state.remaining = size
+    state.phase = PHASE_METADATA
+    return GO
+  }
+  let digits = nibbles + 4
+  if count < at + digits * 4 {
+    return NEED_INPUT
+  }
+  let mut length: u32 = 0
+  let mut index: u32 = 0
+  while index < digits {
+    let nibble = bitsAt(acc, at + index * 4, 4)
+    if index + 1 == digits && digits > 4 && nibble == 0 {
+      return fault(&mut state, BrotliReason.Header)
+    }
+    length = length | u32.shiftLeft(nibble, index * 4)
+    index = index + 1
+  }
+  at = at + digits * 4
+  length = length + 1
+  let mut raw = false
+  if !last {
+    if count < at + 1 {
+      return NEED_INPUT
+    }
+    raw = bitsAt(acc, at, 1) == 1
+    at = at + 1
+  }
+  dropBits(&mut state, at)
+  state.last = last
+  state.remaining = length
+  if u32.toU64(length) > state.limits.outputBytes - state.produced {
+    return fault(&mut state, BrotliReason.OutputLimit)
+  }
+  if raw {
+    if !align(&mut state) {
+      return fault(&mut state, BrotliReason.Header)
+    }
+    state.phase = PHASE_UNCOMPRESSED
+    return GO
+  }
+  state.category = 0
+  state.poolUsed = 0
+  state.phase = PHASE_TYPES
+  return GO
+}
+
+fn metadata(state: &mut Brotli, input: &[u8]) -> u32 {
+  while state.remaining > 0 && state.count >= 8 {
+    dropBits(&mut state, 8)
+    state.remaining = state.remaining - 1
+  }
+  let mut take = input.length - state.position
+  if take > u32.toUsize(state.remaining) {
+    take = u32.toUsize(state.remaining)
+  }
+  state.position = state.position + take
+  state.remaining = state.remaining - usize.toU32(take)
+  if state.remaining > 0 {
+    return NEED_INPUT
+  }
+  state.phase = PHASE_BLOCK_DONE
+  return GO
+}
+
+fn uncompressed(state: &mut Brotli, input: &[u8], output: &mut [u8]) -> u32 {
+  while state.remaining > 0 {
+    if !room(&mut state, &mut output) {
+      return NEED_OUTPUT
+    }
+    if state.count >= 8 {
+      let byte = u64.wrappingToU8(state.acc)
+      dropBits(&mut state, 8)
+      put(&mut state, byte)
+      state.remaining = state.remaining - 1
+      continue
+    }
+    if state.position == input.length {
+      return NEED_INPUT
+    }
+    let start = u64.wrappingToUsize(state.produced) & state.ringMask
+    let mut length = u32.toUsize(state.remaining)
+    let left = input.length - state.position
+    if length > left {
+      length = left
+    }
+    if length > state.ringSize - start {
+      length = state.ringSize - start
+    }
+    let space = state.ringSize - u64.toUsize(state.produced - state.flushed)
+    if length > space {
+      length = space
+    }
+    Slice.copyInto<u8>(
+      List<u8>.asMutSlice(&mut state.ring),
+      start,
+      Slice.view<u8>(input, state.position, length),
+    )
+    if length >= 2 {
+      state.last2 = input[state.position + length - 2]
+    } else {
+      state.last2 = state.last1
+    }
+    state.last1 = input[state.position + length - 1]
+    state.position = state.position + length
+    state.produced = state.produced + usize.toU64(length)
+    state.remaining = state.remaining - usize.toU32(length)
+  }
+  state.phase = PHASE_BLOCK_DONE
+  return GO
+}
+
+fn blockDone(state: &mut Brotli) -> u32 {
+  if !state.last {
+    state.phase = PHASE_HEADER
+    return GO
+  }
+  if !align(&mut state) {
+    return fault(&mut state, BrotliReason.Header)
+  }
+  state.phase = PHASE_FLUSH_END
+  return GO
+}
+
+fn blockTypes(state: &mut Brotli, input: &[u8]) -> u32 {
+  let category = u32.toUsize(state.category)
+  if category == 3 {
+    state.phase = PHASE_DISTANCE_PARAMETERS
+    return GO
+  }
+  fill(&mut state, input)
+  let result = varLength(state.acc, state.count)
+  if result == NEED {
+    return NEED_INPUT
+  }
+  dropBits(&mut state, result & 255)
+  let types = u32.shiftRight(result, 8) + 1
+  state.types[category] = types
+  state.blockType[category] = 0
+  state.previousType[category] = 1
+  if types >= 2 {
+    let destination = state.category
+    startTree(&mut state, types + 2, destination)
+    state.phase = PHASE_TYPE_TREE
+    return GO
+  }
+  state.blockLength[category] = u32.MAX
+  state.category = state.category + 1
+  return GO
+}
+
+fn firstCount(state: &mut Brotli, input: &[u8]) -> u32 {
+  let category = u32.toUsize(state.category)
+  fill(&mut state, input)
+  let acc = state.acc
+  let count = state.count
+  let result = decodeSymbol(
+    List<u32>.asSlice(&state.countTrees),
+    category * COUNT_TREE_SIZE,
+    acc,
+    count,
+  )
+  if result == NEED {
+    return NEED_INPUT
+  }
+  let length = result & 255
+  let symbol = u32.toUsize(u32.shiftRight(result, 8))
+  let extra = BLOCK_LENGTH_EXTRA[symbol]
+  if count < length + extra {
+    return NEED_INPUT
+  }
+  state.blockLength[category] = BLOCK_LENGTH_BASE[symbol] + bitsAt(acc, length, extra)
+  dropBits(&mut state, length + extra)
+  state.category = state.category + 1
+  state.phase = PHASE_TYPES
+  return GO
+}
+
+fn distanceParameters(state: &mut Brotli, input: &[u8]) -> u32 {
+  fill(&mut state, input)
+  if state.count < 6 {
+    return NEED_INPUT
+  }
+  let postfix = bitsAt(state.acc, 0, 2)
+  state.postfix = postfix
+  state.direct = u32.shiftLeft(bitsAt(state.acc, 2, 4), postfix)
+  state.distanceAlphabet = 16 + state.direct + u32.shiftLeft(48, postfix)
+  dropBits(&mut state, 6)
+  state.category = 0
+  state.phase = PHASE_MODES
+  return GO
+}
+
+fn contextModes(state: &mut Brotli, input: &[u8]) -> u32 {
+  while state.category < state.types[0] {
+    fill(&mut state, input)
+    if state.count < 2 {
+      return NEED_INPUT
+    }
+    let mode = bitsAt(state.acc, 0, 2)
+    let modes = List<u8>.asMutSlice(&mut state.modes)
+    modes[u32.toUsize(state.category)] = u32.wrappingToU8(mode)
+    dropBits(&mut state, 2)
+    state.category = state.category + 1
+  }
+  state.phase = PHASE_LITERAL_TREE_COUNT
+  return GO
+}
+
+// Reads NTREESL (`category` 0) or NTREESD (`category` 2) and starts its context map.
+fn treeCount(state: &mut Brotli, input: &[u8], category: usize) -> u32 {
+  fill(&mut state, input)
+  let result = varLength(state.acc, state.count)
+  if result == NEED {
+    return NEED_INPUT
+  }
+  dropBits(&mut state, result & 255)
+  let trees = u32.shiftRight(result, 8) + 1
+  let mut base: usize = 0
+  let mut size = u32.toUsize(state.types[0]) * 64
+  if category == 2 {
+    base = DISTANCE_MAP_BASE
+    size = u32.toUsize(state.types[2]) * 4
+    state.distanceTreeCount = trees
+  } else {
+    state.literalTreeCount = trees
+  }
+  if trees >= 2 {
+    state.mapPhase = MAP_START
+    state.mapBase = base
+    state.mapSize = size
+    state.mapTrees = trees
+    if category == 2 {
+      state.phase = PHASE_DISTANCE_MAP
+    } else {
+      state.phase = PHASE_LITERAL_MAP
+    }
+    return GO
+  }
+  let maps = List<u8>.asMutSlice(&mut state.maps)
+  let mut index: usize = 0
+  while index < size {
+    maps[base + index] = 0
+    index = index + 1
+  }
+  if category == 2 {
+    startGroups(&mut state)
+  } else {
+    state.phase = PHASE_DISTANCE_TREE_COUNT
+  }
+  return GO
+}
+
+fn startGroups(state: &mut Brotli) -> () {
+  state.group = 0
+  state.groupTree = 0
+  state.poolUsed = 0
+  startTree(&mut state, 256, DEST_POOL)
+  state.phase = PHASE_GROUPS
+}
+
+fn groups(state: &mut Brotli, input: &[u8]) -> u32 {
+  while true {
+    let outcome = readTree(&mut state, input)
+    if outcome != GO {
+      return outcome
+    }
+    let tree = u32.toUsize(state.groupTree)
+    let base = usize.toU32(state.treeBase)
+    let mut trees = state.literalTreeCount
+    if state.group == 0 {
+      let slots = List<u32>.asMutSlice(&mut state.literalOffsets)
+      slots[tree] = base
+    } else if state.group == 1 {
+      let slots = List<u32>.asMutSlice(&mut state.commandOffsets)
+      slots[tree] = base
+      trees = state.types[1]
+    } else {
+      let slots = List<u32>.asMutSlice(&mut state.distanceOffsets)
+      slots[tree] = base
+      trees = state.distanceTreeCount
+    }
+    state.groupTree = state.groupTree + 1
+    if state.groupTree == trees {
+      state.group = state.group + 1
+      state.groupTree = 0
+      if state.group == 3 {
+        startBody(&mut state)
+        return GO
+      }
+    }
+    if state.group == 0 {
+      startTree(&mut state, 256, DEST_POOL)
+    } else if state.group == 1 {
+      startTree(&mut state, 704, DEST_POOL)
+    } else {
+      let alphabet = state.distanceAlphabet
+      startTree(&mut state, alphabet, DEST_POOL)
+    }
+  }
+  return GO
+}
+
+fn startBody(state: &mut Brotli) -> () {
+  state.contextMode = u8.toUsize(List<u8>.asSlice(&state.modes)[0])
+  state.literalMapBase = 0
+  state.distanceMapBase = DISTANCE_MAP_BASE
+  state.commandBase = u32.toUsize(List<u32>.asSlice(&state.commandOffsets)[0])
+  state.phase = PHASE_COMMAND
+}
+
+// Reads a block switch command for `category` as one unit: the block type code, the block count
+// code, and its extra bits.
+fn blockSwitch(state: &mut Brotli, input: &[u8], category: usize) -> u32 {
+  fill(&mut state, input)
+  let acc = state.acc
+  let count = state.count
+  let typeResult = decodeSymbol(
+    List<u32>.asSlice(&state.typeTrees),
+    category * TYPE_TREE_SIZE,
+    acc,
+    count,
+  )
+  if typeResult == NEED {
+    return NEED_INPUT
+  }
+  let typeLength = typeResult & 255
+  let countResult = decodeSymbol(
+    List<u32>.asSlice(&state.countTrees),
+    category * COUNT_TREE_SIZE,
+    u64.shiftRight(acc, u32.toU64(typeLength)),
+    count - typeLength,
+  )
+  if countResult == NEED {
+    return NEED_INPUT
+  }
+  let countLength = countResult & 255
+  let symbol = u32.toUsize(u32.shiftRight(countResult, 8))
+  let extra = BLOCK_LENGTH_EXTRA[symbol]
+  if count < typeLength + countLength + extra {
+    return NEED_INPUT
+  }
+  state.blockLength[category] = BLOCK_LENGTH_BASE[symbol]
+    + bitsAt(acc, typeLength + countLength, extra)
+  dropBits(&mut state, typeLength + countLength + extra)
+  let code = u32.shiftRight(typeResult, 8)
+  let mut next = state.previousType[category]
+  if code == 1 {
+    next = state.blockType[category] + 1
+    if next == state.types[category] {
+      next = 0
+    }
+  } else if code > 1 {
+    next = code - 2
+  }
+  state.previousType[category] = state.blockType[category]
+  state.blockType[category] = next
+  let index = u32.toUsize(next)
+  if category == 0 {
+    state.contextMode = u8.toUsize(List<u8>.asSlice(&state.modes)[index])
+    state.literalMapBase = index * 64
+  } else if category == 1 {
+    state.commandBase = u32.toUsize(List<u32>.asSlice(&state.commandOffsets)[index])
+  } else {
+    state.distanceMapBase = DISTANCE_MAP_BASE + index * 4
+  }
+  return GO
+}
+
+// Copies 8 bytes from `from` to `to` in `ring`. The ranges may overlap only if `to` is at least 8
+// bytes after `from`.
+@inlineAlways
+fn copy8(ring: &mut [u8], to: usize, from: usize) -> () {
+  let value = load64(&ring, from)
+  store64(&mut ring, to, value)
+}
+
+// Runs whole commands while the input has 16 bytes ahead for refills and the window has room for
+// each command's output. It stops before anything rare: a block switch, a static dictionary
+// reference, a distance past the window, or a length past the meta-block. It leaves the state at
+// the phase where the general path continues, which handles those cases and reports the errors.
+fn fastCommands(state: &mut Brotli, input: &[u8]) -> () {
+  let lookup = brotli_tables.contextLookup()
+  let mode = state.contextMode * 512
+  let literalMapBase = state.literalMapBase
+  let distanceMapBase = state.distanceMapBase
+  let commandBase = state.commandBase
+  let mask = state.ringMask
+  let ringBytes = state.ringSize
+  let ringSize = usize.toU64(ringBytes)
+  let flushed = state.flushed
+  let maxBackward = state.maxBackward
+  let direct = state.direct
+  let postfix = state.postfix
+  let postfixMask = u32.shiftLeft(1, postfix) - 1
+  let maps = List<u8>.asSlice(&state.maps)
+  let literalOffsets = List<u32>.asSlice(&state.literalOffsets)
+  let distanceOffsets = List<u32>.asSlice(&state.distanceOffsets)
+  let pool = List<u32>.asSlice(&state.pool)
+  let ring = List<u8>.asMutSlice(&mut state.ring)
+  let end = input.length
+  let mut acc = state.acc
+  let mut count = state.count
+  let mut position = state.position
+  let mut produced = state.produced
+  let mut last1 = state.last1
+  let mut last2 = state.last2
+  let mut remaining = state.remaining
+  let mut literalLength = state.blockLength[0]
+  let mut commandLength = state.blockLength[1]
+  let mut distanceLength = state.blockLength[2]
+  let mut distances = state.distances
+  let mut phase = PHASE_COMMAND
+  let mut insertCode: u32 = 0
+  let mut copyCode: u32 = 0
+  let mut left: u32 = 0
+  let mut copyLength: u32 = 0
+  let mut implicit = false
+  while commandLength > 0 && end - position >= 16 {
+    if count < 57 {
+      let take = (63 - count) / 8
+      let word = u64.shiftLeft(load64(input, position), u32.toU64(count))
+      count = count + take * 8
+      acc = acc | (word & lowMask(count))
+      position = position + u32.toUsize(take)
+    }
+    let commandResult = decodeSymbol(pool, commandBase, acc, count)
+    let commandBits = commandResult & 255
+    acc = u64.shiftRight(acc, u32.toU64(commandBits))
+    count = count - commandBits
+    commandLength = commandLength - 1
+    let symbol = u32.shiftRight(commandResult, 8)
+    let cell = u32.toUsize(u32.shiftRight(symbol, 6))
+    insertCode = CELL_INSERT[cell] + (u32.shiftRight(symbol, 3) & 7)
+    copyCode = CELL_COPY[cell] + (symbol & 7)
+    implicit = symbol < 128
+    let insertExtra = INSERT_EXTRA[u32.toUsize(insertCode)]
+    let copyExtra = COPY_EXTRA[u32.toUsize(copyCode)]
+    if count < 57 {
+      let take = (63 - count) / 8
+      let word = u64.shiftLeft(load64(input, position), u32.toU64(count))
+      count = count + take * 8
+      acc = acc | (word & lowMask(count))
+      position = position + u32.toUsize(take)
+    }
+    let insert = INSERT_BASE[u32.toUsize(insertCode)] + bitsAt(acc, 0, insertExtra)
+    copyLength = COPY_BASE[u32.toUsize(copyCode)] + bitsAt(acc, insertExtra, copyExtra)
+    if insert > remaining || u32.toU64(insert + copyLength) > ringSize - (produced - flushed) {
+      phase = PHASE_COMMAND_EXTRA
+      break
+    }
+    acc = u64.shiftRight(acc, u32.toU64(insertExtra + copyExtra))
+    count = count - insertExtra - copyExtra
+    remaining = remaining - insert
+    left = insert
+    while left > 0 && literalLength > 0 {
+      if count < 15 {
+        if end - position < 8 {
+          break
+        }
+        let take = (63 - count) / 8
+        let word = u64.shiftLeft(load64(input, position), u32.toU64(count))
+        count = count + take * 8
+        acc = acc | (word & lowMask(count))
+        position = position + u32.toUsize(take)
+      }
+      let context = lookup[mode + u8.toUsize(last1)] | lookup[mode + 256 + u8.toUsize(last2)]
+      let tree = maps[literalMapBase + u8.toUsize(context)]
+      let result = decodeSymbol(pool, u32.toUsize(literalOffsets[u8.toUsize(tree)]), acc, count)
+      let bits = result & 255
+      acc = u64.shiftRight(acc, u32.toU64(bits))
+      count = count - bits
+      let byte = u32.wrappingToU8(u32.shiftRight(result, 8))
+      ring[u64.wrappingToUsize(produced) & mask] = byte
+      produced = produced + 1
+      last2 = last1
+      last1 = byte
+      left = left - 1
+      literalLength = literalLength - 1
+    }
+    if left > 0 {
+      phase = PHASE_LITERALS
+      break
+    }
+    if remaining == 0 {
+      phase = PHASE_BLOCK_DONE
+      break
+    }
+    let mut code: u32 = 0
+    let mut value: i64 = u32.toI64(distances[0])
+    let mut nextAcc = acc
+    let mut nextCount = count
+    if !implicit {
+      if distanceLength == 0 {
+        phase = PHASE_DISTANCE
+        break
+      }
+      if count < 39 {
+        if end - position < 8 {
+          phase = PHASE_DISTANCE
+          break
+        }
+        let take = (63 - count) / 8
+        let word = u64.shiftLeft(load64(input, position), u32.toU64(count))
+        count = count + take * 8
+        acc = acc | (word & lowMask(count))
+        position = position + u32.toUsize(take)
+      }
+      let mut context = copyLength - 2
+      if copyLength > 4 {
+        context = 3
+      }
+      let tree = maps[distanceMapBase + u32.toUsize(context)]
+      let result = decodeSymbol(pool, u32.toUsize(distanceOffsets[u8.toUsize(tree)]), acc, count)
+      let length = result & 255
+      code = u32.shiftRight(result, 8)
+      if code < 16 {
+        if code < 4 {
+          value = u32.toI64(distances[u32.toUsize(code)])
+        } else if code < 10 {
+          value = u32.toI64(distances[0]) + DISTANCE_DELTAS[u32.toUsize(code - 4)]
+        } else {
+          value = u32.toI64(distances[1]) + DISTANCE_DELTAS[u32.toUsize(code - 10)]
+        }
+        if value <= 0 {
+          phase = PHASE_DISTANCE
+          break
+        }
+        nextAcc = u64.shiftRight(acc, u32.toU64(length))
+        nextCount = count - length
+      } else if code < 16 + direct {
+        value = u32.toI64(code - 15)
+        nextAcc = u64.shiftRight(acc, u32.toU64(length))
+        nextCount = count - length
+      } else {
+        let shifted = code - direct - 16
+        let extraBits = 1 + u32.shiftRight(shifted, postfix + 1)
+        let extra = bitsAt(acc, length, extraBits)
+        let high = u32.shiftRight(shifted, postfix)
+        let offset = u32.toI64(u32.shiftLeft(2 + (high & 1), extraBits)) - 4
+        value = u64.toI64(u64.shiftLeft(i64.toU64(offset) + u32.toU64(extra), u32.toU64(postfix)))
+          + u32.toI64((shifted & postfixMask) + direct + 1)
+        nextAcc = u64.shiftRight(acc, u32.toU64(length + extraBits))
+        nextCount = count - length - extraBits
+      }
+    }
+    let found = i64.toU64(value)
+    let mut maxDistance = produced
+    if maxDistance > maxBackward {
+      maxDistance = maxBackward
+    }
+    if found > maxDistance || found > ringSize || copyLength > remaining {
+      phase = PHASE_DISTANCE
+      break
+    }
+    acc = nextAcc
+    count = nextCount
+    if !implicit {
+      distanceLength = distanceLength - 1
+    }
+    if code != 0 {
+      distances[3] = distances[2]
+      distances[2] = distances[1]
+      distances[1] = distances[0]
+      distances[0] = u64.toU32(found)
+    }
+    remaining = remaining - copyLength
+    let length = u32.toUsize(copyLength)
+    let mut target = u64.wrappingToUsize(produced)
+    let mut source = u64.wrappingToUsize(produced - found)
+    let targetStart = target & mask
+    let sourceStart = source & mask
+    let mut index: usize = 0
+    if found >= 8 && length >= 8 && targetStart + length <= ringBytes
+      && sourceStart + length <= ringBytes {
+      while index + 8 <= length {
+        copy8(&mut ring, targetStart + index, sourceStart + index)
+        index = index + 8
+      }
+      if index < length {
+        copy8(&mut ring, targetStart + length - 8, sourceStart + length - 8)
+        index = length
+      }
+      target = target + length
+    } else {
+      while index < length {
+        ring[target & mask] = ring[source & mask]
+        target = target + 1
+        source = source + 1
+        index = index + 1
+      }
+    }
+    last1 = ring[(target - 1) & mask]
+    last2 = ring[(target - 2) & mask]
+    produced = produced + u32.toU64(copyLength)
+    if remaining == 0 {
+      phase = PHASE_BLOCK_DONE
+      break
+    }
+  }
+  state.acc = acc
+  state.count = count
+  state.position = position
+  state.produced = produced
+  state.last1 = last1
+  state.last2 = last2
+  state.remaining = remaining
+  state.blockLength[0] = literalLength
+  state.blockLength[1] = commandLength
+  state.blockLength[2] = distanceLength
+  state.distances = distances
+  state.insertCode = insertCode
+  state.copyCode = copyCode
+  state.insertRemaining = left
+  state.copyLength = copyLength
+  state.implicitDistance = implicit
+  state.phase = phase
+}
+
+fn command(state: &mut Brotli, input: &[u8]) -> u32 {
+  if state.blockLength[1] == 0 {
+    let outcome = blockSwitch(&mut state, input, 1)
+    if outcome != GO {
+      return outcome
+    }
+  }
+  fill(&mut state, input)
+  let result = decodeSymbol(
+    List<u32>.asSlice(&state.pool),
+    state.commandBase,
+    state.acc,
+    state.count,
+  )
+  if result == NEED {
+    return NEED_INPUT
+  }
+  dropBits(&mut state, result & 255)
+  let symbol = u32.shiftRight(result, 8)
+  let cell = u32.toUsize(u32.shiftRight(symbol, 6))
+  state.insertCode = CELL_INSERT[cell] + (u32.shiftRight(symbol, 3) & 7)
+  state.copyCode = CELL_COPY[cell] + (symbol & 7)
+  state.implicitDistance = symbol < 128
+  state.blockLength[1] = state.blockLength[1] - 1
+  state.phase = PHASE_COMMAND_EXTRA
+  return GO
+}
+
+fn commandExtra(state: &mut Brotli, input: &[u8]) -> u32 {
+  fill(&mut state, input)
+  let insertCode = u32.toUsize(state.insertCode)
+  let copyCode = u32.toUsize(state.copyCode)
+  let insertExtra = INSERT_EXTRA[insertCode]
+  let copyExtra = COPY_EXTRA[copyCode]
+  if state.count < insertExtra + copyExtra {
+    return NEED_INPUT
+  }
+  let insert = INSERT_BASE[insertCode] + bitsAt(state.acc, 0, insertExtra)
+  let copyLength = COPY_BASE[copyCode] + bitsAt(state.acc, insertExtra, copyExtra)
+  dropBits(&mut state, insertExtra + copyExtra)
+  if insert > state.remaining {
+    return fault(&mut state, BrotliReason.BlockLength)
+  }
+  state.remaining = state.remaining - insert
+  state.insertRemaining = insert
+  state.copyLength = copyLength
+  state.phase = PHASE_LITERALS
+  return GO
+}
+
+fn literals(state: &mut Brotli, input: &[u8], output: &mut [u8]) -> u32 {
+  while state.insertRemaining > 0 {
+    if !room(&mut state, &mut output) {
+      return NEED_OUTPUT
+    }
+    if state.blockLength[0] == 0 {
+      let outcome = blockSwitch(&mut state, input, 0)
+      if outcome != GO {
+        return outcome
+      }
+    }
+    fastLiterals(&mut state, input)
+    if state.insertRemaining == 0 {
+      break
+    }
+    if state.blockLength[0] == 0 || !room(&mut state, &mut output) {
+      continue
+    }
+    fill(&mut state, input)
+    let lookup = brotli_tables.contextLookup()
+    let mode = state.contextMode * 512
+    let context = lookup[mode + u8.toUsize(state.last1)]
+      | lookup[mode + 256 + u8.toUsize(state.last2)]
+    let tree = List<u8>.asSlice(&state.maps)[state.literalMapBase + u8.toUsize(context)]
+    let base = u32.toUsize(List<u32>.asSlice(&state.literalOffsets)[u8.toUsize(tree)])
+    let result = decodeSymbol(List<u32>.asSlice(&state.pool), base, state.acc, state.count)
+    if result == NEED {
+      return NEED_INPUT
+    }
+    dropBits(&mut state, result & 255)
+    put(&mut state, u32.wrappingToU8(u32.shiftRight(result, 8)))
+    state.blockLength[0] = state.blockLength[0] - 1
+    state.insertRemaining = state.insertRemaining - 1
+  }
+  if state.remaining == 0 {
+    state.phase = PHASE_BLOCK_DONE
+    return GO
+  }
+  state.phase = PHASE_DISTANCE
+  return GO
+}
+
+// Decodes literals while the bit buffer can be refilled 8 bytes at a time, the block and the
+// window have room, and the command has literals left.
+fn fastLiterals(state: &mut Brotli, input: &[u8]) -> () {
+  let mut limit = state.insertRemaining
+  if limit > state.blockLength[0] {
+    limit = state.blockLength[0]
+  }
+  let space = state.ringSize - u64.toUsize(state.produced - state.flushed)
+  if u32.toUsize(limit) > space {
+    limit = usize.toU32(space)
+  }
+  if limit == 0 || input.length - state.position < 8 {
+    return ()
+  }
+  let lookup = brotli_tables.contextLookup()
+  let mode = state.contextMode * 512
+  let mapBase = state.literalMapBase
+  let mask = state.ringMask
+  let maps = List<u8>.asSlice(&state.maps)
+  let offsets = List<u32>.asSlice(&state.literalOffsets)
+  let pool = List<u32>.asSlice(&state.pool)
+  let ring = List<u8>.asMutSlice(&mut state.ring)
+  let mut acc = state.acc
+  let mut count = state.count
+  let mut position = state.position
+  let mut produced = state.produced
+  let mut last1 = state.last1
+  let mut last2 = state.last2
+  let mut done: u32 = 0
+  while done < limit {
+    if count < 15 {
+      if input.length - position < 8 {
+        break
+      }
+      let take = (63 - count) / 8
+      let word = u64.shiftLeft(load64(input, position), u32.toU64(count))
+      count = count + take * 8
+      acc = acc | (word & lowMask(count))
+      position = position + u32.toUsize(take)
+    }
+    let context = lookup[mode + u8.toUsize(last1)] | lookup[mode + 256 + u8.toUsize(last2)]
+    let tree = maps[mapBase + u8.toUsize(context)]
+    let result = decodeSymbol(pool, u32.toUsize(offsets[u8.toUsize(tree)]), acc, count)
+    let length = result & 255
+    acc = u64.shiftRight(acc, u32.toU64(length))
+    count = count - length
+    let byte = u32.wrappingToU8(u32.shiftRight(result, 8))
+    ring[u64.wrappingToUsize(produced) & mask] = byte
+    produced = produced + 1
+    last2 = last1
+    last1 = byte
+    done = done + 1
+  }
+  state.acc = acc
+  state.count = count
+  state.position = position
+  state.produced = produced
+  state.last1 = last1
+  state.last2 = last2
+  state.insertRemaining = state.insertRemaining - done
+  state.blockLength[0] = state.blockLength[0] - done
+}
+
+fn distance(state: &mut Brotli, input: &[u8]) -> u32 {
+  let mut code: u32 = 0
+  let mut value: i64 = u32.toI64(state.distances[0])
+  if !state.implicitDistance {
+    if state.blockLength[2] == 0 {
+      let outcome = blockSwitch(&mut state, input, 2)
+      if outcome != GO {
+        return outcome
+      }
+    }
+    fill(&mut state, input)
+    let acc = state.acc
+    let count = state.count
+    let mut context = state.copyLength - 2
+    if state.copyLength > 4 {
+      context = 3
+    }
+    let tree = List<u8>.asSlice(&state.maps)[state.distanceMapBase + u32.toUsize(context)]
+    let base = u32.toUsize(List<u32>.asSlice(&state.distanceOffsets)[u8.toUsize(tree)])
+    let result = decodeSymbol(List<u32>.asSlice(&state.pool), base, acc, count)
+    if result == NEED {
+      return NEED_INPUT
+    }
+    let length = result & 255
+    code = u32.shiftRight(result, 8)
+    if code < 16 {
+      if code < 4 {
+        value = u32.toI64(state.distances[u32.toUsize(code)])
+      } else if code < 10 {
+        value = u32.toI64(state.distances[0]) + DISTANCE_DELTAS[u32.toUsize(code - 4)]
+      } else {
+        value = u32.toI64(state.distances[1]) + DISTANCE_DELTAS[u32.toUsize(code - 10)]
+      }
+      dropBits(&mut state, length)
+      if value <= 0 {
+        return fault(&mut state, BrotliReason.Distance)
+      }
+    } else if code < 16 + state.direct {
+      value = u32.toI64(code - 15)
+      dropBits(&mut state, length)
+    } else {
+      let shifted = code - state.direct - 16
+      let extraBits = 1 + u32.shiftRight(shifted, state.postfix + 1)
+      if count < length + extraBits {
+        return NEED_INPUT
+      }
+      let extra = bitsAt(acc, length, extraBits)
+      let high = u32.shiftRight(shifted, state.postfix)
+      let low = shifted & (u32.shiftLeft(1, state.postfix) - 1)
+      let offset = u32.toI64(u32.shiftLeft(2 + (high & 1), extraBits)) - 4
+      value = u64.toI64(
+        u64.shiftLeft(i64.toU64(offset) + u32.toU64(extra), u32.toU64(state.postfix)),
+      )
+        + u32.toI64(low + state.direct + 1)
+      dropBits(&mut state, length + extraBits)
+    }
+    state.blockLength[2] = state.blockLength[2] - 1
+  }
+  let found = i64.toU64(value)
+  let mut maxDistance = state.produced
+  if maxDistance > state.maxBackward {
+    maxDistance = state.maxBackward
+  }
+  if found > maxDistance {
+    if found > MAX_ALLOWED_DISTANCE {
+      return fault(&mut state, BrotliReason.Distance)
+    }
+    return dictionaryWord(&mut state, found - maxDistance - 1, found)
+  }
+  if found > usize.toU64(state.ringSize) {
+    return fault(&mut state, BrotliReason.WindowLimit)
+  }
+  if code != 0 {
+    state.distances[3] = state.distances[2]
+    state.distances[2] = state.distances[1]
+    state.distances[1] = state.distances[0]
+    state.distances[0] = u64.toU32(found)
+  }
+  if state.copyLength > state.remaining {
+    return fault(&mut state, BrotliReason.BlockLength)
+  }
+  state.remaining = state.remaining - state.copyLength
+  state.copyRemaining = state.copyLength
+  state.copyDistance = found
+  state.phase = PHASE_COPY
+  return GO
+}
+
+// Stages the transformed static dictionary word `address` for the current copy length.
+fn dictionaryWord(state: &mut Brotli, address: u64, found: u64) -> u32 {
+  let length = state.copyLength
+  if length < 4 || length > 24 {
+    return fault(&mut state, BrotliReason.Dictionary)
+  }
+  let size = u32.toUsize(length)
+  let sizeBits = brotli_tables.wordSizeBits(size)
+  if sizeBits == 0 {
+    return fault(&mut state, BrotliReason.Dictionary)
+  }
+  let index = u64.toUsize(address & lowMask(sizeBits))
+  let transform = u64.shiftRight(address, u32.toU64(sizeBits))
+  if transform >= usize.toU64(brotli_tables.transformCount()) {
+    return fault(&mut state, BrotliReason.Dictionary)
+  }
+  let transformIndex = u64.toUsize(transform)
+  let words = brotli_tables.words()
+  let wordStart = brotli_tables.wordOffset(size) + index * size
+  let affixes = brotli_tables.affixes()
+  let mut out: usize = 0
+  let prefix = brotli_tables.affixOffset(brotli_tables.transformPrefix(transformIndex))
+  let prefixLength = u8.toUsize(affixes[prefix])
+  let mut at: usize = 0
+  while at < prefixLength {
+    state.word[out] = affixes[prefix + 1 + at]
+    out = out + 1
+    at = at + 1
+  }
+  let kind = brotli_tables.transformKind(transformIndex)
+  let mut start: usize = 0
+  let mut end = size
+  if kind >= 1 && kind <= 9 {
+    end = 0
+    if u32.toUsize(kind) < size {
+      end = size - u32.toUsize(kind)
+    }
+  } else if kind >= 12 && kind <= 20 {
+    start = u32.toUsize(kind - 11)
+  }
+  let wordBegin = out
+  at = start
+  while at < end {
+    state.word[out] = words[wordStart + at]
+    out = out + 1
+    at = at + 1
+  }
+  if kind == 10 && out > wordBegin {
+    let _step = upperCase(&mut state.word, wordBegin, out)
+  } else if kind == 11 {
+    let mut cursor = wordBegin
+    while cursor < out {
+      cursor = cursor + upperCase(&mut state.word, cursor, out)
+    }
+  }
+  let suffix = brotli_tables.affixOffset(brotli_tables.transformSuffix(transformIndex))
+  let suffixLength = u8.toUsize(affixes[suffix])
+  at = 0
+  while at < suffixLength {
+    state.word[out] = affixes[suffix + 1 + at]
+    out = out + 1
+    at = at + 1
+  }
+  if out == 0 && found <= 120 {
+    return fault(&mut state, BrotliReason.Dictionary)
+  }
+  if usize.toU64(out) > u32.toU64(state.remaining) {
+    return fault(&mut state, BrotliReason.BlockLength)
+  }
+  state.remaining = state.remaining - usize.toU32(out)
+  state.wordLength = out
+  state.wordIndex = 0
+  state.phase = PHASE_WORD
+  return GO
+}
+
+// Uppercases the UTF-8 character at `at` the way RFC 7932 does, changing only bytes before `end`,
+// and returns its length.
+fn upperCase(word: &mut [u8; 64], at: usize, end: usize) -> usize {
+  let first = word[at]
+  if first < 192 {
+    if first >= 97 && first <= 122 {
+      word[at] = first ^ 32
+    }
+    return 1
+  }
+  if first < 224 {
+    if at + 1 < end {
+      word[at + 1] = word[at + 1] ^ 32
+    }
+    return 2
+  }
+  if at + 2 < end {
+    word[at + 2] = word[at + 2] ^ 5
+  }
+  return 3
+}
+
+fn emitWord(state: &mut Brotli, output: &mut [u8]) -> u32 {
+  while state.wordIndex < state.wordLength {
+    if !room(&mut state, &mut output) {
+      return NEED_OUTPUT
+    }
+    let byte = state.word[state.wordIndex]
+    put(&mut state, byte)
+    state.wordIndex = state.wordIndex + 1
+  }
+  if state.remaining == 0 {
+    state.phase = PHASE_BLOCK_DONE
+  } else {
+    state.phase = PHASE_COMMAND
+  }
+  return GO
+}
+
+fn copy(state: &mut Brotli, output: &mut [u8]) -> u32 {
+  while state.copyRemaining > 0 {
+    if !room(&mut state, &mut output) {
+      return NEED_OUTPUT
+    }
+    let mut length = u32.toUsize(state.copyRemaining)
+    let space = state.ringSize - u64.toUsize(state.produced - state.flushed)
+    if length > space {
+      length = space
+    }
+    let mask = state.ringMask
+    let mut target = u64.wrappingToUsize(state.produced)
+    let mut source = u64.wrappingToUsize(state.produced - state.copyDistance)
+    let targetStart = target & mask
+    let sourceStart = source & mask
+    let mut index: usize = 0
+    if targetStart + length <= state.ringSize && sourceStart + length <= state.ringSize {
+      if state.copyDistance >= 8 && length >= 8 {
+        while index + 8 <= length {
+          move8(&mut state.ring, targetStart + index, sourceStart + index)
+          index = index + 8
+        }
+
+        // The last 8 bytes again, ending at the end of the copy: their sources are all written
+        // already, since the distance is at least 8.
+        if index < length {
+          move8(&mut state.ring, targetStart + length - 8, sourceStart + length - 8)
+          index = length
+        }
+      }
+    }
+    target = target + index
+    source = source + index
+    let ring = List<u8>.asMutSlice(&mut state.ring)
+    while index < length {
+      ring[target & mask] = ring[source & mask]
+      target = target + 1
+      source = source + 1
+      index = index + 1
+    }
+    state.last1 = ring[(target - 1) & mask]
+    state.last2 = ring[(target - 2) & mask]
+    state.produced = state.produced + usize.toU64(length)
+    state.copyRemaining = state.copyRemaining - usize.toU32(length)
+  }
+  if state.remaining == 0 {
+    state.phase = PHASE_BLOCK_DONE
+  } else {
+    state.phase = PHASE_COMMAND
+  }
+  return GO
+}
+
+@inlineAlways
+fn put(state: &mut Brotli, byte: u8) -> () {
+  let ring = List<u8>.asMutSlice(&mut state.ring)
+  ring[u64.wrappingToUsize(state.produced) & state.ringMask] = byte
+  state.produced = state.produced + 1
+  state.last2 = state.last1
+  state.last1 = byte
+}
+
+// Returns whether the window has room for one more byte, flushing to `output` if it is full.
+@inlineAlways
+fn room(state: &mut Brotli, output: &mut [u8]) -> bool {
+  if state.produced - state.flushed < usize.toU64(state.ringSize) {
+    return true
+  }
+  flush(&mut state, &mut output)
+  return state.produced - state.flushed < usize.toU64(state.ringSize)
+}
+
+fn flush(state: &mut Brotli, output: &mut [u8]) -> () {
+  while state.flushed < state.produced && state.written < output.length {
+    let start = u64.wrappingToUsize(state.flushed) & state.ringMask
+    let mut length = u64.toUsize(state.produced - state.flushed)
+    if length > state.ringSize - start {
+      length = state.ringSize - start
+    }
+    if length > output.length - state.written {
+      length = output.length - state.written
+    }
+    Slice.copyInto<u8>(
+      &mut output,
+      state.written,
+      Slice.view<u8>(List<u8>.asSlice(&state.ring), start, length),
+    )
+    state.written = state.written + length
+    state.flushed = state.flushed + usize.toU64(length)
+  }
+}
+
+fn startTree(state: &mut Brotli, alphabet: u32, destination: u32) -> () {
+  state.treeAlphabet = alphabet
+  state.treeDestination = destination
+  state.treePhase = TREE_START
+}
+
+// Reads one prefix code (RFC 7932 section 3.4 and 3.5) and builds its table. Returns `GO` when the
+// table is ready.
+fn readTree(state: &mut Brotli, input: &[u8]) -> u32 {
+  let alphabet = u32.toUsize(state.treeAlphabet)
+  if state.treePhase == TREE_START {
+    fill(&mut state, input)
+    if state.count < 2 {
+      return NEED_INPUT
+    }
+    let skip = bitsAt(state.acc, 0, 2)
+    if skip == 1 {
+      return simpleTree(&mut state)
+    }
+    dropBits(&mut state, 2)
+    state.codeLengthLengths = [0; 18]
+    state.treeIndex = u32.toUsize(skip)
+    state.treeSpace = 32
+    state.treeCodes = 0
+    state.treePhase = TREE_LENGTHS
+  }
+  if state.treePhase == TREE_LENGTHS {
+    while state.treeIndex < 18 {
+      fill(&mut state, input)
+      let peek = u32.toUsize(bitsAt(state.acc, 0, 4))
+      let length = LENGTH_PREFIX_BITS[peek]
+      if length > state.count {
+        return NEED_INPUT
+      }
+      let value = LENGTH_PREFIX_VALUE[peek]
+      dropBits(&mut state, length)
+      state.codeLengthLengths[CODE_LENGTH_ORDER[state.treeIndex]] = u32.wrappingToU8(value)
+      state.treeIndex = state.treeIndex + 1
+      if value != 0 {
+        state.treeSpace = state.treeSpace - u32.toI64(u32.shiftRight(32, value))
+        state.treeCodes = state.treeCodes + 1
+        if state.treeSpace <= 0 {
+          break
+        }
+      }
+    }
+    if state.treeCodes != 1 && state.treeSpace != 0 {
+      return fault(&mut state, BrotliReason.PrefixCode)
+    }
+    let codeLengths = state.codeLengthLengths
+    let used = sortLengths(
+      &codeLengths,
+      18,
+      &mut state.treeCounts,
+      List<u32>.asMutSlice(&mut state.sorted),
+    )
+    let counts = state.treeCounts
+    let size = buildTable(
+      List<u32>.asMutSlice(&mut state.lengthTree),
+      0,
+      256,
+      &counts,
+      List<u32>.asSlice(&state.sorted),
+      used,
+    )
+    if size == 0 {
+      return fault(&mut state, BrotliReason.PrefixCode)
+    }
+    state.treeIndex = 0
+    state.treePrevious = 8
+    state.treeRepeat = 0
+    state.treeRepeatLength = 0
+    state.treeSpace = 32768
+    state.treePhase = TREE_SYMBOLS
+  }
+  while state.treeIndex < alphabet && state.treeSpace > 0 {
+    fill(&mut state, input)
+    let acc = state.acc
+    let count = state.count
+    let result = decodeSymbol(List<u32>.asSlice(&state.lengthTree), 0, acc, count)
+    if result == NEED {
+      return NEED_INPUT
+    }
+    let length = result & 255
+    let symbol = u32.shiftRight(result, 8)
+    if symbol < 16 {
+      dropBits(&mut state, length)
+      state.treeRepeat = 0
+      let at = state.treeIndex
+      let slots = List<u8>.asMutSlice(&mut state.lengths)
+      slots[at] = u32.wrappingToU8(symbol)
+      if symbol != 0 {
+        state.treePrevious = symbol
+        state.treeSpace = state.treeSpace - u32.toI64(u32.shiftRight(32768, symbol))
+      }
+      state.treeIndex = state.treeIndex + 1
+    } else {
+      let mut extraBits: u32 = 3
+      let mut newLength: u32 = 0
+      if symbol == 16 {
+        extraBits = 2
+        newLength = state.treePrevious
+      }
+      if count < length + extraBits {
+        return NEED_INPUT
+      }
+      let delta = bitsAt(acc, length, extraBits)
+      dropBits(&mut state, length + extraBits)
+      if state.treeRepeatLength != newLength {
+        state.treeRepeat = 0
+        state.treeRepeatLength = newLength
+      }
+      let old = state.treeRepeat
+      if state.treeRepeat > 0 {
+        state.treeRepeat = u32.shiftLeft(state.treeRepeat - 2, extraBits)
+      }
+      state.treeRepeat = state.treeRepeat + delta + 3
+      let streak = u32.toUsize(state.treeRepeat - old)
+      if state.treeIndex + streak > alphabet {
+        return fault(&mut state, BrotliReason.PrefixCode)
+      }
+      let fillLength = u32.wrappingToU8(state.treeRepeatLength)
+      let lengths = List<u8>.asMutSlice(&mut state.lengths)
+      let mut index: usize = 0
+      while index < streak {
+        lengths[state.treeIndex + index] = fillLength
+        index = index + 1
+      }
+      if state.treeRepeatLength != 0 {
+        state.treeSpace = state.treeSpace
+          - i64.shiftLeft(usize.toI64(streak), u32.toI64(15 - state.treeRepeatLength))
+      }
+      state.treeIndex = state.treeIndex + streak
+    }
+  }
+  if state.treeSpace != 0 {
+    return fault(&mut state, BrotliReason.PrefixCode)
+  }
+  let symbols = state.treeIndex
+  state.treeUsed = sortLengths(
+    List<u8>.asSlice(&state.lengths),
+    symbols,
+    &mut state.treeCounts,
+    List<u32>.asMutSlice(&mut state.sorted),
+  )
+  return finishTree(&mut state)
+}
+
+// Lists the symbols below `symbols` with a nonzero length in `sorted`, by length and then by
+// symbol, which is the order of their canonical codes. Counts them by length in `counts`, and
+// returns how many there are.
+fn sortLengths(
+  lengths: &[u8],
+  symbols: usize,
+  counts: &mut [u32; 16],
+  sorted: &mut [u32],
+) -> usize {
+  let mut length: usize = 0
+  while length < 16 {
+    counts[length] = 0
+    length = length + 1
+  }
+  let mut symbol: usize = 0
+  while symbol < symbols {
+    let size = u8.toUsize(lengths[symbol])
+    counts[size] = counts[size] + 1
+    symbol = symbol + 1
+  }
+  counts[0] = 0
+  let mut offsets: [u32; 16] = [0; 16]
+  length = 1
+  while length < 15 {
+    offsets[length + 1] = offsets[length] + counts[length]
+    length = length + 1
+  }
+  symbol = 0
+  while symbol < symbols {
+    let size = u8.toUsize(lengths[symbol])
+    if size != 0 {
+      sorted[u32.toUsize(offsets[size])] = usize.toU32(symbol)
+      offsets[size] = offsets[size] + 1
+    }
+    symbol = symbol + 1
+  }
+  return u32.toUsize(offsets[15])
+}
+
+// Reads a simple prefix code of 1 to 4 symbols as one unit.
+fn simpleTree(state: &mut Brotli) -> u32 {
+  let acc = state.acc
+  let count = state.count
+  if count < 4 {
+    return NEED_INPUT
+  }
+  let symbols = bitsAt(acc, 2, 2) + 1
+  let width = 32 - u32.leadingZeros(state.treeAlphabet - 1)
+  let mut need = 4 + symbols * width
+  if symbols == 4 {
+    need = need + 1
+  }
+  if count < need {
+    return NEED_INPUT
+  }
+  let mut values: [u32; 4] = [0, 0, 0, 0]
+  let mut index: u32 = 0
+  while index < symbols {
+    let value = bitsAt(acc, 4 + index * width, width)
+    if value >= state.treeAlphabet {
+      return fault(&mut state, BrotliReason.PrefixCode)
+    }
+    let mut other: u32 = 0
+    while other < index {
+      if values[u32.toUsize(other)] == value {
+        return fault(&mut state, BrotliReason.PrefixCode)
+      }
+      other = other + 1
+    }
+    values[u32.toUsize(index)] = value
+    index = index + 1
+  }
+
+  // The symbols that share a code length get codes in symbol order.
+  let mut first: u32 = 0
+  let mut lengths: [u32; 4] = [1, 1, 0, 0]
+  if symbols == 3 {
+    first = 1
+    lengths = [1, 2, 2, 0]
+  } else if symbols == 4 {
+    if bitsAt(acc, 4 + 4 * width, 1) == 0 {
+      lengths = [2, 2, 2, 2]
+    } else {
+      first = 2
+      lengths = [1, 2, 3, 3]
+    }
+  }
+  sortSymbols(&mut values, first, symbols)
+  let mut counts: [u32; 16] = [0; 16]
+  let sorted = List<u32>.asMutSlice(&mut state.sorted)
+  index = 0
+  while index < symbols {
+    let at = u32.toUsize(index)
+    sorted[at] = values[at]
+    let size = u32.toUsize(lengths[at])
+    counts[size] = counts[size] + 1
+    index = index + 1
+  }
+  state.treeCounts = counts
+  state.treeUsed = u32.toUsize(symbols)
+  dropBits(&mut state, need)
+  return finishTree(&mut state)
+}
+
+// Sorts `values[from..to]` in place.
+fn sortSymbols(values: &mut [u32; 4], from: u32, to: u32) -> () {
+  let mut index = u32.toUsize(from) + 1
+  while index < u32.toUsize(to) {
+    let value = values[index]
+    let mut at = index
+    while at > u32.toUsize(from) && values[at - 1] > value {
+      values[at] = values[at - 1]
+      at = at - 1
+    }
+    values[at] = value
+    index = index + 1
+  }
+}
+
+fn finishTree(state: &mut Brotli) -> u32 {
+  let destination = state.treeDestination
+  let counts = state.treeCounts
+  let used = state.treeUsed
+  let sorted = List<u32>.asSlice(&state.sorted)
+  if destination == DEST_POOL {
+    let base = state.poolUsed
+    let capacity = List<u32>.length(&state.pool) - base
+    let size = buildTable(
+      List<u32>.asMutSlice(&mut state.pool),
+      base,
+      capacity,
+      &counts,
+      sorted,
+      used,
+    )
+    if size == 0 {
+      return fault(&mut state, BrotliReason.WorkspaceLimit)
+    }
+    state.treeBase = base
+    state.poolUsed = base + size
+    return GO
+  }
+  let mut size: usize = 0
+  if destination == DEST_MAP {
+    size = buildTable(
+      List<u32>.asMutSlice(&mut state.mapTree),
+      0,
+      MAP_TREE_SIZE,
+      &counts,
+      sorted,
+      used,
+    )
+  } else if destination < 3 {
+    size = buildTable(
+      List<u32>.asMutSlice(&mut state.typeTrees),
+      u32.toUsize(destination) * TYPE_TREE_SIZE,
+      TYPE_TREE_SIZE,
+      &counts,
+      sorted,
+      used,
+    )
+  } else {
+    size = buildTable(
+      List<u32>.asMutSlice(&mut state.countTrees),
+      u32.toUsize(destination - 3) * COUNT_TREE_SIZE,
+      COUNT_TREE_SIZE,
+      &counts,
+      sorted,
+      used,
+    )
+  }
+  if size == 0 {
+    return fault(&mut state, BrotliReason.PrefixCode)
+  }
+  return GO
+}
+
+// Returns the bit-reversed `length`-bit code after the bit-reversed code `key`.
+@inlineAlways
+fn nextKey(key: u32, length: u32) -> u32 {
+  let mut step = u32.shiftLeft(1, length - 1)
+  while key & step != 0 {
+    step = u32.shiftRight(step, 1)
+  }
+  if step == 0 {
+    return 0
+  }
+  return (key & (step - 1)) + step
+}
+
+// Builds the lookup table of a complete canonical prefix code at `table[base..]`, from the `used`
+// symbols in `sorted` (by code length, then symbol) and the number of codes of each length in
+// `counts`. The table has a root part indexed by the next 8 bits, then a second-level part for
+// each root entry whose codes are longer. An entry is `symbol << 16 | bits`; a root entry with
+// more than 8 bits holds the offset of its second-level part instead of a symbol. A code of one
+// symbol takes 0 bits. Returns the number of entries, or 0 if they do not fit in `capacity`.
+fn buildTable(
+  table: &mut [u32],
+  base: usize,
+  capacity: usize,
+  counts: &[u32; 16],
+  sorted: &[u32],
+  used: usize,
+) -> usize {
+  if capacity < 256 {
+    return 0
+  }
+  if used == 1 {
+    let entry = u32.shiftLeft(sorted[0], 16)
+    let mut index: usize = 0
+    while index < 256 {
+      table[base + index] = entry
+      index = index + 1
+    }
+    return 256
+  }
+  let mut remaining = counts.*
+  let mut key: u32 = 0
+  let mut next: usize = 0
+  let mut length: u32 = 1
+  while length <= 8 {
+    let step = usize.shiftLeft(1, u32.toUsize(length))
+    while remaining[u32.toUsize(length)] > 0 {
+      let entry = u32.shiftLeft(sorted[next], 16) | length
+      next = next + 1
+      let mut index = u32.toUsize(key)
+      while index < 256 {
+        table[base + index] = entry
+        index = index + step
+      }
+      key = nextKey(key, length)
+      remaining[u32.toUsize(length)] = remaining[u32.toUsize(length)] - 1
+    }
+    length = length + 1
+  }
+  let mut total: usize = 256
+  let mut low: u32 = 256
+  let mut span: usize = 0
+  let mut start: usize = 0
+  while length <= 15 {
+    let step = usize.shiftLeft(1, u32.toUsize(length - 8))
+    while remaining[u32.toUsize(length)] > 0 {
+      if (key & 255) != low {
+        low = key & 255
+
+        // The smallest second-level part that the codes with this root prefix fill.
+        let mut bits = length - 8
+        let mut left = u32.toI64(u32.shiftLeft(1, bits))
+        while bits + 8 < 15 {
+          left = left - u32.toI64(remaining[u32.toUsize(bits + 8)])
+          if left <= 0 {
+            break
+          }
+          bits = bits + 1
+          left = left * 2
+        }
+        span = usize.shiftLeft(1, u32.toUsize(bits))
+        if total + span > capacity {
+          return 0
+        }
+        table[base + u32.toUsize(low)] = u32.shiftLeft(usize.toU32(total), 16) | (bits + 8)
+        start = base + total
+        total = total + span
+      }
+      let entry = u32.shiftLeft(sorted[next], 16) | (length - 8)
+      next = next + 1
+      let mut index = u32.toUsize(u32.shiftRight(key, 8))
+      while index < span {
+        table[start + index] = entry
+        index = index + step
+      }
+      key = nextKey(key, length)
+      remaining[u32.toUsize(length)] = remaining[u32.toUsize(length)] - 1
+    }
+    length = length + 1
+  }
+  return total
+}
+
+fn readMap(state: &mut Brotli, input: &[u8]) -> u32 {
+  if state.mapPhase == MAP_START {
+    fill(&mut state, input)
+    if state.count < 1 {
+      return NEED_INPUT
+    }
+    if bitsAt(state.acc, 0, 1) == 1 {
+      if state.count < 5 {
+        return NEED_INPUT
+      }
+      state.mapRle = bitsAt(state.acc, 1, 4) + 1
+      dropBits(&mut state, 5)
+    } else {
+      state.mapRle = 0
+      dropBits(&mut state, 1)
+    }
+    let alphabet = state.mapTrees + state.mapRle
+    startTree(&mut state, alphabet, DEST_MAP)
+    state.mapPhase = MAP_TREE
+  }
+  if state.mapPhase == MAP_TREE {
+    let outcome = readTree(&mut state, input)
+    if outcome != GO {
+      return outcome
+    }
+    state.mapIndex = 0
+    state.mapPhase = MAP_VALUES
+  }
+  if state.mapPhase == MAP_VALUES {
+    while state.mapIndex < state.mapSize {
+      fill(&mut state, input)
+      let acc = state.acc
+      let count = state.count
+      let result = decodeSymbol(List<u32>.asSlice(&state.mapTree), 0, acc, count)
+      if result == NEED {
+        return NEED_INPUT
+      }
+      let length = result & 255
+      let symbol = u32.shiftRight(result, 8)
+      let at = state.mapBase + state.mapIndex
+      if symbol == 0 {
+        dropBits(&mut state, length)
+        let slots = List<u8>.asMutSlice(&mut state.maps)
+        slots[at] = 0
+        state.mapIndex = state.mapIndex + 1
+      } else if symbol <= state.mapRle {
+        if count < length + symbol {
+          return NEED_INPUT
+        }
+        let streak = u32.toUsize(u32.shiftLeft(1, symbol) + bitsAt(acc, length, symbol))
+        dropBits(&mut state, length + symbol)
+        if state.mapIndex + streak > state.mapSize {
+          return fault(&mut state, BrotliReason.ContextMap)
+        }
+        let maps = List<u8>.asMutSlice(&mut state.maps)
+        let mut index: usize = 0
+        while index < streak {
+          maps[at + index] = 0
+          index = index + 1
+        }
+        state.mapIndex = state.mapIndex + streak
+      } else {
+        dropBits(&mut state, length)
+        let slots = List<u8>.asMutSlice(&mut state.maps)
+        slots[at] = u32.wrappingToU8(symbol - state.mapRle)
+        state.mapIndex = state.mapIndex + 1
+      }
+    }
+    state.mapPhase = MAP_TRANSFORM
+  }
+  fill(&mut state, input)
+  if state.count < 1 {
+    return NEED_INPUT
+  }
+  let inverse = bitsAt(state.acc, 0, 1) == 1
+  dropBits(&mut state, 1)
+  if inverse {
+    let mut table: [u8; 256] = [0; 256]
+    let mut index: usize = 0
+    while index < 256 {
+      table[index] = usize.wrappingToU8(index)
+      index = index + 1
+    }
+    let maps = List<u8>.asMutSlice(&mut state.maps)
+    index = 0
+    while index < state.mapSize {
+      let at = state.mapBase + index
+      let position = u8.toUsize(maps[at])
+      let value = table[position]
+      maps[at] = value
+      let mut slot: usize = position
+      while slot > 0 {
+        table[slot] = table[slot - 1]
+        slot = slot - 1
+      }
+      table[0] = value
+      index = index + 1
+    }
+  }
+  return GO
+}
