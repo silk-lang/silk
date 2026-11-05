@@ -159,8 +159,9 @@ before falling back to [`Allocator.allocate`](#Allocator.allocate) on null.
 
 #### Details
 
-The default returns null. A pooling provider can hand out a free block here without the
-owner record of an `Intrinsic.Allocation`.
+Every provider answers it. A pooling provider can hand out a free block here without the
+owner record of an `Intrinsic.Allocation`; a provider that keeps no blocks ready, such as
+the system provider or one that counts or refuses requests, returns null.
 
 #### Gotchas
 
@@ -266,6 +267,14 @@ allocate: SystemAllocator.systemAllocate
 
 ```silk
 effect fn growsInPlace(self: &mut Self) -> bool ? &mut Allocator
+```
+
+<a id="SystemAllocator.impl.Allocator.takeBlock"></a>
+
+### Operation `takeBlock`
+
+```silk
+unsafe effect fn takeBlock(self: &mut Self, layout: Layout) -> ?*mut u8 ? &mut Allocator
 ```
 
 
