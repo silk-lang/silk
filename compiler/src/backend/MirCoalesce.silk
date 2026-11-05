@@ -19,6 +19,12 @@
 //! - A local that every return path moves or copies whole into the result local, as its last use,
 //!   becomes the result local itself, so it is built in the caller's result storage.
 //!
+//! - An aggregate, variant or union operand that is a temporary snapshot of a place, taken earlier
+//!   in the same block with nothing in between touching that place, reads the place itself. The
+//!   operand is copied into the new value either way, so the place need not be dead afterwards. A
+//!   wrapper such as an effect combinator builds its value around the effect it received without
+//!   first moving that effect into a temporary.
+//!
 //! All keep the invariants `MirVerification.callDestinationsFresh` checks: a destination is still a
 //! whole temporary or the result local, never borrowed, and named by no argument.
 
@@ -58,8 +64,9 @@ pub effect fn coalesce(function: &mut MirFunction) -> () ! OutOfMemoryError ? &m
   // Collapsing first folds each return's own temporary into `_0 = r`, which the rename needs.
   run collapseCopies(&mut function.*)
   run renameReturned(&mut function.*)
-  if !hasCall(&function.*) { return () }
   let mut table = run UseTable.of(&function.*)
+  run forwardFields(&mut function.*, &mut table)
+  if !hasCall(&function.*) { return () }
   run forwardResults(&mut function.*, &mut table)
   return run forwardArguments(&mut function.*, &mut table)
 }
@@ -1139,4 +1146,151 @@ effect fn argumentCandidates(function: &MirFunction, table: &UseTable, at: usize
     }
   }
   return move ordered
+}
+
+// The operand of an aggregate field, variant field or injection at `index` of `value`, counting
+// fields in order, or none past the last.
+fn operandAt(value: &Rvalue, index: usize) -> Option<&Operand> {
+  return match &value.* {
+    Rvalue.Aggregate {fields} => fieldOperand(&fields, index)
+    Rvalue.Variant {fields, ..} => fieldOperand(&fields, index)
+    Rvalue.Inject {value: injected, ..} => {
+      if index == usize.ZERO { return Option<&Operand>.some(&injected) }
+      return Option<&Operand>.none()
+    }
+    _ => Option<&Operand>.none()
+  }
+}
+
+fn fieldOperand(fields: &List<AggregateField>, index: usize) -> Option<&Operand> {
+  let listed = List<AggregateField>.asSlice(&fields.*)
+  if index >= listed.length { return Option<&Operand>.none() }
+  return Option<&Operand>.some(&listed[index].value)
+}
+
+fn replaceOperandAt(value: &mut Rvalue, index: usize, operand: Operand) -> () {
+  match &mut value.* {
+    Rvalue.Aggregate {fields} => {
+      let mut listed = List<AggregateField>.asMutSlice(&mut fields)
+      listed[index].value = move operand
+    }
+    Rvalue.Variant {fields, ..} => {
+      let mut listed = List<AggregateField>.asMutSlice(&mut fields)
+      listed[index].value = move operand
+    }
+    Rvalue.Inject {value: injected, ..} => { injected = move operand }
+    _ => { drop operand }
+  }
+  return ()
+}
+
+// A field operand at `operand` of the statement at `statement` that can read the place its
+// temporary snapshots, taken by the statement at `snapshot`.
+struct FieldSnapshot {
+  statement: usize,
+  operand: usize,
+  snapshot: usize,
+}
+
+impl Copy for FieldSnapshot {}
+
+effect fn forwardFields(function: &mut MirFunction, table: &mut UseTable) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut block = usize.ZERO
+  while block < List<Block>.length(&function.blocks) {
+    while true {
+      let picked = match fieldCandidate(&function.*, &table.*, block) {
+        Option<FieldSnapshot>.None => { break }
+        Option<FieldSnapshot>.Some {value} => value
+      }
+      let mut blocks = List<Block>.asMutSlice(&mut function.blocks)
+      let removed = List<Statement>.remove(&mut blocks[block].statements, picked.snapshot)
+      let mut temporary = usize.MAX
+      let source = match move removed {
+        Statement.Assign {destination, value: Rvalue.Use {value: used}, ..} => {
+          temporary = wholePlace(&destination)
+          move used
+        }
+        _ => { continue }
+      }
+      let whole = match &source {
+        Operand.Move {place} => wholePlace(&place)
+        Operand.Copy {place} => wholePlace(&place)
+        _ => usize.MAX
+      }
+      let mut statements = List<Statement>.asMutSlice(&mut blocks[block].statements)
+      // The snapshot came first, so the field's statement moved up by one.
+      if let Statement.Assign {value, ..} = &mut statements[picked.statement - usize.ONE] {
+        replaceOperandAt(&mut value, picked.operand, move source)
+      }
+      if whole != usize.MAX { moveVariables(&mut function.*, temporary, whole) }
+      UseTable.forget(&mut table.*, temporary)
+    }
+    block = block + usize.ONE
+  }
+  return ()
+}
+
+fn fieldCandidate(function: &MirFunction, table: &UseTable, block: usize) -> Option<FieldSnapshot> {
+  let statements = List<Statement>.asSlice(&List<Block>.asSlice(&function.blocks)[block].statements)
+  let locals = List<Local>.asSlice(&function.locals)
+  let mut statement = usize.ZERO
+  while statement < statements.length {
+    if let Statement.Assign {value, ..} = &statements[statement] {
+      let mut operand = usize.ZERO
+      while true {
+        let field = match operandAt(&value, operand) {
+          Option<&Operand>.None => { break }
+          Option<&Operand>.Some {value: found} => found
+        }
+        let temporary = wholeLocal(field)
+        operand = operand + usize.ONE
+        if temporary == usize.MAX || !isTemp(function, temporary) { continue }
+        let temporaryUses = UseTable.uses(table, temporary)
+        if temporaryUses.named != 2 || temporaryUses.borrowed || temporaryUses.dropped || UseTable.flagged(table, temporary) { continue }
+        // The snapshot: the temporary's whole assignment from a place, earlier in this block.
+        let mut snapshot = statement
+        let mut found = false
+        while snapshot > usize.ZERO {
+          snapshot = snapshot - usize.ONE
+          if statementNames(&statements[snapshot], temporary) != usize.ZERO {
+            found = true
+            break
+          }
+        }
+        if !found { continue }
+        let source = match &statements[snapshot] {
+          Statement.Assign {destination, value: Rvalue.Use {value: Operand.Move {place}}, ..} => {
+            if wholePlace(&destination) != temporary { continue }
+            &place
+          }
+          Statement.Assign {destination, value: Rvalue.Use {value: Operand.Copy {place}}, ..} => {
+            if wholePlace(&destination) != temporary { continue }
+            &place
+          }
+          _ => { continue }
+        }
+        let local = source.local
+        if local == temporary || !fixedPath(source) { continue }
+        let kind = match &locals[local].kind {
+          LocalKind.Parameter {..} => true
+          LocalKind.User {..} => true
+          LocalKind.Temp => true
+          _ => false
+        }
+        if !kind { continue }
+        // Nothing between the snapshot and the field touches the source, and the field's own
+        // statement names it nowhere else.
+        let mut between = snapshot + usize.ONE
+        let mut touched = false
+        while between < statement {
+          if statementNames(&statements[between], local) != usize.ZERO { touched = true }
+          between = between + usize.ONE
+        }
+        if touched || statementNames(&statements[statement], local) != usize.ZERO { continue }
+        return Option<FieldSnapshot>.some(FieldSnapshot {statement: statement, operand: operand - usize.ONE, snapshot: snapshot})
+      }
+    }
+    statement = statement + usize.ONE
+  }
+  return Option<FieldSnapshot>.none()
 }
