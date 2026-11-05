@@ -21,8 +21,8 @@ secret of a group. Nothing allocates.
 - [`DhError`](#DhError) for a group, a secret, or a peer key that is not valid.
 
 ## Gotchas
-[`DhGroup.make`](#DhGroup.impl.make) does not test that `p` is prime or that `g` generates a large subgroup, so take
-custom groups only from a source that you trust. The key exchange does not authenticate the
+[`DhGroup.make`](#DhGroup.impl.make) does not test that `p` is prime. Call [`DhGroup.check`](#DhGroup.impl.check) on a group from a
+source that you do not trust, and use only safe primes. The key exchange does not authenticate the
 peer. Pass the shared secret through `silk.crypto.hkdf` before you use it as a key. The secret
 is not erased when it is dropped.
 
@@ -80,7 +80,7 @@ pub fn main() -> i32 {
 
 Import as `DhPrivateKey` with `import silk.crypto.dh { DhPrivateKey }`.
 
-Public declarations: 4.
+Public declarations: 5.
 
 <a id="DhError"></a>
 
@@ -391,7 +391,7 @@ Leading zero bytes are allowed.
 - `InvalidGenerator` if the generator is not from 2 to `p - 2`.
 
 #### Gotchas
-It does not test that `prime` is prime or that `generator` generates a large subgroup.
+It does not test that `prime` is prime; [`DhGroup.check`](#DhGroup.impl.check) does.
 
 <a id="DhGroup.impl.prime"></a>
 
@@ -433,6 +433,57 @@ pub fn primeBits(self: &Self) -> usize
 ```
 
 Returns the length of `p` in bits.
+
+<a id="DhGroup.impl.check"></a>
+
+### Method `check`
+
+```silk
+pub effect fn check(self: &Self) -> DhCheck
+    ? &mut Random
+```
+
+Tests whether `p` is prime and whether `(p - 1) / 2` is prime too, as OpenSSL `DH_check`
+does for a group without a known subgroup order.
+
+It uses `silk.crypto.prime` with [`Prime.recommendedRounds`](./crypto-prime.md#Prime.impl.recommendedRounds) and reads random bases from the
+ambient `Random`. For an 8192-bit group it takes seconds, so check a custom group once, and do
+not check the named groups, which are safe primes.
+
+<a id="DhCheck"></a>
+
+## `DhCheck`
+
+```silk
+pub struct DhCheck
+```
+
+The result of [`DhGroup.check`](#DhGroup.impl.check): whether the prime of a group is prime and safe.
+
+### Details
+Node.js reports the same facts as `verifyError`: `DH_CHECK_P_NOT_PRIME` (1) when
+[`DhCheck.prime`](#DhCheck.prime) is false, and `DH_CHECK_P_NOT_SAFE_PRIME` (2) when [`DhCheck.safePrime`](#DhCheck.safePrime) is
+false.
+
+<a id="DhCheck.prime"></a>
+
+### Field `prime`
+
+```silk
+pub prime: bool
+```
+
+Whether `p` passed the primality test.
+
+<a id="DhCheck.safePrime"></a>
+
+### Field `safePrime`
+
+```silk
+pub safePrime: bool
+```
+
+Whether `p` and `(p - 1) / 2` both passed the primality test.
 
 <a id="DhPrivateKey"></a>
 
