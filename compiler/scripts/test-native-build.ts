@@ -2821,7 +2821,7 @@ const program = Effect.gen(function* () {
   assert.equal(directHost.status, 1, directHost.stderr)
   assert.match(
     directHost.stderr,
-    /^silk: invalid build profile: UnsupportedCombination: backend direct builds WebAssembly targets only; choose a wasm target, such as wasm32-wasip1, or the llvm backend$/m,
+    /^silk: invalid build profile: UnsupportedCombination: backend = "direct" builds WebAssembly targets only; choose a wasm target, such as wasm32-wasip1, or backend = "llvm"$/m,
   )
   // Freed memory is reused: 100 threads with 1 MiB stacks and repeated list growth fit in 64 MiB.
   const churn = join(directory, 'churn')
