@@ -1,0 +1,280 @@
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.compress.zstd_encode {
+  ZstdEncodeError,
+  ZstdEncodeErrorKind,
+  ZstdEncodeProgress,
+  ZstdEncodeStatus,
+  ZstdEncoder,
+  ZstdFlush,
+  ZstdOptions
+}
+import silk.compress.zstd { Zstd, ZstdError, ZstdLimits, ZstdProgress, ZstdStatus }
+import silk.collections.list { List }
+import silk.core.result { Result }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.num.u32
+import silk.num.usize
+
+// Decodes `encoded` with the Silk decoder and checks that it is exactly `input`.
+effect fn decodes(encoded: &[u8], input: &[u8]) -> bool
+  ! OutOfMemoryError | ZstdError
+  ? &mut Allocator {
+  let mut decoded = List<u8>.make()
+  run List<u8>.appendRepeated(&mut decoded, 165, input.length + 1)
+  let mut decoder = run Zstd.make(ZstdLimits.make())
+  let valid = match move Zstd.step(&mut decoder, encoded, List<u8>.asMutSlice(&mut decoded), true) {
+    Result<ZstdProgress, ZstdError>.Success { value } => value.status == ZstdStatus.Finished
+      && value.consumed == encoded.length
+      && value.written == input.length
+    Result<ZstdProgress, ZstdError>.Failure { .. } => false
+  }
+  if !valid {
+    return false
+  }
+  let mut index: usize = 0
+  while index < input.length {
+    if List<u8>.get(&decoded, index) != input[index] {
+      return false
+    }
+    index = index + 1
+  }
+  return List<u8>.get(&decoded, input.length) == 165
+}
+
+// One-shot encoding within the bound.
+effect fn roundtrip(input: &[u8], options: ZstdOptions) -> bool
+  ! OutOfMemoryError | ZstdEncodeError | ZstdError
+  ? &mut Allocator {
+  let bound = match move ZstdEncoder.encodedBound(input.length) {
+    Option<usize>.Some { value } => value
+    Option<usize>.None => {
+      return false
+    }
+  }
+  let mut encoded = List<u8>.make()
+  run List<u8>.appendRepeated(&mut encoded, 165, bound + 1)
+  let size = run ZstdEncoder.encode(input, List<u8>.asMutSlice(&mut encoded), move options)
+  if List<u8>.get(&encoded, size) != 165 {
+    return false
+  }
+  return run decodes(Slice.view<u8>(List<u8>.asSlice(&encoded), 0, size), input)
+}
+
+// Streams `input` in 1000-byte parts with `flush` after each part and a 7-byte output buffer.
+effect fn streamed(
+  input: &[u8],
+  level: u32,
+  flush: ZstdFlush,
+  checksum: bool,
+  pledged: bool,
+) -> bool
+  ! OutOfMemoryError | ZstdEncodeError | ZstdError
+  ? &mut Allocator {
+  let mut options = ZstdOptions.make(level)
+  options.checksum = checksum
+  options.windowLog = 16
+  let mut encoder = run ZstdEncoder.make(move options)
+  if pledged {
+    if let Result<(), ZstdEncodeError>.Failure { .. } = ZstdEncoder.setPledgedSize(
+      &mut encoder,
+      usize.toU64(input.length),
+    ) {
+      return false
+    }
+  }
+  let mut encoded = List<u8>.make()
+  let mut buffer: [u8; 7] = [0; 7]
+  let mut position: usize = 0
+  while true {
+    let mut end = position + 1000
+    let mut mode = flush
+    if end >= input.length {
+      end = input.length
+      mode = ZstdFlush.End
+    }
+    let mut part = Slice.view<u8>(input, position, end - position)
+    while true {
+      let progress = match move ZstdEncoder.step(&mut encoder, part, &mut buffer, mode) {
+        Result<ZstdEncodeProgress, ZstdEncodeError>.Success { value } => move value
+        Result<ZstdEncodeProgress, ZstdEncodeError>.Failure { .. } => {
+          return false
+        }
+      }
+      run List<u8>.appendSlice(&mut encoded, Slice.view<u8>(&buffer, 0, progress.written))
+      part = Slice.view<u8>(part, progress.consumed, part.length - progress.consumed)
+      if progress.status == ZstdEncodeStatus.Finished {
+        return run decodes(List<u8>.asSlice(&encoded), input)
+      }
+      if progress.status == ZstdEncodeStatus.NeedInput
+        || progress.status == ZstdEncodeStatus.Flushed {
+        break
+      }
+    }
+    if flush == ZstdFlush.Flush {
+      // Everything so far is in complete blocks, so a decoder can decode all of it now.
+      let mut decoded = List<u8>.make()
+      run List<u8>.appendRepeated(&mut decoded, 0, end)
+      let mut decoder = run Zstd.make(ZstdLimits.make())
+      let complete = match move Zstd.step(
+        &mut decoder,
+        List<u8>.asSlice(&encoded),
+        List<u8>.asMutSlice(&mut decoded),
+        false,
+      ) {
+        Result<ZstdProgress, ZstdError>.Success { value } => value.written == end
+        Result<ZstdProgress, ZstdError>.Failure { .. } => false
+      }
+      if !complete {
+        return false
+      }
+    }
+    position = end
+  }
+  return false
+}
+
+// A buffer one byte shorter than the frame fails with OutputFull after filling it completely.
+effect fn bounds() -> bool
+  ! OutOfMemoryError | ZstdEncodeError
+  ? &mut Allocator {
+  let input = b"abracadabra abracadabra abracadabra"
+  let mut output: [u8; 128] = [165; 128]
+  let size = run ZstdEncoder.encode(input, &mut output, ZstdOptions.make(3))
+  let mut small = List<u8>.make()
+  run List<u8>.appendRepeated(&mut small, 165, size - 1)
+  let result = run Effect.result(
+    ZstdEncoder.encode(input, List<u8>.asMutSlice(&mut small), ZstdOptions.make(3)),
+  )
+  return match move result {
+    Result<usize, OutOfMemoryError | ZstdEncodeError>.Success { .. } => false
+    Result<usize, OutOfMemoryError | ZstdEncodeError>.Failure { error } => match move error {
+      ZstdEncodeError failure => failure.kind == ZstdEncodeErrorKind.OutputFull
+        && failure.written == size - 1
+        && List<u8>.get(&small, size - 2) == output[size - 2]
+      OutOfMemoryError { .. } => false
+    }
+  }
+}
+
+// Invalid options fail before allocating, and a pledged size that differs fails at the end.
+effect fn misuse() -> bool
+  ! OutOfMemoryError | ZstdEncodeError
+  ? &mut Allocator {
+  let invalid = run Effect.result(ZstdEncoder.make(ZstdOptions.make(23)))
+  let rejected = match move invalid {
+    Result<ZstdEncoder, OutOfMemoryError | ZstdEncodeError>.Success { .. } => false
+    Result<ZstdEncoder, OutOfMemoryError | ZstdEncodeError>.Failure { error } => match move error {
+      ZstdEncodeError failure => failure.kind == ZstdEncodeErrorKind.InvalidOptions
+      OutOfMemoryError { .. } => false
+    }
+  }
+  if !rejected {
+    return false
+  }
+  let mut options = ZstdOptions.make(1)
+  options.windowLog = 10
+  let mut encoder = run ZstdEncoder.make(move options)
+  if let Result<(), ZstdEncodeError>.Failure { .. } = ZstdEncoder.setPledgedSize(&mut encoder, 5) {
+    return false
+  }
+  let mut output: [u8; 64] = [0; 64]
+  let wrong = match move ZstdEncoder.step(&mut encoder, b"four", &mut output, ZstdFlush.End) {
+    Result<ZstdEncodeProgress, ZstdEncodeError>.Success { .. } => false
+    Result<ZstdEncodeProgress, ZstdEncodeError>.Failure { error } => error.kind
+      == ZstdEncodeErrorKind.InvalidUse
+  }
+  if !wrong {
+    return false
+  }
+  ZstdEncoder.reset(&mut encoder)
+  let size = match move ZstdEncoder.step(&mut encoder, b"four", &mut output, ZstdFlush.End) {
+    Result<ZstdEncodeProgress, ZstdEncodeError>.Success { value } => value.written
+    Result<ZstdEncodeProgress, ZstdEncodeError>.Failure { .. } => {
+      return false
+    }
+  }
+  let late = match move ZstdEncoder.step(&mut encoder, b"more", &mut output, ZstdFlush.End) {
+    Result<ZstdEncodeProgress, ZstdEncodeError>.Success { .. } => false
+    Result<ZstdEncodeProgress, ZstdEncodeError>.Failure { error } => error.kind
+      == ZstdEncodeErrorKind.InvalidUse
+  }
+  return late && size > 0
+}
+
+effect fn program() -> i32
+  ! OutOfMemoryError | ZstdEncodeError | ZstdError
+  ? &mut Allocator {
+  let mut text = List<u8>.make()
+  let mut index: usize = 0
+  while index < 20000 {
+    let word = usize.remainder(index * 2654435761, 977)
+    run List<u8>.appendSlice(&mut text, b"zstd ")
+    run List<u8>.append(&mut text, usize.toU8(97 + usize.remainder(word, 26)))
+    run List<u8>.append(&mut text, usize.toU8(97 + usize.remainder(word / 26, 26)))
+    if usize.remainder(index, 11) == 0 {
+      run List<u8>.append(&mut text, 10)
+    }
+    index = index + 1
+  }
+  let mut noise = List<u8>.make()
+  let mut seed: u32 = 1
+  index = 0
+  while index < 30000 {
+    seed = u32.wrappingAdd(u32.wrappingMultiply(seed, 1103515245), 12345)
+    run List<u8>.append(&mut noise, u32.toU8(u32.shiftRight(seed, 16) & 255))
+    index = index + 1
+  }
+  let mut same = List<u8>.make()
+  run List<u8>.appendRepeated(&mut same, 120, 150000)
+  let inputs: [&[u8]; 6] = [
+    b"",
+    b"a",
+    b"abcabcabcabcabcabcabc",
+    List<u8>.asSlice(&text),
+    List<u8>.asSlice(&noise),
+    List<u8>.asSlice(&same),
+  ]
+  let levels: [u32; 6] = [1, 3, 5, 9, 14, 22]
+  let mut input: usize = 0
+  while input < 6 {
+    let mut level: usize = 0
+    while level < 6 {
+      let mut options = ZstdOptions.make(levels[level])
+      options.checksum = usize.remainder(level, 2) == 0
+      options.contentSize = level != 3
+      if !run roundtrip(inputs[input], move options) {
+        return 1
+      }
+      level = level + 1
+    }
+    input = input + 1
+  }
+  let textSlice = List<u8>.asSlice(&text)
+  if !run streamed(textSlice, 3, ZstdFlush.Flush, true, false) {
+    return 2
+  }
+  if !run streamed(textSlice, 7, ZstdFlush.Continue, false, true) {
+    return 3
+  }
+  if !run streamed(List<u8>.asSlice(&noise), 1, ZstdFlush.Flush, false, true) {
+    return 4
+  }
+  if !run streamed(b"", 3, ZstdFlush.Flush, true, true) {
+    return 5
+  }
+  if !run bounds() {
+    return 6
+  }
+  if !run misuse() {
+    return 7
+  }
+  return 42
+}
+
+pub effect fn main() -> i32
+  ! OutOfMemoryError | ZstdEncodeError | ZstdError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run program() |> Effect.provideMut<Allocator>(&mut allocator)
+}
