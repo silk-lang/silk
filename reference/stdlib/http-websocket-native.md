@@ -31,7 +31,7 @@ URI is not a `ws`, `wss`, `http`, or `https` URI.
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.http.exchange_native { NativeTransport }
 import silk.http.websocket_native { split }
-import silk.http.websocket_stream { ReadHalf, Split, WebSocket, WriteHalf }
+import silk.http.websocket_stream { Split, WebSocket }
 
 // Splits `socket`, so a fiber can read with the reader while others send with the writer.
 effect fn halves(socket: WebSocket<NativeTransport>) -> Split<NativeTransport, NativeTransport>
