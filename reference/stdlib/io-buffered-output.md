@@ -524,7 +524,7 @@ impl<W> BufferedWriter<W>
 ### Associated function `make`
 
 ```silk
-pub effect fn make<W>(destination: W, capacity: usize) -> BufferedWriter<W>
+pub effect fn make(destination: W, capacity: usize) -> BufferedWriter<W>
   ! BufferError | OutOfMemoryError
   ? &mut Allocator
 ```
@@ -542,17 +542,25 @@ Returns a writer that sends its bytes to `destination` through a buffer of `capa
 ### Method `pending`
 
 ```silk
-pub fn pending<W>(self: &Self) -> usize
+pub fn pending(self: &Self) -> usize
 ```
 
 Returns the number of bytes that the buffer holds and the destination has not yet received.
+
+<a id="BufferedWriter.impl-2"></a>
+
+## Implementation `BufferedWriter<W>`
+
+```silk
+impl<W: Writer> BufferedWriter<W>
+```
 
 <a id="BufferedWriter.impl.finish"></a>
 
 ### Method `finish`
 
 ```silk
-pub effect fn finish<W: Writer>(self: Self) -> W ! WriterError
+pub effect fn finish(self: Self) -> W ! WriterError
 ```
 
 Sends the pending bytes, flushes the destination, and returns it.

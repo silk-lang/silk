@@ -1746,6 +1746,31 @@ const program = Effect.gen(function* () {
     kindless.stderr,
     /^Skipping geo: its root module \(\[package\]\.main\) is missing\n {2}help: its source root has lib\.silk; a library sets `kind = "library"` and `exports = \["lib"\]` under \[package\]$/m,
   )
+  // A member's first check adopts its dependency's semantic cache, and what changed in the
+  // dependency since that cache was written is checked again: the stale result is not reused.
+  yield* fs.makeDirectory(join(directory, 'adopt/core/src'), { recursive: true })
+  yield* fs.makeDirectory(join(directory, 'adopt/app/src'), { recursive: true })
+  yield* fs.writeFileString(join(directory, 'adopt/silk.toml'), '[workspace]\nmembers = ["core", "app"]\n')
+  yield* fs.writeFileString(
+    join(directory, 'adopt/core/silk.toml'),
+    '[package]\nname = "adoptcore"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\n',
+  )
+  yield* fs.writeFileString(join(directory, 'adopt/core/src/lib.silk'), 'pub fn size() -> i64 {\n  return 2\n}\n')
+  yield* fs.writeFileString(
+    join(directory, 'adopt/app/silk.toml'),
+    '[package]\nname = "adoptapp"\nversion = "0.1.0"\n\n[dependencies]\nadoptcore = { path = "../core" }\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'adopt/app/src/main.silk'),
+    'import adoptcore.lib { size }\n\npub fn main() -> i32 {\n  let n: i64 = size()\n  return 0\n}\n',
+  )
+  const coreChecked = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(directory, 'adopt/core'))
+  assert.equal(coreChecked.status, 0, coreChecked.stderr)
+  assert.ok(yield* fs.exists(join(directory, 'adopt/build/cache/adoptcore')), 'the library check leaves its cache in the workspace output')
+  yield* fs.writeFileString(join(directory, 'adopt/core/src/lib.silk'), 'pub fn size() -> bool {\n  return true\n}\n')
+  const adoptedCheck = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(directory, 'adopt/app'))
+  assert.equal(adoptedCheck.status, 1, adoptedCheck.stderr)
+  assert.match(adoptedCheck.stderr, /app\/src\/main\.silk:4:\d+: error\[/)
   // A `mut fn` binding is lent to each call it is passed to, so it stays usable afterwards, and one
   // call cannot be lent it twice. Callable diagnostics name the binding and the fix.
   // Match and pattern mistakes are one diagnostic each, naming the fix or the types involved.
@@ -2774,6 +2799,33 @@ const program = Effect.gen(function* () {
     tooOld.stderr,
     /^silk: Silk builds need Clang 22 or newer, but \S+clang-18 \(from SILK_CLANG\) is Clang 18; set SILK_CLANG or pass --clang the path of a newer Clang$/m,
   )
+  // Clang 22 miscompiles AVX-512 mask code (llvm/llvm-project#198220), so a profile with avx512vl
+  // and avx512dq needs Clang 23.
+  const twentyTwo = join(directory, 'clang-22')
+  yield* fs.writeFileString(
+    twentyTwo,
+    `#!/bin/sh\nif [ "$1" = --version ]; then echo 'clang version 22.1.8'; exit 0; fi\nexec ${quote(clang)} "$@"\n`,
+  )
+  yield* fs.chmod(twentyTwo, 0o755)
+  const masks = join(directory, 'masks')
+  yield* fs.makeDirectory(masks, { recursive: true })
+  yield* fs.writeFileString(
+    join(masks, 'silk.toml'),
+    '[package]\nname = "masks"\nversion = "0.0.0"\nsilk-version = "0.0.0"\nsource = "."\n' +
+      '\n[profiles.avx]\ntarget = "x86_64-unknown-linux-gnu"\ncpu = { features = ["avx512vl", "avx512dq"] }\n',
+  )
+  yield* fs.writeFileString(join(masks, 'main.silk'), 'pub fn main() -> i32 { return 0 }\n')
+  const maskRefused = yield* invoke(
+    silk,
+    ['build', '--manifest-path', join('masks', 'silk.toml'), '--profile', 'avx', '--stdlib', standardLibrary],
+    directory,
+    { ...process.env, SILK_CLANG: twentyTwo },
+  )
+  assert.equal(maskRefused.status, 2, maskRefused.stderr)
+  assert.match(
+    maskRefused.stderr,
+    /^silk: builds with avx512vl and avx512dq or avx512bw need Clang 23 or newer, but \S+clang-22 \(from SILK_CLANG\) is Clang 22; set SILK_CLANG or pass --clang the path of a newer Clang$/m,
+  )
   const threadedPath = join(threads, 'build/llvm/wasm32-unknown-unknown/web/threads')
   const threadedModule = new WebAssembly.Module(yield* fs.readFile(threadedPath))
   assert.deepEqual(
@@ -2797,7 +2849,9 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: '/nonexistent' },
   )
   assert.equal(direct.status, 0, direct.stderr)
-  const directModule = new WebAssembly.Module(yield* fs.readFile(threadedPath))
+  // Each backend keeps its own output directory.
+  const directPath = join(threads, 'build/direct/wasm32-unknown-unknown/web/threads')
+  const directModule = new WebAssembly.Module(yield* fs.readFile(directPath))
   assert.deepEqual(
     WebAssembly.Module.imports(directModule)
       .map((entry) => `${entry.module}.${entry.name}`)
@@ -2806,7 +2860,7 @@ const program = Effect.gen(function* () {
   )
   const directRun = yield* invoke(
     process.execPath,
-    [join(standardLibrary, 'host/wasm-runner.mjs'), threadedPath],
+    [join(standardLibrary, 'host/wasm-runner.mjs'), directPath],
     directory,
     process.env,
   )
@@ -2968,7 +3022,7 @@ const program = Effect.gen(function* () {
     assert.equal(wideBuild.status, 0, wideBuild.stderr)
     const wideRun = yield* invoke(
       process.execPath,
-      [join(standardLibrary, 'host/wasm-runner.mjs'), join(arena, 'build/llvm/wasm64-unknown-unknown/web64/arena')],
+      [join(standardLibrary, 'host/wasm-runner.mjs'), join(arena, `build/${backend}/wasm64-unknown-unknown/web64/arena`)],
       directory,
       process.env,
     )

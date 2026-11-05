@@ -1254,6 +1254,7 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
     if same(Bytes.asSlice(&profileFlags[scanned]), b"-static") { staticLink = true }
     scanned = scanned + usize.ONE
   }
+  let minimumClang = clangMinimum(profileFlags)
   let glibcStubbed = linux && !explicitSupply && same(libc, b"gnu") && !staticLink && linkInputs.length == usize.ZERO
   let crossTarget = Target.id(target) != Target.id(&hostTarget())
   if linux && !explicitSupply && !glibcStubbed && crossTarget {
@@ -1454,7 +1455,7 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
   // `[native].sources` compile only for a final output, which links or archives them.
   let compilesSources = final && NativeLinkInputs.hasSources(linkInputs)
   if units.length > usize.ZERO || lld || compilesSources {
-    match move run probeClang(&clang, origin, &mut progress.*) {
+    match move run probeClang(&clang, origin, minimumClang, &mut progress.*) {
       ClangVersion.Answered {output: answer} => { probed = Option<Bytes>.some(move answer) }
       ClangVersion.Failed {status} => { return status }
     }
@@ -1719,7 +1720,7 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
     run CodegenCache.forgetLink(&unitDirectory)
     if units.length == usize.ZERO {
       if let Option<Bytes>.None = &probed {
-        if let ClangVersion.Failed {status} = run probeClang(&clang, origin, &mut progress.*) { return status }
+        if let ClangVersion.Failed {status} = run probeClang(&clang, origin, minimumClang, &mut progress.*) { return status }
       }
       let mut bitcode = Bytes.make()
       if debugInfo.length == usize.ZERO {
@@ -1988,9 +1989,30 @@ union ClangVersion {
   Failed {status: i32},
 }
 
-// Asks `clang`, from `origin`, for its version. The backend writes LLVM 22 bitcode, which older
-// Clang misreads (Clang 18's optimizer crashes on its lifetime markers), so an older one is refused.
-effect fn probeClang(clang: &Path, origin: &[u8], progress: &mut Progress) -> ClangVersion
+// The oldest Clang major version that compiles a program given `profileFlags` correctly. The
+// backend writes LLVM 22 bitcode, which older Clang misreads (Clang 18's optimizer crashes on its
+// lifetime markers). Clang 22's x86 backend also miscompiles AVX-512 mask code: its EVEX
+// compression folds `vpmov*2m` into `vmovmsk*` while a later instruction still reads the mask
+// register (llvm/llvm-project#198220, fixed in Clang 23). Those instructions exist for 128- and
+// 256-bit vectors only with avx512vl and avx512dq or avx512bw, which `cpu.model = "native"` turns
+// on for recent x86 CPUs, so such a build needs Clang 23.
+fn clangMinimum(profileFlags: &[Bytes]) -> usize {
+  let mut lengths = false
+  let mut masks = false
+  let mut at = usize.ZERO
+  while at < profileFlags.length {
+    let flag = Bytes.asSlice(&profileFlags[at])
+    if same(flag, b"+avx512vl") { lengths = true }
+    if same(flag, b"+avx512dq") || same(flag, b"+avx512bw") { masks = true }
+    at = at + usize.ONE
+  }
+  if lengths && masks { return usize.add(0, 23) }
+  return usize.add(0, 22)
+}
+
+// Asks `clang`, from `origin`, for its version, and refuses one older than `minimum`
+// (`clangMinimum`).
+effect fn probeClang(clang: &Path, origin: &[u8], minimum: usize, progress: &mut Progress) -> ClangVersion
 ! FileError | ProcessError | HostInputError | OutOfMemoryError | WriterError ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
   let mut version = run NativeToolchain.request(clang)
   run ChildProcess.addArgument(&mut version, "--version")
@@ -2009,9 +2031,16 @@ effect fn probeClang(clang: &Path, origin: &[u8], progress: &mut Progress) -> Cl
   if !answered { return ClangVersion.Failed {status: run unstartedClang(clang, origin, &mut progress.*)} }
   let output = ChildProcess.outputBytes(&probed)
   if let Option<usize>.Some {value: major} = clangMajor(output) {
-    if major < usize.add(0, 22) {
+    if major < minimum {
       run Progress.clear(&mut progress.*)
-      let mut message = run Bytes.copy(b"silk: Silk builds need Clang 22 or newer, but ")
+      let mut message = run Bytes.copy(b"silk: ")
+      if minimum > usize.add(0, 22) {
+        run Bytes.append(&mut message, b"builds with avx512vl and avx512dq or avx512bw need Clang ")
+      } else {
+        run Bytes.append(&mut message, b"Silk builds need Clang ")
+      }
+      run appendDecimal(&mut message, minimum)
+      run Bytes.append(&mut message, b" or newer, but ")
       run Bytes.append(&mut message, Path.rawBytes(clang))
       run Bytes.append(&mut message, b" (")
       run Bytes.append(&mut message, origin)
@@ -3108,7 +3137,9 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, cacheDirectory: Opti
   let mut cache = Option<CacheFile>.none()
   if let Option<&Path>.Some {value: directory} = &cacheDirectory {
     if let Option<Bytes>.Some {value: stamped} = &compiler {
-      cache = run SemanticCache.openPrefetched(&mut store, &request, directory, Bytes.asSlice(&stamped), false, true, move prefetched)
+      let none = List<Path>.make()
+      cache = run SemanticCache.openPrefetched(&mut store, &request, directory, Bytes.asSlice(&stamped), false, true, move prefetched,
+        List<Path>.asSlice(&none))
     }
   }
   let selectedRuntime: Option<&ModuleId> = match &runtime {
@@ -5161,7 +5192,11 @@ effect fn buildProjectTarget(project: &Project, plan: ProjectPlan, standardLibra
     Option<bool>.None => run invalidBuildProfile()
   }
   let profileName = run Projects.profileDirectory(&profileNamed, optimization, debug)
-  let path = run Projects.artifact(project, Target.name(&target), Bytes.asSlice(&profileName))
+  let backend = match move InitialProfile.text(&profile, b"backend") {
+    Option<&[u8]>.Some {value} => value
+    Option<&[u8]>.None => run invalidBuildProfile()
+  }
+  let path = run Projects.artifact(project, backend, Target.name(&target), Bytes.asSlice(&profileName))
   if form == Form.SharedLibrary {
     run writeError(b"SILK_GAP artifact-form: the ")
     run writeError(Projects.formSpelling(form))
@@ -5413,6 +5448,24 @@ effect fn writeDiagnostics(target: &Target, json: bool, diagnostics: &Bytes, pro
 // module and the imports of every reached one. Diagnostics go to standard error in `format`,
 // after a `[<target>]` header in the human format, as the TypeScript `silk check` writes them.
 // The status is 0, 1 when a declaration is rejected, or 2 for an unsupported construct.
+// The cache directories of the packages `project` depends on directly, below its output
+// directory, which a workspace shares among its members. A dependency's check sweeps the packages
+// it depends on, so its own image holds theirs.
+effect fn dependencyCaches(project: &Project, sources: &ModuleSources) -> List<Path> ! OutOfMemoryError ? &mut Allocator {
+  let graph = run ModuleSourceFiles.packageGraph(sources)
+  let names = run PackageGraph.directDependencies(&graph, ModuleSourceFiles.entry(sources))
+  let listed = List<Bytes>.asSlice(&names)
+  let mut directories = List<Path>.make()
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if let Option<Path>.Some {value} = move run SemanticCache.directory(Projects.outputDirectory(project), Bytes.asSlice(&listed[at])) {
+      run List<Path>.append(&mut directories, move value)
+    }
+    at = at + usize.ONE
+  }
+  return move directories
+}
+
 effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Option<Path>, json: bool, roots: bool, abandon: bool, settings: &ProgressSettings) -> ProjectArtifact
 ! ApplicationError | InitialProfileProblem | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
@@ -5463,7 +5516,9 @@ effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Op
   let mut cache = Option<CacheFile>.none()
   if let Option<Bytes>.Some {value: stamped} = &compiler {
     if let Option<Path>.Some {value: directory} = &cacheHome {
-      cache = run SemanticCache.openPrefetched(&mut store, &request, &directory, Bytes.asSlice(&stamped), false, false, move prefetched)
+      let dependencies = run dependencyCaches(project, &sources)
+      cache = run SemanticCache.openPrefetched(&mut store, &request, &directory, Bytes.asSlice(&stamped), false, false, move prefetched,
+        List<Path>.asSlice(&dependencies))
     }
   }
   let mut status = 0
@@ -6101,6 +6156,7 @@ effect fn checkProject(working: &Path, command: CheckCommand) -> i32
     }
   }
   let projects = List<Project>.asSlice(&selection.projects)
+  let order = run dependencyOrder(projects)
   // JSON diagnostics share standard error, so a JSON check reports no progress.
   let mut settings = silentProgress()
   let mut replaying = false
@@ -6112,7 +6168,15 @@ effect fn checkProject(working: &Path, command: CheckCommand) -> i32
   let mut at = usize.ZERO
   while at < projects.length {
     if selection.members { settings.position = at + usize.ONE }
-    let checked = run memberStatus(run Effect.result(checkOne(&projects[at], &options, &standardLibrary, json, roots, &settings, &edits, differential, at + usize.ONE == projects.length)))
+    let member = List<usize>.get(&order, at)
+    // Each member interns its own applications: no type outlives its check, so a long workspace
+    // check does not keep every earlier member's keys.
+    let mut memberTypes = TypeTable.make()
+    let checked = run memberStatus(run Effect.result(checkOne(&projects[member], &options, &standardLibrary, json, roots, &settings, &edits, differential, at + usize.ONE == projects.length)
+      |> Effect.provideMut<Types>(&mut memberTypes)))
+    drop memberTypes
+    // The member's store is gone; hand its free pages back before the next member allocates.
+    HeapRelease.release()
     if checked == 0 { succeeded = succeeded + usize.ONE }
     status = worse(status, checked)
     at = at + usize.ONE
@@ -6122,6 +6186,51 @@ effect fn checkProject(working: &Path, command: CheckCommand) -> i32
 }
 
 // Checks one project's planned compilations, as `checkProject` does for each selected project.
+// The order a check visits `projects`: each after the selected packages it depends on, and
+// otherwise as listed, so a package checked for the first time finds the caches its
+// dependencies' checks just wrote (`dependencyCaches`).
+effect fn dependencyOrder(projects: &[Project]) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
+  let mut order = List<usize>.make()
+  let mut state = List<usize>.make()
+  run List<usize>.appendRepeated(&mut state, usize.ZERO, projects.length)
+  let mut at = usize.ZERO
+  while at < projects.length {
+    run visitInOrder(projects, at, &mut state, &mut order)
+    at = at + usize.ONE
+  }
+  return move order
+}
+
+// Appends `at` to `order` after the projects it depends on; `state` marks each project unseen
+// (0), being visited (1) or placed (2), so a dependency cycle keeps the listed order.
+effect fn visitInOrder(projects: &[Project], at: usize, state: &mut List<usize>, order: &mut List<usize>) -> () ! OutOfMemoryError ? &mut Allocator {
+  if List<usize>.get(&state.*, at) != usize.ZERO { return () }
+  List<usize>.set(&mut state.*, at, usize.ONE)
+  // A manifest that no longer parses orders as listed; its own check reports it.
+  let parsed = match move run Effect.result(Projects.document(&projects[at])) {
+    Result<TomlValue, TomlError | OutOfMemoryError>.Success {value} => Option<TomlValue>.some(move value)
+    Result<TomlValue, TomlError | OutOfMemoryError>.Failure {error} => match move error {
+      TomlError failure => {
+        drop failure
+        Option<TomlValue>.none()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  if let Option<TomlValue>.Some {value: document} = &parsed {
+    let mut other = usize.ZERO
+    while other < projects.length {
+      let name = run dependencyName(Projects.name(&projects[other]))
+      if other != at && hasDependency(&document, Bytes.asSlice(&name)) {
+        run visitInOrder(projects, other, &mut state.*, &mut order.*)
+      }
+      other = other + usize.ONE
+    }
+  }
+  List<usize>.set(&mut state.*, at, 2)
+  run List<usize>.append(&mut order.*, at)
+}
+
 effect fn checkOne(project: &Project, options: &ProjectOptions, standardLibrary: &Option<Path>, json: bool, roots: bool, packages: &ProgressSettings, edits: &Option<List<Edit>>, differential: bool, last: bool) -> i32
 ! ApplicationError | InitialProfileProblem | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types | &mut Writer {

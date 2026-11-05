@@ -16,6 +16,10 @@
 // Every Worker is created by the top-level thread, never by another Worker, so a thread that
 // returns cannot take the threads it started with it. `main` never runs on the top-level thread,
 // because a browser's main thread may not block in `memory.atomic.wait32`.
+//
+// A thread's instance starts with the `__stack_pointer` of the main thread, whose frames are live
+// on the shared memory, so it calls no export before `wasi_thread_start` moves it to the thread's
+// own stack. The report length a thread reads from is taken on the spawning thread instead.
 
 const isNode = typeof process === 'object' && process.versions?.node !== undefined
 
@@ -142,7 +146,7 @@ const importsFor = (memory, spawn, parallelism, log) => ({
 const runRole = (data, post) => {
   const spawn = (argument) => {
     const thread = Atomics.add(data.threads, 0, 1) + 1
-    post({ kind: 'spawn', thread, argument })
+    post({ kind: 'spawn', thread, argument, before: reportLength(reading) })
     return thread
   }
   const reading = { exports: undefined }
@@ -165,7 +169,7 @@ const runRole = (data, post) => {
     importsFor(data.memory, spawn, data.parallelism, log),
   )
   reading.exports = data.memory === undefined ? instance.exports : { ...instance.exports, memory: data.memory }
-  const before = reportLength(reading)
+  const before = data.role === 'main' ? reportLength(reading) : data.before
   try {
     if (data.role === 'main') {
       // LLVM gives a `main` without parameters the C parameters `argc` and `argv`, which a
@@ -215,7 +219,7 @@ export const runWasm = async (bytes, options = {}) => {
       workers.add(worker)
       listen(worker, (message) => {
         if (message.kind === 'spawn') {
-          start({ role: 'thread', thread: message.thread, argument: message.argument }).catch(
+          start({ role: 'thread', thread: message.thread, argument: message.argument, before: message.before }).catch(
             (error) => finish(reject, error),
           )
         } else if (message.kind === 'log') {
