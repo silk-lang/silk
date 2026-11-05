@@ -87,6 +87,8 @@ import silk.num.u8
 import silk.num.usize
 import silk.collections.list { List }
 import silk.io.writer { Writer, WriterError }
+import silk.core.effect { Effect }
+import silk.collections.slice { Slice }
 
 /// One key and value of a JSON object.
 pub struct JsonEntry {
@@ -341,7 +343,12 @@ impl Json {
   /// # Errors
   ///
   /// - `JsonError` if the nesting is deeper than 64.
-  /// - `WriterError` if the `Writer` fails. Bytes that it accepted before the failure stay written.
+  /// - `WriterError` if the `Writer` fails.
+  ///
+  /// # Gotchas
+  ///
+  /// The text goes to the `Writer` in pieces of up to 4 KiB. After a failure, the `Writer` holds
+  /// only the pieces passed to it before the failure.
   pub effect fn write(document: &Value) -> () ! JsonError | WriterError ? &mut Writer {
     let options = JsonOptions.compact()
     return run Json.writeWith(document, &options)
@@ -353,10 +360,17 @@ impl Json {
   /// # Errors
   ///
   /// - `JsonError` if the nesting is deeper than the limit in `options`.
-  /// - `WriterError` if the `Writer` fails. Bytes that it accepted before the failure stay written.
+  /// - `WriterError` if the `Writer` fails.
+  ///
+  /// # Gotchas
+  ///
+  /// The text goes to the `Writer` in pieces of up to 4 KiB. After a failure, the `Writer` holds
+  /// only the pieces passed to it before the failure.
   pub effect fn writeWith(document: &Value, options: &JsonOptions)
     -> () ! JsonError | WriterError ? &mut Writer {
-    return run writeNode(document, options)
+    let mut buffer = OutputBuffer { bytes: [0; 4096], length: usize.ZERO }
+    run writeNode(document, options, &mut buffer)
+    return run flushOutput(&mut buffer)
   }
 
   /// Returns the value of member `key` of an object. Returns an absent option if `self` is not an
@@ -670,47 +684,142 @@ fn containsKey(entries: &List<JsonEntry>, from: usize, key: string) -> bool {
   return false
 }
 
-effect fn writeNode(document: &Value, options: &JsonOptions)
+// The writer collects output here and passes it to the ambient `Writer` in large pieces, so that
+// each comma, bracket, and number costs a copy instead of a `Writer` call.
+struct OutputBuffer {
+  bytes: [u8; 4096],
+  length: usize,
+}
+
+const OUTPUT_CAPACITY: usize = 4096
+
+effect fn outputWrite(self: &mut OutputBuffer, values: &[u8]) -> () ! WriterError {
+  if values.length > OUTPUT_CAPACITY - self.length { fail Writer.failure() }
+  Slice.copyInto<u8>(&mut self.bytes, self.length, values)
+  self.length = self.length + values.length
+}
+
+effect fn outputFlush(self: &mut OutputBuffer) -> () ! WriterError { return () }
+
+impl Writer for OutputBuffer {
+  writeAll: OutputBuffer.outputWrite
+  flush: OutputBuffer.outputFlush
+}
+
+effect fn flushOutput(buffer: &mut OutputBuffer) -> () ! WriterError ? &mut Writer {
+  if buffer.length == usize.ZERO { return () }
+  run Writer.writeAll(Slice.view<u8>(&buffer.bytes, usize.ZERO, buffer.length))
+  buffer.length = usize.ZERO
+}
+
+// Makes room for `size` more bytes, which is at most `OUTPUT_CAPACITY`.
+@inlineAlways
+effect fn reserveOutput(buffer: &mut OutputBuffer, size: usize) -> () ! WriterError ? &mut Writer {
+  if size > OUTPUT_CAPACITY - buffer.length { run flushOutput(&mut buffer) }
+}
+
+// Appends one byte that `reserveOutput` made room for.
+@inlineAlways
+fn pushOutput(buffer: &mut OutputBuffer, byte: u8) -> () {
+  buffer.bytes[buffer.length] = byte
+  buffer.length = buffer.length + usize.ONE
+}
+
+effect fn literalOutput(buffer: &mut OutputBuffer, text: &[u8]) -> () ! WriterError ? &mut Writer {
+  run reserveOutput(&mut buffer, text.length)
+  Slice.copyInto<u8>(&mut buffer.bytes, buffer.length, text)
+  buffer.length = buffer.length + text.length
+}
+
+// An escaped byte takes at most 6 bytes, so a string of up to this many bytes always fits in an
+// empty buffer with its quotes.
+const BUFFERED_STRING_LIMIT: usize = 680
+
+effect fn stringOutput(buffer: &mut OutputBuffer, text: string) -> () ! WriterError ? &mut Writer {
+  let size = String.byteLength(text)
+  if size > BUFFERED_STRING_LIMIT {
+    run flushOutput(&mut buffer)
+    return run JsonOutput.writeString(text)
+  }
+  run reserveOutput(&mut buffer, size * 6 + 2)
+  return run JsonOutput.writeString(text) |> Effect.provideMut<Writer>(&mut buffer)
+}
+
+effect fn separatorOutput(buffer: &mut OutputBuffer, options: &JsonOptions, first: bool)
+  -> () ! WriterError ? &mut Writer {
+  if options.indent == usize.ZERO {
+    if !first {
+      run reserveOutput(&mut buffer, usize.ONE)
+      pushOutput(&mut buffer, 44)
+    }
+    return ()
+  }
+  run flushOutput(&mut buffer)
+  return run JsonOutput.separator(options, first)
+}
+
+effect fn lineOutput(buffer: &mut OutputBuffer, options: &JsonOptions) -> () ! WriterError ? &mut Writer {
+  if options.indent == usize.ZERO { return () }
+  run flushOutput(&mut buffer)
+  return run JsonOutput.line(options)
+}
+
+effect fn colonOutput(buffer: &mut OutputBuffer, options: &JsonOptions) -> () ! WriterError ? &mut Writer {
+  run reserveOutput(&mut buffer, 2)
+  pushOutput(&mut buffer, 58)
+  if options.indent != usize.ZERO { pushOutput(&mut buffer, 32) }
+}
+
+// The longest number text: 20 digits and a sign for an integer, 24 bytes for a float.
+const NUMBER_ROOM: usize = 32
+
+effect fn writeNode(document: &Value, options: &JsonOptions, buffer: &mut OutputBuffer)
   -> () ! JsonError | WriterError ? &mut Writer {
   return match &document.* {
-    Value.Null => run Writer.writeAll(b"null")
+    Value.Null => run literalOutput(&mut buffer, b"null")
     Value.Bool { value } => {
-      if value { return run Writer.writeAll(b"true") }
-      return run Writer.writeAll(b"false")
+      if value { return run literalOutput(&mut buffer, b"true") }
+      return run literalOutput(&mut buffer, b"false")
     }
-    Value.Number { value } => match value {
-      JsonNumber.Integer { value: integer } => run Format.display<i64>(&integer)
-      JsonNumber.Unsigned { value: integer } => run Format.display<u64>(&integer)
-      JsonNumber.Float { value: float } => run JsonOutput.writeFloat(float)
+    Value.Number { value } => {
+      run reserveOutput(&mut buffer, NUMBER_ROOM)
+      return match value {
+        JsonNumber.Integer { value: integer } =>
+          run Format.display<i64>(&integer) |> Effect.provideMut<Writer>(&mut buffer)
+        JsonNumber.Unsigned { value: integer } =>
+          run Format.display<u64>(&integer) |> Effect.provideMut<Writer>(&mut buffer)
+        JsonNumber.Float { value: float } =>
+          run JsonOutput.writeFloat(float) |> Effect.provideMut<Writer>(&mut buffer)
+      }
     }
-    Value.String { text } => run JsonOutput.writeString(String.view(&text))
+    Value.String { text } => run stringOutput(&mut buffer, String.view(&text))
     Value.Array { values } => {
       let child = run JsonOptions.child(options)
       let items = List<Value>.asSlice(&values)
-      run Writer.writeAll(b"[")
+      run literalOutput(&mut buffer, b"[")
       let mut index = usize.ZERO
       while index < items.length {
-        run JsonOutput.separator(&child, index == usize.ZERO)
-        run writeNode(&items[index], &child)
+        run separatorOutput(&mut buffer, &child, index == usize.ZERO)
+        run writeNode(&items[index], &child, &mut buffer)
         index = index + usize.ONE
       }
-      if items.length != usize.ZERO { run JsonOutput.line(options) }
-      return run Writer.writeAll(b"]")
+      if items.length != usize.ZERO { run lineOutput(&mut buffer, options) }
+      return run literalOutput(&mut buffer, b"]")
     }
     Value.Object { entries } => {
       let child = run JsonOptions.child(options)
       let members = List<JsonEntry>.asSlice(&entries)
-      run Writer.writeAll(b"{")
+      run literalOutput(&mut buffer, b"{")
       let mut index = usize.ZERO
       while index < members.length {
-        run JsonOutput.separator(&child, index == usize.ZERO)
-        run JsonOutput.writeString(String.view(&members[index].key))
-        run JsonOutput.colon(&child)
-        run writeNode(&members[index].value, &child)
+        run separatorOutput(&mut buffer, &child, index == usize.ZERO)
+        run stringOutput(&mut buffer, String.view(&members[index].key))
+        run colonOutput(&mut buffer, &child)
+        run writeNode(&members[index].value, &child, &mut buffer)
         index = index + usize.ONE
       }
-      if members.length != usize.ZERO { run JsonOutput.line(options) }
-      return run Writer.writeAll(b"}")
+      if members.length != usize.ZERO { run lineOutput(&mut buffer, options) }
+      return run literalOutput(&mut buffer, b"}")
     }
   }
 }

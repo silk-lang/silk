@@ -512,7 +512,12 @@ Writes `document` as compact JSON to the `Writer`. It does not flush the `Writer
 #### Errors
 
 - `JsonError` if the nesting is deeper than 64.
-- `WriterError` if the `Writer` fails. Bytes that it accepted before the failure stay written.
+- `WriterError` if the `Writer` fails.
+
+#### Gotchas
+
+The text goes to the `Writer` in pieces of up to 4 KiB. After a failure, the `Writer` holds
+only the pieces passed to it before the failure.
 
 <a id="Json.impl.writeWith"></a>
 
@@ -529,7 +534,12 @@ It does not flush the `Writer`.
 #### Errors
 
 - `JsonError` if the nesting is deeper than the limit in `options`.
-- `WriterError` if the `Writer` fails. Bytes that it accepted before the failure stay written.
+- `WriterError` if the `Writer` fails.
+
+#### Gotchas
+
+The text goes to the `Writer` in pieces of up to 4 KiB. After a failure, the `Writer` holds
+only the pieces passed to it before the failure.
 
 <a id="Json.impl.field"></a>
 
