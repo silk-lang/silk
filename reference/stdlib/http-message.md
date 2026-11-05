@@ -1039,6 +1039,22 @@ impl<'value> Copy for Header<'value>
 impl<'value> Header<'value>
 ```
 
+<a id="Header.impl.makeUnchecked"></a>
+
+### Associated function `makeUnchecked`
+
+```silk
+pub unsafe fn makeUnchecked(name: string<'value>, value: &'value [u8]) -> Header<'value>
+```
+
+Returns a field without checking it, for code that has already checked the rules of
+[`Header.make`](#Header.impl.make), such as a parser that rebuilds the fields it validated.
+
+#### Gotchas
+
+This function is `unsafe`. A field that breaks the rules of `make`, such as a value with CR or
+LF, can split the message it is written into.
+
 <a id="Header.impl.make"></a>
 
 ### Associated function `make`
