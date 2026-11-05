@@ -1,0 +1,631 @@
+//! A multi-core TCP server engine: one event loop for each worker thread, and a protocol that turns
+//! received bytes into bytes to send.
+//!
+//! # When to use
+//! Use it to serve a byte protocol, such as HTTP/1.1 in `silk.http.serve`, over many connections
+//! at the same time with little overhead. Write a [`Protocol`], then call [`TcpServer.serve`] with
+//! [`TcpServerOptions`].
+//!
+//! # Details
+//! Each worker thread has its own listener socket on the same address, with `SO_REUSEPORT`, and its
+//! own `epoll` instance. The kernel spreads new connections over the listeners. A worker accepts,
+//! reads, calls the protocol and writes on its own thread, so workers share nothing.
+//!
+//! For each connection, the engine keeps an input buffer and an output buffer. When bytes arrive, it
+//! calls [`Protocol.receive`] with all bytes that were not consumed yet. The protocol consumes a
+//! prefix, appends its answer to the output buffer, and says whether the connection stays open.
+//! The engine sends the output at once, and waits for the socket when the kernel cannot take it
+//! all.
+//!
+//! The input buffer starts at `readBufferBytes`. When it is full and the protocol consumed nothing,
+//! it doubles, up to `maxInputBytes`. A protocol that needs more than that closes the connection
+//! itself first, with an answer such as `413 Content Too Large`.
+//!
+//! A connection that sends nothing for `idleTimeoutSeconds` is closed.
+//!
+//! # Errors
+//! [`TcpServerError`] tells the system call that failed and the system error code. It ends
+//! [`TcpServer.serve`]. Errors of one connection only close that connection.
+//!
+//! # Gotchas
+//! - It needs Linux with GNU libc on x86_64 or aarch64. On other targets, a call fails to compile.
+//! - [`TcpServer.serve`] runs until a worker fails. Each worker is a native thread.
+//!
+//! @category Networking
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.ownership { Copy }
+import silk.mem.pointer { Pointer }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.concurrency.sync { Arc }
+import silk.concurrency.thread { Concurrent, Transferable }
+import silk.concurrency.thread_native { JoinHandle, NativeThread, SpawnError }
+import silk.net.address { IpAddress, Ipv4Address }
+import silk.text.format { Debug, Format, Formatter }
+import silk.io.writer { Writer, WriterError }
+import silk.num.i32
+import silk.num.i64
+import silk.num.isize
+import silk.num.u16
+import silk.num.u32
+import silk.num.u8
+import silk.num.usize
+
+/// What happens to a connection after [`Protocol.receive`].
+pub enum Verdict {
+  /// Keep the connection open, and call `receive` again when more bytes arrive.
+  KeepOpen,
+  /// Send the output that is buffered, then close the connection.
+  Close,
+}
+
+
+/// The answer of [`Protocol.receive`]: how many input bytes it consumed, and what happens next.
+pub struct Received {
+  /// The number of bytes at the start of the input that the protocol used. The engine drops them.
+  pub consumed: usize,
+  /// Whether the connection stays open.
+  pub verdict: Verdict,
+}
+
+impl Copy for Received {}
+
+/// A byte protocol that the engine runs on each connection.
+///
+/// # Details
+/// `S` is the state of one connection. The engine makes it with `open` when it accepts the
+/// connection, and drops it when the connection closes. All calls for one connection happen on one
+/// worker thread, one at a time. One protocol value serves all workers through a shared borrow.
+pub interface Protocol<S> {
+  /// Makes the state of a new connection.
+  effect fn open(self: &Self) -> S ! OutOfMemoryError ? &mut Allocator
+
+  /// Consumes a prefix of `input`, and appends the bytes to send to `output`.
+  ///
+  /// # Details
+  /// `input` holds every received byte that was not consumed yet, so the protocol can wait for a
+  /// complete message and consume nothing. `ended` is true when the peer closed its side, so no
+  /// more bytes come. The protocol can change `input` in place, for example to decode a body.
+  effect fn receive(
+    self: &Self,
+    state: &mut S,
+    input: &mut [u8],
+    ended: bool,
+    output: &mut List<u8>,
+  ) -> Received ! OutOfMemoryError ? &mut Allocator
+}
+
+/// The settings of [`TcpServer.serve`].
+pub struct TcpServerOptions {
+  /// The address to listen on.
+  pub address: IpAddress,
+  /// The TCP port to listen on.
+  pub port: u16,
+  /// The number of worker threads. Zero means one for each processor.
+  pub workers: usize,
+  /// The kernel backlog of each listener.
+  pub backlog: usize,
+  /// The first size of the input buffer of a connection.
+  pub readBufferBytes: usize,
+  /// The largest size of the input buffer of a connection.
+  pub maxInputBytes: usize,
+  /// The time a connection can stay silent before it is closed, in seconds. Zero means no limit.
+  pub idleTimeoutSeconds: usize,
+}
+
+impl Copy for TcpServerOptions {}
+
+impl TcpServerOptions {
+  /// Returns options for `127.0.0.1` and `port`, one worker for each processor, an 8 KiB input
+  /// buffer that grows up to 1 MiB, a backlog of 4096, and a 60 second idle timeout.
+  pub fn make(port: u16) -> TcpServerOptions {
+    return TcpServerOptions {
+      address: IpAddress.V4 { value: Ipv4Address.fromOctets([127, 0, 0, 1]) },
+      port: port,
+      workers: 0,
+      backlog: 4096,
+      readBufferBytes: 8192,
+      maxInputBytes: 1048576,
+      idleTimeoutSeconds: 60,
+    }
+  }
+}
+
+/// The system call that failed in [`TcpServerError`].
+pub enum TcpServerOperation {
+  /// `socket`: make the listener.
+  Socket,
+  /// `setsockopt`: set a listener option.
+  SetSocketOption,
+  /// `bind`: bind the listener to the address.
+  Bind,
+  /// `listen`: start listening.
+  Listen,
+  /// `epoll_create1`: make the event loop.
+  EventLoop,
+  /// `epoll_ctl`: watch a socket.
+  Watch,
+  /// `epoll_wait`: wait for events.
+  Wait,
+  /// `pthread_create`: start a worker thread.
+  Spawn,
+}
+
+
+impl Debug for TcpServerOperation {
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    let name = match self.* {
+      TcpServerOperation.Socket => "Socket"
+      TcpServerOperation.SetSocketOption => "SetSocketOption"
+      TcpServerOperation.Bind => "Bind"
+      TcpServerOperation.Listen => "Listen"
+      TcpServerOperation.EventLoop => "EventLoop"
+      TcpServerOperation.Watch => "Watch"
+      TcpServerOperation.Wait => "Wait"
+      TcpServerOperation.Spawn => "Spawn"
+    }
+    return run Writer.writeString(name)
+  }
+}
+
+/// A system call of the engine failed.
+pub struct TcpServerError {
+  /// The system call that failed.
+  pub operation: TcpServerOperation,
+  /// The system error code, such as 98 for an address that is in use on Linux.
+  pub code: i32,
+}
+
+impl Debug for TcpServerError {
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return run Format.debugFields(self, "TcpServerError", &mut formatter)
+  }
+}
+
+/// The entry point of the engine.
+pub struct TcpServer {}
+
+static if Intrinsic.targetOperatingSystem() == "linux"
+  && Intrinsic.targetAbi() == "gnu"
+  && Intrinsic.profileText("libc") == "gnu"
+  && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64") {
+
+  impl TcpServer {
+    /// Serves connections with `protocol` on every worker, until a worker fails.
+    ///
+    /// # Details
+    /// It starts `workers - 1` native threads and runs the last worker on the calling thread. Each
+    /// worker binds its own listener with `SO_REUSEPORT`, so all of them must be able to bind the
+    /// address. It returns only with an error.
+    ///
+    /// # Errors
+    /// - `TcpServerError` if a listener, an event loop or a thread cannot be made, or a wait
+    ///   fails.
+    /// - `OutOfMemoryError` if a buffer cannot be allocated.
+    pub effect<'static> fn serve<
+      S: 'static,
+      P: 'static + Protocol<S> + Transferable + Concurrent,
+    >(options: TcpServerOptions, protocol: P) -> () ! TcpServerError | OutOfMemoryError ? &mut Allocator {
+      let shared = run Arc<P>.make(move protocol)
+      let mut count = options.workers
+      if count == 0 { count = NativeThread.processorCount() }
+      if count == 0 { count = 1 }
+      // Bind every listener first, so a bind error fails the call before any thread starts.
+      let mut listeners = List<i32>.make()
+      let mut index: usize = 0
+      while index < count {
+        let fd = run makeListener(&options)
+        run List.append(&mut listeners, fd)
+        index = index + 1
+      }
+      let mut handles = List<JoinHandle<WorkerOutcome>>.make()
+      index = 1
+      while index < count {
+        let listener = List.get(&listeners, index)
+        let mine = Arc.clone(&shared)
+        let spawned = run Effect.result(NativeThread.spawn(fn() -> WorkerOutcome {
+          let mut allocator = Allocator.systemAllocatorProvider()
+          return run Effect.catchAll(
+            workerOutcome<S, P>(listener, options, move mine),
+            outcomeOf,
+          ) |> Effect.provideMut<Allocator>(&mut allocator)
+        }))
+        match move spawned {
+          Result.Success { value } => run List.append(&mut handles, move value)
+          Result.Failure { error } => {
+            drop error
+            fail TcpServerError { operation: TcpServerOperation.Spawn, code: 11 }
+          }
+        }
+        index = index + 1
+      }
+      let first = List.get(&listeners, 0)
+      run worker<S, P>(first, options, &shared)
+      return ()
+    }
+  }
+
+  union WorkerOutcome {
+    Failed { error: TcpServerError },
+    OutOfMemory,
+  }
+
+  effect fn workerOutcome<S, P: Protocol<S>>(listener: i32, options: TcpServerOptions, protocol: Arc<P>) -> WorkerOutcome
+  ! TcpServerError | OutOfMemoryError ? &mut Allocator {
+    run worker<S, P>(listener, options, &protocol)
+    return WorkerOutcome.OutOfMemory
+  }
+
+  effect fn outcomeOf(error: TcpServerError | OutOfMemoryError) -> WorkerOutcome {
+    return match move error {
+      TcpServerError failed => WorkerOutcome.Failed { error: move failed }
+      OutOfMemoryError _ignored => WorkerOutcome.OutOfMemory
+    }
+  }
+
+  // The C `struct epoll_event`: packed to 12 bytes on x86_64, 16 bytes with padding on aarch64.
+  static if Intrinsic.targetArchitecture() == "x86_64" {
+    extern "C" struct EpollEvent { events: u32, low: u32, high: u32 }
+    fn epollEvent(events: u32, low: u32, high: u32) -> EpollEvent {
+      return EpollEvent { events: events, low: low, high: high }
+    }
+  } else {
+    extern "C" struct EpollEvent { events: u32, padding: u32, low: u32, high: u32 }
+    fn epollEvent(events: u32, low: u32, high: u32) -> EpollEvent {
+      return EpollEvent { events: events, padding: 0, low: low, high: high }
+    }
+  }
+  impl Copy for EpollEvent {}
+
+  extern "C" struct SockAddrV4 { family: u16, port: u16, address: [u8; 4], zero: [u8; 8] }
+  extern "C" struct SockAddrV6 { family: u16, port: u16, flowInfo: u32, address: [u8; 16], scopeId: u32 }
+
+  unsafe extern "C" fn __errno_location() -> *mut i32
+  unsafe extern "C" fn epoll_create1(flags: i32) -> i32
+  @foreign(noCapture: .("event"))
+  unsafe extern "C" fn epoll_ctl(epoll: i32, operation: i32, fd: i32, event: *mut EpollEvent) -> i32
+  @foreign(noCapture: .("events"))
+  unsafe extern "C" fn epoll_wait(epoll: i32, events: ?[*]mut EpollEvent, capacity: i32, timeout: i32) -> i32
+  unsafe extern "C" fn openSocket(domain: i32, kind: i32, protocol: i32) -> i32 as "socket"
+  @foreign(noCapture: .("value"))
+  unsafe extern "C" fn setsockopt(fd: i32, level: i32, option: i32, value: *const i32, length: u32) -> i32
+  @foreign(noCapture: .("address"))
+  unsafe extern "C" fn bindV4(fd: i32, address: *const SockAddrV4, length: u32) -> i32 as "bind"
+  @foreign(noCapture: .("address"))
+  unsafe extern "C" fn bindV6(fd: i32, address: *const SockAddrV6, length: u32) -> i32 as "bind"
+  unsafe extern "C" fn listenSocket(fd: i32, backlog: i32) -> i32 as "listen"
+  unsafe extern "C" fn accept4(fd: i32, address: ?*mut u8, length: ?*mut u32, flags: i32) -> i32
+  @foreign(noCapture: .("buffer"))
+  unsafe extern "C" fn readSocket(fd: i32, buffer: ?[*]mut u8, length: usize) -> isize as "read"
+  @foreign(noCapture: .("buffer"))
+  unsafe extern "C" fn sendSocket(fd: i32, buffer: ?[*]const u8, length: usize, flags: i32) -> isize as "send"
+  unsafe extern "C" fn closeSocket(fd: i32) -> i32 as "close"
+  @foreign(noCapture: .("seconds"))
+  unsafe extern "C" fn time(seconds: ?*mut i64) -> i64
+
+  const NONBLOCK: i32 = 2048
+  const CLOEXEC: i32 = 524288
+  const STREAM: i32 = 1
+  const SOL_SOCKET: i32 = 1
+  const SO_REUSEADDR: i32 = 2
+  const SO_REUSEPORT: i32 = 15
+  const IPPROTO_TCP: i32 = 6
+  const TCP_NODELAY: i32 = 1
+  const IPPROTO_IPV6: i32 = 41
+  const IPV6_V6ONLY: i32 = 26
+  const MSG_NOSIGNAL: i32 = 16384
+  const EPOLL_CTL_ADD: i32 = 1
+  const EPOLLIN: u32 = 1
+  const EPOLLOUT: u32 = 4
+  const EPOLLERR: u32 = 8
+  const EPOLLHUP: u32 = 16
+  const EPOLLRDHUP: u32 = 8192
+  const EPOLLET: u32 = 2147483648
+  const LISTENER_TOKEN: u32 = 4294967295
+  const AGAIN: i32 = 11
+  const INTERRUPTED: i32 = 4
+  const EVENT_CAPACITY: usize = 512
+
+  fn lastError() -> i32 {
+    unsafe { return Pointer.read<i32>(__errno_location()) }
+  }
+
+  fn swapPort(port: u16) -> u16 {
+    return u16.bitOr(u16.shiftLeft(u16.bitAnd(port, 255), 8), u16.shiftRight(port, 8))
+  }
+
+  effect fn failWith(operation: TcpServerOperation) -> i32 ! TcpServerError {
+    fail TcpServerError { operation: operation, code: lastError() }
+  }
+
+  effect fn makeListener(options: &TcpServerOptions) -> i32 ! TcpServerError {
+    let v4 = IpAddress.isV4(&options.address)
+    let family = if v4 { 2 } else { 10 }
+    let fd = unsafe openSocket(family, i32.bitOr(STREAM, i32.bitOr(NONBLOCK, CLOEXEC)), 0)
+    if fd < 0 { return run failWith(TcpServerOperation.Socket) }
+    let one: i32 = 1
+    if unsafe setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, Pointer.fromRef<i32>(&one), 4) != 0 {
+      let _closed = unsafe closeSocket(fd)
+      return run failWith(TcpServerOperation.SetSocketOption)
+    }
+    if unsafe setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, Pointer.fromRef<i32>(&one), 4) != 0 {
+      let _closed = unsafe closeSocket(fd)
+      return run failWith(TcpServerOperation.SetSocketOption)
+    }
+    let mut status = 0
+    match options.address {
+      IpAddress.V4 { value } => {
+        let address = SockAddrV4 { family: 2, port: swapPort(options.port), address: value.octets(), zero: [0; 8] }
+        status = unsafe bindV4(fd, Pointer.fromRef<SockAddrV4>(&address), 16)
+      }
+      IpAddress.V6 { value } => {
+        let _only = unsafe setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, Pointer.fromRef<i32>(&one), 4)
+        let address = SockAddrV6 { family: 10, port: swapPort(options.port), flowInfo: 0, address: value.octets(), scopeId: 0 }
+        status = unsafe bindV6(fd, Pointer.fromRef<SockAddrV6>(&address), 28)
+      }
+    }
+    if status != 0 {
+      let code = lastError()
+      let _closed = unsafe closeSocket(fd)
+      fail TcpServerError { operation: TcpServerOperation.Bind, code: code }
+    }
+    let backlog = if options.backlog > 65535 { 65535 } else { usize.toI32(options.backlog) }
+    if unsafe listenSocket(fd, backlog) != 0 {
+      let code = lastError()
+      let _closed = unsafe closeSocket(fd)
+      fail TcpServerError { operation: TcpServerOperation.Listen, code: code }
+    }
+    return fd
+  }
+
+  // One connection slot. `fd` is -1 when the slot is free. `generation` changes each time the slot
+  // is reused, so an event for a closed connection does not reach the next one.
+  struct Slot<S> {
+    fd: i32,
+    generation: u32,
+    input: Bytes,
+    start: usize,
+    end: usize,
+    output: List<u8>,
+    sent: usize,
+    state: Option<S>,
+    lastActive: i64,
+    closing: bool,
+  }
+
+  effect fn worker<S, P: Protocol<S>>(listener: i32, options: TcpServerOptions, protocol: &Arc<P>) -> ()
+  ! TcpServerError | OutOfMemoryError ? &mut Allocator {
+    let epoll = unsafe epoll_create1(CLOEXEC)
+    if epoll < 0 { let _e = run failWith(TcpServerOperation.EventLoop) return () }
+    let mut watch = epollEvent(EPOLLIN, LISTENER_TOKEN, 0)
+    if unsafe epoll_ctl(epoll, EPOLL_CTL_ADD, listener, Pointer.fromMutRef<EpollEvent>(&mut watch)) != 0 {
+      let _w = run failWith(TcpServerOperation.Watch)
+      return ()
+    }
+    let mut events: [EpollEvent; 512] = [epollEvent(0, 0, 0); 512]
+    let mut slots = List<Slot<S>>.make()
+    let mut free = List<u32>.make()
+    let mut now = unsafe time(Pointer.null<i64>())
+    let mut lastSweep = now
+    let timeout = if options.idleTimeoutSeconds == 0 { -1 } else { 1000 }
+    while true {
+      let ready = unsafe epoll_wait(epoll, Pointer.fromMutSlice<EpollEvent>(&mut events), 512, timeout)
+      if ready < 0 {
+        if lastError() != INTERRUPTED { let _f = run failWith(TcpServerOperation.Wait) return () }
+        continue
+      }
+      now = unsafe time(Pointer.null<i64>())
+      let mut at: usize = 0
+      let count = i32.toUsize(ready)
+      while at < count {
+        let event = events[at]
+        at = at + 1
+        if event.low == LISTENER_TOKEN {
+          run acceptAll<S, P>(listener, epoll, &options, protocol.get(), &mut slots, &mut free, now)
+          continue
+        }
+        let index = u32.toUsize(event.low)
+        if index >= List.length(&slots) { continue }
+        let slot = &mut List.asMutSlice(&mut slots)[index]
+        if slot.fd < 0 || slot.generation != event.high { continue }
+        let mut open = true
+        if u32.bitAnd(event.events, u32.bitOr(EPOLLIN, u32.bitOr(EPOLLRDHUP, u32.bitOr(EPOLLHUP, EPOLLERR)))) != 0 {
+          slot.lastActive = now
+          open = run serveInput<S, P>(&mut slot, protocol.get(), &options)
+        }
+        if open && u32.bitAnd(event.events, EPOLLOUT) != 0 { open = flush<S>(&mut slot) }
+        if !open { run release<S>(&mut slot, &mut free, index) }
+      }
+      if options.idleTimeoutSeconds != 0 && now - lastSweep >= 1 {
+        lastSweep = now
+        let limit = usize.toI64(options.idleTimeoutSeconds)
+        let mut index: usize = 0
+        let total = List.length(&slots)
+        while index < total {
+          let slot = &mut List.asMutSlice(&mut slots)[index]
+          if slot.fd >= 0 && now - slot.lastActive >= limit { run release<S>(&mut slot, &mut free, index) }
+          index = index + 1
+        }
+      }
+    }
+    return ()
+  }
+
+  effect fn acceptAll<S, P: Protocol<S>>(
+    listener: i32,
+    epoll: i32,
+    options: &TcpServerOptions,
+    protocol: &P,
+    slots: &mut List<Slot<S>>,
+    free: &mut List<u32>,
+    now: i64,
+  ) -> () ! OutOfMemoryError ? &mut Allocator {
+    while true {
+      let fd = unsafe accept4(listener, Pointer.null<u8>(), Pointer.null<u32>(), i32.bitOr(NONBLOCK, CLOEXEC))
+      if fd < 0 {
+        let code = lastError()
+        if code == INTERRUPTED { continue }
+        // EAGAIN ends the batch. Other errors, such as a full descriptor table, drop this round;
+        // the listener stays readable and the next wait tries again.
+        return ()
+      }
+      let one: i32 = 1
+      let _delay = unsafe setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, Pointer.fromRef<i32>(&one), 4)
+      let state = run Protocol<S>.open(protocol)
+      let input = run Bytes.zeroed(options.readBufferBytes)
+      let mut index: usize = 0
+      let mut generation: u32 = 0
+      match List.pop(&mut free.*) {
+        Option.Some { value } => {
+          index = u32.toUsize(value)
+          let slot = &mut List.asMutSlice(&mut slots.*)[index]
+          generation = slot.generation + 1
+          slot.fd = fd
+          slot.generation = generation
+          slot.input = move input
+          slot.start = 0
+          slot.end = 0
+          List.clear(&mut slot.output)
+          slot.sent = 0
+          slot.state = Option<S>.some(move state)
+          slot.lastActive = now
+          slot.closing = false
+        }
+        Option.None => {
+          index = List.length(&slots.*)
+          run List.append(&mut slots.*, Slot<S> {
+            fd: fd,
+            generation: 0,
+            input: move input,
+            start: 0,
+            end: 0,
+            output: List<u8>.make(),
+            sent: 0,
+            state: Option<S>.some(move state),
+            lastActive: now,
+            closing: false,
+          })
+        }
+      }
+      let interest = u32.bitOr(EPOLLIN, u32.bitOr(EPOLLOUT, u32.bitOr(EPOLLRDHUP, EPOLLET)))
+      let mut watch = epollEvent(interest, usize.toU32(index), generation)
+      if unsafe epoll_ctl(epoll, EPOLL_CTL_ADD, fd, Pointer.fromMutRef<EpollEvent>(&mut watch)) != 0 {
+        run release<S>(&mut List.asMutSlice(&mut slots.*)[index], &mut free.*, index)
+      }
+    }
+    return ()
+  }
+
+  effect fn release<S>(slot: &mut Slot<S>, free: &mut List<u32>, index: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let _closed = unsafe closeSocket(slot.fd)
+    slot.fd = -1
+    slot.state = Option<S>.none()
+    slot.input = Bytes.make()
+    List.clearAndFree(&mut slot.output)
+    run List.append(&mut free.*, usize.toU32(index))
+    return ()
+  }
+
+  // Reads until the socket is empty, runs the protocol, and sends. Returns false to close.
+  effect fn serveInput<S, P: Protocol<S>>(slot: &mut Slot<S>, protocol: &P, options: &TcpServerOptions) -> bool
+  ! OutOfMemoryError ? &mut Allocator {
+    let mut ended = false
+    while true {
+      let capacity = Bytes.length(&slot.input)
+      if slot.end == capacity {
+        if slot.start > 0 {
+          let pending = slot.end - slot.start
+          let storage = Bytes.asMutSlice(&mut slot.input)
+          let mut moved: usize = 0
+          while moved < pending {
+            storage[moved] = storage[slot.start + moved]
+            moved = moved + 1
+          }
+          slot.start = 0
+          slot.end = pending
+        } else {
+          if capacity >= options.maxInputBytes {
+            // The protocol cannot make progress within the limit.
+            return false
+          }
+          let mut grown = capacity * 2
+          if grown > options.maxInputBytes { grown = options.maxInputBytes }
+          run Bytes.reserveExact(&mut slot.input, grown - capacity)
+          let zeros: [u8; 64] = [0; 64]
+          while Bytes.length(&slot.input) < grown {
+            let room = grown - Bytes.length(&slot.input)
+            let step = if room < 64 { room } else { 64 }
+            run Bytes.append(&mut slot.input, Slice.view<u8>(&zeros, 0, step))
+          }
+        }
+        continue
+      }
+      let room = capacity - slot.end
+      let spare = Slice.viewMut<u8>(Bytes.asMutSlice(&mut slot.input), slot.end, room)
+      let got = unsafe readSocket(slot.fd, Pointer.fromMutSlice<u8>(move spare), room)
+      if got > 0 {
+        slot.end = slot.end + isize.toUsize(got)
+        // A short read means the socket is empty: serve now instead of paying for an EAGAIN.
+        if isize.toUsize(got) < room { break }
+        continue
+      }
+      if got == 0 { ended = true break }
+      let code = lastError()
+      if code == INTERRUPTED { continue }
+      if code == AGAIN { break }
+      return false
+    }
+    if slot.end > slot.start && !slot.closing {
+      let length = slot.end - slot.start
+      let input = Slice.viewMut<u8>(Bytes.asMutSlice(&mut slot.input), slot.start, length)
+      let received = match &mut slot.state {
+        Option.Some { value } => run Protocol<S>.receive(protocol, &mut value, move input, ended, &mut slot.output)
+        Option.None => Received { consumed: length, verdict: Verdict.Close }
+      }
+      let consumed = if received.consumed > length { length } else { received.consumed }
+      slot.start = slot.start + consumed
+      if slot.start == slot.end {
+        slot.start = 0
+        slot.end = 0
+      }
+      if received.verdict == Verdict.Close { slot.closing = true }
+    }
+    if ended && List.length(&slot.output) == slot.sent { return false }
+    if ended { slot.closing = true }
+    return flush<S>(&mut slot.*)
+  }
+
+  // Sends the buffered output. Returns false to close.
+  fn flush<S>(slot: &mut Slot<S>) -> bool {
+    let total = List.length(&slot.output)
+    while slot.sent < total {
+      let data = Slice.view<u8>(List.asSlice(&slot.output), slot.sent, total - slot.sent)
+      let wrote = unsafe sendSocket(slot.fd, Pointer.fromSlice<u8>(data), total - slot.sent, MSG_NOSIGNAL)
+      if wrote < 0 {
+        let code = lastError()
+        if code == INTERRUPTED { continue }
+        if code == AGAIN { return true }
+        return false
+      }
+      slot.sent = slot.sent + isize.toUsize(wrote)
+    }
+    List.clear(&mut slot.output)
+    slot.sent = 0
+    return !slot.closing
+  }
+} else {
+  impl TcpServer {
+    /// Serves connections with `protocol` on every worker, until a worker fails.
+    ///
+    /// # Gotchas
+    /// It needs Linux with GNU libc on x86_64 or aarch64.
+    pub effect fn serve<S, P: Protocol<S>>(options: TcpServerOptions, protocol: P) -> () ! TcpServerError | OutOfMemoryError ? &mut Allocator {
+      compileError("silk.net.tcp_server needs Linux with GNU libc on x86_64 or aarch64")
+    }
+  }
+}

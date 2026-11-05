@@ -1,0 +1,1151 @@
+//! A fast HTTP/1.1 server: write one handler function, and serve it on every core.
+//!
+//! # When to use
+//! Use this module to answer HTTP requests with little code and high throughput. Write a handler
+//! that reads a [`Request`] and writes a [`Response`], then call [`Server.serve`]. Use
+//! [`Router`] to send each method and path to its own handler. For streaming bodies, upgrades or
+//! full control of the connection, use `silk.http.server` instead.
+//!
+//! # Details
+//! [`Server.serve`] runs the `silk.net.tcp_server` engine: one event loop for each worker thread,
+//! and no locks between workers. The server reads a whole request, with its body, before it calls
+//! the handler. Requests that come one after another on the same connection (pipelining) are
+//! answered in order.
+//!
+//! The server parses HTTP/1.0 and HTTP/1.1 requests with a `Content-Length` body, a `chunked` body,
+//! or no body. It answers with HTTP/1.1 and adds the `Date`, `Content-Length` and, when it closes
+//! the connection, `Connection: close` header fields. A request with `Expect: 100-continue` gets
+//! `100 Continue` before its body is read. A `HEAD` request gets the head of the response, without
+//! the body.
+//!
+//! The connection closes after the response when the request asks for it, or when the request is
+//! HTTP/1.0 without `Connection: keep-alive`. A request that the server cannot read gets an error
+//! response, and then the connection closes:
+//!
+//! | Status | Cause |
+//! |---|---|
+//! | 400 | The request line, a header field or the body framing is malformed |
+//! | 413 | The body is larger than `maxBodyBytes` |
+//! | 431 | The head is larger than `maxHeadBytes`, or has more than `maxHeaderFields` fields |
+//! | 501 | The transfer coding is not `chunked` |
+//! | 505 | The version is not HTTP/1.0 or HTTP/1.1 |
+//!
+//! # Errors
+//! [`Server.serve`] fails with `TcpServerError` if a listener cannot be made, and with
+//! `OutOfMemoryError` if a worker cannot allocate. A failure of a handler only ends its request: the
+//! server answers `500 Internal Server Error` and closes that connection.
+//!
+//! # Gotchas
+//! - It needs Linux with GNU libc on x86_64 or aarch64, like `silk.net.tcp_server`.
+//! - The handler runs on the worker thread of the connection. A handler that blocks, for example on
+//!   a slow file, stops every other connection of that worker until it returns.
+//! - [`Request`] and its texts borrow the input buffer. They are valid only during the handler.
+//!
+//! # Examples
+//! ## Answer every request
+//! ```silk,no_run
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.http.serve { Request, Response, Server }
+//!
+//! effect fn hello(request: &Request, response: &mut Response) -> () ! OutOfMemoryError ? &mut Allocator {
+//!   if request.path() == "/" {
+//!     run response.text("Hello, World!")
+//!     return ()
+//!   }
+//!   response.status(404)
+//!   run response.text("Not found")
+//! }
+//!
+//! effect fn failed<E>(error: E) -> i32 { drop error return 1 }
+//!
+//! pub fn main() -> i32 {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let served = Server.make(8080).serve(hello)
+//!   return run Effect.catchAll(Effect.map(served, fn(done: ()) -> i32 { return 0 }), failed)
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//! }
+//! ```
+//!
+//! @category HTTP
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.ownership { Copy }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.concurrency.thread { Concurrent, Transferable }
+import silk.mem.pointer { Pointer }
+import silk.net.address { AddressError, IpAddress, Ipv4Address, Ipv6Address }
+import silk.net.tcp_server { Protocol, Received, TcpServer, TcpServerError, TcpServerOptions, Verdict }
+import silk.text.string { String }
+import silk.num.i64
+import silk.num.u16
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+
+/// The position of one header field in the head of a [`Request`].
+struct FieldSpan {
+  nameStart: usize,
+  nameLength: usize,
+  valueStart: usize,
+  valueLength: usize,
+}
+
+impl Copy for FieldSpan {}
+
+/// One HTTP request, with its whole body.
+///
+/// # Details
+/// The texts it returns borrow the input buffer of the connection, so they cost no copy. The
+/// method, the target and the header names are ASCII, as the parser checks. Header values may hold
+/// bytes that are not UTF-8: [`Request.header`] skips such a value, and
+/// [`Request.headerBytes`] returns it.
+pub struct Request<'a> {
+  head: &'a [u8],
+  methodLength: usize,
+  targetStart: usize,
+  targetLength: usize,
+  pathLength: usize,
+  minorVersion: u8,
+  fields: &'a [FieldSpan],
+  bodyBytes: &'a [u8],
+}
+
+impl<'a> Request<'a> {
+  /// Returns the method, such as `GET`.
+  pub fn method(self: &Self) -> string<'a> {
+    return unsafe String.fromUtf8Unchecked(Slice.view<u8>(self.head, 0, self.methodLength))
+  }
+
+  /// Returns the request target as it was sent, such as `/search?q=silk`.
+  pub fn target(self: &Self) -> string<'a> {
+    return unsafe String.fromUtf8Unchecked(Slice.view<u8>(self.head, self.targetStart, self.targetLength))
+  }
+
+  /// Returns the path of the target: the part before `?`. It is not percent-decoded.
+  pub fn path(self: &Self) -> string<'a> {
+    return unsafe String.fromUtf8Unchecked(Slice.view<u8>(self.head, self.targetStart, self.pathLength))
+  }
+
+  /// Returns the query of the target: the part after `?`, or an empty text when there is none. It
+  /// is not percent-decoded.
+  pub fn query(self: &Self) -> string<'a> {
+    if self.pathLength >= self.targetLength { return "" }
+    let start = self.targetStart + self.pathLength + 1
+    let length = self.targetLength - self.pathLength - 1
+    return unsafe String.fromUtf8Unchecked(Slice.view<u8>(self.head, start, length))
+  }
+
+  /// Returns the value of the query parameter `name`, as it was sent, or `None`. The value is not
+  /// percent-decoded, and `+` stays `+`.
+  pub fn queryParameter(self: &Self, name: string) -> Option<string<'a>> {
+    let query = Request.query(self)
+    let text = String.utf8Bytes(query)
+    let wanted = String.utf8Bytes(name)
+    let mut at: usize = 0
+    while at <= text.length {
+      let mut end = at
+      while end < text.length && text[end] != 38 { end = end + 1 }
+      let mut equals = at
+      while equals < end && text[equals] != 61 { equals = equals + 1 }
+      if equals - at == wanted.length && bytesEqual(Slice.view<u8>(text, at, wanted.length), wanted) {
+        if equals == end { return Option<string<'a>>.some("") }
+        return Option<string<'a>>.some(String.slice(query, equals + 1, end - equals - 1))
+      }
+      at = end + 1
+    }
+    return Option<string<'a>>.none()
+  }
+
+  /// Returns the minor version: 0 for HTTP/1.0, 1 for HTTP/1.1.
+  pub fn minorVersion(self: &Self) -> u8 { return self.minorVersion }
+
+  /// Returns the number of header fields.
+  pub fn headerCount(self: &Self) -> usize { return self.fields.length }
+
+  /// Returns the value of the first header field named `name`, compared without case, or `None`.
+  /// It skips a value that is not UTF-8.
+  pub fn header(self: &Self, name: string) -> Option<string<'a>> {
+    return match Request.headerBytes(self, name) {
+      Option.None => Option<string<'a>>.none()
+      Option.Some { value } => match String.fromUtf8(value) {
+        Result.Success { value: text } => Option<string<'a>>.some(text)
+        Result.Failure { error } => { drop error Option<string<'a>>.none() }
+      }
+    }
+  }
+
+  /// Returns the bytes of the value of the first header field named `name`, compared without case,
+  /// or `None`. The value has no leading or trailing spaces.
+  pub fn headerBytes(self: &Self, name: string) -> Option<&'a [u8]> {
+    let wanted = String.utf8Bytes(name)
+    let mut index: usize = 0
+    while index < self.fields.length {
+      let field = self.fields[index]
+      index = index + 1
+      if field.nameLength == wanted.length
+        && sameIgnoringCase(Slice.view<u8>(self.head, field.nameStart, field.nameLength), wanted) {
+        return Option<&'a [u8]>.some(Slice.view<u8>(self.head, field.valueStart, field.valueLength))
+      }
+    }
+    return Option<&'a [u8]>.none()
+  }
+
+  /// Returns the name of header field `index`, in the case it was sent.
+  pub fn headerName(self: &Self, index: usize) -> string<'a> {
+    let field = self.fields[index]
+    return unsafe String.fromUtf8Unchecked(Slice.view<u8>(self.head, field.nameStart, field.nameLength))
+  }
+
+  /// Returns the value bytes of header field `index`.
+  pub fn headerValueBytes(self: &Self, index: usize) -> &'a [u8] {
+    let field = self.fields[index]
+    return Slice.view<u8>(self.head, field.valueStart, field.valueLength)
+  }
+
+  /// Returns the body. A chunked body is already decoded.
+  pub fn body(self: &Self) -> &'a [u8] { return self.bodyBytes }
+
+  /// Returns the body as text, or `None` if it is not UTF-8.
+  pub fn text(self: &Self) -> Option<string<'a>> {
+    return match String.fromUtf8(self.bodyBytes) {
+      Result.Success { value } => Option<string<'a>>.some(value)
+      Result.Failure { error } => { drop error Option<string<'a>>.none() }
+    }
+  }
+}
+
+/// The response to one [`Request`].
+///
+/// # Details
+/// Set the status with [`Response.status`] and add header fields with [`Response.header`]. Then
+/// write the body with [`Response.send`], [`Response.text`] or [`Response.html`]. The server adds
+/// `Date` and `Content-Length`. A handler that returns without a body sends an empty one, with the
+/// status it set.
+///
+/// # Gotchas
+/// - The body can be sent once. Later sends and header fields are ignored.
+/// - [`Response.header`] skips a field whose name is not a token or whose value has a line break,
+///   and the `Content-Length`, `Transfer-Encoding`, `Connection` and `Date` fields, which the
+///   server writes itself.
+pub struct Response<'a> {
+  output: &'a mut List<u8>,
+  fields: &'a mut List<u8>,
+  date: &'a [u8],
+  statusCode: u16,
+  sent: bool,
+  close: bool,
+  omitBody: bool,
+}
+
+impl<'a> Response<'a> {
+  /// Sets the status code. The default is 200. A code outside 100 to 999 is ignored.
+  pub fn status(self: &mut Self, code: u16) -> () {
+    if code >= 100 && code <= 999 { self.statusCode = code }
+    return ()
+  }
+
+  /// Returns the status code.
+  pub fn statusCode(self: &Self) -> u16 { return self.statusCode }
+
+  /// Returns whether the body was sent.
+  pub fn isSent(self: &Self) -> bool { return self.sent }
+
+  /// Makes the server close the connection after this response.
+  pub fn closeConnection(self: &mut Self) -> () {
+    self.close = true
+    return ()
+  }
+
+  /// Adds the header field `name: value`.
+  ///
+  /// # Details
+  /// It skips the field if the name is not a token, if the value holds a CR, an LF or a NUL, or if
+  /// the name is one the server writes itself: `Content-Length`, `Transfer-Encoding`, `Connection`
+  /// or `Date`.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the field cannot be stored.
+  pub effect fn header(self: &mut Self, name: string, value: string) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.sent { return () }
+    let nameBytes = String.utf8Bytes(name)
+    let valueBytes = String.utf8Bytes(value)
+    if !isToken(nameBytes) || !isFieldValue(valueBytes) || isReserved(nameBytes) { return () }
+    run List.appendBytes(&mut self.fields.*, nameBytes)
+    run List.appendBytes(&mut self.fields.*, b": ")
+    run List.appendBytes(&mut self.fields.*, valueBytes)
+    run List.appendBytes(&mut self.fields.*, b"\r\n")
+    return ()
+  }
+
+  /// Sends `body` with the status and the header fields that were set.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the output buffer cannot grow.
+  pub effect fn send(self: &mut Self, body: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.sent { return () }
+    self.sent = true
+    let output = &mut self.output.*
+    run List.reserve(&mut output.*, 96 + List.length(&self.fields.*) + body.length)
+    run List.appendBytes(&mut output.*, b"HTTP/1.1 ")
+    run appendStatusLine(&mut output.*, self.statusCode)
+    run List.appendBytes(&mut output.*, self.date)
+    run List.appendBytes(&mut output.*, List.asSlice(&self.fields.*))
+    let bodyless = self.statusCode < 200 || self.statusCode == 204 || self.statusCode == 304
+    if !bodyless {
+      run List.appendBytes(&mut output.*, b"Content-Length: ")
+      run appendDecimal(&mut output.*, usize.toU64(body.length))
+      run List.appendBytes(&mut output.*, b"\r\n")
+    }
+    if self.close { run List.appendBytes(&mut output.*, b"Connection: close\r\n") }
+    run List.appendBytes(&mut output.*, b"\r\n")
+    if !self.omitBody && !bodyless { run List.appendBytes(&mut output.*, body) }
+    return ()
+  }
+
+  /// Sends `body` as `text/plain; charset=utf-8`.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the output buffer cannot grow.
+  pub effect fn text(self: &mut Self, body: string) -> () ! OutOfMemoryError ? &mut Allocator {
+    run Response.header(&mut self.*, "Content-Type", "text/plain; charset=utf-8")
+    run Response.send(&mut self.*, String.utf8Bytes(body))
+    return ()
+  }
+
+  /// Sends `body` as `text/html; charset=utf-8`.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the output buffer cannot grow.
+  pub effect fn html(self: &mut Self, body: string) -> () ! OutOfMemoryError ? &mut Allocator {
+    run Response.header(&mut self.*, "Content-Type", "text/html; charset=utf-8")
+    run Response.send(&mut self.*, String.utf8Bytes(body))
+    return ()
+  }
+
+  /// Sends `body`, which holds JSON text, as `application/json`.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the output buffer cannot grow.
+  pub effect fn json(self: &mut Self, body: string) -> () ! OutOfMemoryError ? &mut Allocator {
+    run Response.header(&mut self.*, "Content-Type", "application/json")
+    run Response.send(&mut self.*, String.utf8Bytes(body))
+    return ()
+  }
+}
+
+/// The code that answers requests. [`Server.serve`] calls `handle` for each request.
+///
+/// # Details
+/// One handler value serves every worker thread through a shared borrow, so the type must be
+/// `Transferable` and `Concurrent`. Keep state that requests change in a `Mutex` or in atomics.
+pub interface Handler {
+  /// Reads `request` and writes `response`. A failure makes the server answer 500 and close the
+  /// connection.
+  effect fn handle(self: &Self, request: &Request, response: &mut Response) -> () ! OutOfMemoryError ? &mut Allocator
+}
+
+/// The settings of a [`Server`]: the address, the workers, and the limits of one request.
+pub struct ServerOptions {
+  /// The address to listen on. The default is `127.0.0.1`.
+  pub address: IpAddress,
+  /// The TCP port to listen on.
+  pub port: u16,
+  /// The number of worker threads. Zero, the default, means one for each processor.
+  pub workers: usize,
+  /// The largest request head: the request line and the header fields. The default is 16 KiB.
+  pub maxHeadBytes: usize,
+  /// The largest number of header fields. The default is 100.
+  pub maxHeaderFields: usize,
+  /// The largest request body, after chunked decoding. The default is 1 MiB.
+  pub maxBodyBytes: usize,
+  /// The time a connection can stay silent before it is closed, in seconds. The default is 60.
+  pub idleTimeoutSeconds: usize,
+}
+
+impl Copy for ServerOptions {}
+
+/// An HTTP server, with the settings of [`ServerOptions`].
+///
+/// # Details
+/// [`Server.make`] gives the defaults for a port. The other functions return a copy with one
+/// setting changed, so calls chain: `Server.make(8080).host("0.0.0.0").workers(4)`.
+pub struct Server {
+  options: ServerOptions,
+  hostError: bool,
+}
+
+impl Copy for Server {}
+
+/// The failure of [`Server.serve`].
+pub union ServeError {
+  /// The host given to [`Server.host`] is not an IPv4 or IPv6 address.
+  InvalidHost,
+  /// The engine failed: a listener, a thread or the event loop.
+  Engine { error: TcpServerError },
+}
+
+impl Server {
+  /// Returns a server for `port` on `127.0.0.1`, with one worker for each processor and the
+  /// default limits of [`ServerOptions`].
+  pub fn make(port: u16) -> Server {
+    return Server {
+      options: ServerOptions {
+        address: IpAddress.V4 { value: Ipv4Address.fromOctets([127, 0, 0, 1]) },
+        port: port,
+        workers: 0,
+        maxHeadBytes: 16384,
+        maxHeaderFields: 100,
+        maxBodyBytes: 1048576,
+        idleTimeoutSeconds: 60,
+      },
+      hostError: false,
+    }
+  }
+
+  /// Returns a server with all its settings from `options`.
+  pub fn fromOptions(options: ServerOptions) -> Server {
+    return Server { options: options, hostError: false }
+  }
+
+  /// Returns the settings.
+  pub fn options(self: &Self) -> ServerOptions { return self.options }
+
+  /// Returns a copy that listens on `address`, an IPv4 or IPv6 address such as `0.0.0.0` or `::1`.
+  /// If it is not an address, [`Server.serve`] fails with `InvalidHost`.
+  pub fn host(self: Self, address: string) -> Server {
+    let mut next = self
+    match Ipv4Address.parse(address) {
+      Result.Success { value } => { next.options.address = IpAddress.V4 { value: value } }
+      Result.Failure { error } => {
+        drop error
+        match Ipv6Address.parse(address) {
+          Result.Success { value } => { next.options.address = IpAddress.V6 { value: value } }
+          Result.Failure { error: second } => { drop second next.hostError = true }
+        }
+      }
+    }
+    return next
+  }
+
+  /// Returns a copy with `count` worker threads. Zero means one for each processor.
+  pub fn workers(self: Self, count: usize) -> Server {
+    let mut next = self
+    next.options.workers = count
+    return next
+  }
+
+  /// Returns a copy that accepts request bodies up to `limit` bytes.
+  pub fn maxBodyBytes(self: Self, limit: usize) -> Server {
+    let mut next = self
+    next.options.maxBodyBytes = limit
+    return next
+  }
+
+  /// Serves `handler` on every worker, until a worker fails.
+  ///
+  /// # Details
+  /// The handler gets each request and writes its response. One handler value serves every
+  /// worker through a shared borrow, so it must be `Transferable` and `Concurrent`: a function, or
+  /// a closure that captures only such values, such as an `Arc` of a `Mutex`.
+  ///
+  /// # Errors
+  /// - `InvalidHost` if [`Server.host`] got a text that is not an address.
+  /// - `Engine` if a listener, a thread or an event loop cannot be made, for example when the port
+  ///   is in use.
+  /// - `OutOfMemoryError` if a worker cannot allocate.
+  pub effect<'static> fn serve<H: 'static + Handler + Transferable + Concurrent>(self: Self, handler: H) -> () ! ServeError | OutOfMemoryError ? &mut Allocator {
+    if self.hostError { fail ServeError.InvalidHost }
+    let options = self.options
+    let mut engine = TcpServerOptions.make(options.port)
+    engine.address = options.address
+    engine.workers = options.workers
+    engine.idleTimeoutSeconds = options.idleTimeoutSeconds
+    engine.maxInputBytes = options.maxHeadBytes + options.maxBodyBytes * 2 + 4096
+    let protocol = HttpProtocol<H> { handler: move handler, options: options }
+    let served = run Effect.result(TcpServer.serve<HttpState, HttpProtocol<H>>(engine, move protocol))
+    return match move served {
+      Result.Success { value } => value
+      Result.Failure { error } => match move error {
+        TcpServerError failure => { fail ServeError.Engine { error: move failure } }
+        OutOfMemoryError failure => { fail move failure }
+      }
+    }
+  }
+}
+
+// The state of one connection: reusable scratch storage and the cached `Date` field.
+struct HttpState {
+  fields: List<FieldSpan>,
+  responseFields: List<u8>,
+  date: [u8; 37],
+  dateSecond: i64,
+  continueSent: bool,
+}
+
+struct HttpProtocol<H> {
+  handler: H,
+  options: ServerOptions,
+}
+
+impl<H: Handler> Protocol<HttpState> for HttpProtocol<H> {
+  effect fn open(self: &Self) -> HttpState ! OutOfMemoryError ? &mut Allocator {
+    return HttpState {
+      fields: run List<FieldSpan>.makeWithCapacity(16),
+      responseFields: List<u8>.make(),
+      date: [0; 37],
+      dateSecond: -1,
+      continueSent: false,
+    }
+  }
+
+  effect fn receive(
+    self: &Self,
+    state: &mut HttpState,
+    input: &mut [u8],
+    ended: bool,
+    output: &mut List<u8>,
+  ) -> Received ! OutOfMemoryError ? &mut Allocator {
+    let mut consumed: usize = 0
+    let total = input.length
+    while consumed < total {
+      List.clear(&mut state.fields)
+      let parsed = run parseRequest(Slice.view<u8>(&input, consumed, total - consumed), &self.options, &mut state.fields)
+      let head = match parsed {
+        Parsed.Incomplete { expectsContinue } => {
+          if expectsContinue && !state.continueSent {
+            state.continueSent = true
+            run List.appendBytes(&mut output.*, b"HTTP/1.1 100 Continue\r\n\r\n")
+          }
+          return Received { consumed: consumed, verdict: Verdict.KeepOpen }
+        }
+        Parsed.Invalid { status } => {
+          run writeError(&mut state.*, &mut output.*, status)
+          return Received { consumed: total, verdict: Verdict.Close }
+        }
+        Parsed.Complete { head } => head
+      }
+      state.continueSent = false
+      // A chunked body is decoded in place, right after the head.
+      if head.chunked {
+        let region = Slice.viewMut<u8>(&mut input, consumed + head.headLength, head.bodyWireLength)
+        decodeChunked(move region)
+      }
+      refreshDate(&mut state.*)
+      let close = head.close
+      let answer = run answerRequest<H>(&self.handler, &mut state.*, Slice.view<u8>(&input, consumed, head.headLength + head.bodyWireLength), &head, &mut output.*)
+      consumed = consumed + head.headLength + head.bodyWireLength
+      match answer {
+        Answer.Failed => {
+          run writeError(&mut state.*, &mut output.*, 500)
+          return Received { consumed: total, verdict: Verdict.Close }
+        }
+        Answer.Close => { return Received { consumed: total, verdict: Verdict.Close } }
+        Answer.KeepOpen => {
+          if close { return Received { consumed: total, verdict: Verdict.Close } }
+        }
+      }
+    }
+    drop ended
+    return Received { consumed: consumed, verdict: Verdict.KeepOpen }
+  }
+}
+
+
+enum Answer {
+  KeepOpen,
+  Close,
+  Failed,
+}
+
+// Calls the handler for one complete request in `message`, and writes its response.
+effect fn answerRequest<H: Handler>(handler: &H, state: &mut HttpState, message: &[u8], head: &Head, output: &mut List<u8>) -> Answer
+! OutOfMemoryError ? &mut Allocator {
+  let request = Request {
+    head: message,
+    methodLength: head.methodLength,
+    targetStart: head.targetStart,
+    targetLength: head.targetLength,
+    pathLength: head.pathLength,
+    minorVersion: head.minorVersion,
+    fields: List.asSlice(&state.fields),
+    bodyBytes: Slice.view<u8>(message, head.headLength, head.bodyLength),
+  }
+  let mark = List.length(&output.*)
+  List.clear(&mut state.responseFields)
+  let mut response = Response {
+    output: &mut output.*,
+    fields: &mut state.responseFields,
+    date: &state.date,
+    statusCode: 200,
+    sent: false,
+    close: head.close,
+    omitBody: head.isHead,
+  }
+  let outcome = run Effect.result(Handler.handle(handler, &request, &mut response))
+  return match move outcome {
+    Result.Success { value } => {
+      drop value
+      if !response.sent { run Response.send(&mut response, b"") }
+      if response.close { Answer.Close } else { Answer.KeepOpen }
+    }
+    Result.Failure { error } => {
+      drop error
+      List.truncate(&mut response.output.*, mark)
+      Answer.Failed
+    }
+  }
+}
+
+impl<H: Transferable> Transferable for HttpProtocol<H> {}
+impl<H: Concurrent> Concurrent for HttpProtocol<H> {}
+
+effect fn writeError(state: &mut HttpState, output: &mut List<u8>, status: u16) -> () ! OutOfMemoryError ? &mut Allocator {
+  refreshDate(&mut state.*)
+  run List.appendBytes(&mut output.*, b"HTTP/1.1 ")
+  run appendStatusLine(&mut output.*, status)
+  run List.appendBytes(&mut output.*, &state.date)
+  run List.appendBytes(&mut output.*, b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+  return ()
+}
+
+// The facts of one complete request.
+struct Head {
+  headLength: usize,
+  methodLength: usize,
+  targetStart: usize,
+  targetLength: usize,
+  pathLength: usize,
+  minorVersion: u8,
+  bodyLength: usize,
+  bodyWireLength: usize,
+  chunked: bool,
+  close: bool,
+  isHead: bool,
+}
+
+impl Copy for Head {}
+
+union Parsed {
+  Incomplete { expectsContinue: bool },
+  Invalid { status: u16 },
+  Complete { head: Head },
+}
+
+impl Copy for Parsed {}
+
+// Parses one request at the start of `input`. It records the header fields in `fields`.
+effect fn parseRequest(input: &[u8], options: &ServerOptions, fields: &mut List<FieldSpan>) -> Parsed
+! OutOfMemoryError ? &mut Allocator {
+  let length = input.length
+  let headLimit = if length < options.maxHeadBytes { length } else { options.maxHeadBytes }
+  // Find the end of the head first: one fast scan for CR LF CR LF.
+  let mut end: usize = 0
+  let mut found = false
+  let mut at: usize = 0
+  while at + 3 < headLimit {
+    let byte = input[at + 3]
+    if byte != 10 {
+      let step: usize = if byte == 13 { 1 } else { 4 }
+      at = at + step
+      continue
+    }
+    if input[at] == 13 && input[at + 1] == 10 && input[at + 2] == 13 {
+      end = at + 4
+      found = true
+      break
+    }
+    at = at + 1
+  }
+  if !found {
+    if length >= options.maxHeadBytes { return Parsed.Invalid { status: 431 } }
+    return Parsed.Incomplete { expectsContinue: false }
+  }
+  // The request line: method SP target SP HTTP/1.x CRLF.
+  let mut cursor: usize = 0
+  while cursor < end && isTokenByte(input[cursor]) { cursor = cursor + 1 }
+  if cursor == 0 || input[cursor] != 32 { return Parsed.Invalid { status: 400 } }
+  let methodLength = cursor
+  cursor = cursor + 1
+  let targetStart = cursor
+  let mut pathLength: usize = 0
+  let mut sawQuery = false
+  while cursor < end {
+    let byte = input[cursor]
+    if byte <= 32 || byte >= 127 { break }
+    if byte == 63 && !sawQuery {
+      sawQuery = true
+      pathLength = cursor - targetStart
+    }
+    cursor = cursor + 1
+  }
+  let targetLength = cursor - targetStart
+  if targetLength == 0 || input[cursor] != 32 { return Parsed.Invalid { status: 400 } }
+  if !sawQuery { pathLength = targetLength }
+  cursor = cursor + 1
+  if cursor + 10 > end { return Parsed.Invalid { status: 400 } }
+  if input[cursor] != 72 || input[cursor + 1] != 84 || input[cursor + 2] != 84 || input[cursor + 3] != 80
+    || input[cursor + 4] != 47 {
+    return Parsed.Invalid { status: 400 }
+  }
+  let major = input[cursor + 5]
+  let minor = input[cursor + 7]
+  if input[cursor + 6] != 46 || major < 48 || major > 57 || minor < 48 || minor > 57 {
+    return Parsed.Invalid { status: 400 }
+  }
+  if major != 49 || minor > 49 { return Parsed.Invalid { status: 505 } }
+  if input[cursor + 8] != 13 || input[cursor + 9] != 10 { return Parsed.Invalid { status: 400 } }
+  cursor = cursor + 10
+  let minorVersion = minor - 48
+  // The header fields.
+  let mut contentLength: u64 = 0
+  let mut hasLength = false
+  let mut chunked = false
+  let mut hasCoding = false
+  let mut closeRequested = minorVersion == 0
+  let mut expectsContinue = false
+  while cursor + 2 <= end {
+    if input[cursor] == 13 {
+      cursor = cursor + 2
+      break
+    }
+    let nameStart = cursor
+    while isTokenByte(input[cursor]) { cursor = cursor + 1 }
+    let nameLength = cursor - nameStart
+    if nameLength == 0 || input[cursor] != 58 { return Parsed.Invalid { status: 400 } }
+    cursor = cursor + 1
+    while input[cursor] == 32 || input[cursor] == 9 { cursor = cursor + 1 }
+    let valueStart = cursor
+    while true {
+      let byte = input[cursor]
+      if byte == 13 { break }
+      if (byte < 32 && byte != 9) || byte == 127 { return Parsed.Invalid { status: 400 } }
+      cursor = cursor + 1
+    }
+    if input[cursor + 1] != 10 { return Parsed.Invalid { status: 400 } }
+    let mut valueEnd = cursor
+    while valueEnd > valueStart && (input[valueEnd - 1] == 32 || input[valueEnd - 1] == 9) {
+      valueEnd = valueEnd - 1
+    }
+    cursor = cursor + 2
+    if List.length(&fields.*) >= options.maxHeaderFields { return Parsed.Invalid { status: 431 } }
+    let field = FieldSpan {
+      nameStart: nameStart,
+      nameLength: nameLength,
+      valueStart: valueStart,
+      valueLength: valueEnd - valueStart,
+    }
+    run List.append(&mut fields.*, field)
+    let name = Slice.view<u8>(input, nameStart, nameLength)
+    let value = Slice.view<u8>(input, valueStart, valueEnd - valueStart)
+    let first = u8.bitOr(name[0], 32)
+    if first == 99 {
+      if nameLength == 14 && sameIgnoringCase(name, b"content-length") {
+        let parsedLength = parseDecimal(value)
+        match parsedLength {
+          Option.None => { return Parsed.Invalid { status: 400 } }
+          Option.Some { value: number } => {
+            if hasLength && number != contentLength { return Parsed.Invalid { status: 400 } }
+            hasLength = true
+            contentLength = number
+          }
+        }
+      } else if nameLength == 10 && sameIgnoringCase(name, b"connection") {
+        if containsToken(value, b"close") { closeRequested = true }
+        else if containsToken(value, b"keep-alive") { closeRequested = false }
+      }
+    } else if first == 116 {
+      if nameLength == 17 && sameIgnoringCase(name, b"transfer-encoding") {
+        hasCoding = true
+        if !endsWithChunked(value) { return Parsed.Invalid { status: 501 } }
+        chunked = true
+      }
+    } else if first == 101 {
+      if nameLength == 6 && sameIgnoringCase(name, b"expect") {
+        if value.length == 12 && sameIgnoringCase(value, b"100-continue") { expectsContinue = true }
+      }
+    }
+  }
+  if hasCoding && (hasLength || minorVersion == 0) { return Parsed.Invalid { status: 400 } }
+  let headLength = end
+  let isHead = methodLength == 4 && input[0] == 72 && input[1] == 69 && input[2] == 65 && input[3] == 68
+  if chunked {
+    let scanned = scanChunked(Slice.view<u8>(input, end, length - end), options.maxBodyBytes)
+    return match scanned {
+      Chunked.Incomplete => Parsed.Incomplete { expectsContinue: expectsContinue }
+      Chunked.Invalid { status } => Parsed.Invalid { status: status }
+      Chunked.Complete { wireLength, payloadLength } => Parsed.Complete {
+        head: Head {
+          headLength: headLength,
+          methodLength: methodLength,
+          targetStart: targetStart,
+          targetLength: targetLength,
+          pathLength: pathLength,
+          minorVersion: minorVersion,
+          bodyLength: payloadLength,
+          bodyWireLength: wireLength,
+          chunked: true,
+          close: closeRequested,
+          isHead: isHead,
+        },
+      }
+    }
+  }
+  if contentLength > usize.toU64(options.maxBodyBytes) { return Parsed.Invalid { status: 413 } }
+  let bodyLength = u64.toUsize(contentLength)
+  if length - end < bodyLength { return Parsed.Incomplete { expectsContinue: expectsContinue } }
+  return Parsed.Complete {
+    head: Head {
+      headLength: headLength,
+      methodLength: methodLength,
+      targetStart: targetStart,
+      targetLength: targetLength,
+      pathLength: pathLength,
+      minorVersion: minorVersion,
+      bodyLength: bodyLength,
+      bodyWireLength: bodyLength,
+      chunked: false,
+      close: closeRequested,
+      isHead: isHead,
+    },
+  }
+}
+
+union Chunked {
+  Incomplete,
+  Invalid { status: u16 },
+  Complete { wireLength: usize, payloadLength: usize },
+}
+
+impl Copy for Chunked {}
+
+// Checks a complete chunked body at the start of `input`, with its trailer section.
+fn scanChunked(input: &[u8], maxPayload: usize) -> Chunked {
+  let mut cursor: usize = 0
+  let mut payload: usize = 0
+  while true {
+    let mut size: usize = 0
+    let mut digits: usize = 0
+    while cursor < input.length {
+      let digit = hexValue(input[cursor])
+      if digit > 15 { break }
+      if digits >= 15 { return Chunked.Invalid { status: 413 } }
+      size = size * 16 + u8.toUsize(digit)
+      digits = digits + 1
+      cursor = cursor + 1
+    }
+    if cursor >= input.length { return Chunked.Incomplete }
+    if digits == 0 { return Chunked.Invalid { status: 400 } }
+    // Chunk extensions are skipped up to the line end.
+    while cursor < input.length && input[cursor] != 13 {
+      let byte = input[cursor]
+      if byte == 10 || (byte < 32 && byte != 9) { return Chunked.Invalid { status: 400 } }
+      cursor = cursor + 1
+    }
+    if cursor + 1 >= input.length { return Chunked.Incomplete }
+    if input[cursor + 1] != 10 { return Chunked.Invalid { status: 400 } }
+    cursor = cursor + 2
+    if size == 0 { break }
+    payload = payload + size
+    if payload > maxPayload { return Chunked.Invalid { status: 413 } }
+    if cursor + size + 2 > input.length { return Chunked.Incomplete }
+    cursor = cursor + size
+    if input[cursor] != 13 || input[cursor + 1] != 10 { return Chunked.Invalid { status: 400 } }
+    cursor = cursor + 2
+  }
+  // The trailer section: field lines up to an empty line.
+  while true {
+    let lineStart = cursor
+    while cursor < input.length && input[cursor] != 13 {
+      if input[cursor] == 10 { return Chunked.Invalid { status: 400 } }
+      cursor = cursor + 1
+    }
+    if cursor + 1 >= input.length { return Chunked.Incomplete }
+    if input[cursor + 1] != 10 { return Chunked.Invalid { status: 400 } }
+    cursor = cursor + 2
+    if cursor - 2 == lineStart { break }
+  }
+  return Chunked.Complete { wireLength: cursor, payloadLength: payload }
+}
+
+// Moves the chunk payloads of a checked chunked body to its start.
+fn decodeChunked(region: &mut [u8]) -> () {
+  let mut read: usize = 0
+  let mut write: usize = 0
+  while true {
+    let mut size: usize = 0
+    while true {
+      let digit = hexValue(region[read])
+      if digit > 15 { break }
+      size = size * 16 + u8.toUsize(digit)
+      read = read + 1
+    }
+    while region[read] != 13 { read = read + 1 }
+    read = read + 2
+    if size == 0 { break }
+    let mut copied: usize = 0
+    while copied < size {
+      region[write + copied] = region[read + copied]
+      copied = copied + 1
+    }
+    write = write + size
+    read = read + size + 2
+  }
+  return ()
+}
+
+fn hexValue(byte: u8) -> u8 {
+  if byte >= 48 && byte <= 57 { return byte - 48 }
+  if byte >= 97 && byte <= 102 { return byte - 87 }
+  if byte >= 65 && byte <= 70 { return byte - 55 }
+  return 255
+}
+
+fn parseDecimal(value: &[u8]) -> Option<u64> {
+  if value.length == 0 || value.length > 18 { return Option<u64>.none() }
+  let mut total: u64 = 0
+  let mut index: usize = 0
+  while index < value.length {
+    let byte = value[index]
+    if byte < 48 || byte > 57 { return Option<u64>.none() }
+    total = total * 10 + u8.toU64(byte - 48)
+    index = index + 1
+  }
+  return Option<u64>.some(total)
+}
+
+// Whether the comma-separated list `value` holds `token`, compared without case.
+fn containsToken(value: &[u8], token: &[u8]) -> bool {
+  let mut at: usize = 0
+  while at < value.length {
+    while at < value.length && (value[at] == 32 || value[at] == 9 || value[at] == 44) { at = at + 1 }
+    let start = at
+    while at < value.length && value[at] != 44 { at = at + 1 }
+    let mut stop = at
+    while stop > start && (value[stop - 1] == 32 || value[stop - 1] == 9) { stop = stop - 1 }
+    if stop - start == token.length && sameIgnoringCase(Slice.view<u8>(value, start, stop - start), token) {
+      return true
+    }
+  }
+  return false
+}
+
+// Whether the last transfer coding of `value` is `chunked`, and every coding is `chunked`.
+fn endsWithChunked(value: &[u8]) -> bool {
+  let mut at: usize = 0
+  let mut any = false
+  while at < value.length {
+    while at < value.length && (value[at] == 32 || value[at] == 9 || value[at] == 44) { at = at + 1 }
+    if at >= value.length { break }
+    let start = at
+    while at < value.length && value[at] != 44 { at = at + 1 }
+    let mut stop = at
+    while stop > start && (value[stop - 1] == 32 || value[stop - 1] == 9) { stop = stop - 1 }
+    if stop - start != 7 || !sameIgnoringCase(Slice.view<u8>(value, start, 7), b"chunked") { return false }
+    any = true
+  }
+  return any
+}
+
+fn sameIgnoringCase(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut index: usize = 0
+  while index < left.length {
+    let a = left[index]
+    let b = right[index]
+    if a != b {
+      let lowerA = if a >= 65 && a <= 90 { a + 32 } else { a }
+      let lowerB = if b >= 65 && b <= 90 { b + 32 } else { b }
+      if lowerA != lowerB { return false }
+    }
+    index = index + 1
+  }
+  return true
+}
+
+fn bytesEqual(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut index: usize = 0
+  while index < left.length {
+    if left[index] != right[index] { return false }
+    index = index + 1
+  }
+  return true
+}
+
+// tchar of RFC 9110: ALPHA, DIGIT and !#$%&'*+-.^_`|~
+fn isTokenByte(byte: u8) -> bool {
+  if byte >= 97 && byte <= 122 { return true }
+  if byte >= 65 && byte <= 90 { return true }
+  if byte >= 48 && byte <= 57 { return true }
+  return byte == 33 || byte == 35 || byte == 36 || byte == 37 || byte == 38 || byte == 39 || byte == 42
+    || byte == 43 || byte == 45 || byte == 46 || byte == 94 || byte == 95 || byte == 96 || byte == 124
+    || byte == 126
+}
+
+fn isToken(value: &[u8]) -> bool {
+  if value.length == 0 { return false }
+  let mut index: usize = 0
+  while index < value.length {
+    if !isTokenByte(value[index]) { return false }
+    index = index + 1
+  }
+  return true
+}
+
+fn isFieldValue(value: &[u8]) -> bool {
+  let mut index: usize = 0
+  while index < value.length {
+    let byte = value[index]
+    if byte == 13 || byte == 10 || byte == 0 { return false }
+    index = index + 1
+  }
+  return true
+}
+
+fn isReserved(name: &[u8]) -> bool {
+  return sameIgnoringCase(name, b"content-length") || sameIgnoringCase(name, b"transfer-encoding")
+    || sameIgnoringCase(name, b"connection") || sameIgnoringCase(name, b"date")
+}
+
+effect fn appendDecimal(output: &mut List<u8>, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut digits: [u8; 20] = [0; 20]
+  let mut count: usize = 0
+  let mut rest = value
+  while true {
+    digits[19 - count] = u64.toU8(rest % 10) + 48
+    count = count + 1
+    rest = rest / 10
+    if rest == 0 { break }
+  }
+  run List.appendBytes(&mut output.*, Slice.view<u8>(&digits, 20 - count, count))
+  return ()
+}
+
+// Appends `code reason\r\n`.
+effect fn appendStatusLine(output: &mut List<u8>, code: u16) -> () ! OutOfMemoryError ? &mut Allocator {
+  let line: string = match code {
+    200 => "200 OK\r\n"
+    201 => "201 Created\r\n"
+    202 => "202 Accepted\r\n"
+    204 => "204 No Content\r\n"
+    206 => "206 Partial Content\r\n"
+    301 => "301 Moved Permanently\r\n"
+    302 => "302 Found\r\n"
+    303 => "303 See Other\r\n"
+    304 => "304 Not Modified\r\n"
+    307 => "307 Temporary Redirect\r\n"
+    308 => "308 Permanent Redirect\r\n"
+    400 => "400 Bad Request\r\n"
+    401 => "401 Unauthorized\r\n"
+    403 => "403 Forbidden\r\n"
+    404 => "404 Not Found\r\n"
+    405 => "405 Method Not Allowed\r\n"
+    408 => "408 Request Timeout\r\n"
+    409 => "409 Conflict\r\n"
+    410 => "410 Gone\r\n"
+    413 => "413 Content Too Large\r\n"
+    414 => "414 URI Too Long\r\n"
+    415 => "415 Unsupported Media Type\r\n"
+    422 => "422 Unprocessable Content\r\n"
+    429 => "429 Too Many Requests\r\n"
+    431 => "431 Request Header Fields Too Large\r\n"
+    500 => "500 Internal Server Error\r\n"
+    501 => "501 Not Implemented\r\n"
+    502 => "502 Bad Gateway\r\n"
+    503 => "503 Service Unavailable\r\n"
+    504 => "504 Gateway Timeout\r\n"
+    505 => "505 HTTP Version Not Supported\r\n"
+    _ => ""
+  }
+  if String.byteLength(line) > 0 {
+    run List.appendBytes(&mut output.*, String.utf8Bytes(line))
+    return ()
+  }
+  run appendDecimal(&mut output.*, u16.toU64(code))
+  run List.appendBytes(&mut output.*, b" \r\n")
+  return ()
+}
+
+static if Intrinsic.targetOperatingSystem() == "windows" {
+  fn currentSecond() -> i64 { return 0 }
+} else {
+  @foreign(noCapture: .("seconds"))
+  unsafe extern "C" fn time(seconds: ?*mut i64) -> i64
+  fn currentSecond() -> i64 { return unsafe time(Pointer.null<i64>()) }
+}
+
+// Rewrites the cached `Date: ...\r\n` field when the second changed.
+fn refreshDate(state: &mut HttpState) -> () {
+  let now = currentSecond()
+  if now == state.dateSecond { return () }
+  state.dateSecond = now
+  formatDate(now, &mut state.date)
+  return ()
+}
+
+// Writes `Date: Sun, 06 Nov 1994 08:49:37 GMT\r\n` (37 bytes) for the Unix time `seconds`.
+fn formatDate(seconds: i64, output: &mut [u8; 37]) -> () {
+  let days = seconds / 86400
+  let ofDay = seconds - days * 86400
+  // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+  let shifted = days + 719468
+  let era = (if shifted >= 0 { shifted } else { shifted - 146096 }) / 146097
+  let dayOfEra = shifted - era * 146097
+  let yearOfEra = (dayOfEra - dayOfEra / 1460 + dayOfEra / 36524 - dayOfEra / 146096) / 365
+  let dayOfYear = dayOfEra - (365 * yearOfEra + yearOfEra / 4 - yearOfEra / 100)
+  let monthIndex = (5 * dayOfYear + 2) / 153
+  let day = dayOfYear - (153 * monthIndex + 2) / 5 + 1
+  let month = if monthIndex < 10 { monthIndex + 3 } else { monthIndex - 9 }
+  let carry: i64 = if month <= 2 { 1 } else { 0 }
+  let year = yearOfEra + era * 400 + carry
+  let weekday = (days % 7 + 11) % 7
+  let names = String.utf8Bytes("SunMonTueWedThuFriSat")
+  let months = String.utf8Bytes("JanFebMarAprMayJunJulAugSepOctNovDec")
+  let prefix = String.utf8Bytes("Date: ")
+  let mut index: usize = 0
+  while index < 6 { output[index] = prefix[index] index = index + 1 }
+  let w = i64.toUsize(weekday) * 3
+  output[6] = names[w]
+  output[7] = names[w + 1]
+  output[8] = names[w + 2]
+  output[9] = 44
+  output[10] = 32
+  output[11] = digit(day / 10)
+  output[12] = digit(day % 10)
+  output[13] = 32
+  let m = (i64.toUsize(month) - 1) * 3
+  output[14] = months[m]
+  output[15] = months[m + 1]
+  output[16] = months[m + 2]
+  output[17] = 32
+  output[18] = digit(year / 1000 % 10)
+  output[19] = digit(year / 100 % 10)
+  output[20] = digit(year / 10 % 10)
+  output[21] = digit(year % 10)
+  output[22] = 32
+  let hour = ofDay / 3600
+  let minute = ofDay / 60 % 60
+  let second = ofDay % 60
+  output[23] = digit(hour / 10)
+  output[24] = digit(hour % 10)
+  output[25] = 58
+  output[26] = digit(minute / 10)
+  output[27] = digit(minute % 10)
+  output[28] = 58
+  output[29] = digit(second / 10)
+  output[30] = digit(second % 10)
+  output[31] = 32
+  output[32] = 71
+  output[33] = 77
+  output[34] = 84
+  output[35] = 13
+  output[36] = 10
+  return ()
+}
+
+fn digit(value: i64) -> u8 { return i64.toU8(value) + 48 }
