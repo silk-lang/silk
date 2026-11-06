@@ -3614,7 +3614,7 @@ const program = Effect.gen(function* () {
     assert.match(official.stdout, /^post-init ready \d+\.\d+\.\d+\S* --dark two words\nInitialized Silk project app at \S+app from template silk-lang\/examples\/ui \(([0-9a-f]{40})\)\n$/)
     assert.equal(official.stdout.includes(commit), true, official.stdout)
     const manifest = yield* fs.readFileString(join(work, 'app/silk.toml'))
-    assert.match(manifest, /^\[package\]\nname = "app"\nversion = "0\.1\.0"\nsilk-version = "[^"]+"\ndescription = "A window"\n$/)
+    assert.match(manifest, /^\[package\]\nname = "app"\nversion = "0\.1\.0"\nsilk-version = "[^"]+"\n$/)
     assert.equal(manifest.includes('0.0.1'), false, manifest)
     assert.equal(yield* fs.readFileString(join(work, 'app/.gitignore')), '/build/\n')
     assert.equal(yield* fs.exists(join(work, 'app/scripts/post-init.sh')), false)

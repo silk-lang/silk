@@ -431,7 +431,7 @@ The template's directory must hold a `silk.toml` with a `[package]` or a `[works
 Every file in it is written to the project directory, keeping executable bits and symbolic links;
 a file that already exists there refuses the whole template before anything is written. For a
 package, the new manifest gets the package name (`--name`, or else the directory's name) and this
-compiler's release as `silk-version`, and a package outside a workspace gets `/build/` in its
+compiler's release as `silk-version` and loses the template's `description`, and a package outside a workspace gets `/build/` in its
 `.gitignore`. A package created inside a workspace becomes one of its members, as `silk init`
 makes it. A workspace template takes no `--name`, and only a `silk-version` it pins is updated.
 `--template` cannot be combined with `--lib` or `--workspace`.
