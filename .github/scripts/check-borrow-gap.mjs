@@ -27,8 +27,9 @@
 //
 // The baseline has one physical line per program, `<name> <reason>=<count> ...` (a bare name when
 // nothing is unchecked), one `carried <program>` line per carried invalid program, plus one
-// `retired <reason> ...` line. Lines are self-contained and their order is irrelevant, so git
-// merges concurrent edits with `merge=union`; totals are computed, never stored. Two lines for one
+// `retired <reason> ...` line. Lines are self-contained, so git merges concurrent edits with
+// `merge=union`. Program lines must stay in name order, as `update` writes them: two branches that
+// add the same program then add it at the same place, and the merge keeps one copy; totals are computed, never stored. Two lines for one
 // program mean two branches changed it, and fail until `update` reruns on the merged tree.
 //
 // A retired reason must be zero everywhere: in every mode that reads receipts, any body unchecked
@@ -47,11 +48,13 @@ const notices = []
 const print = (line) => process.stdout.write(`${line}\n`)
 const byText = (left, right) => Number(left > right) - Number(left < right)
 
-// A baseline file's retired reasons and per-program counts. Repeated program lines are failures.
+// A baseline file's retired reasons and per-program counts. Repeated program lines, and program
+// lines out of name order (a hand edit), are failures.
 const parseBaseline = (text, where) => {
   const retired = new Set()
   const carried = new Set()
   const programs = new Map()
+  let previous = ''
   for (const [index, raw] of text.split('\n').entries()) {
     const line = raw.trim()
     if (line === '' || line.startsWith('#')) continue
@@ -72,6 +75,11 @@ const parseBaseline = (text, where) => {
       if (match === null) throw new Error(`${where}:${index + 1}: malformed field ${field}`)
       reasons[match[1]] = Number(match[2])
     }
+    if (byText(name, previous) < 0)
+      failures.push(
+        `${where}:${index + 1}: ${name} comes after ${previous}; lines are in name order so that two branches adding one line merge into one, so ${updateHint}`,
+      )
+    previous = name
     if (programs.has(name))
       failures.push(
         `${where}: ${name} has more than one line, so two changes to it were merged; keep the right one, or ${updateHint}`,
@@ -328,6 +336,10 @@ if (mode === 'corpus') {
     notices: 0,
   })
   expect('repeated line', outcome(`${baselineText}beta\n`, agreeing), { failures: 1, notices: 0 })
+  expect('line out of order', outcome('retired patterns\nbeta\nalpha awaiting=2\n', agreeing), {
+    failures: 1,
+    notices: 0,
+  })
   expect('retired reason', outcome(baselineText, { ...agreeing, beta: { patterns: 1 } }), {
     failures: 2,
     notices: 0,
