@@ -37,9 +37,17 @@
 //! anchors for the `ClientAuth` purpose. [`Server.clientCertificateStatus`] and
 //! [`Server.clientCertificates`] tell you the result.
 //!
+//! With [`TicketPolicy`] `Issue`, the server sends NewSessionTicket messages after the client's
+//! Finished, when the client offered `psk_dhe_ke`. Each ticket holds the session state sealed with
+//! AES-256-GCM under your [`TicketKey`], so the server keeps no session cache. A ClientHello that
+//! offers a valid ticket resumes: the server checks the binder, sends no certificate messages, and
+//! [`Server.resumed`] returns `true`. A ticket from a handshake whose client certificate the
+//! current [`ClientAuth`] would refuse gives a full handshake instead.
+//!
 //! # Gotchas
-//! The server does not support PSK, session tickets, or 0-RTT data. A client that sends early data
-//! fails with `BadRecordMac`. It does not ask for `ed25519` client signatures, because the
+//! The server resumes only sessions from its own tickets, and only with (EC)DHE. It does not
+//! accept 0-RTT data: a client that sends early data fails with `BadRecordMac`. The ticket checks
+//! use the [`TicketPolicy`] `now`, so make a server with the current time. It does not ask for `ed25519` client signatures, because the
 //! certificate profile admits no Ed25519 client keys. The server sends no alert when it fails, so
 //! close the transport. Dropping the server does not send `close_notify`.
 //! Call [`Server.closeWrite`] first. Secrets are not erased.
@@ -62,6 +70,7 @@
 //!   ServerConfig,
 //!   ServerError,
 //!   ServerLimits,
+//!   TicketPolicy,
 //! }
 //! import silk.collections.slice { Slice }
 //! import silk.num.usize
@@ -94,6 +103,7 @@
 //!     alpn: AlpnConfig.defaults(),
 //!     groups: GroupPolicy.defaults(),
 //!     clientAuth: ClientAuth<'static>.Off,
+//!     tickets: TicketPolicy<'static>.Off,
 //!     limits: ServerLimits.defaults(),
 //!   }
 //!   let made = run Server.make(&config, SigningKey.EcdsaP256 { key: move key })
@@ -125,6 +135,8 @@ import silk.system.system_clock { Instant, SystemClock }
 import silk.collections.list { List }
 import silk.tls.client { AlpnConfig }
 import silk.text.format { Debug, Format, Formatter }
+import silk.crypto.aes_gcm { AesGcm, AesGcmError }
+import silk.crypto.digest { Digest }
 import silk.crypto.hkdf { HkdfSha256, HkdfSha384 }
 import silk.crypto.hmac { HmacSha256, HmacSha384 }
 import silk.mem.layout { Layout }
@@ -148,6 +160,7 @@ import silk.tls.record {
   TlsRecordReceiver,
   TlsRecordSender,
 }
+import silk.num.i64
 import silk.num.u8
 import silk.num.usize
 import silk.io.writer { Writer, WriterError }
@@ -168,6 +181,19 @@ const SERVER_NAME_LIMIT: usize = 255
 const SCRATCH_LENGTH: usize = 512
 
 const FLIGHT_OVERHEAD: usize = 1536
+
+const TICKET_LIFETIME_LIMIT: usize = 604800
+
+const TICKET_COUNT_LIMIT: usize = 4
+
+// A sealed ticket: the 16-byte key name, a 12-byte nonce, the encrypted state, and a 16-byte tag.
+const TICKET_STATE_LENGTH: usize = 138
+
+const TICKET_LENGTH: usize = 16 + 12 + TICKET_STATE_LENGTH + 16
+
+// A NewSessionTicket message: header, lifetime, age_add, a one-byte nonce, the ticket, and empty
+// extensions.
+const TICKET_MESSAGE_LENGTH: usize = 4 + 4 + 4 + 2 + 2 + TICKET_LENGTH + 2
 
 
 /// A key exchange group that the server can select.
@@ -277,9 +303,68 @@ pub struct ServerConfig<'a> {
   pub groups: GroupPolicy,
   /// Whether the server asks for a client certificate, and how it checks one.
   pub clientAuth: ClientAuth<'a>,
+  /// Whether the server issues session tickets and resumes sessions from them.
+  pub tickets: TicketPolicy<'a>,
   /// Finite connection limits.
   pub limits: ServerLimits,
 }
+
+/// The key that seals and opens session tickets, in [`TicketPolicy`].
+///
+/// # Details
+/// The 48 bytes are a 16-byte key name, which the server puts at the start of each ticket, and a
+/// 32-byte AES-256-GCM key. Servers that share a key resume each other's sessions.
+///
+/// # Gotchas
+/// Anyone with the key can decrypt the session secrets of every ticket that it sealed. Make it
+/// with random bytes, keep it secret, and replace it often.
+pub struct TicketKey {
+  name: [u8; 16],
+  key: [u8; 32],
+}
+
+impl Copy for TicketKey {}
+
+impl TicketKey {
+  /// Returns the key with the name `bytes[0..16]` and the AES-256-GCM key `bytes[16..48]`.
+  pub fn make(bytes: &[u8; 48]) -> TicketKey {
+    let mut name: [u8; 16] = [0; 16]
+    let mut key: [u8; 32] = [0; 32]
+    let mut index = usize.ZERO
+    while index < 16 {
+      name[index] = bytes[index]
+      index = index + usize.ONE
+    }
+    index = 0
+    while index < 32 {
+      key[index] = bytes[16 + index]
+      index = index + usize.ONE
+    }
+    return TicketKey { name: name, key: key }
+  }
+}
+
+/// Whether a [`Server`] issues session tickets, in [`ServerConfig.tickets`].
+pub union TicketPolicy<'a> {
+  /// The server issues no tickets and does full handshakes only.
+  Off,
+  /// After the client's Finished, the server sends `count` NewSessionTicket messages sealed with
+  /// `key`. A later ClientHello that offers one of them resumes the session without certificates,
+  /// when the ticket is younger than `lifetime` at `now`, has the same server name, and has the
+  /// same cipher suite hash.
+  Issue {
+    /// The key that seals and opens tickets.
+    pub key: &'a TicketKey,
+    /// The current time, which dates new tickets and checks the age of offered ones.
+    pub now: &'a Instant,
+    /// The ticket lifetime in seconds, from 1 to 604800.
+    pub lifetime: usize,
+    /// The number of tickets to send after each handshake, from 1 to 4.
+    pub count: usize,
+  },
+}
+
+impl<'a> Copy for TicketPolicy<'a> {}
 
 /// Whether a [`Server`] asks the client for a certificate, in [`ServerConfig.clientAuth`].
 pub union ClientAuth<'a> {
@@ -319,6 +404,12 @@ pub union ClientCertificateStatus {
     /// Why the chain did not validate.
     pub error: ValidationError,
   },
+  /// The connection resumed a session in which the client presented a certificate. The client
+  /// sends no certificate on resumption, so [`Server.clientCertificates`] is empty.
+  Resumed {
+    /// Whether the chain validated in the original handshake.
+    pub trusted: bool,
+  },
 }
 
 impl Debug for ClientCertificateStatus {
@@ -334,6 +425,11 @@ impl Debug for ClientCertificateStatus {
       ClientCertificateStatus.Untrusted { error } => {
         let mut record = run Format.debugRecord("Untrusted", &mut formatter)
         run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      ClientCertificateStatus.Resumed { trusted } => {
+        let mut record = run Format.debugRecord("Resumed", &mut formatter)
+        run Format.debugField(&mut record, "trusted", &trusted, &mut formatter)
         return run Format.debugFinish(record, &mut formatter)
       }
     }
@@ -581,6 +677,11 @@ pub union ServerError {
   },
   /// The client's Finished did not authenticate the transcript.
   Finished,
+  /// The client's PSK binder did not authenticate the ClientHello for a ticket that the server
+  /// sealed.
+  Binder,
+  /// [`TicketPolicy`] `Issue` has a lifetime or count out of range.
+  InvalidTicketPolicy,
   /// A finite resource budget was exceeded.
   LimitExceeded {
     /// The exhausted resource category.
@@ -663,6 +764,8 @@ impl Debug for ServerError {
         return run Format.debugFinish(record, &mut formatter)
       }
       ServerError.Finished => run Format.write(&mut formatter, b"Finished")
+      ServerError.Binder => run Format.write(&mut formatter, b"Binder")
+      ServerError.InvalidTicketPolicy => run Format.write(&mut formatter, b"InvalidTicketPolicy")
       ServerError.LimitExceeded { kind, limit } => {
         let mut record = run Format.debugRecord("LimitExceeded", &mut formatter)
         run Format.debugField(&mut record, "kind", &kind, &mut formatter)
@@ -731,6 +834,7 @@ enum PendingKind {
   Application,
   KeyUpdate,
   CloseNotify,
+  Tickets,
 }
 
 struct ParsedClientHello {
@@ -755,6 +859,14 @@ struct ParsedClientHello {
   alpnOffset: usize,
   alpnLength: usize,
   hasAlpn: bool,
+  pskDheKe: bool,
+  hasPskModes: bool,
+  hasPsk: bool,
+  identityOffset: usize,
+  identityLength: usize,
+  bindersOffset: usize,
+  binderOffset: usize,
+  binderLength: usize,
 }
 
 struct Digest48 {
@@ -815,6 +927,17 @@ pub struct Server {
   clientValidationTime: Instant,
   clientChain: List<Certificate>,
   clientStatus: ClientCertificateStatus,
+  ticketsEnabled: bool,
+  ticketName: [u8; 16],
+  ticketKey: [u8; 32],
+  ticketNow: usize,
+  ticketNowValid: bool,
+  ticketLifetime: usize,
+  ticketCount: usize,
+  pskDheKe: bool,
+  pskAccepted: bool,
+  psk: [u8; 48],
+  ticketsPending: bool,
   sender: TlsRecordSender,
   receiver: TlsRecordReceiver,
   handshake: Intrinsic.RawBuffer<u8>,
@@ -902,6 +1025,10 @@ impl Server {
     }
     if let Option<ServerError>.Some { value: error } = validateAlpn(config.alpn) {
       return Result<Server, ServerError>.failResult(error)
+    }
+    let tickets = copyTickets(config.tickets)
+    if tickets.invalid {
+      return Result<Server, ServerError>.failResult(ServerError.InvalidTicketPolicy)
     }
 
     let leafBytes = certificates[0].bytes
@@ -998,6 +1125,17 @@ impl Server {
         clientValidationTime: move clientAuth.validationTime,
         clientChain: List<Certificate>.make(),
         clientStatus: move clientAuth.status,
+        ticketsEnabled: tickets.enabled,
+        ticketName: tickets.name,
+        ticketKey: tickets.key,
+        ticketNow: tickets.now,
+        ticketNowValid: tickets.nowValid,
+        ticketLifetime: tickets.lifetime,
+        ticketCount: tickets.count,
+        pskDheKe: false,
+        pskAccepted: false,
+        psk: zero48(),
+        ticketsPending: false,
         sender: move sender,
         receiver: move receiver,
         handshake: move handshake,
@@ -1084,6 +1222,12 @@ impl Server {
   /// Returns whether the server sent a HelloRetryRequest in this handshake.
   pub fn retried(self: &Self) -> bool {
     return self.helloRetried
+  }
+
+  /// Returns whether the handshake resumed a session from a ticket, after the server read the
+  /// ClientHello. A resumed handshake sends no certificates.
+  pub fn resumed(self: &Self) -> bool {
+    return self.pskAccepted
   }
 
   /// Returns what the server knows about the client's certificate. After `HandshakeComplete` it is
@@ -1470,6 +1614,47 @@ effect fn copyClientAuth<'a>(auth: ClientAuth<'a>, limits: SnapshotLimits) -> Re
   }
 }
 
+struct TicketsCopy {
+  enabled: bool,
+  invalid: bool,
+  name: [u8; 16],
+  key: [u8; 32],
+  now: usize,
+  nowValid: bool,
+  lifetime: usize,
+  count: usize,
+}
+
+fn copyTickets<'a>(policy: TicketPolicy<'a>) -> TicketsCopy {
+  let mut copy = TicketsCopy {
+    enabled: false,
+    invalid: false,
+    name: [0; 16],
+    key: [0; 32],
+    now: 0,
+    nowValid: false,
+    lifetime: 0,
+    count: 0,
+  }
+  if let TicketPolicy<'a>.Issue { key, now, lifetime, count } = policy {
+    if lifetime == 0 || lifetime > TICKET_LIFETIME_LIMIT || count == 0 || count > TICKET_COUNT_LIMIT {
+      copy.invalid = true
+      return move copy
+    }
+    let seconds = SystemClock.seconds(now)
+    copy.enabled = true
+    copy.name = key.name
+    copy.key = key.key
+    copy.lifetime = lifetime
+    copy.count = count
+    if seconds >= 0 && seconds < 4000000000000 {
+      copy.nowValid = true
+      copy.now = i64.toUsize(seconds) * 1000 + i64.toUsize(SystemClock.nanoseconds(now)) / 1000000
+    }
+  }
+  return move copy
+}
+
 fn limitFailure<T>(kind: ServerLimitKind, limit: usize) -> Result<T, ServerError> {
   return Result<T, ServerError>.failResult(ServerError.LimitExceeded { kind: kind, limit: limit })
 }
@@ -1776,7 +1961,7 @@ fn completePending(server: &mut Server) -> Result<(), ServerError> {
   }
   if kind == PendingKind.Flight {
     if server.flightOffset < server.flightLength {
-      return queueFlightChunk(&mut server.*)
+      return queueFlightChunk(&mut server.*, PendingKind.Flight)
     }
     let suite = server.selectedSuite
     let secret = server.serverTrafficSecret
@@ -1789,7 +1974,7 @@ fn completePending(server: &mut Server) -> Result<(), ServerError> {
     if let Result<(), ServerError>.Failure { error } = recordUnit(move replaced) {
       return failure(error)
     }
-    if server.clientAuthMode == ClientAuthMode.Off {
+    if server.clientAuthMode == ClientAuthMode.Off || server.pskAccepted {
       server.state = ServerState.AwaitClientFinished
     } else {
       server.state = ServerState.AwaitClientCertificate
@@ -1813,6 +1998,13 @@ fn completePending(server: &mut Server) -> Result<(), ServerError> {
   }
   if kind == PendingKind.CloseNotify {
     server.localClosed = true
+    return ok()
+  }
+  if kind == PendingKind.Tickets {
+    if server.flightOffset < server.flightLength {
+      return queueFlightChunk(&mut server.*, PendingKind.Tickets)
+    }
+    server.ticketsPending = false
     return ok()
   }
   return ok()
@@ -1841,15 +2033,15 @@ fn startFlight(server: &mut Server) -> Result<(), ServerError> {
   if let Result<(), ServerError>.Failure { error } = recordUnit(move replaced) {
     return failure(error)
   }
-  return queueFlightChunk(&mut server.*)
+  return queueFlightChunk(&mut server.*, PendingKind.Flight)
 }
 
-fn queueFlightChunk(server: &mut Server) -> Result<(), ServerError> {
+fn queueFlightChunk(server: &mut Server, kind: PendingKind) -> Result<(), ServerError> {
   let offset = server.flightOffset
   let remaining = server.flightLength - offset
 
   // `flightOffset < flightLength <= chainLength + FLIGHT_OVERHEAD`, the flight buffer's capacity,
-  // and `buildFlight` wrote every byte before `flightLength`.
+  // and `buildFlight` or `buildTickets` wrote every byte before `flightLength`.
   let chunk = unsafe RawBuffer.view<u8>(&server.flight, offset, remaining)
   let queued = TlsRecordSender.queueRecord(&mut server.sender, ContentType.Handshake, chunk)
   let accepted = match move queued {
@@ -1862,7 +2054,7 @@ fn queueFlightChunk(server: &mut Server) -> Result<(), ServerError> {
     return violation(ServerProtocolReason.InternalState)
   }
   server.flightOffset = offset + accepted
-  server.pendingKind = PendingKind.Flight
+  server.pendingKind = kind
   return ok()
 }
 
@@ -1870,6 +2062,9 @@ fn scheduleControl(server: &mut Server) -> Result<(), ServerError> {
   if server.state != ServerState.Traffic
     || TlsRecordSender.pendingOutput(&server.sender).length > 0 {
     return ok()
+  }
+  if server.ticketsPending {
+    return queueFlightChunk(&mut server.*, PendingKind.Tickets)
   }
   if TlsRecordSender.recordsRemaining(&server.sender) == 1 {
     server.pendingKeyUpdate = true
@@ -2137,7 +2332,7 @@ effect fn dispatchHandshake(
     return handleClientCertificateVerify(&mut server.*, messageLength)
   }
   if server.state == ServerState.AwaitClientFinished && messageType == 20 {
-    return handleClientFinished(&mut server.*, messageLength)
+    return run handleClientFinished(&mut server.*, messageLength)
   }
   if server.state == ServerState.Traffic && messageType == 24 {
     return handleKeyUpdate(&mut server.*, messageLength)
@@ -2283,6 +2478,9 @@ effect fn handleClientHello(server: &mut Server, messageLength: usize, retry: bo
       return failure(error)
     }
     let offset = shareOffset(&parsed, server.selectedGroup)
+    if let Result<(), ServerError>.Failure { error } = evaluatePsk(&mut server.*, &parsed) {
+      return failure(error)
+    }
     updateTranscriptHandshake(&mut server.*, messageLength)
     return run queueServerHello(&mut server.*, offset)
   }
@@ -2308,6 +2506,9 @@ effect fn handleClientHello(server: &mut Server, messageLength: usize, retry: bo
     if groupAllowed(policy, group) && shareOffset(&parsed, group) != 0 {
       server.selectedGroup = group
       let offset = shareOffset(&parsed, group)
+      if let Result<(), ServerError>.Failure { error } = evaluatePsk(&mut server.*, &parsed) {
+        return failure(error)
+      }
       updateTranscriptHandshake(&mut server.*, messageLength)
       return run queueServerHello(&mut server.*, offset)
     }
@@ -2323,6 +2524,166 @@ effect fn handleClientHello(server: &mut Server, messageLength: usize, retry: bo
     index = index + usize.ONE
   }
   return failure(ServerError.Negotiation { failure: NegotiationFailure.Group })
+}
+
+// Resumes the session of the first offered ticket when the server sealed it, it is still valid,
+// and it fits this connection. Any other offer gets a full handshake. A binder that does not
+// authenticate a ticket that the server sealed fails the handshake. Runs on the ClientHello that
+// gets the ServerHello, before the transcript includes it.
+fn evaluatePsk(server: &mut Server, parsed: &ParsedClientHello) -> Result<(), ServerError> {
+  server.pskDheKe = parsed.pskDheKe
+  server.pskAccepted = false
+  if !server.ticketsEnabled || !server.ticketNowValid || !parsed.hasPsk || !parsed.pskDheKe {
+    return ok()
+  }
+  if parsed.identityLength != TICKET_LENGTH {
+    return ok()
+  }
+  let start = parsed.identityOffset
+  let mut ticket: [u8; 182] = [0; 182]
+  let mut index = usize.ZERO
+  while index < TICKET_LENGTH {
+    ticket[index] = usize.toU8(readU8Raw(&server.handshake, start + index))
+    index = index + usize.ONE
+  }
+  let name = server.ticketName
+  if !sameBytes(Slice.view<u8>(&ticket, 0, 16), &name) {
+    return ok()
+  }
+  let mut state: [u8; 138] = [0; 138]
+  let key = server.ticketKey
+  let opened = AesGcm.open(
+    &key,
+    Slice.view<u8>(&ticket, 16, 12),
+    &name,
+    Slice.view<u8>(&ticket, 28, TICKET_STATE_LENGTH),
+    Slice.view<u8>(&ticket, 28 + TICKET_STATE_LENGTH, 16),
+    &mut state,
+  )
+  if let Result<(), AesGcmError>.Failure { error } = move opened {
+    drop error
+    return ok()
+  }
+  if state[0] != 1 {
+    return ok()
+  }
+  let suite = match suiteFromCode(u8.toUsize(state[1]) * 256 + u8.toUsize(state[2])) {
+    Option<CipherSuite>.Some { value } => value
+    Option<CipherSuite>.None => {
+      return ok()
+    }
+  }
+  let mut length: usize = 32
+  if suite == CipherSuite.Aes256GcmSha384 {
+    length = 48
+  }
+  if length != server.secretLength || parsed.binderLength != length {
+    return ok()
+  }
+  let issued = readStateNumber(&state, 51, 8)
+  let lifetime = readStateNumber(&state, 63, 4)
+  if server.ticketNow < issued || server.ticketNow - issued > lifetime * 1000 {
+    return ok()
+  }
+  let nameHash = serverNameDigest(&server.*)
+  if (state[68] == 1) != server.hasServerName
+    || !sameBytes(Slice.view<u8>(&state, 69, 32), &nameHash) {
+    return ok()
+  }
+  let kind = state[67]
+  let mut status = ClientCertificateStatus.NotRequested
+  if server.clientAuthMode != ClientAuthMode.Off {
+    if kind == 0 || (kind == 1 && server.clientAuthMode == ClientAuthMode.Required)
+      || (kind == 3 && server.rejectUntrusted) {
+      return ok()
+    }
+    if kind == 1 {
+      status = ClientCertificateStatus.Absent
+    } else {
+      status = ClientCertificateStatus.Resumed { trusted: kind == 2 }
+    }
+  }
+
+  let psk = fixed48(Slice.view<u8>(&state, 3, 48))
+  let zeros = zero48()
+  let early = extractBy(length, secretView(&zeros, length), secretView(&psk, length))
+  let emptyHash = emptyHashBy(length)
+  let binderKey = match deriveSecretBy(length, &early, b"res binder", &emptyHash) {
+    Result<[u8; 48], ServerError>.Failure { error } => {
+      return failure(error)
+    }
+    Result<[u8; 48], ServerError>.Success { value } => value
+  }
+
+  // `parsePreSharedKey` checked that the binders start inside the ClientHello in
+  // `handshake[0..handshakeLength]`.
+  let truncated = unsafe RawBuffer.view<u8>(&server.handshake, 0, parsed.bindersOffset)
+  let mut hash = zero48()
+  if length == 48 {
+    let mut transcript = server.transcript384.copy()
+    transcript.update(truncated)
+    hash = transcript.checkpoint()
+  } else {
+    let mut transcript = server.transcript256.copy()
+    transcript.update(truncated)
+    let digest = transcript.checkpoint()
+    hash = fixed48(&digest)
+  }
+  drop truncated
+  let expected = match finishedData(length, &binderKey, &hash) {
+    Result<[u8; 48], ServerError>.Failure { error } => {
+      return failure(error)
+    }
+    Result<[u8; 48], ServerError>.Success { value } => value
+  }
+  let supplied = unsafe RawBuffer.view<u8>(&server.handshake, parsed.binderOffset, length)
+  if !constantWorkEqual(supplied, secretView(&expected, length)) {
+    return failure(ServerError.Binder)
+  }
+  drop supplied
+  server.pskAccepted = true
+  server.psk = psk
+  server.clientStatus = move status
+  return ok()
+}
+
+fn readStateNumber(state: &[u8; 138], offset: usize, width: usize) -> usize {
+  let mut value = usize.ZERO
+  let mut index = usize.ZERO
+  while index < width {
+    value = value * 256 + u8.toUsize(state[offset + index])
+    index = index + usize.ONE
+  }
+  return value
+}
+
+// The SHA-256 digest of the lowercase SNI name, or of nothing without SNI.
+fn serverNameDigest(server: &Server) -> [u8; 32] {
+  let mut name: [u8; 255] = [0; 255]
+  let mut index = usize.ZERO
+  while index < server.serverNameLength {
+    let mut byte = usize.toU8(readU8Raw(&server.serverNameBuffer, index))
+    if byte >= 65 && byte <= 90 {
+      byte = byte + 32
+    }
+    name[index] = byte
+    index = index + usize.ONE
+  }
+  return Sha256.hash(Slice.view<u8>(&name, 0, server.serverNameLength))
+}
+
+// The SHA-256 digest of the selected ALPN protocol, or of nothing without one.
+fn alpnDigest(server: &Server) -> [u8; 32] {
+  if !server.hasSelectedAlpn {
+    let empty: [u8; 0] = []
+    return Sha256.hash(&empty)
+  }
+  let offset = server.alpnOffsets[server.selectedAlpnIndex]
+  let length = server.alpnLengths[server.selectedAlpnIndex]
+
+  // `copyAlpn` recorded this protocol's range within the ALPN buffer, and filled that range.
+  let protocol = unsafe RawBuffer.view<u8>(&server.alpn, offset, length)
+  return Sha256.hash(protocol)
 }
 
 fn sameSession(server: &Server, parsed: &ParsedClientHello) -> bool {
@@ -2431,6 +2792,14 @@ fn emptyParsed() -> ParsedClientHello {
     alpnOffset: 0,
     alpnLength: 0,
     hasAlpn: false,
+    pskDheKe: false,
+    hasPskModes: false,
+    hasPsk: false,
+    identityOffset: 0,
+    identityLength: 0,
+    bindersOffset: 0,
+    binderOffset: 0,
+    binderLength: 0,
   }
 }
 
@@ -2541,8 +2910,11 @@ fn parseClientHello(server: &Server, end: usize) -> Result<ParsedClientHello, Se
       valid = parseAlpn(buffer, cursor, length, &mut parsed)
     } else if kind == 44 {
       valid = false
+    } else if kind == 45 {
+      valid = parsePskModes(buffer, cursor, length, &mut parsed)
     } else if kind == 41 {
       sawPreSharedKey = true
+      valid = parsePreSharedKey(buffer, cursor, length, &mut parsed)
     }
     if !valid {
       return parseFailure(ServerProtocolReason.Extension)
@@ -2552,7 +2924,93 @@ fn parseClientHello(server: &Server, end: usize) -> Result<ParsedClientHello, Se
   if parsed.tls13 && !onlyNull {
     return parseFailure(ServerProtocolReason.ClientHello)
   }
+  if parsed.hasPsk && !parsed.hasPskModes {
+    return parseFailure(ServerProtocolReason.Extension)
+  }
   return Result<ParsedClientHello, ServerError>.succeed(move parsed)
+}
+
+fn parsePskModes(
+  buffer: &Intrinsic.RawBuffer<u8>,
+  start: usize,
+  length: usize,
+  parsed: &mut ParsedClientHello,
+) -> bool {
+  if length < 2 || readU8Raw(buffer, start) + usize.ONE != length {
+    return false
+  }
+  let mut cursor = start + usize.ONE
+  while cursor < start + length {
+    if readU8Raw(buffer, cursor) == 1 {
+      parsed.pskDheKe = true
+    }
+    cursor = cursor + usize.ONE
+  }
+  parsed.hasPskModes = true
+  return true
+}
+
+// Checks the identities and binders vectors, which have the same count, and records the first
+// identity, the first binder, and where the binders start.
+fn parsePreSharedKey(
+  buffer: &Intrinsic.RawBuffer<u8>,
+  start: usize,
+  length: usize,
+  parsed: &mut ParsedClientHello,
+) -> bool {
+  let end = start + length
+  if length < 2 {
+    return false
+  }
+  let identitiesLength = readU16Raw(buffer, start)
+  if identitiesLength < 7 || identitiesLength > length - 2 {
+    return false
+  }
+  let identitiesEnd = start + 2 + identitiesLength
+  let mut cursor = start + 2
+  let mut identities = usize.ZERO
+  while cursor < identitiesEnd {
+    if identitiesEnd - cursor < 2 {
+      return false
+    }
+    let identityLength = readU16Raw(buffer, cursor)
+    if identityLength == 0 || identityLength + 6 > identitiesEnd - cursor {
+      return false
+    }
+    if identities == 0 {
+      parsed.identityOffset = cursor + 2
+      parsed.identityLength = identityLength
+    }
+    cursor = cursor + 6 + identityLength
+    identities = identities + usize.ONE
+  }
+  if end - identitiesEnd < 2 {
+    return false
+  }
+  let bindersLength = readU16Raw(buffer, identitiesEnd)
+  if bindersLength < 33 || bindersLength != end - identitiesEnd - 2 {
+    return false
+  }
+  cursor = identitiesEnd + 2
+  let mut binders = usize.ZERO
+  while cursor < end {
+    let binderLength = readU8Raw(buffer, cursor)
+    if binderLength < 32 || binderLength > end - cursor - usize.ONE {
+      return false
+    }
+    if binders == 0 {
+      parsed.binderOffset = cursor + usize.ONE
+      parsed.binderLength = binderLength
+    }
+    cursor = cursor + usize.ONE + binderLength
+    binders = binders + usize.ONE
+  }
+  if binders != identities {
+    return false
+  }
+  parsed.bindersOffset = identitiesEnd
+  parsed.hasPsk = true
+  return true
 }
 
 fn parseServerName(
@@ -2958,7 +3416,11 @@ effect fn queueServerHello(server: &mut Server, offset: usize) -> Result<(), Ser
   putSlice(&mut server.scratch, &mut cursor, Slice.view<u8>(&session, 0, sessionLength))
   putU16(&mut server.scratch, &mut cursor, suite)
   putU8(&mut server.scratch, &mut cursor, 0)
-  putU16(&mut server.scratch, &mut cursor, publicLength + 14)
+  let mut extensionsLength = publicLength + 14
+  if server.pskAccepted {
+    extensionsLength = extensionsLength + 6
+  }
+  putU16(&mut server.scratch, &mut cursor, extensionsLength)
   putU16(&mut server.scratch, &mut cursor, 43)
   putU16(&mut server.scratch, &mut cursor, 2)
   putU16(&mut server.scratch, &mut cursor, 772)
@@ -2967,6 +3429,12 @@ effect fn queueServerHello(server: &mut Server, offset: usize) -> Result<(), Ser
   putU16(&mut server.scratch, &mut cursor, group)
   putU16(&mut server.scratch, &mut cursor, publicLength)
   putSlice(&mut server.scratch, &mut cursor, Slice.view<u8>(&publicKey, 0, publicLength))
+  if server.pskAccepted {
+    // pre_shared_key with the first identity selected.
+    putU16(&mut server.scratch, &mut cursor, 41)
+    putU16(&mut server.scratch, &mut cursor, 2)
+    putU16(&mut server.scratch, &mut cursor, 0)
+  }
   RawBuffer.fill(&mut server.scratch, 0, usize.ONE, 2)
   setU24(&mut server.scratch, usize.ONE, cursor - HANDSHAKE_HEADER_LENGTH)
   let queued = queueScratch(&mut server.*, cursor)
@@ -3003,7 +3471,11 @@ fn deriveHandshakeSecrets(server: &mut Server, shared: &[u8]) -> Result<(), Serv
   let zeros = zero48()
   let zeroView = secretView(&zeros, length)
   let emptyHash = emptyHashBy(length)
-  let early = extractBy(length, zeroView, zeroView)
+  let psk = server.psk
+  let mut early = extractBy(length, zeroView, zeroView)
+  if server.pskAccepted {
+    early = extractBy(length, zeroView, secretView(&psk, length))
+  }
   let derived = match deriveSecretBy(length, &early, b"derived", &emptyHash) {
     Result<[u8; 48], ServerError>.Failure { error } => {
       return failure(error)
@@ -3065,69 +3537,15 @@ effect fn buildFlight(server: &mut Server) -> Result<(), ServerError>
   setU24(&mut server.flight, start + usize.ONE, cursor - start - HANDSHAKE_HEADER_LENGTH)
   updateTranscriptFlight(&mut server.*, start, cursor - start)
 
-  // CertificateRequest, with an empty context and the schemes that `HandshakeSignature` verifies
-  // for keys that the certificate profile admits.
-  if server.clientAuthMode != ClientAuthMode.Off {
-    let requestStart = cursor
-    putU8(&mut server.flight, &mut cursor, 13)
-    putU24(&mut server.flight, &mut cursor, 1 + 2 + 4 + 2 + 2 * CLIENT_SCHEMES.length)
-    putU8(&mut server.flight, &mut cursor, 0)
-    putU16(&mut server.flight, &mut cursor, 4 + 2 + 2 * CLIENT_SCHEMES.length)
-    putU16(&mut server.flight, &mut cursor, 13)
-    putU16(&mut server.flight, &mut cursor, 2 + 2 * CLIENT_SCHEMES.length)
-    putU16(&mut server.flight, &mut cursor, 2 * CLIENT_SCHEMES.length)
-    let mut schemeIndex = usize.ZERO
-    while schemeIndex < CLIENT_SCHEMES.length {
-      putU16(&mut server.flight, &mut cursor, CLIENT_SCHEMES[schemeIndex])
-      schemeIndex = schemeIndex + usize.ONE
+  // A resumed handshake authenticates with the PSK, so it sends no certificate messages.
+  if !server.pskAccepted {
+    let built = run buildCertificateMessages(&mut server.*, &mut cursor)
+    if let Result<(), ServerError>.Failure { error } = move built {
+      return failure(error)
     }
-    updateTranscriptFlight(&mut server.*, requestStart, cursor - requestStart)
   }
 
-  // Certificate, with an empty request context and the configured chain.
-  let certificateStart = cursor
-  let chainLength = server.chainLength
-  putU8(&mut server.flight, &mut cursor, 11)
-  putU24(&mut server.flight, &mut cursor, chainLength + 4)
-  putU8(&mut server.flight, &mut cursor, 0)
-  putU24(&mut server.flight, &mut cursor, chainLength)
-
-  // `make` wrote every byte of `chain[0..chainLength]`, and sized the flight buffer for it.
-  let chain = unsafe RawBuffer.view<u8>(&server.chain, 0, chainLength)
-  putSlice(&mut server.flight, &mut cursor, chain)
-  drop chain
-  updateTranscriptFlight(&mut server.*, certificateStart, cursor - certificateStart)
-
-  // CertificateVerify over the transcript through Certificate.
-  let hash = transcriptHash(&server.*)
-  let context = b"TLS 1.3, server CertificateVerify"
-  let mut contentLength = usize.ZERO
-  RawBuffer.fill(&mut server.scratch, 0, 64, 32)
-  contentLength = 64
-  putSlice(&mut server.scratch, &mut contentLength, context)
-  putU8(&mut server.scratch, &mut contentLength, 0)
-  putSlice(&mut server.scratch, &mut contentLength, Slice.view<u8>(&hash, 0, length))
-  let mut signature: [u8; 1024] = [0; 1024]
-
-  // The block above wrote every byte of `scratch[0..contentLength]`, at most 146 bytes.
-  let content = unsafe RawBuffer.view<u8>(&server.scratch, 0, contentLength)
-  let signed = run server.key.sign(server.scheme, content, &mut signature)
-  drop content
-  let signatureLength = match move signed {
-    Result<usize, SigningError>.Failure { error } => {
-      return failure(ServerError.Signing { error: error })
-    }
-    Result<usize, SigningError>.Success { value } => value
-  }
-  let verifyStart = cursor
-  putU8(&mut server.flight, &mut cursor, 15)
-  putU24(&mut server.flight, &mut cursor, signatureLength + 4)
-  putU16(&mut server.flight, &mut cursor, server.scheme)
-  putU16(&mut server.flight, &mut cursor, signatureLength)
-  putSlice(&mut server.flight, &mut cursor, Slice.view<u8>(&signature, 0, signatureLength))
-  updateTranscriptFlight(&mut server.*, verifyStart, cursor - verifyStart)
-
-  // Finished over the transcript through CertificateVerify.
+  // Finished over the transcript so far.
   let serverSecret = server.serverHandshakeSecret
   let serverFinished = match finishedData(length, &serverSecret, &transcriptHash(&server.*)) {
     Result<[u8; 48], ServerError>.Failure { error } => {
@@ -3161,6 +3579,79 @@ effect fn buildFlight(server: &mut Server) -> Result<(), ServerError>
   }
   server.clientTrafficSecret = clientTraffic
   server.serverTrafficSecret = serverTraffic
+  return ok()
+}
+
+// CertificateRequest when the server asks for a client certificate, then Certificate and
+// CertificateVerify, written into the flight at `cursor`.
+effect fn buildCertificateMessages(server: &mut Server, cursor: &mut usize) -> Result<
+  (),
+  ServerError
+>
+  ? &mut Random {
+  let length = server.secretLength
+
+  // CertificateRequest, with an empty context and the schemes that `HandshakeSignature` verifies
+  // for keys that the certificate profile admits.
+  if server.clientAuthMode != ClientAuthMode.Off {
+    let requestStart = cursor.*
+    putU8(&mut server.flight, &mut cursor.*, 13)
+    putU24(&mut server.flight, &mut cursor.*, 1 + 2 + 4 + 2 + 2 * CLIENT_SCHEMES.length)
+    putU8(&mut server.flight, &mut cursor.*, 0)
+    putU16(&mut server.flight, &mut cursor.*, 4 + 2 + 2 * CLIENT_SCHEMES.length)
+    putU16(&mut server.flight, &mut cursor.*, 13)
+    putU16(&mut server.flight, &mut cursor.*, 2 + 2 * CLIENT_SCHEMES.length)
+    putU16(&mut server.flight, &mut cursor.*, 2 * CLIENT_SCHEMES.length)
+    let mut schemeIndex = usize.ZERO
+    while schemeIndex < CLIENT_SCHEMES.length {
+      putU16(&mut server.flight, &mut cursor.*, CLIENT_SCHEMES[schemeIndex])
+      schemeIndex = schemeIndex + usize.ONE
+    }
+    updateTranscriptFlight(&mut server.*, requestStart, cursor.* - requestStart)
+  }
+
+  // Certificate, with an empty request context and the configured chain.
+  let certificateStart = cursor.*
+  let chainLength = server.chainLength
+  putU8(&mut server.flight, &mut cursor.*, 11)
+  putU24(&mut server.flight, &mut cursor.*, chainLength + 4)
+  putU8(&mut server.flight, &mut cursor.*, 0)
+  putU24(&mut server.flight, &mut cursor.*, chainLength)
+
+  // `make` wrote every byte of `chain[0..chainLength]`, and sized the flight buffer for it.
+  let chain = unsafe RawBuffer.view<u8>(&server.chain, 0, chainLength)
+  putSlice(&mut server.flight, &mut cursor.*, chain)
+  drop chain
+  updateTranscriptFlight(&mut server.*, certificateStart, cursor.* - certificateStart)
+
+  // CertificateVerify over the transcript through Certificate.
+  let hash = transcriptHash(&server.*)
+  let context = b"TLS 1.3, server CertificateVerify"
+  let mut contentLength = usize.ZERO
+  RawBuffer.fill(&mut server.scratch, 0, 64, 32)
+  contentLength = 64
+  putSlice(&mut server.scratch, &mut contentLength, context)
+  putU8(&mut server.scratch, &mut contentLength, 0)
+  putSlice(&mut server.scratch, &mut contentLength, Slice.view<u8>(&hash, 0, length))
+  let mut signature: [u8; 1024] = [0; 1024]
+
+  // The block above wrote every byte of `scratch[0..contentLength]`, at most 146 bytes.
+  let content = unsafe RawBuffer.view<u8>(&server.scratch, 0, contentLength)
+  let signed = run server.key.sign(server.scheme, content, &mut signature)
+  drop content
+  let signatureLength = match move signed {
+    Result<usize, SigningError>.Failure { error } => {
+      return failure(ServerError.Signing { error: error })
+    }
+    Result<usize, SigningError>.Success { value } => value
+  }
+  let verifyStart = cursor.*
+  putU8(&mut server.flight, &mut cursor.*, 15)
+  putU24(&mut server.flight, &mut cursor.*, signatureLength + 4)
+  putU16(&mut server.flight, &mut cursor.*, server.scheme)
+  putU16(&mut server.flight, &mut cursor.*, signatureLength)
+  putSlice(&mut server.flight, &mut cursor.*, Slice.view<u8>(&signature, 0, signatureLength))
+  updateTranscriptFlight(&mut server.*, verifyStart, cursor.* - verifyStart)
   return ok()
 }
 
@@ -3331,7 +3822,11 @@ fn handleClientCertificateVerify(server: &mut Server, messageLength: usize) -> R
   return ok()
 }
 
-fn handleClientFinished(server: &mut Server, messageLength: usize) -> Result<(), ServerError> {
+effect fn handleClientFinished(server: &mut Server, messageLength: usize) -> Result<
+  (),
+  ServerError
+>
+  ? &mut Random {
   let length = server.secretLength
   if messageLength != HANDSHAKE_HEADER_LENGTH + length || messageLength != server.handshakeLength {
     return violation(ServerProtocolReason.InvalidLength)
@@ -3362,7 +3857,155 @@ fn handleClientFinished(server: &mut Server, messageLength: usize) -> Result<(),
   }
   server.state = ServerState.Traffic
   server.completeReady = true
+  if !server.ticketsEnabled || !server.ticketNowValid || !server.pskDheKe {
+    return ok()
+  }
+  updateTranscriptHandshake(&mut server.*, messageLength)
+  let master = server.masterSecret
+  let resumption = match deriveSecretBy(length, &master, b"res master", &transcriptHash(&server.*)) {
+    Result<[u8; 48], ServerError>.Failure { error } => {
+      return failure(error)
+    }
+    Result<[u8; 48], ServerError>.Success { value } => value
+  }
+  return run buildTickets(&mut server.*, &resumption)
+}
+
+// Writes `ticketCount` NewSessionTicket messages into the flight buffer, which the handshake no
+// longer uses. `scheduleControl` sends them before other post-handshake output.
+effect fn buildTickets(server: &mut Server, resumption: &[u8; 48]) -> Result<(), ServerError>
+  ? &mut Random {
+  let length = server.secretLength
+  let nameHash = serverNameDigest(&server.*)
+  let alpnHash = alpnDigest(&server.*)
+  let name = server.ticketName
+  let key = server.ticketKey
+  let kind = statusKind(&server.clientStatus)
+  let mut cursor = usize.ZERO
+  let mut index = usize.ZERO
+  while index < server.ticketCount {
+    let nonce: [u8; 1] = [usize.toU8(index)]
+    let mut psk = zero48()
+    let pskView = Slice.viewMut<u8>(&mut psk, 0, length)
+    let expanded = expandLabelContextBy(
+      length,
+      secretView(resumption, length),
+      b"resumption",
+      &nonce,
+      move pskView,
+    )
+    if let Result<(), ServerError>.Failure { error } = move expanded {
+      return failure(error)
+    }
+    // `random[0..4]` is the ticket's age_add, and `random[4..16]` is its AES-GCM nonce.
+    let mut random: [u8; 16] = [0; 16]
+    run Random.fillBytes(&mut random)
+    let mut state: [u8; 138] = [0; 138]
+    let mut at = usize.ZERO
+    state[0] = 1
+    at = 1
+    putStateNumber(&mut state, &mut at, suiteCode(server.selectedSuite), 2)
+    putStateBytes(&mut state, &mut at, &psk)
+    putStateNumber(&mut state, &mut at, server.ticketNow, 8)
+    putStateBytes(&mut state, &mut at, Slice.view<u8>(&random, 0, 4))
+    putStateNumber(&mut state, &mut at, server.ticketLifetime, 4)
+    state[at] = kind
+    at = at + usize.ONE
+    if server.hasServerName {
+      state[at] = 1
+    }
+    at = at + usize.ONE
+    putStateBytes(&mut state, &mut at, &nameHash)
+    putStateNumber(&mut state, &mut at, 0, 4)
+    if server.hasSelectedAlpn {
+      state[at] = 1
+    }
+    at = at + usize.ONE
+    putStateBytes(&mut state, &mut at, &alpnHash)
+    let mut ticket: [u8; 182] = [0; 182]
+    copyInto(&mut ticket, &name)
+    let mut tag: [u8; 16] = [0; 16]
+    let sealed = AesGcm.seal(
+      &key,
+      Slice.view<u8>(&random, 4, 12),
+      &name,
+      &state,
+      Slice.viewMut<u8>(&mut ticket, 28, TICKET_STATE_LENGTH),
+      &mut tag,
+    )
+    if let Result<(), AesGcmError>.Failure { error } = move sealed {
+      drop error
+      return violation(ServerProtocolReason.InternalState)
+    }
+    let mut tagIndex = usize.ZERO
+    while tagIndex < 12 {
+      ticket[16 + tagIndex] = random[4 + tagIndex]
+      tagIndex = tagIndex + usize.ONE
+    }
+    tagIndex = 0
+    while tagIndex < 16 {
+      ticket[28 + TICKET_STATE_LENGTH + tagIndex] = tag[tagIndex]
+      tagIndex = tagIndex + usize.ONE
+    }
+
+    // The flight buffer holds `chainLength + FLIGHT_OVERHEAD` bytes, more than
+    // `TICKET_COUNT_LIMIT * TICKET_MESSAGE_LENGTH`.
+    putU8(&mut server.flight, &mut cursor, 4)
+    putU24(&mut server.flight, &mut cursor, TICKET_MESSAGE_LENGTH - HANDSHAKE_HEADER_LENGTH)
+    putU16(&mut server.flight, &mut cursor, server.ticketLifetime / 65536)
+    putU16(&mut server.flight, &mut cursor, server.ticketLifetime % 65536)
+    putSlice(&mut server.flight, &mut cursor, Slice.view<u8>(&random, 0, 4))
+    putU8(&mut server.flight, &mut cursor, 1)
+    putSlice(&mut server.flight, &mut cursor, &nonce)
+    putU16(&mut server.flight, &mut cursor, TICKET_LENGTH)
+    putSlice(&mut server.flight, &mut cursor, &ticket)
+    putU16(&mut server.flight, &mut cursor, 0)
+    index = index + usize.ONE
+  }
+  server.flightLength = cursor
+  server.flightOffset = 0
+  server.ticketsPending = true
   return ok()
+}
+
+// The client certificate status that a ticket carries: 0 for none requested, 1 for absent, 2 for
+// trusted, and 3 for untrusted.
+fn statusKind(status: &ClientCertificateStatus) -> u8 {
+  return match &status.* {
+    ClientCertificateStatus.NotRequested => 0
+    ClientCertificateStatus.Pending => 0
+    ClientCertificateStatus.Absent => 1
+    ClientCertificateStatus.Trusted => 2
+    ClientCertificateStatus.Untrusted { .. } => 3
+    ClientCertificateStatus.Resumed { trusted } => {
+      if trusted {
+        return 2
+      }
+      return 3
+    }
+  }
+}
+
+fn putStateNumber(state: &mut [u8; 138], at: &mut usize, value: usize, width: usize) -> () {
+  let mut remaining = value
+  let mut index = width
+  while index > 0 {
+    index = index - usize.ONE
+    state[at.* + index] = usize.toU8(remaining % 256)
+    remaining = remaining / 256
+  }
+  at.* = at.* + width
+  return ()
+}
+
+fn putStateBytes(state: &mut [u8; 138], at: &mut usize, bytes: &[u8]) -> () {
+  let mut index = usize.ZERO
+  while index < bytes.length {
+    state[at.* + index] = bytes[index]
+    index = index + usize.ONE
+  }
+  at.* = at.* + bytes.length
+  return ()
 }
 
 fn handleKeyUpdate(server: &mut Server, messageLength: usize) -> Result<(), ServerError> {
@@ -3466,6 +4109,35 @@ fn expandLabelBy(length: usize, secret: &[u8], label: &[u8], output: &mut [u8]) 
   }
   let key = first32(secret)
   let expanded = TlsHkdfSha256.expandLabel(&key, label, &empty, move output)
+  return match move expanded {
+    Result<(), LabelError>.Success { .. } => ok()
+    Result<(), LabelError>.Failure { error } => {
+      drop error
+      return violation(ServerProtocolReason.InternalState)
+    }
+  }
+}
+
+fn expandLabelContextBy(
+  length: usize,
+  secret: &[u8],
+  label: &[u8],
+  context: &[u8],
+  output: &mut [u8],
+) -> Result<(), ServerError> {
+  if length == 48 {
+    let key = fixed48(secret)
+    let expanded = TlsHkdfSha384.expandLabel(&key, label, context, move output)
+    return match move expanded {
+      Result<(), LabelError>.Success { .. } => ok()
+      Result<(), LabelError>.Failure { error } => {
+        drop error
+        return violation(ServerProtocolReason.InternalState)
+      }
+    }
+  }
+  let key = first32(secret)
+  let expanded = TlsHkdfSha256.expandLabel(&key, label, context, move output)
   return match move expanded {
     Result<(), LabelError>.Success { .. } => ok()
     Result<(), LabelError>.Failure { error } => {

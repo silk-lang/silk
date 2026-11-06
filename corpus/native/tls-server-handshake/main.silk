@@ -14,6 +14,9 @@ import silk.tls.client {
   ClientCredential,
   ClientLimits,
   Progress,
+  Resumption,
+  Session,
+  SessionError,
   TlsError,
 }
 import silk.tls.certificate {CertificateDer}
@@ -30,6 +33,8 @@ import silk.tls.server {
   ServerGroup,
   ServerLimits,
   ServerProgress,
+  TicketKey,
+  TicketPolicy,
 }
 import silk.tls.record {CipherSuite}
 import silk.tls.trust_snapshot {TrustLoadLimits, TrustSnapshot, TrustSourceError}
@@ -204,6 +209,7 @@ fn serverConfig<'a>(
     alpn: alpn,
     groups: groups,
     clientAuth: ClientAuth<'a>.Off,
+    tickets: TicketPolicy<'a>.Off,
     limits: ServerLimits.defaults(),
   }
 }
@@ -314,6 +320,7 @@ effect fn makeClientWith<'a>(alpn: AlpnConfig<'a>, credential: ClientCredential<
   let config = ClientConfig {
     reference: reference(b"example.com"),
     alpn: alpn,
+    resumption: Resumption<'a>.Disabled,
     limits: ClientLimits.defaults(),
   }
   return run Client.make(&config, move trust, SystemClock.make(1789156800, 0), move credential)
@@ -346,6 +353,8 @@ fn serverCode(error: ServerError) -> i32 {
     ServerError.ClientCertificateDecode {..} => 121
     ServerError.ClientCertificateVerify {..} => 122
     ServerError.UntrustedClientCertificate {..} => 123
+    ServerError.Binder => 124
+    ServerError.InvalidTicketPolicy => 125
   }
 }
 
@@ -625,6 +634,7 @@ fn clientAuthConfig<'a>(
       required: required,
       rejectUntrusted: rejectUntrusted,
     },
+    tickets: TicketPolicy<'a>.Off,
     limits: ServerLimits.defaults(),
   }
 }
@@ -761,6 +771,7 @@ effect fn largeCredential() -> i32
   let config = ClientConfig {
     reference: reference(b"example.com"),
     alpn: AlpnConfig.defaults(),
+    resumption: Resumption.Disabled,
     limits: ClientLimits.defaults(),
   }
   let credential = presented(&chain, p256Key(client256Secret()))
@@ -901,6 +912,255 @@ effect fn recordedHello(groups: GroupPolicy, key: SigningKey, leaf: &[u8]) -> i3
   if !pendingIs(&server, 0, b"\x17\x03\x03") { return 17 }
   if !ackAll(&mut server) { return 18 }
   if Server.pendingOutput(&server).length != 0 { return 19 }
+  return 0
+}
+
+fn ticketConfig<'a>(
+  certificates: &'a [CertificateDer<'a>],
+  groups: GroupPolicy,
+  clientAuth: ClientAuth<'a>,
+  key: &'a TicketKey,
+  now: &'a Instant,
+  count: usize,
+) -> ServerConfig<'a> {
+  return ServerConfig<'a> {
+    certificates: certificates,
+    alpn: AlpnConfig<'a>.Disabled,
+    groups: groups,
+    clientAuth: clientAuth,
+    tickets: TicketPolicy<'a>.Issue {key: key, now: now, lifetime: 7200, count: count},
+    limits: ServerLimits.defaults(),
+  }
+}
+
+effect fn makeClientSession<'a>(session: Option<&'a Session>, credential: ClientCredential<'a>) -> Result<
+  Client,
+  TlsError
+>
+! OutOfMemoryError
+? &mut Allocator | &mut Random {
+  let made = run TrustSnapshot.fromPem(rootPem(), TrustLoadLimits.defaults())
+  let trust = match move made {
+    Result<TrustSnapshot, TrustSourceError>.Success {value} => move value
+    Result<TrustSnapshot, TrustSourceError>.Failure {..} => {
+      Intrinsic.trap("bad trust")
+      return run makeClientSession(session, move credential)
+    }
+  }
+  let config = ClientConfig {
+    reference: reference(b"example.com"),
+    alpn: AlpnConfig.defaults(),
+    resumption: Resumption<'a>.Enabled {session: session},
+    limits: ClientLimits.defaults(),
+  }
+  return run Client.make(&config, move trust, SystemClock.make(1789156800, 0), move credential)
+}
+
+// One connection between a server with `config` and a client that offers `session`. Returns 0
+// when it completes, data flows both ways, and the server's and client's resumed flags are both
+// `resumed`. Otherwise returns an error code. `out` gets the first session that the server
+// issued, if any.
+effect fn ticketConnection<'a>(
+  config: &ServerConfig<'a>,
+  session: Option<&'a Session>,
+  credential: ClientCredential<'a>,
+  resumed: bool,
+  out: &mut Option<Session>,
+) -> i32
+! OutOfMemoryError
+? &mut Allocator | &mut Random {
+  let mut server = match run Server.make(config, p256Key(leaf256Secret())) {
+    Result<Server, ServerError>.Success {value} => move value
+    Result<Server, ServerError>.Failure {error} => {
+      return serverCode(error)
+    }
+  }
+  let mut client = match move run makeClientSession(session, move credential) {
+    Result<Client, TlsError>.Success {value} => move value
+    Result<Client, TlsError>.Failure {error} => {
+      return clientCode(move error)
+    }
+  }
+  let code = run pump(&mut client, &mut server)
+  if code != 0 { return code }
+  if Server.resumed(&server) != resumed { return 70 }
+  let authenticated = match Client.authentication(&client) {
+    Option.Some {value} => value.resumed() == resumed
+    Option.None => false
+  }
+  if !authenticated { return 72 }
+  if !writeClient(&mut client, b"ticket ping") { return 73 }
+  let moved = run pump(&mut client, &mut server)
+  if moved != 0 { return moved }
+  if !readServer(&mut server, b"ticket ping") { return 74 }
+  if !writeServer(&mut server, b"ticket pong") { return 75 }
+  let back = run pump(&mut client, &mut server)
+  if back != 0 { return back }
+  if !readClient(&mut client, b"ticket pong") { return 76 }
+  out.* = Client.takeSession(&mut client)
+  return 0
+}
+
+fn sessionCount(client: &mut Client) -> usize {
+  let mut count = usize.ZERO
+  while true {
+    if let Option<Session>.None = Client.takeSession(&mut client.*) { return count }
+    count = count + usize.ONE
+  }
+  return count
+}
+
+// Session resumption between the Silk client and server. Returns 0 or an error code.
+effect fn resumption() -> i32
+! OutOfMemoryError
+? &mut Allocator | &mut Random {
+  let keyBytes: [u8; 48] = [7; 48]
+  let key = TicketKey.make(&keyBytes)
+  let otherBytes: [u8; 48] = [8; 48]
+  let otherKey = TicketKey.make(&otherBytes)
+  let at = SystemClock.make(1789156800, 0)
+  let later = SystemClock.make(1789156800 + 8000, 0)
+  let chain = [CertificateDer {bytes: leaf256Der()}, CertificateDer {bytes: rootDer()}]
+  let config = ticketConfig(&chain, GroupPolicy.defaults(), ClientAuth.Off, &key, &at, 2)
+
+  // A full handshake issues two tickets.
+  let mut server = match run Server.make(&config, p256Key(leaf256Secret())) {
+    Result<Server, ServerError>.Success {value} => move value
+    Result<Server, ServerError>.Failure {error} => {
+      return serverCode(error)
+    }
+  }
+  let mut client = match move run makeClientSession(Option<&Session>.none(), ClientCredential.None) {
+    Result<Client, TlsError>.Success {value} => move value
+    Result<Client, TlsError>.Failure {error} => {
+      return clientCode(move error)
+    }
+  }
+  let code = run pump(&mut client, &mut server)
+  if code != 0 { return code }
+  if Server.resumed(&server) { return 1 }
+  if sessionCount(&mut client) != 2 { return 2 }
+
+  // The session survives encode and decode.
+  let mut taken = Option<Session>.none()
+  let full = run ticketConnection(&config, Option<&Session>.none(), ClientCredential.None, false, &mut taken)
+  if full != 0 { return 300 + full }
+  let issued = match move taken {
+    Option<Session>.Some {value} => move value
+    Option<Session>.None => { return 3 }
+  }
+  let mut encoded: [u8; 2048] = [0; 2048]
+  let length = match issued.encode(&mut encoded) {
+    Result<usize, SessionError>.Success {value} => value
+    Result<usize, SessionError>.Failure {..} => { return 4 }
+  }
+  if length != issued.encodedLength() { return 5 }
+  let decoded = match move run Session.decode(Slice.view<u8>(&encoded, 0, length)) {
+    Result<Session, SessionError>.Success {value} => move value
+    Result<Session, SessionError>.Failure {..} => { return 6 }
+  }
+
+  // The decoded session resumes, and the resumed connection issues a new session.
+  let mut again = Option<Session>.none()
+  let resumedCode = run ticketConnection(&config, Option<&Session>.some(&decoded), ClientCredential.None, true, &mut again)
+  if resumedCode != 0 { return 400 + resumedCode }
+  let renewed = match move again {
+    Option<Session>.Some {value} => move value
+    Option<Session>.None => { return 7 }
+  }
+  let mut ignored = Option<Session>.none()
+  let renewedCode = run ticketConnection(&config, Option<&Session>.some(&renewed), ClientCredential.None, true, &mut ignored)
+  if renewedCode != 0 { return 500 + renewedCode }
+
+  // A HelloRetryRequest keeps the offer, and the second ClientHello resumes.
+  let p256Only = GroupPolicy {x25519: false, p256: true, p384: false}
+  let retryConfig = ticketConfig(&chain, p256Only, ClientAuth.Off, &key, &at, 1)
+  let retryCode = run ticketConnection(&retryConfig, Option<&Session>.some(&decoded), ClientCredential.None, true, &mut ignored)
+  if retryCode != 0 { return 600 + retryCode }
+
+  // Another key, or a server clock past the lifetime, gives a full handshake.
+  let otherConfig = ticketConfig(&chain, GroupPolicy.defaults(), ClientAuth.Off, &otherKey, &at, 1)
+  let otherCode = run ticketConnection(&otherConfig, Option<&Session>.some(&decoded), ClientCredential.None, false, &mut ignored)
+  if otherCode != 0 { return 700 + otherCode }
+  let laterConfig = ticketConfig(&chain, GroupPolicy.defaults(), ClientAuth.Off, &key, &later, 1)
+  let laterCode = run ticketConnection(&laterConfig, Option<&Session>.some(&decoded), ClientCredential.None, false, &mut ignored)
+  if laterCode != 0 { return 800 + laterCode }
+
+  // A server without tickets does a full handshake.
+  let plainConfig = serverConfig(&chain, AlpnConfig.Disabled, GroupPolicy.defaults())
+  let plainCode = run ticketConnection(&plainConfig, Option<&Session>.some(&decoded), ClientCredential.None, false, &mut ignored)
+  if plainCode != 0 { return 900 + plainCode }
+
+  // Client certificates: a trusted session resumes as `Resumed`, and a session without a
+  // certificate does not resume on a server that requires one.
+  let made = run TrustSnapshot.fromPem(rootPem(), TrustLoadLimits.defaults())
+  let trust = match move made {
+    Result<TrustSnapshot, TrustSourceError>.Success {value} => move value
+    Result<TrustSnapshot, TrustSourceError>.Failure {..} => { return 8 }
+  }
+  let optional = ClientAuth.Request {trust: &trust, validationTime: &at, required: false, rejectUntrusted: true}
+  let required = ClientAuth.Request {trust: &trust, validationTime: &at, required: true, rejectUntrusted: true}
+  let optionalConfig = ticketConfig(&chain, GroupPolicy.defaults(), optional, &key, &at, 1)
+  let requiredConfig = ticketConfig(&chain, GroupPolicy.defaults(), required, &key, &at, 1)
+  let clientChain = [CertificateDer {bytes: client256Der()}, CertificateDer {bytes: rootDer()}]
+  let mut trustedSession = Option<Session>.none()
+  let presentedCode = run ticketConnection(&optionalConfig, Option<&Session>.none(), presented(&clientChain, p256Key(client256Secret())), false, &mut trustedSession)
+  if presentedCode != 0 { return 1000 + presentedCode }
+  let trusted = match move trustedSession {
+    Option<Session>.Some {value} => move value
+    Option<Session>.None => { return 9 }
+  }
+  let statusCode = run resumedStatus(&requiredConfig, &trusted)
+  if statusCode != 0 { return 1100 + statusCode }
+  let mut absentSession = Option<Session>.none()
+  let absentCode = run ticketConnection(&optionalConfig, Option<&Session>.none(), ClientCredential.None, false, &mut absentSession)
+  if absentCode != 0 { return 1200 + absentCode }
+  let absent = match move absentSession {
+    Option<Session>.Some {value} => move value
+    Option<Session>.None => { return 10 }
+  }
+  let absentResumed = run ticketConnection(&optionalConfig, Option<&Session>.some(&absent), ClientCredential.None, true, &mut ignored)
+  if absentResumed != 0 { return 1300 + absentResumed }
+  // The client sends no certificate in the full handshake that replaces the session.
+  let refused = run ticketConnection(&requiredConfig, Option<&Session>.some(&absent), ClientCredential.None, false, &mut ignored)
+  if refused != 120 { return 1400 + refused }
+
+  // Make checks the policy.
+  let zeroCount = ticketConfig(&chain, GroupPolicy.defaults(), ClientAuth.Off, &key, &at, 0)
+  let invalid = match run Server.make(&zeroCount, p256Key(leaf256Secret())) {
+    Result<Server, ServerError>.Success {..} => 0
+    Result<Server, ServerError>.Failure {error} => serverCode(error)
+  }
+  if invalid != 125 { return 1500 + invalid }
+  return 0
+}
+
+// Resumes `session` on a server that requires a client certificate. Returns 0 when the status is
+// `Resumed` and trusted with no certificates, or an error code.
+effect fn resumedStatus<'a>(config: &ServerConfig<'a>, session: &'a Session) -> i32
+! OutOfMemoryError
+? &mut Allocator | &mut Random {
+  let mut server = match run Server.make(config, p256Key(leaf256Secret())) {
+    Result<Server, ServerError>.Success {value} => move value
+    Result<Server, ServerError>.Failure {error} => {
+      return serverCode(error)
+    }
+  }
+  let mut client = match move run makeClientSession(Option<&Session>.some(session), ClientCredential.None) {
+    Result<Client, TlsError>.Success {value} => move value
+    Result<Client, TlsError>.Failure {error} => {
+      return clientCode(move error)
+    }
+  }
+  let code = run pump(&mut client, &mut server)
+  if code != 0 { return code }
+  if !Server.resumed(&server) { return 1 }
+  let trusted = match &Server.clientCertificateStatus(&server).* {
+    ClientCertificateStatus.Resumed {trusted} => trusted
+    _ => false
+  }
+  if !trusted { return 2 }
+  if Server.clientCertificates(&server).length != 0 { return 3 }
   return 0
 }
 
@@ -1166,6 +1426,11 @@ effect fn cases() -> i32 ! OutOfMemoryError {
     |> Effect.provideMut<Random>(&mut random)
     |> Effect.provideMut<Allocator>(&mut allocator)
   if typeCode != 147 { return 15800 + typeCode }
+
+  let resumed = run resumption()
+    |> Effect.provideMut<Random>(&mut random)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  if resumed != 0 { return 16000 + resumed }
   return 0
 }
 
