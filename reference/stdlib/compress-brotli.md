@@ -7,8 +7,8 @@ Decompress Brotli data (RFC 7932) in steps, with fixed memory and limits that yo
 ## When to use
 Use [`Brotli`](#Brotli) to read `.br` files or HTTP bodies with `Content-Encoding: br`. Make a decoder
 with [`Brotli.make`](#Brotli.impl.make), and call [`Brotli.step`](#Brotli.impl.step) until it returns `Finished`. Call
-[`Brotli.reset`](#Brotli.impl.reset) to decode another stream with the same storage. This module does not
-compress.
+[`Brotli.reset`](#Brotli.impl.reset) to decode another stream with the same storage. To compress, use
+`silk.compress.brotli_encode.BrotliEncoder`.
 
 ## Details
 The decoder supports all of RFC 7932: compressed, uncompressed, and metadata meta-blocks, all
