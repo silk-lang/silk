@@ -10,14 +10,16 @@ steps and with fixed memory. Use [`BrotliEncoder.encode`](#BrotliEncoder.impl.en
 Decode with `silk.compress.brotli.Brotli`.
 
 ## Details
-The encoder finds matches with the bucket hash tables of the reference `brotli` (more and
-longer buckets as the quality rises), checks the recent distances first, and looks one or more
-bytes ahead for a better match from quality 2. Each meta-block gets its own prefix codes for
-literals, commands, and distances. A meta-block that does not shrink is stored uncompressed.
+Up to quality 9 the encoder finds matches with the bucket hash tables of the reference
+`brotli` (more and longer buckets as the quality rises), checks the recent distances first, and
+looks one or more bytes ahead for a better match from quality 2. Qualities 10 and 11 collect
+all matches from a binary tree and choose the commands with the shortest path search of the
+reference, priced by estimated literal costs, and at quality 11 a second time with the costs of
+the first result. Each meta-block gets its own prefix codes for literals, commands, and
+distances. A meta-block that does not shrink is stored uncompressed.
 [`BrotliEncoder.make`](#BrotliEncoder.impl.make) allocates all storage one time. Later calls do not allocate and do not
 keep a borrow of your buffers. The output is deterministic but is not the same bytes that the
-reference `brotli` writes, and it is larger at qualities 10 and 11, which the reference
-compresses with a slower optimal parser.
+reference `brotli` writes.
 
 ## Examples
 ### Compress a buffer
@@ -372,10 +374,12 @@ with the same storage.
 
 ### Details
 [`BrotliEncoder.make`](#BrotliEncoder.impl.make) allocates all storage one time: twice the window or twice the
-meta-block (64 KiB to 256 KiB), whichever is larger, the hash buckets (256 KiB at quality 0, 32
-MiB at qualities 9 and 10, and 64 MiB at 11, less when the window is small), and about two
-meta-blocks of command and output buffers. Later calls do not allocate and do not keep a borrow
-of your buffers, so you can move the encoder between threads between calls.
+meta-block (64 KiB to 256 KiB), whichever is larger, and about two meta-blocks of command and
+output buffers. Up to quality 9 it adds the hash buckets (512 KiB at quality 0 and 32 MiB at 9,
+less when the window is small). Qualities 10 and 11 add one more window, a binary tree of 8
+bytes for each byte of the window, and about 17 MiB for matches and the shortest path search.
+Later calls do not allocate and do not keep a borrow of your buffers, so you can move the
+encoder between threads between calls.
 
 <a id="BrotliEncoder.impl"></a>
 
