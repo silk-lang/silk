@@ -350,7 +350,7 @@ so nothing is checked at run time.
 | `silk build` / `silk run`   | Compile for one or more targets, in debug or `--release`             |
 | `silk check`                | Check types, ownership and effects without building                  |
 | `silk test`                 | Discover and run `test` declarations                                 |
-| `silk format`               | Format source canonically, with `--check` for CI                     |
+| `silk format`               | Format Silk and TOML, with `--check` for CI                     |
 | `silk doc` / `silk doctest` | Extract documentation from `///` comments and compile their examples |
 | `silk clean`                | Remove build output                                                  |
 
@@ -361,7 +361,7 @@ It includes:
   formatting, and checked arithmetic for every scalar type.
 - **Systems:** files, child processes, sockets, clocks, randomness, single-threaded fibers and
   schedulers, and WebAssembly start-up.
-- **Data:** JSON and TOML, Base64, URIs, LZMA/LZMA2, XZ, and Zstandard decoding, and DEFLATE/zlib/gzip encoding and decoding.
+- **Data:** JSON and TOML (including comment-preserving TOML formatting), Base64, URIs, LZMA/LZMA2, XZ, and Zstandard decoding, and DEFLATE/zlib/gzip encoding and decoding.
 - **Network:** HTTP/1.x and HTTP/2 clients and servers, HPACK, a WebSocket server, connection pooling, and TLS with X.509
   certificate path validation.
 - **Crypto:** SHA-1, SHA-2 and SHA-3, HMAC, HKDF, AES-GCM, ChaCha20-Poly1305, X25519, and ECDSA
@@ -401,6 +401,17 @@ times. It also has to run a shared corpus of 443 programs with exactly the expec
 | [`reference/`](reference) | The language reference and the generated stdlib reference  |
 | [`corpus/`](corpus)       | The shared acceptance corpus                               |
 | [`examples/`](examples)   | Larger example programs                                    |
+
+`silk format` includes package and workspace manifests alongside source files. Exact `.toml`
+paths can be formatted without a project; `--check` reports drift without writing. Formatting
+preserves comments, string contents, value spellings, and declaration order, normalizes spacing
+and line endings, and indents nested values by two spaces. Existing line breaks inside arrays
+and inline tables remain. Invalid TOML is reported and left untouched.
+
+Silk formats TOML before saving project initialization, dependency and workspace edits, toolchain
+pins and settings, and release manifests, records, and snapshots. Recovery restores the original
+bytes; copying an immutable snapshot also preserves its bytes. Library callers can use
+[`TomlFormat`](reference/stdlib/toml-format.md).
 
 The root `silk.toml` defines a native workspace containing `compiler`, `changes`, `tomledit` and
 `tool`. Members

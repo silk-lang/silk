@@ -124,6 +124,64 @@ const physicalPath = Effect.fnUntraced(function* (path) {
 })
 // This is a byte-level overlay guard, not a second implementation of changes policy.
 // The native command alone computes versions, renders modules and serializes history.
+// Compare source tokens, including comments and statement boundaries, while allowing the
+// native TOML formatter to change whitespace. String bodies remain exact, even across lines.
+const manifestTokens = (source) => {
+  const tokens = []
+  let at = 0
+  let lineHasContent = false
+  while (at < source.length) {
+    const char = source[at]
+    if (char === ' ' || char === '\t') { at += 1; continue }
+    if (char === '\r' || char === '\n') {
+      if (char === '\r' && source[at + 1] !== '\n') return undefined
+      if (char === '\r') at += 1
+      at += 1
+      if (lineHasContent) tokens.push('\n')
+      lineHasContent = false
+      continue
+    }
+    const start = at
+    if (char === '#') {
+      while (at < source.length && source[at] !== '\r' && source[at] !== '\n') at += 1
+      tokens.push(source.slice(start, at).replace(/[ \t]+$/, ''))
+    } else if (char === '"' || char === "'") {
+      const multiline = source.startsWith(char.repeat(3), at)
+      at += multiline ? 3 : 1
+      let closed = false
+      while (at < source.length) {
+        if (!multiline && (source[at] === '\r' || source[at] === '\n')) return undefined
+        if (char === '"' && source[at] === '\\') { at += 2; continue }
+        if (source.startsWith(char.repeat(multiline ? 3 : 1), at)) {
+          at += multiline ? 3 : 1
+          if (multiline) {
+            let extra = 0
+            while (extra < 2 && source[at] === char) { at += 1; extra += 1 }
+          }
+          closed = true
+          break
+        }
+        at += 1
+      }
+      if (!closed) return undefined
+      tokens.push(source.slice(start, at))
+    } else if ('[]{}=,.'.includes(char)) {
+      tokens.push(char)
+      at += 1
+    } else {
+      // The space between a date and its time is part of the scalar, not layout.
+      const dateTime = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}[^ \t\r\n,\]}#]*/.exec(source.slice(at))
+      if (dateTime) at += dateTime[0].length
+      else while (at < source.length && !/[ \t\r\n[\]{}=,.#"']/.test(source[at])) at += 1
+      if (at === start) return undefined
+      tokens.push(source.slice(start, at))
+    }
+    lineHasContent = true
+  }
+  if (lineHasContent) tokens.push('\n')
+  return tokens
+}
+
 const validateProjection = (snapshot, sourceCommit, baseManifest, baseVersionSource) => {
   const packageSection = /^\[package\][ \t]*\r?\n([\s\S]*?)(?=^\[|$(?![\s\S]))/m.exec(baseManifest)
   const version =
@@ -154,14 +212,19 @@ const validateProjection = (snapshot, sourceCommit, baseManifest, baseVersionSou
     baseManifest.slice(0, start) +
     `"${snapshot.version}"` +
     baseManifest.slice(start + version[2].length + 2)
+  const expectedTokens = manifestTokens(expectedManifest)
+  const actualTokens = manifestTokens(snapshot.manifest)
+  const sameManifest = expectedTokens !== undefined && actualTokens !== undefined &&
+    expectedTokens.length === actualTokens.length &&
+    expectedTokens.every((token, index) => token === actualTokens[index])
   const literal = `b"${version[2]}"`
   if (
     !baseVersionSource.includes(literal) ||
     baseVersionSource.indexOf(literal) !== baseVersionSource.lastIndexOf(literal) ||
-    snapshot.manifest !== expectedManifest ||
+    !sameManifest ||
     snapshot.versionSource !== baseVersionSource.replace(literal, `b"${snapshot.version}"`)
   )
-    return 'Projection may change only the manifest version and generated version literal'
+    return 'Projection may change only manifest formatting, the manifest version, and the generated version literal'
   const header = snapshot.toml.split(/^\[/m)[0]
   for (const [key, value] of [
     ['schema', 'silk.changes.snapshot'],

@@ -243,6 +243,20 @@ it.effect(
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 )
 
+it.effect('accepts formatted manifest projections without changing values or comments', () =>
+  Effect.gen(function* () {
+    const f = yield* fixture()
+    const native = yield* releaseMetadata(f, `0.2.0-dev.7+${f.revision.slice(0, 12)}`)
+    const input = join(f.temporary, 'formatted.json')
+    const manifest = native.manifest.replaceAll(' = ', '=').replaceAll('\n', '\r\n')
+    yield* f.fs.writeFileString(input, yield* encodeJson({ ...native, manifest }))
+    const directory = join(f.temporary, 'formatted')
+    yield* projectSnapshot({ base: f.snapshot, snapshot: input, directory })
+    yield* verifySnapshot({ directory })
+    assert.strictEqual(yield* f.fs.readFileString(join(directory, 'compiler/silk.toml')), manifest)
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+)
+
 it.effect(
   'rejects wrong commits, paths, metadata, or source edits before exporting a projection',
   () =>
@@ -257,6 +271,10 @@ it.effect(
         { versionFile: '../changes/src/Command.silk' },
         { versionFile: 'src/main.silk' },
         { manifest: native.manifest.replace('main = "main.silk"', 'main = "other.silk"') },
+        { manifest: native.manifest.replace('main.silk', 'main .silk') },
+        { manifest: native.manifest.replace('\nmain =', ' main =') },
+        { manifest: `${native.manifest}# extra comment\n` },
+        { manifest: native.manifest.replace('main = "main.silk"', 'main = "unterminated') },
         { versionSource: `${native.versionSource}// extra source\n` },
         { toml: native.toml.replace(f.revision, 'f'.repeat(40)) },
         { toml: native.toml.replace('kind = "dev"', 'kind = "stable"') },
