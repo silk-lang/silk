@@ -13,7 +13,9 @@
 //!
 //! For data that arrives in parts, such as a stream or a Node.js `createCipheriv` call, use
 //! [`AesGcmEncryptor`] and [`AesGcmDecryptor`]. They take the message in any split, give the same
-//! result, accept nonces of any nonzero length, and can write a truncated tag.
+//! result, accept nonces of any nonzero length, and can write a truncated tag. On x86-64 they check
+//! for AES-NI and PCLMULQDQ at run time, as [`AesGcm.seal`] and [`AesGcm.open`] do, and then run
+//! the counter mode and GHASH eight blocks at a time.
 //!
 //! # Errors
 //! The functions return an [`AesGcmError`]. All checks come before the first write, and on any
@@ -348,6 +350,48 @@ fn tagsDiffer(computed: &[u8; 16], tag: &[u8]) -> bool {
   return difference != 0
 }
 
+// The round keys of AES-128 (10 rounds), AES-192 (12 rounds) or AES-256 (14 rounds), as `aesenc`
+// takes them. Only the x86-64 kernel uses them; elsewhere they stay zero.
+struct RoundKeys {
+  keys: [simd<u64, 2>; 15],
+  rounds: usize,
+}
+
+// The hash key's powers H to H^8, each `[low word, high word]`, with each power's words swapped
+// and its Karatsuba sum (low XOR high in both words). Eight blocks hash as
+// ((X + b0) H^8) + (b1 H^7) + ... + (b7 H) with one reduction, so the products do not wait for
+// each other. Only the x86-64 kernel uses them; elsewhere they stay zero.
+struct HashKeys {
+  powers: [simd<u64, 2>; 8],
+  swapped: [simd<u64, 2>; 8],
+  sums: [simd<u64, 2>; 8],
+}
+
+fn zeroRoundKeys() -> RoundKeys {
+  let zero = u64x2.splat(0)
+  return RoundKeys {
+    keys: [zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero],
+    rounds: 0,
+  }
+}
+
+fn zeroHashKeys() -> HashKeys {
+  let zero = u64x2.splat(0)
+  return HashKeys {
+    powers: [zero, zero, zero, zero, zero, zero, zero, zero],
+    swapped: [zero, zero, zero, zero, zero, zero, zero, zero],
+    sums: [zero, zero, zero, zero, zero, zero, zero, zero],
+  }
+}
+
+// True when the x86-64 kernel can run on this machine.
+fn hardware() -> bool {
+  static if Target.arch() == Arch.X86_64 {
+    return CpuFeatures.available("aes") && CpuFeatures.available("pclmul") && CpuFeatures.available("ssse3")
+  }
+  return false
+}
+
 struct FieldBlock {
   high: u64,
   low: u64,
@@ -394,12 +438,21 @@ struct Ghash {
   state: FieldBlock,
   buffer: [u8; 16],
   buffered: usize,
+  hardware: bool,
+  powers: HashKeys,
 }
 
 fn ghashBlock(ghash: &mut Ghash, block: FieldBlock) -> () {
   let mixed = FieldBlock {
     high: u64.bitXor(ghash.state.high, block.high),
     low: u64.bitXor(ghash.state.low, block.low),
+  }
+  static if Target.arch() == Arch.X86_64 {
+    if ghash.hardware {
+      let product = unsafe multiplyX86(u64x2.fromArray([mixed.low, mixed.high]), ghash.powers.powers[0])
+      ghash.state = FieldBlock {high: u64x2.extract(product, 1), low: u64x2.extract(product, 0)}
+      return ()
+    }
   }
   ghash.state = multiplyField(mixed, ghash.key)
 }
@@ -418,6 +471,15 @@ fn ghashAbsorb(ghash: &mut Ghash, bytes: &[u8]) -> () {
     let block = loadField(&ghash.buffer, 0)
     ghashBlock(&mut ghash, block)
     ghash.buffered = 0
+  }
+  static if Target.arch() == Arch.X86_64 {
+    if ghash.hardware && offset + 16 <= bytes.length {
+      let whole = (bytes.length - offset) / 16 * 16
+      let state = u64x2.fromArray([ghash.state.low, ghash.state.high])
+      let next = unsafe hashInputX86(state, &ghash.powers, Slice.view<u8>(bytes, offset, whole), whole)
+      ghash.state = FieldBlock {high: u64x2.extract(next, 1), low: u64x2.extract(next, 0)}
+      offset = offset + whole
+    }
   }
   while offset + 16 <= bytes.length {
     ghashBlock(&mut ghash, loadField(bytes, offset))
@@ -451,6 +513,8 @@ struct Keystream {
   counter: [u8; 16],
   stream: [u8; 16],
   used: usize,
+  hardware: bool,
+  roundKeys: RoundKeys,
 }
 
 fn nextStream(keystream: &mut Keystream) -> simd<u8, 16> {
@@ -472,6 +536,13 @@ fn keystreamApply(keystream: &mut Keystream, input: &[u8], output: &mut [u8]) ->
     output[offset] = u8.bitXor(input[offset], keystream.stream[keystream.used])
     keystream.used = keystream.used + 1
     offset = offset + 1
+  }
+  static if Target.arch() == Arch.X86_64 {
+    if keystream.hardware && offset + 16 <= input.length {
+      let blocks = (input.length - offset) / 16
+      unsafe counterBlocksX86(&keystream.roundKeys, &mut keystream.counter, input, offset, &mut output, blocks)
+      offset = offset + blocks * 16
+    }
   }
   while offset + 16 <= input.length {
     let block = nextStream(&mut keystream)
@@ -505,6 +576,15 @@ fn makeCore(key: &[u8], nonce: &[u8]) -> Core {
   let schedule = expand(key)
   let zero: [u8; 16] = [0; 16]
   let hashKey = loadField(&u8x16.toArray(aes.encryptState(&schedule, u8x16.load(&zero, 0))), 0)
+  let fast = hardware()
+  let mut roundKeys = zeroRoundKeys()
+  let mut powers = zeroHashKeys()
+  static if Target.arch() == Arch.X86_64 {
+    if fast {
+      roundKeys = unsafe expandKeyX86(key)
+      powers = unsafe hashKeysX86(u64x2.fromArray([hashKey.low, hashKey.high]))
+    }
+  }
   let mut first: [u8; 16] = [0; 16]
   if nonce.length == 12 {
     let mut index: usize = 0
@@ -520,6 +600,8 @@ fn makeCore(key: &[u8], nonce: &[u8]) -> Core {
       state: FieldBlock { high: 0, low: 0 },
       buffer: [0; 16],
       buffered: 0,
+      hardware: false,
+      powers: zeroHashKeys(),
     }
     ghashAbsorb(&mut nonceHash, nonce)
     ghashPad(&mut nonceHash)
@@ -536,7 +618,14 @@ fn makeCore(key: &[u8], nonce: &[u8]) -> Core {
     }
   }
   let mask = u8x16.toArray(aes.encryptState(&schedule, u8x16.load(&first, 0)))
-  let mut keystream = Keystream { key: move schedule, counter: first, stream: [0; 16], used: 16 }
+  let mut keystream = Keystream {
+    key: move schedule,
+    counter: first,
+    stream: [0; 16],
+    used: 16,
+    hardware: fast,
+    roundKeys: move roundKeys,
+  }
 
   // The message starts at the second counter block.
   drop nextStream(&mut keystream)
@@ -547,6 +636,8 @@ fn makeCore(key: &[u8], nonce: &[u8]) -> Core {
       state: FieldBlock { high: 0, low: 0 },
       buffer: [0; 16],
       buffered: 0,
+      hardware: fast,
+      powers: move powers,
     },
     mask: mask,
     aadLength: 0,
@@ -900,13 +991,6 @@ static if Target.arch() == Arch.X86_64 {
     high: simd<u64, 2>,
   }
 
-  // The round keys of AES-128 (10 rounds), AES-192 (12 rounds) or AES-256 (14 rounds), as
-  // `aesenc` takes them.
-  struct RoundKeys {
-    keys: [simd<u64, 2>; 15],
-    rounds: usize,
-  }
-
   @features("aes", "pclmul", "ssse3")
   unsafe fn sealX86(key: &[u8], nonce: &[u8], aad: &[u8], plaintext: &[u8], ciphertext: &mut [u8], tag: &mut [u8]) -> () {
     let keys = unsafe expandKeyX86(key)
@@ -1076,10 +1160,6 @@ static if Target.arch() == Arch.X86_64 {
     return Product {low: low ^ u64x2.shuffle(zero, middle, [0, 2]), high: high ^ u64x2.shuffle(middle, zero, [1, 2])}
   }
 
-  fn addProducts(left: Product, right: Product) -> Product {
-    return Product {low: left.low ^ right.low, high: left.high ^ right.high}
-  }
-
   // The element of a product (Gueron and Kounavis, "Intel Carry-Less Multiplication Instruction
   // and its Usage for Computing the GCM Mode", algorithm 5). Read as big-endian integers, the
   // operands' bits are reflected, so the product is shifted left by one and reduced modulo
@@ -1106,22 +1186,20 @@ static if Target.arch() == Arch.X86_64 {
     return reduce(unsafe productX86(left, right))
   }
 
-  // The hash key's powers H, H^2, H^3 and H^4. Four blocks hash as
-  // ((X + b0) H^4) + (b1 H^3) + (b2 H^2) + (b3 H) with one reduction, so the four products do not
-  // wait for each other.
-  struct HashKeys {
-    first: simd<u64, 2>,
-    second: simd<u64, 2>,
-    third: simd<u64, 2>,
-    fourth: simd<u64, 2>,
-  }
-
   @features("aes", "pclmul", "ssse3")
   unsafe fn hashKeysX86(key: simd<u64, 2>) -> HashKeys {
-    let second = unsafe multiplyX86(key, key)
-    let third = unsafe multiplyX86(second, key)
-    let fourth = unsafe multiplyX86(third, key)
-    return HashKeys {first: key, second: second, third: third, fourth: fourth}
+    let mut keys = zeroHashKeys()
+    let mut power = key
+    let mut index: usize = 0
+    while index < 8 {
+      let swapped = u64x2.shuffle(power, power, [1, 0])
+      keys.powers[index] = power
+      keys.swapped[index] = swapped
+      keys.sums[index] = power ^ swapped
+      power = unsafe multiplyX86(power, key)
+      index = index + 1
+    }
+    return move keys
   }
 
   // `hashInput` with carry-less multiplication, four blocks per reduction.
@@ -1129,16 +1207,30 @@ static if Target.arch() == Arch.X86_64 {
   unsafe fn hashInputX86(state: simd<u64, 2>, keys: &HashKeys, input: &[u8], length: usize) -> simd<u64, 2> {
     let mut current = state
     let mut offset: usize = 0
-    while length - offset >= 64 {
-      let a = unsafe productX86(current ^ elementAt(input, offset), keys.fourth)
-      let b = unsafe productX86(elementAt(input, offset + 16), keys.third)
-      let c = unsafe productX86(elementAt(input, offset + 32), keys.second)
-      let d = unsafe productX86(elementAt(input, offset + 48), keys.first)
-      current = reduce(addProducts(addProducts(move a, move b), addProducts(move c, move d)))
-      offset = offset + 64
+    let zero = u64x2.splat(0)
+    while length - offset >= 128 {
+      // Karatsuba per block, with the three partial sums added over all eight blocks first.
+      let mut low = zero
+      let mut high = zero
+      let mut middle = zero
+      let mut block: usize = 0
+      while block < 8 {
+        let mut element = elementAt(input, offset + block * 16)
+        if block == 0 {
+          element = element ^ current
+        }
+        let swapped = u64x2.shuffle(element, element, [1, 0])
+        low = low ^ Intrinsic.x86CarrylessMultiply<simd<u64, 2>>(element, keys.powers[7 - block])
+        high = high ^ Intrinsic.x86CarrylessMultiply<simd<u64, 2>>(swapped, keys.swapped[7 - block])
+        middle = middle ^ Intrinsic.x86CarrylessMultiply<simd<u64, 2>>(element ^ swapped, keys.sums[7 - block])
+        block = block + 1
+      }
+      middle = middle ^ low ^ high
+      current = reduce(Product {low: low ^ u64x2.shuffle(zero, middle, [0, 2]), high: high ^ u64x2.shuffle(middle, zero, [1, 2])})
+      offset = offset + 128
     }
     while length - offset >= 16 {
-      current = unsafe multiplyX86(current ^ elementAt(input, offset), keys.first)
+      current = unsafe multiplyX86(current ^ elementAt(input, offset), keys.powers[0])
       offset = offset + 16
     }
     if offset < length {
@@ -1149,7 +1241,7 @@ static if Target.arch() == Arch.X86_64 {
         index = index + 1
         offset = offset + 1
       }
-      current = unsafe multiplyX86(current ^ elementAt(&last, 0), keys.first)
+      current = unsafe multiplyX86(current ^ elementAt(&last, 0), keys.powers[0])
     }
     return current
   }
@@ -1162,9 +1254,69 @@ static if Target.arch() == Arch.X86_64 {
     let mut state = unsafe hashInputX86(u64x2.splat(0), &powers, aad, aad.length)
     state = unsafe hashInputX86(state, &powers, ciphertext, length)
     let sizes = u64x2.fromArray([usize.toU64(length) * 8, usize.toU64(aad.length) * 8])
-    let digest = unsafe multiplyX86(state ^ sizes, powers.first)
+    let digest = unsafe multiplyX86(state ^ sizes, powers.powers[0])
     let mask = unsafe encryptX86(keys, u8x16.fromArray(counterBlock(nonce, 1)))
     return mask ^ reverse(u64x2.bitcastToU8x16(digest))
+  }
+
+  // `blocks` whole blocks of the GCM counter mode, eight at a time, from `counter`, which then
+  // holds the next counter block. inc32 steps only the last four bytes, which wrap.
+  @features("aes", "pclmul", "ssse3")
+  unsafe fn counterBlocksX86(keys: &RoundKeys, counter: &mut [u8; 16], input: &[u8], offset: usize, output: &mut [u8], blocks: usize) -> () {
+    let mut current = u8x16.bitcastToU32x4(reverse(u8x16.load(&counter, 0)))
+    let one = u32x4.fromArray([1, 0, 0, 0])
+    let first = keys.keys[0]
+    let mut done: usize = 0
+    while done + 8 <= blocks {
+      let mut v0 = u8x16.bitcastToU64x2(reverse(u32x4.bitcastToU8x16(current))) ^ first
+      current = u32x4.wrappingAdd(current, one)
+      let mut v1 = u8x16.bitcastToU64x2(reverse(u32x4.bitcastToU8x16(current))) ^ first
+      current = u32x4.wrappingAdd(current, one)
+      let mut v2 = u8x16.bitcastToU64x2(reverse(u32x4.bitcastToU8x16(current))) ^ first
+      current = u32x4.wrappingAdd(current, one)
+      let mut v3 = u8x16.bitcastToU64x2(reverse(u32x4.bitcastToU8x16(current))) ^ first
+      current = u32x4.wrappingAdd(current, one)
+      let mut v4 = u8x16.bitcastToU64x2(reverse(u32x4.bitcastToU8x16(current))) ^ first
+      current = u32x4.wrappingAdd(current, one)
+      let mut v5 = u8x16.bitcastToU64x2(reverse(u32x4.bitcastToU8x16(current))) ^ first
+      current = u32x4.wrappingAdd(current, one)
+      let mut v6 = u8x16.bitcastToU64x2(reverse(u32x4.bitcastToU8x16(current))) ^ first
+      current = u32x4.wrappingAdd(current, one)
+      let mut v7 = u8x16.bitcastToU64x2(reverse(u32x4.bitcastToU8x16(current))) ^ first
+      current = u32x4.wrappingAdd(current, one)
+      let mut round: usize = 1
+      while round < keys.rounds {
+        let key = keys.keys[round]
+        v0 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v0, key)
+        v1 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v1, key)
+        v2 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v2, key)
+        v3 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v3, key)
+        v4 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v4, key)
+        v5 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v5, key)
+        v6 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v6, key)
+        v7 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v7, key)
+        round = round + 1
+      }
+      let last = keys.keys[keys.rounds]
+      let at = offset + done * 16
+      u8x16.store(&mut output, at + 0, u8x16.load(input, at + 0) ^ u64x2.bitcastToU8x16(Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v0, last)))
+      u8x16.store(&mut output, at + 16, u8x16.load(input, at + 16) ^ u64x2.bitcastToU8x16(Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v1, last)))
+      u8x16.store(&mut output, at + 32, u8x16.load(input, at + 32) ^ u64x2.bitcastToU8x16(Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v2, last)))
+      u8x16.store(&mut output, at + 48, u8x16.load(input, at + 48) ^ u64x2.bitcastToU8x16(Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v3, last)))
+      u8x16.store(&mut output, at + 64, u8x16.load(input, at + 64) ^ u64x2.bitcastToU8x16(Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v4, last)))
+      u8x16.store(&mut output, at + 80, u8x16.load(input, at + 80) ^ u64x2.bitcastToU8x16(Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v5, last)))
+      u8x16.store(&mut output, at + 96, u8x16.load(input, at + 96) ^ u64x2.bitcastToU8x16(Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v6, last)))
+      u8x16.store(&mut output, at + 112, u8x16.load(input, at + 112) ^ u64x2.bitcastToU8x16(Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v7, last)))
+      done = done + 8
+    }
+    while done < blocks {
+      let at = offset + done * 16
+      let stream = unsafe encryptX86(keys, reverse(u32x4.bitcastToU8x16(current)))
+      current = u32x4.wrappingAdd(current, one)
+      u8x16.store(&mut output, at, u8x16.load(input, at) ^ stream)
+      done = done + 1
+    }
+    u8x16.store(&mut counter, 0, reverse(u32x4.bitcastToU8x16(current)))
   }
 
   fn readU32BigEndian(bytes: &[u8], offset: usize) -> u32 {

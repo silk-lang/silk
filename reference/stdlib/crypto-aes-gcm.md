@@ -17,7 +17,9 @@ must stay readable. The ciphertext has the same length as the plaintext. Nothing
 
 For data that arrives in parts, such as a stream or a Node.js `createCipheriv` call, use
 [`AesGcmEncryptor`](#AesGcmEncryptor) and [`AesGcmDecryptor`](#AesGcmDecryptor). They take the message in any split, give the same
-result, accept nonces of any nonzero length, and can write a truncated tag.
+result, accept nonces of any nonzero length, and can write a truncated tag. On x86-64 they check
+for AES-NI and PCLMULQDQ at run time, as [`AesGcm.seal`](#AesGcm.impl.seal) and [`AesGcm.open`](#AesGcm.impl.open) do, and then run
+the counter mode and GHASH eight blocks at a time.
 
 ## Errors
 The functions return an [`AesGcmError`](#AesGcmError). All checks come before the first write, and on any
