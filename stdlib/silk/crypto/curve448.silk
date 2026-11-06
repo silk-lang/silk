@@ -1,0 +1,871 @@
+//! Agree on a shared secret with X448 (RFC 7748) on the Goldilocks curve, Curve448.
+//!
+//! # When to use
+//! Use [`X448`] when two parties must get the same secret over a channel that others can read and
+//! a 224-bit security level is wanted, for example in a TLS 1.3 handshake with the `x448` group.
+//! Each side makes a key with [`X448.generate`], sends [`X448.publicKey`], and calls
+//! [`X448.agree`] with the public key of the other side. Then derive the real keys from the shared
+//! secret with `silk.crypto.hkdf`. For the more common 128-bit level, use `silk.crypto.x25519`.
+//!
+//! # Details
+//! Secrets, public keys, and shared secrets are 56 bytes, little-endian. A secret is clamped as RFC
+//! 7748 says, so all 56-byte values are valid. The field is the integers modulo
+//! `p = 2^448 - 2^224 - 1`, held as sixteen 28-bit limbs, and every step on a secret runs in
+//! constant time. Nothing allocates. Use `silk.crypto.okp_key` to read and write the keys in PKCS #8
+//! and SubjectPublicKeyInfo.
+//!
+//! # Errors
+//! - [`X448Error`] for an input with the wrong length, or for a peer key that gives an all-zero
+//!   secret.
+//!
+//! # Gotchas
+//! The exchange does not tell you who the other side is. An attacker in the middle can run one
+//! exchange with each side. Authenticate the exchange, for example with a certificate signature. Do
+//! not use the shared secret directly as a key. The key is not erased when it is dropped.
+//!
+//! # Examples
+//! ## Agree on a secret (RFC 7748 test vector)
+//! ```silk
+import silk.core.result { Result }
+//! import silk.crypto.curve448 { X448, X448Error }
+//!
+//! pub fn main() -> i32 {
+//!   // Real programs use `X448.generate()` with a secure `Random` provider.
+//!   let alice = match X448.fromSecret(
+//!     b"\x9a\x8f\x49\x25\xd1\x51\x9f\x57\x75\xcf\x46\xb0\x4b\x58\x00\xd4\xee\x9e\xe8\xba\xe8\xbc\x55\x65\xd4\x98\xc2\x8d\xd9\xc9\xba\xf5\x74\xa9\x41\x97\x44\x89\x73\x91\x00\x63\x82\xa6\xf1\x27\xab\x1d\x9a\xc2\xd8\xc0\xa5\x98\x72\x6b"
+//!   ) {
+//!     Result<X448, X448Error>.Success { value } => move value
+//!     Result<X448, X448Error>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let bob = match X448.fromSecret(
+//!     b"\x1c\x30\x6a\x7a\xc2\xa0\xe2\xe0\x99\x0b\x29\x44\x70\xcb\xa3\x39\xe6\x45\x37\x72\xb0\x75\x81\x1d\x8f\xad\x0d\x1d\x69\x27\xc1\x20\xbb\x5e\xe8\x97\x2b\x0d\x3e\x21\x37\x4c\x9c\x92\x1b\x09\xd1\xb0\x36\x6f\x10\xb6\x51\x73\x99\x2d"
+//!   ) {
+//!     Result<X448, X448Error>.Success { value } => move value
+//!     Result<X448, X448Error>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let alicePublic = X448.publicKey(&alice)
+//!   let bobPublic = X448.publicKey(&bob)
+//!   let fromAlice = match X448.agree(move alice, &bobPublic) {
+//!     Result<[u8; 56], X448Error>.Success { value } => value
+//!     Result<[u8; 56], X448Error>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let fromBob = match X448.agree(move bob, &alicePublic) {
+//!     Result<[u8; 56], X448Error>.Success { value } => value
+//!     Result<[u8; 56], X448Error>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!
+//!   // Both sides get 07fff418...a5d.
+//!   if alicePublic[0] != 0x9b || fromAlice[0] != 0x07 || fromBob[0] != 0x07 || fromBob[55] != 0x5d {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Cryptography
+
+import silk.text.format { Debug, Format, Formatter }
+import silk.system.random { Random }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.num.u8
+import silk.num.u64
+import silk.num.usize
+import silk.io.writer { Writer, WriterError }
+
+/// The reason that an X448 call failed. It holds no secret bytes.
+pub union X448Error {
+  /// The secret is not 56 bytes.
+  InvalidScalarLength,
+  /// The public key of the peer is not 56 bytes.
+  InvalidPeerLength,
+  /// The public key of the peer gives an all-zero shared secret. This occurs for a few low-order
+  /// points that a hostile peer can send.
+  AllZeroSharedSecret,
+}
+
+impl Debug for X448Error {
+  /// Writes the name of the variant, such as `InvalidScalarLength`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      X448Error.InvalidScalarLength => run Format.write(&mut formatter, b"InvalidScalarLength")
+      X448Error.InvalidPeerLength => run Format.write(&mut formatter, b"InvalidPeerLength")
+      X448Error.AllZeroSharedSecret => run Format.write(&mut formatter, b"AllZeroSharedSecret")
+    }
+  }
+}
+
+/// An X448 key pair: a secret and its public key.
+///
+/// # When to use
+/// Use it when two parties must get the same secret over a channel that others can read. Each side
+/// makes a key with [`X448.generate`], sends [`X448.publicKey`], and calls [`X448.agree`] with the
+/// public key of the other side.
+///
+/// # Details
+/// [`X448.agree`] consumes it; [`X448.agreeWith`] borrows it, for a static key. Secrets, public
+/// keys, and shared secrets are 56 bytes, little-endian. Nothing allocates.
+///
+/// # Gotchas
+/// The exchange does not tell you who the other side is. Authenticate the exchange, for example
+/// with a certificate signature. Derive the real keys from the shared secret with
+/// `silk.crypto.hkdf`. The key is not erased when it is dropped.
+pub struct X448 {
+  secretBytes: [u8; 56],
+  scalar: [u8; 56],
+  public: [u8; 56],
+}
+
+impl X448 {
+  /// Returns the key pair for the 56-byte secret `bytes`. The bytes are copied, and clamped as RFC
+  /// 7748 says before use.
+  ///
+  /// # Errors
+  /// - `InvalidScalarLength` if `bytes` is not 56 bytes.
+  ///
+  /// # Gotchas
+  /// For a new exchange, use [`X448.generate`]. A secret that is used for two exchanges gives the
+  /// same public key to both, so the exchanges can be linked.
+  pub fn fromSecret(bytes: &[u8]) -> Result<X448, X448Error> {
+    if bytes.length != 56 {
+      return Result<X448, X448Error>.failResult(X448Error.InvalidScalarLength)
+    }
+    return Result<X448, X448Error>.succeed(makeX448(bytes))
+  }
+
+  /// Returns a new key pair with a secret from 56 bytes of the ambient `Random`.
+  ///
+  /// The `Random` provider must be cryptographically secure. If it fails, the program stops. There
+  /// is no fallback to a weaker source.
+  pub effect fn generate() -> X448 ? &mut Random {
+    let mut bytes: [u8; 56] = [0; 56]
+    run Random.fillBytes(&mut bytes)
+    return makeX448(&bytes)
+  }
+
+  /// Returns the 56 secret bytes as they were given, before clamping. PKCS #8 stores these bytes.
+  pub fn secret(self: &X448) -> [u8; 56] {
+    return self.secretBytes
+  }
+
+  /// Returns the 56-byte public key to send to the peer. It does not consume the key pair.
+  pub fn publicKey(self: &X448) -> [u8; 56] {
+    return self.public
+  }
+
+  /// Returns the 56-byte shared secret for the public key `peer` of the other side, and consumes
+  /// the key pair.
+  ///
+  /// As RFC 7748 says, any 56-byte value is accepted, also a value that is not below `p` or a point
+  /// that is not on the curve.
+  ///
+  /// # Errors
+  /// - `InvalidPeerLength` if `peer` is not 56 bytes.
+  /// - `AllZeroSharedSecret` if the result is all zeros. Stop the exchange.
+  ///
+  /// The key pair is consumed also when it fails.
+  pub fn agree(self: X448, peer: &[u8]) -> Result<[u8; 56], X448Error> {
+    return self.agreeWith(peer)
+  }
+
+  /// Returns the 56-byte shared secret for the public key `peer`, as [`X448.agree`] does, but
+  /// borrows the key pair so that a static key can agree with many peers.
+  ///
+  /// # Errors
+  /// - `InvalidPeerLength` if `peer` is not 56 bytes.
+  /// - `AllZeroSharedSecret` if the result is all zeros. Stop the exchange.
+  ///
+  /// # Gotchas
+  /// A static key gives no forward secrecy. Prefer a new key pair for each exchange.
+  pub fn agreeWith(self: &X448, peer: &[u8]) -> Result<[u8; 56], X448Error> {
+    if peer.length != 56 {
+      return Result<[u8; 56], X448Error>.failResult(X448Error.InvalidPeerLength)
+    }
+    let shared = ladder(&self.scalar, peer)
+    // An OR of all bytes keeps the check free of early exits.
+    let mut total: u8 = 0
+    let mut index: usize = 0
+    while index < 56 {
+      total = u8.bitOr(total, shared[index])
+      index = index + 1
+    }
+    if total == 0 {
+      return Result<[u8; 56], X448Error>.failResult(X448Error.AllZeroSharedSecret)
+    }
+    return Result<[u8; 56], X448Error>.succeed(move shared)
+  }
+}
+
+fn makeX448(bytes: &[u8]) -> X448 {
+  let mut secretBytes: [u8; 56] = [0; 56]
+  let mut index: usize = 0
+  while index < 56 {
+    secretBytes[index] = bytes[index]
+    index = index + 1
+  }
+  let mut scalar = secretBytes
+  scalar[0] = u8.bitAnd(scalar[0], 252)
+  scalar[55] = u8.bitOr(scalar[55], 128)
+  let mut base: [u8; 56] = [0; 56]
+  base[0] = 5
+  let public = ladder(&scalar, &base)
+  return X448 { secretBytes: move secretBytes, scalar: move scalar, public: move public }
+}
+
+// The Montgomery ladder of RFC 7748 for the clamped `scalar` and the u-coordinate `peer`, with a
+// constant-time swap on each of the 448 bits.
+fn ladder(scalar: &[u8; 56], peer: &[u8]) -> [u8; 56] {
+  let x1 = decodeField(peer)
+  let mut x2 = one()
+  let mut z2 = zero()
+  let mut x3 = x1
+  let mut z3 = one()
+  let mut previous: u64 = 0
+  let mut remaining: usize = 448
+  while remaining > 0 {
+    remaining = remaining - 1
+    let bit = u64.bitAnd(
+      u64.shiftRight(u8.toU64(scalar[remaining / 8]), usize.toU64(remaining % 8)),
+      1,
+    )
+    let switched = u64.bitXor(previous, bit)
+    swap(&mut x2, &mut x3, switched)
+    swap(&mut z2, &mut z3, switched)
+    previous = bit
+    let a = add(&x2, &z2)
+    let aa = square(&a)
+    let b = subtract(&x2, &z2)
+    let bb = square(&b)
+    let e = subtract(&aa, &bb)
+    let c = add(&x3, &z3)
+    let d = subtract(&x3, &z3)
+    let da = product(&d, &a)
+    let cb = product(&c, &b)
+    let sum = add(&da, &cb)
+    x3 = square(&sum)
+    let difference = subtract(&da, &cb)
+    let differenceSquared = square(&difference)
+    z3 = product(&x1, &differenceSquared)
+    x2 = product(&aa, &bb)
+    let scaled = multiplySmall(&e, 39081)
+    let combined = add(&aa, &scaled)
+    z2 = product(&e, &combined)
+  }
+  swap(&mut x2, &mut x3, previous)
+  swap(&mut z2, &mut z3, previous)
+  let reciprocal = inverse(&z2)
+  let result = product(&x2, &reciprocal)
+  return encodeField(&result)
+}
+
+// Field elements modulo p = 2^448 - 2^224 - 1, as eight 56-bit limbs, least significant first.
+// Since 2^448 = 2^224 + 1 modulo p, a carry out of the top limb goes into limbs 0 and 4. `product`,
+// `square`, `carry`, and `multiplySmall` return weakly reduced values, with limbs below 2^56 + 2^12.
+// `add` and `subtract` do not carry, so their limbs can reach 2^58; `product` and `square` accept
+// limbs up to 2^59. A value can still be p or above; `canonical` gives the value below p. This is
+// the representation of Mike Hamburg's Goldilocks code, which OpenSSL also uses.
+struct Field {
+  limbs: [u64; 8],
+}
+
+impl Copy for Field {}
+
+const LIMB_MASK: u64 = 72057594037927935
+
+fn zero() -> Field {
+  return Field { limbs: [0; 8] }
+}
+
+fn one() -> Field {
+  let mut result = zero()
+  result.limbs[0] = 1
+  return move result
+}
+
+// Brings limbs below 2^63 into the weakly reduced form with one pass: each limb keeps 56 bits, and
+// limb 7 carries at most 2^7 into limbs 0 and 4.
+fn carry(value: Field) -> Field {
+  let mut result = move value
+  let mut index: usize = 0
+  while index < 7 {
+    result.limbs[index + 1] = u64.wrappingAdd(
+      result.limbs[index + 1],
+      u64.shiftRight(result.limbs[index], 56),
+    )
+    result.limbs[index] = u64.bitAnd(result.limbs[index], LIMB_MASK)
+    index = index + 1
+  }
+  let top = u64.shiftRight(result.limbs[7], 56)
+  result.limbs[7] = u64.bitAnd(result.limbs[7], LIMB_MASK)
+  result.limbs[0] = u64.wrappingAdd(result.limbs[0], top)
+  result.limbs[4] = u64.wrappingAdd(result.limbs[4], top)
+  return move result
+}
+
+// Returns the value below p. Three more carry passes leave all limbs below 2^56. A pass carries out
+// of the top limb only when limbs 4 to 7 overflow together, which leaves limb 4 at 1 and limbs 5 to
+// 7 at 0, so the pass after it cannot carry out again. The value is then below 2^448 < 2p, and
+// adding 2^224 + 1 carries out of bit 448 exactly when it is p or above, so one masked selection
+// subtracts p.
+fn canonical(value: &Field) -> Field {
+  let mut result = carry(carry(carry(value.*)))
+  let mut reduced = zero()
+  let mut carried: u64 = 1
+  let mut index: usize = 0
+  while index < 8 {
+    let mut sum = u64.wrappingAdd(result.limbs[index], carried)
+    if index == 4 {
+      sum = u64.wrappingAdd(sum, 1)
+    }
+    reduced.limbs[index] = u64.bitAnd(sum, LIMB_MASK)
+    carried = u64.shiftRight(sum, 56)
+    index = index + 1
+  }
+  let mask = u64.wrappingSubtract(0, carried)
+  index = 0
+  while index < 8 {
+    result.limbs[index] = u64.bitXor(
+      result.limbs[index],
+      u64.bitAnd(mask, u64.bitXor(result.limbs[index], reduced.limbs[index])),
+    )
+    index = index + 1
+  }
+  return move result
+}
+
+// Adds without carrying. With operands that a product returned, limbs stay below 2^58, which
+// `product` and `carry` accept.
+fn add(left: &Field, right: &Field) -> Field {
+  let mut result = zero()
+  let mut index: usize = 0
+  while index < 8 {
+    result.limbs[index] = u64.wrappingAdd(left.limbs[index], right.limbs[index])
+    index = index + 1
+  }
+  return move result
+}
+
+// Subtracts without carrying, adding 2p first so no limb goes below zero. The limbs of 2p are
+// 2^57 - 2, and 2^57 - 4 at limb 4, so `right` must have limbs below 2^57 - 4, as a product or a
+// carry returns. The result has limbs below 2^58 when `left` came from a product.
+fn subtract(left: &Field, right: &Field) -> Field {
+  let mut result = zero()
+  let mut index: usize = 0
+  while index < 8 {
+    let mut twicePrime: u64 = 144115188075855870
+    if index == 4 {
+      twicePrime = 144115188075855868
+    }
+    result.limbs[index] = u64.wrappingSubtract(
+      u64.wrappingAdd(left.limbs[index], twicePrime),
+      right.limbs[index],
+    )
+    index = index + 1
+  }
+  return move result
+}
+
+// Karatsuba multiplication on the halves of 224 bits, with phi = 2^224 and phi^2 = phi + 1:
+// (a0 + a1 phi)(b0 + b1 phi) = (a0 b0 + a1 b1) + ((a0 + a1)(b0 + b1) - a0 b0) phi. It is the
+// `gf_mul` of the arch_64 Goldilocks field, unrolled, with each 128-bit accumulator held as a low
+// and a high word. It takes 48 word products. With limbs below 2^59 an accumulator stays below
+// 2^124, and the result limbs are below 2^56 + 2^12, so no final carry is needed.
+fn product(left: &Field, right: &Field) -> Field {
+  let a0 = left.limbs[0]
+  let a1 = left.limbs[1]
+  let a2 = left.limbs[2]
+  let a3 = left.limbs[3]
+  let a4 = left.limbs[4]
+  let a5 = left.limbs[5]
+  let a6 = left.limbs[6]
+  let a7 = left.limbs[7]
+  let b0 = right.limbs[0]
+  let b1 = right.limbs[1]
+  let b2 = right.limbs[2]
+  let b3 = right.limbs[3]
+  let b4 = right.limbs[4]
+  let b5 = right.limbs[5]
+  let b6 = right.limbs[6]
+  let b7 = right.limbs[7]
+  let aa0 = u64.wrappingAdd(a0, a4)
+  let aa1 = u64.wrappingAdd(a1, a5)
+  let aa2 = u64.wrappingAdd(a2, a6)
+  let aa3 = u64.wrappingAdd(a3, a7)
+  let bb0 = u64.wrappingAdd(b0, b4)
+  let bb1 = u64.wrappingAdd(b1, b5)
+  let bb2 = u64.wrappingAdd(b2, b6)
+  let bb3 = u64.wrappingAdd(b3, b7)
+  let bbb0 = u64.wrappingAdd(bb0, b4)
+  let bbb1 = u64.wrappingAdd(bb1, b5)
+  let bbb2 = u64.wrappingAdd(bb2, b6)
+  let bbb3 = u64.wrappingAdd(bb3, b7)
+  let mut sum0Low: u64 = 0
+  let mut sum0High: u64 = 0
+  let mut sum1Low: u64 = 0
+  let mut sum1High: u64 = 0
+  let mut sum2Low: u64 = 0
+  let mut sum2High: u64 = 0
+  sum2Low = 0
+  sum2High = 0
+  sum2Low = u64.wrappingAdd(sum2Low, u64.wrappingMultiply(a0, b0))
+  sum2High = u64.wrappingAdd(sum2High, u64.wrappingAdd(u64.multiplyHigh(a0, b0), carryOf(sum2Low, u64.wrappingMultiply(a0, b0))))
+  sum1Low = u64.wrappingAdd(sum1Low, u64.wrappingMultiply(aa0, bb0))
+  sum1High = u64.wrappingAdd(sum1High, u64.wrappingAdd(u64.multiplyHigh(aa0, bb0), carryOf(sum1Low, u64.wrappingMultiply(aa0, bb0))))
+  sum0Low = u64.wrappingAdd(sum0Low, u64.wrappingMultiply(a4, b4))
+  sum0High = u64.wrappingAdd(sum0High, u64.wrappingAdd(u64.multiplyHigh(a4, b4), carryOf(sum0Low, u64.wrappingMultiply(a4, b4))))
+  sum2Low = u64.wrappingAdd(sum2Low, u64.wrappingMultiply(a1, b7))
+  sum2High = u64.wrappingAdd(sum2High, u64.wrappingAdd(u64.multiplyHigh(a1, b7), carryOf(sum2Low, u64.wrappingMultiply(a1, b7))))
+  sum1Low = u64.wrappingAdd(sum1Low, u64.wrappingMultiply(aa1, bbb3))
+  sum1High = u64.wrappingAdd(sum1High, u64.wrappingAdd(u64.multiplyHigh(aa1, bbb3), carryOf(sum1Low, u64.wrappingMultiply(aa1, bbb3))))
+  sum0Low = u64.wrappingAdd(sum0Low, u64.wrappingMultiply(a5, bb3))
+  sum0High = u64.wrappingAdd(sum0High, u64.wrappingAdd(u64.multiplyHigh(a5, bb3), carryOf(sum0Low, u64.wrappingMultiply(a5, bb3))))
+  sum2Low = u64.wrappingAdd(sum2Low, u64.wrappingMultiply(a2, b6))
+  sum2High = u64.wrappingAdd(sum2High, u64.wrappingAdd(u64.multiplyHigh(a2, b6), carryOf(sum2Low, u64.wrappingMultiply(a2, b6))))
+  sum1Low = u64.wrappingAdd(sum1Low, u64.wrappingMultiply(aa2, bbb2))
+  sum1High = u64.wrappingAdd(sum1High, u64.wrappingAdd(u64.multiplyHigh(aa2, bbb2), carryOf(sum1Low, u64.wrappingMultiply(aa2, bbb2))))
+  sum0Low = u64.wrappingAdd(sum0Low, u64.wrappingMultiply(a6, bb2))
+  sum0High = u64.wrappingAdd(sum0High, u64.wrappingAdd(u64.multiplyHigh(a6, bb2), carryOf(sum0Low, u64.wrappingMultiply(a6, bb2))))
+  sum2Low = u64.wrappingAdd(sum2Low, u64.wrappingMultiply(a3, b5))
+  sum2High = u64.wrappingAdd(sum2High, u64.wrappingAdd(u64.multiplyHigh(a3, b5), carryOf(sum2Low, u64.wrappingMultiply(a3, b5))))
+  sum1Low = u64.wrappingAdd(sum1Low, u64.wrappingMultiply(aa3, bbb1))
+  sum1High = u64.wrappingAdd(sum1High, u64.wrappingAdd(u64.multiplyHigh(aa3, bbb1), carryOf(sum1Low, u64.wrappingMultiply(aa3, bbb1))))
+  sum0Low = u64.wrappingAdd(sum0Low, u64.wrappingMultiply(a7, bb1))
+  sum0High = u64.wrappingAdd(sum0High, u64.wrappingAdd(u64.multiplyHigh(a7, bb1), carryOf(sum0Low, u64.wrappingMultiply(a7, bb1))))
+  let borrow0 = borrowOf(sum1Low, sum2Low)
+  sum1Low = u64.wrappingSubtract(sum1Low, sum2Low)
+  sum1High = u64.wrappingSubtract(u64.wrappingSubtract(sum1High, sum2High), borrow0)
+  sum0Low = u64.wrappingAdd(sum0Low, sum2Low)
+  sum0High = u64.wrappingAdd(u64.wrappingAdd(sum0High, sum2High), carryOf(sum0Low, sum2Low))
+  let mut c0 = u64.bitAnd(sum0Low, LIMB_MASK)
+  let mut c4 = u64.bitAnd(sum1Low, LIMB_MASK)
+  sum0Low = u64.bitOr(u64.shiftRight(sum0Low, 56), u64.shiftLeft(sum0High, 8))
+  sum0High = u64.shiftRight(sum0High, 56)
+  sum1Low = u64.bitOr(u64.shiftRight(sum1Low, 56), u64.shiftLeft(sum1High, 8))
+  sum1High = u64.shiftRight(sum1High, 56)
+  sum2Low = 0
+  sum2High = 0
+  sum2Low = u64.wrappingAdd(sum2Low, u64.wrappingMultiply(a0, b1))
+  sum2High = u64.wrappingAdd(sum2High, u64.wrappingAdd(u64.multiplyHigh(a0, b1), carryOf(sum2Low, u64.wrappingMultiply(a0, b1))))
+  sum1Low = u64.wrappingAdd(sum1Low, u64.wrappingMultiply(aa0, bb1))
+  sum1High = u64.wrappingAdd(sum1High, u64.wrappingAdd(u64.multiplyHigh(aa0, bb1), carryOf(sum1Low, u64.wrappingMultiply(aa0, bb1))))
+  sum0Low = u64.wrappingAdd(sum0Low, u64.wrappingMultiply(a4, b5))
+  sum0High = u64.wrappingAdd(sum0High, u64.wrappingAdd(u64.multiplyHigh(a4, b5), carryOf(sum0Low, u64.wrappingMultiply(a4, b5))))
+  sum2Low = u64.wrappingAdd(sum2Low, u64.wrappingMultiply(a1, b0))
+  sum2High = u64.wrappingAdd(sum2High, u64.wrappingAdd(u64.multiplyHigh(a1, b0), carryOf(sum2Low, u64.wrappingMultiply(a1, b0))))
+  sum1Low = u64.wrappingAdd(sum1Low, u64.wrappingMultiply(aa1, bb0))
+  sum1High = u64.wrappingAdd(sum1High, u64.wrappingAdd(u64.multiplyHigh(aa1, bb0), carryOf(sum1Low, u64.wrappingMultiply(aa1, bb0))))
+  sum0Low = u64.wrappingAdd(sum0Low, u64.wrappingMultiply(a5, b4))
+  sum0High = u64.wrappingAdd(sum0High, u64.wrappingAdd(u64.multiplyHigh(a5, b4), carryOf(sum0Low, u64.wrappingMultiply(a5, b4))))
+  sum2Low = u64.wrappingAdd(sum2Low, u64.wrappingMultiply(a2, b7))
+  sum2High = u64.wrappingAdd(sum2High, u64.wrappingAdd(u64.multiplyHigh(a2, b7), carryOf(sum2Low, u64.wrappingMultiply(a2, b7))))
+  sum1Low = u64.wrappingAdd(sum1Low, u64.wrappingMultiply(aa2, bbb3))
+  sum1High = u64.wrappingAdd(sum1High, u64.wrappingAdd(u64.multiplyHigh(aa2, bbb3), carryOf(sum1Low, u64.wrappingMultiply(aa2, bbb3))))
+  sum0Low = u64.wrappingAdd(sum0Low, u64.wrappingMultiply(a6, bb3))
+  sum0High = u64.wrappingAdd(sum0High, u64.wrappingAdd(u64.multiplyHigh(a6, bb3), carryOf(sum0Low, u64.wrappingMultiply(a6, bb3))))
+  sum2Low = u64.wrappingAdd(sum2Low, u64.wrappingMultiply(a3, b6))
+  sum2High = u64.wrappingAdd(sum2High, u64.wrappingAdd(u64.multiplyHigh(a3, b6), carryOf(sum2Low, u64.wrappingMultiply(a3, b6))))
+  sum1Low = u64.wrappingAdd(sum1Low, u64.wrappingMultiply(aa3, bbb2))
+  sum1High = u64.wrappingAdd(sum1High, u64.wrappingAdd(u64.multiplyHigh(aa3, bbb2), carryOf(sum1Low, u64.wrappingMultiply(aa3, bbb2))))
+  sum0Low = u64.wrappingAdd(sum0Low, u64.wrappingMultiply(a7, bb2))
+  sum0High = u64.wrappingAdd(sum0High, u64.wrappingAdd(u64.multiplyHigh(a7, bb2), carryOf(sum0Low, u64.wrappingMultiply(a7, bb2))))
+  let borrow1 = borrowOf(sum1Low, sum2Low)
+  sum1Low = u64.wrappingSubtract(sum1Low, sum2Low)
+  sum1High = u64.wrappingSubtract(u64.wrappingSubtract(sum1High, sum2High), borrow1)
+  sum0Low = u64.wrappingAdd(sum0Low, sum2Low)
+  sum0High = u64.wrappingAdd(u64.wrappingAdd(sum0High, sum2High), carryOf(sum0Low, sum2Low))
+  let mut c1 = u64.bitAnd(sum0Low, LIMB_MASK)
+  let mut c5 = u64.bitAnd(sum1Low, LIMB_MASK)
+  sum0Low = u64.bitOr(u64.shiftRight(sum0Low, 56), u64.shiftLeft(sum0High, 8))
+  sum0High = u64.shiftRight(sum0High, 56)
+  sum1Low = u64.bitOr(u64.shiftRight(sum1Low, 56), u64.shiftLeft(sum1High, 8))
+  sum1High = u64.shiftRight(sum1High, 56)
+  sum2Low = 0
+  sum2High = 0
+  sum2Low = u64.wrappingAdd(sum2Low, u64.wrappingMultiply(a0, b2))
+  sum2High = u64.wrappingAdd(sum2High, u64.wrappingAdd(u64.multiplyHigh(a0, b2), carryOf(sum2Low, u64.wrappingMultiply(a0, b2))))
+  sum1Low = u64.wrappingAdd(sum1Low, u64.wrappingMultiply(aa0, bb2))
+  sum1High = u64.wrappingAdd(sum1High, u64.wrappingAdd(u64.multiplyHigh(aa0, bb2), carryOf(sum1Low, u64.wrappingMultiply(aa0, bb2))))
+  sum0Low = u64.wrappingAdd(sum0Low, u64.wrappingMultiply(a4, b6))
+  sum0High = u64.wrappingAdd(sum0High, u64.wrappingAdd(u64.multiplyHigh(a4, b6), carryOf(sum0Low, u64.wrappingMultiply(a4, b6))))
+  sum2Low = u64.wrappingAdd(sum2Low, u64.wrappingMultiply(a1, b1))
+  sum2High = u64.wrappingAdd(sum2High, u64.wrappingAdd(u64.multiplyHigh(a1, b1), carryOf(sum2Low, u64.wrappingMultiply(a1, b1))))
+  sum1Low = u64.wrappingAdd(sum1Low, u64.wrappingMultiply(aa1, bb1))
+  sum1High = u64.wrappingAdd(sum1High, u64.wrappingAdd(u64.multiplyHigh(aa1, bb1), carryOf(sum1Low, u64.wrappingMultiply(aa1, bb1))))
+  sum0Low = u64.wrappingAdd(sum0Low, u64.wrappingMultiply(a5, b5))
+  sum0High = u64.wrappingAdd(sum0High, u64.wrappingAdd(u64.multiplyHigh(a5, b5), carryOf(sum0Low, u64.wrappingMultiply(a5, b5))))
+  sum2Low = u64.wrappingAdd(sum2Low, u64.wrappingMultiply(a2, b0))
+  sum2High = u64.wrappingAdd(sum2High, u64.wrappingAdd(u64.multiplyHigh(a2, b0), carryOf(sum2Low, u64.wrappingMultiply(a2, b0))))
+  sum1Low = u64.wrappingAdd(sum1Low, u64.wrappingMultiply(aa2, bb0))
+  sum1High = u64.wrappingAdd(sum1High, u64.wrappingAdd(u64.multiplyHigh(aa2, bb0), carryOf(sum1Low, u64.wrappingMultiply(aa2, bb0))))
+  sum0Low = u64.wrappingAdd(sum0Low, u64.wrappingMultiply(a6, b4))
+  sum0High = u64.wrappingAdd(sum0High, u64.wrappingAdd(u64.multiplyHigh(a6, b4), carryOf(sum0Low, u64.wrappingMultiply(a6, b4))))
+  sum2Low = u64.wrappingAdd(sum2Low, u64.wrappingMultiply(a3, b7))
+  sum2High = u64.wrappingAdd(sum2High, u64.wrappingAdd(u64.multiplyHigh(a3, b7), carryOf(sum2Low, u64.wrappingMultiply(a3, b7))))
+  sum1Low = u64.wrappingAdd(sum1Low, u64.wrappingMultiply(aa3, bbb3))
+  sum1High = u64.wrappingAdd(sum1High, u64.wrappingAdd(u64.multiplyHigh(aa3, bbb3), carryOf(sum1Low, u64.wrappingMultiply(aa3, bbb3))))
+  sum0Low = u64.wrappingAdd(sum0Low, u64.wrappingMultiply(a7, bb3))
+  sum0High = u64.wrappingAdd(sum0High, u64.wrappingAdd(u64.multiplyHigh(a7, bb3), carryOf(sum0Low, u64.wrappingMultiply(a7, bb3))))
+  let borrow2 = borrowOf(sum1Low, sum2Low)
+  sum1Low = u64.wrappingSubtract(sum1Low, sum2Low)
+  sum1High = u64.wrappingSubtract(u64.wrappingSubtract(sum1High, sum2High), borrow2)
+  sum0Low = u64.wrappingAdd(sum0Low, sum2Low)
+  sum0High = u64.wrappingAdd(u64.wrappingAdd(sum0High, sum2High), carryOf(sum0Low, sum2Low))
+  let c2 = u64.bitAnd(sum0Low, LIMB_MASK)
+  let c6 = u64.bitAnd(sum1Low, LIMB_MASK)
+  sum0Low = u64.bitOr(u64.shiftRight(sum0Low, 56), u64.shiftLeft(sum0High, 8))
+  sum0High = u64.shiftRight(sum0High, 56)
+  sum1Low = u64.bitOr(u64.shiftRight(sum1Low, 56), u64.shiftLeft(sum1High, 8))
+  sum1High = u64.shiftRight(sum1High, 56)
+  sum2Low = 0
+  sum2High = 0
+  sum2Low = u64.wrappingAdd(sum2Low, u64.wrappingMultiply(a0, b3))
+  sum2High = u64.wrappingAdd(sum2High, u64.wrappingAdd(u64.multiplyHigh(a0, b3), carryOf(sum2Low, u64.wrappingMultiply(a0, b3))))
+  sum1Low = u64.wrappingAdd(sum1Low, u64.wrappingMultiply(aa0, bb3))
+  sum1High = u64.wrappingAdd(sum1High, u64.wrappingAdd(u64.multiplyHigh(aa0, bb3), carryOf(sum1Low, u64.wrappingMultiply(aa0, bb3))))
+  sum0Low = u64.wrappingAdd(sum0Low, u64.wrappingMultiply(a4, b7))
+  sum0High = u64.wrappingAdd(sum0High, u64.wrappingAdd(u64.multiplyHigh(a4, b7), carryOf(sum0Low, u64.wrappingMultiply(a4, b7))))
+  sum2Low = u64.wrappingAdd(sum2Low, u64.wrappingMultiply(a1, b2))
+  sum2High = u64.wrappingAdd(sum2High, u64.wrappingAdd(u64.multiplyHigh(a1, b2), carryOf(sum2Low, u64.wrappingMultiply(a1, b2))))
+  sum1Low = u64.wrappingAdd(sum1Low, u64.wrappingMultiply(aa1, bb2))
+  sum1High = u64.wrappingAdd(sum1High, u64.wrappingAdd(u64.multiplyHigh(aa1, bb2), carryOf(sum1Low, u64.wrappingMultiply(aa1, bb2))))
+  sum0Low = u64.wrappingAdd(sum0Low, u64.wrappingMultiply(a5, b6))
+  sum0High = u64.wrappingAdd(sum0High, u64.wrappingAdd(u64.multiplyHigh(a5, b6), carryOf(sum0Low, u64.wrappingMultiply(a5, b6))))
+  sum2Low = u64.wrappingAdd(sum2Low, u64.wrappingMultiply(a2, b1))
+  sum2High = u64.wrappingAdd(sum2High, u64.wrappingAdd(u64.multiplyHigh(a2, b1), carryOf(sum2Low, u64.wrappingMultiply(a2, b1))))
+  sum1Low = u64.wrappingAdd(sum1Low, u64.wrappingMultiply(aa2, bb1))
+  sum1High = u64.wrappingAdd(sum1High, u64.wrappingAdd(u64.multiplyHigh(aa2, bb1), carryOf(sum1Low, u64.wrappingMultiply(aa2, bb1))))
+  sum0Low = u64.wrappingAdd(sum0Low, u64.wrappingMultiply(a6, b5))
+  sum0High = u64.wrappingAdd(sum0High, u64.wrappingAdd(u64.multiplyHigh(a6, b5), carryOf(sum0Low, u64.wrappingMultiply(a6, b5))))
+  sum2Low = u64.wrappingAdd(sum2Low, u64.wrappingMultiply(a3, b0))
+  sum2High = u64.wrappingAdd(sum2High, u64.wrappingAdd(u64.multiplyHigh(a3, b0), carryOf(sum2Low, u64.wrappingMultiply(a3, b0))))
+  sum1Low = u64.wrappingAdd(sum1Low, u64.wrappingMultiply(aa3, bb0))
+  sum1High = u64.wrappingAdd(sum1High, u64.wrappingAdd(u64.multiplyHigh(aa3, bb0), carryOf(sum1Low, u64.wrappingMultiply(aa3, bb0))))
+  sum0Low = u64.wrappingAdd(sum0Low, u64.wrappingMultiply(a7, b4))
+  sum0High = u64.wrappingAdd(sum0High, u64.wrappingAdd(u64.multiplyHigh(a7, b4), carryOf(sum0Low, u64.wrappingMultiply(a7, b4))))
+  let borrow3 = borrowOf(sum1Low, sum2Low)
+  sum1Low = u64.wrappingSubtract(sum1Low, sum2Low)
+  sum1High = u64.wrappingSubtract(u64.wrappingSubtract(sum1High, sum2High), borrow3)
+  sum0Low = u64.wrappingAdd(sum0Low, sum2Low)
+  sum0High = u64.wrappingAdd(u64.wrappingAdd(sum0High, sum2High), carryOf(sum0Low, sum2Low))
+  let c3 = u64.bitAnd(sum0Low, LIMB_MASK)
+  let c7 = u64.bitAnd(sum1Low, LIMB_MASK)
+  sum0Low = u64.bitOr(u64.shiftRight(sum0Low, 56), u64.shiftLeft(sum0High, 8))
+  sum0High = u64.shiftRight(sum0High, 56)
+  sum1Low = u64.bitOr(u64.shiftRight(sum1Low, 56), u64.shiftLeft(sum1High, 8))
+  sum1High = u64.shiftRight(sum1High, 56)
+  sum0Low = u64.wrappingAdd(sum0Low, sum1Low)
+  sum0High = u64.wrappingAdd(u64.wrappingAdd(sum0High, sum1High), carryOf(sum0Low, sum1Low))
+  sum0Low = u64.wrappingAdd(sum0Low, c4)
+  sum0High = u64.wrappingAdd(sum0High, carryOf(sum0Low, c4))
+  sum1Low = u64.wrappingAdd(sum1Low, c0)
+  sum1High = u64.wrappingAdd(sum1High, carryOf(sum1Low, c0))
+  c4 = u64.bitAnd(sum0Low, LIMB_MASK)
+  c0 = u64.bitAnd(sum1Low, LIMB_MASK)
+  c5 = u64.wrappingAdd(c5, u64.bitOr(u64.shiftRight(sum0Low, 56), u64.shiftLeft(sum0High, 8)))
+  c1 = u64.wrappingAdd(c1, u64.bitOr(u64.shiftRight(sum1Low, 56), u64.shiftLeft(sum1High, 8)))
+  return Field { limbs: [c0, c1, c2, c3, c4, c5, c6, c7] }
+}
+
+
+// The carry out of `sum = addend + other`, as 0 or 1, without a branch.
+fn carryOf(sum: u64, addend: u64) -> u64 {
+  if sum < addend {
+    return 1
+  }
+  return 0
+}
+
+// The borrow out of `left - right`, as 0 or 1, without a branch.
+fn borrowOf(left: u64, right: u64) -> u64 {
+  if left < right {
+    return 1
+  }
+  return 0
+}
+
+// Schoolbook squaring: the 36 distinct word products, doubled where two limbs differ, summed into
+// the eight result columns after folding the high columns with 2^448 = 2^224 + 1. With limbs below
+// 2^59 a column stays below 2^124, and the carry out of the top column below 2^67.
+fn square(value: &Field) -> Field {
+  let a0 = value.limbs[0]
+  let a1 = value.limbs[1]
+  let a2 = value.limbs[2]
+  let a3 = value.limbs[3]
+  let a4 = value.limbs[4]
+  let a5 = value.limbs[5]
+  let a6 = value.limbs[6]
+  let a7 = value.limbs[7]
+  let d0 = u64.shiftLeft(a0, 1)
+  let d1 = u64.shiftLeft(a1, 1)
+  let d2 = u64.shiftLeft(a2, 1)
+  let d3 = u64.shiftLeft(a3, 1)
+  let d4 = u64.shiftLeft(a4, 1)
+  let d5 = u64.shiftLeft(a5, 1)
+  let d6 = u64.shiftLeft(a6, 1)
+  let mut low: u64 = 0
+  let mut high: u64 = 0
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(a0, a0))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(a0, a0), carryOf(low, u64.wrappingMultiply(a0, a0))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d1, a7))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d1, a7), carryOf(low, u64.wrappingMultiply(d1, a7))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d2, a6))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d2, a6), carryOf(low, u64.wrappingMultiply(d2, a6))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d3, a5))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d3, a5), carryOf(low, u64.wrappingMultiply(d3, a5))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(a4, a4))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(a4, a4), carryOf(low, u64.wrappingMultiply(a4, a4))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d5, a7))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d5, a7), carryOf(low, u64.wrappingMultiply(d5, a7))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(a6, a6))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(a6, a6), carryOf(low, u64.wrappingMultiply(a6, a6))))
+  let mut c0 = u64.bitAnd(low, LIMB_MASK)
+  low = u64.bitOr(u64.shiftRight(low, 56), u64.shiftLeft(high, 8))
+  high = u64.shiftRight(high, 56)
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d0, a1))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d0, a1), carryOf(low, u64.wrappingMultiply(d0, a1))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d2, a7))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d2, a7), carryOf(low, u64.wrappingMultiply(d2, a7))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d3, a6))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d3, a6), carryOf(low, u64.wrappingMultiply(d3, a6))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d4, a5))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d4, a5), carryOf(low, u64.wrappingMultiply(d4, a5))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d6, a7))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d6, a7), carryOf(low, u64.wrappingMultiply(d6, a7))))
+  let mut c1 = u64.bitAnd(low, LIMB_MASK)
+  low = u64.bitOr(u64.shiftRight(low, 56), u64.shiftLeft(high, 8))
+  high = u64.shiftRight(high, 56)
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d0, a2))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d0, a2), carryOf(low, u64.wrappingMultiply(d0, a2))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(a1, a1))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(a1, a1), carryOf(low, u64.wrappingMultiply(a1, a1))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d3, a7))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d3, a7), carryOf(low, u64.wrappingMultiply(d3, a7))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d4, a6))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d4, a6), carryOf(low, u64.wrappingMultiply(d4, a6))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(a5, a5))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(a5, a5), carryOf(low, u64.wrappingMultiply(a5, a5))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(a7, a7))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(a7, a7), carryOf(low, u64.wrappingMultiply(a7, a7))))
+  let c2 = u64.bitAnd(low, LIMB_MASK)
+  low = u64.bitOr(u64.shiftRight(low, 56), u64.shiftLeft(high, 8))
+  high = u64.shiftRight(high, 56)
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d0, a3))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d0, a3), carryOf(low, u64.wrappingMultiply(d0, a3))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d1, a2))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d1, a2), carryOf(low, u64.wrappingMultiply(d1, a2))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d4, a7))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d4, a7), carryOf(low, u64.wrappingMultiply(d4, a7))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d5, a6))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d5, a6), carryOf(low, u64.wrappingMultiply(d5, a6))))
+  let c3 = u64.bitAnd(low, LIMB_MASK)
+  low = u64.bitOr(u64.shiftRight(low, 56), u64.shiftLeft(high, 8))
+  high = u64.shiftRight(high, 56)
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d0, a4))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d0, a4), carryOf(low, u64.wrappingMultiply(d0, a4))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d1, a3))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d1, a3), carryOf(low, u64.wrappingMultiply(d1, a3))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d1, a7))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d1, a7), carryOf(low, u64.wrappingMultiply(d1, a7))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(a2, a2))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(a2, a2), carryOf(low, u64.wrappingMultiply(a2, a2))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d2, a6))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d2, a6), carryOf(low, u64.wrappingMultiply(d2, a6))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d3, a5))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d3, a5), carryOf(low, u64.wrappingMultiply(d3, a5))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(a4, a4))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(a4, a4), carryOf(low, u64.wrappingMultiply(a4, a4))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d5, a7))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d5, a7), carryOf(low, u64.wrappingMultiply(d5, a7))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d5, a7))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d5, a7), carryOf(low, u64.wrappingMultiply(d5, a7))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(a6, a6))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(a6, a6), carryOf(low, u64.wrappingMultiply(a6, a6))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(a6, a6))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(a6, a6), carryOf(low, u64.wrappingMultiply(a6, a6))))
+  let mut c4 = u64.bitAnd(low, LIMB_MASK)
+  low = u64.bitOr(u64.shiftRight(low, 56), u64.shiftLeft(high, 8))
+  high = u64.shiftRight(high, 56)
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d0, a5))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d0, a5), carryOf(low, u64.wrappingMultiply(d0, a5))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d1, a4))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d1, a4), carryOf(low, u64.wrappingMultiply(d1, a4))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d2, a3))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d2, a3), carryOf(low, u64.wrappingMultiply(d2, a3))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d2, a7))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d2, a7), carryOf(low, u64.wrappingMultiply(d2, a7))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d3, a6))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d3, a6), carryOf(low, u64.wrappingMultiply(d3, a6))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d4, a5))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d4, a5), carryOf(low, u64.wrappingMultiply(d4, a5))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d6, a7))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d6, a7), carryOf(low, u64.wrappingMultiply(d6, a7))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d6, a7))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d6, a7), carryOf(low, u64.wrappingMultiply(d6, a7))))
+  let mut c5 = u64.bitAnd(low, LIMB_MASK)
+  low = u64.bitOr(u64.shiftRight(low, 56), u64.shiftLeft(high, 8))
+  high = u64.shiftRight(high, 56)
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d0, a6))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d0, a6), carryOf(low, u64.wrappingMultiply(d0, a6))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d1, a5))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d1, a5), carryOf(low, u64.wrappingMultiply(d1, a5))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d2, a4))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d2, a4), carryOf(low, u64.wrappingMultiply(d2, a4))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(a3, a3))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(a3, a3), carryOf(low, u64.wrappingMultiply(a3, a3))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d3, a7))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d3, a7), carryOf(low, u64.wrappingMultiply(d3, a7))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d4, a6))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d4, a6), carryOf(low, u64.wrappingMultiply(d4, a6))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(a5, a5))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(a5, a5), carryOf(low, u64.wrappingMultiply(a5, a5))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(a7, a7))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(a7, a7), carryOf(low, u64.wrappingMultiply(a7, a7))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(a7, a7))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(a7, a7), carryOf(low, u64.wrappingMultiply(a7, a7))))
+  let c6 = u64.bitAnd(low, LIMB_MASK)
+  low = u64.bitOr(u64.shiftRight(low, 56), u64.shiftLeft(high, 8))
+  high = u64.shiftRight(high, 56)
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d0, a7))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d0, a7), carryOf(low, u64.wrappingMultiply(d0, a7))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d1, a6))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d1, a6), carryOf(low, u64.wrappingMultiply(d1, a6))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d2, a5))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d2, a5), carryOf(low, u64.wrappingMultiply(d2, a5))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d3, a4))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d3, a4), carryOf(low, u64.wrappingMultiply(d3, a4))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d4, a7))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d4, a7), carryOf(low, u64.wrappingMultiply(d4, a7))))
+  low = u64.wrappingAdd(low, u64.wrappingMultiply(d5, a6))
+  high = u64.wrappingAdd(high, u64.wrappingAdd(u64.multiplyHigh(d5, a6), carryOf(low, u64.wrappingMultiply(d5, a6))))
+  let c7 = u64.bitAnd(low, LIMB_MASK)
+  low = u64.bitOr(u64.shiftRight(low, 56), u64.shiftLeft(high, 8))
+  high = u64.shiftRight(high, 56)
+  // The carry out of limb 7 goes into limbs 0 and 4.
+  let sum0 = u64.wrappingAdd(c0, low)
+  let over0 = u64.wrappingAdd(high, carryOf(sum0, low))
+  c0 = u64.bitAnd(sum0, LIMB_MASK)
+  c1 = u64.wrappingAdd(c1, u64.bitOr(u64.shiftRight(sum0, 56), u64.shiftLeft(over0, 8)))
+  let sum4 = u64.wrappingAdd(c4, low)
+  let over4 = u64.wrappingAdd(high, carryOf(sum4, low))
+  c4 = u64.bitAnd(sum4, LIMB_MASK)
+  c5 = u64.wrappingAdd(c5, u64.bitOr(u64.shiftRight(sum4, 56), u64.shiftLeft(over4, 8)))
+  return Field { limbs: [c0, c1, c2, c3, c4, c5, c6, c7] }
+}
+
+// `factor` is below 2^20. Each limb is split at bit 28 so no product passes 2^50.
+fn multiplySmall(value: &Field, factor: u64) -> Field {
+  let mut result = zero()
+  let mut index: usize = 0
+  while index < 8 {
+    let limb = value.limbs[index]
+    let low = u64.wrappingMultiply(u64.bitAnd(limb, 268435455), factor)
+    let high = u64.wrappingMultiply(u64.shiftRight(limb, 28), factor)
+    result.limbs[index] = u64.wrappingAdd(
+      result.limbs[index],
+      u64.wrappingAdd(low, u64.shiftLeft(u64.bitAnd(high, 268435455), 28)),
+    )
+    if index < 7 {
+      result.limbs[index + 1] = u64.shiftRight(high, 28)
+    } else {
+      result.limbs[0] = u64.wrappingAdd(result.limbs[0], u64.shiftRight(high, 28))
+      result.limbs[4] = u64.wrappingAdd(result.limbs[4], u64.shiftRight(high, 28))
+    }
+    index = index + 1
+  }
+  return carry(move result)
+}
+
+fn swap(left: &mut Field, right: &mut Field, bit: u64) -> () {
+  let mask = u64.wrappingSubtract(0, bit)
+  let mut index: usize = 0
+  while index < 8 {
+    let difference = u64.bitAnd(mask, u64.bitXor(left.limbs[index], right.limbs[index]))
+    left.limbs[index] = u64.bitXor(left.limbs[index], difference)
+    right.limbs[index] = u64.bitXor(right.limbs[index], difference)
+    index = index + 1
+  }
+}
+
+// Returns value^(2^222 - 1) and value^(2^223 - 1) with a fixed addition chain: the common part of
+// the exponents for inversion and square roots. The chain does not depend on the value.
+struct Chain {
+  ones222: Field,
+  ones223: Field,
+}
+
+fn squareTimes(value: &Field, count: usize) -> Field {
+  let mut result = square(value)
+  let mut index: usize = 1
+  while index < count {
+    result = square(&result)
+    index = index + 1
+  }
+  return move result
+}
+
+fn chain(value: &Field) -> Chain {
+  let x2 = product(&square(value), value)
+  let x3 = product(&square(&x2), value)
+  let x6 = product(&squareTimes(&x3, 3), &x3)
+  let x9 = product(&squareTimes(&x6, 3), &x3)
+  let x18 = product(&squareTimes(&x9, 9), &x9)
+  let x19 = product(&square(&x18), value)
+  let x37 = product(&squareTimes(&x19, 18), &x18)
+  let x74 = product(&squareTimes(&x37, 37), &x37)
+  let x111 = product(&squareTimes(&x74, 37), &x37)
+  let x222 = product(&squareTimes(&x111, 111), &x111)
+  let x223 = product(&square(&x222), value)
+  return Chain { ones222: move x222, ones223: move x223 }
+}
+
+// value^(p - 2), where p - 2 = (2^223 - 1) * 2^225 + (2^222 - 1) * 4 + 1. Zero maps to zero.
+fn inverse(value: &Field) -> Field {
+  let parts = chain(value)
+  let high = squareTimes(&parts.ones223, 223)
+  let combined = product(&high, &parts.ones222)
+  let shifted = squareTimes(&combined, 2)
+  return product(&shifted, value)
+}
+
+// Reads 56 little-endian bytes as a field element, seven bytes to a limb. A value of p or above
+// is reduced, as RFC 7748 asks for X448 inputs.
+fn decodeField(bytes: &[u8]) -> Field {
+  let mut result = zero()
+  let mut index: usize = 0
+  while index < 8 {
+    let mut limb: u64 = 0
+    let mut byte: usize = 0
+    while byte < 7 {
+      limb = u64.bitOr(limb, u64.shiftLeft(u8.toU64(bytes[index * 7 + byte]), usize.toU64(byte * 8)))
+      byte = byte + 1
+    }
+    result.limbs[index] = limb
+    index = index + 1
+  }
+  return canonical(&result)
+}
+
+fn encodeField(value: &Field) -> [u8; 56] {
+  let reduced = canonical(value)
+  let mut result: [u8; 56] = [0; 56]
+  let mut index: usize = 0
+  while index < 8 {
+    let mut byte: usize = 0
+    while byte < 7 {
+      result[index * 7 + byte] = u64.toU8(
+        u64.bitAnd(u64.shiftRight(reduced.limbs[index], usize.toU64(byte * 8)), 255),
+      )
+      byte = byte + 1
+    }
+    index = index + 1
+  }
+  return result
+}
