@@ -432,10 +432,14 @@ The SIMD-007 catalog also holds the AES and carry-less multiplication instructio
 | `aarch64AesDecrypt`           | `u8x16`, `u8x16` → `u8x16` | AArch64 `aes`   | `aesd`                            |
 | `aarch64AesMixColumns`        | `u8x16` → `u8x16`      | AArch64 `aes`      | `aesmc`                           |
 | `aarch64AesInverseMixColumns` | `u8x16` → `u8x16`      | AArch64 `aes`      | `aesimc`                          |
+| `aarch64PolynomialMultiply`   | `u64x2`, `u64x2` → `u64x2` | AArch64 `aes`   | `pmull` (64-bit lanes)            |
+| `aarch64PolynomialMultiplyHigh` | `u64x2`, `u64x2` → `u64x2` | AArch64 `aes` | `pmull2` (64-bit lanes)           |
 
 The x86 rounds take the operand order of the instructions: the state, then the round key.
 `x86CarrylessMultiply` multiplies lane 0 of each operand into a 128-bit product, low half in lane
 0; a program picks other halves with `simdShuffle` first.
+`aarch64PolynomialMultiply` multiplies lane 0 of each operand the same way, and
+`aarch64PolynomialMultiplyHigh` multiplies lane 1 of each.
 
 `silk.crypto.aes_round` computes SubBytes, ShiftRows, MixColumns and their inverses with portable code,
 without tables. `silk.simd.x86` and `silk.simd.aarch64` wrap each operation on `u8x16` states and
