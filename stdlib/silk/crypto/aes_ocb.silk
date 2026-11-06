@@ -1,0 +1,498 @@
+//! Encrypt and authenticate data with AES-OCB3 (RFC 7253), for a message in parts.
+//!
+//! # When to use
+//! Use [`AesOcbEncryptor`] and [`AesOcbDecryptor`] where a protocol names OCB, or for Node's
+//! `aes-128-ocb`. For new designs, `silk.crypto.aes_gcm` is the common choice.
+//!
+//! # Details
+//! The key is 16, 24, or 32 bytes, the nonce 1 to 15 bytes, and the tag 1 to 16 bytes. The tag
+//! length is fixed when the value is made, because OCB mixes it into the nonce. The associated
+//! data (`aad`) is authenticated but not encrypted. `update` writes the ciphertext of every
+//! complete 16-byte block and keeps a partial block, so [`AesOcbEncryptor.updateLength`] says how
+//! many bytes a call writes. `finish` writes the rest. Nothing allocates.
+//!
+//! # Errors
+//! The functions return an [`AesOcbError`]. All checks come before the first write, and on any
+//! error the output buffers do not change.
+//!
+//! # Gotchas
+//! The same key and nonce must never encrypt two messages. [`AesOcbDecryptor.update`] writes
+//! plaintext before the tag is checked: do not use it until [`AesOcbDecryptor.finish`] succeeds. A
+//! message is at most 2^32 blocks. The values do not erase their copies of the key.
+//!
+//! # Examples
+//! ## Encrypt and decrypt
+//! ```silk
+//! import silk.crypto.aes_ocb { AesOcbDecryptor, AesOcbEncryptor, AesOcbError }
+//! import silk.core.result { Result }
+//!
+//! pub fn main() -> i32 {
+//!   let key: [u8; 16] = [4; 16]
+//!   let nonce: [u8; 12] = [8; 12]
+//!   let mut encryptor = match AesOcbEncryptor.make(&key, &nonce, b"v1", 16) {
+//!     Result<AesOcbEncryptor, AesOcbError>.Success { value } => move value
+//!     Result<AesOcbEncryptor, AesOcbError>.Failure { error: _ } => { return 1 }
+//!   }
+//!   let mut ciphertext: [u8; 5] = [0; 5]
+//!   let mut tag: [u8; 16] = [0; 16]
+//!   // Five bytes are less than a block, so update writes nothing and finish writes them.
+//!   if let Result.Failure { error: _ } = encryptor.update(b"hello", &mut ciphertext) { return 1 }
+//!   if let Result.Failure { error: _ } = encryptor.finish(&mut ciphertext, &mut tag) { return 1 }
+//!   let mut decryptor = match AesOcbDecryptor.make(&key, &nonce, b"v1", 16) {
+//!     Result<AesOcbDecryptor, AesOcbError>.Success { value } => move value
+//!     Result<AesOcbDecryptor, AesOcbError>.Failure { error: _ } => { return 1 }
+//!   }
+//!   let mut plaintext: [u8; 5] = [0; 5]
+//!   if let Result.Failure { error: _ } = decryptor.update(&ciphertext, &mut plaintext) { return 1 }
+//!   return match decryptor.finish(&mut plaintext, &tag) {
+//!     Result<usize, AesOcbError>.Success { value } => if value == 5 && plaintext[0] == 104 { 0 } else { 1 }
+//!     Result<usize, AesOcbError>.Failure { error: _ } => 1
+//!   }
+//! }
+//! ```
+//!
+//! @category Cryptography
+
+import silk.text.format { Debug, Format, Formatter }
+import silk.core.result { Result }
+import silk.crypto.aes { Aes, AesError }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.io.writer { Writer, WriterError }
+
+/// The reason that an OCB call was rejected. The checks run in the order of the variants, and the
+/// first failure is returned.
+pub enum AesOcbError {
+  /// The key is not 16, 24, or 32 bytes.
+  InvalidKeyLength,
+  /// The nonce is not 1 to 15 bytes.
+  InvalidNonceLength,
+  /// The tag length is not 1 to 16 bytes, or a tag buffer does not have that length.
+  InvalidTagLength,
+  /// The output is shorter than the bytes the call writes.
+  OutputTooSmall,
+  /// The message is longer than 2^32 blocks.
+  LimitExceeded,
+  /// The tag is not correct for the key, nonce, associated data, and ciphertext.
+  AuthenticationFailed,
+}
+
+impl Debug for AesOcbError {
+  /// Writes the name of the variant, such as `InvalidKeyLength`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      AesOcbError.InvalidKeyLength => run Format.write(&mut formatter, b"InvalidKeyLength")
+      AesOcbError.InvalidNonceLength => run Format.write(&mut formatter, b"InvalidNonceLength")
+      AesOcbError.InvalidTagLength => run Format.write(&mut formatter, b"InvalidTagLength")
+      AesOcbError.OutputTooSmall => run Format.write(&mut formatter, b"OutputTooSmall")
+      AesOcbError.LimitExceeded => run Format.write(&mut formatter, b"LimitExceeded")
+      AesOcbError.AuthenticationFailed => run Format.write(&mut formatter, b"AuthenticationFailed")
+    }
+  }
+}
+
+// The OCB state that the encryptor and decryptor share. `table` holds L_0 to L_31, 16 bytes each.
+struct Core {
+  cipher: Aes,
+  star: [u8; 16],
+  dollar: [u8; 16],
+  table: [u8; 512],
+  offset: [u8; 16],
+  checksum: [u8; 16],
+  hash: [u8; 16],
+  blocks: u64,
+  buffer: [u8; 16],
+  buffered: usize,
+  tagLength: usize,
+  decrypting: bool,
+}
+
+fn xorInto(target: &mut [u8; 16], source: &[u8], offset: usize) -> () {
+  let mut index: usize = 0
+  while index < 16 {
+    target[index] = u8.bitXor(target[index], source[offset + index])
+    index = index + 1
+  }
+}
+
+// Multiplies by x in GF(2^128) with the big-endian bit order of RFC 7253.
+fn double(block: &[u8; 16]) -> [u8; 16] {
+  let mut result: [u8; 16] = [0; 16]
+  let mut index: usize = 0
+  while index < 15 {
+    result[index] = u8.bitOr(u8.shiftLeft(block[index], 1), u8.shiftRight(block[index + 1], 7))
+    index = index + 1
+  }
+  let carry = u8.shiftRight(block[0], 7)
+  result[15] = u8.bitXor(u8.shiftLeft(block[15], 1), u8.bitAnd(u8.wrappingSubtract(0, carry), 0x87))
+  return result
+}
+
+fn trailingZeros(value: u64) -> usize {
+  let mut count: usize = 0
+  let mut rest = value
+  while u64.bitAnd(rest, 1) == 0 {
+    rest = u64.shiftRight(rest, 1)
+    count = count + 1
+  }
+  return count
+}
+
+fn start(key: &[u8], nonce: &[u8], aad: &[u8], tagLength: usize, decrypting: bool) -> Result<Core, AesOcbError> {
+  if key.length != 16 && key.length != 24 && key.length != 32 {
+    return Result<Core, AesOcbError>.failResult(AesOcbError.InvalidKeyLength)
+  }
+  if nonce.length < 1 || nonce.length > 15 {
+    return Result<Core, AesOcbError>.failResult(AesOcbError.InvalidNonceLength)
+  }
+  if tagLength < 1 || tagLength > 16 {
+    return Result<Core, AesOcbError>.failResult(AesOcbError.InvalidTagLength)
+  }
+  let cipher = match Aes.make(key) {
+    Result<Aes, AesError>.Success { value } => move value
+    Result<Aes, AesError>.Failure { error: _ } => {
+      return Result<Core, AesOcbError>.failResult(AesOcbError.InvalidKeyLength)
+    }
+  }
+  let zero: [u8; 16] = [0; 16]
+  let star = cipher.encryptBlock(&zero)
+  let dollar = double(&star)
+  let mut table: [u8; 512] = [0; 512]
+  let mut current = double(&dollar)
+  let mut entry: usize = 0
+  while entry < 32 {
+    let mut index: usize = 0
+    while index < 16 {
+      table[entry * 16 + index] = current[index]
+      index = index + 1
+    }
+    current = double(&current)
+    entry = entry + 1
+  }
+
+  // Nonce = num2str(TAGLEN mod 128, 7) || zeros || 1 || N, then Ktop and Stretch (section 4.2).
+  let mut formatted: [u8; 16] = [0; 16]
+  formatted[0] = usize.toU8(((tagLength * 8) % 128) * 2)
+  formatted[15 - nonce.length] = u8.bitOr(formatted[15 - nonce.length], 1)
+  let mut index: usize = 0
+  while index < nonce.length {
+    formatted[16 - nonce.length + index] = nonce[index]
+    index = index + 1
+  }
+  let bottom = u8.toUsize(u8.bitAnd(formatted[15], 63))
+  formatted[15] = u8.bitAnd(formatted[15], 192)
+  let top = cipher.encryptBlock(&formatted)
+  let mut stretch: [u8; 25] = [0; 25]
+  index = 0
+  while index < 16 {
+    stretch[index] = top[index]
+    index = index + 1
+  }
+  index = 0
+  while index < 8 {
+    stretch[16 + index] = u8.bitXor(top[index], top[index + 1])
+    index = index + 1
+  }
+  let byteShift = bottom / 8
+  let bitShift = bottom % 8
+  let mut offset: [u8; 16] = [0; 16]
+  index = 0
+  while index < 16 {
+    if bitShift == 0 {
+      offset[index] = stretch[index + byteShift]
+    } else {
+      offset[index] = u8.bitOr(
+        u8.shiftLeft(stretch[index + byteShift], usize.toU8(bitShift)),
+        u8.shiftRight(stretch[index + byteShift + 1], usize.toU8(8 - bitShift))
+      )
+    }
+    index = index + 1
+  }
+  let mut core = Core {
+    cipher: move cipher,
+    star: star,
+    dollar: dollar,
+    table: table,
+    offset: offset,
+    checksum: [0; 16],
+    hash: [0; 16],
+    blocks: 0,
+    buffer: [0; 16],
+    buffered: 0,
+    tagLength: tagLength,
+    decrypting: decrypting,
+  }
+  core.hash = hashAad(&core, aad)
+  return Result<Core, AesOcbError>.succeed(move core)
+}
+
+// HASH(K, A) of RFC 7253 section 4.1.
+fn hashAad(core: &Core, aad: &[u8]) -> [u8; 16] {
+  let mut sum: [u8; 16] = [0; 16]
+  let mut offset: [u8; 16] = [0; 16]
+  let mut blocks: u64 = 0
+  let mut position: usize = 0
+  while position + 16 <= aad.length {
+    blocks = blocks + 1
+    xorInto(&mut offset, &core.table, trailingZeros(blocks) * 16)
+    let mut input = offset
+    xorInto(&mut input, aad, position)
+    let encrypted = core.cipher.encryptBlock(&input)
+    xorInto(&mut sum, &encrypted, 0)
+    position = position + 16
+  }
+  if position < aad.length {
+    xorInto(&mut offset, &core.star, 0)
+    let mut input: [u8; 16] = [0; 16]
+    let mut index: usize = 0
+    while position + index < aad.length {
+      input[index] = aad[position + index]
+      index = index + 1
+    }
+    input[index] = 128
+    xorInto(&mut input, &offset, 0)
+    let encrypted = core.cipher.encryptBlock(&input)
+    xorInto(&mut sum, &encrypted, 0)
+  }
+  return sum
+}
+
+// Encrypts or decrypts the full block in `core.buffer` into `output` at `at`.
+fn processBlock(core: &mut Core, output: &mut [u8], at: usize) -> () {
+  core.blocks = core.blocks + 1
+  xorInto(&mut core.offset, &core.table, trailingZeros(core.blocks) * 16)
+  let mut input = core.buffer
+  xorInto(&mut input, &core.offset, 0)
+  let mut result = core.cipher.encryptBlock(&input)
+  if core.decrypting {
+    result = core.cipher.decryptBlock(&input)
+  }
+  xorInto(&mut result, &core.offset, 0)
+  if core.decrypting {
+    xorInto(&mut core.checksum, &result, 0)
+  } else {
+    xorInto(&mut core.checksum, &core.buffer, 0)
+  }
+  let mut index: usize = 0
+  while index < 16 {
+    output[at + index] = result[index]
+    index = index + 1
+  }
+}
+
+fn updateLength(core: &Core, length: usize) -> usize {
+  return ((core.buffered + length) / 16) * 16
+}
+
+fn update(core: &mut Core, input: &[u8], output: &mut [u8]) -> Result<usize, AesOcbError> {
+  let written = updateLength(&core.*, input.length)
+  if output.length < written {
+    return Result<usize, AesOcbError>.failResult(AesOcbError.OutputTooSmall)
+  }
+  if u64.saturatingAdd(core.blocks, usize.toU64(written / 16)) > 4294967295 {
+    return Result<usize, AesOcbError>.failResult(AesOcbError.LimitExceeded)
+  }
+  let mut position: usize = 0
+  let mut at: usize = 0
+  while position < input.length {
+    core.buffer[core.buffered] = input[position]
+    core.buffered = core.buffered + 1
+    position = position + 1
+    if core.buffered == 16 {
+      processBlock(&mut core.*, &mut output, at)
+      core.buffered = 0
+      at = at + 16
+    }
+  }
+  return Result<usize, AesOcbError>.succeed(written)
+}
+
+// Handles the partial last block, writes it to `output`, and returns the full tag.
+fn finishCore(core: &mut Core, output: &mut [u8]) -> [u8; 16] {
+  if core.buffered > 0 {
+    xorInto(&mut core.offset, &core.star, 0)
+    let pad = core.cipher.encryptBlock(&core.offset)
+    let mut padded: [u8; 16] = [0; 16]
+    let mut index: usize = 0
+    while index < core.buffered {
+      let produced = u8.bitXor(core.buffer[index], pad[index])
+      output[index] = produced
+      if core.decrypting {
+        padded[index] = produced
+      } else {
+        padded[index] = core.buffer[index]
+      }
+      index = index + 1
+    }
+    padded[core.buffered] = 128
+    xorInto(&mut core.checksum, &padded, 0)
+  }
+  let mut input = core.checksum
+  xorInto(&mut input, &core.offset, 0)
+  xorInto(&mut input, &core.dollar, 0)
+  let mut tag = core.cipher.encryptBlock(&input)
+  xorInto(&mut tag, &core.hash, 0)
+  return tag
+}
+
+/// A streaming AES-OCB3 encryptor (RFC 7253).
+///
+/// # Details
+///
+/// Make one with [`AesOcbEncryptor.make`], give the message with [`AesOcbEncryptor.update`], then
+/// call [`AesOcbEncryptor.finish`] for the last partial block and the tag. Any split of the
+/// message gives the same result. Nothing allocates.
+///
+/// # Gotchas
+///
+/// The same key and nonce must never encrypt two messages. The value holds key material and is not
+/// erased when it is dropped.
+pub struct AesOcbEncryptor {
+  core: Core,
+}
+
+impl AesOcbEncryptor {
+  /// Returns an encryptor for `key` and `nonce` that authenticates `aad` and makes a tag of
+  /// `tagLength` bytes.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidKeyLength` if `key` is not 16, 24, or 32 bytes.
+  /// - `InvalidNonceLength` if `nonce` is not 1 to 15 bytes.
+  /// - `InvalidTagLength` if `tagLength` is not 1 to 16.
+  pub fn make(key: &[u8], nonce: &[u8], aad: &[u8], tagLength: usize) -> Result<AesOcbEncryptor, AesOcbError> {
+    return match start(key, nonce, aad, tagLength, false) {
+      Result<Core, AesOcbError>.Success { value } => Result<AesOcbEncryptor, AesOcbError>.succeed(AesOcbEncryptor { core: move value })
+      Result<Core, AesOcbError>.Failure { error } => Result<AesOcbEncryptor, AesOcbError>.failResult(move error)
+    }
+  }
+
+  /// Returns how many bytes [`AesOcbEncryptor.update`] writes for `length` more input bytes: every
+  /// complete 16-byte block.
+  pub fn updateLength(self: &Self, length: usize) -> usize {
+    return updateLength(&self.core, length)
+  }
+
+  /// Encrypts the complete blocks of the buffered bytes and `plaintext` into `ciphertext` and
+  /// returns how many bytes it wrote. A partial block stays buffered.
+  ///
+  /// # Errors
+  ///
+  /// On an error the state and `ciphertext` do not change.
+  ///
+  /// - `OutputTooSmall` if `ciphertext` is shorter than [`AesOcbEncryptor.updateLength`].
+  /// - `LimitExceeded` if the message grows past 2^32 blocks.
+  pub fn update(self: &mut Self, plaintext: &[u8], ciphertext: &mut [u8]) -> Result<usize, AesOcbError> {
+    return update(&mut self.core, plaintext, move ciphertext)
+  }
+
+  /// Encrypts the buffered partial block into `ciphertext`, writes the tag to `tag`, and returns
+  /// how many ciphertext bytes it wrote (0 to 15).
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidTagLength` if `tag` is not the tag length given to [`AesOcbEncryptor.make`].
+  /// - `OutputTooSmall` if `ciphertext` is shorter than the buffered bytes.
+  pub fn finish(self: Self, ciphertext: &mut [u8], tag: &mut [u8]) -> Result<usize, AesOcbError> {
+    let mut core = move self.core
+    if tag.length != core.tagLength {
+      return Result<usize, AesOcbError>.failResult(AesOcbError.InvalidTagLength)
+    }
+    if ciphertext.length < core.buffered {
+      return Result<usize, AesOcbError>.failResult(AesOcbError.OutputTooSmall)
+    }
+    let written = core.buffered
+    let computed = finishCore(&mut core, move ciphertext)
+    let mut index: usize = 0
+    while index < tag.length {
+      tag[index] = computed[index]
+      index = index + 1
+    }
+    return Result<usize, AesOcbError>.succeed(written)
+  }
+}
+
+/// A streaming AES-OCB3 decryptor (RFC 7253).
+///
+/// # Details
+///
+/// Make one with [`AesOcbDecryptor.make`], give the ciphertext with [`AesOcbDecryptor.update`],
+/// then call [`AesOcbDecryptor.finish`] with the received tag. Nothing allocates.
+///
+/// # Gotchas
+///
+/// [`AesOcbDecryptor.update`] writes plaintext before the tag is checked. Do not use or release it
+/// until [`AesOcbDecryptor.finish`] succeeds. The value holds key material and is not erased when it
+/// is dropped.
+pub struct AesOcbDecryptor {
+  core: Core,
+}
+
+impl AesOcbDecryptor {
+  /// Returns a decryptor for `key` and `nonce` that authenticates `aad` and checks a tag of
+  /// `tagLength` bytes.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidKeyLength` if `key` is not 16, 24, or 32 bytes.
+  /// - `InvalidNonceLength` if `nonce` is not 1 to 15 bytes.
+  /// - `InvalidTagLength` if `tagLength` is not 1 to 16.
+  pub fn make(key: &[u8], nonce: &[u8], aad: &[u8], tagLength: usize) -> Result<AesOcbDecryptor, AesOcbError> {
+    return match start(key, nonce, aad, tagLength, true) {
+      Result<Core, AesOcbError>.Success { value } => Result<AesOcbDecryptor, AesOcbError>.succeed(AesOcbDecryptor { core: move value })
+      Result<Core, AesOcbError>.Failure { error } => Result<AesOcbDecryptor, AesOcbError>.failResult(move error)
+    }
+  }
+
+  /// Returns how many bytes [`AesOcbDecryptor.update`] writes for `length` more input bytes: every
+  /// complete 16-byte block.
+  pub fn updateLength(self: &Self, length: usize) -> usize {
+    return updateLength(&self.core, length)
+  }
+
+  /// Decrypts the complete blocks of the buffered bytes and `ciphertext` into `plaintext` and
+  /// returns how many bytes it wrote. The plaintext is not authenticated until
+  /// [`AesOcbDecryptor.finish`] succeeds.
+  ///
+  /// # Errors
+  ///
+  /// On an error the state and `plaintext` do not change.
+  ///
+  /// - `OutputTooSmall` if `plaintext` is shorter than [`AesOcbDecryptor.updateLength`].
+  /// - `LimitExceeded` if the ciphertext grows past 2^32 blocks.
+  pub fn update(self: &mut Self, ciphertext: &[u8], plaintext: &mut [u8]) -> Result<usize, AesOcbError> {
+    return update(&mut self.core, ciphertext, move plaintext)
+  }
+
+  /// Decrypts the buffered partial block into `plaintext`, checks `tag`, and returns how many
+  /// plaintext bytes it wrote (0 to 15).
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidTagLength` if `tag` is not the tag length given to [`AesOcbDecryptor.make`].
+  /// - `OutputTooSmall` if `plaintext` is shorter than the buffered bytes.
+  /// - `AuthenticationFailed` if the tag is not correct. Discard all plaintext this value wrote.
+  pub fn finish(self: Self, plaintext: &mut [u8], tag: &[u8]) -> Result<usize, AesOcbError> {
+    let mut core = move self.core
+    if tag.length != core.tagLength {
+      return Result<usize, AesOcbError>.failResult(AesOcbError.InvalidTagLength)
+    }
+    if plaintext.length < core.buffered {
+      return Result<usize, AesOcbError>.failResult(AesOcbError.OutputTooSmall)
+    }
+    let written = core.buffered
+    let computed = finishCore(&mut core, move plaintext)
+    let mut difference: u32 = 0
+    let mut index: usize = 0
+    while index < tag.length {
+      difference = u32.bitOr(difference, u8.toU32(u8.bitXor(computed[index], tag[index])))
+      index = index + 1
+    }
+    if difference != 0 {
+      return Result<usize, AesOcbError>.failResult(AesOcbError.AuthenticationFailed)
+    }
+    return Result<usize, AesOcbError>.succeed(written)
+  }
+}
