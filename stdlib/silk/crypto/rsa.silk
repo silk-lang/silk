@@ -26,8 +26,9 @@
 //! # Gotchas
 //! A valid signature proves only that the holder of the private key signed the message. It does
 //! not prove that you can trust the key. To check a certificate chain, use the `silk.tls.trust_*`
-//! modules. PKCS #1 v1.5 encryption is here only for old formats: its decryption is not
-//! provided, because its errors can reveal the plaintext. Use OAEP for new formats.
+//! modules. PKCS #1 v1.5 encryption is here only for old formats. Its decryption uses implicit
+//! rejection, so a bad ciphertext gives a wrong message instead of an error. Use OAEP for new
+//! formats.
 //!
 //! # Examples
 //! ## Sign and verify with a generated key
@@ -80,6 +81,8 @@ import silk.text.format { Debug, Format, Formatter }
 import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.crypto.digest { Digest }
+import silk.crypto.prime { Prime }
+import silk.crypto.hmac { HmacSha256 }
 import silk.crypto.modular { ModularError, Modulus, Natural }
 import silk.crypto.sha2 { Sha256 }
 import silk.collections.slice { Slice }
@@ -151,8 +154,8 @@ pub struct RsaPublicKey {
 /// An RSA private key with its two primes and the values that speed up its operations.
 ///
 /// # When to use
-/// Use it to sign with PKCS #1 v1.5 or PSS and to decrypt OAEP. Get its public half with
-/// [`RsaPrivateKey.publicKey`].
+/// Use it to sign with PKCS #1 v1.5 or PSS and to decrypt OAEP or PKCS #1 v1.5. Get its public
+/// half with [`RsaPrivateKey.publicKey`].
 ///
 /// # Details
 /// Make one from its parts with [`RsaPrivateKey.fromComponents`], or generate one with
@@ -706,8 +709,8 @@ impl RsaPublicKey {
   /// - `MessageTooLong` if `message` is too long.
   ///
   /// # Gotchas
-  /// Use it only for formats that require it. Its decryption can reveal the plaintext through
-  /// errors, so prefer [`RsaPublicKey.encryptOaep`].
+  /// Use it only for formats that require it. Prefer [`RsaPublicKey.encryptOaep`]: PKCS #1 v1.5
+  /// padding has a long history of padding-oracle attacks.
   pub effect fn encryptPkcs1(self: &RsaPublicKey, message: &[u8], output: &mut [u8]) -> ()
     ! RsaError
     ? &mut Random {
@@ -1186,68 +1189,6 @@ effect fn randomCandidate(bits: usize) -> Natural
   return natural(Slice.view<u8>(&bytes, 0, length))
 }
 
-// Returns a random number from 2 to `limit` - 2, for an odd limit of `bits` bits.
-effect fn randomBase(limit: &Natural, bits: usize) -> Natural
-  ? &mut Random {
-  let length = (bits + 7) / 8
-  let excess = 8 * length - bits
-  let lowest = Natural.fromU64(2)
-  let highest = difference(limit, &lowest)
-  while true {
-    let mut bytes: [u8; 512] = [0; 512]
-    run Random.fillBytes(Slice.viewMut<u8>(&mut bytes, 0, length))
-    bytes[0] = u8.bitAnd(bytes[0], u32.toU8(u32.shiftRight(255, usize.toU32(excess))))
-    let value = natural(Slice.view<u8>(&bytes, 0, length))
-    if !value.lessThan(&lowest) && !highest.lessThan(&value) {
-      return value
-    }
-  }
-  Intrinsic.trap("unreachable")
-}
-
-// Miller-Rabin with random bases on an odd candidate of `bits` bits above 3.
-effect fn probablyPrime(candidate: &Natural, bits: usize) -> bool
-  ? &mut Random {
-  let modulus = match Modulus.make(candidate) {
-    Result<Modulus, ModularError>.Success { value } => move value
-    Result<Modulus, ModularError>.Failure { .. } => {
-      return false
-    }
-  }
-  let one = Natural.fromU64(1)
-  let minusOne = difference(candidate, &one)
-  let mut shift: usize = 1
-  while minusOne.bit(shift) == 0 {
-    shift = shift + 1
-  }
-  let odd = minusOne.shiftRight(shift)
-  let mut rounds: usize = 64
-  if bits > 2048 {
-    rounds = 128
-  }
-  let mut round: usize = 0
-  while round < rounds {
-    let base = run randomBase(candidate, bits)
-    let mut value = modulus.power(&base, &odd)
-    if !value.equals(&one) && !value.equals(&minusOne) {
-      let mut step: usize = 1
-      let mut witness = true
-      while step < shift && witness {
-        value = modulus.multiply(&value, &value)
-        if value.equals(&minusOne) {
-          witness = false
-        }
-        step = step + 1
-      }
-      if witness {
-        return false
-      }
-    }
-    round = round + 1
-  }
-  return true
-}
-
 struct SmallInverse {
   value: u32,
   found: bool,
@@ -1317,7 +1258,7 @@ effect fn generatePrime(bits: usize, exponent: u32, primes: &SmallPrimes) -> Nat
           previousResidue(fitted.remainderWord(exponent), exponent),
           exponent,
         )
-        if inverse.found && run probablyPrime(&fitted, bits) {
+        if inverse.found && run Prime.isProbablePrime(&fitted, Prime.recommendedRounds(bits)) {
           return fitted
         }
       }
@@ -1643,5 +1584,546 @@ impl RsaPublicKey {
       return verifyPkcs1Digest<Sha256>(self, &digest, signature)
     }
     return Result<(), RsaError>.failResult(RsaError.InvalidParameters)
+  }
+}
+
+// The rsaEncryption AlgorithmIdentifier with NULL parameters.
+fn rsaEncryptionDer() -> [u8; 15] {
+  return [48, 13, 6, 9, 42, 134, 72, 134, 247, 13, 1, 1, 1, 5, 0]
+}
+
+// Reads a minimal, non-negative DER INTEGER. `start` skips the sign byte of a value whose top
+// bit is set.
+fn readInteger(bytes: &[u8], offset: usize, limit: usize) -> DerValue {
+  let invalid = DerValue { start: 0, end: 0, valid: false }
+  let value = readDer(bytes, offset, limit, 2)
+  if !value.valid || value.start == value.end || bytes[value.start] >= 128 {
+    return move invalid
+  }
+  if bytes[value.start] == 0 && value.end - value.start > 1 {
+    if bytes[value.start + 1] < 128 {
+      return move invalid
+    }
+    return DerValue { start: value.start + 1, end: value.end, valid: true }
+  }
+  return move value
+}
+
+fn integerBytes<'bytes>(bytes: &'bytes [u8], value: &DerValue) -> &'bytes [u8] {
+  return Slice.view<u8>(bytes, value.start, value.end - value.start)
+}
+
+fn publicFromSequence(der: &[u8]) -> Result<RsaPublicKey, RsaError> {
+  let sequence = readDer(der, 0, der.length, 48)
+  if !sequence.valid || sequence.end != der.length {
+    return Result<RsaPublicKey, RsaError>.failResult(RsaError.InvalidEncoding)
+  }
+  let modulus = readInteger(der, sequence.start, sequence.end)
+  if !modulus.valid {
+    return Result<RsaPublicKey, RsaError>.failResult(RsaError.InvalidEncoding)
+  }
+  let exponent = readInteger(der, modulus.end, sequence.end)
+  if !exponent.valid || exponent.end != sequence.end {
+    return Result<RsaPublicKey, RsaError>.failResult(RsaError.InvalidEncoding)
+  }
+  return publicKeyFrom(integerBytes(der, &modulus), integerBytes(der, &exponent))
+}
+
+fn privateFromSequence(der: &[u8]) -> Result<RsaPrivateKey, RsaError> {
+  let sequence = readDer(der, 0, der.length, 48)
+  if !sequence.valid || sequence.end != der.length {
+    return Result<RsaPrivateKey, RsaError>.failResult(RsaError.InvalidEncoding)
+  }
+  let version = readInteger(der, sequence.start, sequence.end)
+  if !version.valid || version.end - version.start != 1 {
+    return Result<RsaPrivateKey, RsaError>.failResult(RsaError.InvalidEncoding)
+  }
+  if der[version.start] != 0 {
+    // Version 1 is a multi-prime key.
+    return Result<RsaPrivateKey, RsaError>.failResult(RsaError.InvalidParameters)
+  }
+  let mut values: [DerValue; 8] = [
+    DerValue { start: 0, end: 0, valid: false },
+    DerValue { start: 0, end: 0, valid: false },
+    DerValue { start: 0, end: 0, valid: false },
+    DerValue { start: 0, end: 0, valid: false },
+    DerValue { start: 0, end: 0, valid: false },
+    DerValue { start: 0, end: 0, valid: false },
+    DerValue { start: 0, end: 0, valid: false },
+    DerValue { start: 0, end: 0, valid: false },
+  ]
+  let mut offset = version.end
+  let mut i: usize = 0
+  while i < 8 {
+    let value = readInteger(der, offset, sequence.end)
+    if !value.valid {
+      return Result<RsaPrivateKey, RsaError>.failResult(RsaError.InvalidEncoding)
+    }
+    offset = value.end
+    values[i] = move value
+    i = i + 1
+  }
+  if offset != sequence.end {
+    return Result<RsaPrivateKey, RsaError>.failResult(RsaError.InvalidEncoding)
+  }
+  return RsaPrivateKey.fromComponents(
+    integerBytes(der, &values[0]),
+    integerBytes(der, &values[1]),
+    integerBytes(der, &values[2]),
+    integerBytes(der, &values[3]),
+    integerBytes(der, &values[4]),
+    integerBytes(der, &values[5]),
+    integerBytes(der, &values[6]),
+    integerBytes(der, &values[7]),
+  )
+}
+
+fn headerLength(length: usize) -> usize {
+  if length < 128 {
+    return 2
+  }
+  if length < 256 {
+    return 3
+  }
+  if length < 65536 {
+    return 4
+  }
+  return 5
+}
+
+// The content length of a DER INTEGER for the value: its bytes and a sign byte when the top
+// bit is set, which together is always the bit length / 8 + 1.
+fn integerContentLength(value: &Natural) -> usize {
+  return value.bitLength() / 8 + 1
+}
+
+fn integerLength(value: &Natural) -> usize {
+  let content = integerContentLength(value)
+  return headerLength(content) + content
+}
+
+fn writeHeader(output: &mut [u8], position: usize, tag: u8, length: usize) -> usize {
+  output[position] = tag
+  let size = headerLength(length)
+  if size == 2 {
+    output[position + 1] = usize.toU8(length)
+    return position + 2
+  }
+  output[position + 1] = usize.toU8(128 + size - 2)
+  let mut i: usize = 0
+  while i < size - 2 {
+    let shift = 8 * (size - 3 - i)
+    output[position + 2 + i] = usize.toU8(usize.bitAnd(usize.shiftRight(length, shift), 255))
+    i = i + 1
+  }
+  return position + size
+}
+
+fn writeInteger(output: &mut [u8], position: usize, value: &Natural) -> usize {
+  let content = integerContentLength(value)
+  let start = writeHeader(&mut output, position, 2, content)
+  writeFixed(value, Slice.viewMut<u8>(&mut output, start, content))
+  return start + content
+}
+
+fn publicContentLength(key: &RsaPublicKey) -> usize {
+  return integerLength(&key.n.natural()) + integerLength(&key.e)
+}
+
+fn writePublicSequence(key: &RsaPublicKey, output: &mut [u8], position: usize) -> usize {
+  let mut at = writeHeader(&mut output, position, 48, publicContentLength(key))
+  at = writeInteger(&mut output, at, &key.n.natural())
+  return writeInteger(&mut output, at, &key.e)
+}
+
+fn spkiContentLength(key: &RsaPublicKey) -> usize {
+  let bits = 1 + headerLength(publicContentLength(key)) + publicContentLength(key)
+  return 15 + headerLength(bits) + bits
+}
+
+fn privateParts(key: &RsaPrivateKey) -> [Natural; 8] {
+  return [
+    key.public.n.natural(),
+    key.public.e,
+    key.d,
+    key.p.natural(),
+    key.q.natural(),
+    key.dp,
+    key.dq,
+    key.qInverse,
+  ]
+}
+
+fn privateContentLength(key: &RsaPrivateKey) -> usize {
+  let parts = privateParts(key)
+  let mut length: usize = 3
+  let mut i: usize = 0
+  while i < 8 {
+    length = length + integerLength(&parts[i])
+    i = i + 1
+  }
+  return length
+}
+
+fn writePrivateSequence(key: &RsaPrivateKey, output: &mut [u8], position: usize) -> usize {
+  let parts = privateParts(key)
+  let mut at = writeHeader(&mut output, position, 48, privateContentLength(key))
+  at = writeInteger(&mut output, at, &Natural.zero())
+  let mut i: usize = 0
+  while i < 8 {
+    at = writeInteger(&mut output, at, &parts[i])
+    i = i + 1
+  }
+  return at
+}
+
+fn pkcs8ContentLength(key: &RsaPrivateKey) -> usize {
+  let inner = headerLength(privateContentLength(key)) + privateContentLength(key)
+  return 3 + 15 + headerLength(inner) + inner
+}
+
+fn writeAlgorithm(output: &mut [u8], position: usize) -> usize {
+  let algorithm = rsaEncryptionDer()
+  let mut i: usize = 0
+  while i < 15 {
+    output[position + i] = algorithm[i]
+    i = i + 1
+  }
+  return position + 15
+}
+
+impl RsaPublicKey {
+  /// Returns the key in a DER PKCS #1 `RSAPublicKey`: a SEQUENCE of the modulus and the
+  /// exponent, as in a PEM `RSA PUBLIC KEY`.
+  ///
+  /// # Errors
+  /// - `InvalidEncoding` if the DER is not valid, not minimal, or has bytes after it.
+  /// - `InvalidKey` if the key is not valid, as with [`RsaPublicKey.fromComponents`].
+  pub fn fromPkcs1Der(der: &[u8]) -> Result<RsaPublicKey, RsaError> {
+    return publicFromSequence(der)
+  }
+
+  /// Returns the key in a DER `SubjectPublicKeyInfo` with the `rsaEncryption` algorithm, as in a
+  /// PEM `PUBLIC KEY`.
+  ///
+  /// # Errors
+  /// - `InvalidEncoding` if the DER is not valid, or the BIT STRING has unused bits.
+  /// - `InvalidParameters` if the algorithm is not `rsaEncryption` with NULL or no parameters.
+  /// - `InvalidKey` if the key is not valid, as with [`RsaPublicKey.fromComponents`].
+  pub fn fromSpkiDer(der: &[u8]) -> Result<RsaPublicKey, RsaError> {
+    let sequence = readDer(der, 0, der.length, 48)
+    if !sequence.valid || sequence.end != der.length {
+      return Result<RsaPublicKey, RsaError>.failResult(RsaError.InvalidEncoding)
+    }
+    let algorithm = readDer(der, sequence.start, sequence.end, 48)
+    if !algorithm.valid {
+      return Result<RsaPublicKey, RsaError>.failResult(RsaError.InvalidEncoding)
+    }
+    let algorithmDer = Slice.view<u8>(der, sequence.start, algorithm.end - sequence.start)
+    if !rsaAlgorithm(algorithmDer, 1, false) {
+      return Result<RsaPublicKey, RsaError>.failResult(RsaError.InvalidParameters)
+    }
+    let bits = readDer(der, algorithm.end, sequence.end, 3)
+    if !bits.valid || bits.end != sequence.end || bits.start == bits.end || der[bits.start] != 0 {
+      return Result<RsaPublicKey, RsaError>.failResult(RsaError.InvalidEncoding)
+    }
+    return publicFromSequence(Slice.view<u8>(der, bits.start + 1, bits.end - bits.start - 1))
+  }
+
+  /// Returns the length in bytes of [`RsaPublicKey.writePkcs1Der`].
+  pub fn pkcs1DerLength(self: &RsaPublicKey) -> usize {
+    let content = publicContentLength(self)
+    return headerLength(content) + content
+  }
+
+  /// Writes the key as a DER PKCS #1 `RSAPublicKey` to the start of `output` and returns its
+  /// length.
+  ///
+  /// # Errors
+  /// - `InvalidLength` if `output` is shorter than [`RsaPublicKey.pkcs1DerLength`].
+  pub fn writePkcs1Der(self: &RsaPublicKey, output: &mut [u8]) -> Result<usize, RsaError> {
+    if output.length < self.pkcs1DerLength() {
+      return Result<usize, RsaError>.failResult(RsaError.InvalidLength)
+    }
+    return Result<usize, RsaError>.succeed(writePublicSequence(self, &mut output, 0))
+  }
+
+  /// Returns the length in bytes of [`RsaPublicKey.writeSpkiDer`].
+  pub fn spkiDerLength(self: &RsaPublicKey) -> usize {
+    let content = spkiContentLength(self)
+    return headerLength(content) + content
+  }
+
+  /// Writes the key as a DER `SubjectPublicKeyInfo` with `rsaEncryption` to the start of
+  /// `output` and returns its length.
+  ///
+  /// # Errors
+  /// - `InvalidLength` if `output` is shorter than [`RsaPublicKey.spkiDerLength`].
+  pub fn writeSpkiDer(self: &RsaPublicKey, output: &mut [u8]) -> Result<usize, RsaError> {
+    if output.length < self.spkiDerLength() {
+      return Result<usize, RsaError>.failResult(RsaError.InvalidLength)
+    }
+    let mut at = writeHeader(&mut output, 0, 48, spkiContentLength(self))
+    at = writeAlgorithm(&mut output, at)
+    let public = publicContentLength(self)
+    at = writeHeader(&mut output, at, 3, 1 + headerLength(public) + public)
+    output[at] = 0
+    return Result<usize, RsaError>.succeed(writePublicSequence(self, &mut output, at + 1))
+  }
+}
+
+impl RsaPrivateKey {
+  /// Returns the key in a DER PKCS #1 `RSAPrivateKey`, as in a PEM `RSA PRIVATE KEY`.
+  ///
+  /// # Errors
+  /// - `InvalidEncoding` if the DER is not valid, not minimal, or has bytes after it.
+  /// - `InvalidParameters` if it is a multi-prime key (version 1).
+  /// - `InvalidKey` if the parts are not valid, as with [`RsaPrivateKey.fromComponents`].
+  pub fn fromPkcs1Der(der: &[u8]) -> Result<RsaPrivateKey, RsaError> {
+    return privateFromSequence(der)
+  }
+
+  /// Returns the key in a DER PKCS #8 `PrivateKeyInfo` with the `rsaEncryption` algorithm, as
+  /// in a PEM `PRIVATE KEY`. Attributes and a public key after the private key are skipped.
+  ///
+  /// # Errors
+  /// - `InvalidEncoding` if the DER is not valid, or the version is not 0 or 1.
+  /// - `InvalidParameters` if the algorithm is not `rsaEncryption` with NULL or no parameters,
+  ///   or the key is multi-prime.
+  /// - `InvalidKey` if the parts are not valid, as with [`RsaPrivateKey.fromComponents`].
+  ///
+  /// # Gotchas
+  /// It does not decrypt an `ENCRYPTED PRIVATE KEY`.
+  pub fn fromPkcs8Der(der: &[u8]) -> Result<RsaPrivateKey, RsaError> {
+    let sequence = readDer(der, 0, der.length, 48)
+    if !sequence.valid || sequence.end != der.length {
+      return Result<RsaPrivateKey, RsaError>.failResult(RsaError.InvalidEncoding)
+    }
+    let version = readInteger(der, sequence.start, sequence.end)
+    if !version.valid || version.end - version.start != 1 || der[version.start] > 1 {
+      return Result<RsaPrivateKey, RsaError>.failResult(RsaError.InvalidEncoding)
+    }
+    let algorithm = readDer(der, version.end, sequence.end, 48)
+    if !algorithm.valid {
+      return Result<RsaPrivateKey, RsaError>.failResult(RsaError.InvalidEncoding)
+    }
+    let algorithmDer = Slice.view<u8>(der, version.end, algorithm.end - version.end)
+    if !rsaAlgorithm(algorithmDer, 1, false) {
+      return Result<RsaPrivateKey, RsaError>.failResult(RsaError.InvalidParameters)
+    }
+    let key = readDer(der, algorithm.end, sequence.end, 4)
+    if !key.valid {
+      return Result<RsaPrivateKey, RsaError>.failResult(RsaError.InvalidEncoding)
+    }
+
+    // Skips [0] attributes and the [1] public key of version 2 (RFC 5958).
+    let mut offset = key.end
+    let attributes = readDer(der, offset, sequence.end, 160)
+    if attributes.valid {
+      offset = attributes.end
+    }
+    let publicKey = readDer(der, offset, sequence.end, 129)
+    if publicKey.valid {
+      offset = publicKey.end
+    }
+    if offset != sequence.end {
+      return Result<RsaPrivateKey, RsaError>.failResult(RsaError.InvalidEncoding)
+    }
+    return privateFromSequence(Slice.view<u8>(der, key.start, key.end - key.start))
+  }
+
+  /// Returns the length in bytes of [`RsaPrivateKey.writePkcs1Der`].
+  pub fn pkcs1DerLength(self: &RsaPrivateKey) -> usize {
+    let content = privateContentLength(self)
+    return headerLength(content) + content
+  }
+
+  /// Writes the key as a DER PKCS #1 `RSAPrivateKey` to the start of `output` and returns its
+  /// length.
+  ///
+  /// # Errors
+  /// - `InvalidLength` if `output` is shorter than [`RsaPrivateKey.pkcs1DerLength`].
+  pub fn writePkcs1Der(self: &RsaPrivateKey, output: &mut [u8]) -> Result<usize, RsaError> {
+    if output.length < self.pkcs1DerLength() {
+      return Result<usize, RsaError>.failResult(RsaError.InvalidLength)
+    }
+    return Result<usize, RsaError>.succeed(writePrivateSequence(self, &mut output, 0))
+  }
+
+  /// Returns the length in bytes of [`RsaPrivateKey.writePkcs8Der`].
+  pub fn pkcs8DerLength(self: &RsaPrivateKey) -> usize {
+    let content = pkcs8ContentLength(self)
+    return headerLength(content) + content
+  }
+
+  /// Writes the key as a DER PKCS #8 `PrivateKeyInfo` (version 0, `rsaEncryption`) to the start
+  /// of `output` and returns its length.
+  ///
+  /// # Errors
+  /// - `InvalidLength` if `output` is shorter than [`RsaPrivateKey.pkcs8DerLength`].
+  pub fn writePkcs8Der(self: &RsaPrivateKey, output: &mut [u8]) -> Result<usize, RsaError> {
+    if output.length < self.pkcs8DerLength() {
+      return Result<usize, RsaError>.failResult(RsaError.InvalidLength)
+    }
+    let mut at = writeHeader(&mut output, 0, 48, pkcs8ContentLength(self))
+    at = writeInteger(&mut output, at, &Natural.zero())
+    at = writeAlgorithm(&mut output, at)
+    let inner = privateContentLength(self)
+    at = writeHeader(&mut output, at, 4, headerLength(inner) + inner)
+    return Result<usize, RsaError>.succeed(writePrivateSequence(self, &mut output, at))
+  }
+}
+
+// The pseudorandom function of implicit rejection: HMAC-SHA256 blocks of the counter, the label,
+// and the output length in bits, written to all of `output`.
+fn rejectionBytes(derivationKey: &[u8; 32], label: &[u8], output: &mut [u8]) -> () {
+  let bits = 8 * output.length
+  let suffix: [u8; 2] = [usize.toU8(usize.shiftRight(bits, 8)), usize.toU8(usize.bitAnd(bits, 255))]
+  let mut counter: usize = 0
+  let mut offset: usize = 0
+  while offset < output.length {
+    let mut mac = HmacSha256.make(derivationKey)
+    let prefix: [u8; 2] = [
+      usize.toU8(usize.shiftRight(counter, 8)),
+      usize.toU8(usize.bitAnd(counter, 255)),
+    ]
+    mac.update(&prefix)
+    mac.update(label)
+    mac.update(&suffix)
+    let block = mac.finish()
+    let mut i: usize = 0
+    while i < 32 && offset + i < output.length {
+      output[offset + i] = block[i]
+      i = i + 1
+    }
+    offset = offset + 32
+    counter = counter + 1
+  }
+}
+
+fn selectByte(condition: u32, whenTrue: u8, whenFalse: u8) -> u8 {
+  return u8.bitXor(whenFalse, u8.bitAnd(byteMask(condition), u8.bitXor(whenTrue, whenFalse)))
+}
+
+fn selectLength(condition: u32, whenTrue: usize, whenFalse: usize) -> usize {
+  let mask = usize.wrappingSubtract(0, u32.toUsize(condition))
+  return usize.bitXor(whenFalse, usize.bitAnd(mask, usize.bitXor(whenTrue, whenFalse)))
+}
+
+// 1 when left < right, for values below 2^63.
+fn lessBit(left: usize, right: usize) -> u32 {
+  return u64.toU32(u64.shiftRight(u64.wrappingSubtract(usize.toU64(left), usize.toU64(right)), 63))
+}
+
+impl RsaPrivateKey {
+  /// Decrypts an RSAES-PKCS1-v1_5 `ciphertext` with implicit rejection and returns the length of
+  /// the message that it writes to the start of `output`.
+  ///
+  /// When the padding is not valid, it returns a message derived from the private key and the
+  /// ciphertext instead of an error, as OpenSSL 3.2 and later and Node.js do, so a padding oracle
+  /// does not reveal the plaintext. The check and the choice run without a branch on secret
+  /// data. The bytes of `output` after the message are zero.
+  ///
+  /// # Errors
+  /// - `InvalidLength` if `ciphertext` is not as long as the modulus, or `output` is shorter than
+  ///   the modulus length less 11.
+  /// - `InvalidCiphertext` if `ciphertext` is not less than the modulus.
+  /// - `InvalidKey` if the private parts do not match the public key.
+  ///
+  /// # Gotchas
+  /// A wrong key or a changed ciphertext gives a wrong message, not an error. Use it only for
+  /// formats that require PKCS #1 v1.5, and check the message with something else, such as its
+  /// expected length or a MAC.
+  pub fn decryptPkcs1(self: &RsaPrivateKey, ciphertext: &[u8], output: &mut [u8]) -> Result<
+    usize,
+    RsaError,
+  > {
+    let width = self.public.width
+    if ciphertext.length != width || output.length < width - 11 {
+      return Result<usize, RsaError>.failResult(RsaError.InvalidLength)
+    }
+    let mut block: [u8; 1024] = [0; 1024]
+    let opened = openBlock(self, ciphertext, &mut block)
+    if let Result<(), RsaError>.Failure { error } = move opened {
+      return Result<usize, RsaError>.failResult(error)
+    }
+
+    // The synthetic message: KDK = HMAC-SHA256(SHA-256(d), ciphertext).
+    let mut exponentBytes: [u8; 1024] = [0; 1024]
+    writeFixed(&self.d, Slice.viewMut<u8>(&mut exponentBytes, 0, width))
+    let exponentHash = Sha256.hash(Slice.view<u8>(&exponentBytes, 0, width))
+    let mut derivation = HmacSha256.make(&exponentHash)
+    derivation.update(ciphertext)
+    let derivationKey = derivation.finish()
+    let mut synthetic: [u8; 1024] = [0; 1024]
+    rejectionBytes(&derivationKey, b"message", Slice.viewMut<u8>(&mut synthetic, 0, width))
+    let mut candidates: [u8; 256] = [0; 256]
+    rejectionBytes(&derivationKey, b"length", &mut candidates)
+    let limit = width - 10
+    let mut mask: usize = 1
+    while mask < limit {
+      mask = mask * 2 + 1
+    }
+    let mut syntheticLength: usize = 0
+    let mut i: usize = 0
+    while i < 128 {
+      let candidate = usize.bitAnd(
+        u8.toUsize(candidates[2 * i]) * 256 + u8.toUsize(candidates[2 * i + 1]),
+        mask,
+      )
+      syntheticLength = selectLength(lessBit(candidate, limit), candidate, syntheticLength)
+      i = i + 1
+    }
+
+    // The real message: 00 02, at least eight nonzero bytes, 00, then the message.
+    let mut good = u32.bitAnd(zeroByte(block[0]), equalByte(block[1], 2))
+    let mut looking: u32 = 1
+    let mut separator: usize = 0
+    i = 2
+    while i < width {
+      let take = u32.bitAnd(looking, zeroByte(block[i]))
+      separator = selectLength(take, i, separator)
+      looking = u32.bitAnd(looking, u32.bitXor(take, 1))
+      i = i + 1
+    }
+    good = u32.bitAnd(good, u32.bitXor(looking, 1))
+    good = u32.bitAnd(good, u32.bitXor(lessBit(separator, 10), 1))
+    let length = selectLength(good, width - separator - 1, syntheticLength)
+
+    // Both messages end the block, so pick bytes, then shift the last width - 11 bytes left.
+    let window = width - 11
+    let mut shifted: [u8; 1024] = [0; 1024]
+    i = 0
+    while i < window {
+      shifted[i] = selectByte(good, block[11 + i], synthetic[11 + i])
+      i = i + 1
+    }
+    let shift = window - length
+    let mut step: usize = 1
+    let mut bitIndex: usize = 0
+    while step < window {
+      let bit = usize.toU32(usize.bitAnd(usize.shiftRight(shift, bitIndex), 1))
+      bitIndex = bitIndex + 1
+      i = 0
+      while i < window {
+        let mut moved: u8 = 0
+        if i + step < window {
+          moved = shifted[i + step]
+        }
+        shifted[i] = selectByte(bit, moved, shifted[i])
+        i = i + 1
+      }
+      step = step * 2
+    }
+    i = 0
+    while i < output.length {
+      if i < window {
+        output[i] = selectByte(lessBit(i, length), shifted[i], 0)
+      } else {
+        output[i] = 0
+      }
+      i = i + 1
+    }
+    return Result<usize, RsaError>.succeed(length)
   }
 }

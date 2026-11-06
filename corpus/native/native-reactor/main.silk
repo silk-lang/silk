@@ -1,0 +1,138 @@
+static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu") {
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.concurrency.thread_native { NativeThread, SpawnError }
+import silk.io.reactor { Interest, ReadyEvent, Reactor, ReactorError, ReactorOperation, WAKE_TOKEN, Waker }
+
+@foreign(noCapture: .("fds"))
+unsafe extern "C" fn pipe(fds: ?[*]mut i32) -> i32
+@foreign(noCapture: .("buffer"))
+unsafe extern "C" fn write(fd: i32, buffer: ?[*]const u8, count: usize) -> isize
+@foreign(noCapture: .("buffer"))
+unsafe extern "C" fn read(fd: i32, buffer: ?[*]mut u8, count: usize) -> isize
+unsafe extern "C" fn close(fd: i32) -> i32
+
+fn writeByte(fd: i32) -> bool {
+  let one: [u8; 1] = [7]
+  return unsafe write(fd, Pointer.fromSlice<u8>(&one), 1) == 1
+}
+
+fn readByte(fd: i32) -> bool {
+  let mut one: [u8; 1] = [0]
+  return unsafe read(fd, Pointer.fromMutSlice<u8>(&mut one), 1) == 1
+}
+
+// The number of events with `token` and the given readable flag in the first `count` events.
+fn countMatching(events: &[ReadyEvent], count: usize, token: u64, readable: bool, writable: bool) -> usize {
+  let mut found: usize = 0
+  let mut index: usize = 0
+  while index < count {
+    let event = events[index]
+    if event.token == token && event.readable == readable && event.writable == writable { found = found + 1 }
+    index = index + 1
+  }
+  return found
+}
+
+fn wakeOnce(waker: Waker) -> bool {
+  return match run Effect.result(waker.wake()) {
+    Result<(), ReactorError>.Success { .. } => true
+    Result<(), ReactorError>.Failure { .. } => false
+  }
+}
+
+fn operationIndex(operation: ReactorOperation) -> i32 {
+  return match operation {
+    ReactorOperation.Create => 0
+    ReactorOperation.Register => 1
+    ReactorOperation.Modify => 2
+    ReactorOperation.Deregister => 3
+    ReactorOperation.Wait => 4
+    ReactorOperation.Wake => 5
+  }
+}
+
+fn failureCode(result: Result<(), ReactorError>, operation: ReactorOperation) -> i32 {
+  return match move result {
+    Result<(), ReactorError>.Success { .. } => -1
+    Result<(), ReactorError>.Failure { error } => {
+      if operationIndex(error.operation) == operationIndex(operation) { error.code } else { -2 }
+    }
+  }
+}
+
+effect fn program() -> i32 ! ReactorError | OutOfMemoryError | SpawnError ? &mut Allocator {
+  let mut fds: [i32; 2] = [-1, -1]
+  if unsafe pipe(Pointer.fromMutSlice<i32>(&mut fds)) != 0 { return 1 }
+  let reader = fds[0]
+  let writer = fds[1]
+  let mut reactor = run Reactor.make()
+  let mut events = [ReadyEvent.empty(); 8]
+
+  // An empty pipe is not readable, and its write end is writable.
+  run reactor.register(reader, 10, Interest.readOnly())
+  run reactor.register(writer, 11, Interest.writeOnly())
+  let first = run reactor.wait(&mut events, Option<u64>.some(0))
+  if first != 1 || countMatching(&events, first, 11, false, true) != 1 { return 2 }
+
+  // Level-triggered: the byte is reported by each wait until it is read.
+  if !writeByte(writer) { return 3 }
+  run reactor.modify(writer, 11, Interest { readable: false, writable: false })
+  let second = run reactor.wait(&mut events, Option<u64>.some(1000000000))
+  if second != 1 || countMatching(&events, second, 10, true, false) != 1 { return 4 }
+  let third = run reactor.wait(&mut events, Option<u64>.some(0))
+  if third != 1 || countMatching(&events, third, 10, true, false) != 1 { return 5 }
+  if !readByte(reader) { return 6 }
+  let quiet = run reactor.wait(&mut events, Option<u64>.some(0))
+  if quiet != 0 { return 7 }
+
+  // A new token from modify.
+  run reactor.modify(reader, 12, Interest.readOnly())
+  if !writeByte(writer) { return 8 }
+  let renamed = run reactor.wait(&mut events, Option<u64>.some(1000000000))
+  if renamed != 1 || events[0].token != 12 { return 9 }
+  if !readByte(reader) { return 10 }
+
+  // Errors carry the operation and the native code.
+  if failureCode(run Effect.result(reactor.register(reader, WAKE_TOKEN, Interest.readOnly())), ReactorOperation.Register) != 22 { return 11 }
+  if failureCode(run Effect.result(reactor.register(-1, 3, Interest.readOnly())), ReactorOperation.Register) != 9 { return 12 }
+  run reactor.deregister(writer)
+  if failureCode(run Effect.result(reactor.deregister(writer)), ReactorOperation.Deregister) != 2 { return 13 }
+
+  // Closing the write end makes the read end report a hangup.
+  let _closedWriter = unsafe close(writer)
+  let hung = run reactor.wait(&mut events, Option<u64>.some(1000000000))
+  if hung != 1 || events[0].token != 12 || !events[0].hangup { return 14 }
+  run reactor.deregister(reader)
+  let _closedReader = unsafe close(reader)
+
+  // A wake from another thread ends a wait with no limit, and is not reported as an event.
+  let waker = reactor.waker()
+  let handle = run NativeThread.spawn(fn() -> bool { return wakeOnce(move waker) })
+  let woken = run reactor.wait(&mut events, Option<u64>.none())
+  if !handle.join() || woken != 0 { return 15 }
+
+  // Many wakes before one wait end only that wait.
+  let local = reactor.waker()
+  run local.wake()
+  run local.wake()
+  let single = run reactor.wait(&mut events, Option<u64>.some(0))
+  let after = run reactor.wait(&mut events, Option<u64>.some(0))
+  if single != 0 || after != 0 { return 16 }
+  return 42
+}
+
+pub effect fn main() -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let result = run Effect.result(program()) |> Effect.provideMut<Allocator>(&mut allocator)
+  return match move result {
+    Result<i32, ReactorError | OutOfMemoryError | SpawnError>.Success { value } => value
+    Result<i32, ReactorError | OutOfMemoryError | SpawnError>.Failure { .. } => 100
+  }
+}
+} else {
+pub fn main() -> i32 { return 42 }
+}
