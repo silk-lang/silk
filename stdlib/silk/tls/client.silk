@@ -1,4 +1,4 @@
-//! A TLS 1.3 client state machine that authenticates an HTTPS server over a byte transport that you
+//! A TLS 1.2 and TLS 1.3 client state machine that authenticates an HTTPS server over a byte transport that you
 //! drive.
 //!
 //! # When to use
@@ -8,15 +8,20 @@
 //! `Authenticated`, and then read and write application data.
 //!
 //! # Details
-//! The client supports TLS 1.3 only, with the cipher suites ChaCha20-Poly1305, AES-128-GCM, and
-//! AES-256-GCM, and the key exchange groups X25519 and P-256. It checks the certificate chain
+//! The client offers the versions that `ClientConfig.versions` allows. In TLS 1.3 it supports the
+//! cipher suites ChaCha20-Poly1305, AES-128-GCM, and AES-256-GCM, and the key exchange groups X25519
+//! and P-256. In TLS 1.2 (RFC 5246) it supports the ECDHE suites with ECDSA or RSA keys and
+//! ChaCha20-Poly1305, AES-128-GCM, or AES-256-GCM, and the groups X25519, P-256, and P-384. It
+//! requires the extended master secret (RFC 7627) and secure renegotiation from a TLS 1.2 server,
+//! and when TLS 1.3 is also allowed, it rejects a TLS 1.2 ServerHello with the RFC 8446 downgrade
+//! mark. It checks the certificate chain
 //! against your `TrustSnapshot`, the host name of your `ReferenceIdentity`, the CertificateVerify
 //! signature, and the Finished message. It gives no application data before all checks pass.
 //!
 //! When the server sends a CertificateRequest, the client answers with the [`ClientCredential`]
 //! given to [`Client.make`]: the chain and a CertificateVerify signed with its key, using a scheme
-//! that the server lists. With `ClientCredential.None`, or when no listed scheme fits the key, it
-//! sends an empty Certificate message, and the server decides whether to go on.
+//! that the server lists. With `ClientCredential.None`, when no listed scheme fits the key, or in
+//! TLS 1.2, it sends an empty Certificate message, and the server decides whether to go on.
 //!
 //! With [`Resumption`] `Enabled`, the client asks for session tickets and returns each one as a
 //! [`Session`] from [`Client.takeSession`]. A later client given that session offers it as a PSK
@@ -40,7 +45,8 @@
 //!
 //! # Gotchas
 //! You provide the trust, the time, the random source, and the transport. The client supports one
-//! TLS 1.3 profile, not all of the Web PKI. Dropping the client does not send `close_notify`. Call
+//! profile, not all of the Web PKI. In TLS 1.2 it does not resume sessions, does not present client
+//! certificates, has no KeyUpdate, and ignores a HelloRequest, so the server cannot renegotiate. Dropping the client does not send `close_notify`. Call
 //! [`Client.closeWrite`] first. Secrets are not erased.
 //!
 //! # Examples
@@ -54,6 +60,7 @@
 //! import silk.core.result { Result }
 //! import silk.system.system_clock { SystemClock }
 //! import silk.tls.client { AlpnConfig, Client, ClientConfig, ClientCredential, ClientLimits, Progress, Resumption, TlsError }
+//! import silk.tls.record { VersionPolicy }
 //! import silk.tls.trust_anchor { TrustAnchor }
 //! import silk.tls.trust_snapshot { SnapshotLimits, TrustSnapshot, TrustSourceError }
 //! import silk.num.usize
@@ -97,6 +104,7 @@
 //!     reference: reference,
 //!     alpn: AlpnConfig.defaults(),
 //!     resumption: Resumption.Disabled,
+//!     versions: VersionPolicy.defaults(),
 //!     limits: ClientLimits.defaults()
 //!   }
 //!   let made = run Client.make(&config, move trust, SystemClock.make(1789156800, 0), ClientCredential.None)
@@ -161,6 +169,7 @@ import silk.mem.layout {Layout}
 import silk.core.option {Option}
 import silk.core.ownership {Copy}
 import silk.crypto.p256 {P256, P256Error}
+import silk.crypto.p384 {P384, P384Error}
 import silk.system.random {Random}
 import silk.mem.raw_buffer {RawBuffer}
 import silk.core.result {Result}
@@ -169,6 +178,7 @@ import silk.crypto.sha2 {Sha256, Sha384}
 import silk.collections.slice {Slice}
 import silk.system.system_clock {Instant, SystemClock}
 import silk.tls.hkdf {LabelError, TlsHkdfSha256, TlsHkdfSha384}
+import silk.tls.prf {Tls12Keys, TlsPrf, VERIFY_DATA_LENGTH}
 import silk.tls.record {
   CipherSuite,
   ContentType,
@@ -178,6 +188,8 @@ import silk.tls.record {
   RecordError,
   TlsRecordReceiver,
   TlsRecordSender,
+  TlsVersion,
+  VersionPolicy,
 }
 import silk.tls.signature {
   HandshakeSignature,
@@ -212,6 +224,8 @@ pub enum NamedGroup {
   X25519,
   /// The NIST P-256 curve with a 65-byte uncompressed encoded point.
   P256,
+  /// The NIST P-384 curve with a 97-byte uncompressed encoded point, in TLS 1.2 only.
+  P384,
 }
 
 /// One borrowed opaque ALPN protocol offered in caller order.
@@ -319,6 +333,8 @@ pub struct ClientConfig<'a> {
   pub alpn: AlpnConfig<'a>,
   /// Whether the client asks for session tickets, and which session it offers.
   pub resumption: Resumption<'a>,
+  /// The TLS versions the client offers. `VersionPolicy.defaults()` offers TLS 1.2 and TLS 1.3.
+  pub versions: VersionPolicy,
   /// Finite connection limits and nested certificate policies.
   pub limits: ClientLimits,
 }
@@ -794,7 +810,8 @@ pub enum ProtocolReason {
   InvalidLength,
   /// An extension is duplicated, unsolicited, misplaced, or malformed.
   Extension,
-  /// ServerHello does not select the admitted TLS 1.3 profile.
+  /// ServerHello does not select an offered version and profile, or a TLS 1.2 ServerHello carries
+  /// the downgrade mark while TLS 1.3 is allowed.
   ServerHello,
   /// HelloRetryRequest violates its single-retry and changed-ClientHello rules.
   HelloRetryRequest,
@@ -1094,8 +1111,14 @@ pub struct Authentication<'a> {
 }
 
 impl<'a> Authentication<'a> {
-  /// Returns the negotiated TLS 1.3 cipher suite.
+  /// Returns the negotiated cipher suite.
   pub fn suite(self: &Self) -> CipherSuite { return self.suiteValue }
+
+  /// Returns the negotiated TLS version.
+  pub fn version(self: &Self) -> TlsVersion {
+    if self.clientValue.tls12 { return TlsVersion.Tls12 }
+    return TlsVersion.Tls13
+  }
 
   /// Returns the negotiated ephemeral key-exchange group.
   pub fn group(self: &Self) -> NamedGroup { return self.groupValue }
@@ -1151,6 +1174,12 @@ enum ClientState {
   AwaitServerFinished,
   ClientFinishedPending,
   Traffic,
+  Tls12AwaitCertificate,
+  Tls12AwaitKeyExchange,
+  Tls12AwaitHelloDone,
+  Tls12FlightPending,
+  Tls12AwaitCcs,
+  Tls12AwaitFinished,
 }
 
 union OwnedReference {
@@ -1180,6 +1209,9 @@ enum PendingKind {
   KeyUpdate,
   CloseNotify,
   FatalAlert,
+  Tls12KeyExchange,
+  Tls12Ccs,
+  Tls12Finished,
 }
 
 struct ParsedServerHello {
@@ -1206,7 +1238,7 @@ struct PathEvidence {
   revocation: RevocationStatus,
 }
 
-/// A TLS 1.3 client state machine that does no I/O.
+/// A TLS 1.2 and TLS 1.3 client state machine that does no I/O.
 ///
 /// # When to use
 /// Most programs use `silk.tls.connection`, which drives this client over a `ByteDuplex`. Use it
@@ -1220,9 +1252,10 @@ struct PathEvidence {
 /// [`Client.ackWritten`] with the number of bytes written. The client does not keep your buffers.
 /// [`ClientLimits`] bound all memory and work.
 ///
-/// It supports TLS 1.3 only, with the cipher suites ChaCha20-Poly1305, AES-128-GCM, and
-/// AES-256-GCM, the key exchange groups X25519 and P-256, and server keys ECDSA P-256, ECDSA P-384,
-/// and RSA (PSS with SHA-256). It checks the certificate chain against your `TrustSnapshot`, the
+/// It supports TLS 1.3 with the cipher suites ChaCha20-Poly1305, AES-128-GCM, and AES-256-GCM, and
+/// the key exchange groups X25519 and P-256. It supports TLS 1.2 with the ECDHE versions of those
+/// ciphers and the groups X25519, P-256, and P-384. Server keys can be ECDSA P-256, ECDSA P-384,
+/// or RSA (PSS, and in TLS 1.2 also PKCS #1 v1.5). It checks the certificate chain against your `TrustSnapshot`, the
 /// host name of your `ReferenceIdentity`, the CertificateVerify signature, and the Finished
 /// message. It gives no application data before all checks pass.
 ///
@@ -1315,6 +1348,14 @@ pub struct Client {
   earlyLength: usize,
   earlyStatus: EarlyDataStatus,
   earlySecret: [u8; 48],
+  versions: VersionPolicy,
+  tls12: bool,
+  serverRandom: [u8; 32],
+  tls12Keys: Tls12Keys,
+  preMaster: [u8; 48],
+  preMasterLength: usize,
+  clientShare: [u8; 97],
+  clientShareLength: usize,
 }
 
 impl Client {
@@ -1376,7 +1417,8 @@ impl Client {
     let dnsLength = referenceDnsLength(config.reference)
     let alpnLength = alpnPayloadLength(config.alpn)
     let alpnCount = alpnProtocolCount(config.alpn)
-    let offerable = sessionOfferable(config, &validationTime)
+    // Sessions and early data are TLS 1.3 only.
+    let offerable = config.versions.allows(TlsVersion.Tls13) && sessionOfferable(config, &validationTime)
     let earlyLength = configEarlyDataLength(config)
     if earlyLength > RECORD_CONTENT_LIMIT {
       return Result<Client, TlsError>.failResult(
@@ -1408,6 +1450,7 @@ impl Client {
       alpnLength,
       alpnCount,
       config.limits.cookieBytes,
+      config.versions.allows(TlsVersion.Tls12),
     ) + pskLength
     if generatedBody - 47 > 65535 {
       return Result<Client, TlsError>.failResult(
@@ -1544,6 +1587,21 @@ impl Client {
       earlyLength: earlyLength,
       earlyStatus: earlyStatus,
       earlySecret: zero48(),
+      versions: config.versions,
+      tls12: false,
+      serverRandom: zero32(),
+      tls12Keys: Tls12Keys {
+        clientKey: zero32(),
+        serverKey: zero32(),
+        clientIv: [0; 12],
+        serverIv: [0; 12],
+        keyLength: 0,
+        ivLength: 0,
+      },
+      preMaster: zero48(),
+      preMasterLength: 0,
+      clientShare: [0; 97],
+      clientShareLength: 0,
     }
     let queued = run queueClientHello(&mut client, false)
     return match move queued {
@@ -1794,7 +1852,8 @@ impl Client {
     if let Option<TlsError>.Some {value: error} = move terminalError(&self.*) {
       return Result<Progress, TlsError>.failResult(move error)
     }
-    if self.state != ClientState.Traffic || self.localCloseRequested {
+    // TLS 1.2 has no KeyUpdate message.
+    if self.state != ClientState.Traffic || self.localCloseRequested || self.tls12 {
       return invalidState(ClientOperation.RequestKeyUpdate)
     }
     if self.pendingKind != PendingKind.KeyUpdate && !self.pendingKeyUpdate {
@@ -2409,7 +2468,7 @@ fn restoreSessionAuthentication(client: &mut Client) -> () {
 }
 
 fn selectedTranscriptHash(client: &Client) -> [u8; 48] {
-  if client.selectedSuite == CipherSuite.Aes256GcmSha384 {
+  if client.selectedSuite.hashLength() == 48 {
     return client.transcript384.checkpoint()
   }
   let digest = client.transcript256.checkpoint()
@@ -2561,8 +2620,12 @@ fn maximumClientHelloBody(
   alpnLength: usize,
   alpnCount: usize,
   cookieLength: usize,
+  tls12: bool,
 ) -> usize {
   let mut body: usize = 161
+  // Six TLS 1.2 suites, two more schemes, a second version, P-384, and the
+  // extended_master_secret, renegotiation_info, and ec_point_formats extensions.
+  if tls12 { body = body + 35 }
   if dnsLength > 0 { body = body + dnsLength + 9 }
   if alpnCount > 0 { body = body + alpnLength + alpnCount + 6 }
   return body + cookieLength + 6
@@ -2699,14 +2762,31 @@ effect fn queueClientHello(client: &mut Client, retry: bool) -> Result<(), TlsEr
   let alpnOffsets = client.alpnOffsets
   let alpnLengths = client.alpnLengths
   let cookieLength = client.cookieLength
+  let offer13 = client.versions.allows(TlsVersion.Tls13)
+  // A retried ClientHello keeps the TLS 1.2 offer, since it may change only what RFC 8446 section
+  // 4.1.2 lists.
+  let offer12 = client.versions.allows(TlsVersion.Tls12)
+  let mut suitesLength: usize = 0
+  if offer13 { suitesLength = suitesLength + 6 }
+  if offer12 { suitesLength = suitesLength + 12 }
   let mut cursor = HANDSHAKE_HEADER_LENGTH
   putU16(&mut client.handshake, &mut cursor, 771)
   putSlice(&mut client.handshake, &mut cursor, &random)
   putU8(&mut client.handshake, &mut cursor, 0)
-  putU16(&mut client.handshake, &mut cursor, 6)
-  putU16(&mut client.handshake, &mut cursor, 4867)
-  putU16(&mut client.handshake, &mut cursor, 4865)
-  putU16(&mut client.handshake, &mut cursor, 4866)
+  putU16(&mut client.handshake, &mut cursor, suitesLength)
+  if offer13 {
+    putU16(&mut client.handshake, &mut cursor, 4867)
+    putU16(&mut client.handshake, &mut cursor, 4865)
+    putU16(&mut client.handshake, &mut cursor, 4866)
+  }
+  if offer12 {
+    putU16(&mut client.handshake, &mut cursor, 52393)
+    putU16(&mut client.handshake, &mut cursor, 52392)
+    putU16(&mut client.handshake, &mut cursor, 49195)
+    putU16(&mut client.handshake, &mut cursor, 49199)
+    putU16(&mut client.handshake, &mut cursor, 49196)
+    putU16(&mut client.handshake, &mut cursor, 49200)
+  }
   putU8(&mut client.handshake, &mut cursor, 1)
   putU8(&mut client.handshake, &mut cursor, 0)
   let extensionsLengthAt = cursor
@@ -2728,17 +2808,37 @@ effect fn queueClientHello(client: &mut Client, retry: bool) -> Result<(), TlsEr
     }
   }
 
-  putU16(&mut client.handshake, &mut cursor, 43)
-  putU16(&mut client.handshake, &mut cursor, 3)
-  putU8(&mut client.handshake, &mut cursor, 2)
-  putU16(&mut client.handshake, &mut cursor, 772)
+  if offer13 && offer12 {
+    putU16(&mut client.handshake, &mut cursor, 43)
+    putU16(&mut client.handshake, &mut cursor, 5)
+    putU8(&mut client.handshake, &mut cursor, 4)
+    putU16(&mut client.handshake, &mut cursor, 772)
+    putU16(&mut client.handshake, &mut cursor, 771)
+  } else if offer13 {
+    putU16(&mut client.handshake, &mut cursor, 43)
+    putU16(&mut client.handshake, &mut cursor, 3)
+    putU8(&mut client.handshake, &mut cursor, 2)
+    putU16(&mut client.handshake, &mut cursor, 772)
+  }
 
-  putU16(&mut client.handshake, &mut cursor, 13)
-  putU16(&mut client.handshake, &mut cursor, 8)
-  putU16(&mut client.handshake, &mut cursor, 6)
-  putU16(&mut client.handshake, &mut cursor, 1027)
-  putU16(&mut client.handshake, &mut cursor, 1283)
-  putU16(&mut client.handshake, &mut cursor, 2052)
+  // TLS 1.2 also allows RSA PKCS#1 v1.5 signatures in ServerKeyExchange.
+  if offer12 {
+    putU16(&mut client.handshake, &mut cursor, 13)
+    putU16(&mut client.handshake, &mut cursor, 12)
+    putU16(&mut client.handshake, &mut cursor, 10)
+    putU16(&mut client.handshake, &mut cursor, 1027)
+    putU16(&mut client.handshake, &mut cursor, 1283)
+    putU16(&mut client.handshake, &mut cursor, 2052)
+    putU16(&mut client.handshake, &mut cursor, 1025)
+    putU16(&mut client.handshake, &mut cursor, 1281)
+  } else {
+    putU16(&mut client.handshake, &mut cursor, 13)
+    putU16(&mut client.handshake, &mut cursor, 8)
+    putU16(&mut client.handshake, &mut cursor, 6)
+    putU16(&mut client.handshake, &mut cursor, 1027)
+    putU16(&mut client.handshake, &mut cursor, 1283)
+    putU16(&mut client.handshake, &mut cursor, 2052)
+  }
 
   putU16(&mut client.handshake, &mut cursor, 50)
   putU16(&mut client.handshake, &mut cursor, 10)
@@ -2748,28 +2848,56 @@ effect fn queueClientHello(client: &mut Client, retry: bool) -> Result<(), TlsEr
   putU16(&mut client.handshake, &mut cursor, 2052)
   putU16(&mut client.handshake, &mut cursor, 1025)
 
-  putU16(&mut client.handshake, &mut cursor, 10)
-  putU16(&mut client.handshake, &mut cursor, 6)
-  putU16(&mut client.handshake, &mut cursor, 4)
-  putU16(&mut client.handshake, &mut cursor, 29)
-  putU16(&mut client.handshake, &mut cursor, 23)
-
-  let shareLength = publicKey.length
-  if shareLength == 0 {
-    return Result<(), TlsError>.failResult(
-      TlsError.ProtocolViolation {reason: ProtocolReason.InternalState},
-    )
+  // TLS 1.2 also offers P-384, which a TLS 1.2 server also needs for a P-384 certificate
+  // (RFC 8422 section 5.1).
+  if offer12 {
+    putU16(&mut client.handshake, &mut cursor, 10)
+    putU16(&mut client.handshake, &mut cursor, 8)
+    putU16(&mut client.handshake, &mut cursor, 6)
+    putU16(&mut client.handshake, &mut cursor, 29)
+    putU16(&mut client.handshake, &mut cursor, 23)
+    putU16(&mut client.handshake, &mut cursor, 24)
+  } else {
+    putU16(&mut client.handshake, &mut cursor, 10)
+    putU16(&mut client.handshake, &mut cursor, 6)
+    putU16(&mut client.handshake, &mut cursor, 4)
+    putU16(&mut client.handshake, &mut cursor, 29)
+    putU16(&mut client.handshake, &mut cursor, 23)
   }
-  putU16(&mut client.handshake, &mut cursor, 51)
-  putU16(&mut client.handshake, &mut cursor, shareLength + 6)
-  putU16(&mut client.handshake, &mut cursor, shareLength + 4)
-  let mut groupCode: usize = 23
-  if shareLength == 32 { groupCode = 29 }
-  putU16(&mut client.handshake, &mut cursor, groupCode)
-  putU16(&mut client.handshake, &mut cursor, shareLength)
-  let publicKeyView = Slice.view<u8>(&publicKeyBytes, 0, shareLength)
-  putSlice(&mut client.handshake, &mut cursor, publicKeyView)
-  drop publicKeyView
+
+  if offer12 {
+    // extended_master_secret (RFC 7627), which the client requires.
+    putU16(&mut client.handshake, &mut cursor, 23)
+    putU16(&mut client.handshake, &mut cursor, 0)
+    // An empty renegotiation_info (RFC 5746). The client never renegotiates.
+    putU16(&mut client.handshake, &mut cursor, 65281)
+    putU16(&mut client.handshake, &mut cursor, 1)
+    putU8(&mut client.handshake, &mut cursor, 0)
+    // ec_point_formats with only the uncompressed format (RFC 8422).
+    putU16(&mut client.handshake, &mut cursor, 11)
+    putU16(&mut client.handshake, &mut cursor, 2)
+    putU8(&mut client.handshake, &mut cursor, 1)
+    putU8(&mut client.handshake, &mut cursor, 0)
+  }
+
+  if offer13 {
+    let shareLength = publicKey.length
+    if shareLength == 0 {
+      return Result<(), TlsError>.failResult(
+        TlsError.ProtocolViolation {reason: ProtocolReason.InternalState},
+      )
+    }
+    putU16(&mut client.handshake, &mut cursor, 51)
+    putU16(&mut client.handshake, &mut cursor, shareLength + 6)
+    putU16(&mut client.handshake, &mut cursor, shareLength + 4)
+    let mut groupCode: usize = 23
+    if shareLength == 32 { groupCode = 29 }
+    putU16(&mut client.handshake, &mut cursor, groupCode)
+    putU16(&mut client.handshake, &mut cursor, shareLength)
+    let publicKeyView = Slice.view<u8>(&publicKeyBytes, 0, shareLength)
+    putSlice(&mut client.handshake, &mut cursor, publicKeyView)
+    drop publicKeyView
+  }
 
   if alpnEnabled {
     let mut encodedLength = usize.ZERO
@@ -2813,18 +2941,20 @@ effect fn queueClientHello(client: &mut Client, retry: bool) -> Result<(), TlsEr
 
   // A PSK goes in a retried ClientHello only when the retry chose a suite of the session's hash.
   let secretLength = offeredSecretLength(&client.*)
-  let offerPsk = secretLength > 0 && (!retry || hashLength(client.selectedSuite) == secretLength)
+  let offerPsk = offer13
+    && secretLength > 0
+    && (!retry || hashLength(client.selectedSuite) == secretLength)
   client.pskOffered = offerPsk
   let mut bindersAt = usize.ZERO
 
   // psk_key_exchange_modes with psk_dhe_ke only, which lets the server send tickets.
-  if client.ticketsRequested {
+  if offer13 && client.ticketsRequested {
     putU16(&mut client.handshake, &mut cursor, 45)
     putU16(&mut client.handshake, &mut cursor, 2)
     putU8(&mut client.handshake, &mut cursor, 1)
     putU8(&mut client.handshake, &mut cursor, 1)
   }
-  if !retry && client.earlyStatus == EarlyDataStatus.Pending {
+  if offer13 && !retry && client.earlyStatus == EarlyDataStatus.Pending {
     putU16(&mut client.handshake, &mut cursor, 42)
     putU16(&mut client.handshake, &mut cursor, 0)
   }
@@ -3122,6 +3252,12 @@ fn completePending(client: &mut Client) -> Result<(), TlsError> {
     client.localClosed = true
     return Result<(), TlsError>.succeed(())
   }
+  if kind == PendingKind.Tls12KeyExchange {
+    return queueTls12ChangeCipherSpec(&mut client.*)
+  }
+  if kind == PendingKind.Tls12Ccs {
+    return queueTls12Finished(&mut client.*)
+  }
   return Result<(), TlsError>.succeed(())
 }
 
@@ -3129,7 +3265,8 @@ fn scheduleControl(client: &mut Client) -> Result<(), TlsError> {
   if client.state != ClientState.Traffic || TlsRecordSender.pendingOutput(&client.sender).length > 0 {
     return Result<(), TlsError>.succeed(())
   }
-  if TlsRecordSender.recordsRemaining(&client.sender) == 1 {
+  // TLS 1.2 has no KeyUpdate, so the record layer refuses records past the key's limit.
+  if !client.tls12 && TlsRecordSender.recordsRemaining(&client.sender) == 1 {
     client.pendingKeyUpdate = true
   }
   if client.respondingKeyUpdate || client.pendingKeyUpdate {
@@ -3338,7 +3475,7 @@ effect fn handleReadyRecord(client: &mut Client) -> Result<Progress, TlsError>
         return Result<Progress, TlsError>.failResult(move error)
       }
     }
-    return success(0, 0, demand(&mut client.*))
+    return recordHandled()
   }
   if contentType == ContentType.ChangeCipherSpec {
     if client.handshakeLength > 0 {
@@ -3346,6 +3483,9 @@ effect fn handleReadyRecord(client: &mut Client) -> Result<Progress, TlsError>
         &mut client.*,
         TlsError.ProtocolViolation {reason: ProtocolReason.UnexpectedMessage},
       )
+    }
+    if client.tls12 {
+      return handleTls12ChangeCipherSpec(&mut client.*, contentLength)
     }
     if !compatibilityWindow(client.state) || contentLength != 1 {
       return unitProgressFailure(
@@ -3372,7 +3512,7 @@ effect fn handleReadyRecord(client: &mut Client) -> Result<Progress, TlsError>
         TlsError.LimitExceeded {kind: TlsLimitKind.EmptyRecords, limit: limit},
       )
     }
-    return success(0, 0, demand(&mut client.*))
+    return recordHandled()
   }
   if contentType == ContentType.Alert {
     if client.handshakeLength > 0 || contentLength != 2 {
@@ -3386,8 +3526,20 @@ effect fn handleReadyRecord(client: &mut Client) -> Result<Progress, TlsError>
     if let Result<usize, RecordError>.Failure {error} = move consumed {
       return recordFailure(&mut client.*, move error)
     }
-    let _level = alert[0]
+    let level = alert[0]
     let description = alert[1]
+    // TLS 1.2 warning alerts, such as no_renegotiation, do not end the connection.
+    if client.tls12 && level == 1 && description != 0 {
+      client.emptyRecords = client.emptyRecords + usize.ONE
+      if client.emptyRecords > client.limits.emptyRecords {
+        let limit = client.limits.emptyRecords
+        return unitProgressFailure(
+          &mut client.*,
+          TlsError.LimitExceeded {kind: TlsLimitKind.EmptyRecords, limit: limit},
+        )
+      }
+      return recordHandled()
+    }
     if description == 0 {
       if client.state != ClientState.Traffic && client.state != ClientState.ClientFinishedPending {
         return unitProgressFailure(
@@ -3396,10 +3548,10 @@ effect fn handleReadyRecord(client: &mut Client) -> Result<Progress, TlsError>
         )
       }
       client.peerClosed = true
-      return success(0, 0, demand(&mut client.*))
+      return recordHandled()
     }
     if description == 90 {
-      return success(0, 0, demand(&mut client.*))
+      return recordHandled()
     }
     return terminalFailure(&mut client.*, TlsError.PeerAlert {code: description})
   }
@@ -3443,12 +3595,18 @@ effect fn handleReadyRecord(client: &mut Client) -> Result<Progress, TlsError>
       client.emptyRecords = 0
       client.postHandshakeControls = 0
     }
-    return success(0, 0, demand(&mut client.*))
+    return recordHandled()
   }
   return unitProgressFailure(
     &mut client.*,
     TlsError.ProtocolViolation {reason: ProtocolReason.Record},
   )
+}
+
+// `feedInput` computes the demand after a record, so that the demand publishes `Authenticated`
+// only one time.
+fn recordHandled() -> Result<Progress, TlsError> {
+  return success(0, 0, Demand.NeedInput)
 }
 
 fn unitProgressFailure(client: &mut Client, error: TlsError) -> Result<Progress, TlsError> {
@@ -3570,6 +3728,30 @@ effect fn dispatchHandshake(
     if messageType != 20 { return unexpectedHandshake() }
     return run handleServerFinished(&mut client.*, messageLength)
   }
+  if client.state == ClientState.Tls12AwaitCertificate {
+    if messageType != 11 { return unexpectedHandshake() }
+    return run handleCertificate(&mut client.*, messageLength)
+  }
+  if client.state == ClientState.Tls12AwaitKeyExchange {
+    if messageType != 12 { return unexpectedHandshake() }
+    return run handleServerKeyExchange(&mut client.*, messageLength)
+  }
+  if client.state == ClientState.Tls12AwaitHelloDone {
+    if messageType == 13 { return handleCertificateRequestTls12(&mut client.*, messageLength) }
+    if messageType == 14 { return handleServerHelloDone(&mut client.*, messageLength) }
+    return unexpectedHandshake()
+  }
+  if client.state == ClientState.Tls12AwaitFinished {
+    if messageType != 20 { return unexpectedHandshake() }
+    return handleServerFinishedTls12(&mut client.*, messageLength)
+  }
+  if postHandshake && client.tls12 {
+    // The client never renegotiates, so it ignores HelloRequest (RFC 5246 section 7.4.1.1).
+    if messageType == 0 && messageLength == HANDSHAKE_HEADER_LENGTH {
+      return Result<(), TlsError>.succeed(())
+    }
+    return unexpectedHandshake()
+  }
   if postHandshake {
     if messageType == 4 { return run handleNewSessionTicket(&mut client.*, messageLength) }
     if messageType == 24 { return handlePeerKeyUpdate(&mut client.*, messageLength) }
@@ -3621,6 +3803,15 @@ fn readU24Raw(buffer: &Intrinsic.RawBuffer<u8>, offset: usize) -> usize {
 effect fn handleServerHello(client: &mut Client, messageLength: usize) -> Result<(), TlsError>
 ! OutOfMemoryError
 ? &mut Allocator | &mut Random {
+  let hasVersions = serverHelloHasVersions(&client.*, messageLength)
+  if !hasVersions && client.versions.allows(TlsVersion.Tls12) && !client.retried {
+    return handleServerHelloTls12(&mut client.*, messageLength)
+  }
+  if hasVersions && !client.versions.allows(TlsVersion.Tls13) {
+    return Result<(), TlsError>.failResult(
+      TlsError.ProtocolViolation {reason: ProtocolReason.ServerHello},
+    )
+  }
   if messageLength != client.handshakeLength {
     return Result<(), TlsError>.failResult(
       TlsError.ProtocolViolation {reason: ProtocolReason.ServerHello},
@@ -3993,7 +4184,7 @@ fn replaceTranscriptForRetry(client: &mut Client, messageLength: usize) -> () {
   // The complete message sits in `handshake[0..handshakeLength]`, and `allocateBytes` zero-fills
   // every buffer, so all bytes are initialized.
   let message = unsafe RawBuffer.view<u8>(&client.handshake, 0, messageLength)
-  if client.selectedSuite == CipherSuite.Aes256GcmSha384 {
+  if client.selectedSuite.hashLength() == 48 {
     let digest = client.transcript384.checkpoint()
     let mut replacement = Sha384.make()
     let header: [u8; 4] = [254, 0, 0, 48]
@@ -4017,7 +4208,7 @@ fn updateSelectedTranscript(client: &mut Client, offset: usize, length: usize) -
   // Every caller passes a range within the complete message in `handshake[0..handshakeLength]`.
   // `allocateBytes` zero-fills every buffer, so all bytes are initialized.
   let message = unsafe RawBuffer.view<u8>(&client.handshake, offset, length)
-  if client.selectedSuite == CipherSuite.Aes256GcmSha384 {
+  if client.selectedSuite.hashLength() == 48 {
     client.transcript384.update(message)
   } else {
     client.transcript256.update(message)
@@ -4026,7 +4217,7 @@ fn updateSelectedTranscript(client: &mut Client, offset: usize, length: usize) -
 }
 
 fn installHandshakeEpochs(client: &mut Client, shared: &[u8]) -> Result<(), TlsError> {
-  if client.selectedSuite == CipherSuite.Aes256GcmSha384 {
+  if client.selectedSuite.hashLength() == 48 {
     let empty: [u8; 0] = []
     let zeros = zero48()
     let pskInput = earlyInput(&client.*)
@@ -4271,46 +4462,12 @@ fn handleEncryptedExtensions(client: &mut Client, messageLength: usize) -> Resul
       }
       sawGroups = true
     } else if kind == 16 {
-      if sawAlpn || length < 3 {
+      if sawAlpn {
         return Result<(), TlsError>.failResult(TlsError.UnsupportedProfile)
       }
-      let listLength = readU16Raw(&client.handshake, cursor)
-      // The extension's `length >= 3` bytes at `cursor` lie within the parsed message.
-      // `allocateBytes` zero-fills every buffer, so all bytes are initialized.
-      let selectedLength = u8.toUsize(unsafe RawBuffer.read<u8>(&client.handshake, cursor + 2))
-      if listLength + 2 != length || selectedLength == 0 || selectedLength + 1 != listLength {
-        return Result<(), TlsError>.failResult(
-          TlsError.ProtocolViolation {reason: ProtocolReason.Extension},
-        )
-      }
-      if !client.alpnEnabled {
-        return Result<(), TlsError>.failResult(TlsError.NoApplicationProtocol)
-      }
-      let mut index = usize.ZERO
-      let mut found = false
-      while index < client.alpnCount {
-        let offeredLength = client.alpnLengths[index]
-        let offeredOffset = client.alpnOffsets[index]
-        let mut equal = offeredLength == selectedLength
-        let mut byteIndex = usize.ZERO
-        while equal && byteIndex < selectedLength {
-          // `selectedLength + 3 == length`, so the selected protocol lies within the extension.
-          // `allocateBytes` zero-fills every buffer, so all bytes are initialized.
-          let selectedByte = unsafe RawBuffer.read<u8>(&client.handshake, cursor + 3 + byteIndex)
-          // `byteIndex < offeredLength`, and `copyAlpn` filled this offered protocol's range.
-          let offeredByte = unsafe RawBuffer.read<u8>(&client.alpn, offeredOffset + byteIndex)
-          if selectedByte != offeredByte { equal = false }
-          byteIndex = byteIndex + usize.ONE
-        }
-        if equal {
-          client.selectedAlpnIndex = index
-          client.hasSelectedAlpn = true
-          found = true
-        }
-        index = index + usize.ONE
-      }
-      if !found {
-        return Result<(), TlsError>.failResult(TlsError.NoApplicationProtocol)
+      let selected = selectAlpn(&mut client.*, cursor, length)
+      if let Result<(), TlsError>.Failure {error} = move selected {
+        return Result<(), TlsError>.failResult(move error)
       }
       sawAlpn = true
     } else if kind == 42 {
@@ -4351,6 +4508,53 @@ fn handleEncryptedExtensions(client: &mut Client, messageLength: usize) -> Resul
   client.state = ClientState.AwaitCertificate
   // A resumed handshake has no Certificate or CertificateVerify from the server.
   if client.resumed { client.state = ClientState.AwaitServerFinished }
+  return Result<(), TlsError>.succeed(())
+}
+
+// Records the server's ALPN selection from the extension of `length` bytes at `cursor`, which must
+// name one offered protocol.
+fn selectAlpn(client: &mut Client, cursor: usize, length: usize) -> Result<(), TlsError> {
+  if length < 3 {
+    return Result<(), TlsError>.failResult(TlsError.UnsupportedProfile)
+  }
+  let listLength = readU16Raw(&client.handshake, cursor)
+  // The extension's `length >= 3` bytes at `cursor` lie within the parsed message.
+  // `allocateBytes` zero-fills every buffer, so all bytes are initialized.
+  let selectedLength = u8.toUsize(unsafe RawBuffer.read<u8>(&client.handshake, cursor + 2))
+  if listLength + 2 != length || selectedLength == 0 || selectedLength + 1 != listLength {
+    return Result<(), TlsError>.failResult(
+      TlsError.ProtocolViolation {reason: ProtocolReason.Extension},
+    )
+  }
+  if !client.alpnEnabled {
+    return Result<(), TlsError>.failResult(TlsError.NoApplicationProtocol)
+  }
+  let mut index = usize.ZERO
+  let mut found = false
+  while index < client.alpnCount {
+    let offeredLength = client.alpnLengths[index]
+    let offeredOffset = client.alpnOffsets[index]
+    let mut equal = offeredLength == selectedLength
+    let mut byteIndex = usize.ZERO
+    while equal && byteIndex < selectedLength {
+      // `selectedLength + 3 == length`, so the selected protocol lies within the extension.
+      // `allocateBytes` zero-fills every buffer, so all bytes are initialized.
+      let selectedByte = unsafe RawBuffer.read<u8>(&client.handshake, cursor + 3 + byteIndex)
+      // `byteIndex < offeredLength`, and `copyAlpn` filled this offered protocol's range.
+      let offeredByte = unsafe RawBuffer.read<u8>(&client.alpn, offeredOffset + byteIndex)
+      if selectedByte != offeredByte { equal = false }
+      byteIndex = byteIndex + usize.ONE
+    }
+    if equal {
+      client.selectedAlpnIndex = index
+      client.hasSelectedAlpn = true
+      found = true
+    }
+    index = index + usize.ONE
+  }
+  if !found {
+    return Result<(), TlsError>.failResult(TlsError.NoApplicationProtocol)
+  }
   return Result<(), TlsError>.succeed(())
 }
 
@@ -4532,36 +4736,46 @@ fn validOidFilters(client: &Client, start: usize, length: usize) -> bool {
   return cursor == end
 }
 
+// Handles a TLS 1.3 Certificate message, or with `client.tls12` a TLS 1.2 one, which has no
+// request context and no extensions per certificate (RFC 5246 section 7.4.2).
 effect fn handleCertificate(client: &mut Client, messageLength: usize) -> Result<(), TlsError>
 ! OutOfMemoryError
 ? &mut Allocator {
+  let tls12 = client.tls12
+  let mut listAt: usize = 5
+  // The bytes each entry has after its DER: the extensions length in TLS 1.3.
+  let mut trailer: usize = 2
+  if tls12 {
+    listAt = 4
+    trailer = 0
+  }
   // The read runs only when `messageLength >= 8`. The complete message sits in
   // `handshake[0..handshakeLength]`, and `allocateBytes` zero-fills every buffer, so all bytes are
   // initialized.
-  if messageLength < 8 || unsafe RawBuffer.read<u8>(&client.handshake, 4) != 0 {
+  if messageLength < 8 || (!tls12 && unsafe RawBuffer.read<u8>(&client.handshake, 4) != 0) {
     return Result<(), TlsError>.failResult(
       TlsError.ProtocolViolation {reason: ProtocolReason.Certificate},
     )
   }
-  let listLength = readU24Raw(&client.handshake, 5)
-  if listLength == 0 || listLength + 8 != messageLength {
+  let listLength = readU24Raw(&client.handshake, listAt)
+  if listLength == 0 || listLength + listAt + 3 != messageLength {
     return Result<(), TlsError>.failResult(
       TlsError.ProtocolViolation {reason: ProtocolReason.Certificate},
     )
   }
   List<Certificate>.clear(&mut client.peerCertificates)
-  let mut cursor: usize = 8
+  let mut cursor: usize = listAt + 3
   let mut count = usize.ZERO
   let mut total = usize.ZERO
   while cursor < messageLength {
-    if messageLength - cursor < 5 {
+    if messageLength - cursor < 3 + trailer {
       return Result<(), TlsError>.failResult(
         TlsError.ProtocolViolation {reason: ProtocolReason.Certificate},
       )
     }
     let derLength = readU24Raw(&client.handshake, cursor)
     cursor = cursor + 3
-    if derLength == 0 || derLength > messageLength - cursor - 2 {
+    if derLength == 0 || derLength > messageLength - cursor - trailer {
       return Result<(), TlsError>.failResult(
         TlsError.ProtocolViolation {reason: ProtocolReason.Certificate},
       )
@@ -4605,6 +4819,7 @@ effect fn handleCertificate(client: &mut Client, messageLength: usize) -> Result
     total = total + derLength
     count = count + usize.ONE
     cursor = cursor + derLength
+    if tls12 { continue }
     let extensionLength = readU16Raw(&client.handshake, cursor)
     cursor = cursor + 2
     if extensionLength > client.limits.extensionBytes {
@@ -4638,6 +4853,7 @@ effect fn handleCertificate(client: &mut Client, messageLength: usize) -> Result
   }
   updateSelectedTranscript(&mut client.*, 0, messageLength)
   client.state = ClientState.AwaitCertificateVerify
+  if tls12 { client.state = ClientState.Tls12AwaitKeyExchange }
   return Result<(), TlsError>.succeed(())
 }
 
@@ -4894,7 +5110,7 @@ fn handleCertificateVerify(client: &mut Client, messageLength: usize) -> Result<
     121,
   ]
   let mut transcriptLength: usize = 32
-  if client.selectedSuite == CipherSuite.Aes256GcmSha384 { transcriptLength = 48 }
+  if client.selectedSuite.hashLength() == 48 { transcriptLength = 48 }
   // The signed content occupies bytes 0..98 + transcriptLength, at most 146, of the application
   // buffer, whose capacity is `RECORD_CONTENT_LIMIT`.
   unsafe {
@@ -4925,7 +5141,7 @@ fn handleCertificateVerify(client: &mut Client, messageLength: usize) -> Result<
   if scheme != 1027 && scheme != 1283 && scheme != 2052 {
     return Result<(), TlsError>.failResult(TlsError.UnsupportedProfile)
   }
-  let verified = HandshakeSignature.verify(&certificates[0], scheme, verificationMessage, signature)
+  let verified = HandshakeSignature.verify(&certificates[0], scheme, verificationMessage, signature, TlsVersion.Tls13)
   if let Result<(), SignatureFailure>.Failure {error} = move verified {
     return Result<(), TlsError>.failResult(TlsError.CertificateVerify {error: error})
   }
@@ -4937,7 +5153,7 @@ fn handleCertificateVerify(client: &mut Client, messageLength: usize) -> Result<
 effect fn handleServerFinished(client: &mut Client, messageLength: usize) -> Result<(), TlsError>
 ? &mut Random {
   let mut expectedLength: usize = 32
-  if client.selectedSuite == CipherSuite.Aes256GcmSha384 { expectedLength = 48 }
+  if client.selectedSuite.hashLength() == 48 { expectedLength = 48 }
   if messageLength != HANDSHAKE_HEADER_LENGTH + expectedLength || messageLength != client.handshakeLength {
     return Result<(), TlsError>.failResult(
       TlsError.ProtocolViolation {reason: ProtocolReason.InvalidLength},
@@ -5037,7 +5253,7 @@ fn finishedKey48(secret: &([u8; 48])) -> Result<[u8; 48], TlsError> {
 }
 
 fn deriveApplicationTraffic(client: &mut Client) -> Result<(), TlsError> {
-  if client.selectedSuite == CipherSuite.Aes256GcmSha384 {
+  if client.selectedSuite.hashLength() == 48 {
     let master = fixed48(&client.masterSecret)
     let transcript = client.transcript384.checkpoint()
     let clientLabel = clientApplicationLabel()
@@ -5197,7 +5413,7 @@ effect fn prepareCredential<'a>(credential: ClientCredential<'a>, limits: Client
 // scheme, or an empty Certificate when it has no usable credential.
 effect fn queueCertificateFlight(client: &mut Client) -> Result<(), TlsError> ? &mut Random {
   let scheme = match &client.credentialKey {
-    Option<SigningKey>.Some {value: key} => key.chooseScheme(&client.requestedSchemes)
+    Option<SigningKey>.Some {value: key} => key.chooseScheme(&client.requestedSchemes, TlsVersion.Tls13)
     Option<SigningKey>.None => Option<usize>.none()
   }
   let selected = match scheme {
@@ -5209,7 +5425,7 @@ effect fn queueCertificateFlight(client: &mut Client) -> Result<(), TlsError> ? 
   let certificateLength = client.credentialCertificateLength
   // `prepareCredential` wrote every byte of the Certificate message.
   let certificate = unsafe RawBuffer.view<u8>(&client.credentialFlight, 0, certificateLength)
-  if client.selectedSuite == CipherSuite.Aes256GcmSha384 {
+  if client.selectedSuite.hashLength() == 48 {
     client.transcript384.update(certificate)
   } else {
     client.transcript256.update(certificate)
@@ -5230,7 +5446,7 @@ effect fn queueCertificateFlight(client: &mut Client) -> Result<(), TlsError> ? 
     index = index + 1
   }
   content[97] = 0
-  if client.selectedSuite == CipherSuite.Aes256GcmSha384 {
+  if client.selectedSuite.hashLength() == 48 {
     let digest = client.transcript384.checkpoint()
     index = 0
     while index < 48 {
@@ -5284,7 +5500,7 @@ effect fn queueCertificateFlight(client: &mut Client) -> Result<(), TlsError> ? 
   let verifyLength = 8 + signatureLength
   // The writes above initialized every byte of the CertificateVerify message.
   let verify = unsafe RawBuffer.view<u8>(&client.credentialFlight, verifyStart, verifyLength)
-  if client.selectedSuite == CipherSuite.Aes256GcmSha384 {
+  if client.selectedSuite.hashLength() == 48 {
     client.transcript384.update(verify)
   } else {
     client.transcript256.update(verify)
@@ -5388,7 +5604,7 @@ fn queueClientFinished(client: &mut Client) -> Result<(), TlsError> {
 }
 
 fn updateTranscriptSlice(client: &mut Client, message: &[u8]) -> () {
-  if client.selectedSuite == CipherSuite.Aes256GcmSha384 {
+  if client.selectedSuite.hashLength() == 48 {
     client.transcript384.update(message)
   } else {
     client.transcript256.update(message)
@@ -5626,4 +5842,472 @@ fn postHandshakeFailure() -> Result<(), TlsError> {
   return Result<(), TlsError>.failResult(
     TlsError.ProtocolViolation {reason: ProtocolReason.PostHandshake},
   )
+}
+
+// TLS 1.2 (RFC 5246): ECDHE key exchange, AEAD suites, and the extended master secret (RFC 7627).
+
+// Whether the ServerHello in `handshake[0..messageLength]` has supported_versions, which only a
+// TLS 1.3 ServerHello or HelloRetryRequest has. A malformed message gives `true`, so the TLS 1.3
+// parser reports it.
+fn serverHelloHasVersions(client: &Client, messageLength: usize) -> bool {
+  if messageLength < 42 { return true }
+  // `messageLength >= 42`. The complete message sits in `handshake[0..handshakeLength]`, and
+  // `allocateBytes` zero-fills every buffer, so all bytes are initialized.
+  let sessionLength = u8.toUsize(unsafe RawBuffer.read<u8>(&client.handshake, 38))
+  if sessionLength > 32 || messageLength < 42 + sessionLength { return true }
+  let mut cursor = 42 + sessionLength
+  if cursor == messageLength { return false }
+  if messageLength - cursor < 2 { return true }
+  let extensionsLength = readU16Raw(&client.handshake, cursor)
+  cursor = cursor + 2
+  if extensionsLength != messageLength - cursor { return true }
+  while messageLength - cursor >= 4 {
+    let kind = readU16Raw(&client.handshake, cursor)
+    let length = readU16Raw(&client.handshake, cursor + 2)
+    cursor = cursor + 4
+    if kind == 43 || length > messageLength - cursor { return true }
+    cursor = cursor + length
+  }
+  return cursor != messageLength
+}
+
+fn serverHelloFailure() -> Result<(), TlsError> {
+  return Result<(), TlsError>.failResult(
+    TlsError.ProtocolViolation {reason: ProtocolReason.ServerHello},
+  )
+}
+
+fn extensionFailure() -> Result<(), TlsError> {
+  return Result<(), TlsError>.failResult(
+    TlsError.ProtocolViolation {reason: ProtocolReason.Extension},
+  )
+}
+
+fn lengthFailure() -> Result<(), TlsError> {
+  return Result<(), TlsError>.failResult(
+    TlsError.ProtocolViolation {reason: ProtocolReason.InvalidLength},
+  )
+}
+
+fn handshakeByte(client: &Client, offset: usize) -> u8 {
+  // Every caller passes an offset within the complete message in `handshake[0..handshakeLength]`.
+  // `allocateBytes` zero-fills every buffer, so all bytes are initialized.
+  return unsafe RawBuffer.read<u8>(&client.handshake, offset)
+}
+
+// A TLS 1.2 ServerHello. The client requires extended_master_secret and renegotiation_info, and it
+// rejects the TLS 1.3 downgrade sentinel when it offered TLS 1.3 (RFC 8446 section 4.1.3).
+fn handleServerHelloTls12(client: &mut Client, messageLength: usize) -> Result<(), TlsError> {
+  // Early data was sent under TLS 1.3 keys, which a TLS 1.2 server cannot read.
+  if client.earlyStatus == EarlyDataStatus.Pending { return serverHelloFailure() }
+  if messageLength < 42 || readU16Raw(&client.handshake, 4) != 771 { return serverHelloFailure() }
+  let mut random = zero32()
+  let mut index = usize.ZERO
+  while index < 32 {
+    random[index] = handshakeByte(&client.*, 6 + index)
+    index = index + usize.ONE
+  }
+  // The server may name a session to resume, which the client ignores.
+  let sessionLength = u8.toUsize(handshakeByte(&client.*, 38))
+  if sessionLength > 32 || messageLength < 42 + sessionLength { return serverHelloFailure() }
+  let mut cursor = 39 + sessionLength
+  let suiteOption = CipherSuite.fromCode(readU16Raw(&client.handshake, cursor))
+  let suite = match move suiteOption {
+    Option<CipherSuite>.None => {
+      return Result<(), TlsError>.failResult(TlsError.UnsupportedProfile)
+    }
+    Option<CipherSuite>.Some {value} => value
+  }
+  if suite.version() != TlsVersion.Tls12 {
+    return Result<(), TlsError>.failResult(TlsError.UnsupportedProfile)
+  }
+  if handshakeByte(&client.*, cursor + 2) != 0 { return serverHelloFailure() }
+  cursor = cursor + 3
+  // Without extensions, the server has no extended master secret.
+  if cursor == messageLength {
+    return Result<(), TlsError>.failResult(TlsError.UnsupportedProfile)
+  }
+  if messageLength - cursor < 2 { return extensionFailure() }
+  let extensionsLength = readU16Raw(&client.handshake, cursor)
+  if extensionsLength > client.limits.extensionBytes {
+    return Result<(), TlsError>.failResult(
+      TlsError.LimitExceeded {
+        kind: TlsLimitKind.ExtensionBytes,
+        limit: client.limits.extensionBytes,
+      },
+    )
+  }
+  cursor = cursor + 2
+  if extensionsLength != messageLength - cursor { return extensionFailure() }
+  let mut sawServerName = false
+  let mut sawPointFormats = false
+  let mut sawAlpn = false
+  let mut sawExtendedMaster = false
+  let mut sawRenegotiation = false
+  while cursor < messageLength {
+    if messageLength - cursor < 4 { return extensionFailure() }
+    let kind = readU16Raw(&client.handshake, cursor)
+    let length = readU16Raw(&client.handshake, cursor + 2)
+    cursor = cursor + 4
+    if length > messageLength - cursor { return extensionFailure() }
+    if kind == 0 {
+      if sawServerName || client.dnsLength == 0 || length != 0 { return extensionFailure() }
+      sawServerName = true
+    } else if kind == 11 {
+      if sawPointFormats || length < 2 { return extensionFailure() }
+      let listLength = u8.toUsize(handshakeByte(&client.*, cursor))
+      if listLength + 1 != length { return extensionFailure() }
+      let mut uncompressed = false
+      let mut formatIndex = usize.ONE
+      while formatIndex < length {
+        if handshakeByte(&client.*, cursor + formatIndex) == 0 { uncompressed = true }
+        formatIndex = formatIndex + usize.ONE
+      }
+      if !uncompressed {
+        return Result<(), TlsError>.failResult(TlsError.UnsupportedProfile)
+      }
+      sawPointFormats = true
+    } else if kind == 16 {
+      if sawAlpn {
+        return Result<(), TlsError>.failResult(TlsError.UnsupportedProfile)
+      }
+      let selected = selectAlpn(&mut client.*, cursor, length)
+      if let Result<(), TlsError>.Failure {error} = move selected {
+        return Result<(), TlsError>.failResult(move error)
+      }
+      sawAlpn = true
+    } else if kind == 23 {
+      if sawExtendedMaster || length != 0 { return extensionFailure() }
+      sawExtendedMaster = true
+    } else if kind == 65281 {
+      if sawRenegotiation || length != 1 || handshakeByte(&client.*, cursor) != 0 {
+        return extensionFailure()
+      }
+      sawRenegotiation = true
+    } else {
+      return extensionFailure()
+    }
+    cursor = cursor + length
+  }
+  if !sawExtendedMaster || !sawRenegotiation {
+    return Result<(), TlsError>.failResult(TlsError.UnsupportedProfile)
+  }
+  if client.alpnRequired && !sawAlpn {
+    return Result<(), TlsError>.failResult(TlsError.NoApplicationProtocol)
+  }
+  // "DOWNGRD" and then 1 or 0: a TLS 1.3 server that answers with TLS 1.2 or an older version.
+  if client.versions.allows(TlsVersion.Tls13) {
+    let sentinel: [u8; 7] = [68, 79, 87, 78, 71, 82, 68]
+    let mut matches = random[31] == 0 || random[31] == 1
+    index = 0
+    while index < 7 {
+      if random[24 + index] != sentinel[index] { matches = false }
+      index = index + usize.ONE
+    }
+    if matches { return serverHelloFailure() }
+  }
+  client.tls12 = true
+  client.serverRandom = random
+  client.selectedSuite = suite
+  client.hasSelection = true
+  updateSelectedTranscript(&mut client.*, 0, messageLength)
+  client.state = ClientState.Tls12AwaitCertificate
+  return Result<(), TlsError>.succeed(())
+}
+
+// ServerKeyExchange with ServerECDHParams (RFC 8422 section 5.4), signed with the leaf key over
+// both hello random values and the parameters. The client answers with its share for that group.
+effect fn handleServerKeyExchange(client: &mut Client, messageLength: usize) -> Result<(), TlsError>
+? &mut Random {
+  if messageLength < 8 { return lengthFailure() }
+  // Only named_curve parameters.
+  if handshakeByte(&client.*, 4) != 3 {
+    return Result<(), TlsError>.failResult(TlsError.UnsupportedProfile)
+  }
+  let groupCode = readU16Raw(&client.handshake, 5)
+  let pointLength = u8.toUsize(handshakeByte(&client.*, 7))
+  let paramsEnd = 8 + pointLength
+  if messageLength < paramsEnd + 4 { return lengthFailure() }
+  let mut group = NamedGroup.X25519
+  if groupCode == 23 && pointLength == 65 {
+    group = NamedGroup.P256
+  } else if groupCode == 24 && pointLength == 97 {
+    group = NamedGroup.P384
+  } else if groupCode != 29 || pointLength != 32 {
+    return Result<(), TlsError>.failResult(TlsError.UnsupportedProfile)
+  }
+  let scheme = readU16Raw(&client.handshake, paramsEnd)
+  let signatureLength = readU16Raw(&client.handshake, paramsEnd + 2)
+  if signatureLength == 0 || paramsEnd + 4 + signatureLength != messageLength {
+    return lengthFailure()
+  }
+  // The schemes of the ClientHello, of the key type that the suite names.
+  let ecdsaScheme = scheme == 1027 || scheme == 1283
+  let rsaScheme = scheme == 2052 || scheme == 1025 || scheme == 1281
+  if (!ecdsaScheme && !rsaScheme) || ecdsaScheme != client.selectedSuite.isEcdsa() {
+    return Result<(), TlsError>.failResult(TlsError.UnsupportedProfile)
+  }
+  let paramsLength = paramsEnd - HANDSHAKE_HEADER_LENGTH
+  let clientRandom = client.clientRandom
+  let serverRandom = client.serverRandom
+  // The signed content is at most 64 + 69 bytes, within the application buffer's capacity of
+  // `RECORD_CONTENT_LIMIT`. The parameters lie within the complete message.
+  unsafe {
+    RawBuffer.copy<u8>(&mut client.application, 0, &clientRandom, 32)
+    RawBuffer.copy<u8>(&mut client.application, 32, &serverRandom, 32)
+    let params = RawBuffer.view<u8>(&client.handshake, HANDSHAKE_HEADER_LENGTH, paramsLength)
+    RawBuffer.copy<u8>(&mut client.application, 64, params, paramsLength)
+  }
+  // The block above wrote every byte of 0..64 + paramsLength.
+  let signed = unsafe RawBuffer.view<u8>(&client.application, 0, 64 + paramsLength)
+  // `paramsEnd + 4 + signatureLength == messageLength`, within the complete message.
+  let signature = unsafe RawBuffer.view<u8>(&client.handshake, paramsEnd + 4, signatureLength)
+  let certificates = List<Certificate>.asSlice(&client.peerCertificates)
+  if certificates.length == 0 {
+    return Result<(), TlsError>.failResult(
+      TlsError.ProtocolViolation {reason: ProtocolReason.InternalState},
+    )
+  }
+  let verified = HandshakeSignature.verify(&certificates[0], scheme, signed, signature, TlsVersion.Tls12)
+  if let Result<(), SignatureFailure>.Failure {error} = move verified {
+    return Result<(), TlsError>.failResult(TlsError.CertificateVerify {error: error})
+  }
+  let mut peerKeyBytes: [u8; 97] = [0; 97]
+  let mut index = usize.ZERO
+  while index < pointLength {
+    peerKeyBytes[index] = handshakeByte(&client.*, 8 + index)
+    index = index + usize.ONE
+  }
+  let peerKey = Slice.view<u8>(&peerKeyBytes, 0, pointLength)
+  let agreed = run agreeTls12(&mut client.*, group, peerKey)
+  if let Result<(), TlsError>.Failure {error} = move agreed {
+    return Result<(), TlsError>.failResult(move error)
+  }
+  client.selectedGroup = group
+  updateSelectedTranscript(&mut client.*, 0, messageLength)
+  client.state = ClientState.Tls12AwaitHelloDone
+  return Result<(), TlsError>.succeed(())
+}
+
+// Makes the client's share for `group` and the premaster secret with the server's `peerKey`. The
+// ClientHello's X25519 share serves X25519, and the other groups get a new share.
+effect fn agreeTls12(client: &mut Client, group: NamedGroup, peerKey: &[u8]) -> Result<(), TlsError>
+? &mut Random {
+  if group == NamedGroup.P384 {
+    let mine = run P384.generate()
+    client.clientShare = P384.publicKey(&mine)
+    client.clientShareLength = 97
+    return match move P384.agree(move mine, peerKey) {
+      Result<[u8; 48], P384Error>.Failure {error} => {
+        drop error
+        return Result<(), TlsError>.failResult(TlsError.UnsupportedProfile)
+      }
+      Result<[u8; 48], P384Error>.Success {value} => {
+        client.preMaster = value
+        client.preMasterLength = 48
+        return Result<(), TlsError>.succeed(())
+      }
+    }
+  }
+  if group == NamedGroup.P256 {
+    let next = run P256.generate()
+    client.keyShare = EphemeralShare.P256 { value: move next }
+  }
+  let publicKey = ephemeralPublicKey(&client.keyShare)
+  let mut index = usize.ZERO
+  while index < publicKey.length {
+    client.clientShare[index] = publicKey.bytes[index]
+    index = index + usize.ONE
+  }
+  client.clientShareLength = publicKey.length
+  let share = Intrinsic.replace(client.keyShare, EphemeralShare.None)
+  return match move deriveSharedSecret(move share, group, peerKey) {
+    Result<[u8; 32], TlsError>.Failure {error} => Result<(), TlsError>.failResult(move error)
+    Result<[u8; 32], TlsError>.Success {value} => {
+      copy32Into48(&mut client.preMaster, &value)
+      client.preMasterLength = 32
+      return Result<(), TlsError>.succeed(())
+    }
+  }
+}
+
+// A TLS 1.2 CertificateRequest (RFC 5246 section 7.4.4). The client answers with an empty
+// Certificate message.
+fn handleCertificateRequestTls12(client: &mut Client, messageLength: usize) -> Result<(), TlsError> {
+  if client.certificateRequest || messageLength < 9 { return certificateRequestFailure() }
+  let typesLength = u8.toUsize(handshakeByte(&client.*, 4))
+  if typesLength == 0 || messageLength - 5 < typesLength + 4 { return certificateRequestFailure() }
+  let mut cursor = 5 + typesLength
+  let schemesLength = readU16Raw(&client.handshake, cursor)
+  cursor = cursor + 2
+  if schemesLength < 2 || schemesLength % 2 != 0 || messageLength - cursor < schemesLength + 2 {
+    return certificateRequestFailure()
+  }
+  cursor = cursor + schemesLength
+  let authoritiesLength = readU16Raw(&client.handshake, cursor)
+  cursor = cursor + 2
+  if authoritiesLength != messageLength - cursor { return certificateRequestFailure() }
+  updateSelectedTranscript(&mut client.*, 0, messageLength)
+  client.certificateRequest = true
+  return Result<(), TlsError>.succeed(())
+}
+
+// ServerHelloDone ends the server's flight. The client sends its own: [Certificate],
+// ClientKeyExchange, ChangeCipherSpec, and Finished.
+fn handleServerHelloDone(client: &mut Client, messageLength: usize) -> Result<(), TlsError> {
+  if messageLength != HANDSHAKE_HEADER_LENGTH { return lengthFailure() }
+  if messageLength != client.handshakeLength { return unexpectedHandshake() }
+  updateSelectedTranscript(&mut client.*, 0, messageLength)
+  let mut message: [u8; 109] = [0; 109]
+  let mut length = usize.ZERO
+  if client.certificateRequest {
+    // An empty Certificate message.
+    message[0] = 11
+    message[3] = 3
+    length = 7
+  }
+  let shareLength = client.clientShareLength
+  message[length] = 16
+  message[length + 3] = usize.toU8(shareLength + 1)
+  message[length + 4] = usize.toU8(shareLength)
+  let mut index = usize.ZERO
+  while index < shareLength {
+    message[length + 5 + index] = client.clientShare[index]
+    index = index + usize.ONE
+  }
+  length = length + 5 + shareLength
+  let flight = Slice.view<u8>(&message, 0, length)
+  updateTranscriptSlice(&mut client.*, flight)
+  let suite = client.selectedSuite
+  let hashLength = suite.hashLength()
+  let sessionHash = selectedTranscriptHash(&client.*)
+  let preMaster = client.preMaster
+  let master = TlsPrf.extendedMasterSecret(
+    suite,
+    Slice.view<u8>(&preMaster, 0, client.preMasterLength),
+    Slice.view<u8>(&sessionHash, 0, hashLength),
+  )
+  let clientRandom = client.clientRandom
+  let serverRandom = client.serverRandom
+  client.masterSecret = master
+  client.masterSecretLength = 48
+  client.tls12Keys = TlsPrf.keys(suite, &master, &clientRandom, &serverRandom)
+  let queued = TlsRecordSender.queueRecord(&mut client.sender, ContentType.Handshake, flight)
+  match move queued {
+    Result<OutputProgress, RecordError>.Failure {error} => {
+      return mapRecordUnit(&mut client.*, move error)
+    }
+    Result<OutputProgress, RecordError>.Success {value} => {
+      if value.accepted != length {
+        return unitFailure(
+          &mut client.*,
+          TlsError.ProtocolViolation {reason: ProtocolReason.InternalState},
+        )
+      }
+    }
+  }
+  client.pendingKind = PendingKind.Tls12KeyExchange
+  client.state = ClientState.Tls12FlightPending
+  return Result<(), TlsError>.succeed(())
+}
+
+fn queueTls12ChangeCipherSpec(client: &mut Client) -> Result<(), TlsError> {
+  let ccs: [u8; 1] = [1]
+  let queued = TlsRecordSender.queueRecord(&mut client.sender, ContentType.ChangeCipherSpec, &ccs)
+  if let Result<OutputProgress, RecordError>.Failure {error} = move queued {
+    return mapRecordUnit(&mut client.*, move error)
+  }
+  client.pendingKind = PendingKind.Tls12Ccs
+  return Result<(), TlsError>.succeed(())
+}
+
+// After its ChangeCipherSpec, the client protects its records with the new keys and sends
+// Finished.
+fn queueTls12Finished(client: &mut Client) -> Result<(), TlsError> {
+  let suite = client.selectedSuite
+  let keys = client.tls12Keys
+  let replaced = TlsRecordSender.replaceEpochTls12(
+    &mut client.sender,
+    suite,
+    Slice.view<u8>(&keys.clientKey, 0, keys.keyLength),
+    Slice.view<u8>(&keys.clientIv, 0, keys.ivLength),
+  )
+  if let Result<(), RecordError>.Failure {error} = move replaced {
+    return mapRecordUnit(&mut client.*, move error)
+  }
+  let hash = selectedTranscriptHash(&client.*)
+  let master = client.masterSecret
+  let verifyData = TlsPrf.finished(suite, &master, true, Slice.view<u8>(&hash, 0, suite.hashLength()))
+  let mut message: [u8; 16] = [20, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let mut index = usize.ZERO
+  while index < VERIFY_DATA_LENGTH {
+    message[HANDSHAKE_HEADER_LENGTH + index] = verifyData[index]
+    index = index + usize.ONE
+  }
+  updateTranscriptSlice(&mut client.*, &message)
+  let queued = TlsRecordSender.queueRecord(&mut client.sender, ContentType.Handshake, &message)
+  if let Result<OutputProgress, RecordError>.Failure {error} = move queued {
+    return mapRecordUnit(&mut client.*, move error)
+  }
+  client.pendingKind = PendingKind.Tls12Finished
+  client.state = ClientState.Tls12AwaitCcs
+  return Result<(), TlsError>.succeed(())
+}
+
+// The server's ChangeCipherSpec, after which its records use the new keys.
+fn handleTls12ChangeCipherSpec(client: &mut Client, contentLength: usize) -> Result<Progress, TlsError> {
+  if client.state != ClientState.Tls12AwaitCcs || contentLength != 1 {
+    return unitProgressFailure(
+      &mut client.*,
+      TlsError.ProtocolViolation {reason: ProtocolReason.UnexpectedMessage},
+    )
+  }
+  let mut ccs: [u8; 1] = [0]
+  let consumed = TlsRecordReceiver.consumeRecordInto(&mut client.receiver, &mut ccs)
+  if let Result<usize, RecordError>.Failure {error} = move consumed {
+    return recordFailure(&mut client.*, move error)
+  }
+  if ccs[0] != 1 {
+    return unitProgressFailure(
+      &mut client.*,
+      TlsError.ProtocolViolation {reason: ProtocolReason.UnexpectedMessage},
+    )
+  }
+  let suite = client.selectedSuite
+  let keys = client.tls12Keys
+  let replaced = TlsRecordReceiver.replaceEpochTls12(
+    &mut client.receiver,
+    suite,
+    Slice.view<u8>(&keys.serverKey, 0, keys.keyLength),
+    Slice.view<u8>(&keys.serverIv, 0, keys.ivLength),
+  )
+  if let Result<(), RecordError>.Failure {error} = move replaced {
+    drop error
+    return unitProgressFailure(
+      &mut client.*,
+      TlsError.ProtocolViolation {reason: ProtocolReason.InternalState},
+    )
+  }
+  client.state = ClientState.Tls12AwaitFinished
+  return recordHandled()
+}
+
+// The server's Finished, over the transcript through the client's Finished.
+fn handleServerFinishedTls12(client: &mut Client, messageLength: usize) -> Result<(), TlsError> {
+  if messageLength != HANDSHAKE_HEADER_LENGTH + VERIFY_DATA_LENGTH || messageLength != client.handshakeLength {
+    return lengthFailure()
+  }
+  let suite = client.selectedSuite
+  let hash = selectedTranscriptHash(&client.*)
+  let master = client.masterSecret
+  let expected = TlsPrf.finished(suite, &master, false, Slice.view<u8>(&hash, 0, suite.hashLength()))
+  // `messageLength == HANDSHAKE_HEADER_LENGTH + VERIFY_DATA_LENGTH == handshakeLength`.
+  let supplied = unsafe RawBuffer.view<u8>(&client.handshake, HANDSHAKE_HEADER_LENGTH, VERIFY_DATA_LENGTH)
+  if !constantWorkEqual(supplied, &expected) {
+    return Result<(), TlsError>.failResult(TlsError.Finished)
+  }
+  updateSelectedTranscript(&mut client.*, 0, messageLength)
+  client.state = ClientState.Traffic
+  client.authenticatedReady = true
+  return Result<(), TlsError>.succeed(())
 }
