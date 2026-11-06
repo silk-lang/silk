@@ -30,8 +30,9 @@ the key. OAEP decryption checks the padding without a branch on secret data.
 ## Gotchas
 A valid signature proves only that the holder of the private key signed the message. It does
 not prove that you can trust the key. To check a certificate chain, use the `silk.tls.trust_*`
-modules. PKCS #1 v1.5 encryption is here only for old formats: its decryption is not
-provided, because its errors can reveal the plaintext. Use OAEP for new formats.
+modules. PKCS #1 v1.5 encryption is here only for old formats. Its decryption uses implicit
+rejection, so a bad ciphertext gives a wrong message instead of an error. Use OAEP for new
+formats.
 
 ## Examples
 ### Sign and verify with a generated key
@@ -226,8 +227,8 @@ pub struct RsaPrivateKey
 An RSA private key with its two primes and the values that speed up its operations.
 
 ### When to use
-Use it to sign with PKCS #1 v1.5 or PSS and to decrypt OAEP. Get its public half with
-[`RsaPrivateKey.publicKey`](#RsaPrivateKey.impl.publicKey).
+Use it to sign with PKCS #1 v1.5 or PSS and to decrypt OAEP or PKCS #1 v1.5. Get its public
+half with [`RsaPrivateKey.publicKey`](#RsaPrivateKey.impl.publicKey).
 
 ### Details
 Make one from its parts with [`RsaPrivateKey.fromComponents`](#RsaPrivateKey.impl.fromComponents), or generate one with
@@ -402,8 +403,8 @@ The message can have up to the modulus length less 11 bytes.
 - `MessageTooLong` if `message` is too long.
 
 #### Gotchas
-Use it only for formats that require it. Its decryption can reveal the plaintext through
-errors, so prefer [`RsaPublicKey.encryptOaep`](#RsaPublicKey.impl.encryptOaep).
+Use it only for formats that require it. Prefer [`RsaPublicKey.encryptOaep`](#RsaPublicKey.impl.encryptOaep): PKCS #1 v1.5
+padding has a long history of padding-oracle attacks.
 
 <a id="RsaPublicKey.impl.encryptRaw"></a>
 
@@ -710,6 +711,222 @@ SHA-256, MGF1 with SHA-256, and a 32-byte salt.
 
 #### Gotchas
 It checks only this one signature. It does not check the chain, the dates, or the names.
+
+<a id="RsaPublicKey.impl-3"></a>
+
+## Implementation `RsaPublicKey`
+
+```silk
+impl RsaPublicKey
+```
+
+<a id="RsaPublicKey.impl.fromPkcs1Der"></a>
+
+### Associated function `fromPkcs1Der`
+
+```silk
+pub fn fromPkcs1Der(der: &[u8]) -> Result<RsaPublicKey, RsaError>
+```
+
+Returns the key in a DER PKCS #1 `RSAPublicKey`: a SEQUENCE of the modulus and the
+exponent, as in a PEM `RSA PUBLIC KEY`.
+
+#### Errors
+- `InvalidEncoding` if the DER is not valid, not minimal, or has bytes after it.
+- `InvalidKey` if the key is not valid, as with [`RsaPublicKey.fromComponents`](#RsaPublicKey.impl.fromComponents).
+
+<a id="RsaPublicKey.impl.fromSpkiDer"></a>
+
+### Associated function `fromSpkiDer`
+
+```silk
+pub fn fromSpkiDer(der: &[u8]) -> Result<RsaPublicKey, RsaError>
+```
+
+Returns the key in a DER `SubjectPublicKeyInfo` with the `rsaEncryption` algorithm, as in a
+PEM `PUBLIC KEY`.
+
+#### Errors
+- `InvalidEncoding` if the DER is not valid, or the BIT STRING has unused bits.
+- `InvalidParameters` if the algorithm is not `rsaEncryption` with NULL or no parameters.
+- `InvalidKey` if the key is not valid, as with [`RsaPublicKey.fromComponents`](#RsaPublicKey.impl.fromComponents).
+
+<a id="RsaPublicKey.impl.pkcs1DerLength"></a>
+
+### Method `pkcs1DerLength`
+
+```silk
+pub fn pkcs1DerLength(self: &RsaPublicKey) -> usize
+```
+
+Returns the length in bytes of [`RsaPublicKey.writePkcs1Der`](#RsaPublicKey.impl.writePkcs1Der).
+
+<a id="RsaPublicKey.impl.writePkcs1Der"></a>
+
+### Method `writePkcs1Der`
+
+```silk
+pub fn writePkcs1Der(self: &RsaPublicKey, output: &mut [u8]) -> Result<usize, RsaError>
+```
+
+Writes the key as a DER PKCS #1 `RSAPublicKey` to the start of `output` and returns its
+length.
+
+#### Errors
+- `InvalidLength` if `output` is shorter than [`RsaPublicKey.pkcs1DerLength`](#RsaPublicKey.impl.pkcs1DerLength).
+
+<a id="RsaPublicKey.impl.spkiDerLength"></a>
+
+### Method `spkiDerLength`
+
+```silk
+pub fn spkiDerLength(self: &RsaPublicKey) -> usize
+```
+
+Returns the length in bytes of [`RsaPublicKey.writeSpkiDer`](#RsaPublicKey.impl.writeSpkiDer).
+
+<a id="RsaPublicKey.impl.writeSpkiDer"></a>
+
+### Method `writeSpkiDer`
+
+```silk
+pub fn writeSpkiDer(self: &RsaPublicKey, output: &mut [u8]) -> Result<usize, RsaError>
+```
+
+Writes the key as a DER `SubjectPublicKeyInfo` with `rsaEncryption` to the start of
+`output` and returns its length.
+
+#### Errors
+- `InvalidLength` if `output` is shorter than [`RsaPublicKey.spkiDerLength`](#RsaPublicKey.impl.spkiDerLength).
+
+<a id="RsaPrivateKey.impl-2"></a>
+
+## Implementation `RsaPrivateKey`
+
+```silk
+impl RsaPrivateKey
+```
+
+<a id="RsaPrivateKey.impl.fromPkcs1Der"></a>
+
+### Associated function `fromPkcs1Der`
+
+```silk
+pub fn fromPkcs1Der(der: &[u8]) -> Result<RsaPrivateKey, RsaError>
+```
+
+Returns the key in a DER PKCS #1 `RSAPrivateKey`, as in a PEM `RSA PRIVATE KEY`.
+
+#### Errors
+- `InvalidEncoding` if the DER is not valid, not minimal, or has bytes after it.
+- `InvalidParameters` if it is a multi-prime key (version 1).
+- `InvalidKey` if the parts are not valid, as with [`RsaPrivateKey.fromComponents`](#RsaPrivateKey.impl.fromComponents).
+
+<a id="RsaPrivateKey.impl.fromPkcs8Der"></a>
+
+### Associated function `fromPkcs8Der`
+
+```silk
+pub fn fromPkcs8Der(der: &[u8]) -> Result<RsaPrivateKey, RsaError>
+```
+
+Returns the key in a DER PKCS #8 `PrivateKeyInfo` with the `rsaEncryption` algorithm, as
+in a PEM `PRIVATE KEY`. Attributes and a public key after the private key are skipped.
+
+#### Errors
+- `InvalidEncoding` if the DER is not valid, or the version is not 0 or 1.
+- `InvalidParameters` if the algorithm is not `rsaEncryption` with NULL or no parameters,
+  or the key is multi-prime.
+- `InvalidKey` if the parts are not valid, as with [`RsaPrivateKey.fromComponents`](#RsaPrivateKey.impl.fromComponents).
+
+#### Gotchas
+It does not decrypt an `ENCRYPTED PRIVATE KEY`.
+
+<a id="RsaPrivateKey.impl.pkcs1DerLength"></a>
+
+### Method `pkcs1DerLength`
+
+```silk
+pub fn pkcs1DerLength(self: &RsaPrivateKey) -> usize
+```
+
+Returns the length in bytes of [`RsaPrivateKey.writePkcs1Der`](#RsaPrivateKey.impl.writePkcs1Der).
+
+<a id="RsaPrivateKey.impl.writePkcs1Der"></a>
+
+### Method `writePkcs1Der`
+
+```silk
+pub fn writePkcs1Der(self: &RsaPrivateKey, output: &mut [u8]) -> Result<usize, RsaError>
+```
+
+Writes the key as a DER PKCS #1 `RSAPrivateKey` to the start of `output` and returns its
+length.
+
+#### Errors
+- `InvalidLength` if `output` is shorter than [`RsaPrivateKey.pkcs1DerLength`](#RsaPrivateKey.impl.pkcs1DerLength).
+
+<a id="RsaPrivateKey.impl.pkcs8DerLength"></a>
+
+### Method `pkcs8DerLength`
+
+```silk
+pub fn pkcs8DerLength(self: &RsaPrivateKey) -> usize
+```
+
+Returns the length in bytes of [`RsaPrivateKey.writePkcs8Der`](#RsaPrivateKey.impl.writePkcs8Der).
+
+<a id="RsaPrivateKey.impl.writePkcs8Der"></a>
+
+### Method `writePkcs8Der`
+
+```silk
+pub fn writePkcs8Der(self: &RsaPrivateKey, output: &mut [u8]) -> Result<usize, RsaError>
+```
+
+Writes the key as a DER PKCS #8 `PrivateKeyInfo` (version 0, `rsaEncryption`) to the start
+of `output` and returns its length.
+
+#### Errors
+- `InvalidLength` if `output` is shorter than [`RsaPrivateKey.pkcs8DerLength`](#RsaPrivateKey.impl.pkcs8DerLength).
+
+<a id="RsaPrivateKey.impl-3"></a>
+
+## Implementation `RsaPrivateKey`
+
+```silk
+impl RsaPrivateKey
+```
+
+<a id="RsaPrivateKey.impl.decryptPkcs1"></a>
+
+### Method `decryptPkcs1`
+
+```silk
+pub fn decryptPkcs1(self: &RsaPrivateKey, ciphertext: &[u8], output: &mut [u8]) -> Result<
+    usize,
+    RsaError,
+  >
+```
+
+Decrypts an RSAES-PKCS1-v1_5 `ciphertext` with implicit rejection and returns the length of
+the message that it writes to the start of `output`.
+
+When the padding is not valid, it returns a message derived from the private key and the
+ciphertext instead of an error, as OpenSSL 3.2 and later and Node.js do, so a padding oracle
+does not reveal the plaintext. The check and the choice run without a branch on secret
+data. The bytes of `output` after the message are zero.
+
+#### Errors
+- `InvalidLength` if `ciphertext` is not as long as the modulus, or `output` is shorter than
+  the modulus length less 11.
+- `InvalidCiphertext` if `ciphertext` is not less than the modulus.
+- `InvalidKey` if the private parts do not match the public key.
+
+#### Gotchas
+A wrong key or a changed ciphertext gives a wrong message, not an error. Use it only for
+formats that require PKCS #1 v1.5, and check the message with something else, such as its
+expected length or a MAC.
 
 
 Category: Cryptography.
