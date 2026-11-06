@@ -22,6 +22,16 @@ given to [`Client.make`](#Client.impl.make): the chain and a CertificateVerify s
 that the server lists. With `ClientCredential.None`, or when no listed scheme fits the key, it
 sends an empty Certificate message, and the server decides whether to go on.
 
+With [`Resumption`](#Resumption) `Enabled`, the client asks for session tickets and returns each one as a
+[`Session`](#Session) from [`Client.takeSession`](#Client.impl.takeSession). A later client given that session offers it as a PSK
+with (EC)DHE, and when the server accepts, the handshake skips the certificate messages.
+[`Session.encode`](#Session.impl.encode) and [`Session.decode`](#Session.impl.decode) let you keep sessions across processes.
+
+A session whose ticket allows early data also lets the client send the `Resumption` `earlyData`
+bytes as 0-RTT data, right after the ClientHello and before the server answers.
+[`Client.earlyData`](#Client.impl.earlyData) tells you whether the server accepted them. When it rejected them, write
+them again after `Authenticated`.
+
 Each call returns a [`Progress`](#Progress): how many bytes it took or wrote, and the next [`Demand`](#Demand).
 Output works in two steps: write [`Client.pendingOutput`](#Client.impl.pendingOutput) to the transport, and then call
 [`Client.ackWritten`](#Client.impl.ackWritten) with the number of bytes written. The client does not keep your buffers.
@@ -47,7 +57,7 @@ import silk.collections.list { List }
 import silk.system.random { Random }
 import silk.core.result { Result }
 import silk.system.system_clock { SystemClock }
-import silk.tls.client { AlpnConfig, Client, ClientConfig, ClientCredential, ClientLimits, Progress, TlsError }
+import silk.tls.client { AlpnConfig, Client, ClientConfig, ClientCredential, ClientLimits, Progress, Resumption, TlsError }
 import silk.tls.trust_anchor { TrustAnchor }
 import silk.tls.trust_snapshot { SnapshotLimits, TrustSnapshot, TrustSourceError }
 import silk.num.usize
@@ -90,6 +100,7 @@ pub effect fn main() -> i32
   let config = ClientConfig {
     reference: reference,
     alpn: AlpnConfig.defaults(),
+    resumption: Resumption.Disabled,
     limits: ClientLimits.defaults()
   }
   let made = run Client.make(&config, move trust, SystemClock.make(1789156800, 0), ClientCredential.None)
@@ -116,7 +127,7 @@ pub effect fn main() -> i32
 
 Import as `Client` with `import silk.tls.client { Client }`.
 
-Public declarations: 15.
+Public declarations: 19.
 
 <a id="NamedGroup"></a>
 
@@ -499,6 +510,16 @@ pub alpn: AlpnConfig<'a>
 
 ALPN policy, with opaque protocols in caller preference order.
 
+<a id="ClientConfig.resumption"></a>
+
+### Field `resumption`
+
+```silk
+pub resumption: Resumption<'a>
+```
+
+Whether the client asks for session tickets, and which session it offers.
+
 <a id="ClientConfig.limits"></a>
 
 ### Field `limits`
@@ -508,6 +529,141 @@ pub limits: ClientLimits
 ```
 
 Finite connection limits and nested certificate policies.
+
+<a id="Resumption"></a>
+
+## `Resumption`
+
+```silk
+pub union Resumption<'a>
+```
+
+Whether a [`Client`](#Client) resumes sessions, in [`ClientConfig.resumption`](#ClientConfig.resumption).
+
+<a id="Resumption.Disabled"></a>
+
+### `Disabled`
+
+```silk
+Disabled
+```
+
+The client does not send `psk_key_exchange_modes`, so servers send no tickets, and it drops
+any ticket that a server sends anyway.
+
+<a id="Resumption.Enabled"></a>
+
+### `Enabled`
+
+```silk
+Enabled
+```
+
+The client asks for tickets, which [`Client.takeSession`](#Client.impl.takeSession) returns as sessions.
+
+<a id="Resumption.Enabled.session"></a>
+
+#### Field `session`
+
+```silk
+pub session: Option<&'a Session>
+```
+
+A session to resume, from [`Client.takeSession`](#Client.impl.takeSession) or [`Session.decode`](#Session.impl.decode), or `None` for a
+full handshake. [`Client.make`](#Client.impl.make) copies it. The client offers it only before it expires and
+only to the server name of the connection it came from. Otherwise it does a full handshake.
+
+<a id="Resumption.Enabled.earlyData"></a>
+
+#### Field `earlyData`
+
+```silk
+pub earlyData: &'a [u8]
+```
+
+Bytes to send as 0-RTT data with `session`, at most 16384, or an empty slice for none.
+[`Client.make`](#Client.impl.make) copies them. The client sends them only when it offers the session and the
+session's [`Session.maxEarlyData`](#Session.impl.maxEarlyData) is at least their length.
+
+##### Gotchas
+An attacker can replay 0-RTT data to the server, so send only requests that are safe to
+repeat.
+
+<a id="EarlyDataStatus"></a>
+
+## `EarlyDataStatus`
+
+```silk
+pub enum EarlyDataStatus
+```
+
+What happened to the 0-RTT data of a connection, from [`Client.earlyData`](#Client.impl.earlyData) or `Server.earlyData`.
+
+<a id="EarlyDataStatus.NotOffered"></a>
+
+### `NotOffered`
+
+```silk
+NotOffered
+```
+
+No early data was offered.
+
+<a id="EarlyDataStatus.Pending"></a>
+
+### `Pending`
+
+```silk
+Pending
+```
+
+The client sent early data and waits for the server's answer. A server never reports it.
+
+<a id="EarlyDataStatus.Accepted"></a>
+
+### `Accepted`
+
+```silk
+Accepted
+```
+
+The server accepted the early data.
+
+<a id="EarlyDataStatus.Rejected"></a>
+
+### `Rejected`
+
+```silk
+Rejected
+```
+
+The server rejected the early data, which it did not read.
+
+<a id="EarlyDataStatus.impl.Debug"></a>
+
+## Implementation `Debug for EarlyDataStatus`
+
+```silk
+impl Debug for EarlyDataStatus
+```
+
+<a id="EarlyDataStatus.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Accepted`.
+
+<a id="Resumption.impl.Copy"></a>
+
+## Implementation `Copy for Resumption<'a>`
+
+```silk
+impl<'a> Copy for Resumption<'a>
+```
 
 <a id="ClientCredential"></a>
 
@@ -560,6 +716,202 @@ pub key: SigningKey
 ```
 
 The private key of the leaf.
+
+<a id="Session"></a>
+
+## `Session`
+
+```silk
+pub struct Session
+```
+
+A TLS 1.3 session from a server's NewSessionTicket, for resuming with
+`ClientConfig.session`.
+
+### Details
+[`Client.takeSession`](#Client.impl.takeSession) returns one for each ticket the server sends after the handshake. A
+session holds the resumption secret, the ticket, the cipher suite, the server name and ALPN
+protocol of its connection, and the leaf certificate that the full handshake authenticated.
+[`Session.encode`](#Session.impl.encode) and [`Session.decode`](#Session.impl.decode) save and load it.
+
+### Gotchas
+The encoded session holds the resumption secret. Store it as you would a key. A server can
+refuse a ticket at any time, and the client then does a full handshake.
+
+<a id="SessionError"></a>
+
+## `SessionError`
+
+```silk
+pub enum SessionError
+```
+
+Why [`Session.encode`](#Session.impl.encode) or [`Session.decode`](#Session.impl.decode) fails.
+
+<a id="SessionError.InvalidEncoding"></a>
+
+### `InvalidEncoding`
+
+```silk
+InvalidEncoding
+```
+
+The bytes are not a session that [`Session.encode`](#Session.impl.encode) wrote.
+
+<a id="SessionError.OutputTooShort"></a>
+
+### `OutputTooShort`
+
+```silk
+OutputTooShort
+```
+
+The output is shorter than [`Session.encodedLength`](#Session.impl.encodedLength).
+
+<a id="SessionError.impl.Debug"></a>
+
+## Implementation `Debug for SessionError`
+
+```silk
+impl Debug for SessionError
+```
+
+<a id="SessionError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `InvalidEncoding`.
+
+<a id="Session.impl"></a>
+
+## Implementation `Session`
+
+```silk
+impl Session
+```
+
+<a id="Session.impl.suite"></a>
+
+### Method `suite`
+
+```silk
+pub fn suite(self: &Self) -> CipherSuite
+```
+
+Returns the cipher suite of the connection that issued the session.
+
+<a id="Session.impl.ticket"></a>
+
+### Method `ticket`
+
+```silk
+pub fn ticket<'a>(self: &'a Self) -> &'a [u8]
+```
+
+Borrows the opaque ticket that the server issued.
+
+<a id="Session.impl.lifetime"></a>
+
+### Method `lifetime`
+
+```silk
+pub fn lifetime(self: &Self) -> usize
+```
+
+Returns the ticket lifetime that the server gave, in seconds.
+
+<a id="Session.impl.issuedAt"></a>
+
+### Method `issuedAt`
+
+```silk
+pub fn issuedAt(self: &Self) -> Instant
+```
+
+Returns the time the client received the ticket, from the client's validation time.
+
+<a id="Session.impl.isExpired"></a>
+
+### Method `isExpired`
+
+```silk
+pub fn isExpired(self: &Self, at: &Instant) -> bool
+```
+
+Returns whether the lifetime has passed at `at`.
+
+<a id="Session.impl.maxEarlyData"></a>
+
+### Method `maxEarlyData`
+
+```silk
+pub fn maxEarlyData(self: &Self) -> usize
+```
+
+Returns the most early data in bytes that the server accepts with this session, or 0.
+
+<a id="Session.impl.alpn"></a>
+
+### Method `alpn`
+
+```silk
+pub fn alpn<'a>(self: &'a Self) -> Option<&'a [u8]>
+```
+
+Borrows the ALPN protocol of the connection that issued the session, if it had one.
+
+<a id="Session.impl.leafDer"></a>
+
+### Method `leafDer`
+
+```silk
+pub fn leafDer<'a>(self: &'a Self) -> &'a [u8]
+```
+
+Borrows the DER of the leaf certificate that the full handshake authenticated.
+
+<a id="Session.impl.encodedLength"></a>
+
+### Method `encodedLength`
+
+```silk
+pub fn encodedLength(self: &Self) -> usize
+```
+
+Returns the length of [`Session.encode`](#Session.impl.encode)'s output.
+
+<a id="Session.impl.encode"></a>
+
+### Method `encode`
+
+```silk
+pub fn encode(self: &Self, output: &mut [u8]) -> Result<usize, SessionError>
+```
+
+Writes the session to the start of `output`, and returns the number of bytes written.
+
+#### Errors
+- `OutputTooShort` if `output` is shorter than [`Session.encodedLength`](#Session.impl.encodedLength).
+
+<a id="Session.impl.decode"></a>
+
+### Associated function `decode`
+
+```silk
+pub effect fn decode(bytes: &[u8]) -> Result<Session, SessionError>
+  ! OutOfMemoryError
+  ? &mut Allocator
+```
+
+Reads a session that [`Session.encode`](#Session.impl.encode) wrote.
+
+#### Errors
+- `InvalidEncoding` if `bytes` is not exactly one encoded session.
+- `OutOfMemoryError` if the `Allocator` fails.
 
 <a id="Demand"></a>
 
@@ -1138,6 +1490,16 @@ CredentialBytes
 
 DER bytes in the client's credential chain.
 
+<a id="TlsLimitKind.EarlyDataBytes"></a>
+
+### `EarlyDataBytes`
+
+```silk
+EarlyDataBytes
+```
+
+The `Resumption` `earlyData` bytes.
+
 <a id="TlsLimitKind.impl.Debug"></a>
 
 ## Implementation `Debug for TlsLimitKind`
@@ -1661,6 +2023,18 @@ pub fn sanIndex(self: &Self) -> usize
 
 Returns the matching SAN's original certificate index.
 
+<a id="Authentication.impl.resumed"></a>
+
+### Method `resumed`
+
+```silk
+pub fn resumed(self: &Self) -> bool
+```
+
+Returns whether the handshake resumed a [`Session`](#Session). Then the server sent no certificate, and
+the leaf, anchor index, and SAN index are those of the full handshake that issued the session.
+The intermediate indices are empty.
+
 <a id="Client"></a>
 
 ## `Client`
@@ -1766,6 +2140,31 @@ pub fn authentication<'a>(self: &'a Self) -> Option<Authentication<'a>>
 
 Returns the result of authentication, after the `Authenticated` action. Before that, returns
 `None`.
+
+<a id="Client.impl.earlyData"></a>
+
+### Method `earlyData`
+
+```silk
+pub fn earlyData(self: &Self) -> EarlyDataStatus
+```
+
+Returns what happened to the `Resumption` `earlyData` bytes. It is `Pending` from
+[`Client.make`](#Client.impl.make) until the server's EncryptedExtensions, and final by `Authenticated`.
+
+<a id="Client.impl.takeSession"></a>
+
+### Method `takeSession`
+
+```silk
+pub fn takeSession(self: &mut Self) -> Option<Session>
+```
+
+Removes and returns the oldest [`Session`](#Session) from the server's NewSessionTicket messages, or
+`None` when no new one has arrived.
+
+The client keeps at most `limits.tickets` sessions over the connection. A ticket with a zero
+lifetime gives no session.
 
 <a id="Client.impl.feedInput"></a>
 
