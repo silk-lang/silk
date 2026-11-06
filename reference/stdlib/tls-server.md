@@ -48,9 +48,19 @@ offers a valid ticket resumes: the server checks the binder, sends no certificat
 [`Server.resumed`](#Server.impl.resumed) returns `true`. A ticket from a handshake whose client certificate the
 current [`ClientAuth`](#ClientAuth) would refuse gives a full handshake instead.
 
+When the `TicketPolicy` `maxEarlyData` is not 0, the tickets allow 0-RTT data. The server
+accepts a resuming client's early data when the ticket allows it, there was no
+HelloRetryRequest, the cipher suite and ALPN protocol are the ones of the session, and the
+client's ticket age is within 10 seconds of the server's. It then reports `PlaintextReady`
+before `HandshakeComplete`, and [`Server.earlyData`](#Server.impl.earlyData) returns `Accepted`. Otherwise it skips
+the early data, up to [`ServerLimits`](#ServerLimits) `rejectedEarlyDataBytes`.
+
+The server keeps no state across connections, so it cannot detect a replayed ClientHello. An
+attacker can deliver the same early data many times. Accept 0-RTT data only for requests that
+are safe to repeat.
+
 ## Gotchas
-The server resumes only sessions from its own tickets, and only with (EC)DHE. It does not
-accept 0-RTT data: a client that sends early data fails with `BadRecordMac`. The ticket checks
+The server resumes only sessions from its own tickets, and only with (EC)DHE. The ticket checks
 use the [`TicketPolicy`](#TicketPolicy) `now`, so make a server with the current time. It does not ask for `ed25519` client signatures, because the
 certificate profile admits no Ed25519 client keys. The server sends no alert when it fails, so
 close the transport. Dropping the server does not send `close_notify`.
@@ -391,6 +401,17 @@ pub clientValidation: ValidationLimits
 
 Limits for validating a client's chain.
 
+<a id="ServerLimits.rejectedEarlyDataBytes"></a>
+
+### Field `rejectedEarlyDataBytes`
+
+```silk
+pub rejectedEarlyDataBytes: usize
+```
+
+Maximum protected record bytes of rejected 0-RTT data that the server skips. More fails
+with `BadRecordMac`.
+
 <a id="ServerLimits.impl.Copy"></a>
 
 ## Implementation `Copy for ServerLimits`
@@ -604,6 +625,17 @@ pub count: usize
 ```
 
 The number of tickets to send after each handshake, from 1 to 4.
+
+<a id="TicketPolicy.Issue.maxEarlyData"></a>
+
+#### Field `maxEarlyData`
+
+```silk
+pub maxEarlyData: usize
+```
+
+The most 0-RTT plaintext bytes that a client may send when it resumes from one of these
+tickets, at most 16777216, or 0 for none.
 
 <a id="TicketPolicy.impl.Copy"></a>
 
@@ -1145,6 +1177,16 @@ InternalState
 
 The server reached an impossible private transition.
 
+<a id="ServerProtocolReason.EarlyData"></a>
+
+### `EarlyData`
+
+```silk
+EarlyData
+```
+
+The client sent more 0-RTT data than the ticket allows, or misplaced EndOfEarlyData.
+
 <a id="ServerProtocolReason.impl.Debug"></a>
 
 ## Implementation `Debug for ServerProtocolReason`
@@ -1566,7 +1608,7 @@ sealed.
 InvalidTicketPolicy
 ```
 
-[`TicketPolicy`](#TicketPolicy) `Issue` has a lifetime or count out of range.
+[`TicketPolicy`](#TicketPolicy) `Issue` has a lifetime, count, or `maxEarlyData` out of range.
 
 <a id="ServerError.LimitExceeded"></a>
 
@@ -1887,6 +1929,18 @@ pub fn resumed(self: &Self) -> bool
 
 Returns whether the handshake resumed a session from a ticket, after the server read the
 ClientHello. A resumed handshake sends no certificates.
+
+<a id="Server.impl.earlyData"></a>
+
+### Method `earlyData`
+
+```silk
+pub fn earlyData(self: &Self) -> EarlyDataStatus
+```
+
+Returns what happened to the client's 0-RTT data, after the server read the ClientHello. It
+is `NotOffered`, `Accepted`, or `Rejected`. Plaintext that you read before
+`HandshakeComplete` is accepted early data.
 
 <a id="Server.impl.clientCertificateStatus"></a>
 

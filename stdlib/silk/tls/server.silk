@@ -44,9 +44,19 @@
 //! [`Server.resumed`] returns `true`. A ticket from a handshake whose client certificate the
 //! current [`ClientAuth`] would refuse gives a full handshake instead.
 //!
+//! When the `TicketPolicy` `maxEarlyData` is not 0, the tickets allow 0-RTT data. The server
+//! accepts a resuming client's early data when the ticket allows it, there was no
+//! HelloRetryRequest, the cipher suite and ALPN protocol are the ones of the session, and the
+//! client's ticket age is within 10 seconds of the server's. It then reports `PlaintextReady`
+//! before `HandshakeComplete`, and [`Server.earlyData`] returns `Accepted`. Otherwise it skips
+//! the early data, up to [`ServerLimits`] `rejectedEarlyDataBytes`.
+//!
+//! The server keeps no state across connections, so it cannot detect a replayed ClientHello. An
+//! attacker can deliver the same early data many times. Accept 0-RTT data only for requests that
+//! are safe to repeat.
+//!
 //! # Gotchas
-//! The server resumes only sessions from its own tickets, and only with (EC)DHE. It does not
-//! accept 0-RTT data: a client that sends early data fails with `BadRecordMac`. The ticket checks
+//! The server resumes only sessions from its own tickets, and only with (EC)DHE. The ticket checks
 //! use the [`TicketPolicy`] `now`, so make a server with the current time. It does not ask for `ed25519` client signatures, because the
 //! certificate profile admits no Ed25519 client keys. The server sends no alert when it fails, so
 //! close the transport. Dropping the server does not send `close_notify`.
@@ -133,7 +143,7 @@ import silk.tls.trust_anchor { TrustAnchor }
 import silk.tls.trust_snapshot { SnapshotLimits, TrustSnapshot, TrustSourceError }
 import silk.system.system_clock { Instant, SystemClock }
 import silk.collections.list { List }
-import silk.tls.client { AlpnConfig }
+import silk.tls.client { AlpnConfig, EarlyDataStatus }
 import silk.text.format { Debug, Format, Formatter }
 import silk.crypto.aes_gcm { AesGcm, AesGcmError }
 import silk.crypto.digest { Digest }
@@ -185,6 +195,12 @@ const FLIGHT_OVERHEAD: usize = 1536
 const TICKET_LIFETIME_LIMIT: usize = 604800
 
 const TICKET_COUNT_LIMIT: usize = 4
+
+// The largest `TicketPolicy` `maxEarlyData`.
+const TICKET_EARLY_DATA_LIMIT: usize = 16777216
+
+// How far the client's ticket age may be from the server's for early data, in milliseconds.
+const EARLY_DATA_AGE_WINDOW: usize = 10000
 
 // A sealed ticket: the 16-byte key name, a 12-byte nonce, the encrypted state, and a 16-byte tag.
 const TICKET_STATE_LENGTH: usize = 138
@@ -267,6 +283,9 @@ pub struct ServerLimits {
   pub clientTrust: SnapshotLimits,
   /// Limits for validating a client's chain.
   pub clientValidation: ValidationLimits,
+  /// Maximum protected record bytes of rejected 0-RTT data that the server skips. More fails
+  /// with `BadRecordMac`.
+  pub rejectedEarlyDataBytes: usize,
 }
 
 impl Copy for ServerLimits {}
@@ -288,6 +307,7 @@ impl ServerLimits {
       clientCertificateBytes: 262144,
       clientTrust: SnapshotLimits.defaults(),
       clientValidation: ValidationLimits.defaults(),
+      rejectedEarlyDataBytes: 32768,
     }
   }
 }
@@ -361,6 +381,9 @@ pub union TicketPolicy<'a> {
     pub lifetime: usize,
     /// The number of tickets to send after each handshake, from 1 to 4.
     pub count: usize,
+    /// The most 0-RTT plaintext bytes that a client may send when it resumes from one of these
+    /// tickets, at most 16777216, or 0 for none.
+    pub maxEarlyData: usize,
   },
 }
 
@@ -525,6 +548,8 @@ pub enum ServerProtocolReason {
   ClientCertificate,
   /// The server reached an impossible private transition.
   InternalState,
+  /// The client sent more 0-RTT data than the ticket allows, or misplaced EndOfEarlyData.
+  EarlyData,
 }
 
 impl Debug for ServerProtocolReason {
@@ -552,6 +577,7 @@ impl Debug for ServerProtocolReason {
         b"ClientCertificate",
       )
       ServerProtocolReason.InternalState => run Format.write(&mut formatter, b"InternalState")
+      ServerProtocolReason.EarlyData => run Format.write(&mut formatter, b"EarlyData")
     }
   }
 }
@@ -680,7 +706,7 @@ pub union ServerError {
   /// The client's PSK binder did not authenticate the ClientHello for a ticket that the server
   /// sealed.
   Binder,
-  /// [`TicketPolicy`] `Issue` has a lifetime or count out of range.
+  /// [`TicketPolicy`] `Issue` has a lifetime, count, or `maxEarlyData` out of range.
   InvalidTicketPolicy,
   /// A finite resource budget was exceeded.
   LimitExceeded {
@@ -867,6 +893,8 @@ struct ParsedClientHello {
   bindersOffset: usize,
   binderOffset: usize,
   binderLength: usize,
+  obfuscatedAge: usize,
+  earlyData: bool,
 }
 
 struct Digest48 {
@@ -934,6 +962,11 @@ pub struct Server {
   ticketNowValid: bool,
   ticketLifetime: usize,
   ticketCount: usize,
+  ticketEarlyData: usize,
+  earlyStatus: EarlyDataStatus,
+  earlyActive: bool,
+  earlyLimit: usize,
+  earlyReceived: usize,
   pskDheKe: bool,
   pskAccepted: bool,
   psk: [u8; 48],
@@ -1132,6 +1165,11 @@ impl Server {
         ticketNowValid: tickets.nowValid,
         ticketLifetime: tickets.lifetime,
         ticketCount: tickets.count,
+        ticketEarlyData: tickets.maxEarlyData,
+        earlyStatus: EarlyDataStatus.NotOffered,
+        earlyActive: false,
+        earlyLimit: 0,
+        earlyReceived: 0,
         pskDheKe: false,
         pskAccepted: false,
         psk: zero48(),
@@ -1228,6 +1266,13 @@ impl Server {
   /// ClientHello. A resumed handshake sends no certificates.
   pub fn resumed(self: &Self) -> bool {
     return self.pskAccepted
+  }
+
+  /// Returns what happened to the client's 0-RTT data, after the server read the ClientHello. It
+  /// is `NotOffered`, `Accepted`, or `Rejected`. Plaintext that you read before
+  /// `HandshakeComplete` is accepted early data.
+  pub fn earlyData(self: &Self) -> EarlyDataStatus {
+    return self.earlyStatus
   }
 
   /// Returns what the server knows about the client's certificate. After `HandshakeComplete` it is
@@ -1344,7 +1389,7 @@ impl Server {
     if output.length == 0 {
       return Result<ServerProgress, ServerError>.failResult(ServerError.EmptyBuffer)
     }
-    if !self.completePublished {
+    if !self.completePublished && self.earlyStatus != EarlyDataStatus.Accepted {
       return invalidState(ServerOperation.ReadPlaintext)
     }
     let available = self.applicationLength - self.applicationRead
@@ -1515,7 +1560,8 @@ fn demand(server: &mut Server) -> ServerDemand {
   if TlsRecordSender.pendingOutput(&server.sender).length > 0 {
     return ServerDemand.NeedOutput
   }
-  if server.completePublished && server.applicationLength > server.applicationRead {
+  if (server.completePublished || server.earlyStatus == EarlyDataStatus.Accepted)
+    && server.applicationLength > server.applicationRead {
     return ServerDemand.PlaintextReady
   }
   if server.completeReady && !server.completePublished {
@@ -1623,6 +1669,7 @@ struct TicketsCopy {
   nowValid: bool,
   lifetime: usize,
   count: usize,
+  maxEarlyData: usize,
 }
 
 fn copyTickets<'a>(policy: TicketPolicy<'a>) -> TicketsCopy {
@@ -1635,9 +1682,11 @@ fn copyTickets<'a>(policy: TicketPolicy<'a>) -> TicketsCopy {
     nowValid: false,
     lifetime: 0,
     count: 0,
+    maxEarlyData: 0,
   }
-  if let TicketPolicy<'a>.Issue { key, now, lifetime, count } = policy {
-    if lifetime == 0 || lifetime > TICKET_LIFETIME_LIMIT || count == 0 || count > TICKET_COUNT_LIMIT {
+  if let TicketPolicy<'a>.Issue { key, now, lifetime, count, maxEarlyData } = policy {
+    if lifetime == 0 || lifetime > TICKET_LIFETIME_LIMIT || count == 0 || count > TICKET_COUNT_LIMIT
+      || maxEarlyData > TICKET_EARLY_DATA_LIMIT {
       copy.invalid = true
       return move copy
     }
@@ -1647,6 +1696,7 @@ fn copyTickets<'a>(policy: TicketPolicy<'a>) -> TicketsCopy {
     copy.key = key.key
     copy.lifetime = lifetime
     copy.count = count
+    copy.maxEarlyData = maxEarlyData
     if seconds >= 0 && seconds < 4000000000000 {
       copy.nowValid = true
       copy.now = i64.toUsize(seconds) * 1000 + i64.toUsize(SystemClock.nanoseconds(now)) / 1000000
@@ -2188,8 +2238,14 @@ effect fn handleReadyRecord(server: &mut Server) -> Result<(), ServerError>
     return failure(ServerError.PeerAlert { code: description })
   }
   if contentType == ContentType.ApplicationData {
-    if server.handshakeLength > 0 || server.state != ServerState.Traffic {
+    if server.handshakeLength > 0 || (server.state != ServerState.Traffic && !server.earlyActive) {
       return violation(ServerProtocolReason.UnexpectedMessage)
+    }
+    if server.earlyActive {
+      if contentLength > server.earlyLimit - server.earlyReceived {
+        return violation(ServerProtocolReason.EarlyData)
+      }
+      server.earlyReceived = server.earlyReceived + contentLength
     }
     if contentLength == 0 {
       let mut empty: [u8; 0] = []
@@ -2331,6 +2387,12 @@ effect fn dispatchHandshake(
   if server.state == ServerState.AwaitClientCertificateVerify && messageType == 15 {
     return handleClientCertificateVerify(&mut server.*, messageLength)
   }
+  if server.earlyActive {
+    if messageType == 5 && server.state == ServerState.AwaitClientFinished {
+      return handleEndOfEarlyData(&mut server.*, messageLength)
+    }
+    return violation(ServerProtocolReason.EarlyData)
+  }
   if server.state == ServerState.AwaitClientFinished && messageType == 20 {
     return run handleClientFinished(&mut server.*, messageLength)
   }
@@ -2470,7 +2532,7 @@ effect fn handleClientHello(server: &mut Server, messageLength: usize, retry: bo
     if !parsed.offersSelectedSuite || shareOffset(&parsed, server.selectedGroup) == 0 {
       return violation(ServerProtocolReason.HelloRetryRequest)
     }
-    if !sameSession(&server.*, &parsed) {
+    if !sameSession(&server.*, &parsed) || parsed.earlyData {
       return violation(ServerProtocolReason.HelloRetryRequest)
     }
     let alpn = selectAlpn(&mut server.*, &parsed)
@@ -2519,6 +2581,10 @@ effect fn handleClientHello(server: &mut Server, messageLength: usize, retry: bo
     let group = groupAt(index)
     if groupAllowed(policy, group) && groupListed(&parsed, group) {
       server.selectedGroup = group
+      if parsed.earlyData {
+        server.earlyStatus = EarlyDataStatus.Rejected
+        TlsRecordReceiver.skipUndecryptable(&mut server.receiver, server.limits.rejectedEarlyDataBytes)
+      }
       return queueHelloRetry(&mut server.*, messageLength)
     }
     index = index + usize.ONE
@@ -2533,6 +2599,9 @@ effect fn handleClientHello(server: &mut Server, messageLength: usize, retry: bo
 fn evaluatePsk(server: &mut Server, parsed: &ParsedClientHello) -> Result<(), ServerError> {
   server.pskDheKe = parsed.pskDheKe
   server.pskAccepted = false
+  if parsed.earlyData {
+    server.earlyStatus = EarlyDataStatus.Rejected
+  }
   if !server.ticketsEnabled || !server.ticketNowValid || !parsed.hasPsk || !parsed.pskDheKe {
     return ok()
   }
@@ -2644,7 +2713,38 @@ fn evaluatePsk(server: &mut Server, parsed: &ParsedClientHello) -> Result<(), Se
   server.pskAccepted = true
   server.psk = psk
   server.clientStatus = move status
+  if parsed.earlyData && earlyDataAcceptable(&server.*, &state, suite, issued, parsed.obfuscatedAge) {
+    server.earlyStatus = EarlyDataStatus.Accepted
+    server.earlyLimit = readStateNumber(&state, 101, 4)
+  }
   return ok()
+}
+
+// Whether the server takes the early data of a resumed session: the ticket allows it, there was
+// no HelloRetryRequest, the suite and ALPN protocol are the session's, and the client's ticket age
+// is within `EARLY_DATA_AGE_WINDOW` of the server's (RFC 8446 sections 4.2.10 and 8.3).
+fn earlyDataAcceptable(
+  server: &Server,
+  state: &[u8; 138],
+  suite: CipherSuite,
+  issued: usize,
+  obfuscatedAge: usize,
+) -> bool {
+  if server.helloRetried || readStateNumber(state, 101, 4) == 0 || suite != server.selectedSuite {
+    return false
+  }
+  let alpnHash = alpnDigest(server)
+  if (state[105] == 1) != server.hasSelectedAlpn
+    || !sameBytes(Slice.view<u8>(state, 106, 32), &alpnHash) {
+    return false
+  }
+  let ageAdd = readStateNumber(state, 59, 4)
+  let clientAge = (obfuscatedAge + 4294967296 - ageAdd) % 4294967296
+  let serverAge = server.ticketNow - issued
+  if clientAge > serverAge {
+    return clientAge - serverAge <= EARLY_DATA_AGE_WINDOW
+  }
+  return serverAge - clientAge <= EARLY_DATA_AGE_WINDOW
 }
 
 fn readStateNumber(state: &[u8; 138], offset: usize, width: usize) -> usize {
@@ -2800,6 +2900,8 @@ fn emptyParsed() -> ParsedClientHello {
     bindersOffset: 0,
     binderOffset: 0,
     binderLength: 0,
+    obfuscatedAge: 0,
+    earlyData: false,
   }
 }
 
@@ -2912,6 +3014,9 @@ fn parseClientHello(server: &Server, end: usize) -> Result<ParsedClientHello, Se
       valid = false
     } else if kind == 45 {
       valid = parsePskModes(buffer, cursor, length, &mut parsed)
+    } else if kind == 42 {
+      valid = length == 0
+      parsed.earlyData = true
     } else if kind == 41 {
       sawPreSharedKey = true
       valid = parsePreSharedKey(buffer, cursor, length, &mut parsed)
@@ -2925,6 +3030,9 @@ fn parseClientHello(server: &Server, end: usize) -> Result<ParsedClientHello, Se
     return parseFailure(ServerProtocolReason.ClientHello)
   }
   if parsed.hasPsk && !parsed.hasPskModes {
+    return parseFailure(ServerProtocolReason.Extension)
+  }
+  if parsed.earlyData && !parsed.hasPsk {
     return parseFailure(ServerProtocolReason.Extension)
   }
   return Result<ParsedClientHello, ServerError>.succeed(move parsed)
@@ -2980,6 +3088,8 @@ fn parsePreSharedKey(
     if identities == 0 {
       parsed.identityOffset = cursor + 2
       parsed.identityLength = identityLength
+      let ageAt = cursor + 2 + identityLength
+      parsed.obfuscatedAge = readU16Raw(buffer, ageAt) * 65536 + readU16Raw(buffer, ageAt + 2)
     }
     cursor = cursor + 6 + identityLength
     identities = identities + usize.ONE
@@ -3395,6 +3505,16 @@ fn copyInto(destination: &mut [u8], source: &[u8]) -> () {
 
 effect fn queueServerHello(server: &mut Server, offset: usize) -> Result<(), ServerError>
   ? &mut Random {
+  // Accepted early data comes under the client early traffic secret, over the ClientHello only.
+  let mut earlySecret = zero48()
+  if server.earlyStatus == EarlyDataStatus.Accepted {
+    earlySecret = match earlyTrafficSecret(&server.*) {
+      Result<[u8; 48], ServerError>.Failure { error } => {
+        return failure(error)
+      }
+      Result<[u8; 48], ServerError>.Success { value } => value
+    }
+  }
   let agreement = match run agree(&server.*, offset) {
     Result<Agreement, ServerError>.Failure { error } => {
       return failure(error)
@@ -3453,8 +3573,12 @@ effect fn queueServerHello(server: &mut Server, offset: usize) -> Result<(), Ser
     return failure(error)
   }
   let suiteValue = server.selectedSuite
-  let clientSecret = server.clientHandshakeSecret
   let length = server.secretLength
+  let mut clientSecret = server.clientHandshakeSecret
+  if server.earlyStatus == EarlyDataStatus.Accepted {
+    clientSecret = earlySecret
+    server.earlyActive = true
+  }
   let replaced = TlsRecordReceiver.replaceEpoch(
     &mut server.receiver,
     suiteValue,
@@ -3462,6 +3586,9 @@ effect fn queueServerHello(server: &mut Server, offset: usize) -> Result<(), Ser
   )
   if let Result<(), ServerError>.Failure { error } = recordUnit(move replaced) {
     return failure(error)
+  }
+  if server.earlyStatus == EarlyDataStatus.Rejected && !server.helloRetried {
+    TlsRecordReceiver.skipUndecryptable(&mut server.receiver, server.limits.rejectedEarlyDataBytes)
   }
   return run buildFlight(&mut server.*)
 }
@@ -3517,10 +3644,21 @@ effect fn buildFlight(server: &mut Server) -> Result<(), ServerError>
   let start = cursor
   putU8(&mut server.flight, &mut cursor, 8)
   putU24(&mut server.flight, &mut cursor, 0)
+  let mut extensionsLength = usize.ZERO
+  if server.hasSelectedAlpn {
+    extensionsLength = server.alpnLengths[server.selectedAlpnIndex] + 7
+  }
+  if server.earlyStatus == EarlyDataStatus.Accepted {
+    extensionsLength = extensionsLength + 4
+  }
+  putU16(&mut server.flight, &mut cursor, extensionsLength)
+  if server.earlyStatus == EarlyDataStatus.Accepted {
+    putU16(&mut server.flight, &mut cursor, 42)
+    putU16(&mut server.flight, &mut cursor, 0)
+  }
   if server.hasSelectedAlpn {
     let offset = server.alpnOffsets[server.selectedAlpnIndex]
     let protocolLength = server.alpnLengths[server.selectedAlpnIndex]
-    putU16(&mut server.flight, &mut cursor, protocolLength + 7)
     putU16(&mut server.flight, &mut cursor, 16)
     putU16(&mut server.flight, &mut cursor, protocolLength + 3)
     putU16(&mut server.flight, &mut cursor, protocolLength + usize.ONE)
@@ -3531,8 +3669,6 @@ effect fn buildFlight(server: &mut Server) -> Result<(), ServerError>
       putU8(&mut server.flight, &mut cursor, byte)
       index = index + usize.ONE
     }
-  } else {
-    putU16(&mut server.flight, &mut cursor, 0)
   }
   setU24(&mut server.flight, start + usize.ONE, cursor - start - HANDSHAKE_HEADER_LENGTH)
   updateTranscriptFlight(&mut server.*, start, cursor - start)
@@ -3822,6 +3958,35 @@ fn handleClientCertificateVerify(server: &mut Server, messageLength: usize) -> R
   return ok()
 }
 
+// EndOfEarlyData ends the early data. It is the last message under the early data key, so no
+// other handshake bytes may follow it in the record.
+fn handleEndOfEarlyData(server: &mut Server, messageLength: usize) -> Result<(), ServerError> {
+  if messageLength != HANDSHAKE_HEADER_LENGTH || server.handshakeLength != messageLength {
+    return violation(ServerProtocolReason.EarlyData)
+  }
+  updateTranscriptHandshake(&mut server.*, messageLength)
+  let suite = server.selectedSuite
+  let secret = server.clientHandshakeSecret
+  let replaced = TlsRecordReceiver.replaceEpoch(
+    &mut server.receiver,
+    suite,
+    secretView(&secret, server.secretLength),
+  )
+  if let Result<(), ServerError>.Failure { error } = recordUnit(move replaced) {
+    return failure(error)
+  }
+  server.earlyActive = false
+  return ok()
+}
+
+fn earlyTrafficSecret(server: &Server) -> Result<[u8; 48], ServerError> {
+  let length = server.secretLength
+  let zeros = zero48()
+  let psk = server.psk
+  let early = extractBy(length, secretView(&zeros, length), secretView(&psk, length))
+  return deriveSecretBy(length, &early, b"c e traffic", &transcriptHash(server))
+}
+
 effect fn handleClientFinished(server: &mut Server, messageLength: usize) -> Result<
   (),
   ServerError
@@ -3916,7 +4081,7 @@ effect fn buildTickets(server: &mut Server, resumption: &[u8; 48]) -> Result<(),
     }
     at = at + usize.ONE
     putStateBytes(&mut state, &mut at, &nameHash)
-    putStateNumber(&mut state, &mut at, 0, 4)
+    putStateNumber(&mut state, &mut at, server.ticketEarlyData, 4)
     if server.hasSelectedAlpn {
       state[at] = 1
     }
@@ -3949,9 +4114,17 @@ effect fn buildTickets(server: &mut Server, resumption: &[u8; 48]) -> Result<(),
     }
 
     // The flight buffer holds `chainLength + FLIGHT_OVERHEAD` bytes, more than
-    // `TICKET_COUNT_LIMIT * TICKET_MESSAGE_LENGTH`.
+    // `TICKET_COUNT_LIMIT * (TICKET_MESSAGE_LENGTH + 8)`.
+    let mut extensionsLength = usize.ZERO
+    if server.ticketEarlyData > 0 {
+      extensionsLength = 8
+    }
     putU8(&mut server.flight, &mut cursor, 4)
-    putU24(&mut server.flight, &mut cursor, TICKET_MESSAGE_LENGTH - HANDSHAKE_HEADER_LENGTH)
+    putU24(
+      &mut server.flight,
+      &mut cursor,
+      TICKET_MESSAGE_LENGTH - HANDSHAKE_HEADER_LENGTH + extensionsLength,
+    )
     putU16(&mut server.flight, &mut cursor, server.ticketLifetime / 65536)
     putU16(&mut server.flight, &mut cursor, server.ticketLifetime % 65536)
     putSlice(&mut server.flight, &mut cursor, Slice.view<u8>(&random, 0, 4))
@@ -3959,7 +4132,14 @@ effect fn buildTickets(server: &mut Server, resumption: &[u8; 48]) -> Result<(),
     putSlice(&mut server.flight, &mut cursor, &nonce)
     putU16(&mut server.flight, &mut cursor, TICKET_LENGTH)
     putSlice(&mut server.flight, &mut cursor, &ticket)
-    putU16(&mut server.flight, &mut cursor, 0)
+    putU16(&mut server.flight, &mut cursor, extensionsLength)
+    if server.ticketEarlyData > 0 {
+      // early_data with max_early_data_size.
+      putU16(&mut server.flight, &mut cursor, 42)
+      putU16(&mut server.flight, &mut cursor, 4)
+      putU16(&mut server.flight, &mut cursor, server.ticketEarlyData / 65536)
+      putU16(&mut server.flight, &mut cursor, server.ticketEarlyData % 65536)
+    }
     index = index + usize.ONE
   }
   server.flightLength = cursor

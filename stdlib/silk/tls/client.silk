@@ -23,6 +23,11 @@
 //! with (EC)DHE, and when the server accepts, the handshake skips the certificate messages.
 //! [`Session.encode`] and [`Session.decode`] let you keep sessions across processes.
 //!
+//! A session whose ticket allows early data also lets the client send the `Resumption` `earlyData`
+//! bytes as 0-RTT data, right after the ClientHello and before the server answers.
+//! [`Client.earlyData`] tells you whether the server accepted them. When it rejected them, write
+//! them again after `Authenticated`.
+//!
 //! Each call returns a [`Progress`]: how many bytes it took or wrote, and the next [`Demand`].
 //! Output works in two steps: write [`Client.pendingOutput`] to the transport, and then call
 //! [`Client.ackWritten`] with the number of bytes written. The client does not keep your buffers.
@@ -329,7 +334,39 @@ pub union Resumption<'a> {
     /// full handshake. [`Client.make`] copies it. The client offers it only before it expires and
     /// only to the server name of the connection it came from. Otherwise it does a full handshake.
     pub session: Option<&'a Session>,
+    /// Bytes to send as 0-RTT data with `session`, at most 16384, or an empty slice for none.
+    /// [`Client.make`] copies them. The client sends them only when it offers the session and the
+    /// session's [`Session.maxEarlyData`] is at least their length.
+    ///
+    /// # Gotchas
+    /// An attacker can replay 0-RTT data to the server, so send only requests that are safe to
+    /// repeat.
+    pub earlyData: &'a [u8],
   },
+}
+
+/// What happened to the 0-RTT data of a connection, from [`Client.earlyData`] or `Server.earlyData`.
+pub enum EarlyDataStatus {
+  /// No early data was offered.
+  NotOffered,
+  /// The client sent early data and waits for the server's answer. A server never reports it.
+  Pending,
+  /// The server accepted the early data.
+  Accepted,
+  /// The server rejected the early data, which it did not read.
+  Rejected,
+}
+
+impl Debug for EarlyDataStatus {
+  /// Writes the name of the variant, such as `Accepted`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      EarlyDataStatus.NotOffered => run Format.write(&mut formatter, b"NotOffered")
+      EarlyDataStatus.Pending => run Format.write(&mut formatter, b"Pending")
+      EarlyDataStatus.Accepted => run Format.write(&mut formatter, b"Accepted")
+      EarlyDataStatus.Rejected => run Format.write(&mut formatter, b"Rejected")
+    }
+  }
 }
 
 impl<'a> Copy for Resumption<'a> {}
@@ -337,8 +374,29 @@ impl<'a> Copy for Resumption<'a> {}
 fn configSession<'a>(config: &ClientConfig<'a>) -> Option<&'a Session> {
   return match config.resumption {
     Resumption<'a>.Disabled => Option<&'a Session>.none()
-    Resumption<'a>.Enabled {session} => session
+    Resumption<'a>.Enabled {session, ..} => session
   }
+}
+
+fn configEarlyDataLength<'a>(config: &ClientConfig<'a>) -> usize {
+  return match config.resumption {
+    Resumption<'a>.Disabled => 0
+    Resumption<'a>.Enabled {earlyData, ..} => earlyData.length
+  }
+}
+
+fn copyEarlyData<'a>(config: &ClientConfig<'a>, destination: &mut Intrinsic.RawBuffer<u8>) -> () {
+  match config.resumption {
+    Resumption<'a>.Disabled => {}
+    Resumption<'a>.Enabled {earlyData, ..} => {
+      let mut index = usize.ZERO
+      while index < earlyData.length {
+        RawBuffer.fill(&mut destination.*, index, usize.ONE, earlyData[index])
+        index = index + usize.ONE
+      }
+    }
+  }
+  return ()
 }
 
 fn resumptionEnabled<'a>(config: &ClientConfig<'a>) -> bool {
@@ -815,6 +873,8 @@ pub enum TlsLimitKind {
   CredentialCertificates,
   /// DER bytes in the client's credential chain.
   CredentialBytes,
+  /// The `Resumption` `earlyData` bytes.
+  EarlyDataBytes,
 }
 
 impl Debug for TlsLimitKind {
@@ -842,6 +902,7 @@ impl Debug for TlsLimitKind {
       TlsLimitKind.CertificateProfile => run Format.write(&mut formatter, b"CertificateProfile")
       TlsLimitKind.CredentialCertificates => run Format.write(&mut formatter, b"CredentialCertificates")
       TlsLimitKind.CredentialBytes => run Format.write(&mut formatter, b"CredentialBytes")
+      TlsLimitKind.EarlyDataBytes => run Format.write(&mut formatter, b"EarlyDataBytes")
     }
   }
 }
@@ -1112,6 +1173,8 @@ enum PendingKind {
   RetryClientHello,
   EmptyCertificate,
   CredentialFlight,
+  EarlyData,
+  EndOfEarlyData,
   Finished,
   Application,
   KeyUpdate,
@@ -1248,6 +1311,10 @@ pub struct Client {
   resumed: bool,
   resumptionSecret: [u8; 48],
   sessions: List<Session>,
+  earlyBytes: Intrinsic.RawBuffer<u8>,
+  earlyLength: usize,
+  earlyStatus: EarlyDataStatus,
+  earlySecret: [u8; 48],
 }
 
 impl Client {
@@ -1310,15 +1377,31 @@ impl Client {
     let alpnLength = alpnPayloadLength(config.alpn)
     let alpnCount = alpnProtocolCount(config.alpn)
     let offerable = sessionOfferable(config, &validationTime)
+    let earlyLength = configEarlyDataLength(config)
+    if earlyLength > RECORD_CONTENT_LIMIT {
+      return Result<Client, TlsError>.failResult(
+        TlsError.LimitExceeded {kind: TlsLimitKind.EarlyDataBytes, limit: RECORD_CONTENT_LIMIT},
+      )
+    }
+    let mut earlyOffered = false
     let mut pskLength = usize.ZERO
     if resumptionEnabled(config) {
       pskLength = 6
     }
     if offerable {
       pskLength = match configSession(config) {
-        Option<&'a Session>.Some {value} => pskLength + 15 + Bytes.length(&value.ticketBytes) + value.secretLength
+        Option<&'a Session>.Some {value} => {
+          earlyOffered = earlyLength > 0 && value.earlyDataLimit >= earlyLength
+          pskLength + 15 + Bytes.length(&value.ticketBytes) + value.secretLength
+        }
         Option<&'a Session>.None => 0
       }
+    }
+    // early_data, which is empty in a ClientHello.
+    let mut earlyStatus = EarlyDataStatus.NotOffered
+    if earlyOffered {
+      pskLength = pskLength + 4
+      earlyStatus = EarlyDataStatus.Pending
     }
     let generatedBody = maximumClientHelloBody(
       dnsLength,
@@ -1367,6 +1450,8 @@ impl Client {
     let handshake = run allocateBytes(handshakeCapacity)
     let application = run allocateBytes(RECORD_CONTENT_LIMIT)
     let cookie = run allocateBytes(config.limits.cookieBytes)
+    let mut earlyBytes = run allocateBytes(nonzero(earlyLength))
+    copyEarlyData(config, &mut earlyBytes)
     let sender = run TlsRecordSender.makePlaintext()
     let receiver = run TlsRecordReceiver.makePlaintext()
     let mut clientRandom = zero32()
@@ -1455,6 +1540,10 @@ impl Client {
       resumed: false,
       resumptionSecret: zero48(),
       sessions: List<Session>.make(),
+      earlyBytes: move earlyBytes,
+      earlyLength: earlyLength,
+      earlyStatus: earlyStatus,
+      earlySecret: zero48(),
     }
     let queued = run queueClientHello(&mut client, false)
     return match move queued {
@@ -1501,6 +1590,12 @@ impl Client {
     )
   }
 
+  /// Returns what happened to the `Resumption` `earlyData` bytes. It is `Pending` from
+  /// [`Client.make`] until the server's EncryptedExtensions, and final by `Authenticated`.
+  pub fn earlyData(self: &Self) -> EarlyDataStatus {
+    return self.earlyStatus
+  }
+
   /// Removes and returns the oldest [`Session`] from the server's NewSessionTicket messages, or
   /// `None` when no new one has arrived.
   ///
@@ -1531,6 +1626,10 @@ impl Client {
       return success(input.length, 0, demand(&mut self.*))
     }
     if self.applicationLength > self.applicationRead {
+      return success(0, 0, demand(&mut self.*))
+    }
+    // The handshake keys replace the early data key, so the early data goes out first.
+    if self.pendingKind == PendingKind.EarlyData {
       return success(0, 0, demand(&mut self.*))
     }
     if self.inputEnded {
@@ -2725,6 +2824,10 @@ effect fn queueClientHello(client: &mut Client, retry: bool) -> Result<(), TlsEr
     putU8(&mut client.handshake, &mut cursor, 1)
     putU8(&mut client.handshake, &mut cursor, 1)
   }
+  if !retry && client.earlyStatus == EarlyDataStatus.Pending {
+    putU16(&mut client.handshake, &mut cursor, 42)
+    putU16(&mut client.handshake, &mut cursor, 0)
+  }
   if offerPsk {
     // pre_shared_key, which must come last.
     let ticketLength = offeredTicketLength(&client.*)
@@ -2782,6 +2885,113 @@ effect fn queueClientHello(client: &mut Client, retry: bool) -> Result<(), TlsEr
   }
   client.pendingKind = PendingKind.ClientHello
   if retry { client.pendingKind = PendingKind.RetryClientHello }
+  if !retry && client.earlyStatus == EarlyDataStatus.Pending {
+    return deriveEarlySecret(&mut client.*)
+  }
+  return Result<(), TlsError>.succeed(())
+}
+
+// The client early traffic secret, over the ClientHello in the transcript (RFC 8446 section 7.1).
+fn deriveEarlySecret(client: &mut Client) -> Result<(), TlsError> {
+  let length = offeredSecretLength(&client.*)
+  let psk = offeredSecret(&client.*)
+  let early = extractBy(length, &psk)
+  let mut hash = zero48()
+  if length == 48 {
+    hash = client.transcript384.checkpoint()
+  } else {
+    let digest = client.transcript256.checkpoint()
+    hash = widen32(&digest)
+  }
+  return match move deriveSecretBy(length, &early, b"c e traffic", &hash) {
+    Result<[u8; 48], TlsError>.Failure {error} => Result<(), TlsError>.failResult(move error)
+    Result<[u8; 48], TlsError>.Success {value} => {
+      client.earlySecret = value
+      return Result<(), TlsError>.succeed(())
+    }
+  }
+}
+
+fn offeredSuite(client: &Client) -> CipherSuite {
+  return match &client.offered {
+    Option<Session>.Some {value} => value.cipherSuite
+    Option<Session>.None => CipherSuite.Aes128GcmSha256
+  }
+}
+
+// Whether the selected ALPN protocol is the one of the offered session, as accepted early data
+// requires (RFC 8446 section 4.2.10).
+fn earlyAlpnMatches(client: &Client) -> bool {
+  return match &client.offered {
+    Option<Session>.None => false
+    Option<Session>.Some {value} => {
+      if value.hasAlpn != client.hasSelectedAlpn { return false }
+      if !value.hasAlpn { return true }
+      let offset = client.alpnOffsets[client.selectedAlpnIndex]
+      let length = client.alpnLengths[client.selectedAlpnIndex]
+      let stored = Bytes.asSlice(&value.alpnBytes)
+      if stored.length != length { return false }
+      let mut index = usize.ZERO
+      while index < length {
+        // `copyAlpn` recorded the selected protocol's range within the ALPN buffer, and filled it.
+        let byte = unsafe RawBuffer.read<u8>(&client.alpn, offset + index)
+        if byte != stored[index] { return false }
+        index = index + usize.ONE
+      }
+      return true
+    }
+  }
+}
+
+// Sends the early data under the client early traffic secret, after the ClientHello.
+fn queueEarlyData(client: &mut Client) -> Result<(), TlsError> {
+  let suite = offeredSuite(&client.*)
+  let secret = client.earlySecret
+  let length = offeredSecretLength(&client.*)
+  let replaced = TlsRecordSender.replaceEpoch(&mut client.sender, suite, Slice.view<u8>(&secret, 0, length))
+  if let Result<(), RecordError>.Failure {error} = move replaced {
+    return mapRecordUnit(&mut client.*, move error)
+  }
+  // `make` copied `earlyLength` bytes into the early data buffer.
+  let bytes = unsafe RawBuffer.view<u8>(&client.earlyBytes, 0, client.earlyLength)
+  let queued = TlsRecordSender.queueRecord(&mut client.sender, ContentType.ApplicationData, bytes)
+  match move queued {
+    Result<OutputProgress, RecordError>.Failure {error} => {
+      return mapRecordUnit(&mut client.*, move error)
+    }
+    Result<OutputProgress, RecordError>.Success {value} => {
+      if value.accepted != client.earlyLength {
+        return unitFailure(
+          &mut client.*,
+          TlsError.ProtocolViolation {reason: ProtocolReason.InternalState},
+        )
+      }
+    }
+  }
+  client.pendingKind = PendingKind.EarlyData
+  return Result<(), TlsError>.succeed(())
+}
+
+// Sends EndOfEarlyData under the early traffic secret. The client Finished follows it.
+fn queueEndOfEarlyData(client: &mut Client) -> Result<(), TlsError> {
+  let message: [u8; 4] = [5, 0, 0, 0]
+  let queued = TlsRecordSender.queueRecord(&mut client.sender, ContentType.Handshake, &message)
+  if let Result<OutputProgress, RecordError>.Failure {error} = move queued {
+    return mapRecordUnit(&mut client.*, move error)
+  }
+  updateTranscriptSlice(&mut client.*, &message)
+  client.pendingKind = PendingKind.EndOfEarlyData
+  return Result<(), TlsError>.succeed(())
+}
+
+fn installClientHandshakeSender(client: &mut Client) -> Result<(), TlsError> {
+  let suite = client.selectedSuite
+  let secret = client.clientHandshakeSecret
+  let length = client.clientHandshakeSecretLength
+  let replaced = TlsRecordSender.replaceEpoch(&mut client.sender, suite, Slice.view<u8>(&secret, 0, length))
+  if let Result<(), RecordError>.Failure {error} = move replaced {
+    return mapRecordUnit(&mut client.*, move error)
+  }
   return Result<(), TlsError>.succeed(())
 }
 
@@ -2829,8 +3039,22 @@ fn completePending(client: &mut Client) -> Result<(), TlsError> {
   let kind = client.pendingKind
   client.pendingKind = PendingKind.None
   if kind == PendingKind.ClientHello {
+    if client.earlyStatus == EarlyDataStatus.Pending {
+      return queueEarlyData(&mut client.*)
+    }
     client.state = ClientState.AwaitServerHello
     return Result<(), TlsError>.succeed(())
+  }
+  if kind == PendingKind.EarlyData {
+    client.state = ClientState.AwaitServerHello
+    return Result<(), TlsError>.succeed(())
+  }
+  if kind == PendingKind.EndOfEarlyData {
+    let installed = installClientHandshakeSender(&mut client.*)
+    if let Result<(), TlsError>.Failure {error} = move installed {
+      return Result<(), TlsError>.failResult(move error)
+    }
+    return queueClientFinished(&mut client.*)
   }
   if kind == PendingKind.RetryClientHello {
     client.state = ClientState.AwaitServerHello
@@ -3446,6 +3670,14 @@ effect fn handleServerHello(client: &mut Client, messageLength: usize) -> Result
     }
     client.retried = true
     client.state = ClientState.RetryClientHelloPending
+    if client.earlyStatus == EarlyDataStatus.Pending {
+      // The server rejects early data after a HelloRetryRequest, and the second ClientHello goes
+      // out without protection.
+      client.earlyStatus = EarlyDataStatus.Rejected
+      let plaintext = run TlsRecordSender.makePlaintext()
+      let previous = Intrinsic.replace(client.sender, move plaintext)
+      drop previous
+    }
     return run queueClientHello(&mut client.*, true)
   }
 
@@ -3911,19 +4143,22 @@ fn replaceHandshakeRecordEpochs(
   serverSecret: &[u8],
 ) -> Result<(), TlsError> {
   let suite = client.selectedSuite
-  let senderResult = TlsRecordSender.replaceEpoch(
-    &mut client.sender,
-    suite,
-    clientSecret,
-  )
-  match move senderResult {
-    Result<(), RecordError>.Failure {error} => {
-      drop error
-      return Result<(), TlsError>.failResult(
-        TlsError.ProtocolViolation {reason: ProtocolReason.InternalState},
-      )
+  // While early data may be accepted, the client keeps the early data key until EndOfEarlyData.
+  if client.earlyStatus != EarlyDataStatus.Pending {
+    let senderResult = TlsRecordSender.replaceEpoch(
+      &mut client.sender,
+      suite,
+      clientSecret,
+    )
+    match move senderResult {
+      Result<(), RecordError>.Failure {error} => {
+        drop error
+        return Result<(), TlsError>.failResult(
+          TlsError.ProtocolViolation {reason: ProtocolReason.InternalState},
+        )
+      }
+      Result<(), RecordError>.Success {..} => {}
     }
-    Result<(), RecordError>.Success {..} => {}
   }
   let receiverResult = TlsRecordReceiver.replaceEpoch(
     &mut client.receiver,
@@ -3998,6 +4233,7 @@ fn handleEncryptedExtensions(client: &mut Client, messageLength: usize) -> Resul
   let mut sawServerName = false
   let mut sawAlpn = false
   let mut sawGroups = false
+  let mut sawEarlyData = false
   while cursor < messageLength {
     if messageLength - cursor < 4 {
       return Result<(), TlsError>.failResult(
@@ -4077,6 +4313,13 @@ fn handleEncryptedExtensions(client: &mut Client, messageLength: usize) -> Resul
         return Result<(), TlsError>.failResult(TlsError.NoApplicationProtocol)
       }
       sawAlpn = true
+    } else if kind == 42 {
+      if sawEarlyData || length != 0 || client.earlyStatus != EarlyDataStatus.Pending || !client.resumed {
+        return Result<(), TlsError>.failResult(
+          TlsError.ProtocolViolation {reason: ProtocolReason.Extension},
+        )
+      }
+      sawEarlyData = true
     } else {
       return Result<(), TlsError>.failResult(
         TlsError.ProtocolViolation {reason: ProtocolReason.Extension},
@@ -4086,6 +4329,23 @@ fn handleEncryptedExtensions(client: &mut Client, messageLength: usize) -> Resul
   }
   if client.alpnRequired && !sawAlpn {
     return Result<(), TlsError>.failResult(TlsError.NoApplicationProtocol)
+  }
+  if client.earlyStatus == EarlyDataStatus.Pending {
+    if sawEarlyData {
+      // Accepted early data keeps the session's cipher suite and ALPN protocol.
+      if client.selectedSuite != offeredSuite(&client.*) || !earlyAlpnMatches(&client.*) {
+        return Result<(), TlsError>.failResult(
+          TlsError.ProtocolViolation {reason: ProtocolReason.Extension},
+        )
+      }
+      client.earlyStatus = EarlyDataStatus.Accepted
+    } else {
+      client.earlyStatus = EarlyDataStatus.Rejected
+      let installed = installClientHandshakeSender(&mut client.*)
+      if let Result<(), TlsError>.Failure {error} = move installed {
+        return Result<(), TlsError>.failResult(move error)
+      }
+    }
   }
   updateSelectedTranscript(&mut client.*, 0, messageLength)
   client.state = ClientState.AwaitCertificate
@@ -4743,6 +5003,9 @@ effect fn handleServerFinished(client: &mut Client, messageLength: usize) -> Res
     Result<(), RecordError>.Success {..} => {}
   }
   client.state = ClientState.ClientFinishedPending
+  if client.earlyStatus == EarlyDataStatus.Accepted {
+    return queueEndOfEarlyData(&mut client.*)
+  }
   if client.certificateRequest {
     return run queueCertificateFlight(&mut client.*)
   }
@@ -5063,8 +5326,9 @@ fn queueEmptyCertificate(client: &mut Client) -> Result<(), TlsError> {
 
 fn queueClientFinished(client: &mut Client) -> Result<(), TlsError> {
   let length = client.clientHandshakeSecretLength
-  RawBuffer.fill(&mut client.handshake, 0, usize.ONE, 20)
-  setU24(&mut client.handshake, usize.ONE, length)
+  let mut finished: [u8; 52] = [0; 52]
+  finished[0] = 20
+  finished[3] = usize.toU8(length)
   if length == 48 {
     let secret = fixed48(&client.clientHandshakeSecret)
     let transcript = client.transcript384.checkpoint()
@@ -5076,9 +5340,11 @@ fn queueClientFinished(client: &mut Client) -> Result<(), TlsError> {
       Result<[u8; 48], TlsError>.Success {value} => value
     }
     let verifyData = HmacSha384.authenticate(&key, &transcript)
-    // The Finished message is 52 bytes, far below the handshake capacity, which also holds a full
-    // record.
-    unsafe RawBuffer.copy<u8>(&mut client.handshake, 4, &verifyData, 48)
+    let mut index = usize.ZERO
+    while index < 48 {
+      finished[4 + index] = verifyData[index]
+      index = index + usize.ONE
+    }
   } else if length == 32 {
     let secret = first32(&client.clientHandshakeSecret)
     let transcript = client.transcript256.checkpoint()
@@ -5090,21 +5356,22 @@ fn queueClientFinished(client: &mut Client) -> Result<(), TlsError> {
       Result<[u8; 32], TlsError>.Success {value} => value
     }
     let verifyData = HmacSha256.authenticate(&key, &transcript)
-    // The Finished message is 36 bytes, far below the handshake capacity, which also holds a full
-    // record.
-    unsafe RawBuffer.copy<u8>(&mut client.handshake, 4, &verifyData, 32)
+    let mut index = usize.ZERO
+    while index < 32 {
+      finished[4 + index] = verifyData[index]
+      index = index + usize.ONE
+    }
   } else {
     return Result<(), TlsError>.failResult(
       TlsError.ProtocolViolation {reason: ProtocolReason.InternalState},
     )
   }
-  // The header and the verify data above wrote every byte of the Finished message.
-  let message = unsafe RawBuffer.view<u8>(&client.handshake, 0, HANDSHAKE_HEADER_LENGTH + length)
+  let message = Slice.view<u8>(&finished, 0, HANDSHAKE_HEADER_LENGTH + length)
   let queued = TlsRecordSender.queueRecord(&mut client.sender, ContentType.Handshake, message)
   if let Result<OutputProgress, RecordError>.Failure {error} = move queued {
     return mapRecordUnit(&mut client.*, move error)
   }
-  updateSelectedTranscript(&mut client.*, 0, HANDSHAKE_HEADER_LENGTH + length)
+  updateTranscriptSlice(&mut client.*, message)
   let master = client.masterSecret
   let transcript = selectedTranscriptHash(&client.*)
   let resumption = deriveSecretBy(length, &master, b"res master", &transcript)

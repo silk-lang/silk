@@ -27,6 +27,11 @@ With [`Resumption`](#Resumption) `Enabled`, the client asks for session tickets 
 with (EC)DHE, and when the server accepts, the handshake skips the certificate messages.
 [`Session.encode`](#Session.impl.encode) and [`Session.decode`](#Session.impl.decode) let you keep sessions across processes.
 
+A session whose ticket allows early data also lets the client send the `Resumption` `earlyData`
+bytes as 0-RTT data, right after the ClientHello and before the server answers.
+[`Client.earlyData`](#Client.impl.earlyData) tells you whether the server accepted them. When it rejected them, write
+them again after `Authenticated`.
+
 Each call returns a [`Progress`](#Progress): how many bytes it took or wrote, and the next [`Demand`](#Demand).
 Output works in two steps: write [`Client.pendingOutput`](#Client.impl.pendingOutput) to the transport, and then call
 [`Client.ackWritten`](#Client.impl.ackWritten) with the number of bytes written. The client does not keep your buffers.
@@ -122,7 +127,7 @@ pub effect fn main() -> i32
 
 Import as `Client` with `import silk.tls.client { Client }`.
 
-Public declarations: 18.
+Public declarations: 19.
 
 <a id="NamedGroup"></a>
 
@@ -567,6 +572,90 @@ pub session: Option<&'a Session>
 A session to resume, from [`Client.takeSession`](#Client.impl.takeSession) or [`Session.decode`](#Session.impl.decode), or `None` for a
 full handshake. [`Client.make`](#Client.impl.make) copies it. The client offers it only before it expires and
 only to the server name of the connection it came from. Otherwise it does a full handshake.
+
+<a id="Resumption.Enabled.earlyData"></a>
+
+#### Field `earlyData`
+
+```silk
+pub earlyData: &'a [u8]
+```
+
+Bytes to send as 0-RTT data with `session`, at most 16384, or an empty slice for none.
+[`Client.make`](#Client.impl.make) copies them. The client sends them only when it offers the session and the
+session's [`Session.maxEarlyData`](#Session.impl.maxEarlyData) is at least their length.
+
+##### Gotchas
+An attacker can replay 0-RTT data to the server, so send only requests that are safe to
+repeat.
+
+<a id="EarlyDataStatus"></a>
+
+## `EarlyDataStatus`
+
+```silk
+pub enum EarlyDataStatus
+```
+
+What happened to the 0-RTT data of a connection, from [`Client.earlyData`](#Client.impl.earlyData) or `Server.earlyData`.
+
+<a id="EarlyDataStatus.NotOffered"></a>
+
+### `NotOffered`
+
+```silk
+NotOffered
+```
+
+No early data was offered.
+
+<a id="EarlyDataStatus.Pending"></a>
+
+### `Pending`
+
+```silk
+Pending
+```
+
+The client sent early data and waits for the server's answer. A server never reports it.
+
+<a id="EarlyDataStatus.Accepted"></a>
+
+### `Accepted`
+
+```silk
+Accepted
+```
+
+The server accepted the early data.
+
+<a id="EarlyDataStatus.Rejected"></a>
+
+### `Rejected`
+
+```silk
+Rejected
+```
+
+The server rejected the early data, which it did not read.
+
+<a id="EarlyDataStatus.impl.Debug"></a>
+
+## Implementation `Debug for EarlyDataStatus`
+
+```silk
+impl Debug for EarlyDataStatus
+```
+
+<a id="EarlyDataStatus.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Accepted`.
 
 <a id="Resumption.impl.Copy"></a>
 
@@ -1401,6 +1490,16 @@ CredentialBytes
 
 DER bytes in the client's credential chain.
 
+<a id="TlsLimitKind.EarlyDataBytes"></a>
+
+### `EarlyDataBytes`
+
+```silk
+EarlyDataBytes
+```
+
+The `Resumption` `earlyData` bytes.
+
 <a id="TlsLimitKind.impl.Debug"></a>
 
 ## Implementation `Debug for TlsLimitKind`
@@ -2041,6 +2140,17 @@ pub fn authentication<'a>(self: &'a Self) -> Option<Authentication<'a>>
 
 Returns the result of authentication, after the `Authenticated` action. Before that, returns
 `None`.
+
+<a id="Client.impl.earlyData"></a>
+
+### Method `earlyData`
+
+```silk
+pub fn earlyData(self: &Self) -> EarlyDataStatus
+```
+
+Returns what happened to the `Resumption` `earlyData` bytes. It is `Pending` from
+[`Client.make`](#Client.impl.make) until the server's EncryptedExtensions, and final by `Authenticated`.
 
 <a id="Client.impl.takeSession"></a>
 
