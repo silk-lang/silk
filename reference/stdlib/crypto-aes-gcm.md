@@ -10,14 +10,17 @@ change is detected. Use [`AesGcm.open`](#AesGcm.impl.open) to check and decrypt 
 an algorithm, `silk.crypto.chacha20_poly1305` is also a good choice.
 
 ## Details
-The key is 16 bytes (AES-128), 24 bytes (AES-192), or 32 bytes (AES-256), the nonce is 12 bytes,
-and the tag is 16 bytes. The tag is separate from the ciphertext ("detached"), so store or send
+The key is 16 bytes (AES-128), 24 bytes (AES-192), or 32 bytes (AES-256). The nonce is usually
+12 bytes; any other nonzero length is hashed into the first counter block, as NIST SP 800-38D
+says. The tag is 16 bytes, or a prefix of 4, 8 or 12 to 15 bytes. The tag is separate from the ciphertext ("detached"), so store or send
 both. The associated data (`aad`) is authenticated but not encrypted. Use it for headers that
 must stay readable. The ciphertext has the same length as the plaintext. Nothing allocates.
 
 For data that arrives in parts, such as a stream or a Node.js `createCipheriv` call, use
 [`AesGcmEncryptor`](#AesGcmEncryptor) and [`AesGcmDecryptor`](#AesGcmDecryptor). They take the message in any split, give the same
-result, accept nonces of any nonzero length, and can write a truncated tag.
+result, accept nonces of any nonzero length, and can write a truncated tag. On x86-64 they check
+for AES-NI and PCLMULQDQ at run time, as [`AesGcm.seal`](#AesGcm.impl.seal) and [`AesGcm.open`](#AesGcm.impl.open) do, and then run
+the counter mode and GHASH eight blocks at a time.
 
 ## Errors
 The functions return an [`AesGcmError`](#AesGcmError). All checks come before the first write, and on any
@@ -132,7 +135,7 @@ The key is not 16, 24, or 32 bytes.
 InvalidNonceLength
 ```
 
-The nonce is not 12 bytes.
+The nonce is empty or longer than 2^61 - 1 bytes.
 
 <a id="AesGcmError.InvalidTagLength"></a>
 
@@ -142,7 +145,7 @@ The nonce is not 12 bytes.
 InvalidTagLength
 ```
 
-The tag, or the tag output, is not 16 bytes.
+The tag, or the tag output, is not 4, 8, or 12 to 16 bytes.
 
 <a id="AesGcmError.OutputTooSmall"></a>
 
@@ -212,8 +215,9 @@ change is detected. Use [`AesGcm.open`](#AesGcm.impl.open) to check and decrypt 
 
 ### Details
 
-The key is 16 bytes (AES-128), 24 bytes (AES-192), or 32 bytes (AES-256), the nonce is 12 bytes,
-and the tag is 16 bytes. The tag is separate from the ciphertext, so store or send both. The
+The key is 16 bytes (AES-128), 24 bytes (AES-192), or 32 bytes (AES-256). The nonce is usually
+12 bytes but can have any nonzero length. The tag is 16 bytes, or a prefix of 4, 8 or 12 to 15
+bytes. The tag is separate from the ciphertext, so store or send both. The
 ciphertext has the same length as the plaintext. Nothing allocates. All checks come before the
 first write, and on any error the output buffers do not change.
 
@@ -246,10 +250,11 @@ pub fn seal(
   ) -> Result<(), AesGcmError>
 ```
 
-Encrypts `plaintext` into `ciphertext` and writes the 16-byte authentication tag to `tag`.
+Encrypts `plaintext` into `ciphertext` and writes the authentication tag to `tag`.
 
-The key is 16 bytes (AES-128), 24 bytes (AES-192), or 32 bytes (AES-256), and the nonce is 12
-bytes. `aad` is authenticated but not encrypted. Use it for headers that must stay readable.
+The key is 16 bytes (AES-128), 24 bytes (AES-192), or 32 bytes (AES-256). The nonce is usually
+12 bytes and can have any nonzero length. `tag` is 16 bytes for the full tag, or 4, 8 or 12 to
+15 bytes for a prefix of it. `aad` is authenticated but not encrypted. Use it for headers that must stay readable.
 The ciphertext has the same length as `plaintext`. `ciphertext` can be longer than
 `plaintext`. The bytes after the written prefix do not change. The buffers must not overlap.
 Nothing allocates.
@@ -258,8 +263,8 @@ Nothing allocates.
 All checks come before the first write. On an error, `ciphertext` and `tag` do not change.
 
 - `InvalidKeyLength` if `key` is not 16, 24, or 32 bytes.
-- `InvalidNonceLength` if `nonce` is not 12 bytes.
-- `InvalidTagLength` if `tag` is not 16 bytes.
+- `InvalidNonceLength` if `nonce` is empty or longer than 2^61 - 1 bytes.
+- `InvalidTagLength` if `tag` is not 4, 8, or 12 to 16 bytes.
 - `OutputTooSmall` if `ciphertext` is shorter than `plaintext`.
 - `LimitExceeded` if `plaintext` is longer than 2^36 - 32 bytes or `aad` is longer than
   2^61 - 1 bytes.
@@ -287,9 +292,10 @@ pub fn open(
 
 Checks `tag`, and if it is correct, decrypts `ciphertext` into `plaintext`.
 
-The key is 16 bytes (AES-128), 24 bytes (AES-192), or 32 bytes (AES-256), the nonce is 12
-bytes, and the tag is 16 bytes. `aad` must be the same bytes that were given to
-[`AesGcm.seal`](#AesGcm.impl.seal). The function checks all 16 tag bytes before it writes `plaintext`. The bytes
+The key is 16 bytes (AES-128), 24 bytes (AES-192), or 32 bytes (AES-256), and the nonce is the
+one given to [`AesGcm.seal`](#AesGcm.impl.seal). `tag` is 16 bytes, or a prefix of 4, 8 or 12 to 15 bytes, which
+is compared in constant time. `aad` must be the same bytes that were given to
+[`AesGcm.seal`](#AesGcm.impl.seal). The function checks every tag byte before it writes `plaintext`. The bytes
 after the written prefix do not change. Nothing allocates.
 
 #### Errors
@@ -297,8 +303,8 @@ All checks come before the first write. On an error, `plaintext` does not change
 
 - `AuthenticationFailed` if the tag is not correct for the key, nonce, `aad`, and ciphertext.
 - `InvalidKeyLength` if `key` is not 16, 24, or 32 bytes.
-- `InvalidNonceLength` if `nonce` is not 12 bytes.
-- `InvalidTagLength` if `tag` is not 16 bytes.
+- `InvalidNonceLength` if `nonce` is empty or longer than 2^61 - 1 bytes.
+- `InvalidTagLength` if `tag` is not 4, 8, or 12 to 16 bytes.
 - `OutputTooSmall` if `plaintext` is shorter than `ciphertext`.
 - `LimitExceeded` if `ciphertext` is longer than 2^36 - 32 bytes or `aad` is longer than
   2^61 - 1 bytes.
