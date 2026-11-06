@@ -1,0 +1,907 @@
+//! A readable listing of lowered MIR, which `silk dump mir` prints.
+//!
+//! # When to use
+//!
+//! Use [`append`] to show a person or a tool what one checked function instance lowered to:
+//! its locals, its blocks, and each block's statements and terminator.
+//!
+//! # Details
+//!
+//! A function begins with its header, `fn name<arguments>(parameters) -> result`, then one
+//! `let _n: type` line per local in local order, then each block as `bbN:` followed by its
+//! indented statements and its terminator. Local `_0` is the return slot. A place spells its
+//! projections after its local: `.n` for a field, `[_n]` and `[n]` for an index, `*` for a
+//! dereference, `as #n` for a union member and `as #n.m` for a variant field. A type without a
+//! source spelling, such as a closure or a structural union, is described by its structure:
+//! `closure main.main`, `A | B`, and a type parameter as `T` and its position.
+//!
+//! # Gotchas
+//!
+//! The listing is for people and is not a stable serialization format. Local and block numbers
+//! are positions in this one function, and change whenever lowering changes.
+
+import backend.InstanceKey {HelperRole, InstanceKey}
+import backend.Mir
+import backend.Mir {
+  AggregateField,
+  Block,
+  Callee,
+  Local,
+  LocalKind,
+  MirFunction,
+  Operand,
+  Place,
+  Projection,
+  Rvalue,
+  ScalarBinary,
+  ScalarUnary,
+  Statement,
+  SwitchCase,
+  Terminator,
+}
+import hir.Hir {Access, InfixOperator, Multiplicity, PrefixOperator}
+import semantic.DeclarationId {DeclarationId}
+import semantic.Intrinsic as CheckedIntrinsic
+import semantic.Specialization {Application}
+import semantic.Type {Argument, Composition, Type}
+import semantic.TypeText
+import semantic.TypedBody {BorrowStatus}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.collections.slice {Slice}
+import silk.core.option {Option}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.mem.shared {Shared}
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+
+/// Appends the listing of `function` to `out`, ending with a blank line.
+///
+/// # Details
+///
+/// The header names the instance as `module.Owner.name`, with its type arguments, then its
+/// parameter and result types. A function whose body was not borrow-checked says so in a comment
+/// after the header. Types are spelled as seen from the instance's own module.
+pub effect fn append(function: &MirFunction, out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  let identity = InstanceKey.identity(&function.key)
+  let declaration = DeclarationId.copyShared(&identity)
+  run Bytes.append(&mut out.*, b"fn ")
+  run appendKey(&function.key, &declaration, &mut out.*)
+  run Bytes.append(&mut out.*, b"(")
+  let parameters = List<Shared<Type>>.asSlice(&function.parameters)
+  let mut at = usize.ZERO
+  while at < parameters.length {
+    if at > usize.ZERO { run Bytes.append(&mut out.*, b", ") }
+    run appendType(&parameters[at], &declaration, &mut out.*)
+    at = at + usize.ONE
+  }
+  run Bytes.append(&mut out.*, b") -> ")
+  run appendType(&function.result, &declaration, &mut out.*)
+  if function.borrow == BorrowStatus.Awaiting { run Bytes.append(&mut out.*, b"  // not borrow-checked") }
+  run Bytes.append(&mut out.*, b"\n")
+  let locals = List<Local>.asSlice(&function.locals)
+  at = usize.ZERO
+  while at < locals.length {
+    run Bytes.append(&mut out.*, b"  let _")
+    run appendDecimal(&mut out.*, usize.toU64(at))
+    run Bytes.append(&mut out.*, b": ")
+    run appendType(&locals[at].ty, &declaration, &mut out.*)
+    run appendLocalKind(&locals[at].kind, &mut out.*)
+    run Bytes.append(&mut out.*, b"\n")
+    at = at + usize.ONE
+  }
+  let blocks = List<Block>.asSlice(&function.blocks)
+  at = usize.ZERO
+  while at < blocks.length {
+    run Bytes.append(&mut out.*, b"bb")
+    run appendDecimal(&mut out.*, usize.toU64(at))
+    run Bytes.append(&mut out.*, b":\n")
+    let statements = List<Statement>.asSlice(&blocks[at].statements)
+    let mut statement = usize.ZERO
+    while statement < statements.length {
+      run Bytes.append(&mut out.*, b"  ")
+      run appendStatement(&statements[statement], &declaration, &mut out.*)
+      run Bytes.append(&mut out.*, b"\n")
+      statement = statement + usize.ONE
+    }
+    run Bytes.append(&mut out.*, b"  ")
+    run appendTerminator(&blocks[at].terminator, &declaration, &mut out.*)
+    run Bytes.append(&mut out.*, b"\n")
+    at = at + usize.ONE
+  }
+  return run Bytes.append(&mut out.*, b"\n")
+}
+
+// Appends `value` in decimal.
+effect fn appendDecimal(out: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value >= 10 { run appendDecimal(&mut out.*, u64.divide(value, 10)) }
+  let digit = [u64.toU8(48 + u64.remainder(value, 10))]
+  return run Bytes.append(&mut out.*, &digit)
+}
+
+// Appends `value` as sixteen lowercase hexadecimal digits.
+effect fn appendHex(out: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let digits = b"0123456789abcdef"
+  let mut shift: u64 = 60
+  while true {
+    let nibble = u64.toUsize(u64.bitAnd(u64.shiftRight(value, shift), 15))
+    run Bytes.append(&mut out.*, &[digits[nibble]])
+    if shift == 0 { break }
+    shift = shift - 4
+  }
+  return ()
+}
+
+// Appends `text` in double quotes, escaping quotes, backslashes, line breaks and tabs, and writing
+// any other byte below 0x20 or from 0x7f as `\xNN`.
+effect fn appendQuoted(out: &mut Bytes, text: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let digits = b"0123456789abcdef"
+  run Bytes.append(&mut out.*, b"\"")
+  let mut at = usize.ZERO
+  while at < text.length {
+    let byte = text[at]
+    if byte == 34 {
+      run Bytes.append(&mut out.*, b"\\\"")
+    } else if byte == 92 {
+      run Bytes.append(&mut out.*, b"\\\\")
+    } else if byte == 10 {
+      run Bytes.append(&mut out.*, b"\\n")
+    } else if byte == 13 {
+      run Bytes.append(&mut out.*, b"\\r")
+    } else if byte == 9 {
+      run Bytes.append(&mut out.*, b"\\t")
+    } else if byte < 32 || byte == 127 {
+      run Bytes.append(&mut out.*, b"\\x")
+      run Bytes.append(&mut out.*, &[digits[u8.toUsize(byte / 16)], digits[u8.toUsize(byte % 16)]])
+    } else {
+      run Bytes.append(&mut out.*, &[byte])
+    }
+    at = at + usize.ONE
+  }
+  return run Bytes.append(&mut out.*, b"\"")
+}
+
+// Appends the written spelling of `ty` from the module of `owner`, or for a type without one, a
+// readable description of its structure.
+effect fn appendType(ty: &Shared<Type>, owner: &DeclarationId, out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  if let Option<Bytes>.Some {value} = move run TypeText.displayElided(ty, DeclarationId.moduleId(owner)) {
+    return run Bytes.append(&mut out.*, Bytes.asSlice(&value))
+  }
+  let copied = run Type.copy(ty)
+  match move copied {
+    Type.Nominal {declaration, arguments, ..} => {
+      let name = run Mir.declarationName(&declaration)
+      run Bytes.append(&mut out.*, Bytes.asSlice(&name))
+      run appendArguments(List<Argument>.asSlice(&arguments), owner, &mut out.*)
+    }
+    Type.Parameter {ordinal, ..} => {
+      run Bytes.append(&mut out.*, b"T")
+      run appendDecimal(&mut out.*, usize.toU64(ordinal))
+    }
+    Type.String {..} => run Bytes.append(&mut out.*, b"string")
+    Type.Reference {referent, access, ..} => {
+      run Bytes.append(&mut out.*, accessWord(access))
+      run appendType(&referent, owner, &mut out.*)
+    }
+    Type.Slice {element, access, ..} => {
+      run Bytes.append(&mut out.*, accessWord(access))
+      run Bytes.append(&mut out.*, b"[")
+      run appendType(&element, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b"]")
+    }
+    Type.Pointer {pointee, access, nullable, multiplicity, ..} => {
+      if nullable { run Bytes.append(&mut out.*, b"?") }
+      if multiplicity == Multiplicity.Many { run Bytes.append(&mut out.*, b"[*]") } else { run Bytes.append(&mut out.*, b"*") }
+      if access == Access.Mutable { run Bytes.append(&mut out.*, b"mut ") } else { run Bytes.append(&mut out.*, b"const ") }
+      run appendType(&pointee, owner, &mut out.*)
+    }
+    Type.Array {element, extent} => {
+      run Bytes.append(&mut out.*, b"[")
+      run appendType(&element, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b"; ")
+      run Bytes.append(&mut out.*, Bytes.asSlice(&extent))
+      run Bytes.append(&mut out.*, b"]")
+    }
+    Type.Anonymous {members, ..} => {
+      run Bytes.append(&mut out.*, b"(")
+      run appendTypes(List<Shared<Type>>.asSlice(&members), b", ", owner, &mut out.*)
+      run Bytes.append(&mut out.*, b")")
+    }
+    Type.Union {members} => {
+      if List<Shared<Type>>.length(&members) == usize.ZERO {
+        run Bytes.append(&mut out.*, b"never")
+      } else {
+        run appendTypes(List<Shared<Type>>.asSlice(&members), b" | ", owner, &mut out.*)
+      }
+    }
+    Type.Without {source, removed} => {
+      run appendType(&source, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b" without ")
+      run appendType(&removed, owner, &mut out.*)
+    }
+    Type.TypeDescriptor {owner: described} => {
+      run Bytes.append(&mut out.*, b"type ")
+      run appendType(&described, owner, &mut out.*)
+    }
+    Type.OpaqueRepresentation {contract, ..} => {
+      run Bytes.append(&mut out.*, b"opaque ")
+      run appendType(&contract, owner, &mut out.*)
+    }
+    Type.ForeignFunction {signature, ..} => {
+      run Bytes.append(&mut out.*, b"extern ")
+      run appendType(&signature, owner, &mut out.*)
+    }
+    Type.Callable {parameters, result, ..} => {
+      run Bytes.append(&mut out.*, b"fn(")
+      run appendTypes(List<Shared<Type>>.asSlice(&parameters), b", ", owner, &mut out.*)
+      run Bytes.append(&mut out.*, b") -> ")
+      run appendType(&result, owner, &mut out.*)
+    }
+    Type.CallableValue {application, ..} => {
+      run Bytes.append(&mut out.*, b"closure ")
+      let body = Shared<Application>.with<DeclarationId>(&application, fn(selected: &Application) -> DeclarationId {
+        return DeclarationId.copy(Application.bodyDeclaration(selected))
+      })
+      let name = run Mir.declarationName(&body)
+      run Bytes.append(&mut out.*, Bytes.asSlice(&name))
+    }
+    Type.CallableView {contract, ..} => run appendType(&contract, owner, &mut out.*)
+    Type.CallableOrigin {contract, ..} => run appendType(&contract, owner, &mut out.*)
+    Type.CallableStage {contract, ..} => run appendType(&contract, owner, &mut out.*)
+    Type.CallableResult {contract, ..} => run appendType(&contract, owner, &mut out.*)
+    Type.Effect {success, failure, ..} => {
+      run Bytes.append(&mut out.*, b"effect -> ")
+      run appendType(&success, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b" ! ")
+      run appendType(&failure, owner, &mut out.*)
+    }
+    Type.EffectComposite {operation, parts, contract, ..} => {
+      run Bytes.append(&mut out.*, compositionName(operation))
+      run Bytes.append(&mut out.*, b"(")
+      run appendTypes(List<Shared<Type>>.asSlice(&parts), b", ", owner, &mut out.*)
+      run Bytes.append(&mut out.*, b"): ")
+      run appendType(&contract, owner, &mut out.*)
+    }
+    Type.EffectJoin {contract, ..} => run appendType(&contract, owner, &mut out.*)
+    Type.CallableSchema {..} => run Bytes.append(&mut out.*, b"callable schema")
+    Type.CallableWitnessResult {..} => run Bytes.append(&mut out.*, b"callable witness")
+    Type.Vector {element, lanes} => {
+      run Bytes.append(&mut out.*, b"simd<")
+      run appendType(&element, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b", ")
+      run Bytes.append(&mut out.*, Bytes.asSlice(&lanes))
+      run Bytes.append(&mut out.*, b">")
+    }
+    Type.Primitive {name} => run Bytes.append(&mut out.*, Bytes.asSlice(&name))
+    Type.Unit => run Bytes.append(&mut out.*, b"()")
+  }
+  return ()
+}
+
+// The name of the Effect operation an Effect composite applies.
+fn compositionName(operation: Composition) -> &'static [u8] {
+  return match operation {
+    Composition.CatchFailure => b"catchFailure"
+    Composition.BindShared => b"bindShared"
+    Composition.BindExclusive => b"bindExclusive"
+    Composition.BindOwned => b"bindOwned"
+    Composition.Finalize => b"finalize"
+    Composition.FinalizeNonParking => b"finalizeNonParking"
+    Composition.UseRelease => b"useRelease"
+    Composition.Observe => b"observe"
+    Composition.Suspend => b"suspend"
+    Composition.Interrupt => b"interrupt"
+  }
+}
+
+// Appends `types` with `separator` between them.
+effect fn appendTypes(types: &[Shared<Type>], separator: &[u8], owner: &DeclarationId, out: &mut Bytes) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < types.length {
+    if at > usize.ZERO { run Bytes.append(&mut out.*, separator) }
+    run appendType(&types[at], owner, &mut out.*)
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Appends `<arguments>`, its type arguments spelled and any other argument as `_`; nothing
+// when there are none.
+effect fn appendArguments(arguments: &[Argument], owner: &DeclarationId, out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  if arguments.length == usize.ZERO { return () }
+  run Bytes.append(&mut out.*, b"<")
+  let mut at = usize.ZERO
+  while at < arguments.length {
+    if at > usize.ZERO { run Bytes.append(&mut out.*, b", ") }
+    match &arguments[at] {
+      Argument.Type {value} => run appendType(&value, owner, &mut out.*)
+      _ => run Bytes.append(&mut out.*, b"_")
+    }
+    at = at + usize.ONE
+  }
+  return run Bytes.append(&mut out.*, b">")
+}
+
+// Appends `module.Owner.name` of `declaration`.
+effect fn appendDeclaration(declaration: &Shared<DeclarationId>, out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  let copied = DeclarationId.copyShared(declaration)
+  let name = run Mir.declarationName(&copied)
+  return run Bytes.append(&mut out.*, Bytes.asSlice(&name))
+}
+
+// Appends the name of the instance `key` selects: a function with its type arguments, an export,
+// a type's drop glue, or a helper of its creator.
+effect fn appendKey(key: &InstanceKey, owner: &DeclarationId, out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  match &key.* {
+    InstanceKey.Function {application, ..} => {
+      run appendDeclaration(&InstanceKey.identity(key), &mut out.*)
+      // Region arguments have no type to print, so only the type arguments are listed.
+      let count = Shared<Application>.with<usize>(&application, Application.typeCount)
+      let mut written = usize.ZERO
+      let mut at = usize.ZERO
+      while at < count {
+        let argument = Shared<Application>.with<Option<Shared<Type>>>(&application, fn(selected: &Application) -> Option<Shared<Type>> {
+          return Application.typeAt(selected, at)
+        })
+        if let Option<Shared<Type>>.Some {value} = move argument {
+          if written == usize.ZERO { run Bytes.append(&mut out.*, b"<") } else { run Bytes.append(&mut out.*, b", ") }
+          run appendType(&value, owner, &mut out.*)
+          written = written + usize.ONE
+        }
+        at = at + usize.ONE
+      }
+      if written > usize.ZERO { run Bytes.append(&mut out.*, b">") }
+    }
+    InstanceKey.Export {function, symbol} => {
+      run appendDeclaration(&function, &mut out.*)
+      run Bytes.append(&mut out.*, b" as export ")
+      run appendSharedText(&symbol, &mut out.*)
+    }
+    InstanceKey.DropGlue {ty, ..} => {
+      run Bytes.append(&mut out.*, b"drop<")
+      run appendType(&ty, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b">")
+    }
+    InstanceKey.Helper {creator, node, ordinal, purpose} => {
+      run Bytes.append(&mut out.*, match purpose {
+        HelperRole.Start => b"start"
+        HelperRole.Notify => b"notify"
+        HelperRole.Observe => b"observe"
+      })
+      run Bytes.append(&mut out.*, b"#")
+      run appendDecimal(&mut out.*, usize.toU64(node))
+      run Bytes.append(&mut out.*, b".")
+      run appendDecimal(&mut out.*, usize.toU64(ordinal))
+      run Bytes.append(&mut out.*, b"[")
+      let created = Shared<InstanceKey>.with<InstanceKey>(&creator, InstanceKey.copy)
+      run appendKey(&created, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b"]")
+    }
+  }
+  return ()
+}
+
+// Appends the quoted text `shared` holds.
+effect fn appendSharedText(shared: &Shared<Bytes>, out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  let count = Shared<Bytes>.with<usize>(shared, fn(bytes: &Bytes) -> usize { return Bytes.asSlice(bytes).length })
+  let mut copied = run Bytes.zeroed(count)
+  let target = Bytes.asMutSlice(&mut copied)
+  Shared<Bytes>.with<()>(shared, fn(bytes: &Bytes) -> () {
+    return Slice.copyInto<u8>(move target, usize.ZERO, Bytes.asSlice(bytes))
+  })
+  return run appendQuoted(&mut out.*, Bytes.asSlice(&copied))
+}
+
+// Appends the comment that names what a local holds; nothing for a temporary.
+effect fn appendLocalKind(kind: &LocalKind, out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  match &kind.* {
+    LocalKind.Return => run Bytes.append(&mut out.*, b"  // return")
+    LocalKind.Parameter {index} => {
+      run Bytes.append(&mut out.*, b"  // parameter ")
+      run appendDecimal(&mut out.*, usize.toU64(index))
+    }
+    LocalKind.User {index} => {
+      run Bytes.append(&mut out.*, b"  // binding ")
+      run appendDecimal(&mut out.*, usize.toU64(index))
+    }
+    LocalKind.Temp => {}
+    LocalKind.Failure => run Bytes.append(&mut out.*, b"  // failure")
+    LocalKind.Provider {index} => {
+      run Bytes.append(&mut out.*, b"  // provider ")
+      run appendDecimal(&mut out.*, usize.toU64(index))
+    }
+    LocalKind.Observer => run Bytes.append(&mut out.*, b"  // observer")
+    LocalKind.Cause => run Bytes.append(&mut out.*, b"  // cause")
+    LocalKind.Site => run Bytes.append(&mut out.*, b"  // site")
+    LocalKind.DropFlag {local, path} => {
+      run Bytes.append(&mut out.*, b"  // drop flag of ")
+      run appendPlaceParts(local, List<Projection>.asSlice(&path), &mut out.*)
+    }
+  }
+  return ()
+}
+
+// Appends `_n` and each projection of `place`.
+effect fn appendPlace(place: &Place, out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run appendPlaceParts(place.local, List<Projection>.asSlice(&place.projections), &mut out.*)
+}
+
+// Appends `_root` and each of `steps`.
+effect fn appendPlaceParts(root: usize, steps: &[Projection], out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  run Bytes.append(&mut out.*, b"_")
+  run appendDecimal(&mut out.*, usize.toU64(root))
+  let mut at = usize.ZERO
+  while at < steps.length {
+    match &steps[at] {
+      Projection.Field {index} => {
+        run Bytes.append(&mut out.*, b".")
+        run appendDecimal(&mut out.*, usize.toU64(index))
+      }
+      Projection.Payload {index, ..} => {
+        run Bytes.append(&mut out.*, b" as #")
+        run appendDecimal(&mut out.*, usize.toU64(index))
+      }
+      Projection.VariantField {variant, field} => {
+        run Bytes.append(&mut out.*, b" as #")
+        run appendDecimal(&mut out.*, usize.toU64(variant))
+        run Bytes.append(&mut out.*, b".")
+        run appendDecimal(&mut out.*, usize.toU64(field))
+      }
+      Projection.Index {local} => {
+        run Bytes.append(&mut out.*, b"[_")
+        run appendDecimal(&mut out.*, usize.toU64(local))
+        run Bytes.append(&mut out.*, b"]")
+      }
+      Projection.ConstIndex {index} => {
+        run Bytes.append(&mut out.*, b"[")
+        run appendDecimal(&mut out.*, usize.toU64(index))
+        run Bytes.append(&mut out.*, b"]")
+      }
+      Projection.Deref => run Bytes.append(&mut out.*, b".*")
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn appendOperand(operand: &Operand, owner: &DeclarationId, out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  match &operand.* {
+    Operand.Copy {place} => {
+      run Bytes.append(&mut out.*, b"copy ")
+      run appendPlace(&place, &mut out.*)
+    }
+    Operand.Move {place} => {
+      run Bytes.append(&mut out.*, b"move ")
+      run appendPlace(&place, &mut out.*)
+    }
+    Operand.Integer {decimal, negative, ty} => {
+      if negative { run Bytes.append(&mut out.*, b"-") }
+      run Bytes.append(&mut out.*, Bytes.asSlice(&decimal))
+      run Bytes.append(&mut out.*, b"_")
+      run appendType(&ty, owner, &mut out.*)
+    }
+    Operand.Float {bits, ty} => {
+      run Bytes.append(&mut out.*, b"0x")
+      run appendHex(&mut out.*, bits)
+      run Bytes.append(&mut out.*, b"_")
+      run appendType(&ty, owner, &mut out.*)
+    }
+    Operand.Boolean {value} => {
+      if value { run Bytes.append(&mut out.*, b"true") } else { run Bytes.append(&mut out.*, b"false") }
+    }
+    Operand.Unit => run Bytes.append(&mut out.*, b"()")
+    Operand.StaticBytes {bytes} => {
+      run Bytes.append(&mut out.*, b"static b")
+      run appendQuoted(&mut out.*, Bytes.asSlice(&bytes))
+    }
+    Operand.StaticText {bytes} => {
+      run Bytes.append(&mut out.*, b"static ")
+      run appendQuoted(&mut out.*, Bytes.asSlice(&bytes))
+    }
+    Operand.StaticValue {ty, ..} => {
+      run Bytes.append(&mut out.*, b"static constant: ")
+      run appendType(&ty, owner, &mut out.*)
+    }
+    Operand.Null {ty} => {
+      run Bytes.append(&mut out.*, b"null: ")
+      run appendType(&ty, owner, &mut out.*)
+    }
+  }
+  return ()
+}
+
+// Appends `operands` separated by commas.
+effect fn appendOperands(operands: &List<Operand>, owner: &DeclarationId, out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  let listed = List<Operand>.asSlice(operands)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if at > usize.ZERO { run Bytes.append(&mut out.*, b", ") }
+    run appendOperand(&listed[at], owner, &mut out.*)
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Appends `{index: operand, ...}`.
+effect fn appendFields(fields: &List<AggregateField>, owner: &DeclarationId, out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  run Bytes.append(&mut out.*, b"{")
+  let listed = List<AggregateField>.asSlice(fields)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if at > usize.ZERO { run Bytes.append(&mut out.*, b", ") }
+    run appendDecimal(&mut out.*, usize.toU64(listed[at].index))
+    run Bytes.append(&mut out.*, b": ")
+    run appendOperand(&listed[at].value, owner, &mut out.*)
+    at = at + usize.ONE
+  }
+  return run Bytes.append(&mut out.*, b"}")
+}
+
+fn accessWord(access: Access) -> &'static [u8] {
+  return match access {
+    Access.Shared => b"&"
+    Access.Mutable => b"&mut "
+  }
+}
+
+fn prefixSpelling(operator: PrefixOperator) -> &'static [u8] {
+  return match operator {
+    PrefixOperator.Negate => b"-"
+    PrefixOperator.Not => b"!"
+    PrefixOperator.BitwiseNot => b"~"
+  }
+}
+
+fn infixSpelling(operator: InfixOperator) -> &'static [u8] {
+  return match operator {
+    InfixOperator.Add => b"+"
+    InfixOperator.Subtract => b"-"
+    InfixOperator.Multiply => b"*"
+    InfixOperator.Divide => b"/"
+    InfixOperator.Remainder => b"%"
+    InfixOperator.Equals => b"=="
+    InfixOperator.NotEquals => b"!="
+    InfixOperator.LessThan => b"<"
+    InfixOperator.LessOrEqual => b"<="
+    InfixOperator.GreaterThan => b">"
+    InfixOperator.GreaterOrEqual => b">="
+    InfixOperator.And => b"&&"
+    InfixOperator.Or => b"||"
+    InfixOperator.BitAnd => b"&"
+    InfixOperator.BitOr => b"|"
+    InfixOperator.BitXor => b"^"
+  }
+}
+
+fn scalarBinaryName(operation: ScalarBinary) -> &'static [u8] {
+  return match operation {
+    ScalarBinary.ShiftLeft => b"shiftLeft"
+    ScalarBinary.ShiftRight => b"shiftRight"
+    ScalarBinary.RotateLeft => b"rotateLeft"
+    ScalarBinary.RotateRight => b"rotateRight"
+    ScalarBinary.WrappingAdd => b"wrappingAdd"
+    ScalarBinary.WrappingSubtract => b"wrappingSubtract"
+    ScalarBinary.WrappingMultiply => b"wrappingMultiply"
+    ScalarBinary.SaturatingAdd => b"saturatingAdd"
+    ScalarBinary.SaturatingSubtract => b"saturatingSubtract"
+    ScalarBinary.SaturatingMultiply => b"saturatingMultiply"
+    ScalarBinary.MultiplyHigh => b"multiplyHigh"
+    ScalarBinary.TotalOrder => b"totalOrder"
+    ScalarBinary.AddOverflows => b"addOverflows"
+    ScalarBinary.SubtractOverflows => b"subtractOverflows"
+    ScalarBinary.MultiplyOverflows => b"multiplyOverflows"
+    ScalarBinary.DivisionUndefined => b"divisionUndefined"
+  }
+}
+
+fn scalarUnaryName(operation: ScalarUnary) -> &'static [u8] {
+  return match operation {
+    ScalarUnary.IsNaN => b"isNaN"
+    ScalarUnary.IsInfinite => b"isInfinite"
+    ScalarUnary.IsFinite => b"isFinite"
+    ScalarUnary.IsNormal => b"isNormal"
+    ScalarUnary.IsSubnormal => b"isSubnormal"
+    ScalarUnary.IsSignNegative => b"isSignNegative"
+    ScalarUnary.Sqrt => b"sqrt"
+  }
+}
+
+// Appends `name(operand, ...)`.
+effect fn appendCall(name: &[u8], operands: &List<Operand>, owner: &DeclarationId, out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  run Bytes.append(&mut out.*, name)
+  run Bytes.append(&mut out.*, b"(")
+  run appendOperands(operands, owner, &mut out.*)
+  return run Bytes.append(&mut out.*, b")")
+}
+
+effect fn appendRvalue(value: &Rvalue, owner: &DeclarationId, out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  match &value.* {
+    Rvalue.Aggregate {fields} => run appendFields(&fields, owner, &mut out.*)
+    Rvalue.Slice {data, count} => {
+      run Bytes.append(&mut out.*, b"slice(")
+      run appendOperand(&data, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b", ")
+      run appendOperand(&count, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b")")
+    }
+    Rvalue.SliceLength {place} => {
+      run Bytes.append(&mut out.*, b"length(")
+      run appendPlace(&place, &mut out.*)
+      run Bytes.append(&mut out.*, b")")
+    }
+    Rvalue.SliceData {place} => {
+      run Bytes.append(&mut out.*, b"data(")
+      run appendPlace(&place, &mut out.*)
+      run Bytes.append(&mut out.*, b")")
+    }
+    Rvalue.PointerOffset {pointer, index, element} => {
+      run Bytes.append(&mut out.*, b"offset<")
+      run appendType(&element, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b">(")
+      run appendOperand(&pointer, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b", ")
+      run appendOperand(&index, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b")")
+    }
+    Rvalue.Use {value: used} => run appendOperand(&used, owner, &mut out.*)
+    Rvalue.Ref {access, place} => {
+      run Bytes.append(&mut out.*, accessWord(access))
+      run appendPlace(&place, &mut out.*)
+    }
+    Rvalue.AddressOf {access, place} => {
+      run Bytes.append(&mut out.*, b"address ")
+      run Bytes.append(&mut out.*, accessWord(access))
+      run appendPlace(&place, &mut out.*)
+    }
+    Rvalue.Unary {operation, value: used} => {
+      run Bytes.append(&mut out.*, prefixSpelling(operation))
+      run appendOperand(&used, owner, &mut out.*)
+    }
+    Rvalue.Binary {operation, left, right} => {
+      run appendOperand(&left, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b" ")
+      run Bytes.append(&mut out.*, infixSpelling(operation))
+      run Bytes.append(&mut out.*, b" ")
+      run appendOperand(&right, owner, &mut out.*)
+    }
+    Rvalue.ScalarBinary {operation, left, right} => {
+      run Bytes.append(&mut out.*, scalarBinaryName(operation))
+      run Bytes.append(&mut out.*, b"(")
+      run appendOperand(&left, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b", ")
+      run appendOperand(&right, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b")")
+    }
+    Rvalue.ScalarUnary {operation, value: used} => {
+      run Bytes.append(&mut out.*, scalarUnaryName(operation))
+      run Bytes.append(&mut out.*, b"(")
+      run appendOperand(&used, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b")")
+    }
+    Rvalue.Convert {value: used, ty} => {
+      run appendOperand(&used, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b" as ")
+      run appendType(&ty, owner, &mut out.*)
+    }
+    Rvalue.Fits {value: used, ty} => {
+      run Bytes.append(&mut out.*, b"fits<")
+      run appendType(&ty, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b">(")
+      run appendOperand(&used, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b")")
+    }
+    Rvalue.AddressIntegerConversion {operand, destinationType} => {
+      run appendOperand(&operand, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b" as address ")
+      run appendType(&destinationType, owner, &mut out.*)
+    }
+    Rvalue.Bitcast {value: used, ty} => {
+      run Bytes.append(&mut out.*, b"bitcast<")
+      run appendType(&ty, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b">(")
+      run appendOperand(&used, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b")")
+    }
+    Rvalue.Discriminant {place} => {
+      run Bytes.append(&mut out.*, b"discriminant(")
+      run appendPlace(&place, &mut out.*)
+      run Bytes.append(&mut out.*, b")")
+    }
+    Rvalue.Inject {tag, value: used} => {
+      run Bytes.append(&mut out.*, b"#")
+      run appendDecimal(&mut out.*, usize.toU64(tag))
+      run Bytes.append(&mut out.*, b"(")
+      run appendOperand(&used, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b")")
+    }
+    Rvalue.Variant {tag, fields} => {
+      run Bytes.append(&mut out.*, b"#")
+      run appendDecimal(&mut out.*, usize.toU64(tag))
+      run Bytes.append(&mut out.*, b" ")
+      run appendFields(&fields, owner, &mut out.*)
+    }
+    Rvalue.FunctionAddress {key} => {
+      run Bytes.append(&mut out.*, b"address fn ")
+      run appendKey(&key, owner, &mut out.*)
+    }
+    Rvalue.ContextOf {place} => {
+      run Bytes.append(&mut out.*, b"context(")
+      run appendPlace(&place, &mut out.*)
+      run Bytes.append(&mut out.*, b")")
+    }
+    Rvalue.ContextHandle {address} => {
+      run Bytes.append(&mut out.*, b"contextHandle(")
+      run appendOperand(&address, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b")")
+    }
+    Rvalue.ForeignStatic {declaration, address} => {
+      if address { run Bytes.append(&mut out.*, b"address ") }
+      run Bytes.append(&mut out.*, b"extern static ")
+      run appendDeclaration(&declaration, &mut out.*)
+    }
+    Rvalue.RunningPackage => run Bytes.append(&mut out.*, b"runningPackage")
+    Rvalue.FrameAddress => run Bytes.append(&mut out.*, b"frameAddress")
+    Rvalue.ProcessWord => run Bytes.append(&mut out.*, b"processWord")
+    Rvalue.StackAllocate {count, element} => {
+      run Bytes.append(&mut out.*, b"stackAllocate<")
+      run appendType(&element, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b">(")
+      run appendOperand(&count, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b")")
+    }
+    Rvalue.Wasm {primitive, operands} => run appendCall(CheckedIntrinsic.spelling(primitive), &operands, owner, &mut out.*)
+    Rvalue.Fill {byte} => {
+      run Bytes.append(&mut out.*, b"fill(")
+      run appendDecimal(&mut out.*, u8.toU64(byte))
+      run Bytes.append(&mut out.*, b")")
+    }
+    Rvalue.Assembly {..} => run Bytes.append(&mut out.*, b"assembly")
+    Rvalue.Atomic {primitive, operands, success, failure, ..} => {
+      run appendCall(CheckedIntrinsic.spelling(primitive), &operands, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b" ")
+      run Bytes.append(&mut out.*, CheckedIntrinsic.memoryOrderSpelling(success))
+      if failure != success {
+        run Bytes.append(&mut out.*, b" ")
+        run Bytes.append(&mut out.*, CheckedIntrinsic.memoryOrderSpelling(failure))
+      }
+    }
+    Rvalue.Vector {primitive, operands, ..} => run appendCall(CheckedIntrinsic.spelling(primitive), &operands, owner, &mut out.*)
+  }
+  return ()
+}
+
+effect fn appendStatement(statement: &Statement, owner: &DeclarationId, out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  match &statement.* {
+    Statement.Assign {destination, value, ..} => {
+      run appendPlace(&destination, &mut out.*)
+      run Bytes.append(&mut out.*, b" = ")
+      run appendRvalue(&value, owner, &mut out.*)
+    }
+    Statement.Drop {destination, glue, ..} => {
+      run Bytes.append(&mut out.*, b"drop ")
+      run appendPlace(&destination, &mut out.*)
+      run Bytes.append(&mut out.*, b" with ")
+      run appendKey(&glue, owner, &mut out.*)
+    }
+    Statement.FailureContext {destination, source, ..} => {
+      run Bytes.append(&mut out.*, b"context(")
+      run appendPlace(&destination, &mut out.*)
+      run Bytes.append(&mut out.*, b") = ")
+      if let Option<Place>.Some {value} = &source {
+        run Bytes.append(&mut out.*, b"context(")
+        run appendPlace(&value, &mut out.*)
+        run Bytes.append(&mut out.*, b")")
+      } else {
+        run Bytes.append(&mut out.*, b"origin")
+      }
+    }
+    Statement.SetContextHandle {address, value, ..} => {
+      run Bytes.append(&mut out.*, b"contextHandle(")
+      run appendOperand(&address, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b") = ")
+      run appendOperand(&value, owner, &mut out.*)
+    }
+  }
+  return ()
+}
+
+effect fn appendBlockName(out: &mut Bytes, block: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  run Bytes.append(&mut out.*, b"bb")
+  return run appendDecimal(&mut out.*, usize.toU64(block))
+}
+
+effect fn appendCallee(callee: &Callee, owner: &DeclarationId, out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  match &callee.* {
+    Callee.Instance {key} => run appendKey(&key, owner, &mut out.*)
+    Callee.Extern {declaration, ..} => {
+      run Bytes.append(&mut out.*, b"extern ")
+      run appendDeclaration(&declaration, &mut out.*)
+    }
+    Callee.Indirect {address} => {
+      run Bytes.append(&mut out.*, b"(")
+      run appendOperand(&address, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b")")
+    }
+    Callee.NativeIndirect {address, ..} => {
+      run Bytes.append(&mut out.*, b"extern (")
+      run appendOperand(&address, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b")")
+    }
+  }
+  return ()
+}
+
+effect fn appendTerminator(terminator: &Terminator, owner: &DeclarationId, out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  match &terminator.* {
+    Terminator.Goto {target, ..} => {
+      run Bytes.append(&mut out.*, b"goto ")
+      run appendBlockName(&mut out.*, target)
+    }
+    Terminator.Branch {condition, thenBlock, elseBlock, ..} => {
+      run Bytes.append(&mut out.*, b"branch ")
+      run appendOperand(&condition, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b" ? ")
+      run appendBlockName(&mut out.*, thenBlock)
+      run Bytes.append(&mut out.*, b" : ")
+      run appendBlockName(&mut out.*, elseBlock)
+    }
+    Terminator.Return {..} => run Bytes.append(&mut out.*, b"return")
+    Terminator.Call {callee, arguments, providers, destination, normal, failure, ..} => {
+      run appendPlace(&destination, &mut out.*)
+      run Bytes.append(&mut out.*, b" = call ")
+      run appendCallee(&callee, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b"(")
+      run appendOperands(&arguments, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b")")
+      if List<Operand>.length(&providers) > usize.ZERO {
+        run Bytes.append(&mut out.*, b" providing (")
+        run appendOperands(&providers, owner, &mut out.*)
+        run Bytes.append(&mut out.*, b")")
+      }
+      run Bytes.append(&mut out.*, b" -> ")
+      run appendBlockName(&mut out.*, normal)
+      if let Option<Mir.FailureEdge>.Some {value} = &failure {
+        run Bytes.append(&mut out.*, b", fail ")
+        run appendPlace(&value.destination, &mut out.*)
+        run Bytes.append(&mut out.*, b" -> ")
+        run appendBlockName(&mut out.*, value.target)
+      }
+    }
+    Terminator.Fail {..} => run Bytes.append(&mut out.*, b"fail")
+    Terminator.Trap {reason, ..} => {
+      run Bytes.append(&mut out.*, b"trap ")
+      run appendQuoted(&mut out.*, Mir.trapReasonText(reason))
+    }
+    Terminator.TrapText {reason, ..} => {
+      run Bytes.append(&mut out.*, b"trap ")
+      run appendOperand(&reason, owner, &mut out.*)
+    }
+    Terminator.Unreachable {..} => run Bytes.append(&mut out.*, b"unreachable")
+    Terminator.Switch {value, cases, otherwise, ..} => {
+      run Bytes.append(&mut out.*, b"switch ")
+      run appendOperand(&value, owner, &mut out.*)
+      run Bytes.append(&mut out.*, b" [")
+      let listed = List<SwitchCase>.asSlice(&cases)
+      let mut at = usize.ZERO
+      while at < listed.length {
+        if listed[at].negative { run Bytes.append(&mut out.*, b"-") }
+        run Bytes.append(&mut out.*, Bytes.asSlice(&listed[at].decimal))
+        run Bytes.append(&mut out.*, b" -> ")
+        run appendBlockName(&mut out.*, listed[at].target)
+        run Bytes.append(&mut out.*, b", ")
+        at = at + usize.ONE
+      }
+      run Bytes.append(&mut out.*, b"otherwise -> ")
+      run appendBlockName(&mut out.*, otherwise)
+      run Bytes.append(&mut out.*, b"]")
+    }
+    Terminator.Relinquish {resume, ..} => {
+      run Bytes.append(&mut out.*, b"relinquish -> ")
+      run appendBlockName(&mut out.*, resume)
+    }
+    Terminator.Abandon {..} => run Bytes.append(&mut out.*, b"abandon")
+  }
+  return ()
+}

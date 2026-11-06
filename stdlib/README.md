@@ -19,7 +19,7 @@ The compression modules cover the formats in Zig's `lib/std/compress` (reference
 | Raw LZMA2 | — | `silk.compress.lzma2.Lzma2.decode` |
 | XZ (`.xz`, single LZMA2 filter per block) | — | `silk.compress.xz.Xz.decode` |
 | Zstandard | `silk.compress.zstd_encode.ZstdEncoder` | `silk.compress.zstd.Zstd` |
-| Brotli | — | `silk.compress.brotli.Brotli` |
+| Brotli | `silk.compress.brotli_encode.BrotliEncoder` | `silk.compress.brotli.Brotli` |
 
 DEFLATE encoding follows zlib: levels 0 to 9, its strategies and flush modes, preset dictionaries,
 and stored, fixed, or dynamic Huffman blocks, with raw, zlib, or deterministic gzip framing.
@@ -32,6 +32,13 @@ Zstandard encoding covers levels 1 to 22 with the reference `zstd` parameters an
 (hash tables, lazy hash chains, binary trees, and the optimal parser), in steps with flushes, an
 optional checksum, and the content size. Its frames decode with the reference `zstd` and are
 within about 1% of its size at each level, but are not the same bytes that it writes.
+
+Brotli encoding covers qualities 0 to 11: the bucket hashers and lazy matching of the reference
+`brotli` up to quality 9, and its binary tree hasher, shortest path search, static dictionary
+matches, and literal block splitting at 10 and 11, in steps with flushes. From quality 5
+literals have prefix codes for clusters of their contexts, and commands and distances are split
+into block types. Its streams decode with the reference `brotli` and are within about 1% of its
+size from quality 8, and within about 2.5% at the others.
 
 The Brotli decoder covers all of RFC 7932, including the static dictionary and its word
 transforms, and decodes incrementally into a window it allocates once. Regenerate its dictionary

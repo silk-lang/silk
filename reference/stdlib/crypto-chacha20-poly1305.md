@@ -16,8 +16,11 @@ but not encrypted. The ciphertext has the same length as the plaintext. Nothing 
 
 For data that arrives in parts, such as a Node.js `createCipheriv("chacha20-poly1305")` call,
 use [`ChaCha20Poly1305Encryptor`](#ChaCha20Poly1305Encryptor) and [`ChaCha20Poly1305Decryptor`](#ChaCha20Poly1305Decryptor). They take the message in
-any split, give the same result, and can write a truncated tag. [`ChaCha20`](#ChaCha20) is the raw stream
-cipher without authentication, for formats that name it.
+any split, give the same result, and can write or check a truncated tag of 1 to 16 bytes.
+[`ChaCha20`](#ChaCha20) is the raw stream cipher without authentication, for formats that name it.
+
+ChaCha20 runs four blocks at a time in 128-bit vectors, and eight at a time with AVX2 when an
+x86-64 machine has it, checked at run time. Poly1305 keeps its accumulator in 64-bit words.
 
 ## Errors
 The functions return an [`AeadError`](#AeadError). All checks come before the first write, and on any error
