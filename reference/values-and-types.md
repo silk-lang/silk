@@ -1764,8 +1764,9 @@ and uncovered members. Ownership diagnostics still apply when moving an affine p
 
 A structural union conforms to an interface when every member conforms to it and every operation
 of the interface receives `self` through `&Self` or `&mut Self` and names `Self` in no other
-parameter, its result or its failure. A call on the union runs the active member's operation with
-the remaining arguments unchanged.
+parameter, its result or its failure. A service operation that requires its own service once
+receives its provider that way, so a union provides a service whose members all do. A call on the
+union runs the active member's operation with the remaining arguments unchanged.
 
 ```silk
 import silk.mem.allocator { OutOfMemoryError }
