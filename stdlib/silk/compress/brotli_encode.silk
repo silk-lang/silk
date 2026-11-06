@@ -6,14 +6,16 @@
 //! Decode with `silk.compress.brotli.Brotli`.
 //!
 //! # Details
-//! The encoder finds matches with the bucket hash tables of the reference `brotli` (more and
-//! longer buckets as the quality rises), checks the recent distances first, and looks one or more
-//! bytes ahead for a better match from quality 2. Each meta-block gets its own prefix codes for
-//! literals, commands, and distances. A meta-block that does not shrink is stored uncompressed.
+//! Up to quality 9 the encoder finds matches with the bucket hash tables of the reference
+//! `brotli` (more and longer buckets as the quality rises), checks the recent distances first, and
+//! looks one or more bytes ahead for a better match from quality 2. Qualities 10 and 11 collect
+//! all matches from a binary tree and choose the commands with the shortest path search of the
+//! reference, priced by estimated literal costs, and at quality 11 a second time with the costs of
+//! the first result. Each meta-block gets its own prefix codes for literals, commands, and
+//! distances. A meta-block that does not shrink is stored uncompressed.
 //! [`BrotliEncoder.make`] allocates all storage one time. Later calls do not allocate and do not
 //! keep a borrow of your buffers. The output is deterministic but is not the same bytes that the
-//! reference `brotli` writes, and it is larger at qualities 10 and 11, which the reference
-//! compresses with a slower optimal parser.
+//! reference `brotli` writes.
 //!
 //! # Examples
 //! ## Compress a buffer
@@ -49,6 +51,7 @@ import silk.num.u8
 import silk.num.u32
 import silk.num.u64
 import silk.num.usize
+import silk.num.f64
 import silk.io.writer { Writer, WriterError }
 
 /// What a call to [`BrotliEncoder.step`] must finish before it returns.
@@ -165,10 +168,12 @@ impl BrotliOptions {
 ///
 /// # Details
 /// [`BrotliEncoder.make`] allocates all storage one time: twice the window or twice the
-/// meta-block (64 KiB to 256 KiB), whichever is larger, the hash buckets (256 KiB at quality 0, 32
-/// MiB at qualities 9 and 10, and 64 MiB at 11, less when the window is small), and about two
-/// meta-blocks of command and output buffers. Later calls do not allocate and do not keep a borrow
-/// of your buffers, so you can move the encoder between threads between calls.
+/// meta-block (64 KiB to 256 KiB), whichever is larger, and about two meta-blocks of command and
+/// output buffers. Up to quality 9 it adds the hash buckets (512 KiB at quality 0 and 32 MiB at 9,
+/// less when the window is small). Qualities 10 and 11 add one more window, a binary tree of 8
+/// bytes for each byte of the window, and about 17 MiB for matches and the shortest path search.
+/// Later calls do not allocate and do not keep a borrow of your buffers, so you can move the
+/// encoder between threads between calls.
 pub struct BrotliEncoder {
   quality: u32,
   windowBits: u32,
@@ -181,6 +186,34 @@ pub struct BrotliEncoder {
   rowSize: u32,
   lastDistances: usize,
   lazy: bool,
+  zopfli: bool,
+  zopfliRounds: u32,
+  zopfliStarts: usize,
+  zopfliLongest: usize,
+  shortReach: usize,
+  windowMask: usize,
+  heads: List<u32>,
+  forest: List<u32>,
+  matchDistance: List<u32>,
+  matchLength: List<u32>,
+  matchCount: List<u32>,
+  nodeLength: List<u32>,
+  nodeDistance: List<u32>,
+  nodeInsert: List<u32>,
+  nodeShortcut: List<u32>,
+  nodeNext: List<u32>,
+  nodeCost: List<f64>,
+  literalCosts: List<f64>,
+  byteCosts: List<f64>,
+  commandCosts: List<f64>,
+  distanceCosts: List<f64>,
+  minCommandCost: f64,
+  queuePosition: [usize; 8],
+  queueCost: [f64; 8],
+  queueDifference: [f64; 8],
+  queueCache: [usize; 32],
+  queueSize: usize,
+  matchUsed: usize,
   buffer: List<u8>,
   capacity: usize,
   bufferEnd: usize,
@@ -225,15 +258,39 @@ pub struct BrotliEncoder {
 
 // Hash buckets by quality: the base-2 logarithm of the bucket count and of the positions that
 // each bucket remembers, as the reference hashers H2 to H6 use them.
-const BUCKET_BITS: [u32; 12] = [16, 16, 16, 16, 17, 14, 14, 15, 15, 15, 15, 16]
+const BUCKET_BITS: [u32; 12] = [16, 16, 16, 16, 17, 14, 14, 15, 15, 15, 0, 0]
 
-const BLOCK_BITS: [u32; 12] = [0, 0, 0, 1, 2, 4, 5, 6, 7, 8, 8, 8]
+const BLOCK_BITS: [u32; 12] = [0, 0, 0, 1, 2, 4, 5, 6, 7, 8, 0, 0]
 
 // The recent distances (with the variations of the last two) that each search tries first.
 const LAST_DISTANCES: [u32; 12] = [1, 1, 4, 4, 4, 4, 4, 10, 10, 16, 16, 16]
 
 // The base-2 logarithm of the meta-block size by quality.
 const BLOCK_LOGS: [u32; 12] = [16, 16, 16, 16, 17, 17, 17, 17, 18, 18, 18, 18]
+
+// Qualities 10 and 11 parse each meta-block with the shortest path search of the reference
+// `brotli` (its "Zopfli" parser) over all matches from a binary tree hasher (H10).
+const ZOPFLI_ROUNDS: [u32; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2]
+
+// How many of the cheapest literal run starts each position tries.
+const ZOPFLI_STARTS: [u32; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 5]
+
+// Matches longer than this are taken whole and the positions that they cover are skipped.
+const ZOPFLI_LONGEST: [u32; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 150, 325]
+
+// The distances that the search scans byte by byte for matches of 2 and 3 bytes.
+const SHORT_REACH: [u32; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 64]
+
+const TREE_BITS: u32 = 17
+
+const TREE_DEPTH: u32 = 64
+
+const TREE_COMPARE: usize = 128
+
+// The matches stored for each position on average; a position past that keeps only its longest.
+const MATCH_POOL: usize = 4
+
+const NO_COST: f64 = 1e30
 
 const MIN_SCORE: u64 = 2020
 
@@ -405,10 +462,52 @@ impl BrotliEncoder {
     if span < blockSize {
       span = blockSize
     }
-    let capacity = 2 * span
+    let zopfli = quality >= 10
+    let mut capacity = 2 * span
+    let mut bucketCount = usize.shiftLeft(1, u32.toUsize(bucketBits))
+    let mut treeHeads: usize = 0
+    let mut treeNodes: usize = 0
+    let mut positions: usize = 0
+    if zopfli {
+      // Slides keep tree slots in place by moving whole windows, which needs one window more.
+      capacity = capacity + windowSize
+      bucketCount = 0
+      treeHeads = usize.shiftLeft(1, u32.toUsize(TREE_BITS))
+      treeNodes = 2 * windowSize
+      positions = blockSize + 1
+    }
+    let mut heads = List<u32>.make()
+    run List<u32>.appendRepeated(&mut heads, 0, treeHeads)
+    let mut forest = List<u32>.make()
+    run List<u32>.appendRepeated(&mut forest, 0, treeNodes)
+    let mut matchDistance = List<u32>.make()
+    run List<u32>.appendRepeated(&mut matchDistance, 0, MATCH_POOL * positions)
+    let mut matchLength = List<u32>.make()
+    run List<u32>.appendRepeated(&mut matchLength, 0, MATCH_POOL * positions)
+    let mut matchCount = List<u32>.make()
+    run List<u32>.appendRepeated(&mut matchCount, 0, positions)
+    let mut nodeLength = List<u32>.make()
+    run List<u32>.appendRepeated(&mut nodeLength, 0, positions)
+    let mut nodeDistance = List<u32>.make()
+    run List<u32>.appendRepeated(&mut nodeDistance, 0, positions)
+    let mut nodeInsert = List<u32>.make()
+    run List<u32>.appendRepeated(&mut nodeInsert, 0, positions)
+    let mut nodeShortcut = List<u32>.make()
+    run List<u32>.appendRepeated(&mut nodeShortcut, 0, positions)
+    let mut nodeNext = List<u32>.make()
+    run List<u32>.appendRepeated(&mut nodeNext, 0, positions)
+    let mut nodeCost = List<f64>.make()
+    run List<f64>.appendRepeated(&mut nodeCost, 0.0, positions)
+    let mut literalCosts = List<f64>.make()
+    run List<f64>.appendRepeated(&mut literalCosts, 0.0, positions)
+    let mut byteCosts = List<f64>.make()
+    run List<f64>.appendRepeated(&mut byteCosts, 0.0, LITERAL_ALPHABET)
+    let mut commandCosts = List<f64>.make()
+    run List<f64>.appendRepeated(&mut commandCosts, 0.0, COMMAND_ALPHABET)
+    let mut distanceCosts = List<f64>.make()
+    run List<f64>.appendRepeated(&mut distanceCosts, 0.0, DISTANCE_ALPHABET)
     let mut buffer = List<u8>.make()
     run List<u8>.appendRepeated(&mut buffer, 0, capacity + BUFFER_PADDING)
-    let bucketCount = usize.shiftLeft(1, u32.toUsize(bucketBits))
     let mut buckets = List<u32>.make()
     run List<u32>.appendRepeated(
       &mut buckets,
@@ -476,6 +575,34 @@ impl BrotliEncoder {
       rowSize: u32.shiftLeft(1, blockBits),
       lastDistances: u32.toUsize(LAST_DISTANCES[index]),
       lazy: quality >= 2,
+      zopfli: zopfli,
+      zopfliRounds: ZOPFLI_ROUNDS[index],
+      zopfliStarts: u32.toUsize(ZOPFLI_STARTS[index]),
+      zopfliLongest: u32.toUsize(ZOPFLI_LONGEST[index]),
+      shortReach: u32.toUsize(SHORT_REACH[index]),
+      windowMask: windowSize - 1,
+      heads: move heads,
+      forest: move forest,
+      matchDistance: move matchDistance,
+      matchLength: move matchLength,
+      matchCount: move matchCount,
+      nodeLength: move nodeLength,
+      nodeDistance: move nodeDistance,
+      nodeInsert: move nodeInsert,
+      nodeShortcut: move nodeShortcut,
+      nodeNext: move nodeNext,
+      nodeCost: move nodeCost,
+      literalCosts: move literalCosts,
+      byteCosts: move byteCosts,
+      commandCosts: move commandCosts,
+      distanceCosts: move distanceCosts,
+      minCommandCost: 0.0,
+      queuePosition: [0; 8],
+      queueCost: [0.0; 8],
+      queueDifference: [0.0; 8],
+      queueCache: [0; 32],
+      queueSize: 0,
+      matchUsed: 0,
       buffer: move buffer,
       capacity: capacity,
       bufferEnd: 0,
@@ -534,6 +661,12 @@ impl BrotliEncoder {
     index = 0
     while index < buckets.length {
       buckets[index] = 0
+      index = index + 1
+    }
+    let heads = List<u32>.asMutSlice(&mut self.heads)
+    index = 0
+    while index < heads.length {
+      heads[index] = 0
       index = index + 1
     }
     self.bufferEnd = 0
@@ -772,7 +905,10 @@ fn fill(state: &mut BrotliEncoder, input: &[u8]) -> () {
 // Keeps the last window of history before the uncompressed bytes and moves the bucket positions
 // with it. Positions that fall out of the buffer become empty.
 fn slide(state: &mut BrotliEncoder) -> () {
-  let shift = state.compressedEnd - state.windowSize
+  let mut shift = state.compressedEnd - state.windowSize
+  if state.zopfli {
+    shift = shift - usize.remainder(shift, state.windowSize)
+  }
   let buffer = List<u8>.asMutSlice(&mut state.buffer)
   let moved = state.bufferEnd - shift
   let mut index: usize = 0
@@ -788,8 +924,14 @@ fn slide(state: &mut BrotliEncoder) -> () {
     state.stitchFrom = 0
   }
   let offset = usize.toU32(shift)
-  let table = List<u32>.asMutSlice(&mut state.buckets)
-  index = 0
+  lower(List<u32>.asMutSlice(&mut state.buckets), offset)
+  lower(List<u32>.asMutSlice(&mut state.heads), offset)
+  lower(List<u32>.asMutSlice(&mut state.forest), offset)
+}
+
+// Moves the positions (plus 1) of a table down by `offset`, and empties those below it.
+fn lower(table: &mut [u32], offset: u32) -> () {
+  let mut index: usize = 0
   while index < table.length {
     let stored = table[index]
     if stored > offset {
@@ -1884,8 +2026,12 @@ fn compressBlock(state: &mut BrotliEncoder, size: usize, last: bool) -> () {
   let start = state.compressedEnd
   let end = start + size
   let savedCache = state.distanceCache
-  stitch(&mut state, start)
-  createCommands(&mut state, start, end)
+  if state.zopfli {
+    zopfliCommands(&mut state, start, end)
+  } else {
+    stitch(&mut state, start)
+    createCommands(&mut state, start, end)
+  }
   countSymbols(&mut state, start)
   let savedBuffer = state.bitBuffer
   let savedCount = state.bitCount
@@ -1991,4 +2137,712 @@ fn store64(buffer: &mut List<u8>, at: usize, value: u64) -> () {
   bytes[5] = u64.wrappingToU8(u64.shiftRight(value, 40))
   bytes[6] = u64.wrappingToU8(u64.shiftRight(value, 48))
   bytes[7] = u64.wrappingToU8(u64.shiftRight(value, 56))
+}
+
+// The base-2 logarithm of `value`, at least 1.
+fn log2Of(value: usize) -> f64 {
+  return f64.log(usize.toF64(value)) * 1.4426950408889634
+}
+
+// Searches the binary tree of the bucket of `position` (hasher H10 of the reference `brotli`)
+// and re-roots it at `position` when at least `TREE_COMPARE` bytes follow. With `collect`, each
+// match longer than `best` goes to the match pool. Returns the longest match length found.
+fn treeSearch(
+  state: &mut BrotliEncoder,
+  position: usize,
+  maxLength: usize,
+  maxDistance: usize,
+  collect: bool,
+  best: usize,
+) -> usize {
+  let buffer = List<u8>.asSlice(&state.buffer)
+  let mut maxCompare = maxLength
+  if maxCompare > TREE_COMPARE {
+    maxCompare = TREE_COMPARE
+  }
+  let reroot = maxLength >= TREE_COMPARE
+  let mask = state.windowMask
+  let key = hashAt(buffer, position, TREE_BITS)
+  let heads = List<u32>.asMutSlice(&mut state.heads)
+  let forest = List<u32>.asMutSlice(&mut state.forest)
+  let distances = List<u32>.asMutSlice(&mut state.matchDistance)
+  let lengths = List<u32>.asMutSlice(&mut state.matchLength)
+  let mut stored = u32.toUsize(heads[key])
+  if reroot {
+    heads[key] = usize.wrappingToU32(position + 1)
+  }
+  let mut nodeLeft = 2 * (position & mask)
+  let mut nodeRight = nodeLeft + 1
+  let mut bestLeft: usize = 0
+  let mut bestRight: usize = 0
+  let mut longest = best
+  let mut depth = TREE_DEPTH
+  while true {
+    let mut distance: usize = 0
+    if stored != 0 && stored <= position {
+      distance = position - (stored - 1)
+    }
+    if distance == 0 || distance > maxDistance || depth == 0 {
+      if reroot {
+        forest[nodeLeft] = 0
+        forest[nodeRight] = 0
+      }
+      break
+    }
+    let earlier = stored - 1
+    let mut known = bestLeft
+    if known > bestRight {
+      known = bestRight
+    }
+    let length = known + commonLength(buffer, earlier + known, position + known, maxLength - known)
+    if collect && length > longest {
+      longest = length
+      let slot = state.matchUsed
+      distances[slot] = usize.toU32(distance)
+      lengths[slot] = usize.toU32(length)
+      state.matchUsed = slot + 1
+    }
+    let earlierSlot = 2 * (earlier & mask)
+    if length >= maxCompare {
+      if reroot {
+        forest[nodeLeft] = forest[earlierSlot]
+        forest[nodeRight] = forest[earlierSlot + 1]
+      }
+      break
+    }
+    if buffer[position + length] > buffer[earlier + length] {
+      bestLeft = length
+      if reroot {
+        forest[nodeLeft] = u32.wrappingAdd(usize.wrappingToU32(earlier), 1)
+      }
+      nodeLeft = earlierSlot + 1
+      stored = u32.toUsize(forest[nodeLeft])
+    } else {
+      bestRight = length
+      if reroot {
+        forest[nodeRight] = u32.wrappingAdd(usize.wrappingToU32(earlier), 1)
+      }
+      nodeRight = earlierSlot
+      stored = u32.toUsize(forest[nodeRight])
+    }
+    depth = depth - 1
+  }
+  return longest
+}
+
+// Adds `position`, which has `TREE_COMPARE` bytes after it, to the tree without collecting.
+fn treeStore(state: &mut BrotliEncoder, position: usize) -> () {
+  let reach = state.maxDistance
+  drop treeSearch(&mut state, position, TREE_COMPARE, reach, false, 0)
+}
+
+// Adds the positions from `from` to `to` to the tree, sparsely when the range is long, as the
+// reference `StoreRangeH10` does.
+fn treeStoreRange(state: &mut BrotliEncoder, from: usize, to: usize) -> () {
+  let mut dense = from
+  if from + 63 <= to {
+    dense = to - 63
+  }
+  if from + 512 <= dense {
+    let mut sparse = from
+    while sparse < dense {
+      treeStore(&mut state, sparse)
+      sparse = sparse + 8
+    }
+  }
+  while dense < to {
+    treeStore(&mut state, dense)
+    dense = dense + 1
+  }
+}
+
+// Collects the matches at `position` with increasing length into the pool: short matches at the
+// nearest distances, then the tree matches, as the reference `FindAllMatchesH10` does. Returns
+// how many it collected.
+fn findAllMatches(
+  state: &mut BrotliEncoder,
+  position: usize,
+  maxLength: usize,
+  maxDistance: usize,
+) -> usize {
+  let first = state.matchUsed
+  let mut best: usize = 1
+  let mut stop: usize = 0
+  if position > state.shortReach {
+    stop = position - state.shortReach
+  }
+  if position > 0 {
+    let mut earlier = position - 1
+    while earlier > stop && best <= 2 {
+      let distance = position - earlier
+      if distance > maxDistance {
+        break
+      }
+      let buffer = List<u8>.asSlice(&state.buffer)
+      if buffer[earlier] == buffer[position] && buffer[earlier + 1] == buffer[position + 1] {
+        let length = commonLength(buffer, earlier, position, maxLength)
+        if length > best {
+          best = length
+          let slot = state.matchUsed
+          List<u32>.set(&mut state.matchDistance, slot, usize.toU32(distance))
+          List<u32>.set(&mut state.matchLength, slot, usize.toU32(length))
+          state.matchUsed = slot + 1
+        }
+      }
+      earlier = earlier - 1
+    }
+  }
+  if best < maxLength {
+    drop treeSearch(&mut state, position, maxLength, maxDistance, true, best)
+  }
+  return state.matchUsed - first
+}
+
+// Inserts the positions before `start` that the last meta-block could not insert because fewer
+// than `TREE_COMPARE` bytes followed them, as the reference `StitchToPreviousBlockH10` does.
+fn treeStitch(state: &mut BrotliEncoder, start: usize, size: usize) -> () {
+  if size < 3 || start < TREE_COMPARE {
+    return ()
+  }
+  let from = start - TREE_COMPARE + 1
+  let mut to = from + size
+  if to > start {
+    to = start
+  }
+  let mut position = from
+  while position < to {
+    let mut maxDistance = state.windowMask - 15
+    if start - position > 15 {
+      maxDistance = state.windowMask - (start - position)
+    }
+    drop treeSearch(&mut state, position, TREE_COMPARE, maxDistance, false, 0)
+    position = position + 1
+  }
+}
+
+// Finds the matches of every position of the meta-block from `start`, as the reference
+// `BrotliCreateHqZopfliBackwardReferences` does. A match longer than `zopfliLongest` is kept
+// alone and the positions that it covers get no matches.
+fn collectMatches(state: &mut BrotliEncoder, start: usize, size: usize) -> () {
+  state.matchUsed = 0
+  let counts = List<u32>.asMutSlice(&mut state.matchCount)
+  let mut index: usize = 0
+  while index <= size {
+    counts[index] = 0
+    index = index + 1
+  }
+  let mut storeEnd = start
+  if size >= TREE_COMPARE {
+    storeEnd = start + size - TREE_COMPARE + 1
+  }
+  let capacity = List<u32>.length(&state.matchDistance)
+  index = 0
+  while index + 3 < size {
+    let position = start + index
+    let mut maxDistance = state.maxDistance
+    if maxDistance > position {
+      maxDistance = position
+    }
+    let firstMatch = state.matchUsed
+    let mut found = findAllMatches(&mut state, position, size - index, maxDistance)
+    if found > 1 && firstMatch + 2 * TREE_COMPARE + size - index > capacity {
+      // Keep room for one match at each later position.
+      let lastDistance = List<u32>.get(&state.matchDistance, firstMatch + found - 1)
+      let lastLength = List<u32>.get(&state.matchLength, firstMatch + found - 1)
+      List<u32>.set(&mut state.matchDistance, firstMatch, lastDistance)
+      List<u32>.set(&mut state.matchLength, firstMatch, lastLength)
+      state.matchUsed = firstMatch + 1
+      found = 1
+    }
+    List<u32>.set(&mut state.matchCount, index, usize.toU32(found))
+    if found > 0 {
+      let lastSlot = state.matchUsed - 1
+      let longest = u32.toUsize(List<u32>.get(&state.matchLength, lastSlot))
+      if longest > state.zopfliLongest {
+        let lastDistance = List<u32>.get(&state.matchDistance, lastSlot)
+        List<u32>.set(&mut state.matchDistance, firstMatch, lastDistance)
+        List<u32>.set(&mut state.matchLength, firstMatch, usize.toU32(longest))
+        state.matchUsed = firstMatch + 1
+        List<u32>.set(&mut state.matchCount, index, 1)
+        let mut storeTo = position + longest
+        if storeTo > storeEnd {
+          storeTo = storeEnd
+        }
+        treeStoreRange(&mut state, position + 1, storeTo)
+        index = index + longest - 1
+      }
+    }
+    index = index + 1
+  }
+}
+
+// Literal costs as prefix sums over the meta-block, estimated from the byte counts of a window
+// of 4000 bytes around each position, and command and distance costs that grow slowly with the
+// symbol, as the reference `ZopfliCostModelSetFromLiteralCosts` does.
+fn setLiteralModel(state: &mut BrotliEncoder, start: usize, size: usize) -> () {
+  clear(&mut state.literalHistogram)
+  let buffer = List<u8>.asSlice(&state.buffer)
+  let histogram = List<u32>.asMutSlice(&mut state.literalHistogram)
+  let costs = List<f64>.asMutSlice(&mut state.literalCosts)
+  let half: usize = 2000
+  let mut inWindow = half
+  if inWindow > size {
+    inWindow = size
+  }
+  let mut index: usize = 0
+  while index < inWindow {
+    let byte = u8.toUsize(buffer[start + index])
+    histogram[byte] = histogram[byte] + 1
+    index = index + 1
+  }
+  costs[0] = 0.0
+  let mut total: f64 = 0.0
+  index = 0
+  while index < size {
+    if index >= half {
+      let byte = u8.toUsize(buffer[start + index - half])
+      histogram[byte] = histogram[byte] - 1
+      inWindow = inWindow - 1
+    }
+    if index + half < size {
+      let byte = u8.toUsize(buffer[start + index + half])
+      histogram[byte] = histogram[byte] + 1
+      inWindow = inWindow + 1
+    }
+    let mut count = u32.toUsize(histogram[u8.toUsize(buffer[start + index])])
+    if count == 0 {
+      count = 1
+    }
+    let mut cost = log2Of(inWindow) - log2Of(count) + 0.029
+    if cost < 1.0 {
+      cost = cost * 0.5 + 0.5
+    }
+    total = total + cost
+    costs[index + 1] = total
+    index = index + 1
+  }
+  let commands = List<f64>.asMutSlice(&mut state.commandCosts)
+  index = 0
+  while index < COMMAND_ALPHABET {
+    commands[index] = log2Of(11 + index)
+    index = index + 1
+  }
+  let distances = List<f64>.asMutSlice(&mut state.distanceCosts)
+  index = 0
+  while index < DISTANCE_ALPHABET {
+    distances[index] = log2Of(20 + index)
+    index = index + 1
+  }
+  state.minCommandCost = log2Of(11)
+}
+
+// Shannon costs from the histogram, at least 1 bit, with a cost for the symbols that it lacks,
+// as the reference `SetCost` does.
+fn shannonCosts(histogram: &[u32], costs: &mut [f64], literal: bool) -> () {
+  let mut sum: usize = 0
+  let mut missing: usize = 0
+  let mut index: usize = 0
+  while index < histogram.length {
+    sum = sum + u32.toUsize(histogram[index])
+    if histogram[index] == 0 {
+      missing = missing + 1
+    }
+    index = index + 1
+  }
+  let mut missingSum = sum
+  if !literal {
+    missingSum = sum + missing
+  }
+  if missingSum == 0 {
+    missingSum = 1
+  }
+  let missingCost = log2Of(missingSum) + 2.0
+  let mut logSum: f64 = 0.0
+  if sum > 0 {
+    logSum = log2Of(sum)
+  }
+  index = 0
+  while index < histogram.length {
+    let count = histogram[index]
+    if count == 0 {
+      costs[index] = missingCost
+    } else {
+      let mut cost = logSum - log2Of(u32.toUsize(count))
+      if cost < 1.0 {
+        cost = 1.0
+      }
+      costs[index] = cost
+    }
+    index = index + 1
+  }
+}
+
+// Costs from the commands of the last round, as the reference `ZopfliCostModelSetFromCommands`
+// does.
+fn setCommandModel(state: &mut BrotliEncoder, start: usize, size: usize) -> () {
+  countSymbols(&mut state, start)
+  shannonCosts(
+    List<u32>.asSlice(&state.literalHistogram),
+    List<f64>.asMutSlice(&mut state.byteCosts),
+    true,
+  )
+  shannonCosts(
+    List<u32>.asSlice(&state.commandHistogram),
+    List<f64>.asMutSlice(&mut state.commandCosts),
+    false,
+  )
+  shannonCosts(
+    List<u32>.asSlice(&state.distanceHistogram),
+    List<f64>.asMutSlice(&mut state.distanceCosts),
+    false,
+  )
+  let commands = List<f64>.asSlice(&state.commandCosts)
+  let mut least = NO_COST
+  let mut index: usize = 0
+  while index < COMMAND_ALPHABET {
+    if commands[index] < least {
+      least = commands[index]
+    }
+    index = index + 1
+  }
+  state.minCommandCost = least
+  let buffer = List<u8>.asSlice(&state.buffer)
+  let bytes = List<f64>.asSlice(&state.byteCosts)
+  let costs = List<f64>.asMutSlice(&mut state.literalCosts)
+  costs[0] = 0.0
+  let mut total: f64 = 0.0
+  index = 0
+  while index < size {
+    total = total + bytes[u8.toUsize(buffer[start + index])]
+    costs[index + 1] = total
+    index = index + 1
+  }
+}
+
+const INSERT_MASK: u32 = 0x7ffffff
+
+// The distance code of the command that ends at node `at`.
+fn nodeCode(state: &BrotliEncoder, at: usize) -> u32 {
+  let short = u32.shiftRight(List<u32>.get(&state.nodeInsert, at), 27)
+  if short == 0 {
+    return List<u32>.get(&state.nodeDistance, at) + 15
+  }
+  return short - 1
+}
+
+// The last node before `at` whose command changed the recent distances.
+fn shortcutAt(state: &BrotliEncoder, start: usize, at: usize) -> u32 {
+  if at == 0 {
+    return 0
+  }
+  let copy = u32.toUsize(List<u32>.get(&state.nodeLength, at))
+  let insert = u32.toUsize(List<u32>.get(&state.nodeInsert, at) & INSERT_MASK)
+  let distance = u32.toUsize(List<u32>.get(&state.nodeDistance, at))
+  if distance + copy <= start + at && distance <= state.maxDistance && nodeCode(&state, at) > 0 {
+    return usize.toU32(at)
+  }
+  return List<u32>.get(&state.nodeShortcut, at - copy - insert)
+}
+
+// Considers node `at` as the start of a literal run, as the reference `EvaluateNode` does: the
+// queue keeps the 8 starts with the lowest cost less their literal cost.
+fn evaluateNode(state: &mut BrotliEncoder, start: usize, at: usize) -> () {
+  let shortcut = shortcutAt(&state, start, at)
+  List<u32>.set(&mut state.nodeShortcut, at, shortcut)
+  let cost = List<f64>.get(&state.nodeCost, at)
+  let literal = List<f64>.get(&state.literalCosts, at)
+  if cost > literal {
+    return ()
+  }
+  let difference = cost - literal
+  let mut cache = state.distanceCache
+  let mut found: usize = 0
+  let mut walk = u32.toUsize(shortcut)
+  let mut recent: [usize; 4] = [0; 4]
+  while found < 4 && walk > 0 {
+    let copy = u32.toUsize(List<u32>.get(&state.nodeLength, walk))
+    let insert = u32.toUsize(List<u32>.get(&state.nodeInsert, walk) & INSERT_MASK)
+    recent[found] = u32.toUsize(List<u32>.get(&state.nodeDistance, walk))
+    found = found + 1
+    walk = u32.toUsize(List<u32>.get(&state.nodeShortcut, walk - copy - insert))
+  }
+  let mut fill: usize = 0
+  while found < 4 {
+    recent[found] = cache[fill]
+    found = found + 1
+    fill = fill + 1
+  }
+  cache = recent
+
+  // Insert in increasing order of difference, dropping the largest when full.
+  let mut slot = state.queueSize
+  if slot == 8 {
+    if state.queueDifference[7] <= difference {
+      return ()
+    }
+    slot = 7
+  } else {
+    state.queueSize = slot + 1
+  }
+  while slot > 0 && state.queueDifference[slot - 1] > difference {
+    state.queuePosition[slot] = state.queuePosition[slot - 1]
+    state.queueCost[slot] = state.queueCost[slot - 1]
+    state.queueDifference[slot] = state.queueDifference[slot - 1]
+    let mut part: usize = 0
+    while part < 4 {
+      state.queueCache[slot * 4 + part] = state.queueCache[slot * 4 - 4 + part]
+      part = part + 1
+    }
+    slot = slot - 1
+  }
+  state.queuePosition[slot] = at
+  state.queueCost[slot] = cost
+  state.queueDifference[slot] = difference
+  let mut part: usize = 0
+  while part < 4 {
+    state.queueCache[slot * 4 + part] = cache[part]
+    part = part + 1
+  }
+}
+
+fn updateNode(
+  state: &mut BrotliEncoder,
+  at: usize,
+  from: usize,
+  length: usize,
+  distance: usize,
+  short: u32,
+  cost: f64,
+) -> () {
+  let target = at + length
+  List<u32>.set(&mut state.nodeLength, target, usize.toU32(length))
+  List<u32>.set(&mut state.nodeDistance, target, usize.toU32(distance))
+  List<u32>.set(&mut state.nodeInsert, target, usize.toU32(at - from) | u32.shiftLeft(short, 27))
+  List<f64>.set(&mut state.nodeCost, target, cost)
+}
+
+// The index into the recent distances and the offset from it for each short distance code.
+const CACHE_INDEX: [usize; 16] = [0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1]
+
+const CACHE_DELTA: [u32; 16] = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 1, 1, 2, 2, 3, 3]
+
+// Relaxes the nodes that commands starting at `at` reach, as the reference `UpdateNodes` does.
+// Returns the longest copy length that improved a node.
+fn updateNodes(
+  state: &mut BrotliEncoder,
+  start: usize,
+  size: usize,
+  at: usize,
+  firstMatch: usize,
+  matches: usize,
+) -> usize {
+  let maxLength = size - at
+  let position = start + at
+  let mut maxDistance = state.maxDistance
+  if maxDistance > position {
+    maxDistance = position
+  }
+  evaluateNode(&mut state, start, at)
+  let literalAt = List<f64>.get(&state.literalCosts, at)
+
+  // No copy shorter than this can improve on what literals already reach.
+  let mut minCost = state.queueCost[0] + state.minCommandCost + literalAt
+    - List<f64>.get(&state.literalCosts, state.queuePosition[0])
+  let mut minLength: usize = 2
+  let mut bucket: usize = 4
+  let mut nextOffset: usize = 10
+  while at + minLength <= size && List<f64>.get(&state.nodeCost, at + minLength) <= minCost {
+    minLength = minLength + 1
+    if minLength == nextOffset {
+      minCost = minCost + 1.0
+      nextOffset = nextOffset + bucket
+      bucket = bucket * 2
+    }
+  }
+  let mut result: usize = 0
+  let mut entry: usize = 0
+  while entry < state.zopfliStarts && entry < state.queueSize {
+    let from = state.queuePosition[entry]
+    let insertBucket = insertCode(usize.toU32(at - from))
+    let baseCost = state.queueDifference[entry] + u32.toF64(INSERT_EXTRA[u32.toUsize(insertBucket)])
+      + literalAt
+    let mut bestLength = minLength - 1
+    let mut code: usize = 0
+    while code < 16 && bestLength < maxLength {
+      let recent = state.queueCache[entry * 4 + CACHE_INDEX[code]]
+      let delta = u32.toUsize(CACHE_DELTA[code])
+      let mut distance = recent
+      if code >= 4 {
+        if usize.remainder(code, 2) == 0 {
+          if recent <= delta {
+            distance = 0
+          } else {
+            distance = recent - delta
+          }
+        } else {
+          distance = recent + delta
+        }
+      }
+      if distance != 0 && distance <= maxDistance {
+        let buffer = List<u8>.asSlice(&state.buffer)
+        let earlier = position - distance
+        if buffer[earlier + bestLength] == buffer[position + bestLength] {
+          let length = commonLength(buffer, earlier, position, maxLength)
+          let distanceCost = baseCost + List<f64>.get(&state.distanceCosts, code)
+          let mut copy = bestLength + 1
+          while copy <= length {
+            let copyBucket = copyCode(usize.toU32(copy))
+            let symbol = commandSymbolFor(insertBucket, copyBucket, code == 0)
+            let mut cost = distanceCost
+            if symbol < 128 {
+              cost = baseCost
+            }
+            cost = cost + u32.toF64(COPY_EXTRA[u32.toUsize(copyBucket)])
+              + List<f64>.get(&state.commandCosts, u32.toUsize(symbol))
+            if cost < List<f64>.get(&state.nodeCost, at + copy) {
+              updateNode(&mut state, at, from, copy, distance, usize.toU32(code) + 1, cost)
+              if copy > result {
+                result = copy
+              }
+            }
+            bestLength = copy
+            copy = copy + 1
+          }
+        }
+      }
+      code = code + 1
+    }
+    if entry < 2 {
+      let mut length = minLength
+      let mut index: usize = 0
+      while index < matches {
+        let slot = firstMatch + index
+        let distance = List<u32>.get(&state.matchDistance, slot)
+        let matchLength = u32.toUsize(List<u32>.get(&state.matchLength, slot))
+        let distanceCode = distance + 15
+        let distanceSlot = u32.toUsize(distanceSymbol(distanceCode))
+        let distanceCost = baseCost + u32.toF64(distanceExtra(distanceCode) & 31)
+          + List<f64>.get(&state.distanceCosts, distanceSlot)
+        if length < matchLength && matchLength > state.zopfliLongest {
+          length = matchLength
+        }
+        while length <= matchLength {
+          let copyBucket = copyCode(usize.toU32(length))
+          let symbol = commandSymbolFor(insertBucket, copyBucket, false)
+          let cost = distanceCost + u32.toF64(COPY_EXTRA[u32.toUsize(copyBucket)])
+            + List<f64>.get(&state.commandCosts, u32.toUsize(symbol))
+          if cost < List<f64>.get(&state.nodeCost, at + length) {
+            updateNode(&mut state, at, from, length, u32.toUsize(distance), 0, cost)
+            if length > result {
+              result = length
+            }
+          }
+          length = length + 1
+        }
+        index = index + 1
+      }
+    }
+    entry = entry + 1
+  }
+  return result
+}
+
+// One shortest path search over the meta-block with the current costs, then the commands of
+// the path, as the reference `ZopfliIterate` and `BrotliZopfliCreateCommands` do.
+fn zopfliRound(state: &mut BrotliEncoder, start: usize, size: usize) -> () {
+  let mut index: usize = 0
+  while index <= size {
+    List<u32>.set(&mut state.nodeLength, index, 1)
+    List<u32>.set(&mut state.nodeDistance, index, 0)
+    List<u32>.set(&mut state.nodeInsert, index, 0)
+    List<u32>.set(&mut state.nodeShortcut, index, 0)
+    List<f64>.set(&mut state.nodeCost, index, NO_COST)
+    index = index + 1
+  }
+  List<u32>.set(&mut state.nodeLength, 0, 0)
+  List<f64>.set(&mut state.nodeCost, 0, 0.0)
+  state.queueSize = 0
+  let mut cursor: usize = 0
+  index = 0
+  while index + 3 < size {
+    let matches = u32.toUsize(List<u32>.get(&state.matchCount, index))
+    let mut skip = updateNodes(&mut state, start, size, index, cursor, matches)
+    if skip < 16384 {
+      skip = 0
+    }
+    cursor = cursor + matches
+    if matches == 1 {
+      let longest = u32.toUsize(List<u32>.get(&state.matchLength, cursor - 1))
+      if longest > state.zopfliLongest && longest > skip {
+        skip = longest
+      }
+    }
+    if skip > 1 {
+      skip = skip - 1
+      while skip > 0 {
+        index = index + 1
+        if index + 3 >= size {
+          break
+        }
+        evaluateNode(&mut state, start, index)
+        cursor = cursor + u32.toUsize(List<u32>.get(&state.matchCount, index))
+        skip = skip - 1
+      }
+    }
+    index = index + 1
+  }
+
+  // Walk back from the last node that a command reaches.
+  let mut at = size
+  while List<u32>.get(&state.nodeLength, at) == 1
+    && (List<u32>.get(&state.nodeInsert, at) & INSERT_MASK) == 0 {
+    at = at - 1
+  }
+  List<u32>.set(&mut state.nodeNext, at, 0xffffffff)
+  while at != 0 {
+    let span = List<u32>.get(&state.nodeLength, at)
+      + (List<u32>.get(&state.nodeInsert, at) & INSERT_MASK)
+    at = at - u32.toUsize(span)
+    List<u32>.set(&mut state.nodeNext, at, span)
+  }
+  state.commandCount = 0
+  let mut position: usize = 0
+  let mut offset = List<u32>.get(&state.nodeNext, 0)
+  while offset != 0xffffffff {
+    let next = position + u32.toUsize(offset)
+    let copy = u32.toUsize(List<u32>.get(&state.nodeLength, next))
+    let insert = u32.toUsize(List<u32>.get(&state.nodeInsert, next) & INSERT_MASK)
+    let code = nodeCode(&state, next)
+    let distance = u32.toUsize(List<u32>.get(&state.nodeDistance, next))
+    offset = List<u32>.get(&state.nodeNext, next)
+    addCommand(&mut state, insert, copy, code)
+    if code != 0 {
+      let cache = state.distanceCache
+      state.distanceCache = [distance, cache[0], cache[1], cache[2]]
+    }
+    position = next
+  }
+  if position < size {
+    addCommand(&mut state, size - position, 0, 0)
+  }
+}
+
+// Commands for qualities 10 and 11: all matches from the binary tree, then one or two rounds of
+// the shortest path search, the second with costs from the commands of the first.
+fn zopfliCommands(state: &mut BrotliEncoder, start: usize, end: usize) -> () {
+  let size = end - start
+  treeStitch(&mut state, start, size)
+  collectMatches(&mut state, start, size)
+  let savedCache = state.distanceCache
+  let mut round: u32 = 0
+  while round < state.zopfliRounds {
+    if round == 0 {
+      setLiteralModel(&mut state, start, size)
+    } else {
+      setCommandModel(&mut state, start, size)
+    }
+    state.distanceCache = savedCache
+    zopfliRound(&mut state, start, size)
+    round = round + 1
+  }
 }

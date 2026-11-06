@@ -33,10 +33,11 @@ Zstandard encoding covers levels 1 to 22 with the reference `zstd` parameters an
 optional checksum, and the content size. Its frames decode with the reference `zstd` and are
 within about 1% of its size at each level, but are not the same bytes that it writes.
 
-Brotli encoding covers qualities 0 to 11 with the bucket hashers and lazy matching of the
-reference `brotli`, in steps with flushes, and one set of prefix codes per meta-block. Its streams
-decode with the reference `brotli` and are within about 4% of its size at qualities 2 to 9, and
-about 10% to 25% larger at 10 and 11, where the reference uses a slower optimal parser.
+Brotli encoding covers qualities 0 to 11: the bucket hashers and lazy matching of the reference
+`brotli` up to quality 9, and its binary tree hasher and shortest path search at 10 and 11, in
+steps with flushes, and one set of prefix codes per meta-block. Its streams decode with the
+reference `brotli` and are within about 4% of its size on text at each quality, and up to about
+17% larger on source code at 10 and 11, where the reference also models literal contexts.
 
 The Brotli decoder covers all of RFC 7932, including the static dictionary and its word
 transforms, and decodes incrementally into a window it allocates once. Regenerate its dictionary
