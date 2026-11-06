@@ -55,7 +55,7 @@ pub effect fn main() -> i32
 
 Import as `Certificate` with `import silk.tls.certificate { Certificate }`.
 
-Public declarations: 12.
+Public declarations: 13.
 
 <a id="DecodeLimits"></a>
 
@@ -1061,6 +1061,35 @@ pub value: &'a [u8]
 ```
 
 The bytes inside the extension OCTET STRING. They are not decoded.
+
+<a id="CertificateDer"></a>
+
+## `CertificateDer`
+
+```silk
+pub struct CertificateDer<'a>
+```
+
+The borrowed DER bytes of one certificate, as a TLS Certificate message carries it. A
+`silk.tls.server` chain and a `silk.tls.client` credential are lists of these.
+
+<a id="CertificateDer.bytes"></a>
+
+### Field `bytes`
+
+```silk
+pub bytes: &'a [u8]
+```
+
+The DER bytes of the certificate.
+
+<a id="CertificateDer.impl.Copy"></a>
+
+## Implementation `Copy for CertificateDer<'a>`
+
+```silk
+impl<'a> Copy for CertificateDer<'a>
+```
 
 <a id="Certificate"></a>
 
