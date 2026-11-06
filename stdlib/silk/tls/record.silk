@@ -1,10 +1,13 @@
-//! Frame and protect TLS 1.3 records (RFC 8446, section 5) over a byte transport that you drive.
+//! Frame and protect TLS 1.3 records (RFC 8446, section 5) and TLS 1.2 AEAD records (RFC 5246,
+//! section 6.2) over a byte transport that you drive.
 //!
 //! # When to use
 //! Most programs use `silk.tls.connection` or `silk.tls.client`, which use this module. Use
 //! [`TlsRecordSender`] and [`TlsRecordReceiver`] directly to build another TLS endpoint or a test
 //! tool. The `makePlaintext` functions frame records without encryption, for the first handshake
-//! messages. The `make` functions take a traffic secret and encrypt with the [`CipherSuite`].
+//! messages. The `make` functions take a TLS 1.3 traffic secret and encrypt with the
+//! [`CipherSuite`]. `replaceEpochTls12` starts TLS 1.2 protection with a key and IV from the TLS
+//! 1.2 key block, as after `change_cipher_spec`.
 //!
 //! # Details
 //! Each direction allocates fixed buffers one time, when you make it. Later calls do not allocate
@@ -98,6 +101,7 @@ import silk.crypto.chacha20_poly1305 {AeadError, ChaCha20Poly1305}
 import silk.text.format {Debug, Format, Formatter}
 import silk.mem.layout {Layout}
 import silk.core.option {Option}
+import silk.core.ownership {Copy}
 import silk.mem.raw_buffer {RawBuffer}
 import silk.core.result {Result}
 import silk.collections.slice {Slice}
@@ -118,14 +122,226 @@ const TAG_LENGTH: usize = 16
 /// example after a KeyUpdate.
 pub const RECORDS_PER_EPOCH: u64 = 8388608
 
-/// A TLS 1.3 cipher suite that this module supports.
+/// The most records that one TLS 1.2 AES-GCM key protects: 2^24.5, the limit that RFC 8446
+/// section 5.5 gives for AES-GCM. TLS 1.2 has no KeyUpdate, so the connection must end there.
+pub const TLS12_GCM_RECORDS: u64 = 23726566
+
+/// The most records that one TLS 1.2 ChaCha20-Poly1305 key protects: 2^62. The sequence number
+/// never wraps before it.
+pub const TLS12_CHACHA_RECORDS: u64 = 4611686018427387904
+
+/// A version of the TLS protocol.
+pub enum TlsVersion {
+  /// TLS 1.2 (RFC 5246).
+  Tls12,
+  /// TLS 1.3 (RFC 8446).
+  Tls13,
+}
+
+impl Debug for TlsVersion {
+  /// Writes the name of the variant, such as `Tls13`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      TlsVersion.Tls12 => run Format.write(&mut formatter, b"Tls12")
+      TlsVersion.Tls13 => run Format.write(&mut formatter, b"Tls13")
+    }
+  }
+}
+
+/// The TLS versions that an endpoint accepts: a range from a minimum to a maximum version, both
+/// included.
+///
+/// # Details
+/// When both versions are allowed, the endpoints use TLS 1.3 when both support it. A TLS 1.3
+/// client that gets a TLS 1.2 answer checks the downgrade marker in the server's random value
+/// (RFC 8446 section 4.1.3), and a server that could have used TLS 1.3 sets it.
+pub struct VersionPolicy {
+  minimumVersion: TlsVersion,
+  maximumVersion: TlsVersion,
+}
+
+impl Copy for VersionPolicy {}
+
+impl VersionPolicy {
+  /// Returns the policy that accepts TLS 1.2 and TLS 1.3, as Node.js does by default.
+  pub fn defaults() -> VersionPolicy {
+    return VersionPolicy {minimumVersion: TlsVersion.Tls12, maximumVersion: TlsVersion.Tls13}
+  }
+
+  /// Returns the policy that accepts only TLS 1.3.
+  pub fn tls13() -> VersionPolicy {
+    return VersionPolicy {minimumVersion: TlsVersion.Tls13, maximumVersion: TlsVersion.Tls13}
+  }
+
+  /// Returns the policy that accepts only TLS 1.2.
+  pub fn tls12() -> VersionPolicy {
+    return VersionPolicy {minimumVersion: TlsVersion.Tls12, maximumVersion: TlsVersion.Tls12}
+  }
+
+  /// Returns the policy that accepts the versions from `minimum` to `maximum`, or `None` when
+  /// `minimum` is newer than `maximum`.
+  pub fn range(minimum: TlsVersion, maximum: TlsVersion) -> Option<VersionPolicy> {
+    if minimum == TlsVersion.Tls13 && maximum == TlsVersion.Tls12 {
+      return Option<VersionPolicy>.none()
+    }
+    return Option<VersionPolicy>.some(VersionPolicy {minimumVersion: minimum, maximumVersion: maximum})
+  }
+
+  /// Returns the oldest accepted version.
+  pub fn minimum(self: &Self) -> TlsVersion { return self.minimumVersion }
+
+  /// Returns the newest accepted version.
+  pub fn maximum(self: &Self) -> TlsVersion { return self.maximumVersion }
+
+  /// Returns whether the policy accepts `version`.
+  pub fn allows(self: &Self, version: TlsVersion) -> bool {
+    if version == TlsVersion.Tls12 {
+      return self.minimumVersion == TlsVersion.Tls12
+    }
+    return self.maximumVersion == TlsVersion.Tls13
+  }
+}
+
+/// A cipher suite that this module supports: the three TLS 1.3 suites, and the six TLS 1.2
+/// ECDHE suites with an AEAD cipher.
 pub enum CipherSuite {
-  /// `TLS_AES_128_GCM_SHA256`. Its traffic secrets are 32 bytes.
+  /// `TLS_AES_128_GCM_SHA256` (TLS 1.3). Its traffic secrets are 32 bytes.
   Aes128GcmSha256,
-  /// `TLS_AES_256_GCM_SHA384`. Its traffic secrets are 48 bytes.
+  /// `TLS_AES_256_GCM_SHA384` (TLS 1.3). Its traffic secrets are 48 bytes.
   Aes256GcmSha384,
-  /// `TLS_CHACHA20_POLY1305_SHA256`. Its traffic secrets are 32 bytes.
+  /// `TLS_CHACHA20_POLY1305_SHA256` (TLS 1.3). Its traffic secrets are 32 bytes.
   ChaCha20Poly1305Sha256,
+  /// `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256` (TLS 1.2, RFC 5289).
+  EcdheEcdsaAes128GcmSha256,
+  /// `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256` (TLS 1.2, RFC 5289).
+  EcdheRsaAes128GcmSha256,
+  /// `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384` (TLS 1.2, RFC 5289).
+  EcdheEcdsaAes256GcmSha384,
+  /// `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384` (TLS 1.2, RFC 5289).
+  EcdheRsaAes256GcmSha384,
+  /// `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` (TLS 1.2, RFC 7905).
+  EcdheEcdsaChaCha20Poly1305Sha256,
+  /// `TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256` (TLS 1.2, RFC 7905).
+  EcdheRsaChaCha20Poly1305Sha256,
+}
+
+impl Debug for CipherSuite {
+  /// Writes the name of the variant, such as `Aes128GcmSha256`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      CipherSuite.Aes128GcmSha256 => run Format.write(&mut formatter, b"Aes128GcmSha256")
+      CipherSuite.Aes256GcmSha384 => run Format.write(&mut formatter, b"Aes256GcmSha384")
+      CipherSuite.ChaCha20Poly1305Sha256 => run Format.write(&mut formatter, b"ChaCha20Poly1305Sha256")
+      CipherSuite.EcdheEcdsaAes128GcmSha256 => run Format.write(
+        &mut formatter,
+        b"EcdheEcdsaAes128GcmSha256",
+      )
+      CipherSuite.EcdheRsaAes128GcmSha256 => run Format.write(&mut formatter, b"EcdheRsaAes128GcmSha256")
+      CipherSuite.EcdheEcdsaAes256GcmSha384 => run Format.write(
+        &mut formatter,
+        b"EcdheEcdsaAes256GcmSha384",
+      )
+      CipherSuite.EcdheRsaAes256GcmSha384 => run Format.write(&mut formatter, b"EcdheRsaAes256GcmSha384")
+      CipherSuite.EcdheEcdsaChaCha20Poly1305Sha256 => run Format.write(
+        &mut formatter,
+        b"EcdheEcdsaChaCha20Poly1305Sha256",
+      )
+      CipherSuite.EcdheRsaChaCha20Poly1305Sha256 => run Format.write(
+        &mut formatter,
+        b"EcdheRsaChaCha20Poly1305Sha256",
+      )
+    }
+  }
+}
+
+impl CipherSuite {
+  /// Returns the TLS version that the suite belongs to.
+  pub fn version(self: &Self) -> TlsVersion {
+    let suite = self.*
+    if suite == CipherSuite.Aes128GcmSha256 || suite == CipherSuite.Aes256GcmSha384
+      || suite == CipherSuite.ChaCha20Poly1305Sha256 {
+      return TlsVersion.Tls13
+    }
+    return TlsVersion.Tls12
+  }
+
+  /// Returns the suite's two-byte IANA code, such as 4865 (0x1301) for `TLS_AES_128_GCM_SHA256`.
+  pub fn code(self: &Self) -> usize {
+    return match &self.* {
+      CipherSuite.Aes128GcmSha256 => 4865
+      CipherSuite.Aes256GcmSha384 => 4866
+      CipherSuite.ChaCha20Poly1305Sha256 => 4867
+      CipherSuite.EcdheEcdsaAes128GcmSha256 => 49195
+      CipherSuite.EcdheRsaAes128GcmSha256 => 49199
+      CipherSuite.EcdheEcdsaAes256GcmSha384 => 49196
+      CipherSuite.EcdheRsaAes256GcmSha384 => 49200
+      CipherSuite.EcdheEcdsaChaCha20Poly1305Sha256 => 52393
+      CipherSuite.EcdheRsaChaCha20Poly1305Sha256 => 52392
+    }
+  }
+
+  /// Returns the suite with the IANA `code`, or `None` when this module does not support it.
+  pub fn fromCode(code: usize) -> Option<CipherSuite> {
+    if code == 4865 { return Option<CipherSuite>.some(CipherSuite.Aes128GcmSha256) }
+    if code == 4866 { return Option<CipherSuite>.some(CipherSuite.Aes256GcmSha384) }
+    if code == 4867 { return Option<CipherSuite>.some(CipherSuite.ChaCha20Poly1305Sha256) }
+    if code == 49195 { return Option<CipherSuite>.some(CipherSuite.EcdheEcdsaAes128GcmSha256) }
+    if code == 49199 { return Option<CipherSuite>.some(CipherSuite.EcdheRsaAes128GcmSha256) }
+    if code == 49196 { return Option<CipherSuite>.some(CipherSuite.EcdheEcdsaAes256GcmSha384) }
+    if code == 49200 { return Option<CipherSuite>.some(CipherSuite.EcdheRsaAes256GcmSha384) }
+    if code == 52393 {
+      return Option<CipherSuite>.some(CipherSuite.EcdheEcdsaChaCha20Poly1305Sha256)
+    }
+    if code == 52392 {
+      return Option<CipherSuite>.some(CipherSuite.EcdheRsaChaCha20Poly1305Sha256)
+    }
+    return Option<CipherSuite>.none()
+  }
+
+  /// Returns the length of the suite's hash: 48 for the SHA-384 suites and 32 for the others. It
+  /// is the TLS 1.3 secret length and the hash of the TLS 1.2 PRF.
+  pub fn hashLength(self: &Self) -> usize {
+    let suite = self.*
+    if suite == CipherSuite.Aes256GcmSha384 || suite == CipherSuite.EcdheEcdsaAes256GcmSha384
+      || suite == CipherSuite.EcdheRsaAes256GcmSha384 {
+      return 48
+    }
+    return 32
+  }
+
+  /// Returns the length of the suite's AEAD key: 16 for AES-128-GCM and 32 for the others.
+  pub fn keyLength(self: &Self) -> usize {
+    let suite = self.*
+    if suite == CipherSuite.Aes128GcmSha256 || suite == CipherSuite.EcdheEcdsaAes128GcmSha256
+      || suite == CipherSuite.EcdheRsaAes128GcmSha256 {
+      return 16
+    }
+    return 32
+  }
+
+  /// Returns whether the suite encrypts with ChaCha20-Poly1305.
+  pub fn isChaCha(self: &Self) -> bool {
+    let suite = self.*
+    return suite == CipherSuite.ChaCha20Poly1305Sha256
+      || suite == CipherSuite.EcdheEcdsaChaCha20Poly1305Sha256
+      || suite == CipherSuite.EcdheRsaChaCha20Poly1305Sha256
+  }
+
+  /// Returns whether the TLS 1.2 suite authenticates the server with an ECDSA (or EdDSA) key, as
+  /// opposed to an RSA key. It is `false` for the TLS 1.3 suites, which do not fix the key type.
+  pub fn isEcdsa(self: &Self) -> bool {
+    let suite = self.*
+    return suite == CipherSuite.EcdheEcdsaAes128GcmSha256
+      || suite == CipherSuite.EcdheEcdsaAes256GcmSha384
+      || suite == CipherSuite.EcdheEcdsaChaCha20Poly1305Sha256
+  }
+
+  /// Returns the length of the TLS 1.2 fixed IV from the key block: 4 for AES-GCM, which sends the
+  /// other 8 nonce bytes in each record (RFC 5288), and 12 for ChaCha20-Poly1305 (RFC 7905).
+  pub fn tls12IvLength(self: &Self) -> usize {
+    if self.isChaCha() { return 12 }
+    return 4
+  }
 }
 
 /// The content type of a record.
@@ -278,7 +494,9 @@ pub struct TlsRecordSender {
   keyLength: usize,
   iv: [u8; 12],
   sequence: u64,
+  limit: u64,
   protected: bool,
+  tls12: bool,
   pending: Intrinsic.RawBuffer<u8>,
   staging: Intrinsic.RawBuffer<u8>,
   pendingLength: usize,
@@ -314,7 +532,9 @@ impl TlsRecordSender {
         keyLength: material.keyLength,
         iv: material.iv,
         sequence: 0,
+        limit: RECORDS_PER_EPOCH,
         protected: true,
+        tls12: false,
         pending: move pending,
         staging: move staging,
         pendingLength: 0,
@@ -333,7 +553,9 @@ impl TlsRecordSender {
       keyLength: 0,
       iv: zeroIv(),
       sequence: 0,
+      limit: RECORDS_PER_EPOCH,
       protected: false,
+      tls12: false,
       pending: move pending,
       staging: move staging,
       pendingLength: 0,
@@ -371,7 +593,52 @@ impl TlsRecordSender {
     self.keyLength = material.keyLength
     self.iv = material.iv
     self.sequence = 0
+    self.limit = RECORDS_PER_EPOCH
     self.protected = true
+    self.tls12 = false
+    self.pendingLength = 0
+    self.acknowledged = 0
+    return Result<(), RecordError>.succeed(())
+  }
+
+  /// Starts TLS 1.2 protection (RFC 5246 section 6.2.3.3) with the write key and the fixed IV
+  /// of a TLS 1.2 `suite`, as after sending `change_cipher_spec`. It does not allocate.
+  ///
+  /// # Details
+  /// `key` is 16 bytes for AES-128-GCM and 32 bytes otherwise. `iv` is the 4-byte salt for
+  /// AES-GCM, whose records carry the sequence number as their explicit nonce (RFC 5288), or the
+  /// 12-byte IV for ChaCha20-Poly1305 (RFC 7905). The sequence number starts at 0. A key protects
+  /// at most [`TLS12_GCM_RECORDS`] or [`TLS12_CHACHA_RECORDS`] records.
+  ///
+  /// # Errors
+  /// - `InvalidState` if output is pending or `suite` is a TLS 1.3 suite.
+  /// - `InvalidSecretLength` if `key` or `iv` has the wrong length.
+  ///
+  /// On an error, the old key stays in use.
+  pub fn replaceEpochTls12(
+    self: &mut Self,
+    suite: CipherSuite,
+    key: &[u8],
+    iv: &[u8],
+  ) -> Result<(), RecordError> {
+    if self.acknowledged < self.pendingLength {
+      return Result<(), RecordError>.failResult(RecordError.InvalidState)
+    }
+    let derived = tls12Material(suite, key, iv)
+    let material = match move derived {
+      Result<KeyMaterial, RecordError>.Failure {error} => {
+        return Result<(), RecordError>.failResult(move error)
+      }
+      Result<KeyMaterial, RecordError>.Success {value} => move value
+    }
+    self.suite = suite
+    self.key = material.key
+    self.keyLength = material.keyLength
+    self.iv = material.iv
+    self.sequence = 0
+    self.limit = tls12Limit(suite)
+    self.protected = true
+    self.tls12 = true
     self.pendingLength = 0
     self.acknowledged = 0
     return Result<(), RecordError>.succeed(())
@@ -402,8 +669,11 @@ impl TlsRecordSender {
       accepted = CONTENT_LIMIT
     }
     if self.protected {
-      if self.sequence >= RECORDS_PER_EPOCH {
+      if self.sequence >= self.limit {
         return Result<OutputProgress, RecordError>.failResult(RecordError.KeyUsageExhausted)
+      }
+      if self.tls12 {
+        return queueProtectedTls12(&mut self, contentType, content, accepted)
       }
       return queueProtected(&mut self, contentType, content, accepted)
     }
@@ -438,7 +708,7 @@ impl TlsRecordSender {
   /// sender.
   pub fn recordsRemaining(self: &Self) -> u64 {
     if !self.protected { return 0 }
-    return RECORDS_PER_EPOCH - self.sequence
+    return self.limit - self.sequence
   }
 
   /// Marks the first `count` pending bytes as written.
@@ -478,7 +748,9 @@ pub struct TlsRecordReceiver {
   keyLength: usize,
   iv: [u8; 12],
   sequence: u64,
+  limit: u64,
   protected: bool,
+  tls12: bool,
   wire: Intrinsic.RawBuffer<u8>,
   plaintext: Intrinsic.RawBuffer<u8>,
   wireLength: usize,
@@ -516,7 +788,9 @@ impl TlsRecordReceiver {
         keyLength: material.keyLength,
         iv: material.iv,
         sequence: 0,
+        limit: RECORDS_PER_EPOCH,
         protected: true,
+        tls12: false,
         wire: move wire,
         plaintext: move plaintext,
         wireLength: 0,
@@ -540,7 +814,9 @@ impl TlsRecordReceiver {
       keyLength: 0,
       iv: zeroIv(),
       sequence: 0,
+      limit: RECORDS_PER_EPOCH,
       protected: false,
+      tls12: false,
       wire: move wire,
       plaintext: move plaintext,
       wireLength: 0,
@@ -592,7 +868,56 @@ impl TlsRecordReceiver {
     self.keyLength = material.keyLength
     self.iv = material.iv
     self.sequence = 0
+    self.limit = RECORDS_PER_EPOCH
     self.protected = true
+    self.tls12 = false
+    self.wireLength = 0
+    self.expectedLength = 0
+    self.recordLength = 0
+    self.recordType = ContentType.Handshake
+    self.ready = false
+    return Result<(), RecordError>.succeed(())
+  }
+
+  /// Starts TLS 1.2 protection (RFC 5246 section 6.2.3.3) with the peer's write key and fixed
+  /// IV of a TLS 1.2 `suite`, as after receiving `change_cipher_spec`. It does not allocate.
+  ///
+  /// # Details
+  /// `key` is 16 bytes for AES-128-GCM and 32 bytes otherwise. `iv` is the 4-byte salt for
+  /// AES-GCM, whose records carry their explicit nonce, or the 12-byte IV for ChaCha20-Poly1305.
+  /// The sequence number starts at 0. The record's outer type is its content type, and no
+  /// `change_cipher_spec` record is accepted after this call.
+  ///
+  /// # Errors
+  /// - `InvalidState` if part of a record was received, a record is ready, the receiver failed, or
+  ///   `suite` is a TLS 1.3 suite.
+  /// - `InvalidSecretLength` if `key` or `iv` has the wrong length.
+  ///
+  /// On an error, the old key stays in use.
+  pub fn replaceEpochTls12(
+    self: &mut Self,
+    suite: CipherSuite,
+    key: &[u8],
+    iv: &[u8],
+  ) -> Result<(), RecordError> {
+    if self.wireLength != 0 || self.ready || self.terminal {
+      return Result<(), RecordError>.failResult(RecordError.InvalidState)
+    }
+    let derived = tls12Material(suite, key, iv)
+    let material = match move derived {
+      Result<KeyMaterial, RecordError>.Failure {error} => {
+        return Result<(), RecordError>.failResult(move error)
+      }
+      Result<KeyMaterial, RecordError>.Success {value} => move value
+    }
+    self.suite = suite
+    self.key = material.key
+    self.keyLength = material.keyLength
+    self.iv = material.iv
+    self.sequence = 0
+    self.limit = tls12Limit(suite)
+    self.protected = true
+    self.tls12 = true
     self.wireLength = 0
     self.expectedLength = 0
     self.recordLength = 0
@@ -872,6 +1197,9 @@ fn admitHeader(receiver: &TlsRecordReceiver) -> Result<usize, RecordError> {
   let major = header[1]
   let minor = header[2]
   let payload = u8.toUsize(header[3]) * 256 + u8.toUsize(header[4])
+  if receiver.protected && receiver.tls12 {
+    return admitHeaderTls12(receiver, outerType, major, minor, payload)
+  }
   if receiver.protected {
     if outerType == 20 && major == 3 && minor == 3 && payload == 1 {
       return Result<usize, RecordError>.succeed(payload)
@@ -922,6 +1250,9 @@ fn admitHeader(receiver: &TlsRecordReceiver) -> Result<usize, RecordError> {
 }
 
 fn finishRecord(receiver: &mut TlsRecordReceiver) -> Result<(), RecordError> {
+  if receiver.protected && receiver.tls12 {
+    return finishProtectedTls12(&mut receiver)
+  }
   if receiver.protected {
     // A finished record has at least its header in the wire buffer.
     let outerType = unsafe RawBuffer.read<u8>(&receiver.wire, 0)
@@ -967,7 +1298,7 @@ fn finishRecord(receiver: &mut TlsRecordReceiver) -> Result<(), RecordError> {
 
 fn finishProtected(receiver: &mut TlsRecordReceiver) -> Result<(), RecordError> {
   let sequence = receiver.sequence
-  if sequence >= RECORDS_PER_EPOCH {
+  if sequence >= receiver.limit {
     return Result<(), RecordError>.failResult(RecordError.KeyUsageExhausted)
   }
   let payloadLength = receiver.expectedLength - HEADER_LENGTH
@@ -1079,6 +1410,9 @@ fn parseInner(inner: &[u8]) -> Result<ParsedRecord, RecordError> {
 }
 
 fn deriveMaterial(suite: CipherSuite, trafficSecret: &[u8]) -> Result<KeyMaterial, RecordError> {
+  if suite.version() != TlsVersion.Tls13 {
+    return Result<KeyMaterial, RecordError>.failResult(RecordError.InvalidState)
+  }
   let expected = secretLength(suite)
   if trafficSecret.length != expected {
     return Result<KeyMaterial, RecordError>.failResult(
@@ -1255,6 +1589,214 @@ fn copyBuffer(
     index = index + 1
   }
   return ()
+}
+
+fn tls12Limit(suite: CipherSuite) -> u64 {
+  if suite.isChaCha() { return TLS12_CHACHA_RECORDS }
+  return TLS12_GCM_RECORDS
+}
+
+fn tls12Material(suite: CipherSuite, key: &[u8], iv: &[u8]) -> Result<KeyMaterial, RecordError> {
+  if suite.version() != TlsVersion.Tls12 {
+    return Result<KeyMaterial, RecordError>.failResult(RecordError.InvalidState)
+  }
+  let keyLength = suite.keyLength()
+  if key.length != keyLength {
+    return Result<KeyMaterial, RecordError>.failResult(
+      RecordError.InvalidSecretLength {requested: key.length, expected: keyLength},
+    )
+  }
+  let ivLength = suite.tls12IvLength()
+  if iv.length != ivLength {
+    return Result<KeyMaterial, RecordError>.failResult(
+      RecordError.InvalidSecretLength {requested: iv.length, expected: ivLength},
+    )
+  }
+  let mut material = KeyMaterial {key: zeroKey(), keyLength: keyLength, iv: zeroIv()}
+  let mut index: usize = 0
+  while index < keyLength {
+    material.key[index] = key[index]
+    index = index + 1
+  }
+  index = 0
+  while index < ivLength {
+    material.iv[index] = iv[index]
+    index = index + 1
+  }
+  return Result<KeyMaterial, RecordError>.succeed(move material)
+}
+
+// The TLS 1.2 additional data: the sequence number, the content type, the version, and the
+// plaintext length (RFC 5246 section 6.2.3.3).
+fn tls12Aad(sequence: u64, contentType: u8, length: usize) -> [u8; 13] {
+  let mut aad: [u8; 13] = [0, 0, 0, 0, 0, 0, 0, 0, contentType, 3, 3, 0, 0]
+  let mut index: usize = 0
+  while index < 8 {
+    let shift = usize.toU64((7 - index) * 8)
+    aad[index] = u64.toU8(u64.bitAnd(u64.shiftRight(sequence, shift), 255))
+    index = index + 1
+  }
+  aad[11] = usize.toU8(length / 256)
+  aad[12] = usize.toU8(length % 256)
+  return aad
+}
+
+fn explicitNonceLength(suite: CipherSuite) -> usize {
+  if suite.isChaCha() { return 0 }
+  return 8
+}
+
+fn queueProtectedTls12(
+  sender: &mut TlsRecordSender,
+  contentType: ContentType,
+  content: &[u8],
+  accepted: usize,
+) -> Result<OutputProgress, RecordError> {
+  let suite = sender.suite
+  let chacha = suite.isChaCha()
+  let explicitLength = explicitNonceLength(suite)
+  let typeByte = contentTypeByte(contentType)
+  let encryptedLength = explicitLength + accepted + TAG_LENGTH
+  let header = headerBytes(typeByte, encryptedLength)
+  let sequence = sender.sequence
+  let aad = tls12Aad(sequence, typeByte, accepted)
+  // For AES-GCM the IV holds the 4-byte salt and zeros, so this nonce is the salt followed by the
+  // sequence number, which is also the explicit nonce that the record carries.
+  let nonce = recordNonce(&sender.iv, sequence)
+  let keyLength = sender.keyLength
+  let key = sender.key
+  let keyBytes = Slice.view<u8>(&key, 0, keyLength)
+  let mut tag = zeroTag()
+  copySlice(&mut sender.staging, 0, content, accepted)
+  // `accepted <= CONTENT_LIMIT` fits staging, and the header, explicit nonce, ciphertext, and tag
+  // fit pending (`WIRE_LIMIT`). `allocateBytes` zero-fills every buffer, so all bytes are
+  // initialized.
+  unsafe {
+    let plaintext = RawBuffer.view<u8>(&sender.staging, 0, accepted)
+    let ciphertext = RawBuffer.viewMut<u8>(
+      &mut sender.pending,
+      HEADER_LENGTH + explicitLength,
+      accepted,
+    )
+    if chacha {
+      let sealed = mapChaChaSeal(
+        ChaCha20Poly1305.seal(keyBytes, &nonce, &aad, plaintext, move ciphertext, &mut tag),
+      )
+      if let Result<(), RecordError>.Failure {error} = move sealed {
+        return Result<OutputProgress, RecordError>.failResult(move error)
+      }
+    } else {
+      let sealed = mapAesSeal(
+        AesGcm.seal(keyBytes, &nonce, &aad, plaintext, move ciphertext, &mut tag),
+      )
+      if let Result<(), RecordError>.Failure {error} = move sealed {
+        return Result<OutputProgress, RecordError>.failResult(move error)
+      }
+    }
+  }
+  copyArray(&mut sender.pending, 0, &header)
+  if explicitLength > 0 {
+    let explicit = Slice.view<u8>(&nonce, 4, 8)
+    copyArray(&mut sender.pending, HEADER_LENGTH, explicit)
+  }
+  copyArray(&mut sender.pending, HEADER_LENGTH + explicitLength + accepted, &tag)
+  sender.pendingLength = HEADER_LENGTH + encryptedLength
+  sender.acknowledged = 0
+  sender.sequence = sender.sequence + 1
+  return outputProgress(accepted, OutputDemand.RecordQueued)
+}
+
+fn admitHeaderTls12(
+  receiver: &TlsRecordReceiver,
+  outerType: u8,
+  major: u8,
+  minor: u8,
+  payload: usize,
+) -> Result<usize, RecordError> {
+  if (outerType != 21 && outerType != 22 && outerType != 23) || major != 3 || minor != 3 {
+    return Result<usize, RecordError>.failResult(RecordError.InvalidContent)
+  }
+  let overhead = explicitNonceLength(receiver.suite) + TAG_LENGTH
+  if payload < overhead || payload - overhead > CONTENT_LIMIT {
+    return Result<usize, RecordError>.failResult(
+      RecordError.RecordOverflow {requested: payload, maximum: CONTENT_LIMIT + overhead},
+    )
+  }
+  let length = payload - overhead
+  if outerType == 21 && length != 2 {
+    return Result<usize, RecordError>.failResult(RecordError.InvalidContent)
+  }
+  if outerType == 22 && length == 0 {
+    return Result<usize, RecordError>.failResult(RecordError.InvalidContent)
+  }
+  return Result<usize, RecordError>.succeed(payload)
+}
+
+fn finishProtectedTls12(receiver: &mut TlsRecordReceiver) -> Result<(), RecordError> {
+  let sequence = receiver.sequence
+  if sequence >= receiver.limit {
+    return Result<(), RecordError>.failResult(RecordError.KeyUsageExhausted)
+  }
+  let suite = receiver.suite
+  let chacha = suite.isChaCha()
+  let explicitLength = explicitNonceLength(suite)
+  let payloadLength = receiver.expectedLength - HEADER_LENGTH
+  let ciphertextLength = payloadLength - explicitLength - TAG_LENGTH
+  let header = firstHeader(&receiver.wire)
+  let outerType = header[0]
+  let decoded = decodeContentType(outerType, true)
+  let contentType = match move decoded {
+    Option<ContentType>.None => {
+      return Result<(), RecordError>.failResult(RecordError.InvalidContent)
+    }
+    Option<ContentType>.Some {value} => value
+  }
+  let aad = tls12Aad(sequence, outerType, ciphertextLength)
+  let mut nonce = recordNonce(&receiver.iv, sequence)
+  if !chacha {
+    let mut index: usize = 0
+    while index < 8 {
+      // `admitHeaderTls12` checked that the payload holds the 8-byte explicit nonce.
+      nonce[4 + index] = unsafe RawBuffer.read<u8>(&receiver.wire, HEADER_LENGTH + index)
+      index = index + 1
+    }
+  }
+  let mut tag = zeroTag()
+  copyBuffer(
+    &mut tag,
+    &receiver.wire,
+    HEADER_LENGTH + explicitLength + ciphertextLength,
+    TAG_LENGTH,
+  )
+  let key = receiver.key
+  let keyBytes = Slice.view<u8>(&key, 0, receiver.keyLength)
+  // `admitHeaderTls12` bounds the ciphertext by `CONTENT_LIMIT`, so it fits the wire after the
+  // header and the explicit nonce, and the plaintext buffer. `allocateBytes` zero-fills every
+  // buffer, so all bytes are initialized.
+  let ciphertext = unsafe RawBuffer.view<u8>(
+    &receiver.wire,
+    HEADER_LENGTH + explicitLength,
+    ciphertextLength,
+  )
+  let plaintext = unsafe RawBuffer.viewMut<u8>(&mut receiver.plaintext, 0, ciphertextLength)
+  if chacha {
+    let opened = mapChaChaOpen(
+      ChaCha20Poly1305.open(keyBytes, &nonce, &aad, ciphertext, &tag, move plaintext),
+    )
+    if let Result<(), RecordError>.Failure {error} = move opened {
+      return Result<(), RecordError>.failResult(move error)
+    }
+  } else {
+    let opened = mapAesOpen(AesGcm.open(keyBytes, &nonce, &aad, ciphertext, &tag, move plaintext))
+    if let Result<(), RecordError>.Failure {error} = move opened {
+      return Result<(), RecordError>.failResult(move error)
+    }
+  }
+  receiver.recordType = contentType
+  receiver.recordLength = ciphertextLength
+  receiver.sequence = receiver.sequence + 1
+  receiver.ready = true
+  return Result<(), RecordError>.succeed(())
 }
 
 effect fn allocateBytes(length: usize) -> Intrinsic.RawBuffer<u8> ! OutOfMemoryError ? &mut Allocator {
