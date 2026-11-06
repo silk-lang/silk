@@ -25,8 +25,10 @@ The other AES modes have their own modules: `silk.crypto.aes_gcm`, `silk.crypto.
 `silk.crypto.aes_wrap` wraps keys.
 
 When the build targets x86-64 or AArch64 with the `aes` CPU feature, each round is one AES
-instruction. Otherwise the rounds use portable code that computes the S-box instead of reading a
-table, so the time does not depend on the key or the data on any target.
+instruction. A default x86-64 build checks at run time for AES-NI and SSSE3 and uses them when
+the machine has them, with CBC decryption, ECB and CTR running eight blocks at a time. Otherwise
+the rounds use portable code that computes the S-box instead of reading a table, so the time
+does not depend on the key or the data on any target.
 
 ## Errors
 The functions return an [`AesError`](#AesError). Every check comes before the first write, and on an error
@@ -231,9 +233,9 @@ Use it to build a block cipher mode that this module does not offer. For CBC, CT
 
 [`Aes.make`](#Aes.impl.make) takes a 16-byte (AES-128), 24-byte (AES-192), or 32-byte (AES-256) key and expands
 the encryption and decryption round keys once. The value is fixed-size and does not allocate.
-With the `aes` CPU feature on x86-64 or AArch64, each round is one instruction. Otherwise the
-portable rounds compute the S-box instead of reading a table, so the time does not depend on the
-key or the data.
+With the `aes` CPU feature on x86-64 or AArch64, or with AES-NI found at run time on x86-64,
+each round is one instruction. Otherwise the portable rounds compute the S-box instead of reading
+a table, so the time does not depend on the key or the data.
 
 ### Gotchas
 
