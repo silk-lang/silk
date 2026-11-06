@@ -17,6 +17,11 @@ AES-256-GCM, and the key exchange groups X25519 and P-256. It checks the certifi
 against your `TrustSnapshot`, the host name of your `ReferenceIdentity`, the CertificateVerify
 signature, and the Finished message. It gives no application data before all checks pass.
 
+When the server sends a CertificateRequest, the client answers with the [`ClientCredential`](#ClientCredential)
+given to [`Client.make`](#Client.impl.make): the chain and a CertificateVerify signed with its key, using a scheme
+that the server lists. With `ClientCredential.None`, or when no listed scheme fits the key, it
+sends an empty Certificate message, and the server decides whether to go on.
+
 Each call returns a [`Progress`](#Progress): how many bytes it took or wrote, and the next [`Demand`](#Demand).
 Output works in two steps: write [`Client.pendingOutput`](#Client.impl.pendingOutput) to the transport, and then call
 [`Client.ackWritten`](#Client.impl.ackWritten) with the number of bytes written. The client does not keep your buffers.
@@ -42,7 +47,7 @@ import silk.collections.list { List }
 import silk.system.random { Random }
 import silk.core.result { Result }
 import silk.system.system_clock { SystemClock }
-import silk.tls.client { AlpnConfig, Client, ClientConfig, ClientLimits, Progress, TlsError }
+import silk.tls.client { AlpnConfig, Client, ClientConfig, ClientCredential, ClientLimits, Progress, TlsError }
 import silk.tls.trust_anchor { TrustAnchor }
 import silk.tls.trust_snapshot { SnapshotLimits, TrustSnapshot, TrustSourceError }
 import silk.num.usize
@@ -87,7 +92,7 @@ pub effect fn main() -> i32
     alpn: AlpnConfig.defaults(),
     limits: ClientLimits.defaults()
   }
-  let made = run Client.make(&config, move trust, SystemClock.make(1789156800, 0))
+  let made = run Client.make(&config, move trust, SystemClock.make(1789156800, 0), ClientCredential.None)
     |> Effect.provideMut<Random>(&mut random)
     |> Effect.provideMut<Allocator>(&mut allocator)
   let mut client = match move made {
@@ -111,7 +116,7 @@ pub effect fn main() -> i32
 
 Import as `Client` with `import silk.tls.client { Client }`.
 
-Public declarations: 14.
+Public declarations: 15.
 
 <a id="NamedGroup"></a>
 
@@ -418,6 +423,26 @@ pub path: ValidationLimits
 
 Certificate-path policy.
 
+<a id="ClientLimits.credentialCertificates"></a>
+
+### Field `credentialCertificates`
+
+```silk
+pub credentialCertificates: usize
+```
+
+Maximum certificate count in a [`ClientCredential`](#ClientCredential) chain, at most 16.
+
+<a id="ClientLimits.credentialBytes"></a>
+
+### Field `credentialBytes`
+
+```silk
+pub credentialBytes: usize
+```
+
+Maximum aggregate DER bytes in a [`ClientCredential`](#ClientCredential) chain.
+
 <a id="ClientLimits.impl.Copy"></a>
 
 ## Implementation `Copy for ClientLimits`
@@ -483,6 +508,58 @@ pub limits: ClientLimits
 ```
 
 Finite connection limits and nested certificate policies.
+
+<a id="ClientCredential"></a>
+
+## `ClientCredential`
+
+```silk
+pub union ClientCredential<'a>
+```
+
+The certificate that a [`Client`](#Client) sends when the server asks for one, in [`Client.make`](#Client.impl.make).
+
+<a id="ClientCredential.None"></a>
+
+### `None`
+
+```silk
+None
+```
+
+The client answers a CertificateRequest with an empty Certificate message.
+
+<a id="ClientCredential.Certificate"></a>
+
+### `Certificate`
+
+```silk
+Certificate
+```
+
+The client sends `certificates`, leaf first, and signs CertificateVerify with `key`, the
+leaf's private key. It signs only with a scheme that the server's CertificateRequest lists;
+otherwise it sends an empty Certificate message.
+
+<a id="ClientCredential.Certificate.certificates"></a>
+
+#### Field `certificates`
+
+```silk
+pub certificates: &'a [CertificateDer<'a>]
+```
+
+The chain, leaf first. [`Client.make`](#Client.impl.make) copies it.
+
+<a id="ClientCredential.Certificate.key"></a>
+
+#### Field `key`
+
+```silk
+pub key: SigningKey
+```
+
+The private key of the leaf.
 
 <a id="Demand"></a>
 
@@ -1041,6 +1118,26 @@ CertificateProfile
 
 The configured semantic certificate-profile policy.
 
+<a id="TlsLimitKind.CredentialCertificates"></a>
+
+### `CredentialCertificates`
+
+```silk
+CredentialCertificates
+```
+
+Certificate count in the client's credential chain.
+
+<a id="TlsLimitKind.CredentialBytes"></a>
+
+### `CredentialBytes`
+
+```silk
+CredentialBytes
+```
+
+DER bytes in the client's credential chain.
+
 <a id="TlsLimitKind.impl.Debug"></a>
 
 ## Implementation `Debug for TlsLimitKind`
@@ -1378,6 +1475,66 @@ NoApplicationProtocol
 
 The server omits a required ALPN selection or selects a protocol that was not offered.
 
+<a id="TlsError.EmptyCredential"></a>
+
+### `EmptyCredential`
+
+```silk
+EmptyCredential
+```
+
+The [`ClientCredential`](#ClientCredential) has no certificates.
+
+<a id="TlsError.CredentialDecode"></a>
+
+### `CredentialDecode`
+
+```silk
+CredentialDecode
+```
+
+The [`ClientCredential`](#ClientCredential) leaf certificate did not decode.
+
+<a id="TlsError.CredentialDecode.error"></a>
+
+#### Field `error`
+
+```silk
+pub error: DecodeError
+```
+
+The decoder failure.
+
+<a id="TlsError.CredentialKeyMismatch"></a>
+
+### `CredentialKeyMismatch`
+
+```silk
+CredentialKeyMismatch
+```
+
+The [`ClientCredential`](#ClientCredential) key is not the key of its leaf certificate.
+
+<a id="TlsError.Signing"></a>
+
+### `Signing`
+
+```silk
+Signing
+```
+
+The credential key could not sign CertificateVerify.
+
+<a id="TlsError.Signing.error"></a>
+
+#### Field `error`
+
+```silk
+pub error: SigningError
+```
+
+The signing failure.
+
 <a id="TlsError.impl.Debug"></a>
 
 ## Implementation `Debug for TlsError`
@@ -1553,6 +1710,7 @@ pub effect fn make<'a>(
     config: &ClientConfig<'a>,
     trust: TrustSnapshot,
     validationTime: Instant,
+    credential: ClientCredential<'a>,
   ) -> Result<Client, TlsError>
   ! OutOfMemoryError
   ? &mut Allocator | &mut Random
@@ -1561,11 +1719,15 @@ pub effect fn make<'a>(
 Returns a new client for `config` and `trust`, with the ClientHello already queued as pending
 output.
 
-`validationTime` is the time used to check certificate dates. The client copies `config` and
-consumes `trust`. A DNS name is sent as SNI in lowercase. An IP address sends no SNI.
+`validationTime` is the time used to check certificate dates. `credential` is what the client
+sends when the server asks for a certificate. The client copies `config` and the credential's
+chain, and consumes `trust` and the credential's key. A DNS name is sent as SNI in lowercase.
+An IP address sends no SNI.
 
 #### Errors
-- `Failure` with a `TlsError` if `config` is not valid.
+- `Failure` with a `TlsError` if `config` is not valid, or if the credential has no
+  certificates (`EmptyCredential`), a leaf that does not decode (`CredentialDecode`), a key
+  that is not the leaf's (`CredentialKeyMismatch`), or a chain over the credential limits.
 - `OutOfMemoryError` if the `Allocator` fails.
 
 #### Gotchas

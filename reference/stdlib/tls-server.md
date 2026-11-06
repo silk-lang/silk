@@ -17,7 +17,7 @@ ChaCha20-Poly1305, AES-128-GCM, and AES-256-GCM. It selects the key exchange gro
 X25519, P-256, and P-384 in that order, limited by your [`GroupPolicy`](#GroupPolicy). If the client sent no
 key share for an allowed group that it supports, the server sends one HelloRetryRequest. The
 server signs CertificateVerify with the leaf's ECDSA P-256, ECDSA P-384, Ed25519, or RSA key
-([`ServerKey`](#ServerKey)), using a scheme that the client offers, and checks the client's Finished
+([`SigningKey`](./tls-signature.md#SigningKey)), using a scheme that the client offers, and checks the client's Finished
 message. An RSA key signs with RSA-PSS, preferring SHA-256, then SHA-384, then SHA-512.
 
 The server reads the client's SNI name, which you get from [`Server.serverName`](#Server.impl.serverName), and selects an
@@ -42,9 +42,10 @@ anchors for the `ClientAuth` purpose. [`Server.clientCertificateStatus`](#Server
 [`Server.clientCertificates`](#Server.impl.clientCertificates) tell you the result.
 
 ## Gotchas
-The server does not support PSK, session tickets, or 0-RTT data. It does not ask for `ed25519`
-client signatures, because the certificate profile admits no Ed25519 client keys. A client that sends early data fails with `BadRecordMac`. The server sends no
-alert when it fails, so close the transport. Dropping the server does not send `close_notify`.
+The server does not support PSK, session tickets, or 0-RTT data. A client that sends early data
+fails with `BadRecordMac`. It does not ask for `ed25519` client signatures, because the
+certificate profile admits no Ed25519 client keys. The server sends no alert when it fails, so
+close the transport. Dropping the server does not send `close_notify`.
 Call [`Server.closeWrite`](#Server.impl.closeWrite) first. Secrets are not erased.
 
 ## Examples
@@ -56,14 +57,14 @@ import silk.system.random { Random }
 import silk.core.result { Result }
 import silk.crypto.p256 { P256 }
 import silk.tls.client { AlpnConfig }
+import silk.tls.certificate { CertificateDer }
+import silk.tls.signature { SigningKey }
 import silk.tls.server {
-  CertificateDer,
   ClientAuth,
   GroupPolicy,
   Server,
   ServerConfig,
   ServerError,
-  ServerKey,
   ServerLimits,
 }
 import silk.collections.slice { Slice }
@@ -99,7 +100,7 @@ pub effect fn main() -> i32
     clientAuth: ClientAuth<'static>.Off,
     limits: ServerLimits.defaults(),
   }
-  let made = run Server.make(&config, ServerKey.EcdsaP256 { key: move key })
+  let made = run Server.make(&config, SigningKey.EcdsaP256 { key: move key })
     |> Effect.provideMut<Allocator>(&mut allocator)
   return match move made {
     Result<Server, ServerError>.Success {..} => 1
@@ -111,7 +112,7 @@ pub effect fn main() -> i32
 
 Import as `Server` with `import silk.tls.server { Server }`.
 
-Public declarations: 16.
+Public declarations: 14.
 
 <a id="ServerGroup"></a>
 
@@ -238,125 +239,6 @@ pub fn defaults() -> GroupPolicy
 ```
 
 Returns the policy that allows all three groups.
-
-<a id="CertificateDer"></a>
-
-## `CertificateDer`
-
-```silk
-pub struct CertificateDer<'a>
-```
-
-One borrowed DER certificate of the server's chain.
-
-<a id="CertificateDer.bytes"></a>
-
-### Field `bytes`
-
-```silk
-pub bytes: &'a [u8]
-```
-
-The DER bytes of the certificate.
-
-<a id="CertificateDer.impl.Copy"></a>
-
-## Implementation `Copy for CertificateDer<'a>`
-
-```silk
-impl<'a> Copy for CertificateDer<'a>
-```
-
-<a id="ServerKey"></a>
-
-## `ServerKey`
-
-```silk
-pub union ServerKey
-```
-
-The private key of the leaf certificate. The server signs CertificateVerify with it.
-
-<a id="ServerKey.EcdsaP256"></a>
-
-### `EcdsaP256`
-
-```silk
-EcdsaP256
-```
-
-An ECDSA P-256 key, used with the `ecdsa_secp256r1_sha256` scheme.
-
-<a id="ServerKey.EcdsaP256.key"></a>
-
-#### Field `key`
-
-```silk
-pub key: P256
-```
-
-The private key.
-
-<a id="ServerKey.EcdsaP384"></a>
-
-### `EcdsaP384`
-
-```silk
-EcdsaP384
-```
-
-An ECDSA P-384 key, used with the `ecdsa_secp384r1_sha384` scheme.
-
-<a id="ServerKey.EcdsaP384.key"></a>
-
-#### Field `key`
-
-```silk
-pub key: P384
-```
-
-The private key.
-
-<a id="ServerKey.Ed25519"></a>
-
-### `Ed25519`
-
-```silk
-Ed25519
-```
-
-An Ed25519 key, used with the `ed25519` scheme.
-
-<a id="ServerKey.Ed25519.key"></a>
-
-#### Field `key`
-
-```silk
-pub key: Ed25519PrivateKey
-```
-
-The private key.
-
-<a id="ServerKey.RsaPss"></a>
-
-### `RsaPss`
-
-```silk
-RsaPss
-```
-
-An RSA key for an `rsaEncryption` certificate, used with the `rsa_pss_rsae_sha256`,
-`rsa_pss_rsae_sha384`, or `rsa_pss_rsae_sha512` scheme, in that order of preference.
-
-<a id="ServerKey.RsaPss.key"></a>
-
-#### Field `key`
-
-```silk
-pub key: RsaPrivateKey
-```
-
-The private key.
 
 <a id="ServerLimits"></a>
 
@@ -543,7 +425,7 @@ Borrowed server configuration that [`Server.make`](#Server.impl.make) copies int
 pub certificates: &'a [CertificateDer<'a>]
 ```
 
-The certificate chain, leaf first. The leaf's public key matches the [`ServerKey`](#ServerKey).
+The certificate chain, leaf first. The leaf's public key matches the [`SigningKey`](./tls-signature.md#SigningKey).
 
 <a id="ServerConfig.alpn"></a>
 
@@ -1165,7 +1047,7 @@ The client supports no group that the [`GroupPolicy`](#GroupPolicy) allows.
 SignatureScheme
 ```
 
-The client does not accept the signature scheme of the [`ServerKey`](#ServerKey).
+The client does not accept the signature scheme of the [`SigningKey`](./tls-signature.md#SigningKey).
 
 <a id="NegotiationFailure.impl.Debug"></a>
 
@@ -1386,7 +1268,7 @@ The complete strict decoder failure.
 KeyMismatch
 ```
 
-The configured leaf certificate's public key does not match the [`ServerKey`](#ServerKey).
+The configured leaf certificate's public key does not match the [`SigningKey`](./tls-signature.md#SigningKey).
 
 <a id="ServerError.PeerAlert"></a>
 
@@ -1468,26 +1350,26 @@ InvalidKeyShare
 
 The client's key share is not a valid public key.
 
-<a id="ServerError.RsaSignature"></a>
+<a id="ServerError.Signing"></a>
 
-### `RsaSignature`
+### `Signing`
 
 ```silk
-RsaSignature
+Signing
 ```
 
-The RSA key could not sign CertificateVerify, for example because it is too small for the
-scheme.
+The key could not sign CertificateVerify, for example because an RSA key is too small for
+the scheme.
 
-<a id="ServerError.RsaSignature.error"></a>
+<a id="ServerError.Signing.error"></a>
 
 #### Field `error`
 
 ```silk
-pub error: RsaError
+pub error: SigningError
 ```
 
-The RSA failure.
+The signing failure.
 
 <a id="ServerError.Finished"></a>
 
@@ -1727,7 +1609,7 @@ impl Server
 ### Associated function `make`
 
 ```silk
-pub effect fn make<'a>(config: &ServerConfig<'a>, key: ServerKey) -> Result<Server, ServerError>
+pub effect fn make<'a>(config: &ServerConfig<'a>, key: SigningKey) -> Result<Server, ServerError>
     ! OutOfMemoryError
     ? &mut Allocator
 ```

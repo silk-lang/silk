@@ -13,6 +13,11 @@
 //! against your `TrustSnapshot`, the host name of your `ReferenceIdentity`, the CertificateVerify
 //! signature, and the Finished message. It gives no application data before all checks pass.
 //!
+//! When the server sends a CertificateRequest, the client answers with the [`ClientCredential`]
+//! given to [`Client.make`]: the chain and a CertificateVerify signed with its key, using a scheme
+//! that the server lists. With `ClientCredential.None`, or when no listed scheme fits the key, it
+//! sends an empty Certificate message, and the server decides whether to go on.
+//!
 //! Each call returns a [`Progress`]: how many bytes it took or wrote, and the next [`Demand`].
 //! Output works in two steps: write [`Client.pendingOutput`] to the transport, and then call
 //! [`Client.ackWritten`] with the number of bytes written. The client does not keep your buffers.
@@ -38,7 +43,7 @@
 //! import silk.system.random { Random }
 //! import silk.core.result { Result }
 //! import silk.system.system_clock { SystemClock }
-//! import silk.tls.client { AlpnConfig, Client, ClientConfig, ClientLimits, Progress, TlsError }
+//! import silk.tls.client { AlpnConfig, Client, ClientConfig, ClientCredential, ClientLimits, Progress, TlsError }
 //! import silk.tls.trust_anchor { TrustAnchor }
 //! import silk.tls.trust_snapshot { SnapshotLimits, TrustSnapshot, TrustSourceError }
 //! import silk.num.usize
@@ -83,7 +88,7 @@
 //!     alpn: AlpnConfig.defaults(),
 //!     limits: ClientLimits.defaults()
 //!   }
-//!   let made = run Client.make(&config, move trust, SystemClock.make(1789156800, 0))
+//!   let made = run Client.make(&config, move trust, SystemClock.make(1789156800, 0), ClientCredential.None)
 //!     |> Effect.provideMut<Random>(&mut random)
 //!     |> Effect.provideMut<Allocator>(&mut allocator)
 //!   let mut client = match move made {
@@ -109,7 +114,7 @@
 
 import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.collections.bytes {Bytes}
-import silk.tls.certificate {Certificate, DecodeError, DecodeLimits}
+import silk.tls.certificate {Certificate, CertificateDer, DecodeError, DecodeLimits}
 import silk.tls.certificate_identities {
   CertificateSan,
   SanDecodeError,
@@ -162,7 +167,14 @@ import silk.tls.record {
   TlsRecordReceiver,
   TlsRecordSender,
 }
-import silk.tls.signature {HandshakeSignature, SignatureFailure}
+import silk.tls.signature {
+  HandshakeSignature,
+  SIGNATURE_LIMIT,
+  SchemeSet,
+  SignatureFailure,
+  SigningError,
+  SigningKey,
+}
 import silk.tls.trust_snapshot {TrustSnapshot}
 import silk.tls.trust_anchor {TrustAnchor}
 import silk.num.u8
@@ -251,6 +263,10 @@ pub struct ClientLimits {
   pub identity: IdentityLimits,
   /// Certificate-path policy.
   pub path: ValidationLimits,
+  /// Maximum certificate count in a [`ClientCredential`] chain, at most 16.
+  pub credentialCertificates: usize,
+  /// Maximum aggregate DER bytes in a [`ClientCredential`] chain.
+  pub credentialBytes: usize,
 }
 
 impl Copy for ClientLimits {}
@@ -275,6 +291,8 @@ impl ClientLimits {
       sanDecode: SanDecodeLimits.standard(),
       identity: IdentityLimits.standard(),
       path: ValidationLimits.defaults(),
+      credentialCertificates: 16,
+      credentialBytes: 262144,
     }
   }
 }
@@ -287,6 +305,21 @@ pub struct ClientConfig<'a> {
   pub alpn: AlpnConfig<'a>,
   /// Finite connection limits and nested certificate policies.
   pub limits: ClientLimits,
+}
+
+/// The certificate that a [`Client`] sends when the server asks for one, in [`Client.make`].
+pub union ClientCredential<'a> {
+  /// The client answers a CertificateRequest with an empty Certificate message.
+  None,
+  /// The client sends `certificates`, leaf first, and signs CertificateVerify with `key`, the
+  /// leaf's private key. It signs only with a scheme that the server's CertificateRequest lists;
+  /// otherwise it sends an empty Certificate message.
+  Certificate {
+    /// The chain, leaf first. [`Client.make`] copies it.
+    pub certificates: &'a [CertificateDer<'a>],
+    /// The private key of the leaf.
+    pub key: SigningKey,
+  },
 }
 
 /// The next action or observable connection event of a [`Client`], in [`Progress.demand`].
@@ -437,6 +470,10 @@ pub enum TlsLimitKind {
   CertificatePath,
   /// The configured semantic certificate-profile policy.
   CertificateProfile,
+  /// Certificate count in the client's credential chain.
+  CredentialCertificates,
+  /// DER bytes in the client's credential chain.
+  CredentialBytes,
 }
 
 impl Debug for TlsLimitKind {
@@ -462,6 +499,8 @@ impl Debug for TlsLimitKind {
       TlsLimitKind.CertificateIdentity => run Format.write(&mut formatter, b"CertificateIdentity")
       TlsLimitKind.CertificatePath => run Format.write(&mut formatter, b"CertificatePath")
       TlsLimitKind.CertificateProfile => run Format.write(&mut formatter, b"CertificateProfile")
+      TlsLimitKind.CredentialCertificates => run Format.write(&mut formatter, b"CredentialCertificates")
+      TlsLimitKind.CredentialBytes => run Format.write(&mut formatter, b"CredentialBytes")
     }
   }
 }
@@ -557,6 +596,20 @@ pub union TlsError {
   Truncated,
   /// The server omits a required ALPN selection or selects a protocol that was not offered.
   NoApplicationProtocol,
+  /// The [`ClientCredential`] has no certificates.
+  EmptyCredential,
+  /// The [`ClientCredential`] leaf certificate did not decode.
+  CredentialDecode {
+    /// The decoder failure.
+    pub error: DecodeError,
+  },
+  /// The [`ClientCredential`] key is not the key of its leaf certificate.
+  CredentialKeyMismatch,
+  /// The credential key could not sign CertificateVerify.
+  Signing {
+    /// The signing failure.
+    pub error: SigningError,
+  },
 }
 
 impl Debug for TlsError {
@@ -611,6 +664,18 @@ impl Debug for TlsError {
       TlsError.HandshakeTruncated => run Format.write(&mut formatter, b"HandshakeTruncated")
       TlsError.Truncated => run Format.write(&mut formatter, b"Truncated")
       TlsError.NoApplicationProtocol => run Format.write(&mut formatter, b"NoApplicationProtocol")
+      TlsError.EmptyCredential => run Format.write(&mut formatter, b"EmptyCredential")
+      TlsError.CredentialDecode {error} => {
+        let mut record = run Format.debugRecord("CredentialDecode", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      TlsError.CredentialKeyMismatch => run Format.write(&mut formatter, b"CredentialKeyMismatch")
+      TlsError.Signing {error} => {
+        let mut record = run Format.debugRecord("Signing", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
     }
   }
 }
@@ -700,6 +765,7 @@ enum PendingKind {
   ClientHello,
   RetryClientHello,
   EmptyCertificate,
+  CredentialFlight,
   Finished,
   Application,
   KeyUpdate,
@@ -792,6 +858,12 @@ pub struct Client {
   handshakeMessages: usize,
   handshakeBytes: usize,
   certificateRequest: bool,
+  requestedSchemes: SchemeSet,
+  credentialKey: Option<SigningKey>,
+  credentialFlight: Intrinsic.RawBuffer<u8>,
+  credentialCertificateLength: usize,
+  credentialFlightLength: usize,
+  credentialFlightOffset: usize,
   peerCertificates: List<Certificate>,
   pathIndices: [usize; 16],
   pathLength: usize,
@@ -829,11 +901,15 @@ impl Client {
   /// Returns a new client for `config` and `trust`, with the ClientHello already queued as pending
   /// output.
   ///
-  /// `validationTime` is the time used to check certificate dates. The client copies `config` and
-  /// consumes `trust`. A DNS name is sent as SNI in lowercase. An IP address sends no SNI.
+  /// `validationTime` is the time used to check certificate dates. `credential` is what the client
+  /// sends when the server asks for a certificate. The client copies `config` and the credential's
+  /// chain, and consumes `trust` and the credential's key. A DNS name is sent as SNI in lowercase.
+  /// An IP address sends no SNI.
   ///
   /// # Errors
-  /// - `Failure` with a `TlsError` if `config` is not valid.
+  /// - `Failure` with a `TlsError` if `config` is not valid, or if the credential has no
+  ///   certificates (`EmptyCredential`), a leaf that does not decode (`CredentialDecode`), a key
+  ///   that is not the leaf's (`CredentialKeyMismatch`), or a chain over the credential limits.
   /// - `OutOfMemoryError` if the `Allocator` fails.
   ///
   /// # Gotchas
@@ -843,6 +919,7 @@ impl Client {
     config: &ClientConfig<'a>,
     trust: TrustSnapshot,
     validationTime: Instant,
+    credential: ClientCredential<'a>,
   ) -> Result<Client, TlsError>
   ! OutOfMemoryError
   ? &mut Allocator | &mut Random {
@@ -876,7 +953,6 @@ impl Client {
     if let Option<TlsError>.Some {value: error} = move alpnError {
       return Result<Client, TlsError>.failResult(move error)
     }
-
     let dnsLength = referenceDnsLength(config.reference)
     let alpnLength = alpnPayloadLength(config.alpn)
     let alpnCount = alpnProtocolCount(config.alpn)
@@ -901,6 +977,13 @@ impl Client {
           limit: config.limits.handshakeBodyBytes,
         },
       )
+    }
+    let preparedResult = run prepareCredential(move credential, config.limits)
+    let prepared = match move preparedResult {
+      Result<PreparedCredential, TlsError>.Failure {error} => {
+        return Result<Client, TlsError>.failResult(move error)
+      }
+      Result<PreparedCredential, TlsError>.Success {value} => move value
     }
     let mut dns = run allocateBytes(nonzero(dnsLength))
     let mut alpn = run allocateBytes(nonzero(alpnLength))
@@ -959,6 +1042,12 @@ impl Client {
       handshakeMessages: 0,
       handshakeBytes: 0,
       certificateRequest: false,
+      requestedSchemes: SchemeSet.empty(),
+      credentialKey: move prepared.key,
+      credentialFlight: move prepared.flight,
+      credentialCertificateLength: prepared.certificateLength,
+      credentialFlightLength: 0,
+      credentialFlightOffset: 0,
       peerCertificates: List<Certificate>.make(),
       pathIndices: zeroUsize16(),
       pathLength: 0,
@@ -1360,6 +1449,10 @@ fn copyTlsError(error: &TlsError) -> TlsError {
     TlsError.HandshakeTruncated => TlsError.HandshakeTruncated
     TlsError.Truncated => TlsError.Truncated
     TlsError.NoApplicationProtocol => TlsError.NoApplicationProtocol
+    TlsError.EmptyCredential => TlsError.EmptyCredential
+    TlsError.CredentialDecode {error: cause} => TlsError.CredentialDecode {error: cause}
+    TlsError.CredentialKeyMismatch => TlsError.CredentialKeyMismatch
+    TlsError.Signing {error: cause} => TlsError.Signing {error: cause}
   }
 }
 
@@ -1428,6 +1521,12 @@ effect fn allocateBytes(length: usize) -> Intrinsic.RawBuffer<u8> ! OutOfMemoryE
 }
 
 fn validateLimits(limits: ClientLimits) -> Option<TlsError> {
+  if limits.credentialCertificates == 0 || limits.credentialCertificates > 16 {
+    return limitOption(TlsLimitKind.CredentialCertificates, limits.credentialCertificates)
+  }
+  if limits.credentialBytes == 0 || limits.credentialBytes > 16777215 {
+    return limitOption(TlsLimitKind.CredentialBytes, limits.credentialBytes)
+  }
   if limits.handshakeBodyBytes == 0 || limits.handshakeBodyBytes > 16777215 {
     return limitOption(TlsLimitKind.HandshakeBodyBytes, limits.handshakeBodyBytes)
   }
@@ -2026,6 +2125,12 @@ fn completePending(client: &mut Client) -> Result<(), TlsError> {
   if kind == PendingKind.EmptyCertificate {
     return queueClientFinished(&mut client.*)
   }
+  if kind == PendingKind.CredentialFlight {
+    if client.credentialFlightOffset < client.credentialFlightLength {
+      return queueCredentialChunk(&mut client.*)
+    }
+    return queueClientFinished(&mut client.*)
+  }
   if kind == PendingKind.Finished {
     let suite = client.selectedSuite
     let trafficSecret = client.clientTrafficSecret
@@ -2525,7 +2630,7 @@ effect fn dispatchHandshake(
   }
   if client.state == ClientState.AwaitServerFinished {
     if messageType != 20 { return unexpectedHandshake() }
-    return handleServerFinished(&mut client.*, messageLength)
+    return run handleServerFinished(&mut client.*, messageLength)
   }
   if postHandshake {
     if messageType == 4 { return handleNewSessionTicket(&mut client.*, messageLength) }
@@ -3303,6 +3408,7 @@ fn handleCertificateRequest(client: &mut Client, messageLength: usize) -> Result
       if !validRequestedSignatureSchemes(&client.*, cursor, length) {
         return certificateRequestFailure()
       }
+      client.requestedSchemes = requestedSchemes(&client.*, cursor, length)
       seen13 = true
     } else if kind == 5 || kind == 18 {
       if length != 0 { return certificateRequestFailure() }
@@ -3376,6 +3482,18 @@ fn validRequestedSignatureSchemes(
     cursor = cursor + 2
   }
   return cursor == end
+}
+
+// The schemes of a `signature_algorithms` extension that `validRequestedSignatureSchemes` accepted.
+fn requestedSchemes(client: &Client, start: usize, length: usize) -> SchemeSet {
+  let mut schemes = SchemeSet.empty()
+  let mut cursor = start + 2
+  let end = start + length
+  while cursor < end {
+    schemes.insert(readU16Raw(&client.handshake, cursor))
+    cursor = cursor + 2
+  }
+  return schemes
 }
 
 fn validCertificateAuthorities(client: &Client, start: usize, length: usize) -> bool {
@@ -3818,7 +3936,8 @@ fn handleCertificateVerify(client: &mut Client, messageLength: usize) -> Result<
   return Result<(), TlsError>.succeed(())
 }
 
-fn handleServerFinished(client: &mut Client, messageLength: usize) -> Result<(), TlsError> {
+effect fn handleServerFinished(client: &mut Client, messageLength: usize) -> Result<(), TlsError>
+? &mut Random {
   let mut expectedLength: usize = 32
   if client.selectedSuite == CipherSuite.Aes256GcmSha384 { expectedLength = 48 }
   if messageLength != HANDSHAKE_HEADER_LENGTH + expectedLength || messageLength != client.handshakeLength {
@@ -3887,7 +4006,7 @@ fn handleServerFinished(client: &mut Client, messageLength: usize) -> Result<(),
   }
   client.state = ClientState.ClientFinishedPending
   if client.certificateRequest {
-    return queueEmptyCertificate(&mut client.*)
+    return run queueCertificateFlight(&mut client.*)
   }
   return queueClientFinished(&mut client.*)
 }
@@ -3981,6 +4100,216 @@ fn clientApplicationLabel() -> [u8; 12] {
 
 fn serverApplicationLabel() -> [u8; 12] {
   return [115, 32, 97, 112, 32, 116, 114, 97, 102, 102, 105, 99]
+}
+
+struct PreparedCredential {
+  key: Option<SigningKey>,
+  flight: Intrinsic.RawBuffer<u8>,
+  certificateLength: usize,
+}
+
+// Checks the credential and writes its Certificate message to the start of a buffer that also
+// holds a CertificateVerify after it.
+effect fn prepareCredential<'a>(credential: ClientCredential<'a>, limits: ClientLimits) -> Result<
+  PreparedCredential,
+  TlsError
+>
+! OutOfMemoryError
+? &mut Allocator {
+  return match move credential {
+    ClientCredential<'a>.None => {
+      let flight = run allocateBytes(usize.ONE)
+      return Result<PreparedCredential, TlsError>.succeed(PreparedCredential {
+        key: Option<SigningKey>.none(),
+        flight: move flight,
+        certificateLength: 0,
+      })
+    }
+    ClientCredential<'a>.Certificate {certificates, key} => {
+      if certificates.length == 0 {
+        return Result<PreparedCredential, TlsError>.failResult(TlsError.EmptyCredential)
+      }
+      if certificates.length > limits.credentialCertificates {
+        return Result<PreparedCredential, TlsError>.failResult(TlsError.LimitExceeded {
+          kind: TlsLimitKind.CredentialCertificates,
+          limit: limits.credentialCertificates,
+        })
+      }
+      let mut total = usize.ZERO
+      let mut index = usize.ZERO
+      while index < certificates.length {
+        let length = certificates[index].bytes.length
+        if length == 0 || length > limits.credentialBytes - total {
+          return Result<PreparedCredential, TlsError>.failResult(TlsError.LimitExceeded {
+            kind: TlsLimitKind.CredentialBytes,
+            limit: limits.credentialBytes,
+          })
+        }
+        total = total + length
+        index = index + usize.ONE
+      }
+      let decoded = run Certificate.decodeDer(certificates[0].bytes, limits.certificateDecode)
+      let leaf = match move decoded {
+        Result<Certificate, DecodeError>.Failure {error} => {
+          return Result<PreparedCredential, TlsError>.failResult(TlsError.CredentialDecode {
+            error: error,
+          })
+        }
+        Result<Certificate, DecodeError>.Success {value} => move value
+      }
+      if !key.matches(&leaf) {
+        return Result<PreparedCredential, TlsError>.failResult(TlsError.CredentialKeyMismatch)
+      }
+      drop leaf
+
+      // Certificate: header, empty context, list length, then each entry with no extensions.
+      let listLength = total + certificates.length * 5
+      let certificateLength = HANDSHAKE_HEADER_LENGTH + 4 + listLength
+      let mut flight = run allocateBytes(certificateLength + 8 + SIGNATURE_LIMIT)
+      RawBuffer.fill(&mut flight, 0, usize.ONE, 11)
+      setU24(&mut flight, usize.ONE, 4 + listLength)
+      RawBuffer.fill(&mut flight, 4, usize.ONE, 0)
+      setU24(&mut flight, 5, listLength)
+      let mut cursor: usize = 8
+      index = 0
+      while index < certificates.length {
+        let der = certificates[index].bytes
+        setU24(&mut flight, cursor, der.length)
+        // The buffer holds `certificateLength` plus room for CertificateVerify, and each entry
+        // ends within `certificateLength`.
+        unsafe RawBuffer.copy<u8>(&mut flight, cursor + 3, der, der.length)
+        cursor = cursor + 3 + der.length
+        RawBuffer.fill(&mut flight, cursor, 2, 0)
+        cursor = cursor + 2
+        index = index + usize.ONE
+      }
+      return Result<PreparedCredential, TlsError>.succeed(PreparedCredential {
+        key: Option<SigningKey>.some(move key),
+        flight: move flight,
+        certificateLength: certificateLength,
+      })
+    }
+  }
+}
+
+// Queues the client's Certificate, and its CertificateVerify when it has a key for a requested
+// scheme, or an empty Certificate when it has no usable credential.
+effect fn queueCertificateFlight(client: &mut Client) -> Result<(), TlsError> ? &mut Random {
+  let scheme = match &client.credentialKey {
+    Option<SigningKey>.Some {value: key} => key.chooseScheme(&client.requestedSchemes)
+    Option<SigningKey>.None => Option<usize>.none()
+  }
+  let selected = match scheme {
+    Option<usize>.None => {
+      return queueEmptyCertificate(&mut client.*)
+    }
+    Option<usize>.Some {value} => value
+  }
+  let certificateLength = client.credentialCertificateLength
+  // `prepareCredential` wrote every byte of the Certificate message.
+  let certificate = unsafe RawBuffer.view<u8>(&client.credentialFlight, 0, certificateLength)
+  if client.selectedSuite == CipherSuite.Aes256GcmSha384 {
+    client.transcript384.update(certificate)
+  } else {
+    client.transcript256.update(certificate)
+  }
+  drop certificate
+
+  // The signed content: 64 spaces, the context, a zero byte, and the transcript hash.
+  let context: [u8; 33] = [
+    84, 76, 83, 32, 49, 46, 51, 44, 32, 99, 108, 105, 101, 110, 116, 32,
+    67, 101, 114, 116, 105, 102, 105, 99, 97, 116, 101, 86, 101, 114, 105, 102,
+    121,
+  ]
+  let mut content: [u8; 146] = [32; 146]
+  let mut contentLength: usize = 98
+  let mut index: usize = 0
+  while index < 33 {
+    content[64 + index] = context[index]
+    index = index + 1
+  }
+  content[97] = 0
+  if client.selectedSuite == CipherSuite.Aes256GcmSha384 {
+    let digest = client.transcript384.checkpoint()
+    index = 0
+    while index < 48 {
+      content[98 + index] = digest[index]
+      index = index + 1
+    }
+    contentLength = 146
+  } else {
+    let digest = client.transcript256.checkpoint()
+    index = 0
+    while index < 32 {
+      content[98 + index] = digest[index]
+      index = index + 1
+    }
+    contentLength = 130
+  }
+  let mut signature: [u8; 1024] = [0; 1024]
+  let signed = match &client.credentialKey {
+    Option<SigningKey>.Some {value: key} => run key.sign(
+      selected,
+      Slice.view<u8>(&content, 0, contentLength),
+      &mut signature,
+    )
+    Option<SigningKey>.None => Result<usize, SigningError>.failResult(SigningError.UnsupportedScheme)
+  }
+  let signatureLength = match move signed {
+    Result<usize, SigningError>.Failure {error} => {
+      return Result<(), TlsError>.failResult(TlsError.Signing {error: error})
+    }
+    Result<usize, SigningError>.Success {value} => value
+  }
+  let verifyStart = certificateLength
+  RawBuffer.fill(&mut client.credentialFlight, verifyStart, usize.ONE, 15)
+  setU24(&mut client.credentialFlight, verifyStart + 1, signatureLength + 4)
+  RawBuffer.fill(&mut client.credentialFlight, verifyStart + 4, usize.ONE, usize.toU8(selected / 256))
+  RawBuffer.fill(&mut client.credentialFlight, verifyStart + 5, usize.ONE, usize.toU8(selected % 256))
+  RawBuffer.fill(
+    &mut client.credentialFlight,
+    verifyStart + 6,
+    usize.ONE,
+    usize.toU8(signatureLength / 256),
+  )
+  RawBuffer.fill(
+    &mut client.credentialFlight,
+    verifyStart + 7,
+    usize.ONE,
+    usize.toU8(signatureLength % 256),
+  )
+  // The buffer has `8 + SIGNATURE_LIMIT` bytes after the Certificate message.
+  unsafe RawBuffer.copy<u8>(&mut client.credentialFlight, verifyStart + 8, &signature, signatureLength)
+  let verifyLength = 8 + signatureLength
+  // The writes above initialized every byte of the CertificateVerify message.
+  let verify = unsafe RawBuffer.view<u8>(&client.credentialFlight, verifyStart, verifyLength)
+  if client.selectedSuite == CipherSuite.Aes256GcmSha384 {
+    client.transcript384.update(verify)
+  } else {
+    client.transcript256.update(verify)
+  }
+  drop verify
+  client.credentialFlightLength = certificateLength + verifyLength
+  client.credentialFlightOffset = 0
+  return queueCredentialChunk(&mut client.*)
+}
+
+fn queueCredentialChunk(client: &mut Client) -> Result<(), TlsError> {
+  let offset = client.credentialFlightOffset
+  let mut length = client.credentialFlightLength - offset
+  if length > RECORD_CONTENT_LIMIT {
+    length = RECORD_CONTENT_LIMIT
+  }
+  // `offset + length <= credentialFlightLength`, all written by `queueCertificateFlight`.
+  let chunk = unsafe RawBuffer.view<u8>(&client.credentialFlight, offset, length)
+  let queued = TlsRecordSender.queueRecord(&mut client.sender, ContentType.Handshake, chunk)
+  drop chunk
+  if let Result<OutputProgress, RecordError>.Failure {error} = move queued {
+    return mapRecordUnit(&mut client.*, move error)
+  }
+  client.credentialFlightOffset = offset + length
+  client.pendingKind = PendingKind.CredentialFlight
+  return Result<(), TlsError>.succeed(())
 }
 
 fn queueEmptyCertificate(client: &mut Client) -> Result<(), TlsError> {
