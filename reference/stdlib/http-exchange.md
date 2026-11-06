@@ -1255,6 +1255,17 @@ pub fn phase(self: &Self) -> ExchangePhase
 
 Returns the next step.
 
+<a id="Exchange.impl.responseFraming"></a>
+
+### Method `responseFraming`
+
+```silk
+pub fn responseFraming(self: &Self) -> Option<Framing>
+```
+
+Returns how the body of the final response is framed, such as a fixed length from
+`Content-Length`. It is none until [`receive`](#receive) or [`receiveFinal`](#receiveFinal) returns a final response.
+
 <a id="Exchange.impl.head"></a>
 
 ### Method `head`
