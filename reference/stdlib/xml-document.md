@@ -20,6 +20,8 @@ It accepts UTF-8 and UTF-16 input, with or without a byte order mark, and checks
 declaration. It reads the internal DTD subset: general and parameter entities, attribute
 defaults, and ID attributes. It never fetches an external subset or an external entity. It skips
 their content, and [`XmlDocument.skippedExternalContent`](#XmlDocument.impl.skippedExternalContent) reports that it did.
+[`XmlDocument.skippedEntities`](#XmlDocument.impl.skippedEntities) identifies unread references. [`XmlDocument.notations`](#XmlDocument.impl.notations) and
+[`XmlDocument.unparsedEntities`](#XmlDocument.impl.unparsedEntities) expose DTD metadata without fetching external resources.
 
 All nodes live in one arena in the document and are addressed by [`XmlNodeId`](#XmlNodeId). The document
 stores names, namespace URIs, text, and attribute values as normalized UTF-8, and the accessors
@@ -94,7 +96,7 @@ Use `silk.json.value` for JSON and `silk.toml.value` for TOML.
 
 Import as `XmlDocument` with `import silk.xml.document { XmlDocument }`.
 
-Public declarations: 11.
+Public declarations: 15.
 
 <a id="XmlReason"></a>
 
@@ -690,6 +692,146 @@ Utf16Be
 
 UTF-16 big-endian.
 
+<a id="XmlSkippedEntity"></a>
+
+## `XmlSkippedEntity`
+
+```silk
+pub struct XmlSkippedEntity
+```
+
+An entity reference whose replacement text was not read.
+
+<a id="XmlSkippedEntity.name"></a>
+
+### Field `name`
+
+```silk
+pub name: String
+```
+
+The referenced name, without delimiters.
+
+<a id="XmlSkippedEntity.parameter"></a>
+
+### Field `parameter`
+
+```silk
+pub parameter: bool
+```
+
+Whether this is a parameter entity from the DTD.
+
+<a id="XmlSkippedEntity.offset"></a>
+
+### Field `offset`
+
+```silk
+pub offset: usize
+```
+
+The reference position in normalized UTF-8 text, or its enclosing entity reference position.
+
+<a id="XmlExternalId"></a>
+
+## `XmlExternalId`
+
+```silk
+pub struct XmlExternalId
+```
+
+External identifiers from an XML declaration. No external resource is fetched.
+
+<a id="XmlExternalId.publicId"></a>
+
+### Field `publicId`
+
+```silk
+pub publicId: Option<String>
+```
+
+The public identifier with whitespace collapsed, or `None` if absent.
+
+<a id="XmlExternalId.systemId"></a>
+
+### Field `systemId`
+
+```silk
+pub systemId: Option<String>
+```
+
+The system identifier as written after line-end normalization, or `None` if absent.
+
+<a id="XmlNotation"></a>
+
+## `XmlNotation`
+
+```silk
+pub struct XmlNotation
+```
+
+A notation read from the DTD. Identifiers describe the format of unparsed data.
+
+<a id="XmlNotation.name"></a>
+
+### Field `name`
+
+```silk
+pub name: String
+```
+
+The notation name.
+
+<a id="XmlNotation.externalId"></a>
+
+### Field `externalId`
+
+```silk
+pub externalId: XmlExternalId
+```
+
+The declared public and system identifiers.
+
+<a id="XmlUnparsedEntity"></a>
+
+## `XmlUnparsedEntity`
+
+```silk
+pub struct XmlUnparsedEntity
+```
+
+An unparsed entity read from the DTD. Its contents are not read by the parser.
+
+<a id="XmlUnparsedEntity.name"></a>
+
+### Field `name`
+
+```silk
+pub name: String
+```
+
+The entity name, without the reference delimiters.
+
+<a id="XmlUnparsedEntity.externalId"></a>
+
+### Field `externalId`
+
+```silk
+pub externalId: XmlExternalId
+```
+
+The external identifiers of the entity.
+
+<a id="XmlUnparsedEntity.notation"></a>
+
+### Field `notation`
+
+```silk
+pub notation: String
+```
+
+The notation that describes the entity's format.
+
 <a id="XmlDocument"></a>
 
 ## `XmlDocument`
@@ -720,6 +862,41 @@ stored in document order.
 ```silk
 impl XmlDocument
 ```
+
+<a id="XmlDocument.impl.skippedEntities"></a>
+
+### Method `skippedEntities`
+
+```silk
+pub fn skippedEntities(self: &XmlDocument) -> &[XmlSkippedEntity]
+```
+
+Borrows notifications for unread entity references in declarations, attributes, and content.
+Each entry gives the entity name and the normalized byte offset. A skipped reference supplies
+no replacement text. External subset declarations are reported by `skippedExternalContent`.
+
+<a id="XmlDocument.impl.notations"></a>
+
+### Method `notations`
+
+```silk
+pub fn notations(self: &XmlDocument) -> &[XmlNotation]
+```
+
+Borrows notation declarations read from the internal DTD, in declaration order.
+Public identifiers have collapsed whitespace. System identifiers retain their spelling.
+Declarations in unread external content are absent.
+
+<a id="XmlDocument.impl.unparsedEntities"></a>
+
+### Method `unparsedEntities`
+
+```silk
+pub fn unparsedEntities(self: &XmlDocument) -> &[XmlUnparsedEntity]
+```
+
+Borrows unparsed entity declarations read from the internal DTD, in declaration order.
+The first declaration of each entity binds. No external content is fetched.
 
 <a id="XmlDocument.impl.parse"></a>
 
@@ -869,8 +1046,9 @@ read, such as an entity or an attribute default in an external subset.
 
 #### Details
 
-The parser never fetches external content. A reference to a skipped external entity in
-content produces no node.
+The parser never fetches external content. A skipped entity reference produces no replacement
+text or node. `skippedEntities` identifies unread references, including references in attributes.
+Attribute values can therefore be incomplete when this function returns `true`.
 
 <a id="XmlDocument.impl.firstChild"></a>
 
@@ -1085,6 +1263,7 @@ Returns the normalized value of `attr`.
 References are replaced and white space is normalized as XML requires, including the extra
 collapsing for attributes that the DTD declares with a type other than `CDATA`. `attr` must
 come from [`XmlDocument.attributes`](#XmlDocument.impl.attributes) of this document. The result borrows the document.
+An unread entity contributes no replacement text; `skippedEntities` reports the omitted reference.
 
 <a id="XmlDocument.impl.attributeIsId"></a>
 

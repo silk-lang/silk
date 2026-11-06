@@ -32,6 +32,31 @@ erases them.
 ### Compute a power modulo a prime
 ```silk
 import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.crypto.modular { ModularError, Modulus, Natural }
+
+pub fn main() -> i32 {
+  let modulus = match Modulus.make(&Natural.fromU64(1000003)) {
+    Result<Modulus, ModularError>.Success { value } => move value
+    Result<Modulus, ModularError>.Failure { error: _ } => {
+      return 1
+    }
+  }
+  // 2^1000002 is 1 modulo the prime 1000003.
+  let result = modulus.power(&Natural.fromU64(2), &Natural.fromU64(1000002))
+  let mut bytes: [u8; 4] = [0; 4]
+  match result.writeBytes(&mut bytes) {
+    Result<(), ModularError>.Success { value: _ } => {}
+    Result<(), ModularError>.Failure { error: _ } => {
+      return 2
+    }
+  }
+  if bytes[0] != 0 || bytes[1] != 0 || bytes[2] != 0 || bytes[3] != 1 {
+    return 3
+  }
+  return 0
+}
+```
 
 Import as `Modulus` with `import silk.crypto.modular { Modulus }`.
 
@@ -532,5 +557,7 @@ gives 1 when multiplied by `value`. `value` must be less than the modulus. 0 giv
 
 It computes `value` to the power modulus - 2, in the time of [`Modulus.power`](#Modulus.impl.power).
 
+
+Category: Cryptography.
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`, `wasm64-unknown-unknown`.
