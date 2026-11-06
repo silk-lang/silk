@@ -162,7 +162,7 @@ pub fn main() -> i32 {
 
 Import as `Decoder` with `import silk.http.body { Decoder }`.
 
-Public declarations: 22.
+Public declarations: 23.
 
 <a id="Framing"></a>
 
@@ -295,6 +295,55 @@ pub struct Selection<'head>
 The framing of a body, from [`selectRequest`](#selectRequest) or [`selectResponse`](#selectResponse). Give it to [`Decoder.make`](#Decoder.impl.make)
 or [`Encoder.make`](#Encoder.impl.make).
 
+<a id="ConnectionTokens"></a>
+
+## `ConnectionTokens`
+
+```silk
+pub struct ConnectionTokens
+```
+
+The `close`, `keep-alive` and `upgrade` options of the `Connection` fields of a head, from
+[`Selection.connection`](#Selection.impl.connection). Names compare without regard to ASCII case.
+
+<a id="ConnectionTokens.close"></a>
+
+### Field `close`
+
+```silk
+pub close: bool
+```
+
+A `Connection` field lists `close`.
+
+<a id="ConnectionTokens.keepAlive"></a>
+
+### Field `keepAlive`
+
+```silk
+pub keepAlive: bool
+```
+
+A `Connection` field lists `keep-alive`.
+
+<a id="ConnectionTokens.upgrade"></a>
+
+### Field `upgrade`
+
+```silk
+pub upgrade: bool
+```
+
+A `Connection` field lists `upgrade`.
+
+<a id="ConnectionTokens.impl.Copy"></a>
+
+## Implementation `Copy for ConnectionTokens`
+
+```silk
+impl Copy for ConnectionTokens
+```
+
 <a id="Selection.impl"></a>
 
 ## Implementation `Selection<'head>`
@@ -322,6 +371,16 @@ pub fn anomaly(self: &Self) -> Anomaly
 ```
 
 Returns a problem that prevents use of the connection again, if any.
+
+<a id="Selection.impl.connection"></a>
+
+### Method `connection`
+
+```silk
+pub fn connection(self: &Self) -> ConnectionTokens
+```
+
+Returns the options of the head's `Connection` fields, read in the same pass as the framing.
 
 <a id="Limits"></a>
 
