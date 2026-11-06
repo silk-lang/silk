@@ -1549,6 +1549,216 @@ effect fn makeClientSession<'a>(
   return run Client.make(&config, move trust, SystemClock.make(1789156800, 0), move credential)
 }
 
+fn credentialOf<'a>(certificates: &'a [CertificateDer<'a>], key: SigningKey) -> ClientCredential<'a> {
+  return ClientCredential<'a>.Certificate {certificates: certificates, key: move key}
+}
+
+// A TLS 1.2 ticket server for the resumption cases, with `versions`.
+fn tls12TicketConfig<'a>(
+  certificates: &'a [CertificateDer<'a>],
+  clientAuth: ClientAuth<'a>,
+  key: &'a TicketKey,
+  now: &'a Instant,
+  versions: VersionPolicy,
+) -> ServerConfig<'a> {
+  let mut config = ticketConfig(certificates, GroupPolicy.defaults(), clientAuth, key, now, 1)
+  config.versions = versions
+  return move config
+}
+
+// One TLS 1.2 or 1.3 connection for the TLS 1.2 resumption cases: the client allows `versions`
+// and offers `session`. Returns 0 when the handshake completes at `version`, data flows, and both
+// resumed flags are `resumed`. `out` gets the session that the client keeps, if any.
+effect fn resumeConnection12<'a>(
+  config: &ServerConfig<'a>,
+  session: Option<&'a Session>,
+  credential: ClientCredential<'a>,
+  versions: VersionPolicy,
+  version: TlsVersion,
+  resumed: bool,
+  out: &mut Option<Session>,
+) -> i32
+! OutOfMemoryError
+? &mut Allocator | &mut Random {
+  let mut server = match run Server.make(config, p256Key(leaf256Secret())) {
+    Result<Server, ServerError>.Success {value} => move value
+    Result<Server, ServerError>.Failure {error} => {
+      return serverCode(error)
+    }
+  }
+  let made = run TrustSnapshot.fromPem(rootPem(), TrustLoadLimits.defaults())
+  let trust = match move made {
+    Result<TrustSnapshot, TrustSourceError>.Success {value} => move value
+    Result<TrustSnapshot, TrustSourceError>.Failure {..} => { return 69 }
+  }
+  let none: [u8; 0] = []
+  let clientConfig = ClientConfig {
+    reference: reference(b"example.com"),
+    alpn: AlpnConfig.defaults(),
+    resumption: Resumption<'a>.Enabled {session: session, earlyData: &none},
+    versions: versions,
+    limits: ClientLimits.defaults(),
+  }
+  let mut client = match move run Client.make(&clientConfig, move trust, SystemClock.make(1789156800, 0), move credential) {
+    Result<Client, TlsError>.Success {value} => move value
+    Result<Client, TlsError>.Failure {error} => {
+      return clientCode(move error)
+    }
+  }
+  let code = run pump(&mut client, &mut server)
+  if code != 0 { return code }
+  let negotiated = match Server.version(&server) {
+    Option<TlsVersion>.Some {value} => value == version
+    Option<TlsVersion>.None => false
+  }
+  if !negotiated { return 68 }
+  if Server.resumed(&server) != resumed { return 70 }
+  let authenticated = match Client.authentication(&client) {
+    Option.Some {value} => value.resumed() == resumed && value.version() == version
+    Option.None => false
+  }
+  if !authenticated { return 72 }
+  if !writeClient(&mut client, b"ticket ping") { return 73 }
+  let moved = run pump(&mut client, &mut server)
+  if moved != 0 { return moved }
+  if !readServer(&mut server, b"ticket ping") { return 74 }
+  if !writeServer(&mut server, b"ticket pong") { return 75 }
+  let back = run pump(&mut client, &mut server)
+  if back != 0 { return back }
+  if !readClient(&mut client, b"ticket pong") { return 76 }
+  out.* = Client.takeSession(&mut client)
+  return 0
+}
+
+// TLS 1.2 session tickets (RFC 5077) between the Silk client and server. Returns 0 or an error
+// code.
+effect fn resumption12() -> i32
+! OutOfMemoryError
+? &mut Allocator | &mut Random {
+  let keyBytes: [u8; 48] = [7; 48]
+  let key = TicketKey.make(&keyBytes)
+  let otherBytes: [u8; 48] = [8; 48]
+  let otherKey = TicketKey.make(&otherBytes)
+  let at = SystemClock.make(1789156800, 0)
+  let later = SystemClock.make(1789156800 + 8000, 0)
+  let chain = [CertificateDer {bytes: leaf256Der()}, CertificateDer {bytes: rootDer()}]
+  let tls12 = VersionPolicy.tls12()
+  let config = tls12TicketConfig(&chain, ClientAuth.Off, &key, &at, tls12)
+
+  // A full handshake gives a TLS 1.2 session with a ticket and no session ID.
+  let mut first = Option<Session>.none()
+  let full = run resumeConnection12(&config, Option<&Session>.none(), ClientCredential.None, tls12, TlsVersion.Tls12, false, &mut first)
+  if full != 0 { return 100 + full }
+  let session = match move first {
+    Option<Session>.Some {value} => move value
+    Option<Session>.None => { return 200 }
+  }
+  if session.version() != TlsVersion.Tls12 || session.ticket().length == 0 || session.sessionId().length != 0 {
+    return 201
+  }
+
+  // The session resumes, and the server sends no new ticket.
+  let mut again = Option<Session>.none()
+  let resumedCode = run resumeConnection12(&config, Option<&Session>.some(&session), ClientCredential.None, tls12, TlsVersion.Tls12, true, &mut again)
+  if resumedCode != 0 { return 300 + resumedCode }
+  if let Option<Session>.Some {..} = &again { return 301 }
+
+  // An encoded and decoded session resumes too.
+  let mut encoded: [u8; 4096] = [0; 4096]
+  let encodedLength = match session.encode(&mut encoded) {
+    Result<usize, SessionError>.Success {value} => value
+    Result<usize, SessionError>.Failure {..} => { return 400 }
+  }
+  if encodedLength != session.encodedLength() { return 401 }
+  let decoded = match move run Session.decode(Slice.view<u8>(&encoded, 0, encodedLength)) {
+    Result<Session, SessionError>.Success {value} => move value
+    Result<Session, SessionError>.Failure {..} => { return 402 }
+  }
+  let mut fromDecoded = Option<Session>.none()
+  let decodedCode = run resumeConnection12(&config, Option<&Session>.some(&decoded), ClientCredential.None, tls12, TlsVersion.Tls12, true, &mut fromDecoded)
+  if decodedCode != 0 { return 410 + decodedCode }
+
+  // A server with another key, or past the lifetime, does a full handshake and issues a new
+  // ticket.
+  let otherConfig = tls12TicketConfig(&chain, ClientAuth.Off, &otherKey, &at, tls12)
+  let mut renewed = Option<Session>.none()
+  let otherCode = run resumeConnection12(&otherConfig, Option<&Session>.some(&session), ClientCredential.None, tls12, TlsVersion.Tls12, false, &mut renewed)
+  if otherCode != 0 { return 500 + otherCode }
+  if let Option<Session>.None = &renewed { return 501 }
+  let laterConfig = tls12TicketConfig(&chain, ClientAuth.Off, &key, &later, tls12)
+  let mut expired = Option<Session>.none()
+  let laterCode = run resumeConnection12(&laterConfig, Option<&Session>.some(&session), ClientCredential.None, tls12, TlsVersion.Tls12, false, &mut expired)
+  if laterCode != 0 { return 600 + laterCode }
+
+  // A server without tickets gives no session: it sends neither a ticket nor a session ID.
+  let mut plainConfig = tls12TicketConfig(&chain, ClientAuth.Off, &key, &at, tls12)
+  plainConfig.tickets = TicketPolicy.Off
+  let mut nothing = Option<Session>.none()
+  let plainCode = run resumeConnection12(&plainConfig, Option<&Session>.some(&session), ClientCredential.None, tls12, TlsVersion.Tls12, false, &mut nothing)
+  if plainCode != 0 { return 700 + plainCode }
+  if let Option<Session>.Some {..} = &nothing { return 701 }
+
+  // A client that also allows TLS 1.3 offers the TLS 1.2 session with its session ID. A server
+  // that picks TLS 1.3 echoes the ID, sends the compatibility ChangeCipherSpec, and does a full
+  // TLS 1.3 handshake.
+  let both = VersionPolicy.defaults()
+  let bothConfig = tls12TicketConfig(&chain, ClientAuth.Off, &key, &at, both)
+  let mut upgraded = Option<Session>.none()
+  let upgradeCode = run resumeConnection12(&bothConfig, Option<&Session>.some(&session), ClientCredential.None, both, TlsVersion.Tls13, false, &mut upgraded)
+  if upgradeCode != 0 { return 800 + upgradeCode }
+  let tls13Session = match move upgraded {
+    Option<Session>.Some {value} => move value
+    Option<Session>.None => { return 801 }
+  }
+  if tls13Session.version() != TlsVersion.Tls13 { return 802 }
+  // A TLS 1.3 session is not offered to a TLS 1.2 only client.
+  let mut skipped = Option<Session>.none()
+  let skipCode = run resumeConnection12(&config, Option<&Session>.some(&tls13Session), ClientCredential.None, tls12, TlsVersion.Tls12, false, &mut skipped)
+  if skipCode != 0 { return 900 + skipCode }
+
+  // With ClientAuth, the resumed session keeps the trusted status of its full handshake.
+  let made = run TrustSnapshot.fromPem(rootPem(), TrustLoadLimits.defaults())
+  let trust = match move made {
+    Result<TrustSnapshot, TrustSourceError>.Success {value} => move value
+    Result<TrustSnapshot, TrustSourceError>.Failure {..} => { return 1000 }
+  }
+  let auth = ClientAuth.Request {trust: &trust, validationTime: &at, required: true, rejectUntrusted: true}
+  let authConfig = tls12TicketConfig(&chain, auth, &key, &at, tls12)
+  let clientChain = [CertificateDer {bytes: client256Der()}]
+  let clientCertificates: &[CertificateDer] = &clientChain
+  let mut authFirst = Option<Session>.none()
+  let authFull = run resumeConnection12(
+    &authConfig,
+    Option<&Session>.none(),
+    credentialOf(clientCertificates, p256Key(client256Secret())),
+    tls12,
+    TlsVersion.Tls12,
+    false,
+    &mut authFirst,
+  )
+  if authFull != 0 { return 1100 + authFull }
+  let authSession = match move authFirst {
+    Option<Session>.Some {value} => move value
+    Option<Session>.None => { return 1200 }
+  }
+  let mut authAgain = Option<Session>.none()
+  let authResumed = run resumeConnection12(&authConfig, Option<&Session>.some(&authSession), ClientCredential.None, tls12, TlsVersion.Tls12, true, &mut authAgain)
+  if authResumed != 0 { return 1300 + authResumed }
+  // A session from a server without ClientAuth does not resume where it is required.
+  let mut refused = Option<Session>.none()
+  let refusedCode = run resumeConnection12(
+    &authConfig,
+    Option<&Session>.some(&session),
+    credentialOf(clientCertificates, p256Key(client256Secret())),
+    tls12,
+    TlsVersion.Tls12,
+    false,
+    &mut refused,
+  )
+  if refusedCode != 0 { return 1400 + refusedCode }
+  return 0
+}
+
 // One connection between a server with `config` and a client that offers `session`. Returns 0
 // when it completes, data flows both ways, and the server's and client's resumed flags are both
 // `resumed`. Otherwise returns an error code. `out` gets the first session that the server
@@ -2067,6 +2277,11 @@ effect fn cases() -> i32 ! OutOfMemoryError {
     |> Effect.provideMut<Random>(&mut random)
     |> Effect.provideMut<Allocator>(&mut allocator)
   if tls12 != 0 { return 19000 + tls12 }
+
+  let resumed12 = run resumption12()
+    |> Effect.provideMut<Random>(&mut random)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  if resumed12 != 0 { return 20000 + resumed12 }
   return 0
 }
 

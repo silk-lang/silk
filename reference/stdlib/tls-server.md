@@ -57,6 +57,13 @@ offers a valid ticket resumes: the server checks the binder, sends no certificat
 [`Server.resumed`](#Server.impl.resumed) returns `true`. A ticket from a handshake whose client certificate the
 current [`ClientAuth`](#ClientAuth) would refuse gives a full handshake instead.
 
+In TLS 1.2 the server issues one ticket (RFC 5077) when the client sends a session_ticket
+extension: a NewSessionTicket before its ChangeCipherSpec, with the `TicketPolicy` lifetime as
+the hint. A ClientHello with a session ID and a valid ticket of the same cipher suite resumes:
+the server echoes the session ID and sends its ChangeCipherSpec and Finished right after the
+ServerHello, with no new ticket. The server keeps no session cache, so it never resumes by
+session ID alone, and its full handshakes send an empty session ID.
+
 When the `TicketPolicy` `maxEarlyData` is not 0, the tickets allow 0-RTT data. The server
 accepts a resuming client's early data when the ticket allows it, there was no
 HelloRetryRequest, the cipher suite and ALPN protocol are the ones of the session, and the
@@ -645,7 +652,7 @@ The ticket lifetime in seconds, from 1 to 604800.
 pub count: usize
 ```
 
-The number of tickets to send after each handshake, from 1 to 4.
+The number of tickets to send after each TLS 1.3 handshake, from 1 to 4. TLS 1.2 sends one.
 
 <a id="TicketPolicy.Issue.maxEarlyData"></a>
 
