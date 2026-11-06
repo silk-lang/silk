@@ -14,7 +14,8 @@ The cost `N` (a power of two above 1), the block size `r`, and the parallelism `
 scrypt allocates 128 * `r` * (`N` + `p` + 2) bytes through the ambient `Allocator`, which
 [`Scrypt.memoryLength`](#Scrypt.impl.memoryLength) returns before the call, and frees them before it returns. Common
 settings are `N` = 16384, `r` = 8, `p` = 1, which use 16 MiB. The output can have any length up
-to (2^32 - 1) * 32 bytes.
+to (2^32 - 1) * 32 bytes. [`Scrypt.deriveWithScratch`](#Scrypt.impl.deriveWithScratch) does the same work in a buffer that the
+caller owns and can reuse, so that repeated calls do not map and clear fresh memory.
 
 ## Errors
 [`Scrypt.derive`](#Scrypt.impl.derive) fails with a [`ScryptError`](#ScryptError) for parameters that RFC 7914 does not allow, and
@@ -49,6 +50,29 @@ pub effect fn main() -> i32 ! OutOfMemoryError | ScryptError {
 }
 ```
 
+### Reuse one scratch for many keys
+```silk
+import silk.crypto.scrypt { Scrypt, ScryptError }
+import silk.core.result { Result }
+
+pub fn main() -> i32 {
+  // Scrypt.scratchLength(16, 1, 1) is 32 * (16 + 1 + 2) = 608 words.
+  let mut scratch: [u32; 608] = [0; 608]
+  let mut first: [u8; 16] = [0; 16]
+  let mut second: [u8; 16] = [0; 16]
+  if let Result.Failure { error: _ } = Scrypt.deriveWithScratch(b"one", b"salt", 16, 1, 1, &mut scratch, &mut first) {
+    return 1
+  }
+  if let Result.Failure { error: _ } = Scrypt.deriveWithScratch(b"two", b"salt", 16, 1, 1, &mut scratch, &mut second) {
+    return 1
+  }
+  if first[0] == second[0] && first[1] == second[1] && first[2] == second[2] {
+    return 1
+  }
+  return 0
+}
+```
+
 Import as `Scrypt` with `import silk.crypto.scrypt { Scrypt }`.
 
 Public declarations: 2.
@@ -61,7 +85,7 @@ Public declarations: 2.
 pub union ScryptError
 ```
 
-The reason that [`Scrypt.derive`](#Scrypt.impl.derive) rejected its parameters. The output does not change.
+The reason that [`Scrypt.derive`](#Scrypt.impl.derive) or [`Scrypt.deriveWithScratch`](#Scrypt.impl.deriveWithScratch) rejected its parameters. The output does not change.
 
 <a id="ScryptError.InvalidCost"></a>
 
@@ -102,6 +126,16 @@ OutputTooLong
 ```
 
 The output is longer than (2^32 - 1) * 32 bytes, or the memory does not fit in an address.
+
+<a id="ScryptError.ScratchTooSmall"></a>
+
+### `ScratchTooSmall`
+
+```silk
+ScratchTooSmall
+```
+
+The scratch passed to [`Scrypt.deriveWithScratch`](#Scrypt.impl.deriveWithScratch) is shorter than [`Scrypt.scratchLength`](#Scrypt.impl.scratchLength).
 
 <a id="ScryptError.impl.Debug"></a>
 
@@ -202,6 +236,61 @@ On an error, `output` does not change.
 
 The memory and time grow with `cost` and `blockSize`. The function does not erase the
 password or its memory.
+
+<a id="Scrypt.impl.scratchLength"></a>
+
+### Associated function `scratchLength`
+
+```silk
+pub fn scratchLength(cost: u64, blockSize: u32, parallelism: u32) -> Option<usize>
+```
+
+Returns the number of `u32` words that [`Scrypt.deriveWithScratch`](#Scrypt.impl.deriveWithScratch) needs in its scratch for
+cost `cost`, block size `blockSize`, and parallelism `parallelism`: 32 * `r` * (`N` + `p` + 2),
+a quarter of [`Scrypt.memoryLength`](#Scrypt.impl.memoryLength).
+
+Returns `None` if the length does not fit in a `usize`. It does not check the other
+parameter rules.
+
+<a id="Scrypt.impl.deriveWithScratch"></a>
+
+### Associated function `deriveWithScratch`
+
+```silk
+pub fn deriveWithScratch(
+    password: &[u8],
+    salt: &[u8],
+    cost: u64,
+    blockSize: u32,
+    parallelism: u32,
+    scratch: &mut [u32],
+    output: &mut [u8],
+  ) -> Result<(), ScryptError>
+```
+
+Fills `output` with the scrypt key of `password` and `salt`, as [`Scrypt.derive`](#Scrypt.impl.derive) does, but
+works in `scratch` instead of allocating.
+
+#### When to use
+
+Use `deriveWithScratch` to derive many keys with one buffer, such as in a worker that serves
+`crypto.scrypt` calls, so that no call maps and clears fresh memory.
+
+#### Details
+
+`scratch` needs at least [`Scrypt.scratchLength`](#Scrypt.impl.scratchLength) words, and its contents on entry do not
+matter. The call overwrites that many words and leaves the rest alone. Nothing allocates.
+
+#### Errors
+
+The same as [`Scrypt.derive`](#Scrypt.impl.derive), with `ScryptError.ScratchTooSmall` in place of
+`OutOfMemoryError` when `scratch` is shorter than [`Scrypt.scratchLength`](#Scrypt.impl.scratchLength). On an error,
+`output` and `scratch` do not change.
+
+#### Gotchas
+
+The scratch holds values derived from the password after the call. Clear it when that
+matters.
 
 
 Category: Cryptography.

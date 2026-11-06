@@ -10,7 +10,8 @@
 //! scrypt allocates 128 * `r` * (`N` + `p` + 2) bytes through the ambient `Allocator`, which
 //! [`Scrypt.memoryLength`] returns before the call, and frees them before it returns. Common
 //! settings are `N` = 16384, `r` = 8, `p` = 1, which use 16 MiB. The output can have any length up
-//! to (2^32 - 1) * 32 bytes.
+//! to (2^32 - 1) * 32 bytes. [`Scrypt.deriveWithScratch`] does the same work in a buffer that the
+//! caller owns and can reuse, so that repeated calls do not map and clear fresh memory.
 //!
 //! # Errors
 //! [`Scrypt.derive`] fails with a [`ScryptError`] for parameters that RFC 7914 does not allow, and
@@ -45,6 +46,29 @@
 //! }
 //! ```
 //!
+//! ## Reuse one scratch for many keys
+//! ```silk
+//! import silk.crypto.scrypt { Scrypt, ScryptError }
+//! import silk.core.result { Result }
+//!
+//! pub fn main() -> i32 {
+//!   // Scrypt.scratchLength(16, 1, 1) is 32 * (16 + 1 + 2) = 608 words.
+//!   let mut scratch: [u32; 608] = [0; 608]
+//!   let mut first: [u8; 16] = [0; 16]
+//!   let mut second: [u8; 16] = [0; 16]
+//!   if let Result.Failure { error: _ } = Scrypt.deriveWithScratch(b"one", b"salt", 16, 1, 1, &mut scratch, &mut first) {
+//!     return 1
+//!   }
+//!   if let Result.Failure { error: _ } = Scrypt.deriveWithScratch(b"two", b"salt", 16, 1, 1, &mut scratch, &mut second) {
+//!     return 1
+//!   }
+//!   if first[0] == second[0] && first[1] == second[1] && first[2] == second[2] {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
 //! @category Cryptography
 
 import silk.text.format { Debug, Format, Formatter }
@@ -55,13 +79,13 @@ import silk.collections.slice { Slice }
 import silk.crypto.pbkdf2 { Pbkdf2, Pbkdf2Error }
 import silk.crypto.sha2 { Sha256 }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
-import silk.num.u8
 import silk.num.u32
 import silk.num.u64
 import silk.num.usize
+import silk.simd.u32x4
 import silk.io.writer { Writer, WriterError }
 
-/// The reason that [`Scrypt.derive`] rejected its parameters. The output does not change.
+/// The reason that [`Scrypt.derive`] or [`Scrypt.deriveWithScratch`] rejected its parameters. The output does not change.
 pub union ScryptError {
   /// The cost `N` is not a power of two above 1, or it is not below 2^(16 * `r`).
   InvalidCost,
@@ -71,6 +95,8 @@ pub union ScryptError {
   InvalidParallelism,
   /// The output is longer than (2^32 - 1) * 32 bytes, or the memory does not fit in an address.
   OutputTooLong,
+  /// The scratch passed to [`Scrypt.deriveWithScratch`] is shorter than [`Scrypt.scratchLength`].
+  ScratchTooSmall,
 }
 
 impl Debug for ScryptError {
@@ -83,6 +109,7 @@ impl Debug for ScryptError {
       ScryptError.InvalidBlockSize => run Format.write(&mut formatter, b"InvalidBlockSize")
       ScryptError.InvalidParallelism => run Format.write(&mut formatter, b"InvalidParallelism")
       ScryptError.OutputTooLong => run Format.write(&mut formatter, b"OutputTooLong")
+      ScryptError.ScratchTooSmall => run Format.write(&mut formatter, b"ScratchTooSmall")
     }
   }
 }
@@ -146,52 +173,141 @@ impl Scrypt {
   ) -> ()
     ! OutOfMemoryError | ScryptError
     ? &mut Allocator {
-    if blockSize == 0
-      || u64.wrappingMultiply(u32.toU64(blockSize), u32.toU64(parallelism)) >= 1073741824 {
-      fail ScryptError.InvalidBlockSize
-    }
-    if cost < 2 || u64.bitAnd(cost, cost - 1) != 0 {
-      fail ScryptError.InvalidCost
-    }
-
-    // N < 2^(128 * r / 8): only blocks of fewer than four 128-byte units restrict a u64 cost.
-    if blockSize < 4 && u64.shiftRight(cost, u32.toU64(16 * blockSize)) != 0 {
-      fail ScryptError.InvalidCost
-    }
-    if parallelism == 0 || u32.toU64(parallelism) * 128 * u32.toU64(blockSize) > 137438953440 {
-      fail ScryptError.InvalidParallelism
-    }
-    if usize.toU64(output.length) > 137438953440 {
-      fail ScryptError.OutputTooLong
-    }
-    let words = 32 * u32.toUsize(blockSize)
-    let mixed = Scrypt.memoryLength(cost, blockSize, parallelism)
-    if let Option.Some { value } = mixed {
-      if value > usize.toU64(usize.MAX) {
-        fail ScryptError.OutputTooLong
+    let mut words: usize = 0
+    match check(cost, blockSize, parallelism, output.length) {
+      Result<usize, ScryptError>.Success { value } => {
+        words = value
       }
-    } else {
-      fail ScryptError.OutputTooLong
+      Result<usize, ScryptError>.Failure { error } => {
+        fail move error
+      }
     }
-    let count = u64.toUsize(cost)
-    let mut blocks = List<u8>.make()
-    run List<u8>.appendRepeated(&mut blocks, 0, 4 * words * u32.toUsize(parallelism))
-    let mut table = List<u32>.make()
-    run List<u32>.appendRepeated(&mut table, 0, words * count + 2 * words)
-    expand(password, salt, List<u8>.asMutSlice(&mut blocks))
-    let mut lane: usize = 0
-    while lane < u32.toUsize(parallelism) {
-      mix(
-        List<u8>.asMutSlice(&mut blocks),
-        lane * 4 * words,
-        words,
-        count,
-        List<u32>.asMutSlice(&mut table),
-      )
-      lane = lane + 1
-    }
-    expand(password, List<u8>.asSlice(&blocks), move output)
+    let mut scratch = List<u32>.make()
+    run List<u32>.appendRepeated(&mut scratch, 0, words)
+    compute(
+      password,
+      salt,
+      cost,
+      blockSize,
+      parallelism,
+      List<u32>.asMutSlice(&mut scratch),
+      move output,
+    )
   }
+
+  /// Returns the number of `u32` words that [`Scrypt.deriveWithScratch`] needs in its scratch for
+  /// cost `cost`, block size `blockSize`, and parallelism `parallelism`: 32 * `r` * (`N` + `p` + 2),
+  /// a quarter of [`Scrypt.memoryLength`].
+  ///
+  /// Returns `None` if the length does not fit in a `usize`. It does not check the other
+  /// parameter rules.
+  pub fn scratchLength(cost: u64, blockSize: u32, parallelism: u32) -> Option<usize> {
+    if let Option.Some { value } = Scrypt.memoryLength(cost, blockSize, parallelism) {
+      if value / 4 <= usize.toU64(usize.MAX) {
+        return Option<usize>.some(u64.toUsize(value / 4))
+      }
+    }
+    return Option<usize>.none()
+  }
+
+  /// Fills `output` with the scrypt key of `password` and `salt`, as [`Scrypt.derive`] does, but
+  /// works in `scratch` instead of allocating.
+  ///
+  /// # When to use
+  ///
+  /// Use `deriveWithScratch` to derive many keys with one buffer, such as in a worker that serves
+  /// `crypto.scrypt` calls, so that no call maps and clears fresh memory.
+  ///
+  /// # Details
+  ///
+  /// `scratch` needs at least [`Scrypt.scratchLength`] words, and its contents on entry do not
+  /// matter. The call overwrites that many words and leaves the rest alone. Nothing allocates.
+  ///
+  /// # Errors
+  ///
+  /// The same as [`Scrypt.derive`], with `ScryptError.ScratchTooSmall` in place of
+  /// `OutOfMemoryError` when `scratch` is shorter than [`Scrypt.scratchLength`]. On an error,
+  /// `output` and `scratch` do not change.
+  ///
+  /// # Gotchas
+  ///
+  /// The scratch holds values derived from the password after the call. Clear it when that
+  /// matters.
+  pub fn deriveWithScratch(
+    password: &[u8],
+    salt: &[u8],
+    cost: u64,
+    blockSize: u32,
+    parallelism: u32,
+    scratch: &mut [u32],
+    output: &mut [u8],
+  ) -> Result<(), ScryptError> {
+    let words = match check(cost, blockSize, parallelism, output.length) {
+      Result<usize, ScryptError>.Success { value } => value
+      Result<usize, ScryptError>.Failure { error } => {
+        return Result<(), ScryptError>.failResult(move error)
+      }
+    }
+    if scratch.length < words {
+      return Result<(), ScryptError>.failResult(ScryptError.ScratchTooSmall)
+    }
+    compute(password, salt, cost, blockSize, parallelism, move scratch, move output)
+    return Result<(), ScryptError>.succeed(())
+  }
+}
+
+// Checks the parameter rules of RFC 7914 and returns the scratch length in words.
+fn check(cost: u64, blockSize: u32, parallelism: u32, outputLength: usize) -> Result<usize, ScryptError> {
+  if blockSize == 0
+    || u64.wrappingMultiply(u32.toU64(blockSize), u32.toU64(parallelism)) >= 1073741824 {
+    return Result<usize, ScryptError>.failResult(ScryptError.InvalidBlockSize)
+  }
+  if cost < 2 || u64.bitAnd(cost, cost - 1) != 0 {
+    return Result<usize, ScryptError>.failResult(ScryptError.InvalidCost)
+  }
+
+  // N < 2^(128 * r / 8): only blocks of fewer than four 128-byte units restrict a u64 cost.
+  if blockSize < 4 && u64.shiftRight(cost, u32.toU64(16 * blockSize)) != 0 {
+    return Result<usize, ScryptError>.failResult(ScryptError.InvalidCost)
+  }
+  if parallelism == 0 || u32.toU64(parallelism) * 128 * u32.toU64(blockSize) > 137438953440 {
+    return Result<usize, ScryptError>.failResult(ScryptError.InvalidParallelism)
+  }
+  if usize.toU64(outputLength) > 137438953440 {
+    return Result<usize, ScryptError>.failResult(ScryptError.OutputTooLong)
+  }
+  if let Option.Some { value } = Scrypt.memoryLength(cost, blockSize, parallelism) {
+    // Bytes must fit in an address, so the words can be indexed too.
+    if value <= usize.toU64(usize.MAX) {
+      return Result<usize, ScryptError>.succeed(u64.toUsize(value / 4))
+    }
+  }
+  return Result<usize, ScryptError>.failResult(ScryptError.OutputTooLong)
+}
+
+// Runs scrypt with checked parameters in the first 32 * r * (N + p + 2) words of `scratch`: the
+// p blocks of B, then the N blocks of V, then the two working blocks.
+fn compute(
+  password: &[u8],
+  salt: &[u8],
+  cost: u64,
+  blockSize: u32,
+  parallelism: u32,
+  scratch: &mut [u32],
+  output: &mut [u8],
+) -> () {
+  let words = 32 * u32.toUsize(blockSize)
+  let lanes = words * u32.toUsize(parallelism)
+  // RFC 7914 reads B as little-endian words, which is the memory order of every target that
+  // the compiler supports (see `Target.endianness`), so PBKDF2 writes B straight into the words.
+  expand(password, salt, Slice.asMutBytes<u32>(Slice.viewMut<u32>(&mut scratch, 0, lanes)))
+  let count = u64.toUsize(cost)
+  let mut lane: usize = 0
+  while lane < lanes {
+    mix(&mut scratch, lane, words, count, lanes)
+    lane = lane + words
+  }
+  expand(password, Slice.asBytes<u32>(Slice.view<u32>(&scratch, 0, lanes)), move output)
 }
 
 // PBKDF2-HMAC-SHA-256 with one iteration, which cannot fail for the lengths scrypt admits.
@@ -201,128 +317,113 @@ fn expand(password: &[u8], salt: &[u8], output: &mut [u8]) -> () {
   }
 }
 
-fn load(bytes: &[u8], offset: usize) -> u32 {
-  return u32.bitOr(
-    u32.bitOr(u8.toU32(bytes[offset]), u32.shiftLeft(u8.toU32(bytes[offset + 1]), 8)),
-    u32.bitOr(
-      u32.shiftLeft(u8.toU32(bytes[offset + 2]), 16),
-      u32.shiftLeft(u8.toU32(bytes[offset + 3]), 24),
-    ),
-  )
-}
-
-fn store(bytes: &mut [u8], offset: usize, value: u32) -> () {
-  bytes[offset] = u32.toU8(u32.bitAnd(value, 255))
-  bytes[offset + 1] = u32.toU8(u32.bitAnd(u32.shiftRight(value, 8), 255))
-  bytes[offset + 2] = u32.toU8(u32.bitAnd(u32.shiftRight(value, 16), 255))
-  bytes[offset + 3] = u32.toU8(u32.shiftRight(value, 24))
-}
-
-fn quarter(x: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) -> () {
-  x[b] = u32.bitXor(x[b], u32.rotateLeft(u32.wrappingAdd(x[a], x[d]), 7))
-  x[c] = u32.bitXor(x[c], u32.rotateLeft(u32.wrappingAdd(x[b], x[a]), 9))
-  x[d] = u32.bitXor(x[d], u32.rotateLeft(u32.wrappingAdd(x[c], x[b]), 13))
-  x[a] = u32.bitXor(x[a], u32.rotateLeft(u32.wrappingAdd(x[d], x[c]), 18))
-}
-
-// Salsa20/8 core of RFC 7914 section 3 on `block`, in place.
-fn salsa(block: &mut [u32; 16]) -> () {
-  let mut x = block.*
-  let mut round: usize = 0
-  while round < 4 {
-    quarter(&mut x, 0, 4, 8, 12)
-    quarter(&mut x, 5, 9, 13, 1)
-    quarter(&mut x, 10, 14, 2, 6)
-    quarter(&mut x, 15, 3, 7, 11)
-    quarter(&mut x, 0, 1, 2, 3)
-    quarter(&mut x, 5, 6, 7, 4)
-    quarter(&mut x, 10, 11, 8, 9)
-    quarter(&mut x, 15, 12, 13, 14)
-    round = round + 1
-  }
-  let mut index: usize = 0
-  while index < 16 {
-    block[index] = u32.wrappingAdd(block[index], x[index])
-    index = index + 1
-  }
-}
-
-// scryptBlockMix of RFC 7914 section 4: mixes the `words` words at `from` in `table` into the
-// `words` words at `to`. The even 64-byte blocks of the result go first, then the odd ones.
-fn blockMix(table: &mut [u32], from: usize, to: usize, words: usize) -> () {
-  let mut x: [u32; 16] = [0; 16]
-  let mut index: usize = 0
-  while index < 16 {
-    x[index] = table[from + words - 16 + index]
-    index = index + 1
-  }
+// scryptBlockMix of RFC 7914 section 4: mixes the `words` words at `from` in `scratch` into the
+// `words` words at `to`, which do not overlap them. The even 64-byte blocks of the result go
+// first, then the odd ones.
+//
+// Each 64-byte block is stored in the diagonal order of `permute`, so that every row of the
+// Salsa20/8 core of section 3 is one vector: word `k` of the RFC's block sits at position `i` with
+// `k` = 5 * `i` mod 16.
+fn blockMix(scratch: &mut [u32], from: usize, to: usize, words: usize) -> () {
+  let last = from + words - 16
+  let mut x0 = u32x4.load(&scratch, last)
+  let mut x1 = u32x4.load(&scratch, last + 4)
+  let mut x2 = u32x4.load(&scratch, last + 8)
+  let mut x3 = u32x4.load(&scratch, last + 12)
+  let seven = u32x4.splat(7)
+  let nine = u32x4.splat(9)
+  let thirteen = u32x4.splat(13)
+  let eighteen = u32x4.splat(18)
   let half = words / 2
   let mut block: usize = 0
   while block < words / 16 {
-    index = 0
-    while index < 16 {
-      x[index] = u32.bitXor(x[index], table[from + block * 16 + index])
-      index = index + 1
+    let source = from + block * 16
+    x0 = x0 ^ u32x4.load(&scratch, source)
+    x1 = x1 ^ u32x4.load(&scratch, source + 4)
+    x2 = x2 ^ u32x4.load(&scratch, source + 8)
+    x3 = x3 ^ u32x4.load(&scratch, source + 12)
+    let start0 = x0
+    let start1 = x1
+    let start2 = x2
+    let start3 = x3
+    let mut round: usize = 0
+    while round < 4 {
+      // Column round: x1 holds words 4, 9, 14, 3 below words 0, 5, 10, 15 of x0, and so on.
+      x1 = x1 ^ u32x4.rotateLeft(u32x4.wrappingAdd(x0, x3), seven)
+      x2 = x2 ^ u32x4.rotateLeft(u32x4.wrappingAdd(x1, x0), nine)
+      x3 = x3 ^ u32x4.rotateLeft(u32x4.wrappingAdd(x2, x1), thirteen)
+      x0 = x0 ^ u32x4.rotateLeft(u32x4.wrappingAdd(x3, x2), eighteen)
+      x1 = u32x4.shuffle(x1, x1, [3, 0, 1, 2])
+      x2 = u32x4.shuffle(x2, x2, [2, 3, 0, 1])
+      x3 = u32x4.shuffle(x3, x3, [1, 2, 3, 0])
+      // Row round on the rotated rows.
+      x3 = x3 ^ u32x4.rotateLeft(u32x4.wrappingAdd(x0, x1), seven)
+      x2 = x2 ^ u32x4.rotateLeft(u32x4.wrappingAdd(x3, x0), nine)
+      x1 = x1 ^ u32x4.rotateLeft(u32x4.wrappingAdd(x2, x3), thirteen)
+      x0 = x0 ^ u32x4.rotateLeft(u32x4.wrappingAdd(x1, x2), eighteen)
+      x1 = u32x4.shuffle(x1, x1, [1, 2, 3, 0])
+      x2 = u32x4.shuffle(x2, x2, [2, 3, 0, 1])
+      x3 = u32x4.shuffle(x3, x3, [3, 0, 1, 2])
+      round = round + 1
     }
-    salsa(&mut x)
+    x0 = u32x4.wrappingAdd(x0, start0)
+    x1 = u32x4.wrappingAdd(x1, start1)
+    x2 = u32x4.wrappingAdd(x2, start2)
+    x3 = u32x4.wrappingAdd(x3, start3)
     let target = to + (block % 2) * half + (block / 2) * 16
-    index = 0
-    while index < 16 {
-      table[target + index] = x[index]
-      index = index + 1
-    }
+    u32x4.store(&mut scratch, target, x0)
+    u32x4.store(&mut scratch, target + 4, x1)
+    u32x4.store(&mut scratch, target + 8, x2)
+    u32x4.store(&mut scratch, target + 12, x3)
     block = block + 1
   }
 }
 
-// scryptROMix of RFC 7914 section 5 on the block of `words` words at byte `offset` of `blocks`.
-// `table` holds `count` blocks of V followed by the two working blocks X and Y.
-fn mix(blocks: &mut [u8], offset: usize, words: usize, count: usize, table: &mut [u32]) -> () {
-  let x = count * words
-  let y = x + words
+// Returns the RFC position of the word stored at position `index` of a 64-byte block.
+fn permute(index: usize) -> usize {
+  return (index / 16) * 16 + (index % 16) * 5 % 16
+}
+
+// scryptROMix of RFC 7914 section 5 on the block of `words` words at `lane` in `scratch`. The
+// table V of `count` blocks starts at `table`, and the two working blocks follow it. Each block of
+// V is the BlockMix of the one before it, so nothing is copied into V.
+fn mix(scratch: &mut [u32], lane: usize, words: usize, count: usize, table: usize) -> () {
   let mut index: usize = 0
   while index < words {
-    table[x + index] = load(&blocks, offset + index * 4)
+    scratch[table + index] = scratch[lane + permute(index)]
     index = index + 1
   }
   let mut step: usize = 0
-  while step < count {
-    index = 0
-    while index < words {
-      table[step * words + index] = table[x + index]
-      index = index + 1
-    }
-    blockMix(&mut table, x, y, words)
-    index = 0
-    while index < words {
-      table[x + index] = table[y + index]
-      index = index + 1
-    }
+  while step + 1 < count {
+    blockMix(&mut scratch, table + step * words, table + (step + 1) * words, words)
     step = step + 1
   }
+  let mut current = table + count * words
+  let mut other = current + words
+  blockMix(&mut scratch, table + (count - 1) * words, current, words)
   let mask = usize.toU64(count - 1)
   step = 0
   while step < count {
-    // Integerify: the first 64 bits of the last 64-byte block, reduced modulo the power of two.
-    let low = u32.toU64(table[x + words - 16])
-    let high = u32.toU64(table[x + words - 15])
-    let selected = u64.toUsize(u64.bitAnd(u64.bitOr(low, u64.shiftLeft(high, 32)), mask))
+    // Integerify: words 0 and 1 of the last 64-byte block, at positions 0 and 13, as one
+    // little-endian u64 reduced modulo the power of two.
+    let low = u32.toU64(scratch[current + words - 16])
+    let high = u32.toU64(scratch[current + words - 3])
+    let selected = table + u64.toUsize(u64.bitAnd(u64.bitOr(low, u64.shiftLeft(high, 32)), mask)) * words
     index = 0
     while index < words {
-      table[x + index] = u32.bitXor(table[x + index], table[selected * words + index])
-      index = index + 1
+      let mixed = u32x4.load(&scratch, current + index) ^ u32x4.load(&scratch, selected + index)
+      u32x4.store(&mut scratch, current + index, mixed)
+      index = index + 4
     }
-    blockMix(&mut table, x, y, words)
-    index = 0
-    while index < words {
-      table[x + index] = table[y + index]
-      index = index + 1
-    }
+    blockMix(&mut scratch, current, other, words)
+    let swap = current
+    current = other
+    other = swap
     step = step + 1
   }
   index = 0
   while index < words {
-    store(&mut blocks, offset + index * 4, table[x + index])
+    scratch[lane + permute(index)] = scratch[current + index]
     index = index + 1
   }
 }
