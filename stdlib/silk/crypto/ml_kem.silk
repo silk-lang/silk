@@ -1,0 +1,923 @@
+//! Agree on a shared secret with ML-KEM (FIPS 203), the module-lattice key encapsulation
+//! mechanism, at the levels ML-KEM-512, ML-KEM-768, and ML-KEM-1024.
+//!
+//! # When to use
+//! Use [`MlKem`] when a shared secret must stay secret also against an attacker with a large
+//! quantum computer, for example in a hybrid TLS 1.3 group such as `X25519MLKEM768`. One side makes
+//! a key pair with [`MlKem.keyPairFromSeed`] and sends the encapsulation key. The other side calls
+//! [`MlKem.encapsulate`], keeps the 32-byte shared secret, and sends the ciphertext back. The first
+//! side gets the same secret with [`MlKem.decapsulate`]. Use `silk.crypto.ml_key` to read and write
+//! the keys in PKCS #8 and SubjectPublicKeyInfo.
+//!
+//! # Details
+//! The caller gives every buffer, so nothing allocates. A key pair comes from a 64-byte seed
+//! `d || z`, the form that PKCS #8 stores; the functions of [`MlKemParameters`] give the sizes.
+//! Decapsulation runs in constant time for the secret values and returns the implicit-rejection
+//! secret for a ciphertext that does not match, as FIPS 203 says, so it never fails for a
+//! ciphertext of the right length. The NTT uses 16-bit Montgomery products with lazy reduction.
+//! The encapsulation and decapsulation keys are checked as FIPS 203 section 7 asks.
+//!
+//! # Errors
+//! - [`MlKemError`] for a buffer of the wrong length, or for a key that fails the checks of FIPS
+//!   203.
+//!
+//! # Gotchas
+//! ML-KEM does not tell you who the other side is; authenticate the exchange, for example with a
+//! signature. Secrets are not erased.
+//!
+//! # Examples
+//! ## Agree on a secret
+//! ```silk
+//! import silk.core.result { Result }
+//! import silk.crypto.ml_kem { MlKem, MlKemError, MlKemParameters }
+//!
+//! pub fn main() -> i32 {
+//!   let parameters = MlKemParameters.MlKem768
+//!   // Real programs fill the seed and the message from a secure `Random` provider.
+//!   let seed: [u8; 64] = [1; 64]
+//!   let mut encapsulationKey: [u8; 1184] = [0; 1184]
+//!   let mut decapsulationKey: [u8; 2400] = [0; 2400]
+//!   match MlKem.keyPairFromSeed(parameters, &seed, &mut encapsulationKey, &mut decapsulationKey) {
+//!     Result<(), MlKemError>.Success { .. } => {}
+//!     Result<(), MlKemError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let message: [u8; 32] = [2; 32]
+//!   let mut ciphertext: [u8; 1088] = [0; 1088]
+//!   let sent = match MlKem.encapsulateWith(parameters, &encapsulationKey, &message, &mut ciphertext) {
+//!     Result<[u8; 32], MlKemError>.Success { value } => value
+//!     Result<[u8; 32], MlKemError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let received = match MlKem.decapsulate(parameters, &decapsulationKey, &ciphertext) {
+//!     Result<[u8; 32], MlKemError>.Success { value } => value
+//!     Result<[u8; 32], MlKemError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   if sent[0] != received[0] || sent[31] != received[31] {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Cryptography
+
+import silk.collections.slice { Slice }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.crypto.sha3 { Sha3_256, Sha3_512, Shake128, Shake256 }
+import silk.io.writer { Writer, WriterError }
+import silk.num.i16
+import silk.num.i32
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.system.random { Random }
+import silk.text.format { Debug, Format, Formatter }
+
+/// A parameter set of FIPS 203.
+pub enum MlKemParameters {
+  /// ML-KEM-512, security category 1.
+  MlKem512,
+  /// ML-KEM-768, security category 3.
+  MlKem768,
+  /// ML-KEM-1024, security category 5.
+  MlKem1024,
+}
+
+impl MlKemParameters {
+  /// Returns the length of an encapsulation key in bytes: 800, 1184, or 1568.
+  pub fn encapsulationKeyLength(self: &Self) -> usize {
+    return 384 * rank(self.*) + 32
+  }
+
+  /// Returns the length of a decapsulation key in bytes: 1632, 2400, or 3168.
+  pub fn decapsulationKeyLength(self: &Self) -> usize {
+    return 768 * rank(self.*) + 96
+  }
+
+  /// Returns the length of a ciphertext in bytes: 768, 1088, or 1568.
+  pub fn ciphertextLength(self: &Self) -> usize {
+    let set = settings(self.*)
+    return 32 * (set.du * set.k + set.dv)
+  }
+
+  /// Returns the content bytes of the object identifier that names the parameter set, without the
+  /// tag and length: `id-alg-ml-kem-512` is 2.16.840.1.101.3.4.4.1, and the others end in 2 and 3.
+  pub fn objectIdentifier(self: &Self) -> &[u8] {
+    return match &self.* {
+      MlKemParameters.MlKem512 => b"\x60\x86\x48\x01\x65\x03\x04\x04\x01"
+      MlKemParameters.MlKem768 => b"\x60\x86\x48\x01\x65\x03\x04\x04\x02"
+      MlKemParameters.MlKem1024 => b"\x60\x86\x48\x01\x65\x03\x04\x04\x03"
+    }
+  }
+}
+
+impl Debug for MlKemParameters {
+  /// Writes the name of the variant, such as `MlKem768`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      MlKemParameters.MlKem512 => run Format.write(&mut formatter, b"MlKem512")
+      MlKemParameters.MlKem768 => run Format.write(&mut formatter, b"MlKem768")
+      MlKemParameters.MlKem1024 => run Format.write(&mut formatter, b"MlKem1024")
+    }
+  }
+}
+
+/// The reason that an ML-KEM call failed. It holds no secret bytes.
+pub enum MlKemError {
+  /// A seed, key, message, ciphertext, or output buffer does not have the length of the parameter
+  /// set.
+  InvalidLength,
+  /// The encapsulation key fails the modulus check of FIPS 203 section 7.2: a coefficient is not
+  /// below q.
+  InvalidEncapsulationKey,
+  /// The decapsulation key fails the hash check of FIPS 203 section 7.3: it does not hold the
+  /// hash of its encapsulation key.
+  InvalidDecapsulationKey,
+}
+
+impl Debug for MlKemError {
+  /// Writes the name of the variant, such as `InvalidLength`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      MlKemError.InvalidLength => run Format.write(&mut formatter, b"InvalidLength")
+      MlKemError.InvalidEncapsulationKey => run Format.write(&mut formatter, b"InvalidEncapsulationKey")
+      MlKemError.InvalidDecapsulationKey => run Format.write(&mut formatter, b"InvalidDecapsulationKey")
+    }
+  }
+}
+
+/// The functions of ML-KEM.
+///
+/// # When to use
+/// Make a key pair with [`MlKem.keyPairFromSeed`], encapsulate with [`MlKem.encapsulate`], and
+/// decapsulate with [`MlKem.decapsulate`].
+///
+/// # Details
+/// Each function takes the parameter set and the caller's buffers, which must have the lengths of
+/// [`MlKemParameters`]. The decapsulation key holds the encapsulation key; see
+/// [`MlKem.encapsulationKeyOf`].
+pub struct MlKem {}
+
+impl MlKem {
+  /// Writes the key pair of ML-KEM.KeyGen_internal for the 64-byte `seed`, `d` followed by `z`,
+  /// into `encapsulationKey` and `decapsulationKey`.
+  ///
+  /// # Errors
+  /// - `InvalidLength` if `seed` is not 64 bytes, or a key buffer does not have the length of the
+  ///   parameter set. The buffers do not change.
+  pub fn keyPairFromSeed(
+    parameters: MlKemParameters,
+    seed: &[u8],
+    encapsulationKey: &mut [u8],
+    decapsulationKey: &mut [u8],
+  ) -> Result<(), MlKemError> {
+    if seed.length != 64 || encapsulationKey.length != parameters.encapsulationKeyLength()
+      || decapsulationKey.length != parameters.decapsulationKeyLength() {
+      return Result<(), MlKemError>.failResult(MlKemError.InvalidLength)
+    }
+    let set = settings(parameters)
+    keyGenerate(&set, seed, &mut encapsulationKey, &mut decapsulationKey)
+    return Result<(), MlKemError>.succeed(())
+  }
+
+  /// Returns a new 64-byte seed from the ambient `Random`, for [`MlKem.keyPairFromSeed`].
+  ///
+  /// The `Random` provider must be cryptographically secure.
+  pub effect fn generateSeed() -> [u8; 64] ? &mut Random {
+    let mut seed: [u8; 64] = [0; 64]
+    run Random.fillBytes(&mut seed)
+    return seed
+  }
+
+  /// Returns the encapsulation key inside `decapsulationKey`, a view that does not copy.
+  ///
+  /// # Errors
+  /// - `InvalidLength` if `decapsulationKey` does not have the length of the parameter set.
+  pub fn encapsulationKeyOf<'a>(parameters: MlKemParameters, decapsulationKey: &'a [u8]) -> Result<
+    &'a [u8],
+    MlKemError,
+  > {
+    if decapsulationKey.length != parameters.decapsulationKeyLength() {
+      return Result<&'a [u8], MlKemError>.failResult(MlKemError.InvalidLength)
+    }
+    let k = rank(parameters)
+    return Result<&'a [u8], MlKemError>.succeed(
+      Slice.view<u8>(decapsulationKey, 384 * k, 384 * k + 32),
+    )
+  }
+
+  /// Checks an encapsulation key as FIPS 203 section 7.2 asks: the length, and that every
+  /// coefficient is below q.
+  ///
+  /// # Errors
+  /// - `InvalidLength` or `InvalidEncapsulationKey`.
+  pub fn checkEncapsulationKey(parameters: MlKemParameters, encapsulationKey: &[u8]) -> Result<
+    (),
+    MlKemError,
+  > {
+    if encapsulationKey.length != parameters.encapsulationKeyLength() {
+      return Result<(), MlKemError>.failResult(MlKemError.InvalidLength)
+    }
+    if !coefficientsBelowModulus(encapsulationKey, rank(parameters)) {
+      return Result<(), MlKemError>.failResult(MlKemError.InvalidEncapsulationKey)
+    }
+    return Result<(), MlKemError>.succeed(())
+  }
+
+  /// Checks a decapsulation key as FIPS 203 section 7.3 asks: the length, and that it holds the
+  /// SHA3-256 hash of its encapsulation key.
+  ///
+  /// # Errors
+  /// - `InvalidLength` or `InvalidDecapsulationKey`.
+  pub fn checkDecapsulationKey(parameters: MlKemParameters, decapsulationKey: &[u8]) -> Result<
+    (),
+    MlKemError,
+  > {
+    if decapsulationKey.length != parameters.decapsulationKeyLength() {
+      return Result<(), MlKemError>.failResult(MlKemError.InvalidLength)
+    }
+    let k = rank(parameters)
+    let digest = Sha3_256.hash(Slice.view<u8>(decapsulationKey, 384 * k, 384 * k + 32))
+    let mut difference: u8 = 0
+    let mut index: usize = 0
+    while index < 32 {
+      difference = u8.bitOr(difference, u8.bitXor(digest[index], decapsulationKey[768 * k + 32 + index]))
+      index = index + 1
+    }
+    if difference != 0 {
+      return Result<(), MlKemError>.failResult(MlKemError.InvalidDecapsulationKey)
+    }
+    return Result<(), MlKemError>.succeed(())
+  }
+
+  /// Writes a ciphertext for `encapsulationKey` into `ciphertext` and returns the 32-byte shared
+  /// secret, with a 32-byte message from the ambient `Random`.
+  ///
+  /// # Errors
+  /// - `InvalidLength` if `encapsulationKey` or `ciphertext` does not have the length of the
+  ///   parameter set.
+  /// - `InvalidEncapsulationKey` if the key fails the modulus check.
+  ///
+  /// `ciphertext` does not change on an error.
+  pub effect fn encapsulate(
+    parameters: MlKemParameters,
+    encapsulationKey: &[u8],
+    ciphertext: &mut [u8],
+  ) -> Result<[u8; 32], MlKemError> ? &mut Random {
+    let mut message: [u8; 32] = [0; 32]
+    run Random.fillBytes(&mut message)
+    return MlKem.encapsulateWith(parameters, encapsulationKey, &message, &mut ciphertext)
+  }
+
+  /// Writes the ciphertext of ML-KEM.Encaps_internal for `encapsulationKey` and the 32-byte
+  /// `message` into `ciphertext`, and returns the shared secret.
+  ///
+  /// # Errors
+  /// - `InvalidLength` for a key, message, or ciphertext buffer of the wrong length.
+  /// - `InvalidEncapsulationKey` if the key fails the modulus check.
+  ///
+  /// # Gotchas
+  /// It is for test vectors. A message that is not fresh random bytes breaks the security, so use
+  /// [`MlKem.encapsulate`].
+  pub fn encapsulateWith(
+    parameters: MlKemParameters,
+    encapsulationKey: &[u8],
+    message: &[u8],
+    ciphertext: &mut [u8],
+  ) -> Result<[u8; 32], MlKemError> {
+    if message.length != 32 || ciphertext.length != parameters.ciphertextLength() {
+      return Result<[u8; 32], MlKemError>.failResult(MlKemError.InvalidLength)
+    }
+    match MlKem.checkEncapsulationKey(parameters, encapsulationKey) {
+      Result<(), MlKemError>.Success { .. } => {}
+      Result<(), MlKemError>.Failure { error } => {
+        return Result<[u8; 32], MlKemError>.failResult(error)
+      }
+    }
+    let set = settings(parameters)
+    let keyHash = Sha3_256.hash(encapsulationKey)
+    let mut seeds = Sha3_512.make()
+    seeds.update(message)
+    seeds.update(&keyHash)
+    let derived = seeds.finish()
+    encrypt(&set, encapsulationKey, message, Slice.view<u8>(&derived, 32, 32), &mut ciphertext)
+    let mut secret: [u8; 32] = [0; 32]
+    let mut index: usize = 0
+    while index < 32 {
+      secret[index] = derived[index]
+      index = index + 1
+    }
+    return Result<[u8; 32], MlKemError>.succeed(secret)
+  }
+
+  /// Returns the 32-byte shared secret of ML-KEM.Decaps for `ciphertext`.
+  ///
+  /// A ciphertext of the right length that was not made for this key gives the implicit-rejection
+  /// secret of FIPS 203, a value that the sender cannot predict, and not an error. The time does
+  /// not depend on the secret values or on whether the ciphertext matched.
+  ///
+  /// # Errors
+  /// - `InvalidLength` if `decapsulationKey` or `ciphertext` does not have the length of the
+  ///   parameter set.
+  /// - `InvalidDecapsulationKey` if the key fails the hash check.
+  pub fn decapsulate(parameters: MlKemParameters, decapsulationKey: &[u8], ciphertext: &[u8]) -> Result<
+    [u8; 32],
+    MlKemError,
+  > {
+    if ciphertext.length != parameters.ciphertextLength() {
+      return Result<[u8; 32], MlKemError>.failResult(MlKemError.InvalidLength)
+    }
+    match MlKem.checkDecapsulationKey(parameters, decapsulationKey) {
+      Result<(), MlKemError>.Success { .. } => {}
+      Result<(), MlKemError>.Failure { error } => {
+        return Result<[u8; 32], MlKemError>.failResult(error)
+      }
+    }
+    let set = settings(parameters)
+    let k = set.k
+    let encapsulationKey = Slice.view<u8>(decapsulationKey, 384 * k, 384 * k + 32)
+    let message = decrypt(&set, Slice.view<u8>(decapsulationKey, 0, 384 * k), ciphertext)
+    let mut seeds = Sha3_512.make()
+    seeds.update(&message)
+    seeds.update(Slice.view<u8>(decapsulationKey, 768 * k + 32, 32))
+    let derived = seeds.finish()
+    let mut rejection: [u8; 32] = [0; 32]
+    let mut implicit = Shake256.make()
+    implicit.update(Slice.view<u8>(decapsulationKey, 768 * k + 64, 32))
+    implicit.update(ciphertext)
+    implicit.finishInto(&mut rejection)
+    let mut again: [u8; 1568] = [0; 1568]
+    let length = ciphertext.length
+    encrypt(&set, encapsulationKey, &message, Slice.view<u8>(&derived, 32, 32), Slice.viewMut<u8>(&mut again, 0, length))
+    let mut difference: u8 = 0
+    let mut index: usize = 0
+    while index < length {
+      difference = u8.bitOr(difference, u8.bitXor(again[index], ciphertext[index]))
+      index = index + 1
+    }
+    // 0xff when the ciphertexts differ, without a branch on the secret comparison.
+    let mismatch = u32.toU8(u32.bitAnd(u32.wrappingSubtract(0, u32.shiftRight(u32.wrappingAdd(u8.toU32(difference), 255), 8)), 255))
+    let mut secret: [u8; 32] = [0; 32]
+    index = 0
+    while index < 32 {
+      secret[index] = u8.bitXor(derived[index], u8.bitAnd(mismatch, u8.bitXor(derived[index], rejection[index])))
+      index = index + 1
+    }
+    return Result<[u8; 32], MlKemError>.succeed(secret)
+  }
+}
+
+// The numbers of a parameter set: the rank k, the noise widths, and the compression widths.
+struct Settings {
+  k: usize,
+  eta1: usize,
+  du: usize,
+  dv: usize,
+}
+
+impl Copy for Settings {}
+
+fn rank(parameters: MlKemParameters) -> usize {
+  return settings(parameters).k
+}
+
+fn settings(parameters: MlKemParameters) -> Settings {
+  return match parameters {
+    MlKemParameters.MlKem512 => Settings { k: 2, eta1: 3, du: 10, dv: 4 }
+    MlKemParameters.MlKem768 => Settings { k: 3, eta1: 2, du: 10, dv: 4 }
+    MlKemParameters.MlKem1024 => Settings { k: 4, eta1: 2, du: 11, dv: 5 }
+  }
+}
+
+const Q: u32 = 3329
+
+// A polynomial of R_q, or its NTT, with coefficients below q.
+struct Poly {
+  c: [u16; 256],
+}
+
+impl Copy for Poly {}
+
+fn zeroPoly() -> Poly {
+  return Poly { c: [0; 256] }
+}
+
+// x mod q for x below 2^26, in constant time: a Barrett estimate with 2^26 / q leaves x below 2q.
+fn reduce(x: u32) -> u32 {
+  let estimate = u64.toU32(u64.shiftRight(u64.wrappingMultiply(u32.toU64(x), 20642678), 36))
+  return lowerOnce(u32.wrappingSubtract(x, u32.wrappingMultiply(estimate, Q)))
+}
+
+// x mod q for x below 2q.
+fn lowerOnce(x: u32) -> u32 {
+  let lowered = u32.wrappingSubtract(x, Q)
+  let mask = u32.wrappingSubtract(0, u32.shiftRight(lowered, 31))
+  return u32.wrappingAdd(lowered, u32.bitAnd(mask, Q))
+}
+
+fn addMod(left: u32, right: u32) -> u32 {
+  return lowerOnce(u32.wrappingAdd(left, right))
+}
+
+fn subtractMod(left: u32, right: u32) -> u32 {
+  return lowerOnce(u32.wrappingSubtract(u32.wrappingAdd(left, Q), right))
+}
+
+fn multiplyMod(left: u32, right: u32) -> u32 {
+  return reduce(u32.wrappingMultiply(left, right))
+}
+
+// floor(n / q) for n below 2^23, with a multiply and a shift checked for every such n.
+fn divideByModulus(n: u32) -> u32 {
+  return u64.toU32(u64.shiftRight(u64.wrappingMultiply(u32.toU64(n), 2580335), 33))
+}
+
+// zeta^BitRev7(i) 2^16 mod q for zeta = 17, centered: the factors of the NTT layers in the
+// Montgomery form of `montgomeryMultiply`.
+fn zetas() -> [i16; 128] {
+  return [
+    -1044, -758, -359, -1517, 1493, 1422, 287, 202, -171, 622, 1577, 182, 962, -1202, -1474, 1468,
+    573, -1325, 264, 383, -829, 1458, -1602, -130, -681, 1017, 732, 608, -1542, 411, -205, -1571,
+    1223, 652, -552, 1015, -1293, 1491, -282, -1544, 516, -8, -320, -666, -1618, -1162, 126, 1469,
+    -853, -90, -271, 830, 107, -1421, -247, -951, -398, 961, -1508, -725, 448, -1065, 677, -1275,
+    -1103, 430, 555, 843, -1251, 871, 1550, 105, 422, 587, 177, -235, -291, -460, 1574, 1653, -246,
+    778, 1159, -147, -777, 1483, -602, 1119, -1590, 644, -872, 349, 418, 329, -156, -75, 817, 1097,
+    603, 610, 1322, -1285, -1465, 384, -1215, -136, 1218, -1335, -874, 220, -1187, -1659, -1185,
+    -1530, -1278, 794, -1510, -854, -870, 478, -108, -308, 996, 991, 958, -1460, 1522, 1628,
+  ]
+}
+
+// The factors of `zetas` times q^-1 mod 2^16, for the low half of the Montgomery product.
+fn twistedZetas() -> [i16; 128] {
+  return [
+    -20, 31498, 14745, 787, 13525, -12402, 28191, -16694, -20907, 27758, -3799, -15690, 10690, 1358,
+    -11202, 31164, -5827, 17363, -26360, -29057, 5571, -1102, 21438, -26242, -28073, 24313, -10532,
+    8800, 18426, 8859, 26675, -16163, -5689, -6516, 1496, 30967, -23565, 20179, 20710, 25080,
+    -12796, 26616, 16064, -12442, 9134, -650, -25986, 27837, 19883, -28250, -15887, -8898, -28309,
+    9075, -30199, 18249, 13426, 14017, -29156, -12757, 16832, 4311, -24155, -17915, -335, 11182,
+    -11477, 13387, -32227, -14233, 20494, -21655, -27738, 13131, 945, -4587, -14883, 23092, 6182,
+    5493, 32010, -32502, 10631, 30317, 29175, -18741, -28762, 12639, -18486, 20100, 17560, 18525,
+    -14430, 19529, -5276, -12619, -31183, 20297, 25435, 2146, -7382, 15355, 24391, -32384, -20927,
+    -6280, 10946, -14903, 24214, -11044, 16989, 14469, 10335, -21498, -7934, -20198, -22502, 23210,
+    10906, -17442, 31636, -23860, 28644, -20257, 23998, 7756, -17422, 23132,
+  ]
+}
+
+// zeta^(2 BitRev7(i) + 1) mod q, the factors of the base-case products.
+fn gammas() -> [u16; 128] {
+  return [
+    17, 3312, 2761, 568, 583, 2746, 2649, 680, 1637, 1692, 723, 2606, 2288, 1041, 1100, 2229, 1409,
+    1920, 2662, 667, 3281, 48, 233, 3096, 756, 2573, 2156, 1173, 3015, 314, 3050, 279, 1703, 1626,
+    1651, 1678, 2789, 540, 1789, 1540, 1847, 1482, 952, 2377, 1461, 1868, 2687, 642, 939, 2390,
+    2308, 1021, 2437, 892, 2388, 941, 733, 2596, 2337, 992, 268, 3061, 641, 2688, 1584, 1745, 2298,
+    1031, 2037, 1292, 3220, 109, 375, 2954, 2549, 780, 2090, 1239, 1645, 1684, 1063, 2266, 319,
+    3010, 2773, 556, 757, 2572, 2099, 1230, 561, 2768, 2466, 863, 2594, 735, 2804, 525, 1092, 2237,
+    403, 2926, 1026, 2303, 1143, 2186, 2150, 1179, 2775, 554, 886, 2443, 1722, 1607, 1212, 2117,
+    1874, 1455, 1029, 2300, 2110, 1219, 2935, 394, 885, 2444, 2154, 1175,
+  ]
+}
+
+// a z mod q in (-q, q) for |a| < 2^15, with `factor` = z 2^16 mod q and `twisted` = factor q^-1
+// mod 2^16: the Montgomery product without a division, in the high halves of 16-bit products.
+fn montgomeryMultiply(a: i16, factor: i16, twisted: i16) -> i16 {
+  return i16.wrappingSubtract(
+    i16.multiplyHigh(a, factor),
+    i16.multiplyHigh(i16.wrappingMultiply(a, twisted), 3329),
+  )
+}
+
+// a mod q in [-q/2, q/2] for any i16 a, rounding a / q with 20159 / 2^26.
+fn barrettReduce(a: i16) -> i16 {
+  let estimate = i32.shiftRight(i32.wrappingAdd(i32.wrappingMultiply(i16.toI32(a), 20159), 33554432), 26)
+  return i16.wrappingSubtract(a, i16.wrappingMultiply(i32.wrappingToI16(estimate), 3329))
+}
+
+// a mod q in [0, q) for any i16 a.
+fn canonical(a: i16) -> u16 {
+  let centered = barrettReduce(a)
+  return i16.wrappingToU16(i16.wrappingAdd(centered, i16.bitAnd(i16.shiftRight(centered, 15), 3329)))
+}
+
+// Algorithm 9 of FIPS 203. Each butterfly leaves its values unreduced: a coefficient grows by
+// less than q per layer, so all stay below 8q < 2^15 and only the end reduces.
+fn ntt(poly: &mut Poly) -> () {
+  let factors = zetas()
+  let twisted = twistedZetas()
+  let mut a: [i16; 256] = [0; 256]
+  let mut index: usize = 0
+  while index < 256 {
+    a[index] = u16.wrappingToI16(poly.c[index])
+    index = index + 1
+  }
+  let mut i: usize = 1
+  let mut length: usize = 128
+  while length >= 2 {
+    let mut start: usize = 0
+    while start < 256 {
+      let factor = factors[i]
+      let twist = twisted[i]
+      i = i + 1
+      let mut j = start
+      while j < start + length {
+        let t = montgomeryMultiply(a[j + length], factor, twist)
+        let f = a[j]
+        a[j + length] = i16.wrappingSubtract(f, t)
+        a[j] = i16.wrappingAdd(f, t)
+        j = j + 1
+      }
+      start = start + 2 * length
+    }
+    length = length / 2
+  }
+  index = 0
+  while index < 256 {
+    poly.c[index] = canonical(a[index])
+    index = index + 1
+  }
+}
+
+// Algorithm 10 of FIPS 203, ending with the factor 128^-1. The sums are reduced in every layer, so
+// each value stays below q in magnitude.
+fn inverseNtt(poly: &mut Poly) -> () {
+  let factors = zetas()
+  let twisted = twistedZetas()
+  let mut a: [i16; 256] = [0; 256]
+  let mut index: usize = 0
+  while index < 256 {
+    a[index] = u16.wrappingToI16(poly.c[index])
+    index = index + 1
+  }
+  let mut i: usize = 127
+  let mut length: usize = 2
+  while length <= 128 {
+    let mut start: usize = 0
+    while start < 256 {
+      let factor = factors[i]
+      let twist = twisted[i]
+      i = i - 1
+      let mut j = start
+      while j < start + length {
+        let t = a[j]
+        let other = a[j + length]
+        a[j] = barrettReduce(i16.wrappingAdd(t, other))
+        a[j + length] = montgomeryMultiply(i16.wrappingSubtract(other, t), factor, twist)
+        j = j + 1
+      }
+      start = start + 2 * length
+    }
+    length = length * 2
+  }
+  // 128^-1 2^16 mod q is 512, and 512 q^-1 mod 2^16 is 512 too.
+  index = 0
+  while index < 256 {
+    poly.c[index] = canonical(montgomeryMultiply(a[index], 512, 512))
+    index = index + 1
+  }
+}
+
+// A sum of NTT-domain products whose coefficients are reduced only at the end. Each product adds
+// less than 2q^2 to a coefficient, so four of them stay far below 2^32.
+struct Wide {
+  c: [u32; 256],
+}
+
+impl Copy for Wide {}
+
+fn zeroWide() -> Wide {
+  return Wide { c: [0; 256] }
+}
+
+// Adds the NTT-domain product of `left` and `right` (Algorithms 11 and 12) to `sum`.
+fn multiplyAdd(sum: &mut Wide, left: &Poly, right: &Poly) -> () {
+  let factors = gammas()
+  let mut i: usize = 0
+  while i < 128 {
+    let a0 = u16.toU32(left.c[2 * i])
+    let a1 = u16.toU32(left.c[2 * i + 1])
+    let b0 = u16.toU32(right.c[2 * i])
+    let b1 = u16.toU32(right.c[2 * i + 1])
+    let high = u32.wrappingMultiply(multiplyMod(a1, b1), u16.toU32(factors[i]))
+    let c0 = u32.wrappingAdd(u32.wrappingMultiply(a0, b0), high)
+    let c1 = u32.wrappingAdd(u32.wrappingMultiply(a0, b1), u32.wrappingMultiply(a1, b0))
+    sum.c[2 * i] = u32.wrappingAdd(sum.c[2 * i], c0)
+    sum.c[2 * i + 1] = u32.wrappingAdd(sum.c[2 * i + 1], c1)
+    i = i + 1
+  }
+}
+
+fn widen(poly: &Poly) -> Wide {
+  let mut sum = zeroWide()
+  let mut index: usize = 0
+  while index < 256 {
+    sum.c[index] = u16.toU32(poly.c[index])
+    index = index + 1
+  }
+  return sum
+}
+
+fn reduceWide(sum: &Wide) -> Poly {
+  let mut poly = zeroPoly()
+  let mut index: usize = 0
+  while index < 256 {
+    poly.c[index] = u32.toU16(reduce(sum.c[index]))
+    index = index + 1
+  }
+  return poly
+}
+
+fn addPoly(sum: &mut Poly, other: &Poly) -> () {
+  let mut index: usize = 0
+  while index < 256 {
+    sum.c[index] = u32.toU16(addMod(u16.toU32(sum.c[index]), u16.toU32(other.c[index])))
+    index = index + 1
+  }
+}
+
+// Algorithm 7 of FIPS 203: rejection sampling of an NTT-domain polynomial from SHAKE128 of the
+// 34 bytes `rho || column || row`. The input is public, so the time may depend on it.
+fn sampleNtt(rho: &[u8], column: u8, row: u8) -> Poly {
+  let mut xof = Shake128.make()
+  xof.update(rho)
+  let indices: [u8; 2] = [column, row]
+  xof.update(&indices)
+  let mut reader = xof.finish()
+  let mut result = zeroPoly()
+  let mut block: [u8; 168] = [0; 168]
+  let mut count: usize = 0
+  while count < 256 {
+    reader.read(&mut block)
+    let mut at: usize = 0
+    while at < 168 && count < 256 {
+      let b0 = u8.toU32(block[at])
+      let b1 = u8.toU32(block[at + 1])
+      let b2 = u8.toU32(block[at + 2])
+      let first = u32.wrappingAdd(b0, u32.shiftLeft(u32.bitAnd(b1, 15), 8))
+      let second = u32.wrappingAdd(u32.shiftRight(b1, 4), u32.shiftLeft(b2, 4))
+      if first < Q {
+        result.c[count] = u32.toU16(first)
+        count = count + 1
+      }
+      if second < Q && count < 256 {
+        result.c[count] = u32.toU16(second)
+        count = count + 1
+      }
+      at = at + 3
+    }
+  }
+  return move result
+}
+
+// Algorithm 8 of FIPS 203 on PRF_eta(seed, nonce) = SHAKE256(seed || nonce, 64 eta).
+fn sampleNoise(seed: &[u8], nonce: u8, eta: usize) -> Poly {
+  let mut bytes: [u8; 192] = [0; 192]
+  let mut prf = Shake256.make()
+  prf.update(seed)
+  let suffix: [u8; 1] = [nonce]
+  prf.update(&suffix)
+  prf.finishInto(Slice.viewMut<u8>(&mut bytes, 0, 64 * eta))
+  let mut result = zeroPoly()
+  let mut i: usize = 0
+  while i < 256 {
+    let mut positive: u32 = 0
+    let mut negative: u32 = 0
+    let mut j: usize = 0
+    while j < eta {
+      positive = u32.wrappingAdd(positive, bitAt(&bytes, 2 * i * eta + j))
+      negative = u32.wrappingAdd(negative, bitAt(&bytes, 2 * i * eta + eta + j))
+      j = j + 1
+    }
+    result.c[i] = u32.toU16(subtractMod(positive, negative))
+    i = i + 1
+  }
+  return move result
+}
+
+fn bitAt(bytes: &[u8], index: usize) -> u32 {
+  return u32.bitAnd(u32.shiftRight(u8.toU32(bytes[index / 8]), usize.toU32(index % 8)), 1)
+}
+
+// ByteEncode_d of Algorithm 5: the 256 values of `poly`, each below 2^d, as 32 d bytes.
+fn encodePoly(poly: &Poly, d: usize, output: &mut [u8]) -> () {
+  let mut buffer: u64 = 0
+  let mut bits: usize = 0
+  let mut at: usize = 0
+  let mut index: usize = 0
+  while index < 256 {
+    buffer = u64.bitOr(buffer, u64.shiftLeft(u16.toU64(poly.c[index]), usize.toU64(bits)))
+    bits = bits + d
+    while bits >= 8 {
+      output[at] = u64.toU8(u64.bitAnd(buffer, 255))
+      buffer = u64.shiftRight(buffer, 8)
+      bits = bits - 8
+      at = at + 1
+    }
+    index = index + 1
+  }
+}
+
+// ByteDecode_d of Algorithm 6, without the reduction modulo q of d = 12.
+fn decodePoly(input: &[u8], d: usize) -> Poly {
+  let mut result = zeroPoly()
+  let mask = u64.wrappingSubtract(u64.shiftLeft(1, usize.toU64(d)), 1)
+  let mut buffer: u64 = 0
+  let mut bits: usize = 0
+  let mut at: usize = 0
+  let mut index: usize = 0
+  while index < 256 {
+    while bits < d {
+      buffer = u64.bitOr(buffer, u64.shiftLeft(u8.toU64(input[at]), usize.toU64(bits)))
+      bits = bits + 8
+      at = at + 1
+    }
+    result.c[index] = u64.toU16(u64.bitAnd(buffer, mask))
+    buffer = u64.shiftRight(buffer, usize.toU64(d))
+    bits = bits - d
+    index = index + 1
+  }
+  return move result
+}
+
+// ByteDecode_12 with the reduction modulo q. Every 12-bit value is below 2q.
+fn decodeReduced(input: &[u8]) -> Poly {
+  let mut result = decodePoly(input, 12)
+  let mut index: usize = 0
+  while index < 256 {
+    result.c[index] = u32.toU16(lowerOnce(u16.toU32(result.c[index])))
+    index = index + 1
+  }
+  return move result
+}
+
+fn coefficientsBelowModulus(encapsulationKey: &[u8], k: usize) -> bool {
+  let mut below = true
+  let mut i: usize = 0
+  while i < k {
+    let poly = decodePoly(Slice.view<u8>(encapsulationKey, 384 * i, 384), 12)
+    let mut index: usize = 0
+    while index < 256 {
+      if u16.toU32(poly.c[index]) >= Q {
+        below = false
+      }
+      index = index + 1
+    }
+    i = i + 1
+  }
+  return below
+}
+
+// Compress_d of FIPS 203 section 4.2.1 on every coefficient: round(2^d x / q) mod 2^d.
+fn compress(poly: &mut Poly, d: usize) -> () {
+  let mask = u32.wrappingSubtract(u32.shiftLeft(1, usize.toU32(d)), 1)
+  let mut index: usize = 0
+  while index < 256 {
+    let scaled = u32.wrappingAdd(u32.shiftLeft(u16.toU32(poly.c[index]), usize.toU32(d)), 1664)
+    poly.c[index] = u32.toU16(u32.bitAnd(divideByModulus(scaled), mask))
+    index = index + 1
+  }
+}
+
+// Decompress_d: round(q y / 2^d).
+fn decompress(poly: &mut Poly, d: usize) -> () {
+  let half = u32.shiftLeft(1, usize.toU32(d - 1))
+  let mut index: usize = 0
+  while index < 256 {
+    let scaled = u32.wrappingAdd(u32.wrappingMultiply(u16.toU32(poly.c[index]), Q), half)
+    poly.c[index] = u32.toU16(u32.shiftRight(scaled, usize.toU32(d)))
+    index = index + 1
+  }
+}
+
+// ML-KEM.KeyGen_internal (Algorithm 16) with K-PKE.KeyGen (Algorithm 13).
+fn keyGenerate(set: &Settings, seed: &[u8], encapsulationKey: &mut [u8], decapsulationKey: &mut [u8]) -> () {
+  let k = set.k
+  let mut expand = Sha3_512.make()
+  expand.update(Slice.view<u8>(seed, 0, 32))
+  let rankByte: [u8; 1] = [usize.toU8(k)]
+  expand.update(&rankByte)
+  let expanded = expand.finish()
+  let rho = Slice.view<u8>(&expanded, 0, 32)
+  let sigma = Slice.view<u8>(&expanded, 32, 32)
+  let mut secret: [Poly; 4] = [zeroPoly(); 4]
+  let mut nonce: u8 = 0
+  let mut i: usize = 0
+  while i < k {
+    secret[i] = sampleNoise(sigma, nonce, set.eta1)
+    ntt(&mut secret[i])
+    nonce = nonce + 1
+    i = i + 1
+  }
+  i = 0
+  while i < k {
+    let mut noise = sampleNoise(sigma, usize.toU8(k + i), set.eta1)
+    ntt(&mut noise)
+    let mut sum = widen(&noise)
+    let mut j: usize = 0
+    while j < k {
+      let entry = sampleNtt(rho, usize.toU8(j), usize.toU8(i))
+      multiplyAdd(&mut sum, &entry, &secret[j])
+      j = j + 1
+    }
+    let t = reduceWide(&sum)
+    encodePoly(&t, 12, Slice.viewMut<u8>(&mut encapsulationKey, 384 * i, 384))
+    encodePoly(&secret[i], 12, Slice.viewMut<u8>(&mut decapsulationKey, 384 * i, 384))
+    i = i + 1
+  }
+  let mut index: usize = 0
+  while index < 32 {
+    encapsulationKey[384 * k + index] = rho[index]
+    index = index + 1
+  }
+  let publicLength = 384 * k + 32
+  index = 0
+  while index < publicLength {
+    decapsulationKey[384 * k + index] = encapsulationKey[index]
+    index = index + 1
+  }
+  let keyHash = Sha3_256.hash(Slice.view<u8>(&encapsulationKey, 0, publicLength))
+  index = 0
+  while index < 32 {
+    decapsulationKey[768 * k + 32 + index] = keyHash[index]
+    decapsulationKey[768 * k + 64 + index] = seed[32 + index]
+    index = index + 1
+  }
+}
+
+// K-PKE.Encrypt (Algorithm 14). The key has passed the modulus check.
+fn encrypt(set: &Settings, encapsulationKey: &[u8], message: &[u8], randomness: &[u8], ciphertext: &mut [u8]) -> () {
+  let k = set.k
+  let rho = Slice.view<u8>(encapsulationKey, 384 * k, 32)
+  let mut y: [Poly; 4] = [zeroPoly(); 4]
+  let mut i: usize = 0
+  while i < k {
+    y[i] = sampleNoise(randomness, usize.toU8(i), set.eta1)
+    ntt(&mut y[i])
+    i = i + 1
+  }
+  i = 0
+  while i < k {
+    let mut sum = zeroWide()
+    let mut j: usize = 0
+    while j < k {
+      let entry = sampleNtt(rho, usize.toU8(i), usize.toU8(j))
+      multiplyAdd(&mut sum, &entry, &y[j])
+      j = j + 1
+    }
+    let mut u = reduceWide(&sum)
+    inverseNtt(&mut u)
+    addPoly(&mut u, &sampleNoise(randomness, usize.toU8(k + i), 2))
+    compress(&mut u, set.du)
+    encodePoly(&u, set.du, Slice.viewMut<u8>(&mut ciphertext, 32 * set.du * i, 32 * set.du))
+    i = i + 1
+  }
+  let mut sum = zeroWide()
+  i = 0
+  while i < k {
+    let t = decodePoly(Slice.view<u8>(encapsulationKey, 384 * i, 384), 12)
+    multiplyAdd(&mut sum, &t, &y[i])
+    i = i + 1
+  }
+  let mut v = reduceWide(&sum)
+  inverseNtt(&mut v)
+  addPoly(&mut v, &sampleNoise(randomness, usize.toU8(2 * k), 2))
+  let mut mu = decodePoly(message, 1)
+  decompress(&mut mu, 1)
+  addPoly(&mut v, &mu)
+  compress(&mut v, set.dv)
+  encodePoly(&v, set.dv, Slice.viewMut<u8>(&mut ciphertext, 32 * set.du * k, 32 * set.dv))
+}
+
+// K-PKE.Decrypt (Algorithm 15).
+fn decrypt(set: &Settings, secretKey: &[u8], ciphertext: &[u8]) -> [u8; 32] {
+  let k = set.k
+  let mut sum = zeroWide()
+  let mut i: usize = 0
+  while i < k {
+    let mut u = decodePoly(Slice.view<u8>(ciphertext, 32 * set.du * i, 32 * set.du), set.du)
+    decompress(&mut u, set.du)
+    ntt(&mut u)
+    let s = decodeReduced(Slice.view<u8>(secretKey, 384 * i, 384))
+    multiplyAdd(&mut sum, &s, &u)
+    i = i + 1
+  }
+  let mut w = reduceWide(&sum)
+  inverseNtt(&mut w)
+  let mut v = decodePoly(Slice.view<u8>(ciphertext, 32 * set.du * k, 32 * set.dv), set.dv)
+  decompress(&mut v, set.dv)
+  let mut index: usize = 0
+  while index < 256 {
+    v.c[index] = u32.toU16(subtractMod(u16.toU32(v.c[index]), u16.toU32(w.c[index])))
+    index = index + 1
+  }
+  compress(&mut v, 1)
+  let mut message: [u8; 32] = [0; 32]
+  encodePoly(&v, 1, &mut message)
+  return message
+}
