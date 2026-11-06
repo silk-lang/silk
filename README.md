@@ -162,7 +162,8 @@ silk run
 Hello, world!
 ```
 
-`silk init` writes a `silk.toml` and a `src/main.silk`. Even "hello world" names what it needs:
+`silk init` writes a `silk.toml` and a `src/main.silk` from the official `default` template
+(`silk init -l` lists the others; `-t minimal` works offline). Even "hello world" names what it needs:
 
 ```silk
 import silk.core.effect { Effect }

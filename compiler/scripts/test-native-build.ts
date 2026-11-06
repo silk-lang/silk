@@ -1063,8 +1063,8 @@ const program = Effect.gen(function* () {
   const recleaned = yield* invoke(silk, ['clean'], directory)
   assert.equal(recleaned.status, 0, recleaned.stderr)
   assert.match(recleaned.stdout, /^Nothing to clean: \S+build does not exist\n$/)
-  // `init` writes a project whose generated entry `run` builds and runs.
-  const initialized = yield* invoke(silk, ['init', 'greeting'], directory)
+  // `init -t minimal` writes, offline, a project whose generated entry `run` builds and runs.
+  const initialized = yield* invoke(silk, ['init', 'greeting', '-t', 'minimal'], directory)
   assert.equal(initialized.status, 0, initialized.stderr)
   const greeted = yield* invoke(
     silk,
@@ -2696,7 +2696,7 @@ const program = Effect.gen(function* () {
     assert.equal(refusedTests.status, 2, `test accepted ${selection.join(' ')}`)
   }
   assert.equal(yield* fs.exists(marker), false)
-  const repeated = yield* invoke(silk, ['init', 'greeting'], directory)
+  const repeated = yield* invoke(silk, ['init', 'greeting', '-t', 'minimal'], directory)
   assert.equal(repeated.status, 2, 'init must refuse an existing manifest')
   // A project `build` names its manifest instead of discovering one, and `--release` selects the
   // release profile directory; `run` refuses a foreign target before building anything.
@@ -3650,6 +3650,15 @@ const program = Effect.gen(function* () {
     const listedFull = yield* templated(['--list', 'silk-lang/examples/ui@v1'])
     assert.equal(listedFull.status, 0, listedFull.stderr)
     assert.match(listedFull.stdout, /\n  ui@v1  A window\n/)
+    // Without a template, a package is the official `default` template; a fetch that fails says why
+    // and how to create a project offline.
+    const defaulted = yield* templated(['plain'])
+    assert.equal(defaulted.status, 1, defaulted.stderr)
+    assert.match(defaulted.stderr, /^Template silk-lang\/examples\/default names no directory of its repository; `silk init --list` shows the official templates\n$/)
+    const unreachable = yield* invoke(silk, ['init', 'offline', '-t', 'nobody/nothing'], work, { ...process.env, HOME: home, SILK_HOME: silkHome, XDG_CONFIG_HOME: join(home, '.config') })
+    assert.equal(unreachable.status, 1, unreachable.stderr)
+    assert.match(unreachable.stderr, /^Cannot fetch template nobody\/nothing: git fetch failed: .+\nCheck the template's name and your network connection, or add `-t minimal` to create a minimal project offline\n$/)
+    assert.equal(yield* fs.exists(join(work, 'offline')), false)
     const malformed = yield* templated(['bad', '-t', 'silk-lang/examples@a..b'])
     assert.equal(malformed.status, 2, malformed.stderr)
     assert.match(malformed.stderr, /Template revision `a\.\.b` must be a branch, a tag or a full commit hash/)
@@ -3754,7 +3763,7 @@ const program = Effect.gen(function* () {
   yield* fs.remove(join(managed, 'app'), { recursive: true })
   yield* fs.remove(join(managed, 'build'), { recursive: true })
   yield* fs.writeFileString(join(managed, 'silk.toml'), '[workspace]\nmembers = []\n')
-  const hello = yield* invoke(silk, ['init', 'apps/hello'], managed)
+  const hello = yield* invoke(silk, ['init', 'apps/hello', '-t', 'minimal'], managed)
   assert.equal(hello.status, 0, hello.stderr)
   assert.match(hello.stdout, /Added apps\/hello to the workspace members in /)
   const greeting = yield* invoke(silk, ['init', '--lib', 'libs/greeting'], managed)
@@ -3835,7 +3844,7 @@ const program = Effect.gen(function* () {
   assert.match(unlinked.stderr, /^  link     failed +[0-9.ms ]+s$/m)
   assert.match(unlinked.stderr, /^Failed hello in /m)
   assert.doesNotMatch(unlinked.stderr + unlinked.stdout, /Run summary/)
-  const other = yield* invoke(silk, ['init', 'apps/other'], managed)
+  const other = yield* invoke(silk, ['init', 'apps/other', '-t', 'minimal'], managed)
   assert.equal(other.status, 0, other.stderr)
   const unchosen = yield* invoke(silk, ['run', '--stdlib', standardLibrary], managed, {
     ...process.env,

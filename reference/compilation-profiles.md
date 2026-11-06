@@ -414,7 +414,9 @@ refuses tool steps unless the root manifest sets
 ## PROFILE-011 — Project templates
 
 `silk init [path] --template <template>` (or `-t <template>`) creates the project from one
-directory of a GitHub repository instead of the minimal package. The template is written
+directory of a GitHub repository. Without `--template`, a package comes from the official
+`default` template, `silk-lang/examples/default`. `--template minimal` never fetches anything: the
+compiler writes its own minimal package, as it does for `--lib` and `--workspace`. The template is written
 `<owner>/<repository>[/<directory>...][@<revision>]`:
 
 - One segment alone names a directory of the official examples: `silk init -t ui` is
@@ -457,6 +459,7 @@ every argument given after `--`: `silk init app -t ui -- --dark` runs
 `scripts/post-init.sh 0.1.0-dev.50+e1a2bc7cec4a --dark`. A template can check the release or read
 options from those arguments. A failing
 entry stops the rest, and `silk init` then removes every file and directory it created, restores a
-`.gitignore` it changed and exits 1. A template it cannot fetch or use also exits 1; a malformed
+`.gitignore` it changed and exits 1. A template it cannot fetch or use also exits 1, and a failed fetch prints git's reason and
+suggests `-t minimal` for an offline project; a malformed
 template or a file in the way exits 2. Builds never run an entry; they only refuse a malformed
 one, naming its manifest line.
