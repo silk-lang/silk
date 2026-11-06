@@ -3584,7 +3584,9 @@ const program = Effect.gen(function* () {
     )
     yield* fs.writeFileString(
       join(examples, 'ui/silk.toml'),
-      '[package]\nname = "ui"\nversion = "0.1.0"\nsilk-version = "0.0.1"\ndescription = "A window"\n\n[[post-init]]\nrun = ["scripts/post-init.sh", "ready"]\n',
+      '[package]\nname = "ui"\nversion = "0.1.0"\nsilk-version = "0.0.1"\ndescription = "A window"\n\n' +
+        "[[post-init]]\nrun = ['sh', '-c', 'echo \"plain $# $SILK_VERSION\"']\n\n" +
+        '[[post-init]]\nrun = ["scripts/post-init.sh", "ready"]\narguments = true\n',
     )
     yield* fs.writeFileString(join(examples, 'ui/src/main.silk'), 'pub fn main() -> i32 {\n  return 7\n}\n')
     yield* fs.writeFileString(
@@ -3610,8 +3612,9 @@ const program = Effect.gen(function* () {
       invoke(silk, ['init', ...args], cwd, { ...process.env, HOME: home, SILK_HOME: silkHome, XDG_CONFIG_HOME: join(home, '.config') })
     const official = yield* templated(['app', '-t', 'ui', '--', '--dark', 'two words'])
     assert.equal(official.status, 0, official.stderr)
-    // An entry gets its own arguments, then the compiler's release, then the ones after `--`.
-    assert.match(official.stdout, /^post-init ready \d+\.\d+\.\d+\S* --dark two words\nInitialized Silk project app at \S+app from template silk-lang\/examples\/ui \(([0-9a-f]{40})\)\n$/)
+    // Every entry sees the compiler's release in SILK_VERSION and gets only its own arguments; one
+    // that sets `arguments = true` also gets the ones after `--`.
+    assert.match(official.stdout, /^plain 0 \d+\.\d+\.\d+\S*\npost-init ready --dark two words\nInitialized Silk project app at \S+app from template silk-lang\/examples\/ui \(([0-9a-f]{40})\)\n$/)
     assert.equal(official.stdout.includes(commit), true, official.stdout)
     const manifest = yield* fs.readFileString(join(work, 'app/silk.toml'))
     assert.match(manifest, /^\[package\]\nname = "app"\nversion = "0\.1\.0"\nsilk-version = "[^"]+"\n$/)
@@ -3633,6 +3636,11 @@ const program = Effect.gen(function* () {
     assert.match(collision.stderr, /Refusing to overwrite existing project file \S+taken\/src\/main\.silk\n/)
     assert.deepEqual(readdirSync(join(work, 'taken')).sort(), ['src'])
     assert.equal(yield* fs.readFileString(join(work, 'taken/src/main.silk')), 'kept\n')
+    // Arguments no entry takes are refused before anything is written.
+    const unwanted = yield* templated(['unwanted', '-t', 'broken', '--', 'extra'])
+    assert.equal(unwanted.status, 1, unwanted.stderr)
+    assert.match(unwanted.stderr, /Template silk-lang\/examples\/broken takes no arguments after `--`: no \[\[post-init\]\] entry of its silk\.toml sets `arguments = true`\n/)
+    assert.equal(yield* fs.exists(join(work, 'unwanted')), false)
     const failing = yield* templated(['failing', '-t', 'broken'])
     assert.equal(failing.status, 1, failing.stderr)
     assert.match(failing.stderr, /silk: sh -c touch made; exit 3 failed with status 3\nsilk: the template's \[\[post-init\]\] entry failed, so the project was removed\n/)

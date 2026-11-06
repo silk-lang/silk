@@ -446,18 +446,23 @@ one.
 A template adjusts the new project with `[[post-init]]` entries in its `silk.toml`. `run` is the
 command line, spelled as a `[[generate]]` entry's: the program, then its arguments, where a
 program with a `/` is a path below the template's directory and a bare name is searched on `PATH`.
+`arguments = true` also passes the entry every argument given after `--`.
 
 ```toml
 [[post-init]]
+run = ["git", "init", "--quiet"]
+
+[[post-init]]
 run = ["scripts/post-init.sh"]
+arguments = true
 ```
 
 The entries are removed from the new manifest before they run, so they run once. They run in order
-in the project directory with the caller's environment, after every file is written. Each entry
-gets its own arguments, then this compiler's release (such as `0.1.0-dev.50+e1a2bc7cec4a`), then
-every argument given after `--`: `silk init app -t ui -- --dark` runs
-`scripts/post-init.sh 0.1.0-dev.50+e1a2bc7cec4a --dark`. A template can check the release or read
-options from those arguments. A failing
+in the project directory with the caller's environment plus `SILK_VERSION`, this compiler's release
+(such as `0.1.0-dev.50+e1a2bc7cec4a`), after every file is written. An entry gets only its own
+arguments unless it sets `arguments = true`: then `silk init app -t ui -- --dark` runs
+`scripts/post-init.sh --dark`. Arguments after `--` for a template with no such entry are refused
+before anything is written. A failing
 entry stops the rest, and `silk init` then removes every file and directory it created, restores a
 `.gitignore` it changed and exits 1. A template it cannot fetch or use also exits 1, and a failed fetch prints git's reason and
 suggests `-t minimal` for an offline project; a malformed
