@@ -26,7 +26,8 @@
 //! # Gotchas
 //! Output is not verified until `Finished`, because the checksum comes at the end. If a step fails,
 //! discard all output of the stream. A failed decoder rejects each later step with `InvalidUse`
-//! until you call [`Decoder.reset`]. Zlib streams with a preset dictionary are not supported.
+//! until you call [`Decoder.reset`]. A zlib stream with a preset dictionary, or a raw stream made
+//! with one, needs [`Decoder.setDictionary`] before the first step.
 //!
 //! # Examples
 //! ## Decode a stored DEFLATE block
@@ -70,6 +71,8 @@
 import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.text.format {Debug, Format as TextFormat, Formatter}
 import silk.collections.list {List}
+import silk.collections.slice {Slice}
+import silk.compress.checksum {CompressionChecksum}
 import silk.core.result {Result}
 import silk.num.u8
 import silk.num.u32
@@ -91,8 +94,8 @@ pub const MEMORY_BOUND: u64 = 65536
 pub enum Format {
   /// One raw DEFLATE stream (RFC 1951) with no header or checksum.
   Raw,
-  /// One zlib stream (RFC 1950): a 2-byte header, DEFLATE data, and an Adler-32 checksum. A preset
-  /// dictionary is not supported.
+  /// One zlib stream (RFC 1950): a 2-byte header, an optional dictionary id, DEFLATE data, and an
+  /// Adler-32 checksum.
   Zlib,
   /// Gzip data (RFC 1952): one or more members, each with a header, DEFLATE data, a CRC-32, and the
   /// size.
@@ -144,8 +147,10 @@ pub enum ErrorKind {
   InvalidHeader,
   /// The header names a compression method that is not DEFLATE.
   UnsupportedMethod,
-  /// The zlib header asks for a preset dictionary.
-  UnsupportedDictionary,
+  /// The zlib header names a preset dictionary, and [`Decoder.setDictionary`] loaded none.
+  MissingDictionary,
+  /// The zlib header names a preset dictionary whose Adler-32 is not that of the loaded one.
+  DictionaryMismatch,
   /// A block type, a stored block length, or a compressed symbol is not valid.
   InvalidBlock,
   /// A Huffman code or a code-length repeat is not valid.
@@ -179,7 +184,8 @@ impl Debug for ErrorKind {
     return match &self.* {
       ErrorKind.InvalidHeader => run TextFormat.write(&mut formatter, b"InvalidHeader")
       ErrorKind.UnsupportedMethod => run TextFormat.write(&mut formatter, b"UnsupportedMethod")
-      ErrorKind.UnsupportedDictionary => run TextFormat.write(&mut formatter, b"UnsupportedDictionary")
+      ErrorKind.MissingDictionary => run TextFormat.write(&mut formatter, b"MissingDictionary")
+      ErrorKind.DictionaryMismatch => run TextFormat.write(&mut formatter, b"DictionaryMismatch")
       ErrorKind.InvalidBlock => run TextFormat.write(&mut formatter, b"InvalidBlock")
       ErrorKind.InvalidHuffman => run TextFormat.write(&mut formatter, b"InvalidHuffman")
       ErrorKind.InvalidDistance => run TextFormat.write(&mut formatter, b"InvalidDistance")
@@ -235,8 +241,8 @@ impl Debug for DecodeError {
 /// stream with the same storage.
 ///
 /// # Gotchas
-/// Output is not verified until `Finished`, because the checksum comes at the end. Zlib streams
-/// with a preset dictionary are not supported.
+/// Output is not verified until `Finished`, because the checksum comes at the end. A stream made
+/// with a preset dictionary needs [`Decoder.setDictionary`] before the first step.
 pub struct Decoder {
   format: Format,
   limits: Limits,
@@ -271,6 +277,8 @@ pub struct Decoder {
   crc: u32,
   adlerLow: u32,
   adlerHigh: u32,
+  dictionaryId: u32,
+  dictionaryLength: usize,
   memberSize: u32,
   literalCount: usize,
   distanceCount: usize,
@@ -360,6 +368,8 @@ impl Decoder {
       crc: 0xffffffff,
       adlerLow: 1,
       adlerHigh: 0,
+      dictionaryId: 0,
+      dictionaryLength: 0,
       memberSize: 0,
       literalCount: 0,
       distanceCount: 0,
@@ -439,6 +449,8 @@ impl Decoder {
     self.crc = 0xffffffff
     self.adlerLow = 1
     self.adlerHigh = 0
+    self.dictionaryId = 0
+    self.dictionaryLength = 0
     self.memberSize = 0
     self.literalCount = 0
     self.distanceCount = 0
@@ -453,6 +465,35 @@ impl Decoder {
     self.hFirst = 0
     self.hIndex = 0
     self.hLength = 1
+    return Result<(), DecodeError>.succeed(())
+  }
+  /// Loads `dictionary` as the history that the stream can refer to, before the first step, as
+  /// zlib's `inflateSetDictionary` does.
+  ///
+  /// # Details
+  /// Only the last 32 KiB are kept. A raw stream can then refer to the dictionary at once. A zlib
+  /// stream can refer to it only if its header names the dictionary by its Adler-32; a zlib stream
+  /// without a dictionary id decodes as if none was loaded. It does not allocate.
+  ///
+  /// # Errors
+  /// `InvalidUse` with gzip, after the first step, or after a dictionary was loaded for this
+  /// stream. The decoder does not change.
+  pub fn setDictionary(self: &mut Self, dictionary: &[u8]) -> Result<(), DecodeError> {
+    if self.format == Format.Gzip || self.totalInput != 0 || self.finalSeen
+      || self.dictionaryLength != 0 || self.phase == 60 || self.phase == 50 {
+      return Result<(), DecodeError>.failResult(
+        DecodeError {kind: ErrorKind.InvalidUse, consumed: 0, written: 0},
+      )
+    }
+    let mut used = dictionary
+    if used.length > 32768 {
+      used = Slice.view<u8>(dictionary, dictionary.length - 32768, 32768)
+    }
+    Slice.copyInto<u8>(List<u8>.asMutSlice(&mut self.history), 0, used)
+    self.historyNext = usize.remainder(used.length, 32768)
+    self.historyCount = used.length
+    self.dictionaryId = CompressionChecksum.adler32(dictionary)
+    self.dictionaryLength = dictionary.length
     return Result<(), DecodeError>.succeed(())
   }
   /// Decodes from `input` into `output` and returns how much it consumed and wrote.
@@ -748,9 +789,34 @@ fn advance(state: &mut Decoder, input: &[u8], output: &mut [u8]) -> u32 {
       return reject(&mut state, ErrorKind.InvalidHeader)
     }
     if u32.bitAnd(state.value, 32) != 0 {
-      return reject(&mut state, ErrorKind.UnsupportedDictionary)
+      if state.dictionaryLength == 0 {
+        return reject(&mut state, ErrorKind.MissingDictionary)
+      }
+      state.index = 0
+      state.trailer = 0
+      state.phase = 8
+      return 0
     }
+    // A loaded dictionary that the header does not name is not part of this stream.
+    state.historyNext = 0
+    state.historyCount = 0
     state.phase = 10
+    return 0
+  }
+  if state.phase == 8 {
+    if headerByte(&mut state, input, false) == false {
+      return 1
+    }
+    state.trailer = u32.shiftLeft(state.trailer, 8) | state.value
+    state.index = state.index + 1
+    if state.index == 4 {
+      if state.trailer != state.dictionaryId {
+        return reject(&mut state, ErrorKind.DictionaryMismatch)
+      }
+      state.index = 0
+      state.trailer = 0
+      state.phase = 10
+    }
     return 0
   }
   if state.phase == 10 {

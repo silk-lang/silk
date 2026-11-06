@@ -1,0 +1,1310 @@
+//! POSIX file and directory operations on host paths and descriptors, for native providers and
+//! runtimes that need the full file model of the system.
+//!
+//! # When to use
+//! Use [`NativeFile`] to build a runtime or a provider that must expose the file operations of the
+//! host as they are: open flags and modes, positioned reads and writes, complete status records,
+//! links, owners, times, and directory entries. Application code that only reads and writes files
+//! uses the `FileSystem` effect from `silk.system.filesystem` instead. That effect's native provider,
+//! `silk.platform.native.filesystem`, keeps each path inside a root directory; [`NativeFile`] does not.
+//!
+//! # Details
+//! A path is bytes, as the system takes it. A relative path starts at the working directory of the
+//! process, and symbolic links resolve as the system resolves them. A path is copied with a final
+//! zero byte into a buffer of [`PATH_LIMIT`] bytes, so a longer path fails with the code for a name
+//! that is too long, and a path that contains a zero byte fails with the code for an argument that
+//! is not valid.
+//!
+//! Each operation is one system call, or a short fixed sequence for [`NativeFile.copy`]. A call
+//! that a signal interrupts is made again. The operations block the calling thread; run them on a
+//! worker thread when the caller must stay responsive.
+//!
+//! [`FileStatus`] holds every field of the system record. On Linux it comes from `statx`, so the
+//! birth time is set when the file system records it, and is zero when it does not. On Darwin it
+//! comes from `stat`, which always has the birth time.
+//!
+//! The open flags and mode bits that the system uses are constants of this module, such as
+//! [`OPEN_CREATE`]. Their values differ between targets, so do not write the numbers.
+//!
+//! # Errors
+//! Each operation fails with [`NativeFileError`]: the [`NativeFileOperation`] and the `errno` value.
+//!
+//! # Gotchas
+//! - A descriptor from [`NativeFile.open`] belongs to the caller. Close it with
+//!   [`NativeFile.close`]. Nothing closes it on a drop.
+//! - [`NativeFile.changeMode`] of a symbolic link itself, with `followLinks` false, fails on Linux,
+//!   which cannot change the mode of a link.
+//! - The module is empty on targets other than Darwin on x86_64 or aarch64, and Linux with GNU libc
+//!   on x86_64 or aarch64.
+//!
+//! # Examples
+//! ## Write, read back, and inspect a file
+//! ```silk
+//! import silk.collections.slice { Slice }
+//! import silk.core.effect { Effect }
+//! import silk.core.option { Option }
+//! import silk.core.result { Result }
+//! import silk.platform.native.file {
+//!   NativeFile,
+//!   NativeFileError,
+//!   OPEN_CREATE,
+//!   OPEN_EXCLUSIVE,
+//!   OPEN_READ_WRITE,
+//!   TYPE_FILE,
+//!   TYPE_MASK,
+//! }
+//!
+//! effect fn program() -> i32 ! NativeFileError {
+//!   let mut directory: [u8; 64] = [0; 64]
+//!   let length = run NativeFile.makeTemporaryDirectory(b"/tmp/silk-file-XXXXXX", &mut directory)
+//!   let mut path: [u8; 72] = [0; 72]
+//!   let mut index: usize = 0
+//!   while index < length {
+//!     path[index] = directory[index]
+//!     index = index + 1
+//!   }
+//!   let name = b"/data"
+//!   let mut offset: usize = 0
+//!   while offset < name.length {
+//!     path[length + offset] = name[offset]
+//!     offset = offset + 1
+//!   }
+//!   let file = Slice.view<u8>(&path, 0, length + name.length)
+//!
+//!   let fd = run NativeFile.open(file, OPEN_READ_WRITE | OPEN_CREATE | OPEN_EXCLUSIVE, 420)
+//!   let written = run NativeFile.write(fd, b"hello", Option<u64>.none())
+//!
+//!   // A positioned read does not move the file offset.
+//!   let mut buffer: [u8; 3] = [0, 0, 0]
+//!   let read = run NativeFile.read(fd, &mut buffer, Option<u64>.some(2))
+//!   let status = run NativeFile.statusOf(fd)
+//!   run NativeFile.close(fd)
+//!   run NativeFile.remove(file)
+//!   run NativeFile.removeDirectory(Slice.view<u8>(&directory, 0, length))
+//!   if written != 5 || read != 3 || buffer[0] != 108 || status.size != 5 {
+//!     return 1
+//!   }
+//!   if (status.mode & TYPE_MASK) != TYPE_FILE {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//!
+//! pub effect fn main() -> i32 {
+//!   return match run Effect.result(program()) {
+//!     Result<i32, NativeFileError>.Success { value } => value
+//!     Result<i32, NativeFileError>.Failure { .. } => 1
+//!   }
+//! }
+//! ```
+//!
+//! @category Native platform
+
+static if (Intrinsic.targetOperatingSystem() == "darwin" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64") && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+import silk.collections.slice { Slice }
+import silk.mem.pointer { Pointer }
+import silk.core.option { Option }
+import silk.core.ownership { Copy, Drop }
+import silk.num.i32
+import silk.num.i64
+import silk.num.isize
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+
+/// The number of bytes that a path and its final zero byte may use.
+pub const PATH_LIMIT: usize = 4096
+
+/// The operation of [`NativeFile`] that failed.
+pub enum NativeFileOperation {
+  /// [`NativeFile.open`].
+  Open,
+  /// [`NativeFile.close`].
+  Close,
+  /// [`NativeFile.read`] and [`NativeFile.readScatter`].
+  Read,
+  /// [`NativeFile.write`] and [`NativeFile.writeGather`].
+  Write,
+  /// [`NativeFile.status`] and [`NativeFile.statusOf`].
+  Status,
+  /// [`NativeFile.truncate`] and [`NativeFile.truncateOf`].
+  Truncate,
+  /// [`NativeFile.synchronize`].
+  Synchronize,
+  /// [`NativeFile.setTimes`] and [`NativeFile.setTimesOf`].
+  SetTimes,
+  /// [`NativeFile.changeMode`] and [`NativeFile.changeModeOf`].
+  ChangeMode,
+  /// [`NativeFile.changeOwner`] and [`NativeFile.changeOwnerOf`].
+  ChangeOwner,
+  /// [`NativeFile.link`].
+  Link,
+  /// [`NativeFile.symbolicLink`].
+  SymbolicLink,
+  /// [`NativeFile.readLink`].
+  ReadLink,
+  /// [`NativeFile.realPath`].
+  RealPath,
+  /// [`NativeFile.rename`].
+  Rename,
+  /// [`NativeFile.remove`].
+  Remove,
+  /// [`NativeFile.removeDirectory`].
+  RemoveDirectory,
+  /// [`NativeFile.makeDirectory`].
+  MakeDirectory,
+  /// [`NativeFile.makeTemporaryDirectory`].
+  MakeTemporaryDirectory,
+  /// [`NativeFile.copy`].
+  Copy,
+  /// [`NativeFile.access`].
+  Access,
+  /// [`NativeFile.volumeStatus`].
+  VolumeStatus,
+  /// [`NativeFile.openDirectory`].
+  OpenDirectory,
+  /// [`Directory.next`].
+  ReadDirectory,
+  /// [`Directory.close`].
+  CloseDirectory,
+}
+
+/// A failed [`NativeFile`] operation: which one, and the native error code.
+///
+/// # Details
+/// `code` is the `errno` value of the failed system call, such as 2 (`ENOENT`) for a path that does
+/// not exist.
+pub struct NativeFileError {
+  /// The operation that failed.
+  pub operation: NativeFileOperation,
+  /// The native error code.
+  pub code: i32,
+}
+
+/// A point in time: seconds and nanoseconds since 1970-01-01 00:00:00 UTC.
+pub struct Timestamp {
+  /// Whole seconds. Negative for a time before 1970.
+  pub seconds: i64,
+  /// Nanoseconds after `seconds`, from 0 through 999999999.
+  pub nanoseconds: u32,
+}
+
+impl Copy for Timestamp {}
+
+/// The status record of a file, as the system keeps it.
+///
+/// # Details
+/// `mode` holds the type bits ([`TYPE_MASK`]) and the permission bits. `born` is zero when the file
+/// system does not record a birth time. `flags` and `generation` are zero on Linux.
+pub struct FileStatus {
+  /// The device that holds the file.
+  pub device: u64,
+  /// The inode number.
+  pub inode: u64,
+  /// The type and permission bits.
+  pub mode: u32,
+  /// The number of hard links.
+  pub links: u64,
+  /// The user id of the owner.
+  pub user: u32,
+  /// The group id of the owner.
+  pub group: u32,
+  /// The device that the file is, for a device file.
+  pub specialDevice: u64,
+  /// The size in bytes.
+  pub size: u64,
+  /// The preferred block size for transfers.
+  pub blockSize: u64,
+  /// The number of 512-byte blocks that the file uses.
+  pub blocks: u64,
+  /// The user flags of the file, on Darwin.
+  pub flags: u32,
+  /// The generation number of the file, on Darwin.
+  pub generation: u32,
+  /// The time of the last read.
+  pub accessed: Timestamp,
+  /// The time of the last change of the data.
+  pub modified: Timestamp,
+  /// The time of the last change of the status.
+  pub changed: Timestamp,
+  /// The time of creation, or zero when the file system does not record it.
+  pub born: Timestamp,
+}
+
+impl Copy for FileStatus {}
+
+/// The status of the file system that holds a path.
+pub struct VolumeStatus {
+  /// The file system type number.
+  pub kind: u64,
+  /// The block size in bytes.
+  pub blockSize: u64,
+  /// The total number of blocks.
+  pub blocks: u64,
+  /// The number of free blocks.
+  pub freeBlocks: u64,
+  /// The number of free blocks that a user without privileges can use.
+  pub availableBlocks: u64,
+  /// The total number of file nodes.
+  pub files: u64,
+  /// The number of free file nodes.
+  pub freeFiles: u64,
+}
+
+impl Copy for VolumeStatus {}
+
+/// The type of a directory entry, as the directory reports it.
+pub enum EntryKind {
+  /// The file system did not report the type. Get it with [`NativeFile.status`].
+  Unknown,
+  /// A regular file.
+  File,
+  /// A directory.
+  Directory,
+  /// A symbolic link.
+  SymbolicLink,
+  /// A named pipe.
+  Fifo,
+  /// A socket.
+  Socket,
+  /// A character device.
+  CharacterDevice,
+  /// A block device.
+  BlockDevice,
+}
+
+/// The name and the type of one directory entry, from [`Directory.next`].
+pub struct DirectoryEntry {
+  /// The number of name bytes written to the start of the output buffer.
+  pub length: usize,
+  /// The type of the entry.
+  pub kind: EntryKind,
+}
+
+/// How [`NativeFile.copy`] makes the copy.
+pub enum CopyMethod {
+  /// Copy the bytes.
+  Bytes,
+  /// Share the data blocks when the file system can, and else copy the bytes.
+  CloneOrBytes,
+  /// Share the data blocks, or fail when the file system cannot.
+  Clone,
+}
+
+extern "C" struct Timespec { seconds: i64, nanoseconds: i64 }
+impl Copy for Timespec {}
+
+/// The C `struct iovec`: one buffer of a scattered read or a gathered write.
+extern "C" struct IoVector { base: ?[*]const u8, length: usize }
+impl Copy for IoVector {}
+// The same C `struct iovec`, for buffers that a read fills.
+extern "C" struct ReadVector { base: ?[*]mut u8, length: usize }
+impl Copy for ReadVector {}
+
+extern "C" struct DirectoryStream {}
+
+@foreign(noCapture: .("path"))
+unsafe extern "C" fn open(path: ?[*]const u8, flags: i32, ...) -> i32
+unsafe extern "C" fn close(fd: i32) -> i32
+@foreign(noCapture: .("buffer"))
+unsafe extern "C" fn read(fd: i32, buffer: ?[*]mut u8, count: usize) -> isize
+@foreign(noCapture: .("buffer"))
+unsafe extern "C" fn write(fd: i32, buffer: ?[*]const u8, count: usize) -> isize
+@foreign(noCapture: .("buffer"))
+unsafe extern "C" fn pread(fd: i32, buffer: ?[*]mut u8, count: usize, offset: i64) -> isize
+@foreign(noCapture: .("buffer"))
+unsafe extern "C" fn pwrite(fd: i32, buffer: ?[*]const u8, count: usize, offset: i64) -> isize
+@foreign(noCapture: .("vectors"))
+unsafe extern "C" fn readv(fd: i32, vectors: ?[*]const ReadVector, count: i32) -> isize
+@foreign(noCapture: .("vectors"))
+unsafe extern "C" fn writev(fd: i32, vectors: ?[*]const IoVector, count: i32) -> isize
+@foreign(noCapture: .("vectors"))
+unsafe extern "C" fn preadv(fd: i32, vectors: ?[*]const ReadVector, count: i32, offset: i64) -> isize
+@foreign(noCapture: .("vectors"))
+unsafe extern "C" fn pwritev(fd: i32, vectors: ?[*]const IoVector, count: i32, offset: i64) -> isize
+@foreign(noCapture: .("path"))
+unsafe extern "C" fn truncate(path: ?[*]const u8, length: i64) -> i32
+unsafe extern "C" fn ftruncate(fd: i32, length: i64) -> i32
+unsafe extern "C" fn fsync(fd: i32) -> i32
+@foreign(noCapture: .("path", "times"))
+unsafe extern "C" fn utimensat(directory: i32, path: ?[*]const u8, times: ?[*]const Timespec, flags: i32) -> i32
+@foreign(noCapture: .("times"))
+unsafe extern "C" fn futimens(fd: i32, times: ?[*]const Timespec) -> i32
+@foreign(noCapture: .("path"))
+unsafe extern "C" fn fchmodat(directory: i32, path: ?[*]const u8, mode: u32, flags: i32) -> i32
+unsafe extern "C" fn fchmod(fd: i32, mode: u32) -> i32
+@foreign(noCapture: .("path"))
+unsafe extern "C" fn fchownat(directory: i32, path: ?[*]const u8, user: u32, group: u32, flags: i32) -> i32
+unsafe extern "C" fn fchown(fd: i32, user: u32, group: u32) -> i32
+@foreign(noCapture: .("existing", "created"))
+unsafe extern "C" fn link(existing: ?[*]const u8, created: ?[*]const u8) -> i32
+@foreign(noCapture: .("target", "path"))
+unsafe extern "C" fn symlink(target: ?[*]const u8, path: ?[*]const u8) -> i32
+@foreign(noCapture: .("path", "buffer"))
+unsafe extern "C" fn readlink(path: ?[*]const u8, buffer: ?[*]mut u8, size: usize) -> isize
+@foreign(noCapture: .("path", "resolved"))
+unsafe extern "C" fn realpath(path: ?[*]const u8, resolved: ?[*]mut u8) -> ?*mut u8
+@foreign(noCapture: .("from", "to"))
+unsafe extern "C" fn rename(from: ?[*]const u8, to: ?[*]const u8) -> i32
+@foreign(noCapture: .("path"))
+unsafe extern "C" fn unlink(path: ?[*]const u8) -> i32
+@foreign(noCapture: .("path"))
+unsafe extern "C" fn rmdir(path: ?[*]const u8) -> i32
+@foreign(noCapture: .("template"))
+unsafe extern "C" fn mkdtemp(template: ?[*]mut u8) -> ?*mut u8
+@foreign(noCapture: .("path"))
+unsafe extern "C" fn access(path: ?[*]const u8, mode: i32) -> i32
+unsafe extern "C" fn closedir(stream: *mut DirectoryStream) -> i32
+
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  unsafe extern "C" fn __error() -> *mut i32
+  unsafe fn currentError() -> i32 { unsafe { return Pointer.read<i32>(__error()) } }
+  @foreign(noCapture: .("path"))
+  unsafe extern "C" fn mkdir(path: ?[*]const u8, mode: u16) -> i32
+  unsafe fn makeDirectoryCall(path: ?[*]const u8, mode: u32) -> i32 { return unsafe mkdir(path, u32.toU16(mode & 65535)) }
+
+  /// Open for reading only.
+  pub const OPEN_READ_ONLY: i32 = 0
+  /// Open for writing only.
+  pub const OPEN_WRITE_ONLY: i32 = 1
+  /// Open for reading and writing.
+  pub const OPEN_READ_WRITE: i32 = 2
+  /// Write each time at the end of the file.
+  pub const OPEN_APPEND: i32 = 8
+  /// Make the file when it does not exist.
+  pub const OPEN_CREATE: i32 = 512
+  /// Make the file length zero.
+  pub const OPEN_TRUNCATE: i32 = 1024
+  /// With [`OPEN_CREATE`], fail when the file exists.
+  pub const OPEN_EXCLUSIVE: i32 = 2048
+  /// Fail when the last part of the path is a symbolic link.
+  pub const OPEN_NO_FOLLOW: i32 = 256
+  /// Wait for data and status to reach the device on each write.
+  pub const OPEN_SYNCHRONOUS: i32 = 128
+  /// Wait for data to reach the device on each write.
+  pub const OPEN_DATA_SYNCHRONOUS: i32 = 4194304
+  /// Fail when the path is not a directory.
+  pub const OPEN_DIRECTORY: i32 = 1048576
+  /// Do not block on reads and writes.
+  pub const OPEN_NONBLOCK: i32 = 4
+  /// Do not make a terminal the controlling terminal.
+  pub const OPEN_NO_TERMINAL: i32 = 131072
+  /// Close the descriptor in a child program.
+  pub const OPEN_CLOSE_ON_EXEC: i32 = 16777216
+  /// Open a symbolic link itself, on Darwin.
+  pub const OPEN_SYMBOLIC_LINK: i32 = 2097152
+  /// Do not change the access time, on Linux. Zero on Darwin.
+  pub const OPEN_NO_ACCESS_TIME: i32 = 0
+  /// Bypass the cache, on Linux. Zero on Darwin.
+  pub const OPEN_DIRECT: i32 = 0
+
+  const AT_CWD: i32 = -2
+  const AT_NO_FOLLOW: i32 = 32
+  const NAME_TOO_LONG: i32 = 63
+  const NOT_SUPPORTED: i32 = 45
+
+  // The C `struct stat` with 64-bit inodes.
+  extern "C" struct Stat {
+    dev: i32, mode: u16, nlink: u16, ino: u64, uid: u32, gid: u32, rdev: i32,
+    atime: Timespec, mtime: Timespec, ctime: Timespec, birthtime: Timespec,
+    size: i64, blocks: i64, blksize: i32, flags: u32, gen: u32, lspare: i32, qspare: [i64; 2],
+  }
+  impl Copy for Stat {}
+  fn zeroTime() -> Timespec { return Timespec { seconds: 0, nanoseconds: 0 } }
+  fn emptyStat() -> Stat {
+    return Stat { dev: 0, mode: 0, nlink: 0, ino: 0, uid: 0, gid: 0, rdev: 0, atime: zeroTime(), mtime: zeroTime(), ctime: zeroTime(), birthtime: zeroTime(), size: 0, blocks: 0, blksize: 0, flags: 0, gen: 0, lspare: 0, qspare: [0, 0] }
+  }
+  // The C `struct statfs` with 64-bit inodes.
+  extern "C" struct StatFs {
+    bsize: u32, iosize: i32, blocks: u64, bfree: u64, bavail: u64, files: u64, ffree: u64,
+    fsid: [i32; 2], owner: u32, kind: u32, flags: u32, subtype: u32,
+    typeName: [u8; 16], mountedOn: [u8; 1024], mountedFrom: [u8; 1024], flagsExtended: u32, reserved: [u32; 7],
+  }
+  static if Intrinsic.targetArchitecture() == "x86_64" {
+    @foreign(noCapture: .("path", "value"))
+    unsafe extern "C" fn stat(path: ?[*]const u8, value: *mut Stat) -> i32 as "stat$INODE64"
+    @foreign(noCapture: .("path", "value"))
+    unsafe extern "C" fn lstat(path: ?[*]const u8, value: *mut Stat) -> i32 as "lstat$INODE64"
+    @foreign(noCapture: .("value"))
+    unsafe extern "C" fn fstat(fd: i32, value: *mut Stat) -> i32 as "fstat$INODE64"
+    @foreign(noCapture: .("path", "value"))
+    unsafe extern "C" fn statfs(path: ?[*]const u8, value: *mut StatFs) -> i32 as "statfs$INODE64"
+    @foreign(noCapture: .("path"))
+    unsafe extern "C" fn opendir(path: ?[*]const u8) -> ?*mut DirectoryStream as "opendir$INODE64"
+    @foreign(noCapture: .("stream"))
+    unsafe extern "C" fn readdir(stream: *mut DirectoryStream) -> ?*const u8 as "readdir$INODE64"
+  } else {
+    @foreign(noCapture: .("path", "value"))
+    unsafe extern "C" fn stat(path: ?[*]const u8, value: *mut Stat) -> i32
+    @foreign(noCapture: .("path", "value"))
+    unsafe extern "C" fn lstat(path: ?[*]const u8, value: *mut Stat) -> i32
+    @foreign(noCapture: .("value"))
+    unsafe extern "C" fn fstat(fd: i32, value: *mut Stat) -> i32
+    @foreign(noCapture: .("path", "value"))
+    unsafe extern "C" fn statfs(path: ?[*]const u8, value: *mut StatFs) -> i32
+    @foreign(noCapture: .("path"))
+    unsafe extern "C" fn opendir(path: ?[*]const u8) -> ?*mut DirectoryStream
+    @foreign(noCapture: .("stream"))
+    unsafe extern "C" fn readdir(stream: *mut DirectoryStream) -> ?*const u8
+  }
+  unsafe extern "C" fn fcntl(fd: i32, command: i32, ...) -> i32
+  @foreign(noCapture: .("state"))
+  unsafe extern "C" fn fcopyfile(from: i32, to: i32, state: ?*mut u8, flags: u32) -> i32
+  @foreign(noCapture: .("from", "to"))
+  unsafe extern "C" fn clonefile(from: ?[*]const u8, to: ?[*]const u8, flags: u32) -> i32
+
+  // The type byte and the name of `struct dirent` with 64-bit inodes.
+  const ENTRY_TYPE_OFFSET: usize = 20
+  const ENTRY_NAME_OFFSET: usize = 21
+
+  fn timestamp(value: Timespec) -> Timestamp {
+    return Timestamp { seconds: value.seconds, nanoseconds: u32.wrappingToU32(i64.wrappingToU32(value.nanoseconds)) }
+  }
+  fn record(value: &Stat) -> FileStatus {
+    return FileStatus {
+      device: i64.wrappingToU64(i32.toI64(value.dev)), inode: value.ino, mode: u16.toU32(value.mode),
+      links: u16.toU64(value.nlink), user: value.uid, group: value.gid,
+      specialDevice: i64.wrappingToU64(i32.toI64(value.rdev)), size: i64.wrappingToU64(value.size),
+      blockSize: i64.wrappingToU64(i32.toI64(value.blksize)), blocks: i64.wrappingToU64(value.blocks),
+      flags: value.flags, generation: value.gen,
+      accessed: timestamp(value.atime), modified: timestamp(value.mtime), changed: timestamp(value.ctime), born: timestamp(value.birthtime),
+    }
+  }
+  unsafe fn statusCall(path: ?[*]const u8, followLinks: bool, output: &mut FileStatus) -> i32 {
+    let mut value = emptyStat()
+    let result = if followLinks { unsafe stat(path, Pointer.fromMutRef<Stat>(&mut value)) } else { unsafe lstat(path, Pointer.fromMutRef<Stat>(&mut value)) }
+    if result != 0 { return unsafe currentError() }
+    output.* = record(&value)
+    return 0
+  }
+  unsafe fn statusOfCall(fd: i32, output: &mut FileStatus) -> i32 {
+    let mut value = emptyStat()
+    if unsafe fstat(fd, Pointer.fromMutRef<Stat>(&mut value)) != 0 { return unsafe currentError() }
+    output.* = record(&value)
+    return 0
+  }
+  unsafe fn volumeCall(path: ?[*]const u8, output: &mut VolumeStatus) -> i32 {
+    let mut value = StatFs { bsize: 0, iosize: 0, blocks: 0, bfree: 0, bavail: 0, files: 0, ffree: 0, fsid: [0, 0], owner: 0, kind: 0, flags: 0, subtype: 0, typeName: [0; 16], mountedOn: [0; 1024], mountedFrom: [0; 1024], flagsExtended: 0, reserved: [0; 7] }
+    if unsafe statfs(path, Pointer.fromMutRef<StatFs>(&mut value)) != 0 { return unsafe currentError() }
+    output.* = VolumeStatus { kind: u32.toU64(value.kind), blockSize: u32.toU64(value.bsize), blocks: value.blocks, freeBlocks: value.bfree, availableBlocks: value.bavail, files: value.files, freeFiles: value.ffree }
+    return 0
+  }
+  // `fdatasync` is not public on Darwin; `F_FULLFSYNC` is stronger than both, so the data-only
+  // request uses `fsync`, as libuv does.
+  unsafe fn synchronizeCall(fd: i32, dataOnly: bool) -> i32 {
+    if unsafe fsync(fd) != 0 { return unsafe currentError() }
+    return 0
+  }
+  // `fcopyfile` with COPYFILE_DATA after the destination is open; `clonefile` for a clone.
+  unsafe fn cloneCall(from: ?[*]const u8, to: ?[*]const u8) -> i32 {
+    if unsafe clonefile(from, to, 0) != 0 { return unsafe currentError() }
+    return 0
+  }
+  unsafe fn copyData(from: i32, to: i32) -> i32 {
+    if unsafe fcopyfile(from, to, Pointer.null<u8>(), 8) != 0 { return unsafe currentError() }
+    return 0
+  }
+} else {
+  unsafe extern "C" fn __errno_location() -> *mut i32
+  unsafe fn currentError() -> i32 { unsafe { return Pointer.read<i32>(__errno_location()) } }
+  @foreign(noCapture: .("path"))
+  unsafe extern "C" fn mkdir(path: ?[*]const u8, mode: u32) -> i32
+  unsafe fn makeDirectoryCall(path: ?[*]const u8, mode: u32) -> i32 { return unsafe mkdir(path, mode) }
+  unsafe extern "C" fn fdatasync(fd: i32) -> i32
+  unsafe extern "C" fn syscall(number: i64, ...) -> i64
+  @foreign(noCapture: .("path"))
+  unsafe extern "C" fn opendir(path: ?[*]const u8) -> ?*mut DirectoryStream
+  @foreign(noCapture: .("stream"))
+  unsafe extern "C" fn readdir(stream: *mut DirectoryStream) -> ?*const u8
+  @foreign(noCapture: .("path", "value"))
+  unsafe extern "C" fn statfs(path: ?[*]const u8, value: *mut StatFs) -> i32
+  unsafe extern "C" fn ioctl(fd: i32, request: u64, ...) -> i32
+  @foreign(noCapture: .("fromOffset", "toOffset"))
+  unsafe extern "C" fn copy_file_range(from: i32, fromOffset: ?*mut i64, to: i32, toOffset: ?*mut i64, length: usize, flags: u32) -> isize
+
+  /// Open for reading only.
+  pub const OPEN_READ_ONLY: i32 = 0
+  /// Open for writing only.
+  pub const OPEN_WRITE_ONLY: i32 = 1
+  /// Open for reading and writing.
+  pub const OPEN_READ_WRITE: i32 = 2
+  /// Write each time at the end of the file.
+  pub const OPEN_APPEND: i32 = 1024
+  /// Make the file when it does not exist.
+  pub const OPEN_CREATE: i32 = 64
+  /// Make the file length zero.
+  pub const OPEN_TRUNCATE: i32 = 512
+  /// With [`OPEN_CREATE`], fail when the file exists.
+  pub const OPEN_EXCLUSIVE: i32 = 128
+  /// Wait for data and status to reach the device on each write.
+  pub const OPEN_SYNCHRONOUS: i32 = 1052672
+  /// Wait for data to reach the device on each write.
+  pub const OPEN_DATA_SYNCHRONOUS: i32 = 4096
+  /// Do not block on reads and writes.
+  pub const OPEN_NONBLOCK: i32 = 2048
+  /// Do not make a terminal the controlling terminal.
+  pub const OPEN_NO_TERMINAL: i32 = 256
+  /// Close the descriptor in a child program.
+  pub const OPEN_CLOSE_ON_EXEC: i32 = 524288
+  /// Do not change the access time, on Linux. Zero on Darwin.
+  pub const OPEN_NO_ACCESS_TIME: i32 = 262144
+  /// Open a symbolic link itself, on Darwin. Zero on Linux.
+  pub const OPEN_SYMBOLIC_LINK: i32 = 0
+  static if Intrinsic.targetArchitecture() == "x86_64" {
+    /// Fail when the last part of the path is a symbolic link.
+    pub const OPEN_NO_FOLLOW: i32 = 131072
+    /// Fail when the path is not a directory.
+    pub const OPEN_DIRECTORY: i32 = 65536
+    /// Bypass the cache, on Linux. Zero on Darwin.
+    pub const OPEN_DIRECT: i32 = 16384
+    const STATX: i64 = 332
+  } else {
+    /// Fail when the last part of the path is a symbolic link.
+    pub const OPEN_NO_FOLLOW: i32 = 32768
+    /// Fail when the path is not a directory.
+    pub const OPEN_DIRECTORY: i32 = 16384
+    /// Bypass the cache, on Linux. Zero on Darwin.
+    pub const OPEN_DIRECT: i32 = 65536
+    const STATX: i64 = 291
+  }
+
+  const AT_CWD: i32 = -100
+  const AT_NO_FOLLOW: i32 = 256
+  const AT_EMPTY_PATH: i32 = 4096
+  const NAME_TOO_LONG: i32 = 36
+  const NOT_SUPPORTED: i32 = 95
+  // STATX_BASIC_STATS | STATX_BTIME
+  const STATX_MASK: u32 = 4095
+  const STATX_BIRTH: u32 = 2048
+  // FICLONE
+  const CLONE_REQUEST: u64 = 1074041865
+
+  extern "C" struct StatxTime { seconds: i64, nanoseconds: u32, reserved: i32 }
+  impl Copy for StatxTime {}
+  // The C `struct statx`.
+  extern "C" struct Statx {
+    mask: u32, blksize: u32, attributes: u64, nlink: u32, uid: u32, gid: u32, mode: u16, spare0: u16,
+    ino: u64, size: u64, blocks: u64, attributesMask: u64,
+    atime: StatxTime, btime: StatxTime, ctime: StatxTime, mtime: StatxTime,
+    rdevMajor: u32, rdevMinor: u32, devMajor: u32, devMinor: u32, spare: [u64; 14],
+  }
+  // The C `struct statfs` of 64-bit Linux.
+  extern "C" struct StatFs {
+    kind: i64, bsize: i64, blocks: u64, bfree: u64, bavail: u64, files: u64, ffree: u64,
+    fsid: [i32; 2], namelen: i64, frsize: i64, flags: i64, spare: [i64; 4],
+  }
+
+  // The type byte and the name of the glibc `struct dirent`.
+  const ENTRY_TYPE_OFFSET: usize = 18
+  const ENTRY_NAME_OFFSET: usize = 19
+
+  fn zeroStatxTime() -> StatxTime { return StatxTime { seconds: 0, nanoseconds: 0, reserved: 0 } }
+  fn timestamp(value: StatxTime) -> Timestamp { return Timestamp { seconds: value.seconds, nanoseconds: value.nanoseconds } }
+  // glibc `makedev`.
+  fn device(major: u32, minor: u32) -> u64 {
+    let high = u64.shiftLeft(u32.toU64(major & 4294963200), 32)
+    let middle = u64.shiftLeft(u32.toU64(major & 4095), 8)
+    let low = u64.shiftLeft(u32.toU64(minor & 4294967040), 12)
+    return high | middle | low | u32.toU64(minor & 255)
+  }
+  // glibc 2.28 is the baseline, and `statx` is a system call there, so it is called directly.
+  unsafe fn statxCall(directory: i32, path: ?[*]const u8, flags: i32, output: &mut FileStatus) -> i32 {
+    let mut value = Statx {
+      mask: 0, blksize: 0, attributes: 0, nlink: 0, uid: 0, gid: 0, mode: 0, spare0: 0, ino: 0, size: 0, blocks: 0, attributesMask: 0,
+      atime: zeroStatxTime(), btime: zeroStatxTime(), ctime: zeroStatxTime(), mtime: zeroStatxTime(),
+      rdevMajor: 0, rdevMinor: 0, devMajor: 0, devMinor: 0, spare: [0; 14],
+    }
+    while true {
+      let result = unsafe syscall(STATX, i32.toI64(directory), path, i32.toI64(flags), u32.toI64(STATX_MASK), Pointer.fromMutRef<Statx>(&mut value))
+      if result == 0 { break }
+      let code = unsafe currentError()
+      if code != 4 { return code }
+    }
+    let born = if (value.mask & STATX_BIRTH) != 0 { timestamp(value.btime) } else { Timestamp { seconds: 0, nanoseconds: 0 } }
+    output.* = FileStatus {
+      device: device(value.devMajor, value.devMinor), inode: value.ino, mode: u16.toU32(value.mode),
+      links: u32.toU64(value.nlink), user: value.uid, group: value.gid,
+      specialDevice: device(value.rdevMajor, value.rdevMinor), size: value.size,
+      blockSize: u32.toU64(value.blksize), blocks: value.blocks, flags: 0, generation: 0,
+      accessed: timestamp(value.atime), modified: timestamp(value.mtime), changed: timestamp(value.ctime), born: born,
+    }
+    return 0
+  }
+  unsafe fn statusCall(path: ?[*]const u8, followLinks: bool, output: &mut FileStatus) -> i32 {
+    let flags = if followLinks { 0 } else { AT_NO_FOLLOW }
+    return unsafe statxCall(AT_CWD, path, flags, move output)
+  }
+  unsafe fn statusOfCall(fd: i32, output: &mut FileStatus) -> i32 {
+    let empty: [u8; 1] = [0]
+    return unsafe statxCall(fd, Pointer.fromSlice<u8>(&empty), AT_EMPTY_PATH, move output)
+  }
+  unsafe fn volumeCall(path: ?[*]const u8, output: &mut VolumeStatus) -> i32 {
+    let mut value = StatFs { kind: 0, bsize: 0, blocks: 0, bfree: 0, bavail: 0, files: 0, ffree: 0, fsid: [0, 0], namelen: 0, frsize: 0, flags: 0, spare: [0; 4] }
+    if unsafe statfs(path, Pointer.fromMutRef<StatFs>(&mut value)) != 0 { return unsafe currentError() }
+    output.* = VolumeStatus { kind: i64.wrappingToU64(value.kind), blockSize: i64.wrappingToU64(value.bsize), blocks: value.blocks, freeBlocks: value.bfree, availableBlocks: value.bavail, files: value.files, freeFiles: value.ffree }
+    return 0
+  }
+  unsafe fn synchronizeCall(fd: i32, dataOnly: bool) -> i32 {
+    let result = if dataOnly { unsafe fdatasync(fd) } else { unsafe fsync(fd) }
+    if result != 0 { return unsafe currentError() }
+    return 0
+  }
+  // A clone on Linux opens the destination and shares the blocks with `FICLONE`, so `cloneCall`
+  // is not used; `copyClone` does it on the open descriptors.
+  unsafe fn cloneDescriptors(from: i32, to: i32) -> i32 {
+    if unsafe ioctl(to, CLONE_REQUEST, from) != 0 { return unsafe currentError() }
+    return 0
+  }
+  // `copy_file_range` until the end, and `read` and `write` where the kernel cannot copy.
+  unsafe fn copyData(from: i32, to: i32) -> i32 {
+    while true {
+      let copied = unsafe copy_file_range(from, Pointer.null<i64>(), to, Pointer.null<i64>(), 1073741824, 0)
+      if copied == 0 { return 0 }
+      if copied < 0 {
+        let code = unsafe currentError()
+        if code == 4 { continue }
+        // EXDEV, ENOSYS, EOPNOTSUPP or EINVAL: the file systems do not support it.
+        if code == 18 || code == 38 || code == 95 || code == 22 { return unsafe copyBytes(from, to) }
+        return code
+      }
+    }
+    return 0
+  }
+}
+
+// The C path of `path` with a final zero byte, in `storage`. Returns 0, or the error code for a
+// path that is too long or holds a zero byte.
+fn terminate(path: &[u8], storage: &mut [u8; 4096]) -> i32 {
+  if path.length >= PATH_LIMIT { return NAME_TOO_LONG }
+  let mut index: usize = 0
+  while index < path.length {
+    if path[index] == 0 { return 22 }
+    storage[index] = path[index]
+    index = index + 1
+  }
+  storage[index] = 0
+  return 0
+}
+
+fn failure(operation: NativeFileOperation, code: i32) -> NativeFileError {
+  return NativeFileError { operation: operation, code: code }
+}
+
+fn timespec(value: Timestamp) -> Timespec {
+  return Timespec { seconds: value.seconds, nanoseconds: u32.toI64(value.nanoseconds) }
+}
+
+fn entryKind(value: u8) -> EntryKind {
+  if value == 1 { return EntryKind.Fifo }
+  if value == 2 { return EntryKind.CharacterDevice }
+  if value == 4 { return EntryKind.Directory }
+  if value == 6 { return EntryKind.BlockDevice }
+  if value == 8 { return EntryKind.File }
+  if value == 10 { return EntryKind.SymbolicLink }
+  if value == 12 { return EntryKind.Socket }
+  return EntryKind.Unknown
+}
+
+// Copies with `read` and `write` from the current offsets until the end of `from`.
+unsafe fn copyBytes(from: i32, to: i32) -> i32 {
+  let mut buffer: [u8; 65536] = [0; 65536]
+  while true {
+    let count = unsafe read(from, Pointer.fromMutSlice<u8>(&mut buffer), 65536)
+    if count == 0 { return 0 }
+    if count < 0 {
+      let code = unsafe currentError()
+      if code == 4 { continue }
+      return code
+    }
+    let total = isize.toUsize(count)
+    let mut offset: usize = 0
+    while offset < total {
+      let written = unsafe write(to, Pointer.fromSlice<u8>(Slice.view<u8>(&buffer, offset, total - offset)), total - offset)
+      if written < 0 {
+        let code = unsafe currentError()
+        if code != 4 { return code }
+      } else {
+        offset = offset + isize.toUsize(written)
+      }
+    }
+  }
+  return 0
+}
+
+/// File and directory operations on host paths and descriptors.
+///
+/// # Details
+/// A path is bytes. A relative path starts at the working directory. Each path, with its final zero
+/// byte, must fit in [`PATH_LIMIT`] bytes. A call that a signal interrupts is made again. The
+/// operations block the calling thread. Each one fails with [`NativeFileError`] and the `errno`
+/// value.
+///
+/// # Gotchas
+/// A descriptor from [`NativeFile.open`] belongs to the caller. Nothing closes it on a drop.
+pub struct NativeFile {}
+
+impl NativeFile {
+  /// Opens `path` with the open `flags` of this module, such as [`OPEN_READ_WRITE`], and returns the
+  /// new descriptor.
+  ///
+  /// # Details
+  /// `mode` gives the permission bits of a new file, filtered by the umask of the process. It is
+  /// used only with [`OPEN_CREATE`].
+  pub effect fn open(path: &[u8], flags: i32, mode: u32) -> i32 ! NativeFileError {
+    let mut storage: [u8; 4096] = [0; 4096]
+    let invalid = terminate(path, &mut storage)
+    if invalid != 0 { fail failure(NativeFileOperation.Open, invalid) }
+    while true {
+      let fd = unsafe open(Pointer.fromSlice<u8>(&storage), flags, mode)
+      if fd >= 0 { return fd }
+      let code = unsafe currentError()
+      if code != 4 { fail failure(NativeFileOperation.Open, code) }
+    }
+    return -1
+  }
+
+  /// Closes `fd`.
+  ///
+  /// # Gotchas
+  /// The descriptor is closed also when the close fails. Do not close it again.
+  pub effect fn close(fd: i32) -> () ! NativeFileError {
+    if unsafe close(fd) != 0 {
+      let code = unsafe currentError()
+      // EINTR: the descriptor is closed on both systems; another close could close a new one.
+      if code != 4 { fail failure(NativeFileOperation.Close, code) }
+    }
+    return ()
+  }
+
+  /// Reads at most `buffer.length` bytes from `fd` into the start of `buffer`, and returns their
+  /// number. Zero means the end of the file.
+  ///
+  /// # Details
+  /// With `position` set, the read starts at that byte and does not move the file offset. With
+  /// `none`, it starts at the file offset and moves it.
+  pub effect fn read(fd: i32, buffer: &mut [u8], position: Option<u64>) -> usize ! NativeFileError {
+    let length = buffer.length
+    let pointer = Pointer.fromMutSlice<u8>(move buffer)
+    while true {
+      let count = match position {
+        Option<u64>.Some { value } => unsafe pread(fd, pointer, length, u64.toI64(value))
+        Option<u64>.None => unsafe read(fd, pointer, length)
+      }
+      if count >= 0 { return isize.toUsize(count) }
+      let code = unsafe currentError()
+      if code != 4 { fail failure(NativeFileOperation.Read, code) }
+    }
+    return 0
+  }
+
+  /// Writes at most all of `bytes` to `fd`, and returns the number written.
+  ///
+  /// # Details
+  /// With `position` set, the write starts at that byte and does not move the file offset. With
+  /// `none`, it starts at the file offset, or at the end for [`OPEN_APPEND`], and moves it. The
+  /// count can be less than `bytes.length`.
+  pub effect fn write(fd: i32, bytes: &[u8], position: Option<u64>) -> usize ! NativeFileError {
+    let pointer = Pointer.fromSlice<u8>(bytes)
+    while true {
+      let count = match position {
+        Option<u64>.Some { value } => unsafe pwrite(fd, pointer, bytes.length, u64.toI64(value))
+        Option<u64>.None => unsafe write(fd, pointer, bytes.length)
+      }
+      if count >= 0 { return isize.toUsize(count) }
+      let code = unsafe currentError()
+      if code != 4 { fail failure(NativeFileOperation.Write, code) }
+    }
+    return 0
+  }
+
+  /// Reads from `fd` into `buffers` in order, as one read, and returns the number of bytes read.
+  ///
+  /// # Details
+  /// At most 1024 buffers are used. `position` acts as for [`NativeFile.read`].
+  pub effect fn readScatter(fd: i32, buffers: &mut [&mut [u8]], position: Option<u64>) -> usize ! NativeFileError {
+    let mut empty: [u8; 0] = []
+    let mut vectors: [ReadVector; 1024] = [ReadVector { base: Pointer.fromMutSlice<u8>(&mut empty), length: 0 }; 1024]
+    let mut count: usize = 0
+    while count < buffers.length && count < 1024 {
+      let part = &mut buffers[count]
+      let partLength = part.length
+      vectors[count] = ReadVector { base: Pointer.fromMutSlice<u8>(move part), length: partLength }
+      count = count + 1
+    }
+    while true {
+      let result = match position {
+        Option<u64>.Some { value } => unsafe preadv(fd, Pointer.fromSlice<ReadVector>(&vectors), usize.toI32(count), u64.toI64(value))
+        Option<u64>.None => unsafe readv(fd, Pointer.fromSlice<ReadVector>(&vectors), usize.toI32(count))
+      }
+      if result >= 0 { return isize.toUsize(result) }
+      let code = unsafe currentError()
+      if code != 4 { fail failure(NativeFileOperation.Read, code) }
+    }
+    return 0
+  }
+
+  /// Writes `parts` to `fd` in order, as one write, and returns the number of bytes written.
+  ///
+  /// # Details
+  /// At most 1024 parts are used. `position` acts as for [`NativeFile.write`]. The count can be
+  /// less than the sum of the lengths, and can end inside any part.
+  pub effect fn writeGather(fd: i32, parts: &[&[u8]], position: Option<u64>) -> usize ! NativeFileError {
+    let mut vectors: [IoVector; 1024] = [IoVector { base: Pointer.fromSlice<u8>(b""), length: 0 }; 1024]
+    let mut count: usize = 0
+    while count < parts.length && count < 1024 {
+      vectors[count] = IoVector { base: Pointer.fromSlice<u8>(parts[count]), length: parts[count].length }
+      count = count + 1
+    }
+    while true {
+      let result = match position {
+        Option<u64>.Some { value } => unsafe pwritev(fd, Pointer.fromSlice<IoVector>(&vectors), usize.toI32(count), u64.toI64(value))
+        Option<u64>.None => unsafe writev(fd, Pointer.fromSlice<IoVector>(&vectors), usize.toI32(count))
+      }
+      if result >= 0 { return isize.toUsize(result) }
+      let code = unsafe currentError()
+      if code != 4 { fail failure(NativeFileOperation.Write, code) }
+    }
+    return 0
+  }
+
+  /// Returns the status of `path`. With `followLinks` false, a final symbolic link is inspected
+  /// itself.
+  pub effect fn status(path: &[u8], followLinks: bool) -> FileStatus ! NativeFileError {
+    let mut storage: [u8; 4096] = [0; 4096]
+    let invalid = terminate(path, &mut storage)
+    if invalid != 0 { fail failure(NativeFileOperation.Status, invalid) }
+    let mut output = emptyStatus()
+    let code = unsafe statusCall(Pointer.fromSlice<u8>(&storage), followLinks, &mut output)
+    if code != 0 { fail failure(NativeFileOperation.Status, code) }
+    return output
+  }
+
+  /// Returns the status of the open descriptor `fd`.
+  pub effect fn statusOf(fd: i32) -> FileStatus ! NativeFileError {
+    let mut output = emptyStatus()
+    let code = unsafe statusOfCall(fd, &mut output)
+    if code != 0 { fail failure(NativeFileOperation.Status, code) }
+    return output
+  }
+
+  /// Sets the length of the file at `path` to `length` bytes. A longer file reads as zeros past
+  /// its old end.
+  pub effect fn truncate(path: &[u8], length: u64) -> () ! NativeFileError {
+    let mut storage: [u8; 4096] = [0; 4096]
+    let invalid = terminate(path, &mut storage)
+    if invalid != 0 { fail failure(NativeFileOperation.Truncate, invalid) }
+    while unsafe truncate(Pointer.fromSlice<u8>(&storage), u64.toI64(length)) != 0 {
+      let code = unsafe currentError()
+      if code != 4 { fail failure(NativeFileOperation.Truncate, code) }
+    }
+    return ()
+  }
+
+  /// Sets the length of the open file `fd` to `length` bytes.
+  pub effect fn truncateOf(fd: i32, length: u64) -> () ! NativeFileError {
+    while unsafe ftruncate(fd, u64.toI64(length)) != 0 {
+      let code = unsafe currentError()
+      if code != 4 { fail failure(NativeFileOperation.Truncate, code) }
+    }
+    return ()
+  }
+
+  /// Waits until the data of `fd` reaches the device, and its status too unless `dataOnly`.
+  ///
+  /// # Details
+  /// Darwin has no public data-only call, so `dataOnly` waits for the status there too.
+  pub effect fn synchronize(fd: i32, dataOnly: bool) -> () ! NativeFileError {
+    let code = unsafe synchronizeCall(fd, dataOnly)
+    if code != 0 { fail failure(NativeFileOperation.Synchronize, code) }
+    return ()
+  }
+
+  /// Sets the access and modification times of `path`. With `followLinks` false, a final symbolic
+  /// link is changed itself.
+  pub effect fn setTimes(path: &[u8], accessed: Timestamp, modified: Timestamp, followLinks: bool) -> () ! NativeFileError {
+    let mut storage: [u8; 4096] = [0; 4096]
+    let invalid = terminate(path, &mut storage)
+    if invalid != 0 { fail failure(NativeFileOperation.SetTimes, invalid) }
+    let times = [timespec(accessed), timespec(modified)]
+    let flags = if followLinks { 0 } else { AT_NO_FOLLOW }
+    if unsafe utimensat(AT_CWD, Pointer.fromSlice<u8>(&storage), Pointer.fromSlice<Timespec>(&times), flags) != 0 {
+      fail failure(NativeFileOperation.SetTimes, unsafe currentError())
+    }
+    return ()
+  }
+
+  /// Sets the access and modification times of the open file `fd`.
+  pub effect fn setTimesOf(fd: i32, accessed: Timestamp, modified: Timestamp) -> () ! NativeFileError {
+    let times = [timespec(accessed), timespec(modified)]
+    if unsafe futimens(fd, Pointer.fromSlice<Timespec>(&times)) != 0 {
+      fail failure(NativeFileOperation.SetTimes, unsafe currentError())
+    }
+    return ()
+  }
+
+  /// Sets the permission bits of `path` to `mode`. With `followLinks` false, a final symbolic link
+  /// is changed itself.
+  ///
+  /// # Gotchas
+  /// Linux cannot change the mode of a link: with `followLinks` false and a final link, the call
+  /// fails with code 95 (`EOPNOTSUPP`).
+  pub effect fn changeMode(path: &[u8], mode: u32, followLinks: bool) -> () ! NativeFileError {
+    let mut storage: [u8; 4096] = [0; 4096]
+    let invalid = terminate(path, &mut storage)
+    if invalid != 0 { fail failure(NativeFileOperation.ChangeMode, invalid) }
+    let flags = if followLinks { 0 } else { AT_NO_FOLLOW }
+    if unsafe fchmodat(AT_CWD, Pointer.fromSlice<u8>(&storage), mode, flags) != 0 {
+      fail failure(NativeFileOperation.ChangeMode, unsafe currentError())
+    }
+    return ()
+  }
+
+  /// Sets the permission bits of the open file `fd` to `mode`.
+  pub effect fn changeModeOf(fd: i32, mode: u32) -> () ! NativeFileError {
+    if unsafe fchmod(fd, mode) != 0 { fail failure(NativeFileOperation.ChangeMode, unsafe currentError()) }
+    return ()
+  }
+
+  /// Sets the owner user and group of `path`. A value of 4294967295 keeps that id. With
+  /// `followLinks` false, a final symbolic link is changed itself.
+  pub effect fn changeOwner(path: &[u8], user: u32, group: u32, followLinks: bool) -> () ! NativeFileError {
+    let mut storage: [u8; 4096] = [0; 4096]
+    let invalid = terminate(path, &mut storage)
+    if invalid != 0 { fail failure(NativeFileOperation.ChangeOwner, invalid) }
+    let flags = if followLinks { 0 } else { AT_NO_FOLLOW }
+    if unsafe fchownat(AT_CWD, Pointer.fromSlice<u8>(&storage), user, group, flags) != 0 {
+      fail failure(NativeFileOperation.ChangeOwner, unsafe currentError())
+    }
+    return ()
+  }
+
+  /// Sets the owner user and group of the open file `fd`. A value of 4294967295 keeps that id.
+  pub effect fn changeOwnerOf(fd: i32, user: u32, group: u32) -> () ! NativeFileError {
+    if unsafe fchown(fd, user, group) != 0 { fail failure(NativeFileOperation.ChangeOwner, unsafe currentError()) }
+    return ()
+  }
+
+  /// Makes `created` a new hard link to the file `existing`.
+  pub effect fn link(existing: &[u8], created: &[u8]) -> () ! NativeFileError {
+    let mut first: [u8; 4096] = [0; 4096]
+    let mut second: [u8; 4096] = [0; 4096]
+    let invalidFirst = terminate(existing, &mut first)
+    if invalidFirst != 0 { fail failure(NativeFileOperation.Link, invalidFirst) }
+    let invalidSecond = terminate(created, &mut second)
+    if invalidSecond != 0 { fail failure(NativeFileOperation.Link, invalidSecond) }
+    if unsafe link(Pointer.fromSlice<u8>(&first), Pointer.fromSlice<u8>(&second)) != 0 {
+      fail failure(NativeFileOperation.Link, unsafe currentError())
+    }
+    return ()
+  }
+
+  /// Makes `path` a symbolic link that holds `target`. The target is stored as it is, and need not
+  /// exist.
+  pub effect fn symbolicLink(target: &[u8], path: &[u8]) -> () ! NativeFileError {
+    let mut first: [u8; 4096] = [0; 4096]
+    let mut second: [u8; 4096] = [0; 4096]
+    let invalidFirst = terminate(target, &mut first)
+    if invalidFirst != 0 { fail failure(NativeFileOperation.SymbolicLink, invalidFirst) }
+    let invalidSecond = terminate(path, &mut second)
+    if invalidSecond != 0 { fail failure(NativeFileOperation.SymbolicLink, invalidSecond) }
+    if unsafe symlink(Pointer.fromSlice<u8>(&first), Pointer.fromSlice<u8>(&second)) != 0 {
+      fail failure(NativeFileOperation.SymbolicLink, unsafe currentError())
+    }
+    return ()
+  }
+
+  /// Writes the target of the symbolic link `path` to the start of `output`, and returns its
+  /// length.
+  ///
+  /// # Details
+  /// A target longer than `output` is cut to `output.length` bytes; compare the result with
+  /// `output.length` and read again with a larger buffer when they are equal.
+  pub effect fn readLink(path: &[u8], output: &mut [u8]) -> usize ! NativeFileError {
+    let mut storage: [u8; 4096] = [0; 4096]
+    let invalid = terminate(path, &mut storage)
+    if invalid != 0 { fail failure(NativeFileOperation.ReadLink, invalid) }
+    let length = output.length
+    let count = unsafe readlink(Pointer.fromSlice<u8>(&storage), Pointer.fromMutSlice<u8>(move output), length)
+    if count < 0 { fail failure(NativeFileOperation.ReadLink, unsafe currentError()) }
+    return isize.toUsize(count)
+  }
+
+  /// Writes the absolute path of `path` with no symbolic links and no `.` or `..` parts to the
+  /// start of `output`, and returns its length.
+  ///
+  /// # Details
+  /// A result longer than `output` fails with code 36 on Linux or 63 on Darwin (`ENAMETOOLONG`).
+  pub effect fn realPath(path: &[u8], output: &mut [u8]) -> usize ! NativeFileError {
+    let mut storage: [u8; 4096] = [0; 4096]
+    let invalid = terminate(path, &mut storage)
+    if invalid != 0 { fail failure(NativeFileOperation.RealPath, invalid) }
+    let mut result: [u8; 4096] = [0; 4096]
+    let resolved = unsafe realpath(Pointer.fromSlice<u8>(&storage), Pointer.fromMutSlice<u8>(&mut result))
+    if Pointer.isNull<u8>(resolved) { fail failure(NativeFileOperation.RealPath, unsafe currentError()) }
+    let mut length: usize = 0
+    while length < 4096 && result[length] != 0 {
+      if length >= output.length { fail failure(NativeFileOperation.RealPath, NAME_TOO_LONG) }
+      output[length] = result[length]
+      length = length + 1
+    }
+    return length
+  }
+
+  /// Moves `from` to `to`, and replaces a file at `to`.
+  pub effect fn rename(from: &[u8], to: &[u8]) -> () ! NativeFileError {
+    let mut first: [u8; 4096] = [0; 4096]
+    let mut second: [u8; 4096] = [0; 4096]
+    let invalidFirst = terminate(from, &mut first)
+    if invalidFirst != 0 { fail failure(NativeFileOperation.Rename, invalidFirst) }
+    let invalidSecond = terminate(to, &mut second)
+    if invalidSecond != 0 { fail failure(NativeFileOperation.Rename, invalidSecond) }
+    if unsafe rename(Pointer.fromSlice<u8>(&first), Pointer.fromSlice<u8>(&second)) != 0 {
+      fail failure(NativeFileOperation.Rename, unsafe currentError())
+    }
+    return ()
+  }
+
+  /// Removes the file or link `path`. A final symbolic link is removed itself.
+  pub effect fn remove(path: &[u8]) -> () ! NativeFileError {
+    let mut storage: [u8; 4096] = [0; 4096]
+    let invalid = terminate(path, &mut storage)
+    if invalid != 0 { fail failure(NativeFileOperation.Remove, invalid) }
+    if unsafe unlink(Pointer.fromSlice<u8>(&storage)) != 0 { fail failure(NativeFileOperation.Remove, unsafe currentError()) }
+    return ()
+  }
+
+  /// Removes the empty directory `path`.
+  pub effect fn removeDirectory(path: &[u8]) -> () ! NativeFileError {
+    let mut storage: [u8; 4096] = [0; 4096]
+    let invalid = terminate(path, &mut storage)
+    if invalid != 0 { fail failure(NativeFileOperation.RemoveDirectory, invalid) }
+    if unsafe rmdir(Pointer.fromSlice<u8>(&storage)) != 0 { fail failure(NativeFileOperation.RemoveDirectory, unsafe currentError()) }
+    return ()
+  }
+
+  /// Makes the directory `path` with the permission bits `mode`, filtered by the umask.
+  pub effect fn makeDirectory(path: &[u8], mode: u32) -> () ! NativeFileError {
+    let mut storage: [u8; 4096] = [0; 4096]
+    let invalid = terminate(path, &mut storage)
+    if invalid != 0 { fail failure(NativeFileOperation.MakeDirectory, invalid) }
+    if unsafe makeDirectoryCall(Pointer.fromSlice<u8>(&storage), mode) != 0 { fail failure(NativeFileOperation.MakeDirectory, unsafe currentError()) }
+    return ()
+  }
+
+  /// Makes a new directory with a unique name, and writes its path to the start of `output`.
+  /// Returns the length of the path.
+  ///
+  /// # Details
+  /// `template` must end with `XXXXXX`; those six bytes are replaced to make the name unique. The
+  /// directory has mode 0700. `output` must have at least `template.length` bytes, or the call
+  /// fails with code 22 (`EINVAL`).
+  pub effect fn makeTemporaryDirectory(template: &[u8], output: &mut [u8]) -> usize ! NativeFileError {
+    if output.length < template.length { fail failure(NativeFileOperation.MakeTemporaryDirectory, 22) }
+    let mut storage: [u8; 4096] = [0; 4096]
+    let invalid = terminate(template, &mut storage)
+    if invalid != 0 { fail failure(NativeFileOperation.MakeTemporaryDirectory, invalid) }
+    let made = unsafe mkdtemp(Pointer.fromMutSlice<u8>(&mut storage))
+    if Pointer.isNull<u8>(made) { fail failure(NativeFileOperation.MakeTemporaryDirectory, unsafe currentError()) }
+    let mut index: usize = 0
+    while index < template.length {
+      output[index] = storage[index]
+      index = index + 1
+    }
+    return template.length
+  }
+
+  /// Copies the file `from` to `to` with `method`. The copy gets the permission bits of `from`.
+  ///
+  /// # Details
+  /// With `exclusive`, the call fails with code 17 (`EEXIST`) when `to` exists. Else a file at `to`
+  /// is replaced. A byte copy uses `copy_file_range` on Linux and `fcopyfile` on Darwin. A clone
+  /// uses `FICLONE` on Linux and `clonefile` on Darwin.
+  pub effect fn copy(from: &[u8], to: &[u8], exclusive: bool, method: CopyMethod) -> () ! NativeFileError {
+    let mut first: [u8; 4096] = [0; 4096]
+    let mut second: [u8; 4096] = [0; 4096]
+    let invalidFirst = terminate(from, &mut first)
+    if invalidFirst != 0 { fail failure(NativeFileOperation.Copy, invalidFirst) }
+    let invalidSecond = terminate(to, &mut second)
+    if invalidSecond != 0 { fail failure(NativeFileOperation.Copy, invalidSecond) }
+    let code = unsafe copyFile(&first, &second, exclusive, method)
+    if code != 0 { fail failure(NativeFileOperation.Copy, code) }
+    return ()
+  }
+
+  /// Checks that the process may use `path` with `mode`: 0 for existence, or the sum of 4 for
+  /// reading, 2 for writing and 1 for running.
+  pub effect fn access(path: &[u8], mode: i32) -> () ! NativeFileError {
+    let mut storage: [u8; 4096] = [0; 4096]
+    let invalid = terminate(path, &mut storage)
+    if invalid != 0 { fail failure(NativeFileOperation.Access, invalid) }
+    if unsafe access(Pointer.fromSlice<u8>(&storage), mode) != 0 { fail failure(NativeFileOperation.Access, unsafe currentError()) }
+    return ()
+  }
+
+  /// Returns the status of the file system that holds `path`.
+  pub effect fn volumeStatus(path: &[u8]) -> VolumeStatus ! NativeFileError {
+    let mut storage: [u8; 4096] = [0; 4096]
+    let invalid = terminate(path, &mut storage)
+    if invalid != 0 { fail failure(NativeFileOperation.VolumeStatus, invalid) }
+    let mut output = VolumeStatus { kind: 0, blockSize: 0, blocks: 0, freeBlocks: 0, availableBlocks: 0, files: 0, freeFiles: 0 }
+    let code = unsafe volumeCall(Pointer.fromSlice<u8>(&storage), &mut output)
+    if code != 0 { fail failure(NativeFileOperation.VolumeStatus, code) }
+    return output
+  }
+
+  /// Opens the directory `path` to list its entries with [`Directory.next`].
+  pub effect fn openDirectory(path: &[u8]) -> Directory ! NativeFileError {
+    let mut storage: [u8; 4096] = [0; 4096]
+    let invalid = terminate(path, &mut storage)
+    if invalid != 0 { fail failure(NativeFileOperation.OpenDirectory, invalid) }
+    let stream = unsafe opendir(Pointer.fromSlice<u8>(&storage))
+    if Pointer.isNull<DirectoryStream>(stream) { fail failure(NativeFileOperation.OpenDirectory, unsafe currentError()) }
+    return Directory { stream: stream }
+  }
+}
+
+fn emptyStatus() -> FileStatus {
+  let zero = Timestamp { seconds: 0, nanoseconds: 0 }
+  return FileStatus { device: 0, inode: 0, mode: 0, links: 0, user: 0, group: 0, specialDevice: 0, size: 0, blockSize: 0, blocks: 0, flags: 0, generation: 0, accessed: zero, modified: zero, changed: zero, born: zero }
+}
+
+// Opens both files and copies with the method. Returns 0 or the error code.
+unsafe fn copyFile(from: &[u8; 4096], to: &[u8; 4096], exclusive: bool, method: CopyMethod) -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    let wantsClone = match method { CopyMethod.Bytes => false CopyMethod.CloneOrBytes => true CopyMethod.Clone => true }
+    if wantsClone {
+      // `clonefile` fails when `to` exists, so a replacing clone removes it first.
+      if !exclusive { let _removed = unsafe unlink(Pointer.fromSlice<u8>(to)) }
+      let cloned = unsafe cloneCall(Pointer.fromSlice<u8>(from), Pointer.fromSlice<u8>(to))
+      if cloned == 0 { return 0 }
+      let required = match method { CopyMethod.Clone => true CopyMethod.Bytes => false CopyMethod.CloneOrBytes => false }
+      if required || cloned == 17 { return cloned }
+    }
+  }
+  let source = unsafe open(Pointer.fromSlice<u8>(from), OPEN_READ_ONLY | OPEN_CLOSE_ON_EXEC)
+  if source < 0 { return unsafe currentError() }
+  let mut status = emptyStatus()
+  let inspected = unsafe statusOfCall(source, &mut status)
+  if inspected != 0 { let _closed = unsafe close(source) return inspected }
+  let mut flags = OPEN_WRITE_ONLY | OPEN_CREATE | OPEN_TRUNCATE | OPEN_CLOSE_ON_EXEC
+  if exclusive { flags = flags | OPEN_EXCLUSIVE }
+  let destination = unsafe open(Pointer.fromSlice<u8>(to), flags, status.mode & 4095)
+  if destination < 0 { let code = unsafe currentError() let _closed = unsafe close(source) return code }
+  let mut code: i32 = 0
+  static if Intrinsic.targetOperatingSystem() == "linux" {
+    let wantsClone = match method { CopyMethod.Bytes => false CopyMethod.CloneOrBytes => true CopyMethod.Clone => true }
+    let mut cloned = false
+    if wantsClone {
+      let result = unsafe cloneDescriptors(source, destination)
+      if result == 0 { cloned = true }
+      else {
+        let required = match method { CopyMethod.Clone => true CopyMethod.Bytes => false CopyMethod.CloneOrBytes => false }
+        if required { code = result }
+      }
+    }
+    if !cloned && code == 0 { code = unsafe copyData(source, destination) }
+  } else {
+    code = unsafe copyData(source, destination)
+  }
+  if code == 0 { let _mode = unsafe fchmod(destination, status.mode & 4095) }
+  let closedDestination = unsafe close(destination)
+  let _closedSource = unsafe close(source)
+  if code == 0 && closedDestination != 0 { code = unsafe currentError() }
+  return code
+}
+
+/// An open directory listing from [`NativeFile.openDirectory`]. Dropping it closes the listing.
+///
+/// # Details
+/// [`Directory.next`] returns the entries in the order of the file system, including `.` and `..`.
+pub struct Directory {
+  stream: ?*mut DirectoryStream,
+}
+
+impl Directory {
+  /// Writes the name of the next entry to the start of `output`, and returns its length and type,
+  /// or `none` after the last entry.
+  ///
+  /// # Details
+  /// A name longer than `output` fails with code 36 on Linux or 63 on Darwin (`ENAMETOOLONG`); an
+  /// output of 1024 bytes holds every name.
+  pub effect fn next(self: &mut Self, output: &mut [u8]) -> Option<DirectoryEntry> ! NativeFileError {
+    let stream = match Pointer.nonNullMut<DirectoryStream>(self.stream) {
+      Option<*mut DirectoryStream>.Some { value } => value
+      Option<*mut DirectoryStream>.None => { fail failure(NativeFileOperation.ReadDirectory, 9) }
+    }
+    unsafe { Pointer.write<i32>(errorSlot(), 0) }
+    let entry = unsafe readdir(stream)
+    let record = match Pointer.nonNull<u8>(entry) {
+      Option<*const u8>.Some { value } => value
+      Option<*const u8>.None => {
+        let code = unsafe currentError()
+        if code != 0 { fail failure(NativeFileOperation.ReadDirectory, code) }
+        return Option<DirectoryEntry>.none()
+      }
+    }
+    let base = unsafe Pointer.assumeMany<u8>(record)
+    let kind = unsafe byteAt(base, ENTRY_TYPE_OFFSET)
+    let mut length: usize = 0
+    while unsafe byteAt(base, ENTRY_NAME_OFFSET + length) != 0 {
+      if length >= output.length { fail failure(NativeFileOperation.ReadDirectory, NAME_TOO_LONG) }
+      output[length] = unsafe byteAt(base, ENTRY_NAME_OFFSET + length)
+      length = length + 1
+    }
+    return Option<DirectoryEntry>.some(DirectoryEntry { length: length, kind: entryKind(kind) })
+  }
+
+  /// Closes the listing, and reports a close error.
+  pub effect fn close(self: Self) -> () ! NativeFileError {
+    let mut owned = move self
+    let stream = Intrinsic.replace(owned.stream, Pointer.null<DirectoryStream>())
+    match Pointer.nonNullMut<DirectoryStream>(stream) {
+      Option<*mut DirectoryStream>.Some { value } => {
+        if unsafe closedir(value) != 0 { fail failure(NativeFileOperation.CloseDirectory, unsafe currentError()) }
+      }
+      Option<*mut DirectoryStream>.None => ()
+    }
+    return ()
+  }
+}
+
+impl Drop for Directory {
+  fn drop(self: &mut Directory) -> () {
+    let stream = Intrinsic.replace(self.stream, Pointer.null<DirectoryStream>())
+    match Pointer.nonNullMut<DirectoryStream>(stream) {
+      Option<*mut DirectoryStream>.Some { value } => { let _closed = unsafe closedir(value) }
+      Option<*mut DirectoryStream>.None => ()
+    }
+    return ()
+  }
+}
+
+unsafe fn byteAt(base: [*]const u8, index: usize) -> u8 {
+  unsafe { return Pointer.read<u8>(Pointer.at<u8>(base, index)) }
+}
+
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  unsafe fn errorSlot() -> *mut i32 { unsafe { return __error() } }
+} else {
+  unsafe fn errorSlot() -> *mut i32 { unsafe { return __errno_location() } }
+}
+
+/// The bits of a status `mode` that give the file type.
+pub const TYPE_MASK: u32 = 61440
+/// The type bits of a regular file.
+pub const TYPE_FILE: u32 = 32768
+/// The type bits of a directory.
+pub const TYPE_DIRECTORY: u32 = 16384
+/// The type bits of a symbolic link.
+pub const TYPE_SYMBOLIC_LINK: u32 = 40960
+/// The type bits of a named pipe.
+pub const TYPE_FIFO: u32 = 4096
+/// The type bits of a socket.
+pub const TYPE_SOCKET: u32 = 49152
+/// The type bits of a character device.
+pub const TYPE_CHARACTER_DEVICE: u32 = 8192
+/// The type bits of a block device.
+pub const TYPE_BLOCK_DEVICE: u32 = 24576
+}
