@@ -1,0 +1,449 @@
+//! Read and write PEM, the Base64 text armor for keys and certificates (RFC 7468).
+//!
+//! # When to use
+//! Use [`Pem`] to find the `-----BEGIN PRIVATE KEY-----` style blocks in text and get their DER
+//! bytes, or to wrap DER bytes in such a block, for example for `createPrivateKey` and `export` in
+//! Node.js. The DER itself is read by the key modules, such as `silk.crypto.rsa`.
+//!
+//! # Details
+//! [`Pem.find`] returns the next block at or after an offset as a [`PemSection`] of offsets into the
+//! input, so nothing is copied. Text before, between, and after blocks is skipped. Inside a block
+//! the Base64 may wrap at any width and may hold spaces, tabs, and CR or LF line ends, as OpenSSL
+//! allows. RFC 1421 headers such as `Proc-Type` and `DEK-Info`, which a legacy encrypted key has,
+//! end at the first empty line and can be read with [`Pem.header`]. [`Pem.encode`] writes lines of
+//! 64 characters with LF line ends. Nothing allocates.
+//!
+//! # Errors
+//! The functions return a [`PemError`]. On an error the output does not change.
+//!
+//! # Gotchas
+//! The Base64 of a block must be canonical: padding only at the end, and zero unused bits. A label
+//! is not checked against a list; compare [`Pem.label`] with the one you expect.
+//!
+//! # Examples
+//! ## Round trip a block
+//! ```silk
+//! import silk.encoding.pem { Pem, PemError, PemSection }
+//! import silk.core.result { Result }
+//!
+//! pub fn main() -> i32 {
+//!   let mut text: [u8; 64] = [0; 64]
+//!   let length = match Pem.encode(b"TEST", b"hello", &mut text) {
+//!     Result<usize, PemError>.Success { value } => value
+//!     Result<usize, PemError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   if length != Pem.encodedLength(4, 5) {
+//!     return 1
+//!   }
+//!   let section = match Pem.find(&text, 0) {
+//!     Result<PemSection, PemError>.Success { value } => move value
+//!     Result<PemSection, PemError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let label = Pem.label(&text, &section)
+//!   if label.length != 4 || label[0] != 84 {
+//!     return 1
+//!   }
+//!   let mut bytes: [u8; 8] = [0; 8]
+//!   let decoded = match Pem.decode(&text, &section, &mut bytes) {
+//!     Result<usize, PemError>.Success { value } => value
+//!     Result<usize, PemError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   if decoded != 5 || bytes[0] != 104 || bytes[4] != 111 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Encoding
+
+import silk.text.format { Debug, Format, Formatter }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.collections.slice { Slice }
+import silk.encoding.base64 { Base64, Base64Error }
+import silk.num.usize
+import silk.io.writer { Writer, WriterError }
+
+/// The reason that a [`Pem`] function rejected a call. The output does not change.
+pub union PemError {
+  /// No `-----BEGIN` line starts at or after the offset.
+  NotFound,
+  /// A block starts but is not well formed: the BEGIN or END line is broken, the labels differ,
+  /// the END line is missing, or the Base64 is not canonical.
+  Malformed,
+  /// The output buffer is shorter than the bytes the call writes.
+  OutputTooSmall,
+  /// The label is empty, or holds a byte other than printable ASCII without `-`.
+  InvalidLabel,
+}
+
+impl Debug for PemError {
+  /// Writes the name of the variant, such as `NotFound`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      PemError.NotFound => run Format.write(&mut formatter, b"NotFound")
+      PemError.Malformed => run Format.write(&mut formatter, b"Malformed")
+      PemError.OutputTooSmall => run Format.write(&mut formatter, b"OutputTooSmall")
+      PemError.InvalidLabel => run Format.write(&mut formatter, b"InvalidLabel")
+    }
+  }
+}
+
+/// One PEM block, as offsets into the text that [`Pem.find`] read.
+///
+/// # Details
+///
+/// The label is `labelStart` to `labelEnd`, the RFC 1421 headers are `headersStart` to `headersEnd`
+/// (empty when there are none), and the Base64 body is `bodyStart` to `bodyEnd`. The block ends at
+/// `end`, after the END line, where the next search can start.
+pub struct PemSection {
+  /// The offset of the `-----BEGIN` line.
+  pub start: usize,
+  /// The offset of the first byte of the label.
+  pub labelStart: usize,
+  /// The offset after the label.
+  pub labelEnd: usize,
+  /// The offset of the first header line.
+  pub headersStart: usize,
+  /// The offset after the headers and the empty line that ends them.
+  pub headersEnd: usize,
+  /// The offset of the Base64 body.
+  pub bodyStart: usize,
+  /// The offset of the `-----END` line.
+  pub bodyEnd: usize,
+  /// The offset after the END line and its line end.
+  pub end: usize,
+}
+
+/// Functions that find, decode, and encode PEM blocks.
+pub struct Pem {}
+
+impl Pem {
+  /// Returns the next PEM block that starts at or after `offset` of `input`.
+  ///
+  /// # Errors
+  ///
+  /// - `NotFound` if no `-----BEGIN ` line starts at or after `offset`.
+  /// - `Malformed` if the first such block is broken, or its END line is missing or has another
+  ///   label.
+  pub fn find(input: &[u8], offset: usize) -> Result<PemSection, PemError> {
+    let begin = search(input, offset, b"-----BEGIN ")
+    if begin == input.length {
+      return Result<PemSection, PemError>.failResult(PemError.NotFound)
+    }
+    let labelStart = begin + 11
+    let labelEnd = search(input, labelStart, b"-----")
+    if labelEnd == input.length || labelEnd == labelStart || validLabel(Slice.view<u8>(input, labelStart, labelEnd - labelStart)) == false {
+      return Result<PemSection, PemError>.failResult(PemError.Malformed)
+    }
+    let afterBegin = lineEnd(input, labelEnd + 5)
+    if afterBegin == 0 {
+      return Result<PemSection, PemError>.failResult(PemError.Malformed)
+    }
+    // RFC 1421 headers: lines with a colon up to an empty line.
+    let mut headersEnd = afterBegin
+    let firstLine = nextLine(input, afterBegin)
+    if contains(input, afterBegin, firstLine, 58) {
+      let mut line = afterBegin
+      let mut found = false
+      while line < input.length && found == false {
+        let next = nextLine(input, line)
+        if blank(input, line, next) {
+          found = true
+        }
+        line = next
+      }
+      if found == false {
+        return Result<PemSection, PemError>.failResult(PemError.Malformed)
+      }
+      headersEnd = line
+    }
+    let endLine = search(input, headersEnd, b"-----END ")
+    if endLine == input.length {
+      return Result<PemSection, PemError>.failResult(PemError.Malformed)
+    }
+    let endLabel = endLine + 9
+    let labelLength = labelEnd - labelStart
+    if input.length - endLabel < labelLength + 5
+      || same(input, endLabel, Slice.view<u8>(input, labelStart, labelLength)) == false
+      || same(input, endLabel + labelLength, b"-----") == false {
+      return Result<PemSection, PemError>.failResult(PemError.Malformed)
+    }
+    let end = lineEnd(input, endLabel + labelLength + 5)
+    if end == 0 {
+      return Result<PemSection, PemError>.failResult(PemError.Malformed)
+    }
+    return Result<PemSection, PemError>.succeed(
+      PemSection {
+        start: begin,
+        labelStart: labelStart,
+        labelEnd: labelEnd,
+        headersStart: afterBegin,
+        headersEnd: headersEnd,
+        bodyStart: headersEnd,
+        bodyEnd: endLine,
+        end: end,
+      },
+    )
+  }
+
+  /// Returns the label of `section`, such as `PRIVATE KEY`.
+  pub fn label<'a>(input: &'a [u8], section: &PemSection) -> &'a [u8] {
+    return Slice.view<u8>(input, section.labelStart, section.labelEnd - section.labelStart)
+  }
+
+  /// Returns the value of the RFC 1421 header `name` of `section`, such as `DEK-Info`, without the
+  /// spaces around it, or `None` if the block has no such header.
+  ///
+  /// The name compares exactly. A header that continues on the next line is not joined.
+  pub fn header<'a>(input: &'a [u8], section: &PemSection, name: &[u8]) -> Option<&'a [u8]> {
+    let mut line = section.headersStart
+    while line < section.headersEnd {
+      let next = nextLine(input, line)
+      if next - line > name.length && same(input, line, name) && input[line + name.length] == 58 {
+        let mut first = line + name.length + 1
+        let mut last = next
+        while last > first && whitespace(input[last - 1]) {
+          last = last - 1
+        }
+        while first < last && whitespace(input[first]) {
+          first = first + 1
+        }
+        return Option<&'a [u8]>.some(Slice.view<u8>(input, first, last - first))
+      }
+      line = next
+    }
+    return Option<&'a [u8]>.none()
+  }
+
+  /// Decodes the Base64 body of `section` into `output` and returns the number of bytes written.
+  ///
+  /// # Errors
+  ///
+  /// - `Malformed` if the body is not canonical Base64 once spaces, tabs, CR, and LF are removed.
+  /// - `OutputTooSmall` if `output` is shorter than the decoded bytes.
+  pub fn decode(input: &[u8], section: &PemSection, output: &mut [u8]) -> Result<usize, PemError> {
+    // Check the body and measure it first, so that an error writes nothing.
+    let measured = walk(input, section, Option<&mut [u8]>.none())
+    let length = match move measured {
+      Result<usize, PemError>.Success { value } => value
+      Result<usize, PemError>.Failure { error } => {
+        return Result<usize, PemError>.failResult(move error)
+      }
+    }
+    if output.length < length {
+      return Result<usize, PemError>.failResult(PemError.OutputTooSmall)
+    }
+    return walk(input, section, Option<&mut [u8]>.some(move output))
+  }
+
+  /// Returns the number of bytes that [`Pem.encode`] writes for a label of `labelLength` bytes and
+  /// `length` bytes of data.
+  pub fn encodedLength(labelLength: usize, length: usize) -> usize {
+    let characters = (length + 2) / 3 * 4
+    let lines = (characters + 63) / 64
+    // "-----BEGIN " label "-----\n", the lines, "-----END " label "-----\n".
+    return 11 + labelLength + 6 + characters + lines + 9 + labelLength + 6
+  }
+
+  /// Writes `bytes` as a PEM block with label `label` to `output`, with Base64 lines of 64
+  /// characters and LF line ends, and returns the number of bytes written,
+  /// [`Pem.encodedLength`].
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidLabel` if `label` is empty, or holds a byte outside printable ASCII or a `-`.
+  /// - `OutputTooSmall` if `output` is shorter than [`Pem.encodedLength`].
+  pub fn encode(label: &[u8], bytes: &[u8], output: &mut [u8]) -> Result<usize, PemError> {
+    if label.length == 0 || validLabel(label) == false {
+      return Result<usize, PemError>.failResult(PemError.InvalidLabel)
+    }
+    let total = Pem.encodedLength(label.length, bytes.length)
+    if output.length < total {
+      return Result<usize, PemError>.failResult(PemError.OutputTooSmall)
+    }
+    let mut at = put(&mut output, 0, b"-----BEGIN ")
+    at = put(&mut output, at, label)
+    at = put(&mut output, at, b"-----\n")
+    let mut offset: usize = 0
+    while offset < bytes.length {
+      let mut chunk: usize = 48
+      if bytes.length - offset < 48 {
+        chunk = bytes.length - offset
+      }
+      let width = (chunk + 2) / 3 * 4
+      let line = Slice.view<u8>(bytes, offset, chunk)
+      if let Result.Failure { error: _ } = Base64.encodeInto(Slice.viewMut<u8>(&mut output, at, width), line) {
+        Intrinsic.trap("Pem: the line length was checked")
+      }
+      at = at + width
+      output[at] = 10
+      at = at + 1
+      offset = offset + chunk
+    }
+    at = put(&mut output, at, b"-----END ")
+    at = put(&mut output, at, label)
+    at = put(&mut output, at, b"-----\n")
+    return Result<usize, PemError>.succeed(at)
+  }
+}
+
+// Decodes the body in groups of four Base64 characters, skipping whitespace. Without an output it
+// only checks the body and returns the decoded length.
+fn walk(input: &[u8], section: &PemSection, output: Option<&mut [u8]>) -> Result<usize, PemError> {
+  let mut target = move output
+  let mut group: [u8; 4] = [0; 4]
+  let mut filled: usize = 0
+  let mut written: usize = 0
+  let mut finished = false
+  let mut index = section.bodyStart
+  while index < section.bodyEnd {
+    let byte = input[index]
+    index = index + 1
+    if whitespace(byte) == false {
+      if finished {
+        return Result<usize, PemError>.failResult(PemError.Malformed)
+      }
+      group[filled] = byte
+      filled = filled + 1
+      if filled == 4 {
+        let mut decoded: [u8; 3] = [0; 3]
+        let count = match Base64.decodeInto(&mut decoded, &group) {
+          Result<usize, Base64Error>.Success { value } => value
+          Result<usize, Base64Error>.Failure { error: _ } => {
+            return Result<usize, PemError>.failResult(PemError.Malformed)
+          }
+        }
+        if let Option.Some { value } = &mut target {
+          let mut copied: usize = 0
+          while copied < count {
+            value[written + copied] = decoded[copied]
+            copied = copied + 1
+          }
+        }
+        written = written + count
+        // A padded group ends the body.
+        finished = count < 3
+        filled = 0
+      }
+    }
+  }
+  if filled != 0 {
+    return Result<usize, PemError>.failResult(PemError.Malformed)
+  }
+  return Result<usize, PemError>.succeed(written)
+}
+
+fn whitespace(byte: u8) -> bool {
+  return byte == 32 || byte == 9 || byte == 10 || byte == 13
+}
+
+// A label is printable ASCII without `-`, and not empty.
+fn validLabel(label: &[u8]) -> bool {
+  let mut index: usize = 0
+  while index < label.length {
+    if label[index] < 32 || label[index] > 126 || label[index] == 45 {
+      return false
+    }
+    index = index + 1
+  }
+  return true
+}
+
+fn same(input: &[u8], offset: usize, expected: &[u8]) -> bool {
+  if offset > input.length || input.length - offset < expected.length {
+    return false
+  }
+  let mut index: usize = 0
+  while index < expected.length {
+    if input[offset + index] != expected[index] {
+      return false
+    }
+    index = index + 1
+  }
+  return true
+}
+
+// The offset of the first `needle` at or after `offset`, or `input.length`.
+fn search(input: &[u8], offset: usize, needle: &[u8]) -> usize {
+  let mut index = offset
+  while index < input.length {
+    if same(input, index, needle) {
+      return index
+    }
+    index = index + 1
+  }
+  return input.length
+}
+
+// The offset after the spaces, tabs, and line end at `offset`, or 0 if other text follows.
+fn lineEnd(input: &[u8], offset: usize) -> usize {
+  let mut index = offset
+  while index < input.length && (input[index] == 32 || input[index] == 9) {
+    index = index + 1
+  }
+  if index == input.length {
+    return index
+  }
+  if input[index] == 13 {
+    index = index + 1
+    if index < input.length && input[index] == 10 {
+      index = index + 1
+    }
+    return index
+  }
+  if input[index] == 10 {
+    return index + 1
+  }
+  return 0
+}
+
+// The offset after the LF that ends the line at `offset`, or `input.length`.
+fn nextLine(input: &[u8], offset: usize) -> usize {
+  let mut index = offset
+  while index < input.length {
+    if input[index] == 10 {
+      return index + 1
+    }
+    index = index + 1
+  }
+  return input.length
+}
+
+fn contains(input: &[u8], start: usize, end: usize, byte: u8) -> bool {
+  let mut index = start
+  while index < end {
+    if input[index] == byte {
+      return true
+    }
+    index = index + 1
+  }
+  return false
+}
+
+fn blank(input: &[u8], start: usize, end: usize) -> bool {
+  let mut index = start
+  while index < end {
+    if whitespace(input[index]) == false {
+      return false
+    }
+    index = index + 1
+  }
+  return true
+}
+
+fn put(output: &mut [u8], offset: usize, bytes: &[u8]) -> usize {
+  let mut index: usize = 0
+  while index < bytes.length {
+    output[offset + index] = bytes[index]
+    index = index + 1
+  }
+  return offset + bytes.length
+}
