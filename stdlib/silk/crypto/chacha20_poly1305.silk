@@ -1,4 +1,4 @@
-//! Encrypt and authenticate data with ChaCha20-Poly1305 (RFC 8439).
+//! Encrypt and authenticate data with ChaCha20-Poly1305, and encrypt with raw ChaCha20 (RFC 8439).
 //!
 //! # When to use
 //! Use [`ChaCha20Poly1305.seal`] to encrypt a message so that only holders of the key can read it
@@ -9,6 +9,11 @@
 //! The key is 32 bytes, the nonce is 12 bytes, and the tag is 16 bytes. The tag is separate from
 //! the ciphertext ("detached"), so store or send both. The associated data (`aad`) is authenticated
 //! but not encrypted. The ciphertext has the same length as the plaintext. Nothing allocates.
+//!
+//! For data that arrives in parts, such as a Node.js `createCipheriv("chacha20-poly1305")` call,
+//! use [`ChaCha20Poly1305Encryptor`] and [`ChaCha20Poly1305Decryptor`]. They take the message in
+//! any split, give the same result, and can write a truncated tag. [`ChaCha20`] is the raw stream
+//! cipher without authentication, for formats that name it.
 //!
 //! # Errors
 //! The functions return an [`AeadError`]. All checks come before the first write, and on any error
@@ -474,4 +479,337 @@ fn authenticate(key: &[u8], nonce: &[u8], aad: &[u8], ciphertext: &[u8], count: 
   }
   polyUpdate(&mut state, &lengths, 16)
   return polyFinish(move state)
+}
+
+/// The reason that a [`ChaCha20`] call was rejected.
+pub enum ChaCha20Error {
+  /// The key is not 32 bytes.
+  InvalidKey,
+  /// The nonce is not 12 bytes.
+  InvalidNonce,
+  /// The output is shorter than the input.
+  OutputTooSmall,
+}
+
+impl Debug for ChaCha20Error {
+  /// Writes the name of the variant, such as `InvalidKey`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      ChaCha20Error.InvalidKey => run Format.write(&mut formatter, b"InvalidKey")
+      ChaCha20Error.InvalidNonce => run Format.write(&mut formatter, b"InvalidNonce")
+      ChaCha20Error.OutputTooSmall => run Format.write(&mut formatter, b"OutputTooSmall")
+    }
+  }
+}
+
+// The ChaCha20 key stream of one key and nonce, with the unused rest of the current block.
+struct KeyStream {
+  key: [u8; 32],
+  nonce: [u8; 12],
+  counter: u32,
+  block: [u8; 64],
+  used: usize,
+}
+
+fn makeKeyStream(key: &[u8], nonce: &[u8], counter: u32) -> KeyStream {
+  let mut stream = KeyStream {key: [0; 32], nonce: [0; 12], counter: counter, block: [0; 64], used: 64}
+  let mut index = usize.ZERO
+  while index < 32 {
+    stream.key[index] = key[index]
+    index = index + usize.ONE
+  }
+  index = usize.ZERO
+  while index < 12 {
+    stream.nonce[index] = nonce[index]
+    index = index + usize.ONE
+  }
+  return move stream
+}
+
+// XORs `input` with the next key stream bytes into `output`. After 2^32 blocks the counter carries
+// into the first nonce word, as OpenSSL does.
+fn keyStreamApply(stream: &mut KeyStream, input: &[u8], output: &mut [u8]) -> () {
+  let mut index = usize.ZERO
+  while index < input.length {
+    if stream.used == 64 {
+      stream.block = block(&stream.key, &stream.nonce, stream.counter)
+      stream.used = usize.ZERO
+      stream.counter = u32.wrappingAdd(stream.counter, 1)
+      if stream.counter == 0 {
+        let carried = u32.wrappingAdd(load32(&stream.nonce, 0), 1)
+        write32(&mut stream.nonce, 0, carried)
+      }
+    }
+    output[index] = u8.bitXor(input[index], stream.block[stream.used])
+    stream.used = stream.used + usize.ONE
+    index = index + usize.ONE
+  }
+  return ()
+}
+
+/// A streaming ChaCha20 cipher (RFC 8439 section 2.4) without authentication.
+///
+/// # When to use
+///
+/// Use it only where a protocol names raw ChaCha20, such as Node's `createCipheriv("chacha20")`.
+/// It does not detect changes to the ciphertext. Use [`ChaCha20Poly1305`] to encrypt messages.
+///
+/// # Details
+///
+/// The key is 32 bytes and the nonce is 12 bytes. `counter` is the number of the first 64-byte
+/// block. Encryption and decryption are the same operation, so [`ChaCha20.apply`] does both, and
+/// any split of the input gives the same output. After block 2^32 - 1 the counter carries into the
+/// first nonce word, which is what OpenSSL does. Node's 16-byte `chacha20` IV is the counter as a
+/// little-endian u32 followed by the nonce. Nothing allocates.
+///
+/// # Gotchas
+///
+/// The same key, nonce and counter must never encrypt two messages. The value holds key material
+/// and is not erased when it is dropped.
+pub struct ChaCha20 {
+  stream: KeyStream,
+}
+
+impl ChaCha20 {
+  /// Returns a cipher for `key` and `nonce` that starts at block `counter`.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidKey` if `key` is not 32 bytes.
+  /// - `InvalidNonce` if `nonce` is not 12 bytes.
+  pub fn make(key: &[u8], nonce: &[u8], counter: u32) -> Result<ChaCha20, ChaCha20Error> {
+    if key.length != 32 { return Result<ChaCha20, ChaCha20Error>.failResult(ChaCha20Error.InvalidKey) }
+    if nonce.length != 12 { return Result<ChaCha20, ChaCha20Error>.failResult(ChaCha20Error.InvalidNonce) }
+    return Result<ChaCha20, ChaCha20Error>.succeed(ChaCha20 {stream: makeKeyStream(key, nonce, counter)})
+  }
+
+  /// XORs `input` with the key stream into the first `input.length` bytes of `output`.
+  ///
+  /// The bytes of `output` after them do not change. The buffers must not overlap.
+  ///
+  /// # Errors
+  ///
+  /// - `OutputTooSmall` if `output` is shorter than `input`. The state and `output` do not change.
+  pub fn apply(self: &mut Self, input: &[u8], output: &mut [u8]) -> Result<(), ChaCha20Error> {
+    if output.length < input.length {
+      return Result<(), ChaCha20Error>.failResult(ChaCha20Error.OutputTooSmall)
+    }
+    keyStreamApply(&mut self.stream, input, move output)
+    return Result<(), ChaCha20Error>.succeed(())
+  }
+}
+
+// The state that a streaming encryptor and decryptor share: the key stream from block 1, the
+// Poly1305 state after the padded associated data, and the two lengths.
+struct AeadStream {
+  stream: KeyStream,
+  poly: PolyState,
+  aadLength: u64,
+  textLength: u64,
+}
+
+fn aeadStart(key: &[u8], nonce: &[u8], aad: &[u8]) -> Result<AeadStream, AeadError> {
+  if key.length != 32 { return Result<AeadStream, AeadError>.failResult(AeadError.InvalidKey) }
+  if nonce.length != 12 { return Result<AeadStream, AeadError>.failResult(AeadError.InvalidNonce) }
+  let first = block(key, nonce, 0)
+  let mut poly = polyMake(&first)
+  polyUpdate(&mut poly, aad, aad.length)
+  polyPad(&mut poly)
+  return Result<AeadStream, AeadError>.succeed(
+    AeadStream {stream: makeKeyStream(key, nonce, 1), poly: move poly, aadLength: usize.toU64(aad.length), textLength: 0}
+  )
+}
+
+fn aeadText(state: &mut AeadStream, input: &[u8], output: &mut [u8], decrypting: bool) -> Result<(), AeadError> {
+  if output.length < input.length {
+    return Result<(), AeadError>.failResult(AeadError.OutputTooSmall)
+  }
+  let total = u64.saturatingAdd(state.textLength, usize.toU64(input.length))
+  if total > 274877906880 {
+    return Result<(), AeadError>.failResult(AeadError.LimitExceeded)
+  }
+  state.textLength = total
+  if decrypting {
+    polyUpdate(&mut state.poly, input, input.length)
+    keyStreamApply(&mut state.stream, input, move output)
+  } else {
+    keyStreamApply(&mut state.stream, input, &mut output)
+    polyUpdate(&mut state.poly, &output, input.length)
+  }
+  return Result<(), AeadError>.succeed(())
+}
+
+fn aeadTag(state: AeadStream) -> [u8; 16] {
+  let mut poly = move state.poly
+  polyPad(&mut poly)
+  let mut lengths: [u8; 16] = [0; 16]
+  let mut index = usize.ZERO
+  while index < 8 {
+    let shift = usize.toU64(index * 8)
+    lengths[index] = u64.toU8(u64.bitAnd(u64.shiftRight(state.aadLength, shift), 255))
+    lengths[8 + index] = u64.toU8(u64.bitAnd(u64.shiftRight(state.textLength, shift), 255))
+    index = index + usize.ONE
+  }
+  polyUpdate(&mut poly, &lengths, 16)
+  return polyFinish(move poly)
+}
+
+/// A streaming ChaCha20-Poly1305 encryptor (RFC 8439) for a message that arrives in parts.
+///
+/// # When to use
+///
+/// Use it when the message does not fit in one buffer, or to implement an API that encrypts in
+/// steps, such as `createCipheriv("chacha20-poly1305")` in Node.js. For a message in one slice,
+/// use [`ChaCha20Poly1305.seal`].
+///
+/// # Details
+///
+/// Make one with [`ChaCha20Poly1305Encryptor.make`] and the associated data, give the message with
+/// [`ChaCha20Poly1305Encryptor.update`], then call [`ChaCha20Poly1305Encryptor.finish`] for the
+/// tag. Any split of the message gives the same ciphertext and tag as [`ChaCha20Poly1305.seal`].
+/// Nothing allocates.
+///
+/// # Gotchas
+///
+/// The same key and nonce must never encrypt two messages. The value holds key material and is not
+/// erased when it is dropped.
+pub struct ChaCha20Poly1305Encryptor {
+  state: AeadStream,
+}
+
+impl ChaCha20Poly1305Encryptor {
+  /// Returns an encryptor for `key` and `nonce` that authenticates the associated data `aad`.
+  ///
+  /// The encryptor copies what it needs and does not borrow the arguments.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidKey` if `key` is not 32 bytes.
+  /// - `InvalidNonce` if `nonce` is not 12 bytes.
+  pub fn make(key: &[u8], nonce: &[u8], aad: &[u8]) -> Result<ChaCha20Poly1305Encryptor, AeadError> {
+    return match aeadStart(key, nonce, aad) {
+      Result<AeadStream, AeadError>.Success {value} => Result<ChaCha20Poly1305Encryptor, AeadError>.succeed(
+        ChaCha20Poly1305Encryptor {state: move value}
+      )
+      Result<AeadStream, AeadError>.Failure {error} => Result<ChaCha20Poly1305Encryptor, AeadError>.failResult(move error)
+    }
+  }
+
+  /// Encrypts `plaintext` into the first `plaintext.length` bytes of `ciphertext`.
+  ///
+  /// The bytes of `ciphertext` after them do not change. The buffers must not overlap.
+  ///
+  /// # Errors
+  ///
+  /// On an error the state and `ciphertext` do not change.
+  ///
+  /// - `OutputTooSmall` if `ciphertext` is shorter than `plaintext`.
+  /// - `LimitExceeded` if the message grows past 274877906880 bytes.
+  pub fn update(self: &mut Self, plaintext: &[u8], ciphertext: &mut [u8]) -> Result<(), AeadError> {
+    return aeadText(&mut self.state, plaintext, move ciphertext, false)
+  }
+
+  /// Writes the authentication tag to `tag` and consumes the state.
+  ///
+  /// `tag` is 16 bytes for the full tag, or 1 to 15 bytes for a prefix of it, as Node's
+  /// `authTagLength` allows. Shorter tags are easier to forge.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidTag` if `tag` is empty or longer than 16 bytes. `tag` does not change.
+  pub fn finish(self: Self, tag: &mut [u8]) -> Result<(), AeadError> {
+    if tag.length == 0 || tag.length > 16 {
+      return Result<(), AeadError>.failResult(AeadError.InvalidTag)
+    }
+    let computed = aeadTag(move self.state)
+    let mut index = usize.ZERO
+    while index < tag.length {
+      tag[index] = computed[index]
+      index = index + usize.ONE
+    }
+    return Result<(), AeadError>.succeed(())
+  }
+}
+
+/// A streaming ChaCha20-Poly1305 decryptor (RFC 8439) for a ciphertext that arrives in parts.
+///
+/// # When to use
+///
+/// Use it when the ciphertext does not fit in one buffer, or to implement an API that decrypts in
+/// steps, such as `createDecipheriv("chacha20-poly1305")` in Node.js. For a ciphertext in one
+/// slice, use [`ChaCha20Poly1305.open`], which writes no plaintext unless the tag is correct.
+///
+/// # Details
+///
+/// Make one with [`ChaCha20Poly1305Decryptor.make`] and the associated data, give the ciphertext
+/// with [`ChaCha20Poly1305Decryptor.update`], then call [`ChaCha20Poly1305Decryptor.finish`] with
+/// the received tag. Nothing allocates.
+///
+/// # Gotchas
+///
+/// [`ChaCha20Poly1305Decryptor.update`] writes plaintext before the tag is checked. Do not use or
+/// release that plaintext until [`ChaCha20Poly1305Decryptor.finish`] succeeds. The value holds key
+/// material and is not erased when it is dropped.
+pub struct ChaCha20Poly1305Decryptor {
+  state: AeadStream,
+}
+
+impl ChaCha20Poly1305Decryptor {
+  /// Returns a decryptor for `key` and `nonce` that authenticates the associated data `aad`.
+  ///
+  /// `aad` must be the same bytes that the encryptor got. The decryptor copies what it needs and
+  /// does not borrow the arguments.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidKey` if `key` is not 32 bytes.
+  /// - `InvalidNonce` if `nonce` is not 12 bytes.
+  pub fn make(key: &[u8], nonce: &[u8], aad: &[u8]) -> Result<ChaCha20Poly1305Decryptor, AeadError> {
+    return match aeadStart(key, nonce, aad) {
+      Result<AeadStream, AeadError>.Success {value} => Result<ChaCha20Poly1305Decryptor, AeadError>.succeed(
+        ChaCha20Poly1305Decryptor {state: move value}
+      )
+      Result<AeadStream, AeadError>.Failure {error} => Result<ChaCha20Poly1305Decryptor, AeadError>.failResult(move error)
+    }
+  }
+
+  /// Decrypts `ciphertext` into the first `ciphertext.length` bytes of `plaintext`.
+  ///
+  /// The plaintext is not authenticated until [`ChaCha20Poly1305Decryptor.finish`] succeeds. The
+  /// bytes of `plaintext` after the written ones do not change. The buffers must not overlap.
+  ///
+  /// # Errors
+  ///
+  /// On an error the state and `plaintext` do not change.
+  ///
+  /// - `OutputTooSmall` if `plaintext` is shorter than `ciphertext`.
+  /// - `LimitExceeded` if the ciphertext grows past 274877906880 bytes.
+  pub fn update(self: &mut Self, ciphertext: &[u8], plaintext: &mut [u8]) -> Result<(), AeadError> {
+    return aeadText(&mut self.state, ciphertext, move plaintext, true)
+  }
+
+  /// Checks the received `tag` and consumes the state.
+  ///
+  /// `tag` is the full 16-byte tag or a 1 to 15-byte prefix of it. The comparison takes the same
+  /// time wherever the bytes differ.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidTag` if `tag` is empty or longer than 16 bytes.
+  /// - `AuthenticationFailed` if the tag is not correct for the key, nonce, associated data, and
+  ///   ciphertext. Discard all plaintext that [`ChaCha20Poly1305Decryptor.update`] wrote.
+  pub fn finish(self: Self, tag: &[u8]) -> Result<(), AeadError> {
+    if tag.length == 0 || tag.length > 16 {
+      return Result<(), AeadError>.failResult(AeadError.InvalidTag)
+    }
+    let computed = aeadTag(move self.state)
+    let mut difference: u32 = 0
+    let mut index = usize.ZERO
+    while index < tag.length {
+      difference = u32.wrappingAdd(difference, u8.toU32(u8.bitXor(computed[index], tag[index])))
+      index = index + usize.ONE
+    }
+    if difference != 0 { return Result<(), AeadError>.failResult(AeadError.AuthenticationFailed) }
+    return Result<(), AeadError>.succeed(())
+  }
 }
