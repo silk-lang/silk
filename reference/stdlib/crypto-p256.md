@@ -378,6 +378,14 @@ are 32 bytes big-endian. Nothing allocates.
 The key exchange does not authenticate the peer. Pass the shared secret through
 `silk.crypto.hkdf` before you use it as a key. The secret is not erased when it is dropped.
 
+<a id="P256.impl.Copy"></a>
+
+## Implementation `Copy for P256`
+
+```silk
+impl Copy for P256
+```
+
 <a id="P256.impl"></a>
 
 ## Implementation `P256`
