@@ -1,0 +1,1294 @@
+//! The native provider of the `SystemInfo` effect: facts about the computer and the process from
+//! the C library and the kernel.
+//!
+//! # When to use
+//! Provide [`OsSystemInfo`] for `SystemInfo` in a native program. In a test, provide a fake with
+//! fixed values.
+//!
+//! # Details
+//! Each operation makes a few system calls and returns: none of them waits for an event. On Linux,
+//! the provider reads `/proc`, `/sys`, `uname`, `getifaddrs`, `getpwuid_r`, `getrusage`, and
+//! `sched_getaffinity`. On macOS, it uses `sysctl`, the Mach host and task calls, `getifaddrs`,
+//! `getpwuid_r`, and `getrusage`. Every list and copy that the system gives is freed before the
+//! operation returns, also on errors.
+//!
+//! # Gotchas
+//! - The memory limit of a control group is read from cgroup v2 `memory.max` or cgroup v1
+//!   `memory.limit_in_bytes`. Other limits, such as `ulimit`, are not reported.
+//! - The provider exists on Darwin on x86_64 or aarch64, and on GNU Linux on x86_64 or aarch64.
+//!
+//! # Examples
+//! ## Read the processors and the user
+//! ```silk
+//! import silk.collections.bytes { Bytes }
+//! import silk.collections.list { List }
+//! import silk.core.effect { Effect }
+//! import silk.core.result { Result }
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.system.system_info { ProcessorInfo, SystemInfo, SystemInfoError }
+//! import silk.system.system_info_native { OsSystemInfo }
+//!
+//! effect fn program() -> i32 ! SystemInfoError | OutOfMemoryError ? &mut SystemInfo | &mut Allocator {
+//!   let processors = run SystemInfo.processors()
+//!   let parallelism = run SystemInfo.availableParallelism()
+//!   if List<ProcessorInfo>.length(&processors) == 0 || parallelism == 0 {
+//!     return 1
+//!   }
+//!   let user = run SystemInfo.currentUser()
+//!   if Bytes.length(&user.name) == 0 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//!
+//! pub effect fn main() -> i32 {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let mut provider = OsSystemInfo.make()
+//!   let result = run Effect.result(program()) |> Effect.provideMut<SystemInfo>(&mut provider)
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   return match move result {
+//!     Result<i32, SystemInfoError | OutOfMemoryError>.Success { value } => value
+//!     Result<i32, SystemInfoError | OutOfMemoryError>.Failure { .. } => 1
+//!   }
+//! }
+//! ```
+//!
+//! @category System
+
+static if (Intrinsic.targetOperatingSystem() == "darwin" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64") && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy, Drop }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.net.address { IpAddress, Ipv4Address, Ipv6Address }
+import silk.num.i32
+import silk.num.i64
+import silk.num.isize
+import silk.num.u32
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.system.system_info {
+  KernelInfo,
+  MemoryInfo,
+  MemoryLimit,
+  NetworkInterface,
+  ProcessorInfo,
+  ProcessorTimes,
+  ResourceUsage,
+  SystemInfo,
+  SystemInfoError,
+  SystemInfoOperation,
+  UsageScope,
+  UserInfo,
+}
+
+// --- C library calls that both systems share --------------------------------------------------
+
+// Declared as the other standard library modules declare them: two declarations of one C symbol in
+// a program must agree (SEM0192).
+unsafe extern "C" fn strlen(text: [*]const u8) -> usize
+unsafe extern "C" fn sysconf(name: i32) -> i64
+@foreign(noCapture: .("path"))
+unsafe extern "C" fn open(path: ?[*]const u8, flags: i32, ...) -> i32
+unsafe extern "C" fn close(fd: i32) -> i32
+@foreign(noCapture: .("buffer"))
+unsafe extern "C" fn read(fd: i32, buffer: ?[*]mut u8, count: usize) -> isize
+@foreign(noCapture: .("name"))
+unsafe extern "C" fn gethostname(name: ?[*]mut u8, length: usize) -> i32
+@foreign(noCapture: .("averages"))
+unsafe extern "C" fn getloadavg(averages: ?[*]mut f64, count: i32) -> i32
+unsafe extern "C" fn getpriority(which: i32, who: u32) -> i32
+unsafe extern "C" fn setpriority(which: i32, who: u32, value: i32) -> i32
+unsafe extern "C" fn getpid() -> i32
+unsafe extern "C" fn getppid() -> i32
+unsafe extern "C" fn geteuid() -> u32
+@foreign(noCapture: .("usage"))
+unsafe extern "C" fn getrusage(who: i32, usage: *mut NativeUsage) -> i32
+@foreign(noCapture: .("list"))
+unsafe extern "C" fn getifaddrs(list: *mut ?*mut InterfaceEntry) -> i32
+unsafe extern "C" fn freeifaddrs(list: ?*mut InterfaceEntry) -> ()
+@foreign(noCapture: ("record", "buffer", "result"))
+unsafe extern "C" fn getpwuid_r(uid: u32, record: *mut PasswordRecord, buffer: ?[*]mut u8, size: usize, result: *mut ?*mut PasswordRecord) -> i32
+
+// `struct timeval` is 16 bytes on both 64-bit systems, but Darwin keeps a 32-bit microsecond
+// field followed by padding. Both systems are little-endian, so the low half is the value.
+extern "C" struct NativeTime {
+  seconds: i64,
+  microseconds: i32,
+  padding: i32,
+}
+
+impl Copy for NativeTime {}
+
+// `struct rusage`: the two times and fourteen `long` counters.
+extern "C" struct NativeUsage {
+  user: NativeTime,
+  system: NativeTime,
+  counters: [i64; 14],
+}
+
+impl Copy for NativeUsage {}
+
+// `struct ifaddrs`. Linux keeps a union of the broadcast and destination addresses in the place of
+// `destination`.
+extern "C" struct InterfaceEntry {
+  next: ?*mut InterfaceEntry,
+  name: ?[*]const u8,
+  flags: u32,
+  address: ?[*]const u8,
+  netmask: ?[*]const u8,
+  destination: ?[*]const u8,
+  data: ?*mut u8,
+}
+
+impl Copy for InterfaceEntry {}
+
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  unsafe extern "C" fn __error() -> *mut i32
+  unsafe fn errorSlot() -> *mut i32 { unsafe { return __error() } }
+
+  // `struct passwd` on Darwin.
+  extern "C" struct PasswordRecord {
+    name: ?*mut u8,
+    password: ?*mut u8,
+    uid: u32,
+    gid: u32,
+    change: i64,
+    className: ?*mut u8,
+    gecos: ?*mut u8,
+    home: ?*mut u8,
+    shell: ?*mut u8,
+    expire: i64,
+    fields: i32,
+  }
+
+  // `struct utsname` on Darwin: five fields of 256 bytes.
+  extern "C" struct NativeUname {
+    name: [u8; 256],
+    node: [u8; 256],
+    release: [u8; 256],
+    version: [u8; 256],
+    machine: [u8; 256],
+  }
+
+  extern "C" struct Timespec {
+    seconds: i64,
+    nanoseconds: i64,
+  }
+
+  @foreign(noCapture: .("value"))
+  unsafe extern "C" fn darwinClockGetTime(clock: u32, value: *mut Timespec) -> i32 as "clock_gettime"
+  @foreign(noCapture: .("value"))
+  unsafe extern "C" fn uname(value: *mut NativeUname) -> i32
+  unsafe extern "C" fn sysctlbyname(name: ?[*]const u8, value: *mut i32, length: *mut usize, replacement: ?*mut u8, replacementLength: usize) -> i32
+  unsafe extern "C" static taskPort: u32 as "mach_task_self_"
+  // The task port of the process: the `mach_task_self()` macro of C.
+  fn taskSelf() -> u32 { unsafe { return taskPort } }
+  unsafe extern "C" fn mach_host_self() -> u32
+  unsafe extern "C" fn mach_thread_self() -> u32
+  unsafe extern "C" fn mach_port_deallocate(task: u32, name: u32) -> i32
+  @foreign(noCapture: ("info", "count"))
+  unsafe extern "C" fn host_statistics64(host: u32, flavor: i32, info: ?[*]mut u32, count: *mut u32) -> i32
+  @foreign(noCapture: ("processorCount", "info", "infoCount"))
+  unsafe extern "C" fn host_processor_info(host: u32, flavor: i32, processorCount: *mut u32, info: *mut ?*mut i32, infoCount: *mut u32) -> i32
+  unsafe extern "C" fn vm_deallocate(task: u32, address: usize, size: usize) -> i32
+  @foreign(noCapture: ("info", "count"))
+  unsafe extern "C" fn task_info(task: u32, flavor: u32, info: ?[*]mut u32, count: *mut u32) -> i32
+  @foreign(noCapture: ("info", "count"))
+  unsafe extern "C" fn thread_info(thread: u32, flavor: u32, info: ?[*]mut i32, count: *mut u32) -> i32
+  @foreign(noCapture: ("buffer", "size"))
+  unsafe extern "C" fn _NSGetExecutablePath(buffer: ?[*]mut u8, size: *mut u32) -> i32
+  @foreign(noCapture: ("path", "resolved"))
+  unsafe extern "C" fn realpath(path: ?[*]const u8, resolved: ?[*]mut u8) -> ?[*]mut u8 as "realpath$DARWIN_EXTSN"
+
+  fn emptyRecord() -> PasswordRecord {
+    return PasswordRecord {
+      name: Pointer.null<u8>(), password: Pointer.null<u8>(), uid: 0, gid: 0, change: 0,
+      className: Pointer.null<u8>(), gecos: Pointer.null<u8>(), home: Pointer.null<u8>(),
+      shell: Pointer.null<u8>(), expire: 0, fields: 0,
+    }
+  }
+
+  fn emptyUname() -> NativeUname {
+    return NativeUname { name: [0; 256], node: [0; 256], release: [0; 256], version: [0; 256], machine: [0; 256] }
+  }
+
+  // `CLOCK_MONOTONIC` on Darwin counts from boot and keeps counting while asleep.
+  unsafe fn bootClock(value: *mut Timespec) -> i32 { return unsafe darwinClockGetTime(6, value) }
+
+  const PASSWORD_BUFFER_NAME: i32 = 71
+  // Darwin reports the largest resident memory in bytes.
+  const RESIDENT_SCALE: u64 = 1
+  const PAGE_SIZE_NAME: i32 = 29
+  const CLOCK_TICK_NAME: i32 = 3
+  const ONLINE_PROCESSORS_NAME: i32 = 58
+  const IPV6_FAMILY: u8 = 30
+  const LINK_FAMILY: u8 = 18
+} else {
+  unsafe extern "C" fn __errno_location() -> *mut i32
+  unsafe fn errorSlot() -> *mut i32 { unsafe { return __errno_location() } }
+
+  // `struct passwd` on GNU libc.
+  extern "C" struct PasswordRecord {
+    name: ?*mut u8,
+    password: ?*mut u8,
+    uid: u32,
+    gid: u32,
+    gecos: ?*mut u8,
+    home: ?*mut u8,
+    shell: ?*mut u8,
+  }
+
+  // `struct utsname` on GNU libc: six fields of 65 bytes.
+  extern "C" struct NativeUname {
+    name: [u8; 65],
+    node: [u8; 65],
+    release: [u8; 65],
+    version: [u8; 65],
+    machine: [u8; 65],
+    domain: [u8; 65],
+  }
+
+  extern "C" struct Timespec {
+    seconds: i64,
+    nanoseconds: i64,
+  }
+
+  @foreign(noCapture: .("value"))
+  unsafe extern "C" fn gnuClockGetTime(clock: i32, value: *mut Timespec) -> i32 as "clock_gettime"
+  @foreign(noCapture: .("value"))
+  unsafe extern "C" fn uname(value: *mut NativeUname) -> i32
+  @foreign(noCapture: .("mask"))
+  unsafe extern "C" fn sched_getaffinity(pid: i32, size: usize, mask: ?[*]mut u64) -> i32
+  @foreign(noCapture: ("path", "buffer"))
+  unsafe extern "C" fn readlinkat(fd: i32, path: ?[*]const u8, buffer: ?[*]mut u8, size: usize) -> isize
+
+  fn emptyRecord() -> PasswordRecord {
+    return PasswordRecord {
+      name: Pointer.null<u8>(), password: Pointer.null<u8>(), uid: 0, gid: 0,
+      gecos: Pointer.null<u8>(), home: Pointer.null<u8>(), shell: Pointer.null<u8>(),
+    }
+  }
+
+  fn emptyUname() -> NativeUname {
+    return NativeUname { name: [0; 65], node: [0; 65], release: [0; 65], version: [0; 65], machine: [0; 65], domain: [0; 65] }
+  }
+
+  // `CLOCK_BOOTTIME` counts from boot, with the time asleep.
+  unsafe fn bootClock(value: *mut Timespec) -> i32 { return unsafe gnuClockGetTime(7, value) }
+
+  const PASSWORD_BUFFER_NAME: i32 = 70
+  // Linux reports the largest resident memory in kilobytes.
+  const RESIDENT_SCALE: u64 = 1024
+  const PAGE_SIZE_NAME: i32 = 30
+  const CLOCK_TICK_NAME: i32 = 2
+  const IPV6_FAMILY: u8 = 10
+  const PACKET_FAMILY: u8 = 17
+}
+
+impl Copy for PasswordRecord {}
+
+const IPV4_FAMILY: u8 = 2
+// `O_RDONLY | O_CLOEXEC`.
+static if Intrinsic.targetOperatingSystem() == "darwin" { const READ_ONLY: i32 = 16777216 } else { const READ_ONLY: i32 = 524288 }
+const INTERRUPTED: i32 = 4
+const NOT_FOUND: i32 = 2
+const RANGE: i32 = 34
+const FLAG_UP: u32 = 1
+const FLAG_LOOPBACK: u32 = 8
+const FLAG_RUNNING: u32 = 64
+
+unsafe fn currentError() -> i32 { unsafe { return Pointer.read<i32>(errorSlot()) } }
+
+effect fn reject(operation: SystemInfoOperation, code: i32) -> never ! SystemInfoError {
+  fail SystemInfo.failure(operation, code)
+}
+
+// --- Small helpers ------------------------------------------------------------------------------
+
+// A descriptor that this module opened. It closes one time.
+struct OwnedDescriptor {
+  fd: i32,
+}
+
+impl Drop for OwnedDescriptor {
+  fn drop(self: &mut OwnedDescriptor) -> () {
+    let fd = Intrinsic.replace(self.fd, -1)
+    if fd >= 0 { let _closed = unsafe close(fd) }
+  }
+}
+
+// Opens the file at `path`, which ends with a zero byte, for reading. Returns `None` with `error`
+// set when it cannot.
+fn openFile(path: &[u8], error: &mut i32) -> Option<OwnedDescriptor> {
+  while true {
+    let fd = unsafe open(Pointer.fromSlice<u8>(path), READ_ONLY)
+    if fd >= 0 { return Option<OwnedDescriptor>.some(OwnedDescriptor { fd: fd }) }
+    let code = unsafe currentError()
+    if code != INTERRUPTED {
+      error.* = code
+      return Option<OwnedDescriptor>.none()
+    }
+  }
+  return Option<OwnedDescriptor>.none()
+}
+
+// Reads from `fd` into `buffer` until the end of the file or a full buffer. Returns the count, or
+// -1 with `error` set.
+fn readAvailable(fd: i32, buffer: &mut [u8], error: &mut i32) -> isize {
+  let capacity = buffer.length
+  let base = Pointer.fromMutSlice<u8>(move buffer)
+  let mut total: usize = 0
+  while total < capacity {
+    let mut transferred: isize = 0
+    unsafe {
+      let start = Intrinsic.pointerRequalify<?[*]mut u8, [*]mut u8>(base)
+      let next = Pointer.assumeManyMut<u8>(Pointer.atMut<u8>(start, total))
+      transferred = read(fd, next, capacity - total)
+    }
+    if transferred < 0 {
+      let code = unsafe currentError()
+      if code != INTERRUPTED {
+        error.* = code
+        return -1
+      }
+    } else {
+      if transferred == 0 { return usize.toIsize(total) }
+      total = total + isize.toUsize(transferred)
+    }
+  }
+  return usize.toIsize(total)
+}
+
+// Reads the start of the file at `path` into `buffer`, and returns the count. A file larger than
+// the buffer is cut at its length.
+effect fn readSmall(path: &[u8], buffer: &mut [u8], operation: SystemInfoOperation) -> usize ! SystemInfoError {
+  let mut error: i32 = 0
+  let opened = openFile(path, &mut error)
+  let descriptor = match move opened {
+    Option<OwnedDescriptor>.Some { value } => move value
+    Option<OwnedDescriptor>.None => run reject(operation, error)
+  }
+  let count = readAvailable(descriptor.fd, move buffer, &mut error)
+  if count < 0 { run reject(operation, error) }
+  return isize.toUsize(count)
+}
+
+// Reads the whole file at `path`.
+effect fn readWhole(path: &[u8], operation: SystemInfoOperation) -> Bytes ! SystemInfoError | OutOfMemoryError ? &mut Allocator {
+  let mut error: i32 = 0
+  let opened = openFile(path, &mut error)
+  let descriptor = match move opened {
+    Option<OwnedDescriptor>.Some { value } => move value
+    Option<OwnedDescriptor>.None => run reject(operation, error)
+  }
+  let mut result = Bytes.make()
+  let mut chunk: [u8; 4096] = [0; 4096]
+  while true {
+    let count = readAvailable(descriptor.fd, &mut chunk, &mut error)
+    if count < 0 { run reject(operation, error) }
+    let received = isize.toUsize(count)
+    run Bytes.append(&mut result, Slice.view<u8>(&chunk, 0, received))
+    if received < 4096 { return move result }
+  }
+  return move result
+}
+
+// Returns the length of the zero-ended text at the start of `values`, or the whole length.
+fn terminatedLength(values: &[u8]) -> usize {
+  let mut index: usize = 0
+  while index < values.length {
+    if values[index] == 0 { return index }
+    index = index + 1
+  }
+  return values.length
+}
+
+// Copies the zero-ended text at the start of `values`.
+effect fn copyTerminated(values: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  return run Bytes.copy(Slice.view<u8>(values, 0, terminatedLength(values)))
+}
+
+// Copies a C string. A null pointer gives empty bytes.
+effect fn copyString(text: ?[*]const u8) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let present = Pointer.nonNullMany<u8>(text)
+  return match move present {
+    Option<[*]const u8>.Some { value } => {
+      let length = unsafe strlen(value)
+      let anchor = length
+      let view = unsafe Pointer.borrowMany<usize, u8>(&anchor, value, length)
+      run Bytes.copy(view)
+    }
+    Option<[*]const u8>.None => Bytes.make()
+  }
+}
+
+// Returns whether `values` has `prefix` at `start`.
+fn hasPrefixAt(values: &[u8], start: usize, prefix: &[u8]) -> bool {
+  if start > values.length || values.length - start < prefix.length { return false }
+  let mut index: usize = 0
+  while index < prefix.length {
+    if values[start + index] != prefix[index] { return false }
+    index = index + 1
+  }
+  return true
+}
+
+// Returns the index after the end of the line that holds `start`.
+fn nextLine(values: &[u8], start: usize) -> usize {
+  let mut index = start
+  while index < values.length {
+    if values[index] == 10 { return index + 1 }
+    index = index + 1
+  }
+  return values.length
+}
+
+// Skips spaces, tabs, and colons from `index`.
+fn skipBlanks(values: &[u8], index: usize) -> usize {
+  let mut cursor = index
+  while cursor < values.length && (values[cursor] == 32 || values[cursor] == 9 || values[cursor] == 58) {
+    cursor = cursor + 1
+  }
+  return cursor
+}
+
+// Parses the decimal digits at `cursor`, and moves `cursor` after them. Returns `None` when there
+// is no digit or the number does not fit.
+fn parseNumber(values: &[u8], cursor: &mut usize) -> Option<u64> {
+  let mut index = cursor.*
+  let mut value: u64 = 0
+  let mut digits: usize = 0
+  while index < values.length && values[index] >= 48 && values[index] <= 57 {
+    let digit = u8.toU64(values[index] - 48)
+    if value > (u64.MAX - digit) / 10 { return Option<u64>.none() }
+    value = value * 10 + digit
+    digits = digits + 1
+    index = index + 1
+  }
+  cursor.* = index
+  if digits == 0 { return Option<u64>.none() }
+  return Option<u64>.some(value)
+}
+
+// Returns the number after `key` on the first line that starts with `key`.
+fn fieldValue(values: &[u8], key: &[u8]) -> Option<u64> {
+  let mut line: usize = 0
+  while line < values.length {
+    if hasPrefixAt(values, line, key) {
+      let mut cursor = skipBlanks(values, line + key.length)
+      return parseNumber(values, &mut cursor)
+    }
+    line = nextLine(values, line)
+  }
+  return Option<u64>.none()
+}
+
+// Writes `value` in decimal at `offset` of `output`, and returns the offset after it.
+fn writeDecimal(output: &mut [u8], offset: usize, value: u64) -> usize {
+  let mut digits: [u8; 20] = [0; 20]
+  let mut count: usize = 0
+  let mut rest = value
+  while true {
+    digits[count] = u64.toU8(rest % 10) + 48
+    count = count + 1
+    rest = rest / 10
+    if rest == 0 { break }
+  }
+  let mut index: usize = 0
+  while index < count {
+    output[offset + index] = digits[count - 1 - index]
+    index = index + 1
+  }
+  return offset + count
+}
+
+// Writes `values` at `offset` of `output`, and returns the offset after it.
+fn writeText(output: &mut [u8], offset: usize, values: &[u8]) -> usize {
+  let mut index: usize = 0
+  while index < values.length {
+    output[offset + index] = values[index]
+    index = index + 1
+  }
+  return offset + values.length
+}
+
+fn optionalOr(value: Option<u64>, otherwise: u64) -> u64 {
+  return match move value {
+    Option<u64>.Some { value: found } => found
+    Option<u64>.None => otherwise
+  }
+}
+
+fn pageSize() -> u64 {
+  let size = unsafe sysconf(PAGE_SIZE_NAME)
+  if size < 1 { return 4096 }
+  return i64.toU64(size)
+}
+
+fn nonNegative(value: i64) -> u64 {
+  if value < 0 { return 0 }
+  return i64.toU64(value)
+}
+
+fn microseconds(time: NativeTime) -> u64 {
+  return nonNegative(time.seconds) * 1000000 + nonNegative(i32.toI64(time.microseconds))
+}
+
+// Reads byte `index` behind a raw pointer.
+unsafe fn byteAt(base: [*]const u8, index: usize) -> u8 {
+  unsafe { return Pointer.read<u8>(Pointer.at<u8>(base, index)) }
+}
+
+// Returns whether the two C strings are equal.
+unsafe fn sameName(left: [*]const u8, right: [*]const u8) -> bool {
+  let mut index: usize = 0
+  while true {
+    let a = unsafe byteAt(left, index)
+    let b = unsafe byteAt(right, index)
+    if a != b { return false }
+    if a == 0 { return true }
+    index = index + 1
+  }
+  return false
+}
+
+// --- Socket addresses ---------------------------------------------------------------------------
+
+// Returns the family byte of a `struct sockaddr`. Darwin keeps a length byte first.
+unsafe fn addressFamily(address: [*]const u8) -> u8 {
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    return unsafe byteAt(address, 1)
+  } else {
+    return unsafe byteAt(address, 0)
+  }
+}
+
+unsafe fn ipv4At(address: [*]const u8) -> IpAddress {
+  let mut octets: [u8; 4] = [0; 4]
+  let mut index: usize = 0
+  while index < 4 {
+    octets[index] = unsafe byteAt(address, 4 + index)
+    index = index + 1
+  }
+  return IpAddress.V4 { value: Ipv4Address.fromOctets(octets) }
+}
+
+unsafe fn ipv6At(address: [*]const u8) -> IpAddress {
+  let mut octets: [u8; 16] = [0; 16]
+  let mut index: usize = 0
+  while index < 16 {
+    octets[index] = unsafe byteAt(address, 8 + index)
+    index = index + 1
+  }
+  return IpAddress.V6 { value: Ipv6Address.fromOctets(octets) }
+}
+
+// The `sin6_scope_id` of a `struct sockaddr_in6`, at offset 24.
+unsafe fn ipv6Scope(address: [*]const u8) -> u32 {
+  let mut value: u32 = 0
+  let mut index: usize = 4
+  while index > 0 {
+    index = index - 1
+    value = u32.shiftLeft(value, 8) | u8.toU32(unsafe byteAt(address, 24 + index))
+  }
+  return value
+}
+
+// The netmask of an entry, of the family `ipv4`. A missing netmask gives zeros.
+unsafe fn netmaskOf(entry: &InterfaceEntry, ipv4: bool) -> IpAddress {
+  let present = Pointer.nonNullMany<u8>(entry.netmask)
+  return match move present {
+    Option<[*]const u8>.Some { value } => {
+      if ipv4 { unsafe ipv4At(value) } else { unsafe ipv6At(value) }
+    }
+    Option<[*]const u8>.None => {
+      if ipv4 {
+        IpAddress.V4 { value: Ipv4Address.fromOctets([0; 4]) }
+      } else {
+        IpAddress.V6 { value: Ipv6Address.fromOctets([0; 16]) }
+      }
+    }
+  }
+}
+
+// Returns the hardware address of a link-layer entry, or `None` for other entries.
+unsafe fn hardwareAddress(address: [*]const u8) -> Option<[u8; 6]> {
+  let mut mac: [u8; 6] = [0; 6]
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    // `struct sockaddr_dl`: the name (`sdl_nlen` bytes) and then the address (`sdl_alen` bytes)
+    // start at `sdl_data`, offset 8.
+    if unsafe addressFamily(address) != LINK_FAMILY { return Option<[u8; 6]>.none() }
+    let nameLength = u8.toUsize(unsafe byteAt(address, 5))
+    let addressLength = u8.toUsize(unsafe byteAt(address, 6))
+    if addressLength < 6 { return Option<[u8; 6]>.some(mac) }
+    let mut index: usize = 0
+    while index < 6 {
+      mac[index] = unsafe byteAt(address, 8 + nameLength + index)
+      index = index + 1
+    }
+  } else {
+    // `struct sockaddr_ll`: `sll_halen` at offset 11 and `sll_addr` at offset 12.
+    if unsafe addressFamily(address) != PACKET_FAMILY { return Option<[u8; 6]>.none() }
+    let addressLength = u8.toUsize(unsafe byteAt(address, 11))
+    if addressLength < 6 { return Option<[u8; 6]>.some(mac) }
+    let mut index: usize = 0
+    while index < 6 {
+      mac[index] = unsafe byteAt(address, 12 + index)
+      index = index + 1
+    }
+  }
+  return Option<[u8; 6]>.some(mac)
+}
+
+// The list from `getifaddrs`. It is freed one time.
+struct InterfaceList {
+  head: ?*mut InterfaceEntry,
+}
+
+impl Drop for InterfaceList {
+  fn drop(self: &mut InterfaceList) -> () {
+    let head = Intrinsic.replace(self.head, Pointer.null<InterfaceEntry>())
+    if !Pointer.isNull<InterfaceEntry>(head) { unsafe freeifaddrs(head) }
+  }
+}
+
+// A memory region that a Mach call gave. It is freed one time.
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  struct MachRegion {
+    address: usize,
+    size: usize,
+  }
+
+  impl Drop for MachRegion {
+    fn drop(self: &mut MachRegion) -> () {
+      let size = Intrinsic.replace(self.size, 0)
+      if size != 0 { let _freed = unsafe vm_deallocate(taskSelf(), self.address, size) }
+    }
+  }
+
+  // Reads a `sysctl` value of `capacity` bytes or less into `value`. Returns the length, or `None`.
+  unsafe fn sysctlInto(name: &[u8], value: *mut u8, capacity: usize) -> Option<usize> {
+    let mut length = capacity
+    let typed = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut i32>(value)
+    let status = unsafe sysctlbyname(Pointer.fromSlice<u8>(name), typed, Pointer.fromMutRef<usize>(&mut length), Pointer.null<u8>(), 0)
+    if status != 0 { return Option<usize>.none() }
+    return Option<usize>.some(length)
+  }
+
+  // Reads an integer `sysctl` of 4 or 8 bytes.
+  fn sysctlNumber(name: &[u8]) -> Option<u64> {
+    let mut value: u64 = 0
+    let found = unsafe sysctlInto(name, unsafe Intrinsic.pointerReinterpret<*mut u64, *mut u8>(Pointer.fromMutRef<u64>(&mut value)), 8)
+    return match move found {
+      Option<usize>.Some { value: length } => {
+        if length == 4 { Option<u64>.some(value & 4294967295) } else { Option<u64>.some(value) }
+      }
+      Option<usize>.None => Option<u64>.none()
+    }
+  }
+}
+
+// --- Linux files --------------------------------------------------------------------------------
+
+static if Intrinsic.targetOperatingSystem() == "linux" {
+  // Returns the cgroup memory limit of the process, if it has one.
+  fn cgroupLimit() -> Option<MemoryLimit> {
+    let mut table: [u8; 4096] = [0; 4096]
+    let mut error: i32 = 0
+    let opened = openFile(b"/proc/self/cgroup\0", &mut error)
+    let descriptor = match move opened {
+      Option<OwnedDescriptor>.Some { value } => move value
+      Option<OwnedDescriptor>.None => { return Option<MemoryLimit>.none() }
+    }
+    let count = readAvailable(descriptor.fd, &mut table, &mut error)
+    if count <= 0 { return Option<MemoryLimit>.none() }
+    let length = isize.toUsize(count)
+    let lines = Slice.view<u8>(&table, 0, length)
+    // cgroup v2 has the line `0::<path>`. cgroup v1 has `<id>:<controllers>:<path>`, and the
+    // memory controller lists `memory`.
+    let mut line: usize = 0
+    while line < length {
+      let end = nextLine(lines, line)
+      let mut stop = end
+      if stop > line && lines[stop - 1] == 10 { stop = stop - 1 }
+      if hasPrefixAt(lines, line, b"0::") {
+        let found = readLimit(lines, line + 3, stop, b"/sys/fs/cgroup", b"/memory.max\0", b"/memory.current\0")
+        if Option<MemoryLimit>.isSome(&found) { return found }
+      } else {
+        // Find the controllers between the first and second colon.
+        let mut first = line
+        while first < stop && lines[first] != 58 { first = first + 1 }
+        let mut second = first + 1
+        while second < stop && lines[second] != 58 { second = second + 1 }
+        if second < stop && listsMemory(lines, first + 1, second) {
+          let found = readLimit(lines, second + 1, stop, b"/sys/fs/cgroup/memory", b"/memory.limit_in_bytes\0", b"/memory.usage_in_bytes\0")
+          if Option<MemoryLimit>.isSome(&found) { return found }
+        }
+      }
+      line = end
+    }
+    return Option<MemoryLimit>.none()
+  }
+
+  // Returns whether the comma-separated controllers in `lines[start..stop]` include `memory`.
+  fn listsMemory(lines: &[u8], start: usize, stop: usize) -> bool {
+    let mut cursor = start
+    while cursor < stop {
+      let mut end = cursor
+      while end < stop && lines[end] != 44 { end = end + 1 }
+      if end - cursor == 6 && hasPrefixAt(lines, cursor, b"memory") { return true }
+      cursor = end + 1
+    }
+    return false
+  }
+
+  // Reads the limit file and the usage file of the cgroup at `lines[start..stop]` under `root`.
+  // A limit of `max`, or the cgroup v1 value for no limit, gives `None`.
+  fn readLimit(lines: &[u8], start: usize, stop: usize, root: &[u8], limitFile: &[u8], usageFile: &[u8]) -> Option<MemoryLimit> {
+    let pathLength = stop - start
+    if root.length + pathLength + 32 > 4096 { return Option<MemoryLimit>.none() }
+    let mut path: [u8; 4096] = [0; 4096]
+    let mut offset = writeText(&mut path, 0, root)
+    offset = writeText(&mut path, offset, Slice.view<u8>(lines, start, pathLength))
+    let base = offset
+    let _end = writeText(&mut path, base, limitFile)
+    let mut value: [u8; 64] = [0; 64]
+    let mut error: i32 = 0
+    let opened = openFile(&path, &mut error)
+    let limitDescriptor = match move opened {
+      Option<OwnedDescriptor>.Some { value: found } => move found
+      Option<OwnedDescriptor>.None => { return Option<MemoryLimit>.none() }
+    }
+    let count = readAvailable(limitDescriptor.fd, &mut value, &mut error)
+    if count <= 0 { return Option<MemoryLimit>.none() }
+    let mut cursor: usize = 0
+    let parsed = parseNumber(Slice.view<u8>(&value, 0, isize.toUsize(count)), &mut cursor)
+    let bytes = match move parsed {
+      Option<u64>.Some { value: found } => found
+      Option<u64>.None => { return Option<MemoryLimit>.none() }
+    }
+    // cgroup v1 reports a page-rounded `LONG_MAX` when there is no limit.
+    if bytes >= 9223372036854771712 { return Option<MemoryLimit>.none() }
+    let _usageEnd = writeText(&mut path, base, usageFile)
+    let mut used: u64 = 0
+    let usageOpened = openFile(&path, &mut error)
+    match move usageOpened {
+      Option<OwnedDescriptor>.Some { value: usageDescriptor } => {
+        let usageCount = readAvailable(usageDescriptor.fd, &mut value, &mut error)
+        if usageCount > 0 {
+          let mut usageCursor: usize = 0
+          used = optionalOr(parseNumber(Slice.view<u8>(&value, 0, isize.toUsize(usageCount)), &mut usageCursor), 0)
+        }
+      }
+      Option<OwnedDescriptor>.None => {}
+    }
+    return Option<MemoryLimit>.some(MemoryLimit { bytes: bytes, used: used })
+  }
+
+  // Returns the text after `key` and the blanks on the line at `line`, up to the line end.
+  fn lineValue<'a>(values: &'a [u8], line: usize, key: &[u8]) -> &'a [u8] {
+    let start = skipBlanks(values, line + key.length)
+    let mut stop = nextLine(values, line)
+    if stop > start && values[stop - 1] == 10 { stop = stop - 1 }
+    if stop < start { return Slice.view<u8>(values, start, 0) }
+    return Slice.view<u8>(values, start, stop - start)
+  }
+
+  // Returns the `cpu MHz` value of processor entry `wanted` of `/proc/cpuinfo`, or 0.
+  fn cpuinfoSpeed(info: &[u8], wanted: usize) -> u32 {
+    let mut seen: usize = 0
+    let mut line: usize = 0
+    while line < info.length {
+      if hasPrefixAt(info, line, b"cpu MHz") {
+        if seen == wanted {
+          let mut cursor = skipBlanks(info, line + 7)
+          let parsed = parseNumber(info, &mut cursor)
+          return u64.toU32(optionalOr(parsed, 0) & 4294967295)
+        }
+        seen = seen + 1
+      }
+      line = nextLine(info, line)
+    }
+    return 0
+  }
+
+  // Reads `/sys/devices/system/cpu/cpu<index>/cpufreq/scaling_cur_freq`, in MHz.
+  fn scalingSpeed(index: u64) -> Option<u32> {
+    let mut path: [u8; 96] = [0; 96]
+    let mut offset = writeText(&mut path, 0, b"/sys/devices/system/cpu/cpu")
+    offset = writeDecimal(&mut path, offset, index)
+    let _end = writeText(&mut path, offset, b"/cpufreq/scaling_cur_freq\0")
+    let mut value: [u8; 32] = [0; 32]
+    let mut error: i32 = 0
+    let opened = openFile(&path, &mut error)
+    let descriptor = match move opened {
+      Option<OwnedDescriptor>.Some { value: found } => move found
+      Option<OwnedDescriptor>.None => { return Option<u32>.none() }
+    }
+    let count = readAvailable(descriptor.fd, &mut value, &mut error)
+    if count <= 0 { return Option<u32>.none() }
+    let mut cursor: usize = 0
+    let parsed = parseNumber(Slice.view<u8>(&value, 0, isize.toUsize(count)), &mut cursor)
+    return match move parsed {
+      Option<u64>.Some { value: kilohertz } => Option<u32>.some(u64.toU32((kilohertz / 1000) & 4294967295))
+      Option<u64>.None => Option<u32>.none()
+    }
+  }
+}
+
+// --- The provider -------------------------------------------------------------------------------
+
+/// The native `SystemInfo` provider. It has no state.
+///
+/// # Details
+/// On Linux, it reads `/proc`, `/sys`, `uname`, `getifaddrs`, `getpwuid_r`, `getrusage`, and
+/// `sched_getaffinity`. On macOS, it uses `sysctl`, the Mach host and task calls, `getifaddrs`,
+/// `getpwuid_r`, and `getrusage`. No operation waits for an event.
+///
+/// # Gotchas
+/// - The memory limit of a control group is read from cgroup v2 `memory.max` or cgroup v1
+///   `memory.limit_in_bytes`. Other limits, such as `ulimit`, are not reported.
+/// - The provider exists on Darwin on x86_64 or aarch64, and on GNU Linux on x86_64 or aarch64.
+pub struct OsSystemInfo {}
+
+impl OsSystemInfo {
+  /// Returns the provider. It makes no system call.
+  pub fn make() -> OsSystemInfo { return OsSystemInfo {} }
+}
+
+effect fn readUser(uid: u32) -> UserInfo ! SystemInfoError | OutOfMemoryError ? &mut Allocator {
+  let operation = SystemInfoOperation.User
+  let suggested = unsafe sysconf(PASSWORD_BUFFER_NAME)
+  let mut size: usize = 1024
+  if suggested > 0 && suggested < 1048576 { size = i64.toUsize(suggested) }
+  while true {
+    let mut buffer = run Bytes.zeroed(size)
+    let mut record = emptyRecord()
+    let mut found = Pointer.null<PasswordRecord>()
+    let status = unsafe getpwuid_r(uid, Pointer.fromMutRef<PasswordRecord>(&mut record), Pointer.fromMutSlice<u8>(Bytes.asMutSlice(&mut buffer)), size, Pointer.fromMutRef<?*mut PasswordRecord>(&mut found))
+    if status == RANGE {
+      if size >= 67108864 { run reject(operation, status) }
+      size = size * 2
+    } else {
+      if status != 0 { run reject(operation, status) }
+      if Pointer.isNull<PasswordRecord>(found) { run reject(operation, NOT_FOUND) }
+      let name = run copyString(unsafe Pointer.bytes<u8>(record.name))
+      let home = run copyString(unsafe Pointer.bytes<u8>(record.home))
+      let shell = run copyString(unsafe Pointer.bytes<u8>(record.shell))
+      return UserInfo { name: move name, uid: record.uid, gid: record.gid, home: move home, shell: move shell }
+    }
+  }
+  run reject(operation, 0)
+}
+
+impl SystemInfo for OsSystemInfo {
+  effect fn hostName(self: &mut Self) -> Bytes ! SystemInfoError | OutOfMemoryError ? &mut Allocator {
+    let mut name: [u8; 256] = [0; 256]
+    let status = unsafe gethostname(Pointer.fromMutSlice<u8>(&mut name), 255)
+    if status != 0 { run reject(SystemInfoOperation.HostName, unsafe currentError()) }
+    return run copyTerminated(&name)
+  }
+
+  effect fn kernel(self: &mut Self) -> KernelInfo ! SystemInfoError | OutOfMemoryError ? &mut Allocator {
+    let mut info = emptyUname()
+    let status = unsafe uname(Pointer.fromMutRef<NativeUname>(&mut info))
+    if status != 0 { run reject(SystemInfoOperation.Kernel, unsafe currentError()) }
+    let name = run copyTerminated(&info.name)
+    let release = run copyTerminated(&info.release)
+    let version = run copyTerminated(&info.version)
+    let machine = run copyTerminated(&info.machine)
+    return KernelInfo { name: move name, release: move release, version: move version, machine: move machine }
+  }
+
+  effect fn uptime(self: &mut Self) -> u64 ! SystemInfoError {
+    let mut value = Timespec { seconds: 0, nanoseconds: 0 }
+    let status = unsafe bootClock(Pointer.fromMutRef<Timespec>(&mut value))
+    if status != 0 { run reject(SystemInfoOperation.Uptime, unsafe currentError()) }
+    if value.seconds < 0 || value.nanoseconds < 0 || value.nanoseconds >= 1000000000 { run reject(SystemInfoOperation.Uptime, 0) }
+    return i64.toU64(value.seconds) * 1000000000 + i64.toU64(value.nanoseconds)
+  }
+
+  effect fn loadAverage(self: &mut Self) -> [f64; 3] ! SystemInfoError {
+    let mut averages: [f64; 3] = [0.0; 3]
+    let count = unsafe getloadavg(Pointer.fromMutSlice<f64>(&mut averages), 3)
+    if count != 3 { run reject(SystemInfoOperation.LoadAverage, 0) }
+    return averages
+  }
+
+  effect fn memory(self: &mut Self) -> MemoryInfo ! SystemInfoError {
+    let operation = SystemInfoOperation.Memory
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      let total = match move sysctlNumber(b"hw.memsize\0") {
+        Option<u64>.Some { value } => value
+        Option<u64>.None => run reject(operation, unsafe currentError())
+      }
+      // `vm_statistics64` is 38 words. `free_count` is the first one.
+      let mut statistics: [u32; 40] = [0; 40]
+      let mut count: u32 = 38
+      let status = unsafe host_statistics64(unsafe mach_host_self(), 4, Pointer.fromMutSlice<u32>(&mut statistics), Pointer.fromMutRef<u32>(&mut count))
+      if status != 0 { run reject(operation, status) }
+      let free = u32.toU64(statistics[0]) * pageSize()
+      return MemoryInfo { total: total, free: free, available: free, limit: Option<MemoryLimit>.none() }
+    } else {
+      let mut table: [u8; 8192] = [0; 8192]
+      let length = run readSmall(b"/proc/meminfo\0", &mut table, operation)
+      let lines = Slice.view<u8>(&table, 0, length)
+      let total = match move fieldValue(lines, b"MemTotal:") {
+        Option<u64>.Some { value } => value * 1024
+        Option<u64>.None => run reject(operation, 0)
+      }
+      let free = match move fieldValue(lines, b"MemFree:") {
+        Option<u64>.Some { value } => value * 1024
+        Option<u64>.None => run reject(operation, 0)
+      }
+      let available = optionalOr(fieldValue(lines, b"MemAvailable:"), free / 1024) * 1024
+      let limit = cgroupLimit()
+      return MemoryInfo { total: total, free: free, available: available, limit: limit }
+    }
+  }
+
+  effect fn processors(self: &mut Self) -> List<ProcessorInfo> ! SystemInfoError | OutOfMemoryError ? &mut Allocator {
+    let operation = SystemInfoOperation.Processors
+    let ticks = unsafe sysconf(CLOCK_TICK_NAME)
+    if ticks < 1 { run reject(operation, 0) }
+    // Converts clock ticks to milliseconds.
+    let multiplier = 1000 / i64.toU64(ticks)
+    let mut result = List<ProcessorInfo>.make()
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      let mut model: [u8; 256] = [0; 256]
+      let found = unsafe sysctlInto(b"machdep.cpu.brand_string\0", Pointer.fromMutRef<u8>(&mut model[0]), 255)
+      if Option<usize>.isNone(&found) { model = [0; 256] }
+      if model[0] == 0 { let _end = writeText(&mut model, 0, b"unknown") }
+      let speed = u64.toU32((optionalOr(sysctlNumber(b"hw.cpufrequency\0"), 0) / 1000000) & 4294967295)
+      let mut processorCount: u32 = 0
+      let mut info = Pointer.null<i32>()
+      let mut infoCount: u32 = 0
+      // `PROCESSOR_CPU_LOAD_INFO`: four tick counts for each processor, in the order user,
+      // system, idle, nice.
+      let status = unsafe host_processor_info(unsafe mach_host_self(), 2, Pointer.fromMutRef<u32>(&mut processorCount), Pointer.fromMutRef<?*mut i32>(&mut info), Pointer.fromMutRef<u32>(&mut infoCount))
+      if status != 0 { run reject(operation, status) }
+      let region = MachRegion { address: Pointer.address<i32>(info), size: u32.toUsize(infoCount) * 4 }
+      let present = match move Pointer.nonNullMut<i32>(info) {
+        Option<*mut i32>.Some { value } => value
+        Option<*mut i32>.None => run reject(operation, 0)
+      }
+      let counts = unsafe Intrinsic.pointerRequalify<[*]mut i32, [*]const i32>(unsafe Pointer.assumeManyMut<i32>(present))
+      if u32.toUsize(infoCount) < u32.toUsize(processorCount) * 4 { run reject(operation, 0) }
+      let mut index: usize = 0
+      while index < u32.toUsize(processorCount) {
+        let user = unsafe Pointer.read<i32>(unsafe Pointer.at<i32>(counts, index * 4))
+        let system = unsafe Pointer.read<i32>(unsafe Pointer.at<i32>(counts, index * 4 + 1))
+        let idle = unsafe Pointer.read<i32>(unsafe Pointer.at<i32>(counts, index * 4 + 2))
+        let nice = unsafe Pointer.read<i32>(unsafe Pointer.at<i32>(counts, index * 4 + 3))
+        let times = ProcessorTimes {
+          user: u32.toU64(i32.wrappingToU32(user)) * multiplier,
+          nice: u32.toU64(i32.wrappingToU32(nice)) * multiplier,
+          system: u32.toU64(i32.wrappingToU32(system)) * multiplier,
+          idle: u32.toU64(i32.wrappingToU32(idle)) * multiplier,
+          interrupt: 0,
+        }
+        let name = run copyTerminated(&model)
+        run List<ProcessorInfo>.append(&mut result, ProcessorInfo { model: move name, speed: speed, times: times })
+        index = index + 1
+      }
+      let _freed = move region
+      return move result
+    } else {
+      let stat = run readWhole(b"/proc/stat\0", operation)
+      let info = run readWhole(b"/proc/cpuinfo\0", operation)
+      let lines = Bytes.asSlice(&stat)
+      let infoLines = Bytes.asSlice(&info)
+      let mut modelLine: usize = 0
+      let mut position: usize = 0
+      let mut line: usize = 0
+      while line < lines.length {
+        // Each processor has a line `cpu<N> user nice system idle iowait irq ...`. The first line,
+        // `cpu `, is the sum of all of them.
+        if hasPrefixAt(lines, line, b"cpu") && line + 3 < lines.length && lines[line + 3] >= 48 && lines[line + 3] <= 57 {
+          let mut cursor = line + 3
+          let number = optionalOr(parseNumber(lines, &mut cursor), 0)
+          let mut values: [u64; 6] = [0; 6]
+          let mut field: usize = 0
+          while field < 6 {
+            cursor = skipBlanks(lines, cursor)
+            values[field] = optionalOr(parseNumber(lines, &mut cursor), 0)
+            field = field + 1
+          }
+          let times = ProcessorTimes {
+            user: values[0] * multiplier,
+            nice: values[1] * multiplier,
+            system: values[2] * multiplier,
+            idle: values[3] * multiplier,
+            interrupt: values[5] * multiplier,
+          }
+          // The `model name` lines of `/proc/cpuinfo` come in processor order.
+          let mut model = Bytes.make()
+          while modelLine < infoLines.length && !hasPrefixAt(infoLines, modelLine, b"model name") {
+            modelLine = nextLine(infoLines, modelLine)
+          }
+          if modelLine < infoLines.length {
+            model = run Bytes.copy(lineValue(infoLines, modelLine, b"model name"))
+            modelLine = nextLine(infoLines, modelLine)
+          }
+          if Bytes.length(&model) == 0 { model = run Bytes.copy(b"unknown") }
+          let scaled = scalingSpeed(number)
+          let speed = match move scaled {
+            Option<u32>.Some { value } => value
+            Option<u32>.None => cpuinfoSpeed(infoLines, position)
+          }
+          run List<ProcessorInfo>.append(&mut result, ProcessorInfo { model: move model, speed: speed, times: times })
+          position = position + 1
+        }
+        line = nextLine(lines, line)
+      }
+      if List<ProcessorInfo>.length(&result) == 0 { run reject(operation, 0) }
+      return move result
+    }
+  }
+
+  effect fn availableParallelism(self: &mut Self) -> usize ! SystemInfoError {
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      let online = unsafe sysconf(ONLINE_PROCESSORS_NAME)
+      if online < 1 { run reject(SystemInfoOperation.Parallelism, unsafe currentError()) }
+      return i64.toUsize(online)
+    } else {
+      // Room for 1024 processors, the size of `cpu_set_t`.
+      let mut mask: [u64; 16] = [0; 16]
+      let status = unsafe sched_getaffinity(0, 128, Pointer.fromMutSlice<u64>(&mut mask))
+      if status != 0 { run reject(SystemInfoOperation.Parallelism, unsafe currentError()) }
+      let mut count: usize = 0
+      let mut index: usize = 0
+      while index < 16 {
+        count = count + u32.toUsize(u64.countOnes(mask[index]))
+        index = index + 1
+      }
+      if count == 0 { return 1 }
+      return count
+    }
+  }
+
+  effect fn networkInterfaces(self: &mut Self) -> List<NetworkInterface> ! SystemInfoError | OutOfMemoryError ? &mut Allocator {
+    let operation = SystemInfoOperation.NetworkInterfaces
+    let mut head = Pointer.null<InterfaceEntry>()
+    let status = unsafe getifaddrs(Pointer.fromMutRef<?*mut InterfaceEntry>(&mut head))
+    if status != 0 { run reject(operation, unsafe currentError()) }
+    let list = InterfaceList { head: head }
+    let mut result = List<NetworkInterface>.make()
+    let mut cursor = list.head
+    while !Pointer.isNull<InterfaceEntry>(cursor) {
+      let entry = unsafe Pointer.read<InterfaceEntry>(unsafe Intrinsic.pointerRequalify<?*mut InterfaceEntry, *mut InterfaceEntry>(cursor))
+      cursor = entry.next
+      let wanted = FLAG_UP | FLAG_RUNNING
+      let address = Pointer.nonNullMany<u8>(entry.address)
+      let name = Pointer.nonNullMany<u8>(entry.name)
+      if (entry.flags & wanted) == wanted && Option<[*]const u8>.isSome(&address) && Option<[*]const u8>.isSome(&name) {
+        let base = match move address {
+          Option<[*]const u8>.Some { value } => value
+          Option<[*]const u8>.None => { continue }
+        }
+        let family = unsafe addressFamily(base)
+        if family == IPV4_FAMILY || family == IPV6_FAMILY {
+          let ipv4 = family == IPV4_FAMILY
+          let mut value = IpAddress.V4 { value: Ipv4Address.fromOctets([0; 4]) }
+          let mut scope: u32 = 0
+          if ipv4 { value = unsafe ipv4At(base) } else {
+            value = unsafe ipv6At(base)
+            scope = unsafe ipv6Scope(base)
+          }
+          let netmask = unsafe netmaskOf(&entry, ipv4)
+          let copied = run copyString(entry.name)
+          let mac = unsafe macFor(list.head, entry.name)
+          run List<NetworkInterface>.append(&mut result, NetworkInterface {
+            name: move copied,
+            address: value,
+            netmask: netmask,
+            mac: mac,
+            internal: (entry.flags & FLAG_LOOPBACK) != 0,
+            scopeId: scope,
+          })
+        }
+      }
+    }
+    return move result
+  }
+
+  effect fn currentUser(self: &mut Self) -> UserInfo ! SystemInfoError | OutOfMemoryError ? &mut Allocator {
+    return run readUser(unsafe geteuid())
+  }
+
+  effect fn user(self: &mut Self, uid: u32) -> UserInfo ! SystemInfoError | OutOfMemoryError ? &mut Allocator {
+    return run readUser(uid)
+  }
+
+  effect fn priority(self: &mut Self, pid: i32) -> i32 ! SystemInfoError {
+    // `getpriority` can return -1 for a valid priority, so the error slot tells a failure.
+    unsafe { Pointer.write<i32>(errorSlot(), 0) }
+    let value = unsafe getpriority(0, i32.wrappingToU32(pid))
+    if value == -1 {
+      let code = unsafe currentError()
+      if code != 0 { run reject(SystemInfoOperation.Priority, code) }
+    }
+    return value
+  }
+
+  effect fn setPriority(self: &mut Self, pid: i32, value: i32) -> () ! SystemInfoError {
+    let status = unsafe setpriority(0, i32.wrappingToU32(pid), value)
+    if status != 0 { run reject(SystemInfoOperation.SetPriority, unsafe currentError()) }
+    return ()
+  }
+
+  effect fn resourceUsage(self: &mut Self, scope: UsageScope) -> ResourceUsage ! SystemInfoError {
+    let operation = SystemInfoOperation.ResourceUsage
+    let empty = NativeTime { seconds: 0, microseconds: 0, padding: 0 }
+    let mut usage = NativeUsage { user: empty, system: empty, counters: [0; 14] }
+    let thread = match scope {
+      UsageScope.Process => false
+      UsageScope.Thread => true
+    }
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      if thread {
+        // `THREAD_BASIC_INFO`: the user and system times as seconds and microseconds first.
+        let mut info: [i32; 10] = [0; 10]
+        let mut count: u32 = 10
+        let port = unsafe mach_thread_self()
+        let status = unsafe thread_info(port, 3, Pointer.fromMutSlice<i32>(&mut info), Pointer.fromMutRef<u32>(&mut count))
+        let _released = unsafe mach_port_deallocate(taskSelf(), port)
+        if status != 0 { run reject(operation, status) }
+        usage.user = NativeTime { seconds: i32.toI64(info[0]), microseconds: info[1], padding: 0 }
+        usage.system = NativeTime { seconds: i32.toI64(info[2]), microseconds: info[3], padding: 0 }
+      } else {
+        let status = unsafe getrusage(0, Pointer.fromMutRef<NativeUsage>(&mut usage))
+        if status != 0 { run reject(operation, unsafe currentError()) }
+      }
+    } else {
+      // `RUSAGE_SELF` is 0 and `RUSAGE_THREAD` is 1.
+      let mut who: i32 = 0
+      if thread { who = 1 }
+      let status = unsafe getrusage(who, Pointer.fromMutRef<NativeUsage>(&mut usage))
+      if status != 0 { run reject(operation, unsafe currentError()) }
+    }
+    let counters = usage.counters
+    return ResourceUsage {
+      userMicroseconds: microseconds(usage.user),
+      systemMicroseconds: microseconds(usage.system),
+      maxResidentBytes: nonNegative(counters[0]) * RESIDENT_SCALE,
+      sharedMemory: nonNegative(counters[1]),
+      unsharedData: nonNegative(counters[2]),
+      unsharedStack: nonNegative(counters[3]),
+      minorFaults: nonNegative(counters[4]),
+      majorFaults: nonNegative(counters[5]),
+      swaps: nonNegative(counters[6]),
+      blockInputs: nonNegative(counters[7]),
+      blockOutputs: nonNegative(counters[8]),
+      messagesSent: nonNegative(counters[9]),
+      messagesReceived: nonNegative(counters[10]),
+      signals: nonNegative(counters[11]),
+      voluntaryContextSwitches: nonNegative(counters[12]),
+      involuntaryContextSwitches: nonNegative(counters[13]),
+    }
+  }
+
+  effect fn residentSetSize(self: &mut Self) -> u64 ! SystemInfoError {
+    let operation = SystemInfoOperation.ResidentSetSize
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      // `MACH_TASK_BASIC_INFO`: 12 words, with the 64-bit `resident_size` in words 2 and 3.
+      let mut info: [u32; 12] = [0; 12]
+      let mut count: u32 = 12
+      let status = unsafe task_info(taskSelf(), 20, Pointer.fromMutSlice<u32>(&mut info), Pointer.fromMutRef<u32>(&mut count))
+      if status != 0 { run reject(operation, status) }
+      return u64.shiftLeft(u32.toU64(info[3]), 32) | u32.toU64(info[2])
+    } else {
+      // `/proc/self/statm` lists the sizes in pages. The second is the resident size.
+      let mut table: [u8; 256] = [0; 256]
+      let length = run readSmall(b"/proc/self/statm\0", &mut table, operation)
+      let values = Slice.view<u8>(&table, 0, length)
+      let mut cursor: usize = 0
+      let _size = parseNumber(values, &mut cursor)
+      cursor = skipBlanks(values, cursor)
+      return match move parseNumber(values, &mut cursor) {
+        Option<u64>.Some { value } => value * pageSize()
+        Option<u64>.None => run reject(operation, 0)
+      }
+    }
+  }
+
+  effect fn executablePath(self: &mut Self) -> Bytes ! SystemInfoError | OutOfMemoryError ? &mut Allocator {
+    let operation = SystemInfoOperation.ExecutablePath
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      let mut size: u32 = 1024
+      let mut path = run Bytes.zeroed(1025)
+      if unsafe _NSGetExecutablePath(Pointer.fromMutSlice<u8>(Bytes.asMutSlice(&mut path)), Pointer.fromMutRef<u32>(&mut size)) != 0 {
+        // `size` is now the length that the path needs, with its zero byte.
+        path = run Bytes.zeroed(u32.toUsize(size) + 1)
+        if unsafe _NSGetExecutablePath(Pointer.fromMutSlice<u8>(Bytes.asMutSlice(&mut path)), Pointer.fromMutRef<u32>(&mut size)) != 0 { run reject(operation, 0) }
+      }
+      // `PATH_MAX` is 1024 on Darwin.
+      let mut resolved: [u8; 1025] = [0; 1025]
+      let status = unsafe realpath(Pointer.fromSlice<u8>(Bytes.asSlice(&path)), Pointer.fromMutSlice<u8>(&mut resolved))
+      if Pointer.isNullMany<u8>(unsafe Intrinsic.pointerRequalify<?[*]mut u8, ?[*]const u8>(status)) { run reject(operation, unsafe currentError()) }
+      return run copyTerminated(&resolved)
+    } else {
+      let mut capacity: usize = 256
+      while true {
+        let mut path = run Bytes.zeroed(capacity)
+        let count = unsafe readlinkat(-100, Pointer.fromSlice<u8>(b"/proc/self/exe\0"), Pointer.fromMutSlice<u8>(Bytes.asMutSlice(&mut path)), capacity)
+        if count < 0 { run reject(operation, unsafe currentError()) }
+        let length = isize.toUsize(count)
+        if length < capacity {
+          Bytes.truncate(&mut path, length)
+          return move path
+        }
+        if capacity >= 1048576 { run reject(operation, 0) }
+        capacity = capacity * 2
+      }
+      run reject(operation, 0)
+    }
+  }
+
+  effect fn processId(self: &mut Self) -> i32 {
+    return unsafe getpid()
+  }
+
+  effect fn parentProcessId(self: &mut Self) -> i32 {
+    return unsafe getppid()
+  }
+}
+
+// Returns the hardware address of the interface named `name`, from its link-layer entry, or zeros.
+unsafe fn macFor(head: ?*mut InterfaceEntry, name: ?[*]const u8) -> [u8; 6] {
+  let mut none: [u8; 6] = [0; 6]
+  let wanted = match move Pointer.nonNullMany<u8>(name) {
+    Option<[*]const u8>.Some { value } => value
+    Option<[*]const u8>.None => { return none }
+  }
+  let mut cursor = head
+  while !Pointer.isNull<InterfaceEntry>(cursor) {
+    let entry = unsafe Pointer.read<InterfaceEntry>(unsafe Intrinsic.pointerRequalify<?*mut InterfaceEntry, *mut InterfaceEntry>(cursor))
+    cursor = entry.next
+    let address = Pointer.nonNullMany<u8>(entry.address)
+    let other = Pointer.nonNullMany<u8>(entry.name)
+    match move address {
+      Option<[*]const u8>.Some { value: base } => {
+        match move other {
+          Option<[*]const u8>.Some { value: otherName } => {
+            if unsafe sameName(wanted, otherName) {
+              match move unsafe hardwareAddress(base) {
+                Option<[u8; 6]>.Some { value: mac } => { return mac }
+                Option<[u8; 6]>.None => {}
+              }
+            }
+          }
+          Option<[*]const u8>.None => {}
+        }
+      }
+      Option<[*]const u8>.None => {}
+    }
+  }
+  return none
+}
+}
