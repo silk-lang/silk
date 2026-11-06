@@ -1220,7 +1220,9 @@ wherever it is written outside import declarations, in a type, an expression, a 
 a module condition, except an identifier that resolves to a local binding of the same spelling.
 Import declarations and comments are not uses. A `pub import` publishes its bindings and is never
 reported, and neither is a binding whose name starts with `_`, such as an import kept only to load
-a module of test cases: `import hir.UnusedCases as _cases`.
+a module of test cases: `import hir.UnusedCases as _cases`. A module whose top-level declarations
+are all imports, such as a `silk test` discovery root, reports none of its imports: such a module
+imports only to load the modules it names.
 
 A warning does not reject the program: the command still succeeds, and its exit status is the
 one it would have without the warning. Only the root package's modules are reported, a module with

@@ -251,11 +251,14 @@ implies `avx512bw`, and `aes`, `pclmul` and `sha` imply `sse2`; on AArch64 `cryp
 `fp-armv8`; on wasm32 `relaxed-simd` implies `simd128`. `profileContains("cpu-features", f)`
 answers for the closed set.
 
-The default CPU model is `x86-64` on x86-64 and `generic` elsewhere; it guarantees only the
-baseline. x86-64 also admits the microarchitecture levels `x86-64-v2` (`cx16`, `popcnt`, `sse3`,
+The default CPU model is `x86-64` on x86-64, `apple-m1` on `aarch64-apple-darwin` and `generic`
+elsewhere. `x86-64` and `generic` guarantee only the baseline; `apple-m1`, the oldest CPU of an
+AArch64 Mac, also guarantees `aes`, `crc`, `crypto`, `dotprod`, `fullfp16`, `lse`, `rdm`, `sha2` and
+`sha3`. x86-64 also admits the microarchitecture levels `x86-64-v2` (`cx16`, `popcnt`, `sse3`,
 `sse4.1`, `sse4.2`, `ssse3`), `x86-64-v3` (v2 with `avx`, `avx2`, `bmi`, `bmi2`, `f16c`, `fma`,
 `lzcnt`, `movbe`, `xsave`) and `x86-64-v4` (v3 with `avx512bw`, `avx512cd`, `avx512dq`, `avx512f`,
-`avx512vl`). A model other than the default is passed to Clang for tuning.
+`avx512vl`). A native build always names its model to Clang, and a ThinLTO link generates code for the same
+model and features.
 
 In a manifest profile, `cpu.model = "native"` asks the machine that runs the compiler, through
 `silk.simd.cpu`, and adds each catalog feature it has to `cpu.features`; the model stays the default.
