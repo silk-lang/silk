@@ -1,0 +1,1248 @@
+//! DSA keys and signatures (FIPS 186-4): parameter and key generation, signing, verification, and
+//! the DER forms that OpenSSL and Node.js use.
+//!
+//! # When to use
+//! Use [`DsaPrivateKey`] to sign and [`DsaPublicKey`] to verify where a format requires DSA, such
+//! as Node.js `crypto.sign` with a `dsa` key, `generateKeyPair('dsa')`, or old SSH and X.509 keys.
+//! For a new design, use `silk.crypto.ed25519` or ECDSA instead.
+//!
+//! # Details
+//! A [`DsaParameters`] value holds the primes `p` and `q`, where `q` divides `p - 1`, and a
+//! generator `g` of order `q` modulo `p`. `p` has 512 to 8192 bits and `q` 160, 224, or 256 bits
+//! (the pairs of FIPS 186-4 are 1024/160, 2048/224, 2048/256, and 3072/256). A private key is a
+//! number `x` from 1 to `q - 1` and its public key is `y = g^x mod p`.
+//!
+//! The signing functions take the digest of the message, not the message. A digest longer than
+//! `q` keeps its leftmost bytes, as OpenSSL does. A signature is `r || s`, each big-endian and as
+//! long as `q`, the IEEE P1363 form that Node.js calls `ieee-p1363`. [`DsaSignature`] converts it
+//! to and from the DER form that is the default of Node.js.
+//!
+//! The private operations use the constant-time arithmetic of `silk.crypto.modular`: their time
+//! does not depend on `x` or on the per-signature secret `k`.
+//!
+//! # Errors
+//! - [`DsaError`] for parameters, a key, a length, an encoding, or a signature that is not valid.
+//!
+//! # Gotchas
+//! The keys do not check that `p` and `q` are prime or that `g` has order `q`. Use keys and
+//! parameters only from sources that you trust. Each signature needs a fresh secret from a
+//! cryptographically secure `Random`; a repeated or predictable one reveals the private key.
+//!
+//! # Examples
+//! ## Sign and verify a digest
+//! ```silk
+//! import silk.core.effect { Effect }
+//! import silk.core.result { Result }
+//! import silk.crypto.dsa { DsaError, DsaParameters, DsaPrivateKey }
+//! import silk.crypto.sha2 { Sha256 }
+//! import silk.num.u64
+//! import silk.system.random { Random }
+//!
+//! // A test provider. Never use it for keys.
+//! struct Counter {
+//!   state: u64,
+//! }
+//!
+//! impl Random for Counter {
+//!   effect fn fillBytes(self: &mut Self, output: &mut [u8]) -> () {
+//!     let mut index: usize = 0
+//!     while index < output.length {
+//!       self.state = u64.wrappingAdd(u64.wrappingMultiply(self.state, 6364136223846793005), 1)
+//!       output[index] = u64.toU8(u64.shiftRight(self.state, 56))
+//!       index = index + 1
+//!     }
+//!   }
+//! }
+//!
+//! effect fn signAndVerify() -> i32 ! DsaError ? &mut Random {
+//!   let parameters = run DsaParameters.generate(1024, 160)
+//!   let key = run DsaPrivateKey.generate(&parameters)
+//!   let digest = Sha256.hash(b"hello")
+//!   let mut signature: [u8; 40] = [0; 40]
+//!   run key.signDigest(&digest, &mut signature)
+//!   return match key.publicKey().verifyDigest(&digest, &signature) {
+//!     Result<(), DsaError>.Success { value: _ } => 0
+//!     Result<(), DsaError>.Failure { error: _ } => 1
+//!   }
+//! }
+//!
+//! pub effect fn main() -> i32 ! DsaError {
+//!   let mut random = Counter { state: 1 }
+//!   return run signAndVerify() |> Effect.provideMut<Random>(&mut random)
+//! }
+//! ```
+//!
+//! @category Cryptography
+
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.crypto.modular { ModularError, Modulus, Natural }
+import silk.crypto.prime { Prime, PrimeError, PrimeOptions }
+import silk.io.writer { Writer, WriterError }
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import silk.system.random { Random }
+import silk.text.format { Debug, Format, Formatter }
+
+/// The reason that DSA parameters, a key, an encoding, or a signature were rejected.
+pub enum DsaError {
+  /// The sizes are not supported: `p` is not 512 to 8192 bits, or `q` is not 160, 224, or 256
+  /// bits, or the values are not consistent: `p` or `q` is even, or `g` is not from 2 to `p - 1`.
+  InvalidParameters,
+  /// A key value is out of range: `x` is not from 1 to `q - 1`, or `y` is not from 2 to `p - 1`.
+  InvalidKey,
+  /// A DER value is not valid, not minimal, has bytes after it, or names another algorithm.
+  InvalidEncoding,
+  /// An output or a signature does not have the required length.
+  InvalidLength,
+  /// The signature does not match the digest and the key.
+  InvalidSignature,
+}
+
+impl Debug for DsaError {
+  /// Writes the name of the variant, such as `InvalidKey`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      DsaError.InvalidParameters => run Format.write(&mut formatter, b"InvalidParameters")
+      DsaError.InvalidKey => run Format.write(&mut formatter, b"InvalidKey")
+      DsaError.InvalidEncoding => run Format.write(&mut formatter, b"InvalidEncoding")
+      DsaError.InvalidLength => run Format.write(&mut formatter, b"InvalidLength")
+      DsaError.InvalidSignature => run Format.write(&mut formatter, b"InvalidSignature")
+    }
+  }
+}
+
+/// The domain parameters of DSA: the primes `p` and `q`, where `q` divides `p - 1`, and the
+/// generator `g`.
+///
+/// # When to use
+/// Make one with [`DsaParameters.generate`], from its parts with [`DsaParameters.fromComponents`],
+/// or from the DER `Dss-Parms` of a key or a `DSA PARAMETERS` PEM block with
+/// [`DsaParameters.fromDer`]. Many keys can share one set of parameters.
+///
+/// # Details
+/// `p` has 512 to 8192 bits and `q` has 160, 224, or 256 bits.
+///
+/// # Gotchas
+/// It does not check that `p` and `q` are prime or that `g` has order `q`. It is a fixed-size
+/// value of about 5 KiB. Pass it by reference.
+pub struct DsaParameters {
+  p: Modulus,
+  q: Modulus,
+  g: Natural,
+  pLength: usize,
+  qLength: usize,
+}
+
+impl Copy for DsaParameters {}
+
+/// A DSA public key: the parameters and `y = g^x mod p`.
+///
+/// # When to use
+/// Use it to verify signatures. Make one with [`DsaPublicKey.fromComponents`], from a
+/// SubjectPublicKeyInfo with [`DsaPublicKey.fromSpkiDer`], or from a private key with
+/// [`DsaPrivateKey.publicKey`].
+///
+/// # Gotchas
+/// It is a fixed-size value of about 6 KiB. Pass it by reference.
+pub struct DsaPublicKey {
+  domain: DsaParameters,
+  y: Natural,
+}
+
+impl Copy for DsaPublicKey {}
+
+/// A DSA private key: the parameters, the secret `x`, and the public value `y`.
+///
+/// # When to use
+/// Use it to sign digests. Generate one with [`DsaPrivateKey.generate`], or read one with
+/// [`DsaPrivateKey.fromComponents`], [`DsaPrivateKey.fromPkcs8Der`], or
+/// [`DsaPrivateKey.fromTraditionalDer`].
+///
+/// # Gotchas
+/// It does not erase its memory when dropped. It is a fixed-size value of about 7 KiB. Pass it by
+/// reference.
+pub struct DsaPrivateKey {
+  public: DsaPublicKey,
+  x: Natural,
+}
+
+impl Copy for DsaPrivateKey {}
+
+/// Conversions between the `r || s` form of a DSA signature and its DER form.
+///
+/// # When to use
+/// Use it for Node.js `dsaEncoding`: `der`, the default, is the DER `SEQUENCE` of two
+/// `INTEGER`s, and `ieee-p1363` is `r || s`, which the signing functions of this module write.
+pub struct DsaSignature {}
+
+// The largest p is 8192 bits, so every value of p fits in 1024 bytes.
+const BLOCK: usize = 1024
+
+fn natural(bytes: &[u8]) -> Natural {
+  return match Natural.fromBytes(bytes) {
+    Result<Natural, ModularError>.Success { value } => value
+    Result<Natural, ModularError>.Failure { .. } => Intrinsic.trap("DSA input above 8192 bits")
+  }
+}
+
+fn resized(value: &Natural, length: usize) -> Natural {
+  return match value.resize(length) {
+    Result<Natural, ModularError>.Success { value: fitted } => fitted
+    Result<Natural, ModularError>.Failure { .. } => Intrinsic.trap("DSA value does not fit")
+  }
+}
+
+fn writeFixed(value: &Natural, output: &mut [u8]) -> () {
+  match value.writeBytes(move output) {
+    Result<(), ModularError>.Success { .. } => {}
+    Result<(), ModularError>.Failure { .. } => Intrinsic.trap("DSA value wider than its field")
+  }
+}
+
+// Skips leading zero bytes. Only for public values: the time depends on the count.
+fn significantStart(bytes: &[u8]) -> usize {
+  let mut start: usize = 0
+  while start < bytes.length && bytes[start] == 0 {
+    start = start + 1
+  }
+  return start
+}
+
+fn significant<'a>(bytes: &'a [u8]) -> &'a [u8] {
+  let start = significantStart(bytes)
+  return Slice.view<u8>(bytes, start, bytes.length - start)
+}
+
+fn modulusOf(value: &Natural) -> Option<Modulus> {
+  return match Modulus.make(value) {
+    Result<Modulus, ModularError>.Success { value: modulus } => Option<Modulus>.some(modulus)
+    Result<Modulus, ModularError>.Failure { .. } => Option<Modulus>.none()
+  }
+}
+
+fn validQBits(bits: usize) -> bool {
+  return bits == 160 || bits == 224 || bits == 256
+}
+
+fn parametersFrom(p: &[u8], q: &[u8], g: &[u8]) -> Result<DsaParameters, DsaError> {
+  let pBytes = significant(p)
+  let qBytes = significant(q)
+  let gBytes = significant(g)
+  if pBytes.length > BLOCK || qBytes.length > 32 || gBytes.length > BLOCK {
+    return Result<DsaParameters, DsaError>.failResult(DsaError.InvalidParameters)
+  }
+  let pValue = natural(pBytes)
+  let qValue = natural(qBytes)
+  let pBits = pValue.bitLength()
+  if pBits < 512 || pBits > 8192 || !validQBits(qValue.bitLength()) {
+    return Result<DsaParameters, DsaError>.failResult(DsaError.InvalidParameters)
+  }
+  let pModulus = match modulusOf(&pValue) {
+    Option<Modulus>.Some { value } => value
+    Option<Modulus>.None => {
+      return Result<DsaParameters, DsaError>.failResult(DsaError.InvalidParameters)
+    }
+  }
+  let qModulus = match modulusOf(&qValue) {
+    Option<Modulus>.Some { value } => value
+    Option<Modulus>.None => {
+      return Result<DsaParameters, DsaError>.failResult(DsaError.InvalidParameters)
+    }
+  }
+  let gValue = natural(gBytes)
+  if gValue.lessThan(&Natural.fromU64(2)) || !gValue.lessThan(&pValue) {
+    return Result<DsaParameters, DsaError>.failResult(DsaError.InvalidParameters)
+  }
+  return Result<DsaParameters, DsaError>.succeed(
+    DsaParameters {
+      p: pModulus,
+      q: qModulus,
+      g: resized(&gValue, pModulus.wordLength()),
+      pLength: (pBits + 7) / 8,
+      qLength: (qValue.bitLength() + 7) / 8,
+    },
+  )
+}
+
+// `dividend / divisor` for public values, one bit at a time.
+fn quotient(dividend: &Natural, divisor: &Natural) -> Natural {
+  let bits = dividend.bitLength()
+  let length = (bits + 7) / 8
+  let mut bytes: [u8; 1024] = [0; 1024]
+  let mut rest = resized(&Natural.zero(), divisor.wordLength() + 1)
+  let one = Natural.fromU64(1)
+  let mut index = bits
+  while index > 0 {
+    index = index - 1
+    let mut doubled = match rest.add(&rest) {
+      Result<Natural, ModularError>.Success { value } => value
+      Result<Natural, ModularError>.Failure { .. } => Intrinsic.trap("DSA quotient")
+    }
+    if dividend.bit(index) == 1 {
+      doubled = match doubled.add(&one) {
+        Result<Natural, ModularError>.Success { value } => value
+        Result<Natural, ModularError>.Failure { .. } => Intrinsic.trap("DSA quotient")
+      }
+    }
+    if !doubled.lessThan(divisor) {
+      doubled = match doubled.subtract(divisor) {
+        Result<Natural, ModularError>.Success { value } => value
+        Result<Natural, ModularError>.Failure { .. } => Intrinsic.trap("DSA quotient")
+      }
+      let at = length - 1 - index / 8
+      bytes[at] = u8.bitOr(bytes[at], u32.toU8(u32.shiftLeft(1, usize.toU32(index % 8))))
+    }
+    rest = resized(&doubled, divisor.wordLength() + 1)
+  }
+  return natural(Slice.view<u8>(&bytes, 0, length))
+}
+
+// A uniform value from 1 to q - 1, from qLength + 8 random bytes reduced modulo q - 1 (FIPS
+// 186-4 B.1.1). The time does not depend on the value.
+effect fn randomScalar(parameters: &DsaParameters) -> Natural
+  ? &mut Random {
+  let mut bytes: [u8; 40] = [0; 40]
+  let length = parameters.qLength + 8
+  run Random.fillBytes(Slice.viewMut<u8>(&mut bytes, 0, length))
+  let wide = natural(Slice.view<u8>(&bytes, 0, length))
+  let qValue = parameters.q.natural()
+  let below = match qValue.subtract(&Natural.fromU64(1)) {
+    Result<Natural, ModularError>.Success { value } => value
+    Result<Natural, ModularError>.Failure { .. } => Intrinsic.trap("DSA q")
+  }
+  let reduced = match wide.remainder(&below) {
+    Result<Natural, ModularError>.Success { value } => value
+    Result<Natural, ModularError>.Failure { .. } => Intrinsic.trap("DSA q")
+  }
+  let scalar = match reduced.add(&Natural.fromU64(1)) {
+    Result<Natural, ModularError>.Success { value } => value
+    Result<Natural, ModularError>.Failure { .. } => Intrinsic.trap("DSA q")
+  }
+  return resized(&scalar, parameters.q.wordLength())
+}
+
+// The leftmost bytes of the digest, at most as many as q has, reduced modulo q.
+fn digestValue(parameters: &DsaParameters, digest: &[u8]) -> Natural {
+  let mut length = digest.length
+  if length > parameters.qLength {
+    length = parameters.qLength
+  }
+  let value = natural(Slice.view<u8>(digest, 0, length))
+  return parameters.q.reduce(&value)
+}
+
+fn publicFor(parameters: &DsaParameters, x: &Natural) -> Natural {
+  return parameters.p.power(&parameters.g, x)
+}
+
+impl DsaParameters {
+  /// Returns new parameters with a `p` of `pBits` bits and a `q` of `qBits` bits, from the ambient
+  /// `Random`, as `generateKeyPair('dsa')` and `generateKeyPair('dsa', { divisorLength })` do in
+  /// Node.js.
+  ///
+  /// `q` is a random prime of `qBits` bits, `p` a random prime of `pBits` bits with `p = 1` modulo
+  /// `2q`, both tested with [`Prime.recommendedRounds`] of Miller-Rabin, and `g` is
+  /// `h^((p - 1) / q) mod p` for the first `h` from 2 up that does not give 1 (FIPS 186-4 A.2.1).
+  ///
+  /// # Errors
+  /// - `InvalidParameters` if `pBits` is not 512 to 8192, or `qBits` is not 160, 224, or 256.
+  ///
+  /// # Gotchas
+  /// It takes a random time, about a second for 2048 bits and much longer for 3072 bits. The
+  /// primes do not come from a seed, so they cannot be verified as FIPS 186-4 A.1.1.2 primes can.
+  pub effect fn generate(pBits: usize, qBits: usize) -> DsaParameters
+    ! DsaError
+    ? &mut Random {
+    if pBits < 512 || pBits > 8192 || !validQBits(qBits) {
+      fail DsaError.InvalidParameters
+    }
+    let plain = PrimeOptions {
+      safe: false,
+      add: Option<Natural>.none(),
+      remainder: Option<Natural>.none(),
+    }
+    let qValue = match run Prime.generate(qBits, &plain) {
+      Result<Natural, PrimeError>.Success { value } => value
+      Result<Natural, PrimeError>.Failure { .. } => Intrinsic.trap("DSA q generation")
+    }
+    let step = match qValue.add(&qValue) {
+      Result<Natural, ModularError>.Success { value } => value
+      Result<Natural, ModularError>.Failure { .. } => Intrinsic.trap("DSA q generation")
+    }
+    let stepped = PrimeOptions {
+      safe: false,
+      add: Option<Natural>.some(step),
+      remainder: Option<Natural>.some(Natural.fromU64(1)),
+    }
+    let pValue = match run Prime.generate(pBits, &stepped) {
+      Result<Natural, PrimeError>.Success { value } => value
+      Result<Natural, PrimeError>.Failure { .. } => Intrinsic.trap("DSA p generation")
+    }
+    let pModulus = match modulusOf(&pValue) {
+      Option<Modulus>.Some { value } => value
+      Option<Modulus>.None => Intrinsic.trap("DSA p generation")
+    }
+    let qModulus = match modulusOf(&qValue) {
+      Option<Modulus>.Some { value } => value
+      Option<Modulus>.None => Intrinsic.trap("DSA q generation")
+    }
+    let below = match pValue.subtract(&Natural.fromU64(1)) {
+      Result<Natural, ModularError>.Success { value } => value
+      Result<Natural, ModularError>.Failure { .. } => Intrinsic.trap("DSA p generation")
+    }
+    let cofactor = quotient(&below, &qValue)
+    let length = pModulus.wordLength()
+    let one = resized(&Natural.fromU64(1), length)
+    let mut h: u64 = 2
+    while true {
+      let base = resized(&Natural.fromU64(h), length)
+      let g = pModulus.powerPublic(&base, &cofactor)
+      if !g.equals(&one) {
+        return DsaParameters {
+          p: pModulus,
+          q: qModulus,
+          g: g,
+          pLength: (pBits + 7) / 8,
+          qLength: (qBits + 7) / 8,
+        }
+      }
+      h = h + 1
+    }
+    return Intrinsic.trap("DsaParameters.generate: the loop returns")
+  }
+
+  /// Returns the parameters for the big-endian `p`, `q`, and `g`. Leading zero bytes are allowed.
+  ///
+  /// # Errors
+  /// - `InvalidParameters` if `p` is not an odd number of 512 to 8192 bits, `q` is not an odd
+  ///   number of 160, 224, or 256 bits, or `g` is not from 2 to `p - 1`.
+  ///
+  /// # Gotchas
+  /// It does not check that `p` and `q` are prime, that `q` divides `p - 1`, or that `g` has
+  /// order `q`.
+  pub fn fromComponents(p: &[u8], q: &[u8], g: &[u8]) -> Result<DsaParameters, DsaError> {
+    return parametersFrom(p, q, g)
+  }
+
+  /// Returns the number of bits of `p`, as `modulusLength` in Node.js.
+  pub fn primeBits(self: &Self) -> usize {
+    return self.p.bitLength()
+  }
+
+  /// Returns the number of bits of `q`, as `divisorLength` in Node.js.
+  pub fn divisorBits(self: &Self) -> usize {
+    return self.q.bitLength()
+  }
+
+  /// Returns the length of `p` in bytes, which is the length of a public value `y`.
+  pub fn primeLength(self: &Self) -> usize {
+    return self.pLength
+  }
+
+  /// Returns the length of `q` in bytes, which is the length of a secret `x` and of each half of
+  /// a signature.
+  pub fn divisorLength(self: &Self) -> usize {
+    return self.qLength
+  }
+
+  /// Returns the length in bytes of a signature in the `r || s` form: twice
+  /// [`DsaParameters.divisorLength`].
+  pub fn signatureLength(self: &Self) -> usize {
+    return 2 * self.qLength
+  }
+
+  /// Returns `p` as a number.
+  pub fn prime(self: &Self) -> Natural {
+    return self.p.natural()
+  }
+
+  /// Returns `q` as a number.
+  pub fn divisor(self: &Self) -> Natural {
+    return self.q.natural()
+  }
+
+  /// Returns `g` as a number, with the word length of `p`.
+  pub fn generator(self: &Self) -> Natural {
+    return self.g
+  }
+}
+
+impl DsaPublicKey {
+  /// Returns the public key for `parameters` and the big-endian public value `y`. Leading zero
+  /// bytes are allowed.
+  ///
+  /// # Errors
+  /// - `InvalidKey` if `y` is not from 2 to `p - 1`.
+  pub fn fromComponents(parameters: &DsaParameters, y: &[u8]) -> Result<DsaPublicKey, DsaError> {
+    let bytes = significant(y)
+    if bytes.length > BLOCK {
+      return Result<DsaPublicKey, DsaError>.failResult(DsaError.InvalidKey)
+    }
+    let value = natural(bytes)
+    let pValue = parameters.p.natural()
+    if value.lessThan(&Natural.fromU64(2)) || !value.lessThan(&pValue) {
+      return Result<DsaPublicKey, DsaError>.failResult(DsaError.InvalidKey)
+    }
+    return Result<DsaPublicKey, DsaError>.succeed(
+      DsaPublicKey { domain: parameters.*, y: resized(&value, parameters.p.wordLength()) },
+    )
+  }
+
+  /// Returns the parameters of the key.
+  pub fn parameters(self: &Self) -> DsaParameters {
+    return self.domain
+  }
+
+  /// Returns the public value `y`, with the word length of `p`.
+  pub fn publicValue(self: &Self) -> Natural {
+    return self.y
+  }
+
+  /// Checks that `signature` is a valid signature in the `r || s` form of the message with the
+  /// digest `digest`.
+  ///
+  /// A digest longer than `q` keeps its leftmost [`DsaParameters.divisorLength`] bytes. The time
+  /// depends on the values, which are all public.
+  ///
+  /// # Errors
+  /// - `InvalidLength` if `signature` is not [`DsaParameters.signatureLength`] bytes.
+  /// - `InvalidSignature` if `r` or `s` is not from 1 to `q - 1`, or the signature does not
+  ///   match.
+  pub fn verifyDigest(self: &Self, digest: &[u8], signature: &[u8]) -> Result<(), DsaError> {
+    let parameters = &self.domain
+    let half = parameters.qLength
+    if signature.length != 2 * half {
+      return Result<(), DsaError>.failResult(DsaError.InvalidLength)
+    }
+    let qValue = parameters.q.natural()
+    let length = parameters.q.wordLength()
+    let r = resized(&natural(Slice.view<u8>(signature, 0, half)), length)
+    let s = resized(&natural(Slice.view<u8>(signature, half, half)), length)
+    if r.isZero() || s.isZero() || !r.lessThan(&qValue) || !s.lessThan(&qValue) {
+      return Result<(), DsaError>.failResult(DsaError.InvalidSignature)
+    }
+    let q = &parameters.q
+    let w = q.invertPrime(&s)
+    let z = digestValue(parameters, digest)
+    let first = q.multiply(&z, &w)
+    let second = q.multiply(&r, &w)
+    let p = &parameters.p
+    let left = p.powerPublic(&parameters.g, &first)
+    let right = p.powerPublic(&self.y, &second)
+    let v = q.reduce(&p.multiply(&left, &right))
+    if !v.equals(&r) {
+      return Result<(), DsaError>.failResult(DsaError.InvalidSignature)
+    }
+    return Result<(), DsaError>.succeed(())
+  }
+}
+
+impl DsaPrivateKey {
+  /// Returns a new key for `parameters`, with a secret from the ambient `Random`.
+  ///
+  /// The secret is uniform from 1 to `q - 1` (FIPS 186-4 B.1.1). The time does not depend on the
+  /// secret. The `Random` provider must be cryptographically secure.
+  pub effect fn generate(parameters: &DsaParameters) -> DsaPrivateKey
+    ? &mut Random {
+    let x = run randomScalar(parameters)
+    return DsaPrivateKey {
+      public: DsaPublicKey { domain: parameters.*, y: publicFor(parameters, &x) },
+      x: x,
+    }
+  }
+
+  /// Returns the private key for `parameters` and the big-endian secret `x`, and computes its
+  /// public value. Leading zero bytes are allowed.
+  ///
+  /// # Errors
+  /// - `InvalidKey` if `x` is not from 1 to `q - 1`.
+  pub fn fromComponents(parameters: &DsaParameters, x: &[u8]) -> Result<DsaPrivateKey, DsaError> {
+    if x.length > BLOCK {
+      return Result<DsaPrivateKey, DsaError>.failResult(DsaError.InvalidKey)
+    }
+    let value = natural(x)
+    let qValue = parameters.q.natural()
+    if value.isZero() || !value.lessThan(&qValue) {
+      return Result<DsaPrivateKey, DsaError>.failResult(DsaError.InvalidKey)
+    }
+    let secret = resized(&parameters.q.reduce(&value), parameters.q.wordLength())
+    return Result<DsaPrivateKey, DsaError>.succeed(
+      DsaPrivateKey {
+        public: DsaPublicKey { domain: parameters.*, y: publicFor(parameters, &secret) },
+        x: secret,
+      },
+    )
+  }
+
+  /// Returns the parameters of the key.
+  pub fn parameters(self: &Self) -> DsaParameters {
+    return self.public.domain
+  }
+
+  /// Returns the public half of the key.
+  pub fn publicKey(self: &Self) -> DsaPublicKey {
+    return self.public
+  }
+
+  /// Returns the secret `x`, with the word length of `q`.
+  ///
+  /// # Gotchas
+  /// The value is the private key. Keep it secret.
+  pub fn secret(self: &Self) -> Natural {
+    return self.x
+  }
+
+  /// Signs the message with the digest `digest` and writes the signature to `signature` in the
+  /// `r || s` form. It reads the per-signature secret `k` from the ambient `Random`.
+  ///
+  /// A digest longer than `q` keeps its leftmost [`DsaParameters.divisorLength`] bytes, as
+  /// OpenSSL does. The time does not depend on `x` or `k`.
+  ///
+  /// # Errors
+  /// - `InvalidLength` if `signature` is not [`DsaParameters.signatureLength`] bytes.
+  ///
+  /// # Gotchas
+  /// The `Random` provider must be cryptographically secure: a repeated or biased `k` reveals
+  /// the private key.
+  pub effect fn signDigest(self: &Self, digest: &[u8], signature: &mut [u8]) -> ()
+    ! DsaError
+    ? &mut Random {
+    let parameters = &self.public.domain
+    let half = parameters.qLength
+    if signature.length != 2 * half {
+      fail DsaError.InvalidLength
+    }
+    let q = &parameters.q
+    let z = digestValue(parameters, digest)
+    while true {
+      let k = run randomScalar(parameters)
+      let r = q.reduce(&parameters.p.power(&parameters.g, &k))
+      if r.isZero() {
+        continue
+      }
+      let inverse = q.invertPrime(&k)
+      let s = q.multiply(&inverse, &q.add(&z, &q.multiply(&self.x, &r)))
+      if s.isZero() {
+        continue
+      }
+      writeFixed(&r, Slice.viewMut<u8>(&mut signature, 0, half))
+      writeFixed(&s, Slice.viewMut<u8>(&mut signature, half, half))
+      return ()
+    }
+  }
+}
+
+impl DsaSignature {
+  /// Returns the length of the DER form of the `r || s` signature `signature`.
+  ///
+  /// # Gotchas
+  /// The program traps if `signature` has an odd length or is longer than 64 bytes.
+  pub fn derLength(signature: &[u8]) -> usize {
+    let half = halfOf(signature)
+    let content = signatureContentLength(signature, half)
+    return headerLength(content) + content
+  }
+
+  /// Writes the DER form of the `r || s` signature `signature` to the start of `output`, and
+  /// returns its length, which is [`DsaSignature.derLength`].
+  ///
+  /// The bytes of `output` after the DER do not change.
+  ///
+  /// # Errors
+  /// - `InvalidLength` if `output` is shorter than the DER.
+  ///
+  /// # Gotchas
+  /// The program traps if `signature` has an odd length or is longer than 64 bytes.
+  pub fn toDer(signature: &[u8], output: &mut [u8]) -> Result<usize, DsaError> {
+    let half = halfOf(signature)
+    let content = signatureContentLength(signature, half)
+    let total = headerLength(content) + content
+    if output.length < total {
+      return Result<usize, DsaError>.failResult(DsaError.InvalidLength)
+    }
+    let mut at = writeHeader(&mut output, 0, 48, content)
+    at = writeBytesInteger(&mut output, at, Slice.view<u8>(signature, 0, half))
+    at = writeBytesInteger(&mut output, at, Slice.view<u8>(signature, half, half))
+    return Result<usize, DsaError>.succeed(at)
+  }
+
+  /// Reads the DER signature `der` and writes it to all of `output` in the `r || s` form, each
+  /// half `output.length / 2` bytes, such as [`DsaParameters.signatureLength`].
+  ///
+  /// # Errors
+  /// - `InvalidEncoding` if `der` is not strict DER of two non-negative integers.
+  /// - `InvalidSignature` if `r` or `s` is 0 or does not fit in half of `output`.
+  /// - `InvalidLength` if `output` has an odd length.
+  pub fn fromDer(der: &[u8], output: &mut [u8]) -> Result<(), DsaError> {
+    if output.length % 2 != 0 {
+      return Result<(), DsaError>.failResult(DsaError.InvalidLength)
+    }
+    let half = output.length / 2
+    let sequence = readDer(der, 0, der.length, 48)
+    if !sequence.valid || sequence.end != der.length {
+      return Result<(), DsaError>.failResult(DsaError.InvalidEncoding)
+    }
+    let r = readInteger(der, sequence.start, sequence.end)
+    if !r.valid {
+      return Result<(), DsaError>.failResult(DsaError.InvalidEncoding)
+    }
+    let s = readInteger(der, r.end, sequence.end)
+    if !s.valid || s.end != sequence.end {
+      return Result<(), DsaError>.failResult(DsaError.InvalidEncoding)
+    }
+    let rBytes = significant(integerBytes(der, &r))
+    let sBytes = significant(integerBytes(der, &s))
+    if rBytes.length == 0 || sBytes.length == 0 || rBytes.length > half || sBytes.length > half {
+      return Result<(), DsaError>.failResult(DsaError.InvalidSignature)
+    }
+    let mut i: usize = 0
+    while i < output.length {
+      output[i] = 0
+      i = i + 1
+    }
+    i = 0
+    while i < rBytes.length {
+      output[half - rBytes.length + i] = rBytes[i]
+      i = i + 1
+    }
+    i = 0
+    while i < sBytes.length {
+      output[output.length - sBytes.length + i] = sBytes[i]
+      i = i + 1
+    }
+    return Result<(), DsaError>.succeed(())
+  }
+}
+
+fn halfOf(signature: &[u8]) -> usize {
+  if signature.length % 2 != 0 || signature.length > 64 {
+    Intrinsic.trap("DsaSignature: the signature is not r || s")
+  }
+  return signature.length / 2
+}
+
+// The content length of a DER INTEGER for big-endian bytes: no leading zeros, and a sign byte
+// when the top bit is set.
+fn bytesIntegerContentLength(bytes: &[u8]) -> usize {
+  let value = significant(bytes)
+  if value.length == 0 {
+    return 1
+  }
+  if value[0] >= 128 {
+    return value.length + 1
+  }
+  return value.length
+}
+
+fn signatureContentLength(signature: &[u8], half: usize) -> usize {
+  let r = bytesIntegerContentLength(Slice.view<u8>(signature, 0, half))
+  let s = bytesIntegerContentLength(Slice.view<u8>(signature, half, half))
+  return headerLength(r) + r + headerLength(s) + s
+}
+
+fn writeBytesInteger(output: &mut [u8], position: usize, bytes: &[u8]) -> usize {
+  let value = significant(bytes)
+  let content = bytesIntegerContentLength(bytes)
+  let mut at = writeHeader(&mut output, position, 2, content)
+  if content > value.length {
+    output[at] = 0
+    at = at + 1
+  }
+  let mut i: usize = 0
+  while i < value.length {
+    output[at + i] = value[i]
+    i = i + 1
+  }
+  return at + value.length
+}
+
+// DER.
+
+struct DerValue {
+  start: usize,
+  end: usize,
+  valid: bool,
+}
+
+fn invalidDer() -> DerValue {
+  return DerValue { start: 0, end: 0, valid: false }
+}
+
+fn readDer(bytes: &[u8], offset: usize, limit: usize, tag: u8) -> DerValue {
+  if limit > bytes.length || offset >= limit || limit - offset < 2 {
+    return invalidDer()
+  }
+  if bytes[offset] != tag {
+    return invalidDer()
+  }
+  let first = bytes[offset + 1]
+  let mut start = offset + 2
+  let mut length = u8.toUsize(first)
+  if first >= 128 {
+    let count = u8.toUsize(first - 128)
+    if count == 0 || count > 4 || count > limit - start || bytes[start] == 0 {
+      return invalidDer()
+    }
+    length = 0
+    let mut i: usize = 0
+    while i < count {
+      length = length * 256 + u8.toUsize(bytes[start + i])
+      i = i + 1
+    }
+    if length < 128 {
+      return invalidDer()
+    }
+    start = start + count
+  }
+  if length > limit - start {
+    return invalidDer()
+  }
+  return DerValue { start: start, end: start + length, valid: true }
+}
+
+// Reads a minimal, non-negative DER INTEGER. `start` skips the sign byte of a value whose top
+// bit is set.
+fn readInteger(bytes: &[u8], offset: usize, limit: usize) -> DerValue {
+  let value = readDer(bytes, offset, limit, 2)
+  if !value.valid || value.start == value.end || bytes[value.start] >= 128 {
+    return invalidDer()
+  }
+  if bytes[value.start] == 0 && value.end - value.start > 1 {
+    if bytes[value.start + 1] < 128 {
+      return invalidDer()
+    }
+    return DerValue { start: value.start + 1, end: value.end, valid: true }
+  }
+  return move value
+}
+
+fn integerBytes<'bytes>(bytes: &'bytes [u8], value: &DerValue) -> &'bytes [u8] {
+  return Slice.view<u8>(bytes, value.start, value.end - value.start)
+}
+
+fn headerLength(length: usize) -> usize {
+  if length < 128 {
+    return 2
+  }
+  if length < 256 {
+    return 3
+  }
+  if length < 65536 {
+    return 4
+  }
+  return 5
+}
+
+fn writeHeader(output: &mut [u8], position: usize, tag: u8, length: usize) -> usize {
+  output[position] = tag
+  let size = headerLength(length)
+  if size == 2 {
+    output[position + 1] = usize.toU8(length)
+    return position + 2
+  }
+  output[position + 1] = usize.toU8(128 + size - 2)
+  let mut i: usize = 0
+  while i < size - 2 {
+    let shift = 8 * (size - 3 - i)
+    output[position + 2 + i] = usize.toU8(usize.bitAnd(usize.shiftRight(length, shift), 255))
+    i = i + 1
+  }
+  return position + size
+}
+
+// The content length of a DER INTEGER for the value: its bytes and a sign byte when the top bit
+// is set, which together is always the bit length / 8 + 1.
+fn integerContentLength(value: &Natural) -> usize {
+  return value.bitLength() / 8 + 1
+}
+
+fn integerLength(value: &Natural) -> usize {
+  let content = integerContentLength(value)
+  return headerLength(content) + content
+}
+
+fn writeInteger(output: &mut [u8], position: usize, value: &Natural) -> usize {
+  let content = integerContentLength(value)
+  let start = writeHeader(&mut output, position, 2, content)
+  writeFixed(value, Slice.viewMut<u8>(&mut output, start, content))
+  return start + content
+}
+
+fn writeBytes(output: &mut [u8], position: usize, bytes: &[u8]) -> usize {
+  let mut i: usize = 0
+  while i < bytes.length {
+    output[position + i] = bytes[i]
+    i = i + 1
+  }
+  return position + bytes.length
+}
+
+// The DER OBJECT IDENTIFIER of id-dsa, 1.2.840.10040.4.1.
+fn dsaOid() -> [u8; 9] {
+  return [6, 7, 42, 134, 72, 206, 56, 4, 1]
+}
+
+fn parametersContentLength(parameters: &DsaParameters) -> usize {
+  return integerLength(&parameters.p.natural()) + integerLength(&parameters.q.natural())
+    + integerLength(&parameters.g)
+}
+
+fn parametersLength(parameters: &DsaParameters) -> usize {
+  let content = parametersContentLength(parameters)
+  return headerLength(content) + content
+}
+
+fn writeParameters(parameters: &DsaParameters, output: &mut [u8], position: usize) -> usize {
+  let mut at = writeHeader(&mut output, position, 48, parametersContentLength(parameters))
+  at = writeInteger(&mut output, at, &parameters.p.natural())
+  at = writeInteger(&mut output, at, &parameters.q.natural())
+  return writeInteger(&mut output, at, &parameters.g)
+}
+
+fn algorithmContentLength(parameters: &DsaParameters) -> usize {
+  return 9 + parametersLength(parameters)
+}
+
+fn algorithmLength(parameters: &DsaParameters) -> usize {
+  let content = algorithmContentLength(parameters)
+  return headerLength(content) + content
+}
+
+fn writeAlgorithm(parameters: &DsaParameters, output: &mut [u8], position: usize) -> usize {
+  let mut at = writeHeader(&mut output, position, 48, algorithmContentLength(parameters))
+  at = writeBytes(&mut output, at, &dsaOid())
+  return writeParameters(parameters, &mut output, at)
+}
+
+// Reads Dss-Parms: SEQUENCE { p INTEGER, q INTEGER, g INTEGER } that ends at `limit`.
+fn readParameters(der: &[u8], offset: usize, limit: usize) -> Result<DsaParameters, DsaError> {
+  let sequence = readDer(der, offset, limit, 48)
+  if !sequence.valid || sequence.end != limit {
+    return Result<DsaParameters, DsaError>.failResult(DsaError.InvalidEncoding)
+  }
+  let p = readInteger(der, sequence.start, sequence.end)
+  if !p.valid {
+    return Result<DsaParameters, DsaError>.failResult(DsaError.InvalidEncoding)
+  }
+  let q = readInteger(der, p.end, sequence.end)
+  if !q.valid {
+    return Result<DsaParameters, DsaError>.failResult(DsaError.InvalidEncoding)
+  }
+  let g = readInteger(der, q.end, sequence.end)
+  if !g.valid || g.end != sequence.end {
+    return Result<DsaParameters, DsaError>.failResult(DsaError.InvalidEncoding)
+  }
+  return parametersFrom(integerBytes(der, &p), integerBytes(der, &q), integerBytes(der, &g))
+}
+
+// Reads AlgorithmIdentifier { id-dsa, Dss-Parms } that ends at `limit`.
+fn readAlgorithm(der: &[u8], offset: usize, limit: usize) -> Result<DsaParameters, DsaError> {
+  let sequence = readDer(der, offset, limit, 48)
+  if !sequence.valid || sequence.end != limit {
+    return Result<DsaParameters, DsaError>.failResult(DsaError.InvalidEncoding)
+  }
+  let oid = dsaOid()
+  if sequence.end - sequence.start < oid.length {
+    return Result<DsaParameters, DsaError>.failResult(DsaError.InvalidEncoding)
+  }
+  let mut i: usize = 0
+  while i < oid.length {
+    if der[sequence.start + i] != oid[i] {
+      return Result<DsaParameters, DsaError>.failResult(DsaError.InvalidEncoding)
+    }
+    i = i + 1
+  }
+  return readParameters(der, sequence.start + oid.length, sequence.end)
+}
+
+fn checkOutput(available: usize, length: usize) -> Result<(), DsaError> {
+  if available < length {
+    return Result<(), DsaError>.failResult(DsaError.InvalidLength)
+  }
+  return Result<(), DsaError>.succeed(())
+}
+
+impl DsaParameters {
+  /// Reads the DER `Dss-Parms` `der`: `SEQUENCE { p, q, g }`, the content of a `DSA PARAMETERS`
+  /// PEM block.
+  ///
+  /// # Errors
+  /// - `InvalidEncoding` if `der` is not strict DER of three non-negative integers.
+  /// - `InvalidParameters` if the values are not valid for [`DsaParameters.fromComponents`].
+  pub fn fromDer(der: &[u8]) -> Result<DsaParameters, DsaError> {
+    return readParameters(der, 0, der.length)
+  }
+
+  /// Returns the length of the DER `Dss-Parms` of the parameters.
+  pub fn derLength(self: &Self) -> usize {
+    return parametersLength(self)
+  }
+
+  /// Writes the DER `Dss-Parms` of the parameters to the start of `output`, and returns its
+  /// length, which is [`DsaParameters.derLength`].
+  ///
+  /// # Errors
+  /// - `InvalidLength` if `output` is shorter than the DER.
+  pub fn writeDer(self: &Self, output: &mut [u8]) -> Result<usize, DsaError> {
+    if let Result<(), DsaError>.Failure { error } = checkOutput(output.length, parametersLength(self)) {
+      return Result<usize, DsaError>.failResult(error)
+    }
+    return Result<usize, DsaError>.succeed(writeParameters(self, &mut output, 0))
+  }
+}
+
+fn spkiKeyContentLength(key: &DsaPublicKey) -> usize {
+  // The BIT STRING holds its unused-bit count and the INTEGER y.
+  return 1 + integerLength(&key.y)
+}
+
+fn spkiContentLength(key: &DsaPublicKey) -> usize {
+  let bits = spkiKeyContentLength(key)
+  return algorithmLength(&key.domain) + headerLength(bits) + bits
+}
+
+fn pkcs8KeyContentLength(key: &DsaPrivateKey) -> usize {
+  return integerLength(&key.x)
+}
+
+fn pkcs8ContentLength(key: &DsaPrivateKey) -> usize {
+  let octets = pkcs8KeyContentLength(key)
+  return 3 + algorithmLength(&key.public.domain) + headerLength(octets) + octets
+}
+
+fn traditionalContentLength(key: &DsaPrivateKey) -> usize {
+  let parameters = &key.public.domain
+  return 3 + integerLength(&parameters.p.natural()) + integerLength(&parameters.q.natural())
+    + integerLength(&parameters.g) + integerLength(&key.public.y) + integerLength(&key.x)
+}
+
+fn privateWithPublic(parameters: &DsaParameters, x: &[u8], y: &[u8]) -> Result<
+  DsaPrivateKey,
+  DsaError,
+> {
+  let key = match DsaPrivateKey.fromComponents(parameters, x) {
+    Result<DsaPrivateKey, DsaError>.Success { value } => value
+    Result<DsaPrivateKey, DsaError>.Failure { error } => {
+      return Result<DsaPrivateKey, DsaError>.failResult(error)
+    }
+  }
+  let given = natural(significant(y))
+  if !given.equals(&key.public.y) {
+    return Result<DsaPrivateKey, DsaError>.failResult(DsaError.InvalidKey)
+  }
+  return Result<DsaPrivateKey, DsaError>.succeed(key)
+}
+
+impl DsaPublicKey {
+  /// Reads the DER SubjectPublicKeyInfo `der` of a DSA key, with the `id-dsa` algorithm and its
+  /// `Dss-Parms`, as Node.js exports with `type: 'spki'`.
+  ///
+  /// # Errors
+  /// - `InvalidEncoding` if `der` is not strict DER, names another algorithm, or has no
+  ///   parameters.
+  /// - `InvalidParameters` if the parameters are not valid.
+  /// - `InvalidKey` if `y` is not from 2 to `p - 1`.
+  pub fn fromSpkiDer(der: &[u8]) -> Result<DsaPublicKey, DsaError> {
+    let sequence = readDer(der, 0, der.length, 48)
+    if !sequence.valid || sequence.end != der.length {
+      return Result<DsaPublicKey, DsaError>.failResult(DsaError.InvalidEncoding)
+    }
+    let algorithm = readDer(der, sequence.start, sequence.end, 48)
+    if !algorithm.valid {
+      return Result<DsaPublicKey, DsaError>.failResult(DsaError.InvalidEncoding)
+    }
+    let parameters = match readAlgorithm(der, sequence.start, algorithm.end) {
+      Result<DsaParameters, DsaError>.Success { value } => value
+      Result<DsaParameters, DsaError>.Failure { error } => {
+        return Result<DsaPublicKey, DsaError>.failResult(error)
+      }
+    }
+    let bits = readDer(der, algorithm.end, sequence.end, 3)
+    if !bits.valid || bits.end != sequence.end || bits.start == bits.end || der[bits.start] != 0 {
+      return Result<DsaPublicKey, DsaError>.failResult(DsaError.InvalidEncoding)
+    }
+    let y = readInteger(der, bits.start + 1, bits.end)
+    if !y.valid || y.end != bits.end {
+      return Result<DsaPublicKey, DsaError>.failResult(DsaError.InvalidEncoding)
+    }
+    return DsaPublicKey.fromComponents(&parameters, integerBytes(der, &y))
+  }
+
+  /// Returns the length of the DER SubjectPublicKeyInfo of the key.
+  pub fn spkiDerLength(self: &Self) -> usize {
+    let content = spkiContentLength(self)
+    return headerLength(content) + content
+  }
+
+  /// Writes the DER SubjectPublicKeyInfo of the key to the start of `output`, and returns its
+  /// length, which is [`DsaPublicKey.spkiDerLength`].
+  ///
+  /// # Errors
+  /// - `InvalidLength` if `output` is shorter than the DER.
+  pub fn writeSpkiDer(self: &Self, output: &mut [u8]) -> Result<usize, DsaError> {
+    if let Result<(), DsaError>.Failure { error } = checkOutput(output.length, self.spkiDerLength()) {
+      return Result<usize, DsaError>.failResult(error)
+    }
+    let mut at = writeHeader(&mut output, 0, 48, spkiContentLength(self))
+    at = writeAlgorithm(&self.domain, &mut output, at)
+    at = writeHeader(&mut output, at, 3, spkiKeyContentLength(self))
+    output[at] = 0
+    at = writeInteger(&mut output, at + 1, &self.y)
+    return Result<usize, DsaError>.succeed(at)
+  }
+}
+
+impl DsaPrivateKey {
+  /// Reads the DER PKCS #8 PrivateKeyInfo `der` of a DSA key, with the `id-dsa` algorithm and
+  /// its `Dss-Parms` and the secret as an `INTEGER`, as Node.js exports with `type: 'pkcs8'`.
+  ///
+  /// It computes the public value from the secret. Version 1 keys, attributes, and a public key
+  /// field (RFC 5958) are accepted and the public key field is ignored.
+  ///
+  /// # Errors
+  /// - `InvalidEncoding` if `der` is not strict DER or names another algorithm.
+  /// - `InvalidParameters` if the parameters are not valid.
+  /// - `InvalidKey` if `x` is not from 1 to `q - 1`.
+  pub fn fromPkcs8Der(der: &[u8]) -> Result<DsaPrivateKey, DsaError> {
+    let sequence = readDer(der, 0, der.length, 48)
+    if !sequence.valid || sequence.end != der.length {
+      return Result<DsaPrivateKey, DsaError>.failResult(DsaError.InvalidEncoding)
+    }
+    let version = readInteger(der, sequence.start, sequence.end)
+    if !version.valid || version.end - version.start != 1 || der[version.start] > 1 {
+      return Result<DsaPrivateKey, DsaError>.failResult(DsaError.InvalidEncoding)
+    }
+    let algorithm = readDer(der, version.end, sequence.end, 48)
+    if !algorithm.valid {
+      return Result<DsaPrivateKey, DsaError>.failResult(DsaError.InvalidEncoding)
+    }
+    let parameters = match readAlgorithm(der, version.end, algorithm.end) {
+      Result<DsaParameters, DsaError>.Success { value } => value
+      Result<DsaParameters, DsaError>.Failure { error } => {
+        return Result<DsaPrivateKey, DsaError>.failResult(error)
+      }
+    }
+    let octets = readDer(der, algorithm.end, sequence.end, 4)
+    if !octets.valid {
+      return Result<DsaPrivateKey, DsaError>.failResult(DsaError.InvalidEncoding)
+    }
+    let x = readInteger(der, octets.start, octets.end)
+    if !x.valid || x.end != octets.end {
+      return Result<DsaPrivateKey, DsaError>.failResult(DsaError.InvalidEncoding)
+    }
+    let mut offset = octets.end
+    let attributes = readDer(der, offset, sequence.end, 160)
+    if attributes.valid {
+      offset = attributes.end
+    }
+    let publicKey = readDer(der, offset, sequence.end, 129)
+    if publicKey.valid {
+      offset = publicKey.end
+    }
+    if offset != sequence.end {
+      return Result<DsaPrivateKey, DsaError>.failResult(DsaError.InvalidEncoding)
+    }
+    return DsaPrivateKey.fromComponents(&parameters, integerBytes(der, &x))
+  }
+
+  /// Returns the length of the DER PKCS #8 PrivateKeyInfo of the key.
+  pub fn pkcs8DerLength(self: &Self) -> usize {
+    let content = pkcs8ContentLength(self)
+    return headerLength(content) + content
+  }
+
+  /// Writes the DER PKCS #8 PrivateKeyInfo of the key, version 0 with the secret as an
+  /// `INTEGER`, to the start of `output`, and returns its length, which is
+  /// [`DsaPrivateKey.pkcs8DerLength`].
+  ///
+  /// # Errors
+  /// - `InvalidLength` if `output` is shorter than the DER.
+  pub fn writePkcs8Der(self: &Self, output: &mut [u8]) -> Result<usize, DsaError> {
+    if let Result<(), DsaError>.Failure { error } = checkOutput(output.length, self.pkcs8DerLength()) {
+      return Result<usize, DsaError>.failResult(error)
+    }
+    let mut at = writeHeader(&mut output, 0, 48, pkcs8ContentLength(self))
+    output[at] = 2
+    output[at + 1] = 1
+    output[at + 2] = 0
+    at = writeAlgorithm(&self.public.domain, &mut output, at + 3)
+    at = writeHeader(&mut output, at, 4, pkcs8KeyContentLength(self))
+    at = writeInteger(&mut output, at, &self.x)
+    return Result<usize, DsaError>.succeed(at)
+  }
+
+  /// Reads the DER OpenSSL DSA private key `der`: `SEQUENCE { 0, p, q, g, y, x }`, the content of
+  /// a `DSA PRIVATE KEY` PEM block.
+  ///
+  /// # Errors
+  /// - `InvalidEncoding` if `der` is not strict DER of six non-negative integers, or the version
+  ///   is not 0.
+  /// - `InvalidParameters` if the parameters are not valid.
+  /// - `InvalidKey` if `x` is not from 1 to `q - 1`, or `y` is not `g^x mod p`.
+  pub fn fromTraditionalDer(der: &[u8]) -> Result<DsaPrivateKey, DsaError> {
+    let sequence = readDer(der, 0, der.length, 48)
+    if !sequence.valid || sequence.end != der.length {
+      return Result<DsaPrivateKey, DsaError>.failResult(DsaError.InvalidEncoding)
+    }
+    let mut values: [DerValue; 6] = [invalidDer(), invalidDer(), invalidDer(), invalidDer(), invalidDer(), invalidDer()]
+    let mut offset = sequence.start
+    let mut i: usize = 0
+    while i < 6 {
+      let value = readInteger(der, offset, sequence.end)
+      if !value.valid {
+        return Result<DsaPrivateKey, DsaError>.failResult(DsaError.InvalidEncoding)
+      }
+      offset = value.end
+      values[i] = move value
+      i = i + 1
+    }
+    if offset != sequence.end || values[0].end - values[0].start != 1 || der[values[0].start] != 0 {
+      return Result<DsaPrivateKey, DsaError>.failResult(DsaError.InvalidEncoding)
+    }
+    let parameters = match parametersFrom(
+      integerBytes(der, &values[1]),
+      integerBytes(der, &values[2]),
+      integerBytes(der, &values[3]),
+    ) {
+      Result<DsaParameters, DsaError>.Success { value } => value
+      Result<DsaParameters, DsaError>.Failure { error } => {
+        return Result<DsaPrivateKey, DsaError>.failResult(error)
+      }
+    }
+    return privateWithPublic(&parameters, integerBytes(der, &values[5]), integerBytes(der, &values[4]))
+  }
+
+  /// Returns the length of the DER OpenSSL DSA private key of the key.
+  pub fn traditionalDerLength(self: &Self) -> usize {
+    let content = traditionalContentLength(self)
+    return headerLength(content) + content
+  }
+
+  /// Writes the DER OpenSSL DSA private key `SEQUENCE { 0, p, q, g, y, x }` of the key to the
+  /// start of `output`, and returns its length, which is [`DsaPrivateKey.traditionalDerLength`].
+  ///
+  /// # Errors
+  /// - `InvalidLength` if `output` is shorter than the DER.
+  pub fn writeTraditionalDer(self: &Self, output: &mut [u8]) -> Result<usize, DsaError> {
+    if let Result<(), DsaError>.Failure { error } = checkOutput(output.length, self.traditionalDerLength()) {
+      return Result<usize, DsaError>.failResult(error)
+    }
+    let parameters = &self.public.domain
+    let mut at = writeHeader(&mut output, 0, 48, traditionalContentLength(self))
+    output[at] = 2
+    output[at + 1] = 1
+    output[at + 2] = 0
+    at = writeInteger(&mut output, at + 3, &parameters.p.natural())
+    at = writeInteger(&mut output, at, &parameters.q.natural())
+    at = writeInteger(&mut output, at, &parameters.g)
+    at = writeInteger(&mut output, at, &self.public.y)
+    at = writeInteger(&mut output, at, &self.x)
+    return Result<usize, DsaError>.succeed(at)
+  }
+}

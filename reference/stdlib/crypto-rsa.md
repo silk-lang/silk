@@ -409,6 +409,34 @@ The message can have up to the modulus length less 11 bytes.
 Use it only for formats that require it. Prefer [`RsaPublicKey.encryptOaep`](#RsaPublicKey.impl.encryptOaep): PKCS #1 v1.5
 padding has a long history of padding-oracle attacks.
 
+<a id="RsaPublicKey.impl.recoverPkcs1Raw"></a>
+
+### Method `recoverPkcs1Raw`
+
+```silk
+pub fn recoverPkcs1Raw(self: &RsaPublicKey, signature: &[u8], output: &mut [u8]) -> Result<
+    usize,
+    RsaError,
+  >
+```
+
+Recovers the message of a signature made with PKCS #1 v1.5 type 1 padding over raw bytes,
+as `RSA_public_decrypt` with `RSA_PKCS1_PADDING` and `crypto.publicDecrypt` in Node.js do,
+and returns the length of the message that it writes to the start of `output`.
+
+The recovered block must be 0x00, 0x01, at least 8 bytes of 0xFF, 0x00, and the message.
+It is the inverse of [`RsaPrivateKey.signPkcs1Raw`](#RsaPrivateKey.impl.signPkcs1Raw). The message can have up to the modulus
+length less 11 bytes.
+
+#### Errors
+- `InvalidLength` if `signature` is not as long as the modulus, or `output` is shorter than
+  the message.
+- `InvalidSignature` if `signature` is not less than the modulus or the padding is not valid.
+
+#### Gotchas
+It does not check a digest. To verify a signature of a message, use
+[`RsaPublicKey.verifyPkcs1`](#RsaPublicKey.impl.verifyPkcs1).
+
 <a id="RsaPublicKey.impl.encryptRaw"></a>
 
 ### Method `encryptRaw`
@@ -418,7 +446,8 @@ pub fn encryptRaw(self: &RsaPublicKey, input: &[u8], output: &mut [u8]) -> Resul
 ```
 
 Computes `input`^e modulo n without padding (RSAEP, `RSA_NO_PADDING` in Node.js) and writes
-it to `output`.
+it to `output`. It is also the public operation of `crypto.publicDecrypt` with
+`RSA_NO_PADDING`.
 
 #### Errors
 - `InvalidLength` if `input` or `output` is not as long as the modulus.
@@ -631,6 +660,34 @@ ciphertext, so the errors do not reveal the plaintext.
 - `InvalidCiphertext` if the ciphertext is not valid.
 - `InvalidKey` if the private parts do not match the public key.
 
+<a id="RsaPrivateKey.impl.signPkcs1Raw"></a>
+
+### Method `signPkcs1Raw`
+
+```silk
+pub fn signPkcs1Raw(self: &RsaPrivateKey, message: &[u8], signature: &mut [u8]) -> Result<
+    (),
+    RsaError,
+  >
+```
+
+Signs `message` as raw bytes with PKCS #1 v1.5 type 1 padding, as `RSA_private_encrypt`
+with `RSA_PKCS1_PADDING` and `crypto.privateEncrypt` in Node.js do, and writes the signature
+to `signature`.
+
+The padded block is 0x00, 0x01, 0xFF bytes, 0x00, and the message, with no DigestInfo. The
+message can have up to the modulus length less 11 bytes. Recover it with
+[`RsaPublicKey.recoverPkcs1Raw`](#RsaPublicKey.impl.recoverPkcs1Raw).
+
+#### Errors
+- `InvalidLength` if `signature` is not as long as the modulus.
+- `MessageTooLong` if `message` is too long.
+- `InvalidKey` if the private parts do not match the public key.
+
+#### Gotchas
+It does not hash or encode a digest. To sign a message for [`RsaPublicKey.verifyPkcs1`](#RsaPublicKey.impl.verifyPkcs1),
+use [`RsaPrivateKey.signPkcs1`](#RsaPrivateKey.impl.signPkcs1).
+
 <a id="RsaPrivateKey.impl.decryptRaw"></a>
 
 ### Method `decryptRaw`
@@ -643,7 +700,8 @@ pub fn decryptRaw(self: &RsaPrivateKey, input: &[u8], output: &mut [u8]) -> Resu
 ```
 
 Computes `input`^d modulo n without padding (RSADP, `RSA_NO_PADDING` in Node.js) and writes
-it to `output`.
+it to `output`. It is also the private operation of `crypto.privateEncrypt` with
+`RSA_NO_PADDING`.
 
 #### Errors
 - `InvalidLength` if `input` or `output` is not as long as the modulus.
