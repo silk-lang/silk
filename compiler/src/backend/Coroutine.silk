@@ -25,6 +25,8 @@
 //! A frame never moves. Locals whose address can escape, and the places a suspended callee writes,
 //! stay in the frame for their whole lifetime. Every other local that lives across a point is saved
 //! into that point's resume state, and the states of different points share storage.
+//! Resident temporaries and bindings whose address nothing takes share storage with each other
+//! when no block holds two of them at once, and so do the context companions they own.
 
 import backend.InstanceKey {InstanceKey}
 import backend.LoweringPlan {failureLocal}
@@ -321,6 +323,16 @@ fn useDiagnostics(effects: &mut Effects, diagnostics: &Option<Diagnostics>) -> (
   }
 }
 
+// With `callDefs`, a call writes a destination without projections whole after it reads its
+// operands; otherwise the destination counts as read.
+fn writeCall(effects: &mut Effects, destination: &Place, callDefs: bool) -> () {
+  if callDefs && List<Projection>.length(&destination.projections) == usize.ZERO {
+    mark(List<u64>.asMutSlice(&mut effects.defs), usize.ZERO, destination.local)
+  } else {
+    usePlace(&mut effects.*, destination)
+  }
+}
+
 // An aggregate or variant store may write only some fields of a whole local, so it keeps the rest
 // live; every other whole-local store replaces it.
 fn replacesWhole(value: &Rvalue) -> bool {
@@ -331,7 +343,9 @@ fn replacesWhole(value: &Rvalue) -> bool {
   }
 }
 
-effect fn blockEffects(function: &MirFunction, block: &Block, words: usize) -> Effects
+// With `callDefs`, a call writes a destination without projections whole after it reads its
+// operands; without, the destination counts as read, as a resume state needs it.
+effect fn blockEffects(function: &MirFunction, block: &Block, words: usize, callDefs: bool) -> Effects
 ! OutOfMemoryError ? &mut Allocator {
   let mut effects = Effects {uses: run zeros(words), defs: run zeros(words)}
   let statements = List<Statement>.asSlice(&block.statements)
@@ -370,8 +384,8 @@ effect fn blockEffects(function: &MirFunction, block: &Block, words: usize) -> E
       useOperands(&mut effects, &arguments)
       useOperands(&mut effects, &providers)
       useDiagnostics(&mut effects, &diagnostics)
-      usePlace(&mut effects, &destination)
-      if let Option<FailureEdge>.Some {value: edge} = &failure { usePlace(&mut effects, &edge.destination) }
+      writeCall(&mut effects, &destination, callDefs)
+      if let Option<FailureEdge>.Some {value: edge} = &failure { writeCall(&mut effects, &edge.destination, callDefs) }
     }
     Terminator.Fail {..} => {
       let failed = failureLocal(function)
@@ -393,14 +407,14 @@ effect fn appendAll(sets: &mut List<u64>, values: &[u64]) -> () ! OutOfMemoryErr
 }
 
 // The locals live on entry to each block, `words` words per block.
-effect fn liveness(function: &MirFunction, words: usize) -> List<u64> ! OutOfMemoryError ? &mut Allocator {
+effect fn liveness(function: &MirFunction, words: usize, callDefs: bool) -> List<u64> ! OutOfMemoryError ? &mut Allocator {
   let blocks = List<Block>.asSlice(&function.blocks)
   let mut uses = List<u64>.make()
   let mut defs = List<u64>.make()
   let mut edges = List<List<usize>>.make()
   let mut at = usize.ZERO
   while at < blocks.length {
-    let effects = run blockEffects(function, &blocks[at], words)
+    let effects = run blockEffects(function, &blocks[at], words, callDefs)
     run appendAll(&mut uses, List<u64>.asSlice(&effects.uses))
     run appendAll(&mut defs, List<u64>.asSlice(&effects.defs))
     run List<List<usize>>.append(&mut edges, run MirFunction.successors(function, at))
@@ -570,6 +584,208 @@ effect fn residentLocals(function: &MirFunction, points: &[bool], words: usize) 
   return move resident
 }
 
+// Resident locals whose storage can be shared with others whose lives never meet: temporaries and
+// named bindings whose address nothing takes. Their lives are
+// then exact: a block holds such a local's value only where the local is live on entry or exit,
+// or where the block names it, so two of them that no block holds together never need storage at
+// the same time. A call writes its destination whole, so its life starts at the call; a local
+// that a path other than the call's normal edge still reads keeps its own slot, because that path
+// sees the value from before the call.
+effect fn shareableLocals(function: &MirFunction, extents: &[Extent], resident: &[u64], entries: &[u64], words: usize)
+-> List<u64> ! OutOfMemoryError ? &mut Allocator {
+  let mut shareable = run zeros(words)
+  let locals = List<Local>.asSlice(&function.locals)
+  let mut local = usize.ZERO
+  while local < extents.length && local < locals.length {
+    let kind = match &locals[local].kind {
+      LocalKind.Temp => true
+      LocalKind.User {..} => true
+      _ => false
+    }
+    if kind && isSet(resident, usize.ZERO, local) && extents[local].size > usize.ZERO {
+      mark(List<u64>.asMutSlice(&mut shareable), usize.ZERO, local)
+    }
+    local = local + usize.ONE
+  }
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let mut block = usize.ZERO
+  while block < blocks.length {
+    let statements = List<Statement>.asSlice(&blocks[block].statements)
+    let mut statementAt = usize.ZERO
+    while statementAt < statements.length {
+      if let Statement.Assign {value, ..} = &statements[statementAt] {
+        match &value {
+          Rvalue.Ref {place, ..} => clear(List<u64>.asMutSlice(&mut shareable), place.local)
+          Rvalue.AddressOf {place, ..} => clear(List<u64>.asMutSlice(&mut shareable), place.local)
+          _ => {}
+        }
+      }
+      statementAt = statementAt + usize.ONE
+    }
+    if let Terminator.Call {destination, normal, failure, ..} = &blocks[block].terminator {
+      let targets = run MirFunction.successors(function, block)
+      let listed = List<usize>.asSlice(&targets)
+      let mut failedTarget = usize.MAX
+      if let Option<FailureEdge>.Some {value: failed} = &failure {
+        failedTarget = failed.target
+        run keepWritten(&mut shareable, &failed.destination, failed.target, normal, listed, entries, words)
+      }
+      run keepWritten(&mut shareable, &destination, normal, failedTarget, listed, entries, words)
+    }
+    block = block + usize.ONE
+  }
+  return move shareable
+}
+
+// A call writes `destination` only on the edge to `written`. Any other successor that reads it
+// would see its value from before the call, so it then keeps its own slot; so does a destination
+// whose edge shares its target with the call's other edge (`other`).
+effect fn keepWritten(shareable: &mut List<u64>, destination: &Place, written: usize, other: usize,
+  targets: &[usize], entries: &[u64], words: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if List<Projection>.length(&destination.projections) != usize.ZERO { return () }
+  if written == other {
+    clear(List<u64>.asMutSlice(&mut shareable.*), destination.local)
+    return ()
+  }
+  let mut edge = usize.ZERO
+  while edge < targets.length {
+    if targets[edge] != written && isSet(entries, targets[edge] * words, destination.local) {
+      clear(List<u64>.asMutSlice(&mut shareable.*), destination.local)
+    }
+    edge = edge + usize.ONE
+  }
+  return ()
+}
+
+fn clear(sets: &mut [u64], local: usize) -> () {
+  let at = bitWord(local)
+  sets[at] = u64.bitAnd(sets[at], u64.bitNot(bitMask(local)))
+}
+
+// One local or context companion to place in the shared region.
+struct Item {
+  local: usize,
+  size: usize,
+  alignment: usize,
+  companion: bool,
+}
+
+impl Copy for Item {}
+
+// Places the shareable locals from `start`, with the context companions they own, the widest
+// first, each at the lowest offset that overlaps no placed item held in a common block. A
+// companion lives as long as its owner. Returns the end of the shared region.
+effect fn packShared(function: &MirFunction, extents: &[Extent], shareable: &[u64], entries: &[u64], companions: &[usize],
+  word: usize, words: usize, start: usize, slots: &mut List<FrameSlot>, companionSlots: &mut List<FrameSlot>) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  let mut order = List<Item>.make()
+  let mut local = usize.ZERO
+  while local < extents.length {
+    if isSet(shareable, usize.ZERO, local) {
+      let mut aligned = extents[local].alignment
+      if aligned == usize.ZERO { aligned = usize.ONE }
+      run List<Item>.append(&mut order, Item {local: local, size: extents[local].size, alignment: aligned, companion: false})
+    }
+    local = local + usize.ONE
+  }
+  let mut companionAt = usize.ZERO
+  while companionAt < companions.length {
+    if isSet(shareable, usize.ZERO, companions[companionAt]) {
+      run List<Item>.append(&mut order, Item {local: companions[companionAt], size: word * 5, alignment: word, companion: true})
+    }
+    companionAt = companionAt + usize.ONE
+  }
+  let count = List<Item>.length(&order)
+  if count == usize.ZERO { return start }
+  // Widest first; ties keep their order, so the layout is deterministic.
+  let sorted = List<Item>.asMutSlice(&mut order)
+  let mut at = usize.ONE
+  while at < count {
+    let value = sorted[at]
+    let mut hole = at
+    while hole > usize.ZERO && sorted[hole - usize.ONE].size < value.size {
+      sorted[hole] = sorted[hole - usize.ONE]
+      hole = hole - usize.ONE
+    }
+    sorted[hole] = value
+    at = at + usize.ONE
+  }
+  // The blocks that hold each item: live on entry or exit, or named there.
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let blockWords = blocks.length / 64 + usize.ONE
+  let mut named = List<u64>.make()
+  let mut block = usize.ZERO
+  while block < blocks.length {
+    let effects = run blockEffects(function, &blocks[block], words, false)
+    let mut index = usize.ZERO
+    while index < words {
+      run List<u64>.append(&mut named, u64.bitOr(List<u64>.asSlice(&effects.uses)[index], List<u64>.asSlice(&effects.defs)[index]))
+      index = index + usize.ONE
+    }
+    block = block + usize.ONE
+  }
+  let mut held = run zeros(count * blockWords)
+  block = usize.ZERO
+  while block < blocks.length {
+    let targets = run MirFunction.successors(function, block)
+    let listed = List<usize>.asSlice(&targets)
+    let mut position = usize.ZERO
+    while position < count {
+      let owner = List<Item>.asSlice(&order)[position].local
+      let mut holds = isSet(entries, block * words, owner) || isSet(List<u64>.asSlice(&named), block * words, owner)
+      let mut edge = usize.ZERO
+      while !holds && edge < listed.length {
+        holds = isSet(entries, listed[edge] * words, owner)
+        edge = edge + usize.ONE
+      }
+      if holds { mark(List<u64>.asMutSlice(&mut held), position * blockWords, block) }
+      position = position + usize.ONE
+    }
+    block = block + usize.ONE
+  }
+  let mut placed = List<FrameSlot>.make()
+  let mut end = start
+  let mut position = usize.ZERO
+  while position < count {
+    let item = List<Item>.asSlice(&order)[position]
+    let mut offset = alignUp(start, item.alignment)
+    let mut moved = true
+    while moved {
+      moved = false
+      let slotsSoFar = List<FrameSlot>.asSlice(&placed)
+      let mut other = usize.ZERO
+      while other < slotsSoFar.length {
+        let slot = slotsSoFar[other]
+        if offset < slot.offset + slot.size && slot.offset < offset + item.size && meets(List<u64>.asSlice(&held), position, other, blockWords) {
+          offset = alignUp(slot.offset + slot.size, item.alignment)
+          moved = true
+        }
+        other = other + usize.ONE
+      }
+    }
+    let slot = FrameSlot {local: item.local, offset: offset, size: item.size}
+    run List<FrameSlot>.append(&mut placed, slot)
+    if item.companion {
+      run List<FrameSlot>.append(&mut companionSlots.*, slot)
+    } else {
+      run List<FrameSlot>.append(&mut slots.*, slot)
+    }
+    if offset + item.size > end { end = offset + item.size }
+    position = position + usize.ONE
+  }
+  return end
+}
+
+// Whether the locals at positions `left` and `right` of the packing order share a block.
+fn meets(held: &[u64], left: usize, right: usize, blockWords: usize) -> bool {
+  let mut index = usize.ZERO
+  while index < blockWords {
+    if u64.bitAnd(held[left * blockWords + index], held[right * blockWords + index]) != 0 { return true }
+    index = index + usize.ONE
+  }
+  return false
+}
+
 // A drop flag live after a suspension point decides which owners its resume and cancel exits
 // drop (SUSP-011, SUSP-013), so it must be resident or saved in the point's state. One without
 // storage would drop an owner twice or never: that is a compiler bug, never a user diagnostic,
@@ -674,7 +890,7 @@ pub fn liveFlag(locals: &[Local], live: &[u64]) -> usize {
 /// The locals live on entry to `function`'s first block, one bit per local.
 pub effect fn entryLive(function: &MirFunction) -> List<u64> ! OutOfMemoryError ? &mut Allocator {
   let words = List<Local>.length(&function.locals) / 64 + usize.ONE
-  let live = run liveness(function, words)
+  let live = run liveness(function, words, false)
   let mut entry = List<u64>.make()
   let listed = List<u64>.asSlice(&live)
   let mut at = usize.ZERO
@@ -785,7 +1001,7 @@ impl Coroutine {
     let count = extents.length
     let words = count / 64 + usize.ONE
     let mut resident = run residentLocals(function, points, words)
-    let live = run liveness(function, words)
+    let live = run liveness(function, words, false)
     let entries = List<u64>.asSlice(&live)
     let written = run assigned(function, words)
     let exits = List<u64>.asSlice(&written)
@@ -818,12 +1034,15 @@ impl Coroutine {
       parameter = parameter + usize.ONE
     }
     let resided = List<u64>.asSlice(&resident)
+    // Lives in which a call writes its destination, for the locals that can share storage.
+    let exact = run liveness(function, words, true)
+    let shareable = run shareableLocals(function, extents, resided, List<u64>.asSlice(&exact), words)
     let mut alignment = word
     let mut offset = Coroutine.providerOffset(word, providers)
     let mut residentSlots = List<FrameSlot>.make()
     let mut local = usize.ZERO
     while local < count {
-      if isSet(resided, usize.ZERO, local) {
+      if isSet(resided, usize.ZERO, local) && !isSet(List<u64>.asSlice(&shareable), usize.ZERO, local) {
         let mut size = extents[local].size
         if size == usize.ZERO { size = usize.ONE }
         let mut aligned = extents[local].alignment
@@ -838,11 +1057,24 @@ impl Coroutine {
     let mut companionSlots = List<FrameSlot>.make()
     let mut companionAt = usize.ZERO
     while companionAt < companions.length {
+      if isSet(List<u64>.asSlice(&shareable), usize.ZERO, companions[companionAt]) {
+        companionAt = companionAt + usize.ONE
+        continue
+      }
       offset = alignUp(offset, word)
       let size = word * 5
       run List<FrameSlot>.append(&mut companionSlots, FrameSlot {local: companions[companionAt], offset: offset, size: size})
       offset = offset + size
       companionAt = companionAt + usize.ONE
+    }
+    offset = run packShared(function, extents, List<u64>.asSlice(&shareable), List<u64>.asSlice(&exact), companions, word, words, offset, &mut residentSlots,
+      &mut companionSlots)
+    local = usize.ZERO
+    while local < count {
+      if isSet(List<u64>.asSlice(&shareable), usize.ZERO, local) && extents[local].alignment > alignment {
+        alignment = extents[local].alignment
+      }
+      local = local + usize.ONE
     }
     let base = offset
     let mut end = base
