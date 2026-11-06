@@ -1197,7 +1197,7 @@ effect fn readableNames(plan: &EmissionPlan) -> FunctionNames ! OutOfMemoryError
 
 // Compiles as `compileIr` does, with the intermediate files in `scratch` under the output's name,
 // which Clang records in the object.
-effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: Option<&EmissionPlan>, sources: &ModuleSources, functionNames: &FunctionNames, units: &[CodegenUnit], packs: &[BuildRecord.PackBody], output: &Path, form: Form, stage: Stage, optimization: &[u8], debug: bool,
+effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: Option<&EmissionPlan>, sources: &ModuleSources, functionNames: &FunctionNames, requestedUnits: &[CodegenUnit], packs: &[BuildRecord.PackBody], output: &Path, form: Form, stage: Stage, optimization: &[u8], debug: bool,
   relocation: &[u8], libc: &[u8], profileFlags: &[Bytes], target: &Target, supply: &Option<Supply>, linkInputs: &[NativeLinkInput],
   functionOrder: Option<&Path>, selectedClang: &Option<Bytes>, world: &WasiTools.World, started: bool, printed: bool, progress: &mut Progress) -> i32
 ! FileError | ProcessError | HostInputError | InvalidNativeLinkInput | OutOfMemoryError | WriterError
@@ -1357,6 +1357,8 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
   let orderPath = run Path.fromBytes(Bytes.asSlice(&orderBytes))
   // The flags that decide the code Clang writes, which each codegen unit's compile shares.
   let mut common = List<Bytes>.make()
+  // The `-mllvm` options among them, which a ThinLTO link passes on to the code generator it runs.
+  let mut backendOptions = List<Bytes>.make()
   // Split codegen units are compiled by separate Clang requests before the final link.
   // The IR names no triple, so every native link and its units state the target to Clang; a
   // cross link would otherwise build for Clang's default triple.
@@ -1375,6 +1377,7 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
     // and gave 12% fewer branch mispredicts and 1-2% fewer instructions.
     run List<Bytes>.append(&mut common, run Bytes.copy(b"-mllvm"))
     run List<Bytes>.append(&mut common, run Bytes.copy(b"-enable-tail-merge=false"))
+    run List<Bytes>.append(&mut backendOptions, run Bytes.copy(b"-enable-tail-merge=false"))
     // Runtime unrolling turns every loop with an unknown trip count into a four-way body
     // plus a remainder loop. Loops that run a handful of times, such as filling a call
     // frame's few locals, then pay the remainder's setup on every entry: silkjs ran 2-2.5%
@@ -1382,6 +1385,7 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
     // nothing.
     run List<Bytes>.append(&mut common, run Bytes.copy(b"-mllvm"))
     run List<Bytes>.append(&mut common, run Bytes.copy(b"-unroll-runtime=false"))
+    run List<Bytes>.append(&mut backendOptions, run Bytes.copy(b"-unroll-runtime=false"))
   } else if same(optimization, b"size") {
     // `size` optimizes as hard as Clang can for small code, such as a wasm module to download.
     run List<Bytes>.append(&mut common, run Bytes.copy(b"-Oz"))
@@ -1449,7 +1453,12 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
     if let Option<Path>.Some {..} = &selected.linker { supplied = true }
   }
   let crossDarwin = darwin && (Target.id(target) != Target.id(&hostTarget()) || stubbed)
-  let lld = linked && !freestanding && !supplied && (same(Target.operatingSystem(target), b"linux") || crossDarwin)
+  // An optimized executable's codegen units compile for ThinLTO, which lld links: a native macOS
+  // one then links with the `ld64.lld` installed beside Clang too. Without lld the whole module
+  // compiles as one instead, since units without the link's cross-unit inlining run much slower.
+  let thinWanted = requestedUnits.length > usize.ZERO && same(optimization, b"speed") && linked && !freestanding && !windows
+    && !supplied
+  let lld = linked && !freestanding && !supplied && (same(Target.operatingSystem(target), b"linux") || crossDarwin || darwin && thinWanted)
   let mut lldName: &[u8] = b"/ld.lld"
   if darwin { lldName = b"/ld64.lld" }
   // Clang's version is asked once: it stamps a split build's objects, and it names where Clang is
@@ -1457,7 +1466,7 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
   let mut probed = Option<Bytes>.none()
   // `[native].sources` compile only for a final output, which links or archives them.
   let compilesSources = final && NativeLinkInputs.hasSources(linkInputs)
-  if units.length > usize.ZERO || lld || compilesSources {
+  if requestedUnits.length > usize.ZERO || lld || compilesSources {
     match move run probeClang(&clang, origin, minimumClang, &mut progress.*) {
       ClangVersion.Answered {output: answer} => { probed = Option<Bytes>.some(move answer) }
       ClangVersion.Failed {status} => { return status }
@@ -1465,6 +1474,7 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
   }
   // The options that select the program's linker, with which the glibc stub libraries link too.
   let mut stubLinker = List<Bytes>.make()
+  let mut thinLinked = false
   if lld {
     let mut installed = false
     if let Option<Bytes>.Some {value: answer} = &probed {
@@ -1482,7 +1492,46 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
     if ordered && !installed || crossDarwin || glibcStubbed && crossTarget && !installed {
       run ChildProcess.addArgument(&mut process, "-fuse-ld=lld")
       run List<Bytes>.append(&mut stubLinker, run Bytes.copy(b"-fuse-ld=lld"))
+      installed = true
     }
+    thinLinked = thinWanted && installed
+  }
+  let noUnits = List<CodegenUnit>.make()
+  let mut units = requestedUnits
+  if thinWanted && !thinLinked { units = List<CodegenUnit>.asSlice(&noUnits) }
+  // A ThinLTO link optimizes and generates each unit's code again, on as many threads as the host
+  // has, after importing what the unit calls from the others. Its cache keeps each unit's result
+  // for the same unit and imports, so an edit regenerates only the units it reaches.
+  let mut unitFlags = List<Bytes>.make()
+  flag = usize.ZERO
+  while flag < shared.length {
+    run List<Bytes>.append(&mut unitFlags, run Bytes.copy(Bytes.asSlice(&shared[flag])))
+    flag = flag + usize.ONE
+  }
+  if thinLinked {
+    run List<Bytes>.append(&mut unitFlags, run Bytes.copy(b"-flto=thin"))
+    run ChildProcess.addArgument(&mut process, "-flto=thin")
+    let options = List<Bytes>.asSlice(&backendOptions)
+    let mut option = usize.ZERO
+    while option < options.length {
+      let mut forwarded = run Bytes.copy(b"-Wl,-mllvm,")
+      run Bytes.append(&mut forwarded, Bytes.asSlice(&options[option]))
+      run ChildProcess.addArgumentBytes(&mut process, Bytes.asSlice(&forwarded))
+      option = option + usize.ONE
+    }
+    let unitCache = run CodegenCache.directoryFor(output)
+    let mut cached = Bytes.make()
+    if darwin {
+      cached = run Bytes.copy(b"-Wl,-cache_path_lto,")
+    } else {
+      cached = run Bytes.copy(b"-Wl,--thinlto-cache-dir=")
+    }
+    let cacheRoot = run NativeToolchain.pathBytes(&unitCache)
+    run Bytes.append(&mut cached, Bytes.asSlice(&cacheRoot))
+    run Bytes.append(&mut cached, b"/thinlto")
+    run ChildProcess.addArgumentBytes(&mut process, Bytes.asSlice(&cached))
+    // A few builds' worth of the units' results; the link removes the oldest past that.
+    run ChildProcess.addArgument(&mut process, "-Wl,--thinlto-cache-policy=cache_size_files=64")
   }
   if ordered {
     run ChildProcess.addArgument(&mut process, "-Xlinker")
@@ -1498,7 +1547,7 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
   let mut objects = List<Path>.make()
   if let Option<Bytes>.Some {value: answer} = &probed {
     if units.length > usize.ZERO {
-      objects = match move run compileUnits(scratch, &clang, origin, Bytes.asSlice(&answer), shared, units, packs, unitLines, sources, output, &mut progress.*) {
+      objects = match move run compileUnits(scratch, &clang, origin, Bytes.asSlice(&answer), List<Bytes>.asSlice(&unitFlags), units, packs, unitLines, sources, output, &mut progress.*) {
         UnitBuild.Objects {paths} => move paths
         UnitBuild.Failed {status} => { return status }
       }
@@ -1962,6 +2011,11 @@ union UnitBuild {
   Objects {paths: List<Path>},
   Failed {status: i32},
 }
+
+// The codegen units an optimized executable splits into unless asked otherwise. The count is
+// fixed rather than the host's core count, so every host writes the same objects and the cache
+// shares them.
+fn defaultReleaseUnits() -> usize { return 16 }
 
 // The lld driver `name` (`/ld.lld` or `/ld64.lld`) in the directory Clang's `--version` output
 // names as its installation, when it is there.
@@ -3336,20 +3390,14 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, cacheDirectory: Opti
       }
       // Units that only the cache asked for are not compiled apart.
       if !split { units = List<CodegenUnit>.make() }
-      // An optimized executable splits into the codegen units `SILK_CODEGEN_UNITS` asks for, by its
-      // call graph (`ReleaseUnits`), so Clang optimizes them on several threads. One module stays
-      // the default: units call across at a few percent of run time.
+      // An optimized executable splits into codegen units by its call graph (`ReleaseUnits`), so
+      // Clang optimizes them on several threads: as one module, Clang's -O2 ran on one thread for
+      // nearly all of a large program's build. The profile's `codegen-units` sets the count, and 1
+      // keeps one module. A build with line tables stays one module, whose tables `debugInfo` holds.
       if !split && form == Form.Executable && stage == Stage.Final && same(Bytes.asSlice(&optimization), b"speed")
-        && !same(Target.objectFormat(&target), b"wasm") {
-        let mut requested = usize.ZERO
-        if let Option<Bytes>.Some {value: written} = move run HostInput.variableNamed("SILK_CODEGEN_UNITS") {
-          let digits = Bytes.asSlice(&written)
-          let mut at = usize.ZERO
-          while at < digits.length && digits[at] >= 48 && digits[at] <= 57 {
-            requested = requested * 10 + u8.toUsize(digits[at] - 48)
-            at = at + usize.ONE
-          }
-        }
+        && !same(Target.objectFormat(&target), b"wasm") && !debug {
+        let mut requested = defaultReleaseUnits()
+        if InitialProfile.unitCount(&profile) > 0 { requested = u64.toUsize(InitialProfile.unitCount(&profile)) }
         if requested > usize.ONE {
           let partitioning = Profiler.zone(b"releaseUnits")
           units = run ReleaseUnits.partition(Bytes.asSlice(&text), requested)
@@ -4167,9 +4215,9 @@ effect fn testBuildKey(kind: &[u8], sourcePath: &Path, manifest: &Option<&Path>,
     }
   }
   let variables = ["SILK_CLANG", "SILK_LLVM_AR", "PATH", "SDKROOT", "DEVELOPER_DIR", "SILK_WASM_TOOLS", "SILK_WASI_ADAPTER", "SILK_WASI_REACTOR_ADAPTER",
-    "SILK_VERIFY_MIR", "SILK_PROFILE_GENERATE", "SILK_PROFILE_USE", "SILK_CODEGEN_UNITS"]
+    "SILK_VERIFY_MIR", "SILK_PROFILE_GENERATE", "SILK_PROFILE_USE"]
   let mut at = usize.ZERO
-  while at < 12 {
+  while at < variables.length {
     match move run HostInput.variableNamed(variables[at]) {
       Option<Bytes>.Some {value} => {
         run RuntimeEncoding.field(&mut key, b"=")
