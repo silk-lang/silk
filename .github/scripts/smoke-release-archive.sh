@@ -13,7 +13,7 @@ top=$(echo "$work"/silk-*)
 test -x "$top/bin/silk"
 test "$("$top/bin/silkc" --version)" = "silk v$version"
 cd "$work"
-env -u SILK_CLANG -u SDKROOT "$top/bin/silkc" init hello
+env -u SILK_CLANG -u SDKROOT "$top/bin/silkc" init hello -t minimal
 grep -Fx "silk-version = \"$version\"" hello/silk.toml
 # `run` reports the build on standard error, so standard output is the program's own.
 output=$(cd hello && env -u SILK_CLANG -u SDKROOT "$top/bin/silkc" run)

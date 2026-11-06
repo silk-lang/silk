@@ -1,14 +1,15 @@
-//! A TLS 1.3 server state machine that does the handshake and protects application data over a
+//! A TLS 1.2 and TLS 1.3 server state machine that does the handshake and protects application data over a
 //! byte transport that you drive.
 //!
 //! # When to use
-//! Use [`Server`] to accept TLS 1.3 connections, for example in an HTTPS server or a runtime's
+//! Use [`Server`] to accept TLS connections, for example in an HTTPS server or a runtime's
 //! `node:tls`. Make one server for each accepted connection with [`Server.make`], then move bytes
 //! between it and the transport until it reports `HandshakeComplete`, and then read and write
 //! application data.
 //!
 //! # Details
-//! The server supports TLS 1.3 only. It selects the first cipher suite in the client's order among
+//! The server accepts the versions that `ServerConfig.versions` allows, and prefers TLS 1.3. In
+//! TLS 1.3 it selects the first cipher suite in the client's order among
 //! ChaCha20-Poly1305, AES-128-GCM, and AES-256-GCM. It selects the key exchange group from
 //! X25519, P-256, and P-384 in that order, limited by your [`GroupPolicy`]. If the client sent no
 //! key share for an allowed group that it supports, the server sends one HelloRetryRequest. The
@@ -19,6 +20,13 @@
 //! The server reads the client's SNI name, which you get from [`Server.serverName`], and selects an
 //! ALPN protocol from your [`AlpnConfig`] in your preference order. It handles KeyUpdate in both
 //! directions, `close_notify`, and the compatibility `change_cipher_spec` records.
+//!
+//! In TLS 1.2 (RFC 5246), the server selects the first ECDHE suite in the client's order that its
+//! key can sign for: ECDSA keys take the ECDSA suites and RSA keys take the RSA suites, each with
+//! ChaCha20-Poly1305, AES-128-GCM, or AES-256-GCM. An Ed25519 key serves no TLS 1.2 suite. The
+//! server requires the extended master secret (RFC 7627), and an ECDSA certificate's curve must be
+//! in the client's groups. When TLS 1.3 is also allowed, it puts the RFC 8446 downgrade mark in a
+//! TLS 1.2 ServerHello.
 //!
 //! Each call returns a [`ServerProgress`]: how many bytes it took or wrote, and the next
 //! [`ServerDemand`]. Output works in two steps: write [`Server.pendingOutput`] to the transport,
@@ -34,7 +42,8 @@
 //!
 //! With [`ClientAuth`] `Request`, the server sends a CertificateRequest, checks the client's
 //! CertificateVerify with its leaf's key, and validates the client's chain against your trust
-//! anchors for the `ClientAuth` purpose. [`Server.clientCertificateStatus`] and
+//! anchors for the `ClientAuth` purpose. In TLS 1.2 the request lists no certificate authorities,
+//! and the client may sign with ECDSA or RSA under SHA-256 or SHA-384. [`Server.clientCertificateStatus`] and
 //! [`Server.clientCertificates`] tell you the result.
 //!
 //! With [`TicketPolicy`] `Issue`, the server sends NewSessionTicket messages after the client's
@@ -43,6 +52,13 @@
 //! offers a valid ticket resumes: the server checks the binder, sends no certificate messages, and
 //! [`Server.resumed`] returns `true`. A ticket from a handshake whose client certificate the
 //! current [`ClientAuth`] would refuse gives a full handshake instead.
+//!
+//! In TLS 1.2 the server issues one ticket (RFC 5077) when the client sends a session_ticket
+//! extension: a NewSessionTicket before its ChangeCipherSpec, with the `TicketPolicy` lifetime as
+//! the hint. A ClientHello with a session ID and a valid ticket of the same cipher suite resumes:
+//! the server echoes the session ID and sends its ChangeCipherSpec and Finished right after the
+//! ServerHello, with no new ticket. The server keeps no session cache, so it never resumes by
+//! session ID alone, and its full handshakes send an empty session ID.
 //!
 //! When the `TicketPolicy` `maxEarlyData` is not 0, the tickets allow 0-RTT data. The server
 //! accepts a resuming client's early data when the ticket allows it, there was no
@@ -73,6 +89,7 @@
 //! import silk.tls.client { AlpnConfig }
 //! import silk.tls.certificate { CertificateDer }
 //! import silk.tls.signature { SigningKey }
+//! import silk.tls.record { VersionPolicy }
 //! import silk.tls.server {
 //!   ClientAuth,
 //!   GroupPolicy,
@@ -114,6 +131,7 @@
 //!     groups: GroupPolicy.defaults(),
 //!     clientAuth: ClientAuth<'static>.Off,
 //!     tickets: TicketPolicy<'static>.Off,
+//!     versions: VersionPolicy.defaults(),
 //!     limits: ServerLimits.defaults(),
 //!   }
 //!   let made = run Server.make(&config, SigningKey.EcdsaP256 { key: move key })
@@ -160,6 +178,7 @@ import silk.core.result { Result }
 import silk.crypto.sha2 { Sha256, Sha384 }
 import silk.collections.slice { Slice }
 import silk.tls.hkdf { LabelError, TlsHkdfSha256, TlsHkdfSha384 }
+import silk.tls.prf { Tls12Keys, TlsPrf, VERIFY_DATA_LENGTH }
 import silk.tls.record {
   CipherSuite,
   ContentType,
@@ -169,6 +188,8 @@ import silk.tls.record {
   RecordError,
   TlsRecordReceiver,
   TlsRecordSender,
+  TlsVersion,
+  VersionPolicy,
 }
 import silk.num.i64
 import silk.num.u8
@@ -193,7 +214,7 @@ const HANDSHAKE_INITIAL_BYTES: usize = 4096
 
 const SCRATCH_LENGTH: usize = 512
 
-const FLIGHT_OVERHEAD: usize = 1536
+const FLIGHT_OVERHEAD: usize = 2048
 
 const TICKET_LIFETIME_LIMIT: usize = 604800
 
@@ -328,6 +349,8 @@ pub struct ServerConfig<'a> {
   pub clientAuth: ClientAuth<'a>,
   /// Whether the server issues session tickets and resumes sessions from them.
   pub tickets: TicketPolicy<'a>,
+  /// The TLS versions the server accepts. `VersionPolicy.defaults()` accepts TLS 1.2 and TLS 1.3.
+  pub versions: VersionPolicy,
   /// Finite connection limits.
   pub limits: ServerLimits,
 }
@@ -382,7 +405,7 @@ pub union TicketPolicy<'a> {
     pub now: &'a Instant,
     /// The ticket lifetime in seconds, from 1 to 604800.
     pub lifetime: usize,
-    /// The number of tickets to send after each handshake, from 1 to 4.
+    /// The number of tickets to send after each TLS 1.3 handshake, from 1 to 4. TLS 1.2 sends one.
     pub count: usize,
     /// The most 0-RTT plaintext bytes that a client may send when it resumes from one of these
     /// tickets, at most 16777216, or 0 for none.
@@ -587,7 +610,7 @@ impl Debug for ServerProtocolReason {
 
 /// A handshake parameter that the client and the server do not share.
 pub enum NegotiationFailure {
-  /// The client does not offer TLS 1.3.
+  /// The client offers no TLS version that the server accepts.
   Version,
   /// The client offers no supported cipher suite.
   CipherSuite,
@@ -595,6 +618,9 @@ pub enum NegotiationFailure {
   Group,
   /// The client does not accept the signature scheme of the [`SigningKey`].
   SignatureScheme,
+  /// A TLS 1.2 client does not offer the extended master secret (RFC 7627), which the server
+  /// requires.
+  ExtendedMasterSecret,
 }
 
 impl Debug for NegotiationFailure {
@@ -607,6 +633,10 @@ impl Debug for NegotiationFailure {
       NegotiationFailure.CipherSuite => run Format.write(&mut formatter, b"CipherSuite")
       NegotiationFailure.Group => run Format.write(&mut formatter, b"Group")
       NegotiationFailure.SignatureScheme => run Format.write(&mut formatter, b"SignatureScheme")
+      NegotiationFailure.ExtendedMasterSecret => run Format.write(
+        &mut formatter,
+        b"ExtendedMasterSecret",
+      )
     }
   }
 }
@@ -845,6 +875,12 @@ enum ServerState {
   AwaitClientCertificateVerify,
   AwaitClientFinished,
   Traffic,
+  Tls12AwaitClientCertificate,
+  Tls12AwaitKeyExchange,
+  Tls12AwaitClientCertificateVerify,
+  Tls12AwaitCcs,
+  Tls12AwaitFinished,
+  Tls12FinishedPending,
 }
 
 enum ClientAuthMode {
@@ -864,6 +900,17 @@ enum PendingKind {
   KeyUpdate,
   CloseNotify,
   Tickets,
+  Tls12Flight,
+  Tls12Ccs,
+  Tls12Finished,
+  Tls12Ticket,
+}
+
+union ServerShare {
+  None,
+  X25519 { value: X25519 },
+  P256 { value: P256 },
+  P384 { value: P384 },
 }
 
 struct ParsedClientHello {
@@ -898,6 +945,16 @@ struct ParsedClientHello {
   binderLength: usize,
   obfuscatedAge: usize,
   earlyData: bool,
+  hasVersions: bool,
+  tls12: bool,
+  suite12: CipherSuite,
+  hasSuite12: bool,
+  extendedMaster: bool,
+  renegotiation: bool,
+  pointFormats: bool,
+  sessionTicket: bool,
+  ticketOffset: usize,
+  ticketLength: usize,
 }
 
 struct Digest48 {
@@ -905,7 +962,7 @@ struct Digest48 {
   length: usize,
 }
 
-/// A TLS 1.3 server state machine that does no I/O.
+/// A TLS 1.2 and TLS 1.3 server state machine that does no I/O.
 ///
 /// # When to use
 /// Make one server for each accepted connection with [`Server.make`]. Then move bytes between it
@@ -919,7 +976,8 @@ struct Digest48 {
 ///
 /// # Gotchas
 /// A [`ServerError`] from a call after [`Server.make`] is permanent for the server. The server sends
-/// no alert when it fails. Dropping the server does not send `close_notify`. Call
+/// no alert when it fails. In TLS 1.2 it does not resume sessions, has no KeyUpdate, and refuses
+/// renegotiation. Dropping the server does not send `close_notify`. Call
 /// [`Server.closeWrite`] first. Secrets are not erased.
 pub struct Server {
   state: ServerState,
@@ -1003,6 +1061,14 @@ pub struct Server {
   serverTrafficSecret: [u8; 48],
   nextServerTrafficSecret: [u8; 48],
   terminal: Option<ServerError>,
+  versions: VersionPolicy,
+  tls12: bool,
+  tls12VerifyExpected: bool,
+  tls12IssueTicket: bool,
+  clientRandom: [u8; 32],
+  serverRandom: [u8; 32],
+  share: ServerShare,
+  tls12Keys: Tls12Keys,
 }
 
 impl Server {
@@ -1204,6 +1270,21 @@ impl Server {
         serverTrafficSecret: zero48(),
         nextServerTrafficSecret: zero48(),
         terminal: Option<ServerError>.none(),
+        versions: config.versions,
+        tls12: false,
+        tls12VerifyExpected: false,
+        tls12IssueTicket: false,
+        clientRandom: zero32(),
+        serverRandom: zero32(),
+        share: ServerShare.None,
+        tls12Keys: Tls12Keys {
+          clientKey: zero32(),
+          serverKey: zero32(),
+          clientIv: [0; 12],
+          serverIv: [0; 12],
+          keyLength: 0,
+          ivLength: 0,
+        },
       },
     )
   }
@@ -1247,6 +1328,18 @@ impl Server {
       return Option<CipherSuite>.none()
     }
     return Option<CipherSuite>.some(self.selectedSuite)
+  }
+
+  /// Returns the negotiated TLS version after the `HandshakeComplete` action. Before that, returns
+  /// `None`.
+  pub fn version(self: &Self) -> Option<TlsVersion> {
+    if !self.completePublished {
+      return Option<TlsVersion>.none()
+    }
+    if self.tls12 {
+      return Option<TlsVersion>.some(TlsVersion.Tls12)
+    }
+    return Option<TlsVersion>.some(TlsVersion.Tls13)
   }
 
   /// Returns the negotiated key exchange group after the `HandshakeComplete` action. Before that,
@@ -1463,7 +1556,8 @@ impl Server {
     if let Option<ServerError>.Some { value: error } = self.terminal {
       return Result<ServerProgress, ServerError>.failResult(error)
     }
-    if self.state != ServerState.Traffic || self.localCloseRequested {
+    // TLS 1.2 has no KeyUpdate message.
+    if self.state != ServerState.Traffic || self.localCloseRequested || self.tls12 {
       return invalidState(ServerOperation.RequestKeyUpdate)
     }
     if self.pendingKind != PendingKind.KeyUpdate {
@@ -2058,6 +2152,36 @@ fn completePending(server: &mut Server) -> Result<(), ServerError> {
     server.ticketsPending = false
     return ok()
   }
+  if kind == PendingKind.Tls12Flight {
+    if server.flightOffset < server.flightLength {
+      return queueFlightChunk(&mut server.*, PendingKind.Tls12Flight)
+    }
+    // A resumed session sends its ChangeCipherSpec and Finished right after the ServerHello.
+    if server.pskAccepted {
+      return queueTls12ChangeCipherSpec(&mut server.*)
+    }
+    server.state = ServerState.Tls12AwaitKeyExchange
+    if server.clientAuthMode != ClientAuthMode.Off {
+      server.state = ServerState.Tls12AwaitClientCertificate
+    }
+    return ok()
+  }
+  if kind == PendingKind.Tls12Ticket {
+    return queueTls12ChangeCipherSpec(&mut server.*)
+  }
+  if kind == PendingKind.Tls12Ccs {
+    return queueTls12Finished(&mut server.*)
+  }
+  if kind == PendingKind.Tls12Finished {
+    // In a resumed session the client's ChangeCipherSpec and Finished come last.
+    if server.pskAccepted {
+      server.state = ServerState.Tls12AwaitCcs
+      return ok()
+    }
+    server.state = ServerState.Traffic
+    server.completeReady = true
+    return ok()
+  }
   return ok()
 }
 
@@ -2117,7 +2241,8 @@ fn scheduleControl(server: &mut Server) -> Result<(), ServerError> {
   if server.ticketsPending {
     return queueFlightChunk(&mut server.*, PendingKind.Tickets)
   }
-  if TlsRecordSender.recordsRemaining(&server.sender) == 1 {
+  // TLS 1.2 has no KeyUpdate, so the record layer refuses records past the key's limit.
+  if !server.tls12 && TlsRecordSender.recordsRemaining(&server.sender) == 1 {
     server.pendingKeyUpdate = true
   }
   if server.respondingKeyUpdate || server.pendingKeyUpdate {
@@ -2219,6 +2344,9 @@ effect fn handleReadyRecord(server: &mut Server) -> Result<(), ServerError>
     if server.handshakeLength > 0 {
       return violation(ServerProtocolReason.UnexpectedMessage)
     }
+    if server.tls12 {
+      return handleTls12ChangeCipherSpec(&mut server.*, contentLength)
+    }
     if !compatibilityWindow(server.state) || contentLength != 1 {
       return violation(ServerProtocolReason.CompatibilityCcs)
     }
@@ -2242,6 +2370,10 @@ effect fn handleReadyRecord(server: &mut Server) -> Result<(), ServerError>
       return failure(mapRecordError(move error))
     }
     let description = alert[1]
+    // TLS 1.2 warning alerts, such as no_renegotiation, do not end the connection.
+    if server.tls12 && alert[0] == 1 && description != 0 {
+      return countEmptyRecord(&mut server.*)
+    }
     if description == 0 {
       if server.state != ServerState.Traffic {
         return violation(ServerProtocolReason.UnexpectedMessage)
@@ -2413,7 +2545,20 @@ effect fn dispatchHandshake(
   if server.state == ServerState.AwaitClientFinished && messageType == 20 {
     return run handleClientFinished(&mut server.*, messageLength)
   }
-  if server.state == ServerState.Traffic && messageType == 24 {
+  if server.state == ServerState.Tls12AwaitClientCertificate && messageType == 11 {
+    return run handleClientCertificate(&mut server.*, messageLength)
+  }
+  if server.state == ServerState.Tls12AwaitKeyExchange && messageType == 16 {
+    return handleClientKeyExchange(&mut server.*, messageLength)
+  }
+  if server.state == ServerState.Tls12AwaitClientCertificateVerify && messageType == 15 {
+    return handleClientCertificateVerify(&mut server.*, messageLength)
+  }
+  if server.state == ServerState.Tls12AwaitFinished && messageType == 20 {
+    return run handleClientFinishedTls12(&mut server.*, messageLength)
+  }
+  // The server never renegotiates, so a TLS 1.2 ClientHello after the handshake fails.
+  if server.state == ServerState.Traffic && messageType == 24 && !server.tls12 {
     return handleKeyUpdate(&mut server.*, messageLength)
   }
   return violation(ServerProtocolReason.UnexpectedMessage)
@@ -2532,13 +2677,17 @@ effect fn handleClientHello(server: &mut Server, messageLength: usize, retry: bo
     }
     Result<ParsedClientHello, ServerError>.Success { value } => move value
   }
-  if !parsed.tls13 {
+  if !parsed.tls13 || !server.versions.allows(TlsVersion.Tls13) {
+    // TLS 1.2 has no HelloRetryRequest.
+    if !retry && parsed.tls12 && server.versions.allows(TlsVersion.Tls12) {
+      return run handleClientHelloTls12(&mut server.*, messageLength, &parsed)
+    }
     return failure(ServerError.Negotiation { failure: NegotiationFailure.Version })
   }
   if !parsed.hasGroups || !parsed.hasShares || !parsed.hasSchemes {
     return violation(ServerProtocolReason.Extension)
   }
-  let scheme = match server.key.chooseScheme(&parsed.schemes) {
+  let scheme = match server.key.chooseScheme(&parsed.schemes, TlsVersion.Tls13) {
     Option<usize>.Some { value } => value
     Option<usize>.None => {
       return failure(ServerError.Negotiation { failure: NegotiationFailure.SignatureScheme })
@@ -2622,36 +2771,11 @@ fn evaluatePsk(server: &mut Server, parsed: &ParsedClientHello) -> Result<(), Se
   if !server.ticketsEnabled || !server.ticketNowValid || !parsed.hasPsk || !parsed.pskDheKe {
     return ok()
   }
-  if parsed.identityLength != TICKET_LENGTH {
-    return ok()
-  }
-  let start = parsed.identityOffset
-  let mut ticket: [u8; 182] = [0; 182]
-  let mut index = usize.ZERO
-  while index < TICKET_LENGTH {
-    ticket[index] = usize.toU8(readU8Raw(&server.handshake, start + index))
-    index = index + usize.ONE
-  }
-  let name = server.ticketName
-  if !sameBytes(Slice.view<u8>(&ticket, 0, 16), &name) {
-    return ok()
-  }
-  let mut state: [u8; 138] = [0; 138]
-  let key = server.ticketKey
-  let opened = AesGcm.open(
-    &key,
-    Slice.view<u8>(&ticket, 16, 12),
-    &name,
-    Slice.view<u8>(&ticket, 28, TICKET_STATE_LENGTH),
-    Slice.view<u8>(&ticket, 28 + TICKET_STATE_LENGTH, 16),
-    &mut state,
-  )
-  if let Result<(), AesGcmError>.Failure { error } = move opened {
-    drop error
-    return ok()
-  }
-  if state[0] != 1 {
-    return ok()
+  let state = match openTicket(&server.*, parsed.identityOffset, parsed.identityLength, 1) {
+    Option<[u8; 138]>.Some { value } => value
+    Option<[u8; 138]>.None => {
+      return ok()
+    }
   }
   let suite = match suiteFromCode(u8.toUsize(state[1]) * 256 + u8.toUsize(state[2])) {
     Option<CipherSuite>.Some { value } => value
@@ -2667,26 +2791,13 @@ fn evaluatePsk(server: &mut Server, parsed: &ParsedClientHello) -> Result<(), Se
     return ok()
   }
   let issued = readStateNumber(&state, 51, 8)
-  let lifetime = readStateNumber(&state, 63, 4)
-  if server.ticketNow < issued || server.ticketNow - issued > lifetime * 1000 {
+  if !ticketFresh(&server.*, &state) {
     return ok()
   }
-  let nameHash = serverNameDigest(&server.*)
-  if (state[68] == 1) != server.hasServerName
-    || !sameBytes(Slice.view<u8>(&state, 69, 32), &nameHash) {
-    return ok()
-  }
-  let kind = state[67]
-  let mut status = ClientCertificateStatus.NotRequested
-  if server.clientAuthMode != ClientAuthMode.Off {
-    if kind == 0 || (kind == 1 && server.clientAuthMode == ClientAuthMode.Required)
-      || (kind == 3 && server.rejectUntrusted) {
+  let status = match ticketStatus(&server.*, state[67]) {
+    Option<ClientCertificateStatus>.Some { value } => move value
+    Option<ClientCertificateStatus>.None => {
       return ok()
-    }
-    if kind == 1 {
-      status = ClientCertificateStatus.Absent
-    } else {
-      status = ClientCertificateStatus.Resumed { trusted: kind == 2 }
     }
   }
 
@@ -2735,6 +2846,133 @@ fn evaluatePsk(server: &mut Server, parsed: &ParsedClientHello) -> Result<(), Se
     server.earlyLimit = readStateNumber(&state, 101, 4)
   }
   return ok()
+}
+
+// Opens the ticket at `handshake[start..start + length]` when the server sealed it under its
+// current key, and returns its state when the state's first byte is `version`: 1 for TLS 1.3 and
+// 2 for TLS 1.2. Any other ticket gives `None`, and the server does a full handshake.
+fn openTicket(server: &Server, start: usize, length: usize, version: u8) -> Option<[u8; 138]> {
+  if length != TICKET_LENGTH {
+    return Option<[u8; 138]>.none()
+  }
+  let mut ticket: [u8; 182] = [0; 182]
+  let mut index = usize.ZERO
+  while index < TICKET_LENGTH {
+    ticket[index] = usize.toU8(readU8Raw(&server.handshake, start + index))
+    index = index + usize.ONE
+  }
+  let name = server.ticketName
+  if !sameBytes(Slice.view<u8>(&ticket, 0, 16), &name) {
+    return Option<[u8; 138]>.none()
+  }
+  let mut state: [u8; 138] = [0; 138]
+  let key = server.ticketKey
+  let opened = AesGcm.open(
+    &key,
+    Slice.view<u8>(&ticket, 16, 12),
+    &name,
+    Slice.view<u8>(&ticket, 28, TICKET_STATE_LENGTH),
+    Slice.view<u8>(&ticket, 28 + TICKET_STATE_LENGTH, 16),
+    &mut state,
+  )
+  if let Result<(), AesGcmError>.Failure { error } = move opened {
+    drop error
+    return Option<[u8; 138]>.none()
+  }
+  if state[0] != version {
+    return Option<[u8; 138]>.none()
+  }
+  return Option<[u8; 138]>.some(state)
+}
+
+// Whether a ticket's state is younger than its lifetime at the server's time and names the
+// connection's server name.
+fn ticketFresh(server: &Server, state: &[u8; 138]) -> bool {
+  let issued = readStateNumber(state, 51, 8)
+  let lifetime = readStateNumber(state, 63, 4)
+  if server.ticketNow < issued || server.ticketNow - issued > lifetime * 1000 {
+    return false
+  }
+  let nameHash = serverNameDigest(server)
+  return (state[68] == 1) == server.hasServerName
+    && sameBytes(Slice.view<u8>(state, 69, 32), &nameHash)
+}
+
+// The client certificate status of a session whose ticket carries `kind` (see `statusKind`), or
+// `None` when the current `ClientAuth` would refuse the session.
+fn ticketStatus(server: &Server, kind: u8) -> Option<ClientCertificateStatus> {
+  if server.clientAuthMode == ClientAuthMode.Off {
+    return Option<ClientCertificateStatus>.some(ClientCertificateStatus.NotRequested)
+  }
+  if kind == 0 || (kind == 1 && server.clientAuthMode == ClientAuthMode.Required)
+    || (kind == 3 && server.rejectUntrusted) {
+    return Option<ClientCertificateStatus>.none()
+  }
+  if kind == 1 {
+    return Option<ClientCertificateStatus>.some(ClientCertificateStatus.Absent)
+  }
+  return Option<ClientCertificateStatus>.some(ClientCertificateStatus.Resumed { trusted: kind == 2 })
+}
+
+// Fills a ticket state for this connection: `version` (1 for TLS 1.3, 2 for TLS 1.2), the suite,
+// the 48-byte `secret`, the issue time, `ageAdd`, the lifetime, the client certificate status, the
+// server name digest, the early data limit, and the ALPN digest.
+fn ticketState(server: &Server, version: u8, secret: &[u8; 48], ageAdd: &[u8]) -> [u8; 138] {
+  let nameHash = serverNameDigest(server)
+  let alpnHash = alpnDigest(server)
+  let mut state: [u8; 138] = [0; 138]
+  state[0] = version
+  let mut at = usize.ONE
+  putStateNumber(&mut state, &mut at, suiteCode(server.selectedSuite), 2)
+  putStateBytes(&mut state, &mut at, secret)
+  putStateNumber(&mut state, &mut at, server.ticketNow, 8)
+  putStateBytes(&mut state, &mut at, ageAdd)
+  putStateNumber(&mut state, &mut at, server.ticketLifetime, 4)
+  state[at] = statusKind(&server.clientStatus)
+  at = at + usize.ONE
+  if server.hasServerName {
+    state[at] = 1
+  }
+  at = at + usize.ONE
+  putStateBytes(&mut state, &mut at, &nameHash)
+  let mut earlyData = server.ticketEarlyData
+  if version == 2 {
+    earlyData = 0
+  }
+  putStateNumber(&mut state, &mut at, earlyData, 4)
+  if server.hasSelectedAlpn {
+    state[at] = 1
+  }
+  at = at + usize.ONE
+  putStateBytes(&mut state, &mut at, &alpnHash)
+  return state
+}
+
+// Seals `state` under the ticket key with the 12-byte `nonce`: the key name, the nonce, the
+// encrypted state, and the tag.
+fn sealTicket(server: &Server, state: &[u8; 138], nonce: &[u8]) -> Result<[u8; 182], ServerError> {
+  let name = server.ticketName
+  let key = server.ticketKey
+  let mut ticket: [u8; 182] = [0; 182]
+  copyInto(&mut ticket, &name)
+  copyInto(Slice.viewMut<u8>(&mut ticket, 16, 12), nonce)
+  let mut tag: [u8; 16] = [0; 16]
+  let sealed = AesGcm.seal(
+    &key,
+    nonce,
+    &name,
+    state,
+    Slice.viewMut<u8>(&mut ticket, 28, TICKET_STATE_LENGTH),
+    &mut tag,
+  )
+  if let Result<(), AesGcmError>.Failure { error } = move sealed {
+    drop error
+    return Result<[u8; 182], ServerError>.failResult(
+      ServerError.ProtocolViolation { reason: ServerProtocolReason.InternalState },
+    )
+  }
+  copyInto(Slice.viewMut<u8>(&mut ticket, 28 + TICKET_STATE_LENGTH, 16), &tag)
+  return Result<[u8; 182], ServerError>.succeed(ticket)
 }
 
 // Whether the server takes the early data of a resumed session: the ticket allows it, there was
@@ -2919,6 +3157,16 @@ fn emptyParsed() -> ParsedClientHello {
     binderLength: 0,
     obfuscatedAge: 0,
     earlyData: false,
+    hasVersions: false,
+    tls12: false,
+    suite12: CipherSuite.EcdheEcdsaAes128GcmSha256,
+    hasSuite12: false,
+    extendedMaster: false,
+    renegotiation: false,
+    pointFormats: false,
+    sessionTicket: false,
+    ticketOffset: 0,
+    ticketLength: 0,
   }
 }
 
@@ -2955,6 +3203,18 @@ fn parseClientHello(server: &Server, end: usize) -> Result<ParsedClientHello, Se
   let suitesEnd = cursor + suitesLength
   while cursor < suitesEnd {
     let code = readU16Raw(buffer, cursor)
+    // TLS_EMPTY_RENEGOTIATION_INFO_SCSV (RFC 5746).
+    if code == 255 {
+      parsed.renegotiation = true
+    }
+    if !parsed.hasSuite12 {
+      if let Option<CipherSuite>.Some { value: suite } = CipherSuite.fromCode(code) {
+        if suite.version() == TlsVersion.Tls12 && keyServesTls12(&server.key, suite) {
+          parsed.suite12 = suite
+          parsed.hasSuite12 = true
+        }
+      }
+    }
     if !parsed.hasSuite {
       if let Option<CipherSuite>.Some { value: suite } = suiteFromCode(code) {
         parsed.suite = suite
@@ -3037,13 +3297,31 @@ fn parseClientHello(server: &Server, end: usize) -> Result<ParsedClientHello, Se
     } else if kind == 41 {
       sawPreSharedKey = true
       valid = parsePreSharedKey(buffer, cursor, length, &mut parsed)
+    } else if kind == 23 {
+      valid = length == 0
+      parsed.extendedMaster = true
+    } else if kind == 65281 {
+      // An initial handshake has an empty renegotiated_connection.
+      valid = length == 1 && readU8Raw(buffer, cursor) == 0
+      parsed.renegotiation = true
+    } else if kind == 11 {
+      valid = parsePointFormats(buffer, cursor, length, &mut parsed)
+    } else if kind == 35 {
+      // session_ticket (RFC 5077), empty or with a ticket to resume.
+      parsed.sessionTicket = true
+      parsed.ticketOffset = cursor
+      parsed.ticketLength = length
     }
     if !valid {
       return parseFailure(ServerProtocolReason.Extension)
     }
     cursor = cursor + length
   }
-  if parsed.tls13 && !onlyNull {
+  // Without supported_versions, the legacy version names the newest version the client offers.
+  if !parsed.hasVersions {
+    parsed.tls12 = readU16Raw(buffer, 4) >= 771
+  }
+  if (parsed.tls13 || parsed.tls12) && !onlyNull {
     return parseFailure(ServerProtocolReason.ClientHello)
   }
   if parsed.hasPsk && !parsed.hasPskModes {
@@ -3230,12 +3508,48 @@ fn parseVersions(
   }
   let mut cursor = start + usize.ONE
   while cursor < start + length {
-    if readU16Raw(buffer, cursor) == 772 {
+    let version = readU16Raw(buffer, cursor)
+    if version == 772 {
       parsed.tls13 = true
+    }
+    if version == 771 {
+      parsed.tls12 = true
     }
     cursor = cursor + 2
   }
+  parsed.hasVersions = true
   return true
+}
+
+// ec_point_formats (RFC 8422 section 5.1.2), which must list the uncompressed format.
+fn parsePointFormats(
+  buffer: &Intrinsic.RawBuffer<u8>,
+  start: usize,
+  length: usize,
+  parsed: &mut ParsedClientHello,
+) -> bool {
+  if length < 2 || readU8Raw(buffer, start) + 1 != length {
+    return false
+  }
+  let mut cursor = start + usize.ONE
+  while cursor < start + length {
+    if readU8Raw(buffer, cursor) == 0 {
+      parsed.pointFormats = true
+    }
+    cursor = cursor + usize.ONE
+  }
+  return parsed.pointFormats
+}
+
+// Whether `key` signs ServerKeyExchange for a TLS 1.2 `suite`: an ECDSA key for the ECDSA suites
+// and an RSA key for the RSA suites. Ed25519 keys serve only TLS 1.3.
+fn keyServesTls12(key: &SigningKey, suite: CipherSuite) -> bool {
+  return match &key.* {
+    SigningKey.EcdsaP256 { .. } => suite.isEcdsa()
+    SigningKey.EcdsaP384 { .. } => suite.isEcdsa()
+    SigningKey.Rsa { .. } => !suite.isEcdsa()
+    SigningKey.Ed25519 { .. } => false
+  }
 }
 
 fn parseKeyShares(
@@ -3400,10 +3714,11 @@ fn queueHelloRetry(server: &mut Server, messageLength: usize) -> Result<(), Serv
 fn queueScratch(server: &mut Server, length: usize) -> Result<(), ServerError> {
   // Every caller wrote `scratch[0..length]`, and `length <= SCRATCH_LENGTH`.
   let message = unsafe RawBuffer.view<u8>(&server.scratch, 0, length)
-  if server.secretLength == 48 {
-    server.transcript384.update(message)
-  } else {
+  if server.tls12 || server.secretLength != 48 {
     server.transcript256.update(message)
+  }
+  if server.tls12 || server.secretLength == 48 {
+    server.transcript384.update(message)
   }
   let queued = TlsRecordSender.queueRecord(&mut server.sender, ContentType.Handshake, message)
   return match move queued {
@@ -3420,24 +3735,28 @@ fn queueScratch(server: &mut Server, length: usize) -> Result<(), ServerError> {
 fn updateTranscriptHandshake(server: &mut Server, length: usize) -> () {
   // Every caller passes the length of the complete message in `handshake[0..handshakeLength]`.
   let message = unsafe RawBuffer.view<u8>(&server.handshake, 0, length)
-  if server.secretLength == 48 {
-    server.transcript384.update(message)
-  } else {
+  if server.tls12 || server.secretLength != 48 {
     server.transcript256.update(message)
+  }
+  if server.tls12 || server.secretLength == 48 {
+    server.transcript384.update(message)
   }
   return ()
 }
 
+// TLS 1.2 keeps both transcripts, since a client CertificateVerify can sign under either hash.
 fn updateTranscriptFlight(server: &mut Server, offset: usize, length: usize) -> () {
   // Every caller passes a message that `buildFlight` wrote within the flight buffer.
   let message = unsafe RawBuffer.view<u8>(&server.flight, offset, length)
-  if server.secretLength == 48 {
-    server.transcript384.update(message)
-  } else {
+  if server.tls12 || server.secretLength != 48 {
     server.transcript256.update(message)
+  }
+  if server.tls12 || server.secretLength == 48 {
+    server.transcript384.update(message)
   }
   return ()
 }
+
 
 fn transcriptHash(server: &Server) -> [u8; 48] {
   if server.secretLength == 48 {
@@ -3813,34 +4132,47 @@ effect fn buildCertificateMessages(server: &mut Server, cursor: &mut usize) -> R
 // profile admits no Ed25519 keys, so the server does not ask for ed25519.
 const CLIENT_SCHEMES: [usize; 5] = [1027, 1283, 2052, 2053, 2054]
 
+// The schemes that a TLS 1.2 client CertificateVerify may sign with. Each hashes with SHA-256 or
+// SHA-384, the two transcripts that TLS 1.2 keeps, and RSA keys may also use PKCS #1 v1.5.
+const CLIENT_SCHEMES_TLS12: [usize; 6] = [1027, 1283, 2052, 2053, 1025, 1281]
+
 effect fn handleClientCertificate(server: &mut Server, messageLength: usize) -> Result<
   (),
   ServerError
 >
   ! OutOfMemoryError
   ? &mut Allocator {
-  if messageLength < 8 {
+  // TLS 1.3 has a request context and extensions for each entry (RFC 8446 section 4.4.2), and
+  // TLS 1.2 has neither (RFC 5246 section 7.4.6).
+  let tls12 = server.tls12
+  let mut listStart: usize = 5
+  let mut entryTrailer: usize = 2
+  if tls12 {
+    listStart = 4
+    entryTrailer = 0
+  }
+  if messageLength < listStart + 3 {
     return violation(ServerProtocolReason.ClientCertificate)
   }
 
   // The request context must be empty, as the CertificateRequest's was.
-  if readU8Raw(&server.handshake, 4) != 0 {
+  if !tls12 && readU8Raw(&server.handshake, 4) != 0 {
     return violation(ServerProtocolReason.ClientCertificate)
   }
-  let listLength = readU24Raw(&server.handshake, 5)
-  if listLength + 8 != messageLength {
+  let listLength = readU24Raw(&server.handshake, listStart)
+  if listLength + listStart + 3 != messageLength {
     return violation(ServerProtocolReason.ClientCertificate)
   }
   let limits = server.limits
-  let mut cursor: usize = 8
+  let mut cursor: usize = listStart + 3
   let mut total = usize.ZERO
   while cursor < messageLength {
-    if messageLength - cursor < 5 {
+    if messageLength - cursor < 3 + entryTrailer {
       return violation(ServerProtocolReason.ClientCertificate)
     }
     let derLength = readU24Raw(&server.handshake, cursor)
     cursor = cursor + 3
-    if derLength == 0 || derLength > messageLength - cursor - 2 {
+    if derLength == 0 || derLength > messageLength - cursor - entryTrailer {
       return violation(ServerProtocolReason.ClientCertificate)
     }
     if List<Certificate>.length(&server.clientChain) >= limits.clientCertificates {
@@ -3872,6 +4204,7 @@ effect fn handleClientCertificate(server: &mut Server, messageLength: usize) -> 
     run List<Certificate>.append(&mut server.clientChain, move certificate)
     total = total + derLength
     cursor = cursor + derLength
+    if tls12 { continue }
     let extensionLength = readU16Raw(&server.handshake, cursor)
     cursor = cursor + 2
     if extensionLength > limits.extensionBytes {
@@ -3896,6 +4229,9 @@ effect fn handleClientCertificate(server: &mut Server, messageLength: usize) -> 
     }
     server.clientStatus = ClientCertificateStatus.Absent
     server.state = ServerState.AwaitClientFinished
+    if tls12 {
+      server.state = ServerState.Tls12AwaitKeyExchange
+    }
     return ok()
   }
   let anchors = TrustSnapshot.anchors(&server.clientTrust)
@@ -3919,6 +4255,11 @@ effect fn handleClientCertificate(server: &mut Server, messageLength: usize) -> 
   }
   server.clientStatus = move status
   server.state = ServerState.AwaitClientCertificateVerify
+  if tls12 {
+    // The client's CertificateVerify follows its ClientKeyExchange.
+    server.tls12VerifyExpected = true
+    server.state = ServerState.Tls12AwaitKeyExchange
+  }
   return ok()
 }
 
@@ -3933,6 +4274,9 @@ fn handleClientCertificateVerify(server: &mut Server, messageLength: usize) -> R
   let signatureLength = readU16Raw(&server.handshake, 6)
   if signatureLength == 0 || signatureLength + 8 != messageLength {
     return violation(ServerProtocolReason.ClientCertificate)
+  }
+  if server.tls12 {
+    return handleClientCertificateVerifyTls12(&mut server.*, messageLength, scheme, signatureLength)
   }
   let mut offered = false
   let mut index = usize.ZERO
@@ -3964,7 +4308,7 @@ fn handleClientCertificateVerify(server: &mut Server, messageLength: usize) -> R
   let content = unsafe RawBuffer.view<u8>(&server.scratch, 0, contentLength)
   let signature = unsafe RawBuffer.view<u8>(&server.handshake, 8, signatureLength)
   let certificates = List<Certificate>.asSlice(&server.clientChain)
-  let verified = HandshakeSignature.verify(&certificates[0], scheme, content, signature)
+  let verified = HandshakeSignature.verify(&certificates[0], scheme, content, signature, TlsVersion.Tls13)
   drop content
   drop signature
   if let Result<(), SignatureFailure>.Failure { error } = move verified {
@@ -4058,11 +4402,6 @@ effect fn handleClientFinished(server: &mut Server, messageLength: usize) -> Res
 effect fn buildTickets(server: &mut Server, resumption: &[u8; 48]) -> Result<(), ServerError>
   ? &mut Random {
   let length = server.secretLength
-  let nameHash = serverNameDigest(&server.*)
-  let alpnHash = alpnDigest(&server.*)
-  let name = server.ticketName
-  let key = server.ticketKey
-  let kind = statusKind(&server.clientStatus)
   let mut cursor = usize.ZERO
   let mut index = usize.ZERO
   while index < server.ticketCount {
@@ -4082,52 +4421,12 @@ effect fn buildTickets(server: &mut Server, resumption: &[u8; 48]) -> Result<(),
     // `random[0..4]` is the ticket's age_add, and `random[4..16]` is its AES-GCM nonce.
     let mut random: [u8; 16] = [0; 16]
     run Random.fillBytes(&mut random)
-    let mut state: [u8; 138] = [0; 138]
-    let mut at = usize.ZERO
-    state[0] = 1
-    at = 1
-    putStateNumber(&mut state, &mut at, suiteCode(server.selectedSuite), 2)
-    putStateBytes(&mut state, &mut at, &psk)
-    putStateNumber(&mut state, &mut at, server.ticketNow, 8)
-    putStateBytes(&mut state, &mut at, Slice.view<u8>(&random, 0, 4))
-    putStateNumber(&mut state, &mut at, server.ticketLifetime, 4)
-    state[at] = kind
-    at = at + usize.ONE
-    if server.hasServerName {
-      state[at] = 1
-    }
-    at = at + usize.ONE
-    putStateBytes(&mut state, &mut at, &nameHash)
-    putStateNumber(&mut state, &mut at, server.ticketEarlyData, 4)
-    if server.hasSelectedAlpn {
-      state[at] = 1
-    }
-    at = at + usize.ONE
-    putStateBytes(&mut state, &mut at, &alpnHash)
-    let mut ticket: [u8; 182] = [0; 182]
-    copyInto(&mut ticket, &name)
-    let mut tag: [u8; 16] = [0; 16]
-    let sealed = AesGcm.seal(
-      &key,
-      Slice.view<u8>(&random, 4, 12),
-      &name,
-      &state,
-      Slice.viewMut<u8>(&mut ticket, 28, TICKET_STATE_LENGTH),
-      &mut tag,
-    )
-    if let Result<(), AesGcmError>.Failure { error } = move sealed {
-      drop error
-      return violation(ServerProtocolReason.InternalState)
-    }
-    let mut tagIndex = usize.ZERO
-    while tagIndex < 12 {
-      ticket[16 + tagIndex] = random[4 + tagIndex]
-      tagIndex = tagIndex + usize.ONE
-    }
-    tagIndex = 0
-    while tagIndex < 16 {
-      ticket[28 + TICKET_STATE_LENGTH + tagIndex] = tag[tagIndex]
-      tagIndex = tagIndex + usize.ONE
+    let state = ticketState(&server.*, 1, &psk, Slice.view<u8>(&random, 0, 4))
+    let ticket = match sealTicket(&server.*, &state, Slice.view<u8>(&random, 4, 12)) {
+      Result<[u8; 182], ServerError>.Success { value } => value
+      Result<[u8; 182], ServerError>.Failure { error } => {
+        return failure(error)
+      }
     }
 
     // The flight buffer holds `chainLength + FLIGHT_OVERHEAD` bytes, more than
@@ -4167,6 +4466,63 @@ effect fn buildTickets(server: &mut Server, resumption: &[u8; 48]) -> Result<(),
 
 // The client certificate status that a ticket carries: 0 for none requested, 1 for absent, 2 for
 // trusted, and 3 for untrusted.
+// A TLS 1.2 CertificateVerify signs the hash of the handshake messages through
+// ClientKeyExchange under the scheme's hash (RFC 5246 section 7.4.8).
+fn handleClientCertificateVerifyTls12(
+  server: &mut Server,
+  messageLength: usize,
+  scheme: usize,
+  signatureLength: usize,
+) -> Result<(), ServerError> {
+  let mut offered = false
+  let mut index = usize.ZERO
+  while index < CLIENT_SCHEMES_TLS12.length {
+    if CLIENT_SCHEMES_TLS12[index] == scheme {
+      offered = true
+    }
+    index = index + usize.ONE
+  }
+  if !offered {
+    return failure(
+      ServerError.ClientCertificateVerify { error: SignatureFailure.UnsupportedScheme },
+    )
+  }
+  let mut digest = zero48()
+  let mut digestLength: usize = 32
+  if wideDigest(scheme) {
+    digest = server.transcript384.checkpoint()
+    digestLength = 48
+  } else {
+    let short = server.transcript256.checkpoint()
+    digest = fixed48(&short)
+  }
+  // `8 + signatureLength == messageLength` keeps the signature within the complete message.
+  let signature = unsafe RawBuffer.view<u8>(&server.handshake, 8, signatureLength)
+  let certificates = List<Certificate>.asSlice(&server.clientChain)
+  let verified = HandshakeSignature.verifyDigest(
+    &certificates[0],
+    scheme,
+    Slice.view<u8>(&digest, 0, digestLength),
+    signature,
+  )
+  drop signature
+  if let Result<(), SignatureFailure>.Failure { error } = move verified {
+    return failure(ServerError.ClientCertificateVerify { error: error })
+  }
+  updateTranscriptHandshake(&mut server.*, messageLength)
+  server.tls12VerifyExpected = false
+  server.state = ServerState.Tls12AwaitCcs
+  return ok()
+}
+
+// Whether a TLS 1.2 CertificateVerify scheme hashes with SHA-384.
+fn wideDigest(scheme: usize) -> bool {
+  return match HandshakeSignature.digestLength(scheme) {
+    Option<usize>.Some { value } => value == 48
+    Option<usize>.None => false
+  }
+}
+
 fn statusKind(status: &ClientCertificateStatus) -> u8 {
   return match &status.* {
     ClientCertificateStatus.NotRequested => 0
@@ -4359,4 +4715,529 @@ fn finishedData(length: usize, secret: &[u8; 48], hash: &[u8; 48]) -> Result<
   }
   let value = HmacSha256.authenticate(Slice.view<u8>(&key, 0, 32), Slice.view<u8>(hash, 0, 32))
   return Result<[u8; 48], ServerError>.succeed(fixed48(&value))
+}
+
+// TLS 1.2 (RFC 5246): ECDHE key exchange, AEAD suites, and the extended master secret (RFC 7627).
+
+// A TLS 1.2 ClientHello. The server requires extended_master_secret and signature_algorithms, picks
+// the first TLS 1.2 suite in the client's order that its key signs, and sends its whole flight:
+// ServerHello, Certificate, ServerKeyExchange, and ServerHelloDone.
+effect fn handleClientHelloTls12(
+  server: &mut Server,
+  messageLength: usize,
+  parsed: &ParsedClientHello,
+) -> Result<(), ServerError>
+  ? &mut Random {
+  if !parsed.hasSuite12 {
+    return failure(ServerError.Negotiation { failure: NegotiationFailure.CipherSuite })
+  }
+  if !parsed.extendedMaster {
+    return failure(ServerError.Negotiation { failure: NegotiationFailure.ExtendedMasterSecret })
+  }
+  // Without signature_algorithms, a TLS 1.2 client accepts only SHA-1, which the server does not
+  // sign with.
+  if !parsed.hasSchemes {
+    return failure(ServerError.Negotiation { failure: NegotiationFailure.SignatureScheme })
+  }
+  let scheme = match server.key.chooseScheme(&parsed.schemes, TlsVersion.Tls12) {
+    Option<usize>.Some { value } => value
+    Option<usize>.None => {
+      return failure(ServerError.Negotiation { failure: NegotiationFailure.SignatureScheme })
+    }
+  }
+  // An ECDSA certificate's curve must be one that the client lists (RFC 8422 section 5.1).
+  let curveListed = match &server.key {
+    SigningKey.EcdsaP256 { .. } => parsed.listsP256
+    SigningKey.EcdsaP384 { .. } => parsed.listsP384
+    _ => true
+  }
+  if !curveListed {
+    return failure(ServerError.Negotiation { failure: NegotiationFailure.Group })
+  }
+  let policy = server.groups
+  let mut found = false
+  let mut index = usize.ZERO
+  while index < 3 && !found {
+    let group = groupAt(index)
+    if groupAllowed(policy, group) && groupListed(&parsed.*, group) {
+      server.selectedGroup = group
+      found = true
+    }
+    index = index + usize.ONE
+  }
+  if !found {
+    return failure(ServerError.Negotiation { failure: NegotiationFailure.Group })
+  }
+  server.tls12 = true
+  server.scheme = scheme
+  server.selectedSuite = parsed.suite12
+  server.secretLength = parsed.suite12.hashLength()
+  storeServerName(&mut server.*, &parsed.*)
+  let alpn = selectAlpn(&mut server.*, &parsed.*)
+  if let Result<(), ServerError>.Failure { error } = move alpn {
+    return failure(error)
+  }
+  index = 0
+  while index < 32 {
+    server.clientRandom[index] = usize.toU8(readU8Raw(&server.handshake, 6 + index))
+    index = index + usize.ONE
+  }
+  updateTranscriptHandshake(&mut server.*, messageLength)
+  let tickets = server.ticketsEnabled && server.ticketNowValid && parsed.sessionTicket
+  if tickets && resumeTls12(&mut server.*, &parsed.*) {
+    return run buildTls12ResumedHello(&mut server.*, parsed.renegotiation, parsed.pointFormats)
+  }
+  server.tls12IssueTicket = tickets
+  return run buildTls12Flight(&mut server.*, parsed.renegotiation, parsed.pointFormats)
+}
+
+// Resumes the session of the client's session_ticket when the server sealed it, it is still
+// valid, and it has the suite that this ClientHello gets (RFC 5077 section 3.4). The ClientHello
+// must also carry a session ID, which the ServerHello echoes to tell the client.
+fn resumeTls12(server: &mut Server, parsed: &ParsedClientHello) -> bool {
+  if parsed.sessionLength == 0 {
+    return false
+  }
+  let state = match openTicket(&server.*, parsed.ticketOffset, parsed.ticketLength, 2) {
+    Option<[u8; 138]>.Some { value } => value
+    Option<[u8; 138]>.None => {
+      return false
+    }
+  }
+  if readStateNumber(&state, 1, 2) != suiteCode(server.selectedSuite) || !ticketFresh(&server.*, &state) {
+    return false
+  }
+  let status = match ticketStatus(&server.*, state[67]) {
+    Option<ClientCertificateStatus>.Some { value } => move value
+    Option<ClientCertificateStatus>.None => {
+      return false
+    }
+  }
+  let master = fixed48(Slice.view<u8>(&state, 3, 48))
+  storeSession(&mut server.*, &parsed.*)
+  server.masterSecret = master
+  server.clientStatus = move status
+  server.pskAccepted = true
+  return true
+}
+
+// The ServerHello of a resumed TLS 1.2 session, after which the server sends its
+// ChangeCipherSpec and Finished.
+effect fn buildTls12ResumedHello(server: &mut Server, renegotiation: bool, pointFormats: bool) -> Result<
+  (),
+  ServerError
+>
+  ? &mut Random {
+  let mut cursor = usize.ZERO
+  run putTls12ServerHello(&mut server.*, &mut cursor, renegotiation, pointFormats)
+  let suite = server.selectedSuite
+  let master = server.masterSecret
+  let clientRandom = server.clientRandom
+  let serverRandom = server.serverRandom
+  server.tls12Keys = TlsPrf.keys(suite, &master, &clientRandom, &serverRandom)
+  server.flightLength = cursor
+  server.flightOffset = 0
+  server.state = ServerState.ServerFlightPending
+  return queueFlightChunk(&mut server.*, PendingKind.Tls12Flight)
+}
+
+// Writes the TLS 1.2 ServerHello at `cursor` in the flight buffer and adds it to the transcript.
+// It echoes the client's session ID only when resuming, since the server keeps no session cache.
+effect fn putTls12ServerHello(
+  server: &mut Server,
+  cursor: &mut usize,
+  renegotiation: bool,
+  pointFormats: bool,
+) -> ()
+  ? &mut Random {
+  let mut serverRandom = zero32()
+  run Random.fillBytes(&mut serverRandom)
+  // "DOWNGRD" and 1: a server that also accepts TLS 1.3 (RFC 8446 section 4.1.3).
+  if server.versions.allows(TlsVersion.Tls13) {
+    let sentinel: [u8; 8] = [68, 79, 87, 78, 71, 82, 68, 1]
+    let mut index = usize.ZERO
+    while index < 8 {
+      serverRandom[24 + index] = sentinel[index]
+      index = index + usize.ONE
+    }
+  }
+  server.serverRandom = serverRandom
+  let helloStart = cursor.*
+  putU8(&mut server.flight, &mut cursor.*, 2)
+  putU24(&mut server.flight, &mut cursor.*, 0)
+  putU16(&mut server.flight, &mut cursor.*, 771)
+  putSlice(&mut server.flight, &mut cursor.*, &serverRandom)
+  let mut sessionLength = usize.ZERO
+  if server.pskAccepted {
+    sessionLength = server.sessionIdLength
+  }
+  putU8(&mut server.flight, &mut cursor.*, usize.toU8(sessionLength))
+  let sessionId = server.sessionId
+  putSlice(&mut server.flight, &mut cursor.*, Slice.view<u8>(&sessionId, 0, sessionLength))
+  putU16(&mut server.flight, &mut cursor.*, server.selectedSuite.code())
+  putU8(&mut server.flight, &mut cursor.*, 0)
+  let extensionsAt = cursor.*
+  putU16(&mut server.flight, &mut cursor.*, 0)
+  putU16(&mut server.flight, &mut cursor.*, 23)
+  putU16(&mut server.flight, &mut cursor.*, 0)
+  if renegotiation {
+    putU16(&mut server.flight, &mut cursor.*, 65281)
+    putU16(&mut server.flight, &mut cursor.*, 1)
+    putU8(&mut server.flight, &mut cursor.*, 0)
+  }
+  if pointFormats {
+    putU16(&mut server.flight, &mut cursor.*, 11)
+    putU16(&mut server.flight, &mut cursor.*, 2)
+    putU8(&mut server.flight, &mut cursor.*, 1)
+    putU8(&mut server.flight, &mut cursor.*, 0)
+  }
+  // An empty session_ticket: the server sends a NewSessionTicket before its ChangeCipherSpec.
+  if server.tls12IssueTicket {
+    putU16(&mut server.flight, &mut cursor.*, 35)
+    putU16(&mut server.flight, &mut cursor.*, 0)
+  }
+  if server.hasSelectedAlpn {
+    let offset = server.alpnOffsets[server.selectedAlpnIndex]
+    let protocolLength = server.alpnLengths[server.selectedAlpnIndex]
+    putU16(&mut server.flight, &mut cursor.*, 16)
+    putU16(&mut server.flight, &mut cursor.*, protocolLength + 3)
+    putU16(&mut server.flight, &mut cursor.*, protocolLength + usize.ONE)
+    putU8(&mut server.flight, &mut cursor.*, usize.toU8(protocolLength))
+    let mut index = usize.ZERO
+    while index < protocolLength {
+      let byte = usize.toU8(readU8Raw(&server.alpn, offset + index))
+      putU8(&mut server.flight, &mut cursor.*, byte)
+      index = index + usize.ONE
+    }
+  }
+  setU16(&mut server.flight, extensionsAt, cursor.* - extensionsAt - 2)
+  setU24(&mut server.flight, helloStart + usize.ONE, cursor.* - helloStart - HANDSHAKE_HEADER_LENGTH)
+  updateTranscriptFlight(&mut server.*, helloStart, cursor.* - helloStart)
+  return ()
+}
+
+effect fn buildTls12Flight(server: &mut Server, renegotiation: bool, pointFormats: bool) -> Result<
+  (),
+  ServerError
+>
+  ? &mut Random {
+  let mut cursor = usize.ZERO
+  run putTls12ServerHello(&mut server.*, &mut cursor, renegotiation, pointFormats)
+
+  // Certificate. TLS 1.2 entries have no extensions, so each drops the 2 bytes that `make` wrote
+  // after its DER.
+  let certificateStart = cursor
+  putU8(&mut server.flight, &mut cursor, 11)
+  putU24(&mut server.flight, &mut cursor, 0)
+  putU24(&mut server.flight, &mut cursor, 0)
+  let chainLength = server.chainLength
+  let mut chainCursor = usize.ZERO
+  while chainCursor < chainLength {
+    let derLength = readU24Raw(&server.chain, chainCursor)
+    putU24(&mut server.flight, &mut cursor, derLength)
+    // `make` wrote each entry as a 3-byte length, the DER, and 2 bytes, within `chainLength`.
+    let der = unsafe RawBuffer.view<u8>(&server.chain, chainCursor + 3, derLength)
+    putSlice(&mut server.flight, &mut cursor, der)
+    drop der
+    chainCursor = chainCursor + 3 + derLength + 2
+  }
+  setU24(&mut server.flight, certificateStart + 4, cursor - certificateStart - 7)
+  setU24(&mut server.flight, certificateStart + usize.ONE, cursor - certificateStart - HANDSHAKE_HEADER_LENGTH)
+  updateTranscriptFlight(&mut server.*, certificateStart, cursor - certificateStart)
+
+  // ServerKeyExchange: named_curve parameters with a new share, signed over both hello random
+  // values and the parameters.
+  let mut publicKey: [u8; 97] = [0; 97]
+  let group = server.selectedGroup
+  let publicLength = groupKeyLength(group)
+  if group == ServerGroup.X25519 {
+    let secret = run X25519.generate()
+    copyInto(&mut publicKey, &X25519.publicKey(&secret))
+    server.share = ServerShare.X25519 { value: move secret }
+  } else if group == ServerGroup.P256 {
+    let secret = run P256.generate()
+    copyInto(&mut publicKey, &P256.publicKey(&secret))
+    server.share = ServerShare.P256 { value: move secret }
+  } else {
+    let secret = run P384.generate()
+    copyInto(&mut publicKey, &P384.publicKey(&secret))
+    server.share = ServerShare.P384 { value: move secret }
+  }
+  let keyExchangeStart = cursor
+  putU8(&mut server.flight, &mut cursor, 12)
+  putU24(&mut server.flight, &mut cursor, 0)
+  let paramsStart = cursor
+  putU8(&mut server.flight, &mut cursor, 3)
+  putU16(&mut server.flight, &mut cursor, groupCode(group))
+  putU8(&mut server.flight, &mut cursor, usize.toU8(publicLength))
+  putSlice(&mut server.flight, &mut cursor, Slice.view<u8>(&publicKey, 0, publicLength))
+  let paramsLength = cursor - paramsStart
+  let clientRandom = server.clientRandom
+  let serverRandom = server.serverRandom
+  let mut contentLength = usize.ZERO
+  putSlice(&mut server.scratch, &mut contentLength, &clientRandom)
+  putSlice(&mut server.scratch, &mut contentLength, &serverRandom)
+  // The parameters are at most 101 bytes, so the content fits the scratch buffer.
+  let params = unsafe RawBuffer.view<u8>(&server.flight, paramsStart, paramsLength)
+  unsafe RawBuffer.copy<u8>(&mut server.scratch, contentLength, params, paramsLength)
+  drop params
+  contentLength = contentLength + paramsLength
+  let mut signature: [u8; 1024] = [0; 1024]
+  // The lines above wrote every byte of `scratch[0..contentLength]`.
+  let content = unsafe RawBuffer.view<u8>(&server.scratch, 0, contentLength)
+  let signed = run server.key.sign(server.scheme, content, &mut signature)
+  drop content
+  let signatureLength = match move signed {
+    Result<usize, SigningError>.Failure { error } => {
+      return failure(ServerError.Signing { error: error })
+    }
+    Result<usize, SigningError>.Success { value } => value
+  }
+  putU16(&mut server.flight, &mut cursor, server.scheme)
+  putU16(&mut server.flight, &mut cursor, signatureLength)
+  putSlice(&mut server.flight, &mut cursor, Slice.view<u8>(&signature, 0, signatureLength))
+  setU24(&mut server.flight, keyExchangeStart + usize.ONE, cursor - keyExchangeStart - HANDSHAKE_HEADER_LENGTH)
+  updateTranscriptFlight(&mut server.*, keyExchangeStart, cursor - keyExchangeStart)
+
+  // CertificateRequest: the certificate types rsa_sign and ecdsa_sign, the schemes that
+  // CertificateVerify can sign by digest, and no certificate authorities.
+  if server.clientAuthMode != ClientAuthMode.Off {
+    let requestStart = cursor
+    putU8(&mut server.flight, &mut cursor, 13)
+    putU24(&mut server.flight, &mut cursor, 1 + 2 + 2 + 2 * CLIENT_SCHEMES_TLS12.length + 2)
+    putU8(&mut server.flight, &mut cursor, 2)
+    putU8(&mut server.flight, &mut cursor, 1)
+    putU8(&mut server.flight, &mut cursor, 64)
+    putU16(&mut server.flight, &mut cursor, 2 * CLIENT_SCHEMES_TLS12.length)
+    let mut schemeIndex = usize.ZERO
+    while schemeIndex < CLIENT_SCHEMES_TLS12.length {
+      putU16(&mut server.flight, &mut cursor, CLIENT_SCHEMES_TLS12[schemeIndex])
+      schemeIndex = schemeIndex + usize.ONE
+    }
+    putU16(&mut server.flight, &mut cursor, 0)
+    updateTranscriptFlight(&mut server.*, requestStart, cursor - requestStart)
+  }
+
+  // ServerHelloDone.
+  let doneStart = cursor
+  putU8(&mut server.flight, &mut cursor, 14)
+  putU24(&mut server.flight, &mut cursor, 0)
+  updateTranscriptFlight(&mut server.*, doneStart, cursor - doneStart)
+  server.flightLength = cursor
+  server.flightOffset = 0
+  server.state = ServerState.ServerFlightPending
+  return queueFlightChunk(&mut server.*, PendingKind.Tls12Flight)
+}
+
+// ClientKeyExchange with the client's share for the selected group. The server derives the
+// extended master secret over the transcript through it, and the traffic keys.
+fn handleClientKeyExchange(server: &mut Server, messageLength: usize) -> Result<(), ServerError> {
+  if messageLength < 5 {
+    return violation(ServerProtocolReason.InvalidLength)
+  }
+  let pointLength = readU8Raw(&server.handshake, 4)
+  if pointLength + 5 != messageLength {
+    return violation(ServerProtocolReason.InvalidLength)
+  }
+  if pointLength != groupKeyLength(server.selectedGroup) {
+    return failure(ServerError.InvalidKeyShare)
+  }
+  // `pointLength + 5 == messageLength`, within the complete message.
+  let peer = unsafe RawBuffer.view<u8>(&server.handshake, 5, pointLength)
+  let share = Intrinsic.replace(server.share, ServerShare.None)
+  let mut preMaster = zero48()
+  let mut preMasterLength = usize.ZERO
+  let mut agreed = true
+  match move share {
+    ServerShare.X25519 { value } => {
+      match move X25519.agree(move value, peer) {
+        Result<[u8; 32], X25519Error>.Failure { error } => {
+          drop error
+          agreed = false
+        }
+        Result<[u8; 32], X25519Error>.Success { value: shared } => {
+          copyInto(&mut preMaster, &shared)
+          preMasterLength = 32
+        }
+      }
+    }
+    ServerShare.P256 { value } => {
+      match move P256.agree(move value, peer) {
+        Result<[u8; 32], P256Error>.Failure { error } => {
+          drop error
+          agreed = false
+        }
+        Result<[u8; 32], P256Error>.Success { value: shared } => {
+          copyInto(&mut preMaster, &shared)
+          preMasterLength = 32
+        }
+      }
+    }
+    ServerShare.P384 { value } => {
+      match move P384.agree(move value, peer) {
+        Result<[u8; 48], P384Error>.Failure { error } => {
+          drop error
+          agreed = false
+        }
+        Result<[u8; 48], P384Error>.Success { value: shared } => {
+          copyInto(&mut preMaster, &shared)
+          preMasterLength = 48
+        }
+      }
+    }
+    ServerShare.None => {
+      return violation(ServerProtocolReason.InternalState)
+    }
+  }
+  drop peer
+  if !agreed {
+    return failure(ServerError.InvalidKeyShare)
+  }
+  updateTranscriptHandshake(&mut server.*, messageLength)
+  let suite = server.selectedSuite
+  let sessionHash = transcriptHash(&server.*)
+  let master = TlsPrf.extendedMasterSecret(
+    suite,
+    Slice.view<u8>(&preMaster, 0, preMasterLength),
+    secretView(&sessionHash, server.secretLength),
+  )
+  let clientRandom = server.clientRandom
+  let serverRandom = server.serverRandom
+  server.masterSecret = master
+  server.tls12Keys = TlsPrf.keys(suite, &master, &clientRandom, &serverRandom)
+  server.state = ServerState.Tls12AwaitCcs
+  if server.tls12VerifyExpected {
+    server.state = ServerState.Tls12AwaitClientCertificateVerify
+  }
+  return ok()
+}
+
+// The client's ChangeCipherSpec, after which its records use the new keys.
+fn handleTls12ChangeCipherSpec(server: &mut Server, contentLength: usize) -> Result<(), ServerError> {
+  if server.state != ServerState.Tls12AwaitCcs || contentLength != 1 {
+    return violation(ServerProtocolReason.UnexpectedMessage)
+  }
+  let mut ccs: [u8; 1] = [0]
+  let consumed = TlsRecordReceiver.consumeRecordInto(&mut server.receiver, &mut ccs)
+  if let Result<usize, RecordError>.Failure { error } = move consumed {
+    return failure(mapRecordError(move error))
+  }
+  if ccs[0] != 1 {
+    return violation(ServerProtocolReason.UnexpectedMessage)
+  }
+  let keys = server.tls12Keys
+  let replaced = TlsRecordReceiver.replaceEpochTls12(
+    &mut server.receiver,
+    server.selectedSuite,
+    Slice.view<u8>(&keys.clientKey, 0, keys.keyLength),
+    Slice.view<u8>(&keys.clientIv, 0, keys.ivLength),
+  )
+  if let Result<(), ServerError>.Failure { error } = recordUnit(move replaced) {
+    return failure(error)
+  }
+  server.state = ServerState.Tls12AwaitFinished
+  return ok()
+}
+
+// The client's Finished, over the transcript before it. In a full handshake the server answers
+// with a NewSessionTicket when it issues one, its ChangeCipherSpec, and Finished. In a resumed
+// session the client's Finished comes last.
+effect fn handleClientFinishedTls12(server: &mut Server, messageLength: usize) -> Result<(), ServerError>
+  ? &mut Random {
+  if messageLength != HANDSHAKE_HEADER_LENGTH + VERIFY_DATA_LENGTH
+    || messageLength != server.handshakeLength {
+    return violation(ServerProtocolReason.InvalidLength)
+  }
+  let suite = server.selectedSuite
+  let master = server.masterSecret
+  let hash = transcriptHash(&server.*)
+  let expected = TlsPrf.finished(suite, &master, true, secretView(&hash, server.secretLength))
+  // `messageLength == HANDSHAKE_HEADER_LENGTH + VERIFY_DATA_LENGTH == handshakeLength`.
+  let supplied = unsafe RawBuffer.view<u8>(&server.handshake, HANDSHAKE_HEADER_LENGTH, VERIFY_DATA_LENGTH)
+  if !constantWorkEqual(supplied, &expected) {
+    return failure(ServerError.Finished)
+  }
+  drop supplied
+  updateTranscriptHandshake(&mut server.*, messageLength)
+  if server.pskAccepted {
+    server.state = ServerState.Traffic
+    server.completeReady = true
+    return ok()
+  }
+  server.state = ServerState.Tls12FinishedPending
+  if !server.tls12IssueTicket {
+    return queueTls12ChangeCipherSpec(&mut server.*)
+  }
+  // NewSessionTicket (RFC 5077 section 3.3): the lifetime hint and the ticket, which seals the
+  // master secret.
+  let mut nonce: [u8; 12] = [0; 12]
+  run Random.fillBytes(&mut nonce)
+  let none: [u8; 4] = [0; 4]
+  let state = ticketState(&server.*, 2, &master, &none)
+  let ticket = match sealTicket(&server.*, &state, &nonce) {
+    Result<[u8; 182], ServerError>.Success { value } => value
+    Result<[u8; 182], ServerError>.Failure { error } => {
+      return failure(error)
+    }
+  }
+  let mut message: [u8; 192] = [0; 192]
+  message[0] = 4
+  message[3] = usize.toU8(4 + 2 + TICKET_LENGTH)
+  let lifetime = server.ticketLifetime
+  message[4] = usize.toU8(lifetime / 16777216)
+  message[5] = usize.toU8(lifetime / 65536 % 256)
+  message[6] = usize.toU8(lifetime / 256 % 256)
+  message[7] = usize.toU8(lifetime % 256)
+  message[9] = usize.toU8(TICKET_LENGTH)
+  copyInto(Slice.viewMut<u8>(&mut message, 10, TICKET_LENGTH), &ticket)
+  server.transcript256.update(&message)
+  server.transcript384.update(&message)
+  let queued = queueRecordUnit(&mut server.*, ContentType.Handshake, &message)
+  if let Result<usize, ServerError>.Failure { error } = move queued {
+    return failure(error)
+  }
+  server.pendingKind = PendingKind.Tls12Ticket
+  return ok()
+}
+
+fn queueTls12ChangeCipherSpec(server: &mut Server) -> Result<(), ServerError> {
+  let ccs: [u8; 1] = [1]
+  let queued = queueRecordUnit(&mut server.*, ContentType.ChangeCipherSpec, &ccs)
+  if let Result<usize, ServerError>.Failure { error } = move queued {
+    return failure(error)
+  }
+  server.pendingKind = PendingKind.Tls12Ccs
+  return ok()
+}
+
+// After its ChangeCipherSpec, the server protects its records with the new keys and sends
+// Finished over the transcript through the client's Finished.
+fn queueTls12Finished(server: &mut Server) -> Result<(), ServerError> {
+  let suite = server.selectedSuite
+  let keys = server.tls12Keys
+  let replaced = TlsRecordSender.replaceEpochTls12(
+    &mut server.sender,
+    suite,
+    Slice.view<u8>(&keys.serverKey, 0, keys.keyLength),
+    Slice.view<u8>(&keys.serverIv, 0, keys.ivLength),
+  )
+  if let Result<(), ServerError>.Failure { error } = recordUnit(move replaced) {
+    return failure(error)
+  }
+  let master = server.masterSecret
+  let hash = transcriptHash(&server.*)
+  let verifyData = TlsPrf.finished(suite, &master, false, secretView(&hash, server.secretLength))
+  let mut message: [u8; 16] = [20, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  copyInto(Slice.viewMut<u8>(&mut message, HANDSHAKE_HEADER_LENGTH, VERIFY_DATA_LENGTH), &verifyData)
+  // In a resumed session the client's Finished also covers this one.
+  if server.pskAccepted {
+    server.transcript256.update(&message)
+    server.transcript384.update(&message)
+  }
+  let queued = queueRecordUnit(&mut server.*, ContentType.Handshake, &message)
+  if let Result<usize, ServerError>.Failure { error } = move queued {
+    return failure(error)
+  }
+  server.pendingKind = PendingKind.Tls12Finished
+  return ok()
 }

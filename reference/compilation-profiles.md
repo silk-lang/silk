@@ -73,7 +73,7 @@ final-link setting outside the profile's identity, and another target refuses it
 unsupported combination.
 
 A profile may set `codegen-units`, a whole number from 1 to 256: how many codegen units an
-optimized native executable splits into (16 when unset; `1` keeps one module). It changes no
+optimized native executable splits into (one module when unset or `1`). It changes no
 source-visible fact, but it is part of the profile's identity, so each count keeps its own cache.
 
 Safety and threading choices are source-visible policy requests; they never change the language's
@@ -221,7 +221,9 @@ spelling. A profile's `backend` (`--backend` on the command line) picks the code
 default, or `direct`, which writes wasm32 executables itself, without Clang. A `wasm32-wasip2`
 component still needs wasm-tools and the Preview 1 adapter, as with `llvm`. `--profile-input` JSON keeps `codeModel`, `maxMemory`, `stackSize`, `codegenUnits` and tagged `bindings`. Without a table
 of that name, `dev` (unoptimized, with debug information) and `release` (optimized, without it) are
-built-in profiles for the host. A complete request override replaces project profile selection. CLI `--profile`
+built-in profiles for the host. `--release` and `--optimization release` build the manifest's
+`[profiles.release]` when it declares one, as `--profile release` does; with `--target`, each
+target replaces the table's own. A complete request override replaces project profile selection. CLI `--profile`
 and LSP profile-name settings select a project profile; `--profile-input` and its LSP equivalent
 provide the complete input object; target-triple shorthand selects a default logical input for
 that target. Conflicting explicit modes are errors. Without an explicit mode, tooling uses the
@@ -251,11 +253,14 @@ implies `avx512bw`, and `aes`, `pclmul` and `sha` imply `sse2`; on AArch64 `cryp
 `fp-armv8`; on wasm32 `relaxed-simd` implies `simd128`. `profileContains("cpu-features", f)`
 answers for the closed set.
 
-The default CPU model is `x86-64` on x86-64 and `generic` elsewhere; it guarantees only the
-baseline. x86-64 also admits the microarchitecture levels `x86-64-v2` (`cx16`, `popcnt`, `sse3`,
+The default CPU model is `x86-64` on x86-64, `apple-m1` on `aarch64-apple-darwin` and `generic`
+elsewhere. `x86-64` and `generic` guarantee only the baseline; `apple-m1`, the oldest CPU of an
+AArch64 Mac, also guarantees `aes`, `crc`, `crypto`, `dotprod`, `fullfp16`, `lse`, `rdm`, `sha2` and
+`sha3`. x86-64 also admits the microarchitecture levels `x86-64-v2` (`cx16`, `popcnt`, `sse3`,
 `sse4.1`, `sse4.2`, `ssse3`), `x86-64-v3` (v2 with `avx`, `avx2`, `bmi`, `bmi2`, `f16c`, `fma`,
 `lzcnt`, `movbe`, `xsave`) and `x86-64-v4` (v3 with `avx512bw`, `avx512cd`, `avx512dq`, `avx512f`,
-`avx512vl`). A model other than the default is passed to Clang for tuning.
+`avx512vl`). A native build always names its model to Clang, and a ThinLTO link generates code for the same
+model and features.
 
 In a manifest profile, `cpu.model = "native"` asks the machine that runs the compiler, through
 `silk.simd.cpu`, and adds each catalog feature it has to `cpu.features`; the model stays the default.
@@ -280,16 +285,17 @@ object's cache key, so changing either the variable or the profile rebuilds the 
 profile describes one build of the program: regenerate it after changing the source or the
 compiler.
 
-An optimized (`speed`) native executable of more than 4 MB of bitcode splits into 16 codegen units, which Clang optimizes on
-separate threads; an unoptimized build already splits by module. The units follow the call graph:
+An optimized (`speed`) native executable is one module unless its profile sets `codegen-units`
+above 1. Then, when it holds more than 4 MB of bitcode, it splits into that many codegen units,
+which Clang optimizes on separate threads; an unoptimized build already splits by module. The units follow the call graph:
 a function that only one group of functions calls joins that group, up to an even share of the
 program, and every unit keeps its own internal copy of each function that asks to be inlined that
 it calls. The units compile for ThinLTO, and lld links them: the link imports what each unit calls
 from the others, inlines it, and generates each unit's code on its own thread, keeping each result
-in a cache beside the units' objects. A split program runs about 3% slower than one module. With
+in a cache beside the units' objects. A split program runs slower than one module, and its code is
+larger: the compiler ran 3% slower in 16 units, and silkjs 10% slower and 30% larger. With
 no lld beside Clang (`ld.lld`, or `ld64.lld` for macOS), with a platform supply's own linker, on
 Windows, or in a build with debug information, the program stays one module.
-A profile's `codegen-units` sets the count; `1` keeps one module.
 
 ## PROFILE-008 — Generated source
 
@@ -404,3 +410,56 @@ writing its output directory, so it has no network at all. Any other host has no
 refuses tool steps unless the root manifest sets
 `[build].unsandboxed-tools = true`; each build that then runs a step prints a warning naming it.
 `SILK_NO_TOOL_SANDBOX` set makes a host behave as one without a sandbox.
+
+## PROFILE-011 — Project templates
+
+`silk init [path] --template <template>` (or `-t <template>`) creates the project from one
+directory of a GitHub repository. Without `--template`, a package comes from the official
+`default` template, `silk-lang/examples/default`. `--template minimal` never fetches anything: the
+compiler writes its own minimal package, as it does for `--lib` and `--workspace`. The template is written
+`<owner>/<repository>[/<directory>...][@<revision>]`:
+
+- One segment alone names a directory of the official examples: `silk init -t ui` is
+  `silk init -t silk-lang/examples/ui`.
+- Two segments name a repository whose root is the template, such as `julia-script/starter`.
+- More segments name a directory inside the repository, such as `julia-script/starters/cli`.
+- `@<revision>` picks a branch, a tag or a full commit hash; without it the default branch is used.
+
+The repository is fetched with the `git` on `PATH`, without history, into a scratch directory
+below `$SILK_HOME/git` (`$HOME/.silk/git` when `SILK_HOME` is unset) that is removed afterwards.
+The template's directory must hold a `silk.toml` with a `[package]` or a `[workspace]` table.
+Every file in it is written to the project directory, keeping executable bits and symbolic links;
+a file that already exists there refuses the whole template before anything is written. For a
+package, the new manifest gets the package name (`--name`, or else the directory's name) and this
+compiler's release as `silk-version` and loses the template's `description`, and a package outside a workspace gets `/build/` in its
+`.gitignore`. A package created inside a workspace becomes one of its members, as `silk init`
+makes it. A workspace template takes no `--name`, and only a `silk-version` it pins is updated.
+`--template` cannot be combined with `--lib` or `--workspace`.
+
+`silk init --list [template]` (or `-l`) lists the templates in a template's directory and every
+directory below it, the official examples at the root of `silk-lang/examples` when no template is
+given. A template is each directory with a `silk.toml` that is not inside another template, so a
+workspace's members are part of their workspace. Each line gives the name `--template` takes
+(the short form for an official example) and the manifest's `[package].description`, when it has
+one.
+
+A template adjusts the new project with `[[post-init]]` entries in its `silk.toml`. `run` is the
+command line, spelled as a `[[generate]]` entry's: the program, then its arguments, where a
+program with a `/` is a path below the template's directory and a bare name is searched on `PATH`.
+
+```toml
+[[post-init]]
+run = ["scripts/post-init.sh"]
+```
+
+The entries are removed from the new manifest before they run, so they run once. They run in order
+in the project directory with the caller's environment, after every file is written. Each entry
+gets its own arguments, then this compiler's release (such as `0.1.0-dev.50+e1a2bc7cec4a`), then
+every argument given after `--`: `silk init app -t ui -- --dark` runs
+`scripts/post-init.sh 0.1.0-dev.50+e1a2bc7cec4a --dark`. A template can check the release or read
+options from those arguments. A failing
+entry stops the rest, and `silk init` then removes every file and directory it created, restores a
+`.gitignore` it changed and exits 1. A template it cannot fetch or use also exits 1, and a failed fetch prints git's reason and
+suggests `-t minimal` for an offline project; a malformed
+template or a file in the way exits 2. Builds never run an entry; they only refuse a malformed
+one, naming its manifest line.

@@ -1,0 +1,850 @@
+//! Creating a project from a template: one directory of a GitHub repository, for `silk init --template`.
+//!
+//! A template is written `<owner>/<repository>[/<directory>...][@<revision>]`. One segment alone,
+//! such as `ui`, names a directory of the official examples, `silk-lang/examples/ui`. Two or more
+//! segments name a repository, then a directory inside it; with exactly two the template is the
+//! repository's root. The revision is a branch, a tag or a full commit hash, and the default branch
+//! when it is left out. The template's directory holds a `silk.toml`: a package or a workspace.
+//!
+//! The repository is fetched with the `git` on `PATH` into a scratch directory below the git
+//! checkout store, without history, and the scratch directory is removed afterwards. Every file of
+//! the template's directory is then written to the project directory, keeping executable bits and
+//! symbolic links. The new manifest gets the project's package name and the creating compiler's
+//! release as `silk-version`, as `silk init` writes them, and its `[package].description` and
+//! `[[post-init]]` entries, which describe the template, are removed. A package outside a workspace also gets `/build/` in its `.gitignore`.
+//!
+//! `silk init --list [template]` lists the templates in a directory and below it, the official
+//! examples by default: each directory with a `silk.toml` that is not inside another template, by
+//! the name `--template` takes, with its `[package].description`.
+//!
+//! Then the template's `[[post-init]]` entries run in order in the project directory, with the
+//! caller's environment, for adjustments the template needs. Each runs with its own arguments,
+//! then the creating compiler's release, then the arguments given after `--`. Initialization never overwrites a
+//! file; when a step fails, including an entry, it removes every file and directory it created and
+//! restores a `.gitignore` it changed.
+
+import driver.CommandPath
+import driver.Generate as Generators {InvalidHook, PostInit}
+import driver.GenerateRun as GenerateRuns {Outcome}
+import driver.GitCheckouts as GitCheckouts {FetchFailed, Fetched}
+import driver.Project as Projects
+import driver.ProjectInitializer as ProjectInitializers {InitializationError}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.core.effect {Effect}
+import silk.core.option {Option}
+import silk.core.result {Result}
+import silk.collections.slice {Slice}
+import silk.system.child_process {ChildProcess}
+import silk.system.filesystem {DirectoryInfo, FileError, FileInfo, FileSystem, Path, TemporaryDirectory}
+import silk.system.host_input {HostInput, HostInputError}
+import silk.text.string {String}
+import silk.toml.scanner {TomlError}
+import silk.toml.value {Toml, Value as TomlValue}
+import silk.num.usize
+import tomledit.ManifestEdit as ManifestEdits {ManifestEditRefused}
+
+/// A template that cannot be used, or a step of creating a project from it that failed; nothing it
+/// created remains. `detail` is the whole message, without a trailing newline.
+pub struct TemplateRefused {
+  pub detail: Bytes,
+}
+
+/// A parsed template: the GitHub repository, the directory inside it and the revision.
+pub struct Spec {
+  pub owner: Bytes,
+  pub repository: Bytes,
+
+  /// The template's directory below the repository's root, segments separated by `/`; empty for
+  /// the root.
+  pub directory: Bytes,
+
+  /// The branch, tag or full commit hash; absent for the default branch.
+  pub revision: Option<Bytes>,
+}
+
+/// One project created from a template.
+pub struct Created {
+  /// The package name written to the manifest; absent for a workspace template.
+  pub name: Option<Bytes>,
+
+  /// The project directory.
+  pub directory: Path,
+
+  /// The full hash of the template's commit.
+  pub commit: Bytes,
+
+  /// What the `[[post-init]]` entries printed to standard output and standard error.
+  pub output: Bytes,
+  pub errors: Bytes,
+}
+
+/// The template `silk init` uses without `--template`: `silk-lang/examples/default`.
+pub fn defaultTemplate() -> &'static [u8] {
+  return b"default"
+}
+
+/// The template name `silk init` never fetches: it writes its own minimal package instead, offline.
+pub fn minimalTemplate() -> &'static [u8] {
+  return b"minimal"
+}
+
+/// The owner of the repository a template of one segment names a directory of.
+pub fn officialOwner() -> &'static [u8] {
+  return b"silk-lang"
+}
+
+/// The repository a template of one segment names a directory of, below `officialOwner`.
+pub fn officialRepository() -> &'static [u8] {
+  return b"examples"
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn refused(first: &[u8], second: &[u8], third: &[u8]) -> never ! TemplateRefused | OutOfMemoryError ? &mut Allocator {
+  let mut detail = run Bytes.copy(first)
+  run Bytes.append(&mut detail, second)
+  run Bytes.append(&mut detail, third)
+  fail TemplateRefused {detail: move detail}
+}
+
+// Whether `name` can be a GitHub owner or repository name: letters, digits, `-`, `_` and `.`, not
+// `.` or `..` and not starting with `-`.
+fn isRepositoryName(name: &[u8]) -> bool {
+  if name.length == usize.ZERO || name[usize.ZERO] == 45 || same(name, b".") || same(name, b"..") { return false }
+  let mut at = usize.ZERO
+  while at < name.length {
+    let byte = name[at]
+    let letter = (byte >= 97 && byte <= 122) || (byte >= 65 && byte <= 90)
+    let digit = byte >= 48 && byte <= 57
+    if !letter && !digit && byte != 45 && byte != 95 && byte != 46 { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Whether `segment` can be one directory name of a template: not empty, `.` or `..`, and without
+// `\`, `:` or control bytes.
+fn isDirectoryName(segment: &[u8]) -> bool {
+  if segment.length == usize.ZERO || same(segment, b".") || same(segment, b"..") { return false }
+  let mut at = usize.ZERO
+  while at < segment.length {
+    let byte = segment[at]
+    if byte < 32 || byte == 127 || byte == 92 || byte == 58 { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// Whether `revision` can name a branch, tag or commit: not empty, not starting with `-` or `/`,
+/// without `..` or `@{`, and without spaces, control bytes or any of `:~^?*[\`, as git requires
+/// of a reference name.
+pub fn isRevision(revision: &[u8]) -> bool {
+  if revision.length == usize.ZERO || revision[usize.ZERO] == 45 || revision[usize.ZERO] == 47 { return false }
+  let mut at = usize.ZERO
+  while at < revision.length {
+    let byte = revision[at]
+    if byte <= 32 || byte == 127 || byte == 58 || byte == 126 || byte == 94 || byte == 63 || byte == 42 || byte == 91 || byte == 92 {
+      return false
+    }
+    if at + usize.ONE < revision.length {
+      let next = revision[at + usize.ONE]
+      if (byte == 46 && next == 46) || (byte == 64 && next == 123) { return false }
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// Parses the template `written`, as `silk init --template` takes it.
+pub effect fn parse(written: &[u8]) -> Spec ! TemplateRefused | OutOfMemoryError ? &mut Allocator {
+  // The revision follows the first `@`, since no owner, repository or directory holds one.
+  let mut split = usize.ZERO
+  while split < written.length && written[split] != 64 { split = split + usize.ONE }
+  let path = Slice.view<u8>(written, usize.ZERO, split)
+  let mut revision = Option<Bytes>.none()
+  if split < written.length {
+    let named = Slice.view<u8>(written, split + usize.ONE, written.length - split - usize.ONE)
+    if !isRevision(named) {
+      run refused(b"Template revision `", named, b"` must be a branch, a tag or a full commit hash")
+    }
+    revision = Option<Bytes>.some(run Bytes.copy(named))
+  }
+  let mut segments = List<Bytes>.make()
+  let mut start = usize.ZERO
+  let mut at = usize.ZERO
+  while at <= path.length {
+    if at == path.length || path[at] == 47 {
+      let segment = Slice.view<u8>(path, start, at - start)
+      if !isDirectoryName(segment) {
+        run refused(b"Template `", written, b"` must be `<name>` for an official example or `<owner>/<repository>[/<directory>][@<revision>]`")
+      }
+      run List<Bytes>.append(&mut segments, run Bytes.copy(segment))
+      start = at + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  let listed = List<Bytes>.asSlice(&segments)
+  if listed.length == usize.ONE {
+    return Spec {
+      owner: run Bytes.copy(officialOwner()),
+      repository: run Bytes.copy(officialRepository()),
+      directory: run Bytes.copy(Bytes.asSlice(&listed[usize.ZERO])),
+      revision: move revision,
+    }
+  }
+  let owner = Bytes.asSlice(&listed[usize.ZERO])
+  let repository = Bytes.asSlice(&listed[usize.ONE])
+  if !isRepositoryName(owner) || !isRepositoryName(repository) {
+    run refused(b"Template `", written, b"` must start with a GitHub owner and repository, such as `silk-lang/examples`")
+  }
+  let mut directory = Bytes.make()
+  let mut segment = usize.add(0, 2)
+  while segment < listed.length {
+    if Bytes.length(&directory) > usize.ZERO { run Bytes.append(&mut directory, b"/") }
+    run Bytes.append(&mut directory, Bytes.asSlice(&listed[segment]))
+    segment = segment + usize.ONE
+  }
+  return Spec {owner: run Bytes.copy(owner), repository: run Bytes.copy(repository), directory: move directory, revision: move revision}
+}
+
+/// The URL git fetches the template's repository from.
+pub effect fn url(spec: &Spec) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut text = run Bytes.copy(b"https://github.com/")
+  run Bytes.append(&mut text, Bytes.asSlice(&spec.owner))
+  run Bytes.append(&mut text, b"/")
+  run Bytes.append(&mut text, Bytes.asSlice(&spec.repository))
+  run Bytes.append(&mut text, b".git")
+  return move text
+}
+
+/// The template as one line for a message: `owner/repository[/directory][@revision]`.
+pub effect fn spelled(spec: &Spec) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut text = run Bytes.copy(Bytes.asSlice(&spec.owner))
+  run Bytes.append(&mut text, b"/")
+  run Bytes.append(&mut text, Bytes.asSlice(&spec.repository))
+  if Bytes.length(&spec.directory) > usize.ZERO {
+    run Bytes.append(&mut text, b"/")
+    run Bytes.append(&mut text, Bytes.asSlice(&spec.directory))
+  }
+  if let Option<Bytes>.Some {value} = &spec.revision {
+    run Bytes.append(&mut text, b"@")
+    run Bytes.append(&mut text, Bytes.asSlice(&value))
+  }
+  return move text
+}
+
+effect fn copyPath(path: &Path) -> Path ! OutOfMemoryError ? &mut Allocator {
+  return match move run Effect.result(Path.fromBytes(Path.rawBytes(path))) {
+    Result<Path, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError impossible => { drop impossible Intrinsic.trap("a valid path copies") }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// `base/relative`, where `relative` is a path the template's tree listed.
+effect fn below(base: &Path, relative: &[u8]) -> Path ! TemplateRefused | OutOfMemoryError ? &mut Allocator {
+  return match move run Effect.result(Path.joinBytes(base, relative)) {
+    Result<Path, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError invalid => {
+        drop invalid
+        run refused(b"The template holds a file this system cannot name: ", relative, b"")
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// Whether anything is at `path`; an unreadable path counts as present, so nothing is overwritten.
+effect fn present(path: &Path) -> bool ? &mut FileSystem {
+  return match move run Effect.result(FileSystem.exists(path)) {
+    Result<bool, FileError>.Success {value} => value
+    Result<bool, FileError>.Failure {error} => {
+      drop error
+      return true
+    }
+  }
+}
+
+effect fn isDirectory(path: &Path) -> bool ? &mut FileSystem {
+  return match move run Effect.result(FileSystem.stat(path)) {
+    Result<FileInfo | DirectoryInfo, FileError>.Success {value} => match move value {
+      DirectoryInfo _directory => true
+      FileInfo _file => false
+    }
+    Result<FileInfo | DirectoryInfo, FileError>.Failure {error} => {
+      drop error
+      return false
+    }
+  }
+}
+
+// Removes one created path, a file or a whole directory; a path that is already gone is fine.
+effect fn removeCreated(path: &Path) -> () ? &mut FileSystem | &mut Allocator {
+  if run isDirectory(path) {
+    let removed = run Effect.result(FileSystem.removeDirectoryRecursively(path))
+    drop removed
+  } else {
+    let removed = run Effect.result(FileSystem.removeFile(path))
+    drop removed
+  }
+  return ()
+}
+
+// Whether `directory` sits inside a workspace. A manifest that cannot be read counts as none.
+effect fn insideWorkspace(directory: &Path) -> bool ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  return match move run Effect.result(Projects.enclosingWorkspace(directory)) {
+    Result<Option<Path>, FileError | OutOfMemoryError>.Success {value} => match move value {
+      Option<Path>.Some {..} => true
+      Option<Path>.None => false
+    }
+    Result<Option<Path>, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError unreadable => {
+        drop unreadable
+        return false
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+fn isTable(value: Option<&TomlValue>) -> bool {
+  return match move value {
+    Option<&TomlValue>.Some {value: found} => match &found.* {
+      TomlValue.Table {..} => true
+      _ => false
+    }
+    Option<&TomlValue>.None => false
+  }
+}
+
+effect fn edited(result: Result<Bytes, ManifestEditRefused | OutOfMemoryError>) -> Bytes ! TemplateRefused | OutOfMemoryError ? &mut Allocator {
+  return match move result {
+    Result<Bytes, ManifestEditRefused | OutOfMemoryError>.Success {value} => move value
+    Result<Bytes, ManifestEditRefused | OutOfMemoryError>.Failure {error} => match move error {
+      ManifestEditRefused problem => run refused(b"Cannot write the template's silk.toml: ", Bytes.asSlice(&problem.detail), b"")
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// What a template's manifest becomes in the new project, and the entries to run there.
+struct Manifest {
+  // The package name, for a package template.
+  name: Option<Bytes>,
+  text: Bytes,
+  entries: List<PostInit>,
+}
+
+// The new project's manifest from the template's `text`: `[[post-init]]` removed and, for a
+// package, `description` removed and `name` and `silk-version` set; for a workspace that pins `silk-version`, that pin set.
+effect fn adapted(text: &[u8], name: Option<Bytes>, directory: &Path, compilerRelease: &[u8]) -> Manifest
+  ! InitializationError | TemplateRefused | OutOfMemoryError
+  ? &mut Allocator {
+  let document = match move run Effect.result(Toml.parse(text)) {
+    Result<TomlValue, TomlError | OutOfMemoryError>.Success {value} => move value
+    Result<TomlValue, TomlError | OutOfMemoryError>.Failure {error} => match move error {
+      TomlError malformed => {
+        drop malformed
+        run refused(b"The template's silk.toml is not valid TOML", b"", b"")
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let entries = match move run Effect.result(Generators.postInit(&document)) {
+    Result<List<PostInit>, InvalidHook | OutOfMemoryError>.Success {value} => move value
+    Result<List<PostInit>, InvalidHook | OutOfMemoryError>.Failure {error} => match move error {
+      InvalidHook problem => run refused(b"The template's silk.toml is invalid: ", Bytes.asSlice(&problem.detail), b"")
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let mut result = run ManifestEdits.removeArrayTables(text, b"post-init")
+  let packaged = isTable(Toml.field(&document, "package"))
+  if !packaged {
+    if !isTable(Toml.field(&document, "workspace")) {
+      run refused(b"The template's silk.toml has neither a [package] nor a [workspace] table", b"", b"")
+    }
+    if let Option<Bytes>.Some {value} = move name {
+      run refused(b"--name ", Bytes.asSlice(&value), b" names a package, and this template is a workspace")
+    }
+    if let Option<&TomlValue>.Some {..} = move Toml.fieldAt(Toml.field(&document, "workspace"), "silk-version") {
+      let release = run ManifestEdits.quoted(compilerRelease)
+      result = run edited(run Effect.result(ManifestEdits.setValue(Bytes.asSlice(&result), b"workspace", b"silk-version", Bytes.asSlice(&release))))
+    }
+    return Manifest {name: Option<Bytes>.none(), text: move result, entries: move entries}
+  }
+  let named = match &name {
+    Option<Bytes>.Some {..} => true
+    Option<Bytes>.None => false
+  }
+  let packageName = match move name {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => match move Path.name(directory) {
+      Option<string>.Some {value} => run Bytes.copy(String.utf8Bytes(value))
+      Option<string>.None => Bytes.make()
+    }
+  }
+  if !Projects.isPackageName(Bytes.asSlice(&packageName)) {
+    fail InitializationError.InvalidPackageName {name: move packageName, derived: !named}
+  }
+  // The description is the template's, not the new project's.
+  result = run ManifestEdits.removeValue(Bytes.asSlice(&result), b"package", b"description")
+  let quotedName = run ManifestEdits.quoted(Bytes.asSlice(&packageName))
+  result = run edited(run Effect.result(ManifestEdits.setValue(Bytes.asSlice(&result), b"package", b"name", Bytes.asSlice(&quotedName))))
+  let release = run ManifestEdits.quoted(compilerRelease)
+  result = run edited(run Effect.result(ManifestEdits.setValue(Bytes.asSlice(&result), b"package", b"silk-version", Bytes.asSlice(&release))))
+  return Manifest {name: Option<Bytes>.some(move packageName), text: move result, entries: move entries}
+}
+
+// Everything created so far, so a failed initialization can undo it: paths in creation order, and a
+// `.gitignore` that existed before with its contents.
+struct Journal {
+  created: List<Path>,
+  ignore: Path,
+  previousIgnore: Option<Bytes>,
+}
+
+effect fn undo(journal: &Journal) -> () ? &mut FileSystem | &mut Allocator {
+  if let Option<Bytes>.Some {value} = &journal.previousIgnore {
+    let restored = run Effect.result(FileSystem.writeFile(&journal.ignore, Bytes.asSlice(&value)))
+    drop restored
+  }
+  let created = List<Path>.asSlice(&journal.created)
+  let mut at = created.length
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    run removeCreated(&created[at])
+  }
+  return ()
+}
+
+effect fn fileFailed(path: &Path, error: FileError) -> never ! TemplateRefused | OutOfMemoryError ? &mut Allocator {
+  drop error
+  run refused(b"Cannot write ", Path.rawBytes(path), b"")
+}
+
+effect fn fetchFailed(spec: &Spec, problem: FetchFailed) -> never ! TemplateRefused | OutOfMemoryError ? &mut Allocator {
+  let shown = run spelled(spec)
+  let mut detail = run Bytes.copy(b"Cannot fetch template ")
+  run Bytes.append(&mut detail, Bytes.asSlice(&shown))
+  run Bytes.append(&mut detail, b": ")
+  run Bytes.append(&mut detail, Bytes.asSlice(&problem.detail))
+  run Bytes.append(&mut detail, b"\nCheck the template's name and your network connection, or add `-t minimal` to create a minimal project offline")
+  fail TemplateRefused {detail: move detail}
+}
+
+// Writes the template into `directory` and runs its entries, recording each created path in
+// `journal` before creating it.
+effect fn write(fetched: &Fetched, spec: &Spec, treeish: &[u8], files: &[Bytes], directory: &Path, manifest: &Manifest, extra: &[Bytes], journal: &mut Journal) -> Outcome
+  ! InitializationError | TemplateRefused | HostInputError | OutOfMemoryError
+  ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
+  // The missing directories, outermost first, up to the nearest existing ancestor.
+  let mut missing = List<Path>.make()
+  let mut existing = run copyPath(directory)
+  while !run present(&existing) {
+    run List<Path>.append(&mut missing, run copyPath(&existing))
+    match move run CommandPath.parent(&existing) {
+      Option<Path>.Some {value} => { existing = move value }
+      Option<Path>.None => { break }
+    }
+  }
+  if !run isDirectory(&existing) {
+    fail InitializationError.AncestorNotDirectory {path: move existing}
+  }
+  while List<Path>.length(&missing) > usize.ZERO {
+    if let Option<Path>.Some {value} = move List<Path>.pop(&mut missing) {
+      run List<Path>.append(&mut journal.created, run copyPath(&value))
+      if let Result<(), FileError>.Failure {error} = move run Effect.result(FileSystem.createDirectory(&value)) {
+        run fileFailed(&value, move error)
+      }
+    }
+  }
+  // Each directory of the template's files that is not there yet, parents first, then each file.
+  let mut at = usize.ZERO
+  while at < files.length {
+    let relative = Bytes.asSlice(&files[at])
+    let mut end = usize.ZERO
+    while end < relative.length {
+      if relative[end] == 47 {
+        let parent = run below(directory, Slice.view<u8>(relative, usize.ZERO, end))
+        if !run present(&parent) {
+          run List<Path>.append(&mut journal.created, move parent)
+        }
+      }
+      end = end + usize.ONE
+    }
+    run List<Path>.append(&mut journal.created, run below(directory, relative))
+    at = at + usize.ONE
+  }
+  match move run Effect.result(GitCheckouts.checkOut(fetched, treeish, directory)) {
+    Result<(), FetchFailed | HostInputError | FileError | OutOfMemoryError>.Success {..} => {}
+    Result<(), FetchFailed | HostInputError | FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FetchFailed problem => run fetchFailed(spec, move problem)
+      HostInputError input => { fail move input }
+      FileError file => run fileFailed(directory, move file)
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let manifestPath = run below(directory, b"silk.toml")
+  if let Result<(), FileError>.Failure {error} = move run Effect.result(FileSystem.writeFile(&manifestPath, Bytes.asSlice(&manifest.text))) {
+    run fileFailed(&manifestPath, move error)
+  }
+  // A package builds into its own `build` directory unless a workspace holds it.
+  let isPackage = match &manifest.name {
+    Option<Bytes>.Some {..} => true
+    Option<Bytes>.None => false
+  }
+  if !isPackage || !(run insideWorkspace(directory)) {
+    let mut previous = Option<Bytes>.none()
+    if run present(&journal.ignore) {
+      match move run Effect.result(FileSystem.readFile(&journal.ignore)) {
+        Result<Bytes, FileError | OutOfMemoryError>.Success {value} => { previous = Option<Bytes>.some(move value) }
+        Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+          FileError file => run fileFailed(&journal.ignore, move file)
+          OutOfMemoryError exhausted => { fail move exhausted }
+        }
+      }
+    }
+    let existed = match &previous {
+      Option<Bytes>.Some {..} => true
+      Option<Bytes>.None => false
+    }
+    if let Option<Bytes>.Some {value: next} = move run ProjectInitializers.ignore(&previous) {
+      if !existed { run List<Path>.append(&mut journal.created, run copyPath(&journal.ignore)) }
+      if let Result<(), FileError>.Failure {error} = move run Effect.result(FileSystem.writeFile(&journal.ignore, Bytes.asSlice(&next))) {
+        run fileFailed(&journal.ignore, move error)
+      }
+    }
+  }
+  return run GenerateRuns.postInit(directory, List<PostInit>.asSlice(&manifest.entries), extra)
+}
+
+// Creates the project once the template is fetched into `fetched`.
+effect fn instantiate(fetched: &Fetched, spec: &Spec, directory: &Path, name: Option<Bytes>, compilerRelease: &[u8], extra: &[Bytes]) -> Created
+  ! InitializationError | TemplateRefused | HostInputError | OutOfMemoryError
+  ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
+  let mut treeish = run Bytes.copy(Bytes.asSlice(&fetched.commit))
+  if Bytes.length(&spec.directory) > usize.ZERO {
+    run Bytes.append(&mut treeish, b":")
+    run Bytes.append(&mut treeish, Bytes.asSlice(&spec.directory))
+  } else {
+    run Bytes.append(&mut treeish, b"^{tree}")
+  }
+  let shown = run spelled(spec)
+  let listed = match move run GitCheckouts.listTree(fetched, Bytes.asSlice(&treeish)) {
+    Option<List<Bytes>>.Some {value} => move value
+    Option<List<Bytes>>.None => run refused(b"Template ", Bytes.asSlice(&shown), b" names no directory of its repository; `silk init --list` shows the official templates")
+  }
+  let files = List<Bytes>.asSlice(&listed)
+  let mut object = run Bytes.copy(Bytes.asSlice(&fetched.commit))
+  run Bytes.append(&mut object, b":")
+  if Bytes.length(&spec.directory) > usize.ZERO {
+    run Bytes.append(&mut object, Bytes.asSlice(&spec.directory))
+    run Bytes.append(&mut object, b"/")
+  }
+  run Bytes.append(&mut object, b"silk.toml")
+  let text = match move run GitCheckouts.readFile(fetched, Bytes.asSlice(&object)) {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => run refused(b"Template ", Bytes.asSlice(&shown), b" has no silk.toml")
+  }
+  let manifest = run adapted(Bytes.asSlice(&text), move name, directory, compilerRelease)
+  // Nothing is written until every file is known to be new.
+  let mut at = usize.ZERO
+  while at < files.length {
+    let destination = run below(directory, Bytes.asSlice(&files[at]))
+    if run present(&destination) {
+      fail InitializationError.ExistingFile {path: move destination}
+    }
+    at = at + usize.ONE
+  }
+  let ignore = run below(directory, b".gitignore")
+  let mut previousIgnore = Option<Bytes>.none()
+  if run present(&ignore) {
+    if let Result<Bytes, FileError | OutOfMemoryError>.Success {value} = move run Effect.result(FileSystem.readFile(&ignore)) {
+      previousIgnore = Option<Bytes>.some(move value)
+    }
+  }
+  let mut journal = Journal {created: List<Path>.make(), ignore: move ignore, previousIgnore: move previousIgnore}
+  let written = run Effect.result(write(fetched, spec, Bytes.asSlice(&treeish), files, directory, &manifest, extra, &mut journal))
+  let outcome = match move written {
+    Result<Outcome, InitializationError | TemplateRefused | HostInputError | OutOfMemoryError>.Success {value} => move value
+    Result<Outcome, InitializationError | TemplateRefused | HostInputError | OutOfMemoryError>.Failure {error} => {
+      run undo(&journal)
+      return match move error {
+        InitializationError problem => { fail move problem }
+        TemplateRefused problem => { fail move problem }
+        HostInputError input => { fail move input }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+  }
+  if outcome.status != 0 {
+    run undo(&journal)
+    let mut detail = run Bytes.copy(Bytes.asSlice(&outcome.output))
+    run Bytes.append(&mut detail, Bytes.asSlice(&outcome.errors))
+    run Bytes.append(&mut detail, b"silk: the template's [[post-init]] entry failed, so the project was removed")
+    fail TemplateRefused {detail: move detail}
+  }
+  let Manifest {name: packageName, text: _, entries: _} = move manifest
+  return Created {
+    name: move packageName,
+    directory: run copyPath(directory),
+    commit: run Bytes.copy(Bytes.asSlice(&fetched.commit)),
+    output: move outcome.output,
+    errors: move outcome.errors,
+  }
+}
+
+// A scratch directory below `store`, the git checkout store, to fetch a template into.
+effect fn scratchBelow(store: &Path) -> TemporaryDirectory
+  ! TemplateRefused | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  if let Result<(), FileError | OutOfMemoryError>.Failure {error} = move run Effect.result(FileSystem.createDirectoriesRecursively(store)) {
+    return match move error {
+      FileError file => run fileFailed(store, move file)
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  return match move run Effect.result(FileSystem.temporaryDirectory(store, ".template-")) {
+    Result<TemporaryDirectory, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<TemporaryDirectory, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError file => run fileFailed(store, move file)
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// Fetches the revision of `spec`, or the default branch, into the empty directory `scratch`.
+effect fn fetchInto(scratch: &Path, spec: &Spec) -> Fetched
+  ! TemplateRefused | HostInputError | OutOfMemoryError
+  ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
+  let repository = run url(spec)
+  let mut revision = run Bytes.copy(b"HEAD")
+  if let Option<Bytes>.Some {value} = &spec.revision { revision = run Bytes.copy(Bytes.asSlice(&value)) }
+  return match move run Effect.result(GitCheckouts.fetchRevision(scratch, Bytes.asSlice(&repository), Bytes.asSlice(&revision))) {
+    Result<Fetched, FetchFailed | HostInputError | FileError | OutOfMemoryError>.Success {value} => move value
+    Result<Fetched, FetchFailed | HostInputError | FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FetchFailed problem => run fetchFailed(spec, move problem)
+      HostInputError input => { fail move input }
+      FileError file => run fileFailed(scratch, move file)
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+/// Creates a project from the template `spec` in `directory`, fetching it into a scratch directory
+/// below `store`, the git checkout store, that is removed afterwards. The package name is `name`,
+/// or else the directory's own name, and the manifest records `compilerRelease` as its
+/// `silk-version`. Each `[[post-init]]` entry runs with `compilerRelease`, then `arguments`, after
+/// its own arguments.
+pub effect fn create(store: &Path, spec: &Spec, directory: &Path, name: Option<Bytes>, compilerRelease: &[u8], arguments: &[Bytes]) -> Created
+  ! InitializationError | TemplateRefused | HostInputError | OutOfMemoryError
+  ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
+  let mut extra = List<Bytes>.make()
+  run List<Bytes>.append(&mut extra, run Bytes.copy(compilerRelease))
+  let mut argument = usize.ZERO
+  while argument < arguments.length {
+    run List<Bytes>.append(&mut extra, run Bytes.copy(Bytes.asSlice(&arguments[argument])))
+    argument = argument + usize.ONE
+  }
+  let scratch = run scratchBelow(store)
+  let scratchPath = run copyPath(&scratch.path)
+  let ran = run Effect.result(created(&scratchPath, spec, directory, move name, compilerRelease, List<Bytes>.asSlice(&extra)))
+  run FileSystem.releaseIgnored(move scratch)
+  return match move ran {
+    Result<Created, InitializationError | TemplateRefused | HostInputError | OutOfMemoryError>.Success {value} => move value
+    Result<Created, InitializationError | TemplateRefused | HostInputError | OutOfMemoryError>.Failure {error} => match move error {
+      InitializationError problem => { fail move problem }
+      TemplateRefused problem => { fail move problem }
+      HostInputError input => { fail move input }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// Fetches the template into `scratch` and creates the project from it.
+effect fn created(scratch: &Path, spec: &Spec, directory: &Path, name: Option<Bytes>, compilerRelease: &[u8], extra: &[Bytes]) -> Created
+  ! InitializationError | TemplateRefused | HostInputError | OutOfMemoryError
+  ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
+  let fetched = run fetchInto(scratch, spec)
+  return run instantiate(&fetched, spec, directory, move name, compilerRelease, extra)
+}
+
+/// The official examples, `silk-lang/examples` at its root on the default branch: what
+/// `silk init --list` lists without a template.
+pub effect fn official() -> Spec ! OutOfMemoryError ? &mut Allocator {
+  return Spec {
+    owner: run Bytes.copy(officialOwner()),
+    repository: run Bytes.copy(officialRepository()),
+    directory: Bytes.make(),
+    revision: Option<Bytes>.none(),
+  }
+}
+
+/// One template a listing found: the name `silk init --template` takes for it and the
+/// `[package].description` of its manifest.
+pub struct Listed {
+  pub name: Bytes,
+  pub description: Option<Bytes>,
+}
+
+/// The templates below the directory of `spec`, in path order, and the commit they were read at.
+pub struct Listing {
+  pub templates: List<Listed>,
+  pub commit: Bytes,
+}
+
+// Whether `path` lies below the directory `directory`, both relative and separated by `/`; every
+// path lies below the root, spelled empty.
+fn inside(path: &[u8], directory: &[u8]) -> bool {
+  if directory.length == usize.ZERO { return true }
+  return path.length > directory.length && same(Slice.view<u8>(path, usize.ZERO, directory.length), directory) && path[directory.length] == 47
+}
+
+// The `[package].description` of the manifest `text`, when it is a string.
+effect fn description(text: &[u8]) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  let document = match move run Effect.result(Toml.parse(text)) {
+    Result<TomlValue, TomlError | OutOfMemoryError>.Success {value} => move value
+    Result<TomlValue, TomlError | OutOfMemoryError>.Failure {error} => match move error {
+      TomlError malformed => {
+        drop malformed
+        return Option<Bytes>.none()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  return match move Toml.asString(Toml.fieldAt(Toml.field(&document, "package"), "description")) {
+    Option<string>.Some {value} => Option<Bytes>.some(run Bytes.copy(String.utf8Bytes(value)))
+    Option<string>.None => Option<Bytes>.none()
+  }
+}
+
+// Lists the templates of `fetched` below the directory of `spec`.
+effect fn listed(fetched: &Fetched, spec: &Spec) -> Listing
+  ! TemplateRefused | HostInputError | OutOfMemoryError
+  ? &mut ChildProcess | &mut HostInput | &mut Allocator {
+  let mut treeish = run Bytes.copy(Bytes.asSlice(&fetched.commit))
+  let base = Bytes.asSlice(&spec.directory)
+  if base.length > usize.ZERO {
+    run Bytes.append(&mut treeish, b":")
+    run Bytes.append(&mut treeish, base)
+  } else {
+    run Bytes.append(&mut treeish, b"^{tree}")
+  }
+  let shown = run spelled(spec)
+  let files = match move run GitCheckouts.listTree(fetched, Bytes.asSlice(&treeish)) {
+    Option<List<Bytes>>.Some {value} => move value
+    Option<List<Bytes>>.None => run refused(b"Template ", Bytes.asSlice(&shown), b" names no directory of its repository; `silk init --list` shows the official templates")
+  }
+  let paths = List<Bytes>.asSlice(&files)
+  // A directory with a `silk.toml` is a template; one below another template, such as a
+  // workspace's member, is part of it.
+  let mut directories = List<Bytes>.make()
+  let mut at = usize.ZERO
+  while at < paths.length {
+    let path = Bytes.asSlice(&paths[at])
+    let manifest = b"silk.toml"
+    let mut directory = Option<&[u8]>.none()
+    if same(path, manifest) {
+      directory = Option<&[u8]>.some(b"")
+    } else if path.length > manifest.length && path[path.length - manifest.length - usize.ONE] == 47
+      && same(Slice.view<u8>(path, path.length - manifest.length, manifest.length), manifest) {
+      directory = Option<&[u8]>.some(Slice.view<u8>(path, usize.ZERO, path.length - manifest.length - usize.ONE))
+    }
+    if let Option<&[u8]>.Some {value: found} = move directory {
+      let earlier = List<Bytes>.asSlice(&directories)
+      let mut covered = false
+      let mut check = usize.ZERO
+      while check < earlier.length {
+        if inside(found, Bytes.asSlice(&earlier[check])) { covered = true }
+        check = check + usize.ONE
+      }
+      if !covered { run List<Bytes>.append(&mut directories, run Bytes.copy(found)) }
+    }
+    at = at + usize.ONE
+  }
+  let officialRepository = same(Bytes.asSlice(&spec.owner), officialOwner()) && same(Bytes.asSlice(&spec.repository), officialRepository())
+  let mut templates = List<Listed>.make()
+  let found = List<Bytes>.asSlice(&directories)
+  at = usize.ZERO
+  while at < found.length {
+    let relative = Bytes.asSlice(&found[at])
+    // The template's directory below the repository's root.
+    let mut path = run Bytes.copy(base)
+    if base.length > usize.ZERO && relative.length > usize.ZERO { run Bytes.append(&mut path, b"/") }
+    run Bytes.append(&mut path, relative)
+    let mut name = Bytes.make()
+    // An official example goes by its directory alone when that is one segment.
+    let mut short = officialRepository && Bytes.length(&path) > usize.ZERO
+    let segments = Bytes.asSlice(&path)
+    let mut byte = usize.ZERO
+    while byte < segments.length {
+      if segments[byte] == 47 { short = false }
+      byte = byte + usize.ONE
+    }
+    if !short {
+      run Bytes.append(&mut name, Bytes.asSlice(&spec.owner))
+      run Bytes.append(&mut name, b"/")
+      run Bytes.append(&mut name, Bytes.asSlice(&spec.repository))
+      if Bytes.length(&path) > usize.ZERO { run Bytes.append(&mut name, b"/") }
+    }
+    run Bytes.append(&mut name, Bytes.asSlice(&path))
+    if let Option<Bytes>.Some {value} = &spec.revision {
+      run Bytes.append(&mut name, b"@")
+      run Bytes.append(&mut name, Bytes.asSlice(&value))
+    }
+    let mut object = run Bytes.copy(Bytes.asSlice(&fetched.commit))
+    run Bytes.append(&mut object, b":")
+    if Bytes.length(&path) > usize.ZERO {
+      run Bytes.append(&mut object, Bytes.asSlice(&path))
+      run Bytes.append(&mut object, b"/")
+    }
+    run Bytes.append(&mut object, b"silk.toml")
+    let mut summary = Option<Bytes>.none()
+    if let Option<Bytes>.Some {value: text} = move run GitCheckouts.readFile(fetched, Bytes.asSlice(&object)) {
+      summary = run description(Bytes.asSlice(&text))
+    }
+    run List<Listed>.append(&mut templates, Listed {name: move name, description: move summary})
+    at = at + usize.ONE
+  }
+  return Listing {templates: move templates, commit: run Bytes.copy(Bytes.asSlice(&fetched.commit))}
+}
+
+/// Lists the templates in the directory of `spec` and every directory below it: each directory
+/// with a `silk.toml` that is not inside another one, fetched into a scratch directory below
+/// `store`, the git checkout store, that is removed afterwards.
+pub effect fn list(store: &Path, spec: &Spec) -> Listing
+  ! TemplateRefused | HostInputError | OutOfMemoryError
+  ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
+  let scratch = run scratchBelow(store)
+  let scratchPath = run copyPath(&scratch.path)
+  let ran = run Effect.result(fetchedListing(&scratchPath, spec))
+  run FileSystem.releaseIgnored(move scratch)
+  return match move ran {
+    Result<Listing, TemplateRefused | HostInputError | OutOfMemoryError>.Success {value} => move value
+    Result<Listing, TemplateRefused | HostInputError | OutOfMemoryError>.Failure {error} => match move error {
+      TemplateRefused problem => { fail move problem }
+      HostInputError input => { fail move input }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+effect fn fetchedListing(scratch: &Path, spec: &Spec) -> Listing
+  ! TemplateRefused | HostInputError | OutOfMemoryError
+  ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
+  let fetched = run fetchInto(scratch, spec)
+  return run listed(&fetched, spec)
+}

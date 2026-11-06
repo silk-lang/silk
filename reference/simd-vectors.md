@@ -432,10 +432,14 @@ The SIMD-007 catalog also holds the AES and carry-less multiplication instructio
 | `aarch64AesDecrypt`           | `u8x16`, `u8x16` → `u8x16` | AArch64 `aes`   | `aesd`                            |
 | `aarch64AesMixColumns`        | `u8x16` → `u8x16`      | AArch64 `aes`      | `aesmc`                           |
 | `aarch64AesInverseMixColumns` | `u8x16` → `u8x16`      | AArch64 `aes`      | `aesimc`                          |
+| `aarch64PolynomialMultiply`   | `u64x2`, `u64x2` → `u64x2` | AArch64 `aes`   | `pmull` (64-bit lanes)            |
+| `aarch64PolynomialMultiplyHigh` | `u64x2`, `u64x2` → `u64x2` | AArch64 `aes` | `pmull2` (64-bit lanes)           |
 
 The x86 rounds take the operand order of the instructions: the state, then the round key.
 `x86CarrylessMultiply` multiplies lane 0 of each operand into a 128-bit product, low half in lane
 0; a program picks other halves with `simdShuffle` first.
+`aarch64PolynomialMultiply` multiplies lane 0 of each operand the same way, and
+`aarch64PolynomialMultiplyHigh` multiplies lane 1 of each.
 
 `silk.crypto.aes_round` computes SubBytes, ShiftRows, MixColumns and their inverses with portable code,
 without tables. `silk.simd.x86` and `silk.simd.aarch64` wrap each operation on `u8x16` states and
@@ -486,7 +490,7 @@ The operands follow the instructions. `x86Sha256Rounds2` takes C, D, G and H, th
 `silk.simd.x86` and `silk.simd.aarch64` wrap each operation and fall back to portable code when
 the profile lacks the feature, like the SIMD-007 wrappers.
 
-**Boundary:** SHA-1 and SHA-512 instructions are not in the catalog yet.
+**Boundary:** SHA-512 instructions and the AArch64 SHA-1 instructions are not in the catalog yet. SIMD-013 adds the x86 SHA-1 instructions.
 
 **Diagnostics:** As SIMD-007: `SEM0239` for a first operand outside the catalog and `SEM0241`
 when the profile and function do not select the feature.
@@ -495,3 +499,38 @@ when the profile and function do not select the feature.
 
 **Evidence:** `corpus/native/simd-sha` (one SHA-256 block through both instruction flows, and the
 x86 instructions themselves when the machine has them).
+
+## SIMD-013 — x86 SHA-1 instructions are architecture operations
+
+**Status:** Confirmed
+
+```silk,ignore
+@features("sha")
+unsafe fn rounds(abcd: simd<u32, 4>, wk: simd<u32, 4>) -> simd<u32, 4> {
+  return Intrinsic.x86Sha1Rounds4Stage0<simd<u32, 4>>(abcd, wk)
+}
+```
+
+The SIMD-007 catalog also holds the x86 SHA-1 instructions, all on `u32x4`:
+
+| Operation              | Operands | Target and feature | Instruction            |
+| ---------------------- | -------- | ------------------ | ---------------------- |
+| `x86Sha1Rounds4Stage0` | 2        | x86-64 `sha`       | `sha1rnds4` selector 0 |
+| `x86Sha1Rounds4Stage1` | 2        | x86-64 `sha`       | `sha1rnds4` selector 1 |
+| `x86Sha1Rounds4Stage2` | 2        | x86-64 `sha`       | `sha1rnds4` selector 2 |
+| `x86Sha1Rounds4Stage3` | 2        | x86-64 `sha`       | `sha1rnds4` selector 3 |
+| `x86Sha1NextE`         | 2        | x86-64 `sha`       | `sha1nexte`            |
+| `x86Sha1Message1`      | 2        | x86-64 `sha`       | `sha1msg1`             |
+| `x86Sha1Message2`      | 2        | x86-64 `sha`       | `sha1msg2`             |
+
+`sha1rnds4` takes its round function as an immediate, so each of the four selectors is its own
+operation: stage `n` runs four of rounds `20n` to `20n + 19`. A and E ride in lane 3 of their
+vectors, as the instructions expect.
+
+`silk.simd.x86` wraps each operation and falls back to portable code when the profile lacks the
+feature, like the SIMD-007 wrappers.
+
+**Diagnostics:** As SIMD-007: `SEM0239` for a first operand outside the catalog and `SEM0241`
+when the profile and function do not select the feature.
+
+**Current compiler:** Aligned.

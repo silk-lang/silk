@@ -30,6 +30,7 @@
 
 import backend.CodegenUnits {CodegenUnit}
 import driver.CacheStamp
+import diagnostic.JsonText
 import driver.DetachedWriter as DetachedWriter {Handoff, Held}
 import driver.ImportSummaries as Summaries {ImportSummaries}
 import semantic.BuildRecord
@@ -65,6 +66,9 @@ pub struct CacheFile {
   /// What the store reused from the file it read; nothing when it read none. The store keeps the
   /// image it read (`Semantic.adoptedImage`), which the next one carries reused checks from.
   pub adopted: Adopted,
+  /// Whether the store adopted this file's own image, not a dependency's or none. Only then do the
+  /// files the store parses tell the next load which files it will parse again.
+  pub own: bool,
 }
 
 fn hexDigit(value: u64) -> u8 {
@@ -382,16 +386,16 @@ effect fn fetch(path: &Bytes, building: bool) -> Option<Fetched> ! OutOfMemoryEr
   return Option<Fetched>.some(Fetched {path: run Bytes.copy(Bytes.asSlice(&path.*)), stamp: move stamp, graph: move graph, packs: move packs})
 }
 
-// The graph file `bytes` under `stamp`. Its nodes stay in the file until an adoption needs them
-// (`CacheImage.readNodes`).
+// The graph file `bytes` under `stamp`. Its leaves past its anchors and its nodes stay in the file
+// until an adoption needs them (`CacheImage.readLeaves`, `CacheImage.readNodes`).
 effect fn graphOf(bytes: Bytes, stamp: &[u8]) -> Option<CacheImage.Graph> ! OutOfMemoryError ? &mut Allocator {
   let parts = match move run CacheImage.graphParts(Bytes.asSlice(&bytes), stamp) {
     Option<CacheImage.GraphParts>.Some {value} => move value
     Option<CacheImage.GraphParts>.None => { return Option<CacheImage.Graph>.none() }
   }
-  return match move run CacheImage.decodeLeaves(Bytes.asSlice(&bytes), &parts) {
-    Option<CacheImage.Leaves>.Some {value: read} => CacheImage.assembled(&parts, move read, move bytes)
-    Option<CacheImage.Leaves>.None => Option<CacheImage.Graph>.none()
+  return match move run CacheImage.decodeSummary(Bytes.asSlice(&bytes), &parts) {
+    Option<CacheImage.Summary>.Some {value: read} => CacheImage.assembled(&parts, move read, move bytes)
+    Option<CacheImage.Summary>.None => Option<CacheImage.Graph>.none()
   }
 }
 
@@ -455,15 +459,18 @@ effect fn readRoots(path: &Path) -> Option<CacheImage.Roots> ! OutOfMemoryError 
 pub effect fn open(store: &mut Semantic, request: &Request, cache: &Path, compiler: &[u8], linked: bool, building: bool)
   -> Option<CacheFile>
   ! Cycle | OutOfMemoryError ? &mut FileSystem | &mut Allocator | &mut Types {
-  return run openPrefetched(&mut store.*, request, cache, compiler, linked, building, Option<Prefetch>.none(), &[])
+  return run openPrefetched(&mut store.*, request, cache, compiler, linked, building, Option<Prefetch>.none(), &[], &[])
 }
 
 /// As [`open`], taking what `prefetched` read when it read the file the store names under the
 /// stamp the store expects, and reading the file itself otherwise. When the store has no file of
 /// its own to adopt, it adopts the module checks of the cache directories `dependencies` lists,
-/// those of the packages it depends on ([`dependencyImage`]).
+/// those of the packages it depends on ([`dependencyImage`]). A store that walks a runtime adopts
+/// the escape walks of the package that walked one and loaded most of the packages whose cache
+/// directories `runtime` lists, the ones it loads, too ([`rememberRuntime`]); `runtime` is empty
+/// for a store that walks none.
 pub effect fn openPrefetched(store: &mut Semantic, request: &Request, cache: &Path, compiler: &[u8], linked: bool, building: bool,
-  prefetched: Option<Prefetch>, dependencies: &[Path]) -> Option<CacheFile>
+  prefetched: Option<Prefetch>, dependencies: &[Path], runtime: &[Path]) -> Option<CacheFile>
   ! Cycle | OutOfMemoryError ? &mut FileSystem | &mut Allocator | &mut Types {
   let stamp = run CacheStamp.stamp(&store.*, compiler)
   let identity = run Semantic.stampIdentity(&store.*)
@@ -528,21 +535,212 @@ pub effect fn openPrefetched(store: &mut Semantic, request: &Request, cache: &Pa
           if building { Semantic.offerPacks(&mut store.*, move bodies) }
           adopted = run Semantic.adoptImage(&mut store.*, request, move image, linked)
           return Option<CacheFile>.some(CacheFile {path: move path, packs: move packs, lock: move lock, stamp: move stamp,
-            adopted: move adopted})
+            adopted: move adopted, own: true})
         }
       }
     }
   }
   run DetachedWriter.waitFor(&lock)
   if building { Semantic.offerPacks(&mut store.*, run readPacks(&packs)) }
+  let mut own = false
   if let Option<CacheImage.Image>.Some {value: image} = move run readImage(&path, Bytes.asSlice(&stamp)) {
     adopted = run Semantic.adoptImage(&mut store.*, request, move image, linked)
-  } else if let Option<CacheImage.Image>.Some {value: image} = move run dependencyImage(&store.*, compiler, dependencies) {
-    // The image is held as if read from this file, so the checks adopted from it are carried into
-    // the file the store writes.
-    adopted = run Semantic.adoptImage(&mut store.*, request, move image, linked)
+    own = true
+  } else {
+    let walked = run runtimeImage(&path, runtime)
+    if let Option<CacheImage.Image>.Some {value: image} = move run dependencyImage(&store.*, compiler, dependencies, &walked) {
+      // The image is held as if read from this file, so the checks adopted from it are carried
+      // into the file the store writes.
+      adopted = run Semantic.adoptImage(&mut store.*, request, move image, linked)
+    }
   }
-  return Option<CacheFile>.some(CacheFile {path: move path, packs: move packs, lock: move lock, stamp: move stamp, adopted: move adopted})
+  return Option<CacheFile>.some(CacheFile {path: move path, packs: move packs, lock: move lock, stamp: move stamp, adopted: move adopted,
+    own: own})
+}
+
+/// Records that the cache file `file` holds the escape walk of a runtime, as an executable's
+/// check writes one, under each package it loads, whose cache directories `packages` lists. The
+/// next package that walks a runtime under the same name and holds no file of its own starts from
+/// the walk of the one that loaded most of the packages it loads ([`openPrefetched`]). Best effort,
+/// like the cache.
+pub effect fn rememberRuntime(file: &CacheFile, packages: &[Path]) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let package = match move run Path.parent(&file.path) {
+    Option<Path>.Some {value} => move value
+    Option<Path>.None => { return () }
+  }
+  let own = lastName(Path.rawBytes(&package))
+  let mut at = usize.ZERO
+  while at < packages.length {
+    if let Option<Path>.Some {value: marker} = move run runtimeMarker(&file.path, &packages[at]) {
+      // Each package that walked a runtime is listed once, the latest last, a line each: its name,
+      // a space, and how many packages it loads.
+      let mut listed = Bytes.make()
+      let read = run markerNames(&marker)
+      let names = List<MarkedRuntime>.asSlice(&read)
+      let mut name = usize.ZERO
+      while name < names.length {
+        if !same(Bytes.asSlice(&names[name].name), own) {
+          run appendMarked(&mut listed, Bytes.asSlice(&names[name].name), names[name].loads)
+        }
+        name = name + usize.ONE
+      }
+      run appendMarked(&mut listed, own, packages.length)
+      run remember(&marker, Bytes.asSlice(&listed))
+    }
+    at = at + usize.ONE
+  }
+}
+
+// One package a runtime marker lists: its name and how many packages it loads.
+struct MarkedRuntime {
+  name: Bytes,
+  loads: usize,
+}
+
+effect fn appendMarked(listed: &mut Bytes, name: &[u8], loads: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  run Bytes.append(&mut listed.*, name)
+  run Bytes.append(&mut listed.*, b" ")
+  run JsonText.appendDecimal(&mut listed.*, loads)
+  run Bytes.append(&mut listed.*, b"\n")
+}
+
+// The packages the marker file `marker` lists ([`rememberRuntime`]); none when it cannot be read,
+// and a line that does not read is left out.
+effect fn markerNames(marker: &Path) -> List<MarkedRuntime> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut names = List<MarkedRuntime>.make()
+  let read = match move run Effect.result(FileSystem.readFile(marker)) {
+    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => {
+        drop failure
+        return move names
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let bytes = Bytes.asSlice(&read)
+  let mut start = usize.ZERO
+  let mut at = usize.ZERO
+  while at < bytes.length {
+    if bytes[at] == 10 {
+      let mut space = start
+      while space < at && bytes[space] != 32 { space = space + usize.ONE }
+      let mut loads = usize.ZERO
+      let mut digit = space + usize.ONE
+      let mut valid = space > start && digit < at
+      while valid && digit < at {
+        if bytes[digit] < 48 || bytes[digit] > 57 { valid = false } else { loads = loads * 10 + u8.toUsize(bytes[digit] - 48) }
+        digit = digit + usize.ONE
+      }
+      if valid {
+        run List<MarkedRuntime>.append(&mut names, MarkedRuntime {name: run Bytes.copy(Slice.view<u8>(bytes, start, space - start)),
+          loads: loads})
+      }
+      start = at + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return move names
+}
+
+// The last component of `path`.
+fn lastName(path: &[u8]) -> &[u8] {
+  let mut start = path.length
+  while start > usize.ZERO && path[start - usize.ONE] != 47 { start = start - usize.ONE }
+  return Slice.view<u8>(path, start, path.length - start)
+}
+
+// The file in the cache directory `package` that lists the packages loading it whose file, named
+// as `image` is, holds a runtime's escape walk: `runtime-` and the file's name.
+effect fn runtimeMarker(image: &Path, package: &Path) -> Option<Path> ! OutOfMemoryError ? &mut Allocator {
+  let mut name = run Bytes.copy(b"runtime-")
+  run Bytes.append(&mut name, lastName(Path.rawBytes(image)))
+  return match move run Effect.result(Path.joinBytes(package, Bytes.asSlice(&name))) {
+    Result<Path, FileError | OutOfMemoryError>.Success {value} => Option<Path>.some(move value)
+    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => {
+        drop failure
+        Option<Path>.none()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// How many packages this one, which loads `ours`, or `marked`, which shares `shared` of them,
+// loads.
+fn loadedByEither(ours: usize, marked: &MarkedRuntime, shared: usize) -> usize {
+  let mut theirs = marked.loads
+  if theirs < shared { theirs = shared }
+  return ours + theirs - shared
+}
+
+// The file named as `image` in the directory of the package whose walk most likely reaches what
+// this one does ([`rememberRuntime`]): of those the markers of `packages` list, the one sharing
+// the largest part of the packages either loads, the first listed on a tie. None when no marker
+// lists another package.
+effect fn runtimeImage(image: &Path, packages: &[Path]) -> Option<Path> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  if packages.length == usize.ZERO { return Option<Path>.none() }
+  let own = match move run Path.parent(image) {
+    Option<Path>.Some {value} => move value
+    Option<Path>.None => { return Option<Path>.none() }
+  }
+  let mut named = List<MarkedRuntime>.make()
+  let mut counts = List<usize>.make()
+  let mut at = usize.ZERO
+  while at < packages.length {
+    let marker = match move run runtimeMarker(image, &packages[at]) {
+      Option<Path>.Some {value} => move value
+      Option<Path>.None => { return Option<Path>.none() }
+    }
+    at = at + usize.ONE
+    let read = run markerNames(&marker)
+    let mut names = move read
+    while List<MarkedRuntime>.length(&names) > usize.ZERO {
+      let listed = List<MarkedRuntime>.remove(&mut names, usize.ZERO)
+      if same(Bytes.asSlice(&listed.name), lastName(Path.rawBytes(&own))) { continue }
+      let known = List<MarkedRuntime>.asSlice(&named)
+      let mut found = usize.ZERO
+      while found < known.length && !same(Bytes.asSlice(&known[found].name), Bytes.asSlice(&listed.name)) { found = found + usize.ONE }
+      if found < known.length {
+        let tally = List<usize>.get(&counts, found) + usize.ONE
+        List<usize>.set(&mut counts, found, tally)
+      } else {
+        run List<MarkedRuntime>.append(&mut named, move listed)
+        run List<usize>.append(&mut counts, usize.ONE)
+      }
+    }
+  }
+  let tallies = List<usize>.asSlice(&counts)
+  if tallies.length == usize.ZERO { return Option<Path>.none() }
+  let marked = List<MarkedRuntime>.asSlice(&named)
+  // The share is `shared / (ours + theirs - shared)`; two compare by cross multiplication.
+  let mut best = usize.ZERO
+  at = usize.ONE
+  while at < tallies.length {
+    if tallies[at] * loadedByEither(packages.length, &marked[best], tallies[best])
+      > tallies[best] * loadedByEither(packages.length, &marked[at], tallies[at]) {
+      best = at
+    }
+    at = at + usize.ONE
+  }
+  let caches = match move run Path.parent(&own) {
+    Option<Path>.Some {value} => move value
+    Option<Path>.None => { return Option<Path>.none() }
+  }
+  let mut relative = run Bytes.copy(Bytes.asSlice(&marked[best].name))
+  run Bytes.append(&mut relative, b"/")
+  run Bytes.append(&mut relative, lastName(Path.rawBytes(image)))
+  return match move run Effect.result(Path.joinBytes(&caches, Bytes.asSlice(&relative))) {
+    Result<Path, FileError | OutOfMemoryError>.Success {value} => Option<Path>.some(move value)
+    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => {
+        drop failure
+        Option<Path>.none()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
 }
 
 /// The module checks and escape walks of the images in the cache directories `dependencies`
@@ -552,7 +750,12 @@ pub effect fn openPrefetched(store: &mut Semantic, request: &Request, cache: &Pa
 /// package roots the check (`Semantic.checkRoots`). So a package checked for the first time
 /// reuses each dependency's checks that still read the same, written by the same compiler for the
 /// same target under any profile.
-effect fn dependencyImage(store: &Semantic, compiler: &[u8], dependencies: &[Path]) -> Option<CacheImage.Image>
+///
+/// The escape walks of the file `walked` names join them: no dependency walks a runtime, and an
+/// executable's walk from the runtime's roots rests on what it reached, never on which package
+/// roots the check, so a package checked for the first time walks again only what the last
+/// executable's walk did not reach (`Semantic.escapeRoots`).
+effect fn dependencyImage(store: &Semantic, compiler: &[u8], dependencies: &[Path], walked: &Option<Path>) -> Option<CacheImage.Image>
   ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
   let mut merged = ImageMerge.make()
   let mut found = false
@@ -569,13 +772,25 @@ effect fn dependencyImage(store: &Semantic, compiler: &[u8], dependencies: &[Pat
       if !imageName(named) { continue }
       if let Option<CacheImage.Image>.Some {value: read} = move run dependencyFile(store, compiler, named) {
         let mut image = move read
-        // A merge copies leaves by key and walks nodes, so the keys are expanded and the nodes
-        // read; an image whose nodes do not read is passed over.
-        run CacheImage.expandKeys(&mut image)
+        // A merge copies leaves by key and walks nodes, so the leaves and nodes are read; their
+        // keys are read packed. An image whose leaves or nodes do not read is passed over.
+        if !run CacheImage.readLeaves(&mut image) { continue }
         if !run CacheImage.readNodes(&mut image) { continue }
         let roots = run Semantic.checkRoots(&image)
         run ImageMerge.add(&mut merged, &image, List<usize>.asSlice(&roots))
         taken = true
+        found = true
+      }
+    }
+  }
+  // Added last, so a dependency's own walk of a module wins over the copy carried here.
+  if let Option<Path>.Some {value: sibling} = &walked.* {
+    if let Option<CacheImage.Image>.Some {value: read} = move run dependencyFile(store, compiler, Path.rawBytes(&sibling)) {
+      let mut image = move read
+      let leaves = run CacheImage.readLeaves(&mut image)
+      if leaves && run CacheImage.readNodes(&mut image) {
+        let roots = run Semantic.escapeRoots(&image)
+        run ImageMerge.add(&mut merged, &image, List<usize>.asSlice(&roots))
         found = true
       }
     }

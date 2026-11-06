@@ -375,6 +375,16 @@ pub tls: ClientLimits
 
 The storage limits of the TLS client.
 
+<a id="Options.tlsVersions"></a>
+
+### Field `tlsVersions`
+
+```silk
+pub tlsVersions: VersionPolicy
+```
+
+The TLS versions the client offers.
+
 <a id="Options.trust"></a>
 
 ### Field `trust`
@@ -414,7 +424,7 @@ pub fn defaults() -> Options
 Returns the default settings.
 
 They are: 16 addresses, any family, Nagle on, 64 attempts, no deadline, 30 seconds for the
-handshake, and `OptionalHttp11`.
+handshake, TLS 1.2 and TLS 1.3, and `OptionalHttp11`.
 
 <a id="NativeTransport"></a>
 

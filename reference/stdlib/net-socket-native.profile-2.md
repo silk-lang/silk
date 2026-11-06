@@ -149,7 +149,7 @@ pub fn main() -> i32 {
 
 Import as `NativeSocket` with `import silk.net.socket_native { NativeSocket }`.
 
-Public declarations: 41.
+Public declarations: 42.
 
 <a id="RawSocket"></a>
 
@@ -1276,7 +1276,7 @@ The settings of a connect: Nagle and the attempt limit.
 pub struct ListenOptions
 ```
 
-The settings of a listener: the backlog and address reuse.
+The settings of a listener: the backlog, address reuse, and IPv6-only mode.
 
 <a id="UnixSocketPath"></a>
 
@@ -1732,7 +1732,7 @@ impl ListenOptions
 ### Associated function `make`
 
 ```silk
-pub fn make(kernelBacklog: usize, reuseAddress: bool) -> Result<ListenOptions, ListenOptionsError>
+pub fn make(kernelBacklog: usize, reuseAddress: bool, ipv6Only: bool) -> Result<ListenOptions, ListenOptionsError>
 ```
 
 Returns listen options.
@@ -1750,7 +1750,8 @@ Windows defaults to an exclusive bind when `reuseAddress` is false. When true, W
 pub fn defaults() -> ListenOptions
 ```
 
-Returns the default listen options: a backlog of 128, and no address reuse.
+Returns the default listen options: a backlog of 128, no address reuse, and IPv6 listeners
+that take only IPv6.
 
 <a id="ListenOptions.impl.kernelBacklog"></a>
 
@@ -1771,6 +1772,17 @@ pub fn reuseAddress(self: &Self) -> bool
 ```
 
 Returns whether the listener sets `SO_REUSEADDR`.
+
+<a id="ListenOptions.impl.ipv6Only"></a>
+
+### Method `ipv6Only`
+
+```silk
+pub fn ipv6Only(self: &Self) -> bool
+```
+
+Returns whether an IPv6 listener takes only IPv6 clients (`IPV6_V6ONLY`). When false, it
+also takes IPv4 clients, as IPv4-mapped IPv6 addresses.
 
 <a id="UnixSocketPath.impl"></a>
 
@@ -2343,6 +2355,31 @@ The returned connection is `Open` when the connect finished at once, else `Conne
 ### Errors
 `ConnectionRefused`, `NetworkUnreachable`, `AddressUnavailable`, `PermissionDenied`,
 `SystemResources`, or another `NativeSocketError`, if the system refused the connect at once.
+
+<a id="startConnectFrom"></a>
+
+## `startConnectFrom`
+
+```silk
+pub effect fn startConnectFrom(local: Endpoint, endpoint: Endpoint, options: ConnectOptions) -> Connection
+! NativeSocketError
+```
+
+Makes a TCP socket bound to the local address `local`, and starts its connect to `endpoint`
+without waiting.
+
+### When to use
+Use it to choose the local address or port of a connection, as Node's `localAddress` and
+`localPort` do. Otherwise use [`startConnect`](#startConnect).
+
+### Details
+It works as [`startConnect`](#startConnect) does, with a bind to `local` before the connect. Port 0 in `local`
+lets the system choose the port.
+
+### Errors
+`FamilyUnsupported` if `local` and `endpoint` are not of one family. `AddressInUse`,
+`AddressUnavailable`, or `NativeFailure` with operation `Bind` if the bind fails. Otherwise the
+errors of [`startConnect`](#startConnect).
 
 <a id="startConnectUnix"></a>
 

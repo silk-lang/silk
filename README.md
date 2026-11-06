@@ -162,7 +162,8 @@ silk run
 Hello, world!
 ```
 
-`silk init` writes a `silk.toml` and a `src/main.silk`. Even "hello world" names what it needs:
+`silk init` writes a `silk.toml` and a `src/main.silk` from the official `default` template
+(`silk init -l` lists the others; `-t minimal` works offline). Even "hello world" names what it needs:
 
 ```silk
 import silk.core.effect { Effect }
@@ -345,7 +346,7 @@ so nothing is checked at run time.
 
 | Command                     | What it does                                                         |
 | --------------------------- | -------------------------------------------------------------------- |
-| `silk init`                 | Create a package with `silk.toml` and `src/main.silk`                |
+| `silk init`                 | Create a package with `silk.toml` and `src/main.silk`, or from `-t <template>` |
 | `silk build` / `silk run`   | Compile for one or more targets, in debug or `--release`             |
 | `silk check`                | Check types, ownership and effects without building                  |
 | `silk test`                 | Discover and run `test` declarations                                 |

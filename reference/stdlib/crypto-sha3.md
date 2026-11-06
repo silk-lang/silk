@@ -45,7 +45,7 @@ pub fn main() -> i32 {
 
 Import as `Sha3_256` with `import silk.crypto.sha3 { Sha3_256 }`.
 
-Public declarations: 6.
+Public declarations: 8.
 
 <a id="Sha3_224"></a>
 
@@ -696,6 +696,18 @@ pub fn finishInto(self: Self, output: &mut [u8]) -> ()
 Fills `output` with the first `output.length` bytes of the SHAKE128 output and consumes
 the state. An empty slice is allowed. Node's default output length is 16 bytes.
 
+<a id="Shake128.impl.finish"></a>
+
+### Method `finish`
+
+```silk
+pub fn finish(self: Self) -> Shake128Reader
+```
+
+Ends the message and returns a reader for the SHAKE128 output, consuming the state.
+Successive [`Shake128Reader.read`](#Shake128Reader.impl.read) calls return successive bytes of the output, so their
+concatenation equals what [`Shake128.finishInto`](#Shake128.impl.finishInto) writes for the same total length.
+
 <a id="Shake128.impl.hash"></a>
 
 ### Associated function `hash`
@@ -715,6 +727,38 @@ pub fn objectIdentifier() -> &'static [u8]
 ```
 
 Returns the content bytes of the SHAKE128 object identifier, 2.16.840.1.101.3.4.2.11.
+
+<a id="Shake128Reader"></a>
+
+## `Shake128Reader`
+
+```silk
+pub struct Shake128Reader
+```
+
+The output side of a finished [`Shake128`](#Shake128): reads the SHAKE128 output a part at a time.
+
+Get one from [`Shake128.finish`](#Shake128.impl.finish). Each [`Shake128Reader.read`](#Shake128Reader.impl.read) continues where the last one stopped,
+with any part sizes, for as many bytes as the caller wants. Use it where the needed length is
+not known up front, as in the rejection sampling of ML-KEM and ML-DSA. It does not allocate.
+
+<a id="Shake128Reader.impl"></a>
+
+## Implementation `Shake128Reader`
+
+```silk
+impl Shake128Reader
+```
+
+<a id="Shake128Reader.impl.read"></a>
+
+### Method `read`
+
+```silk
+pub fn read(self: &mut Self, output: &mut [u8]) -> ()
+```
+
+Fills `output` with the next `output.length` bytes of the output. An empty slice is allowed.
 
 <a id="Shake256"></a>
 
@@ -785,6 +829,18 @@ pub fn finishInto(self: Self, output: &mut [u8]) -> ()
 Fills `output` with the first `output.length` bytes of the SHAKE256 output and consumes
 the state. An empty slice is allowed. Node's default output length is 32 bytes.
 
+<a id="Shake256.impl.finish"></a>
+
+### Method `finish`
+
+```silk
+pub fn finish(self: Self) -> Shake256Reader
+```
+
+Ends the message and returns a reader for the SHAKE256 output, consuming the state.
+Successive [`Shake256Reader.read`](#Shake256Reader.impl.read) calls return successive bytes of the output, so their
+concatenation equals what [`Shake256.finishInto`](#Shake256.impl.finishInto) writes for the same total length.
+
 <a id="Shake256.impl.hash"></a>
 
 ### Associated function `hash`
@@ -804,6 +860,38 @@ pub fn objectIdentifier() -> &'static [u8]
 ```
 
 Returns the content bytes of the SHAKE256 object identifier, 2.16.840.1.101.3.4.2.12.
+
+<a id="Shake256Reader"></a>
+
+## `Shake256Reader`
+
+```silk
+pub struct Shake256Reader
+```
+
+The output side of a finished [`Shake256`](#Shake256): reads the SHAKE256 output a part at a time.
+
+Get one from [`Shake256.finish`](#Shake256.impl.finish). Each [`Shake256Reader.read`](#Shake256Reader.impl.read) continues where the last one stopped,
+with any part sizes, for as many bytes as the caller wants. Use it where the needed length is
+not known up front, as in the rejection sampling of ML-KEM and ML-DSA. It does not allocate.
+
+<a id="Shake256Reader.impl"></a>
+
+## Implementation `Shake256Reader`
+
+```silk
+impl Shake256Reader
+```
+
+<a id="Shake256Reader.impl.read"></a>
+
+### Method `read`
+
+```silk
+pub fn read(self: &mut Self, output: &mut [u8]) -> ()
+```
+
+Fills `output` with the next `output.length` bytes of the output. An empty slice is allowed.
 
 
 Category: Cryptography.

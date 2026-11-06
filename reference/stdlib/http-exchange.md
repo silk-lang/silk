@@ -1398,6 +1398,16 @@ pub tls: ClientLimits
 
 The limits of the TLS client.
 
+<a id="RouteSettings.tlsVersions"></a>
+
+### Field `tlsVersions`
+
+```silk
+pub tlsVersions: VersionPolicy
+```
+
+The TLS versions the client offers.
+
 <a id="RouteSettings.handshakeDurationNanoseconds"></a>
 
 ### Field `handshakeDurationNanoseconds`

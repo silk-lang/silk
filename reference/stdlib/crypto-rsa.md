@@ -16,6 +16,9 @@ A key has a modulus of 512 to 8192 bits and an odd public exponent of 3 or more,
 65537. Make a key from its big-endian parts with [`RsaPublicKey.fromComponents`](#RsaPublicKey.impl.fromComponents) or
 [`RsaPrivateKey.fromComponents`](#RsaPrivateKey.impl.fromComponents), or generate one with [`RsaPrivateKey.generate`](#RsaPrivateKey.impl.generate).
 
+Keys of the RSA-PSS type, which OpenSSL writes with the `id-RSASSA-PSS` algorithm and
+optional limits on the hash and the salt, are [`RsaPssPublicKey`](#RsaPssPublicKey) and [`RsaPssPrivateKey`](#RsaPssPrivateKey).
+
 The signature functions take the digest of the message, not the message, and the hash as a
 type argument that implements `silk.crypto.digest.Digest`, such as `Sha256`. PSS and OAEP use
 MGF1 with the same hash. A signature or a ciphertext has the length in bytes of the modulus.
@@ -81,7 +84,7 @@ pub effect fn main() -> i32 ! RsaError {
 
 Import as `RsaPublicKey` with `import silk.crypto.rsa { RsaPublicKey }`.
 
-Public declarations: 3.
+Public declarations: 7.
 
 <a id="RsaError"></a>
 
@@ -406,6 +409,34 @@ The message can have up to the modulus length less 11 bytes.
 Use it only for formats that require it. Prefer [`RsaPublicKey.encryptOaep`](#RsaPublicKey.impl.encryptOaep): PKCS #1 v1.5
 padding has a long history of padding-oracle attacks.
 
+<a id="RsaPublicKey.impl.recoverPkcs1Raw"></a>
+
+### Method `recoverPkcs1Raw`
+
+```silk
+pub fn recoverPkcs1Raw(self: &RsaPublicKey, signature: &[u8], output: &mut [u8]) -> Result<
+    usize,
+    RsaError,
+  >
+```
+
+Recovers the message of a signature made with PKCS #1 v1.5 type 1 padding over raw bytes,
+as `RSA_public_decrypt` with `RSA_PKCS1_PADDING` and `crypto.publicDecrypt` in Node.js do,
+and returns the length of the message that it writes to the start of `output`.
+
+The recovered block must be 0x00, 0x01, at least 8 bytes of 0xFF, 0x00, and the message.
+It is the inverse of [`RsaPrivateKey.signPkcs1Raw`](#RsaPrivateKey.impl.signPkcs1Raw). The message can have up to the modulus
+length less 11 bytes.
+
+#### Errors
+- `InvalidLength` if `signature` is not as long as the modulus, or `output` is shorter than
+  the message.
+- `InvalidSignature` if `signature` is not less than the modulus or the padding is not valid.
+
+#### Gotchas
+It does not check a digest. To verify a signature of a message, use
+[`RsaPublicKey.verifyPkcs1`](#RsaPublicKey.impl.verifyPkcs1).
+
 <a id="RsaPublicKey.impl.encryptRaw"></a>
 
 ### Method `encryptRaw`
@@ -415,7 +446,8 @@ pub fn encryptRaw(self: &RsaPublicKey, input: &[u8], output: &mut [u8]) -> Resul
 ```
 
 Computes `input`^e modulo n without padding (RSAEP, `RSA_NO_PADDING` in Node.js) and writes
-it to `output`.
+it to `output`. It is also the public operation of `crypto.publicDecrypt` with
+`RSA_NO_PADDING`.
 
 #### Errors
 - `InvalidLength` if `input` or `output` is not as long as the modulus.
@@ -628,6 +660,34 @@ ciphertext, so the errors do not reveal the plaintext.
 - `InvalidCiphertext` if the ciphertext is not valid.
 - `InvalidKey` if the private parts do not match the public key.
 
+<a id="RsaPrivateKey.impl.signPkcs1Raw"></a>
+
+### Method `signPkcs1Raw`
+
+```silk
+pub fn signPkcs1Raw(self: &RsaPrivateKey, message: &[u8], signature: &mut [u8]) -> Result<
+    (),
+    RsaError,
+  >
+```
+
+Signs `message` as raw bytes with PKCS #1 v1.5 type 1 padding, as `RSA_private_encrypt`
+with `RSA_PKCS1_PADDING` and `crypto.privateEncrypt` in Node.js do, and writes the signature
+to `signature`.
+
+The padded block is 0x00, 0x01, 0xFF bytes, 0x00, and the message, with no DigestInfo. The
+message can have up to the modulus length less 11 bytes. Recover it with
+[`RsaPublicKey.recoverPkcs1Raw`](#RsaPublicKey.impl.recoverPkcs1Raw).
+
+#### Errors
+- `InvalidLength` if `signature` is not as long as the modulus.
+- `MessageTooLong` if `message` is too long.
+- `InvalidKey` if the private parts do not match the public key.
+
+#### Gotchas
+It does not hash or encode a digest. To sign a message for [`RsaPublicKey.verifyPkcs1`](#RsaPublicKey.impl.verifyPkcs1),
+use [`RsaPrivateKey.signPkcs1`](#RsaPrivateKey.impl.signPkcs1).
+
 <a id="RsaPrivateKey.impl.decryptRaw"></a>
 
 ### Method `decryptRaw`
@@ -640,7 +700,8 @@ pub fn decryptRaw(self: &RsaPrivateKey, input: &[u8], output: &mut [u8]) -> Resu
 ```
 
 Computes `input`^d modulo n without padding (RSADP, `RSA_NO_PADDING` in Node.js) and writes
-it to `output`.
+it to `output`. It is also the private operation of `crypto.privateEncrypt` with
+`RSA_NO_PADDING`.
 
 #### Errors
 - `InvalidLength` if `input` or `output` is not as long as the modulus.
@@ -889,6 +950,334 @@ of `output` and returns its length.
 
 #### Errors
 - `InvalidLength` if `output` is shorter than [`RsaPrivateKey.pkcs8DerLength`](#RsaPrivateKey.impl.pkcs8DerLength).
+
+<a id="RsaPssHash"></a>
+
+## `RsaPssHash`
+
+```silk
+pub enum RsaPssHash
+```
+
+A hash that the parameters of an RSA-PSS key name (RFC 4055).
+
+<a id="RsaPssHash.Sha1"></a>
+
+### `Sha1`
+
+```silk
+Sha1
+```
+
+SHA-1, the default when the parameters name no hash.
+
+<a id="RsaPssHash.Sha224"></a>
+
+### `Sha224`
+
+```silk
+Sha224
+```
+
+SHA-224.
+
+<a id="RsaPssHash.Sha256"></a>
+
+### `Sha256`
+
+```silk
+Sha256
+```
+
+SHA-256.
+
+<a id="RsaPssHash.Sha384"></a>
+
+### `Sha384`
+
+```silk
+Sha384
+```
+
+SHA-384.
+
+<a id="RsaPssHash.Sha512"></a>
+
+### `Sha512`
+
+```silk
+Sha512
+```
+
+SHA-512.
+
+<a id="RsaPssHash.Sha512_224"></a>
+
+### `Sha512_224`
+
+```silk
+Sha512_224
+```
+
+SHA-512/224.
+
+<a id="RsaPssHash.Sha512_256"></a>
+
+### `Sha512_256`
+
+```silk
+Sha512_256
+```
+
+SHA-512/256.
+
+<a id="RsaPssHash.impl"></a>
+
+## Implementation `RsaPssHash`
+
+```silk
+impl RsaPssHash
+```
+
+<a id="RsaPssHash.impl.digestLength"></a>
+
+### Method `digestLength`
+
+```silk
+pub fn digestLength(self: &Self) -> usize
+```
+
+Returns the length in bytes of the digest of the hash, such as 32 for SHA-256.
+
+<a id="RsaPssRestrictions"></a>
+
+## `RsaPssRestrictions`
+
+```silk
+pub struct RsaPssRestrictions
+```
+
+The parameters of an RSA-PSS key, which limit the signatures that the key may make.
+
+### Details
+A key with these parameters signs only with `hash`, MGF1 with `maskHash`, and a salt of at
+least `saltLength` bytes. The defaults of RFC 4055 are SHA-1, MGF1 with SHA-1, and 20 bytes.
+
+### Gotchas
+The sign and verify functions do not read these. The caller checks its options against them,
+as Node.js and OpenSSL do.
+
+<a id="RsaPssRestrictions.hash"></a>
+
+### Field `hash`
+
+```silk
+pub hash: RsaPssHash
+```
+
+The hash of the message.
+
+<a id="RsaPssRestrictions.maskHash"></a>
+
+### Field `maskHash`
+
+```silk
+pub maskHash: RsaPssHash
+```
+
+The hash of MGF1.
+
+<a id="RsaPssRestrictions.saltLength"></a>
+
+### Field `saltLength`
+
+```silk
+pub saltLength: u32
+```
+
+The smallest salt length in bytes.
+
+<a id="RsaPssPublicKey"></a>
+
+## `RsaPssPublicKey`
+
+```silk
+pub struct RsaPssPublicKey
+```
+
+An RSA public key with the RSA-PSS algorithm (`id-RSASSA-PSS`), as OpenSSL writes for a key
+of type `rsa-pss`.
+
+### Details
+`restrictions` is `None` when the algorithm has no parameters, so the key may sign with any
+PSS parameters. Read one with [`RsaPssPublicKey.fromSpkiDer`](#RsaPssPublicKey.impl.fromSpkiDer).
+
+<a id="RsaPssPublicKey.key"></a>
+
+### Field `key`
+
+```silk
+pub key: RsaPublicKey
+```
+
+The key.
+
+<a id="RsaPssPublicKey.restrictions"></a>
+
+### Field `restrictions`
+
+```silk
+pub restrictions: Option<RsaPssRestrictions>
+```
+
+The parameters of the key, or `None`.
+
+<a id="RsaPssPrivateKey"></a>
+
+## `RsaPssPrivateKey`
+
+```silk
+pub struct RsaPssPrivateKey
+```
+
+An RSA private key with the RSA-PSS algorithm (`id-RSASSA-PSS`), as OpenSSL writes for a key
+of type `rsa-pss`.
+
+### Details
+`restrictions` is `None` when the algorithm has no parameters. Read one with
+[`RsaPssPrivateKey.fromPkcs8Der`](#RsaPssPrivateKey.impl.fromPkcs8Der).
+
+<a id="RsaPssPrivateKey.key"></a>
+
+### Field `key`
+
+```silk
+pub key: RsaPrivateKey
+```
+
+The key.
+
+<a id="RsaPssPrivateKey.restrictions"></a>
+
+### Field `restrictions`
+
+```silk
+pub restrictions: Option<RsaPssRestrictions>
+```
+
+The parameters of the key, or `None`.
+
+<a id="RsaPssPublicKey.impl"></a>
+
+## Implementation `RsaPssPublicKey`
+
+```silk
+impl RsaPssPublicKey
+```
+
+<a id="RsaPssPublicKey.impl.fromSpkiDer"></a>
+
+### Associated function `fromSpkiDer`
+
+```silk
+pub fn fromSpkiDer(der: &[u8]) -> Result<RsaPssPublicKey, RsaError>
+```
+
+Returns the key in a DER `SubjectPublicKeyInfo` with the `id-RSASSA-PSS` algorithm, as in
+a PEM `PUBLIC KEY` that OpenSSL writes for an `rsa-pss` key.
+
+#### Errors
+- `InvalidEncoding` if the DER is not valid, or the BIT STRING has unused bits.
+- `InvalidParameters` if the algorithm is not `id-RSASSA-PSS`, or its parameters name a
+  hash other than SHA-1 or SHA-2, a mask other than MGF1, a salt length above `u32.MAX`, or
+  a trailer field other than 1.
+- `InvalidKey` if the key is not valid, as with [`RsaPublicKey.fromComponents`](#RsaPublicKey.impl.fromComponents).
+
+<a id="RsaPssPublicKey.impl.spkiDerLength"></a>
+
+### Method `spkiDerLength`
+
+```silk
+pub fn spkiDerLength(self: &RsaPssPublicKey) -> usize
+```
+
+Returns the length in bytes of [`RsaPssPublicKey.writeSpkiDer`](#RsaPssPublicKey.impl.writeSpkiDer).
+
+<a id="RsaPssPublicKey.impl.writeSpkiDer"></a>
+
+### Method `writeSpkiDer`
+
+```silk
+pub fn writeSpkiDer(self: &RsaPssPublicKey, output: &mut [u8]) -> Result<usize, RsaError>
+```
+
+Writes the key as a DER `SubjectPublicKeyInfo` with `id-RSASSA-PSS` to the start of
+`output` and returns its length. The parameters are left out when `restrictions` is
+`None`, and each field that holds its default is left out, as OpenSSL writes them.
+
+#### Errors
+- `InvalidLength` if `output` is shorter than [`RsaPssPublicKey.spkiDerLength`](#RsaPssPublicKey.impl.spkiDerLength).
+
+<a id="RsaPssPrivateKey.impl"></a>
+
+## Implementation `RsaPssPrivateKey`
+
+```silk
+impl RsaPssPrivateKey
+```
+
+<a id="RsaPssPrivateKey.impl.fromPkcs8Der"></a>
+
+### Associated function `fromPkcs8Der`
+
+```silk
+pub fn fromPkcs8Der(der: &[u8]) -> Result<RsaPssPrivateKey, RsaError>
+```
+
+Returns the key in a DER PKCS #8 `PrivateKeyInfo` with the `id-RSASSA-PSS` algorithm, as
+in a PEM `PRIVATE KEY` that OpenSSL writes for an `rsa-pss` key. Attributes and a public
+key after the private key are skipped.
+
+#### Errors
+- `InvalidEncoding` if the DER is not valid, or the version is not 0 or 1.
+- `InvalidParameters` if the algorithm or its parameters are not supported, as with
+  [`RsaPssPublicKey.fromSpkiDer`](#RsaPssPublicKey.impl.fromSpkiDer), or the key is multi-prime.
+- `InvalidKey` if the parts are not valid, as with [`RsaPrivateKey.fromComponents`](#RsaPrivateKey.impl.fromComponents).
+
+<a id="RsaPssPrivateKey.impl.publicKey"></a>
+
+### Method `publicKey`
+
+```silk
+pub fn publicKey(self: &RsaPssPrivateKey) -> RsaPssPublicKey
+```
+
+Returns the public half of the key with the same parameters.
+
+<a id="RsaPssPrivateKey.impl.pkcs8DerLength"></a>
+
+### Method `pkcs8DerLength`
+
+```silk
+pub fn pkcs8DerLength(self: &RsaPssPrivateKey) -> usize
+```
+
+Returns the length in bytes of [`RsaPssPrivateKey.writePkcs8Der`](#RsaPssPrivateKey.impl.writePkcs8Der).
+
+<a id="RsaPssPrivateKey.impl.writePkcs8Der"></a>
+
+### Method `writePkcs8Der`
+
+```silk
+pub fn writePkcs8Der(self: &RsaPssPrivateKey, output: &mut [u8]) -> Result<usize, RsaError>
+```
+
+Writes the key as a DER PKCS #8 `PrivateKeyInfo` (version 0, `id-RSASSA-PSS`) to the start
+of `output` and returns its length. The parameters are written as with
+[`RsaPssPublicKey.writeSpkiDer`](#RsaPssPublicKey.impl.writeSpkiDer).
+
+#### Errors
+- `InvalidLength` if `output` is shorter than [`RsaPssPrivateKey.pkcs8DerLength`](#RsaPssPrivateKey.impl.pkcs8DerLength).
 
 <a id="RsaPrivateKey.impl-3"></a>
 
