@@ -15,7 +15,11 @@
 //! the start of the word, and pick the postfix bits and direct codes of the distances. Each
 //! meta-block gets its own prefix codes for literals, commands, and distances. From quality 5 the
 //! literals use one prefix code for each cluster of the 64 contexts of their two previous bytes,
-//! in UTF-8 or signed context mode. A meta-block that does not shrink is stored uncompressed.
+//! in UTF-8 or signed context mode, and the commands and distances of a meta-block are split
+//! into blocks of up to 64 types with their own prefix codes, with 4 contexts by copy length for
+//! the distances. At qualities 10 and 11 the literals are also split, into up to 32 types, from
+//! more histograms. From quality 4 the counts are smoothed toward runs before the prefix codes
+//! are built. A meta-block that does not shrink is stored uncompressed.
 //! [`BrotliEncoder.make`] allocates all storage one time. Later calls do not allocate and do not
 //! keep a borrow of your buffers. The output is deterministic but is not the same bytes that the
 //! reference `brotli` writes.
@@ -53,6 +57,7 @@ import silk.core.result { Result }
 import silk.num.u8
 import silk.num.u32
 import silk.num.u64
+import silk.num.i64
 import silk.num.usize
 import silk.num.f64
 import silk.io.writer { Writer, WriterError }
@@ -172,11 +177,13 @@ impl BrotliOptions {
 ///
 /// # Details
 /// [`BrotliEncoder.make`] allocates all storage one time: twice the window or twice the
-/// meta-block (64 KiB to 256 KiB), whichever is larger, and about two meta-blocks of command and
-/// output buffers. Up to quality 9 it adds the hash buckets (512 KiB at quality 0 and 32 MiB at 9,
-/// less when the window is small), and from quality 5 about 300 KiB for literal contexts.
-/// Qualities 10 and 11 add one more window, a binary tree of 8 bytes for each byte of the window,
-/// about 17 MiB for matches and the shortest path search, and 200 KiB for a dictionary index.
+/// meta-block (64 KiB to 256 KiB, and at most the window from 64 KiB), whichever is larger, and
+/// about two meta-blocks of command and output buffers. Up to quality 9 it adds the hash buckets
+/// (512 KiB at quality 0 and 32 MiB at 9, less when the window is small), and from quality 5
+/// about 5 MiB for literal contexts and block splitting. Qualities 10 and 11 add one more window, a binary tree of
+/// 8 bytes for each byte of the window, about 115 bytes for each byte of the meta-block for
+/// matches, the shortest path search, and block splitting (30 MiB with 256 KiB meta-blocks), and
+/// about 7 MiB for histogram clustering and a dictionary index.
 /// Later calls do not allocate and do not keep a borrow of your buffers, so you can move the
 /// encoder between threads between calls.
 pub struct BrotliEncoder {
@@ -257,6 +264,47 @@ pub struct BrotliEncoder {
   mapDepth: List<u32>,
   mapCode: List<u32>,
   mapSymbols: List<u32>,
+  mapMoved: List<u32>,
+  distanceMap: List<u32>,
+  literalTypes: usize,
+  commandTypes: usize,
+  distanceTypes: usize,
+  distanceClusters: usize,
+  blockCounts: [usize; 3],
+  blockRegion: [usize; 3],
+  blockType: List<u8>,
+  blockLength: List<u32>,
+  switchHistogram: List<u32>,
+  switchDepth: List<u32>,
+  switchCode: List<u32>,
+  switchLast: [u32; 3],
+  switchSecond: [u32; 3],
+  switchBits: u64,
+  cursorIndex: [usize; 3],
+  cursorLeft: [u32; 3],
+  cursorType: [u32; 3],
+  splitData: List<u32>,
+  splitIds: List<u8>,
+  splitSignals: List<u8>,
+  splitInsert: List<f64>,
+  splitCost: List<f64>,
+  splitNewId: List<u32>,
+  splitHistograms: List<u32>,
+  splitTotals: List<u32>,
+  blockSpans: List<u32>,
+  blockSymbols: List<u32>,
+  pool: List<u32>,
+  inputs: List<u32>,
+  poolCost: List<f64>,
+  poolTotal: List<u32>,
+  poolCount: List<u32>,
+  poolClusters: List<u32>,
+  poolIndex: List<u32>,
+  pairLeft: List<u32>,
+  pairRight: List<u32>,
+  pairDiff: List<f64>,
+  pairCombo: List<f64>,
+  pairCount: usize,
   logTable: List<f64>,
   commandHistogram: List<u32>,
   commandDepth: List<u32>,
@@ -271,6 +319,8 @@ pub struct BrotliEncoder {
   lengthDepth: List<u32>,
   lengthCode: List<u32>,
   rleSymbols: List<u32>,
+  rleCounts: List<u32>,
+  rleGood: List<u8>,
   rleExtra: List<u32>,
   treeCount: List<u32>,
   treeLeft: List<u32>,
@@ -330,12 +380,103 @@ const CONTEXT_QUALITY: u32 = 5
 const CONTEXTS: usize = 64
 
 // The context map alphabet: up to 64 cluster indexes after up to 6 run-length codes of zeros.
-const MAP_ALPHABET: usize = 70
+const MAP_ALPHABET: usize = 272
 
 const MODE_UTF8: u32 = 2
 
 // Base-2 logarithms of the counts below this come from a table.
 const LOG_TABLE: usize = 4096
+
+// Block splitting: the most block types of literals (at qualities 10 and 11), commands, and
+// distances, the most prefix codes of literals or distances, and the storage of the histogram
+// clustering.
+const MAX_LITERAL_TYPES: usize = 32
+
+const MAX_COMMAND_TYPES: usize = 64
+
+const MAX_DISTANCE_TYPES: usize = 64
+
+const MAX_CLUSTERS: usize = 256
+
+const MAX_SPLIT_HISTOGRAMS: usize = 100
+
+const SPLIT_HISTOGRAMS: usize = 45056
+
+const POOL_SIZE: usize = 524288
+
+const POOL_SLOTS: usize = 2048
+
+const PAIR_LIMIT: usize = 8192
+
+const BLOCK_SPLIT_MIN: usize = 128
+
+// From quality 5 to 9 only commands and distances are split, from this many histograms, and the
+// histogram clustering has a pool for the distance contexts of all block types.
+const SPLIT_QUALITY: u32 = 5
+
+const SPLIT_HISTOGRAMS_FAST: usize = 8
+
+const SPLIT_POOL_FAST: usize = MAX_DISTANCE_TYPES * 4 * DISTANCE_LIMIT
+
+const NO_INDEX: u32 = 0xffffffff
+
+const SPAN_BASE: [u32; 26] = [
+  1,
+  5,
+  9,
+  13,
+  17,
+  25,
+  33,
+  41,
+  49,
+  65,
+  81,
+  97,
+  113,
+  145,
+  177,
+  209,
+  241,
+  305,
+  369,
+  497,
+  753,
+  1265,
+  2289,
+  4337,
+  8433,
+  16625,
+]
+
+const SPAN_EXTRA: [u32; 26] = [
+  2,
+  2,
+  2,
+  2,
+  3,
+  3,
+  3,
+  3,
+  4,
+  4,
+  4,
+  4,
+  5,
+  5,
+  5,
+  5,
+  6,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  24,
+]
 
 const MODE_SIGNED: u32 = 3
 
@@ -525,7 +666,16 @@ impl BrotliEncoder {
     let quality = options.quality
     let index = u32.toUsize(quality)
     let windowSize = usize.shiftLeft(1, u32.toUsize(options.windowBits))
-    let blockSize = usize.shiftLeft(1, u32.toUsize(BLOCK_LOGS[index]))
+
+    // Like the reference, a small window keeps meta-blocks at 64 KiB or the window size.
+    let mut blockLog = BLOCK_LOGS[index]
+    if options.windowBits < blockLog {
+      blockLog = options.windowBits
+      if blockLog < 16 {
+        blockLog = 16
+      }
+    }
+    let blockSize = usize.shiftLeft(1, u32.toUsize(blockLog))
     let mut bucketBits = BUCKET_BITS[index]
     if bucketBits > options.windowBits {
       bucketBits = options.windowBits
@@ -571,7 +721,11 @@ impl BrotliEncoder {
     let mut prefixTransforms = List<u32>.make()
     let mut prefixGroups = List<u32>.make()
     if zopfli {
-      run List<u32>.appendRepeated(&mut wordHeads, 0, usize.shiftLeft(1, u32.toUsize(WORD_HASH_BITS)))
+      run List<u32>.appendRepeated(
+        &mut wordHeads,
+        0,
+        usize.shiftLeft(1, u32.toUsize(WORD_HASH_BITS)),
+      )
       run List<u32>.appendRepeated(&mut wordNext, 0, WORD_COUNT)
       run List<u32>.appendRepeated(&mut wordEntry, 0, WORD_COUNT)
       run List<u32>.appendRepeated(&mut prefixTransforms, 0, brotli_tables.transformCount())
@@ -581,7 +735,10 @@ impl BrotliEncoder {
         List<u32>.asMutSlice(&mut wordNext),
         List<u32>.asMutSlice(&mut wordEntry),
       )
-      indexPrefixes(List<u32>.asMutSlice(&mut prefixTransforms), List<u32>.asMutSlice(&mut prefixGroups))
+      indexPrefixes(
+        List<u32>.asMutSlice(&mut prefixTransforms),
+        List<u32>.asMutSlice(&mut prefixGroups),
+      )
     }
     let mut nodeInsert = List<u32>.make()
     run List<u32>.appendRepeated(&mut nodeInsert, 0, positions)
@@ -622,25 +779,124 @@ impl BrotliEncoder {
     run List<u32>.appendRepeated(&mut commandSymbol, 0, commands)
     let contextModeling = quality >= CONTEXT_QUALITY
     let mut clusters: usize = 1
+    let mut literalTrees: usize = 1
+    let mut mapSize = CONTEXTS
+    let mut commandTrees: usize = 1
+    let mut distanceTrees: usize = 1
+    let mut distanceMapSize: usize = 4
+    let mut blockSlots: usize = 3
+    let mut splitSymbols: usize = 0
+    let mut splitBuckets: usize = 0
+    let mut poolSize: usize = 0
+    let mut poolSlots: usize = 0
+    let mut pairSlots: usize = 0
+    let mut histogramSlots: usize = 0
+    let mut commandRegion: usize = 1
+    let mut regionSize: usize = 1
     if contextModeling {
       clusters = CONTEXTS
+      literalTrees = CONTEXTS
+    }
+    if zopfli {
+      literalTrees = MAX_CLUSTERS
+      mapSize = MAX_LITERAL_TYPES * CONTEXTS
+      blockSlots = blockSize + 2 * commands
+      commandRegion = blockSize
+      splitSymbols = blockSize
+      splitBuckets = SPLIT_HISTOGRAMS
+      histogramSlots = MAX_SPLIT_HISTOGRAMS
+    } else if quality >= SPLIT_QUALITY {
+      // Only commands and distances are split below quality 10, into fewer histograms.
+      blockSlots = 1 + 2 * commands
+      commandRegion = 1
+      splitSymbols = commands
+      splitBuckets = SPLIT_HISTOGRAMS_FAST * COMMAND_ALPHABET
+      histogramSlots = SPLIT_HISTOGRAMS_FAST
+    }
+    if quality >= SPLIT_QUALITY {
+      commandTrees = MAX_COMMAND_TYPES
+      distanceTrees = MAX_CLUSTERS
+      distanceMapSize = MAX_DISTANCE_TYPES * 4
+      regionSize = commands
+      poolSize = POOL_SIZE
+      poolSlots = POOL_SLOTS
+      pairSlots = PAIR_LIMIT
+      if !zopfli {
+        poolSize = SPLIT_POOL_FAST
+      }
     }
     let mut literalHistogram = List<u32>.make()
-    run List<u32>.appendRepeated(&mut literalHistogram, 0, LITERAL_ALPHABET * clusters)
+    run List<u32>.appendRepeated(&mut literalHistogram, 0, LITERAL_ALPHABET * literalTrees)
     let mut literalDepth = List<u32>.make()
-    run List<u32>.appendRepeated(&mut literalDepth, 0, LITERAL_ALPHABET * clusters)
+    run List<u32>.appendRepeated(&mut literalDepth, 0, LITERAL_ALPHABET * literalTrees)
     let mut literalCode = List<u32>.make()
-    run List<u32>.appendRepeated(&mut literalCode, 0, LITERAL_ALPHABET * clusters)
+    run List<u32>.appendRepeated(&mut literalCode, 0, LITERAL_ALPHABET * literalTrees)
     let mut contextHistogram = List<u32>.make()
     run List<u32>.appendRepeated(&mut contextHistogram, 0, LITERAL_ALPHABET * clusters)
     let mut contextMap = List<u32>.make()
-    run List<u32>.appendRepeated(&mut contextMap, 0, CONTEXTS)
+    run List<u32>.appendRepeated(&mut contextMap, 0, mapSize)
+    let mut mapMoved = List<u32>.make()
+    run List<u32>.appendRepeated(&mut mapMoved, 0, mapSize)
+    let mut distanceMap = List<u32>.make()
+    run List<u32>.appendRepeated(&mut distanceMap, 0, distanceMapSize)
+    let mut switchHistogram = List<u32>.make()
+    run List<u32>.appendRepeated(&mut switchHistogram, 0, 3 * SWITCH_SPAN)
+    let mut switchDepth = List<u32>.make()
+    run List<u32>.appendRepeated(&mut switchDepth, 0, 3 * SWITCH_SPAN)
+    let mut switchCode = List<u32>.make()
+    run List<u32>.appendRepeated(&mut switchCode, 0, 3 * SWITCH_SPAN)
+    let mut blockType = List<u8>.make()
+    run List<u8>.appendRepeated(&mut blockType, 0, blockSlots)
+    let mut blockLength = List<u32>.make()
+    run List<u32>.appendRepeated(&mut blockLength, 0, blockSlots)
+    let mut splitData = List<u32>.make()
+    run List<u32>.appendRepeated(&mut splitData, 0, splitSymbols)
+    let mut splitIds = List<u8>.make()
+    run List<u8>.appendRepeated(&mut splitIds, 0, splitSymbols)
+    let mut splitSignals = List<u8>.make()
+    run List<u8>.appendRepeated(&mut splitSignals, 0, splitSymbols * ((histogramSlots + 7) / 8))
+    let mut splitInsert = List<f64>.make()
+    run List<f64>.appendRepeated(&mut splitInsert, 0.0, splitBuckets)
+    let mut splitCost = List<f64>.make()
+    run List<f64>.appendRepeated(&mut splitCost, 0.0, histogramSlots)
+    let mut splitNewId = List<u32>.make()
+    run List<u32>.appendRepeated(&mut splitNewId, 0, histogramSlots)
+    let mut splitHistograms = List<u32>.make()
+    run List<u32>.appendRepeated(&mut splitHistograms, 0, splitBuckets)
+    let mut splitTotals = List<u32>.make()
+    run List<u32>.appendRepeated(&mut splitTotals, 0, histogramSlots)
+    let mut blockSpans = List<u32>.make()
+    run List<u32>.appendRepeated(&mut blockSpans, 0, splitSymbols)
+    let mut blockSymbols = List<u32>.make()
+    run List<u32>.appendRepeated(&mut blockSymbols, 0, splitSymbols + poolSlots)
+    let mut pool = List<u32>.make()
+    run List<u32>.appendRepeated(&mut pool, 0, poolSize)
+    let mut inputs = List<u32>.make()
+    run List<u32>.appendRepeated(&mut inputs, 0, poolSize)
+    let mut poolCost = List<f64>.make()
+    run List<f64>.appendRepeated(&mut poolCost, 0.0, poolSlots)
+    let mut poolTotal = List<u32>.make()
+    run List<u32>.appendRepeated(&mut poolTotal, 0, poolSlots)
+    let mut poolCount = List<u32>.make()
+    run List<u32>.appendRepeated(&mut poolCount, 0, poolSlots)
+    let mut poolClusters = List<u32>.make()
+    run List<u32>.appendRepeated(&mut poolClusters, 0, poolSlots)
+    let mut poolIndex = List<u32>.make()
+    run List<u32>.appendRepeated(&mut poolIndex, 0, poolSlots)
+    let mut pairLeft = List<u32>.make()
+    run List<u32>.appendRepeated(&mut pairLeft, 0, pairSlots)
+    let mut pairRight = List<u32>.make()
+    run List<u32>.appendRepeated(&mut pairRight, 0, pairSlots)
+    let mut pairDiff = List<f64>.make()
+    run List<f64>.appendRepeated(&mut pairDiff, 0.0, pairSlots)
+    let mut pairCombo = List<f64>.make()
+    run List<f64>.appendRepeated(&mut pairCombo, 0.0, pairSlots)
     let mut clusterCost = List<f64>.make()
     run List<f64>.appendRepeated(&mut clusterCost, 0.0, clusters)
     let mut mergeCost = List<f64>.make()
     run List<f64>.appendRepeated(&mut mergeCost, 0.0, clusters * clusters)
     let mut mergedHistogram = List<u32>.make()
-    run List<u32>.appendRepeated(&mut mergedHistogram, 0, LITERAL_ALPHABET)
+    run List<u32>.appendRepeated(&mut mergedHistogram, 0, COMMAND_ALPHABET)
     let mut mapHistogram = List<u32>.make()
     run List<u32>.appendRepeated(&mut mapHistogram, 0, MAP_ALPHABET)
     let mut mapDepth = List<u32>.make()
@@ -648,7 +904,7 @@ impl BrotliEncoder {
     let mut mapCode = List<u32>.make()
     run List<u32>.appendRepeated(&mut mapCode, 0, MAP_ALPHABET)
     let mut mapSymbols = List<u32>.make()
-    run List<u32>.appendRepeated(&mut mapSymbols, 0, CONTEXTS)
+    run List<u32>.appendRepeated(&mut mapSymbols, 0, mapSize)
     let mut logTable = List<f64>.make()
     run List<f64>.appendRepeated(&mut logTable, 0.0, LOG_TABLE)
     let mut logIndex: usize = 1
@@ -657,23 +913,27 @@ impl BrotliEncoder {
       logIndex = logIndex + 1
     }
     let mut commandHistogram = List<u32>.make()
-    run List<u32>.appendRepeated(&mut commandHistogram, 0, COMMAND_ALPHABET)
+    run List<u32>.appendRepeated(&mut commandHistogram, 0, COMMAND_ALPHABET * commandTrees)
     let mut commandDepth = List<u32>.make()
-    run List<u32>.appendRepeated(&mut commandDepth, 0, COMMAND_ALPHABET)
+    run List<u32>.appendRepeated(&mut commandDepth, 0, COMMAND_ALPHABET * commandTrees)
     let mut commandCode = List<u32>.make()
-    run List<u32>.appendRepeated(&mut commandCode, 0, COMMAND_ALPHABET)
+    run List<u32>.appendRepeated(&mut commandCode, 0, COMMAND_ALPHABET * commandTrees)
     let mut distanceHistogram = List<u32>.make()
-    run List<u32>.appendRepeated(&mut distanceHistogram, 0, DISTANCE_LIMIT)
+    run List<u32>.appendRepeated(&mut distanceHistogram, 0, DISTANCE_LIMIT * distanceTrees)
     let mut distanceDepth = List<u32>.make()
-    run List<u32>.appendRepeated(&mut distanceDepth, 0, DISTANCE_LIMIT)
+    run List<u32>.appendRepeated(&mut distanceDepth, 0, DISTANCE_LIMIT * distanceTrees)
     let mut distanceCode = List<u32>.make()
-    run List<u32>.appendRepeated(&mut distanceCode, 0, DISTANCE_LIMIT)
+    run List<u32>.appendRepeated(&mut distanceCode, 0, DISTANCE_LIMIT * distanceTrees)
     let mut lengthHistogram = List<u32>.make()
     run List<u32>.appendRepeated(&mut lengthHistogram, 0, LENGTH_ALPHABET)
     let mut lengthDepth = List<u32>.make()
     run List<u32>.appendRepeated(&mut lengthDepth, 0, LENGTH_ALPHABET)
     let mut lengthCode = List<u32>.make()
     run List<u32>.appendRepeated(&mut lengthCode, 0, LENGTH_ALPHABET)
+    let mut rleCounts = List<u32>.make()
+    run List<u32>.appendRepeated(&mut rleCounts, 0, COMMAND_ALPHABET)
+    let mut rleGood = List<u8>.make()
+    run List<u8>.appendRepeated(&mut rleGood, 0, COMMAND_ALPHABET)
     let mut rleSymbols = List<u32>.make()
     run List<u32>.appendRepeated(&mut rleSymbols, 0, COMMAND_ALPHABET + 8)
     let mut rleExtra = List<u32>.make()
@@ -766,6 +1026,47 @@ impl BrotliEncoder {
       mapDepth: move mapDepth,
       mapCode: move mapCode,
       mapSymbols: move mapSymbols,
+      mapMoved: move mapMoved,
+      distanceMap: move distanceMap,
+      literalTypes: 1,
+      commandTypes: 1,
+      distanceTypes: 1,
+      distanceClusters: 1,
+      blockCounts: [0, 0, 0],
+      blockRegion: [0, commandRegion, commandRegion + regionSize],
+      blockType: move blockType,
+      blockLength: move blockLength,
+      switchHistogram: move switchHistogram,
+      switchDepth: move switchDepth,
+      switchCode: move switchCode,
+      switchLast: [1, 1, 1],
+      switchSecond: [0, 0, 0],
+      switchBits: 0,
+      cursorIndex: [0, 0, 0],
+      cursorLeft: [0, 0, 0],
+      cursorType: [0, 0, 0],
+      splitData: move splitData,
+      splitIds: move splitIds,
+      splitSignals: move splitSignals,
+      splitInsert: move splitInsert,
+      splitCost: move splitCost,
+      splitNewId: move splitNewId,
+      splitHistograms: move splitHistograms,
+      splitTotals: move splitTotals,
+      blockSpans: move blockSpans,
+      blockSymbols: move blockSymbols,
+      pool: move pool,
+      inputs: move inputs,
+      poolCost: move poolCost,
+      poolTotal: move poolTotal,
+      poolCount: move poolCount,
+      poolClusters: move poolClusters,
+      poolIndex: move poolIndex,
+      pairLeft: move pairLeft,
+      pairRight: move pairRight,
+      pairDiff: move pairDiff,
+      pairCombo: move pairCombo,
+      pairCount: 0,
       logTable: move logTable,
       commandHistogram: move commandHistogram,
       commandDepth: move commandDepth,
@@ -780,6 +1081,8 @@ impl BrotliEncoder {
       lengthDepth: move lengthDepth,
       lengthCode: move lengthCode,
       rleSymbols: move rleSymbols,
+      rleCounts: move rleCounts,
+      rleGood: move rleGood,
       rleExtra: move rleExtra,
       treeCount: move treeCount,
       treeLeft: move treeLeft,
@@ -1304,13 +1607,7 @@ fn distanceCodeFor(distance: usize, cache: [usize; 4]) -> u32 {
   return usize.toU32(distance) + 15
 }
 
-fn addCommand(
-  state: &mut BrotliEncoder,
-  insert: usize,
-  copy: usize,
-  word: u32,
-  code: u32,
-) -> () {
+fn addCommand(state: &mut BrotliEncoder, insert: usize, copy: usize, word: u32, code: u32) -> () {
   let index = state.commandCount
   List<u32>.set(&mut state.commandInsert, index, usize.toU32(insert))
   List<u32>.set(&mut state.commandCopy, index, usize.toU32(copy))
@@ -1733,32 +2030,130 @@ fn buildCodes(depths: &[u32], codes: &mut [u32]) -> () {
 
 // Which prefix code `writeTree` builds and stores.
 // Tree ids below 64 are the literal codes of the clusters.
+// Prefix code ids: literal clusters from 0, command block types from `TREE_COMMAND`, distance
+// clusters from `TREE_DISTANCE`, the code-length code, the context maps, and the block type and
+// block count codes of each category.
 const TREE_LITERAL: u32 = 0
 
-const TREE_COMMAND: u32 = 64
+const TREE_COMMAND: u32 = 256
 
-const TREE_DISTANCE: u32 = 65
+const TREE_DISTANCE: u32 = 512
 
-const TREE_LENGTH: u32 = 66
+const TREE_LENGTH: u32 = 768
 
-const TREE_MAP: u32 = 67
+const TREE_MAP: u32 = 769
+
+const TREE_TYPE: u32 = 770
+
+const TREE_SPAN: u32 = 773
+
+// The block type code (up to 258 symbols) and block count code (26 symbols) of one category.
+const SWITCH_SPAN: usize = 284
+
+const SPAN_ALPHABET: usize = 26
+
+// Where the histogram, depths, and codes of `tree` start in their lists, and how many symbols
+// they have.
+fn treeBase(state: &BrotliEncoder, tree: u32) -> usize {
+  if tree < TREE_COMMAND {
+    return u32.toUsize(tree) * LITERAL_ALPHABET
+  }
+  if tree < TREE_DISTANCE {
+    return u32.toUsize(tree - TREE_COMMAND) * COMMAND_ALPHABET
+  }
+  if tree < TREE_LENGTH {
+    return u32.toUsize(tree - TREE_DISTANCE) * DISTANCE_LIMIT
+  }
+  if tree < TREE_SPAN {
+    if tree < TREE_TYPE {
+      return 0
+    }
+    return u32.toUsize(tree - TREE_TYPE) * SWITCH_SPAN
+  }
+  return u32.toUsize(tree - TREE_SPAN) * SWITCH_SPAN + SWITCH_SPAN - SPAN_ALPHABET
+}
+
+fn treeSize(state: &BrotliEncoder, tree: u32) -> usize {
+  if tree < TREE_COMMAND {
+    return LITERAL_ALPHABET
+  }
+  if tree < TREE_DISTANCE {
+    return COMMAND_ALPHABET
+  }
+  if tree < TREE_LENGTH {
+    return state.distanceAlphabet
+  }
+  if tree == TREE_LENGTH {
+    return LENGTH_ALPHABET
+  }
+  if tree == TREE_MAP {
+    return MAP_ALPHABET
+  }
+  if tree < TREE_SPAN {
+    return SWITCH_SPAN - SPAN_ALPHABET
+  }
+  return SPAN_ALPHABET
+}
 
 fn buildTree(state: &mut BrotliEncoder, tree: u32, limit: u32) -> () {
+  let base = treeBase(&state, tree)
+  let size = treeSize(&state, tree)
   if tree < TREE_COMMAND {
-    let base = u32.toUsize(tree) * LITERAL_ALPHABET
+    rleHistogram(&mut state, tree, base, size)
     buildDepths(
-      Slice.view<u32>(List<u32>.asSlice(&state.literalHistogram), base, LITERAL_ALPHABET),
+      Slice.view<u32>(List<u32>.asSlice(&state.rleCounts), 0, size),
       limit,
-      Slice.viewMut<u32>(List<u32>.asMutSlice(&mut state.literalDepth), base, LITERAL_ALPHABET),
+      Slice.viewMut<u32>(List<u32>.asMutSlice(&mut state.literalDepth), base, size),
       List<u32>.asMutSlice(&mut state.treeCount),
       List<u32>.asMutSlice(&mut state.treeLeft),
       List<u32>.asMutSlice(&mut state.treeRight),
       List<u32>.asMutSlice(&mut state.treeStack),
     )
     buildCodes(
-      Slice.view<u32>(List<u32>.asSlice(&state.literalDepth), base, LITERAL_ALPHABET),
-      Slice.viewMut<u32>(List<u32>.asMutSlice(&mut state.literalCode), base, LITERAL_ALPHABET),
+      Slice.view<u32>(List<u32>.asSlice(&state.literalDepth), base, size),
+      Slice.viewMut<u32>(List<u32>.asMutSlice(&mut state.literalCode), base, size),
     )
+  } else if tree < TREE_DISTANCE {
+    rleHistogram(&mut state, tree, base, size)
+    buildDepths(
+      Slice.view<u32>(List<u32>.asSlice(&state.rleCounts), 0, size),
+      limit,
+      Slice.viewMut<u32>(List<u32>.asMutSlice(&mut state.commandDepth), base, size),
+      List<u32>.asMutSlice(&mut state.treeCount),
+      List<u32>.asMutSlice(&mut state.treeLeft),
+      List<u32>.asMutSlice(&mut state.treeRight),
+      List<u32>.asMutSlice(&mut state.treeStack),
+    )
+    buildCodes(
+      Slice.view<u32>(List<u32>.asSlice(&state.commandDepth), base, size),
+      Slice.viewMut<u32>(List<u32>.asMutSlice(&mut state.commandCode), base, size),
+    )
+  } else if tree < TREE_LENGTH {
+    rleHistogram(&mut state, tree, base, size)
+    buildDepths(
+      Slice.view<u32>(List<u32>.asSlice(&state.rleCounts), 0, size),
+      limit,
+      Slice.viewMut<u32>(List<u32>.asMutSlice(&mut state.distanceDepth), base, size),
+      List<u32>.asMutSlice(&mut state.treeCount),
+      List<u32>.asMutSlice(&mut state.treeLeft),
+      List<u32>.asMutSlice(&mut state.treeRight),
+      List<u32>.asMutSlice(&mut state.treeStack),
+    )
+    buildCodes(
+      Slice.view<u32>(List<u32>.asSlice(&state.distanceDepth), base, size),
+      Slice.viewMut<u32>(List<u32>.asMutSlice(&mut state.distanceCode), base, size),
+    )
+  } else if tree == TREE_LENGTH {
+    buildDepths(
+      List<u32>.asSlice(&state.lengthHistogram),
+      limit,
+      List<u32>.asMutSlice(&mut state.lengthDepth),
+      List<u32>.asMutSlice(&mut state.treeCount),
+      List<u32>.asMutSlice(&mut state.treeLeft),
+      List<u32>.asMutSlice(&mut state.treeRight),
+      List<u32>.asMutSlice(&mut state.treeStack),
+    )
+    buildCodes(List<u32>.asSlice(&state.lengthDepth), List<u32>.asMutSlice(&mut state.lengthCode))
   } else if tree == TREE_MAP {
     buildDepths(
       List<u32>.asSlice(&state.mapHistogram),
@@ -1770,82 +2165,217 @@ fn buildTree(state: &mut BrotliEncoder, tree: u32, limit: u32) -> () {
       List<u32>.asMutSlice(&mut state.treeStack),
     )
     buildCodes(List<u32>.asSlice(&state.mapDepth), List<u32>.asMutSlice(&mut state.mapCode))
-  } else if tree == TREE_COMMAND {
+  } else {
     buildDepths(
-      List<u32>.asSlice(&state.commandHistogram),
+      Slice.view<u32>(List<u32>.asSlice(&state.switchHistogram), base, size),
       limit,
-      List<u32>.asMutSlice(&mut state.commandDepth),
-      List<u32>.asMutSlice(&mut state.treeCount),
-      List<u32>.asMutSlice(&mut state.treeLeft),
-      List<u32>.asMutSlice(&mut state.treeRight),
-      List<u32>.asMutSlice(&mut state.treeStack),
-    )
-    buildCodes(List<u32>.asSlice(&state.commandDepth), List<u32>.asMutSlice(&mut state.commandCode))
-  } else if tree == TREE_DISTANCE {
-    let alphabet = state.distanceAlphabet
-    buildDepths(
-      Slice.view<u32>(List<u32>.asSlice(&state.distanceHistogram), 0, alphabet),
-      limit,
-      Slice.viewMut<u32>(List<u32>.asMutSlice(&mut state.distanceDepth), 0, alphabet),
+      Slice.viewMut<u32>(List<u32>.asMutSlice(&mut state.switchDepth), base, size),
       List<u32>.asMutSlice(&mut state.treeCount),
       List<u32>.asMutSlice(&mut state.treeLeft),
       List<u32>.asMutSlice(&mut state.treeRight),
       List<u32>.asMutSlice(&mut state.treeStack),
     )
     buildCodes(
-      Slice.view<u32>(List<u32>.asSlice(&state.distanceDepth), 0, alphabet),
-      Slice.viewMut<u32>(List<u32>.asMutSlice(&mut state.distanceCode), 0, alphabet),
+      Slice.view<u32>(List<u32>.asSlice(&state.switchDepth), base, size),
+      Slice.viewMut<u32>(List<u32>.asMutSlice(&mut state.switchCode), base, size),
     )
-  } else {
-    buildDepths(
-      List<u32>.asSlice(&state.lengthHistogram),
-      limit,
-      List<u32>.asMutSlice(&mut state.lengthDepth),
-      List<u32>.asMutSlice(&mut state.treeCount),
-      List<u32>.asMutSlice(&mut state.treeLeft),
-      List<u32>.asMutSlice(&mut state.treeRight),
-      List<u32>.asMutSlice(&mut state.treeStack),
+  }
+}
+
+// The histogram of a literal, command, or distance code to build its depths from: from quality 4
+// a copy with counts smoothed toward runs that the code-length code stores cheaply, as the
+// reference `BrotliOptimizeHistograms` does.
+fn rleHistogram(state: &mut BrotliEncoder, tree: u32, base: usize, size: usize) -> () {
+  let mut index: usize = 0
+  while index < size {
+    let mut count: u32 = 0
+    if tree < TREE_COMMAND {
+      count = List<u32>.get(&state.literalHistogram, base + index)
+    } else if tree < TREE_DISTANCE {
+      count = List<u32>.get(&state.commandHistogram, base + index)
+    } else {
+      count = List<u32>.get(&state.distanceHistogram, base + index)
+    }
+    List<u32>.set(&mut state.rleCounts, index, count)
+    index = index + 1
+  }
+  if state.quality >= 4 {
+    smoothCounts(
+      Slice.viewMut<u32>(List<u32>.asMutSlice(&mut state.rleCounts), 0, size),
+      List<u8>.asMutSlice(&mut state.rleGood),
     )
-    buildCodes(List<u32>.asSlice(&state.lengthDepth), List<u32>.asMutSlice(&mut state.lengthCode))
+  }
+}
+
+// Makes the counts of a histogram more uniform in stretches, so that their code lengths form
+// runs, as the reference `BrotliOptimizeHuffmanCountsForRle` does.
+fn smoothCounts(counts: &mut [u32], good: &mut [u8]) -> () {
+  let mut length = counts.length
+  let mut nonzero: usize = 0
+  let mut index: usize = 0
+  while index < length {
+    if counts[index] != 0 {
+      nonzero = nonzero + 1
+    }
+    index = index + 1
+  }
+  if nonzero < 16 {
+    return ()
+  }
+  while length != 0 && counts[length - 1] == 0 {
+    length = length - 1
+  }
+  let mut smallest: u32 = 0x40000000
+  index = 0
+  while index < length {
+    if counts[index] != 0 && counts[index] < smallest {
+      smallest = counts[index]
+    }
+    index = index + 1
+  }
+  if smallest < 4 && length - nonzero < 6 {
+    index = 1
+    while index + 1 < length {
+      if counts[index - 1] != 0 && counts[index] == 0 && counts[index + 1] != 0 {
+        counts[index] = 1
+      }
+      index = index + 1
+    }
+  }
+  if nonzero < 28 {
+    return ()
+  }
+
+  // Mark the runs that the code-length code already stores well: 5 zeros or 7 equal counts.
+  index = 0
+  while index < length {
+    good[index] = 0
+    index = index + 1
+  }
+  let mut symbol = counts[0]
+  let mut step: usize = 0
+  index = 0
+  while index <= length {
+    if index == length || counts[index] != symbol {
+      if (symbol == 0 && step >= 5) || (symbol != 0 && step >= 7) {
+        let mut back: usize = 0
+        while back < step {
+          good[index - back - 1] = 1
+          back = back + 1
+        }
+      }
+      step = 1
+      if index != length {
+        symbol = counts[index]
+      }
+    } else {
+      step = step + 1
+    }
+    index = index + 1
+  }
+
+  // Replace the counts of stretches of similar counts with their average, in 24.8 fixed point.
+  let mut stride: usize = 0
+  let mut limit: i64 = 256 * (u32.toI64(counts[0]) + u32.toI64(counts[1]) + u32.toI64(counts[2]))
+    / 3
+    + 420
+  let mut sum: u64 = 0
+  index = 0
+  while index <= length {
+    let mut ends = index == length || good[index] != 0 || (index != 0 && good[index - 1] != 0)
+    if !ends {
+      let gap = 256 * u32.toI64(counts[index]) - limit
+      ends = gap >= 1240 || gap < -1240
+    }
+    if ends {
+      if stride >= 4 || (stride >= 3 && sum == 0) {
+        let mut count = (sum + usize.toU64(stride) / 2) / usize.toU64(stride)
+        if count == 0 {
+          count = 1
+        }
+        if sum == 0 {
+          count = 0
+        }
+        let mut back: usize = 0
+        while back < stride {
+          counts[index - back - 1] = u64.toU32(count)
+          back = back + 1
+        }
+      }
+      stride = 0
+      sum = 0
+      if index + 2 < length {
+        limit = 256
+          * (u32.toI64(counts[index]) + u32.toI64(counts[index + 1]) + u32.toI64(counts[index + 2]))
+          / 3
+          + 420
+      } else if index < length {
+        limit = 256 * u32.toI64(counts[index])
+      } else {
+        limit = 0
+      }
+    }
+    stride = stride + 1
+    if index != length {
+      sum = sum + u32.toU64(counts[index])
+      if stride >= 4 {
+        limit = u64.toI64((256 * sum + usize.toU64(stride) / 2) / usize.toU64(stride))
+      }
+      if stride == 4 {
+        limit = limit + 120
+      }
+    }
+    index = index + 1
   }
 }
 
 fn treeHistogram(state: &BrotliEncoder, tree: u32) -> &[u32] {
+  let base = treeBase(&state, tree)
+  let size = treeSize(&state, tree)
   if tree < TREE_COMMAND {
-    let base = u32.toUsize(tree) * LITERAL_ALPHABET
-    return Slice.view<u32>(List<u32>.asSlice(&state.literalHistogram), base, LITERAL_ALPHABET)
+    return Slice.view<u32>(List<u32>.asSlice(&state.literalHistogram), base, size)
+  }
+  if tree < TREE_DISTANCE {
+    return Slice.view<u32>(List<u32>.asSlice(&state.commandHistogram), base, size)
+  }
+  if tree < TREE_LENGTH {
+    return Slice.view<u32>(List<u32>.asSlice(&state.distanceHistogram), base, size)
   }
   if tree == TREE_MAP {
     return List<u32>.asSlice(&state.mapHistogram)
   }
-  if tree == TREE_COMMAND {
-    return List<u32>.asSlice(&state.commandHistogram)
-  }
-  return Slice.view<u32>(List<u32>.asSlice(&state.distanceHistogram), 0, state.distanceAlphabet)
+  return Slice.view<u32>(List<u32>.asSlice(&state.switchHistogram), base, size)
 }
 
 fn treeDepth(state: &BrotliEncoder, tree: u32, symbol: usize) -> u32 {
+  let at = treeBase(&state, tree) + symbol
   if tree < TREE_COMMAND {
-    return List<u32>.get(&state.literalDepth, u32.toUsize(tree) * LITERAL_ALPHABET + symbol)
+    return List<u32>.get(&state.literalDepth, at)
+  }
+  if tree < TREE_DISTANCE {
+    return List<u32>.get(&state.commandDepth, at)
+  }
+  if tree < TREE_LENGTH {
+    return List<u32>.get(&state.distanceDepth, at)
   }
   if tree == TREE_MAP {
     return List<u32>.get(&state.mapDepth, symbol)
   }
-  if tree == TREE_COMMAND {
-    return List<u32>.get(&state.commandDepth, symbol)
-  }
-  return List<u32>.get(&state.distanceDepth, symbol)
+  return List<u32>.get(&state.switchDepth, at)
 }
 
 fn setDepth(state: &mut BrotliEncoder, tree: u32, symbol: usize, depth: u32) -> () {
+  let at = treeBase(&state, tree) + symbol
   if tree < TREE_COMMAND {
-    List<u32>.set(&mut state.literalDepth, u32.toUsize(tree) * LITERAL_ALPHABET + symbol, depth)
+    List<u32>.set(&mut state.literalDepth, at, depth)
+  } else if tree < TREE_DISTANCE {
+    List<u32>.set(&mut state.commandDepth, at, depth)
+  } else if tree < TREE_LENGTH {
+    List<u32>.set(&mut state.distanceDepth, at, depth)
   } else if tree == TREE_MAP {
     List<u32>.set(&mut state.mapDepth, symbol, depth)
-  } else if tree == TREE_COMMAND {
-    List<u32>.set(&mut state.commandDepth, symbol, depth)
   } else {
-    List<u32>.set(&mut state.distanceDepth, symbol, depth)
+    List<u32>.set(&mut state.switchDepth, at, depth)
   }
 }
 
@@ -2140,17 +2670,22 @@ fn dataBits(state: &BrotliEncoder) -> u64 {
   let commands = List<u32>.asSlice(&state.commandHistogram)
   let commandDepths = List<u32>.asSlice(&state.commandDepth)
   index = 0
-  while index < COMMAND_ALPHABET {
+  while index < COMMAND_ALPHABET * state.commandTypes {
     total = total + u32.toU64(commands[index]) * u32.toU64(commandDepths[index])
     index = index + 1
   }
   let distances = List<u32>.asSlice(&state.distanceHistogram)
   let distanceDepths = List<u32>.asSlice(&state.distanceDepth)
-  index = 0
-  while index < state.distanceAlphabet {
-    total = total + u32.toU64(distances[index]) * u32.toU64(distanceDepths[index])
-    index = index + 1
+  let mut cluster: usize = 0
+  while cluster < state.distanceClusters {
+    index = cluster * DISTANCE_LIMIT
+    while index < cluster * DISTANCE_LIMIT + state.distanceAlphabet {
+      total = total + u32.toU64(distances[index]) * u32.toU64(distanceDepths[index])
+      index = index + 1
+    }
+    cluster = cluster + 1
   }
+  total = total + state.switchBits
   let inserts = List<u32>.asSlice(&state.commandInsert)
   let copies = List<u32>.asSlice(&state.commandCopy)
   let words = List<u32>.asSlice(&state.commandWord)
@@ -2183,8 +2718,12 @@ fn writeData(state: &mut BrotliEncoder, start: usize) -> () {
     let copy = List<u32>.get(&state.commandCopy, index)
     let code = List<u32>.get(&state.commandDistance, index)
     let symbol = u32.toUsize(List<u32>.get(&state.commandSymbol, index))
-    let value2 = List<u32>.get(&state.commandCode, symbol)
-    let count2 = List<u32>.get(&state.commandDepth, symbol)
+    let mut commandBase: usize = 0
+    if state.commandTypes > 1 {
+      commandBase = writtenType(&mut state, COMMAND_SPLIT) * COMMAND_ALPHABET
+    }
+    let value2 = List<u32>.get(&state.commandCode, commandBase + symbol)
+    let count2 = List<u32>.get(&state.commandDepth, commandBase + symbol)
     addBits(&mut state, value2, count2)
     let insertBucket = u32.toUsize(insertCode(insert))
     let insertBits = INSERT_EXTRA[insertBucket]
@@ -2207,6 +2746,10 @@ fn writeData(state: &mut BrotliEncoder, start: usize) -> () {
     while position < stop {
       let byte = u8.toUsize(List<u8>.get(&state.buffer, position))
       let mut slot = byte
+      let mut kind: usize = 0
+      if state.literalTypes > 1 {
+        kind = writtenType(&mut state, LITERAL_SPLIT)
+      }
       if state.clusterCount > 1 {
         let context = contextAt(
           List<u8>.asSlice(&state.buffer),
@@ -2214,7 +2757,8 @@ fn writeData(state: &mut BrotliEncoder, start: usize) -> () {
           u32.toUsize(state.contextMode) * 512,
           position,
         )
-        slot = u32.toUsize(List<u32>.get(&state.contextMap, context)) * LITERAL_ALPHABET + byte
+        let cluster = List<u32>.get(&state.contextMap, kind * CONTEXTS + context)
+        slot = u32.toUsize(cluster) * LITERAL_ALPHABET + byte
       }
       let value3 = List<u32>.get(&state.literalCode, slot)
       let count3 = List<u32>.get(&state.literalDepth, slot)
@@ -2224,7 +2768,15 @@ fn writeData(state: &mut BrotliEncoder, start: usize) -> () {
     if copy != 0 && symbol >= 128 {
       let postfix = state.distancePostfix
       let direct = state.distanceDirect
-      let slot = u32.toUsize(distanceSymbol(code, postfix, direct))
+      let mut slot = u32.toUsize(distanceSymbol(code, postfix, direct))
+      let mut kind: usize = 0
+      if state.distanceTypes > 1 {
+        kind = writtenType(&mut state, DISTANCE_SPLIT)
+      }
+      if state.distanceClusters > 1 {
+        let context = kind * 4 + distanceContext(symbol)
+        slot = slot + u32.toUsize(List<u32>.get(&state.distanceMap, context)) * DISTANCE_LIMIT
+      }
       let value4 = List<u32>.get(&state.distanceCode, slot)
       let count4 = List<u32>.get(&state.distanceDepth, slot)
       addBits(&mut state, value4, count4)
@@ -2266,6 +2818,11 @@ fn compressBlock(state: &mut BrotliEncoder, size: usize, last: bool) -> () {
     createCommands(&mut state, start, end)
   }
   state.clusterCount = 1
+  state.literalTypes = 1
+  state.commandTypes = 1
+  state.distanceTypes = 1
+  state.distanceClusters = 1
+  state.switchBits = 0
   state.contextMode = 0
   if state.contextModeling {
     state.contextMode = MODE_SIGNED
@@ -2274,7 +2831,9 @@ fn compressBlock(state: &mut BrotliEncoder, size: usize, last: bool) -> () {
     }
   }
   countSymbols(&mut state, start)
-  if state.contextModeling {
+  if state.quality >= SPLIT_QUALITY {
+    splitMetaBlock(&mut state, start)
+  } else if state.contextModeling {
     clusterContexts(&mut state)
   }
   let savedBuffer = state.bitBuffer
@@ -2293,25 +2852,43 @@ fn compressBlock(state: &mut BrotliEncoder, size: usize, last: bool) -> () {
     addBits(&mut state, 0, 1)
   }
 
-  // One block type for each category, the distance code parameters, the context mode, the
-  // literal prefix codes with their context map, and one distance prefix code.
-  addBits(&mut state, 0, 3)
+  // The block splits, the distance code parameters, the context mode of each literal block type,
+  // the context maps, and the prefix codes.
+  writeBlockSplit(&mut state, LITERAL_SPLIT)
+  writeBlockSplit(&mut state, COMMAND_SPLIT)
+  writeBlockSplit(&mut state, DISTANCE_SPLIT)
   let postfix = state.distancePostfix
   addBits(&mut state, postfix, 2)
   let directBits = u32.shiftRight(state.distanceDirect, postfix)
   addBits(&mut state, directBits, 4)
   let mode = state.contextMode
-  addBits(&mut state, mode, 2)
-  writeContextMap(&mut state)
-  addBits(&mut state, 0, 1)
+  let mut kind: usize = 0
+  while kind < state.literalTypes {
+    addBits(&mut state, mode, 2)
+    kind = kind + 1
+  }
+  let literalMap = state.literalTypes * CONTEXTS
+  let literalClusters = state.clusterCount
+  writeContextMap(&mut state, false, literalMap, literalClusters)
+  let distanceMap = state.distanceTypes * 4
+  let distanceClusters = state.distanceClusters
+  writeContextMap(&mut state, true, distanceMap, distanceClusters)
   let mut cluster: usize = 0
   while cluster < state.clusterCount {
     writeTree(&mut state, usize.toU32(cluster), LITERAL_ALPHABET)
     cluster = cluster + 1
   }
-  writeTree(&mut state, TREE_COMMAND, COMMAND_ALPHABET)
+  kind = 0
+  while kind < state.commandTypes {
+    writeTree(&mut state, TREE_COMMAND + usize.toU32(kind), COMMAND_ALPHABET)
+    kind = kind + 1
+  }
   let distanceAlphabet = state.distanceAlphabet
-  writeTree(&mut state, TREE_DISTANCE, distanceAlphabet)
+  cluster = 0
+  while cluster < state.distanceClusters {
+    writeTree(&mut state, TREE_DISTANCE + usize.toU32(cluster), distanceAlphabet)
+    cluster = cluster + 1
+  }
   let compressedBits = usize.toU64(state.pendingLength) * 8 + u32.toU64(state.bitCount)
     + dataBits(&state)
   let headerBits = startBits + 4 + 4 * u32.toU64(nibbles)
@@ -2748,7 +3325,7 @@ fn setCommandModel(state: &mut BrotliEncoder, start: usize, size: usize) -> () {
     true,
   )
   shannonCosts(
-    List<u32>.asSlice(&state.commandHistogram),
+    Slice.view<u32>(List<u32>.asSlice(&state.commandHistogram), 0, COMMAND_ALPHABET),
     List<f64>.asMutSlice(&mut state.commandCosts),
     false,
   )
@@ -2930,51 +3507,79 @@ fn updateNodes(
     let insertBucket = insertCode(usize.toU32(at - from))
     let baseCost = state.queueDifference[entry] + u32.toF64(INSERT_EXTRA[u32.toUsize(insertBucket)])
       + literalAt
+
+    // First the recent distances that reach further than the copies before them, then their
+    // costs.
+    let mut found: [usize; 16] = [0; 16]
+    let mut foundDistance: [usize; 16] = [0; 16]
+    let mut foundFrom: [usize; 16] = [0; 16]
+    let mut foundLength: [usize; 16] = [0; 16]
+    let mut count: usize = 0
+    let recent: [usize; 4] = [
+      state.queueCache[entry * 4],
+      state.queueCache[entry * 4 + 1],
+      state.queueCache[entry * 4 + 2],
+      state.queueCache[entry * 4 + 3],
+    ]
+    let buffer = List<u8>.asSlice(&state.buffer)
     let mut bestLength = minLength - 1
     let mut code: usize = 0
     while code < 16 && bestLength < maxLength {
-      let recent = state.queueCache[entry * 4 + CACHE_INDEX[code]]
+      let base = recent[CACHE_INDEX[code]]
       let delta = u32.toUsize(CACHE_DELTA[code])
-      let mut distance = recent
+      let mut distance = base
       if code >= 4 {
-        if usize.remainder(code, 2) == 0 {
-          if recent <= delta {
+        if (code & 1) == 0 {
+          if base <= delta {
             distance = 0
           } else {
-            distance = recent - delta
+            distance = base - delta
           }
         } else {
-          distance = recent + delta
+          distance = base + delta
         }
       }
       if distance != 0 && distance <= maxDistance {
-        let buffer = List<u8>.asSlice(&state.buffer)
         let earlier = position - distance
         if buffer[earlier + bestLength] == buffer[position + bestLength] {
           let length = commonLength(buffer, earlier, position, maxLength)
-          let distanceCost = baseCost + List<f64>.get(&state.distanceCosts, code)
-          let mut copy = bestLength + 1
-          while copy <= length {
-            let copyBucket = copyCode(usize.toU32(copy))
-            let symbol = commandSymbolFor(insertBucket, copyBucket, code == 0)
-            let mut cost = distanceCost
-            if symbol < 128 {
-              cost = baseCost
-            }
-            cost = cost + u32.toF64(COPY_EXTRA[u32.toUsize(copyBucket)])
-              + List<f64>.get(&state.commandCosts, u32.toUsize(symbol))
-            if cost < List<f64>.get(&state.nodeCost, at + copy) {
-              updateNode(&mut state, at, from, copy, distance, usize.toU32(code) + 1, cost)
-              if copy > result {
-                result = copy
-              }
-            }
-            bestLength = copy
-            copy = copy + 1
+          if length > bestLength {
+            found[count] = code
+            foundDistance[count] = distance
+            foundFrom[count] = bestLength + 1
+            foundLength[count] = length
+            count = count + 1
+            bestLength = length
           }
         }
       }
       code = code + 1
+    }
+    let mut item: usize = 0
+    while item < count {
+      let code = found[item]
+      let distance = foundDistance[item]
+      let length = foundLength[item]
+      let distanceCost = baseCost + List<f64>.get(&state.distanceCosts, code)
+      let mut copy = foundFrom[item]
+      while copy <= length {
+        let copyBucket = copyCode(usize.toU32(copy))
+        let symbol = commandSymbolFor(insertBucket, copyBucket, code == 0)
+        let mut cost = distanceCost
+        if symbol < 128 {
+          cost = baseCost
+        }
+        cost = cost + u32.toF64(COPY_EXTRA[u32.toUsize(copyBucket)])
+          + List<f64>.get(&state.commandCosts, u32.toUsize(symbol))
+        if cost < List<f64>.get(&state.nodeCost, at + copy) {
+          updateNode(&mut state, at, from, copy, distance, usize.toU32(code) + 1, cost)
+          if copy > result {
+            result = copy
+          }
+        }
+        copy = copy + 1
+      }
+      item = item + 1
     }
     if entry < 2 {
       let mut length = minLength
@@ -3305,7 +3910,7 @@ fn mergedCost(state: &mut BrotliEncoder, left: usize, right: usize) -> f64 {
     index = index + 1
   }
   return populationCost(
-    List<u32>.asSlice(&state.mergedHistogram),
+    Slice.view<u32>(List<u32>.asSlice(&state.mergedHistogram), 0, LITERAL_ALPHABET),
     List<f64>.asSlice(&state.logTable),
   )
 }
@@ -3471,29 +4076,31 @@ fn writeVarLen(state: &mut BrotliEncoder, value: usize) -> () {
   addBits(&mut state, usize.toU32(value) - u32.shiftLeft(1, bits), bits)
 }
 
-// Writes NTREESL and the literal context map: move-to-front, run-length codes of zeros, and a
-// prefix code, as the reference `EncodeContextMap` does.
-fn writeContextMap(state: &mut BrotliEncoder) -> () {
-  let clusters = state.clusterCount
+// Writes the number of prefix codes and the literal or distance context map of `size` entries:
+// move-to-front, run-length codes of zeros, and a prefix code, as the reference
+// `EncodeContextMap` does.
+fn writeContextMap(state: &mut BrotliEncoder, distance: bool, size: usize, clusters: usize) -> () {
   writeVarLen(&mut state, clusters - 1)
   if clusters == 1 {
     return ()
   }
-  let mut order: [u32; 64] = [0; 64]
+  let mut order: [u32; 256] = [0; 256]
   let mut index: usize = 0
-  while index < CONTEXTS {
+  while index < 256 {
     order[index] = usize.toU32(index)
     index = index + 1
   }
-  let mut moved: [u32; 64] = [0; 64]
   index = 0
-  while index < CONTEXTS {
-    let value = List<u32>.get(&state.contextMap, index)
+  while index < size {
+    let mut value = List<u32>.get(&state.contextMap, index)
+    if distance {
+      value = List<u32>.get(&state.distanceMap, index)
+    }
     let mut place: usize = 0
     while order[place] != value {
       place = place + 1
     }
-    moved[index] = usize.toU32(place)
+    List<u32>.set(&mut state.mapMoved, index, usize.toU32(place))
     while place > 0 {
       order[place] = order[place - 1]
       place = place - 1
@@ -3503,16 +4110,16 @@ fn writeContextMap(state: &mut BrotliEncoder) -> () {
   }
   let mut longest: usize = 0
   index = 0
-  while index < CONTEXTS {
+  while index < size {
     let mut streak: usize = 0
-    while index < CONTEXTS && moved[index] == 0 {
+    while index < size && List<u32>.get(&state.mapMoved, index) == 0 {
       streak = streak + 1
       index = index + 1
     }
     if streak > longest {
       longest = streak
     }
-    while index < CONTEXTS && moved[index] != 0 {
+    while index < size && List<u32>.get(&state.mapMoved, index) != 0 {
       index = index + 1
     }
   }
@@ -3525,14 +4132,14 @@ fn writeContextMap(state: &mut BrotliEncoder) -> () {
   }
   let mut count: usize = 0
   index = 0
-  while index < CONTEXTS {
-    if moved[index] != 0 {
-      List<u32>.set(&mut state.mapSymbols, count, moved[index] + prefix)
+  while index < size {
+    if List<u32>.get(&state.mapMoved, index) != 0 {
+      List<u32>.set(&mut state.mapSymbols, count, List<u32>.get(&state.mapMoved, index) + prefix)
       count = count + 1
       index = index + 1
     } else {
       let mut streak: u32 = 0
-      while index < CONTEXTS && moved[index] == 0 {
+      while index < size && List<u32>.get(&state.mapMoved, index) == 0 {
         streak = streak + 1
         index = index + 1
       }
@@ -3604,7 +4211,8 @@ fn lowerAscii(byte: u8) -> u32 {
 // The dictionary index bucket of the 4 bytes at `at`, with ASCII letters lowercased.
 fn wordKey(bytes: &[u8], at: usize) -> usize {
   let key = lowerAscii(bytes[at]) | u32.shiftLeft(lowerAscii(bytes[at + 1]), 8)
-    | u32.shiftLeft(lowerAscii(bytes[at + 2]), 16) | u32.shiftLeft(lowerAscii(bytes[at + 3]), 24)
+    | u32.shiftLeft(lowerAscii(bytes[at + 2]), 16)
+    | u32.shiftLeft(lowerAscii(bytes[at + 3]), 24)
   let hash = u32.wrappingMultiply(key, 0x1e35a7bd)
   return u32.toUsize(u32.shiftRight(hash, 32 - WORD_HASH_BITS))
 }
@@ -3941,5 +4549,1170 @@ fn chooseDistanceCodes(state: &mut BrotliEncoder) -> () {
   }
   state.distancePostfix = bestPostfix
   state.distanceDirect = bestDirect
-  state.distanceAlphabet = 16 + u32.toUsize(bestDirect) + usize.shiftLeft(48, u32.toUsize(bestPostfix))
+  state.distanceAlphabet = 16 + u32.toUsize(bestDirect)
+    + usize.shiftLeft(48, u32.toUsize(bestPostfix))
+}
+
+// Block splitting from quality 5, as the reference `BrotliBuildMetaBlock` does: each of the
+// literals (at qualities 10 and 11), the commands, and the distances of a meta-block is split
+// into blocks of types with their own prefix codes, from histograms of random samples refined by
+// the best path through them, then clustered.
+
+const LITERAL_SPLIT: usize = 0
+
+const COMMAND_SPLIT: usize = 1
+
+const DISTANCE_SPLIT: usize = 2
+
+@inlineAlways
+fn nextRandom(seed: u32) -> u32 {
+  return u32.wrappingMultiply(seed, 16807)
+}
+
+// The bits that one more `count` costs, as the reference `BitCost` estimates them.
+@inlineAlways
+fn bitCost(logs: &[f64], count: u32) -> f64 {
+  if count == 0 {
+    return -2.0
+  }
+  return fastLog2(logs, u32.toUsize(count))
+}
+
+// Adds `count` symbols of the split data from `from` to split histogram `slot`.
+fn addSamples(
+  state: &mut BrotliEncoder,
+  slot: usize,
+  alphabet: usize,
+  from: usize,
+  count: usize,
+) -> () {
+  let data = List<u32>.asSlice(&state.splitData)
+  let histograms = List<u32>.asMutSlice(&mut state.splitHistograms)
+  let base = slot * alphabet
+  let mut index: usize = 0
+  while index < count {
+    let symbol = u32.toUsize(data[from + index])
+    histograms[base + symbol] = histograms[base + symbol] + 1
+    index = index + 1
+  }
+  let total = List<u32>.get(&state.splitTotals, slot) + usize.toU32(count)
+  List<u32>.set(&mut state.splitTotals, slot, total)
+}
+
+fn clearRange(values: &mut List<u32>, from: usize, count: usize) -> () {
+  let slice = List<u32>.asMutSlice(&mut values)
+  let mut index: usize = 0
+  while index < count {
+    slice[from + index] = 0
+    index = index + 1
+  }
+}
+
+// Gives each of `length` split symbols the histogram that codes the run around it cheapest, where
+// a switch costs `switchBits`, as the reference `FindBlocks` does. Returns the number of blocks.
+fn findBlocks(
+  state: &mut BrotliEncoder,
+  length: usize,
+  alphabet: usize,
+  count: usize,
+  switchBits: f64,
+) -> usize {
+  if count <= 1 {
+    let ids = List<u8>.asMutSlice(&mut state.splitIds)
+    let mut index: usize = 0
+    while index < length {
+      ids[index] = 0
+      index = index + 1
+    }
+    return 1
+  }
+  let logs = List<f64>.asSlice(&state.logTable)
+  let histograms = List<u32>.asSlice(&state.splitHistograms)
+  let totals = List<u32>.asSlice(&state.splitTotals)
+  let insert = List<f64>.asMutSlice(&mut state.splitInsert)
+  let mut symbol: usize = 0
+  while symbol < alphabet {
+    let mut slot: usize = 0
+    while slot < count {
+      insert[symbol * count + slot] = fastLog2(logs, u32.toUsize(totals[slot]))
+        - bitCost(logs, histograms[slot * alphabet + symbol])
+      slot = slot + 1
+    }
+    symbol = symbol + 1
+  }
+  let costs = List<f64>.asMutSlice(&mut state.splitCost)
+  let mut slot: usize = 0
+  while slot < count {
+    costs[slot] = 0.0
+    slot = slot + 1
+  }
+  let bitmap = (count + 7) / 8
+  let signals = List<u8>.asMutSlice(&mut state.splitSignals)
+  let mut index: usize = 0
+  while index < length * bitmap {
+    signals[index] = 0
+    index = index + 1
+  }
+  let data = List<u32>.asSlice(&state.splitData)
+  let ids = List<u8>.asMutSlice(&mut state.splitIds)
+  let mut position: usize = 0
+  while position < length {
+    let base = u32.toUsize(data[position]) * count
+    let mut least: f64 = 1e99
+    slot = 0
+    while slot < count {
+      let cost = costs[slot] + insert[base + slot]
+      costs[slot] = cost
+      if cost < least {
+        least = cost
+        ids[position] = usize.toU8(slot)
+      }
+      slot = slot + 1
+    }
+    let mut switchCost = switchBits
+    if position < 2000 {
+      switchCost = switchCost * (0.77 + 0.07 * usize.toF64(position) / 2000.0)
+    }
+    let row = position * bitmap
+    slot = 0
+    while slot < count {
+      let cost = costs[slot] - least
+      if cost >= switchCost {
+        costs[slot] = switchCost
+        signals[row + slot / 8] = signals[row + slot / 8] | u8.shiftLeft(1, usize.toU8(slot & 7))
+      } else {
+        costs[slot] = cost
+      }
+      slot = slot + 1
+    }
+    position = position + 1
+  }
+
+  // Trace back from the last symbol and switch where the marks allow it.
+  let mut blocks: usize = 1
+  position = length - 1
+  let mut current = ids[position]
+  while position > 0 {
+    position = position - 1
+    let mark = signals[position * bitmap + u8.toUsize(current) / 8]
+    if (mark & u8.shiftLeft(1, current & 7)) != 0 && current != ids[position] {
+      current = ids[position]
+      blocks = blocks + 1
+    }
+    ids[position] = current
+  }
+  return blocks
+}
+
+// Numbers the block ids by first use and returns how many there are.
+fn remapIds(state: &mut BrotliEncoder, length: usize, count: usize) -> usize {
+  let renamed = List<u32>.asMutSlice(&mut state.splitNewId)
+  let mut slot: usize = 0
+  while slot < count {
+    renamed[slot] = 256
+    slot = slot + 1
+  }
+  let ids = List<u8>.asMutSlice(&mut state.splitIds)
+  let mut next: u32 = 0
+  let mut index: usize = 0
+  while index < length {
+    let id = u8.toUsize(ids[index])
+    if renamed[id] == 256 {
+      renamed[id] = next
+      next = next + 1
+    }
+    index = index + 1
+  }
+  index = 0
+  while index < length {
+    ids[index] = u32.toU8(renamed[u8.toUsize(ids[index])])
+    index = index + 1
+  }
+  return u32.toUsize(next)
+}
+
+// Counts the symbols of each block id in its split histogram.
+fn blockHistograms(state: &mut BrotliEncoder, length: usize, alphabet: usize, count: usize) -> () {
+  clearRange(&mut state.splitHistograms, 0, count * alphabet)
+  clearRange(&mut state.splitTotals, 0, count)
+  let data = List<u32>.asSlice(&state.splitData)
+  let ids = List<u8>.asSlice(&state.splitIds)
+  let histograms = List<u32>.asMutSlice(&mut state.splitHistograms)
+  let totals = List<u32>.asMutSlice(&mut state.splitTotals)
+  let mut index: usize = 0
+  while index < length {
+    let id = u8.toUsize(ids[index])
+    let at = id * alphabet + u32.toUsize(data[index])
+    histograms[at] = histograms[at] + 1
+    totals[id] = totals[id] + 1
+    index = index + 1
+  }
+}
+
+// Splits the `length` symbols of the split data, with an alphabet of `alphabet`, into the
+// blocks of `category`, as the reference `SplitByteVector` does.
+fn splitSymbols(state: &mut BrotliEncoder, length: usize, alphabet: usize, category: usize) -> () {
+  let region = state.blockRegion[category]
+  if length == 0 {
+    state.blockCounts[category] = 0
+    setTypes(&mut state, category, 1)
+    return ()
+  }
+  if length < BLOCK_SPLIT_MIN || (category == LITERAL_SPLIT && !state.zopfli) {
+    List<u8>.set(&mut state.blockType, region, 0)
+    List<u32>.set(&mut state.blockLength, region, usize.toU32(length))
+    state.blockCounts[category] = 1
+    setTypes(&mut state, category, 1)
+    return ()
+  }
+  let mut perHistogram: usize = 544
+  let mut most: usize = 100
+  let mut stride: usize = 70
+  let mut switchBits: f64 = 28.1
+  if category == COMMAND_SPLIT {
+    perHistogram = 530
+    most = 50
+    stride = 40
+    switchBits = 13.5
+  } else if category == DISTANCE_SPLIT {
+    most = 50
+    stride = 40
+    switchBits = 14.6
+  }
+  if !state.zopfli {
+    most = SPLIT_HISTOGRAMS_FAST
+  }
+  let mut count = length / perHistogram + 1
+  if count > most {
+    count = most
+  }
+
+  // Seed each histogram with a sample from its part of the data, then add random samples.
+  clearRange(&mut state.splitHistograms, 0, count * alphabet)
+  clearRange(&mut state.splitTotals, 0, count)
+  let mut seed: u32 = 7
+  let part = length / count
+  let mut slot: usize = 0
+  while slot < count {
+    let mut position = length * slot / count
+    if slot != 0 {
+      seed = nextRandom(seed)
+      position = position + usize.remainder(u32.toUsize(seed), part)
+    }
+    if position + stride >= length {
+      position = length - stride - 1
+    }
+    addSamples(&mut state, slot, alphabet, position, stride)
+    slot = slot + 1
+  }
+  let mut rounds = 2 * length / stride + 100
+  rounds = (rounds + count - 1) / count * count
+  seed = 7
+  let mut round: usize = 0
+  while round < rounds {
+    let mut position: usize = 0
+    let mut size = stride
+    if stride >= length {
+      size = length
+    } else {
+      seed = nextRandom(seed)
+      position = usize.remainder(u32.toUsize(seed), length - stride + 1)
+    }
+    addSamples(&mut state, usize.remainder(round, count), alphabet, position, size)
+    round = round + 1
+  }
+
+  let mut passes: u32 = 3
+  if state.quality < 10 {
+    passes = 1
+  }
+  if state.quality >= 11 {
+    passes = 10
+  }
+  let mut blocks: usize = 0
+  let mut pass: u32 = 0
+  while pass < passes {
+    blocks = findBlocks(&mut state, length, alphabet, count, switchBits)
+    count = remapIds(&mut state, length, count)
+    blockHistograms(&mut state, length, alphabet, count)
+    pass = pass + 1
+  }
+  clusterBlocks(&mut state, length, blocks, alphabet, category)
+}
+
+fn setTypes(state: &mut BrotliEncoder, category: usize, types: usize) -> () {
+  if category == LITERAL_SPLIT {
+    state.literalTypes = types
+  } else if category == COMMAND_SPLIT {
+    state.commandTypes = types
+  } else {
+    state.distanceTypes = types
+  }
+}
+
+fn typesOf(state: &BrotliEncoder, category: usize) -> usize {
+  if category == LITERAL_SPLIT {
+    return state.literalTypes
+  }
+  if category == COMMAND_SPLIT {
+    return state.commandTypes
+  }
+  return state.distanceTypes
+}
+
+// The difference in the cost of the cluster sizes when two clusters merge, as the reference
+// `ClusterCostDiff` computes it.
+fn clusterCostDiff(logs: &[f64], left: u32, right: u32) -> f64 {
+  let both = left + right
+  return u32.toF64(left) * fastLog2(logs, u32.toUsize(left))
+    + u32.toF64(right) * fastLog2(logs, u32.toUsize(right))
+    - u32.toF64(both) * fastLog2(logs, u32.toUsize(both))
+}
+
+// Whether pair `left` is worse than pair `right` in the queue: it saves fewer bits, or as many
+// with closer indices.
+fn pairWorse(state: &BrotliEncoder, left: usize, right: usize) -> bool {
+  let leftDiff = List<f64>.get(&state.pairDiff, left)
+  let rightDiff = List<f64>.get(&state.pairDiff, right)
+  if leftDiff != rightDiff {
+    return leftDiff > rightDiff
+  }
+  return List<u32>.get(&state.pairRight, left) - List<u32>.get(&state.pairLeft, left)
+    > List<u32>.get(&state.pairRight, right) - List<u32>.get(&state.pairLeft, right)
+}
+
+fn copyPair(state: &mut BrotliEncoder, from: usize, to: usize) -> () {
+  let left = List<u32>.get(&state.pairLeft, from)
+  let right = List<u32>.get(&state.pairRight, from)
+  let diff = List<f64>.get(&state.pairDiff, from)
+  let combo = List<f64>.get(&state.pairCombo, from)
+  List<u32>.set(&mut state.pairLeft, to, left)
+  List<u32>.set(&mut state.pairRight, to, right)
+  List<f64>.set(&mut state.pairDiff, to, diff)
+  List<f64>.set(&mut state.pairCombo, to, combo)
+}
+
+// The cost of pool slots `left` and `right` together.
+fn comboCost(state: &mut BrotliEncoder, alphabet: usize, left: usize, right: usize) -> f64 {
+  let pool = List<u32>.asSlice(&state.pool)
+  let merged = List<u32>.asMutSlice(&mut state.mergedHistogram)
+  let mut index: usize = 0
+  while index < alphabet {
+    merged[index] = pool[left * alphabet + index] + pool[right * alphabet + index]
+    index = index + 1
+  }
+  return populationCost(
+    Slice.view<u32>(List<u32>.asSlice(&state.mergedHistogram), 0, alphabet),
+    List<f64>.asSlice(&state.logTable),
+  )
+}
+
+// Queues the merge of pool slots `first` and `second` if it may save bits, keeping the best pair
+// first, as the reference `BrotliCompareAndPushToQueue` does. Slot `PAIR_LIMIT - 1` is spare.
+fn pushPair(
+  state: &mut BrotliEncoder,
+  alphabet: usize,
+  first: u32,
+  second: u32,
+  maxPairs: usize,
+) -> () {
+  if first == second {
+    return ()
+  }
+  let mut left = u32.toUsize(first)
+  let mut right = u32.toUsize(second)
+  if right < left {
+    left = u32.toUsize(second)
+    right = u32.toUsize(first)
+  }
+  let logs = List<f64>.asSlice(&state.logTable)
+  let leftCost = List<f64>.get(&state.poolCost, left)
+  let rightCost = List<f64>.get(&state.poolCost, right)
+  let mut diff = 0.5
+    * clusterCostDiff(
+      logs,
+      List<u32>.get(&state.poolCount, left),
+      List<u32>.get(&state.poolCount, right),
+    )
+    - leftCost
+    - rightCost
+  let mut combo: f64 = 0.0
+  if List<u32>.get(&state.poolTotal, left) == 0 {
+    combo = rightCost
+  } else if List<u32>.get(&state.poolTotal, right) == 0 {
+    combo = leftCost
+  } else {
+    let mut threshold: f64 = 1e99
+    if state.pairCount > 0 {
+      threshold = List<f64>.get(&state.pairDiff, 0)
+      if threshold < 0.0 {
+        threshold = 0.0
+      }
+    }
+    let cost = comboCost(&mut state, alphabet, left, right)
+    if cost >= threshold - diff {
+      return ()
+    }
+    combo = cost
+  }
+  diff = diff + combo
+  let spare = PAIR_LIMIT - 1
+  List<u32>.set(&mut state.pairLeft, spare, usize.toU32(left))
+  List<u32>.set(&mut state.pairRight, spare, usize.toU32(right))
+  List<f64>.set(&mut state.pairDiff, spare, diff)
+  List<f64>.set(&mut state.pairCombo, spare, combo)
+  let count = state.pairCount
+  if count > 0 && pairWorse(&state, 0, spare) {
+    if count < maxPairs {
+      copyPair(&mut state, 0, count)
+      state.pairCount = count + 1
+    }
+    copyPair(&mut state, spare, 0)
+  } else if count < maxPairs {
+    copyPair(&mut state, spare, count)
+    state.pairCount = count + 1
+  }
+}
+
+// Merges the pool slots listed in `poolClusters` from `clustersAt` while a merge saves bits, and
+// then until at most `maxClusters` are left, as the reference `BrotliHistogramCombine` does. It
+// renames merged slots in `blockSymbols` from `symbolsAt`. Returns how many slots are left.
+fn combine(
+  state: &mut BrotliEncoder,
+  alphabet: usize,
+  symbolsAt: usize,
+  symbolCount: usize,
+  clustersAt: usize,
+  clusterCount: usize,
+  maxClusters: usize,
+  maxPairs: usize,
+) -> usize {
+  let mut count = clusterCount
+  let mut threshold: f64 = 0.0
+  let mut least: usize = 1
+  state.pairCount = 0
+  let mut first: usize = 0
+  while first < count {
+    let mut second = first + 1
+    while second < count {
+      let left = List<u32>.get(&state.poolClusters, clustersAt + first)
+      let right = List<u32>.get(&state.poolClusters, clustersAt + second)
+      pushPair(&mut state, alphabet, left, right, maxPairs)
+      second = second + 1
+    }
+    first = first + 1
+  }
+  while count > least {
+    if state.pairCount == 0 {
+      break
+    }
+    if List<f64>.get(&state.pairDiff, 0) >= threshold {
+      threshold = 1e99
+      least = maxClusters
+      continue
+    }
+    let best = u32.toUsize(List<u32>.get(&state.pairLeft, 0))
+    let other = u32.toUsize(List<u32>.get(&state.pairRight, 0))
+    let mut index: usize = 0
+    while index < alphabet {
+      let sum = List<u32>.get(&state.pool, best * alphabet + index)
+        + List<u32>.get(&state.pool, other * alphabet + index)
+      List<u32>.set(&mut state.pool, best * alphabet + index, sum)
+      index = index + 1
+    }
+    let total = List<u32>.get(&state.poolTotal, best) + List<u32>.get(&state.poolTotal, other)
+    List<u32>.set(&mut state.poolTotal, best, total)
+    let combo = List<f64>.get(&state.pairCombo, 0)
+    List<f64>.set(&mut state.poolCost, best, combo)
+    let size = List<u32>.get(&state.poolCount, best) + List<u32>.get(&state.poolCount, other)
+    List<u32>.set(&mut state.poolCount, best, size)
+    index = 0
+    while index < symbolCount {
+      if u32.toUsize(List<u32>.get(&state.blockSymbols, symbolsAt + index)) == other {
+        List<u32>.set(&mut state.blockSymbols, symbolsAt + index, usize.toU32(best))
+      }
+      index = index + 1
+    }
+    index = 0
+    while index < count {
+      if u32.toUsize(List<u32>.get(&state.poolClusters, clustersAt + index)) == other {
+        while index + 1 < count {
+          let next = List<u32>.get(&state.poolClusters, clustersAt + index + 1)
+          List<u32>.set(&mut state.poolClusters, clustersAt + index, next)
+          index = index + 1
+        }
+        break
+      }
+      index = index + 1
+    }
+    count = count - 1
+
+    // Drop the pairs that use either merged slot, keeping the best one first.
+    let mut kept: usize = 0
+    index = 0
+    while index < state.pairCount {
+      let left = u32.toUsize(List<u32>.get(&state.pairLeft, index))
+      let right = u32.toUsize(List<u32>.get(&state.pairRight, index))
+      if left == best || right == best || left == other || right == other {
+        index = index + 1
+        continue
+      }
+      if pairWorse(&state, 0, index) {
+        let spare = PAIR_LIMIT - 1
+        copyPair(&mut state, 0, spare)
+        copyPair(&mut state, index, 0)
+        copyPair(&mut state, spare, kept)
+      } else {
+        copyPair(&mut state, index, kept)
+      }
+      kept = kept + 1
+      index = index + 1
+    }
+    state.pairCount = kept
+    index = 0
+    while index < count {
+      let slot = List<u32>.get(&state.poolClusters, clustersAt + index)
+      pushPair(&mut state, alphabet, usize.toU32(best), slot, maxPairs)
+      index = index + 1
+    }
+  }
+  return count
+}
+
+// The bits that `histogram`, with `total` symbols, adds to pool slot `slot`.
+fn costDistance(
+  state: &mut BrotliEncoder,
+  alphabet: usize,
+  fromInputs: bool,
+  at: usize,
+  total: u32,
+  slot: usize,
+) -> f64 {
+  if total == 0 {
+    return 0.0
+  }
+  let pool = List<u32>.asSlice(&state.pool)
+  let merged = List<u32>.asMutSlice(&mut state.mergedHistogram)
+  let mut index: usize = 0
+  if fromInputs {
+    let inputs = List<u32>.asSlice(&state.inputs)
+    while index < alphabet {
+      merged[index] = inputs[at + index] + pool[slot * alphabet + index]
+      index = index + 1
+    }
+  } else {
+    let histograms = List<u32>.asSlice(&state.splitHistograms)
+    while index < alphabet {
+      merged[index] = histograms[at + index] + pool[slot * alphabet + index]
+      index = index + 1
+    }
+  }
+  let cost = populationCost(
+    Slice.view<u32>(List<u32>.asSlice(&state.mergedHistogram), 0, alphabet),
+    List<f64>.asSlice(&state.logTable),
+  )
+  return cost - List<f64>.get(&state.poolCost, slot)
+}
+
+fn copySlot(state: &mut BrotliEncoder, alphabet: usize, from: usize, to: usize) -> () {
+  let mut index: usize = 0
+  while index < alphabet {
+    let value = List<u32>.get(&state.pool, from * alphabet + index)
+    List<u32>.set(&mut state.pool, to * alphabet + index, value)
+    index = index + 1
+  }
+  let cost = List<f64>.get(&state.poolCost, from)
+  List<f64>.set(&mut state.poolCost, to, cost)
+  let total = List<u32>.get(&state.poolTotal, from)
+  List<u32>.set(&mut state.poolTotal, to, total)
+  let size = List<u32>.get(&state.poolCount, from)
+  List<u32>.set(&mut state.poolCount, to, size)
+}
+
+// Moves the slots left in `poolClusters` from `at` (in increasing order) down to `at` onwards,
+// and renames them in `blockSymbols` from `symbolsAt`.
+fn packSlots(
+  state: &mut BrotliEncoder,
+  alphabet: usize,
+  at: usize,
+  kept: usize,
+  symbolsAt: usize,
+  symbolCount: usize,
+) -> () {
+  let mut index: usize = 0
+  while index < kept {
+    let from = u32.toUsize(List<u32>.get(&state.poolClusters, at + index))
+    if from != at + index {
+      copySlot(&mut state, alphabet, from, at + index)
+    }
+    List<u32>.set(&mut state.poolIndex, from - at, usize.toU32(index))
+    index = index + 1
+  }
+  index = 0
+  while index < symbolCount {
+    let slot = u32.toUsize(List<u32>.get(&state.blockSymbols, symbolsAt + index))
+    let renamed = usize.toU32(at) + List<u32>.get(&state.poolIndex, slot - at)
+    List<u32>.set(&mut state.blockSymbols, symbolsAt + index, renamed)
+    index = index + 1
+  }
+}
+
+// Clusters the blocks of `category` and writes its block types and lengths, as the reference
+// `ClusterBlocks` does: batches of 64 blocks first, then all their clusters.
+fn clusterBlocks(
+  state: &mut BrotliEncoder,
+  length: usize,
+  blocks: usize,
+  alphabet: usize,
+  category: usize,
+) -> () {
+  clearRange(&mut state.blockSpans, 0, blocks)
+  let mut block: usize = 0
+  let mut index: usize = 0
+  while index < length {
+    let span = List<u32>.get(&state.blockSpans, block) + 1
+    List<u32>.set(&mut state.blockSpans, block, span)
+    if index + 1 == length
+      || List<u8>.get(&state.splitIds, index) != List<u8>.get(&state.splitIds, index + 1) {
+      block = block + 1
+    }
+    index = index + 1
+  }
+  let mut capacity = List<u32>.length(&state.pool) / alphabet
+  if capacity > POOL_SLOTS {
+    capacity = POOL_SLOTS
+  }
+  let mut used: usize = 0
+  let mut position: usize = 0
+  block = 0
+  while block < blocks {
+    let mut batch = blocks - block
+    if batch > 64 {
+      batch = 64
+    }
+    if used + batch > capacity {
+      // Too many clusters so far: merge them down to half of the pool.
+      index = 0
+      while index < used {
+        List<u32>.set(&mut state.poolClusters, index, usize.toU32(index))
+        index = index + 1
+      }
+      let kept = combine(&mut state, alphabet, 0, block, 0, used, capacity / 2, PAIR_LIMIT - 1)
+      packSlots(&mut state, alphabet, 0, kept, 0, block)
+      used = kept
+    }
+    let mut item: usize = 0
+    while item < batch {
+      let slot = used + item
+      clearRange(&mut state.pool, slot * alphabet, alphabet)
+      let span = u32.toUsize(List<u32>.get(&state.blockSpans, block + item))
+      let mut step: usize = 0
+      while step < span {
+        let at = slot * alphabet + u32.toUsize(List<u32>.get(&state.splitData, position + step))
+        let value = List<u32>.get(&state.pool, at) + 1
+        List<u32>.set(&mut state.pool, at, value)
+        step = step + 1
+      }
+      position = position + span
+      List<u32>.set(&mut state.poolTotal, slot, usize.toU32(span))
+      let cost = populationCost(
+        Slice.view<u32>(List<u32>.asSlice(&state.pool), slot * alphabet, alphabet),
+        List<f64>.asSlice(&state.logTable),
+      )
+      List<f64>.set(&mut state.poolCost, slot, cost)
+      List<u32>.set(&mut state.poolCount, slot, 1)
+      List<u32>.set(&mut state.blockSymbols, block + item, usize.toU32(slot))
+      List<u32>.set(&mut state.poolClusters, slot, usize.toU32(slot))
+      item = item + 1
+    }
+    let kept = combine(&mut state, alphabet, block, batch, used, batch, 64, 2048)
+    packSlots(&mut state, alphabet, used, kept, block, batch)
+    used = used + kept
+    block = block + batch
+  }
+
+  let mut maxPairs = 64 * used
+  if used / 2 * used < maxPairs {
+    maxPairs = used / 2 * used
+  }
+  if maxPairs > PAIR_LIMIT - 1 {
+    maxPairs = PAIR_LIMIT - 1
+  }
+  index = 0
+  while index < used {
+    List<u32>.set(&mut state.poolClusters, index, usize.toU32(index))
+    index = index + 1
+  }
+  let mut most = MAX_LITERAL_TYPES
+  if category == COMMAND_SPLIT {
+    most = MAX_COMMAND_TYPES
+  } else if category == DISTANCE_SPLIT {
+    most = MAX_DISTANCE_TYPES
+  }
+  let finals = combine(&mut state, alphabet, 0, blocks, 0, used, most, maxPairs)
+
+  // Give each block the cluster that codes it cheapest, preferring the one before.
+  index = 0
+  while index < used {
+    List<u32>.set(&mut state.poolIndex, index, NO_INDEX)
+    index = index + 1
+  }
+  let mut next: u32 = 0
+  position = 0
+  block = 0
+  while block < blocks {
+    clearRange(&mut state.splitHistograms, 0, alphabet)
+    let span = u32.toUsize(List<u32>.get(&state.blockSpans, block))
+    let mut step: usize = 0
+    while step < span {
+      let at = u32.toUsize(List<u32>.get(&state.splitData, position + step))
+      let value = List<u32>.get(&state.splitHistograms, at) + 1
+      List<u32>.set(&mut state.splitHistograms, at, value)
+      step = step + 1
+    }
+    position = position + span
+    let mut best = List<u32>.get(&state.blockSymbols, 0)
+    if block > 0 {
+      best = List<u32>.get(&state.blockSymbols, block - 1)
+    }
+    let total = usize.toU32(span)
+    let mut bestBits = costDistance(&mut state, alphabet, false, 0, total, u32.toUsize(best))
+    let mut cluster: usize = 0
+    while cluster < finals {
+      let slot = List<u32>.get(&state.poolClusters, cluster)
+      let bits = costDistance(&mut state, alphabet, false, 0, total, u32.toUsize(slot))
+      if bits < bestBits {
+        bestBits = bits
+        best = slot
+      }
+      cluster = cluster + 1
+    }
+    List<u32>.set(&mut state.blockSymbols, block, best)
+    if List<u32>.get(&state.poolIndex, u32.toUsize(best)) == NO_INDEX {
+      List<u32>.set(&mut state.poolIndex, u32.toUsize(best), next)
+      next = next + 1
+    }
+    block = block + 1
+  }
+
+  // Join neighbor blocks of the same cluster.
+  let region = state.blockRegion[category]
+  let mut count: usize = 0
+  let mut span: u32 = 0
+  let mut top: u32 = 0
+  block = 0
+  while block < blocks {
+    span = span + List<u32>.get(&state.blockSpans, block)
+    let symbol = List<u32>.get(&state.blockSymbols, block)
+    if block + 1 == blocks || symbol != List<u32>.get(&state.blockSymbols, block + 1) {
+      let kind = List<u32>.get(&state.poolIndex, u32.toUsize(symbol))
+      List<u8>.set(&mut state.blockType, region + count, u32.toU8(kind))
+      List<u32>.set(&mut state.blockLength, region + count, span)
+      if kind > top {
+        top = kind
+      }
+      span = 0
+      count = count + 1
+    }
+    block = block + 1
+  }
+  state.blockCounts[category] = count
+  setTypes(&mut state, category, u32.toUsize(top) + 1)
+}
+
+// Clusters `count` histograms of `alphabet` symbols in `inputs` into at most `MAX_CLUSTERS`, as
+// the reference `BrotliClusterHistograms` does. Writes the cluster of each input to its context
+// map, and the clusters, in the order of first use, to the literal or distance prefix codes.
+// Returns the number of clusters.
+fn clusterHistograms(
+  state: &mut BrotliEncoder,
+  count: usize,
+  alphabet: usize,
+  distance: bool,
+) -> usize {
+  let mut index: usize = 0
+  while index < count {
+    let mut total: u32 = 0
+    let mut symbol: usize = 0
+    while symbol < alphabet {
+      let value = List<u32>.get(&state.inputs, index * alphabet + symbol)
+      List<u32>.set(&mut state.pool, index * alphabet + symbol, value)
+      total = total + value
+      symbol = symbol + 1
+    }
+    List<u32>.set(&mut state.poolTotal, index, total)
+    let cost = populationCost(
+      Slice.view<u32>(List<u32>.asSlice(&state.inputs), index * alphabet, alphabet),
+      List<f64>.asSlice(&state.logTable),
+    )
+    List<f64>.set(&mut state.poolCost, index, cost)
+    List<u32>.set(&mut state.poolCount, index, 1)
+    List<u32>.set(&mut state.blockSymbols, index, usize.toU32(index))
+    index = index + 1
+  }
+  let mut used: usize = 0
+  index = 0
+  while index < count {
+    let mut batch = count - index
+    if batch > 64 {
+      batch = 64
+    }
+    let mut item: usize = 0
+    while item < batch {
+      List<u32>.set(&mut state.poolClusters, used + item, usize.toU32(index + item))
+      item = item + 1
+    }
+    used = used + combine(&mut state, alphabet, index, batch, used, batch, MAX_CLUSTERS, 2048)
+    index = index + batch
+  }
+  let mut maxPairs = 64 * used
+  if used / 2 * used < maxPairs {
+    maxPairs = used / 2 * used
+  }
+  if maxPairs > PAIR_LIMIT - 1 {
+    maxPairs = PAIR_LIMIT - 1
+  }
+  used = combine(&mut state, alphabet, 0, count, 0, used, MAX_CLUSTERS, maxPairs)
+
+  // Give each input the cluster that codes it cheapest, preferring the one before, and rebuild
+  // the clusters from their inputs.
+  index = 0
+  while index < count {
+    let mut best = List<u32>.get(&state.blockSymbols, 0)
+    if index > 0 {
+      best = List<u32>.get(&state.blockSymbols, index - 1)
+    }
+    let mut inputTotal: u32 = 0
+    let mut symbol: usize = 0
+    while symbol < alphabet {
+      inputTotal = inputTotal + List<u32>.get(&state.inputs, index * alphabet + symbol)
+      symbol = symbol + 1
+    }
+    let at = index * alphabet
+    let mut bestBits = costDistance(&mut state, alphabet, true, at, inputTotal, u32.toUsize(best))
+    let mut cluster: usize = 0
+    while cluster < used {
+      let slot = List<u32>.get(&state.poolClusters, cluster)
+      let bits = costDistance(&mut state, alphabet, true, at, inputTotal, u32.toUsize(slot))
+      if bits < bestBits {
+        bestBits = bits
+        best = slot
+      }
+      cluster = cluster + 1
+    }
+    List<u32>.set(&mut state.blockSymbols, index, best)
+    index = index + 1
+  }
+  let mut cluster: usize = 0
+  while cluster < used {
+    let slot = u32.toUsize(List<u32>.get(&state.poolClusters, cluster))
+    clearRange(&mut state.pool, slot * alphabet, alphabet)
+    cluster = cluster + 1
+  }
+  index = 0
+  while index < count {
+    let slot = u32.toUsize(List<u32>.get(&state.blockSymbols, index))
+    let mut symbol: usize = 0
+    while symbol < alphabet {
+      let value = List<u32>.get(&state.pool, slot * alphabet + symbol)
+        + List<u32>.get(&state.inputs, index * alphabet + symbol)
+      List<u32>.set(&mut state.pool, slot * alphabet + symbol, value)
+      symbol = symbol + 1
+    }
+    index = index + 1
+  }
+
+  // Number the clusters by first use and copy them to the prefix code histograms.
+  index = 0
+  while index < count {
+    List<u32>.set(&mut state.poolIndex, index, NO_INDEX)
+    index = index + 1
+  }
+  let mut next: usize = 0
+  index = 0
+  while index < count {
+    let slot = u32.toUsize(List<u32>.get(&state.blockSymbols, index))
+    if List<u32>.get(&state.poolIndex, slot) == NO_INDEX {
+      List<u32>.set(&mut state.poolIndex, slot, usize.toU32(next))
+      let mut symbol: usize = 0
+      while symbol < alphabet {
+        let value = List<u32>.get(&state.pool, slot * alphabet + symbol)
+        if distance {
+          List<u32>.set(&mut state.distanceHistogram, next * DISTANCE_LIMIT + symbol, value)
+        } else {
+          List<u32>.set(&mut state.literalHistogram, next * LITERAL_ALPHABET + symbol, value)
+        }
+        symbol = symbol + 1
+      }
+      next = next + 1
+    }
+    let number = List<u32>.get(&state.poolIndex, slot)
+    if distance {
+      List<u32>.set(&mut state.distanceMap, index, number)
+    } else {
+      List<u32>.set(&mut state.contextMap, index, number)
+    }
+    index = index + 1
+  }
+  return next
+}
+
+// The distance context of a command from its symbol: its copy length 2, 3, 4, or longer.
+fn distanceContext(symbol: usize) -> usize {
+  let range = symbol / 64
+  let cell = symbol & 7
+  if (range == 0 || range == 2 || range == 4 || range == 7) && cell <= 2 {
+    return cell
+  }
+  return 3
+}
+
+// The block type code of `kind` after the types `last` and `second`: 1 for the next type, 0 for
+// the one before the last, else the type plus 2.
+fn typeCode(kind: u32, last: u32, second: u32) -> u32 {
+  if kind == last + 1 {
+    return 1
+  }
+  if kind == second {
+    return 0
+  }
+  return kind + 2
+}
+
+// The block count code of a block of `length` symbols.
+fn spanCode(length: u32) -> usize {
+  let mut code: usize = 0
+  if length >= 177 {
+    code = 14
+    if length >= 753 {
+      code = 20
+    }
+  } else if length >= 41 {
+    code = 7
+  }
+  while code < 25 && length >= SPAN_BASE[code + 1] {
+    code = code + 1
+  }
+  return code
+}
+
+fn writeSpan(state: &mut BrotliEncoder, category: usize, length: u32) -> () {
+  let code = spanCode(length)
+  let at = category * SWITCH_SPAN + SWITCH_SPAN - SPAN_ALPHABET + code
+  let value = List<u32>.get(&state.switchCode, at)
+  let depth = List<u32>.get(&state.switchDepth, at)
+  addBits(&mut state, value, depth)
+  addBits(&mut state, length - SPAN_BASE[code], SPAN_EXTRA[code])
+}
+
+// Points the block cursor of `category` at its first block.
+fn startBlocks(state: &mut BrotliEncoder, category: usize) -> () {
+  let region = state.blockRegion[category]
+  state.cursorIndex[category] = 0
+  state.cursorLeft[category] = 0
+  state.cursorType[category] = 0
+  if state.blockCounts[category] > 0 {
+    state.cursorLeft[category] = List<u32>.get(&state.blockLength, region)
+    state.cursorType[category] = u8.toU32(List<u8>.get(&state.blockType, region))
+  }
+}
+
+// The block type of the next symbol of `category`, moving to the next block when this one ends.
+fn nextType(state: &mut BrotliEncoder, category: usize) -> usize {
+  if state.cursorLeft[category] == 0 {
+    let index = state.cursorIndex[category] + 1
+    let region = state.blockRegion[category]
+    state.cursorIndex[category] = index
+    state.cursorLeft[category] = List<u32>.get(&state.blockLength, region + index)
+    state.cursorType[category] = u8.toU32(List<u8>.get(&state.blockType, region + index))
+  }
+  state.cursorLeft[category] = state.cursorLeft[category] - 1
+  return u32.toUsize(state.cursorType[category])
+}
+
+// Like `nextType`, and writes the block switch command when a new block starts.
+fn writtenType(state: &mut BrotliEncoder, category: usize) -> usize {
+  if state.cursorLeft[category] == 0 {
+    let index = state.cursorIndex[category] + 1
+    let region = state.blockRegion[category]
+    let kind = u8.toU32(List<u8>.get(&state.blockType, region + index))
+    let length = List<u32>.get(&state.blockLength, region + index)
+    let code = typeCode(kind, state.switchLast[category], state.switchSecond[category])
+    state.switchSecond[category] = state.switchLast[category]
+    state.switchLast[category] = kind
+    let at = category * SWITCH_SPAN + u32.toUsize(code)
+    let value = List<u32>.get(&state.switchCode, at)
+    let depth = List<u32>.get(&state.switchDepth, at)
+    addBits(&mut state, value, depth)
+    writeSpan(&mut state, category, length)
+    state.cursorIndex[category] = index
+    state.cursorLeft[category] = length
+    state.cursorType[category] = kind
+  }
+  state.cursorLeft[category] = state.cursorLeft[category] - 1
+  return u32.toUsize(state.cursorType[category])
+}
+
+// Writes the number of block types of `category`, and with more than one, the prefix codes of
+// its block switches and the length of its first block, as the reference
+// `BuildAndStoreBlockSplitCode` does. Adds the bits of the later switches to `switchBits`.
+fn writeBlockSplit(state: &mut BrotliEncoder, category: usize) -> () {
+  let types = typesOf(&state, category)
+  writeVarLen(&mut state, types - 1)
+  if types <= 1 {
+    return ()
+  }
+  let region = state.blockRegion[category]
+  let blocks = state.blockCounts[category]
+  let base = category * SWITCH_SPAN
+  let spans = base + SWITCH_SPAN - SPAN_ALPHABET
+  clearRange(&mut state.switchHistogram, base, SWITCH_SPAN)
+  let mut last: u32 = 1
+  let mut second: u32 = 0
+  let mut block: usize = 0
+  while block < blocks {
+    let kind = u8.toU32(List<u8>.get(&state.blockType, region + block))
+    let code = u32.toUsize(typeCode(kind, last, second))
+    second = last
+    last = kind
+    if block != 0 {
+      let seen = List<u32>.get(&state.switchHistogram, base + code) + 1
+      List<u32>.set(&mut state.switchHistogram, base + code, seen)
+    }
+    let span = spans + spanCode(List<u32>.get(&state.blockLength, region + block))
+    let count = List<u32>.get(&state.switchHistogram, span) + 1
+    List<u32>.set(&mut state.switchHistogram, span, count)
+    block = block + 1
+  }
+  writeTree(&mut state, TREE_TYPE + usize.toU32(category), types + 2)
+  writeTree(&mut state, TREE_SPAN + usize.toU32(category), SPAN_ALPHABET)
+  last = 1
+  second = 0
+  let mut bits: u64 = 0
+  block = 0
+  while block < blocks {
+    let kind = u8.toU32(List<u8>.get(&state.blockType, region + block))
+    let code = u32.toUsize(typeCode(kind, last, second))
+    second = last
+    last = kind
+    if block != 0 {
+      let span = spanCode(List<u32>.get(&state.blockLength, region + block))
+      bits = bits + u32.toU64(List<u32>.get(&state.switchDepth, base + code))
+        + u32.toU64(List<u32>.get(&state.switchDepth, spans + span))
+        + u32.toU64(SPAN_EXTRA[span])
+    }
+    block = block + 1
+  }
+  state.switchBits = state.switchBits + bits
+  let first = List<u32>.get(&state.blockLength, region)
+  writeSpan(&mut state, category, first)
+  state.switchSecond[category] = 1
+  state.switchLast[category] = u8.toU32(List<u8>.get(&state.blockType, region))
+  startBlocks(&mut state, category)
+}
+
+// Splits the literals, commands, and distances of the meta-block from `start` into block types,
+// and clusters the literal histograms of each block type and context, and the distance
+// histograms of each block type and copy length context, into prefix codes.
+fn splitMetaBlock(state: &mut BrotliEncoder, start: usize) -> () {
+  let mut count: usize = 0
+  let mut position = start
+  let mut index: usize = 0
+  while state.zopfli && index < state.commandCount {
+    let insert = u32.toUsize(List<u32>.get(&state.commandInsert, index))
+    let mut step: usize = 0
+    while step < insert {
+      let byte = u8.toU32(List<u8>.get(&state.buffer, position + step))
+      List<u32>.set(&mut state.splitData, count, byte)
+      count = count + 1
+      step = step + 1
+    }
+    position = position + insert + u32.toUsize(List<u32>.get(&state.commandCopy, index))
+    index = index + 1
+  }
+  splitSymbols(&mut state, count, LITERAL_ALPHABET, LITERAL_SPLIT)
+  index = 0
+  while index < state.commandCount {
+    let symbol = List<u32>.get(&state.commandSymbol, index)
+    List<u32>.set(&mut state.splitData, index, symbol)
+    index = index + 1
+  }
+  let commands = state.commandCount
+  splitSymbols(&mut state, commands, COMMAND_ALPHABET, COMMAND_SPLIT)
+  count = 0
+  index = 0
+  while index < state.commandCount {
+    if List<u32>.get(&state.commandCopy, index) != 0
+      && List<u32>.get(&state.commandSymbol, index) >= 128 {
+      let code = List<u32>.get(&state.commandDistance, index)
+      let symbol = distanceSymbol(code, state.distancePostfix, state.distanceDirect)
+      List<u32>.set(&mut state.splitData, count, symbol)
+      count = count + 1
+    }
+    index = index + 1
+  }
+  let alphabet = state.distanceAlphabet
+  splitSymbols(&mut state, count, alphabet, DISTANCE_SPLIT)
+
+  // Literal histograms by block type and context, and command histograms by block type.
+  let literalInputs = state.literalTypes * CONTEXTS
+  clearRange(&mut state.inputs, 0, literalInputs * LITERAL_ALPHABET)
+  clearRange(&mut state.commandHistogram, 0, state.commandTypes * COMMAND_ALPHABET)
+  startBlocks(&mut state, LITERAL_SPLIT)
+  startBlocks(&mut state, COMMAND_SPLIT)
+  startBlocks(&mut state, DISTANCE_SPLIT)
+  let mode = u32.toUsize(state.contextMode) * 512
+  position = start
+  index = 0
+  while index < state.commandCount {
+    let kind = nextType(&mut state, COMMAND_SPLIT)
+    let symbol = u32.toUsize(List<u32>.get(&state.commandSymbol, index))
+    let slot = kind * COMMAND_ALPHABET + symbol
+    let seen = List<u32>.get(&state.commandHistogram, slot) + 1
+    List<u32>.set(&mut state.commandHistogram, slot, seen)
+    let stop = position + u32.toUsize(List<u32>.get(&state.commandInsert, index))
+    if !state.zopfli {
+      position = stop
+    }
+    while position < stop {
+      let literalKind = nextType(&mut state, LITERAL_SPLIT)
+      let context = contextAt(
+        List<u8>.asSlice(&state.buffer),
+        brotli_tables.contextLookup(),
+        mode,
+        position,
+      )
+      let byte = u8.toUsize(List<u8>.get(&state.buffer, position))
+      let at = (literalKind * CONTEXTS + context) * LITERAL_ALPHABET + byte
+      let value = List<u32>.get(&state.inputs, at) + 1
+      List<u32>.set(&mut state.inputs, at, value)
+      position = position + 1
+    }
+    position = position + u32.toUsize(List<u32>.get(&state.commandCopy, index))
+    index = index + 1
+  }
+  if state.zopfli {
+    state.clusterCount = clusterHistograms(&mut state, literalInputs, LITERAL_ALPHABET, false)
+  } else {
+    clusterContexts(&mut state)
+  }
+
+  // Distance histograms by block type and copy length context.
+  let distanceInputs = state.distanceTypes * 4
+  clearRange(&mut state.inputs, 0, distanceInputs * alphabet)
+  index = 0
+  while index < state.commandCount {
+    let symbol = List<u32>.get(&state.commandSymbol, index)
+    if List<u32>.get(&state.commandCopy, index) != 0 && symbol >= 128 {
+      let kind = nextType(&mut state, DISTANCE_SPLIT)
+      let code = List<u32>.get(&state.commandDistance, index)
+      let distance = distanceSymbol(code, state.distancePostfix, state.distanceDirect)
+      let context = kind * 4 + distanceContext(u32.toUsize(symbol))
+      let at = context * alphabet + u32.toUsize(distance)
+      let value = List<u32>.get(&state.inputs, at) + 1
+      List<u32>.set(&mut state.inputs, at, value)
+    }
+    index = index + 1
+  }
+  state.distanceClusters = clusterHistograms(&mut state, distanceInputs, alphabet, true)
 }
