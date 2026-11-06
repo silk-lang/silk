@@ -6,8 +6,8 @@ Decompress Zstandard data (RFC 8878) in steps, with fixed memory and limits that
 
 ## When to use
 Use [`Zstd`](#Zstd) to read `.zst` files or HTTP bodies with `Content-Encoding: zstd`. Make a decoder
-with [`Zstd.make`](#Zstd.impl.make), and call [`Zstd.step`](#Zstd.impl.step) until it returns `Finished`. This module does not
-compress.
+with [`Zstd.make`](#Zstd.impl.make), and call [`Zstd.step`](#Zstd.impl.step) until it returns `Finished`. To compress, use
+`silk.compress.zstd_encode.ZstdEncoder`.
 
 ## Details
 The decoder supports all block types and all entropy modes, and more than one frame, including
