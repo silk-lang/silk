@@ -3584,12 +3584,12 @@ const program = Effect.gen(function* () {
     )
     yield* fs.writeFileString(
       join(examples, 'ui/silk.toml'),
-      '[package]\nname = "ui"\nversion = "0.1.0"\nsilk-version = "0.0.1"\n\n[[post-init]]\nrun = ["scripts/post-init.sh", "ready"]\n',
+      '[package]\nname = "ui"\nversion = "0.1.0"\nsilk-version = "0.0.1"\ndescription = "A window"\n\n[[post-init]]\nrun = ["scripts/post-init.sh", "ready"]\n',
     )
     yield* fs.writeFileString(join(examples, 'ui/src/main.silk'), 'pub fn main() -> i32 {\n  return 7\n}\n')
     yield* fs.writeFileString(
       join(examples, 'ui/scripts/post-init.sh'),
-      '#!/bin/sh\ngrep -q post-init silk.toml && exit 4\necho "post-init $1"\nrm scripts/post-init.sh\n',
+      '#!/bin/sh\ngrep -q post-init silk.toml && exit 4\necho "post-init $*"\nrm scripts/post-init.sh\n',
     )
     yield* fs.chmod(join(examples, 'ui/scripts/post-init.sh'), 0o755)
     yield* fs.writeFileString(
@@ -3608,12 +3608,13 @@ const program = Effect.gen(function* () {
     const commit = git(['rev-parse', 'HEAD'])
     const templated = (args: ReadonlyArray<string>, cwd = work) =>
       invoke(silk, ['init', ...args], cwd, { ...process.env, HOME: home, SILK_HOME: silkHome, XDG_CONFIG_HOME: join(home, '.config') })
-    const official = yield* templated(['app', '-t', 'ui'])
+    const official = yield* templated(['app', '-t', 'ui', '--', '--dark', 'two words'])
     assert.equal(official.status, 0, official.stderr)
-    assert.match(official.stdout, /^post-init ready\nInitialized Silk project app at \S+app from template silk-lang\/examples\/ui \(([0-9a-f]{40})\)\n$/)
+    // An entry gets its own arguments, then the compiler's release, then the ones after `--`.
+    assert.match(official.stdout, /^post-init ready \d+\.\d+\.\d+\S* --dark two words\nInitialized Silk project app at \S+app from template silk-lang\/examples\/ui \(([0-9a-f]{40})\)\n$/)
     assert.equal(official.stdout.includes(commit), true, official.stdout)
     const manifest = yield* fs.readFileString(join(work, 'app/silk.toml'))
-    assert.match(manifest, /^\[package\]\nname = "app"\nversion = "0\.1\.0"\nsilk-version = "[^"]+"\n$/)
+    assert.match(manifest, /^\[package\]\nname = "app"\nversion = "0\.1\.0"\nsilk-version = "[^"]+"\ndescription = "A window"\n$/)
     assert.equal(manifest.includes('0.0.1'), false, manifest)
     assert.equal(yield* fs.readFileString(join(work, 'app/.gitignore')), '/build/\n')
     assert.equal(yield* fs.exists(join(work, 'app/scripts/post-init.sh')), false)
@@ -3642,6 +3643,13 @@ const program = Effect.gen(function* () {
     const rootless = yield* templated(['rootless', '-t', 'silk-lang/examples'])
     assert.equal(rootless.status, 1, rootless.stderr)
     assert.match(rootless.stderr, /Template silk-lang\/examples has no silk\.toml/)
+    // `--list` names each directory with a silk.toml by what `--template` takes, with its description.
+    const listed = yield* templated(['-l'])
+    assert.equal(listed.status, 0, listed.stderr)
+    assert.match(listed.stdout, /^Templates in silk-lang\/examples \([0-9a-f]{40}\):\n  broken\n  ui      A window\nCreate a project from one with `silk init <path> --template <name>`\n$/)
+    const listedFull = yield* templated(['--list', 'silk-lang/examples/ui@v1'])
+    assert.equal(listedFull.status, 0, listedFull.stderr)
+    assert.match(listedFull.stdout, /\n  ui@v1  A window\n/)
     const malformed = yield* templated(['bad', '-t', 'silk-lang/examples@a..b'])
     assert.equal(malformed.status, 2, malformed.stderr)
     assert.match(malformed.stderr, /Template revision `a\.\.b` must be a branch, a tag or a full commit hash/)

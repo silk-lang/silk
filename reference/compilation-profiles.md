@@ -434,6 +434,13 @@ compiler's release as `silk-version`, and a package outside a workspace gets `/b
 makes it. A workspace template takes no `--name`, and only a `silk-version` it pins is updated.
 `--template` cannot be combined with `--lib` or `--workspace`.
 
+`silk init --list [template]` (or `-l`) lists the templates in a template's directory and every
+directory below it, the official examples at the root of `silk-lang/examples` when no template is
+given. A template is each directory with a `silk.toml` that is not inside another template, so a
+workspace's members are part of their workspace. Each line gives the name `--template` takes
+(the short form for an official example) and the manifest's `[package].description`, when it has
+one.
+
 A template adjusts the new project with `[[post-init]]` entries in its `silk.toml`. `run` is the
 command line, spelled as a `[[generate]]` entry's: the program, then its arguments, where a
 program with a `/` is a path below the template's directory and a bare name is searched on `PATH`.
@@ -444,7 +451,11 @@ run = ["scripts/post-init.sh"]
 ```
 
 The entries are removed from the new manifest before they run, so they run once. They run in order
-in the project directory with the caller's environment, after every file is written. A failing
+in the project directory with the caller's environment, after every file is written. Each entry
+gets its own arguments, then this compiler's release (such as `0.1.0-dev.50+e1a2bc7cec4a`), then
+every argument given after `--`: `silk init app -t ui -- --dark` runs
+`scripts/post-init.sh 0.1.0-dev.50+e1a2bc7cec4a --dark`. A template can check the release or read
+options from those arguments. A failing
 entry stops the rest, and `silk init` then removes every file and directory it created, restores a
 `.gitignore` it changed and exits 1. A template it cannot fetch or use also exits 1; a malformed
 template or a file in the way exits 2. Builds never run an entry; they only refuse a malformed
