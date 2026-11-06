@@ -3564,6 +3564,88 @@ const program = Effect.gen(function* () {
     assert.equal(moving.status, 2, 'a branch name was accepted as rev')
     assert.match(moving.stderr, /dependency `vector` of app@1\.0\.0: rev must be a full commit hash/)
   }
+  {
+    // `init --template` copies one directory of a GitHub repository, here served from local
+    // repositories through git's `insteadOf`, runs its [[post-init]] entries and drops them from the
+    // new manifest. A one-segment template is a directory of silk-lang/examples.
+    const served = join(directory, 'templates/served')
+    const home = join(directory, 'templates/home')
+    const silkHome = join(directory, 'templates/silk-home')
+    const work = join(directory, 'templates/work')
+    const examples = join(served, 'silk-lang/examples.git')
+    yield* fs.makeDirectory(join(examples, 'ui/src'), { recursive: true })
+    yield* fs.makeDirectory(join(examples, 'ui/scripts'), { recursive: true })
+    yield* fs.makeDirectory(join(examples, 'broken'), { recursive: true })
+    yield* fs.makeDirectory(home, { recursive: true })
+    yield* fs.makeDirectory(work, { recursive: true })
+    yield* fs.writeFileString(
+      join(home, '.gitconfig'),
+      `[url "${pathToFileURL(served).href}/"]\n\tinsteadOf = https://github.com/\n`,
+    )
+    yield* fs.writeFileString(
+      join(examples, 'ui/silk.toml'),
+      '[package]\nname = "ui"\nversion = "0.1.0"\nsilk-version = "0.0.1"\n\n[[post-init]]\nrun = ["scripts/post-init.sh", "ready"]\n',
+    )
+    yield* fs.writeFileString(join(examples, 'ui/src/main.silk'), 'pub fn main() -> i32 {\n  return 7\n}\n')
+    yield* fs.writeFileString(
+      join(examples, 'ui/scripts/post-init.sh'),
+      '#!/bin/sh\ngrep -q post-init silk.toml && exit 4\necho "post-init $1"\nrm scripts/post-init.sh\n',
+    )
+    yield* fs.chmod(join(examples, 'ui/scripts/post-init.sh'), 0o755)
+    yield* fs.writeFileString(
+      join(examples, 'broken/silk.toml'),
+      '[package]\nname = "broken"\n\n[[post-init]]\nrun = ["sh", "-c", "touch made; exit 3"]\n',
+    )
+    const git = (args: ReadonlyArray<string>) => {
+      const ran = spawnSync('git', ['-C', examples, ...args], { encoding: 'utf8' })
+      assert.equal(ran.status, 0, ran.stderr)
+      return ran.stdout.trim()
+    }
+    git(['init', '--quiet'])
+    git(['add', '.'])
+    git(['-c', 'user.name=Silk', '-c', 'user.email=silk@example.com', '-c', 'commit.gpgsign=false', 'commit', '--quiet', '-m', 'templates'])
+    git(['tag', 'v1'])
+    const commit = git(['rev-parse', 'HEAD'])
+    const templated = (args: ReadonlyArray<string>, cwd = work) =>
+      invoke(silk, ['init', ...args], cwd, { ...process.env, HOME: home, SILK_HOME: silkHome, XDG_CONFIG_HOME: join(home, '.config') })
+    const official = yield* templated(['app', '-t', 'ui'])
+    assert.equal(official.status, 0, official.stderr)
+    assert.match(official.stdout, /^post-init ready\nInitialized Silk project app at \S+app from template silk-lang\/examples\/ui \(([0-9a-f]{40})\)\n$/)
+    assert.equal(official.stdout.includes(commit), true, official.stdout)
+    const manifest = yield* fs.readFileString(join(work, 'app/silk.toml'))
+    assert.match(manifest, /^\[package\]\nname = "app"\nversion = "0\.1\.0"\nsilk-version = "[^"]+"\n$/)
+    assert.equal(manifest.includes('0.0.1'), false, manifest)
+    assert.equal(yield* fs.readFileString(join(work, 'app/.gitignore')), '/build/\n')
+    assert.equal(yield* fs.exists(join(work, 'app/scripts/post-init.sh')), false)
+    assert.deepEqual(readdirSync(join(silkHome, 'git')), [], 'a template scratch directory was left behind')
+    const ran = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(work, 'app'), { ...process.env, SILK_CLANG: clang })
+    assert.equal(ran.status, 7, ran.stderr)
+    // The full spelling with a tag, and a name; the template's own manifest never names the project.
+    const tagged = yield* templated(['named', '-t', 'silk-lang/examples/ui@v1', '--name', 'other'])
+    assert.equal(tagged.status, 0, tagged.stderr)
+    assert.match(yield* fs.readFileString(join(work, 'named/silk.toml')), /name = "other"/)
+    // Initialization never overwrites a file, and a failing entry removes everything it created.
+    yield* fs.makeDirectory(join(work, 'taken/src'), { recursive: true })
+    yield* fs.writeFileString(join(work, 'taken/src/main.silk'), 'kept\n')
+    const collision = yield* templated(['taken', '-t', 'ui'])
+    assert.equal(collision.status, 2, collision.stderr)
+    assert.match(collision.stderr, /Refusing to overwrite existing project file \S+taken\/src\/main\.silk\n/)
+    assert.deepEqual(readdirSync(join(work, 'taken')).sort(), ['src'])
+    assert.equal(yield* fs.readFileString(join(work, 'taken/src/main.silk')), 'kept\n')
+    const failing = yield* templated(['failing', '-t', 'broken'])
+    assert.equal(failing.status, 1, failing.stderr)
+    assert.match(failing.stderr, /silk: sh -c touch made; exit 3 failed with status 3\nsilk: the template's \[\[post-init\]\] entry failed, so the project was removed\n/)
+    assert.equal(yield* fs.exists(join(work, 'failing')), false)
+    const missing = yield* templated(['missing', '-t', 'silk-lang/examples/absent@v1'])
+    assert.equal(missing.status, 1, missing.stderr)
+    assert.match(missing.stderr, /Template silk-lang\/examples\/absent@v1 names no directory of its repository/)
+    const rootless = yield* templated(['rootless', '-t', 'silk-lang/examples'])
+    assert.equal(rootless.status, 1, rootless.stderr)
+    assert.match(rootless.stderr, /Template silk-lang\/examples has no silk\.toml/)
+    const malformed = yield* templated(['bad', '-t', 'silk-lang/examples@a..b'])
+    assert.equal(malformed.status, 2, malformed.stderr)
+    assert.match(malformed.stderr, /Template revision `a\.\.b` must be a branch, a tag or a full commit hash/)
+  }
   // A workspace member builds against a sibling member by path and shares the workspace's output.
   const workspace = join(directory, 'workspace')
   yield* fs.makeDirectory(join(workspace, 'app'), { recursive: true })

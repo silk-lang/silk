@@ -11,6 +11,10 @@
 //! processes fetching the same missing commit at once can disturb each other's checkout; the
 //! marker is written last, so a disturbed fetch fails rather than leaving a partial checkout marked
 //! complete, and the next build fetches it again.
+//!
+//! `silk init --template` fetches a branch, tag or commit into a scratch directory instead
+//! (`fetchRevision`), keeping the git metadata so it can list, read and check out one directory of
+//! that commit's tree.
 
 import driver.CommandPath
 import silk.platform.windows.path {WindowsPath}
@@ -20,6 +24,7 @@ import silk.core.effect {Effect}
 import silk.system.child_process {ChildProcess, ProcessError, ProcessOutcome, ProcessRequest}
 import silk.system.filesystem {FileError, FileSystem, Path}
 import silk.system.host_input {HostInput, HostInputError}
+import silk.collections.list {List}
 import silk.core.option {Option}
 import silk.core.result {Result}
 import silk.collections.slice {Slice}
@@ -284,4 +289,143 @@ effect fn gitProgram() -> Option<Path> ! HostInputError | FileError | OutOfMemor
     Option<Bytes>.Some {value} => Option<Path>.some(run Path.fromBytes(Bytes.asSlice(&value)))
     Option<Bytes>.None => Option<Path>.none()
   }
+}
+
+// `path` as the host spells it, for a git argument.
+effect fn hostBytes(path: &Path) -> Bytes ! FileError | OutOfMemoryError ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return run WindowsPath.toNativeBytes(path)
+  } else {
+    return run Bytes.copy(Path.rawBytes(path))
+  }
+}
+
+// Runs git with `arguments`: what it printed to standard output when it succeeds, else `None`.
+effect fn output(git: &Path, arguments: &[&[u8]]) -> Option<Bytes>
+  ! HostInputError | OutOfMemoryError
+  ? &mut ChildProcess | &mut HostInput | &mut Allocator {
+  let mut request = run gitRequest(git)
+  let mut at = usize.ZERO
+  while at < arguments.length {
+    run ChildProcess.addArgumentBytes(&mut request, arguments[at])
+    at = at + usize.ONE
+  }
+  return match move run Effect.result(ChildProcess.submit(&request)) {
+    Result<ProcessOutcome, ProcessError | OutOfMemoryError>.Success {value: outcome} => {
+      if let Option<i32>.Some {value: code} = move ChildProcess.exitCode(&outcome) {
+        if code == 0 { return Option<Bytes>.some(run Bytes.copy(ChildProcess.outputBytes(&outcome))) }
+      }
+      return Option<Bytes>.none()
+    }
+    Result<ProcessOutcome, ProcessError | OutOfMemoryError>.Failure {error} => match move error {
+      ProcessError refused => {
+        drop refused
+        return Option<Bytes>.none()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+/// A repository fetched into a scratch directory for its files, with its git metadata kept so
+/// `listTree`, `readFile` and `checkOut` can read one commit's tree.
+pub struct Fetched {
+  /// The git on `PATH` that fetched it.
+  pub git: Path,
+
+  /// The scratch directory, as the host spells it.
+  pub directory: Bytes,
+
+  /// The full hash of the fetched commit.
+  pub commit: Bytes,
+}
+
+/// Fetches revision `rev` of the repository at `url` into the empty directory `scratch`: a branch,
+/// a tag, a full commit hash, or `HEAD` for the default branch. It asks the server for that one
+/// revision without history, and when the server refuses a commit by hash, fetches every branch and
+/// tag and finds the commit among them.
+pub effect fn fetchRevision(scratch: &Path, url: &[u8], rev: &[u8]) -> Fetched
+  ! FetchFailed | HostInputError | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
+  let git = match move run gitProgram() {
+    Option<Path>.Some {value} => move value
+    Option<Path>.None => run failed(b"fetching it needs git, and no git is on PATH", b"")
+  }
+  let hostScratch = run hostBytes(scratch)
+  let directory = Bytes.asSlice(&hostScratch)
+  let initialize: [&[u8]; 3] = [b"init", b"--quiet", directory]
+  run step(&git, &initialize, b"git init")
+  // `--` ends the options, so no URL is read as one.
+  let one: [&[u8]; 9] = [b"-C", directory, b"fetch", b"--quiet", b"--depth", b"1", b"--", url, rev]
+  let mut wanted = run Bytes.copy(b"FETCH_HEAD")
+  if let Option<Bytes>.Some {value: refused} = move run attempt(&git, &one) {
+    if !isCommit(rev) { run failed(b"git fetch failed", Bytes.asSlice(&refused)) }
+    drop refused
+    let every: [&[u8]; 8] = [b"-C", directory, b"fetch", b"--quiet", b"--tags", b"--", url, b"+refs/heads/*:refs/remotes/origin/*"]
+    run step(&git, &every, b"git fetch")
+    wanted = run Bytes.copy(rev)
+  }
+  run Bytes.append(&mut wanted, b"^{commit}")
+  let verify: [&[u8]; 6] = [b"-C", directory, b"rev-parse", b"--verify", b"--quiet", Bytes.asSlice(&wanted)]
+  let resolved = match move run output(&git, &verify) {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => run failed(b"the repository has no such commit", b"")
+  }
+  let printed = Bytes.asSlice(&resolved)
+  let mut end = printed.length
+  while end > usize.ZERO && (printed[end - usize.ONE] == 10 || printed[end - usize.ONE] == 13) { end = end - usize.ONE }
+  return Fetched {git: move git, directory: move hostScratch, commit: run Bytes.copy(Slice.view<u8>(printed, usize.ZERO, end))}
+}
+
+/// The paths of every file below the tree `treeish` of a fetched repository, such as
+/// `<commit>^{tree}` or `<commit>:<directory>`, relative to that tree and separated by `/`, or
+/// `None` when it names no tree.
+pub effect fn listTree(fetched: &Fetched, treeish: &[u8]) -> Option<List<Bytes>>
+  ! HostInputError | OutOfMemoryError
+  ? &mut ChildProcess | &mut HostInput | &mut Allocator {
+  let list: [&[u8]; 7] = [b"-C", Bytes.asSlice(&fetched.directory), b"ls-tree", b"-r", b"-z", b"--name-only", treeish]
+  let printed = match move run output(&fetched.git, &list) {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => { return Option<List<Bytes>>.none() }
+  }
+  let text = Bytes.asSlice(&printed)
+  let mut found = List<Bytes>.make()
+  let mut start = usize.ZERO
+  let mut at = usize.ZERO
+  while at < text.length {
+    if text[at] == 0 {
+      if at > start { run List<Bytes>.append(&mut found, run Bytes.copy(Slice.view<u8>(text, start, at - start))) }
+      start = at + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return Option<List<Bytes>>.some(move found)
+}
+
+/// The contents of the file `object`, spelled `<commit>:<path>`, of a fetched repository, or
+/// `None` when there is no such file.
+pub effect fn readFile(fetched: &Fetched, object: &[u8]) -> Option<Bytes>
+  ! HostInputError | OutOfMemoryError
+  ? &mut ChildProcess | &mut HostInput | &mut Allocator {
+  let show: [&[u8]; 5] = [b"-C", Bytes.asSlice(&fetched.directory), b"cat-file", b"blob", object]
+  return run output(&fetched.git, &show)
+}
+
+/// Writes every file of the tree `treeish` (as `listTree` takes it) of a fetched repository below `destination`, creating
+/// the directories it needs and keeping each file's executable bit and symbolic links. It never
+/// replaces a file that exists; the caller checks first.
+pub effect fn checkOut(fetched: &Fetched, treeish: &[u8], destination: &Path) -> ()
+  ! FetchFailed | HostInputError | FileError | OutOfMemoryError
+  ? &mut ChildProcess | &mut HostInput | &mut Allocator {
+  let directory = Bytes.asSlice(&fetched.directory)
+  let read: [&[u8]; 4] = [b"-C", directory, b"read-tree", treeish]
+  run step(&fetched.git, &read, b"git read-tree")
+  let hostDestination = run hostBytes(destination)
+  // The prefix ends with a separator, so `checkout-index` reads it as a directory.
+  let mut prefix = run Bytes.copy(b"--prefix=")
+  run Bytes.append(&mut prefix, Bytes.asSlice(&hostDestination))
+  run Bytes.append(&mut prefix, b"/")
+  let write: [&[u8]; 6] = [b"-C", directory, b"checkout-index", b"--all", b"--quiet", Bytes.asSlice(&prefix)]
+  run step(&fetched.git, &write, b"git checkout-index")
+  return ()
 }
