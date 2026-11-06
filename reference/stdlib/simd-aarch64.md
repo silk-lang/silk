@@ -35,7 +35,7 @@ pub fn main() -> i32 {
 
 Import as `aarch64` with `import silk.simd.aarch64 as aarch64`.
 
-Public declarations: 14.
+Public declarations: 16.
 
 <a id="tableLookup"></a>
 
@@ -166,6 +166,34 @@ pub fn aesInverseMixColumns(state: simd<u8, 16>) -> simd<u8, 16>
 ```
 
 `aesimc` (AES): AES InvMixColumns.
+
+When the build targets AArch64 with the `aes` feature, it compiles to this one instruction.
+Otherwise it computes the same lanes with portable code, which is correct but slower.
+
+<a id="polynomialMultiply"></a>
+
+## `polynomialMultiply`
+
+```silk
+pub fn polynomialMultiply(left: simd<u64, 2>, right: simd<u64, 2>) -> simd<u64, 2>
+```
+
+`pmull` (AES): the 128-bit carry-less product of lane 0 of `left` and lane 0 of `right`, with
+its low 64 bits in lane 0. Lane 1 of each operand is ignored.
+
+When the build targets AArch64 with the `aes` feature, it compiles to this one instruction.
+Otherwise it computes the same lanes with portable code, which is correct but slower.
+
+<a id="polynomialMultiplyHigh"></a>
+
+## `polynomialMultiplyHigh`
+
+```silk
+pub fn polynomialMultiplyHigh(left: simd<u64, 2>, right: simd<u64, 2>) -> simd<u64, 2>
+```
+
+`pmull2` (AES): the 128-bit carry-less product of lane 1 of `left` and lane 1 of `right`, with
+its low 64 bits in lane 0. Lane 0 of each operand is ignored.
 
 When the build targets AArch64 with the `aes` feature, it compiles to this one instruction.
 Otherwise it computes the same lanes with portable code, which is correct but slower.
