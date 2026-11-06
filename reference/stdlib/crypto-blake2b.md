@@ -173,6 +173,16 @@ fn digestLength(self: &Self) -> usize
 
 Returns 64, the BLAKE2b-512 digest length in bytes.
 
+<a id="Blake2b512.impl.Digest.objectIdentifier"></a>
+
+### Operation `objectIdentifier`
+
+```silk
+fn objectIdentifier(self: &Self) -> &[u8]
+```
+
+Returns the content bytes of the BLAKE2b-512 object identifier, 1.3.6.1.4.1.1722.12.2.1.16.
+
 <a id="Blake2b512.impl.Digest.copy"></a>
 
 ### Operation `copy`
