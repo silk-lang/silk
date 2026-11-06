@@ -1,0 +1,451 @@
+//! Encrypt and decrypt PEM keys with the legacy OpenSSL scheme of the `Proc-Type` and `DEK-Info`
+//! headers (RFC 1421 framing).
+//!
+//! # When to use
+//! Use [`LegacyPem`] for a `-----BEGIN RSA PRIVATE KEY-----` or `-----BEGIN EC PRIVATE KEY-----`
+//! block with `Proc-Type: 4,ENCRYPTED`, such as the output of `export` with `type: 'pkcs1'` or
+//! `'sec1'` and a cipher in Node.js. For PKCS #8 keys, use `silk.crypto.pkcs8`, which is stronger.
+//!
+//! # Details
+//! The key is `EVP_BytesToKey` with MD5, one iteration, and the first 8 bytes of the IV as the
+//! salt. The cipher is AES, Camellia, or ARIA with a 128, 192, or 256-bit key, or Triple DES, all
+//! in CBC mode with PKCS #7 padding ([`LegacyPemCipher`]). Read the `DEK-Info` header with
+//! `Pem.header` of `silk.encoding.pem` and pass it to [`LegacyPem.decrypt`]; [`LegacyPem.writeHeaders`]
+//! writes the two headers for `Pem.encode`. Nothing allocates.
+//!
+//! # Errors
+//! The functions return a [`LegacyPemError`]. On an error the output does not change.
+//!
+//! # Gotchas
+//! The scheme derives the key with one MD5 call, so a weak password falls fast to guessing. A wrong
+//! password usually fails with `WrongPassword`, but about one in 256 passes the padding check;
+//! check that the result parses as a key.
+//!
+//! # Examples
+//! ## Encrypt and decrypt a key
+//! ```silk
+//! import silk.crypto.legacy_pem { LegacyPem, LegacyPemCipher, LegacyPemError }
+//! import silk.core.result { Result }
+//! import silk.collections.slice { Slice }
+//!
+//! pub fn main() -> i32 {
+//!   let iv: [u8; 16] = [1; 16]
+//!   let mut headers: [u8; 96] = [0; 96]
+//!   let headerLength = LegacyPem.writeHeaders(LegacyPemCipher.Aes256Cbc, &iv, &mut headers)
+//!   // The DEK-Info value starts after "Proc-Type: 4,ENCRYPTED\nDEK-Info: ".
+//!   let dekInfo = Slice.view<u8>(&headers, 33, headerLength - 34)
+//!   let mut sealed: [u8; 32] = [0; 32]
+//!   let length = match LegacyPem.encrypt(LegacyPemCipher.Aes256Cbc, b"secret", &iv, b"key bytes", &mut sealed) {
+//!     Result<usize, LegacyPemError>.Success { value } => value
+//!     Result<usize, LegacyPemError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let mut opened: [u8; 32] = [0; 32]
+//!   let back = match LegacyPem.decrypt(dekInfo, b"secret", Slice.view<u8>(&sealed, 0, length), &mut opened) {
+//!     Result<usize, LegacyPemError>.Success { value } => value
+//!     Result<usize, LegacyPemError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   if back != 9 || opened[0] != 107 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Cryptography
+
+import silk.text.format { Debug, Format, Formatter }
+import silk.core.result { Result }
+import silk.collections.slice { Slice }
+import silk.crypto.aes { AesCbc, AesError }
+import silk.crypto.aria { Aria }
+import silk.crypto.block_cipher { BlockCipher, BlockCipherError, Cbc }
+import silk.crypto.camellia { Camellia }
+import silk.crypto.des { TripleDes }
+import silk.crypto.digest { Digest }
+import silk.crypto.md5 { Md5 }
+import silk.num.u8
+import silk.num.usize
+import silk.io.writer { Writer, WriterError }
+
+/// The reason that a [`LegacyPem`] function rejected a call. The output does not change.
+pub union LegacyPemError {
+  /// The `DEK-Info` value is not a supported cipher name, a comma, and the IV in hex.
+  InvalidDekInfo,
+  /// The decrypted data does not end in valid padding: the password is wrong, or the data was
+  /// changed.
+  WrongPassword,
+  /// The ciphertext is empty or not a whole number of blocks.
+  InvalidInputLength,
+  /// The IV given to [`LegacyPem.encrypt`] is not one cipher block.
+  InvalidIvLength,
+  /// The output buffer is shorter than the bytes the call writes.
+  OutputTooSmall,
+}
+
+impl Debug for LegacyPemError {
+  /// Writes the name of the variant, such as `WrongPassword`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      LegacyPemError.InvalidDekInfo => run Format.write(&mut formatter, b"InvalidDekInfo")
+      LegacyPemError.WrongPassword => run Format.write(&mut formatter, b"WrongPassword")
+      LegacyPemError.InvalidInputLength => run Format.write(&mut formatter, b"InvalidInputLength")
+      LegacyPemError.InvalidIvLength => run Format.write(&mut formatter, b"InvalidIvLength")
+      LegacyPemError.OutputTooSmall => run Format.write(&mut formatter, b"OutputTooSmall")
+    }
+  }
+}
+
+/// The CBC ciphers of the legacy scheme, with their `DEK-Info` names.
+pub enum LegacyPemCipher {
+  /// `AES-128-CBC`.
+  Aes128Cbc,
+  /// `AES-192-CBC`.
+  Aes192Cbc,
+  /// `AES-256-CBC`.
+  Aes256Cbc,
+  /// `DES-EDE3-CBC`, Triple DES with a 24-byte key.
+  TripleDesCbc,
+  /// `CAMELLIA-128-CBC`.
+  Camellia128Cbc,
+  /// `CAMELLIA-192-CBC`.
+  Camellia192Cbc,
+  /// `CAMELLIA-256-CBC`.
+  Camellia256Cbc,
+  /// `ARIA-128-CBC`.
+  Aria128Cbc,
+  /// `ARIA-192-CBC`.
+  Aria192Cbc,
+  /// `ARIA-256-CBC`.
+  Aria256Cbc,
+}
+
+impl LegacyPemCipher {
+  /// Returns the name that `DEK-Info` uses, such as `AES-256-CBC`.
+  pub fn name(self: &Self) -> &'static [u8] {
+    return match &self.* {
+      LegacyPemCipher.Aes128Cbc => b"AES-128-CBC"
+      LegacyPemCipher.Aes192Cbc => b"AES-192-CBC"
+      LegacyPemCipher.Aes256Cbc => b"AES-256-CBC"
+      LegacyPemCipher.TripleDesCbc => b"DES-EDE3-CBC"
+      LegacyPemCipher.Camellia128Cbc => b"CAMELLIA-128-CBC"
+      LegacyPemCipher.Camellia192Cbc => b"CAMELLIA-192-CBC"
+      LegacyPemCipher.Camellia256Cbc => b"CAMELLIA-256-CBC"
+      LegacyPemCipher.Aria128Cbc => b"ARIA-128-CBC"
+      LegacyPemCipher.Aria192Cbc => b"ARIA-192-CBC"
+      LegacyPemCipher.Aria256Cbc => b"ARIA-256-CBC"
+    }
+  }
+
+  /// Returns the key length in bytes.
+  pub fn keyLength(self: &Self) -> usize {
+    return match &self.* {
+      LegacyPemCipher.Aes128Cbc => 16
+      LegacyPemCipher.Aes192Cbc => 24
+      LegacyPemCipher.Aes256Cbc => 32
+      LegacyPemCipher.TripleDesCbc => 24
+      LegacyPemCipher.Camellia128Cbc => 16
+      LegacyPemCipher.Camellia192Cbc => 24
+      LegacyPemCipher.Camellia256Cbc => 32
+      LegacyPemCipher.Aria128Cbc => 16
+      LegacyPemCipher.Aria192Cbc => 24
+      LegacyPemCipher.Aria256Cbc => 32
+    }
+  }
+
+  /// Returns the block length in bytes, which is also the IV length: 8 for Triple DES, 16 for the
+  /// others.
+  pub fn blockLength(self: &Self) -> usize {
+    return match &self.* {
+      LegacyPemCipher.TripleDesCbc => 8
+      LegacyPemCipher.Aes128Cbc => 16
+      LegacyPemCipher.Aes192Cbc => 16
+      LegacyPemCipher.Aes256Cbc => 16
+      LegacyPemCipher.Camellia128Cbc => 16
+      LegacyPemCipher.Camellia192Cbc => 16
+      LegacyPemCipher.Camellia256Cbc => 16
+      LegacyPemCipher.Aria128Cbc => 16
+      LegacyPemCipher.Aria192Cbc => 16
+      LegacyPemCipher.Aria256Cbc => 16
+    }
+  }
+}
+
+/// Functions of the legacy PEM encryption scheme.
+pub struct LegacyPem {}
+
+impl LegacyPem {
+  /// Decrypts `ciphertext`, the decoded body of a block whose `DEK-Info` header is `dekInfo`, with
+  /// `password` into `output`, and returns the number of bytes written.
+  ///
+  /// The cipher name in `dekInfo` compares without regard to case, as in OpenSSL. The result is at
+  /// most `ciphertext.length` bytes.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidDekInfo` if `dekInfo` is not a name of [`LegacyPemCipher`], a comma, and one block
+  ///   of IV in hex.
+  /// - `InvalidInputLength` if `ciphertext` is empty or not a whole number of blocks.
+  /// - `WrongPassword` if the padding is wrong after decryption.
+  /// - `OutputTooSmall` if `output` is shorter than `ciphertext`.
+  pub fn decrypt(dekInfo: &[u8], password: &[u8], ciphertext: &[u8], output: &mut [u8]) -> Result<usize, LegacyPemError> {
+    let mut comma: usize = 0
+    while comma < dekInfo.length && dekInfo[comma] != 44 {
+      comma = comma + 1
+    }
+    if comma == dekInfo.length {
+      return Result<usize, LegacyPemError>.failResult(LegacyPemError.InvalidDekInfo)
+    }
+    let name = Slice.view<u8>(dekInfo, 0, comma)
+    let mut found = false
+    let mut cipher = LegacyPemCipher.Aes128Cbc
+    let all: [LegacyPemCipher; 10] = [
+      LegacyPemCipher.Aes128Cbc,
+      LegacyPemCipher.Aes192Cbc,
+      LegacyPemCipher.Aes256Cbc,
+      LegacyPemCipher.TripleDesCbc,
+      LegacyPemCipher.Camellia128Cbc,
+      LegacyPemCipher.Camellia192Cbc,
+      LegacyPemCipher.Camellia256Cbc,
+      LegacyPemCipher.Aria128Cbc,
+      LegacyPemCipher.Aria192Cbc,
+      LegacyPemCipher.Aria256Cbc,
+    ]
+    let mut index: usize = 0
+    while index < 10 {
+      if sameIgnoringCase(name, all[index].name()) {
+        cipher = all[index]
+        found = true
+      }
+      index = index + 1
+    }
+    let block = cipher.blockLength()
+    let hex = Slice.view<u8>(dekInfo, comma + 1, dekInfo.length - comma - 1)
+    if found == false || hex.length != 2 * block {
+      return Result<usize, LegacyPemError>.failResult(LegacyPemError.InvalidDekInfo)
+    }
+    let mut iv: [u8; 16] = [0; 16]
+    index = 0
+    while index < block {
+      let high = digit(hex[2 * index])
+      let low = digit(hex[2 * index + 1])
+      if high > 15 || low > 15 {
+        return Result<usize, LegacyPemError>.failResult(LegacyPemError.InvalidDekInfo)
+      }
+      iv[index] = u8.bitOr(u8.shiftLeft(high, 4), low)
+      index = index + 1
+    }
+    if ciphertext.length == 0 || ciphertext.length % block != 0 {
+      return Result<usize, LegacyPemError>.failResult(LegacyPemError.InvalidInputLength)
+    }
+    if output.length < ciphertext.length {
+      return Result<usize, LegacyPemError>.failResult(LegacyPemError.OutputTooSmall)
+    }
+    let mut key: [u8; 32] = [0; 32]
+    let keyLength = cipher.keyLength()
+    deriveKey(password, Slice.view<u8>(&iv, 0, 8), Slice.viewMut<u8>(&mut key, 0, keyLength))
+    let cipherKey = Slice.view<u8>(&key, 0, keyLength)
+    let ivBytes = Slice.view<u8>(&iv, 0, block)
+    // Check the padding on the last block alone first, so that a wrong password writes nothing.
+    let mut chain = ivBytes
+    if ciphertext.length > block {
+      chain = Slice.view<u8>(ciphertext, ciphertext.length - 2 * block, block)
+    }
+    let mut last: [u8; 16] = [0; 16]
+    if let Result.Failure { error } = cbc(&cipher, cipherKey, chain, Slice.view<u8>(ciphertext, ciphertext.length - block, block), true, &mut last) {
+      return Result<usize, LegacyPemError>.failResult(move error)
+    }
+    return cbc(&cipher, cipherKey, ivBytes, ciphertext, true, move output)
+  }
+
+  /// Returns the number of bytes that [`LegacyPem.encrypt`] writes for `length` bytes with
+  /// `cipher`: the length padded to the next whole block.
+  pub fn encryptedLength(cipher: LegacyPemCipher, length: usize) -> usize {
+    let block = cipher.blockLength()
+    return (length / block + 1) * block
+  }
+
+  /// Encrypts `plaintext`, the DER of a key, with `cipher`, `password`, and `iv` into `output`,
+  /// and returns the number of bytes written, [`LegacyPem.encryptedLength`].
+  ///
+  /// `iv` is one random cipher block; its first 8 bytes are also the salt of the key.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidIvLength` if `iv` is not one block of `cipher`.
+  /// - `OutputTooSmall` if `output` is shorter than [`LegacyPem.encryptedLength`].
+  pub fn encrypt(cipher: LegacyPemCipher, password: &[u8], iv: &[u8], plaintext: &[u8], output: &mut [u8]) -> Result<usize, LegacyPemError> {
+    if iv.length != cipher.blockLength() {
+      return Result<usize, LegacyPemError>.failResult(LegacyPemError.InvalidIvLength)
+    }
+    if output.length < LegacyPem.encryptedLength(cipher, plaintext.length) {
+      return Result<usize, LegacyPemError>.failResult(LegacyPemError.OutputTooSmall)
+    }
+    let mut key: [u8; 32] = [0; 32]
+    let keyLength = cipher.keyLength()
+    deriveKey(password, Slice.view<u8>(iv, 0, 8), Slice.viewMut<u8>(&mut key, 0, keyLength))
+    return cbc(&cipher, Slice.view<u8>(&key, 0, keyLength), iv, plaintext, false, move output)
+  }
+
+  /// Returns the number of bytes that [`LegacyPem.writeHeaders`] writes for `cipher`.
+  pub fn headersLength(cipher: LegacyPemCipher) -> usize {
+    // "Proc-Type: 4,ENCRYPTED\n", "DEK-Info: ", the name, ",", the IV in hex, "\n".
+    return 23 + 10 + cipher.name().length + 1 + 2 * cipher.blockLength() + 1
+  }
+
+  /// Writes the `Proc-Type` and `DEK-Info` header lines for `cipher` and `iv` to `output`, each
+  /// ending with LF, ready for the headers of `Pem.encode`, and returns the number of bytes
+  /// written, [`LegacyPem.headersLength`].
+  ///
+  /// The IV is written in uppercase hex, as OpenSSL does. It traps if `iv` is not one block of
+  /// `cipher` or `output` is shorter than [`LegacyPem.headersLength`].
+  pub fn writeHeaders(cipher: LegacyPemCipher, iv: &[u8], output: &mut [u8]) -> usize {
+    if iv.length != cipher.blockLength() || output.length < LegacyPem.headersLength(cipher) {
+      Intrinsic.trap("LegacyPem.writeHeaders: the IV must be one block and the output long enough")
+    }
+    let mut at = put(&mut output, 0, b"Proc-Type: 4,ENCRYPTED\nDEK-Info: ")
+    at = put(&mut output, at, cipher.name())
+    output[at] = 44
+    at = at + 1
+    let digits = b"0123456789ABCDEF"
+    let mut index: usize = 0
+    while index < iv.length {
+      output[at] = digits[u8.toUsize(u8.shiftRight(iv[index], 4))]
+      output[at + 1] = digits[u8.toUsize(u8.bitAnd(iv[index], 15))]
+      at = at + 2
+      index = index + 1
+    }
+    output[at] = 10
+    return at + 1
+  }
+}
+
+fn put(output: &mut [u8], position: usize, bytes: &[u8]) -> usize {
+  let mut index: usize = 0
+  while index < bytes.length {
+    output[position + index] = bytes[index]
+    index = index + 1
+  }
+  return position + bytes.length
+}
+
+fn sameIgnoringCase(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut index: usize = 0
+  while index < left.length {
+    let mut byte = left[index]
+    if byte >= 97 && byte <= 122 {
+      byte = byte - 32
+    }
+    if byte != right[index] {
+      return false
+    }
+    index = index + 1
+  }
+  return true
+}
+
+// The value of a hex digit, or 16 for another byte.
+fn digit(byte: u8) -> u8 {
+  if byte >= 48 && byte <= 57 {
+    return byte - 48
+  }
+  if byte >= 65 && byte <= 70 {
+    return byte - 55
+  }
+  if byte >= 97 && byte <= 102 {
+    return byte - 87
+  }
+  return 16
+}
+
+// EVP_BytesToKey with MD5 and one iteration: D1 = MD5(password, salt), Di = MD5(Di-1, password,
+// salt), until the key is full.
+fn deriveKey(password: &[u8], salt: &[u8], key: &mut [u8]) -> () {
+  let mut previous: [u8; 16] = [0; 16]
+  let mut filled: usize = 0
+  let mut first = true
+  while filled < key.length {
+    let mut digest = Md5.make()
+    if first == false {
+      digest.update(&previous)
+    }
+    digest.update(password)
+    digest.update(salt)
+    digest.finishInto(&mut previous)
+    first = false
+    let mut index: usize = 0
+    while index < 16 && filled < key.length {
+      key[filled] = previous[index]
+      filled = filled + 1
+      index = index + 1
+    }
+  }
+}
+
+// Encrypts or decrypts `input` with CBC and PKCS #7 padding into `output`, which holds at least
+// the padded length.
+fn cbc(cipher: &LegacyPemCipher, key: &[u8], iv: &[u8], input: &[u8], decrypting: bool, output: &mut [u8]) -> Result<usize, LegacyPemError> {
+  return match &cipher.* {
+    LegacyPemCipher.TripleDesCbc => generic<TripleDes>(made(TripleDes.make(key)), iv, input, decrypting, move output)
+    LegacyPemCipher.Camellia128Cbc => generic<Camellia>(made(Camellia.make(key)), iv, input, decrypting, move output)
+    LegacyPemCipher.Camellia192Cbc => generic<Camellia>(made(Camellia.make(key)), iv, input, decrypting, move output)
+    LegacyPemCipher.Camellia256Cbc => generic<Camellia>(made(Camellia.make(key)), iv, input, decrypting, move output)
+    LegacyPemCipher.Aria128Cbc => generic<Aria>(made(Aria.make(key)), iv, input, decrypting, move output)
+    LegacyPemCipher.Aria192Cbc => generic<Aria>(made(Aria.make(key)), iv, input, decrypting, move output)
+    LegacyPemCipher.Aria256Cbc => generic<Aria>(made(Aria.make(key)), iv, input, decrypting, move output)
+    LegacyPemCipher.Aes128Cbc => aes(key, iv, input, decrypting, move output)
+    LegacyPemCipher.Aes192Cbc => aes(key, iv, input, decrypting, move output)
+    LegacyPemCipher.Aes256Cbc => aes(key, iv, input, decrypting, move output)
+  }
+}
+
+fn made<C: BlockCipher>(result: Result<C, BlockCipherError>) -> C {
+  return match move result {
+    Result<C, BlockCipherError>.Success { value } => move value
+    Result<C, BlockCipherError>.Failure { error: _ } => Intrinsic.trap("LegacyPem: the key length was checked")
+  }
+}
+
+fn generic<C: BlockCipher>(cipher: C, iv: &[u8], input: &[u8], decrypting: bool, output: &mut [u8]) -> Result<usize, LegacyPemError> {
+  let started = if decrypting { Cbc<C>.decryptor(move cipher, iv, true) } else { Cbc<C>.encryptor(move cipher, iv, true) }
+  let mut state = match move started {
+    Result<Cbc<C>, BlockCipherError>.Success { value } => move value
+    Result<Cbc<C>, BlockCipherError>.Failure { error: _ } => {
+      return Result<usize, LegacyPemError>.failResult(LegacyPemError.InvalidIvLength)
+    }
+  }
+  let capacity = output.length
+  let first = match state.update(input, Slice.viewMut<u8>(&mut output, 0, capacity)) {
+    Result<usize, BlockCipherError>.Success { value } => value
+    Result<usize, BlockCipherError>.Failure { error: _ } => Intrinsic.trap("LegacyPem: the output length was checked")
+  }
+  return match state.finish(Slice.viewMut<u8>(&mut output, first, capacity - first)) {
+    Result<usize, BlockCipherError>.Success { value } => Result<usize, LegacyPemError>.succeed(first + value)
+    Result<usize, BlockCipherError>.Failure { error: _ } => Result<usize, LegacyPemError>.failResult(LegacyPemError.WrongPassword)
+  }
+}
+
+fn aes(key: &[u8], iv: &[u8], input: &[u8], decrypting: bool, output: &mut [u8]) -> Result<usize, LegacyPemError> {
+  let started = if decrypting { AesCbc.decryptor(key, iv, true) } else { AesCbc.encryptor(key, iv, true) }
+  let mut state = match move started {
+    Result<AesCbc, AesError>.Success { value } => move value
+    Result<AesCbc, AesError>.Failure { error: _ } => {
+      return Result<usize, LegacyPemError>.failResult(LegacyPemError.InvalidIvLength)
+    }
+  }
+  let capacity = output.length
+  let first = match state.update(input, Slice.viewMut<u8>(&mut output, 0, capacity)) {
+    Result<usize, AesError>.Success { value } => value
+    Result<usize, AesError>.Failure { error: _ } => Intrinsic.trap("LegacyPem: the output length was checked")
+  }
+  return match state.finish(Slice.viewMut<u8>(&mut output, first, capacity - first)) {
+    Result<usize, AesError>.Success { value } => Result<usize, LegacyPemError>.succeed(first + value)
+    Result<usize, AesError>.Failure { error: _ } => Result<usize, LegacyPemError>.failResult(LegacyPemError.WrongPassword)
+  }
+}
