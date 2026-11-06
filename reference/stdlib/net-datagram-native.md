@@ -598,6 +598,30 @@ Makes an unbound UDP socket for `family`. It is nonblocking, and child processes
 - `FamilyUnsupported` if the system has no support for `family`.
 - Another `DatagramError` if the system cannot make the socket.
 
+<a id="NativeUdpSocket.impl.adopt"></a>
+
+### Associated function `adopt`
+
+```silk
+pub unsafe effect fn adopt(fd: RawSocket, family: Family) -> NativeUdpSocket
+    ! DatagramError
+```
+
+Takes an open UDP socket of `family`, such as one that another process sent, and makes it
+nonblocking and kept from child processes. The returned socket owns `fd` and closes it when
+it is dropped.
+
+#### When to use
+Use it for a socket descriptor that this program did not make, as Node's `dgram` does for a
+socket shared by a cluster primary. Use [`NativeUdpSocket.open`](#NativeUdpSocket.impl.open) for a new socket.
+
+#### Safety
+`fd` must be an open UDP socket of `family` that nothing else closes.
+
+#### Errors
+- A `DatagramError` with operation `Configure` if the system cannot set the socket flags. The
+  socket is closed then.
+
 <a id="NativeUdpSocket.impl.family"></a>
 
 ### Method `family`
