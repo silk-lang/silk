@@ -1,0 +1,1041 @@
+//! Start a child process whose standard streams stay open while it runs, send it signals, and learn
+//! when it ends through a descriptor that an event loop can watch.
+//!
+//! # When to use
+//! Use [`Subprocess.spawn`] when your program talks to the child while it runs, as a JavaScript
+//! runtime or a shell does: you get the process ID and the parent end of each pipe as raw
+//! descriptors, and you read and write them in your own loop. To run a program to the end and get
+//! all of its output, use the `ChildProcess` effect from `silk.system.child_process` instead.
+//!
+//! # Details
+//! A [`ProcessRequest`] from `silk.system.child_process` gives the program, the arguments, the
+//! environment, and the working directory. [`SpawnOptions`] gives the rest: what the child gets in
+//! each descriptor slot ([`Stdio`]), the first argument, a new session, and the user and group.
+//!
+//! Every call returns at once. Nothing in this module waits for the child:
+//! - The parent end of each [`Stdio.pipe`] slot is a nonblocking, close-on-exec UNIX stream socket.
+//! - [`ExitWatch.open`] gives a descriptor that becomes readable when the child ends: a pidfd on
+//!   Linux, and a kqueue with an `EVFILT_PROC` filter on Darwin. Register it with a reactor, such
+//!   as `silk.io.reactor`, next to the pipes.
+//! - [`ExitWatch.collect`] collects the exit status once the exit descriptor is readable.
+//!   [`Subprocess.tryWait`] collects it if the child has ended, or returns `none` if it still runs.
+//!
+//! The child starts with every signal unblocked, and with the default action for every signal that
+//! can be caught, so a signal that the parent blocks or ignores reaches the child normally.
+//!
+//! # Errors
+//! Each operation fails with [`SubprocessError`]: the [`SubprocessOperation`] and the native error
+//! code, such as 2 (`ENOENT`) when the program does not exist.
+//!
+//! # Gotchas
+//! - Collect the status after the child ends, or the child stays a zombie process.
+//! - Collect the status of a child in one place only. A second `waitpid` for the same child, from
+//!   other code, takes the status away.
+//! - A program is a path. This module does not search `PATH`.
+//! - On GNU/Linux, a child with a working directory, a user, or a group starts with `fork`, which
+//!   is slower for a large parent. Darwin uses `fork` only for a user or a group.
+//! - On GNU/Linux, a child started without `fork` also gets each descriptor that the parent itself
+//!   inherited without close-on-exec.
+//! - The module is empty on targets other than Darwin on x86_64 or aarch64, and Linux with GNU libc
+//!   on x86_64 or aarch64.
+//!
+//! # Examples
+//! ## Read the output of a child and wait for its exit
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.mem.pointer { Pointer }
+//! import silk.core.effect { Effect }
+//! import silk.core.option { Option }
+//! import silk.core.result { Result }
+//! import silk.system.child_process { ChildProcess }
+//! import silk.system.filesystem { FileError, Path }
+//! import silk.system.subprocess { ExitStatus, ExitWatch, SpawnOptions, Stdio, Subprocess, SubprocessError }
+//!
+//! extern "C" struct PollFd { fd: i32, events: i16, revents: i16 }
+//! static if Intrinsic.targetOperatingSystem() == "darwin" {
+//!   @foreign(noCapture: .("fds"))
+//!   unsafe extern "C" fn poll(fds: ?[*]mut PollFd, count: u32, timeout: i32) -> i32
+//! } else {
+//!   @foreign(noCapture: .("fds"))
+//!   unsafe extern "C" fn poll(fds: ?[*]mut PollFd, count: usize, timeout: i32) -> i32
+//! }
+//! @foreign(noCapture: .("buffer"))
+//! unsafe extern "C" fn read(fd: i32, buffer: ?[*]mut u8, count: usize) -> isize
+//!
+//! effect fn program() -> i32 ! FileError | SubprocessError | OutOfMemoryError ? &mut Allocator {
+//!   let path = run Path.make("/bin/echo")
+//!   let mut request = run ChildProcess.request(&path)
+//!   run ChildProcess.addArgument(&mut request, "hi")
+//!   let mut options = SpawnOptions.make()
+//!   run options.setStdio(1, Stdio.pipe())
+//!   let mut child = run Subprocess.spawn(&request, &options)
+//!   let output = match child.takePipe(1) {
+//!     Option<i32>.Some { value } => value
+//!     Option<i32>.None => { return 1 }
+//!   }
+//!   let watch = run ExitWatch.open(child.pid())
+//!
+//!   // Wait for the exit descriptor; a real program registers it with a reactor instead.
+//!   let mut watched = [PollFd { fd: watch.descriptor(), events: 1, revents: 0 }]
+//!   let _ready = unsafe poll(Pointer.fromMutSlice<PollFd>(&mut watched), 1, -1)
+//!   let status = run watch.collect()
+//!
+//!   // echo has ended, so its output is in the socket.
+//!   let mut bytes: [u8; 8] = [0; 8]
+//!   let count = unsafe read(output, Pointer.fromMutSlice<u8>(&mut bytes), 8)
+//!   Subprocess.closeDescriptor(output)
+//!   if status.signaled || status.code != 0 || count != 3 || bytes[0] != 104 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//!
+//! pub effect fn main() -> i32 {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let result = run Effect.result(program()) |> Effect.provideMut<Allocator>(&mut allocator)
+//!   return match move result {
+//!     Result<i32, FileError | SubprocessError | OutOfMemoryError>.Success { value } => value
+//!     Result<i32, FileError | SubprocessError | OutOfMemoryError>.Failure { .. } => 1
+//!   }
+//! }
+//! ```
+//!
+//! @category System
+
+static if (Intrinsic.targetOperatingSystem() == "darwin" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64") && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy, Drop }
+import silk.system.child_process { ChildProcess, ProcessRequest }
+import silk.num.i32
+import silk.num.i64
+import silk.num.isize
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+
+/// The operation of this module that failed.
+pub enum SubprocessOperation {
+  /// Starting the child, in [`Subprocess.spawn`].
+  Spawn,
+  /// Collecting an exit status, in [`Subprocess.tryWait`].
+  Wait,
+  /// Sending a signal, in [`Subprocess.kill`].
+  Kill,
+  /// Opening the exit descriptor, in [`ExitWatch.open`].
+  Watch,
+}
+
+/// A failed operation of this module: which one, and the native error code.
+///
+/// # Details
+/// `code` is the `errno` value of the failed system call, such as 2 (`ENOENT`) when the program
+/// does not exist, 13 (`EACCES`) when it cannot be run, 3 (`ESRCH`) when no process has the ID, or
+/// 22 (`EINVAL`) for a request with a NUL byte or an empty program.
+pub struct SubprocessError {
+  /// The operation that failed.
+  pub operation: SubprocessOperation,
+  /// The native error code.
+  pub code: i32,
+}
+
+/// What a child gets in one descriptor slot.
+///
+/// # Details
+/// Make one with [`Stdio.ignore`], [`Stdio.inherit`], or [`Stdio.pipe`].
+pub struct Stdio {
+  // 0: ignore, 1: inherit `fd`, 2: pipe.
+  kind: u8,
+  fd: i32,
+}
+
+impl Copy for Stdio {}
+
+impl Stdio {
+  /// Returns a slot that the child does not get from the parent.
+  ///
+  /// # Details
+  /// Slots 0, 1, and 2 are opened on `/dev/null` in the child, so a read sees the end at once and a
+  /// write is discarded. A higher slot is not opened by this module.
+  pub fn ignore() -> Stdio { return Stdio { kind: 0, fd: -1 } }
+
+  /// Returns a slot that the child gets as a copy of the parent's descriptor `fd`.
+  ///
+  /// # Details
+  /// The parent keeps `fd` open and owns it. `fd` can be any open descriptor, such as the
+  /// parent's own standard output, a file, or a socket. [`Subprocess.spawn`] fails with code 9
+  /// (`EBADF`) if `fd` is not open.
+  pub fn inherit(fd: i32) -> Stdio { return Stdio { kind: 1, fd: fd } }
+
+  /// Returns a slot connected to a new pipe between the parent and the child.
+  ///
+  /// # Details
+  /// The pipe is a UNIX stream socket pair, so both sides can read and write, and it can carry
+  /// descriptors with `SCM_RIGHTS`. The parent end is nonblocking and close-on-exec. Take it with
+  /// [`Subprocess.takePipe`]. The child end is blocking, as programs expect.
+  pub fn pipe() -> Stdio { return Stdio { kind: 2, fd: -1 } }
+}
+
+/// How [`Subprocess.spawn`] starts a child, apart from the [`ProcessRequest`].
+///
+/// # Details
+/// [`SpawnOptions.make`] gives slots 0, 1, and 2 as [`Stdio.ignore`], the program path as the
+/// first argument, the session, user, and group of the parent.
+pub struct SpawnOptions {
+  stdio: List<Stdio>,
+  argumentZero: Bytes,
+  hasArgumentZero: bool,
+  detached: bool,
+  hasUser: bool,
+  user: u32,
+  hasGroup: bool,
+  group: u32,
+}
+
+impl SpawnOptions {
+  /// Returns the options with no slot set, the program path as the first argument, and the session,
+  /// user, and group of the parent. It does not allocate.
+  pub fn make() -> SpawnOptions {
+    return SpawnOptions {
+      stdio: List<Stdio>.make(),
+      argumentZero: Bytes.make(),
+      hasArgumentZero: false,
+      detached: false,
+      hasUser: false,
+      user: 0,
+      hasGroup: false,
+      group: 0,
+    }
+  }
+
+  /// Sets what the child gets in descriptor `slot`, such as 0 for standard input.
+  ///
+  /// # Details
+  /// Each slot below `slot` that is not set is [`Stdio.ignore`]. The child gets slots 0, 1, and 2,
+  /// and each higher slot that you set. Each other descriptor of the parent is closed in the child,
+  /// except as the module gotchas say for GNU/Linux.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the `Allocator` cannot supply the slot list.
+  pub effect fn setStdio(self: &mut Self, slot: usize, stdio: Stdio) -> () ! OutOfMemoryError ? &mut Allocator {
+    while self.stdio.length() <= slot {
+      run self.stdio.append(Stdio.ignore())
+    }
+    let entries = self.stdio.asMutSlice()
+    entries[slot] = stdio
+    return ()
+  }
+
+  /// Sets the first argument of the child, which programs read as their own name. By default it
+  /// is the program path.
+  ///
+  /// # Errors
+  /// `OutOfMemoryError` if the `Allocator` cannot supply the copy.
+  ///
+  /// # Gotchas
+  /// `value` must not contain NUL.
+  pub effect fn setArgumentZero(self: &mut Self, value: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    let copy = run Bytes.copy(value)
+    self.argumentZero = move copy
+    self.hasArgumentZero = true
+    return ()
+  }
+
+  /// Starts the child in a new session and process group, with no controlling terminal, when
+  /// `detached` is true. A signal for the terminal of the parent, such as an interrupt from
+  /// Control-C, then does not reach the child.
+  pub fn setDetached(self: &mut Self, detached: bool) -> () {
+    self.detached = detached
+    return ()
+  }
+
+  /// Runs the child as the user with ID `user`. The parent needs the privilege to do so.
+  pub fn setUser(self: &mut Self, user: u32) -> () {
+    self.user = user
+    self.hasUser = true
+    return ()
+  }
+
+  /// Runs the child with the group ID `group` and no supplementary groups. The parent needs the
+  /// privilege to do so.
+  pub fn setGroup(self: &mut Self, group: u32) -> () {
+    self.group = group
+    self.hasGroup = true
+    return ()
+  }
+}
+
+/// How an ended child ended, from [`Subprocess.tryWait`].
+///
+/// # Details
+/// When `signaled` is false, the child exited and `code` is its exit code from 0 to 255, and
+/// `signal` is 0. When `signaled` is true, a signal ended the child: `signal` is its number, such
+/// as 9 for `SIGKILL`, and `code` is 0.
+pub struct ExitStatus {
+  /// A signal ended the child.
+  pub signaled: bool,
+  /// The exit code, when `signaled` is false.
+  pub code: i32,
+  /// The signal number, when `signaled` is true.
+  pub signal: i32,
+}
+
+impl Copy for ExitStatus {}
+
+/// A started child: its process ID and the parent ends of its pipes.
+///
+/// # Details
+/// The value owns each pipe end until you take it with [`Subprocess.takePipe`]; dropping the value
+/// closes the pipe ends that were not taken. Dropping it does not stop the child and does not
+/// collect its status.
+///
+/// # Gotchas
+/// Call [`Subprocess.tryWait`] after the child ends, or the child stays a zombie process.
+pub struct Subprocess {
+  processId: i32,
+  pipes: List<i32>,
+}
+
+impl Drop for Subprocess {
+  fn drop(self: &mut Subprocess) -> () {
+    let pipes = self.pipes.asMutSlice()
+    let mut index: usize = 0
+    while index < pipes.length {
+      let fd = Intrinsic.replace(pipes[index], -1)
+      if fd >= 0 { let _closed = unsafe close(fd) }
+      index = index + 1
+    }
+    return ()
+  }
+}
+
+impl Subprocess {
+  /// Starts the program of `request` with `options`, and returns at once.
+  ///
+  /// # Details
+  /// The child gets the arguments and the environment of `request`, and its working directory, or
+  /// the parent's when it has none. Each descriptor slot gets what [`SpawnOptions.setStdio`] set.
+  /// The child starts with every signal unblocked and with the default action for each signal
+  /// that can be caught.
+  ///
+  /// A failure to start, such as a program that does not exist, is an error of this call; no
+  /// child is left.
+  ///
+  /// # Errors
+  /// - [`SubprocessError`] with operation `Spawn` and the native code, such as 2 (`ENOENT`) for a
+  ///   missing program or working directory, 13 (`EACCES`), 1 (`EPERM`) for a user or group change
+  ///   that is not allowed, 9 (`EBADF`) for a [`Stdio.inherit`] descriptor that is not open, or 22
+  ///   (`EINVAL`) for an empty program or a NUL byte in the request.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the copies of the request.
+  ///
+  /// # Gotchas
+  /// This function does not search `PATH`. Give the full path of the program.
+  pub effect fn spawn(request: &ProcessRequest, options: &SpawnOptions) -> Subprocess ! SubprocessError | OutOfMemoryError ? &mut Allocator {
+    let program = ChildProcess.program(request)
+    let arguments = ChildProcess.arguments(request)
+    let environment = ChildProcess.environment(request)
+    let directory = ChildProcess.workingDirectory(request)
+    let first = Bytes.asSlice(&options.argumentZero)
+    if program.length == 0 || !validString(program) || !validString(directory) || !validString(first) || !validEntries(arguments) || !validEntries(environment) {
+      fail SubprocessError { operation: SubprocessOperation.Spawn, code: 22 }
+    }
+    let programBytes = run terminated(program)
+    let directoryBytes = run terminated(directory)
+    let firstBytes = run terminated(first)
+    let argumentBytes = run Bytes.copy(arguments)
+    let environmentBytes = run Bytes.copy(environment)
+    let programPointer = Pointer.fromSlice<u8>(Bytes.asSlice(&programBytes))
+    let mut directoryPointer = nullBytes()
+    if directory.length != 0 {
+      directoryPointer = Pointer.fromSlice<u8>(Bytes.asSlice(&directoryBytes))
+    }
+    let argumentZero = if options.hasArgumentZero { Pointer.fromSlice<u8>(Bytes.asSlice(&firstBytes)) } else { programPointer }
+    let argv = run entries(&argumentBytes, argumentZero)
+    let envp = run entries(&environmentBytes, nullBytes())
+
+    // The child's slots, and the parent end of each pipe. Each source is a close-on-exec copy at
+    // or above the slot count, so moving one source into its slot never overwrites another.
+    let mut count = options.stdio.length()
+    if count < 3 { count = 3 }
+    let mut sources = run Descriptors.make(count)
+    let mut parents = run Descriptors.make(count)
+    let slots = options.stdio.asSlice()
+    let lowest = usize.toI32(count)
+    let mut slot: usize = 0
+    while slot < count {
+      let stdio = if slot < slots.length { slots[slot] } else { Stdio.ignore() }
+      if stdio.kind == 0 {
+        if slot < 3 {
+          let opened = unsafe openNull()
+          if opened < 0 { return run spawnFailure(unsafe currentError()) }
+          let source = unsafe moveAbove(opened, lowest, true)
+          if source < 0 { return run spawnFailure(-source) }
+          sources.set(slot, source)
+        }
+      } else if stdio.kind == 1 {
+        let source = unsafe moveAbove(stdio.fd, lowest, false)
+        if source < 0 { return run spawnFailure(-source) }
+        sources.set(slot, source)
+      } else {
+        let mut pair: [i32; 2] = [-1, -1]
+        let code = unsafe openPair(&mut pair)
+        if code != 0 { return run spawnFailure(code) }
+        parents.set(slot, pair[0])
+        let source = unsafe moveAbove(pair[1], lowest, true)
+        if source < 0 { return run spawnFailure(-source) }
+        sources.set(slot, source)
+      }
+      slot = slot + 1
+    }
+
+    let settings = Launch {
+      program: programPointer,
+      arguments: Pointer.fromSlice<?[*]const u8>(argv.asSlice()),
+      environment: Pointer.fromSlice<?[*]const u8>(envp.asSlice()),
+      directory: directoryPointer,
+      detached: options.detached,
+      hasUser: options.hasUser,
+      user: options.user,
+      hasGroup: options.hasGroup,
+      group: options.group,
+    }
+    let mut pid: i32 = -1
+    let code = unsafe launch(&settings, sources.values.asSlice(), &mut pid)
+    if code != 0 { return run spawnFailure(code) }
+    drop sources
+    let pipes = parents.release()
+    return Subprocess { processId: pid, pipes: move pipes }
+  }
+
+  /// Returns the process ID of the child.
+  pub fn pid(self: &Self) -> i32 { return self.processId }
+
+  /// Takes the parent end of the pipe in `slot`, or returns `none` if `slot` is not a
+  /// [`Stdio.pipe`] slot or its end was taken before.
+  ///
+  /// # Details
+  /// The end is a nonblocking, close-on-exec UNIX stream socket. You own it: close it with
+  /// [`Subprocess.closeDescriptor`] or other code.
+  pub fn takePipe(self: &mut Self, slot: usize) -> Option<i32> {
+    if slot >= self.pipes.length() { return Option<i32>.none() }
+    let pipes = self.pipes.asMutSlice()
+    let fd = Intrinsic.replace(pipes[slot], -1)
+    if fd < 0 { return Option<i32>.none() }
+    return Option<i32>.some(fd)
+  }
+
+  /// Closes the descriptor `fd` that you took with [`Subprocess.takePipe`]. A descriptor that is
+  /// not open is ignored.
+  pub fn closeDescriptor(fd: i32) -> () {
+    if fd >= 0 { let _closed = unsafe close(fd) }
+    return ()
+  }
+
+  /// Sends `signal` to the process `pid`, such as 15 for `SIGTERM`.
+  ///
+  /// # Details
+  /// A negative `pid` sends the signal to each process of the process group `-pid`, such as a
+  /// group that a [`SpawnOptions.setDetached`] child leads. Signal 0 sends nothing and checks
+  /// that the process exists.
+  ///
+  /// # Errors
+  /// [`SubprocessError`] with operation `Kill`, for example with code 3 (`ESRCH`) if no process has
+  /// the ID, 1 (`EPERM`) if the caller may not signal it, or 22 (`EINVAL`) for a signal that does
+  /// not exist.
+  pub effect fn kill(pid: i32, signal: i32) -> () ! SubprocessError {
+    if unsafe kill(pid, signal) != 0 {
+      fail SubprocessError { operation: SubprocessOperation.Kill, code: unsafe currentError() }
+    }
+    return ()
+  }
+
+  /// Collects the exit status of the child `pid` if it has ended, and returns `none` if it still
+  /// runs. It never blocks.
+  ///
+  /// # Details
+  /// After a status is returned, the process ID is free and can belong to a new process, so do not
+  /// signal or wait for `pid` again. A stopped child counts as running.
+  ///
+  /// # Errors
+  /// [`SubprocessError`] with operation `Wait`, for example with code 10 (`ECHILD`) if `pid` is not
+  /// a child of this process or its status was collected before.
+  pub effect fn tryWait(pid: i32) -> Option<ExitStatus> ! SubprocessError {
+    let mut status: i32 = 0
+    while true {
+      let result = unsafe waitpid(pid, Pointer.fromMutRef<i32>(&mut status), NO_HANG)
+      if result == 0 { return Option<ExitStatus>.none() }
+      if result > 0 { return Option<ExitStatus>.some(decodeStatus(status)) }
+      let code = unsafe currentError()
+      if code != 4 { fail SubprocessError { operation: SubprocessOperation.Wait, code: code } }
+    }
+    return Option<ExitStatus>.none()
+  }
+}
+
+// The status of `waitpid`.
+fn decodeStatus(status: i32) -> ExitStatus {
+  if (status & 127) == 0 { return ExitStatus { signaled: false, code: (status / 256) % 256, signal: 0 } }
+  return ExitStatus { signaled: true, code: 0, signal: status & 127 }
+}
+
+/// A descriptor that becomes readable when a child process ends.
+///
+/// # When to use
+/// Open one for each child that you start with [`Subprocess.spawn`], and register
+/// [`ExitWatch.descriptor`] with a reactor for reads. When it is readable, call
+/// [`ExitWatch.collect`] and drop the watch.
+///
+/// # Details
+/// The descriptor is a pidfd on Linux and a kqueue with an `EVFILT_PROC` exit filter on Darwin. It
+/// is close-on-exec. It stays readable after the child ends; do not read from it. Dropping the
+/// watch closes it.
+///
+/// # Gotchas
+/// - Open the watch before you collect the status of the child. After that, the process ID can
+///   belong to another process.
+/// - On Darwin the descriptor can become readable while the kernel still finishes the exit, so
+///   [`Subprocess.tryWait`] can still return `none` then. [`ExitWatch.collect`] waits for that
+///   short step.
+/// - On Linux, pidfds need kernel 5.3 or later.
+pub struct ExitWatch {
+  fd: i32,
+  processId: i32,
+}
+
+impl Drop for ExitWatch {
+  fn drop(self: &mut ExitWatch) -> () {
+    let fd = Intrinsic.replace(self.fd, -1)
+    if fd >= 0 { let _closed = unsafe close(fd) }
+    return ()
+  }
+}
+
+impl ExitWatch {
+  /// Opens a descriptor that becomes readable when the process `pid` ends. A child that has
+  /// already ended, but whose status was not collected, makes it readable at once.
+  ///
+  /// # Errors
+  /// [`SubprocessError`] with operation `Watch`, for example with code 3 (`ESRCH`) if no process
+  /// has the ID, or 38 (`ENOSYS`) on a Linux kernel before 5.3.
+  pub effect fn open(pid: i32) -> ExitWatch ! SubprocessError {
+    let mut fd: i32 = -1
+    let code = unsafe openExitWatch(pid, &mut fd)
+    let watch = ExitWatch { fd: fd, processId: pid }
+    if code != 0 { fail SubprocessError { operation: SubprocessOperation.Watch, code: code } }
+    return move watch
+  }
+
+  /// Returns the descriptor to register for reads. The watch keeps owning it.
+  pub fn descriptor(self: &Self) -> i32 { return self.fd }
+
+  /// Collects the exit status of the watched child after [`ExitWatch.descriptor`] is readable.
+  ///
+  /// # Details
+  /// The child has ended when the descriptor is readable. On Linux the status is ready then, and
+  /// the call returns at once. On Darwin the kernel reports the exit a moment before the status is
+  /// ready, and the call waits for the kernel to finish the exit. After it returns, the process ID
+  /// is free, as after [`Subprocess.tryWait`].
+  ///
+  /// # Errors
+  /// [`SubprocessError`] with operation `Wait`, for example with code 10 (`ECHILD`) if the status
+  /// was collected before.
+  ///
+  /// # Gotchas
+  /// - Before the descriptor is readable, the call blocks until the child ends.
+  pub effect fn collect(self: &Self) -> ExitStatus ! SubprocessError {
+    let mut status: i32 = 0
+    while true {
+      let result = unsafe waitpid(self.processId, Pointer.fromMutRef<i32>(&mut status), 0)
+      if result > 0 { return decodeStatus(status) }
+      let code = unsafe currentError()
+      if code != 4 { fail SubprocessError { operation: SubprocessOperation.Wait, code: code } }
+    }
+    return decodeStatus(status)
+  }
+}
+
+// A list of owned descriptors, -1 where a slot has none. Dropping it closes the rest.
+struct Descriptors {
+  values: List<i32>,
+}
+
+impl Drop for Descriptors {
+  fn drop(self: &mut Descriptors) -> () {
+    let values = self.values.asMutSlice()
+    let mut index: usize = 0
+    while index < values.length {
+      let fd = Intrinsic.replace(values[index], -1)
+      if fd >= 0 { let _closed = unsafe close(fd) }
+      index = index + 1
+    }
+    return ()
+  }
+}
+
+impl Descriptors {
+  effect fn make(count: usize) -> Descriptors ! OutOfMemoryError ? &mut Allocator {
+    let mut values = run List<i32>.makeWithCapacity(count)
+    let mut index: usize = 0
+    while index < count {
+      run values.append(-1)
+      index = index + 1
+    }
+    return Descriptors { values: move values }
+  }
+
+  fn set(self: &mut Self, slot: usize, fd: i32) -> () {
+    let values = self.values.asMutSlice()
+    values[slot] = fd
+    return ()
+  }
+
+  // Gives up ownership of every descriptor.
+  fn release(self: &mut Self) -> List<i32> {
+    return Intrinsic.replace(self.values, List<i32>.make())
+  }
+}
+
+effect fn spawnFailure(code: i32) -> never ! SubprocessError {
+  fail SubprocessError { operation: SubprocessOperation.Spawn, code: code }
+}
+
+fn validString(value: &[u8]) -> bool {
+  let mut index: usize = 0
+  while index < value.length {
+    if value[index] == 0 { return false }
+    index = index + 1
+  }
+  return true
+}
+
+fn validEntries(value: &[u8]) -> bool {
+  if value.length == 0 { return true }
+  return value[value.length - 1] == 0
+}
+
+effect fn terminated(value: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut result = run Bytes.copy(value)
+  let ending: [u8; 1] = [0]
+  run Bytes.append(&mut result, &ending)
+  return move result
+}
+
+fn nullBytes() -> ?[*]const u8 {
+  unsafe {
+    return Intrinsic.pointerRequalify<?*mut u8, ?[*]const u8>(Pointer.null<u8>())
+  }
+}
+
+// The C array of pointers to each NUL-terminated entry of `value`, after `first` when it is not
+// null, and ending with a null pointer.
+effect fn entries(value: &Bytes, first: ?[*]const u8) -> List<?[*]const u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut result = List<?[*]const u8>.make()
+  if Pointer.isNullMany<u8>(first) == false {
+    run List.append(&mut result, first)
+  }
+  let view = Bytes.asSlice(value)
+  let mut offset: usize = 0
+  while offset < view.length {
+    unsafe {
+      let base = Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(view))
+      let next = Pointer.assumeMany<u8>(Pointer.at<u8>(base, offset))
+      run List.append(&mut result, next)
+    }
+    while offset < view.length && view[offset] != 0 { offset = offset + 1 }
+    if offset < view.length { offset = offset + 1 }
+  }
+  run List.append(&mut result, nullBytes())
+  return move result
+}
+
+// What `launch` passes to the child, apart from the slot sources.
+struct Launch {
+  program: ?[*]const u8,
+  arguments: ?[*]const ?[*]const u8,
+  environment: ?[*]const ?[*]const u8,
+  directory: ?[*]const u8,
+  detached: bool,
+  hasUser: bool,
+  user: u32,
+  hasGroup: bool,
+  group: u32,
+}
+
+unsafe extern "C" fn close(fd: i32) -> i32
+@foreign(noCapture: .("buffer"))
+unsafe extern "C" fn read(fd: i32, buffer: ?[*]mut u8, count: usize) -> isize
+@foreign(noCapture: .("buffer"))
+unsafe extern "C" fn write(fd: i32, buffer: ?[*]const u8, count: usize) -> isize
+@foreign(noCapture: .("status"))
+unsafe extern "C" fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32
+unsafe extern "C" fn kill(pid: i32, signal: i32) -> i32
+@foreign(noCapture: .("path"))
+unsafe extern "C" fn open(path: ?[*]const u8, flags: i32, ...) -> i32
+unsafe extern "C" fn fcntl(fd: i32, command: i32, ...) -> i32
+@foreign(noCapture: .("fds"))
+unsafe extern "C" fn socketpair(domain: i32, kind: i32, protocol: i32, fds: [*]mut i32) -> i32
+unsafe extern "C" fn fork() -> i32
+unsafe extern "C" fn dup2(from: i32, to: i32) -> i32
+@foreign(noCapture: .("path"))
+unsafe extern "C" fn chdir(path: ?[*]const u8) -> i32
+// Declared as the compiler's tool sandbox declares it: one C symbol has one signature.
+unsafe extern "C" fn execve(path: ?[*]const u8, arguments: ?[*]const ?[*]const u8, environment: ?[*]const ?[*]const u8) -> i32
+unsafe extern "C" fn _exit(status: i32) -> ()
+unsafe extern "C" fn setsid() -> i32
+unsafe extern "C" fn setuid(user: u32) -> i32
+unsafe extern "C" fn setgid(group: u32) -> i32
+@foreign(noCapture: .("groups"))
+unsafe extern "C" fn setgroups(count: usize, groups: ?[*]const u32) -> i32
+// `handler` is a `sighandler_t`: 0 is `SIG_DFL`.
+unsafe extern "C" fn signal(number: i32, handler: usize) -> usize
+
+const NO_HANG: i32 = 1
+const F_SETFD: i32 = 2
+const F_GETFL: i32 = 3
+const F_SETFL: i32 = 4
+const FD_CLOEXEC: i32 = 1
+const UNIX: i32 = 1
+const STREAM: i32 = 1
+const SPAWN_SETSIGDEF: i16 = 4
+const SPAWN_SETSIGMASK: i16 = 8
+
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  unsafe extern "C" fn __error() -> *mut i32
+  unsafe fn currentError() -> i32 { unsafe { return Pointer.read<i32>(__error()) } }
+  const CLOEXEC: i32 = 16777216
+  const NONBLOCK: i32 = 4
+  const READ_WRITE: i32 = 2
+  const DUP_CLOEXEC: i32 = 67
+  const SIGNAL_STOP: i32 = 17
+  const SIGNAL_SETMASK: i32 = 3
+  const SPAWN_SETSID: i16 = 1024
+  const SPAWN_CLOEXEC_DEFAULT: i16 = 16384
+  // Darwin's `sigset_t` is one 32-bit mask.
+  extern "C" struct SignalSet { bits: u32 }
+  fn signalSet(full: bool) -> SignalSet {
+    if !full { return SignalSet { bits: 0 } }
+    // Every signal from 1 to 31 except SIGKILL (9) and SIGSTOP (17).
+    return SignalSet { bits: 2147483647 & ~(256 | 65536) }
+  }
+  // Darwin's `posix_spawn_file_actions_t` and `posix_spawnattr_t` are each one pointer.
+  extern "C" struct ActionsHandle { value: ?*mut u8 }
+  extern "C" struct AttributesHandle { value: ?*mut u8 }
+  fn emptyActions() -> ActionsHandle { return ActionsHandle { value: Pointer.null<u8>() } }
+  fn emptyAttributes() -> AttributesHandle { return AttributesHandle { value: Pointer.null<u8>() } }
+  @foreign(noCapture: ("value", "path"))
+  unsafe extern "C" fn posix_spawn_file_actions_addchdir_np(value: *mut ActionsHandle, path: ?[*]const u8) -> i32
+  unsafe extern "C" fn getdtablesize() -> i32
+} else {
+  unsafe extern "C" fn __errno_location() -> *mut i32
+  unsafe fn currentError() -> i32 { unsafe { return Pointer.read<i32>(__errno_location()) } }
+  const CLOEXEC: i32 = 524288
+  const NONBLOCK: i32 = 2048
+  const READ_WRITE: i32 = 2
+  const DUP_CLOEXEC: i32 = 1030
+  const SIGNAL_STOP: i32 = 19
+  const SIGNAL_SETMASK: i32 = 2
+  const SPAWN_SETSID: i16 = 128
+  // glibc's `sigset_t` is 1024 bits. The child resets the standard signals, 1 to 31.
+  extern "C" struct SignalSet { words: [u64; 16] }
+  fn signalSet(full: bool) -> SignalSet {
+    let mut set = SignalSet { words: [0; 16] }
+    // Every signal from 1 to 31 except SIGKILL (9) and SIGSTOP (19).
+    if full { set.words[0] = 2147483647 & ~(256 | 262144) }
+    return move set
+  }
+  // glibc's `posix_spawn_file_actions_t` is 80 bytes and its `posix_spawnattr_t` 336, on x86-64
+  // and AArch64 alike; `init` fills them in place.
+  extern "C" struct ActionsHandle { words: [u64; 10] }
+  extern "C" struct AttributesHandle { words: [u64; 42] }
+  fn emptyActions() -> ActionsHandle { return ActionsHandle { words: [0; 10] } }
+  fn emptyAttributes() -> AttributesHandle { return AttributesHandle { words: [0; 42] } }
+  unsafe extern "C" fn syscall(number: i64, ...) -> i64
+  // `close_range` and `pidfd_open` have the same numbers on x86-64 and AArch64.
+  const CLOSE_RANGE: i64 = 436
+  const CLOSE_RANGE_CLOEXEC: i64 = 4
+  const PIDFD_OPEN: i64 = 434
+  const LAST_DESCRIPTOR: i64 = 4294967295
+}
+
+@foreign(noCapture: .("set", "previous"))
+unsafe extern "C" fn sigprocmask(how: i32, set: ?*const SignalSet, previous: ?*mut SignalSet) -> i32
+
+@foreign(noCapture: .("value"))
+unsafe extern "C" fn posix_spawn_file_actions_init(value: *mut ActionsHandle) -> i32
+@foreign(noCapture: .("value"))
+unsafe extern "C" fn posix_spawn_file_actions_destroy(value: *mut ActionsHandle) -> i32
+@foreign(noCapture: .("value"))
+unsafe extern "C" fn posix_spawn_file_actions_adddup2(value: *mut ActionsHandle, from: i32, to: i32) -> i32
+@foreign(noCapture: .("value"))
+unsafe extern "C" fn posix_spawnattr_init(value: *mut AttributesHandle) -> i32
+@foreign(noCapture: .("value"))
+unsafe extern "C" fn posix_spawnattr_destroy(value: *mut AttributesHandle) -> i32
+@foreign(noCapture: .("value"))
+unsafe extern "C" fn posix_spawnattr_setflags(value: *mut AttributesHandle, flags: i16) -> i32
+@foreign(noCapture: ("value", "set"))
+unsafe extern "C" fn posix_spawnattr_setsigmask(value: *mut AttributesHandle, set: *const SignalSet) -> i32
+@foreign(noCapture: ("value", "set"))
+unsafe extern "C" fn posix_spawnattr_setsigdefault(value: *mut AttributesHandle, set: *const SignalSet) -> i32
+@foreign(noCapture: ("pid", "path", "actions", "attributes", "arguments", "environment"))
+unsafe extern "C" fn posix_spawn(
+  pid: *mut i32,
+  path: ?[*]const u8,
+  actions: *const ActionsHandle,
+  attributes: *const AttributesHandle,
+  arguments: ?[*]const ?[*]const u8,
+  environment: ?[*]const ?[*]const u8,
+) -> i32
+
+struct Actions { handle: ActionsHandle }
+impl Drop for Actions {
+  fn drop(self: &mut Actions) -> () {
+    let _ignored = unsafe posix_spawn_file_actions_destroy(Pointer.fromMutRef<ActionsHandle>(&mut self.handle))
+  }
+}
+struct Attributes { handle: AttributesHandle }
+impl Drop for Attributes {
+  fn drop(self: &mut Attributes) -> () {
+    let _ignored = unsafe posix_spawnattr_destroy(Pointer.fromMutRef<AttributesHandle>(&mut self.handle))
+  }
+}
+
+unsafe fn openNull() -> i32 {
+  return unsafe open(Pointer.fromSlice<u8>(b"/dev/null\0"), READ_WRITE | CLOEXEC)
+}
+
+// Returns a close-on-exec copy of `fd` at or above `lowest`, or the negated error code. With
+// `owned`, it closes `fd` too.
+unsafe fn moveAbove(fd: i32, lowest: i32, owned: bool) -> i32 {
+  let copy = unsafe fcntl(fd, DUP_CLOEXEC, lowest)
+  let error = if copy < 0 { unsafe currentError() } else { 0 }
+  if owned { let _closed = unsafe close(fd) }
+  if copy < 0 { return -error }
+  return copy
+}
+
+// Opens a UNIX stream socket pair. `pair[0]`, the parent end, is nonblocking and close-on-exec;
+// `pair[1]` is blocking and close-on-exec. Returns 0 or the native error code; on a failure no
+// descriptor stays open.
+unsafe fn openPair(pair: &mut [i32; 2]) -> i32 {
+  let mut kind = STREAM
+  static if Intrinsic.targetOperatingSystem() == "linux" { kind = STREAM | CLOEXEC }
+  let pointer = unsafe Intrinsic.pointerRequalify<?[*]mut i32, [*]mut i32>(Pointer.fromMutSlice<i32>(&mut pair.*))
+  if unsafe socketpair(UNIX, kind, 0, pointer) != 0 { return unsafe currentError() }
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    if unsafe fcntl(pair[0], F_SETFD, FD_CLOEXEC) < 0 || unsafe fcntl(pair[1], F_SETFD, FD_CLOEXEC) < 0 {
+      let error = unsafe currentError()
+      unsafe closePair(&mut pair.*)
+      return error
+    }
+  }
+  let flags = unsafe fcntl(pair[0], F_GETFL)
+  if flags < 0 || unsafe fcntl(pair[0], F_SETFL, flags | NONBLOCK) < 0 {
+    let error = unsafe currentError()
+    unsafe closePair(&mut pair.*)
+    return error
+  }
+  return 0
+}
+
+unsafe fn closePair(pair: &mut [i32; 2]) -> () {
+  let _first = unsafe close(pair[0])
+  let _second = unsafe close(pair[1])
+  pair[0] = -1
+  pair[1] = -1
+  return ()
+}
+
+// Starts the child and writes its ID to `pid`. Returns 0 or the native error code. `sources[i]`
+// is the descriptor for slot `i`, or -1.
+unsafe fn launch(settings: &Launch, sources: &[i32], pid: &mut i32) -> i32 {
+  let mut forked = settings.hasUser || settings.hasGroup
+  static if Intrinsic.targetOperatingSystem() == "linux" {
+    // GNU libc adds `posix_spawn_file_actions_addchdir_np` in 2.29, after Silk's glibc 2.28
+    // baseline.
+    if !Pointer.isNullMany<u8>(settings.directory) { forked = true }
+  }
+  if forked { return unsafe launchForked(settings, sources, &mut pid.*) }
+  return unsafe launchSpawned(settings, sources, &mut pid.*)
+}
+
+// Starts the child with `posix_spawn`, which never copies the parent's address space: `fork` from
+// a large process copies its page tables.
+unsafe fn launchSpawned(settings: &Launch, sources: &[i32], pid: &mut i32) -> i32 {
+  let mut actionsValue = emptyActions()
+  let initialized = unsafe posix_spawn_file_actions_init(Pointer.fromMutRef<ActionsHandle>(&mut actionsValue))
+  if initialized != 0 { return initialized }
+  let mut actions = Actions { handle: move actionsValue }
+  let mut attributesValue = emptyAttributes()
+  let prepared = unsafe posix_spawnattr_init(Pointer.fromMutRef<AttributesHandle>(&mut attributesValue))
+  if prepared != 0 { return prepared }
+  let mut attributes = Attributes { handle: move attributesValue }
+
+  let mut flags = SPAWN_SETSIGDEF | SPAWN_SETSIGMASK
+  if settings.detached { flags = flags | SPAWN_SETSID }
+  // `POSIX_SPAWN_CLOEXEC_DEFAULT` keeps every descriptor without a file action out of the child.
+  static if Intrinsic.targetOperatingSystem() == "darwin" { flags = flags | SPAWN_CLOEXEC_DEFAULT }
+  let attributePointer = Pointer.fromMutRef<AttributesHandle>(&mut attributes.handle)
+  let flagged = unsafe posix_spawnattr_setflags(attributePointer, flags)
+  if flagged != 0 { return flagged }
+  let empty = signalSet(false)
+  let masked = unsafe posix_spawnattr_setsigmask(attributePointer, Pointer.fromRef<SignalSet>(&empty))
+  if masked != 0 { return masked }
+  let full = signalSet(true)
+  let defaulted = unsafe posix_spawnattr_setsigdefault(attributePointer, Pointer.fromRef<SignalSet>(&full))
+  if defaulted != 0 { return defaulted }
+
+  let actionPointer = Pointer.fromMutRef<ActionsHandle>(&mut actions.handle)
+  let mut slot: usize = 0
+  while slot < sources.length {
+    if sources[slot] >= 0 {
+      let duplicated = unsafe posix_spawn_file_actions_adddup2(actionPointer, sources[slot], usize.toI32(slot))
+      if duplicated != 0 { return duplicated }
+    }
+    slot = slot + 1
+  }
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    if !Pointer.isNullMany<u8>(settings.directory) {
+      let changed = unsafe posix_spawn_file_actions_addchdir_np(actionPointer, settings.directory)
+      if changed != 0 { return changed }
+    }
+  }
+  return unsafe posix_spawn(
+    Pointer.fromMutRef<i32>(&mut pid.*),
+    settings.program,
+    Pointer.fromRef<ActionsHandle>(&actions.handle),
+    Pointer.fromRef<AttributesHandle>(&attributes.handle),
+    settings.arguments,
+    settings.environment,
+  )
+}
+
+// Starts the child with `fork`, for a working directory on GNU/Linux or a user or group. A start
+// failure in the child arrives through a close-on-exec pipe as its `errno`.
+unsafe fn launchForked(settings: &Launch, sources: &[i32], pid: &mut i32) -> i32 {
+  let mut report: [i32; 2] = [-1, -1]
+  let opened = unsafe openPair(&mut report)
+  if opened != 0 { return opened }
+  let child = unsafe fork()
+  if child < 0 {
+    let error = unsafe currentError()
+    unsafe closePair(&mut report)
+    return error
+  }
+  if child == 0 { unsafe startForked(settings, sources, report[1]) }
+  let _closed = unsafe close(report[1])
+  report[1] = -1
+  // The parent end is nonblocking; wait for the end of the pipe or the error code.
+  let flags = unsafe fcntl(report[0], F_GETFL)
+  let _blocking = unsafe fcntl(report[0], F_SETFL, flags & ~NONBLOCK)
+  let mut code: [u8; 4] = [0, 0, 0, 0]
+  let mut received: usize = 0
+  while received < 4 {
+    let remaining = Slice.viewMut<u8>(&mut code, received, 4 - received)
+    let count = unsafe read(report[0], Pointer.fromMutSlice<u8>(move remaining), 4 - received)
+    if count == 0 { break }
+    if count < 0 {
+      if unsafe currentError() != 4 { break }
+    } else {
+      received = received + isize.toUsize(count)
+    }
+  }
+  let _closedReader = unsafe close(report[0])
+  if received == 0 {
+    pid.* = child
+    return 0
+  }
+  let mut status: i32 = 0
+  while unsafe waitpid(child, Pointer.fromMutRef<i32>(&mut status), 0) < 0 && unsafe currentError() == 4 {}
+  if received < 4 { return 5 }
+  // `errno` values are small and positive, so its little-endian bytes add up without overflow.
+  return u8.toI32(code[0]) + u8.toI32(code[1]) * 256 + u8.toI32(code[2]) * 65536 + u8.toI32(code[3]) * 16777216
+}
+
+// The child of `launchForked`: it never returns. Between `fork` and `execve` a child of a
+// multi-threaded parent may only make async-signal-safe calls, so this allocates nothing. On a
+// failure it writes `errno` to `report` and exits with status 127.
+unsafe fn startForked(settings: &Launch, sources: &[i32], report: i32) -> () {
+  let mut failed = false
+  let mut number: i32 = 1
+  while number < 32 {
+    if number != 9 && number != SIGNAL_STOP { let _reset = unsafe signal(number, 0) }
+    number = number + 1
+  }
+  let empty = signalSet(false)
+  let _unmasked = unsafe sigprocmask(SIGNAL_SETMASK, Pointer.fromRef<SignalSet>(&empty), Pointer.null<SignalSet>())
+  if settings.detached { failed = unsafe setsid() < 0 }
+  if !failed && settings.hasGroup {
+    let none: [u32; 0] = []
+    let _cleared = unsafe setgroups(0, Pointer.fromSlice<u32>(&none))
+    failed = unsafe setgid(settings.group) != 0
+  }
+  if !failed && settings.hasUser { failed = unsafe setuid(settings.user) != 0 }
+  let mut slot: usize = 0
+  while !failed && slot < sources.length {
+    if sources[slot] >= 0 { failed = unsafe dup2(sources[slot], usize.toI32(slot)) < 0 }
+    slot = slot + 1
+  }
+  if !failed {
+    let first = usize.toI32(sources.length)
+    static if Intrinsic.targetOperatingSystem() == "linux" {
+      // Kernels before 5.11 refuse the flag; their children inherit only close-on-exec descriptors
+      // and the descriptors that the parent inherited.
+      let _marked = unsafe syscall(CLOSE_RANGE, i32.toI64(first), LAST_DESCRIPTOR, CLOSE_RANGE_CLOEXEC)
+    } else {
+      let limit = unsafe getdtablesize()
+      let mut fd = first
+      while fd < limit {
+        let _marked = unsafe fcntl(fd, F_SETFD, FD_CLOEXEC)
+        fd = fd + 1
+      }
+    }
+    if !Pointer.isNullMany<u8>(settings.directory) { failed = unsafe chdir(settings.directory) != 0 }
+  }
+  if !failed { let _ignored = unsafe execve(settings.program, settings.arguments, settings.environment) }
+  let code: [i32; 1] = [unsafe currentError()]
+  let _written = unsafe write(report, unsafe Intrinsic.pointerReinterpret<?[*]const i32, ?[*]const u8>(Pointer.fromSlice<i32>(&code)), 4)
+  unsafe _exit(127)
+}
+
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  import silk.platform.native.kqueue { ADD, FILTER_PROC, FILTER_USER, KernelEvent, NOTE_EXIT, NOTE_TRIGGER, ONESHOT, TimeSpec, kevent, kqueue }
+
+  unsafe fn submit(queue: i32, change: KernelEvent) -> i32 {
+    let changes = [change]
+    let mut none: [KernelEvent; 0] = []
+    if unsafe kevent(queue, Pointer.fromSlice<KernelEvent>(&changes), 1, Pointer.fromMutSlice<KernelEvent>(&mut none), 0, Pointer.null<TimeSpec>()) < 0 {
+      return unsafe currentError()
+    }
+    return 0
+  }
+
+  // A kqueue that becomes readable when `pid` exits. A zombie child cannot take an `EVFILT_PROC`
+  // filter, so a user event that is already triggered stands for its exit.
+  unsafe fn openExitWatch(pid: i32, fd: &mut i32) -> i32 {
+    if pid <= 0 { return 3 }
+    let queue = unsafe kqueue()
+    if queue < 0 { return unsafe currentError() }
+    fd.* = queue
+    if unsafe fcntl(queue, F_SETFD, FD_CLOEXEC) < 0 { return unsafe currentError() }
+    let watched = KernelEvent { ident: i32.toUsize(pid), filter: FILTER_PROC, flags: ADD | ONESHOT, fflags: NOTE_EXIT, data: 0, udata: 0 }
+    let code = unsafe submit(queue, watched)
+    if code != 3 { return code }
+    if unsafe kill(pid, 0) != 0 { return 3 }
+    let ended = KernelEvent { ident: 0, filter: FILTER_USER, flags: ADD, fflags: NOTE_TRIGGER, data: 0, udata: 0 }
+    return unsafe submit(queue, ended)
+  }
+} else {
+  unsafe fn openExitWatch(pid: i32, fd: &mut i32) -> i32 {
+    if pid <= 0 { return 3 }
+    // A pidfd is always close-on-exec.
+    let opened = unsafe syscall(PIDFD_OPEN, i32.toI64(pid), 0)
+    if opened < 0 { return unsafe currentError() }
+    fd.* = i64.toI32(opened)
+    return 0
+  }
+}
+}

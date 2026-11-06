@@ -161,6 +161,16 @@ fn digestLength(self: &Self) -> usize
 
 Returns 20, the SHA-1 digest length in bytes.
 
+<a id="Sha1.impl.Digest.objectIdentifier"></a>
+
+### Operation `objectIdentifier`
+
+```silk
+fn objectIdentifier(self: &Self) -> &[u8]
+```
+
+Returns the content bytes of the SHA-1 object identifier, 1.3.14.3.2.26.
+
 <a id="Sha1.impl.Digest.copy"></a>
 
 ### Operation `copy`
