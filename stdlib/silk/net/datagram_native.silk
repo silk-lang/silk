@@ -1,0 +1,1022 @@
+//! Nonblocking UDP sockets on the native system: send and receive whole datagrams.
+//!
+//! # When to use
+//! Use a [`NativeUdpSocket`] to send datagrams, such as DNS queries, from a native program. Every
+//! socket is nonblocking: a send or a receive that cannot complete now returns `WouldBlock` and does
+//! not wait. Call [`NativeUdpSocket.waitReadable`] to wait, or register
+//! [`NativeUdpSocket.rawDescriptor`] with your own event loop.
+//!
+//! # Details
+//! A socket is IPv4 or IPv6, and is closed when it is dropped. A socket made for IPv6 does not
+//! accept IPv4 traffic. After [`NativeUdpSocket.connect`], the system drops datagrams from other
+//! peers, and reports `ConnectionRefused` when the peer reports that its port is closed.
+//! [`waitAny`] waits for any of several sockets.
+//!
+//! The module supports Linux with GNU libc, macOS, and Windows on x86_64.
+//!
+//! # Examples
+//! ## Send a datagram to yourself
+//!
+//! ```silk
+//! import silk.core.effect { Effect }
+//! import silk.net.address { Endpoint, IpAddress, Ipv4Address, Port }
+//! import silk.net.datagram_native { DatagramError, Family, NativeUdpSocket, Received, Sent }
+//! import silk.system.monotonic_clock { MonotonicClock }
+//! import silk.system.monotonic_clock_native { OsMonotonicClock }
+//!
+//! effect fn program() -> i32 ! DatagramError ? &mut MonotonicClock {
+//!   let loopback = IpAddress.V4 { value: Ipv4Address.fromOctets([127, 0, 0, 1]) }
+//!   let mut socket = run NativeUdpSocket.open(Family.V4)
+//!   run NativeUdpSocket.bind(&mut socket, Endpoint.make(loopback, Port.fromU16(0)))
+//!   let local = run NativeUdpSocket.localEndpoint(&socket)
+//!   match run NativeUdpSocket.sendTo(&mut socket, b"ping", local) {
+//!     Sent.Count { count } => {
+//!       if count != 4 { return 1 }
+//!     }
+//!     Sent.WouldBlock => { return 1 }
+//!   }
+//!   let now = run MonotonicClock.now()
+//!   if !(run NativeUdpSocket.waitReadable(&socket, MonotonicClock.deadlineAfter(&now, 1000000000))) {
+//!     return 1
+//!   }
+//!   let mut buffer: [u8; 16] = [0; 16]
+//!   return match run NativeUdpSocket.receive(&mut socket, &mut buffer) {
+//!     Received.Datagram { count, from } => {
+//!       if count != 4 || buffer[0] != 112 || !Endpoint.equals(&from, &local) { return 1 }
+//!       return 0
+//!     }
+//!     Received.WouldBlock => 1
+//!   }
+//! }
+//!
+//! effect fn failed<E>(error: E) -> i32 {
+//!   drop error
+//!   return 1
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   let mut clock = OsMonotonicClock.make()
+//!   return run Effect.catchAll(program(), failed) |> Effect.provideMut<MonotonicClock>(&mut clock)
+//! }
+//! ```
+//!
+//! @category Networking
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy, Drop }
+import silk.core.result { Result }
+import silk.mem.pointer { Pointer }
+import silk.net.address { Endpoint, IpAddress, Ipv4Address, Ipv6Address, Port }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.system_clock { Instant, SystemClock }
+import silk.text.format { Debug, Format, Formatter }
+import silk.io.writer { Writer, WriterError }
+import silk.num.i16
+import silk.num.i32
+import silk.num.i64
+import silk.num.isize
+import silk.num.u16
+import silk.num.u32
+import silk.num.u8
+import silk.num.usize
+
+static if Intrinsic.targetOperatingSystem() == "windows" {
+  import silk.platform.windows.winsock { WinsockSession }
+
+  /// The type of a raw socket handle: a Windows `SOCKET`.
+  pub type RawSocket = usize
+  type SocketSession = WinsockSession
+  unsafe extern "C" fn WSAGetLastError() -> i32
+  unsafe extern "C" fn GetLastError() -> u32
+  unsafe extern "C" fn WSASocketW(
+    family: i32,
+    kind: i32,
+    protocol: i32,
+    information: ?*mut u8,
+    group: u32,
+    flags: u32,
+  ) -> usize
+  unsafe extern "C" fn closesocket(fd: usize) -> i32
+  @foreign(noCapture: .("value"))
+  unsafe extern "C" fn ioctlsocket(fd: usize, command: i32, value: *mut u32) -> i32
+  @foreign(noCapture: .("fds"))
+  unsafe extern "C" fn WSAPoll(fds: ?[*]mut PollFd, count: u32, timeout: i32) -> i32
+  @foreign(noCapture: ("buffer", "address"))
+  unsafe extern "C" fn windowsSendTo(
+    fd: usize,
+    buffer: ?[*]const u8,
+    length: i32,
+    flags: i32,
+    address: ?[*]const u8,
+    addressLength: i32,
+  ) -> i32 as "sendto"
+  @foreign(noCapture: ("buffer", "address", "addressLength"))
+  unsafe extern "C" fn windowsReceiveFrom(
+    fd: usize,
+    buffer: ?[*]mut u8,
+    length: i32,
+    flags: i32,
+    address: ?[*]mut u8,
+    addressLength: *mut i32,
+  ) -> i32 as "recvfrom"
+} else {
+  /// The type of a raw socket handle: a file descriptor.
+  pub type RawSocket = i32
+  struct SocketSession {}
+  @foreign(noCapture: ("buffer", "address"))
+  unsafe extern "C" fn unixSendTo(
+    fd: i32,
+    buffer: ?[*]const u8,
+    length: usize,
+    flags: i32,
+    address: ?[*]const u8,
+    addressLength: u32,
+  ) -> isize as "sendto"
+  @foreign(noCapture: ("buffer", "address", "addressLength"))
+  unsafe extern "C" fn unixReceiveFrom(
+    fd: i32,
+    buffer: ?[*]mut u8,
+    length: usize,
+    flags: i32,
+    address: ?[*]mut u8,
+    addressLength: *mut u32,
+  ) -> isize as "recvfrom"
+  unsafe extern "C" fn unixClose(fd: i32) -> i32 as "close"
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    unsafe extern "C" fn __error() -> *mut i32
+    unsafe extern "C" fn unixSocket(domain: i32, socketType: i32, protocol: i32) -> i32 as "socket"
+    unsafe extern "C" fn fcntl(fd: i32, command: i32, ...) -> i32
+    @foreign(noCapture: .("fds"))
+    unsafe extern "C" fn unixPoll(fds: ?[*]mut PollFd, count: u32, timeout: i32) -> i32 as "poll"
+  } else {
+    unsafe extern "C" fn __errno_location() -> *mut i32
+    unsafe extern "C" fn unixSocket(domain: i32, socketType: i32, protocol: i32) -> i32 as "socket"
+    @foreign(noCapture: .("fds"))
+    unsafe extern "C" fn unixPoll(fds: ?[*]mut PollFd, count: usize, timeout: i32) -> i32 as "poll"
+  }
+}
+
+@foreign(noCapture: .("address"))
+unsafe extern "C" fn connectSocket(
+  fd: RawSocket,
+  address: ?[*]const u8,
+  length: u32,
+) -> i32 as "connect"
+
+@foreign(noCapture: .("address"))
+unsafe extern "C" fn bindSocket(fd: RawSocket, address: ?[*]const u8, length: u32) -> i32 as "bind"
+
+@foreign(noCapture: ("address", "length"))
+unsafe extern "C" fn socketName(
+  fd: RawSocket,
+  address: ?[*]mut u8,
+  length: *mut u32,
+) -> i32 as "getsockname"
+
+@foreign(noCapture: .("value"))
+unsafe extern "C" fn setsockopt(
+  fd: RawSocket,
+  level: i32,
+  option: i32,
+  value: ?[*]const u8,
+  length: u32,
+) -> i32
+
+extern "C" struct PollFd {
+  fd: RawSocket,
+  events: i16,
+  revents: i16,
+}
+
+/// The address family of a socket.
+pub enum Family {
+  /// IPv4.
+  V4,
+  /// IPv6.
+  V6,
+}
+
+/// The system call that failed.
+pub enum DatagramOperation {
+  /// Making the socket.
+  Socket,
+  /// Making the socket nonblocking and not inherited by child processes.
+  Configure,
+  /// Binding a local address.
+  Bind,
+  /// Connecting to a peer.
+  Connect,
+  /// Sending a datagram.
+  Send,
+  /// Receiving a datagram.
+  Receive,
+  /// Reading the local address.
+  LocalAddress,
+  /// Waiting for a datagram.
+  Wait,
+}
+
+impl Debug for DatagramOperation {
+  /// Writes the name of the variant, such as `Send`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      DatagramOperation.Socket => run Format.write(&mut formatter, b"Socket")
+      DatagramOperation.Configure => run Format.write(&mut formatter, b"Configure")
+      DatagramOperation.Bind => run Format.write(&mut formatter, b"Bind")
+      DatagramOperation.Connect => run Format.write(&mut formatter, b"Connect")
+      DatagramOperation.Send => run Format.write(&mut formatter, b"Send")
+      DatagramOperation.Receive => run Format.write(&mut formatter, b"Receive")
+      DatagramOperation.LocalAddress => run Format.write(&mut formatter, b"LocalAddress")
+      DatagramOperation.Wait => run Format.write(&mut formatter, b"Wait")
+    }
+  }
+}
+
+/// The error from a UDP socket operation.
+pub union DatagramError {
+  /// The peer reported that its port is closed. On Linux and macOS only a connected socket gets
+  /// this; on Windows any socket can.
+  ConnectionRefused {
+    /// The operation that saw the report.
+    pub operation: DatagramOperation,
+  },
+  /// The local address is in use.
+  AddressInUse,
+  /// The system does not allow the operation, for example a bind to a privileged port.
+  PermissionDenied,
+  /// The network or host of the peer cannot be reached.
+  NetworkUnreachable,
+  /// The datagram is too long to send, or, on Windows, too long for the receive buffer.
+  MessageTooLarge,
+  /// The address family is not supported or not enabled.
+  FamilyUnsupported,
+  /// The system returned an address that is not IPv4 or IPv6.
+  InvalidNativeAddress,
+  /// Another system error.
+  NativeFailure {
+    /// The operation that failed.
+    pub operation: DatagramOperation,
+    /// The `errno` value, or the Winsock error code on Windows.
+    pub code: i32,
+  },
+}
+
+impl Debug for DatagramError {
+  /// Writes the name of the variant and its fields, such as `NativeFailure { ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      DatagramError.ConnectionRefused { operation } => {
+        let mut record = run Format.debugRecord("ConnectionRefused", &mut formatter)
+        run Format.debugField(&mut record, "operation", &operation, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      DatagramError.AddressInUse => run Format.write(&mut formatter, b"AddressInUse")
+      DatagramError.PermissionDenied => run Format.write(&mut formatter, b"PermissionDenied")
+      DatagramError.NetworkUnreachable => run Format.write(&mut formatter, b"NetworkUnreachable")
+      DatagramError.MessageTooLarge => run Format.write(&mut formatter, b"MessageTooLarge")
+      DatagramError.FamilyUnsupported => run Format.write(&mut formatter, b"FamilyUnsupported")
+      DatagramError.InvalidNativeAddress => run Format.write(
+        &mut formatter,
+        b"InvalidNativeAddress",
+      )
+      DatagramError.NativeFailure { operation, code } => {
+        let mut record = run Format.debugRecord("NativeFailure", &mut formatter)
+        run Format.debugField(&mut record, "operation", &operation, &mut formatter)
+        run Format.debugField(&mut record, "code", &code, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+    }
+  }
+}
+
+/// The result of a send.
+pub union Sent {
+  /// The system took the whole datagram.
+  Count {
+    /// The number of bytes sent, which is the length of the datagram.
+    pub count: usize,
+  },
+  /// The send buffer is full. Try again later.
+  WouldBlock,
+}
+
+/// The result of a receive.
+pub union Received {
+  /// One datagram is at the start of the buffer.
+  Datagram {
+    /// The number of bytes of the datagram in the buffer. A longer datagram is cut to the buffer
+    /// length on Linux and macOS.
+    pub count: usize,
+    /// The address that sent the datagram.
+    pub from: Endpoint,
+  },
+  /// No datagram is waiting. Try again later.
+  WouldBlock,
+}
+
+/// A nonblocking UDP socket. It is closed when it is dropped.
+pub struct NativeUdpSocket {
+  fd: RawSocket,
+  familyValue: Family,
+  session: Option<SocketSession>,
+}
+
+impl Copy for PollFd {}
+
+impl Drop for NativeUdpSocket {
+  fn drop(self: &mut NativeUdpSocket) -> () {
+    let fd = Intrinsic.replace(self.fd, invalidSocket())
+    if fd != invalidSocket() {
+      let _ignored = unsafe closeRaw(fd)
+    }
+  }
+}
+
+fn invalidSocket() -> RawSocket {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return usize.MAX
+  } else {
+    return -1
+  }
+}
+
+fn ipv6Family() -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return 23
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      return 30
+    } else {
+      return 10
+    }
+  }
+}
+
+fn ipv6OnlyOption() -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "linux" {
+    return 26
+  } else {
+    return 27
+  }
+}
+
+// Error codes: errno on Linux and macOS, Winsock codes on Windows.
+fn wouldBlockCode() -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return 10035
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      return 35
+    } else {
+      return 11
+    }
+  }
+}
+
+fn interruptedCode() -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return 10004
+  } else {
+    return 4
+  }
+}
+
+fn refusedCode() -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return 10054
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      return 61
+    } else {
+      return 111
+    }
+  }
+}
+
+fn addressInUseCode() -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return 10048
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      return 48
+    } else {
+      return 98
+    }
+  }
+}
+
+fn permissionCode() -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return 10013
+  } else {
+    return 13
+  }
+}
+
+fn networkUnreachableCode() -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return 10051
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      return 51
+    } else {
+      return 101
+    }
+  }
+}
+
+fn hostUnreachableCode() -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return 10065
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      return 65
+    } else {
+      return 113
+    }
+  }
+}
+
+fn messageSizeCode() -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return 10040
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      return 40
+    } else {
+      return 90
+    }
+  }
+}
+
+fn familyCode() -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return 10047
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      return 47
+    } else {
+      return 97
+    }
+  }
+}
+
+unsafe fn lastError() -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return unsafe WSAGetLastError()
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      unsafe {
+        return Pointer.read<i32>(__error())
+      }
+    } else {
+      unsafe {
+        return Pointer.read<i32>(__errno_location())
+      }
+    }
+  }
+}
+
+unsafe fn closeRaw(fd: RawSocket) -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return unsafe closesocket(fd)
+  } else {
+    return unsafe unixClose(fd)
+  }
+}
+
+fn classify(operation: DatagramOperation, code: i32) -> DatagramError {
+  if code == refusedCode() {
+    return DatagramError.ConnectionRefused { operation: operation }
+  }
+  if code == addressInUseCode() {
+    return DatagramError.AddressInUse
+  }
+  if code == permissionCode() {
+    return DatagramError.PermissionDenied
+  }
+  if code == networkUnreachableCode() || code == hostUnreachableCode() {
+    return DatagramError.NetworkUnreachable
+  }
+  if code == messageSizeCode() {
+    return DatagramError.MessageTooLarge
+  }
+  if code == familyCode() {
+    return DatagramError.FamilyUnsupported
+  }
+  return DatagramError.NativeFailure { operation: operation, code: code }
+}
+
+// A socket address in native layout, and its length.
+struct NativeAddress {
+  bytes: [u8; 28],
+  length: u32,
+}
+
+fn encodeAddress(endpoint: &Endpoint) -> NativeAddress {
+  let mut bytes: [u8; 28] = [0; 28]
+  let port = Port.value(&Endpoint.port(endpoint))
+  bytes[2] = u16.toU8(port / 256)
+  bytes[3] = u16.toU8(port % 256)
+  let mut family: i32 = 2
+  let mut length: u32 = 16
+  match Endpoint.address(endpoint) {
+    IpAddress.V4 { value } => {
+      let octets = Ipv4Address.octets(&value)
+      let mut index: usize = 0
+      while index < 4 {
+        bytes[4 + index] = octets[index]
+        index = index + 1
+      }
+    }
+    IpAddress.V6 { value } => {
+      family = ipv6Family()
+      length = 28
+      let octets = Ipv6Address.octets(&value)
+      let mut index: usize = 0
+      while index < 16 {
+        bytes[8 + index] = octets[index]
+        index = index + 1
+      }
+    }
+  }
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    bytes[0] = u32.toU8(length)
+    bytes[1] = i32.toU8(family)
+  } else {
+    bytes[0] = i32.toU8(family)
+  }
+  return NativeAddress { bytes: bytes, length: length }
+}
+
+fn decodeAddress(bytes: &[u8; 128], length: usize) -> Result<Endpoint, DatagramError> {
+  let mut family: i32 = 0
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    family = u8.toI32(bytes[1])
+  } else {
+    family = u8.toI32(bytes[0]) + u8.toI32(bytes[1]) * 256
+  }
+  let port = Port.fromU16(u8.toU16(bytes[2]) * 256 + u8.toU16(bytes[3]))
+  if family == 2 && length >= 16 {
+    let octets = [bytes[4], bytes[5], bytes[6], bytes[7]]
+    return Result<Endpoint, DatagramError>.succeed(
+      Endpoint.make(IpAddress.V4 { value: Ipv4Address.fromOctets(octets) }, port),
+    )
+  }
+  if family == ipv6Family() && length >= 24 {
+    let mut octets: [u8; 16] = [0; 16]
+    let mut index: usize = 0
+    while index < 16 {
+      octets[index] = bytes[8 + index]
+      index = index + 1
+    }
+    return Result<Endpoint, DatagramError>.succeed(
+      Endpoint.make(IpAddress.V6 { value: Ipv6Address.fromOctets(octets) }, port),
+    )
+  }
+  return Result<Endpoint, DatagramError>.failResult(DatagramError.InvalidNativeAddress)
+}
+
+effect fn session() -> SocketSession
+  ! DatagramError {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return match move WinsockSession.make() {
+      Result<WinsockSession, i32>.Success { value } => move value
+      Result<WinsockSession, i32>.Failure { error } => {
+        fail DatagramError.NativeFailure { operation: DatagramOperation.Socket, code: error }
+      }
+    }
+  } else {
+    return SocketSession {}
+  }
+}
+
+// Makes `fd` nonblocking and keeps it from child processes, where the socket call cannot.
+unsafe fn configure(fd: RawSocket) -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    let mut nonblocking: u32 = 1
+
+    // FIONBIO uses Win32's signed 32-bit long, even on Win64.
+    if unsafe ioctlsocket(fd, -2147195266, Pointer.fromMutRef(&mut nonblocking)) != 0 {
+      return unsafe WSAGetLastError()
+    }
+    return 0
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      // F_GETFL, F_SETFL with O_NONBLOCK, then F_GETFD, F_SETFD with FD_CLOEXEC.
+      let status = unsafe fcntl(fd, 3)
+      if status < 0 || unsafe fcntl(fd, 4, i32.bitOr(status, 4)) < 0 {
+        return unsafe lastError()
+      }
+      let flags = unsafe fcntl(fd, 1)
+      if flags < 0 || unsafe fcntl(fd, 2, i32.bitOr(flags, 1)) < 0 {
+        return unsafe lastError()
+      }
+      return 0
+    } else {
+      return 0
+    }
+  }
+}
+
+unsafe fn openRaw(family: i32) -> RawSocket {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    // SOCK_DGRAM, IPPROTO_UDP, WSA_FLAG_NO_HANDLE_INHERIT.
+    return unsafe WSASocketW(family, 2, 17, Pointer.null<u8>(), 0, 128)
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      return unsafe unixSocket(family, 2, 17)
+    } else {
+      // SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC.
+      return unsafe unixSocket(family, 2 + 2048 + 524288, 17)
+    }
+  }
+}
+
+// Converts `deadline` to a poll timeout in milliseconds, rounded up, at most one minute so that a far
+// deadline is checked again.
+fn pollMilliseconds(now: &Instant, deadline: &Instant) -> i32 {
+  let seconds = SystemClock.seconds(deadline) - SystemClock.seconds(now)
+  let nanoseconds = SystemClock.nanoseconds(deadline) - SystemClock.nanoseconds(now)
+  let total = seconds * 1000 + (nanoseconds + 999999) / 1000000
+  if total <= 0 {
+    return 0
+  }
+  if total > 60000 {
+    return 60000
+  }
+  return i64.toI32(total)
+}
+
+fn reached(now: &Instant, deadline: &Instant) -> bool {
+  if SystemClock.seconds(now) != SystemClock.seconds(deadline) {
+    return SystemClock.seconds(now) > SystemClock.seconds(deadline)
+  }
+  return SystemClock.nanoseconds(now) >= SystemClock.nanoseconds(deadline)
+}
+
+impl NativeUdpSocket {
+  /// Makes an unbound UDP socket for `family`. It is nonblocking, and child processes do not get it.
+  ///
+  /// # Errors
+  /// - `FamilyUnsupported` if the system has no support for `family`.
+  /// - Another `DatagramError` if the system cannot make the socket.
+  pub effect fn open(family: Family) -> NativeUdpSocket
+    ! DatagramError {
+    static if !((Intrinsic.targetOperatingSystem() == "windows"
+      && Intrinsic.targetArchitecture() == "x86_64"
+      && Intrinsic.targetAbi() == "msvc")
+      || (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetAbi() == "apple")
+      || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu")) {
+      compileError("NativeUdpSocket requires Linux with GNU libc, macOS, or Windows on x86_64")
+    }
+    let held = run session()
+    let mut native: i32 = 2
+    if family == Family.V6 {
+      native = ipv6Family()
+    }
+    let fd = unsafe openRaw(native)
+    if fd == invalidSocket() {
+      fail classify(DatagramOperation.Socket, unsafe lastError())
+    }
+    let socket = NativeUdpSocket {
+      fd: fd,
+      familyValue: family,
+      session: Option<SocketSession>.some(move held),
+    }
+    let code = unsafe configure(fd)
+    if code != 0 {
+      fail classify(DatagramOperation.Configure, code)
+    }
+    if family == Family.V6 {
+      let on: [u8; 4] = [1, 0, 0, 0]
+      if unsafe setsockopt(fd, 41, ipv6OnlyOption(), Pointer.fromSlice<u8>(&on), 4) != 0 {
+        fail classify(DatagramOperation.Configure, unsafe lastError())
+      }
+    }
+    return move socket
+  }
+
+  /// Returns the family of the socket.
+  pub fn family(self: &Self) -> Family {
+    return self.familyValue
+  }
+
+  /// Returns the raw handle of the socket, for example to register it with an event loop. The socket
+  /// still owns it: do not close it.
+  pub fn rawDescriptor(self: &Self) -> RawSocket {
+    return self.fd
+  }
+
+  /// Binds the socket to the local address `endpoint`. Port 0 lets the system choose a free port.
+  ///
+  /// # Errors
+  /// - `AddressInUse`, `PermissionDenied`, or another `DatagramError` from the system.
+  /// - `FamilyUnsupported` if `endpoint` is not of the family of the socket.
+  pub effect fn bind(self: &mut Self, endpoint: Endpoint) -> ()
+    ! DatagramError {
+    run checkFamily(&self.*, &endpoint)
+    let address = encodeAddress(&endpoint)
+    if unsafe bindSocket(self.fd, Pointer.fromSlice<u8>(&address.bytes), address.length) != 0 {
+      fail classify(DatagramOperation.Bind, unsafe lastError())
+    }
+  }
+
+  /// Connects the socket to `endpoint`: [`NativeUdpSocket.send`] then goes there, and the system
+  /// drops datagrams from other addresses.
+  ///
+  /// # Errors
+  /// - `NetworkUnreachable`, or another `DatagramError` from the system.
+  /// - `FamilyUnsupported` if `endpoint` is not of the family of the socket.
+  pub effect fn connect(self: &mut Self, endpoint: Endpoint) -> ()
+    ! DatagramError {
+    run checkFamily(&self.*, &endpoint)
+    let address = encodeAddress(&endpoint)
+    if unsafe connectSocket(self.fd, Pointer.fromSlice<u8>(&address.bytes), address.length) != 0 {
+      fail classify(DatagramOperation.Connect, unsafe lastError())
+    }
+  }
+
+  /// Returns the local address of the socket, such as the port that the system chose.
+  ///
+  /// # Errors
+  /// - A `DatagramError` from the system.
+  pub effect fn localEndpoint(self: &Self) -> Endpoint
+    ! DatagramError {
+    let mut bytes: [u8; 128] = [0; 128]
+    let mut length: u32 = 128
+    if unsafe socketName(
+      self.fd,
+      Pointer.fromMutSlice<u8>(&mut bytes),
+      Pointer.fromMutRef<u32>(&mut length),
+    )
+      != 0 {
+      fail classify(DatagramOperation.LocalAddress, unsafe lastError())
+    }
+    return match decodeAddress(&bytes, u32.toUsize(length)) {
+      Result<Endpoint, DatagramError>.Success { value } => value
+      Result<Endpoint, DatagramError>.Failure { error } => {
+        fail move error
+      }
+    }
+  }
+
+  /// Sends `datagram` to the connected peer.
+  ///
+  /// # Errors
+  /// - `ConnectionRefused` if the peer reported a closed port for an earlier datagram.
+  /// - `MessageTooLarge`, or another `DatagramError` from the system.
+  pub effect fn send(self: &mut Self, datagram: &[u8]) -> Sent
+    ! DatagramError {
+    let none: [u8; 0] = []
+    return run sendRaw(&mut self.*, datagram, &none, 0)
+  }
+
+  /// Sends `datagram` to `endpoint`.
+  ///
+  /// # Errors
+  /// - `FamilyUnsupported` if `endpoint` is not of the family of the socket.
+  /// - `MessageTooLarge`, `NetworkUnreachable`, or another `DatagramError` from the system.
+  pub effect fn sendTo(self: &mut Self, datagram: &[u8], endpoint: Endpoint) -> Sent
+    ! DatagramError {
+    run checkFamily(&self.*, &endpoint)
+    let address = encodeAddress(&endpoint)
+    return run sendRaw(&mut self.*, datagram, &address.bytes, address.length)
+  }
+
+  /// Receives one datagram into `buffer`, if one is waiting.
+  ///
+  /// # Details
+  /// A datagram longer than `buffer` is cut to its length on Linux and macOS. Use a buffer of 65535
+  /// bytes to get every datagram whole.
+  ///
+  /// # Errors
+  /// - `ConnectionRefused` if the socket is connected and the peer reported a closed port.
+  /// - `MessageTooLarge` on Windows, for a datagram longer than `buffer`.
+  /// - Another `DatagramError` from the system.
+  pub effect fn receive(self: &mut Self, buffer: &mut [u8]) -> Received
+    ! DatagramError {
+    let mut address: [u8; 128] = [0; 128]
+    let size = buffer.length
+    let data = Pointer.fromMutSlice<u8>(move buffer)
+    while true {
+      static if Intrinsic.targetOperatingSystem() == "windows" {
+        let mut length: i32 = 128
+        let mut capacity = size
+        if capacity > 2147483647 {
+          capacity = 2147483647
+        }
+        let count = unsafe windowsReceiveFrom(
+          self.fd,
+          data,
+          usize.toI32(capacity),
+          0,
+          Pointer.fromMutSlice<u8>(&mut address),
+          Pointer.fromMutRef<i32>(&mut length),
+        )
+        if count >= 0 {
+          return run received(i32.toUsize(count), &address, i32.toUsize(length))
+        }
+      } else {
+        let mut length: u32 = 128
+        let count = unsafe unixReceiveFrom(
+          self.fd,
+          data,
+          size,
+          0,
+          Pointer.fromMutSlice<u8>(&mut address),
+          Pointer.fromMutRef<u32>(&mut length),
+        )
+        if count >= 0 {
+          return run received(isize.toUsize(count), &address, u32.toUsize(length))
+        }
+      }
+      let code = unsafe lastError()
+      if code == wouldBlockCode() {
+        return Received.WouldBlock
+      }
+      if code != interruptedCode() {
+        fail classify(DatagramOperation.Receive, code)
+      }
+    }
+    return Received.WouldBlock
+  }
+
+  /// Waits until a datagram or an error is waiting on the socket, or until `deadline` on the
+  /// `MonotonicClock`. Returns `false` if the deadline passed first.
+  ///
+  /// # When to use
+  /// Use it in a program without an event loop. It blocks the thread.
+  ///
+  /// # Errors
+  /// - A `DatagramError` from the system.
+  pub effect fn waitReadable(self: &Self, deadline: Instant) -> bool
+    ! DatagramError
+    ? &mut MonotonicClock {
+    while true {
+      let now = run MonotonicClock.now()
+      if reached(&now, &deadline) {
+        return false
+      }
+      let timeout = pollMilliseconds(&now, &deadline)
+      let ready = unsafe pollReadable(self.fd, timeout)
+      if ready > 0 {
+        return true
+      }
+      if ready < 0 {
+        let code = unsafe lastError()
+        if code != interruptedCode() {
+          fail classify(DatagramOperation.Wait, code)
+        }
+      }
+    }
+    return false
+  }
+}
+
+/// Waits until a datagram or an error is waiting on any of `sockets`, or until `deadline` on the
+/// `MonotonicClock`. Returns `false` if the deadline passed first.
+///
+/// # When to use
+/// Use it in a program without an event loop, then call [`NativeUdpSocket.receive`] on each socket:
+/// a socket that has nothing returns `Received.WouldBlock`. It blocks the thread.
+///
+/// # Errors
+/// - A `DatagramError` from the system.
+/// - `OutOfMemoryError` if the `Allocator` cannot supply the list of sockets for the system.
+pub effect fn waitAny(sockets: &[NativeUdpSocket], deadline: Instant) -> bool
+  ! DatagramError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator {
+  let mut entries = run List<PollFd>.makeWithCapacity(sockets.length)
+  let mut index: usize = 0
+  while index < sockets.length {
+    run List<PollFd>.append(
+      &mut entries,
+      PollFd { fd: sockets[index].fd, events: readableEvent(), revents: 0 },
+    )
+    index = index + 1
+  }
+  while true {
+    let now = run MonotonicClock.now()
+    if reached(&now, &deadline) {
+      return false
+    }
+    let timeout = pollMilliseconds(&now, &deadline)
+    let slice = List<PollFd>.asMutSlice(&mut entries)
+    let count = slice.length
+    let ready = unsafe pollMany(Pointer.fromMutSlice<PollFd>(move slice), count, timeout)
+    if ready > 0 {
+      return true
+    }
+    if ready < 0 {
+      let code = unsafe lastError()
+      if code != interruptedCode() {
+        fail classify(DatagramOperation.Wait, code)
+      }
+    }
+  }
+  return false
+}
+
+fn readableEvent() -> i16 {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return 256
+  } else {
+    return 1
+  }
+}
+
+unsafe fn pollMany(entries: ?[*]mut PollFd, count: usize, timeout: i32) -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return unsafe WSAPoll(entries, usize.toU32(count), timeout)
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      return unsafe unixPoll(entries, usize.toU32(count), timeout)
+    } else {
+      return unsafe unixPoll(entries, count, timeout)
+    }
+  }
+}
+
+unsafe fn pollReadable(fd: RawSocket, timeout: i32) -> i32 {
+  let mut entries = [PollFd { fd: fd, events: readableEvent(), revents: 0 }]
+  return unsafe pollMany(Pointer.fromMutSlice<PollFd>(&mut entries), 1, timeout)
+}
+
+effect fn checkFamily(socket: &NativeUdpSocket, endpoint: &Endpoint) -> ()
+  ! DatagramError {
+  let isV4 = IpAddress.isV4(&Endpoint.address(endpoint))
+  if isV4 != (socket.familyValue == Family.V4) {
+    fail DatagramError.FamilyUnsupported
+  }
+}
+
+effect fn received(count: usize, address: &[u8; 128], length: usize) -> Received
+  ! DatagramError {
+  return match decodeAddress(address, length) {
+    Result<Endpoint, DatagramError>.Success { value } => Received.Datagram {
+      count: count,
+      from: value,
+    }
+    Result<Endpoint, DatagramError>.Failure { error } => {
+      fail move error
+    }
+  }
+}
+
+effect fn sendRaw(
+  socket: &mut NativeUdpSocket,
+  datagram: &[u8],
+  address: &[u8],
+  addressLength: u32,
+) -> Sent
+  ! DatagramError {
+  let mut target = Pointer.fromSlice<u8>(address)
+  if addressLength == 0 {
+    target = unsafe Intrinsic.pointerRequalify<?*mut u8, ?[*]const u8>(Pointer.null<u8>())
+  }
+  while true {
+    static if Intrinsic.targetOperatingSystem() == "windows" {
+      if datagram.length > 2147483647 {
+        fail DatagramError.MessageTooLarge
+      }
+      let count = unsafe windowsSendTo(
+        socket.fd,
+        Pointer.fromSlice<u8>(datagram),
+        usize.toI32(datagram.length),
+        0,
+        target,
+        u32.toI32(addressLength),
+      )
+      if count >= 0 {
+        return Sent.Count { count: i32.toUsize(count) }
+      }
+    } else {
+      let count = unsafe unixSendTo(
+        socket.fd,
+        Pointer.fromSlice<u8>(datagram),
+        datagram.length,
+        0,
+        target,
+        addressLength,
+      )
+      if count >= 0 {
+        return Sent.Count { count: isize.toUsize(count) }
+      }
+    }
+    let code = unsafe lastError()
+    if code == wouldBlockCode() {
+      return Sent.WouldBlock
+    }
+    if code != interruptedCode() {
+      fail classify(DatagramOperation.Send, code)
+    }
+  }
+  return Sent.WouldBlock
+}

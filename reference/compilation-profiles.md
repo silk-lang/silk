@@ -64,6 +64,10 @@ most 4 GiB, such as `max-memory = "256MiB"`. It is a final-link setting, not an 
 never enters source specialization or its identity. Another target refuses it as an unsupported
 combination. A multi-threaded wasm32 profile defaults it to 1 GiB (THREAD-009).
 
+A profile may set `codegen-units`, a whole number from 1 to 256: how many codegen units an
+optimized native executable splits into (16 when unset; `1` keeps one module). It changes no
+source-visible fact, but it is part of the profile's identity, so each count keeps its own cache.
+
 Safety and threading choices are source-visible policy requests; they never change the language's
 ownership or type rules. Logical runtime, entry and native link requests do not resolve startup
 roots, runtime packages, SDKs or sysroots. Their later resolution has separate contracts.
@@ -207,7 +211,7 @@ that names no `target` builds for the host. Profile fields are kebab-case (`code
 `max-memory`); the earlier `codeModel`, `maxMemory` and `bindings` are refused, naming the current
 spelling. A profile's `backend` (`--backend` on the command line) picks the code generator: `llvm`, the
 default, or `direct`, which writes wasm32 executables itself, without Clang. A `wasm32-wasip2`
-component still needs wasm-tools and the Preview 1 adapter, as with `llvm`. `--profile-input` JSON keeps `codeModel`, `maxMemory` and tagged `bindings`. Without a table
+component still needs wasm-tools and the Preview 1 adapter, as with `llvm`. `--profile-input` JSON keeps `codeModel`, `maxMemory`, `codegenUnits` and tagged `bindings`. Without a table
 of that name, `dev` (unoptimized, with debug information) and `release` (optimized, without it) are
 built-in profiles for the host. A complete request override replaces project profile selection. CLI `--profile`
 and LSP profile-name settings select a project profile; `--profile-input` and its LSP equivalent
@@ -268,13 +272,16 @@ object's cache key, so changing either the variable or the profile rebuilds the 
 profile describes one build of the program: regenerate it after changing the source or the
 compiler.
 
-`SILK_CODEGEN_UNITS=<n>` splits an optimized (`speed`) native executable into at most `n` codegen
-units, which Clang optimizes on separate threads; an unoptimized build already splits by module.
-The units follow the call graph: a function that only one group of functions calls joins that
-group, and every unit keeps its own internal copy of each small function and each function that
-asks to be inlined that it calls. A call that still crosses units is not inlined, so a split
-program runs a few percent slower and its code is larger. The variable is part of the build
-fingerprint; without it, or with `1`, the program stays one module.
+An optimized (`speed`) native executable of more than 4 MB of bitcode splits into 16 codegen units, which Clang optimizes on
+separate threads; an unoptimized build already splits by module. The units follow the call graph:
+a function that only one group of functions calls joins that group, up to an even share of the
+program, and every unit keeps its own internal copy of each function that asks to be inlined that
+it calls. The units compile for ThinLTO, and lld links them: the link imports what each unit calls
+from the others, inlines it, and generates each unit's code on its own thread, keeping each result
+in a cache beside the units' objects. A split program runs about 3% slower than one module. With
+no lld beside Clang (`ld.lld`, or `ld64.lld` for macOS), with a platform supply's own linker, on
+Windows, or in a build with debug information, the program stays one module.
+A profile's `codegen-units` sets the count; `1` keeps one module.
 
 ## PROFILE-008 — Generated source
 

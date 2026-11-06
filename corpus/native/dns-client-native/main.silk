@@ -1,0 +1,287 @@
+// A DNS server on a second thread answers the blocking client: over UDP, then a truncated UDP
+// answer that the client asks again over TCP. The first configured server has a closed port, so the
+// client skips it.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.concurrency.thread_native { NativeThread, SpawnError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.io.byte_duplex { ByteDuplex, ByteIoError, ReadTransfer }
+import silk.net.address { Endpoint, IpAddress, Ipv4Address, Port }
+import silk.net.datagram_native { DatagramError, Family, NativeUdpSocket, Received, Sent }
+import silk.net.dns.client_native { NativeDnsClient }
+import silk.net.dns.config { ResolverConfig }
+import silk.net.dns.message {
+  CLASS_IN,
+  Message,
+  MessageError,
+  Name,
+  Question,
+  Record,
+  RecordData,
+  TYPE_A,
+  TYPE_TXT,
+}
+import silk.net.dns.query { QueryError, Reply, Transport }
+import silk.net.socket_native {
+  Connection,
+  ListenOptions,
+  Listener,
+  NativeSocketError,
+  accept,
+  listen
+}
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.system.random { Random }
+import silk.system.random_native { OsRandom }
+import silk.system.system_clock { Instant }
+import silk.num.u16
+import silk.num.u8
+import silk.num.usize
+
+fn loopback(port: u16) -> Endpoint {
+  return Endpoint.make(
+    IpAddress.V4 { value: Ipv4Address.fromOctets([127, 0, 0, 1]) },
+    Port.fromU16(port),
+  )
+}
+
+fn name(text: string) -> Name {
+  return match Name.parse(text) {
+    Result<Name, MessageError>.Success { value } => value
+    Result<Name, MessageError>.Failure { .. } => Intrinsic.trap("name")
+  }
+}
+
+// Returns the answer to `query`: an A record for `a.example`, and for `big.example` a TXT record, or
+// over UDP only the TC bit.
+effect fn answer(query: &[u8], udp: bool) -> Bytes
+  ! MessageError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut message = run Message.parse(query)
+  message.header.response = true
+  message.header.recursionAvailable = true
+  let asked = List<Question>.get(&message.questions, 0)
+  if asked.kind == TYPE_A {
+    run List<Record>.append(
+      &mut message.answers,
+      Record {
+        name: asked.name,
+        class: CLASS_IN,
+        ttl: 30,
+        data: RecordData.A { address: Ipv4Address.fromOctets([203, 0, 113, 9]) },
+      },
+    )
+  } else if udp {
+    message.header.truncated = true
+  } else {
+    let mut strings = List<Bytes>.make()
+    run List<Bytes>.append(&mut strings, run Bytes.zeroed(200))
+    run List<Bytes>.append(&mut strings, run Bytes.copy(b"long"))
+    run List<Record>.append(
+      &mut message.answers,
+      Record {
+        name: asked.name,
+        class: CLASS_IN,
+        ttl: 30,
+        data: RecordData.Txt { strings: move strings },
+      },
+    )
+  }
+  let mut output = Bytes.make()
+  run Message.encode(&message, &mut output)
+  return move output
+}
+
+effect fn serveUdp(socket: &mut NativeUdpSocket) -> ()
+  ! DatagramError | MessageError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock {
+  let now = run MonotonicClock.now()
+  if !(run NativeUdpSocket.waitReadable(
+    &socket.*,
+    MonotonicClock.deadlineAfter(&now, 10000000000),
+  )) {
+    fail DatagramError.InvalidNativeAddress
+  }
+  let mut buffer = run Bytes.zeroed(512)
+  match run NativeUdpSocket.receive(&mut socket.*, Bytes.asMutSlice(&mut buffer)) {
+    Received.WouldBlock => {
+      fail DatagramError.InvalidNativeAddress
+    }
+    Received.Datagram { count, from } => {
+      let reply = run answer(Slice.view<u8>(Bytes.asSlice(&buffer), 0, count), true)
+      match run NativeUdpSocket.sendTo(&mut socket.*, Bytes.asSlice(&reply), from) {
+        Sent.Count { .. } => {}
+        Sent.WouldBlock => {
+          fail DatagramError.InvalidNativeAddress
+        }
+      }
+    }
+  }
+}
+
+effect fn readAll(connection: &mut Connection, output: &mut Bytes) -> ()
+  ! ByteIoError
+  ? &mut MonotonicClock {
+  let mut filled: usize = 0
+  let total = Bytes.length(&output.*)
+  while filled < total {
+    let transfer = run ByteDuplex.readSome(
+      Slice.viewMut<u8>(Bytes.asMutSlice(&mut output.*), filled, total - filled),
+      Option<Instant>.none(),
+    )
+      |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+    match move transfer {
+      ReadTransfer.Data { count } => {
+        filled = filled + count
+      }
+      ReadTransfer.End => {
+        return ()
+      }
+    }
+  }
+}
+
+effect fn serveTcp(listener: &mut Listener) -> ()
+  ! NativeSocketError | ByteIoError | MessageError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock {
+  let accepted = run accept(&mut listener.*, Option<Instant>.none())
+  let mut connection = accepted.intoConnection()
+  let mut prefix = run Bytes.zeroed(2)
+  run readAll(&mut connection, &mut prefix)
+  let length = u8.toUsize(Bytes.asSlice(&prefix)[0]) * 256 + u8.toUsize(Bytes.asSlice(&prefix)[1])
+  let mut query = run Bytes.zeroed(length)
+  run readAll(&mut connection, &mut query)
+  let reply = run answer(Bytes.asSlice(&query), false)
+  let size = Bytes.length(&reply)
+  let mut framed = Bytes.make()
+  let head = [usize.toU8(size / 256), usize.toU8(size % 256)]
+  run Bytes.append(&mut framed, &head)
+  run Bytes.append(&mut framed, Bytes.asSlice(&reply))
+  let mut written: usize = 0
+  while written < Bytes.length(&framed) {
+    written = written
+      + run ByteDuplex.writeSome(
+        Slice.view<u8>(Bytes.asSlice(&framed), written, Bytes.length(&framed) - written),
+        Option<Instant>.none(),
+      )
+        |> Effect.provideMut<ByteDuplex>(&mut connection)
+  }
+  run Connection.close(&mut connection)
+}
+
+effect fn serve(socket: NativeUdpSocket, listener: Listener) -> i32
+  ! DatagramError | NativeSocketError | ByteIoError | MessageError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock {
+  let mut udp = move socket
+  let mut tcp = move listener
+  run serveUdp(&mut udp)
+  run serveUdp(&mut udp)
+  run serveTcp(&mut tcp)
+  return 0
+}
+
+effect fn serverFailed<E>(error: E) -> i32 {
+  drop error
+  return 1
+}
+
+effect fn ask(client: &mut NativeDnsClient, text: string, kind: u16) -> Reply
+  ! QueryError | MessageError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock | &mut Random {
+  return run NativeDnsClient.query(
+    &mut client.*,
+    Question { name: name(text), kind: kind, class: CLASS_IN },
+  )
+}
+
+effect fn program() -> i32
+  ! SpawnError | DatagramError | NativeSocketError | QueryError | MessageError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock | &mut Random {
+  let mut socket = run NativeUdpSocket.open(Family.V4)
+  run NativeUdpSocket.bind(&mut socket, loopback(0))
+  let port = Port.value(&Endpoint.port(&run NativeUdpSocket.localEndpoint(&socket)))
+  let listener = run listen(loopback(port), ListenOptions.defaults())
+
+  // A bound socket that never answers gives a port that nothing serves after it closes.
+  let mut closed = run NativeUdpSocket.open(Family.V4)
+  run NativeUdpSocket.bind(&mut closed, loopback(0))
+  let deadPort = Port.value(&Endpoint.port(&run NativeUdpSocket.localEndpoint(&closed)))
+  drop closed
+
+  let server = run NativeThread.spawn(
+    fn() -> i32 {
+      let mut allocator = Allocator.systemAllocatorProvider()
+      let mut clock = OsMonotonicClock.make()
+      return run Effect.catchAll(serve(move socket, move listener), serverFailed)
+        |> Effect.provideMut<Allocator>(&mut allocator)
+        |> Effect.provideMut<MonotonicClock>(&mut clock)
+    },
+  )
+
+  let mut servers = List<Endpoint>.make()
+  run List<Endpoint>.append(&mut servers, loopback(deadPort))
+  run List<Endpoint>.append(&mut servers, loopback(port))
+  let mut config = ResolverConfig.make(move servers)
+  config.timeout = 3000000000
+  config.attempts = 1
+  let mut client = NativeDnsClient.make(move config)
+
+  let first = run ask(&mut client, "a.example", TYPE_A)
+  if first.server != 1 || first.transport != Transport.Udp {
+    return 2
+  }
+  let answers = List<Record>.asSlice(&first.message.answers)
+  if answers.length != 1 {
+    return 3
+  }
+  match &answers[0].data {
+    RecordData.A { address } => {
+      if !Ipv4Address.equals(&address, &Ipv4Address.fromOctets([203, 0, 113, 9])) {
+        return 4
+      }
+    }
+    _ => {
+      return 4
+    }
+  }
+
+  let second = run ask(&mut client, "big.example", TYPE_TXT)
+  if second.server != 1 || second.transport != Transport.Tcp {
+    return 5
+  }
+  match &List<Record>.asSlice(&second.message.answers)[0].data {
+    RecordData.Txt { strings } => {
+      let values = List<Bytes>.asSlice(&strings)
+      if values.length != 2 || Bytes.length(&values[0]) != 200 {
+        return 6
+      }
+    }
+    _ => {
+      return 6
+    }
+  }
+  if server.join() != 0 {
+    return 7
+  }
+  return 42
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  return 1
+}
+
+pub fn main() -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut clock = OsMonotonicClock.make()
+  let mut random = OsRandom.make()
+  return run Effect.catchAll(program(), failed)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+    |> Effect.provideMut<Random>(&mut random)
+}

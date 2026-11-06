@@ -289,6 +289,21 @@ pub fn lessThan(self: &Natural, other: &Natural) -> bool
 
 Returns whether this value is less than `other`. The time depends only on the lengths.
 
+<a id="Natural.impl.remainder"></a>
+
+### Method `remainder`
+
+```silk
+pub fn remainder(self: &Natural, divisor: &Natural) -> Result<Natural, ModularError>
+```
+
+Returns the value modulo `divisor`, with the length of `divisor`.
+
+The divisor can be even. The time depends only on the two lengths.
+
+#### Errors
+- `InvalidModulus` if `divisor` is 0.
+
 <a id="Natural.impl.resize"></a>
 
 ### Method `resize`

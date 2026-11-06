@@ -1,4 +1,7 @@
-"""Regenerate compression corpus vectors with Python's independent liblzma/zlib codecs."""
+"""Regenerate compression corpus vectors with Python's independent liblzma, zlib, and Brotli codecs.
+
+The Brotli cases need the `brotli` package (the reference encoder and decoder).
+"""
 import json
 import lzma
 from pathlib import Path
@@ -258,7 +261,290 @@ def xz_cases():
     write_case('xz-decode', source + FOOTER)
 
 
+class BitWriter:
+    """Writes Brotli bit fields, least significant bit first."""
+
+    def __init__(self):
+        self.value = 0
+        self.bits = 0
+
+    def put(self, value, width):
+        self.value |= value << self.bits
+        self.bits += width
+
+    def align(self):
+        self.bits = (self.bits + 7) // 8 * 8
+
+    def raw(self, data):
+        self.align()
+        for byte in data:
+            self.put(byte, 8)
+
+    def data(self):
+        return self.value.to_bytes((self.bits + 7) // 8, 'little')
+
+
+def fnv(data):
+    value = 0x811c9dc5
+    for byte in data:
+        value = ((value ^ byte) * 0x01000193) & 0xffffffff
+    return value
+
+
+# Corrupted reference streams, one for each failure reason, found by flipping bits of the
+# reference encoder's output for BROTLI_SHORT. The reference decoder rejects each one.
+BROTLI_CORRUPT = [
+    ('PrefixCode', '1b0c0100c4dc46a9de4259090b796016e483c1810b1fd4e480fd6faded35c8038c24434d6f78ec39461e24a929ef1787c88b537911472f787968e4ff50d81404466b88120d298ecb26778cee2d8bb5d30eabfe1be283733103'),
+    ('ContextMap', '1b0c0100ccc86da93e9da30497503647d50d0e9c4b03cc9e687ae59d16c4c14dd659071dc566b85b2db0f316745f9e197279d15fd37a60b9c5cec0f8d091fc1ff8a22c0418de8c02200499f85c01b410d8fb728e1d4e719ce81d38964958273f900e332b6a0f95db8d31'),
+    ('BlockLength', '1b0c0100c4dc46a9de4259090b796016e483c1810a1fd4e480fd6faded35c8038c24434d6f78ec39461e24a929ef1707c88b537911472f787968e4ff50d81404466b88120d298ecb26778cee2d8bb5d30eabfe1be283733103'),
+    ('Distance', '1b0c0100c4dc46a9de4259090b796016e483c1810a1fd4e480fd6faded35c8038c24434d6f78ec31461e24a929ef1787c88b537911472f787968e4ff50d81404466b88120d298ecb26778cee2d8bb5d30eabfe1be283733103'),
+    ('Dictionary', '1b0c0100c4dc46a9de4259090b796016e483c1810a1fd4e480fd6faded35c8038c24434d6f78ec39461e24a929ef1787c88b577911472f787968e4ff50d81404466b88120d298ecb26778cee2d8bb5d30eabfe1be283733103'),
+]
+
+BROTLI_SHORT = (b'The quick brown fox jumps over the lazy dog. ' * 3
+                + b'Hello World, this is a Brotli test with some Words and MORE words! ' * 2)
+
+
+def brotli_cases():
+    import brotli
+    import random
+
+    rng = random.Random(7932)
+    words = ['the', 'of', 'and', 'Brotli', 'window', 'Hello', 'WORLD', 'data', 'stream', 'context',
+             'été', 'über', 'дом', '日本', 'compression', 'Dictionary', 'TRANSFORM']
+    text = ' '.join(rng.choice(words) for _ in range(700)).encode()[:4000]
+    binary = bytes((index * index + index // 7) % 251 for index in range(3000))
+    noise = bytes(rng.randrange(256) for _ in range(2000))
+    raw = bytes(rng.randrange(256) for _ in range(300))
+    streams = [
+        ('text, quality 11, text mode', text, brotli.compress(text, quality=11, lgwin=22, mode=brotli.MODE_TEXT)),
+        ('text, quality 5', text, brotli.compress(text, quality=5, lgwin=18)),
+        ('binary, quality 9, font mode', binary, brotli.compress(binary, quality=9, lgwin=16, mode=brotli.MODE_FONT)),
+        ('repeats, quality 1', b'abc' * 700, brotli.compress(b'abc' * 700, quality=1)),
+        ('noise twice, quality 6', noise + noise, brotli.compress(noise + noise, quality=6, lgwin=12)),
+        ('stored, quality 0', raw, brotli.compress(raw, quality=0)),
+        ('empty', b'', brotli.compress(b'')),
+    ]
+    metadata = BitWriter()
+    metadata.put(0, 1)  # WBITS 16
+    metadata.put(0, 1)  # not last
+    metadata.put(3, 2)  # metadata
+    metadata.put(0, 1)  # reserved
+    metadata.put(1, 2)  # one length byte
+    metadata.put(2, 8)  # MSKIPLEN - 1
+    metadata.raw(b'xyz')
+    metadata.put(0, 1)  # not last
+    metadata.put(0, 2)  # 4 nibbles
+    metadata.put(4, 16)  # MLEN - 1
+    metadata.put(1, 1)  # uncompressed
+    metadata.raw(b'hello')
+    metadata.put(1, 1)  # last
+    metadata.put(1, 1)  # empty
+    stored = metadata.data()
+    assert brotli.decompress(stored) == b'hello'
+    streams.append(('metadata and uncompressed', b'hello', stored))
+    for _, plain, encoded in streams:
+        assert brotli.decompress(encoded) == plain
+
+    exuberant = BitWriter()
+    exuberant.put(0, 1)
+    exuberant.put(0, 1)
+    exuberant.put(1, 2)  # 5 nibbles
+    exuberant.put(5, 20)  # the last nibble is zero
+    exuberant.put(0, 1)
+    reserved = BitWriter()
+    reserved.put(0, 1)
+    reserved.put(0, 1)
+    reserved.put(3, 2)
+    reserved.put(1, 1)  # reserved bit set
+    reserved.put(0, 2)
+    padding = bytearray(brotli.compress(b'hi', quality=0))
+    padding[-1] |= 0x80
+    hand = [('Header', exuberant.data()), ('Header', reserved.data()), ('Header', bytes(padding)),
+            ('WindowBits', b'\x11'), ('Truncated', streams[0][2][:-3])]
+    corrupt = hand + [(reason, bytes.fromhex(value)) for reason, value in BROTLI_CORRUPT]
+    for _, value in corrupt:
+        try:
+            brotli.decompress(value)
+        except brotli.error:
+            continue
+        raise SystemExit('the reference decoder accepts a corrupt Brotli case')
+
+    source = """// Generated by compiler/fixtures/compression/generate.py from the reference Brotli encoder.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.compress.brotli { Brotli, BrotliError, BrotliLimits, BrotliProgress, BrotliReason, BrotliStatus }
+import silk.collections.list { List }
+import silk.core.result { Result }
+import silk.collections.slice { Slice }
+import silk.concurrency.thread { Transferable }
+import silk.num.u8
+import silk.num.u32
+
+// Compiles only if a decoder can move to another thread.
+fn transferable<T: Transferable>(value: &T) -> bool {
+  return true
+}
+
+fn hash(data: &[u8]) -> u32 {
+  let mut value: u32 = 2166136261
+  let mut index: usize = 0
+  while index < data.length {
+    value = u32.wrappingMultiply(value ^ u8.toU32(data[index]), 16777619)
+    index = index + 1
+  }
+  return value
+}
+
+// Decodes `input` in steps of `inputStep` input and `outputStep` output bytes, twice with one
+// decoder, and checks the size and hash of the output and that all input is consumed. The 64 KiB
+// window is smaller than most streams declare, and larger than their data.
+effect fn decodes(input: &[u8], size: usize, expected: u32, inputStep: usize, outputStep: usize) -> bool
+  ! OutOfMemoryError | BrotliError
+  ? &mut Allocator {
+  let mut limits = BrotliLimits.make()
+  limits.windowBytes = 65536
+  let mut decoder = run Brotli.make(move limits)
+  let mut output = List<u8>.make()
+  run List<u8>.appendRepeated(&mut output, 165, size + 1)
+  let mut round = 0
+  while round < 2 {
+    Brotli.reset(&mut decoder)
+    let mut consumed: usize = 0
+    let mut written: usize = 0
+    let mut steps: usize = 0
+    let mut finished = false
+    while !finished {
+      steps = steps + 1
+      if steps > 100000 {
+        return false
+      }
+      let mut take = input.length - consumed
+      if take > inputStep {
+        take = inputStep
+      }
+      let mut room = size + 1 - written
+      if room > outputStep {
+        room = outputStep
+      }
+      let last = consumed + take == input.length
+      let slots = List<u8>.asMutSlice(&mut output)
+      let result = Brotli.step(
+        &mut decoder,
+        Slice.view<u8>(input, consumed, take),
+        Slice.viewMut<u8>(move slots, written, room),
+        last,
+      )
+      match move result {
+        Result<BrotliProgress, BrotliError>.Success { value } => {
+          consumed = consumed + value.consumed
+          written = written + value.written
+          finished = value.status == BrotliStatus.Finished
+        }
+        Result<BrotliProgress, BrotliError>.Failure { .. } => {
+          return false
+        }
+      }
+    }
+    if consumed != input.length || written != size || List<u8>.get(&output, size) != 165 {
+      return false
+    }
+    if hash(Slice.view<u8>(List<u8>.asSlice(&output), 0, size)) != expected {
+      return false
+    }
+    round = round + 1
+  }
+  return true
+}
+
+// Decodes `input` in one step and checks that it fails with `reason`.
+effect fn rejects(input: &[u8], limits: BrotliLimits, reason: BrotliReason) -> bool
+  ! OutOfMemoryError | BrotliError
+  ? &mut Allocator {
+  let mut decoder = run Brotli.make(move limits)
+  let mut output: [u8; 8192] = [0; 8192]
+  return match move Brotli.step(&mut decoder, input, &mut output, true) {
+    Result<BrotliProgress, BrotliError>.Success { .. } => false
+    Result<BrotliProgress, BrotliError>.Failure { error } => error.reason == reason
+      && error.consumed <= input.length
+      && error.written <= output.length
+  }
+}
+
+effect fn program() -> i32 ! OutOfMemoryError | BrotliError ? &mut Allocator {
+"""
+    code = 1
+    functions = ''
+    for index, (name, plain, encoded) in enumerate(streams):
+        functions += f'// {name}\nfn stream{index}() -> &\'static [u8] {{\n  return {literal(encoded)}\n}}\n\n'
+        for inputStep, outputStep in [(1 << 30, 1 << 30), (1, 1), (7, 13)]:
+            source += (f'  if !run decodes(stream{index}(), {len(plain)}, {fnv(plain)}, {inputStep}, '
+                       f'{outputStep}) {{ return {code} }}\n')
+            code += 1
+    source = source.replace('effect fn program()', functions + 'effect fn program()')
+    for reason, value in corrupt:
+        source += f'  if !run rejects({literal(value)}, BrotliLimits.make(), BrotliReason.{reason}) {{ return {code} }}\n'
+        code += 1
+    text_stream = 'stream0()'
+    noise_stream = 'stream4()'
+    source += f"""  let mut input = BrotliLimits.make()
+  input.inputBytes = 10
+  if !run rejects({text_stream}, move input, BrotliReason.InputLimit) {{ return {code} }}
+  let mut output = BrotliLimits.make()
+  output.outputBytes = 100
+  if !run rejects({text_stream}, move output, BrotliReason.OutputLimit) {{ return {code + 1} }}
+  let mut window = BrotliLimits.make()
+  window.windowBytes = 1024
+  if !run rejects({noise_stream}, move window, BrotliReason.WindowLimit) {{ return {code + 2} }}
+  let mut small = BrotliLimits.make()
+  small.workspaceBytes = 1000
+  let made = run Effect.result(Brotli.make(move small))
+  let refused = match move made {{
+    Result<Brotli, OutOfMemoryError | BrotliError>.Success {{ .. }} => false
+    Result<Brotli, OutOfMemoryError | BrotliError>.Failure {{ error }} => match move error {{
+      BrotliError failure => failure.reason == BrotliReason.WorkspaceLimit
+      OutOfMemoryError _failure => false
+    }}
+  }}
+  if !refused {{ return {code + 3} }}
+  // The bytes after the stream stay unconsumed.
+  let trailing = {literal(streams[3][2] + b'tail')}
+  let mut decoder = run Brotli.make(BrotliLimits.make())
+  if !transferable(&decoder) {{ return {code + 6} }}
+  let mut buffer: [u8; 4096] = [0; 4096]
+  let stopped = match move Brotli.step(&mut decoder, &trailing, &mut buffer, true) {{
+    Result<BrotliProgress, BrotliError>.Success {{ value }} => value.status == BrotliStatus.Finished
+      && value.consumed == {len(streams[3][2])}
+      && value.written == 2100
+    Result<BrotliProgress, BrotliError>.Failure {{ .. }} => false
+  }}
+  if !stopped {{ return {code + 4} }}
+  // A call after the final input must give exactly the rest of it.
+  Brotli.reset(&mut decoder)
+  let head = Slice.view<u8>(&trailing, 0, 0)
+  let mut tiny: [u8; 1] = [0]
+  let first = match move Brotli.step(&mut decoder, &trailing, &mut tiny, true) {{
+    Result<BrotliProgress, BrotliError>.Success {{ value }} => value.status == BrotliStatus.NeedOutput
+    Result<BrotliProgress, BrotliError>.Failure {{ .. }} => false
+  }}
+  let changed = match move Brotli.step(&mut decoder, head, &mut buffer, true) {{
+    Result<BrotliProgress, BrotliError>.Success {{ .. }} => false
+    Result<BrotliProgress, BrotliError>.Failure {{ error }} => error.reason == BrotliReason.InvalidState
+  }}
+  if !first || !changed {{ return {code + 5} }}
+  return 42
+}}
+
+pub effect fn main() -> i32 ! OutOfMemoryError | BrotliError {{
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run program() |> Effect.provideMut<Allocator>(&mut allocator)
+}}
+"""
+    write_case('brotli-decode', source)
+
+
 if __name__ == '__main__':
     lzma_cases()
     lzma2_cases()
     xz_cases()
+    brotli_cases()

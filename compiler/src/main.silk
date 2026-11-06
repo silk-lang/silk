@@ -53,7 +53,7 @@ import semantic.ModuleId {InvalidModulePath, ModuleId}
 import semantic.PackageGraph {PackageGraph}
 import semantic.Query {Cycle}
 import semantic.TypedBody {uncheckedReasonCount, uncheckedReasonName}
-import driver.ModuleSources as ModuleSourceFiles {InvalidBuildComposition, InvalidSourceRoot, MissingManifest, MissingStandardLibrary, ModuleSources}
+import driver.ModuleSources as ModuleSourceFiles {InvalidBuildComposition, InvalidSourceRoot, MissingManifest, MissingStandardLibrary, ModuleSources, SourceSnapshot}
 import driver.GitCheckouts
 import driver.Packages as PackageSources {InvalidDependency}
 import driver.HeapRelease
@@ -1197,7 +1197,7 @@ effect fn readableNames(plan: &EmissionPlan) -> FunctionNames ! OutOfMemoryError
 
 // Compiles as `compileIr` does, with the intermediate files in `scratch` under the output's name,
 // which Clang records in the object.
-effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: Option<&EmissionPlan>, sources: &ModuleSources, functionNames: &FunctionNames, units: &[CodegenUnit], packs: &[BuildRecord.PackBody], output: &Path, form: Form, stage: Stage, optimization: &[u8], debug: bool,
+effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: Option<&EmissionPlan>, sources: &ModuleSources, functionNames: &FunctionNames, requestedUnits: &[CodegenUnit], packs: &[BuildRecord.PackBody], output: &Path, form: Form, stage: Stage, optimization: &[u8], debug: bool,
   relocation: &[u8], libc: &[u8], profileFlags: &[Bytes], target: &Target, supply: &Option<Supply>, linkInputs: &[NativeLinkInput],
   functionOrder: Option<&Path>, selectedClang: &Option<Bytes>, world: &WasiTools.World, started: bool, printed: bool, progress: &mut Progress) -> i32
 ! FileError | ProcessError | HostInputError | InvalidNativeLinkInput | OutOfMemoryError | WriterError
@@ -1357,6 +1357,8 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
   let orderPath = run Path.fromBytes(Bytes.asSlice(&orderBytes))
   // The flags that decide the code Clang writes, which each codegen unit's compile shares.
   let mut common = List<Bytes>.make()
+  // The `-mllvm` options among them, which a ThinLTO link passes on to the code generator it runs.
+  let mut backendOptions = List<Bytes>.make()
   // Split codegen units are compiled by separate Clang requests before the final link.
   // The IR names no triple, so every native link and its units state the target to Clang; a
   // cross link would otherwise build for Clang's default triple.
@@ -1375,6 +1377,7 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
     // and gave 12% fewer branch mispredicts and 1-2% fewer instructions.
     run List<Bytes>.append(&mut common, run Bytes.copy(b"-mllvm"))
     run List<Bytes>.append(&mut common, run Bytes.copy(b"-enable-tail-merge=false"))
+    run List<Bytes>.append(&mut backendOptions, run Bytes.copy(b"-enable-tail-merge=false"))
     // Runtime unrolling turns every loop with an unknown trip count into a four-way body
     // plus a remainder loop. Loops that run a handful of times, such as filling a call
     // frame's few locals, then pay the remainder's setup on every entry: silkjs ran 2-2.5%
@@ -1382,6 +1385,7 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
     // nothing.
     run List<Bytes>.append(&mut common, run Bytes.copy(b"-mllvm"))
     run List<Bytes>.append(&mut common, run Bytes.copy(b"-unroll-runtime=false"))
+    run List<Bytes>.append(&mut backendOptions, run Bytes.copy(b"-unroll-runtime=false"))
   } else if same(optimization, b"size") {
     // `size` optimizes as hard as Clang can for small code, such as a wasm module to download.
     run List<Bytes>.append(&mut common, run Bytes.copy(b"-Oz"))
@@ -1449,7 +1453,12 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
     if let Option<Path>.Some {..} = &selected.linker { supplied = true }
   }
   let crossDarwin = darwin && (Target.id(target) != Target.id(&hostTarget()) || stubbed)
-  let lld = linked && !freestanding && !supplied && (same(Target.operatingSystem(target), b"linux") || crossDarwin)
+  // An optimized executable's codegen units compile for ThinLTO, which lld links: a native macOS
+  // one then links with the `ld64.lld` installed beside Clang too. Without lld the whole module
+  // compiles as one instead, since units without the link's cross-unit inlining run much slower.
+  let thinWanted = requestedUnits.length > usize.ZERO && same(optimization, b"speed") && linked && !freestanding && !windows
+    && !supplied
+  let lld = linked && !freestanding && !supplied && (same(Target.operatingSystem(target), b"linux") || crossDarwin || darwin && thinWanted)
   let mut lldName: &[u8] = b"/ld.lld"
   if darwin { lldName = b"/ld64.lld" }
   // Clang's version is asked once: it stamps a split build's objects, and it names where Clang is
@@ -1457,7 +1466,7 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
   let mut probed = Option<Bytes>.none()
   // `[native].sources` compile only for a final output, which links or archives them.
   let compilesSources = final && NativeLinkInputs.hasSources(linkInputs)
-  if units.length > usize.ZERO || lld || compilesSources {
+  if requestedUnits.length > usize.ZERO || lld || compilesSources {
     match move run probeClang(&clang, origin, minimumClang, &mut progress.*) {
       ClangVersion.Answered {output: answer} => { probed = Option<Bytes>.some(move answer) }
       ClangVersion.Failed {status} => { return status }
@@ -1465,6 +1474,7 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
   }
   // The options that select the program's linker, with which the glibc stub libraries link too.
   let mut stubLinker = List<Bytes>.make()
+  let mut thinLinked = false
   if lld {
     let mut installed = false
     if let Option<Bytes>.Some {value: answer} = &probed {
@@ -1482,7 +1492,46 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
     if ordered && !installed || crossDarwin || glibcStubbed && crossTarget && !installed {
       run ChildProcess.addArgument(&mut process, "-fuse-ld=lld")
       run List<Bytes>.append(&mut stubLinker, run Bytes.copy(b"-fuse-ld=lld"))
+      installed = true
     }
+    thinLinked = thinWanted && installed
+  }
+  let noUnits = List<CodegenUnit>.make()
+  let mut units = requestedUnits
+  if thinWanted && !thinLinked { units = List<CodegenUnit>.asSlice(&noUnits) }
+  // A ThinLTO link optimizes and generates each unit's code again, on as many threads as the host
+  // has, after importing what the unit calls from the others. Its cache keeps each unit's result
+  // for the same unit and imports, so an edit regenerates only the units it reaches.
+  let mut unitFlags = List<Bytes>.make()
+  flag = usize.ZERO
+  while flag < shared.length {
+    run List<Bytes>.append(&mut unitFlags, run Bytes.copy(Bytes.asSlice(&shared[flag])))
+    flag = flag + usize.ONE
+  }
+  if thinLinked {
+    run List<Bytes>.append(&mut unitFlags, run Bytes.copy(b"-flto=thin"))
+    run ChildProcess.addArgument(&mut process, "-flto=thin")
+    let options = List<Bytes>.asSlice(&backendOptions)
+    let mut option = usize.ZERO
+    while option < options.length {
+      let mut forwarded = run Bytes.copy(b"-Wl,-mllvm,")
+      run Bytes.append(&mut forwarded, Bytes.asSlice(&options[option]))
+      run ChildProcess.addArgumentBytes(&mut process, Bytes.asSlice(&forwarded))
+      option = option + usize.ONE
+    }
+    let unitCache = run CodegenCache.directoryFor(output)
+    let mut cached = Bytes.make()
+    if darwin {
+      cached = run Bytes.copy(b"-Wl,-cache_path_lto,")
+    } else {
+      cached = run Bytes.copy(b"-Wl,--thinlto-cache-dir=")
+    }
+    let cacheRoot = run NativeToolchain.pathBytes(&unitCache)
+    run Bytes.append(&mut cached, Bytes.asSlice(&cacheRoot))
+    run Bytes.append(&mut cached, b"/thinlto")
+    run ChildProcess.addArgumentBytes(&mut process, Bytes.asSlice(&cached))
+    // A few builds' worth of the units' results; the link removes the oldest past that.
+    run ChildProcess.addArgument(&mut process, "-Wl,--thinlto-cache-policy=cache_size_files=64")
   }
   if ordered {
     run ChildProcess.addArgument(&mut process, "-Xlinker")
@@ -1498,7 +1547,7 @@ effect fn compileIrIn(scratch: &Path, ir: &Bytes, debugInfo: &[u8], unitLines: O
   let mut objects = List<Path>.make()
   if let Option<Bytes>.Some {value: answer} = &probed {
     if units.length > usize.ZERO {
-      objects = match move run compileUnits(scratch, &clang, origin, Bytes.asSlice(&answer), shared, units, packs, unitLines, sources, output, &mut progress.*) {
+      objects = match move run compileUnits(scratch, &clang, origin, Bytes.asSlice(&answer), List<Bytes>.asSlice(&unitFlags), units, packs, unitLines, sources, output, &mut progress.*) {
         UnitBuild.Objects {paths} => move paths
         UnitBuild.Failed {status} => { return status }
       }
@@ -1963,6 +2012,11 @@ union UnitBuild {
   Failed {status: i32},
 }
 
+// The codegen units an optimized executable splits into unless asked otherwise. The count is
+// fixed rather than the host's core count, so every host writes the same objects and the cache
+// shares them.
+fn defaultReleaseUnits() -> usize { return 16 }
+
 // The lld driver `name` (`/ld.lld` or `/ld64.lld`) in the directory Clang's `--version` output
 // names as its installation, when it is there.
 effect fn installedLld(version: &[u8], name: &[u8]) -> Option<Bytes> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
@@ -2376,8 +2430,9 @@ effect fn fetchDependencies(sourcePath: &Path, manifest: Option<&Path>, store: &
 // Loads the program rooted at `sourcePath` (within `manifest`'s package when given), publishes
 // every module reachable through imports, and assembles the final profile with `bindings`. A test
 // analysis is rooted at the bundled runner. A refused profile is reported in `format` and answers
-// its status instead, appended to `out`.
-effect fn prepare(sourcePath: &Path, manifest: Option<&Path>, standardLibrary: Option<Path>, profile: &InitialProfile, bindings: List<Supplied>, testing: bool, revisable: bool, alias: Option<&[u8]>, imports: Option<&Path>, compiler: &Option<Bytes>, format: &DiagnosticFormat, out: &mut Bytes, progress: &mut Progress) -> Prepared
+// its status instead, appended to `out`. The files `snapshot` holds are not read again, and the
+// files the load reads are left there for the next load of the run.
+effect fn prepare(sourcePath: &Path, manifest: Option<&Path>, standardLibrary: Option<Path>, profile: &InitialProfile, bindings: List<Supplied>, testing: bool, revisable: bool, alias: Option<&[u8]>, imports: Option<&Path>, compiler: &Option<Bytes>, snapshot: &mut SourceSnapshot, format: &DiagnosticFormat, out: &mut Bytes, progress: &mut Progress) -> Prepared
 ! ApplicationError | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
   // A refused binding names its manifest, which `sources` takes over.
@@ -2407,7 +2462,8 @@ effect fn prepare(sourcePath: &Path, manifest: Option<&Path>, standardLibrary: O
       return Prepared.Finished {status: run report(move error)}
     }
   }
-  let attempted = run Effect.result(Analyses.open(sourcePath, move manifest, move standardLibrary, borrowedPath(&checkoutStore), profile, move bindings, testing, revisable, move alias, move summaries))
+  let attempted = run Effect.result(Analyses.open(sourcePath, move manifest, move standardLibrary, borrowedPath(&checkoutStore), profile, move bindings, testing, revisable, move alias, move summaries,
+    Option<SourceSnapshot>.some(Intrinsic.replace(snapshot.*, ModuleSourceFiles.snapshot()))))
   let opened = match move attempted {
     Result<Opened, FileError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError>.Success {value} => move value
     Result<Opened, FileError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError>.Failure {error} => {
@@ -2418,6 +2474,7 @@ effect fn prepare(sourcePath: &Path, manifest: Option<&Path>, standardLibrary: O
   return match move opened {
     Opened.Ready {analysis: ready} => {
       let mut analysis = move ready
+      if let Option<SourceSnapshot>.Some {value: held} = move ModuleSourceFiles.takeSnapshot(&mut analysis.sources) { snapshot.* = move held }
       if let Option<&Path>.Some {value: directory} = &imports {
         if let Option<ImportSummaries>.Some {value: held} = move ModuleSourceFiles.takeSummaries(&mut analysis.sources) {
           run SemanticCache.saveImports(directory, &held)
@@ -3146,7 +3203,8 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, cacheDirectory: Opti
       prefetched = run SemanticCache.prefetch(directory, true, Bytes.asSlice(&identity))
     }
   }
-  let prepared = run prepare(sourcePath, move manifest, move standardLibrary, &profile, move bindings, testing, revisable, move alias, move imports, &compiler, &machine, &mut refused, &mut progress.*)
+  let mut snapshot = ModuleSourceFiles.snapshot()
+  let prepared = run prepare(sourcePath, move manifest, move standardLibrary, &profile, move bindings, testing, revisable, move alias, move imports, &compiler, &mut snapshot, &machine, &mut refused, &mut progress.*)
   run writeHeaded(heading, &mut headed, Bytes.asSlice(&refused), &mut progress.*)
   let analysis = match move prepared {
     Prepared.Ready {analysis} => move analysis
@@ -3336,20 +3394,14 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, cacheDirectory: Opti
       }
       // Units that only the cache asked for are not compiled apart.
       if !split { units = List<CodegenUnit>.make() }
-      // An optimized executable splits into the codegen units `SILK_CODEGEN_UNITS` asks for, by its
-      // call graph (`ReleaseUnits`), so Clang optimizes them on several threads. One module stays
-      // the default: units call across at a few percent of run time.
+      // An optimized executable splits into codegen units by its call graph (`ReleaseUnits`), so
+      // Clang optimizes them on several threads: as one module, Clang's -O2 ran on one thread for
+      // nearly all of a large program's build. The profile's `codegen-units` sets the count, and 1
+      // keeps one module. A build with line tables stays one module, whose tables `debugInfo` holds.
       if !split && form == Form.Executable && stage == Stage.Final && same(Bytes.asSlice(&optimization), b"speed")
-        && !same(Target.objectFormat(&target), b"wasm") {
-        let mut requested = usize.ZERO
-        if let Option<Bytes>.Some {value: written} = move run HostInput.variableNamed("SILK_CODEGEN_UNITS") {
-          let digits = Bytes.asSlice(&written)
-          let mut at = usize.ZERO
-          while at < digits.length && digits[at] >= 48 && digits[at] <= 57 {
-            requested = requested * 10 + u8.toUsize(digits[at] - 48)
-            at = at + usize.ONE
-          }
-        }
+        && !same(Target.objectFormat(&target), b"wasm") && !debug {
+        let mut requested = defaultReleaseUnits()
+        if InitialProfile.unitCount(&profile) > 0 { requested = u64.toUsize(InitialProfile.unitCount(&profile)) }
         if requested > usize.ONE {
           let partitioning = Profiler.zone(b"releaseUnits")
           units = run ReleaseUnits.partition(Bytes.asSlice(&text), requested)
@@ -4167,9 +4219,9 @@ effect fn testBuildKey(kind: &[u8], sourcePath: &Path, manifest: &Option<&Path>,
     }
   }
   let variables = ["SILK_CLANG", "SILK_LLVM_AR", "PATH", "SDKROOT", "DEVELOPER_DIR", "SILK_WASM_TOOLS", "SILK_WASI_ADAPTER", "SILK_WASI_REACTOR_ADAPTER",
-    "SILK_VERIFY_MIR", "SILK_PROFILE_GENERATE", "SILK_PROFILE_USE", "SILK_CODEGEN_UNITS"]
+    "SILK_VERIFY_MIR", "SILK_PROFILE_GENERATE", "SILK_PROFILE_USE"]
   let mut at = usize.ZERO
-  while at < 12 {
+  while at < variables.length {
     match move run HostInput.variableNamed(variables[at]) {
       Option<Bytes>.Some {value} => {
         run RuntimeEncoding.field(&mut key, b"=")
@@ -5190,12 +5242,12 @@ effect fn unitsProgress(settings: &ProgressSettings) -> Progress ! OutOfMemoryEr
   return run Progress.start(&whole, b"", b"", b"")
 }
 
-effect fn buildProjectTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Option<Path>, clang: &Option<Bytes>, headed: bool, abandon: bool, settings: &ProgressSettings) -> ProjectArtifact
+effect fn buildProjectTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Option<Path>, clang: &Option<Bytes>, headed: bool, abandon: bool, settings: &ProgressSettings, compiler: &Option<Bytes>) -> ProjectArtifact
 ! ApplicationError | InitialProfileProblem | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
   // A library is Silk source for other packages: building it checks it and makes no artifact.
   if Projects.form(project) == Form.Library {
-    return run checkTarget(project, move plan, standardLibrary, false, false, abandon, settings)
+    return run checkTarget(project, move plan, standardLibrary, false, false, abandon, settings, compiler, &mut ModuleSourceFiles.snapshot())
   }
   let ProjectPlan {input: planned, bindings, name: profileNamed, maxMemory} = move plan
   let form = Projects.form(project)
@@ -5246,11 +5298,13 @@ effect fn buildProjectTarget(project: &Project, plan: ProjectPlan, standardLibra
   // build that changes nothing reads its inputs and nothing else (`reusedBuild`).
   let record = run reuseRecordFor(&path)
   let mut key = Option<Bytes>.none()
-  // The compiler's identity, which keys the reuse record and stamps the cache.
+  // The compiler's identity (`compiler`, from `CacheStamp.compiler`), which keys the reuse record and stamps the cache.
   let mut stamp = Option<Bytes>.none()
   let mut wanted = form == Form.Executable && stage == Stage.Final
   if let Option<Path>.Some {..} = &cacheHome { wanted = true }
-  if wanted { stamp = run CacheStamp.compiler() }
+  if wanted {
+    if let Option<Bytes>.Some {value} = &compiler.* { stamp = Option<Bytes>.some(run Bytes.copy(Bytes.asSlice(&value))) }
+  }
   if form == Form.Executable && stage == Stage.Final {
     let manifestPath = Option<&Path>.some(Projects.manifest(project))
     key = run testBuildKey(b"silk-build-1", Projects.entry(project), &manifestPath, &path, Projects.directory(project), standardLibrary, &profile,
@@ -5388,12 +5442,14 @@ effect fn buildProject(working: &Path, command: BuildCommand) -> i32
   let projects = List<Project>.asSlice(&selection.projects)
   let mut settings = run progressSettings(&options, projects.length)
   let whole = run unitsProgress(&settings)
+  // The compiler's identity hashes the whole executable, so a workspace reads it once for every member.
+  let compiler = run CacheStamp.compiler()
   let mut status = 0
   let mut succeeded = usize.ZERO
   let mut at = usize.ZERO
   while at < projects.length {
     if selection.members { settings.position = at + usize.ONE }
-    let built = run memberStatus(run Effect.result(buildOne(&projects[at], &options, &standardLibrary, &clang, &settings, at + usize.ONE == projects.length)))
+    let built = run memberStatus(run Effect.result(buildOne(&projects[at], &options, &standardLibrary, &clang, &settings, at + usize.ONE == projects.length, &compiler)))
     if built == 0 { succeeded = succeeded + usize.ONE }
     status = worse(status, built)
     at = at + usize.ONE
@@ -5424,7 +5480,7 @@ fn unitSettings(packages: &ProgressSettings, targets: usize) -> ProgressSettings
     compact: packages.compact || targets > usize.ONE, position: packages.position, units: packages.units, timings: packages.timings}
 }
 
-effect fn buildOne(project: &Project, options: &ProjectOptions, standardLibrary: &Option<Path>, clang: &Option<Bytes>, packages: &ProgressSettings, last: bool) -> i32
+effect fn buildOne(project: &Project, options: &ProjectOptions, standardLibrary: &Option<Path>, clang: &Option<Bytes>, packages: &ProgressSettings, last: bool, compiler: &Option<Bytes>) -> i32
 ! ApplicationError | InitialProfileProblem | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types | &mut Writer {
   let mut plans = match move run projectPlans(project, options, Projects.targets(project)) {
@@ -5435,7 +5491,7 @@ effect fn buildOne(project: &Project, options: &ProjectOptions, standardLibrary:
   let mut attempts = List<ProjectArtifact>.make()
   while List<ProjectPlan>.length(&plans) > usize.ZERO {
     let plan = List<ProjectPlan>.remove(&mut plans, usize.ZERO)
-    run List<ProjectArtifact>.append(&mut attempts, run buildProjectTarget(project, move plan, standardLibrary, clang, true, last && List<ProjectPlan>.length(&plans) == usize.ZERO, &settings))
+    run List<ProjectArtifact>.append(&mut attempts, run buildProjectTarget(project, move plan, standardLibrary, clang, true, last && List<ProjectPlan>.length(&plans) == usize.ZERO, &settings, compiler))
   }
   // Each attempt has reported itself on standard error, so only the status is left to combine.
   let attempted = List<ProjectArtifact>.asSlice(&attempts)
@@ -5489,7 +5545,7 @@ effect fn dependencyCaches(project: &Project, sources: &ModuleSources) -> List<P
   return move directories
 }
 
-effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Option<Path>, json: bool, roots: bool, abandon: bool, settings: &ProgressSettings) -> ProjectArtifact
+effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Option<Path>, json: bool, roots: bool, abandon: bool, settings: &ProgressSettings, compiler: &Option<Bytes>, snapshot: &mut SourceSnapshot) -> ProjectArtifact
 ! ApplicationError | InitialProfileProblem | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
   let ProjectPlan {input: planned, bindings, name: _, maxMemory: unlimited} = move plan
@@ -5509,22 +5565,21 @@ effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Op
   if json { format = DiagnosticFormat.Json {target: run Bytes.copy(Target.name(&target))} }
   let mut out = Bytes.make()
   let mut progress = run startProgress(settings, b"Checking", project, &target, b"")
-  // A compiler that can stamp a cache checks on a revisable store, whose module checks the next
-  // check reuses from the project's cache file.
-  let compiler = run CacheStamp.compiler()
+  // A compiler that can stamp a cache (`compiler`, from `CacheStamp.compiler`) checks on a revisable
+  // store, whose module checks the next check reuses from the project's cache file.
   let mut revisable = false
-  if let Option<Bytes>.Some {..} = &compiler { revisable = true }
+  if let Option<Bytes>.Some {..} = &compiler.* { revisable = true }
   let cacheHome = run SemanticCache.directory(Projects.outputDirectory(project), Projects.name(project))
   // The cache file is read and decoded while the sources load.
   let mut prefetched = Option<SemanticCache.Prefetch>.none()
-  if let Option<Bytes>.Some {..} = &compiler {
+  if let Option<Bytes>.Some {..} = &compiler.* {
     if let Option<Path>.Some {value: directory} = &cacheHome {
       let mut identity = Bytes.make()
       run InitialProfile.appendIdentity(&profile, &mut identity)
       prefetched = run SemanticCache.prefetch(&directory, false, Bytes.asSlice(&identity))
     }
   }
-  let prepared = run prepare(Projects.entry(project), Option<&Path>.some(Projects.manifest(project)), move library, &profile, move bindings, false, revisable, Option<&[u8]>.none(), borrowedPath(&cacheHome), &compiler, &format, &mut out, &mut progress)
+  let prepared = run prepare(Projects.entry(project), Option<&Path>.some(Projects.manifest(project)), move library, &profile, move bindings, false, revisable, Option<&[u8]>.none(), borrowedPath(&cacheHome), compiler, &mut snapshot.*, &format, &mut out, &mut progress)
   let analysis = match move prepared {
     Prepared.Ready {analysis} => move analysis
     Prepared.Finished {status} => {
@@ -5537,7 +5592,7 @@ effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Op
   let mut store = move analyzed
   let mut request = move requested
   let mut cache = Option<CacheFile>.none()
-  if let Option<Bytes>.Some {value: stamped} = &compiler {
+  if let Option<Bytes>.Some {value: stamped} = &compiler.* {
     if let Option<Path>.Some {value: directory} = &cacheHome {
       let dependencies = run dependencyCaches(project, &sources)
       cache = run SemanticCache.openPrefetched(&mut store, &request, &directory, Bytes.asSlice(&stamped), false, false, move prefetched,
@@ -5976,7 +6031,7 @@ effect fn replayTarget(project: &Project, plan: ProjectPlan, standardLibrary: &O
   let mut out = Bytes.make()
   // A replay reports its own lines, so it shows no progress.
   let mut progress = run startProgress(&silentProgress(), b"Replaying", project, &target, b"")
-  let prepared = run prepare(Projects.entry(project), Option<&Path>.some(Projects.manifest(project)), move library, &profile, move bindings, false, true, Option<&[u8]>.none(), Option<&Path>.none(), &Option<Bytes>.none(), &format, &mut out, &mut progress)
+  let prepared = run prepare(Projects.entry(project), Option<&Path>.some(Projects.manifest(project)), move library, &profile, move bindings, false, true, Option<&[u8]>.none(), Option<&Path>.none(), &Option<Bytes>.none(), &mut ModuleSourceFiles.snapshot(), &format, &mut out, &mut progress)
   let analysis = match move prepared {
     Prepared.Ready {analysis} => move analysis
     Prepared.Finished {status} => {
@@ -6186,6 +6241,10 @@ effect fn checkProject(working: &Path, command: CheckCommand) -> i32
   if let Option<List<Edit>>.Some {..} = &edits { replaying = true }
   if !json && !replaying { settings = run progressSettings(&options, projects.length) }
   let whole = run unitsProgress(&settings)
+  // The compiler's identity hashes the whole executable, so a workspace reads it once for every member.
+  let compiler = run CacheStamp.compiler()
+  // Members share the packages they depend on, so each source file is read once for all of them.
+  let mut snapshot = ModuleSourceFiles.snapshot()
   let mut status = 0
   let mut succeeded = usize.ZERO
   let mut at = usize.ZERO
@@ -6195,7 +6254,7 @@ effect fn checkProject(working: &Path, command: CheckCommand) -> i32
     // Each member interns its own applications: no type outlives its check, so a long workspace
     // check does not keep every earlier member's keys.
     let mut memberTypes = TypeTable.make()
-    let checked = run memberStatus(run Effect.result(checkOne(&projects[member], &options, &standardLibrary, json, roots, &settings, &edits, differential, at + usize.ONE == projects.length)
+    let checked = run memberStatus(run Effect.result(checkOne(&projects[member], &options, &standardLibrary, json, roots, &settings, &edits, differential, at + usize.ONE == projects.length, &compiler, &mut snapshot)
       |> Effect.provideMut<Types>(&mut memberTypes)))
     drop memberTypes
     // The member's store is gone; hand its free pages back before the next member allocates.
@@ -6254,7 +6313,7 @@ effect fn visitInOrder(projects: &[Project], at: usize, state: &mut List<usize>,
   run List<usize>.append(&mut order.*, at)
 }
 
-effect fn checkOne(project: &Project, options: &ProjectOptions, standardLibrary: &Option<Path>, json: bool, roots: bool, packages: &ProgressSettings, edits: &Option<List<Edit>>, differential: bool, last: bool) -> i32
+effect fn checkOne(project: &Project, options: &ProjectOptions, standardLibrary: &Option<Path>, json: bool, roots: bool, packages: &ProgressSettings, edits: &Option<List<Edit>>, differential: bool, last: bool, compiler: &Option<Bytes>, snapshot: &mut SourceSnapshot) -> i32
 ! ApplicationError | InitialProfileProblem | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types | &mut Writer {
   let mut plans = match move run projectPlans(project, options, Projects.targets(project)) {
@@ -6274,7 +6333,7 @@ effect fn checkOne(project: &Project, options: &ProjectOptions, standardLibrary:
   while List<ProjectPlan>.length(&plans) > usize.ZERO {
     let plan = List<ProjectPlan>.remove(&mut plans, usize.ZERO)
     let abandon = last && List<ProjectPlan>.length(&plans) == usize.ZERO
-    run List<ProjectArtifact>.append(&mut attempts, run checkTarget(project, move plan, standardLibrary, json, roots, abandon, &settings))
+    run List<ProjectArtifact>.append(&mut attempts, run checkTarget(project, move plan, standardLibrary, json, roots, abandon, &settings, compiler, &mut snapshot.*))
   }
   // Each attempt has reported itself on standard error, so only the status is left to combine.
   let attempted = List<ProjectArtifact>.asSlice(&attempts)
@@ -6373,7 +6432,7 @@ effect fn runProject(working: &Path, command: RunCommand) -> i32
   // The build reports its progress on standard error as `silk build` does, its `Finished` or
   // `Failed` line included, so standard output carries only the program's own output.
   let settings = run progressSettings(&options, usize.ONE)
-  let built = run buildProjectTarget(&project, move plan, &standardLibrary, &clang, true, false, &settings)
+  let built = run buildProjectTarget(&project, move plan, &standardLibrary, &clang, true, false, &settings, &run CacheStamp.compiler())
   if built.status != 0 {
     return built.status
   }
