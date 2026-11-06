@@ -1,0 +1,252 @@
+//! Encrypt storage sectors with AES-XTS (IEEE 1619, NIST SP 800-38E).
+//!
+//! # When to use
+//! Use [`AesXts`] where a disk or file format names XTS, or for Node's `aes-128-xts` and
+//! `aes-256-xts`. XTS is made for storage: it does not detect changes, and it does not hide when a
+//! sector is written again with the same data. Use `silk.crypto.aes_gcm` for messages.
+//!
+//! # Details
+//! The key is two AES keys side by side: 32 bytes for AES-128-XTS or 64 bytes for AES-256-XTS. The
+//! 16-byte tweak names the data unit, usually the sector number. Each call encrypts or decrypts one
+//! whole data unit of at least 16 bytes. A length that is not a multiple of 16 uses ciphertext
+//! stealing, so the ciphertext has the same length as the plaintext. Nothing allocates.
+//!
+//! # Errors
+//! The functions return an [`AesXtsError`]. Every check comes before the first write, and on an
+//! error the output does not change.
+//!
+//! # Gotchas
+//! Encryption rejects a key whose two halves are equal, as OpenSSL does. A data unit is at most
+//! 2^20 blocks, OpenSSL's limit. Each call is one data unit: splitting a sector across calls gives a
+//! different result.
+//!
+//! # Examples
+//! ## Encrypt and decrypt a sector
+//! ```silk
+//! import silk.crypto.aes_xts { AesXts, AesXtsError }
+//! import silk.core.result { Result }
+//!
+//! pub fn main() -> i32 {
+//!   let mut key: [u8; 32] = [0; 32]
+//!   key[16] = 1
+//!   let tweak: [u8; 16] = [0; 16]
+//!   let sector: [u8; 20] = [7; 20]
+//!   let mut ciphertext: [u8; 20] = [0; 20]
+//!   if let Result.Failure { error: _ } = AesXts.encrypt(&key, &tweak, &sector, &mut ciphertext) {
+//!     return 1
+//!   }
+//!   let mut plaintext: [u8; 20] = [0; 20]
+//!   if let Result.Failure { error: _ } = AesXts.decrypt(&key, &tweak, &ciphertext, &mut plaintext) {
+//!     return 1
+//!   }
+//!   if plaintext[0] != 7 || plaintext[19] != 7 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Cryptography
+
+import silk.text.format { Debug, Format, Formatter }
+import silk.core.result { Result }
+import silk.crypto.aes { Aes, AesError }
+import silk.collections.slice { Slice }
+import silk.num.u8
+import silk.num.usize
+import silk.io.writer { Writer, WriterError }
+
+/// The reason that [`AesXts.encrypt`] or [`AesXts.decrypt`] rejected a call. The output does not
+/// change.
+pub enum AesXtsError {
+  /// The key is not 32 or 64 bytes.
+  InvalidKeyLength,
+  /// The two halves of the key are equal, which XTS encryption does not allow.
+  DuplicateKeyHalves,
+  /// The tweak is not 16 bytes.
+  InvalidIvLength,
+  /// The data unit is shorter than 16 bytes or longer than 2^20 blocks.
+  InvalidInputLength,
+  /// The output is shorter than the input.
+  OutputTooSmall,
+}
+
+impl Debug for AesXtsError {
+  /// Writes the name of the variant, such as `InvalidKeyLength`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      AesXtsError.InvalidKeyLength => run Format.write(&mut formatter, b"InvalidKeyLength")
+      AesXtsError.DuplicateKeyHalves => run Format.write(&mut formatter, b"DuplicateKeyHalves")
+      AesXtsError.InvalidIvLength => run Format.write(&mut formatter, b"InvalidIvLength")
+      AesXtsError.InvalidInputLength => run Format.write(&mut formatter, b"InvalidInputLength")
+      AesXtsError.OutputTooSmall => run Format.write(&mut formatter, b"OutputTooSmall")
+    }
+  }
+}
+
+/// Functions that encrypt and decrypt one data unit with AES-XTS (IEEE 1619).
+///
+/// # Details
+///
+/// The key is 32 bytes (AES-128-XTS) or 64 bytes (AES-256-XTS): the first half encrypts the data
+/// and the second half encrypts the tweak. Each call handles one data unit of 16 bytes to 2^20
+/// blocks, with ciphertext stealing for a partial last block. Nothing allocates.
+///
+/// # Gotchas
+///
+/// XTS does not detect changes to the ciphertext. Encryption rejects a key whose halves are equal.
+pub struct AesXts {}
+
+impl AesXts {
+  /// Encrypts the data unit `plaintext` with `key` and `tweak` into the first `plaintext.length`
+  /// bytes of `ciphertext`.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidKeyLength` if `key` is not 32 or 64 bytes.
+  /// - `DuplicateKeyHalves` if the two halves of `key` are equal.
+  /// - `InvalidIvLength` if `tweak` is not 16 bytes.
+  /// - `InvalidInputLength` if `plaintext` is shorter than 16 bytes or longer than 2^20 blocks.
+  /// - `OutputTooSmall` if `ciphertext` is shorter than `plaintext`.
+  pub fn encrypt(key: &[u8], tweak: &[u8], plaintext: &[u8], ciphertext: &mut [u8]) -> Result<(), AesXtsError> {
+    return process(key, tweak, plaintext, move ciphertext, false)
+  }
+
+  /// Decrypts the data unit `ciphertext` with `key` and `tweak` into the first
+  /// `ciphertext.length` bytes of `plaintext`.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidKeyLength` if `key` is not 32 or 64 bytes.
+  /// - `InvalidIvLength` if `tweak` is not 16 bytes.
+  /// - `InvalidInputLength` if `ciphertext` is shorter than 16 bytes or longer than 2^20 blocks.
+  /// - `OutputTooSmall` if `plaintext` is shorter than `ciphertext`.
+  pub fn decrypt(key: &[u8], tweak: &[u8], ciphertext: &[u8], plaintext: &mut [u8]) -> Result<(), AesXtsError> {
+    return process(key, tweak, ciphertext, move plaintext, true)
+  }
+}
+
+fn expandHalf(key: &[u8], offset: usize, length: usize) -> Aes {
+  return match Aes.make(Slice.view<u8>(key, offset, length)) {
+    Result<Aes, AesError>.Success { value } => move value
+    Result<Aes, AesError>.Failure { error: _ } => Intrinsic.trap("AesXts: a checked key half did not expand")
+  }
+}
+
+fn process(key: &[u8], tweak: &[u8], input: &[u8], output: &mut [u8], decrypting: bool) -> Result<(), AesXtsError> {
+  if key.length != 32 && key.length != 64 {
+    return Result<(), AesXtsError>.failResult(AesXtsError.InvalidKeyLength)
+  }
+  let half = key.length / 2
+  if !decrypting {
+    let mut difference: u8 = 0
+    let mut index: usize = 0
+    while index < half {
+      difference = u8.bitOr(difference, u8.bitXor(key[index], key[half + index]))
+      index = index + 1
+    }
+    if difference == 0 {
+      return Result<(), AesXtsError>.failResult(AesXtsError.DuplicateKeyHalves)
+    }
+  }
+  if tweak.length != 16 {
+    return Result<(), AesXtsError>.failResult(AesXtsError.InvalidIvLength)
+  }
+  if input.length < 16 || input.length > 16777216 {
+    return Result<(), AesXtsError>.failResult(AesXtsError.InvalidInputLength)
+  }
+  if output.length < input.length {
+    return Result<(), AesXtsError>.failResult(AesXtsError.OutputTooSmall)
+  }
+  let data = expandHalf(key, 0, half)
+  let tweakKey = expandHalf(key, half, half)
+  let mut start: [u8; 16] = [0; 16]
+  let mut index: usize = 0
+  while index < 16 {
+    start[index] = tweak[index]
+    index = index + 1
+  }
+  let mut mask = tweakKey.encryptBlock(&start)
+  let blocks = input.length / 16
+  let tail = input.length % 16
+  // With a partial last block, the last full block takes part in ciphertext stealing.
+  let mut plain = blocks
+  if tail != 0 {
+    plain = blocks - 1
+  }
+  let mut block: usize = 0
+  while block < plain {
+    let processed = crypt(&data, input, block * 16, &mask, decrypting)
+    store(&mut output, block * 16, &processed)
+    mask = double(&mask)
+    block = block + 1
+  }
+  if tail == 0 {
+    return Result<(), AesXtsError>.succeed(())
+  }
+  let last = plain * 16
+  let nextMask = double(&mask)
+  // Encryption uses the current mask on the last full block and the next one on the stolen
+  // block. Decryption uses them the other way around.
+  let mut firstMask = mask
+  let mut secondMask = nextMask
+  if decrypting {
+    firstMask = nextMask
+    secondMask = mask
+  }
+  let full = crypt(&data, input, last, &firstMask, decrypting)
+  let mut stolen: [u8; 16] = full
+  index = 0
+  while index < tail {
+    output[last + 16 + index] = full[index]
+    stolen[index] = input[last + 16 + index]
+    index = index + 1
+  }
+  let finalBlock = crypt(&data, &stolen, 0, &secondMask, decrypting)
+  store(&mut output, last, &finalBlock)
+  return Result<(), AesXtsError>.succeed(())
+}
+
+// Returns the block at `offset` of `input` XORed with `mask`, encrypted or decrypted, then XORed
+// with `mask` again.
+fn crypt(key: &Aes, input: &[u8], offset: usize, mask: &[u8; 16], decrypting: bool) -> [u8; 16] {
+  let mut block: [u8; 16] = [0; 16]
+  let mut index: usize = 0
+  while index < 16 {
+    block[index] = u8.bitXor(input[offset + index], mask[index])
+    index = index + 1
+  }
+  let mut result = key.encryptBlock(&block)
+  if decrypting {
+    result = key.decryptBlock(&block)
+  }
+  index = 0
+  while index < 16 {
+    result[index] = u8.bitXor(result[index], mask[index])
+    index = index + 1
+  }
+  return result
+}
+
+fn store(output: &mut [u8], offset: usize, block: &[u8; 16]) -> () {
+  let mut index: usize = 0
+  while index < 16 {
+    output[offset + index] = block[index]
+    index = index + 1
+  }
+}
+
+// Multiplies the tweak by x in GF(2^128) with the little-endian byte order of IEEE 1619.
+fn double(mask: &[u8; 16]) -> [u8; 16] {
+  let mut result: [u8; 16] = [0; 16]
+  let mut carry: u8 = 0
+  let mut index: usize = 0
+  while index < 16 {
+    result[index] = u8.bitOr(u8.shiftLeft(mask[index], 1), carry)
+    carry = u8.shiftRight(mask[index], 7)
+    index = index + 1
+  }
+  // 0x87 when the top bit carried out, 0 otherwise, without a branch on the tweak.
+  result[0] = u8.bitXor(result[0], u8.bitAnd(u8.wrappingSubtract(0, carry), 0x87))
+  return result
+}
