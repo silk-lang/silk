@@ -59,10 +59,9 @@ effect fn useAccepted(accepted: Accepted, requestId: i32) -> i32 {
 
 ## Options
 
-`ListenOptions.make(kernelBacklog, reuseAddress, ipv6Only, pollIntervalNanoseconds)` is pure.
-Backlog must be 1 through 65535 and the polling interval must be 1 through 1,000,000,000
-nanoseconds. `defaults()` selects backlog 128, disables reuse, keeps IPv6 listeners IPv6-only, and
-polls at one-millisecond intervals. Reuse controls only
+`ListenOptions.make(kernelBacklog, reuseAddress, ipv6Only)` is pure. Backlog must be 1 through
+65535. `defaults()` selects backlog 128, disables reuse, and keeps IPv6 listeners IPv6-only. Accept
+waits for the listener's readiness instead of polling. Reuse controls only
 `SO_REUSEADDR`; the actor never enables `SO_REUSEPORT` or creates an application queue.
 
 An IPv6 listener sets `IPV6_V6ONLY` from `ipv6Only` and owns one descriptor. With `ipv6Only` on,

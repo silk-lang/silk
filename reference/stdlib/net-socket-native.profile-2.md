@@ -21,9 +21,10 @@ A [`Connection`](#Connection) provides `ByteDuplex`, so `silk.http.exchange`, `s
 `silk.io.buffered_duplex` can use it.
 
 ## Details
-All sockets are nonblocking. When a socket is not ready, a waiting operation waits for the poll
-interval with `MonotonicClock`, then tries again. So an idle wait costs about one check for each
-interval. One deadline covers all attempts of one connect or accept.
+All sockets are nonblocking. When a socket is not ready, the operation waits with
+`MonotonicClock.waitReady` until the socket is ready or the deadline passes. The native clock
+waits in the kernel `poll` and goes on as soon as the socket is ready; a task scheduler parks
+only the task. One deadline covers all attempts of one connect or accept.
 
 A connect tries the endpoints in their order, until one connects or the attempt limit is
 reached. A flush means that the kernel accepted the bytes, not that the peer got them.
@@ -443,16 +444,6 @@ KernelBacklog
 
 The backlog is not 1 through 65535.
 
-<a id="ListenOptionsReason.PollInterval"></a>
-
-### `PollInterval`
-
-```silk
-PollInterval
-```
-
-The poll interval is not 1 nanosecond through 1 second.
-
 <a id="ListenOptionsReason.impl.Debug"></a>
 
 ## Implementation `Debug for ListenOptionsReason`
@@ -597,16 +588,6 @@ pub enum ConnectOptionsReason
 
 The [`ConnectOptions`](#ConnectOptions) value that is not valid.
 
-<a id="ConnectOptionsReason.PollInterval"></a>
-
-### `PollInterval`
-
-```silk
-PollInterval
-```
-
-The poll interval is not 1 nanosecond through 1 second.
-
 <a id="ConnectOptionsReason.MaxAttempts"></a>
 
 ### `MaxAttempts`
@@ -633,7 +614,7 @@ impl Debug for ConnectOptionsReason
 effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-Writes the name of the variant, such as `PollInterval`.
+Writes the name of the variant, such as `MaxAttempts`.
 
 <a id="ConnectOptionsError"></a>
 
@@ -1285,7 +1266,7 @@ An empty marker type for this module.
 pub struct ConnectOptions
 ```
 
-The settings of a connect: Nagle, the poll interval, and the attempt limit.
+The settings of a connect: Nagle and the attempt limit.
 
 <a id="ListenOptions"></a>
 
@@ -1295,8 +1276,7 @@ The settings of a connect: Nagle, the poll interval, and the attempt limit.
 pub struct ListenOptions
 ```
 
-The settings of a listener: the backlog, address reuse, IPv6-only mode, and the poll interval of
-accept.
+The settings of a listener: the backlog, address reuse, and IPv6-only mode.
 
 <a id="UnixSocketPath"></a>
 
@@ -1701,18 +1681,13 @@ impl ConnectOptions
 ### Associated function `make`
 
 ```silk
-pub fn make(
-    noDelay: bool,
-    pollIntervalNanoseconds: u64,
-    maxAttempts: usize,
-  ) -> Result<ConnectOptions, ConnectOptionsError>
+pub fn make(noDelay: bool, maxAttempts: usize) -> Result<ConnectOptions, ConnectOptionsError>
 ```
 
 Returns connect options.
 
 #### Errors
-`ConnectOptionsError` if `pollIntervalNanoseconds` is not 1 through 1000000000, or
-`maxAttempts` is not 1 through 1024.
+`ConnectOptionsError` if `maxAttempts` is not 1 through 1024.
 
 <a id="ConnectOptions.impl.defaults"></a>
 
@@ -1722,7 +1697,7 @@ Returns connect options.
 pub fn defaults() -> ConnectOptions
 ```
 
-Returns the default connect options: Nagle on, a 1 ms poll interval, and 64 attempts.
+Returns the default connect options: Nagle on, and 64 attempts.
 
 <a id="ConnectOptions.impl.noDelay"></a>
 
@@ -1733,16 +1708,6 @@ pub fn noDelay(self: &Self) -> bool
 ```
 
 Returns whether Nagle is off (`TCP_NODELAY`).
-
-<a id="ConnectOptions.impl.pollInterval"></a>
-
-### Method `pollInterval`
-
-```silk
-pub fn pollInterval(self: &Self) -> u64
-```
-
-Returns the poll interval, in nanoseconds.
 
 <a id="ConnectOptions.impl.maxAttempts"></a>
 
@@ -1767,12 +1732,7 @@ impl ListenOptions
 ### Associated function `make`
 
 ```silk
-pub fn make(
-    kernelBacklog: usize,
-    reuseAddress: bool,
-    ipv6Only: bool,
-    pollIntervalNanoseconds: u64,
-  ) -> Result<ListenOptions, ListenOptionsError>
+pub fn make(kernelBacklog: usize, reuseAddress: bool, ipv6Only: bool) -> Result<ListenOptions, ListenOptionsError>
 ```
 
 Returns listen options.
@@ -1780,8 +1740,7 @@ Windows defaults to an exclusive bind when `reuseAddress` is false. When true, W
 `SO_REUSEADDR` permits binding over an existing listener, unlike Unix's usual reuse behavior.
 
 #### Errors
-`ListenOptionsError` if `kernelBacklog` is not 1 through 65535, or `pollIntervalNanoseconds`
-is not 1 through 1000000000.
+`ListenOptionsError` if `kernelBacklog` is not 1 through 65535.
 
 <a id="ListenOptions.impl.defaults"></a>
 
@@ -1791,8 +1750,8 @@ is not 1 through 1000000000.
 pub fn defaults() -> ListenOptions
 ```
 
-Returns the default listen options: a backlog of 128, no address reuse, IPv6 listeners that
-take only IPv6, and a 1 ms poll interval.
+Returns the default listen options: a backlog of 128, no address reuse, and IPv6 listeners
+that take only IPv6.
 
 <a id="ListenOptions.impl.kernelBacklog"></a>
 
@@ -1824,16 +1783,6 @@ pub fn ipv6Only(self: &Self) -> bool
 
 Returns whether an IPv6 listener takes only IPv6 clients (`IPV6_V6ONLY`). When false, it
 also takes IPv4 clients, as IPv4-mapped IPv6 addresses.
-
-<a id="ListenOptions.impl.pollInterval"></a>
-
-### Method `pollInterval`
-
-```silk
-pub fn pollInterval(self: &Self) -> u64
-```
-
-Returns the poll interval of accept, in nanoseconds.
 
 <a id="UnixSocketPath.impl"></a>
 
@@ -2013,6 +1962,17 @@ both halves are closed or dropped.
 
 #### Errors
 `OutOfMemoryError` if the shared socket cannot be allocated. The connection is then closed.
+
+<a id="Connection.impl.idle"></a>
+
+### Method `idle`
+
+```silk
+pub fn idle(self: &Self) -> bool
+```
+
+Returns true when the connection is open and the peer has sent nothing and not closed it,
+so a new request can go out on it. It does not wait.
 
 <a id="Connection.impl.close"></a>
 

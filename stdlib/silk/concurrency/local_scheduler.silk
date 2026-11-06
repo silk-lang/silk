@@ -79,7 +79,8 @@ import silk.text.format { Debug, Format, Formatter }
 import silk.collections.hash { Hash }
 import silk.collections.hash_map { HashMap }
 import silk.num.i64
-import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock { MonotonicClock, ReadyWatch }
+import silk.collections.slice { Slice }
 import silk.core.option { Option }
 import silk.core.ownership { Copy, Drop }
 import silk.core.result { Result }
@@ -210,6 +211,7 @@ impl LocalScheduler {
     let rootClock = TaskClockClient {
       clock: Shared<ClockState>.clone(&clock),
       inbox: Shared<TimerRequestInbox>.clone(&timerInbox),
+      ready: Option<Shared<ReadySlot>>.none(),
     }
     let endpoint = ReadyEndpoint {
       queue: Shared<ReadyQueue>.clone(&queue),
@@ -230,6 +232,7 @@ impl LocalScheduler {
       parent: NoLink {},
       firstChild: NoLink {},
       nextSibling: NoLink {},
+      previousSibling: NoLink {},
       cancellationNext: NoLink {},
       phase: Initial {},
       execution: StoredExecution { execution: move execution },
@@ -245,6 +248,10 @@ impl LocalScheduler {
     let driverValue = Driver {
       store: TaskStore {
         timers: List<TimerEntry>.make(),
+        waiters: List<ReadyWaiter>.make(),
+        watches: List<ReadyWatch>.make(),
+        spans: List<usize>.make(),
+        drivesSincePoll: usize.ZERO,
         tasks: HashMap<TaskId, TaskEntry>.make(Hash.seed(0)),
         nextTimerOrder: u64.MIN,
         timerOrderExhausted: false,
@@ -488,9 +495,88 @@ fn replaceClock(state: &mut ClockState, mark: &Instant) -> () {
 struct NoTimerRequest {}
 struct AbsoluteTimerRequest { deadline: Instant, wake: Wake }
 struct RelativeTimerRequest { duration: u64, wake: Wake }
+struct ReadyWaitRequest { slot: Shared<ReadySlot>, until: Option<Instant>, wake: Wake }
 
 struct TimerRequestInbox {
-  request: NoTimerRequest | AbsoluteTimerRequest | RelativeTimerRequest,
+  request: NoTimerRequest | AbsoluteTimerRequest | RelativeTimerRequest | ReadyWaitRequest,
+}
+
+// The handles of one task's `waitReady`, shared with the driver. The driver writes the events
+// that came and the count of ready handles before it wakes the task.
+const MAX_TASK_WATCHES: usize = 16
+
+struct ReadySlot {
+  watches: [ReadyWatch; 16],
+  count: usize,
+  ready: usize,
+}
+
+struct ReadyWaitRegistration {
+  inbox: Shared<TimerRequestInbox>,
+  slot: Shared<ReadySlot>,
+  until: Option<Instant>,
+}
+
+fn installReadyRequest(
+  inbox: &mut TimerRequestInbox,
+  slot: Shared<ReadySlot>,
+  until: Option<Instant>,
+  wake: Wake,
+) -> () {
+  let previous = Intrinsic.replace(
+    inbox.request,
+    ReadyWaitRequest { slot: move slot, until: move until, wake: move wake },
+  )
+  return rejectPendingRequest(move previous)
+}
+
+fn rejectPendingRequest(
+  previous: NoTimerRequest | AbsoluteTimerRequest | RelativeTimerRequest | ReadyWaitRequest,
+) -> () {
+  return match move previous {
+    NoTimerRequest {} => ()
+    AbsoluteTimerRequest { deadline: retainedDeadline, wake: retainedWake } =>
+      duplicateTimerRequest(move retainedDeadline, move retainedWake)
+    RelativeTimerRequest { duration: retainedDuration, wake: retainedWake } =>
+      duplicateRelativeTimerRequest(retainedDuration, move retainedWake)
+    ReadyWaitRequest { slot, until, wake } => {
+      drop slot
+      drop until
+      drop wake
+      return Intrinsic.trap("LocalScheduler: a fiber requested a wait while one was already pending")
+    }
+  }
+}
+
+fn registerReadyWait(wake: Wake, registration: ReadyWaitRegistration) -> TimerWaitGuard {
+  let ReadyWaitRegistration { inbox, slot, until } = move registration
+  let _installed = Shared.withMut(&inbox, installReadyRequest(move slot, move until, move wake))
+  drop inbox
+  return TimerWaitGuard {}
+}
+
+fn fillSlot(slot: &mut ReadySlot, watch: &[ReadyWatch]) -> () {
+  if watch.length > MAX_TASK_WATCHES {
+    Intrinsic.trap("LocalScheduler: a fiber can wait for at most 16 handles at a time")
+  }
+  let mut index: usize = 0
+  while index < watch.length {
+    slot.watches[index] = watch[index]
+    ReadyWatch.clear(&mut slot.watches[index])
+    index = index + 1
+  }
+  slot.count = watch.length
+  slot.ready = 0
+  return ()
+}
+
+fn drainSlot(slot: &mut ReadySlot, watch: &mut [ReadyWatch]) -> usize {
+  let mut index: usize = 0
+  while index < watch.length && index < slot.count {
+    ReadyWatch.takeEvents(&mut watch[index], &slot.watches[index])
+    index = index + 1
+  }
+  return slot.ready
 }
 
 struct TimerWaitGuard {}
@@ -512,13 +598,7 @@ fn installAbsoluteRequest(
     inbox.request,
     AbsoluteTimerRequest { deadline: move deadline, wake: move wake },
   )
-  return match move previous {
-    NoTimerRequest {} => ()
-    AbsoluteTimerRequest { deadline: retainedDeadline, wake: retainedWake } =>
-      duplicateTimerRequest(move retainedDeadline, move retainedWake)
-    RelativeTimerRequest { duration: retainedDuration, wake: retainedWake } =>
-      duplicateRelativeTimerRequest(retainedDuration, move retainedWake)
-  }
+  return rejectPendingRequest(move previous)
 }
 
 fn installRelativeRequest(
@@ -530,13 +610,7 @@ fn installRelativeRequest(
     inbox.request,
     RelativeTimerRequest { duration: duration, wake: move wake },
   )
-  return match move previous {
-    NoTimerRequest {} => ()
-    AbsoluteTimerRequest { deadline: retainedDeadline, wake: retainedWake } =>
-      duplicateTimerRequest(move retainedDeadline, move retainedWake)
-    RelativeTimerRequest { duration: retainedDuration, wake: retainedWake } =>
-      duplicateRelativeTimerRequest(retainedDuration, move retainedWake)
-  }
+  return rejectPendingRequest(move previous)
 }
 
 fn duplicateTimerRequest(deadline: Instant, wake: Wake) -> () {
@@ -581,6 +655,7 @@ fn reached(state: &ClockState, deadline: &Instant) -> bool {
 struct TaskClockClient {
   clock: Shared<ClockState>,
   inbox: Shared<TimerRequestInbox>,
+  ready: Option<Shared<ReadySlot>>,
 }
 
 impl TaskClockClient {
@@ -612,6 +687,50 @@ impl TaskClockClient {
     }
     return run Execution.park(registerRelativeWait(move registration))
   }
+
+  // Parks the task until a handle is ready or `until` passes. The driver forwards the handles of
+  // all parked tasks to its own clock in one wait.
+  effect fn taskWaitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Instant>) -> usize {
+    if watch.length == usize.ZERO {
+      return match move until {
+        Option<Instant>.None => Intrinsic.trap("LocalScheduler: a fiber would wait forever for no handles")
+        Option<Instant>.Some {value} => {
+          run self.taskWaitUntil(move value)
+          return usize.ZERO
+        }
+      }
+    }
+    if Option.isNone(&self.ready) {
+      let mut allocator = Allocator.systemAllocatorProvider()
+      let made = run Effect.result(Shared<ReadySlot>.make(ReadySlot {
+        watches: [ReadyWatch.forRead(usize.ZERO); 16],
+        count: usize.ZERO,
+        ready: usize.ZERO,
+      }) |> Effect.provideMut<Allocator>(&mut allocator))
+      let slot = match move made {
+        Result<Shared<ReadySlot>, OutOfMemoryError>.Success {value} => move value
+        Result<Shared<ReadySlot>, OutOfMemoryError>.Failure {error} => {
+          drop error
+          return Intrinsic.trap("LocalScheduler: storage for a readiness wait could not be allocated")
+        }
+      }
+      self.ready = Option<Shared<ReadySlot>>.some(move slot)
+    }
+    let slot = match &self.ready {
+      Option<Shared<ReadySlot>>.Some {value} => Shared<ReadySlot>.clone(&value)
+      Option<Shared<ReadySlot>>.None => Intrinsic.trap("LocalScheduler: the readiness slot is missing")
+    }
+    Shared.withMut(&slot, fillSlot(&watch))
+    let registration = ReadyWaitRegistration {
+      inbox: Shared<TimerRequestInbox>.clone(&self.inbox),
+      slot: Shared<ReadySlot>.clone(&slot),
+      until: move until,
+    }
+    run Execution.park(registerReadyWait(move registration))
+    let ready = Shared.withMut(&slot, drainSlot(&mut watch))
+    drop slot
+    return ready
+  }
 }
 
 impl MonotonicClock for TaskClockClient {
@@ -619,6 +738,7 @@ impl MonotonicClock for TaskClockClient {
   getResolution: TaskClockClient.taskResolution
   waitUntil: TaskClockClient.taskWaitUntil
   waitFor: TaskClockClient.taskWaitFor
+  waitReady: TaskClockClient.taskWaitReady
 }
 
 struct SchedulerClient {
@@ -768,6 +888,7 @@ effect fn prepareChild<A: 'static, E: 'static>(
   let clock = TaskClockClient {
     clock: move childClock,
     inbox: move childTimerInbox,
+    ready: Option<Shared<ReadySlot>>.none(),
   }
   let endpoint = ReadyEndpoint {
     queue: Shared<ReadyQueue>.clone(&self.queue),
@@ -937,7 +1058,15 @@ struct StoredExecution { execution: Intrinsic.Execution<()> }
 
 struct NoTimerInterest {}
 struct TimerInterest { index: usize }
-struct EventInterests { timer: NoTimerInterest | TimerInterest }
+struct NoReadyInterest {}
+struct ReadyInterest { slot: Shared<ReadySlot> }
+struct EventInterests { timer: NoTimerInterest | TimerInterest, ready: NoReadyInterest | ReadyInterest }
+
+// A task parked in `waitReady`, by the generation of its registration. The driver drops an entry
+// once that registration is no longer armed.
+struct ReadyWaiter { identity: TaskId, generation: u64 }
+
+impl Copy for ReadyWaiter {}
 
 struct RegistrationIdle {}
 struct RegistrationArmed {
@@ -982,6 +1111,8 @@ struct TaskEntry {
   parent: NoLink | TaskLink,
   firstChild: NoLink | TaskLink,
   nextSibling: NoLink | TaskLink,
+  // The sibling before this task in its parent's list, so that unlinking it takes constant time.
+  previousSibling: NoLink | TaskLink,
   cancellationNext: NoLink | TaskLink,
   phase: Initial | Running | Dormant | Eligible | Completed,
   execution: NoExecution | StoredExecution,
@@ -995,6 +1126,10 @@ struct TaskEntry {
 
 struct TaskStore {
   timers: List<TimerEntry>,
+  waiters: List<ReadyWaiter>,
+  watches: List<ReadyWatch>,
+  spans: List<usize>,
+  drivesSincePoll: usize,
   tasks: HashMap<TaskId, TaskEntry>,
   nextTimerOrder: u64,
   timerOrderExhausted: bool,
@@ -1062,7 +1197,7 @@ fn retainTimerIndex(
   interests: EventInterests,
   wake: Wake,
 ) -> () {
-  let EventInterests { timer } = move interests
+  let EventInterests { timer, ready } = move interests
   let selected = match move timer {
     NoTimerInterest {} => missingTimerInterest()
     TimerInterest { index: oldIndex } => selectTimerIndex(
@@ -1074,7 +1209,7 @@ fn retainTimerIndex(
   }
   entry.registration = RegistrationArmed {
     generation: armed,
-    interests: EventInterests { timer: TimerInterest { index: selected } },
+    interests: EventInterests { timer: TimerInterest { index: selected }, ready: move ready },
     wake: move wake,
   }
   return ()
@@ -1199,7 +1334,10 @@ effect fn reserveTimerSlot(store: &mut TaskStore) -> () ! OutOfMemoryError {
   let initialized = List<TimerEntry>.length(&store.timers)
   let additional = target - initialized
   let mut allocator = Allocator.systemAllocatorProvider()
-  return run List<TimerEntry>.reserve(&mut store.timers, additional)
+  run List<TimerEntry>.reserve(&mut store.timers, additional)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let waiting = target - List<ReadyWaiter>.length(&store.waiters)
+  return run List<ReadyWaiter>.reserve(&mut store.waiters, waiting)
     |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
@@ -1229,10 +1367,11 @@ fn installArmedTimer(
   generation: u64,
   index: usize,
   wake: Wake,
+  ready: NoReadyInterest | ReadyInterest,
 ) -> () {
   let previous = Intrinsic.replace(entry.registration, RegistrationArmed {
     generation: generation,
-    interests: EventInterests { timer: TimerInterest { index: index } },
+    interests: EventInterests { timer: TimerInterest { index: index }, ready: move ready },
     wake: move wake,
   })
   return match move previous {
@@ -1266,6 +1405,16 @@ effect fn armTimer(
   deadline: Instant,
   wake: Wake,
 ) -> () {
+  return run armTimerWith(move store, identity, move deadline, move wake, NoReadyInterest {})
+}
+
+effect fn armTimerWith(
+  store: &mut TaskStore,
+  identity: TaskId,
+  deadline: Instant,
+  wake: Wake,
+  ready: NoReadyInterest | ReadyInterest,
+) -> () {
   let mut generation = GenerationOutput { phase: NoGeneration {} }
   let found = HashMap.withMut(
     &mut store.tasks,
@@ -1275,6 +1424,7 @@ effect fn armTimer(
   if !found {
     drop deadline
     drop wake
+    drop ready
     return ()
   }
   let GenerationOutput { phase: generationPhase } = move generation
@@ -1304,7 +1454,7 @@ effect fn armTimer(
   let installed = HashMap.withMut(
     &mut store.tasks,
     identity,
-    installArmedTimer(selectedGeneration, index, move wake),
+    installArmedTimer(selectedGeneration, index, move wake, move ready),
   )
   if !installed {
     return Intrinsic.trap("LocalScheduler: a timer could not be installed on its task")
@@ -1356,7 +1506,8 @@ fn finishDisarm(
   interests: EventInterests,
   wake: Wake,
 ) -> NoDisarmedWake | DisarmedWake {
-  let EventInterests { timer } = move interests
+  let EventInterests { timer, ready } = move interests
+  drop ready
   return match move timer {
     NoTimerInterest {} => DisarmedWake { wake: move wake }
     TimerInterest { index } => finishDisarmTimer(
@@ -1442,8 +1593,9 @@ fn completeTimer(store: &mut TaskStore, timer: TimerEntry) -> () {
 }
 
 fn completeClaimedTimer(interests: EventInterests, wake: Wake) -> () {
-  let EventInterests { timer } = move interests
+  let EventInterests { timer, ready } = move interests
   drop timer
+  drop ready
   return Execution.wake(move wake)
 }
 
@@ -1471,18 +1623,25 @@ fn drainDueTimers(driver: &mut Driver) -> () {
 
 fn takeTimerRequest(
   inbox: &mut TimerRequestInbox,
-) -> NoTimerRequest | AbsoluteTimerRequest | RelativeTimerRequest {
+) -> NoTimerRequest | AbsoluteTimerRequest | RelativeTimerRequest | ReadyWaitRequest {
   return Intrinsic.replace(inbox.request, NoTimerRequest {})
 }
 
 effect fn processTimerRequest(
   store: &mut TaskStore,
   identity: TaskId,
-  request: NoTimerRequest | AbsoluteTimerRequest | RelativeTimerRequest,
+  request: NoTimerRequest | AbsoluteTimerRequest | RelativeTimerRequest | ReadyWaitRequest,
 ) -> ()
 ? &mut MonotonicClock {
   return match move request {
     NoTimerRequest {} => ()
+    ReadyWaitRequest { slot, until, wake } => run armReadyWait(
+      move store,
+      identity,
+      move slot,
+      move until,
+      move wake,
+    )
     AbsoluteTimerRequest { deadline, wake } => run armTimer(
       move store,
       identity,
@@ -1496,6 +1655,78 @@ effect fn processTimerRequest(
       move wake,
     )
   }
+}
+
+// Arms a readiness wait: a timer for `until` when it is set, and a waiter entry that the idle wait
+// of the driver reads.
+effect fn armReadyWait(
+  store: &mut TaskStore,
+  identity: TaskId,
+  slot: Shared<ReadySlot>,
+  until: Option<Instant>,
+  wake: Wake,
+) -> () {
+  match move until {
+    Option<Instant>.Some {value} => {
+      run armTimerWith(&mut store.*, identity, move value, move wake, ReadyInterest { slot: move slot })
+    }
+    Option<Instant>.None => {
+      let mut generation = GenerationOutput { phase: NoGeneration {} }
+      let found = HashMap.withMut(&mut store.tasks, identity, reserveRegistrationGeneration(&mut generation))
+      if !found {
+        drop slot
+        drop wake
+        return ()
+      }
+      let GenerationOutput { phase } = move generation
+      let selected = match move phase {
+        NoGeneration {} => missingTimerGeneration()
+        ReservedGeneration { value } => value
+      }
+      let installed = HashMap.withMut(
+        &mut store.tasks,
+        identity,
+        installReadyOnly(selected, move wake, ReadyInterest { slot: move slot }),
+      )
+      if !installed { return Intrinsic.trap("LocalScheduler: a readiness wait could not be installed") }
+    }
+  }
+  let generation = armedGeneration(&mut store.tasks, identity)
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let appended = List<ReadyWaiter>.append(&mut store.waiters, ReadyWaiter { identity: identity, generation: generation })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let outcome = run Effect.result(move appended)
+  return match move outcome {
+    Result<(), OutOfMemoryError>.Success { value } => finishTimerAppend(move value)
+    Result<(), OutOfMemoryError>.Failure { error } => impossibleTimerAllocation(move error)
+  }
+}
+
+fn installReadyOnly(entry: &mut TaskEntry, generation: u64, wake: Wake, ready: ReadyInterest) -> () {
+  let previous = Intrinsic.replace(entry.registration, RegistrationArmed {
+    generation: generation,
+    interests: EventInterests { timer: NoTimerInterest {}, ready: move ready },
+    wake: move wake,
+  })
+  return match move previous {
+    RegistrationIdle {} => ()
+    RegistrationArmed { generation: retained, interests, wake: retainedWake } =>
+      rejectDuplicateArmed(retained, move interests, move retainedWake)
+  }
+}
+
+fn readArmedGeneration(entry: &mut TaskEntry, output: &mut u64) -> () {
+  match &entry.registration {
+    RegistrationArmed { generation, .. } => { output.* = generation }
+    RegistrationIdle {} => {}
+  }
+  return ()
+}
+
+fn armedGeneration(tasks: &mut HashMap<TaskId, TaskEntry>, identity: TaskId) -> u64 {
+  let mut generation = u64.MAX
+  let _found = HashMap.withMut(&mut tasks.*, identity, readArmedGeneration(&mut generation))
+  return generation
 }
 
 effect fn armRelativeTimer(
@@ -1679,11 +1910,6 @@ fn extract(entry: &mut TaskEntry, output: &mut Extraction) -> () {
   return ()
 }
 
-fn markEligible(entry: &mut TaskEntry) -> () {
-  entry.phase = Eligible {}
-  return ()
-}
-
 fn restore(entry: &mut TaskEntry, execution: Intrinsic.Execution<()>) -> () {
   entry.execution = StoredExecution { execution: move execution }
   entry.phase = Dormant {}
@@ -1809,6 +2035,7 @@ fn makeEntry(task: PreparedTask, sibling: NoLink | TaskLink) -> TaskEntry {
     parent: TaskLink { identity: parent },
     firstChild: NoLink {},
     nextSibling: move sibling,
+    previousSibling: NoLink {},
     cancellationNext: NoLink {},
     phase: Initial {},
     execution: StoredExecution { execution: move execution },
@@ -1944,6 +2171,11 @@ fn finishAcceptedAdoption(
 ) -> () {
   drop previous
   let _linked = HashMap.withMut(&mut driver.store.tasks, parent, setFirstChild(child))
+  let mut siblings = SiblingLinks { previous: NoLink {}, next: NoLink {} }
+  let _read = HashMap.withMut(&mut driver.store.tasks, child, copySiblingLinks(&mut siblings))
+  if hasLink(siblings.next) {
+    let _backed = HashMap.withMut(&mut driver.store.tasks, requireIdentity(siblings.next), setPreviousSiblingLink(TaskLink { identity: child }))
+  }
   let _published = Shared.withMut(&response, markPublished)
   Execution.wake(move wake)
   let _notified = HashMap.withMut(&mut driver.store.tasks, child, notifyInitialEntry)
@@ -2052,11 +2284,6 @@ fn finishMissingSubmission(
   return ()
 }
 
-struct CompletionAudit { completed: bool }
-fn phaseCompleted(entry: &mut TaskEntry, output: &mut CompletionAudit) -> () {
-  output.completed = match &entry.phase { Completed {} => true _ => false }
-  return ()
-}
 
 fn releaseEntry(entry: TaskEntry) -> () { drop entry return () }
 fn releaseRemoved(selected: Option<TaskEntry>) -> () {
@@ -2127,6 +2354,7 @@ fn cancelEntry(entry: TaskEntry) -> () {
     parent,
     firstChild,
     nextSibling,
+    previousSibling,
     cancellationNext,
     phase,
     execution,
@@ -2140,6 +2368,7 @@ fn cancelEntry(entry: TaskEntry) -> () {
   drop parent
   drop firstChild
   drop nextSibling
+  drop previousSibling
   drop cancellationNext
   drop phase
   drop execution
@@ -2215,60 +2444,59 @@ fn queueChildren(driver: &mut Driver, firstChild: NoLink | TaskLink) -> () {
 
 // Removes a task from its parent's list of children.
 fn unlinkFromParent(driver: &mut Driver, identity: TaskId, parent: NoLink | TaskLink) -> () {
-  if hasLink(parent) {
-    let parentIdentity = requireIdentity(parent)
-    let mut parentLinks = TaskLinks {
-      parent: NoLink {},
-      firstChild: NoLink {},
-      nextSibling: NoLink {},
-    }
-    let parentFound = readTaskLinks(
-      &mut driver.store.tasks,
-      parentIdentity,
-      &mut parentLinks,
-    )
-    if parentFound {
-      let mut current = parentLinks.firstChild
-      let mut previous = LinkOutput { link: NoLink {} }
-      let mut unlinked = false
-      while !unlinked && hasLink(current) {
-        let currentIdentity = requireIdentity(current)
-        let mut currentLinks = TaskLinks {
-          parent: NoLink {},
-          firstChild: NoLink {},
-          nextSibling: NoLink {},
-        }
-        let currentFound = readTaskLinks(
-          &mut driver.store.tasks,
-          currentIdentity,
-          &mut currentLinks,
-        )
-        if !currentFound {
-          unlinked = true
-        } else if currentIdentity.value == identity.value {
-          let nextSibling = currentLinks.nextSibling
-          let _replaced = match previous.link {
-            NoLink {} => HashMap.withMut(
-              &mut driver.store.tasks,
-              parentIdentity,
-              setFirstChildLink(nextSibling),
-            )
-            TaskLink { identity: previousIdentity } => HashMap.withMut(
-              &mut driver.store.tasks,
-              previousIdentity,
-              setNextSiblingLink(nextSibling),
-            )
-          }
-          unlinked = true
-        } else {
-          previous.link = TaskLink { identity: currentIdentity }
-          current = currentLinks.nextSibling
-        }
+  if !hasLink(parent) { return () }
+  let parentIdentity = requireIdentity(parent)
+  let mut siblings = SiblingLinks { previous: NoLink {}, next: NoLink {} }
+  let found = HashMap.withMut(&mut driver.store.tasks, identity, takeSiblingLinks(&mut siblings))
+  if !found { return () }
+  let next = siblings.next
+  let mut unlinked = false
+  match siblings.previous {
+    NoLink {} => {
+      // Only the first child has no previous sibling; a task that is not linked changes nothing.
+      let mut first = LinkOutput { link: NoLink {} }
+      let _read = HashMap.withMut(&mut driver.store.tasks, parentIdentity, copyFirstChild(&mut first))
+      if sameLink(first.link, identity) {
+        let _replaced = HashMap.withMut(&mut driver.store.tasks, parentIdentity, setFirstChildLink(next))
+        unlinked = true
       }
     }
+    TaskLink { identity: previousIdentity } => {
+      let _replaced = HashMap.withMut(&mut driver.store.tasks, previousIdentity, setNextSiblingLink(next))
+      unlinked = true
+    }
   }
-
+  if unlinked && hasLink(next) {
+    let _backed = HashMap.withMut(&mut driver.store.tasks, requireIdentity(next), setPreviousSiblingLink(siblings.previous))
+  }
   return ()
+}
+
+struct SiblingLinks { previous: NoLink | TaskLink, next: NoLink | TaskLink }
+
+fn copySiblingLinks(entry: &mut TaskEntry, output: &mut SiblingLinks) -> () {
+  output.previous = entry.previousSibling
+  output.next = entry.nextSibling
+  return ()
+}
+
+// Reads the sibling links of a task that leaves its parent's list, and clears them.
+fn takeSiblingLinks(entry: &mut TaskEntry, output: &mut SiblingLinks) -> () {
+  output.previous = Intrinsic.replace(entry.previousSibling, NoLink {})
+  output.next = Intrinsic.replace(entry.nextSibling, NoLink {})
+  return ()
+}
+
+fn setPreviousSiblingLink(entry: &mut TaskEntry, link: NoLink | TaskLink) -> () {
+  entry.previousSibling = move link
+  return ()
+}
+
+fn sameLink(link: NoLink | TaskLink, identity: TaskId) -> bool {
+  return match move link {
+    NoLink {} => false
+    TaskLink { identity: linked } => linked.value == identity.value
+  }
 }
 
 // Cancels each queued task and queues its children in turn.
@@ -2410,8 +2638,9 @@ effect fn driveDurableSelected(
 effect fn driveIdentity(driver: &mut Driver, identity: TaskId) -> ()
 ! OutOfMemoryError
 ? &mut MonotonicClock {
-  let eligible = HashMap.withMut(&mut driver.store.tasks, identity, markEligible)
-  if !eligible { return () }
+  // One lookup takes the execution and one puts it back or marks the task completed. Only this
+  // drive marks a task `Completed`, and neither the timer request nor the publication check
+  // removes the entry, so the task is terminal exactly when this drive marked it.
   let mut extraction = Extraction { slot: NoExecution {} }
   let found = HashMap.withMut(&mut driver.store.tasks, identity, extract(&mut extraction))
   if !found { drop extraction return () }
@@ -2420,29 +2649,58 @@ effect fn driveIdentity(driver: &mut Driver, identity: TaskId) -> ()
   let mut state = ActivationState { slot: NoExecution {}, completed: false }
   run driveSelected(move slot, &mut state)
   let ActivationState { slot: parked, completed: parkedComplete } = move state
+  let mut audit = PublicationAudit { idle: false }
   let _restored = match move parked {
     NoExecution {} => false
     StoredExecution { execution } => HashMap.withMut(
       &mut driver.store.tasks,
       identity,
-      restore(move execution),
+      restoreAudited(move execution, &mut audit),
     )
   }
+  let mut terminal = false
   if parkedComplete {
-    let _marked = HashMap.withMut(&mut driver.store.tasks, identity, markCompleted(()))
+    terminal = HashMap.withMut(&mut driver.store.tasks, identity, markCompleted(()))
   }
   let timerRequest = Shared.withMut(&driver.timerInbox, takeTimerRequest)
   run processTimerRequest(&mut driver.store, identity, move timerRequest)
-  let mut terminal = CompletionAudit { completed: false }
-  let _inspected = HashMap.withMut(&mut driver.store.tasks, identity, phaseCompleted(&mut terminal))
-  return run finishDrive(move driver, identity, terminal.completed)
+  return run finishDrive(move driver, identity, terminal, audit.idle)
+}
+
+// Puts a parked execution back, and records whether the task has no publication to process. No
+// task code runs between this and the publication check, so the mailbox and the submission stay
+// as they are seen here.
+fn restoreAudited(entry: &mut TaskEntry, execution: Intrinsic.Execution<()>, audit: &mut PublicationAudit) -> () {
+  restore(&mut entry.*, move execution)
+  audit.idle = publicationIdle(&entry.*)
+  return ()
+}
+
+struct PublicationAudit { idle: bool }
+
+// Whether the task has neither a publication request nor a submission, so that processing its
+// publication would change nothing.
+fn publicationIdle(entry: &TaskEntry) -> bool {
+  let quiet = Shared<TaskMailbox>.with<bool>(&entry.mailbox, noRequest)
+  if !quiet { return false }
+  return Shared<SubmissionSlot>.with<bool>(&entry.submission, noSubmission)
+}
+
+fn noRequest(mailbox: &TaskMailbox) -> bool {
+  return match &mailbox.request { NoRequest {} => true _ => false }
+}
+
+fn noSubmission(slot: &SubmissionSlot) -> bool {
+  return match &slot.phase { NoSubmission {} => true _ => false }
 }
 
 effect fn finishDrive(
   driver: &mut Driver,
   identity: TaskId,
   terminal: bool,
+  idle: bool,
 ) -> () ! OutOfMemoryError {
+  if idle { return () }
   if !terminal { return run processPublication(move driver, identity) }
   let cleaned = finishCompletedTask(move driver, identity)
   drop cleaned
@@ -2478,7 +2736,162 @@ effect fn driveUntilRoot(driver: Box<Driver>) -> ()
     let progressed = run driveDurableSelected(&mut owner, move selected)
     if !progressed {
       let deadline = durableEarliestTimer(&owner)
-      run waitForDeadline(move deadline)
+      let until = match &deadline {
+        NoTimerDeadline {} => Option<Instant>.none()
+        TimerDeadline { value } => Option<Instant>.some(SystemClock.make(SystemClock.seconds(&value), SystemClock.nanoseconds(&value)))
+      }
+      let waited = run durableWaitReady(&mut owner, move until)
+      if waited { drop deadline } else { run waitForDeadline(move deadline) }
+    } else {
+      run durablePollReady(&mut owner)
+    }
+  }
+  return ()
+}
+
+// After every `POLL_EVERY` drives, checks the parked handles without waiting, so tasks that stay
+// ready cannot starve tasks that wait for sockets.
+const POLL_EVERY: usize = 64
+
+effect fn durablePollReady(owner: &mut DurableDriver) -> ()
+! OutOfMemoryError
+? &mut MonotonicClock {
+  let mut drivers = Box<Driver>.getMut(&mut owner.boxed)
+  drivers[0].store.drivesSincePoll = drivers[0].store.drivesSincePoll + usize.ONE
+  if drivers[0].store.drivesSincePoll < POLL_EVERY { return () }
+  drivers[0].store.drivesSincePoll = usize.ZERO
+  if List<ReadyWaiter>.length(&drivers[0].store.waiters) == usize.ZERO { return () }
+  let mark = Shared<ClockState>.with<ClockSnapshot>(&drivers[0].clock, snapshotClock)
+  let now = SystemClock.make(mark.seconds, mark.nanoseconds)
+  let _waited = run waitReadyStore(&mut drivers[0].store, Option<Instant>.some(move now))
+  return ()
+}
+
+effect fn durableWaitReady(owner: &mut DurableDriver, until: Option<Instant>) -> bool
+! OutOfMemoryError
+? &mut MonotonicClock {
+  let mut drivers = Box<Driver>.getMut(&mut owner.boxed)
+  drivers[0].store.drivesSincePoll = usize.ZERO
+  return run waitReadyStore(&mut drivers[0].store, move until)
+}
+
+// Forwards the handles of every task parked in `waitReady` to the parent clock in one wait, then
+// wakes each task that has a ready handle. Returns false, without waiting, when no task waits.
+effect fn waitReadyStore(store: &mut TaskStore, until: Option<Instant>) -> bool
+! OutOfMemoryError
+? &mut MonotonicClock {
+  let waiting = run gatherWatches(&mut store.*)
+  if waiting == usize.ZERO {
+    drop until
+    return false
+  }
+  let ready = run MonotonicClock.waitReady(List<ReadyWatch>.asMutSlice(&mut store.watches), move until)
+  if ready > usize.ZERO { deliverReadiness(&mut store.*) }
+  return true
+}
+
+struct SlotSnapshot { watches: [ReadyWatch; 16], count: usize }
+
+impl Copy for SlotSnapshot {}
+
+fn snapshotSlot(slot: &ReadySlot) -> SlotSnapshot {
+  return SlotSnapshot { watches: slot.watches, count: slot.count }
+}
+
+struct SlotLookup { slot: Option<Shared<ReadySlot>> }
+
+fn lookupSlot(entry: &mut TaskEntry, generation: u64, output: &mut SlotLookup) -> () {
+  match &entry.registration {
+    RegistrationArmed { generation: armed, interests, .. } => {
+      if armed != generation { return () }
+      match &interests.ready {
+        ReadyInterest { slot } => { output.slot = Option<Shared<ReadySlot>>.some(Shared<ReadySlot>.clone(&slot)) }
+        NoReadyInterest {} => {}
+      }
+    }
+    RegistrationIdle {} => {}
+  }
+  return ()
+}
+
+fn waiterSlot(store: &mut TaskStore, waiter: ReadyWaiter) -> Option<Shared<ReadySlot>> {
+  let mut lookup = SlotLookup { slot: Option<Shared<ReadySlot>>.none() }
+  let _found = HashMap.withMut(&mut store.tasks, waiter.identity, lookupSlot(waiter.generation, &mut lookup))
+  let SlotLookup { slot } = move lookup
+  return move slot
+}
+
+// Copies the handles of each live waiter into `store.watches`, and the start of each waiter's
+// handles into `store.spans`. A waiter whose wait ended is removed. Returns the live waiters.
+effect fn gatherWatches(store: &mut TaskStore) -> usize ! OutOfMemoryError {
+  List<ReadyWatch>.clear(&mut store.watches)
+  List<usize>.clear(&mut store.spans)
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut index = usize.ZERO
+  while index < List<ReadyWaiter>.length(&store.waiters) {
+    let waiter = List<ReadyWaiter>.get(&store.waiters, index)
+    let found = waiterSlot(&mut store.*, waiter)
+    match move found {
+      Option<Shared<ReadySlot>>.None => {
+        let _removed = List<ReadyWaiter>.remove(&mut store.waiters, index)
+      }
+      Option<Shared<ReadySlot>>.Some {value: slot} => {
+        let snapshot = Shared<ReadySlot>.with<SlotSnapshot>(&slot, snapshotSlot)
+        drop slot
+        run List<usize>.append(&mut store.spans, List<ReadyWatch>.length(&store.watches))
+          |> Effect.provideMut<Allocator>(&mut allocator)
+        run List<ReadyWatch>.appendSlice(&mut store.watches, Slice.view<ReadyWatch>(&snapshot.watches, usize.ZERO, snapshot.count))
+          |> Effect.provideMut<Allocator>(&mut allocator)
+        index = index + usize.ONE
+      }
+    }
+  }
+  return List<ReadyWaiter>.length(&store.waiters)
+}
+
+fn storeEvents(slot: &mut ReadySlot, watches: &[ReadyWatch], ready: usize) -> () {
+  let mut index = usize.ZERO
+  while index < slot.count && index < watches.length {
+    ReadyWatch.takeEvents(&mut slot.watches[index], &watches[index])
+    index = index + usize.ONE
+  }
+  slot.ready = ready
+  return ()
+}
+
+// Wakes each waiter with a ready handle, after it hands the events to its slot. The span list
+// matches the waiter list, since `gatherWatches` made both and nothing ran since.
+fn deliverReadiness(store: &mut TaskStore) -> () {
+  let mut index = List<ReadyWaiter>.length(&store.waiters)
+  while index > usize.ZERO {
+    index = index - usize.ONE
+    let waiter = List<ReadyWaiter>.get(&store.waiters, index)
+    let start = List<usize>.get(&store.spans, index)
+    let mut end = List<ReadyWatch>.length(&store.watches)
+    if index + usize.ONE < List<usize>.length(&store.spans) { end = List<usize>.get(&store.spans, index + usize.ONE) }
+    let mut events = SlotSnapshot { watches: [ReadyWatch.forRead(usize.ZERO); 16], count: end - start }
+    let mut ready = usize.ZERO
+    let mut at = usize.ZERO
+    while at < events.count {
+      events.watches[at] = List<ReadyWatch>.get(&store.watches, start + at)
+      if events.watches[at].isReady() { ready = ready + usize.ONE }
+      at = at + usize.ONE
+    }
+    if ready > usize.ZERO {
+      let found = waiterSlot(&mut store.*, waiter)
+      match move found {
+        Option<Shared<ReadySlot>>.None => {}
+        Option<Shared<ReadySlot>>.Some {value: slot} => {
+          Shared.withMut(&slot, storeEvents(Slice.view<ReadyWatch>(&events.watches, usize.ZERO, events.count), ready))
+          drop slot
+          let disarmed = disarmRegistration(&mut store.*, waiter.identity)
+          match move disarmed {
+            NoDisarmedWake {} => {}
+            DisarmedWake { wake } => Execution.wake(move wake)
+          }
+        }
+      }
+      let _removed = List<ReadyWaiter>.remove(&mut store.waiters, index)
     }
   }
   return ()

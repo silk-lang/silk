@@ -1,0 +1,517 @@
+//! Serve TLS 1.3 on a `silk.net.tcp_server` engine, with the certificate chain and private key
+//! loaded from PEM text.
+//!
+//! # When to use
+//! Use [`TlsProtocol`] to run any `silk.net.tcp_server` protocol over TLS, as the HTTPS mode of
+//! `silk.http.serve` does. Load the certificate chain and the private key one time with
+//! [`TlsServerConfig.fromPem`], and share the config across all connections and workers.
+//!
+//! # Details
+//! Each connection runs one `silk.tls.server` [`Server`]: the handshake, the record layer,
+//! KeyUpdate and `close_notify` all come from it. The protocol decrypts the bytes that arrive and
+//! gives them to the inner protocol, and encrypts what the inner protocol writes. When the inner
+//! protocol closes the connection, it sends `close_notify` first. The server offers ALPN
+//! `http/1.1` without requiring it.
+//!
+//! The private key is an ECDSA P-256 or P-384 key, in a `PRIVATE KEY` (PKCS #8) or
+//! `EC PRIVATE KEY` (SEC 1) block.
+//!
+//! # Errors
+//! - [`TlsConfigError`] from [`TlsServerConfig.fromPem`] for PEM text that it cannot use.
+//! - A TLS error on a connection closes that connection without an alert.
+//! - `OutOfMemoryError` if a buffer cannot grow.
+//!
+//! # Gotchas
+//! The server does not check its own chain. Give the leaf certificate first. Secrets are not
+//! erased.
+//!
+//! @category TLS and certificates
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.ownership { Copy }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.crypto.ec_key { EcCurve, EcKeyDer, EcKeyError, EcPrivateKeyDer }
+import silk.crypto.p256 { P256, P256Error }
+import silk.crypto.p384 { P384, P384Error }
+import silk.encoding.base64 { Base64 }
+import silk.system.random { Random }
+import silk.system.random_native { OsRandom }
+import silk.tls.client { AlpnConfig, AlpnProtocol }
+import silk.tls.certificate { CertificateDer }
+import silk.tls.signature { SigningKey }
+import silk.tls.server {
+  ClientAuth,
+  GroupPolicy,
+  Server,
+  ServerConfig,
+  ServerDemand,
+  ServerError,
+  TicketPolicy,
+  ServerLimits,
+  ServerProgress,
+}
+import silk.net.tcp_server { Protocol, Received, Verdict }
+import silk.text.format { Debug, Format, Formatter }
+import silk.io.writer { Writer, WriterError }
+import silk.num.u8
+import silk.num.usize
+
+/// Why [`TlsServerConfig.fromPem`] cannot use its input.
+pub enum TlsConfigError {
+  /// The certificate text holds no `CERTIFICATE` block.
+  NoCertificate,
+  /// A PEM block is malformed, or its base64 is not valid.
+  InvalidPem,
+  /// The key text holds no `PRIVATE KEY` or `EC PRIVATE KEY` block with a P-256 or P-384 key.
+  UnsupportedKey,
+  /// The chain is larger than the server allows.
+  ChainTooLarge,
+  /// The leaf certificate cannot be decoded.
+  InvalidCertificate,
+  /// The public key of the leaf certificate is not the public key of the private key.
+  KeyMismatch,
+}
+
+impl Debug for TlsConfigError {
+  /// Writes the name of the variant, such as `NoCertificate`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    let name = match self.* {
+      TlsConfigError.NoCertificate => "NoCertificate"
+      TlsConfigError.InvalidPem => "InvalidPem"
+      TlsConfigError.UnsupportedKey => "UnsupportedKey"
+      TlsConfigError.ChainTooLarge => "ChainTooLarge"
+      TlsConfigError.InvalidCertificate => "InvalidCertificate"
+      TlsConfigError.KeyMismatch => "KeyMismatch"
+    }
+    return run Writer.writeString(name)
+  }
+}
+
+/// The certificate chain and the private key of a server. One config serves every connection and
+/// every worker.
+pub struct TlsServerConfig {
+  chain: List<Bytes>,
+  // Made once, so that each connection's key already holds its public key.
+  key: EcKey,
+  alpn: [AlpnProtocol<'static>; 1],
+}
+
+impl TlsServerConfig {
+  /// Reads the certificate chain from the `CERTIFICATE` blocks of `certificates`, leaf first, and
+  /// the private key from the first `PRIVATE KEY` (PKCS #8) or `EC PRIVATE KEY` (SEC 1) block of
+  /// `privateKey`.
+  ///
+  /// # Details
+  /// It makes one `silk.tls.server` [`Server`] to check the chain and the key, so a config that
+  /// loads serves every connection.
+  ///
+  /// # Errors
+  /// - `NoCertificate`, `InvalidPem`, `UnsupportedKey`, `ChainTooLarge`, `InvalidCertificate` or
+  ///   `KeyMismatch` for input it cannot use.
+  /// - `OutOfMemoryError` if the chain cannot be stored.
+  pub effect fn fromPem(certificates: &[u8], privateKey: &[u8]) -> TlsServerConfig
+  ! TlsConfigError | OutOfMemoryError ? &mut Allocator {
+    let mut chain = List<Bytes>.make()
+    let mut offset: usize = 0
+    while true {
+      let found = findBlock(certificates, offset, b"CERTIFICATE")
+      let block = match move found {
+        Option.None => { break }
+        Option.Some { value } => value
+      }
+      offset = block.end
+      let der = run decodeBlock(certificates, &block)
+      run List.append(&mut chain, move der)
+    }
+    if List.length(&chain) == 0 { fail TlsConfigError.NoCertificate }
+    let config = run readPrivateKey(privateKey, move chain)
+    let made = run makeServer(&config)
+    match move made {
+      Result.Success { value } => { drop value }
+      Result.Failure { error } => {
+        fail match error {
+          ServerError.KeyMismatch => TlsConfigError.KeyMismatch
+          ServerError.CertificateDecode {..} => TlsConfigError.InvalidCertificate
+          ServerError.LimitExceeded {..} => TlsConfigError.ChainTooLarge
+          _ => TlsConfigError.InvalidCertificate
+        }
+      }
+    }
+    return move config
+  }
+}
+
+// A new server for one connection. `fromPem` checked the chain and the key, so only a failing
+// allocator makes it fail later.
+effect fn makeServer<'a>(config: &'a TlsServerConfig) -> Result<Server, ServerError> ! OutOfMemoryError ? &mut Allocator {
+  let key = match serverKey(config) {
+    Option.Some { value } => move value
+    Option.None => { return Result<Server, ServerError>.failResult(ServerError.KeyMismatch) }
+  }
+  let mut entries = run List<CertificateDer<'a>>.makeWithCapacity(List.length(&config.chain))
+  let mut index: usize = 0
+  while index < List.length(&config.chain) {
+    let der = List.asSlice(&config.chain)
+    run List.append(&mut entries, CertificateDer { bytes: Bytes.asSlice(&der[index]) })
+    index = index + 1
+  }
+  let settings = serverConfig(List.asSlice(&entries), &config.alpn)
+  return run Server.make(&settings, move key)
+}
+
+fn serverConfig<'b>(certificates: &'b [CertificateDer<'b>], alpn: &'b [AlpnProtocol<'b>]) -> ServerConfig<'b> {
+  return ServerConfig<'b> {
+    certificates: certificates,
+    alpn: AlpnConfig<'b>.Offered { protocols: alpn, required: false },
+    groups: GroupPolicy.defaults(),
+    clientAuth: ClientAuth<'b>.Off,
+    tickets: TicketPolicy<'b>.Off,
+    limits: ServerLimits.defaults(),
+  }
+}
+
+// An EC private key that a config keeps.
+union EcKey {
+  P256 { key: P256 },
+  P384 { key: P384 },
+}
+
+impl Copy for EcKey {}
+
+fn serverKey(config: &TlsServerConfig) -> Option<SigningKey> {
+  return match config.key {
+    EcKey.P256 { key } => Option<SigningKey>.some(SigningKey.EcdsaP256 { key: key })
+    EcKey.P384 { key } => Option<SigningKey>.some(SigningKey.EcdsaP384 { key: key })
+  }
+}
+
+// Makes the key of `curve` from its secret bytes.
+fn ecKey(curve: EcCurve, secret: &[u8]) -> Option<EcKey> {
+  return match curve {
+    EcCurve.P256 => match P256.fromBytes(secret) {
+      Result.Success { value } => Option<EcKey>.some(EcKey.P256 { key: value })
+      Result.Failure { error } => { drop error Option<EcKey>.none() }
+    }
+    EcCurve.P384 => match P384.fromBytes(secret) {
+      Result.Success { value } => Option<EcKey>.some(EcKey.P384 { key: value })
+      Result.Failure { error } => { drop error Option<EcKey>.none() }
+    }
+  }
+}
+
+struct PemBlock {
+  bodyStart: usize,
+  bodyEnd: usize,
+  end: usize,
+}
+
+impl Copy for PemBlock {}
+
+// Finds the next `-----BEGIN label-----` block at or after `offset`.
+fn findBlock(text: &[u8], offset: usize, label: &[u8]) -> Option<PemBlock> {
+  let begin = b"-----BEGIN "
+  let close = b"-----END "
+  let mut at = offset
+  while at + begin.length + label.length + 5 <= text.length {
+    if startsAt(text, at, begin) && startsAt(text, at + begin.length, label)
+      && startsAt(text, at + begin.length + label.length, b"-----") {
+      let bodyStart = at + begin.length + label.length + 5
+      let mut cursor = bodyStart
+      while cursor + close.length <= text.length {
+        if startsAt(text, cursor, close) {
+          let mut end = cursor + close.length
+          while end < text.length && text[end] != 10 { end = end + 1 }
+          return Option<PemBlock>.some(PemBlock { bodyStart: bodyStart, bodyEnd: cursor, end: end })
+        }
+        cursor = cursor + 1
+      }
+      return Option<PemBlock>.none()
+    }
+    at = at + 1
+  }
+  return Option<PemBlock>.none()
+}
+
+fn startsAt(text: &[u8], at: usize, prefix: &[u8]) -> bool {
+  if at + prefix.length > text.length { return false }
+  let mut index: usize = 0
+  while index < prefix.length {
+    if text[at + index] != prefix[index] { return false }
+    index = index + 1
+  }
+  return true
+}
+
+// Decodes the base64 body of `block`, skipping line breaks and spaces.
+effect fn decodeBlock(text: &[u8], block: &PemBlock) -> Bytes ! TlsConfigError | OutOfMemoryError ? &mut Allocator {
+  let mut compact = Bytes.make()
+  let mut at = block.bodyStart
+  while at < block.bodyEnd {
+    let byte = text[at]
+    if byte != 10 && byte != 13 && byte != 32 && byte != 9 { run Bytes.append(&mut compact, &[byte]) }
+    at = at + 1
+  }
+  let mut decoded = run Bytes.zeroed(Bytes.length(&compact))
+  let written = Base64.decodeInto(Bytes.asMutSlice(&mut decoded), Bytes.asSlice(&compact))
+  let length = match move written {
+    Result.Success { value } => value
+    Result.Failure { error } => { drop error fail TlsConfigError.InvalidPem }
+  }
+  Bytes.truncate(&mut decoded, length)
+  return move decoded
+}
+
+
+// Reads the EC private key of `text` and returns the config with `chain`.
+effect fn readPrivateKey(text: &[u8], chain: List<Bytes>) -> TlsServerConfig
+! TlsConfigError | OutOfMemoryError ? &mut Allocator {
+  let mut sec1 = true
+  let block = match findBlock(text, 0, b"EC PRIVATE KEY") {
+    Option.Some { value } => value
+    Option.None => {
+      sec1 = false
+      match findBlock(text, 0, b"PRIVATE KEY") {
+        Option.Some { value } => value
+        Option.None => { fail TlsConfigError.UnsupportedKey }
+      }
+    }
+  }
+  let der = run decodeBlock(text, &block)
+  let read = if sec1 { EcKeyDer.readSec1(Bytes.asSlice(&der)) } else { EcKeyDer.readPkcs8(Bytes.asSlice(&der)) }
+  let key = match move read {
+    Result.Success { value } => move value
+    Result.Failure { error } => { drop error fail TlsConfigError.UnsupportedKey }
+  }
+  let length = key.curve.secretLength()
+  if key.secret.length != length { fail TlsConfigError.UnsupportedKey }
+  let made = match ecKey(key.curve, key.secret) {
+    Option.Some { value } => value
+    Option.None => { fail TlsConfigError.UnsupportedKey }
+  }
+  let config = TlsServerConfig {
+    chain: move chain,
+    key: made,
+    alpn: [AlpnProtocol<'static> { bytes: b"http/1.1" }],
+  }
+  return move config
+}
+
+/// A `silk.net.tcp_server` protocol that serves TLS 1.3 and runs `inner` over the decrypted bytes.
+///
+/// # Details
+/// For each connection it makes a `silk.tls.server` [`Server`] and the state of `inner`. Bytes that
+/// arrive are decrypted and given to `inner`, and what `inner` writes is encrypted. When `inner`
+/// closes the connection, the server sends `close_notify` first.
+pub struct TlsProtocol<P> {
+  config: TlsServerConfig,
+  inner: P,
+}
+
+impl<P> TlsProtocol<P> {
+  /// Returns a protocol that serves `inner` over TLS with `config`.
+  pub fn make(config: TlsServerConfig, inner: P) -> TlsProtocol<P> {
+    return TlsProtocol<P> { config: move config, inner: move inner }
+  }
+}
+
+/// The state of one connection of a [`TlsProtocol`].
+pub struct TlsSession<S> {
+  server: Option<Server>,
+  random: OsRandom,
+  inner: S,
+  received: List<u8>,
+  sent: List<u8>,
+}
+
+// Where a connection stands after its output is written and its plaintext read.
+enum Settled {
+  NeedInput,
+  PeerClosed,
+  Closed,
+  Failed,
+}
+
+impl<S, P: Protocol<S>> Protocol<TlsSession<S>> for TlsProtocol<P> {
+  effect fn open(self: &Self) -> TlsSession<S> ! OutOfMemoryError ? &mut Allocator {
+    let inner = run Protocol<S>.open(&self.inner)
+    let made = run makeServer(&self.config)
+    let server = match move made {
+      Result.Success { value } => Option<Server>.some(move value)
+      Result.Failure { error } => { drop error Option<Server>.none() }
+    }
+    return TlsSession<S> {
+      server: move server,
+      random: OsRandom.make(),
+      inner: move inner,
+      received: List<u8>.make(),
+      sent: List<u8>.make(),
+    }
+  }
+
+  effect fn receive(
+    self: &Self,
+    state: &mut TlsSession<S>,
+    input: &mut [u8],
+    ended: bool,
+    output: &mut List<u8>,
+  ) -> Received ! OutOfMemoryError ? &mut Allocator {
+    let total = input.length
+    let closed = match &mut state.server {
+      Option.Some { value } => run feedRecords(&mut value, &mut state.random, &mut input, ended, &mut state.received, &mut output.*)
+      Option.None => Settled.Failed
+    }
+    if closed == Settled.Failed { return Received { consumed: total, verdict: Verdict.Close } }
+    let peerDone = closed != Settled.NeedInput || ended
+    let pending = List.length(&state.received)
+    if pending > 0 || peerDone {
+      let answer = run Protocol<S>.receive(&self.inner, &mut state.inner, List.asMutSlice(&mut state.received), peerDone, &mut state.sent)
+      let used = if answer.consumed > pending { pending } else { answer.consumed }
+      if used > 0 {
+        let rest = pending - used
+        let storage = List.asMutSlice(&mut state.received)
+        let mut moved: usize = 0
+        while moved < rest {
+          storage[moved] = storage[used + moved]
+          moved = moved + 1
+        }
+        List.truncate(&mut state.received, rest)
+      }
+      let finished = match &mut state.server {
+        Option.Some { value } => {
+          let sealed = run sealAll(&mut value, List.asSlice(&state.sent), &mut output.*)
+          if answer.verdict == Verdict.Close || peerDone {
+            if sealed { run closeServer(&mut value, &mut output.*) }
+            true
+          } else {
+            !sealed
+          }
+        }
+        Option.None => true
+      }
+      List.clear(&mut state.sent)
+      if finished { return Received { consumed: total, verdict: Verdict.Close } }
+    }
+    return Received { consumed: total, verdict: Verdict.KeepOpen }
+  }
+}
+
+// Feeds all of `input` to `server`, writes its answers to `output`, and appends the plaintext to
+// `plaintext`. The server keeps partial records, so the whole input is always used.
+effect fn feedRecords(
+  server: &mut Server,
+  random: &mut OsRandom,
+  input: &mut [u8],
+  ended: bool,
+  plaintext: &mut List<u8>,
+  output: &mut List<u8>,
+) -> Settled ! OutOfMemoryError ? &mut Allocator {
+  let mut consumed: usize = 0
+  let mut settled = Settled.NeedInput
+  while consumed < input.length {
+    let fed = run server.feedInput(Slice.view<u8>(&input, consumed, input.length - consumed))
+      |> Effect.provideMut<Random>(&mut random.*)
+    let progress = match move fed {
+      Result.Success { value } => value
+      Result.Failure { error } => { drop error return Settled.Failed }
+    }
+    consumed = consumed + progress.consumed
+    settled = run settle(&mut server.*, &mut random.*, progress.demand, &mut plaintext.*, &mut output.*)
+    if settled != Settled.NeedInput { return settled }
+    if progress.consumed == 0 && progress.demand == ServerDemand.NeedInput { return Settled.Failed }
+  }
+  if ended {
+    let finished = server.endInput()
+    return match move finished {
+      Result.Success { value } => run settle(&mut server.*, &mut random.*, value.demand, &mut plaintext.*, &mut output.*)
+      Result.Failure { error } => { drop error Settled.Failed }
+    }
+  }
+  return settled
+}
+
+// Writes the pending output, reads the plaintext and finishes the handshake until the server needs
+// input or the connection closes.
+effect fn settle(
+  server: &mut Server,
+  random: &mut OsRandom,
+  demand: ServerDemand,
+  plaintext: &mut List<u8>,
+  output: &mut List<u8>,
+) -> Settled ! OutOfMemoryError ? &mut Allocator {
+  let mut current = demand
+  while true {
+    let next = match current {
+      ServerDemand.NeedInput => { return Settled.NeedInput }
+      ServerDemand.PeerClosed => { return Settled.PeerClosed }
+      ServerDemand.Closed => { return Settled.Closed }
+      ServerDemand.NeedOutput => {
+        let pending = server.pendingOutput()
+        let count = pending.length
+        run List.appendSlice(&mut output.*, pending)
+        server.ackWritten(count)
+      }
+      ServerDemand.PlaintextReady => {
+        let start = List.length(&plaintext.*)
+        run List.appendRepeated(&mut plaintext.*, 0, 16384)
+        let read = server.readPlaintext(Slice.viewMut<u8>(List.asMutSlice(&mut plaintext.*), start, 16384))
+        let written = match &read {
+          Result.Success { value } => value.written
+          Result.Failure {..} => 0
+        }
+        List.truncate(&mut plaintext.*, start + written)
+        read
+      }
+      ServerDemand.HandshakeComplete => run server.progress() |> Effect.provideMut<Random>(&mut random.*)
+    }
+    current = match move next {
+      Result.Success { value } => value.demand
+      Result.Failure { error } => { drop error return Settled.Failed }
+    }
+  }
+  return Settled.Failed
+}
+
+// Encrypts all of `data` to `output`. Returns false if the server failed.
+effect fn sealAll(server: &mut Server, data: &[u8], output: &mut List<u8>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut at: usize = 0
+  while at < data.length {
+    let wrote = server.writePlaintext(Slice.view<u8>(data, at, data.length - at))
+    let progress = match move wrote {
+      Result.Success { value } => value
+      Result.Failure { error } => { drop error return false }
+    }
+    at = at + progress.consumed
+    if !(run flush(&mut server.*, &mut output.*)) { return false }
+    if progress.consumed == 0 && progress.demand != ServerDemand.NeedOutput { return false }
+  }
+  return true
+}
+
+// Queues `close_notify` and writes it to `output`.
+effect fn closeServer(server: &mut Server, output: &mut List<u8>) -> () ! OutOfMemoryError ? &mut Allocator {
+  match server.closeWrite() {
+    Result.Success { value } => { drop value }
+    Result.Failure { error } => { drop error return () }
+  }
+  let _flushed = run flush(&mut server.*, &mut output.*)
+  return ()
+}
+
+effect fn flush(server: &mut Server, output: &mut List<u8>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  while server.pendingOutput().length > 0 {
+    let pending = server.pendingOutput()
+    let count = pending.length
+    run List.appendSlice(&mut output.*, pending)
+    match server.ackWritten(count) {
+      Result.Success { value } => { drop value }
+      Result.Failure { error } => { drop error return false }
+    }
+  }
+  return true
+}
+

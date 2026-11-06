@@ -137,6 +137,13 @@ try {
     ]),
   )
   const origin = await listen(main)
+  const opened = { main: 0, other: 0 }
+  main.on('connection', () => {
+    opened.main += 1
+  })
+  other.on('connection', () => {
+    opened.other += 1
+  })
 
   // A forward proxy answers itself, so the echo shows the absolute target it received. NO_PROXY
   // names 127.0.0.1, so the other server is reached directly.
@@ -152,6 +159,10 @@ try {
     no_proxy: '',
   })
   assert.equal(result.status, 0, JSON.stringify(result))
+  // Sequential requests reuse an idle connection, so a redirect to the other server and back
+  // reuses the first connection to the main server. The four requests of `sendAll` run at once and
+  // open up to four more.
+  assert.ok(opened.main <= 8 && opened.other <= 2, JSON.stringify(opened))
   console.log('Native silk.http.client conformance passed')
 } finally {
   for (const timer of timers) clearTimeout(timer)

@@ -113,7 +113,7 @@ pub fn main() -> i32 {
 
 Import as `HttpRequest` with `import silk.http.request as HttpRequest`.
 
-Public declarations: 11.
+Public declarations: 12.
 
 <a id="BodyMode"></a>
 
@@ -692,6 +692,16 @@ pub fn bytes<'a>(self: &'a Self) -> &'a [u8]
 
 Returns the bytes of the head, ending with the empty line.
 
+<a id="PreparedRequest.impl.head"></a>
+
+### Method `head`
+
+```silk
+pub fn head<'a>(self: &'a Self) -> WrittenHead<'a>
+```
+
+Returns the head, read back from its bytes without parsing them.
+
 <a id="PreparedRequest.impl.origin"></a>
 
 ### Method `origin`
@@ -847,6 +857,32 @@ their order. Nothing is sent and nothing is resolved here.
 
 ### Gotchas
 By default, Basic credentials fail over plain HTTP with `InsecureBasic`.
+
+<a id="fromUriAt"></a>
+
+## `fromUriAt`
+
+```silk
+pub effect fn fromUriAt<'value>(
+  origin: &Origin,
+  uri: &Uri<'value>,
+  version: Version,
+  method: Method<'value>,
+  headers: &Headers<'value>,
+  policy: &HeaderPolicy<'value>,
+  body: BodyMode,
+  require100: bool,
+  limits: Limits,
+  maxHeadBytes: usize,
+  maxCredentialBytes: usize,
+) -> PreparedRequest ! RequestError | OutOfMemoryError ? &mut Allocator
+```
+
+Checks a direct request for `uri` like [`fromUri`](#fromUri), with the origin of `uri` that you already
+have.
+
+### Details
+`origin` must be `Origin.fromUri(uri)`; it is not checked again. The request goes to `origin`.
 
 
 Category: HTTP.

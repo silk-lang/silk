@@ -325,7 +325,6 @@ int poll(struct pollfd *fds, nfds_t count, int timeout) {
   silk_polls += 1;
   if (count != 1 || timeout != 0 || fds == NULL) silk_configuration_ok = 0;
   if (silk_mode == 46 && silk_polls == 1) { errno = EINTR; return -1; }
-  if (silk_mode == 47) { errno = EIO; return -1; }
   if (fds != NULL) {
     if (fds[0].fd < SOCKET_BASE + 100) silk_configuration_ok = 0;
     if (silk_mode == 4 || silk_mode == 6 || silk_mode == 62) fds[0].revents = 0;
@@ -361,7 +360,7 @@ silk_transfer recv(silk_socket fd, void *buffer, silk_count length, int flags) {
   if (silk_mode == 6) { errno = EAGAIN; return -1; }
   if (silk_mode == 30 && silk_recv_calls == 1) { errno = EINTR; return -1; }
   if ((silk_mode == 31 || silk_mode == 36 || silk_mode == 37 || silk_mode == 38
-      || silk_mode == 46 || silk_mode == 47 || silk_mode == 48)
+      || silk_mode == 46 || silk_mode == 48)
     && silk_recv_calls == 1) { errno = EAGAIN; return -1; }
   if (silk_mode == 32 && silk_recv_calls <= 2) { errno = EAGAIN; return -1; }
   if (silk_mode == 39) return (silk_transfer)length + 1;

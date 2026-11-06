@@ -53,7 +53,7 @@
 //!   MemoryWriteAction,
 //!   MemoryWriteEvent
 //! }
-//! import silk.system.monotonic_clock { MonotonicClock }
+//! import silk.system.monotonic_clock { MonotonicClock, ReadyWatch }
 //! import silk.core.option { Option }
 //! import silk.system.random { Random }
 //! import silk.core.result { Result }
@@ -130,6 +130,16 @@
 //!   effect fn waitFor(self: &mut Self, howLong: u64) -> () {
 //!     drop howLong
 //!     return ()
+//!   }
+//!   effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Instant>) -> usize {
+//!     if watch.length > 0 { Intrinsic.trap("this clock has no handles to watch") }
+//!     match move until {
+//!       Option<Instant>.None => {}
+//!       Option<Instant>.Some {value: when} => {
+//!         drop when
+//!       }
+//!     }
+//!     return 0
 //!   }
 //! }
 //!
@@ -289,6 +299,7 @@ import silk.http.body {
   BodyReason,
   Framing,
   Anomaly,
+  ConnectionTokens,
   ProgressState,
   TrailerPolicy,
   Trailers,
@@ -775,7 +786,6 @@ pub struct Exchange<'exchange, P> {
   contentSelected: bool,
   options: RequestOptions,
   phaseValue: ExchangePhase,
-  headBytes: Bytes,
   requestComplete: bool,
   responseDelimited: bool,
   responseWireTotal: u64,
@@ -786,6 +796,7 @@ pub struct Exchange<'exchange, P> {
   informationalWire: u64,
   responseHeadUsed: bool,
   callbackSucceeded: bool,
+  requestConnection: ConnectionTokens,
 }
 
 impl<'exchange, P> Exchange<'exchange, P> {
@@ -2397,15 +2408,10 @@ pub effect fn withExchange<'exchange, 'callback, P, A, E, ?R>(
     }
   }
   connection.parserUsed = true
-  let bytes = PreparedRequest.bytes(request)
-  let progress = match move RequestParser.feed(&mut connection.requestParser, bytes, true) {
-    Result.Failure {error} => {
-      fail ExchangeError.Head {error: move error}
-    }
-    Result.Success {value} => value
-  }
-  if progress.state != HeadState.Complete || progress.consumed != bytes.length {
-    fail ExchangeError.InvalidRequest
+  // A prepared request is already checked, so the parser takes its head without parsing it.
+  let loaded = RequestParser.load(&mut connection.requestParser, PreparedRequest.head(request))
+  if let Result.Failure {error} = move loaded {
+    fail ExchangeError.Head {error: move error}
   }
   let head = match move RequestParser.head(&connection.requestParser) {
     Result.Failure {error} => {
@@ -2423,6 +2429,7 @@ pub effect fn withExchange<'exchange, 'callback, P, A, E, ?R>(
     }
     Result.Success {value} => move value
   }
+  let requestConnection = selection.connection()
   let encoder = match move run Encoder.make(move selection, connection.limits.requestBody, policy) {
     Result.Failure {error} => {
       fail ExchangeError.Body {error: move error}
@@ -2430,8 +2437,6 @@ pub effect fn withExchange<'exchange, 'callback, P, A, E, ?R>(
     Result.Success {value} => move value
   }
   drop head
-  let headBytes = run Bytes.copy(bytes)
-  drop bytes
   if connection.requests > usize.ZERO {
     let resetResponse = ResponseParser.reset(&mut connection.responseParser)
     if let Result.Failure {error} = move resetResponse {
@@ -2449,7 +2454,6 @@ pub effect fn withExchange<'exchange, 'callback, P, A, E, ?R>(
     contentSelected: false,
     options: move options,
     phaseValue: ExchangePhase.Prepared,
-    headBytes: move headBytes,
     requestComplete: false,
     responseDelimited: false,
     responseWireTotal: u64.MIN,
@@ -2460,6 +2464,7 @@ pub effect fn withExchange<'exchange, 'callback, P, A, E, ?R>(
     informationalWire: u64.MIN,
     responseHeadUsed: false,
     callbackSucceeded: false,
+    requestConnection: requestConnection,
   }
   let use = effect fn(owned: &mut Exchange<'exchange, P>) -> A ! E ? R {
     let value = run callback(&mut owned.*)
@@ -2496,8 +2501,13 @@ where
   }
   exchange.phaseValue = ExchangePhase.Aborted
   run checkDeadline(&exchange.options.deadline, false)
-  let bytes = Bytes.asSlice(&exchange.headBytes)
-  run writeBytes(&mut exchange.connection.*, bytes, &exchange.options.deadline)
+  // The request parser holds the head that `withExchange` loaded, so the head is sent from there.
+  let head = match move RequestParser.head(&exchange.connection.requestParser) {
+    Result.Failure {..} => { fail ExchangeError.InvalidState }
+    Result.Success {value} => value
+  }
+  let bytes = head.headBytes()
+  run writeTransport(&mut exchange.connection.transport, bytes, &exchange.options.deadline, usize.ZERO, Option<WriteProgress>.none())
   let written = bytes.length
   drop bytes
   let required = match & exchange.options.continuePolicy {
@@ -2691,6 +2701,11 @@ where
   }
   let mut wire = u64.MIN
   while true {
+    // A connection that ends with no more head bytes is a truncated head, the same as one that
+    // ends inside it; the parser would only report the end of its input.
+    if exchange.connection.eof && exchange.connection.end == exchange.connection.start {
+      fail ExchangeError.TruncatedHead
+    }
     let input = Bytes.asSlice(&exchange.connection.input)
     let bytes = Slice.view<u8>(
       input,
@@ -2796,16 +2811,12 @@ where
   if selection.anomaly() != Anomaly.None || !exchange.responseDelimited {
     exchange.reusable = false
   }
-  if responseCloses(head) || requestCloses(requestHead) {
+  let responseConnection = selection.connection()
+  if responseConnection.close || exchange.requestConnection.close {
     exchange.reusable = false
   }
   if head.version() == Version.Http10 || requestHead.version() == Version.Http10 {
-    let mut responseFields = head.fields()
-    let mut requestFields = requestHead.fields()
-    if !fieldsHaveToken(&mut responseFields, b"keep-alive") || !fieldsHaveToken(
-      &mut requestFields,
-      b"keep-alive",
-    ) {
+    if !responseConnection.keepAlive || !exchange.requestConnection.keepAlive {
       exchange.reusable = false
     }
   }
@@ -3328,16 +3339,6 @@ fn byteTimedOut(error: &ByteIoError) -> bool {
   }
 }
 
-fn responseCloses(head: ResponseHead) -> bool {
-  let mut fields = head.fields()
-  return fieldsClose(&mut fields)
-}
-
-fn requestCloses(head: RequestHead) -> bool {
-  let mut fields = head.fields()
-  return fieldsClose(&mut fields)
-}
-
 fn requestsUpgrade(head: RequestHead) -> bool {
   if head.version() != Version.Http11 {
     return false
@@ -3360,10 +3361,6 @@ fn requestsUpgrade(head: RequestHead) -> bool {
     }
   }
   return false
-}
-
-fn fieldsClose(fields: &mut HeaderIterator) -> bool {
-  return fieldsHaveToken(&mut fields.*, b"close")
 }
 
 fn fieldsHaveToken(fields: &mut HeaderIterator, sought: &[u8]) -> bool {
@@ -3460,20 +3457,6 @@ where
     }
   }
   return ()
-}
-
-effect fn writeBytes<P>(connection: &mut Connection<P>, bytes: &[u8], deadline: &Option<Instant>) -> ()
-! ExchangeError | OutOfMemoryError
-? &mut MonotonicClock | &mut Allocator | &mut Random
-where
-  &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
-  return run writeTransport(
-    &mut connection.transport,
-    bytes,
-    deadline,
-    usize.ZERO,
-    Option<WriteProgress>.none(),
-  )
 }
 
 effect fn flushConnection<P>(

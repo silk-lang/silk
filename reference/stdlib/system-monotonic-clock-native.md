@@ -10,7 +10,8 @@ wait for deadlines. In a test, provide a fake clock that you advance yourself.
 
 ## Details
 `waitUntil` blocks until the deadline. `waitFor` reads the clock one time, adds the duration,
-and then waits until that deadline.
+and then waits until that deadline. `waitReady` waits in one `poll` for the handles, so it goes
+on as soon as a socket is ready.
 
 ## Gotchas
 - An `Instant` from this clock means nothing to other clocks. Do not mix it with `SystemClock`
@@ -140,6 +141,37 @@ effect fn waitUntil(self: &mut Self, when: Instant) -> ()
 ```silk
 effect fn waitFor(self: &mut Self, howLong: u64) -> ()
 ```
+
+<a id="OsMonotonicClock.impl.MonotonicClock.waitReady"></a>
+
+### Operation `waitReady`
+
+```silk
+effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Instant>) -> usize
+```
+
+<a id="OsMonotonicClock.impl-2"></a>
+
+## Implementation `OsMonotonicClock`
+
+```silk
+impl OsMonotonicClock
+```
+
+<a id="OsMonotonicClock.impl.pollNow"></a>
+
+### Associated function `pollNow`
+
+```silk
+pub fn pollNow(watch: &mut [ReadyWatch]) -> usize
+```
+
+Polls `watch` once without waiting, and returns how many handles are ready.
+
+#### When to use
+
+A test clock that moves its own time calls it in its `waitReady`, so that real sockets still
+make progress.
 
 
 Category: System.

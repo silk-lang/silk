@@ -284,6 +284,17 @@ pub fn fragment(self: &Self) -> Option<string<'text>>
 Returns the fragment without the `#`. Returns `None` if the component is absent. A component
 that is present but empty, such as the query of `http://a/?`, returns `Some("")`.
 
+<a id="Uri.impl.pathAndQuery"></a>
+
+### Method `pathAndQuery`
+
+```silk
+pub fn pathAndQuery(self: &Self) -> string<'text>
+```
+
+Returns the path and, when it is present, the `?` and the query, as one part of the text. For
+`http://a/b?c#d` it is `/b?c`.
+
 <a id="Uri.impl.resolveInto"></a>
 
 ### Associated function `resolveInto`

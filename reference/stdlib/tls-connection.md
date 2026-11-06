@@ -40,7 +40,7 @@ import silk.core.effect { Effect }
 import silk.tls.https_identity { HttpsIdentity, OriginHost, ReferenceIdentity }
 import silk.tls.record { VersionPolicy }
 import silk.io.memory_byte_duplex { MemoryByteDuplex, MemoryReadEvent, MemoryWriteEvent }
-import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock { MonotonicClock, ReadyWatch }
 import silk.core.option { Option }
 import silk.system.random { Random }
 import silk.core.result { Result }
@@ -84,6 +84,16 @@ impl MonotonicClock for FixedMonotonic {
   effect fn waitFor(self: &mut Self, howLong: u64) -> () {
     drop howLong
     return ()
+  }
+  effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Instant>) -> usize {
+    if watch.length > 0 { Intrinsic.trap("this clock has no handles to watch") }
+    match move until {
+      Option<Instant>.None => {}
+      Option<Instant>.Some {value: when} => {
+        drop when
+      }
+    }
+    return 0
   }
 }
 
@@ -411,6 +421,16 @@ pub fn phase(self: &Self) -> ConnectionPhase
 ```
 
 Returns the current [`ConnectionPhase`](#ConnectionPhase).
+
+<a id="OwnedConnection.impl.socket"></a>
+
+### Method `socket`
+
+```silk
+pub fn socket(self: &Self) -> &P
+```
+
+Returns the transport under TLS. Use it to look at the socket, such as its readiness.
 
 <a id="OwnedConnection.impl.authentication"></a>
 

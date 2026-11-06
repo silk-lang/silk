@@ -37,7 +37,7 @@ import silk.collections.bytes { Bytes }
 import silk.core.effect { Effect }
 import silk.collections.list { List }
 import silk.io.memory_byte_duplex { MemoryByteDuplex, MemoryReadEvent, MemoryWriteEvent }
-import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock { MonotonicClock, ReadyWatch }
 import silk.core.option { Option }
 import silk.system.system_clock { Instant, SystemClock }
 
@@ -58,6 +58,15 @@ impl MonotonicClock for FixedClock {
 
   effect fn waitFor(self: &mut Self, howLong: u64) -> () {
     return ()
+  }
+  effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Instant>) -> usize {
+    if watch.length > 0 { Intrinsic.trap("this clock has no handles to watch") }
+    match move until {
+      Option<Instant>.None => {}
+      Option<Instant>.Some {value: when} => {
+      }
+    }
+    return 0
   }
 }
 

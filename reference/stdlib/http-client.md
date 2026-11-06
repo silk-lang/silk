@@ -31,7 +31,9 @@ module. Fields that are private to another module are not written.
 ```silk
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
+import silk.collections.list { List }
 import silk.http.client { Http, HttpError, Request, Response }
+import silk.core.result { Result }
 import silk.text.string { String }
 
 struct FakeHttp {
@@ -39,6 +41,12 @@ struct FakeHttp {
 }
 
 impl Http for FakeHttp {
+  effect fn sendAll(self: &mut Self, requests: List<Request>) -> List<Result<Response, HttpError>>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run Http.sendEach(move requests) |> Effect.provideMut<Http>(&mut self.*)
+  }
+
   effect fn send(self: &mut Self, request: Request) -> Response
     ! HttpError | OutOfMemoryError
     ? &mut Allocator {
@@ -1320,6 +1328,28 @@ It checks the request first. A response with a 4xx or 5xx status is a success. C
   `InvalidRequest`.
 - `OutOfMemoryError` if the `Allocator` fails.
 
+<a id="Http.sendAll"></a>
+
+### Operation `sendAll`
+
+```silk
+effect fn sendAll(requests: List<Request>) -> List<Result<Response, HttpError>>
+  ! OutOfMemoryError
+  ? &mut Http | &mut Allocator
+```
+
+Sends all `requests` and returns their results in the same order.
+
+#### Details
+
+The provider may send them at the same time. `NativeHttp` runs up to 32 of them at once on
+one thread. A provider that sends one at a time can forward to [`Http.sendEach`](#Http.impl.sendEach). Each result
+is what [`Http.send`](#Http.send) would return for its request.
+
+#### Errors
+
+- `OutOfMemoryError` if the `Allocator` fails. The failure of one request is its result.
+
 <a id="Http.impl"></a>
 
 ## Implementation `Http`
@@ -1327,6 +1357,22 @@ It checks the request first. A response with a 4xx or 5xx status is a success. C
 ```silk
 impl Http
 ```
+
+<a id="Http.impl.sendEach"></a>
+
+### Associated function `sendEach`
+
+```silk
+pub effect fn sendEach(requests: List<Request>) -> List<Result<Response, HttpError>>
+  ! OutOfMemoryError
+  ? &mut Http | &mut Allocator
+```
+
+Sends `requests` one after another with [`Http.send`](#Http.send) and returns their results in order.
+
+#### When to use
+
+A provider that has no faster way implements [`Http.sendAll`](#Http.sendAll) with it.
 
 <a id="Http.impl.get"></a>
 

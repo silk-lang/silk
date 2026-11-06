@@ -19,6 +19,23 @@
 //! - A local that every return path moves or copies whole into the result local, as its last use,
 //!   becomes the result local itself, so it is built in the caller's result storage.
 //!
+//! - An aggregate, variant or union operand that is a temporary snapshot of a place, taken earlier
+//!   in the same block with nothing in between touching that place, reads the place itself. The
+//!   operand is copied into the new value either way, so the place need not be dead afterwards. A
+//!   wrapper such as an effect combinator builds its value around the effect it received without
+//!   first moving that effect into a temporary.
+//!
+//! - A temporary written only whole and moved or copied whole into another temporary, or into a
+//!   `let` binding that the copy alone writes, becomes that local, so each arm of an `if` or
+//!   `match` writes the value of the whole expression, or the binding it initializes. The
+//!   backend then lets every call that writes such a temporary write a large `let` binding that
+//!   the move alone defines (`joinBindings`).
+//!
+//! - A local built whole by one aggregate of moved locals, and otherwise named only through its
+//!   fields, becomes those locals when it is an Effect or lives in a suspending frame. A composed
+//!   Effect built from its function's parameters then runs on the parameters' own storage instead
+//!   of a copy of them.
+//!
 //! All keep the invariants `MirVerification.callDestinationsFresh` checks: a destination is still a
 //! whole temporary or the result local, never borrowed, and named by no argument.
 
@@ -28,6 +45,7 @@ import backend.Mir {
   AssemblyFragment,
   Block,
   Callee,
+  copyPlace,
   Cancel,
   Diagnostics,
   FailureEdge,
@@ -47,6 +65,7 @@ import semantic.TypedBody {Origin}
 import semantic.Types {Types}
 import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.mem.box {Box}
+import silk.mem.shared {Shared}
 import silk.collections.list {List}
 import silk.core.option {Option}
 import silk.core.ownership {Copy}
@@ -57,11 +76,17 @@ import silk.num.usize
 pub effect fn coalesce(function: &mut MirFunction) -> () ! OutOfMemoryError ? &mut Allocator | &mut Types {
   // Collapsing first folds each return's own temporary into `_0 = r`, which the rename needs.
   run collapseCopies(&mut function.*)
+  run mergeJoins(&mut function.*, false)
+  run mergeJoins(&mut function.*, true)
+  run aliasParts(&mut function.*)
   run renameReturned(&mut function.*)
-  if !hasCall(&function.*) { return () }
   let mut table = run UseTable.of(&function.*)
-  run forwardResults(&mut function.*, &mut table)
-  return run forwardArguments(&mut function.*, &mut table)
+  run forwardFields(&mut function.*, &mut table)
+  if hasCall(&function.*) {
+    run forwardResults(&mut function.*, &mut table)
+    run forwardArguments(&mut function.*, &mut table)
+  }
+  return run splitAggregates(&mut function.*)
 }
 
 // Whether `callee` follows the Silk calling convention rather than a C signature.
@@ -540,6 +565,7 @@ effect fn renameReturned(function: &mut MirFunction) -> () ! OutOfMemoryError ? 
   if bodySize(&function.*) < smallBody { return () }
   let returned = run returnedLocal(&function.*)
   if returned == usize.MAX { return () }
+  let mut rename = Rename.make(returned, Place {local: usize.ZERO, projections: List<Projection>.make()}, true)
   let mut blocks = List<Block>.asMutSlice(&mut function.blocks)
   let mut block = usize.ZERO
   while block < blocks.length {
@@ -553,12 +579,13 @@ effect fn renameReturned(function: &mut MirFunction) -> () ! OutOfMemoryError ? 
         drop List<Statement>.remove(&mut blocks[block].statements, at)
         continue
       }
-      renameStatement(&mut List<Statement>.asMutSlice(&mut blocks[block].statements)[at], returned)
+      run renameStatement(&mut List<Statement>.asMutSlice(&mut blocks[block].statements)[at], &mut rename)
       at = at + usize.ONE
     }
-    renameTerminator(&mut blocks[block].terminator, returned)
+    run renameTerminator(&mut blocks[block].terminator, &mut rename)
     block = block + usize.ONE
   }
+  drop rename
   moveVariables(&mut function.*, returned, usize.ZERO)
   // Drops of the local on paths that do not return it, such as a failure exit, now drop the
   // result local, guarded by the same flags.
@@ -592,128 +619,182 @@ fn moveVariables(function: &mut MirFunction, from: usize, to: usize) -> () {
   return ()
 }
 
-fn renamePlace(place: &mut Place, local: usize) -> () {
-  if place.local == local { place.local = usize.ZERO }
+// One local renamed to a place: `from` becomes `target`, whose projections go before the place's
+// own. `count` counts the names of `from` that the walk passed, and `blocked` whether one was an
+// index or a dereference, which a place with projections before it cannot take. Without `write`
+// the walk only counts.
+struct Rename {
+  from: usize,
+  target: Place,
+  count: usize,
+  blocked: bool,
+  write: bool,
+}
+
+impl Rename {
+  fn make(from: usize, target: Place, write: bool) -> Rename {
+    return Rename {from: from, target: move target, count: usize.ZERO, blocked: false, write: write}
+  }
+}
+
+fn copyProjection(projection: &Projection) -> Projection {
+  return match &projection.* {
+    Projection.Field {index} => Projection.Field {index: index}
+    Projection.Payload {index, ty} => Projection.Payload {index: index, ty: Shared<Type>.clone(&ty)}
+    Projection.VariantField {variant, field} => Projection.VariantField {variant: variant, field: field}
+    Projection.Index {local} => Projection.Index {local: local}
+    Projection.ConstIndex {index} => Projection.ConstIndex {index: index}
+    Projection.Deref => Projection.Deref
+  }
+}
+
+effect fn renamePlace(place: &mut Place, rename: &mut Rename) -> () ! OutOfMemoryError ? &mut Allocator {
   let mut steps = List<Projection>.asMutSlice(&mut place.projections)
   let mut at = usize.ZERO
   while at < steps.length {
     if let Projection.Index {local: index} = &mut steps[at] {
-      if index == local { index = usize.ZERO }
+      if index == rename.from {
+        rename.count = rename.count + usize.ONE
+        rename.blocked = true
+        if rename.write { index = rename.target.local }
+      }
     }
     at = at + usize.ONE
   }
+  drop steps
+  if place.local != rename.from { return () }
+  rename.count = rename.count + usize.ONE
+  let first = List<Projection>.asSlice(&place.projections)
+  if first.length != usize.ZERO {
+    if let Projection.Deref = &first[usize.ZERO] { rename.blocked = true }
+  }
+  drop first
+  if !rename.write { return () }
+  if List<Projection>.length(&rename.target.projections) == usize.ZERO {
+    place.local = rename.target.local
+    return ()
+  }
+  let mut joined = run copyPlace(&rename.target)
+  let own = List<Projection>.asSlice(&place.projections)
+  let mut step = usize.ZERO
+  while step < own.length {
+    run List<Projection>.append(&mut joined.projections, copyProjection(&own[step]))
+    step = step + usize.ONE
+  }
+  drop own
+  place.* = move joined
   return ()
 }
 
-fn renameOperand(operand: &mut Operand, local: usize) -> () {
+effect fn renameOperand(operand: &mut Operand, rename: &mut Rename) -> () ! OutOfMemoryError ? &mut Allocator {
   match &mut operand.* {
-    Operand.Copy {place} => renamePlace(&mut place, local)
-    Operand.Move {place} => renamePlace(&mut place, local)
+    Operand.Copy {place} => run renamePlace(&mut place, &mut rename.*)
+    Operand.Move {place} => run renamePlace(&mut place, &mut rename.*)
     _ => ()
   }
   return ()
 }
 
-fn renameOperands(operands: &mut List<Operand>, local: usize) -> () {
+effect fn renameOperands(operands: &mut List<Operand>, rename: &mut Rename) -> () ! OutOfMemoryError ? &mut Allocator {
   let mut listed = List<Operand>.asMutSlice(&mut operands.*)
   let mut at = usize.ZERO
   while at < listed.length {
-    renameOperand(&mut listed[at], local)
+    run renameOperand(&mut listed[at], &mut rename.*)
     at = at + usize.ONE
   }
   return ()
 }
 
-fn renameFields(fields: &mut List<AggregateField>, local: usize) -> () {
+effect fn renameFields(fields: &mut List<AggregateField>, rename: &mut Rename) -> () ! OutOfMemoryError ? &mut Allocator {
   let mut listed = List<AggregateField>.asMutSlice(&mut fields.*)
   let mut at = usize.ZERO
   while at < listed.length {
-    renameOperand(&mut listed[at].value, local)
+    run renameOperand(&mut listed[at].value, &mut rename.*)
     at = at + usize.ONE
   }
   return ()
 }
 
 // Every place `rvalueNames` counts except assembly inputs, which `returnedLocal` rules out.
-fn renameRvalue(value: &mut Rvalue, local: usize) -> () {
+effect fn renameRvalue(value: &mut Rvalue, rename: &mut Rename) -> () ! OutOfMemoryError ? &mut Allocator {
   match &mut value.* {
-    Rvalue.Aggregate {fields} => renameFields(&mut fields, local)
+    Rvalue.Aggregate {fields} => run renameFields(&mut fields, &mut rename.*)
     Rvalue.Slice {data, count} => {
-      renameOperand(&mut data, local)
-      renameOperand(&mut count, local)
+      run renameOperand(&mut data, &mut rename.*)
+      run renameOperand(&mut count, &mut rename.*)
     }
-    Rvalue.SliceLength {place} => renamePlace(&mut place, local)
-    Rvalue.SliceData {place} => renamePlace(&mut place, local)
+    Rvalue.SliceLength {place} => run renamePlace(&mut place, &mut rename.*)
+    Rvalue.SliceData {place} => run renamePlace(&mut place, &mut rename.*)
     Rvalue.PointerOffset {pointer, index, ..} => {
-      renameOperand(&mut pointer, local)
-      renameOperand(&mut index, local)
+      run renameOperand(&mut pointer, &mut rename.*)
+      run renameOperand(&mut index, &mut rename.*)
     }
-    Rvalue.Use {value: used} => renameOperand(&mut used, local)
-    Rvalue.Ref {place, ..} => renamePlace(&mut place, local)
-    Rvalue.AddressOf {place, ..} => renamePlace(&mut place, local)
-    Rvalue.Unary {value: used, ..} => renameOperand(&mut used, local)
+    Rvalue.Use {value: used} => run renameOperand(&mut used, &mut rename.*)
+    Rvalue.Ref {place, ..} => run renamePlace(&mut place, &mut rename.*)
+    Rvalue.AddressOf {place, ..} => run renamePlace(&mut place, &mut rename.*)
+    Rvalue.Unary {value: used, ..} => run renameOperand(&mut used, &mut rename.*)
     Rvalue.Binary {left, right, ..} => {
-      renameOperand(&mut left, local)
-      renameOperand(&mut right, local)
+      run renameOperand(&mut left, &mut rename.*)
+      run renameOperand(&mut right, &mut rename.*)
     }
     Rvalue.ScalarBinary {left, right, ..} => {
-      renameOperand(&mut left, local)
-      renameOperand(&mut right, local)
+      run renameOperand(&mut left, &mut rename.*)
+      run renameOperand(&mut right, &mut rename.*)
     }
-    Rvalue.ScalarUnary {value: used, ..} => renameOperand(&mut used, local)
-    Rvalue.Convert {value: used, ..} => renameOperand(&mut used, local)
-    Rvalue.Fits {value: used, ..} => renameOperand(&mut used, local)
-    Rvalue.AddressIntegerConversion {operand, ..} => renameOperand(&mut operand, local)
-    Rvalue.Bitcast {value: used, ..} => renameOperand(&mut used, local)
-    Rvalue.Discriminant {place} => renamePlace(&mut place, local)
-    Rvalue.Inject {value: used, ..} => renameOperand(&mut used, local)
-    Rvalue.Variant {fields, ..} => renameFields(&mut fields, local)
-    Rvalue.ContextOf {place} => renamePlace(&mut place, local)
-    Rvalue.ContextHandle {address} => renameOperand(&mut address, local)
-    Rvalue.Atomic {operands, ..} => renameOperands(&mut operands, local)
-    Rvalue.Vector {operands, ..} => renameOperands(&mut operands, local)
-    Rvalue.StackAllocate {count, ..} => renameOperand(&mut count, local)
-    Rvalue.Wasm {operands, ..} => renameOperands(&mut operands, local)
+    Rvalue.ScalarUnary {value: used, ..} => run renameOperand(&mut used, &mut rename.*)
+    Rvalue.Convert {value: used, ..} => run renameOperand(&mut used, &mut rename.*)
+    Rvalue.Fits {value: used, ..} => run renameOperand(&mut used, &mut rename.*)
+    Rvalue.AddressIntegerConversion {operand, ..} => run renameOperand(&mut operand, &mut rename.*)
+    Rvalue.Bitcast {value: used, ..} => run renameOperand(&mut used, &mut rename.*)
+    Rvalue.Discriminant {place} => run renamePlace(&mut place, &mut rename.*)
+    Rvalue.Inject {value: used, ..} => run renameOperand(&mut used, &mut rename.*)
+    Rvalue.Variant {fields, ..} => run renameFields(&mut fields, &mut rename.*)
+    Rvalue.ContextOf {place} => run renamePlace(&mut place, &mut rename.*)
+    Rvalue.ContextHandle {address} => run renameOperand(&mut address, &mut rename.*)
+    Rvalue.Atomic {operands, ..} => run renameOperands(&mut operands, &mut rename.*)
+    Rvalue.Vector {operands, ..} => run renameOperands(&mut operands, &mut rename.*)
+    Rvalue.StackAllocate {count, ..} => run renameOperand(&mut count, &mut rename.*)
+    Rvalue.Wasm {operands, ..} => run renameOperands(&mut operands, &mut rename.*)
     _ => ()
   }
   return ()
 }
 
-fn renameStatement(statement: &mut Statement, local: usize) -> () {
+effect fn renameStatement(statement: &mut Statement, rename: &mut Rename) -> () ! OutOfMemoryError ? &mut Allocator {
   match &mut statement.* {
     Statement.Assign {destination, value, ..} => {
-      renamePlace(&mut destination, local)
-      renameRvalue(&mut value, local)
+      run renamePlace(&mut destination, &mut rename.*)
+      run renameRvalue(&mut value, &mut rename.*)
     }
-    Statement.Drop {destination, ..} => renamePlace(&mut destination, local)
+    Statement.Drop {destination, ..} => run renamePlace(&mut destination, &mut rename.*)
     Statement.FailureContext {destination, source, ..} => {
-      renamePlace(&mut destination, local)
-      if let Option<Place>.Some {value: from} = &mut source { renamePlace(&mut from, local) }
+      run renamePlace(&mut destination, &mut rename.*)
+      if let Option<Place>.Some {value: from} = &mut source { run renamePlace(&mut from, &mut rename.*) }
     }
     Statement.SetContextHandle {address, value, ..} => {
-      renameOperand(&mut address, local)
-      renameOperand(&mut value, local)
+      run renameOperand(&mut address, &mut rename.*)
+      run renameOperand(&mut value, &mut rename.*)
     }
   }
   return ()
 }
 
 // Every place `terminatorNames` counts except diagnostics, which `returnedLocal` rules out.
-fn renameTerminator(terminator: &mut Terminator, local: usize) -> () {
+effect fn renameTerminator(terminator: &mut Terminator, rename: &mut Rename) -> () ! OutOfMemoryError ? &mut Allocator {
   match &mut terminator.* {
-    Terminator.Branch {condition, ..} => renameOperand(&mut condition, local)
-    Terminator.Switch {value, ..} => renameOperand(&mut value, local)
-    Terminator.TrapText {reason, ..} => renameOperand(&mut reason, local)
+    Terminator.Branch {condition, ..} => run renameOperand(&mut condition, &mut rename.*)
+    Terminator.Switch {value, ..} => run renameOperand(&mut value, &mut rename.*)
+    Terminator.TrapText {reason, ..} => run renameOperand(&mut reason, &mut rename.*)
     Terminator.Call {callee, arguments, providers, destination, failure, ..} => {
-      renameOperands(&mut arguments, local)
-      renameOperands(&mut providers, local)
-      renamePlace(&mut destination, local)
+      run renameOperands(&mut arguments, &mut rename.*)
+      run renameOperands(&mut providers, &mut rename.*)
+      run renamePlace(&mut destination, &mut rename.*)
       match &mut callee {
-        Callee.Indirect {address} => renameOperand(&mut address, local)
-        Callee.NativeIndirect {address, ..} => renameOperand(&mut address, local)
+        Callee.Indirect {address} => run renameOperand(&mut address, &mut rename.*)
+        Callee.NativeIndirect {address, ..} => run renameOperand(&mut address, &mut rename.*)
         _ => ()
       }
-      if let Option<FailureEdge>.Some {value: edge} = &mut failure { renamePlace(&mut edge.destination, local) }
+      if let Option<FailureEdge>.Some {value: edge} = &mut failure { run renamePlace(&mut edge.destination, &mut rename.*) }
     }
     _ => ()
   }
@@ -787,6 +868,386 @@ effect fn returnedLocal(function: &MirFunction) -> usize ! OutOfMemoryError ? &m
   }
   if run reachedNames(function, &exits, returned) { return usize.MAX }
   return returned
+}
+
+// Where a temporary is written whole: statement `index` of `block`, or its terminator when `index`
+// is `usize.MAX`. `next` links the local's next site, or is `usize.MAX`.
+struct JoinSite {
+  block: usize,
+  index: usize,
+  next: usize,
+}
+
+impl Copy for JoinSite {}
+
+// The whole writes of every temporary, gathered in one walk, as one linked list of sites for each
+// local.
+struct JoinSites {
+  sites: List<JoinSite>,
+  first: List<usize>,
+  count: List<usize>,
+}
+
+impl JoinSites {
+  effect fn of(function: &MirFunction) -> JoinSites ! OutOfMemoryError ? &mut Allocator {
+    let locals = List<Local>.asSlice(&function.locals)
+    let mut table = JoinSites {
+      sites: List<JoinSite>.make(),
+      first: run List<usize>.makeWithCapacity(locals.length),
+      count: run List<usize>.makeWithCapacity(locals.length),
+    }
+    run List<usize>.appendRepeated(&mut table.first, usize.MAX, locals.length)
+    run List<usize>.appendRepeated(&mut table.count, usize.ZERO, locals.length)
+    let blocks = List<Block>.asSlice(&function.blocks)
+    let mut block = usize.ZERO
+    while block < blocks.length {
+      let statements = List<Statement>.asSlice(&blocks[block].statements)
+      let mut index = usize.ZERO
+      while index < statements.length {
+        if let Statement.Assign {destination, ..} = &statements[index] {
+          let local = wholePlace(&destination)
+          if local != usize.MAX && isUserOrTemp(function, local) { run table.add(local, block, index) }
+        }
+        index = index + usize.ONE
+      }
+      if let Terminator.Call {destination, ..} = &blocks[block].terminator {
+        let local = wholePlace(&destination)
+        if local != usize.MAX && isUserOrTemp(function, local) { run table.add(local, block, usize.MAX) }
+      }
+      block = block + usize.ONE
+    }
+    return move table
+  }
+
+  effect fn add(self: &mut Self, local: usize, block: usize, index: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let head = List<usize>.get(&self.first, local)
+    List<usize>.set(&mut self.first, local, List<JoinSite>.length(&self.sites))
+    let count = List<usize>.get(&self.count, local)
+    List<usize>.set(&mut self.count, local, count + usize.ONE)
+    return run List<JoinSite>.append(&mut self.sites, JoinSite {block: block, index: index, next: head})
+  }
+
+  // Moves the sites of `from` to `into`, leaving out the site of statement `index` of `block`.
+  fn merge(self: &mut Self, from: usize, into: usize, block: usize, index: usize) -> () {
+    let mut sites = List<JoinSite>.asMutSlice(&mut self.sites)
+    let mut kept = usize.MAX
+    let mut count = usize.ZERO
+    let mut lists: [usize; 2] = [List<usize>.get(&self.first, into), List<usize>.get(&self.first, from)]
+    let mut list = usize.ZERO
+    while list < 2 {
+      let mut at = lists[list]
+      while at != usize.MAX {
+        let next = sites[at].next
+        if !(sites[at].block == block && sites[at].index == index) {
+          sites[at].next = kept
+          kept = at
+          count = count + usize.ONE
+        }
+        at = next
+      }
+      list = list + usize.ONE
+    }
+    List<usize>.set(&mut self.first, into, kept)
+    List<usize>.set(&mut self.count, into, count)
+    List<usize>.set(&mut self.first, from, usize.MAX)
+    List<usize>.set(&mut self.count, from, usize.ZERO)
+    return ()
+  }
+}
+
+// The most blocks `joinable` walks for one copy before it gives up on it.
+fn joinWalkLimit() -> usize { return 256 }
+
+// Merges a temporary that is only ever written whole, and read only by one whole move or copy into
+// another temporary, into that temporary. The arms of an `if` or `match` each write the value of
+// the arm into a temporary of their own, which a join block then copies into the temporary of the
+// whole expression, so a nested `match` copies a large result once for each level. After the merge
+// each arm writes the outer temporary directly. No block that a write of the inner temporary
+// reaches before the copy may name the outer one, so its earlier value is dead wherever the inner
+// one was live.
+//
+// With `bindings`, the target is instead a `let` binding that the copy alone writes, after every
+// temporary has merged, so a call that writes the join still writes a temporary and the backend's
+// `joinBindings` lets it write the binding.
+effect fn mergeJoins(function: &mut MirFunction, bindings: bool) -> () ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut table = run UseTable.of(&function.*)
+  let mut sites = run JoinSites.of(&function.*)
+  let mut removed = List<JoinSite>.make()
+  let mut block = usize.ZERO
+  while block < List<Block>.length(&function.blocks) {
+    let mut at = usize.ZERO
+    while at < List<Statement>.length(&List<Block>.asSlice(&function.blocks)[block].statements) {
+      let mut source = usize.MAX
+      let mut target = usize.MAX
+      if let Statement.Assign {destination, value: Rvalue.Use {value: used}, ..} = &List<Statement>.asSlice(&List<Block>.asSlice(&function.blocks)[block].statements)[at] {
+        source = wholeLocal(&used)
+        target = wholePlace(&destination)
+      }
+      if source != usize.MAX && target != usize.MAX && isTemp(&function.*, target) != bindings && run joinable(&function.*, &table, &sites, block, at, source, target) {
+        renameSites(&mut function.*, &sites, source, target)
+        moveVariables(&mut function.*, source, target)
+        let mut named = List<usize>.asMutSlice(&mut table.named)
+        named[target] = named[target] + named[source] - 2
+        named[source] = usize.ZERO
+        sites.merge(source, target, block, at)
+        run List<JoinSite>.append(&mut removed, JoinSite {block: block, index: at, next: usize.MAX})
+      }
+      at = at + usize.ONE
+    }
+    block = block + usize.ONE
+  }
+  // The copies were found in increasing order; removing them from the last keeps each index valid.
+  let mut blocks = List<Block>.asMutSlice(&mut function.blocks)
+  let mut left = List<JoinSite>.length(&removed)
+  while left > usize.ZERO {
+    left = left - usize.ONE
+    let site = List<JoinSite>.get(&removed, left)
+    drop List<Statement>.remove(&mut blocks[site.block].statements, site.index)
+  }
+  return ()
+}
+
+// Whether `source` can be merged into `target` at the copy `target = source`, statement `at` of
+// `block`.
+effect fn joinable(
+  function: &MirFunction,
+  table: &UseTable,
+  sites: &JoinSites,
+  block: usize,
+  at: usize,
+  source: usize,
+  target: usize,
+) -> bool ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  if source == target || !isTemp(function, source) { return false }
+  // A `let` binding of a declared type that this copy alone writes holds nothing before it, so no
+  // borrow or unconditional drop of it can see the earlier writes. Its writes stay statements: a call writes only a temporary.
+  let binding = !isTemp(function, target)
+  if binding && (!boundOnlyHere(function, sites, target, block, at) || !nominal(&List<Local>.asSlice(&function.locals)[target].ty)) { return false }
+  let writes = List<usize>.get(&sites.count, source)
+  let sourceUses = UseTable.uses(table, source)
+  // Every name of the source but this copy is one of its whole writes.
+  if writes == usize.ZERO || sourceUses.named != writes + usize.ONE { return false }
+  if sourceUses.borrowed || sourceUses.dropped || UseTable.flagged(table, source) { return false }
+  let targetUses = UseTable.uses(table, target)
+  if UseTable.flagged(table, target) { return false }
+  if !binding && (targetUses.borrowed || targetUses.dropped) { return false }
+  let locals = List<Local>.asSlice(&function.locals)
+  if !(run Type.equalsShared(&locals[source].ty, &locals[target].ty)) { return false }
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let mut pending = List<usize>.make()
+  let all = List<JoinSite>.asSlice(&sites.sites)
+  let mut site = List<usize>.get(&sites.first, source)
+  while site != usize.MAX {
+    let write = all[site]
+    site = write.next
+    if write.index == usize.MAX {
+      if binding { return false }
+      // A call writes the source and continues to its successors, which the walk below checks.
+      if terminatorNames(&blocks[write.block].terminator, target) != usize.ZERO { return false }
+      if terminatorNames(&blocks[write.block].terminator, source) != usize.ONE { return false }
+      let following = run MirFunction.successors(function, write.block)
+      run List<usize>.appendSlice(&mut pending, List<usize>.asSlice(&following))
+      continue
+    }
+    let statements = List<Statement>.asSlice(&blocks[write.block].statements)
+    if statementNames(&statements[write.index], source) != usize.ONE { return false }
+    if statementNames(&statements[write.index], target) != usize.ZERO { return false }
+    // A write before the copy in its own block reaches the copy first.
+    let mut end = statements.length
+    if write.block == block && write.index < at { end = at }
+    let mut index = write.index + usize.ONE
+    while index < end {
+      if statementNames(&statements[index], target) != usize.ZERO { return false }
+      index = index + usize.ONE
+    }
+    if end == at && write.block == block { continue }
+    if terminatorNames(&blocks[write.block].terminator, target) != usize.ZERO { return false }
+    let following = run MirFunction.successors(function, write.block)
+    run List<usize>.appendSlice(&mut pending, List<usize>.asSlice(&following))
+  }
+  let mut seen = List<bool>.make()
+  run List<bool>.appendRepeated(&mut seen, false, blocks.length)
+  let mut walked = usize.ZERO
+  while true {
+    let next = match List<usize>.pop(&mut pending) {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => { break }
+    }
+    if List<bool>.get(&seen, next) { continue }
+    List<bool>.set(&mut seen, next, true)
+    walked = walked + usize.ONE
+    if walked > joinWalkLimit() { return false }
+    if next == block {
+      // The walk stops at the copy, where the target is written.
+      let statements = List<Statement>.asSlice(&blocks[next].statements)
+      let mut index = usize.ZERO
+      while index < at {
+        if statementNames(&statements[index], target) != usize.ZERO { return false }
+        index = index + usize.ONE
+      }
+      continue
+    }
+    if blockNames(function, &blocks[next], target) != usize.ZERO { return false }
+    let following = run MirFunction.successors(function, next)
+    run List<usize>.appendSlice(&mut pending, List<usize>.asSlice(&following))
+  }
+  return true
+}
+
+// Turns a local that one move or copy out of a part of a temporary alone writes into that part, when
+// nothing after the move names the temporary. `let head = match move parsed { Success {value} =>
+// value ... }` then keeps the head where the call that made `parsed` wrote it, instead of copying
+// it out of the result. The local's drops and borrows name the part instead, and its debug
+// variable has no slot.
+effect fn aliasParts(function: &mut MirFunction) -> () ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut table = run UseTable.of(&function.*)
+  let mut sites = run JoinSites.of(&function.*)
+  let mut block = usize.ZERO
+  while block < List<Block>.length(&function.blocks) {
+    let mut at = usize.ZERO
+    while at < List<Statement>.length(&List<Block>.asSlice(&function.blocks)[block].statements) {
+      let mut bound = usize.MAX
+      let mut part = Option<Place>.none()
+      if let Statement.Assign {destination, value: Rvalue.Use {value: used}, ..} = &List<Statement>.asSlice(&List<Block>.asSlice(&function.blocks)[block].statements)[at] {
+        bound = wholePlace(&destination)
+        // A copy whose source nothing names afterwards is a move as well.
+        let read = match &used {
+          Operand.Move {place} => Option<&Place>.some(&place)
+          Operand.Copy {place} => Option<&Place>.some(&place)
+          _ => Option<&Place>.none()
+        }
+        if let Option<&Place>.Some {value: source} = move read {
+          if bound != usize.MAX && partPath(source) && source.local != bound {
+            part = Option<Place>.some(run copyPlace(source))
+          }
+        }
+      }
+      if let Option<Place>.Some {value: source} = move part {
+        // A rename walk must pass every name of `bound`, none of them an index; a name it does
+        // not reach, such as in diagnostics, keeps `bound` a local.
+        let mut counting = Rename.make(bound, run copyPlace(&source), false)
+        if run aliasable(&function.*, &table, &sites, block, at, bound, &source) {
+          run renameAll(&mut function.*, &mut counting)
+        }
+        if counting.count == UseTable.uses(&table, bound).named && !counting.blocked && counting.count != usize.ZERO {
+          drop List<Statement>.remove(&mut List<Block>.asMutSlice(&mut function.blocks)[block].statements, at)
+          let mut rename = Rename.make(bound, move source, true)
+          run renameAll(&mut function.*, &mut rename)
+          drop rename
+          moveVariables(&mut function.*, bound, usize.MAX)
+          table = run UseTable.of(&function.*)
+          sites = run JoinSites.of(&function.*)
+          continue
+        }
+      }
+      at = at + usize.ONE
+    }
+    block = block + usize.ONE
+  }
+  return ()
+}
+
+// Whether a place is a part of its local at a fixed offset: fields, constant elements, and members
+// of a variant or union, with no index or dereference.
+fn partPath(place: &Place) -> bool {
+  let steps = List<Projection>.asSlice(&place.projections)
+  if steps.length == usize.ZERO { return false }
+  let mut at = usize.ZERO
+  while at < steps.length {
+    let fixed = match &steps[at] {
+      Projection.Field {..} => true
+      Projection.ConstIndex {..} => true
+      Projection.VariantField {..} => true
+      Projection.Payload {..} => true
+      _ => false
+    }
+    if !fixed { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn renameAll(function: &mut MirFunction, rename: &mut Rename) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut blocks = List<Block>.asMutSlice(&mut function.blocks)
+  let mut block = usize.ZERO
+  while block < blocks.length {
+    let mut statements = List<Statement>.asMutSlice(&mut blocks[block].statements)
+    let mut at = usize.ZERO
+    while at < statements.length {
+      run renameStatement(&mut statements[at], &mut rename.*)
+      at = at + usize.ONE
+    }
+    drop statements
+    run renameTerminator(&mut blocks[block].terminator, &mut rename.*)
+    block = block + usize.ONE
+  }
+  return ()
+}
+
+// Whether `bound = source`, statement `at` of `block`, can make `bound` the place `source`.
+// `bound` is a user binding or temporary of a declared type that this move alone writes whole,
+// with no drop flag; `source` is a part of a temporary that nothing borrows or guards with a drop
+// flag, and that no statement after the move names, in its block or in any block it can reach.
+effect fn aliasable(
+  function: &MirFunction,
+  table: &UseTable,
+  sites: &JoinSites,
+  block: usize,
+  at: usize,
+  bound: usize,
+  source: &Place,
+) -> bool ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let whole = source.local
+  if !isUserOrTemp(function, bound) || !isTemp(function, whole) { return false }
+  // Only a declared type can be large enough for its copy to matter; a scalar is a register.
+  if !nominal(&List<Local>.asSlice(&function.locals)[bound].ty) { return false }
+  if List<usize>.get(&sites.count, bound) != usize.ONE { return false }
+  let only = List<JoinSite>.get(&sites.sites, List<usize>.get(&sites.first, bound))
+  if only.block != block || only.index != at { return false }
+  if UseTable.flagged(table, bound) { return false }
+  let sourceUses = UseTable.uses(table, whole)
+  if sourceUses.borrowed || UseTable.flagged(table, whole) { return false }
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let statements = List<Statement>.asSlice(&blocks[block].statements)
+  let mut index = at + usize.ONE
+  while index < statements.length {
+    if statementNames(&statements[index], whole) != usize.ZERO { return false }
+    index = index + usize.ONE
+  }
+  if terminatorNames(&blocks[block].terminator, whole) != usize.ZERO { return false }
+  let following = run MirFunction.successors(function, block)
+  if run reachedNames(function, &following, whole) { return false }
+  return true
+}
+
+// Whether `local` is a user binding whose only whole write is statement `at` of `block`.
+fn boundOnlyHere(function: &MirFunction, sites: &JoinSites, local: usize, block: usize, at: usize) -> bool {
+  match &List<Local>.asSlice(&function.locals)[local].kind {
+    LocalKind.User {..} => ()
+    _ => { return false }
+  }
+  if List<usize>.get(&sites.count, local) != usize.ONE { return false }
+  let only = List<JoinSite>.get(&sites.sites, List<usize>.get(&sites.first, local))
+  return only.block == block && only.index == at
+}
+
+// Names `target` at every whole write of `source`, which `joinable` found are its only names but
+// the copy.
+fn renameSites(function: &mut MirFunction, sites: &JoinSites, source: usize, target: usize) -> () {
+  let all = List<JoinSite>.asSlice(&sites.sites)
+  let mut blocks = List<Block>.asMutSlice(&mut function.blocks)
+  let mut site = List<usize>.get(&sites.first, source)
+  while site != usize.MAX {
+    let write = all[site]
+    site = write.next
+    if write.index == usize.MAX {
+      if let Terminator.Call {destination, ..} = &mut blocks[write.block].terminator { destination.local = target }
+      continue
+    }
+    let mut statements = List<Statement>.asMutSlice(&mut blocks[write.block].statements)
+    if let Statement.Assign {destination, ..} = &mut statements[write.index] { destination.local = target }
+  }
+  return ()
 }
 
 // Collapses `b = v; ...; a = b` within a block into `a = v` when `b` is a whole user binding or
@@ -1007,6 +1468,107 @@ pub effect fn bindingCandidate(function: &MirFunction, at: usize) -> usize ! Out
   return binding
 }
 
+/// A `let` binding that the calls writing a temporary can write instead, for the move of that
+/// temporary into the binding at statement `index` of `block`.
+pub struct JoinBinding {
+  pub block: usize,
+  pub index: usize,
+  pub binding: usize,
+  /// The blocks whose calls write the temporary.
+  pub calls: List<usize>,
+}
+
+/// The moves `x = t` where every write of the temporary `t` is a call and `x` is a borrowed `let`
+/// binding that the move alone defines, such as `let x = match ... { ... => run f(...) }` or
+/// `let x = if c { run f() } else { run g() }`: each call can write the binding, and the move
+/// then has nothing to do.
+///
+/// The argument is the one of [`bindingCandidate`] for each of the calls: the move is the
+/// binding's only definition, so no earlier value of it is live wherever the temporary is, and the
+/// temporary is named nowhere but by the calls and the move. Moves that `bindingCandidate` takes
+/// are found too; the backend takes those first.
+pub effect fn joinBindings(function: &MirFunction) -> List<JoinBinding> ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut result = List<JoinBinding>.make()
+  if !hasCall(function) { return move result }
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let locals = List<Local>.asSlice(&function.locals)
+  // Whole statement writes and call writes of each local.
+  let mut written = run List<usize>.makeWithCapacity(locals.length)
+  run List<usize>.appendRepeated(&mut written, usize.ZERO, locals.length)
+  let mut called = run List<usize>.makeWithCapacity(locals.length)
+  run List<usize>.appendRepeated(&mut called, usize.ZERO, locals.length)
+  let mut moves = usize.ZERO
+  let mut block = usize.ZERO
+  while block < blocks.length {
+    let statements = List<Statement>.asSlice(&blocks[block].statements)
+    let mut index = usize.ZERO
+    while index < statements.length {
+      if let Statement.Assign {destination, value, ..} = &statements[index] {
+        let local = wholePlace(&destination)
+        if local != usize.MAX {
+          let count = List<usize>.get(&written, local)
+          List<usize>.set(&mut written, local, count + usize.ONE)
+          if let Rvalue.Use {..} = &value { moves = moves + usize.ONE }
+        }
+      }
+      index = index + usize.ONE
+    }
+    if let Terminator.Call {destination, ..} = &blocks[block].terminator {
+      let local = wholePlace(&destination)
+      if local != usize.MAX {
+        let count = List<usize>.get(&called, local)
+        List<usize>.set(&mut called, local, count + usize.ONE)
+      }
+    }
+    block = block + usize.ONE
+  }
+  if moves == usize.ZERO { return move result }
+  let uses = run UseTable.of(function)
+  block = usize.ZERO
+  while block < blocks.length {
+    let statements = List<Statement>.asSlice(&blocks[block].statements)
+    let mut index = usize.ZERO
+    while index < statements.length {
+      let mut binding = usize.MAX
+      let mut temporary = usize.MAX
+      if let Statement.Assign {destination, value: Rvalue.Use {value: used}, ..} = &statements[index] {
+        binding = wholePlace(&destination)
+        temporary = wholeLocal(&used)
+      }
+      index = index + usize.ONE
+      if binding == usize.MAX || temporary == usize.MAX || binding == temporary { continue }
+      if !isUserOrTemp(function, binding) || isTemp(function, binding) || !isTemp(function, temporary) { continue }
+      let calls = List<usize>.get(&called, temporary)
+      if calls == usize.ZERO || List<usize>.get(&written, temporary) != usize.ZERO { continue }
+      if List<usize>.get(&written, binding) != usize.ONE || List<usize>.get(&called, binding) != usize.ZERO { continue }
+      let temporaryUses = UseTable.uses(&uses, temporary)
+      if temporaryUses.named != calls + usize.ONE || temporaryUses.borrowed || temporaryUses.dropped || UseTable.flagged(&uses, temporary) { continue }
+      if !UseTable.uses(&uses, binding).borrowed || UseTable.flagged(&uses, binding) { continue }
+      if !(run Type.equalsShared(&locals[temporary].ty, &locals[binding].ty)) { continue }
+      let mut writers = List<usize>.make()
+      let mut valid = true
+      let mut at = usize.ZERO
+      while at < blocks.length {
+        if let Terminator.Call {callee, destination, ..} = &blocks[at].terminator {
+          if destination.local == temporary {
+            if !silkCallee(&callee) || terminatorNames(&blocks[at].terminator, temporary) != usize.ONE
+              || terminatorNames(&blocks[at].terminator, binding) != usize.ZERO {
+              valid = false
+              break
+            }
+            run List<usize>.append(&mut writers, at)
+          }
+        }
+        at = at + usize.ONE
+      }
+      if !valid { continue }
+      run List<JoinBinding>.append(&mut result, JoinBinding {block: block, index: index - usize.ONE, binding: binding, calls: move writers})
+    }
+    block = block + usize.ONE
+  }
+  return move result
+}
+
 // A by-value argument and the snapshot statement it can replace.
 struct Snapshot {
   argument: usize,
@@ -1138,4 +1700,772 @@ effect fn argumentCandidates(function: &MirFunction, table: &UseTable, at: usize
     }
   }
   return move ordered
+}
+
+// The operand of an aggregate field, variant field or injection at `index` of `value`, counting
+// fields in order, or none past the last.
+fn operandAt(value: &Rvalue, index: usize) -> Option<&Operand> {
+  return match &value.* {
+    Rvalue.Aggregate {fields} => fieldOperand(&fields, index)
+    Rvalue.Variant {fields, ..} => fieldOperand(&fields, index)
+    Rvalue.Inject {value: injected, ..} => {
+      if index == usize.ZERO { return Option<&Operand>.some(&injected) }
+      return Option<&Operand>.none()
+    }
+    _ => Option<&Operand>.none()
+  }
+}
+
+fn fieldOperand(fields: &List<AggregateField>, index: usize) -> Option<&Operand> {
+  let listed = List<AggregateField>.asSlice(&fields.*)
+  if index >= listed.length { return Option<&Operand>.none() }
+  return Option<&Operand>.some(&listed[index].value)
+}
+
+fn replaceOperandAt(value: &mut Rvalue, index: usize, operand: Operand) -> () {
+  match &mut value.* {
+    Rvalue.Aggregate {fields} => {
+      let mut listed = List<AggregateField>.asMutSlice(&mut fields)
+      listed[index].value = move operand
+    }
+    Rvalue.Variant {fields, ..} => {
+      let mut listed = List<AggregateField>.asMutSlice(&mut fields)
+      listed[index].value = move operand
+    }
+    Rvalue.Inject {value: injected, ..} => { injected = move operand }
+    _ => { drop operand }
+  }
+  return ()
+}
+
+// A field operand at `operand` of the statement at `statement` that can read the place its
+// temporary snapshots, taken by the statement at `snapshot`.
+struct FieldSnapshot {
+  statement: usize,
+  operand: usize,
+  snapshot: usize,
+}
+
+impl Copy for FieldSnapshot {}
+
+effect fn forwardFields(function: &mut MirFunction, table: &mut UseTable) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut block = usize.ZERO
+  while block < List<Block>.length(&function.blocks) {
+    while true {
+      let picked = match fieldCandidate(&function.*, &table.*, block) {
+        Option<FieldSnapshot>.None => { break }
+        Option<FieldSnapshot>.Some {value} => value
+      }
+      let mut blocks = List<Block>.asMutSlice(&mut function.blocks)
+      let removed = List<Statement>.remove(&mut blocks[block].statements, picked.snapshot)
+      let mut temporary = usize.MAX
+      let source = match move removed {
+        Statement.Assign {destination, value: Rvalue.Use {value: used}, ..} => {
+          temporary = wholePlace(&destination)
+          move used
+        }
+        _ => { continue }
+      }
+      let whole = match &source {
+        Operand.Move {place} => wholePlace(&place)
+        Operand.Copy {place} => wholePlace(&place)
+        _ => usize.MAX
+      }
+      let mut statements = List<Statement>.asMutSlice(&mut blocks[block].statements)
+      // The snapshot came first, so the field's statement moved up by one.
+      if let Statement.Assign {value, ..} = &mut statements[picked.statement - usize.ONE] {
+        replaceOperandAt(&mut value, picked.operand, move source)
+      }
+      if whole != usize.MAX { moveVariables(&mut function.*, temporary, whole) }
+      UseTable.forget(&mut table.*, temporary)
+    }
+    block = block + usize.ONE
+  }
+  return ()
+}
+
+fn fieldCandidate(function: &MirFunction, table: &UseTable, block: usize) -> Option<FieldSnapshot> {
+  let statements = List<Statement>.asSlice(&List<Block>.asSlice(&function.blocks)[block].statements)
+  let locals = List<Local>.asSlice(&function.locals)
+  let mut statement = usize.ZERO
+  while statement < statements.length {
+    if let Statement.Assign {value, ..} = &statements[statement] {
+      let mut operand = usize.ZERO
+      while true {
+        let field = match operandAt(&value, operand) {
+          Option<&Operand>.None => { break }
+          Option<&Operand>.Some {value: found} => found
+        }
+        let temporary = wholeLocal(field)
+        operand = operand + usize.ONE
+        if temporary == usize.MAX || !isTemp(function, temporary) { continue }
+        let temporaryUses = UseTable.uses(table, temporary)
+        if temporaryUses.named != 2 || temporaryUses.borrowed || temporaryUses.dropped || UseTable.flagged(table, temporary) { continue }
+        // The snapshot: the temporary's whole assignment from a place, earlier in this block.
+        let mut snapshot = statement
+        let mut found = false
+        while snapshot > usize.ZERO {
+          snapshot = snapshot - usize.ONE
+          if statementNames(&statements[snapshot], temporary) != usize.ZERO {
+            found = true
+            break
+          }
+        }
+        if !found { continue }
+        let source = match &statements[snapshot] {
+          Statement.Assign {destination, value: Rvalue.Use {value: Operand.Move {place}}, ..} => {
+            if wholePlace(&destination) != temporary { continue }
+            &place
+          }
+          Statement.Assign {destination, value: Rvalue.Use {value: Operand.Copy {place}}, ..} => {
+            // A copy that the field then moves is a move out whose transfer only the field shows,
+            // so the field keeps its temporary.
+            if wholePlace(&destination) != temporary { continue }
+            if let Operand.Move {..} = &field.* { continue }
+            &place
+          }
+          _ => { continue }
+        }
+        let local = source.local
+        if local == temporary || !fixedPath(source) { continue }
+        let kind = match &locals[local].kind {
+          LocalKind.Parameter {..} => true
+          LocalKind.User {..} => true
+          LocalKind.Temp => true
+          _ => false
+        }
+        if !kind { continue }
+        // Nothing between the snapshot and the field touches the source, and the field's own
+        // statement names it nowhere else.
+        let mut between = snapshot + usize.ONE
+        let mut touched = false
+        while between < statement {
+          if statementNames(&statements[between], local) != usize.ZERO { touched = true }
+          between = between + usize.ONE
+        }
+        if touched || statementNames(&statements[statement], local) != usize.ZERO { continue }
+        return Option<FieldSnapshot>.some(FieldSnapshot {statement: statement, operand: operand - usize.ONE, snapshot: snapshot})
+      }
+    }
+    statement = statement + usize.ONE
+  }
+  return Option<FieldSnapshot>.none()
+}
+
+// Splits a local built whole by one aggregate of moved locals, and otherwise only named through
+// its fields, into those locals: `e = {a, b}; ... e.0 ...` reads `a` in place of `e.0`. A composed
+// Effect is such a local: `run Effect.map(move inner, f)` builds `{inner, f}` from the function's
+// parameters, and every step of the run names a part of it. In a suspending frame both live in
+// the frame, so the aggregate was a copy of each parameter that LLVM cannot remove.
+//
+// A part's source is a whole temporary the same block defines earlier, named only there and in
+// the aggregate, or a parameter named only by the aggregate or by the one snapshot that a source
+// temporary copies or moves it into. Nothing borrows, drops or flags a source. Between the
+// earliest source definition and the aggregate nothing names the split local, a parameter source
+// is used outside every loop, and the split local is no call's destination and no debug
+// variable. Its drop flags guard a field path, which moves to the source.
+effect fn splitAggregates(function: &mut MirFunction) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let mut table = run UseTable.of(&function.*)
+  let mut block = usize.ZERO
+  while block < List<Block>.length(&function.blocks) {
+    let mut at = usize.ZERO
+    while at < List<Statement>.length(&List<Block>.asSlice(&function.blocks)[block].statements) {
+      let found = run splitCandidate(&mut function.*, &table, block, at)
+      if let Option<SplitPlan>.Some { value: plan } = move found {
+        run applySplit(&mut function.*, block, move plan)
+        table = run UseTable.of(&function.*)
+
+        // The aggregate is gone; the statement now at `at` is the one after it.
+        continue
+      }
+      at = at + usize.ONE
+    }
+    block = block + usize.ONE
+  }
+  return ()
+}
+
+// One split: the local, the source of each field index, and the statements of `block` it
+// removes, in increasing order.
+struct SplitPlan {
+  local: usize,
+  sources: List<usize>,
+  removed: List<usize>,
+}
+
+// How a walk over the body treats the places of the split local `local`: counting them and
+// checking each has a field first (`apply` false), or naming the field's source instead.
+struct SplitWalk {
+  local: usize,
+  sources: List<usize>,
+  apply: bool,
+  valid: bool,
+  seen: usize,
+}
+
+fn splitPlace(place: &mut Place, walk: &mut SplitWalk, destination: bool) -> () {
+  let steps = List<Projection>.asSlice(&place.projections)
+  let mut at = usize.ZERO
+  while at < steps.length {
+    if let Projection.Index { local: index } = &steps[at] {
+      if index == walk.local {
+        walk.valid = false
+      }
+    }
+    at = at + usize.ONE
+  }
+  if place.local != walk.local {
+    return ()
+  }
+  walk.seen = walk.seen + usize.ONE
+  if destination {
+    walk.valid = false
+  }
+  let mut field = usize.MAX
+  if steps.length > usize.ZERO {
+    if let Projection.Field { index } = &steps[usize.ZERO] {
+      field = index
+    }
+  }
+  let sources = List<usize>.asSlice(&walk.sources)
+  if field >= sources.length || sources[field] == usize.MAX {
+    walk.valid = false
+    return ()
+  }
+  if walk.apply {
+    drop List<Projection>.remove(&mut place.projections, usize.ZERO)
+    place.local = sources[field]
+  }
+  return ()
+}
+
+fn splitOperand(operand: &mut Operand, walk: &mut SplitWalk) -> () {
+  match &mut operand.* {
+    Operand.Copy { place } => splitPlace(&mut place, &mut walk.*, false)
+    Operand.Move { place } => splitPlace(&mut place, &mut walk.*, false)
+    _ => ()
+  }
+  return ()
+}
+
+fn splitOperands(operands: &mut List<Operand>, walk: &mut SplitWalk) -> () {
+  let mut listed = List<Operand>.asMutSlice(&mut operands.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    splitOperand(&mut listed[at], &mut walk.*)
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+fn splitFields(fields: &mut List<AggregateField>, walk: &mut SplitWalk) -> () {
+  let mut listed = List<AggregateField>.asMutSlice(&mut fields.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    splitOperand(&mut listed[at].value, &mut walk.*)
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Every place `rvalueNames` counts but assembly inputs; the count check rejects a split local
+// named there.
+fn splitRvalue(value: &mut Rvalue, walk: &mut SplitWalk) -> () {
+  match &mut value.* {
+    Rvalue.Aggregate { fields } => splitFields(&mut fields, &mut walk.*)
+    Rvalue.Slice { data, count } => {
+      splitOperand(&mut data, &mut walk.*)
+      splitOperand(&mut count, &mut walk.*)
+    }
+    Rvalue.SliceLength { place } => splitPlace(&mut place, &mut walk.*, false)
+    Rvalue.SliceData { place } => splitPlace(&mut place, &mut walk.*, false)
+    Rvalue.PointerOffset { pointer, index, .. } => {
+      splitOperand(&mut pointer, &mut walk.*)
+      splitOperand(&mut index, &mut walk.*)
+    }
+    Rvalue.Use { value: used } => splitOperand(&mut used, &mut walk.*)
+    Rvalue.Ref { place, .. } => splitPlace(&mut place, &mut walk.*, false)
+    Rvalue.AddressOf { place, .. } => splitPlace(&mut place, &mut walk.*, false)
+    Rvalue.Unary { value: used, .. } => splitOperand(&mut used, &mut walk.*)
+    Rvalue.Binary { left, right, .. } => {
+      splitOperand(&mut left, &mut walk.*)
+      splitOperand(&mut right, &mut walk.*)
+    }
+    Rvalue.ScalarBinary { left, right, .. } => {
+      splitOperand(&mut left, &mut walk.*)
+      splitOperand(&mut right, &mut walk.*)
+    }
+    Rvalue.ScalarUnary { value: used, .. } => splitOperand(&mut used, &mut walk.*)
+    Rvalue.Convert { value: used, .. } => splitOperand(&mut used, &mut walk.*)
+    Rvalue.Fits { value: used, .. } => splitOperand(&mut used, &mut walk.*)
+    Rvalue.AddressIntegerConversion { operand, .. } => splitOperand(&mut operand, &mut walk.*)
+    Rvalue.Bitcast { value: used, .. } => splitOperand(&mut used, &mut walk.*)
+    Rvalue.Discriminant { place } => splitPlace(&mut place, &mut walk.*, false)
+    Rvalue.Inject { value: used, .. } => splitOperand(&mut used, &mut walk.*)
+    Rvalue.Variant { fields, .. } => splitFields(&mut fields, &mut walk.*)
+    Rvalue.ContextOf { place } => splitPlace(&mut place, &mut walk.*, false)
+    Rvalue.ContextHandle { address } => splitOperand(&mut address, &mut walk.*)
+    Rvalue.Atomic { operands, .. } => splitOperands(&mut operands, &mut walk.*)
+    Rvalue.Vector { operands, .. } => splitOperands(&mut operands, &mut walk.*)
+    Rvalue.StackAllocate { count, .. } => splitOperand(&mut count, &mut walk.*)
+    Rvalue.Wasm { operands, .. } => splitOperands(&mut operands, &mut walk.*)
+    _ => ()
+  }
+  return ()
+}
+
+fn splitStatement(statement: &mut Statement, walk: &mut SplitWalk) -> () {
+  match &mut statement.* {
+    Statement.Assign { destination, value, .. } => {
+      // A whole write would define the local again.
+      if destination.local == walk.local
+        && List<Projection>.length(&destination.projections) == usize.ZERO {
+        walk.valid = false
+      }
+      splitPlace(&mut destination, &mut walk.*, false)
+      splitRvalue(&mut value, &mut walk.*)
+    }
+    Statement.Drop { destination, .. } => splitPlace(&mut destination, &mut walk.*, false)
+    Statement.FailureContext { destination, source, .. } => {
+      splitPlace(&mut destination, &mut walk.*, false)
+      if let Option<Place>.Some { value: from } = &mut source {
+        splitPlace(&mut from, &mut walk.*, false)
+      }
+    }
+    Statement.SetContextHandle { address, value, .. } => {
+      splitOperand(&mut address, &mut walk.*)
+      splitOperand(&mut value, &mut walk.*)
+    }
+  }
+  return ()
+}
+
+fn splitTerminator(terminator: &mut Terminator, walk: &mut SplitWalk) -> () {
+  match &mut terminator.* {
+    Terminator.Branch { condition, .. } => splitOperand(&mut condition, &mut walk.*)
+    Terminator.Switch { value, .. } => splitOperand(&mut value, &mut walk.*)
+    Terminator.TrapText { reason, .. } => splitOperand(&mut reason, &mut walk.*)
+    Terminator.Call { callee, arguments, providers, destination, failure, .. } => {
+      splitOperands(&mut arguments, &mut walk.*)
+      splitOperands(&mut providers, &mut walk.*)
+
+      // A call destination stays a fresh whole temporary (`callDestinationsFresh`).
+      splitPlace(&mut destination, &mut walk.*, true)
+      match &mut callee {
+        Callee.Indirect { address } => splitOperand(&mut address, &mut walk.*)
+        Callee.NativeIndirect { address, .. } => splitOperand(&mut address, &mut walk.*)
+        _ => ()
+      }
+      if let Option<FailureEdge>.Some { value: edge } = &mut failure {
+        splitPlace(&mut edge.destination, &mut walk.*, true)
+      }
+    }
+    _ => ()
+  }
+  return ()
+}
+
+// Walks every block but the statements `skipped` of `block`.
+fn walkSplit(
+  function: &mut MirFunction,
+  block: usize,
+  skipped: &List<usize>,
+  walk: &mut SplitWalk,
+) -> () {
+  let removed = List<usize>.asSlice(&skipped.*)
+  let mut blocks = List<Block>.asMutSlice(&mut function.blocks)
+  let mut at = usize.ZERO
+  while at < blocks.length {
+    let mut statements = List<Statement>.asMutSlice(&mut blocks[at].statements)
+    let mut index = usize.ZERO
+    while index < statements.length {
+      let mut skip = false
+      if at == block {
+        let mut k = usize.ZERO
+        while k < removed.length {
+          if removed[k] == index {
+            skip = true
+          }
+          k = k + usize.ONE
+        }
+      }
+      if !skip {
+        splitStatement(&mut statements[index], &mut walk.*)
+      }
+      index = index + usize.ONE
+    }
+    splitTerminator(&mut blocks[at].terminator, &mut walk.*)
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+fn splitSource(function: &MirFunction, table: &UseTable, local: usize, names: usize) -> bool {
+  let uses = UseTable.uses(table, local)
+  return uses.named == names && !uses.borrowed && !uses.dropped && !UseTable.flagged(table, local)
+}
+
+fn isParameter(function: &MirFunction, local: usize) -> bool {
+  return match &List<Local>.asSlice(&function.locals)[local].kind {
+    LocalKind.Parameter { .. } => true
+    _ => false
+  }
+}
+
+// Whether `block` can run again after itself.
+effect fn inCycle(function: &MirFunction, block: usize) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let count = List<Block>.length(&function.blocks)
+  let mut seen = List<bool>.make()
+  run List<bool>.appendRepeated(&mut seen, false, count)
+  let mut pending = run MirFunction.successors(function, block)
+  while true {
+    let next = match List<usize>.pop(&mut pending) {
+      Option<usize>.Some { value } => value
+      Option<usize>.None => {
+        break
+      }
+    }
+    if next == block {
+      return true
+    }
+    if List<bool>.get(&seen, next) {
+      continue
+    }
+    List<bool>.set(&mut seen, next, true)
+    let following = run MirFunction.successors(function, next)
+    run List<usize>.appendSlice(&mut pending, List<usize>.asSlice(&following))
+  }
+  return false
+}
+
+// The split the aggregate at statement `at` of `block` allows, if any.
+// Whether `ty` is an Effect value, such as one a composition intrinsic builds.
+fn nominal(ty: &Shared<Type>) -> bool {
+  return Shared<Type>.with<bool>(ty, fn(value: &Type) -> bool {
+    return match &value.* {
+      Type.Nominal {..} => true
+      _ => false
+    }
+  })
+}
+
+fn composedEffect(ty: &Shared<Type>) -> bool {
+  return Shared<Type>.with<bool>(ty, fn(value: &Type) -> bool {
+    return match &value.* {
+      Type.EffectComposite {..} => true
+      Type.EffectJoin {..} => true
+      Type.Effect {..} => true
+      _ => false
+    }
+  })
+}
+
+effect fn splitCandidate(
+  owner: &mut MirFunction,
+  table: &UseTable,
+  block: usize,
+  at: usize,
+) -> Option<SplitPlan>
+  ! OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let function = &owner.*
+  let statements = List<Statement>.asSlice(&List<Block>.asSlice(&function.blocks)[block].statements)
+  let mut built = usize.MAX
+  let mut operands = List<usize>.make()
+  let mut indexes = List<usize>.make()
+  match &statements[at] {
+    Statement.Assign { destination, value: Rvalue.Aggregate { fields }, .. } => {
+      built = wholePlace(&destination)
+      let listed = List<AggregateField>.asSlice(&fields)
+      let mut k = usize.ZERO
+      while k < listed.length {
+        run List<usize>.append(&mut operands, wholeLocal(&listed[k].value))
+        run List<usize>.append(&mut indexes, listed[k].index)
+        k = k + usize.ONE
+      }
+    }
+    _ => {
+      return Option<SplitPlan>.none()
+    }
+  }
+  if built == usize.MAX || !isUserOrTemp(function, built)
+    || List<usize>.length(&operands) == usize.ZERO {
+    return Option<SplitPlan>.none()
+  }
+  // An ordinary function keeps any other such local in a stack slot that SROA splits anyway,
+  // together with its lifetime markers. A composed Effect is copied into the frame of the step
+  // that runs it, which SROA cannot see through.
+  if let Option<Origin>.None = &function.suspension {
+    if !composedEffect(&List<Local>.asSlice(&function.locals)[built].ty) { return Option<SplitPlan>.none() }
+  }
+  let mut removed = List<usize>.make()
+  run List<usize>.append(&mut removed, at)
+
+  // `e = move t` right after the aggregate, with nothing naming `e` between, splits `e`.
+  let mut local = built
+  let builtUses = UseTable.uses(table, built)
+  if isTemp(function, built) && builtUses.named == 2 && !builtUses.borrowed && !builtUses.dropped
+    && !UseTable.flagged(table, built) {
+    let mut next = at + usize.ONE
+    while next < statements.length && statementNames(&statements[next], built) == usize.ZERO {
+      next = next + usize.ONE
+    }
+    if next < statements.length {
+      if let Statement.Assign {
+        destination,
+        value: Rvalue.Use { value: Operand.Move { place } },
+        ..
+      } = &statements[next] {
+        let target = wholePlace(&destination)
+        if wholePlace(&place) == built && target != usize.MAX && target != built
+          && isUserOrTemp(function, target) {
+          let mut between = at + usize.ONE
+          let mut clear = true
+          while between < next {
+            if statementNames(&statements[between], target) != usize.ZERO {
+              clear = false
+            }
+            between = between + usize.ONE
+          }
+          if clear {
+            local = target
+            run List<usize>.append(&mut removed, next)
+          }
+        }
+      }
+    }
+  }
+
+  // The source of each field.
+  let mut highest = usize.ZERO
+  let listed = List<usize>.asSlice(&indexes)
+  let mut k = usize.ZERO
+  while k < listed.length {
+    if listed[k] > highest {
+      highest = listed[k]
+    }
+    k = k + usize.ONE
+  }
+  let mut sources = List<usize>.make()
+  run List<usize>.appendRepeated(&mut sources, usize.MAX, highest + usize.ONE)
+  let mut earliest = at
+  let mut parameter = false
+  let fields = List<usize>.asSlice(&operands)
+  let locals = List<Local>.asSlice(&function.locals)
+  k = usize.ZERO
+  while k < fields.length {
+    let named = fields[k]
+    if named == usize.MAX || named == local {
+      return Option<SplitPlan>.none()
+    }
+    let mut source = usize.MAX
+    if isParameter(function, named) && splitSource(function, table, named, usize.ONE) {
+      source = named
+      parameter = true
+    } else if isTemp(function, named) && splitSource(function, table, named, 2) {
+      let mut definition = at
+      let mut found = false
+      while definition > usize.ZERO {
+        definition = definition - usize.ONE
+        if statementNames(&statements[definition], named) != usize.ZERO {
+          found = true
+          break
+        }
+      }
+      if !found {
+        return Option<SplitPlan>.none()
+      }
+      let mut snapshot = usize.MAX
+      match &statements[definition] {
+        Statement.Assign { destination, value, .. } => {
+          if wholePlace(&destination) != named || rvalueNames(&value, named) != usize.ZERO {
+            return Option<SplitPlan>.none()
+          }
+          match &value {
+            Rvalue.Use { value: Operand.Move { place } } => {
+              snapshot = wholePlace(&place)
+            }
+            Rvalue.Use { value: Operand.Copy { place } } => {
+              snapshot = wholePlace(&place)
+            }
+            _ => ()
+          }
+        }
+        _ => {
+          return Option<SplitPlan>.none()
+        }
+      }
+      if definition < earliest {
+        earliest = definition
+      }
+      source = named
+
+      // A snapshot of a parameter used nowhere else reads the parameter itself.
+      if snapshot != usize.MAX && isParameter(function, snapshot)
+        && splitSource(function, table, snapshot, usize.ONE)
+        && run Type.equalsShared(&locals[snapshot].ty, &locals[named].ty) {
+        source = snapshot
+        parameter = true
+        run List<usize>.append(&mut removed, definition)
+      }
+    } else {
+      return Option<SplitPlan>.none()
+    }
+    let mut slots = List<usize>.asMutSlice(&mut sources)
+    if slots[listed[k]] != usize.MAX {
+      return Option<SplitPlan>.none()
+    }
+    let mut other = usize.ZERO
+    while other < slots.length {
+      if slots[other] == source {
+        return Option<SplitPlan>.none()
+      }
+      other = other + usize.ONE
+    }
+    slots[listed[k]] = source
+    k = k + usize.ONE
+  }
+  let mut between = earliest
+  while between < at {
+    if statementNames(&statements[between], local) != usize.ZERO {
+      return Option<SplitPlan>.none()
+    }
+    between = between + usize.ONE
+  }
+  if parameter && run inCycle(function, block) {
+    return Option<SplitPlan>.none()
+  }
+  let variables = List<Variable>.asSlice(&function.variables)
+  k = usize.ZERO
+  while k < variables.length {
+    if variables[k].local == local {
+      return Option<SplitPlan>.none()
+    }
+    k = k + usize.ONE
+  }
+
+  // Drop flags of the local guard a field with a source.
+  let slotsRead = List<usize>.asSlice(&sources)
+  k = usize.ZERO
+  while k < locals.length {
+    if let LocalKind.DropFlag { local: guarded, path } = &locals[k].kind {
+      if guarded == local {
+        let steps = List<Projection>.asSlice(&path)
+        if steps.length == usize.ZERO {
+          return Option<SplitPlan>.none()
+        }
+        let field = match &steps[usize.ZERO] {
+          Projection.Field { index } => index
+          _ => usize.MAX
+        }
+        if field >= slotsRead.length || slotsRead[field] == usize.MAX {
+          return Option<SplitPlan>.none()
+        }
+      }
+      let steps = List<Projection>.asSlice(&path)
+      let mut step = usize.ZERO
+      while step < steps.length {
+        if let Projection.Index { local: index } = &steps[step] {
+          if index == local {
+            return Option<SplitPlan>.none()
+          }
+        }
+        step = step + usize.ONE
+      }
+    }
+    k = k + usize.ONE
+  }
+
+  // Every other name of the local is a field place: the walk sees all names the table counts
+  // but the removed definitions'.
+  let mut walk = SplitWalk {
+    local: local,
+    sources: run copyIndexes(&sources),
+    apply: false,
+    valid: true,
+    seen: usize.ZERO,
+  }
+  walkSplit(&mut owner.*, block, &removed, &mut walk)
+
+  // Its one whole definition, the aggregate or `e = move t`, names it once.
+  let mut expected = UseTable.uses(table, local).named
+  if expected < usize.ONE {
+    return Option<SplitPlan>.none()
+  }
+  expected = expected - usize.ONE
+  if !walk.valid || walk.seen != expected {
+    return Option<SplitPlan>.none()
+  }
+  return Option<SplitPlan>.some(
+    SplitPlan { local: local, sources: move sources, removed: move removed },
+  )
+}
+
+effect fn copyIndexes(values: &List<usize>) -> List<usize>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut copied = List<usize>.make()
+  run List<usize>.appendSlice(&mut copied, List<usize>.asSlice(values))
+  return move copied
+}
+
+effect fn applySplit(function: &mut MirFunction, block: usize, plan: SplitPlan) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let SplitPlan { local, sources, removed } = move plan
+  let mut walk = SplitWalk {
+    local: local,
+    sources: move sources,
+    apply: true,
+    valid: true,
+    seen: usize.ZERO,
+  }
+  walkSplit(&mut function.*, block, &removed, &mut walk)
+
+  // Drop flags move to the source of their field.
+  let slots = List<usize>.asSlice(&walk.sources)
+  let mut locals = List<Local>.asMutSlice(&mut function.locals)
+  let mut k = usize.ZERO
+  while k < locals.length {
+    if let LocalKind.DropFlag { local: guarded, path } = &mut locals[k].kind {
+      if guarded == local {
+        let field = match &List<Projection>.asSlice(&path)[usize.ZERO] {
+          Projection.Field { index } => index
+          _ => usize.ZERO
+        }
+        guarded = slots[field]
+        drop List<Projection>.remove(&mut path, usize.ZERO)
+      }
+    }
+    k = k + usize.ONE
+  }
+
+  // Later statements first, so earlier indexes stay valid.
+  let mut order = move removed
+  let mut ordered = List<usize>.asMutSlice(&mut order)
+  let mut i = usize.ZERO
+  while i < ordered.length {
+    let mut j = i + usize.ONE
+    while j < ordered.length {
+      if ordered[j] > ordered[i] {
+        let held = ordered[i]
+        ordered[i] = ordered[j]
+        ordered[j] = held
+      }
+      j = j + usize.ONE
+    }
+    i = i + usize.ONE
+  }
+  let mut blocks = List<Block>.asMutSlice(&mut function.blocks)
+  let listed = List<usize>.asSlice(&order)
+  i = usize.ZERO
+  while i < listed.length {
+    drop List<Statement>.remove(&mut blocks[block].statements, listed[i])
+    i = i + usize.ONE
+  }
+  return ()
 }

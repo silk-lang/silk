@@ -15,8 +15,10 @@ up to 10 redirects, and the PEM bundle of the platform for HTTPS: `/etc/ssl/cert
 and `/etc/ssl/certs/ca-certificates.crt` on Linux, or the logical Windows `ROOT` store.
 [`NativeHttp.fromEnvironment`](#NativeHttp.impl.fromEnvironment) uses the file
 in `SSL_CERT_FILE` when it is set, and the proxies in `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`,
-and `NO_PROXY`. Each request opens a new HTTP/1.1 connection and sends `Accept-Encoding:
-identity`, so the body arrives as the server sent it.
+and `NO_PROXY`. Requests use HTTP/1.1 and send `Accept-Encoding: identity`, so the body
+arrives as the server sent it. A direct connection stays open after a response and the next
+request to the same origin reuses it. The client keeps one for each of up to 8 origins, and a new
+origin past that closes the oldest.
 
 Redirects follow the Fetch standard. After 303, and after 301 or 302 for a POST, the client
 sends a GET without a body. After 307 and 308, it sends the same method and body. A redirect
@@ -76,7 +78,7 @@ pub effect fn main() -> i32
 
 Import as `HttpClientNative` with `import silk.http.client_native as HttpClientNative`.
 
-Public declarations: 5.
+Public declarations: 6.
 
 <a id="DEFAULT_TIMEOUT_SECONDS"></a>
 
@@ -107,6 +109,16 @@ pub const DEFAULT_MAX_REDIRECTS: usize
 ```
 
 The default number of redirects followed.
+
+<a id="DEFAULT_CONCURRENCY"></a>
+
+## `DEFAULT_CONCURRENCY`
+
+```silk
+pub const DEFAULT_CONCURRENCY: usize
+```
+
+The default number of requests that [`Http.sendAll`](./http-client.md#Http.sendAll) runs at the same time.
 
 <a id="MAX_DEFAULT_HEADERS"></a>
 
@@ -140,9 +152,13 @@ The provider has its own clocks, random source, and trust store, so you give onl
 allocator. The defaults are a deadline of 30 seconds for each request, a response body of at
 most 16 MiB, up to 10 redirects, and the PEM bundle of the platform for HTTPS:
 `/etc/ssl/cert.pem` on macOS and `/etc/ssl/certs/ca-certificates.crt` on Linux, or the logical
-Windows `ROOT` certificate store. Each request
-opens a new HTTP/1.1 connection and sends `Accept-Encoding: identity`, so the body arrives as
-the server sent it.
+Windows `ROOT` certificate store. Requests use HTTP/1.1 and send `Accept-Encoding: identity`,
+so the body arrives as the server sent it. The next request to an origin reuses an open
+connection to it. The client keeps up to 64 open connections, several for one origin when
+requests ran at the same time.
+
+[`Http.sendAll`](./http-client.md#Http.sendAll) runs up to 32 requests at the same time on one thread, each on its own
+connection. Set the number with [`NativeHttp.withConcurrency`](#NativeHttp.impl.withConcurrency).
 
 Redirects follow the Fetch standard. After 303, and after 301 or 302 for a POST, the client
 sends a GET without a body. After 307 and 308, it sends the same method and body. A redirect
@@ -269,6 +285,16 @@ pub fn maxRedirects(self: Self, hops: usize) -> NativeHttp<'config>
 Sets how many redirects requests follow by default. With 0, a redirect response is returned
 as it is.
 
+<a id="NativeHttp.impl.withConcurrency"></a>
+
+### Method `withConcurrency`
+
+```silk
+pub fn withConcurrency(self: Self, limit: usize) -> NativeHttp<'config>
+```
+
+Sets how many requests [`Http.sendAll`](./http-client.md#Http.sendAll) runs at the same time. A value of 0 counts as 1.
+
 <a id="NativeHttp.impl.failOnStatus"></a>
 
 ### Method `failOnStatus`
@@ -297,6 +323,16 @@ the bundle is opened on local NTFS without following reparse points.
 
 ```silk
 impl<'config> Http for NativeHttp<'config>
+```
+
+<a id="NativeHttp.impl.Http.sendAll"></a>
+
+### Operation `sendAll`
+
+```silk
+effect fn sendAll(self: &mut Self, requests: List<Request>) -> List<Result<Response, HttpError>>
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 <a id="NativeHttp.impl.Http.send"></a>

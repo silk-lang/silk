@@ -363,20 +363,28 @@ Writes the name of the variant, such as `InvalidLength`.
 pub struct P256
 ```
 
-A P-256 secret, for key agreement and for ECDSA signatures. It is not `Copy`.
+A P-256 secret for key agreement. It is not `Copy`.
 
 ### When to use
 Use it for an ECDH key exchange where a protocol needs P-256, such as a TLS 1.3 key share
-`secp256r1`, or to sign with ECDSA. For a new design, `silk.crypto.x25519` is simpler.
+`secp256r1`. For a new design, `silk.crypto.x25519` is simpler.
 
 ### Details
-[`P256.agree`](#P256.impl.agree) consumes it, so make a new one for each exchange. [`P256.sign`](#P256.impl.sign) does not. Public keys are 65 bytes in
+[`P256.agree`](#P256.impl.agree) consumes it. Make a new one for each exchange. Public keys are 65 bytes in
 uncompressed SEC1 form: `0x04`, then the X and Y coordinates, each 32 bytes big-endian. Secrets
 are 32 bytes big-endian. Nothing allocates.
 
 ### Gotchas
 The key exchange does not authenticate the peer. Pass the shared secret through
 `silk.crypto.hkdf` before you use it as a key. The secret is not erased when it is dropped.
+
+<a id="P256.impl.Copy"></a>
+
+## Implementation `Copy for P256`
+
+```silk
+impl Copy for P256
+```
 
 <a id="P256.impl"></a>
 
@@ -629,11 +637,12 @@ Writes the name of the variant, such as `InvalidLength`.
 pub struct EcdsaP256Sha256
 ```
 
-Functions that verify ECDSA signatures on P-256 with SHA-256.
+Functions that make and verify ECDSA signatures on P-256 with SHA-256.
 
 ### When to use
 Use it to verify an ECDSA signature with SHA-256, for example the signature of a certificate or
-a JSON Web Token with `ES256`. To sign, use [`P256.sign`](#P256.impl.sign) and [`EcdsaP256.toDer`](#EcdsaP256.impl.toDer).
+a JSON Web Token with `ES256`, and [`EcdsaP256Sha256.sign`](#EcdsaP256Sha256.impl.sign) to make a DER one with a low `s`.
+[`P256.sign`](#P256.impl.sign) and [`EcdsaP256.toDer`](#EcdsaP256.impl.toDer) sign with any hash.
 
 ### Details
 Public keys are 65 bytes in uncompressed SEC1 form. Signatures are in DER form, as in X.509 and
@@ -651,6 +660,30 @@ modules.
 ```silk
 impl EcdsaP256Sha256
 ```
+
+<a id="EcdsaP256Sha256.impl.sign"></a>
+
+### Associated function `sign`
+
+```silk
+pub fn sign(secret: &[u8], message: &[u8], output: &mut [u8; 72]) -> Result<usize, P256SignatureError>
+```
+
+Signs `message` with the 32-byte big-endian private key `secret`, and writes the DER
+signature to the start of `output`. Returns the length of the signature, 8 to 72 bytes.
+
+#### Details
+The function hashes `message` with SHA-256, so give the message, not its digest. The nonce is
+deterministic (RFC 6979 with HMAC-SHA-256), so signing needs no random source and the same
+key and message always give the same signature. The signature uses the low `s` form.
+Nothing allocates.
+
+#### Errors
+- `InvalidLength` if `message` is longer than SHA-256 allows.
+- `InvalidKey` if `secret` is not 32 bytes, or its value is 0 or not less than the order.
+
+#### Gotchas
+The secret is not erased. The time of the call does not depend on the secret or the message.
 
 <a id="EcdsaP256Sha256.impl.verify"></a>
 

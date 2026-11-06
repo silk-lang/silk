@@ -43,7 +43,7 @@ import silk.io.memory_byte_duplex {
   MemoryWriteAction,
   MemoryWriteEvent
 }
-import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock { MonotonicClock, ReadyWatch }
 import silk.core.option { Option }
 import silk.system.random { Random }
 import silk.core.result { Result }
@@ -69,6 +69,16 @@ impl MonotonicClock for FixedClock {
   effect fn waitFor(self: &mut Self, howLong: u64) -> () {
     drop howLong
     return ()
+  }
+  effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Instant>) -> usize {
+    if watch.length > 0 { Intrinsic.trap("this clock has no handles to watch") }
+    match move until {
+      Option<Instant>.None => {}
+      Option<Instant>.Some {value: when} => {
+        drop when
+      }
+    }
+    return 0
   }
 }
 

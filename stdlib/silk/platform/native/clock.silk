@@ -45,6 +45,10 @@ import silk.num.i64
 import silk.num.u64
 import silk.mem.pointer { Pointer }
 import silk.system.system_clock { SystemClock, Instant }
+import silk.system.monotonic_clock { ReadyWatch }
+import silk.core.option { Option }
+import silk.num.i32
+import silk.num.usize
 
 extern "C" struct Timespec {
   seconds: i64,
@@ -66,6 +70,70 @@ unsafe extern "C" fn gnuClockGetResolution(clock: i32, value: *mut Timespec) -> 
 unsafe extern "C" fn clock_nanosleep(clock: i32, flags: i32, request: *const Timespec, remaining: ?*mut Timespec) -> i32
 
 unsafe fn currentError() -> i32 { unsafe { return Pointer.read<i32>(__error()) } }
+
+@foreign(noCapture: .("fds"))
+unsafe extern "C" fn darwinPoll(fds: [*]mut ReadyWatch, count: u32, timeout: i32) -> i32 as "poll"
+@foreign(noCapture: .("fds"))
+unsafe extern "C" fn gnuPoll(fds: [*]mut ReadyWatch, count: usize, timeout: i32) -> i32 as "poll"
+unsafe extern "C" fn __errno_location() -> *mut i32
+static if Intrinsic.targetOperatingSystem() == "windows" {
+  @foreign(noCapture: .("fds"))
+  unsafe extern "C" fn WSAPoll(fds: [*]mut ReadyWatch, count: u32, timeout: i32) -> i32
+  unsafe extern "C" fn WSAGetLastError() -> i32
+}
+
+// Polls `watch` in place for up to `timeout` milliseconds (-1 waits without end). Returns the
+// count of ready handles, or -1 when a signal interrupted the wait.
+unsafe fn pollWatches(watch: &mut [ReadyWatch], timeout: i32) -> i32 {
+  let length = watch.length
+  let pointer = unsafe Intrinsic.pointerRequalify<?[*]mut ReadyWatch, [*]mut ReadyWatch>(
+    Pointer.fromMutSlice<ReadyWatch>(move watch),
+  )
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    if length > 4294967295 { Intrinsic.trap("NativeClock.waitReady: too many handles") }
+    let status = unsafe WSAPoll(pointer, usize.toU32(length), timeout)
+    if status < 0 {
+      // WSAEINTR: a blocking call was interrupted, so the caller polls again.
+      if unsafe WSAGetLastError() == 10004 { return -1 }
+      Intrinsic.trap("NativeClock.waitReady: the operating system poll call failed")
+    }
+    return status
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      if length > 4294967295 { Intrinsic.trap("NativeClock.waitReady: too many handles") }
+      let status = unsafe darwinPoll(pointer, usize.toU32(length), timeout)
+      if status < 0 {
+        if unsafe currentError() == 4 { return -1 }
+        Intrinsic.trap("NativeClock.waitReady: the operating system poll call failed")
+      }
+      return status
+    } else {
+      let status = unsafe gnuPoll(pointer, length, timeout)
+      if status < 0 {
+        if unsafe Pointer.read<i32>(unsafe __errno_location()) == 4 { return -1 }
+        Intrinsic.trap("NativeClock.waitReady: the operating system poll call failed")
+      }
+      return status
+    }
+  }
+}
+
+// The milliseconds from `now` to `until`, rounded up, and at most i32.MAX.
+fn millisecondsUntil(now: &Instant, until: &Instant) -> i32 {
+  let seconds = SystemClock.seconds(until) - SystemClock.seconds(now)
+  let nanoseconds = SystemClock.nanoseconds(until) - SystemClock.nanoseconds(now)
+  if seconds < 0 || (seconds == 0 && nanoseconds <= 0) { return 0 }
+  if seconds > 2000000 { return 2147483647 }
+  let total = seconds * 1000000000 + nanoseconds
+  return i64.toI32((total + 999999) / 1000000)
+}
+
+fn reachedMark(now: &Instant, until: &Instant) -> bool {
+  let seconds = SystemClock.seconds(now)
+  let limit = SystemClock.seconds(until)
+  if seconds != limit { return seconds > limit }
+  return SystemClock.nanoseconds(now) >= SystemClock.nanoseconds(until)
+}
 
 unsafe fn clockTime(monotonic: bool, value: *mut Timespec) -> i32 {
   static if Intrinsic.targetOperatingSystem() == "darwin" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64") && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system" {
@@ -208,6 +276,69 @@ impl NativeClock {
     }
     return ()
       }
+    }
+  }
+
+  /// Waits in one `poll` until a handle in `watch` is ready or the monotonic clock reaches
+  /// `until`, and returns how many handles are ready.
+  ///
+  /// It clears the events of each watch first. An empty `watch` waits until `until`. A signal that
+  /// interrupts the poll does not end the wait. WASI has no handles to poll, so a watch there traps.
+  pub effect fn waitReady(watch: &mut [ReadyWatch], until: Option<Instant>) -> usize {
+    let mut index: usize = 0
+    while index < watch.length {
+      ReadyWatch.clear(&mut watch[index])
+      index = index + 1
+    }
+    if watch.length == 0 {
+      return match move until {
+        Option<Instant>.None => Intrinsic.trap("NativeClock.waitReady: nothing to wait for")
+        Option<Instant>.Some {value} => {
+          run NativeClock.waitUntil(move value)
+          return 0
+        }
+      }
+    }
+    static if Intrinsic.targetOperatingSystem() == "wasi" {
+      drop until
+      return Intrinsic.trap("NativeClock.waitReady: WASI has no handles to poll")
+    } else {
+      while true {
+        let mut timeout: i32 = -1
+        if let Option<Instant>.Some {value: limit} = &until {
+          let now = run NativeClock.now(true)
+          timeout = millisecondsUntil(&now, &limit)
+        }
+        let status = unsafe pollWatches(&mut watch, timeout)
+        if status > 0 { return i32.toUsize(status) }
+        if status == 0 && timeout >= 0 {
+          if let Option<Instant>.Some {value: limit} = &until {
+            let after = run NativeClock.now(true)
+            if reachedMark(&after, &limit) { return 0 }
+          }
+        }
+      }
+      return 0
+    }
+  }
+
+  /// Polls `watch` once without waiting, and returns how many handles are ready. A test clock uses
+  /// it to see real sockets while it moves its own time.
+  pub fn pollNow(watch: &mut [ReadyWatch]) -> usize {
+    let mut index: usize = 0
+    while index < watch.length {
+      ReadyWatch.clear(&mut watch[index])
+      index = index + 1
+    }
+    if watch.length == 0 { return 0 }
+    static if Intrinsic.targetOperatingSystem() == "wasi" {
+      return Intrinsic.trap("NativeClock.pollNow: WASI has no handles to poll")
+    } else {
+      while true {
+        let status = unsafe pollWatches(&mut watch, 0)
+        if status >= 0 { return i32.toUsize(status) }
+      }
+      return 0
     }
   }
 }

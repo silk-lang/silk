@@ -144,6 +144,28 @@ A `length` of 0 returns an empty value and does not allocate.
 
 - `OutOfMemoryError` if the `Allocator` cannot supply the storage.
 
+<a id="Bytes.impl.appendWithinCapacity"></a>
+
+### Method `appendWithinCapacity`
+
+```silk
+pub fn appendWithinCapacity(self: &mut Self, value: u8) -> bool
+```
+
+Adds `value` at the end if the capacity has room, and returns `true`. Returns `false` and
+changes nothing when the capacity is full. It never allocates.
+
+<a id="Bytes.impl.appendSliceWithinCapacity"></a>
+
+### Method `appendSliceWithinCapacity`
+
+```silk
+pub fn appendSliceWithinCapacity(self: &mut Self, values: &[u8]) -> bool
+```
+
+Adds a copy of `values` at the end if the capacity has room for all of them, and returns
+`true`. Returns `false` and changes nothing otherwise. It never allocates.
+
 <a id="Bytes.impl.length"></a>
 
 ### Method `length`

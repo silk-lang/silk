@@ -116,6 +116,7 @@ import silk.http.message {Header, Method, RequestHead, ValueError, Version}
 import silk.http.basic as Basic
 import silk.http.basic {BasicError}
 import silk.http.head as Head
+import silk.http.head {RequestHead as WrittenHead, WrittenRequest}
 import silk.http.headers {HeaderIterator, Headers, Limits}
 import silk.http.origin {Origin, OriginError}
 import silk.http.proxy {ProxyError, Route, RouteMode}
@@ -129,7 +130,6 @@ import silk.num.u64
 import silk.num.u8
 import silk.uri.uri {Uri}
 import silk.num.usize
-import silk.collections.list {List}
 import silk.io.writer {Writer, WriterError}
 
 /// How the request body is framed. It adds `Content-Length` or `Transfer-Encoding`, so you cannot
@@ -338,8 +338,7 @@ impl Debug for RequestError {
 /// [`prepareForward`] and [`prepareConnect`] for a route from `silk.http.proxy`. Send it with
 /// `silk.http.exchange`.
 pub struct PreparedRequest {
-  storage: Bytes,
-  length: usize,
+  written: WrittenRequest,
   logicalOriginValue: Origin,
   physicalPeerValue: Origin,
   versionValue: Version,
@@ -350,7 +349,11 @@ pub struct PreparedRequest {
 impl PreparedRequest {
   /// Returns the bytes of the head, ending with the empty line.
   pub fn bytes<'a>(self: &'a Self) -> &'a [u8] {
-    return Slice.view<u8>(Bytes.asSlice(&self.storage), usize.ZERO, self.length)
+    return WrittenRequest.bytes(&self.written)
+  }
+  /// Returns the head, read back from its bytes without parsing them.
+  pub fn head<'a>(self: &'a Self) -> WrittenHead<'a> {
+    return WrittenRequest.head(&self.written)
   }
   /// Returns the origin that the request is for.
   pub fn origin(self: &Self) -> Origin {
@@ -454,7 +457,7 @@ pub effect fn prepareForward<'configuration, 'value>(
   if Origin.secure(&physicalPeer) {
     fail ProxyError.invalidRoute()
   }
-  let mut targetStorage = run Bytes.zeroed(limits.maxTargetBytes)
+  let mut targetStorage = run Bytes.zeroed(targetCapacity(uri, limits))
   let output = Bytes.asMutSlice(&mut targetStorage)
   let count = match move RequestTarget.fromUri(uri, TargetForm.Absolute, &mut output) {
     Result.Failure {error} => {
@@ -964,7 +967,8 @@ effect fn prepareCore<'configuration, 'value>(
       }
     }
   }
-  let mut credential = run Bytes.zeroed(maxCredentialBytes)
+  // Only a request that sends credentials pays for their storage.
+  let mut credential = Bytes.make()
   let mut credentialLength = usize.ZERO
   let mut hasAuthorization = false
   match policy.authorization {
@@ -977,13 +981,7 @@ effect fn prepareCore<'configuration, 'value>(
         fail RequestError.CredentialLimit
       }
       run validateBasicTransport(logicalOrigin, value, policy.basicSecurity)
-      let output = Bytes.asMutSlice(&mut credential)
-      let mut index = usize.ZERO
-      while index < value.length {
-        output[index] = value[index]
-        index = index + usize.ONE
-      }
-      drop output
+      credential = run Bytes.copy(value)
       credentialLength = value.length
       hasAuthorization = true
     }
@@ -1003,6 +1001,7 @@ effect fn prepareCore<'configuration, 'value>(
       if needed > maxCredentialBytes {
         fail RequestError.CredentialLimit
       }
+      credential = run Bytes.zeroed(maxCredentialBytes)
       let mut scratch = run Bytes.zeroed(maxCredentialBytes)
       let output = Bytes.asMutSlice(&mut credential)
       let temporary = Bytes.asMutSlice(&mut scratch)
@@ -1041,18 +1040,10 @@ effect fn prepareCore<'configuration, 'value>(
       }
     }
   }
-  let mut entries = List<Header>.make()
-  let mut source = Headers.iter(headers)
-  while true {
-    match move HeaderIterator.next(&mut source) {
-      Option.None => {
-        break
-      }
-      Option.Some {value} => {
-        run append(&mut entries, Header.name(&value), Header.value(&value), limits)
-      }
-    }
-  }
+  // Your fields are written as they are, and the fields that the request adds follow them.
+  let spare = spareField(Slice.view<u8>(&lengthStorage, usize.ZERO, usize.ZERO))
+  let mut added = [spare, spare, spare, spare, spare, spare, spare, spare, spare, spare]
+  let mut entries = Added {fields: &mut added, count: usize.ZERO, base: Headers.count(headers)}
   if proxyCredentialLength > usize.ZERO {
     run append(
       &mut entries,
@@ -1138,30 +1129,24 @@ effect fn prepareCore<'configuration, 'value>(
   if hasAuthorization {
     run append(&mut entries, "Authorization", authorization, limits)
   }
-  let fields = match move Headers.make(List<Header>.asSlice(&entries), limits) {
+  let count = entries.count
+  drop entries
+  let written = match move run Head.writeRequestWith(
+    version,
+    method,
+    target,
+    headers,
+    Slice.view<Header>(&added, usize.ZERO, count),
+    limits,
+    maxHeadBytes,
+  ) {
     Result.Failure {error} => {
       fail RequestError.Value {error: move error}
     }
-    Result.Success {value} => value
+    Result.Success {value} => move value
   }
-  let head = match move RequestHead.make(version, method, target, fields) {
-    Result.Failure {error} => {
-      fail RequestError.Value {error: move error}
-    }
-    Result.Success {value} => value
-  }
-  let mut storage = run Bytes.zeroed(maxHeadBytes)
-  let output = Bytes.asMutSlice(&mut storage)
-  let length = match move Head.writeRequestInto(&head, &mut output, limits) {
-    Result.Failure {error} => {
-      fail RequestError.Value {error: move error}
-    }
-    Result.Success {value} => value
-  }
-  drop output
   return PreparedRequest {
-    storage: move storage,
-    length: length,
+    written: move written,
     logicalOriginValue: logicalOrigin.*,
     physicalPeerValue: physicalPeer.*,
     versionValue: version,
@@ -1198,31 +1183,66 @@ pub effect fn fromUri<'value>(
     }
     Result.Success {value} => value
   }
-  let mut targetStorage = run Bytes.zeroed(limits.maxTargetBytes)
-  let output = Bytes.asMutSlice(&mut targetStorage)
-  let count = match move RequestTarget.fromUri(uri, TargetForm.Origin, &mut output) {
-    Result.Failure {error} => {
-      fail RequestError.Value {error: move error}
+  return run fromUriAt(&origin, uri, version, method, headers, policy, body, require100, limits, maxHeadBytes, maxCredentialBytes)
+}
+
+/// Checks a direct request for `uri` like [`fromUri`], with the origin of `uri` that you already
+/// have.
+///
+/// # Details
+/// `origin` must be `Origin.fromUri(uri)`; it is not checked again. The request goes to `origin`.
+pub effect fn fromUriAt<'value>(
+  origin: &Origin,
+  uri: &Uri<'value>,
+  version: Version,
+  method: Method<'value>,
+  headers: &Headers<'value>,
+  policy: &HeaderPolicy<'value>,
+  body: BodyMode,
+  require100: bool,
+  limits: Limits,
+  maxHeadBytes: usize,
+  maxCredentialBytes: usize,
+) -> PreparedRequest ! RequestError | OutOfMemoryError ? &mut Allocator {
+  // A URI with a path holds its origin form as written, so the target is a view of the URI. The
+  // other URIs are written out, which adds the `/` of an empty path and reports a bad target.
+  let mut targetStorage = Bytes.make()
+  let mut text = Uri.pathAndQuery(uri)
+  let written = Uri.userinfo(uri).isSome() || String.byteLength(Uri.path(uri)) == usize.ZERO
+    || String.byteLength(text) > limits.maxTargetBytes
+  if written {
+    targetStorage = run Bytes.zeroed(targetCapacity(uri, limits))
+    let output = Bytes.asMutSlice(&mut targetStorage)
+    let count = match move RequestTarget.fromUri(uri, TargetForm.Origin, &mut output) {
+      Result.Failure {error} => {
+        fail RequestError.Value {error: move error}
+      }
+      Result.Success {value} => value
     }
-    Result.Success {value} => value
+    drop output
+    let bytes = Slice.view<u8>(Bytes.asSlice(&targetStorage), usize.ZERO, count)
+    text = match move String.fromUtf8(bytes) {
+      Result.Failure {error} => {
+        drop error
+        fail RequestError.InvalidTarget
+      }
+      Result.Success {value} => value
+    }
   }
-  drop output
-  let bytes = Slice.view<u8>(Bytes.asSlice(&targetStorage), usize.ZERO, count)
-  let text = match move String.fromUtf8(bytes) {
-    Result.Failure {error} => {
-      drop error
-      fail RequestError.InvalidTarget
+  // The URI is valid already, so its own path and query need no second parse.
+  let mut viewed = Option<RequestTarget<'value>>.none()
+  if !written && Method.format(&method) != "CONNECT" { viewed = RequestTarget<'value>.originOf(uri) }
+  let target = match move viewed {
+    Option.Some {value} => value
+    Option.None => match move RequestTarget.parse(&method, text, limits.maxTargetBytes) {
+      Result.Failure {error} => {
+        fail RequestError.Value {error: move error}
+      }
+      Result.Success {value} => value
     }
-    Result.Success {value} => value
-  }
-  let target = match move RequestTarget.parse(&method, text, limits.maxTargetBytes) {
-    Result.Failure {error} => {
-      fail RequestError.Value {error: move error}
-    }
-    Result.Success {value} => value
   }
   return run prepare(
-    &origin,
+    origin,
     version,
     method,
     target,
@@ -1236,13 +1256,26 @@ pub effect fn fromUri<'value>(
   )
 }
 
-effect fn append<'a>(
-  entries: &mut List<Header<'a>>,
+// Fills a slot of `Added` that is not used, with the lifetime of `anchor`. It is never written to
+// a head.
+fn spareField<'a>(anchor: &'a [u8]) -> Header<'a> {
+  unsafe { return Header.makeUnchecked("", anchor) }
+}
+
+// The fields that the request adds after your fields.
+struct Added<'a, 'fields> {
+  fields: &'fields mut [Header<'a>; 10],
+  count: usize,
+  base: usize,
+}
+
+effect fn append<'a, 'fields>(
+  entries: &mut Added<'a, 'fields>,
   name: string<'a>,
   value: &'a [u8],
   limits: Limits,
-) -> () ! RequestError | OutOfMemoryError ? &mut Allocator {
-  if List<Header<'a>>.length(&entries.*) >= limits.maxFields {
+) -> () ! RequestError ? &mut Allocator {
+  if entries.base + entries.count >= limits.maxFields {
     fail RequestError.HeaderLimit
   }
   let field = match move Header.make(name, value, limits) {
@@ -1251,17 +1284,18 @@ effect fn append<'a>(
     }
     Result.Success {value: fieldValue} => fieldValue
   }
-  let _appended = run List<Header<'a>>.append(&mut entries.*, field)
+  entries.fields[entries.count] = field
+  entries.count = entries.count + usize.ONE
   return ()
 }
 
-effect fn controlled<'a>(
-  entries: &mut List<Header<'a>>,
+effect fn controlled<'a, 'fields>(
+  entries: &mut Added<'a, 'fields>,
   name: string<'a>,
   control: HeaderControl<'a>,
   fallback: &'a [u8],
   limits: Limits,
-) -> () ! RequestError | OutOfMemoryError ? &mut Allocator {
+) -> () ! RequestError ? &mut Allocator {
   match control {
     HeaderControl.Omit => {}
     HeaderControl.Default => {
@@ -1290,6 +1324,19 @@ effect fn validateBasicTransport(origin: &Origin, value: &[u8], security: BasicS
     }
   }
   return ()
+}
+
+fn smaller(left: usize, right: usize) -> usize {
+  if left < right {
+    return left
+  }
+  return right
+}
+
+// A request target is a part of the URI text, or `/` for an empty path, so it never needs more
+// than the URI length plus one. Sizing to that keeps each request from zeroing the whole limit.
+fn targetCapacity(uri: &Uri, limits: Limits) -> usize {
+  return smaller(String.byteLength(Uri.format(uri)) + usize.ONE, limits.maxTargetBytes)
 }
 
 fn ascii(left: string, right: string) -> bool {

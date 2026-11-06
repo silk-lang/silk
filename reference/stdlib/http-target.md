@@ -265,6 +265,21 @@ impl<'text> Copy for RequestTarget<'text>
 impl<'text> RequestTarget<'text>
 ```
 
+<a id="RequestTarget.impl.originOf"></a>
+
+### Associated function `originOf`
+
+```silk
+pub fn originOf(uri: &Uri<'text>) -> Option<RequestTarget<'text>>
+```
+
+Returns the origin form of `uri` as a view of its path and query, or none if `uri` has user
+information or its path does not start with `/`.
+
+#### Details
+It checks nothing more, since `uri` is valid already: the target is what
+[`RequestTarget.parse`](#RequestTarget.impl.parse) returns for that text with any method but `CONNECT`.
+
 <a id="RequestTarget.impl.parse"></a>
 
 ### Associated function `parse`

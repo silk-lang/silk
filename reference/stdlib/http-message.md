@@ -97,7 +97,7 @@ pub fn main() -> i32 {
 
 Import as `Version` with `import silk.http.message { Version }`.
 
-Public declarations: 13.
+Public declarations: 14.
 
 <a id="ValueComponent"></a>
 
@@ -773,6 +773,17 @@ pub fn equals(self: &Self, other: &Method) -> bool
 
 Returns `true` if the two methods have the same spelling. Case matters.
 
+<a id="Method.impl.idempotent"></a>
+
+### Method `idempotent`
+
+```silk
+pub fn idempotent(self: &Self) -> bool
+```
+
+Returns true for the methods that RFC 9110 defines as idempotent: `GET`, `HEAD`, `OPTIONS`,
+`TRACE`, `PUT`, and `DELETE`. Sending one of these again has the same effect as sending it once.
+
 <a id="Method.impl.get"></a>
 
 ### Associated function `get`
@@ -997,6 +1008,17 @@ pub fn class(self: &Self) -> StatusClass
 
 Returns the class, from the first digit of the code.
 
+<a id="Status.impl.reasonPhrase"></a>
+
+### Method `reasonPhrase`
+
+```silk
+pub fn reasonPhrase(self: &Self) -> Option<&'static [u8]>
+```
+
+Returns the reason phrase that RFC 9110 gives the code, such as `Not Found` for 404. Returns
+`None` for a code that has no phrase in this list.
+
 <a id="Header"></a>
 
 ## `Header`
@@ -1027,6 +1049,22 @@ impl<'value> Copy for Header<'value>
 ```silk
 impl<'value> Header<'value>
 ```
+
+<a id="Header.impl.makeUnchecked"></a>
+
+### Associated function `makeUnchecked`
+
+```silk
+pub unsafe fn makeUnchecked(name: string<'value>, value: &'value [u8]) -> Header<'value>
+```
+
+Returns a field without checking it, for code that has already checked the rules of
+[`Header.make`](#Header.impl.make), such as a parser that rebuilds the fields it validated.
+
+#### Gotchas
+
+This function is `unsafe`. A field that breaks the rules of `make`, such as a value with CR or
+LF, can split the message it is written into.
 
 <a id="Header.impl.make"></a>
 
@@ -1068,6 +1106,17 @@ pub fn value(self: &Self) -> &'value [u8]
 ```
 
 Returns the field value bytes.
+
+<a id="isTokenByte"></a>
+
+## `isTokenByte`
+
+```silk
+pub fn isTokenByte(value: u8) -> bool
+```
+
+Returns `true` if `value` is a byte of a token, such as a method or a field name: a letter, a
+digit, or one of ``!#$%&'*+-.^_`|~``.
 
 <a id="RequestHead"></a>
 
@@ -1362,6 +1411,28 @@ pub fn view<'value>(self: &'value Self) -> ResponseHead<'value>
 ```
 
 Returns the head as a [`ResponseHead`](#ResponseHead) that borrows this value.
+
+<a id="OwnedResponseHead.impl.make"></a>
+
+### Associated function `make`
+
+```silk
+pub effect fn make(
+    version: Version,
+    status: Status,
+    reason: &[u8],
+    headers: OwnedHeaders,
+    limits: Limits,
+  ) -> Result<OwnedResponseHead, ValueError> ! OutOfMemoryError ? &mut Allocator
+```
+
+Makes an owned head from its parts, and keeps `headers` without copying them.
+
+#### Errors
+- `InvalidValueByte` if `reason` has a control byte.
+- `LimitExceeded` if `reason` is longer than `maxValueBytes`, or the head uses more memory than
+  `maxOwnedBytes`.
+- `OutOfMemoryError` if the `Allocator` fails.
 
 
 Category: HTTP.
