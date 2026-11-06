@@ -34,10 +34,11 @@ optional checksum, and the content size. Its frames decode with the reference `z
 within about 1% of its size at each level, but are not the same bytes that it writes.
 
 Brotli encoding covers qualities 0 to 11: the bucket hashers and lazy matching of the reference
-`brotli` up to quality 9, and its binary tree hasher and shortest path search at 10 and 11, in
-steps with flushes, and one set of prefix codes per meta-block. Its streams decode with the
-reference `brotli` and are within about 4% of its size on text at each quality, and up to about
-17% larger on source code at 10 and 11, where the reference also models literal contexts.
+`brotli` up to quality 9, and its binary tree hasher, shortest path search, and static dictionary
+matches at 10 and 11, in steps with flushes. From quality 5 literals have prefix codes for
+clusters of their contexts. Its streams decode with the reference `brotli` and are within about 4%
+of its size on text at each quality, and up to about 6% larger on source code, where the
+reference also splits meta-blocks into block types.
 
 The Brotli decoder covers all of RFC 7932, including the static dictionary and its word
 transforms, and decodes incrementally into a window it allocates once. Regenerate its dictionary

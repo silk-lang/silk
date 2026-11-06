@@ -11,8 +11,11 @@
 //! looks one or more bytes ahead for a better match from quality 2. Qualities 10 and 11 collect
 //! all matches from a binary tree and choose the commands with the shortest path search of the
 //! reference, priced by estimated literal costs, and at quality 11 a second time with the costs of
-//! the first result. Each meta-block gets its own prefix codes for literals, commands, and
-//! distances. A meta-block that does not shrink is stored uncompressed.
+//! the first result. They also copy words of the static dictionary, with the transforms that keep
+//! the start of the word, and pick the postfix bits and direct codes of the distances. Each
+//! meta-block gets its own prefix codes for literals, commands, and distances. From quality 5 the
+//! literals use one prefix code for each cluster of the 64 contexts of their two previous bytes,
+//! in UTF-8 or signed context mode. A meta-block that does not shrink is stored uncompressed.
 //! [`BrotliEncoder.make`] allocates all storage one time. Later calls do not allocate and do not
 //! keep a borrow of your buffers. The output is deterministic but is not the same bytes that the
 //! reference `brotli` writes.
@@ -53,6 +56,7 @@ import silk.num.u64
 import silk.num.usize
 import silk.num.f64
 import silk.io.writer { Writer, WriterError }
+import silk.compress.brotli_tables
 
 /// What a call to [`BrotliEncoder.step`] must finish before it returns.
 ///
@@ -170,8 +174,9 @@ impl BrotliOptions {
 /// [`BrotliEncoder.make`] allocates all storage one time: twice the window or twice the
 /// meta-block (64 KiB to 256 KiB), whichever is larger, and about two meta-blocks of command and
 /// output buffers. Up to quality 9 it adds the hash buckets (512 KiB at quality 0 and 32 MiB at 9,
-/// less when the window is small). Qualities 10 and 11 add one more window, a binary tree of 8
-/// bytes for each byte of the window, and about 17 MiB for matches and the shortest path search.
+/// less when the window is small), and from quality 5 about 300 KiB for literal contexts.
+/// Qualities 10 and 11 add one more window, a binary tree of 8 bytes for each byte of the window,
+/// about 17 MiB for matches and the shortest path search, and 200 KiB for a dictionary index.
 /// Later calls do not allocate and do not keep a borrow of your buffers, so you can move the
 /// encoder between threads between calls.
 pub struct BrotliEncoder {
@@ -198,6 +203,7 @@ pub struct BrotliEncoder {
   matchLength: List<u32>,
   matchCount: List<u32>,
   nodeLength: List<u32>,
+  nodeWord: List<u32>,
   nodeDistance: List<u32>,
   nodeInsert: List<u32>,
   nodeShortcut: List<u32>,
@@ -214,6 +220,14 @@ pub struct BrotliEncoder {
   queueCache: [usize; 32],
   queueSize: usize,
   matchUsed: usize,
+  wordHeads: List<u32>,
+  wordNext: List<u32>,
+  wordEntry: List<u32>,
+  prefixTransforms: List<u32>,
+  prefixGroups: List<u32>,
+  wordBest: [u32; 38],
+  wordLength: [u32; 38],
+  streamBase: usize,
   buffer: List<u8>,
   capacity: usize,
   bufferEnd: usize,
@@ -224,15 +238,32 @@ pub struct BrotliEncoder {
   distanceCache: [usize; 4],
   commandInsert: List<u32>,
   commandCopy: List<u32>,
+  commandWord: List<u32>,
   commandDistance: List<u32>,
   commandSymbol: List<u32>,
   commandCount: usize,
   literalHistogram: List<u32>,
   literalDepth: List<u32>,
   literalCode: List<u32>,
+  contextModeling: bool,
+  contextMode: u32,
+  clusterCount: usize,
+  contextHistogram: List<u32>,
+  contextMap: List<u32>,
+  clusterCost: List<f64>,
+  mergeCost: List<f64>,
+  mergedHistogram: List<u32>,
+  mapHistogram: List<u32>,
+  mapDepth: List<u32>,
+  mapCode: List<u32>,
+  mapSymbols: List<u32>,
+  logTable: List<f64>,
   commandHistogram: List<u32>,
   commandDepth: List<u32>,
   commandCode: List<u32>,
+  distancePostfix: u32,
+  distanceDirect: u32,
+  distanceAlphabet: usize,
   distanceHistogram: List<u32>,
   distanceDepth: List<u32>,
   distanceCode: List<u32>,
@@ -292,6 +323,45 @@ const MATCH_POOL: usize = 4
 
 const NO_COST: f64 = 1e30
 
+// From this quality, each meta-block clusters the literals by context (the last two bytes in the
+// UTF8 or signed context mode) and gives each cluster its own prefix code.
+const CONTEXT_QUALITY: u32 = 5
+
+const CONTEXTS: usize = 64
+
+// The context map alphabet: up to 64 cluster indexes after up to 6 run-length codes of zeros.
+const MAP_ALPHABET: usize = 70
+
+const MODE_UTF8: u32 = 2
+
+// Base-2 logarithms of the counts below this come from a table.
+const LOG_TABLE: usize = 4096
+
+const MODE_SIGNED: u32 = 3
+
+// The static dictionary index for qualities 10 and 11: a hash of the first 4 bytes of each word,
+// with ASCII letters lowercased, over its 13,504 words.
+const WORD_HASH_BITS: u32 = 15
+
+const WORD_COUNT: usize = 13504
+
+// The number of transform prefixes and suffixes in `brotli_tables.affixes`.
+const AFFIX_COUNT: usize = 50
+
+// The longest output of a dictionary word with its prefix and suffix, plus 1.
+const WORD_REACH: usize = 38
+
+const NO_WORD: u32 = 0xffffffff
+
+// A prefix group: the prefix, then 13 bounds of its transforms by kind.
+const GROUP_SIZE: usize = 14
+
+// A match length in the pool keeps a dictionary word's length above this shift, 0 for a backward
+// match.
+const MATCH_WORD_SHIFT: u32 = 27
+
+const MATCH_LENGTH: u32 = 0x7ffffff
+
 const MIN_SCORE: u64 = 2020
 
 const LAZY_GAIN: u64 = 175
@@ -312,6 +382,9 @@ const COMMAND_ALPHABET: usize = 704
 
 // 16 short codes and 48 long codes, with no postfix bits and no direct codes.
 const DISTANCE_ALPHABET: usize = 64
+
+// The largest distance alphabet: 3 postfix bits and 120 direct distance codes.
+const DISTANCE_LIMIT: usize = 520
 
 const LENGTH_ALPHABET: usize = 18
 
@@ -488,8 +561,28 @@ impl BrotliEncoder {
     run List<u32>.appendRepeated(&mut matchCount, 0, positions)
     let mut nodeLength = List<u32>.make()
     run List<u32>.appendRepeated(&mut nodeLength, 0, positions)
+    let mut nodeWord = List<u32>.make()
+    run List<u32>.appendRepeated(&mut nodeWord, 0, positions)
     let mut nodeDistance = List<u32>.make()
     run List<u32>.appendRepeated(&mut nodeDistance, 0, positions)
+    let mut wordHeads = List<u32>.make()
+    let mut wordNext = List<u32>.make()
+    let mut wordEntry = List<u32>.make()
+    let mut prefixTransforms = List<u32>.make()
+    let mut prefixGroups = List<u32>.make()
+    if zopfli {
+      run List<u32>.appendRepeated(&mut wordHeads, 0, usize.shiftLeft(1, u32.toUsize(WORD_HASH_BITS)))
+      run List<u32>.appendRepeated(&mut wordNext, 0, WORD_COUNT)
+      run List<u32>.appendRepeated(&mut wordEntry, 0, WORD_COUNT)
+      run List<u32>.appendRepeated(&mut prefixTransforms, 0, brotli_tables.transformCount())
+      run List<u32>.appendRepeated(&mut prefixGroups, 0, GROUP_SIZE * AFFIX_COUNT + 1)
+      indexWords(
+        List<u32>.asMutSlice(&mut wordHeads),
+        List<u32>.asMutSlice(&mut wordNext),
+        List<u32>.asMutSlice(&mut wordEntry),
+      )
+      indexPrefixes(List<u32>.asMutSlice(&mut prefixTransforms), List<u32>.asMutSlice(&mut prefixGroups))
+    }
     let mut nodeInsert = List<u32>.make()
     run List<u32>.appendRepeated(&mut nodeInsert, 0, positions)
     let mut nodeShortcut = List<u32>.make()
@@ -521,16 +614,48 @@ impl BrotliEncoder {
     run List<u32>.appendRepeated(&mut commandInsert, 0, commands)
     let mut commandCopy = List<u32>.make()
     run List<u32>.appendRepeated(&mut commandCopy, 0, commands)
+    let mut commandWord = List<u32>.make()
+    run List<u32>.appendRepeated(&mut commandWord, 0, commands)
     let mut commandDistance = List<u32>.make()
     run List<u32>.appendRepeated(&mut commandDistance, 0, commands)
     let mut commandSymbol = List<u32>.make()
     run List<u32>.appendRepeated(&mut commandSymbol, 0, commands)
+    let contextModeling = quality >= CONTEXT_QUALITY
+    let mut clusters: usize = 1
+    if contextModeling {
+      clusters = CONTEXTS
+    }
     let mut literalHistogram = List<u32>.make()
-    run List<u32>.appendRepeated(&mut literalHistogram, 0, LITERAL_ALPHABET)
+    run List<u32>.appendRepeated(&mut literalHistogram, 0, LITERAL_ALPHABET * clusters)
     let mut literalDepth = List<u32>.make()
-    run List<u32>.appendRepeated(&mut literalDepth, 0, LITERAL_ALPHABET)
+    run List<u32>.appendRepeated(&mut literalDepth, 0, LITERAL_ALPHABET * clusters)
     let mut literalCode = List<u32>.make()
-    run List<u32>.appendRepeated(&mut literalCode, 0, LITERAL_ALPHABET)
+    run List<u32>.appendRepeated(&mut literalCode, 0, LITERAL_ALPHABET * clusters)
+    let mut contextHistogram = List<u32>.make()
+    run List<u32>.appendRepeated(&mut contextHistogram, 0, LITERAL_ALPHABET * clusters)
+    let mut contextMap = List<u32>.make()
+    run List<u32>.appendRepeated(&mut contextMap, 0, CONTEXTS)
+    let mut clusterCost = List<f64>.make()
+    run List<f64>.appendRepeated(&mut clusterCost, 0.0, clusters)
+    let mut mergeCost = List<f64>.make()
+    run List<f64>.appendRepeated(&mut mergeCost, 0.0, clusters * clusters)
+    let mut mergedHistogram = List<u32>.make()
+    run List<u32>.appendRepeated(&mut mergedHistogram, 0, LITERAL_ALPHABET)
+    let mut mapHistogram = List<u32>.make()
+    run List<u32>.appendRepeated(&mut mapHistogram, 0, MAP_ALPHABET)
+    let mut mapDepth = List<u32>.make()
+    run List<u32>.appendRepeated(&mut mapDepth, 0, MAP_ALPHABET)
+    let mut mapCode = List<u32>.make()
+    run List<u32>.appendRepeated(&mut mapCode, 0, MAP_ALPHABET)
+    let mut mapSymbols = List<u32>.make()
+    run List<u32>.appendRepeated(&mut mapSymbols, 0, CONTEXTS)
+    let mut logTable = List<f64>.make()
+    run List<f64>.appendRepeated(&mut logTable, 0.0, LOG_TABLE)
+    let mut logIndex: usize = 1
+    while logIndex < LOG_TABLE {
+      List<f64>.set(&mut logTable, logIndex, log2Of(logIndex))
+      logIndex = logIndex + 1
+    }
     let mut commandHistogram = List<u32>.make()
     run List<u32>.appendRepeated(&mut commandHistogram, 0, COMMAND_ALPHABET)
     let mut commandDepth = List<u32>.make()
@@ -538,11 +663,11 @@ impl BrotliEncoder {
     let mut commandCode = List<u32>.make()
     run List<u32>.appendRepeated(&mut commandCode, 0, COMMAND_ALPHABET)
     let mut distanceHistogram = List<u32>.make()
-    run List<u32>.appendRepeated(&mut distanceHistogram, 0, DISTANCE_ALPHABET)
+    run List<u32>.appendRepeated(&mut distanceHistogram, 0, DISTANCE_LIMIT)
     let mut distanceDepth = List<u32>.make()
-    run List<u32>.appendRepeated(&mut distanceDepth, 0, DISTANCE_ALPHABET)
+    run List<u32>.appendRepeated(&mut distanceDepth, 0, DISTANCE_LIMIT)
     let mut distanceCode = List<u32>.make()
-    run List<u32>.appendRepeated(&mut distanceCode, 0, DISTANCE_ALPHABET)
+    run List<u32>.appendRepeated(&mut distanceCode, 0, DISTANCE_LIMIT)
     let mut lengthHistogram = List<u32>.make()
     run List<u32>.appendRepeated(&mut lengthHistogram, 0, LENGTH_ALPHABET)
     let mut lengthDepth = List<u32>.make()
@@ -587,6 +712,7 @@ impl BrotliEncoder {
       matchLength: move matchLength,
       matchCount: move matchCount,
       nodeLength: move nodeLength,
+      nodeWord: move nodeWord,
       nodeDistance: move nodeDistance,
       nodeInsert: move nodeInsert,
       nodeShortcut: move nodeShortcut,
@@ -603,6 +729,14 @@ impl BrotliEncoder {
       queueCache: [0; 32],
       queueSize: 0,
       matchUsed: 0,
+      wordHeads: move wordHeads,
+      wordNext: move wordNext,
+      wordEntry: move wordEntry,
+      prefixTransforms: move prefixTransforms,
+      prefixGroups: move prefixGroups,
+      wordBest: [0; 38],
+      wordLength: [0; 38],
+      streamBase: 0,
       buffer: move buffer,
       capacity: capacity,
       bufferEnd: 0,
@@ -613,15 +747,32 @@ impl BrotliEncoder {
       distanceCache: [4, 11, 15, 16],
       commandInsert: move commandInsert,
       commandCopy: move commandCopy,
+      commandWord: move commandWord,
       commandDistance: move commandDistance,
       commandSymbol: move commandSymbol,
       commandCount: 0,
       literalHistogram: move literalHistogram,
       literalDepth: move literalDepth,
       literalCode: move literalCode,
+      contextModeling: contextModeling,
+      contextMode: 0,
+      clusterCount: 1,
+      contextHistogram: move contextHistogram,
+      contextMap: move contextMap,
+      clusterCost: move clusterCost,
+      mergeCost: move mergeCost,
+      mergedHistogram: move mergedHistogram,
+      mapHistogram: move mapHistogram,
+      mapDepth: move mapDepth,
+      mapCode: move mapCode,
+      mapSymbols: move mapSymbols,
+      logTable: move logTable,
       commandHistogram: move commandHistogram,
       commandDepth: move commandDepth,
       commandCode: move commandCode,
+      distancePostfix: 0,
+      distanceDirect: 0,
+      distanceAlphabet: DISTANCE_ALPHABET,
       distanceHistogram: move distanceHistogram,
       distanceDepth: move distanceDepth,
       distanceCode: move distanceCode,
@@ -672,6 +823,7 @@ impl BrotliEncoder {
     self.bufferEnd = 0
     self.compressedEnd = 0
     self.stitchFrom = 0
+    self.streamBase = 0
     self.distanceCache = [4, 11, 15, 16]
     self.commandCount = 0
     self.pendingLength = 0
@@ -917,6 +1069,7 @@ fn slide(state: &mut BrotliEncoder) -> () {
     index = index + 1
   }
   state.bufferEnd = moved
+  state.streamBase = state.streamBase + shift
   state.compressedEnd = state.compressedEnd - shift
   if state.stitchFrom > shift {
     state.stitchFrom = state.stitchFrom - shift
@@ -1151,10 +1304,17 @@ fn distanceCodeFor(distance: usize, cache: [usize; 4]) -> u32 {
   return usize.toU32(distance) + 15
 }
 
-fn addCommand(state: &mut BrotliEncoder, insert: usize, copy: usize, code: u32) -> () {
+fn addCommand(
+  state: &mut BrotliEncoder,
+  insert: usize,
+  copy: usize,
+  word: u32,
+  code: u32,
+) -> () {
   let index = state.commandCount
   List<u32>.set(&mut state.commandInsert, index, usize.toU32(insert))
   List<u32>.set(&mut state.commandCopy, index, usize.toU32(copy))
+  List<u32>.set(&mut state.commandWord, index, word)
   List<u32>.set(&mut state.commandDistance, index, code)
   state.commandCount = index + 1
 }
@@ -1226,7 +1386,7 @@ fn createCommands(state: &mut BrotliEncoder, start: usize, end: usize) -> () {
         let cache = state.distanceCache
         state.distanceCache = [found.distance, cache[0], cache[1], cache[2]]
       }
-      addCommand(&mut state, insert, found.length, code)
+      addCommand(&mut state, insert, found.length, 0, code)
       insert = 0
       let mut rangeStart = position + 1
       if state.lazy {
@@ -1275,7 +1435,7 @@ fn createCommands(state: &mut BrotliEncoder, start: usize, end: usize) -> () {
   }
   insert = insert + (end - position)
   if insert != 0 {
-    addCommand(&mut state, insert, 0, 0)
+    addCommand(&mut state, insert, 0, 0, 0)
   }
   state.stitchFrom = storeEnd
 }
@@ -1327,26 +1487,30 @@ fn commandSymbolFor(insert: u32, copy: u32, lastDistance: bool) -> u32 {
   return u32.shiftLeft(cell, 6) | low
 }
 
-// The distance symbol of a distance code, and its extra bits as `value << 5 | count`.
-fn distanceSymbol(code: u32) -> u32 {
-  if code < 16 {
+// The distance symbol of distance code `code` with `postfix` postfix bits and `direct` direct
+// distance codes.
+fn distanceSymbol(code: u32, postfix: u32, direct: u32) -> u32 {
+  if code < 16 + direct {
     return code
   }
-  let value = code - 12
+  let value = u32.shiftLeft(1, postfix + 2) + code - 16 - direct
   let bucket = log2Floor(u32.toUsize(value)) - 1
   let prefix = u32.shiftRight(value, bucket) & 1
-  return 16 + 2 * (bucket - 1) + prefix
+  let bits = bucket - postfix
+  return 16 + direct + u32.shiftLeft(2 * (bits - 1) + prefix, postfix)
+    + (value & (u32.shiftLeft(1, postfix) - 1))
 }
 
-fn distanceExtra(code: u32) -> u32 {
-  if code < 16 {
+// The extra bits of distance code `code`, above bit 5, and their count.
+fn distanceExtra(code: u32, postfix: u32, direct: u32) -> u32 {
+  if code < 16 + direct {
     return 0
   }
-  let value = code - 12
+  let value = u32.shiftLeft(1, postfix + 2) + code - 16 - direct
   let bucket = log2Floor(u32.toUsize(value)) - 1
   let prefix = u32.shiftRight(value, bucket) & 1
   let offset = u32.shiftLeft(2 + prefix, bucket)
-  return u32.shiftLeft(value - offset, 5) | bucket
+  return u32.shiftLeft(u32.shiftRight(value - offset, postfix), 5) | (bucket - postfix)
 }
 
 fn clear(values: &mut List<u32>) -> () {
@@ -1363,12 +1527,20 @@ fn countSymbols(state: &mut BrotliEncoder, start: usize) -> () {
   clear(&mut state.literalHistogram)
   clear(&mut state.commandHistogram)
   clear(&mut state.distanceHistogram)
+  clear(&mut state.contextHistogram)
+  let modeling = state.contextModeling
+  let lookup = brotli_tables.contextLookup()
+  let mode = u32.toUsize(state.contextMode) * 512
+  let postfix = state.distancePostfix
+  let direct = state.distanceDirect
   let buffer = List<u8>.asSlice(&state.buffer)
+  let contexts = List<u32>.asMutSlice(&mut state.contextHistogram)
   let literals = List<u32>.asMutSlice(&mut state.literalHistogram)
   let commands = List<u32>.asMutSlice(&mut state.commandHistogram)
   let distances = List<u32>.asMutSlice(&mut state.distanceHistogram)
   let inserts = List<u32>.asSlice(&state.commandInsert)
   let copies = List<u32>.asSlice(&state.commandCopy)
+  let words = List<u32>.asSlice(&state.commandWord)
   let codes = List<u32>.asSlice(&state.commandDistance)
   let symbols = List<u32>.asMutSlice(&mut state.commandSymbol)
   let mut position = start
@@ -1378,7 +1550,9 @@ fn countSymbols(state: &mut BrotliEncoder, start: usize) -> () {
     let copy = copies[index]
     let code = codes[index]
     let mut copyBucket: u32 = 0
-    if copy != 0 {
+    if words[index] != 0 {
+      copyBucket = copyCode(words[index])
+    } else if copy != 0 {
       copyBucket = copyCode(copy)
     }
     let symbol = commandSymbolFor(insertCode(insert), copyBucket, code == 0)
@@ -1388,10 +1562,15 @@ fn countSymbols(state: &mut BrotliEncoder, start: usize) -> () {
     while position < stop {
       let byte = u8.toUsize(buffer[position])
       literals[byte] = literals[byte] + 1
+      if modeling {
+        let context = contextAt(buffer, lookup, mode, position)
+        let slot = context * LITERAL_ALPHABET + byte
+        contexts[slot] = contexts[slot] + 1
+      }
       position = position + 1
     }
     if copy != 0 && symbol >= 128 {
-      let slot = u32.toUsize(distanceSymbol(code))
+      let slot = u32.toUsize(distanceSymbol(code, postfix, direct))
       distances[slot] = distances[slot] + 1
     }
     position = position + u32.toUsize(copy)
@@ -1553,26 +1732,44 @@ fn buildCodes(depths: &[u32], codes: &mut [u32]) -> () {
 }
 
 // Which prefix code `writeTree` builds and stores.
+// Tree ids below 64 are the literal codes of the clusters.
 const TREE_LITERAL: u32 = 0
 
-const TREE_COMMAND: u32 = 1
+const TREE_COMMAND: u32 = 64
 
-const TREE_DISTANCE: u32 = 2
+const TREE_DISTANCE: u32 = 65
 
-const TREE_LENGTH: u32 = 3
+const TREE_LENGTH: u32 = 66
+
+const TREE_MAP: u32 = 67
 
 fn buildTree(state: &mut BrotliEncoder, tree: u32, limit: u32) -> () {
-  if tree == TREE_LITERAL {
+  if tree < TREE_COMMAND {
+    let base = u32.toUsize(tree) * LITERAL_ALPHABET
     buildDepths(
-      List<u32>.asSlice(&state.literalHistogram),
+      Slice.view<u32>(List<u32>.asSlice(&state.literalHistogram), base, LITERAL_ALPHABET),
       limit,
-      List<u32>.asMutSlice(&mut state.literalDepth),
+      Slice.viewMut<u32>(List<u32>.asMutSlice(&mut state.literalDepth), base, LITERAL_ALPHABET),
       List<u32>.asMutSlice(&mut state.treeCount),
       List<u32>.asMutSlice(&mut state.treeLeft),
       List<u32>.asMutSlice(&mut state.treeRight),
       List<u32>.asMutSlice(&mut state.treeStack),
     )
-    buildCodes(List<u32>.asSlice(&state.literalDepth), List<u32>.asMutSlice(&mut state.literalCode))
+    buildCodes(
+      Slice.view<u32>(List<u32>.asSlice(&state.literalDepth), base, LITERAL_ALPHABET),
+      Slice.viewMut<u32>(List<u32>.asMutSlice(&mut state.literalCode), base, LITERAL_ALPHABET),
+    )
+  } else if tree == TREE_MAP {
+    buildDepths(
+      List<u32>.asSlice(&state.mapHistogram),
+      limit,
+      List<u32>.asMutSlice(&mut state.mapDepth),
+      List<u32>.asMutSlice(&mut state.treeCount),
+      List<u32>.asMutSlice(&mut state.treeLeft),
+      List<u32>.asMutSlice(&mut state.treeRight),
+      List<u32>.asMutSlice(&mut state.treeStack),
+    )
+    buildCodes(List<u32>.asSlice(&state.mapDepth), List<u32>.asMutSlice(&mut state.mapCode))
   } else if tree == TREE_COMMAND {
     buildDepths(
       List<u32>.asSlice(&state.commandHistogram),
@@ -1585,18 +1782,19 @@ fn buildTree(state: &mut BrotliEncoder, tree: u32, limit: u32) -> () {
     )
     buildCodes(List<u32>.asSlice(&state.commandDepth), List<u32>.asMutSlice(&mut state.commandCode))
   } else if tree == TREE_DISTANCE {
+    let alphabet = state.distanceAlphabet
     buildDepths(
-      List<u32>.asSlice(&state.distanceHistogram),
+      Slice.view<u32>(List<u32>.asSlice(&state.distanceHistogram), 0, alphabet),
       limit,
-      List<u32>.asMutSlice(&mut state.distanceDepth),
+      Slice.viewMut<u32>(List<u32>.asMutSlice(&mut state.distanceDepth), 0, alphabet),
       List<u32>.asMutSlice(&mut state.treeCount),
       List<u32>.asMutSlice(&mut state.treeLeft),
       List<u32>.asMutSlice(&mut state.treeRight),
       List<u32>.asMutSlice(&mut state.treeStack),
     )
     buildCodes(
-      List<u32>.asSlice(&state.distanceDepth),
-      List<u32>.asMutSlice(&mut state.distanceCode),
+      Slice.view<u32>(List<u32>.asSlice(&state.distanceDepth), 0, alphabet),
+      Slice.viewMut<u32>(List<u32>.asMutSlice(&mut state.distanceCode), 0, alphabet),
     )
   } else {
     buildDepths(
@@ -1613,18 +1811,25 @@ fn buildTree(state: &mut BrotliEncoder, tree: u32, limit: u32) -> () {
 }
 
 fn treeHistogram(state: &BrotliEncoder, tree: u32) -> &[u32] {
-  if tree == TREE_LITERAL {
-    return List<u32>.asSlice(&state.literalHistogram)
+  if tree < TREE_COMMAND {
+    let base = u32.toUsize(tree) * LITERAL_ALPHABET
+    return Slice.view<u32>(List<u32>.asSlice(&state.literalHistogram), base, LITERAL_ALPHABET)
+  }
+  if tree == TREE_MAP {
+    return List<u32>.asSlice(&state.mapHistogram)
   }
   if tree == TREE_COMMAND {
     return List<u32>.asSlice(&state.commandHistogram)
   }
-  return List<u32>.asSlice(&state.distanceHistogram)
+  return Slice.view<u32>(List<u32>.asSlice(&state.distanceHistogram), 0, state.distanceAlphabet)
 }
 
 fn treeDepth(state: &BrotliEncoder, tree: u32, symbol: usize) -> u32 {
-  if tree == TREE_LITERAL {
-    return List<u32>.get(&state.literalDepth, symbol)
+  if tree < TREE_COMMAND {
+    return List<u32>.get(&state.literalDepth, u32.toUsize(tree) * LITERAL_ALPHABET + symbol)
+  }
+  if tree == TREE_MAP {
+    return List<u32>.get(&state.mapDepth, symbol)
   }
   if tree == TREE_COMMAND {
     return List<u32>.get(&state.commandDepth, symbol)
@@ -1633,8 +1838,10 @@ fn treeDepth(state: &BrotliEncoder, tree: u32, symbol: usize) -> u32 {
 }
 
 fn setDepth(state: &mut BrotliEncoder, tree: u32, symbol: usize, depth: u32) -> () {
-  if tree == TREE_LITERAL {
-    List<u32>.set(&mut state.literalDepth, symbol, depth)
+  if tree < TREE_COMMAND {
+    List<u32>.set(&mut state.literalDepth, u32.toUsize(tree) * LITERAL_ALPHABET + symbol, depth)
+  } else if tree == TREE_MAP {
+    List<u32>.set(&mut state.mapDepth, symbol, depth)
   } else if tree == TREE_COMMAND {
     List<u32>.set(&mut state.commandDepth, symbol, depth)
   } else {
@@ -1926,7 +2133,7 @@ fn dataBits(state: &BrotliEncoder) -> u64 {
   let literals = List<u32>.asSlice(&state.literalHistogram)
   let literalDepths = List<u32>.asSlice(&state.literalDepth)
   let mut index: usize = 0
-  while index < LITERAL_ALPHABET {
+  while index < LITERAL_ALPHABET * state.clusterCount {
     total = total + u32.toU64(literals[index]) * u32.toU64(literalDepths[index])
     index = index + 1
   }
@@ -1940,22 +2147,27 @@ fn dataBits(state: &BrotliEncoder) -> u64 {
   let distances = List<u32>.asSlice(&state.distanceHistogram)
   let distanceDepths = List<u32>.asSlice(&state.distanceDepth)
   index = 0
-  while index < DISTANCE_ALPHABET {
+  while index < state.distanceAlphabet {
     total = total + u32.toU64(distances[index]) * u32.toU64(distanceDepths[index])
     index = index + 1
   }
   let inserts = List<u32>.asSlice(&state.commandInsert)
   let copies = List<u32>.asSlice(&state.commandCopy)
+  let words = List<u32>.asSlice(&state.commandWord)
   let codes = List<u32>.asSlice(&state.commandDistance)
   let symbols = List<u32>.asSlice(&state.commandSymbol)
   index = 0
   while index < state.commandCount {
     total = total + u32.toU64(INSERT_EXTRA[u32.toUsize(insertCode(inserts[index]))])
-    let copy = copies[index]
+    let mut copy = copies[index]
+    if words[index] != 0 {
+      copy = words[index]
+    }
     if copy != 0 {
       total = total + u32.toU64(COPY_EXTRA[u32.toUsize(copyCode(copy))])
       if symbols[index] >= 128 {
-        total = total + u32.toU64(distanceExtra(codes[index]) & 31)
+        let extra = distanceExtra(codes[index], state.distancePostfix, state.distanceDirect)
+        total = total + u32.toU64(extra & 31)
       }
     }
     index = index + 1
@@ -1979,27 +2191,44 @@ fn writeData(state: &mut BrotliEncoder, start: usize) -> () {
     if insertBits != 0 {
       addBits(&mut state, insert - INSERT_BASE[insertBucket], insertBits)
     }
-    if copy != 0 {
-      let copyBucket = u32.toUsize(copyCode(copy))
+    let mut coded = copy
+    let word = List<u32>.get(&state.commandWord, index)
+    if word != 0 {
+      coded = word
+    }
+    if coded != 0 {
+      let copyBucket = u32.toUsize(copyCode(coded))
       let copyBits = COPY_EXTRA[copyBucket]
       if copyBits != 0 {
-        addBits(&mut state, copy - COPY_BASE[copyBucket], copyBits)
+        addBits(&mut state, coded - COPY_BASE[copyBucket], copyBits)
       }
     }
     let stop = position + u32.toUsize(insert)
     while position < stop {
       let byte = u8.toUsize(List<u8>.get(&state.buffer, position))
-      let value3 = List<u32>.get(&state.literalCode, byte)
-      let count3 = List<u32>.get(&state.literalDepth, byte)
+      let mut slot = byte
+      if state.clusterCount > 1 {
+        let context = contextAt(
+          List<u8>.asSlice(&state.buffer),
+          brotli_tables.contextLookup(),
+          u32.toUsize(state.contextMode) * 512,
+          position,
+        )
+        slot = u32.toUsize(List<u32>.get(&state.contextMap, context)) * LITERAL_ALPHABET + byte
+      }
+      let value3 = List<u32>.get(&state.literalCode, slot)
+      let count3 = List<u32>.get(&state.literalDepth, slot)
       addBits(&mut state, value3, count3)
       position = position + 1
     }
     if copy != 0 && symbol >= 128 {
-      let slot = u32.toUsize(distanceSymbol(code))
+      let postfix = state.distancePostfix
+      let direct = state.distanceDirect
+      let slot = u32.toUsize(distanceSymbol(code, postfix, direct))
       let value4 = List<u32>.get(&state.distanceCode, slot)
       let count4 = List<u32>.get(&state.distanceDepth, slot)
       addBits(&mut state, value4, count4)
-      let extra = distanceExtra(code)
+      let extra = distanceExtra(code, postfix, direct)
       let extraBits = extra & 31
       if extraBits != 0 {
         addBits(&mut state, u32.shiftRight(extra, 5), extraBits)
@@ -2026,13 +2255,28 @@ fn compressBlock(state: &mut BrotliEncoder, size: usize, last: bool) -> () {
   let start = state.compressedEnd
   let end = start + size
   let savedCache = state.distanceCache
+  state.distancePostfix = 0
+  state.distanceDirect = 0
+  state.distanceAlphabet = DISTANCE_ALPHABET
   if state.zopfli {
     zopfliCommands(&mut state, start, end)
+    chooseDistanceCodes(&mut state)
   } else {
     stitch(&mut state, start)
     createCommands(&mut state, start, end)
   }
+  state.clusterCount = 1
+  state.contextMode = 0
+  if state.contextModeling {
+    state.contextMode = MODE_SIGNED
+    if mostlyUtf8(List<u8>.asSlice(&state.buffer), start, size) {
+      state.contextMode = MODE_UTF8
+    }
+  }
   countSymbols(&mut state, start)
+  if state.contextModeling {
+    clusterContexts(&mut state)
+  }
   let savedBuffer = state.bitBuffer
   let savedCount = state.bitCount
   let savedLength = state.pendingLength
@@ -2049,15 +2293,25 @@ fn compressBlock(state: &mut BrotliEncoder, size: usize, last: bool) -> () {
     addBits(&mut state, 0, 1)
   }
 
-  // One block type for each category, no postfix or direct distance codes, the LSB6 context
-  // mode, and one literal and one distance prefix code.
+  // One block type for each category, the distance code parameters, the context mode, the
+  // literal prefix codes with their context map, and one distance prefix code.
   addBits(&mut state, 0, 3)
-  addBits(&mut state, 0, 6)
-  addBits(&mut state, 0, 2)
-  addBits(&mut state, 0, 2)
-  writeTree(&mut state, TREE_LITERAL, LITERAL_ALPHABET)
+  let postfix = state.distancePostfix
+  addBits(&mut state, postfix, 2)
+  let directBits = u32.shiftRight(state.distanceDirect, postfix)
+  addBits(&mut state, directBits, 4)
+  let mode = state.contextMode
+  addBits(&mut state, mode, 2)
+  writeContextMap(&mut state)
+  addBits(&mut state, 0, 1)
+  let mut cluster: usize = 0
+  while cluster < state.clusterCount {
+    writeTree(&mut state, usize.toU32(cluster), LITERAL_ALPHABET)
+    cluster = cluster + 1
+  }
   writeTree(&mut state, TREE_COMMAND, COMMAND_ALPHABET)
-  writeTree(&mut state, TREE_DISTANCE, DISTANCE_ALPHABET)
+  let distanceAlphabet = state.distanceAlphabet
+  writeTree(&mut state, TREE_DISTANCE, distanceAlphabet)
   let compressedBits = usize.toU64(state.pendingLength) * 8 + u32.toU64(state.bitCount)
     + dataBits(&state)
   let headerBits = startBits + 4 + 4 * u32.toU64(nibbles)
@@ -2345,7 +2599,14 @@ fn collectMatches(state: &mut BrotliEncoder, start: usize, size: usize) -> () {
     }
     let firstMatch = state.matchUsed
     let mut found = findAllMatches(&mut state, position, size - index, maxDistance)
-    if found > 1 && firstMatch + 2 * TREE_COMPARE + size - index > capacity {
+    let mut best: usize = 0
+    if found > 0 {
+      best = u32.toUsize(List<u32>.get(&state.matchLength, firstMatch + found - 1) & MATCH_LENGTH)
+    }
+    if best < size - index && best < WORD_REACH {
+      found = found + wordMatches(&mut state, position, start + size, best)
+    }
+    if found > 1 && firstMatch + 2 * TREE_COMPARE + WORD_REACH + size - index > capacity {
       // Keep room for one match at each later position.
       let lastDistance = List<u32>.get(&state.matchDistance, firstMatch + found - 1)
       let lastLength = List<u32>.get(&state.matchLength, firstMatch + found - 1)
@@ -2357,7 +2618,7 @@ fn collectMatches(state: &mut BrotliEncoder, start: usize, size: usize) -> () {
     List<u32>.set(&mut state.matchCount, index, usize.toU32(found))
     if found > 0 {
       let lastSlot = state.matchUsed - 1
-      let longest = u32.toUsize(List<u32>.get(&state.matchLength, lastSlot))
+      let longest = u32.toUsize(List<u32>.get(&state.matchLength, lastSlot) & MATCH_LENGTH)
       if longest > state.zopfliLongest {
         let lastDistance = List<u32>.get(&state.matchDistance, lastSlot)
         List<u32>.set(&mut state.matchDistance, firstMatch, lastDistance)
@@ -2482,7 +2743,7 @@ fn shannonCosts(histogram: &[u32], costs: &mut [f64], literal: bool) -> () {
 fn setCommandModel(state: &mut BrotliEncoder, start: usize, size: usize) -> () {
   countSymbols(&mut state, start)
   shannonCosts(
-    List<u32>.asSlice(&state.literalHistogram),
+    Slice.view<u32>(List<u32>.asSlice(&state.literalHistogram), 0, LITERAL_ALPHABET),
     List<f64>.asMutSlice(&mut state.byteCosts),
     true,
   )
@@ -2492,7 +2753,7 @@ fn setCommandModel(state: &mut BrotliEncoder, start: usize, size: usize) -> () {
     false,
   )
   shannonCosts(
-    List<u32>.asSlice(&state.distanceHistogram),
+    Slice.view<u32>(List<u32>.asSlice(&state.distanceHistogram), 0, DISTANCE_ALPHABET),
     List<f64>.asMutSlice(&mut state.distanceCosts),
     false,
   )
@@ -2538,7 +2799,9 @@ fn shortcutAt(state: &BrotliEncoder, start: usize, at: usize) -> u32 {
   let copy = u32.toUsize(List<u32>.get(&state.nodeLength, at))
   let insert = u32.toUsize(List<u32>.get(&state.nodeInsert, at) & INSERT_MASK)
   let distance = u32.toUsize(List<u32>.get(&state.nodeDistance, at))
-  if distance + copy <= start + at && distance <= state.maxDistance && nodeCode(&state, at) > 0 {
+  let word = List<u32>.get(&state.nodeWord, at)
+  if word == 0 && distance + copy <= start + at && distance <= state.maxDistance
+    && nodeCode(&state, at) > 0 {
     return usize.toU32(at)
   }
   return List<u32>.get(&state.nodeShortcut, at - copy - insert)
@@ -2616,6 +2879,7 @@ fn updateNode(
 ) -> () {
   let target = at + length
   List<u32>.set(&mut state.nodeLength, target, usize.toU32(length))
+  List<u32>.set(&mut state.nodeWord, target, 0)
   List<u32>.set(&mut state.nodeDistance, target, usize.toU32(distance))
   List<u32>.set(&mut state.nodeInsert, target, usize.toU32(at - from) | u32.shiftLeft(short, 27))
   List<f64>.set(&mut state.nodeCost, target, cost)
@@ -2718,21 +2982,28 @@ fn updateNodes(
       while index < matches {
         let slot = firstMatch + index
         let distance = List<u32>.get(&state.matchDistance, slot)
-        let matchLength = u32.toUsize(List<u32>.get(&state.matchLength, slot))
+        let packed = List<u32>.get(&state.matchLength, slot)
+        let matchLength = u32.toUsize(packed & MATCH_LENGTH)
+        let word = u32.shiftRight(packed, MATCH_WORD_SHIFT)
         let distanceCode = distance + 15
-        let distanceSlot = u32.toUsize(distanceSymbol(distanceCode))
-        let distanceCost = baseCost + u32.toF64(distanceExtra(distanceCode) & 31)
+        let distanceSlot = u32.toUsize(distanceSymbol(distanceCode, 0, 0))
+        let distanceCost = baseCost + u32.toF64(distanceExtra(distanceCode, 0, 0) & 31)
           + List<f64>.get(&state.distanceCosts, distanceSlot)
-        if length < matchLength && matchLength > state.zopfliLongest {
+        if length < matchLength && (word != 0 || matchLength > state.zopfliLongest) {
           length = matchLength
         }
         while length <= matchLength {
-          let copyBucket = copyCode(usize.toU32(length))
+          let mut coded = usize.toU32(length)
+          if word != 0 {
+            coded = word
+          }
+          let copyBucket = copyCode(coded)
           let symbol = commandSymbolFor(insertBucket, copyBucket, false)
           let cost = distanceCost + u32.toF64(COPY_EXTRA[u32.toUsize(copyBucket)])
             + List<f64>.get(&state.commandCosts, u32.toUsize(symbol))
           if cost < List<f64>.get(&state.nodeCost, at + length) {
             updateNode(&mut state, at, from, length, u32.toUsize(distance), 0, cost)
+            List<u32>.set(&mut state.nodeWord, at + length, word)
             if length > result {
               result = length
             }
@@ -2753,6 +3024,7 @@ fn zopfliRound(state: &mut BrotliEncoder, start: usize, size: usize) -> () {
   let mut index: usize = 0
   while index <= size {
     List<u32>.set(&mut state.nodeLength, index, 1)
+    List<u32>.set(&mut state.nodeWord, index, 0)
     List<u32>.set(&mut state.nodeDistance, index, 0)
     List<u32>.set(&mut state.nodeInsert, index, 0)
     List<u32>.set(&mut state.nodeShortcut, index, 0)
@@ -2772,7 +3044,7 @@ fn zopfliRound(state: &mut BrotliEncoder, start: usize, size: usize) -> () {
     }
     cursor = cursor + matches
     if matches == 1 {
-      let longest = u32.toUsize(List<u32>.get(&state.matchLength, cursor - 1))
+      let longest = u32.toUsize(List<u32>.get(&state.matchLength, cursor - 1) & MATCH_LENGTH)
       if longest > state.zopfliLongest && longest > skip {
         skip = longest
       }
@@ -2814,16 +3086,17 @@ fn zopfliRound(state: &mut BrotliEncoder, start: usize, size: usize) -> () {
     let insert = u32.toUsize(List<u32>.get(&state.nodeInsert, next) & INSERT_MASK)
     let code = nodeCode(&state, next)
     let distance = u32.toUsize(List<u32>.get(&state.nodeDistance, next))
+    let word = List<u32>.get(&state.nodeWord, next)
     offset = List<u32>.get(&state.nodeNext, next)
-    addCommand(&mut state, insert, copy, code)
-    if code != 0 {
+    addCommand(&mut state, insert, copy, word, code)
+    if code != 0 && word == 0 {
       let cache = state.distanceCache
       state.distanceCache = [distance, cache[0], cache[1], cache[2]]
     }
     position = next
   }
   if position < size {
-    addCommand(&mut state, size - position, 0, 0)
+    addCommand(&mut state, size - position, 0, 0, 0)
   }
 }
 
@@ -2845,4 +3118,828 @@ fn zopfliCommands(state: &mut BrotliEncoder, start: usize, end: usize) -> () {
     zopfliRound(&mut state, start, size)
     round = round + 1
   }
+}
+
+// The literal context of `position` from the two bytes before it, as the decoder computes it.
+@inlineAlways
+fn contextAt(buffer: &[u8], lookup: &[u8], mode: usize, position: usize) -> usize {
+  let mut last: usize = 0
+  let mut before: usize = 0
+  if position >= 1 {
+    last = u8.toUsize(buffer[position - 1])
+  }
+  if position >= 2 {
+    before = u8.toUsize(buffer[position - 2])
+  }
+  return u8.toUsize(lookup[mode + last] | lookup[mode + 256 + before])
+}
+
+// Whether more than 3/4 of the bytes form UTF-8 sequences, as the reference
+// `BrotliIsMostlyUTF8` decides.
+fn mostlyUtf8(buffer: &[u8], start: usize, size: usize) -> bool {
+  let mut valid: usize = 0
+  let mut index: usize = 0
+  while index < size {
+    let first = buffer[start + index]
+    let left = size - index
+    let mut length: usize = 0
+    if first & 128 == 0 {
+      if first != 0 {
+        length = 1
+      }
+    } else if left > 1 && first & 224 == 192 && buffer[start + index + 1] & 192 == 128 {
+      if first & 31 >= 2 {
+        length = 2
+      }
+    } else if left > 2 && first & 240 == 224 && buffer[start + index + 1] & 192 == 128
+      && buffer[start + index + 2] & 192 == 128 {
+      if first & 15 != 0 || buffer[start + index + 1] & 32 != 0 {
+        length = 3
+      }
+    } else if left > 3 && first & 248 == 240 && buffer[start + index + 1] & 192 == 128
+      && buffer[start + index + 2] & 192 == 128
+      && buffer[start + index + 3] & 192 == 128 {
+      let plane = u32.shiftLeft(u8.toU32(first & 7), 2)
+        | u32.shiftRight(u8.toU32(buffer[start + index + 1] & 63), 4)
+      if plane >= 1 && plane <= 16 {
+        length = 4
+      }
+    }
+    if length == 0 {
+      index = index + 1
+    } else {
+      valid = valid + length
+      index = index + length
+    }
+  }
+  return 4 * valid > 3 * size
+}
+
+// The estimated bits of a histogram coded with its own prefix code, the code included, as the
+// reference `BrotliPopulationCost` estimates them.
+fn populationCost(histogram: &[u32], logs: &[f64]) -> f64 {
+  let mut count: usize = 0
+  let mut total: usize = 0
+  let mut top: [u32; 4] = [0; 4]
+  let mut index: usize = 0
+  while index < histogram.length {
+    let value = histogram[index]
+    if value != 0 {
+      if count < 4 {
+        top[count] = value
+      }
+      count = count + 1
+      total = total + u32.toUsize(value)
+    }
+    index = index + 1
+  }
+  if count <= 1 {
+    return 12.0
+  }
+  if count == 2 {
+    return 20.0 + usize.toF64(total)
+  }
+  if count == 3 {
+    let mut most = top[0]
+    if top[1] > most {
+      most = top[1]
+    }
+    if top[2] > most {
+      most = top[2]
+    }
+    return 28.0 + 2.0 * usize.toF64(total) - u32.toF64(most)
+  }
+  if count == 4 {
+    // Sort decreasing.
+    let mut first: usize = 0
+    while first < 4 {
+      let mut second = first + 1
+      while second < 4 {
+        if top[second] > top[first] {
+          let swap = top[first]
+          top[first] = top[second]
+          top[second] = swap
+        }
+        second = second + 1
+      }
+      first = first + 1
+    }
+    let low = top[2] + top[3]
+    let mut most = low
+    if top[0] > most {
+      most = top[0]
+    }
+    return 37.0 + 3.0 * u32.toF64(low) + 2.0 * u32.toF64(top[0] + top[1]) - u32.toF64(most)
+  }
+  let mut bits: f64 = 0.0
+  let mut lengths: [u32; 18] = [0; 18]
+  let mut deepest: usize = 1
+  let logTotal = fastLog2(logs, total)
+  index = 0
+  while index < histogram.length {
+    let value = histogram[index]
+    if value != 0 {
+      let cost = logTotal - fastLog2(logs, u32.toUsize(value))
+      bits = bits + u32.toF64(value) * cost
+      let mut depth: usize = 15
+      if cost + 0.5 < 15.0 {
+        depth = f64.toUsize(cost + 0.5)
+      }
+      if depth > deepest {
+        deepest = depth
+      }
+      lengths[depth] = lengths[depth] + 1
+      index = index + 1
+    } else {
+      let mut repeats: usize = 1
+      while index + repeats < histogram.length && histogram[index + repeats] == 0 {
+        repeats = repeats + 1
+      }
+      index = index + repeats
+      if index == histogram.length {
+        break
+      }
+      if repeats < 3 {
+        lengths[0] = lengths[0] + usize.toU32(repeats)
+      } else {
+        repeats = repeats - 2
+        while repeats > 0 {
+          lengths[17] = lengths[17] + 1
+          bits = bits + 3.0
+          repeats = usize.shiftRight(repeats, 3)
+        }
+      }
+    }
+  }
+  bits = bits + usize.toF64(18 + 2 * deepest)
+
+  // The entropy of the code length histogram, at least 1 bit for each length.
+  let mut sum: u32 = 0
+  let mut entropy: f64 = 0.0
+  index = 0
+  while index < 18 {
+    let value = lengths[index]
+    if value != 0 {
+      sum = sum + value
+      entropy = entropy - u32.toF64(value) * fastLog2(logs, u32.toUsize(value))
+    }
+    index = index + 1
+  }
+  if sum != 0 {
+    entropy = entropy + u32.toF64(sum) * fastLog2(logs, u32.toUsize(sum))
+  }
+  if entropy < u32.toF64(sum) {
+    entropy = u32.toF64(sum)
+  }
+  return bits + entropy
+}
+
+// The cost of the union of the clusters `left` and `right`, from their histograms.
+fn mergedCost(state: &mut BrotliEncoder, left: usize, right: usize) -> f64 {
+  let histograms = List<u32>.asSlice(&state.literalHistogram)
+  let merged = List<u32>.asMutSlice(&mut state.mergedHistogram)
+  let mut index: usize = 0
+  while index < LITERAL_ALPHABET {
+    merged[index] = histograms[left * LITERAL_ALPHABET + index]
+      + histograms[right * LITERAL_ALPHABET + index]
+    index = index + 1
+  }
+  return populationCost(
+    List<u32>.asSlice(&state.mergedHistogram),
+    List<f64>.asSlice(&state.logTable),
+  )
+}
+
+// Clusters the 64 literal context histograms by merging the pair that saves the most bits until
+// no merge saves any, as the reference `BrotliHistogramCombine` does, then numbers the clusters
+// in the order of their first context.
+fn clusterContexts(state: &mut BrotliEncoder) -> () {
+  // Cluster `c` starts as context `c`; a merge keeps the lower index. Empty contexts join the
+  // cluster of the context before them.
+  let mut alive: [bool; 64] = [false; 64]
+  let mut index: usize = 0
+  while index < CONTEXTS * LITERAL_ALPHABET {
+    List<u32>.set(&mut state.literalHistogram, index, List<u32>.get(&state.contextHistogram, index))
+    index = index + 1
+  }
+  let mut owner: [usize; 64] = [0; 64]
+  let mut context: usize = 0
+  while context < CONTEXTS {
+    let histogram = Slice.view<u32>(
+      List<u32>.asSlice(&state.literalHistogram),
+      context * LITERAL_ALPHABET,
+      LITERAL_ALPHABET,
+    )
+    let mut any = false
+    let mut symbol: usize = 0
+    while symbol < LITERAL_ALPHABET {
+      if histogram[symbol] != 0 {
+        any = true
+        break
+      }
+      symbol = symbol + 1
+    }
+    if any {
+      alive[context] = true
+      owner[context] = context
+      let cost = populationCost(histogram, List<f64>.asSlice(&state.logTable))
+      List<f64>.set(&mut state.clusterCost, context, cost)
+    } else {
+      owner[context] = CONTEXTS
+    }
+    context = context + 1
+  }
+  let mut left: usize = 0
+  while left < CONTEXTS {
+    if alive[left] {
+      let mut right = left + 1
+      while right < CONTEXTS {
+        if alive[right] {
+          let saving = mergedCost(&mut state, left, right) - List<f64>.get(&state.clusterCost, left)
+            - List<f64>.get(&state.clusterCost, right)
+          List<f64>.set(&mut state.mergeCost, left * CONTEXTS + right, saving)
+        }
+        right = right + 1
+      }
+    }
+    left = left + 1
+  }
+  while true {
+    let mut best: f64 = 0.0
+    let mut bestLeft: usize = CONTEXTS
+    let mut bestRight: usize = CONTEXTS
+    left = 0
+    while left < CONTEXTS {
+      if alive[left] {
+        let mut right = left + 1
+        while right < CONTEXTS {
+          if alive[right] {
+            let saving = List<f64>.get(&state.mergeCost, left * CONTEXTS + right)
+            if saving < best {
+              best = saving
+              bestLeft = left
+              bestRight = right
+            }
+          }
+          right = right + 1
+        }
+      }
+      left = left + 1
+    }
+    if bestLeft == CONTEXTS {
+      break
+    }
+    let combined = best + List<f64>.get(&state.clusterCost, bestLeft)
+      + List<f64>.get(&state.clusterCost, bestRight)
+    index = 0
+    while index < LITERAL_ALPHABET {
+      let into = bestLeft * LITERAL_ALPHABET + index
+      let from = bestRight * LITERAL_ALPHABET + index
+      let sum = List<u32>.get(&state.literalHistogram, into)
+        + List<u32>.get(&state.literalHistogram, from)
+      List<u32>.set(&mut state.literalHistogram, into, sum)
+      index = index + 1
+    }
+    alive[bestRight] = false
+    List<f64>.set(&mut state.clusterCost, bestLeft, combined)
+    context = 0
+    while context < CONTEXTS {
+      if owner[context] == bestRight {
+        owner[context] = bestLeft
+      }
+      context = context + 1
+    }
+    let mut other: usize = 0
+    while other < CONTEXTS {
+      if alive[other] && other != bestLeft {
+        let mut low = other
+        let mut high = bestLeft
+        if low > high {
+          low = bestLeft
+          high = other
+        }
+        let saving = mergedCost(&mut state, low, high) - List<f64>.get(&state.clusterCost, low)
+          - List<f64>.get(&state.clusterCost, high)
+        List<f64>.set(&mut state.mergeCost, low * CONTEXTS + high, saving)
+      }
+      other = other + 1
+    }
+  }
+
+  // Number the clusters by first context and move their histograms down to that number.
+  let mut number: [usize; 64] = [CONTEXTS; 64]
+  let mut clusters: usize = 0
+  let mut previous: usize = 0
+  context = 0
+  while context < CONTEXTS {
+    let cluster = owner[context]
+    let mut assigned = previous
+    if cluster != CONTEXTS {
+      if number[cluster] == CONTEXTS {
+        number[cluster] = clusters
+        if clusters != cluster {
+          index = 0
+          while index < LITERAL_ALPHABET {
+            let value = List<u32>.get(&state.literalHistogram, cluster * LITERAL_ALPHABET + index)
+            List<u32>.set(&mut state.literalHistogram, clusters * LITERAL_ALPHABET + index, value)
+            index = index + 1
+          }
+        }
+        clusters = clusters + 1
+      }
+      assigned = number[cluster]
+    }
+    List<u32>.set(&mut state.contextMap, context, usize.toU32(assigned))
+    previous = assigned
+    context = context + 1
+  }
+  if clusters == 0 {
+    clusters = 1
+  }
+  state.clusterCount = clusters
+}
+
+// Writes `value` (0 to 255) as the 1 to 11 bits of a VarLenUint8.
+fn writeVarLen(state: &mut BrotliEncoder, value: usize) -> () {
+  if value == 0 {
+    addBits(&mut state, 0, 1)
+    return ()
+  }
+  let bits = log2Floor(value)
+  addBits(&mut state, 1, 1)
+  addBits(&mut state, bits, 3)
+  addBits(&mut state, usize.toU32(value) - u32.shiftLeft(1, bits), bits)
+}
+
+// Writes NTREESL and the literal context map: move-to-front, run-length codes of zeros, and a
+// prefix code, as the reference `EncodeContextMap` does.
+fn writeContextMap(state: &mut BrotliEncoder) -> () {
+  let clusters = state.clusterCount
+  writeVarLen(&mut state, clusters - 1)
+  if clusters == 1 {
+    return ()
+  }
+  let mut order: [u32; 64] = [0; 64]
+  let mut index: usize = 0
+  while index < CONTEXTS {
+    order[index] = usize.toU32(index)
+    index = index + 1
+  }
+  let mut moved: [u32; 64] = [0; 64]
+  index = 0
+  while index < CONTEXTS {
+    let value = List<u32>.get(&state.contextMap, index)
+    let mut place: usize = 0
+    while order[place] != value {
+      place = place + 1
+    }
+    moved[index] = usize.toU32(place)
+    while place > 0 {
+      order[place] = order[place - 1]
+      place = place - 1
+    }
+    order[0] = value
+    index = index + 1
+  }
+  let mut longest: usize = 0
+  index = 0
+  while index < CONTEXTS {
+    let mut streak: usize = 0
+    while index < CONTEXTS && moved[index] == 0 {
+      streak = streak + 1
+      index = index + 1
+    }
+    if streak > longest {
+      longest = streak
+    }
+    while index < CONTEXTS && moved[index] != 0 {
+      index = index + 1
+    }
+  }
+  let mut prefix: u32 = 0
+  if longest > 0 {
+    prefix = log2Floor(longest)
+  }
+  if prefix > 6 {
+    prefix = 6
+  }
+  let mut count: usize = 0
+  index = 0
+  while index < CONTEXTS {
+    if moved[index] != 0 {
+      List<u32>.set(&mut state.mapSymbols, count, moved[index] + prefix)
+      count = count + 1
+      index = index + 1
+    } else {
+      let mut streak: u32 = 0
+      while index < CONTEXTS && moved[index] == 0 {
+        streak = streak + 1
+        index = index + 1
+      }
+      while streak != 0 {
+        if streak < u32.shiftLeft(2, prefix) {
+          let code = log2Floor(u32.toUsize(streak))
+          let extra = streak - u32.shiftLeft(1, code)
+          List<u32>.set(&mut state.mapSymbols, count, code + u32.shiftLeft(extra, 9))
+          count = count + 1
+          streak = 0
+        } else {
+          let extra = u32.shiftLeft(1, prefix) - 1
+          List<u32>.set(&mut state.mapSymbols, count, prefix + u32.shiftLeft(extra, 9))
+          count = count + 1
+          streak = streak - (u32.shiftLeft(2, prefix) - 1)
+        }
+      }
+    }
+  }
+  clear(&mut state.mapHistogram)
+  index = 0
+  while index < count {
+    let symbol = u32.toUsize(List<u32>.get(&state.mapSymbols, index) & 511)
+    let seen = List<u32>.get(&state.mapHistogram, symbol)
+    List<u32>.set(&mut state.mapHistogram, symbol, seen + 1)
+    index = index + 1
+  }
+  if prefix > 0 {
+    addBits(&mut state, 1, 1)
+    addBits(&mut state, prefix - 1, 4)
+  } else {
+    addBits(&mut state, 0, 1)
+  }
+  writeTree(&mut state, TREE_MAP, clusters + u32.toUsize(prefix))
+  index = 0
+  while index < count {
+    let entry = List<u32>.get(&state.mapSymbols, index)
+    let symbol = entry & 511
+    let value = List<u32>.get(&state.mapCode, u32.toUsize(symbol))
+    let depth = List<u32>.get(&state.mapDepth, u32.toUsize(symbol))
+    addBits(&mut state, value, depth)
+    if symbol > 0 && symbol <= prefix {
+      addBits(&mut state, u32.shiftRight(entry, 9), symbol)
+    }
+    index = index + 1
+  }
+
+  // The decoder undoes the move-to-front.
+  addBits(&mut state, 1, 1)
+}
+
+@inlineAlways
+fn fastLog2(logs: &[f64], value: usize) -> f64 {
+  if value < logs.length {
+    return logs[value]
+  }
+  return log2Of(value)
+}
+
+@inlineAlways
+fn lowerAscii(byte: u8) -> u32 {
+  let value = u8.toU32(byte)
+  if value >= 65 && value <= 90 {
+    return value + 32
+  }
+  return value
+}
+
+// The dictionary index bucket of the 4 bytes at `at`, with ASCII letters lowercased.
+fn wordKey(bytes: &[u8], at: usize) -> usize {
+  let key = lowerAscii(bytes[at]) | u32.shiftLeft(lowerAscii(bytes[at + 1]), 8)
+    | u32.shiftLeft(lowerAscii(bytes[at + 2]), 16) | u32.shiftLeft(lowerAscii(bytes[at + 3]), 24)
+  let hash = u32.wrappingMultiply(key, 0x1e35a7bd)
+  return u32.toUsize(u32.shiftRight(hash, 32 - WORD_HASH_BITS))
+}
+
+// Chains every dictionary word into its bucket. An entry is the word length above bit 16 and the
+// word's index.
+fn indexWords(heads: &mut [u32], next: &mut [u32], entries: &mut [u32]) -> () {
+  let words = brotli_tables.words()
+  let mut count: usize = 0
+  let mut size: usize = 4
+  while size <= 24 {
+    let bits = brotli_tables.wordSizeBits(size)
+    let offset = brotli_tables.wordOffset(size)
+    let total = usize.shiftLeft(1, u32.toUsize(bits))
+    let mut index: usize = 0
+    while bits != 0 && index < total {
+      let key = wordKey(words, offset + index * size)
+      entries[count] = u32.shiftLeft(usize.toU32(size), 16) | usize.toU32(index)
+      next[count] = heads[key]
+      heads[key] = usize.toU32(count + 1)
+      count = count + 1
+      index = index + 1
+    }
+    size = size + 1
+  }
+}
+
+// Groups the transforms that keep the start of the word by prefix, and in each group by kind:
+// `groups` holds for each group the prefix, then where the transforms of each kind from 0 to 11
+// start in `transforms` and where the last ends, and it ends with `NO_WORD`.
+fn indexPrefixes(transforms: &mut [u32], groups: &mut [u32]) -> () {
+  let mut count: usize = 0
+  let mut group: usize = 0
+  let mut affix: usize = 0
+  while affix < AFFIX_COUNT {
+    let first = count
+    let base = group * GROUP_SIZE
+    let mut kind: u32 = 0
+    while kind <= 11 {
+      groups[base + 1 + u32.toUsize(kind)] = usize.toU32(count)
+      let mut transform: usize = 0
+      while transform < brotli_tables.transformCount() {
+        if brotli_tables.transformPrefix(transform) == affix
+          && brotli_tables.transformKind(transform) == kind {
+          transforms[count] = usize.toU32(transform)
+          count = count + 1
+        }
+        transform = transform + 1
+      }
+      kind = kind + 1
+    }
+    groups[base + 13] = usize.toU32(count)
+    if count > first {
+      groups[base] = usize.toU32(affix)
+      group = group + 1
+    }
+    affix = affix + 1
+  }
+  groups[group * GROUP_SIZE] = NO_WORD
+}
+
+// Uppercases the UTF-8 character at `at` of `word` the way the decoder does, changing only bytes
+// before `end`, and returns its length.
+fn upperWord(word: &mut [u8; 24], at: usize, end: usize) -> usize {
+  let first = word[at]
+  if first < 192 {
+    if first >= 97 && first <= 122 {
+      word[at] = first ^ 32
+    }
+    return 1
+  }
+  if first < 224 {
+    if at + 1 < end {
+      word[at + 1] = word[at + 1] ^ 32
+    }
+    return 2
+  }
+  if at + 2 < end {
+    word[at + 2] = word[at + 2] ^ 5
+  }
+  return 3
+}
+
+// Whether the word at `start` of `size` bytes, with its first character or all of them
+// uppercased, is the `size` bytes of `buffer` at `at`.
+fn upperMatches(
+  words: &[u8],
+  start: usize,
+  size: usize,
+  buffer: &[u8],
+  at: usize,
+  all: bool,
+) -> bool {
+  let mut word: [u8; 24] = [0; 24]
+  let mut index: usize = 0
+  while index < size {
+    word[index] = words[start + index]
+    index = index + 1
+  }
+  let mut cursor: usize = 0
+  cursor = cursor + upperWord(&mut word, cursor, size)
+  while all && cursor < size {
+    cursor = cursor + upperWord(&mut word, cursor, size)
+  }
+  index = 0
+  while index < size {
+    if word[index] != buffer[at + index] {
+      return false
+    }
+    index = index + 1
+  }
+  return true
+}
+
+// Notes in `wordBest` each output length that a dictionary word at `at`, after a prefix of
+// `prefixLength` bytes, can give with the transforms of prefix group `base`, keeping the lowest
+// word address for each length.
+fn wordsAt(
+  state: &mut BrotliEncoder,
+  at: usize,
+  end: usize,
+  prefixLength: usize,
+  base: usize,
+  minLength: usize,
+) -> () {
+  let words = brotli_tables.words()
+  let room = end - at
+  let mut entry = List<u32>.get(&state.wordHeads, wordKey(List<u8>.asSlice(&state.buffer), at))
+  while entry != 0 {
+    let slot = u32.toUsize(entry - 1)
+    entry = List<u32>.get(&state.wordNext, slot)
+    let packed = List<u32>.get(&state.wordEntry, slot)
+    let size = u32.toUsize(u32.shiftRight(packed, 16))
+    let index = packed & 0xffff
+    let start = brotli_tables.wordOffset(size) + u32.toUsize(index) * size
+    let buffer = List<u8>.asSlice(&state.buffer)
+    let mut limit = size
+    if limit > room {
+      limit = room
+    }
+    let mut same: usize = 0
+    while same < limit && words[start + same] == buffer[at + same] {
+      same = same + 1
+    }
+    let lead = words[start]
+    let mut upperFirst = false
+    let mut upperAll = false
+    if size <= room && same < size
+      && (lead >= 192 || (lead >= 97 && lead <= 122 && buffer[at] == lead ^ 32)) {
+      upperFirst = upperMatches(words, start, size, buffer, at, false)
+      upperAll = upperMatches(words, start, size, buffer, at, true)
+    }
+    let word = Word { at: at, room: room, prefixLength: prefixLength, size: size, index: index }
+    if same == size {
+      wordTransforms(&mut state, &word, base, 0, size, minLength)
+    }
+    let mut kind: usize = 1
+    while kind <= 9 && kind < size {
+      if same >= size - kind {
+        wordTransforms(&mut state, &word, base, kind, size - kind, minLength)
+      }
+      kind = kind + 1
+    }
+    if upperFirst {
+      wordTransforms(&mut state, &word, base, 10, size, minLength)
+    }
+    if upperAll {
+      wordTransforms(&mut state, &word, base, 11, size, minLength)
+    }
+  }
+}
+
+// A dictionary word that matches at `at`, with `room` bytes left there.
+struct Word {
+  at: usize,
+  room: usize,
+  prefixLength: usize,
+  size: usize,
+  index: u32,
+}
+
+// Notes the outputs of `word` with the transforms of `kind` in prefix group `base`, whose first
+// `core` bytes match: those whose suffix follows.
+fn wordTransforms(
+  state: &mut BrotliEncoder,
+  word: &Word,
+  base: usize,
+  kind: usize,
+  core: usize,
+  minLength: usize,
+) -> () {
+  let affixes = brotli_tables.affixes()
+  let buffer = List<u8>.asSlice(&state.buffer)
+  let bits = brotli_tables.wordSizeBits(word.size)
+  let mut cursor = u32.toUsize(List<u32>.get(&state.prefixGroups, base + 1 + kind))
+  let last = u32.toUsize(List<u32>.get(&state.prefixGroups, base + 2 + kind))
+  while cursor < last {
+    let transform = u32.toUsize(List<u32>.get(&state.prefixTransforms, cursor))
+    cursor = cursor + 1
+    let suffix = brotli_tables.affixOffset(brotli_tables.transformSuffix(transform))
+    let suffixLength = u8.toUsize(affixes[suffix])
+    let output = word.prefixLength + core + suffixLength
+    if output < minLength || output >= WORD_REACH || core + suffixLength > word.room {
+      continue
+    }
+    let mut matched: usize = 0
+    while matched < suffixLength
+      && affixes[suffix + 1 + matched] == buffer[word.at + core + matched] {
+      matched = matched + 1
+    }
+    if matched != suffixLength {
+      continue
+    }
+    let address = u32.shiftLeft(usize.toU32(transform), bits) | word.index
+    if address < state.wordBest[output] {
+      state.wordBest[output] = address
+      state.wordLength[output] = usize.toU32(word.size)
+    }
+  }
+}
+
+// Adds to the pool the dictionary words that `position` can copy, longer than `best` and before
+// `end`: for each output length the lowest address, as the reference
+// `BrotliFindAllStaticDictionaryMatches` does for the transforms that keep the start of the word.
+// Returns how many it added.
+fn wordMatches(state: &mut BrotliEncoder, position: usize, end: usize, best: usize) -> usize {
+  let mut length: usize = 0
+  while length < WORD_REACH {
+    state.wordBest[length] = NO_WORD
+    length = length + 1
+  }
+  let mut minLength = best + 1
+  if minLength < 4 {
+    minLength = 4
+  }
+  let affixes = brotli_tables.affixes()
+  let mut group: usize = 0
+  while List<u32>.get(&state.prefixGroups, group * GROUP_SIZE) != NO_WORD {
+    let base = group * GROUP_SIZE
+    let prefix = brotli_tables.affixOffset(u32.toUsize(List<u32>.get(&state.prefixGroups, base)))
+    group = group + 1
+    let prefixLength = u8.toUsize(affixes[prefix])
+    if position + prefixLength + 4 > end {
+      continue
+    }
+    let buffer = List<u8>.asSlice(&state.buffer)
+    let mut matched: usize = 0
+    while matched < prefixLength && affixes[prefix + 1 + matched] == buffer[position + matched] {
+      matched = matched + 1
+    }
+    if matched == prefixLength {
+      wordsAt(&mut state, position + prefixLength, end, prefixLength, base, minLength)
+    }
+  }
+
+  // A distance past the bytes that a copy can reach selects the word, as the decoder sees it.
+  let mut reach = state.maxDistance
+  if reach > state.streamBase + position {
+    reach = state.streamBase + position
+  }
+  let mut added: usize = 0
+  length = minLength
+  while length < WORD_REACH {
+    let address = state.wordBest[length]
+    if address != NO_WORD {
+      let slot = state.matchUsed
+      List<u32>.set(&mut state.matchDistance, slot, usize.toU32(reach + 1) + address)
+      let word = u32.shiftLeft(state.wordLength[length], MATCH_WORD_SHIFT)
+      List<u32>.set(&mut state.matchLength, slot, usize.toU32(length) | word)
+      state.matchUsed = slot + 1
+      added = added + 1
+    }
+    length = length + 1
+  }
+  return added
+}
+
+// The cost of the distances of the commands with `postfix` postfix bits and `direct` direct
+// distance codes: their symbols as one prefix code, and their extra bits.
+fn distanceCost(state: &mut BrotliEncoder, postfix: u32, direct: u32) -> f64 {
+  clear(&mut state.distanceHistogram)
+  let histogram = List<u32>.asMutSlice(&mut state.distanceHistogram)
+  let inserts = List<u32>.asSlice(&state.commandInsert)
+  let copies = List<u32>.asSlice(&state.commandCopy)
+  let words = List<u32>.asSlice(&state.commandWord)
+  let codes = List<u32>.asSlice(&state.commandDistance)
+  let mut extra: u64 = 0
+  let mut index: usize = 0
+  while index < state.commandCount {
+    let mut copy = copies[index]
+    if words[index] != 0 {
+      copy = words[index]
+    }
+    let code = codes[index]
+    if copy != 0 && commandSymbolFor(insertCode(inserts[index]), copyCode(copy), code == 0) >= 128 {
+      let slot = u32.toUsize(distanceSymbol(code, postfix, direct))
+      histogram[slot] = histogram[slot] + 1
+      extra = extra + u32.toU64(distanceExtra(code, postfix, direct) & 31)
+    }
+    index = index + 1
+  }
+  let alphabet = 16 + u32.toUsize(direct) + usize.shiftLeft(48, u32.toUsize(postfix))
+  let cost = populationCost(
+    Slice.view<u32>(List<u32>.asSlice(&state.distanceHistogram), 0, alphabet),
+    List<f64>.asSlice(&state.logTable),
+  )
+  return cost + u64.toF64(extra)
+}
+
+// Picks the postfix bits and direct distance codes of the meta-block that make its distances
+// cheapest, with the search of the reference `BrotliBuildMetaBlock`.
+fn chooseDistanceCodes(state: &mut BrotliEncoder) -> () {
+  let mut best = NO_COST
+  let mut bestPostfix: u32 = 0
+  let mut bestDirect: u32 = 0
+  let mut postfix: u32 = 0
+  let mut direct: u32 = 0
+  while postfix <= 3 {
+    while direct < 16 {
+      let cost = distanceCost(&mut state, postfix, u32.shiftLeft(direct, postfix))
+      if cost > best {
+        break
+      }
+      best = cost
+      bestPostfix = postfix
+      bestDirect = u32.shiftLeft(direct, postfix)
+      direct = direct + 1
+    }
+    if direct > 0 {
+      direct = direct - 1
+    }
+    direct = direct / 2
+    postfix = postfix + 1
+  }
+  state.distancePostfix = bestPostfix
+  state.distanceDirect = bestDirect
+  state.distanceAlphabet = 16 + u32.toUsize(bestDirect) + usize.shiftLeft(48, u32.toUsize(bestPostfix))
 }
