@@ -41,9 +41,17 @@ CertificateVerify with its leaf's key, and validates the client's chain against 
 anchors for the `ClientAuth` purpose. [`Server.clientCertificateStatus`](#Server.impl.clientCertificateStatus) and
 [`Server.clientCertificates`](#Server.impl.clientCertificates) tell you the result.
 
+With [`TicketPolicy`](#TicketPolicy) `Issue`, the server sends NewSessionTicket messages after the client's
+Finished, when the client offered `psk_dhe_ke`. Each ticket holds the session state sealed with
+AES-256-GCM under your [`TicketKey`](#TicketKey), so the server keeps no session cache. A ClientHello that
+offers a valid ticket resumes: the server checks the binder, sends no certificate messages, and
+[`Server.resumed`](#Server.impl.resumed) returns `true`. A ticket from a handshake whose client certificate the
+current [`ClientAuth`](#ClientAuth) would refuse gives a full handshake instead.
+
 ## Gotchas
-The server does not support PSK, session tickets, or 0-RTT data. A client that sends early data
-fails with `BadRecordMac`. It does not ask for `ed25519` client signatures, because the
+The server resumes only sessions from its own tickets, and only with (EC)DHE. It does not
+accept 0-RTT data: a client that sends early data fails with `BadRecordMac`. The ticket checks
+use the [`TicketPolicy`](#TicketPolicy) `now`, so make a server with the current time. It does not ask for `ed25519` client signatures, because the
 certificate profile admits no Ed25519 client keys. The server sends no alert when it fails, so
 close the transport. Dropping the server does not send `close_notify`.
 Call [`Server.closeWrite`](#Server.impl.closeWrite) first. Secrets are not erased.
@@ -66,6 +74,7 @@ import silk.tls.server {
   ServerConfig,
   ServerError,
   ServerLimits,
+  TicketPolicy,
 }
 import silk.collections.slice { Slice }
 import silk.num.usize
@@ -98,6 +107,7 @@ pub effect fn main() -> i32
     alpn: AlpnConfig.defaults(),
     groups: GroupPolicy.defaults(),
     clientAuth: ClientAuth<'static>.Off,
+    tickets: TicketPolicy<'static>.Off,
     limits: ServerLimits.defaults(),
   }
   let made = run Server.make(&config, SigningKey.EcdsaP256 { key: move key })
@@ -112,7 +122,7 @@ pub effect fn main() -> i32
 
 Import as `Server` with `import silk.tls.server { Server }`.
 
-Public declarations: 14.
+Public declarations: 16.
 
 <a id="ServerGroup"></a>
 
@@ -458,6 +468,16 @@ pub clientAuth: ClientAuth<'a>
 
 Whether the server asks for a client certificate, and how it checks one.
 
+<a id="ServerConfig.tickets"></a>
+
+### Field `tickets`
+
+```silk
+pub tickets: TicketPolicy<'a>
+```
+
+Whether the server issues session tickets and resumes sessions from them.
+
 <a id="ServerConfig.limits"></a>
 
 ### Field `limits`
@@ -467,6 +487,131 @@ pub limits: ServerLimits
 ```
 
 Finite connection limits.
+
+<a id="TicketKey"></a>
+
+## `TicketKey`
+
+```silk
+pub struct TicketKey
+```
+
+The key that seals and opens session tickets, in [`TicketPolicy`](#TicketPolicy).
+
+### Details
+The 48 bytes are a 16-byte key name, which the server puts at the start of each ticket, and a
+32-byte AES-256-GCM key. Servers that share a key resume each other's sessions.
+
+### Gotchas
+Anyone with the key can decrypt the session secrets of every ticket that it sealed. Make it
+with random bytes, keep it secret, and replace it often.
+
+<a id="TicketKey.impl.Copy"></a>
+
+## Implementation `Copy for TicketKey`
+
+```silk
+impl Copy for TicketKey
+```
+
+<a id="TicketKey.impl"></a>
+
+## Implementation `TicketKey`
+
+```silk
+impl TicketKey
+```
+
+<a id="TicketKey.impl.make"></a>
+
+### Associated function `make`
+
+```silk
+pub fn make(bytes: &[u8; 48]) -> TicketKey
+```
+
+Returns the key with the name `bytes[0..16]` and the AES-256-GCM key `bytes[16..48]`.
+
+<a id="TicketPolicy"></a>
+
+## `TicketPolicy`
+
+```silk
+pub union TicketPolicy<'a>
+```
+
+Whether a [`Server`](#Server) issues session tickets, in [`ServerConfig.tickets`](#ServerConfig.tickets).
+
+<a id="TicketPolicy.Off"></a>
+
+### `Off`
+
+```silk
+Off
+```
+
+The server issues no tickets and does full handshakes only.
+
+<a id="TicketPolicy.Issue"></a>
+
+### `Issue`
+
+```silk
+Issue
+```
+
+After the client's Finished, the server sends `count` NewSessionTicket messages sealed with
+`key`. A later ClientHello that offers one of them resumes the session without certificates,
+when the ticket is younger than `lifetime` at `now`, has the same server name, and has the
+same cipher suite hash.
+
+<a id="TicketPolicy.Issue.key"></a>
+
+#### Field `key`
+
+```silk
+pub key: &'a TicketKey
+```
+
+The key that seals and opens tickets.
+
+<a id="TicketPolicy.Issue.now"></a>
+
+#### Field `now`
+
+```silk
+pub now: &'a Instant
+```
+
+The current time, which dates new tickets and checks the age of offered ones.
+
+<a id="TicketPolicy.Issue.lifetime"></a>
+
+#### Field `lifetime`
+
+```silk
+pub lifetime: usize
+```
+
+The ticket lifetime in seconds, from 1 to 604800.
+
+<a id="TicketPolicy.Issue.count"></a>
+
+#### Field `count`
+
+```silk
+pub count: usize
+```
+
+The number of tickets to send after each handshake, from 1 to 4.
+
+<a id="TicketPolicy.impl.Copy"></a>
+
+## Implementation `Copy for TicketPolicy<'a>`
+
+```silk
+impl<'a> Copy for TicketPolicy<'a>
+```
 
 <a id="ClientAuth"></a>
 
@@ -619,6 +764,27 @@ pub error: ValidationError
 ```
 
 Why the chain did not validate.
+
+<a id="ClientCertificateStatus.Resumed"></a>
+
+### `Resumed`
+
+```silk
+Resumed
+```
+
+The connection resumed a session in which the client presented a certificate. The client
+sends no certificate on resumption, so [`Server.clientCertificates`](#Server.impl.clientCertificates) is empty.
+
+<a id="ClientCertificateStatus.Resumed.trusted"></a>
+
+#### Field `trusted`
+
+```silk
+pub trusted: bool
+```
+
+Whether the chain validated in the original handshake.
 
 <a id="ClientCertificateStatus.impl.Debug"></a>
 
@@ -1381,6 +1547,27 @@ Finished
 
 The client's Finished did not authenticate the transcript.
 
+<a id="ServerError.Binder"></a>
+
+### `Binder`
+
+```silk
+Binder
+```
+
+The client's PSK binder did not authenticate the ClientHello for a ticket that the server
+sealed.
+
+<a id="ServerError.InvalidTicketPolicy"></a>
+
+### `InvalidTicketPolicy`
+
+```silk
+InvalidTicketPolicy
+```
+
+[`TicketPolicy`](#TicketPolicy) `Issue` has a lifetime or count out of range.
+
 <a id="ServerError.LimitExceeded"></a>
 
 ### `LimitExceeded`
@@ -1689,6 +1876,17 @@ pub fn retried(self: &Self) -> bool
 ```
 
 Returns whether the server sent a HelloRetryRequest in this handshake.
+
+<a id="Server.impl.resumed"></a>
+
+### Method `resumed`
+
+```silk
+pub fn resumed(self: &Self) -> bool
+```
+
+Returns whether the handshake resumed a session from a ticket, after the server read the
+ClientHello. A resumed handshake sends no certificates.
 
 <a id="Server.impl.clientCertificateStatus"></a>
 

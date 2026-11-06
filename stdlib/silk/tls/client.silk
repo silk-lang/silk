@@ -18,6 +18,11 @@
 //! that the server lists. With `ClientCredential.None`, or when no listed scheme fits the key, it
 //! sends an empty Certificate message, and the server decides whether to go on.
 //!
+//! With [`Resumption`] `Enabled`, the client asks for session tickets and returns each one as a
+//! [`Session`] from [`Client.takeSession`]. A later client given that session offers it as a PSK
+//! with (EC)DHE, and when the server accepts, the handshake skips the certificate messages.
+//! [`Session.encode`] and [`Session.decode`] let you keep sessions across processes.
+//!
 //! Each call returns a [`Progress`]: how many bytes it took or wrote, and the next [`Demand`].
 //! Output works in two steps: write [`Client.pendingOutput`] to the transport, and then call
 //! [`Client.ackWritten`] with the number of bytes written. The client does not keep your buffers.
@@ -43,7 +48,7 @@
 //! import silk.system.random { Random }
 //! import silk.core.result { Result }
 //! import silk.system.system_clock { SystemClock }
-//! import silk.tls.client { AlpnConfig, Client, ClientConfig, ClientCredential, ClientLimits, Progress, TlsError }
+//! import silk.tls.client { AlpnConfig, Client, ClientConfig, ClientCredential, ClientLimits, Progress, Resumption, TlsError }
 //! import silk.tls.trust_anchor { TrustAnchor }
 //! import silk.tls.trust_snapshot { SnapshotLimits, TrustSnapshot, TrustSourceError }
 //! import silk.num.usize
@@ -86,6 +91,7 @@
 //!   let config = ClientConfig {
 //!     reference: reference,
 //!     alpn: AlpnConfig.defaults(),
+//!     resumption: Resumption.Disabled,
 //!     limits: ClientLimits.defaults()
 //!   }
 //!   let made = run Client.make(&config, move trust, SystemClock.make(1789156800, 0), ClientCredential.None)
@@ -153,6 +159,7 @@ import silk.crypto.p256 {P256, P256Error}
 import silk.system.random {Random}
 import silk.mem.raw_buffer {RawBuffer}
 import silk.core.result {Result}
+import silk.crypto.digest {Digest}
 import silk.crypto.sha2 {Sha256, Sha384}
 import silk.collections.slice {Slice}
 import silk.system.system_clock {Instant, SystemClock}
@@ -177,6 +184,8 @@ import silk.tls.signature {
 }
 import silk.tls.trust_snapshot {TrustSnapshot}
 import silk.tls.trust_anchor {TrustAnchor}
+import silk.num.i64
+import silk.num.u64
 import silk.num.u8
 import silk.num.usize
 import silk.collections.list {List}
@@ -303,8 +312,40 @@ pub struct ClientConfig<'a> {
   pub reference: ReferenceIdentity<'a>,
   /// ALPN policy, with opaque protocols in caller preference order.
   pub alpn: AlpnConfig<'a>,
+  /// Whether the client asks for session tickets, and which session it offers.
+  pub resumption: Resumption<'a>,
   /// Finite connection limits and nested certificate policies.
   pub limits: ClientLimits,
+}
+
+/// Whether a [`Client`] resumes sessions, in [`ClientConfig.resumption`].
+pub union Resumption<'a> {
+  /// The client does not send `psk_key_exchange_modes`, so servers send no tickets, and it drops
+  /// any ticket that a server sends anyway.
+  Disabled,
+  /// The client asks for tickets, which [`Client.takeSession`] returns as sessions.
+  Enabled {
+    /// A session to resume, from [`Client.takeSession`] or [`Session.decode`], or `None` for a
+    /// full handshake. [`Client.make`] copies it. The client offers it only before it expires and
+    /// only to the server name of the connection it came from. Otherwise it does a full handshake.
+    pub session: Option<&'a Session>,
+  },
+}
+
+impl<'a> Copy for Resumption<'a> {}
+
+fn configSession<'a>(config: &ClientConfig<'a>) -> Option<&'a Session> {
+  return match config.resumption {
+    Resumption<'a>.Disabled => Option<&'a Session>.none()
+    Resumption<'a>.Enabled {session} => session
+  }
+}
+
+fn resumptionEnabled<'a>(config: &ClientConfig<'a>) -> bool {
+  return match config.resumption {
+    Resumption<'a>.Disabled => false
+    Resumption<'a>.Enabled {..} => true
+  }
 }
 
 /// The certificate that a [`Client`] sends when the server asks for one, in [`Client.make`].
@@ -320,6 +361,306 @@ pub union ClientCredential<'a> {
     /// The private key of the leaf.
     pub key: SigningKey,
   },
+}
+
+/// A TLS 1.3 session from a server's NewSessionTicket, for resuming with
+/// [`ClientConfig.session`].
+///
+/// # Details
+/// [`Client.takeSession`] returns one for each ticket the server sends after the handshake. A
+/// session holds the resumption secret, the ticket, the cipher suite, the server name and ALPN
+/// protocol of its connection, and the leaf certificate that the full handshake authenticated.
+/// [`Session.encode`] and [`Session.decode`] save and load it.
+///
+/// # Gotchas
+/// The encoded session holds the resumption secret. Store it as you would a key. A server can
+/// refuse a ticket at any time, and the client then does a full handshake.
+pub struct Session {
+  cipherSuite: CipherSuite,
+  secret: [u8; 48],
+  secretLength: usize,
+  ticketBytes: Bytes,
+  lifetimeSeconds: usize,
+  ageAdd: usize,
+  issuedSeconds: i64,
+  issuedNanoseconds: i64,
+  earlyDataLimit: usize,
+  serverName: Bytes,
+  alpnBytes: Bytes,
+  hasAlpn: bool,
+  leaf: Bytes,
+  anchorIndex: usize,
+  sanIndex: usize,
+}
+
+/// Why [`Session.encode`] or [`Session.decode`] fails.
+pub enum SessionError {
+  /// The bytes are not a session that [`Session.encode`] wrote.
+  InvalidEncoding,
+  /// The output is shorter than [`Session.encodedLength`].
+  OutputTooShort,
+}
+
+
+impl Debug for SessionError {
+  /// Writes the name of the variant, such as `InvalidEncoding`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      SessionError.InvalidEncoding => run Format.write(&mut formatter, b"InvalidEncoding")
+      SessionError.OutputTooShort => run Format.write(&mut formatter, b"OutputTooShort")
+    }
+  }
+}
+
+fn sessionMagic() -> [u8; 5] { return [83, 76, 75, 83, 1] }
+
+impl Session {
+  /// Returns the cipher suite of the connection that issued the session.
+  pub fn suite(self: &Self) -> CipherSuite { return self.cipherSuite }
+
+  /// Borrows the opaque ticket that the server issued.
+  pub fn ticket<'a>(self: &'a Self) -> &'a [u8] { return Bytes.asSlice(&self.ticketBytes) }
+
+  /// Returns the ticket lifetime that the server gave, in seconds.
+  pub fn lifetime(self: &Self) -> usize { return self.lifetimeSeconds }
+
+  /// Returns the time the client received the ticket, from the client's validation time.
+  pub fn issuedAt(self: &Self) -> Instant {
+    return SystemClock.make(self.issuedSeconds, self.issuedNanoseconds)
+  }
+
+  /// Returns whether the lifetime has passed at `at`.
+  pub fn isExpired(self: &Self, at: &Instant) -> bool {
+    let elapsed = SystemClock.seconds(at) - self.issuedSeconds
+    if elapsed < 0 { return false }
+    return i64.toUsize(elapsed) >= self.lifetimeSeconds
+  }
+
+  /// Returns the most early data in bytes that the server accepts with this session, or 0.
+  pub fn maxEarlyData(self: &Self) -> usize { return self.earlyDataLimit }
+
+  /// Borrows the ALPN protocol of the connection that issued the session, if it had one.
+  pub fn alpn<'a>(self: &'a Self) -> Option<&'a [u8]> {
+    if !self.hasAlpn { return Option<&'a [u8]>.none() }
+    return Option<&'a [u8]>.some(Bytes.asSlice(&self.alpnBytes))
+  }
+
+  /// Borrows the DER of the leaf certificate that the full handshake authenticated.
+  pub fn leafDer<'a>(self: &'a Self) -> &'a [u8] { return Bytes.asSlice(&self.leaf) }
+
+  /// Returns the length of [`Session.encode`]'s output.
+  pub fn encodedLength(self: &Self) -> usize {
+    return 5 + 2 + 1 + self.secretLength + 4 + 4 + 8 + 4 + 4 + 2 + 2
+      + 1 + Bytes.length(&self.serverName)
+      + 2 + Bytes.length(&self.alpnBytes)
+      + 3 + Bytes.length(&self.leaf)
+      + 2 + Bytes.length(&self.ticketBytes)
+  }
+
+  /// Writes the session to the start of `output`, and returns the number of bytes written.
+  ///
+  /// # Errors
+  /// - `OutputTooShort` if `output` is shorter than [`Session.encodedLength`].
+  pub fn encode(self: &Self, output: &mut [u8]) -> Result<usize, SessionError> {
+    let length = self.encodedLength()
+    if output.length < length {
+      return Result<usize, SessionError>.failResult(SessionError.OutputTooShort)
+    }
+    let mut cursor = usize.ZERO
+    let magic = sessionMagic()
+    putSessionBytes(&mut output, &mut cursor, &magic)
+    putSessionNumber(&mut output, &mut cursor, sessionSuiteCode(self.cipherSuite), 2)
+    putSessionNumber(&mut output, &mut cursor, self.secretLength, 1)
+    putSessionBytes(&mut output, &mut cursor, Slice.view<u8>(&self.secret, 0, self.secretLength))
+    putSessionNumber(&mut output, &mut cursor, self.lifetimeSeconds, 4)
+    putSessionNumber(&mut output, &mut cursor, self.ageAdd, 4)
+    let seconds = u64.toUsize(i64.wrappingToU64(self.issuedSeconds))
+    putSessionNumber(&mut output, &mut cursor, seconds, 8)
+    putSessionNumber(&mut output, &mut cursor, i64.toUsize(self.issuedNanoseconds), 4)
+    putSessionNumber(&mut output, &mut cursor, self.earlyDataLimit, 4)
+    putSessionNumber(&mut output, &mut cursor, self.anchorIndex, 2)
+    putSessionNumber(&mut output, &mut cursor, self.sanIndex, 2)
+    putSessionNumber(&mut output, &mut cursor, Bytes.length(&self.serverName), 1)
+    putSessionBytes(&mut output, &mut cursor, Bytes.asSlice(&self.serverName))
+    let mut alpnFlag: usize = 0
+    if self.hasAlpn { alpnFlag = 1 }
+    putSessionNumber(&mut output, &mut cursor, alpnFlag, 1)
+    putSessionNumber(&mut output, &mut cursor, Bytes.length(&self.alpnBytes), 1)
+    putSessionBytes(&mut output, &mut cursor, Bytes.asSlice(&self.alpnBytes))
+    putSessionNumber(&mut output, &mut cursor, Bytes.length(&self.leaf), 3)
+    putSessionBytes(&mut output, &mut cursor, Bytes.asSlice(&self.leaf))
+    putSessionNumber(&mut output, &mut cursor, Bytes.length(&self.ticketBytes), 2)
+    putSessionBytes(&mut output, &mut cursor, Bytes.asSlice(&self.ticketBytes))
+    return Result<usize, SessionError>.succeed(cursor)
+  }
+
+  /// Reads a session that [`Session.encode`] wrote.
+  ///
+  /// # Errors
+  /// - `InvalidEncoding` if `bytes` is not exactly one encoded session.
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn decode(bytes: &[u8]) -> Result<Session, SessionError>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+    let mut reader = SessionReader {cursor: 0, failed: false}
+    let magic = sessionMagic()
+    let mut index = usize.ZERO
+    while index < 5 {
+      if reader.number(bytes, 1) != u8.toUsize(magic[index]) { reader.failed = true }
+      index = index + usize.ONE
+    }
+    let suiteCode = reader.number(bytes, 2)
+    let mut suite = CipherSuite.ChaCha20Poly1305Sha256
+    let mut expectedSecret: usize = 32
+    if suiteCode == 4865 {
+      suite = CipherSuite.Aes128GcmSha256
+    } else if suiteCode == 4866 {
+      suite = CipherSuite.Aes256GcmSha384
+      expectedSecret = 48
+    } else if suiteCode != 4867 {
+      reader.failed = true
+    }
+    let secretLength = reader.number(bytes, 1)
+    if secretLength != expectedSecret { reader.failed = true }
+    let mut secret = zero48()
+    let secretRange = reader.range(bytes, secretLength)
+    if !reader.failed {
+      index = 0
+      while index < secretLength {
+        secret[index] = bytes[secretRange + index]
+        index = index + usize.ONE
+      }
+    }
+    let lifetime = reader.number(bytes, 4)
+    let ageAdd = reader.number(bytes, 4)
+    let seconds = u64.wrappingToI64(usize.toU64(reader.number(bytes, 8)))
+    let nanoseconds = reader.number(bytes, 4)
+    if nanoseconds >= 1000000000 { reader.failed = true }
+    let maxEarlyData = reader.number(bytes, 4)
+    let anchorIndex = reader.number(bytes, 2)
+    let sanIndex = reader.number(bytes, 2)
+    let nameLength = reader.number(bytes, 1)
+    let nameStart = reader.range(bytes, nameLength)
+    let alpnFlag = reader.number(bytes, 1)
+    if alpnFlag > 1 { reader.failed = true }
+    let alpnLength = reader.number(bytes, 1)
+    if alpnFlag == 0 && alpnLength != 0 { reader.failed = true }
+    if alpnFlag == 1 && alpnLength == 0 { reader.failed = true }
+    let alpnStart = reader.range(bytes, alpnLength)
+    let leafLength = reader.number(bytes, 3)
+    let leafStart = reader.range(bytes, leafLength)
+    let ticketLength = reader.number(bytes, 2)
+    if ticketLength == 0 { reader.failed = true }
+    let ticketStart = reader.range(bytes, ticketLength)
+    if reader.failed || reader.cursor != bytes.length || leafLength == 0 {
+      return Result<Session, SessionError>.failResult(SessionError.InvalidEncoding)
+    }
+    let ticket = run Bytes.copy(Slice.view<u8>(bytes, ticketStart, ticketLength))
+    let serverName = run Bytes.copy(Slice.view<u8>(bytes, nameStart, nameLength))
+    let alpn = run Bytes.copy(Slice.view<u8>(bytes, alpnStart, alpnLength))
+    let leaf = run Bytes.copy(Slice.view<u8>(bytes, leafStart, leafLength))
+    return Result<Session, SessionError>.succeed(Session {
+      cipherSuite: suite,
+      secret: secret,
+      secretLength: secretLength,
+      ticketBytes: move ticket,
+      lifetimeSeconds: lifetime,
+      ageAdd: ageAdd,
+      issuedSeconds: seconds,
+      issuedNanoseconds: usize.toI64(nanoseconds),
+      earlyDataLimit: maxEarlyData,
+      serverName: move serverName,
+      alpnBytes: move alpn,
+      hasAlpn: alpnFlag == 1,
+      leaf: move leaf,
+      anchorIndex: anchorIndex,
+      sanIndex: sanIndex,
+    })
+  }
+}
+
+struct SessionReader {
+  cursor: usize,
+  failed: bool,
+}
+
+impl SessionReader {
+  fn number(self: &mut Self, bytes: &[u8], width: usize) -> usize {
+    if self.failed || bytes.length - self.cursor < width {
+      self.failed = true
+      return 0
+    }
+    let mut value = usize.ZERO
+    let mut index = usize.ZERO
+    while index < width {
+      value = value * 256 + u8.toUsize(bytes[self.cursor + index])
+      index = index + usize.ONE
+    }
+    self.cursor = self.cursor + width
+    return value
+  }
+
+  fn range(self: &mut Self, bytes: &[u8], length: usize) -> usize {
+    let start = self.cursor
+    if self.failed || bytes.length - self.cursor < length {
+      self.failed = true
+      return 0
+    }
+    self.cursor = self.cursor + length
+    return start
+  }
+}
+
+fn putSessionNumber(output: &mut [u8], cursor: &mut usize, value: usize, width: usize) -> () {
+  let mut remaining = value
+  let mut index = width
+  while index > 0 {
+    index = index - usize.ONE
+    output[cursor.* + index] = usize.toU8(remaining % 256)
+    remaining = remaining / 256
+  }
+  cursor.* = cursor.* + width
+  return ()
+}
+
+fn putSessionBytes(output: &mut [u8], cursor: &mut usize, bytes: &[u8]) -> () {
+  let mut index = usize.ZERO
+  while index < bytes.length {
+    output[cursor.* + index] = bytes[index]
+    index = index + usize.ONE
+  }
+  cursor.* = cursor.* + bytes.length
+  return ()
+}
+
+fn sessionSuiteCode(suite: CipherSuite) -> usize {
+  if suite == CipherSuite.Aes128GcmSha256 { return 4865 }
+  if suite == CipherSuite.Aes256GcmSha384 { return 4866 }
+  return 4867
+}
+
+effect fn copySession(session: &Session) -> Session ! OutOfMemoryError ? &mut Allocator {
+  let ticket = run Bytes.copy(Bytes.asSlice(&session.ticketBytes))
+  let serverName = run Bytes.copy(Bytes.asSlice(&session.serverName))
+  let alpn = run Bytes.copy(Bytes.asSlice(&session.alpnBytes))
+  let leaf = run Bytes.copy(Bytes.asSlice(&session.leaf))
+  return Session {
+    cipherSuite: session.cipherSuite,
+    secret: session.secret,
+    secretLength: session.secretLength,
+    ticketBytes: move ticket,
+    lifetimeSeconds: session.lifetimeSeconds,
+    ageAdd: session.ageAdd,
+    issuedSeconds: session.issuedSeconds,
+    issuedNanoseconds: session.issuedNanoseconds,
+    earlyDataLimit: session.earlyDataLimit,
+    serverName: move serverName,
+    alpnBytes: move alpn,
+    hasAlpn: session.hasAlpn,
+    leaf: move leaf,
+    anchorIndex: session.anchorIndex,
+    sanIndex: session.sanIndex,
+  }
 }
 
 /// The next action or observable connection event of a [`Client`], in [`Progress.demand`].
@@ -732,6 +1073,11 @@ impl<'a> Authentication<'a> {
 
   /// Returns the matching SAN's original certificate index.
   pub fn sanIndex(self: &Self) -> usize { return self.sanIndexValue }
+
+  /// Returns whether the handshake resumed a [`Session`]. Then the server sent no certificate, and
+  /// the leaf, anchor index, and SAN index are those of the full handshake that issued the session.
+  /// The intermediate indices are empty.
+  pub fn resumed(self: &Self) -> bool { return self.clientValue.resumed }
 }
 
 enum ClientState {
@@ -782,6 +1128,7 @@ struct ParsedServerHello {
   cookieLength: usize,
   keyOffset: usize,
   keyLength: usize,
+  pskSelected: bool,
 }
 
 struct EphemeralPublicKey {
@@ -895,6 +1242,12 @@ pub struct Client {
   serverTrafficSecret: [u8; 48],
   serverTrafficSecretLength: usize,
   terminal: Option<TlsError>,
+  offered: Option<Session>,
+  ticketsRequested: bool,
+  pskOffered: bool,
+  resumed: bool,
+  resumptionSecret: [u8; 48],
+  sessions: List<Session>,
 }
 
 impl Client {
@@ -956,12 +1309,23 @@ impl Client {
     let dnsLength = referenceDnsLength(config.reference)
     let alpnLength = alpnPayloadLength(config.alpn)
     let alpnCount = alpnProtocolCount(config.alpn)
+    let offerable = sessionOfferable(config, &validationTime)
+    let mut pskLength = usize.ZERO
+    if resumptionEnabled(config) {
+      pskLength = 6
+    }
+    if offerable {
+      pskLength = match configSession(config) {
+        Option<&'a Session>.Some {value} => pskLength + 15 + Bytes.length(&value.ticketBytes) + value.secretLength
+        Option<&'a Session>.None => 0
+      }
+    }
     let generatedBody = maximumClientHelloBody(
       dnsLength,
       alpnLength,
       alpnCount,
       config.limits.cookieBytes,
-    )
+    ) + pskLength
     if generatedBody - 47 > 65535 {
       return Result<Client, TlsError>.failResult(
         TlsError.LimitExceeded {
@@ -984,6 +1348,12 @@ impl Client {
         return Result<Client, TlsError>.failResult(move error)
       }
       Result<PreparedCredential, TlsError>.Success {value} => move value
+    }
+    let mut offered = Option<Session>.none()
+    if offerable {
+      if let Option<&'a Session>.Some {value} = configSession(config) {
+        offered = Option<Session>.some(run copySession(value))
+      }
     }
     let mut dns = run allocateBytes(nonzero(dnsLength))
     let mut alpn = run allocateBytes(nonzero(alpnLength))
@@ -1079,6 +1449,12 @@ impl Client {
       serverTrafficSecret: zero48(),
       serverTrafficSecretLength: 0,
       terminal: Option<TlsError>.none(),
+      offered: move offered,
+      ticketsRequested: resumptionEnabled(config),
+      pskOffered: false,
+      resumed: false,
+      resumptionSecret: zero48(),
+      sessions: List<Session>.make(),
     }
     let queued = run queueClientHello(&mut client, false)
     return match move queued {
@@ -1105,7 +1481,7 @@ impl Client {
     if !self.authenticatedPublished {
       return Option<Authentication<'a>>.none()
     }
-    if List<Certificate>.length(&self.peerCertificates) == 0 {
+    if !self.resumed && List<Certificate>.length(&self.peerCertificates) == 0 {
       return Option<Authentication<'a>>.none()
     }
     let suite = self.selectedSuite
@@ -1123,6 +1499,16 @@ impl Client {
         sanIndexValue: sanIndex,
       },
     )
+  }
+
+  /// Removes and returns the oldest [`Session`] from the server's NewSessionTicket messages, or
+  /// `None` when no new one has arrived.
+  ///
+  /// The client keeps at most `limits.tickets` sessions over the connection. A ticket with a zero
+  /// lifetime gives no session.
+  pub fn takeSession(self: &mut Self) -> Option<Session> {
+    if List<Session>.length(&self.sessions) == 0 { return Option<Session>.none() }
+    return Option<Session>.some(List<Session>.remove(&mut self.sessions, 0))
   }
 
   /// Gives bytes from the server to the client. `consumed` in the result tells how many it
@@ -1793,6 +2179,284 @@ fn alpnProtocolCount<'a>(config: AlpnConfig<'a>) -> usize {
   }
 }
 
+fn hashLength(suite: CipherSuite) -> usize {
+  if suite == CipherSuite.Aes256GcmSha384 { return 48 }
+  return 32
+}
+
+fn widen32(bytes: &[u8; 32]) -> [u8; 48] {
+  let mut output = zero48()
+  let mut index = usize.ZERO
+  while index < 32 {
+    output[index] = bytes[index]
+    index = index + usize.ONE
+  }
+  return output
+}
+
+// Writes the reference identity as a tag byte and the lowercase DNS name or the address bytes. A
+// session matches a connection when these bytes match.
+fn referenceKey<'a>(reference: ReferenceIdentity<'a>, output: &mut [u8; 256]) -> usize {
+  return match reference {
+    ReferenceIdentity<'a>.Dns {bytes} => {
+      output[0] = 0
+      let mut index = usize.ZERO
+      // `validateReference` admitted the name, so it is at most 253 bytes.
+      while index < bytes.length && index < 255 {
+        let byte = bytes[index]
+        let mut lower = byte
+        if byte >= 65 && byte <= 90 { lower = byte + 32 }
+        output[index + 1] = lower
+        index = index + usize.ONE
+      }
+      return index + 1
+    }
+    ReferenceIdentity<'a>.Ipv4 {bytes} => {
+      output[0] = 4
+      let mut index = usize.ZERO
+      while index < 4 {
+        output[index + 1] = bytes[index]
+        index = index + usize.ONE
+      }
+      return 5
+    }
+    ReferenceIdentity<'a>.Ipv6 {bytes} => {
+      output[0] = 6
+      let mut index = usize.ZERO
+      while index < 16 {
+        output[index + 1] = bytes[index]
+        index = index + usize.ONE
+      }
+      return 17
+    }
+  }
+}
+
+fn sessionOfferable<'a>(config: &ClientConfig<'a>, at: &Instant) -> bool {
+  return match configSession(config) {
+    Option<&'a Session>.None => false
+    Option<&'a Session>.Some {value} => {
+      if value.isExpired(at) { return false }
+      let mut key: [u8; 256] = [0; 256]
+      let keyLength = referenceKey(config.reference, &mut key)
+      return sameBytes(Slice.view<u8>(&key, 0, keyLength), Bytes.asSlice(&value.serverName))
+    }
+  }
+}
+
+fn offeredSecretLength(client: &Client) -> usize {
+  return match &client.offered {
+    Option<Session>.Some {value} => value.secretLength
+    Option<Session>.None => 0
+  }
+}
+
+fn offeredTicketLength(client: &Client) -> usize {
+  return match &client.offered {
+    Option<Session>.Some {value} => Bytes.length(&value.ticketBytes)
+    Option<Session>.None => 0
+  }
+}
+
+fn putOfferedTicket(client: &mut Client, cursor: &mut usize) -> () {
+  match &client.offered {
+    Option<Session>.Some {value} => {
+      putSlice(&mut client.handshake, &mut cursor.*, Bytes.asSlice(&value.ticketBytes))
+    }
+    Option<Session>.None => {}
+  }
+  return ()
+}
+
+// The ticket age in milliseconds plus the server's `ticket_age_add`, modulo 2^32.
+fn obfuscatedAge(client: &Client) -> usize {
+  return match &client.offered {
+    Option<Session>.None => 0
+    Option<Session>.Some {value} => {
+      let seconds = SystemClock.seconds(&client.validationTime) - value.issuedSeconds
+      let nanoseconds = SystemClock.nanoseconds(&client.validationTime) - value.issuedNanoseconds
+      let mut milliseconds = seconds * 1000 + nanoseconds / 1000000
+      if milliseconds < 0 { milliseconds = 0 }
+      let age = i64.toUsize(milliseconds) % 4294967296
+      return (age + value.ageAdd) % 4294967296
+    }
+  }
+}
+
+fn offeredSecret(client: &Client) -> [u8; 48] {
+  return match &client.offered {
+    Option<Session>.Some {value} => value.secret
+    Option<Session>.None => zero48()
+  }
+}
+
+// The input keying material of the early secret: the PSK when resuming, or zeros.
+fn earlyInput(client: &Client) -> [u8; 48] {
+  if client.resumed { return offeredSecret(client) }
+  return zero48()
+}
+
+fn restoreSessionAuthentication(client: &mut Client) -> () {
+  let mut anchorIndex = usize.ZERO
+  let mut sanIndex = usize.ZERO
+  if let Option<Session>.Some {value} = &client.offered {
+    anchorIndex = value.anchorIndex
+    sanIndex = value.sanIndex
+  }
+  client.anchorIndex = anchorIndex
+  client.sanIndex = sanIndex
+  client.pathLength = 0
+  return ()
+}
+
+fn selectedTranscriptHash(client: &Client) -> [u8; 48] {
+  if client.selectedSuite == CipherSuite.Aes256GcmSha384 {
+    return client.transcript384.checkpoint()
+  }
+  let digest = client.transcript256.checkpoint()
+  return widen32(&digest)
+}
+
+fn internalFailure48() -> Result<[u8; 48], TlsError> {
+  return Result<[u8; 48], TlsError>.failResult(
+    TlsError.ProtocolViolation {reason: ProtocolReason.InternalState},
+  )
+}
+
+fn deriveSecretBy(length: usize, secret: &[u8; 48], label: &[u8], hash: &[u8; 48]) -> Result<
+  [u8; 48],
+  TlsError
+> {
+  if length == 48 {
+    let derived = TlsHkdfSha384.deriveSecretFromHash(secret, label, hash)
+    return match move derived {
+      Result<[u8; 48], LabelError>.Success {value} => Result<[u8; 48], TlsError>.succeed(value)
+      Result<[u8; 48], LabelError>.Failure {error} => {
+        drop error
+        return internalFailure48()
+      }
+    }
+  }
+  let key = first32(secret)
+  let digest = first32(hash)
+  let derived = TlsHkdfSha256.deriveSecretFromHash(&key, label, &digest)
+  return match move derived {
+    Result<[u8; 32], LabelError>.Success {value} => Result<[u8; 48], TlsError>.succeed(
+      widen32(&value),
+    )
+    Result<[u8; 32], LabelError>.Failure {error} => {
+      drop error
+      return internalFailure48()
+    }
+  }
+}
+
+fn extractBy(length: usize, input: &[u8; 48]) -> [u8; 48] {
+  if length == 48 {
+    let zeros = zero48()
+    return HkdfSha384.extract(&zeros, input)
+  }
+  let zeros = zero32()
+  let value = HkdfSha256.extract(&zeros, Slice.view<u8>(input, 0, 32))
+  return widen32(&value)
+}
+
+fn emptyHashBy(length: usize) -> [u8; 48] {
+  let empty: [u8; 0] = []
+  if length == 48 {
+    return Sha384.hash(&empty)
+  }
+  let value = Sha256.hash(&empty)
+  return widen32(&value)
+}
+
+fn expandLabelBy(
+  length: usize,
+  secret: &[u8; 48],
+  label: &[u8],
+  context: &[u8],
+  output: &mut [u8],
+) -> Result<(), TlsError> {
+  if length == 48 {
+    let expanded = TlsHkdfSha384.expandLabel(secret, label, context, move output)
+    return match move expanded {
+      Result<(), LabelError>.Success {..} => Result<(), TlsError>.succeed(())
+      Result<(), LabelError>.Failure {error} => {
+        drop error
+        return Result<(), TlsError>.failResult(
+          TlsError.ProtocolViolation {reason: ProtocolReason.InternalState},
+        )
+      }
+    }
+  }
+  let key = first32(secret)
+  let expanded = TlsHkdfSha256.expandLabel(&key, label, context, move output)
+  return match move expanded {
+    Result<(), LabelError>.Success {..} => Result<(), TlsError>.succeed(())
+    Result<(), LabelError>.Failure {error} => {
+      drop error
+      return Result<(), TlsError>.failResult(
+        TlsError.ProtocolViolation {reason: ProtocolReason.InternalState},
+      )
+    }
+  }
+}
+
+fn hmacBy(length: usize, key: &[u8; 48], message: &[u8; 48]) -> [u8; 48] {
+  if length == 48 {
+    return HmacSha384.authenticate(key, message)
+  }
+  let value = HmacSha256.authenticate(Slice.view<u8>(key, 0, 32), Slice.view<u8>(message, 0, 32))
+  return widen32(&value)
+}
+
+// Fills in the PSK binder: an HMAC over the ClientHello up to the binders list, keyed from the
+// session's resumption secret (RFC 8446 section 4.2.11.2).
+fn writeBinder(client: &mut Client, bindersAt: usize, retry: bool) -> Result<(), TlsError> {
+  let length = offeredSecretLength(&client.*)
+  let psk = offeredSecret(&client.*)
+  let early = extractBy(length, &psk)
+  let emptyHash = emptyHashBy(length)
+  let binderKey = match move deriveSecretBy(length, &early, b"res binder", &emptyHash) {
+    Result<[u8; 48], TlsError>.Failure {error} => {
+      return Result<(), TlsError>.failResult(move error)
+    }
+    Result<[u8; 48], TlsError>.Success {value} => value
+  }
+  let mut finishedKey = zero48()
+  let empty: [u8; 0] = []
+  let expanded = expandLabelBy(
+    length,
+    &binderKey,
+    b"finished",
+    &empty,
+    Slice.viewMut<u8>(&mut finishedKey, 0, length),
+  )
+  if let Result<(), TlsError>.Failure {error} = move expanded {
+    return Result<(), TlsError>.failResult(move error)
+  }
+  // `queueClientHello` wrote every byte before `bindersAt`.
+  let truncated = unsafe RawBuffer.view<u8>(&client.handshake, 0, bindersAt)
+  let mut hash = zero48()
+  if length == 48 {
+    let mut transcript = Sha384.make()
+    if retry { transcript = client.transcript384.copy() }
+    transcript.update(truncated)
+    hash = transcript.finish()
+  } else {
+    let mut transcript = Sha256.make()
+    if retry { transcript = client.transcript256.copy() }
+    transcript.update(truncated)
+    let digest = transcript.finish()
+    hash = widen32(&digest)
+  }
+  drop truncated
+  let binder = hmacBy(length, &finishedKey, &hash)
+  // The binders list holds a 2-byte length, a 1-byte length, and `length` bytes at `bindersAt`.
+  unsafe RawBuffer.copy<u8>(&mut client.handshake, bindersAt + 3, &binder, length)
+  return Result<(), TlsError>.succeed(())
+}
+
 fn maximumClientHelloBody(
   dnsLength: usize,
   alpnLength: usize,
@@ -1840,6 +2504,15 @@ fn authenticationAlpn<'a>(client: &'a Client) -> Option<&'a [u8]> {
 }
 
 fn authenticationLeaf<'a>(client: &'a Client) -> &'a [u8] {
+  if client.resumed {
+    return match &client.offered {
+      Option<Session>.Some {value} => Bytes.asSlice(&value.leaf)
+      Option<Session>.None => {
+        let empty: &'static [u8] = b""
+        return empty
+      }
+    }
+  }
   let certificates = List<Certificate>.asSlice(&client.peerCertificates)
   return Certificate.der(&certificates[0])
 }
@@ -2039,11 +2712,52 @@ effect fn queueClientHello(client: &mut Client, retry: bool) -> Result<(), TlsEr
     }
   }
 
+  // A PSK goes in a retried ClientHello only when the retry chose a suite of the session's hash.
+  let secretLength = offeredSecretLength(&client.*)
+  let offerPsk = secretLength > 0 && (!retry || hashLength(client.selectedSuite) == secretLength)
+  client.pskOffered = offerPsk
+  let mut bindersAt = usize.ZERO
+
+  // psk_key_exchange_modes with psk_dhe_ke only, which lets the server send tickets.
+  if client.ticketsRequested {
+    putU16(&mut client.handshake, &mut cursor, 45)
+    putU16(&mut client.handshake, &mut cursor, 2)
+    putU8(&mut client.handshake, &mut cursor, 1)
+    putU8(&mut client.handshake, &mut cursor, 1)
+  }
+  if offerPsk {
+    // pre_shared_key, which must come last.
+    let ticketLength = offeredTicketLength(&client.*)
+    let identitiesLength = ticketLength + 6
+    putU16(&mut client.handshake, &mut cursor, 41)
+    putU16(&mut client.handshake, &mut cursor, identitiesLength + 5 + secretLength)
+    putU16(&mut client.handshake, &mut cursor, identitiesLength)
+    putU16(&mut client.handshake, &mut cursor, ticketLength)
+    putOfferedTicket(&mut client.*, &mut cursor)
+    let age = obfuscatedAge(&client.*)
+    putU16(&mut client.handshake, &mut cursor, age / 65536)
+    putU16(&mut client.handshake, &mut cursor, age % 65536)
+    bindersAt = cursor
+    putU16(&mut client.handshake, &mut cursor, secretLength + 1)
+    putU8(&mut client.handshake, &mut cursor, usize.toU8(secretLength))
+    let mut binderIndex = usize.ZERO
+    while binderIndex < secretLength {
+      putU8(&mut client.handshake, &mut cursor, 0)
+      binderIndex = binderIndex + usize.ONE
+    }
+  }
+
   let extensionsLength = cursor - extensionsStart
   setU16(&mut client.handshake, extensionsLengthAt, extensionsLength)
   let bodyLength = cursor - HANDSHAKE_HEADER_LENGTH
   RawBuffer.fill(&mut client.handshake, 0, usize.ONE, 1)
   setU24(&mut client.handshake, usize.ONE, bodyLength)
+  if offerPsk {
+    let binded = writeBinder(&mut client.*, bindersAt, retry)
+    if let Result<(), TlsError>.Failure {error} = move binded {
+      return Result<(), TlsError>.failResult(move error)
+    }
+  }
   // `make` checked that `maximumClientHelloBody` fits `handshakeBodyBytes`, so `cursor` stays
   // within the handshake capacity, and every byte before it was written.
   let handshakeView = unsafe RawBuffer.view<u8>(&client.handshake, 0, cursor)
@@ -2633,7 +3347,7 @@ effect fn dispatchHandshake(
     return run handleServerFinished(&mut client.*, messageLength)
   }
   if postHandshake {
-    if messageType == 4 { return handleNewSessionTicket(&mut client.*, messageLength) }
+    if messageType == 4 { return run handleNewSessionTicket(&mut client.*, messageLength) }
     if messageType == 24 { return handlePeerKeyUpdate(&mut client.*, messageLength) }
   }
   return unexpectedHandshake()
@@ -2764,6 +3478,16 @@ effect fn handleServerHello(client: &mut Client, messageLength: usize) -> Result
     }
     Result<[u8; 32], TlsError>.Success {value} => value
   }
+  if parsed.pskSelected {
+    // A PSK is valid only with a suite of the same hash as the suite that issued it.
+    if hashLength(parsed.suite) != offeredSecretLength(&client.*) {
+      return Result<(), TlsError>.failResult(
+        TlsError.ProtocolViolation {reason: ProtocolReason.ServerHello},
+      )
+    }
+    client.resumed = true
+    restoreSessionAuthentication(&mut client.*)
+  }
   client.selectedSuite = parsed.suite
   client.selectedGroup = parsed.group
   client.hasSelection = true
@@ -2889,6 +3613,7 @@ fn parseServerHello(
   let mut keyLength = usize.ZERO
   let mut cookieOffset = usize.ZERO
   let mut cookieLength = usize.ZERO
+  let mut pskSelected = false
   while cursor < messageLength {
     if messageLength - cursor < 4 {
       return Result<ParsedServerHello, TlsError>.failResult(
@@ -2969,6 +3694,14 @@ fn parseServerHello(
         )
       }
       hasCookie = true
+    } else if extensionType == 41 && !retry {
+      // The server may select only the one PSK identity that the client offered.
+      if pskSelected || !client.pskOffered || length != 2 || readU16Raw(&client.handshake, cursor) != 0 {
+        return Result<ParsedServerHello, TlsError>.failResult(
+          TlsError.ProtocolViolation {reason: ProtocolReason.Extension},
+        )
+      }
+      pskSelected = true
     } else {
       return Result<ParsedServerHello, TlsError>.failResult(
         TlsError.ProtocolViolation {reason: ProtocolReason.Extension},
@@ -2991,6 +3724,7 @@ fn parseServerHello(
       cookieLength: cookieLength,
       keyOffset: keyOffset,
       keyLength: keyLength,
+      pskSelected: pskSelected,
     },
   )
 }
@@ -3063,7 +3797,8 @@ fn installHandshakeEpochs(client: &mut Client, shared: &[u8]) -> Result<(), TlsE
   if client.selectedSuite == CipherSuite.Aes256GcmSha384 {
     let empty: [u8; 0] = []
     let zeros = zero48()
-    let early = HkdfSha384.extract(&zeros, &zeros)
+    let pskInput = earlyInput(&client.*)
+    let early = HkdfSha384.extract(&zeros, &pskInput)
     let emptyHash = Sha384.hash(&empty)
     let derivedBytes = derivedLabel()
     let derivedResult = TlsHkdfSha384.deriveSecretFromHash(&early, &derivedBytes, &emptyHash)
@@ -3117,7 +3852,8 @@ fn installHandshakeEpochs(client: &mut Client, shared: &[u8]) -> Result<(), TlsE
 
   let empty: [u8; 0] = []
   let zeros = zero32()
-  let early = HkdfSha256.extract(&zeros, &zeros)
+  let pskInput = earlyInput(&client.*)
+  let early = HkdfSha256.extract(&zeros, Slice.view<u8>(&pskInput, 0, 32))
   let emptyHash = Sha256.hash(&empty)
   let derivedBytes = derivedLabel()
   let derivedResult = TlsHkdfSha256.deriveSecretFromHash(&early, &derivedBytes, &emptyHash)
@@ -3353,6 +4089,8 @@ fn handleEncryptedExtensions(client: &mut Client, messageLength: usize) -> Resul
   }
   updateSelectedTranscript(&mut client.*, 0, messageLength)
   client.state = ClientState.AwaitCertificate
+  // A resumed handshake has no Certificate or CertificateVerify from the server.
+  if client.resumed { client.state = ClientState.AwaitServerFinished }
   return Result<(), TlsError>.succeed(())
 }
 
@@ -4367,6 +5105,17 @@ fn queueClientFinished(client: &mut Client) -> Result<(), TlsError> {
     return mapRecordUnit(&mut client.*, move error)
   }
   updateSelectedTranscript(&mut client.*, 0, HANDSHAKE_HEADER_LENGTH + length)
+  let master = client.masterSecret
+  let transcript = selectedTranscriptHash(&client.*)
+  let resumption = deriveSecretBy(length, &master, b"res master", &transcript)
+  match move resumption {
+    Result<[u8; 48], TlsError>.Failure {error} => {
+      return Result<(), TlsError>.failResult(move error)
+    }
+    Result<[u8; 48], TlsError>.Success {value} => {
+      client.resumptionSecret = value
+    }
+  }
   client.pendingKind = PendingKind.Finished
   return Result<(), TlsError>.succeed(())
 }
@@ -4396,7 +5145,12 @@ fn constantWorkEqual(left: &[u8], right: &[u8]) -> bool {
   return difference == 0 && left.length == right.length
 }
 
-fn handleNewSessionTicket(client: &mut Client, messageLength: usize) -> Result<(), TlsError> {
+effect fn handleNewSessionTicket(client: &mut Client, messageLength: usize) -> Result<
+  (),
+  TlsError
+>
+! OutOfMemoryError
+? &mut Allocator {
   if messageLength < 17 {
     return Result<(), TlsError>.failResult(
       TlsError.ProtocolViolation {reason: ProtocolReason.PostHandshake},
@@ -4435,6 +5189,7 @@ fn handleNewSessionTicket(client: &mut Client, messageLength: usize) -> Result<(
   }
   let extensionsStart = cursor
   let extensionsEnd = cursor + extensionLength
+  let mut maxEarlyData = usize.ZERO
   while cursor < extensionsEnd {
     if extensionsEnd - cursor < 4 { return postHandshakeFailure() }
     let kind = readU16Raw(&client.handshake, cursor)
@@ -4448,7 +5203,11 @@ fn handleNewSessionTicket(client: &mut Client, messageLength: usize) -> Result<(
       if priorKind == kind { return postHandshakeFailure() }
       prior = prior + 4 + priorLength
     }
-    if kind == 42 && length != 4 { return postHandshakeFailure() }
+    if kind == 42 {
+      if length != 4 { return postHandshakeFailure() }
+      maxEarlyData = readU16Raw(&client.handshake, cursor) * 65536
+        + readU16Raw(&client.handshake, cursor + 2)
+    }
     cursor = cursor + length
   }
   if cursor != extensionsEnd { return postHandshakeFailure() }
@@ -4464,7 +5223,96 @@ fn handleNewSessionTicket(client: &mut Client, messageLength: usize) -> Result<(
   }
   client.ticketCount = client.ticketCount + usize.ONE
   client.ticketBytes = client.ticketBytes + messageLength
+
+  // The checks above bound every field within `handshake[0..messageLength]`.
+  let lifetime = readU16Raw(&client.handshake, 4) * 65536 + readU16Raw(&client.handshake, 6)
+  if lifetime > 604800 { return postHandshakeFailure() }
+  // A zero lifetime tells the client to discard the ticket, and a client that did not ask for
+  // tickets drops them.
+  if lifetime == 0 || !client.ticketsRequested { return Result<(), TlsError>.succeed(()) }
+  let ageAdd = readU16Raw(&client.handshake, 8) * 65536 + readU16Raw(&client.handshake, 10)
+  let length = hashLength(client.selectedSuite)
+  let resumptionSecret = client.resumptionSecret
+  let mut secret = zero48()
+  let nonce = unsafe RawBuffer.view<u8>(&client.handshake, 13, nonceLength)
+  let expanded = expandLabelBy(
+    length,
+    &resumptionSecret,
+    b"resumption",
+    nonce,
+    Slice.viewMut<u8>(&mut secret, 0, length),
+  )
+  drop nonce
+  if let Result<(), TlsError>.Failure {error} = move expanded {
+    return Result<(), TlsError>.failResult(move error)
+  }
+  let ticketStart = 13 + nonceLength + 2
+  let ticketView = unsafe RawBuffer.view<u8>(&client.handshake, ticketStart, ticketLength)
+  let ticket = run Bytes.copy(ticketView)
+  drop ticketView
+  let mut key: [u8; 256] = [0; 256]
+  let keyLength = ownedReferenceKey(&client.*, &mut key)
+  let serverName = run Bytes.copy(Slice.view<u8>(&key, 0, keyLength))
+  let mut hasAlpn = false
+  let mut alpn = Bytes.make()
+  if let Option<&[u8]>.Some {value} = authenticationAlpn(&client.*) {
+    alpn = run Bytes.copy(value)
+    hasAlpn = true
+  }
+  let leaf = run Bytes.copy(authenticationLeaf(&client.*))
+  let session = Session {
+    cipherSuite: client.selectedSuite,
+    secret: secret,
+    secretLength: length,
+    ticketBytes: move ticket,
+    lifetimeSeconds: lifetime,
+    ageAdd: ageAdd,
+    issuedSeconds: SystemClock.seconds(&client.validationTime),
+    issuedNanoseconds: SystemClock.nanoseconds(&client.validationTime),
+    earlyDataLimit: maxEarlyData,
+    serverName: move serverName,
+    alpnBytes: move alpn,
+    hasAlpn: hasAlpn,
+    leaf: move leaf,
+    anchorIndex: client.anchorIndex,
+    sanIndex: client.sanIndex,
+  }
+  run List<Session>.append(&mut client.sessions, move session)
   return Result<(), TlsError>.succeed(())
+}
+
+// `referenceKey` for the client's owned reference.
+fn ownedReferenceKey(client: &Client, output: &mut [u8; 256]) -> usize {
+  return match client.reference {
+    OwnedReference.Dns => {
+      output[0] = 0
+      let mut index = usize.ZERO
+      while index < client.dnsLength && index < 255 {
+        // `index < dnsLength`, which `copyOwnedDns` filled in lowercase.
+        output[index + 1] = unsafe RawBuffer.read<u8>(&client.dns, index)
+        index = index + usize.ONE
+      }
+      return index + 1
+    }
+    OwnedReference.Ipv4 {bytes} => {
+      output[0] = 4
+      let mut index = usize.ZERO
+      while index < 4 {
+        output[index + 1] = bytes[index]
+        index = index + usize.ONE
+      }
+      return 5
+    }
+    OwnedReference.Ipv6 {bytes} => {
+      output[0] = 6
+      let mut index = usize.ZERO
+      while index < 16 {
+        output[index + 1] = bytes[index]
+        index = index + usize.ONE
+      }
+      return 17
+    }
+  }
 }
 
 fn handlePeerKeyUpdate(client: &mut Client, messageLength: usize) -> Result<(), TlsError> {
