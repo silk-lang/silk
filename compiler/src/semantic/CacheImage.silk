@@ -29,6 +29,7 @@
 
 import semantic.ContentHash {ContentHash}
 import semantic.InternIndex {InternIndex}
+import semantic.StableKey
 import silk.collections.hash {Hash}
 import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.collections.bytes {Bytes}
@@ -41,7 +42,11 @@ import silk.num.usize
 
 // Changes whenever the layout below changes, so an image of an older layout decodes to none even
 // under the same stamp.
-const FORMAT: u64 = 7
+const FORMAT: u64 = 9
+
+// Every this many leaves, a leaf's key is written whole, sharing nothing with the key before it,
+// so a reader expands any one key from at most this many ([`keyAt`]).
+const RESTART: usize = 16
 
 fn magic() -> &'static [u8] {
   return b"silk-semantic-cache"
@@ -51,8 +56,10 @@ fn magic() -> &'static [u8] {
 pub struct Leaf {
   /// Whether this is a source input; otherwise it is a whole source file.
   pub input: bool,
-  /// The stable bytes of the file's module, or of the input's module and selector.
-  pub key: Bytes,
+  // The stable bytes of the file's module, or of the input's module and selector, once expanded
+  // ([`key`]); empty while the key is still packed at `packedAt` of the image's `packed`.
+  stored: Bytes,
+  packedAt: usize,
   /// The digest of the file's bytes or of the input's captured value.
   pub digest: ContentHash,
   /// For an input that names a declaration, the declaration's position in its module's index
@@ -67,6 +74,10 @@ pub struct Leaf {
   /// when its digest was captured (`SourceInputs.text`); otherwise zero. A reader that finds the
   /// declaration's tokens unchanged takes the digest without capturing the input again.
   pub text: ContentHash,
+  /// For an input, the word its key writes after its module, which tells what kind of read it
+  /// records (`StableKey`); otherwise, or when the key is too short to hold one, `u64.MAX`. A
+  /// reader learns what kind of input a leaf is without expanding its key.
+  pub selector: u64,
 }
 
 /// A root: a node whose answer the image holds.
@@ -83,6 +94,11 @@ pub struct Root {
 /// names leaf `e / 2` when even and node `e / 2` when odd, and a node names only earlier nodes.
 pub struct Image {
   pub leaves: List<Leaf>,
+  // The graph file a decode read, up to the end of its leaf section, where each leaf's key stays
+  // packed at its `packedAt`: the length it shares with the key before it and the rest, packed. A
+  // key is expanded only when [`expandKeys`] or a [`KeyCursor`] reads it, so an adoption that
+  // finds a leaf unchanged never reads its key.
+  packed: Bytes,
   pub ends: List<usize>,
   pub edges: List<usize>,
   pub roots: List<Root>,
@@ -90,7 +106,128 @@ pub struct Image {
 
 /// An empty image.
 pub fn make() -> Image {
-  return Image {leaves: List<Leaf>.make(), ends: List<usize>.make(), edges: List<usize>.make(), roots: List<Root>.make()}
+  return Image {leaves: List<Leaf>.make(), packed: Bytes.make(), ends: List<usize>.make(), edges: List<usize>.make(), roots: List<Root>.make()}
+}
+
+/// A leaf with `key`. Each other field is as [`Leaf`] describes it.
+pub fn leaf(input: bool, key: Bytes, digest: ContentHash, position: usize, file: usize, text: ContentHash) -> Leaf {
+  let mut selector = u64.MAX
+  if input { selector = selectorOf(Bytes.asSlice(&key)) }
+  return Leaf {input: input, stored: move key, packedAt: usize.MAX, digest: digest, position: position, file: file, text: text,
+    selector: selector}
+}
+
+// The word an input's `key` writes after its module, or `u64.MAX` when it holds none.
+fn selectorOf(key: &[u8]) -> u64 {
+  let mut reader = StableKey.reader()
+  StableKey.skipModule(key, &mut reader)
+  let tag = StableKey.readWord(key, &mut reader)
+  if StableKey.failed(&reader) { return u64.MAX }
+  return tag
+}
+
+/// The key of leaf `at` of `image`, which must not be packed: an image a decode read holds its
+/// keys packed until [`expandKeys`]; read them in order with a [`KeyCursor`] instead.
+pub fn key(image: &Image, at: usize) -> &[u8] {
+  let leaves = List<Leaf>.asSlice(&image.leaves)
+  if leaves[at].packedAt != usize.MAX { Intrinsic.trap("CacheImage.key read a packed key") }
+  return Bytes.asSlice(&leaves[at].stored)
+}
+
+/// Reads the keys of an image's leaves in order without allocating each: a reader that visits
+/// leaves `0, 1, 2, ...` expands each packed key once over the one before it.
+pub struct KeyCursor {
+  key: Bytes,
+  // The leaf whose key `key` holds, or `usize.MAX` before the first.
+  at: usize,
+}
+
+/// A cursor before the first leaf.
+pub fn keyCursor() -> KeyCursor {
+  return KeyCursor {key: Bytes.make(), at: usize.MAX}
+}
+
+/// The key of leaf `at` of `image`. A packed key is expanded on `cursor`, stepping from the leaf
+/// it last read when that is no further back than the last whole key ([`RESTART`]), and from the
+/// whole key otherwise.
+pub effect fn keyAt<'a>(image: &'a Image, cursor: &'a mut KeyCursor, at: usize) -> &'a [u8] ! OutOfMemoryError ? &mut Allocator {
+  let leaves = List<Leaf>.asSlice(&image.leaves)
+  if leaves[at].packedAt == usize.MAX { return Bytes.asSlice(&leaves[at].stored) }
+  if cursor.at != at {
+    let whole = at - at % RESTART
+    let mut next = whole
+    if cursor.at != usize.MAX && cursor.at < at && cursor.at >= whole { next = cursor.at + usize.ONE }
+    while next <= at {
+      if leaves[next].packedAt == usize.MAX {
+        Bytes.clear(&mut cursor.key)
+        run Bytes.append(&mut cursor.key, Bytes.asSlice(&leaves[next].stored))
+      } else {
+        run unpackKey(Bytes.asSlice(&image.packed), leaves[next].packedAt, &mut cursor.key)
+      }
+      next = next + usize.ONE
+    }
+    cursor.at = at
+  }
+  return Bytes.asSlice(&cursor.key)
+}
+
+/// Expands every packed key of `image`, so [`key`] reads each and the leaves can be copied,
+/// reordered or dropped.
+pub effect fn expandKeys(image: &mut Image) -> () ! OutOfMemoryError ? &mut Allocator {
+  if Bytes.length(&image.packed) == usize.ZERO { return () }
+  let mut current = Bytes.make()
+  let packed = Intrinsic.replace(image.packed, Bytes.make())
+  let mut leaves = List<Leaf>.asMutSlice(&mut image.leaves)
+  let mut at = usize.ZERO
+  while at < leaves.length {
+    if leaves[at].packedAt == usize.MAX {
+      Bytes.clear(&mut current)
+      run Bytes.append(&mut current, Bytes.asSlice(&leaves[at].stored))
+    } else {
+      run unpackKey(Bytes.asSlice(&packed), leaves[at].packedAt, &mut current)
+      leaves[at].stored = run Bytes.copy(Bytes.asSlice(&current))
+      leaves[at].packedAt = usize.MAX
+    }
+    at = at + usize.ONE
+  }
+}
+
+// Expands the packed key at `at` of `packed` over `key`, the key before it. The decode checked
+// the run's lengths; a run whose bytes expand to another length leaves the rest zero or cut.
+effect fn unpackKey(packed: &[u8], at: usize, key: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut cursor = Cursor {at: at, failed: false}
+  let common = u64.toUsize(readVarint(packed, &mut cursor))
+  let length = u64.toUsize(readVarint(packed, &mut cursor))
+  let written = u64.toUsize(readVarint(packed, &mut cursor))
+  Bytes.truncate(&mut key.*, common)
+  let mut grown = usize.ZERO
+  while grown < length {
+    let mut step = length - grown
+    if step > 256 { step = 256 }
+    run Bytes.append(&mut key.*, Slice.view<u8>(zeroRun(), usize.ZERO, step))
+    grown = grown + step
+  }
+  let target = Bytes.asMutSlice(&mut key.*)
+  let mut into = common
+  let end = cursor.at + written
+  let mut read = cursor.at
+  while read < end && into < target.length {
+    let byte = packed[read]
+    read = read + usize.ONE
+    if byte == 0 {
+      if read >= end { return () }
+      into = into + u8.toUsize(packed[read]) + usize.ONE
+      read = read + usize.ONE
+    } else {
+      target[into] = byte
+      into = into + usize.ONE
+    }
+  }
+}
+
+// A run of zero bytes as long as one packed zero marker writes.
+fn zeroRun() -> &'static [u8] {
+  return b"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
 }
 
 /// A copy of `image`.
@@ -100,10 +237,12 @@ pub effect fn copy(image: &Image) -> Image ! OutOfMemoryError ? &mut Allocator {
   run List<Leaf>.reserveExact(&mut copied.leaves, leaves.length)
   let mut at = usize.ZERO
   while at < leaves.length {
-    run List<Leaf>.append(&mut copied.leaves, Leaf {input: leaves[at].input, key: run Bytes.copy(Bytes.asSlice(&leaves[at].key)),
-      digest: leaves[at].digest, position: leaves[at].position, file: leaves[at].file, text: leaves[at].text})
+    run List<Leaf>.append(&mut copied.leaves, Leaf {input: leaves[at].input, stored: run Bytes.copy(Bytes.asSlice(&leaves[at].stored)),
+      packedAt: leaves[at].packedAt, digest: leaves[at].digest, position: leaves[at].position, file: leaves[at].file, text: leaves[at].text,
+      selector: leaves[at].selector})
     at = at + usize.ONE
   }
+  copied.packed = run Bytes.copy(Bytes.asSlice(&image.packed))
   run List<usize>.appendSlice(&mut copied.ends, List<usize>.asSlice(&image.ends))
   run List<usize>.appendSlice(&mut copied.edges, List<usize>.asSlice(&image.edges))
   let roots = List<Root>.asSlice(&image.roots)
@@ -225,6 +364,7 @@ pub effect fn carry(into: &mut Image, from: &Image, roots: &[usize]) -> List<usi
 /// Drops each leaf that no edge names and no named input names as its file, such as the file a
 /// carried input was read from once the input names the file as it reads now.
 pub effect fn dropUnusedLeaves(image: &mut Image) -> () ! OutOfMemoryError ? &mut Allocator {
+  run expandKeys(&mut image.*)
   let leaves = List<Leaf>.asSlice(&image.leaves)
   let total = leaves.length
   let mut kept = List<usize>.make()
@@ -259,9 +399,9 @@ pub effect fn dropUnusedLeaves(image: &mut Image) -> () ! OutOfMemoryError ? &mu
     if List<usize>.get(&kept, at) != usize.MAX {
       let mut file = usize.MAX
       if slots[at].file != usize.MAX { file = List<usize>.get(&kept, slots[at].file) }
-      let key = Intrinsic.replace(slots[at].key, Bytes.make())
-      run List<Leaf>.append(&mut compacted, Leaf {input: slots[at].input, key: move key, digest: slots[at].digest,
-        position: slots[at].position, file: file, text: slots[at].text})
+      let key = Intrinsic.replace(slots[at].stored, Bytes.make())
+      run List<Leaf>.append(&mut compacted, Leaf {input: slots[at].input, stored: move key, packedAt: usize.MAX, digest: slots[at].digest,
+        position: slots[at].position, file: file, text: slots[at].text, selector: slots[at].selector})
     }
     at = at + usize.ONE
   }
@@ -396,7 +536,8 @@ impl Merge {
     let leaf = &leaves[at]
     let mut file = usize.MAX
     if leaf.file != usize.MAX { file = run Merge.leaf(&mut self.*, leaves, &mut copied.*, leaf.file) }
-    let mut hashed = InternIndex.hashBytes(0, Bytes.asSlice(&leaf.key))
+    if leaf.packedAt != usize.MAX { Intrinsic.trap("CacheImage.Merge read a packed key") }
+    let mut hashed = InternIndex.hashBytes(0, Bytes.asSlice(&leaf.stored))
     hashed = Hash.combine(Hash.combine(hashed, leaf.digest.high), leaf.digest.low)
     hashed = Hash.combine(Hash.combine(hashed, usize.toU64(leaf.position)), usize.toU64(file))
     let held = List<Leaf>.asSlice(&self.image.leaves)
@@ -405,15 +546,16 @@ impl Merge {
       let other = &held[found]
       if other.input == leaf.input && other.position == leaf.position && other.file == file
         && ContentHash.equals(other.digest, leaf.digest) && ContentHash.equals(other.text, leaf.text)
-        && sameBytes(Bytes.asSlice(&other.key), Bytes.asSlice(&leaf.key)) {
+        && sameBytes(Bytes.asSlice(&other.stored), Bytes.asSlice(&leaf.stored)) {
         List<usize>.set(&mut copied.*, at, found)
         return found
       }
       found = InternIndex.after(&self.leafLookup, found)
     }
     let placed = List<Leaf>.length(&self.image.leaves)
-    run List<Leaf>.append(&mut self.image.leaves, Leaf {input: leaf.input, key: run Bytes.copy(Bytes.asSlice(&leaf.key)),
-      digest: leaf.digest, position: leaf.position, file: file, text: leaf.text})
+    run List<Leaf>.append(&mut self.image.leaves, Leaf {input: leaf.input, stored: run Bytes.copy(Bytes.asSlice(&leaf.stored)),
+      packedAt: usize.MAX, digest: leaf.digest, position: leaf.position, file: file, text: leaf.text,
+      selector: leaf.selector})
     run InternIndex.record(&mut self.leafLookup, hashed)
     List<usize>.set(&mut copied.*, at, placed)
     return placed
@@ -456,8 +598,9 @@ effect fn copyLeaf(into: &mut Image, leaves: &[Leaf], copied: &mut List<usize>, 
   let mut file = usize.MAX
   if leaf.file != usize.MAX { file = run copyLeaf(&mut into.*, leaves, &mut copied.*, leaf.file) }
   let placed = List<Leaf>.length(&into.leaves)
-  run List<Leaf>.append(&mut into.leaves, Leaf {input: leaf.input, key: run Bytes.copy(Bytes.asSlice(&leaf.key)),
-    digest: leaf.digest, position: leaf.position, file: file, text: leaf.text})
+  if leaf.packedAt != usize.MAX { Intrinsic.trap("CacheImage.carry copied a packed key") }
+  run List<Leaf>.append(&mut into.leaves, Leaf {input: leaf.input, stored: run Bytes.copy(Bytes.asSlice(&leaf.stored)),
+    packedAt: usize.MAX, digest: leaf.digest, position: leaf.position, file: file, text: leaf.text, selector: leaf.selector})
   List<usize>.set(&mut copied.*, at, placed)
   return placed
 }
@@ -594,12 +737,22 @@ pub effect fn encodeFiles(image: &Image, stamp: &[u8]) -> Files ! OutOfMemoryErr
   run varint(&mut graph, usize.toU64(leaves.length))
   // The leaves go in a run of their own, so a reader finds the nodes without reading them first.
   let mut leafRun = Bytes.make()
+  // Keys are read in order, each packed over the one before it.
+  let mut cursor = keyCursor()
+  let mut previous = Bytes.make()
   let mut at = usize.ZERO
   while at < leaves.length {
     if leaves[at].input { run varint(&mut leafRun, 1) } else { run varint(&mut leafRun, 0) }
-    run frontKey(&mut leafRun, Bytes.asSlice(&leaves[at].key), previousLeafKey(List<Leaf>.asSlice(&image.leaves), at))
+    let key = run keyAt(image, &mut cursor, at)
+    if at % RESTART == usize.ZERO { Bytes.clear(&mut previous) }
+    run frontKey(&mut leafRun, key, Bytes.asSlice(&previous))
+    Bytes.clear(&mut previous)
+    run Bytes.append(&mut previous, key)
     run digest(&mut leafRun, leaves[at].digest)
     if leaves[at].input {
+      let mut selector: u64 = 0
+      if leaves[at].selector != u64.MAX { selector = leaves[at].selector + 1 }
+      run varint(&mut leafRun, selector)
       // A position is written one higher, so a leaf without one writes zero.
       let mut position: u64 = 0
       if leaves[at].position != usize.MAX { position = usize.toU64(leaves[at].position) + 1 }
@@ -741,12 +894,6 @@ effect fn readPacked(bytes: &[u8], cursor: &mut Cursor, before: &[u8], prefix: u
   return move output
 }
 
-// The key of the leaf before leaf `at`, or none for the first.
-fn previousLeafKey(leaves: &[Leaf], at: usize) -> &[u8] {
-  if at == usize.ZERO { return b"" }
-  return Bytes.asSlice(&leaves[at - usize.ONE].key)
-}
-
 // The key of the root before root `at`, or none for the first.
 fn previousRootKey(roots: &[Root], at: usize) -> &[u8] {
   if at == usize.ZERO { return b"" }
@@ -813,7 +960,8 @@ pub struct GraphParts {
   /// How many leaves the file holds, which [`decodeNodes`] takes.
   pub leaves: usize,
   leavesStart: usize,
-  leavesEnd: usize,
+  /// Where the leaf section ends, which bounds the bytes packed keys read from.
+  pub leavesEnd: usize,
   /// Where the node section starts and how long it is.
   pub nodesStart: usize,
   pub nodesLength: usize,
@@ -843,26 +991,44 @@ pub effect fn graphParts(bytes: &[u8], stamp: &[u8]) -> Option<GraphParts> ! Out
     nodesLength: nodesLength, end: cursor.at + nodesLength})
 }
 
+/// The leaves of a graph file as [`decodeLeaves`] reads them, their keys still packed in the file.
+pub struct Leaves {
+  leaves: List<Leaf>,
+}
+
 /// The leaves of the graph file `bytes` whose sections are `parts`, or none when they are
-/// malformed or an input's file names no file leaf.
-pub effect fn decodeLeaves(bytes: &[u8], parts: &GraphParts) -> Option<List<Leaf>> ! OutOfMemoryError ? &mut Allocator {
+/// malformed or an input's file names no file leaf. Their keys stay packed where the file holds
+/// them (see [`Image`]): each is read when the image keeps the file's leaf section ([`assembled`]).
+pub effect fn decodeLeaves(bytes: &[u8], parts: &GraphParts) -> Option<Leaves> ! OutOfMemoryError ? &mut Allocator {
   let section = Slice.view<u8>(bytes, usize.ZERO, parts.leavesEnd)
   let mut cursor = Cursor {at: parts.leavesStart, failed: false}
   let leaves = parts.leaves
   let mut read = List<Leaf>.make()
   // Every count is sized before the reads, so no list is copied while it grows.
   run List<Leaf>.reserveExact(&mut read, leaves)
+  // The length of the key before, which bounds the length the next one shares with it.
+  let mut previous = usize.ZERO
   let mut at = usize.ZERO
   while at < leaves && !cursor.failed {
     let kind = readVarint(section, &mut cursor)
+    let keyStart = cursor.at
     let common = u64.toUsize(readVarint(section, &mut cursor))
-    let key = run readPacked(section, &mut cursor, previousLeafKey(List<Leaf>.asSlice(&read), at), common)
+    // A key at a restart is written whole (`RESTART`).
+    if at % RESTART == usize.ZERO { previous = usize.ZERO }
+    if common > previous { cursor.failed = true }
+    let length = skipPacked(section, &mut cursor)
+    if cursor.failed { return Option<Leaves>.none() }
+    previous = common + length
     let high = readVarint(section, &mut cursor)
     let low = readVarint(section, &mut cursor)
     let mut position = usize.MAX
     let mut file = usize.MAX
     let mut text = ContentHash {high: 0, low: 0}
+    let mut selector = u64.MAX
     if kind == 1 {
+      // The selector is written one higher, so a leaf without one writes zero.
+      let tag = readVarint(section, &mut cursor)
+      if tag > 0 { selector = tag - 1 }
       let written = readVarint(section, &mut cursor)
       if written > 0 { position = u64.toUsize(written - 1) }
       let named = readVarint(section, &mut cursor)
@@ -872,19 +1038,33 @@ pub effect fn decodeLeaves(bytes: &[u8], parts: &GraphParts) -> Option<List<Leaf
       text = ContentHash {high: textHigh, low: readVarint(section, &mut cursor)}
     }
     if kind > 1 { cursor.failed = true }
-    run List<Leaf>.append(&mut read, Leaf {input: kind == 1, key: move key, digest: ContentHash {high: high, low: low},
-      position: position, file: file, text: text})
+    run List<Leaf>.append(&mut read, Leaf {input: kind == 1, stored: Bytes.make(), packedAt: keyStart,
+      digest: ContentHash {high: high, low: low}, position: position, file: file, text: text, selector: selector})
     at = at + usize.ONE
   }
-  if cursor.failed || cursor.at != section.length { return Option<List<Leaf>>.none() }
+  if cursor.failed || cursor.at != section.length { return Option<Leaves>.none() }
   // An input's file must name a file leaf.
   let held = List<Leaf>.asSlice(&read)
   at = usize.ZERO
   while at < held.length {
-    if held[at].file != usize.MAX && (held[at].file >= held.length || held[held[at].file].input) { return Option<List<Leaf>>.none() }
+    if held[at].file != usize.MAX && (held[at].file >= held.length || held[held[at].file].input) { return Option<Leaves>.none() }
     at = at + usize.ONE
   }
-  return Option<List<Leaf>>.some(move read)
+  return Option<Leaves>.some(Leaves {leaves: move read})
+}
+
+// Steps over a run `pack` wrote and returns the length it expands to, or fails `cursor` when its
+// lengths cannot be a run: its bytes are read when the key is expanded (`unpackKey`).
+fn skipPacked(bytes: &[u8], cursor: &mut Cursor) -> usize {
+  let length = readVarint(bytes, &mut cursor.*)
+  let written = readCount(bytes, &mut cursor.*)
+  // Each written byte yields at most 256, and each at least one byte per two written.
+  if cursor.failed || length > u64.saturatingMultiply(usize.toU64(written), 256) || usize.toU64(written) > u64.saturatingMultiply(length, 2) {
+    cursor.failed = true
+    return usize.ZERO
+  }
+  cursor.at = cursor.at + written
+  return u64.toUsize(length)
 }
 
 /// The nodes the node section `bytes` of a graph file of `leaves` leaves holds, or none when it is
@@ -920,10 +1100,13 @@ pub effect fn decodeNodes(bytes: &[u8], leaves: usize) -> Option<Nodes> ! OutOfM
   return Option<Nodes>.some(move read)
 }
 
-/// The graph of the file whose sections are `parts`, from its leaves and nodes.
-pub fn assembled(parts: &GraphParts, leaves: List<Leaf>, nodes: Nodes) -> Graph {
+/// The graph of the file whose sections are `parts`, from its leaves and nodes. `file` holds the
+/// file's bytes at least up to the end of its leaf section, where the leaves' keys stay packed.
+pub fn assembled(parts: &GraphParts, leaves: Leaves, nodes: Nodes, file: Bytes) -> Graph {
   let Nodes {ends, edges} = move nodes
-  return Graph {image: Image {leaves: move leaves, ends: move ends, edges: move edges, roots: List<Root>.make()}, seal: parts.seal}
+  let Leaves {leaves: read} = move leaves
+  return Graph {image: Image {leaves: move read, packed: move file, ends: move ends, edges: move edges, roots: List<Root>.make()},
+    seal: parts.seal}
 }
 
 // Reads a graph file from the start of `bytes`, or none; `end` is set to where it ends.
@@ -934,14 +1117,14 @@ effect fn readGraph(bytes: &[u8], stamp: &[u8], end: &mut usize) -> Option<Graph
   }
   end.* = parts.end
   let leaves = match move run decodeLeaves(bytes, &parts) {
-    Option<List<Leaf>>.Some {value} => move value
-    Option<List<Leaf>>.None => { return Option<Graph>.none() }
+    Option<Leaves>.Some {value} => move value
+    Option<Leaves>.None => { return Option<Graph>.none() }
   }
   let nodes = match move run decodeNodes(Slice.view<u8>(bytes, parts.nodesStart, parts.nodesLength), parts.leaves) {
     Option<Nodes>.Some {value} => move value
     Option<Nodes>.None => { return Option<Graph>.none() }
   }
-  return Option<Graph>.some(assembled(&parts, move leaves, move nodes))
+  return Option<Graph>.some(assembled(&parts, move leaves, move nodes, run Bytes.copy(Slice.view<u8>(bytes, usize.ZERO, parts.leavesEnd))))
 }
 
 // Reads a roots file from `cursor` on, or fails it. Which node each root names is checked when

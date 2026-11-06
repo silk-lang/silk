@@ -143,6 +143,16 @@ fn digestLength(self: &Self) -> usize
 
 Returns 16, the MD5 digest length in bytes.
 
+<a id="Md5.impl.Digest.objectIdentifier"></a>
+
+### Operation `objectIdentifier`
+
+```silk
+fn objectIdentifier(self: &Self) -> &[u8]
+```
+
+Returns the content bytes of the MD5 object identifier, 1.2.840.113549.2.5.
+
 <a id="Md5.impl.Digest.copy"></a>
 
 ### Operation `copy`

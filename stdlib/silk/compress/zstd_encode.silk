@@ -1,0 +1,4102 @@
+//! Compress bytes as Zstandard frames (RFC 8878), in steps or all at once, with levels 1 to 22.
+//!
+//! # When to use
+//! Use a [`ZstdEncoder`] to write `.zst` files or HTTP bodies with `Content-Encoding: zstd`, in
+//! steps and with fixed memory. Use [`ZstdEncoder.encode`] to compress one complete buffer. Decode
+//! with `silk.compress.zstd.Zstd`.
+//!
+//! # Details
+//! Each level uses the parameters and match strategy of the reference `zstd` for large inputs:
+//! one hash table for levels 1 and 2, two hash tables for 3 and 4, lazy matching over hash chains
+//! for 5 to 12, a binary tree with lazy matching for 13 to 15, and a binary tree with an optimal
+//! parser that prices literals and sequences for 16 to 22. The window grows from 512 KiB at level
+//! 1 to 128 MiB at level 22. Literals use Huffman codes, and sequences use FSE tables made for each
+//! block, or the predefined tables when those are smaller. A block that does not shrink is stored
+//! raw, and a block of one repeated byte is stored as RLE.
+//! [`ZstdEncoder.make`] allocates all storage one time. Later calls do not allocate and do not
+//! keep a borrow of your buffers. The output is deterministic but is not the same bytes that the
+//! reference `zstd` writes.
+//!
+//! # Examples
+//! ## Compress a buffer
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.compress.zstd_encode { ZstdEncodeError, ZstdEncoder, ZstdOptions }
+//!
+//! pub effect fn main() -> i32
+//!   ! OutOfMemoryError | ZstdEncodeError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let input = b"abcabcabcabcabcabcabcabcabcabcabcabc"
+//!   let mut output: [u8; 64] = [0; 64]
+//!   let written = run ZstdEncoder.encode(input, &mut output, ZstdOptions.make(3))
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   // A frame starts with the magic number 28 b5 2f fd.
+//!   if output[0] != 40 || output[3] != 253 || written >= input.length {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Data formats
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.format { Debug, Format as TextFormat, Formatter }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.compress.zstd_checksum { Xxh64 }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.i64
+import silk.num.usize
+import silk.io.writer { Writer, WriterError }
+
+/// What a call to [`ZstdEncoder.step`] must finish before it returns.
+///
+/// The values match the end directives of the reference `ZSTD_compressStream2`.
+pub enum ZstdFlush {
+  /// Compress as the encoder sees fit. Output can lag behind the input by up to one block.
+  Continue,
+  /// Write all input in complete blocks, so that a decoder can decode all of it.
+  Flush,
+  /// Write all input, end the frame, and write the checksum if it is on. After it finishes, the
+  /// encoder accepts no more input.
+  End,
+}
+
+/// What the encoder needs after a successful [`ZstdEncoder.step`].
+pub enum ZstdEncodeStatus {
+  /// All input is consumed and the flush was `Continue`. Call again with more input, or with
+  /// another flush.
+  NeedInput,
+  /// The output buffer is full. Call again with a new output buffer, the input that was not
+  /// consumed, and the same flush.
+  NeedOutput,
+  /// All input is consumed and written in complete blocks, after `ZstdFlush.Flush`.
+  Flushed,
+  /// The frame is complete.
+  Finished,
+}
+
+/// The result of one successful [`ZstdEncoder.step`].
+pub struct ZstdEncodeProgress {
+  /// The number of input bytes that this call consumed, from the start of the input.
+  pub consumed: usize,
+  /// The number of output bytes that this call wrote, from the start of the output.
+  pub written: usize,
+  /// What the encoder needs next.
+  pub status: ZstdEncodeStatus,
+}
+
+/// The cause of a [`ZstdEncodeError`].
+pub enum ZstdEncodeErrorKind {
+  /// The level or window size is outside its range.
+  InvalidOptions,
+  /// The call is not allowed now: a pledged size after the frame started, input after the frame
+  /// finished, a frame whose size differs from the pledged size, or any step after a failure.
+  InvalidUse,
+  /// [`ZstdEncoder.encode`] filled the output buffer before the frame was complete.
+  OutputFull,
+}
+
+impl Debug for ZstdEncodeErrorKind {
+  /// Writes the name of the variant, such as `InvalidOptions`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      ZstdEncodeErrorKind.InvalidOptions => run TextFormat.write(&mut formatter, b"InvalidOptions")
+      ZstdEncodeErrorKind.InvalidUse => run TextFormat.write(&mut formatter, b"InvalidUse")
+      ZstdEncodeErrorKind.OutputFull => run TextFormat.write(&mut formatter, b"OutputFull")
+    }
+  }
+}
+
+/// An encoding failure, with the progress of the call before it failed.
+///
+/// # Gotchas
+/// After a failed [`ZstdEncoder.step`], discard the frame. Each later step fails with
+/// `InvalidUse` until you call [`ZstdEncoder.reset`].
+pub struct ZstdEncodeError {
+  /// The cause of the failure.
+  pub kind: ZstdEncodeErrorKind,
+  /// The number of input bytes that the call consumed before it failed.
+  pub consumed: usize,
+  /// The number of output bytes that the call wrote before it failed.
+  pub written: usize,
+}
+
+impl Debug for ZstdEncodeError {
+  /// Writes the fields, as `ZstdEncodeError { kind: ..., consumed: ..., written: ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return run TextFormat.debugFields(self, "ZstdEncodeError", &mut formatter)
+  }
+}
+
+/// The settings of a [`ZstdEncoder`].
+pub struct ZstdOptions {
+  /// The effort, from 1 to 22. 1 is the fastest, 22 the smallest, and 3 is the default of the
+  /// reference `zstd`.
+  pub level: u32,
+  /// The base-2 logarithm of the match window, from 10 to 27. A larger window finds older matches
+  /// and uses more memory. The decoder needs a window of the same size.
+  pub windowLog: u32,
+  /// Whether the frame ends with the low 32 bits of the XXH64 of the content.
+  pub checksum: bool,
+  /// Whether the frame header records the content size when the encoder knows it: from
+  /// [`ZstdEncoder.setPledgedSize`], or when the first step ends the frame.
+  pub contentSize: bool,
+}
+
+impl ZstdOptions {
+  /// Returns options for `level` with the window of the reference `zstd` for that level (512 KiB
+  /// for level 1, 1 MiB for 2, 2 MiB for 3 to 8, 4 MiB for 9 to 16, 8 MiB for 17 to 19, and 32,
+  /// 64, and 128 MiB for 20, 21, and 22), no checksum, and the content size recorded when known.
+  pub fn make(level: u32) -> ZstdOptions {
+    let mut windowLog: u32 = 27
+    if level >= 1 && level <= 22 {
+      windowLog = WINDOW_LOGS[u32.toUsize(level - 1)]
+    }
+    return ZstdOptions { level: level, windowLog: windowLog, checksum: false, contentSize: true }
+  }
+}
+
+struct FseTable {
+  state: [u32; 512],
+  deltaBits: [u32; 64],
+  deltaFind: [i64; 64],
+  log: u32,
+  rle: bool,
+}
+
+/// A streaming Zstandard encoder that owns its window, match tables, and output buffer.
+///
+/// # When to use
+/// Use it to compress data that arrives in parts, as the reference `ZSTD_compressStream2` does.
+/// Make one with [`ZstdEncoder.make`], call [`ZstdEncoder.step`] with each part of the input, and
+/// end with `ZstdFlush.End`. Call [`ZstdEncoder.reset`] to write another frame with the same
+/// storage.
+///
+/// # Details
+/// [`ZstdEncoder.make`] allocates all storage one time: twice the window, the hash and chain
+/// tables (64 KiB together at level 1, 640 MiB at level 22, and smaller when the window is), about
+/// 640 KiB of block buffers, and 160 KiB more for the optimal parser of levels 16 to 22. Later
+/// calls do not allocate and do not keep a borrow of your buffers, so you can move the encoder
+/// between threads between calls.
+pub struct ZstdEncoder {
+  level: u32,
+  windowLog: u32,
+  windowSize: usize,
+  blockSize: usize,
+  checksumOn: bool,
+  contentSizeOn: bool,
+  strategy: u32,
+  searches: u32,
+  minMatch: u32,
+  targetLength: usize,
+  hashLog: u32,
+  chainLog: u32,
+  chainMask: usize,
+  treeMask: usize,
+  buffer: List<u8>,
+  capacity: usize,
+  bufferEnd: usize,
+  compressedEnd: usize,
+  nextInsert: usize,
+  hashTable: List<u32>,
+  chainTable: List<u32>,
+  repeat: [u32; 3],
+  candidateLengths: List<u32>,
+  candidateCodes: List<u32>,
+  candidateDistances: List<u32>,
+  nodes: List<OptNode>,
+  prices: Prices,
+  literals: List<u8>,
+  literalCount: usize,
+  sequenceLiteral: List<u32>,
+  sequenceMatch: List<u32>,
+  sequenceOffset: List<u32>,
+  sequenceCount: usize,
+  literalCodes: List<u8>,
+  matchCodes: List<u8>,
+  offsetCodes: List<u8>,
+  literalTable: FseTable,
+  matchTable: FseTable,
+  offsetTable: FseTable,
+  huffmanCode: [u32; 256],
+  huffmanBits: [u32; 256],
+  stage: List<u8>,
+  stageLength: usize,
+  stageFull: bool,
+  bitBuffer: u64,
+  bitCount: u32,
+  pending: List<u8>,
+  pendingLength: usize,
+  pendingOffset: usize,
+  phase: u32,
+  pledged: u64,
+  hasPledged: bool,
+  totalIn: u64,
+  hash: Xxh64,
+  wroteLast: bool,
+  flushed: bool,
+  inputPosition: usize,
+  outputPosition: usize,
+}
+
+const BLOCK_MAX: usize = 131072
+
+const MIN_MATCH: usize = 4
+
+// The reference `zstd` parameters for inputs above 256 KiB, by level from 1 (clevels.h).
+const WINDOW_LOGS: [u32; 22] = [
+  19,
+  20,
+  21,
+  21,
+  21,
+  21,
+  21,
+  21,
+  22,
+  22,
+  22,
+  22,
+  22,
+  22,
+  22,
+  22,
+  23,
+  23,
+  23,
+  25,
+  26,
+  27,
+]
+
+const CHAIN_LOGS: [u32; 22] = [
+  13,
+  15,
+  16,
+  18,
+  18,
+  18,
+  19,
+  19,
+  20,
+  21,
+  21,
+  22,
+  22,
+  22,
+  23,
+  22,
+  23,
+  23,
+  24,
+  25,
+  26,
+  27,
+]
+
+const HASH_LOGS: [u32; 22] = [
+  14,
+  16,
+  17,
+  18,
+  19,
+  19,
+  20,
+  20,
+  21,
+  22,
+  22,
+  23,
+  22,
+  23,
+  23,
+  22,
+  22,
+  22,
+  22,
+  23,
+  24,
+  25,
+]
+
+const SEARCH_LOGS: [u32; 22] = [1, 1, 1, 1, 3, 3, 4, 4, 4, 5, 6, 6, 4, 5, 6, 5, 5, 6, 7, 7, 7, 9]
+
+const MIN_MATCHES: [u32; 22] = [7, 6, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 4, 3, 3, 3, 3, 3]
+
+const TARGET_LENGTHS: [u32; 22] = [
+  0,
+  0,
+  0,
+  0,
+  2,
+  4,
+  8,
+  16,
+  16,
+  16,
+  16,
+  32,
+  32,
+  32,
+  32,
+  48,
+  64,
+  64,
+  256,
+  256,
+  512,
+  999,
+]
+
+const STRATEGY_FAST: u32 = 0
+
+const STRATEGY_DOUBLE_FAST: u32 = 1
+
+const STRATEGY_GREEDY: u32 = 2
+
+const STRATEGY_LAZY: u32 = 3
+
+const STRATEGY_LAZY2: u32 = 4
+
+const STRATEGY_BINARY_LAZY2: u32 = 5
+
+const STRATEGY_OPTIMAL: u32 = 6
+
+const STRATEGY_ULTRA: u32 = 7
+
+const STRATEGY_ULTRA2: u32 = 8
+
+const STRATEGIES: [u32; 22] = [0, 0, 1, 1, 2, 3, 3, 4, 4, 4, 4, 4, 5, 5, 5, 6, 6, 7, 8, 8, 8, 8]
+
+// Bytes past the end of the window buffer, so that 8-byte reads near the end stay in bounds.
+const BUFFER_PADDING: usize = 8
+
+const PHASE_START: u32 = 0
+
+const PHASE_RUNNING: u32 = 1
+
+const PHASE_FINISHED: u32 = 2
+
+const PHASE_FAILED: u32 = 3
+
+impl ZstdEncoder {
+  /// Returns an encoder for one frame with `options`, with storage from the ambient `Allocator`.
+  ///
+  /// # Errors
+  /// - [`ZstdEncodeError`] with `InvalidOptions` if the level is not 1 to 22 or the window log is
+  ///   not 10 to 27, checked before the allocation.
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn make(options: ZstdOptions) -> ZstdEncoder
+    ! OutOfMemoryError | ZstdEncodeError
+    ? &mut Allocator {
+    if options.level < 1 || options.level > 22 || options.windowLog < 10 || options.windowLog > 27 {
+      fail ZstdEncodeError { kind: ZstdEncodeErrorKind.InvalidOptions, consumed: 0, written: 0 }
+    }
+    let windowSize = usize.shiftLeft(1, u32.toUsize(options.windowLog))
+    let mut blockSize = BLOCK_MAX
+    if blockSize > windowSize {
+      blockSize = windowSize
+    }
+    let level = options.level
+    let index = u32.toUsize(level - 1)
+    let strategy = STRATEGIES[index]
+    let mut hashLog = HASH_LOGS[index]
+    if hashLog > options.windowLog + 1 {
+      hashLog = options.windowLog + 1
+    }
+    let mut chainLog = CHAIN_LOGS[index]
+    if strategy == STRATEGY_FAST {
+      chainLog = 0
+    } else if chainLog > options.windowLog {
+      chainLog = options.windowLog
+    }
+    let chainSize = usize.shiftLeft(1, u32.toUsize(chainLog))
+    let mut span = windowSize
+    if span < BLOCK_MAX {
+      span = BLOCK_MAX
+    }
+    let capacity = 2 * span + chainSize
+    let mut buffer = List<u8>.make()
+    run List<u8>.appendRepeated(&mut buffer, 0, capacity + BUFFER_PADDING)
+    let mut hashTable = List<u32>.make()
+    run List<u32>.appendRepeated(&mut hashTable, 0, usize.shiftLeft(1, u32.toUsize(hashLog)))
+    let mut chainTable = List<u32>.make()
+    run List<u32>.appendRepeated(&mut chainTable, 0, chainSize)
+    let tree = strategy >= STRATEGY_BINARY_LAZY2
+    let mut candidates: usize = 0
+    if tree {
+      candidates = usize.shiftLeft(1, u32.toUsize(SEARCH_LOGS[index])) + 8
+    }
+    let mut candidateLengths = List<u32>.make()
+    run List<u32>.appendRepeated(&mut candidateLengths, 0, candidates)
+    let mut candidateCodes = List<u32>.make()
+    run List<u32>.appendRepeated(&mut candidateCodes, 0, candidates)
+    let mut candidateDistances = List<u32>.make()
+    run List<u32>.appendRepeated(&mut candidateDistances, 0, candidates)
+    let mut nodeCount: usize = 0
+    if strategy >= STRATEGY_OPTIMAL {
+      nodeCount = OPT_NUM + 8
+    }
+    let mut nodes = List<OptNode>.make()
+    run List<OptNode>.appendRepeated(&mut nodes, emptyNode(), nodeCount)
+    let mut treeMask: usize = 0
+    if tree && chainLog > 0 {
+      treeMask = usize.shiftLeft(1, u32.toUsize(chainLog - 1)) - 1
+    }
+    let mut literals = List<u8>.make()
+    run List<u8>.appendRepeated(&mut literals, 0, BLOCK_MAX)
+    let mut sequenceLiteral = List<u32>.make()
+    run List<u32>.appendRepeated(&mut sequenceLiteral, 0, BLOCK_MAX / 4 + 1)
+    let mut sequenceMatch = List<u32>.make()
+    run List<u32>.appendRepeated(&mut sequenceMatch, 0, BLOCK_MAX / 4 + 1)
+    let mut sequenceOffset = List<u32>.make()
+    run List<u32>.appendRepeated(&mut sequenceOffset, 0, BLOCK_MAX / 4 + 1)
+    let mut literalCodes = List<u8>.make()
+    run List<u8>.appendRepeated(&mut literalCodes, 0, BLOCK_MAX / 4 + 1)
+    let mut matchCodes = List<u8>.make()
+    run List<u8>.appendRepeated(&mut matchCodes, 0, BLOCK_MAX / 4 + 1)
+    let mut offsetCodes = List<u8>.make()
+    run List<u8>.appendRepeated(&mut offsetCodes, 0, BLOCK_MAX / 4 + 1)
+    let mut stage = List<u8>.make()
+    run List<u8>.appendRepeated(&mut stage, 0, BLOCK_MAX + 1024)
+    let mut pending = List<u8>.make()
+    run List<u8>.appendRepeated(&mut pending, 0, BLOCK_MAX + 64)
+    let mut encoder = ZstdEncoder {
+      level: level,
+      windowLog: options.windowLog,
+      windowSize: windowSize,
+      blockSize: blockSize,
+      checksumOn: options.checksum,
+      contentSizeOn: options.contentSize,
+      strategy: strategy,
+      searches: u32.shiftLeft(1, SEARCH_LOGS[index]),
+      minMatch: MIN_MATCHES[index],
+      targetLength: u32.toUsize(TARGET_LENGTHS[index]),
+      hashLog: hashLog,
+      chainLog: chainLog,
+      chainMask: chainSize - 1,
+      treeMask: treeMask,
+      buffer: move buffer,
+      capacity: capacity,
+      bufferEnd: 0,
+      compressedEnd: 0,
+      nextInsert: 0,
+      hashTable: move hashTable,
+      chainTable: move chainTable,
+      repeat: [1, 4, 8],
+      candidateLengths: move candidateLengths,
+      candidateCodes: move candidateCodes,
+      candidateDistances: move candidateDistances,
+      nodes: move nodes,
+      prices: emptyPrices(),
+      literals: move literals,
+      literalCount: 0,
+      sequenceLiteral: move sequenceLiteral,
+      sequenceMatch: move sequenceMatch,
+      sequenceOffset: move sequenceOffset,
+      sequenceCount: 0,
+      literalCodes: move literalCodes,
+      matchCodes: move matchCodes,
+      offsetCodes: move offsetCodes,
+      literalTable: emptyTable(),
+      matchTable: emptyTable(),
+      offsetTable: emptyTable(),
+      huffmanCode: [0; 256],
+      huffmanBits: [0; 256],
+      stage: move stage,
+      stageLength: 0,
+      stageFull: false,
+      bitBuffer: 0,
+      bitCount: 0,
+      pending: move pending,
+      pendingLength: 0,
+      pendingOffset: 0,
+      phase: PHASE_START,
+      pledged: 0,
+      hasPledged: false,
+      totalIn: 0,
+      hash: Xxh64.make(),
+      wroteLast: false,
+      flushed: false,
+      inputPosition: 0,
+      outputPosition: 0,
+    }
+    ZstdEncoder.reset(&mut encoder)
+    return move encoder
+  }
+
+  /// Starts a new frame with the same options and storage. It does not allocate. It drops the
+  /// input and output that the encoder holds, the pledged size, and a failure.
+  pub fn reset(self: &mut Self) -> () {
+    let table = List<u32>.asMutSlice(&mut self.hashTable)
+    let mut index: usize = 0
+    while index < table.length {
+      table[index] = 0
+      index = index + 1
+    }
+    self.bufferEnd = 0
+    self.compressedEnd = 0
+    self.nextInsert = 0
+    self.repeat = [1, 4, 8]
+    self.prices.ready = false
+    self.literalCount = 0
+    self.sequenceCount = 0
+    self.stageLength = 0
+    self.stageFull = false
+    self.bitBuffer = 0
+    self.bitCount = 0
+    self.pendingLength = 0
+    self.pendingOffset = 0
+    self.phase = PHASE_START
+    self.pledged = 0
+    self.hasPledged = false
+    self.totalIn = 0
+    self.hash = Xxh64.make()
+    self.wroteLast = false
+    self.flushed = false
+  }
+
+  /// Declares the exact size of the frame's content before the first step, as the reference
+  /// `ZSTD_CCtx_setPledgedSrcSize` does. The frame header then records the size.
+  ///
+  /// # Errors
+  /// `InvalidUse` after the first step or after a failure. The step that ends the frame fails with
+  /// `InvalidUse` if the content has another size.
+  pub fn setPledgedSize(self: &mut Self, size: u64) -> Result<(), ZstdEncodeError> {
+    if self.phase != PHASE_START {
+      return Result<(), ZstdEncodeError>.failResult(
+        ZstdEncodeError { kind: ZstdEncodeErrorKind.InvalidUse, consumed: 0, written: 0 },
+      )
+    }
+    self.pledged = size
+    self.hasPledged = true
+    return Result<(), ZstdEncodeError>.succeed(())
+  }
+
+  /// Compresses from `input` into `output` and returns how much it consumed and wrote.
+  ///
+  /// # Details
+  /// On the next call, give only the input after the consumed prefix. You can give a new output
+  /// buffer of any length. Call with `ZstdFlush.Continue` while more input follows. A flush
+  /// finishes only when the step returns `Flushed`, or `Finished` for `ZstdFlush.End`. Until then,
+  /// call again with the same flush.
+  ///
+  /// # Errors
+  /// `InvalidUse` with input after the frame finished, a frame whose size differs from the pledged
+  /// size, or after an earlier failure.
+  pub fn step(self: &mut Self, input: &[u8], output: &mut [u8], flush: ZstdFlush) -> Result<
+    ZstdEncodeProgress,
+    ZstdEncodeError,
+  > {
+    self.inputPosition = 0
+    self.outputPosition = 0
+    if self.phase == PHASE_FAILED {
+      return failure(&mut self, ZstdEncodeErrorKind.InvalidUse)
+    }
+    if self.phase == PHASE_FINISHED {
+      if !drain(&mut self, &mut output) {
+        return success(&mut self, ZstdEncodeStatus.NeedOutput)
+      }
+      if input.length != 0 {
+        return failure(&mut self, ZstdEncodeErrorKind.InvalidUse)
+      }
+      return success(&mut self, ZstdEncodeStatus.Finished)
+    }
+    if self.phase == PHASE_START {
+      writeFrameHeader(&mut self, input.length, flush == ZstdFlush.End)
+      self.phase = PHASE_RUNNING
+    }
+    if input.length != 0 {
+      self.flushed = false
+    }
+    while true {
+      if !drain(&mut self, &mut output) {
+        return success(&mut self, ZstdEncodeStatus.NeedOutput)
+      }
+      let buffered = self.bufferEnd - self.compressedEnd
+      let remaining = input.length - self.inputPosition
+      if buffered >= self.blockSize {
+        let size = self.blockSize
+        let last = flush == ZstdFlush.End && remaining == 0 && buffered == size
+        compressBlock(&mut self, size, last)
+        continue
+      }
+      if remaining != 0 {
+        fill(&mut self, input)
+        continue
+      }
+      if flush == ZstdFlush.Continue {
+        return success(&mut self, ZstdEncodeStatus.NeedInput)
+      }
+      if flush == ZstdFlush.Flush {
+        if buffered != 0 {
+          compressBlock(&mut self, buffered, false)
+          continue
+        }
+        self.flushed = true
+        return success(&mut self, ZstdEncodeStatus.Flushed)
+      }
+      if self.hasPledged && self.totalIn != self.pledged {
+        return failure(&mut self, ZstdEncodeErrorKind.InvalidUse)
+      }
+      if buffered != 0 || !self.wroteLast {
+        compressBlock(&mut self, buffered, true)
+      }
+      if self.checksumOn {
+        let digest = u64.toU32(Xxh64.finish(&self.hash) & 0xffffffff)
+        putLittle(&mut self, digest, 4)
+      }
+      self.phase = PHASE_FINISHED
+      if !drain(&mut self, &mut output) {
+        return success(&mut self, ZstdEncodeStatus.NeedOutput)
+      }
+      return success(&mut self, ZstdEncodeStatus.Finished)
+    }
+    return failure(&mut self, ZstdEncodeErrorKind.InvalidUse)
+  }
+
+  /// Returns the most bytes that [`ZstdEncoder.encode`] can write for `length` input bytes with
+  /// any options, or `None` if that count does not fit in `usize`.
+  ///
+  /// # Details
+  /// An output buffer of this size never fails with `OutputFull`. The bound is the frame header
+  /// (at most 18 bytes), 3 bytes per 128 KiB block or part of one, the input, and a 4-byte
+  /// checksum.
+  pub fn encodedBound(length: usize) -> Option<usize> {
+    let blocks = usize.divide(length, BLOCK_MAX) + 1
+    return usize.checkedAdd(length, blocks * 3 + 22)
+  }
+
+  /// Compresses all of `input` into the start of `output` as one frame with `options`, and returns
+  /// the encoded length.
+  ///
+  /// # Details
+  /// It makes a [`ZstdEncoder`] with storage from the ambient `Allocator`, runs one step with
+  /// `ZstdFlush.End`, and releases the storage before it returns. The window shrinks to the
+  /// smallest power of two, at least 1 KiB, that holds the input, so small inputs need little
+  /// memory and the decoder needs a small window. The frame header records the
+  /// content size if `options.contentSize` is set.
+  ///
+  /// # Errors
+  /// - `OutputFull` if `output` fills before the frame is complete. It never occurs when `output`
+  ///   holds at least `ZstdEncoder.encodedBound(input.length)` bytes. Discard the partial frame.
+  /// - `InvalidOptions` if an option is outside its range.
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn encode(input: &[u8], output: &mut [u8], options: ZstdOptions) -> usize
+    ! OutOfMemoryError | ZstdEncodeError
+    ? &mut Allocator {
+    let mut fitted = move options
+    let mut needed: u32 = 10
+    while needed < fitted.windowLog && usize.shiftLeft(1, u32.toUsize(needed)) < input.length {
+      needed = needed + 1
+    }
+    fitted.windowLog = needed
+    let mut encoder = run ZstdEncoder.make(move fitted)
+    return match ZstdEncoder.step(&mut encoder, input, &mut output, ZstdFlush.End) {
+      Result<ZstdEncodeProgress, ZstdEncodeError>.Success { value } => {
+        if value.status != ZstdEncodeStatus.Finished {
+          fail ZstdEncodeError {
+            kind: ZstdEncodeErrorKind.OutputFull,
+            consumed: value.consumed,
+            written: value.written,
+          }
+        }
+        value.written
+      }
+      Result<ZstdEncodeProgress, ZstdEncodeError>.Failure { error } => {
+        fail move error
+      }
+    }
+  }
+}
+
+fn emptyTable() -> FseTable {
+  return FseTable { state: [0; 512], deltaBits: [0; 64], deltaFind: [0; 64], log: 0, rle: false }
+}
+
+fn success(state: &mut ZstdEncoder, status: ZstdEncodeStatus) -> Result<
+  ZstdEncodeProgress,
+  ZstdEncodeError,
+> {
+  return Result<ZstdEncodeProgress, ZstdEncodeError>.succeed(
+    ZstdEncodeProgress {
+      consumed: state.inputPosition,
+      written: state.outputPosition,
+      status: status,
+    },
+  )
+}
+
+fn failure(state: &mut ZstdEncoder, kind: ZstdEncodeErrorKind) -> Result<
+  ZstdEncodeProgress,
+  ZstdEncodeError,
+> {
+  state.phase = PHASE_FAILED
+  return Result<ZstdEncodeProgress, ZstdEncodeError>.failResult(
+    ZstdEncodeError { kind: kind, consumed: state.inputPosition, written: state.outputPosition },
+  )
+}
+
+// Copies pending bytes to the output; returns whether no pending byte is left.
+fn drain(state: &mut ZstdEncoder, output: &mut [u8]) -> bool {
+  let available = state.pendingLength - state.pendingOffset
+  if available != 0 {
+    let mut count = output.length - state.outputPosition
+    if count > available {
+      count = available
+    }
+    if count != 0 {
+      let source = Slice.view<u8>(List<u8>.asSlice(&state.pending), state.pendingOffset, count)
+      Slice.copyInto<u8>(&mut output, state.outputPosition, source)
+      state.outputPosition = state.outputPosition + count
+      state.pendingOffset = state.pendingOffset + count
+    }
+  }
+  if state.pendingOffset == state.pendingLength {
+    state.pendingOffset = 0
+    state.pendingLength = 0
+    return true
+  }
+  return false
+}
+
+fn putByte(state: &mut ZstdEncoder, value: u8) -> () {
+  let position = state.pendingLength
+  List<u8>.set(&mut state.pending, position, value)
+  state.pendingLength = position + 1
+}
+
+fn putLittle(state: &mut ZstdEncoder, value: u32, count: u32) -> () {
+  let mut index: u32 = 0
+  while index < count {
+    putByte(&mut state, u32.toU8(u32.shiftRight(value, index * 8) & 255))
+    index = index + 1
+  }
+}
+
+fn writeFrameHeader(state: &mut ZstdEncoder, inputLength: usize, endNow: bool) -> () {
+  let mut known = false
+  let mut size: u64 = 0
+  if state.hasPledged {
+    known = true
+    size = state.pledged
+  } else if endNow {
+    known = true
+    size = usize.toU64(inputLength)
+  }
+  if !state.contentSizeOn {
+    known = false
+  }
+  let single = known && size <= usize.toU64(state.windowSize)
+  let mut sizeFlag: u32 = 0
+  if known {
+    if single && size < 256 {
+      sizeFlag = 0
+    } else if size >= 256 && size < 65792 {
+      sizeFlag = 1
+    } else if size <= 4294967295 {
+      sizeFlag = 2
+    } else {
+      sizeFlag = 3
+    }
+  }
+  let mut descriptor = u32.shiftLeft(sizeFlag, 6)
+  if single {
+    descriptor = descriptor | 32
+  }
+  if state.checksumOn {
+    descriptor = descriptor | 4
+  }
+  putLittle(&mut state, 0xfd2fb528, 4)
+  putByte(&mut state, u32.toU8(descriptor))
+  if !single {
+    let windowByte = u32.toU8(u32.shiftLeft(state.windowLog - 10, 3))
+    putByte(&mut state, windowByte)
+  }
+  if known {
+    if sizeFlag == 0 {
+      putByte(&mut state, u64.toU8(size))
+    } else if sizeFlag == 1 {
+      putLittle(&mut state, u64.toU32(size - 256), 2)
+    } else if sizeFlag == 2 {
+      putLittle(&mut state, u64.toU32(size), 4)
+    } else {
+      putLittle(&mut state, u64.toU32(size & 0xffffffff), 4)
+      putLittle(&mut state, u64.toU32(u64.shiftRight(size, 32)), 4)
+    }
+  }
+  if single {
+    // A single-segment frame's window is its content, so blocks cannot be longer.
+    let content = u64.toUsize(size)
+    if content < state.blockSize && content > 0 {
+      state.blockSize = content
+    }
+  }
+}
+
+// Copies input into the buffer after the uncompressed bytes, sliding the history down when the
+// buffer is full.
+fn fill(state: &mut ZstdEncoder, input: &[u8]) -> () {
+  let capacity = state.capacity
+  if state.bufferEnd == capacity {
+    slide(&mut state)
+  }
+  let mut count = input.length - state.inputPosition
+  let room = capacity - state.bufferEnd
+  if count > room {
+    count = room
+  }
+  let wanted = state.blockSize - (state.bufferEnd - state.compressedEnd)
+  if count > wanted {
+    count = wanted
+  }
+  let source = Slice.view<u8>(input, state.inputPosition, count)
+  Slice.copyInto<u8>(List<u8>.asMutSlice(&mut state.buffer), state.bufferEnd, source)
+  if state.checksumOn {
+    Xxh64.update(&mut state.hash, source)
+  }
+  state.bufferEnd = state.bufferEnd + count
+  state.inputPosition = state.inputPosition + count
+  state.totalIn = state.totalIn + usize.toU64(count)
+}
+
+// Keeps the last window of history before the uncompressed bytes. The shift is a multiple of the
+// chain size, so chain slots stay valid.
+fn slide(state: &mut ZstdEncoder) -> () {
+  let chainSize = state.chainMask + 1
+  let keep = state.compressedEnd - state.windowSize
+  let shift = keep - usize.remainder(keep, chainSize)
+  let buffer = List<u8>.asMutSlice(&mut state.buffer)
+  let mut index: usize = 0
+  let moved = state.bufferEnd - shift
+  while index < moved {
+    buffer[index] = buffer[index + shift]
+    index = index + 1
+  }
+  state.bufferEnd = moved
+  state.compressedEnd = state.compressedEnd - shift
+  state.nextInsert = state.nextInsert - shift
+  let offset = usize.toU32(shift)
+  let table = List<u32>.asMutSlice(&mut state.hashTable)
+  index = 0
+  while index < table.length {
+    if table[index] > offset {
+      table[index] = table[index] - offset
+    } else {
+      table[index] = 0
+    }
+    index = index + 1
+  }
+  let chain = List<u32>.asMutSlice(&mut state.chainTable)
+  index = 0
+  while index < chain.length {
+    if chain[index] > offset {
+      chain[index] = chain[index] - offset
+    } else {
+      chain[index] = 0
+    }
+    index = index + 1
+  }
+}
+
+// Hashes the `length` bytes at `position` (4 to 8) to `bits` bits, as the reference `zstd` does.
+@inlineAlways
+fn hashBytes(buffer: &[u8], position: usize, length: u32, bits: u32) -> usize {
+  let word = load64(buffer, position)
+  if length == 4 {
+    let low = u64.toU32(word & 0xffffffff)
+    return u32.toUsize(u32.shiftRight(u32.wrappingMultiply(low, 2654435761), 32 - bits))
+  }
+  let mut prime: u64 = 0xcf1bbcdcb7a56463
+  let mut shifted = word
+  if length == 5 {
+    prime = 889523592379
+    shifted = u64.shiftLeft(word, 24)
+  } else if length == 6 {
+    prime = 227718039650203
+    shifted = u64.shiftLeft(word, 16)
+  } else if length == 7 {
+    prime = 58295818150454627
+    shifted = u64.shiftLeft(word, 8)
+  }
+  return u64.toUsize(u64.shiftRight(u64.wrappingMultiply(shifted, prime), u32.toU64(64 - bits)))
+}
+
+// Links every position before `target` that has 4 readable bytes into the hash chains.
+fn insertUpTo(state: &mut ZstdEncoder, target: usize) -> () {
+  let mut position = state.nextInsert
+  let mut stop = target
+  if stop + MIN_MATCH > state.bufferEnd + 1 {
+    if state.bufferEnd + 1 < MIN_MATCH {
+      stop = 0
+    } else {
+      stop = state.bufferEnd + 1 - MIN_MATCH
+    }
+  }
+  let bits = state.hashLog
+  let length = state.minMatch
+  let mask = state.chainMask
+  let buffer = List<u8>.asSlice(&state.buffer)
+  let hashes = List<u32>.asMutSlice(&mut state.hashTable)
+  let chain = List<u32>.asMutSlice(&mut state.chainTable)
+  while position < stop {
+    let slot = hashBytes(buffer, position, length, bits)
+    chain[position & mask] = hashes[slot]
+    hashes[slot] = usize.wrappingToU32(position + 1)
+    position = position + 1
+  }
+  if position < target {
+    position = target
+  }
+  state.nextInsert = position
+}
+
+// Reads 8 bytes at `at` as a little-endian word, with one bounds check.
+@inlineAlways
+fn load64(buffer: &[u8], at: usize) -> u64 {
+  let bytes = Slice.view<u8>(buffer, at, 8)
+  return u8.toU64(bytes[0]) | u64.shiftLeft(u8.toU64(bytes[1]), 8)
+    | u64.shiftLeft(u8.toU64(bytes[2]), 16)
+    | u64.shiftLeft(u8.toU64(bytes[3]), 24)
+    | u64.shiftLeft(u8.toU64(bytes[4]), 32)
+    | u64.shiftLeft(u8.toU64(bytes[5]), 40)
+    | u64.shiftLeft(u8.toU64(bytes[6]), 48)
+    | u64.shiftLeft(u8.toU64(bytes[7]), 56)
+}
+
+// Reads 4 bytes at `at` as a little-endian word, with one bounds check.
+@inlineAlways
+fn load32(buffer: &[u8], at: usize) -> u32 {
+  let bytes = Slice.view<u8>(buffer, at, 4)
+  return u8.toU32(bytes[0]) | u32.shiftLeft(u8.toU32(bytes[1]), 8)
+    | u32.shiftLeft(u8.toU32(bytes[2]), 16)
+    | u32.shiftLeft(u8.toU32(bytes[3]), 24)
+}
+
+// Counts the equal bytes at `earlier` and `position`, up to `limit`, 8 bytes at a time.
+@inlineAlways
+fn commonLength(buffer: &[u8], earlier: usize, position: usize, limit: usize) -> usize {
+  let mut length: usize = 0
+  while length + 8 <= limit {
+    let difference = load64(buffer, earlier + length) ^ load64(buffer, position + length)
+    if difference != 0 {
+      return length + u32.toUsize(u64.trailingZeros(difference) / 8)
+    }
+    length = length + 8
+  }
+  while length < limit && buffer[earlier + length] == buffer[position + length] {
+    length = length + 1
+  }
+  return length
+}
+
+struct Found {
+  length: usize,
+  offset: usize,
+}
+
+impl Copy for Found {}
+
+// Returns the longest match at `position` that ends by `end` from the hash chain. Inserts
+// `position` afterwards.
+fn bestMatch(state: &mut ZstdEncoder, position: usize, end: usize) -> Found {
+  insertUpTo(&mut state, position)
+  let limit = end - position
+  let mut best = Found { length: 0, offset: 0 }
+  let buffer = List<u8>.asSlice(&state.buffer)
+  let mut candidate = u32.toUsize(
+    List<u32>.get(&state.hashTable, hashBytes(buffer, position, state.minMatch, state.hashLog)),
+  )
+  let mut attempts = state.searches
+  while candidate != 0 && attempts != 0 && best.length < limit {
+    let earlier = candidate - 1
+    if earlier >= position || position - earlier > state.windowSize {
+      break
+    }
+    if buffer[earlier + best.length] == buffer[position + best.length] {
+      let length = commonLength(buffer, earlier, position, limit)
+      if length > best.length {
+        best = Found { length: length, offset: position - earlier }
+      }
+    }
+    let next = u32.toUsize(List<u32>.get(&state.chainTable, earlier & state.chainMask))
+    if next >= candidate {
+      break
+    }
+    candidate = next
+    attempts = attempts - 1
+  }
+  insertUpTo(&mut state, position + 1)
+  return best
+}
+
+fn highBit(value: u32) -> u32 {
+  return 31 - u32.leadingZeros(value)
+}
+
+// Splits the block into literals and sequences with the strategy of the level.
+fn findSequences(state: &mut ZstdEncoder, start: usize, end: usize) -> () {
+  state.literalCount = 0
+  state.sequenceCount = 0
+  if state.strategy == STRATEGY_FAST {
+    fastSequences(&mut state, start, end)
+  } else if state.strategy == STRATEGY_DOUBLE_FAST {
+    doubleFastSequences(&mut state, start, end)
+  } else if state.strategy >= STRATEGY_OPTIMAL {
+    optimalSequences(&mut state, start, end)
+  } else {
+    lazySequences(&mut state, start, end)
+  }
+}
+
+// Whether a table entry (a position plus 1, or 0 for none) is a usable match source for
+// `position`.
+@inlineAlways
+fn usable(stored: usize, position: usize, window: usize) -> bool {
+  return stored != 0 && stored - 1 < position && position - (stored - 1) <= window
+}
+
+// Whether repeat offset `offset` reaches a byte of the window from `position`.
+@inlineAlways
+fn reaches(offset: usize, position: usize, window: usize) -> bool {
+  return offset <= position && offset <= window
+}
+
+// Counts the bytes before `at` and `earlier` that are equal, stopping at `anchor`.
+@inlineAlways
+fn extendBackward(buffer: &[u8], at: usize, earlier: usize, anchor: usize) -> usize {
+  let mut count: usize = 0
+  while at - count > anchor && earlier - count > 0
+    && buffer[at - count - 1] == buffer[earlier - count - 1] {
+    count = count + 1
+  }
+  return count
+}
+
+// A match that starts at `at`.
+struct Hit {
+  at: usize,
+  length: usize,
+  offset: usize,
+}
+
+impl Copy for Hit {}
+
+// Which tables `repeatRuns` updates: none, the hash table, or the hash and chain tables.
+const TABLES_NONE: u32 = 0
+
+const TABLES_SINGLE: u32 = 1
+
+const TABLES_DOUBLE: u32 = 2
+
+// Emits matches that start right where the last one ended with the second repeat offset, as the
+// reference does after each match. Returns the position after them.
+fn repeatRuns(state: &mut ZstdEncoder, start: usize, end: usize, tables: u32) -> usize {
+  let mut position = start
+  let window = state.windowSize
+  let length = state.minMatch
+  let longBits = state.hashLog
+  let shortBits = state.chainLog
+  while position + 8 <= end {
+    let offset = u32.toUsize(state.repeat[1])
+    let buffer = List<u8>.asSlice(&state.buffer)
+    if !reaches(offset, position, window)
+      || load32(buffer, position - offset) != load32(buffer, position) {
+      return position
+    }
+    let matched = 4 + commonLength(buffer, position - offset + 4, position + 4, end - position - 4)
+    if tables == TABLES_DOUBLE {
+      let longSlot = hashBytes(buffer, position, 8, longBits)
+      let shortSlot = hashBytes(buffer, position, length, shortBits)
+      List<u32>.set(&mut state.hashTable, longSlot, usize.wrappingToU32(position + 1))
+      List<u32>.set(&mut state.chainTable, shortSlot, usize.wrappingToU32(position + 1))
+    } else if tables == TABLES_SINGLE {
+      let slot = hashBytes(buffer, position, length, longBits)
+      List<u32>.set(&mut state.hashTable, slot, usize.wrappingToU32(position + 1))
+    }
+    addSequence(&mut state, position, position, matched, offset)
+    position = position + matched
+  }
+  return position
+}
+
+// The fixed inputs of one match search.
+struct Search {
+  position: usize,
+  anchor: usize,
+  end: usize,
+  window: usize,
+  length: u32,
+  bits: u32,
+  shortBits: u32,
+  repeat: usize,
+}
+
+// Finds the next match for `ZSTD_fast` from `search.position`, as the reference
+// `ZSTD_compressBlock_fast_noDict_generic` does: it looks at two positions at a time, checks the
+// last offset two bytes ahead first, and takes larger steps through data without matches.
+// Returns a hit of length 0 when none starts 8 bytes or more before the end.
+fn fastSearch(buffer: &[u8], table: &mut [u32], search: Search) -> Hit {
+  let end = search.end
+  let window = search.window
+  let anchor = search.anchor
+  let repeat = search.repeat
+  let length = search.length
+  let bits = search.bits
+  let limit = end - 8
+  let mut step: usize = 2
+  let mut first = search.position
+  let mut nextStep = first + 128
+  let mut second = first + 1
+  let mut third = first + step
+  let mut fourth = third + 1
+  if fourth >= limit {
+    return Hit { at: first, length: 0, offset: 0 }
+  }
+  let mut firstSlot = hashBytes(buffer, first, length, bits)
+  let mut secondSlot = hashBytes(buffer, second, length, bits)
+  let mut stored = u32.toUsize(table[firstSlot])
+  while true {
+    table[firstSlot] = usize.wrappingToU32(first + 1)
+    if reaches(repeat, third, window) && load32(buffer, third - repeat) == load32(buffer, third) {
+      let mut back: usize = 0
+      if buffer[third - 1] == buffer[third - 1 - repeat] {
+        back = 1
+      }
+      table[secondSlot] = usize.wrappingToU32(second + 1)
+      let matched = 4 + commonLength(buffer, third - repeat + 4, third + 4, end - third - 4)
+      return Hit { at: third - back, length: matched + back, offset: repeat }
+    }
+    if usable(stored, first, window) && load32(buffer, stored - 1) == load32(buffer, first) {
+      table[secondSlot] = usize.wrappingToU32(second + 1)
+      return offsetHit(buffer, first, stored - 1, anchor, end)
+    }
+    stored = u32.toUsize(table[secondSlot])
+    firstSlot = secondSlot
+    secondSlot = hashBytes(buffer, third, length, bits)
+    first = second
+    second = third
+    third = fourth
+    table[firstSlot] = usize.wrappingToU32(first + 1)
+    if usable(stored, first, window) && load32(buffer, stored - 1) == load32(buffer, first) {
+      if step <= 4 {
+        table[secondSlot] = usize.wrappingToU32(second + 1)
+      }
+      return offsetHit(buffer, first, stored - 1, anchor, end)
+    }
+    stored = u32.toUsize(table[secondSlot])
+    firstSlot = secondSlot
+    secondSlot = hashBytes(buffer, third, length, bits)
+    first = second
+    second = third
+    third = first + step
+    fourth = second + step
+    if third >= nextStep {
+      step = step + 1
+      nextStep = nextStep + 128
+    }
+    if fourth >= limit {
+      break
+    }
+  }
+  return Hit { at: first, length: 0, offset: 0 }
+}
+
+// A match at `position` with the earlier position `earlier`, extended backward to `anchor`.
+@inlineAlways
+fn offsetHit(buffer: &[u8], position: usize, earlier: usize, anchor: usize, end: usize) -> Hit {
+  let matched = 4 + commonLength(buffer, earlier + 4, position + 4, end - position - 4)
+  let back = extendBackward(buffer, position, earlier, anchor)
+  return Hit { at: position - back, length: matched + back, offset: position - earlier }
+}
+
+// Finds the next match for `ZSTD_dfast` from `search.position`, preferring 8-byte prefixes.
+fn doubleFastSearch(buffer: &[u8], long: &mut [u32], short: &mut [u32], search: Search) -> Hit {
+  let end = search.end
+  let window = search.window
+  let anchor = search.anchor
+  let repeat = search.repeat
+  let longBits = search.bits
+  let mut position = search.position
+  while position + 8 <= end {
+    let longSlot = hashBytes(buffer, position, 8, longBits)
+    let shortSlot = hashBytes(buffer, position, search.length, search.shortBits)
+    let longStored = u32.toUsize(long[longSlot])
+    let shortStored = u32.toUsize(short[shortSlot])
+    long[longSlot] = usize.wrappingToU32(position + 1)
+    short[shortSlot] = usize.wrappingToU32(position + 1)
+    let next = position + 1
+    if reaches(repeat, next, window) && load32(buffer, next - repeat) == load32(buffer, next) {
+      let matched = 4 + commonLength(buffer, next - repeat + 4, next + 4, end - next - 4)
+      return Hit { at: next, length: matched, offset: repeat }
+    }
+    if usable(longStored, position, window)
+      && load64(buffer, longStored - 1) == load64(buffer, position) {
+      let earlier = longStored - 1
+      let matched = 8 + commonLength(buffer, earlier + 8, position + 8, end - position - 8)
+      let back = extendBackward(buffer, position, earlier, anchor)
+      return Hit { at: position - back, length: matched + back, offset: position - earlier }
+    }
+    if usable(shortStored, position, window)
+      && load32(buffer, shortStored - 1) == load32(buffer, position) {
+      let nextSlot = hashBytes(buffer, next, 8, longBits)
+      let nextStored = u32.toUsize(long[nextSlot])
+      long[nextSlot] = usize.wrappingToU32(next + 1)
+      let earlier = shortStored - 1
+      let matched = 4 + commonLength(buffer, earlier + 4, position + 4, end - position - 4)
+      if next + 8 <= end && usable(nextStored, next, window)
+        && load64(buffer, nextStored - 1) == load64(buffer, next) {
+        let farther = nextStored - 1
+        let longer = 8 + commonLength(buffer, farther + 8, next + 8, end - next - 8)
+        if longer > matched {
+          let back = extendBackward(buffer, next, farther, anchor)
+          return Hit { at: next - back, length: longer + back, offset: next - farther }
+        }
+      }
+      let back = extendBackward(buffer, position, earlier, anchor)
+      return Hit { at: position - back, length: matched + back, offset: position - earlier }
+    }
+    position = position + 1 + usize.shiftRight(position - anchor, 8)
+  }
+  return Hit { at: position, length: 0, offset: 0 }
+}
+
+// The reference `ZSTD_fast` strategy: one hash table, a check of the last offset one byte ahead,
+// and larger steps through data without matches.
+fn fastSequences(state: &mut ZstdEncoder, start: usize, end: usize) -> () {
+  let window = state.windowSize
+  let length = state.minMatch
+  let bits = state.hashLog
+  let mut position = start
+  let mut anchor = start
+  if position == 0 {
+    position = 1
+  }
+  while position + 8 <= end {
+    let repeat = u32.toUsize(state.repeat[0])
+    let hit = fastSearch(
+      List<u8>.asSlice(&state.buffer),
+      List<u32>.asMutSlice(&mut state.hashTable),
+      Search {
+        position: position,
+        anchor: anchor,
+        end: end,
+        window: window,
+        length: length,
+        bits: bits,
+        shortBits: 0,
+        repeat: repeat,
+      },
+    )
+    if hit.length == 0 {
+      break
+    }
+    addSequence(&mut state, anchor, hit.at, hit.length, hit.offset)
+    position = hit.at + hit.length
+    anchor = position
+    if position + 8 <= end {
+      let filled = List<u8>.asSlice(&state.buffer)
+      let early = hit.at + 2
+      let earlySlot = hashBytes(filled, early, length, bits)
+      let lateSlot = hashBytes(filled, position - 2, length, bits)
+      List<u32>.set(&mut state.hashTable, earlySlot, usize.wrappingToU32(early + 1))
+      List<u32>.set(&mut state.hashTable, lateSlot, usize.wrappingToU32(position - 1))
+      position = repeatRuns(&mut state, position, end, TABLES_SINGLE)
+      anchor = position
+    }
+  }
+  addLiterals(&mut state, anchor, end)
+  state.nextInsert = end
+}
+
+// The reference `ZSTD_dfast` strategy: a table of 8-byte prefixes (the hash table) and a table
+// of short prefixes (the chain table), preferring long matches.
+fn doubleFastSequences(state: &mut ZstdEncoder, start: usize, end: usize) -> () {
+  let window = state.windowSize
+  let length = state.minMatch
+  let longBits = state.hashLog
+  let shortBits = state.chainLog
+  let mut position = start
+  let mut anchor = start
+  if position == 0 {
+    position = 1
+  }
+  while position + 8 <= end {
+    let repeat = u32.toUsize(state.repeat[0])
+    let hit = doubleFastSearch(
+      List<u8>.asSlice(&state.buffer),
+      List<u32>.asMutSlice(&mut state.hashTable),
+      List<u32>.asMutSlice(&mut state.chainTable),
+      Search {
+        position: position,
+        anchor: anchor,
+        end: end,
+        window: window,
+        length: length,
+        bits: longBits,
+        shortBits: shortBits,
+        repeat: repeat,
+      },
+    )
+    if hit.length == 0 {
+      break
+    }
+    addSequence(&mut state, anchor, hit.at, hit.length, hit.offset)
+    position = hit.at + hit.length
+    anchor = position
+    if position + 8 <= end {
+      let filled = List<u8>.asSlice(&state.buffer)
+      let early = hit.at + 2
+      let earlyLong = hashBytes(filled, early, 8, longBits)
+      let earlyShort = hashBytes(filled, early, length, shortBits)
+      let lateLong = hashBytes(filled, position - 2, 8, longBits)
+      let lateShort = hashBytes(filled, position - 1, length, shortBits)
+      List<u32>.set(&mut state.hashTable, earlyLong, usize.wrappingToU32(early + 1))
+      List<u32>.set(&mut state.chainTable, earlyShort, usize.wrappingToU32(early + 1))
+      List<u32>.set(&mut state.hashTable, lateLong, usize.wrappingToU32(position - 1))
+      List<u32>.set(&mut state.chainTable, lateShort, usize.wrappingToU32(position))
+      position = repeatRuns(&mut state, position, end, TABLES_DOUBLE)
+      anchor = position
+    }
+  }
+  addLiterals(&mut state, anchor, end)
+  state.nextInsert = end
+}
+
+// Binary-tree match finding and optimal parsing, as the reference `zstd_opt.c` does for
+// `ZSTD_btlazy2`, `ZSTD_btopt`, `ZSTD_btultra`, and `ZSTD_btultra2`.
+
+// The most positions that one optimal parse looks ahead.
+const OPT_NUM: usize = 4096
+
+// A price larger than any real one, in 1/256 bits.
+const MAX_PRICE: i64 = 1073741824
+
+// Starting frequencies of literal-length and offset codes for the first block.
+const BASE_LITERAL_LENGTH_FREQUENCIES: [u32; 36] = [
+  4,
+  2,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+]
+
+const BASE_OFFSET_FREQUENCIES: [u32; 32] = [
+  6,
+  2,
+  1,
+  1,
+  2,
+  3,
+  4,
+  4,
+  4,
+  3,
+  2,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+]
+
+// One position of an optimal parse: the cheapest way found to reach it.
+struct OptNode {
+  // The price from the start of the parse, in 1/256 bits.
+  price: i64,
+  // The length of the match that ends here, or 0 if a literal ends here.
+  length: u32,
+  // The offset code of that match: 1 to 3 for repeat offsets, the distance plus 3 otherwise.
+  code: u32,
+  // The distance of that match.
+  distance: u32,
+  // The literals since the last match, if a literal ends here.
+  literals: u32,
+  // The repeat offsets after this position.
+  repeat: [u32; 3],
+}
+
+impl Copy for OptNode {}
+
+fn emptyNode() -> OptNode {
+  return OptNode {
+    price: MAX_PRICE,
+    length: 0,
+    code: 0,
+    distance: 0,
+    literals: 0,
+    repeat: [1, 4, 8],
+  }
+}
+
+// Symbol statistics that price literals and sequences during optimal parsing.
+struct Prices {
+  ready: bool,
+  literal: [u32; 256],
+  literalLength: [u32; 36],
+  matchLength: [u32; 53],
+  offset: [u32; 32],
+  literalSum: u32,
+  literalLengthSum: u32,
+  matchLengthSum: u32,
+  offsetSum: u32,
+  literalBase: i64,
+  literalLengthBase: i64,
+  matchLengthBase: i64,
+  offsetBase: i64,
+}
+
+impl Copy for Prices {}
+
+fn emptyPrices() -> Prices {
+  return Prices {
+    ready: false,
+    literal: [0; 256],
+    literalLength: [0; 36],
+    matchLength: [0; 53],
+    offset: [0; 32],
+    literalSum: 0,
+    literalLengthSum: 0,
+    matchLengthSum: 0,
+    offsetSum: 0,
+    literalBase: 0,
+    literalLengthBase: 0,
+    matchLengthBase: 0,
+    offsetBase: 0,
+  }
+}
+
+// The cost in 1/256 bits of a symbol seen `count` times: whole bits, or with a linear fraction.
+@inlineAlways
+fn weight(count: u32, fractional: bool) -> i64 {
+  let value = count + 1
+  let high = highBit(value)
+  if !fractional {
+    return u32.toI64(high) * 256
+  }
+  return u32.toI64(high) * 256 + u32.toI64(u32.shiftRight(u32.shiftLeft(value, 8), high))
+}
+
+fn setBasePrices(prices: &mut Prices, fractional: bool) -> () {
+  prices.literalBase = weight(prices.literalSum, fractional)
+  prices.literalLengthBase = weight(prices.literalLengthSum, fractional)
+  prices.matchLengthBase = weight(prices.matchLengthSum, fractional)
+  prices.offsetBase = weight(prices.offsetSum, fractional)
+}
+
+// Divides each count by 2^shift, keeping it at least `floor` (1, or 1 for counts above 0), and
+// returns the new sum.
+fn downscale(counts: &mut [u32], shift: u32, alwaysOne: bool) -> u32 {
+  let mut sum: u32 = 0
+  let mut index: usize = 0
+  while index < counts.length {
+    let count = counts[index]
+    let mut floor: u32 = 0
+    if alwaysOne || count > 0 {
+      floor = 1
+    }
+    let scaled = floor + u32.shiftRight(count, shift)
+    counts[index] = scaled
+    sum = sum + scaled
+    index = index + 1
+  }
+  return sum
+}
+
+// Shrinks counts whose sum is above 2^log, as the reference `ZSTD_scaleStats` does.
+fn scaleCounts(counts: &mut [u32], log: u32) -> u32 {
+  let mut sum: u32 = 0
+  let mut index: usize = 0
+  while index < counts.length {
+    sum = sum + counts[index]
+    index = index + 1
+  }
+  let factor = u32.shiftRight(sum, log)
+  if factor <= 1 {
+    return sum
+  }
+  return downscale(&mut counts, highBit(factor), true)
+}
+
+// Seeds the statistics from the block's literals at the start of a frame, and shrinks them
+// for later blocks, as the reference `ZSTD_rescaleFreqs` does.
+fn rescalePrices(state: &mut ZstdEncoder, start: usize, end: usize) -> () {
+  let fractional = state.strategy >= STRATEGY_ULTRA
+  if !state.prices.ready {
+    let mut counts: [u32; 256] = [0; 256]
+    let buffer = List<u8>.asSlice(&state.buffer)
+    let mut index = start
+    while index < end {
+      let symbol = u8.toUsize(buffer[index])
+      counts[symbol] = counts[symbol] + 1
+      index = index + 1
+    }
+    state.prices.literalSum = downscale(&mut counts, 8, false)
+    state.prices.literal = counts
+    state.prices.literalLength = BASE_LITERAL_LENGTH_FREQUENCIES
+    state.prices.literalLengthSum = 0
+    index = 0
+    while index < 36 {
+      state.prices.literalLengthSum = state.prices.literalLengthSum
+        + BASE_LITERAL_LENGTH_FREQUENCIES[index]
+      index = index + 1
+    }
+    state.prices.matchLength = [1; 53]
+    state.prices.matchLengthSum = 53
+    state.prices.offset = BASE_OFFSET_FREQUENCIES
+    state.prices.offsetSum = 0
+    index = 0
+    while index < 32 {
+      state.prices.offsetSum = state.prices.offsetSum + BASE_OFFSET_FREQUENCIES[index]
+      index = index + 1
+    }
+    state.prices.ready = true
+  } else {
+    state.prices.literalSum = scaleCounts(&mut state.prices.literal, 12)
+    state.prices.literalLengthSum = scaleCounts(&mut state.prices.literalLength, 11)
+    state.prices.matchLengthSum = scaleCounts(&mut state.prices.matchLength, 11)
+    state.prices.offsetSum = scaleCounts(&mut state.prices.offset, 11)
+  }
+  setBasePrices(&mut state.prices, fractional)
+}
+
+@inlineAlways
+fn literalPrice(prices: &Prices, symbol: u8, fractional: bool) -> i64 {
+  let most = prices.literalBase - 256
+  let price = prices.literalBase - weight(prices.literal[u8.toUsize(symbol)], fractional)
+  if price > most {
+    return most
+  }
+  return price
+}
+
+@inlineAlways
+fn literalLengthPrice(prices: &Prices, length: u32, fractional: bool) -> i64 {
+  let code = literalCode(length)
+  return u32.toI64(LITERAL_EXTRA[code]) * 256 + prices.literalLengthBase
+    - weight(prices.literalLength[code], fractional)
+}
+
+@inlineAlways
+fn matchPrice(prices: &Prices, code: u32, length: u32, strategy: u32, fractional: bool) -> i64 {
+  let offsetCode = highBit(code)
+  let mut price = u32.toI64(offsetCode) * 256 + prices.offsetBase
+    - weight(prices.offset[u32.toUsize(offsetCode)], fractional)
+  if strategy < STRATEGY_ULTRA && offsetCode >= 20 {
+    price = price + u32.toI64(offsetCode - 19) * 512
+  }
+  let lengthCode = matchCode(length)
+  price = price + u32.toI64(MATCH_EXTRA[lengthCode]) * 256 + prices.matchLengthBase
+    - weight(prices.matchLength[lengthCode], fractional)
+  return price + 51
+}
+
+// Counts one chosen sequence and its literals into the statistics.
+fn countSequence(
+  state: &mut ZstdEncoder,
+  from: usize,
+  literals: usize,
+  code: u32,
+  length: u32,
+) -> () {
+  let buffer = List<u8>.asSlice(&state.buffer)
+  let mut index: usize = 0
+  while index < literals {
+    let symbol = u8.toUsize(buffer[from + index])
+    state.prices.literal[symbol] = state.prices.literal[symbol] + 2
+    index = index + 1
+  }
+  state.prices.literalSum = state.prices.literalSum + usize.toU32(literals) * 2
+  let literalSymbol = literalCode(usize.toU32(literals))
+  state.prices.literalLength[literalSymbol] = state.prices.literalLength[literalSymbol] + 1
+  state.prices.literalLengthSum = state.prices.literalLengthSum + 1
+  let offsetSymbol = u32.toUsize(highBit(code))
+  state.prices.offset[offsetSymbol] = state.prices.offset[offsetSymbol] + 1
+  state.prices.offsetSum = state.prices.offsetSum + 1
+  let lengthSymbol = matchCode(length)
+  state.prices.matchLength[lengthSymbol] = state.prices.matchLength[lengthSymbol] + 1
+  state.prices.matchLengthSum = state.prices.matchLengthSum + 1
+}
+
+// The offset code that `addSequence` writes for `distance`, given the repeat offsets.
+fn offsetCodeFor(distance: u32, repeat: [u32; 3], noLiterals: bool) -> u32 {
+  if !noLiterals {
+    if distance == repeat[0] {
+      return 1
+    }
+    if distance == repeat[1] {
+      return 2
+    }
+    if distance == repeat[2] {
+      return 3
+    }
+    return distance + 3
+  }
+  if distance == repeat[1] {
+    return 1
+  }
+  if distance == repeat[2] {
+    return 2
+  }
+  if repeat[0] > 1 && distance == repeat[0] - 1 {
+    return 3
+  }
+  return distance + 3
+}
+
+// The repeat offsets after a match with offset code `code`, as the decoder updates them.
+fn nextRepeat(repeat: [u32; 3], code: u32, noLiterals: bool) -> [u32; 3] {
+  if code > 3 {
+    return [code - 3, repeat[0], repeat[1]]
+  }
+  let mut slot = code - 1
+  if noLiterals {
+    slot = slot + 1
+  }
+  if slot == 0 {
+    return repeat
+  }
+  let mut current = repeat[0] - 1
+  if slot < 3 {
+    current = repeat[u32.toUsize(slot)]
+  }
+  if slot >= 2 {
+    return [current, repeat[0], repeat[1]]
+  }
+  return [current, repeat[0], repeat[2]]
+}
+
+// The fixed inputs of one binary-tree search.
+struct TreeQuery {
+  position: usize,
+  end: usize,
+  window: usize,
+  hashLength: u32,
+  hashBits: u32,
+  mask: usize,
+  searches: u32,
+  minLength: usize,
+  sufficient: usize,
+  repeat: [u32; 3],
+  noLiterals: bool,
+  collect: bool,
+  insert: bool,
+}
+
+impl Copy for TreeQuery {}
+
+// The candidates found and how far the matches reached.
+struct TreeResult {
+  count: usize,
+  reach: usize,
+  best: usize,
+}
+
+impl Copy for TreeResult {}
+
+// Searches the binary tree of earlier positions with the same hash, and inserts `position` into
+// it when `insert` is set, as the reference `ZSTD_insertBtAndGetAllMatches` does. With `collect`,
+// it records the repeat-offset matches and then each tree match longer than all before it, in
+// `lengths`, `codes` (offset codes), and `distances`.
+fn treeSearch(
+  buffer: &[u8],
+  hashes: &mut [u32],
+  tree: &mut [u32],
+  lengths: &mut [u32],
+  codes: &mut [u32],
+  distances: &mut [u32],
+  query: TreeQuery,
+) -> TreeResult {
+  let position = query.position
+  let limit = query.end - position
+  let window = query.window
+  let mask = query.mask
+  let mut count: usize = 0
+  let mut best = query.minLength - 1
+  let slot = hashBytes(buffer, position, query.hashLength, query.hashBits)
+  let mut candidate = u32.toUsize(hashes[slot])
+  if query.insert {
+    hashes[slot] = usize.wrappingToU32(position + 1)
+  }
+  let own = 2 * (position & mask)
+  if query.collect {
+    let mut first: u32 = 0
+    if query.noLiterals {
+      first = 1
+    }
+    let mut slotIndex = first
+    while slotIndex < first + 3 {
+      let mut distance = query.repeat[0] - 1
+      if slotIndex < 3 {
+        distance = query.repeat[u32.toUsize(slotIndex)]
+      }
+      let reach = u32.toUsize(distance)
+      if reach != 0 && reach <= position && reach <= window {
+        let length = commonLength(buffer, position - reach, position, limit)
+        if length > best {
+          best = length
+          lengths[count] = usize.wrappingToU32(length)
+          codes[count] = slotIndex - first + 1
+          distances[count] = distance
+          count = count + 1
+          if length > query.sufficient || length == limit {
+            if query.insert {
+              tree[own] = 0
+              tree[own + 1] = 0
+            }
+            return TreeResult { count: count, reach: position + 9, best: best }
+          }
+        }
+      }
+      slotIndex = slotIndex + 1
+    }
+  }
+  let mut low: usize = 0
+  if position > window {
+    low = position - window
+  }
+  let mut treeLow: usize = 0
+  if position > mask {
+    treeLow = position - mask
+  }
+  let mut smallerSlot = own
+  let mut largerSlot = own + 1
+  let mut smallerLive = query.insert
+  let mut largerLive = query.insert
+  let mut smallerLength: usize = 0
+  let mut largerLength: usize = 0
+  let mut reach = position + 9
+  let mut treeBest: usize = 0
+  let mut compares = query.searches
+  while compares > 0 && candidate != 0 {
+    let earlier = candidate - 1
+    if earlier < low || earlier >= position {
+      break
+    }
+    let node = 2 * (earlier & mask)
+    let mut length = smallerLength
+    if largerLength < length {
+      length = largerLength
+    }
+    length = length + commonLength(buffer, earlier + length, position + length, limit - length)
+    if length > treeBest {
+      treeBest = length
+      if earlier + length > reach {
+        reach = earlier + length
+      }
+    }
+    if query.collect && length > best {
+      best = length
+      let distance = usize.wrappingToU32(position - earlier)
+      lengths[count] = usize.wrappingToU32(length)
+      codes[count] = offsetCodeFor(distance, query.repeat, query.noLiterals)
+      distances[count] = distance
+      count = count + 1
+    }
+    if length == limit || length > OPT_NUM {
+      break
+    }
+    if buffer[earlier + length] < buffer[position + length] {
+      if smallerLive {
+        tree[smallerSlot] = usize.wrappingToU32(candidate)
+      }
+      smallerLength = length
+      if earlier <= treeLow {
+        smallerLive = false
+        break
+      }
+      smallerSlot = node + 1
+      candidate = u32.toUsize(tree[node + 1])
+    } else {
+      if largerLive {
+        tree[largerSlot] = usize.wrappingToU32(candidate)
+      }
+      largerLength = length
+      if earlier <= treeLow {
+        largerLive = false
+        break
+      }
+      largerSlot = node
+      candidate = u32.toUsize(tree[node])
+    }
+    compares = compares - 1
+  }
+  if smallerLive {
+    tree[smallerSlot] = 0
+  }
+  if largerLive {
+    tree[largerSlot] = 0
+  }
+  if treeBest > best {
+    best = treeBest
+  }
+  return TreeResult { count: count, reach: reach, best: treeBest }
+}
+
+fn treeQuery(
+  state: &ZstdEncoder,
+  position: usize,
+  end: usize,
+  repeat: [u32; 3],
+  noLiterals: bool,
+  collect: bool,
+  insert: bool,
+) -> TreeQuery {
+  let mut minLength = u32.toUsize(state.minMatch)
+  if minLength < 3 {
+    minLength = 3
+  }
+  let mut hashLength = state.minMatch
+  if hashLength < 4 {
+    hashLength = 4
+  }
+  let mut sufficient = state.targetLength
+  if sufficient > OPT_NUM - 1 {
+    sufficient = OPT_NUM - 1
+  }
+  return TreeQuery {
+    position: position,
+    end: end,
+    window: state.windowSize,
+    hashLength: hashLength,
+    hashBits: state.hashLog,
+    mask: state.treeMask,
+    searches: state.searches,
+    minLength: minLength,
+    sufficient: sufficient,
+    repeat: repeat,
+    noLiterals: noLiterals,
+    collect: collect,
+    insert: insert,
+  }
+}
+
+fn runTree(state: &mut ZstdEncoder, query: TreeQuery) -> TreeResult {
+  return treeSearch(
+    List<u8>.asSlice(&state.buffer),
+    List<u32>.asMutSlice(&mut state.hashTable),
+    List<u32>.asMutSlice(&mut state.chainTable),
+    List<u32>.asMutSlice(&mut state.candidateLengths),
+    List<u32>.asMutSlice(&mut state.candidateCodes),
+    List<u32>.asMutSlice(&mut state.candidateDistances),
+    query,
+  )
+}
+
+// Inserts every position before `target` into the tree, skipping ahead inside long matches as
+// the reference `ZSTD_updateTree` does. `end` bounds the matches.
+fn updateTree(state: &mut ZstdEncoder, target: usize, end: usize) -> () {
+  let mut position = state.nextInsert
+  while position < target && position + 8 <= state.bufferEnd {
+    let repeat = state.repeat
+    let query = treeQuery(&state, position, end, repeat, false, false, true)
+    let result = runTree(&mut state, query)
+    let mut skip = result.reach - (position + 8)
+    if result.best > 384 {
+      let mut fast = result.best - 384
+      if fast > 192 {
+        fast = 192
+      }
+      if fast > skip {
+        skip = fast
+      }
+    }
+    position = position + skip
+  }
+  if position < target {
+    position = target
+  }
+  state.nextInsert = position
+}
+
+// Collects the candidate matches at `position` and returns how many there are. Inside an area
+// that a long match skipped, it searches without inserting.
+fn treeCandidates(
+  state: &mut ZstdEncoder,
+  position: usize,
+  end: usize,
+  repeat: [u32; 3],
+  noLiterals: bool,
+) -> usize {
+  updateTree(&mut state, position, end)
+  let insert = position >= state.nextInsert
+  let query = treeQuery(&state, position, end, repeat, noLiterals, true, insert)
+  let result = runTree(&mut state, query)
+  if insert {
+    state.nextInsert = result.reach - 8
+  }
+  return result.count
+}
+
+// The longest match at `position` from the tree and the repeat offsets, for `ZSTD_btlazy2`.
+fn treeBestMatch(state: &mut ZstdEncoder, position: usize, end: usize) -> Found {
+  let repeat = state.repeat
+  let count = treeCandidates(&mut state, position, end, repeat, false)
+  if count == 0 {
+    return Found { length: 0, offset: 0 }
+  }
+  let length = u32.toUsize(List<u32>.get(&state.candidateLengths, count - 1))
+  let offset = u32.toUsize(List<u32>.get(&state.candidateDistances, count - 1))
+  return Found { length: length, offset: offset }
+}
+
+// Brings the match tables up to `end` after a block that did not search every position.
+fn catchUp(state: &mut ZstdEncoder, end: usize) -> () {
+  if state.strategy <= STRATEGY_DOUBLE_FAST {
+    state.nextInsert = end
+  } else if state.strategy >= STRATEGY_BINARY_LAZY2 {
+    updateTree(&mut state, end, end)
+  } else {
+    insertUpTo(&mut state, end)
+  }
+}
+
+// Writes the matches on the cheapest path to `last` and returns the new anchor.
+fn emitPath(state: &mut ZstdEncoder, base: usize, last: usize, anchor: usize) -> usize {
+  let fractional = state.strategy >= STRATEGY_ULTRA
+
+  // Walk back from the end, linking each match to the one after it through `literals`.
+  let mut position = last
+  let mut next: usize = 0
+  let mut first: usize = 0
+  while position > 0 {
+    let node = List<OptNode>.get(&state.nodes, position)
+    if node.length == 0 {
+      position = position - 1
+      continue
+    }
+    let start = position - u32.toUsize(node.length)
+    let mut linked = node
+    linked.literals = usize.wrappingToU32(next)
+    List<OptNode>.set(&mut state.nodes, position, linked)
+    next = position
+    first = position
+    position = start
+  }
+  let mut from = anchor
+  position = first
+  while position != 0 {
+    let node = List<OptNode>.get(&state.nodes, position)
+    let length = u32.toUsize(node.length)
+    let start = base + position - length
+    let literals = start - from
+    let code = offsetCodeFor(node.distance, state.repeat, literals == 0)
+    countSequence(&mut state, from, literals, code, node.length)
+    addSequence(&mut state, from, start, length, u32.toUsize(node.distance))
+    from = start + length
+    position = u32.toUsize(node.literals)
+  }
+  setBasePrices(&mut state.prices, fractional)
+  return from
+}
+
+// The reference optimal parser: prices each way to reach the positions ahead with literals and
+// the candidate matches, then writes the cheapest path.
+fn optimalSequences(state: &mut ZstdEncoder, start: usize, end: usize) -> () {
+  rescalePrices(&mut state, start, end)
+  let strategy = state.strategy
+  let fractional = strategy >= STRATEGY_ULTRA
+  let mut minLength = u32.toUsize(state.minMatch)
+  if minLength < 3 {
+    minLength = 3
+  }
+  let mut sufficient = state.targetLength
+  if sufficient > OPT_NUM - 1 {
+    sufficient = OPT_NUM - 1
+  }
+  let mut limit: usize = 0
+  if end > start + 8 {
+    limit = end - 8
+  }
+  let mut position = start
+  let mut anchor = start
+  if position == 0 {
+    position = 1
+  }
+  while position < limit {
+    let literals = position - anchor
+    let repeat = state.repeat
+    let count = treeCandidates(&mut state, position, end, repeat, literals == 0)
+    if count == 0 {
+      position = position + 1
+      continue
+    }
+    let startNode = OptNode {
+      price: literalLengthPrice(&state.prices, usize.toU32(literals), fractional),
+      length: 0,
+      code: 0,
+      distance: 0,
+      literals: usize.toU32(literals),
+      repeat: repeat,
+    }
+    List<OptNode>.set(&mut state.nodes, 0, startNode)
+    let longest = u32.toUsize(List<u32>.get(&state.candidateLengths, count - 1))
+    let mut last: usize = 0
+
+    // A match that ends the parse early, starting at `stretchAt`, when `stretch` is not 0.
+    let mut stretch: usize = 0
+    let mut stretchAt: usize = 0
+    let mut stretchDistance: u32 = 0
+    if longest > sufficient {
+      stretch = longest
+      stretchDistance = List<u32>.get(&state.candidateDistances, count - 1)
+    } else {
+      let mut index: usize = 1
+      while index < minLength {
+        List<OptNode>.set(&mut state.nodes, index, emptyNode())
+        index = index + 1
+      }
+      let mut length = minLength
+      let mut candidate: usize = 0
+      while candidate < count {
+        let code = List<u32>.get(&state.candidateCodes, candidate)
+        let distance = List<u32>.get(&state.candidateDistances, candidate)
+        let reach = u32.toUsize(List<u32>.get(&state.candidateLengths, candidate))
+        let after = nextRepeat(repeat, code, literals == 0)
+        while length <= reach {
+          let price = startNode.price
+            + matchPrice(&state.prices, code, usize.toU32(length), strategy, fractional)
+          List<OptNode>.set(
+            &mut state.nodes,
+            length,
+            OptNode {
+              price: price,
+              length: usize.toU32(length),
+              code: code,
+              distance: distance,
+              literals: 0,
+              repeat: after,
+            },
+          )
+          length = length + 1
+        }
+        candidate = candidate + 1
+      }
+      last = length - 1
+      List<OptNode>.set(&mut state.nodes, last + 1, emptyNode())
+      let mut current: usize = 1
+      while current <= last {
+        let previous = List<OptNode>.get(&state.nodes, current - 1)
+        let mut streak: u32 = 0
+        let mut charged: i64 = 0
+        if previous.length == 0 {
+          streak = previous.literals
+          charged = literalLengthPrice(&state.prices, streak, fractional)
+        }
+        let byte = List<u8>.get(&state.buffer, position + current - 1)
+        let viaLiteral = previous.price + literalPrice(&state.prices, byte, fractional)
+          + literalLengthPrice(&state.prices, streak + 1, fractional)
+          - charged
+        let mut here = List<OptNode>.get(&state.nodes, current)
+        if viaLiteral <= here.price {
+          here = OptNode {
+            price: viaLiteral,
+            length: 0,
+            code: 0,
+            distance: 0,
+            literals: streak + 1,
+            repeat: previous.repeat,
+          }
+          List<OptNode>.set(&mut state.nodes, current, here)
+        }
+        if current == last {
+          break
+        }
+        let at = position + current
+        if at > limit {
+          current = current + 1
+          continue
+        }
+        if !fractional && List<OptNode>.get(&state.nodes, current + 1).price <= here.price + 128 {
+          current = current + 1
+          continue
+        }
+        let afterMatch = here.length != 0
+        let mut basePrice = here.price
+        if afterMatch {
+          basePrice = basePrice + literalLengthPrice(&state.prices, 0, fractional)
+        }
+        let found = treeCandidates(&mut state, at, end, here.repeat, afterMatch)
+        if found == 0 {
+          current = current + 1
+          continue
+        }
+        let farthest = u32.toUsize(List<u32>.get(&state.candidateLengths, found - 1))
+        if farthest > sufficient || current + farthest >= OPT_NUM || at + farthest >= end {
+          stretch = farthest
+          stretchAt = current
+          stretchDistance = List<u32>.get(&state.candidateDistances, found - 1)
+          break
+        }
+        let mut candidate = found
+        while candidate > 0 {
+          candidate = candidate - 1
+          let code = List<u32>.get(&state.candidateCodes, candidate)
+          let distance = List<u32>.get(&state.candidateDistances, candidate)
+          let mut shortest = minLength
+          if candidate > 0 {
+            shortest = u32.toUsize(List<u32>.get(&state.candidateLengths, candidate - 1)) + 1
+          }
+          let after = nextRepeat(here.repeat, code, afterMatch)
+          let mut length = u32.toUsize(List<u32>.get(&state.candidateLengths, candidate))
+          while length >= shortest {
+            let target = current + length
+            let price = basePrice
+              + matchPrice(&state.prices, code, usize.toU32(length), strategy, fractional)
+            if target > last || price < List<OptNode>.get(&state.nodes, target).price {
+              while last < target {
+                last = last + 1
+                List<OptNode>.set(&mut state.nodes, last, emptyNode())
+              }
+              List<OptNode>.set(
+                &mut state.nodes,
+                target,
+                OptNode {
+                  price: price,
+                  length: usize.toU32(length),
+                  code: code,
+                  distance: distance,
+                  literals: 0,
+                  repeat: after,
+                },
+              )
+            } else if !fractional {
+              break
+            }
+            length = length - 1
+          }
+        }
+        current = current + 1
+      }
+    }
+    if stretch == 0 {
+      anchor = emitPath(&mut state, position, last, anchor)
+      position = position + last
+    } else {
+      anchor = emitPath(&mut state, position, stretchAt, anchor)
+      let start = position + stretchAt
+      let literals = start - anchor
+      let code = offsetCodeFor(stretchDistance, state.repeat, literals == 0)
+      countSequence(&mut state, anchor, literals, code, usize.toU32(stretch))
+      addSequence(&mut state, anchor, start, stretch, u32.toUsize(stretchDistance))
+      setBasePrices(&mut state.prices, fractional)
+      anchor = start + stretch
+      position = anchor
+    }
+  }
+  addLiterals(&mut state, anchor, end)
+}
+
+// The longest match at `position` for the lazy strategies.
+fn lazyMatch(state: &mut ZstdEncoder, position: usize, end: usize) -> Found {
+  if state.strategy == STRATEGY_BINARY_LAZY2 {
+    return treeBestMatch(&mut state, position, end)
+  }
+  return bestMatch(&mut state, position, end)
+}
+
+// Greedy or lazy matching over hash chains, as the reference `ZSTD_greedy`, `ZSTD_lazy`, and
+// `ZSTD_lazy2` strategies.
+fn lazySequences(state: &mut ZstdEncoder, start: usize, end: usize) -> () {
+  let mut depth: u32 = 2
+  if state.strategy == STRATEGY_GREEDY {
+    depth = 0
+  } else if state.strategy == STRATEGY_LAZY {
+    depth = 1
+  }
+  let window = state.windowSize
+  let mut limit = start
+  if end > start + 8 {
+    limit = end - 8
+  }
+  let mut position = start
+  let mut anchor = start
+  if position == 0 {
+    position = 1
+  }
+  while position < limit {
+    let repeat = u32.toUsize(state.repeat[0])
+    let mut length: usize = 0
+    let mut code: u32 = 1
+    let mut distance: usize = repeat
+    let mut at = position + 1
+    if reaches(repeat, at, window) && repeatLength(&state, at, repeat, end) >= 4 {
+      length = repeatLength(&state, at, repeat, end)
+    }
+    if depth != 0 || length == 0 {
+      let found = lazyMatch(&mut state, position, end)
+      if found.length > length {
+        length = found.length
+        distance = found.offset
+        code = usize.toU32(found.offset) + 3
+        at = position
+      }
+    }
+    if length < 4 {
+      position = position + 1 + usize.shiftRight(position - anchor, 8)
+      continue
+    }
+    let mut probe = position
+    let mut steps: u32 = 0
+    while depth != 0 && probe < limit {
+      probe = probe + 1
+      steps = 1
+      let mut improved = false
+      while true {
+        if reaches(repeat, probe, window) {
+          let repeated = repeatLength(&state, probe, repeat, end)
+          let mut repeatWeight: i64 = 3
+          let mut bonus: i64 = 1
+          if steps == 2 {
+            repeatWeight = 4
+          }
+          let current = usize.toI64(length) * repeatWeight - u32.toI64(highBit(code)) + bonus
+          if repeated >= 4 && usize.toI64(repeated) * repeatWeight > current {
+            length = repeated
+            code = 1
+            distance = repeat
+            at = probe
+          }
+        }
+        let found = lazyMatch(&mut state, probe, end)
+        let mut margin: i64 = 4
+        if steps == 2 {
+          margin = 7
+        }
+        let candidateGain = usize.toI64(found.length) * 4
+          - u32.toI64(highBit(usize.toU32(found.offset) + 3))
+        let currentGain = usize.toI64(length) * 4 - u32.toI64(highBit(code)) + margin
+        if found.length >= 4 && candidateGain > currentGain {
+          length = found.length
+          distance = found.offset
+          code = usize.toU32(found.offset) + 3
+          at = probe
+          improved = true
+          break
+        }
+        if depth == 2 && steps == 1 && probe < limit {
+          probe = probe + 1
+          steps = 2
+          continue
+        }
+        break
+      }
+      if !improved {
+        break
+      }
+    }
+    if code > 3 {
+      let back = extendBackward(List<u8>.asSlice(&state.buffer), at, at - distance, anchor)
+      at = at - back
+      length = length + back
+    }
+    addSequence(&mut state, anchor, at, length, distance)
+    position = repeatRuns(&mut state, at + length, end, TABLES_NONE)
+    anchor = position
+  }
+  catchUp(&mut state, end)
+  addLiterals(&mut state, anchor, end)
+}
+
+// The length of the match at `position` with `distance`, or 0 if its first 4 bytes differ.
+fn repeatLength(state: &ZstdEncoder, position: usize, distance: usize, end: usize) -> usize {
+  let buffer = List<u8>.asSlice(&state.buffer)
+  if position + 4 > end || load32(buffer, position - distance) != load32(buffer, position) {
+    return 0
+  }
+  return 4 + commonLength(buffer, position - distance + 4, position + 4, end - position - 4)
+}
+
+fn addLiterals(state: &mut ZstdEncoder, from: usize, to: usize) -> () {
+  let count = to - from
+  if count == 0 {
+    return ()
+  }
+  let source = Slice.view<u8>(List<u8>.asSlice(&state.buffer), from, count)
+  Slice.copyInto<u8>(List<u8>.asMutSlice(&mut state.literals), state.literalCount, source)
+  state.literalCount = state.literalCount + count
+}
+
+// Records literals from `anchor` to `position` and a match, choosing a repeat-offset code when it
+// applies and updating the repeat offsets as the decoder will.
+fn addSequence(
+  state: &mut ZstdEncoder,
+  anchor: usize,
+  position: usize,
+  length: usize,
+  offset: usize,
+) -> () {
+  addLiterals(&mut state, anchor, position)
+  let literalLength = position - anchor
+  let distance = usize.toU32(offset)
+  let rep0 = state.repeat[0]
+  let rep1 = state.repeat[1]
+  let rep2 = state.repeat[2]
+  let mut value = distance + 3
+  if literalLength != 0 {
+    if distance == rep0 {
+      value = 1
+    } else if distance == rep1 {
+      value = 2
+      state.repeat = [rep1, rep0, rep2]
+    } else if distance == rep2 {
+      value = 3
+      state.repeat = [rep2, rep0, rep1]
+    } else {
+      state.repeat = [distance, rep0, rep1]
+    }
+  } else {
+    if distance == rep1 {
+      value = 1
+      state.repeat = [rep1, rep0, rep2]
+    } else if distance == rep2 {
+      value = 2
+      state.repeat = [rep2, rep0, rep1]
+    } else if rep0 > 1 && distance == rep0 - 1 {
+      value = 3
+      state.repeat = [distance, rep0, rep1]
+    } else {
+      state.repeat = [distance, rep0, rep1]
+    }
+  }
+  let index = state.sequenceCount
+  List<u32>.set(&mut state.sequenceLiteral, index, usize.toU32(literalLength))
+  List<u32>.set(&mut state.sequenceMatch, index, usize.toU32(length))
+  List<u32>.set(&mut state.sequenceOffset, index, value)
+  state.sequenceCount = index + 1
+}
+
+fn blockHeader(state: &mut ZstdEncoder, last: bool, kind: u32, size: usize) -> () {
+  let mut value = u32.shiftLeft(kind, 1) | u32.shiftLeft(usize.toU32(size), 3)
+  if last {
+    value = value | 1
+  }
+  putLittle(&mut state, value, 3)
+}
+
+// Compresses `size` buffered bytes as one block: RLE if they are one byte, compressed if that is
+// smaller, raw otherwise.
+fn compressBlock(state: &mut ZstdEncoder, size: usize, last: bool) -> () {
+  let start = state.compressedEnd
+  let end = start + size
+  state.compressedEnd = end
+  if last {
+    state.wroteLast = true
+  }
+  if size == 0 {
+    blockHeader(&mut state, last, 0, 0)
+    return ()
+  }
+  let buffer = List<u8>.asSlice(&state.buffer)
+  let first = buffer[start]
+  let mut same = true
+  let mut index = start + 1
+  while index < end {
+    if buffer[index] != first {
+      same = false
+      break
+    }
+    index = index + 1
+  }
+  if same && size > 1 {
+    catchUp(&mut state, end)
+    blockHeader(&mut state, last, 1, size)
+    putByte(&mut state, first)
+    return ()
+  }
+  let saved = state.repeat
+  findSequences(&mut state, start, end)
+  state.stageLength = 0
+  state.stageFull = false
+  encodeLiterals(&mut state)
+  encodeSequences(&mut state)
+  if !state.stageFull && state.stageLength < size {
+    let length = state.stageLength
+    blockHeader(&mut state, last, 2, length)
+    let source = Slice.view<u8>(List<u8>.asSlice(&state.stage), 0, length)
+    let target = state.pendingLength
+    Slice.copyInto<u8>(List<u8>.asMutSlice(&mut state.pending), target, source)
+    state.pendingLength = target + length
+    return ()
+  }
+  state.repeat = saved
+  blockHeader(&mut state, last, 0, size)
+  let source = Slice.view<u8>(List<u8>.asSlice(&state.buffer), start, size)
+  let target = state.pendingLength
+  Slice.copyInto<u8>(List<u8>.asMutSlice(&mut state.pending), target, source)
+  state.pendingLength = target + size
+}
+
+fn stageByte(state: &mut ZstdEncoder, value: u8) -> () {
+  let position = state.stageLength
+  if position == List<u8>.length(&state.stage) {
+    state.stageFull = true
+    return ()
+  }
+  List<u8>.set(&mut state.stage, position, value)
+  state.stageLength = position + 1
+}
+
+fn stageLittle(state: &mut ZstdEncoder, value: u32, count: u32) -> () {
+  let mut index: u32 = 0
+  while index < count {
+    stageByte(&mut state, u32.toU8(u32.shiftRight(value, index * 8) & 255))
+    index = index + 1
+  }
+}
+
+fn stagePatch(state: &mut ZstdEncoder, position: usize, value: u32, count: u32) -> () {
+  let mut index: u32 = 0
+  while index < count {
+    let slot = position + u32.toUsize(index)
+    if slot < state.stageLength {
+      List<u8>.set(&mut state.stage, slot, u32.toU8(u32.shiftRight(value, index * 8) & 255))
+    }
+    index = index + 1
+  }
+}
+
+// A forward bit writer into the stage, read backward by the decoder. It holds up to 63 bits and
+// writes whole bytes 8 at a time.
+@inlineAlways
+fn addBits(state: &mut ZstdEncoder, value: u32, count: u32) -> () {
+  let masked = u32.toU64(value) & (u64.shiftLeft(1, u32.toU64(count)) - 1)
+  state.bitBuffer = state.bitBuffer | u64.shiftLeft(masked, u32.toU64(state.bitCount))
+  state.bitCount = state.bitCount + count
+  if state.bitCount >= 32 {
+    flushBits(&mut state)
+  }
+}
+
+// Moves the whole bytes of the bit buffer to the stage.
+@inlineAlways
+fn flushBits(state: &mut ZstdEncoder) -> () {
+  let bytes = u32.shiftRight(state.bitCount, 3)
+  let position = state.stageLength
+  if position + 8 > List<u8>.length(&state.stage) {
+    state.stageFull = true
+  } else {
+    store64(&mut state.stage, position, state.bitBuffer)
+    state.stageLength = position + u32.toUsize(bytes)
+  }
+  let used = u32.shiftLeft(bytes, 3)
+  if used == 64 {
+    state.bitBuffer = 0
+  } else {
+    state.bitBuffer = u64.shiftRight(state.bitBuffer, u32.toU64(used))
+  }
+  state.bitCount = state.bitCount - used
+}
+
+// Ends a backward bit stream with its 1 marker bit and the padding of its last byte.
+fn closeBits(state: &mut ZstdEncoder) -> () {
+  addBits(&mut state, 1, 1)
+  state.bitCount = u32.shiftLeft(u32.shiftRight(state.bitCount + 7, 3), 3)
+  flushBits(&mut state)
+  state.bitBuffer = 0
+  state.bitCount = 0
+}
+
+// Writes `value` as 8 little-endian bytes at `at`, with one bounds check.
+@inlineAlways
+fn store64(buffer: &mut List<u8>, at: usize, value: u64) -> () {
+  let bytes = Slice.viewMut<u8>(List<u8>.asMutSlice(&mut buffer), at, 8)
+  bytes[0] = u64.wrappingToU8(value)
+  bytes[1] = u64.wrappingToU8(u64.shiftRight(value, 8))
+  bytes[2] = u64.wrappingToU8(u64.shiftRight(value, 16))
+  bytes[3] = u64.wrappingToU8(u64.shiftRight(value, 24))
+  bytes[4] = u64.wrappingToU8(u64.shiftRight(value, 32))
+  bytes[5] = u64.wrappingToU8(u64.shiftRight(value, 40))
+  bytes[6] = u64.wrappingToU8(u64.shiftRight(value, 48))
+  bytes[7] = u64.wrappingToU8(u64.shiftRight(value, 56))
+}
+
+// Approximate base-2 logarithm in 1/256 bits, with a linear mantissa.
+fn log2Fixed(value: u32) -> i64 {
+  let bits = highBit(value)
+  let scaled = u64.shiftRight(u64.shiftLeft(u32.toU64(value), 8), u32.toU64(bits))
+  return u32.toI64(bits) * 256 + u64.toI64(scaled) - 256
+}
+
+// The cost in 1/256 bits of a symbol with normalized count `count` in a table of `log` bits.
+fn symbolCost(count: i64, log: u32) -> i64 {
+  let mut probability = count
+  if probability < 1 {
+    probability = 1
+  }
+  return u32.toI64(log) * 256 - log2Fixed(i64.toU32(probability))
+}
+
+fn optimalLog(maxLog: u32, total: usize, maxSymbol: usize) -> u32 {
+  let totalValue = usize.toU32(total)
+  let mut maxBitsSource: i64 = 0
+  if totalValue > 1 {
+    maxBitsSource = u32.toI64(highBit(totalValue - 1)) - 2
+  }
+  let minBitsSource = highBit(totalValue) + 1
+  let mut minBitsSymbols: u32 = 2
+  if maxSymbol > 0 {
+    minBitsSymbols = highBit(usize.toU32(maxSymbol)) + 2
+  }
+  let mut minBits = minBitsSource
+  if minBitsSymbols < minBits {
+    minBits = minBitsSymbols
+  }
+  let mut log = u32.toI64(maxLog)
+  if maxBitsSource < log {
+    log = maxBitsSource
+  }
+  if u32.toI64(minBits) > log {
+    log = u32.toI64(minBits)
+  }
+  if log < 5 {
+    log = 5
+  }
+  if log > u32.toI64(maxLog) {
+    log = u32.toI64(maxLog)
+  }
+  return i64.toU32(log)
+}
+
+// Rounding thresholds for small probabilities, from the reference `FSE_normalizeCount`.
+const ROUND_THRESHOLDS: [u64; 8] = [0, 473195, 504333, 520860, 550000, 700000, 750000, 830000]
+
+// Scales `counts` to sum to 2^log as the reference `FSE_normalizeCount` does. With `lowProbability`,
+// a rare symbol gets the "less than one" probability -1.
+fn normalize(
+  counts: &[u32; 64],
+  maxSymbol: usize,
+  total: usize,
+  log: u32,
+  lowProbability: bool,
+  normalized: &mut [i64; 64],
+) -> () {
+  let mut low: i64 = 1
+  if lowProbability {
+    low = -1
+  }
+  let scale = u32.toU64(62 - log)
+  let step = u64.divide(u64.shiftLeft(1, 62), usize.toU64(total))
+  let roundStep = u64.shiftLeft(1, scale - 20)
+  let mut remaining = usize.toI64(usize.shiftLeft(1, u32.toUsize(log)))
+  let lowThreshold = usize.toU64(usize.shiftRight(total, u32.toUsize(log)))
+  let mut largest: usize = 0
+  let mut largestShare: i64 = 0
+  let mut symbol: usize = 0
+  while symbol <= maxSymbol {
+    let count = u32.toU64(counts[symbol])
+    if count == 0 {
+      normalized[symbol] = 0
+    } else if count <= lowThreshold {
+      normalized[symbol] = low
+      remaining = remaining - 1
+    } else {
+      let scaled = count * step
+      let mut share = u64.toI64(u64.shiftRight(scaled, scale))
+      if share < 8 {
+        let beat = roundStep * ROUND_THRESHOLDS[i64.toUsize(share)]
+        if scaled - u64.shiftLeft(i64.toU64(share), scale) > beat {
+          share = share + 1
+        }
+      }
+      if share > largestShare {
+        largestShare = share
+        largest = symbol
+      }
+      normalized[symbol] = share
+      remaining = remaining - share
+    }
+    symbol = symbol + 1
+  }
+  if 0 - remaining >= i64.shiftRight(normalized[largest], 1) {
+    normalizeSlowly(counts, maxSymbol, total, log, low, &mut normalized)
+  } else {
+    normalized[largest] = normalized[largest] + remaining
+  }
+}
+
+// The reference `FSE_normalizeM2`, for distributions where rounding takes too much from the
+// largest symbol.
+fn normalizeSlowly(
+  counts: &[u32; 64],
+  maxSymbol: usize,
+  total: usize,
+  log: u32,
+  low: i64,
+  normalized: &mut [i64; 64],
+) -> () {
+  let unassigned: i64 = -2
+  let mut distributed: u64 = 0
+  let mut left = usize.toU64(total)
+  let lowThreshold = usize.toU64(usize.shiftRight(total, u32.toUsize(log)))
+  let mut lowOne = usize.toU64(usize.shiftRight(total * 3, u32.toUsize(log + 1)))
+  let mut symbol: usize = 0
+  while symbol <= maxSymbol {
+    let count = u32.toU64(counts[symbol])
+    if count == 0 {
+      normalized[symbol] = 0
+    } else if count <= lowThreshold {
+      normalized[symbol] = low
+      distributed = distributed + 1
+      left = left - count
+    } else if count <= lowOne {
+      normalized[symbol] = 1
+      distributed = distributed + 1
+      left = left - count
+    } else {
+      normalized[symbol] = unassigned
+    }
+    symbol = symbol + 1
+  }
+  let size = u64.shiftLeft(1, u32.toU64(log))
+  let mut toDistribute = size - distributed
+  if toDistribute == 0 {
+    return ()
+  }
+  if u64.divide(left, toDistribute) > lowOne {
+    lowOne = u64.divide(left * 3, toDistribute * 2)
+    symbol = 0
+    while symbol <= maxSymbol {
+      let count = u32.toU64(counts[symbol])
+      if normalized[symbol] == unassigned && count <= lowOne {
+        normalized[symbol] = 1
+        distributed = distributed + 1
+        left = left - count
+      }
+      symbol = symbol + 1
+    }
+    toDistribute = size - distributed
+  }
+  if distributed == usize.toU64(maxSymbol + 1) {
+    let mut most: usize = 0
+    symbol = 0
+    while symbol <= maxSymbol {
+      if counts[symbol] > counts[most] {
+        most = symbol
+      }
+      symbol = symbol + 1
+    }
+    normalized[most] = normalized[most] + u64.toI64(toDistribute)
+    return ()
+  }
+  if left == 0 {
+    symbol = 0
+    while toDistribute > 0 {
+      if normalized[symbol] > 0 {
+        toDistribute = toDistribute - 1
+        normalized[symbol] = normalized[symbol] + 1
+      }
+      symbol = usize.remainder(symbol + 1, maxSymbol + 1)
+    }
+    return ()
+  }
+  let stepLog = u32.toU64(62 - log)
+  let middle = u64.shiftLeft(1, stepLog - 1) - 1
+  let ratio = u64.divide(u64.shiftLeft(1, stepLog) * toDistribute + middle, left)
+  let mut running = middle
+  symbol = 0
+  while symbol <= maxSymbol {
+    if normalized[symbol] == unassigned {
+      let finish = running + u32.toU64(counts[symbol]) * ratio
+      let weight = u64.shiftRight(finish, stepLog) - u64.shiftRight(running, stepLog)
+      normalized[symbol] = u64.toI64(weight)
+      running = finish
+    }
+    symbol = symbol + 1
+  }
+}
+
+fn buildTable(table: &mut FseTable, normalized: &[i64; 64], maxSymbol: usize, log: u32) -> () {
+  let size = usize.shiftLeft(1, u32.toUsize(log))
+  let mask = size - 1
+  let step = size / 2 + size / 8 + 3
+  let mut high = size - 1
+  let mut cumulative: [usize; 65] = [0; 65]
+  let mut spread: [u8; 512] = [0; 512]
+  let mut symbol: usize = 0
+  while symbol <= maxSymbol {
+    if normalized[symbol] == -1 {
+      cumulative[symbol + 1] = cumulative[symbol] + 1
+      spread[high] = usize.toU8(symbol)
+      high = high - 1
+    } else {
+      cumulative[symbol + 1] = cumulative[symbol] + i64.toUsize(normalized[symbol])
+    }
+    symbol = symbol + 1
+  }
+  let mut position: usize = 0
+  symbol = 0
+  while symbol <= maxSymbol {
+    let mut occurrence: i64 = 0
+    while occurrence < normalized[symbol] {
+      spread[position] = usize.toU8(symbol)
+      position = (position + step) & mask
+      while position > high {
+        position = (position + step) & mask
+      }
+      occurrence = occurrence + 1
+    }
+    symbol = symbol + 1
+  }
+  let mut index: usize = 0
+  while index < size {
+    let owner = u8.toUsize(spread[index])
+    table.state[cumulative[owner]] = usize.toU32(size + index)
+    cumulative[owner] = cumulative[owner] + 1
+    index = index + 1
+  }
+  let sizeValue = usize.toU32(size)
+  let mut total: i64 = 0
+  symbol = 0
+  while symbol <= maxSymbol {
+    let count = normalized[symbol]
+    if count == 0 {
+      table.deltaBits[symbol] = u32.shiftLeft(log + 1, 16) - sizeValue
+    } else if count == -1 || count == 1 {
+      table.deltaBits[symbol] = u32.shiftLeft(log, 16) - sizeValue
+      table.deltaFind[symbol] = total - 1
+      total = total + 1
+    } else {
+      let countValue = i64.toU32(count)
+      let maxBitsOut = log - highBit(countValue - 1)
+      let minStatePlus = u32.shiftLeft(countValue, maxBitsOut)
+      table.deltaBits[symbol] = u32.shiftLeft(maxBitsOut, 16) - minStatePlus
+      table.deltaFind[symbol] = total - count
+      total = total + count
+    }
+    symbol = symbol + 1
+  }
+  table.log = log
+  table.rle = false
+}
+
+fn initialState(table: &FseTable, symbol: usize) -> u32 {
+  let bits = u32.shiftRight(table.deltaBits[symbol] + 32768, 16)
+  let value = u32.shiftLeft(bits, 16) - table.deltaBits[symbol]
+  let slot = u32.toI64(u32.shiftRight(value, bits)) + table.deltaFind[symbol]
+  return table.state[i64.toUsize(slot)]
+}
+
+// Writes the bits of one symbol for an FSE state and returns the next state.
+@inlineAlways
+fn encodeSymbol(state: &mut ZstdEncoder, kind: u32, value: u32, symbol: usize) -> u32 {
+  let mut deltaBits: u32 = 0
+  let mut deltaFind: i64 = 0
+  if kind == 0 {
+    deltaBits = state.literalTable.deltaBits[symbol]
+    deltaFind = state.literalTable.deltaFind[symbol]
+  } else if kind == 1 {
+    deltaBits = state.offsetTable.deltaBits[symbol]
+    deltaFind = state.offsetTable.deltaFind[symbol]
+  } else {
+    deltaBits = state.matchTable.deltaBits[symbol]
+    deltaFind = state.matchTable.deltaFind[symbol]
+  }
+  let bits = u32.shiftRight(value + deltaBits, 16)
+  addBits(&mut state, value, bits)
+  let slot = i64.toUsize(u32.toI64(u32.shiftRight(value, bits)) + deltaFind)
+  if kind == 0 {
+    return state.literalTable.state[slot]
+  }
+  if kind == 1 {
+    return state.offsetTable.state[slot]
+  }
+  return state.matchTable.state[slot]
+}
+
+// Writes a normalized distribution as an FSE table description, as FSE_writeNCount does.
+fn writeDistribution(
+  state: &mut ZstdEncoder,
+  normalized: &[i64; 64],
+  maxSymbol: usize,
+  log: u32,
+) -> () {
+  let size = i64.shiftLeft(1, u32.toI64(log))
+  let mut bits: u64 = u32.toU64(log - 5)
+  let mut count: u32 = 4
+  let mut remaining = size + 1
+  let mut threshold = size
+  let mut width = log + 1
+  let mut symbol: usize = 0
+  let mut previousZero = false
+  while symbol <= maxSymbol && remaining > 1 {
+    if previousZero {
+      let mut start = symbol
+      while symbol <= maxSymbol && normalized[symbol] == 0 {
+        symbol = symbol + 1
+      }
+      if symbol > maxSymbol {
+        break
+      }
+      while symbol >= start + 24 {
+        start = start + 24
+        bits = bits + u64.shiftLeft(0xffff, u32.toU64(count))
+        stageByte(&mut state, u64.toU8(bits & 255))
+        stageByte(&mut state, u64.toU8(u64.shiftRight(bits, 8) & 255))
+        bits = u64.shiftRight(bits, 16)
+      }
+      while symbol >= start + 3 {
+        start = start + 3
+        bits = bits + u64.shiftLeft(3, u32.toU64(count))
+        count = count + 2
+      }
+      bits = bits + u64.shiftLeft(usize.toU64(symbol - start), u32.toU64(count))
+      count = count + 2
+      if count > 16 {
+        stageByte(&mut state, u64.toU8(bits & 255))
+        stageByte(&mut state, u64.toU8(u64.shiftRight(bits, 8) & 255))
+        bits = u64.shiftRight(bits, 16)
+        count = count - 16
+      }
+    }
+    let mut value = normalized[symbol]
+    symbol = symbol + 1
+    let most = 2 * threshold - 1 - remaining
+    if value < 0 {
+      remaining = remaining + value
+    } else {
+      remaining = remaining - value
+    }
+    value = value + 1
+    if value >= threshold {
+      value = value + most
+    }
+    bits = bits + u64.shiftLeft(i64.toU64(value), u32.toU64(count))
+    count = count + width
+    if value < most {
+      count = count - 1
+    }
+    previousZero = value == 1
+    while remaining < threshold {
+      width = width - 1
+      threshold = i64.shiftRight(threshold, 1)
+    }
+    if count > 16 {
+      stageByte(&mut state, u64.toU8(bits & 255))
+      stageByte(&mut state, u64.toU8(u64.shiftRight(bits, 8) & 255))
+      bits = u64.shiftRight(bits, 16)
+      count = count - 16
+    }
+  }
+  let mut emitted: u32 = 0
+  while emitted < (count + 7) / 8 {
+    stageByte(&mut state, u64.toU8(bits & 255))
+    bits = u64.shiftRight(bits, 8)
+    emitted = emitted + 1
+  }
+}
+
+// Computes Huffman code lengths of at most 11 bits for the literal counts into `huffmanBits`,
+// with a complete code, and returns the longest length.
+fn buildHuffman(state: &mut ZstdEncoder, counts: &[u32; 256], maxSymbol: usize) -> u32 {
+  let mut order: [u32; 256] = [0; 256]
+  let mut present: usize = 0
+  let mut symbol: usize = 0
+  while symbol <= maxSymbol {
+    state.huffmanBits[symbol] = 0
+    if counts[symbol] != 0 {
+      // Insertion sort by count, then by symbol.
+      let mut slot = present
+      while slot > 0 && counts[u32.toUsize(order[slot - 1])] > counts[symbol] {
+        order[slot] = order[slot - 1]
+        slot = slot - 1
+      }
+      order[slot] = usize.toU32(symbol)
+      present = present + 1
+    }
+    symbol = symbol + 1
+  }
+  let mut weight: [u64; 512] = [0; 512]
+  let mut parent: [u32; 512] = [0; 512]
+  let mut depth: [u32; 512] = [0; 512]
+  let mut index: usize = 0
+  while index < present {
+    weight[index] = u32.toU64(counts[u32.toUsize(order[index])])
+    index = index + 1
+  }
+  let mut leaf: usize = 0
+  let mut inner = present
+  let mut next = present
+  while next < 2 * present - 1 {
+    let mut pair: [usize; 2] = [0, 0]
+    let mut pick: usize = 0
+    while pick < 2 {
+      if leaf < present && (inner >= next || weight[leaf] <= weight[inner]) {
+        pair[pick] = leaf
+        leaf = leaf + 1
+      } else {
+        pair[pick] = inner
+        inner = inner + 1
+      }
+      pick = pick + 1
+    }
+    weight[next] = weight[pair[0]] + weight[pair[1]]
+    parent[pair[0]] = usize.toU32(next)
+    parent[pair[1]] = usize.toU32(next)
+    next = next + 1
+  }
+  let root = 2 * present - 2
+  depth[root] = 0
+  index = root
+  while index > 0 {
+    index = index - 1
+    depth[index] = depth[u32.toUsize(parent[index])] + 1
+  }
+  let limit: u32 = 11
+  let mut longest: u32 = 0
+  index = 0
+  while index < present {
+    if depth[index] > longest {
+      longest = depth[index]
+    }
+    index = index + 1
+  }
+  if longest > limit {
+    // Clamp, then repay the Kraft excess by lengthening the rarest short codes, then fill any
+    // deficit by shortening the longest codes, so that the code stays complete.
+    let mut excess: i64 = 0 - i64.shiftLeft(1, u32.toI64(limit))
+    index = 0
+    while index < present {
+      if depth[index] > limit {
+        depth[index] = limit
+      }
+      excess = excess + i64.shiftLeft(1, u32.toI64(limit - depth[index]))
+      index = index + 1
+    }
+    while excess > 0 {
+      let mut target = limit - 1
+      let mut done = false
+      while target >= 1 && !done {
+        index = 0
+        while index < present {
+          if depth[index] == target {
+            depth[index] = target + 1
+            excess = excess - i64.shiftLeft(1, u32.toI64(limit - target - 1))
+            done = true
+            break
+          }
+          index = index + 1
+        }
+        target = target - 1
+      }
+    }
+    while excess < 0 {
+      let mut chosen = present
+      index = present
+      while index > 0 {
+        index = index - 1
+        let gainValue = i64.shiftLeft(1, u32.toI64(limit - depth[index]))
+        if depth[index] > 1 && gainValue <= 0 - excess
+          && (chosen == present || depth[index] > depth[chosen]) {
+          chosen = index
+        }
+      }
+      excess = excess + i64.shiftLeft(1, u32.toI64(limit - depth[chosen]))
+      depth[chosen] = depth[chosen] - 1
+    }
+    longest = 0
+    index = 0
+    while index < present {
+      if depth[index] > longest {
+        longest = depth[index]
+      }
+      index = index + 1
+    }
+  }
+  index = 0
+  while index < present {
+    state.huffmanBits[u32.toUsize(order[index])] = depth[index]
+    index = index + 1
+  }
+
+  // Canonical codes: lower weights (longer codes) first, by symbol within a weight.
+  let mut perWeight: [u32; 13] = [0; 13]
+  symbol = 0
+  while symbol <= maxSymbol {
+    let bits = state.huffmanBits[symbol]
+    if bits != 0 {
+      let weightValue = u32.toUsize(longest + 1 - bits)
+      perWeight[weightValue] = perWeight[weightValue] + 1
+    }
+    symbol = symbol + 1
+  }
+  let mut start: [u32; 13] = [0; 13]
+  let mut current: u32 = 0
+  let mut level: usize = 1
+  while level <= u32.toUsize(longest) {
+    start[level] = current
+    current = u32.shiftRight(current + perWeight[level], 1)
+    level = level + 1
+  }
+  symbol = 0
+  while symbol <= maxSymbol {
+    let bits = state.huffmanBits[symbol]
+    if bits != 0 {
+      let weightValue = u32.toUsize(longest + 1 - bits)
+      state.huffmanCode[symbol] = start[weightValue]
+      start[weightValue] = start[weightValue] + 1
+    }
+    symbol = symbol + 1
+  }
+  return longest
+}
+
+// Writes the Huffman weights of symbols below `maxSymbol` with FSE and two interleaved states.
+// Returns false, with the stage unchanged, if that is not possible in 127 bytes.
+fn writeWeightsFse(
+  state: &mut ZstdEncoder,
+  weights: &[u32; 256],
+  count: usize,
+  longest: u32,
+) -> bool {
+  let begin = state.stageLength
+  let mut counts: [u32; 64] = [0; 64]
+  let mut maxWeight: usize = 0
+  let mut index: usize = 0
+  while index < count {
+    let weightValue = u32.toUsize(weights[index])
+    counts[weightValue] = counts[weightValue] + 1
+    if weightValue > maxWeight {
+      maxWeight = weightValue
+    }
+    index = index + 1
+  }
+  let mut distinct: usize = 0
+  index = 0
+  while index <= maxWeight {
+    if counts[index] != 0 {
+      distinct = distinct + 1
+    }
+    index = index + 1
+  }
+  if count <= 2 || distinct < 2 {
+    return false
+  }
+  let log = optimalLog(6, count, maxWeight)
+  let mut normalized: [i64; 64] = [0; 64]
+  normalize(&counts, maxWeight, count, log, false, &mut normalized)
+  buildTable(&mut state.literalTable, &normalized, maxWeight, log)
+  stageByte(&mut state, 0)
+  writeDistribution(&mut state, &normalized, maxWeight, log)
+  state.bitBuffer = 0
+  state.bitCount = 0
+  let mut position = count
+  let mut first: u32 = 0
+  let mut second: u32 = 0
+  if usize.remainder(count, 2) == 1 {
+    first = initialState(&state.literalTable, u32.toUsize(weights[position - 1]))
+    second = initialState(&state.literalTable, u32.toUsize(weights[position - 2]))
+    first = encodeSymbol(&mut state, 0, first, u32.toUsize(weights[position - 3]))
+    position = position - 3
+  } else {
+    second = initialState(&state.literalTable, u32.toUsize(weights[position - 1]))
+    first = initialState(&state.literalTable, u32.toUsize(weights[position - 2]))
+    position = position - 2
+  }
+  while position >= 2 {
+    second = encodeSymbol(&mut state, 0, second, u32.toUsize(weights[position - 1]))
+    first = encodeSymbol(&mut state, 0, first, u32.toUsize(weights[position - 2]))
+    position = position - 2
+  }
+  addBits(&mut state, second, log)
+  addBits(&mut state, first, log)
+  closeBits(&mut state)
+  let size = state.stageLength - begin - 1
+  if state.stageFull || size >= 128 {
+    state.stageLength = begin
+    state.stageFull = false
+    return false
+  }
+  List<u8>.set(&mut state.stage, begin, usize.toU8(size))
+  return true
+}
+
+fn writeHuffmanStream(state: &mut ZstdEncoder, from: usize, to: usize) -> () {
+  let mut bits: u64 = 0
+  let mut count: u32 = 0
+  let mut position = state.stageLength
+  let mut full = state.stageFull
+  let limit = List<u8>.length(&state.stage) - 8
+  let literals = List<u8>.asSlice(&state.literals)
+  let mut index = to
+  while index > from {
+    index = index - 1
+    let symbol = u8.toUsize(literals[index])
+    bits = bits | u64.shiftLeft(u32.toU64(state.huffmanCode[symbol]), u32.toU64(count))
+    count = count + state.huffmanBits[symbol]
+    if count >= 32 {
+      if position > limit {
+        full = true
+      } else {
+        store64(&mut state.stage, position, bits)
+      }
+      let bytes = u32.shiftRight(count, 3)
+      position = position + u32.toUsize(bytes)
+      bits = u64.shiftRight(bits, u32.toU64(u32.shiftLeft(bytes, 3)))
+      count = count - u32.shiftLeft(bytes, 3)
+    }
+  }
+  if position > limit {
+    full = true
+    position = limit
+  }
+  state.stageLength = position
+  state.stageFull = full
+  state.bitBuffer = bits
+  state.bitCount = count
+  closeBits(&mut state)
+}
+
+fn literalHeader(state: &mut ZstdEncoder, kind: u32, size: usize) -> () {
+  let value = usize.toU32(size)
+  if size < 32 {
+    stageByte(&mut state, u32.toU8(kind | u32.shiftLeft(value, 3)))
+  } else if size < 4096 {
+    stageLittle(&mut state, kind | 4 | u32.shiftLeft(value, 4), 2)
+  } else {
+    stageLittle(&mut state, kind | 12 | u32.shiftLeft(value, 4), 3)
+  }
+}
+
+fn rawLiterals(state: &mut ZstdEncoder) -> () {
+  let count = state.literalCount
+  literalHeader(&mut state, 0, count)
+  let mut index: usize = 0
+  while index < count {
+    let byte = List<u8>.get(&state.literals, index)
+    stageByte(&mut state, byte)
+    index = index + 1
+  }
+}
+
+// Writes the literals section: raw, RLE, or Huffman-coded with one or four streams, whichever
+// is smallest.
+fn encodeLiterals(state: &mut ZstdEncoder) -> () {
+  let count = state.literalCount
+  let mut counts: [u32; 256] = [0; 256]
+  let mut maxSymbol: usize = 0
+  let mut index: usize = 0
+  while index < count {
+    let symbol = u8.toUsize(List<u8>.get(&state.literals, index))
+    counts[symbol] = counts[symbol] + 1
+    if symbol > maxSymbol {
+      maxSymbol = symbol
+    }
+    index = index + 1
+  }
+  let mut distinct: usize = 0
+  index = 0
+  while index <= maxSymbol {
+    if counts[index] != 0 {
+      distinct = distinct + 1
+    }
+    index = index + 1
+  }
+  if count == 0 || count < 64 && distinct > 1 {
+    rawLiterals(&mut state)
+    return ()
+  }
+  if distinct == 1 {
+    literalHeader(&mut state, 1, count)
+    let byte = List<u8>.get(&state.literals, 0)
+    stageByte(&mut state, byte)
+    return ()
+  }
+  let longest = buildHuffman(&mut state, &counts, maxSymbol)
+  let mut weights: [u32; 256] = [0; 256]
+  index = 0
+  while index < maxSymbol {
+    if state.huffmanBits[index] != 0 {
+      weights[index] = longest + 1 - state.huffmanBits[index]
+    }
+    index = index + 1
+  }
+  let begin = state.stageLength
+  let fourStreams = count > 1023
+  let mut headerSize: usize = 3
+  if count > 16383 {
+    headerSize = 5
+  } else if count > 1023 {
+    headerSize = 4
+  }
+  index = 0
+  while index < headerSize {
+    stageByte(&mut state, 0)
+    index = index + 1
+  }
+  let treeStart = state.stageLength
+  if !writeWeightsFse(&mut state, &weights, maxSymbol, longest) {
+    if maxSymbol > 128 {
+      state.stageLength = begin
+      rawLiterals(&mut state)
+      return ()
+    }
+    stageByte(&mut state, usize.toU8(127 + maxSymbol))
+    index = 0
+    while index < maxSymbol {
+      let high = u32.shiftLeft(weights[index], 4)
+      let mut low: u32 = 0
+      if index + 1 < maxSymbol {
+        low = weights[index + 1]
+      }
+      stageByte(&mut state, u32.toU8(high | low))
+      index = index + 2
+    }
+  } else {
+    let fseSize = state.stageLength - treeStart
+    if maxSymbol <= 128 && 1 + (maxSymbol + 1) / 2 < fseSize {
+      state.stageLength = treeStart
+      stageByte(&mut state, usize.toU8(127 + maxSymbol))
+      index = 0
+      while index < maxSymbol {
+        let high = u32.shiftLeft(weights[index], 4)
+        let mut low: u32 = 0
+        if index + 1 < maxSymbol {
+          low = weights[index + 1]
+        }
+        stageByte(&mut state, u32.toU8(high | low))
+        index = index + 2
+      }
+    }
+  }
+  if fourStreams {
+    let segment = (count + 3) / 4
+    let jump = state.stageLength
+    stageLittle(&mut state, 0, 4)
+    stageLittle(&mut state, 0, 2)
+    let mut sizes: [usize; 3] = [0, 0, 0]
+    let mut stream: usize = 0
+    while stream < 4 {
+      let from = stream * segment
+      let mut to = from + segment
+      if stream == 3 || to > count {
+        to = count
+      }
+      let streamStart = state.stageLength
+      writeHuffmanStream(&mut state, from, to)
+      if stream < 3 {
+        sizes[stream] = state.stageLength - streamStart
+      }
+      stream = stream + 1
+    }
+    if sizes[0] > 65535 || sizes[1] > 65535 || sizes[2] > 65535 {
+      state.stageLength = begin
+      state.stageFull = false
+      rawLiterals(&mut state)
+      return ()
+    }
+    stagePatch(
+      &mut state,
+      jump,
+      usize.toU32(sizes[0]) | u32.shiftLeft(usize.toU32(sizes[1]), 16),
+      4,
+    )
+    stagePatch(&mut state, jump + 4, usize.toU32(sizes[2]), 2)
+  } else {
+    writeHuffmanStream(&mut state, 0, count)
+  }
+  let compressed = state.stageLength - treeStart
+  if state.stageFull || compressed + headerSize >= count + 3 || (!fourStreams && compressed > 1023)
+    || compressed > 262143 {
+    state.stageLength = begin
+    state.stageFull = false
+    rawLiterals(&mut state)
+    return ()
+  }
+  let regenerated = usize.toU32(count)
+  let size = usize.toU32(compressed)
+  if headerSize == 3 {
+    let mut format: u32 = 0
+    if fourStreams {
+      format = 4
+    }
+    stagePatch(
+      &mut state,
+      begin,
+      2 | format | u32.shiftLeft(regenerated, 4) | u32.shiftLeft(size, 14),
+      3,
+    )
+  } else if headerSize == 4 {
+    stagePatch(
+      &mut state,
+      begin,
+      2 | 8 | u32.shiftLeft(regenerated, 4) | u32.shiftLeft(size, 18),
+      4,
+    )
+  } else {
+    let low = u64.toU32(
+      u32.toU64(2 | 12) | u64.shiftLeft(u32.toU64(regenerated), 4)
+        | u64.shiftLeft(u32.toU64(size), 22) & 0xffffffff,
+    )
+    stagePatch(&mut state, begin, low, 4)
+    stagePatch(&mut state, begin + 4, u32.shiftRight(size, 10), 1)
+  }
+}
+
+const LITERAL_DEFAULT: [i64; 36] = [
+  4,
+  3,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  1,
+  1,
+  1,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  3,
+  2,
+  1,
+  1,
+  1,
+  1,
+  1,
+  -1,
+  -1,
+  -1,
+  -1,
+]
+
+const MATCH_DEFAULT: [i64; 53] = [
+  1,
+  4,
+  3,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  -1,
+  -1,
+  -1,
+  -1,
+  -1,
+  -1,
+  -1,
+]
+
+const OFFSET_DEFAULT: [i64; 29] = [
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  2,
+  2,
+  2,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  -1,
+  -1,
+  -1,
+  -1,
+  -1,
+]
+
+const LITERAL_BASE: [u32; 36] = [
+  0,
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+  18,
+  20,
+  22,
+  24,
+  28,
+  32,
+  40,
+  48,
+  64,
+  128,
+  256,
+  512,
+  1024,
+  2048,
+  4096,
+  8192,
+  16384,
+  32768,
+  65536,
+]
+
+const LITERAL_EXTRA: [u32; 36] = [
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  1,
+  1,
+  1,
+  1,
+  2,
+  2,
+  3,
+  3,
+  4,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+]
+
+const MATCH_BASE: [u32; 53] = [
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+  17,
+  18,
+  19,
+  20,
+  21,
+  22,
+  23,
+  24,
+  25,
+  26,
+  27,
+  28,
+  29,
+  30,
+  31,
+  32,
+  33,
+  34,
+  35,
+  37,
+  39,
+  41,
+  43,
+  47,
+  51,
+  59,
+  67,
+  83,
+  99,
+  131,
+  259,
+  515,
+  1027,
+  2051,
+  4099,
+  8195,
+  16387,
+  32771,
+  65539,
+]
+
+const MATCH_EXTRA: [u32; 53] = [
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  1,
+  1,
+  1,
+  1,
+  2,
+  2,
+  3,
+  3,
+  4,
+  4,
+  5,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+]
+
+fn literalCode(length: u32) -> usize {
+  if length < 16 {
+    return u32.toUsize(length)
+  }
+  if length >= 64 {
+    return u32.toUsize(highBit(length) + 19)
+  }
+  let mut code: usize = 16
+  while code < 35 && LITERAL_BASE[code + 1] <= length {
+    code = code + 1
+  }
+  return code
+}
+
+fn matchCode(length: u32) -> usize {
+  let base = length - 3
+  if base < 32 {
+    return u32.toUsize(base)
+  }
+  if base >= 128 {
+    return u32.toUsize(highBit(base) + 36)
+  }
+  let mut code: usize = 32
+  while code < 52 && MATCH_BASE[code + 1] <= length {
+    code = code + 1
+  }
+  return code
+}
+
+fn defaultCount(kind: u32, symbol: usize) -> i64 {
+  if kind == 0 {
+    return LITERAL_DEFAULT[symbol]
+  }
+  if kind == 1 {
+    if symbol > 28 {
+      return 0
+    }
+    return OFFSET_DEFAULT[symbol]
+  }
+  return MATCH_DEFAULT[symbol]
+}
+
+fn buildKindTable(
+  state: &mut ZstdEncoder,
+  kind: u32,
+  normalized: &[i64; 64],
+  maxSymbol: usize,
+  log: u32,
+) -> () {
+  if kind == 0 {
+    buildTable(&mut state.literalTable, normalized, maxSymbol, log)
+  } else if kind == 1 {
+    buildTable(&mut state.offsetTable, normalized, maxSymbol, log)
+  } else {
+    buildTable(&mut state.matchTable, normalized, maxSymbol, log)
+  }
+}
+
+fn setRle(state: &mut ZstdEncoder, kind: u32) -> () {
+  if kind == 0 {
+    state.literalTable.rle = true
+    state.literalTable.log = 0
+  } else if kind == 1 {
+    state.offsetTable.rle = true
+    state.offsetTable.log = 0
+  } else {
+    state.matchTable.rle = true
+    state.matchTable.log = 0
+  }
+}
+
+// Picks RLE, predefined, or a new FSE table for one symbol stream, writes its description to the
+// stage, builds its encoding table, and returns the mode.
+fn chooseTable(
+  state: &mut ZstdEncoder,
+  kind: u32,
+  counts: &[u32; 64],
+  maxSymbol: usize,
+  total: usize,
+) -> u32 {
+  let mut distinct: usize = 0
+  let mut only: usize = 0
+  let mut symbol: usize = 0
+  while symbol <= maxSymbol {
+    if counts[symbol] != 0 {
+      distinct = distinct + 1
+      only = symbol
+    }
+    symbol = symbol + 1
+  }
+  let mut defaultLog: u32 = 6
+  let mut maxLog: u32 = 9
+  let mut defaultMax: usize = 35
+  if kind == 1 {
+    defaultLog = 5
+    maxLog = 8
+    defaultMax = 28
+  } else if kind == 2 {
+    defaultMax = 52
+  }
+  let mut defaultCost: i64 = 0
+  let mut defaultValid = maxSymbol <= defaultMax
+  symbol = 0
+  while symbol <= maxSymbol && defaultValid {
+    if counts[symbol] != 0 {
+      let count = defaultCount(kind, symbol)
+      if count == 0 {
+        defaultValid = false
+      } else {
+        defaultCost = defaultCost + u32.toI64(counts[symbol]) * symbolCost(count, defaultLog)
+      }
+    }
+    symbol = symbol + 1
+  }
+  if distinct == 1 && (total > 2 || !defaultValid) {
+    stageByte(&mut state, usize.toU8(only))
+    setRle(&mut state, kind)
+    return 1
+  }
+  if defaultValid && total <= 16 {
+    useDefault(&mut state, kind, defaultMax, defaultLog)
+    return 0
+  }
+  let log = optimalLog(maxLog, total, maxSymbol)
+  let mut normalized: [i64; 64] = [0; 64]
+  normalize(counts, maxSymbol, total, log, total >= 2048, &mut normalized)
+  let begin = state.stageLength
+  writeDistribution(&mut state, &normalized, maxSymbol, log)
+  let mut customCost = usize.toI64(state.stageLength - begin) * 8 * 256
+  symbol = 0
+  while symbol <= maxSymbol {
+    if counts[symbol] != 0 {
+      customCost = customCost + u32.toI64(counts[symbol]) * symbolCost(normalized[symbol], log)
+    }
+    symbol = symbol + 1
+  }
+  if defaultValid && defaultCost <= customCost {
+    state.stageLength = begin
+    useDefault(&mut state, kind, defaultMax, defaultLog)
+    return 0
+  }
+  buildKindTable(&mut state, kind, &normalized, maxSymbol, log)
+  return 2
+}
+
+fn useDefault(state: &mut ZstdEncoder, kind: u32, maxSymbol: usize, log: u32) -> () {
+  let mut normalized: [i64; 64] = [0; 64]
+  let mut symbol: usize = 0
+  while symbol <= maxSymbol {
+    normalized[symbol] = defaultCount(kind, symbol)
+    symbol = symbol + 1
+  }
+  buildKindTable(&mut state, kind, &normalized, maxSymbol, log)
+}
+
+fn tableLog(state: &ZstdEncoder, kind: u32) -> u32 {
+  if kind == 0 {
+    return state.literalTable.log
+  }
+  if kind == 1 {
+    return state.offsetTable.log
+  }
+  return state.matchTable.log
+}
+
+@inlineAlways
+fn tableRle(state: &ZstdEncoder, kind: u32) -> bool {
+  if kind == 0 {
+    return state.literalTable.rle
+  }
+  if kind == 1 {
+    return state.offsetTable.rle
+  }
+  return state.matchTable.rle
+}
+
+fn startState(state: &ZstdEncoder, kind: u32, symbol: usize) -> u32 {
+  if tableRle(state, kind) {
+    return 0
+  }
+  if kind == 0 {
+    return initialState(&state.literalTable, symbol)
+  }
+  if kind == 1 {
+    return initialState(&state.offsetTable, symbol)
+  }
+  return initialState(&state.matchTable, symbol)
+}
+
+@inlineAlways
+fn stepState(state: &mut ZstdEncoder, kind: u32, value: u32, symbol: usize) -> u32 {
+  if tableRle(&state, kind) {
+    return 0
+  }
+  return encodeSymbol(&mut state, kind, value, symbol)
+}
+
+@inlineAlways
+fn sequenceExtras(state: &mut ZstdEncoder, index: usize) -> () {
+  let literal = List<u32>.get(&state.sequenceLiteral, index)
+  let literalSymbol = u8.toUsize(List<u8>.get(&state.literalCodes, index))
+  addBits(&mut state, literal - LITERAL_BASE[literalSymbol], LITERAL_EXTRA[literalSymbol])
+  let length = List<u32>.get(&state.sequenceMatch, index)
+  let matchSymbol = u8.toUsize(List<u8>.get(&state.matchCodes, index))
+  addBits(&mut state, length - MATCH_BASE[matchSymbol], MATCH_EXTRA[matchSymbol])
+  let offset = List<u32>.get(&state.sequenceOffset, index)
+  let offsetSymbol = u8.toU32(List<u8>.get(&state.offsetCodes, index))
+  addBits(&mut state, offset - u32.shiftLeft(1, offsetSymbol), offsetSymbol)
+}
+
+// Writes the sequences section: the count, the table modes and descriptions, and the backward
+// bit stream of codes and extra bits.
+fn encodeSequences(state: &mut ZstdEncoder) -> () {
+  let count = state.sequenceCount
+  if count < 128 {
+    stageByte(&mut state, usize.toU8(count))
+  } else if count < 32512 {
+    stageByte(&mut state, usize.toU8(usize.shiftRight(count, 8) + 128))
+    stageByte(&mut state, usize.toU8(count & 255))
+  } else {
+    stageByte(&mut state, 255)
+    stageLittle(&mut state, usize.toU32(count - 32512), 2)
+  }
+  if count == 0 {
+    return ()
+  }
+  let mut literalCounts: [u32; 64] = [0; 64]
+  let mut matchCounts: [u32; 64] = [0; 64]
+  let mut offsetCounts: [u32; 64] = [0; 64]
+  let mut literalMax: usize = 0
+  let mut matchMax: usize = 0
+  let mut offsetMax: usize = 0
+  let mut index: usize = 0
+  while index < count {
+    let literal = literalCode(List<u32>.get(&state.sequenceLiteral, index))
+    let length = matchCode(List<u32>.get(&state.sequenceMatch, index))
+    let offset = u32.toUsize(highBit(List<u32>.get(&state.sequenceOffset, index)))
+    List<u8>.set(&mut state.literalCodes, index, usize.toU8(literal))
+    List<u8>.set(&mut state.matchCodes, index, usize.toU8(length))
+    List<u8>.set(&mut state.offsetCodes, index, usize.toU8(offset))
+    literalCounts[literal] = literalCounts[literal] + 1
+    matchCounts[length] = matchCounts[length] + 1
+    offsetCounts[offset] = offsetCounts[offset] + 1
+    if literal > literalMax {
+      literalMax = literal
+    }
+    if length > matchMax {
+      matchMax = length
+    }
+    if offset > offsetMax {
+      offsetMax = offset
+    }
+    index = index + 1
+  }
+  let modes = state.stageLength
+  stageByte(&mut state, 0)
+  let literalMode = chooseTable(&mut state, 0, &literalCounts, literalMax, count)
+  let offsetMode = chooseTable(&mut state, 1, &offsetCounts, offsetMax, count)
+  let matchMode = chooseTable(&mut state, 2, &matchCounts, matchMax, count)
+  stagePatch(
+    &mut state,
+    modes,
+    u32.shiftLeft(literalMode, 6) | u32.shiftLeft(offsetMode, 4) | u32.shiftLeft(matchMode, 2),
+    1,
+  )
+  let last = count - 1
+  let mut matchState = startState(&state, 2, u8.toUsize(List<u8>.get(&state.matchCodes, last)))
+  let mut offsetState = startState(&state, 1, u8.toUsize(List<u8>.get(&state.offsetCodes, last)))
+  let mut literalState = startState(&state, 0, u8.toUsize(List<u8>.get(&state.literalCodes, last)))
+  let literalRle = state.literalTable.rle
+  let matchRle = state.matchTable.rle
+  let offsetRle = state.offsetTable.rle
+  let mut writer = BitWriter {
+    bits: 0,
+    count: 0,
+    position: state.stageLength,
+    limit: List<u8>.length(&state.stage) - 8,
+    full: state.stageFull,
+  }
+  let literals = List<u32>.asSlice(&state.sequenceLiteral)
+  let matches = List<u32>.asSlice(&state.sequenceMatch)
+  let offsets = List<u32>.asSlice(&state.sequenceOffset)
+  let literalCodes = List<u8>.asSlice(&state.literalCodes)
+  let matchCodes = List<u8>.asSlice(&state.matchCodes)
+  let offsetCodes = List<u8>.asSlice(&state.offsetCodes)
+  index = count
+  while index > 0 {
+    index = index - 1
+    let literalSymbol = u8.toUsize(literalCodes[index])
+    let matchSymbol = u8.toUsize(matchCodes[index])
+    let offsetSymbol = u8.toUsize(offsetCodes[index])
+    if index != last {
+      if !offsetRle {
+        offsetState = fseStep(
+          &state.offsetTable,
+          &mut writer,
+          &mut state.stage,
+          offsetState,
+          offsetSymbol,
+        )
+      }
+      if !matchRle {
+        matchState = fseStep(
+          &state.matchTable,
+          &mut writer,
+          &mut state.stage,
+          matchState,
+          matchSymbol,
+        )
+      }
+      if !literalRle {
+        literalState = fseStep(
+          &state.literalTable,
+          &mut writer,
+          &mut state.stage,
+          literalState,
+          literalSymbol,
+        )
+      }
+    }
+    put(
+      &mut writer,
+      &mut state.stage,
+      literals[index] - LITERAL_BASE[literalSymbol],
+      LITERAL_EXTRA[literalSymbol],
+    )
+    put(
+      &mut writer,
+      &mut state.stage,
+      matches[index] - MATCH_BASE[matchSymbol],
+      MATCH_EXTRA[matchSymbol],
+    )
+    let offsetBits = usize.toU32(offsetSymbol)
+    put(&mut writer, &mut state.stage, offsets[index] - u32.shiftLeft(1, offsetBits), offsetBits)
+  }
+  put(&mut writer, &mut state.stage, matchState, state.matchTable.log)
+  put(&mut writer, &mut state.stage, offsetState, state.offsetTable.log)
+  put(&mut writer, &mut state.stage, literalState, state.literalTable.log)
+  if writer.position > writer.limit {
+    writer.full = true
+    writer.position = writer.limit
+  }
+  state.stageLength = writer.position
+  state.stageFull = writer.full
+  state.bitBuffer = writer.bits
+  state.bitCount = writer.count
+  closeBits(&mut state)
+}
+
+// A bit writer that lives in locals during a hot loop and writes 8 bytes at a time into a stage.
+struct BitWriter {
+  bits: u64,
+  count: u32,
+  position: usize,
+  limit: usize,
+  full: bool,
+}
+
+// Adds the low `count` bits of `value`, at most 32.
+@inlineAlways
+fn put(writer: &mut BitWriter, stage: &mut List<u8>, value: u32, count: u32) -> () {
+  let masked = u32.toU64(value) & (u64.shiftLeft(1, u32.toU64(count)) - 1)
+  writer.bits = writer.bits | u64.shiftLeft(masked, u32.toU64(writer.count))
+  writer.count = writer.count + count
+  if writer.count >= 32 {
+    if writer.position > writer.limit {
+      writer.full = true
+    } else {
+      store64(&mut stage, writer.position, writer.bits)
+    }
+    let bytes = u32.shiftRight(writer.count, 3)
+    writer.position = writer.position + u32.toUsize(bytes)
+    writer.bits = u64.shiftRight(writer.bits, u32.toU64(u32.shiftLeft(bytes, 3)))
+    writer.count = writer.count - u32.shiftLeft(bytes, 3)
+  }
+}
+
+// Writes the bits of one symbol for an FSE state and returns the next state.
+@inlineAlways
+fn fseStep(
+  table: &FseTable,
+  writer: &mut BitWriter,
+  stage: &mut List<u8>,
+  value: u32,
+  symbol: usize,
+) -> u32 {
+  let bits = u32.shiftRight(value + table.deltaBits[symbol], 16)
+  put(&mut writer, &mut stage, value, bits)
+  let slot = i64.toUsize(u32.toI64(u32.shiftRight(value, bits)) + table.deltaFind[symbol])
+  return table.state[slot]
+}

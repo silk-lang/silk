@@ -1,0 +1,226 @@
+static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu") {
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.system.child_process { ChildProcess, ProcessError, ProcessRequest }
+import silk.system.child_process_native { OsChildProcess }
+import silk.system.filesystem { FileError, Path }
+import silk.num.isize
+import silk.system.subprocess { ExitStatus, ExitWatch, SpawnOptions, Stdio, Subprocess, SubprocessError, SubprocessOperation }
+
+extern "C" struct PollFd { fd: i32, events: i16, revents: i16 }
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  @foreign(noCapture: .("fds"))
+  unsafe extern "C" fn poll(fds: ?[*]mut PollFd, count: u32, timeout: i32) -> i32
+} else {
+  @foreign(noCapture: .("fds"))
+  unsafe extern "C" fn poll(fds: ?[*]mut PollFd, count: usize, timeout: i32) -> i32
+}
+@foreign(noCapture: .("buffer"))
+unsafe extern "C" fn write(fd: i32, buffer: ?[*]const u8, count: usize) -> isize
+@foreign(noCapture: .("buffer"))
+unsafe extern "C" fn read(fd: i32, buffer: ?[*]mut u8, count: usize) -> isize
+@foreign(noCapture: .("fds"))
+unsafe extern "C" fn pipe(fds: ?[*]mut i32) -> i32
+unsafe extern "C" fn close(fd: i32) -> i32
+unsafe extern "C" fn getsid(pid: i32) -> i32
+unsafe extern "C" fn signal(number: i32, handler: usize) -> usize
+
+// Waits up to `milliseconds` for `fd` to be readable.
+fn readable(fd: i32, milliseconds: i32) -> bool {
+  let mut watched = [PollFd { fd: fd, events: 1, revents: 0 }]
+  return unsafe poll(Pointer.fromMutSlice<PollFd>(&mut watched), 1, milliseconds) == 1
+}
+
+// Reads from `fd` until the end, at most `buffer.length` bytes, and returns the count.
+fn readAll(fd: i32, buffer: &mut [u8]) -> usize {
+  let mut total: usize = 0
+  while total < buffer.length {
+    if !readable(fd, 5000) { return total }
+    let mut chunk: [u8; 64] = [0; 64]
+    let count = unsafe read(fd, Pointer.fromMutSlice<u8>(&mut chunk), 64)
+    if count <= 0 { return total }
+    let mut index: usize = 0
+    while index < isize.toUsize(count) && total < buffer.length {
+      buffer[total] = chunk[index]
+      total = total + 1
+      index = index + 1
+    }
+  }
+  return total
+}
+
+fn same(bytes: &[u8], count: usize, expected: &[u8]) -> bool {
+  if count != expected.length { return false }
+  let mut index: usize = 0
+  while index < count {
+    if bytes[index] != expected[index] { return false }
+    index = index + 1
+  }
+  return true
+}
+
+// Takes the parent end of the pipe in `slot`, or -1.
+fn pipeOf(child: &mut Subprocess, slot: usize) -> i32 {
+  return match child.takePipe(slot) {
+    Option<i32>.Some { value } => value
+    Option<i32>.None => -1
+  }
+}
+
+// Waits for the exit descriptor of `pid`, then collects its status.
+effect fn finish(pid: i32) -> ExitStatus ! SubprocessError {
+  let watch = run ExitWatch.open(pid)
+  if !readable(watch.descriptor(), 5000) { return ExitStatus { signaled: true, code: -1, signal: -1 } }
+  return run watch.collect()
+}
+
+fn operationIndex(operation: SubprocessOperation) -> i32 {
+  return match operation {
+    SubprocessOperation.Spawn => 0
+    SubprocessOperation.Wait => 1
+    SubprocessOperation.Kill => 2
+    SubprocessOperation.Watch => 3
+  }
+}
+
+fn failureCode<T>(result: Result<T, SubprocessError | OutOfMemoryError>, operation: SubprocessOperation) -> i32 {
+  return match move result {
+    Result<T, SubprocessError | OutOfMemoryError>.Success { .. } => -1
+    Result<T, SubprocessError | OutOfMemoryError>.Failure { error } => match move error {
+      SubprocessError { operation: failed, code } => if operationIndex(failed) == operationIndex(operation) { code } else { -2 }
+      _ => -3
+    }
+  }
+}
+
+fn plainFailureCode<T>(result: Result<T, SubprocessError>, operation: SubprocessOperation) -> i32 {
+  return match move result {
+    Result<T, SubprocessError>.Success { .. } => -1
+    Result<T, SubprocessError>.Failure { error } => if operationIndex(error.operation) == operationIndex(operation) { error.code } else { -2 }
+  }
+}
+
+effect fn shell(script: string) -> ProcessRequest ! FileError | OutOfMemoryError ? &mut Allocator {
+  let path = run Path.make("/bin/sh")
+  let mut request = run ChildProcess.request(&path)
+  run ChildProcess.addArgument(&mut request, "-c")
+  run ChildProcess.addArgument(&mut request, script)
+  return move request
+}
+
+effect fn program() -> i32 ! FileError | SubprocessError | ProcessError | OutOfMemoryError ? &mut Allocator {
+  // A pipe on slot 0 and 1: what the parent writes comes back from cat.
+  let catPath = run Path.make("/bin/cat")
+  let cat = run ChildProcess.request(&catPath)
+  let mut piped = SpawnOptions.make()
+  run piped.setStdio(0, Stdio.pipe())
+  run piped.setStdio(1, Stdio.pipe())
+  let mut echoing = run Subprocess.spawn(&cat, &piped)
+  let input = pipeOf(&mut echoing, 0)
+  let output = pipeOf(&mut echoing, 1)
+  if input < 0 || output < 0 { return 1 }
+  if echoing.takePipe(1).isSome() || echoing.takePipe(2).isSome() || echoing.takePipe(7).isSome() { return 2 }
+  // Still running: no status yet.
+  if (run Subprocess.tryWait(echoing.pid())).isSome() { return 3 }
+  if unsafe write(input, Pointer.fromSlice<u8>(b"silk"), 4) != 4 { return 4 }
+  Subprocess.closeDescriptor(input)
+  let mut received: [u8; 16] = [0; 16]
+  let count = readAll(output, &mut received)
+  Subprocess.closeDescriptor(output)
+  if !same(&received, count, b"silk") { return 5 }
+  let catStatus = run finish(echoing.pid())
+  if catStatus.signaled || catStatus.code != 0 { return 6 }
+  // The status was collected, so a second wait fails with ECHILD.
+  if plainFailureCode(run Effect.result(Subprocess.tryWait(echoing.pid())), SubprocessOperation.Wait) != 10 { return 7 }
+
+  // Argument zero, the environment, an exit code, and an inherited descriptor on slot 3.
+  let mut fds: [i32; 2] = [-1, -1]
+  if unsafe pipe(Pointer.fromMutSlice<i32>(&mut fds)) != 0 { return 8 }
+  let mut request = run shell("printf '%s:%s' \"$0\" \"$WORD\" >&3; exit 7")
+  run ChildProcess.setVariable(&mut request, "WORD", "weft")
+  let mut options = SpawnOptions.make()
+  run options.setArgumentZero(b"warp")
+  run options.setStdio(3, Stdio.inherit(fds[1]))
+  let named = run Subprocess.spawn(&request, &options)
+  let _closedWriter = unsafe close(fds[1])
+  let namedCount = readAll(fds[0], &mut received)
+  let _closedReader = unsafe close(fds[0])
+  if !same(&received, namedCount, b"warp:weft") { return 9 }
+  let namedStatus = run finish(named.pid())
+  if namedStatus.signaled || namedStatus.code != 7 { return 10 }
+
+  // A working directory starts the child with fork on GNU/Linux.
+  let pwdPath = run Path.make("/bin/pwd")
+  let root = run Path.make("/")
+  let within = run ChildProcess.requestWithin(&pwdPath, &root)
+  let mut located = SpawnOptions.make()
+  run located.setStdio(1, Stdio.pipe())
+  let mut where = run Subprocess.spawn(&within, &located)
+  let whereOutput = pipeOf(&mut where, 1)
+  let whereCount = readAll(whereOutput, &mut received)
+  Subprocess.closeDescriptor(whereOutput)
+  if !same(&received, whereCount, b"/\n") { return 12 }
+  let whereStatus = run finish(where.pid())
+  if whereStatus.signaled || whereStatus.code != 0 { return 13 }
+
+  // An ignored SIGTERM in the parent is the default action in the child, on both start paths.
+  let _ignored = unsafe signal(15, 1)
+  let sleepPath = run Path.make("/bin/sleep")
+  let mut sleeping = run ChildProcess.request(&sleepPath)
+  run ChildProcess.addArgument(&mut sleeping, "30")
+  let quiet = SpawnOptions.make()
+  let spawned = run Subprocess.spawn(&sleeping, &quiet)
+  let mut forkedRequest = run ChildProcess.requestWithin(&sleepPath, &root)
+  run ChildProcess.addArgument(&mut forkedRequest, "30")
+  let forked = run Subprocess.spawn(&forkedRequest, &quiet)
+  let _restored = unsafe signal(15, 0)
+  run Subprocess.kill(spawned.pid(), 15)
+  run Subprocess.kill(forked.pid(), 15)
+  let spawnedStatus = run finish(spawned.pid())
+  let forkedStatus = run finish(forked.pid())
+  if !spawnedStatus.signaled || spawnedStatus.signal != 15 { return 14 }
+  if !forkedStatus.signaled || forkedStatus.signal != 15 { return 15 }
+
+  // A detached child leads a new session.
+  let mut detaching = SpawnOptions.make()
+  detaching.setDetached(true)
+  let leader = run Subprocess.spawn(&sleeping, &detaching)
+  if unsafe getsid(leader.pid()) != leader.pid() { return 16 }
+  run Subprocess.kill(leader.pid(), 9)
+  let leaderStatus = run finish(leader.pid())
+  if !leaderStatus.signaled || leaderStatus.signal != 9 { return 17 }
+
+  // Start failures carry the native code and leave no child.
+  let missingPath = run Path.make("/nonexistent/silk-program")
+  let missing = run ChildProcess.request(&missingPath)
+  if failureCode(run Effect.result(Subprocess.spawn(&missing, &quiet)), SubprocessOperation.Spawn) != 2 { return 18 }
+  let missingWithin = run ChildProcess.requestWithin(&missingPath, &root)
+  if failureCode(run Effect.result(Subprocess.spawn(&missingWithin, &quiet)), SubprocessOperation.Spawn) != 2 { return 19 }
+  let mut badSlot = SpawnOptions.make()
+  run badSlot.setStdio(0, Stdio.inherit(-1))
+  if failureCode(run Effect.result(Subprocess.spawn(&cat, &badSlot)), SubprocessOperation.Spawn) != 9 { return 20 }
+  if plainFailureCode(run Effect.result(Subprocess.kill(0 - 1 - 2147483647, 0)), SubprocessOperation.Kill) != 3 { return 21 }
+  if plainFailureCode(run Effect.result(ExitWatch.open(-5)), SubprocessOperation.Watch) != 3 { return 22 }
+
+  // The blocking ChildProcess provider runs on the same launcher.
+  let mut provider = OsChildProcess.make()
+  let outcome = run ChildProcess.submit(&within) |> Effect.provideMut<ChildProcess>(&mut provider)
+  let printed = ChildProcess.outputBytes(&outcome)
+  if !same(printed, printed.length, b"/\n") { return 23 }
+  return 42
+}
+
+pub effect fn main() -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let result = run Effect.result(program()) |> Effect.provideMut<Allocator>(&mut allocator)
+  return match move result {
+    Result<i32, FileError | SubprocessError | ProcessError | OutOfMemoryError>.Success { value } => value
+    Result<i32, FileError | SubprocessError | ProcessError | OutOfMemoryError>.Failure { .. } => 100
+  }
+}
+} else {
+pub fn main() -> i32 { return 42 }
+}

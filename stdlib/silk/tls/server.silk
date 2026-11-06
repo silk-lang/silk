@@ -1,0 +1,3240 @@
+//! A TLS 1.3 server state machine that does the handshake and protects application data over a
+//! byte transport that you drive.
+//!
+//! # When to use
+//! Use [`Server`] to accept TLS 1.3 connections, for example in an HTTPS server or a runtime's
+//! `node:tls`. Make one server for each accepted connection with [`Server.make`], then move bytes
+//! between it and the transport until it reports `HandshakeComplete`, and then read and write
+//! application data.
+//!
+//! # Details
+//! The server supports TLS 1.3 only. It selects the first cipher suite in the client's order among
+//! ChaCha20-Poly1305, AES-128-GCM, and AES-256-GCM. It selects the key exchange group from
+//! X25519, P-256, and P-384 in that order, limited by your [`GroupPolicy`]. If the client sent no
+//! key share for an allowed group that it supports, the server sends one HelloRetryRequest. The
+//! server signs CertificateVerify with the leaf's ECDSA P-256, ECDSA P-384, Ed25519, or RSA key
+//! ([`ServerKey`]), using a scheme that the client offers, and checks the client's Finished
+//! message. An RSA key signs with RSA-PSS, preferring SHA-256, then SHA-384, then SHA-512.
+//!
+//! The server reads the client's SNI name, which you get from [`Server.serverName`], and selects an
+//! ALPN protocol from your [`AlpnConfig`] in your preference order. It handles KeyUpdate in both
+//! directions, `close_notify`, and the compatibility `change_cipher_spec` records.
+//!
+//! Each call returns a [`ServerProgress`]: how many bytes it took or wrote, and the next
+//! [`ServerDemand`]. Output works in two steps: write [`Server.pendingOutput`] to the transport,
+//! and then call [`Server.ackWritten`] with the number of bytes written. During the handshake, the
+//! server takes no input while output is pending. [`ServerLimits`] bound all memory and work.
+//!
+//! # Errors
+//! - [`ServerError`] for a configuration that is not valid, an alert from the client, a protocol
+//!   error, no shared parameters, a limit, or a call in the wrong state. An error from a call after
+//!   [`Server.make`] is permanent for the server.
+//! - `OutOfMemoryError` if the `Allocator` fails.
+//!
+//! # Gotchas
+//! The server does not ask for client certificates, and it does not support PSK, session tickets,
+//! or 0-RTT data. A client that sends early data fails with `BadRecordMac`. The server sends no
+//! alert when it fails, so close the transport. Dropping the server does not send `close_notify`.
+//! Call [`Server.closeWrite`] first. Secrets are not erased.
+//!
+//! # Examples
+//! ## Reject a configuration without certificates
+//! ```silk
+//! import silk.mem.allocator { Allocator, OutOfMemoryError }
+//! import silk.core.effect { Effect }
+//! import silk.system.random { Random }
+//! import silk.core.result { Result }
+//! import silk.crypto.p256 { P256 }
+//! import silk.tls.client { AlpnConfig }
+//! import silk.tls.server {
+//!   CertificateDer,
+//!   GroupPolicy,
+//!   Server,
+//!   ServerConfig,
+//!   ServerError,
+//!   ServerKey,
+//!   ServerLimits,
+//! }
+//! import silk.collections.slice { Slice }
+//! import silk.num.usize
+//!
+//! // Not secure. Real programs use a `Random` provider from the operating system.
+//! struct ExampleRandom {
+//!   next: usize,
+//! }
+//!
+//! impl Random for ExampleRandom {
+//!   effect fn fillBytes(self: &mut Self, output: &mut [u8]) -> () {
+//!     let mut index: usize = 0
+//!     while index < output.length {
+//!       output[index] = usize.toU8((self.next + index) % 251 + 1)
+//!       index = index + 1
+//!     }
+//!     self.next = self.next + output.length
+//!     return ()
+//!   }
+//! }
+//!
+//! pub effect fn main() -> i32
+//!   ! OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let mut random = ExampleRandom { next: 1 }
+//!   let key = run P256.generate() |> Effect.provideMut<Random>(&mut random)
+//!   let chain: [CertificateDer<'static>; 0] = []
+//!   let config = ServerConfig<'static> {
+//!     certificates: Slice.view<CertificateDer<'static>>(&chain, 0, 0),
+//!     alpn: AlpnConfig.defaults(),
+//!     groups: GroupPolicy.defaults(),
+//!     limits: ServerLimits.defaults(),
+//!   }
+//!   let made = run Server.make(&config, ServerKey.EcdsaP256 { key: move key })
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   return match move made {
+//!     Result<Server, ServerError>.Success {..} => 1
+//!     Result<Server, ServerError>.Failure { error: ServerError.EmptyCertificateChain } => 0
+//!     Result<Server, ServerError>.Failure {..} => 1
+//!   }
+//! }
+//! ```
+//!
+//! @category TLS and certificates
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.tls.certificate { Certificate, DecodeError, DecodeLimits }
+import silk.tls.client { AlpnConfig }
+import silk.text.format { Debug, Format, Formatter }
+import silk.crypto.hkdf { HkdfSha256, HkdfSha384 }
+import silk.crypto.hmac { HmacSha256, HmacSha384 }
+import silk.mem.layout { Layout }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.crypto.p256 { EcdsaP256, P256, P256Error }
+import silk.crypto.p384 { EcdsaP384, P384, P384Error }
+import silk.crypto.ed25519 { Ed25519PrivateKey }
+import silk.crypto.digest { Digest }
+import silk.crypto.rsa { RsaError, RsaPrivateKey, RsaPublicKey }
+import silk.core.effect { Effect }
+import silk.system.random { Random }
+import silk.mem.raw_buffer { RawBuffer }
+import silk.core.result { Result }
+import silk.crypto.sha2 { Sha256, Sha384, Sha512 }
+import silk.collections.slice { Slice }
+import silk.tls.hkdf { LabelError, TlsHkdfSha256, TlsHkdfSha384 }
+import silk.tls.record {
+  CipherSuite,
+  ContentType,
+  InputDemand,
+  InputProgress,
+  OutputProgress,
+  RecordError,
+  TlsRecordReceiver,
+  TlsRecordSender,
+}
+import silk.num.u8
+import silk.num.usize
+import silk.io.writer { Writer, WriterError }
+import silk.crypto.x25519 { X25519, X25519Error }
+
+const RECORD_CONTENT_LIMIT: usize = 16384
+
+const HANDSHAKE_HEADER_LENGTH: usize = 4
+
+const ALPN_PROTOCOL_LIMIT: usize = 16
+
+const ALPN_BYTES_LIMIT: usize = 1024
+
+const CERTIFICATE_LIMIT: usize = 16
+
+const SERVER_NAME_LIMIT: usize = 255
+
+const SCRATCH_LENGTH: usize = 512
+
+const FLIGHT_OVERHEAD: usize = 1536
+
+const SIGNATURE_LIMIT: usize = 1024
+
+/// A key exchange group that the server can select.
+pub enum ServerGroup {
+  /// X25519 with a 32-byte public key.
+  X25519,
+  /// The NIST P-256 curve with a 65-byte uncompressed point.
+  P256,
+  /// The NIST P-384 curve with a 97-byte uncompressed point.
+  P384,
+}
+
+impl Debug for ServerGroup {
+  /// Writes the name of the variant, such as `X25519`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      ServerGroup.X25519 => run Format.write(&mut formatter, b"X25519")
+      ServerGroup.P256 => run Format.write(&mut formatter, b"P256")
+      ServerGroup.P384 => run Format.write(&mut formatter, b"P384")
+    }
+  }
+}
+
+/// The key exchange groups that the server allows. It prefers X25519, then P-256, then P-384.
+pub struct GroupPolicy {
+  /// Allows X25519.
+  pub x25519: bool,
+  /// Allows P-256.
+  pub p256: bool,
+  /// Allows P-384.
+  pub p384: bool,
+}
+
+impl Copy for GroupPolicy {}
+
+impl GroupPolicy {
+  /// Returns the policy that allows all three groups.
+  pub fn defaults() -> GroupPolicy {
+    return GroupPolicy { x25519: true, p256: true, p384: true }
+  }
+}
+
+/// One borrowed DER certificate of the server's chain.
+pub struct CertificateDer<'a> {
+  /// The DER bytes of the certificate.
+  pub bytes: &'a [u8],
+}
+
+impl<'a> Copy for CertificateDer<'a> {}
+
+/// The private key of the leaf certificate. The server signs CertificateVerify with it.
+pub union ServerKey {
+  /// An ECDSA P-256 key, used with the `ecdsa_secp256r1_sha256` scheme.
+  EcdsaP256 {
+    /// The private key.
+    pub key: P256,
+  },
+  /// An ECDSA P-384 key, used with the `ecdsa_secp384r1_sha384` scheme.
+  EcdsaP384 {
+    /// The private key.
+    pub key: P384,
+  },
+  /// An Ed25519 key, used with the `ed25519` scheme.
+  Ed25519 {
+    /// The private key.
+    pub key: Ed25519PrivateKey,
+  },
+  /// An RSA key for an `rsaEncryption` certificate, used with the `rsa_pss_rsae_sha256`,
+  /// `rsa_pss_rsae_sha384`, or `rsa_pss_rsae_sha512` scheme, in that order of preference.
+  RsaPss {
+    /// The private key.
+    pub key: RsaPrivateKey,
+  },
+}
+
+/// Inclusive local resource policy for one server connection. The limits bound all memory and work
+/// of the server.
+pub struct ServerLimits {
+  /// Maximum body bytes in one handshake message from the client, from 64 to 16777215.
+  pub handshakeBodyBytes: usize,
+  /// Maximum total handshake bytes from the client, including four-byte headers.
+  pub handshakeBytes: usize,
+  /// Maximum handshake message count from the client.
+  pub handshakeMessages: usize,
+  /// Maximum bytes in one extension vector.
+  pub extensionBytes: usize,
+  /// Maximum consecutive empty application or compatibility records.
+  pub emptyRecords: usize,
+  /// Maximum consecutive post-handshake control messages without positive application content.
+  pub postHandshakeControls: usize,
+  /// Maximum certificate count in the configured chain, at most 16.
+  pub certificates: usize,
+  /// Maximum aggregate DER bytes in the configured chain.
+  pub certificateBytes: usize,
+  /// Strict decoder policy for the configured leaf certificate.
+  pub certificateDecode: DecodeLimits,
+}
+
+impl Copy for ServerLimits {}
+
+impl ServerLimits {
+  /// Returns the finite TLS server defaults.
+  pub fn defaults() -> ServerLimits {
+    return ServerLimits {
+      handshakeBodyBytes: 65536,
+      handshakeBytes: 262144,
+      handshakeMessages: 8,
+      extensionBytes: 65535,
+      emptyRecords: 32,
+      postHandshakeControls: 64,
+      certificates: 16,
+      certificateBytes: 262144,
+      certificateDecode: DecodeLimits.defaults(),
+    }
+  }
+}
+
+/// Borrowed server configuration that [`Server.make`] copies into owned storage.
+pub struct ServerConfig<'a> {
+  /// The certificate chain, leaf first. The leaf's public key matches the [`ServerKey`].
+  pub certificates: &'a [CertificateDer<'a>],
+  /// The supported ALPN protocols in server preference order. `required` makes a client without
+  /// ALPN fail.
+  pub alpn: AlpnConfig<'a>,
+  /// The key exchange groups that the server allows.
+  pub groups: GroupPolicy,
+  /// Finite connection limits.
+  pub limits: ServerLimits,
+}
+
+/// The next action or observable connection event of a [`Server`], in [`ServerProgress.demand`].
+pub enum ServerDemand {
+  /// Supply client transport bytes.
+  NeedInput,
+  /// Write and acknowledge the complete pending output before other work.
+  NeedOutput,
+  /// Read buffered application plaintext.
+  PlaintextReady,
+  /// Observe the one-shot handshake completion. Application data can flow after it.
+  HandshakeComplete,
+  /// The client's direction closed cleanly.
+  PeerClosed,
+  /// Both directions closed cleanly and no output remains.
+  Closed,
+}
+
+/// Exact progress from one [`Server`] operation: how many bytes it took or wrote, and the next
+/// [`ServerDemand`].
+pub struct ServerProgress {
+  /// The accepted prefix of caller input or application plaintext.
+  pub consumed: usize,
+  /// The bytes copied into a caller plaintext destination.
+  pub written: usize,
+  /// The next action or event.
+  pub demand: ServerDemand,
+}
+
+impl Copy for ServerProgress {}
+
+/// A public operation rejected because of caller state.
+pub enum ServerOperation {
+  /// Transport input feed.
+  FeedInput,
+  /// State-machine progress without new bytes.
+  Progress,
+  /// Pending-output acknowledgment.
+  AckWritten,
+  /// Application plaintext read.
+  ReadPlaintext,
+  /// Application plaintext write.
+  WritePlaintext,
+  /// Local traffic-key update request.
+  RequestKeyUpdate,
+  /// Local write-direction close.
+  CloseWrite,
+  /// Transport input end.
+  EndInput,
+}
+
+impl Debug for ServerOperation {
+  /// Writes the name of the variant, such as `FeedInput`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      ServerOperation.FeedInput => run Format.write(&mut formatter, b"FeedInput")
+      ServerOperation.Progress => run Format.write(&mut formatter, b"Progress")
+      ServerOperation.AckWritten => run Format.write(&mut formatter, b"AckWritten")
+      ServerOperation.ReadPlaintext => run Format.write(&mut formatter, b"ReadPlaintext")
+      ServerOperation.WritePlaintext => run Format.write(&mut formatter, b"WritePlaintext")
+      ServerOperation.RequestKeyUpdate => run Format.write(&mut formatter, b"RequestKeyUpdate")
+      ServerOperation.CloseWrite => run Format.write(&mut formatter, b"CloseWrite")
+      ServerOperation.EndInput => run Format.write(&mut formatter, b"EndInput")
+    }
+  }
+}
+
+/// A protocol rule that the client broke.
+pub enum ServerProtocolReason {
+  /// A record has an invalid content type, version, length, padding, or inner framing.
+  Record,
+  /// A message or record arrived in an invalid order.
+  UnexpectedMessage,
+  /// A handshake message or vector is truncated or has trailing bytes.
+  InvalidLength,
+  /// An extension is duplicated, misplaced, or malformed.
+  Extension,
+  /// ClientHello has a field that TLS 1.3 forbids.
+  ClientHello,
+  /// The second ClientHello does not follow the HelloRetryRequest.
+  HelloRetryRequest,
+  /// A compatibility `change_cipher_spec` record is outside its window or not exactly `{1}`.
+  CompatibilityCcs,
+  /// A KeyUpdate or other post-handshake message is not valid.
+  PostHandshake,
+  /// The server reached an impossible private transition.
+  InternalState,
+}
+
+impl Debug for ServerProtocolReason {
+  /// Writes the name of the variant, such as `Record`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      ServerProtocolReason.Record => run Format.write(&mut formatter, b"Record")
+      ServerProtocolReason.UnexpectedMessage => run Format.write(
+        &mut formatter,
+        b"UnexpectedMessage",
+      )
+      ServerProtocolReason.InvalidLength => run Format.write(&mut formatter, b"InvalidLength")
+      ServerProtocolReason.Extension => run Format.write(&mut formatter, b"Extension")
+      ServerProtocolReason.ClientHello => run Format.write(&mut formatter, b"ClientHello")
+      ServerProtocolReason.HelloRetryRequest => run Format.write(
+        &mut formatter,
+        b"HelloRetryRequest",
+      )
+      ServerProtocolReason.CompatibilityCcs => run Format.write(&mut formatter, b"CompatibilityCcs")
+      ServerProtocolReason.PostHandshake => run Format.write(&mut formatter, b"PostHandshake")
+      ServerProtocolReason.InternalState => run Format.write(&mut formatter, b"InternalState")
+    }
+  }
+}
+
+/// A handshake parameter that the client and the server do not share.
+pub enum NegotiationFailure {
+  /// The client does not offer TLS 1.3.
+  Version,
+  /// The client offers no supported cipher suite.
+  CipherSuite,
+  /// The client supports no group that the [`GroupPolicy`] allows.
+  Group,
+  /// The client does not accept the signature scheme of the [`ServerKey`].
+  SignatureScheme,
+}
+
+impl Debug for NegotiationFailure {
+  /// Writes the name of the variant, such as `Version`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      NegotiationFailure.Version => run Format.write(&mut formatter, b"Version")
+      NegotiationFailure.CipherSuite => run Format.write(&mut formatter, b"CipherSuite")
+      NegotiationFailure.Group => run Format.write(&mut formatter, b"Group")
+      NegotiationFailure.SignatureScheme => run Format.write(&mut formatter, b"SignatureScheme")
+    }
+  }
+}
+
+/// A named finite resource exhausted by client input or configuration.
+pub enum ServerLimitKind {
+  /// One handshake body.
+  HandshakeBodyBytes,
+  /// Aggregate handshake headers and bodies.
+  HandshakeBytes,
+  /// Handshake message count.
+  HandshakeMessages,
+  /// One extension vector.
+  ExtensionBytes,
+  /// Consecutive empty application or compatibility records.
+  EmptyRecords,
+  /// Consecutive post-handshake control messages.
+  PostHandshakeControls,
+  /// Configured certificate count.
+  Certificates,
+  /// Configured certificate DER bytes.
+  CertificateBytes,
+  /// One ALPN protocol or list.
+  Alpn,
+}
+
+impl Debug for ServerLimitKind {
+  /// Writes the name of the variant, such as `HandshakeBodyBytes`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      ServerLimitKind.HandshakeBodyBytes => run Format.write(&mut formatter, b"HandshakeBodyBytes")
+      ServerLimitKind.HandshakeBytes => run Format.write(&mut formatter, b"HandshakeBytes")
+      ServerLimitKind.HandshakeMessages => run Format.write(&mut formatter, b"HandshakeMessages")
+      ServerLimitKind.ExtensionBytes => run Format.write(&mut formatter, b"ExtensionBytes")
+      ServerLimitKind.EmptyRecords => run Format.write(&mut formatter, b"EmptyRecords")
+      ServerLimitKind.PostHandshakeControls => run Format.write(
+        &mut formatter,
+        b"PostHandshakeControls",
+      )
+      ServerLimitKind.Certificates => run Format.write(&mut formatter, b"Certificates")
+      ServerLimitKind.CertificateBytes => run Format.write(&mut formatter, b"CertificateBytes")
+      ServerLimitKind.Alpn => run Format.write(&mut formatter, b"Alpn")
+    }
+  }
+}
+
+/// A typed TLS server failure. An error from a call after [`Server.make`] is permanent for the
+/// server.
+pub union ServerError {
+  /// The configured chain has no certificates.
+  EmptyCertificateChain,
+  /// The configured leaf certificate did not decode.
+  CertificateDecode {
+    /// The complete strict decoder failure.
+    pub error: DecodeError,
+  },
+  /// The configured leaf certificate's public key does not match the [`ServerKey`].
+  KeyMismatch,
+  /// The client sent a fatal alert with this wire description.
+  PeerAlert {
+    /// The alert description byte.
+    pub code: u8,
+  },
+  /// Protected record authentication failed.
+  BadRecordMac,
+  /// The client broke a protocol rule.
+  ProtocolViolation {
+    /// The rejected rule.
+    pub reason: ServerProtocolReason,
+  },
+  /// The client and the server share no value for a handshake parameter.
+  Negotiation {
+    /// The parameter without a shared value.
+    pub failure: NegotiationFailure,
+  },
+  /// The client's key share is not a valid public key.
+  InvalidKeyShare,
+  /// The RSA key could not sign CertificateVerify, for example because it is too small for the
+  /// scheme.
+  RsaSignature {
+    /// The RSA failure.
+    pub error: RsaError,
+  },
+  /// The client's Finished did not authenticate the transcript.
+  Finished,
+  /// A finite resource budget was exceeded.
+  LimitExceeded {
+    /// The exhausted resource category.
+    pub kind: ServerLimitKind,
+    /// The inclusive configured limit.
+    pub limit: usize,
+  },
+  /// A caller operation is invalid in the current state.
+  InvalidState {
+    /// The rejected operation.
+    pub operation: ServerOperation,
+  },
+  /// A caller supplied an empty plaintext output buffer.
+  EmptyBuffer,
+  /// Transport input ended before the handshake completed.
+  HandshakeTruncated,
+  /// Transport input ended after the handshake without client `close_notify`.
+  Truncated,
+  /// The client's ALPN offer shares no protocol with the server, or the server requires ALPN and
+  /// the client sent none.
+  NoApplicationProtocol,
+}
+
+impl Copy for ServerError {}
+
+impl Debug for ServerError {
+  /// Writes the name of the variant and its fields, such as `PeerAlert { ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      ServerError.EmptyCertificateChain => run Format.write(
+        &mut formatter,
+        b"EmptyCertificateChain",
+      )
+      ServerError.CertificateDecode { error } => {
+        let mut record = run Format.debugRecord("CertificateDecode", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      ServerError.KeyMismatch => run Format.write(&mut formatter, b"KeyMismatch")
+      ServerError.PeerAlert { code } => {
+        let mut record = run Format.debugRecord("PeerAlert", &mut formatter)
+        run Format.debugField(&mut record, "code", &code, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      ServerError.BadRecordMac => run Format.write(&mut formatter, b"BadRecordMac")
+      ServerError.ProtocolViolation { reason } => {
+        let mut record = run Format.debugRecord("ProtocolViolation", &mut formatter)
+        run Format.debugField(&mut record, "reason", &reason, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      ServerError.Negotiation { failure } => {
+        let mut record = run Format.debugRecord("Negotiation", &mut formatter)
+        run Format.debugField(&mut record, "failure", &failure, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      ServerError.InvalidKeyShare => run Format.write(&mut formatter, b"InvalidKeyShare")
+      ServerError.RsaSignature { error } => {
+        let mut record = run Format.debugRecord("RsaSignature", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      ServerError.Finished => run Format.write(&mut formatter, b"Finished")
+      ServerError.LimitExceeded { kind, limit } => {
+        let mut record = run Format.debugRecord("LimitExceeded", &mut formatter)
+        run Format.debugField(&mut record, "kind", &kind, &mut formatter)
+        run Format.debugField(&mut record, "limit", &limit, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      ServerError.InvalidState { operation } => {
+        let mut record = run Format.debugRecord("InvalidState", &mut formatter)
+        run Format.debugField(&mut record, "operation", &operation, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      ServerError.EmptyBuffer => run Format.write(&mut formatter, b"EmptyBuffer")
+      ServerError.HandshakeTruncated => run Format.write(&mut formatter, b"HandshakeTruncated")
+      ServerError.Truncated => run Format.write(&mut formatter, b"Truncated")
+      ServerError.NoApplicationProtocol => run Format.write(
+        &mut formatter,
+        b"NoApplicationProtocol",
+      )
+    }
+  }
+}
+
+enum ServerState {
+  AwaitClientHello,
+  HelloRetryPending,
+  AwaitRetryClientHello,
+  ServerFlightPending,
+  AwaitClientFinished,
+  Traffic,
+}
+
+enum PendingKind {
+  None,
+  HelloRetry,
+  RetryCcs,
+  ServerHello,
+  Ccs,
+  Flight,
+  Application,
+  KeyUpdate,
+  CloseNotify,
+}
+
+struct ParsedClientHello {
+  sessionOffset: usize,
+  sessionLength: usize,
+  suite: CipherSuite,
+  hasSuite: bool,
+  offersSelectedSuite: bool,
+  tls13: bool,
+  listsX25519: bool,
+  listsP256: bool,
+  listsP384: bool,
+  hasGroups: bool,
+  shareX25519: usize,
+  shareP256: usize,
+  shareP384: usize,
+  hasShares: bool,
+  schemes: usize,
+  hasSchemes: bool,
+  nameOffset: usize,
+  nameLength: usize,
+  alpnOffset: usize,
+  alpnLength: usize,
+  hasAlpn: bool,
+}
+
+struct Digest48 {
+  bytes: [u8; 48],
+  length: usize,
+}
+
+/// A TLS 1.3 server state machine that does no I/O.
+///
+/// # When to use
+/// Make one server for each accepted connection with [`Server.make`]. Then move bytes between it
+/// and the transport until it reports `HandshakeComplete`, and then read and write application
+/// data.
+///
+/// # Details
+/// Each operation returns a [`ServerProgress`] with a [`ServerDemand`] that tells you what to do
+/// next. Output works in two steps: write [`Server.pendingOutput`] to the transport, and then call
+/// [`Server.ackWritten`] with the number of bytes written. The server does not keep your buffers.
+///
+/// # Gotchas
+/// A [`ServerError`] from a call after [`Server.make`] is permanent for the server. The server sends
+/// no alert when it fails. Dropping the server does not send `close_notify`. Call
+/// [`Server.closeWrite`] first. Secrets are not erased.
+pub struct Server {
+  state: ServerState,
+  limits: ServerLimits,
+  key: ServerKey,
+  scheme: usize,
+  groups: GroupPolicy,
+  chain: Intrinsic.RawBuffer<u8>,
+  chainLength: usize,
+  alpn: Intrinsic.RawBuffer<u8>,
+  alpnOffsets: [usize; 16],
+  alpnLengths: [usize; 16],
+  alpnCount: usize,
+  alpnRequired: bool,
+  alpnEnabled: bool,
+  selectedAlpnIndex: usize,
+  hasSelectedAlpn: bool,
+  serverNameBuffer: Intrinsic.RawBuffer<u8>,
+  serverNameLength: usize,
+  hasServerName: bool,
+  sessionId: [u8; 32],
+  sessionIdLength: usize,
+  selectedSuite: CipherSuite,
+  selectedGroup: ServerGroup,
+  helloRetried: bool,
+  ccsSent: bool,
+  transcript256: Sha256,
+  transcript384: Sha384,
+  secretLength: usize,
+  clientHandshakeSecret: [u8; 48],
+  serverHandshakeSecret: [u8; 48],
+  masterSecret: [u8; 48],
+  expectedFinished: [u8; 48],
+  sender: TlsRecordSender,
+  receiver: TlsRecordReceiver,
+  handshake: Intrinsic.RawBuffer<u8>,
+  handshakeLength: usize,
+  handshakeMessages: usize,
+  handshakeBytes: usize,
+  scratch: Intrinsic.RawBuffer<u8>,
+  flight: Intrinsic.RawBuffer<u8>,
+  flightLength: usize,
+  flightOffset: usize,
+  completeReady: bool,
+  completePublished: bool,
+  application: Intrinsic.RawBuffer<u8>,
+  applicationLength: usize,
+  applicationRead: usize,
+  peerClosed: bool,
+  localCloseRequested: bool,
+  localClosed: bool,
+  inputEnded: bool,
+  truncationPending: bool,
+  pendingKind: PendingKind,
+  emptyRecords: usize,
+  postHandshakeControls: usize,
+  pendingKeyUpdate: bool,
+  respondingKeyUpdate: bool,
+  clientTrafficSecret: [u8; 48],
+  serverTrafficSecret: [u8; 48],
+  nextServerTrafficSecret: [u8; 48],
+  terminal: Option<ServerError>,
+}
+
+impl Server {
+  /// Returns a new server for `config` and the leaf's private `key`, waiting for the ClientHello.
+  ///
+  /// The server copies the chain and the ALPN protocols. It decodes the leaf certificate and checks
+  /// that its public key is the public key of `key`.
+  ///
+  /// # Errors
+  /// - `EmptyCertificateChain`, `CertificateDecode`, or `KeyMismatch` for a chain that is not
+  ///   valid.
+  /// - `LimitExceeded` for limits, a chain, or ALPN protocols that are not valid.
+  /// - `OutOfMemoryError` if the `Allocator` fails.
+  pub effect fn make<'a>(config: &ServerConfig<'a>, key: ServerKey) -> Result<Server, ServerError>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let limits = config.limits
+    if let Option<ServerError>.Some { value: error } = validateLimits(limits) {
+      return Result<Server, ServerError>.failResult(error)
+    }
+    let certificates = config.certificates
+    if certificates.length == 0 {
+      return Result<Server, ServerError>.failResult(ServerError.EmptyCertificateChain)
+    }
+    if certificates.length > limits.certificates {
+      return Result<Server, ServerError>.failResult(
+        ServerError.LimitExceeded {
+          kind: ServerLimitKind.Certificates,
+          limit: limits.certificates,
+        },
+      )
+    }
+    let mut derTotal = usize.ZERO
+    let mut index = usize.ZERO
+    while index < certificates.length {
+      let length = certificates[index].bytes.length
+      if length == 0 || length > limits.certificateBytes - derTotal {
+        return Result<Server, ServerError>.failResult(
+          ServerError.LimitExceeded {
+            kind: ServerLimitKind.CertificateBytes,
+            limit: limits.certificateBytes,
+          },
+        )
+      }
+      derTotal = derTotal + length
+      index = index + usize.ONE
+    }
+    let chainLength = derTotal + certificates.length * 5
+    if chainLength > 16777215 - 8 {
+      return Result<Server, ServerError>.failResult(
+        ServerError.LimitExceeded {
+          kind: ServerLimitKind.CertificateBytes,
+          limit: limits.certificateBytes,
+        },
+      )
+    }
+    if let Option<ServerError>.Some { value: error } = validateAlpn(config.alpn) {
+      return Result<Server, ServerError>.failResult(error)
+    }
+
+    let leafBytes = certificates[0].bytes
+    let decoded = run Certificate.decodeDer(leafBytes, limits.certificateDecode)
+    let leaf = match move decoded {
+      Result<Certificate, DecodeError>.Failure { error } => {
+        return Result<Server, ServerError>.failResult(
+          ServerError.CertificateDecode { error: error },
+        )
+      }
+      Result<Certificate, DecodeError>.Success { value } => move value
+    }
+    if !keyMatches(&key, &leaf) {
+      return Result<Server, ServerError>.failResult(ServerError.KeyMismatch)
+    }
+    drop leaf
+
+    let mut chain = run allocateBytes(chainLength)
+    let mut cursor = usize.ZERO
+    index = 0
+    while index < certificates.length {
+      let der = certificates[index].bytes
+      putU24(&mut chain, &mut cursor, der.length)
+
+      // The chain buffer holds `chainLength`, the sum of every DER length plus five bytes for each
+      // entry, so each write ends within it.
+      unsafe RawBuffer.copy<u8>(&mut chain, cursor, der, der.length)
+      cursor = cursor + der.length
+      putU16(&mut chain, &mut cursor, 0)
+      index = index + usize.ONE
+    }
+
+    let alpnLength = alpnPayloadLength(config.alpn)
+    let mut alpn = run allocateBytes(nonzero(alpnLength))
+    let mut alpnOffsets = zeroUsize16()
+    let mut alpnLengths = zeroUsize16()
+    let alpnCount = copyAlpn(&mut alpn, &mut alpnOffsets, &mut alpnLengths, config.alpn)
+    let alpnEnabled = alpnIsEnabled(config.alpn)
+    let alpnRequired = alpnIsRequired(config.alpn)
+
+    let handshakeCapacity = limits.handshakeBodyBytes + HANDSHAKE_HEADER_LENGTH
+      + RECORD_CONTENT_LIMIT
+    let handshake = run allocateBytes(handshakeCapacity)
+    let serverName = run allocateBytes(SERVER_NAME_LIMIT)
+    let scratch = run allocateBytes(SCRATCH_LENGTH)
+    let flight = run allocateBytes(chainLength + FLIGHT_OVERHEAD)
+    let application = run allocateBytes(RECORD_CONTENT_LIMIT)
+    let sender = run TlsRecordSender.makePlaintext()
+    let receiver = run TlsRecordReceiver.makePlaintext()
+
+    return Result<Server, ServerError>.succeed(
+      Server {
+        state: ServerState.AwaitClientHello,
+        limits: limits,
+        key: move key,
+        scheme: 0,
+        groups: config.groups,
+        chain: move chain,
+        chainLength: chainLength,
+        alpn: move alpn,
+        alpnOffsets: alpnOffsets,
+        alpnLengths: alpnLengths,
+        alpnCount: alpnCount,
+        alpnRequired: alpnRequired,
+        alpnEnabled: alpnEnabled,
+        selectedAlpnIndex: 0,
+        hasSelectedAlpn: false,
+        serverNameBuffer: move serverName,
+        serverNameLength: 0,
+        hasServerName: false,
+        sessionId: zero32(),
+        sessionIdLength: 0,
+        selectedSuite: CipherSuite.Aes128GcmSha256,
+        selectedGroup: ServerGroup.X25519,
+        helloRetried: false,
+        ccsSent: false,
+        transcript256: Sha256.make(),
+        transcript384: Sha384.make(),
+        secretLength: 32,
+        clientHandshakeSecret: zero48(),
+        serverHandshakeSecret: zero48(),
+        masterSecret: zero48(),
+        expectedFinished: zero48(),
+        sender: move sender,
+        receiver: move receiver,
+        handshake: move handshake,
+        handshakeLength: 0,
+        handshakeMessages: 0,
+        handshakeBytes: 0,
+        scratch: move scratch,
+        flight: move flight,
+        flightLength: 0,
+        flightOffset: 0,
+        completeReady: false,
+        completePublished: false,
+        application: move application,
+        applicationLength: 0,
+        applicationRead: 0,
+        peerClosed: false,
+        localCloseRequested: false,
+        localClosed: false,
+        inputEnded: false,
+        truncationPending: false,
+        pendingKind: PendingKind.None,
+        emptyRecords: 0,
+        postHandshakeControls: 0,
+        pendingKeyUpdate: false,
+        respondingKeyUpdate: false,
+        clientTrafficSecret: zero48(),
+        serverTrafficSecret: zero48(),
+        nextServerTrafficSecret: zero48(),
+        terminal: Option<ServerError>.none(),
+      },
+    )
+  }
+
+  /// Returns the TLS output to send to the client. After you send some of it, call
+  /// [`Server.ackWritten`].
+  pub fn pendingOutput<'a>(self: &'a Self) -> &'a [u8] {
+    return TlsRecordSender.pendingOutput(&self.sender)
+  }
+
+  /// Returns the host name that the client sent in its SNI extension, after the server read the
+  /// ClientHello. Before that, or without SNI, returns `None`.
+  pub fn serverName<'a>(self: &'a Self) -> Option<&'a [u8]> {
+    if !self.hasServerName {
+      return Option<&'a [u8]>.none()
+    }
+    let length = self.serverNameLength
+
+    // `serverNameLength <= SERVER_NAME_LIMIT`, the buffer's capacity, and the ClientHello parser
+    // wrote every byte before it.
+    return Option<&'a [u8]>.some(unsafe RawBuffer.view<u8>(&self.serverNameBuffer, 0, length))
+  }
+
+  /// Returns the ALPN protocol that the server selected, after the server read the ClientHello.
+  /// Before that, or without a selection, returns `None`.
+  pub fn selectedAlpn<'a>(self: &'a Self) -> Option<&'a [u8]> {
+    if !self.hasSelectedAlpn {
+      return Option<&'a [u8]>.none()
+    }
+    let offset = self.alpnOffsets[self.selectedAlpnIndex]
+    let length = self.alpnLengths[self.selectedAlpnIndex]
+
+    // `copyAlpn` recorded this protocol's range within the ALPN buffer, and filled that range.
+    return Option<&'a [u8]>.some(unsafe RawBuffer.view<u8>(&self.alpn, offset, length))
+  }
+
+  /// Returns the negotiated cipher suite after the `HandshakeComplete` action. Before that, returns
+  /// `None`.
+  pub fn cipherSuite(self: &Self) -> Option<CipherSuite> {
+    if !self.completePublished {
+      return Option<CipherSuite>.none()
+    }
+    return Option<CipherSuite>.some(self.selectedSuite)
+  }
+
+  /// Returns the negotiated key exchange group after the `HandshakeComplete` action. Before that,
+  /// returns `None`.
+  pub fn group(self: &Self) -> Option<ServerGroup> {
+    if !self.completePublished {
+      return Option<ServerGroup>.none()
+    }
+    return Option<ServerGroup>.some(self.selectedGroup)
+  }
+
+  /// Returns whether the server sent a HelloRetryRequest in this handshake.
+  pub fn retried(self: &Self) -> bool {
+    return self.helloRetried
+  }
+
+  /// Returns whether the client sent `close_notify`. Plaintext that came before it can still be
+  /// read.
+  pub fn closeNotified(self: &Self) -> bool {
+    return self.peerClosed
+  }
+
+  /// Gives bytes from the client to the server. `consumed` in the result tells how many it
+  /// accepted.
+  ///
+  /// # Details
+  /// The server does not keep `input`. Give the bytes that it did not accept again in the next
+  /// call. During the handshake, it accepts no bytes while output is pending. After the client
+  /// sends `close_notify`, the server accepts and ignores all later bytes.
+  pub effect fn feedInput(self: &mut Self, input: &[u8]) -> Result<ServerProgress, ServerError>
+    ! OutOfMemoryError
+    ? &mut Allocator | &mut Random {
+    if let Option<ServerError>.Some { value: error } = self.terminal {
+      return Result<ServerProgress, ServerError>.failResult(error)
+    }
+    if self.peerClosed {
+      return success(input.length, 0, demand(&mut self.*))
+    }
+    if self.applicationLength > self.applicationRead {
+      return success(0, 0, demand(&mut self.*))
+    }
+    if self.state != ServerState.Traffic && TlsRecordSender.pendingOutput(&self.sender).length > 0 {
+      return success(0, 0, demand(&mut self.*))
+    }
+    if self.inputEnded {
+      return invalidState(ServerOperation.FeedInput)
+    }
+    let fed = TlsRecordReceiver.feedInput(&mut self.receiver, input)
+    let progress = match move fed {
+      Result<InputProgress, RecordError>.Failure { error } => {
+        return progressFailure(&mut self.*, mapRecordError(move error))
+      }
+      Result<InputProgress, RecordError>.Success { value } => move value
+    }
+    if progress.demand == InputDemand.RecordReady {
+      let handled = run handleReadyRecord(&mut self.*)
+      if let Result<(), ServerError>.Failure { error } = move handled {
+        return progressFailure(&mut self.*, error)
+      }
+      if let Result<(), ServerError>.Failure { error } = scheduleControl(&mut self.*) {
+        return progressFailure(&mut self.*, error)
+      }
+    }
+    return success(progress.consumed, 0, demand(&mut self.*))
+  }
+
+  /// Processes buffered handshake messages without new input, and returns the next action.
+  pub effect fn progress(self: &mut Self) -> Result<ServerProgress, ServerError>
+    ! OutOfMemoryError
+    ? &mut Allocator | &mut Random {
+    if let Option<ServerError>.Some { value: error } = self.terminal {
+      return Result<ServerProgress, ServerError>.failResult(error)
+    }
+    let processed = run processAvailable(&mut self.*)
+    if let Result<(), ServerError>.Failure { error } = move processed {
+      return progressFailure(&mut self.*, error)
+    }
+    if let Result<(), ServerError>.Failure { error } = scheduleControl(&mut self.*) {
+      return progressFailure(&mut self.*, error)
+    }
+    return success(0, 0, demand(&mut self.*))
+  }
+
+  /// Tells the server that the transport sent the first `count` bytes of [`Server.pendingOutput`].
+  pub fn ackWritten(self: &mut Self, count: usize) -> Result<ServerProgress, ServerError> {
+    if let Option<ServerError>.Some { value: error } = self.terminal {
+      return Result<ServerProgress, ServerError>.failResult(error)
+    }
+    let before = TlsRecordSender.pendingOutput(&self.sender).length
+    let acknowledged = TlsRecordSender.ackWritten(&mut self.sender, count)
+    if let Result<(), RecordError>.Failure { error } = move acknowledged {
+      drop error
+      return invalidState(ServerOperation.AckWritten)
+    }
+    let after = TlsRecordSender.pendingOutput(&self.sender).length
+    if before > 0 && after == 0 {
+      if let Result<(), ServerError>.Failure { error } = completePending(&mut self.*) {
+        return progressFailure(&mut self.*, error)
+      }
+    }
+    if let Result<(), ServerError>.Failure { error } = scheduleControl(&mut self.*) {
+      return progressFailure(&mut self.*, error)
+    }
+    return success(0, 0, demand(&mut self.*))
+  }
+
+  /// Copies decrypted application data into `output`. `written` in the result tells how many
+  /// bytes.
+  ///
+  /// # Gotchas
+  /// An empty `output` returns the `EmptyBuffer` error. It never means the end of input.
+  pub fn readPlaintext(self: &mut Self, output: &mut [u8]) -> Result<ServerProgress, ServerError> {
+    if let Option<ServerError>.Some { value: error } = self.terminal {
+      return Result<ServerProgress, ServerError>.failResult(error)
+    }
+    if output.length == 0 {
+      return Result<ServerProgress, ServerError>.failResult(ServerError.EmptyBuffer)
+    }
+    if !self.completePublished {
+      return invalidState(ServerOperation.ReadPlaintext)
+    }
+    let available = self.applicationLength - self.applicationRead
+    if available > 0 {
+      let start = self.applicationRead
+      let mut count = available
+      if count > output.length {
+        count = output.length
+      }
+      let mut copied = usize.ZERO
+      while copied < count {
+        // `start + copied < applicationLength <= RECORD_CONTENT_LIMIT`, the application buffer's
+        // capacity. `allocateBytes` zero-fills every buffer, so all bytes are initialized.
+        output[copied] = unsafe RawBuffer.read<u8>(&self.application, start + copied)
+        copied = copied + usize.ONE
+      }
+      self.applicationRead = self.applicationRead + count
+      if self.applicationRead == self.applicationLength {
+        self.applicationRead = 0
+        self.applicationLength = 0
+        if self.truncationPending {
+          return success(0, count, ServerDemand.PlaintextReady)
+        }
+      }
+      return success(0, count, demand(&mut self.*))
+    }
+    if self.truncationPending {
+      self.truncationPending = false
+      return progressFailure(&mut self.*, ServerError.Truncated)
+    }
+    return success(0, 0, demand(&mut self.*))
+  }
+
+  /// Encrypts a prefix of `input`, at most 16384 bytes. `consumed` in the result tells how many
+  /// bytes.
+  ///
+  /// # Details
+  /// When TLS output is waiting, the server accepts no bytes. Send that output first. Do not give
+  /// accepted bytes again, even if the transport sent only part of the record.
+  pub fn writePlaintext(self: &mut Self, input: &[u8]) -> Result<ServerProgress, ServerError> {
+    if let Option<ServerError>.Some { value: error } = self.terminal {
+      return Result<ServerProgress, ServerError>.failResult(error)
+    }
+    if self.state != ServerState.Traffic || !self.completePublished || self.localCloseRequested {
+      return invalidState(ServerOperation.WritePlaintext)
+    }
+    if let Result<(), ServerError>.Failure { error } = scheduleControl(&mut self.*) {
+      return progressFailure(&mut self.*, error)
+    }
+    if TlsRecordSender.pendingOutput(&self.sender).length > 0 {
+      return success(0, 0, ServerDemand.NeedOutput)
+    }
+    if input.length == 0 {
+      return success(0, 0, demand(&mut self.*))
+    }
+    let queued = TlsRecordSender.queueRecord(&mut self.sender, ContentType.ApplicationData, input)
+    let accepted = match move queued {
+      Result<OutputProgress, RecordError>.Failure { error } => {
+        return progressFailure(&mut self.*, mapRecordError(move error))
+      }
+      Result<OutputProgress, RecordError>.Success { value } => value.accepted
+    }
+    self.pendingKind = PendingKind.Application
+    return success(accepted, 0, ServerDemand.NeedOutput)
+  }
+
+  /// Asks for a new local traffic key before the next application write. More calls before that
+  /// write do nothing.
+  pub fn requestKeyUpdate(self: &mut Self) -> Result<ServerProgress, ServerError> {
+    if let Option<ServerError>.Some { value: error } = self.terminal {
+      return Result<ServerProgress, ServerError>.failResult(error)
+    }
+    if self.state != ServerState.Traffic || self.localCloseRequested {
+      return invalidState(ServerOperation.RequestKeyUpdate)
+    }
+    if self.pendingKind != PendingKind.KeyUpdate {
+      self.pendingKeyUpdate = true
+    }
+    if let Result<(), ServerError>.Failure { error } = scheduleControl(&mut self.*) {
+      return progressFailure(&mut self.*, error)
+    }
+    return success(0, 0, demand(&mut self.*))
+  }
+
+  /// Queues `close_notify` after the accepted output. More calls do nothing.
+  pub fn closeWrite(self: &mut Self) -> Result<ServerProgress, ServerError> {
+    if let Option<ServerError>.Some { value: error } = self.terminal {
+      return Result<ServerProgress, ServerError>.failResult(error)
+    }
+    if self.state != ServerState.Traffic {
+      return invalidState(ServerOperation.CloseWrite)
+    }
+    self.localCloseRequested = true
+    if let Result<(), ServerError>.Failure { error } = scheduleControl(&mut self.*) {
+      return progressFailure(&mut self.*, error)
+    }
+    return success(0, 0, demand(&mut self.*))
+  }
+
+  /// Tells the server that the transport has no more input. Pending output stays pending.
+  pub fn endInput(self: &mut Self) -> Result<ServerProgress, ServerError> {
+    if let Option<ServerError>.Some { value: error } = self.terminal {
+      return Result<ServerProgress, ServerError>.failResult(error)
+    }
+    if self.peerClosed {
+      self.inputEnded = true
+      return success(0, 0, demand(&mut self.*))
+    }
+    if self.inputEnded {
+      return invalidState(ServerOperation.EndInput)
+    }
+    self.inputEnded = true
+    if !self.completePublished {
+      return progressFailure(&mut self.*, ServerError.HandshakeTruncated)
+    }
+    if self.applicationLength > self.applicationRead {
+      self.truncationPending = true
+      return success(0, 0, ServerDemand.PlaintextReady)
+    }
+    return progressFailure(&mut self.*, ServerError.Truncated)
+  }
+}
+
+struct Agreement {
+  publicKey: [u8; 97],
+  publicLength: usize,
+  shared: [u8; 48],
+  sharedLength: usize,
+}
+
+fn success(consumed: usize, written: usize, next: ServerDemand) -> Result<
+  ServerProgress,
+  ServerError
+> {
+  return Result<ServerProgress, ServerError>.succeed(
+    ServerProgress { consumed: consumed, written: written, demand: next },
+  )
+}
+
+fn invalidState(operation: ServerOperation) -> Result<ServerProgress, ServerError> {
+  return Result<ServerProgress, ServerError>.failResult(
+    ServerError.InvalidState { operation: operation },
+  )
+}
+
+fn progressFailure(server: &mut Server, error: ServerError) -> Result<ServerProgress, ServerError> {
+  server.terminal = Option<ServerError>.some(error)
+  TlsRecordSender.cancelPending(&mut server.sender)
+  server.pendingKind = PendingKind.None
+  server.applicationLength = 0
+  server.applicationRead = 0
+  return Result<ServerProgress, ServerError>.failResult(error)
+}
+
+fn violation(reason: ServerProtocolReason) -> Result<(), ServerError> {
+  return Result<(), ServerError>.failResult(ServerError.ProtocolViolation { reason: reason })
+}
+
+fn failure(error: ServerError) -> Result<(), ServerError> {
+  return Result<(), ServerError>.failResult(error)
+}
+
+fn ok() -> Result<(), ServerError> {
+  return Result<(), ServerError>.succeed(())
+}
+
+fn demand(server: &mut Server) -> ServerDemand {
+  if TlsRecordSender.pendingOutput(&server.sender).length > 0 {
+    return ServerDemand.NeedOutput
+  }
+  if server.completePublished && server.applicationLength > server.applicationRead {
+    return ServerDemand.PlaintextReady
+  }
+  if server.completeReady && !server.completePublished {
+    server.completePublished = true
+    return ServerDemand.HandshakeComplete
+  }
+  if server.localClosed && server.peerClosed {
+    return ServerDemand.Closed
+  }
+  if server.peerClosed {
+    return ServerDemand.PeerClosed
+  }
+  return ServerDemand.NeedInput
+}
+
+fn nonzero(length: usize) -> usize {
+  if length == 0 {
+    return usize.ONE
+  }
+  return length
+}
+
+effect fn allocateBytes(length: usize) -> Intrinsic.RawBuffer<u8>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let allocation = run Allocator.allocate(Layout { bytes: length, alignment: usize.ONE })
+
+  // The allocation was requested for `length` bytes with byte alignment.
+  let mut buffer = unsafe RawBuffer.from<u8>(move allocation, length)
+  RawBuffer.fill(&mut buffer, 0, length, 0)
+  return move buffer
+}
+
+fn limitError(kind: ServerLimitKind, limit: usize) -> Option<ServerError> {
+  return Option<ServerError>.some(ServerError.LimitExceeded { kind: kind, limit: limit })
+}
+
+fn validateLimits(limits: ServerLimits) -> Option<ServerError> {
+  if limits.handshakeBodyBytes < 64 || limits.handshakeBodyBytes > 16777215 {
+    return limitError(ServerLimitKind.HandshakeBodyBytes, limits.handshakeBodyBytes)
+  }
+  if limits.handshakeBytes == 0 {
+    return limitError(ServerLimitKind.HandshakeBytes, limits.handshakeBytes)
+  }
+  if limits.handshakeMessages == 0 {
+    return limitError(ServerLimitKind.HandshakeMessages, limits.handshakeMessages)
+  }
+  if limits.extensionBytes == 0 || limits.extensionBytes > 65535 {
+    return limitError(ServerLimitKind.ExtensionBytes, limits.extensionBytes)
+  }
+  if limits.certificates == 0 || limits.certificates > CERTIFICATE_LIMIT {
+    return limitError(ServerLimitKind.Certificates, limits.certificates)
+  }
+  if limits.certificateBytes == 0 || limits.certificateBytes > 16777215 {
+    return limitError(ServerLimitKind.CertificateBytes, limits.certificateBytes)
+  }
+  return Option<ServerError>.none()
+}
+
+fn validateAlpn<'a>(config: AlpnConfig<'a>) -> Option<ServerError> {
+  return match config {
+    AlpnConfig<'a>.Disabled => Option<ServerError>.none()
+    AlpnConfig<'a>.Offered { protocols, required: _ } => {
+      if protocols.length == 0 || protocols.length > ALPN_PROTOCOL_LIMIT {
+        return limitError(ServerLimitKind.Alpn, ALPN_PROTOCOL_LIMIT)
+      }
+      let mut total = usize.ZERO
+      let mut index = usize.ZERO
+      while index < protocols.length {
+        let bytes = protocols[index].bytes
+        if bytes.length == 0 || bytes.length > 255 {
+          return limitError(ServerLimitKind.Alpn, 255)
+        }
+        if bytes.length + usize.ONE > ALPN_BYTES_LIMIT - total {
+          return limitError(ServerLimitKind.Alpn, ALPN_BYTES_LIMIT)
+        }
+        total = total + bytes.length + usize.ONE
+        index = index + usize.ONE
+      }
+      return Option<ServerError>.none()
+    }
+  }
+}
+
+fn alpnPayloadLength<'a>(config: AlpnConfig<'a>) -> usize {
+  return match config {
+    AlpnConfig<'a>.Disabled => 0
+    AlpnConfig<'a>.Offered { protocols, required: _ } => {
+      let mut total = usize.ZERO
+      let mut index = usize.ZERO
+      while index < protocols.length {
+        total = total + protocols[index].bytes.length
+        index = index + usize.ONE
+      }
+      return total
+    }
+  }
+}
+
+fn alpnIsEnabled<'a>(config: AlpnConfig<'a>) -> bool {
+  return match config {
+    AlpnConfig<'a>.Disabled => false
+    AlpnConfig<'a>.Offered { .. } => true
+  }
+}
+
+fn alpnIsRequired<'a>(config: AlpnConfig<'a>) -> bool {
+  return match config {
+    AlpnConfig<'a>.Disabled => false
+    AlpnConfig<'a>.Offered { protocols: _, required } => required
+  }
+}
+
+fn copyAlpn<'a>(
+  destination: &mut Intrinsic.RawBuffer<u8>,
+  offsets: &mut [usize],
+  lengths: &mut [usize],
+  config: AlpnConfig<'a>,
+) -> usize {
+  return match config {
+    AlpnConfig<'a>.Disabled => 0
+    AlpnConfig<'a>.Offered { protocols, required: _ } => {
+      let mut offset = usize.ZERO
+      let mut index = usize.ZERO
+      while index < protocols.length {
+        let bytes = protocols[index].bytes
+        offsets[index] = offset
+        lengths[index] = bytes.length
+
+        // The destination holds `alpnPayloadLength` bytes, the sum of every protocol length, so
+        // each copy ends within it.
+        unsafe RawBuffer.copy<u8>(&mut destination.*, offset, bytes, bytes.length)
+        offset = offset + bytes.length
+        index = index + usize.ONE
+      }
+      return protocols.length
+    }
+  }
+}
+
+// The DER AlgorithmIdentifier of each certificate key type that a `ServerKey` signs for:
+// id-ecPublicKey with secp256r1 or secp384r1 (RFC 5480), and id-Ed25519 (RFC 8410).
+const P256_ALGORITHM: &'static [u8] = b"\x30\x13\x06\x07\x2a\x86\x48\xce\x3d\x02\x01\x06\x08\x2a\x86\x48\xce\x3d\x03\x01\x07"
+
+const P384_ALGORITHM: &'static [u8] = b"\x30\x10\x06\x07\x2a\x86\x48\xce\x3d\x02\x01\x06\x05\x2b\x81\x04\x00\x22"
+
+const ED25519_ALGORITHM: &'static [u8] = b"\x30\x05\x06\x03\x2b\x65\x70"
+
+fn keyMatches(key: &ServerKey, leaf: &Certificate) -> bool {
+  let leafKey = Certificate.publicKey(leaf)
+  if leafKey.unusedBits != 0 {
+    return false
+  }
+  let algorithm = Certificate.publicKeyAlgorithm(leaf)
+  return match &key.* {
+    ServerKey.EcdsaP256 { key: secret } => {
+      let publicKey = P256.publicKey(&secret)
+      return sameBytes(algorithm.der, P256_ALGORITHM) && sameBytes(&publicKey, leafKey.bytes)
+    }
+    ServerKey.EcdsaP384 { key: secret } => {
+      let publicKey = P384.publicKey(&secret)
+      return sameBytes(algorithm.der, P384_ALGORITHM) && sameBytes(&publicKey, leafKey.bytes)
+    }
+    ServerKey.Ed25519 { key: secret } => {
+      let publicKey = secret.publicKey()
+      return sameBytes(algorithm.der, ED25519_ALGORITHM) && sameBytes(&publicKey, leafKey.bytes)
+    }
+    ServerKey.RsaPss { key: secret } => {
+      return match RsaPublicKey.fromCertificateKey(
+        algorithm.der,
+        leafKey.bytes,
+        leafKey.unusedBits,
+      ) {
+        Result<RsaPublicKey, RsaError>.Failure { .. } => false
+        Result<RsaPublicKey, RsaError>.Success { value: certified } => {
+          let own = secret.publicKey()
+          return certified.modulus().equals(&own.modulus())
+            && certified.exponent().equals(&own.exponent())
+        }
+      }
+    }
+  }
+}
+
+fn sameBytes(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut index = usize.ZERO
+  while index < left.length {
+    if left[index] != right[index] {
+      return false
+    }
+    index = index + usize.ONE
+  }
+  return true
+}
+
+fn constantWorkEqual(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut difference: u8 = 0
+  let mut index = usize.ZERO
+  while index < left.length {
+    difference = difference | (left[index] ^ right[index])
+    index = index + usize.ONE
+  }
+  return difference == 0
+}
+
+fn zero32() -> [u8; 32] {
+  return [0; 32]
+}
+
+fn zero48() -> [u8; 48] {
+  return [0; 48]
+}
+
+fn zeroUsize16() -> [usize; 16] {
+  return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+}
+
+fn fixed48(bytes: &[u8]) -> [u8; 48] {
+  let mut output = zero48()
+  let mut index = usize.ZERO
+  while index < 48 && index < bytes.length {
+    output[index] = bytes[index]
+    index = index + usize.ONE
+  }
+  return output
+}
+
+fn first32(bytes: &[u8]) -> [u8; 32] {
+  let mut output = zero32()
+  let mut index = usize.ZERO
+  while index < 32 && index < bytes.length {
+    output[index] = bytes[index]
+    index = index + usize.ONE
+  }
+  return output
+}
+
+fn putU8(buffer: &mut Intrinsic.RawBuffer<u8>, cursor: &mut usize, value: u8) -> () {
+  RawBuffer.fill(&mut buffer.*, cursor.*, usize.ONE, value)
+  cursor.* = cursor.* + usize.ONE
+  return ()
+}
+
+fn putU16(buffer: &mut Intrinsic.RawBuffer<u8>, cursor: &mut usize, value: usize) -> () {
+  putU8(&mut buffer.*, &mut cursor.*, usize.toU8(value / 256 % 256))
+  putU8(&mut buffer.*, &mut cursor.*, usize.toU8(value % 256))
+  return ()
+}
+
+fn putU24(buffer: &mut Intrinsic.RawBuffer<u8>, cursor: &mut usize, value: usize) -> () {
+  putU8(&mut buffer.*, &mut cursor.*, usize.toU8(value / 65536 % 256))
+  putU8(&mut buffer.*, &mut cursor.*, usize.toU8(value / 256 % 256))
+  putU8(&mut buffer.*, &mut cursor.*, usize.toU8(value % 256))
+  return ()
+}
+
+fn putSlice(buffer: &mut Intrinsic.RawBuffer<u8>, cursor: &mut usize, bytes: &[u8]) -> () {
+  // Callers write messages whose maximum size fits the buffer: ServerHello and HelloRetryRequest
+  // fit `SCRATCH_LENGTH`, and the flight fits `chainLength + FLIGHT_OVERHEAD`.
+  unsafe RawBuffer.copy<u8>(&mut buffer.*, cursor.*, bytes, bytes.length)
+  cursor.* = cursor.* + bytes.length
+  return ()
+}
+
+fn setU16(buffer: &mut Intrinsic.RawBuffer<u8>, offset: usize, value: usize) -> () {
+  let mut cursor = offset
+  putU16(&mut buffer.*, &mut cursor, value)
+  return ()
+}
+
+fn setU24(buffer: &mut Intrinsic.RawBuffer<u8>, offset: usize, value: usize) -> () {
+  let mut cursor = offset
+  putU24(&mut buffer.*, &mut cursor, value)
+  return ()
+}
+
+fn readU8Raw(buffer: &Intrinsic.RawBuffer<u8>, offset: usize) -> usize {
+  // Every caller passes `offset + 1` within the bytes it has received. `allocateBytes` zero-fills
+  // every buffer, so all bytes are initialized.
+  return u8.toUsize(unsafe RawBuffer.read<u8>(buffer, offset))
+}
+
+fn readU16Raw(buffer: &Intrinsic.RawBuffer<u8>, offset: usize) -> usize {
+  return readU8Raw(buffer, offset) * 256 + readU8Raw(buffer, offset + usize.ONE)
+}
+
+fn readU24Raw(buffer: &Intrinsic.RawBuffer<u8>, offset: usize) -> usize {
+  return readU8Raw(buffer, offset) * 65536 + readU8Raw(buffer, offset + usize.ONE) * 256
+    + readU8Raw(buffer, offset + 2)
+}
+
+fn mapRecordError(error: RecordError) -> ServerError {
+  return match move error {
+    RecordError.AuthenticationFailed => ServerError.BadRecordMac
+    RecordError.InvalidAcknowledgment { .. } => ServerError.InvalidState {
+      operation: ServerOperation.AckWritten,
+    }
+    RecordError.InvalidSecretLength { .. } => ServerError.ProtocolViolation {
+      reason: ServerProtocolReason.InternalState,
+    }
+    RecordError.InvalidState => ServerError.ProtocolViolation {
+      reason: ServerProtocolReason.InternalState,
+    }
+    RecordError.RecordOverflow { .. } => ServerError.ProtocolViolation {
+      reason: ServerProtocolReason.Record,
+    }
+    RecordError.InvalidContent => ServerError.ProtocolViolation {
+      reason: ServerProtocolReason.Record,
+    }
+    RecordError.KeyUsageExhausted => ServerError.ProtocolViolation {
+      reason: ServerProtocolReason.Record,
+    }
+  }
+}
+
+fn recordUnit(result: Result<(), RecordError>) -> Result<(), ServerError> {
+  return match move result {
+    Result<(), RecordError>.Failure { error } => failure(mapRecordError(move error))
+    Result<(), RecordError>.Success { .. } => ok()
+  }
+}
+
+fn queueRecordUnit(server: &mut Server, contentType: ContentType, content: &[u8]) -> Result<
+  usize,
+  ServerError
+> {
+  let queued = TlsRecordSender.queueRecord(&mut server.sender, contentType, content)
+  return match move queued {
+    Result<OutputProgress, RecordError>.Failure { error } => {
+      return Result<usize, ServerError>.failResult(mapRecordError(move error))
+    }
+    Result<OutputProgress, RecordError>.Success { value } => {
+      if value.accepted == 0 && content.length > 0 {
+        return Result<usize, ServerError>.failResult(
+          ServerError.ProtocolViolation { reason: ServerProtocolReason.InternalState },
+        )
+      }
+      return Result<usize, ServerError>.succeed(value.accepted)
+    }
+  }
+}
+
+fn secretView<'a>(secret: &'a [u8; 48], length: usize) -> &'a [u8] {
+  return Slice.view<u8>(secret, 0, length)
+}
+
+fn completePending(server: &mut Server) -> Result<(), ServerError> {
+  let kind = server.pendingKind
+  server.pendingKind = PendingKind.None
+  if kind == PendingKind.HelloRetry {
+    if server.sessionIdLength > 0 && !server.ccsSent {
+      return queueCompatibilityCcs(&mut server.*, PendingKind.RetryCcs)
+    }
+    server.state = ServerState.AwaitRetryClientHello
+    return ok()
+  }
+  if kind == PendingKind.RetryCcs {
+    server.state = ServerState.AwaitRetryClientHello
+    return ok()
+  }
+  if kind == PendingKind.ServerHello {
+    if server.sessionIdLength > 0 && !server.ccsSent {
+      return queueCompatibilityCcs(&mut server.*, PendingKind.Ccs)
+    }
+    return startFlight(&mut server.*)
+  }
+  if kind == PendingKind.Ccs {
+    return startFlight(&mut server.*)
+  }
+  if kind == PendingKind.Flight {
+    if server.flightOffset < server.flightLength {
+      return queueFlightChunk(&mut server.*)
+    }
+    let suite = server.selectedSuite
+    let secret = server.serverTrafficSecret
+    let length = server.secretLength
+    let replaced = TlsRecordSender.replaceEpoch(
+      &mut server.sender,
+      suite,
+      secretView(&secret, length),
+    )
+    if let Result<(), ServerError>.Failure { error } = recordUnit(move replaced) {
+      return failure(error)
+    }
+    server.state = ServerState.AwaitClientFinished
+    return ok()
+  }
+  if kind == PendingKind.KeyUpdate {
+    let suite = server.selectedSuite
+    let secret = server.nextServerTrafficSecret
+    let length = server.secretLength
+    let replaced = TlsRecordSender.replaceEpoch(
+      &mut server.sender,
+      suite,
+      secretView(&secret, length),
+    )
+    if let Result<(), ServerError>.Failure { error } = recordUnit(move replaced) {
+      return failure(error)
+    }
+    server.serverTrafficSecret = secret
+    return ok()
+  }
+  if kind == PendingKind.CloseNotify {
+    server.localClosed = true
+    return ok()
+  }
+  return ok()
+}
+
+fn queueCompatibilityCcs(server: &mut Server, kind: PendingKind) -> Result<(), ServerError> {
+  let ccs: [u8; 1] = [1]
+  let queued = queueRecordUnit(&mut server.*, ContentType.ChangeCipherSpec, &ccs)
+  if let Result<usize, ServerError>.Failure { error } = move queued {
+    return failure(error)
+  }
+  server.ccsSent = true
+  server.pendingKind = kind
+  return ok()
+}
+
+fn startFlight(server: &mut Server) -> Result<(), ServerError> {
+  let suite = server.selectedSuite
+  let secret = server.serverHandshakeSecret
+  let length = server.secretLength
+  let replaced = TlsRecordSender.replaceEpoch(
+    &mut server.sender,
+    suite,
+    secretView(&secret, length),
+  )
+  if let Result<(), ServerError>.Failure { error } = recordUnit(move replaced) {
+    return failure(error)
+  }
+  return queueFlightChunk(&mut server.*)
+}
+
+fn queueFlightChunk(server: &mut Server) -> Result<(), ServerError> {
+  let offset = server.flightOffset
+  let remaining = server.flightLength - offset
+
+  // `flightOffset < flightLength <= chainLength + FLIGHT_OVERHEAD`, the flight buffer's capacity,
+  // and `buildFlight` wrote every byte before `flightLength`.
+  let chunk = unsafe RawBuffer.view<u8>(&server.flight, offset, remaining)
+  let queued = TlsRecordSender.queueRecord(&mut server.sender, ContentType.Handshake, chunk)
+  let accepted = match move queued {
+    Result<OutputProgress, RecordError>.Failure { error } => {
+      return failure(mapRecordError(move error))
+    }
+    Result<OutputProgress, RecordError>.Success { value } => value.accepted
+  }
+  if accepted == 0 {
+    return violation(ServerProtocolReason.InternalState)
+  }
+  server.flightOffset = offset + accepted
+  server.pendingKind = PendingKind.Flight
+  return ok()
+}
+
+fn scheduleControl(server: &mut Server) -> Result<(), ServerError> {
+  if server.state != ServerState.Traffic
+    || TlsRecordSender.pendingOutput(&server.sender).length > 0 {
+    return ok()
+  }
+  if TlsRecordSender.recordsRemaining(&server.sender) == 1 {
+    server.pendingKeyUpdate = true
+  }
+  if server.respondingKeyUpdate || server.pendingKeyUpdate {
+    let requestPeer = server.pendingKeyUpdate && !server.respondingKeyUpdate
+    let mut message: [u8; 5] = [24, 0, 0, 1, 0]
+    if requestPeer {
+      message[4] = 1
+    }
+    let current = server.serverTrafficSecret
+    let next = nextTrafficSecret(server.secretLength, &current)
+    let secret = match move next {
+      Result<[u8; 48], ServerError>.Failure { error } => {
+        return failure(error)
+      }
+      Result<[u8; 48], ServerError>.Success { value } => value
+    }
+    let queued = queueRecordUnit(&mut server.*, ContentType.Handshake, &message)
+    if let Result<usize, ServerError>.Failure { error } = move queued {
+      return failure(error)
+    }
+    server.nextServerTrafficSecret = secret
+    server.pendingKeyUpdate = false
+    server.respondingKeyUpdate = false
+    server.pendingKind = PendingKind.KeyUpdate
+    return ok()
+  }
+  if server.localCloseRequested && !server.localClosed {
+    let alert: [u8; 2] = [1, 0]
+    let queued = queueRecordUnit(&mut server.*, ContentType.Alert, &alert)
+    if let Result<usize, ServerError>.Failure { error } = move queued {
+      return failure(error)
+    }
+    server.pendingKind = PendingKind.CloseNotify
+  }
+  return ok()
+}
+
+fn nextTrafficSecret(length: usize, secret: &[u8; 48]) -> Result<[u8; 48], ServerError> {
+  let mut output = zero48()
+  let view = Slice.viewMut<u8>(&mut output, 0, length)
+  let expanded = expandLabelBy(length, secretView(secret, length), b"traffic upd", move view)
+  if let Result<(), ServerError>.Failure { error } = move expanded {
+    return Result<[u8; 48], ServerError>.failResult(error)
+  }
+  return Result<[u8; 48], ServerError>.succeed(output)
+}
+
+effect fn handleReadyRecord(server: &mut Server) -> Result<(), ServerError>
+  ! OutOfMemoryError
+  ? &mut Allocator | &mut Random {
+  let contentTypeOption = TlsRecordReceiver.readyContentType(&server.receiver)
+  let contentType = match move contentTypeOption {
+    Option<ContentType>.None => {
+      return violation(ServerProtocolReason.InternalState)
+    }
+    Option<ContentType>.Some { value } => value
+  }
+  let contentLength = TlsRecordReceiver.readyLength(&server.receiver)
+  if contentType == ContentType.Handshake {
+    let capacity = server.limits.handshakeBodyBytes + HANDSHAKE_HEADER_LENGTH + RECORD_CONTENT_LIMIT
+    if contentLength > capacity - server.handshakeLength {
+      return failure(
+        ServerError.LimitExceeded {
+          kind: ServerLimitKind.HandshakeBodyBytes,
+          limit: server.limits.handshakeBodyBytes,
+        },
+      )
+    }
+
+    // The check above keeps `handshakeLength + contentLength` within the handshake capacity.
+    // `allocateBytes` zero-fills every buffer, so all bytes are initialized.
+    let offset = server.handshakeLength
+    let destination = unsafe RawBuffer.viewMut<u8>(&mut server.handshake, offset, contentLength)
+    let consumed = TlsRecordReceiver.consumeRecordInto(&mut server.receiver, move destination)
+    if let Result<usize, RecordError>.Failure { error } = move consumed {
+      return failure(mapRecordError(move error))
+    }
+    server.handshakeLength = server.handshakeLength + contentLength
+    server.emptyRecords = 0
+    return run processAvailable(&mut server.*)
+  }
+  if contentType == ContentType.ChangeCipherSpec {
+    if server.handshakeLength > 0 {
+      return violation(ServerProtocolReason.UnexpectedMessage)
+    }
+    if !compatibilityWindow(server.state) || contentLength != 1 {
+      return violation(ServerProtocolReason.CompatibilityCcs)
+    }
+    let mut ccs: [u8; 1] = [0]
+    let consumed = TlsRecordReceiver.consumeRecordInto(&mut server.receiver, &mut ccs)
+    if let Result<usize, RecordError>.Failure { error } = move consumed {
+      return failure(mapRecordError(move error))
+    }
+    if ccs[0] != 1 {
+      return violation(ServerProtocolReason.CompatibilityCcs)
+    }
+    return countEmptyRecord(&mut server.*)
+  }
+  if contentType == ContentType.Alert {
+    if server.handshakeLength > 0 || contentLength != 2 {
+      return violation(ServerProtocolReason.UnexpectedMessage)
+    }
+    let mut alert: [u8; 2] = [0, 0]
+    let consumed = TlsRecordReceiver.consumeRecordInto(&mut server.receiver, &mut alert)
+    if let Result<usize, RecordError>.Failure { error } = move consumed {
+      return failure(mapRecordError(move error))
+    }
+    let description = alert[1]
+    if description == 0 {
+      if server.state != ServerState.Traffic {
+        return violation(ServerProtocolReason.UnexpectedMessage)
+      }
+      server.peerClosed = true
+      return ok()
+    }
+    if description == 90 {
+      return ok()
+    }
+    return failure(ServerError.PeerAlert { code: description })
+  }
+  if contentType == ContentType.ApplicationData {
+    if server.handshakeLength > 0 || server.state != ServerState.Traffic {
+      return violation(ServerProtocolReason.UnexpectedMessage)
+    }
+    if contentLength == 0 {
+      let mut empty: [u8; 0] = []
+      let consumed = TlsRecordReceiver.consumeRecordInto(&mut server.receiver, &mut empty)
+      if let Result<usize, RecordError>.Failure { error } = move consumed {
+        return failure(mapRecordError(move error))
+      }
+      return countEmptyRecord(&mut server.*)
+    }
+
+    // The record receiver admits at most `RECORD_CONTENT_LIMIT` content bytes, the application
+    // buffer's capacity. `allocateBytes` zero-fills every buffer, so all bytes are initialized.
+    let destination = unsafe RawBuffer.viewMut<u8>(&mut server.application, 0, contentLength)
+    let consumed = TlsRecordReceiver.consumeRecordInto(&mut server.receiver, move destination)
+    if let Result<usize, RecordError>.Failure { error } = move consumed {
+      return failure(mapRecordError(move error))
+    }
+    server.applicationLength = contentLength
+    server.applicationRead = 0
+    server.emptyRecords = 0
+    server.postHandshakeControls = 0
+    return ok()
+  }
+  return violation(ServerProtocolReason.Record)
+}
+
+fn countEmptyRecord(server: &mut Server) -> Result<(), ServerError> {
+  server.emptyRecords = server.emptyRecords + usize.ONE
+  if server.emptyRecords > server.limits.emptyRecords {
+    return failure(
+      ServerError.LimitExceeded {
+        kind: ServerLimitKind.EmptyRecords,
+        limit: server.limits.emptyRecords,
+      },
+    )
+  }
+  return ok()
+}
+
+fn compatibilityWindow(state: ServerState) -> bool {
+  return state == ServerState.HelloRetryPending || state == ServerState.AwaitRetryClientHello
+    || state == ServerState.ServerFlightPending
+    || state == ServerState.AwaitClientFinished
+}
+
+fn completeHandshakeAvailable(server: &Server) -> bool {
+  if server.handshakeLength < HANDSHAKE_HEADER_LENGTH {
+    return false
+  }
+  let length = readU24Raw(&server.handshake, usize.ONE)
+  if length > server.limits.handshakeBodyBytes {
+    return true
+  }
+  return length <= server.handshakeLength - HANDSHAKE_HEADER_LENGTH
+}
+
+effect fn processAvailable(server: &mut Server) -> Result<(), ServerError>
+  ! OutOfMemoryError
+  ? &mut Allocator | &mut Random {
+  while completeHandshakeAvailable(&server.*) {
+    let processed = run processHandshake(&mut server.*)
+    if let Result<(), ServerError>.Failure { error } = move processed {
+      return failure(error)
+    }
+  }
+  return ok()
+}
+
+effect fn processHandshake(server: &mut Server) -> Result<(), ServerError>
+  ! OutOfMemoryError
+  ? &mut Allocator | &mut Random {
+  let messageType = readU8Raw(&server.handshake, 0)
+  let bodyLength = readU24Raw(&server.handshake, usize.ONE)
+  if bodyLength > server.limits.handshakeBodyBytes {
+    return failure(
+      ServerError.LimitExceeded {
+        kind: ServerLimitKind.HandshakeBodyBytes,
+        limit: server.limits.handshakeBodyBytes,
+      },
+    )
+  }
+  let messageLength = bodyLength + HANDSHAKE_HEADER_LENGTH
+  if server.state == ServerState.Traffic {
+    server.postHandshakeControls = server.postHandshakeControls + usize.ONE
+    if server.postHandshakeControls > server.limits.postHandshakeControls {
+      return failure(
+        ServerError.LimitExceeded {
+          kind: ServerLimitKind.PostHandshakeControls,
+          limit: server.limits.postHandshakeControls,
+        },
+      )
+    }
+  } else {
+    if messageLength > server.limits.handshakeBytes - server.handshakeBytes {
+      return failure(
+        ServerError.LimitExceeded {
+          kind: ServerLimitKind.HandshakeBytes,
+          limit: server.limits.handshakeBytes,
+        },
+      )
+    }
+    if server.handshakeMessages >= server.limits.handshakeMessages {
+      return failure(
+        ServerError.LimitExceeded {
+          kind: ServerLimitKind.HandshakeMessages,
+          limit: server.limits.handshakeMessages,
+        },
+      )
+    }
+    server.handshakeBytes = server.handshakeBytes + messageLength
+    server.handshakeMessages = server.handshakeMessages + usize.ONE
+  }
+  let handled = run dispatchHandshake(&mut server.*, messageType, messageLength)
+  if let Result<(), ServerError>.Failure { error } = move handled {
+    return failure(error)
+  }
+  shiftHandshake(&mut server.*, messageLength)
+  return ok()
+}
+
+effect fn dispatchHandshake(
+  server: &mut Server,
+  messageType: usize,
+  messageLength: usize,
+) -> Result<(), ServerError>
+  ! OutOfMemoryError
+  ? &mut Allocator | &mut Random {
+  if server.state == ServerState.AwaitClientHello && messageType == 1 {
+    return run handleClientHello(&mut server.*, messageLength, false)
+  }
+  if server.state == ServerState.AwaitRetryClientHello && messageType == 1 {
+    return run handleClientHello(&mut server.*, messageLength, true)
+  }
+  if server.state == ServerState.AwaitClientFinished && messageType == 20 {
+    return handleClientFinished(&mut server.*, messageLength)
+  }
+  if server.state == ServerState.Traffic && messageType == 24 {
+    return handleKeyUpdate(&mut server.*, messageLength)
+  }
+  return violation(ServerProtocolReason.UnexpectedMessage)
+}
+
+fn shiftHandshake(server: &mut Server, length: usize) -> () {
+  let remaining = server.handshakeLength - length
+  let mut index = usize.ZERO
+  while index < remaining {
+    // `length + index < handshakeLength`, which stays within the capacity. `allocateBytes`
+    // zero-fills every buffer, so all bytes are initialized.
+    let byte = unsafe RawBuffer.read<u8>(&server.handshake, length + index)
+    RawBuffer.fill(&mut server.handshake, index, usize.ONE, byte)
+    index = index + usize.ONE
+  }
+  server.handshakeLength = remaining
+  return ()
+}
+
+fn suiteFromCode(code: usize) -> Option<CipherSuite> {
+  if code == 4865 {
+    return Option<CipherSuite>.some(CipherSuite.Aes128GcmSha256)
+  }
+  if code == 4866 {
+    return Option<CipherSuite>.some(CipherSuite.Aes256GcmSha384)
+  }
+  if code == 4867 {
+    return Option<CipherSuite>.some(CipherSuite.ChaCha20Poly1305Sha256)
+  }
+  return Option<CipherSuite>.none()
+}
+
+fn suiteCode(suite: CipherSuite) -> usize {
+  if suite == CipherSuite.Aes128GcmSha256 {
+    return 4865
+  }
+  if suite == CipherSuite.Aes256GcmSha384 {
+    return 4866
+  }
+  return 4867
+}
+
+fn groupCode(group: ServerGroup) -> usize {
+  if group == ServerGroup.X25519 {
+    return 29
+  }
+  if group == ServerGroup.P256 {
+    return 23
+  }
+  return 24
+}
+
+fn groupKeyLength(group: ServerGroup) -> usize {
+  if group == ServerGroup.X25519 {
+    return 32
+  }
+  if group == ServerGroup.P256 {
+    return 65
+  }
+  return 97
+}
+
+fn shareOffset(parsed: &ParsedClientHello, group: ServerGroup) -> usize {
+  if group == ServerGroup.X25519 {
+    return parsed.shareX25519
+  }
+  if group == ServerGroup.P256 {
+    return parsed.shareP256
+  }
+  return parsed.shareP384
+}
+
+fn groupListed(parsed: &ParsedClientHello, group: ServerGroup) -> bool {
+  if group == ServerGroup.X25519 {
+    return parsed.listsX25519
+  }
+  if group == ServerGroup.P256 {
+    return parsed.listsP256
+  }
+  return parsed.listsP384
+}
+
+fn groupAllowed(policy: GroupPolicy, group: ServerGroup) -> bool {
+  if group == ServerGroup.X25519 {
+    return policy.x25519
+  }
+  if group == ServerGroup.P256 {
+    return policy.p256
+  }
+  return policy.p384
+}
+
+fn groupAt(index: usize) -> ServerGroup {
+  if index == 0 {
+    return ServerGroup.X25519
+  }
+  if index == 1 {
+    return ServerGroup.P256
+  }
+  return ServerGroup.P384
+}
+
+fn schemeBit(code: usize) -> usize {
+  if code == 1027 {
+    return 1
+  }
+  if code == 1283 {
+    return 2
+  }
+  if code == 2052 {
+    return 4
+  }
+  if code == 2053 {
+    return 8
+  }
+  if code == 2054 {
+    return 16
+  }
+  if code == 2055 {
+    return 32
+  }
+  return 0
+}
+
+// The signature scheme for `key` that the client accepts, or 0 when there is none.
+fn chooseScheme(key: &ServerKey, schemes: usize) -> usize {
+  let mut candidates: [usize; 3] = [0, 0, 0]
+  match &key.* {
+    ServerKey.EcdsaP256 { .. } => {
+      candidates[0] = 1027
+    }
+    ServerKey.EcdsaP384 { .. } => {
+      candidates[0] = 1283
+    }
+    ServerKey.Ed25519 { .. } => {
+      candidates[0] = 2055
+    }
+    ServerKey.RsaPss { .. } => {
+      candidates[0] = 2052
+      candidates[1] = 2053
+      candidates[2] = 2054
+    }
+  }
+  let mut index = usize.ZERO
+  while index < 3 {
+    let code = candidates[index]
+    if code != 0 && usize.bitAnd(schemes, schemeBit(code)) != 0 {
+      return code
+    }
+    index = index + usize.ONE
+  }
+  return 0
+}
+
+effect fn handleClientHello(server: &mut Server, messageLength: usize, retry: bool) -> Result<
+  (),
+  ServerError
+>
+  ! OutOfMemoryError
+  ? &mut Allocator | &mut Random {
+  if messageLength != server.handshakeLength {
+    return violation(ServerProtocolReason.UnexpectedMessage)
+  }
+  let parsedResult = parseClientHello(&server.*, messageLength)
+  let parsed = match move parsedResult {
+    Result<ParsedClientHello, ServerError>.Failure { error } => {
+      return failure(error)
+    }
+    Result<ParsedClientHello, ServerError>.Success { value } => move value
+  }
+  if !parsed.tls13 {
+    return failure(ServerError.Negotiation { failure: NegotiationFailure.Version })
+  }
+  if !parsed.hasGroups || !parsed.hasShares || !parsed.hasSchemes {
+    return violation(ServerProtocolReason.Extension)
+  }
+  let scheme = chooseScheme(&server.key, parsed.schemes)
+  if scheme == 0 {
+    return failure(ServerError.Negotiation { failure: NegotiationFailure.SignatureScheme })
+  }
+  server.scheme = scheme
+  if retry {
+    if !parsed.offersSelectedSuite || shareOffset(&parsed, server.selectedGroup) == 0 {
+      return violation(ServerProtocolReason.HelloRetryRequest)
+    }
+    if !sameSession(&server.*, &parsed) {
+      return violation(ServerProtocolReason.HelloRetryRequest)
+    }
+    let alpn = selectAlpn(&mut server.*, &parsed)
+    if let Result<(), ServerError>.Failure { error } = move alpn {
+      return failure(error)
+    }
+    let offset = shareOffset(&parsed, server.selectedGroup)
+    updateTranscriptHandshake(&mut server.*, messageLength)
+    return run queueServerHello(&mut server.*, offset)
+  }
+  if !parsed.hasSuite {
+    return failure(ServerError.Negotiation { failure: NegotiationFailure.CipherSuite })
+  }
+  server.selectedSuite = parsed.suite
+  server.secretLength = 32
+  if parsed.suite == CipherSuite.Aes256GcmSha384 {
+    server.secretLength = 48
+  }
+  storeSession(&mut server.*, &parsed)
+  storeServerName(&mut server.*, &parsed)
+  let alpn = selectAlpn(&mut server.*, &parsed)
+  if let Result<(), ServerError>.Failure { error } = move alpn {
+    return failure(error)
+  }
+
+  let policy = server.groups
+  let mut index = usize.ZERO
+  while index < 3 {
+    let group = groupAt(index)
+    if groupAllowed(policy, group) && shareOffset(&parsed, group) != 0 {
+      server.selectedGroup = group
+      let offset = shareOffset(&parsed, group)
+      updateTranscriptHandshake(&mut server.*, messageLength)
+      return run queueServerHello(&mut server.*, offset)
+    }
+    index = index + usize.ONE
+  }
+  index = 0
+  while index < 3 {
+    let group = groupAt(index)
+    if groupAllowed(policy, group) && groupListed(&parsed, group) {
+      server.selectedGroup = group
+      return queueHelloRetry(&mut server.*, messageLength)
+    }
+    index = index + usize.ONE
+  }
+  return failure(ServerError.Negotiation { failure: NegotiationFailure.Group })
+}
+
+fn sameSession(server: &Server, parsed: &ParsedClientHello) -> bool {
+  if parsed.sessionLength != server.sessionIdLength {
+    return false
+  }
+  let mut index = usize.ZERO
+  while index < parsed.sessionLength {
+    if readU8Raw(&server.handshake, parsed.sessionOffset + index)
+      != u8.toUsize(server.sessionId[index]) {
+      return false
+    }
+    index = index + usize.ONE
+  }
+  return true
+}
+
+fn storeSession(server: &mut Server, parsed: &ParsedClientHello) -> () {
+  let mut index = usize.ZERO
+  while index < parsed.sessionLength {
+    server.sessionId[index] = usize.toU8(readU8Raw(&server.handshake, parsed.sessionOffset + index))
+    index = index + usize.ONE
+  }
+  server.sessionIdLength = parsed.sessionLength
+  return ()
+}
+
+fn storeServerName(server: &mut Server, parsed: &ParsedClientHello) -> () {
+  if parsed.nameLength == 0 {
+    return ()
+  }
+  let mut index = usize.ZERO
+  while index < parsed.nameLength {
+    let byte = usize.toU8(readU8Raw(&server.handshake, parsed.nameOffset + index))
+    RawBuffer.fill(&mut server.serverNameBuffer, index, usize.ONE, byte)
+    index = index + usize.ONE
+  }
+  server.serverNameLength = parsed.nameLength
+  server.hasServerName = true
+  return ()
+}
+
+fn selectAlpn(server: &mut Server, parsed: &ParsedClientHello) -> Result<(), ServerError> {
+  server.hasSelectedAlpn = false
+  if !server.alpnEnabled {
+    return ok()
+  }
+  if !parsed.hasAlpn {
+    if server.alpnRequired {
+      return failure(ServerError.NoApplicationProtocol)
+    }
+    return ok()
+  }
+  let end = parsed.alpnOffset + parsed.alpnLength
+  let mut index = usize.ZERO
+  while index < server.alpnCount {
+    let offset = server.alpnOffsets[index]
+    let length = server.alpnLengths[index]
+    let mut cursor = parsed.alpnOffset
+    while cursor < end {
+      let candidate = readU8Raw(&server.handshake, cursor)
+      cursor = cursor + usize.ONE
+      if candidate == length {
+        let mut same = true
+        let mut byteIndex = usize.ZERO
+        while byteIndex < length {
+          if readU8Raw(&server.handshake, cursor + byteIndex)
+            != readU8Raw(&server.alpn, offset + byteIndex) {
+            same = false
+          }
+          byteIndex = byteIndex + usize.ONE
+        }
+        if same {
+          server.selectedAlpnIndex = index
+          server.hasSelectedAlpn = true
+          return ok()
+        }
+      }
+      cursor = cursor + candidate
+    }
+    index = index + usize.ONE
+  }
+  return failure(ServerError.NoApplicationProtocol)
+}
+
+fn emptyParsed() -> ParsedClientHello {
+  return ParsedClientHello {
+    sessionOffset: 0,
+    sessionLength: 0,
+    suite: CipherSuite.Aes128GcmSha256,
+    hasSuite: false,
+    offersSelectedSuite: false,
+    tls13: false,
+    listsX25519: false,
+    listsP256: false,
+    listsP384: false,
+    hasGroups: false,
+    shareX25519: 0,
+    shareP256: 0,
+    shareP384: 0,
+    hasShares: false,
+    schemes: 0,
+    hasSchemes: false,
+    nameOffset: 0,
+    nameLength: 0,
+    alpnOffset: 0,
+    alpnLength: 0,
+    hasAlpn: false,
+  }
+}
+
+fn parseFailure(reason: ServerProtocolReason) -> Result<ParsedClientHello, ServerError> {
+  return Result<ParsedClientHello, ServerError>.failResult(
+    ServerError.ProtocolViolation { reason: reason },
+  )
+}
+
+fn parseClientHello(server: &Server, end: usize) -> Result<ParsedClientHello, ServerError> {
+  let buffer = &server.handshake
+  let mut parsed = emptyParsed()
+  if end < 43 {
+    return parseFailure(ServerProtocolReason.InvalidLength)
+  }
+  let mut cursor: usize = 38
+  let sessionLength = readU8Raw(buffer, cursor)
+  cursor = cursor + usize.ONE
+  if sessionLength > 32 || sessionLength > end - cursor {
+    return parseFailure(ServerProtocolReason.ClientHello)
+  }
+  parsed.sessionOffset = cursor
+  parsed.sessionLength = sessionLength
+  cursor = cursor + sessionLength
+  if end - cursor < 2 {
+    return parseFailure(ServerProtocolReason.InvalidLength)
+  }
+  let suitesLength = readU16Raw(buffer, cursor)
+  cursor = cursor + 2
+  if suitesLength == 0 || suitesLength % 2 != 0 || suitesLength > end - cursor {
+    return parseFailure(ServerProtocolReason.InvalidLength)
+  }
+  let selected = suiteCode(server.selectedSuite)
+  let suitesEnd = cursor + suitesLength
+  while cursor < suitesEnd {
+    let code = readU16Raw(buffer, cursor)
+    if !parsed.hasSuite {
+      if let Option<CipherSuite>.Some { value: suite } = suiteFromCode(code) {
+        parsed.suite = suite
+        parsed.hasSuite = true
+      }
+    }
+    if code == selected {
+      parsed.offersSelectedSuite = true
+    }
+    cursor = cursor + 2
+  }
+  if end - cursor < 2 {
+    return parseFailure(ServerProtocolReason.InvalidLength)
+  }
+  let compressionLength = readU8Raw(buffer, cursor)
+  cursor = cursor + usize.ONE
+  if compressionLength == 0 || compressionLength > end - cursor {
+    return parseFailure(ServerProtocolReason.InvalidLength)
+  }
+  let onlyNull = compressionLength == 1 && readU8Raw(buffer, cursor) == 0
+  cursor = cursor + compressionLength
+  if cursor == end {
+    return Result<ParsedClientHello, ServerError>.succeed(move parsed)
+  }
+  if end - cursor < 2 {
+    return parseFailure(ServerProtocolReason.InvalidLength)
+  }
+  let extensionsLength = readU16Raw(buffer, cursor)
+  cursor = cursor + 2
+  if extensionsLength > server.limits.extensionBytes {
+    return Result<ParsedClientHello, ServerError>.failResult(
+      ServerError.LimitExceeded {
+        kind: ServerLimitKind.ExtensionBytes,
+        limit: server.limits.extensionBytes,
+      },
+    )
+  }
+  if extensionsLength != end - cursor {
+    return parseFailure(ServerProtocolReason.InvalidLength)
+  }
+  let extensionsStart = cursor
+  let mut sawPreSharedKey = false
+  while cursor < end {
+    if end - cursor < 4 || sawPreSharedKey {
+      return parseFailure(ServerProtocolReason.Extension)
+    }
+    let kind = readU16Raw(buffer, cursor)
+    let length = readU16Raw(buffer, cursor + 2)
+    cursor = cursor + 4
+    if length > end - cursor {
+      return parseFailure(ServerProtocolReason.Extension)
+    }
+    let mut prior = extensionsStart
+    while prior < cursor - 4 {
+      if readU16Raw(buffer, prior) == kind {
+        return parseFailure(ServerProtocolReason.Extension)
+      }
+      prior = prior + 4 + readU16Raw(buffer, prior + 2)
+    }
+    let mut valid = true
+    if kind == 0 {
+      valid = parseServerName(buffer, cursor, length, &mut parsed)
+    } else if kind == 10 {
+      valid = parseGroups(buffer, cursor, length, &mut parsed)
+    } else if kind == 13 {
+      valid = parseSchemes(buffer, cursor, length, &mut parsed)
+    } else if kind == 43 {
+      valid = parseVersions(buffer, cursor, length, &mut parsed)
+    } else if kind == 51 {
+      valid = parseKeyShares(buffer, cursor, length, &mut parsed)
+    } else if kind == 16 {
+      valid = parseAlpn(buffer, cursor, length, &mut parsed)
+    } else if kind == 44 {
+      valid = false
+    } else if kind == 41 {
+      sawPreSharedKey = true
+    }
+    if !valid {
+      return parseFailure(ServerProtocolReason.Extension)
+    }
+    cursor = cursor + length
+  }
+  if parsed.tls13 && !onlyNull {
+    return parseFailure(ServerProtocolReason.ClientHello)
+  }
+  return Result<ParsedClientHello, ServerError>.succeed(move parsed)
+}
+
+fn parseServerName(
+  buffer: &Intrinsic.RawBuffer<u8>,
+  start: usize,
+  length: usize,
+  parsed: &mut ParsedClientHello,
+) -> bool {
+  if length < 2 || readU16Raw(buffer, start) + 2 != length {
+    return false
+  }
+  let end = start + length
+  let mut cursor = start + 2
+  while cursor < end {
+    if end - cursor < 3 {
+      return false
+    }
+    let nameType = readU8Raw(buffer, cursor)
+    let nameLength = readU16Raw(buffer, cursor + usize.ONE)
+    cursor = cursor + 3
+    if nameLength > end - cursor {
+      return false
+    }
+    if nameType == 0 {
+      if parsed.nameLength != 0 || nameLength == 0 || nameLength > SERVER_NAME_LIMIT {
+        return false
+      }
+      parsed.nameOffset = cursor
+      parsed.nameLength = nameLength
+    }
+    cursor = cursor + nameLength
+  }
+  return true
+}
+
+fn parseGroups(
+  buffer: &Intrinsic.RawBuffer<u8>,
+  start: usize,
+  length: usize,
+  parsed: &mut ParsedClientHello,
+) -> bool {
+  if length < 4 || readU16Raw(buffer, start) + 2 != length || length % 2 != 0 {
+    return false
+  }
+  let mut cursor = start + 2
+  while cursor < start + length {
+    let code = readU16Raw(buffer, cursor)
+    if code == 29 {
+      parsed.listsX25519 = true
+    }
+    if code == 23 {
+      parsed.listsP256 = true
+    }
+    if code == 24 {
+      parsed.listsP384 = true
+    }
+    cursor = cursor + 2
+  }
+  parsed.hasGroups = true
+  return true
+}
+
+fn parseSchemes(
+  buffer: &Intrinsic.RawBuffer<u8>,
+  start: usize,
+  length: usize,
+  parsed: &mut ParsedClientHello,
+) -> bool {
+  if length < 4 || readU16Raw(buffer, start) + 2 != length || length % 2 != 0 {
+    return false
+  }
+  let mut cursor = start + 2
+  while cursor < start + length {
+    let code = readU16Raw(buffer, cursor)
+    parsed.schemes = usize.bitOr(parsed.schemes, schemeBit(code))
+    cursor = cursor + 2
+  }
+  parsed.hasSchemes = true
+  return true
+}
+
+fn parseVersions(
+  buffer: &Intrinsic.RawBuffer<u8>,
+  start: usize,
+  length: usize,
+  parsed: &mut ParsedClientHello,
+) -> bool {
+  if length < 3 || readU8Raw(buffer, start) + 1 != length || length % 2 != 1 {
+    return false
+  }
+  let mut cursor = start + usize.ONE
+  while cursor < start + length {
+    if readU16Raw(buffer, cursor) == 772 {
+      parsed.tls13 = true
+    }
+    cursor = cursor + 2
+  }
+  return true
+}
+
+fn parseKeyShares(
+  buffer: &Intrinsic.RawBuffer<u8>,
+  start: usize,
+  length: usize,
+  parsed: &mut ParsedClientHello,
+) -> bool {
+  if length < 2 || readU16Raw(buffer, start) + 2 != length {
+    return false
+  }
+  let end = start + length
+  let mut cursor = start + 2
+  while cursor < end {
+    if end - cursor < 4 {
+      return false
+    }
+    let code = readU16Raw(buffer, cursor)
+    let keyLength = readU16Raw(buffer, cursor + 2)
+    cursor = cursor + 4
+    if keyLength == 0 || keyLength > end - cursor {
+      return false
+    }
+    let mut prior = start + 2
+    while prior < cursor - 4 {
+      if readU16Raw(buffer, prior) == code {
+        return false
+      }
+      prior = prior + 4 + readU16Raw(buffer, prior + 2)
+    }
+    if code == 29 {
+      if keyLength != 32 {
+        return false
+      }
+      parsed.shareX25519 = cursor
+    } else if code == 23 {
+      if keyLength != 65 {
+        return false
+      }
+      parsed.shareP256 = cursor
+    } else if code == 24 {
+      if keyLength != 97 {
+        return false
+      }
+      parsed.shareP384 = cursor
+    }
+    cursor = cursor + keyLength
+  }
+  parsed.hasShares = true
+  return true
+}
+
+fn parseAlpn(
+  buffer: &Intrinsic.RawBuffer<u8>,
+  start: usize,
+  length: usize,
+  parsed: &mut ParsedClientHello,
+) -> bool {
+  if length < 4 || readU16Raw(buffer, start) + 2 != length {
+    return false
+  }
+  let end = start + length
+  let mut cursor = start + 2
+  while cursor < end {
+    let protocolLength = readU8Raw(buffer, cursor)
+    cursor = cursor + usize.ONE
+    if protocolLength == 0 || protocolLength > end - cursor {
+      return false
+    }
+    cursor = cursor + protocolLength
+  }
+  parsed.alpnOffset = start + 2
+  parsed.alpnLength = length - 2
+  parsed.hasAlpn = true
+  return true
+}
+
+fn queueHelloRetry(server: &mut Server, messageLength: usize) -> Result<(), ServerError> {
+  // `messageLength == handshakeLength`, the complete ClientHello. `allocateBytes` zero-fills every
+  // buffer, so all bytes are initialized.
+  let firstHello = unsafe RawBuffer.view<u8>(&server.handshake, 0, messageLength)
+  if server.secretLength == 48 {
+    let digest = Sha384.hash(firstHello)
+    let mut replacement = Sha384.make()
+    let header: [u8; 4] = [254, 0, 0, 48]
+    replacement.update(&header)
+    replacement.update(&digest)
+    server.transcript384 = move replacement
+  } else {
+    let digest = Sha256.hash(firstHello)
+    let mut replacement = Sha256.make()
+    let header: [u8; 4] = [254, 0, 0, 32]
+    replacement.update(&header)
+    replacement.update(&digest)
+    server.transcript256 = move replacement
+  }
+  drop firstHello
+  let retryRandom: [u8; 32] = [
+    207,
+    33,
+    173,
+    116,
+    229,
+    154,
+    97,
+    17,
+    190,
+    29,
+    140,
+    2,
+    30,
+    101,
+    184,
+    145,
+    194,
+    162,
+    17,
+    22,
+    122,
+    187,
+    140,
+    94,
+    7,
+    158,
+    9,
+    226,
+    200,
+    168,
+    51,
+    156,
+  ]
+  let session = server.sessionId
+  let sessionLength = server.sessionIdLength
+  let suite = suiteCode(server.selectedSuite)
+  let group = groupCode(server.selectedGroup)
+  let mut cursor = HANDSHAKE_HEADER_LENGTH
+  putU16(&mut server.scratch, &mut cursor, 771)
+  putSlice(&mut server.scratch, &mut cursor, &retryRandom)
+  putU8(&mut server.scratch, &mut cursor, usize.toU8(sessionLength))
+  putSlice(&mut server.scratch, &mut cursor, Slice.view<u8>(&session, 0, sessionLength))
+  putU16(&mut server.scratch, &mut cursor, suite)
+  putU8(&mut server.scratch, &mut cursor, 0)
+  putU16(&mut server.scratch, &mut cursor, 12)
+  putU16(&mut server.scratch, &mut cursor, 43)
+  putU16(&mut server.scratch, &mut cursor, 2)
+  putU16(&mut server.scratch, &mut cursor, 772)
+  putU16(&mut server.scratch, &mut cursor, 51)
+  putU16(&mut server.scratch, &mut cursor, 2)
+  putU16(&mut server.scratch, &mut cursor, group)
+  RawBuffer.fill(&mut server.scratch, 0, usize.ONE, 2)
+  setU24(&mut server.scratch, usize.ONE, cursor - HANDSHAKE_HEADER_LENGTH)
+  let queued = queueScratch(&mut server.*, cursor)
+  if let Result<(), ServerError>.Failure { error } = move queued {
+    return failure(error)
+  }
+  server.helloRetried = true
+  server.pendingKind = PendingKind.HelloRetry
+  server.state = ServerState.HelloRetryPending
+  return ok()
+}
+
+fn queueScratch(server: &mut Server, length: usize) -> Result<(), ServerError> {
+  // Every caller wrote `scratch[0..length]`, and `length <= SCRATCH_LENGTH`.
+  let message = unsafe RawBuffer.view<u8>(&server.scratch, 0, length)
+  if server.secretLength == 48 {
+    server.transcript384.update(message)
+  } else {
+    server.transcript256.update(message)
+  }
+  let queued = TlsRecordSender.queueRecord(&mut server.sender, ContentType.Handshake, message)
+  return match move queued {
+    Result<OutputProgress, RecordError>.Failure { error } => failure(mapRecordError(move error))
+    Result<OutputProgress, RecordError>.Success { value } => {
+      if value.accepted != length {
+        return violation(ServerProtocolReason.InternalState)
+      }
+      return ok()
+    }
+  }
+}
+
+fn updateTranscriptHandshake(server: &mut Server, length: usize) -> () {
+  // Every caller passes the length of the complete message in `handshake[0..handshakeLength]`.
+  let message = unsafe RawBuffer.view<u8>(&server.handshake, 0, length)
+  if server.secretLength == 48 {
+    server.transcript384.update(message)
+  } else {
+    server.transcript256.update(message)
+  }
+  return ()
+}
+
+fn updateTranscriptFlight(server: &mut Server, offset: usize, length: usize) -> () {
+  // Every caller passes a message that `buildFlight` wrote within the flight buffer.
+  let message = unsafe RawBuffer.view<u8>(&server.flight, offset, length)
+  if server.secretLength == 48 {
+    server.transcript384.update(message)
+  } else {
+    server.transcript256.update(message)
+  }
+  return ()
+}
+
+fn transcriptHash(server: &Server) -> [u8; 48] {
+  if server.secretLength == 48 {
+    return server.transcript384.checkpoint()
+  }
+  let digest = server.transcript256.checkpoint()
+  return fixed48(&digest)
+}
+
+effect fn agree(server: &Server, offset: usize) -> Result<Agreement, ServerError>
+  ? &mut Random {
+  let group = server.selectedGroup
+  let keyLength = groupKeyLength(group)
+
+  // `parseKeyShares` checked that this share's `keyLength` bytes sit inside the complete
+  // ClientHello in `handshake[0..handshakeLength]`.
+  let peer = unsafe RawBuffer.view<u8>(&server.handshake, offset, keyLength)
+  let mut publicKey: [u8; 97] = [0; 97]
+  let mut shared = zero48()
+  if group == ServerGroup.X25519 {
+    let secret = run X25519.generate()
+    let encoded = X25519.publicKey(&secret)
+    copyInto(&mut publicKey, &encoded)
+    let agreed = X25519.agree(move secret, peer)
+    return match move agreed {
+      Result<[u8; 32], X25519Error>.Failure { error } => {
+        drop error
+        return Result<Agreement, ServerError>.failResult(ServerError.InvalidKeyShare)
+      }
+      Result<[u8; 32], X25519Error>.Success { value } => {
+        copyInto(&mut shared, &value)
+        return Result<Agreement, ServerError>.succeed(
+          Agreement { publicKey: publicKey, publicLength: 32, shared: shared, sharedLength: 32 },
+        )
+      }
+    }
+  }
+  if group == ServerGroup.P256 {
+    let secret = run P256.generate()
+    let encoded = P256.publicKey(&secret)
+    copyInto(&mut publicKey, &encoded)
+    let agreed = P256.agree(move secret, peer)
+    return match move agreed {
+      Result<[u8; 32], P256Error>.Failure { error } => {
+        drop error
+        return Result<Agreement, ServerError>.failResult(ServerError.InvalidKeyShare)
+      }
+      Result<[u8; 32], P256Error>.Success { value } => {
+        copyInto(&mut shared, &value)
+        return Result<Agreement, ServerError>.succeed(
+          Agreement { publicKey: publicKey, publicLength: 65, shared: shared, sharedLength: 32 },
+        )
+      }
+    }
+  }
+  let secret = run P384.generate()
+  let encoded = P384.publicKey(&secret)
+  copyInto(&mut publicKey, &encoded)
+  let agreed = P384.agree(move secret, peer)
+  return match move agreed {
+    Result<[u8; 48], P384Error>.Failure { error } => {
+      drop error
+      return Result<Agreement, ServerError>.failResult(ServerError.InvalidKeyShare)
+    }
+    Result<[u8; 48], P384Error>.Success { value } => {
+      copyInto(&mut shared, &value)
+      return Result<Agreement, ServerError>.succeed(
+        Agreement { publicKey: publicKey, publicLength: 97, shared: shared, sharedLength: 48 },
+      )
+    }
+  }
+}
+
+fn copyInto(destination: &mut [u8], source: &[u8]) -> () {
+  let mut index = usize.ZERO
+  while index < source.length {
+    destination[index] = source[index]
+    index = index + usize.ONE
+  }
+  return ()
+}
+
+effect fn queueServerHello(server: &mut Server, offset: usize) -> Result<(), ServerError>
+  ? &mut Random {
+  let agreement = match run agree(&server.*, offset) {
+    Result<Agreement, ServerError>.Failure { error } => {
+      return failure(error)
+    }
+    Result<Agreement, ServerError>.Success { value } => move value
+  }
+  let mut serverRandom = zero32()
+  run Random.fillBytes(&mut serverRandom)
+  let session = server.sessionId
+  let sessionLength = server.sessionIdLength
+  let suite = suiteCode(server.selectedSuite)
+  let group = groupCode(server.selectedGroup)
+  let publicKey = agreement.publicKey
+  let publicLength = agreement.publicLength
+  let mut cursor = HANDSHAKE_HEADER_LENGTH
+  putU16(&mut server.scratch, &mut cursor, 771)
+  putSlice(&mut server.scratch, &mut cursor, &serverRandom)
+  putU8(&mut server.scratch, &mut cursor, usize.toU8(sessionLength))
+  putSlice(&mut server.scratch, &mut cursor, Slice.view<u8>(&session, 0, sessionLength))
+  putU16(&mut server.scratch, &mut cursor, suite)
+  putU8(&mut server.scratch, &mut cursor, 0)
+  putU16(&mut server.scratch, &mut cursor, publicLength + 14)
+  putU16(&mut server.scratch, &mut cursor, 43)
+  putU16(&mut server.scratch, &mut cursor, 2)
+  putU16(&mut server.scratch, &mut cursor, 772)
+  putU16(&mut server.scratch, &mut cursor, 51)
+  putU16(&mut server.scratch, &mut cursor, publicLength + 4)
+  putU16(&mut server.scratch, &mut cursor, group)
+  putU16(&mut server.scratch, &mut cursor, publicLength)
+  putSlice(&mut server.scratch, &mut cursor, Slice.view<u8>(&publicKey, 0, publicLength))
+  RawBuffer.fill(&mut server.scratch, 0, usize.ONE, 2)
+  setU24(&mut server.scratch, usize.ONE, cursor - HANDSHAKE_HEADER_LENGTH)
+  let queued = queueScratch(&mut server.*, cursor)
+  if let Result<(), ServerError>.Failure { error } = move queued {
+    return failure(error)
+  }
+  server.pendingKind = PendingKind.ServerHello
+  server.state = ServerState.ServerFlightPending
+
+  let shared = agreement.shared
+  let derived = deriveHandshakeSecrets(
+    &mut server.*,
+    Slice.view<u8>(&shared, 0, agreement.sharedLength),
+  )
+  if let Result<(), ServerError>.Failure { error } = move derived {
+    return failure(error)
+  }
+  let suiteValue = server.selectedSuite
+  let clientSecret = server.clientHandshakeSecret
+  let length = server.secretLength
+  let replaced = TlsRecordReceiver.replaceEpoch(
+    &mut server.receiver,
+    suiteValue,
+    secretView(&clientSecret, length),
+  )
+  if let Result<(), ServerError>.Failure { error } = recordUnit(move replaced) {
+    return failure(error)
+  }
+  return run buildFlight(&mut server.*)
+}
+
+fn deriveHandshakeSecrets(server: &mut Server, shared: &[u8]) -> Result<(), ServerError> {
+  let length = server.secretLength
+  let zeros = zero48()
+  let zeroView = secretView(&zeros, length)
+  let emptyHash = emptyHashBy(length)
+  let early = extractBy(length, zeroView, zeroView)
+  let derived = match deriveSecretBy(length, &early, b"derived", &emptyHash) {
+    Result<[u8; 48], ServerError>.Failure { error } => {
+      return failure(error)
+    }
+    Result<[u8; 48], ServerError>.Success { value } => value
+  }
+  let handshakeSecret = extractBy(length, secretView(&derived, length), shared)
+  let hash = transcriptHash(&server.*)
+  let clientSecret = match deriveSecretBy(length, &handshakeSecret, b"c hs traffic", &hash) {
+    Result<[u8; 48], ServerError>.Failure { error } => {
+      return failure(error)
+    }
+    Result<[u8; 48], ServerError>.Success { value } => value
+  }
+  let serverSecret = match deriveSecretBy(length, &handshakeSecret, b"s hs traffic", &hash) {
+    Result<[u8; 48], ServerError>.Failure { error } => {
+      return failure(error)
+    }
+    Result<[u8; 48], ServerError>.Success { value } => value
+  }
+  let masterInput = match deriveSecretBy(length, &handshakeSecret, b"derived", &emptyHash) {
+    Result<[u8; 48], ServerError>.Failure { error } => {
+      return failure(error)
+    }
+    Result<[u8; 48], ServerError>.Success { value } => value
+  }
+  server.clientHandshakeSecret = clientSecret
+  server.serverHandshakeSecret = serverSecret
+  server.masterSecret = extractBy(length, secretView(&masterInput, length), zeroView)
+  return ok()
+}
+
+effect fn buildFlight(server: &mut Server) -> Result<(), ServerError>
+  ? &mut Random {
+  let length = server.secretLength
+  let mut cursor = usize.ZERO
+
+  // EncryptedExtensions, with the selected ALPN protocol.
+  let start = cursor
+  putU8(&mut server.flight, &mut cursor, 8)
+  putU24(&mut server.flight, &mut cursor, 0)
+  if server.hasSelectedAlpn {
+    let offset = server.alpnOffsets[server.selectedAlpnIndex]
+    let protocolLength = server.alpnLengths[server.selectedAlpnIndex]
+    putU16(&mut server.flight, &mut cursor, protocolLength + 7)
+    putU16(&mut server.flight, &mut cursor, 16)
+    putU16(&mut server.flight, &mut cursor, protocolLength + 3)
+    putU16(&mut server.flight, &mut cursor, protocolLength + usize.ONE)
+    putU8(&mut server.flight, &mut cursor, usize.toU8(protocolLength))
+    let mut index = usize.ZERO
+    while index < protocolLength {
+      let byte = usize.toU8(readU8Raw(&server.alpn, offset + index))
+      putU8(&mut server.flight, &mut cursor, byte)
+      index = index + usize.ONE
+    }
+  } else {
+    putU16(&mut server.flight, &mut cursor, 0)
+  }
+  setU24(&mut server.flight, start + usize.ONE, cursor - start - HANDSHAKE_HEADER_LENGTH)
+  updateTranscriptFlight(&mut server.*, start, cursor - start)
+
+  // Certificate, with an empty request context and the configured chain.
+  let certificateStart = cursor
+  let chainLength = server.chainLength
+  putU8(&mut server.flight, &mut cursor, 11)
+  putU24(&mut server.flight, &mut cursor, chainLength + 4)
+  putU8(&mut server.flight, &mut cursor, 0)
+  putU24(&mut server.flight, &mut cursor, chainLength)
+
+  // `make` wrote every byte of `chain[0..chainLength]`, and sized the flight buffer for it.
+  let chain = unsafe RawBuffer.view<u8>(&server.chain, 0, chainLength)
+  putSlice(&mut server.flight, &mut cursor, chain)
+  drop chain
+  updateTranscriptFlight(&mut server.*, certificateStart, cursor - certificateStart)
+
+  // CertificateVerify over the transcript through Certificate.
+  let hash = transcriptHash(&server.*)
+  let context = b"TLS 1.3, server CertificateVerify"
+  let mut contentLength = usize.ZERO
+  RawBuffer.fill(&mut server.scratch, 0, 64, 32)
+  contentLength = 64
+  putSlice(&mut server.scratch, &mut contentLength, context)
+  putU8(&mut server.scratch, &mut contentLength, 0)
+  putSlice(&mut server.scratch, &mut contentLength, Slice.view<u8>(&hash, 0, length))
+  let mut signature: [u8; 1024] = [0; 1024]
+
+  // The block above wrote every byte of `scratch[0..contentLength]`, at most 146 bytes.
+  let content = unsafe RawBuffer.view<u8>(&server.scratch, 0, contentLength)
+  let signed = run signContent(&server.key, server.scheme, content, &mut signature)
+  drop content
+  let signatureLength = match move signed {
+    Result<usize, ServerError>.Failure { error } => {
+      return failure(error)
+    }
+    Result<usize, ServerError>.Success { value } => value
+  }
+  let verifyStart = cursor
+  putU8(&mut server.flight, &mut cursor, 15)
+  putU24(&mut server.flight, &mut cursor, signatureLength + 4)
+  putU16(&mut server.flight, &mut cursor, server.scheme)
+  putU16(&mut server.flight, &mut cursor, signatureLength)
+  putSlice(&mut server.flight, &mut cursor, Slice.view<u8>(&signature, 0, signatureLength))
+  updateTranscriptFlight(&mut server.*, verifyStart, cursor - verifyStart)
+
+  // Finished over the transcript through CertificateVerify.
+  let serverSecret = server.serverHandshakeSecret
+  let serverFinished = match finishedData(length, &serverSecret, &transcriptHash(&server.*)) {
+    Result<[u8; 48], ServerError>.Failure { error } => {
+      return failure(error)
+    }
+    Result<[u8; 48], ServerError>.Success { value } => value
+  }
+  let finishedStart = cursor
+  putU8(&mut server.flight, &mut cursor, 20)
+  putU24(&mut server.flight, &mut cursor, length)
+  putSlice(&mut server.flight, &mut cursor, Slice.view<u8>(&serverFinished, 0, length))
+  updateTranscriptFlight(&mut server.*, finishedStart, cursor - finishedStart)
+  server.flightLength = cursor
+  server.flightOffset = 0
+
+  // Application secrets and the expected client Finished, both over the transcript through the
+  // server Finished.
+  let finalHash = transcriptHash(&server.*)
+  let master = server.masterSecret
+  let clientTraffic = match deriveSecretBy(length, &master, b"c ap traffic", &finalHash) {
+    Result<[u8; 48], ServerError>.Failure { error } => {
+      return failure(error)
+    }
+    Result<[u8; 48], ServerError>.Success { value } => value
+  }
+  let serverTraffic = match deriveSecretBy(length, &master, b"s ap traffic", &finalHash) {
+    Result<[u8; 48], ServerError>.Failure { error } => {
+      return failure(error)
+    }
+    Result<[u8; 48], ServerError>.Success { value } => value
+  }
+  let clientSecret = server.clientHandshakeSecret
+  let expected = match finishedData(length, &clientSecret, &finalHash) {
+    Result<[u8; 48], ServerError>.Failure { error } => {
+      return failure(error)
+    }
+    Result<[u8; 48], ServerError>.Success { value } => value
+  }
+  server.clientTrafficSecret = clientTraffic
+  server.serverTrafficSecret = serverTraffic
+  server.expectedFinished = expected
+  return ok()
+}
+
+// Signs `content` with `key` under `scheme`, writes the signature to the start of `output`, which
+// holds `SIGNATURE_LIMIT` bytes, and returns its length.
+effect fn signContent(key: &ServerKey, scheme: usize, content: &[u8], output: &mut [u8]) -> Result<
+  usize,
+  ServerError
+>
+  ? &mut Random {
+  return match &key.* {
+    ServerKey.EcdsaP256 { key: secret } => {
+      let raw = secret.sign<Sha256>(content)
+      return Result<usize, ServerError>.succeed(EcdsaP256.toDer(&raw, move output))
+    }
+    ServerKey.EcdsaP384 { key: secret } => {
+      let raw = secret.sign<Sha384>(content)
+      return Result<usize, ServerError>.succeed(EcdsaP384.toDer(&raw, move output))
+    }
+    ServerKey.Ed25519 { key: secret } => {
+      let signature = secret.sign(content)
+      copyInto(move output, &signature)
+      return Result<usize, ServerError>.succeed(64)
+    }
+    ServerKey.RsaPss { key: secret } => {
+      let width = secret.publicKey().byteLength()
+      if width > SIGNATURE_LIMIT {
+        return Result<usize, ServerError>.failResult(
+          ServerError.RsaSignature { error: RsaError.InvalidLength },
+        )
+      }
+      let view = Slice.viewMut<u8>(move output, 0, width)
+      if scheme == 2054 {
+        let digest = Sha512.hash(content)
+        return run rsaSignPss<Sha512>(&secret, &digest, 64, move view)
+      }
+      if scheme == 2053 {
+        let digest = Sha384.hash(content)
+        return run rsaSignPss<Sha384>(&secret, &digest, 48, move view)
+      }
+      let digest = Sha256.hash(content)
+      return run rsaSignPss<Sha256>(&secret, &digest, 32, move view)
+    }
+  }
+}
+
+effect fn rsaSignPss<H: Digest>(
+  key: &RsaPrivateKey,
+  digest: &[u8],
+  saltLength: usize,
+  output: &mut [u8],
+) -> Result<usize, ServerError>
+  ? &mut Random {
+  return run Effect.catchAll(rsaSignedLength<H>(key, digest, saltLength, move output), rsaFailed)
+}
+
+effect fn rsaSignedLength<H: Digest>(
+  key: &RsaPrivateKey,
+  digest: &[u8],
+  saltLength: usize,
+  output: &mut [u8],
+) -> Result<usize, ServerError>
+  ! RsaError
+  ? &mut Random {
+  let width = output.length
+  run key.signPss<H>(digest, saltLength, move output)
+  return Result<usize, ServerError>.succeed(width)
+}
+
+effect fn rsaFailed(error: RsaError) -> Result<usize, ServerError> {
+  return Result<usize, ServerError>.failResult(ServerError.RsaSignature { error: error })
+}
+
+fn handleClientFinished(server: &mut Server, messageLength: usize) -> Result<(), ServerError> {
+  let length = server.secretLength
+  if messageLength != HANDSHAKE_HEADER_LENGTH + length || messageLength != server.handshakeLength {
+    return violation(ServerProtocolReason.InvalidLength)
+  }
+
+  // `messageLength == HANDSHAKE_HEADER_LENGTH + length == handshakeLength`, within the capacity.
+  let supplied = unsafe RawBuffer.view<u8>(&server.handshake, HANDSHAKE_HEADER_LENGTH, length)
+  let expected = server.expectedFinished
+  if !constantWorkEqual(supplied, secretView(&expected, length)) {
+    return failure(ServerError.Finished)
+  }
+  drop supplied
+  let suite = server.selectedSuite
+  let secret = server.clientTrafficSecret
+  let replaced = TlsRecordReceiver.replaceEpoch(
+    &mut server.receiver,
+    suite,
+    secretView(&secret, length),
+  )
+  if let Result<(), ServerError>.Failure { error } = recordUnit(move replaced) {
+    return failure(error)
+  }
+  server.state = ServerState.Traffic
+  server.completeReady = true
+  return ok()
+}
+
+fn handleKeyUpdate(server: &mut Server, messageLength: usize) -> Result<(), ServerError> {
+  if messageLength != 5 || messageLength != server.handshakeLength {
+    return violation(ServerProtocolReason.PostHandshake)
+  }
+  let request = readU8Raw(&server.handshake, 4)
+  if request > 1 {
+    return violation(ServerProtocolReason.PostHandshake)
+  }
+  let current = server.clientTrafficSecret
+  let length = server.secretLength
+  let secret = match nextTrafficSecret(length, &current) {
+    Result<[u8; 48], ServerError>.Failure { error } => {
+      return failure(error)
+    }
+    Result<[u8; 48], ServerError>.Success { value } => value
+  }
+  let suite = server.selectedSuite
+  let replaced = TlsRecordReceiver.replaceEpoch(
+    &mut server.receiver,
+    suite,
+    secretView(&secret, length),
+  )
+  if let Result<(), ServerError>.Failure { error } = recordUnit(move replaced) {
+    return failure(error)
+  }
+  server.clientTrafficSecret = secret
+  if request == 1 {
+    server.respondingKeyUpdate = true
+  }
+  return ok()
+}
+
+fn internalFailure48() -> Result<[u8; 48], ServerError> {
+  return Result<[u8; 48], ServerError>.failResult(
+    ServerError.ProtocolViolation { reason: ServerProtocolReason.InternalState },
+  )
+}
+
+fn deriveSecretBy(length: usize, secret: &[u8; 48], label: &[u8], hash: &[u8; 48]) -> Result<
+  [u8; 48],
+  ServerError
+> {
+  if length == 48 {
+    let derived = TlsHkdfSha384.deriveSecretFromHash(secret, label, hash)
+    return match move derived {
+      Result<[u8; 48], LabelError>.Success { value } => Result<[u8; 48], ServerError>.succeed(value)
+      Result<[u8; 48], LabelError>.Failure { error } => {
+        drop error
+        return internalFailure48()
+      }
+    }
+  }
+  let key = first32(secret)
+  let digest = first32(hash)
+  let derived = TlsHkdfSha256.deriveSecretFromHash(&key, label, &digest)
+  return match move derived {
+    Result<[u8; 32], LabelError>.Success { value } => Result<[u8; 48], ServerError>.succeed(
+      fixed48(&value),
+    )
+    Result<[u8; 32], LabelError>.Failure { error } => {
+      drop error
+      return internalFailure48()
+    }
+  }
+}
+
+fn extractBy(length: usize, salt: &[u8], input: &[u8]) -> [u8; 48] {
+  if length == 48 {
+    return HkdfSha384.extract(salt, input)
+  }
+  let value = HkdfSha256.extract(salt, input)
+  return fixed48(&value)
+}
+
+fn emptyHashBy(length: usize) -> [u8; 48] {
+  let empty: [u8; 0] = []
+  if length == 48 {
+    return Sha384.hash(&empty)
+  }
+  let value = Sha256.hash(&empty)
+  return fixed48(&value)
+}
+
+fn expandLabelBy(length: usize, secret: &[u8], label: &[u8], output: &mut [u8]) -> Result<
+  (),
+  ServerError
+> {
+  let empty: [u8; 0] = []
+  if length == 48 {
+    let key = fixed48(secret)
+    let expanded = TlsHkdfSha384.expandLabel(&key, label, &empty, move output)
+    return match move expanded {
+      Result<(), LabelError>.Success { .. } => ok()
+      Result<(), LabelError>.Failure { error } => {
+        drop error
+        return violation(ServerProtocolReason.InternalState)
+      }
+    }
+  }
+  let key = first32(secret)
+  let expanded = TlsHkdfSha256.expandLabel(&key, label, &empty, move output)
+  return match move expanded {
+    Result<(), LabelError>.Success { .. } => ok()
+    Result<(), LabelError>.Failure { error } => {
+      drop error
+      return violation(ServerProtocolReason.InternalState)
+    }
+  }
+}
+
+fn finishedData(length: usize, secret: &[u8; 48], hash: &[u8; 48]) -> Result<
+  [u8; 48],
+  ServerError
+> {
+  let mut key = zero48()
+  let keyView = Slice.viewMut<u8>(&mut key, 0, length)
+  let expanded = expandLabelBy(length, secretView(secret, length), b"finished", move keyView)
+  if let Result<(), ServerError>.Failure { error } = move expanded {
+    return Result<[u8; 48], ServerError>.failResult(error)
+  }
+  if length == 48 {
+    return Result<[u8; 48], ServerError>.succeed(HmacSha384.authenticate(&key, hash))
+  }
+  let value = HmacSha256.authenticate(Slice.view<u8>(&key, 0, 32), Slice.view<u8>(hash, 0, 32))
+  return Result<[u8; 48], ServerError>.succeed(fixed48(&value))
+}

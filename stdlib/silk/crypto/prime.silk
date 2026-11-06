@@ -1,0 +1,436 @@
+//! Test numbers for primality and generate random primes, including safe primes.
+//!
+//! # When to use
+//! Use [`Prime.isProbablePrime`] to check a number, as Node.js `crypto.checkPrime` does, and
+//! [`Prime.generate`] for a new random prime, as Node.js `crypto.generatePrime` does. RSA key
+//! generation in `silk.crypto.rsa` and the group check in `silk.crypto.dh` use the same test.
+//!
+//! # Details
+//! The test is trial division by the odd primes below 4096, then Miller-Rabin with random bases
+//! from the ambient `Random`. With `r` rounds, a composite passes with probability at most
+//! `4^-r`. [`Prime.recommendedRounds`] gives the rounds that OpenSSL uses. Numbers are
+//! `silk.crypto.modular` values of up to 8192 bits. Nothing allocates.
+//!
+//! # Errors
+//! - [`PrimeError`] for a bit length or a constraint that no prime can meet.
+//!
+//! # Gotchas
+//! Trial division and the number of Miller-Rabin rounds that run depend on the candidate, but the
+//! exponentiations take the same time for every candidate of a length. A rejected candidate tells
+//! nothing about the prime that is kept, so generated primes can be secret.
+//!
+//! # Examples
+//! ## Test and generate primes
+//! ```silk
+//! import silk.core.effect { Effect }
+//! import silk.core.option { Option }
+//! import silk.core.result { Result }
+//! import silk.crypto.modular { Natural }
+//! import silk.crypto.prime { Prime, PrimeError, PrimeOptions }
+//! import silk.num.u64
+//! import silk.system.random { Random }
+//!
+//! // A predictable generator for the example. Real programs use a secure `Random` provider.
+//! struct Counter {
+//!   state: u64,
+//! }
+//!
+//! impl Random for Counter {
+//!   effect fn fillBytes(self: &mut Self, output: &mut [u8]) -> () {
+//!     let mut index: usize = 0
+//!     while index < output.length {
+//!       self.state = u64.wrappingAdd(u64.wrappingMultiply(self.state, 6364136223846793005), 1)
+//!       output[index] = u64.toU8(u64.shiftRight(self.state, 56))
+//!       index = index + 1
+//!     }
+//!   }
+//! }
+//!
+//! effect fn check() -> i32 ? &mut Random {
+//!   // 2^61 - 1 is prime, and 2^61 + 1 is divisible by 3.
+//!   if !run Prime.isProbablePrime(&Natural.fromU64(2305843009213693951), 64) {
+//!     return 1
+//!   }
+//!   if run Prime.isProbablePrime(&Natural.fromU64(2305843009213693953), 64) {
+//!     return 1
+//!   }
+//!   let options = PrimeOptions { safe: true, add: Option<Natural>.none(), remainder: Option<Natural>.none() }
+//!   return match run Prime.generate(64, &options) {
+//!     Result<Natural, PrimeError>.Success { value } => {
+//!       if value.bitLength() == 64 {
+//!         return 0
+//!       }
+//!       return 1
+//!     }
+//!     Result<Natural, PrimeError>.Failure {..} => 1
+//!   }
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   let mut random = Counter { state: 7 }
+//!   return run check() |> Effect.provideMut<Random>(&mut random)
+//! }
+//! ```
+//!
+//! @category Cryptography
+
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.crypto.modular { ModularError, Modulus, Natural }
+import silk.io.writer { Writer, WriterError }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.system.random { Random }
+import silk.text.format { Debug, Format, Formatter }
+
+/// The reason that [`Prime.generate`] cannot make a prime.
+pub enum PrimeError {
+  /// The bit length is below 2, below 3 for a safe prime, or above 8192.
+  InvalidBits,
+  /// `add` is 0 or longer than the prime, `remainder` is not below `add`, or no prime of the form
+  /// `add * k + remainder` exists, such as when they share a factor.
+  InvalidConstraint,
+}
+
+impl Debug for PrimeError {
+  /// Writes the name of the variant, such as `InvalidBits`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      PrimeError.InvalidBits => run Format.write(&mut formatter, b"InvalidBits")
+      PrimeError.InvalidConstraint => run Format.write(&mut formatter, b"InvalidConstraint")
+    }
+  }
+}
+
+/// What [`Prime.generate`] asks of the prime, as in Node.js `crypto.generatePrime`.
+pub struct PrimeOptions {
+  /// Whether `(p - 1) / 2` must also be prime.
+  pub safe: bool,
+  /// If set, the prime has the remainder [`PrimeOptions.remainder`] when divided by this value.
+  pub add: Option<Natural>,
+  /// The remainder modulo `add`. It is ignored without `add`. Without it, the remainder is 3 for a
+  /// safe prime and 1 for another prime, as in OpenSSL.
+  pub remainder: Option<Natural>,
+}
+
+/// Functions that test numbers for primality and generate primes.
+///
+/// # When to use
+/// Use it for Node.js `crypto.checkPrime` and `crypto.generatePrime`, or to check a
+/// Diffie-Hellman group that a peer sent.
+///
+/// # Details
+/// Both functions read random bytes from the ambient `Random`, which must be cryptographically
+/// secure for a prime that must be secret.
+pub struct Prime {}
+
+impl Prime {
+  /// Returns the Miller-Rabin rounds that OpenSSL uses for a number of `bits` bits: 64, or 128
+  /// above 2048 bits. A composite passes with probability at most `2^-128` or `2^-256`.
+  pub fn recommendedRounds(bits: usize) -> usize {
+    if bits > 2048 {
+      return 128
+    }
+    return 64
+  }
+
+  /// Returns whether `candidate` is probably prime, after trial division and `rounds` rounds of
+  /// Miller-Rabin with random bases.
+  ///
+  /// The answer is exact below 2^24. A prime always passes. A composite passes with probability
+  /// at most `4^-rounds`, so 0 rounds gives trial division only.
+  pub effect fn isProbablePrime(candidate: &Natural, rounds: usize) -> bool
+    ? &mut Random {
+    let primes = smallPrimes()
+    return run testPrime(candidate, rounds, &primes)
+  }
+
+  /// Returns a random prime of exactly `bits` bits that meets `options`.
+  ///
+  /// The candidates are random odd numbers of `bits` bits with the top bit set, stepped by `add`
+  /// (or 2, or 4 for a safe prime) until one passes trial division and
+  /// [`Prime.recommendedRounds`] of Miller-Rabin. For a safe prime, `(p - 1) / 2` passes too.
+  ///
+  /// # Errors
+  /// - `InvalidBits` if `bits` is below 2, below 3 for a safe prime, or above 8192.
+  /// - `InvalidConstraint` if `add` is 0 or has more than `bits` bits, `remainder` is not below
+  ///   `add`, they share a factor, or for a safe prime `add` and `remainder - 1` share a factor
+  ///   other than 2.
+  ///
+  /// # Gotchas
+  /// A constraint can still leave no prime of `bits` bits, such as `add` of `bits` bits with a
+  /// remainder too small; then the call does not return.
+  pub effect fn generate(bits: usize, options: &PrimeOptions) -> Result<Natural, PrimeError>
+    ? &mut Random {
+    let safe = options.safe
+    if bits < 2 || bits > 8192 || (safe && bits < 3) {
+      return Result<Natural, PrimeError>.failResult(PrimeError.InvalidBits)
+    }
+    let mut step = Natural.fromU64(2)
+    let mut remainder = Natural.fromU64(1)
+    if safe {
+      step = Natural.fromU64(4)
+      remainder = Natural.fromU64(3)
+    }
+    match &options.add {
+      Option<Natural>.Some { value } => {
+        step = value
+        match &options.remainder {
+          Option<Natural>.Some { value: given } => {
+            remainder = given
+          }
+          Option<Natural>.None => {}
+        }
+      }
+      Option<Natural>.None => {}
+    }
+    if step.isZero() || step.bitLength() > bits || !remainder.lessThan(&step) {
+      return Result<Natural, PrimeError>.failResult(PrimeError.InvalidConstraint)
+    }
+    if !isOne(&greatestDivisor(&step, &remainder)) {
+      return Result<Natural, PrimeError>.failResult(PrimeError.InvalidConstraint)
+    }
+    if safe {
+      // p - 1 = 2q, so an odd factor of both add and remainder - 1 divides q.
+      let below = match remainder.subtract(&Natural.fromU64(1)) {
+        Result<Natural, ModularError>.Success { value } => value
+        Result<Natural, ModularError>.Failure { .. } => {
+          return Result<Natural, PrimeError>.failResult(PrimeError.InvalidConstraint)
+        }
+      }
+      if Natural.fromU64(2).lessThan(&greatestDivisor(&step, &below)) {
+        return Result<Natural, PrimeError>.failResult(PrimeError.InvalidConstraint)
+      }
+    }
+    let primes = smallPrimes()
+    let rounds = Prime.recommendedRounds(bits)
+    while true {
+      let start = run randomTop(bits)
+      let offset = remainderOf(&start, &step)
+      let mut candidate = sumOf(&differenceOf(&start, &offset), &remainder)
+      let mut tries: usize = 0
+      while tries < 4096 && candidate.bitLength() == bits {
+        if run passes(&candidate, safe, rounds, &primes) {
+          return Result<Natural, PrimeError>.succeed(candidate)
+        }
+        candidate = sumOf(&candidate, &step)
+        tries = tries + 1
+      }
+    }
+    return Intrinsic.trap("Prime.generate: the loop returns")
+  }
+}
+
+// The odd primes below 4096, for trial division.
+struct SmallPrimes {
+  values: [u32; 563],
+}
+
+fn smallPrimes() -> SmallPrimes {
+  let mut composite: [bool; 4096] = [false; 4096]
+  let mut primes = SmallPrimes { values: [0; 563] }
+  let mut count: usize = 0
+  let mut candidate: usize = 3
+  while candidate < 4096 {
+    if !composite[candidate] {
+      primes.values[count] = usize.toU32(candidate)
+      count = count + 1
+      let mut multiple = candidate * candidate
+      while multiple < 4096 {
+        composite[multiple] = true
+        multiple = multiple + 2 * candidate
+      }
+    }
+    candidate = candidate + 2
+  }
+  return move primes
+}
+
+fn isOne(value: &Natural) -> bool {
+  return value.equals(&Natural.fromU64(1))
+}
+
+fn sumOf(left: &Natural, right: &Natural) -> Natural {
+  return match left.add(right) {
+    Result<Natural, ModularError>.Success { value } => value
+    Result<Natural, ModularError>.Failure { .. } => Intrinsic.trap(
+      "Prime: the values fit in 8192 bits",
+    )
+  }
+}
+
+fn differenceOf(left: &Natural, right: &Natural) -> Natural {
+  return match left.subtract(right) {
+    Result<Natural, ModularError>.Success { value } => value
+    Result<Natural, ModularError>.Failure { .. } => Intrinsic.trap(
+      "Prime: the difference is not negative",
+    )
+  }
+}
+
+fn remainderOf(value: &Natural, divisor: &Natural) -> Natural {
+  return match value.remainder(divisor) {
+    Result<Natural, ModularError>.Success { value: rest } => rest
+    Result<Natural, ModularError>.Failure { .. } => Intrinsic.trap("Prime: the divisor is not 0")
+  }
+}
+
+// Euclid's algorithm. The values are public.
+fn greatestDivisor(left: &Natural, right: &Natural) -> Natural {
+  let mut a = left.*
+  let mut b = right.*
+  while !b.isZero() {
+    let rest = remainderOf(&a, &b)
+    a = b
+    b = rest
+  }
+  return a
+}
+
+// A random number of exactly `bits` bits.
+effect fn randomTop(bits: usize) -> Natural
+  ? &mut Random {
+  let length = (bits + 7) / 8
+  let mut bytes: [u8; 1024] = [0; 1024]
+  run Random.fillBytes(Slice.viewMut<u8>(&mut bytes, 0, length))
+  let excess = 8 * length - bits
+  bytes[0] = u8.bitAnd(bytes[0], u32.toU8(u32.shiftRight(255, usize.toU32(excess))))
+  bytes[0] = u8.bitOr(bytes[0], u32.toU8(u32.shiftRight(128, usize.toU32(excess))))
+  return match Natural.fromBytes(Slice.view<u8>(&bytes, 0, length)) {
+    Result<Natural, ModularError>.Success { value } => value
+    Result<Natural, ModularError>.Failure { .. } => Intrinsic.trap("Prime: 8192 bits fit")
+  }
+}
+
+// A candidate of `generate`: p prime and, for a safe prime, (p - 1) / 2 prime.
+effect fn passes(candidate: &Natural, safe: bool, rounds: usize, primes: &SmallPrimes) -> bool
+  ? &mut Random {
+  if !safe {
+    return run testPrime(candidate, rounds, primes)
+  }
+  if candidate.bitLength() > 12 {
+    // q = (p - 1) / 2 is divisible by an odd prime r exactly when p mod r is 1.
+    let mut i: usize = 0
+    while i < 563 {
+      let rest = candidate.remainderWord(primes.values[i])
+      if rest == 0 || rest == 1 {
+        return false
+      }
+      i = i + 1
+    }
+  }
+  let half = candidate.shiftRight(1)
+  if !run testPrime(&half, rounds, primes) {
+    return false
+  }
+  return run testPrime(candidate, rounds, primes)
+}
+
+effect fn testPrime(candidate: &Natural, rounds: usize, primes: &SmallPrimes) -> bool
+  ? &mut Random {
+  let bits = candidate.bitLength()
+  if bits <= 1 {
+    return false
+  }
+  if candidate.bit(0) == 0 {
+    return bits == 2
+  }
+  if bits <= 24 {
+    return smallPrime(lowWord(candidate))
+  }
+  let mut i: usize = 0
+  while i < 563 {
+    if candidate.remainderWord(primes.values[i]) == 0 {
+      return false
+    }
+    i = i + 1
+  }
+  return run millerRabin(candidate, rounds)
+}
+
+fn lowWord(value: &Natural) -> u32 {
+  let mut word: u32 = 0
+  let mut i: usize = 0
+  while i < 32 {
+    word = u32.bitOr(word, u32.shiftLeft(value.bit(i), usize.toU32(i)))
+    i = i + 1
+  }
+  return word
+}
+
+// Trial division of an odd number below 2^24.
+fn smallPrime(value: u32) -> bool {
+  if value < 3 {
+    return value == 2
+  }
+  let mut divisor: u32 = 3
+  while divisor * divisor <= value {
+    if value % divisor == 0 {
+      return false
+    }
+    divisor = divisor + 2
+  }
+  return true
+}
+
+// Miller-Rabin with random bases on an odd candidate of 25 bits or more.
+effect fn millerRabin(candidate: &Natural, rounds: usize) -> bool
+  ? &mut Random {
+  let modulus = match Modulus.make(candidate) {
+    Result<Modulus, ModularError>.Success { value } => value
+    Result<Modulus, ModularError>.Failure { .. } => {
+      return false
+    }
+  }
+  let fitted = modulus.natural()
+  let one = Natural.fromU64(1)
+  let minusOne = differenceOf(&fitted, &one)
+  let mut shift: usize = 1
+  while minusOne.bit(shift) == 0 {
+    shift = shift + 1
+  }
+  let odd = minusOne.shiftRight(shift)
+  let bits = fitted.bitLength()
+  let length = (bits + 7) / 8
+  let excess = 8 * length - bits
+  let lowest = Natural.fromU64(2)
+  let highest = differenceOf(&fitted, &lowest)
+  let mut round: usize = 0
+  while round < rounds {
+    let mut bytes: [u8; 1024] = [0; 1024]
+    run Random.fillBytes(Slice.viewMut<u8>(&mut bytes, 0, length))
+    bytes[0] = u8.bitAnd(bytes[0], u32.toU8(u32.shiftRight(255, usize.toU32(excess))))
+    let drawn = match Natural.fromBytes(Slice.view<u8>(&bytes, 0, length)) {
+      Result<Natural, ModularError>.Success { value } => value
+      Result<Natural, ModularError>.Failure { .. } => Intrinsic.trap("Prime: 8192 bits fit")
+    }
+    if !drawn.lessThan(&lowest) && !highest.lessThan(&drawn) {
+      let base = match drawn.resize(fitted.wordLength()) {
+        Result<Natural, ModularError>.Success { value } => value
+        Result<Natural, ModularError>.Failure { .. } => Intrinsic.trap("Prime: the base is below p")
+      }
+      let mut value = modulus.power(&base, &odd)
+      if !value.equals(&one) && !value.equals(&minusOne) {
+        let mut step: usize = 1
+        let mut witness = true
+        while step < shift && witness {
+          value = modulus.multiply(&value, &value)
+          if value.equals(&minusOne) {
+            witness = false
+          }
+          step = step + 1
+        }
+        if witness {
+          return false
+        }
+      }
+      round = round + 1
+    }
+  }
+  return true
+}
