@@ -19,7 +19,10 @@ the first result. They also copy words of the static dictionary, with the transf
 the start of the word, and pick the postfix bits and direct codes of the distances. Each
 meta-block gets its own prefix codes for literals, commands, and distances. From quality 5 the
 literals use one prefix code for each cluster of the 64 contexts of their two previous bytes,
-in UTF-8 or signed context mode. A meta-block that does not shrink is stored uncompressed.
+in UTF-8 or signed context mode. At qualities 10 and 11 the literals, commands, and distances
+of a meta-block are also split into blocks of up to 32, 64, and 64 types with their own
+prefix codes, and the distances get 4 contexts by copy length. A meta-block that does not
+shrink is stored uncompressed.
 [`BrotliEncoder.make`](#BrotliEncoder.impl.make) allocates all storage one time. Later calls do not allocate and do not
 keep a borrow of your buffers. The output is deterministic but is not the same bytes that the
 reference `brotli` writes.
@@ -377,11 +380,13 @@ with the same storage.
 
 ### Details
 [`BrotliEncoder.make`](#BrotliEncoder.impl.make) allocates all storage one time: twice the window or twice the
-meta-block (64 KiB to 256 KiB), whichever is larger, and about two meta-blocks of command and
-output buffers. Up to quality 9 it adds the hash buckets (512 KiB at quality 0 and 32 MiB at 9,
-less when the window is small), and from quality 5 about 300 KiB for literal contexts.
-Qualities 10 and 11 add one more window, a binary tree of 8 bytes for each byte of the window,
-about 17 MiB for matches and the shortest path search, and 200 KiB for a dictionary index.
+meta-block (64 KiB to 256 KiB, and at most the window from 64 KiB), whichever is larger, and
+about two meta-blocks of command and output buffers. Up to quality 9 it adds the hash buckets
+(512 KiB at quality 0 and 32 MiB at 9, less when the window is small), and from quality 5
+about 300 KiB for literal contexts. Qualities 10 and 11 add one more window, a binary tree of
+8 bytes for each byte of the window, about 115 bytes for each byte of the meta-block for
+matches, the shortest path search, and block splitting (30 MiB with 256 KiB meta-blocks), and
+about 7 MiB for histogram clustering and a dictionary index.
 Later calls do not allocate and do not keep a borrow of your buffers, so you can move the
 encoder between threads between calls.
 
