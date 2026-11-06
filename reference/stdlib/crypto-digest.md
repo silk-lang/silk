@@ -11,9 +11,11 @@ Bound a type parameter with [`Digest`](#Digest) to write code that works with an
 a known algorithm, call that hash's own functions, which return a fixed-size array.
 
 ## Details
-MD5, SHA-1, the six SHA-2 hashes, the four SHA-3 hashes, and BLAKE2b-512 conform. Each state
-is a fixed-size value that does not allocate. No block is longer than 144 bytes and no digest is
-longer than 64 bytes, so generic code can keep them in arrays of those sizes.
+MD5, SHA-1, the six SHA-2 hashes, the four SHA-3 hashes, BLAKE2b-512, BLAKE2s-256, RIPEMD-160,
+SM3, and MD5-SHA1 conform. The SHAKE functions of `silk.crypto.sha3` do not, because their
+output length is the caller's choice. Each state is a fixed-size value that does not allocate.
+No block is longer than 144 bytes and no digest is longer than 64 bytes, so generic code can keep
+them in arrays of those sizes.
 
 ## Examples
 ### Hash with any digest

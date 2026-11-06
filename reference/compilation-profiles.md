@@ -64,6 +64,14 @@ most 4 GiB, such as `max-memory = "256MiB"`. It is a final-link setting, not an 
 never enters source specialization or its identity. Another target refuses it as an unsupported
 combination. A multi-threaded wasm32 profile defaults it to 1 GiB (THREAD-009).
 
+A project profile may also set `stack-size`, the wasm32 main thread's stack: a whole number of
+bytes, `KiB`, `MiB` or `GiB` that is a positive multiple of 16, below 4 GiB, and below `max-memory`
+when that is set, such as `stack-size = "8MiB"`. Without it the main stack is 1 MiB, the size the
+runtime gives each new thread (THREAD-009). The stack sits below the module's data, so a program
+that recurses past it traps with an out-of-bounds memory access. Like `max-memory` it is a
+final-link setting outside the profile's identity, and another target refuses it as an
+unsupported combination.
+
 A profile may set `codegen-units`, a whole number from 1 to 256: how many codegen units an
 optimized native executable splits into (16 when unset; `1` keeps one module). It changes no
 source-visible fact, but it is part of the profile's identity, so each count keeps its own cache.
@@ -208,10 +216,10 @@ inputs and `config`. `[config]` contains project-tier package parameter values, 
 module's path and the parameter's name (`main.limit = 42`) and written as plain TOML that is checked
 against the parameter's declared type. A profile's `config` holds override-tier values. A profile
 that names no `target` builds for the host. Profile fields are kebab-case (`code-model`,
-`max-memory`); the earlier `codeModel`, `maxMemory` and `bindings` are refused, naming the current
+`max-memory`, `stack-size`); the earlier `codeModel`, `maxMemory` and `bindings` are refused, naming the current
 spelling. A profile's `backend` (`--backend` on the command line) picks the code generator: `llvm`, the
 default, or `direct`, which writes wasm32 executables itself, without Clang. A `wasm32-wasip2`
-component still needs wasm-tools and the Preview 1 adapter, as with `llvm`. `--profile-input` JSON keeps `codeModel`, `maxMemory`, `codegenUnits` and tagged `bindings`. Without a table
+component still needs wasm-tools and the Preview 1 adapter, as with `llvm`. `--profile-input` JSON keeps `codeModel`, `maxMemory`, `stackSize`, `codegenUnits` and tagged `bindings`. Without a table
 of that name, `dev` (unoptimized, with debug information) and `release` (optimized, without it) are
 built-in profiles for the host. A complete request override replaces project profile selection. CLI `--profile`
 and LSP profile-name settings select a project profile; `--profile-input` and its LSP equivalent
