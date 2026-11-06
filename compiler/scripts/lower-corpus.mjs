@@ -28,7 +28,7 @@ function sourceFiles() {
   ]
 }
 
-// `Hir.writeQuotedText` escapes `"`, `\`, and the line breaks, so a quoted value never leaves its
+// `Token.writeQuoted` escapes `"`, `\`, and the line breaks, so a quoted value never leaves its
 // line and never closes early. Reading one back is the inverse of that escape.
 function readQuoted(text, from) {
   assert.equal(text[from], '"', `quoted value at ${from}`)
@@ -278,7 +278,7 @@ let checked = 0
 let failed = 0
 function checkFile(file) {
   const bytes = readFileSync(file)
-  const output = execFileSync(executable, ['hir', relative(process.cwd(), resolve(file))], {
+  const output = execFileSync(executable, ['dump', 'hir', relative(process.cwd(), resolve(file))], {
     encoding: 'utf8',
     // The largest standard-library modules take about a minute in an unoptimized debug build.
     timeout: 180000,
