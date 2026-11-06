@@ -31,7 +31,11 @@ fits the key, it sends an empty Certificate message, and the server decides whet
 With [`Resumption`](#Resumption) `Enabled`, the client asks for session tickets and returns each one as a
 [`Session`](#Session) from [`Client.takeSession`](#Client.impl.takeSession). A later client given that session offers it as a PSK
 with (EC)DHE, and when the server accepts, the handshake skips the certificate messages.
-[`Session.encode`](#Session.impl.encode) and [`Session.decode`](#Session.impl.decode) let you keep sessions across processes.
+[`Session.encode`](#Session.impl.encode) and [`Session.decode`](#Session.impl.decode) let you keep sessions across processes. In TLS 1.2
+the client asks with an empty session_ticket (RFC 5077), and a session holds the ticket or the
+server's session ID. A later client offers both, and the server resumes when it echoes the
+session ID: the ServerHello is followed by the ChangeCipherSpec and Finished messages, without a
+new key exchange.
 
 A session whose ticket allows early data also lets the client send the `Resumption` `earlyData`
 bytes as 0-RTT data, right after the ClientHello and before the server answers.
@@ -50,7 +54,7 @@ Output works in two steps: write [`Client.pendingOutput`](#Client.impl.pendingOu
 
 ## Gotchas
 You provide the trust, the time, the random source, and the transport. The client supports one
-profile, not all of the Web PKI. In TLS 1.2 it does not resume sessions, has no KeyUpdate,
+profile, not all of the Web PKI. In TLS 1.2 it has no KeyUpdate,
 sends an empty Certificate for an Ed25519 credential, and ignores a HelloRequest, so the server
 cannot renegotiate. Dropping the client does not send `close_notify`. Call
 [`Client.closeWrite`](#Client.impl.closeWrite) first. Secrets are not erased.
@@ -578,8 +582,8 @@ Whether a [`Client`](#Client) resumes sessions, in [`ClientConfig.resumption`](#
 Disabled
 ```
 
-The client does not send `psk_key_exchange_modes`, so servers send no tickets, and it drops
-any ticket that a server sends anyway.
+The client does not send `psk_key_exchange_modes` or `session_ticket`, so servers send no
+tickets, and it drops any TLS 1.3 ticket that a server sends anyway.
 
 <a id="Resumption.Enabled"></a>
 
@@ -600,8 +604,9 @@ pub session: Option<&'a Session>
 ```
 
 A session to resume, from [`Client.takeSession`](#Client.impl.takeSession) or [`Session.decode`](#Session.impl.decode), or `None` for a
-full handshake. [`Client.make`](#Client.impl.make) copies it. The client offers it only before it expires and
-only to the server name of the connection it came from. Otherwise it does a full handshake.
+full handshake. [`Client.make`](#Client.impl.make) copies it. The client offers it only before it expires,
+only to the server name of the connection it came from, and only when `versions` allows
+the session's version. Otherwise it does a full handshake.
 
 <a id="Resumption.Enabled.earlyData"></a>
 
@@ -755,14 +760,20 @@ The private key of the leaf.
 pub struct Session
 ```
 
-A TLS 1.3 session from a server's NewSessionTicket, for resuming with
-`ClientConfig.session`.
+A session to resume with [`Resumption`](#Resumption) `Enabled`: from a TLS 1.3 NewSessionTicket, or from a
+TLS 1.2 handshake that gave a session ticket (RFC 5077) or a session ID.
 
 ### Details
-[`Client.takeSession`](#Client.impl.takeSession) returns one for each ticket the server sends after the handshake. A
-session holds the resumption secret, the ticket, the cipher suite, the server name and ALPN
-protocol of its connection, and the leaf certificate that the full handshake authenticated.
-[`Session.encode`](#Session.impl.encode) and [`Session.decode`](#Session.impl.decode) save and load it.
+[`Client.takeSession`](#Client.impl.takeSession) returns one for each TLS 1.3 ticket the server sends after the
+handshake, and one after a full TLS 1.2 handshake, or a resumed one that got a new ticket, when
+the server sent a ticket or a session ID. A session holds the resumption secret (in TLS 1.2,
+the master secret), the ticket, the TLS 1.2 session ID, the cipher suite, the server name and
+ALPN protocol of its connection, and the leaf certificate that the full handshake
+authenticated. [`Session.encode`](#Session.impl.encode) and [`Session.decode`](#Session.impl.decode) save and load it.
+
+A TLS 1.2 session resumes only over TLS 1.2, and a TLS 1.3 session only over TLS 1.3. A TLS
+1.2 session ID without a ticket gets the lifetime 7200 seconds, and a TLS 1.2 ticket the
+server's lifetime hint, or 7200 seconds without one.
 
 ### Gotchas
 The encoded session holds the resumption secret. Store it as you would a key. A server can
@@ -834,6 +845,27 @@ pub fn suite(self: &Self) -> CipherSuite
 
 Returns the cipher suite of the connection that issued the session.
 
+<a id="Session.impl.version"></a>
+
+### Method `version`
+
+```silk
+pub fn version(self: &Self) -> TlsVersion
+```
+
+Returns the TLS version of the session, which is the only version it resumes.
+
+<a id="Session.impl.sessionId"></a>
+
+### Method `sessionId`
+
+```silk
+pub fn sessionId<'a>(self: &'a Self) -> &'a [u8]
+```
+
+Borrows the TLS 1.2 session ID that the server gave, which is empty for TLS 1.3 and for a
+TLS 1.2 server that sent only a ticket.
+
 <a id="Session.impl.ticket"></a>
 
 ### Method `ticket`
@@ -842,7 +874,8 @@ Returns the cipher suite of the connection that issued the session.
 pub fn ticket<'a>(self: &'a Self) -> &'a [u8]
 ```
 
-Borrows the opaque ticket that the server issued.
+Borrows the opaque ticket that the server issued. It is empty for a TLS 1.2 session that
+resumes by session ID.
 
 <a id="Session.impl.lifetime"></a>
 
