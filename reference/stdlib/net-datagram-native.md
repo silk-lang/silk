@@ -66,7 +66,7 @@ pub fn main() -> i32 {
 
 Import as `NativeUdpSocket` with `import silk.net.datagram_native { NativeUdpSocket }`.
 
-Public declarations: 8.
+Public declarations: 9.
 
 <a id="RawSocket"></a>
 
@@ -107,6 +107,75 @@ V6
 ```
 
 IPv6.
+
+<a id="MulticastInterface"></a>
+
+## `MulticastInterface`
+
+```silk
+pub union MulticastInterface
+```
+
+The network interface for multicast traffic, in [`NativeUdpSocket.setMulticastInterface`](#NativeUdpSocket.impl.setMulticastInterface) and
+the group calls such as [`NativeUdpSocket.joinGroup`](#NativeUdpSocket.impl.joinGroup).
+
+<a id="MulticastInterface.Default"></a>
+
+### `Default`
+
+```silk
+Default
+```
+
+The interface that the system chooses.
+
+<a id="MulticastInterface.V4"></a>
+
+### `V4`
+
+```silk
+V4
+```
+
+The IPv4 interface with this local address. Use it with IPv4 groups.
+
+<a id="MulticastInterface.V4.address"></a>
+
+#### Field `address`
+
+```silk
+pub address: Ipv4Address
+```
+
+The local address of the interface.
+
+<a id="MulticastInterface.V6"></a>
+
+### `V6`
+
+```silk
+V6
+```
+
+The IPv6 interface with this index, as `if_nametoindex` returns it. Use it with IPv6 groups.
+
+<a id="MulticastInterface.V6.index"></a>
+
+#### Field `index`
+
+```silk
+pub index: u32
+```
+
+The index of the interface.
+
+<a id="MulticastInterface.impl.Copy"></a>
+
+## Implementation `Copy for MulticastInterface`
+
+```silk
+impl Copy for MulticastInterface
+```
 
 <a id="DatagramOperation"></a>
 
@@ -187,6 +256,36 @@ LocalAddress
 ```
 
 Reading the local address.
+
+<a id="DatagramOperation.PeerAddress"></a>
+
+### `PeerAddress`
+
+```silk
+PeerAddress
+```
+
+Reading the address of the connected peer.
+
+<a id="DatagramOperation.Disconnect"></a>
+
+### `Disconnect`
+
+```silk
+Disconnect
+```
+
+Removing the connected peer.
+
+<a id="DatagramOperation.Option"></a>
+
+### `Option`
+
+```silk
+Option
+```
+
+Reading or setting a socket option, such as the TTL or a multicast group.
 
 <a id="DatagramOperation.Wait"></a>
 
@@ -499,6 +598,30 @@ Makes an unbound UDP socket for `family`. It is nonblocking, and child processes
 - `FamilyUnsupported` if the system has no support for `family`.
 - Another `DatagramError` if the system cannot make the socket.
 
+<a id="NativeUdpSocket.impl.adopt"></a>
+
+### Associated function `adopt`
+
+```silk
+pub unsafe effect fn adopt(fd: RawSocket, family: Family) -> NativeUdpSocket
+    ! DatagramError
+```
+
+Takes an open UDP socket of `family`, such as one that another process sent, and makes it
+nonblocking and kept from child processes. The returned socket owns `fd` and closes it when
+it is dropped.
+
+#### When to use
+Use it for a socket descriptor that this program did not make, as Node's `dgram` does for a
+socket shared by a cluster primary. Use [`NativeUdpSocket.open`](#NativeUdpSocket.impl.open) for a new socket.
+
+#### Safety
+`fd` must be an open UDP socket of `family` that nothing else closes.
+
+#### Errors
+- A `DatagramError` with operation `Configure` if the system cannot set the socket flags. The
+  socket is closed then.
+
 <a id="NativeUdpSocket.impl.family"></a>
 
 ### Method `family`
@@ -564,6 +687,297 @@ Returns the local address of the socket, such as the port that the system chose.
 
 #### Errors
 - A `DatagramError` from the system.
+
+<a id="NativeUdpSocket.impl.peerEndpoint"></a>
+
+### Method `peerEndpoint`
+
+```silk
+pub effect fn peerEndpoint(self: &Self) -> Endpoint
+    ! DatagramError
+```
+
+Returns the address of the peer that [`NativeUdpSocket.connect`](#NativeUdpSocket.impl.connect) set.
+
+#### Errors
+- A `DatagramError` from the system, such as `NativeFailure` with operation `PeerAddress` and
+  `ENOTCONN` when the socket is not connected.
+
+<a id="NativeUdpSocket.impl.disconnect"></a>
+
+### Method `disconnect`
+
+```silk
+pub effect fn disconnect(self: &mut Self) -> ()
+    ! DatagramError
+```
+
+Removes the peer that [`NativeUdpSocket.connect`](#NativeUdpSocket.impl.connect) set, so that the socket can send to and
+receive from any address again. The socket stays bound to its local address.
+
+#### Errors
+- A `DatagramError` from the system.
+
+<a id="NativeUdpSocket.impl.setIpv6Only"></a>
+
+### Method `setIpv6Only`
+
+```silk
+pub effect fn setIpv6Only(self: &mut Self, enabled: bool) -> ()
+    ! DatagramError
+```
+
+Sets whether an IPv6 socket takes only IPv6 traffic (`IPV6_V6ONLY`). [`NativeUdpSocket.open`](#NativeUdpSocket.impl.open)
+turns it on. Turn it off before [`NativeUdpSocket.bind`](#NativeUdpSocket.impl.bind) to take IPv4 traffic too, as
+IPv4-mapped IPv6 addresses.
+
+#### Errors
+- `FamilyUnsupported` for an IPv4 socket.
+- A `DatagramError` from the system.
+
+<a id="NativeUdpSocket.impl.setReuseAddress"></a>
+
+### Method `setReuseAddress`
+
+```silk
+pub effect fn setReuseAddress(self: &mut Self, enabled: bool) -> ()
+    ! DatagramError
+```
+
+Sets whether other sockets can bind the same address and port, as several receivers of one
+multicast group do. Call it before [`NativeUdpSocket.bind`](#NativeUdpSocket.impl.bind).
+
+#### Details
+It sets `SO_REUSEADDR`. On macOS it also sets `SO_REUSEPORT`, which macOS needs to share a
+port.
+
+#### Errors
+- A `DatagramError` from the system.
+
+<a id="NativeUdpSocket.impl.setBroadcast"></a>
+
+### Method `setBroadcast`
+
+```silk
+pub effect fn setBroadcast(self: &mut Self, enabled: bool) -> ()
+    ! DatagramError
+```
+
+Sets whether the socket can send to broadcast addresses (`SO_BROADCAST`).
+
+#### Errors
+- A `DatagramError` from the system.
+
+<a id="NativeUdpSocket.impl.setTtl"></a>
+
+### Method `setTtl`
+
+```silk
+pub effect fn setTtl(self: &mut Self, hops: u8) -> ()
+    ! DatagramError
+```
+
+Sets the hop limit of unicast datagrams: `IP_TTL` for an IPv4 socket and
+`IPV6_UNICAST_HOPS` for an IPv6 socket.
+
+#### Errors
+- A `DatagramError` from the system, such as `NativeFailure` with `EINVAL` for 0 on some
+  systems.
+
+<a id="NativeUdpSocket.impl.setMulticastTtl"></a>
+
+### Method `setMulticastTtl`
+
+```silk
+pub effect fn setMulticastTtl(self: &mut Self, hops: u8) -> ()
+    ! DatagramError
+```
+
+Sets the hop limit of multicast datagrams: `IP_MULTICAST_TTL` for an IPv4 socket and
+`IPV6_MULTICAST_HOPS` for an IPv6 socket. 0 keeps them on this host.
+
+#### Errors
+- A `DatagramError` from the system.
+
+<a id="NativeUdpSocket.impl.setMulticastLoopback"></a>
+
+### Method `setMulticastLoopback`
+
+```silk
+pub effect fn setMulticastLoopback(self: &mut Self, enabled: bool) -> ()
+    ! DatagramError
+```
+
+Sets whether this host gets the multicast datagrams that the socket sends:
+`IP_MULTICAST_LOOP` or `IPV6_MULTICAST_LOOP`.
+
+#### Errors
+- A `DatagramError` from the system.
+
+<a id="NativeUdpSocket.impl.setMulticastInterface"></a>
+
+### Method `setMulticastInterface`
+
+```silk
+pub effect fn setMulticastInterface(self: &mut Self, via: MulticastInterface) -> ()
+    ! DatagramError
+```
+
+Sets the interface that sends the multicast datagrams of the socket: `IP_MULTICAST_IF` or
+`IPV6_MULTICAST_IF`. `Default` lets the system choose again.
+
+#### Errors
+- `FamilyUnsupported` if `via` is `V4` for an IPv6 socket, or `V6` for an IPv4 socket.
+- A `DatagramError` from the system, such as `NativeFailure` with `EADDRNOTAVAIL` when no
+  interface has the address.
+
+<a id="NativeUdpSocket.impl.joinGroup"></a>
+
+### Method `joinGroup`
+
+```silk
+pub effect fn joinGroup(self: &mut Self, group: IpAddress, via: MulticastInterface) -> ()
+    ! DatagramError
+```
+
+Joins the multicast group `group` on `via`, so that the socket gets its datagrams.
+
+#### Details
+The family of `group` chooses the option: `IP_ADD_MEMBERSHIP` for IPv4 and `IPV6_JOIN_GROUP`
+for IPv6. Bind the socket to the port of the group first.
+
+#### Errors
+- `FamilyUnsupported` if `via` is of the other family than `group`.
+- A `DatagramError` from the system, such as `NativeFailure` with `EINVAL` when `group` is not
+  a multicast address, or `EADDRINUSE` when the socket is already a member.
+
+<a id="NativeUdpSocket.impl.leaveGroup"></a>
+
+### Method `leaveGroup`
+
+```silk
+pub effect fn leaveGroup(self: &mut Self, group: IpAddress, via: MulticastInterface) -> ()
+    ! DatagramError
+```
+
+Leaves the multicast group `group` on `via`, which [`NativeUdpSocket.joinGroup`](#NativeUdpSocket.impl.joinGroup) joined.
+
+#### Errors
+- `FamilyUnsupported` if `via` is of the other family than `group`.
+- A `DatagramError` from the system, such as `NativeFailure` with `EADDRNOTAVAIL` when the
+  socket is not a member.
+
+<a id="NativeUdpSocket.impl.joinSourceGroup"></a>
+
+### Method `joinSourceGroup`
+
+```silk
+pub effect fn joinSourceGroup(
+    self: &mut Self,
+    group: IpAddress,
+    source: IpAddress,
+    via: MulticastInterface,
+  ) -> ()
+    ! DatagramError
+```
+
+Joins the multicast group `group` on `via` for datagrams from `source` only
+(source-specific multicast).
+
+#### Details
+IPv4 uses `IP_ADD_SOURCE_MEMBERSHIP`. IPv6 uses `MCAST_JOIN_SOURCE_GROUP`.
+
+#### Errors
+- `FamilyUnsupported` if `group`, `source`, and `via` are not all of one family.
+- A `DatagramError` from the system.
+
+<a id="NativeUdpSocket.impl.leaveSourceGroup"></a>
+
+### Method `leaveSourceGroup`
+
+```silk
+pub effect fn leaveSourceGroup(
+    self: &mut Self,
+    group: IpAddress,
+    source: IpAddress,
+    via: MulticastInterface,
+  ) -> ()
+    ! DatagramError
+```
+
+Leaves the source-specific group that [`NativeUdpSocket.joinSourceGroup`](#NativeUdpSocket.impl.joinSourceGroup) joined.
+
+#### Errors
+- `FamilyUnsupported` if `group`, `source`, and `via` are not all of one family.
+- A `DatagramError` from the system.
+
+<a id="NativeUdpSocket.impl.receiveBufferSize"></a>
+
+### Method `receiveBufferSize`
+
+```silk
+pub effect fn receiveBufferSize(self: &Self) -> usize
+    ! DatagramError
+```
+
+Returns the size of the receive buffer of the socket in bytes (`SO_RCVBUF`).
+
+#### Details
+Linux reports twice the size that [`NativeUdpSocket.setReceiveBufferSize`](#NativeUdpSocket.impl.setReceiveBufferSize) set, because it
+counts its bookkeeping.
+
+#### Errors
+- A `DatagramError` from the system.
+
+<a id="NativeUdpSocket.impl.setReceiveBufferSize"></a>
+
+### Method `setReceiveBufferSize`
+
+```silk
+pub effect fn setReceiveBufferSize(self: &mut Self, size: usize) -> ()
+    ! DatagramError
+```
+
+Asks the system for a receive buffer of `size` bytes (`SO_RCVBUF`). The system can round or
+cap it.
+
+#### Errors
+- `NativeFailure` with operation `Option` and `EINVAL` if `size` does not fit in an `int`.
+- Another `DatagramError` from the system.
+
+<a id="NativeUdpSocket.impl.sendBufferSize"></a>
+
+### Method `sendBufferSize`
+
+```silk
+pub effect fn sendBufferSize(self: &Self) -> usize
+    ! DatagramError
+```
+
+Returns the size of the send buffer of the socket in bytes (`SO_SNDBUF`).
+
+#### Details
+Linux reports twice the size that [`NativeUdpSocket.setSendBufferSize`](#NativeUdpSocket.impl.setSendBufferSize) set, because it
+counts its bookkeeping.
+
+#### Errors
+- A `DatagramError` from the system.
+
+<a id="NativeUdpSocket.impl.setSendBufferSize"></a>
+
+### Method `setSendBufferSize`
+
+```silk
+pub effect fn setSendBufferSize(self: &mut Self, size: usize) -> ()
+    ! DatagramError
+```
+
+Asks the system for a send buffer of `size` bytes (`SO_SNDBUF`). The system can round or cap
+it.
+
+#### Errors
+- `NativeFailure` with operation `Option` and `EINVAL` if `size` does not fit in an `int`.
+- Another `DatagramError` from the system.
 
 <a id="NativeUdpSocket.impl.send"></a>
 

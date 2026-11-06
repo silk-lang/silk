@@ -16,6 +16,9 @@ EC key on that curve, `rsa_pss_rsae_sha256`, `_sha384` and `_sha512` (2052, 2053
 `rsaEncryption` key, with a salt as long as the digest, and `ed25519` (2055) for an Ed25519 key.
 [`HandshakeSignature.keyType`](#HandshakeSignature.impl.keyType) gives the key type of a certificate.
 
+[`SigningKey`](#SigningKey) is the private key of a leaf certificate, for the side that signs. It checks that
+it matches a certificate, picks a scheme from a peer's [`SchemeSet`](#SchemeSet), and signs.
+
 ## Errors
 - [`SignatureFailure`](#SignatureFailure) for a scheme that this module does not know, a scheme that does not fit
   the key, or a signature that does not verify.
@@ -44,7 +47,7 @@ pub fn main() -> i32 {
 
 Import as `HandshakeSignature` with `import silk.tls.signature { HandshakeSignature }`.
 
-Public declarations: 3.
+Public declarations: 7.
 
 <a id="CertificateKeyType"></a>
 
@@ -295,6 +298,291 @@ Checks that `signature` signs `message` under `scheme` with the public key of `c
 - `UnsupportedScheme` or `KeyMismatch` for a scheme that this module does not know, or that
   does not fit the key.
 - `Ecdsa`, `EcdsaP384`, `Rsa`, or `Ed25519` for a key or a signature that is not valid.
+
+<a id="SchemeSet"></a>
+
+## `SchemeSet`
+
+```silk
+pub struct SchemeSet
+```
+
+A set of TLS `SignatureScheme` codes that this module knows, such as the ones that a peer
+offers in `signature_algorithms`. Unknown codes are left out.
+
+<a id="SchemeSet.impl.Copy"></a>
+
+## Implementation `Copy for SchemeSet`
+
+```silk
+impl Copy for SchemeSet
+```
+
+<a id="SchemeSet.impl"></a>
+
+## Implementation `SchemeSet`
+
+```silk
+impl SchemeSet
+```
+
+<a id="SchemeSet.impl.empty"></a>
+
+### Associated function `empty`
+
+```silk
+pub fn empty() -> SchemeSet
+```
+
+Returns an empty set.
+
+<a id="SchemeSet.impl.insert"></a>
+
+### Method `insert`
+
+```silk
+pub fn insert(self: &mut Self, scheme: usize) -> ()
+```
+
+Adds `scheme` to the set. A code that this module does not know is ignored.
+
+<a id="SchemeSet.impl.contains"></a>
+
+### Method `contains`
+
+```silk
+pub fn contains(self: &Self, scheme: usize) -> bool
+```
+
+Returns whether the set holds `scheme`.
+
+<a id="SIGNATURE_LIMIT"></a>
+
+## `SIGNATURE_LIMIT`
+
+```silk
+pub const SIGNATURE_LIMIT: usize
+```
+
+The longest signature that [`SigningKey.sign`](#SigningKey.impl.sign) writes: an 8192-bit RSA signature.
+
+<a id="SigningError"></a>
+
+## `SigningError`
+
+```silk
+pub union SigningError
+```
+
+Why [`SigningKey.sign`](#SigningKey.impl.sign) did not sign.
+
+<a id="SigningError.UnsupportedScheme"></a>
+
+### `UnsupportedScheme`
+
+```silk
+UnsupportedScheme
+```
+
+The scheme is not one that this key signs with.
+
+<a id="SigningError.OutputTooShort"></a>
+
+### `OutputTooShort`
+
+```silk
+OutputTooShort
+```
+
+The output is shorter than the signature.
+
+<a id="SigningError.Rsa"></a>
+
+### `Rsa`
+
+```silk
+Rsa
+```
+
+RSA-PSS signing failed.
+
+<a id="SigningError.Rsa.error"></a>
+
+#### Field `error`
+
+```silk
+pub error: RsaError
+```
+
+The primitive failure.
+
+<a id="SigningError.impl.Copy"></a>
+
+## Implementation `Copy for SigningError`
+
+```silk
+impl Copy for SigningError
+```
+
+<a id="SigningError.impl.Debug"></a>
+
+## Implementation `Debug for SigningError`
+
+```silk
+impl Debug for SigningError
+```
+
+<a id="SigningError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `Rsa { ... }`.
+
+<a id="SigningKey"></a>
+
+## `SigningKey`
+
+```silk
+pub union SigningKey
+```
+
+The private key of a leaf certificate, which signs CertificateVerify.
+
+<a id="SigningKey.EcdsaP256"></a>
+
+### `EcdsaP256`
+
+```silk
+EcdsaP256
+```
+
+An ECDSA P-256 key, used with the `ecdsa_secp256r1_sha256` scheme.
+
+<a id="SigningKey.EcdsaP256.key"></a>
+
+#### Field `key`
+
+```silk
+pub key: P256
+```
+
+The private key.
+
+<a id="SigningKey.EcdsaP384"></a>
+
+### `EcdsaP384`
+
+```silk
+EcdsaP384
+```
+
+An ECDSA P-384 key, used with the `ecdsa_secp384r1_sha384` scheme.
+
+<a id="SigningKey.EcdsaP384.key"></a>
+
+#### Field `key`
+
+```silk
+pub key: P384
+```
+
+The private key.
+
+<a id="SigningKey.Ed25519"></a>
+
+### `Ed25519`
+
+```silk
+Ed25519
+```
+
+An Ed25519 key, used with the `ed25519` scheme.
+
+<a id="SigningKey.Ed25519.key"></a>
+
+#### Field `key`
+
+```silk
+pub key: Ed25519PrivateKey
+```
+
+The private key.
+
+<a id="SigningKey.RsaPss"></a>
+
+### `RsaPss`
+
+```silk
+RsaPss
+```
+
+An RSA key for an `rsaEncryption` certificate, used with the `rsa_pss_rsae_sha256`,
+`rsa_pss_rsae_sha384`, or `rsa_pss_rsae_sha512` scheme, in that order of preference.
+
+<a id="SigningKey.RsaPss.key"></a>
+
+#### Field `key`
+
+```silk
+pub key: RsaPrivateKey
+```
+
+The private key.
+
+<a id="SigningKey.impl"></a>
+
+## Implementation `SigningKey`
+
+```silk
+impl SigningKey
+```
+
+<a id="SigningKey.impl.matches"></a>
+
+### Method `matches`
+
+```silk
+pub fn matches(self: &Self, certificate: &Certificate) -> bool
+```
+
+Returns whether `certificate`'s public key is the public key of this key, with the matching
+algorithm.
+
+<a id="SigningKey.impl.chooseScheme"></a>
+
+### Method `chooseScheme`
+
+```silk
+pub fn chooseScheme(self: &Self, offered: &SchemeSet) -> Option<usize>
+```
+
+Returns this key's preferred scheme among `offered`, or `None` when the peer offers none that
+this key signs with.
+
+<a id="SigningKey.impl.sign"></a>
+
+### Method `sign`
+
+```silk
+pub effect fn sign(self: &Self, scheme: usize, message: &[u8], output: &mut [u8]) -> Result<
+    usize,
+    SigningError
+  >
+  ? &mut Random
+```
+
+Signs `message` under `scheme`, writes the signature to the start of `output`, and returns
+its length. ECDSA signatures are DER, as TLS sends them. An output of [`SIGNATURE_LIMIT`](#SIGNATURE_LIMIT)
+bytes always fits.
+
+#### Errors
+- `UnsupportedScheme` for a scheme that this key does not sign with.
+- `OutputTooShort` when `output` cannot hold the signature.
+- `Rsa` when RSA-PSS signing fails.
 
 
 Category: TLS and certificates.

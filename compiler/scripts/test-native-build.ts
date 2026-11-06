@@ -152,16 +152,47 @@ const program = Effect.gen(function* () {
   const combined = yield* invoke(silk, ['init', '--lib', '--workspace'], directory)
   assert.equal(combined.status, 2, combined.stderr)
   assert.match(combined.stderr, /^silk init: `--lib` and `--workspace` cannot be combined/)
-  // A lone word that names no file is a mistyped command, not a source to dump.
-  const unknown = yield* invoke(silk, ['frobnicate'], directory)
-  assert.equal(unknown.status, 2, unknown.stderr)
-  assert.match(unknown.stderr, /^silk: unknown command `frobnicate`\n/)
-  // A path-like word that names no file reports that file, also as a usage error.
-  for (const missing of ['missing.silk', './frob']) {
-    const absent = yield* invoke(silk, [missing], directory)
-    assert.equal(absent.status, 2, absent.stderr)
-    assert.ok(absent.stderr.startsWith(`silk: no such source file \`${missing}\`;`), absent.stderr)
+  // A lone word is a mistyped command, even one that names a source file.
+  for (const word of ['frobnicate', 'main.silk']) {
+    const unknown = yield* invoke(silk, [word], directory)
+    assert.equal(unknown.status, 2, unknown.stderr)
+    assert.ok(unknown.stderr.startsWith(`silk: unknown command \`${word}\`\n`), unknown.stderr)
   }
+  // `silk dump` prints one stage of the compiler on standard output, without Clang.
+  const dumpEnv = { ...process.env, SILK_CLANG: sentinel }
+  const tokens = yield* invoke(silk, ['dump', 'tokens', 'main.silk'], directory, dumpEnv)
+  assert.equal(tokens.status, 0, tokens.stderr)
+  const tokenLines = tokens.stdout.trimEnd().split('\n')
+  assert.deepEqual(tokenLines.slice(0, 3), ['#0 PubKeyword 0..3 "pub"', '#1 Whitespace 3..4 " "', '#2 FnKeyword 4..6 "fn"'])
+  assert.match(tokenLines[tokenLines.length - 1], /^#\d+ EndOfFile (\d+)\.\.\1 ""$/)
+  const syntax = yield* invoke(silk, ['dump', 'syntax', 'main.silk'], directory, dumpEnv)
+  assert.equal(syntax.status, 0, syntax.stderr)
+  // Each element is indented one level under its node, and a token shows its text: `5 * 8` is
+  // nested inside `2 + ...`.
+  assert.match(syntax.stdout, /^SourceFile 0\.\.41\n {2}FunctionDeclaration 0\.\.41\n {4}PubKeyword 0\.\.3 "pub"\n/)
+  assert.match(syntax.stdout, /\n {10}Plus 32\.\.33 "\+"\n {10}InfixExpression 34\.\.39\n(?: {12,}.*\n)* {12}Star 36\.\.37 "\*"\n/)
+  assert.match(syntax.stdout, /\ndiagnostics 0\n$/)
+  const hir = yield* invoke(silk, ['dump', 'hir', 'main.silk'], directory, dumpEnv)
+  assert.equal(hir.status, 0, hir.stderr)
+  assert.match(hir.stdout, /^documentation none\ndeclarations \[#\d+\]\n/)
+  const mir = yield* invoke(silk, ['dump', 'mir', 'main.silk', '--stdlib', standardLibrary], directory, dumpEnv)
+  assert.equal(mir.status, 0, mir.stderr)
+  // Only the package's own functions are listed; the constant expression is still a multiply and
+  // an add, since MIR is listed before LLVM optimizes it.
+  assert.deepEqual([...mir.stdout.matchAll(/^fn (.*)$/gm)].map((header) => header[1]), ['main.main() -> i32'])
+  assert.match(mir.stdout, /\n {2}let _0: i32 {2}\/\/ return\n/)
+  assert.match(mir.stdout, /\nbb0:\n(?: {2}.*\n)* {2}_\d+ = 5_i32 \* 8_i32\n/)
+  assert.match(mir.stdout, /\n {2}return\n\n$/)
+  const everything = yield* invoke(silk, ['dump', 'mir', 'main.silk', '--all', '--stdlib', standardLibrary, '--target', 'wasm32-wasip1'], directory, dumpEnv)
+  assert.equal(everything.status, 0, everything.stderr)
+  assert.match(everything.stdout, /^fn silk\/platform\/wasi\//m)
+  assert.ok(!existsSync(marker), 'silk dump ran Clang')
+  const badStage = yield* invoke(silk, ['dump', 'llvm', 'main.silk'], directory)
+  assert.equal(badStage.status, 2, badStage.stderr)
+  assert.match(badStage.stderr, /^silk dump: unknown stage `llvm`; expected tokens, syntax, hir or mir\nusage: silk dump tokens\|syntax\|hir <source>\n {7}silk dump mir /)
+  const absent = yield* invoke(silk, ['dump', 'syntax', 'missing.silk'], directory)
+  assert.equal(absent.status, 2, absent.stderr)
+  assert.equal(absent.stderr, 'silk dump: no such source file `missing.silk`\n')
   // Release notes belong to the silk tool (`silk change`), not the compiler.
   const changes = yield* invoke(silk, ['changes'], directory)
   assert.equal(changes.status, 2, changes.stderr)

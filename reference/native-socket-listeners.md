@@ -59,13 +59,15 @@ effect fn useAccepted(accepted: Accepted, requestId: i32) -> i32 {
 
 ## Options
 
-`ListenOptions.make(kernelBacklog, reuseAddress, pollIntervalNanoseconds)` is pure. Backlog must be
-1 through 65535 and the polling interval must be 1 through 1,000,000,000 nanoseconds. `defaults()`
-selects backlog 128, disables reuse, and polls at one-millisecond intervals. Reuse controls only
+`ListenOptions.make(kernelBacklog, reuseAddress, ipv6Only, pollIntervalNanoseconds)` is pure.
+Backlog must be 1 through 65535 and the polling interval must be 1 through 1,000,000,000
+nanoseconds. `defaults()` selects backlog 128, disables reuse, keeps IPv6 listeners IPv6-only, and
+polls at one-millisecond intervals. Reuse controls only
 `SO_REUSEADDR`; the actor never enables `SO_REUSEPORT` or creates an application queue.
 
-IPv6 listeners are explicitly IPv6-only and own one descriptor. IPv4-mapped IPv6 values therefore
-remain IPv6 identities rather than being silently converted to IPv4.
+An IPv6 listener sets `IPV6_V6ONLY` from `ipv6Only` and owns one descriptor. With `ipv6Only` on,
+IPv4 clients cannot reach it. With it off, IPv4 clients arrive as IPv4-mapped IPv6 peers, which stay
+IPv6 identities rather than being silently converted to IPv4.
 
 ## Serial acceptance and ownership
 

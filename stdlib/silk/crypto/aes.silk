@@ -1,10 +1,11 @@
-//! Encrypt data with the AES block cipher (FIPS 197) in ECB, CBC, or CTR mode (NIST SP 800-38A).
+//! Encrypt data with the AES block cipher (FIPS 197) in ECB, CBC, CTR, CFB, or OFB mode (NIST SP
+//! 800-38A).
 //!
 //! # When to use
-//! Use this module when a protocol or file format names AES-CBC, AES-CTR, or AES-ECB, or when it
-//! needs the raw AES block function. These modes do not detect changes to the ciphertext. To
-//! encrypt new data, prefer `silk.crypto.aes_gcm` or `silk.crypto.chacha20_poly1305`, which also
-//! authenticate it.
+//! Use this module when a protocol or file format names AES-CBC, AES-CTR, AES-ECB, AES-CFB, or
+//! AES-OFB, or when it needs the raw AES block function. These modes do not detect changes to the
+//! ciphertext. To encrypt new data, prefer `silk.crypto.aes_gcm` or
+//! `silk.crypto.chacha20_poly1305`, which also authenticate it.
 //!
 //! # Details
 //! [`Aes`] holds an expanded 16-byte (AES-128), 24-byte (AES-192), or 32-byte (AES-256) key and
@@ -12,11 +13,18 @@
 //! arrives in parts: call `update` for each part and `finish` at the end. With padding on, they add
 //! and remove PKCS #7 padding, as OpenSSL does. [`AesCtr`] XORs a key stream into the data, so the
 //! same call encrypts and decrypts. The counter is the whole 16-byte block, incremented as one
-//! big-endian number. Nothing allocates.
+//! big-endian number. [`AesCfb`], [`AesCfb8`], and [`AesCfb1`] are cipher feedback with 128, 8, and
+//! 1-bit segments, and [`AesOfb`] is output feedback. Nothing allocates.
+//!
+//! The other AES modes have their own modules: `silk.crypto.aes_gcm`, `silk.crypto.aes_ccm`, and
+//! `silk.crypto.aes_ocb` authenticate, `silk.crypto.aes_xts` encrypts storage sectors, and
+//! `silk.crypto.aes_wrap` wraps keys.
 //!
 //! When the build targets x86-64 or AArch64 with the `aes` CPU feature, each round is one AES
-//! instruction. Otherwise the rounds use portable code that computes the S-box instead of reading a
-//! table, so the time does not depend on the key or the data on any target.
+//! instruction. A default x86-64 build checks at run time for AES-NI and SSSE3 and uses them when
+//! the machine has them, with CBC decryption, ECB and CTR running eight blocks at a time. Otherwise
+//! the rounds use portable code that computes the S-box instead of reading a table, so the time
+//! does not depend on the key or the data on any target.
 //!
 //! # Errors
 //! The functions return an [`AesError`]. Every check comes before the first write, and on an error
@@ -123,10 +131,13 @@ import silk.core.result { Result }
 import silk.core.target { Arch, Target }
 import silk.crypto.aes_round
 import silk.simd.aarch64
+import silk.simd.cpu { CpuFeatures }
 import silk.simd.u8x16
+import silk.simd.u64x2
 import silk.simd.x86
 import silk.num.u8
 import silk.num.u32
+import silk.num.u64
 import silk.num.usize
 import silk.io.writer { Writer, WriterError }
 
@@ -172,9 +183,9 @@ impl Debug for AesError {
 ///
 /// [`Aes.make`] takes a 16-byte (AES-128), 24-byte (AES-192), or 32-byte (AES-256) key and expands
 /// the encryption and decryption round keys once. The value is fixed-size and does not allocate.
-/// With the `aes` CPU feature on x86-64 or AArch64, each round is one instruction. Otherwise the
-/// portable rounds compute the S-box instead of reading a table, so the time does not depend on the
-/// key or the data.
+/// With the `aes` CPU feature on x86-64 or AArch64, or with AES-NI found at run time on x86-64,
+/// each round is one instruction. Otherwise the portable rounds compute the S-box instead of reading
+/// a table, so the time does not depend on the key or the data.
 ///
 /// # Gotchas
 ///
@@ -232,6 +243,11 @@ pub fn encryptState(key: &Aes, state: simd<u8, 16>) -> simd<u8, 16> {
     }
     return aarch64.aesEncrypt(value, key.encryption[last - 1]) ^ key.encryption[last]
   }
+  static if Target.arch() == Arch.X86_64 && !Target.hasCpuFeature("aes") {
+    if hardware() {
+      return unsafe encryptNi(key, state)
+    }
+  }
   let mut value = state ^ key.encryption[0]
   let mut round: usize = 1
   while round < last {
@@ -255,6 +271,11 @@ pub fn decryptState(key: &Aes, state: simd<u8, 16>) -> simd<u8, 16> {
       round = round + 1
     }
     return aarch64.aesDecrypt(value, key.decryption[last - 1]) ^ key.decryption[last]
+  }
+  static if Target.arch() == Arch.X86_64 && !Target.hasCpuFeature("aes") {
+    if hardware() {
+      return unsafe decryptNi(key, state)
+    }
   }
   let mut value = state ^ key.decryption[0]
   let mut round: usize = 1
@@ -430,6 +451,14 @@ fn modeUpdate(mode: &mut BlockMode, input: &[u8], output: &mut [u8]) -> Result<u
     u8x16.store(&mut output, 0, block)
     mode.pendingLength = 0
     written = 16
+  }
+  static if Target.arch() == Arch.X86_64 {
+    if written < emit && hardware() {
+      let blocks = (emit - written) / 16
+      modeBlocksNi(&mut mode, input, consumed, &mut output, written, blocks)
+      consumed = consumed + blocks * 16
+      written = emit
+    }
   }
   while written < emit {
     let block = modeBlock(&mut mode, u8x16.load(input, consumed))
@@ -786,6 +815,13 @@ impl AesCtr {
       self.used = self.used + 1
       offset = offset + 1
     }
+    static if Target.arch() == Arch.X86_64 {
+      if offset + 16 <= input.length && hardware() {
+        let blocks = (input.length - offset) / 16
+        unsafe ctrNi(&self.key, &mut self.counter, input, offset, &mut output, offset, blocks)
+        offset = offset + blocks * 16
+      }
+    }
     while offset + 16 <= input.length {
       let stream = nextStream(&mut self)
       u8x16.store(&mut output, offset, u8x16.load(input, offset) ^ stream)
@@ -816,4 +852,750 @@ fn nextStream(state: &mut AesCtr) -> simd<u8, 16> {
     carry = u32.shiftRight(sum, 8)
   }
   return stream
+}
+
+// Checks the key and IV lengths for the feedback stream modes and returns the expanded key.
+fn streamStart(key: &[u8], iv: &[u8]) -> Result<Aes, AesError> {
+  if key.length != 16 && key.length != 24 && key.length != 32 {
+    return Result<Aes, AesError>.failResult(AesError.InvalidKeyLength)
+  }
+  if iv.length != 16 {
+    return Result<Aes, AesError>.failResult(AesError.InvalidIvLength)
+  }
+  return Result<Aes, AesError>.succeed(expand(key))
+}
+
+fn copyIv(iv: &[u8]) -> [u8; 16] {
+  let mut register: [u8; 16] = [0; 16]
+  let mut index: usize = 0
+  while index < 16 {
+    register[index] = iv[index]
+    index = index + 1
+  }
+  return register
+}
+
+/// AES in full-block cipher feedback mode, CFB-128 (NIST SP 800-38A section 6.3).
+///
+/// # When to use
+///
+/// Use it where a protocol names AES-CFB, such as Node's `aes-256-cfb`. It does not detect changes
+/// to the ciphertext. For new designs, use `silk.crypto.aes_gcm`.
+///
+/// # Details
+///
+/// The 16-byte IV is the first input block. Each key stream block is the encryption of the
+/// previous 16 ciphertext bytes, so encryption and decryption differ: make the value with
+/// [`AesCfb.encryptor`] or [`AesCfb.decryptor`]. [`AesCfb.apply`] takes the data in any split and
+/// gives the same result. Nothing allocates.
+///
+/// # Gotchas
+///
+/// The same key and IV must never encrypt two messages. The value holds key material and is not
+/// erased when it is dropped.
+pub struct AesCfb {
+  key: Aes,
+  register: [u8; 16],
+  stream: [u8; 16],
+  used: usize,
+  decrypting: bool,
+}
+
+impl AesCfb {
+  /// Returns a CFB-128 encryptor for `key` and `iv`.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidKeyLength` if `key` is not 16, 24, or 32 bytes.
+  /// - `InvalidIvLength` if `iv` is not 16 bytes.
+  pub fn encryptor(key: &[u8], iv: &[u8]) -> Result<AesCfb, AesError> {
+    return makeCfb(key, iv, false)
+  }
+
+  /// Returns a CFB-128 decryptor for `key` and `iv`.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidKeyLength` if `key` is not 16, 24, or 32 bytes.
+  /// - `InvalidIvLength` if `iv` is not 16 bytes.
+  pub fn decryptor(key: &[u8], iv: &[u8]) -> Result<AesCfb, AesError> {
+    return makeCfb(key, iv, true)
+  }
+
+  /// Encrypts or decrypts `input` into the first `input.length` bytes of `output`.
+  ///
+  /// The bytes of `output` after them do not change. `input` and `output` must not overlap.
+  ///
+  /// # Errors
+  ///
+  /// - `OutputTooSmall` if `output` is shorter than `input`. The state does not change.
+  pub fn apply(self: &mut Self, input: &[u8], output: &mut [u8]) -> Result<(), AesError> {
+    if output.length < input.length {
+      return Result<(), AesError>.failResult(AesError.OutputTooSmall)
+    }
+    let mut offset: usize = 0
+    while offset < input.length && self.used < 16 {
+      output[offset] = cfbByte(&mut self, input[offset])
+      offset = offset + 1
+    }
+    // Whole blocks: the key stream is the encryption of the previous ciphertext block.
+    while offset + 16 <= input.length {
+      let source = u8x16.load(input, offset)
+      let produced = source ^ encryptState(&self.key, u8x16.load(&self.register, 0))
+      u8x16.store(&mut output, offset, produced)
+      if self.decrypting {
+        u8x16.store(&mut self.register, 0, source)
+      } else {
+        u8x16.store(&mut self.register, 0, produced)
+      }
+      offset = offset + 16
+    }
+    while offset < input.length {
+      output[offset] = cfbByte(&mut self, input[offset])
+      offset = offset + 1
+    }
+    return Result<(), AesError>.succeed(())
+  }
+}
+
+// One byte of CFB-128: refills the key stream when it is used up, and shifts the ciphertext byte
+// into the register.
+fn cfbByte(state: &mut AesCfb, input: u8) -> u8 {
+  if state.used == 16 {
+    state.stream = state.key.encryptBlock(&state.register)
+    state.used = 0
+  }
+  let produced = u8.bitXor(input, state.stream[state.used])
+  if state.decrypting {
+    state.register[state.used] = input
+  } else {
+    state.register[state.used] = produced
+  }
+  state.used = state.used + 1
+  return produced
+}
+
+fn makeCfb(key: &[u8], iv: &[u8], decrypting: bool) -> Result<AesCfb, AesError> {
+  return match streamStart(key, iv) {
+    Result<Aes, AesError>.Success { value } => Result<AesCfb, AesError>.succeed(
+      AesCfb { key: move value, register: copyIv(iv), stream: [0; 16], used: 16, decrypting: decrypting },
+    )
+    Result<Aes, AesError>.Failure { error } => Result<AesCfb, AesError>.failResult(move error)
+  }
+}
+
+/// AES in 8-bit cipher feedback mode, CFB-8 (NIST SP 800-38A section 6.3).
+///
+/// # When to use
+///
+/// Use it where a protocol names AES-CFB8, such as Node's `aes-128-cfb8`. It does not detect
+/// changes to the ciphertext, and it runs one block encryption per byte.
+///
+/// # Details
+///
+/// The 16-byte IV is the first shift register. For each byte, the first byte of the encrypted
+/// register is the key stream byte, and the register shifts left by one byte and takes the
+/// ciphertext byte. Make the value with [`AesCfb8.encryptor`] or [`AesCfb8.decryptor`]. Nothing
+/// allocates.
+///
+/// # Gotchas
+///
+/// The same key and IV must never encrypt two messages. The value holds key material and is not
+/// erased when it is dropped.
+pub struct AesCfb8 {
+  key: Aes,
+  register: [u8; 16],
+  decrypting: bool,
+}
+
+impl AesCfb8 {
+  /// Returns a CFB-8 encryptor for `key` and `iv`.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidKeyLength` if `key` is not 16, 24, or 32 bytes.
+  /// - `InvalidIvLength` if `iv` is not 16 bytes.
+  pub fn encryptor(key: &[u8], iv: &[u8]) -> Result<AesCfb8, AesError> {
+    return makeCfb8(key, iv, false)
+  }
+
+  /// Returns a CFB-8 decryptor for `key` and `iv`.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidKeyLength` if `key` is not 16, 24, or 32 bytes.
+  /// - `InvalidIvLength` if `iv` is not 16 bytes.
+  pub fn decryptor(key: &[u8], iv: &[u8]) -> Result<AesCfb8, AesError> {
+    return makeCfb8(key, iv, true)
+  }
+
+  /// Encrypts or decrypts `input` into the first `input.length` bytes of `output`.
+  ///
+  /// The bytes of `output` after them do not change. `input` and `output` must not overlap.
+  ///
+  /// # Errors
+  ///
+  /// - `OutputTooSmall` if `output` is shorter than `input`. The state does not change.
+  pub fn apply(self: &mut Self, input: &[u8], output: &mut [u8]) -> Result<(), AesError> {
+    if output.length < input.length {
+      return Result<(), AesError>.failResult(AesError.OutputTooSmall)
+    }
+    let mut offset: usize = 0
+    while offset < input.length {
+      let stream = self.key.encryptBlock(&self.register)
+      let produced = u8.bitXor(input[offset], stream[0])
+      let mut index: usize = 0
+      while index < 15 {
+        self.register[index] = self.register[index + 1]
+        index = index + 1
+      }
+      if self.decrypting {
+        self.register[15] = input[offset]
+      } else {
+        self.register[15] = produced
+      }
+      output[offset] = produced
+      offset = offset + 1
+    }
+    return Result<(), AesError>.succeed(())
+  }
+}
+
+fn makeCfb8(key: &[u8], iv: &[u8], decrypting: bool) -> Result<AesCfb8, AesError> {
+  return match streamStart(key, iv) {
+    Result<Aes, AesError>.Success { value } => Result<AesCfb8, AesError>.succeed(
+      AesCfb8 { key: move value, register: copyIv(iv), decrypting: decrypting },
+    )
+    Result<Aes, AesError>.Failure { error } => Result<AesCfb8, AesError>.failResult(move error)
+  }
+}
+
+/// AES in 1-bit cipher feedback mode, CFB-1 (NIST SP 800-38A section 6.3).
+///
+/// # When to use
+///
+/// Use it where a protocol names AES-CFB1, such as Node's `aes-128-cfb1`. It does not detect
+/// changes to the ciphertext, and it runs one block encryption per bit, so it is slow.
+///
+/// # Details
+///
+/// The 16-byte IV is the first shift register. Each byte is taken as eight bits, most significant
+/// first, as OpenSSL does for byte input. For each bit, the top bit of the encrypted register is
+/// the key stream bit, and the register shifts left by one bit and takes the ciphertext bit. Make
+/// the value with [`AesCfb1.encryptor`] or [`AesCfb1.decryptor`]. Nothing allocates.
+///
+/// # Gotchas
+///
+/// The same key and IV must never encrypt two messages. The value holds key material and is not
+/// erased when it is dropped.
+pub struct AesCfb1 {
+  key: Aes,
+  register: [u8; 16],
+  decrypting: bool,
+}
+
+impl AesCfb1 {
+  /// Returns a CFB-1 encryptor for `key` and `iv`.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidKeyLength` if `key` is not 16, 24, or 32 bytes.
+  /// - `InvalidIvLength` if `iv` is not 16 bytes.
+  pub fn encryptor(key: &[u8], iv: &[u8]) -> Result<AesCfb1, AesError> {
+    return makeCfb1(key, iv, false)
+  }
+
+  /// Returns a CFB-1 decryptor for `key` and `iv`.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidKeyLength` if `key` is not 16, 24, or 32 bytes.
+  /// - `InvalidIvLength` if `iv` is not 16 bytes.
+  pub fn decryptor(key: &[u8], iv: &[u8]) -> Result<AesCfb1, AesError> {
+    return makeCfb1(key, iv, true)
+  }
+
+  /// Encrypts or decrypts `input` into the first `input.length` bytes of `output`.
+  ///
+  /// The bytes of `output` after them do not change. `input` and `output` must not overlap.
+  ///
+  /// # Errors
+  ///
+  /// - `OutputTooSmall` if `output` is shorter than `input`. The state does not change.
+  pub fn apply(self: &mut Self, input: &[u8], output: &mut [u8]) -> Result<(), AesError> {
+    if output.length < input.length {
+      return Result<(), AesError>.failResult(AesError.OutputTooSmall)
+    }
+    let mut offset: usize = 0
+    while offset < input.length {
+      let mut produced: u8 = 0
+      let mut bit: usize = 0
+      while bit < 8 {
+        let stream = self.key.encryptBlock(&self.register)
+        let inBit = u8.bitAnd(u8.shiftRight(input[offset], usize.toU8(7 - bit)), 1)
+        let outBit = u8.bitXor(inBit, u8.shiftRight(stream[0], 7))
+        produced = u8.bitOr(produced, u8.shiftLeft(outBit, usize.toU8(7 - bit)))
+        let mut feedback = outBit
+        if self.decrypting {
+          feedback = inBit
+        }
+        let mut index: usize = 0
+        while index < 15 {
+          self.register[index] = u8.bitOr(u8.shiftLeft(self.register[index], 1), u8.shiftRight(self.register[index + 1], 7))
+          index = index + 1
+        }
+        self.register[15] = u8.bitOr(u8.shiftLeft(self.register[15], 1), feedback)
+        bit = bit + 1
+      }
+      output[offset] = produced
+      offset = offset + 1
+    }
+    return Result<(), AesError>.succeed(())
+  }
+}
+
+fn makeCfb1(key: &[u8], iv: &[u8], decrypting: bool) -> Result<AesCfb1, AesError> {
+  return match streamStart(key, iv) {
+    Result<Aes, AesError>.Success { value } => Result<AesCfb1, AesError>.succeed(
+      AesCfb1 { key: move value, register: copyIv(iv), decrypting: decrypting },
+    )
+    Result<Aes, AesError>.Failure { error } => Result<AesCfb1, AesError>.failResult(move error)
+  }
+}
+
+/// AES in output feedback mode, OFB (NIST SP 800-38A section 6.4).
+///
+/// # When to use
+///
+/// Use it where a protocol names AES-OFB, such as Node's `aes-256-ofb`. It does not detect changes
+/// to the ciphertext. For new designs, use `silk.crypto.aes_gcm`.
+///
+/// # Details
+///
+/// The 16-byte IV is encrypted again and again to give the key stream, so it does not depend on the
+/// data and [`AesOfb.apply`] both encrypts and decrypts. The result does not depend on how the data
+/// is split. Nothing allocates.
+///
+/// # Gotchas
+///
+/// The same key and IV must never encrypt two messages. If they do, the XOR of the two ciphertexts
+/// is the XOR of the two plaintexts. The value holds key material and is not erased when it is
+/// dropped.
+pub struct AesOfb {
+  key: Aes,
+  stream: [u8; 16],
+  used: usize,
+}
+
+impl AesOfb {
+  /// Returns an OFB key stream for `key` and `iv`.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidKeyLength` if `key` is not 16, 24, or 32 bytes.
+  /// - `InvalidIvLength` if `iv` is not 16 bytes.
+  pub fn make(key: &[u8], iv: &[u8]) -> Result<AesOfb, AesError> {
+    return match streamStart(key, iv) {
+      Result<Aes, AesError>.Success { value } => Result<AesOfb, AesError>.succeed(
+        AesOfb { key: move value, stream: copyIv(iv), used: 16 },
+      )
+      Result<Aes, AesError>.Failure { error } => Result<AesOfb, AesError>.failResult(move error)
+    }
+  }
+
+  /// XORs the next `input.length` bytes of key stream with `input` into `output`.
+  ///
+  /// The bytes of `output` after them do not change. `input` and `output` must not overlap.
+  ///
+  /// # Errors
+  ///
+  /// - `OutputTooSmall` if `output` is shorter than `input`. The state does not change.
+  pub fn apply(self: &mut Self, input: &[u8], output: &mut [u8]) -> Result<(), AesError> {
+    if output.length < input.length {
+      return Result<(), AesError>.failResult(AesError.OutputTooSmall)
+    }
+    let mut offset: usize = 0
+    while offset < input.length && self.used < 16 {
+      output[offset] = u8.bitXor(input[offset], self.stream[self.used])
+      self.used = self.used + 1
+      offset = offset + 1
+    }
+    // Whole blocks: each key stream block is the encryption of the one before.
+    if offset + 16 <= input.length {
+      let mut stream = u8x16.load(&self.stream, 0)
+      while offset + 16 <= input.length {
+        stream = encryptState(&self.key, stream)
+        u8x16.store(&mut output, offset, u8x16.load(input, offset) ^ stream)
+        offset = offset + 16
+      }
+      u8x16.store(&mut self.stream, 0, stream)
+    }
+    while offset < input.length {
+      if self.used == 16 {
+        self.stream = self.key.encryptBlock(&self.stream)
+        self.used = 0
+      }
+      output[offset] = u8.bitXor(input[offset], self.stream[self.used])
+      self.used = self.used + 1
+      offset = offset + 1
+    }
+    return Result<(), AesError>.succeed(())
+  }
+}
+
+// The x86-64 AES-NI kernels. Each needs the `aes` and `ssse3` features, so a caller checks
+// `hardware()` first. Their output equals the portable rounds' for every input. The bulk kernels
+// run eight independent blocks at once, so the rounds overlap in the pipeline.
+static if Target.arch() == Arch.X86_64 {
+  // Runs `blocks` whole blocks of a CBC or ECB mode on the kernels below.
+  fn modeBlocksNi(mode: &mut BlockMode, input: &[u8], inputOffset: usize, output: &mut [u8], outputOffset: usize, blocks: usize) -> () {
+    if mode.chained == false {
+      if mode.decrypting {
+        unsafe ecbDecryptNi(&mode.key, input, inputOffset, &mut output, outputOffset, blocks)
+      } else {
+        unsafe ecbEncryptNi(&mode.key, input, inputOffset, &mut output, outputOffset, blocks)
+      }
+      return ()
+    }
+    if mode.decrypting {
+      mode.chain = unsafe cbcDecryptNi(&mode.key, mode.chain, input, inputOffset, &mut output, outputOffset, blocks)
+    } else {
+      mode.chain = unsafe cbcEncryptNi(&mode.key, mode.chain, input, inputOffset, &mut output, outputOffset, blocks)
+    }
+  }
+
+  fn hardware() -> bool {
+    return CpuFeatures.available("aes") && CpuFeatures.available("ssse3")
+  }
+
+  @features("aes", "ssse3")
+  unsafe fn encryptNi(key: &Aes, state: simd<u8, 16>) -> simd<u8, 16> {
+    let mut v0 = u8x16.bitcastToU64x2(state ^ key.encryption[0])
+    let mut round: usize = 1
+    while round < key.rounds {
+      let roundKey = u8x16.bitcastToU64x2(key.encryption[round])
+      v0 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v0, roundKey)
+      round = round + 1
+    }
+    let lastKey = u8x16.bitcastToU64x2(key.encryption[key.rounds])
+    v0 = Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v0, lastKey)
+    return u64x2.bitcastToU8x16(v0)
+  }
+
+  @features("aes", "ssse3")
+  unsafe fn decryptNi(key: &Aes, state: simd<u8, 16>) -> simd<u8, 16> {
+    let mut v0 = u8x16.bitcastToU64x2(state ^ key.decryption[0])
+    let mut round: usize = 1
+    while round < key.rounds {
+      let roundKey = u8x16.bitcastToU64x2(key.decryption[round])
+      v0 = Intrinsic.x86AesDecrypt<simd<u64, 2>>(v0, roundKey)
+      round = round + 1
+    }
+    let lastKey = u8x16.bitcastToU64x2(key.decryption[key.rounds])
+    v0 = Intrinsic.x86AesDecryptLast<simd<u64, 2>>(v0, lastKey)
+    return u64x2.bitcastToU8x16(v0)
+  }
+
+  // Encrypts or decrypts `blocks` whole blocks of `input` at `inputOffset` into `output` at
+  // `outputOffset`.
+  @features("aes", "ssse3")
+  unsafe fn ecbEncryptNi(key: &Aes, input: &[u8], inputOffset: usize, output: &mut [u8], outputOffset: usize, blocks: usize) -> () {
+    let mut done: usize = 0
+    let firstKey = u8x16.bitcastToU64x2(key.encryption[0])
+    while done + 8 <= blocks {
+      let at = inputOffset + done * 16
+      let mut v0 = u8x16.bitcastToU64x2(u8x16.load(input, at + 0)) ^ firstKey
+      let mut v1 = u8x16.bitcastToU64x2(u8x16.load(input, at + 16)) ^ firstKey
+      let mut v2 = u8x16.bitcastToU64x2(u8x16.load(input, at + 32)) ^ firstKey
+      let mut v3 = u8x16.bitcastToU64x2(u8x16.load(input, at + 48)) ^ firstKey
+      let mut v4 = u8x16.bitcastToU64x2(u8x16.load(input, at + 64)) ^ firstKey
+      let mut v5 = u8x16.bitcastToU64x2(u8x16.load(input, at + 80)) ^ firstKey
+      let mut v6 = u8x16.bitcastToU64x2(u8x16.load(input, at + 96)) ^ firstKey
+      let mut v7 = u8x16.bitcastToU64x2(u8x16.load(input, at + 112)) ^ firstKey
+      let mut round: usize = 1
+      while round < key.rounds {
+        let roundKey = u8x16.bitcastToU64x2(key.encryption[round])
+        v0 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v0, roundKey)
+        v1 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v1, roundKey)
+        v2 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v2, roundKey)
+        v3 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v3, roundKey)
+        v4 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v4, roundKey)
+        v5 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v5, roundKey)
+        v6 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v6, roundKey)
+        v7 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v7, roundKey)
+        round = round + 1
+      }
+      let lastKey = u8x16.bitcastToU64x2(key.encryption[key.rounds])
+      v0 = Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v0, lastKey)
+      v1 = Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v1, lastKey)
+      v2 = Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v2, lastKey)
+      v3 = Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v3, lastKey)
+      v4 = Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v4, lastKey)
+      v5 = Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v5, lastKey)
+      v6 = Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v6, lastKey)
+      v7 = Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v7, lastKey)
+      let to = outputOffset + done * 16
+      u8x16.store(&mut output, to + 0, u64x2.bitcastToU8x16(v0))
+      u8x16.store(&mut output, to + 16, u64x2.bitcastToU8x16(v1))
+      u8x16.store(&mut output, to + 32, u64x2.bitcastToU8x16(v2))
+      u8x16.store(&mut output, to + 48, u64x2.bitcastToU8x16(v3))
+      u8x16.store(&mut output, to + 64, u64x2.bitcastToU8x16(v4))
+      u8x16.store(&mut output, to + 80, u64x2.bitcastToU8x16(v5))
+      u8x16.store(&mut output, to + 96, u64x2.bitcastToU8x16(v6))
+      u8x16.store(&mut output, to + 112, u64x2.bitcastToU8x16(v7))
+      done = done + 8
+    }
+    while done < blocks {
+      u8x16.store(&mut output, outputOffset + done * 16, unsafe encryptNi(key, u8x16.load(input, inputOffset + done * 16)))
+      done = done + 1
+    }
+  }
+
+  @features("aes", "ssse3")
+  unsafe fn ecbDecryptNi(key: &Aes, input: &[u8], inputOffset: usize, output: &mut [u8], outputOffset: usize, blocks: usize) -> () {
+    let mut done: usize = 0
+    let firstKey = u8x16.bitcastToU64x2(key.decryption[0])
+    while done + 8 <= blocks {
+      let at = inputOffset + done * 16
+      let mut v0 = u8x16.bitcastToU64x2(u8x16.load(input, at + 0)) ^ firstKey
+      let mut v1 = u8x16.bitcastToU64x2(u8x16.load(input, at + 16)) ^ firstKey
+      let mut v2 = u8x16.bitcastToU64x2(u8x16.load(input, at + 32)) ^ firstKey
+      let mut v3 = u8x16.bitcastToU64x2(u8x16.load(input, at + 48)) ^ firstKey
+      let mut v4 = u8x16.bitcastToU64x2(u8x16.load(input, at + 64)) ^ firstKey
+      let mut v5 = u8x16.bitcastToU64x2(u8x16.load(input, at + 80)) ^ firstKey
+      let mut v6 = u8x16.bitcastToU64x2(u8x16.load(input, at + 96)) ^ firstKey
+      let mut v7 = u8x16.bitcastToU64x2(u8x16.load(input, at + 112)) ^ firstKey
+      let mut round: usize = 1
+      while round < key.rounds {
+        let roundKey = u8x16.bitcastToU64x2(key.decryption[round])
+        v0 = Intrinsic.x86AesDecrypt<simd<u64, 2>>(v0, roundKey)
+        v1 = Intrinsic.x86AesDecrypt<simd<u64, 2>>(v1, roundKey)
+        v2 = Intrinsic.x86AesDecrypt<simd<u64, 2>>(v2, roundKey)
+        v3 = Intrinsic.x86AesDecrypt<simd<u64, 2>>(v3, roundKey)
+        v4 = Intrinsic.x86AesDecrypt<simd<u64, 2>>(v4, roundKey)
+        v5 = Intrinsic.x86AesDecrypt<simd<u64, 2>>(v5, roundKey)
+        v6 = Intrinsic.x86AesDecrypt<simd<u64, 2>>(v6, roundKey)
+        v7 = Intrinsic.x86AesDecrypt<simd<u64, 2>>(v7, roundKey)
+        round = round + 1
+      }
+      let lastKey = u8x16.bitcastToU64x2(key.decryption[key.rounds])
+      v0 = Intrinsic.x86AesDecryptLast<simd<u64, 2>>(v0, lastKey)
+      v1 = Intrinsic.x86AesDecryptLast<simd<u64, 2>>(v1, lastKey)
+      v2 = Intrinsic.x86AesDecryptLast<simd<u64, 2>>(v2, lastKey)
+      v3 = Intrinsic.x86AesDecryptLast<simd<u64, 2>>(v3, lastKey)
+      v4 = Intrinsic.x86AesDecryptLast<simd<u64, 2>>(v4, lastKey)
+      v5 = Intrinsic.x86AesDecryptLast<simd<u64, 2>>(v5, lastKey)
+      v6 = Intrinsic.x86AesDecryptLast<simd<u64, 2>>(v6, lastKey)
+      v7 = Intrinsic.x86AesDecryptLast<simd<u64, 2>>(v7, lastKey)
+      let to = outputOffset + done * 16
+      u8x16.store(&mut output, to + 0, u64x2.bitcastToU8x16(v0))
+      u8x16.store(&mut output, to + 16, u64x2.bitcastToU8x16(v1))
+      u8x16.store(&mut output, to + 32, u64x2.bitcastToU8x16(v2))
+      u8x16.store(&mut output, to + 48, u64x2.bitcastToU8x16(v3))
+      u8x16.store(&mut output, to + 64, u64x2.bitcastToU8x16(v4))
+      u8x16.store(&mut output, to + 80, u64x2.bitcastToU8x16(v5))
+      u8x16.store(&mut output, to + 96, u64x2.bitcastToU8x16(v6))
+      u8x16.store(&mut output, to + 112, u64x2.bitcastToU8x16(v7))
+      done = done + 8
+    }
+    while done < blocks {
+      u8x16.store(&mut output, outputOffset + done * 16, unsafe decryptNi(key, u8x16.load(input, inputOffset + done * 16)))
+      done = done + 1
+    }
+  }
+
+  // CBC encryption is serial: each block needs the previous ciphertext. Returns the new chain.
+  @features("aes", "ssse3")
+  unsafe fn cbcEncryptNi(key: &Aes, chain: simd<u8, 16>, input: &[u8], inputOffset: usize, output: &mut [u8], outputOffset: usize, blocks: usize) -> simd<u8, 16> {
+    let mut value = chain
+    let mut done: usize = 0
+    while done < blocks {
+      value = unsafe encryptNi(key, u8x16.load(input, inputOffset + done * 16) ^ value)
+      u8x16.store(&mut output, outputOffset + done * 16, value)
+      done = done + 1
+    }
+    return value
+  }
+
+  // CBC decryption: the blocks decrypt in parallel, then each takes the previous ciphertext.
+  // Returns the new chain, the last ciphertext block.
+  @features("aes", "ssse3")
+  unsafe fn cbcDecryptNi(key: &Aes, chain: simd<u8, 16>, input: &[u8], inputOffset: usize, output: &mut [u8], outputOffset: usize, blocks: usize) -> simd<u8, 16> {
+    let mut previous = chain
+    let mut done: usize = 0
+    let firstKey = u8x16.bitcastToU64x2(key.decryption[0])
+    while done + 8 <= blocks {
+      let at = inputOffset + done * 16
+      let c0 = u8x16.load(input, at + 0)
+      let c1 = u8x16.load(input, at + 16)
+      let c2 = u8x16.load(input, at + 32)
+      let c3 = u8x16.load(input, at + 48)
+      let c4 = u8x16.load(input, at + 64)
+      let c5 = u8x16.load(input, at + 80)
+      let c6 = u8x16.load(input, at + 96)
+      let c7 = u8x16.load(input, at + 112)
+      let mut v0 = u8x16.bitcastToU64x2(c0) ^ firstKey
+      let mut v1 = u8x16.bitcastToU64x2(c1) ^ firstKey
+      let mut v2 = u8x16.bitcastToU64x2(c2) ^ firstKey
+      let mut v3 = u8x16.bitcastToU64x2(c3) ^ firstKey
+      let mut v4 = u8x16.bitcastToU64x2(c4) ^ firstKey
+      let mut v5 = u8x16.bitcastToU64x2(c5) ^ firstKey
+      let mut v6 = u8x16.bitcastToU64x2(c6) ^ firstKey
+      let mut v7 = u8x16.bitcastToU64x2(c7) ^ firstKey
+      let mut round: usize = 1
+      while round < key.rounds {
+        let roundKey = u8x16.bitcastToU64x2(key.decryption[round])
+        v0 = Intrinsic.x86AesDecrypt<simd<u64, 2>>(v0, roundKey)
+        v1 = Intrinsic.x86AesDecrypt<simd<u64, 2>>(v1, roundKey)
+        v2 = Intrinsic.x86AesDecrypt<simd<u64, 2>>(v2, roundKey)
+        v3 = Intrinsic.x86AesDecrypt<simd<u64, 2>>(v3, roundKey)
+        v4 = Intrinsic.x86AesDecrypt<simd<u64, 2>>(v4, roundKey)
+        v5 = Intrinsic.x86AesDecrypt<simd<u64, 2>>(v5, roundKey)
+        v6 = Intrinsic.x86AesDecrypt<simd<u64, 2>>(v6, roundKey)
+        v7 = Intrinsic.x86AesDecrypt<simd<u64, 2>>(v7, roundKey)
+        round = round + 1
+      }
+      let lastKey = u8x16.bitcastToU64x2(key.decryption[key.rounds])
+      v0 = Intrinsic.x86AesDecryptLast<simd<u64, 2>>(v0, lastKey)
+      v1 = Intrinsic.x86AesDecryptLast<simd<u64, 2>>(v1, lastKey)
+      v2 = Intrinsic.x86AesDecryptLast<simd<u64, 2>>(v2, lastKey)
+      v3 = Intrinsic.x86AesDecryptLast<simd<u64, 2>>(v3, lastKey)
+      v4 = Intrinsic.x86AesDecryptLast<simd<u64, 2>>(v4, lastKey)
+      v5 = Intrinsic.x86AesDecryptLast<simd<u64, 2>>(v5, lastKey)
+      v6 = Intrinsic.x86AesDecryptLast<simd<u64, 2>>(v6, lastKey)
+      v7 = Intrinsic.x86AesDecryptLast<simd<u64, 2>>(v7, lastKey)
+      let to = outputOffset + done * 16
+      u8x16.store(&mut output, to, u64x2.bitcastToU8x16(v0) ^ previous)
+      u8x16.store(&mut output, to + 16, u64x2.bitcastToU8x16(v1) ^ c0)
+      u8x16.store(&mut output, to + 32, u64x2.bitcastToU8x16(v2) ^ c1)
+      u8x16.store(&mut output, to + 48, u64x2.bitcastToU8x16(v3) ^ c2)
+      u8x16.store(&mut output, to + 64, u64x2.bitcastToU8x16(v4) ^ c3)
+      u8x16.store(&mut output, to + 80, u64x2.bitcastToU8x16(v5) ^ c4)
+      u8x16.store(&mut output, to + 96, u64x2.bitcastToU8x16(v6) ^ c5)
+      u8x16.store(&mut output, to + 112, u64x2.bitcastToU8x16(v7) ^ c6)
+      previous = c7
+      done = done + 8
+    }
+    while done < blocks {
+      let cipher = u8x16.load(input, inputOffset + done * 16)
+      u8x16.store(&mut output, outputOffset + done * 16, unsafe decryptNi(key, cipher) ^ previous)
+      previous = cipher
+      done = done + 1
+    }
+    return previous
+  }
+
+  // CTR over `blocks` whole blocks: XORs the encrypted counters into the input, and advances
+  // `counter` as a 128-bit big-endian number by `blocks`.
+  @features("aes", "ssse3")
+  unsafe fn ctrNi(key: &Aes, counter: &mut [u8; 16], input: &[u8], inputOffset: usize, output: &mut [u8], outputOffset: usize, blocks: usize) -> () {
+    let mut high: u64 = 0
+    let mut low: u64 = 0
+    let mut index: usize = 0
+    while index < 8 {
+      high = u64.bitOr(u64.shiftLeft(high, 8), u8.toU64(counter[index]))
+      low = u64.bitOr(u64.shiftLeft(low, 8), u8.toU64(counter[index + 8]))
+      index = index + 1
+    }
+    let mut done: usize = 0
+    let firstKey = u8x16.bitcastToU64x2(key.encryption[0])
+    while done + 8 <= blocks {
+      let mut v0 = unsafe counterBlock(high, low) ^ firstKey
+      low = u64.wrappingAdd(low, 1)
+      if low == 0 {
+        high = u64.wrappingAdd(high, 1)
+      }
+      let mut v1 = unsafe counterBlock(high, low) ^ firstKey
+      low = u64.wrappingAdd(low, 1)
+      if low == 0 {
+        high = u64.wrappingAdd(high, 1)
+      }
+      let mut v2 = unsafe counterBlock(high, low) ^ firstKey
+      low = u64.wrappingAdd(low, 1)
+      if low == 0 {
+        high = u64.wrappingAdd(high, 1)
+      }
+      let mut v3 = unsafe counterBlock(high, low) ^ firstKey
+      low = u64.wrappingAdd(low, 1)
+      if low == 0 {
+        high = u64.wrappingAdd(high, 1)
+      }
+      let mut v4 = unsafe counterBlock(high, low) ^ firstKey
+      low = u64.wrappingAdd(low, 1)
+      if low == 0 {
+        high = u64.wrappingAdd(high, 1)
+      }
+      let mut v5 = unsafe counterBlock(high, low) ^ firstKey
+      low = u64.wrappingAdd(low, 1)
+      if low == 0 {
+        high = u64.wrappingAdd(high, 1)
+      }
+      let mut v6 = unsafe counterBlock(high, low) ^ firstKey
+      low = u64.wrappingAdd(low, 1)
+      if low == 0 {
+        high = u64.wrappingAdd(high, 1)
+      }
+      let mut v7 = unsafe counterBlock(high, low) ^ firstKey
+      low = u64.wrappingAdd(low, 1)
+      if low == 0 {
+        high = u64.wrappingAdd(high, 1)
+      }
+      let mut round: usize = 1
+      while round < key.rounds {
+        let roundKey = u8x16.bitcastToU64x2(key.encryption[round])
+        v0 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v0, roundKey)
+        v1 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v1, roundKey)
+        v2 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v2, roundKey)
+        v3 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v3, roundKey)
+        v4 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v4, roundKey)
+        v5 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v5, roundKey)
+        v6 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v6, roundKey)
+        v7 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v7, roundKey)
+        round = round + 1
+      }
+      let lastKey = u8x16.bitcastToU64x2(key.encryption[key.rounds])
+      v0 = Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v0, lastKey)
+      v1 = Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v1, lastKey)
+      v2 = Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v2, lastKey)
+      v3 = Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v3, lastKey)
+      v4 = Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v4, lastKey)
+      v5 = Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v5, lastKey)
+      v6 = Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v6, lastKey)
+      v7 = Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v7, lastKey)
+      let at = inputOffset + done * 16
+      let to = outputOffset + done * 16
+      u8x16.store(&mut output, to + 0, u8x16.load(input, at + 0) ^ u64x2.bitcastToU8x16(v0))
+      u8x16.store(&mut output, to + 16, u8x16.load(input, at + 16) ^ u64x2.bitcastToU8x16(v1))
+      u8x16.store(&mut output, to + 32, u8x16.load(input, at + 32) ^ u64x2.bitcastToU8x16(v2))
+      u8x16.store(&mut output, to + 48, u8x16.load(input, at + 48) ^ u64x2.bitcastToU8x16(v3))
+      u8x16.store(&mut output, to + 64, u8x16.load(input, at + 64) ^ u64x2.bitcastToU8x16(v4))
+      u8x16.store(&mut output, to + 80, u8x16.load(input, at + 80) ^ u64x2.bitcastToU8x16(v5))
+      u8x16.store(&mut output, to + 96, u8x16.load(input, at + 96) ^ u64x2.bitcastToU8x16(v6))
+      u8x16.store(&mut output, to + 112, u8x16.load(input, at + 112) ^ u64x2.bitcastToU8x16(v7))
+      done = done + 8
+    }
+    while done < blocks {
+      let stream = unsafe encryptNi(key, u64x2.bitcastToU8x16(unsafe counterBlock(high, low)))
+      u8x16.store(&mut output, outputOffset + done * 16, u8x16.load(input, inputOffset + done * 16) ^ stream)
+      low = u64.wrappingAdd(low, 1)
+      if low == 0 {
+        high = u64.wrappingAdd(high, 1)
+      }
+      done = done + 1
+    }
+    index = 0
+    while index < 8 {
+      counter[index] = u64.toU8(u64.bitAnd(u64.shiftRight(high, 56 - 8 * usize.toU64(index)), 255))
+      counter[index + 8] = u64.toU8(u64.bitAnd(u64.shiftRight(low, 56 - 8 * usize.toU64(index)), 255))
+      index = index + 1
+    }
+  }
+
+  // The counter block of the 128-bit big-endian counter `high`, `low`, as round-key lanes.
+  @inlineAlways
+  @features("aes", "ssse3")
+  unsafe fn counterBlock(high: u64, low: u64) -> simd<u64, 2> {
+    let lanes = u64x2.bitcastToU8x16(u64x2.fromArray([high, low]))
+    return u8x16.bitcastToU64x2(u8x16.shuffle(lanes, lanes, [7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8]))
+  }
 }
