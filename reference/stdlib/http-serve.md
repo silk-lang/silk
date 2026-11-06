@@ -648,7 +648,7 @@ pub effect<'static> fn serveTls<H: 'static + Handler + Transferable + Concurrent
 Serves `handler` over HTTPS with the certificate and key of `config`, until a worker fails.
 
 #### Details
-Each connection runs TLS 1.3 with `silk.tls.server`, then HTTP/1.1 over it, as
+Each connection runs TLS 1.3 with `silk.tls.server` (through `silk.tls.server_protocol`), then HTTP/1.1 over it, as
 [`Server.serve`](#Server.impl.serve) does. Load `config` with `TlsServerConfig.fromPem`.
 
 #### Errors

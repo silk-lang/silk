@@ -125,6 +125,84 @@ pub fn hash(bytes: &[u8]) -> [u8; 64]
 
 Returns the 64-byte BLAKE2b digest of `bytes`.
 
+<a id="Blake2b512.impl.Digest"></a>
+
+## Implementation `Digest for Blake2b512`
+
+```silk
+impl Digest for Blake2b512
+```
+
+<a id="Blake2b512.impl.Digest.make"></a>
+
+### Operation `make`
+
+```silk
+make: Blake2b512.make
+```
+
+Returns a BLAKE2b-512 state for an empty message.
+
+<a id="Blake2b512.impl.Digest.update"></a>
+
+### Operation `update`
+
+```silk
+update: Blake2b512.update
+```
+
+Adds `bytes` to the end of the message.
+
+<a id="Blake2b512.impl.Digest.blockLength"></a>
+
+### Operation `blockLength`
+
+```silk
+fn blockLength(self: &Self) -> usize
+```
+
+Returns 128, the BLAKE2b-512 block length in bytes.
+
+<a id="Blake2b512.impl.Digest.digestLength"></a>
+
+### Operation `digestLength`
+
+```silk
+fn digestLength(self: &Self) -> usize
+```
+
+Returns 64, the BLAKE2b-512 digest length in bytes.
+
+<a id="Blake2b512.impl.Digest.objectIdentifier"></a>
+
+### Operation `objectIdentifier`
+
+```silk
+fn objectIdentifier(self: &Self) -> &[u8]
+```
+
+Returns the content bytes of the BLAKE2b-512 object identifier, 1.3.6.1.4.1.1722.12.2.1.16.
+
+<a id="Blake2b512.impl.Digest.copy"></a>
+
+### Operation `copy`
+
+```silk
+fn copy(self: &Self) -> Self
+```
+
+Returns an independent copy of the state.
+
+<a id="Blake2b512.impl.Digest.finishInto"></a>
+
+### Operation `finishInto`
+
+```silk
+fn finishInto(self: Self, output: &mut [u8]) -> ()
+```
+
+Writes the 64-byte BLAKE2b-512 digest to the start of `output` and consumes the state.
+
 
 Category: Cryptography.
 

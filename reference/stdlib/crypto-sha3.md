@@ -310,6 +310,318 @@ pub fn hash(bytes: &[u8]) -> [u8; 64]
 
 Returns the 64-byte SHA3-512 digest of `bytes`.
 
+<a id="Sha3_224.impl.Digest"></a>
+
+## Implementation `Digest for Sha3_224`
+
+```silk
+impl Digest for Sha3_224
+```
+
+<a id="Sha3_224.impl.Digest.make"></a>
+
+### Operation `make`
+
+```silk
+make: Sha3_224.make
+```
+
+Returns a SHA3-224 state for an empty message.
+
+<a id="Sha3_224.impl.Digest.update"></a>
+
+### Operation `update`
+
+```silk
+update: Sha3_224.update
+```
+
+Adds `bytes` to the end of the message.
+
+<a id="Sha3_224.impl.Digest.blockLength"></a>
+
+### Operation `blockLength`
+
+```silk
+fn blockLength(self: &Self) -> usize
+```
+
+Returns 144, the SHA3-224 block length in bytes.
+
+<a id="Sha3_224.impl.Digest.digestLength"></a>
+
+### Operation `digestLength`
+
+```silk
+fn digestLength(self: &Self) -> usize
+```
+
+Returns 28, the SHA3-224 digest length in bytes.
+
+<a id="Sha3_224.impl.Digest.objectIdentifier"></a>
+
+### Operation `objectIdentifier`
+
+```silk
+fn objectIdentifier(self: &Self) -> &[u8]
+```
+
+Returns the content bytes of the SHA3-224 object identifier, 2.16.840.1.101.3.4.2.7.
+
+<a id="Sha3_224.impl.Digest.copy"></a>
+
+### Operation `copy`
+
+```silk
+fn copy(self: &Self) -> Self
+```
+
+Returns an independent copy of the state.
+
+<a id="Sha3_224.impl.Digest.finishInto"></a>
+
+### Operation `finishInto`
+
+```silk
+fn finishInto(self: Self, output: &mut [u8]) -> ()
+```
+
+Writes the 28-byte SHA3-224 digest to the start of `output` and consumes the state.
+
+<a id="Sha3_256.impl.Digest"></a>
+
+## Implementation `Digest for Sha3_256`
+
+```silk
+impl Digest for Sha3_256
+```
+
+<a id="Sha3_256.impl.Digest.make"></a>
+
+### Operation `make`
+
+```silk
+make: Sha3_256.make
+```
+
+Returns a SHA3-256 state for an empty message.
+
+<a id="Sha3_256.impl.Digest.update"></a>
+
+### Operation `update`
+
+```silk
+update: Sha3_256.update
+```
+
+Adds `bytes` to the end of the message.
+
+<a id="Sha3_256.impl.Digest.blockLength"></a>
+
+### Operation `blockLength`
+
+```silk
+fn blockLength(self: &Self) -> usize
+```
+
+Returns 136, the SHA3-256 block length in bytes.
+
+<a id="Sha3_256.impl.Digest.digestLength"></a>
+
+### Operation `digestLength`
+
+```silk
+fn digestLength(self: &Self) -> usize
+```
+
+Returns 32, the SHA3-256 digest length in bytes.
+
+<a id="Sha3_256.impl.Digest.objectIdentifier"></a>
+
+### Operation `objectIdentifier`
+
+```silk
+fn objectIdentifier(self: &Self) -> &[u8]
+```
+
+Returns the content bytes of the SHA3-256 object identifier, 2.16.840.1.101.3.4.2.8.
+
+<a id="Sha3_256.impl.Digest.copy"></a>
+
+### Operation `copy`
+
+```silk
+fn copy(self: &Self) -> Self
+```
+
+Returns an independent copy of the state.
+
+<a id="Sha3_256.impl.Digest.finishInto"></a>
+
+### Operation `finishInto`
+
+```silk
+fn finishInto(self: Self, output: &mut [u8]) -> ()
+```
+
+Writes the 32-byte SHA3-256 digest to the start of `output` and consumes the state.
+
+<a id="Sha3_384.impl.Digest"></a>
+
+## Implementation `Digest for Sha3_384`
+
+```silk
+impl Digest for Sha3_384
+```
+
+<a id="Sha3_384.impl.Digest.make"></a>
+
+### Operation `make`
+
+```silk
+make: Sha3_384.make
+```
+
+Returns a SHA3-384 state for an empty message.
+
+<a id="Sha3_384.impl.Digest.update"></a>
+
+### Operation `update`
+
+```silk
+update: Sha3_384.update
+```
+
+Adds `bytes` to the end of the message.
+
+<a id="Sha3_384.impl.Digest.blockLength"></a>
+
+### Operation `blockLength`
+
+```silk
+fn blockLength(self: &Self) -> usize
+```
+
+Returns 104, the SHA3-384 block length in bytes.
+
+<a id="Sha3_384.impl.Digest.digestLength"></a>
+
+### Operation `digestLength`
+
+```silk
+fn digestLength(self: &Self) -> usize
+```
+
+Returns 48, the SHA3-384 digest length in bytes.
+
+<a id="Sha3_384.impl.Digest.objectIdentifier"></a>
+
+### Operation `objectIdentifier`
+
+```silk
+fn objectIdentifier(self: &Self) -> &[u8]
+```
+
+Returns the content bytes of the SHA3-384 object identifier, 2.16.840.1.101.3.4.2.9.
+
+<a id="Sha3_384.impl.Digest.copy"></a>
+
+### Operation `copy`
+
+```silk
+fn copy(self: &Self) -> Self
+```
+
+Returns an independent copy of the state.
+
+<a id="Sha3_384.impl.Digest.finishInto"></a>
+
+### Operation `finishInto`
+
+```silk
+fn finishInto(self: Self, output: &mut [u8]) -> ()
+```
+
+Writes the 48-byte SHA3-384 digest to the start of `output` and consumes the state.
+
+<a id="Sha3_512.impl.Digest"></a>
+
+## Implementation `Digest for Sha3_512`
+
+```silk
+impl Digest for Sha3_512
+```
+
+<a id="Sha3_512.impl.Digest.make"></a>
+
+### Operation `make`
+
+```silk
+make: Sha3_512.make
+```
+
+Returns a SHA3-512 state for an empty message.
+
+<a id="Sha3_512.impl.Digest.update"></a>
+
+### Operation `update`
+
+```silk
+update: Sha3_512.update
+```
+
+Adds `bytes` to the end of the message.
+
+<a id="Sha3_512.impl.Digest.blockLength"></a>
+
+### Operation `blockLength`
+
+```silk
+fn blockLength(self: &Self) -> usize
+```
+
+Returns 72, the SHA3-512 block length in bytes.
+
+<a id="Sha3_512.impl.Digest.digestLength"></a>
+
+### Operation `digestLength`
+
+```silk
+fn digestLength(self: &Self) -> usize
+```
+
+Returns 64, the SHA3-512 digest length in bytes.
+
+<a id="Sha3_512.impl.Digest.objectIdentifier"></a>
+
+### Operation `objectIdentifier`
+
+```silk
+fn objectIdentifier(self: &Self) -> &[u8]
+```
+
+Returns the content bytes of the SHA3-512 object identifier, 2.16.840.1.101.3.4.2.10.
+
+<a id="Sha3_512.impl.Digest.copy"></a>
+
+### Operation `copy`
+
+```silk
+fn copy(self: &Self) -> Self
+```
+
+Returns an independent copy of the state.
+
+<a id="Sha3_512.impl.Digest.finishInto"></a>
+
+### Operation `finishInto`
+
+```silk
+fn finishInto(self: Self, output: &mut [u8]) -> ()
+```
+
+Writes the 64-byte SHA3-512 digest to the start of `output` and consumes the state.
+
 
 Category: Cryptography.
 

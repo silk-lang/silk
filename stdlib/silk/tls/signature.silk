@@ -1,0 +1,274 @@
+//! Check a TLS 1.3 CertificateVerify signature with the public key of a peer's leaf certificate.
+//!
+//! # When to use
+//! `silk.tls.client` uses this module for the server's CertificateVerify, and `silk.tls.server`
+//! uses it for a client certificate's. Call [`HandshakeSignature.verify`] directly only when you
+//! build your own TLS 1.3 handshake.
+//!
+//! # Details
+//! [`HandshakeSignature.verify`] takes a TLS `SignatureScheme` code and checks that it fits the
+//! certificate's key: `ecdsa_secp256r1_sha256` (1027) and `ecdsa_secp384r1_sha384` (1283) for an
+//! EC key on that curve, `rsa_pss_rsae_sha256`, `_sha384` and `_sha512` (2052, 2053, 2054) for an
+//! `rsaEncryption` key, with a salt as long as the digest, and `ed25519` (2055) for an Ed25519 key.
+//! [`HandshakeSignature.keyType`] gives the key type of a certificate.
+//!
+//! # Errors
+//! - [`SignatureFailure`] for a scheme that this module does not know, a scheme that does not fit
+//!   the key, or a signature that does not verify.
+//!
+//! # Gotchas
+//! The message is the full signed content that RFC 8446 section 4.4.3 defines: 64 spaces, the
+//! context string, a zero byte, and the transcript hash. This module does not build it.
+//!
+//! # Examples
+//! ## Reject a scheme that this module does not know
+//! ```silk
+//! import silk.core.result { Result }
+//! import silk.tls.signature { CertificateKeyType, HandshakeSignature, SignatureFailure }
+//!
+//! pub fn main() -> i32 {
+//!   // 513 is rsa_pkcs1_sha256, which TLS 1.3 does not use for CertificateVerify.
+//!   return match HandshakeSignature.schemeKeyType(513) {
+//!     Result<CertificateKeyType, SignatureFailure>.Failure { error } => match error {
+//!       SignatureFailure.UnsupportedScheme => 0
+//!       _ => 1
+//!     }
+//!     Result<CertificateKeyType, SignatureFailure>.Success { .. } => 2
+//!   }
+//! }
+//! ```
+//!
+//! @category TLS and certificates
+
+import silk.core.ownership { Copy }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.crypto.ed25519 { Ed25519Error, Ed25519PublicKey }
+import silk.crypto.p256 { EcdsaP256Sha256, P256SignatureError }
+import silk.crypto.p384 { EcdsaP384Sha384, P384SignatureError }
+import silk.crypto.rsa { RsaError, RsaPublicKey }
+import silk.crypto.sha2 { Sha256, Sha384, Sha512 }
+import silk.text.format { Debug, Format, Formatter }
+import silk.tls.certificate { Certificate }
+import silk.io.writer { Writer, WriterError }
+
+/// The type of a certificate's public key, as far as TLS 1.3 signatures go.
+pub enum CertificateKeyType {
+  /// An `id-ecPublicKey` key on secp256r1.
+  EcdsaP256,
+  /// An `id-ecPublicKey` key on secp384r1.
+  EcdsaP384,
+  /// An `id-Ed25519` key.
+  Ed25519,
+  /// An `rsaEncryption` key.
+  Rsa,
+}
+
+/// Why a CertificateVerify signature did not verify.
+pub union SignatureFailure {
+  /// The scheme is not one that this module knows.
+  UnsupportedScheme,
+  /// The scheme does not fit the type of the certificate's key.
+  KeyMismatch,
+  /// ECDSA P-256 with SHA-256 failed.
+  Ecdsa {
+    /// The primitive failure.
+    pub error: P256SignatureError,
+  },
+  /// ECDSA P-384 with SHA-384 failed.
+  EcdsaP384 {
+    /// The primitive failure.
+    pub error: P384SignatureError,
+  },
+  /// RSA-PSS failed, or the certificate's RSA key is not valid.
+  Rsa {
+    /// The primitive failure.
+    pub error: RsaError,
+  },
+  /// Ed25519 failed, or the certificate's Ed25519 key is not valid.
+  Ed25519 {
+    /// The primitive failure.
+    pub error: Ed25519Error,
+  },
+}
+
+impl Copy for SignatureFailure {}
+
+impl Debug for SignatureFailure {
+  /// Writes the name of the variant and its fields, such as `Ecdsa { ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      SignatureFailure.UnsupportedScheme => run Format.write(&mut formatter, b"UnsupportedScheme")
+      SignatureFailure.KeyMismatch => run Format.write(&mut formatter, b"KeyMismatch")
+      SignatureFailure.Ecdsa { error } => {
+        let mut record = run Format.debugRecord("Ecdsa", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      SignatureFailure.EcdsaP384 { error } => {
+        let mut record = run Format.debugRecord("EcdsaP384", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      SignatureFailure.Rsa { error } => {
+        let mut record = run Format.debugRecord("Rsa", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+      SignatureFailure.Ed25519 { error } => {
+        let mut record = run Format.debugRecord("Ed25519", &mut formatter)
+        run Format.debugField(&mut record, "error", &error, &mut formatter)
+        return run Format.debugFinish(record, &mut formatter)
+      }
+    }
+  }
+}
+
+/// Functions that check TLS 1.3 CertificateVerify signatures.
+pub struct HandshakeSignature {}
+
+impl HandshakeSignature {
+  /// Returns the type of `certificate`'s public key, or `None` for a key that no TLS 1.3 scheme of
+  /// this module signs with.
+  pub fn keyType(certificate: &Certificate) -> Option<CertificateKeyType> {
+    // The DER AlgorithmIdentifier of each key type: id-ecPublicKey with secp256r1 or secp384r1
+    // (RFC 5480), and id-Ed25519 (RFC 8410). The rsaEncryption OID is compared without parameters.
+    let algorithm = Certificate.publicKeyAlgorithm(certificate)
+    if sameBytes(algorithm.der, b"\x30\x13\x06\x07\x2a\x86\x48\xce\x3d\x02\x01\x06\x08\x2a\x86\x48\xce\x3d\x03\x01\x07") {
+      return Option<CertificateKeyType>.some(CertificateKeyType.EcdsaP256)
+    }
+    if sameBytes(algorithm.der, b"\x30\x10\x06\x07\x2a\x86\x48\xce\x3d\x02\x01\x06\x05\x2b\x81\x04\x00\x22") {
+      return Option<CertificateKeyType>.some(CertificateKeyType.EcdsaP384)
+    }
+    if sameBytes(algorithm.der, b"\x30\x05\x06\x03\x2b\x65\x70") {
+      return Option<CertificateKeyType>.some(CertificateKeyType.Ed25519)
+    }
+    if sameBytes(algorithm.oid, b"\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01") {
+      return Option<CertificateKeyType>.some(CertificateKeyType.Rsa)
+    }
+    return Option<CertificateKeyType>.none()
+  }
+
+  /// Returns the key type that the TLS `SignatureScheme` code `scheme` signs with.
+  ///
+  /// # Errors
+  /// - `UnsupportedScheme` for a scheme that this module does not know.
+  pub fn schemeKeyType(scheme: usize) -> Result<CertificateKeyType, SignatureFailure> {
+    if scheme == 1027 {
+      return Result<CertificateKeyType, SignatureFailure>.succeed(CertificateKeyType.EcdsaP256)
+    }
+    if scheme == 1283 {
+      return Result<CertificateKeyType, SignatureFailure>.succeed(CertificateKeyType.EcdsaP384)
+    }
+    if scheme == 2052 || scheme == 2053 || scheme == 2054 {
+      return Result<CertificateKeyType, SignatureFailure>.succeed(CertificateKeyType.Rsa)
+    }
+    if scheme == 2055 {
+      return Result<CertificateKeyType, SignatureFailure>.succeed(CertificateKeyType.Ed25519)
+    }
+    return Result<CertificateKeyType, SignatureFailure>.failResult(
+      SignatureFailure.UnsupportedScheme,
+    )
+  }
+
+  /// Checks that `signature` signs `message` under `scheme` with the public key of `certificate`.
+  ///
+  /// # Errors
+  /// - `UnsupportedScheme` or `KeyMismatch` for a scheme that this module does not know, or that
+  ///   does not fit the key.
+  /// - `Ecdsa`, `EcdsaP384`, `Rsa`, or `Ed25519` for a key or a signature that is not valid.
+  pub fn verify(
+    certificate: &Certificate,
+    scheme: usize,
+    message: &[u8],
+    signature: &[u8],
+  ) -> Result<(), SignatureFailure> {
+    let wanted = match HandshakeSignature.schemeKeyType(scheme) {
+      Result<CertificateKeyType, SignatureFailure>.Failure { error } => {
+        return Result<(), SignatureFailure>.failResult(error)
+      }
+      Result<CertificateKeyType, SignatureFailure>.Success { value } => value
+    }
+    let fits = match HandshakeSignature.keyType(certificate) {
+      Option<CertificateKeyType>.Some { value } => value == wanted
+      Option<CertificateKeyType>.None => false
+    }
+    let key = Certificate.publicKey(certificate)
+    if !fits || key.unusedBits != 0 {
+      return Result<(), SignatureFailure>.failResult(SignatureFailure.KeyMismatch)
+    }
+    if wanted == CertificateKeyType.EcdsaP256 {
+      return match EcdsaP256Sha256.verify(key.bytes, message, signature) {
+        Result<(), P256SignatureError>.Failure { error } => Result<(), SignatureFailure>.failResult(
+          SignatureFailure.Ecdsa { error: error },
+        )
+        Result<(), P256SignatureError>.Success { .. } => Result<(), SignatureFailure>.succeed(())
+      }
+    }
+    if wanted == CertificateKeyType.EcdsaP384 {
+      return match EcdsaP384Sha384.verify(key.bytes, message, signature) {
+        Result<(), P384SignatureError>.Failure { error } => Result<(), SignatureFailure>.failResult(
+          SignatureFailure.EcdsaP384 { error: error },
+        )
+        Result<(), P384SignatureError>.Success { .. } => Result<(), SignatureFailure>.succeed(())
+      }
+    }
+    if wanted == CertificateKeyType.Ed25519 {
+      let publicKey = match Ed25519PublicKey.fromBytes(key.bytes) {
+        Result<Ed25519PublicKey, Ed25519Error>.Failure { error } => {
+          return Result<(), SignatureFailure>.failResult(SignatureFailure.Ed25519 { error: error })
+        }
+        Result<Ed25519PublicKey, Ed25519Error>.Success { value } => move value
+      }
+      return match publicKey.verify(message, signature) {
+        Result<(), Ed25519Error>.Failure { error } => Result<(), SignatureFailure>.failResult(
+          SignatureFailure.Ed25519 { error: error },
+        )
+        Result<(), Ed25519Error>.Success { .. } => Result<(), SignatureFailure>.succeed(())
+      }
+    }
+    let algorithm = Certificate.publicKeyAlgorithm(certificate)
+    let publicKey = match RsaPublicKey.fromCertificateKey(
+      algorithm.der,
+      key.bytes,
+      key.unusedBits,
+    ) {
+      Result<RsaPublicKey, RsaError>.Failure { error } => {
+        return Result<(), SignatureFailure>.failResult(SignatureFailure.Rsa { error: error })
+      }
+      Result<RsaPublicKey, RsaError>.Success { value } => move value
+    }
+    let verified = if scheme == 2054 {
+      let digest = Sha512.hash(message)
+      publicKey.verifyPss<Sha512>(&digest, signature, Option<usize>.some(64))
+    } else if scheme == 2053 {
+      let digest = Sha384.hash(message)
+      publicKey.verifyPss<Sha384>(&digest, signature, Option<usize>.some(48))
+    } else {
+      let digest = Sha256.hash(message)
+      publicKey.verifyPss<Sha256>(&digest, signature, Option<usize>.some(32))
+    }
+    return match move verified {
+      Result<(), RsaError>.Failure { error } => Result<(), SignatureFailure>.failResult(
+        SignatureFailure.Rsa { error: error },
+      )
+      Result<(), RsaError>.Success { .. } => Result<(), SignatureFailure>.succeed(())
+    }
+  }
+}
+
+fn sameBytes(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut index: usize = 0
+  while index < left.length {
+    if left[index] != right[index] {
+      return false
+    }
+    index = index + 1
+  }
+  return true
+}

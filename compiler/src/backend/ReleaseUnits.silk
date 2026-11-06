@@ -1,13 +1,16 @@
-//! The codegen units an optimized executable splits into when `SILK_CODEGEN_UNITS` asks for more
-//! than one, so Clang optimizes them on several threads at once.
+//! The codegen units an optimized executable splits into, so Clang optimizes them on several
+//! threads at once.
 //!
-//! An optimized build otherwise compiles the whole program as one module, and Clang's `-O2` then
-//! runs on one thread: a large program spends most of its build there. Splitting costs speed where
-//! a call crosses units, since Clang inlines only what a unit holds. So the units follow the call
-//! graph: a function that only one group of functions calls joins that group, and each unit keeps
-//! its own internal copy of every small function and every function that asks to be inlined that
-//! it calls. A function another unit calls stays external; every other content-named function a
-//! unit defines is internal, as in a whole-program module (`Bitcode.compileUnit`).
+//! As one module, Clang's `-O2` runs on one thread, and a large program spends most of its build
+//! there. The units are compiled for ThinLTO (`compileIr`): each unit's summary lets the link
+//! import the functions another unit calls and inline them, so a call across units costs little.
+//! The units follow the call graph: a function that only one group of functions calls joins that
+//! group. Each unit keeps its own internal copy of every function that asks to be inlined that it
+//! calls. A function another unit calls stays external; every other content-named function a unit
+//! defines is internal, as in a whole-program module (`Bitcode.compileUnit`).
+//!
+//! Copying every small callee into each unit instead, without ThinLTO, doubled the compiler's
+//! code and made it check itself 20% slower; with ThinLTO and no such copies it was 3% slower.
 import backend.Bitcode
 import backend.CodegenUnits {CodegenUnit}
 import semantic.ContentHash {ContentHash}
@@ -25,13 +28,15 @@ fn duplicable(linkage: u64) -> bool {
   return linkage == Bitcode.linkInternal() || linkage == Bitcode.linkPrivate() || linkage == Bitcode.linkLinkOnceOdr()
 }
 
-// The fragment bytes below which every unit that calls a function keeps its own copy. Clang
-// inlines most functions this small, so a call across units would cost the inlining.
-fn localBytes() -> usize { return 16384 }
+// The fragment bytes below which a program stays one module.
+fn smallestSplit() -> usize { return 4194304 }
 
 /// Splits the whole program's `fragments`, as an optimized build assembles them, into at most
 /// `count` units, or into none when they hold too little to split.
 pub effect fn partition(fragments: &[u8], count: usize) -> List<CodegenUnit> ! OutOfMemoryError ? &mut Allocator {
+  // Clang optimizes a program this small as one module in a few seconds, faster than a split
+  // build's extra compiles and ThinLTO link.
+  if fragments.length < smallestSplit() { return List<CodegenUnit>.make() }
   // The fragments every unit holds: declarations and the target's duplicable definitions.
   let mut shared = Bytes.make()
   // The names shared fragments use, which every unit then calls.
@@ -121,11 +126,8 @@ pub effect fn partition(fragments: &[u8], count: usize) -> List<CodegenUnit> ! O
     let size = List<usize>.get(&ends, node) - List<usize>.get(&starts, node)
     let mut copied = false
     if List<bool>.get(&copyable, node) {
-      copied = size <= localBytes()
-      if !copied {
-        let fragment = Slice.view<u8>(fragments, List<usize>.get(&starts, node), size)
-        copied = run Bitcode.definesInlineHint(fragment)
-      }
+      let fragment = Slice.view<u8>(fragments, List<usize>.get(&starts, node), size)
+      copied = run Bitcode.definesInlineHint(fragment)
     }
     run List<bool>.append(&mut local, copied)
     node = node + usize.ONE
@@ -175,13 +177,23 @@ pub effect fn partition(fragments: &[u8], count: usize) -> List<CodegenUnit> ! O
     node = node + usize.ONE
   }
   // Group the non-local nodes: a node whose callers, seen through the local copies they call it
-  // from, all belong to one group joins that group, until no node moves.
+  // from, all belong to one group joins that group, until no node moves. A group stops growing at
+  // an even share of the program: most of a program is reached from `main` through functions
+  // that one group calls, so unbounded groups gathered two thirds of a large program into one
+  // unit, whose compile was then nearly the whole link.
   let mut parent = run List<usize>.makeWithCapacity(nodes)
+  let mut groupSize = run List<usize>.makeWithCapacity(nodes)
+  let mut total = usize.ZERO
   node = usize.ZERO
   while node < nodes {
     run List<usize>.append(&mut parent, node)
+    let mut size = usize.ZERO
+    if !List<bool>.get(&local, node) { size = List<usize>.get(&ends, node) - List<usize>.get(&starts, node) }
+    run List<usize>.append(&mut groupSize, size)
+    total = total + size
     node = node + usize.ONE
   }
+  let share = total / count
   let mut seen = run List<usize>.makeWithCapacity(nodes)
   node = usize.ZERO
   while node < nodes {
@@ -223,29 +235,19 @@ pub effect fn partition(fragments: &[u8], count: usize) -> List<CodegenUnit> ! O
           }
         }
         if !several && group != usize.MAX {
-          List<usize>.set(&mut parent, node, group)
-          changed = true
+          let joined = List<usize>.get(&groupSize, group) + List<usize>.get(&groupSize, node)
+          if joined <= share {
+            List<usize>.set(&mut parent, node, group)
+            List<usize>.set(&mut groupSize, group, joined)
+            List<usize>.set(&mut groupSize, node, usize.ZERO)
+            changed = true
+          }
         }
       }
       node = node + usize.ONE
     }
   }
-  // Each group's size, then the groups placed largest first on the unit with the least so far.
-  let mut groupSize = run List<usize>.makeWithCapacity(nodes)
-  node = usize.ZERO
-  while node < nodes {
-    run List<usize>.append(&mut groupSize, usize.ZERO)
-    node = node + usize.ONE
-  }
-  node = usize.ZERO
-  while node < nodes {
-    if !List<bool>.get(&local, node) {
-      let root = rootOf(List<usize>.asSlice(&parent), node)
-      let grown = List<usize>.get(&groupSize, root) + List<usize>.get(&ends, node) - List<usize>.get(&starts, node)
-      List<usize>.set(&mut groupSize, root, grown)
-    }
-    node = node + usize.ONE
-  }
+  // The groups placed largest first on the unit with the least so far.
   let mut keys = List<u64>.make()
   node = usize.ZERO
   while node < nodes {

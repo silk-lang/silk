@@ -95,6 +95,84 @@ pub fn hash(bytes: &[u8]) -> [u8; 16]
 
 Returns the 16-byte MD5 digest of `bytes`. It does not allocate.
 
+<a id="Md5.impl.Digest"></a>
+
+## Implementation `Digest for Md5`
+
+```silk
+impl Digest for Md5
+```
+
+<a id="Md5.impl.Digest.make"></a>
+
+### Operation `make`
+
+```silk
+make: Md5.make
+```
+
+Returns a MD5 state for an empty message.
+
+<a id="Md5.impl.Digest.update"></a>
+
+### Operation `update`
+
+```silk
+update: Md5.update
+```
+
+Adds `bytes` to the end of the message.
+
+<a id="Md5.impl.Digest.blockLength"></a>
+
+### Operation `blockLength`
+
+```silk
+fn blockLength(self: &Self) -> usize
+```
+
+Returns 64, the MD5 block length in bytes.
+
+<a id="Md5.impl.Digest.digestLength"></a>
+
+### Operation `digestLength`
+
+```silk
+fn digestLength(self: &Self) -> usize
+```
+
+Returns 16, the MD5 digest length in bytes.
+
+<a id="Md5.impl.Digest.objectIdentifier"></a>
+
+### Operation `objectIdentifier`
+
+```silk
+fn objectIdentifier(self: &Self) -> &[u8]
+```
+
+Returns the content bytes of the MD5 object identifier, 1.2.840.113549.2.5.
+
+<a id="Md5.impl.Digest.copy"></a>
+
+### Operation `copy`
+
+```silk
+fn copy(self: &Self) -> Self
+```
+
+Returns an independent copy of the state.
+
+<a id="Md5.impl.Digest.finishInto"></a>
+
+### Operation `finishInto`
+
+```silk
+fn finishInto(self: Self, output: &mut [u8]) -> ()
+```
+
+Writes the 16-byte MD5 digest to the start of `output` and consumes the state.
+
 
 Category: Cryptography.
 
