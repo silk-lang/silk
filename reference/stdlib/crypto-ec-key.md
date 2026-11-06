@@ -72,8 +72,8 @@ Public declarations: 5.
 pub enum EcCurve
 ```
 
-A named elliptic curve over a prime field, as OpenSSL and Node.js `crypto.getCurves` list
-them.
+A named elliptic curve, over a prime field or a binary field, as OpenSSL and Node.js
+`crypto.getCurves` list them.
 
 <a id="EcCurve.Secp112r1"></a>
 
@@ -475,6 +475,426 @@ Sm2
 
 The Chinese SM2 curve, which OpenSSL names `SM2`.
 
+<a id="EcCurve.Sect113r1"></a>
+
+### `Sect113r1`
+
+```silk
+Sect113r1
+```
+
+The curve that OpenSSL names `sect113r1`.
+
+<a id="EcCurve.Sect113r2"></a>
+
+### `Sect113r2`
+
+```silk
+Sect113r2
+```
+
+The curve that OpenSSL names `sect113r2`.
+
+<a id="EcCurve.Sect131r1"></a>
+
+### `Sect131r1`
+
+```silk
+Sect131r1
+```
+
+The curve that OpenSSL names `sect131r1`.
+
+<a id="EcCurve.Sect131r2"></a>
+
+### `Sect131r2`
+
+```silk
+Sect131r2
+```
+
+The curve that OpenSSL names `sect131r2`.
+
+<a id="EcCurve.Sect163k1"></a>
+
+### `Sect163k1`
+
+```silk
+Sect163k1
+```
+
+The curve that OpenSSL names `sect163k1`.
+
+<a id="EcCurve.Sect163r1"></a>
+
+### `Sect163r1`
+
+```silk
+Sect163r1
+```
+
+The curve that OpenSSL names `sect163r1`.
+
+<a id="EcCurve.Sect163r2"></a>
+
+### `Sect163r2`
+
+```silk
+Sect163r2
+```
+
+The curve that OpenSSL names `sect163r2`.
+
+<a id="EcCurve.Sect193r1"></a>
+
+### `Sect193r1`
+
+```silk
+Sect193r1
+```
+
+The curve that OpenSSL names `sect193r1`.
+
+<a id="EcCurve.Sect193r2"></a>
+
+### `Sect193r2`
+
+```silk
+Sect193r2
+```
+
+The curve that OpenSSL names `sect193r2`.
+
+<a id="EcCurve.Sect233k1"></a>
+
+### `Sect233k1`
+
+```silk
+Sect233k1
+```
+
+The curve that OpenSSL names `sect233k1`.
+
+<a id="EcCurve.Sect233r1"></a>
+
+### `Sect233r1`
+
+```silk
+Sect233r1
+```
+
+The curve that OpenSSL names `sect233r1`.
+
+<a id="EcCurve.Sect239k1"></a>
+
+### `Sect239k1`
+
+```silk
+Sect239k1
+```
+
+The curve that OpenSSL names `sect239k1`.
+
+<a id="EcCurve.Sect283k1"></a>
+
+### `Sect283k1`
+
+```silk
+Sect283k1
+```
+
+The curve that OpenSSL names `sect283k1`.
+
+<a id="EcCurve.Sect283r1"></a>
+
+### `Sect283r1`
+
+```silk
+Sect283r1
+```
+
+The curve that OpenSSL names `sect283r1`.
+
+<a id="EcCurve.Sect409k1"></a>
+
+### `Sect409k1`
+
+```silk
+Sect409k1
+```
+
+The curve that OpenSSL names `sect409k1`.
+
+<a id="EcCurve.Sect409r1"></a>
+
+### `Sect409r1`
+
+```silk
+Sect409r1
+```
+
+The curve that OpenSSL names `sect409r1`.
+
+<a id="EcCurve.Sect571k1"></a>
+
+### `Sect571k1`
+
+```silk
+Sect571k1
+```
+
+The curve that OpenSSL names `sect571k1`.
+
+<a id="EcCurve.Sect571r1"></a>
+
+### `Sect571r1`
+
+```silk
+Sect571r1
+```
+
+The curve that OpenSSL names `sect571r1`.
+
+<a id="EcCurve.C2pnb163v1"></a>
+
+### `C2pnb163v1`
+
+```silk
+C2pnb163v1
+```
+
+The curve that OpenSSL names `c2pnb163v1`.
+
+<a id="EcCurve.C2pnb163v2"></a>
+
+### `C2pnb163v2`
+
+```silk
+C2pnb163v2
+```
+
+The curve that OpenSSL names `c2pnb163v2`.
+
+<a id="EcCurve.C2pnb163v3"></a>
+
+### `C2pnb163v3`
+
+```silk
+C2pnb163v3
+```
+
+The curve that OpenSSL names `c2pnb163v3`.
+
+<a id="EcCurve.C2pnb176v1"></a>
+
+### `C2pnb176v1`
+
+```silk
+C2pnb176v1
+```
+
+The curve that OpenSSL names `c2pnb176v1`.
+
+<a id="EcCurve.C2tnb191v1"></a>
+
+### `C2tnb191v1`
+
+```silk
+C2tnb191v1
+```
+
+The curve that OpenSSL names `c2tnb191v1`.
+
+<a id="EcCurve.C2tnb191v2"></a>
+
+### `C2tnb191v2`
+
+```silk
+C2tnb191v2
+```
+
+The curve that OpenSSL names `c2tnb191v2`.
+
+<a id="EcCurve.C2tnb191v3"></a>
+
+### `C2tnb191v3`
+
+```silk
+C2tnb191v3
+```
+
+The curve that OpenSSL names `c2tnb191v3`.
+
+<a id="EcCurve.C2pnb208w1"></a>
+
+### `C2pnb208w1`
+
+```silk
+C2pnb208w1
+```
+
+The curve that OpenSSL names `c2pnb208w1`.
+
+<a id="EcCurve.C2tnb239v1"></a>
+
+### `C2tnb239v1`
+
+```silk
+C2tnb239v1
+```
+
+The curve that OpenSSL names `c2tnb239v1`.
+
+<a id="EcCurve.C2tnb239v2"></a>
+
+### `C2tnb239v2`
+
+```silk
+C2tnb239v2
+```
+
+The curve that OpenSSL names `c2tnb239v2`.
+
+<a id="EcCurve.C2tnb239v3"></a>
+
+### `C2tnb239v3`
+
+```silk
+C2tnb239v3
+```
+
+The curve that OpenSSL names `c2tnb239v3`.
+
+<a id="EcCurve.C2pnb272w1"></a>
+
+### `C2pnb272w1`
+
+```silk
+C2pnb272w1
+```
+
+The curve that OpenSSL names `c2pnb272w1`.
+
+<a id="EcCurve.C2pnb304w1"></a>
+
+### `C2pnb304w1`
+
+```silk
+C2pnb304w1
+```
+
+The curve that OpenSSL names `c2pnb304w1`.
+
+<a id="EcCurve.C2tnb359v1"></a>
+
+### `C2tnb359v1`
+
+```silk
+C2tnb359v1
+```
+
+The curve that OpenSSL names `c2tnb359v1`.
+
+<a id="EcCurve.C2pnb368w1"></a>
+
+### `C2pnb368w1`
+
+```silk
+C2pnb368w1
+```
+
+The curve that OpenSSL names `c2pnb368w1`.
+
+<a id="EcCurve.C2tnb431r1"></a>
+
+### `C2tnb431r1`
+
+```silk
+C2tnb431r1
+```
+
+The curve that OpenSSL names `c2tnb431r1`.
+
+<a id="EcCurve.Wtls1"></a>
+
+### `Wtls1`
+
+```silk
+Wtls1
+```
+
+The curve that OpenSSL names `wap-wsg-idm-ecid-wtls1`.
+
+<a id="EcCurve.Wtls3"></a>
+
+### `Wtls3`
+
+```silk
+Wtls3
+```
+
+The curve that OpenSSL names `wap-wsg-idm-ecid-wtls3`.
+
+<a id="EcCurve.Wtls4"></a>
+
+### `Wtls4`
+
+```silk
+Wtls4
+```
+
+The curve that OpenSSL names `wap-wsg-idm-ecid-wtls4`.
+
+<a id="EcCurve.Wtls5"></a>
+
+### `Wtls5`
+
+```silk
+Wtls5
+```
+
+The curve that OpenSSL names `wap-wsg-idm-ecid-wtls5`.
+
+<a id="EcCurve.Wtls10"></a>
+
+### `Wtls10`
+
+```silk
+Wtls10
+```
+
+The curve that OpenSSL names `wap-wsg-idm-ecid-wtls10`.
+
+<a id="EcCurve.Wtls11"></a>
+
+### `Wtls11`
+
+```silk
+Wtls11
+```
+
+The curve that OpenSSL names `wap-wsg-idm-ecid-wtls11`.
+
+<a id="EcCurve.OakleyEc2n3"></a>
+
+### `OakleyEc2n3`
+
+```silk
+OakleyEc2n3
+```
+
+The curve that OpenSSL names `Oakley-EC2N-3`, the IKE group 3 of RFC 2409. It has no object identifier.
+
+<a id="EcCurve.OakleyEc2n4"></a>
+
+### `OakleyEc2n4`
+
+```silk
+OakleyEc2n4
+```
+
+The curve that OpenSSL names `Oakley-EC2N-4`, the IKE group 4 of RFC 2409. It has no object identifier.
+
 <a id="EcCurve.impl"></a>
 
 ## Implementation `EcCurve`
@@ -536,7 +956,7 @@ pub fn objectIdentifier(self: &Self) -> &[u8]
 ```
 
 Returns the content bytes of the object identifier that names the curve, without the tag
-and length.
+and length. It is empty for `OakleyEc2n3` and `OakleyEc2n4`, which have none.
 
 <a id="EcCurve.impl.name"></a>
 
@@ -751,8 +1171,9 @@ SubjectPublicKeyInfo.
 ### Details
 The writers give the same bytes as OpenSSL: SEC1 names the curve and holds the public key,
 PKCS #8 holds the public key in the inner SEC1 key, and SubjectPublicKeyInfo names the curve. A
-SEC1 key is at most 223 bytes, a PKCS #8 key at most 241 bytes, and a SubjectPublicKeyInfo at
-most 158 bytes.
+SEC1 key is at most 241 bytes, a PKCS #8 key at most 260 bytes, and a SubjectPublicKeyInfo at
+most 170 bytes, all for `sect571k1` and `sect571r1`. `OakleyEc2n3` and `OakleyEc2n4` have no
+object identifier, so the writers do not support them.
 
 ### Gotchas
 The readers do not check that the secret is in range or that the public key is on the curve.
@@ -838,9 +1259,10 @@ length. The bytes of `output` after the DER do not change.
 - `InvalidLength` if `secret` is not [`EcCurve.secretLength`](#EcCurve.impl.secretLength) bytes, or `publicKey` is not a
   compressed, uncompressed, or hybrid key of that length for the curve. `output` does not
   change.
+- `UnsupportedCurve` if the curve has no object identifier: `OakleyEc2n3` or `OakleyEc2n4`.
 
 #### Gotchas
-The program traps if `output` is shorter than the DER, at most 223 bytes.
+The program traps if `output` is shorter than the DER, at most 241 bytes.
 
 <a id="EcKeyDer.impl.writePkcs8"></a>
 
@@ -858,10 +1280,10 @@ returns the length. The inner SEC1 key holds the public key and does not repeat 
 The bytes of `output` after the DER do not change.
 
 #### Errors
-- `InvalidLength`, as for [`EcKeyDer.writeSec1`](#EcKeyDer.impl.writeSec1).
+- `InvalidLength` and `UnsupportedCurve`, as for [`EcKeyDer.writeSec1`](#EcKeyDer.impl.writeSec1).
 
 #### Gotchas
-The program traps if `output` is shorter than the DER, at most 241 bytes.
+The program traps if `output` is shorter than the DER, at most 260 bytes.
 
 <a id="EcKeyDer.impl.writeSpki"></a>
 
@@ -880,9 +1302,10 @@ of `output` after the DER do not change.
 #### Errors
 - `InvalidLength` if `publicKey` is not a compressed, uncompressed, or hybrid key of the right length
   for the curve. `output` does not change.
+- `UnsupportedCurve` if the curve has no object identifier: `OakleyEc2n3` or `OakleyEc2n4`.
 
 #### Gotchas
-The program traps if `output` is shorter than the DER, at most 158 bytes.
+The program traps if `output` is shorter than the DER, at most 170 bytes.
 
 
 Category: Cryptography.
