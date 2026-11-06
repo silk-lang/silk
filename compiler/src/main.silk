@@ -57,6 +57,7 @@ import driver.ModuleSources as ModuleSourceFiles {InvalidBuildComposition, Inval
 import driver.GitCheckouts
 import driver.Packages as PackageSources {InvalidDependency}
 import driver.HeapRelease
+import driver.MemberChecks as MemberChecks {Captured as MemberCapture, Exited as MemberExit, Started as MemberStart}
 import driver.ManifestFields
 import driver.ManifestText
 import tomledit.ManifestEdit as ManifestEdits {ManifestEditRefused}
@@ -6445,6 +6446,16 @@ effect fn checkProject(working: &Path, command: CheckCommand) -> i32
   let mut status = 0
   let mut succeeded = usize.ZERO
   let mut at = usize.ZERO
+  // Members check side by side in copies of the process, except in a replay, which compares one
+  // run's steps.
+  let mut jobs = usize.ONE
+  if !replaying && projects.length > usize.ONE { jobs = run MemberChecks.jobs() }
+  if jobs > usize.ONE {
+    let checked = run checkSideBySide(projects, List<usize>.asSlice(&order), jobs, selection.members, &options, &standardLibrary, json, roots, &settings, &compiler)
+    status = checked.status
+    succeeded = checked.succeeded
+    at = projects.length
+  }
   while at < projects.length {
     if selection.members { settings.position = at + usize.ONE }
     let member = List<usize>.get(&order, at)
@@ -6462,6 +6473,198 @@ effect fn checkProject(working: &Path, command: CheckCommand) -> i32
   }
   if selection.members { run writeUnitsSummary(&settings, move whole, succeeded, projects.length) }
   return status
+}
+
+// What a side-by-side check of members ended with: the combined status and how many succeeded.
+struct SideBySide {
+  status: i32,
+  succeeded: usize,
+}
+
+// Checks `projects`, visited in `order`, up to `jobs` at a time, each in a copy of the process
+// (`MemberChecks`). A member starts once every member it depends on has finished, so it finds the
+// caches their checks wrote, and each member's report is written in `order` once it finishes. A
+// copy that cannot start checks its member here.
+effect fn checkSideBySide(projects: &[Project], order: &[usize], jobs: usize, members: bool, options: &ProjectOptions, standardLibrary: &Option<Path>, json: bool, roots: bool, settings: &ProgressSettings, compiler: &Option<Bytes>) -> SideBySide
+! WriterError | OutOfMemoryError
+? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Writer {
+  let needs = run memberNeeds(projects)
+  // A copy writes its live line's redraws into its file too: replayed, they end on the lines a
+  // terminal shows after a check of one member at a time.
+  let mut copied = ProgressSettings {display: settings.display, color: settings.color, width: settings.width, quiet: settings.quiet,
+    compact: settings.compact, position: settings.position, units: settings.units, timings: settings.timings}
+  let noEdits = Option<List<Edit>>.none()
+  // Per member, by its place in `order`: 0 waiting, 1 running, 2 finished.
+  let mut state = List<usize>.make()
+  run List<usize>.appendRepeated(&mut state, usize.ZERO, order.length)
+  let mut statuses = List<i32>.make()
+  run List<i32>.appendRepeated(&mut statuses, 0, order.length)
+  let mut processes = List<i32>.make()
+  run List<i32>.appendRepeated(&mut processes, -1, order.length)
+  let mut outputs = List<Option<MemberCapture>>.make()
+  let mut filled = usize.ZERO
+  while filled < order.length {
+    run List<Option<MemberCapture>>.append(&mut outputs, Option<MemberCapture>.none())
+    filled = filled + usize.ONE
+  }
+  let mut running = usize.ZERO
+  let mut written = usize.ZERO
+  let mut result = SideBySide {status: 0, succeeded: usize.ZERO}
+  while written < order.length {
+    // Start every member whose dependencies have finished, in order, while a job is free.
+    let mut next = usize.ZERO
+    while next < order.length && running < jobs {
+      if List<usize>.get(&state, next) == usize.ZERO && finishedNeeds(List<List<usize>>.asSlice(&needs), order, List<usize>.asSlice(&state), next) {
+        if members { copied.position = next + usize.ONE }
+        List<usize>.set(&mut state, next, usize.ONE)
+        match move MemberChecks.start() {
+          MemberStart.Original {process, captured} => {
+            List<i32>.set(&mut processes, next, process)
+            let slots = List<Option<MemberCapture>>.asMutSlice(&mut outputs)
+            slots[next] = Option<MemberCapture>.some(move captured)
+            running = running + usize.ONE
+          }
+          MemberStart.Copy => {
+            let checked = run checkMember(&projects[order[next]], options, standardLibrary, json, roots, &copied, &noEdits, true, compiler)
+            MemberChecks.exit(checked)
+          }
+          MemberStart.Here => {
+            List<i32>.set(&mut statuses, next, run checkMember(&projects[order[next]], options, standardLibrary, json, roots, &copied, &noEdits, false, compiler))
+            List<usize>.set(&mut state, next, 2)
+          }
+        }
+      }
+      next = next + usize.ONE
+    }
+    // A dependency cycle leaves members waiting on each other: start the first waiting one.
+    if running == usize.ZERO && List<usize>.get(&state, written) == usize.ZERO {
+      let mut first = written
+      while List<usize>.get(&state, first) != usize.ZERO { first = first + usize.ONE }
+      List<usize>.set(&mut state, first, 2)
+      List<i32>.set(&mut statuses, first, run checkMember(&projects[order[first]], options, standardLibrary, json, roots, &copied, &noEdits, false, compiler))
+    }
+    if running > usize.ZERO {
+      match move MemberChecks.waitAny() {
+        Option<MemberExit>.Some {value: exited} => {
+          let mut at = usize.ZERO
+          while at < order.length {
+            if List<i32>.get(&processes, at) == exited.process && List<usize>.get(&state, at) == usize.ONE {
+              List<usize>.set(&mut state, at, 2)
+              List<i32>.set(&mut statuses, at, exited.status)
+              running = running - usize.ONE
+            }
+            at = at + usize.ONE
+          }
+        }
+        Option<MemberExit>.None => {
+          // No copy is left to wait for: count the running ones as failed.
+          let mut at = usize.ZERO
+          while at < order.length {
+            if List<usize>.get(&state, at) == usize.ONE {
+              List<usize>.set(&mut state, at, 2)
+              List<i32>.set(&mut statuses, at, 2)
+            }
+            at = at + usize.ONE
+          }
+          running = usize.ZERO
+        }
+      }
+    }
+    // Write the reports of the finished members that follow the ones written, in order.
+    while written < order.length && List<usize>.get(&state, written) == 2 {
+      let slots = List<Option<MemberCapture>>.asMutSlice(&mut outputs)
+      let taken = Intrinsic.replace(slots[written], Option<MemberCapture>.none())
+      if let Option<MemberCapture>.Some {value: captured} = move taken {
+        MemberChecks.replay(&captured)
+        drop captured
+      }
+      let checked = List<i32>.get(&statuses, written)
+      if checked == 0 { result.succeeded = result.succeeded + usize.ONE }
+      result.status = worse(result.status, checked)
+      written = written + usize.ONE
+    }
+  }
+  return move result
+}
+
+// Checks one member as the workspace loop does, with its own type table; its status, with any
+// error reported. A member that is `last` leaves its store for the exit to free.
+effect fn checkMember(project: &Project, options: &ProjectOptions, standardLibrary: &Option<Path>, json: bool, roots: bool, settings: &ProgressSettings, edits: &Option<List<Edit>>, last: bool, compiler: &Option<Bytes>) -> i32
+! WriterError | OutOfMemoryError
+? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Writer {
+  let mut memberTypes = TypeTable.make()
+  let mut snapshot = ModuleSourceFiles.snapshot()
+  let checked = run memberStatus(run Effect.result(checkOne(project, options, standardLibrary, json, roots, settings, edits, false, last, compiler, &mut snapshot)
+    |> Effect.provideMut<Types>(&mut memberTypes)))
+  drop memberTypes
+  HeapRelease.release()
+  return checked
+}
+
+// Whether every member that the member at `place` of `order` depends on has finished, by `state`.
+fn finishedNeeds(needs: &[List<usize>], order: &[usize], state: &[usize], place: usize) -> bool {
+  let listed = List<usize>.asSlice(&needs[order[place]])
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let mut other = usize.ZERO
+    while other < order.length {
+      if order[other] == listed[at] && state[other] != 2 { return false }
+      other = other + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// For each of `projects`, the others among them it reaches by path, directly or through packages
+// that are not members; a manifest that no longer parses reaches none, and its own check reports it.
+effect fn memberNeeds(projects: &[Project]) -> List<List<usize>> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut directories = List<Bytes>.make()
+  let mut at = usize.ZERO
+  while at < projects.length {
+    match move run CommandPath.canonical(Path.rawBytes(Projects.directory(&projects[at]))) {
+      Option<Bytes>.Some {value} => { run List<Bytes>.append(&mut directories, move value) }
+      Option<Bytes>.None => { run List<Bytes>.append(&mut directories, run Bytes.copy(Path.rawBytes(Projects.directory(&projects[at])))) }
+    }
+    at = at + usize.ONE
+  }
+  let known = List<Bytes>.asSlice(&directories)
+  let mut needs = List<List<usize>>.make()
+  at = usize.ZERO
+  while at < projects.length {
+    let mut named = List<usize>.make()
+    let parsed = match move run Effect.result(Projects.document(&projects[at])) {
+      Result<TomlValue, TomlError | OutOfMemoryError>.Success {value} => Option<TomlValue>.some(move value)
+      Result<TomlValue, TomlError | OutOfMemoryError>.Failure {error} => match move error {
+        TomlError failure => {
+          drop failure
+          Option<TomlValue>.none()
+        }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+    if let Option<TomlValue>.Some {value: document} = &parsed {
+      let reached = run PackageSources.pathDependencies(Projects.directory(&projects[at]), &document)
+      let listed = List<Bytes>.asSlice(&reached)
+      let mut other = usize.ZERO
+      while other < projects.length {
+        if other != at && listedPath(listed, Bytes.asSlice(&known[other])) { run List<usize>.append(&mut named, other) }
+        other = other + usize.ONE
+      }
+    }
+    run List<List<usize>>.append(&mut needs, move named)
+    at = at + usize.ONE
+  }
+  return move needs
+}
+
+fn listedPath(listed: &[Bytes], path: &[u8]) -> bool {
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if same(Bytes.asSlice(&listed[at]), path) { return true }
+    at = at + usize.ONE
+  }
+  return false
 }
 
 // Checks one project's planned compilations, as `checkProject` does for each selected project.

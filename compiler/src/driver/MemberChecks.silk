@@ -1,0 +1,282 @@
+//! Copies of the compiler that check workspace members side by side.
+//!
+//! A workspace check runs each member's check in a copy of the process (POSIX `fork`), as many at
+//! once as the processors and the memory allow ([`jobs`]). A member's copy writes its standard
+//! output and error into files of its own ([`Captured`]), which the check copies onto its own
+//! streams in member order once the copy exits, so the report reads as one run in order would.
+//! A copy exits without freeing its store, and the check that started it never holds one.
+//!
+//! Other hosts check one member after another in the process.
+
+import silk.core.option { Option }
+
+static if (Intrinsic.targetOperatingSystem() == "darwin"
+  && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")
+  && Intrinsic.targetAbi() == "apple"
+  && Intrinsic.profileText("libc") == "system")
+  || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu"
+    && Intrinsic.profileText("libc") == "gnu"
+    && (Intrinsic.targetArchitecture() == "aarch64"
+      || Intrinsic.targetArchitecture() == "x86_64")) {
+  import silk.core.effect { Effect }
+  import silk.core.result { Result }
+  import silk.core.ownership { Drop }
+  import silk.collections.slice { Slice }
+  import silk.mem.pointer { Pointer }
+  import silk.num.isize
+  import silk.num.u64
+  import silk.num.usize
+  import silk.system.system_info { MemoryInfo, MemoryLimit, SystemInfo, SystemInfoError }
+  import silk.system.system_info_native { OsSystemInfo }
+
+  unsafe extern "C" fn fork() -> i32
+  unsafe extern "C" fn dup2(from: i32, to: i32) -> i32
+  unsafe extern "C" fn _exit(status: i32) -> ()
+  @foreign(noCapture: .("status"))
+  unsafe extern "C" fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32
+  unsafe extern "C" fn tmpfile() -> ?*mut u8
+  unsafe extern "C" fn fileno(stream: ?*mut u8) -> i32
+  unsafe extern "C" fn fclose(stream: ?*mut u8) -> i32
+  unsafe extern "C" fn lseek(fd: i32, offset: i64, whence: i32) -> i64
+  @foreign(noCapture: .("buffer"))
+  unsafe extern "C" fn read(fd: i32, buffer: ?[*]mut u8, count: usize) -> isize
+  @foreign(noCapture: .("buffer"))
+  unsafe extern "C" fn write(fd: i32, buffer: ?[*]const u8, count: usize) -> isize
+
+  // The memory one member's check may take: the largest nonstd executable's check peaks near
+  // 1.9 GB resident.
+  const MEMBER_BYTES: u64 = 2147483648
+
+  /// How many members a workspace check runs at once: one per processor the process may run on,
+  /// and no more than its memory holds at [`MEMBER_BYTES`] each; at least one.
+  pub effect fn jobs() -> usize {
+    let mut info = OsSystemInfo.make()
+    let counted = run Effect.result(
+      SystemInfo.availableParallelism() |> Effect.provideMut<SystemInfo>(&mut info),
+    )
+    let mut count = match move counted {
+      Result<usize, SystemInfoError>.Success { value } => value
+      Result<usize, SystemInfoError>.Failure { .. } => usize.ONE
+    }
+    let measured = run Effect.result(
+      SystemInfo.memory() |> Effect.provideMut<SystemInfo>(&mut info),
+    )
+    if let Result<MemoryInfo, SystemInfoError>.Success { value: memory } = move measured {
+      let mut room = memory.available
+      if let Option<MemoryLimit>.Some { value: limit } = memory.limit {
+        let mut left: u64 = 0
+        if limit.bytes > limit.used {
+          left = limit.bytes - limit.used
+        }
+        if left < room {
+          room = left
+        }
+      }
+      let held = u64.toUsize(room / MEMBER_BYTES)
+      if held < count {
+        count = held
+      }
+    }
+    if count == usize.ZERO {
+      return usize.ONE
+    }
+    return count
+  }
+
+  /// The files a member's copy writes its standard output and error into, removed when dropped.
+  pub struct Captured {
+    output: ?*mut u8,
+    errors: ?*mut u8,
+  }
+
+  impl Drop for Captured {
+    fn drop(self: &mut Captured) -> () {
+      let output = Intrinsic.replace(self.output, Pointer.null<u8>())
+      if !Pointer.isNull<u8>(output) {
+        let _closed = unsafe fclose(output)
+      }
+      let errors = Intrinsic.replace(self.errors, Pointer.null<u8>())
+      if !Pointer.isNull<u8>(errors) {
+        let _closed = unsafe fclose(errors)
+      }
+    }
+  }
+
+  /// Where [`start`] returned.
+  pub union Started {
+    /// In the check that started the copy, which runs as `process`.
+    Original { pub process: i32, pub captured: Captured },
+    /// In the copy: check the member, then [`exit`].
+    Copy,
+    /// No copy could start: check the member here.
+    Here,
+  }
+
+  /// Starts a copy of the process to check one member, its standard output and error written into
+  /// fresh files.
+  ///
+  /// # Gotchas
+  /// Call it on the check's only thread: the copy has no other thread.
+  pub fn start() -> Started {
+    let output = unsafe tmpfile()
+    if Pointer.isNull<u8>(output) {
+      return Started.Here
+    }
+    let errors = unsafe tmpfile()
+    let captured = Captured { output: output, errors: errors }
+    if Pointer.isNull<u8>(errors) {
+      return Started.Here
+    }
+    let child = unsafe fork()
+    if child < 0 {
+      return Started.Here
+    }
+    if child > 0 {
+      return Started.Original { process: child, captured: move captured }
+    }
+    let written = unsafe dup2(unsafe fileno(captured.output), 1)
+    let reported = unsafe dup2(unsafe fileno(captured.errors), 2)
+
+    // The duplicates keep the files open until the copy exits.
+    drop captured
+    if written < 0 || reported < 0 {
+      exit(2)
+    }
+    return Started.Copy
+  }
+
+  /// Ends a copy [`start`] started with `status`, without freeing what it holds.
+  pub fn exit(status: i32) -> never {
+    unsafe _exit(status)
+
+    // _exit never returns; keep the source contract divergent without a compiler intrinsic.
+    return exit(status)
+  }
+
+  /// A copy that exited, and the status a check reports for it: its exit status, or 2 when a
+  /// signal ended it.
+  pub struct Exited {
+    pub process: i32,
+    pub status: i32,
+  }
+
+  /// Waits for any copy of this process to exit; none when there is none.
+  pub fn waitAny() -> Option<Exited> {
+    while true {
+      let mut status: i32 = 0
+      let process = unsafe waitpid(-1, Pointer.fromMutRef<i32>(&mut status), 0)
+      if process > 0 {
+        if (status & 127) == 0 {
+          return Option<Exited>.some(Exited { process: process, status: (status / 256) % 256 })
+        }
+        return Option<Exited>.some(Exited { process: process, status: 2 })
+      }
+
+      // Interrupted by a signal: wait again. Any other failure means no child is left.
+      if process < 0 && !interrupted() {
+        return Option<Exited>.none()
+      }
+    }
+    return Option<Exited>.none()
+  }
+
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    unsafe extern "C" fn __error() -> *mut i32
+
+    fn interrupted() -> bool {
+      unsafe {
+        return Pointer.read<i32>(__error()) == 4
+      }
+    }
+  } else {
+    unsafe extern "C" fn __errno_location() -> *mut i32
+
+    fn interrupted() -> bool {
+      unsafe {
+        return Pointer.read<i32>(__errno_location()) == 4
+      }
+    }
+  }
+
+  /// Copies what a copy wrote into `captured` onto this process's standard output and error.
+  pub fn replay(captured: &Captured) -> () {
+    copyFrom(unsafe fileno(captured.output), 1)
+    copyFrom(unsafe fileno(captured.errors), 2)
+  }
+
+  // Copies the file open as `from` from its start onto `to`.
+  fn copyFrom(from: i32, to: i32) -> () {
+    if unsafe lseek(from, 0, 0) < 0 {
+      return ()
+    }
+    let mut buffer: [u8; 65536] = [0; 65536]
+    while true {
+      let count = unsafe read(from, Pointer.fromMutSlice<u8>(&mut buffer), 65536)
+      if count == 0 {
+        return ()
+      }
+      if count < 0 {
+        if interrupted() {
+          continue
+        }
+        return ()
+      }
+      let total = isize.toUsize(count)
+      let mut offset: usize = 0
+      while offset < total {
+        let sent = unsafe write(
+          to,
+          Pointer.fromSlice<u8>(Slice.view<u8>(&buffer, offset, total - offset)),
+          total - offset,
+        )
+        if sent < 0 {
+          if !interrupted() {
+            return ()
+          }
+        } else {
+          offset = offset + isize.toUsize(sent)
+        }
+      }
+    }
+  }
+} else {
+  /// One: this host checks one member after another.
+  pub effect fn jobs() -> usize {
+    return 1
+  }
+
+  /// Never made on this host, which starts no copy.
+  pub struct Captured {}
+
+  /// Where [`start`] returned; always `Here` on this host.
+  pub union Started {
+    Original { pub process: i32, pub captured: Captured },
+    Copy,
+    Here,
+  }
+
+  /// This host starts no copy: the member is checked here.
+  pub fn start() -> Started {
+    return Started.Here
+  }
+
+  /// Never reached on this host, which starts no copy.
+  pub fn exit(status: i32) -> never {
+    return exit(status)
+  }
+
+  pub struct Exited {
+    pub process: i32,
+    pub status: i32,
+  }
+
+  /// None: this host starts no copy to wait for.
+  pub fn waitAny() -> Option<Exited> {
+    return Option<Exited>.none()
+  }
+
+  /// Never reached on this host.
+  pub fn replay(captured: &Captured) -> () {
+    return ()
+  }
+}
