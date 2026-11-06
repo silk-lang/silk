@@ -1,0 +1,1086 @@
+//! Sign and verify with ML-DSA (FIPS 204), the module-lattice signature scheme, at the levels
+//! ML-DSA-44, ML-DSA-65, and ML-DSA-87.
+//!
+//! # When to use
+//! Use [`MlDsa`] for signatures that must hold also against an attacker with a large quantum
+//! computer. Make a key pair with [`MlDsa.keyPairFromSeed`], sign with [`MlDsa.sign`], and verify
+//! with [`MlDsa.verify`]. Use `silk.crypto.ml_key` to read and write the keys in PKCS #8 and
+//! SubjectPublicKeyInfo.
+//!
+//! # Details
+//! This is the pure ML-DSA of FIPS 204 section 5, with a context string of up to 255 bytes. A key
+//! pair comes from a 32-byte seed, the form that PKCS #8 stores; the functions of
+//! [`MlDsaParameters`] give the sizes. [`MlDsa.sign`] is the hedged variant, with 32 bytes from the
+//! ambient `Random`, and [`MlDsa.signDeterministic`] the deterministic one. The external-mu
+//! functions take the 64-byte message representative mu that [`MlDsa.externalMu`] computes, so a
+//! caller can hash a long message elsewhere. The caller gives every buffer, so nothing allocates.
+//! Signing does not branch on secret values except in the rejection loop of FIPS 204, whose
+//! rejected attempts reveal nothing.
+//!
+//! # Errors
+//! - [`MlDsaError`] for a buffer of the wrong length, a context over 255 bytes, or a private key
+//!   whose secret vectors are out of range.
+//!
+//! # Gotchas
+//! The verifiers return `false` for every failure, including wrong lengths. Secrets are not
+//! erased. The pre-hash variant HashML-DSA is not here.
+//!
+//! # Examples
+//! ## Sign and verify
+//! ```silk
+//! import silk.core.result { Result }
+//! import silk.crypto.ml_dsa { MlDsa, MlDsaError, MlDsaParameters }
+//!
+//! pub fn main() -> i32 {
+//!   let parameters = MlDsaParameters.MlDsa44
+//!   // Real programs fill the seed from a secure `Random` provider.
+//!   let seed: [u8; 32] = [1; 32]
+//!   let mut publicKey: [u8; 1312] = [0; 1312]
+//!   let mut privateKey: [u8; 2560] = [0; 2560]
+//!   match MlDsa.keyPairFromSeed(parameters, &seed, &mut publicKey, &mut privateKey) {
+//!     Result<(), MlDsaError>.Success { .. } => {}
+//!     Result<(), MlDsaError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let mut signature: [u8; 2420] = [0; 2420]
+//!   match MlDsa.signDeterministic(parameters, &privateKey, b"hello", b"", &mut signature) {
+//!     Result<(), MlDsaError>.Success { .. } => {}
+//!     Result<(), MlDsaError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   if !MlDsa.verify(parameters, &publicKey, b"hello", b"", &signature) {
+//!     return 1
+//!   }
+//!   if MlDsa.verify(parameters, &publicKey, b"hullo", b"", &signature) {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Cryptography
+
+import silk.collections.slice { Slice }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.crypto.sha3 { Shake128, Shake256 }
+import silk.io.writer { Writer, WriterError }
+import silk.num.i32
+import silk.num.i64
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.system.random { Random }
+import silk.text.format { Debug, Format, Formatter }
+
+/// An ML-DSA parameter set of FIPS 204.
+pub enum MlDsaParameters {
+  /// ML-DSA-44, security category 2.
+  MlDsa44,
+  /// ML-DSA-65, security category 3.
+  MlDsa65,
+  /// ML-DSA-87, security category 5.
+  MlDsa87,
+}
+
+impl MlDsaParameters {
+  /// Returns the length of a public key in bytes: 1312, 1952, or 2592.
+  pub fn publicKeyLength(self: &Self) -> usize {
+    return 32 + 320 * settings(self.*).k
+  }
+
+  /// Returns the length of an expanded private key in bytes: 2560, 4032, or 4896.
+  pub fn privateKeyLength(self: &Self) -> usize {
+    let set = settings(self.*)
+    return 128 + 32 * set.etaBits * (set.k + set.l) + 416 * set.k
+  }
+
+  /// Returns the length of a signature in bytes: 2420, 3309, or 4627.
+  pub fn signatureLength(self: &Self) -> usize {
+    let set = settings(self.*)
+    return set.challengeLength + 32 * set.gamma1Bits * set.l + set.omega + set.k
+  }
+
+  /// Returns the content bytes of the object identifier that names the parameter set, without the
+  /// tag and length: `id-ml-dsa-44` is 2.16.840.1.101.3.4.3.17, and the others end in 18 and 19.
+  pub fn objectIdentifier(self: &Self) -> &[u8] {
+    return match &self.* {
+      MlDsaParameters.MlDsa44 => b"\x60\x86\x48\x01\x65\x03\x04\x03\x11"
+      MlDsaParameters.MlDsa65 => b"\x60\x86\x48\x01\x65\x03\x04\x03\x12"
+      MlDsaParameters.MlDsa87 => b"\x60\x86\x48\x01\x65\x03\x04\x03\x13"
+    }
+  }
+}
+
+impl Debug for MlDsaParameters {
+  /// Writes the name of the variant, such as `MlDsa65`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      MlDsaParameters.MlDsa44 => run Format.write(&mut formatter, b"MlDsa44")
+      MlDsaParameters.MlDsa65 => run Format.write(&mut formatter, b"MlDsa65")
+      MlDsaParameters.MlDsa87 => run Format.write(&mut formatter, b"MlDsa87")
+    }
+  }
+}
+
+/// The reason that an ML-DSA call failed. It holds no secret bytes.
+pub enum MlDsaError {
+  /// A seed, key, mu, randomness, or output buffer does not have the length of the parameter set.
+  InvalidLength,
+  /// The context string is longer than 255 bytes.
+  ContextTooLong,
+  /// A coefficient of the secret vectors s1 or s2 in the private key is out of range.
+  InvalidPrivateKey,
+}
+
+impl Debug for MlDsaError {
+  /// Writes the name of the variant, such as `InvalidLength`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      MlDsaError.InvalidLength => run Format.write(&mut formatter, b"InvalidLength")
+      MlDsaError.ContextTooLong => run Format.write(&mut formatter, b"ContextTooLong")
+      MlDsaError.InvalidPrivateKey => run Format.write(&mut formatter, b"InvalidPrivateKey")
+    }
+  }
+}
+
+/// The functions of ML-DSA.
+///
+/// # When to use
+/// Make a key pair with [`MlDsa.keyPairFromSeed`], sign with [`MlDsa.sign`] or
+/// [`MlDsa.signDeterministic`], and verify with [`MlDsa.verify`].
+///
+/// # Details
+/// Each function takes the parameter set and the caller's buffers, which must have the lengths of
+/// [`MlDsaParameters`].
+pub struct MlDsa {}
+
+impl MlDsa {
+  /// Writes the key pair of ML-DSA.KeyGen_internal for the 32-byte `seed` into `publicKey` and
+  /// `privateKey`.
+  ///
+  /// # Errors
+  /// - `InvalidLength` if `seed` is not 32 bytes, or a key buffer does not have the length of the
+  ///   parameter set. The buffers do not change.
+  pub fn keyPairFromSeed(
+    parameters: MlDsaParameters,
+    seed: &[u8],
+    publicKey: &mut [u8],
+    privateKey: &mut [u8],
+  ) -> Result<(), MlDsaError> {
+    if seed.length != 32 || publicKey.length != parameters.publicKeyLength()
+      || privateKey.length != parameters.privateKeyLength() {
+      return Result<(), MlDsaError>.failResult(MlDsaError.InvalidLength)
+    }
+    let set = settings(parameters)
+    keyGenerate(&set, seed, &mut publicKey, &mut privateKey)
+    return Result<(), MlDsaError>.succeed(())
+  }
+
+  /// Returns a new 32-byte seed from the ambient `Random`, for [`MlDsa.keyPairFromSeed`].
+  ///
+  /// The `Random` provider must be cryptographically secure.
+  pub effect fn generateSeed() -> [u8; 32] ? &mut Random {
+    let mut seed: [u8; 32] = [0; 32]
+    run Random.fillBytes(&mut seed)
+    return seed
+  }
+
+  /// Returns mu, the 64-byte message representative of FIPS 204 for `message` and `context`
+  /// under `publicKey`, for the external-mu functions.
+  ///
+  /// # Errors
+  /// - `InvalidLength` if `publicKey` does not have the length of the parameter set.
+  /// - `ContextTooLong` if `context` is longer than 255 bytes.
+  pub fn externalMu(parameters: MlDsaParameters, publicKey: &[u8], message: &[u8], context: &[u8]) -> Result<
+    [u8; 64],
+    MlDsaError,
+  > {
+    if publicKey.length != parameters.publicKeyLength() {
+      return Result<[u8; 64], MlDsaError>.failResult(MlDsaError.InvalidLength)
+    }
+    if context.length > 255 {
+      return Result<[u8; 64], MlDsaError>.failResult(MlDsaError.ContextTooLong)
+    }
+    let mut tr: [u8; 64] = [0; 64]
+    let mut hash = Shake256.make()
+    hash.update(publicKey)
+    hash.finishInto(&mut tr)
+    return Result<[u8; 64], MlDsaError>.succeed(representative(&tr, message, context))
+  }
+
+  /// Writes a hedged signature of `message` with `context` into `signature`, with 32 bytes from
+  /// the ambient `Random`.
+  ///
+  /// # Errors
+  /// - `InvalidLength` if `privateKey` or `signature` does not have the length of the parameter
+  ///   set.
+  /// - `ContextTooLong` if `context` is longer than 255 bytes.
+  /// - `InvalidPrivateKey` if the secret vectors are out of range.
+  pub effect fn sign(
+    parameters: MlDsaParameters,
+    privateKey: &[u8],
+    message: &[u8],
+    context: &[u8],
+    signature: &mut [u8],
+  ) -> Result<(), MlDsaError> ? &mut Random {
+    let mut randomness: [u8; 32] = [0; 32]
+    run Random.fillBytes(&mut randomness)
+    return signMessage(parameters, privateKey, message, context, &randomness, &mut signature)
+  }
+
+  /// Writes the deterministic signature of `message` with `context` into `signature`: FIPS 204
+  /// with 32 zero bytes as the randomness.
+  ///
+  /// # Errors
+  /// The errors of [`MlDsa.sign`].
+  pub fn signDeterministic(
+    parameters: MlDsaParameters,
+    privateKey: &[u8],
+    message: &[u8],
+    context: &[u8],
+    signature: &mut [u8],
+  ) -> Result<(), MlDsaError> {
+    let randomness: [u8; 32] = [0; 32]
+    return signMessage(parameters, privateKey, message, context, &randomness, &mut signature)
+  }
+
+  /// Writes the signature of ML-DSA.Sign_internal for the 64-byte message representative `mu`
+  /// and the 32-byte `randomness` into `signature`.
+  ///
+  /// # Errors
+  /// - `InvalidLength` for a key, mu, randomness, or signature buffer of the wrong length.
+  /// - `InvalidPrivateKey` if the secret vectors are out of range.
+  ///
+  /// # Gotchas
+  /// Use 32 fresh random bytes, or 32 zero bytes for the deterministic variant. Get `mu` from
+  /// [`MlDsa.externalMu`] with the public key of `privateKey`.
+  pub fn signExternalMu(
+    parameters: MlDsaParameters,
+    privateKey: &[u8],
+    mu: &[u8],
+    randomness: &[u8],
+    signature: &mut [u8],
+  ) -> Result<(), MlDsaError> {
+    if privateKey.length != parameters.privateKeyLength() || mu.length != 64
+      || randomness.length != 32 || signature.length != parameters.signatureLength() {
+      return Result<(), MlDsaError>.failResult(MlDsaError.InvalidLength)
+    }
+    let set = settings(parameters)
+    if !secretsInRange(&set, privateKey) {
+      return Result<(), MlDsaError>.failResult(MlDsaError.InvalidPrivateKey)
+    }
+    signInternal(&set, privateKey, mu, randomness, &mut signature)
+    return Result<(), MlDsaError>.succeed(())
+  }
+
+  /// Returns whether `signature` is a valid signature of `message` with `context` under
+  /// `publicKey`. Wrong lengths and a context over 255 bytes give `false`.
+  pub fn verify(
+    parameters: MlDsaParameters,
+    publicKey: &[u8],
+    message: &[u8],
+    context: &[u8],
+    signature: &[u8],
+  ) -> bool {
+    return match MlDsa.externalMu(parameters, publicKey, message, context) {
+      Result<[u8; 64], MlDsaError>.Success { value } => {
+        MlDsa.verifyExternalMu(parameters, publicKey, &value, signature)
+      }
+      Result<[u8; 64], MlDsaError>.Failure { error: _ } => false
+    }
+  }
+
+  /// Returns whether `signature` is valid under `publicKey` for the 64-byte message
+  /// representative `mu`, as ML-DSA.Verify_internal checks it. Wrong lengths give `false`.
+  pub fn verifyExternalMu(parameters: MlDsaParameters, publicKey: &[u8], mu: &[u8], signature: &[u8]) -> bool {
+    if publicKey.length != parameters.publicKeyLength() || mu.length != 64
+      || signature.length != parameters.signatureLength() {
+      return false
+    }
+    let set = settings(parameters)
+    return verifyInternal(&set, publicKey, mu, signature)
+  }
+}
+
+fn signMessage(
+  parameters: MlDsaParameters,
+  privateKey: &[u8],
+  message: &[u8],
+  context: &[u8],
+  randomness: &[u8],
+  signature: &mut [u8],
+) -> Result<(), MlDsaError> {
+  if privateKey.length != parameters.privateKeyLength()
+    || signature.length != parameters.signatureLength() {
+    return Result<(), MlDsaError>.failResult(MlDsaError.InvalidLength)
+  }
+  if context.length > 255 {
+    return Result<(), MlDsaError>.failResult(MlDsaError.ContextTooLong)
+  }
+  let mu = representative(Slice.view<u8>(privateKey, 64, 64), message, context)
+  return MlDsa.signExternalMu(parameters, privateKey, &mu, randomness, &mut signature)
+}
+
+// mu = H(tr || 0 || |ctx| || ctx || M, 64).
+fn representative(tr: &[u8], message: &[u8], context: &[u8]) -> [u8; 64] {
+  let mut hash = Shake256.make()
+  hash.update(tr)
+  let prefix: [u8; 2] = [0, usize.toU8(context.length)]
+  hash.update(&prefix)
+  hash.update(context)
+  hash.update(message)
+  let mut mu: [u8; 64] = [0; 64]
+  hash.finishInto(&mut mu)
+  return mu
+}
+
+struct Settings {
+  k: usize,
+  l: usize,
+  eta: i32,
+  tau: usize,
+  beta: i32,
+  gamma1: i32,
+  gamma2: i32,
+  omega: usize,
+  challengeLength: usize,
+  gamma1Bits: usize,
+  etaBits: usize,
+  highBits: usize,
+}
+
+impl Copy for Settings {}
+
+fn settings(parameters: MlDsaParameters) -> Settings {
+  return match parameters {
+    MlDsaParameters.MlDsa44 => Settings {
+      k: 4, l: 4, eta: 2, tau: 39, beta: 78, gamma1: 131072, gamma2: 95232, omega: 80,
+      challengeLength: 32, gamma1Bits: 18, etaBits: 3, highBits: 6,
+    }
+    MlDsaParameters.MlDsa65 => Settings {
+      k: 6, l: 5, eta: 4, tau: 49, beta: 196, gamma1: 524288, gamma2: 261888, omega: 55,
+      challengeLength: 48, gamma1Bits: 20, etaBits: 4, highBits: 4,
+    }
+    MlDsaParameters.MlDsa87 => Settings {
+      k: 8, l: 7, eta: 2, tau: 60, beta: 120, gamma1: 524288, gamma2: 261888, omega: 75,
+      challengeLength: 64, gamma1Bits: 20, etaBits: 3, highBits: 4,
+    }
+  }
+}
+
+const Q: i32 = 8380417
+
+struct Poly {
+  c: [i32; 256],
+}
+
+impl Copy for Poly {}
+
+fn zeroPoly() -> Poly {
+  return Poly { c: [0; 256] }
+}
+
+// a 2^-32 mod q in (-q, q) for |a| < q 2^31.
+fn montgomeryReduce(a: i64) -> i32 {
+  let t = i32.wrappingMultiply(i64.wrappingToI32(a), 58728449)
+  let lowered = i64.wrappingSubtract(a, i64.wrappingMultiply(i32.toI64(t), 8380417))
+  return i64.wrappingToI32(i64.shiftRight(lowered, 32))
+}
+
+// a mod q in [-6283008, 6283008] for a below 2^31 - 2^22.
+fn reduce32(a: i32) -> i32 {
+  let t = i32.shiftRight(i32.wrappingAdd(a, 4194304), 23)
+  return i32.wrappingSubtract(a, i32.wrappingMultiply(t, Q))
+}
+
+// a + q for a negative a, without a branch.
+fn addModulusIfNegative(a: i32) -> i32 {
+  return i32.wrappingAdd(a, i32.bitAnd(i32.shiftRight(a, 31), Q))
+}
+
+// a mod q in [0, q).
+fn freeze(a: i32) -> i32 {
+  return addModulusIfNegative(reduce32(a))
+}
+
+// zeta^BitRev8(i) 2^32 mod q for zeta = 1753, centered: the factors of the NTT layers.
+fn zetas() -> [i32; 256] {
+  return [
+    -4186625, 25847, -2608894, -518909, 237124, -777960, -876248, 466468, 1826347, 2353451, -359251,
+    -2091905, 3119733, -2884855, 3111497, 2680103, 2725464, 1024112, -1079900, 3585928, -549488,
+    -1119584, 2619752, -2108549, -2118186, -3859737, -1399561, -3277672, 1757237, -19422, 4010497,
+    280005, 2706023, 95776, 3077325, 3530437, -1661693, -3592148, -2537516, 3915439, -3861115,
+    -3043716, 3574422, -2867647, 3539968, -300467, 2348700, -539299, -1699267, -1643818, 3505694,
+    -3821735, 3507263, -2140649, -1600420, 3699596, 811944, 531354, 954230, 3881043, 3900724,
+    -2556880, 2071892, -2797779, -3930395, -1528703, -3677745, -3041255, -1452451, 3475950, 2176455,
+    -1585221, -1257611, 1939314, -4083598, -1000202, -3190144, -3157330, -3632928, 126922, 3412210,
+    -983419, 2147896, 2715295, -2967645, -3693493, -411027, -2477047, -671102, -1228525, -22981,
+    -1308169, -381987, 1349076, 1852771, -1430430, -3343383, 264944, 508951, 3097992, 44288,
+    -1100098, 904516, 3958618, -3724342, -8578, 1653064, -3249728, 2389356, -210977, 759969,
+    -1316856, 189548, -3553272, 3159746, -1851402, -2409325, -177440, 1315589, 1341330, 1285669,
+    -1584928, -812732, -1439742, -3019102, -3881060, -3628969, 3839961, 2091667, 3407706, 2316500,
+    3817976, -3342478, 2244091, -2446433, -3562462, 266997, 2434439, -1235728, 3513181, -3520352,
+    -3759364, -1197226, -3193378, 900702, 1859098, 909542, 819034, 495491, -1613174, -43260,
+    -522500, -655327, -3122442, 2031748, 3207046, -3556995, -525098, -768622, -3595838, 342297,
+    286988, -2437823, 4108315, 3437287, -3342277, 1735879, 203044, 2842341, 2691481, -2590150,
+    1265009, 4055324, 1247620, 2486353, 1595974, -3767016, 1250494, 2635921, -3548272, -2994039,
+    1869119, 1903435, -1050970, -1333058, 1237275, -3318210, -1430225, -451100, 1312455, 3306115,
+    -1962642, -1279661, 1917081, -2546312, -1374803, 1500165, 777191, 2235880, 3406031, -542412,
+    -2831860, -1671176, -1846953, -2584293, -3724270, 594136, -3776993, -2013608, 2432395, 2454455,
+    -164721, 1957272, 3369112, 185531, -1207385, -3183426, 162844, 1616392, 3014001, 810149,
+    1652634, -3694233, -1799107, -3038916, 3523897, 3866901, 269760, 2213111, -975884, 1717735,
+    472078, -426683, 1723600, -1803090, 1910376, -1667432, -1104333, -260646, -3833893, -2939036,
+    -2235985, -420899, -2286327, 183443, -976891, 1612842, -3545687, -554416, 3919660, -48306,
+    -1362209, 3937738, 1400424, -846154, 1976782,
+  ]
+}
+
+// Algorithm 41 of FIPS 204, without reductions between the layers: values grow by less than q
+// per layer from inputs below q.
+fn ntt(poly: &mut Poly) -> () {
+  let factors = zetas()
+  let mut k: usize = 0
+  let mut length: usize = 128
+  while length > 0 {
+    let mut start: usize = 0
+    while start < 256 {
+      k = k + 1
+      let zeta = i32.toI64(factors[k])
+      let mut j = start
+      while j < start + length {
+        let t = montgomeryReduce(i64.wrappingMultiply(zeta, i32.toI64(poly.c[j + length])))
+        let f = poly.c[j]
+        poly.c[j + length] = i32.wrappingSubtract(f, t)
+        poly.c[j] = i32.wrappingAdd(f, t)
+        j = j + 1
+      }
+      start = start + 2 * length
+    }
+    length = length / 2
+  }
+}
+
+// Algorithm 42 of FIPS 204 for a product of Montgomery multiplications: the inputs are reduced
+// first, and the factor 2^64 / 256 mod q undoes the 2^-32 of the products and divides by 256. The
+// outputs are below q in magnitude.
+fn inverseNtt(poly: &mut Poly) -> () {
+  let factors = zetas()
+  let mut index: usize = 0
+  while index < 256 {
+    poly.c[index] = reduce32(poly.c[index])
+    index = index + 1
+  }
+  let mut k: usize = 256
+  let mut length: usize = 1
+  while length < 256 {
+    let mut start: usize = 0
+    while start < 256 {
+      k = k - 1
+      let zeta = i64.wrappingNegate(i32.toI64(factors[k]))
+      let mut j = start
+      while j < start + length {
+        let t = poly.c[j]
+        let other = poly.c[j + length]
+        poly.c[j] = i32.wrappingAdd(t, other)
+        poly.c[j + length] = montgomeryReduce(i64.wrappingMultiply(zeta, i32.toI64(i32.wrappingSubtract(t, other))))
+        j = j + 1
+      }
+      start = start + 2 * length
+    }
+    length = length * 2
+  }
+  index = 0
+  while index < 256 {
+    poly.c[index] = montgomeryReduce(i64.wrappingMultiply(41978, i32.toI64(poly.c[index])))
+    index = index + 1
+  }
+}
+
+// Adds the NTT-domain product of `left` and `right`, times 2^-32, to `sum`.
+fn multiplyAdd(sum: &mut Poly, left: &Poly, right: &Poly) -> () {
+  let mut index: usize = 0
+  while index < 256 {
+    let product = montgomeryReduce(i64.wrappingMultiply(i32.toI64(left.c[index]), i32.toI64(right.c[index])))
+    sum.c[index] = i32.wrappingAdd(sum.c[index], product)
+    index = index + 1
+  }
+}
+
+// The NTT-domain product of `left` and `right` in the normal domain, below q in magnitude.
+fn productOf(left: &Poly, right: &Poly) -> Poly {
+  let mut result = zeroPoly()
+  multiplyAdd(&mut result, left, right)
+  inverseNtt(&mut result)
+  return move result
+}
+
+// Whether a coefficient of `poly` has magnitude at least `bound`. The coefficients are reduced.
+// It may stop early, which reveals only the place of a value that the caller rejects.
+fn exceeds(poly: &Poly, bound: i32) -> bool {
+  let mut index: usize = 0
+  while index < 256 {
+    let value = poly.c[index]
+    let magnitude = i32.wrappingSubtract(value, i32.bitAnd(i32.shiftRight(value, 31), i32.wrappingMultiply(2, value)))
+    if magnitude >= bound {
+      return true
+    }
+    index = index + 1
+  }
+  return false
+}
+
+// RejNTTPoly (Algorithm 30) of SHAKE128(rho || column || row). The input is public.
+fn sampleUniform(rho: &[u8], column: usize, row: usize) -> Poly {
+  let mut xof = Shake128.make()
+  xof.update(rho)
+  let indices: [u8; 2] = [usize.toU8(column), usize.toU8(row)]
+  xof.update(&indices)
+  let mut reader = xof.finish()
+  let mut result = zeroPoly()
+  let mut block: [u8; 168] = [0; 168]
+  let mut count: usize = 0
+  while count < 256 {
+    reader.read(&mut block)
+    let mut at: usize = 0
+    while at < 168 && count < 256 {
+      let value = u32.bitOr(
+        u32.bitOr(u8.toU32(block[at]), u32.shiftLeft(u8.toU32(block[at + 1]), 8)),
+        u32.shiftLeft(u32.bitAnd(u8.toU32(block[at + 2]), 127), 16),
+      )
+      if value < 8380417 {
+        result.c[count] = u32.toI32(value)
+        count = count + 1
+      }
+      at = at + 3
+    }
+  }
+  return move result
+}
+
+// ExpandA (Algorithm 32): entry (row, column) at row * l + column.
+fn expandMatrix(set: &Settings, rho: &[u8]) -> [Poly; 56] {
+  let mut matrix: [Poly; 56] = [zeroPoly(); 56]
+  let mut row: usize = 0
+  while row < set.k {
+    let mut column: usize = 0
+    while column < set.l {
+      matrix[row * set.l + column] = sampleUniform(rho, column, row)
+      column = column + 1
+    }
+    row = row + 1
+  }
+  return matrix
+}
+
+// RejBoundedPoly (Algorithm 31) of SHAKE256(seed || nonce), with coefficients in [-eta, eta].
+fn sampleBounded(seed: &[u8], nonce: usize, eta: i32) -> Poly {
+  let mut xof = Shake256.make()
+  xof.update(seed)
+  let suffix: [u8; 2] = [usize.toU8(nonce % 256), usize.toU8(nonce / 256)]
+  xof.update(&suffix)
+  let mut reader = xof.finish()
+  let mut result = zeroPoly()
+  let mut block: [u8; 136] = [0; 136]
+  let mut count: usize = 0
+  while count < 256 {
+    reader.read(&mut block)
+    let mut at: usize = 0
+    while at < 136 && count < 256 {
+      let low = u8.toI32(u8.bitAnd(block[at], 15))
+      let high = u8.toI32(u8.shiftRight(block[at], 4))
+      count = boundedCoefficient(&mut result, count, low, eta)
+      if count < 256 {
+        count = boundedCoefficient(&mut result, count, high, eta)
+      }
+      at = at + 1
+    }
+  }
+  return move result
+}
+
+// CoeffFromHalfByte (Algorithm 15): stores the coefficient of a half byte if it is accepted.
+fn boundedCoefficient(poly: &mut Poly, count: usize, half: i32, eta: i32) -> usize {
+  if eta == 2 {
+    if half < 15 {
+      poly.c[count] = 2 - half % 5
+      return count + 1
+    }
+    return count
+  }
+  if half < 9 {
+    poly.c[count] = 4 - half
+    return count + 1
+  }
+  return count
+}
+
+// ExpandMask (Algorithm 34) for one polynomial: coefficients in (-gamma1, gamma1].
+fn sampleMask(set: &Settings, seed: &[u8], nonce: usize) -> Poly {
+  let mut xof = Shake256.make()
+  xof.update(seed)
+  let suffix: [u8; 2] = [usize.toU8(nonce % 256), usize.toU8(nonce / 256)]
+  xof.update(&suffix)
+  let mut bytes: [u8; 640] = [0; 640]
+  let length = 32 * set.gamma1Bits
+  xof.finishInto(Slice.viewMut<u8>(&mut bytes, 0, length))
+  let mut result = unpack(Slice.view<u8>(&bytes, 0, length), set.gamma1Bits)
+  let mut index: usize = 0
+  while index < 256 {
+    result.c[index] = i32.wrappingSubtract(set.gamma1, result.c[index])
+    index = index + 1
+  }
+  return move result
+}
+
+// SampleInBall (Algorithm 29): tau coefficients of +1 or -1. The challenge is public.
+fn sampleInBall(set: &Settings, challenge: &[u8]) -> Poly {
+  let mut xof = Shake256.make()
+  xof.update(challenge)
+  let mut reader = xof.finish()
+  let mut block: [u8; 136] = [0; 136]
+  reader.read(&mut block)
+  let mut signs: u64 = 0
+  let mut at: usize = 0
+  while at < 8 {
+    signs = u64.bitOr(signs, u64.shiftLeft(u8.toU64(block[at]), usize.toU64(8 * at)))
+    at = at + 1
+  }
+  let mut result = zeroPoly()
+  let mut i = 256 - set.tau
+  while i < 256 {
+    let mut j: usize = 256
+    while j > i {
+      if at == 136 {
+        reader.read(&mut block)
+        at = 0
+      }
+      j = u8.toUsize(block[at])
+      at = at + 1
+    }
+    result.c[i] = result.c[j]
+    result.c[j] = i32.wrappingSubtract(1, i32.wrappingMultiply(2, u64.toI32(u64.bitAnd(signs, 1))))
+    signs = u64.shiftRight(signs, 1)
+    i = i + 1
+  }
+  return move result
+}
+
+// Writes the 256 values of `poly`, each below 2^bits, as 32 bits bytes.
+fn pack(poly: &Poly, bits: usize, output: &mut [u8]) -> () {
+  let mut buffer: u64 = 0
+  let mut filled: usize = 0
+  let mut at: usize = 0
+  let mut index: usize = 0
+  while index < 256 {
+    buffer = u64.bitOr(buffer, u64.shiftLeft(u32.toU64(i32.wrappingToU32(poly.c[index])), usize.toU64(filled)))
+    filled = filled + bits
+    while filled >= 8 {
+      output[at] = u64.toU8(u64.bitAnd(buffer, 255))
+      buffer = u64.shiftRight(buffer, 8)
+      filled = filled - 8
+      at = at + 1
+    }
+    index = index + 1
+  }
+}
+
+// The 256 values of `bits` bits each in `input`.
+fn unpack(input: &[u8], bits: usize) -> Poly {
+  let mut result = zeroPoly()
+  let mask = u64.wrappingSubtract(u64.shiftLeft(1, usize.toU64(bits)), 1)
+  let mut buffer: u64 = 0
+  let mut filled: usize = 0
+  let mut at: usize = 0
+  let mut index: usize = 0
+  while index < 256 {
+    while filled < bits {
+      buffer = u64.bitOr(buffer, u64.shiftLeft(u8.toU64(input[at]), usize.toU64(filled)))
+      filled = filled + 8
+      at = at + 1
+    }
+    result.c[index] = u64.toI32(u64.bitAnd(buffer, mask))
+    buffer = u64.shiftRight(buffer, usize.toU64(bits))
+    filled = filled - bits
+    index = index + 1
+  }
+  return move result
+}
+
+// `offset` minus each coefficient, the form in which the encodings store signed values.
+fn offsetFrom(poly: &Poly, offset: i32) -> Poly {
+  let mut result = zeroPoly()
+  let mut index: usize = 0
+  while index < 256 {
+    result.c[index] = i32.wrappingSubtract(offset, poly.c[index])
+    index = index + 1
+  }
+  return move result
+}
+
+// Whether every encoded coefficient of s1 and s2 in the private key is at most 2 eta.
+fn secretsInRange(set: &Settings, privateKey: &[u8]) -> bool {
+  let bytes = 32 * set.etaBits
+  let limit = i32.wrappingMultiply(2, set.eta)
+  let mut fine: i32 = 0
+  let mut i: usize = 0
+  while i < set.k + set.l {
+    let values = unpack(Slice.view<u8>(privateKey, 128 + bytes * i, bytes), set.etaBits)
+    let mut index: usize = 0
+    while index < 256 {
+      fine = i32.bitOr(fine, i32.wrappingSubtract(limit, values.c[index]))
+      index = index + 1
+    }
+    i = i + 1
+  }
+  return fine >= 0
+}
+
+// ML-DSA.KeyGen_internal (Algorithm 6).
+fn keyGenerate(set: &Settings, seed: &[u8], publicKey: &mut [u8], privateKey: &mut [u8]) -> () {
+  let k = set.k
+  let l = set.l
+  let mut expand = Shake256.make()
+  expand.update(seed)
+  let sizes: [u8; 2] = [usize.toU8(k), usize.toU8(l)]
+  expand.update(&sizes)
+  let mut expanded: [u8; 128] = [0; 128]
+  expand.finishInto(&mut expanded)
+  let rho = Slice.view<u8>(&expanded, 0, 32)
+  let noise = Slice.view<u8>(&expanded, 32, 64)
+  let matrix = expandMatrix(set, rho)
+  let etaBytes = 32 * set.etaBits
+  let mut secret: [Poly; 7] = [zeroPoly(); 7]
+  let mut i: usize = 0
+  while i < l {
+    let s1 = sampleBounded(noise, i, set.eta)
+    pack(&offsetFrom(&s1, set.eta), set.etaBits, Slice.viewMut<u8>(&mut privateKey, 128 + etaBytes * i, etaBytes))
+    secret[i] = s1
+    ntt(&mut secret[i])
+    i = i + 1
+  }
+  let lowStart = 128 + etaBytes * (k + l)
+  i = 0
+  while i < k {
+    let s2 = sampleBounded(noise, l + i, set.eta)
+    pack(&offsetFrom(&s2, set.eta), set.etaBits, Slice.viewMut<u8>(&mut privateKey, 128 + etaBytes * (l + i), etaBytes))
+    let mut t = zeroPoly()
+    let mut j: usize = 0
+    while j < l {
+      multiplyAdd(&mut t, &matrix[i * l + j], &secret[j])
+      j = j + 1
+    }
+    inverseNtt(&mut t)
+    let mut high = zeroPoly()
+    let mut low = zeroPoly()
+    let mut index: usize = 0
+    while index < 256 {
+      // Power2Round (Algorithm 35).
+      let value = freeze(i32.wrappingAdd(t.c[index], s2.c[index]))
+      let top = i32.shiftRight(i32.wrappingAdd(value, 4095), 13)
+      high.c[index] = top
+      low.c[index] = i32.wrappingSubtract(4096, i32.wrappingSubtract(value, i32.shiftLeft(top, 13)))
+      index = index + 1
+    }
+    pack(&high, 10, Slice.viewMut<u8>(&mut publicKey, 32 + 320 * i, 320))
+    pack(&low, 13, Slice.viewMut<u8>(&mut privateKey, lowStart + 416 * i, 416))
+    i = i + 1
+  }
+  let mut index: usize = 0
+  while index < 32 {
+    publicKey[index] = rho[index]
+    privateKey[index] = rho[index]
+    privateKey[32 + index] = expanded[96 + index]
+    index = index + 1
+  }
+  let mut hash = Shake256.make()
+  hash.update(Slice.view<u8>(&publicKey, 0, publicKey.length))
+  hash.finishInto(Slice.viewMut<u8>(&mut privateKey, 64, 64))
+}
+
+// Decompose (Algorithm 36) of a value in [0, q): the high part, with the low part in `low`.
+fn decompose(set: &Settings, value: i32, low: &mut i32) -> i32 {
+  let mut high = i32.shiftRight(i32.wrappingAdd(value, 127), 7)
+  if set.gamma2 == 261888 {
+    high = i32.shiftRight(i32.wrappingAdd(i32.wrappingMultiply(high, 1025), 2097152), 22)
+    high = i32.bitAnd(high, 15)
+  } else {
+    high = i32.shiftRight(i32.wrappingAdd(i32.wrappingMultiply(high, 11275), 8388608), 24)
+    high = i32.bitXor(high, i32.bitAnd(i32.shiftRight(i32.wrappingSubtract(43, high), 31), high))
+  }
+  let mut rest = i32.wrappingSubtract(value, i32.wrappingMultiply(high, i32.wrappingMultiply(2, set.gamma2)))
+  rest = i32.wrappingSubtract(rest, i32.bitAnd(i32.shiftRight(i32.wrappingSubtract(4190208, rest), 31), Q))
+  low.* = rest
+  return high
+}
+
+// UseHint (Algorithm 40) for a value in [0, q).
+fn useHint(set: &Settings, value: i32, hint: bool) -> i32 {
+  let mut low: i32 = 0
+  let high = decompose(set, value, &mut low)
+  if !hint {
+    return high
+  }
+  if set.gamma2 == 261888 {
+    if low > 0 {
+      return i32.bitAnd(high + 1, 15)
+    }
+    return i32.bitAnd(high - 1, 15)
+  }
+  if low > 0 {
+    if high == 43 {
+      return 0
+    }
+    return high + 1
+  }
+  if high == 0 {
+    return 43
+  }
+  return high - 1
+}
+
+// ML-DSA.Sign_internal (Algorithm 7) for mu. The private key has the right length and range.
+fn signInternal(set: &Settings, privateKey: &[u8], mu: &[u8], randomness: &[u8], signature: &mut [u8]) -> () {
+  let k = set.k
+  let l = set.l
+  let etaBytes = 32 * set.etaBits
+  let matrix = expandMatrix(set, Slice.view<u8>(privateKey, 0, 32))
+  let mut s1: [Poly; 7] = [zeroPoly(); 7]
+  let mut s2: [Poly; 8] = [zeroPoly(); 8]
+  let mut t0: [Poly; 8] = [zeroPoly(); 8]
+  let mut i: usize = 0
+  while i < l {
+    s1[i] = offsetFrom(&unpack(Slice.view<u8>(privateKey, 128 + etaBytes * i, etaBytes), set.etaBits), set.eta)
+    ntt(&mut s1[i])
+    i = i + 1
+  }
+  let lowStart = 128 + etaBytes * (k + l)
+  i = 0
+  while i < k {
+    s2[i] = offsetFrom(&unpack(Slice.view<u8>(privateKey, 128 + etaBytes * (l + i), etaBytes), set.etaBits), set.eta)
+    ntt(&mut s2[i])
+    t0[i] = offsetFrom(&unpack(Slice.view<u8>(privateKey, lowStart + 416 * i, 416), 13), 4096)
+    ntt(&mut t0[i])
+    i = i + 1
+  }
+  let mut seeds = Shake256.make()
+  seeds.update(Slice.view<u8>(privateKey, 32, 32))
+  seeds.update(randomness)
+  seeds.update(mu)
+  let mut maskSeed: [u8; 64] = [0; 64]
+  seeds.finishInto(&mut maskSeed)
+  let challengeLength = set.challengeLength
+  let zBytes = 32 * set.gamma1Bits
+  let highBytes = 32 * set.highBits
+  let mut nonce: usize = 0
+  while true {
+    let mut y: [Poly; 7] = [zeroPoly(); 7]
+    i = 0
+    while i < l {
+      y[i] = sampleMask(set, &maskSeed, nonce + i)
+      i = i + 1
+    }
+    nonce = nonce + l
+    let mut yHat: [Poly; 7] = [zeroPoly(); 7]
+    i = 0
+    while i < l {
+      yHat[i] = y[i]
+      ntt(&mut yHat[i])
+      i = i + 1
+    }
+    let mut highs: [Poly; 8] = [zeroPoly(); 8]
+    let mut lows: [Poly; 8] = [zeroPoly(); 8]
+    let mut encodedHigh: [u8; 1536] = [0; 1536]
+    i = 0
+    while i < k {
+      let mut w = zeroPoly()
+      let mut j: usize = 0
+      while j < l {
+        multiplyAdd(&mut w, &matrix[i * l + j], &yHat[j])
+        j = j + 1
+      }
+      inverseNtt(&mut w)
+      let mut index: usize = 0
+      while index < 256 {
+        let mut low: i32 = 0
+        highs[i].c[index] = decompose(set, addModulusIfNegative(w.c[index]), &mut low)
+        lows[i].c[index] = low
+        index = index + 1
+      }
+      pack(&highs[i], set.highBits, Slice.viewMut<u8>(&mut encodedHigh, highBytes * i, highBytes))
+      i = i + 1
+    }
+    let mut commit = Shake256.make()
+    commit.update(mu)
+    commit.update(Slice.view<u8>(&encodedHigh, 0, highBytes * k))
+    let mut challenge: [u8; 64] = [0; 64]
+    commit.finishInto(Slice.viewMut<u8>(&mut challenge, 0, challengeLength))
+    let mut c = sampleInBall(set, Slice.view<u8>(&challenge, 0, challengeLength))
+    ntt(&mut c)
+    let mut rejected = false
+    let mut z: [Poly; 7] = [zeroPoly(); 7]
+    i = 0
+    while i < l && !rejected {
+      let product = productOf(&c, &s1[i])
+      let mut index: usize = 0
+      while index < 256 {
+        z[i].c[index] = reduce32(i32.wrappingAdd(y[i].c[index], product.c[index]))
+        index = index + 1
+      }
+      rejected = exceeds(&z[i], i32.wrappingSubtract(set.gamma1, set.beta))
+      i = i + 1
+    }
+    i = 0
+    while i < k && !rejected {
+      let product = productOf(&c, &s2[i])
+      let mut index: usize = 0
+      while index < 256 {
+        lows[i].c[index] = reduce32(i32.wrappingSubtract(lows[i].c[index], product.c[index]))
+        index = index + 1
+      }
+      rejected = exceeds(&lows[i], i32.wrappingSubtract(set.gamma2, set.beta))
+      i = i + 1
+    }
+    let mut hints: [u8; 84] = [0; 84]
+    let mut count: usize = 0
+    i = 0
+    while i < k && !rejected {
+      let product = productOf(&c, &t0[i])
+      rejected = exceeds(&product, set.gamma2)
+      let mut index: usize = 0
+      while index < 256 && !rejected {
+        // MakeHint (Algorithm 39) in the form of the reference code, on w0 - c s2 + c t0.
+        let low = i32.wrappingAdd(lows[i].c[index], product.c[index])
+        let high = highs[i].c[index]
+        if low > set.gamma2 || low < 0 - set.gamma2 || (low == 0 - set.gamma2 && high != 0) {
+          if count == set.omega {
+            rejected = true
+          } else {
+            hints[count] = usize.toU8(index)
+            count = count + 1
+          }
+        }
+        index = index + 1
+      }
+      hints[set.omega + i] = usize.toU8(count)
+      i = i + 1
+    }
+    if !rejected {
+      let mut index: usize = 0
+      while index < challengeLength {
+        signature[index] = challenge[index]
+        index = index + 1
+      }
+      i = 0
+      while i < l {
+        pack(&offsetFrom(&z[i], set.gamma1), set.gamma1Bits, Slice.viewMut<u8>(&mut signature, challengeLength + zBytes * i, zBytes))
+        i = i + 1
+      }
+      let hintStart = challengeLength + zBytes * l
+      index = 0
+      while index < set.omega + k {
+        signature[hintStart + index] = hints[index]
+        index = index + 1
+      }
+      return ()
+    }
+  }
+}
+
+// ML-DSA.Verify_internal (Algorithm 8). The lengths are right.
+fn verifyInternal(set: &Settings, publicKey: &[u8], mu: &[u8], signature: &[u8]) -> bool {
+  let k = set.k
+  let l = set.l
+  let challengeLength = set.challengeLength
+  let zBytes = 32 * set.gamma1Bits
+  let hintStart = challengeLength + zBytes * l
+  // HintBitUnpack (Algorithm 21).
+  let mut hinted: [bool; 2048] = [false; 2048]
+  let mut position: usize = 0
+  let mut i: usize = 0
+  while i < k {
+    let limit = u8.toUsize(signature[hintStart + set.omega + i])
+    if limit < position || limit > set.omega {
+      return false
+    }
+    let first = position
+    while position < limit {
+      let index = u8.toUsize(signature[hintStart + position])
+      if position > first && u8.toUsize(signature[hintStart + position - 1]) >= index {
+        return false
+      }
+      hinted[256 * i + index] = true
+      position = position + 1
+    }
+    i = i + 1
+  }
+  while position < set.omega {
+    if signature[hintStart + position] != 0 {
+      return false
+    }
+    position = position + 1
+  }
+  let mut z: [Poly; 7] = [zeroPoly(); 7]
+  i = 0
+  while i < l {
+    z[i] = offsetFrom(&unpack(Slice.view<u8>(signature, challengeLength + zBytes * i, zBytes), set.gamma1Bits), set.gamma1)
+    if exceeds(&z[i], i32.wrappingSubtract(set.gamma1, set.beta)) {
+      return false
+    }
+    ntt(&mut z[i])
+    i = i + 1
+  }
+  let challenge = Slice.view<u8>(signature, 0, challengeLength)
+  let mut c = sampleInBall(set, challenge)
+  ntt(&mut c)
+  let matrix = expandMatrix(set, Slice.view<u8>(publicKey, 0, 32))
+  let highBytes = 32 * set.highBits
+  let mut encodedHigh: [u8; 1536] = [0; 1536]
+  i = 0
+  while i < k {
+    let mut w = zeroPoly()
+    let mut j: usize = 0
+    while j < l {
+      multiplyAdd(&mut w, &matrix[i * l + j], &z[j])
+      j = j + 1
+    }
+    let mut t1 = unpack(Slice.view<u8>(publicKey, 32 + 320 * i, 320), 10)
+    let mut index: usize = 0
+    while index < 256 {
+      t1.c[index] = i32.shiftLeft(t1.c[index], 13)
+      index = index + 1
+    }
+    ntt(&mut t1)
+    let mut negated = zeroPoly()
+    multiplyAdd(&mut negated, &c, &t1)
+    index = 0
+    while index < 256 {
+      w.c[index] = i32.wrappingSubtract(reduce32(w.c[index]), reduce32(negated.c[index]))
+      index = index + 1
+    }
+    inverseNtt(&mut w)
+    let mut high = zeroPoly()
+    index = 0
+    while index < 256 {
+      high.c[index] = useHint(set, addModulusIfNegative(w.c[index]), hinted[256 * i + index])
+      index = index + 1
+    }
+    pack(&high, set.highBits, Slice.viewMut<u8>(&mut encodedHigh, highBytes * i, highBytes))
+    i = i + 1
+  }
+  let mut commit = Shake256.make()
+  commit.update(mu)
+  commit.update(Slice.view<u8>(&encodedHigh, 0, highBytes * k))
+  let mut expected: [u8; 64] = [0; 64]
+  commit.finishInto(Slice.viewMut<u8>(&mut expected, 0, challengeLength))
+  let mut difference: u8 = 0
+  let mut index: usize = 0
+  while index < challengeLength {
+    difference = u8.bitOr(difference, u8.bitXor(expected[index], challenge[index]))
+    index = index + 1
+  }
+  return difference == 0
+}
