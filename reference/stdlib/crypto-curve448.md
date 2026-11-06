@@ -14,7 +14,7 @@ secret with `silk.crypto.hkdf`. For the more common 128-bit level, use `silk.cry
 ## Details
 Secrets, public keys, and shared secrets are 56 bytes, little-endian. A secret is clamped as RFC
 7748 says, so all 56-byte values are valid. The field is the integers modulo
-`p = 2^448 - 2^224 - 1`, held as sixteen 28-bit limbs, and every step on a secret runs in
+`p = 2^448 - 2^224 - 1`, held as eight 56-bit limbs, and every step on a secret runs in
 constant time. Nothing allocates. Use `silk.crypto.okp_key` to read and write the keys in PKCS #8
 and SubjectPublicKeyInfo.
 
