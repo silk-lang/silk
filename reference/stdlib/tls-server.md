@@ -44,9 +44,10 @@ server takes no input while output is pending. [`ServerLimits`](#ServerLimits) b
   [`Server.make`](#Server.impl.make) is permanent for the server.
 - `OutOfMemoryError` if the `Allocator` fails.
 
-With [`ClientAuth`](#ClientAuth) `Request`, the server uses only TLS 1.3. It sends a CertificateRequest, checks the client's
+With [`ClientAuth`](#ClientAuth) `Request`, the server sends a CertificateRequest, checks the client's
 CertificateVerify with its leaf's key, and validates the client's chain against your trust
-anchors for the `ClientAuth` purpose. [`Server.clientCertificateStatus`](#Server.impl.clientCertificateStatus) and
+anchors for the `ClientAuth` purpose. In TLS 1.2 the request lists no certificate authorities,
+and the client may sign with ECDSA or RSA under SHA-256 or SHA-384. [`Server.clientCertificateStatus`](#Server.impl.clientCertificateStatus) and
 [`Server.clientCertificates`](#Server.impl.clientCertificates) tell you the result.
 
 With [`TicketPolicy`](#TicketPolicy) `Issue`, the server sends NewSessionTicket messages after the client's
@@ -518,7 +519,6 @@ pub versions: VersionPolicy
 ```
 
 The TLS versions the server accepts. `VersionPolicy.defaults()` accepts TLS 1.2 and TLS 1.3.
-With [`ClientAuth`](#ClientAuth) `Request`, the server uses only TLS 1.3.
 
 <a id="ServerConfig.limits"></a>
 

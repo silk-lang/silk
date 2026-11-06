@@ -40,9 +40,10 @@
 //!   [`Server.make`] is permanent for the server.
 //! - `OutOfMemoryError` if the `Allocator` fails.
 //!
-//! With [`ClientAuth`] `Request`, the server uses only TLS 1.3. It sends a CertificateRequest, checks the client's
+//! With [`ClientAuth`] `Request`, the server sends a CertificateRequest, checks the client's
 //! CertificateVerify with its leaf's key, and validates the client's chain against your trust
-//! anchors for the `ClientAuth` purpose. [`Server.clientCertificateStatus`] and
+//! anchors for the `ClientAuth` purpose. In TLS 1.2 the request lists no certificate authorities,
+//! and the client may sign with ECDSA or RSA under SHA-256 or SHA-384. [`Server.clientCertificateStatus`] and
 //! [`Server.clientCertificates`] tell you the result.
 //!
 //! With [`TicketPolicy`] `Issue`, the server sends NewSessionTicket messages after the client's
@@ -339,7 +340,6 @@ pub struct ServerConfig<'a> {
   /// Whether the server issues session tickets and resumes sessions from them.
   pub tickets: TicketPolicy<'a>,
   /// The TLS versions the server accepts. `VersionPolicy.defaults()` accepts TLS 1.2 and TLS 1.3.
-  /// With [`ClientAuth`] `Request`, the server uses only TLS 1.3.
   pub versions: VersionPolicy,
   /// Finite connection limits.
   pub limits: ServerLimits,
@@ -865,7 +865,9 @@ enum ServerState {
   AwaitClientCertificateVerify,
   AwaitClientFinished,
   Traffic,
+  Tls12AwaitClientCertificate,
   Tls12AwaitKeyExchange,
+  Tls12AwaitClientCertificateVerify,
   Tls12AwaitCcs,
   Tls12AwaitFinished,
   Tls12FinishedPending,
@@ -1047,6 +1049,7 @@ pub struct Server {
   terminal: Option<ServerError>,
   versions: VersionPolicy,
   tls12: bool,
+  tls12VerifyExpected: bool,
   clientRandom: [u8; 32],
   serverRandom: [u8; 32],
   share: ServerShare,
@@ -1256,6 +1259,7 @@ impl Server {
         terminal: Option<ServerError>.none(),
         versions: config.versions,
         tls12: false,
+        tls12VerifyExpected: false,
         clientRandom: zero32(),
         serverRandom: zero32(),
         share: ServerShare.None,
@@ -2139,6 +2143,9 @@ fn completePending(server: &mut Server) -> Result<(), ServerError> {
       return queueFlightChunk(&mut server.*, PendingKind.Tls12Flight)
     }
     server.state = ServerState.Tls12AwaitKeyExchange
+    if server.clientAuthMode != ClientAuthMode.Off {
+      server.state = ServerState.Tls12AwaitClientCertificate
+    }
     return ok()
   }
   if kind == PendingKind.Tls12Ccs {
@@ -2496,8 +2503,14 @@ effect fn dispatchHandshake(
   if server.state == ServerState.AwaitClientFinished && messageType == 20 {
     return run handleClientFinished(&mut server.*, messageLength)
   }
+  if server.state == ServerState.Tls12AwaitClientCertificate && messageType == 11 {
+    return run handleClientCertificate(&mut server.*, messageLength)
+  }
   if server.state == ServerState.Tls12AwaitKeyExchange && messageType == 16 {
     return handleClientKeyExchange(&mut server.*, messageLength)
+  }
+  if server.state == ServerState.Tls12AwaitClientCertificateVerify && messageType == 15 {
+    return handleClientCertificateVerify(&mut server.*, messageLength)
   }
   if server.state == ServerState.Tls12AwaitFinished && messageType == 20 {
     return handleClientFinishedTls12(&mut server.*, messageLength)
@@ -2623,9 +2636,8 @@ effect fn handleClientHello(server: &mut Server, messageLength: usize, retry: bo
     Result<ParsedClientHello, ServerError>.Success { value } => move value
   }
   if !parsed.tls13 || !server.versions.allows(TlsVersion.Tls13) {
-    // TLS 1.2 has no HelloRetryRequest, and the server checks client certificates only in TLS 1.3.
-    if !retry && parsed.tls12 && server.versions.allows(TlsVersion.Tls12)
-      && server.clientAuthMode == ClientAuthMode.Off {
+    // TLS 1.2 has no HelloRetryRequest.
+    if !retry && parsed.tls12 && server.versions.allows(TlsVersion.Tls12) {
       return run handleClientHelloTls12(&mut server.*, messageLength, &parsed)
     }
     return failure(ServerError.Negotiation { failure: NegotiationFailure.Version })
@@ -3563,10 +3575,11 @@ fn queueHelloRetry(server: &mut Server, messageLength: usize) -> Result<(), Serv
 fn queueScratch(server: &mut Server, length: usize) -> Result<(), ServerError> {
   // Every caller wrote `scratch[0..length]`, and `length <= SCRATCH_LENGTH`.
   let message = unsafe RawBuffer.view<u8>(&server.scratch, 0, length)
-  if server.secretLength == 48 {
-    server.transcript384.update(message)
-  } else {
+  if server.tls12 || server.secretLength != 48 {
     server.transcript256.update(message)
+  }
+  if server.tls12 || server.secretLength == 48 {
+    server.transcript384.update(message)
   }
   let queued = TlsRecordSender.queueRecord(&mut server.sender, ContentType.Handshake, message)
   return match move queued {
@@ -3583,24 +3596,28 @@ fn queueScratch(server: &mut Server, length: usize) -> Result<(), ServerError> {
 fn updateTranscriptHandshake(server: &mut Server, length: usize) -> () {
   // Every caller passes the length of the complete message in `handshake[0..handshakeLength]`.
   let message = unsafe RawBuffer.view<u8>(&server.handshake, 0, length)
-  if server.secretLength == 48 {
-    server.transcript384.update(message)
-  } else {
+  if server.tls12 || server.secretLength != 48 {
     server.transcript256.update(message)
+  }
+  if server.tls12 || server.secretLength == 48 {
+    server.transcript384.update(message)
   }
   return ()
 }
 
+// TLS 1.2 keeps both transcripts, since a client CertificateVerify can sign under either hash.
 fn updateTranscriptFlight(server: &mut Server, offset: usize, length: usize) -> () {
   // Every caller passes a message that `buildFlight` wrote within the flight buffer.
   let message = unsafe RawBuffer.view<u8>(&server.flight, offset, length)
-  if server.secretLength == 48 {
-    server.transcript384.update(message)
-  } else {
+  if server.tls12 || server.secretLength != 48 {
     server.transcript256.update(message)
+  }
+  if server.tls12 || server.secretLength == 48 {
+    server.transcript384.update(message)
   }
   return ()
 }
+
 
 fn transcriptHash(server: &Server) -> [u8; 48] {
   if server.secretLength == 48 {
@@ -3976,34 +3993,47 @@ effect fn buildCertificateMessages(server: &mut Server, cursor: &mut usize) -> R
 // profile admits no Ed25519 keys, so the server does not ask for ed25519.
 const CLIENT_SCHEMES: [usize; 5] = [1027, 1283, 2052, 2053, 2054]
 
+// The schemes that a TLS 1.2 client CertificateVerify may sign with. Each hashes with SHA-256 or
+// SHA-384, the two transcripts that TLS 1.2 keeps, and RSA keys may also use PKCS #1 v1.5.
+const CLIENT_SCHEMES_TLS12: [usize; 6] = [1027, 1283, 2052, 2053, 1025, 1281]
+
 effect fn handleClientCertificate(server: &mut Server, messageLength: usize) -> Result<
   (),
   ServerError
 >
   ! OutOfMemoryError
   ? &mut Allocator {
-  if messageLength < 8 {
+  // TLS 1.3 has a request context and extensions for each entry (RFC 8446 section 4.4.2), and
+  // TLS 1.2 has neither (RFC 5246 section 7.4.6).
+  let tls12 = server.tls12
+  let mut listStart: usize = 5
+  let mut entryTrailer: usize = 2
+  if tls12 {
+    listStart = 4
+    entryTrailer = 0
+  }
+  if messageLength < listStart + 3 {
     return violation(ServerProtocolReason.ClientCertificate)
   }
 
   // The request context must be empty, as the CertificateRequest's was.
-  if readU8Raw(&server.handshake, 4) != 0 {
+  if !tls12 && readU8Raw(&server.handshake, 4) != 0 {
     return violation(ServerProtocolReason.ClientCertificate)
   }
-  let listLength = readU24Raw(&server.handshake, 5)
-  if listLength + 8 != messageLength {
+  let listLength = readU24Raw(&server.handshake, listStart)
+  if listLength + listStart + 3 != messageLength {
     return violation(ServerProtocolReason.ClientCertificate)
   }
   let limits = server.limits
-  let mut cursor: usize = 8
+  let mut cursor: usize = listStart + 3
   let mut total = usize.ZERO
   while cursor < messageLength {
-    if messageLength - cursor < 5 {
+    if messageLength - cursor < 3 + entryTrailer {
       return violation(ServerProtocolReason.ClientCertificate)
     }
     let derLength = readU24Raw(&server.handshake, cursor)
     cursor = cursor + 3
-    if derLength == 0 || derLength > messageLength - cursor - 2 {
+    if derLength == 0 || derLength > messageLength - cursor - entryTrailer {
       return violation(ServerProtocolReason.ClientCertificate)
     }
     if List<Certificate>.length(&server.clientChain) >= limits.clientCertificates {
@@ -4035,6 +4065,7 @@ effect fn handleClientCertificate(server: &mut Server, messageLength: usize) -> 
     run List<Certificate>.append(&mut server.clientChain, move certificate)
     total = total + derLength
     cursor = cursor + derLength
+    if tls12 { continue }
     let extensionLength = readU16Raw(&server.handshake, cursor)
     cursor = cursor + 2
     if extensionLength > limits.extensionBytes {
@@ -4059,6 +4090,9 @@ effect fn handleClientCertificate(server: &mut Server, messageLength: usize) -> 
     }
     server.clientStatus = ClientCertificateStatus.Absent
     server.state = ServerState.AwaitClientFinished
+    if tls12 {
+      server.state = ServerState.Tls12AwaitKeyExchange
+    }
     return ok()
   }
   let anchors = TrustSnapshot.anchors(&server.clientTrust)
@@ -4082,6 +4116,11 @@ effect fn handleClientCertificate(server: &mut Server, messageLength: usize) -> 
   }
   server.clientStatus = move status
   server.state = ServerState.AwaitClientCertificateVerify
+  if tls12 {
+    // The client's CertificateVerify follows its ClientKeyExchange.
+    server.tls12VerifyExpected = true
+    server.state = ServerState.Tls12AwaitKeyExchange
+  }
   return ok()
 }
 
@@ -4096,6 +4135,9 @@ fn handleClientCertificateVerify(server: &mut Server, messageLength: usize) -> R
   let signatureLength = readU16Raw(&server.handshake, 6)
   if signatureLength == 0 || signatureLength + 8 != messageLength {
     return violation(ServerProtocolReason.ClientCertificate)
+  }
+  if server.tls12 {
+    return handleClientCertificateVerifyTls12(&mut server.*, messageLength, scheme, signatureLength)
   }
   let mut offered = false
   let mut index = usize.ZERO
@@ -4330,6 +4372,63 @@ effect fn buildTickets(server: &mut Server, resumption: &[u8; 48]) -> Result<(),
 
 // The client certificate status that a ticket carries: 0 for none requested, 1 for absent, 2 for
 // trusted, and 3 for untrusted.
+// A TLS 1.2 CertificateVerify signs the hash of the handshake messages through
+// ClientKeyExchange under the scheme's hash (RFC 5246 section 7.4.8).
+fn handleClientCertificateVerifyTls12(
+  server: &mut Server,
+  messageLength: usize,
+  scheme: usize,
+  signatureLength: usize,
+) -> Result<(), ServerError> {
+  let mut offered = false
+  let mut index = usize.ZERO
+  while index < CLIENT_SCHEMES_TLS12.length {
+    if CLIENT_SCHEMES_TLS12[index] == scheme {
+      offered = true
+    }
+    index = index + usize.ONE
+  }
+  if !offered {
+    return failure(
+      ServerError.ClientCertificateVerify { error: SignatureFailure.UnsupportedScheme },
+    )
+  }
+  let mut digest = zero48()
+  let mut digestLength: usize = 32
+  if wideDigest(scheme) {
+    digest = server.transcript384.checkpoint()
+    digestLength = 48
+  } else {
+    let short = server.transcript256.checkpoint()
+    digest = fixed48(&short)
+  }
+  // `8 + signatureLength == messageLength` keeps the signature within the complete message.
+  let signature = unsafe RawBuffer.view<u8>(&server.handshake, 8, signatureLength)
+  let certificates = List<Certificate>.asSlice(&server.clientChain)
+  let verified = HandshakeSignature.verifyDigest(
+    &certificates[0],
+    scheme,
+    Slice.view<u8>(&digest, 0, digestLength),
+    signature,
+  )
+  drop signature
+  if let Result<(), SignatureFailure>.Failure { error } = move verified {
+    return failure(ServerError.ClientCertificateVerify { error: error })
+  }
+  updateTranscriptHandshake(&mut server.*, messageLength)
+  server.tls12VerifyExpected = false
+  server.state = ServerState.Tls12AwaitCcs
+  return ok()
+}
+
+// Whether a TLS 1.2 CertificateVerify scheme hashes with SHA-384.
+fn wideDigest(scheme: usize) -> bool {
+  return match HandshakeSignature.digestLength(scheme) {
+    Option<usize>.Some { value } => value == 48
+    Option<usize>.None => false
+  }
+}
+
 fn statusKind(status: &ClientCertificateStatus) -> u8 {
   return match &status.* {
     ClientCertificateStatus.NotRequested => 0
@@ -4728,6 +4827,25 @@ effect fn buildTls12Flight(server: &mut Server, renegotiation: bool, pointFormat
   setU24(&mut server.flight, keyExchangeStart + usize.ONE, cursor - keyExchangeStart - HANDSHAKE_HEADER_LENGTH)
   updateTranscriptFlight(&mut server.*, keyExchangeStart, cursor - keyExchangeStart)
 
+  // CertificateRequest: the certificate types rsa_sign and ecdsa_sign, the schemes that
+  // CertificateVerify can sign by digest, and no certificate authorities.
+  if server.clientAuthMode != ClientAuthMode.Off {
+    let requestStart = cursor
+    putU8(&mut server.flight, &mut cursor, 13)
+    putU24(&mut server.flight, &mut cursor, 1 + 2 + 2 + 2 * CLIENT_SCHEMES_TLS12.length + 2)
+    putU8(&mut server.flight, &mut cursor, 2)
+    putU8(&mut server.flight, &mut cursor, 1)
+    putU8(&mut server.flight, &mut cursor, 64)
+    putU16(&mut server.flight, &mut cursor, 2 * CLIENT_SCHEMES_TLS12.length)
+    let mut schemeIndex = usize.ZERO
+    while schemeIndex < CLIENT_SCHEMES_TLS12.length {
+      putU16(&mut server.flight, &mut cursor, CLIENT_SCHEMES_TLS12[schemeIndex])
+      schemeIndex = schemeIndex + usize.ONE
+    }
+    putU16(&mut server.flight, &mut cursor, 0)
+    updateTranscriptFlight(&mut server.*, requestStart, cursor - requestStart)
+  }
+
   // ServerHelloDone.
   let doneStart = cursor
   putU8(&mut server.flight, &mut cursor, 14)
@@ -4816,6 +4934,9 @@ fn handleClientKeyExchange(server: &mut Server, messageLength: usize) -> Result<
   server.masterSecret = master
   server.tls12Keys = TlsPrf.keys(suite, &master, &clientRandom, &serverRandom)
   server.state = ServerState.Tls12AwaitCcs
+  if server.tls12VerifyExpected {
+    server.state = ServerState.Tls12AwaitClientCertificateVerify
+  }
   return ok()
 }
 

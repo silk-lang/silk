@@ -307,6 +307,43 @@ with the scheme rules of `version`.
   `version` does not allow, or that does not fit the key.
 - `Ecdsa`, `EcdsaP384`, `Rsa`, or `Ed25519` for a key or a signature that is not valid.
 
+<a id="HandshakeSignature.impl.digestLength"></a>
+
+### Associated function `digestLength`
+
+```silk
+pub fn digestLength(scheme: usize) -> Option<usize>
+```
+
+Returns the digest length of a scheme that TLS 1.2 CertificateVerify signs by digest with
+[`SigningKey.signDigest`](#SigningKey.impl.signDigest) and [`HandshakeSignature.verifyDigest`](#HandshakeSignature.impl.verifyDigest): 32 for
+`ecdsa_secp256r1_sha256`, `rsa_pss_rsae_sha256`, and `rsa_pkcs1_sha256`, and 48 for
+`ecdsa_secp384r1_sha384`, `rsa_pss_rsae_sha384`, and `rsa_pkcs1_sha384`. Returns `None` for
+any other scheme.
+
+<a id="HandshakeSignature.impl.verifyDigest"></a>
+
+### Associated function `verifyDigest`
+
+```silk
+pub fn verifyDigest(
+    certificate: &Certificate,
+    scheme: usize,
+    digest: &[u8],
+    signature: &[u8],
+  ) -> Result<(), SignatureFailure>
+```
+
+Checks that `signature` signs `digest` under `scheme` with the public key of `certificate`,
+as a TLS 1.2 CertificateVerify does. `digest` is the hash of the handshake messages under the
+hash of `scheme`, which must be one that [`HandshakeSignature.digestLength`](#HandshakeSignature.impl.digestLength) knows. An ECDSA
+scheme names only its hash in TLS 1.2, so either curve may sign with either.
+
+#### Errors
+- `UnsupportedScheme` for another scheme, or a digest of the wrong length.
+- `KeyMismatch` for a scheme that does not fit the key.
+- `Ecdsa`, `EcdsaP384`, or `Rsa` for a key or a signature that is not valid.
+
 <a id="SchemeSet"></a>
 
 ## `SchemeSet`
@@ -592,6 +629,31 @@ bytes always fits.
 
 #### Errors
 - `UnsupportedScheme` for a scheme that this key does not sign with.
+- `OutputTooShort` when `output` cannot hold the signature.
+- `Rsa` when RSA signing fails.
+
+<a id="SigningKey.impl.signDigest"></a>
+
+### Method `signDigest`
+
+```silk
+pub effect fn signDigest(self: &Self, scheme: usize, digest: &[u8], output: &mut [u8]) -> Result<
+    usize,
+    SigningError
+  >
+  ? &mut Random
+```
+
+Signs a TLS 1.2 CertificateVerify `digest`, the hash of the handshake messages under the
+hash of `scheme`, writes the signature to the start of `output`, and returns its length.
+
+`scheme` is one of `ecdsa_secp256r1_sha256` and `ecdsa_secp384r1_sha384` for the key's own
+curve, `rsa_pss_rsae_sha256`, `rsa_pss_rsae_sha384`, `rsa_pkcs1_sha256`, or
+`rsa_pkcs1_sha384`. [`HandshakeSignature.digestLength`](#HandshakeSignature.impl.digestLength) gives the digest length.
+
+#### Errors
+- `UnsupportedScheme` for another scheme, a scheme that this key does not sign with, a digest
+  of the wrong length, or an Ed25519 key, which signs only whole messages.
 - `OutputTooShort` when `output` cannot hold the signature.
 - `Rsa` when RSA signing fails.
 
