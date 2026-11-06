@@ -407,3 +407,42 @@ writing its output directory, so it has no network at all. Any other host has no
 refuses tool steps unless the root manifest sets
 `[build].unsandboxed-tools = true`; each build that then runs a step prints a warning naming it.
 `SILK_NO_TOOL_SANDBOX` set makes a host behave as one without a sandbox.
+
+## PROFILE-011 — Project templates
+
+`silk init [path] --template <template>` (or `-t <template>`) creates the project from one
+directory of a GitHub repository instead of the minimal package. The template is written
+`<owner>/<repository>[/<directory>...][@<revision>]`:
+
+- One segment alone names a directory of the official examples: `silk init -t ui` is
+  `silk init -t silk-lang/examples/ui`.
+- Two segments name a repository whose root is the template, such as `julia-script/starter`.
+- More segments name a directory inside the repository, such as `julia-script/starters/cli`.
+- `@<revision>` picks a branch, a tag or a full commit hash; without it the default branch is used.
+
+The repository is fetched with the `git` on `PATH`, without history, into a scratch directory
+below `$SILK_HOME/git` (`$HOME/.silk/git` when `SILK_HOME` is unset) that is removed afterwards.
+The template's directory must hold a `silk.toml` with a `[package]` or a `[workspace]` table.
+Every file in it is written to the project directory, keeping executable bits and symbolic links;
+a file that already exists there refuses the whole template before anything is written. For a
+package, the new manifest gets the package name (`--name`, or else the directory's name) and this
+compiler's release as `silk-version`, and a package outside a workspace gets `/build/` in its
+`.gitignore`. A package created inside a workspace becomes one of its members, as `silk init`
+makes it. A workspace template takes no `--name`, and only a `silk-version` it pins is updated.
+`--template` cannot be combined with `--lib` or `--workspace`.
+
+A template adjusts the new project with `[[post-init]]` entries in its `silk.toml`. `run` is the
+command line, spelled as a `[[generate]]` entry's: the program, then its arguments, where a
+program with a `/` is a path below the template's directory and a bare name is searched on `PATH`.
+
+```toml
+[[post-init]]
+run = ["scripts/post-init.sh"]
+```
+
+The entries are removed from the new manifest before they run, so they run once. They run in order
+in the project directory with the caller's environment, after every file is written. A failing
+entry stops the rest, and `silk init` then removes every file and directory it created, restores a
+`.gitignore` it changed and exits 1. A template it cannot fetch or use also exits 1; a malformed
+template or a file in the way exits 2. Builds never run an entry; they only refuse a malformed
+one, naming its manifest line.
