@@ -94,6 +94,10 @@ import silk.collections.slice { Slice }
 import silk.simd.simd
 import silk.simd.mask16
 import silk.simd.u8x16
+import silk.simd.u8x32
+import silk.simd.mask32
+import silk.simd.cpu { CpuFeatures }
+import silk.core.target { Arch, Target }
 
 /// One key and value of a JSON object.
 pub struct JsonEntry {
@@ -1450,6 +1454,20 @@ impl JsonDocument {
   ///   [`Json.parse`] reports.
   /// - `OutOfMemoryError` if the `Allocator` cannot supply the buffers.
   pub effect fn parse(bytes: &[u8]) -> JsonDocument ! JsonError | OutOfMemoryError ? &mut Allocator {
+    static if Target.arch() == Arch.X86_64 {
+      if CpuFeatures.available("avx2") && CpuFeatures.available("bmi") && CpuFeatures.available("popcnt") {
+        let inside = unsafe wideTextCheck(bytes)
+        if inside != usize.ZERO {
+          // Room for every string at once, so they are copied 32 bytes at a time without a check.
+          let mut wide = JsonDocument { slots: List<DocumentSlot>.make(), text: run Bytes.zeroed(inside + 64) }
+          run List<DocumentSlot>.reserve(&mut wide.slots, bytes.length / 8 + 4)
+          let mut wideKeys = List<u64>.make()
+          let parsed = run unsafe wideParse(bytes, &mut wide, &mut wideKeys)
+          if parsed { return move wide }
+          drop wide
+        }
+      }
+    }
     let mut cursor = TreeCursor { index: usize.ZERO, depth: usize.ZERO, failed: false }
     let mut document = JsonDocument { slots: List<DocumentSlot>.make(), text: Bytes.make() }
     // A value takes at least 2 bytes of the text but for a lone digit, and the decoded strings are
@@ -1820,6 +1838,433 @@ fn closeSlot(document: &mut JsonDocument, open: usize, kind: u64, count: usize) 
   let end = List<DocumentSlot>.length(&document.slots)
   List<DocumentSlot>.set(&mut document.slots, open,
     DocumentSlot { info: u64.bitOr(kind, u64.shiftLeft(usize.toU64(count), 8)), payload: usize.toU64(end) })
+}
+
+// Parsing on AVX2: `wideTextCheck` checks the UTF-8 of the whole text 64 bytes at a time and counts
+// the bytes inside strings, so `wideParse` then only scans each string for its end and copies it,
+// 32 bytes at a time, into a buffer of that size. `JsonDocument.parse` calls them when
+// `CpuFeatures` finds the features; any failure falls back to the parser above.
+static if Target.arch() == Arch.X86_64 {
+  @features("avx2", "bmi", "popcnt")
+  @inlineAlways
+  unsafe fn wideUtf8Errors(lanes: simd<u8, 32>, previous: simd<u8, 32>) -> simd<u8, 32> {
+    let one = u8x32.shuffle(previous, lanes, [31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
+      47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62])
+    let two = u8x32.shuffle(previous, lanes, [30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
+      46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61])
+    let three = u8x32.shuffle(previous, lanes, [29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
+      45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60])
+    let four = u8x32.splat(4)
+    let firstHigh = Intrinsic.x86ShuffleBytes<simd<u8, 32>>(u8x32.fromArray([2, 2, 2, 2, 2, 2, 2, 2, 128, 128, 128, 128, 33, 1, 21, 73,
+      2, 2, 2, 2, 2, 2, 2, 2, 128, 128, 128, 128, 33, 1, 21, 73]), u8x32.shiftRight(one, four))
+    let firstLow = Intrinsic.x86ShuffleBytes<simd<u8, 32>>(u8x32.fromArray([231, 163, 131, 131, 139, 203, 203, 203, 203, 203, 203, 203, 203, 219, 203, 203,
+      231, 163, 131, 131, 139, 203, 203, 203, 203, 203, 203, 203, 203, 219, 203, 203]), one & u8x32.splat(15))
+    let secondHigh = Intrinsic.x86ShuffleBytes<simd<u8, 32>>(u8x32.fromArray([1, 1, 1, 1, 1, 1, 1, 1, 230, 174, 186, 186, 1, 1, 1, 1,
+      1, 1, 1, 1, 1, 1, 1, 1, 230, 174, 186, 186, 1, 1, 1, 1]), u8x32.shiftRight(lanes, four))
+    let continuation = (u8x32.saturatingSubtract(two, u8x32.splat(96)) | u8x32.saturatingSubtract(three, u8x32.splat(112))) &
+      u8x32.splat(128)
+    return (firstHigh & firstLow & secondHigh) ^ continuation
+  }
+
+  const EVEN_BITS: u64 = 0x5555555555555555
+
+  // What `wideTextCheck` carries from one 64-byte block to the next.
+  struct TextScan {
+    previous: simd<u8, 32>,
+    errors: simd<u8, 32>,
+    pending: bool,
+    escapedCarry: u64,
+    inString: u64,
+    inside: usize,
+  }
+
+  @inlineAlways
+  fn prefixXor(value: u64) -> u64 {
+    let mut x = value
+    x = u64.bitXor(x, u64.shiftLeft(x, 1))
+    x = u64.bitXor(x, u64.shiftLeft(x, 2))
+    x = u64.bitXor(x, u64.shiftLeft(x, 4))
+    x = u64.bitXor(x, u64.shiftLeft(x, 8))
+    x = u64.bitXor(x, u64.shiftLeft(x, 16))
+    x = u64.bitXor(x, u64.shiftLeft(x, 32))
+    return x
+  }
+
+  // Checks the UTF-8 of the 64 bytes `first` and `second` (Keiser and Lemire, "Validating UTF-8 In
+  // Less Than One Instruction Per Byte", 2021), and counts the bytes in them that are inside strings,
+  // with the escape rule of simdjson (Langdale and Lemire, "Parsing Gigabytes of JSON per Second",
+  // 2019).
+  @features("avx2", "bmi", "popcnt")
+  @inlineAlways
+  unsafe fn wideTextBlock(scan: &mut TextScan, first: simd<u8, 32>, second: simd<u8, 32>) -> () {
+    if mask32.any(u8x32.lanesGreaterOrEqual(first | second, u8x32.splat(128))) || scan.pending {
+      scan.errors = scan.errors | unsafe wideUtf8Errors(first, scan.previous) | unsafe wideUtf8Errors(second, first)
+      // A character that the last bytes start and the next block must finish.
+      let limits = u8x32.fromArray([255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 239, 223, 191])
+      scan.pending = mask32.any(u8x32.lanesGreater(u8x32.saturatingSubtract(second, limits), u8x32.splat(0)))
+    }
+    scan.previous = second
+    let quoteLanes = u8x32.splat(34)
+    let backslashLanes = u8x32.splat(92)
+    let quotes = u64.bitOr(mask32.toBits(u8x32.lanesEqual(first, quoteLanes)),
+      u64.shiftLeft(mask32.toBits(u8x32.lanesEqual(second, quoteLanes)), 32))
+    let backslashes = u64.bitOr(mask32.toBits(u8x32.lanesEqual(first, backslashLanes)),
+      u64.shiftLeft(mask32.toBits(u8x32.lanesEqual(second, backslashLanes)), 32))
+    // The bytes that a backslash escapes: the odd-length runs of backslashes end in one.
+    let mut escaped = scan.escapedCarry
+    if backslashes == 0 {
+      scan.escapedCarry = 0
+    } else {
+      let backslash = u64.bitAnd(backslashes, u64.bitNot(scan.escapedCarry))
+      let follows = u64.bitOr(u64.shiftLeft(backslash, 1), scan.escapedCarry)
+      let oddStarts = u64.bitAnd(u64.bitAnd(backslash, u64.bitNot(EVEN_BITS)), u64.bitNot(follows))
+      let sum = u64.wrappingAdd(oddStarts, backslash)
+      if sum < backslash { scan.escapedCarry = 1 } else { scan.escapedCarry = 0 }
+      escaped = u64.bitAnd(u64.bitXor(EVEN_BITS, u64.shiftLeft(sum, 1)), follows)
+    }
+    let quote = u64.bitAnd(quotes, u64.bitNot(escaped))
+    // Set from each opening quote up to, not including, its closing quote.
+    let strings = u64.bitXor(prefixXor(quote), scan.inString)
+    scan.inString = u64.wrappingSubtract(0, u64.shiftRight(strings, 63))
+    scan.inside = scan.inside + u32.toUsize(u64.countOnes(u64.bitAnd(strings, u64.bitNot(quote))))
+  }
+
+  // Returns 0 if `bytes` is not valid UTF-8 or ends inside a string, and otherwise 1 more than the
+  // number of bytes inside its strings, which no decoded string is longer than.
+  @features("avx2", "bmi", "popcnt")
+  unsafe fn wideTextCheck(bytes: &[u8]) -> usize {
+    let mut scan = TextScan {
+      previous: u8x32.splat(0),
+      errors: u8x32.splat(0),
+      pending: false,
+      escapedCarry: 0,
+      inString: 0,
+      inside: usize.ZERO,
+    }
+    let mut at = usize.ZERO
+    while at + 64 <= bytes.length {
+      unsafe wideTextBlock(&mut scan, u8x32.load(bytes, at), u8x32.load(bytes, at + 32))
+      at = at + 64
+    }
+    if at < bytes.length || scan.pending {
+      // The last bytes, padded with spaces, which also end a character that is cut off.
+      let mut last: [u8; 64] = [32; 64]
+      let mut index = usize.ZERO
+      while at + index < bytes.length {
+        last[index] = bytes[at + index]
+        index = index + usize.ONE
+      }
+      unsafe wideTextBlock(&mut scan, u8x32.load(&last, 0), u8x32.load(&last, 32))
+    }
+    if scan.inString != 0 || mask32.any(u8x32.lanesGreater(scan.errors, u8x32.splat(0))) { return usize.ZERO }
+    return scan.inside + usize.ONE
+  }
+
+  // The first byte at or after `at` that is not whitespace.
+  @features("avx2", "bmi", "popcnt")
+  @inlineAlways
+  unsafe fn wideSkip(bytes: &[u8], at: usize) -> usize {
+    // Most values follow a separator directly, or the one space after it in formatted text.
+    if at < bytes.length && bytes[at] > 32 { return at }
+    if at + usize.ONE < bytes.length && bytes[at] == 32 && bytes[at + usize.ONE] > 32 { return at + usize.ONE }
+    return unsafe wideBlankRun(bytes, at)
+  }
+
+  @features("avx2", "bmi", "popcnt")
+  unsafe fn wideBlankRun(bytes: &[u8], start: usize) -> usize {
+    // A byte is whitespace when it equals the table entry for its low nibble.
+    // The other entries are 255, which no lane matches: a lane with its high bit set looks up 0.
+    let table = u8x32.fromArray([32, 255, 255, 255, 255, 255, 255, 255, 255, 9, 10, 255, 255, 13, 255, 255,
+      32, 255, 255, 255, 255, 255, 255, 255, 255, 9, 10, 255, 255, 13, 255, 255])
+    let mut at = start
+    while at + 32 <= bytes.length {
+      let lanes = u8x32.load(bytes, at)
+      let blank = mask32.toBits(u8x32.lanesEqual(lanes, Intrinsic.x86ShuffleBytes<simd<u8, 32>>(table, lanes)))
+      if blank != 0xFFFFFFFF { return at + u32.toUsize(u64.trailingZeros(u64.bitNot(blank))) }
+      at = at + 32
+    }
+    return JsonSyntax.skipWhitespace(bytes, at)
+  }
+
+  // Appends the number at `at`. Arrays of numbers call it in their loop, without a call to
+  // `wideItem` for each.
+  @features("avx2", "bmi", "popcnt")
+  @inlineAlways
+  unsafe effect fn wideNumber(bytes: &[u8], cursor: &mut TreeCursor, document: &mut JsonDocument, at: usize)
+    -> () ! JsonError | OutOfMemoryError ? &mut Allocator {
+    let number = run treeNumber(bytes, &mut cursor.*, at)
+    if cursor.failed { return () }
+    return match number {
+      JsonNumber.Integer { value } => run pushSlot(&mut document.*, SLOT_INTEGER, usize.ZERO, i64.wrappingToU64(value))
+      JsonNumber.Unsigned { value } => run pushSlot(&mut document.*, SLOT_UNSIGNED, usize.ZERO, value)
+      JsonNumber.Float { value } => run pushSlot(&mut document.*, SLOT_FLOAT, usize.ZERO, f64.toBits(value))
+    }
+  }
+
+  @features("avx2", "bmi", "popcnt")
+  unsafe effect fn wideItem(bytes: &[u8], cursor: &mut TreeCursor, document: &mut JsonDocument, used: &mut usize, keys: &mut List<u64>)
+    -> () ! JsonError | OutOfMemoryError ? &mut Allocator {
+    let at = unsafe wideSkip(bytes, cursor.index)
+    if at >= bytes.length { return markFailed(&mut cursor.*) }
+    let byte = bytes[at]
+    if byte == 34 { return run unsafe wideString(bytes, &mut cursor.*, &mut document.*, &mut used.*, at) }
+    if byte == 45 || (byte >= 48 && byte <= 57) { return run unsafe wideNumber(bytes, &mut cursor.*, &mut document.*, at) }
+    if byte == 91 { return run unsafe wideArray(bytes, &mut cursor.*, &mut document.*, &mut used.*, &mut keys.*, at + usize.ONE) }
+    if byte == 123 { return run unsafe wideObject(bytes, &mut cursor.*, &mut document.*, &mut used.*, &mut keys.*, at + usize.ONE) }
+    let mut kind = SLOT_NULL
+    let mut length: usize = 4
+    if byte == 116 && wordAt(bytes, at, b"true") {
+      kind = SLOT_TRUE
+    } else if byte == 102 && wordAt(bytes, at, b"false") {
+      kind = SLOT_FALSE
+      length = 5
+    } else if !(byte == 110 && wordAt(bytes, at, b"null")) {
+      return markFailed(&mut cursor.*)
+    }
+    cursor.index = at + length
+    return run pushSlot(&mut document.*, kind, usize.ZERO, 0)
+  }
+
+  // Appends the string whose quote is at `at` at `used` in `document.text`, which has room for the
+  // whole input and 64 bytes more. The UTF-8 of the text is already checked, so the string is only
+  // scanned for its quote, escapes and control bytes, and copied 32 bytes at a time as it goes.
+  @features("avx2", "bmi", "popcnt")
+  unsafe effect fn wideString(bytes: &[u8], cursor: &mut TreeCursor, document: &mut JsonDocument, used: &mut usize, at: usize)
+    -> () ! OutOfMemoryError ? &mut Allocator {
+    let offset = used.*
+    let out = Bytes.asMutSlice(&mut document.text)
+    let quote = u8x32.splat(34)
+    let backslash = u8x32.splat(92)
+    let space = u8x32.splat(32)
+    let mut index = at + usize.ONE
+    // A decoded string is never longer than its text, so `to` stays at most `index`.
+    let mut to = offset
+    while true {
+      let mut stop = bytes.length
+      // `out` has room by the count of `wideTextCheck`; the checks on `to` only keep a broken text from
+      // writing past it.
+      while index + 32 <= bytes.length && to + 32 <= out.length {
+        let lanes = u8x32.load(bytes, index)
+        u8x32.store(&mut out, to, lanes)
+        let stops = u64.bitOr(u64.bitOr(mask32.toBits(u8x32.lanesEqual(lanes, quote)), mask32.toBits(u8x32.lanesEqual(lanes, backslash))),
+          mask32.toBits(u8x32.lanesLess(lanes, space)))
+        if stops != 0 {
+          let length = u32.toUsize(u64.trailingZeros(stops))
+          stop = index + length
+          to = to + length
+          break
+        }
+        index = index + 32
+        to = to + 32
+      }
+      if stop == bytes.length {
+        while index < bytes.length && to < out.length && bytes[index] != 34 && bytes[index] != 92 && bytes[index] >= 32 {
+          out[to] = bytes[index]
+          index = index + usize.ONE
+          to = to + usize.ONE
+        }
+        if index >= bytes.length || to >= out.length { return markFailed(&mut cursor.*) }
+        stop = index
+      }
+      let byte = bytes[stop]
+      if byte == 34 {
+        cursor.index = stop + usize.ONE
+        used.* = to
+        return run pushSlot(&mut document.*, SLOT_STRING, to - offset, usize.toU64(offset))
+      }
+      if byte != 92 || to + 4 > out.length { return markFailed(&mut cursor.*) }
+      let width = decodeEscape(&mut out, to, bytes, stop)
+      if width == 0 { return markFailed(&mut cursor.*) }
+      to = to + u64.toUsize(u64.bitAnd(width, 255))
+      index = stop + u64.toUsize(u64.shiftRight(width, 8))
+    }
+    return ()
+  }
+
+  // Writes what the escape whose backslash is at `at` stands for at `to` in `out`. Returns the
+  // length of the escape in `bytes` times 256 plus the number of bytes written, or 0 if it is not
+  // valid. An escape is never shorter than what it stands for.
+  fn decodeEscape(out: &mut [u8], to: usize, bytes: &[u8], at: usize) -> u64 {
+    if at + usize.ONE >= bytes.length { return 0 }
+    let next = bytes[at + usize.ONE]
+    let mut decoded: u8 = next
+    if next == 110 { decoded = 10 }
+    else if next == 116 { decoded = 9 }
+    else if next == 114 { decoded = 13 }
+    else if next == 98 { decoded = 8 }
+    else if next == 102 { decoded = 12 }
+    else if next == 117 {
+      let mut scalar = hexScalar(bytes, at + 2)
+      let mut width: u64 = 6
+      if scalar >= 65536 || (scalar >= 56320 && scalar <= 57343) { return 0 }
+      if scalar >= 55296 && scalar <= 56319 {
+        // A high surrogate, which a low one must follow.
+        if at + 7 >= bytes.length || bytes[at + 6] != 92 || bytes[at + 7] != 117 { return 0 }
+        let low = hexScalar(bytes, at + 8)
+        if low < 56320 || low > 57343 { return 0 }
+        scalar = 65536 + (scalar - 55296) * 1024 + (low - 56320)
+        width = 12
+      }
+      if scalar < 128 {
+        out[to] = u32.toU8(scalar)
+        return width * 256 + 1
+      }
+      if scalar < 2048 {
+        out[to] = u32.toU8(192 + scalar / 64)
+        out[to + usize.ONE] = u32.toU8(128 + scalar % 64)
+        return width * 256 + 2
+      }
+      if scalar < 65536 {
+        out[to] = u32.toU8(224 + scalar / 4096)
+        out[to + usize.ONE] = u32.toU8(128 + scalar / 64 % 64)
+        out[to + 2] = u32.toU8(128 + scalar % 64)
+        return width * 256 + 3
+      }
+      out[to] = u32.toU8(240 + scalar / 262144)
+      out[to + usize.ONE] = u32.toU8(128 + scalar / 4096 % 64)
+      out[to + 2] = u32.toU8(128 + scalar / 64 % 64)
+      out[to + 3] = u32.toU8(128 + scalar % 64)
+      return width * 256 + 4
+    } else if next != 34 && next != 92 && next != 47 {
+      return 0
+    }
+    out[to] = decoded
+    return 2 * 256 + 1
+  }
+
+  // The value of the 4 hex digits at `at`, or 65536 or more if they are not 4 hex digits; a value
+  // from 56320 up is not a valid escape on its own either.
+  fn hexScalar(bytes: &[u8], at: usize) -> u32 {
+    if at + 4 > bytes.length { return 65536 }
+    let mut total: u32 = 0
+    let mut index = at
+    while index < at + 4 {
+      let byte = bytes[index]
+      let lower = u8.bitOr(byte, 32)
+      let mut digit: u32 = 16
+      if byte >= 48 && byte <= 57 { digit = u8.toU32(byte) - 48 }
+      else if lower >= 97 && lower <= 102 { digit = u8.toU32(lower) - 87 }
+      if digit == 16 { return 65536 }
+      total = total * 16 + digit
+      index = index + usize.ONE
+    }
+    return total
+  }
+
+  @features("avx2", "bmi", "popcnt")
+  unsafe effect fn wideArray(bytes: &[u8], cursor: &mut TreeCursor, document: &mut JsonDocument, used: &mut usize, keys: &mut List<u64>, start: usize)
+    -> () ! JsonError | OutOfMemoryError ? &mut Allocator {
+    if cursor.depth == MAX_DEPTH { return markFailed(&mut cursor.*) }
+    let open = List<DocumentSlot>.length(&document.slots)
+    run pushSlot(&mut document.*, SLOT_ARRAY, usize.ZERO, usize.toU64(open + usize.ONE))
+    let mut at = unsafe wideSkip(bytes, start)
+    if at < bytes.length && bytes[at] == 93 {
+      cursor.index = at + usize.ONE
+      return ()
+    }
+    if at >= bytes.length { return markFailed(&mut cursor.*) }
+    cursor.depth = cursor.depth + usize.ONE
+    cursor.index = at
+    let mut count = usize.ZERO
+    while true {
+      let byte = bytes[at]
+      if byte == 45 || (byte >= 48 && byte <= 57) {
+        run unsafe wideNumber(bytes, &mut cursor.*, &mut document.*, at)
+      } else if byte == 34 {
+        run unsafe wideString(bytes, &mut cursor.*, &mut document.*, &mut used.*, at)
+      } else {
+        cursor.index = at
+        run unsafe wideItem(bytes, &mut cursor.*, &mut document.*, &mut used.*, &mut keys.*)
+      }
+      if cursor.failed { return () }
+      count = count + usize.ONE
+      at = unsafe wideSkip(bytes, cursor.index)
+      if at >= bytes.length { break }
+      let next = bytes[at]
+      cursor.index = at + usize.ONE
+      if next == 93 {
+        cursor.depth = cursor.depth - usize.ONE
+        return closeSlot(&mut document.*, open, SLOT_ARRAY, count)
+      }
+      if next != 44 { break }
+      at = unsafe wideSkip(bytes, cursor.index)
+      if at >= bytes.length { break }
+    }
+    return markFailed(&mut cursor.*)
+  }
+
+  @features("avx2", "bmi", "popcnt")
+  unsafe effect fn wideObject(bytes: &[u8], cursor: &mut TreeCursor, document: &mut JsonDocument, used: &mut usize, keys: &mut List<u64>, start: usize)
+    -> () ! JsonError | OutOfMemoryError ? &mut Allocator {
+    if cursor.depth == MAX_DEPTH { return markFailed(&mut cursor.*) }
+    let open = List<DocumentSlot>.length(&document.slots)
+    run pushSlot(&mut document.*, SLOT_OBJECT, usize.ZERO, usize.toU64(open + usize.ONE))
+    let mut at = unsafe wideSkip(bytes, start)
+    if at < bytes.length && bytes[at] == 125 {
+      cursor.index = at + usize.ONE
+      return ()
+    }
+    cursor.depth = cursor.depth + usize.ONE
+    let mut count = usize.ZERO
+    let mut seen: [u64; 4] = [0, 0, 0, 0]
+    let base = List<u64>.length(&keys.*)
+    while true {
+      if at >= bytes.length || bytes[at] != 34 { break }
+      let key = List<DocumentSlot>.length(&document.slots)
+      run unsafe wideString(bytes, &mut cursor.*, &mut document.*, &mut used.*, at)
+      if cursor.failed { return () }
+      let hash = keyHash(&document.*, key)
+      let bit = u64.shiftRight(hash, 56)
+      let word = u64.toUsize(u64.shiftRight(bit, 6))
+      let mask = u64.shiftLeft(1, u64.bitAnd(bit, 63))
+      if u64.bitAnd(seen[word], mask) != 0 && sameHash(&keys.*, base, hash)
+        && repeatedKey(&document.*, open + usize.ONE, key) {
+        break
+      }
+      seen[word] = u64.bitOr(seen[word], mask)
+      run List<u64>.append(&mut keys.*, hash)
+      at = unsafe wideSkip(bytes, cursor.index)
+      if at >= bytes.length || bytes[at] != 58 { break }
+      at = unsafe wideSkip(bytes, at + usize.ONE)
+      if at >= bytes.length { break }
+      let value = bytes[at]
+      if value == 34 {
+        run unsafe wideString(bytes, &mut cursor.*, &mut document.*, &mut used.*, at)
+      } else if value == 45 || (value >= 48 && value <= 57) {
+        run unsafe wideNumber(bytes, &mut cursor.*, &mut document.*, at)
+      } else {
+        cursor.index = at
+        run unsafe wideItem(bytes, &mut cursor.*, &mut document.*, &mut used.*, &mut keys.*)
+      }
+      if cursor.failed { return () }
+      count = count + usize.ONE
+      at = unsafe wideSkip(bytes, cursor.index)
+      if at >= bytes.length { break }
+      let byte = bytes[at]
+      cursor.index = at + usize.ONE
+      if byte == 125 {
+        cursor.depth = cursor.depth - usize.ONE
+        List<u64>.truncate(&mut keys.*, base)
+        return closeSlot(&mut document.*, open, SLOT_OBJECT, count)
+      }
+      if byte != 44 { break }
+      at = unsafe wideSkip(bytes, cursor.index)
+    }
+    return markFailed(&mut cursor.*)
+  }
+
+  // Parses `bytes` into `document`, whose text has room for every string. Returns `false` when
+  // the text is not valid, and the caller then reports the error with the scanner path.
+  @features("avx2", "bmi", "popcnt")
+  unsafe effect fn wideParse(bytes: &[u8], document: &mut JsonDocument, keys: &mut List<u64>) -> bool
+    ! JsonError | OutOfMemoryError ? &mut Allocator {
+    let mut used = usize.ZERO
+    let mut cursor = TreeCursor { index: usize.ZERO, depth: usize.ZERO, failed: false }
+    run unsafe wideItem(bytes, &mut cursor, &mut document.*, &mut used, &mut keys.*)
+    Bytes.truncate(&mut document.text, used)
+    return !cursor.failed && JsonSyntax.skipWhitespace(bytes, cursor.index) == bytes.length
+  }
 }
 
 // A hash of the key at `key`, from its length and its first and last 8 bytes.
