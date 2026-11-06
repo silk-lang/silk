@@ -20,8 +20,9 @@
 //!
 //! When the server sends a CertificateRequest, the client answers with the [`ClientCredential`]
 //! given to [`Client.make`]: the chain and a CertificateVerify signed with its key, using a scheme
-//! that the server lists. With `ClientCredential.None`, when no listed scheme fits the key, or in
-//! TLS 1.2, it sends an empty Certificate message, and the server decides whether to go on.
+//! that the server lists. In TLS 1.2 the key must sign a digest, so it is ECDSA or RSA, and the
+//! scheme's hash may differ from the suite's. With `ClientCredential.None`, or when no listed scheme
+//! fits the key, it sends an empty Certificate message, and the server decides whether to go on.
 //!
 //! With [`Resumption`] `Enabled`, the client asks for session tickets and returns each one as a
 //! [`Session`] from [`Client.takeSession`]. A later client given that session offers it as a PSK
@@ -45,8 +46,9 @@
 //!
 //! # Gotchas
 //! You provide the trust, the time, the random source, and the transport. The client supports one
-//! profile, not all of the Web PKI. In TLS 1.2 it does not resume sessions, does not present client
-//! certificates, has no KeyUpdate, and ignores a HelloRequest, so the server cannot renegotiate. Dropping the client does not send `close_notify`. Call
+//! profile, not all of the Web PKI. In TLS 1.2 it does not resume sessions, has no KeyUpdate,
+//! sends an empty Certificate for an Ed25519 credential, and ignores a HelloRequest, so the server
+//! cannot renegotiate. Dropping the client does not send `close_notify`. Call
 //! [`Client.closeWrite`] first. Secrets are not erased.
 //!
 //! # Examples
@@ -3197,6 +3199,9 @@ fn completePending(client: &mut Client) -> Result<(), TlsError> {
     if client.credentialFlightOffset < client.credentialFlightLength {
       return queueCredentialChunk(&mut client.*)
     }
+    if client.tls12 {
+      return queueTls12ChangeCipherSpec(&mut client.*)
+    }
     return queueClientFinished(&mut client.*)
   }
   if kind == PendingKind.Finished {
@@ -3738,7 +3743,7 @@ effect fn dispatchHandshake(
   }
   if client.state == ClientState.Tls12AwaitHelloDone {
     if messageType == 13 { return handleCertificateRequestTls12(&mut client.*, messageLength) }
-    if messageType == 14 { return handleServerHelloDone(&mut client.*, messageLength) }
+    if messageType == 14 { return run handleServerHelloDone(&mut client.*, messageLength) }
     return unexpectedHandshake()
   }
   if client.state == ClientState.Tls12AwaitFinished {
@@ -4208,7 +4213,10 @@ fn updateSelectedTranscript(client: &mut Client, offset: usize, length: usize) -
   // Every caller passes a range within the complete message in `handshake[0..handshakeLength]`.
   // `allocateBytes` zero-fills every buffer, so all bytes are initialized.
   let message = unsafe RawBuffer.view<u8>(&client.handshake, offset, length)
-  if client.selectedSuite.hashLength() == 48 {
+  if client.tls12 {
+    client.transcript256.update(message)
+    client.transcript384.update(message)
+  } else if client.selectedSuite.hashLength() == 48 {
     client.transcript384.update(message)
   } else {
     client.transcript256.update(message)
@@ -5319,6 +5327,10 @@ fn serverApplicationLabel() -> [u8; 12] {
   return [115, 32, 97, 112, 32, 116, 114, 97, 102, 102, 105, 99]
 }
 
+// The longest TLS 1.2 ClientKeyExchange: a header, a length byte, and a P-384 point. In TLS 1.2
+// it sits between the Certificate and the CertificateVerify in the credential flight.
+const TLS12_KEY_EXCHANGE_LIMIT: usize = 102
+
 struct PreparedCredential {
   key: Option<SigningKey>,
   flight: Intrinsic.RawBuffer<u8>,
@@ -5382,7 +5394,7 @@ effect fn prepareCredential<'a>(credential: ClientCredential<'a>, limits: Client
       // Certificate: header, empty context, list length, then each entry with no extensions.
       let listLength = total + certificates.length * 5
       let certificateLength = HANDSHAKE_HEADER_LENGTH + 4 + listLength
-      let mut flight = run allocateBytes(certificateLength + 8 + SIGNATURE_LIMIT)
+      let mut flight = run allocateBytes(certificateLength + 8 + SIGNATURE_LIMIT + TLS12_KEY_EXCHANGE_LIMIT)
       RawBuffer.fill(&mut flight, 0, usize.ONE, 11)
       setU24(&mut flight, usize.ONE, 4 + listLength)
       RawBuffer.fill(&mut flight, 4, usize.ONE, 0)
@@ -5603,8 +5615,12 @@ fn queueClientFinished(client: &mut Client) -> Result<(), TlsError> {
   return Result<(), TlsError>.succeed(())
 }
 
+// A TLS 1.2 CertificateVerify can sign under either hash, so TLS 1.2 keeps both transcripts.
 fn updateTranscriptSlice(client: &mut Client, message: &[u8]) -> () {
-  if client.selectedSuite.hashLength() == 48 {
+  if client.tls12 {
+    client.transcript256.update(message)
+    client.transcript384.update(message)
+  } else if client.selectedSuite.hashLength() == 48 {
     client.transcript384.update(message)
   } else {
     client.transcript256.update(message)
@@ -6131,19 +6147,40 @@ effect fn agreeTls12(client: &mut Client, group: NamedGroup, peerKey: &[u8]) -> 
   }
 }
 
-// A TLS 1.2 CertificateRequest (RFC 5246 section 7.4.4). The client answers with an empty
-// Certificate message.
+// A TLS 1.2 CertificateRequest (RFC 5246 section 7.4.4). The client keeps the schemes that it
+// can sign CertificateVerify with by digest, for the certificate types that the server lists.
 fn handleCertificateRequestTls12(client: &mut Client, messageLength: usize) -> Result<(), TlsError> {
   if client.certificateRequest || messageLength < 9 { return certificateRequestFailure() }
   let typesLength = u8.toUsize(handshakeByte(&client.*, 4))
   if typesLength == 0 || messageLength - 5 < typesLength + 4 { return certificateRequestFailure() }
+  // The certificate types rsa_sign (1) and ecdsa_sign (64).
+  let mut rsaSign = false
+  let mut ecdsaSign = false
+  let mut typeIndex = usize.ZERO
+  while typeIndex < typesLength {
+    let kind = handshakeByte(&client.*, 5 + typeIndex)
+    if kind == 1 { rsaSign = true }
+    if kind == 64 { ecdsaSign = true }
+    typeIndex = typeIndex + usize.ONE
+  }
   let mut cursor = 5 + typesLength
   let schemesLength = readU16Raw(&client.handshake, cursor)
   cursor = cursor + 2
   if schemesLength < 2 || schemesLength % 2 != 0 || messageLength - cursor < schemesLength + 2 {
     return certificateRequestFailure()
   }
-  cursor = cursor + schemesLength
+  let mut schemes = SchemeSet.empty()
+  let schemesEnd = cursor + schemesLength
+  while cursor < schemesEnd {
+    let scheme = readU16Raw(&client.handshake, cursor)
+    let ecdsa = scheme == 1027 || scheme == 1283
+    let allowed = if ecdsa { ecdsaSign } else { rsaSign }
+    if allowed && digestKnown(scheme) {
+      schemes.insert(scheme)
+    }
+    cursor = cursor + 2
+  }
+  client.requestedSchemes = schemes
   let authoritiesLength = readU16Raw(&client.handshake, cursor)
   cursor = cursor + 2
   if authoritiesLength != messageLength - cursor { return certificateRequestFailure() }
@@ -6153,11 +6190,21 @@ fn handleCertificateRequestTls12(client: &mut Client, messageLength: usize) -> R
 }
 
 // ServerHelloDone ends the server's flight. The client sends its own: [Certificate],
-// ClientKeyExchange, ChangeCipherSpec, and Finished.
-fn handleServerHelloDone(client: &mut Client, messageLength: usize) -> Result<(), TlsError> {
+// ClientKeyExchange, [CertificateVerify], ChangeCipherSpec, and Finished.
+effect fn handleServerHelloDone(client: &mut Client, messageLength: usize) -> Result<(), TlsError>
+? &mut Random {
   if messageLength != HANDSHAKE_HEADER_LENGTH { return lengthFailure() }
   if messageLength != client.handshakeLength { return unexpectedHandshake() }
   updateSelectedTranscript(&mut client.*, 0, messageLength)
+  if client.certificateRequest {
+    let scheme = match &client.credentialKey {
+      Option<SigningKey>.Some {value: key} => key.chooseScheme(&client.requestedSchemes, TlsVersion.Tls12)
+      Option<SigningKey>.None => Option<usize>.none()
+    }
+    if let Option<usize>.Some {value} = scheme {
+      return run queueTls12CredentialFlight(&mut client.*, value)
+    }
+  }
   let mut message: [u8; 109] = [0; 109]
   let mut length = usize.ZERO
   if client.certificateRequest {
@@ -6178,20 +6225,7 @@ fn handleServerHelloDone(client: &mut Client, messageLength: usize) -> Result<()
   length = length + 5 + shareLength
   let flight = Slice.view<u8>(&message, 0, length)
   updateTranscriptSlice(&mut client.*, flight)
-  let suite = client.selectedSuite
-  let hashLength = suite.hashLength()
-  let sessionHash = selectedTranscriptHash(&client.*)
-  let preMaster = client.preMaster
-  let master = TlsPrf.extendedMasterSecret(
-    suite,
-    Slice.view<u8>(&preMaster, 0, client.preMasterLength),
-    Slice.view<u8>(&sessionHash, 0, hashLength),
-  )
-  let clientRandom = client.clientRandom
-  let serverRandom = client.serverRandom
-  client.masterSecret = master
-  client.masterSecretLength = 48
-  client.tls12Keys = TlsPrf.keys(suite, &master, &clientRandom, &serverRandom)
+  deriveTls12Keys(&mut client.*)
   let queued = TlsRecordSender.queueRecord(&mut client.sender, ContentType.Handshake, flight)
   match move queued {
     Result<OutputProgress, RecordError>.Failure {error} => {
@@ -6209,6 +6243,129 @@ fn handleServerHelloDone(client: &mut Client, messageLength: usize) -> Result<()
   client.pendingKind = PendingKind.Tls12KeyExchange
   client.state = ClientState.Tls12FlightPending
   return Result<(), TlsError>.succeed(())
+}
+
+// The extended master secret over the transcript through ClientKeyExchange, and the key block.
+fn deriveTls12Keys(client: &mut Client) -> () {
+  let suite = client.selectedSuite
+  let hashLength = suite.hashLength()
+  let sessionHash = selectedTranscriptHash(&client.*)
+  let preMaster = client.preMaster
+  let master = TlsPrf.extendedMasterSecret(
+    suite,
+    Slice.view<u8>(&preMaster, 0, client.preMasterLength),
+    Slice.view<u8>(&sessionHash, 0, hashLength),
+  )
+  let clientRandom = client.clientRandom
+  let serverRandom = client.serverRandom
+  client.masterSecret = master
+  client.masterSecretLength = 48
+  client.tls12Keys = TlsPrf.keys(suite, &master, &clientRandom, &serverRandom)
+  return ()
+}
+
+// Rewrites the prepared TLS 1.3 Certificate message in the credential flight to the TLS 1.2 form,
+// without the request context and the entry extensions, then appends ClientKeyExchange and a
+// CertificateVerify that signs the transcript through ClientKeyExchange under `scheme`'s hash.
+effect fn queueTls12CredentialFlight(client: &mut Client, scheme: usize) -> Result<(), TlsError>
+? &mut Random {
+  let sourceLength = client.credentialCertificateLength
+  // Each entry moves down by one byte for the context and two for each earlier entry's
+  // extensions, so every write lands at or before the byte it copies.
+  let mut source: usize = 8
+  let mut target: usize = 7
+  while source < sourceLength {
+    // `prepareCredential` wrote each entry as a 3-byte length, the DER, and 2 zero bytes.
+    let entryLength = 3 + readU24Raw(&client.credentialFlight, source)
+    let mut index = usize.ZERO
+    while index < entryLength {
+      // `source + index < sourceLength`, all written by `prepareCredential`.
+      let byte = unsafe RawBuffer.read<u8>(&client.credentialFlight, source + index)
+      RawBuffer.fill(&mut client.credentialFlight, target + index, usize.ONE, byte)
+      index = index + usize.ONE
+    }
+    source = source + entryLength + 2
+    target = target + entryLength
+  }
+  let certificateLength = target
+  setU24(&mut client.credentialFlight, usize.ONE, certificateLength - HANDSHAKE_HEADER_LENGTH)
+  setU24(&mut client.credentialFlight, 4, certificateLength - 7)
+
+  // ClientKeyExchange, in the room that `prepareCredential` left after the messages.
+  let shareLength = client.clientShareLength
+  let exchangeStart = certificateLength
+  RawBuffer.fill(&mut client.credentialFlight, exchangeStart, usize.ONE, 16)
+  setU24(&mut client.credentialFlight, exchangeStart + 1, shareLength + 1)
+  RawBuffer.fill(&mut client.credentialFlight, exchangeStart + 4, usize.ONE, usize.toU8(shareLength))
+  let share = client.clientShare
+  unsafe RawBuffer.copy<u8>(&mut client.credentialFlight, exchangeStart + 5, &share, shareLength)
+  let verifyStart = exchangeStart + 5 + shareLength
+  // The writes above initialized `credentialFlight[0..verifyStart]`.
+  let messages = unsafe RawBuffer.view<u8>(&client.credentialFlight, 0, verifyStart)
+  client.transcript256.update(messages)
+  client.transcript384.update(messages)
+  drop messages
+  deriveTls12Keys(&mut client.*)
+
+  let mut digest: [u8; 48] = [0; 48]
+  let mut digestLength: usize = 32
+  if digestKnown(scheme) && wideDigest(scheme) {
+    digest = client.transcript384.checkpoint()
+    digestLength = 48
+  } else {
+    let short = client.transcript256.checkpoint()
+    digest = widen32(&short)
+  }
+  let mut signature: [u8; 1024] = [0; 1024]
+  let signed = match &client.credentialKey {
+    Option<SigningKey>.Some {value: key} => run key.signDigest(
+      scheme,
+      Slice.view<u8>(&digest, 0, digestLength),
+      &mut signature,
+    )
+    Option<SigningKey>.None => Result<usize, SigningError>.failResult(SigningError.UnsupportedScheme)
+  }
+  let signatureLength = match move signed {
+    Result<usize, SigningError>.Failure {error} => {
+      return Result<(), TlsError>.failResult(TlsError.Signing {error: error})
+    }
+    Result<usize, SigningError>.Success {value} => value
+  }
+  RawBuffer.fill(&mut client.credentialFlight, verifyStart, usize.ONE, 15)
+  setU24(&mut client.credentialFlight, verifyStart + 1, signatureLength + 4)
+  RawBuffer.fill(&mut client.credentialFlight, verifyStart + 4, usize.ONE, usize.toU8(scheme / 256))
+  RawBuffer.fill(&mut client.credentialFlight, verifyStart + 5, usize.ONE, usize.toU8(scheme % 256))
+  RawBuffer.fill(&mut client.credentialFlight, verifyStart + 6, usize.ONE, usize.toU8(signatureLength / 256))
+  RawBuffer.fill(&mut client.credentialFlight, verifyStart + 7, usize.ONE, usize.toU8(signatureLength % 256))
+  // The buffer holds `TLS12_KEY_EXCHANGE_LIMIT + 8 + SIGNATURE_LIMIT` bytes after the TLS 1.3
+  // Certificate message, which is longer than the TLS 1.2 one.
+  unsafe RawBuffer.copy<u8>(&mut client.credentialFlight, verifyStart + 8, &signature, signatureLength)
+  let verifyLength = 8 + signatureLength
+  // The writes above initialized every byte of the CertificateVerify message.
+  let verify = unsafe RawBuffer.view<u8>(&client.credentialFlight, verifyStart, verifyLength)
+  client.transcript256.update(verify)
+  client.transcript384.update(verify)
+  drop verify
+  client.credentialFlightLength = verifyStart + verifyLength
+  client.credentialFlightOffset = 0
+  client.state = ClientState.Tls12FlightPending
+  return queueCredentialChunk(&mut client.*)
+}
+
+// Whether TLS 1.2 CertificateVerify can sign under `scheme` by digest.
+fn digestKnown(scheme: usize) -> bool {
+  return match HandshakeSignature.digestLength(scheme) {
+    Option<usize>.Some {..} => true
+    Option<usize>.None => false
+  }
+}
+
+// Whether a TLS 1.2 CertificateVerify scheme hashes with SHA-384.
+fn wideDigest(scheme: usize) -> bool {
+  return match HandshakeSignature.digestLength(scheme) {
+    Option<usize>.Some {value} => value == 48
+    Option<usize>.None => false
+  }
 }
 
 fn queueTls12ChangeCipherSpec(client: &mut Client) -> Result<(), TlsError> {

@@ -24,8 +24,9 @@ signature, and the Finished message. It gives no application data before all che
 
 When the server sends a CertificateRequest, the client answers with the [`ClientCredential`](#ClientCredential)
 given to [`Client.make`](#Client.impl.make): the chain and a CertificateVerify signed with its key, using a scheme
-that the server lists. With `ClientCredential.None`, when no listed scheme fits the key, or in
-TLS 1.2, it sends an empty Certificate message, and the server decides whether to go on.
+that the server lists. In TLS 1.2 the key must sign a digest, so it is ECDSA or RSA, and the
+scheme's hash may differ from the suite's. With `ClientCredential.None`, or when no listed scheme
+fits the key, it sends an empty Certificate message, and the server decides whether to go on.
 
 With [`Resumption`](#Resumption) `Enabled`, the client asks for session tickets and returns each one as a
 [`Session`](#Session) from [`Client.takeSession`](#Client.impl.takeSession). A later client given that session offers it as a PSK
@@ -49,8 +50,9 @@ Output works in two steps: write [`Client.pendingOutput`](#Client.impl.pendingOu
 
 ## Gotchas
 You provide the trust, the time, the random source, and the transport. The client supports one
-profile, not all of the Web PKI. In TLS 1.2 it does not resume sessions, does not present client
-certificates, has no KeyUpdate, and ignores a HelloRequest, so the server cannot renegotiate. Dropping the client does not send `close_notify`. Call
+profile, not all of the Web PKI. In TLS 1.2 it does not resume sessions, has no KeyUpdate,
+sends an empty Certificate for an Ed25519 credential, and ignores a HelloRequest, so the server
+cannot renegotiate. Dropping the client does not send `close_notify`. Call
 [`Client.closeWrite`](#Client.impl.closeWrite) first. Secrets are not erased.
 
 ## Examples
