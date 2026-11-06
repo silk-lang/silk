@@ -25,9 +25,9 @@ and then sleeps on a `Parker`. When a parked fiber wakes, it goes back on the re
 sleeping worker wakes. Thus no worker spins.
 
 [`PoolFiber.interrupt`](#PoolFiber.impl.interrupt) marks the fiber for cancellation and waits for it. A parked fiber is
-cancelled by the next worker that takes it: the worker drops the parked frames, which runs their `Drop` cleanup, and
-the outcome is `Cancelled`. A running fiber is cancelled the next time it parks, for example in
-[`Pool.yieldNow`](#Pool.impl.yieldNow) or [`PoolFiber.join`](#PoolFiber.impl.join).
+cancelled by the next worker that takes it: the worker drops the parked frames, which runs their
+`Drop` cleanup, and the outcome is `Cancelled`. A running fiber is cancelled the next time it
+parks, for example in [`Pool.yieldNow`](#Pool.impl.yieldNow) or [`PoolFiber.join`](#PoolFiber.impl.join).
 
 Each fiber body gets its own [`PoolTask`](#PoolTask) provider, which holds the fiber's deadlines.
 [`Pool.timeout`](#Pool.impl.timeout) arms one, as `Effect.timeout` does under a `Scheduler`. When it passes while
@@ -540,11 +540,11 @@ Runs `body` in the calling fiber, and stops it with `TimeoutError` if it has not
 It works as `Effect.timeout` does under a `Scheduler`. If the deadline passes while the fiber
 is parked inside `body`, such as in a [`PoolFiber.join`](#PoolFiber.impl.join) or [`Pool.yieldNow`](#Pool.impl.yieldNow), the pool
 interrupts the fiber, and if it passes while the fiber runs, the fiber is interrupted at its
-next park inside `body`. Each frame of `body` is abandoned from its park, innermost first, which
-runs `Drop` hooks and non-parking finalizers. Then this call fails with `TimeoutError`. A
-success or typed failure of `body` before the deadline is returned unchanged. Nested timeouts
-work; the one whose deadline passes first stops. The pool measures time on the OS monotonic
-clock, from this call.
+next park inside `body`. Each frame of `body` is abandoned from its park, innermost first,
+which runs `Drop` hooks and non-parking finalizers. Then this call fails with `TimeoutError`.
+A success or typed failure of `body` before the deadline is returned unchanged. Nested
+timeouts work; the one whose deadline passes first stops. The pool measures time on the OS
+monotonic clock, from this call.
 
 #### Gotchas
 - Only a pool fiber has the `PoolTask` provider it needs.

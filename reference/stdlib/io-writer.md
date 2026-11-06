@@ -13,8 +13,9 @@ format. The caller decides where the bytes go when it provides the writer. Use
 A function that needs a writer has `? &mut Writer` in its type. The caller supplies a provider
 with `Effect.provideMut<Writer>(&mut provider)`. A provider is any type that implements
 [`Writer.writeAll`](#Writer.writeAll) and [`Writer.flush`](#Writer.flush), and optionally [`Writer.writeVectored`](#Writer.writeVectored).
-`silk.io.writer_native` has `StdoutWriter` and `StderrWriter`. `silk.io.buffered_output` collects small
-writes into larger ones. A test can provide a writer that keeps the bytes in memory.
+`silk.io.writer_native` has `StdoutWriter` and `StderrWriter`. `silk.io.buffered_output`
+collects small writes into larger ones. A test can provide a writer that keeps the bytes in
+memory.
 
 [`Writer.writeVectored`](#Writer.writeVectored) writes several slices as one. A provider with no faster way to do it
 leaves it out and gets the default, one `writeAll` for each slice.
@@ -25,8 +26,9 @@ leaves it out and gets the default, one `writeAll` for each slice.
 
 ## Gotchas
 The providers in `silk.io.writer_native` exist on Windows x86_64 MSVC without a CRT, WASI,
-Darwin x86_64 or aarch64, and Linux x86_64 or aarch64 with GNU libc. Windows consoles require complete
-canonical WTF-8 per write or concatenated vectored write; redirected handles accept arbitrary bytes.
+Darwin x86_64 or aarch64, and Linux x86_64 or aarch64 with GNU libc. Windows consoles require
+complete canonical WTF-8 per write or concatenated vectored write; redirected handles accept
+arbitrary bytes.
 
 ## Examples
 ### Write to a provider that counts bytes
@@ -123,8 +125,8 @@ The effect that receives output bytes, without the writer knowing where they go.
 
 Require `&mut Writer` in a function that writes output, such as text for a person or a file
 format. The caller decides where the bytes go when it provides the writer, with
-`Effect.provideMut<Writer>(&mut provider)`. Use `silk.text.format.Format` to write values as text,
-and `silk.io.logger.Logger` for log events. `silk.io.writer_native` has `StdoutWriter` and
+`Effect.provideMut<Writer>(&mut provider)`. Use `silk.text.format.Format` to write values as
+text, and `silk.io.logger.Logger` for log events. `silk.io.writer_native` has `StdoutWriter` and
 `StderrWriter`, and `silk.io.buffered_output` collects small writes into larger ones.
 
 ### Details

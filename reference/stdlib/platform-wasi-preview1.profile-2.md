@@ -5,12 +5,13 @@
 The WASI Preview 1 canonical ABI, also used inside Preview 2 command components.
 
 ## When to use
-Use these unsafe calls to implement a WASI provider. Applications use the portable service interfaces.
+Use these unsafe calls to implement a WASI provider. Applications use the portable service
+interfaces.
 
 ## Details
-Functions return a WASI errno: zero means success. Pointer arguments use the Preview 1 memory layouts.
-Calls do not retain pointers. The host controls descriptor rights and available resources.
-Preview 2 builds translate these calls through the WASI command adapter.
+Functions return a WASI errno: zero means success. Pointer arguments use the Preview 1 memory
+layouts. Calls do not retain pointers. The host controls descriptor rights and available
+resources. Preview 2 builds translate these calls through the WASI command adapter.
 
 Import as `wasi` with `import silk.platform.wasi.preview1 as wasi`.
 
@@ -401,7 +402,8 @@ pub unsafe extern "C" fn args_get(
 Calls WASI `args_get` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="args_sizes_get"></a>
 
@@ -418,7 +420,8 @@ pub unsafe extern "C" fn args_sizes_get(
 Calls WASI `args_sizes_get` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="environ_get"></a>
 
@@ -435,7 +438,8 @@ pub unsafe extern "C" fn environ_get(
 Calls WASI `environ_get` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="environ_sizes_get"></a>
 
@@ -452,7 +456,8 @@ pub unsafe extern "C" fn environ_sizes_get(
 Calls WASI `environ_sizes_get` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="clock_res_get"></a>
 
@@ -469,7 +474,8 @@ pub unsafe extern "C" fn clock_res_get(
 Calls WASI `clock_res_get` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="clock_time_get"></a>
 
@@ -487,7 +493,8 @@ pub unsafe extern "C" fn clock_time_get(
 Calls WASI `clock_time_get` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="fd_advise"></a>
 
@@ -505,7 +512,8 @@ pub unsafe extern "C" fn fd_advise(
 Calls WASI `fd_advise` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="fd_allocate"></a>
 
@@ -522,7 +530,8 @@ pub unsafe extern "C" fn fd_allocate(
 Calls WASI `fd_allocate` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="fd_close"></a>
 
@@ -535,7 +544,8 @@ pub unsafe extern "C" fn fd_close(fd: u32) -> u32 as "wasi_snapshot_preview1#fd_
 Calls WASI `fd_close` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="fd_datasync"></a>
 
@@ -548,7 +558,8 @@ pub unsafe extern "C" fn fd_datasync(fd: u32) -> u32 as "wasi_snapshot_preview1#
 Calls WASI `fd_datasync` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="fd_fdstat_get"></a>
 
@@ -565,7 +576,8 @@ pub unsafe extern "C" fn fd_fdstat_get(
 Calls WASI `fd_fdstat_get` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="fd_fdstat_set_flags"></a>
 
@@ -581,7 +593,8 @@ pub unsafe extern "C" fn fd_fdstat_set_flags(
 Calls WASI `fd_fdstat_set_flags` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="fd_fdstat_set_rights"></a>
 
@@ -598,7 +611,8 @@ pub unsafe extern "C" fn fd_fdstat_set_rights(
 Calls WASI `fd_fdstat_set_rights` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="fd_filestat_get"></a>
 
@@ -615,7 +629,8 @@ pub unsafe extern "C" fn fd_filestat_get(
 Calls WASI `fd_filestat_get` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="fd_filestat_set_size"></a>
 
@@ -631,7 +646,8 @@ pub unsafe extern "C" fn fd_filestat_set_size(
 Calls WASI `fd_filestat_set_size` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="fd_filestat_set_times"></a>
 
@@ -649,7 +665,8 @@ pub unsafe extern "C" fn fd_filestat_set_times(
 Calls WASI `fd_filestat_set_times` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="fd_pread"></a>
 
@@ -669,7 +686,8 @@ pub unsafe extern "C" fn fd_pread(
 Calls WASI `fd_pread` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="fd_prestat_get"></a>
 
@@ -686,7 +704,8 @@ pub unsafe extern "C" fn fd_prestat_get(
 Calls WASI `fd_prestat_get` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="fd_prestat_dir_name"></a>
 
@@ -704,7 +723,8 @@ pub unsafe extern "C" fn fd_prestat_dir_name(
 Calls WASI `fd_prestat_dir_name` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="fd_pwrite"></a>
 
@@ -724,7 +744,8 @@ pub unsafe extern "C" fn fd_pwrite(
 Calls WASI `fd_pwrite` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="fd_read"></a>
 
@@ -743,7 +764,8 @@ pub unsafe extern "C" fn fd_read(
 Calls WASI `fd_read` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="fd_readdir"></a>
 
@@ -763,7 +785,8 @@ pub unsafe extern "C" fn fd_readdir(
 Calls WASI `fd_readdir` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="fd_renumber"></a>
 
@@ -776,7 +799,8 @@ pub unsafe extern "C" fn fd_renumber(from: u32, to: u32) -> u32 as "wasi_snapsho
 Calls WASI `fd_renumber` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="fd_seek"></a>
 
@@ -795,7 +819,8 @@ pub unsafe extern "C" fn fd_seek(
 Calls WASI `fd_seek` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="fd_sync"></a>
 
@@ -808,7 +833,8 @@ pub unsafe extern "C" fn fd_sync(fd: u32) -> u32 as "wasi_snapshot_preview1#fd_s
 Calls WASI `fd_sync` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="fd_tell"></a>
 
@@ -825,7 +851,8 @@ pub unsafe extern "C" fn fd_tell(
 Calls WASI `fd_tell` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="fd_write"></a>
 
@@ -844,7 +871,8 @@ pub unsafe extern "C" fn fd_write(
 Calls WASI `fd_write` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="path_create_directory"></a>
 
@@ -862,7 +890,8 @@ pub unsafe extern "C" fn path_create_directory(
 Calls WASI `path_create_directory` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="path_filestat_get"></a>
 
@@ -882,7 +911,8 @@ pub unsafe extern "C" fn path_filestat_get(
 Calls WASI `path_filestat_get` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="path_filestat_set_times"></a>
 
@@ -904,7 +934,8 @@ pub unsafe extern "C" fn path_filestat_set_times(
 Calls WASI `path_filestat_set_times` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="path_link"></a>
 
@@ -926,7 +957,8 @@ pub unsafe extern "C" fn path_link(
 Calls WASI `path_link` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="path_open"></a>
 
@@ -950,7 +982,8 @@ pub unsafe extern "C" fn path_open(
 Calls WASI `path_open` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="path_readlink"></a>
 
@@ -975,7 +1008,8 @@ pub unsafe extern "C" fn path_readlink(
 Calls WASI `path_readlink` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="path_remove_directory"></a>
 
@@ -993,7 +1027,8 @@ pub unsafe extern "C" fn path_remove_directory(
 Calls WASI `path_remove_directory` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="path_rename"></a>
 
@@ -1014,7 +1049,8 @@ pub unsafe extern "C" fn path_rename(
 Calls WASI `path_rename` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="path_symlink"></a>
 
@@ -1034,7 +1070,8 @@ pub unsafe extern "C" fn path_symlink(
 Calls WASI `path_symlink` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="path_unlink_file"></a>
 
@@ -1052,7 +1089,8 @@ pub unsafe extern "C" fn path_unlink_file(
 Calls WASI `path_unlink_file` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="poll_oneoff"></a>
 
@@ -1075,7 +1113,8 @@ pub unsafe extern "C" fn poll_oneoff(
 Calls WASI `poll_oneoff` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="proc_exit"></a>
 
@@ -1088,8 +1127,8 @@ pub unsafe extern "C" fn proc_exit(code: u32) -> () as "wasi_snapshot_preview1#p
 Calls WASI `proc_exit` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
-This call terminates the process without resource cleanup.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call. This call terminates the process without resource cleanup.
 
 <a id="proc_raise"></a>
 
@@ -1102,7 +1141,8 @@ pub unsafe extern "C" fn proc_raise(signal: u32) -> u32 as "wasi_snapshot_previe
 Calls WASI `proc_raise` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="random_get"></a>
 
@@ -1119,7 +1159,8 @@ pub unsafe extern "C" fn random_get(
 Calls WASI `random_get` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="sched_yield"></a>
 
@@ -1132,7 +1173,8 @@ pub unsafe extern "C" fn sched_yield() -> u32 as "wasi_snapshot_preview1#sched_y
 Calls WASI `sched_yield` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="sock_accept"></a>
 
@@ -1150,7 +1192,8 @@ pub unsafe extern "C" fn sock_accept(
 Calls WASI `sock_accept` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="sock_recv"></a>
 
@@ -1175,7 +1218,8 @@ pub unsafe extern "C" fn sock_recv(
 Calls WASI `sock_recv` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="sock_send"></a>
 
@@ -1195,7 +1239,8 @@ pub unsafe extern "C" fn sock_send(
 Calls WASI `sock_send` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 <a id="sock_shutdown"></a>
 
@@ -1208,7 +1253,8 @@ pub unsafe extern "C" fn sock_shutdown(fd: u32, how: u32) -> u32 as "wasi_snapsh
 Calls WASI `sock_shutdown` with the Preview 1 ABI.
 
 ### Gotchas
-All pointers must address the buffers and structures that the WASI specification requires for this call.
+All pointers must address the buffers and structures that the WASI specification requires for
+this call.
 
 
 Category: Native platform.

@@ -6,8 +6,8 @@ Deterministic seeded hashing for hash maps, hash sets, and key types that users 
 
 ## When to use
 `string` and every integer type implement [`HashKey`](#HashKey), so `HashMap<string, i32>` and
-`HashSet<u64>` work without more code. Implement [`HashKey`](#HashKey) for your own type that is a key of a
-`HashMap` or an element of a `HashSet`. In the `hash` member, use [`Hash.mix`](#Hash.impl.mix) for the first
+`HashSet<u64>` work without more code. Implement [`HashKey`](#HashKey) for your own type that is a key of
+a `HashMap` or an element of a `HashSet`. In the `hash` member, use [`Hash.mix`](#Hash.impl.mix) for the first
 integer field and [`Hash.combine`](#Hash.impl.combine) for each other field that `equals` compares.
 
 ## Details
@@ -196,10 +196,10 @@ first integer field and [`Hash.combine`](#Hash.impl.combine) for each other fiel
 
 ### Details
 
-A `string` key compares its UTF-8 bytes exactly, with no case folding or Unicode
-normalization. An integer key compares its value. A conformance gives two members: `equals(left: &Self, right: &Self) -> bool` and `hash(value:
-&Self, seed: &HashSeed) -> u64`. A collection calls `equals` to compare keys and `hash` with its
-own seed.
+A `string` key compares its UTF-8 bytes exactly, with no case folding or Unicode normalization.
+An integer key compares its value. A conformance gives two members: `equals(left: &Self, right:
+&Self) -> bool` and `hash(value: &Self, seed: &HashSeed) -> u64`. A collection calls `equals` to
+compare keys and `hash` with its own seed.
 
 ### Gotchas
 

@@ -10,12 +10,18 @@ TCP and Unix socket connections and listeners, as `ByteDuplex` providers.
   [`connectResolvedOwned`](#connectResolvedOwned) or [`connectUnixOwned`](#connectUnixOwned) to keep the [`Connection`](#Connection) yourself.
 - To serve, call [`listen`](#listen) or [`listenUnix`](#listenUnix), then [`accept`](#accept) for each client. Use
   [`withAccepted`](#withAccepted) to get the connection and the peer address, and close them after.
+- To drive sockets from your own readiness loop, such as one on `silk.io.reactor`, use the
+  calls that never wait: [`startConnect`](#startConnect) or [`startConnectUnix`](#startConnectUnix) with
+  [`Connection.finishConnect`](#Connection.impl.finishConnect), [`Listener.tryAccept`](#Listener.impl.tryAccept), [`Connection.tryRead`](#Connection.impl.tryRead),
+  [`Connection.tryWrite`](#Connection.impl.tryWrite), and [`Connection.tryWriteVectored`](#Connection.impl.tryWriteVectored). They return `WouldBlock` when the
+  socket is not ready. Register [`Connection.rawDescriptor`](#Connection.impl.rawDescriptor) or [`Listener.rawDescriptor`](#Listener.impl.rawDescriptor) with
+  the loop, and try again when it reports the socket ready.
 
 A [`Connection`](#Connection) provides `ByteDuplex`, so `silk.http.exchange`, `silk.http.server`, and
 `silk.io.buffered_duplex` can use it.
 
 ## Details
-All sockets are nonblocking. When a socket is not ready, the operation waits for the poll
+All sockets are nonblocking. When a socket is not ready, a waiting operation waits for the poll
 interval with `MonotonicClock`, then tries again. So an idle wait costs about one check for each
 interval. One deadline covers all attempts of one connect or accept.
 
@@ -142,7 +148,22 @@ pub fn main() -> i32 {
 
 Import as `NativeSocket` with `import silk.net.socket_native { NativeSocket }`.
 
-Public declarations: 34.
+Public declarations: 42.
+
+<a id="RawSocket"></a>
+
+## `RawSocket`
+
+```silk
+pub type RawSocket = i32
+```
+
+A socket descriptor of the system: a POSIX file descriptor, or a pointer-sized Winsock
+`SOCKET` on Windows.
+
+Get it from [`Connection.rawDescriptor`](#Connection.impl.rawDescriptor) or [`Listener.rawDescriptor`](#Listener.impl.rawDescriptor) to register the socket
+with a readiness queue, such as `silk.io.reactor`. The socket stays owned by its connection or
+listener: do not close it.
 
 <a id="ConnectionPhase"></a>
 
@@ -263,6 +284,16 @@ GetSocketName
 ```
 
 `getsockname`: read the bound address.
+
+<a id="NativeSocketOperation.GetPeerName"></a>
+
+### `GetPeerName`
+
+```silk
+GetPeerName
+```
+
+`getpeername`: read the address of the peer.
 
 <a id="NativeSocketOperation.Accept"></a>
 
@@ -1264,7 +1295,8 @@ The settings of a connect: Nagle, the poll interval, and the attempt limit.
 pub struct ListenOptions
 ```
 
-The settings of a listener: the backlog, address reuse, and the poll interval of accept.
+The settings of a listener: the backlog, address reuse, IPv6-only mode, and the poll interval of
+accept.
 
 <a id="UnixSocketPath"></a>
 
@@ -1415,6 +1447,166 @@ pub peer: UnixPeerAddress
 ```
 
 The address of the client.
+
+<a id="Received"></a>
+
+## `Received`
+
+```silk
+pub union Received
+```
+
+The outcome of [`Connection.tryRead`](#Connection.impl.tryRead).
+
+<a id="Received.Data"></a>
+
+### `Data`
+
+```silk
+Data
+```
+
+The read copied `count` bytes into the buffer. `count` is 0 only for an empty buffer.
+
+<a id="Received.Data.count"></a>
+
+#### Field `count`
+
+```silk
+pub count: usize
+```
+
+The number of bytes read.
+
+<a id="Received.End"></a>
+
+### `End`
+
+```silk
+End
+```
+
+The peer shut down its write side, and every byte before that was read.
+
+<a id="Received.WouldBlock"></a>
+
+### `WouldBlock`
+
+```silk
+WouldBlock
+```
+
+No bytes are ready. Try again when the socket is readable.
+
+<a id="Sent"></a>
+
+## `Sent`
+
+```silk
+pub union Sent
+```
+
+The outcome of [`Connection.tryWrite`](#Connection.impl.tryWrite) and [`Connection.tryWriteVectored`](#Connection.impl.tryWriteVectored).
+
+<a id="Sent.Count"></a>
+
+### `Count`
+
+```silk
+Count
+```
+
+The kernel took the first `count` bytes. `count` is 0 only when there was nothing to send.
+
+<a id="Sent.Count.count"></a>
+
+#### Field `count`
+
+```silk
+pub count: usize
+```
+
+The number of bytes sent.
+
+<a id="Sent.WouldBlock"></a>
+
+### `WouldBlock`
+
+```silk
+WouldBlock
+```
+
+The send buffer is full. Try again when the socket is writable.
+
+<a id="Incoming"></a>
+
+## `Incoming`
+
+```silk
+pub union Incoming
+```
+
+The outcome of [`Listener.tryAccept`](#Listener.impl.tryAccept).
+
+<a id="Incoming.Client"></a>
+
+### `Client`
+
+```silk
+Client
+```
+
+A client connected.
+
+<a id="Incoming.Client.accepted"></a>
+
+#### Field `accepted`
+
+```silk
+pub accepted: Accepted
+```
+
+The open connection and the address of the client.
+
+<a id="Incoming.WouldBlock"></a>
+
+### `WouldBlock`
+
+```silk
+WouldBlock
+```
+
+No client is waiting. Try again when the listener is readable.
+
+<a id="ConnectProgress"></a>
+
+## `ConnectProgress`
+
+```silk
+pub enum ConnectProgress
+```
+
+The outcome of [`Connection.finishConnect`](#Connection.impl.finishConnect).
+
+<a id="ConnectProgress.Connected"></a>
+
+### `Connected`
+
+```silk
+Connected
+```
+
+The connect finished. The connection is open.
+
+<a id="ConnectProgress.InProgress"></a>
+
+### `InProgress`
+
+```silk
+InProgress
+```
+
+The connect goes on. Try again when the socket is writable.
 
 <a id="ConnectOptionsError.impl.Copy"></a>
 
@@ -1578,6 +1770,7 @@ impl ListenOptions
 pub fn make(
     kernelBacklog: usize,
     reuseAddress: bool,
+    ipv6Only: bool,
     pollIntervalNanoseconds: u64,
   ) -> Result<ListenOptions, ListenOptionsError>
 ```
@@ -1598,8 +1791,8 @@ is not 1 through 1000000000.
 pub fn defaults() -> ListenOptions
 ```
 
-Returns the default listen options: a backlog of 128, no address reuse, and a 1 ms poll
-interval.
+Returns the default listen options: a backlog of 128, no address reuse, IPv6 listeners that
+take only IPv6, and a 1 ms poll interval.
 
 <a id="ListenOptions.impl.kernelBacklog"></a>
 
@@ -1620,6 +1813,17 @@ pub fn reuseAddress(self: &Self) -> bool
 ```
 
 Returns whether the listener sets `SO_REUSEADDR`.
+
+<a id="ListenOptions.impl.ipv6Only"></a>
+
+### Method `ipv6Only`
+
+```silk
+pub fn ipv6Only(self: &Self) -> bool
+```
+
+Returns whether an IPv6 listener takes only IPv6 clients (`IPV6_V6ONLY`). When false, it
+also takes IPv4 clients, as IPv4-mapped IPv6 addresses.
 
 <a id="ListenOptions.impl.pollInterval"></a>
 
@@ -2167,7 +2371,325 @@ shutdownWriteRaw: Connection.shutdownConnection
 closeRaw: Connection.closeByteConnection
 ```
 
+<a id="startConnect"></a>
+
+## `startConnect`
+
+```silk
+pub effect fn startConnect(endpoint: Endpoint, options: ConnectOptions) -> Connection
+! NativeSocketError
+```
+
+Makes a TCP socket for `endpoint`, IPv4 or IPv6, and starts its connect without waiting.
+
+### When to use
+Use it when your own loop waits for sockets, such as with `silk.io.reactor`. Use
+[`connectResolvedOwned`](#connectResolvedOwned) to wait for the connect in this call.
+
+### Details
+The socket is nonblocking and close-on-exec, and Nagle is off when `options.noDelay()` is set.
+The returned connection is `Open` when the connect finished at once, else `Connecting`. For a
+`Connecting` connection, wait until [`Connection.rawDescriptor`](#Connection.impl.rawDescriptor) is writable, then call
+[`Connection.finishConnect`](#Connection.impl.finishConnect). The attempt limit and poll interval of `options` are not used.
+
+### Errors
+`ConnectionRefused`, `NetworkUnreachable`, `AddressUnavailable`, `PermissionDenied`,
+`SystemResources`, or another `NativeSocketError`, if the system refused the connect at once.
+
+<a id="startConnectFrom"></a>
+
+## `startConnectFrom`
+
+```silk
+pub effect fn startConnectFrom(local: Endpoint, endpoint: Endpoint, options: ConnectOptions) -> Connection
+! NativeSocketError
+```
+
+Makes a TCP socket bound to the local address `local`, and starts its connect to `endpoint`
+without waiting.
+
+### When to use
+Use it to choose the local address or port of a connection, as Node's `localAddress` and
+`localPort` do. Otherwise use [`startConnect`](#startConnect).
+
+### Details
+It works as [`startConnect`](#startConnect) does, with a bind to `local` before the connect. Port 0 in `local`
+lets the system choose the port.
+
+### Errors
+`FamilyUnsupported` if `local` and `endpoint` are not of one family. `AddressInUse`,
+`AddressUnavailable`, or `NativeFailure` with operation `Bind` if the bind fails. Otherwise the
+errors of [`startConnect`](#startConnect).
+
+<a id="startConnectUnix"></a>
+
+## `startConnectUnix`
+
+```silk
+pub effect fn startConnectUnix(path: &[u8], options: ConnectOptions) -> Connection
+! NativeSocketError
+```
+
+Makes a Unix socket for `path`, and starts its connect without waiting.
+
+### When to use
+Use it when your own loop waits for sockets, such as with `silk.io.reactor`. Use
+[`connectUnixOwned`](#connectUnixOwned) to wait for the connect in this call.
+
+### Details
+The socket is nonblocking and close-on-exec. The returned connection is `Open` when the
+connect finished at once, else `Connecting`. For a `Connecting` connection, wait until
+[`Connection.rawDescriptor`](#Connection.impl.rawDescriptor) is writable, then call [`Connection.finishConnect`](#Connection.impl.finishConnect). The options
+of `options` are not used.
+
+### Errors
+`InvalidEndpoint` or `PathTooLong` if `path` is not valid. `ConnectionRefused` if no listener
+is at `path`. On Linux, `NativeFailure` with operation `Connect` and errno `EAGAIN` (11) if the
+backlog of the listener is full. Windows returns `FamilyUnsupported`.
+
+<a id="Connection.impl-3"></a>
+
+## Implementation `Connection`
+
+```silk
+impl Connection
+```
+
+<a id="Connection.impl.rawDescriptor"></a>
+
+### Method `rawDescriptor`
+
+```silk
+pub fn rawDescriptor(self: &Self) -> RawSocket
+```
+
+Returns the socket descriptor, to register it with a readiness queue such as
+`silk.io.reactor`.
+
+#### Details
+The connection still owns the socket: do not close it, and remove it from the queue before
+the connection is closed or dropped. After a close, it returns the invalid descriptor (-1, or
+`INVALID_SOCKET` on Windows). Both halves of a split connection return the same descriptor.
+
+<a id="Connection.impl.finishConnect"></a>
+
+### Method `finishConnect`
+
+```silk
+pub effect fn finishConnect(self: &mut Self) -> ConnectProgress ! NativeSocketError
+```
+
+Checks a connect from [`startConnect`](#startConnect) or [`startConnectUnix`](#startConnectUnix), without waiting.
+
+#### Details
+Call it when the socket is writable. It polls the socket once with no timeout, then
+returns `Connected` and sets the phase to `Open` when the connect finished, and
+`InProgress` while it goes on. It returns `Connected` for a
+connection that is already open.
+
+#### Errors
+The error of the failed connect, such as `ConnectionRefused` or `NetworkUnreachable`, or
+`NativeFailure` with operation `Connect` or `Poll` and the errno. The connection stays
+`Connecting`: close it after you remove it from your readiness queue. `Closed` if it is
+closed.
+
+<a id="Connection.impl.tryRead"></a>
+
+### Method `tryRead`
+
+```silk
+pub effect fn tryRead(self: &mut Self, output: &mut [u8]) -> Received ! NativeSocketError
+```
+
+Reads the bytes that are ready, at most `output.length`, without waiting.
+
+#### When to use
+Use it when your own loop waits for sockets, such as with `silk.io.reactor`. Use
+`ByteDuplex.readSome` to wait for bytes in this call.
+
+#### Details
+It returns `Data` with the count, `End` when the peer shut down its write side, and
+`WouldBlock` when no bytes are ready. After `End`, every call returns `End`. An empty
+`output` returns `Data` with count 0 and reads nothing.
+
+#### Errors
+`Closed` if the connection is closed or its connect has not finished. `NativeFailure` with
+operation `Read` and the errno, such as `ECONNRESET`. The connection stays open: close it
+after you remove it from your readiness queue.
+
+<a id="Connection.impl.tryWrite"></a>
+
+### Method `tryWrite`
+
+```silk
+pub effect fn tryWrite(self: &mut Self, input: &[u8]) -> Sent ! NativeSocketError
+```
+
+Sends the bytes of `input` that fit in the send buffer, without waiting.
+
+#### When to use
+Use it when your own loop waits for sockets, such as with `silk.io.reactor`. Use
+`ByteDuplex.writeSome` to wait for room in this call.
+
+#### Details
+It returns `Count` with the bytes sent, which can be fewer than `input.length`, and
+`WouldBlock` when the buffer is full. An empty `input` returns `Count` 0. A send to a closed
+peer fails and does not raise `SIGPIPE`.
+
+#### Errors
+`WriteClosed` after [`shutdownWrite`](#Connection.impl.shutdownWrite). `Closed` if the connection is closed or its connect has
+not finished. `NativeFailure` with operation `Write` and the errno, such as `EPIPE` or
+`ECONNRESET`.
+
+<a id="Connection.impl.tryWriteVectored"></a>
+
+### Method `tryWriteVectored`
+
+```silk
+pub effect fn tryWriteVectored(self: &mut Self, inputs: &[&[u8]]) -> Sent ! NativeSocketError
+```
+
+Sends the slices of `inputs` in order, as many bytes as fit in the send buffer, in one
+system call and without waiting.
+
+#### Details
+One call sends from at most eight non-empty slices; empty slices are skipped. It returns
+`Count` with the bytes sent, counted across the slices, and `WouldBlock` when the buffer is
+full. No slices, or only empty ones, return `Count` 0. A send to a closed peer fails and does
+not raise `SIGPIPE`.
+
+#### Errors
+`WriteClosed` after [`shutdownWrite`](#Connection.impl.shutdownWrite). `Closed` if the connection is closed or its connect has
+not finished. `NativeFailure` with operation `Write` and the errno, such as `EPIPE` or
+`ECONNRESET`.
+
+<a id="Connection.impl.shutdownWrite"></a>
+
+### Method `shutdownWrite`
+
+```silk
+pub effect fn shutdownWrite(self: &mut Self) -> () ! NativeSocketError
+```
+
+Shuts down the write side, so the peer reads the end after the bytes already sent. Reads are
+still allowed. A second call does nothing. It does not wait.
+
+#### Errors
+`Closed` if the connection is closed or its connect has not finished. `NativeFailure` with
+operation `ShutdownWrite` and the errno, such as `ENOTCONN` after the peer reset.
+
+<a id="Connection.impl.setNoDelay"></a>
+
+### Method `setNoDelay`
+
+```silk
+pub effect fn setNoDelay(self: &mut Self, enabled: bool) -> () ! NativeSocketError
+```
+
+Turns Nagle off (`TCP_NODELAY` set) when `enabled` is true, and on when it is false.
+
+#### Errors
+`Closed` if the connection is closed. `NativeFailure` with operation `Configure` and the
+errno, such as `EOPNOTSUPP` on a Unix socket.
+
+<a id="Connection.impl.setKeepAlive"></a>
+
+### Method `setKeepAlive`
+
+```silk
+pub effect fn setKeepAlive(self: &mut Self, enabled: bool, idleSeconds: u32) -> ()
+  ! NativeSocketError
+```
+
+Turns TCP keepalive probes on or off (`SO_KEEPALIVE`).
+
+#### Details
+With `enabled` and an `idleSeconds` above 0, the first probe goes after the connection is
+idle for `idleSeconds` (`TCP_KEEPIDLE` on Linux, `TCP_KEEPALIVE` on Darwin and Windows). With
+`idleSeconds` 0, the system default stays. The probe interval and count are the system
+defaults. `idleSeconds` is not used when `enabled` is false.
+
+#### Errors
+`Closed` if the connection is closed. `NativeFailure` with operation `Configure` and the
+errno, such as `EINVAL` for an idle time that the system does not allow.
+
+<a id="Connection.impl.localEndpoint"></a>
+
+### Method `localEndpoint`
+
+```silk
+pub effect fn localEndpoint(self: &Self) -> Endpoint ! NativeSocketError
+```
+
+Returns the local address and port of a TCP connection.
+
+#### Errors
+`Closed` if the connection is closed. `InvalidNativeAddress` for a Unix socket connection.
+`NativeFailure` with operation `GetSocketName` and the errno.
+
+<a id="Connection.impl.peerEndpoint"></a>
+
+### Method `peerEndpoint`
+
+```silk
+pub effect fn peerEndpoint(self: &Self) -> Endpoint ! NativeSocketError
+```
+
+Returns the address and port of the peer of a TCP connection.
+
+#### Errors
+`Closed` if the connection is closed. `InvalidNativeAddress` for a Unix socket connection.
+`NativeFailure` with operation `GetPeerName` and the errno, such as `ENOTCONN` before the
+connect finished or after the peer reset.
+
+<a id="Listener.impl-2"></a>
+
+## Implementation `Listener`
+
+```silk
+impl Listener
+```
+
+<a id="Listener.impl.rawDescriptor"></a>
+
+### Method `rawDescriptor`
+
+```silk
+pub fn rawDescriptor(self: &Self) -> RawSocket
+```
+
+Returns the socket descriptor, to register it with a readiness queue such as
+`silk.io.reactor`. The listener is readable when a client waits.
+
+#### Details
+The listener still owns the socket: do not close it, and remove it from the queue before the
+listener is closed or dropped. After a close, it returns the invalid descriptor (-1, or
+`INVALID_SOCKET` on Windows).
+
+<a id="Listener.impl.tryAccept"></a>
+
+### Method `tryAccept`
+
+```silk
+pub effect fn tryAccept(self: &mut Self) -> Incoming ! NativeSocketError
+```
+
+Accepts the next client if one waits, without waiting.
+
+#### When to use
+Use it when your own loop waits for sockets, such as with `silk.io.reactor`. Use [`accept`](#accept)
+to wait for a client in this call.
+
+#### Details
+It returns `Client` with the open connection, which is nonblocking and close-on-exec with
+Nagle on, and `WouldBlock` when no client waits. A client that failed before it was
+accepted is skipped.
+
+#### Errors
+`Closed` if the listener is closed. `SystemResources` when the process or system is out of
+descriptors or memory. `NativeFailure` with operation `Accept` and the errno.
+
 
 Category: Networking.
 
-Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `x86_64-pc-windows-msvc`, `wasm64-unknown-unknown`.
+Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`, `wasm64-unknown-unknown`.

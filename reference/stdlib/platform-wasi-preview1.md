@@ -5,12 +5,13 @@
 The WASI Preview 1 canonical ABI, also used inside Preview 2 command components.
 
 ## When to use
-Use these unsafe calls to implement a WASI provider. Applications use the portable service interfaces.
+Use these unsafe calls to implement a WASI provider. Applications use the portable service
+interfaces.
 
 ## Details
-Functions return a WASI errno: zero means success. Pointer arguments use the Preview 1 memory layouts.
-Calls do not retain pointers. The host controls descriptor rights and available resources.
-Preview 2 builds translate these calls through the WASI command adapter.
+Functions return a WASI errno: zero means success. Pointer arguments use the Preview 1 memory
+layouts. Calls do not retain pointers. The host controls descriptor rights and available
+resources. Preview 2 builds translate these calls through the WASI command adapter.
 
 Public declarations: 0.
 

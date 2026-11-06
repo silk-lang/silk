@@ -5,9 +5,10 @@
 MSVC command-line encoding and decoding over Windows UTF-16 code units.
 
 ## When to use
-Use `CommandLine.parse` for a complete host command line. It returns raw canonical WTF-8 arguments.
-Argument zero has its own quote rules. No wildcard expansion or shell interpretation occurs.
-`CommandLine.encode` prepares a NUL-terminated command line for direct executable launch.
+Use `CommandLine.parse` for a complete host command line. It returns raw canonical WTF-8
+arguments. Argument zero has its own quote rules. No wildcard expansion or shell interpretation
+occurs. `CommandLine.encode` prepares a NUL-terminated command line for direct executable
+launch.
 
 Import as `CommandLine` with `import silk.platform.windows.command_line { CommandLine }`.
 
@@ -72,10 +73,10 @@ Returns arguments in order, with the executable name at index zero.
 
 #### Details
 
-`units` excludes the host NUL terminator. Empty input produces one empty program name.
-Leading space or tab also produces an empty program name. Only space and tab separate arguments.
-Quotes in argument zero toggle quoting; its backslashes are literal. Later arguments use
-MSVC backslash parity and doubled quotes inside quoted text. An unmatched quote consumes the rest.
+`units` excludes the host NUL terminator. Empty input produces one empty program name. Leading
+space or tab also produces an empty program name. Only space and tab separate arguments.
+Quotes in argument zero toggle quoting; its backslashes are literal. Later arguments use MSVC
+backslash parity and doubled quotes inside quoted text. An unmatched quote consumes the rest.
 Lone UTF-16 surrogates survive as WTF-8 bytes, never as a valid UTF-8 `string`.
 
 #### Errors

@@ -21,6 +21,7 @@ import backend.LoweringPlan {
   Callable,
   Lane,
   Step,
+  CopyLeaves,
   ParameterLanes,
   Representation,
   booleanRepresentation,
@@ -33,6 +34,7 @@ import backend.LoweringPlan {
   layoutOf,
   offsetAlignment,
   ownedParameter,
+  copyLeaves,
   parameterLanes,
   passedIndirectly,
   pointerRepresentation,
@@ -2590,6 +2592,27 @@ effect fn emitVector(
   let kind = scalar(ty, target)
   // An architecture operation calls its catalog intrinsic on the operands as they are (SIMD-007).
   let arch = CheckedIntrinsic.archForResult(primitive, ty)
+  if arch.arity != usize.ZERO && arch.lane != usize.MAX {
+    // The intrinsic takes one lane of each operand as a scalar and answers 16 bytes.
+    let laneType = run integerType(&mut writer.*, 64)
+    let int32 = run integerType(&mut writer.*, 32)
+    let index = run Module.int(&mut writer.*.module, int32, usize.toU64(arch.lane))
+    let mut parameters = List<u64>.make()
+    let mut arguments = List<u64>.make()
+    let mut operand = usize.ZERO
+    while operand < lowered.length {
+      run List<u64>.append(&mut parameters, laneType)
+      let element = run Module.extractElement(&mut writer.*.module, lowered[operand].value, index)
+      run List<u64>.append(&mut arguments, element)
+      operand = operand + usize.ONE
+    }
+    let byte = run integerType(&mut writer.*, 8)
+    let bytes = run Module.vector(&mut writer.*.module, 16, byte)
+    let product = run callNamed(&mut writer.*, arch.llvm, bytes, List<u64>.asSlice(&parameters), List<u64>.asSlice(&arguments))
+    let result = run typeOf(&mut writer.*, kind)
+    let vector = run Module.cast(&mut writer.*.module, Bitcode.castBitcast(), product, result)
+    return Value {scalar: kind, value: vector}
+  }
   if arch.arity != usize.ZERO {
     let mut parameters = List<u64>.make()
     let mut arguments = List<u64>.make()
@@ -2997,6 +3020,18 @@ effect fn emitScalarRvalue(
       return Value {scalar: pointerRepresentation(target),
         value: run callNamed(&mut writer.*, b"llvm.frameaddress.p0", pointer, &parameters, &arguments)}
     }
+    // The word is a hidden zero-initialized global named after the instance's own symbol, so it
+    // is defined exactly where the instance is, once per program.
+    Rvalue.ProcessWord => {
+      let word = run integerType(&mut writer.*, 64)
+      let zero = run integerOf(&mut writer.*, 64, 0)
+      let mut name = run Bytes.copy(Bytes.asSlice(&writer.symbol))
+      run Bytes.append(&mut name, b".word")
+      let global = run Module.defineObject(&mut writer.*.module, Bytes.asSlice(&name), word, Bitcode.linkExternal(), false, zero)
+      Module.setHidden(&mut writer.*.module, global)
+      Module.setAlignment(&mut writer.*.module, global, 8)
+      return Value {scalar: pointerRepresentation(target), value: global}
+    }
     Rvalue.Wasm {primitive, operands} => run emitWasm(&mut writer.*, function, target, layouts, primitive, &operands, span)
     // A dynamic `alloca` outside the entry block: LLVM releases it when the function returns. The
     // byte count traps when it does not fit the target word.
@@ -3092,7 +3127,7 @@ effect fn emitScalarRvalue(
     }
     Rvalue.Discriminant {place} => {
       let address = run emitPlace(&mut writer.*, function, target, layouts, &place)
-      let kind = tagRepresentation(run taggedFact(layouts, &address.ty, function, span))
+      let kind = tagRepresentation(run taggedFact(layouts, &address.ty))
       return Value {scalar: kind, value: run loadOf(&mut writer.*, kind, address.value, address.alignment)}
     }
     Rvalue.Use {value} => run emitOperand(&mut writer.*, function, target, layouts, &value)
@@ -3202,14 +3237,82 @@ effect fn emitScalarRvalue(
   }
 }
 
+// Stores a scalar, or copies an aggregate as bytes; `storeCopy` copies a small record by fields.
 effect fn storeValue(writer: &mut Writer, address: &Address, value: &Value) -> ()
 ! OutOfMemoryError ? &mut Allocator {
-  return run storeCopy(&mut writer.*, address, value, false)
+  return run storeBytes(&mut writer.*, address, value, false)
 }
 
-// `distinct` says the value's bytes never overlap the address, so a fast-path function may copy an
-// aggregate with `llvm.memcpy` (see `Writer.fastPath`).
-effect fn storeCopy(writer: &mut Writer, address: &Address, value: &Value, distinct: bool) -> ()
+// Stores `value` at `address`; an aggregate value is the address of its bytes. A small record
+// copies field by field (`copyLeaves`), any other aggregate as bytes (`storeBytes`). `distinct`
+// says the value's bytes never overlap the address, so a fast-path function may copy an aggregate
+// with `llvm.memcpy` (see `Writer.fastPath`). A fast-path function keeps the byte copy, which is
+// one call where the fields would be many instructions.
+effect fn storeCopy(writer: &mut Writer, function: &MirFunction, target: &Target, layouts: &TypeLayouts,
+  address: &Address, value: &Value, distinct: bool) -> () ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if address.representation.aggregate && address.representation.unionAlignment == usize.ZERO && !writer.fastPath {
+    let facts = run layoutOf(layouts, &address.ty, function, Location.generated())
+    // An injected member's slot names the union's type (`emitAssign`), whose size differs.
+    if facts.size == address.representation.size {
+      let plan = run copyLeaves(layouts, &address.ty, facts, target, function, Location.generated())
+      if plan.count != usize.ZERO { return run storeLeaves(&mut writer.*, address, value, facts.alignment, &plan) }
+    }
+  }
+  return run storeBytes(&mut writer.*, address, value, distinct)
+}
+
+// Copies a record by its fields (`copyLeaves`): every field is loaded before any is stored, so
+// overlapping places stay correct. Both places hold the record, so the source has its alignment.
+// Two adjacent 8-byte integers move as one i128, which LLVM splits back into two word moves: as
+// two loads and stores, the SLP vectorizer would merge them into the 16-byte vector move the field
+// copy avoids (see `storePackedUnion`). Floats and pointers keep their own types. A float moved as
+// an integer leaves SROA an integer slice for it, and a loop that carries that slice through
+// bitcasts crashes LLVM 22's x86 peephole optimizer. A vector of one integer and one pointer
+// cannot hold the pointer's provenance.
+effect fn storeLeaves(writer: &mut Writer, address: &Address, value: &Value, alignment: usize, plan: &CopyLeaves) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let wide = integerRepresentation(128, false)
+  let mut lanes = plan.lanes
+  let mut offsets = plan.offsets
+  let mut count = usize.ZERO
+  let mut at = usize.ZERO
+  while at < plan.count {
+    lanes[count] = plan.lanes[at]
+    offsets[count] = plan.offsets[at]
+    if at + usize.ONE < plan.count && pairedWord(plan.lanes[at]) && pairedWord(plan.lanes[at + usize.ONE])
+      && plan.offsets[at + usize.ONE] == plan.offsets[at] + 8 {
+      lanes[count] = wide
+      at = at + usize.ONE
+    }
+    count = count + usize.ONE
+    at = at + usize.ONE
+  }
+  let mut loaded: [u64; 8] = [0, 0, 0, 0, 0, 0, 0, 0]
+  at = usize.ZERO
+  while at < count {
+    let mut source = value.value
+    if offsets[at] != usize.ZERO { source = run byteOffset(&mut writer.*, value.value, offsets[at]) }
+    loaded[at] = run loadOf(&mut writer.*, lanes[at], source, offsetAlignment(alignment, offsets[at]))
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < count {
+    let mut destination = address.value
+    if offsets[at] != usize.ZERO { destination = run byteOffset(&mut writer.*, address.value, offsets[at]) }
+    run storeOf(&mut writer.*, loaded[at], destination, offsetAlignment(address.alignment, offsets[at]))
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Whether a field copy pairs `lane` with an adjacent one into an i128 (`storeLeaves`): an 8-byte
+// integer, never a float or a pointer.
+fn pairedWord(lane: Representation) -> bool {
+  return !lane.pointer && !lane.floating && lane.bits == 64
+}
+
+// Stores a scalar, or copies an aggregate's bytes.
+effect fn storeBytes(writer: &mut Writer, address: &Address, value: &Value, distinct: bool) -> ()
 ! OutOfMemoryError ? &mut Allocator {
   if address.representation.unit { return () }
   // Source and destination may overlap, as when a member is injected into a slot of its own place.
@@ -3381,7 +3484,7 @@ effect fn emitAssign(
       let selectedField = run projectField(&mut writer.*, function, target, layouts,
         &address, operands[fieldAt].index, span)
       let operand = run emitOperand(&mut writer.*, function, target, layouts, &operands[fieldAt].value)
-      run storeCopy(&mut writer.*, &selectedField, &operand, separate(destination, &operands[fieldAt].value, ordinary))
+      run storeCopy(&mut writer.*, function, target, layouts, &selectedField, &operand, separate(destination, &operands[fieldAt].value, ordinary))
       fieldAt = fieldAt + usize.ONE
     }
     return ()
@@ -3393,7 +3496,7 @@ effect fn emitAssign(
   }
   if let Rvalue.Inject {tag, value: member} = &value.* {
     // The tag is stored first; the member is stored at the layout's payload offset.
-    let facts = run taggedFact(layouts, &address.ty, function, span)
+    let facts = run taggedFact(layouts, &address.ty)
     run storeTag(&mut writer.*, facts, tag, &address)
     let operand = run emitOperand(&mut writer.*, function, target, layouts, &member)
     let payload = run byteOffset(&mut writer.*, address.value, facts.payloadOffset)
@@ -3402,17 +3505,17 @@ effect fn emitAssign(
     let whole = run layoutOf(layouts, &address.ty, function, span)
     let room = whole.size - facts.payloadOffset
     if run storeWidened(&mut writer.*, &slot, &operand, room) { return () }
-    run storeCopy(&mut writer.*, &slot, &operand, separate(destination, &member, ordinary))
+    run storeCopy(&mut writer.*, function, target, layouts, &slot, &operand, separate(destination, &member, ordinary))
     return ()
   }
   if let Rvalue.Variant {tag, fields} = &value.* {
     // The tag is stored first; each operand is stored at its variant field offset.
-    let facts = run taggedFact(layouts, &address.ty, function, span)
+    let facts = run taggedFact(layouts, &address.ty)
     run storeTag(&mut writer.*, facts, tag, &address)
     let operands = List<AggregateField>.asSlice(&fields)
     let mut fieldAt = usize.ZERO
     while fieldAt < operands.length {
-      let selected = run variantFieldFact(layouts, &address.ty, tag, operands[fieldAt].index, function, span)
+      let selected = run variantFieldFact(layouts, &address.ty, tag, operands[fieldAt].index)
       let operand = run emitOperand(&mut writer.*, function, target, layouts, &operands[fieldAt].value)
       let fieldAddress = run byteOffset(&mut writer.*, address.value, selected.offset)
       let slot = Address {ty: move selected.ty, value: fieldAddress,
@@ -3425,7 +3528,7 @@ effect fn emitAssign(
         widened = run storeWidened(&mut writer.*, &slot, &operand, room)
       }
       if !widened {
-        run storeCopy(&mut writer.*, &slot, &operand, separate(destination, &operands[fieldAt].value, ordinary))
+        run storeCopy(&mut writer.*, function, target, layouts, &slot, &operand, separate(destination, &operands[fieldAt].value, ordinary))
       }
       fieldAt = fieldAt + usize.ONE
     }
@@ -3464,7 +3567,7 @@ effect fn emitAssign(
     Rvalue.Use {value: used} => separate(destination, &used, ordinary)
     _ => false
   }
-  run storeCopy(&mut writer.*, &address, &selected, distinct)
+  run storeCopy(&mut writer.*, function, target, layouts, &address, &selected, distinct)
   return ()
 }
 
@@ -3552,13 +3655,13 @@ effect fn emitReturn(
   if fallible {
     let output = Address {ty: Shared<Type>.clone(&function.result), value: writer.out,
       alignment: resultLayout.alignment, representation: kind}
-    run storeCopy(&mut writer.*, &output, &value, true)
+    run storeCopy(&mut writer.*, function, target, layouts, &output, &value, true)
     return run returnStatus(&mut writer.*, false)
   }
   if kind.aggregate || (!cExport(function) && passedIndirectly(kind)) {
     let output = Address {ty: Shared<Type>.clone(&function.result), value: writer.out,
       alignment: resultLayout.alignment, representation: kind}
-    run storeCopy(&mut writer.*, &output, &value, true)
+    run storeCopy(&mut writer.*, function, target, layouts, &output, &value, true)
     return run Module.retVoid(&mut writer.*.module)
   }
   return run Module.ret(&mut writer.*.module, value.value)
@@ -3668,7 +3771,7 @@ effect fn emitFailureContext(writer: &mut Writer, function: &MirFunction, target
   if identities.length > usize.ONE {
     // The active member's tag selects its identity.
     let slot = run emitPlace(&mut writer.*, function, target, layouts, destination)
-    let kind = tagRepresentation(run taggedFact(layouts, &slot.ty, function, origin.location))
+    let kind = tagRepresentation(run taggedFact(layouts, &slot.ty))
     let tag = run loadOf(&mut writer.*, kind, slot.value, usize.ZERO)
     let mut member = usize.ONE
     while member < identities.length {
@@ -3702,7 +3805,7 @@ effect fn emitFail(writer: &mut Writer, function: &MirFunction, target: &Target,
     let value = run emitOperand(&mut writer.*, function, target, layouts, &failed)
     let output = Address {ty: Shared<Type>.clone(&locals[local].ty), value: writer.failure,
       alignment: failureLayout.alignment, representation: kind}
-    run storeCopy(&mut writer.*, &output, &value, true)
+    run storeCopy(&mut writer.*, function, target, layouts, &output, &value, true)
   }
   return run returnStatus(&mut writer.*, true)
 }
@@ -4408,7 +4511,7 @@ effect fn emitForeignStaticRead(
     representation: output.representation,
   }
   let value = run loadAddress(&mut writer.*, &object)
-  return run storeValue(&mut writer.*, &output, &value)
+  return run storeCopy(&mut writer.*, function, target, layouts, &output, &value, false)
 }
 
 // A placeholder function type for a symbol used only as an address.
@@ -4944,7 +5047,7 @@ effect fn emitEntrySlots(
     }
     let address = Address {ty: Shared<Type>.clone(&parameters[local]), value: slot,
       alignment: parameterLayout.alignment, representation: kind}
-    run storeCopy(&mut writer.*, &address, &Value {scalar: kind, value: input}, true)
+    run storeCopy(&mut writer.*, function, target, layouts, &address, &Value {scalar: kind, value: input}, true)
     local = local + usize.ONE
   }
   return run emitHiddenStores(&mut writer.*, function)
@@ -6115,17 +6218,54 @@ effect fn emitEnter(writer: &mut Writer, function: &MirFunction, target: &Target
   let wordTy = run wordType(&mut writer.*)
   let size = run wordOf(&mut writer.*, stepping.coroutine.size)
   let alignment = run wordOf(&mut writer.*, stepping.coroutine.alignment)
+  let null = run nullOf(&mut writer.*)
+  let start = run labelled(&mut writer.*, b"start")
+  let provide = run labelled(&mut writer.*, b"provide")
+  let provided = run labelled(&mut writer.*, b"provided")
+  // A frame no more aligned than a word is carved from the state's window when it fits: the
+  // window's word-aligned cursor moves past it, and its release moves the cursor back.
+  let mut carvedIncoming = List<u64>.make()
+  let mut frameIncoming = List<u64>.make()
+  if stepping.coroutine.alignment <= word {
+    let cursor = run loadPointer(&mut writer.*, state, usize.ZERO)
+    let end = run loadWordAt(&mut writer.*, state, word)
+    let low = run Module.cast(&mut writer.*.module, Bitcode.castPtrToInt(), cursor, wordTy)
+    let high = run Module.cast(&mut writer.*.module, Bitcode.castPtrToInt(), end, wordTy)
+    let room = run binaryOf(&mut writer.*, Bitcode.opSub(), high, low)
+    let fits = run compareOf(&mut writer.*, Bitcode.intUle(), size, room)
+    let carve = run labelled(&mut writer.*, b"carve")
+    run branchExpecting(&mut writer.*, fits, true, carve, provide)
+    startBlock(&mut writer.*, carve)
+    let moved = run byteOffset(&mut writer.*, cursor, stepping.coroutine.size)
+    run storeOf(&mut writer.*, moved, state, usize.ZERO)
+    run branch(&mut writer.*, start)
+    run List<u64>.append(&mut frameIncoming, cursor)
+    run List<u64>.append(&mut frameIncoming, carve)
+    run List<u64>.append(&mut carvedIncoming, cursor)
+    run List<u64>.append(&mut carvedIncoming, carve)
+  } else {
+    run branch(&mut writer.*, provide)
+  }
+  startBlock(&mut writer.*, provide)
   let acquireParameters = [pointer, wordTy, wordTy]
   let acquireArguments = [state, size, alignment]
-  let frame = run callNamed(&mut writer.*, Bytes.asSlice(&stepping.facts.acquire), pointer, &acquireParameters, &acquireArguments)
-  Module.setName(&mut writer.*.module, frame, hiddenName(b"frame"))
-  writer.frame = frame
-  let absent = run isNull(&mut writer.*, frame)
-  let start = run labelled(&mut writer.*, b"start")
-  run branchIf(&mut writer.*, absent, exhausted, start)
+  let acquired = run callNamed(&mut writer.*, Bytes.asSlice(&stepping.facts.acquire), pointer, &acquireParameters, &acquireArguments)
+  let absent = run isNull(&mut writer.*, acquired)
+  run branchIf(&mut writer.*, absent, exhausted, provided)
   startBlock(&mut writer.*, exhausted)
   run trapHere(&mut writer.*)
+  startBlock(&mut writer.*, provided)
+  run branch(&mut writer.*, start)
+  run List<u64>.append(&mut frameIncoming, acquired)
+  run List<u64>.append(&mut frameIncoming, provided)
+  run List<u64>.append(&mut carvedIncoming, null)
+  run List<u64>.append(&mut carvedIncoming, provided)
   startBlock(&mut writer.*, start)
+  let frame = run Module.phi(&mut writer.*.module, pointer, List<u64>.asSlice(&frameIncoming))
+  let carved = run Module.phi(&mut writer.*.module, pointer, List<u64>.asSlice(&carvedIncoming))
+  Module.setName(&mut writer.*.module, frame, hiddenName(b"frame"))
+  writer.frame = frame
+  run storeWordAt(&mut writer.*, carved, frame, Coroutine.carvedOffset(word))
   let parent = run loadWordAt(&mut writer.*, transfer, Coroutine.transferTop(word))
   run storeOf(&mut writer.*, parent, frame, usize.ZERO)
   let stepTy = run stepType(&mut writer.*)
@@ -6181,7 +6321,7 @@ effect fn emitEnter(writer: &mut Writer, function: &MirFunction, target: &Target
       }
       let address = Address {ty: Shared<Type>.clone(&parameters[at]), value: slot,
         alignment: offsetAlignment(stepping.coroutine.alignment, offset), representation: kind}
-      run storeValue(&mut writer.*, &address, &Value {scalar: kind, value: input})
+      run storeCopy(&mut writer.*, function, target, layouts, &address, &Value {scalar: kind, value: input}, false)
     }
     at = at + usize.ONE
   }
@@ -6398,9 +6538,24 @@ effect fn emitPop(writer: &mut Writer, target: &Target, stepping: &Suspended, fa
   let state = run loadPointer(&mut writer.*, transfer, usize.ZERO)
   let void = run voidType(&mut writer.*)
   let pointer = run pointerType(&mut writer.*)
+  // A carved frame returns the window's cursor to itself; an acquired one goes back to the state.
+  let carved = run loadWordAt(&mut writer.*, frame, Coroutine.carvedOffset(word))
+  let acquiredFrame = run isNull(&mut writer.*, carved)
+  // A step pops at each of its returns, so these blocks are numbered apart.
+  let number = Module.fresh(&mut writer.*.module)
+  let restore = run Module.newBlock(&mut writer.*.module, Bitcode.named(Bitcode.prefix(b"restore"), number))
+  let returning = run Module.newBlock(&mut writer.*.module, Bitcode.named(Bitcode.prefix(b"returning"), number))
+  let completed = run Module.newBlock(&mut writer.*.module, Bitcode.named(Bitcode.prefix(b"done"), number))
+  run branchExpecting(&mut writer.*, acquiredFrame, false, returning, restore)
+  startBlock(&mut writer.*, restore)
+  run storeOf(&mut writer.*, frame, state, usize.ZERO)
+  run branch(&mut writer.*, completed)
+  startBlock(&mut writer.*, returning)
   let parameters = [pointer, pointer]
   let arguments = [state, frame]
   let _none = run callNamed(&mut writer.*, Bytes.asSlice(&stepping.facts.release), void, &parameters, &arguments)
+  run branch(&mut writer.*, completed)
+  startBlock(&mut writer.*, completed)
   let done = run integerOf(&mut writer.*, 32, 0)
   return run Module.ret(&mut writer.*.module, done)
 }
@@ -6415,7 +6570,7 @@ effect fn emitStepReturn(writer: &mut Writer, function: &MirFunction, target: &T
     let value = run emitOperand(&mut writer.*, function, target, layouts, &returned)
     let output = Address {ty: Shared<Type>.clone(&function.result), value: writer.out,
       alignment: resultLayout.alignment, representation: kind}
-    run storeValue(&mut writer.*, &output, &value)
+    run storeCopy(&mut writer.*, function, target, layouts, &output, &value, false)
   }
   let mut failed = Option<bool>.none()
   if failureLocal(function) != usize.MAX { failed = Option<bool>.some(false) }
@@ -6438,7 +6593,7 @@ effect fn emitStepFail(writer: &mut Writer, function: &MirFunction, target: &Tar
     let value = run emitOperand(&mut writer.*, function, target, layouts, &failedValue)
     let output = Address {ty: Shared<Type>.clone(&locals[local].ty), value: writer.failure,
       alignment: failureLayout.alignment, representation: kind}
-    run storeValue(&mut writer.*, &output, &value)
+    run storeCopy(&mut writer.*, function, target, layouts, &output, &value, false)
   }
   return run emitPop(&mut writer.*, target, stepping, Option<bool>.some(true))
 }

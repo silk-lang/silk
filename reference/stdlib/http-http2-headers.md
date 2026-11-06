@@ -121,8 +121,9 @@ pub effect<'call> fn validate<'call, 'data: 'call>(
   ! ProtocolError
 ```
 
-Validates one complete decoded field section. Violations are stream PROTOCOL_ERRORs.
-It rejects invalid bytes, pseudo-header order and duplicates, connection fields, and conflicting Content-Length values.
+Validates one complete decoded field section. Violations are stream PROTOCOL_ERRORs. It rejects
+invalid bytes, pseudo-header order and duplicates, connection fields, and conflicting
+Content-Length values.
 
 
 Category: HTTP.

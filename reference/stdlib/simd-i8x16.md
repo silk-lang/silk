@@ -187,7 +187,8 @@ Returns a mask with lane `i` set where lane `i` of `left` is less than lane `i` 
 pub fn lanesLessOrEqual(left: simd<i8, 16>, right: simd<i8, 16>) -> mask<16>
 ```
 
-Returns a mask with lane `i` set where lane `i` of `left` is less than or equal to lane `i` of `right`.
+Returns a mask with lane `i` set where lane `i` of `left` is less than or equal to lane `i` of
+`right`.
 
 <a id="lanesGreater"></a>
 
@@ -207,7 +208,8 @@ Returns a mask with lane `i` set where lane `i` of `left` is greater than lane `
 pub fn lanesGreaterOrEqual(left: simd<i8, 16>, right: simd<i8, 16>) -> mask<16>
 ```
 
-Returns a mask with lane `i` set where lane `i` of `left` is greater than or equal to lane `i` of `right`.
+Returns a mask with lane `i` set where lane `i` of `left` is greater than or equal to lane `i`
+of `right`.
 
 <a id="select"></a>
 

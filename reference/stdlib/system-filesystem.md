@@ -8,8 +8,8 @@ atomic writes, directory listings, and temporary directories.
 ## When to use
 Make a [`Path`](#Path) with [`Path.make`](#Path.impl.make), [`Path.join`](#Path.impl.join), or [`Path.resolve`](#Path.impl.resolve). Then require `&mut
 FileSystem` and call [`FileSystem.readFile`](#FileSystem.readFile), [`FileSystem.writeFile`](#FileSystem.writeFile), and the other
-operations. Native programs provide `silk.system.filesystem_native`. Tests can provide a file system in
-memory.
+operations. Native programs provide `silk.system.filesystem_native`. Tests can provide a file
+system in memory.
 
 Use [`FileSystem.writeFileAtomic`](#FileSystem.writeFileAtomic) when a reader must never see a partly written file, such as
 for a configuration file. Use [`FileSystem.temporaryDirectory`](#FileSystem.impl.temporaryDirectory) for scratch space.
@@ -724,9 +724,9 @@ reader must never see a partly written file, such as for a configuration file. U
 ### Details
 
 Provide one with `Effect.provideMut<FileSystem>(&mut provider)`. Native programs use
-`silk.system.filesystem_native`. Each provider must use the portable error reasons, replace the whole file
-on [`FileSystem.writeFile`](#FileSystem.writeFile), and sort directory listings by path bytes, so they are the same on
-each host.
+`silk.system.filesystem_native`. Each provider must use the portable error reasons, replace the
+whole file on [`FileSystem.writeFile`](#FileSystem.writeFile), and sort directory listings by path bytes, so they are
+the same on each host.
 
 ### Errors
 
@@ -838,8 +838,9 @@ With [`FileSystem.synchronized`](#FileSystem.impl.synchronized), the provider sy
 rename and the directory after it. This is normal file system synchronization. It does not
 protect against hardware caches that lose data at power loss.
 
-A Unix provider creates a new file with mode `0666` minus the process umask. Windows inherits permissions. The new file
-does not keep the mode, owner, ACLs, extended attributes, or hard links of the old file.
+A Unix provider creates a new file with mode `0666` minus the process umask. Windows inherits
+permissions. The new file does not keep the mode, owner, ACLs, extended attributes, or hard
+links of the old file.
 
 #### Errors
 
@@ -1508,6 +1509,7 @@ Creates the directory `path` and each missing parent. Existing directories are k
 
 - `FileError` with reason `WrongType` if a component is a regular file, or another reason from
   the provider.
+- `OutOfMemoryError` if the `Allocator` cannot supply the path of a parent directory.
 
 #### Gotchas
 

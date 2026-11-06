@@ -791,7 +791,8 @@ impl Debug for WebSocketError
 effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-Writes the variant and its fields, such as `MessageTooLarge { length: 70000, allowed: 65536 }`.
+Writes the variant and its fields, such as
+`MessageTooLarge { length: 70000, allowed: 65536 }`.
 
 <a id="closeCodeOf"></a>
 
@@ -926,9 +927,9 @@ pub fn make(code: u16, reason: string) -> Result<CloseData, WebSocketError>
 Returns Close data with `code` and a copy of `reason`.
 
 #### Errors
-- `InvalidCloseData` with `Code` if `code` is not allowed. Allowed codes are 1000 through
-  1003, 1007 through 1014 except 1010 and 1012 through 1014 for a client, and 3000 through
-  4999. This function allows 1000 through 1003, 1007 through 1011, and 3000 through 4999.
+- `InvalidCloseData` with `Code` if `code` cannot be sent. Allowed codes are 1000 through
+  1003, 1007 through 1009, 1011, and 3000 through 4999. A received Close can also carry 1010
+  and 1012 through 1014.
 - `InvalidCloseData` with `ReasonTooLarge` if `reason` has more than 123 bytes.
 
 <a id="CloseData.impl.code"></a>
@@ -1405,8 +1406,8 @@ frames that answer the peer to `output`.
 
 #### Errors
 - `InvalidState` if the state is `Closed`.
-- `ProtocolError`, `MessageTooLarge` or `InvalidUtf8` for a bad frame, `PreviousFailure` if the
-  state is `Failed`.
+- `ProtocolError`, `MessageTooLarge` or `InvalidUtf8` for a bad frame, `PreviousFailure` if
+  the state is `Failed`.
 - `OutOfMemoryError` if a buffer cannot grow.
 
 <a id="Session.impl.sendText"></a>
@@ -1423,8 +1424,7 @@ Appends `text` as one Text frame.
 
 #### Errors
 `InvalidState` if the state is not `Open`, `FragmentOrder` while a fragmented message is being
-sent, `MessageTooLarge` is never raised for sending. `OutOfMemoryError` if `output` cannot
-grow.
+sent. `OutOfMemoryError` if `output` cannot grow.
 
 <a id="Session.impl.sendBinary"></a>
 

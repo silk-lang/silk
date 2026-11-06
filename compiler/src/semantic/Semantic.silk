@@ -42,6 +42,7 @@ import backend.CleanupNeeds {CleanupNeeds}
 import backend.Coroutine {Facts as CoroutineFacts}
 import backend.RuntimeType
 import backend.UnionProjection
+import backend.UnionProjection {Placement as UnionPlacement}
 import backend.RuntimeType {Projection as RuntimeProjection}
 import backend.Gap {Code as GapCode, Gap as BackendGap, Source as GapSource}
 import backend.DropGlue {
@@ -54,7 +55,7 @@ import backend.DropGlue {
   Variant as GlueVariant,
 }
 import backend.InstanceKey {HelperRole, InstanceKey, ProviderEntry}
-import backend.UnionDispatch {Arm as DispatchArm, UnionDispatch}
+import backend.UnionDispatch {Arm as DispatchArm, Borrowed as DispatchBorrow, UnionDispatch}
 import backend.CodegenUnits {CodegenUnit}
 import backend.Bitcode
 import backend.Mir
@@ -79,6 +80,9 @@ import backend.Layout {
 import backend.TypeLayouts {TypeLayouts}
 import backend.LlvmCode
 import backend.LlvmCode {ObjectConstant}
+import backend.WasmLower
+import backend.WasmLower {Declaration as WasmDeclaration, ObjectConstant as WasmConstant}
+import backend.WasmObject
 import semantic.CallableWitness
 import semantic.CallableWitness {CallableWitness as WitnessRecipe, OperandLoan as WitnessLoan}
 import semantic.Specialization {
@@ -2634,6 +2638,10 @@ struct Resolver {
   codegenUnits: bool,
   // Whether LLVM text is shaped for an unoptimized compile (`LlvmCode.Writer.fastPath`).
   fastPathIr: bool,
+  // Whether instances lower to wasm fragments for the direct backend (`WasmLower`) instead of
+  // LLVM text, and whether its memory is shared between threads.
+  direct: bool,
+  threads: bool,
   // Whether lowered functions carry their source lines (`MirFunction.lines`) for line tables.
   lineTables: bool,
   // Whether an assembled module is split into packs for a cache to store beside its image
@@ -2647,6 +2655,10 @@ struct Resolver {
   moduleLookup: InternIndex,
   declarations: DeclarationTable.DeclarationTable,
   sourceInputs: SourceInputs,
+  // The inputs of an adopted image's unchanged files that adoption left unplaced
+  // (`unplacedInput`), by stable key, so a check that runs again reads their recorded values
+  // instead of capturing them (`carriedInput`).
+  carried: CarriedInputs,
   declarationChanges: List<DeclarationChange>,
   names: StringTable,
   applications: List<Shared<Type>>,
@@ -2946,6 +2958,13 @@ pub struct Semantic {
   // the image they came from, and the index of each one's root in that image.
   carriedUnits: List<usize>,
   carriedRoots: List<usize>,
+  // The image the store adopted, which the image it writes next carries checks from.
+  heldImage: Option<CacheImage.Image>,
+  // The declaration check roots of the adopted image an unlinked store reused without reading
+  // them yet, by the hash of their module's stable key, read when a sweep of their module runs
+  // (`readPendingDeclarations`); `usize.MAX` once read.
+  pendingLookup: InternIndex,
+  pendingRoots: List<usize>,
   // How many module sweeps and escape checks this store ran rather than reused.
   checkRuns: usize,
   // The record of this store's last successful build walk, which `cacheImage` writes, and
@@ -2997,12 +3016,11 @@ struct EscapeMemo {
   reads: usize,
 }
 
-// One escape walk record an adoption read: its check's stable unit key, its root in the image
-// and the record's bytes.
+// One escape walk record an adoption read: its root in the adopted image, whose key holds its
+// check's stable unit key at `unit` and whose answer holds the record.
 struct EscapeRecordRoot {
-  unit: Bytes,
+  unit: Span,
   root: usize,
-  answer: Bytes,
 }
 
 // The escape walk records an image holds whose guard reads are green, and its green escape
@@ -3113,16 +3131,19 @@ impl EscapeImage {
   }
 
   // Takes the record of the check whose stable unit key is `unit`, if the image holds one.
-  fn take(self: &mut Self, unit: &[u8]) -> Option<EscapeRecordRoot> {
-    let held = List<EscapeRecordRoot>.asSlice(&self.records)
-    let mut at = usize.ZERO
-    while at < held.length {
-      if same(Bytes.asSlice(&held[at].unit), unit) {
-        return Option<EscapeRecordRoot>.some(List<EscapeRecordRoot>.remove(&mut self.records, at))
+  fn take(self: &mut Self, image: &Option<CacheImage.Image>, unit: &[u8]) -> Option<EscapeRecordRoot> {
+    let mut found = usize.MAX
+    if let Option<CacheImage.Image>.Some {value: adopted} = &image.* {
+      let roots = List<CacheImage.Root>.asSlice(&adopted.roots)
+      let held = List<EscapeRecordRoot>.asSlice(&self.records)
+      let mut at = usize.ZERO
+      while at < held.length && found == usize.MAX {
+        if same(StableKey.view(Bytes.asSlice(&roots[held[at].root].key), held[at].unit), unit) { found = at }
+        at = at + usize.ONE
       }
-      at = at + usize.ONE
     }
-    return Option<EscapeRecordRoot>.none()
+    if found == usize.MAX { return Option<EscapeRecordRoot>.none() }
+    return Option<EscapeRecordRoot>.some(List<EscapeRecordRoot>.remove(&mut self.records, found))
   }
 }
 
@@ -6279,18 +6300,15 @@ fn lifetimesOnly(arguments: &[Argument]) -> bool {
 }
 
 // Whether `instance` runs one body whatever requests it: a function applied to no type, row or
-// static arguments and no providers, only regions, whose every pattern runs one definition
-// (`internBackendInstance`).
+// static arguments, only regions, whose every pattern runs one definition
+// (`internBackendInstance`). Its providers do not count: the body reaches each requirement only
+// through the service contract, so a provider changes which code runs but not what the body's
+// check decides, as an `effect fn` that requires `&mut Allocator` refuses the same under every
+// allocator.
 fn callerIndependent(instance: &InstanceKey) -> bool {
-  let application = match move InstanceKey.application(instance) {
-    Option<Shared<Application>>.Some {value} => move value
-    Option<Shared<Application>>.None => { return false }
-  }
-  if !Shared<Application>.with<bool>(&application, regionArgumentsOnly) { return false }
-  return match move InstanceKey.providers(instance) {
-    Option<Shared<List<ProviderEntry>>>.Some {value} => Shared<List<ProviderEntry>>.with<bool>(&value,
-      fn(listed: &List<ProviderEntry>) -> bool { return List<ProviderEntry>.length(listed) == usize.ZERO })
-    Option<Shared<List<ProviderEntry>>>.None => true
+  return match move InstanceKey.application(instance) {
+    Option<Shared<Application>>.Some {value} => Shared<Application>.with<bool>(&value, regionArgumentsOnly)
+    Option<Shared<Application>>.None => false
   }
 }
 
@@ -6733,6 +6751,13 @@ effect fn recordSourceInput(resolver: &mut Resolver, module: &ModuleId, ordinal:
   // A known input keeps the value it was captured with; only a new one is captured.
   let mut input = Inputs.find(&resolver.sourceInputs, ordinal, &selector)
   if input == usize.MAX {
+    let carried = run carriedInput(&mut resolver.*, module, ordinal, &selector)
+    if carried != usize.MAX {
+      input = run Inputs.add(&mut resolver.sourceInputs, ordinal, move selector, CarriedInputs.digestAt(&resolver.carried, carried),
+        CarriedInputs.textAt(&resolver.carried, carried))
+      run Graph.record(&mut resolver.graph, unit, Dependee.SourceInput {input: input, module: ordinal})
+      return ()
+    }
     let mut position = usize.MAX
     let handle = Inputs.handle(&selector)
     if handle != usize.MAX {
@@ -9121,6 +9146,27 @@ effect fn placeStableInputIn(resolver: &mut Resolver, bytes: &[u8], unchanged: b
 }
 
 /// What [`Semantic.adoptCache`] reused from a cache image.
+// Where each leaf of an image stands now, as `Semantic.adoptFrom` places it: its dependee, or
+// `usize.MAX` when it changed; whether each changed leaf records only where a span sits; and how
+// many changed.
+struct LeafPlacement {
+  placed: List<usize>,
+  positional: List<bool>,
+  changed: usize,
+}
+
+// Whether `image` holds a build record, which a replay reads with its node's edges.
+fn recordsBuild(image: &CacheImage.Image) -> bool {
+  let roots = List<CacheImage.Root>.asSlice(&image.roots)
+  let mut exact = Span.make(usize.ZERO, usize.ZERO)
+  let mut at = usize.ZERO
+  while at < roots.length {
+    if buildRootKind(Bytes.asSlice(&roots[at].key), &mut exact) == 1 { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
 pub struct Adopted {
   /// Module checks reused without sweeping.
   pub roots: usize,
@@ -9134,13 +9180,91 @@ pub struct Adopted {
 
 // Whether `leaf` records only where a span sits: a location in a declaration, or a source
 // prefix. Such an input guards the spans a value or report holds, never what is checked.
-effect fn positionalLeaf(leaf: &CacheImage.Leaf) -> bool ! OutOfMemoryError ? &mut Allocator {
-  if !leaf.input { return false }
-  let mut reader = StableKey.reader()
-  let module = run StableKey.readModule(Bytes.asSlice(&leaf.key), &mut reader)
-  if let Option<ModuleId>.Some {..} = &module {} else { return false }
-  let tag = StableKey.readWord(Bytes.asSlice(&leaf.key), &mut reader)
-  return !StableKey.failed(&reader) && (tag == 9 || tag == 10)
+fn positionalLeaf(leaf: &CacheImage.Leaf) -> bool {
+  return leaf.input && (leaf.selector == 9 || leaf.selector == 10)
+}
+
+// Whether the input `leaf`, of a file that reads as the image recorded (placed as module
+// `fileModule`), reads as it did too, as `placeLeaf` finds without capturing it again. A
+// resolution or a request fact is captured again: it reads manifests, which no file leaf records.
+fn unchangedLeaf(leaf: &CacheImage.Leaf, fileModule: usize) -> bool {
+  return fileModule != usize.MAX && !CacheImage.alwaysPlaced(leaf)
+}
+
+// The placement `adoptCache` gives an unlinked store's input that reads as the image recorded
+// (`unchangedLeaf`): unchanged, with no input of the store behind it.
+fn unplacedInput() -> usize { return usize.MAX - usize.ONE }
+
+// The unplaced inputs of an adopted image (`unplacedInput`): each one's stable key digest, the
+// module whose file it reads and that file's digest then, and the value it recorded.
+struct CarriedInputs {
+  lookup: InternIndex,
+  keys: List<ContentHash>,
+  modules: List<usize>,
+  files: List<ContentHash>,
+  digests: List<ContentHash>,
+  texts: List<ContentHash>,
+}
+
+impl CarriedInputs {
+  fn digestAt(self: &Self, at: usize) -> ContentHash { return List<ContentHash>.get(&self.digests, at) }
+  fn textAt(self: &Self, at: usize) -> ContentHash { return List<ContentHash>.get(&self.texts, at) }
+}
+
+fn noCarriedInputs() -> CarriedInputs {
+  return CarriedInputs {lookup: InternIndex.make(), keys: List<ContentHash>.make(), modules: List<usize>.make(),
+    files: List<ContentHash>.make(), digests: List<ContentHash>.make(), texts: List<ContentHash>.make()}
+}
+
+// Keeps the input leaf `leaf`, whose stable key is `key` and whose file, of module `module`, read
+// `file` and reads so still, for `carriedInput`.
+effect fn carryInput(carried: &mut CarriedInputs, key: &[u8], leaf: &CacheImage.Leaf, module: usize, file: ContentHash) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let digest = ContentHash.of(key)
+  run InternIndex.record(&mut carried.lookup, digest.low)
+  run List<ContentHash>.append(&mut carried.keys, digest)
+  run List<usize>.append(&mut carried.modules, module)
+  run List<ContentHash>.append(&mut carried.files, file)
+  run List<ContentHash>.append(&mut carried.digests, leaf.digest)
+  run List<ContentHash>.append(&mut carried.texts, leaf.text)
+}
+
+// The carried input (`carryInput`) that `selector` of `module`, whose ordinal is `ordinal`, names
+// while its file still reads as it did, or `usize.MAX`. Its recorded value is what a capture would
+// read, as `placeLeaf` takes it for an input of an unchanged file.
+effect fn carriedInput(resolver: &mut Resolver, module: &ModuleId, ordinal: usize, selector: &SourceSelector) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  if List<ContentHash>.length(&resolver.carried.keys) == usize.ZERO { return usize.MAX }
+  // A resolution or request input reads the manifests or the request, which no image leaf vouches for.
+  if let SourceSelector.Resolution {..} = &selector.* { return usize.MAX }
+  if let SourceSelector.Request {..} = &selector.* { return usize.MAX }
+  let mut key = Bytes.make()
+  run StableKey.module(&mut key, module)
+  let handle = Inputs.handle(selector)
+  let mut identity = Option<&DeclarationId>.none()
+  if handle != usize.MAX { identity = DeclarationTable.identity(&resolver.declarations, handle) }
+  if !run StableKey.selector(&mut key, selector, move identity) { return usize.MAX }
+  let digest = ContentHash.of(Bytes.asSlice(&key))
+  let mut at = InternIndex.first(&resolver.carried.lookup, digest.low)
+  while at != usize.MAX {
+    if ContentHash.equals(List<ContentHash>.get(&resolver.carried.keys, at), digest)
+      && List<usize>.get(&resolver.carried.modules, at) == ordinal {
+      let file = List<ContentHash>.get(&resolver.carried.files, at)
+      let current = run Effect.result(sourceDigest(&mut resolver.*, module))
+      let mut now = ContentHash {high: 0, low: 0}
+      match move current {
+        Result<ContentHash, Cycle | OutOfMemoryError>.Success {value} => { now = value }
+        Result<ContentHash, Cycle | OutOfMemoryError>.Failure {error} => match move error {
+          Cycle {} => { return usize.MAX }
+          OutOfMemoryError {} => { fail OutOfMemoryError {} }
+        }
+      }
+      if ContentHash.equals(now, file) { return at }
+      return usize.MAX
+    }
+    at = InternIndex.after(&resolver.carried.lookup, at)
+  }
+  return usize.MAX
 }
 
 // Where a unit stands while a cache image is built: not yet reached, reached and not finished,
@@ -9198,9 +9322,8 @@ effect fn imageLeaf(resolver: &Resolver, build: &mut ImageBuild, dependee: Depen
       let modules = List<ModuleId>.asSlice(&resolver.modules)
       let mut key = Bytes.make()
       run StableKey.module(&mut key, &modules[module])
-      let leaf = List<CacheImage.Leaf>.length(&build.image.leaves)
-      run List<CacheImage.Leaf>.append(&mut build.image.leaves, CacheImage.Leaf {input: false, key: move key,
-        digest: ContentHash {high: 0, low: 0}, position: usize.MAX, file: usize.MAX, text: ContentHash {high: 0, low: 0}})
+      let leaf = run CacheImage.addLeaf(&mut build.image, false, move key, ContentHash {high: 0, low: 0}, usize.MAX, usize.MAX,
+        ContentHash {high: 0, low: 0})
       run List<usize>.append(&mut build.fileModules, module)
       List<usize>.set(&mut build.files, module, leaf)
       return leaf
@@ -9218,9 +9341,7 @@ effect fn imageLeaf(resolver: &Resolver, build: &mut ImageBuild, dependee: Depen
         let handle = Inputs.handle(&values[input].selector)
         let mut position = usize.MAX
         if handle != usize.MAX { position = DeclarationTable.position(&resolver.declarations, handle) }
-        found = List<CacheImage.Leaf>.length(&build.image.leaves)
-        run List<CacheImage.Leaf>.append(&mut build.image.leaves, CacheImage.Leaf {input: true, key: move key,
-          digest: values[input].digest, position: position, file: file, text: values[input].text})
+        found = run CacheImage.addLeaf(&mut build.image, true, move key, values[input].digest, position, file, values[input].text)
       }
       List<usize>.set(&mut build.inputs, input, found)
       return found
@@ -9319,9 +9440,11 @@ effect fn emittedLayoutEdges(resolver: &Resolver, build: &mut ImageBuild, emissi
 }
 
 // The answer of a module check root that reported nothing: whether it is a sweep (0) or an
-// escape check (1), then the concrete bodies it names, then no rejections.
+// escape check (1), then the concrete bodies it names, then no rejections and no deferred
+// templates.
 effect fn checkAnswer(kind: u64, concrete: &[DeclarationId]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
   let mut answer = run checkHead(kind, concrete)
+  run RuntimeEncoding.word(&mut answer, 0)
   run RuntimeEncoding.word(&mut answer, 0)
   return move answer
 }
@@ -9338,16 +9461,23 @@ effect fn checkHead(kind: u64, concrete: &[DeclarationId]) -> Bytes ! OutOfMemor
   return move answer
 }
 
-// The answer of a module check root that reports `rejections`, or none when one of them holds
-// what an image does not carry (`RejectionImage.encode`). `sites` gains the module of each site
-// they name.
-effect fn reportingAnswer(kind: u64, concrete: &[DeclarationId], rejections: &[Shared<Rejection>], sites: &mut List<ModuleId>)
-  -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+// The answer of a module check root that reports `rejections` and, for a sweep, defers the
+// static templates `deferred`; none when a rejection holds what an image does not carry
+// (`RejectionImage.encode`). `sites` gains the module of each site they name.
+effect fn reportingAnswer(kind: u64, concrete: &[DeclarationId], rejections: &[Shared<Rejection>], deferred: &[DeferredStaticTemplate],
+  sites: &mut List<ModuleId>) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
   let mut answer = run checkHead(kind, concrete)
   run RuntimeEncoding.word(&mut answer, usize.toU64(rejections.length))
   let mut at = usize.ZERO
   while at < rejections.length {
     if !run RejectionImage.encode(&mut answer, &rejections[at], &mut sites.*) { return Option<Bytes>.none() }
+    at = at + usize.ONE
+  }
+  run RuntimeEncoding.word(&mut answer, usize.toU64(deferred.length))
+  at = usize.ZERO
+  while at < deferred.length {
+    run StableKey.declaration(&mut answer, &deferred[at].declaration)
+    run RuntimeEncoding.word(&mut answer, StaticTemplate.reasonCode(deferred[at].reason))
     at = at + usize.ONE
   }
   return Option<Bytes>.some(move answer)
@@ -9398,16 +9528,15 @@ effect fn sourceDigest(resolver: &mut Resolver, module: &ModuleId) -> ContentHas
 // The digest an image records for an input known to read otherwise than its node read it
 // (`imageCarriedFiles`). No captured value hashes to it.
 fn changedInput() -> ContentHash {
-  return ContentHash {high: 0, low: 0}
+  return CacheImage.changedDigest()
 }
 
 // The current dependee one image leaf names, or `usize.MAX` when what it read changed: a file
 // leaf's module ordinal, or an input leaf's input, interned with its value when this store has not
 // captured it yet. `fileModule` is the module of the file leaf an input leaf names when that file
 // reads the same, or `usize.MAX`.
-effect fn placeLeaf(resolver: &mut Resolver, leaf: &CacheImage.Leaf, fileModule: usize) -> usize ! Cycle | OutOfMemoryError ? &mut Allocator {
+effect fn placeLeaf(resolver: &mut Resolver, leaf: &CacheImage.Leaf, key: &[u8], fileModule: usize) -> usize ! Cycle | OutOfMemoryError ? &mut Allocator {
   let unchangedFile = fileModule != usize.MAX
-  let key = Bytes.asSlice(&leaf.key)
   if leaf.input && ContentHash.equals(leaf.digest, changedInput()) { return usize.MAX }
   if !leaf.input {
     let mut reader = StableKey.reader()
@@ -9495,6 +9624,34 @@ struct CheckAnswer {
   kind: u64,
   concrete: List<DeclarationId>,
   rejections: List<Shared<Rejection>>,
+  // The static templates a sweep deferred, which `deferredStaticTemplates` reports.
+  deferred: List<DeferredStaticTemplate>,
+}
+
+// Where the stable key of a declaration check (`ModuleCheck` name 6) names its module; empty for
+// any other key.
+fn declarationRootModule(key: &[u8]) -> Span {
+  let none = Span.make(usize.ZERO, usize.ZERO)
+  let mut reader = StableKey.reader()
+  let family = StableKey.readWord(key, &mut reader)
+  if StableKey.failed(&reader) || family != u8.toU64(Family.value(Family.ModuleCheck)) { return none }
+  drop StableKey.readWord(key, &mut reader)
+  let start = StableKey.offset(&reader)
+  StableKey.skipModule(key, &mut reader)
+  let end = StableKey.offset(&reader)
+  drop StableKey.readWord(key, &mut reader)
+  drop StableKey.readWord(key, &mut reader)
+  let name = StableKey.readWord(key, &mut reader)
+  if StableKey.failed(&reader) || name != 6 { return none }
+  return Span.make(start, end)
+}
+
+// A copy of the answer of root `root` of the adopted image `image`; empty without one.
+effect fn adoptedAnswer(image: &Option<CacheImage.Image>, root: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  if let Option<CacheImage.Image>.Some {value} = &image.* {
+    return run Bytes.copy(Bytes.asSlice(&List<CacheImage.Root>.asSlice(&value.roots)[root].answer))
+  }
+  return Bytes.make()
 }
 
 // A check's concrete bodies mostly belong to its own module, `checked`, which they share rather
@@ -9529,8 +9686,29 @@ effect fn readCheckAnswer(bytes: &[u8], checked: Option<&ModuleId>) -> Option<Ch
     }
     at = at + 1
   }
+  // Only a sweep defers templates.
+  let deferredCount = StableKey.readWord(bytes, &mut reader)
+  if StableKey.failed(&reader) || (kind != 0 && deferredCount != 0) { return Option<CheckAnswer>.none() }
+  let mut deferred = List<DeferredStaticTemplate>.make()
+  at = 0
+  while at < deferredCount {
+    let read = match checked {
+      Option<&ModuleId>.Some {value: module} => run StableKey.readDeclarationIn(bytes, &mut reader, module)
+      Option<&ModuleId>.None => run StableKey.readDeclaration(bytes, &mut reader)
+    }
+    let declaration = match move read {
+      Option<DeclarationId>.Some {value} => move value
+      Option<DeclarationId>.None => { return Option<CheckAnswer>.none() }
+    }
+    let reason = match move StaticTemplate.reasonOf(StableKey.readWord(bytes, &mut reader)) {
+      Option<StaticTemplate.Reason>.Some {value} => value
+      Option<StaticTemplate.Reason>.None => { return Option<CheckAnswer>.none() }
+    }
+    run List<DeferredStaticTemplate>.append(&mut deferred, DeferredStaticTemplate {declaration: move declaration, reason: reason})
+    at = at + 1
+  }
   if !StableKey.finished(bytes, &reader) { return Option<CheckAnswer>.none() }
-  return Option<CheckAnswer>.some(CheckAnswer {kind: kind, concrete: move concrete, rejections: move rejections})
+  return Option<CheckAnswer>.some(CheckAnswer {kind: kind, concrete: move concrete, rejections: move rejections, deferred: move deferred})
 }
 
 effect fn verifyUnit(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, unit: usize) -> bool
@@ -16446,6 +16624,47 @@ effect fn cObjectField(resolver: &mut Resolver, ty: &Shared<Type>) -> bool
   return false
 }
 
+// The application with each lifetime argument replaced by its binder's own lifetime, or None when
+// it already reads them.
+effect fn authoredLifetimeApplication(application: &Shared<Type>, binders: &[Binder]) -> Option<Shared<Type>>
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let shape = run Type.copy(application)
+  if let Type.Nominal {declaration, isPublic, arguments} = move shape {
+    let supplied = List<Argument>.asSlice(&arguments)
+    if supplied.length != binders.length { return Option<Shared<Type>>.none() }
+    let mut changed = false
+    let mut replaced = List<Argument>.make()
+    let mut at = usize.ZERO
+    while at < supplied.length {
+      let mut next = copyArgument(&supplied[at])
+      if let Argument.Lifetime {value: given} = &supplied[at] {
+        if let Binder.Lifetime {value: own, ..} = &binders[at] {
+          if !Lifetime.equalsShared(&given, &own) {
+            changed = true
+            next = Argument.Lifetime {value: Shared<Lifetime>.clone(&own)}
+          }
+        }
+      }
+      run List<Argument>.append(&mut replaced, move next)
+      at = at + usize.ONE
+    }
+    if !changed { return Option<Shared<Type>>.none() }
+    return Option<Shared<Type>>.some(run Types.intern(Type.Nominal {declaration: move declaration, isPublic: isPublic,
+      arguments: move replaced}))
+  }
+  return Option<Shared<Type>>.none()
+}
+
+fn memberShapeAt(answer: &Result<Answer, NoRejection>, at: usize) -> Option<Shared<Type>> {
+  if let Result<Answer, NoRejection>.Success {value} = &answer.* {
+    if let Outcome.Success {value: Value.MemberShape {types}} = &value.outcome {
+      let entries = List<Shared<Type>>.asSlice(&types)
+      if at < entries.length { return Option<Shared<Type>>.some(Shared<Type>.clone(&entries[at])) }
+    }
+  }
+  return Option<Shared<Type>>.none()
+}
+
 effect fn resolveMemberShape(
   resolver: &mut Resolver,
   owner: &mut Query<Answer, NoRejection>,
@@ -16598,6 +16817,35 @@ effect fn resolveMemberShape(
         )
       }
       argumentAt = argumentAt + usize.ONE
+    }
+    // Most applications of one declaration differ only in their lifetime arguments, as each body
+    // applies it to regions of its own, and a member's written types resolve alike under any of
+    // them. So such an application reads the shape resolved once under the declaration's own
+    // lifetimes, with its lifetimes substituted. A refused shape resolves under this application
+    // itself, so the refusal it reports names it.
+    if let Option<Shared<Type>>.Some {value: authored} = move run authoredLifetimeApplication(&application,
+      List<Binder>.asSlice(&binders)) {
+      let canonical = run internApplication(&mut resolver.*, &authored)
+      let canonicalKey = run internDeclaration(&mut resolver.*, Key {family: Family.MemberShape, module: key.module,
+        name: canonical, declaration: declarationAccess26, member: key.member, external: false})
+      let shaped = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies, canonicalKey, value.span)
+      let cause = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Rejection>>>(&shaped, answerCause)
+      let producer = run declarationAt(&mut resolver.*, &module, declarationAccess26)
+      if let Option<Shared<Rejection>>.None = &cause {
+        if let Option<DeclarationId>.Some {value: declared} = move producer {
+          let mut substituted = List<Shared<Type>>.make()
+          let mut shapeAt = usize.ZERO
+          while true {
+            let entry = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Type>>>(&shaped,
+              fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> { return memberShapeAt(answer, shapeAt) })
+            let shapeType = match move entry { Option<Shared<Type>>.Some {value: held} => move held _ => { break } }
+            run List<Shared<Type>>.append(&mut substituted,
+              run Type.instantiate(&shapeType, &declared, List<Argument>.asSlice(&arguments)))
+            shapeAt = shapeAt + usize.ONE
+          }
+          return memberSuccess(Value.MemberShape {types: move substituted}, move dependencies)
+        }
+      }
     }
     let applied = run bindArguments(
       List<Binder>.asSlice(&binders),
@@ -32493,6 +32741,7 @@ effect fn intrinsicValueType(kind: IntrinsicValueKind) -> Shared<Type>
     )
     IntrinsicValueKind.Never => run Types.intern(Type.Union {members: List<Shared<Type>>.make()})
     IntrinsicValueKind.ByteAddress => run CheckedIntrinsic.byteAddressType()
+    IntrinsicValueKind.WordAddress => run CheckedIntrinsic.wordAddressType()
     IntrinsicValueKind.StaticBytes => run Types.intern(Type.Slice {
       element: run primitiveType(b"u8"), access: Access.Shared, lifetime: run Shared<Lifetime>.make(Lifetime.Static),
     })
@@ -39029,76 +39278,6 @@ effect fn recordFieldsVisible(resolver: &mut Resolver, module: &ModuleId, ty: &S
   return true
 }
 
-// Deferred generic union representation is reported only after ordinary ownership and member validation.
-effect fn deferredUnionVariant(
-  resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
-  dependencies: &mut List<Dependency>, module: &ModuleId,
-  namespace: &[u8], member: &[u8], span: Span,
-) -> Option<Shared<Rejection>>
-! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
-  let moduleOrdinal = run internModule(&mut resolver.*, module)
-  let candidateSelection = run select(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, namespace, false)
-  let candidate = match move candidateSelection {
-    Result<Selection, Shared<Rejection>>.Success {value: selectedValue} => selectedValue
-    Result<Selection, Shared<Rejection>>.Failure {error} => {
-      return Option<Shared<Rejection>>.some(move error)
-    }
-  }
-  if candidate.count != usize.ONE || (candidate.kind != CandidateKind.Declaration && candidate.kind != CandidateKind.ImportMember) {
-    return Option<Shared<Rejection>>.none()
-  }
-  let selected = run selectDeclaration(&mut resolver.*, &mut owner.*, &mut dependencies.*,
-    moduleOrdinal, module, namespace, false, span, RejectionCode.UnknownType, RejectionCode.NotType, false)
-  let declaration = match move selected {
-    Result<SelectedDeclaration, Shared<Rejection>>.Success {value} => move value
-    Result<SelectedDeclaration, Shared<Rejection>>.Failure {error} => {
-      drop error
-      return Option<Shared<Rejection>>.none()
-    }
-  }
-  let declaredModule = resolvedModule(&resolver.*, declaration.module)
-  let written = run scopedHeader(&mut resolver.*, &declaredModule, declaration.ordinal)
-  let mut relevant = false
-  if let Option<HeaderSyntax>.Some {value} = move written {
-    if let Node.UnionHeader {generics, ..} = value.header { relevant = generics.length > usize.ZERO }
-  }
-  if !relevant { return Option<Shared<Rejection>>.none() }
-  let declarationAccess117Request = Key {
-    family: Family.Members, module: declaration.module, name: usize.ZERO,
-    declaration: declaration.ordinal, member: usize.ZERO, external: false,
-  }
-  let declarationAccess117 = run internDeclaration(&mut resolver.*, declarationAccess117Request)
-  let names = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, declarationAccess117, span)
-  let rejected = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Rejection>>>(&names, answerCause)
-  if let Option<Shared<Rejection>>.Some {value} = move rejected {
-    return Option<Shared<Rejection>>.some(move value)
-  }
-  let visibility = Shared<Result<Answer, NoRejection>>.with<Option<bool>>(&names,
-    fn(answer: &Result<Answer, NoRejection>) -> Option<bool> {
-      if let Result<Answer, NoRejection>.Success {value} = &answer.* {
-        if let Outcome.Success {value: Value.Members {members, ..}} = &value.outcome {
-          let values = List<Member>.asSlice(&members)
-          let mut at = usize.ZERO
-          while at < values.length {
-            if let Option<Bytes>.Some {value: name} = &values[at].name {
-              if same(Bytes.asSlice(&name), member) { return Option<bool>.some(values[at].isPublic) }
-            }
-            at = at + usize.ONE
-          }
-        }
-      }
-      return Option<bool>.none()
-    },
-  )
-  if let Option<bool>.Some {value: isPublic} = move visibility {
-    if !isPublic && !ModuleId.equals(module, &declaredModule) {
-      return Option<Shared<Rejection>>.some(run reject(&resolver.*, module, RejectionCode.PrivateMember, span))
-    }
-    return Option<Shared<Rejection>>.some(run reject(&resolver.*, module, RejectionCode.UnionFormUnavailable, span))
-  }
-  return Option<Shared<Rejection>>.some(run reject(&resolver.*, module, RejectionCode.UnknownUnionVariant, span))
-}
-
 // A scalar enum's nominal type and its validated Members answer, which owns every discriminant.
 struct SelectedScalarEnum {
   ty: Shared<Type>,
@@ -39320,26 +39499,6 @@ effect fn checkedEnumSelection(
   }
   return Option<Result<EnumSelection, Shared<Rejection>>>.some(
     Result<EnumSelection, Shared<Rejection>>.failResult(run Shared<Rejection>.make(move diagnostic)))
-}
-
-effect fn deferredRecordAnnotation(
-  resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
-  dependencies: &mut List<Dependency>, module: &ModuleId, annotation: HirId, span: Span,
-) -> Option<Shared<Rejection>>
-! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
-  let written = run typeNode(&mut resolver.*, module, annotation)
-  if let Option<HeaderSyntax>.Some {value: annotationSyntax} = move written {
-    if let Node.NamedType {path: named, hasMode, ..} = annotationSyntax.header {
-      if hasMode { return Option<Shared<Rejection>>.none() }
-      let parsed = run path(&mut resolver.*, module, named)
-      let segments = List<Bytes>.asSlice(&parsed.segments)
-      if parsed.valid && segments.length == 2 {
-        return run deferredUnionVariant(&mut resolver.*, &mut owner.*, &mut dependencies.*,
-          module, Bytes.asSlice(&segments[usize.ZERO]), Bytes.asSlice(&segments[usize.ONE]), span)
-      }
-    }
-  }
-  return Option<Shared<Rejection>>.none()
 }
 
 // A bare generic nominal literal owns one open application while its fields are checked.
@@ -39659,11 +39818,6 @@ effect fn recordAnnotation(
   annotation: HirId, span: Span, constraints: &[Constraint],
 ) -> Result<Shared<Type>, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
-  let deferred = run deferredRecordAnnotation(&mut resolver.*, &mut owner.*, &mut dependencies.*,
-    module, annotation, span)
-  if let Option<Shared<Rejection>>.Some {value} = move deferred {
-    return Result<Shared<Type>, Shared<Rejection>>.failResult(move value)
-  }
   let identity = run Shared<DeclarationId>.make(DeclarationId.copy(caller))
   let ordinal = run ordinalOfIdentity(&mut resolver.*, module, &identity)
   let declaration = match move ordinal {
@@ -46280,7 +46434,7 @@ effect fn checkNestedVariantPattern(
   let mut path = List<BodyPlaceStep>.make()
   run List<BodyPlaceStep>.append(&mut path, BodyPlaceStep.Member {tag: tag, ty: Shared<Type>.clone(&ty), source: Shared<Type>.clone(subjectType)})
   run List<BodyPatternTest>.append(&mut tests.*, BodyPatternTest {path: run copySteps(&path), tag: variant.tag,
-    tags: variant.nominal.count, source: Option<Shared<Type>>.none(), scalar: Option<BodyScalarTest>.none()})
+    tags: variant.nominal.count, member: Option<BodyUnionMember>.none(), scalar: Option<BodyScalarTest>.none()})
   let origin = FieldSource.Variant {tag: variant.tag, shape: move variant.shape}
   return run checkRecordPatternFields(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller, constraints,
     annotations, elided, &mut nodes.*, subject, &origin, fields, &path, access, &mut tests.*, span)
@@ -46404,7 +46558,7 @@ effect fn checkRecordPatternFields(
             }
             if let BodyPattern.EnumMember {member} = &checkedScalar.pattern {
               run List<BodyPatternTest>.append(&mut tests.*, BodyPatternTest {path: run copySteps(&fieldPath), tag: member.ordinal,
-                tags: count, source: Option<Shared<Type>>.none(),
+                tags: count, member: Option<BodyUnionMember>.none(),
                 scalar: Option<BodyScalarTest>.some(BodyScalarTest {member: member, ty: Shared<Type>.clone(&field.ty)})})
             }
             at = at + usize.ONE
@@ -46431,7 +46585,7 @@ effect fn checkRecordPatternFields(
             return Option<Shared<Rejection>>.some(run reject(&resolver.*, module, RejectionCode.MissingPatternField, subpatternSpan))
           }
           run List<BodyPatternTest>.append(&mut tests.*, BodyPatternTest {path: run copySteps(&fieldPath),
-            tag: variant.tag, tags: fieldUnion.count, source: Option<Shared<Type>>.none(), scalar: Option<BodyScalarTest>.none()})
+            tag: variant.tag, tags: fieldUnion.count, member: Option<BodyUnionMember>.none(), scalar: Option<BodyScalarTest>.none()})
         }
         Node.NominalPattern {annotation, fields: nested} => {
           let nominalField = run nominalUnionOf(&mut resolver.*, &field.ty)
@@ -46446,7 +46600,7 @@ effect fn checkRecordPatternFields(
             if !variant.shape.braces {
               return Option<Shared<Rejection>>.some(run reject(&resolver.*, module, RejectionCode.UnitVariantPayloadPattern, subpatternSpan))
             }
-            run List<BodyPatternTest>.append(&mut tests.*, BodyPatternTest {path: run copySteps(&fieldPath), tag: variant.tag, tags: fieldUnion.count, source: Option<Shared<Type>>.none(), scalar: Option<BodyScalarTest>.none()})
+            run List<BodyPatternTest>.append(&mut tests.*, BodyPatternTest {path: run copySteps(&fieldPath), tag: variant.tag, tags: fieldUnion.count, member: Option<BodyUnionMember>.none(), scalar: Option<BodyScalarTest>.none()})
             let nestedOrigin = FieldSource.Variant {tag: variant.tag, shape: move variant.shape}
             let failed = run checkRecordPatternFields(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller, constraints,
               annotations, elided, &mut nodes.*, subject, &nestedOrigin, nested, &fieldPath, access, &mut tests.*, subpatternSpan)
@@ -46482,7 +46636,8 @@ effect fn checkRecordPatternFields(
             }
             if unionField {
               run List<BodyPatternTest>.append(&mut tests.*, BodyPatternTest {path: run copySteps(&fieldPath), tag: tag,
-                tags: List<Shared<Type>>.length(&candidates), source: Option<Shared<Type>>.some(Shared<Type>.clone(&field.ty)), scalar: Option<BodyScalarTest>.none()})
+                tags: List<Shared<Type>>.length(&candidates), member: Option<BodyUnionMember>.some(BodyUnionMember {tag: tag,
+                  ty: Shared<Type>.clone(&nestedType), source: Shared<Type>.clone(&field.ty)}), scalar: Option<BodyScalarTest>.none()})
               nestedPath = run extendedPath(&fieldPath, BodyPlaceStep.Member {tag: tag, ty: Shared<Type>.clone(&nestedType), source: Shared<Type>.clone(&field.ty)})
             }
             let nestedOrigin = FieldSource.Record {ty: move nestedType}
@@ -46510,7 +46665,7 @@ effect fn checkRecordPatternFields(
           if nested.present && !variant.shape.braces {
             return Option<Shared<Rejection>>.some(run reject(&resolver.*, module, RejectionCode.UnitVariantPayloadPattern, subpatternSpan))
           }
-          run List<BodyPatternTest>.append(&mut tests.*, BodyPatternTest {path: run copySteps(&fieldPath), tag: variant.tag, tags: fieldUnion.count, source: Option<Shared<Type>>.none(), scalar: Option<BodyScalarTest>.none()})
+          run List<BodyPatternTest>.append(&mut tests.*, BodyPatternTest {path: run copySteps(&fieldPath), tag: variant.tag, tags: fieldUnion.count, member: Option<BodyUnionMember>.none(), scalar: Option<BodyScalarTest>.none()})
           let nestedOrigin = FieldSource.Variant {tag: variant.tag, shape: move variant.shape}
           let mut nestedFields = Range.empty()
           if nested.present { nestedFields = nested.range }
@@ -55905,7 +56060,32 @@ effect fn checkSourceInfixExpression<'scope>(
     CheckedOperand {node: firstNode, ty: move firstType},
     move secondOperand,
   )
-  let CheckedOperands {leftNode, leftType, rightNode, rightType} = move pair
+  let CheckedOperands {leftNode: checkedLeft, leftType: checkedLeftType, rightNode: checkedRight, rightType: checkedRightType} = move pair
+  let mut leftNode = checkedLeft
+  let mut rightNode = checkedRight
+  let mut leftType = move checkedLeftType
+  let mut rightType = move checkedRightType
+  // Operands that differ only in covariant regions, as `&Option<string>` and the
+  // `&Option<string<'static>>` of a literal do, are both read at their meet by lifetime subtyping
+  // (LIFE-002), as the arguments of a call to the operator's operation would be.
+  if let Option<OperandMeet>.Some {value: met} = move run operandMeet(&mut resolver.*, &mut owner.*, &mut dependencies.*,
+    &leftType, &rightType, operatorAnchor) {
+    let OperandMeet {left: metLeft, right: metRight} = move met
+    let wantedLeft = Option<Shared<Type>>.some(Shared<Type>.clone(&metLeft))
+    leftNode = match move run checkExpectedValue(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, caller, constraints,
+      &mut nodes.*, leftNode, &wantedLeft, RejectionCode.TypeMismatch, operatorAnchor) {
+      Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
+      Result<BodyNodeId, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
+    }
+    let wantedRight = Option<Shared<Type>>.some(Shared<Type>.clone(&metRight))
+    rightNode = match move run checkExpectedValue(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, caller, constraints,
+      &mut nodes.*, rightNode, &wantedRight, RejectionCode.TypeMismatch, operatorAnchor) {
+      Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
+      Result<BodyNodeId, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
+    }
+    leftType = move metLeft
+    rightType = move metRight
+  }
   let leftFamily = run operatorFamily(&mut resolver.*, &leftType)
   let rightFamily = run operatorFamily(&mut resolver.*, &rightType)
   let sameType = run Type.equalsShared(&leftType, &rightType)
@@ -55988,6 +56168,44 @@ effect fn checkSourceInfixExpression<'scope>(
   return run finishExpression(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller, constraints, &mut nodes.*,
     expression, span, move ty, move form,
     diverges, expected, mismatchCode, contractBody, staticBody)
+}
+
+// The operand types of an infix operator read at their common type (`regionMeetType`).
+struct OperandMeet {
+  left: Shared<Type>,
+  right: Shared<Type>,
+}
+
+// The operand types at which an infix operator reads `left` and `right` when they differ only in
+// covariant regions; none when they are equal or differ otherwise. Two shared borrows keep their
+// own regions, which a comparison operation such as `equals(left: &Self, right: &Self)` takes as
+// its own lifetimes, and meet their referents; any other operands meet whole.
+effect fn operandMeet(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  left: &Shared<Type>, right: &Shared<Type>, span: Span) -> Option<OperandMeet>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if run Type.equalsShared(left, right) { return Option<OperandMeet>.none() }
+  let none = List<Shared<DeclarationId>>.make()
+  let variables = List<Shared<DeclarationId>>.asSlice(&none)
+  if let Type.Reference {referent: leftReferent, access: leftAccess, lifetime: leftRegion} = move run Type.copy(left) {
+    if let Type.Reference {referent: rightReferent, access: rightAccess, lifetime: rightRegion} = move run Type.copy(right) {
+      if leftAccess != Access.Shared || rightAccess != Access.Shared || run Type.equalsShared(&leftReferent, &rightReferent) {
+        return Option<OperandMeet>.none()
+      }
+      let met = match move run regionMeetType(&mut resolver.*, &mut owner.*, &mut dependencies.*, &leftReferent, &rightReferent,
+        variables, span) {
+        Option<Shared<Type>>.Some {value} => move value
+        Option<Shared<Type>>.None => { return Option<OperandMeet>.none() }
+      }
+      return Option<OperandMeet>.some(OperandMeet {
+        left: run Types.intern(Type.Reference {referent: Shared<Type>.clone(&met), access: Access.Shared, lifetime: move leftRegion}),
+        right: run Types.intern(Type.Reference {referent: move met, access: Access.Shared, lifetime: move rightRegion}),
+      })
+    }
+  }
+  return match move run regionMeetType(&mut resolver.*, &mut owner.*, &mut dependencies.*, left, right, variables, span) {
+    Option<Shared<Type>>.Some {value} => Option<OperandMeet>.some(OperandMeet {left: Shared<Type>.clone(&value), right: move value})
+    Option<Shared<Type>>.None => Option<OperandMeet>.none()
+  }
 }
 
 // Reports an operand whose type comes only from context: an unsuffixed literal, or arithmetic and
@@ -59561,6 +59779,7 @@ Option<Shared<StaticData>>,
     }
     completedAt = completedAt + usize.ONE
   }
+  run closeArgumentConversions(&mut nodes.*, List<BodyNodeId>.asSlice(&typedArguments), completed)
   // Written arguments are already bindings; skipped lifetimes were inferred beside them.
   let mut specialized = List<Argument>.make()
   let mut specializeAt = usize.ZERO
@@ -63736,6 +63955,11 @@ fn sourceUnionMember(value: &Shared<Type>) -> bool {
     })
 }
 
+// Every union converts its members and narrower unions the same way, whatever its members are.
+fn writtenUnion(value: &Type) -> bool {
+  return match &value.* { Type.Union {..} => true _ => false }
+}
+
 fn sourceUnion(value: &Type) -> bool {
   if let Type.Union {members} = &value.* {
     let listed = List<Shared<Type>>.asSlice(&members)
@@ -63798,9 +64022,44 @@ effect fn opaqueUnionArgument(nodes: &mut List<BodyNode>, node: BodyNodeId,
   return BodyNodeId {index: index}
 }
 
+// A union conversion of a call argument is typed by the parameter it converts to. Checked before
+// the call's binders are inferred, that type still names them; once they are, the conversion's
+// type is the parameter's instance, which lowering places the argument in (UNION-001).
+effect fn closeArgumentConversions(nodes: &mut List<BodyNode>, arguments: &[BodyNodeId], bindings: &[Binding]) -> ()
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut at = usize.ZERO
+  while at < arguments.length {
+    let index = arguments[at].index
+    if index < List<BodyNode>.length(&nodes.*) {
+      let mut written = Option<Shared<Type>>.none()
+      let mut form = Option<BodyExpression>.none()
+      match &List<BodyNode>.asSlice(&nodes.*)[index].kind {
+        BodyNodeKind.Expression {ty, form: BodyExpression.UnionInject {tag, value}} => {
+          written = Option<Shared<Type>>.some(Shared<Type>.clone(&ty))
+          form = Option<BodyExpression>.some(BodyExpression.UnionInject {tag: tag, value: value})
+        }
+        BodyNodeKind.Expression {ty, form: BodyExpression.UnionWiden {value}} => {
+          written = Option<Shared<Type>>.some(Shared<Type>.clone(&ty))
+          form = Option<BodyExpression>.some(BodyExpression.UnionWiden {value: value})
+        }
+        _ => {}
+      }
+      if let Option<Shared<Type>>.Some {value: open} = move written {
+        if let Option<BodyExpression>.Some {value: conversion} = move form {
+          let closed = run Type.applyBindings(&open, bindings, true)
+          let mut listed = List<BodyNode>.asMutSlice(&mut nodes.*)
+          listed[index].kind = BodyNodeKind.Expression {ty: move closed, form: move conversion}
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
 effect fn unionArgument(nodes: &mut List<BodyNode>, node: BodyNodeId, expected: &Shared<Type>)
 -> BodyNodeId ! OutOfMemoryError ? &mut Allocator | &mut Types {
-  if !Shared<Type>.with<bool>(expected, sourceUnion) { return node }
+  if !Shared<Type>.with<bool>(expected, writtenUnion) { return node }
   let actual = match move bodyExpressionType(List<BodyNode>.asSlice(&nodes.*), &node) {
     Option<Shared<Type>>.Some {value} => move value
     Option<Shared<Type>>.None => { return node }
@@ -63824,7 +64083,7 @@ effect fn unionArgument(nodes: &mut List<BodyNode>, node: BodyNodeId, expected: 
     at = at + usize.ONE
   }
   // A narrower union widens when each of its members is a member of the expected union.
-  if !Shared<Type>.with<bool>(&actual, sourceUnion) || run Type.equalsShared(&actual, expected) { return node }
+  if !Shared<Type>.with<bool>(&actual, writtenUnion) || run Type.equalsShared(&actual, expected) { return node }
   let narrower = match move run UnionProjection.members(&actual) {
     Option<List<Shared<Type>>>.Some {value} => move value
     Option<List<Shared<Type>>>.None => { return node }
@@ -63960,31 +64219,6 @@ effect fn nativeAddressArgument(nodes: &mut List<BodyNode>, node: BodyNodeId, pa
     return BodyNodeId {index: index}
   }
   return node
-}
-
-effect fn unionHasMember(unionType: &Shared<Type>, member: &Shared<Type>) -> bool
-! OutOfMemoryError ? &mut Allocator | &mut Types {
-  let mut at = usize.ZERO
-  while true {
-    let candidate = Shared<Type>.with<Option<Shared<Type>>>(unionType,
-      fn(value: &Type) -> Option<Shared<Type>> {
-        if let Type.Union {members} = &value.* {
-          let values = List<Shared<Type>>.asSlice(&members)
-          if at < values.length { return Option<Shared<Type>>.some(Shared<Type>.clone(&values[at])) }
-        }
-        return Option<Shared<Type>>.none()
-      },
-    )
-    let selected = match move candidate {
-      Option<Shared<Type>>.Some {value} => move value
-      Option<Shared<Type>>.None => { break }
-    }
-    if run Type.equalsShared(&selected, member) {
-      return true
-    }
-    at = at + usize.ONE
-  }
-  return false
 }
 
 fn pendingOriginRoot(value: &Type) -> bool {
@@ -64248,12 +64482,6 @@ effect fn matchCallArgument(
       }) && Shared<Type>.with<bool>(evidence, fn(value: &Type) -> bool {
         return match &value.* { Type.CallableSchema {..} => true Type.CallableValue {..} => true Type.CallableStage {..} => true _ => false }
       }) { return Option<Shared<Rejection>>.some(run reject(resolver, module, RejectionCode.Undetermined, span)) }
-      // Closed-record unions are injected before matching; any other exact member injection is a
-      // valid program whose representation is still deferred.
-      if !Shared<Type>.with<bool>(parameter, sourceUnion) && run unionHasMember(parameter, evidence) {
-        return Option<Shared<Rejection>>.some(run reject(resolver, module,
-          RejectionCode.UnionFormUnavailable, span))
-      }
       // Name both types where they print exactly, with the bindings earlier operands fixed, such
       // as a `'static` lifetime that an earlier literal argument chose for the call.
       let shown = run Type.applyBindings(&wantedType, List<Binding>.asSlice(&inferred.*), true)
@@ -71578,22 +71806,32 @@ effect fn stepProjection(step: &BodyPlaceStep) -> MirProjection ! OutOfMemoryErr
   }
 }
 
-// Cleanup uses the same complete physical union map as payload access and match tags.
+// One source place step in an instance's storage, placed as payload access and match tags place it.
+union PartialStep {
+  Projected {step: BodyPlaceStep},
+  // A union member the instance stores as the whole value: the step changes no place.
+  Whole,
+  // A union member that is itself a union at this instance: only a binding ends here, and it
+  // takes the whole union the step would select from.
+  Spread,
+}
+
 effect fn projectedPartialStep(step: &BodyPlaceStep, bindings: &[Binding], projections: &[RuntimeProjection])
-  -> Option<BodyPlaceStep> ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  -> PartialStep ! OutOfMemoryError ? &mut Allocator | &mut Types {
   match &step.* {
-    BodyPlaceStep.Member {tag, source, ..} => {
-      let mapped = run UnionProjection.member(&source, tag, bindings, projections)
-      return match move mapped {
-        Option<UnionProjection.Member>.Some {value} => Option<BodyPlaceStep>.some(
-          BodyPlaceStep.Member {tag: value.tag, ty: move value.ty, source: Shared<Type>.clone(&source)})
-        _ => Option<BodyPlaceStep>.none()
+    BodyPlaceStep.Member {ty: member, source, ..} => {
+      return match move run UnionProjection.placement(&source, &member, bindings, projections) {
+        Option<UnionPlacement>.Some {value: UnionPlacement.Tagged {tag: physical, ty}} => PartialStep.Projected {
+          step: BodyPlaceStep.Member {tag: physical, ty: move ty, source: Shared<Type>.clone(&source)}}
+        Option<UnionPlacement>.Some {value: UnionPlacement.Whole} => PartialStep.Whole
+        Option<UnionPlacement>.Some {value: UnionPlacement.Spread {..}} => PartialStep.Spread
+        Option<UnionPlacement>.None => CompilerBug.panic(b"a checked union member has no placement in its instance")
       }
     }
-    BodyPlaceStep.Field {index} => { return Option<BodyPlaceStep>.some(BodyPlaceStep.Field {index: index}) }
-    BodyPlaceStep.Element {index} => { return Option<BodyPlaceStep>.some(BodyPlaceStep.Element {index: index}) }
+    BodyPlaceStep.Field {index} => { return PartialStep.Projected {step: BodyPlaceStep.Field {index: index}} }
+    BodyPlaceStep.Element {index} => { return PartialStep.Projected {step: BodyPlaceStep.Element {index: index}} }
     BodyPlaceStep.VariantField {tag, field} => {
-      return Option<BodyPlaceStep>.some(BodyPlaceStep.VariantField {tag: tag, field: field})
+      return PartialStep.Projected {step: BodyPlaceStep.VariantField {tag: tag, field: field}}
     }
   }
 }
@@ -71682,15 +71920,16 @@ effect fn siteRemainder(resolver: &mut Resolver, owner: &mut Query<Answer, NoRej
       Option<BodyPlaceStep>.Some {value} => move value
       Option<BodyPlaceStep>.None => { return Result<Option<Remainder>, Shared<Rejection>>.succeed(Option<Remainder>.none()) }
     }
+    let physical = match move run projectedPartialStep(&path, bindings, projections) {
+      PartialStep.Projected {step: placed} => move placed
+      PartialStep.Whole => {
+        step = step + usize.ONE
+        continue
+      }
+      PartialStep.Spread => { break }
+    }
     let span = Shared<TypedBody>.with<Span>(typed,
       fn(body: &TypedBody) -> Span { return BodyOrigin.span(TypedBody.nodeSlice(body)[at].origin, anchor) })
-    let physical = match move run projectedPartialStep(&path, bindings, projections) {
-      Option<BodyPlaceStep>.Some {value} => move value
-      Option<BodyPlaceStep>.None => {
-        return Result<Option<Remainder>, Shared<Rejection>>.failResult(
-          run reject(&resolver.*, module, RejectionCode.UnionFormUnavailable, span))
-      }
-    }
     let hook = match move run dropImplementation(&mut resolver.*, &mut owner.*, &mut dependencies.*, &current, List<Constraint>.asSlice(&declared)) {
       Result<Option<SealedMatch>, Shared<Rejection>>.Success {value} => move value
       Result<Option<SealedMatch>, Shared<Rejection>>.Failure {error} => { return Result<Option<Remainder>, Shared<Rejection>>.failResult(move error) }
@@ -71717,6 +71956,8 @@ effect fn siteRemainder(resolver: &mut Resolver, owner: &mut Query<Answer, NoRej
     current = run RuntimeType.project(&next, projections)
     step = step + usize.ONE
   }
+  // A path the instance stores whole moves its complete root.
+  if List<MirProjection>.length(&steps) == usize.ZERO { return Result<Option<Remainder>, Shared<Rejection>>.succeed(Option<Remainder>.none()) }
   return Result<Option<Remainder>, Shared<Rejection>>.succeed(Option<Remainder>.some(Remainder {node: at, local: local, subject: subject, steps: move steps, levels: move levels}))
 }
 
@@ -73831,174 +74072,6 @@ effect fn producedEffect(resolver: &mut Resolver, owner: &mut Query<Answer, NoRe
   return Result<Shared<Type>, Shared<Rejection>>.succeed(run Type.applyBindings(&finished, List<Binding>.asSlice(&bindings), true))
 }
 
-// The authored owner graph is finite even when its concrete pointer applications grow.
-// Inspect symbolic fields before substitutions can erase a latent T | Leaf union.
-struct UnionStorageBlueprint {
-  hasUnion: bool,
-  changesRepresentation: bool,
-  unknown: bool,
-}
-
-fn unionStorageShape(value: &Type) -> bool {
-  return match &value.* { Type.Union {..} => true _ => false }
-}
-
-fn unionStorageProjectionForm(value: &Type) -> bool {
-  return match &value.* {
-    Type.OpaqueRepresentation {..} => true
-    Type.CallableView {..} => true
-    Type.CallableOrigin {..} => true
-    Type.CallableResult {..} => true
-    Type.CallableWitnessResult {..} => true
-    Type.CallableStage {..} => true
-    _ => false
-  }
-}
-
-effect fn unionStorageIdentity(value: &Shared<Type>) -> Option<Shared<Type>>
-! OutOfMemoryError ? &mut Allocator | &mut Types {
-  let copied = run Type.copy(value)
-  if let Type.Nominal {declaration, isPublic, arguments} = move copied {
-    let listed = List<Argument>.asSlice(&arguments)
-    let mut generic = List<Argument>.make()
-    let mut at = usize.ZERO
-    while at < listed.length {
-      match &listed[at] {
-        Argument.Type {..} => run List<Argument>.append(&mut generic, Argument.Type {
-          value: run Types.intern(Type.Parameter {declaration: DeclarationId.copy(&declaration), ordinal: at})})
-        Argument.Lifetime {..} => run List<Argument>.append(&mut generic, Argument.Lifetime {
-          value: run Shared<Lifetime>.make(Lifetime.Parameter {declaration: DeclarationId.copy(&declaration), ordinal: at})})
-        // A changing static or row family needs its own symbolic storage proof.
-        _ => { return Option<Shared<Type>>.none() }
-      }
-      at = at + usize.ONE
-    }
-    return Option<Shared<Type>>.some(run Types.intern(Type.Nominal {
-      declaration: move declaration, isPublic: isPublic, arguments: move generic}))
-  }
-  return Option<Shared<Type>>.none()
-}
-
-effect fn unionStorageBlueprint(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
-  dependencies: &mut List<Dependency>, value: &Shared<Type>, projections: &[RuntimeProjection],
-  owners: &mut List<Shared<Type>>, facts: &mut UnionStorageBlueprint, span: Span) -> Option<Shared<Rejection>>
-! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
-  if Shared<Type>.with<bool>(value, unionStorageShape) { facts.hasUnion = true }
-  if Shared<Type>.with<bool>(value, unionStorageProjectionForm) { facts.changesRepresentation = true }
-  let projected = run RuntimeType.project(value, projections)
-  if !run Type.equalsShared(value, &projected) { facts.changesRepresentation = true }
-  // Check actual finite argument trees independently of the nominal-owner cutoff.
-  let children = run RuntimeType.inputs(value)
-  let listed = List<Shared<Type>>.asSlice(&children)
-  let mut at = usize.ZERO
-  while at < listed.length {
-    let rejected = run unionStorageBlueprint(&mut resolver.*, &mut owner.*, &mut dependencies.*,
-      &listed[at], projections, &mut owners.*, &mut facts.*, span)
-    if let Option<Shared<Rejection>>.Some {value: error} = move rejected { return Option<Shared<Rejection>>.some(move error) }
-    at = at + usize.ONE
-  }
-  if !Shared<Type>.with<bool>(value, isNominalType) { return Option<Shared<Rejection>>.none() }
-  let earlier = List<Shared<Type>>.asSlice(&owners.*)
-  at = usize.ZERO
-  while at < earlier.length {
-    if sameNominal(value, &earlier[at]) { return Option<Shared<Rejection>>.none() }
-    at = at + usize.ONE
-  }
-  run List<Shared<Type>>.append(&mut owners.*, Shared<Type>.clone(value))
-  let identity = match move run unionStorageIdentity(value) {
-    Option<Shared<Type>>.Some {value: symbolic} => move symbolic
-    _ => {
-      facts.unknown = true
-      return Option<Shared<Rejection>>.none()
-    }
-  }
-  let parts = match move run nominalParts(&mut resolver.*, &mut owner.*, &mut dependencies.*, &identity, span) {
-    Result<List<Shared<Type>>, Shared<Rejection>>.Success {value: fields} => move fields
-    Result<List<Shared<Type>>, Shared<Rejection>>.Failure {error} => { return Option<Shared<Rejection>>.some(move error) }
-  }
-  let fields = List<Shared<Type>>.asSlice(&parts)
-  at = usize.ZERO
-  while at < fields.length {
-    let rejected = run unionStorageBlueprint(&mut resolver.*, &mut owner.*, &mut dependencies.*,
-      &fields[at], projections, &mut owners.*, &mut facts.*, span)
-    if let Option<Shared<Rejection>>.Some {value: error} = move rejected { return Option<Shared<Rejection>>.some(move error) }
-    at = at + usize.ONE
-  }
-  return Option<Shared<Rejection>>.none()
-}
-
-// A descriptor can carry a union without generating an injection or payload operation.
-// Ordinary generic alias collapse precedes this check; only representation projection must
-// preserve an injective map. Tag-bearing operations validate their original ordinals separately.
-effect fn validateRuntimeUnionMaps(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
-  dependencies: &mut List<Dependency>, value: &Shared<Type>, bindings: &[Binding], projections: &[RuntimeProjection],
-  visited: &mut List<Shared<Type>>, visitedLookup: &mut InternIndex, active: &mut List<Shared<Type>>, module: &ModuleId, span: Span)
--> Option<Shared<Rejection>>
-! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
-  let closed = run Type.applyBindings(value, bindings, true)
-  let empty = List<Binding>.make()
-  let noBindings = List<Binding>.asSlice(&empty)
-  let hashed = Type.hash(&closed)
-  if run knownType(List<Shared<Type>>.asSlice(&visited.*), &visitedLookup.*, &closed, hashed) { return Option<Shared<Rejection>>.none() }
-  let mut at = usize.ZERO
-  let storage = run RuntimeType.project(&closed, projections)
-  if Shared<Type>.with<bool>(&closed, unionStorageShape) && !Shared<Type>.with<bool>(&closed, neverType)
-    && !run Type.equalsShared(&closed, &storage) {
-    let mapped = run UnionProjection.map(&closed, noBindings, projections)
-    if let Option<List<UnionProjection.Member>>.None = move mapped {
-      return Option<Shared<Rejection>>.some(run reject(&resolver.*, module, RejectionCode.UnionFormUnavailable, span))
-    }
-  }
-  run List<Shared<Type>>.append(&mut visited.*, Shared<Type>.clone(&closed))
-  run InternIndex.record(&mut visitedLookup.*, hashed)
-  let nominal = Shared<Type>.with<bool>(&closed, isNominalType)
-  // Finite argument subtrees are checked even when a later field edge repeats its owner.
-  let children = run RuntimeType.inputs(&closed)
-  let listed = List<Shared<Type>>.asSlice(&children)
-  at = usize.ZERO
-  while at < listed.length {
-    let rejected = run validateRuntimeUnionMaps(&mut resolver.*, &mut owner.*, &mut dependencies.*, &listed[at],
-      noBindings, projections, &mut visited.*, &mut visitedLookup.*, &mut active.*, module, span)
-    if let Option<Shared<Rejection>>.Some {value: error} = move rejected { return Option<Shared<Rejection>>.some(move error) }
-    at = at + usize.ONE
-  }
-  if !nominal { return Option<Shared<Rejection>>.none() }
-  // This proof covers ABI changes introduced through projected nominal arguments. An unchanged
-  // descriptor referent does not demand unrelated field validity (including elided field binders).
-  if run Type.equalsShared(&closed, &storage) { return Option<Shared<Rejection>>.none() }
-  let path = List<Shared<Type>>.asSlice(&active.*)
-  at = usize.ZERO
-  while at < path.length {
-    if sameNominal(&closed, &path[at]) {
-      let mut owners = List<Shared<Type>>.make()
-      let mut facts = UnionStorageBlueprint {hasUnion: false, changesRepresentation: false, unknown: false}
-      let rejected = run unionStorageBlueprint(&mut resolver.*, &mut owner.*, &mut dependencies.*, &closed,
-        projections, &mut owners, &mut facts, span)
-      if let Option<Shared<Rejection>>.Some {value: error} = move rejected { return Option<Shared<Rejection>>.some(move error) }
-      if facts.unknown || (facts.hasUnion && facts.changesRepresentation) {
-        return Option<Shared<Rejection>>.some(run reject(&resolver.*, module, RejectionCode.UnionFormUnavailable, span))
-      }
-      return Option<Shared<Rejection>>.none()
-    }
-    at = at + usize.ONE
-  }
-  run List<Shared<Type>>.append(&mut active.*, Shared<Type>.clone(&closed))
-  let parts = match move run nominalParts(&mut resolver.*, &mut owner.*, &mut dependencies.*, &closed, span) {
-    Result<List<Shared<Type>>, Shared<Rejection>>.Success {value: fields} => move fields
-    Result<List<Shared<Type>>, Shared<Rejection>>.Failure {error} => { return Option<Shared<Rejection>>.some(move error) }
-  }
-  let fields = List<Shared<Type>>.asSlice(&parts)
-  at = usize.ZERO
-  while at < fields.length {
-    let rejected = run validateRuntimeUnionMaps(&mut resolver.*, &mut owner.*, &mut dependencies.*, &fields[at],
-      noBindings, projections, &mut visited.*, &mut visitedLookup.*, &mut active.*, module, span)
-    if let Option<Shared<Rejection>>.Some {value: error} = move rejected { return Option<Shared<Rejection>>.some(move error) }
-    at = at + usize.ONE
-  }
-  drop List<Shared<Type>>.pop(&mut active.*)
-  return Option<Shared<Rejection>>.none()
-}
-
 effect fn runtimeProjections(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
   dependencies: &mut List<Dependency>, caller: &Application, bindings: &[Binding], body: &Shared<TypedBody>,
   result: &Shared<Type>, parameters: &[Shared<Type>], anchor: &Anchor) -> Result<List<RuntimeProjection>, Shared<Rejection>>
@@ -74036,30 +74109,6 @@ effect fn runtimeProjections(resolver: &mut Resolver, owner: &mut Query<Answer, 
     let refused = run collectRuntimeProjection(&mut resolver.*, &mut owner.*, &mut dependencies.*, caller,
       bindings, &closed[at], &mut projections, &mut visiting, span)
     if let Option<Shared<Rejection>>.Some {value: error} = move refused {
-      return Result<List<RuntimeProjection>, Shared<Rejection>>.failResult(move error)
-    }
-    at = at + usize.ONE
-  }
-  let noBindings = List<Binding>.make()
-  let mut mapped = List<Shared<Type>>.make()
-  let mut mappedLookup = InternIndex.make()
-  let mut mappingPath = List<Shared<Type>>.make()
-  at = usize.ZERO
-  while at < closed.length {
-    let rejected = run validateRuntimeUnionMaps(&mut resolver.*, &mut owner.*, &mut dependencies.*, &closed[at],
-      List<Binding>.asSlice(&noBindings), List<RuntimeProjection>.asSlice(&projections), &mut mapped, &mut mappedLookup,
-      &mut mappingPath, DeclarationId.moduleId(Application.bodyDeclaration(caller)), span)
-    if let Option<Shared<Rejection>>.Some {value: error} = move rejected {
-      return Result<List<RuntimeProjection>, Shared<Rejection>>.failResult(move error)
-    }
-    at = at + usize.ONE
-  }
-  let realized = List<RuntimeProjection>.asSlice(&projections)
-  at = usize.ZERO
-  while at < realized.length {
-    let rejected = run validateRuntimeUnionMaps(&mut resolver.*, &mut owner.*, &mut dependencies.*, &realized[at].storage,
-      bindings, realized, &mut mapped, &mut mappedLookup, &mut mappingPath, DeclarationId.moduleId(Application.bodyDeclaration(caller)), span)
-    if let Option<Shared<Rejection>>.Some {value: error} = move rejected {
       return Result<List<RuntimeProjection>, Shared<Rejection>>.failResult(move error)
     }
     at = at + usize.ONE
@@ -76117,53 +76166,79 @@ struct StoredAlternative {
   storage: Shared<Type>,
 }
 
-// The alternatives of a finite join, or of the union storage a producer's join realizes;
-// absent for any other Effect. A join whose storage collapsed has no injective tag map.
-effect fn storedAlternatives(ty: &Shared<Type>, projections: &[RuntimeProjection]) -> Option<Result<List<StoredAlternative>, PreparationFailure>>
+// The alternatives of a finite join, or of the union storage a producer's join realizes, each
+// under its tag in the storage's canonical members (UNION-001); absent for any other Effect.
+// Nested joins, written or realized, contribute their own alternatives. Alternatives that the
+// storage normalized to one member share it, and its first alternative runs it.
+effect fn storedAlternatives(ty: &Shared<Type>, projections: &[RuntimeProjection]) -> Option<List<StoredAlternative>>
 ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let joined = Shared<Type>.with<bool>(ty, fn(value: &Type) -> bool {
+    return match &value.* { Type.EffectJoin {..} => true Type.Union {..} => true _ => false }
+  })
+  if !joined { return Option<List<StoredAlternative>>.none() }
+  let storage = run RuntimeType.project(ty, projections)
+  let mut leaves = List<Shared<Type>>.make()
+  run joinLeaves(ty, projections, &mut leaves)
+  let listed = List<Shared<Type>>.asSlice(&leaves)
   let mut output = List<StoredAlternative>.make()
-  let copied = run Type.copy(ty)
-  match move copied {
-    Type.EffectJoin {alternatives, ..} => {
-      let listed = List<Shared<Type>>.asSlice(&alternatives)
-      if listed.length == usize.ONE {
-        run List<StoredAlternative>.append(&mut output, StoredAlternative {alternative: Shared<Type>.clone(&listed[usize.ZERO]),
-          tag: usize.ZERO, storage: Shared<Type>.clone(&listed[usize.ZERO])})
-        return Option<Result<List<StoredAlternative>, PreparationFailure>>.some(Result<List<StoredAlternative>, PreparationFailure>.succeed(move output))
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let placed = run UnionProjection.within(&storage, &run RuntimeType.project(&listed[at], projections))
+    let mut tag = usize.ZERO
+    let mut stored = Shared<Type>.clone(&storage)
+    match move placed {
+      Option<UnionPlacement>.Some {value: UnionPlacement.Whole} => {}
+      Option<UnionPlacement>.Some {value: UnionPlacement.Tagged {tag: physical, ty: member}} => {
+        tag = physical
+        stored = move member
       }
-      let none = List<Binding>.make()
-      let mapped = match move run UnionProjection.map(ty, List<Binding>.asSlice(&none), projections) {
-        Option<List<UnionProjection.Member>>.Some {value} => move value
-        Option<List<UnionProjection.Member>>.None => {
-          return Option<Result<List<StoredAlternative>, PreparationFailure>>.some(Result<List<StoredAlternative>, PreparationFailure>.failResult(PreparationFailure.Coverage {code: GapCode.UnionForm}))
-        }
-      }
-      let members = List<UnionProjection.Member>.asSlice(&mapped)
-      let mut at = usize.ZERO
-      while at < listed.length {
-        run List<StoredAlternative>.append(&mut output, StoredAlternative {alternative: Shared<Type>.clone(&listed[at]),
-          tag: members[at].tag, storage: Shared<Type>.clone(&members[at].ty)})
-        at = at + usize.ONE
-      }
+      _ => CompilerBug.panic(b"a stored Effect alternative has no single tag in its join's storage")
     }
-    Type.Union {..} => {
-      let canonical = match move run Type.canonicalUnionMembers(ty) {
-        Option<List<Shared<Type>>>.Some {value} => move value
-        Option<List<Shared<Type>>>.None => {
-          return Option<Result<List<StoredAlternative>, PreparationFailure>>.some(Result<List<StoredAlternative>, PreparationFailure>.failResult(PreparationFailure.Coverage {code: GapCode.UnionForm}))
-        }
-      }
-      let listed = List<Shared<Type>>.asSlice(&canonical)
-      let mut at = usize.ZERO
-      while at < listed.length {
-        run List<StoredAlternative>.append(&mut output, StoredAlternative {alternative: Shared<Type>.clone(&listed[at]),
-          tag: at, storage: Shared<Type>.clone(&listed[at])})
-        at = at + usize.ONE
-      }
+    let previous = List<StoredAlternative>.asSlice(&output)
+    let mut shared = false
+    let mut scan = usize.ZERO
+    while scan < previous.length {
+      if previous[scan].tag == tag { shared = true }
+      scan = scan + usize.ONE
     }
-    _ => { return Option<Result<List<StoredAlternative>, PreparationFailure>>.none() }
+    if !shared {
+      run List<StoredAlternative>.append(&mut output, StoredAlternative {alternative: Shared<Type>.clone(&listed[at]),
+        tag: tag, storage: move stored})
+    }
+    at = at + usize.ONE
   }
-  return Option<Result<List<StoredAlternative>, PreparationFailure>>.some(Result<List<StoredAlternative>, PreparationFailure>.succeed(move output))
+  return Option<List<StoredAlternative>>.some(move output)
+}
+
+// The non-join alternatives a join stores, in order: a nested join, or an Effect family realized
+// as one, contributes its own alternatives; a union storage contributes its canonical members.
+effect fn joinLeaves(ty: &Shared<Type>, projections: &[RuntimeProjection], leaves: &mut List<Shared<Type>>) -> ()
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut nested = Option<List<Shared<Type>>>.none()
+  match move run Type.copy(ty) {
+    Type.EffectJoin {alternatives, ..} => { nested = Option<List<Shared<Type>>>.some(move alternatives) }
+    Type.Union {..} => { nested = run Type.canonicalUnionMembers(ty) }
+    Type.OpaqueRepresentation {..} => {
+      if let Option<Shared<Type>>.Some {value: realized} = move run RuntimeType.resolved(ty, projections) {
+        if Shared<Type>.with<bool>(&realized, fn(value: &Type) -> bool {
+          return match &value.* { Type.EffectJoin {..} => true _ => false }
+        }) { return run joinLeaves(&realized, projections, &mut leaves.*) }
+      }
+    }
+    _ => {}
+  }
+  match move nested {
+    Option<List<Shared<Type>>>.Some {value} => {
+      let listed = List<Shared<Type>>.asSlice(&value)
+      let mut at = usize.ZERO
+      while at < listed.length {
+        run joinLeaves(&listed[at], projections, &mut leaves.*)
+        at = at + usize.ONE
+      }
+    }
+    Option<List<Shared<Type>>>.None => run List<Shared<Type>>.append(&mut leaves.*, Shared<Type>.clone(ty))
+  }
+  return ()
 }
 
 // Prepares the run of one exact Effect: a construction's or block's runner, or a composition whose
@@ -76188,11 +76263,7 @@ effect fn compositePlan(resolver: &mut Resolver, owner: &mut Query<Answer, NoRej
   }
   // A finite join runs only the selected alternative's own plan (EFF-013, D1).
   let stored = run storedAlternatives(ty, projections)
-  if let Option<Result<List<StoredAlternative>, PreparationFailure>>.Some {value: found} = move stored {
-    let alternatives = match move found {
-      Result<List<StoredAlternative>, PreparationFailure>.Success {value} => move value
-      Result<List<StoredAlternative>, PreparationFailure>.Failure {error} => { return Result<usize, PreparationFailure>.failResult(move error) }
-    }
+  if let Option<List<StoredAlternative>>.Some {value: alternatives} = move stored {
     let listed = List<StoredAlternative>.asSlice(&alternatives)
     let mut arms = List<MirJoinArm>.make()
     let mut at = usize.ZERO
@@ -77693,14 +77764,38 @@ effect fn resolveUnionDispatchMir(resolver: &mut Resolver, owner: &mut Query<Ans
       Result<ResolvedWitness, Shared<Rejection>>.Success {value} => move value
       Result<ResolvedWitness, Shared<Rejection>>.Failure {error} => { return run mirRejection(identity, move error, move dependencies) }
     }
-    // Each operand passes unchanged: a member witness that borrows a by-value operand is not admitted.
+    // A by-value operand the member's witness borrows is lent for the call; the lent lifetime is
+    // erased at runtime, as at an ordinary witness call.
     let passes = List<OperandPass>.asSlice(&witness.operands)
-    let mut pass = usize.ZERO
+    let operands = List<Shared<Type>>.asSlice(&parameters)
+    // A service witness's ambient receiver is one operand more than the dispatch passes.
+    if passes.length != operands.length { return memberSuccess(run dispatchGap(GapCode.WitnessOperand, identity), move dependencies) }
+    let mut lent = run Application.bindings(&application)
+    let mut borrows = List<DispatchBorrow>.make()
+    let mut pass = usize.ONE
     while pass < passes.length {
-      if let OperandPass.Borrow {..} = &passes[pass] { return memberSuccess(run dispatchGap(GapCode.WitnessOperand, identity), move dependencies) }
+      if let OperandPass.Borrow {access, lifetimeOrdinal} = &passes[pass] {
+        run List<Binding>.append(&mut lent, Binding {
+          declaration: run Shared<DeclarationId>.make(DeclarationId.copy(Application.bodyDeclaration(&witness.application))),
+          ordinal: lifetimeOrdinal, value: Argument.Lifetime {value: run Shared<Lifetime>.make(Lifetime.Static)},
+        })
+        let needed = match move run glueNeeds(&mut resolver.*, &mut owner.*, &mut dependencies, &operands[pass]) {
+          Result<bool, PreparationFailure>.Success {value} => value
+          Result<bool, PreparationFailure>.Failure {error} => { return run preparationQueryAnswer(identity, move error, move dependencies) }
+        }
+        let mut glue = Option<InstanceKey>.none()
+        if needed {
+          match move run glueChild(pass, &operands[pass], &operation) {
+            Result<Option<GlueChild>, PreparationFailure>.Success {value: Option<GlueChild>.Some {value: child}} => { glue = Option<InstanceKey>.some(move child.glue) }
+            Result<Option<GlueChild>, PreparationFailure>.Success {..} => { return memberSuccess(run dispatchGap(GapCode.Cleanup, identity), move dependencies) }
+            Result<Option<GlueChild>, PreparationFailure>.Failure {error} => { return run preparationQueryAnswer(identity, move error, move dependencies) }
+          }
+        }
+        run List<DispatchBorrow>.append(&mut borrows, DispatchBorrow {parameter: pass, access: access, glue: move glue})
+      }
       pass = pass + usize.ONE
     }
-    let closed = run Application.applyBindings(&witness.application, List<Binding>.asSlice(&bindings))
+    let closed = run Application.applyBindings(&witness.application, List<Binding>.asSlice(&lent))
     let unbound = List<BoundProvider>.make()
     let served = match move run rowProviders(&mut resolver.*, &mut owner.*, &mut dependencies, &closed,
       List<ProviderEntry>.asSlice(&own), List<BoundProvider>.asSlice(&unbound), span) {
@@ -77739,7 +77834,7 @@ effect fn resolveUnionDispatchMir(resolver: &mut Resolver, owner: &mut Query<Ans
       return memberSuccess(run dispatchGap(GapCode.WitnessOperand, identity), move dependencies)
     }
     run List<DispatchArm>.append(&mut arms, DispatchArm {tag: at, member: Shared<Type>.clone(&listed[at]), callee: move callee,
-      providers: move sources, fails: memberFails})
+      providers: move sources, fails: memberFails, borrows: move borrows})
     at = at + usize.ONE
   }
   let function = run UnionDispatch.lower(UnionDispatch {key: move instance, result: move result, parameters: move parameters,
@@ -80738,6 +80833,64 @@ effect fn observeLlvmGap(resolver: &mut Resolver, subject: usize) -> ()
   return run Graph.record(&mut resolver.graph, unit, Dependee.UnitResult {unit: producer})
 }
 
+// One instance's text: LLVM text, or for the direct backend a wasm fragment (`WasmLower`).
+effect fn emitInstance(resolver: &Resolver, function: &MirFunction, input: &EmissionInputs, hostExport: bool) -> Bytes
+! BackendGap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if resolver.direct {
+    return run WasmLower.emit(
+      function,
+      &resolver.target,
+      List<TypeLayout>.asSlice(&input.layouts),
+      List<CAbi.Signature>.asSlice(&input.foreign),
+      List<InstanceIdentity>.asSlice(&input.identities),
+      &input.suspension,
+      resolver.threads,
+      hostExport,
+    )
+  }
+  return run LlvmCode.emit(
+    function,
+    &resolver.target,
+    List<TypeLayout>.asSlice(&input.layouts),
+    List<CAbi.Signature>.asSlice(&input.foreign),
+    List<InstanceIdentity>.asSlice(&input.identities),
+    &input.suspension,
+    resolver.fastPathIr,
+    hostExport,
+  )
+}
+
+// The declarations of the C symbols `foreign`, in the backend's text.
+effect fn foreignDeclarationsFor(resolver: &Resolver, foreign: &[CAbi.Signature]) -> List<LlvmCode.Declaration>
+! BackendGap | OutOfMemoryError ? &mut Allocator {
+  if !resolver.direct { return run LlvmCode.foreignDeclarations(foreign) }
+  let declared = run WasmLower.foreignDeclarations(&resolver.target, foreign)
+  let entries = List<WasmDeclaration>.asSlice(&declared)
+  let mut converted = run List<LlvmCode.Declaration>.makeWithCapacity(entries.length)
+  let mut at = usize.ZERO
+  while at < entries.length {
+    run List<LlvmCode.Declaration>.append(&mut converted, LlvmCode.Declaration {
+      contract: run Bytes.copy(Bytes.asSlice(&entries[at].contract)),
+      symbol: run Bytes.copy(Bytes.asSlice(&entries[at].symbol)),
+      text: run Bytes.copy(Bytes.asSlice(&entries[at].text)),
+    })
+    at = at + usize.ONE
+  }
+  return move converted
+}
+
+// The definition of the exported C object `signature` initialized to `constant`, in the
+// backend's text.
+effect fn exportedObjectFor(resolver: &Resolver, signature: &CAbi.Signature, constant: &ObjectConstant) -> Bytes
+! BackendGap | OutOfMemoryError ? &mut Allocator {
+  if !resolver.direct { return run LlvmCode.exportedObject(signature, constant) }
+  let converted = match &constant.* {
+    ObjectConstant.Integer {negative, magnitude} => WasmConstant.Integer {negative: negative, magnitude: magnitude}
+    ObjectConstant.Float {bits, single} => WasmConstant.Float {bits: bits, single: single}
+  }
+  return run WasmLower.exportedObject(&resolver.target, signature, &converted)
+}
+
 // Pure query over a complete immutable content subject. Its dependency ledger records the
 // prepared MIR/layout/signature facts; its validity follows from content, not source revisions.
 effect fn resolveLlvmText(resolver: &mut Resolver, key: Key) -> Answer
@@ -80763,18 +80916,7 @@ effect fn resolveLlvmText(resolver: &mut Resolver, key: Key) -> Answer
       linkAt = linkAt + usize.ONE
     }
   }
-  let emitted = run Effect.result(
-    LlvmCode.emit(
-      function,
-      &resolver.target,
-      List<TypeLayout>.asSlice(&input.layouts),
-      List<CAbi.Signature>.asSlice(&input.foreign),
-      List<InstanceIdentity>.asSlice(&input.identities),
-      &input.suspension,
-      resolver.fastPathIr,
-      hostExport,
-    ),
-  )
+  let emitted = run Effect.result(emitInstance(&resolver.*, function, input, hostExport))
   let text = match move emitted {
     Result<Bytes, BackendGap | OutOfMemoryError>.Success {value} => move value
     Result<Bytes, BackendGap | OutOfMemoryError>.Failure {error} => match move error {
@@ -80793,9 +80935,7 @@ effect fn resolveLlvmText(resolver: &mut Resolver, key: Key) -> Answer
       }
     }
   }
-  let foreign = run Effect.result(
-    LlvmCode.foreignDeclarations(List<CAbi.Signature>.asSlice(&input.foreign)),
-  )
+  let foreign = run Effect.result(foreignDeclarationsFor(&resolver.*, List<CAbi.Signature>.asSlice(&input.foreign)))
   let declarations = match move foreign {
     Result<List<LlvmCode.Declaration>, BackendGap | OutOfMemoryError>.Success {value} => move value
     Result<List<LlvmCode.Declaration>, BackendGap | OutOfMemoryError>.Failure {error} => match move error {
@@ -91099,6 +91239,8 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       llvmValues: List<InstanceDefinition>.make(),
       codegenUnits: false,
       fastPathIr: false,
+      direct: false,
+      threads: false,
       lineTables: false,
       packing: false,
       offeredBodies: List<BuildRecord.PackBody>.make(),
@@ -91107,6 +91249,7 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       moduleLookup: InternIndex.make(),
       declarations: DeclarationTable.make(),
       sourceInputs: Inputs.make(),
+      carried: noCarriedInputs(),
       declarationChanges: List<DeclarationChange>.make(),
       names: StringTable.make(),
       applications: List<Shared<Type>>.make(),
@@ -91173,6 +91316,9 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
     replayReports: List<ReplayReport>.make(),
     carriedUnits: List<usize>.make(),
     carriedRoots: List<usize>.make(),
+    heldImage: Option<CacheImage.Image>.none(),
+    pendingLookup: InternIndex.make(),
+    pendingRoots: List<usize>.make(),
     checkRuns: usize.ZERO,
     capturedBuild: Option<CapturedBuild>.none(),
     freshBuild: false,
@@ -91828,40 +91974,161 @@ impl Semantic {
   /// and no node becomes a unit, which spares recording the image's edges again.
   pub effect fn adoptCache(self: &mut Self, request: &Request, image: &CacheImage.Image, linked: bool) -> Adopted
     ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
+    return run Semantic.adoptImage(&mut self.*, request, run CacheImage.copy(image), linked)
+  }
+  /// As [`adoptCache`], keeping `image`, which [`adoptedImage`] gives back for the image this
+  /// store writes next to carry its reused checks from.
+  pub effect fn adoptImage(self: &mut Self, request: &Request, image: CacheImage.Image, linked: bool) -> Adopted
+    ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
+    let mut held = move image
+    // An image whose nodes do not read is not adopted.
+    return match move run Semantic.adoptFrom(&mut self.*, request, &mut held, linked) {
+      Option<Adopted>.Some {value} => {
+        self.heldImage = Option<CacheImage.Image>.some(move held)
+        move value
+      }
+      Option<Adopted>.None => Adopted {roots: usize.ZERO, stale: usize.ZERO, nodes: usize.ZERO, changedLeaves: usize.ZERO}
+    }
+  }
+  /// Reads the leaves of the image the store adopted, expands their keys and reads its nodes, so
+  /// a carry can copy its leaves and nodes (`CacheImage.readLeaves`, `CacheImage.expandKeys`,
+  /// `CacheImage.readNodes`). An image whose leaves or nodes do not read is let go, and nothing is
+  /// carried from it.
+  pub effect fn unpackAdoptedImage(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut read = true
+    if let Option<CacheImage.Image>.Some {value: image} = &mut self.heldImage {
+      read = run CacheImage.readLeaves(&mut image)
+      if read {
+        run CacheImage.expandKeys(&mut image)
+        read = run CacheImage.readNodes(&mut image)
+      }
+    }
+    if !read { self.heldImage = Option<CacheImage.Image>.none() }
+  }
+  /// The image the store adopted ([`adoptImage`]), if any.
+  pub fn adoptedImage<'a>(self: &'a Self) -> Option<&'a CacheImage.Image> {
+    return match &self.heldImage {
+      Option<CacheImage.Image>.Some {value} => Option<&CacheImage.Image>.some(&value)
+      Option<CacheImage.Image>.None => Option<&CacheImage.Image>.none()
+    }
+  }
+  // Adopts `image`, or none when its nodes, which it reads only when a leaf changed or the store
+  // is linked or a build record needs them (`CacheImage.readNodes`), do not read.
+  effect fn adoptFrom(self: &mut Self, request: &Request, image: &mut CacheImage.Image, linked: bool) -> Option<Adopted>
+    ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
     run selectRequest(&mut self.resolver, request)
     run reconcileSources(&mut self.resolver)
-    let mut adopted = Adopted {roots: usize.ZERO, stale: usize.ZERO, nodes: usize.ZERO, changedLeaves: usize.ZERO}
-    let leaves = List<CacheImage.Leaf>.asSlice(&image.leaves)
+    // An unlinked store whose anchors all stand where the image recorded them finds every leaf
+    // unchanged without reading the others (`placeAnchors`).
+    if !linked && !CacheImage.leavesRead(&image.*) && run Semantic.placeAnchors(&mut self.*, &image.*) {
+      if recordsBuild(&image.*) {
+        if !run CacheImage.readNodes(&mut image.*) { return Option<Adopted>.none() }
+      }
+      let unchanged = LeafPlacement {placed: List<usize>.make(), positional: List<bool>.make(), changed: usize.ZERO}
+      return Option<Adopted>.some(run Semantic.adoptNodes(&mut self.*, &image.*, linked, move unchanged))
+    }
+    // Placing a leaf again finds what an anchor placed (`placeLeaf`).
+    if !run CacheImage.readLeaves(&mut image.*) { return Option<Adopted>.none() }
+    let placement = run Semantic.placeImageLeaves(&mut self.*, &image.*, linked)
+    if linked || placement.changed > usize.ZERO || recordsBuild(&image.*) {
+      if !run CacheImage.readNodes(&mut image.*) { return Option<Adopted>.none() }
+    }
+    return Option<Adopted>.some(run Semantic.adoptNodes(&mut self.*, &image.*, linked, move placement))
+  }
+  // Whether the anchors of `image`, whose other leaves are not read, all stand where the image
+  // recorded them, placed as `placeImageLeaves` places them: files first, then inputs, each in
+  // index order. Every other leaf is an input of an unchanged file that is not always placed
+  // (`CacheImage.alwaysPlaced`), which an unlinked store takes as unchanged without placing it.
+  effect fn placeAnchors(self: &mut Self, image: &CacheImage.Image) -> bool ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
+    let anchors = CacheImage.anchors(image)
+    let mut placed = List<usize>.make()
+    run List<usize>.appendRepeated(&mut placed, usize.MAX, anchors.length)
+    let mut at = usize.ZERO
+    while at < anchors.length {
+      if !anchors[at].leaf.input {
+        let found = run placeLeaf(&mut self.resolver, &anchors[at].leaf, CacheImage.anchorKey(&anchors[at]), usize.MAX)
+        if found == usize.MAX { return false }
+        List<usize>.set(&mut placed, at, found)
+      }
+      at = at + usize.ONE
+    }
+    at = usize.ZERO
+    while at < anchors.length {
+      if anchors[at].leaf.input {
+        let mut fileModule = usize.MAX
+        if anchors[at].leaf.file != usize.MAX { fileModule = List<usize>.get(&placed, CacheImage.anchorIndex(anchors, anchors[at].leaf.file)) }
+        let found = run placeLeaf(&mut self.resolver, &anchors[at].leaf, CacheImage.anchorKey(&anchors[at]), fileModule)
+        if found == usize.MAX { return false }
+      }
+      at = at + usize.ONE
+    }
+    return true
+  }
+  // Where each leaf of `image` stands now (`placeLeaf`), and whether each changed one records only
+  // where a span sits (`positionalLeaf`).
+  effect fn placeImageLeaves(self: &mut Self, image: &CacheImage.Image, linked: bool) -> LeafPlacement
+    ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
+    let leaves = CacheImage.leaves(image)
+    let mut changed = usize.ZERO
     let mut placed = List<usize>.make()
     // Files first: an input read from a file that reads as the image recorded is unchanged too.
     // Another leaf of the same module can record other bytes: a carried input names the file it
     // was read from, which an edit since can have changed.
+    // Only the keys of the leaves placed are read (`CacheImage.keyAt`).
+    let mut keys = CacheImage.keyCursor()
     let mut at = usize.ZERO
     while at < leaves.length {
       let mut dependee = usize.MAX
-      if !leaves[at].input { dependee = run placeLeaf(&mut self.resolver, &leaves[at], usize.MAX) }
+      if !leaves[at].input { dependee = run placeLeaf(&mut self.resolver, &leaves[at], run CacheImage.keyAt(image, &mut keys, at), usize.MAX) }
       run List<usize>.append(&mut placed, dependee)
       at = at + usize.ONE
     }
+    // Whether each changed leaf records only where a span sits (`positionalLeaf`).
+    let mut positional = List<bool>.make()
+    run List<bool>.appendRepeated(&mut positional, false, leaves.length)
     at = usize.ZERO
     while at < leaves.length {
       if leaves[at].input {
         let file = leaves[at].file
         let mut fileModule = usize.MAX
         if file != usize.MAX { fileModule = List<usize>.get(&placed, file) }
-        List<usize>.set(&mut placed, at, run placeLeaf(&mut self.resolver, &leaves[at], fileModule))
+        // An unlinked store records no edge to an input, so an input that reads as the image
+        // recorded needs no input of its own here: a check that runs again captures what it reads.
+        // Its key is not read either.
+        if !linked && unchangedLeaf(&leaves[at], fileModule) {
+          List<usize>.set(&mut placed, at, unplacedInput())
+          run carryInput(&mut self.resolver.carried, run CacheImage.keyAt(image, &mut keys, at), &leaves[at], fileModule,
+            leaves[file].digest)
+        } else {
+          List<usize>.set(&mut placed, at, run placeLeaf(&mut self.resolver, &leaves[at], run CacheImage.keyAt(image, &mut keys, at), fileModule))
+        }
+        if List<usize>.get(&placed, at) == usize.MAX { List<bool>.set(&mut positional, at, positionalLeaf(&leaves[at])) }
       }
-      if List<usize>.get(&placed, at) == usize.MAX {
-        adopted.changedLeaves = adopted.changedLeaves + usize.ONE
-      }
+      if List<usize>.get(&placed, at) == usize.MAX { changed = changed + usize.ONE }
       at = at + usize.ONE
     }
+    return LeafPlacement {placed: move placed, positional: move positional, changed: changed}
+  }
+  // Adopts the nodes and roots of `image` whose leaves stand as `placement` finds them.
+  effect fn adoptNodes(self: &mut Self, image: &CacheImage.Image, linked: bool, placement: LeafPlacement) -> Adopted
+    ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
+    let LeafPlacement {placed, positional, changed} = move placement
+    let mut adopted = Adopted {roots: usize.ZERO, stale: usize.ZERO, nodes: usize.ZERO, changedLeaves: changed}
+    let mut at = usize.ZERO
     let mut units = List<usize>.make()
     // Whether a node reads the same once positions are set aside: every leaf it reaches reads as
     // the image recorded, or records only where a span sits (`positionalLeaf`).
     let mut settled = List<bool>.make()
     let nodes = CacheImage.nodeCount(image)
-    at = usize.ZERO
+    // In an unlinked store with every leaf reading as the image recorded, every node is green.
+    if !linked && adopted.changedLeaves == usize.ZERO {
+      run List<usize>.reserveExact(&mut units, nodes)
+      run List<bool>.appendRepeated(&mut settled, true, nodes)
+      while at < nodes {
+        run List<usize>.append(&mut units, at)
+        at = at + usize.ONE
+      }
+    }
     while at < nodes {
       let edges = CacheImage.edgesOf(image, at)
       let mut green = true
@@ -91874,7 +92141,7 @@ impl Semantic {
           still = List<bool>.get(&settled, named)
         } else if List<usize>.get(&placed, named) == usize.MAX {
           green = false
-          still = run positionalLeaf(&leaves[named])
+          still = List<bool>.get(&positional, named)
         }
         edge = edge + usize.ONE
       }
@@ -91893,7 +92160,7 @@ impl Semantic {
           let named = CacheImage.target(edges[edge])
           if CacheImage.namesNode(edges[edge]) {
             run Graph.record(&mut self.resolver.graph, unit, Dependee.UnitResult {unit: List<usize>.get(&units, named)})
-          } else if leaves[named].input {
+          } else if CacheImage.leaves(image)[named].input {
             let input = List<usize>.get(&placed, named)
             let module = List<Inputs.Input>.asSlice(&self.resolver.sourceInputs.inputs)[input].module
             run Graph.record(&mut self.resolver.graph, unit, Dependee.SourceInput {input: input, module: module})
@@ -91954,13 +92221,25 @@ impl Semantic {
         if (node != usize.MAX || List<bool>.get(&settled, root.node)) && !linked {
           let named = StableKey.view(Bytes.asSlice(&root.key), exact)
           if kind == 3 {
-            run List<EscapeRecordRoot>.append(&mut self.escapeImage.records, EscapeRecordRoot {unit: run Bytes.copy(named),
-              root: at - usize.ONE, answer: run Bytes.copy(Bytes.asSlice(&root.answer))})
+            run List<EscapeRecordRoot>.append(&mut self.escapeImage.records, EscapeRecordRoot {unit: exact, root: at - usize.ONE})
           } else if run DigestSet.add(&mut self.escapeImage.entries, digestOfBytes(named)) {
             run List<usize>.append(&mut self.escapeImage.roots, at - usize.ONE)
           }
         }
         continue
+      }
+      // An unlinked store reads a declaration's check root only when a sweep of its module runs:
+      // a sweep that is reused reads none of them.
+      if !linked && (node != usize.MAX || List<bool>.get(&settled, root.node)) {
+        let module = declarationRootModule(Bytes.asSlice(&root.key))
+        if module.end > module.start {
+          run InternIndex.record(&mut self.pendingLookup, InternIndex.hashBytes(0, StableKey.view(Bytes.asSlice(&root.key), module)))
+          run List<usize>.append(&mut self.pendingRoots, at - usize.ONE)
+          run List<usize>.append(&mut self.carriedUnits, usize.MAX)
+          run List<usize>.append(&mut self.carriedRoots, at - usize.ONE)
+          adopted.roots = adopted.roots + usize.ONE
+          continue
+        }
       }
       let key = run readCheckKey(Bytes.asSlice(&root.key))
       let answer = match &key {
@@ -92033,7 +92312,7 @@ impl Semantic {
     if node != usize.MAX { run Graph.record(&mut self.resolver.graph, unit, Dependee.UnitResult {unit: node}) }
     else { run List<usize>.append(&mut self.carriedUnits, unit) }
     drop run Graph.finishRun(&mut self.resolver.graph, unit, Option<ContentHash>.none())
-    let CheckAnswer {kind, concrete, rejections} = move kept
+    let CheckAnswer {kind, concrete, rejections, deferred} = move kept
     if kind > 1 {
       let mut named = move concrete
       run Semantic.keepDeclaration(&mut self.*, unit, List<DeclarationId>.remove(&mut named, usize.ZERO), kind == 3, node == usize.MAX)
@@ -92046,7 +92325,7 @@ impl Semantic {
       sweep.concrete = move concrete
       sweep.rejections = move rejections
       run List<ModuleCheckMemo>.append(&mut self.moduleMemos, ModuleCheckMemo {unit: unit, sweep: move sweep,
-        deferred: List<DeferredStaticTemplate>.make(), unchecked: List<UncheckedBody>.make()})
+        deferred: move deferred, unchecked: List<UncheckedBody>.make()})
     }
     return true
   }
@@ -92100,8 +92379,11 @@ impl Semantic {
     let reused = List<usize>.asSlice(&self.carriedUnits)
     let mut at = usize.ZERO
     while at < reused.length {
-      run slotFor(&mut build.nodes, reused[at])
-      List<usize>.set(&mut build.nodes, reused[at], unfit())
+      // A declaration check still unread has no unit (`pendingRoots`).
+      if reused[at] != usize.MAX {
+        run slotFor(&mut build.nodes, reused[at])
+        List<usize>.set(&mut build.nodes, reused[at], unfit())
+      }
       at = at + usize.ONE
     }
     let mut pending = List<PendingCheck>.make()
@@ -92112,14 +92394,13 @@ impl Semantic {
       at = at + usize.ONE
       if List<Shared<BackendGap>>.length(&memo.sweep.gaps) > usize.ZERO
         || List<UncheckedDeclaration>.length(&memo.sweep.unchecked) > usize.ZERO
-        || List<DeferredStaticTemplate>.length(&memo.deferred) > usize.ZERO
         || List<UncheckedBody>.length(&memo.unchecked) > usize.ZERO
         || holdsUnit(List<usize>.asSlice(&self.carriedUnits), memo.unit) {
         continue
       }
       let mut sites = List<ModuleId>.make()
       let answer = match move run reportingAnswer(0, List<DeclarationId>.asSlice(&memo.sweep.concrete),
-        List<Shared<Rejection>>.asSlice(&memo.sweep.rejections), &mut sites) {
+        List<Shared<Rejection>>.asSlice(&memo.sweep.rejections), List<DeferredStaticTemplate>.asSlice(&memo.deferred), &mut sites) {
         Option<Bytes>.Some {value} => move value
         Option<Bytes>.None => { continue }
       }
@@ -92158,7 +92439,7 @@ impl Semantic {
         }
         let mut sites = List<ModuleId>.make()
         let answer = match move run reportingAnswer(1, List<DeclarationId>.asSlice(&memo.concrete),
-          List<Shared<Rejection>>.asSlice(&memo.result.rejections), &mut sites) {
+          List<Shared<Rejection>>.asSlice(&memo.result.rejections), &[], &mut sites) {
           Option<Bytes>.Some {value} => move value
           Option<Bytes>.None => { continue }
         }
@@ -92176,7 +92457,7 @@ impl Semantic {
       }
       let mut sites = List<ModuleId>.make()
       let answer = match move run reportingAnswer(1, List<DeclarationId>.asSlice(&memo.concrete),
-        List<Shared<Rejection>>.asSlice(&memo.result.rejections), &mut sites) {
+        List<Shared<Rejection>>.asSlice(&memo.result.rejections), &[], &mut sites) {
         Option<Bytes>.Some {value} => move value
         Option<Bytes>.None => { continue }
       }
@@ -92286,7 +92567,7 @@ impl Semantic {
       let module = resolvedModule(&self.resolver, List<usize>.get(&build.fileModules, file))
       let leaf = List<usize>.get(&build.files, List<usize>.get(&build.fileModules, file))
       let digest = run sourceDigest(&mut self.resolver, &module)
-      let mut leaves = List<CacheImage.Leaf>.asMutSlice(&mut build.image.leaves)
+      let mut leaves = CacheImage.leavesMut(&mut build.image)
       leaves[leaf].digest = digest
       file = file + usize.ONE
     }
@@ -92314,10 +92595,12 @@ impl Semantic {
     let reused = List<usize>.asSlice(&self.carriedUnits)
     at = usize.ZERO
     while at < reused.length {
-      run slotFor(&mut build.nodes, reused[at])
-      let mut node = unfit()
-      if at < nodes.length { node = nodes[at] }
-      List<usize>.set(&mut build.nodes, reused[at], node)
+      if reused[at] != usize.MAX {
+        run slotFor(&mut build.nodes, reused[at])
+        let mut node = unfit()
+        if at < nodes.length { node = nodes[at] }
+        List<usize>.set(&mut build.nodes, reused[at], node)
+      }
       at = at + usize.ONE
     }
     let filled = List<usize>.length(&build.fileModules)
@@ -92418,7 +92701,7 @@ impl Semantic {
   pub effect fn imageCarriedFiles(self: &mut Self, image: &mut CacheImage.Image) -> () ! Cycle | OutOfMemoryError ? &mut Allocator {
     // The leaf of each module's file as it reads now, by module ordinal, added when first needed.
     let mut current = List<usize>.make()
-    let count = List<CacheImage.Leaf>.length(&image.leaves)
+    let count = CacheImage.leafCount(&image.*)
     // The same by the file leaf an input names, so an input of a module whose file reads as it did
     // is passed over without reading its key.
     let mut byFile = List<usize>.make()
@@ -92427,11 +92710,11 @@ impl Semantic {
     while at < count {
       let slot = at
       at = at + usize.ONE
-      if !List<CacheImage.Leaf>.asSlice(&image.leaves)[slot].input { continue }
-      let file = List<CacheImage.Leaf>.asSlice(&image.leaves)[slot].file
+      if !CacheImage.leaves(&image.*)[slot].input { continue }
+      let file = CacheImage.leaves(&image.*)[slot].file
       if file != usize.MAX && file < count && List<usize>.get(&byFile, file) == file { continue }
-      let key = run Bytes.copy(Bytes.asSlice(&List<CacheImage.Leaf>.asSlice(&image.leaves)[slot].key))
-      let digest = List<CacheImage.Leaf>.asSlice(&image.leaves)[slot].digest
+      let key = run Bytes.copy(CacheImage.key(&image.*, slot))
+      let digest = CacheImage.leaves(&image.*)[slot].digest
       let mut reader = StableKey.reader()
       let module = match move run StableKey.readModule(Bytes.asSlice(&key), &mut reader) {
         Option<ModuleId>.Some {value} => move value
@@ -92442,21 +92725,19 @@ impl Semantic {
       let mut now = List<usize>.get(&current, ordinal)
       if now == unreached() {
         let read = run sourceDigest(&mut self.resolver, &module)
-        if file != usize.MAX && ContentHash.equals(List<CacheImage.Leaf>.asSlice(&image.leaves)[file].digest, read) {
+        if file != usize.MAX && ContentHash.equals(CacheImage.leaves(&image.*)[file].digest, read) {
           now = file
         } else {
           let mut fileKey = Bytes.make()
           run StableKey.module(&mut fileKey, &module)
-          now = List<CacheImage.Leaf>.length(&image.leaves)
-          run List<CacheImage.Leaf>.append(&mut image.leaves, CacheImage.Leaf {input: false, key: move fileKey, digest: read,
-            position: usize.MAX, file: usize.MAX, text: ContentHash {high: 0, low: 0}})
+          now = run CacheImage.addLeaf(&mut image.*, false, move fileKey, read, usize.MAX, usize.MAX, ContentHash {high: 0, low: 0})
         }
         List<usize>.set(&mut current, ordinal, now)
       }
       if file != usize.MAX && file < count { List<usize>.set(&mut byFile, file, now) }
       if file == now { continue }
-      if file != usize.MAX && ContentHash.equals(List<CacheImage.Leaf>.asSlice(&image.leaves)[file].digest,
-        List<CacheImage.Leaf>.asSlice(&image.leaves)[now].digest) { continue }
+      if file != usize.MAX && ContentHash.equals(CacheImage.leaves(&image.*)[file].digest,
+        CacheImage.leaves(&image.*)[now].digest) { continue }
       let read = match move run StableKey.readSelector(Bytes.asSlice(&key), &mut reader) {
         Option<StableKey.ReadSelector>.Some {value} => move value
         Option<StableKey.ReadSelector>.None => { continue }
@@ -92477,7 +92758,7 @@ impl Semantic {
       }
       let input = Inputs.find(&self.resolver.sourceInputs, ordinal, &held)
       if input == usize.MAX { continue }
-      let mut leaves = List<CacheImage.Leaf>.asMutSlice(&mut image.leaves)
+      let mut leaves = CacheImage.leavesMut(&mut image.*)
       // An input that reads otherwise now, such as where a declaration below an edit sits, is
       // marked changed, so the next adoption knows it without indexing the module again.
       if !ContentHash.equals(List<Inputs.Input>.asSlice(&self.resolver.sourceInputs.inputs)[input].digest, digest) {
@@ -92511,7 +92792,8 @@ impl Semantic {
     at = usize.ZERO
     while at < records.length {
       run List<usize>.append(&mut carried, records[at].root)
-      if let Option<BuildRecord.Record>.Some {value: record} = move run BuildRecord.decode(Bytes.asSlice(&records[at].answer)) {
+      let recorded = run adoptedAnswer(&self.heldImage, records[at].root)
+      if let Option<BuildRecord.Record>.Some {value: record} = move run BuildRecord.decode(Bytes.asSlice(&recorded)) {
         let entries = List<BuildRecord.Entry>.asSlice(&record.entries)
         let mut entry = usize.ZERO
         while entry < entries.length {
@@ -92665,6 +92947,14 @@ impl Semantic {
   /// under one choice is never adopted under the other.
   pub fn selectFastPathIr(self: &mut Self, unoptimized: bool) -> () {
     self.resolver.fastPathIr = unoptimized
+  }
+
+  /// Selects whether instances lower to wasm fragments for the direct backend (`WasmLower`)
+  /// instead of LLVM text, and whether that module's memory is shared between threads
+  /// (`threads`). The cache keeps one image per profile, as for `selectFastPathIr`.
+  pub fn selectDirect(self: &mut Self, direct: bool, threads: bool) -> () {
+    self.resolver.direct = direct
+    self.resolver.threads = direct && threads
   }
 
   /// Selects whether lowered functions carry the line and column of each position their location
@@ -93001,12 +93291,13 @@ impl Semantic {
     // check; a walk run here replaces it either way.
     let mut adopted = Option<EscapeRecordRoot>.none()
     if let Option<Bytes>.Some {value: stable} = move run stableUnit(&self.resolver, unit) {
-      adopted = EscapeImage.take(&mut self.escapeImage, Bytes.asSlice(&stable))
+      adopted = EscapeImage.take(&mut self.escapeImage, &self.heldImage, Bytes.asSlice(&stable))
     }
     let mut kept = Option<EscapeRecordRoot>.none()
     if let Option<EscapeRecordRoot>.Some {value: held} = move adopted {
+      let recorded = run adoptedAnswer(&self.heldImage, held.root)
       let replayed = run Semantic.replayKept(&mut self.*, &mut request.*, module, member, unit, concrete, &boundary,
-        Bytes.asSlice(&held.answer), held.root, &[], usize.MAX, false)
+        Bytes.asSlice(&recorded), held.root, &[], usize.MAX, false)
       if let Option<DeclarationCheckResult>.Some {value: result} = move replayed { return move result }
       kept = Option<EscapeRecordRoot>.some(move held)
     } else if let Option<CapturedBuild>.Some {value: last} = move previous {
@@ -93044,8 +93335,8 @@ impl Semantic {
     if guard != usize.MAX {
       drop run Graph.finishRun(&mut self.resolver.graph, guard, Option<ContentHash>.none())
       run Graph.record(&mut self.resolver.graph, unit, Dependee.UnitResult {unit: guard})
-      if List<Shared<Rejection>>.length(&result.rejections) == usize.ZERO && List<Shared<BackendGap>>.length(&result.gaps) == usize.ZERO
-        && List<UncheckedDeclaration>.length(&result.unchecked) == usize.ZERO {
+      // What a body that lowers to nothing reports, a replay of the record reports again.
+      if !capture.unreplayable && List<UncheckedDeclaration>.length(&result.unchecked) == usize.ZERO {
         let mut resting = usize.MAX
         if capture.guarded { resting = guard }
         captured = run BuildCapture.finish(move capture, resting)
@@ -93235,6 +93526,58 @@ impl Semantic {
   }
 
   // Checks a module's name collisions and its declarations, or only the declaration `only` names.
+  // Reads the declaration check roots of `module` an unlinked adoption left unread
+  // (`pendingRoots`), so a sweep of it finds their memos.
+  effect fn readPendingDeclarations(self: &mut Self, module: &ModuleId) -> () ! OutOfMemoryError ? &mut Allocator {
+    if List<usize>.length(&self.pendingRoots) == usize.ZERO { return () }
+    let mut named = Bytes.make()
+    run StableKey.module(&mut named, module)
+    let hash = InternIndex.hashBytes(0, Bytes.asSlice(&named))
+    let mut found = List<usize>.make()
+    let mut entry = InternIndex.first(&self.pendingLookup, hash)
+    while entry != usize.MAX {
+      if List<usize>.get(&self.pendingRoots, entry) != usize.MAX { run List<usize>.append(&mut found, entry) }
+      entry = InternIndex.after(&self.pendingLookup, entry)
+    }
+    if List<usize>.length(&found) == usize.ZERO { return () }
+    let held = Intrinsic.replace(self.heldImage, Option<CacheImage.Image>.none())
+    if let Option<CacheImage.Image>.Some {value: image} = &held {
+      let roots = List<CacheImage.Root>.asSlice(&image.roots)
+      let listed = List<usize>.asSlice(&found)
+      let mut at = usize.ZERO
+      while at < listed.length {
+        let root = List<usize>.get(&self.pendingRoots, listed[at])
+        at = at + usize.ONE
+        let key = Bytes.asSlice(&roots[root].key)
+        let module = declarationRootModule(key)
+        if !same(StableKey.view(key, module), Bytes.asSlice(&named)) { continue }
+        List<usize>.set(&mut self.pendingRoots, listed[at - usize.ONE], usize.MAX)
+        // Its placeholder leaves the carried lists; a root this store reuses rejoins them.
+        let carried = List<usize>.asSlice(&self.carriedRoots)
+        let mut slot = usize.ZERO
+        while slot < carried.length && !(carried[slot] == root && List<usize>.get(&self.carriedUnits, slot) == usize.MAX) {
+          slot = slot + usize.ONE
+        }
+        if slot < carried.length {
+          drop List<usize>.remove(&mut self.carriedUnits, slot)
+          drop List<usize>.remove(&mut self.carriedRoots, slot)
+        }
+        let check = match move run readCheckKey(key) {
+          Option<CheckKey>.Some {value} => move value
+          Option<CheckKey>.None => { continue }
+        }
+        let answer = match move run readCheckAnswer(Bytes.asSlice(&roots[root].answer), Option<&ModuleId>.some(&check.module)) {
+          Option<CheckAnswer>.Some {value} => move value
+          Option<CheckAnswer>.None => { continue }
+        }
+        if run Semantic.adoptCheck(&mut self.*, usize.MAX, key, move check, move answer) {
+          run List<usize>.append(&mut self.carriedRoots, root)
+        }
+      }
+    }
+    self.heldImage = move held
+  }
+
   effect fn sweepModule(
     self: &mut Self,
     request: &mut Request,
@@ -93245,6 +93588,7 @@ impl Semantic {
   ) -> ()
     ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
     ? &mut Allocator | &mut Types {
+    run Semantic.readPendingDeclarations(&mut self.*, module)
     let listed = run Semantic.moduleChecks(&mut self.*, module, only)
     run Semantic.checkNames(&mut self.*, module, List<CheckedName>.asSlice(&listed.names), &mut sweep.rejections)
     let written = List<DeclarationCheck>.asSlice(&listed.declarations)
@@ -93980,9 +94324,12 @@ impl Semantic {
         let answer = run anchorCanonicalAnswer(&mut self.resolver, &rawAnswer, declaration, span)
         let identity = run Shared<DeclarationId>.make(DeclarationId.copy(declaration))
         let instance = run InstanceKey.named(&identity)
+        let reportsBefore = List<Shared<Rejection>>.length(&result.rejections) + List<Shared<BackendGap>>.length(&result.gaps)
         run appendCheckedAnswer(&mut result.rejections, &mut result.gaps, &mut self.query, declaration, &answer)
+        let reports = List<Shared<Rejection>>.length(&result.rejections) + List<Shared<BackendGap>>.length(&result.gaps) != reportsBefore
         let index = Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&answer, answerMirIndex)
         if let Option<usize>.Some { .. } = move index {
+          if reports { capture.unreplayable = true }
           let module = DeclarationId.moduleId(declaration)
           run List<VisitOrigin>.append(&mut origins, VisitOrigin {parent: usize.MAX, position: List<ContentHash>.length(&capture.roots),
             requested: false})
@@ -94151,14 +94498,17 @@ impl Semantic {
                   }
                 }
                 StaticClosure.NotProven { diagnostic } => {
+                  capture.unreplayable = true
                   run List<Shared<Rejection>>.append(&mut result.rejections, move diagnostic)
                   continue
                 }
                 StaticClosure.Rejected { diagnostic } => {
+                  capture.unreplayable = true
                   run List<Shared<Rejection>>.append(&mut result.rejections, move diagnostic)
                   continue
                 }
                 StaticClosure.Unsupported { gaps: found } => {
+                  capture.unreplayable = true
                   let reached = List<Shared<BackendGap>>.asSlice(&found)
                   let mut reachedAt = usize.ZERO
                   while reachedAt < reached.length {
@@ -94176,6 +94526,7 @@ impl Semantic {
           }
           Decision.Reused { .. } => {}
           Decision.Open => {
+            capture.unreplayable = true
             let identity = InstanceKey.identity(&instance)
             let diagnostic = run reject(
               &self.resolver,
@@ -94220,6 +94571,7 @@ impl Semantic {
             }
             self.resolver.rootRecorder = recorder
             if !admitted {
+              capture.unreplayable = true
               run List<
                 Shared<Rejection>
               >.append(
@@ -94271,7 +94623,10 @@ impl Semantic {
         false
       )
       let reportedBefore = List<Shared<Rejection>>.length(&result.rejections)
+      let gapsBefore = List<Shared<BackendGap>>.length(&result.gaps)
       run appendCheckedAnswer(&mut result.rejections, &mut result.gaps, &mut self.query, &identity, &answer)
+      let entryReports = List<Shared<Rejection>>.length(&result.rejections) != reportedBefore
+        || List<Shared<BackendGap>>.length(&result.gaps) != gapsBefore
       // A refusal inside a toolchain body reached from user code belongs at the user's call,
       // unless the body is the same for every caller.
       let site = requestSite(&entered.requester, &entered.module, entered.span)
@@ -94279,6 +94634,7 @@ impl Semantic {
       run relocateRequested(&mut result.rejections, reportedBefore, &site.module, site.span, callerIndependent(&instance), &own)
       let index = Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&answer, answerMirIndex)
       if let Option<usize>.Some { value } = move index {
+        if entryReports { capture.unreplayable = true }
         let anchor = run instanceAnchor(&mut self.resolver, &instance)
         if capturing { BuildCapture.lowered(&mut capture.*, entry, run instanceMirUnit(&mut self.resolver, &instance, false)) }
         let module = DeclarationId.moduleId(&identity)
@@ -94321,6 +94677,7 @@ impl Semantic {
     let mut escapes = List<Shared<Rejection>>.make()
     if !escapesChecked { escapes = run localSharedEscapes(&self.resolver, List<SuspensionSummary>.asSlice(&summaries)) }
     let found = List<Shared<Rejection>>.asSlice(&escapes)
+    if found.length > usize.ZERO { capture.unreplayable = true }
     at = usize.ZERO
     while at < found.length {
       run appendDeclarationRejection(&mut result.rejections, Shared<Rejection>.clone(&found[at]))
@@ -96429,7 +96786,7 @@ impl Semantic {
     }
     let mut signatures = List<CAbi.Signature>.make()
     run List<CAbi.Signature>.append(&mut signatures, move signature)
-    let printed = run Effect.result(LlvmCode.foreignDeclarations(List<CAbi.Signature>.asSlice(&signatures)))
+    let printed = run Effect.result(foreignDeclarationsFor(&self.resolver, List<CAbi.Signature>.asSlice(&signatures)))
     match move printed {
       Result<List<LlvmCode.Declaration>, BackendGap | OutOfMemoryError>.Success {value} => {
         let entries = List<LlvmCode.Declaration>.asSlice(&value)
@@ -96513,7 +96870,7 @@ impl Semantic {
           OutOfMemoryError {} => { fail OutOfMemoryError {} }
         }
       }
-      let defined = run Effect.result(LlvmCode.exportedObject(&signature, &constant))
+      let defined = run Effect.result(exportedObjectFor(&self.resolver, &signature, &constant))
       let definition = match move defined {
         Result<Bytes, BackendGap | OutOfMemoryError>.Success {value: objectText} => move objectText
         Result<Bytes, BackendGap | OutOfMemoryError>.Failure {error} => match move error {
@@ -96527,7 +96884,7 @@ impl Semantic {
       let symbol = run Bytes.copy(Bytes.asSlice(&signature.symbol))
       let mut signatures = List<CAbi.Signature>.make()
       run List<CAbi.Signature>.append(&mut signatures, move signature)
-      let printed = run Effect.result(LlvmCode.foreignDeclarations(List<CAbi.Signature>.asSlice(&signatures)))
+      let printed = run Effect.result(foreignDeclarationsFor(&self.resolver, List<CAbi.Signature>.asSlice(&signatures)))
       let mut external = Bytes.make()
       match move printed {
         Result<List<LlvmCode.Declaration>, BackendGap | OutOfMemoryError>.Success {value: listed} => {
@@ -99547,7 +99904,8 @@ effect fn boundDeclarations(resolver: &Resolver, plan: &EmissionPlan, foreign: &
     at = at + usize.ONE
     let symbol = Bytes.asSlice(&entry.symbol)
     let text = Bytes.asSlice(&entry.text)
-    let global = !Bitcode.namesFunction(text, symbol)
+    let mut global = false
+    if resolver.direct { global = run WasmObject.declaresObject(text, symbol) } else { global = !Bitcode.namesFunction(text, symbol) }
     let mut bound = false
     let mut object = usize.ZERO
     while object < objects.length {
@@ -99618,7 +99976,9 @@ effect fn assembleEmissionChecked(
       return refusedBuild(run reject(resolver, module, RejectionCode.ForeignSymbolConflict, span))
     }
   }
-  let mut text = run LlvmCode.declarations(&resolver.target, resolver.fastPathIr)
+  let mut text = Bytes.make()
+  if resolver.direct { text = run WasmLower.declarations(&resolver.target, resolver.threads) }
+  else { text = run LlvmCode.declarations(&resolver.target, resolver.fastPathIr) }
   run appendEmissionDeclarations(&mut text, &bound)
   let header = run Bytes.copy(Bytes.asSlice(&text))
   let objects = List<ExportedObject>.asSlice(&resolver.exportedObjects)
@@ -99640,8 +100000,9 @@ effect fn assembleEmissionChecked(
     &mut text,
     whole,
   )
+  // The direct backend's link drops no definition, so it needs no list of the retained ones.
   let mut retained = Bytes.make()
-  run appendRetained(&plan, roots, &mut retained)
+  if !resolver.direct { run appendRetained(&plan, roots, &mut retained) }
   if whole { run Bytes.append(&mut text, Bytes.asSlice(&retained)) }
   let mut units = List<CodegenUnit>.make()
   if resolver.codegenUnits || resolver.packing {
@@ -99994,6 +100355,10 @@ struct BuildCapture {
   // every pattern shares, and naming patterns apart would make its record depend on which pattern
   // this process reached first.
   patterns: bool,
+  // Whether the walk reported what a replay of its record would not find again. A replay finds
+  // again what a body that lowers to nothing reports, as it lowers every stale entry; anything
+  // else a walk reports, as a body that lowers and reports or a refused admission, it does not.
+  unreplayable: bool,
 }
 
 // What a rewalk reads of `instance` from a build record instead of the key (`BuildRecord.Facts`).
@@ -101303,14 +101668,14 @@ impl BuildCapture {
       at = at + usize.ONE
     }
     return BuildCapture {observing: observing, roots: move identities, entries: List<CaptureEntry>.make(), lookup: InternIndex.make(),
-      guarded: false, declared: true, patterns: true}
+      guarded: false, declared: true, patterns: true, unreplayable: false}
   }
 
   // An escape walk's capture, whose walk appends its roots as it finds them. Each entry names its
   // declaration, so a replay finds a changed plain body without lowering the bodies above it.
   fn walk() -> BuildCapture {
     return BuildCapture {observing: false, roots: List<ContentHash>.make(), entries: List<CaptureEntry>.make(), lookup: InternIndex.make(),
-      guarded: false, declared: true, patterns: false}
+      guarded: false, declared: true, patterns: false, unreplayable: false}
   }
 
   // Adds the entry of a newly reached instance.
@@ -101435,7 +101800,10 @@ impl BuildCapture {
     let mut at = usize.ZERO
     while at < count {
       let entry = &List<CaptureEntry>.asSlice(&captured.entries)[at]
-      if entry.alias == usize.MAX && entry.leaf == 0 && (entry.mirUnit == usize.MAX || (entry.value != usize.MAX && entry.emissionUnit == usize.MAX)) {
+      // An entered body that lowers to nothing has no MIR unit and no references; a replay finds it
+      // stale and lowers it again.
+      let lowered = entry.mirUnit != usize.MAX || (entry.value == usize.MAX && List<ContentHash>.length(&entry.targets) == usize.ZERO)
+      if entry.alias == usize.MAX && entry.leaf == 0 && (!lowered || (entry.value != usize.MAX && entry.emissionUnit == usize.MAX)) {
         return Option<CapturedBuild>.none()
       }
       let mut references = List<BuildRecord.Reference>.make()

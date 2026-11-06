@@ -6,7 +6,8 @@ Operating-system threads that each run one `Transferable` closure and return its
 
 ## When to use
 Use [`NativeThread.spawn`](#NativeThread.impl.spawn) to run independent work on a new native thread, and
-[`JoinHandle.join`](#JoinHandle.impl.join) to wait for its result. For many small tasks, use `silk.concurrency.thread_pool`.
+[`JoinHandle.join`](#JoinHandle.impl.join) to wait for its result. For many small tasks, use
+`silk.concurrency.thread_pool`.
 
 ## Details
 The closure and its result must be `Transferable`. The closure must be detached: it owns all
@@ -14,16 +15,16 @@ that it captures, and borrows nothing from the caller. Each thread runs its clos
 of one transferable `Execution` package (EXEC-010). Thus one non-generic C entry point starts
 closures of any type.
 
-Threads use `CreateThread` on Windows, `pthread_create` on Darwin and GNU libc targets, and wasi-threads on wasm32 with
-`threading = "multi"`. A native thread gets an 8 MiB stack, the default main-thread stack on
-Darwin and Linux, so work that fits on the main thread fits on a spawned one. The platform's
-own thread default is smaller on Darwin (512 KiB). A wasm32 thread gets the 1 MiB stack its
-runtime gives every thread.
+Threads use `CreateThread` on Windows, `pthread_create` on Darwin and GNU libc targets, and
+wasi-threads on wasm32 with `threading = "multi"`. A native thread gets an 8 MiB stack, the
+default main-thread stack on Darwin and Linux, so work that fits on the main thread fits on a
+spawned one. The platform's own thread default is smaller on Darwin (512 KiB). A wasm32 thread
+gets the 1 MiB stack its runtime gives every thread.
 
 ## Errors
-[`SpawnError`](#SpawnError) if the system cannot make the thread, which a single-threaded wasm32 profile never
-can (code 58, `ENOTSUP`). `OutOfMemoryError` if the start or result
-storage cannot be allocated.
+[`SpawnError`](#SpawnError) if the system cannot make the thread, which a single-threaded wasm32 profile
+never can (code 58, `ENOTSUP`). `OutOfMemoryError` if the start or result storage cannot be
+allocated.
 
 ## Gotchas
 - Dropping a [`JoinHandle`](#JoinHandle) without a join waits for the thread. Thus the result storage that
@@ -180,16 +181,17 @@ The owner of native thread creation.
 
 ### When to use
 Use [`NativeThread.spawn`](#NativeThread.impl.spawn) to run independent work on a new operating-system thread, and
-[`JoinHandle.join`](#JoinHandle.impl.join) to wait for its result. For many small tasks, use `silk.concurrency.thread_pool`.
+[`JoinHandle.join`](#JoinHandle.impl.join) to wait for its result. For many small tasks, use
+`silk.concurrency.thread_pool`.
 
 ### Details
 The closure and its result must be `Transferable`. The closure must be detached: it owns all
-that it captures, and borrows nothing from the caller. Threads use `CreateThread` on Windows and `pthread_create` on Darwin
-and GNU libc targets, and wasi-threads on wasm32 with `threading = "multi"`. A native thread
-gets an 8 MiB stack, the default main-thread stack on Darwin and Linux, so work that fits on the
-main thread fits on a spawned one. A wasm32 thread gets the 1 MiB stack that its runtime gives
-every thread. A single-threaded wasm32 profile has one processor and refuses each spawn with
-[`SpawnError`](#SpawnError).
+that it captures, and borrows nothing from the caller. Threads use `CreateThread` on Windows and
+`pthread_create` on Darwin and GNU libc targets, and wasi-threads on wasm32 with `threading =
+"multi"`. A native thread gets an 8 MiB stack, the default main-thread stack on Darwin and
+Linux, so work that fits on the main thread fits on a spawned one. A wasm32 thread gets the 1
+MiB stack that its runtime gives every thread. A single-threaded wasm32 profile has one
+processor and refuses each spawn with [`SpawnError`](#SpawnError).
 
 ### Gotchas
 A fatal trap on any thread ends the whole process.

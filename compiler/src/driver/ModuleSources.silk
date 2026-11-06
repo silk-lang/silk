@@ -8,6 +8,7 @@ import hir.Unused as UnusedBindings {Unused}
 import driver.NativeLinkInput as NativeLinkInputs {Archive, ArchiveContext, Declared, InvalidNativeLinkInput, NativeLinkInput, PlannedNative}
 import driver.Packages as PackageSources {InvalidDependency, Packages}
 import semantic.ContentHash {ContentHash}
+import semantic.InternIndex {InternIndex}
 import semantic.ExecutionStorage {Binding as StorageBinding, ExecutionStorage}
 import semantic.ModuleId {InvalidModulePath, ModuleId}
 import semantic.InitialProfile {Selection as RuntimeRequest}
@@ -119,6 +120,89 @@ pub struct ModuleSources {
   unused: List<ModuleUnused>,
   /// The modules packages' `build.silk` plans generate (driver/BuildPlan).
   generated: List<GeneratedModule>,
+  // The files earlier loads of the run read, which `preload` takes instead of reading them again.
+  snapshot: Option<SourceSnapshot>,
+}
+
+/// The source files the loads of one run have read, by path, with their digests. A later load in
+/// the run takes a file from it instead of reading and hashing the file again, as each member of a
+/// workspace check does for the packages it shares with the members before it. A file that
+/// changes during the run reads as it did when the run first read it.
+pub struct SourceSnapshot {
+  files: List<SnapshotFile>,
+  lookup: InternIndex,
+}
+
+// One file a snapshot holds: its bytes, or none when it was missing, and their digest.
+struct SnapshotFile {
+  path: Bytes,
+  content: Option<Shared<Bytes>>,
+  digest: ContentHash,
+}
+
+/// A snapshot that holds no file.
+pub fn snapshot() -> SourceSnapshot {
+  return SourceSnapshot {files: List<SnapshotFile>.make(), lookup: InternIndex.make()}
+}
+
+// A source read: its bytes, or none, and their digest (zero for none, as `Revision` keeps it).
+struct SharedSource {
+  content: Option<Shared<Bytes>>,
+  digest: ContentHash,
+}
+
+// The bytes `content` holds, shared, with their digest.
+effect fn sharedSource(content: Option<Bytes>) -> SharedSource ! OutOfMemoryError ? &mut Allocator {
+  return match move content {
+    Option<Bytes>.Some {value} => {
+      let digest = ContentHash.of(Bytes.asSlice(&value))
+      SharedSource {content: Option<Shared<Bytes>>.some(run Shared<Bytes>.make(move value)), digest: digest}
+    }
+    Option<Bytes>.None => SharedSource {content: Option<Shared<Bytes>>.none(), digest: ContentHash {high: 0, low: 0}}
+  }
+}
+
+// The file at `path`, through `snapshot` when there is one.
+effect fn snapshotRead(snapshot: &mut Option<SourceSnapshot>, path: &Path) -> SharedSource
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  if let Option<SourceSnapshot>.Some {value} = &mut snapshot.* { return run heldRead(&mut value, path) }
+  return run sharedSource(run readOptional(path))
+}
+
+// The file at `path`, from `held` when it holds it, and read and kept there otherwise.
+effect fn heldRead(held: &mut SourceSnapshot, path: &Path) -> SharedSource
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let named = Path.rawBytes(path)
+  let hashed = InternIndex.hashBytes(0, named)
+  let files = List<SnapshotFile>.asSlice(&held.files)
+  let mut at = InternIndex.first(&held.lookup, hashed)
+  while at != usize.MAX {
+    if sameText(Bytes.asSlice(&files[at].path), named) {
+      let content = match &files[at].content {
+        Option<Shared<Bytes>>.Some {value} => Option<Shared<Bytes>>.some(Shared<Bytes>.clone(&value))
+        Option<Shared<Bytes>>.None => Option<Shared<Bytes>>.none()
+      }
+      return SharedSource {content: move content, digest: files[at].digest}
+    }
+    at = InternIndex.after(&held.lookup, at)
+  }
+  let read = run sharedSource(run readOptional(path))
+  let mut kept = Option<Shared<Bytes>>.none()
+  if let Option<Shared<Bytes>>.Some {value} = &read.content { kept = Option<Shared<Bytes>>.some(Shared<Bytes>.clone(&value)) }
+  run List<SnapshotFile>.append(&mut held.files, SnapshotFile {path: run Bytes.copy(named), content: move kept, digest: read.digest})
+  run InternIndex.record(&mut held.lookup, hashed)
+  return move read
+}
+
+// A copy of the bytes `shared` holds.
+effect fn copyShared(shared: &Shared<Bytes>) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let count = Shared<Bytes>.with<usize>(shared, Bytes.length)
+  let mut copied = run Bytes.zeroed(count)
+  let target = Bytes.asMutSlice(&mut copied)
+  Shared<Bytes>.with<()>(shared, fn(bytes: &Bytes) -> () {
+    return Slice.copyInto<u8>(move target, usize.ZERO, Bytes.asSlice(bytes))
+  })
+  return move copied
 }
 
 // One generated module: its package identity, its logical path and its source.
@@ -141,6 +225,89 @@ struct ModuleUnused {
 
 // A file `preload` parses ahead on a thread of its own: the position of its module among those
 // the load read, and its bytes.
+// A module of a `preload` wave: its digest, the summary that names its bytes if any, and its
+// bytes.
+struct WaveModule {
+  module: ModuleId,
+  digest: ContentHash,
+  found: Option<ImportSummary>,
+  read: Shared<Bytes>,
+}
+
+// Takes wave module `at` out of `wave`, leaving an empty one.
+effect fn takeWave(wave: &mut List<WaveModule>, at: usize) -> WaveModule ! OutOfMemoryError ? &mut Allocator {
+  let held = List<WaveModule>.asMutSlice(&mut wave.*)
+  let empty = WaveModule {module: ModuleId.copy(&held[at].module), digest: ContentHash {high: 0, low: 0}, found: Option<ImportSummary>.none(),
+    read: Shared<Bytes>.clone(&held[at].read)}
+  return Intrinsic.replace(held[at], move empty)
+}
+
+// The syntax of each of `jobs`, at its slot of `count`, parsed on up to `threads` threads beside
+// this one, largest first to the lightest share. A slot a thread could not parse is none.
+effect fn parseWave(jobs: List<ParseJob>, count: usize, threads: usize) -> List<Option<Parsed>> ! OutOfMemoryError ? &mut Allocator {
+  let mut slots = List<Option<Parsed>>.make()
+  run List<Option<Parsed>>.reserveExact(&mut slots, count)
+  while List<Option<Parsed>>.length(&slots) < count { run List<Option<Parsed>>.append(&mut slots, Option<Parsed>.none()) }
+  let mut pending = move jobs
+  let mut shares = List<List<ParseJob>>.make()
+  let mut loads = List<usize>.make()
+  let mut share = usize.ZERO
+  // A wave of one file parses here.
+  let mut used = threads
+  if List<ParseJob>.length(&pending) < 2 { used = usize.ZERO }
+  while share <= used {
+    run List<List<ParseJob>>.append(&mut shares, List<ParseJob>.make())
+    run List<usize>.append(&mut loads, usize.ZERO)
+    share = share + usize.ONE
+  }
+  while List<ParseJob>.length(&pending) > usize.ZERO {
+    let jobs = List<ParseJob>.asSlice(&pending)
+    let mut largest = usize.ZERO
+    let mut at = usize.ONE
+    while at < jobs.length {
+      if Bytes.length(&jobs[at].bytes) > Bytes.length(&jobs[largest].bytes) { largest = at }
+      at = at + usize.ONE
+    }
+    let job = List<ParseJob>.remove(&mut pending, largest)
+    let weights = List<usize>.asSlice(&loads)
+    let mut lightest = usize.ZERO
+    at = usize.ONE
+    while at < weights.length {
+      if weights[at] < weights[lightest] { lightest = at }
+      at = at + usize.ONE
+    }
+    let load = List<usize>.get(&loads, lightest) + Bytes.length(&job.bytes)
+    List<usize>.set(&mut loads, lightest, load)
+    let mut writable = List<List<ParseJob>>.asMutSlice(&mut shares)
+    run List<ParseJob>.append(&mut writable[lightest], move job)
+  }
+  let own = List<List<ParseJob>>.remove(&mut shares, usize.ZERO)
+  let mut workers = List<JoinHandle<List<ParsedFile>>>.make()
+  while List<List<ParseJob>>.length(&shares) > usize.ZERO {
+    let jobs = List<List<ParseJob>>.remove(&mut shares, usize.ZERO)
+    // A share no thread takes parses here.
+    if List<JoinHandle<List<ParsedFile>>>.length(&workers) < threads { run parseAhead(&mut workers, move jobs) }
+    else { run placeParsed(&mut slots, run parseEach(move jobs)) }
+  }
+  run placeParsed(&mut slots, run parseEach(move own))
+  while List<JoinHandle<List<ParsedFile>>>.length(&workers) > usize.ZERO {
+    let handle = List<JoinHandle<List<ParsedFile>>>.remove(&mut workers, usize.ZERO)
+    run placeParsed(&mut slots, handle.join())
+  }
+  return move slots
+}
+
+// Puts each of `files` at its slot of `slots`.
+effect fn placeParsed(slots: &mut List<Option<Parsed>>, files: List<ParsedFile>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut held = move files
+  while List<ParsedFile>.length(&held) > usize.ZERO {
+    let last = List<ParsedFile>.length(&held) - usize.ONE
+    let ParsedFile {slot, parsed} = List<ParsedFile>.remove(&mut held, last)
+    let mut writable = List<Option<Parsed>>.asMutSlice(&mut slots.*)
+    writable[slot] = Option<Parsed>.some(move parsed)
+  }
+}
+
 struct ParseJob {
   slot: usize,
   bytes: Bytes,
@@ -1294,6 +1461,7 @@ effect fn assemble(source: &Path, located: PackageRoot, standardLibrary: Option<
     attempted: move attempted,
     parsed: List<SourceUnit>.make(),
     summaries: Option<ImportSummaries>.none(),
+    snapshot: Option<SourceSnapshot>.none(),
     digests: List<LoadedDigest>.make(),
     unused: List<ModuleUnused>.make(),
     generated: List<GeneratedModule>.make(),
@@ -1832,6 +2000,22 @@ effect fn readModule(self: &mut ModuleSources, module: &ModuleId) -> Option<Byte
   return move content
 }
 
+// As [`readModule`], shared, the file taken from the run's snapshot when it holds it.
+effect fn readShared(self: &mut ModuleSources, module: &ModuleId) -> SharedSource
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let location = run sourceLocation(&self.*, module)
+  let mut read = SharedSource {content: Option<Shared<Bytes>>.none(), digest: ContentHash {high: 0, low: 0}}
+  if let Option<Path>.Some {value} = &location.path { read = run snapshotRead(&mut self.snapshot, &value) }
+  if let Option<Shared<Bytes>>.None = &read.content {
+    return run sharedSource(run generatedSource(&self.*, module))
+  }
+  let mut listings = Intrinsic.replace(self.listings, List<Listing>.make())
+  let variant = run caseVariantListed(&self.*, module, &mut listings, false)
+  self.listings = move listings
+  if let Option<Bytes>.Some {..} = &variant { return SharedSource {content: Option<Shared<Bytes>>.none(), digest: ContentHash {high: 0, low: 0}} }
+  return move read
+}
+
 /// Reads `module`'s current source: its file, or else the source a `build.silk` plan generates
 /// for it; none when it has neither.
 pub effect fn moduleText(self: &ModuleSources, module: &ModuleId) -> Option<Bytes>
@@ -1918,21 +2102,24 @@ effect fn publishEmbedded(self: &mut ModuleSources, reader: &ModuleId, path: &[u
 }
 
 // Publishes `module` once, as present bytes or explicit absence, and returns its bytes.
-effect fn publish(self: &mut ModuleSources, module: &ModuleId, sealedContent: &Option<Bytes>) -> Option<Bytes>
+effect fn publish(self: &mut ModuleSources, module: &ModuleId, sealedContent: &Option<Bytes>) -> Option<Shared<Bytes>>
 ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
   if attempted(&self.*, module) {
     let observed = run Revision.observe(&self.revision, module)
-    return run Observation.copyContent(&observed)
+    let copied = run sharedSource(run Observation.copyContent(&observed))
+    return move copied.content
   }
-  let mut content = Option<Bytes>.none()
+  let mut read = SharedSource {content: Option<Shared<Bytes>>.none(), digest: ContentHash {high: 0, low: 0}}
   if ModuleId.withPath<bool>(module, SealedOperators.isPath) {
     if let Option<Bytes>.Some {value} = &sealedContent.* {
-      content = Option<Bytes>.some(run Bytes.copy(Bytes.asSlice(&value)))
+      read = run sharedSource(Option<Bytes>.some(run Bytes.copy(Bytes.asSlice(&value))))
     }
-  } else { content = run readModule(&mut self.*, module) }
-  run Revision.publishInPlace(&mut self.revision, module, &content)
+  } else { read = run readShared(&mut self.*, module) }
+  let mut published = Option<Shared<Bytes>>.none()
+  if let Option<Shared<Bytes>>.Some {value} = &read.content { published = Option<Shared<Bytes>>.some(Shared<Bytes>.clone(&value)) }
+  run Revision.publishShared(&mut self.revision, module, move published, read.digest)
   run List<ModuleId>.append(&mut self.attempted, ModuleId.copy(module))
-  return move content
+  return move read.content
 }
 
 /// Publishes every module reachable from `roots` through written imports, so one semantic build
@@ -1982,14 +2169,21 @@ pub effect fn preload(self: &mut ModuleSources, roots: &[ModuleId]) -> ()
   // Modules are taken in the order they were found; a cursor walks the list rather than each
   // removal shifting the thousands of candidates behind it.
   let mut next = usize.ZERO
+  // The modules found so far are a wave: each is read in order, the files no summary names are
+  // parsed together on the threads, and each wave module's imports are then taken in order. A
+  // module's imports land after every module of its wave, as one at a time would take them, so the
+  // order is the same.
   while next < List<ModuleId>.length(&pending) {
+  let waveEnd = List<ModuleId>.length(&pending)
+  let mut wave = List<WaveModule>.make()
+  let mut misses = List<ParseJob>.make()
+  while next < waveEnd {
     let module = ModuleId.copy(&List<ModuleId>.asSlice(&pending)[next])
     next = next + usize.ONE
     if listed(List<ModuleId>.asSlice(&scanned), &module) { continue }
     run List<ModuleId>.append(&mut scanned, ModuleId.copy(&module))
     let content = run publish(&mut self.*, &module, &sealedContent)
-    if let Option<Bytes>.Some {value: read} = move content {
-      let mut bytes = move read
+    if let Option<Shared<Bytes>>.Some {value: read} = move content {
       // A file whose bytes a summary names writes the imports it wrote then, and the store parses
       // it when it first reads it.
       // Its publication hashed the bytes.
@@ -2005,15 +2199,31 @@ pub effect fn preload(self: &mut ModuleSources, roots: &[ModuleId]) -> ()
       let hit = match &found { Option<ImportSummary>.Some {..} => true _ => false }
       if hit && wanted {
         let slot = List<ModuleId>.length(&scanned) - usize.ONE
-        run List<ParseJob>.append(&mut ahead, ParseJob {slot: slot, bytes: Intrinsic.replace(bytes, Bytes.make())})
+        run List<ParseJob>.append(&mut ahead, ParseJob {slot: slot, bytes: run copyShared(&read)})
       }
       // The jobs found so far parse while this file does.
       if !hit && List<JoinHandle<List<ParsedFile>>>.length(&workers) < threads {
         run parseAhead(&mut workers, Intrinsic.replace(ahead, List<ParseJob>.make()))
       }
+      if !hit { run List<ParseJob>.append(&mut misses, ParseJob {slot: List<WaveModule>.length(&wave), bytes: run copyShared(&read)}) }
+      run List<WaveModule>.append(&mut wave, WaveModule {module: move module, digest: digest, found: move found, read: move read})
+    }
+  }
+  let mut free = usize.ZERO
+  if List<JoinHandle<List<ParsedFile>>>.length(&workers) < threads { free = threads - List<JoinHandle<List<ParsedFile>>>.length(&workers) }
+  let mut syntax = run parseWave(move misses, List<WaveModule>.length(&wave), free)
+  let mut taken = usize.ZERO
+  while taken < List<WaveModule>.length(&wave) {
+    let WaveModule {module, digest, found, read} = run takeWave(&mut wave, taken)
+    let parsed = Intrinsic.replace(List<Option<Parsed>>.asMutSlice(&mut syntax)[taken], Option<Parsed>.none())
+    taken = taken + usize.ONE
       let summary = match move found {
         Option<ImportSummary>.Some {value} => move value
-        Option<ImportSummary>.None => run parsedSummary(&mut self.*, &module, move bytes, digest, List<Bytes>.asSlice(&sealedNames))
+        Option<ImportSummary>.None => match move parsed {
+          Option<Parsed>.Some {value} => run summaryOf(&mut self.*, &module, move value, digest, List<Bytes>.asSlice(&sealedNames))
+          // A file a thread could not parse is parsed here.
+          Option<Parsed>.None => run parsedSummary(&mut self.*, &module, run copyShared(&read), digest, List<Bytes>.asSlice(&sealedNames))
+        }
       }
       if !summary.claims { run List<ModuleId>.append(&mut self.claimFree, ModuleId.copy(&module)) }
       if List<Unused>.length(&summary.unused) > usize.ZERO {
@@ -2038,8 +2248,8 @@ pub effect fn preload(self: &mut ModuleSources, roots: &[ModuleId]) -> ()
         }
         run appendCandidates(&self.*, &mut pending, &module, Bytes.asSlice(&written[pathAt]))
         pathAt = pathAt + usize.ONE
-      }
     }
+  }
   }
   // The rest is split between the threads left and this one.
   let mut shares = List<List<ParseJob>>.make()
@@ -2204,7 +2414,13 @@ effect fn appendCandidates(self: &ModuleSources, pending: &mut List<ModuleId>, i
 // reported whether or not anything else reads it.
 effect fn parsedSummary(self: &mut ModuleSources, module: &ModuleId, bytes: Bytes, digest: ContentHash, sealedNames: &[Bytes])
   -> ImportSummary ! OutOfMemoryError ? &mut Allocator {
-  let unit = run SourceUnit.parse(module, Revision.revisionNumber(&self.revision), move bytes)
+  return run summaryOf(&mut self.*, module, run SourceUnit.parseSyntax(move bytes), digest, sealedNames)
+}
+
+// The summary of the file of `module` whose syntax is `parsed`, kept as a unit the store takes.
+effect fn summaryOf(self: &mut ModuleSources, module: &ModuleId, parsed: Parsed, digest: ContentHash, sealedNames: &[Bytes])
+  -> ImportSummary ! OutOfMemoryError ? &mut Allocator {
+  let unit = run SourceUnit.assemble(module, Revision.revisionNumber(&self.revision), move parsed)
   let sealed = SealedOperators.referenced(&unit.syntax, sealedNames)
   let index = run ModuleIndex.build(&unit, false)
   let mut paths = run ModuleIndex.importPaths(&index, &unit)
@@ -2224,6 +2440,17 @@ effect fn parsedSummary(self: &mut ModuleSources, module: &ModuleId, bytes: Byte
 /// imports of each file it parses there.
 pub fn useSummaries(self: &mut ModuleSources, summaries: ImportSummaries) -> () {
   self.summaries = Option<ImportSummaries>.some(move summaries)
+}
+
+/// Lets `preload` take the files `snapshot` holds instead of reading them, and keep there each file
+/// it reads.
+pub fn useSnapshot(self: &mut ModuleSources, snapshot: SourceSnapshot) -> () {
+  self.snapshot = Option<SourceSnapshot>.some(move snapshot)
+}
+
+/// Takes the snapshot [`useSnapshot`] gave, with the files the last load read.
+pub fn takeSnapshot(self: &mut ModuleSources) -> Option<SourceSnapshot> {
+  return Intrinsic.replace(self.snapshot, Option<SourceSnapshot>.none())
 }
 
 /// Takes the summaries [`useSummaries`] gave, with what the last load recorded.

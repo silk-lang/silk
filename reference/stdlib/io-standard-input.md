@@ -6,8 +6,8 @@ The `StandardInput` effect: read raw bytes from standard input.
 
 ## When to use
 Require `&mut StandardInput` in code that reads standard input, so a test can provide the bytes.
-To parse lines or other units, use `silk.io.buffered_input.BufferedInput.fillStandard`. Decode text
-after you read the bytes, so invalid UTF-8 does not lose data.
+To parse lines or other units, use `silk.io.buffered_input.BufferedInput.fillStandard`. Decode
+text after you read the bytes, so invalid UTF-8 does not lose data.
 
 ## Details
 [`StandardInput.receive`](#StandardInput.impl.receive) fills a prefix of the buffer and returns the number of bytes, which
@@ -166,8 +166,8 @@ The effect that reads raw bytes from standard input.
 ### When to use
 
 Require `&mut StandardInput` in code that reads standard input, so a test can provide the bytes.
-To parse lines or other units, use `silk.io.buffered_input.BufferedInput.fillStandard`. Decode text
-after you read the bytes, so invalid UTF-8 does not lose data.
+To parse lines or other units, use `silk.io.buffered_input.BufferedInput.fillStandard`. Decode
+text after you read the bytes, so invalid UTF-8 does not lose data.
 
 ### Details
 

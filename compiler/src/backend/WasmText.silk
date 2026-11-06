@@ -1,0 +1,1554 @@
+//! The WebAssembly text format of a binary module, for `--emit wasm-text`.
+//!
+//! # When to use
+//! A build at stage `wasm-text` links its wasm32 or wasm64 module as usual and writes [`print`]'s
+//! text in place of the binary. It needs no tool beyond the compiler, so the compiler built for
+//! the browser prints modules too.
+//!
+//! # Details
+//! The text is one `module` field per definition, in the order of the module's sections, as
+//! `wasm-tools print` writes it: types, imports, tables, memories, globals, exports, the start
+//! function, element segments, functions, then data segments. Function bodies are flat instruction
+//! sequences, indented by nesting. Each block, loop and `if` carries its label as a `;; label =
+//! @<n>` comment, and each branch names the label it reaches as `(;@<n>;)`. A function, global or
+//! data segment that the `name` section names prints with that name as its identifier, and a call
+//! or global access uses it. A name the section gives twice is written `$"#func<n> <name>"` from
+//! its second use on, as `wasm-tools print` writes it, so identifiers stay unique. Every definition
+//! also gives its index as a `(;<n>;)` comment. Floats print as their shortest decimal, and a NaN
+//! keeps its payload as `nan:0x<payload>`. Custom sections other than `name` print as comments that
+//! give their size.
+//!
+//! The printer reads the instruction set of WebAssembly 2.0 and the proposals the compiler's
+//! backends emit: sign extension, saturating truncation, bulk memory, reference types, multiple
+//! values, threads and atomics, tail calls and memory64. A module that uses anything else, such
+//! as SIMD or exception handling, is refused with the offset of the first byte it cannot read.
+
+import semantic.InternIndex {InternIndex}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.collections.slice {Slice}
+import silk.core.effect {Effect}
+import silk.core.option {Option}
+import silk.io.writer {Writer, WriterError}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.text.format {Format}
+import silk.num.f32
+import silk.num.f64
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+
+/// What [`print`] makes of a module's bytes.
+pub union Printed {
+  /// The module in the text format.
+  Text { pub text: Bytes },
+  /// The bytes are not a module the printer reads. `detail` says what it found at byte `offset`.
+  Refused { pub offset: usize, pub detail: Bytes },
+}
+
+/// The binary `module` as WebAssembly text.
+///
+/// # Details
+/// The text parses back, with `wasm-tools parse` or any other WebAssembly text reader, to a
+/// module with the same types, imports, functions, tables, memories, globals, exports, start
+/// function, element and data segments as `module`. Custom sections are not kept: the `name`
+/// section becomes identifiers and every other one a comment.
+///
+/// # Errors
+/// - [`Printed.Refused`] when `module` is not a well-formed binary module, or uses an instruction
+///   or type this printer does not read, such as a SIMD instruction.
+pub effect fn print(module: &[u8]) -> Printed ! OutOfMemoryError ? &mut Allocator {
+  let mut reader = Reader {at: usize.ZERO, end: module.length, failed: false, problem: b"", problemAt: usize.ZERO}
+  let mut context = Context.make()
+  run survey(module, &mut reader, &mut context)
+  let mut out = Bytes.make()
+  if !reader.failed { run printModule(&mut out, module, &mut reader, &context) }
+  if reader.failed {
+    return Printed.Refused {offset: reader.problemAt, detail: run Bytes.copy(reader.problem)}
+  }
+  return Printed.Text {text: move out}
+}
+
+// A read position in the module. A read past `end`, a malformed number or an unknown byte sets
+// `failed` with what went wrong and where, and every later read answers zero.
+struct Reader {
+  at: usize,
+  end: usize,
+  failed: bool,
+  problem: &'static [u8],
+  problemAt: usize,
+}
+
+fn refuse(reader: &mut Reader, problem: &'static [u8]) -> () {
+  if reader.failed { return () }
+  reader.failed = true
+  reader.problem = problem
+  reader.problemAt = reader.at
+  reader.at = reader.end
+}
+
+fn readByte(bytes: &[u8], reader: &mut Reader) -> u8 {
+  if reader.at >= reader.end {
+    refuse(&mut reader.*, b"the module ends inside an item")
+    return 0
+  }
+  let value = bytes[reader.at]
+  reader.at = reader.at + usize.ONE
+  return value
+}
+
+// The byte at the reader's position without reading it, or 0 at the end.
+fn peekByte(bytes: &[u8], reader: &Reader) -> u8 {
+  if reader.at >= reader.end { return 0 }
+  return bytes[reader.at]
+}
+
+// An unsigned LEB128 number of at most `bits` bits.
+fn readUnsigned(bytes: &[u8], reader: &mut Reader, bits: u64) -> u64 {
+  let mut value: u64 = 0
+  let mut shift: u64 = 0
+  while true {
+    let byte = readByte(bytes, &mut reader.*)
+    if reader.failed { return 0 }
+    value = value | u64.shiftLeft(u8.toU64(byte) & 127, shift)
+    if (byte & 128) == 0 { return value }
+    shift = shift + 7
+    if shift >= bits {
+      refuse(&mut reader.*, b"a number is longer than its type allows")
+      return 0
+    }
+  }
+  return value
+}
+
+// An unsigned LEB128 number of at most 32 bits, as a count or an index.
+fn readIndex(bytes: &[u8], reader: &mut Reader) -> usize {
+  return u64.wrappingToUsize(readUnsigned(bytes, &mut reader.*, 32))
+}
+
+// A signed LEB128 number of at most `bits` bits, as its 64-bit two's complement.
+fn readSigned(bytes: &[u8], reader: &mut Reader, bits: u64) -> u64 {
+  let mut value: u64 = 0
+  let mut shift: u64 = 0
+  while true {
+    let byte = readByte(bytes, &mut reader.*)
+    if reader.failed { return 0 }
+    value = value | u64.shiftLeft(u8.toU64(byte) & 127, shift)
+    shift = shift + 7
+    if (byte & 128) == 0 {
+      if shift < 64 && (byte & 64) != 0 { value = value | u64.shiftLeft(u64.MAX, shift) }
+      return value
+    }
+    if shift >= bits {
+      refuse(&mut reader.*, b"a number is longer than its type allows")
+      return 0
+    }
+  }
+  return value
+}
+
+// `size` bytes as a little-endian number.
+fn readLittleEndian(bytes: &[u8], reader: &mut Reader, size: u64) -> u64 {
+  let mut value: u64 = 0
+  let mut shift: u64 = 0
+  while shift < size * 8 {
+    value = value | u64.shiftLeft(u8.toU64(readByte(bytes, &mut reader.*)), shift)
+    shift = shift + 8
+  }
+  return value
+}
+
+// A name's bytes: its length, then that many bytes, as a view of the module.
+fn readName<'a>(bytes: &'a [u8], reader: &mut Reader) -> &'a [u8] {
+  let length = readIndex(bytes, &mut reader.*)
+  if reader.failed || length > reader.end - reader.at {
+    refuse(&mut reader.*, b"a name runs past the end of its section")
+    return Slice.view<u8>(bytes, usize.ZERO, usize.ZERO)
+  }
+  let name = Slice.view<u8>(bytes, reader.at, length)
+  reader.at = reader.at + length
+  return name
+}
+
+// The identifiers of one index space, from the `name` section. Each identifier is unique in its
+// space, as the text format requires: a later entry with a taken name is written as
+// `$"#<kind><index> <name>"`, as `wasm-tools print` writes it.
+struct Names {
+  // `func`, `global` or `data`.
+  kind: &'static [u8],
+  // By index, the identifier with its `$`, or empty.
+  identifiers: List<Bytes>,
+  // Each kept name, in the order kept, which `index` hashes.
+  kept: List<Bytes>,
+  index: InternIndex,
+}
+
+impl Names {
+  fn make(kind: &'static [u8]) -> Names {
+    return Names {kind: kind, identifiers: List<Bytes>.make(), kept: List<Bytes>.make(), index: InternIndex.make()}
+  }
+
+  effect fn add(self: &mut Self, entity: usize, name: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    if name.length == usize.ZERO || entity > 16777216 { return () }
+    while List<Bytes>.length(&self.identifiers) <= entity { run List<Bytes>.append(&mut self.identifiers, Bytes.make()) }
+    if Bytes.length(&List<Bytes>.asSlice(&self.identifiers)[entity]) > usize.ZERO { return () }
+    let hash = InternIndex.hashBytes(0, name)
+    let mut taken = false
+    let mut at = InternIndex.first(&self.index, hash)
+    while at != usize.MAX && !taken {
+      if same(Bytes.asSlice(&List<Bytes>.asSlice(&self.kept)[at]), name) { taken = true }
+      at = InternIndex.after(&self.index, at)
+    }
+    let mut identifier = Bytes.make()
+    if taken {
+      let mut numbered = run Bytes.copy(b"#")
+      run text(&mut numbered, self.kind)
+      run index(&mut numbered, entity)
+      run text(&mut numbered, b" ")
+      run text(&mut numbered, name)
+      run identifierText(&mut identifier, Bytes.asSlice(&numbered))
+    } else {
+      run InternIndex.record(&mut self.index, hash)
+      run List<Bytes>.append(&mut self.kept, run Bytes.copy(name))
+      run identifierText(&mut identifier, name)
+    }
+    List<Bytes>.set(&mut self.identifiers, entity, move identifier)
+  }
+
+  // The identifier of `entity` with its `$`, or empty when it has none.
+  fn of(self: &Self, entity: usize) -> &[u8] {
+    let identifiers = List<Bytes>.asSlice(&self.identifiers)
+    if entity >= identifiers.length { return b"" }
+    return Bytes.asSlice(&identifiers[entity])
+  }
+}
+
+// What the printer learns of the module before it prints: the signatures, the type of each
+// function, the number of imports of each kind and the names.
+struct Context {
+  // By type index, the signature as `(param ...) (result ...)`, either part left out when empty.
+  signatures: List<Bytes>,
+  // By function index, imports first, the function's type index.
+  functionTypes: List<usize>,
+  importedFunctions: usize,
+  importedTables: usize,
+  importedMemories: usize,
+  importedGlobals: usize,
+  moduleName: Bytes,
+  functions: Names,
+  globals: Names,
+  data: Names,
+  // Each section as its id, then its contents' start and end, in module order.
+  sections: List<usize>,
+}
+
+impl Context {
+  fn make() -> Context {
+    return Context {signatures: List<Bytes>.make(), functionTypes: List<usize>.make(), importedFunctions: usize.ZERO,
+      importedTables: usize.ZERO, importedMemories: usize.ZERO, importedGlobals: usize.ZERO, moduleName: Bytes.make(),
+      functions: Names.make(b"func"), globals: Names.make(b"global"), data: Names.make(b"data"), sections: List<usize>.make()}
+  }
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Reads the header, the section list, the types, the imports, the function section and the
+// `name` section.
+effect fn survey(bytes: &[u8], reader: &mut Reader, context: &mut Context) -> () ! OutOfMemoryError ? &mut Allocator {
+  let header: [u8; 8] = [0, 97, 115, 109, 1, 0, 0, 0]
+  if bytes.length < 8 || !same(Slice.view<u8>(bytes, usize.ZERO, 8), &header) {
+    return refuse(&mut reader.*, b"the bytes do not start with the header of a version 1 module")
+  }
+  reader.at = 8
+  while reader.at < reader.end && !reader.failed {
+    let id = readByte(bytes, &mut reader.*)
+    let size = readIndex(bytes, &mut reader.*)
+    if reader.failed { return () }
+    if size > reader.end - reader.at { return refuse(&mut reader.*, b"a section runs past the end of the module") }
+    run List<usize>.append(&mut context.sections, u8.toUsize(id))
+    run List<usize>.append(&mut context.sections, reader.at)
+    run List<usize>.append(&mut context.sections, reader.at + size)
+    reader.at = reader.at + size
+  }
+  let mut at = usize.ZERO
+  while at < List<usize>.length(&context.sections) && !reader.failed {
+    let id = List<usize>.get(&context.sections, at)
+    let mut inner = Reader {at: List<usize>.get(&context.sections, at + usize.ONE), end: List<usize>.get(&context.sections, at + 2), failed: false,
+      problem: b"", problemAt: usize.ZERO}
+    if id == 1 { run surveyTypes(bytes, &mut inner, &mut context.*) }
+    if id == 2 { run surveyImports(bytes, &mut inner, &mut context.*) }
+    if id == 3 {
+      let count = readIndex(bytes, &mut inner)
+      let mut entry = usize.ZERO
+      while entry < count && !inner.failed {
+        run List<usize>.append(&mut context.functionTypes, readIndex(bytes, &mut inner))
+        entry = entry + usize.ONE
+      }
+    }
+    if id == 0 {
+      let name = readName(bytes, &mut inner)
+      if same(name, b"name") { run surveyNames(bytes, &mut inner, &mut context.*) }
+    }
+    if inner.failed {
+      reader.failed = true
+      reader.problem = inner.problem
+      reader.problemAt = inner.problemAt
+    }
+    at = at + 3
+  }
+}
+
+effect fn surveyTypes(bytes: &[u8], reader: &mut Reader, context: &mut Context) -> () ! OutOfMemoryError ? &mut Allocator {
+  let count = readIndex(bytes, &mut reader.*)
+  let mut entry = usize.ZERO
+  while entry < count && !reader.failed {
+    if readByte(bytes, &mut reader.*) != 0x60 { return refuse(&mut reader.*, b"a type is not a function type") }
+    let mut signature = Bytes.make()
+    run valueTypeList(&mut signature, bytes, &mut reader.*, b"param")
+    run valueTypeList(&mut signature, bytes, &mut reader.*, b"result")
+    run List<Bytes>.append(&mut context.signatures, move signature)
+    entry = entry + usize.ONE
+  }
+}
+
+// Reads a vector of value types and writes it as ` (<keyword> <type>...)`, or nothing when empty.
+effect fn valueTypeList(out: &mut Bytes, bytes: &[u8], reader: &mut Reader, keyword: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let count = readIndex(bytes, &mut reader.*)
+  if count == usize.ZERO || reader.failed { return () }
+  if Bytes.length(&out.*) > usize.ZERO { run text(&mut out.*, b" ") }
+  run text(&mut out.*, b"(")
+  run text(&mut out.*, keyword)
+  let mut entry = usize.ZERO
+  while entry < count && !reader.failed {
+    run text(&mut out.*, b" ")
+    run text(&mut out.*, readValueType(bytes, &mut reader.*))
+    entry = entry + usize.ONE
+  }
+  run text(&mut out.*, b")")
+}
+
+fn valueTypeName(code: u8) -> &'static [u8] {
+  return match code {
+    0x7F => b"i32"
+    0x7E => b"i64"
+    0x7D => b"f32"
+    0x7C => b"f64"
+    0x7B => b"v128"
+    0x70 => b"funcref"
+    0x6F => b"externref"
+    _ => b""
+  }
+}
+
+fn readValueType(bytes: &[u8], reader: &mut Reader) -> &'static [u8] {
+  let name = valueTypeName(readByte(bytes, &mut reader.*))
+  if name.length == usize.ZERO && !reader.failed {
+    reader.at = reader.at - usize.ONE
+    refuse(&mut reader.*, b"a value type is not a number, vector or plain reference type")
+  }
+  return name
+}
+
+effect fn surveyImports(bytes: &[u8], reader: &mut Reader, context: &mut Context) -> () ! OutOfMemoryError ? &mut Allocator {
+  let count = readIndex(bytes, &mut reader.*)
+  let mut entry = usize.ZERO
+  while entry < count && !reader.failed {
+    let _module = readName(bytes, &mut reader.*)
+    let _field = readName(bytes, &mut reader.*)
+    let kind = readByte(bytes, &mut reader.*)
+    if kind == 0 {
+      run List<usize>.append(&mut context.functionTypes, readIndex(bytes, &mut reader.*))
+      context.importedFunctions = context.importedFunctions + usize.ONE
+    } else if kind == 1 {
+      let _type = readValueType(bytes, &mut reader.*)
+      skipLimits(bytes, &mut reader.*)
+      context.importedTables = context.importedTables + usize.ONE
+    } else if kind == 2 {
+      skipLimits(bytes, &mut reader.*)
+      context.importedMemories = context.importedMemories + usize.ONE
+    } else if kind == 3 {
+      let _type = readValueType(bytes, &mut reader.*)
+      let _mutable = readByte(bytes, &mut reader.*)
+      context.importedGlobals = context.importedGlobals + usize.ONE
+    } else {
+      return refuse(&mut reader.*, b"an import is not a function, table, memory or global")
+    }
+    entry = entry + usize.ONE
+  }
+}
+
+fn skipLimits(bytes: &[u8], reader: &mut Reader) -> () {
+  let flags = readByte(bytes, &mut reader.*)
+  let _minimum = readUnsigned(bytes, &mut reader.*, 64)
+  if (flags & 1) != 0 { let _maximum = readUnsigned(bytes, &mut reader.*, 64) }
+}
+
+// Reads the subsections of the `name` section the printer uses: the module name (0), function
+// names (1), global names (7) and data segment names (9). A malformed `name` section is only
+// ignored, as engines ignore it.
+effect fn surveyNames(bytes: &[u8], reader: &mut Reader, context: &mut Context) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut names = Reader {at: reader.at, end: reader.end, failed: false, problem: b"", problemAt: usize.ZERO}
+  reader.at = reader.end
+  while names.at < names.end && !names.failed {
+    let id = readByte(bytes, &mut names)
+    let size = readIndex(bytes, &mut names)
+    if names.failed || size > names.end - names.at { return () }
+    let mut part = Reader {at: names.at, end: names.at + size, failed: false, problem: b"", problemAt: usize.ZERO}
+    names.at = names.at + size
+    if id == 0 {
+      let name = readName(bytes, &mut part)
+      if !part.failed {
+        context.moduleName = Bytes.make()
+        run identifierText(&mut context.moduleName, name)
+      }
+    } else if id == 1 || id == 7 || id == 9 {
+      let count = readIndex(bytes, &mut part)
+      let mut entry = usize.ZERO
+      while entry < count && !part.failed {
+        let entity = readIndex(bytes, &mut part)
+        let name = readName(bytes, &mut part)
+        if !part.failed {
+          if id == 1 { run Names.add(&mut context.functions, entity, name) }
+          if id == 7 { run Names.add(&mut context.globals, entity, name) }
+          if id == 9 { run Names.add(&mut context.data, entity, name) }
+        }
+        entry = entry + usize.ONE
+      }
+    }
+  }
+}
+
+// Whether `byte` may appear in a plain identifier: a printable ASCII byte other than a space,
+// a quote, a comma, a semicolon, a bracket or a parenthesis.
+fn isIdentifierByte(byte: u8) -> bool {
+  if byte <= 32 || byte >= 127 { return false }
+  return byte != 34 && byte != 39 && byte != 44 && byte != 59 && byte != 40 && byte != 41 && byte != 91
+    && byte != 93 && byte != 123 && byte != 125
+}
+
+// Writes `name` as an identifier: `$name` when every byte may appear in a plain identifier,
+// otherwise the quoted form `$"name"`.
+effect fn identifierText(out: &mut Bytes, name: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut plain = true
+  let mut at = usize.ZERO
+  while at < name.length {
+    if !isIdentifierByte(name[at]) { plain = false }
+    at = at + usize.ONE
+  }
+  run text(&mut out.*, b"$")
+  if plain { return run text(&mut out.*, name) }
+  return run quoted(&mut out.*, name)
+}
+
+effect fn text(out: &mut Bytes, value: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run Bytes.append(&mut out.*, value)
+}
+
+effect fn number(out: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut digits: [u8; 20] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let mut at: usize = 20
+  let mut rest = value
+  while true {
+    at = at - usize.ONE
+    digits[at] = u64.wrappingToU8(48 + u64.remainder(rest, 10))
+    rest = u64.divide(rest, 10)
+    if rest == 0 { break }
+  }
+  return run text(&mut out.*, Slice.view<u8>(&digits, at, 20 - at))
+}
+
+effect fn index(out: &mut Bytes, value: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run number(&mut out.*, usize.toU64(value))
+}
+
+// Writes the 64-bit two's complement `value` as a signed decimal.
+effect fn signed(out: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if (value & 9223372036854775808) == 0 { return run number(&mut out.*, value) }
+  run text(&mut out.*, b"-")
+  return run number(&mut out.*, u64.wrappingSubtract(0, value))
+}
+
+fn hexDigit(value: u64) -> u8 {
+  if value < 10 { return u64.wrappingToU8(48 + value) }
+  return u64.wrappingToU8(87 + value)
+}
+
+effect fn hex(out: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut shift: u64 = 60
+  while shift > 0 && u64.shiftRight(value, shift) == 0 { shift = shift - 4 }
+  while true {
+    run Bytes.append(&mut out.*, &[hexDigit(u64.shiftRight(value, shift) & 15)])
+    if shift == 0 { break }
+    shift = shift - 4
+  }
+}
+
+// Writes `bytes` as a string: printable ASCII bytes other than `"` and `\` as themselves, `\n`
+// and `\t` as their escapes, and every other byte as `\hh`.
+effect fn quoted(out: &mut Bytes, bytes: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run text(&mut out.*, b"\"")
+  let mut at = usize.ZERO
+  while at < bytes.length {
+    let byte = bytes[at]
+    if byte >= 32 && byte <= 126 && byte != 34 && byte != 92 {
+      run Bytes.append(&mut out.*, &[byte])
+    } else if byte == 10 {
+      run text(&mut out.*, b"\\n")
+    } else if byte == 9 {
+      run text(&mut out.*, b"\\t")
+    } else {
+      run Bytes.append(&mut out.*, &[92, hexDigit(u64.shiftRight(u8.toU64(byte), 4)), hexDigit(u8.toU64(byte) & 15)])
+    }
+    at = at + usize.ONE
+  }
+  return run text(&mut out.*, b"\"")
+}
+
+// Writes `(;<value>;)`, the index comment after a definition's identifier.
+effect fn indexComment(out: &mut Bytes, value: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  run text(&mut out.*, b"(;")
+  run index(&mut out.*, value)
+  return run text(&mut out.*, b";)")
+}
+
+// Writes the identifier of entity `entity` in `names`, or its index when it has none.
+effect fn reference(out: &mut Bytes, names: &Names, entity: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let identifier = Names.of(names, entity)
+  if identifier.length > usize.ZERO { return run text(&mut out.*, identifier) }
+  return run index(&mut out.*, entity)
+}
+
+// Writes a definition's opening `(<keyword> [$name] (;<index>;)`.
+effect fn definition(out: &mut Bytes, keyword: &[u8], names: Option<&Names>, entity: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  run text(&mut out.*, b"  (")
+  run text(&mut out.*, keyword)
+  run text(&mut out.*, b" ")
+  if let Option<&Names>.Some {value} = names {
+    let identifier = Names.of(value, entity)
+    if identifier.length > usize.ZERO {
+      run text(&mut out.*, identifier)
+      run text(&mut out.*, b" ")
+    }
+  }
+  return run indexComment(&mut out.*, entity)
+}
+
+// Writes a function's `(type <n>)` and its signature.
+effect fn typeUse(out: &mut Bytes, context: &Context, typeIndex: usize, reader: &mut Reader) -> () ! OutOfMemoryError ? &mut Allocator {
+  let signatures = List<Bytes>.asSlice(&context.signatures)
+  if typeIndex >= signatures.length { return refuse(&mut reader.*, b"a function names a type the module does not define") }
+  run text(&mut out.*, b"(type ")
+  run index(&mut out.*, typeIndex)
+  run text(&mut out.*, b")")
+  if Bytes.length(&signatures[typeIndex]) > usize.ZERO {
+    run text(&mut out.*, b" ")
+    run text(&mut out.*, Bytes.asSlice(&signatures[typeIndex]))
+  }
+}
+
+// Reads limits and writes them as ` [i64] <min> [<max>] [shared]`.
+effect fn limits(out: &mut Bytes, bytes: &[u8], reader: &mut Reader) -> () ! OutOfMemoryError ? &mut Allocator {
+  let flags = readByte(bytes, &mut reader.*)
+  if flags > 7 { return refuse(&mut reader.*, b"limits have unknown flags") }
+  if (flags & 4) != 0 { run text(&mut out.*, b" i64") }
+  run text(&mut out.*, b" ")
+  run number(&mut out.*, readUnsigned(bytes, &mut reader.*, 64))
+  if (flags & 1) != 0 {
+    run text(&mut out.*, b" ")
+    run number(&mut out.*, readUnsigned(bytes, &mut reader.*, 64))
+  }
+  if (flags & 2) != 0 { run text(&mut out.*, b" shared") }
+}
+
+// Reads a global type and writes it as `<type>` or `(mut <type>)`.
+effect fn globalType(out: &mut Bytes, bytes: &[u8], reader: &mut Reader) -> () ! OutOfMemoryError ? &mut Allocator {
+  let name = readValueType(bytes, &mut reader.*)
+  let mutable = readByte(bytes, &mut reader.*)
+  if mutable > 1 { return refuse(&mut reader.*, b"a global's mutability is neither 0 nor 1") }
+  if mutable == 1 {
+    run text(&mut out.*, b"(mut ")
+    run text(&mut out.*, name)
+    return run text(&mut out.*, b")")
+  }
+  return run text(&mut out.*, name)
+}
+
+// The contents' start and end of the first section with `id`, or none.
+fn sectionOf(context: &Context, id: usize) -> Option<[usize; 2]> {
+  let sections = List<usize>.asSlice(&context.sections)
+  let mut at = usize.ZERO
+  while at < sections.length {
+    if sections[at] == id { return Option<[usize; 2]>.some([sections[at + usize.ONE], sections[at + 2]]) }
+    at = at + 3
+  }
+  return Option<[usize; 2]>.none()
+}
+
+// Carries a section reader's failure to the module's reader.
+fn carry(reader: &mut Reader, inner: &Reader) -> () {
+  if inner.failed && !reader.failed {
+    reader.failed = true
+    reader.problem = inner.problem
+    reader.problemAt = inner.problemAt
+  }
+}
+
+effect fn printModule(out: &mut Bytes, bytes: &[u8], reader: &mut Reader, context: &Context) -> () ! OutOfMemoryError ? &mut Allocator {
+  run text(&mut out.*, b"(module")
+  if Bytes.length(&context.moduleName) > usize.ZERO {
+    run text(&mut out.*, b" ")
+    run text(&mut out.*, Bytes.asSlice(&context.moduleName))
+  }
+  run text(&mut out.*, b"\n")
+  if List<usize>.length(&context.functionTypes) > context.importedFunctions {
+    if let Option<[usize; 2]>.None = sectionOf(context, 10) {
+      return refuse(&mut reader.*, b"the module declares functions but has no code section")
+    }
+  }
+  let sections = List<usize>.asSlice(&context.sections)
+  let mut at = usize.ZERO
+  while at < sections.length && !reader.failed {
+    let id = sections[at]
+    let mut inner = Reader {at: sections[at + usize.ONE], end: sections[at + 2], failed: false, problem: b"", problemAt: usize.ZERO}
+    if id == 0 {
+      let name = readName(bytes, &mut inner)
+      if !same(name, b"name") && !inner.failed {
+        run text(&mut out.*, b"  ;; custom section ")
+        run quoted(&mut out.*, name)
+        run text(&mut out.*, b", ")
+        run index(&mut out.*, inner.end - inner.at)
+        run text(&mut out.*, b" bytes\n")
+      }
+    } else if id == 1 {
+      run printTypes(&mut out.*, context)
+    } else if id == 2 {
+      run printImports(&mut out.*, bytes, &mut inner, context)
+    } else if id == 4 {
+      let count = readIndex(bytes, &mut inner)
+      let mut entry = usize.ZERO
+      while entry < count && !inner.failed {
+        run definition(&mut out.*, b"table", Option<&Names>.none(), context.importedTables + entry)
+        let name = readValueType(bytes, &mut inner)
+        run limits(&mut out.*, bytes, &mut inner)
+        run text(&mut out.*, b" ")
+        run text(&mut out.*, name)
+        run text(&mut out.*, b")\n")
+        entry = entry + usize.ONE
+      }
+    } else if id == 5 {
+      let count = readIndex(bytes, &mut inner)
+      let mut entry = usize.ZERO
+      while entry < count && !inner.failed {
+        run definition(&mut out.*, b"memory", Option<&Names>.none(), context.importedMemories + entry)
+        run limits(&mut out.*, bytes, &mut inner)
+        run text(&mut out.*, b")\n")
+        entry = entry + usize.ONE
+      }
+    } else if id == 6 {
+      let count = readIndex(bytes, &mut inner)
+      let mut entry = usize.ZERO
+      while entry < count && !inner.failed {
+        run definition(&mut out.*, b"global", Option<&Names>.some(&context.globals), context.importedGlobals + entry)
+        run text(&mut out.*, b" ")
+        run globalType(&mut out.*, bytes, &mut inner)
+        run text(&mut out.*, b" ")
+        let _count = run constantExpression(&mut out.*, bytes, &mut inner, context)
+        run text(&mut out.*, b")\n")
+        entry = entry + usize.ONE
+      }
+    } else if id == 7 {
+      run printExports(&mut out.*, bytes, &mut inner, context)
+    } else if id == 8 {
+      run text(&mut out.*, b"  (start ")
+      run reference(&mut out.*, &context.functions, readIndex(bytes, &mut inner))
+      run text(&mut out.*, b")\n")
+    } else if id == 9 {
+      run printElements(&mut out.*, bytes, &mut inner, context)
+    } else if id == 10 {
+      run printCode(&mut out.*, bytes, &mut inner, context)
+    } else if id == 11 {
+      run printData(&mut out.*, bytes, &mut inner, context)
+    } else if id != 3 && id != 12 {
+      // The function and data count sections have no text of their own.
+      refuse(&mut inner, b"a section has an unknown id")
+    }
+    carry(&mut reader.*, &inner)
+    at = at + 3
+  }
+  run text(&mut out.*, b")\n")
+}
+
+effect fn printTypes(out: &mut Bytes, context: &Context) -> () ! OutOfMemoryError ? &mut Allocator {
+  let signatures = List<Bytes>.asSlice(&context.signatures)
+  let mut at = usize.ZERO
+  while at < signatures.length {
+    run definition(&mut out.*, b"type", Option<&Names>.none(), at)
+    run text(&mut out.*, b" (func")
+    if Bytes.length(&signatures[at]) > usize.ZERO {
+      run text(&mut out.*, b" ")
+      run text(&mut out.*, Bytes.asSlice(&signatures[at]))
+    }
+    run text(&mut out.*, b"))\n")
+    at = at + usize.ONE
+  }
+}
+
+fn kindName(kind: u8) -> &'static [u8] {
+  return match kind {
+    0 => b"func"
+    1 => b"table"
+    2 => b"memory"
+    3 => b"global"
+    _ => b""
+  }
+}
+
+effect fn printImports(out: &mut Bytes, bytes: &[u8], reader: &mut Reader, context: &Context) -> () ! OutOfMemoryError ? &mut Allocator {
+  let count = readIndex(bytes, &mut reader.*)
+  let mut functions = usize.ZERO
+  let mut tables = usize.ZERO
+  let mut memories = usize.ZERO
+  let mut globals = usize.ZERO
+  let mut entry = usize.ZERO
+  while entry < count && !reader.failed {
+    run text(&mut out.*, b"  (import ")
+    run quoted(&mut out.*, readName(bytes, &mut reader.*))
+    run text(&mut out.*, b" ")
+    run quoted(&mut out.*, readName(bytes, &mut reader.*))
+    let kind = readByte(bytes, &mut reader.*)
+    run text(&mut out.*, b" (")
+    run text(&mut out.*, kindName(kind))
+    run text(&mut out.*, b" ")
+    if kind == 0 {
+      let identifier = Names.of(&context.functions, functions)
+      if identifier.length > usize.ZERO {
+        run text(&mut out.*, identifier)
+        run text(&mut out.*, b" ")
+      }
+      run indexComment(&mut out.*, functions)
+      run text(&mut out.*, b" ")
+      run typeUse(&mut out.*, context, readIndex(bytes, &mut reader.*), &mut reader.*)
+      functions = functions + usize.ONE
+    } else if kind == 1 {
+      run indexComment(&mut out.*, tables)
+      let name = readValueType(bytes, &mut reader.*)
+      run limits(&mut out.*, bytes, &mut reader.*)
+      run text(&mut out.*, b" ")
+      run text(&mut out.*, name)
+      tables = tables + usize.ONE
+    } else if kind == 2 {
+      run indexComment(&mut out.*, memories)
+      run limits(&mut out.*, bytes, &mut reader.*)
+      memories = memories + usize.ONE
+    } else {
+      let identifier = Names.of(&context.globals, globals)
+      if identifier.length > usize.ZERO {
+        run text(&mut out.*, identifier)
+        run text(&mut out.*, b" ")
+      }
+      run indexComment(&mut out.*, globals)
+      run text(&mut out.*, b" ")
+      run globalType(&mut out.*, bytes, &mut reader.*)
+      globals = globals + usize.ONE
+    }
+    run text(&mut out.*, b"))\n")
+    entry = entry + usize.ONE
+  }
+}
+
+effect fn printExports(out: &mut Bytes, bytes: &[u8], reader: &mut Reader, context: &Context) -> () ! OutOfMemoryError ? &mut Allocator {
+  let count = readIndex(bytes, &mut reader.*)
+  let mut entry = usize.ZERO
+  while entry < count && !reader.failed {
+    run text(&mut out.*, b"  (export ")
+    run quoted(&mut out.*, readName(bytes, &mut reader.*))
+    let kind = readByte(bytes, &mut reader.*)
+    let name = kindName(kind)
+    if name.length == usize.ZERO { return refuse(&mut reader.*, b"an export is not a function, table, memory or global") }
+    run text(&mut out.*, b" (")
+    run text(&mut out.*, name)
+    run text(&mut out.*, b" ")
+    let entity = readIndex(bytes, &mut reader.*)
+    if kind == 0 {
+      run reference(&mut out.*, &context.functions, entity)
+    } else if kind == 3 {
+      run reference(&mut out.*, &context.globals, entity)
+    } else {
+      run index(&mut out.*, entity)
+    }
+    run text(&mut out.*, b"))\n")
+    entry = entry + usize.ONE
+  }
+}
+
+// Reads a constant expression up to its `end` and writes its instructions separated by spaces;
+// answers how many it wrote.
+effect fn constantExpression(out: &mut Bytes, bytes: &[u8], reader: &mut Reader, context: &Context) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let mut count = usize.ZERO
+  while !reader.failed {
+    if peekByte(bytes, &reader.*) == 0x0B {
+      reader.at = reader.at + usize.ONE
+      return count
+    }
+    if count > usize.ZERO { run text(&mut out.*, b" ") }
+    run instruction(&mut out.*, bytes, &mut reader.*, context, usize.ZERO)
+    count = count + usize.ONE
+  }
+  return count
+}
+
+// Reads a constant expression and writes it as an offset: `(<instruction>)` for one instruction,
+// otherwise `(offset <instructions>)`.
+effect fn offsetExpression(out: &mut Bytes, bytes: &[u8], reader: &mut Reader, context: &Context) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut expression = Bytes.make()
+  let count = run constantExpression(&mut expression, bytes, &mut reader.*, context)
+  if count == usize.ONE {
+    run text(&mut out.*, b"(")
+  } else {
+    run text(&mut out.*, b"(offset ")
+  }
+  run text(&mut out.*, Bytes.asSlice(&expression))
+  return run text(&mut out.*, b")")
+}
+
+effect fn printElements(out: &mut Bytes, bytes: &[u8], reader: &mut Reader, context: &Context) -> () ! OutOfMemoryError ? &mut Allocator {
+  let count = readIndex(bytes, &mut reader.*)
+  let mut entry = usize.ZERO
+  while entry < count && !reader.failed {
+    run definition(&mut out.*, b"elem", Option<&Names>.none(), entry)
+    let flags = readIndex(bytes, &mut reader.*)
+    if flags > 7 { return refuse(&mut reader.*, b"an element segment has unknown flags") }
+    let declared = (flags & 1) != 0 && (flags & 2) != 0
+    let expressions = (flags & 4) != 0
+    if declared { run text(&mut out.*, b" declare") }
+    if (flags & 1) == 0 {
+      if (flags & 2) != 0 {
+        run text(&mut out.*, b" (table ")
+        run index(&mut out.*, readIndex(bytes, &mut reader.*))
+        run text(&mut out.*, b")")
+      }
+      run text(&mut out.*, b" ")
+      run offsetExpression(&mut out.*, bytes, &mut reader.*, context)
+    }
+    // Every form but 0 and 4 names its element kind or type; form 0 holds functions, 4 funcref
+    // expressions.
+    let mut kind: &'static [u8] = b"func"
+    if expressions { kind = b"funcref" }
+    if (flags & 3) != 0 {
+      if expressions {
+        kind = readValueType(bytes, &mut reader.*)
+      } else if readByte(bytes, &mut reader.*) != 0 {
+        return refuse(&mut reader.*, b"an element segment's kind is not a function")
+      }
+    }
+    run text(&mut out.*, b" ")
+    run text(&mut out.*, kind)
+    let items = readIndex(bytes, &mut reader.*)
+    let mut item = usize.ZERO
+    while item < items && !reader.failed {
+      run text(&mut out.*, b" ")
+      if expressions {
+        run text(&mut out.*, b"(item ")
+        let _count = run constantExpression(&mut out.*, bytes, &mut reader.*, context)
+        run text(&mut out.*, b")")
+      } else {
+        run reference(&mut out.*, &context.functions, readIndex(bytes, &mut reader.*))
+      }
+      item = item + usize.ONE
+    }
+    run text(&mut out.*, b")\n")
+    entry = entry + usize.ONE
+  }
+}
+
+effect fn printData(out: &mut Bytes, bytes: &[u8], reader: &mut Reader, context: &Context) -> () ! OutOfMemoryError ? &mut Allocator {
+  let count = readIndex(bytes, &mut reader.*)
+  let mut entry = usize.ZERO
+  while entry < count && !reader.failed {
+    run definition(&mut out.*, b"data", Option<&Names>.some(&context.data), entry)
+    let flags = readIndex(bytes, &mut reader.*)
+    if flags > 2 { return refuse(&mut reader.*, b"a data segment has unknown flags") }
+    if flags == 2 {
+      run text(&mut out.*, b" (memory ")
+      run index(&mut out.*, readIndex(bytes, &mut reader.*))
+      run text(&mut out.*, b")")
+    }
+    if flags != 1 {
+      run text(&mut out.*, b" ")
+      run offsetExpression(&mut out.*, bytes, &mut reader.*, context)
+    }
+    let length = readIndex(bytes, &mut reader.*)
+    if reader.failed || length > reader.end - reader.at { return refuse(&mut reader.*, b"a data segment runs past the end of its section") }
+    let contents = Slice.view<u8>(bytes, reader.at, length)
+    reader.at = reader.at + length
+    // Long contents print as one string per line of at most 64 bytes.
+    if length <= 64 {
+      run text(&mut out.*, b" ")
+      run quoted(&mut out.*, contents)
+    } else {
+      let mut start = usize.ZERO
+      while start < length {
+        let mut size: usize = 64
+        if length - start < size { size = length - start }
+        run text(&mut out.*, b"\n    ")
+        run quoted(&mut out.*, Slice.view<u8>(contents, start, size))
+        start = start + size
+      }
+    }
+    run text(&mut out.*, b")\n")
+    entry = entry + usize.ONE
+  }
+}
+
+effect fn indent(out: &mut Bytes, depth: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < depth + 2 {
+    run text(&mut out.*, b"  ")
+    at = at + usize.ONE
+  }
+}
+
+effect fn printCode(out: &mut Bytes, bytes: &[u8], reader: &mut Reader, context: &Context) -> () ! OutOfMemoryError ? &mut Allocator {
+  let count = readIndex(bytes, &mut reader.*)
+  let types = List<usize>.asSlice(&context.functionTypes)
+  if !reader.failed && context.importedFunctions + count != types.length {
+    return refuse(&mut reader.*, b"the code section's body count differs from the function section's")
+  }
+  let mut entry = usize.ZERO
+  while entry < count && !reader.failed {
+    let function = context.importedFunctions + entry
+    let size = readIndex(bytes, &mut reader.*)
+    if reader.failed || size > reader.end - reader.at { return refuse(&mut reader.*, b"a function body runs past the end of the code section") }
+    let mut body = Reader {at: reader.at, end: reader.at + size, failed: false, problem: b"", problemAt: usize.ZERO}
+    reader.at = reader.at + size
+    run definition(&mut out.*, b"func", Option<&Names>.some(&context.functions), function)
+    run text(&mut out.*, b" ")
+    run typeUse(&mut out.*, context, types[function], &mut body)
+    run text(&mut out.*, b"\n")
+    let groups = readIndex(bytes, &mut body)
+    let mut total: u64 = 0
+    let mut group = usize.ZERO
+    if groups > usize.ZERO && !body.failed { run text(&mut out.*, b"    (local") }
+    while group < groups && !body.failed {
+      let locals = readUnsigned(bytes, &mut body, 32)
+      let name = readValueType(bytes, &mut body)
+      total = total + locals
+      if total > 1000000 {
+        refuse(&mut body, b"a function declares more than a million locals")
+        carry(&mut reader.*, &body)
+        return ()
+      }
+      let mut local: u64 = 0
+      while local < locals {
+        run text(&mut out.*, b" ")
+        run text(&mut out.*, name)
+        local = local + 1
+      }
+      group = group + usize.ONE
+    }
+    if groups > usize.ZERO && !body.failed { run text(&mut out.*, b")\n") }
+    run printBody(&mut out.*, bytes, &mut body, context)
+    if !body.failed && body.at != body.end { refuse(&mut body, b"a function body continues after its final end") }
+    carry(&mut reader.*, &body)
+    run text(&mut out.*, b"  )\n")
+    entry = entry + usize.ONE
+  }
+}
+
+// Writes a function body's instructions, one per line, up to the `end` that closes the body.
+effect fn printBody(out: &mut Bytes, bytes: &[u8], reader: &mut Reader, context: &Context) -> () ! OutOfMemoryError ? &mut Allocator {
+  // The labels open around the next instruction, the body's own not counted.
+  let mut depth = usize.ZERO
+  while !reader.failed {
+    let code = peekByte(bytes, &reader.*)
+    if reader.at >= reader.end { return refuse(&mut reader.*, b"a function body ends before its final end") }
+    if code == 0x0B {
+      reader.at = reader.at + usize.ONE
+      if depth == usize.ZERO { return () }
+      depth = depth - usize.ONE
+      run indent(&mut out.*, depth)
+      run text(&mut out.*, b"end\n")
+    } else if code == 0x05 {
+      reader.at = reader.at + usize.ONE
+      if depth == usize.ZERO { return refuse(&mut reader.*, b"an else is outside any if") }
+      run indent(&mut out.*, depth - usize.ONE)
+      run text(&mut out.*, b"else\n")
+    } else {
+      run indent(&mut out.*, depth)
+      run instruction(&mut out.*, bytes, &mut reader.*, context, depth)
+      if code == 0x02 || code == 0x03 || code == 0x04 {
+        depth = depth + usize.ONE
+        run text(&mut out.*, b" ;; label = @")
+        run index(&mut out.*, depth)
+      }
+      run text(&mut out.*, b"\n")
+    }
+  }
+}
+
+// Writes a block type: nothing for the empty type, `(result <type>)` for one value type, or
+// `(type <n>)`.
+effect fn blockType(out: &mut Bytes, bytes: &[u8], reader: &mut Reader) -> () ! OutOfMemoryError ? &mut Allocator {
+  let code = peekByte(bytes, &reader.*)
+  if code == 0x40 {
+    reader.at = reader.at + usize.ONE
+    return ()
+  }
+  let name = valueTypeName(code)
+  if name.length > usize.ZERO {
+    reader.at = reader.at + usize.ONE
+    run text(&mut out.*, b" (result ")
+    run text(&mut out.*, name)
+    return run text(&mut out.*, b")")
+  }
+  let typeIndex = readSigned(bytes, &mut reader.*, 33)
+  if (typeIndex & 9223372036854775808) != 0 { return refuse(&mut reader.*, b"a block type is neither a value type nor a type index") }
+  run text(&mut out.*, b" (type ")
+  run number(&mut out.*, typeIndex)
+  return run text(&mut out.*, b")")
+}
+
+// Writes ` <label> (;@<n>;)` for a branch `relative` labels out from `depth` open labels.
+effect fn labelText(out: &mut Bytes, relative: usize, depth: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  run text(&mut out.*, b" ")
+  run index(&mut out.*, relative)
+  if relative <= depth {
+    run text(&mut out.*, b" (;@")
+    run index(&mut out.*, depth - relative)
+    run text(&mut out.*, b";)")
+  }
+}
+
+// Reads a memory argument and writes ` [<memory>] [offset=<n>] [align=<n>]`, leaving out a
+// memory 0, a zero offset and the natural alignment `natural` (as a power of two).
+effect fn memoryArgument(out: &mut Bytes, bytes: &[u8], reader: &mut Reader, natural: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut align = readUnsigned(bytes, &mut reader.*, 32)
+  let mut memory: u64 = 0
+  if (align & 64) != 0 {
+    align = align - 64
+    memory = readUnsigned(bytes, &mut reader.*, 32)
+  }
+  let offset = readUnsigned(bytes, &mut reader.*, 64)
+  if align > 16 { return refuse(&mut reader.*, b"a memory access has an alignment above 2^16") }
+  if memory != 0 {
+    run text(&mut out.*, b" ")
+    run number(&mut out.*, memory)
+  }
+  if offset != 0 {
+    run text(&mut out.*, b" offset=")
+    run number(&mut out.*, offset)
+  }
+  if align != natural {
+    run text(&mut out.*, b" align=")
+    run number(&mut out.*, u64.shiftLeft(1, align))
+  }
+}
+
+// Writes ` <n>` for an index immediate.
+effect fn indexImmediate(out: &mut Bytes, bytes: &[u8], reader: &mut Reader) -> () ! OutOfMemoryError ? &mut Allocator {
+  run text(&mut out.*, b" ")
+  return run index(&mut out.*, readIndex(bytes, &mut reader.*))
+}
+
+// Writes the instruction at the reader, with its immediates, on the current line. `depth` is the
+// number of labels open around it, which branches count out from.
+effect fn instruction(out: &mut Bytes, bytes: &[u8], reader: &mut Reader, context: &Context, depth: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let start = reader.at
+  let code = readByte(bytes, &mut reader.*)
+  if reader.failed { return () }
+  let plain = plainName(code)
+  if plain.length > usize.ZERO { return run text(&mut out.*, plain) }
+  let loadStore = memoryName(code)
+  if loadStore.length > usize.ZERO {
+    run text(&mut out.*, loadStore)
+    return run memoryArgument(&mut out.*, bytes, &mut reader.*, memoryAlignment(code))
+  }
+  if code == 0x02 || code == 0x03 || code == 0x04 {
+    if code == 0x02 { run text(&mut out.*, b"block") }
+    if code == 0x03 { run text(&mut out.*, b"loop") }
+    if code == 0x04 { run text(&mut out.*, b"if") }
+    return run blockType(&mut out.*, bytes, &mut reader.*)
+  }
+  if code == 0x0C || code == 0x0D {
+    if code == 0x0C { run text(&mut out.*, b"br") } else { run text(&mut out.*, b"br_if") }
+    return run labelText(&mut out.*, readIndex(bytes, &mut reader.*), depth)
+  }
+  if code == 0x0E {
+    run text(&mut out.*, b"br_table")
+    let count = readIndex(bytes, &mut reader.*)
+    let mut entry = usize.ZERO
+    // The default label follows the listed ones.
+    while entry <= count && !reader.failed {
+      run labelText(&mut out.*, readIndex(bytes, &mut reader.*), depth)
+      entry = entry + usize.ONE
+    }
+    return ()
+  }
+  if code == 0x10 || code == 0x12 {
+    if code == 0x10 { run text(&mut out.*, b"call ") } else { run text(&mut out.*, b"return_call ") }
+    return run reference(&mut out.*, &context.functions, readIndex(bytes, &mut reader.*))
+  }
+  if code == 0x11 || code == 0x13 {
+    if code == 0x11 { run text(&mut out.*, b"call_indirect") } else { run text(&mut out.*, b"return_call_indirect") }
+    let typeIndex = readIndex(bytes, &mut reader.*)
+    let table = readIndex(bytes, &mut reader.*)
+    if table != usize.ZERO {
+      run text(&mut out.*, b" ")
+      run index(&mut out.*, table)
+    }
+    if typeIndex >= List<Bytes>.length(&context.signatures) { return refuse(&mut reader.*, b"an indirect call names a type the module does not define") }
+    run text(&mut out.*, b" (type ")
+    run index(&mut out.*, typeIndex)
+    return run text(&mut out.*, b")")
+  }
+  if code == 0x1C {
+    run text(&mut out.*, b"select")
+    let count = readIndex(bytes, &mut reader.*)
+    let mut entry = usize.ZERO
+    while entry < count && !reader.failed {
+      run text(&mut out.*, b" (result ")
+      run text(&mut out.*, readValueType(bytes, &mut reader.*))
+      run text(&mut out.*, b")")
+      entry = entry + usize.ONE
+    }
+    return ()
+  }
+  if code >= 0x20 && code <= 0x22 {
+    if code == 0x20 { run text(&mut out.*, b"local.get") }
+    if code == 0x21 { run text(&mut out.*, b"local.set") }
+    if code == 0x22 { run text(&mut out.*, b"local.tee") }
+    return run indexImmediate(&mut out.*, bytes, &mut reader.*)
+  }
+  if code == 0x23 || code == 0x24 {
+    if code == 0x23 { run text(&mut out.*, b"global.get ") } else { run text(&mut out.*, b"global.set ") }
+    return run reference(&mut out.*, &context.globals, readIndex(bytes, &mut reader.*))
+  }
+  if code == 0x25 || code == 0x26 {
+    if code == 0x25 { run text(&mut out.*, b"table.get") } else { run text(&mut out.*, b"table.set") }
+    return run indexImmediate(&mut out.*, bytes, &mut reader.*)
+  }
+  if code == 0x3F || code == 0x40 {
+    if code == 0x3F { run text(&mut out.*, b"memory.size") } else { run text(&mut out.*, b"memory.grow") }
+    let memory = readIndex(bytes, &mut reader.*)
+    if memory != usize.ZERO {
+      run text(&mut out.*, b" ")
+      run index(&mut out.*, memory)
+    }
+    return ()
+  }
+  if code == 0x41 {
+    run text(&mut out.*, b"i32.const ")
+    return run signed(&mut out.*, readSigned(bytes, &mut reader.*, 32))
+  }
+  if code == 0x42 {
+    run text(&mut out.*, b"i64.const ")
+    return run signed(&mut out.*, readSigned(bytes, &mut reader.*, 64))
+  }
+  if code == 0x43 {
+    run text(&mut out.*, b"f32.const ")
+    return run floatText(&mut out.*, readLittleEndian(bytes, &mut reader.*, 4), true)
+  }
+  if code == 0x44 {
+    run text(&mut out.*, b"f64.const ")
+    return run floatText(&mut out.*, readLittleEndian(bytes, &mut reader.*, 8), false)
+  }
+  if code == 0xD0 {
+    let heap = readByte(bytes, &mut reader.*)
+    if heap == 0x70 { return run text(&mut out.*, b"ref.null func") }
+    if heap == 0x6F { return run text(&mut out.*, b"ref.null extern") }
+    return refuse(&mut reader.*, b"a ref.null names a heap type other than func or extern")
+  }
+  if code == 0xD1 { return run text(&mut out.*, b"ref.is_null") }
+  if code == 0xD2 {
+    run text(&mut out.*, b"ref.func ")
+    return run reference(&mut out.*, &context.functions, readIndex(bytes, &mut reader.*))
+  }
+  if code == 0xFC { return run miscellaneous(&mut out.*, bytes, &mut reader.*, start) }
+  if code == 0xFE { return run atomic(&mut out.*, bytes, &mut reader.*, start) }
+  reader.at = start
+  if code == 0xFD { return refuse(&mut reader.*, b"the printer does not read SIMD instructions") }
+  return refuse(&mut reader.*, b"an instruction has an unknown opcode")
+}
+
+// The `0xFC` instructions: saturating truncation, bulk memory and table instructions.
+effect fn miscellaneous(out: &mut Bytes, bytes: &[u8], reader: &mut Reader, start: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let code = readUnsigned(bytes, &mut reader.*, 32)
+  if reader.failed { return () }
+  let name: &'static [u8] = match code {
+    0 => b"i32.trunc_sat_f32_s"
+    1 => b"i32.trunc_sat_f32_u"
+    2 => b"i32.trunc_sat_f64_s"
+    3 => b"i32.trunc_sat_f64_u"
+    4 => b"i64.trunc_sat_f32_s"
+    5 => b"i64.trunc_sat_f32_u"
+    6 => b"i64.trunc_sat_f64_s"
+    7 => b"i64.trunc_sat_f64_u"
+    8 => b"memory.init"
+    9 => b"data.drop"
+    10 => b"memory.copy"
+    11 => b"memory.fill"
+    12 => b"table.init"
+    13 => b"elem.drop"
+    14 => b"table.copy"
+    15 => b"table.grow"
+    16 => b"table.size"
+    17 => b"table.fill"
+    _ => b""
+  }
+  if name.length == usize.ZERO {
+    reader.at = start
+    return refuse(&mut reader.*, b"a 0xFC instruction has an unknown opcode")
+  }
+  run text(&mut out.*, name)
+  if code == 8 {
+    // `memory.init` names its segment, then its memory; the text writes the memory first only
+    // when it is not memory 0.
+    let segment = readIndex(bytes, &mut reader.*)
+    let memory = readIndex(bytes, &mut reader.*)
+    if memory != usize.ZERO {
+      run text(&mut out.*, b" ")
+      run index(&mut out.*, memory)
+    }
+    run text(&mut out.*, b" ")
+    return run index(&mut out.*, segment)
+  }
+  if code == 10 || code == 14 {
+    let first = readIndex(bytes, &mut reader.*)
+    let second = readIndex(bytes, &mut reader.*)
+    if first != usize.ZERO || second != usize.ZERO {
+      run text(&mut out.*, b" ")
+      run index(&mut out.*, first)
+      run text(&mut out.*, b" ")
+      run index(&mut out.*, second)
+    }
+    return ()
+  }
+  if code == 11 {
+    let memory = readIndex(bytes, &mut reader.*)
+    if memory != usize.ZERO {
+      run text(&mut out.*, b" ")
+      run index(&mut out.*, memory)
+    }
+    return ()
+  }
+  if code == 12 {
+    // `table.init` names its segment, then its table.
+    let segment = readIndex(bytes, &mut reader.*)
+    let table = readIndex(bytes, &mut reader.*)
+    run text(&mut out.*, b" ")
+    run index(&mut out.*, table)
+    run text(&mut out.*, b" ")
+    return run index(&mut out.*, segment)
+  }
+  if code >= 9 { return run indexImmediate(&mut out.*, bytes, &mut reader.*) }
+  return ()
+}
+
+// The `0xFE` instructions of the threads proposal.
+effect fn atomic(out: &mut Bytes, bytes: &[u8], reader: &mut Reader, start: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let code = readUnsigned(bytes, &mut reader.*, 32)
+  if reader.failed { return () }
+  if code == 3 {
+    if readByte(bytes, &mut reader.*) != 0 { return refuse(&mut reader.*, b"an atomic.fence has a nonzero immediate") }
+    return run text(&mut out.*, b"atomic.fence")
+  }
+  if code <= 2 {
+    if code == 0 { run text(&mut out.*, b"memory.atomic.notify") }
+    if code == 1 { run text(&mut out.*, b"memory.atomic.wait32") }
+    if code == 2 { run text(&mut out.*, b"memory.atomic.wait64") }
+    let mut natural: u64 = 2
+    if code == 2 { natural = 3 }
+    return run memoryArgument(&mut out.*, bytes, &mut reader.*, natural)
+  }
+  if code < 0x10 || code > 0x4E {
+    reader.at = start
+    return refuse(&mut reader.*, b"a 0xFE instruction has an unknown opcode")
+  }
+  // Loads 0x10-0x16 and stores 0x17-0x1D, then seven read-modify-write groups of seven, each in
+  // the access shapes i32, i64, i32 8-bit, i32 16-bit, i64 8-bit, i64 16-bit and i64 32-bit.
+  let widths: [&'static [u8]; 7] = [b"i32.atomic.", b"i64.atomic.", b"i32.atomic.", b"i32.atomic.", b"i64.atomic.", b"i64.atomic.", b"i64.atomic."]
+  let sizes: [&'static [u8]; 7] = [b"", b"", b"8", b"16", b"8", b"16", b"32"]
+  let naturals: [u64; 7] = [2, 3, 0, 1, 0, 1, 2]
+  let operations: [&'static [u8]; 7] = [b"add", b"sub", b"and", b"or", b"xor", b"xchg", b"cmpxchg"]
+  let shape = u64.toUsize(u64.remainder(code - 0x10, 7))
+  let group = u64.divide(code - 0x10, 7)
+  run text(&mut out.*, widths[shape])
+  if group == 0 {
+    run text(&mut out.*, b"load")
+    run text(&mut out.*, sizes[shape])
+    if shape >= 2 { run text(&mut out.*, b"_u") }
+  } else if group == 1 {
+    run text(&mut out.*, b"store")
+    run text(&mut out.*, sizes[shape])
+  } else {
+    run text(&mut out.*, b"rmw")
+    run text(&mut out.*, sizes[shape])
+    run text(&mut out.*, b".")
+    run text(&mut out.*, operations[u64.toUsize(group - 2)])
+    if shape >= 2 { run text(&mut out.*, b"_u") }
+  }
+  return run memoryArgument(&mut out.*, bytes, &mut reader.*, naturals[shape])
+}
+
+// A provider of `Writer` that keeps what one float's `Display` writes.
+struct FloatText {
+  bytes: [u8; 64],
+  length: usize,
+}
+
+impl FloatText {
+  effect fn writeAll(self: &mut Self, values: &[u8]) -> () ! WriterError {
+    let mut at = usize.ZERO
+    while at < values.length && self.length < 64 {
+      self.bytes[self.length] = values[at]
+      self.length = self.length + usize.ONE
+      at = at + usize.ONE
+    }
+    return ()
+  }
+
+  effect fn flush(self: &mut Self) -> () ! WriterError {
+    return ()
+  }
+}
+
+impl Writer for FloatText {
+  writeAll: FloatText.writeAll
+  flush: FloatText.flush
+}
+
+// Writes the float with `bits`, single precision when `single`: `inf`, `nan` for the canonical
+// NaN, `nan:0x<payload>` for another, and otherwise the shortest decimal that reads back to the
+// same bits.
+effect fn floatText(out: &mut Bytes, bits: u64, single: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut exponentBits: u64 = 2047
+  let mut fractionBits: u64 = 52
+  if single {
+    exponentBits = 255
+    fractionBits = 23
+  }
+  let mut signBit: u64 = 63
+  if single { signBit = 31 }
+  let negative = (u64.shiftRight(bits, signBit) & 1) != 0
+  let exponent = u64.shiftRight(bits, fractionBits) & exponentBits
+  let fraction = bits & (u64.shiftLeft(1, fractionBits) - 1)
+  if exponent == exponentBits {
+    if negative { run text(&mut out.*, b"-") }
+    if fraction == 0 { return run text(&mut out.*, b"inf") }
+    if fraction == u64.shiftLeft(1, fractionBits - 1) { return run text(&mut out.*, b"nan") }
+    run text(&mut out.*, b"nan:0x")
+    return run hex(&mut out.*, fraction)
+  }
+  let mut buffer = FloatText {bytes: [0; 64], length: usize.ZERO}
+  if single {
+    let value = f32.fromBits(u64.wrappingToU32(bits))
+    let written = run Effect.result(Format.display<f32>(&value) |> Effect.provideMut<Writer>(&mut buffer))
+    drop written
+  } else {
+    let value = f64.fromBits(bits)
+    let written = run Effect.result(Format.display<f64>(&value) |> Effect.provideMut<Writer>(&mut buffer))
+    drop written
+  }
+  return run text(&mut out.*, Slice.view<u8>(&buffer.bytes, usize.ZERO, buffer.length))
+}
+
+// The instructions without immediates.
+fn plainName(code: u8) -> &'static [u8] {
+  return match code {
+    0x00 => b"unreachable"
+    0x01 => b"nop"
+    0x0F => b"return"
+    0x1A => b"drop"
+    0x1B => b"select"
+    0x45 => b"i32.eqz"
+    0x46 => b"i32.eq"
+    0x47 => b"i32.ne"
+    0x48 => b"i32.lt_s"
+    0x49 => b"i32.lt_u"
+    0x4A => b"i32.gt_s"
+    0x4B => b"i32.gt_u"
+    0x4C => b"i32.le_s"
+    0x4D => b"i32.le_u"
+    0x4E => b"i32.ge_s"
+    0x4F => b"i32.ge_u"
+    0x50 => b"i64.eqz"
+    0x51 => b"i64.eq"
+    0x52 => b"i64.ne"
+    0x53 => b"i64.lt_s"
+    0x54 => b"i64.lt_u"
+    0x55 => b"i64.gt_s"
+    0x56 => b"i64.gt_u"
+    0x57 => b"i64.le_s"
+    0x58 => b"i64.le_u"
+    0x59 => b"i64.ge_s"
+    0x5A => b"i64.ge_u"
+    0x5B => b"f32.eq"
+    0x5C => b"f32.ne"
+    0x5D => b"f32.lt"
+    0x5E => b"f32.gt"
+    0x5F => b"f32.le"
+    0x60 => b"f32.ge"
+    0x61 => b"f64.eq"
+    0x62 => b"f64.ne"
+    0x63 => b"f64.lt"
+    0x64 => b"f64.gt"
+    0x65 => b"f64.le"
+    0x66 => b"f64.ge"
+    0x67 => b"i32.clz"
+    0x68 => b"i32.ctz"
+    0x69 => b"i32.popcnt"
+    0x6A => b"i32.add"
+    0x6B => b"i32.sub"
+    0x6C => b"i32.mul"
+    0x6D => b"i32.div_s"
+    0x6E => b"i32.div_u"
+    0x6F => b"i32.rem_s"
+    0x70 => b"i32.rem_u"
+    0x71 => b"i32.and"
+    0x72 => b"i32.or"
+    0x73 => b"i32.xor"
+    0x74 => b"i32.shl"
+    0x75 => b"i32.shr_s"
+    0x76 => b"i32.shr_u"
+    0x77 => b"i32.rotl"
+    0x78 => b"i32.rotr"
+    0x79 => b"i64.clz"
+    0x7A => b"i64.ctz"
+    0x7B => b"i64.popcnt"
+    0x7C => b"i64.add"
+    0x7D => b"i64.sub"
+    0x7E => b"i64.mul"
+    0x7F => b"i64.div_s"
+    0x80 => b"i64.div_u"
+    0x81 => b"i64.rem_s"
+    0x82 => b"i64.rem_u"
+    0x83 => b"i64.and"
+    0x84 => b"i64.or"
+    0x85 => b"i64.xor"
+    0x86 => b"i64.shl"
+    0x87 => b"i64.shr_s"
+    0x88 => b"i64.shr_u"
+    0x89 => b"i64.rotl"
+    0x8A => b"i64.rotr"
+    0x8B => b"f32.abs"
+    0x8C => b"f32.neg"
+    0x8D => b"f32.ceil"
+    0x8E => b"f32.floor"
+    0x8F => b"f32.trunc"
+    0x90 => b"f32.nearest"
+    0x91 => b"f32.sqrt"
+    0x92 => b"f32.add"
+    0x93 => b"f32.sub"
+    0x94 => b"f32.mul"
+    0x95 => b"f32.div"
+    0x96 => b"f32.min"
+    0x97 => b"f32.max"
+    0x98 => b"f32.copysign"
+    0x99 => b"f64.abs"
+    0x9A => b"f64.neg"
+    0x9B => b"f64.ceil"
+    0x9C => b"f64.floor"
+    0x9D => b"f64.trunc"
+    0x9E => b"f64.nearest"
+    0x9F => b"f64.sqrt"
+    0xA0 => b"f64.add"
+    0xA1 => b"f64.sub"
+    0xA2 => b"f64.mul"
+    0xA3 => b"f64.div"
+    0xA4 => b"f64.min"
+    0xA5 => b"f64.max"
+    0xA6 => b"f64.copysign"
+    0xA7 => b"i32.wrap_i64"
+    0xA8 => b"i32.trunc_f32_s"
+    0xA9 => b"i32.trunc_f32_u"
+    0xAA => b"i32.trunc_f64_s"
+    0xAB => b"i32.trunc_f64_u"
+    0xAC => b"i64.extend_i32_s"
+    0xAD => b"i64.extend_i32_u"
+    0xAE => b"i64.trunc_f32_s"
+    0xAF => b"i64.trunc_f32_u"
+    0xB0 => b"i64.trunc_f64_s"
+    0xB1 => b"i64.trunc_f64_u"
+    0xB2 => b"f32.convert_i32_s"
+    0xB3 => b"f32.convert_i32_u"
+    0xB4 => b"f32.convert_i64_s"
+    0xB5 => b"f32.convert_i64_u"
+    0xB6 => b"f32.demote_f64"
+    0xB7 => b"f64.convert_i32_s"
+    0xB8 => b"f64.convert_i32_u"
+    0xB9 => b"f64.convert_i64_s"
+    0xBA => b"f64.convert_i64_u"
+    0xBB => b"f64.promote_f32"
+    0xBC => b"i32.reinterpret_f32"
+    0xBD => b"i64.reinterpret_f64"
+    0xBE => b"f32.reinterpret_i32"
+    0xBF => b"f64.reinterpret_i64"
+    0xC0 => b"i32.extend8_s"
+    0xC1 => b"i32.extend16_s"
+    0xC2 => b"i64.extend8_s"
+    0xC3 => b"i64.extend16_s"
+    0xC4 => b"i64.extend32_s"
+    _ => b""
+  }
+}
+
+// The loads and stores, 0x28 to 0x3E.
+fn memoryName(code: u8) -> &'static [u8] {
+  return match code {
+    0x28 => b"i32.load"
+    0x29 => b"i64.load"
+    0x2A => b"f32.load"
+    0x2B => b"f64.load"
+    0x2C => b"i32.load8_s"
+    0x2D => b"i32.load8_u"
+    0x2E => b"i32.load16_s"
+    0x2F => b"i32.load16_u"
+    0x30 => b"i64.load8_s"
+    0x31 => b"i64.load8_u"
+    0x32 => b"i64.load16_s"
+    0x33 => b"i64.load16_u"
+    0x34 => b"i64.load32_s"
+    0x35 => b"i64.load32_u"
+    0x36 => b"i32.store"
+    0x37 => b"i64.store"
+    0x38 => b"f32.store"
+    0x39 => b"f64.store"
+    0x3A => b"i32.store8"
+    0x3B => b"i32.store16"
+    0x3C => b"i64.store8"
+    0x3D => b"i64.store16"
+    0x3E => b"i64.store32"
+    _ => b""
+  }
+}
+
+// The natural alignment of a load or store, as a power of two: its access size.
+fn memoryAlignment(code: u8) -> u64 {
+  return match code {
+    0x29 => 3
+    0x2B => 3
+    0x2C => 0
+    0x2D => 0
+    0x2E => 1
+    0x2F => 1
+    0x30 => 0
+    0x31 => 0
+    0x32 => 1
+    0x33 => 1
+    0x37 => 3
+    0x39 => 3
+    0x3A => 0
+    0x3B => 1
+    0x3C => 0
+    0x3D => 1
+    _ => 2
+  }
+}

@@ -184,9 +184,16 @@ before a successful plan is published.
 
 ## Build configuration
 
-`--emit` (earlier `build.stage`) accepts `final` (default), `llvm-ir`, `llvm-bitcode`, `assembly` or
-`object`. `package.kind` additionally accepts `object`. Intermediate destinations use `.ll`, `.bc`,
-`.s` or `.o`; `silk run` requires a final executable. A build can select an ordinary source runtime
+`--emit` (earlier `build.stage`) accepts `final` (default), `llvm-ir`, `llvm-bitcode`, `assembly`,
+`object` or `wasm-text`. `package.kind` additionally accepts `object`. Intermediate destinations use
+`.ll`, `.bc`, `.s` or `.o`; `silk run` requires a final executable.
+
+`wasm-text` applies to a wasm32 or wasm64 executable. The build links the module as a final build
+does, with either backend, and writes the module in the WebAssembly text format to a `.wat`
+destination in place of its bytes. The compiler prints the text itself, so the compiler built for
+`wasm32-wasip1` writes it too. For `wasm32-wasip2` the text is the core module the component
+would wrap. A debug build names functions, globals and data segments after the source, and every
+other custom section appears only as a comment. A build can select an ordinary source runtime
 and retain private support code. The runtime composition lives in `[unstable]`, which carries no
 stability promise:
 

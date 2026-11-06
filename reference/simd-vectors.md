@@ -291,29 +291,38 @@ CPU feature the profile does not select reports `SEM0241`.
 **Evidence:** `corpus/native/simd-arch`, `corpus/invalid/simd-arch-unavailable`.
 
 
-## SIMD-008 — Runtime CPU detection reports a feature set
+## SIMD-008 — Runtime CPU detection reports a feature set, asked once per process
 
 **Status:** Confirmed
 
 ```silk,ignore
 import silk.simd.cpu { CpuFeatures }
 
-let machine = CpuFeatures.detect()
+if CpuFeatures.available("avx2") { total = unsafe sumAvx2(values) }
+let machine = CpuFeatures.machine()
 if CpuFeatures.has(&machine, "avx2") { ... }
 ```
 
 `silk.simd.cpu` names a set of CPU features of the target architecture, spelled as in PROFILE-006.
-`CpuFeatures.selected()` is the set the profile selects. `CpuFeatures.detect()` asks the running
-machine and always contains the selected set: x86-64 Linux reads `cpuid` through ASSEMBLY-001
-and counts AVX and AVX-512 features only when `xgetbv` shows the operating system saves their
-registers; AArch64 Linux with GNU libc reads `getauxval(AT_HWCAP)` and `AT_HWCAP2`; AArch64 Darwin
-reads `sysctlbyname("hw.optional.*")`. wasm32 and profiles without those interfaces report the
-selected set. A name outside the target's catalog is never present.
+`CpuFeatures.selected()` is the set the profile selects. `CpuFeatures.machine()` is the set the
+running machine has and always contains the selected set: x86-64 Linux and Darwin read `cpuid`
+through ASSEMBLY-001 and count AVX and AVX-512 features only when `xgetbv` shows the operating
+system saves their registers; AArch64 Linux with GNU libc reads `getauxval(AT_HWCAP)` and
+`AT_HWCAP2`; AArch64 Darwin reads `sysctlbyname("hw.optional.*")`. wasm32 and profiles without
+those interfaces report the selected set. A name outside the target's catalog is never present.
 
-**Boundary:** Detection is a value, not a cached global, because Silk has no mutable global
-storage; a program detects once and keeps the result. A detected feature does not change
-`Target.hasCpuFeature` or admit SIMD-007 operations, so it selects between kernels that were
-each compiled for their features.
+The first call in a process asks the machine and keeps the answer in the process word of the
+library's cache function (native pointer boundary, process words), with the bit 63 marking it as
+asked. Later calls cost one relaxed load. Threads racing on the first call each ask and store the
+same answer. `CpuFeatures.detect()` asks again on every call.
+
+`CpuFeatures.available(static name)` answers for one feature named at compile time. When the
+profile selects it, the answer is `true` at compile time; when the profile cannot ask the machine
+or the name is outside the catalog, it is `false` at compile time; otherwise it is one load of the
+cached set and one bit test, so a kernel can be chosen per call.
+
+**Boundary:** A detected feature does not change `Target.hasCpuFeature` or admit SIMD-007
+operations, so it selects between kernels that were each compiled for their features (SIMD-009).
 
 **Diagnostics:** None. Detection cannot fail; an interface that is missing reports the selected set.
 
@@ -331,15 +340,14 @@ unsafe fn sumAvx2(values: &[u8]) -> u64 {
   // Intrinsic.x86ShuffleBytes<simd<u8, 32>> is admitted here.
 }
 
-let machine = CpuFeatures.detect()
-if CpuFeatures.has(&machine, "avx2") { total = unsafe sumAvx2(values) }
+if CpuFeatures.available("avx2") { total = unsafe sumAvx2(values) }
 ```
 
 `@features("a", "b")` on an ordinary runtime function compiles that
 function for the listed CPU features of the target (PROFILE-006), their implications, and the
 profile's own features. Its body may use SIMD-007 operations those features admit. Running it on a
 CPU without them is undefined, so the function is `unsafe fn` and each caller proves the machine
-has them, usually with `silk.simd.cpu` (SIMD-008).
+has them, usually with `CpuFeatures.available` (SIMD-008).
 
 Callees keep the profile's features. LLVM inlines a callee into a function with more features,
 never the reverse, so portable `silk.simd.simd` helpers called from the function are compiled with its
@@ -350,7 +358,9 @@ different registers with and without AVX and AVX-512.
 **Boundary:** `Target.hasCpuFeature` keeps answering for the profile inside the function, so a
 `static if` there, and a `silk.simd.x86` (or `aarch64`, `wasm`) wrapper it calls, still sees the profile. `static fn`,
 `extern` and interface operations take no `@features`. Callees are not compiled again for the
-function's features.
+function's features. The Clang 23 requirement for `avx512vl` with `avx512dq` or `avx512bw`, which
+avoids an LLVM 22 mask miscompile, reads only the profile, so a function that adds those features
+should be built with Clang 23.
 
 **Diagnostics:** An entry that is not a text literal naming a CPU feature of the target reports
 `SEM0242`. A function with `@features` that is not `unsafe` reports `SEM0243`. The directive on a
@@ -422,10 +432,14 @@ The SIMD-007 catalog also holds the AES and carry-less multiplication instructio
 | `aarch64AesDecrypt`           | `u8x16`, `u8x16` → `u8x16` | AArch64 `aes`   | `aesd`                            |
 | `aarch64AesMixColumns`        | `u8x16` → `u8x16`      | AArch64 `aes`      | `aesmc`                           |
 | `aarch64AesInverseMixColumns` | `u8x16` → `u8x16`      | AArch64 `aes`      | `aesimc`                          |
+| `aarch64PolynomialMultiply`   | `u64x2`, `u64x2` → `u64x2` | AArch64 `aes`   | `pmull` (64-bit lanes)            |
+| `aarch64PolynomialMultiplyHigh` | `u64x2`, `u64x2` → `u64x2` | AArch64 `aes` | `pmull2` (64-bit lanes)           |
 
 The x86 rounds take the operand order of the instructions: the state, then the round key.
 `x86CarrylessMultiply` multiplies lane 0 of each operand into a 128-bit product, low half in lane
 0; a program picks other halves with `simdShuffle` first.
+`aarch64PolynomialMultiply` multiplies lane 0 of each operand the same way, and
+`aarch64PolynomialMultiplyHigh` multiplies lane 1 of each.
 
 `silk.crypto.aes_round` computes SubBytes, ShiftRows, MixColumns and their inverses with portable code,
 without tables. `silk.simd.x86` and `silk.simd.aarch64` wrap each operation on `u8x16` states and
@@ -476,7 +490,7 @@ The operands follow the instructions. `x86Sha256Rounds2` takes C, D, G and H, th
 `silk.simd.x86` and `silk.simd.aarch64` wrap each operation and fall back to portable code when
 the profile lacks the feature, like the SIMD-007 wrappers.
 
-**Boundary:** SHA-1 and SHA-512 instructions are not in the catalog yet.
+**Boundary:** SHA-512 instructions and the AArch64 SHA-1 instructions are not in the catalog yet. SIMD-013 adds the x86 SHA-1 instructions.
 
 **Diagnostics:** As SIMD-007: `SEM0239` for a first operand outside the catalog and `SEM0241`
 when the profile and function do not select the feature.
@@ -485,3 +499,38 @@ when the profile and function do not select the feature.
 
 **Evidence:** `corpus/native/simd-sha` (one SHA-256 block through both instruction flows, and the
 x86 instructions themselves when the machine has them).
+
+## SIMD-013 — x86 SHA-1 instructions are architecture operations
+
+**Status:** Confirmed
+
+```silk,ignore
+@features("sha")
+unsafe fn rounds(abcd: simd<u32, 4>, wk: simd<u32, 4>) -> simd<u32, 4> {
+  return Intrinsic.x86Sha1Rounds4Stage0<simd<u32, 4>>(abcd, wk)
+}
+```
+
+The SIMD-007 catalog also holds the x86 SHA-1 instructions, all on `u32x4`:
+
+| Operation              | Operands | Target and feature | Instruction            |
+| ---------------------- | -------- | ------------------ | ---------------------- |
+| `x86Sha1Rounds4Stage0` | 2        | x86-64 `sha`       | `sha1rnds4` selector 0 |
+| `x86Sha1Rounds4Stage1` | 2        | x86-64 `sha`       | `sha1rnds4` selector 1 |
+| `x86Sha1Rounds4Stage2` | 2        | x86-64 `sha`       | `sha1rnds4` selector 2 |
+| `x86Sha1Rounds4Stage3` | 2        | x86-64 `sha`       | `sha1rnds4` selector 3 |
+| `x86Sha1NextE`         | 2        | x86-64 `sha`       | `sha1nexte`            |
+| `x86Sha1Message1`      | 2        | x86-64 `sha`       | `sha1msg1`             |
+| `x86Sha1Message2`      | 2        | x86-64 `sha`       | `sha1msg2`             |
+
+`sha1rnds4` takes its round function as an immediate, so each of the four selectors is its own
+operation: stage `n` runs four of rounds `20n` to `20n + 19`. A and E ride in lane 3 of their
+vectors, as the instructions expect.
+
+`silk.simd.x86` wraps each operation and falls back to portable code when the profile lacks the
+feature, like the SIMD-007 wrappers.
+
+**Diagnostics:** As SIMD-007: `SEM0239` for a first operand outside the catalog and `SEM0241`
+when the profile and function do not select the feature.
+
+**Current compiler:** Aligned.

@@ -1,0 +1,1888 @@
+//! Elliptic-curve keys, ECDSA, and ECDH on every named curve over a prime field that OpenSSL and
+//! Node.js list, such as `brainpoolP256r1`, `secp256k1`, `secp224r1`, and `SM2`.
+//!
+//! # When to use
+//! Use [`EcPrivateKey`] and [`EcPublicKey`] for Node.js `crypto.createECDH`, `generateKeyPair('ec')`,
+//! and `crypto.sign` with an `ec` key on any curve of `silk.crypto.ec_key.EcCurve`. For P-256,
+//! P-384, P-521, or secp256k1 alone, `silk.crypto.p256`, `silk.crypto.p384`, `silk.crypto.p521`,
+//! and `silk.crypto.secp256k1` are faster.
+//!
+//! # Details
+//! An [`EcGroup`] holds the parameters of a curve `y^2 = x^3 + ax + b` modulo a prime `p` and its
+//! base point `G` of prime order `n`. A private key is a number `d` from 1 to `n - 1` and its public
+//! key is the point `dG`. Points are read and written in the SEC1 forms: uncompressed `04 || x || y`,
+//! compressed `02` or `03 || x`, and hybrid `06` or `07 || x || y`.
+//!
+//! The signing functions take the digest of the message, not the message. A digest longer than `n`
+//! keeps its leftmost bits, as OpenSSL does. A signature is `r || s`, each big-endian and
+//! [`EcGroup.secretLength`] bytes, the IEEE P1363 form that Node.js calls `ieee-p1363`.
+//! [`EcSignature`] converts it to and from DER, the default of Node.js. [`EcPrivateKey.agree`] gives
+//! the x-coordinate of `dQ`, as Node.js `ecdh.computeSecret` does.
+//!
+//! Field arithmetic uses Montgomery multiplication on 64-bit limbs, and points use the complete
+//! projective formulas of Renes, Costello, and Batina. Operations with a secret, such as
+//! [`EcPrivateKey.generate`], [`EcPrivateKey.signDigest`], and [`EcPrivateKey.agree`], take the
+//! same time for every secret of a curve: they have no branch and no memory access that depends on
+//! the secret.
+//!
+//! # Errors
+//! - [`EcError`] for a secret, a point, a length, or a signature that is not valid.
+//!
+//! # Gotchas
+//! On a curve with a cofactor other than 1, such as `secp112r2`, [`EcPublicKey.fromBytes`] also
+//! checks that the point is in the subgroup of the base point. Each signature needs a fresh secret
+//! from a cryptographically secure `Random`; a repeated or predictable one reveals the private key.
+//! The values stay in memory after use; nothing erases them.
+//!
+//! # Examples
+//! ## Agree on a secret on brainpoolP256r1
+//! ```silk
+//! import silk.core.effect { Effect }
+//! import silk.core.result { Result }
+//! import silk.crypto.ec { EcError, EcGroup, EcPrivateKey }
+//! import silk.crypto.ec_key { EcCurve }
+//! import silk.num.u64
+//! import silk.system.random { Random }
+//!
+//! // A test provider. Never use it for keys.
+//! struct Counter {
+//!   state: u64,
+//! }
+//!
+//! impl Random for Counter {
+//!   effect fn fillBytes(self: &mut Self, output: &mut [u8]) -> () {
+//!     let mut index: usize = 0
+//!     while index < output.length {
+//!       self.state = u64.wrappingAdd(u64.wrappingMultiply(self.state, 6364136223846793005), 1)
+//!       output[index] = u64.toU8(u64.shiftRight(self.state, 56))
+//!       index = index + 1
+//!     }
+//!   }
+//! }
+//!
+//! effect fn agreeBoth() -> i32 ! EcError ? &mut Random {
+//!   let group = EcGroup.named(EcCurve.BrainpoolP256r1)
+//!   let alice = run EcPrivateKey.generate(&group)
+//!   let bob = run EcPrivateKey.generate(&group)
+//!   let mut fromAlice: [u8; 32] = [0; 32]
+//!   let mut fromBob: [u8; 32] = [0; 32]
+//!   if let Result<(), EcError>.Failure { error } = alice.agree(&bob.publicKey(), &mut fromAlice) {
+//!     fail error
+//!   }
+//!   if let Result<(), EcError>.Failure { error } = bob.agree(&alice.publicKey(), &mut fromBob) {
+//!     fail error
+//!   }
+//!   let mut i: usize = 0
+//!   while i < 32 {
+//!     if fromAlice[i] != fromBob[i] {
+//!       return 1
+//!     }
+//!     i = i + 1
+//!   }
+//!   return 0
+//! }
+//!
+//! pub effect fn main() -> i32 ! EcError {
+//!   let mut random = Counter { state: 1 }
+//!   return run agreeBoth() |> Effect.provideMut<Random>(&mut random)
+//! }
+//! ```
+//!
+//! @category Cryptography
+
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.crypto.ec_key { EcCurve }
+import silk.io.writer { Writer, WriterError }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.system.random { Random }
+import silk.text.format { Debug, Format, Formatter }
+
+/// The reason that an elliptic-curve secret, point, length, or signature was rejected.
+pub enum EcError {
+  /// A secret is 0 or not less than the order `n` of the base point.
+  InvalidKey,
+  /// A point encoding is not valid: the first byte is not a SEC1 form, the length is wrong, a
+  /// coordinate is not less than `p`, the point is not on the curve or not in the subgroup of the
+  /// base point, the hybrid parity does not match, or the point is the point at infinity.
+  InvalidPoint,
+  /// An input or output does not have the required length.
+  InvalidLength,
+  /// A DER signature is not strict DER of two non-negative integers.
+  InvalidEncoding,
+  /// The signature does not match the digest and the key.
+  InvalidSignature,
+  /// The shared point of a key agreement is the point at infinity.
+  InvalidSharedSecret,
+}
+
+impl Debug for EcError {
+  /// Writes the name of the variant, such as `InvalidKey`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      EcError.InvalidKey => run Format.write(&mut formatter, b"InvalidKey")
+      EcError.InvalidPoint => run Format.write(&mut formatter, b"InvalidPoint")
+      EcError.InvalidLength => run Format.write(&mut formatter, b"InvalidLength")
+      EcError.InvalidEncoding => run Format.write(&mut formatter, b"InvalidEncoding")
+      EcError.InvalidSignature => run Format.write(&mut formatter, b"InvalidSignature")
+      EcError.InvalidSharedSecret => run Format.write(&mut formatter, b"InvalidSharedSecret")
+    }
+  }
+}
+
+/// The SEC1 form of an encoded public point.
+pub enum EcPointFormat {
+  /// `02` or `03`, by the parity of `y`, then `x`.
+  Compressed,
+  /// `04`, then `x` and `y`.
+  Uncompressed,
+  /// `06` or `07`, by the parity of `y`, then `x` and `y`.
+  Hybrid,
+}
+
+impl Debug for EcPointFormat {
+  /// Writes the name of the variant, such as `Compressed`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return match &self.* {
+      EcPointFormat.Compressed => run Format.write(&mut formatter, b"Compressed")
+      EcPointFormat.Uncompressed => run Format.write(&mut formatter, b"Uncompressed")
+      EcPointFormat.Hybrid => run Format.write(&mut formatter, b"Hybrid")
+    }
+  }
+}
+
+// Little-endian 64-bit limbs. Nine limbs hold 576 bits, enough for P-521.
+const LIMBS: usize = 9
+
+struct Limbs {
+  words: [u64; 9],
+}
+
+impl Copy for Limbs {}
+
+// A prime modulus with the constants of Montgomery multiplication modulo it. Residues have
+// `length` limbs; every loop runs over `length`, which depends only on the curve.
+struct Field {
+  modulus: Limbs,
+  length: usize,
+  bits: usize,
+  // -modulus^-1 modulo 2^64.
+  inverse: u64,
+  // R = 2^(64 * length) modulo the modulus, which is 1 in Montgomery form.
+  one: Limbs,
+  // R^2 modulo the modulus.
+  squared: Limbs,
+}
+
+impl Copy for Field {}
+
+// A projective point (X : Y : Z) with Montgomery coordinates. The point at infinity has Z = 0.
+struct Point {
+  x: Limbs,
+  y: Limbs,
+  z: Limbs,
+}
+
+impl Copy for Point {}
+
+/// The parameters of a named curve over a prime field, with its base point and order.
+///
+/// # When to use
+/// Make one with [`EcGroup.curveName`] and pass it to the key functions of this module. Keep it for
+/// all the operations on that curve.
+///
+/// # Details
+/// Making a group converts the parameters to Montgomery form, which takes a few microseconds.
+///
+/// # Gotchas
+/// It is a fixed-size value of about 1.5 KiB. Pass it by reference.
+pub struct EcGroup {
+  curveName: EcCurve,
+  field: Field,
+  order: Field,
+  a: Limbs,
+  b: Limbs,
+  b3: Limbs,
+  base: Point,
+  cofactorValue: u32,
+  fieldBytes: usize,
+  orderBytes: usize,
+}
+
+impl Copy for EcGroup {}
+
+/// An elliptic-curve public key: a point of the subgroup of the base point other than the point
+/// at infinity.
+///
+/// # When to use
+/// Use it to verify ECDSA signatures and as the peer key of [`EcPrivateKey.agree`]. Read one with
+/// [`EcPublicKey.fromBytes`], or get one with [`EcPrivateKey.publicKey`].
+///
+/// # Gotchas
+/// It is a fixed-size value of about 1.7 KiB. Pass it by reference.
+pub struct EcPublicKey {
+  domain: EcGroup,
+  // Affine coordinates in Montgomery form.
+  x: Limbs,
+  y: Limbs,
+}
+
+impl Copy for EcPublicKey {}
+
+/// An elliptic-curve private key: a secret `d` from 1 to `n - 1` and its public point `dG`.
+///
+/// # When to use
+/// Use it to sign digests with ECDSA and to agree on a secret with ECDH. Generate one with
+/// [`EcPrivateKey.generate`], or read one with [`EcPrivateKey.fromBytes`].
+///
+/// # Gotchas
+/// It does not erase its memory when dropped. It is a fixed-size value of about 1.8 KiB. Pass it
+/// by reference.
+pub struct EcPrivateKey {
+  public: EcPublicKey,
+  // The secret as plain limbs.
+  secret: Limbs,
+}
+
+impl Copy for EcPrivateKey {}
+
+/// Conversions between the `r || s` form of an ECDSA signature and its DER form.
+///
+/// # When to use
+/// Use it for Node.js `dsaEncoding`: `der`, the default, is the DER `SEQUENCE` of two `INTEGER`s,
+/// and `ieee-p1363` is `r || s`, which [`EcPrivateKey.signDigest`] writes.
+pub struct EcSignature {}
+
+// Limb arithmetic. Every function runs in time that depends only on its length arguments.
+
+fn zeroLimbs() -> Limbs {
+  return Limbs { words: [0; 9] }
+}
+
+fn wordLimbs(value: u64) -> Limbs {
+  let mut result = zeroLimbs()
+  result.words[0] = value
+  return result
+}
+
+// The carry out of a + b = sum. Compilers lower the comparison to a flag, not a branch.
+fn carryOf(a: u64, b: u64, sum: u64) -> u64 {
+  if u64.lessThan(sum, a) {
+    return 1
+  }
+  return 0
+}
+
+// The borrow out of a - b = difference.
+fn borrowOf(a: u64, b: u64, difference: u64) -> u64 {
+  if u64.lessThan(a, b) {
+    return 1
+  }
+  return 0
+}
+
+// All ones when `bit` is 1, else 0.
+fn maskOf(bit: u64) -> u64 {
+  return u64.wrappingSubtract(0, bit)
+}
+
+// 1 when `value` is 0, else 0.
+fn zeroWord(value: u64) -> u64 {
+  return u64.bitXor(u64.shiftRight(u64.bitOr(value, u64.wrappingSubtract(0, value)), 63), 1)
+}
+
+// The first `length` limbs of `ifSet` when `mask` is all ones, or of `ifClear` when it is 0.
+fn selectLimbs(mask: u64, ifSet: &Limbs, ifClear: &Limbs, length: usize) -> Limbs {
+  let mut result = zeroLimbs()
+  let mut i: usize = 0
+  while i < length {
+    result.words[i] = u64.bitOr(
+      u64.bitAnd(mask, ifSet.words[i]),
+      u64.bitAnd(u64.bitNot(mask), ifClear.words[i]),
+    )
+    i = i + 1
+  }
+  return result
+}
+
+// 1 when the first `length` limbs are all 0.
+fn isZeroBit(value: &Limbs, length: usize) -> u64 {
+  let mut combined: u64 = 0
+  let mut i: usize = 0
+  while i < length {
+    combined = u64.bitOr(combined, value.words[i])
+    i = i + 1
+  }
+  return zeroWord(combined)
+}
+
+fn equalBit(left: &Limbs, right: &Limbs, length: usize) -> u64 {
+  let mut combined: u64 = 0
+  let mut i: usize = 0
+  while i < length {
+    combined = u64.bitOr(combined, u64.bitXor(left.words[i], right.words[i]))
+    i = i + 1
+  }
+  return zeroWord(combined)
+}
+
+// 1 when left < right over `length` limbs.
+fn lessBit(left: &Limbs, right: &Limbs, length: usize) -> u64 {
+  let mut borrow: u64 = 0
+  let mut i: usize = 0
+  while i < length {
+    let partial = u64.wrappingSubtract(left.words[i], right.words[i])
+    let first = borrowOf(left.words[i], right.words[i], partial)
+    let difference = u64.wrappingSubtract(partial, borrow)
+    let second = borrowOf(partial, borrow, difference)
+    borrow = u64.bitOr(first, second)
+    i = i + 1
+  }
+  return borrow
+}
+
+// left - right over `length` limbs into `result`, returning the borrow.
+fn subtractInto(result: &mut Limbs, left: &Limbs, right: &Limbs, length: usize) -> u64 {
+  let mut borrow: u64 = 0
+  let mut i: usize = 0
+  while i < length {
+    let partial = u64.wrappingSubtract(left.words[i], right.words[i])
+    let first = borrowOf(left.words[i], right.words[i], partial)
+    let difference = u64.wrappingSubtract(partial, borrow)
+    let second = borrowOf(partial, borrow, difference)
+    result.words[i] = difference
+    borrow = u64.bitOr(first, second)
+    i = i + 1
+  }
+  return borrow
+}
+
+// left + right over `length` limbs into `result`, returning the carry.
+fn addInto(result: &mut Limbs, left: &Limbs, right: &Limbs, length: usize) -> u64 {
+  let mut carry: u64 = 0
+  let mut i: usize = 0
+  while i < length {
+    let partial = u64.wrappingAdd(left.words[i], right.words[i])
+    let first = carryOf(left.words[i], right.words[i], partial)
+    let sum = u64.wrappingAdd(partial, carry)
+    let second = carryOf(partial, carry, sum)
+    result.words[i] = sum
+    carry = u64.bitOr(first, second)
+    i = i + 1
+  }
+  return carry
+}
+
+// Reads big-endian bytes, at most 72, into limbs.
+fn limbsFromBytes(bytes: &[u8]) -> Limbs {
+  let mut result = zeroLimbs()
+  let mut i: usize = 0
+  while i < bytes.length {
+    let position = bytes.length - 1 - i
+    let word = i / 8
+    result.words[word] = u64.bitOr(
+      result.words[word],
+      u64.shiftLeft(u8.toU64(bytes[position]), usize.toU64(8 * (i % 8))),
+    )
+    i = i + 1
+  }
+  return result
+}
+
+// Writes the low `output.length` bytes of the value, big-endian.
+fn limbsToBytes(value: &Limbs, output: &mut [u8]) -> () {
+  let mut i: usize = 0
+  while i < output.length {
+    let position = output.length - 1 - i
+    output[position] = u64.toU8(
+      u64.bitAnd(u64.shiftRight(value.words[i / 8], usize.toU64(8 * (i % 8))), 255),
+    )
+    i = i + 1
+  }
+}
+
+fn bitLengthOf(value: &Limbs) -> usize {
+  let mut i = LIMBS
+  while i > 0 {
+    i = i - 1
+    if value.words[i] != 0 {
+      return 64 * i + 64 - u32.toUsize(u64.leadingZeros(value.words[i]))
+    }
+  }
+  return 0
+}
+
+// A shift right by `count` bits, for public values.
+fn shiftRightLimbs(value: &Limbs, count: usize) -> Limbs {
+  let mut result = zeroLimbs()
+  let wordShift = count / 64
+  let bitShift = usize.toU64(count % 64)
+  let mut i: usize = 0
+  while i + wordShift < LIMBS {
+    let source = i + wordShift
+    let mut word = u64.shiftRight(value.words[source], bitShift)
+    if bitShift != 0 && source + 1 < LIMBS {
+      word = u64.bitOr(word, u64.shiftLeft(value.words[source + 1], 64 - bitShift))
+    }
+    result.words[i] = word
+    i = i + 1
+  }
+  return result
+}
+
+fn plainAddWord(value: &Limbs, word: u64) -> Limbs {
+  let mut result = zeroLimbs()
+  drop addInto(&mut result, value, &wordLimbs(word), LIMBS)
+  return result
+}
+
+fn plainSubtractWord(value: &Limbs, word: u64) -> Limbs {
+  let mut result = zeroLimbs()
+  drop subtractInto(&mut result, value, &wordLimbs(word), LIMBS)
+  return result
+}
+
+// Field arithmetic. Inputs are below the modulus; results are below it.
+
+fn makeField(modulus: &Limbs) -> Field {
+  let bits = bitLengthOf(modulus)
+  let length = (bits + 63) / 64
+  let first = modulus.words[0]
+  // Newton's iteration doubles the correct low bits of the inverse: 3, 6, 12, 24, 48, 96.
+  let mut inverse = first
+  let mut i: usize = 0
+  while i < 5 {
+    inverse = u64.wrappingMultiply(inverse, u64.wrappingSubtract(2, u64.wrappingMultiply(first, inverse)))
+    i = i + 1
+  }
+  let mut field = Field {
+    modulus: modulus.*,
+    length: length,
+    bits: bits,
+    inverse: u64.wrappingSubtract(0, inverse),
+    one: zeroLimbs(),
+    squared: zeroLimbs(),
+  }
+  // 2^(64 * length) and 2^(128 * length) modulo the modulus, one doubling at a time from 1.
+  let mut value = wordLimbs(1)
+  i = 0
+  while i < 64 * length {
+    value = fieldAdd(&field, &value, &value)
+    i = i + 1
+  }
+  field.one = value
+  i = 0
+  while i < 64 * length {
+    value = fieldAdd(&field, &value, &value)
+    i = i + 1
+  }
+  field.squared = value
+  return field
+}
+
+fn fieldAdd(field: &Field, left: &Limbs, right: &Limbs) -> Limbs {
+  let length = field.length
+  let mut sum = zeroLimbs()
+  let carry = addInto(&mut sum, left, right, length)
+  let mut reduced = zeroLimbs()
+  let borrow = subtractInto(&mut reduced, &sum, &field.modulus, length)
+  // Keep the reduced value when the sum overflowed or did not go below zero.
+  let keep = u64.bitOr(carry, u64.bitXor(borrow, 1))
+  return selectLimbs(maskOf(keep), &reduced, &sum, length)
+}
+
+fn fieldSubtract(field: &Field, left: &Limbs, right: &Limbs) -> Limbs {
+  let length = field.length
+  let mut difference = zeroLimbs()
+  let borrow = subtractInto(&mut difference, left, right, length)
+  let mut corrected = zeroLimbs()
+  drop addInto(&mut corrected, &difference, &field.modulus, length)
+  return selectLimbs(maskOf(borrow), &corrected, &difference, length)
+}
+
+// Montgomery multiplication: left * right / R modulo the modulus (CIOS).
+fn fieldMultiply(field: &Field, left: &Limbs, right: &Limbs) -> Limbs {
+  let length = field.length
+  let mut t: [u64; 11] = [0; 11]
+  let mut i: usize = 0
+  while i < length {
+    let factor = right.words[i]
+    let mut carry: u64 = 0
+    let mut j: usize = 0
+    while j < length {
+      let low = u64.wrappingMultiply(left.words[j], factor)
+      let high = u64.multiplyHigh(left.words[j], factor)
+      let partial = u64.wrappingAdd(low, t[j])
+      let first = carryOf(low, t[j], partial)
+      let sum = u64.wrappingAdd(partial, carry)
+      let second = carryOf(partial, carry, sum)
+      t[j] = sum
+      carry = u64.wrappingAdd(high, u64.wrappingAdd(first, second))
+      j = j + 1
+    }
+    let top = u64.wrappingAdd(t[length], carry)
+    t[length + 1] = carryOf(t[length], carry, top)
+    t[length] = top
+    let reducer = u64.wrappingMultiply(t[0], field.inverse)
+    let low = u64.wrappingMultiply(reducer, field.modulus.words[0])
+    let high = u64.multiplyHigh(reducer, field.modulus.words[0])
+    let partial = u64.wrappingAdd(low, t[0])
+    carry = u64.wrappingAdd(high, carryOf(low, t[0], partial))
+    j = 1
+    while j < length {
+      let productLow = u64.wrappingMultiply(reducer, field.modulus.words[j])
+      let productHigh = u64.multiplyHigh(reducer, field.modulus.words[j])
+      let partialSum = u64.wrappingAdd(productLow, t[j])
+      let first = carryOf(productLow, t[j], partialSum)
+      let sum = u64.wrappingAdd(partialSum, carry)
+      let second = carryOf(partialSum, carry, sum)
+      t[j - 1] = sum
+      carry = u64.wrappingAdd(productHigh, u64.wrappingAdd(first, second))
+      j = j + 1
+    }
+    let last = u64.wrappingAdd(t[length], carry)
+    t[length - 1] = last
+    t[length] = u64.wrappingAdd(t[length + 1], carryOf(t[length], carry, last))
+    t[length + 1] = 0
+    i = i + 1
+  }
+  let mut value = zeroLimbs()
+  i = 0
+  while i < length {
+    value.words[i] = t[i]
+    i = i + 1
+  }
+  let mut reduced = zeroLimbs()
+  let borrow = subtractInto(&mut reduced, &value, &field.modulus, length)
+  let keep = u64.bitOr(t[length], u64.bitXor(borrow, 1))
+  return selectLimbs(maskOf(keep), &reduced, &value, length)
+}
+
+fn toMontgomery(field: &Field, value: &Limbs) -> Limbs {
+  return fieldMultiply(field, value, &field.squared)
+}
+
+fn fromMontgomery(field: &Field, value: &Limbs) -> Limbs {
+  return fieldMultiply(field, value, &wordLimbs(1))
+}
+
+// base^exponent for a Montgomery base and a public exponent.
+fn fieldPower(field: &Field, base: &Limbs, exponent: &Limbs) -> Limbs {
+  let mut result = field.one
+  let mut index = bitLengthOf(exponent)
+  while index > 0 {
+    index = index - 1
+    result = fieldMultiply(field, &result, &result)
+    if u64.bitAnd(u64.shiftRight(exponent.words[index / 64], usize.toU64(index % 64)), 1) == 1 {
+      result = fieldMultiply(field, &result, base)
+    }
+  }
+  return result
+}
+
+// The inverse of a Montgomery value modulo a prime, by Fermat's little theorem. 0 gives 0.
+fn fieldInvert(field: &Field, value: &Limbs) -> Limbs {
+  return fieldPower(field, value, &plainSubtractWord(&field.modulus, 2))
+}
+
+// A plain value of up to `bits` bits modulo the modulus, one bit at a time.
+fn fieldReduce(field: &Field, value: &Limbs, bits: usize) -> Limbs {
+  let mut result = zeroLimbs()
+  let mut index = bits
+  while index > 0 {
+    index = index - 1
+    result = fieldAdd(field, &result, &result)
+    let bit = u64.bitAnd(u64.shiftRight(value.words[index / 64], usize.toU64(index % 64)), 1)
+    result = fieldAdd(field, &result, &wordLimbs(bit))
+  }
+  return result
+}
+
+// A square root of a Montgomery value, for public values (Tonelli-Shanks), or None.
+fn fieldSquareRoot(field: &Field, value: &Limbs) -> Option<Limbs> {
+  let length = field.length
+  let modulus = &field.modulus
+  let mut root = zeroLimbs()
+  if u64.bitAnd(modulus.words[0], 3) == 3 {
+    root = fieldPower(field, value, &shiftRightLimbs(&plainAddWord(modulus, 1), 2))
+  } else {
+    // p - 1 = q * 2^s with q odd.
+    let below = plainSubtractWord(modulus, 1)
+    let mut s: usize = 0
+    while u64.bitAnd(u64.shiftRight(below.words[s / 64], usize.toU64(s % 64)), 1) == 0 {
+      s = s + 1
+    }
+    let q = shiftRightLimbs(&below, s)
+    let half = shiftRightLimbs(&below, 1)
+    let minusOne = fieldSubtract(field, &zeroLimbs(), &field.one)
+    let mut candidate: u64 = 2
+    let mut nonResidue = toMontgomery(field, &wordLimbs(candidate))
+    while equalBit(&fieldPower(field, &nonResidue, &half), &minusOne, length) == 0 {
+      candidate = candidate + 1
+      nonResidue = toMontgomery(field, &wordLimbs(candidate))
+    }
+    let mut m = s
+    let mut c = fieldPower(field, &nonResidue, &q)
+    let mut t = fieldPower(field, value, &q)
+    root = fieldPower(field, value, &shiftRightLimbs(&plainAddWord(&q, 1), 1))
+    while equalBit(&t, &field.one, length) == 0 && isZeroBit(&t, length) == 0 {
+      let mut i: usize = 0
+      let mut probe = t
+      while equalBit(&probe, &field.one, length) == 0 {
+        probe = fieldMultiply(field, &probe, &probe)
+        i = i + 1
+        if i == m {
+          return Option<Limbs>.none()
+        }
+      }
+      let mut b = c
+      let mut j: usize = 0
+      while j + i + 1 < m {
+        b = fieldMultiply(field, &b, &b)
+        j = j + 1
+      }
+      m = i
+      c = fieldMultiply(field, &b, &b)
+      t = fieldMultiply(field, &t, &c)
+      root = fieldMultiply(field, &root, &b)
+    }
+  }
+  if equalBit(&fieldMultiply(field, &root, &root), value, length) == 0 {
+    return Option<Limbs>.none()
+  }
+  return Option<Limbs>.some(root)
+}
+
+// Points.
+
+fn identity(group: &EcGroup) -> Point {
+  return Point { x: zeroLimbs(), y: group.field.one, z: zeroLimbs() }
+}
+
+fn selectPoint(mask: u64, ifSet: &Point, ifClear: &Point, length: usize) -> Point {
+  return Point {
+    x: selectLimbs(mask, &ifSet.x, &ifClear.x, length),
+    y: selectLimbs(mask, &ifSet.y, &ifClear.y, length),
+    z: selectLimbs(mask, &ifSet.z, &ifClear.z, length),
+  }
+}
+
+// Complete addition for any a (Renes, Costello, Batina 2016, algorithm 1).
+fn addPoints(group: &EcGroup, p: &Point, q: &Point) -> Point {
+  let f = &group.field
+  let mut t0 = fieldMultiply(f, &p.x, &q.x)
+  let mut t1 = fieldMultiply(f, &p.y, &q.y)
+  let mut t2 = fieldMultiply(f, &p.z, &q.z)
+  let mut t3 = fieldAdd(f, &p.x, &p.y)
+  let mut t4 = fieldAdd(f, &q.x, &q.y)
+  t3 = fieldMultiply(f, &t3, &t4)
+  t4 = fieldAdd(f, &t0, &t1)
+  t3 = fieldSubtract(f, &t3, &t4)
+  t4 = fieldAdd(f, &p.x, &p.z)
+  let mut t5 = fieldAdd(f, &q.x, &q.z)
+  t4 = fieldMultiply(f, &t4, &t5)
+  t5 = fieldAdd(f, &t0, &t2)
+  t4 = fieldSubtract(f, &t4, &t5)
+  t5 = fieldAdd(f, &p.y, &p.z)
+  let mut x3 = fieldAdd(f, &q.y, &q.z)
+  t5 = fieldMultiply(f, &t5, &x3)
+  x3 = fieldAdd(f, &t1, &t2)
+  t5 = fieldSubtract(f, &t5, &x3)
+  let mut z3 = fieldMultiply(f, &group.a, &t4)
+  x3 = fieldMultiply(f, &group.b3, &t2)
+  z3 = fieldAdd(f, &x3, &z3)
+  x3 = fieldSubtract(f, &t1, &z3)
+  z3 = fieldAdd(f, &t1, &z3)
+  let mut y3 = fieldMultiply(f, &x3, &z3)
+  t1 = fieldAdd(f, &t0, &t0)
+  t1 = fieldAdd(f, &t1, &t0)
+  t2 = fieldMultiply(f, &group.a, &t2)
+  t4 = fieldMultiply(f, &group.b3, &t4)
+  t1 = fieldAdd(f, &t1, &t2)
+  t2 = fieldSubtract(f, &t0, &t2)
+  t2 = fieldMultiply(f, &group.a, &t2)
+  t4 = fieldAdd(f, &t4, &t2)
+  t0 = fieldMultiply(f, &t1, &t4)
+  y3 = fieldAdd(f, &y3, &t0)
+  t0 = fieldMultiply(f, &t5, &t4)
+  x3 = fieldMultiply(f, &t3, &x3)
+  x3 = fieldSubtract(f, &x3, &t0)
+  t0 = fieldMultiply(f, &t3, &t1)
+  z3 = fieldMultiply(f, &t5, &z3)
+  z3 = fieldAdd(f, &z3, &t0)
+  return Point { x: x3, y: y3, z: z3 }
+}
+
+// Complete doubling for any a (Renes, Costello, Batina 2016, algorithm 3).
+fn doublePoint(group: &EcGroup, p: &Point) -> Point {
+  let f = &group.field
+  let mut t0 = fieldMultiply(f, &p.x, &p.x)
+  let t1 = fieldMultiply(f, &p.y, &p.y)
+  let mut t2 = fieldMultiply(f, &p.z, &p.z)
+  let mut t3 = fieldMultiply(f, &p.x, &p.y)
+  t3 = fieldAdd(f, &t3, &t3)
+  let mut z3 = fieldMultiply(f, &p.x, &p.z)
+  z3 = fieldAdd(f, &z3, &z3)
+  let mut x3 = fieldMultiply(f, &group.a, &z3)
+  let mut y3 = fieldMultiply(f, &group.b3, &t2)
+  y3 = fieldAdd(f, &x3, &y3)
+  x3 = fieldSubtract(f, &t1, &y3)
+  y3 = fieldAdd(f, &t1, &y3)
+  y3 = fieldMultiply(f, &x3, &y3)
+  x3 = fieldMultiply(f, &t3, &x3)
+  z3 = fieldMultiply(f, &group.b3, &z3)
+  t2 = fieldMultiply(f, &group.a, &t2)
+  t3 = fieldSubtract(f, &t0, &t2)
+  t3 = fieldMultiply(f, &group.a, &t3)
+  t3 = fieldAdd(f, &t3, &z3)
+  z3 = fieldAdd(f, &t0, &t0)
+  t0 = fieldAdd(f, &z3, &t0)
+  t0 = fieldAdd(f, &t0, &t2)
+  t0 = fieldMultiply(f, &t0, &t3)
+  y3 = fieldAdd(f, &y3, &t0)
+  t2 = fieldMultiply(f, &p.y, &p.z)
+  t2 = fieldAdd(f, &t2, &t2)
+  t0 = fieldMultiply(f, &t2, &t3)
+  x3 = fieldSubtract(f, &x3, &t0)
+  z3 = fieldMultiply(f, &t2, &t1)
+  z3 = fieldAdd(f, &z3, &z3)
+  z3 = fieldAdd(f, &z3, &z3)
+  return Point { x: x3, y: y3, z: z3 }
+}
+
+// The multiples 0 to 15 of a point, for a 4-bit window.
+fn windowTable(group: &EcGroup, point: &Point) -> [Point; 16] {
+  let mut table: [Point; 16] = [identity(group); 16]
+  table[1] = point.*
+  let mut index: usize = 2
+  while index < 16 {
+    if index % 2 == 0 {
+      table[index] = doublePoint(group, &table[index / 2])
+    } else {
+      table[index] = addPoints(group, &table[index - 1], point)
+    }
+    index = index + 1
+  }
+  return table
+}
+
+// The entry of the table for the 4-bit digit `window` of the scalar, read so that every entry is
+// touched and the time does not depend on the digit.
+fn windowEntry(group: &EcGroup, table: &[Point; 16], scalar: &Limbs, window: usize) -> Point {
+  let position = 4 * window
+  let digit = u64.bitAnd(u64.shiftRight(scalar.words[position / 64], usize.toU64(position % 64)), 15)
+  let mut entry = table[0]
+  let mut candidate: usize = 1
+  while candidate < 16 {
+    let mask = maskOf(zeroWord(u64.bitXor(digit, usize.toU64(candidate))))
+    entry = selectPoint(mask, &table[candidate], &entry, group.field.length)
+    candidate = candidate + 1
+  }
+  return entry
+}
+
+fn quadruple(group: &EcGroup, point: &Point) -> Point {
+  let twice = doublePoint(group, point)
+  let four = doublePoint(group, &twice)
+  let eight = doublePoint(group, &four)
+  return doublePoint(group, &eight)
+}
+
+// scalar * point for a plain scalar of up to `bits` bits, with a fixed 4-bit window, so the time
+// does not depend on the scalar.
+fn multiplyPoint(group: &EcGroup, point: &Point, scalar: &Limbs, bits: usize) -> Point {
+  let table = windowTable(group, point)
+  let mut result = identity(group)
+  let mut window = (bits + 3) / 4
+  while window > 0 {
+    window = window - 1
+    result = quadruple(group, &result)
+    result = addPoints(group, &result, &windowEntry(group, &table, scalar, window))
+  }
+  return result
+}
+
+// first * p + second * q with shared doublings, for verification.
+fn multiplyTwo(
+  group: &EcGroup,
+  p: &Point,
+  first: &Limbs,
+  q: &Point,
+  second: &Limbs,
+  bits: usize,
+) -> Point {
+  let firstTable = windowTable(group, p)
+  let secondTable = windowTable(group, q)
+  let mut result = identity(group)
+  let mut window = (bits + 3) / 4
+  while window > 0 {
+    window = window - 1
+    result = quadruple(group, &result)
+    result = addPoints(group, &result, &windowEntry(group, &firstTable, first, window))
+    result = addPoints(group, &result, &windowEntry(group, &secondTable, second, window))
+  }
+  return result
+}
+
+// Affine Montgomery coordinates of a point, or None for the point at infinity or an invalid
+// result of the formulas (Z = 0).
+fn affine(group: &EcGroup, point: &Point) -> Option<Point> {
+  let f = &group.field
+  if isZeroBit(&point.z, f.length) == 1 {
+    return Option<Point>.none()
+  }
+  let inverse = fieldInvert(f, &point.z)
+  return Option<Point>.some(
+    Point {
+      x: fieldMultiply(f, &point.x, &inverse),
+      y: fieldMultiply(f, &point.y, &inverse),
+      z: f.one,
+    },
+  )
+}
+
+// Whether the projective point is the point at infinity: Z = 0 and Y != 0.
+fn isInfinity(group: &EcGroup, point: &Point) -> bool {
+  let length = group.field.length
+  return isZeroBit(&point.z, length) == 1 && isZeroBit(&point.y, length) == 0
+}
+
+// y^2 = x^3 + ax + b for affine Montgomery coordinates.
+fn onCurve(group: &EcGroup, x: &Limbs, y: &Limbs) -> bool {
+  let f = &group.field
+  let left = fieldMultiply(f, y, y)
+  return equalBit(&left, &rightSide(group, x), f.length) == 1
+}
+
+// x^3 + ax + b for a Montgomery x.
+fn rightSide(group: &EcGroup, x: &Limbs) -> Limbs {
+  let f = &group.field
+  let squared = fieldMultiply(f, x, x)
+  let withA = fieldAdd(f, &squared, &group.a)
+  return fieldAdd(f, &fieldMultiply(f, &withA, x), &group.b)
+}
+
+fn plainParity(group: &EcGroup, y: &Limbs) -> u64 {
+  return u64.bitAnd(fromMontgomery(&group.field, y).words[0], 1)
+}
+
+// The parameters of a curve as big-endian bytes: the prime, a and b, the base point, the order,
+// and the cofactor.
+struct CurveData {
+  prime: &'static [u8],
+  a: &'static [u8],
+  b: &'static [u8],
+  x: &'static [u8],
+  y: &'static [u8],
+  order: &'static [u8],
+  cofactor: u32,
+}
+
+impl EcGroup {
+  /// Returns the group of the named curve `curve`.
+  pub fn named(curve: EcCurve) -> EcGroup {
+    let data = curveData(curve)
+    let field = makeField(&limbsFromBytes(data.prime))
+    let order = makeField(&limbsFromBytes(data.order))
+    let a = toMontgomery(&field, &limbsFromBytes(data.a))
+    let b = toMontgomery(&field, &limbsFromBytes(data.b))
+    let b3 = fieldAdd(&field, &b, &fieldAdd(&field, &b, &b))
+    let base = Point {
+      x: toMontgomery(&field, &limbsFromBytes(data.x)),
+      y: toMontgomery(&field, &limbsFromBytes(data.y)),
+      z: field.one,
+    }
+    return EcGroup {
+      curveName: curve,
+      field: field,
+      order: order,
+      a: a,
+      b: b,
+      b3: b3,
+      base: base,
+      cofactorValue: data.cofactor,
+      fieldBytes: data.prime.length,
+      orderBytes: data.order.length,
+    }
+  }
+
+  /// Returns the named curve of the group.
+  pub fn curve(self: &Self) -> EcCurve {
+    return self.curveName
+  }
+
+  /// Returns the number of bits of the prime `p`, such as 256 for brainpoolP256r1.
+  pub fn fieldBits(self: &Self) -> usize {
+    return self.field.bits
+  }
+
+  /// Returns the number of bits of the order `n` of the base point, such as 161 for secp160r1.
+  pub fn orderBits(self: &Self) -> usize {
+    return self.order.bits
+  }
+
+  /// Returns the cofactor: the number of points of the curve divided by `n`, such as 1 for most
+  /// curves and 4 for `secp112r2`.
+  pub fn cofactor(self: &Self) -> u32 {
+    return self.cofactorValue
+  }
+
+  /// Returns the length in bytes of a field element: the length of a shared secret from
+  /// [`EcPrivateKey.agree`] and of each coordinate of an encoded point.
+  pub fn fieldLength(self: &Self) -> usize {
+    return self.fieldBytes
+  }
+
+  /// Returns the length in bytes of a secret, which is the byte length of `n`.
+  pub fn secretLength(self: &Self) -> usize {
+    return self.orderBytes
+  }
+
+  /// Returns the length in bytes of a signature in the `r || s` form: twice
+  /// [`EcGroup.secretLength`].
+  pub fn signatureLength(self: &Self) -> usize {
+    return 2 * self.orderBytes
+  }
+
+  /// Returns the length in bytes of a point encoded in `format`: [`EcGroup.fieldBytes`] plus 1
+  /// when compressed, and twice it plus 1 otherwise.
+  pub fn encodedLength(self: &Self, format: EcPointFormat) -> usize {
+    return match format {
+      EcPointFormat.Compressed => self.fieldBytes + 1
+      EcPointFormat.Uncompressed => 2 * self.fieldBytes + 1
+      EcPointFormat.Hybrid => 2 * self.fieldBytes + 1
+    }
+  }
+}
+
+// The affine point of a SEC1 encoding with Montgomery coordinates, or None.
+fn decodePoint(group: &EcGroup, encoded: &[u8]) -> Option<Point> {
+  let f = &group.field
+  let length = group.fieldBytes
+  if encoded.length == 0 {
+    return Option<Point>.none()
+  }
+  let tag = encoded[0]
+  let compressed = (tag == 2 || tag == 3) && encoded.length == length + 1
+  let full = (tag == 4 || tag == 6 || tag == 7) && encoded.length == 2 * length + 1
+  if !compressed && !full {
+    return Option<Point>.none()
+  }
+  let xPlain = limbsFromBytes(Slice.view<u8>(encoded, 1, length))
+  if lessBit(&xPlain, &f.modulus, f.length) == 0 {
+    return Option<Point>.none()
+  }
+  let x = toMontgomery(f, &xPlain)
+  let mut y = zeroLimbs()
+  if compressed {
+    y = match fieldSquareRoot(f, &rightSide(group, &x)) {
+      Option<Limbs>.Some { value } => value
+      Option<Limbs>.None => {
+        return Option<Point>.none()
+      }
+    }
+    if plainParity(group, &y) != u8.toU64(u8.bitAnd(tag, 1)) {
+      y = fieldSubtract(f, &zeroLimbs(), &y)
+      if plainParity(group, &y) != u8.toU64(u8.bitAnd(tag, 1)) {
+        return Option<Point>.none()
+      }
+    }
+  } else {
+    let yPlain = limbsFromBytes(Slice.view<u8>(encoded, 1 + length, length))
+    if lessBit(&yPlain, &f.modulus, f.length) == 0 {
+      return Option<Point>.none()
+    }
+    y = toMontgomery(f, &yPlain)
+    if !onCurve(group, &x, &y) {
+      return Option<Point>.none()
+    }
+    if tag != 4 && u64.bitAnd(yPlain.words[0], 1) != u8.toU64(u8.bitAnd(tag, 1)) {
+      return Option<Point>.none()
+    }
+  }
+  let point = Point { x: x, y: y, z: f.one }
+  if group.cofactorValue != 1 {
+    let check = multiplyPoint(group, &point, &group.order.modulus, group.order.bits)
+    if !isInfinity(group, &check) {
+      return Option<Point>.none()
+    }
+  }
+  return Option<Point>.some(point)
+}
+
+fn writePoint(group: &EcGroup, x: &Limbs, y: &Limbs, format: EcPointFormat, output: &mut [u8]) -> usize {
+  let f = &group.field
+  let length = group.fieldBytes
+  let xPlain = fromMontgomery(f, x)
+  let yPlain = fromMontgomery(f, y)
+  let parity = u64.toU8(u64.bitAnd(yPlain.words[0], 1))
+  limbsToBytes(&xPlain, Slice.viewMut<u8>(&mut output, 1, length))
+  return match format {
+    EcPointFormat.Compressed => {
+      output[0] = 2 + parity
+      return length + 1
+    }
+    EcPointFormat.Uncompressed => {
+      output[0] = 4
+      limbsToBytes(&yPlain, Slice.viewMut<u8>(&mut output, 1 + length, length))
+      return 2 * length + 1
+    }
+    EcPointFormat.Hybrid => {
+      output[0] = 6 + parity
+      limbsToBytes(&yPlain, Slice.viewMut<u8>(&mut output, 1 + length, length))
+      return 2 * length + 1
+    }
+  }
+}
+
+// The leftmost bits of the digest, at most as many as n has, reduced modulo n.
+fn digestScalar(group: &EcGroup, digest: &[u8]) -> Limbs {
+  let bits = group.order.bits
+  let mut take = digest.length
+  if take > group.orderBytes {
+    take = group.orderBytes
+  }
+  let mut value = limbsFromBytes(Slice.view<u8>(digest, 0, take))
+  if 8 * take > bits {
+    value = shiftRightLimbs(&value, 8 * take - bits)
+  }
+  return fieldReduce(&group.order, &value, bits)
+}
+
+// A uniform scalar from 1 to n - 1, by rejection: the rejected draws are independent of the
+// result, so the time reveals nothing about it.
+effect fn randomScalar(group: &EcGroup) -> Limbs
+  ? &mut Random {
+  let length = group.orderBytes
+  let excess = 8 * length - group.order.bits
+  let mut bytes: [u8; 72] = [0; 72]
+  while true {
+    run Random.fillBytes(Slice.viewMut<u8>(&mut bytes, 0, length))
+    bytes[0] = u8.bitAnd(bytes[0], u32.toU8(u32.shiftRight(255, usize.toU32(excess))))
+    let value = limbsFromBytes(Slice.view<u8>(&bytes, 0, length))
+    let valid = u64.bitAnd(
+      u64.bitXor(isZeroBit(&value, group.order.length), 1),
+      lessBit(&value, &group.order.modulus, group.order.length),
+    )
+    if valid == 1 {
+      return value
+    }
+  }
+  return Intrinsic.trap("randomScalar: the loop returns")
+}
+
+fn keyFor(group: &EcGroup, secret: &Limbs) -> EcPrivateKey {
+  let product = multiplyPoint(group, &group.base, secret, group.order.bits)
+  let point = match affine(group, &product) {
+    Option<Point>.Some { value } => value
+    Option<Point>.None => Intrinsic.trap("EcPrivateKey: the public point is at infinity")
+  }
+  return EcPrivateKey {
+    public: EcPublicKey { domain: group.*, x: point.x, y: point.y },
+    secret: secret.*,
+  }
+}
+
+fn affinePoint(key: &EcPublicKey) -> Point {
+  return Point { x: key.x, y: key.y, z: key.domain.field.one }
+}
+
+impl EcPublicKey {
+  /// Returns the public key for the SEC1 point `encoded` on `group`: compressed, uncompressed,
+  /// or hybrid, as Node.js `ecdh.computeSecret` and `ECDH.convertKey` accept.
+  ///
+  /// The time depends on the point, which is public.
+  ///
+  /// # Errors
+  /// - `InvalidPoint` if the encoding is not valid, a coordinate is not less than `p`, the point
+  ///   is not on the curve, a hybrid parity does not match `y`, or, on a curve with a cofactor
+  ///   other than 1, the point is not in the subgroup of the base point. The point at infinity
+  ///   is rejected.
+  pub fn fromBytes(group: &EcGroup, encoded: &[u8]) -> Result<EcPublicKey, EcError> {
+    return match decodePoint(group, encoded) {
+      Option<Point>.Some { value } => Result<EcPublicKey, EcError>.succeed(
+        EcPublicKey { domain: group.*, x: value.x, y: value.y },
+      )
+      Option<Point>.None => Result<EcPublicKey, EcError>.failResult(EcError.InvalidPoint)
+    }
+  }
+
+  /// Returns the group of the key.
+  pub fn group(self: &Self) -> EcGroup {
+    return self.domain
+  }
+
+  /// Writes the point in `format` to the start of `output`, and returns its length, which is
+  /// [`EcGroup.encodedLength`]. The bytes of `output` after it do not change.
+  ///
+  /// # Errors
+  /// - `InvalidLength` if `output` is shorter than the encoding.
+  pub fn write(self: &Self, format: EcPointFormat, output: &mut [u8]) -> Result<usize, EcError> {
+    if output.length < self.domain.encodedLength(format) {
+      return Result<usize, EcError>.failResult(EcError.InvalidLength)
+    }
+    return Result<usize, EcError>.succeed(writePoint(&self.domain, &self.x, &self.y, format, &mut output))
+  }
+
+  /// Checks that `signature` is a valid ECDSA signature in the `r || s` form of the message with
+  /// the digest `digest`.
+  ///
+  /// A digest longer than `n` keeps its leftmost [`EcGroup.orderBits`] bits, as OpenSSL does.
+  ///
+  /// # Errors
+  /// - `InvalidLength` if `signature` is not [`EcGroup.signatureLength`] bytes.
+  /// - `InvalidSignature` if `r` or `s` is not from 1 to `n - 1`, or the signature does not
+  ///   match.
+  pub fn verifyDigest(self: &Self, digest: &[u8], signature: &[u8]) -> Result<(), EcError> {
+    let group = &self.domain
+    let half = group.orderBytes
+    if signature.length != 2 * half {
+      return Result<(), EcError>.failResult(EcError.InvalidLength)
+    }
+    let order = &group.order
+    let r = limbsFromBytes(Slice.view<u8>(signature, 0, half))
+    let s = limbsFromBytes(Slice.view<u8>(signature, half, half))
+    if isZeroBit(&r, order.length) == 1 || isZeroBit(&s, order.length) == 1
+      || lessBit(&r, &order.modulus, order.length) == 0
+      || lessBit(&s, &order.modulus, order.length) == 0 {
+      return Result<(), EcError>.failResult(EcError.InvalidSignature)
+    }
+    let z = digestScalar(group, digest)
+    let w = fieldInvert(order, &toMontgomery(order, &s))
+    let first = fromMontgomery(order, &fieldMultiply(order, &toMontgomery(order, &z), &w))
+    let second = fromMontgomery(order, &fieldMultiply(order, &toMontgomery(order, &r), &w))
+    let sum = multiplyTwo(group, &group.base, &first, &affinePoint(self), &second, order.bits)
+    let point = match affine(group, &sum) {
+      Option<Point>.Some { value } => value
+      Option<Point>.None => {
+        return Result<(), EcError>.failResult(EcError.InvalidSignature)
+      }
+    }
+    let x = fromMontgomery(&group.field, &point.x)
+    let v = fieldReduce(order, &x, group.field.bits)
+    if equalBit(&v, &r, order.length) == 0 {
+      return Result<(), EcError>.failResult(EcError.InvalidSignature)
+    }
+    return Result<(), EcError>.succeed(())
+  }
+}
+
+impl EcPrivateKey {
+  /// Returns a new key on `group`, with a secret from the ambient `Random`.
+  ///
+  /// The secret is uniform from 1 to `n - 1`. The time of the public point does not depend on
+  /// the secret. The `Random` provider must be cryptographically secure.
+  pub effect fn generate(group: &EcGroup) -> EcPrivateKey
+    ? &mut Random {
+    let secret = run randomScalar(group)
+    return keyFor(group, &secret)
+  }
+
+  /// Returns the private key for the big-endian secret `secret` on `group`, and computes its
+  /// public point, as Node.js `ecdh.setPrivateKey` does. Leading zero bytes are allowed.
+  ///
+  /// The time depends only on the length of `secret`.
+  ///
+  /// # Errors
+  /// - `InvalidKey` if the secret is 0 or not less than `n`.
+  pub fn fromBytes(group: &EcGroup, secret: &[u8]) -> Result<EcPrivateKey, EcError> {
+    let mut start: usize = 0
+    let mut overflow: u8 = 0
+    if secret.length > 72 {
+      start = secret.length - 72
+      let mut i: usize = 0
+      while i < start {
+        overflow = u8.bitOr(overflow, secret[i])
+        i = i + 1
+      }
+    }
+    let value = limbsFromBytes(Slice.view<u8>(secret, start, secret.length - start))
+    let order = &group.order
+    let mut high: u64 = 0
+    let mut i = order.length
+    while i < LIMBS {
+      high = u64.bitOr(high, value.words[i])
+      i = i + 1
+    }
+    let valid = u64.bitAnd(
+      u64.bitAnd(zeroWord(u64.bitOr(high, u8.toU64(overflow))), u64.bitXor(isZeroBit(&value, order.length), 1)),
+      lessBit(&value, &order.modulus, order.length),
+    )
+    if valid == 0 {
+      return Result<EcPrivateKey, EcError>.failResult(EcError.InvalidKey)
+    }
+    return Result<EcPrivateKey, EcError>.succeed(keyFor(group, &value))
+  }
+
+  /// Returns the group of the key.
+  pub fn group(self: &Self) -> EcGroup {
+    return self.public.domain
+  }
+
+  /// Returns the public half of the key.
+  pub fn publicKey(self: &Self) -> EcPublicKey {
+    return self.public
+  }
+
+  /// Writes the secret to all of `output`, big-endian with leading zero bytes, as Node.js
+  /// `ecdh.getPrivateKey` does.
+  ///
+  /// # Errors
+  /// - `InvalidLength` if `output` is not [`EcGroup.secretLength`] bytes.
+  ///
+  /// # Gotchas
+  /// The bytes are the private key. Keep them secret.
+  pub fn writeSecret(self: &Self, output: &mut [u8]) -> Result<(), EcError> {
+    if output.length != self.public.domain.orderBytes {
+      return Result<(), EcError>.failResult(EcError.InvalidLength)
+    }
+    limbsToBytes(&self.secret, &mut output)
+    return Result<(), EcError>.succeed(())
+  }
+
+  /// Signs the message with the digest `digest` with ECDSA and writes the signature to
+  /// `signature` in the `r || s` form. It reads the per-signature secret `k` from the ambient
+  /// `Random`.
+  ///
+  /// A digest longer than `n` keeps its leftmost [`EcGroup.orderBits`] bits, as OpenSSL does. The
+  /// time does not depend on the secret or on `k`.
+  ///
+  /// # Errors
+  /// - `InvalidLength` if `signature` is not [`EcGroup.signatureLength`] bytes.
+  ///
+  /// # Gotchas
+  /// The `Random` provider must be cryptographically secure: a repeated or biased `k` reveals
+  /// the private key.
+  pub effect fn signDigest(self: &Self, digest: &[u8], signature: &mut [u8]) -> ()
+    ! EcError
+    ? &mut Random {
+    let group = &self.public.domain
+    let half = group.orderBytes
+    if signature.length != 2 * half {
+      fail EcError.InvalidLength
+    }
+    let order = &group.order
+    let z = toMontgomery(order, &digestScalar(group, digest))
+    let d = toMontgomery(order, &self.secret)
+    while true {
+      let k = run randomScalar(group)
+      let point = match affine(group, &multiplyPoint(group, &group.base, &k, order.bits)) {
+        Option<Point>.Some { value } => value
+        Option<Point>.None => Intrinsic.trap("signDigest: kG is at infinity")
+      }
+      let r = fieldReduce(order, &fromMontgomery(&group.field, &point.x), group.field.bits)
+      if isZeroBit(&r, order.length) == 1 {
+        continue
+      }
+      let inverse = fieldInvert(order, &toMontgomery(order, &k))
+      let sum = fieldAdd(order, &z, &fieldMultiply(order, &toMontgomery(order, &r), &d))
+      let s = fromMontgomery(order, &fieldMultiply(order, &inverse, &sum))
+      if isZeroBit(&s, order.length) == 1 {
+        continue
+      }
+      limbsToBytes(&r, Slice.viewMut<u8>(&mut signature, 0, half))
+      limbsToBytes(&s, Slice.viewMut<u8>(&mut signature, half, half))
+      return ()
+    }
+  }
+
+  /// Writes the shared secret with the peer key `peer` to `output`: the x-coordinate of `dQ`,
+  /// big-endian and [`EcGroup.fieldBytes`] bytes, as Node.js `ecdh.computeSecret` and
+  /// `crypto.diffieHellman` do.
+  ///
+  /// The time does not depend on the secret.
+  ///
+  /// # Errors
+  /// - `InvalidLength` if `output` is not [`EcGroup.fieldBytes`] bytes.
+  /// - `InvalidPoint` if `peer` is on another curve.
+  /// - `InvalidSharedSecret` if the shared point is the point at infinity.
+  ///
+  /// # Gotchas
+  /// Pass the secret through a key derivation function, such as `silk.crypto.hkdf`, before you
+  /// use it as a key.
+  pub fn agree(self: &Self, peer: &EcPublicKey, output: &mut [u8]) -> Result<(), EcError> {
+    let group = &self.public.domain
+    if output.length != group.fieldBytes {
+      return Result<(), EcError>.failResult(EcError.InvalidLength)
+    }
+    if peer.domain.curveName != group.curveName {
+      return Result<(), EcError>.failResult(EcError.InvalidPoint)
+    }
+    let product = multiplyPoint(group, &affinePoint(peer), &self.secret, group.order.bits)
+    let point = match affine(group, &product) {
+      Option<Point>.Some { value } => value
+      Option<Point>.None => {
+        return Result<(), EcError>.failResult(EcError.InvalidSharedSecret)
+      }
+    }
+    limbsToBytes(&fromMontgomery(&group.field, &point.x), &mut output)
+    return Result<(), EcError>.succeed(())
+  }
+}
+
+impl EcSignature {
+  /// Returns the length of the DER form of the `r || s` signature `signature`.
+  ///
+  /// # Gotchas
+  /// The program traps if `signature` has an odd length or is longer than 144 bytes.
+  pub fn derLength(signature: &[u8]) -> usize {
+    let half = halfOf(signature)
+    let content = signatureContentLength(signature, half)
+    return headerLength(content) + content
+  }
+
+  /// Writes the DER form of the `r || s` signature `signature` to the start of `output`, and
+  /// returns its length, which is [`EcSignature.derLength`]. The bytes of `output` after the DER
+  /// do not change.
+  ///
+  /// # Errors
+  /// - `InvalidLength` if `output` is shorter than the DER.
+  ///
+  /// # Gotchas
+  /// The program traps if `signature` has an odd length or is longer than 144 bytes.
+  pub fn toDer(signature: &[u8], output: &mut [u8]) -> Result<usize, EcError> {
+    let half = halfOf(signature)
+    let content = signatureContentLength(signature, half)
+    if output.length < headerLength(content) + content {
+      return Result<usize, EcError>.failResult(EcError.InvalidLength)
+    }
+    let mut at = writeHeader(&mut output, 0, 48, content)
+    at = writeInteger(&mut output, at, Slice.view<u8>(signature, 0, half))
+    at = writeInteger(&mut output, at, Slice.view<u8>(signature, half, half))
+    return Result<usize, EcError>.succeed(at)
+  }
+
+  /// Reads the DER signature `der` and writes it to all of `output` in the `r || s` form, each
+  /// half `output.length / 2` bytes, such as [`EcGroup.signatureLength`].
+  ///
+  /// # Errors
+  /// - `InvalidEncoding` if `der` is not strict DER of two non-negative integers.
+  /// - `InvalidSignature` if `r` or `s` is 0 or does not fit in half of `output`.
+  /// - `InvalidLength` if `output` has an odd length.
+  pub fn fromDer(der: &[u8], output: &mut [u8]) -> Result<(), EcError> {
+    if output.length % 2 != 0 {
+      return Result<(), EcError>.failResult(EcError.InvalidLength)
+    }
+    let half = output.length / 2
+    let sequence = readDer(der, 0, der.length, 48)
+    if !sequence.valid || sequence.end != der.length {
+      return Result<(), EcError>.failResult(EcError.InvalidEncoding)
+    }
+    let r = readInteger(der, sequence.start, sequence.end)
+    if !r.valid {
+      return Result<(), EcError>.failResult(EcError.InvalidEncoding)
+    }
+    let s = readInteger(der, r.end, sequence.end)
+    if !s.valid || s.end != sequence.end {
+      return Result<(), EcError>.failResult(EcError.InvalidEncoding)
+    }
+    let rBytes = significant(Slice.view<u8>(der, r.start, r.end - r.start))
+    let sBytes = significant(Slice.view<u8>(der, s.start, s.end - s.start))
+    if rBytes.length == 0 || sBytes.length == 0 || rBytes.length > half || sBytes.length > half {
+      return Result<(), EcError>.failResult(EcError.InvalidSignature)
+    }
+    let mut i: usize = 0
+    while i < output.length {
+      output[i] = 0
+      i = i + 1
+    }
+    i = 0
+    while i < rBytes.length {
+      output[half - rBytes.length + i] = rBytes[i]
+      i = i + 1
+    }
+    i = 0
+    while i < sBytes.length {
+      output[output.length - sBytes.length + i] = sBytes[i]
+      i = i + 1
+    }
+    return Result<(), EcError>.succeed(())
+  }
+}
+
+fn halfOf(signature: &[u8]) -> usize {
+  if signature.length % 2 != 0 || signature.length > 144 {
+    Intrinsic.trap("EcSignature: the signature is not r || s")
+  }
+  return signature.length / 2
+}
+
+// Skips leading zero bytes. Only for public values: the time depends on the count.
+fn significant<'a>(bytes: &'a [u8]) -> &'a [u8] {
+  let mut start: usize = 0
+  while start < bytes.length && bytes[start] == 0 {
+    start = start + 1
+  }
+  return Slice.view<u8>(bytes, start, bytes.length - start)
+}
+
+// The content length of a DER INTEGER for big-endian bytes.
+fn integerContentLength(bytes: &[u8]) -> usize {
+  let value = significant(bytes)
+  if value.length == 0 {
+    return 1
+  }
+  if value[0] >= 128 {
+    return value.length + 1
+  }
+  return value.length
+}
+
+fn signatureContentLength(signature: &[u8], half: usize) -> usize {
+  let r = integerContentLength(Slice.view<u8>(signature, 0, half))
+  let s = integerContentLength(Slice.view<u8>(signature, half, half))
+  return headerLength(r) + r + headerLength(s) + s
+}
+
+fn headerLength(length: usize) -> usize {
+  if length < 128 {
+    return 2
+  }
+  return 3
+}
+
+fn writeHeader(output: &mut [u8], position: usize, tag: u8, length: usize) -> usize {
+  output[position] = tag
+  if length < 128 {
+    output[position + 1] = usize.toU8(length)
+    return position + 2
+  }
+  output[position + 1] = 129
+  output[position + 2] = usize.toU8(length)
+  return position + 3
+}
+
+fn writeInteger(output: &mut [u8], position: usize, bytes: &[u8]) -> usize {
+  let value = significant(bytes)
+  let content = integerContentLength(bytes)
+  let mut at = writeHeader(&mut output, position, 2, content)
+  if content > value.length {
+    output[at] = 0
+    at = at + 1
+  }
+  let mut i: usize = 0
+  while i < value.length {
+    output[at + i] = value[i]
+    i = i + 1
+  }
+  return at + value.length
+}
+
+struct DerValue {
+  start: usize,
+  end: usize,
+  valid: bool,
+}
+
+fn invalidDer() -> DerValue {
+  return DerValue { start: 0, end: 0, valid: false }
+}
+
+// Reads the element with `tag` at `offset` that must end by `limit`, with a length below 256.
+fn readDer(bytes: &[u8], offset: usize, limit: usize, tag: u8) -> DerValue {
+  if limit > bytes.length || offset >= limit || limit - offset < 2 || bytes[offset] != tag {
+    return invalidDer()
+  }
+  let first = bytes[offset + 1]
+  let mut start = offset + 2
+  let mut length = u8.toUsize(first)
+  if first == 129 {
+    if limit - start < 1 || bytes[start] < 128 {
+      return invalidDer()
+    }
+    length = u8.toUsize(bytes[start])
+    start = start + 1
+  } else if first >= 128 {
+    return invalidDer()
+  }
+  if length > limit - start {
+    return invalidDer()
+  }
+  return DerValue { start: start, end: start + length, valid: true }
+}
+
+// Reads a minimal, non-negative DER INTEGER.
+fn readInteger(bytes: &[u8], offset: usize, limit: usize) -> DerValue {
+  let value = readDer(bytes, offset, limit, 2)
+  if !value.valid || value.start == value.end || bytes[value.start] >= 128 {
+    return invalidDer()
+  }
+  if bytes[value.start] == 0 && value.end - value.start > 1 && bytes[value.start + 1] < 128 {
+    return invalidDer()
+  }
+  return move value
+}
+
+fn curveData(curve: EcCurve) -> CurveData {
+  return match curve {
+    EcCurve.Secp112r1 => CurveData {
+      prime: b"\xdb\x7c\x2a\xbf\x62\xe3\x5e\x66\x80\x76\xbe\xad\x20\x8b",
+      a: b"\xdb\x7c\x2a\xbf\x62\xe3\x5e\x66\x80\x76\xbe\xad\x20\x88",
+      b: b"\x65\x9e\xf8\xba\x04\x39\x16\xee\xde\x89\x11\x70\x2b\x22",
+      x: b"\x09\x48\x72\x39\x99\x5a\x5e\xe7\x6b\x55\xf9\xc2\xf0\x98",
+      y: b"\xa8\x9c\xe5\xaf\x87\x24\xc0\xa2\x3e\x0e\x0f\xf7\x75\x00",
+      order: b"\xdb\x7c\x2a\xbf\x62\xe3\x5e\x76\x28\xdf\xac\x65\x61\xc5",
+      cofactor: 1,
+    }
+    EcCurve.Secp112r2 => CurveData {
+      prime: b"\xdb\x7c\x2a\xbf\x62\xe3\x5e\x66\x80\x76\xbe\xad\x20\x8b",
+      a: b"\x61\x27\xc2\x4c\x05\xf3\x8a\x0a\xaa\xf6\x5c\x0e\xf0\x2c",
+      b: b"\x51\xde\xf1\x81\x5d\xb5\xed\x74\xfc\xc3\x4c\x85\xd7\x09",
+      x: b"\x4b\xa3\x0a\xb5\xe8\x92\xb4\xe1\x64\x9d\xd0\x92\x86\x43",
+      y: b"\xad\xcd\x46\xf5\x88\x2e\x37\x47\xde\xf3\x6e\x95\x6e\x97",
+      order: b"\x36\xdf\x0a\xaf\xd8\xb8\xd7\x59\x7c\xa1\x05\x20\xd0\x4b",
+      cofactor: 4,
+    }
+    EcCurve.Secp128r1 => CurveData {
+      prime: b"\xff\xff\xff\xfd\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
+      a: b"\xff\xff\xff\xfd\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfc",
+      b: b"\xe8\x75\x79\xc1\x10\x79\xf4\x3d\xd8\x24\x99\x3c\x2c\xee\x5e\xd3",
+      x: b"\x16\x1f\xf7\x52\x8b\x89\x9b\x2d\x0c\x28\x60\x7c\xa5\x2c\x5b\x86",
+      y: b"\xcf\x5a\xc8\x39\x5b\xaf\xeb\x13\xc0\x2d\xa2\x92\xdd\xed\x7a\x83",
+      order: b"\xff\xff\xff\xfe\x00\x00\x00\x00\x75\xa3\x0d\x1b\x90\x38\xa1\x15",
+      cofactor: 1,
+    }
+    EcCurve.Secp128r2 => CurveData {
+      prime: b"\xff\xff\xff\xfd\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
+      a: b"\xd6\x03\x19\x98\xd1\xb3\xbb\xfe\xbf\x59\xcc\x9b\xbf\xf9\xae\xe1",
+      b: b"\x5e\xee\xfc\xa3\x80\xd0\x29\x19\xdc\x2c\x65\x58\xbb\x6d\x8a\x5d",
+      x: b"\x7b\x6a\xa5\xd8\x5e\x57\x29\x83\xe6\xfb\x32\xa7\xcd\xeb\xc1\x40",
+      y: b"\x27\xb6\x91\x6a\x89\x4d\x3a\xee\x71\x06\xfe\x80\x5f\xc3\x4b\x44",
+      order: b"\x3f\xff\xff\xff\x7f\xff\xff\xff\xbe\x00\x24\x72\x06\x13\xb5\xa3",
+      cofactor: 4,
+    }
+    EcCurve.Secp160k1 => CurveData {
+      prime: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xac\x73",
+      a: b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+      b: b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x07",
+      x: b"\x3b\x4c\x38\x2c\xe3\x7a\xa1\x92\xa4\x01\x9e\x76\x30\x36\xf4\xf5\xdd\x4d\x7e\xbb",
+      y: b"\x93\x8c\xf9\x35\x31\x8f\xdc\xed\x6b\xc2\x82\x86\x53\x17\x33\xc3\xf0\x3c\x4f\xee",
+      order: b"\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\xb8\xfa\x16\xdf\xab\x9a\xca\x16\xb6\xb3",
+      cofactor: 1,
+    }
+    EcCurve.Secp160r1 => CurveData {
+      prime: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x7f\xff\xff\xff",
+      a: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x7f\xff\xff\xfc",
+      b: b"\x1c\x97\xbe\xfc\x54\xbd\x7a\x8b\x65\xac\xf8\x9f\x81\xd4\xd4\xad\xc5\x65\xfa\x45",
+      x: b"\x4a\x96\xb5\x68\x8e\xf5\x73\x28\x46\x64\x69\x89\x68\xc3\x8b\xb9\x13\xcb\xfc\x82",
+      y: b"\x23\xa6\x28\x55\x31\x68\x94\x7d\x59\xdc\xc9\x12\x04\x23\x51\x37\x7a\xc5\xfb\x32",
+      order: b"\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\xf4\xc8\xf9\x27\xae\xd3\xca\x75\x22\x57",
+      cofactor: 1,
+    }
+    EcCurve.Secp160r2 => CurveData {
+      prime: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xac\x73",
+      a: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xac\x70",
+      b: b"\xb4\xe1\x34\xd3\xfb\x59\xeb\x8b\xab\x57\x27\x49\x04\x66\x4d\x5a\xf5\x03\x88\xba",
+      x: b"\x52\xdc\xb0\x34\x29\x3a\x11\x7e\x1f\x4f\xf1\x1b\x30\xf7\x19\x9d\x31\x44\xce\x6d",
+      y: b"\xfe\xaf\xfe\xf2\xe3\x31\xf2\x96\xe0\x71\xfa\x0d\xf9\x98\x2c\xfe\xa7\xd4\x3f\x2e",
+      order: b"\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x35\x1e\xe7\x86\xa8\x18\xf3\xa1\xa1\x6b",
+      cofactor: 1,
+    }
+    EcCurve.Secp192k1 => CurveData {
+      prime: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xee\x37",
+      a: b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+      b: b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03",
+      x: b"\xdb\x4f\xf1\x0e\xc0\x57\xe9\xae\x26\xb0\x7d\x02\x80\xb7\xf4\x34\x1d\xa5\xd1\xb1\xea\xe0\x6c\x7d",
+      y: b"\x9b\x2f\x2f\x6d\x9c\x56\x28\xa7\x84\x41\x63\xd0\x15\xbe\x86\x34\x40\x82\xaa\x88\xd9\x5e\x2f\x9d",
+      order: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\x26\xf2\xfc\x17\x0f\x69\x46\x6a\x74\xde\xfd\x8d",
+      cofactor: 1,
+    }
+    EcCurve.Secp224k1 => CurveData {
+      prime: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xe5\x6d",
+      a: b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+      b: b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x05",
+      x: b"\xa1\x45\x5b\x33\x4d\xf0\x99\xdf\x30\xfc\x28\xa1\x69\xa4\x67\xe9\xe4\x70\x75\xa9\x0f\x7e\x65\x0e\xb6\xb7\xa4\x5c",
+      y: b"\x7e\x08\x9f\xed\x7f\xba\x34\x42\x82\xca\xfb\xd6\xf7\xe3\x19\xf7\xc0\xb0\xbd\x59\xe2\xca\x4b\xdb\x55\x6d\x61\xa5",
+      order: b"\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\xdc\xe8\xd2\xec\x61\x84\xca\xf0\xa9\x71\x76\x9f\xb1\xf7",
+      cofactor: 1,
+    }
+    EcCurve.P224 => CurveData {
+      prime: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01",
+      a: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe",
+      b: b"\xb4\x05\x0a\x85\x0c\x04\xb3\xab\xf5\x41\x32\x56\x50\x44\xb0\xb7\xd7\xbf\xd8\xba\x27\x0b\x39\x43\x23\x55\xff\xb4",
+      x: b"\xb7\x0e\x0c\xbd\x6b\xb4\xbf\x7f\x32\x13\x90\xb9\x4a\x03\xc1\xd3\x56\xc2\x11\x22\x34\x32\x80\xd6\x11\x5c\x1d\x21",
+      y: b"\xbd\x37\x63\x88\xb5\xf7\x23\xfb\x4c\x22\xdf\xe6\xcd\x43\x75\xa0\x5a\x07\x47\x64\x44\xd5\x81\x99\x85\x00\x7e\x34",
+      order: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x16\xa2\xe0\xb8\xf0\x3e\x13\xdd\x29\x45\x5c\x5c\x2a\x3d",
+      cofactor: 1,
+    }
+    EcCurve.Secp256k1 => CurveData {
+      prime: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xfc\x2f",
+      a: b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+      b: b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x07",
+      x: b"\x79\xbe\x66\x7e\xf9\xdc\xbb\xac\x55\xa0\x62\x95\xce\x87\x0b\x07\x02\x9b\xfc\xdb\x2d\xce\x28\xd9\x59\xf2\x81\x5b\x16\xf8\x17\x98",
+      y: b"\x48\x3a\xda\x77\x26\xa3\xc4\x65\x5d\xa4\xfb\xfc\x0e\x11\x08\xa8\xfd\x17\xb4\x48\xa6\x85\x54\x19\x9c\x47\xd0\x8f\xfb\x10\xd4\xb8",
+      order: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xba\xae\xdc\xe6\xaf\x48\xa0\x3b\xbf\xd2\x5e\x8c\xd0\x36\x41\x41",
+      cofactor: 1,
+    }
+    EcCurve.P384 => CurveData {
+      prime: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\xff",
+      a: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\xfc",
+      b: b"\xb3\x31\x2f\xa7\xe2\x3e\xe7\xe4\x98\x8e\x05\x6b\xe3\xf8\x2d\x19\x18\x1d\x9c\x6e\xfe\x81\x41\x12\x03\x14\x08\x8f\x50\x13\x87\x5a\xc6\x56\x39\x8d\x8a\x2e\xd1\x9d\x2a\x85\xc8\xed\xd3\xec\x2a\xef",
+      x: b"\xaa\x87\xca\x22\xbe\x8b\x05\x37\x8e\xb1\xc7\x1e\xf3\x20\xad\x74\x6e\x1d\x3b\x62\x8b\xa7\x9b\x98\x59\xf7\x41\xe0\x82\x54\x2a\x38\x55\x02\xf2\x5d\xbf\x55\x29\x6c\x3a\x54\x5e\x38\x72\x76\x0a\xb7",
+      y: b"\x36\x17\xde\x4a\x96\x26\x2c\x6f\x5d\x9e\x98\xbf\x92\x92\xdc\x29\xf8\xf4\x1d\xbd\x28\x9a\x14\x7c\xe9\xda\x31\x13\xb5\xf0\xb8\xc0\x0a\x60\xb1\xce\x1d\x7e\x81\x9d\x7a\x43\x1d\x7c\x90\xea\x0e\x5f",
+      order: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xc7\x63\x4d\x81\xf4\x37\x2d\xdf\x58\x1a\x0d\xb2\x48\xb0\xa7\x7a\xec\xec\x19\x6a\xcc\xc5\x29\x73",
+      cofactor: 1,
+    }
+    EcCurve.P521 => CurveData {
+      prime: b"\x01\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
+      a: b"\x01\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfc",
+      b: b"\x00\x51\x95\x3e\xb9\x61\x8e\x1c\x9a\x1f\x92\x9a\x21\xa0\xb6\x85\x40\xee\xa2\xda\x72\x5b\x99\xb3\x15\xf3\xb8\xb4\x89\x91\x8e\xf1\x09\xe1\x56\x19\x39\x51\xec\x7e\x93\x7b\x16\x52\xc0\xbd\x3b\xb1\xbf\x07\x35\x73\xdf\x88\x3d\x2c\x34\xf1\xef\x45\x1f\xd4\x6b\x50\x3f\x00",
+      x: b"\x00\xc6\x85\x8e\x06\xb7\x04\x04\xe9\xcd\x9e\x3e\xcb\x66\x23\x95\xb4\x42\x9c\x64\x81\x39\x05\x3f\xb5\x21\xf8\x28\xaf\x60\x6b\x4d\x3d\xba\xa1\x4b\x5e\x77\xef\xe7\x59\x28\xfe\x1d\xc1\x27\xa2\xff\xa8\xde\x33\x48\xb3\xc1\x85\x6a\x42\x9b\xf9\x7e\x7e\x31\xc2\xe5\xbd\x66",
+      y: b"\x01\x18\x39\x29\x6a\x78\x9a\x3b\xc0\x04\x5c\x8a\x5f\xb4\x2c\x7d\x1b\xd9\x98\xf5\x44\x49\x57\x9b\x44\x68\x17\xaf\xbd\x17\x27\x3e\x66\x2c\x97\xee\x72\x99\x5e\xf4\x26\x40\xc5\x50\xb9\x01\x3f\xad\x07\x61\x35\x3c\x70\x86\xa2\x72\xc2\x40\x88\xbe\x94\x76\x9f\xd1\x66\x50",
+      order: b"\x01\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfa\x51\x86\x87\x83\xbf\x2f\x96\x6b\x7f\xcc\x01\x48\xf7\x09\xa5\xd0\x3b\xb5\xc9\xb8\x89\x9c\x47\xae\xbb\x6f\xb7\x1e\x91\x38\x64\x09",
+      cofactor: 1,
+    }
+    EcCurve.P192 => CurveData {
+      prime: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff",
+      a: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xfc",
+      b: b"\x64\x21\x05\x19\xe5\x9c\x80\xe7\x0f\xa7\xe9\xab\x72\x24\x30\x49\xfe\xb8\xde\xec\xc1\x46\xb9\xb1",
+      x: b"\x18\x8d\xa8\x0e\xb0\x30\x90\xf6\x7c\xbf\x20\xeb\x43\xa1\x88\x00\xf4\xff\x0a\xfd\x82\xff\x10\x12",
+      y: b"\x07\x19\x2b\x95\xff\xc8\xda\x78\x63\x10\x11\xed\x6b\x24\xcd\xd5\x73\xf9\x77\xa1\x1e\x79\x48\x11",
+      order: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x99\xde\xf8\x36\x14\x6b\xc9\xb1\xb4\xd2\x28\x31",
+      cofactor: 1,
+    }
+    EcCurve.Prime192v2 => CurveData {
+      prime: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff",
+      a: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xfc",
+      b: b"\xcc\x22\xd6\xdf\xb9\x5c\x6b\x25\xe4\x9c\x0d\x63\x64\xa4\xe5\x98\x0c\x39\x3a\xa2\x16\x68\xd9\x53",
+      x: b"\xee\xa2\xba\xe7\xe1\x49\x78\x42\xf2\xde\x77\x69\xcf\xe9\xc9\x89\xc0\x72\xad\x69\x6f\x48\x03\x4a",
+      y: b"\x65\x74\xd1\x1d\x69\xb6\xec\x7a\x67\x2b\xb8\x2a\x08\x3d\xf2\xf2\xb0\x84\x7d\xe9\x70\xb2\xde\x15",
+      order: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\x5f\xb1\xa7\x24\xdc\x80\x41\x86\x48\xd8\xdd\x31",
+      cofactor: 1,
+    }
+    EcCurve.Prime192v3 => CurveData {
+      prime: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff",
+      a: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xfc",
+      b: b"\x22\x12\x3d\xc2\x39\x5a\x05\xca\xa7\x42\x3d\xae\xcc\xc9\x47\x60\xa7\xd4\x62\x25\x6b\xd5\x69\x16",
+      x: b"\x7d\x29\x77\x81\x00\xc6\x5a\x1d\xa1\x78\x37\x16\x58\x8d\xce\x2b\x8b\x4a\xee\x8e\x22\x8f\x18\x96",
+      y: b"\x38\xa9\x0f\x22\x63\x73\x37\x33\x4b\x49\xdc\xb6\x6a\x6d\xc8\xf9\x97\x8a\xca\x76\x48\xa9\x43\xb0",
+      order: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x7a\x62\xd0\x31\xc8\x3f\x42\x94\xf6\x40\xec\x13",
+      cofactor: 1,
+    }
+    EcCurve.Prime239v1 => CurveData {
+      prime: b"\x7f\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x7f\xff\xff\xff\xff\xff\x80\x00\x00\x00\x00\x00\x7f\xff\xff\xff\xff\xff",
+      a: b"\x7f\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x7f\xff\xff\xff\xff\xff\x80\x00\x00\x00\x00\x00\x7f\xff\xff\xff\xff\xfc",
+      b: b"\x6b\x01\x6c\x3b\xdc\xf1\x89\x41\xd0\xd6\x54\x92\x14\x75\xca\x71\xa9\xdb\x2f\xb2\x7d\x1d\x37\x79\x61\x85\xc2\x94\x2c\x0a",
+      x: b"\x0f\xfa\x96\x3c\xdc\xa8\x81\x6c\xcc\x33\xb8\x64\x2b\xed\xf9\x05\xc3\xd3\x58\x57\x3d\x3f\x27\xfb\xbd\x3b\x3c\xb9\xaa\xaf",
+      y: b"\x7d\xeb\xe8\xe4\xe9\x0a\x5d\xae\x6e\x40\x54\xca\x53\x0b\xa0\x46\x54\xb3\x68\x18\xce\x22\x6b\x39\xfc\xcb\x7b\x02\xf1\xae",
+      order: b"\x7f\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x7f\xff\xff\x9e\x5e\x9a\x9f\x5d\x90\x71\xfb\xd1\x52\x26\x88\x90\x9d\x0b",
+      cofactor: 1,
+    }
+    EcCurve.Prime239v2 => CurveData {
+      prime: b"\x7f\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x7f\xff\xff\xff\xff\xff\x80\x00\x00\x00\x00\x00\x7f\xff\xff\xff\xff\xff",
+      a: b"\x7f\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x7f\xff\xff\xff\xff\xff\x80\x00\x00\x00\x00\x00\x7f\xff\xff\xff\xff\xfc",
+      b: b"\x61\x7f\xab\x68\x32\x57\x6c\xbb\xfe\xd5\x0d\x99\xf0\x24\x9c\x3f\xee\x58\xb9\x4b\xa0\x03\x8c\x7a\xe8\x4c\x8c\x83\x2f\x2c",
+      x: b"\x38\xaf\x09\xd9\x87\x27\x70\x51\x20\xc9\x21\xbb\x5e\x9e\x26\x29\x6a\x3c\xdc\xf2\xf3\x57\x57\xa0\xea\xfd\x87\xb8\x30\xe7",
+      y: b"\x5b\x01\x25\xe4\xdb\xea\x0e\xc7\x20\x6d\xa0\xfc\x01\xd9\xb0\x81\x32\x9f\xb5\x55\xde\x6e\xf4\x60\x23\x7d\xff\x8b\xe4\xba",
+      order: b"\x7f\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x80\x00\x00\xcf\xa7\xe8\x59\x43\x77\xd4\x14\xc0\x38\x21\xbc\x58\x20\x63",
+      cofactor: 1,
+    }
+    EcCurve.Prime239v3 => CurveData {
+      prime: b"\x7f\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x7f\xff\xff\xff\xff\xff\x80\x00\x00\x00\x00\x00\x7f\xff\xff\xff\xff\xff",
+      a: b"\x7f\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x7f\xff\xff\xff\xff\xff\x80\x00\x00\x00\x00\x00\x7f\xff\xff\xff\xff\xfc",
+      b: b"\x25\x57\x05\xfa\x2a\x30\x66\x54\xb1\xf4\xcb\x03\xd6\xa7\x50\xa3\x0c\x25\x01\x02\xd4\x98\x87\x17\xd9\xba\x15\xab\x6d\x3e",
+      x: b"\x67\x68\xae\x8e\x18\xbb\x92\xcf\xcf\x00\x5c\x94\x9a\xa2\xc6\xd9\x48\x53\xd0\xe6\x60\xbb\xf8\x54\xb1\xc9\x50\x5f\xe9\x5a",
+      y: b"\x16\x07\xe6\x89\x8f\x39\x0c\x06\xbc\x1d\x55\x2b\xad\x22\x6f\x3b\x6f\xcf\xe4\x8b\x6e\x81\x84\x99\xaf\x18\xe3\xed\x6c\xf3",
+      order: b"\x7f\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x7f\xff\xff\x97\x5d\xeb\x41\xb3\xa6\x05\x7c\x3c\x43\x21\x46\x52\x65\x51",
+      cofactor: 1,
+    }
+    EcCurve.P256 => CurveData {
+      prime: b"\xff\xff\xff\xff\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
+      a: b"\xff\xff\xff\xff\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfc",
+      b: b"\x5a\xc6\x35\xd8\xaa\x3a\x93\xe7\xb3\xeb\xbd\x55\x76\x98\x86\xbc\x65\x1d\x06\xb0\xcc\x53\xb0\xf6\x3b\xce\x3c\x3e\x27\xd2\x60\x4b",
+      x: b"\x6b\x17\xd1\xf2\xe1\x2c\x42\x47\xf8\xbc\xe6\xe5\x63\xa4\x40\xf2\x77\x03\x7d\x81\x2d\xeb\x33\xa0\xf4\xa1\x39\x45\xd8\x98\xc2\x96",
+      y: b"\x4f\xe3\x42\xe2\xfe\x1a\x7f\x9b\x8e\xe7\xeb\x4a\x7c\x0f\x9e\x16\x2b\xce\x33\x57\x6b\x31\x5e\xce\xcb\xb6\x40\x68\x37\xbf\x51\xf5",
+      order: b"\xff\xff\xff\xff\x00\x00\x00\x00\xff\xff\xff\xff\xff\xff\xff\xff\xbc\xe6\xfa\xad\xa7\x17\x9e\x84\xf3\xb9\xca\xc2\xfc\x63\x25\x51",
+      cofactor: 1,
+    }
+    EcCurve.Wtls6 => CurveData {
+      prime: b"\xdb\x7c\x2a\xbf\x62\xe3\x5e\x66\x80\x76\xbe\xad\x20\x8b",
+      a: b"\xdb\x7c\x2a\xbf\x62\xe3\x5e\x66\x80\x76\xbe\xad\x20\x88",
+      b: b"\x65\x9e\xf8\xba\x04\x39\x16\xee\xde\x89\x11\x70\x2b\x22",
+      x: b"\x09\x48\x72\x39\x99\x5a\x5e\xe7\x6b\x55\xf9\xc2\xf0\x98",
+      y: b"\xa8\x9c\xe5\xaf\x87\x24\xc0\xa2\x3e\x0e\x0f\xf7\x75\x00",
+      order: b"\xdb\x7c\x2a\xbf\x62\xe3\x5e\x76\x28\xdf\xac\x65\x61\xc5",
+      cofactor: 1,
+    }
+    EcCurve.Wtls7 => CurveData {
+      prime: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xac\x73",
+      a: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xac\x70",
+      b: b"\xb4\xe1\x34\xd3\xfb\x59\xeb\x8b\xab\x57\x27\x49\x04\x66\x4d\x5a\xf5\x03\x88\xba",
+      x: b"\x52\xdc\xb0\x34\x29\x3a\x11\x7e\x1f\x4f\xf1\x1b\x30\xf7\x19\x9d\x31\x44\xce\x6d",
+      y: b"\xfe\xaf\xfe\xf2\xe3\x31\xf2\x96\xe0\x71\xfa\x0d\xf9\x98\x2c\xfe\xa7\xd4\x3f\x2e",
+      order: b"\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x35\x1e\xe7\x86\xa8\x18\xf3\xa1\xa1\x6b",
+      cofactor: 1,
+    }
+    EcCurve.Wtls8 => CurveData {
+      prime: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfd\xe7",
+      a: b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+      b: b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03",
+      x: b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01",
+      y: b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02",
+      order: b"\x01\x00\x00\x00\x00\x00\x00\x01\xec\xea\x55\x1a\xd8\x37\xe9",
+      cofactor: 1,
+    }
+    EcCurve.Wtls9 => CurveData {
+      prime: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfc\x80\x8f",
+      a: b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+      b: b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03",
+      x: b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01",
+      y: b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02",
+      order: b"\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\xcd\xc9\x8a\xe0\xe2\xde\x57\x4a\xbf\x33",
+      cofactor: 1,
+    }
+    EcCurve.Wtls12 => CurveData {
+      prime: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01",
+      a: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe",
+      b: b"\xb4\x05\x0a\x85\x0c\x04\xb3\xab\xf5\x41\x32\x56\x50\x44\xb0\xb7\xd7\xbf\xd8\xba\x27\x0b\x39\x43\x23\x55\xff\xb4",
+      x: b"\xb7\x0e\x0c\xbd\x6b\xb4\xbf\x7f\x32\x13\x90\xb9\x4a\x03\xc1\xd3\x56\xc2\x11\x22\x34\x32\x80\xd6\x11\x5c\x1d\x21",
+      y: b"\xbd\x37\x63\x88\xb5\xf7\x23\xfb\x4c\x22\xdf\xe6\xcd\x43\x75\xa0\x5a\x07\x47\x64\x44\xd5\x81\x99\x85\x00\x7e\x34",
+      order: b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x16\xa2\xe0\xb8\xf0\x3e\x13\xdd\x29\x45\x5c\x5c\x2a\x3d",
+      cofactor: 1,
+    }
+    EcCurve.BrainpoolP160r1 => CurveData {
+      prime: b"\xe9\x5e\x4a\x5f\x73\x70\x59\xdc\x60\xdf\xc7\xad\x95\xb3\xd8\x13\x95\x15\x62\x0f",
+      a: b"\x34\x0e\x7b\xe2\xa2\x80\xeb\x74\xe2\xbe\x61\xba\xda\x74\x5d\x97\xe8\xf7\xc3\x00",
+      b: b"\x1e\x58\x9a\x85\x95\x42\x34\x12\x13\x4f\xaa\x2d\xbd\xec\x95\xc8\xd8\x67\x5e\x58",
+      x: b"\xbe\xd5\xaf\x16\xea\x3f\x6a\x4f\x62\x93\x8c\x46\x31\xeb\x5a\xf7\xbd\xbc\xdb\xc3",
+      y: b"\x16\x67\xcb\x47\x7a\x1a\x8e\xc3\x38\xf9\x47\x41\x66\x9c\x97\x63\x16\xda\x63\x21",
+      order: b"\xe9\x5e\x4a\x5f\x73\x70\x59\xdc\x60\xdf\x59\x91\xd4\x50\x29\x40\x9e\x60\xfc\x09",
+      cofactor: 1,
+    }
+    EcCurve.BrainpoolP160t1 => CurveData {
+      prime: b"\xe9\x5e\x4a\x5f\x73\x70\x59\xdc\x60\xdf\xc7\xad\x95\xb3\xd8\x13\x95\x15\x62\x0f",
+      a: b"\xe9\x5e\x4a\x5f\x73\x70\x59\xdc\x60\xdf\xc7\xad\x95\xb3\xd8\x13\x95\x15\x62\x0c",
+      b: b"\x7a\x55\x6b\x6d\xae\x53\x5b\x7b\x51\xed\x2c\x4d\x7d\xaa\x7a\x0b\x5c\x55\xf3\x80",
+      x: b"\xb1\x99\xb1\x3b\x9b\x34\xef\xc1\x39\x7e\x64\xba\xeb\x05\xac\xc2\x65\xff\x23\x78",
+      y: b"\xad\xd6\x71\x8b\x7c\x7c\x19\x61\xf0\x99\x1b\x84\x24\x43\x77\x21\x52\xc9\xe0\xad",
+      order: b"\xe9\x5e\x4a\x5f\x73\x70\x59\xdc\x60\xdf\x59\x91\xd4\x50\x29\x40\x9e\x60\xfc\x09",
+      cofactor: 1,
+    }
+    EcCurve.BrainpoolP192r1 => CurveData {
+      prime: b"\xc3\x02\xf4\x1d\x93\x2a\x36\xcd\xa7\xa3\x46\x30\x93\xd1\x8d\xb7\x8f\xce\x47\x6d\xe1\xa8\x62\x97",
+      a: b"\x6a\x91\x17\x40\x76\xb1\xe0\xe1\x9c\x39\xc0\x31\xfe\x86\x85\xc1\xca\xe0\x40\xe5\xc6\x9a\x28\xef",
+      b: b"\x46\x9a\x28\xef\x7c\x28\xcc\xa3\xdc\x72\x1d\x04\x4f\x44\x96\xbc\xca\x7e\xf4\x14\x6f\xbf\x25\xc9",
+      x: b"\xc0\xa0\x64\x7e\xaa\xb6\xa4\x87\x53\xb0\x33\xc5\x6c\xb0\xf0\x90\x0a\x2f\x5c\x48\x53\x37\x5f\xd6",
+      y: b"\x14\xb6\x90\x86\x6a\xbd\x5b\xb8\x8b\x5f\x48\x28\xc1\x49\x00\x02\xe6\x77\x3f\xa2\xfa\x29\x9b\x8f",
+      order: b"\xc3\x02\xf4\x1d\x93\x2a\x36\xcd\xa7\xa3\x46\x2f\x9e\x9e\x91\x6b\x5b\xe8\xf1\x02\x9a\xc4\xac\xc1",
+      cofactor: 1,
+    }
+    EcCurve.BrainpoolP192t1 => CurveData {
+      prime: b"\xc3\x02\xf4\x1d\x93\x2a\x36\xcd\xa7\xa3\x46\x30\x93\xd1\x8d\xb7\x8f\xce\x47\x6d\xe1\xa8\x62\x97",
+      a: b"\xc3\x02\xf4\x1d\x93\x2a\x36\xcd\xa7\xa3\x46\x30\x93\xd1\x8d\xb7\x8f\xce\x47\x6d\xe1\xa8\x62\x94",
+      b: b"\x13\xd5\x6f\xfa\xec\x78\x68\x1e\x68\xf9\xde\xb4\x3b\x35\xbe\xc2\xfb\x68\x54\x2e\x27\x89\x7b\x79",
+      x: b"\x3a\xe9\xe5\x8c\x82\xf6\x3c\x30\x28\x2e\x1f\xe7\xbb\xf4\x3f\xa7\x2c\x44\x6a\xf6\xf4\x61\x81\x29",
+      y: b"\x09\x7e\x2c\x56\x67\xc2\x22\x3a\x90\x2a\xb5\xca\x44\x9d\x00\x84\xb7\xe5\xb3\xde\x7c\xcc\x01\xc9",
+      order: b"\xc3\x02\xf4\x1d\x93\x2a\x36\xcd\xa7\xa3\x46\x2f\x9e\x9e\x91\x6b\x5b\xe8\xf1\x02\x9a\xc4\xac\xc1",
+      cofactor: 1,
+    }
+    EcCurve.BrainpoolP224r1 => CurveData {
+      prime: b"\xd7\xc1\x34\xaa\x26\x43\x66\x86\x2a\x18\x30\x25\x75\xd1\xd7\x87\xb0\x9f\x07\x57\x97\xda\x89\xf5\x7e\xc8\xc0\xff",
+      a: b"\x68\xa5\xe6\x2c\xa9\xce\x6c\x1c\x29\x98\x03\xa6\xc1\x53\x0b\x51\x4e\x18\x2a\xd8\xb0\x04\x2a\x59\xca\xd2\x9f\x43",
+      b: b"\x25\x80\xf6\x3c\xcf\xe4\x41\x38\x87\x07\x13\xb1\xa9\x23\x69\xe3\x3e\x21\x35\xd2\x66\xdb\xb3\x72\x38\x6c\x40\x0b",
+      x: b"\x0d\x90\x29\xad\x2c\x7e\x5c\xf4\x34\x08\x23\xb2\xa8\x7d\xc6\x8c\x9e\x4c\xe3\x17\x4c\x1e\x6e\xfd\xee\x12\xc0\x7d",
+      y: b"\x58\xaa\x56\xf7\x72\xc0\x72\x6f\x24\xc6\xb8\x9e\x4e\xcd\xac\x24\x35\x4b\x9e\x99\xca\xa3\xf6\xd3\x76\x14\x02\xcd",
+      order: b"\xd7\xc1\x34\xaa\x26\x43\x66\x86\x2a\x18\x30\x25\x75\xd0\xfb\x98\xd1\x16\xbc\x4b\x6d\xde\xbc\xa3\xa5\xa7\x93\x9f",
+      cofactor: 1,
+    }
+    EcCurve.BrainpoolP224t1 => CurveData {
+      prime: b"\xd7\xc1\x34\xaa\x26\x43\x66\x86\x2a\x18\x30\x25\x75\xd1\xd7\x87\xb0\x9f\x07\x57\x97\xda\x89\xf5\x7e\xc8\xc0\xff",
+      a: b"\xd7\xc1\x34\xaa\x26\x43\x66\x86\x2a\x18\x30\x25\x75\xd1\xd7\x87\xb0\x9f\x07\x57\x97\xda\x89\xf5\x7e\xc8\xc0\xfc",
+      b: b"\x4b\x33\x7d\x93\x41\x04\xcd\x7b\xef\x27\x1b\xf6\x0c\xed\x1e\xd2\x0d\xa1\x4c\x08\xb3\xbb\x64\xf1\x8a\x60\x88\x8d",
+      x: b"\x6a\xb1\xe3\x44\xce\x25\xff\x38\x96\x42\x4e\x7f\xfe\x14\x76\x2e\xcb\x49\xf8\x92\x8a\xc0\xc7\x60\x29\xb4\xd5\x80",
+      y: b"\x03\x74\xe9\xf5\x14\x3e\x56\x8c\xd2\x3f\x3f\x4d\x7c\x0d\x4b\x1e\x41\xc8\xcc\x0d\x1c\x6a\xbd\x5f\x1a\x46\xdb\x4c",
+      order: b"\xd7\xc1\x34\xaa\x26\x43\x66\x86\x2a\x18\x30\x25\x75\xd0\xfb\x98\xd1\x16\xbc\x4b\x6d\xde\xbc\xa3\xa5\xa7\x93\x9f",
+      cofactor: 1,
+    }
+    EcCurve.BrainpoolP256r1 => CurveData {
+      prime: b"\xa9\xfb\x57\xdb\xa1\xee\xa9\xbc\x3e\x66\x0a\x90\x9d\x83\x8d\x72\x6e\x3b\xf6\x23\xd5\x26\x20\x28\x20\x13\x48\x1d\x1f\x6e\x53\x77",
+      a: b"\x7d\x5a\x09\x75\xfc\x2c\x30\x57\xee\xf6\x75\x30\x41\x7a\xff\xe7\xfb\x80\x55\xc1\x26\xdc\x5c\x6c\xe9\x4a\x4b\x44\xf3\x30\xb5\xd9",
+      b: b"\x26\xdc\x5c\x6c\xe9\x4a\x4b\x44\xf3\x30\xb5\xd9\xbb\xd7\x7c\xbf\x95\x84\x16\x29\x5c\xf7\xe1\xce\x6b\xcc\xdc\x18\xff\x8c\x07\xb6",
+      x: b"\x8b\xd2\xae\xb9\xcb\x7e\x57\xcb\x2c\x4b\x48\x2f\xfc\x81\xb7\xaf\xb9\xde\x27\xe1\xe3\xbd\x23\xc2\x3a\x44\x53\xbd\x9a\xce\x32\x62",
+      y: b"\x54\x7e\xf8\x35\xc3\xda\xc4\xfd\x97\xf8\x46\x1a\x14\x61\x1d\xc9\xc2\x77\x45\x13\x2d\xed\x8e\x54\x5c\x1d\x54\xc7\x2f\x04\x69\x97",
+      order: b"\xa9\xfb\x57\xdb\xa1\xee\xa9\xbc\x3e\x66\x0a\x90\x9d\x83\x8d\x71\x8c\x39\x7a\xa3\xb5\x61\xa6\xf7\x90\x1e\x0e\x82\x97\x48\x56\xa7",
+      cofactor: 1,
+    }
+    EcCurve.BrainpoolP256t1 => CurveData {
+      prime: b"\xa9\xfb\x57\xdb\xa1\xee\xa9\xbc\x3e\x66\x0a\x90\x9d\x83\x8d\x72\x6e\x3b\xf6\x23\xd5\x26\x20\x28\x20\x13\x48\x1d\x1f\x6e\x53\x77",
+      a: b"\xa9\xfb\x57\xdb\xa1\xee\xa9\xbc\x3e\x66\x0a\x90\x9d\x83\x8d\x72\x6e\x3b\xf6\x23\xd5\x26\x20\x28\x20\x13\x48\x1d\x1f\x6e\x53\x74",
+      b: b"\x66\x2c\x61\xc4\x30\xd8\x4e\xa4\xfe\x66\xa7\x73\x3d\x0b\x76\xb7\xbf\x93\xeb\xc4\xaf\x2f\x49\x25\x6a\xe5\x81\x01\xfe\xe9\x2b\x04",
+      x: b"\xa3\xe8\xeb\x3c\xc1\xcf\xe7\xb7\x73\x22\x13\xb2\x3a\x65\x61\x49\xaf\xa1\x42\xc4\x7a\xaf\xbc\x2b\x79\xa1\x91\x56\x2e\x13\x05\xf4",
+      y: b"\x2d\x99\x6c\x82\x34\x39\xc5\x6d\x7f\x7b\x22\xe1\x46\x44\x41\x7e\x69\xbc\xb6\xde\x39\xd0\x27\x00\x1d\xab\xe8\xf3\x5b\x25\xc9\xbe",
+      order: b"\xa9\xfb\x57\xdb\xa1\xee\xa9\xbc\x3e\x66\x0a\x90\x9d\x83\x8d\x71\x8c\x39\x7a\xa3\xb5\x61\xa6\xf7\x90\x1e\x0e\x82\x97\x48\x56\xa7",
+      cofactor: 1,
+    }
+    EcCurve.BrainpoolP320r1 => CurveData {
+      prime: b"\xd3\x5e\x47\x20\x36\xbc\x4f\xb7\xe1\x3c\x78\x5e\xd2\x01\xe0\x65\xf9\x8f\xcf\xa6\xf6\xf4\x0d\xef\x4f\x92\xb9\xec\x78\x93\xec\x28\xfc\xd4\x12\xb1\xf1\xb3\x2e\x27",
+      a: b"\x3e\xe3\x0b\x56\x8f\xba\xb0\xf8\x83\xcc\xeb\xd4\x6d\x3f\x3b\xb8\xa2\xa7\x35\x13\xf5\xeb\x79\xda\x66\x19\x0e\xb0\x85\xff\xa9\xf4\x92\xf3\x75\xa9\x7d\x86\x0e\xb4",
+      b: b"\x52\x08\x83\x94\x9d\xfd\xbc\x42\xd3\xad\x19\x86\x40\x68\x8a\x6f\xe1\x3f\x41\x34\x95\x54\xb4\x9a\xcc\x31\xdc\xcd\x88\x45\x39\x81\x6f\x5e\xb4\xac\x8f\xb1\xf1\xa6",
+      x: b"\x43\xbd\x7e\x9a\xfb\x53\xd8\xb8\x52\x89\xbc\xc4\x8e\xe5\xbf\xe6\xf2\x01\x37\xd1\x0a\x08\x7e\xb6\xe7\x87\x1e\x2a\x10\xa5\x99\xc7\x10\xaf\x8d\x0d\x39\xe2\x06\x11",
+      y: b"\x14\xfd\xd0\x55\x45\xec\x1c\xc8\xab\x40\x93\x24\x7f\x77\x27\x5e\x07\x43\xff\xed\x11\x71\x82\xea\xa9\xc7\x78\x77\xaa\xac\x6a\xc7\xd3\x52\x45\xd1\x69\x2e\x8e\xe1",
+      order: b"\xd3\x5e\x47\x20\x36\xbc\x4f\xb7\xe1\x3c\x78\x5e\xd2\x01\xe0\x65\xf9\x8f\xcf\xa5\xb6\x8f\x12\xa3\x2d\x48\x2e\xc7\xee\x86\x58\xe9\x86\x91\x55\x5b\x44\xc5\x93\x11",
+      cofactor: 1,
+    }
+    EcCurve.BrainpoolP320t1 => CurveData {
+      prime: b"\xd3\x5e\x47\x20\x36\xbc\x4f\xb7\xe1\x3c\x78\x5e\xd2\x01\xe0\x65\xf9\x8f\xcf\xa6\xf6\xf4\x0d\xef\x4f\x92\xb9\xec\x78\x93\xec\x28\xfc\xd4\x12\xb1\xf1\xb3\x2e\x27",
+      a: b"\xd3\x5e\x47\x20\x36\xbc\x4f\xb7\xe1\x3c\x78\x5e\xd2\x01\xe0\x65\xf9\x8f\xcf\xa6\xf6\xf4\x0d\xef\x4f\x92\xb9\xec\x78\x93\xec\x28\xfc\xd4\x12\xb1\xf1\xb3\x2e\x24",
+      b: b"\xa7\xf5\x61\xe0\x38\xeb\x1e\xd5\x60\xb3\xd1\x47\xdb\x78\x20\x13\x06\x4c\x19\xf2\x7e\xd2\x7c\x67\x80\xaa\xf7\x7f\xb8\xa5\x47\xce\xb5\xb4\xfe\xf4\x22\x34\x03\x53",
+      x: b"\x92\x5b\xe9\xfb\x01\xaf\xc6\xfb\x4d\x3e\x7d\x49\x90\x01\x0f\x81\x34\x08\xab\x10\x6c\x4f\x09\xcb\x7e\xe0\x78\x68\xcc\x13\x6f\xff\x33\x57\xf6\x24\xa2\x1b\xed\x52",
+      y: b"\x63\xba\x3a\x7a\x27\x48\x3e\xbf\x66\x71\xdb\xef\x7a\xbb\x30\xeb\xee\x08\x4e\x58\xa0\xb0\x77\xad\x42\xa5\xa0\x98\x9d\x1e\xe7\x1b\x1b\x9b\xc0\x45\x5f\xb0\xd2\xc3",
+      order: b"\xd3\x5e\x47\x20\x36\xbc\x4f\xb7\xe1\x3c\x78\x5e\xd2\x01\xe0\x65\xf9\x8f\xcf\xa5\xb6\x8f\x12\xa3\x2d\x48\x2e\xc7\xee\x86\x58\xe9\x86\x91\x55\x5b\x44\xc5\x93\x11",
+      cofactor: 1,
+    }
+    EcCurve.BrainpoolP384r1 => CurveData {
+      prime: b"\x8c\xb9\x1e\x82\xa3\x38\x6d\x28\x0f\x5d\x6f\x7e\x50\xe6\x41\xdf\x15\x2f\x71\x09\xed\x54\x56\xb4\x12\xb1\xda\x19\x7f\xb7\x11\x23\xac\xd3\xa7\x29\x90\x1d\x1a\x71\x87\x47\x00\x13\x31\x07\xec\x53",
+      a: b"\x7b\xc3\x82\xc6\x3d\x8c\x15\x0c\x3c\x72\x08\x0a\xce\x05\xaf\xa0\xc2\xbe\xa2\x8e\x4f\xb2\x27\x87\x13\x91\x65\xef\xba\x91\xf9\x0f\x8a\xa5\x81\x4a\x50\x3a\xd4\xeb\x04\xa8\xc7\xdd\x22\xce\x28\x26",
+      b: b"\x04\xa8\xc7\xdd\x22\xce\x28\x26\x8b\x39\xb5\x54\x16\xf0\x44\x7c\x2f\xb7\x7d\xe1\x07\xdc\xd2\xa6\x2e\x88\x0e\xa5\x3e\xeb\x62\xd5\x7c\xb4\x39\x02\x95\xdb\xc9\x94\x3a\xb7\x86\x96\xfa\x50\x4c\x11",
+      x: b"\x1d\x1c\x64\xf0\x68\xcf\x45\xff\xa2\xa6\x3a\x81\xb7\xc1\x3f\x6b\x88\x47\xa3\xe7\x7e\xf1\x4f\xe3\xdb\x7f\xca\xfe\x0c\xbd\x10\xe8\xe8\x26\xe0\x34\x36\xd6\x46\xaa\xef\x87\xb2\xe2\x47\xd4\xaf\x1e",
+      y: b"\x8a\xbe\x1d\x75\x20\xf9\xc2\xa4\x5c\xb1\xeb\x8e\x95\xcf\xd5\x52\x62\xb7\x0b\x29\xfe\xec\x58\x64\xe1\x9c\x05\x4f\xf9\x91\x29\x28\x0e\x46\x46\x21\x77\x91\x81\x11\x42\x82\x03\x41\x26\x3c\x53\x15",
+      order: b"\x8c\xb9\x1e\x82\xa3\x38\x6d\x28\x0f\x5d\x6f\x7e\x50\xe6\x41\xdf\x15\x2f\x71\x09\xed\x54\x56\xb3\x1f\x16\x6e\x6c\xac\x04\x25\xa7\xcf\x3a\xb6\xaf\x6b\x7f\xc3\x10\x3b\x88\x32\x02\xe9\x04\x65\x65",
+      cofactor: 1,
+    }
+    EcCurve.BrainpoolP384t1 => CurveData {
+      prime: b"\x8c\xb9\x1e\x82\xa3\x38\x6d\x28\x0f\x5d\x6f\x7e\x50\xe6\x41\xdf\x15\x2f\x71\x09\xed\x54\x56\xb4\x12\xb1\xda\x19\x7f\xb7\x11\x23\xac\xd3\xa7\x29\x90\x1d\x1a\x71\x87\x47\x00\x13\x31\x07\xec\x53",
+      a: b"\x8c\xb9\x1e\x82\xa3\x38\x6d\x28\x0f\x5d\x6f\x7e\x50\xe6\x41\xdf\x15\x2f\x71\x09\xed\x54\x56\xb4\x12\xb1\xda\x19\x7f\xb7\x11\x23\xac\xd3\xa7\x29\x90\x1d\x1a\x71\x87\x47\x00\x13\x31\x07\xec\x50",
+      b: b"\x7f\x51\x9e\xad\xa7\xbd\xa8\x1b\xd8\x26\xdb\xa6\x47\x91\x0f\x8c\x4b\x93\x46\xed\x8c\xcd\xc6\x4e\x4b\x1a\xbd\x11\x75\x6d\xce\x1d\x20\x74\xaa\x26\x3b\x88\x80\x5c\xed\x70\x35\x5a\x33\xb4\x71\xee",
+      x: b"\x18\xde\x98\xb0\x2d\xb9\xa3\x06\xf2\xaf\xcd\x72\x35\xf7\x2a\x81\x9b\x80\xab\x12\xeb\xd6\x53\x17\x24\x76\xfe\xcd\x46\x2a\xab\xff\xc4\xff\x19\x1b\x94\x6a\x5f\x54\xd8\xd0\xaa\x2f\x41\x88\x08\xcc",
+      y: b"\x25\xab\x05\x69\x62\xd3\x06\x51\xa1\x14\xaf\xd2\x75\x5a\xd3\x36\x74\x7f\x93\x47\x5b\x7a\x1f\xca\x3b\x88\xf2\xb6\xa2\x08\xcc\xfe\x46\x94\x08\x58\x4d\xc2\xb2\x91\x26\x75\xbf\x5b\x9e\x58\x29\x28",
+      order: b"\x8c\xb9\x1e\x82\xa3\x38\x6d\x28\x0f\x5d\x6f\x7e\x50\xe6\x41\xdf\x15\x2f\x71\x09\xed\x54\x56\xb3\x1f\x16\x6e\x6c\xac\x04\x25\xa7\xcf\x3a\xb6\xaf\x6b\x7f\xc3\x10\x3b\x88\x32\x02\xe9\x04\x65\x65",
+      cofactor: 1,
+    }
+    EcCurve.BrainpoolP512r1 => CurveData {
+      prime: b"\xaa\xdd\x9d\xb8\xdb\xe9\xc4\x8b\x3f\xd4\xe6\xae\x33\xc9\xfc\x07\xcb\x30\x8d\xb3\xb3\xc9\xd2\x0e\xd6\x63\x9c\xca\x70\x33\x08\x71\x7d\x4d\x9b\x00\x9b\xc6\x68\x42\xae\xcd\xa1\x2a\xe6\xa3\x80\xe6\x28\x81\xff\x2f\x2d\x82\xc6\x85\x28\xaa\x60\x56\x58\x3a\x48\xf3",
+      a: b"\x78\x30\xa3\x31\x8b\x60\x3b\x89\xe2\x32\x71\x45\xac\x23\x4c\xc5\x94\xcb\xdd\x8d\x3d\xf9\x16\x10\xa8\x34\x41\xca\xea\x98\x63\xbc\x2d\xed\x5d\x5a\xa8\x25\x3a\xa1\x0a\x2e\xf1\xc9\x8b\x9a\xc8\xb5\x7f\x11\x17\xa7\x2b\xf2\xc7\xb9\xe7\xc1\xac\x4d\x77\xfc\x94\xca",
+      b: b"\x3d\xf9\x16\x10\xa8\x34\x41\xca\xea\x98\x63\xbc\x2d\xed\x5d\x5a\xa8\x25\x3a\xa1\x0a\x2e\xf1\xc9\x8b\x9a\xc8\xb5\x7f\x11\x17\xa7\x2b\xf2\xc7\xb9\xe7\xc1\xac\x4d\x77\xfc\x94\xca\xdc\x08\x3e\x67\x98\x40\x50\xb7\x5e\xba\xe5\xdd\x28\x09\xbd\x63\x80\x16\xf7\x23",
+      x: b"\x81\xae\xe4\xbd\xd8\x2e\xd9\x64\x5a\x21\x32\x2e\x9c\x4c\x6a\x93\x85\xed\x9f\x70\xb5\xd9\x16\xc1\xb4\x3b\x62\xee\xf4\xd0\x09\x8e\xff\x3b\x1f\x78\xe2\xd0\xd4\x8d\x50\xd1\x68\x7b\x93\xb9\x7d\x5f\x7c\x6d\x50\x47\x40\x6a\x5e\x68\x8b\x35\x22\x09\xbc\xb9\xf8\x22",
+      y: b"\x7d\xde\x38\x5d\x56\x63\x32\xec\xc0\xea\xbf\xa9\xcf\x78\x22\xfd\xf2\x09\xf7\x00\x24\xa5\x7b\x1a\xa0\x00\xc5\x5b\x88\x1f\x81\x11\xb2\xdc\xde\x49\x4a\x5f\x48\x5e\x5b\xca\x4b\xd8\x8a\x27\x63\xae\xd1\xca\x2b\x2f\xa8\xf0\x54\x06\x78\xcd\x1e\x0f\x3a\xd8\x08\x92",
+      order: b"\xaa\xdd\x9d\xb8\xdb\xe9\xc4\x8b\x3f\xd4\xe6\xae\x33\xc9\xfc\x07\xcb\x30\x8d\xb3\xb3\xc9\xd2\x0e\xd6\x63\x9c\xca\x70\x33\x08\x70\x55\x3e\x5c\x41\x4c\xa9\x26\x19\x41\x86\x61\x19\x7f\xac\x10\x47\x1d\xb1\xd3\x81\x08\x5d\xda\xdd\xb5\x87\x96\x82\x9c\xa9\x00\x69",
+      cofactor: 1,
+    }
+    EcCurve.BrainpoolP512t1 => CurveData {
+      prime: b"\xaa\xdd\x9d\xb8\xdb\xe9\xc4\x8b\x3f\xd4\xe6\xae\x33\xc9\xfc\x07\xcb\x30\x8d\xb3\xb3\xc9\xd2\x0e\xd6\x63\x9c\xca\x70\x33\x08\x71\x7d\x4d\x9b\x00\x9b\xc6\x68\x42\xae\xcd\xa1\x2a\xe6\xa3\x80\xe6\x28\x81\xff\x2f\x2d\x82\xc6\x85\x28\xaa\x60\x56\x58\x3a\x48\xf3",
+      a: b"\xaa\xdd\x9d\xb8\xdb\xe9\xc4\x8b\x3f\xd4\xe6\xae\x33\xc9\xfc\x07\xcb\x30\x8d\xb3\xb3\xc9\xd2\x0e\xd6\x63\x9c\xca\x70\x33\x08\x71\x7d\x4d\x9b\x00\x9b\xc6\x68\x42\xae\xcd\xa1\x2a\xe6\xa3\x80\xe6\x28\x81\xff\x2f\x2d\x82\xc6\x85\x28\xaa\x60\x56\x58\x3a\x48\xf0",
+      b: b"\x7c\xbb\xbc\xf9\x44\x1c\xfa\xb7\x6e\x18\x90\xe4\x68\x84\xea\xe3\x21\xf7\x0c\x0b\xcb\x49\x81\x52\x78\x97\x50\x4b\xec\x3e\x36\xa6\x2b\xcd\xfa\x23\x04\x97\x65\x40\xf6\x45\x00\x85\xf2\xda\xe1\x45\xc2\x25\x53\xb4\x65\x76\x36\x89\x18\x0e\xa2\x57\x18\x67\x42\x3e",
+      x: b"\x64\x0e\xce\x5c\x12\x78\x87\x17\xb9\xc1\xba\x06\xcb\xc2\xa6\xfe\xba\x85\x84\x24\x58\xc5\x6d\xde\x9d\xb1\x75\x8d\x39\xc0\x31\x3d\x82\xba\x51\x73\x5c\xdb\x3e\xa4\x99\xaa\x77\xa7\xd6\x94\x3a\x64\xf7\xa3\xf2\x5f\xe2\x6f\x06\xb5\x1b\xaa\x26\x96\xfa\x90\x35\xda",
+      y: b"\x5b\x53\x4b\xd5\x95\xf5\xaf\x0f\xa2\xc8\x92\x37\x6c\x84\xac\xe1\xbb\x4e\x30\x19\xb7\x16\x34\xc0\x11\x31\x15\x9c\xae\x03\xce\xe9\xd9\x93\x21\x84\xbe\xef\x21\x6b\xd7\x1d\xf2\xda\xdf\x86\xa6\x27\x30\x6e\xcf\xf9\x6d\xbb\x8b\xac\xe1\x98\xb6\x1e\x00\xf8\xb3\x32",
+      order: b"\xaa\xdd\x9d\xb8\xdb\xe9\xc4\x8b\x3f\xd4\xe6\xae\x33\xc9\xfc\x07\xcb\x30\x8d\xb3\xb3\xc9\xd2\x0e\xd6\x63\x9c\xca\x70\x33\x08\x70\x55\x3e\x5c\x41\x4c\xa9\x26\x19\x41\x86\x61\x19\x7f\xac\x10\x47\x1d\xb1\xd3\x81\x08\x5d\xda\xdd\xb5\x87\x96\x82\x9c\xa9\x00\x69",
+      cofactor: 1,
+    }
+    EcCurve.Sm2 => CurveData {
+      prime: b"\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00\xff\xff\xff\xff\xff\xff\xff\xff",
+      a: b"\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00\xff\xff\xff\xff\xff\xff\xff\xfc",
+      b: b"\x28\xe9\xfa\x9e\x9d\x9f\x5e\x34\x4d\x5a\x9e\x4b\xcf\x65\x09\xa7\xf3\x97\x89\xf5\x15\xab\x8f\x92\xdd\xbc\xbd\x41\x4d\x94\x0e\x93",
+      x: b"\x32\xc4\xae\x2c\x1f\x19\x81\x19\x5f\x99\x04\x46\x6a\x39\xc9\x94\x8f\xe3\x0b\xbf\xf2\x66\x0b\xe1\x71\x5a\x45\x89\x33\x4c\x74\xc7",
+      y: b"\xbc\x37\x36\xa2\xf4\xf6\x77\x9c\x59\xbd\xce\xe3\x6b\x69\x21\x53\xd0\xa9\x87\x7c\xc6\x2a\x47\x40\x02\xdf\x32\xe5\x21\x39\xf0\xa0",
+      order: b"\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x72\x03\xdf\x6b\x21\xc6\x05\x2b\x53\xbb\xf4\x09\x39\xd5\x41\x23",
+      cofactor: 1,
+    }
+  }
+}

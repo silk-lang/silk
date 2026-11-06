@@ -18,7 +18,8 @@ This module is for schedulers and runtimes. Application code uses `silk.concurre
 
 The life of an Execution:
 
-1. `Initial` after [`make`](#Execution.impl.make). `notifyInitial` can mark it ready before the first drive.
+1. `Initial` after [`make`](#Execution.impl.make). [`Execution.notifyInitial`](#Execution.impl.notifyInitial) can mark it ready before the first
+   drive.
 2. [`drive`](#Execution.impl.drive) runs the body. It calls `onComplete` with the result, or `onSuspend` with the
    dormant Execution if the body parked.
 3. In [`park`](#Execution.impl.park), the body gives its one [`Wake`](#Wake) to a registration callback, and stops.
@@ -241,7 +242,22 @@ pub fn interruptHeld(self: &mut Self, token: usize) -> bool
 ```
 
 Asks this parked Execution to resume the interruptible boundary for `token`, for an owner
-that holds it under its own lock. See [`Execution.interruptHeld`](#Execution.impl.interruptHeld).
+that holds it under its own lock, and returns whether the caller must now queue it.
+
+#### Details
+
+When the Execution is next driven, every frame above the boundary that
+`Intrinsic.interruptibleEffect` opened for `token` is abandoned from its park, innermost
+first, which runs its `Drop` hooks and non-parking finalizers. Then the boundary resumes with
+`false`. A dormant Execution becomes eligible without running its readiness endpoint, and the
+call returns `true`, so the caller queues it. A park that is still registering is latched,
+so the drive notifies the endpoint once it returns. An Execution that already holds a smaller
+token keeps it.
+
+#### Gotchas
+
+`token` must not be 0. With no boundary for `token`, every frame is abandoned, as when the
+Execution is dropped. Interrupting an Execution that is not parked is a fatal state trap.
 
 <a id="Execution"></a>
 
@@ -257,10 +273,10 @@ which an owner drives and resumes.
 ### When to use
 
 This type is for schedulers and runtimes. Application code uses `silk.concurrency.fiber` or
-`silk.concurrency.thread_pool` instead. [`Execution.make`](#Execution.impl.make) packages a lazy `Effect` for a later owner to
-run. [`Execution.drive`](#Execution.impl.drive) runs the first activation, and each later activation after a wake.
-[`Execution.park`](#Execution.impl.park) in the body stops it until an external event calls [`Execution.wake`](#Execution.impl.wake). For
-an Execution that moves between threads, use [`Execution.makeTransferable`](#Execution.impl.makeTransferable).
+`silk.concurrency.thread_pool` instead. [`Execution.make`](#Execution.impl.make) packages a lazy `Effect` for a later
+owner to run. [`Execution.drive`](#Execution.impl.drive) runs the first activation, and each later activation after a
+wake. [`Execution.park`](#Execution.impl.park) in the body stops it until an external event calls [`Execution.wake`](#Execution.impl.wake).
+For an Execution that moves between threads, use [`Execution.makeTransferable`](#Execution.impl.makeTransferable).
 
 ### Details
 
@@ -277,9 +293,9 @@ A nested `Effect.suspend` transfers execution at once. Only `park` gives up the 
 a Wake.
 
 This struct carries no data and is never constructed by the library. Every operation is an
-inherent member declared in `impl Execution`, so `import silk.concurrency.execution { Execution }` is the
-one import that reaches `Execution.make(...)` and the rest. It is unrelated to the builtin
-`Intrinsic.Execution<A>` type.
+inherent member declared in `impl Execution`, so `import silk.concurrency.execution { Execution
+}` is the one import that reaches `Execution.make(...)` and the rest. It is unrelated to the
+builtin `Intrinsic.Execution<A>` type.
 
 <a id="Execution.impl"></a>
 
@@ -496,16 +512,19 @@ still be registering.
 
 #### Details
 
-It stores the token as [`interrupt`](#Execution.impl.interrupt) does, with three differences. A dormant Execution becomes
-eligible without running its readiness endpoint, and the call returns `true`, so the caller
-queues it. A park that is still registering, as in the `onSuspend` callback of [`drive`](#Execution.impl.drive), is
-latched, so `drive` notifies the endpoint once it returns. An Execution that already holds a smaller token keeps it: with tokens that grow
-with each boundary, that is the outer one.
+When the Execution is next driven, every frame above the boundary that
+`Intrinsic.interruptibleEffect` opened for `token` is abandoned from its park, innermost
+first, which runs its `Drop` hooks and non-parking finalizers. Then the boundary resumes with
+`false`. Unlike [`interrupt`](#Execution.impl.interrupt), a dormant Execution becomes eligible without running its
+readiness endpoint, and the call returns `true`, so the caller queues it. A park that is still
+registering, as in the `onSuspend` callback of [`drive`](#Execution.impl.drive), is latched, so `drive` notifies the
+endpoint once it returns. An Execution that already holds a smaller token keeps it: with
+tokens that grow with each boundary, that is the outer one.
 
 #### Gotchas
 
-`token` must not be 0. The boundary rules of [`interrupt`](#Execution.impl.interrupt) apply. Interrupting an Execution
-that is not parked is a fatal state trap.
+`token` must not be 0. With no boundary for `token`, every frame is abandoned, as when the
+Execution is dropped. Interrupting an Execution that is not parked is a fatal state trap.
 
 <a id="Execution.impl.wakeTransferable"></a>
 

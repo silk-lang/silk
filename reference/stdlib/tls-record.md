@@ -732,6 +732,22 @@ pub effect fn makePlaintext() -> TlsRecordReceiver ! OutOfMemoryError ? &mut All
 
 Returns a receiver for records without encryption, for the first handshake messages.
 
+<a id="TlsRecordReceiver.impl.skipUndecryptable"></a>
+
+### Method `skipUndecryptable`
+
+```silk
+pub fn skipUndecryptable(self: &mut Self, budget: usize) -> ()
+```
+
+Drops records that this receiver cannot read, as a TLS 1.3 server does with 0-RTT data that
+it rejects, until their payloads total more than `budget` bytes.
+
+#### Details
+Without a key, the receiver drops `application_data` records. With a key, it drops records
+that fail authentication, and the first record that it decrypts ends the skipping. A replaced
+key keeps the remaining budget. A record larger than the remaining budget fails as usual.
+
 <a id="TlsRecordReceiver.impl.replaceEpoch"></a>
 
 ### Method `replaceEpoch`

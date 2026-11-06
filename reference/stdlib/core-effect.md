@@ -147,8 +147,9 @@ The owner type of the effect combinators. It has no fields and is never construc
 
 ### Details
 
-`import silk.core.effect { Effect }` gives access to `Effect.map`, `Effect.catchAll`, and the other
-combinators. This struct is not the built-in type `Effect<A ! E ? R>`, which needs no import.
+`import silk.core.effect { Effect }` gives access to `Effect.map`, `Effect.catchAll`, and the
+other combinators. This struct is not the built-in type `Effect<A ! E ? R>`, which needs no
+import.
 
 <a id="Effect.impl"></a>
 
@@ -229,7 +230,9 @@ Sends one log message at `LogLevel.Trace` to the active `Logger`.
 
 #### Details
 
-This function has the same behavior as [`logAt`](#Effect.impl.logAt) with `LogLevel.Trace`.
+`template` is a static format template. The compiler checks it against `args` at compile time.
+The `Logger` provider selects the output format and destination. Use [`logAt`](#Effect.impl.logAt) when the
+level is a value at runtime.
 
 #### Errors
 
@@ -250,7 +253,9 @@ Sends one log message at `LogLevel.Debug` to the active `Logger`.
 
 #### Details
 
-This function has the same behavior as [`logAt`](#Effect.impl.logAt) with `LogLevel.Debug`.
+`template` is a static format template. The compiler checks it against `args` at compile time.
+The `Logger` provider selects the output format and destination. Use [`logAt`](#Effect.impl.logAt) when the
+level is a value at runtime.
 
 #### Errors
 
@@ -271,7 +276,9 @@ Sends one log message at `LogLevel.Info` to the active `Logger`.
 
 #### Details
 
-This function has the same behavior as [`logAt`](#Effect.impl.logAt) with `LogLevel.Info`.
+`template` is a static format template. The compiler checks it against `args` at compile time.
+The `Logger` provider selects the output format and destination. Use [`logAt`](#Effect.impl.logAt) when the
+level is a value at runtime.
 
 #### Errors
 
@@ -292,7 +299,9 @@ Sends one log message at `LogLevel.Warning` to the active `Logger`.
 
 #### Details
 
-This function has the same behavior as [`logAt`](#Effect.impl.logAt) with `LogLevel.Warning`.
+`template` is a static format template. The compiler checks it against `args` at compile time.
+The `Logger` provider selects the output format and destination. Use [`logAt`](#Effect.impl.logAt) when the
+level is a value at runtime.
 
 #### Errors
 
@@ -313,7 +322,9 @@ Sends one log message at `LogLevel.Error` to the active `Logger`.
 
 #### Details
 
-This function has the same behavior as [`logAt`](#Effect.impl.logAt) with `LogLevel.Error`.
+`template` is a static format template. The compiler checks it against `args` at compile time.
+The `Logger` provider selects the output format and destination. Use [`logAt`](#Effect.impl.logAt) when the
+level is a value at runtime.
 
 #### Errors
 
@@ -1184,14 +1195,20 @@ from now.
 
 #### Details
 
-The Scheduler reads its clock when the task next yields to it, so a stale clock reading in
-the task does not shorten the wait. See [`timeoutAt`](#Effect.impl.timeoutAt) for how the effect stops.
+`self` runs in the current task, with no new Fiber. The Scheduler reads its clock when the
+task next yields to it, so a stale clock reading in the task does not shorten the wait. If
+the time passes while the task is parked inside `self`, such as in a clock wait or a Fiber
+join, the Scheduler interrupts the task: each frame of `self` is abandoned from its park,
+innermost first. That runs `Drop` hooks and non-parking finalizers (`ensuringNonParking`,
+`useReleaseNonParking`). Then this call fails with `TimeoutError`. A success or typed failure
+of `self` in time is returned unchanged.
 
 #### Gotchas
 
-It needs a `Scheduler` provider, such as `LocalScheduler`. The effect stops only at a park,
-and work before its first park is not counted. `ensuring` finalizers inside it do not run
-when it stops.
+It needs a `Scheduler` provider, such as `LocalScheduler`. The effect stops only at a park:
+code between two parks always runs to its end, and an effect that never parks never stops.
+`ensuring` finalizers inside it do not run when it stops. Children forked inside it keep
+running; interrupt them, or let their parent finish.
 
 <a id="Effect.impl.timeoutAt"></a>
 

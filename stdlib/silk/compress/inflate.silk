@@ -19,13 +19,15 @@
 //!
 //! # Errors
 //! - `OutOfMemoryError` from [`Decoder.make`] if the `Allocator` fails.
-//! - [`DecodeError`] if the data is not valid, a limit is too small, or the calls do not follow the
-//!   rules of [`Decoder.step`]. Its `kind` tells you the cause.
+//! - [`DecodeError`] if the data is not valid, a limit is too small, or a call after the final
+//!   input does not give exactly the input that is not consumed yet. Its `kind` tells you the
+//!   cause.
 //!
 //! # Gotchas
 //! Output is not verified until `Finished`, because the checksum comes at the end. If a step fails,
 //! discard all output of the stream. A failed decoder rejects each later step with `InvalidUse`
-//! until you call [`Decoder.reset`]. Zlib streams with a preset dictionary are not supported.
+//! until you call [`Decoder.reset`]. A zlib stream with a preset dictionary, or a raw stream made
+//! with one, needs [`Decoder.setDictionary`] before the first step.
 //!
 //! # Examples
 //! ## Decode a stored DEFLATE block
@@ -67,11 +69,15 @@
 //! @category Data formats
 
 import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.mem.layout {Layout}
+import silk.mem.raw_buffer {RawBuffer}
 import silk.text.format {Debug, Format as TextFormat, Formatter}
-import silk.collections.list {List}
+import silk.collections.slice {Slice}
+import silk.compress.checksum {CompressionChecksum}
 import silk.core.result {Result}
 import silk.num.u8
 import silk.num.u32
+import silk.num.u64
 import silk.num.usize
 import silk.io.writer {Writer, WriterError}
 
@@ -90,8 +96,8 @@ pub const MEMORY_BOUND: u64 = 65536
 pub enum Format {
   /// One raw DEFLATE stream (RFC 1951) with no header or checksum.
   Raw,
-  /// One zlib stream (RFC 1950): a 2-byte header, DEFLATE data, and an Adler-32 checksum. A preset
-  /// dictionary is not supported.
+  /// One zlib stream (RFC 1950): a 2-byte header, an optional dictionary id, DEFLATE data, and an
+  /// Adler-32 checksum.
   Zlib,
   /// Gzip data (RFC 1952): one or more members, each with a header, DEFLATE data, a CRC-32, and the
   /// size.
@@ -143,8 +149,10 @@ pub enum ErrorKind {
   InvalidHeader,
   /// The header names a compression method that is not DEFLATE.
   UnsupportedMethod,
-  /// The zlib header asks for a preset dictionary.
-  UnsupportedDictionary,
+  /// The zlib header names a preset dictionary, and [`Decoder.setDictionary`] loaded none.
+  MissingDictionary,
+  /// The zlib header names a preset dictionary whose Adler-32 is not that of the loaded one.
+  DictionaryMismatch,
   /// A block type, a stored block length, or a compressed symbol is not valid.
   InvalidBlock,
   /// A Huffman code or a code-length repeat is not valid.
@@ -157,7 +165,8 @@ pub enum ErrorKind {
   ChecksumMismatch,
   /// The size in a gzip trailer is not the size of the decoded member.
   SizeMismatch,
-  /// The decoder failed before, or a call broke the rules of [`Decoder.step`] about final input.
+  /// The decoder failed before, or a call after the final input did not set `finalInput` and give
+  /// exactly the input that is not consumed yet.
   InvalidUse,
   /// The next input byte would go over [`Limits.maxInputBytes`].
   InputLimit,
@@ -177,7 +186,8 @@ impl Debug for ErrorKind {
     return match &self.* {
       ErrorKind.InvalidHeader => run TextFormat.write(&mut formatter, b"InvalidHeader")
       ErrorKind.UnsupportedMethod => run TextFormat.write(&mut formatter, b"UnsupportedMethod")
-      ErrorKind.UnsupportedDictionary => run TextFormat.write(&mut formatter, b"UnsupportedDictionary")
+      ErrorKind.MissingDictionary => run TextFormat.write(&mut formatter, b"MissingDictionary")
+      ErrorKind.DictionaryMismatch => run TextFormat.write(&mut formatter, b"DictionaryMismatch")
       ErrorKind.InvalidBlock => run TextFormat.write(&mut formatter, b"InvalidBlock")
       ErrorKind.InvalidHuffman => run TextFormat.write(&mut formatter, b"InvalidHuffman")
       ErrorKind.InvalidDistance => run TextFormat.write(&mut formatter, b"InvalidDistance")
@@ -233,19 +243,19 @@ impl Debug for DecodeError {
 /// stream with the same storage.
 ///
 /// # Gotchas
-/// Output is not verified until `Finished`, because the checksum comes at the end. Zlib streams
-/// with a preset dictionary are not supported.
+/// Output is not verified until `Finished`, because the checksum comes at the end. A stream made
+/// with a preset dictionary needs [`Decoder.setDictionary`] before the first step.
 pub struct Decoder {
   format: Format,
   limits: Limits,
-  history: List<u8>,
+  ring: Intrinsic.RawBuffer<u8>,
+  tables: Intrinsic.RawBuffer<u32>,
+  lengths: Intrinsic.RawBuffer<u8>,
+  sorted: Intrinsic.RawBuffer<u32>,
   historyNext: usize,
   historyCount: usize,
   window: usize,
-  workspace: List<u32>,
-  literalMaximum: u32,
-  distanceMaximum: u32,
-  codeMaximum: u32,
+  fixedLoaded: bool,
   phase: u32,
   error: ErrorKind,
   totalInput: u64,
@@ -255,9 +265,12 @@ pub struct Decoder {
   finalSeen: bool,
   finalRemaining: usize,
   inputPosition: usize,
+  inputEnd: usize,
   outputPosition: usize,
-  bits: u32,
-  bitCount: u32,
+  outputEnd: usize,
+  flushed: usize,
+  acc: u64,
+  count: u32,
   value: u32,
   finalBlock: bool,
   index: usize,
@@ -267,22 +280,14 @@ pub struct Decoder {
   trailer: u32,
   headerCrc: u32,
   crc: u32,
-  adlerLow: u32,
-  adlerHigh: u32,
+  adler: u32,
+  dictionaryId: u32,
+  dictionaryLength: usize,
   memberSize: u32,
   literalCount: usize,
   distanceCount: usize,
   codeCount: usize,
-  repeat: u32,
-  repeatValue: u8,
   matchLength: usize,
-  matchDistance: usize,
-  extra: u32,
-  pending: u8,
-  hCode: u32,
-  hFirst: u32,
-  hIndex: u32,
-  hLength: u32,
 }
 
 impl Decoder {
@@ -303,39 +308,22 @@ impl Decoder {
     if limits.maxMembers == 0 {
       fail DecodeError {kind: ErrorKind.MemberLimit, consumed: 0, written: 0}
     }
-    let mut history = List<u8>.make()
-    let _reserved = run List<u8>.reserve(&mut history, 32768)
-    let mut index: usize = 0
-    while index < 32768 {
-      let _initialized = run List<u8>.append(&mut history, 0)
-      index = index + 1
-    }
-    let mut workspace = List<u32>.make()
-    let _workspaceReserved = run List<u32>.reserve(&mut workspace, 1232)
-    index = 0
-    while index < 1232 {
-      let _initialized = run List<u32>.append(&mut workspace, 0)
-      index = index + 1
-    }
-    let mut phase: u32 = 10
-    if format == Format.Zlib {
-      phase = 6
-    }
-    if format == Format.Gzip {
-      phase = 0
-    }
+    let ring = run zeroedBytes(RING)
+    let tables = run zeroedWords(TABLE_WORDS)
+    let lengths = run zeroedBytes(LENGTH_COUNT)
+    let sorted = run zeroedWords(LENGTH_COUNT)
     return Decoder {
       format: format,
       limits: move limits,
-      history: move history,
+      ring: move ring,
+      tables: move tables,
+      lengths: move lengths,
+      sorted: move sorted,
       historyNext: 0,
       historyCount: 0,
-      window: 32768,
-      workspace: move workspace,
-      literalMaximum: 0,
-      distanceMaximum: 0,
-      codeMaximum: 0,
-      phase: phase,
+      window: RING,
+      fixedLoaded: false,
+      phase: startPhase(format),
       error: ErrorKind.InvalidUse,
       totalInput: 0,
       totalOutput: 0,
@@ -344,9 +332,12 @@ impl Decoder {
       finalSeen: false,
       finalRemaining: 0,
       inputPosition: 0,
+      inputEnd: 0,
       outputPosition: 0,
-      bits: 0,
-      bitCount: 0,
+      outputEnd: 0,
+      flushed: 0,
+      acc: 0,
+      count: 0,
       value: 0,
       finalBlock: false,
       index: 0,
@@ -354,24 +345,16 @@ impl Decoder {
       flags: 0,
       first: 0,
       trailer: 0,
-      headerCrc: 0xffffffff,
-      crc: 0xffffffff,
-      adlerLow: 1,
-      adlerHigh: 0,
+      headerCrc: 0,
+      crc: 0,
+      adler: 1,
+      dictionaryId: 0,
+      dictionaryLength: 0,
       memberSize: 0,
       literalCount: 0,
       distanceCount: 0,
       codeCount: 0,
-      repeat: 0,
-      repeatValue: 0,
       matchLength: 0,
-      matchDistance: 0,
-      extra: 0,
-      pending: 0,
-      hCode: 0,
-      hFirst: 0,
-      hIndex: 0,
-      hLength: 1,
     }
   }
   /// Starts a new stream in `format` with new `limits`, and keeps the storage of the decoder.
@@ -397,24 +380,15 @@ impl Decoder {
         DecodeError {kind: ErrorKind.MemberLimit, consumed: 0, written: 0},
       )
     }
-    let mut phase: u32 = 10
-    if format == Format.Zlib {
-      phase = 6
-    }
-    if format == Format.Gzip {
-      phase = 0
-    }
-    // Match construction defaults while keeping both lists in place. Empty logical history
-    // hides old bytes; fixed/dynamic table setup overwrites every workspace entry before use.
+    // The storage stays in place. An empty history hides the old bytes, and each block builds
+    // its tables before it reads a code, except that the fixed tables stay valid while
+    // `fixedLoaded` is set.
     self.format = format
     self.limits = move limits
     self.historyNext = 0
     self.historyCount = 0
-    self.window = 32768
-    self.literalMaximum = 0
-    self.distanceMaximum = 0
-    self.codeMaximum = 0
-    self.phase = phase
+    self.window = RING
+    self.phase = startPhase(format)
     self.error = ErrorKind.InvalidUse
     self.totalInput = 0
     self.totalOutput = 0
@@ -423,9 +397,12 @@ impl Decoder {
     self.finalSeen = false
     self.finalRemaining = 0
     self.inputPosition = 0
+    self.inputEnd = 0
     self.outputPosition = 0
-    self.bits = 0
-    self.bitCount = 0
+    self.outputEnd = 0
+    self.flushed = 0
+    self.acc = 0
+    self.count = 0
     self.value = 0
     self.finalBlock = false
     self.index = 0
@@ -433,24 +410,45 @@ impl Decoder {
     self.flags = 0
     self.first = 0
     self.trailer = 0
-    self.headerCrc = 0xffffffff
-    self.crc = 0xffffffff
-    self.adlerLow = 1
-    self.adlerHigh = 0
+    self.headerCrc = 0
+    self.crc = 0
+    self.adler = 1
+    self.dictionaryId = 0
+    self.dictionaryLength = 0
     self.memberSize = 0
     self.literalCount = 0
     self.distanceCount = 0
     self.codeCount = 0
-    self.repeat = 0
-    self.repeatValue = 0
     self.matchLength = 0
-    self.matchDistance = 0
-    self.extra = 0
-    self.pending = 0
-    self.hCode = 0
-    self.hFirst = 0
-    self.hIndex = 0
-    self.hLength = 1
+    return Result<(), DecodeError>.succeed(())
+  }
+  /// Loads `dictionary` as the history that the stream can refer to, before the first step, as
+  /// zlib's `inflateSetDictionary` does.
+  ///
+  /// # Details
+  /// Only the last 32 KiB are kept. A raw stream can then refer to the dictionary at once. A zlib
+  /// stream can refer to it only if its header names the dictionary by its Adler-32; a zlib stream
+  /// without a dictionary id decodes as if none was loaded. It does not allocate.
+  ///
+  /// # Errors
+  /// `InvalidUse` with gzip, after the first step, or after a dictionary was loaded for this
+  /// stream. The decoder does not change.
+  pub fn setDictionary(self: &mut Self, dictionary: &[u8]) -> Result<(), DecodeError> {
+    if self.format == Format.Gzip || self.totalInput != 0 || self.finalSeen
+      || self.dictionaryLength != 0 || self.phase == PHASE_FAILED || self.phase == PHASE_DONE {
+      return Result<(), DecodeError>.failResult(
+        DecodeError {kind: ErrorKind.InvalidUse, consumed: 0, written: 0},
+      )
+    }
+    let mut used = dictionary
+    if used.length > RING {
+      used = Slice.view<u8>(dictionary, dictionary.length - RING, RING)
+    }
+    Slice.copyInto<u8>(bytesMut(&mut self.ring), 0, used)
+    self.historyNext = used.length & RING_MASK
+    self.historyCount = used.length
+    self.dictionaryId = CompressionChecksum.adler32(dictionary)
+    self.dictionaryLength = dictionary.length
     return Result<(), DecodeError>.succeed(())
   }
   /// Decodes from `input` into `output` and returns how much it consumed and wrote.
@@ -480,10 +478,11 @@ impl Decoder {
   > {
     self.inputPosition = 0
     self.outputPosition = 0
-    if self.phase == 50 {
+    self.flushed = 0
+    if self.phase == PHASE_DONE {
       return success(&mut self, Status.Finished)
     }
-    if self.phase == 60 {
+    if self.phase == PHASE_FAILED {
       return failure(&mut self, ErrorKind.InvalidUse)
     }
     if self.finalSeen {
@@ -496,31 +495,185 @@ impl Decoder {
         self.finalRemaining = input.length
       }
     }
+    // The limits become ends in the buffers of this call, so the loops below compare positions
+    // only. A position that reaches a limit end before the buffer end means the limit is hit.
+    self.inputEnd = input.length
+    let inputRoom = self.limits.maxInputBytes - self.totalInput
+    if inputRoom < usize.toU64(input.length) {
+      self.inputEnd = u64.toUsize(inputRoom)
+    }
+    self.outputEnd = output.length
+    let outputRoom = self.limits.maxOutputBytes - self.totalOutput
+    if outputRoom < usize.toU64(output.length) {
+      self.outputEnd = u64.toUsize(outputRoom)
+    }
     while true {
       let action = advance(&mut self, input, &mut output)
-      if self.phase == 60 {
+      if action == GO {
+        continue
+      }
+      if action == FAILED {
+        // The whole bytes in the bit buffer are not part of the failing unit, except when the
+        // input limit stops the unit, which needs all of them.
         let error = self.error
+        if error != ErrorKind.InputLimit {
+          giveBack(&mut self)
+        }
         return failure(&mut self, error)
       }
-      if action == 1 {
+      commit(&mut self, &output)
+      if action == NEED_INPUT {
         if self.finalSeen {
           return failure(&mut self, ErrorKind.TruncatedInput)
         }
         return success(&mut self, Status.NeedInput)
       }
-      if action == 2 {
+      giveBack(&mut self)
+      if action == NEED_OUTPUT {
         return success(&mut self, Status.NeedOutput)
       }
-      if action == 3 {
-        self.phase = 50
-        return success(&mut self, Status.Finished)
-      }
+      self.phase = PHASE_DONE
+      return success(&mut self, Status.Finished)
     }
     return failure(&mut self, ErrorKind.InvalidUse)
   }
 }
 
+// What one call of `advance` asks `step` to do next.
+const GO: u32 = 0
+const NEED_INPUT: u32 = 1
+const NEED_OUTPUT: u32 = 2
+const DONE: u32 = 3
+const FAILED: u32 = 4
+
+// The phases are private continuations of the parser. Each one reads one unit, which it takes
+// only when all of its bits are on hand, so a step can stop between any two of them.
+const PHASE_GZIP: u32 = 0
+const PHASE_GZIP_EXTRA_LENGTH: u32 = 1
+const PHASE_GZIP_EXTRA: u32 = 2
+const PHASE_GZIP_NAME: u32 = 3
+const PHASE_GZIP_COMMENT: u32 = 4
+const PHASE_GZIP_HEADER_CRC: u32 = 5
+const PHASE_ZLIB_METHOD: u32 = 6
+const PHASE_ZLIB_FLAGS: u32 = 7
+const PHASE_ZLIB_DICTIONARY: u32 = 8
+const PHASE_BLOCK: u32 = 10
+const PHASE_STORED_LENGTH: u32 = 11
+const PHASE_STORED: u32 = 13
+const PHASE_COUNTS: u32 = 14
+const PHASE_CODE_LENGTHS: u32 = 15
+const PHASE_LENGTHS: u32 = 16
+const PHASE_SYMBOL: u32 = 20
+const PHASE_DISTANCE: u32 = 23
+const PHASE_COPY: u32 = 25
+const PHASE_ADLER: u32 = 30
+const PHASE_GZIP_CRC: u32 = 31
+const PHASE_GZIP_SIZE: u32 = 32
+const PHASE_MEMBER: u32 = 40
+const PHASE_DONE: u32 = 50
+const PHASE_FAILED: u32 = 60
+
+const RING: usize = 32768
+const RING_MASK: usize = 32767
+
+// The table storage: the literal/length table, the distance table, and the code-length table.
+// Each has a root part indexed by its root bits and second-level parts after it. The capacities
+// hold the largest tables that valid codes need: a second-level part of 2^k entries holds codes
+// of at least k + 1 symbols, so 288 symbols fill at most 48 parts of 32 entries after a root of
+// 1024, and 32 distance symbols fill at most 4 parts of 128 entries after a root of 256.
+const LITERAL_ROOT: u32 = 10
+const DISTANCE_ROOT: u32 = 8
+const CODE_ROOT: u32 = 7
+const LITERAL_BASE: usize = 0
+const LITERAL_CAPACITY: usize = 2560
+const DISTANCE_BASE: usize = 2560
+const DISTANCE_CAPACITY: usize = 768
+const CODE_BASE: usize = 3328
+const CODE_CAPACITY: usize = 128
+const TABLE_WORDS: usize = 3456
+const LENGTH_COUNT: usize = 320
+
+// A table entry is `value << 16 | kind << 12 | extra << 8 | bits`. `bits` is the length of the
+// code. `value` is a literal byte, a code-length symbol, the base of a length or distance whose
+// `extra` bits follow the code, or for a link the offset of a second-level part whose index is the
+// `extra` bits after the root bits.
+const KIND_LITERAL: u32 = 0
+const KIND_BASE: u32 = 1
+const KIND_END: u32 = 2
+const KIND_LINK: u32 = 3
+const KIND_BAD_CODE: u32 = 4
+const KIND_BAD_LENGTH: u32 = 5
+const KIND_BAD_DISTANCE: u32 = 6
+
+const ALPHABET_LITERAL: u32 = 0
+const ALPHABET_DISTANCE: u32 = 1
+const ALPHABET_CODE: u32 = 2
+
+const LENGTH_BASE: [u32; 29] = [
+  3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
+  163, 195, 227, 258,
+]
+const LENGTH_EXTRA: [u32; 29] = [
+  0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+]
+const DISTANCE_BASE_VALUES: [u32; 30] = [
+  1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049,
+  3073, 4097, 6145, 8193, 12289, 16385, 24577,
+]
+const DISTANCE_EXTRA: [u32; 30] = [
+  0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13,
+]
+const CODE_ORDER: [usize; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+
+fn startPhase(format: Format) -> u32 {
+  if format == Format.Zlib {
+    return PHASE_ZLIB_METHOD
+  }
+  if format == Format.Gzip {
+    return PHASE_GZIP
+  }
+  return PHASE_BLOCK
+}
+
+// The storage comes from `Allocator.allocateZeroed`, so every slot starts initialized. The views
+// below cover the whole buffer, which is in bounds and initialized.
+effect fn zeroedBytes(count: usize) -> Intrinsic.RawBuffer<u8> ! OutOfMemoryError ? &mut Allocator {
+  let allocation = run Allocator.allocateZeroed(Layout { bytes: count, alignment: 1 })
+  // The allocation holds `count` bytes.
+  return unsafe RawBuffer.from<u8>(move allocation, count)
+}
+
+// `count` is at most `TABLE_WORDS`, so `count * 4` does not overflow.
+effect fn zeroedWords(count: usize) -> Intrinsic.RawBuffer<u32> ! OutOfMemoryError ? &mut Allocator {
+  let allocation = run Allocator.allocateZeroed(Layout { bytes: count * 4, alignment: 4 })
+  // The allocation holds `count` words with word alignment.
+  return unsafe RawBuffer.from<u32>(move allocation, count)
+}
+
+@inlineAlways
+fn bytes(buffer: &Intrinsic.RawBuffer<u8>) -> &[u8] {
+  return unsafe RawBuffer.view<u8>(&buffer, 0, RawBuffer.count<u8>(&buffer))
+}
+
+@inlineAlways
+fn bytesMut(buffer: &mut Intrinsic.RawBuffer<u8>) -> &mut [u8] {
+  let count = RawBuffer.count<u8>(&buffer)
+  return unsafe RawBuffer.viewMut<u8>(&mut buffer, 0, count)
+}
+
+@inlineAlways
+fn words(buffer: &Intrinsic.RawBuffer<u32>) -> &[u32] {
+  return unsafe RawBuffer.view<u32>(&buffer, 0, RawBuffer.count<u32>(&buffer))
+}
+
+@inlineAlways
+fn wordsMut(buffer: &mut Intrinsic.RawBuffer<u32>) -> &mut [u32] {
+  let count = RawBuffer.count<u32>(&buffer)
+  return unsafe RawBuffer.viewMut<u32>(&mut buffer, 0, count)
+}
+
 fn success(state: &mut Decoder, status: Status) -> Result<Progress, DecodeError> {
+  state.totalInput = state.totalInput + usize.toU64(state.inputPosition)
   if state.finalSeen {
     state.finalRemaining = state.finalRemaining - state.inputPosition
   }
@@ -530,7 +683,7 @@ fn success(state: &mut Decoder, status: Status) -> Result<Progress, DecodeError>
 }
 
 fn failure(state: &mut Decoder, kind: ErrorKind) -> Result<Progress, DecodeError> {
-  state.phase = 60
+  state.phase = PHASE_FAILED
   return Result<Progress, DecodeError>.failResult(
     DecodeError {kind: kind, consumed: state.inputPosition, written: state.outputPosition},
   )
@@ -538,117 +691,399 @@ fn failure(state: &mut Decoder, kind: ErrorKind) -> Result<Progress, DecodeError
 
 fn reject(state: &mut Decoder, kind: ErrorKind) -> u32 {
   state.error = kind
-  state.phase = 60
-  return 4
+  state.phase = PHASE_FAILED
+  return FAILED
 }
 
-// Reservoir reads are minimal: no full byte beyond the requested field is prefetched.
-fn readBits(state: &mut Decoder, input: &[u8], count: u32) -> bool {
-  while state.bitCount < count {
-    if state.inputPosition == input.length {
-      return false
-    }
-    if state.totalInput == state.limits.maxInputBytes {
-      let _rejected = reject(&mut state, ErrorKind.InputLimit)
-      return false
-    }
-    let byte = u8.toU32(input[state.inputPosition])
-    state.inputPosition = state.inputPosition + 1
-    state.totalInput = state.totalInput + 1
-    state.bits = u32.bitOr(state.bits, u32.shiftLeft(byte, state.bitCount))
-    state.bitCount = state.bitCount + 8
+// Returns what a unit that needs more bits than the buffer holds asks for: more input, or a
+// failure when input is left but the input limit stops the decoder from taking it.
+fn starve(state: &mut Decoder, input: &[u8]) -> u32 {
+  if state.inputPosition < input.length {
+    return reject(&mut state, ErrorKind.InputLimit)
   }
-  state.value = u32.bitAnd(state.bits, u32.shiftLeft(1, count) - 1)
-  state.bits = u32.shiftRight(state.bits, count)
-  state.bitCount = state.bitCount - count
+  return NEED_INPUT
+}
+
+// Returns `NEED_OUTPUT` when the output buffer is full, or fails when the output limit ends it
+// first.
+fn full(state: &mut Decoder, output: &[u8]) -> u32 {
+  if state.outputEnd == output.length {
+    return NEED_OUTPUT
+  }
+  return reject(&mut state, ErrorKind.OutputLimit)
+}
+
+// Returns the whole bytes of the bit buffer to the caller, who gives them again on the next call.
+// They are the last bytes that this call consumed. A step that needs more input keeps them, since
+// the unit it is reading needs all of them, so the bytes after the end of the stream are never
+// consumed.
+fn giveBack(state: &mut Decoder) -> () {
+  let mut whole = u32.toUsize(state.count / 8)
+  if whole > state.inputPosition {
+    whole = state.inputPosition
+  }
+  state.inputPosition = state.inputPosition - whole
+  state.count = state.count - usize.toU32(whole) * 8
+  state.acc = state.acc & lowMask(state.count)
+}
+
+// Adds the output since the last commit to the history and the checksum. The history keeps the
+// last 32 KiB of the member.
+fn commit(state: &mut Decoder, output: &[u8]) -> () {
+  let start = state.flushed
+  let end = state.outputPosition
+  if end == start {
+    return ()
+  }
+  let fresh = Slice.view<u8>(output, start, end - start)
+  if state.format == Format.Zlib {
+    state.adler = CompressionChecksum.adler32Update(state.adler, fresh)
+  }
+  if state.format == Format.Gzip {
+    state.crc = CompressionChecksum.crc32Update(state.crc, fresh)
+    state.memberSize = u32.wrappingAdd(state.memberSize, usize.wrappingToU32(fresh.length))
+  }
+  let next = state.historyNext
+  let ring = bytesMut(&mut state.ring)
+  if fresh.length >= RING {
+    Slice.copyInto<u8>(&mut ring, 0, Slice.view<u8>(output, end - RING, RING))
+    state.historyNext = 0
+  } else {
+    let mut first = RING - next
+    if first > fresh.length {
+      first = fresh.length
+    }
+    Slice.copyInto<u8>(&mut ring, next, Slice.view<u8>(fresh, 0, first))
+    if first < fresh.length {
+      Slice.copyInto<u8>(&mut ring, 0, Slice.view<u8>(fresh, first, fresh.length - first))
+    }
+    state.historyNext = (next + fresh.length) & RING_MASK
+  }
+  state.historyCount = state.historyCount + fresh.length
+  if state.historyCount > RING {
+    state.historyCount = RING
+  }
+  state.totalOutput = state.totalOutput + usize.toU64(fresh.length)
+  state.flushed = end
+}
+
+// The shift helpers below take counts below 64. The masks on the counts change nothing, and
+// they let the compiler drop the range checks of the shifts in the decode loops.
+
+// Returns a mask of the low `bits` bits, for `bits` below 64.
+@inlineAlways
+fn lowMask(bits: u32) -> u64 {
+  return u64.shiftLeft(1, u32.toU64(bits & 63)) - 1
+}
+
+// Returns `acc` without its low `bits` bits, for `bits` below 64.
+@inlineAlways
+fn shifted(acc: u64, bits: u32) -> u64 {
+  return u64.shiftRight(acc, u32.toU64(bits & 63))
+}
+
+// Returns `width` bits of `acc` from bit `shift`.
+@inlineAlways
+fn bitsAt(acc: u64, shift: u32, width: u32) -> u32 {
+  return u64.wrappingToU32(shifted(acc, shift) & lowMask(width))
+}
+
+// Reads 8 bytes at `at` as a little-endian word, with one bounds check.
+@inlineAlways
+fn load64(buffer: &[u8], at: usize) -> u64 {
+  let bytes = Slice.view<u8>(buffer, at, 8)
+  return u8.toU64(bytes[0]) | u64.shiftLeft(u8.toU64(bytes[1]), 8)
+    | u64.shiftLeft(u8.toU64(bytes[2]), 16)
+    | u64.shiftLeft(u8.toU64(bytes[3]), 24)
+    | u64.shiftLeft(u8.toU64(bytes[4]), 32)
+    | u64.shiftLeft(u8.toU64(bytes[5]), 40)
+    | u64.shiftLeft(u8.toU64(bytes[6]), 48)
+    | u64.shiftLeft(u8.toU64(bytes[7]), 56)
+}
+
+// Writes `value` as 8 little-endian bytes at `at`, with one bounds check.
+@inlineAlways
+fn store64(buffer: &mut [u8], at: usize, value: u64) -> () {
+  let bytes = Slice.viewMut<u8>(move buffer, at, 8)
+  bytes[0] = u64.wrappingToU8(value)
+  bytes[1] = u64.wrappingToU8(u64.shiftRight(value, 8))
+  bytes[2] = u64.wrappingToU8(u64.shiftRight(value, 16))
+  bytes[3] = u64.wrappingToU8(u64.shiftRight(value, 24))
+  bytes[4] = u64.wrappingToU8(u64.shiftRight(value, 32))
+  bytes[5] = u64.wrappingToU8(u64.shiftRight(value, 40))
+  bytes[6] = u64.wrappingToU8(u64.shiftRight(value, 48))
+  bytes[7] = u64.wrappingToU8(u64.shiftRight(value, 56))
+}
+
+// Fills the bit buffer to at least 57 bits, or with all of the input up to the input limit. The
+// bits above `count` stay zero.
+@inlineAlways
+fn fill(state: &mut Decoder, input: &[u8]) -> () {
+  if state.count > 56 {
+    return ()
+  }
+  if state.inputEnd - state.inputPosition >= 8 {
+    let take = (63 - state.count) / 8
+    let word = u64.shiftLeft(load64(input, state.inputPosition), u32.toU64(state.count & 63))
+    state.count = state.count + take * 8
+    state.acc = state.acc | (word & lowMask(state.count))
+    state.inputPosition = state.inputPosition + u32.toUsize(take)
+    return ()
+  }
+  while state.count <= 56 && state.inputPosition < state.inputEnd {
+    state.acc = state.acc
+      | u64.shiftLeft(u8.toU64(input[state.inputPosition]), u32.toU64(state.count))
+    state.count = state.count + 8
+    state.inputPosition = state.inputPosition + 1
+  }
+}
+
+@inlineAlways
+fn dropBits(state: &mut Decoder, bits: u32) -> () {
+  state.acc = shifted(state.acc, bits)
+  state.count = state.count - bits
+}
+
+// Reads `count` bits, at most 32, into `state.value`. Returns false, and takes nothing, if the
+// input ends first.
+fn readBits(state: &mut Decoder, input: &[u8], count: u32) -> bool {
+  fill(&mut state, input)
+  if state.count < count {
+    return false
+  }
+  state.value = bitsAt(state.acc, 0, count)
+  dropBits(&mut state, count)
   return true
 }
 
-fn headerByte(state: &mut Decoder, input: &[u8], checksum: bool) -> bool {
-  if state.inputPosition == input.length {
-    return false
+fn headerByte(state: &mut Decoder, input: &[u8], checksum: bool) -> u32 {
+  fill(&mut state, input)
+  if state.count < 8 {
+    if state.inputPosition == input.length {
+      return NEED_INPUT
+    }
   }
   if state.totalHeaders == state.limits.maxHeaderBytes {
-    let _rejected = reject(&mut state, ErrorKind.HeaderLimit)
-    return false
+    return reject(&mut state, ErrorKind.HeaderLimit)
   }
   if readBits(&mut state, input, 8) == false {
-    return false
+    return starve(&mut state, input)
   }
   state.totalHeaders = state.totalHeaders + 1
   if checksum {
-    state.headerCrc = crcByte(state.headerCrc, u32.toU8(state.value))
+    let one: [u8; 1] = [u32.toU8(state.value)]
+    state.headerCrc = CompressionChecksum.crc32Update(state.headerCrc, &one)
   }
-  return true
+  return GO
 }
 
-fn crcByte(crc: u32, byte: u8) -> u32 {
-  let mut value = u32.bitXor(crc, u8.toU32(byte))
-  let mut bit: u32 = 0
-  while bit < 8 {
-    let low = u32.bitAnd(value, 1)
-    value = u32.shiftRight(value, 1)
-    if low != 0 {
-      value = u32.bitXor(value, 0xedb88320)
-    }
-    bit = bit + 1
+// Looks up the code at the bottom of `acc` in the table at `base` with `root` index bits. Returns
+// the entry of the symbol, with the full code length in its low bits. The bits above the buffer
+// count are zero, so a code that fits in the buffer is found correctly.
+@inlineAlways
+fn lookup(table: &[u32], base: usize, root: u32, acc: u64) -> u32 {
+  let entry = table[base + u64.wrappingToUsize(acc & lowMask(root))]
+  if u32.shiftRight(entry, 12) & 15 != KIND_LINK {
+    return entry
   }
-  return value
+  let width = u32.shiftRight(entry, 8) & 15
+  let index = u32.toUsize(u32.shiftRight(entry, 16)) + u32.toUsize(bitsAt(acc, root, width))
+  return table[base + index] + root
 }
 
-fn emit(state: &mut Decoder, output: &mut [u8], byte: u8) -> u32 {
-  if state.outputPosition == output.length {
-    return 2
-  }
-  if state.totalOutput == state.limits.maxOutputBytes {
-    return reject(&mut state, ErrorKind.OutputLimit)
-  }
-  output[state.outputPosition] = byte
-  state.outputPosition = state.outputPosition + 1
-  state.totalOutput = state.totalOutput + 1
-  let historyNext = state.historyNext
-  List<u8>.set(&mut state.history, historyNext, byte)
-  state.historyNext = usize.remainder(state.historyNext + 1, 32768)
-  if state.historyCount < 32768 {
-    state.historyCount = state.historyCount + 1
-  }
-  if state.format == Format.Zlib {
-    state.adlerLow = u32.remainder(state.adlerLow + u8.toU32(byte), 65521)
-    state.adlerHigh = u32.remainder(state.adlerHigh + state.adlerLow, 65521)
-  }
-  if state.format == Format.Gzip {
-    state.crc = crcByte(state.crc, byte)
-    state.memberSize = u32.wrappingAdd(state.memberSize, 1)
-  }
-  return 0
+@inlineAlways
+fn kindOf(entry: u32) -> u32 {
+  return u32.shiftRight(entry, 12) & 15
+}
+
+@inlineAlways
+fn extraOf(entry: u32) -> u32 {
+  return u32.shiftRight(entry, 8) & 15
 }
 
 fn nextGzipField(state: &mut Decoder, phase: u32) -> () {
   state.index = 0
   state.trailer = 0
-  state.phase = 10
-  if phase < 5 && u32.bitAnd(state.flags, 2) != 0 {
-    state.phase = 5
+  state.phase = PHASE_BLOCK
+  if phase < PHASE_GZIP_HEADER_CRC && u32.bitAnd(state.flags, 2) != 0 {
+    state.phase = PHASE_GZIP_HEADER_CRC
   }
-  if phase < 4 && u32.bitAnd(state.flags, 16) != 0 {
-    state.phase = 4
+  if phase < PHASE_GZIP_COMMENT && u32.bitAnd(state.flags, 16) != 0 {
+    state.phase = PHASE_GZIP_COMMENT
   }
-  if phase < 3 && u32.bitAnd(state.flags, 8) != 0 {
-    state.phase = 3
+  if phase < PHASE_GZIP_NAME && u32.bitAnd(state.flags, 8) != 0 {
+    state.phase = PHASE_GZIP_NAME
   }
-  if phase < 1 && u32.bitAnd(state.flags, 4) != 0 {
-    state.phase = 1
+  if phase < PHASE_GZIP_EXTRA_LENGTH && u32.bitAnd(state.flags, 4) != 0 {
+    state.phase = PHASE_GZIP_EXTRA_LENGTH
   }
   return ()
 }
 
-// Numeric phases are private parser continuations; every transition either consumes a field or
-// moves to a different bounded continuation. No input replay is required after suspension.
 fn advance(state: &mut Decoder, input: &[u8], output: &mut [u8]) -> u32 {
-  if state.phase == 0 {
-    if headerByte(&mut state, input, true) == false {
-      return 1
+  let phase = state.phase
+  if phase == PHASE_SYMBOL {
+    return symbol(&mut state, input, &mut output)
+  }
+  if phase == PHASE_COPY {
+    return copy(&mut state, &mut output)
+  }
+  if phase == PHASE_DISTANCE {
+    return distance(&mut state, input)
+  }
+  if phase < PHASE_BLOCK {
+    return header(&mut state, input)
+  }
+  if phase == PHASE_BLOCK {
+    if readBits(&mut state, input, 3) == false {
+      return starve(&mut state, input)
     }
+    state.finalBlock = u32.bitAnd(state.value, 1) != 0
+    let kind = u32.shiftRight(state.value, 1)
+    if kind == 3 {
+      return reject(&mut state, ErrorKind.InvalidBlock)
+    }
+    if kind == 0 {
+      // A stored block starts at the next byte boundary.
+      let partial = state.count % 8
+      dropBits(&mut state, partial)
+      state.phase = PHASE_STORED_LENGTH
+    }
+    if kind == 1 {
+      if state.fixedLoaded == false {
+        fixedTables(&mut state)
+      }
+      state.phase = PHASE_SYMBOL
+    }
+    if kind == 2 {
+      state.fixedLoaded = false
+      state.phase = PHASE_COUNTS
+    }
+    return GO
+  }
+  if phase == PHASE_STORED_LENGTH {
+    if readBits(&mut state, input, 32) == false {
+      return starve(&mut state, input)
+    }
+    let length = state.value & 65535
+    if u32.shiftRight(state.value, 16) != u32.bitXor(length, 65535) {
+      return reject(&mut state, ErrorKind.InvalidBlock)
+    }
+    state.remaining = u32.toUsize(length)
+    state.phase = PHASE_STORED
+    return GO
+  }
+  if phase == PHASE_STORED {
+    return stored(&mut state, input, &mut output)
+  }
+  if phase == PHASE_COUNTS {
+    if readBits(&mut state, input, 14) == false {
+      return starve(&mut state, input)
+    }
+    state.literalCount = u32.toUsize(u32.bitAnd(state.value, 31)) + 257
+    state.distanceCount = u32.toUsize(u32.bitAnd(u32.shiftRight(state.value, 5), 31)) + 1
+    state.codeCount = u32.toUsize(u32.shiftRight(state.value, 10)) + 4
+    if state.literalCount > 286 {
+      return reject(&mut state, ErrorKind.InvalidHuffman)
+    }
+    RawBuffer.fill(&mut state.lengths, 0, LENGTH_COUNT, 0)
+    state.index = 0
+    state.phase = PHASE_CODE_LENGTHS
+    return GO
+  }
+  if phase == PHASE_CODE_LENGTHS {
+    while state.index < state.codeCount {
+      if readBits(&mut state, input, 3) == false {
+        return starve(&mut state, input)
+      }
+      let at = CODE_ORDER[state.index]
+      let value = u32.toU8(state.value)
+      let lengths = bytesMut(&mut state.lengths)
+      lengths[at] = value
+      state.index = state.index + 1
+    }
+    if buildCode(&mut state, 0, 19, ALPHABET_CODE, false, false) == false {
+      return reject(&mut state, ErrorKind.InvalidHuffman)
+    }
+    state.index = 0
+    state.phase = PHASE_LENGTHS
+    return GO
+  }
+  if phase == PHASE_LENGTHS {
+    return codeLengths(&mut state, input)
+  }
+  if phase == PHASE_ADLER {
+    if readBits(&mut state, input, 32) == false {
+      return starve(&mut state, input)
+    }
+    // The Adler-32 is stored most significant byte first.
+    let value = state.value
+    let expected = u32.shiftLeft(value & 255, 24) | u32.shiftLeft(u32.shiftRight(value, 8) & 255, 16)
+      | u32.shiftLeft(u32.shiftRight(value, 16) & 255, 8)
+      | u32.shiftRight(value, 24)
+    if expected != state.adler {
+      return reject(&mut state, ErrorKind.ChecksumMismatch)
+    }
+    return DONE
+  }
+  if phase == PHASE_GZIP_CRC {
+    if readBits(&mut state, input, 32) == false {
+      return starve(&mut state, input)
+    }
+    if state.value != state.crc {
+      return reject(&mut state, ErrorKind.ChecksumMismatch)
+    }
+    state.phase = PHASE_GZIP_SIZE
+    return GO
+  }
+  if phase == PHASE_GZIP_SIZE {
+    if readBits(&mut state, input, 32) == false {
+      return starve(&mut state, input)
+    }
+    if state.value != state.memberSize {
+      return reject(&mut state, ErrorKind.SizeMismatch)
+    }
+    state.phase = PHASE_MEMBER
+    return GO
+  }
+  if phase == PHASE_MEMBER {
+    // The trailer ends on a byte boundary, so the buffer holds only whole bytes of this call.
+    giveBack(&mut state)
+    if state.inputPosition == input.length {
+      if state.finalSeen {
+        return DONE
+      }
+      return NEED_INPUT
+    }
+    if state.members == state.limits.maxMembers {
+      return reject(&mut state, ErrorKind.MemberLimit)
+    }
+    state.members = state.members + 1
+    state.historyNext = 0
+    state.historyCount = 0
+    state.crc = 0
+    state.headerCrc = 0
+    state.memberSize = 0
+    state.adler = 1
+    state.index = 0
+    state.phase = PHASE_GZIP
+    return GO
+  }
+  if phase == PHASE_DONE {
+    return DONE
+  }
+  return reject(&mut state, ErrorKind.InvalidUse)
+}
+
+// Reads one byte of a gzip or zlib header.
+fn header(state: &mut Decoder, input: &[u8]) -> u32 {
+  let phase = state.phase
+  let checksum = phase < PHASE_GZIP_HEADER_CRC
+  let read = headerByte(&mut state, input, checksum)
+  if read != GO {
+    return read
+  }
+  if phase == PHASE_GZIP {
     if state.index == 0 && state.value != 31 {
       return reject(&mut state, ErrorKind.InvalidHeader)
     }
@@ -666,14 +1101,11 @@ fn advance(state: &mut Decoder, input: &[u8], output: &mut [u8]) -> u32 {
     }
     state.index = state.index + 1
     if state.index == 10 {
-      nextGzipField(&mut state, 0)
+      nextGzipField(&mut state, PHASE_GZIP)
     }
-    return 0
+    return GO
   }
-  if state.phase == 1 {
-    if headerByte(&mut state, input, true) == false {
-      return 1
-    }
+  if phase == PHASE_GZIP_EXTRA_LENGTH {
     state.trailer = u32.bitOr(
       state.trailer,
       u32.shiftLeft(state.value, usize.toU32(state.index) * 8),
@@ -681,52 +1113,41 @@ fn advance(state: &mut Decoder, input: &[u8], output: &mut [u8]) -> u32 {
     state.index = state.index + 1
     if state.index == 2 {
       state.remaining = u32.toUsize(state.trailer)
-      state.phase = 2
+      state.phase = PHASE_GZIP_EXTRA
+      if state.remaining == 0 {
+        nextGzipField(&mut state, PHASE_GZIP_EXTRA)
+      }
     }
-    return 0
+    return GO
   }
-  if state.phase == 2 {
-    if state.remaining == 0 {
-      nextGzipField(&mut state, 2)
-      return 0
-    }
-    if headerByte(&mut state, input, true) == false {
-      return 1
-    }
+  if phase == PHASE_GZIP_EXTRA {
     state.remaining = state.remaining - 1
-    return 0
-  }
-  if state.phase == 3 || state.phase == 4 {
-    if headerByte(&mut state, input, true) == false {
-      return 1
+    if state.remaining == 0 {
+      nextGzipField(&mut state, PHASE_GZIP_EXTRA)
     }
+    return GO
+  }
+  if phase == PHASE_GZIP_NAME || phase == PHASE_GZIP_COMMENT {
     if state.value == 0 {
-      let phase = state.phase
       nextGzipField(&mut state, phase)
     }
-    return 0
+    return GO
   }
-  if state.phase == 5 {
-    if headerByte(&mut state, input, false) == false {
-      return 1
-    }
+  if phase == PHASE_GZIP_HEADER_CRC {
     state.trailer = u32.bitOr(
       state.trailer,
       u32.shiftLeft(state.value, usize.toU32(state.index) * 8),
     )
     state.index = state.index + 1
     if state.index == 2 {
-      if state.trailer != u32.bitAnd(u32.bitNot(state.headerCrc), 65535) {
+      if state.trailer != u32.bitAnd(state.headerCrc, 65535) {
         return reject(&mut state, ErrorKind.ChecksumMismatch)
       }
-      state.phase = 10
+      state.phase = PHASE_BLOCK
     }
-    return 0
+    return GO
   }
-  if state.phase == 6 {
-    if headerByte(&mut state, input, false) == false {
-      return 1
-    }
+  if phase == PHASE_ZLIB_METHOD {
     state.first = state.value
     if u32.bitAnd(state.first, 15) != 8 {
       return reject(&mut state, ErrorKind.UnsupportedMethod)
@@ -735,432 +1156,533 @@ fn advance(state: &mut Decoder, input: &[u8], output: &mut [u8]) -> u32 {
       return reject(&mut state, ErrorKind.InvalidHeader)
     }
     state.window = u32.toUsize(u32.shiftLeft(1, 8 + u32.shiftRight(state.first, 4)))
-    state.phase = 7
-    return 0
+    state.phase = PHASE_ZLIB_FLAGS
+    return GO
   }
-  if state.phase == 7 {
-    if headerByte(&mut state, input, false) == false {
-      return 1
-    }
+  if phase == PHASE_ZLIB_FLAGS {
     if u32.remainder(state.first * 256 + state.value, 31) != 0 {
       return reject(&mut state, ErrorKind.InvalidHeader)
     }
     if u32.bitAnd(state.value, 32) != 0 {
-      return reject(&mut state, ErrorKind.UnsupportedDictionary)
-    }
-    state.phase = 10
-    return 0
-  }
-  if state.phase == 10 {
-    if readBits(&mut state, input, 3) == false {
-      return 1
-    }
-    state.finalBlock = u32.bitAnd(state.value, 1) != 0
-    let kind = u32.shiftRight(state.value, 1)
-    if kind == 3 {
-      return reject(&mut state, ErrorKind.InvalidBlock)
-    }
-    if kind == 0 {
-      state.bits = 0
-      state.bitCount = 0
-      state.phase = 11
-    }
-    if kind == 1 {
-      fixedTables(&mut state)
-      state.phase = 20
-    }
-    if kind == 2 {
-      state.phase = 14
-    }
-    return 0
-  }
-  if state.phase == 11 {
-    if readBits(&mut state, input, 16) == false {
-      return 1
-    }
-    state.remaining = u32.toUsize(state.value)
-    state.phase = 12
-    return 0
-  }
-  if state.phase == 12 {
-    if readBits(&mut state, input, 16) == false {
-      return 1
-    }
-    if state.value != u32.bitXor(usize.toU32(state.remaining), 65535) {
-      return reject(&mut state, ErrorKind.InvalidBlock)
-    }
-    state.phase = 13
-    return 0
-  }
-  if state.phase == 13 {
-    if state.remaining == 0 {
-      endBlock(&mut state)
-      return 0
-    }
-    if state.outputPosition == output.length {
-      return 2
-    }
-    if readBits(&mut state, input, 8) == false {
-      return 1
-    }
-    state.pending = u32.toU8(state.value)
-    state.phase = 27
-    return 0
-  }
-  if state.phase == 27 {
-    let pending = state.pending
-    let action = emit(&mut state, &mut output, pending)
-    if action != 0 {
-      return action
-    }
-    state.remaining = state.remaining - 1
-    state.phase = 13
-    return 0
-  }
-  if state.phase == 14 {
-    if readBits(&mut state, input, 14) == false {
-      return 1
-    }
-    state.literalCount = u32.toUsize(u32.bitAnd(state.value, 31)) + 257
-    state.distanceCount = u32.toUsize(u32.bitAnd(u32.shiftRight(state.value, 5), 31)) + 1
-    state.codeCount = u32.toUsize(u32.shiftRight(state.value, 10)) + 4
-    if state.literalCount > 286 {
-      return reject(&mut state, ErrorKind.InvalidHuffman)
-    }
-    clearLengths(&mut state)
-    state.index = 0
-    state.phase = 15
-    return 0
-  }
-  if state.phase == 15 {
-    if state.index == state.codeCount {
-      if buildTable(&mut state, 2, 0, 19, false, false) == false {
-        return reject(&mut state, ErrorKind.InvalidHuffman)
-      }
-      state.index = 0
-      state.phase = 16
-      return 0
-    }
-    if readBits(&mut state, input, 3) == false {
-      return 1
-    }
-    let index = codeOrder(state.index)
-    let value = state.value
-    writeLength(&mut state, index, value)
-    state.index = state.index + 1
-    return 0
-  }
-  if state.phase == 16 {
-    if state.index == state.literalCount + state.distanceCount {
-      if readLength(&state, 256) == 0 {
-        return reject(&mut state, ErrorKind.InvalidHuffman)
-      }
-      let literalCount = state.literalCount
-      let distanceCount = state.distanceCount
-      if buildTable(&mut state, 0, 0, literalCount, true, false) == false {
-        return reject(&mut state, ErrorKind.InvalidHuffman)
-      }
-      if buildTable(&mut state, 1, literalCount, distanceCount, true, true) == false {
-        return reject(&mut state, ErrorKind.InvalidHuffman)
-      }
-      state.phase = 20
-      return 0
-    }
-    if symbol(&mut state, input, 2) == false {
-      return 1
-    }
-    if state.value < 16 {
-      let index = state.index
-      let value = state.value
-      writeLength(&mut state, index, value)
-      state.index = state.index + 1
-      return 0
-    }
-    state.repeat = state.value
-    state.repeatValue = 0
-    if state.repeat == 16 {
-      if state.index == 0 {
-        return reject(&mut state, ErrorKind.InvalidHuffman)
-      }
-      let previous = state.index - 1
-      state.repeatValue = u32.toU8(readLength(&state, previous))
-    }
-    state.phase = 17
-    return 0
-  }
-  if state.phase == 17 {
-    let mut extra: u32 = 2
-    let mut base: usize = 3
-    if state.repeat == 17 {
-      extra = 3
-    }
-    if state.repeat == 18 {
-      extra = 7
-      base = 11
-    }
-    if readBits(&mut state, input, extra) == false {
-      return 1
-    }
-    let count = base + u32.toUsize(state.value)
-    if count > state.literalCount + state.distanceCount - state.index {
-      return reject(&mut state, ErrorKind.InvalidHuffman)
-    }
-    let end = state.index + count
-    while state.index < end {
-      let index = state.index
-      let value = u8.toU32(state.repeatValue)
-      writeLength(&mut state, index, value)
-      state.index = state.index + 1
-    }
-    state.phase = 16
-    return 0
-  }
-  if state.phase == 20 {
-    if symbol(&mut state, input, 0) == false {
-      return 1
-    }
-    if state.value < 256 {
-      state.pending = u32.toU8(state.value)
-      state.phase = 21
-      return 0
-    }
-    if state.value == 256 {
-      endBlock(&mut state)
-      return 0
-    }
-    if state.value > 285 {
-      return reject(&mut state, ErrorKind.InvalidBlock)
-    }
-    let code = state.value - 257
-    if code < 8 {
-      state.matchLength = u32.toUsize(code) + 3
-      state.extra = 0
-    }
-    if code >= 8 && code < 28 {
-      state.extra = u32.shiftRight(code - 4, 2)
-      state.matchLength = u32.toUsize(u32.shiftLeft(4 + u32.bitAnd(code, 3), state.extra)) + 3
-    }
-    if code == 28 {
-      state.matchLength = 258
-      state.extra = 0
-    }
-    state.phase = 22
-    return 0
-  }
-  if state.phase == 21 {
-    let pending = state.pending
-    let action = emit(&mut state, &mut output, pending)
-    if action != 0 {
-      return action
-    }
-    state.phase = 20
-    return 0
-  }
-  if state.phase == 22 {
-    let extra = state.extra
-    if readBits(&mut state, input, extra) == false {
-      return 1
-    }
-    state.matchLength = state.matchLength + u32.toUsize(state.value)
-    state.phase = 23
-    return 0
-  }
-  if state.phase == 23 {
-    if symbol(&mut state, input, 1) == false {
-      return 1
-    }
-    let code = state.value
-    if code > 29 {
-      return reject(&mut state, ErrorKind.InvalidDistance)
-    }
-    state.extra = 0
-    state.matchDistance = u32.toUsize(code) + 1
-    if code >= 4 {
-      state.extra = u32.shiftRight(code, 1) - 1
-      state.matchDistance = u32.toUsize(u32.shiftLeft(2 + u32.bitAnd(code, 1), state.extra)) + 1
-    }
-    state.phase = 24
-    return 0
-  }
-  if state.phase == 24 {
-    let extra = state.extra
-    if readBits(&mut state, input, extra) == false {
-      return 1
-    }
-    state.matchDistance = state.matchDistance + u32.toUsize(state.value)
-    if state.matchDistance > state.historyCount || state.matchDistance > state.window {
-      return reject(&mut state, ErrorKind.InvalidDistance)
-    }
-    state.phase = 25
-    return 0
-  }
-  if state.phase == 25 {
-    if state.matchLength == 0 {
-      state.phase = 20
-      return 0
-    }
-    let index = usize.remainder(state.historyNext + 32768 - state.matchDistance, 32768)
-    let byte = List<u8>.get(&state.history, index)
-    let action = emit(&mut state, &mut output, byte)
-    if action != 0 {
-      return action
-    }
-    state.matchLength = state.matchLength - 1
-    return 0
-  }
-  if state.phase == 30 {
-    if readBits(&mut state, input, 8) == false {
-      return 1
-    }
-    state.trailer = u32.bitOr(u32.shiftLeft(state.trailer, 8), state.value)
-    state.index = state.index + 1
-    if state.index == 4 {
-      let expected = u32.bitOr(u32.shiftLeft(state.adlerHigh, 16), state.adlerLow)
-      if state.trailer != expected {
-        return reject(&mut state, ErrorKind.ChecksumMismatch)
-      }
-      return 3
-    }
-    return 0
-  }
-  if state.phase == 31 || state.phase == 32 {
-    if readBits(&mut state, input, 8) == false {
-      return 1
-    }
-    state.trailer = u32.bitOr(
-      state.trailer,
-      u32.shiftLeft(state.value, usize.toU32(state.index) * 8),
-    )
-    state.index = state.index + 1
-    if state.index == 4 {
-      if state.phase == 31 {
-        if state.trailer != u32.bitNot(state.crc) {
-          return reject(&mut state, ErrorKind.ChecksumMismatch)
-        }
-        state.phase = 32
-      } else {
-        if state.trailer != state.memberSize {
-          return reject(&mut state, ErrorKind.SizeMismatch)
-        }
-        state.phase = 40
+      if state.dictionaryLength == 0 {
+        return reject(&mut state, ErrorKind.MissingDictionary)
       }
       state.index = 0
       state.trailer = 0
+      state.phase = PHASE_ZLIB_DICTIONARY
+      return GO
     }
-    return 0
-  }
-  if state.phase == 40 {
-    if state.inputPosition == input.length {
-      if state.finalSeen {
-        return 3
-      }
-      return 1
-    }
-    if state.members == state.limits.maxMembers {
-      return reject(&mut state, ErrorKind.MemberLimit)
-    }
-    state.members = state.members + 1
+    // A loaded dictionary that the header does not name is not part of this stream.
     state.historyNext = 0
     state.historyCount = 0
-    state.crc = 0xffffffff
-    state.headerCrc = 0xffffffff
-    state.memberSize = 0
-    state.adlerLow = 1
-    state.adlerHigh = 0
-    state.index = 0
-    state.phase = 0
-    return 0
+    state.phase = PHASE_BLOCK
+    return GO
   }
-  if state.phase == 50 {
-    return 3
-  }
-  return reject(&mut state, ErrorKind.InvalidUse)
-}
-
-fn endBlock(state: &mut Decoder) -> () {
-  state.phase = 10
-  if state.finalBlock {
-    state.bits = 0
-    state.bitCount = 0
+  // PHASE_ZLIB_DICTIONARY
+  state.trailer = u32.shiftLeft(state.trailer, 8) | state.value
+  state.index = state.index + 1
+  if state.index == 4 {
+    if state.trailer != state.dictionaryId {
+      return reject(&mut state, ErrorKind.DictionaryMismatch)
+    }
     state.index = 0
     state.trailer = 0
-    state.phase = 50
+    state.phase = PHASE_BLOCK
+  }
+  return GO
+}
+
+// Copies a stored block: first the whole bytes in the bit buffer, then straight from the input.
+fn stored(state: &mut Decoder, input: &[u8], output: &mut [u8]) -> u32 {
+  if state.remaining == 0 {
+    endBlock(&mut state, &output)
+    return GO
+  }
+  if state.outputPosition == state.outputEnd {
+    return full(&mut state, &output)
+  }
+  if state.count >= 8 {
+    output[state.outputPosition] = u64.wrappingToU8(state.acc)
+    dropBits(&mut state, 8)
+    state.outputPosition = state.outputPosition + 1
+    state.remaining = state.remaining - 1
+    return GO
+  }
+  let mut length = state.inputEnd - state.inputPosition
+  if length == 0 {
+    return starve(&mut state, input)
+  }
+  if length > state.remaining {
+    length = state.remaining
+  }
+  if length > state.outputEnd - state.outputPosition {
+    length = state.outputEnd - state.outputPosition
+  }
+  Slice.copyInto<u8>(&mut output, state.outputPosition, Slice.view<u8>(input, state.inputPosition, length))
+  state.inputPosition = state.inputPosition + length
+  state.outputPosition = state.outputPosition + length
+  state.remaining = state.remaining - length
+  return GO
+}
+
+// Reads the code lengths of the literal/length and distance codes, then builds their tables.
+fn codeLengths(state: &mut Decoder, input: &[u8]) -> u32 {
+  let total = state.literalCount + state.distanceCount
+  while state.index < total {
+    fill(&mut state, input)
+    let entry = lookup(words(&state.tables), CODE_BASE, CODE_ROOT, state.acc)
+    let bits = entry & 255
+    if bits > state.count {
+      return starve(&mut state, input)
+    }
+    let symbol = u32.shiftRight(entry, 16)
+    if symbol < 16 {
+      dropBits(&mut state, bits)
+      let at = state.index
+      let lengths = bytesMut(&mut state.lengths)
+      lengths[at] = u32.toU8(symbol)
+      state.index = state.index + 1
+      continue
+    }
+    if symbol == 16 && state.index == 0 {
+      return reject(&mut state, ErrorKind.InvalidHuffman)
+    }
+    let mut extra: u32 = 2
+    let mut base: usize = 3
+    if symbol == 17 {
+      extra = 3
+    }
+    if symbol == 18 {
+      extra = 7
+      base = 11
+    }
+    if bits + extra > state.count {
+      return starve(&mut state, input)
+    }
+    let repeat = base + u32.toUsize(bitsAt(state.acc, bits, extra))
+    dropBits(&mut state, bits + extra)
+    if repeat > total - state.index {
+      return reject(&mut state, ErrorKind.InvalidHuffman)
+    }
+    let mut value: u8 = 0
+    let at = state.index
+    let lengths = bytesMut(&mut state.lengths)
+    if symbol == 16 {
+      value = lengths[at - 1]
+    }
+    let mut index: usize = 0
+    while index < repeat {
+      lengths[at + index] = value
+      index = index + 1
+    }
+    state.index = at + repeat
+  }
+  let literalCount = state.literalCount
+  let distanceCount = state.distanceCount
+  if bytes(&state.lengths)[256] == 0 {
+    return reject(&mut state, ErrorKind.InvalidHuffman)
+  }
+  if buildCode(&mut state, 0, literalCount, ALPHABET_LITERAL, true, false) == false {
+    return reject(&mut state, ErrorKind.InvalidHuffman)
+  }
+  if buildCode(&mut state, literalCount, distanceCount, ALPHABET_DISTANCE, true, true) == false {
+    return reject(&mut state, ErrorKind.InvalidHuffman)
+  }
+  state.phase = PHASE_SYMBOL
+  return GO
+}
+
+// Decodes literal/length symbols. The fast loop runs while the input and output have room for a
+// whole sequence; then one unit at a time.
+fn symbol(state: &mut Decoder, input: &[u8], output: &mut [u8]) -> u32 {
+  if fastBlock(&mut state, input, &mut output) {
+    endBlock(&mut state, &output)
+    return GO
+  }
+  fill(&mut state, input)
+  let entry = lookup(words(&state.tables), LITERAL_BASE, LITERAL_ROOT, state.acc)
+  let bits = entry & 255
+  if bits > state.count {
+    return starve(&mut state, input)
+  }
+  let kind = kindOf(entry)
+  if kind == KIND_LITERAL {
+    if state.outputPosition == state.outputEnd {
+      return full(&mut state, &output)
+    }
+    dropBits(&mut state, bits)
+    output[state.outputPosition] = u32.wrappingToU8(u32.shiftRight(entry, 16))
+    state.outputPosition = state.outputPosition + 1
+    return GO
+  }
+  if kind == KIND_BASE {
+    let extra = extraOf(entry)
+    if bits + extra > state.count {
+      return starve(&mut state, input)
+    }
+    state.matchLength = u32.toUsize(u32.shiftRight(entry, 16) + bitsAt(state.acc, bits, extra))
+    dropBits(&mut state, bits + extra)
+    state.phase = PHASE_DISTANCE
+    return GO
+  }
+  if kind == KIND_END {
+    dropBits(&mut state, bits)
+    endBlock(&mut state, &output)
+    return GO
+  }
+  if kind == KIND_BAD_LENGTH {
+    return reject(&mut state, ErrorKind.InvalidBlock)
+  }
+  return reject(&mut state, ErrorKind.InvalidHuffman)
+}
+
+// Decodes the distance of a match whose length is read.
+fn distance(state: &mut Decoder, input: &[u8]) -> u32 {
+  fill(&mut state, input)
+  let entry = lookup(words(&state.tables), DISTANCE_BASE, DISTANCE_ROOT, state.acc)
+  let bits = entry & 255
+  if bits > state.count {
+    return starve(&mut state, input)
+  }
+  let kind = kindOf(entry)
+  if kind == KIND_BAD_CODE {
+    return reject(&mut state, ErrorKind.InvalidHuffman)
+  }
+  if kind == KIND_BAD_DISTANCE {
+    return reject(&mut state, ErrorKind.InvalidDistance)
+  }
+  let extra = extraOf(entry)
+  if bits + extra > state.count {
+    return starve(&mut state, input)
+  }
+  let found = u32.toUsize(u32.shiftRight(entry, 16) + bitsAt(state.acc, bits, extra))
+  dropBits(&mut state, bits + extra)
+  if found > state.historyCount + (state.outputPosition - state.flushed) || found > state.window {
+    return reject(&mut state, ErrorKind.InvalidDistance)
+  }
+  state.remaining = found
+  state.phase = PHASE_COPY
+  return GO
+}
+
+// Copies as much of the current match as the output has room for. The distance is in
+// `state.remaining`.
+fn copy(state: &mut Decoder, output: &mut [u8]) -> u32 {
+  if state.matchLength == 0 {
+    state.phase = PHASE_SYMBOL
+    return GO
+  }
+  if state.outputPosition == state.outputEnd {
+    return full(&mut state, &output)
+  }
+  let mut length = state.matchLength
+  if length > state.outputEnd - state.outputPosition {
+    length = state.outputEnd - state.outputPosition
+  }
+  let at = state.outputPosition
+  let found = state.remaining
+  let flushed = state.flushed
+  let next = state.historyNext
+  copyMatch(bytes(&state.ring), next, &mut output, at, flushed, found, length)
+  state.outputPosition = at + length
+  state.matchLength = state.matchLength - length
+  return GO
+}
+
+// Copies `length` bytes from `found` bytes back to `output[at..]`. The bytes before `flushed` are
+// in the history, which ends at `next`; the distance is valid and the output has room.
+@inlineAlways
+fn copyMatch(
+  ring: &[u8],
+  next: usize,
+  output: &mut [u8],
+  at: usize,
+  flushed: usize,
+  found: usize,
+  length: usize,
+) -> () {
+  let mut target = at
+  let mut left = length
+  let fresh = at - flushed
+  if found > fresh {
+    // The first bytes come from the history, in at most two pieces where it wraps.
+    let back = found - fresh
+    let mut take = back
+    if take > left {
+      take = left
+    }
+    let from = (next + RING - back) & RING_MASK
+    let mut first = RING - from
+    if first > take {
+      first = take
+    }
+    Slice.copyInto<u8>(&mut output, target, Slice.view<u8>(ring, from, first))
+    if first < take {
+      Slice.copyInto<u8>(&mut output, target + first, Slice.view<u8>(ring, 0, take - first))
+    }
+    target = target + take
+    left = left - take
+    if left == 0 {
+      return ()
+    }
+  }
+  copyBack(&mut output, target, found, left)
+}
+
+// Copies `length` bytes from `found` bytes back to `output[at..]`, where the source is in the
+// output. A match repeats with period `found`, so after its first 8 bytes it can also read from a
+// multiple of `found` that is at least 8 back, which allows 8-byte copies.
+@inlineAlways
+fn copyBack(output: &mut [u8], at: usize, found: usize, length: usize) -> () {
+  let end = at + length
+  let mut target = at
+  let mut back = found
+  if back < 8 && length >= 16 {
+    while target < at + 8 {
+      output[target] = output[target - found]
+      target = target + 1
+    }
+    back = (8 + found - 1) / found * found
+  }
+  if back >= 8 {
+    while target + 8 <= end {
+      let value = load64(&output, target - back)
+      store64(&mut output, target, value)
+      target = target + 8
+    }
+  }
+  while target < end {
+    output[target] = output[target - back]
+    target = target + 1
+  }
+}
+
+// The output room of the fast loop: the longest match, and 8 bytes that its last copy can write
+// past the end of the match.
+const FAST_ROOM: usize = 266
+
+// Copies `length` bytes from `found` bytes back to `output[at..]` in 8-byte pieces, where the
+// source is in the output. It can write up to 8 bytes after the match, which the output has room
+// for; later output overwrites them.
+@inlineAlways
+fn fastCopy(output: &mut [u8], at: usize, found: usize, length: usize) -> () {
+  let end = at + length
+  let mut target = at
+  let mut back = found
+  if found < 8 {
+    // A match repeats with period `found`, so after its first 8 bytes it can also read from the
+    // first multiple of `found` that is at least 8 back.
+    while target < at + 8 {
+      output[target] = output[target - found]
+      target = target + 1
+    }
+    back = (8 + found - 1) / found * found
+  }
+  while target < end {
+    let value = load64(&output, target - back)
+    store64(&mut output, target, value)
+    target = target + 8
+  }
+}
+
+// Decodes whole literals and matches while the input has 8 bytes ahead for each refill and the
+// output has room for the longest match. It stops before anything rare: a code it cannot decode,
+// or a distance past the history, which the unit path then reports. Returns true if it read the
+// end of the block.
+fn fastBlock(state: &mut Decoder, input: &[u8], output: &mut [u8]) -> bool {
+  let table = words(&state.tables)
+  let ring = bytes(&state.ring)
+  let inputEnd = state.inputEnd
+  let outputEnd = state.outputEnd
+  let flushed = state.flushed
+  let next = state.historyNext
+  let reach = state.historyCount
+  let window = state.window
+  let mut acc = state.acc
+  let mut count = state.count
+  let mut position = state.inputPosition
+  let mut at = state.outputPosition
+  let mut ended = false
+  while inputEnd - position >= 8 && outputEnd - at >= FAST_ROOM {
+    if count < 48 {
+      let take = (63 - count) / 8
+      let word = u64.shiftLeft(load64(input, position), u32.toU64(count & 63))
+      count = count + take * 8
+      acc = acc | (word & lowMask(count))
+      position = position + u32.toUsize(take)
+    }
+    let resolved = lookup(table, LITERAL_BASE, LITERAL_ROOT, acc)
+    let bits = resolved & 255
+    let kind = kindOf(resolved)
+    if kind == KIND_LITERAL {
+      acc = shifted(acc, bits)
+      count = count - bits
+      output[at] = u32.wrappingToU8(u32.shiftRight(resolved, 16))
+      at = at + 1
+      // At least 33 bits remain, so a second literal needs no refill.
+      let second = lookup(table, LITERAL_BASE, LITERAL_ROOT, acc)
+      if kindOf(second) == KIND_LITERAL {
+        let secondBits = second & 255
+        acc = shifted(acc, secondBits)
+        count = count - secondBits
+        output[at] = u32.wrappingToU8(u32.shiftRight(second, 16))
+        at = at + 1
+      }
+      continue
+    }
+    if kind != KIND_BASE {
+      if kind == KIND_END {
+        acc = shifted(acc, bits)
+        count = count - bits
+        ended = true
+      }
+      break
+    }
+    let extra = extraOf(resolved)
+    let length = u32.toUsize(u32.shiftRight(resolved, 16) + bitsAt(acc, bits, extra))
+    let used = bits + extra
+    let rest = shifted(acc, used)
+    let distanceEntry = lookup(table, DISTANCE_BASE, DISTANCE_ROOT, rest)
+    if kindOf(distanceEntry) != KIND_BASE {
+      break
+    }
+    let distanceBits = distanceEntry & 255
+    let distanceExtra = extraOf(distanceEntry)
+    let found = u32.toUsize(
+      u32.shiftRight(distanceEntry, 16) + bitsAt(rest, distanceBits, distanceExtra),
+    )
+    if found > reach + (at - flushed) || found > window {
+      break
+    }
+    let total = used + distanceBits + distanceExtra
+    acc = shifted(acc, total)
+    count = count - total
+    if found <= at - flushed {
+      fastCopy(&mut output, at, found, length)
+    } else {
+      copyMatch(ring, next, &mut output, at, flushed, found, length)
+    }
+    at = at + length
+  }
+  state.acc = acc
+  state.count = count
+  state.inputPosition = position
+  state.outputPosition = at
+  return ended
+}
+
+// Ends a block. After the final block, it skips to the next byte boundary and commits the output,
+// so that the trailer can check the checksum.
+fn endBlock(state: &mut Decoder, output: &[u8]) -> () {
+  state.phase = PHASE_BLOCK
+  if state.finalBlock {
+    let partial = state.count % 8
+    dropBits(&mut state, partial)
+    commit(&mut state, output)
+    state.index = 0
+    state.trailer = 0
+    state.phase = PHASE_DONE
     if state.format == Format.Zlib {
-      state.phase = 30
+      state.phase = PHASE_ADLER
     }
     if state.format == Format.Gzip {
-      state.phase = 31
+      state.phase = PHASE_GZIP_CRC
     }
   }
   return ()
 }
 
-fn codeOrder(index: usize) -> usize {
-  let values: [usize; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
-  return values[index]
-}
-
-// The workspace has three 304-word tables (16 counts plus 288 ordered symbols), followed by
-// 320 code lengths. Its 2048-word list capacity is fixed at construction. Keeping these values
-// in owned storage avoids a 1298-lane constructor return and LLVM IPSCCP work on aggregate copies.
-fn readLength(state: &Decoder, index: usize) -> u32 {
-  return List<u32>.get(&state.workspace, 912 + index)
-}
-
-fn writeLength(state: &mut Decoder, index: usize, value: u32) -> () {
-  List<u32>.set(&mut state.workspace, 912 + index, value)
-  return ()
-}
-
-fn clearLengths(state: &mut Decoder) -> () {
-  let mut index: usize = 0
-  while index < 320 {
-    writeLength(&mut state, index, 0)
-    index = index + 1
+// Returns the table entry of `symbol` in `alphabet`, without its code length.
+fn entryOf(alphabet: u32, symbol: u32) -> u32 {
+  if alphabet == ALPHABET_CODE {
+    return u32.shiftLeft(symbol, 16)
   }
-  return ()
+  if alphabet == ALPHABET_DISTANCE {
+    if symbol >= 30 {
+      return u32.shiftLeft(KIND_BAD_DISTANCE, 12)
+    }
+    let at = u32.toUsize(symbol)
+    return u32.shiftLeft(DISTANCE_BASE_VALUES[at], 16) | u32.shiftLeft(KIND_BASE, 12)
+      | u32.shiftLeft(DISTANCE_EXTRA[at], 8)
+  }
+  if symbol < 256 {
+    return u32.shiftLeft(symbol, 16)
+  }
+  if symbol == 256 {
+    return u32.shiftLeft(KIND_END, 12)
+  }
+  if symbol >= 286 {
+    return u32.shiftLeft(KIND_BAD_LENGTH, 12)
+  }
+  let at = u32.toUsize(symbol - 257)
+  return u32.shiftLeft(LENGTH_BASE[at], 16) | u32.shiftLeft(KIND_BASE, 12)
+    | u32.shiftLeft(LENGTH_EXTRA[at], 8)
 }
 
-fn buildTable(
+// Returns the bit-reversed `length`-bit code after the bit-reversed code `key`.
+@inlineAlways
+fn nextKey(key: u32, length: u32) -> u32 {
+  let mut step = u32.shiftLeft(1, length - 1)
+  while key & step != 0 {
+    step = u32.shiftRight(step, 1)
+  }
+  if step == 0 {
+    return 0
+  }
+  return (key & (step - 1)) + step
+}
+
+// Builds the table of `alphabet` from the `count` code lengths at `state.lengths[start..]`.
+// Returns false if the lengths are not a valid code. A code with unused bit patterns is valid only
+// if `single` is set and it has one symbol of length 1; those patterns decode as a bad code. A code
+// with no symbols is valid only if `empty` is set; every pattern then decodes as a bad code.
+fn buildCode(
   state: &mut Decoder,
-  table: u32,
   start: usize,
   count: usize,
+  alphabet: u32,
   single: bool,
   empty: bool,
 ) -> bool {
-  let mut counts = emptyCounts()
-  let mut index: usize = 0
+  let mut base = LITERAL_BASE
+  let mut capacity = LITERAL_CAPACITY
+  let mut root = LITERAL_ROOT
+  if alphabet == ALPHABET_DISTANCE {
+    base = DISTANCE_BASE
+    capacity = DISTANCE_CAPACITY
+    root = DISTANCE_ROOT
+  }
+  if alphabet == ALPHABET_CODE {
+    base = CODE_BASE
+    capacity = CODE_CAPACITY
+    root = CODE_ROOT
+  }
+  let lengths = bytes(&state.lengths)
+  let sorted = wordsMut(&mut state.sorted)
+  let table = wordsMut(&mut state.tables)
+  let mut counts: [u32; 16] = [0; 16]
   let mut maximum: u32 = 0
+  let mut index: usize = 0
   while index < count {
-    let bits = readLength(&state, start + index)
-    if bits > 15 {
-      return false
-    }
-    let length = u32.toUsize(bits)
-    counts[length] = counts[length] + 1
+    let bits = u8.toU32(lengths[start + index])
+    counts[u32.toUsize(bits)] = counts[u32.toUsize(bits)] + 1
     if bits > maximum {
       maximum = bits
     }
     index = index + 1
   }
-  if table == 0 {
-    state.literalMaximum = maximum
-  }
-  if table == 1 {
-    state.distanceMaximum = maximum
-  }
-  if table == 2 {
-    state.codeMaximum = maximum
-  }
-  let base = u32.toUsize(table) * 304
-  index = 0
-  while index < 16 {
-    List<u32>.set(&mut state.workspace, base + index, counts[index])
-    index = index + 1
-  }
+  let rootSize = usize.shiftLeft(1, u32.toUsize(root))
   if maximum == 0 {
-    return empty
+    if empty == false {
+      return false
+    }
+    let bad = u32.shiftLeft(KIND_BAD_CODE, 12)
+    index = 0
+    while index < rootSize {
+      table[base + index] = bad
+      index = index + 1
+    }
+    return true
   }
   let mut left: u32 = 1
   let mut length: usize = 1
@@ -1172,10 +1694,27 @@ fn buildTable(
     left = left - counts[length]
     length = length + 1
   }
-  if left != 0 && (single == false || maximum != 1) {
-    return false
+  if left != 0 {
+    if single == false || maximum != 1 {
+      return false
+    }
+    // One symbol of length 1: the pattern 0 is the symbol, and 1 is a bad code of length 1.
+    let mut symbol: u32 = 0
+    while lengths[start + u32.toUsize(symbol)] == 0 {
+      symbol = symbol + 1
+    }
+    let entry = entryOf(alphabet, symbol) | 1
+    let bad = u32.shiftLeft(KIND_BAD_CODE, 12) | 1
+    index = 0
+    while index < rootSize {
+      table[base + index] = entry
+      table[base + index + 1] = bad
+      index = index + 2
+    }
+    return true
   }
-  let mut offsets = emptyCounts()
+  // Sorts the symbols by code length, then by symbol.
+  let mut offsets: [u32; 16] = [0; 16]
   length = 1
   while length < 15 {
     offsets[length + 1] = offsets[length] + counts[length]
@@ -1183,63 +1722,82 @@ fn buildTable(
   }
   index = 0
   while index < count {
-    let bits = u32.toUsize(readLength(&state, start + index))
+    let bits = u8.toUsize(lengths[start + index])
     if bits != 0 {
-      let offset = base + 16 + u32.toUsize(offsets[bits])
-      List<u32>.set(&mut state.workspace, offset, usize.toU32(index))
+      sorted[u32.toUsize(offsets[bits])] = usize.toU32(index)
       offsets[bits] = offsets[bits] + 1
     }
     index = index + 1
   }
+  let rootMask = u32.shiftLeft(1, root) - 1
+  let mut remaining = counts
+  let mut key: u32 = 0
+  let mut used: usize = 0
+  let mut size: u32 = 1
+  while size <= root {
+    let step = usize.shiftLeft(1, u32.toUsize(size))
+    while remaining[u32.toUsize(size)] > 0 {
+      let entry = entryOf(alphabet, sorted[used]) | size
+      used = used + 1
+      index = u32.toUsize(key)
+      while index < rootSize {
+        table[base + index] = entry
+        index = index + step
+      }
+      key = nextKey(key, size)
+      remaining[u32.toUsize(size)] = remaining[u32.toUsize(size)] - 1
+    }
+    size = size + 1
+  }
+  let mut total = rootSize
+  let mut low: u32 = rootMask + 1
+  let mut span: usize = 0
+  let mut part: usize = 0
+  while size <= 15 {
+    let step = usize.shiftLeft(1, u32.toUsize(size - root))
+    while remaining[u32.toUsize(size)] > 0 {
+      if (key & rootMask) != low {
+        low = key & rootMask
+
+        // The smallest second-level part that the codes with this root prefix fill.
+        let mut bits = size - root
+        let mut room = u32.toI64(u32.shiftLeft(1, bits))
+        while bits + root < 15 {
+          room = room - u32.toI64(remaining[u32.toUsize(bits + root)])
+          if room <= 0 {
+            break
+          }
+          bits = bits + 1
+          room = room * 2
+        }
+        span = usize.shiftLeft(1, u32.toUsize(bits))
+        if total + span > capacity {
+          return false
+        }
+        table[base + u32.toUsize(low)] = u32.shiftLeft(usize.toU32(total), 16)
+          | u32.shiftLeft(KIND_LINK, 12)
+          | u32.shiftLeft(bits, 8)
+          | root
+        part = base + total
+        total = total + span
+      }
+      let entry = entryOf(alphabet, sorted[used]) | (size - root)
+      used = used + 1
+      index = u32.toUsize(u32.shiftRight(key, root))
+      while index < span {
+        table[part + index] = entry
+        index = index + step
+      }
+      key = nextKey(key, size)
+      remaining[u32.toUsize(size)] = remaining[u32.toUsize(size)] - 1
+    }
+    size = size + 1
+  }
   return true
 }
 
-fn tableCount(state: &Decoder, table: u32, length: usize) -> u32 {
-  let offset = u32.toUsize(table) * 304 + length
-  return List<u32>.get(&state.workspace, offset)
-}
-
-fn tableSymbol(state: &Decoder, table: u32, index: usize) -> usize {
-  let offset = u32.toUsize(table) * 304 + 16 + index
-  return u32.toUsize(List<u32>.get(&state.workspace, offset))
-}
-
-// Canonical codes arrive most-significant bit first, although each containing byte is read
-// least-significant bit first. Persist all four traversal values when one code spans calls.
-fn symbol(state: &mut Decoder, input: &[u8], table: u32) -> bool {
-  let mut maximum = state.codeMaximum
-  if table == 0 {
-    maximum = state.literalMaximum
-  }
-  if table == 1 {
-    maximum = state.distanceMaximum
-  }
-  while state.hLength <= maximum {
-    if readBits(&mut state, input, 1) == false {
-      return false
-    }
-    state.hCode = u32.bitOr(state.hCode, state.value)
-    let length = u32.toUsize(state.hLength)
-    let count = tableCount(&state, table, length)
-    if state.hCode >= state.hFirst && state.hCode - state.hFirst < count {
-      let index = state.hIndex + state.hCode - state.hFirst
-      state.value = usize.toU32(tableSymbol(&state, table, u32.toUsize(index)))
-      state.hCode = 0
-      state.hFirst = 0
-      state.hIndex = 0
-      state.hLength = 1
-      return true
-    }
-    state.hIndex = state.hIndex + count
-    state.hFirst = (state.hFirst + count) * 2
-    state.hCode = state.hCode * 2
-    state.hLength = state.hLength + 1
-  }
-  let _rejected = reject(&mut state, ErrorKind.InvalidHuffman)
-  return false
-}
-
 fn fixedTables(state: &mut Decoder) -> () {
+  let lengths = bytesMut(&mut state.lengths)
   let mut index: usize = 0
   while index < 288 {
     let mut bits: u8 = 8
@@ -1249,18 +1807,15 @@ fn fixedTables(state: &mut Decoder) -> () {
     if index >= 256 && index < 280 {
       bits = 7
     }
-    writeLength(&mut state, index, u8.toU32(bits))
+    lengths[index] = bits
     index = index + 1
   }
   while index < 320 {
-    writeLength(&mut state, index, 5)
+    lengths[index] = 5
     index = index + 1
   }
-  let _literals = buildTable(&mut state, 0, 0, 288, false, false)
-  let _distances = buildTable(&mut state, 1, 288, 32, false, false)
+  let _literals = buildCode(&mut state, 0, 288, ALPHABET_LITERAL, false, false)
+  let _distances = buildCode(&mut state, 288, 32, ALPHABET_DISTANCE, false, false)
+  state.fixedLoaded = true
   return ()
-}
-
-fn emptyCounts() -> [u32; 16] {
-  return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 }

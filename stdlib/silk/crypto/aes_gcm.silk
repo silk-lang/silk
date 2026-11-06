@@ -1,4 +1,4 @@
-//! Encrypt and authenticate data with AES-128-GCM or AES-256-GCM (NIST SP 800-38D).
+//! Encrypt and authenticate data with AES-128-GCM, AES-192-GCM, or AES-256-GCM (NIST SP 800-38D).
 //!
 //! # When to use
 //! Use [`AesGcm.seal`] to encrypt a message so that only holders of the key can read it and any
@@ -6,10 +6,17 @@
 //! an algorithm, `silk.crypto.chacha20_poly1305` is also a good choice.
 //!
 //! # Details
-//! The key is 16 bytes (AES-128) or 32 bytes (AES-256), the nonce is 12 bytes, and the tag is 16
-//! bytes. The tag is separate from the ciphertext ("detached"), so store or send both. The
-//! associated data (`aad`) is authenticated but not encrypted. Use it for headers that must stay
-//! readable. The ciphertext has the same length as the plaintext. Nothing allocates.
+//! The key is 16 bytes (AES-128), 24 bytes (AES-192), or 32 bytes (AES-256). The nonce is usually
+//! 12 bytes; any other nonzero length is hashed into the first counter block, as NIST SP 800-38D
+//! says. The tag is 16 bytes, or a prefix of 4, 8 or 12 to 15 bytes. The tag is separate from the ciphertext ("detached"), so store or send
+//! both. The associated data (`aad`) is authenticated but not encrypted. Use it for headers that
+//! must stay readable. The ciphertext has the same length as the plaintext. Nothing allocates.
+//!
+//! For data that arrives in parts, such as a stream or a Node.js `createCipheriv` call, use
+//! [`AesGcmEncryptor`] and [`AesGcmDecryptor`]. They take the message in any split, give the same
+//! result, accept nonces of any nonzero length, and can write a truncated tag. On x86-64 they check
+//! for AES-NI and PCLMULQDQ at run time, as [`AesGcm.seal`] and [`AesGcm.open`] do, and then run
+//! the counter mode and GHASH eight blocks at a time.
 //!
 //! # Errors
 //! The functions return an [`AesGcmError`]. All checks come before the first write, and on any
@@ -18,8 +25,8 @@
 //!
 //! # Gotchas
 //! The same key and nonce must never encrypt two messages. If they do, an attacker can recover the
-//! XOR of the two plaintexts and forge tags. Use a counter, or 12 random bytes from `silk.system.random`
-//! for a small number of messages per key.
+//! XOR of the two plaintexts and forge tags. Use a counter, or 12 random bytes from
+//! `silk.system.random` for a small number of messages per key.
 //!
 //! Authentication does not stop replay: an attacker can send an old valid message again. The
 //! functions do not erase their copies of the key.
@@ -95,6 +102,15 @@
 
 import silk.text.format {Debug, Format, Formatter}
 import silk.core.result {Result}
+import silk.crypto.aes
+import silk.crypto.aes {Aes, AesError}
+import silk.core.target {Arch, Target}
+import silk.simd.cpu {CpuFeatures}
+import silk.simd.u8x16
+import silk.simd.u32x4
+import silk.simd.u64x2
+import silk.collections.slice {Slice}
+import silk.core.ownership {Copy}
 import silk.num.u8
 import silk.num.u32
 import silk.num.u64
@@ -104,11 +120,11 @@ import silk.io.writer {Writer, WriterError}
 /// The reason that [`AesGcm.seal`] or [`AesGcm.open`] rejected a call. The output buffers do not
 /// change.
 pub union AesGcmError {
-  /// The key is not 16 or 32 bytes.
+  /// The key is not 16, 24, or 32 bytes.
   InvalidKeyLength,
-  /// The nonce is not 12 bytes.
+  /// The nonce is empty or longer than 2^61 - 1 bytes.
   InvalidNonceLength,
-  /// The tag, or the tag output, is not 16 bytes.
+  /// The tag, or the tag output, is not 4, 8, or 12 to 16 bytes.
   InvalidTagLength,
   /// The output is shorter than the input message.
   OutputTooSmall,
@@ -134,7 +150,8 @@ impl Debug for AesGcmError {
   }
 }
 
-/// Functions that encrypt and authenticate with AES-128-GCM or AES-256-GCM (NIST SP 800-38D).
+/// Functions that encrypt and authenticate with AES-128-GCM, AES-192-GCM, or AES-256-GCM (NIST SP
+/// 800-38D).
 ///
 /// # When to use
 ///
@@ -143,10 +160,11 @@ impl Debug for AesGcmError {
 ///
 /// # Details
 ///
-/// The key is 16 bytes (AES-128) or 32 bytes (AES-256), the nonce is 12 bytes, and the tag is 16
-/// bytes. The tag is separate from the ciphertext, so store or send both. The ciphertext has the
-/// same length as the plaintext. Nothing allocates. All checks come before the first write, and on
-/// any error the output buffers do not change.
+/// The key is 16 bytes (AES-128), 24 bytes (AES-192), or 32 bytes (AES-256). The nonce is usually
+/// 12 bytes but can have any nonzero length. The tag is 16 bytes, or a prefix of 4, 8 or 12 to 15
+/// bytes. The tag is separate from the ciphertext, so store or send both. The
+/// ciphertext has the same length as the plaintext. Nothing allocates. All checks come before the
+/// first write, and on any error the output buffers do not change.
 ///
 /// # Gotchas
 ///
@@ -156,28 +174,30 @@ impl Debug for AesGcmError {
 pub struct AesGcm {}
 
 impl AesGcm {
-  /// Encrypts `plaintext` into `ciphertext` and writes the 16-byte authentication tag to `tag`.
+  /// Encrypts `plaintext` into `ciphertext` and writes the authentication tag to `tag`.
   ///
-  /// The key is 16 bytes (AES-128) or 32 bytes (AES-256), and the nonce is 12 bytes. `aad` is
-  /// authenticated but not encrypted. Use it for headers that must stay readable. The ciphertext
-  /// has the same length as `plaintext`. `ciphertext` can be longer than `plaintext`. The bytes
-  /// after the written prefix do not change. The buffers must not overlap. Nothing allocates.
+  /// The key is 16 bytes (AES-128), 24 bytes (AES-192), or 32 bytes (AES-256). The nonce is usually
+  /// 12 bytes and can have any nonzero length. `tag` is 16 bytes for the full tag, or 4, 8 or 12 to
+  /// 15 bytes for a prefix of it. `aad` is authenticated but not encrypted. Use it for headers that must stay readable.
+  /// The ciphertext has the same length as `plaintext`. `ciphertext` can be longer than
+  /// `plaintext`. The bytes after the written prefix do not change. The buffers must not overlap.
+  /// Nothing allocates.
   ///
   /// # Errors
   /// All checks come before the first write. On an error, `ciphertext` and `tag` do not change.
   ///
-  /// - `InvalidKeyLength` if `key` is not 16 or 32 bytes.
-  /// - `InvalidNonceLength` if `nonce` is not 12 bytes.
-  /// - `InvalidTagLength` if `tag` is not 16 bytes.
+  /// - `InvalidKeyLength` if `key` is not 16, 24, or 32 bytes.
+  /// - `InvalidNonceLength` if `nonce` is empty or longer than 2^61 - 1 bytes.
+  /// - `InvalidTagLength` if `tag` is not 4, 8, or 12 to 16 bytes.
   /// - `OutputTooSmall` if `ciphertext` is shorter than `plaintext`.
   /// - `LimitExceeded` if `plaintext` is longer than 2^36 - 32 bytes or `aad` is longer than
   ///   2^61 - 1 bytes.
   ///
   /// # Gotchas
   /// Use a new nonce for each message under the same key. The function does not make one. If the
-  /// same key and nonce encrypt two messages, an attacker can recover the XOR of the two
-  /// plaintexts and forge tags. Use a counter, or 12 random bytes from `silk.system.random` for a small
-  /// number of messages per key. The function does not erase its copy of the key.
+  /// same key and nonce encrypt two messages, an attacker can recover the XOR of the two plaintexts
+  /// and forge tags. Use a counter, or 12 random bytes from `silk.system.random` for a small number
+  /// of messages per key. The function does not erase its copy of the key.
   pub fn seal(
     key: &[u8],
     nonce: &[u8],
@@ -197,11 +217,27 @@ impl AesGcm {
     if let Result.Failure {error} = move admitted {
       return Result<(), AesGcmError>.failResult(move error)
     }
-    let schedule = expandKey(key)
-    crypt(&schedule, nonce, plaintext, &mut ciphertext)
-    let computed = authenticate(&schedule, nonce, aad, &ciphertext, plaintext.length)
+    static if Target.arch() == Arch.X86_64 {
+      // The kernel takes the common shape; other nonce and tag lengths take the stream core, which
+      // also uses the instructions.
+      if nonce.length == 12 && tag.length == 16 && hardware() {
+        unsafe sealX86(key, nonce, aad, plaintext, &mut ciphertext, &mut tag)
+        return Result<(), AesGcmError>.succeed(())
+      }
+    }
+    static if Target.arch() == Arch.Aarch64 {
+      if nonce.length == 12 && tag.length == 16 && hardware() {
+        unsafe sealArm(key, nonce, aad, plaintext, &mut ciphertext, &mut tag)
+        return Result<(), AesGcmError>.succeed(())
+      }
+    }
+    let mut core = makeCore(key, nonce)
+    core.aadLength = usize.toU64(aad.length)
+    ghashAbsorb(&mut core.ghash, aad)
+    coreText(&mut core, plaintext, &mut ciphertext, false)
+    let computed = coreTag(&mut core)
     let mut index: usize = 0
-    while index < 16 {
+    while index < tag.length {
       tag[index] = computed[index]
       index = index + 1
     }
@@ -209,18 +245,19 @@ impl AesGcm {
   }
   /// Checks `tag`, and if it is correct, decrypts `ciphertext` into `plaintext`.
   ///
-  /// The key is 16 bytes (AES-128) or 32 bytes (AES-256), the nonce is 12 bytes, and the tag is 16
-  /// bytes. `aad` must be the same bytes that were given to [`AesGcm.seal`]. The function checks
-  /// all 16 tag bytes before it writes `plaintext`. The bytes after the written prefix do not
-  /// change. Nothing allocates.
+  /// The key is 16 bytes (AES-128), 24 bytes (AES-192), or 32 bytes (AES-256), and the nonce is the
+  /// one given to [`AesGcm.seal`]. `tag` is 16 bytes, or a prefix of 4, 8 or 12 to 15 bytes, which
+  /// is compared in constant time. `aad` must be the same bytes that were given to
+  /// [`AesGcm.seal`]. The function checks every tag byte before it writes `plaintext`. The bytes
+  /// after the written prefix do not change. Nothing allocates.
   ///
   /// # Errors
   /// All checks come before the first write. On an error, `plaintext` does not change.
   ///
   /// - `AuthenticationFailed` if the tag is not correct for the key, nonce, `aad`, and ciphertext.
-  /// - `InvalidKeyLength` if `key` is not 16 or 32 bytes.
-  /// - `InvalidNonceLength` if `nonce` is not 12 bytes.
-  /// - `InvalidTagLength` if `tag` is not 16 bytes.
+  /// - `InvalidKeyLength` if `key` is not 16, 24, or 32 bytes.
+  /// - `InvalidNonceLength` if `nonce` is empty or longer than 2^61 - 1 bytes.
+  /// - `InvalidTagLength` if `tag` is not 4, 8, or 12 to 16 bytes.
   /// - `OutputTooSmall` if `plaintext` is shorter than `ciphertext`.
   /// - `LimitExceeded` if `ciphertext` is longer than 2^36 - 32 bytes or `aad` is longer than
   ///   2^61 - 1 bytes.
@@ -247,20 +284,34 @@ impl AesGcm {
     if let Result.Failure {error} = move admitted {
       return Result<(), AesGcmError>.failResult(move error)
     }
-    let schedule = expandKey(key)
-    let computed = authenticate(&schedule, nonce, aad, ciphertext, ciphertext.length)
-    // The sum is bounded by 16 * 255. Keep this form: optimized Wasm may
-    // turn an OR-of-XOR reduction into early-exit byte comparisons.
-    let mut difference: u32 = 0
-    let mut index: usize = 0
-    while index < 16 {
-      difference = u32.wrappingAdd(difference, u8.toU32(u8.bitXor(computed[index], tag[index])))
-      index = index + 1
+    static if Target.arch() == Arch.X86_64 {
+      if nonce.length == 12 && tag.length == 16 && hardware() {
+        if unsafe openX86(key, nonce, aad, ciphertext, tag, &mut plaintext) {
+          return Result<(), AesGcmError>.succeed(())
+        }
+        return Result<(), AesGcmError>.failResult(AesGcmError.AuthenticationFailed)
+      }
     }
-    if difference != 0 {
+    static if Target.arch() == Arch.Aarch64 {
+      if nonce.length == 12 && tag.length == 16 && hardware() {
+        if unsafe openArm(key, nonce, aad, ciphertext, tag, &mut plaintext) {
+          return Result<(), AesGcmError>.succeed(())
+        }
+        return Result<(), AesGcmError>.failResult(AesGcmError.AuthenticationFailed)
+      }
+    }
+    let mut core = makeCore(key, nonce)
+    core.aadLength = usize.toU64(aad.length)
+    ghashAbsorb(&mut core.ghash, aad)
+    ghashPad(&mut core.ghash)
+    core.inText = true
+    core.textLength = usize.toU64(ciphertext.length)
+    ghashAbsorb(&mut core.ghash, ciphertext)
+    let computed = coreTag(&mut core)
+    if tagsDiffer(&computed, tag) {
       return Result<(), AesGcmError>.failResult(AesGcmError.AuthenticationFailed)
     }
-    crypt(&schedule, nonce, ciphertext, move plaintext)
+    keystreamApply(&mut core.keystream, ciphertext, move plaintext)
     return Result<(), AesGcmError>.succeed(())
   }
 }
@@ -274,13 +325,13 @@ fn validate(key: usize, nonce: usize, tag: usize, message: usize, aad: usize, ou
   (),
   AesGcmError,
 > {
-  if key != 16 && key != 32 {
+  if key != 16 && key != 24 && key != 32 {
     return Result<(), AesGcmError>.failResult(AesGcmError.InvalidKeyLength)
   }
-  if nonce != 12 {
+  if nonce == 0 || usize.toU64(nonce) > 2305843009213693951 {
     return Result<(), AesGcmError>.failResult(AesGcmError.InvalidNonceLength)
   }
-  if tag != 16 {
+  if tagLengthAdmitted(tag) == false {
     return Result<(), AesGcmError>.failResult(AesGcmError.InvalidTagLength)
   }
   if output < message {
@@ -292,145 +343,613 @@ fn validate(key: usize, nonce: usize, tag: usize, message: usize, aad: usize, ou
   return Result<(), AesGcmError>.succeed(())
 }
 
-struct KeySchedule {
-  words: [u32; 60],
+// The key length is already checked, so expansion cannot fail.
+fn expand(key: &[u8]) -> Aes {
+  return match Aes.make(key) {
+    Result<Aes, AesError>.Success { value } => move value
+    Result<Aes, AesError>.Failure { error: _ } => Intrinsic.trap("AesGcm: key length checked")
+  }
+}
+
+// Tag lengths of NIST SP 800-38D section 5.2.1.2: 128, 120, 112, 104 and 96 bits, and the 64 and
+// 32 bits it allows for some protocols.
+fn tagLengthAdmitted(length: usize) -> bool {
+  return length == 4 || length == 8 || (length >= 12 && length <= 16)
+}
+
+// Compares the first `tag.length` bytes of `computed` with `tag` without stopping early. The sum is
+// bounded by 16 * 255. Keep this form: optimized Wasm may turn an OR-of-XOR reduction into
+// early-exit byte comparisons.
+fn tagsDiffer(computed: &[u8; 16], tag: &[u8]) -> bool {
+  let mut difference: u32 = 0
+  let mut index: usize = 0
+  while index < tag.length {
+    difference = u32.wrappingAdd(difference, u8.toU32(u8.bitXor(computed[index], tag[index])))
+    index = index + 1
+  }
+  return difference != 0
+}
+
+// The round keys of AES-128 (10 rounds), AES-192 (12 rounds) or AES-256 (14 rounds), as `aesenc`
+// takes them (the AArch64 kernel's `aese` takes the same bytes). Only the kernels use them; elsewhere
+// they stay zero.
+struct RoundKeys {
+  keys: [simd<u64, 2>; 15],
   rounds: usize,
+}
+
+// The hash key's powers H to H^8, each `[low word, high word]`, with each power's words swapped
+// and its Karatsuba sum (low XOR high in both words). Eight blocks hash as
+// ((X + b0) H^8) + (b1 H^7) + ... + (b7 H) with one reduction, so the products do not wait for
+// each other. Only the kernels use them; elsewhere they stay zero. The AArch64 kernel hashes four
+// blocks per reduction and fills only H to H^4.
+struct HashKeys {
+  powers: [simd<u64, 2>; 8],
+  swapped: [simd<u64, 2>; 8],
+  sums: [simd<u64, 2>; 8],
+}
+
+fn zeroRoundKeys() -> RoundKeys {
+  let zero = u64x2.splat(0)
+  return RoundKeys {
+    keys: [zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero],
+    rounds: 0,
+  }
+}
+
+fn zeroHashKeys() -> HashKeys {
+  let zero = u64x2.splat(0)
+  return HashKeys {
+    powers: [zero, zero, zero, zero, zero, zero, zero, zero],
+    swapped: [zero, zero, zero, zero, zero, zero, zero, zero],
+    sums: [zero, zero, zero, zero, zero, zero, zero, zero],
+  }
+}
+
+// True when this machine's kernel can run: AES-NI, PCLMULQDQ and SSSE3 on x86-64, the AES and
+// PMULL instructions on AArch64.
+fn hardware() -> bool {
+  static if Target.arch() == Arch.X86_64 {
+    return CpuFeatures.available("aes") && CpuFeatures.available("pclmul") && CpuFeatures.available("ssse3")
+  }
+  static if Target.arch() == Arch.Aarch64 {
+    return CpuFeatures.available("aes")
+  }
+  return false
+}
+
+struct FieldBlock {
+  high: u64,
+  low: u64,
+}
+
+impl Copy for FieldBlock {}
+
+fn multiplyField(value: FieldBlock, key: FieldBlock) -> FieldBlock {
+  let mut high = value.high
+  let mut low = value.low
+  let mut vHigh = key.high
+  let mut vLow = key.low
+  let mut result = FieldBlock { high: 0, low: 0 }
+  let mut index: usize = 0
+  while index < 128 {
+    let mask = u64.wrappingSubtract(0, u64.shiftRight(high, 63))
+    result.high = u64.bitXor(result.high, u64.bitAnd(vHigh, mask))
+    result.low = u64.bitXor(result.low, u64.bitAnd(vLow, mask))
+    high = u64.bitOr(u64.shiftLeft(high, 1), u64.shiftRight(low, 63))
+    low = u64.shiftLeft(low, 1)
+    let reduction = u64.wrappingSubtract(0, u64.bitAnd(vLow, 1))
+    vLow = u64.bitOr(u64.shiftRight(vLow, 1), u64.shiftLeft(vHigh, 63))
+    vHigh = u64.bitXor(u64.shiftRight(vHigh, 1), u64.bitAnd(reduction, 16212958658533785600))
+    index = index + 1
+  }
+  return result
+}
+
+fn loadField(bytes: &[u8], offset: usize) -> FieldBlock {
+  let mut block = FieldBlock { high: 0, low: 0 }
+  let mut index: usize = 0
+  while index < 8 {
+    block.high = u64.bitOr(u64.shiftLeft(block.high, 8), u8.toU64(bytes[offset + index]))
+    block.low = u64.bitOr(u64.shiftLeft(block.low, 8), u8.toU64(bytes[offset + index + 8]))
+    index = index + 1
+  }
+  return block
+}
+
+// GHASH of NIST SP 800-38D section 6.4 over input that arrives in parts. `buffer` holds the bytes
+// of an incomplete block.
+struct Ghash {
+  key: FieldBlock,
+  state: FieldBlock,
+  buffer: [u8; 16],
+  buffered: usize,
+  hardware: bool,
+  powers: HashKeys,
+}
+
+fn ghashBlock(ghash: &mut Ghash, block: FieldBlock) -> () {
+  let mixed = FieldBlock {
+    high: u64.bitXor(ghash.state.high, block.high),
+    low: u64.bitXor(ghash.state.low, block.low),
+  }
+  static if Target.arch() == Arch.X86_64 {
+    if ghash.hardware {
+      let product = unsafe multiplyX86(u64x2.fromArray([mixed.low, mixed.high]), ghash.powers.powers[0])
+      ghash.state = FieldBlock {high: u64x2.extract(product, 1), low: u64x2.extract(product, 0)}
+      return ()
+    }
+  }
+  static if Target.arch() == Arch.Aarch64 {
+    if ghash.hardware {
+      let product = unsafe multiplyArm(u64x2.fromArray([mixed.low, mixed.high]), ghash.powers.powers[0])
+      ghash.state = FieldBlock {high: u64x2.extract(product, 1), low: u64x2.extract(product, 0)}
+      return ()
+    }
+  }
+  ghash.state = multiplyField(mixed, ghash.key)
+}
+
+fn ghashAbsorb(ghash: &mut Ghash, bytes: &[u8]) -> () {
+  let mut offset: usize = 0
+  if ghash.buffered > 0 {
+    while ghash.buffered < 16 && offset < bytes.length {
+      ghash.buffer[ghash.buffered] = bytes[offset]
+      ghash.buffered = ghash.buffered + 1
+      offset = offset + 1
+    }
+    if ghash.buffered < 16 {
+      return
+    }
+    let block = loadField(&ghash.buffer, 0)
+    ghashBlock(&mut ghash, block)
+    ghash.buffered = 0
+  }
+  static if Target.arch() == Arch.X86_64 {
+    if ghash.hardware && offset + 16 <= bytes.length {
+      let whole = (bytes.length - offset) / 16 * 16
+      let state = u64x2.fromArray([ghash.state.low, ghash.state.high])
+      let next = unsafe hashInputX86(state, &ghash.powers, Slice.view<u8>(bytes, offset, whole), whole)
+      ghash.state = FieldBlock {high: u64x2.extract(next, 1), low: u64x2.extract(next, 0)}
+      offset = offset + whole
+    }
+  }
+  static if Target.arch() == Arch.Aarch64 {
+    if ghash.hardware && offset + 16 <= bytes.length {
+      let whole = (bytes.length - offset) / 16 * 16
+      let state = u64x2.fromArray([ghash.state.low, ghash.state.high])
+      let next = unsafe hashInputArm(state, &ghash.powers, Slice.view<u8>(bytes, offset, whole), whole)
+      ghash.state = FieldBlock {high: u64x2.extract(next, 1), low: u64x2.extract(next, 0)}
+      offset = offset + whole
+    }
+  }
+  while offset + 16 <= bytes.length {
+    ghashBlock(&mut ghash, loadField(bytes, offset))
+    offset = offset + 16
+  }
+  while offset < bytes.length {
+    ghash.buffer[ghash.buffered] = bytes[offset]
+    ghash.buffered = ghash.buffered + 1
+    offset = offset + 1
+  }
+}
+
+// Ends the current part with zero padding to a whole block.
+fn ghashPad(ghash: &mut Ghash) -> () {
+  if ghash.buffered == 0 {
+    return
+  }
+  while ghash.buffered < 16 {
+    ghash.buffer[ghash.buffered] = 0
+    ghash.buffered = ghash.buffered + 1
+  }
+  let block = loadField(&ghash.buffer, 0)
+  ghashBlock(&mut ghash, block)
+  ghash.buffered = 0
+}
+
+// The counter mode of GCM: the low 32 bits of the counter block grow by one per block and wrap
+// (inc32 of NIST SP 800-38D section 6.2).
+struct Keystream {
+  key: Aes,
+  counter: [u8; 16],
+  stream: [u8; 16],
+  used: usize,
+  hardware: bool,
+  roundKeys: RoundKeys,
+}
+
+fn nextStream(keystream: &mut Keystream) -> simd<u8, 16> {
+  let block = aes.encryptState(&keystream.key, u8x16.load(&keystream.counter, 0))
+  let mut carry: u32 = 1
+  let mut index: usize = 16
+  while index > 12 {
+    index = index - 1
+    let sum = u32.wrappingAdd(u8.toU32(keystream.counter[index]), carry)
+    keystream.counter[index] = u32.toU8(u32.bitAnd(sum, 255))
+    carry = u32.shiftRight(sum, 8)
+  }
+  return block
+}
+
+fn keystreamApply(keystream: &mut Keystream, input: &[u8], output: &mut [u8]) -> () {
+  let mut offset: usize = 0
+  while offset < input.length && keystream.used < 16 {
+    output[offset] = u8.bitXor(input[offset], keystream.stream[keystream.used])
+    keystream.used = keystream.used + 1
+    offset = offset + 1
+  }
+  static if Target.arch() == Arch.X86_64 {
+    if keystream.hardware && offset + 16 <= input.length {
+      let blocks = (input.length - offset) / 16
+      unsafe counterBlocksX86(&keystream.roundKeys, &mut keystream.counter, input, offset, &mut output, blocks)
+      offset = offset + blocks * 16
+    }
+  }
+  static if Target.arch() == Arch.Aarch64 {
+    if keystream.hardware && offset + 16 <= input.length {
+      let blocks = (input.length - offset) / 16
+      unsafe counterBlocksArm(&keystream.roundKeys, &mut keystream.counter, input, offset, &mut output, blocks)
+      offset = offset + blocks * 16
+    }
+  }
+  while offset + 16 <= input.length {
+    let block = nextStream(&mut keystream)
+    u8x16.store(&mut output, offset, u8x16.load(input, offset) ^ block)
+    offset = offset + 16
+  }
+  if offset < input.length {
+    keystream.stream = u8x16.toArray(nextStream(&mut keystream))
+    keystream.used = 0
+    while offset < input.length {
+      output[offset] = u8.bitXor(input[offset], keystream.stream[keystream.used])
+      keystream.used = keystream.used + 1
+      offset = offset + 1
+    }
+  }
+}
+
+// The state that every GCM operation shares. `mask` is the encryption of the first counter block,
+// which the tag is XORed with.
+struct Core {
+  keystream: Keystream,
+  ghash: Ghash,
+  mask: [u8; 16],
+  aadLength: u64,
+  textLength: u64,
+  inText: bool,
+}
+
+// The key and nonce lengths are already checked.
+fn makeCore(key: &[u8], nonce: &[u8]) -> Core {
+  let schedule = expand(key)
+  let zero: [u8; 16] = [0; 16]
+  let hashKey = loadField(&u8x16.toArray(aes.encryptState(&schedule, u8x16.load(&zero, 0))), 0)
+  let fast = hardware()
+  let mut roundKeys = zeroRoundKeys()
+  let mut powers = zeroHashKeys()
+  static if Target.arch() == Arch.X86_64 {
+    if fast {
+      roundKeys = unsafe expandKeyX86(key)
+      powers = unsafe hashKeysX86(u64x2.fromArray([hashKey.low, hashKey.high]))
+    }
+  }
+  static if Target.arch() == Arch.Aarch64 {
+    if fast {
+      roundKeys = unsafe expandKeyArm(key)
+      powers = unsafe hashKeysArm(u64x2.fromArray([hashKey.low, hashKey.high]))
+    }
+  }
+  let mut first: [u8; 16] = [0; 16]
+  if nonce.length == 12 {
+    let mut index: usize = 0
+    while index < 12 {
+      first[index] = nonce[index]
+      index = index + 1
+    }
+    first[15] = 1
+  } else {
+    // Another nonce length is hashed: J0 = GHASH(nonce, padding, 64 zero bits, nonce bits).
+    let mut nonceHash = Ghash {
+      key: hashKey,
+      state: FieldBlock { high: 0, low: 0 },
+      buffer: [0; 16],
+      buffered: 0,
+      hardware: false,
+      powers: zeroHashKeys(),
+    }
+    ghashAbsorb(&mut nonceHash, nonce)
+    ghashPad(&mut nonceHash)
+    ghashBlock(
+      &mut nonceHash,
+      FieldBlock { high: 0, low: u64.wrappingMultiply(usize.toU64(nonce.length), 8) },
+    )
+    let mut index: usize = 0
+    while index < 8 {
+      let shift = usize.toU64((7 - index) * 8)
+      first[index] = u64.toU8(u64.bitAnd(u64.shiftRight(nonceHash.state.high, shift), 255))
+      first[index + 8] = u64.toU8(u64.bitAnd(u64.shiftRight(nonceHash.state.low, shift), 255))
+      index = index + 1
+    }
+  }
+  let mask = u8x16.toArray(aes.encryptState(&schedule, u8x16.load(&first, 0)))
+  let mut keystream = Keystream {
+    key: move schedule,
+    counter: first,
+    stream: [0; 16],
+    used: 16,
+    hardware: fast,
+    roundKeys: move roundKeys,
+  }
+
+  // The message starts at the second counter block.
+  drop nextStream(&mut keystream)
+  return Core {
+    keystream: move keystream,
+    ghash: Ghash {
+      key: hashKey,
+      state: FieldBlock { high: 0, low: 0 },
+      buffer: [0; 16],
+      buffered: 0,
+      hardware: fast,
+      powers: move powers,
+    },
+    mask: mask,
+    aadLength: 0,
+    textLength: 0,
+    inText: false,
+  }
+}
+
+// Encrypts or decrypts `input` into `output` and hashes the ciphertext. The limits are checked.
+fn coreText(core: &mut Core, input: &[u8], output: &mut [u8], decrypting: bool) -> () {
+  if core.inText == false {
+    ghashPad(&mut core.ghash)
+    core.inText = true
+  }
+  core.textLength = core.textLength + usize.toU64(input.length)
+  if decrypting {
+    ghashAbsorb(&mut core.ghash, input)
+    keystreamApply(&mut core.keystream, input, move output)
+    return
+  }
+  keystreamApply(&mut core.keystream, input, &mut output)
+  ghashAbsorb(&mut core.ghash, Slice.view<u8>(&output, 0, input.length))
+}
+
+fn coreTag(core: &mut Core) -> [u8; 16] {
+  ghashPad(&mut core.ghash)
+  let lengths = FieldBlock {
+    high: u64.wrappingMultiply(core.aadLength, 8),
+    low: u64.wrappingMultiply(core.textLength, 8),
+  }
+  ghashBlock(&mut core.ghash, lengths)
+  let mut tag = core.mask
+  let mut index: usize = 0
+  while index < 8 {
+    let shift = usize.toU64((7 - index) * 8)
+    tag[index] = u8.bitXor(
+      tag[index],
+      u64.toU8(u64.bitAnd(u64.shiftRight(core.ghash.state.high, shift), 255)),
+    )
+    tag[index + 8] = u8.bitXor(
+      tag[index + 8],
+      u64.toU8(u64.bitAnd(u64.shiftRight(core.ghash.state.low, shift), 255)),
+    )
+    index = index + 1
+  }
+  return tag
+}
+
+fn streamStart(key: &[u8], nonce: &[u8], aad: &[u8]) -> Result<Core, AesGcmError> {
+  if key.length != 16 && key.length != 24 && key.length != 32 {
+    return Result<Core, AesGcmError>.failResult(AesGcmError.InvalidKeyLength)
+  }
+  if nonce.length == 0 || usize.toU64(nonce.length) > 2305843009213693951 {
+    return Result<Core, AesGcmError>.failResult(AesGcmError.InvalidNonceLength)
+  }
+  if lengthsAdmitted(0, usize.toU64(aad.length)) == false {
+    return Result<Core, AesGcmError>.failResult(AesGcmError.LimitExceeded)
+  }
+  let mut core = makeCore(key, nonce)
+  core.aadLength = usize.toU64(aad.length)
+  ghashAbsorb(&mut core.ghash, aad)
+  return Result<Core, AesGcmError>.succeed(move core)
+}
+
+fn streamText(core: &mut Core, input: &[u8], output: &mut [u8], decrypting: bool) -> Result<
+  (),
+  AesGcmError
+> {
+  if output.length < input.length {
+    return Result<(), AesGcmError>.failResult(AesGcmError.OutputTooSmall)
+  }
+  if lengthsAdmitted(u64.saturatingAdd(core.textLength, usize.toU64(input.length)), 0) == false {
+    return Result<(), AesGcmError>.failResult(AesGcmError.LimitExceeded)
+  }
+  coreText(&mut core, input, move output, decrypting)
+  return Result<(), AesGcmError>.succeed(())
+}
+
+/// A streaming AES-GCM encryptor (NIST SP 800-38D) for a message that arrives in parts.
+///
+/// # When to use
+///
+/// Use it when the message does not fit in one buffer, or to implement an API that encrypts in
+/// steps, such as `createCipheriv("aes-256-gcm")` in Node.js. For a message in one slice, use
+/// [`AesGcm.seal`].
+///
+/// # Details
+///
+/// Make one with [`AesGcmEncryptor.make`] and the associated data, give the message with
+/// [`AesGcmEncryptor.update`], then call [`AesGcmEncryptor.finish`] for the tag. Any split of the
+/// message gives the same ciphertext and tag as [`AesGcm.seal`]. The key is 16, 24, or 32 bytes.
+/// The nonce can have any nonzero length: a 12-byte nonce is used directly, and other lengths are
+/// hashed as NIST SP 800-38D section 7.1 says. Nothing allocates.
+///
+/// # Gotchas
+///
+/// The same key and nonce must never encrypt two messages. Prefer 12-byte nonces, which are the
+/// only length that [`AesGcm.seal`] takes. The value holds key material and is not erased when it
+/// is dropped.
+pub struct AesGcmEncryptor {
+  core: Core,
+}
+
+impl AesGcmEncryptor {
+  /// Returns an encryptor for `key` and `nonce` that authenticates the associated data `aad`.
+  ///
+  /// `aad` is authenticated but not encrypted. Use it for headers that must stay readable. The
+  /// encryptor copies what it needs and does not borrow the arguments.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidKeyLength` if `key` is not 16, 24, or 32 bytes.
+  /// - `InvalidNonceLength` if `nonce` is empty or longer than 2^61 - 1 bytes.
+  /// - `LimitExceeded` if `aad` is longer than 2^61 - 1 bytes.
+  pub fn make(key: &[u8], nonce: &[u8], aad: &[u8]) -> Result<AesGcmEncryptor, AesGcmError> {
+    return match streamStart(key, nonce, aad) {
+      Result<Core, AesGcmError>.Success { value } => Result<AesGcmEncryptor, AesGcmError>.succeed(
+        AesGcmEncryptor { core: move value },
+      )
+      Result<Core, AesGcmError>.Failure { error } => Result<
+        AesGcmEncryptor,
+        AesGcmError
+      >.failResult(move error)
+    }
+  }
+
+  /// Encrypts `plaintext` into the first `plaintext.length` bytes of `ciphertext`.
+  ///
+  /// The bytes of `ciphertext` after them do not change. The buffers must not overlap.
+  ///
+  /// # Errors
+  ///
+  /// On an error the state and `ciphertext` do not change.
+  ///
+  /// - `OutputTooSmall` if `ciphertext` is shorter than `plaintext`.
+  /// - `LimitExceeded` if the message grows past 2^36 - 32 bytes.
+  pub fn update(self: &mut Self, plaintext: &[u8], ciphertext: &mut [u8]) -> Result<
+    (),
+    AesGcmError
+  > {
+    return streamText(&mut self.core, plaintext, move ciphertext, false)
+  }
+
+  /// Writes the authentication tag to `tag` and consumes the state.
+  ///
+  /// `tag` is 16 bytes for the full tag, or 4, 8, 12, 13, 14, or 15 bytes for a prefix of it, as
+  /// NIST SP 800-38D allows. Shorter tags are easier to forge.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidTagLength` if `tag` has another length. `tag` does not change.
+  pub fn finish(self: Self, tag: &mut [u8]) -> Result<(), AesGcmError> {
+    if tagLengthAdmitted(tag.length) == false {
+      return Result<(), AesGcmError>.failResult(AesGcmError.InvalidTagLength)
+    }
+    let mut core = move self.core
+    let computed = coreTag(&mut core)
+    let mut index: usize = 0
+    while index < tag.length {
+      tag[index] = computed[index]
+      index = index + 1
+    }
+    return Result<(), AesGcmError>.succeed(())
+  }
+}
+
+/// A streaming AES-GCM decryptor (NIST SP 800-38D) for a ciphertext that arrives in parts.
+///
+/// # When to use
+///
+/// Use it when the ciphertext does not fit in one buffer, or to implement an API that decrypts in
+/// steps, such as `createDecipheriv("aes-256-gcm")` in Node.js. For a ciphertext in one slice, use
+/// [`AesGcm.open`], which writes no plaintext unless the tag is correct.
+///
+/// # Details
+///
+/// Make one with [`AesGcmDecryptor.make`] and the associated data, give the ciphertext with
+/// [`AesGcmDecryptor.update`], then call [`AesGcmDecryptor.finish`] with the received tag. The key
+/// is 16, 24, or 32 bytes. The nonce can have any nonzero length. Nothing allocates.
+///
+/// # Gotchas
+///
+/// [`AesGcmDecryptor.update`] writes plaintext before the tag is checked. Do not use or release
+/// that plaintext until [`AesGcmDecryptor.finish`] succeeds. The value holds key material and is
+/// not erased when it is dropped.
+pub struct AesGcmDecryptor {
+  core: Core,
+}
+
+impl AesGcmDecryptor {
+  /// Returns a decryptor for `key` and `nonce` that authenticates the associated data `aad`.
+  ///
+  /// `aad` must be the same bytes that the encryptor got. The decryptor copies what it needs and
+  /// does not borrow the arguments.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidKeyLength` if `key` is not 16, 24, or 32 bytes.
+  /// - `InvalidNonceLength` if `nonce` is empty or longer than 2^61 - 1 bytes.
+  /// - `LimitExceeded` if `aad` is longer than 2^61 - 1 bytes.
+  pub fn make(key: &[u8], nonce: &[u8], aad: &[u8]) -> Result<AesGcmDecryptor, AesGcmError> {
+    return match streamStart(key, nonce, aad) {
+      Result<Core, AesGcmError>.Success { value } => Result<AesGcmDecryptor, AesGcmError>.succeed(
+        AesGcmDecryptor { core: move value },
+      )
+      Result<Core, AesGcmError>.Failure { error } => Result<
+        AesGcmDecryptor,
+        AesGcmError
+      >.failResult(move error)
+    }
+  }
+
+  /// Decrypts `ciphertext` into the first `ciphertext.length` bytes of `plaintext`.
+  ///
+  /// The plaintext is not authenticated until [`AesGcmDecryptor.finish`] succeeds. The bytes of
+  /// `plaintext` after the written ones do not change. The buffers must not overlap.
+  ///
+  /// # Errors
+  ///
+  /// On an error the state and `plaintext` do not change.
+  ///
+  /// - `OutputTooSmall` if `plaintext` is shorter than `ciphertext`.
+  /// - `LimitExceeded` if the ciphertext grows past 2^36 - 32 bytes.
+  pub fn update(self: &mut Self, ciphertext: &[u8], plaintext: &mut [u8]) -> Result<
+    (),
+    AesGcmError
+  > {
+    return streamText(&mut self.core, ciphertext, move plaintext, true)
+  }
+
+  /// Checks the received `tag` and consumes the state.
+  ///
+  /// `tag` is the full 16-byte tag or a 4, 8, 12, 13, 14, or 15-byte prefix of it. The comparison
+  /// takes the same time wherever the bytes differ.
+  ///
+  /// # Errors
+  ///
+  /// - `AuthenticationFailed` if the tag is not correct for the key, nonce, associated data, and
+  ///   ciphertext. Discard all plaintext that [`AesGcmDecryptor.update`] wrote.
+  /// - `InvalidTagLength` if `tag` has another length.
+  pub fn finish(self: Self, tag: &[u8]) -> Result<(), AesGcmError> {
+    if tagLengthAdmitted(tag.length) == false {
+      return Result<(), AesGcmError>.failResult(AesGcmError.InvalidTagLength)
+    }
+    let mut core = move self.core
+    let computed = coreTag(&mut core)
+    if tagsDiffer(&computed, tag) {
+      return Result<(), AesGcmError>.failResult(AesGcmError.AuthenticationFailed)
+    }
+    return Result<(), AesGcmError>.succeed(())
+  }
 }
 
 // All GF(2^8) values stay in the low byte. Every multiplication takes eight steps.
 fn xtime(value: u32) -> u32 {
   let mask = u32.wrappingSubtract(0, u32.shiftRight(value, 7))
   return u32.bitAnd(u32.bitXor(u32.shiftLeft(value, 1), u32.bitAnd(mask, 27)), 255)
-}
-
-fn multiplyByte(left: u32, right: u32) -> u32 {
-  let mut a = left
-  let mut b = right
-  let mut result: u32 = 0
-  let mut index: usize = 0
-  while index < 8 {
-    let mask = u32.wrappingSubtract(0, u32.bitAnd(b, 1))
-    result = u32.bitXor(result, u32.bitAnd(a, mask))
-    a = xtime(a)
-    b = u32.shiftRight(b, 1)
-    index = index + 1
-  }
-  return move result
-}
-
-// x^254 is the multiplicative inverse, including the required zero mapping.
-fn substitute(value: u32) -> u32 {
-  let x2 = multiplyByte(value, value)
-  let x4 = multiplyByte(x2, x2)
-  let x8 = multiplyByte(x4, x4)
-  let x16 = multiplyByte(x8, x8)
-  let x32 = multiplyByte(x16, x16)
-  let x64 = multiplyByte(x32, x32)
-  let x128 = multiplyByte(x64, x64)
-  let a = multiplyByte(multiplyByte(x2, x4), multiplyByte(x8, x16))
-  let b = multiplyByte(multiplyByte(x32, x64), x128)
-  let inverse = multiplyByte(a, b)
-  let doubled = u32.bitOr(inverse, u32.shiftLeft(inverse, 8))
-  let shifted = u32.bitXor(
-    u32.bitXor(u32.shiftRight(doubled, 4), u32.shiftRight(doubled, 5)),
-    u32.bitXor(u32.shiftRight(doubled, 6), u32.shiftRight(doubled, 7)),
-  )
-  return u32.bitAnd(u32.bitXor(u32.bitXor(inverse, shifted), 99), 255)
-}
-
-fn substituteWord(word: u32) -> u32 {
-  let a = u32.shiftLeft(substitute(u32.shiftRight(word, 24)), 24)
-  let b = u32.shiftLeft(substitute(u32.bitAnd(u32.shiftRight(word, 16), 255)), 16)
-  let c = u32.shiftLeft(substitute(u32.bitAnd(u32.shiftRight(word, 8), 255)), 8)
-  let d = substitute(u32.bitAnd(word, 255))
-  return u32.bitOr(u32.bitOr(a, b), u32.bitOr(c, d))
-}
-
-fn expandKey(key: &[u8]) -> KeySchedule {
-  let mut schedule = KeySchedule {words: zeroWords(), rounds: key.length / 4 + 6}
-  let count = key.length / 4
-  let mut index: usize = 0
-  while index < count {
-    let offset = index * 4
-    schedule.words[index] = u32.bitOr(
-      u32.bitOr(
-        u32.shiftLeft(u8.toU32(key[offset]), 24),
-        u32.shiftLeft(u8.toU32(key[offset + 1]), 16),
-      ),
-      u32.bitOr(u32.shiftLeft(u8.toU32(key[offset + 2]), 8), u8.toU32(key[offset + 3])),
-    )
-    index = index + 1
-  }
-  let mut rcon: u32 = 1
-  while index < 4 * (schedule.rounds + 1) {
-    let mut word = schedule.words[index - 1]
-    if index % count == 0 {
-      word = u32.bitXor(
-        substituteWord(u32.bitOr(u32.shiftLeft(word, 8), u32.shiftRight(word, 24))),
-        u32.shiftLeft(rcon, 24),
-      )
-      rcon = xtime(rcon)
-    } else if count == 8 && index % count == 4 {
-      word = substituteWord(word)
-    }
-    schedule.words[index] = u32.bitXor(schedule.words[index - count], word)
-    index = index + 1
-  }
-  return move schedule
-}
-
-fn addRoundKey(state: &mut [u32], schedule: &KeySchedule, round: usize) -> () {
-  let mut index: usize = 0
-  while index < 16 {
-    let shift = usize.toU32(24 - (index % 4) * 8)
-    let word = schedule.words[round * 4 + index / 4]
-    state[index] = u32.bitXor(state[index], u32.bitAnd(u32.shiftRight(word, shift), 255))
-    index = index + 1
-  }
-}
-
-fn encryptBlock(schedule: &KeySchedule, input: &[u8]) -> [u8; 16] {
-  let mut state: [u32; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-  let mut index: usize = 0
-  while index < 16 {
-    state[index] = u8.toU32(input[index])
-    index = index + 1
-  }
-  addRoundKey(&mut state, schedule, 0)
-  let mut round: usize = 1
-  while round <= schedule.rounds {
-    let previous = state
-    index = 0
-    while index < 16 {
-      let row = index % 4
-      state[index] = substitute(previous[((index / 4 + row) % 4) * 4 + row])
-      index = index + 1
-    }
-    if round < schedule.rounds {
-      index = 0
-      while index < 16 {
-        let a = state[index]
-        let b = state[index + 1]
-        let c = state[index + 2]
-        let d = state[index + 3]
-        let total = u32.bitXor(u32.bitXor(a, b), u32.bitXor(c, d))
-        state[index] = u32.bitXor(u32.bitXor(a, total), xtime(u32.bitXor(a, b)))
-        state[index + 1] = u32.bitXor(u32.bitXor(b, total), xtime(u32.bitXor(b, c)))
-        state[index + 2] = u32.bitXor(u32.bitXor(c, total), xtime(u32.bitXor(c, d)))
-        state[index + 3] = u32.bitXor(u32.bitXor(d, total), xtime(u32.bitXor(d, a)))
-        index = index + 4
-      }
-    }
-    addRoundKey(&mut state, schedule, round)
-    round = round + 1
-  }
-  let mut output = zeroBlock()
-  index = 0
-  while index < 16 {
-    output[index] = u32.toU8(state[index])
-    index = index + 1
-  }
-  return output
 }
 
 fn counterBlock(nonce: &[u8], counter: u32) -> [u8; 16] {
@@ -447,108 +966,6 @@ fn counterBlock(nonce: &[u8], counter: u32) -> [u8; 16] {
   return block
 }
 
-fn crypt(schedule: &KeySchedule, nonce: &[u8], input: &[u8], output: &mut [u8]) -> () {
-  let mut offset: usize = 0
-  let mut counter: u32 = 2
-  while offset < input.length {
-    let block = counterBlock(nonce, counter)
-    let stream = encryptBlock(schedule, &block)
-    let mut index: usize = 0
-    while index < 16 && offset < input.length {
-      output[offset] = u8.bitXor(input[offset], stream[index])
-      offset = offset + 1
-      index = index + 1
-    }
-    // Admission permits counters 2 through 2^32−1, with no following block after wrap.
-    counter = u32.wrappingAdd(counter, 1)
-  }
-}
-
-struct FieldBlock {
-  high: u64,
-  low: u64,
-}
-
-fn multiplyField(value: FieldBlock, key: &FieldBlock) -> FieldBlock {
-  let mut high = value.high
-  let mut low = value.low
-  let mut vHigh = key.high
-  let mut vLow = key.low
-  let mut result = FieldBlock {high: 0, low: 0}
-  let mut index: usize = 0
-  while index < 128 {
-    let mask = u64.wrappingSubtract(0, u64.shiftRight(high, 63))
-    result.high = u64.bitXor(result.high, u64.bitAnd(vHigh, mask))
-    result.low = u64.bitXor(result.low, u64.bitAnd(vLow, mask))
-    high = u64.bitOr(u64.shiftLeft(high, 1), u64.shiftRight(low, 63))
-    low = u64.shiftLeft(low, 1)
-    let reduction = u64.wrappingSubtract(0, u64.bitAnd(vLow, 1))
-    vLow = u64.bitOr(u64.shiftRight(vLow, 1), u64.shiftLeft(vHigh, 63))
-    vHigh = u64.bitXor(u64.shiftRight(vHigh, 1), u64.bitAnd(reduction, 16212958658533785600))
-    index = index + 1
-  }
-  return move result
-}
-
-fn hashInput(state: &mut FieldBlock, key: &FieldBlock, input: &[u8], length: usize) -> () {
-  let mut offset: usize = 0
-  while offset < length {
-    let mut block = FieldBlock {high: 0, low: 0}
-    let mut index: usize = 0
-    while index < 16 && offset < length {
-      let byte = u8.toU64(input[offset])
-      let shift = usize.toU64((7 - index % 8) * 8)
-      if index < 8 {
-        block.high = u64.bitOr(block.high, u64.shiftLeft(byte, shift))
-      } else {
-        block.low = u64.bitOr(block.low, u64.shiftLeft(byte, shift))
-      }
-      index = index + 1
-      offset = offset + 1
-    }
-    block.high = u64.bitXor(block.high, state.high)
-    block.low = u64.bitXor(block.low, state.low)
-    let next = multiplyField(move block, key)
-    state.high = next.high
-    state.low = next.low
-  }
-}
-
-fn authenticate(schedule: &KeySchedule, nonce: &[u8], aad: &[u8], ciphertext: &[u8], length: usize) -> [u8; 16] {
-  let zero = zeroBlock()
-  let hashBytes = encryptBlock(schedule, &zero)
-  let mut key = FieldBlock {high: 0, low: 0}
-  let mut index: usize = 0
-  while index < 8 {
-    key.high = u64.bitOr(u64.shiftLeft(key.high, 8), u8.toU64(hashBytes[index]))
-    key.low = u64.bitOr(u64.shiftLeft(key.low, 8), u8.toU64(hashBytes[index + 8]))
-    index = index + 1
-  }
-  let mut state = FieldBlock {high: 0, low: 0}
-  hashInput(&mut state, &key, aad, aad.length)
-  hashInput(&mut state, &key, ciphertext, length)
-  let sizes = FieldBlock {
-    high: u64.bitXor(state.high, usize.toU64(aad.length) * 8),
-    low: u64.bitXor(state.low, usize.toU64(length) * 8),
-  }
-  let digest = multiplyField(move sizes, &key)
-  let first = counterBlock(nonce, 1)
-  let mut tag = encryptBlock(schedule, &first)
-  index = 0
-  while index < 8 {
-    let shift = usize.toU64((7 - index) * 8)
-    tag[index] = u8.bitXor(
-      tag[index],
-      u64.toU8(u64.bitAnd(u64.shiftRight(digest.high, shift), 255)),
-    )
-    tag[index + 8] = u8.bitXor(
-      tag[index + 8],
-      u64.toU8(u64.bitAnd(u64.shiftRight(digest.low, shift), 255)),
-    )
-    index = index + 1
-  }
-  return tag
-}
 
 fn zeroBlock() -> [u8; 16] {
   return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
@@ -617,4 +1034,646 @@ fn zeroWords() -> [u32; 60] {
     0,
     0,
   ]
+}
+
+// The x86-64 kernel: AES rounds with AES-NI and GHASH with PCLMULQDQ. Its ciphertext and tag equal
+// the portable functions' for every input. Each function needs the three features, so the caller
+// checks `CpuFeatures.available` for each first.
+static if Target.arch() == Arch.X86_64 {
+  // A 256-bit carry-less product as its low and high 128 bits, each `[low word, high word]`.
+  struct Product {
+    low: simd<u64, 2>,
+    high: simd<u64, 2>,
+  }
+
+  @features("aes", "pclmul", "ssse3")
+  unsafe fn sealX86(key: &[u8], nonce: &[u8], aad: &[u8], plaintext: &[u8], ciphertext: &mut [u8], tag: &mut [u8]) -> () {
+    let keys = unsafe expandKeyX86(key)
+    unsafe cryptX86(&keys, nonce, plaintext, &mut ciphertext)
+    let computed = unsafe authenticateX86(&keys, nonce, aad, &ciphertext, plaintext.length)
+    u8x16.store(&mut tag, 0, computed)
+    return ()
+  }
+
+  // Writes the plaintext and answers `true` only when `tag` is correct; otherwise `plaintext`
+  // does not change.
+  @features("aes", "pclmul", "ssse3")
+  unsafe fn openX86(key: &[u8], nonce: &[u8], aad: &[u8], ciphertext: &[u8], tag: &[u8], plaintext: &mut [u8]) -> bool {
+    let keys = unsafe expandKeyX86(key)
+    let computed = u8x16.toArray(unsafe authenticateX86(&keys, nonce, aad, ciphertext, ciphertext.length))
+    if tagsDiffer(&computed, tag) {
+      return false
+    }
+    unsafe cryptX86(&keys, nonce, ciphertext, &mut plaintext)
+    return true
+  }
+
+  // SubWord: `aesenclast` on four copies of `word` with a zero key. ShiftRows moves nothing when
+  // every column is the same, so each byte is just substituted.
+  @features("aes", "pclmul", "ssse3")
+  unsafe fn substituteWordX86(word: u32) -> u32 {
+    let copies = u32x4.bitcastToU64x2(u32x4.splat(word))
+    let substituted = Intrinsic.x86AesEncryptLast<simd<u64, 2>>(copies, u64x2.splat(0))
+    return u32x4.extract(u64x2.bitcastToU32x4(substituted), 0)
+  }
+
+  // The key schedule of FIPS 197 section 5.2, as `expandKey` computes it, with SubWord in
+  // hardware. Round key `r` holds words `4r` to `4r + 3`, each most significant byte first.
+  @features("aes", "pclmul", "ssse3")
+  unsafe fn expandKeyX86(key: &[u8]) -> RoundKeys {
+    let mut words = zeroWords()
+    let count = key.length / 4
+    let rounds = count + 6
+    let mut index: usize = 0
+    while index < count {
+      words[index] = readU32BigEndian(key, index * 4)
+      index = index + 1
+    }
+    let mut rcon: u32 = 1
+    while index < 4 * (rounds + 1) {
+      let mut word = words[index - 1]
+      if index % count == 0 {
+        word = u32.bitXor(unsafe substituteWordX86(u32.rotateLeft(word, 8)), u32.shiftLeft(rcon, 24))
+        rcon = xtime(rcon)
+      } else if count == 8 && index % count == 4 {
+        word = unsafe substituteWordX86(word)
+      }
+      words[index] = u32.bitXor(words[index - count], word)
+      index = index + 1
+    }
+    let zero = u64x2.splat(0)
+    let mut keys = RoundKeys {
+      keys: [zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero],
+      rounds: rounds,
+    }
+    let mut round: usize = 0
+    while round <= rounds {
+      // Reversing each word's bytes turns the little-endian lanes into the key's byte order.
+      let lanes = u32x4.fromArray([words[4 * round], words[4 * round + 1], words[4 * round + 2], words[4 * round + 3]])
+      let bytes = u8x16.shuffle(u32x4.bitcastToU8x16(lanes), u32x4.bitcastToU8x16(lanes), [3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12])
+      keys.keys[round] = u8x16.bitcastToU64x2(bytes)
+      round = round + 1
+    }
+    return move keys
+  }
+
+  @features("aes", "pclmul", "ssse3")
+  unsafe fn encryptX86(keys: &RoundKeys, block: simd<u8, 16>) -> simd<u8, 16> {
+    let mut state = u8x16.bitcastToU64x2(block) ^ keys.keys[0]
+    let mut round: usize = 1
+    while round < keys.rounds {
+      state = Intrinsic.x86AesEncrypt<simd<u64, 2>>(state, keys.keys[round])
+      round = round + 1
+    }
+    return u64x2.bitcastToU8x16(Intrinsic.x86AesEncryptLast<simd<u64, 2>>(state, keys.keys[keys.rounds]))
+  }
+
+  // Four blocks at once, so the rounds of independent blocks overlap in the pipeline.
+  @features("aes", "pclmul", "ssse3")
+  unsafe fn encrypt4X86(keys: &RoundKeys, blocks: [simd<u8, 16>; 4]) -> [simd<u8, 16>; 4] {
+    let first = keys.keys[0]
+    let mut a = u8x16.bitcastToU64x2(blocks[0]) ^ first
+    let mut b = u8x16.bitcastToU64x2(blocks[1]) ^ first
+    let mut c = u8x16.bitcastToU64x2(blocks[2]) ^ first
+    let mut d = u8x16.bitcastToU64x2(blocks[3]) ^ first
+    let mut round: usize = 1
+    while round < keys.rounds {
+      let key = keys.keys[round]
+      a = Intrinsic.x86AesEncrypt<simd<u64, 2>>(a, key)
+      b = Intrinsic.x86AesEncrypt<simd<u64, 2>>(b, key)
+      c = Intrinsic.x86AesEncrypt<simd<u64, 2>>(c, key)
+      d = Intrinsic.x86AesEncrypt<simd<u64, 2>>(d, key)
+      round = round + 1
+    }
+    let last = keys.keys[keys.rounds]
+    return [
+      u64x2.bitcastToU8x16(Intrinsic.x86AesEncryptLast<simd<u64, 2>>(a, last)),
+      u64x2.bitcastToU8x16(Intrinsic.x86AesEncryptLast<simd<u64, 2>>(b, last)),
+      u64x2.bitcastToU8x16(Intrinsic.x86AesEncryptLast<simd<u64, 2>>(c, last)),
+      u64x2.bitcastToU8x16(Intrinsic.x86AesEncryptLast<simd<u64, 2>>(d, last)),
+    ]
+  }
+
+  // The counter mode of `crypt`, from counter 2. The counter is kept with its block's bytes
+  // reversed, so lane 0 is the big-endian 32-bit counter and one lane add steps it.
+  @features("aes", "pclmul", "ssse3")
+  unsafe fn cryptX86(keys: &RoundKeys, nonce: &[u8], input: &[u8], output: &mut [u8]) -> () {
+    let start = u8x16.fromArray(counterBlock(nonce, 2))
+    let mut counter = u8x16.bitcastToU32x4(reverse(start))
+    let one = u32x4.fromArray([1, 0, 0, 0])
+    let mut offset: usize = 0
+    while input.length - offset >= 64 {
+      let a = reverse(u32x4.bitcastToU8x16(counter))
+      counter = u32x4.wrappingAdd(counter, one)
+      let b = reverse(u32x4.bitcastToU8x16(counter))
+      counter = u32x4.wrappingAdd(counter, one)
+      let c = reverse(u32x4.bitcastToU8x16(counter))
+      counter = u32x4.wrappingAdd(counter, one)
+      let d = reverse(u32x4.bitcastToU8x16(counter))
+      counter = u32x4.wrappingAdd(counter, one)
+      let stream = unsafe encrypt4X86(keys, [a, b, c, d])
+      u8x16.store(&mut output, offset, u8x16.load(input, offset) ^ stream[0])
+      u8x16.store(&mut output, offset + 16, u8x16.load(input, offset + 16) ^ stream[1])
+      u8x16.store(&mut output, offset + 32, u8x16.load(input, offset + 32) ^ stream[2])
+      u8x16.store(&mut output, offset + 48, u8x16.load(input, offset + 48) ^ stream[3])
+      offset = offset + 64
+    }
+    while input.length - offset >= 16 {
+      let stream = unsafe encryptX86(keys, reverse(u32x4.bitcastToU8x16(counter)))
+      counter = u32x4.wrappingAdd(counter, one)
+      u8x16.store(&mut output, offset, u8x16.load(input, offset) ^ stream)
+      offset = offset + 16
+    }
+    if offset < input.length {
+      let stream = u8x16.toArray(unsafe encryptX86(keys, reverse(u32x4.bitcastToU8x16(counter))))
+      let mut index: usize = 0
+      while offset < input.length {
+        output[offset] = u8.bitXor(input[offset], stream[index])
+        offset = offset + 1
+        index = index + 1
+      }
+    }
+    return ()
+  }
+
+  // A field element in a vector, `[low, high]`: its 16 bytes read as a big-endian 128-bit
+  // integer, as `FieldBlock` holds it.
+  fn elementAt(input: &[u8], offset: usize) -> simd<u64, 2> {
+    return u8x16.bitcastToU64x2(reverse(u8x16.load(input, offset)))
+  }
+
+  // The unreduced 256-bit carry-less product of two elements, as its low and high 128 bits, with
+  // Karatsuba's three multiplications.
+  @features("aes", "pclmul", "ssse3")
+  unsafe fn productX86(left: simd<u64, 2>, right: simd<u64, 2>) -> Product {
+    let zero = u64x2.splat(0)
+    let leftSwapped = u64x2.shuffle(left, left, [1, 0])
+    let rightSwapped = u64x2.shuffle(right, right, [1, 0])
+    let low = Intrinsic.x86CarrylessMultiply<simd<u64, 2>>(left, right)
+    let high = Intrinsic.x86CarrylessMultiply<simd<u64, 2>>(leftSwapped, rightSwapped)
+    let middle = Intrinsic.x86CarrylessMultiply<simd<u64, 2>>(left ^ leftSwapped, right ^ rightSwapped) ^ low ^ high
+    return Product {low: low ^ u64x2.shuffle(zero, middle, [0, 2]), high: high ^ u64x2.shuffle(middle, zero, [1, 2])}
+  }
+
+  // The element of a product (Gueron and Kounavis, "Intel Carry-Less Multiplication Instruction
+  // and its Usage for Computing the GCM Mode", algorithm 5). Read as big-endian integers, the
+  // operands' bits are reflected, so the product is shifted left by one and reduced modulo
+  // x^128 + x^127 + x^126 + x^121 + 1. Both steps are linear, so a sum of products reduces once.
+  fn reduce(product: Product) -> simd<u64, 2> {
+    let zero = u64x2.splat(0)
+    let carryLow = u64x2.shiftRight(product.low, u64x2.splat(63))
+    let carryHigh = u64x2.shiftRight(product.high, u64x2.splat(63))
+    // The product shifted left by one: [x0, x1] and [x2, x3].
+    let low = u64x2.shiftLeft(product.low, u64x2.splat(1)) | u64x2.shuffle(zero, carryLow, [0, 2])
+    let high = u64x2.shiftLeft(product.high, u64x2.splat(1)) | u64x2.shuffle(carryLow, carryHigh, [1, 2])
+    let folded = u64x2.shiftLeft(low, u64x2.splat(63)) ^ u64x2.shiftLeft(low, u64x2.splat(62)) ^ u64x2.shiftLeft(low, u64x2.splat(57))
+    // [x0, d] with d = x1 + (x0 << 63) + (x0 << 62) + (x0 << 57), and its upper word alone.
+    let middle = low ^ u64x2.shuffle(zero, folded, [0, 2])
+    let upper = u64x2.shuffle(middle, zero, [1, 2])
+    let one = u64x2.shiftRight(middle, u64x2.splat(1)) | u64x2.shiftLeft(upper, u64x2.splat(63))
+    let two = u64x2.shiftRight(middle, u64x2.splat(2)) | u64x2.shiftLeft(upper, u64x2.splat(62))
+    let seven = u64x2.shiftRight(middle, u64x2.splat(7)) | u64x2.shiftLeft(upper, u64x2.splat(57))
+    return high ^ middle ^ one ^ two ^ seven
+  }
+
+  @features("aes", "pclmul", "ssse3")
+  unsafe fn multiplyX86(left: simd<u64, 2>, right: simd<u64, 2>) -> simd<u64, 2> {
+    return reduce(unsafe productX86(left, right))
+  }
+
+  @features("aes", "pclmul", "ssse3")
+  unsafe fn hashKeysX86(key: simd<u64, 2>) -> HashKeys {
+    let mut keys = zeroHashKeys()
+    let mut power = key
+    let mut index: usize = 0
+    while index < 8 {
+      let swapped = u64x2.shuffle(power, power, [1, 0])
+      keys.powers[index] = power
+      keys.swapped[index] = swapped
+      keys.sums[index] = power ^ swapped
+      power = unsafe multiplyX86(power, key)
+      index = index + 1
+    }
+    return move keys
+  }
+
+  // `hashInput` with carry-less multiplication, four blocks per reduction.
+  @features("aes", "pclmul", "ssse3")
+  unsafe fn hashInputX86(state: simd<u64, 2>, keys: &HashKeys, input: &[u8], length: usize) -> simd<u64, 2> {
+    let mut current = state
+    let mut offset: usize = 0
+    let zero = u64x2.splat(0)
+    while length - offset >= 128 {
+      // Karatsuba per block, with the three partial sums added over all eight blocks first.
+      let mut low = zero
+      let mut high = zero
+      let mut middle = zero
+      let mut block: usize = 0
+      while block < 8 {
+        let mut element = elementAt(input, offset + block * 16)
+        if block == 0 {
+          element = element ^ current
+        }
+        let swapped = u64x2.shuffle(element, element, [1, 0])
+        low = low ^ Intrinsic.x86CarrylessMultiply<simd<u64, 2>>(element, keys.powers[7 - block])
+        high = high ^ Intrinsic.x86CarrylessMultiply<simd<u64, 2>>(swapped, keys.swapped[7 - block])
+        middle = middle ^ Intrinsic.x86CarrylessMultiply<simd<u64, 2>>(element ^ swapped, keys.sums[7 - block])
+        block = block + 1
+      }
+      middle = middle ^ low ^ high
+      current = reduce(Product {low: low ^ u64x2.shuffle(zero, middle, [0, 2]), high: high ^ u64x2.shuffle(middle, zero, [1, 2])})
+      offset = offset + 128
+    }
+    while length - offset >= 16 {
+      current = unsafe multiplyX86(current ^ elementAt(input, offset), keys.powers[0])
+      offset = offset + 16
+    }
+    if offset < length {
+      let mut last = zeroBlock()
+      let mut index: usize = 0
+      while offset < length {
+        last[index] = input[offset]
+        index = index + 1
+        offset = offset + 1
+      }
+      current = unsafe multiplyX86(current ^ elementAt(&last, 0), keys.powers[0])
+    }
+    return current
+  }
+
+  // `authenticate` with the hardware cipher and multiplication.
+  @features("aes", "pclmul", "ssse3")
+  unsafe fn authenticateX86(keys: &RoundKeys, nonce: &[u8], aad: &[u8], ciphertext: &[u8], length: usize) -> simd<u8, 16> {
+    let hashKey = u8x16.bitcastToU64x2(reverse(unsafe encryptX86(keys, u8x16.splat(0))))
+    let powers = unsafe hashKeysX86(hashKey)
+    let mut state = unsafe hashInputX86(u64x2.splat(0), &powers, aad, aad.length)
+    state = unsafe hashInputX86(state, &powers, ciphertext, length)
+    let sizes = u64x2.fromArray([usize.toU64(length) * 8, usize.toU64(aad.length) * 8])
+    let digest = unsafe multiplyX86(state ^ sizes, powers.powers[0])
+    let mask = unsafe encryptX86(keys, u8x16.fromArray(counterBlock(nonce, 1)))
+    return mask ^ reverse(u64x2.bitcastToU8x16(digest))
+  }
+
+  // `blocks` whole blocks of the GCM counter mode, eight at a time, from `counter`, which then
+  // holds the next counter block. inc32 steps only the last four bytes, which wrap.
+  @features("aes", "pclmul", "ssse3")
+  unsafe fn counterBlocksX86(keys: &RoundKeys, counter: &mut [u8; 16], input: &[u8], offset: usize, output: &mut [u8], blocks: usize) -> () {
+    let mut current = u8x16.bitcastToU32x4(reverse(u8x16.load(&counter, 0)))
+    let one = u32x4.fromArray([1, 0, 0, 0])
+    let first = keys.keys[0]
+    let mut done: usize = 0
+    while done + 8 <= blocks {
+      let mut v0 = u8x16.bitcastToU64x2(reverse(u32x4.bitcastToU8x16(current))) ^ first
+      current = u32x4.wrappingAdd(current, one)
+      let mut v1 = u8x16.bitcastToU64x2(reverse(u32x4.bitcastToU8x16(current))) ^ first
+      current = u32x4.wrappingAdd(current, one)
+      let mut v2 = u8x16.bitcastToU64x2(reverse(u32x4.bitcastToU8x16(current))) ^ first
+      current = u32x4.wrappingAdd(current, one)
+      let mut v3 = u8x16.bitcastToU64x2(reverse(u32x4.bitcastToU8x16(current))) ^ first
+      current = u32x4.wrappingAdd(current, one)
+      let mut v4 = u8x16.bitcastToU64x2(reverse(u32x4.bitcastToU8x16(current))) ^ first
+      current = u32x4.wrappingAdd(current, one)
+      let mut v5 = u8x16.bitcastToU64x2(reverse(u32x4.bitcastToU8x16(current))) ^ first
+      current = u32x4.wrappingAdd(current, one)
+      let mut v6 = u8x16.bitcastToU64x2(reverse(u32x4.bitcastToU8x16(current))) ^ first
+      current = u32x4.wrappingAdd(current, one)
+      let mut v7 = u8x16.bitcastToU64x2(reverse(u32x4.bitcastToU8x16(current))) ^ first
+      current = u32x4.wrappingAdd(current, one)
+      let mut round: usize = 1
+      while round < keys.rounds {
+        let key = keys.keys[round]
+        v0 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v0, key)
+        v1 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v1, key)
+        v2 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v2, key)
+        v3 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v3, key)
+        v4 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v4, key)
+        v5 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v5, key)
+        v6 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v6, key)
+        v7 = Intrinsic.x86AesEncrypt<simd<u64, 2>>(v7, key)
+        round = round + 1
+      }
+      let last = keys.keys[keys.rounds]
+      let at = offset + done * 16
+      u8x16.store(&mut output, at + 0, u8x16.load(input, at + 0) ^ u64x2.bitcastToU8x16(Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v0, last)))
+      u8x16.store(&mut output, at + 16, u8x16.load(input, at + 16) ^ u64x2.bitcastToU8x16(Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v1, last)))
+      u8x16.store(&mut output, at + 32, u8x16.load(input, at + 32) ^ u64x2.bitcastToU8x16(Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v2, last)))
+      u8x16.store(&mut output, at + 48, u8x16.load(input, at + 48) ^ u64x2.bitcastToU8x16(Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v3, last)))
+      u8x16.store(&mut output, at + 64, u8x16.load(input, at + 64) ^ u64x2.bitcastToU8x16(Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v4, last)))
+      u8x16.store(&mut output, at + 80, u8x16.load(input, at + 80) ^ u64x2.bitcastToU8x16(Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v5, last)))
+      u8x16.store(&mut output, at + 96, u8x16.load(input, at + 96) ^ u64x2.bitcastToU8x16(Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v6, last)))
+      u8x16.store(&mut output, at + 112, u8x16.load(input, at + 112) ^ u64x2.bitcastToU8x16(Intrinsic.x86AesEncryptLast<simd<u64, 2>>(v7, last)))
+      done = done + 8
+    }
+    while done < blocks {
+      let at = offset + done * 16
+      let stream = unsafe encryptX86(keys, reverse(u32x4.bitcastToU8x16(current)))
+      current = u32x4.wrappingAdd(current, one)
+      u8x16.store(&mut output, at, u8x16.load(input, at) ^ stream)
+      done = done + 1
+    }
+    u8x16.store(&mut counter, 0, reverse(u32x4.bitcastToU8x16(current)))
+  }
+
+  fn readU32BigEndian(bytes: &[u8], offset: usize) -> u32 {
+    let high = u32.bitOr(u32.shiftLeft(u8.toU32(bytes[offset]), 24), u32.shiftLeft(u8.toU32(bytes[offset + 1]), 16))
+    return u32.bitOr(high, u32.bitOr(u32.shiftLeft(u8.toU32(bytes[offset + 2]), 8), u8.toU32(bytes[offset + 3])))
+  }
+
+  // The 16 bytes in reverse order.
+  fn reverse(bytes: simd<u8, 16>) -> simd<u8, 16> {
+    return u8x16.shuffle(bytes, bytes, [15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0])
+  }
+}
+
+// The AArch64 kernel: AES rounds with `aese` and `aesmc` and GHASH with `pmull`. Its ciphertext
+// and tag equal the portable functions' for every input. Each function needs the AES extension,
+// which `CpuFeatures.available("aes")` reports only with PMULL.
+static if Target.arch() == Arch.Aarch64 {
+  // A 256-bit carry-less product as its low and high 128 bits, each `[low word, high word]`.
+  struct Product {
+    low: simd<u64, 2>,
+    high: simd<u64, 2>,
+  }
+
+  // A field element in a vector, `[low, high]`: its 16 bytes read as a big-endian 128-bit integer,
+  // as `FieldBlock` holds it.
+  fn elementAt(input: &[u8], offset: usize) -> simd<u64, 2> {
+    return u8x16.bitcastToU64x2(reverse(u8x16.load(input, offset)))
+  }
+
+  fn addProducts(left: Product, right: Product) -> Product {
+    return Product {low: left.low ^ right.low, high: left.high ^ right.high}
+  }
+
+  // The three Karatsuba products of two elements, `low`, `high` and `middle` (the product of the
+  // halves' sums), combined into one 256-bit product.
+  fn combine(low: simd<u64, 2>, high: simd<u64, 2>, middle: simd<u64, 2>) -> Product {
+    let zero = u64x2.splat(0)
+    let cross = middle ^ low ^ high
+    return Product {low: low ^ u64x2.shuffle(zero, cross, [0, 2]), high: high ^ u64x2.shuffle(cross, zero, [1, 2])}
+  }
+
+  // The element of a product (Gueron and Kounavis, "Intel Carry-Less Multiplication Instruction
+  // and its Usage for Computing the GCM Mode", algorithm 5). Read as big-endian integers, the
+  // operands' bits are reflected, so the product is shifted left by one and reduced modulo
+  // x^128 + x^127 + x^126 + x^121 + 1. Both steps are linear, so a sum of products reduces once.
+  fn reduce(product: Product) -> simd<u64, 2> {
+    let zero = u64x2.splat(0)
+    let carryLow = u64x2.shiftRight(product.low, u64x2.splat(63))
+    let carryHigh = u64x2.shiftRight(product.high, u64x2.splat(63))
+    // The product shifted left by one: [x0, x1] and [x2, x3].
+    let low = u64x2.shiftLeft(product.low, u64x2.splat(1)) | u64x2.shuffle(zero, carryLow, [0, 2])
+    let high = u64x2.shiftLeft(product.high, u64x2.splat(1)) | u64x2.shuffle(carryLow, carryHigh, [1, 2])
+    let folded = u64x2.shiftLeft(low, u64x2.splat(63)) ^ u64x2.shiftLeft(low, u64x2.splat(62)) ^ u64x2.shiftLeft(low, u64x2.splat(57))
+    // [x0, d] with d = x1 + (x0 << 63) + (x0 << 62) + (x0 << 57), and its upper word alone.
+    let middle = low ^ u64x2.shuffle(zero, folded, [0, 2])
+    let upper = u64x2.shuffle(middle, zero, [1, 2])
+    let one = u64x2.shiftRight(middle, u64x2.splat(1)) | u64x2.shiftLeft(upper, u64x2.splat(63))
+    let two = u64x2.shiftRight(middle, u64x2.splat(2)) | u64x2.shiftLeft(upper, u64x2.splat(62))
+    let seven = u64x2.shiftRight(middle, u64x2.splat(7)) | u64x2.shiftLeft(upper, u64x2.splat(57))
+    return high ^ middle ^ one ^ two ^ seven
+  }
+
+  fn readU32BigEndian(bytes: &[u8], offset: usize) -> u32 {
+    let high = u32.bitOr(u32.shiftLeft(u8.toU32(bytes[offset]), 24), u32.shiftLeft(u8.toU32(bytes[offset + 1]), 16))
+    return u32.bitOr(high, u32.bitOr(u32.shiftLeft(u8.toU32(bytes[offset + 2]), 8), u8.toU32(bytes[offset + 3])))
+  }
+
+  // Round key `round` of `words` as a vector of the key bytes in order. Reversing each word's bytes
+  // turns the little-endian lanes into that order.
+  fn roundKeyAt(words: &[u32; 60], round: usize) -> simd<u64, 2> {
+    let lanes = u32x4.fromArray([words[4 * round], words[4 * round + 1], words[4 * round + 2], words[4 * round + 3]])
+    let bytes = u8x16.shuffle(u32x4.bitcastToU8x16(lanes), u32x4.bitcastToU8x16(lanes), [3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12])
+    return u8x16.bitcastToU64x2(bytes)
+  }
+
+  // The 16 bytes in reverse order.
+  fn reverse(bytes: simd<u8, 16>) -> simd<u8, 16> {
+    return u8x16.shuffle(bytes, bytes, [15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0])
+  }
+
+  @features("aes")
+  unsafe fn sealArm(key: &[u8], nonce: &[u8], aad: &[u8], plaintext: &[u8], ciphertext: &mut [u8], tag: &mut [u8]) -> () {
+    let keys = unsafe expandKeyArm(key)
+    drop unsafe cryptArm(&keys, u8x16.fromArray(counterBlock(nonce, 2)), plaintext, &mut ciphertext)
+    let computed = unsafe authenticateArm(&keys, nonce, aad, &ciphertext, plaintext.length)
+    u8x16.store(&mut tag, 0, computed)
+    return ()
+  }
+
+  // Writes the plaintext and answers `true` only when `tag` is correct; otherwise `plaintext`
+  // does not change.
+  @features("aes")
+  unsafe fn openArm(key: &[u8], nonce: &[u8], aad: &[u8], ciphertext: &[u8], tag: &[u8], plaintext: &mut [u8]) -> bool {
+    let keys = unsafe expandKeyArm(key)
+    let computed = u8x16.toArray(unsafe authenticateArm(&keys, nonce, aad, ciphertext, ciphertext.length))
+    if tagsDiffer(&computed, tag) {
+      return false
+    }
+    drop unsafe cryptArm(&keys, u8x16.fromArray(counterBlock(nonce, 2)), ciphertext, &mut plaintext)
+    return true
+  }
+
+  // SubWord: `aese` on four copies of `word` with a zero key is ShiftRows and SubBytes, and
+  // ShiftRows moves nothing when every column is the same.
+  @features("aes")
+  unsafe fn substituteWordArm(word: u32) -> u32 {
+    let substituted = Intrinsic.aarch64AesEncrypt<simd<u8, 16>>(u32x4.bitcastToU8x16(u32x4.splat(word)), u8x16.splat(0))
+    return u32x4.extract(u8x16.bitcastToU32x4(substituted), 0)
+  }
+
+  // The key schedule of FIPS 197 section 5.2 with SubWord in hardware.
+  @features("aes")
+  unsafe fn expandKeyArm(key: &[u8]) -> RoundKeys {
+    let mut words = zeroWords()
+    let count = key.length / 4
+    let rounds = count + 6
+    let mut index: usize = 0
+    while index < count {
+      words[index] = readU32BigEndian(key, index * 4)
+      index = index + 1
+    }
+    let mut rcon: u32 = 1
+    while index < 4 * (rounds + 1) {
+      let mut word = words[index - 1]
+      if index % count == 0 {
+        word = u32.bitXor(unsafe substituteWordArm(u32.rotateLeft(word, 8)), u32.shiftLeft(rcon, 24))
+        rcon = xtime(rcon)
+      } else if count == 8 && index % count == 4 {
+        word = unsafe substituteWordArm(word)
+      }
+      words[index] = u32.bitXor(words[index - count], word)
+      index = index + 1
+    }
+    let mut keys = zeroRoundKeys()
+    keys.rounds = rounds
+    let mut round: usize = 0
+    while round <= rounds {
+      keys.keys[round] = roundKeyAt(&words, round)
+      round = round + 1
+    }
+    return move keys
+  }
+
+  // `aese` adds the round key before SubBytes, so the rounds are `aese` and `aesmc` with keys 0 to
+  // `rounds - 2`, then `aese` with the next key, then the last key added.
+  @features("aes")
+  unsafe fn encryptArm(keys: &RoundKeys, block: simd<u8, 16>) -> simd<u8, 16> {
+    let mut state = block
+    let mut round: usize = 0
+    while round + 1 < keys.rounds {
+      state = Intrinsic.aarch64AesMixColumns<simd<u8, 16>>(Intrinsic.aarch64AesEncrypt<simd<u8, 16>>(state, u64x2.bitcastToU8x16(keys.keys[round])))
+      round = round + 1
+    }
+    state = Intrinsic.aarch64AesEncrypt<simd<u8, 16>>(state, u64x2.bitcastToU8x16(keys.keys[keys.rounds - 1]))
+    return state ^ u64x2.bitcastToU8x16(keys.keys[keys.rounds])
+  }
+
+  // Four blocks at once, so the rounds of independent blocks overlap in the pipeline.
+  @features("aes")
+  unsafe fn encrypt4Arm(keys: &RoundKeys, blocks: [simd<u8, 16>; 4]) -> [simd<u8, 16>; 4] {
+    let mut a = blocks[0]
+    let mut b = blocks[1]
+    let mut c = blocks[2]
+    let mut d = blocks[3]
+    let mut round: usize = 0
+    while round + 1 < keys.rounds {
+      let key = u64x2.bitcastToU8x16(keys.keys[round])
+      a = Intrinsic.aarch64AesMixColumns<simd<u8, 16>>(Intrinsic.aarch64AesEncrypt<simd<u8, 16>>(a, key))
+      b = Intrinsic.aarch64AesMixColumns<simd<u8, 16>>(Intrinsic.aarch64AesEncrypt<simd<u8, 16>>(b, key))
+      c = Intrinsic.aarch64AesMixColumns<simd<u8, 16>>(Intrinsic.aarch64AesEncrypt<simd<u8, 16>>(c, key))
+      d = Intrinsic.aarch64AesMixColumns<simd<u8, 16>>(Intrinsic.aarch64AesEncrypt<simd<u8, 16>>(d, key))
+      round = round + 1
+    }
+    let next = u64x2.bitcastToU8x16(keys.keys[keys.rounds - 1])
+    let last = u64x2.bitcastToU8x16(keys.keys[keys.rounds])
+    return [
+      Intrinsic.aarch64AesEncrypt<simd<u8, 16>>(a, next) ^ last,
+      Intrinsic.aarch64AesEncrypt<simd<u8, 16>>(b, next) ^ last,
+      Intrinsic.aarch64AesEncrypt<simd<u8, 16>>(c, next) ^ last,
+      Intrinsic.aarch64AesEncrypt<simd<u8, 16>>(d, next) ^ last,
+    ]
+  }
+
+  // Counter mode as `cryptX86` computes it.
+  @features("aes")
+  unsafe fn cryptArm(keys: &RoundKeys, start: simd<u8, 16>, input: &[u8], output: &mut [u8]) -> simd<u8, 16> {
+    let mut counter = u8x16.bitcastToU32x4(reverse(start))
+    let one = u32x4.fromArray([1, 0, 0, 0])
+    let mut offset: usize = 0
+    while input.length - offset >= 64 {
+      let a = reverse(u32x4.bitcastToU8x16(counter))
+      counter = u32x4.wrappingAdd(counter, one)
+      let b = reverse(u32x4.bitcastToU8x16(counter))
+      counter = u32x4.wrappingAdd(counter, one)
+      let c = reverse(u32x4.bitcastToU8x16(counter))
+      counter = u32x4.wrappingAdd(counter, one)
+      let d = reverse(u32x4.bitcastToU8x16(counter))
+      counter = u32x4.wrappingAdd(counter, one)
+      let stream = unsafe encrypt4Arm(keys, [a, b, c, d])
+      u8x16.store(&mut output, offset, u8x16.load(input, offset) ^ stream[0])
+      u8x16.store(&mut output, offset + 16, u8x16.load(input, offset + 16) ^ stream[1])
+      u8x16.store(&mut output, offset + 32, u8x16.load(input, offset + 32) ^ stream[2])
+      u8x16.store(&mut output, offset + 48, u8x16.load(input, offset + 48) ^ stream[3])
+      offset = offset + 64
+    }
+    while input.length - offset >= 16 {
+      let stream = unsafe encryptArm(keys, reverse(u32x4.bitcastToU8x16(counter)))
+      counter = u32x4.wrappingAdd(counter, one)
+      u8x16.store(&mut output, offset, u8x16.load(input, offset) ^ stream)
+      offset = offset + 16
+    }
+    if offset < input.length {
+      let stream = u8x16.toArray(unsafe encryptArm(keys, reverse(u32x4.bitcastToU8x16(counter))))
+      counter = u32x4.wrappingAdd(counter, one)
+      let mut index: usize = 0
+      while offset < input.length {
+        output[offset] = u8.bitXor(input[offset], stream[index])
+        offset = offset + 1
+        index = index + 1
+      }
+    }
+    return reverse(u32x4.bitcastToU8x16(counter))
+  }
+
+  // `blocks` whole blocks of the GCM counter mode from `counter`, which then holds the next counter
+  // block, as `counterBlocksX86` computes them.
+  @features("aes")
+  unsafe fn counterBlocksArm(keys: &RoundKeys, counter: &mut [u8; 16], input: &[u8], offset: usize, output: &mut [u8], blocks: usize) -> () {
+    let length = blocks * 16
+    let next = unsafe cryptArm(keys, u8x16.load(&counter, 0), Slice.view<u8>(input, offset, length), Slice.viewMut<u8>(&mut output, offset, length))
+    u8x16.store(&mut counter, 0, next)
+  }
+
+  // The unreduced 256-bit carry-less product of two elements: `pmull` multiplies the low words,
+  // `pmull2` the high words, and one more `pmull` the sums of the halves.
+  @features("aes")
+  unsafe fn productArm(left: simd<u64, 2>, right: simd<u64, 2>) -> Product {
+    let low = Intrinsic.aarch64PolynomialMultiply<simd<u64, 2>>(left, right)
+    let high = Intrinsic.aarch64PolynomialMultiplyHigh<simd<u64, 2>>(left, right)
+    let leftSum = left ^ u64x2.shuffle(left, left, [1, 0])
+    let rightSum = right ^ u64x2.shuffle(right, right, [1, 0])
+    let middle = Intrinsic.aarch64PolynomialMultiply<simd<u64, 2>>(leftSum, rightSum)
+    return combine(low, high, middle)
+  }
+
+  @features("aes")
+  unsafe fn multiplyArm(left: simd<u64, 2>, right: simd<u64, 2>) -> simd<u64, 2> {
+    return reduce(unsafe productArm(left, right))
+  }
+
+  @features("aes")
+  unsafe fn hashKeysArm(key: simd<u64, 2>) -> HashKeys {
+    let mut keys = zeroHashKeys()
+    let mut power = key
+    let mut index: usize = 0
+    while index < 4 {
+      keys.powers[index] = power
+      power = unsafe multiplyArm(power, key)
+      index = index + 1
+    }
+    return move keys
+  }
+
+  // GHASH as `hashInputX86` computes it.
+  @features("aes")
+  unsafe fn hashInputArm(state: simd<u64, 2>, keys: &HashKeys, input: &[u8], length: usize) -> simd<u64, 2> {
+    let mut current = state
+    let mut offset: usize = 0
+    while length - offset >= 64 {
+      let a = unsafe productArm(current ^ elementAt(input, offset), keys.powers[3])
+      let b = unsafe productArm(elementAt(input, offset + 16), keys.powers[2])
+      let c = unsafe productArm(elementAt(input, offset + 32), keys.powers[1])
+      let d = unsafe productArm(elementAt(input, offset + 48), keys.powers[0])
+      current = reduce(addProducts(addProducts(move a, move b), addProducts(move c, move d)))
+      offset = offset + 64
+    }
+    while length - offset >= 16 {
+      current = unsafe multiplyArm(current ^ elementAt(input, offset), keys.powers[0])
+      offset = offset + 16
+    }
+    if offset < length {
+      let mut last = zeroBlock()
+      let mut index: usize = 0
+      while offset < length {
+        last[index] = input[offset]
+        index = index + 1
+        offset = offset + 1
+      }
+      current = unsafe multiplyArm(current ^ elementAt(&last, 0), keys.powers[0])
+    }
+    return current
+  }
+
+  @features("aes")
+  unsafe fn authenticateArm(keys: &RoundKeys, nonce: &[u8], aad: &[u8], ciphertext: &[u8], length: usize) -> simd<u8, 16> {
+    let hashKey = u8x16.bitcastToU64x2(reverse(unsafe encryptArm(keys, u8x16.splat(0))))
+    let powers = unsafe hashKeysArm(hashKey)
+    let mut state = unsafe hashInputArm(u64x2.splat(0), &powers, aad, aad.length)
+    state = unsafe hashInputArm(state, &powers, ciphertext, length)
+    let sizes = u64x2.fromArray([usize.toU64(length) * 8, usize.toU64(aad.length) * 8])
+    let digest = unsafe multiplyArm(state ^ sizes, powers.powers[0])
+    let mask = unsafe encryptArm(keys, u8x16.fromArray(counterBlock(nonce, 1)))
+    return mask ^ reverse(u64x2.bitcastToU8x16(digest))
+  }
 }

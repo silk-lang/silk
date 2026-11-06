@@ -6,8 +6,8 @@ Compute SHA-1 digests (20 bytes) for old protocols and file formats.
 
 ## When to use
 Use [`Sha1`](#Sha1) only when an existing format needs SHA-1, such as a Git object ID or the WebSocket
-handshake. For new designs, use SHA-256 from `silk.crypto.sha2` or SHA-3 from `silk.crypto.sha3`. For the keys
-of a hash map, use `silk.collections.hash`.
+handshake. For new designs, use SHA-256 from `silk.crypto.sha2` or SHA-3 from
+`silk.crypto.sha3`. For the keys of a hash map, use `silk.collections.hash`.
 
 ## Details
 [`Sha1.hash`](#Sha1.impl.hash) returns the digest of one slice. For a message that arrives in parts, call
@@ -112,6 +112,84 @@ Returns the 20-byte SHA-1 digest of `bytes`.
 
 #### Gotchas
 The program traps if `bytes` is longer than 2^64 - 1 bits.
+
+<a id="Sha1.impl.Digest"></a>
+
+## Implementation `Digest for Sha1`
+
+```silk
+impl Digest for Sha1
+```
+
+<a id="Sha1.impl.Digest.make"></a>
+
+### Operation `make`
+
+```silk
+make: Sha1.make
+```
+
+Returns a SHA-1 state for an empty message.
+
+<a id="Sha1.impl.Digest.update"></a>
+
+### Operation `update`
+
+```silk
+update: Sha1.update
+```
+
+Adds `bytes` to the end of the message.
+
+<a id="Sha1.impl.Digest.blockLength"></a>
+
+### Operation `blockLength`
+
+```silk
+fn blockLength(self: &Self) -> usize
+```
+
+Returns 64, the SHA-1 block length in bytes.
+
+<a id="Sha1.impl.Digest.digestLength"></a>
+
+### Operation `digestLength`
+
+```silk
+fn digestLength(self: &Self) -> usize
+```
+
+Returns 20, the SHA-1 digest length in bytes.
+
+<a id="Sha1.impl.Digest.objectIdentifier"></a>
+
+### Operation `objectIdentifier`
+
+```silk
+fn objectIdentifier(self: &Self) -> &[u8]
+```
+
+Returns the content bytes of the SHA-1 object identifier, 1.3.14.3.2.26.
+
+<a id="Sha1.impl.Digest.copy"></a>
+
+### Operation `copy`
+
+```silk
+fn copy(self: &Self) -> Self
+```
+
+Returns an independent copy of the state.
+
+<a id="Sha1.impl.Digest.finishInto"></a>
+
+### Operation `finishInto`
+
+```silk
+fn finishInto(self: Self, output: &mut [u8]) -> ()
+```
+
+Writes the 20-byte SHA-1 digest to the start of `output` and consumes the state.
 
 
 Category: Cryptography.

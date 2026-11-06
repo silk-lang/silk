@@ -5,8 +5,8 @@
 The system calls for files and directories, for the native `FileSystem` provider.
 
 ## When to use
-`silk.system.filesystem_native` uses `NativeFileSystem`. Application code uses the `FileSystem` effect
-from `silk.system.filesystem` instead.
+`silk.system.filesystem_native` uses `NativeFileSystem`. Application code uses the
+`FileSystem` effect from `silk.system.filesystem` instead.
 
 ## Details
 Each operation starts at the root directory and opens each part of the path relative to its

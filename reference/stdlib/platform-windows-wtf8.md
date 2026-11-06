@@ -78,7 +78,8 @@ The byte offset immediately after the code point.
 pub struct Wtf8
 ```
 
-Conversion of arbitrary UTF-16 code units to canonical WTF-8 bytes, without replacement characters.
+Conversion of arbitrary UTF-16 code units to canonical WTF-8 bytes, without replacement
+characters.
 
 <a id="Wtf8.impl"></a>
 
@@ -119,8 +120,8 @@ Decodes one canonical WTF-8 code point at `at`, or returns an absent option for 
 #### Details
 
 An absent result also indicates the end of input. Callers start at zero and advance to `end`.
-Overlong encodings, values above 0x10ffff, and separately encoded adjacent surrogate pairs are rejected.
-Lone surrogates and NUL are accepted. This operation does not allocate.
+Overlong encodings, values above 0x10ffff, and separately encoded adjacent surrogate pairs are
+rejected. Lone surrogates and NUL are accepted. This operation does not allocate.
 
 <a id="Wtf8.impl.decodeBytes"></a>
 

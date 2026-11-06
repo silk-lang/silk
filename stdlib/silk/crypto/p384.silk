@@ -1,20 +1,28 @@
-//! Verify ECDSA signatures on the NIST P-384 curve (secp384r1) with SHA-384.
+//! Key agreement (ECDH) and ECDSA signatures on the NIST P-384 curve (secp384r1).
 //!
 //! # When to use
-//! Use [`EcdsaP384Sha384`] to verify a P-384 signature, for example in a certificate chain or a
-//! JSON Web Token with `ES384`. This module cannot sign and has no key agreement.
+//! Use [`P384`] for an ECDH key exchange where a protocol needs P-384, such as a TLS 1.3 key share
+//! `secp384r1`, and to sign with ECDSA, as in `ES384` JSON Web Tokens or Node.js `crypto.sign`. Use
+//! [`EcdsaP384Sha384`] to verify a DER signature with SHA-384, for example in a certificate chain,
+//! and [`EcdsaP384`] to verify with another hash or in the fixed 96-byte form.
 //!
 //! # Details
 //! Public keys are 97 bytes in uncompressed SEC1 form: `0x04`, then the X and Y coordinates, each
-//! 48 bytes big-endian. Signatures are in DER form. The functions hash the message with SHA-384.
-//! Nothing allocates.
+//! 48 bytes big-endian. [`P384.compressPublicKey`] and [`P384.decompressPublicKey`] convert to and
+//! from the 49-byte compressed form. Secrets are 48 bytes big-endian. [`P384.agree`] returns the X
+//! coordinate of the shared point and consumes the key. [`P384.sign`] returns `r` and `s`, each 48
+//! bytes, with the deterministic nonce of RFC 6979. [`EcdsaP384.toDer`] and [`EcdsaP384.fromDer`]
+//! convert signatures to and from DER. Nothing allocates.
 //!
 //! # Errors
+//! - [`P384Error`] for a secret or a peer public key that is not valid.
 //! - [`P384SignatureError`] for a key or signature that is not valid, or that does not match.
 //!
 //! # Gotchas
 //! A valid signature proves only that the holder of the private key signed the message. It does not
-//! prove that you can trust the key. To check a certificate chain, use the `silk.tls.trust_*` modules.
+//! prove that you can trust the key. To check a certificate chain, use the `silk.tls.trust_*`
+//! modules. The key exchange does not authenticate the peer. Pass the shared secret through
+//! `silk.crypto.hkdf` before you use it as a key. The secret is not erased when it is dropped.
 //!
 //! # Examples
 //! ## Verify a signature
@@ -244,13 +252,58 @@
 //! }
 //! ```
 //!
+//! ## Sign and verify
+//! ```silk
+//! import silk.crypto.p384 { EcdsaP384, P384, P384Error, P384SignatureError }
+//! import silk.crypto.sha2 { Sha256 }
+//! import silk.core.result { Result }
+//!
+//! pub fn main() -> i32 {
+//!   // Real programs use `P384.generate()` with a secure `Random` provider.
+//!   let mut secret: [u8; 48] = [0; 48]
+//!   secret[47] = 7
+//!   let key = match P384.fromBytes(&secret) {
+//!     Result<P384, P384Error>.Success { value } => move value
+//!     Result<P384, P384Error>.Failure {..} => {
+//!       return 1
+//!     }
+//!   }
+//!   let publicKey = key.publicKey()
+//!   let signature = key.sign<Sha256>(b"hello")
+//!   match EcdsaP384.verify<Sha256>(&publicKey, b"hello", &signature) {
+//!     Result<(), P384SignatureError>.Success {..} => {}
+//!     Result<(), P384SignatureError>.Failure {..} => {
+//!       return 1
+//!     }
+//!   }
+//!
+//!   // The deterministic nonce gives the same signature again.
+//!   let again = key.sign<Sha256>(b"hello")
+//!   if again[0] != signature[0] || again[95] != signature[95] {
+//!     return 1
+//!   }
+//!
+//!   // The DER form, as in X.509 and TLS, has at most 104 bytes.
+//!   let mut der: [u8; 104] = [0; 104]
+//!   let length = EcdsaP384.toDer(&signature, &mut der)
+//!   if der[0] != 0x30 || length > 104 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
 //! @category Cryptography
 
 import silk.tls.certificate {AlgorithmView, BitStringView}
 import silk.text.format {Debug, Format, Formatter}
 import silk.core.option {Option}
 import silk.core.ownership {Copy}
+import silk.collections.slice {Slice}
+import silk.crypto.digest {Digest}
+import silk.crypto.hmac {Hmac}
 import silk.crypto.sha2 {Sha384}
+import silk.system.random {Random}
 import silk.core.result {Result}
 import silk.num.u8
 import silk.num.u32
@@ -258,7 +311,243 @@ import silk.num.u64
 import silk.num.usize
 import silk.io.writer {Writer, WriterError}
 
-enum P384Error { InvalidLength, InvalidEncoding, InvalidPoint }
+/// The reason that a P-384 secret or public key is not valid. It holds no secret bytes.
+pub enum P384Error {
+  /// A secret is not 48 bytes, or a public key is not 97 bytes.
+  InvalidLength,
+  /// The secret is 0, or not less than the order of the curve.
+  InvalidScalar,
+  /// The public key does not start with `0x04`. Compressed keys are not supported.
+  InvalidEncoding,
+  /// A coordinate is not less than the field prime, or the point is not on the curve.
+  InvalidPoint,
+}
+
+impl Debug for P384Error {
+  /// Writes the name of the variant, such as `InvalidLength`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      P384Error.InvalidLength => run Format.write(&mut formatter, b"InvalidLength")
+      P384Error.InvalidScalar => run Format.write(&mut formatter, b"InvalidScalar")
+      P384Error.InvalidEncoding => run Format.write(&mut formatter, b"InvalidEncoding")
+      P384Error.InvalidPoint => run Format.write(&mut formatter, b"InvalidPoint")
+    }
+  }
+}
+
+/// A P-384 secret, for key agreement and for ECDSA signatures. It is not `Copy`.
+///
+/// # When to use
+/// Use it for an ECDH key exchange where a protocol needs P-384, such as a TLS 1.3 key share
+/// `secp384r1`, or to sign with ECDSA.
+///
+/// # Details
+/// [`P384.agree`] consumes it, so make a new one for each exchange. [`P384.sign`] does not. Public keys are 97 bytes in
+/// uncompressed SEC1 form: `0x04`, then the X and Y coordinates, each 48 bytes big-endian. Secrets
+/// are 48 bytes big-endian. Nothing allocates.
+///
+/// # Gotchas
+/// The key exchange does not authenticate the peer. Pass the shared secret through
+/// `silk.crypto.hkdf` before you use it as a key. The secret is not erased when it is dropped.
+pub struct P384 {
+  secret: [u8; 48],
+}
+
+impl P384 {
+  /// Checks that `publicKey` is a valid uncompressed P-384 public key.
+  ///
+  /// It must be 97 bytes: `0x04`, then X and Y, each 48 bytes big-endian and less than the field
+  /// prime, and the point must be on the curve.
+  ///
+  /// # Errors
+  /// - `InvalidLength`, `InvalidEncoding`, or `InvalidPoint`.
+  pub fn validatePublicKey(publicKey: &[u8]) -> Result<(), P384Error> {
+    let admitted = admitPoint(publicKey)
+    return match move admitted {
+      Result<Point, P384Error>.Success {..} => Result<(), P384Error>.succeed(())
+      Result<Point, P384Error>.Failure {error} => Result<(), P384Error>.failResult(error)
+    }
+  }
+  /// Returns the secret for the 48 big-endian bytes `bytes`.
+  ///
+  /// # Errors
+  /// - `InvalidLength` if `bytes` is not 48 bytes.
+  /// - `InvalidScalar` if the value is 0, or not less than the order of the curve.
+  pub fn fromBytes(bytes: &[u8]) -> Result<P384, P384Error> {
+    if bytes.length != 48 {
+      return Result<P384, P384Error>.failResult(P384Error.InvalidLength)
+    }
+    let value = decode(bytes, 0)
+    if nonzero(value) == 0 || below(value, order()) == 0 {
+      return Result<P384, P384Error>.failResult(P384Error.InvalidScalar)
+    }
+    let secret = encode(value)
+    return Result<P384, P384Error>.succeed(P384 {secret: secret})
+  }
+  /// Returns a new random secret, with bytes from the ambient `Random`.
+  ///
+  /// It draws 48 bytes again until the value is valid, so the result is uniform. The `Random`
+  /// provider must be cryptographically secure. If it fails, the program stops.
+  pub effect fn generate() -> P384 ? &mut Random {
+    let mut bytes = emptyBytes()
+    run Random.fillBytes(&mut bytes)
+    let mut value = decode(&bytes, 0)
+    while nonzero(value) == 0 || below(value, order()) == 0 {
+      run Random.fillBytes(&mut bytes)
+      value = decode(&bytes, 0)
+    }
+    return P384 {secret: bytes}
+  }
+  /// Returns the 97-byte uncompressed public key to send to the peer. It does not consume the
+  /// secret.
+  pub fn publicKey(self: &Self) -> [u8; 97] {
+    let point = affine(multiply(basePoint(), &self.secret))
+    let x = encode(fromMontgomery(point.x))
+    let y = encode(fromMontgomery(point.y))
+    let mut output: [u8; 97] = [0; 97]
+    output[0] = 4
+    let mut i: usize = 0
+    while i < 48 {
+      output[i + 1] = x[i]
+      output[i + 49] = y[i]
+      i = i + 1
+    }
+    return output
+  }
+  /// Returns the 48-byte shared secret for the public key `peer`, and consumes the secret.
+  ///
+  /// The result is the big-endian X coordinate of the shared point.
+  ///
+  /// # Errors
+  /// - `InvalidLength`, `InvalidEncoding`, or `InvalidPoint` if `peer` is not a valid uncompressed
+  ///   public key. The secret is consumed also when it fails.
+  ///
+  /// # Gotchas
+  /// Pass the result through `silk.crypto.hkdf` before you use it as a key.
+  pub fn agree(self: Self, peer: &[u8]) -> Result<[u8; 48], P384Error> {
+    let admitted = admitPoint(peer)
+    return match move admitted {
+      Result<Point, P384Error>.Success {value} => {
+        let point = affine(multiply(value, &self.secret))
+        return Result<[u8; 48], P384Error>.succeed(encode(fromMontgomery(point.x)))
+      }
+      Result<Point, P384Error>.Failure {error} => Result<[u8; 48], P384Error>.failResult(error)
+    }
+  }
+  /// Returns the 48 big-endian bytes of the secret, the input of [`P384.fromBytes`].
+  ///
+  /// # Gotchas
+  /// The bytes are the private key. Keep them secret.
+  pub fn toBytes(self: &Self) -> [u8; 48] {
+    return self.secret
+  }
+  /// Returns the ECDSA signature of `message`, hashed with `H`, as 96 bytes: `r`, then `s`, each
+  /// 48 bytes big-endian.
+  ///
+  /// The nonce is deterministic (RFC 6979) with HMAC over `H`, so the same key, hash, and message
+  /// always give the same signature. [`EcdsaP384.toDer`] converts the result to DER.
+  ///
+  /// # Gotchas
+  /// The program traps if `message` is longer than `H` allows.
+  pub fn sign<H: Digest>(self: &Self, message: &[u8]) -> [u8; 96] {
+    let mut state: H = Digest.make()
+    let length = state.digestLength()
+    state.update(message)
+    let mut digest: [u8; 64] = [0; 64]
+    state.finishInto(&mut digest)
+    return self.signDigest<H>(Slice.view<u8>(&digest, 0, length))
+  }
+  /// Returns the ECDSA signature of a message whose digest is `digest`, as 96 bytes: `r`, then
+  /// `s`, each 48 bytes big-endian.
+  ///
+  /// `H` is the hash for the RFC 6979 nonce, normally the hash that made `digest`. A digest longer
+  /// than 48 bytes is cut to its first 48 bytes, as ECDSA requires.
+  pub fn signDigest<H: Digest>(self: &Self, digest: &[u8]) -> [u8; 96] {
+    let z = digestScalar(digest)
+    let secret = self.secret
+    let digestBytes = encode(z)
+    let dm = scalarToMontgomery(decode(&secret, 0))
+    let zm = scalarToMontgomery(z)
+    let mut nonce = nonceStart<H>(&secret, &digestBytes)
+    while true {
+      let k = nonceNext<H>(&mut nonce)
+      let kBytes = encode(k)
+      let point = affine(multiply(basePoint(), &kBytes))
+      let r = reduceMod(fromMontgomery(point.x), 0, order())
+      // r is public. Both retries happen with probability near 2^-384.
+      if nonzero(r) != 0 {
+        let sum = addMod(zm, scalarMul(scalarToMontgomery(r), dm), order())
+        let s = scalarFromMontgomery(scalarMul(sum, scalarInvert(scalarToMontgomery(k))))
+        if nonzero(s) != 0 {
+          return joinScalars(r, s)
+        }
+      }
+    }
+    return joinScalars(zero(), zero())
+  }
+  /// Returns the 49-byte compressed form of the uncompressed public key `publicKey`: `0x02` or
+  /// `0x03` for the parity of Y, then X.
+  ///
+  /// # Errors
+  /// - `InvalidLength`, `InvalidEncoding`, or `InvalidPoint` if `publicKey` is not a valid
+  ///   uncompressed public key.
+  pub fn compressPublicKey(publicKey: &[u8]) -> Result<[u8; 49], P384Error> {
+    let admitted = admitPoint(publicKey)
+    return match move admitted {
+      Result<Point, P384Error>.Success {..} => {
+        let mut output: [u8; 49] = [0; 49]
+        output[0] = 2 + u8.bitAnd(publicKey[96], 1)
+        let mut i: usize = 0
+        while i < 48 {
+          output[i + 1] = publicKey[i + 1]
+          i = i + 1
+        }
+        return Result<[u8; 49], P384Error>.succeed(output)
+      }
+      Result<Point, P384Error>.Failure {error} => Result<[u8; 49], P384Error>.failResult(error)
+    }
+  }
+  /// Returns the 97-byte uncompressed form of the compressed public key `publicKey`.
+  ///
+  /// # Errors
+  /// - `InvalidLength` if `publicKey` is not 49 bytes.
+  /// - `InvalidEncoding` if it does not start with `0x02` or `0x03`.
+  /// - `InvalidPoint` if X is not less than the field prime, or no point has that X.
+  pub fn decompressPublicKey(publicKey: &[u8]) -> Result<[u8; 97], P384Error> {
+    if publicKey.length != 49 {
+      return Result<[u8; 97], P384Error>.failResult(P384Error.InvalidLength)
+    }
+    if publicKey[0] != 2 && publicKey[0] != 3 {
+      return Result<[u8; 97], P384Error>.failResult(P384Error.InvalidEncoding)
+    }
+    let x = decode(publicKey, 1)
+    if below(x, prime()) == 0 {
+      return Result<[u8; 97], P384Error>.failResult(P384Error.InvalidPoint)
+    }
+    let mx = toMontgomery(x)
+    let rhs = curveRight(mx)
+    let root = power(rhs, squareRootExponent())
+    if nonzero(sub(square(root), rhs)) != 0 {
+      return Result<[u8; 97], P384Error>.failResult(P384Error.InvalidPoint)
+    }
+    let mut y = fromMontgomery(root)
+    if u32.bitAnd(y.limbs[0], 1) != u8.toU32(publicKey[0] - 2) {
+      y = sub(zero(), y)
+    }
+    let xBytes = encode(x)
+    let yBytes = encode(y)
+    let mut output: [u8; 97] = [0; 97]
+    output[0] = 4
+    let mut i: usize = 0
+    while i < 48 {
+      output[i + 1] = xBytes[i]
+      output[i + 49] = yBytes[i]
+      i = i + 1
+    }
+    return Result<[u8; 97], P384Error>.succeed(output)
+  }
+}
+
 
 // Canonical residues use twelve little-endian 32-bit limbs. Field operations return Montgomery
 // residues. Fixed arrays make every loop and temporary independent of input magnitude.
@@ -414,6 +703,10 @@ fn reduceMod(value: Field, high: u64, p: Field) -> Field {
 }
 
 fn add(left: Field, right: Field) -> Field {
+  return addMod(left, right, prime())
+}
+
+fn addMod(left: Field, right: Field, p: Field) -> Field {
   let mut result = zero()
   let mut carry: u64 = 0
   let mut i: usize = 0
@@ -426,7 +719,7 @@ fn add(left: Field, right: Field) -> Field {
     carry = u64.shiftRight(sum, 32)
     i = i + 1
   }
-  return reduce(result, carry)
+  return reduceMod(result, carry, p)
 }
 
 fn sub(left: Field, right: Field) -> Field {
@@ -529,7 +822,11 @@ fn fromMontgomery(value: Field) -> Field {
 }
 
 fn invert(value: Field) -> Field {
-  let exponent = inverseExponent()
+  return power(value, inverseExponent())
+}
+
+// value^exponent for a Montgomery residue. The time does not depend on either input.
+fn power(value: Field, exponent: Field) -> Field {
   let mut result = one()
   let mut i: usize = 384
   while i > 0 {
@@ -681,7 +978,7 @@ impl Debug for P384SignatureError {
 ///
 /// # When to use
 /// Use it to verify a P-384 signature, for example in a certificate chain or a JSON Web Token with
-/// `ES384`. It cannot sign and has no key agreement.
+/// `ES384`. To sign, use [`P384.sign`] and [`EcdsaP384.toDer`].
 ///
 /// # Details
 /// Public keys are 97 bytes in uncompressed SEC1 form: `0x04`, then the X and Y coordinates, each
@@ -689,7 +986,8 @@ impl Debug for P384SignatureError {
 ///
 /// # Gotchas
 /// A valid signature proves only that the holder of the private key signed the message. It does not
-/// prove that you can trust the key. To check a certificate chain, use the `silk.tls.trust_*` modules.
+/// prove that you can trust the key. To check a certificate chain, use the `silk.tls.trust_*`
+/// modules.
 pub struct EcdsaP384Sha384 {}
 
 impl EcdsaP384Sha384 {
@@ -831,28 +1129,53 @@ fn verifyPoint(publicPoint: Point, digest: &([u8; 48]), signature: &[u8]) -> Res
   (),
   P384SignatureError,
 > {
+  let parsed = parseDer(signature)
+  return match move parsed {
+    Result<[u8; 96], P384SignatureError>.Success {value} => verifyScalars(
+      publicPoint,
+      digestScalar(digest),
+      &value,
+    )
+    Result<[u8; 96], P384SignatureError>.Failure {error} => Result<(), P384SignatureError>.failResult(
+      error,
+    )
+  }
+}
+
+fn parseDer(signature: &[u8]) -> Result<[u8; 96], P384SignatureError> {
   if signature.length < 8 || signature.length > 104 {
-    return Result<(), P384SignatureError>.failResult(P384SignatureError.InvalidEncoding)
+    return Result<[u8; 96], P384SignatureError>.failResult(P384SignatureError.InvalidEncoding)
   }
   if signature[0] != 48 || u8.toUsize(signature[1]) != signature.length - 2 || signature[2] != 2 {
-    return Result<(), P384SignatureError>.failResult(P384SignatureError.InvalidEncoding)
+    return Result<[u8; 96], P384SignatureError>.failResult(P384SignatureError.InvalidEncoding)
   }
   let rLength = u8.toUsize(signature[3])
   let sHeader: usize = 4 + rLength
   if sHeader + 2 > signature.length {
-    return Result<(), P384SignatureError>.failResult(P384SignatureError.InvalidEncoding)
+    return Result<[u8; 96], P384SignatureError>.failResult(P384SignatureError.InvalidEncoding)
   }
   let sLength = u8.toUsize(signature[sHeader + 1])
   if signature[sHeader] != 2 || sHeader + 2 + sLength != signature.length {
-    return Result<(), P384SignatureError>.failResult(P384SignatureError.InvalidEncoding)
+    return Result<[u8; 96], P384SignatureError>.failResult(P384SignatureError.InvalidEncoding)
   }
   let r = signatureInteger(signature, 4, rLength)
   let s = signatureInteger(signature, sHeader + 2, sLength)
   if nonzero(r) == 0 || nonzero(s) == 0 {
+    return Result<[u8; 96], P384SignatureError>.failResult(P384SignatureError.InvalidEncoding)
+  }
+  return Result<[u8; 96], P384SignatureError>.succeed(joinScalars(r, s))
+}
+
+// `signature` is the fixed form: r, then s, each 48 bytes big-endian.
+fn verifyScalars(publicPoint: Point, z: Field, signature: &[u8]) -> Result<(), P384SignatureError> {
+  if signature.length != 96 {
     return Result<(), P384SignatureError>.failResult(P384SignatureError.InvalidEncoding)
   }
-  let digestBytes = digest.*
-  let z = reduceMod(decode(&digestBytes, 0), 0, order())
+  let r = decode(signature, 0)
+  let s = decode(signature, 48)
+  if nonzero(r) == 0 || nonzero(s) == 0 || below(r, order()) == 0 || below(s, order()) == 0 {
+    return Result<(), P384SignatureError>.failResult(P384SignatureError.InvalidEncoding)
+  }
   let inverse = scalarInvert(scalarToMontgomery(s))
   let u1 = encode(scalarFromMontgomery(scalarMul(scalarToMontgomery(z), inverse)))
   let u2 = encode(scalarFromMontgomery(scalarMul(scalarToMontgomery(r), inverse)))
@@ -881,10 +1204,250 @@ fn admitPoint(peer: &[u8]) -> Result<Point, P384Error> {
   }
   let mx = toMontgomery(x)
   let my = toMontgomery(y)
-  let rhs = add(sub(mul(square(mx), mx), add(add(mx, mx), mx)), curveB())
+  let rhs = curveRight(mx)
   if nonzero(sub(square(my), rhs)) != 0 {
     return Result<Point, P384Error>.failResult(P384Error.InvalidPoint)
   }
 
   return Result<Point, P384Error>.succeed(Point {x: mx, y: my, z: one()})
+}
+
+fn squareRootExponent() -> Field {
+  return Field {limbs: [
+      1073741824,
+      0,
+      3221225472,
+      3221225471,
+      4294967295,
+      4294967295,
+      4294967295,
+      4294967295,
+      4294967295,
+      4294967295,
+      4294967295,
+      1073741823,
+    ]}
+}
+
+// x^3 - 3x + b for a Montgomery residue x.
+fn curveRight(x: Field) -> Field {
+  return add(sub(mul(square(x), x), add(add(x, x), x)), curveB())
+}
+
+// bits2int of RFC 6979 for a 384-bit order, reduced once below the order.
+fn digestScalar(digest: &[u8]) -> Field {
+  let mut padded = emptyBytes()
+  let mut length = digest.length
+  if length > 48 {
+    length = 48
+  }
+  let mut i: usize = 0
+  while i < length {
+    padded[48 - length + i] = digest[i]
+    i = i + 1
+  }
+  return reduceMod(decode(&padded, 0), 0, order())
+}
+
+fn joinScalars(r: Field, s: Field) -> [u8; 96] {
+  let rBytes = encode(r)
+  let sBytes = encode(s)
+  let mut output: [u8; 96] = [0; 96]
+  let mut i: usize = 0
+  while i < 48 {
+    output[i] = rBytes[i]
+    output[i + 48] = sBytes[i]
+    i = i + 1
+  }
+  return output
+}
+
+// HMAC_DRBG state of RFC 6979, section 3.2. Only the first `length` bytes of K and V are used.
+struct Nonce {
+  key: [u8; 64],
+  value: [u8; 64],
+  length: usize,
+  started: bool,
+}
+
+fn nonceStart<H: Digest>(secret: &([u8; 48]), digest: &([u8; 48])) -> Nonce {
+  let probe: H = Digest.make()
+  let mut nonce = Nonce {key: [0; 64], value: [1; 64], length: probe.digestLength(), started: false}
+  nonceUpdate<H>(&mut nonce, 0, secret, digest)
+  nonceUpdate<H>(&mut nonce, 1, secret, digest)
+  return move nonce
+}
+
+// K = HMAC_K(V || marker || secret || digest), then V = HMAC_K(V).
+fn nonceUpdate<H: Digest>(nonce: &mut Nonce, marker: u8, secret: &[u8], digest: &[u8]) -> () {
+  let mut state = Hmac<H>.make(Slice.view<u8>(&nonce.key, 0, nonce.length))
+  state.update(Slice.view<u8>(&nonce.value, 0, nonce.length))
+  let markerBytes: [u8; 1] = [marker]
+  state.update(&markerBytes)
+  state.update(secret)
+  state.update(digest)
+  state.finishInto(&mut nonce.key)
+  nonceStep<H>(&mut nonce)
+}
+
+// V = HMAC_K(V).
+fn nonceStep<H: Digest>(nonce: &mut Nonce) -> () {
+  let mut state = Hmac<H>.make(Slice.view<u8>(&nonce.key, 0, nonce.length))
+  state.update(Slice.view<u8>(&nonce.value, 0, nonce.length))
+  state.finishInto(&mut nonce.value)
+}
+
+// The next candidate k between 1 and the order minus 1.
+fn nonceNext<H: Digest>(nonce: &mut Nonce) -> Field {
+  while true {
+    if nonce.started {
+      nonceUpdate<H>(&mut nonce, 0, b"", b"")
+    }
+    nonce.started = true
+    let mut candidate = emptyBytes()
+    let mut filled: usize = 0
+    while filled < 48 {
+      nonceStep<H>(&mut nonce)
+      let mut i: usize = 0
+      while i < nonce.length && filled < 48 {
+        candidate[filled] = nonce.value[i]
+        filled = filled + 1
+        i = i + 1
+      }
+    }
+    let k = decode(&candidate, 0)
+    if nonzero(k) != 0 && below(k, order()) != 0 {
+      return k
+    }
+  }
+  return zero()
+}
+
+/// ECDSA on P-384 with any hash, and conversion between the two signature forms.
+///
+/// # When to use
+/// Use it to verify a signature made with a hash other than SHA-256, or a signature in the fixed
+/// 96-byte form (`r`, then `s`), as in JSON Web Tokens and WebCrypto. To sign, use [`P384.sign`].
+/// For SHA-384 with DER signatures, as in TLS and X.509, [`EcdsaP384Sha384`] is shorter.
+///
+/// # Details
+/// Public keys are 97 bytes in uncompressed SEC1 form. A fixed-form signature is 96 bytes. A DER
+/// signature is a SEQUENCE of the two INTEGERs, at most 104 bytes. Nothing allocates.
+///
+/// # Gotchas
+/// A valid signature proves only that the holder of the private key signed the message. It does not
+/// prove that you can trust the key.
+pub struct EcdsaP384 {}
+
+impl EcdsaP384 {
+  /// Checks that `signature`, in the fixed 96-byte form, is a valid signature of `message`,
+  /// hashed with `H`, by `publicKey`.
+  ///
+  /// Both high and low `s` values are accepted.
+  ///
+  /// # Errors
+  /// - `InvalidKey` if `publicKey` is not a valid uncompressed key.
+  /// - `InvalidEncoding` if `signature` is not 96 bytes, or `r` or `s` is not between 1 and the
+  ///   order of the curve.
+  /// - `AuthenticationFailed` if the signature does not match.
+  ///
+  /// # Gotchas
+  /// The program traps if `message` is longer than `H` allows.
+  pub fn verify<H: Digest>(publicKey: &[u8], message: &[u8], signature: &[u8]) -> Result<
+    (),
+    P384SignatureError,
+  > {
+    let mut state: H = Digest.make()
+    let length = state.digestLength()
+    state.update(message)
+    let mut digest: [u8; 64] = [0; 64]
+    state.finishInto(&mut digest)
+    return EcdsaP384.verifyDigest(publicKey, Slice.view<u8>(&digest, 0, length), signature)
+  }
+  /// Checks that `signature`, in the fixed 96-byte form, is a valid signature by `publicKey` of a
+  /// message whose digest is `digest`.
+  ///
+  /// A digest longer than 48 bytes is cut to its first 48 bytes, as ECDSA requires.
+  ///
+  /// # Errors
+  /// - `InvalidKey`, `InvalidEncoding`, or `AuthenticationFailed`, as for [`EcdsaP384.verify`].
+  pub fn verifyDigest(publicKey: &[u8], digest: &[u8], signature: &[u8]) -> Result<
+    (),
+    P384SignatureError,
+  > {
+    let admitted = admitPoint(publicKey)
+    return match move admitted {
+      Result<Point, P384Error>.Success {value} => verifyScalars(value, digestScalar(digest), signature)
+      Result<Point, P384Error>.Failure {..} => Result<(), P384SignatureError>.failResult(
+        P384SignatureError.InvalidKey,
+      )
+    }
+  }
+  /// Returns the fixed 96-byte form of the DER signature `signature`.
+  ///
+  /// # Errors
+  /// - `InvalidEncoding` if `signature` is not strict DER, or `r` or `s` is not between 1 and the
+  ///   order of the curve.
+  pub fn fromDer(signature: &[u8]) -> Result<[u8; 96], P384SignatureError> {
+    return parseDer(signature)
+  }
+  /// Writes the DER form of the fixed 96-byte signature `signature` to the start of `output`, and
+  /// returns its length, at most 104 bytes.
+  ///
+  /// It does not check the values of `r` and `s`. The bytes of `output` after the DER do not
+  /// change.
+  ///
+  /// # Gotchas
+  /// The program traps if `signature` is not 96 bytes, or `output` is shorter than the DER.
+  pub fn toDer(signature: &[u8], output: &mut [u8]) -> usize {
+    if signature.length != 96 {
+      Intrinsic.trap("EcdsaP384.toDer: the signature is not 96 bytes")
+    }
+    let rLength = derIntegerLength(signature, 0, 48)
+    let sLength = derIntegerLength(signature, 48, 48)
+    output[0] = 48
+    output[1] = usize.toU8(rLength + sLength + 4)
+    let mut position: usize = 2
+    position = writeDerInteger(signature, 0, 48, rLength, &mut output, position)
+    position = writeDerInteger(signature, 48, 48, sLength, &mut output, position)
+    return position
+  }
+}
+
+// The length of the DER INTEGER content for the `size` big-endian bytes at `start`.
+fn derIntegerLength(raw: &[u8], start: usize, size: usize) -> usize {
+  let mut skip: usize = 0
+  while skip + 1 < size && raw[start + skip] == 0 {
+    skip = skip + 1
+  }
+  if raw[start + skip] >= 128 {
+    return size + 1 - skip
+  }
+  return size - skip
+}
+
+fn writeDerInteger(
+  raw: &[u8],
+  start: usize,
+  size: usize,
+  length: usize,
+  output: &mut [u8],
+  position: usize,
+) -> usize {
+  output[position] = 2
+  output[position + 1] = usize.toU8(length)
+  let mut at = position + 2
+  let mut source = start
+  if length > size {
+    output[at] = 0
+    at = at + 1
+  } else {
+    source = start + size - length
+  }
+  while source < start + size {
+    output[at] = raw[source]
+    at = at + 1
+    source = source + 1
+  }
+  return at
 }

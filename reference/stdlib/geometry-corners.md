@@ -208,8 +208,8 @@ impl<T: Copy + Order + Zero + One + Add<T, T> + Divide<T, T>> Corners<T>
 pub fn clampToSize(self: Self, size: Size2<T>) -> Corners<T>
 ```
 
-Returns the radii limited so that they fit a box of `size`: each corner is clamped between zero
-and half of the smaller of the width and the height.
+Returns the radii limited so that they fit a box of `size`: each corner is clamped between
+zero and half of the smaller of the width and the height.
 
 #### When to use
 

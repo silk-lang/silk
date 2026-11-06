@@ -38,7 +38,23 @@ impl WindowsHeap
 pub fn acquire(size: usize) -> ?*mut u8
 ```
 
-Returns uninitialized storage aligned to 16 bytes, or null on failure. A zero size allocates one byte.
+Returns uninitialized storage aligned to 16 bytes, or null on failure. A zero size allocates
+one byte.
+
+#### Gotchas
+
+Release a successful result exactly once with `WindowsHeap.release`, after all access ends.
+
+<a id="WindowsHeap.impl.acquireZeroed"></a>
+
+### Associated function `acquireZeroed`
+
+```silk
+pub fn acquireZeroed(size: usize) -> ?*mut u8
+```
+
+Returns storage aligned to 16 bytes whose bytes all start as zero, or null on failure. A
+zero size allocates one byte.
 
 #### Gotchas
 
@@ -56,7 +72,8 @@ Releases storage from `WindowsHeap.acquire`. Null does nothing.
 
 #### Gotchas
 
-`memory` must be null or an unreleased result from `WindowsHeap.acquire`. No access can remain.
+`memory` must be null or an unreleased result from `WindowsHeap.acquire`. No access can
+remain.
 
 <a id="WindowsHeap.impl.allocate"></a>
 
@@ -70,7 +87,24 @@ Returns owned storage for `layout`, including alignments greater than 16 bytes.
 
 #### Errors
 
-- `OutOfMemoryError` if alignment is invalid, size arithmetic overflows, or the heap refuses storage.
+- `OutOfMemoryError` if alignment is invalid, size arithmetic overflows, or the heap refuses
+  storage.
+
+<a id="WindowsHeap.impl.allocateZeroed"></a>
+
+### Associated function `allocateZeroed`
+
+```silk
+pub effect fn allocateZeroed(layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError
+```
+
+Returns owned storage for `layout` whose bytes all start as zero, including alignments
+greater than 16 bytes.
+
+#### Errors
+
+- `OutOfMemoryError` if alignment is invalid, size arithmetic overflows, or the heap refuses
+  storage.
 
 
 Category: Windows platform.

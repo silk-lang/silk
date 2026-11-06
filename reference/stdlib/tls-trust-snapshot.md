@@ -645,7 +645,10 @@ It uses `CertificateBundle.decodeAnnotatedPem`. A certificate that is not valid 
 whole call. None are skipped.
 
 #### Errors
-- The same errors as [`TrustSnapshot.fromPem`](#TrustSnapshot.impl.fromPem).
+- `Failure` with `Decode` if the PEM or a certificate is not valid. The decoder is strict, and
+  an empty file is an error.
+- `Failure` with `LimitExceeded` if a limit is exceeded.
+- `OutOfMemoryError` if the `Allocator` fails.
 
 #### Gotchas
 Use it only for a CA file that you configured and trust, never for data from a peer.

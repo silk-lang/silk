@@ -13,7 +13,7 @@ A point is a `Copy` struct with public fields, generic over its number type `T`.
 arithmetic keeps positions and displacements apart: `point - point` gives a vector, `point +
 vector` and `point - vector` give a point, and there is no `point + point`. `&a == &b` compares
 every field when `T: Equal`. Methods appear only when `T` has the operations they need:
-`distance` needs `silk.num.numeric.Float`.
+[`Point2.distance`](#Point2.impl.distance) needs `silk.num.numeric.Float`.
 
 ## Gotchas
 Comparison takes shared borrows, as in `&a == &b`. Float fields compare with IEEE rules, so a

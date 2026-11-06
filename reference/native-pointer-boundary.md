@@ -114,6 +114,20 @@ callback and releases it when the callback returns.
 
 Both are runtime operations; a static body cannot call them.
 
+## Process words
+
+`Intrinsic.processWord() -> *mut u64` is the safe address of one zero-initialized `u64` that belongs
+to the calling function instance and lives as long as the process. Every call in that instance
+answers the same address; another function, or another instance of a generic function, has a word
+of its own and cannot name this one. The word is the smallest storage that lets a library keep a
+process invariant, such as the CPU features `CpuFeatures.machine` asks for once: the instance reads
+and writes it with `silk.concurrency.atomic`, whose operations are unsafe and must all be atomic,
+since every thread shares the word. A word is a hidden global defined next to its instance, so
+inlining and codegen units keep one word per program. A static body cannot call it.
+
+Silk has no other process-wide or thread-local storage. A function that keeps a value in its word
+must answer as if it computed it on every call, so that callers cannot tell the difference.
+
 ## Native output storage
 
 Ordinary source owns `Uninitialized<T>` and `Initialized<T>` output states for Copy values. Private

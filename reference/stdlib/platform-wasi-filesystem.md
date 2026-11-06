@@ -5,12 +5,14 @@
 Descriptor-relative file operations within WASI preopened directories.
 
 ## When to use
-`OsFileSystem` selects these operations on WASI. Applications use the portable `FileSystem` service.
+`OsFileSystem` selects these operations on WASI. Applications use the portable `FileSystem`
+service.
 
 ## Details
-Every path component is opened without symbolic-link traversal. The host enforces preopen rights.
-Guest paths resolve against the longest matching preopen. A preopen named `.` represents `/`.
-Errors retain WASI errno values. Internal allocation failures become `FileError` with reason `NoSpace`.
+Every path component is opened without symbolic-link traversal. The host enforces preopen
+rights. Guest paths resolve against the longest matching preopen. A preopen named `.` represents
+`/`. Errors retain WASI errno values. Internal allocation failures become `FileError` with
+reason `NoSpace`.
 
 Public declarations: 0.
 
