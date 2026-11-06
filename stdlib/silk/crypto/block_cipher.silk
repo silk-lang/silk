@@ -1,0 +1,835 @@
+//! Run any block cipher in the standard modes: ECB, CBC, CTR, CFB, CFB-8, CFB-1, and OFB.
+//!
+//! # When to use
+//! Use these modes with a cipher that conforms to [`BlockCipher`], such as `silk.crypto.sm4`,
+//! `silk.crypto.aria`, `silk.crypto.camellia`, or `silk.crypto.des`, when a format or a name such
+//! as `sm4-cbc` or `des-ede3-cfb8` in OpenSSL or Node.js asks for one. None of the modes detect
+//! changes to the ciphertext. For new designs, use `silk.crypto.aes_gcm` or
+//! `silk.crypto.chacha20_poly1305`. AES has its own faster mode types in `silk.crypto.aes`.
+//!
+//! # Details
+//! A cipher has a block of 8 or 16 bytes, and the IV of each mode is one block. Each mode takes the
+//! cipher by value, so make the cipher first, for example with `Sm4.make`. [`Ecb`] and [`Cbc`]
+//! buffer partial blocks and can add and remove PKCS #7 padding, with `updateLength`, `update`, and
+//! `finish` as in `silk.crypto.aes`. [`Ctr`], [`Cfb`], [`Cfb8`], [`Cfb1`], and [`Ofb`] are stream
+//! modes: `apply` writes one output byte for each input byte, and the output does not depend on how
+//! the input was split. CTR counts with the whole block as one big-endian number, as OpenSSL does.
+//! CFB-1 handles whole bytes, most significant bit first. Nothing allocates.
+//!
+//! # Errors
+//! The functions return a [`BlockCipherError`]. On an error the output does not change, and the
+//! state does not change.
+//!
+//! # Gotchas
+//! Never use one key and IV for two messages in CTR, CFB, or OFB: the XOR of the ciphertexts gives
+//! away the XOR of the plaintexts. A wrong padding error from a CBC decryptor can act as an oracle,
+//! so authenticate the ciphertext first. The mode values hold key material and are not erased when
+//! they are dropped.
+//!
+//! # Examples
+//! ## Encrypt with SM4-CBC
+//! ```silk
+//! import silk.crypto.block_cipher { BlockCipherError, Cbc }
+//! import silk.crypto.sm4 { Sm4 }
+//! import silk.core.result { Result }
+//!
+//! pub fn main() -> i32 {
+//!   let key: [u8; 16] = [1; 16]
+//!   let iv: [u8; 16] = [2; 16]
+//!   let cipher = match Sm4.make(&key) {
+//!     Result<Sm4, BlockCipherError>.Success { value } => move value
+//!     Result<Sm4, BlockCipherError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let mut encryptor = match Cbc<Sm4>.encryptor(move cipher, &iv, true) {
+//!     Result<Cbc<Sm4>, BlockCipherError>.Success { value } => move value
+//!     Result<Cbc<Sm4>, BlockCipherError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let mut ciphertext: [u8; 16] = [0; 16]
+//!   let written = match encryptor.update(b"hello", &mut ciphertext) {
+//!     Result<usize, BlockCipherError>.Success { value } => value
+//!     Result<usize, BlockCipherError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   // Five bytes are kept until `finish`, which pads them to one block.
+//!   if written != 0 {
+//!     return 1
+//!   }
+//!   let last = match encryptor.finish(&mut ciphertext) {
+//!     Result<usize, BlockCipherError>.Success { value } => value
+//!     Result<usize, BlockCipherError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   if last != 16 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Cryptography
+
+import silk.text.format { Debug, Format, Formatter }
+import silk.core.result { Result }
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import silk.io.writer { Writer, WriterError }
+
+/// A block cipher that the modes of this module can run.
+///
+/// # Details
+///
+/// The block is 8 or 16 bytes. The functions take a 16-byte array and use only its first
+/// `blockLength` bytes; the rest do not change.
+pub interface BlockCipher {
+  /// Returns the block length in bytes, 8 or 16.
+  fn blockLength(self: &Self) -> usize
+
+  /// Encrypts the first `blockLength` bytes of `block` in place.
+  fn encryptBlock(self: &Self, block: &mut [u8; 16]) -> ()
+
+  /// Decrypts the first `blockLength` bytes of `block` in place.
+  fn decryptBlock(self: &Self, block: &mut [u8; 16]) -> ()
+}
+
+/// The reason that a block cipher or mode function rejected a call. The output and the state do
+/// not change.
+pub union BlockCipherError {
+  /// The key length is not one that the cipher takes.
+  InvalidKeyLength,
+  /// The IV is not one block long.
+  InvalidIvLength,
+  /// The output buffer is shorter than the bytes the call writes.
+  OutputTooSmall,
+  /// Without padding, the message is not a whole number of blocks. With padding, the ciphertext
+  /// given to a decryptor is not a whole number of blocks.
+  InvalidInputLength,
+  /// The last decrypted block does not end in valid PKCS #7 padding. The key or IV is wrong, or the
+  /// ciphertext was changed.
+  InvalidPadding,
+}
+
+impl Debug for BlockCipherError {
+  /// Writes the name of the variant, such as `InvalidKeyLength`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      BlockCipherError.InvalidKeyLength => run Format.write(&mut formatter, b"InvalidKeyLength")
+      BlockCipherError.InvalidIvLength => run Format.write(&mut formatter, b"InvalidIvLength")
+      BlockCipherError.OutputTooSmall => run Format.write(&mut formatter, b"OutputTooSmall")
+      BlockCipherError.InvalidInputLength => run Format.write(&mut formatter, b"InvalidInputLength")
+      BlockCipherError.InvalidPadding => run Format.write(&mut formatter, b"InvalidPadding")
+    }
+  }
+}
+
+// The buffered state that ECB and CBC share. `pending` holds the bytes of the current incomplete
+// block, or, for a decryptor with padding, the last complete block, which `finish` unpads.
+struct Chain<C> {
+  cipher: C,
+  size: usize,
+  chain: [u8; 16],
+  pending: [u8; 16],
+  pendingLength: usize,
+  decrypting: bool,
+  padding: bool,
+  chained: bool,
+}
+
+fn makeChain<C: BlockCipher>(cipher: C, iv: &[u8], decrypting: bool, padding: bool, chained: bool) -> Result<Chain<C>, BlockCipherError> {
+  let size = cipher.blockLength()
+  let mut chain: [u8; 16] = [0; 16]
+  if chained {
+    if iv.length != size {
+      return Result<Chain<C>, BlockCipherError>.failResult(BlockCipherError.InvalidIvLength)
+    }
+    chain = copyIv(iv)
+  }
+  return Result<Chain<C>, BlockCipherError>.succeed(
+    Chain<C> {
+      cipher: move cipher,
+      size: size,
+      chain: chain,
+      pending: [0; 16],
+      pendingLength: 0,
+      decrypting: decrypting,
+      padding: padding,
+      chained: chained,
+    },
+  )
+}
+
+fn copyIv(iv: &[u8]) -> [u8; 16] {
+  let mut result: [u8; 16] = [0; 16]
+  let mut index: usize = 0
+  while index < iv.length {
+    result[index] = iv[index]
+    index = index + 1
+  }
+  return result
+}
+
+fn chainUpdateLength<C: BlockCipher>(mode: &Chain<C>, length: usize) -> usize {
+  let total = mode.pendingLength + length
+  if mode.decrypting && mode.padding {
+    // Hold back the last complete block, which may be the padding block.
+    if total == 0 {
+      return 0
+    }
+    return (total - 1) / mode.size * mode.size
+  }
+  return total / mode.size * mode.size
+}
+
+fn chainBlock<C: BlockCipher>(mode: &mut Chain<C>, block: &mut [u8; 16]) -> () {
+  let mut index: usize = 0
+  if mode.decrypting {
+    let saved = block.*
+    mode.cipher.decryptBlock(&mut block)
+    if mode.chained {
+      while index < mode.size {
+        block[index] = u8.bitXor(block[index], mode.chain[index])
+        index = index + 1
+      }
+      mode.chain = saved
+    }
+    return ()
+  }
+  if mode.chained {
+    while index < mode.size {
+      block[index] = u8.bitXor(block[index], mode.chain[index])
+      index = index + 1
+    }
+  }
+  mode.cipher.encryptBlock(&mut block)
+  if mode.chained {
+    mode.chain = block.*
+  }
+}
+
+fn chainUpdate<C: BlockCipher>(mode: &mut Chain<C>, input: &[u8], output: &mut [u8]) -> Result<usize, BlockCipherError> {
+  let emit = chainUpdateLength(&mode.*, input.length)
+  if output.length < emit {
+    return Result<usize, BlockCipherError>.failResult(BlockCipherError.OutputTooSmall)
+  }
+  let size = mode.size
+  let mut consumed: usize = 0
+  let mut written: usize = 0
+  while written < emit {
+    // Fill the pending block from the input, then process it.
+    while mode.pendingLength < size {
+      mode.pending[mode.pendingLength] = input[consumed]
+      mode.pendingLength = mode.pendingLength + 1
+      consumed = consumed + 1
+    }
+    let mut block = mode.pending
+    chainBlock(&mut mode, &mut block)
+    let mut index: usize = 0
+    while index < size {
+      output[written + index] = block[index]
+      index = index + 1
+    }
+    mode.pendingLength = 0
+    written = written + size
+  }
+  while consumed < input.length {
+    mode.pending[mode.pendingLength] = input[consumed]
+    mode.pendingLength = mode.pendingLength + 1
+    consumed = consumed + 1
+  }
+  return Result<usize, BlockCipherError>.succeed(written)
+}
+
+fn chainFinish<C: BlockCipher>(mut mode: Chain<C>, output: &mut [u8]) -> Result<usize, BlockCipherError> {
+  let size = mode.size
+  if mode.padding == false {
+    if mode.pendingLength != 0 {
+      return Result<usize, BlockCipherError>.failResult(BlockCipherError.InvalidInputLength)
+    }
+    return Result<usize, BlockCipherError>.succeed(0)
+  }
+  if mode.decrypting == false {
+    if output.length < size {
+      return Result<usize, BlockCipherError>.failResult(BlockCipherError.OutputTooSmall)
+    }
+    let fill = size - mode.pendingLength
+    let mut block = mode.pending
+    let mut index = mode.pendingLength
+    while index < size {
+      block[index] = usize.toU8(fill)
+      index = index + 1
+    }
+    chainBlock(&mut mode, &mut block)
+    index = 0
+    while index < size {
+      output[index] = block[index]
+      index = index + 1
+    }
+    return Result<usize, BlockCipherError>.succeed(size)
+  }
+  if mode.pendingLength != size {
+    return Result<usize, BlockCipherError>.failResult(BlockCipherError.InvalidInputLength)
+  }
+  let mut plain = mode.pending
+  chainBlock(&mut mode, &mut plain)
+  let fill = plain[size - 1]
+
+  // Check the padding without branching on the bytes: `bad` collects a nonzero bit for a fill of
+  // 0 or more than the block, and for each of the last `fill` bytes that differs from `fill`.
+  let fillWord = u8.toU32(fill)
+  let sizeWord = usize.toU32(size)
+  let mut bad = u32.shiftRight(u32.wrappingSubtract(fillWord, 1), 8)
+  bad = u32.bitOr(bad, u32.shiftRight(u32.wrappingSubtract(sizeWord, fillWord), 8))
+  let mut index: usize = 0
+  while index < size {
+    // `inside` is all ones when byte `index` is one of the last `fill` bytes.
+    let position = usize.toU32(size - index)
+    let inside = u32.wrappingSubtract(
+      0,
+      u32.shiftRight(u32.wrappingSubtract(fillWord, position), 31) ^ 1,
+    )
+    bad = u32.bitOr(bad, u32.bitAnd(inside, u8.toU32(u8.bitXor(plain[index], fill))))
+    index = index + 1
+  }
+  if bad != 0 {
+    return Result<usize, BlockCipherError>.failResult(BlockCipherError.InvalidPadding)
+  }
+  let length = size - u8.toUsize(fill)
+  if output.length < length {
+    return Result<usize, BlockCipherError>.failResult(BlockCipherError.OutputTooSmall)
+  }
+  index = 0
+  while index < length {
+    output[index] = plain[index]
+    index = index + 1
+  }
+  return Result<usize, BlockCipherError>.succeed(length)
+}
+
+/// A streaming ECB encryptor or decryptor over the cipher `C`, with or without PKCS #7 padding.
+///
+/// # When to use
+///
+/// Use it only when a format requires ECB, such as `sm4-ecb` or `des-ede3-ecb`. ECB encrypts equal
+/// blocks to equal blocks, so it shows patterns in the data.
+///
+/// # Details
+///
+/// Make one with [`Ecb.encryptor`] or [`Ecb.decryptor`], call [`Ecb.update`] for each part of the
+/// input, then [`Ecb.finish`]. `update` writes whole blocks and keeps the rest. With padding on, a
+/// decryptor keeps the last whole block until `finish`, which checks and removes the padding.
+pub struct Ecb<C> {
+  mode: Chain<C>,
+}
+
+impl<C: BlockCipher> Ecb<C> {
+  /// Returns an encryptor that owns `cipher`. With `padding`, [`Ecb.finish`] adds PKCS #7 padding,
+  /// so any message length is valid.
+  pub fn encryptor(cipher: C, padding: bool) -> Ecb<C> {
+    return Ecb<C> { mode: madeChain(makeChain(move cipher, b"", false, padding, false)) }
+  }
+
+  /// Returns a decryptor that owns `cipher`. With `padding`, [`Ecb.finish`] checks and removes
+  /// PKCS #7 padding.
+  pub fn decryptor(cipher: C, padding: bool) -> Ecb<C> {
+    return Ecb<C> { mode: madeChain(makeChain(move cipher, b"", true, padding, false)) }
+  }
+
+  /// Returns the number of bytes that [`Ecb.update`] writes for `length` more input bytes.
+  ///
+  /// It is the number of whole blocks in the kept bytes plus the input. A decryptor with padding
+  /// keeps back its last whole block.
+  pub fn updateLength(self: &Self, length: usize) -> usize {
+    return chainUpdateLength(&self.mode, length)
+  }
+
+  /// Encrypts or decrypts the whole blocks of the kept bytes plus `input` into `output`, keeps the
+  /// rest, and returns the number of bytes written, which is [`Ecb.updateLength`] of
+  /// `input.length`. The bytes of `output` after it do not change. `input` and `output` must not
+  /// overlap.
+  ///
+  /// # Errors
+  ///
+  /// - `OutputTooSmall` if `output` is shorter than [`Ecb.updateLength`].
+  pub fn update(self: &mut Self, input: &[u8], output: &mut [u8]) -> Result<usize, BlockCipherError> {
+    return chainUpdate(&mut self.mode, input, move output)
+  }
+
+  /// Ends the message, writes the last bytes to `output`, returns their number, and consumes the
+  /// state.
+  ///
+  /// An encryptor with padding writes one block. A decryptor with padding writes the last block
+  /// without its padding. Without padding, it writes nothing.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidInputLength` without padding if the message is not a whole number of blocks, or for
+  ///   a decryptor with padding if the ciphertext is not a whole number of blocks.
+  /// - `InvalidPadding` for a decryptor with padding if the last block does not end in valid
+  ///   PKCS #7 padding.
+  /// - `OutputTooSmall` if `output` is shorter than the bytes to write.
+  pub fn finish(self: Self, output: &mut [u8]) -> Result<usize, BlockCipherError> {
+    return chainFinish(move self.mode, move output)
+  }
+}
+
+// An ECB chain has no IV to check.
+fn madeChain<C: BlockCipher>(result: Result<Chain<C>, BlockCipherError>) -> Chain<C> {
+  return match move result {
+    Result<Chain<C>, BlockCipherError>.Success { value } => move value
+    Result<Chain<C>, BlockCipherError>.Failure { error: _ } => Intrinsic.trap("Ecb: no IV to reject")
+  }
+}
+
+/// A streaming CBC encryptor or decryptor over the cipher `C` (NIST SP 800-38A), with or without
+/// PKCS #7 padding.
+///
+/// # When to use
+///
+/// Use it when a format names CBC with this cipher, such as `sm4-cbc`, `camellia-256-cbc`, or
+/// `des-ede3-cbc`.
+///
+/// # Details
+///
+/// Make one with [`Cbc.encryptor`] or [`Cbc.decryptor`], call [`Cbc.update`] for each part of the
+/// input, then [`Cbc.finish`]. `update` writes whole blocks and keeps the rest. With padding on, a
+/// decryptor keeps the last whole block until `finish`, which checks and removes the padding. The
+/// IV is one block.
+///
+/// # Gotchas
+///
+/// Use a new random IV for each message under the same key.
+pub struct Cbc<C> {
+  mode: Chain<C>,
+}
+
+impl<C: BlockCipher> Cbc<C> {
+  /// Returns an encryptor that owns `cipher`, for `iv`. With `padding`, [`Cbc.finish`] adds
+  /// PKCS #7 padding, so any message length is valid.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidIvLength` if `iv` is not one block.
+  pub fn encryptor(cipher: C, iv: &[u8], padding: bool) -> Result<Cbc<C>, BlockCipherError> {
+    return wrapCbc(makeChain(move cipher, iv, false, padding, true))
+  }
+
+  /// Returns a decryptor that owns `cipher`, for `iv`. With `padding`, [`Cbc.finish`] checks and
+  /// removes PKCS #7 padding.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidIvLength` if `iv` is not one block.
+  pub fn decryptor(cipher: C, iv: &[u8], padding: bool) -> Result<Cbc<C>, BlockCipherError> {
+    return wrapCbc(makeChain(move cipher, iv, true, padding, true))
+  }
+
+  /// Returns the number of bytes that [`Cbc.update`] writes for `length` more input bytes.
+  ///
+  /// It is the number of whole blocks in the kept bytes plus the input. A decryptor with padding
+  /// keeps back its last whole block.
+  pub fn updateLength(self: &Self, length: usize) -> usize {
+    return chainUpdateLength(&self.mode, length)
+  }
+
+  /// Encrypts or decrypts the whole blocks of the kept bytes plus `input` into `output`, keeps the
+  /// rest, and returns the number of bytes written, which is [`Cbc.updateLength`] of
+  /// `input.length`. The bytes of `output` after it do not change. `input` and `output` must not
+  /// overlap.
+  ///
+  /// # Errors
+  ///
+  /// - `OutputTooSmall` if `output` is shorter than [`Cbc.updateLength`].
+  pub fn update(self: &mut Self, input: &[u8], output: &mut [u8]) -> Result<usize, BlockCipherError> {
+    return chainUpdate(&mut self.mode, input, move output)
+  }
+
+  /// Ends the message, writes the last bytes to `output`, returns their number, and consumes the
+  /// state.
+  ///
+  /// An encryptor with padding writes one block. A decryptor with padding writes the last block
+  /// without its padding. Without padding, it writes nothing.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidInputLength` without padding if the message is not a whole number of blocks, or for
+  ///   a decryptor with padding if the ciphertext is not a whole number of blocks.
+  /// - `InvalidPadding` for a decryptor with padding if the last block does not end in valid
+  ///   PKCS #7 padding.
+  /// - `OutputTooSmall` if `output` is shorter than the bytes to write.
+  pub fn finish(self: Self, output: &mut [u8]) -> Result<usize, BlockCipherError> {
+    return chainFinish(move self.mode, move output)
+  }
+}
+
+fn wrapCbc<C: BlockCipher>(result: Result<Chain<C>, BlockCipherError>) -> Result<Cbc<C>, BlockCipherError> {
+  return match move result {
+    Result<Chain<C>, BlockCipherError>.Success { value } => Result<Cbc<C>, BlockCipherError>.succeed(Cbc<C> { mode: move value })
+    Result<Chain<C>, BlockCipherError>.Failure { error } => Result<Cbc<C>, BlockCipherError>.failResult(move error)
+  }
+}
+
+// The state of the stream modes. `register` is the counter for CTR, the feedback register for
+// CFB, and the last cipher output for OFB. `stream` holds the key stream of the current block, of
+// which `used` bytes are spent.
+struct Stream<C> {
+  cipher: C,
+  size: usize,
+  register: [u8; 16],
+  stream: [u8; 16],
+  used: usize,
+  decrypting: bool,
+}
+
+fn makeStream<C: BlockCipher>(cipher: C, iv: &[u8], decrypting: bool) -> Result<Stream<C>, BlockCipherError> {
+  let size = cipher.blockLength()
+  if iv.length != size {
+    return Result<Stream<C>, BlockCipherError>.failResult(BlockCipherError.InvalidIvLength)
+  }
+  return Result<Stream<C>, BlockCipherError>.succeed(
+    Stream<C> {
+      cipher: move cipher,
+      size: size,
+      register: copyIv(iv),
+      stream: [0; 16],
+      used: size,
+      decrypting: decrypting,
+    },
+  )
+}
+
+/// A CTR key stream over the cipher `C` (NIST SP 800-38A). The same call encrypts and decrypts.
+///
+/// # When to use
+///
+/// Use it when a format names CTR with this cipher, such as `sm4-ctr` or `aria-128-ctr`.
+///
+/// # Details
+///
+/// The IV is the first counter block. The counter is the whole block as one big-endian number and
+/// wraps to zero after all ones, as OpenSSL does.
+pub struct Ctr<C> {
+  state: Stream<C>,
+}
+
+impl<C: BlockCipher> Ctr<C> {
+  /// Returns a key stream that owns `cipher`, starting at the counter block `iv`.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidIvLength` if `iv` is not one block.
+  pub fn make(cipher: C, iv: &[u8]) -> Result<Ctr<C>, BlockCipherError> {
+    return match makeStream(move cipher, iv, false) {
+      Result<Stream<C>, BlockCipherError>.Success { value } => Result<Ctr<C>, BlockCipherError>.succeed(Ctr<C> { state: move value })
+      Result<Stream<C>, BlockCipherError>.Failure { error } => Result<Ctr<C>, BlockCipherError>.failResult(move error)
+    }
+  }
+
+  /// Writes `input` XOR the next `input.length` key stream bytes to the first `input.length`
+  /// bytes of `output`.
+  ///
+  /// # Errors
+  ///
+  /// - `OutputTooSmall` if `output` is shorter than `input`.
+  pub fn apply(self: &mut Self, input: &[u8], output: &mut [u8]) -> Result<(), BlockCipherError> {
+    if output.length < input.length {
+      return Result<(), BlockCipherError>.failResult(BlockCipherError.OutputTooSmall)
+    }
+    let size = self.state.size
+    let mut offset: usize = 0
+    while offset < input.length {
+      if self.state.used == size {
+        let mut block = self.state.register
+        self.state.cipher.encryptBlock(&mut block)
+        self.state.stream = block
+        self.state.used = 0
+        // Add one to the big-endian counter.
+        let mut index = size
+        let mut carry: u32 = 1
+        while index > 0 {
+          index = index - 1
+          let sum = u32.wrappingAdd(u8.toU32(self.state.register[index]), carry)
+          self.state.register[index] = u32.toU8(u32.bitAnd(sum, 255))
+          carry = u32.shiftRight(sum, 8)
+        }
+      }
+      output[offset] = u8.bitXor(input[offset], self.state.stream[self.state.used])
+      self.state.used = self.state.used + 1
+      offset = offset + 1
+    }
+    return Result<(), BlockCipherError>.succeed(())
+  }
+}
+
+/// A CFB encryptor or decryptor with full-block feedback over the cipher `C` (NIST SP 800-38A).
+///
+/// # When to use
+///
+/// Use it when a format names CFB with this cipher, such as `sm4-cfb` or `des-ede3-cfb`, which is
+/// CFB with feedback of one block.
+pub struct Cfb<C> {
+  state: Stream<C>,
+}
+
+impl<C: BlockCipher> Cfb<C> {
+  /// Returns an encryptor that owns `cipher`, for `iv`.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidIvLength` if `iv` is not one block.
+  pub fn encryptor(cipher: C, iv: &[u8]) -> Result<Cfb<C>, BlockCipherError> {
+    return wrapCfb(makeStream(move cipher, iv, false))
+  }
+
+  /// Returns a decryptor that owns `cipher`, for `iv`.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidIvLength` if `iv` is not one block.
+  pub fn decryptor(cipher: C, iv: &[u8]) -> Result<Cfb<C>, BlockCipherError> {
+    return wrapCfb(makeStream(move cipher, iv, true))
+  }
+
+  /// Encrypts or decrypts `input` into the first `input.length` bytes of `output`.
+  ///
+  /// # Errors
+  ///
+  /// - `OutputTooSmall` if `output` is shorter than `input`.
+  pub fn apply(self: &mut Self, input: &[u8], output: &mut [u8]) -> Result<(), BlockCipherError> {
+    if output.length < input.length {
+      return Result<(), BlockCipherError>.failResult(BlockCipherError.OutputTooSmall)
+    }
+    let mut offset: usize = 0
+    while offset < input.length {
+      if self.state.used == self.state.size {
+        let mut block = self.state.register
+        self.state.cipher.encryptBlock(&mut block)
+        self.state.stream = block
+        self.state.used = 0
+      }
+      let produced = u8.bitXor(input[offset], self.state.stream[self.state.used])
+      if self.state.decrypting {
+        self.state.register[self.state.used] = input[offset]
+      } else {
+        self.state.register[self.state.used] = produced
+      }
+      output[offset] = produced
+      self.state.used = self.state.used + 1
+      offset = offset + 1
+    }
+    return Result<(), BlockCipherError>.succeed(())
+  }
+}
+
+fn wrapCfb<C: BlockCipher>(result: Result<Stream<C>, BlockCipherError>) -> Result<Cfb<C>, BlockCipherError> {
+  return match move result {
+    Result<Stream<C>, BlockCipherError>.Success { value } => Result<Cfb<C>, BlockCipherError>.succeed(Cfb<C> { state: move value })
+    Result<Stream<C>, BlockCipherError>.Failure { error } => Result<Cfb<C>, BlockCipherError>.failResult(move error)
+  }
+}
+
+/// A CFB encryptor or decryptor with 8-bit feedback over the cipher `C` (NIST SP 800-38A).
+///
+/// # When to use
+///
+/// Use it when a format names CFB-8 with this cipher, such as `aria-128-cfb8` or `des-ede3-cfb8`.
+///
+/// # Details
+///
+/// Each byte costs one block encryption.
+pub struct Cfb8<C> {
+  state: Stream<C>,
+}
+
+impl<C: BlockCipher> Cfb8<C> {
+  /// Returns an encryptor that owns `cipher`, for `iv`.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidIvLength` if `iv` is not one block.
+  pub fn encryptor(cipher: C, iv: &[u8]) -> Result<Cfb8<C>, BlockCipherError> {
+    return wrapCfb8(makeStream(move cipher, iv, false))
+  }
+
+  /// Returns a decryptor that owns `cipher`, for `iv`.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidIvLength` if `iv` is not one block.
+  pub fn decryptor(cipher: C, iv: &[u8]) -> Result<Cfb8<C>, BlockCipherError> {
+    return wrapCfb8(makeStream(move cipher, iv, true))
+  }
+
+  /// Encrypts or decrypts `input` into the first `input.length` bytes of `output`.
+  ///
+  /// # Errors
+  ///
+  /// - `OutputTooSmall` if `output` is shorter than `input`.
+  pub fn apply(self: &mut Self, input: &[u8], output: &mut [u8]) -> Result<(), BlockCipherError> {
+    if output.length < input.length {
+      return Result<(), BlockCipherError>.failResult(BlockCipherError.OutputTooSmall)
+    }
+    let size = self.state.size
+    let mut offset: usize = 0
+    while offset < input.length {
+      let mut block = self.state.register
+      self.state.cipher.encryptBlock(&mut block)
+      let produced = u8.bitXor(input[offset], block[0])
+      let mut index: usize = 0
+      while index + 1 < size {
+        self.state.register[index] = self.state.register[index + 1]
+        index = index + 1
+      }
+      if self.state.decrypting {
+        self.state.register[size - 1] = input[offset]
+      } else {
+        self.state.register[size - 1] = produced
+      }
+      output[offset] = produced
+      offset = offset + 1
+    }
+    return Result<(), BlockCipherError>.succeed(())
+  }
+}
+
+fn wrapCfb8<C: BlockCipher>(result: Result<Stream<C>, BlockCipherError>) -> Result<Cfb8<C>, BlockCipherError> {
+  return match move result {
+    Result<Stream<C>, BlockCipherError>.Success { value } => Result<Cfb8<C>, BlockCipherError>.succeed(Cfb8<C> { state: move value })
+    Result<Stream<C>, BlockCipherError>.Failure { error } => Result<Cfb8<C>, BlockCipherError>.failResult(move error)
+  }
+}
+
+/// A CFB encryptor or decryptor with 1-bit feedback over the cipher `C` (NIST SP 800-38A).
+///
+/// # When to use
+///
+/// Use it when a format names CFB-1 with this cipher, such as `camellia-128-cfb1` or
+/// `des-ede3-cfb1`.
+///
+/// # Details
+///
+/// It handles whole bytes, most significant bit first, as OpenSSL does for a length in bytes. Each
+/// bit costs one block encryption.
+pub struct Cfb1<C> {
+  state: Stream<C>,
+}
+
+impl<C: BlockCipher> Cfb1<C> {
+  /// Returns an encryptor that owns `cipher`, for `iv`.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidIvLength` if `iv` is not one block.
+  pub fn encryptor(cipher: C, iv: &[u8]) -> Result<Cfb1<C>, BlockCipherError> {
+    return wrapCfb1(makeStream(move cipher, iv, false))
+  }
+
+  /// Returns a decryptor that owns `cipher`, for `iv`.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidIvLength` if `iv` is not one block.
+  pub fn decryptor(cipher: C, iv: &[u8]) -> Result<Cfb1<C>, BlockCipherError> {
+    return wrapCfb1(makeStream(move cipher, iv, true))
+  }
+
+  /// Encrypts or decrypts `input` into the first `input.length` bytes of `output`.
+  ///
+  /// # Errors
+  ///
+  /// - `OutputTooSmall` if `output` is shorter than `input`.
+  pub fn apply(self: &mut Self, input: &[u8], output: &mut [u8]) -> Result<(), BlockCipherError> {
+    if output.length < input.length {
+      return Result<(), BlockCipherError>.failResult(BlockCipherError.OutputTooSmall)
+    }
+    let last = self.state.size - 1
+    let mut offset: usize = 0
+    while offset < input.length {
+      let mut produced: u8 = 0
+      let mut bit: usize = 0
+      while bit < 8 {
+        let mut block = self.state.register
+        self.state.cipher.encryptBlock(&mut block)
+        let inBit = u8.bitAnd(u8.shiftRight(input[offset], usize.toU8(7 - bit)), 1)
+        let outBit = u8.bitXor(inBit, u8.shiftRight(block[0], 7))
+        produced = u8.bitOr(produced, u8.shiftLeft(outBit, usize.toU8(7 - bit)))
+        let mut feedback = outBit
+        if self.state.decrypting {
+          feedback = inBit
+        }
+        let mut index: usize = 0
+        while index < last {
+          self.state.register[index] = u8.bitOr(
+            u8.shiftLeft(self.state.register[index], 1),
+            u8.shiftRight(self.state.register[index + 1], 7),
+          )
+          index = index + 1
+        }
+        self.state.register[last] = u8.bitOr(u8.shiftLeft(self.state.register[last], 1), feedback)
+        bit = bit + 1
+      }
+      output[offset] = produced
+      offset = offset + 1
+    }
+    return Result<(), BlockCipherError>.succeed(())
+  }
+}
+
+fn wrapCfb1<C: BlockCipher>(result: Result<Stream<C>, BlockCipherError>) -> Result<Cfb1<C>, BlockCipherError> {
+  return match move result {
+    Result<Stream<C>, BlockCipherError>.Success { value } => Result<Cfb1<C>, BlockCipherError>.succeed(Cfb1<C> { state: move value })
+    Result<Stream<C>, BlockCipherError>.Failure { error } => Result<Cfb1<C>, BlockCipherError>.failResult(move error)
+  }
+}
+
+/// An OFB key stream over the cipher `C` (NIST SP 800-38A). The same call encrypts and decrypts.
+///
+/// # When to use
+///
+/// Use it when a format names OFB with this cipher, such as `sm4-ofb` or `des-ede3-ofb`.
+pub struct Ofb<C> {
+  state: Stream<C>,
+}
+
+impl<C: BlockCipher> Ofb<C> {
+  /// Returns a key stream that owns `cipher`, for `iv`.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidIvLength` if `iv` is not one block.
+  pub fn make(cipher: C, iv: &[u8]) -> Result<Ofb<C>, BlockCipherError> {
+    return match makeStream(move cipher, iv, false) {
+      Result<Stream<C>, BlockCipherError>.Success { value } => Result<Ofb<C>, BlockCipherError>.succeed(Ofb<C> { state: move value })
+      Result<Stream<C>, BlockCipherError>.Failure { error } => Result<Ofb<C>, BlockCipherError>.failResult(move error)
+    }
+  }
+
+  /// Writes `input` XOR the next `input.length` key stream bytes to the first `input.length`
+  /// bytes of `output`.
+  ///
+  /// # Errors
+  ///
+  /// - `OutputTooSmall` if `output` is shorter than `input`.
+  pub fn apply(self: &mut Self, input: &[u8], output: &mut [u8]) -> Result<(), BlockCipherError> {
+    if output.length < input.length {
+      return Result<(), BlockCipherError>.failResult(BlockCipherError.OutputTooSmall)
+    }
+    let mut offset: usize = 0
+    while offset < input.length {
+      if self.state.used == self.state.size {
+        self.state.cipher.encryptBlock(&mut self.state.register)
+        self.state.stream = self.state.register
+        self.state.used = 0
+      }
+      output[offset] = u8.bitXor(input[offset], self.state.stream[self.state.used])
+      self.state.used = self.state.used + 1
+      offset = offset + 1
+    }
+    return Result<(), BlockCipherError>.succeed(())
+  }
+}
