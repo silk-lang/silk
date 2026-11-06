@@ -14,8 +14,8 @@ Node.js. The DER itself is read by the key modules, such as `silk.crypto.rsa`.
 input, so nothing is copied. Text before, between, and after blocks is skipped. Inside a block
 the Base64 may wrap at any width and may hold spaces, tabs, and CR or LF line ends, as OpenSSL
 allows. RFC 1421 headers such as `Proc-Type` and `DEK-Info`, which a legacy encrypted key has,
-end at the first empty line and can be read with [`Pem.header`](#Pem.impl.header). [`Pem.encode`](#Pem.impl.encode) writes lines of
-64 characters with LF line ends. Nothing allocates.
+end at the first empty line and can be read with [`Pem.header`](#Pem.impl.header). [`Pem.encode`](#Pem.impl.encode) writes such
+headers when given, then Base64 lines of 64 characters, with LF line ends. Nothing allocates.
 
 ## Errors
 The functions return a [`PemError`](#PemError). On an error the output does not change.
@@ -32,13 +32,13 @@ import silk.core.result { Result }
 
 pub fn main() -> i32 {
   let mut text: [u8; 64] = [0; 64]
-  let length = match Pem.encode(b"TEST", b"hello", &mut text) {
+  let length = match Pem.encode(b"TEST", b"", b"hello", &mut text) {
     Result<usize, PemError>.Success { value } => value
     Result<usize, PemError>.Failure { error: _ } => {
       return 1
     }
   }
-  if length != Pem.encodedLength(4, 5) {
+  if length != Pem.encodedLength(4, 0, 5) {
     return 1
   }
   let section = match Pem.find(&text, 0) {
@@ -311,27 +311,31 @@ Decodes the Base64 body of `section` into `output` and returns the number of byt
 ### Associated function `encodedLength`
 
 ```silk
-pub fn encodedLength(labelLength: usize, length: usize) -> usize
+pub fn encodedLength(labelLength: usize, headersLength: usize, length: usize) -> usize
 ```
 
-Returns the number of bytes that [`Pem.encode`](#Pem.impl.encode) writes for a label of `labelLength` bytes and
-`length` bytes of data.
+Returns the number of bytes that [`Pem.encode`](#Pem.impl.encode) writes for a label of `labelLength` bytes,
+`headersLength` bytes of headers, and `length` bytes of data.
 
 <a id="Pem.impl.encode"></a>
 
 ### Associated function `encode`
 
 ```silk
-pub fn encode(label: &[u8], bytes: &[u8], output: &mut [u8]) -> Result<usize, PemError>
+pub fn encode(label: &[u8], headers: &[u8], bytes: &[u8], output: &mut [u8]) -> Result<usize, PemError>
 ```
 
-Writes `bytes` as a PEM block with label `label` to `output`, with Base64 lines of 64
-characters and LF line ends, and returns the number of bytes written,
-[`Pem.encodedLength`](#Pem.impl.encodedLength).
+Writes `bytes` as a PEM block with label `label` to `output` and returns the number of bytes
+written, [`Pem.encodedLength`](#Pem.impl.encodedLength).
+
+`headers` is empty, or RFC 1421 header lines that each end with LF, such as
+`Proc-Type: 4,ENCRYPTED\nDEK-Info: AES-256-CBC,...\n`; the empty line after them is added.
+The Base64 lines have 64 characters and LF line ends.
 
 #### Errors
 
 - `InvalidLabel` if `label` is empty, or holds a byte outside printable ASCII or a `-`.
+- `Malformed` if `headers` is not empty and does not end with LF, or holds an empty line.
 - `OutputTooSmall` if `output` is shorter than [`Pem.encodedLength`](#Pem.impl.encodedLength).
 
 
