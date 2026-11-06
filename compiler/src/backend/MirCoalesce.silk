@@ -25,6 +25,10 @@
 //!   wrapper such as an effect combinator builds its value around the effect it received without
 //!   first moving that effect into a temporary.
 //!
+//! - A local built whole by one aggregate of moved locals, and otherwise named only through its
+//!   fields, becomes those locals. A composed Effect built from its function's parameters then
+//!   runs on the parameters' own storage instead of a copy of them.
+//!
 //! All keep the invariants `MirVerification.callDestinationsFresh` checks: a destination is still a
 //! whole temporary or the result local, never borrowed, and named by no argument.
 
@@ -66,9 +70,11 @@ pub effect fn coalesce(function: &mut MirFunction) -> () ! OutOfMemoryError ? &m
   run renameReturned(&mut function.*)
   let mut table = run UseTable.of(&function.*)
   run forwardFields(&mut function.*, &mut table)
-  if !hasCall(&function.*) { return () }
-  run forwardResults(&mut function.*, &mut table)
-  return run forwardArguments(&mut function.*, &mut table)
+  if hasCall(&function.*) {
+    run forwardResults(&mut function.*, &mut table)
+    run forwardArguments(&mut function.*, &mut table)
+  }
+  return run splitAggregates(&mut function.*)
 }
 
 // Whether `callee` follows the Silk calling convention rather than a C signature.
@@ -1296,4 +1302,595 @@ fn fieldCandidate(function: &MirFunction, table: &UseTable, block: usize) -> Opt
     statement = statement + usize.ONE
   }
   return Option<FieldSnapshot>.none()
+}
+
+// Splits a local built whole by one aggregate of moved locals, and otherwise only named through
+// its fields, into those locals: `e = {a, b}; ... e.0 ...` reads `a` in place of `e.0`. A composed
+// Effect is such a local: `run Effect.map(move inner, f)` builds `{inner, f}` from the function's
+// parameters, and every step of the run names a part of it. In a suspending frame both live in
+// the frame, so the aggregate was a copy of each parameter that LLVM cannot remove.
+//
+// A part's source is a whole temporary the same block defines earlier, named only there and in
+// the aggregate, or a parameter named only by the aggregate or by the one snapshot that a source
+// temporary copies or moves it into. Nothing borrows, drops or flags a source. Between the
+// earliest source definition and the aggregate nothing names the split local, a parameter source
+// is used outside every loop, and the split local is no call's destination and no debug
+// variable. Its drop flags guard a field path, which moves to the source.
+effect fn splitAggregates(function: &mut MirFunction) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let mut table = run UseTable.of(&function.*)
+  let mut block = usize.ZERO
+  while block < List<Block>.length(&function.blocks) {
+    let mut at = usize.ZERO
+    while at < List<Statement>.length(&List<Block>.asSlice(&function.blocks)[block].statements) {
+      let found = run splitCandidate(&mut function.*, &table, block, at)
+      if let Option<SplitPlan>.Some { value: plan } = move found {
+        run applySplit(&mut function.*, block, move plan)
+        table = run UseTable.of(&function.*)
+
+        // The aggregate is gone; the statement now at `at` is the one after it.
+        continue
+      }
+      at = at + usize.ONE
+    }
+    block = block + usize.ONE
+  }
+  return ()
+}
+
+// One split: the local, the source of each field index, and the statements of `block` it
+// removes, in increasing order.
+struct SplitPlan {
+  local: usize,
+  sources: List<usize>,
+  removed: List<usize>,
+}
+
+// How a walk over the body treats the places of the split local `local`: counting them and
+// checking each has a field first (`apply` false), or naming the field's source instead.
+struct SplitWalk {
+  local: usize,
+  sources: List<usize>,
+  apply: bool,
+  valid: bool,
+  seen: usize,
+}
+
+fn splitPlace(place: &mut Place, walk: &mut SplitWalk, destination: bool) -> () {
+  let steps = List<Projection>.asSlice(&place.projections)
+  let mut at = usize.ZERO
+  while at < steps.length {
+    if let Projection.Index { local: index } = &steps[at] {
+      if index == walk.local {
+        walk.valid = false
+      }
+    }
+    at = at + usize.ONE
+  }
+  if place.local != walk.local {
+    return ()
+  }
+  walk.seen = walk.seen + usize.ONE
+  if destination {
+    walk.valid = false
+  }
+  let mut field = usize.MAX
+  if steps.length > usize.ZERO {
+    if let Projection.Field { index } = &steps[usize.ZERO] {
+      field = index
+    }
+  }
+  let sources = List<usize>.asSlice(&walk.sources)
+  if field >= sources.length || sources[field] == usize.MAX {
+    walk.valid = false
+    return ()
+  }
+  if walk.apply {
+    drop List<Projection>.remove(&mut place.projections, usize.ZERO)
+    place.local = sources[field]
+  }
+  return ()
+}
+
+fn splitOperand(operand: &mut Operand, walk: &mut SplitWalk) -> () {
+  match &mut operand.* {
+    Operand.Copy { place } => splitPlace(&mut place, &mut walk.*, false)
+    Operand.Move { place } => splitPlace(&mut place, &mut walk.*, false)
+    _ => ()
+  }
+  return ()
+}
+
+fn splitOperands(operands: &mut List<Operand>, walk: &mut SplitWalk) -> () {
+  let mut listed = List<Operand>.asMutSlice(&mut operands.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    splitOperand(&mut listed[at], &mut walk.*)
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+fn splitFields(fields: &mut List<AggregateField>, walk: &mut SplitWalk) -> () {
+  let mut listed = List<AggregateField>.asMutSlice(&mut fields.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    splitOperand(&mut listed[at].value, &mut walk.*)
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Every place `rvalueNames` counts but assembly inputs; the count check rejects a split local
+// named there.
+fn splitRvalue(value: &mut Rvalue, walk: &mut SplitWalk) -> () {
+  match &mut value.* {
+    Rvalue.Aggregate { fields } => splitFields(&mut fields, &mut walk.*)
+    Rvalue.Slice { data, count } => {
+      splitOperand(&mut data, &mut walk.*)
+      splitOperand(&mut count, &mut walk.*)
+    }
+    Rvalue.SliceLength { place } => splitPlace(&mut place, &mut walk.*, false)
+    Rvalue.SliceData { place } => splitPlace(&mut place, &mut walk.*, false)
+    Rvalue.PointerOffset { pointer, index, .. } => {
+      splitOperand(&mut pointer, &mut walk.*)
+      splitOperand(&mut index, &mut walk.*)
+    }
+    Rvalue.Use { value: used } => splitOperand(&mut used, &mut walk.*)
+    Rvalue.Ref { place, .. } => splitPlace(&mut place, &mut walk.*, false)
+    Rvalue.AddressOf { place, .. } => splitPlace(&mut place, &mut walk.*, false)
+    Rvalue.Unary { value: used, .. } => splitOperand(&mut used, &mut walk.*)
+    Rvalue.Binary { left, right, .. } => {
+      splitOperand(&mut left, &mut walk.*)
+      splitOperand(&mut right, &mut walk.*)
+    }
+    Rvalue.ScalarBinary { left, right, .. } => {
+      splitOperand(&mut left, &mut walk.*)
+      splitOperand(&mut right, &mut walk.*)
+    }
+    Rvalue.ScalarUnary { value: used, .. } => splitOperand(&mut used, &mut walk.*)
+    Rvalue.Convert { value: used, .. } => splitOperand(&mut used, &mut walk.*)
+    Rvalue.Fits { value: used, .. } => splitOperand(&mut used, &mut walk.*)
+    Rvalue.AddressIntegerConversion { operand, .. } => splitOperand(&mut operand, &mut walk.*)
+    Rvalue.Bitcast { value: used, .. } => splitOperand(&mut used, &mut walk.*)
+    Rvalue.Discriminant { place } => splitPlace(&mut place, &mut walk.*, false)
+    Rvalue.Inject { value: used, .. } => splitOperand(&mut used, &mut walk.*)
+    Rvalue.Variant { fields, .. } => splitFields(&mut fields, &mut walk.*)
+    Rvalue.ContextOf { place } => splitPlace(&mut place, &mut walk.*, false)
+    Rvalue.ContextHandle { address } => splitOperand(&mut address, &mut walk.*)
+    Rvalue.Atomic { operands, .. } => splitOperands(&mut operands, &mut walk.*)
+    Rvalue.Vector { operands, .. } => splitOperands(&mut operands, &mut walk.*)
+    Rvalue.StackAllocate { count, .. } => splitOperand(&mut count, &mut walk.*)
+    Rvalue.Wasm { operands, .. } => splitOperands(&mut operands, &mut walk.*)
+    _ => ()
+  }
+  return ()
+}
+
+fn splitStatement(statement: &mut Statement, walk: &mut SplitWalk) -> () {
+  match &mut statement.* {
+    Statement.Assign { destination, value, .. } => {
+      // A whole write would define the local again.
+      if destination.local == walk.local
+        && List<Projection>.length(&destination.projections) == usize.ZERO {
+        walk.valid = false
+      }
+      splitPlace(&mut destination, &mut walk.*, false)
+      splitRvalue(&mut value, &mut walk.*)
+    }
+    Statement.Drop { destination, .. } => splitPlace(&mut destination, &mut walk.*, false)
+    Statement.FailureContext { destination, source, .. } => {
+      splitPlace(&mut destination, &mut walk.*, false)
+      if let Option<Place>.Some { value: from } = &mut source {
+        splitPlace(&mut from, &mut walk.*, false)
+      }
+    }
+    Statement.SetContextHandle { address, value, .. } => {
+      splitOperand(&mut address, &mut walk.*)
+      splitOperand(&mut value, &mut walk.*)
+    }
+  }
+  return ()
+}
+
+fn splitTerminator(terminator: &mut Terminator, walk: &mut SplitWalk) -> () {
+  match &mut terminator.* {
+    Terminator.Branch { condition, .. } => splitOperand(&mut condition, &mut walk.*)
+    Terminator.Switch { value, .. } => splitOperand(&mut value, &mut walk.*)
+    Terminator.TrapText { reason, .. } => splitOperand(&mut reason, &mut walk.*)
+    Terminator.Call { callee, arguments, providers, destination, failure, .. } => {
+      splitOperands(&mut arguments, &mut walk.*)
+      splitOperands(&mut providers, &mut walk.*)
+
+      // A call destination stays a fresh whole temporary (`callDestinationsFresh`).
+      splitPlace(&mut destination, &mut walk.*, true)
+      match &mut callee {
+        Callee.Indirect { address } => splitOperand(&mut address, &mut walk.*)
+        Callee.NativeIndirect { address, .. } => splitOperand(&mut address, &mut walk.*)
+        _ => ()
+      }
+      if let Option<FailureEdge>.Some { value: edge } = &mut failure {
+        splitPlace(&mut edge.destination, &mut walk.*, true)
+      }
+    }
+    _ => ()
+  }
+  return ()
+}
+
+// Walks every block but the statements `skipped` of `block`.
+fn walkSplit(
+  function: &mut MirFunction,
+  block: usize,
+  skipped: &List<usize>,
+  walk: &mut SplitWalk,
+) -> () {
+  let removed = List<usize>.asSlice(&skipped.*)
+  let mut blocks = List<Block>.asMutSlice(&mut function.blocks)
+  let mut at = usize.ZERO
+  while at < blocks.length {
+    let mut statements = List<Statement>.asMutSlice(&mut blocks[at].statements)
+    let mut index = usize.ZERO
+    while index < statements.length {
+      let mut skip = false
+      if at == block {
+        let mut k = usize.ZERO
+        while k < removed.length {
+          if removed[k] == index {
+            skip = true
+          }
+          k = k + usize.ONE
+        }
+      }
+      if !skip {
+        splitStatement(&mut statements[index], &mut walk.*)
+      }
+      index = index + usize.ONE
+    }
+    splitTerminator(&mut blocks[at].terminator, &mut walk.*)
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+fn splitSource(function: &MirFunction, table: &UseTable, local: usize, names: usize) -> bool {
+  let uses = UseTable.uses(table, local)
+  return uses.named == names && !uses.borrowed && !uses.dropped && !UseTable.flagged(table, local)
+}
+
+fn isParameter(function: &MirFunction, local: usize) -> bool {
+  return match &List<Local>.asSlice(&function.locals)[local].kind {
+    LocalKind.Parameter { .. } => true
+    _ => false
+  }
+}
+
+// Whether `block` can run again after itself.
+effect fn inCycle(function: &MirFunction, block: usize) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let count = List<Block>.length(&function.blocks)
+  let mut seen = List<bool>.make()
+  run List<bool>.appendRepeated(&mut seen, false, count)
+  let mut pending = run MirFunction.successors(function, block)
+  while true {
+    let next = match List<usize>.pop(&mut pending) {
+      Option<usize>.Some { value } => value
+      Option<usize>.None => {
+        break
+      }
+    }
+    if next == block {
+      return true
+    }
+    if List<bool>.get(&seen, next) {
+      continue
+    }
+    List<bool>.set(&mut seen, next, true)
+    let following = run MirFunction.successors(function, next)
+    run List<usize>.appendSlice(&mut pending, List<usize>.asSlice(&following))
+  }
+  return false
+}
+
+// The split the aggregate at statement `at` of `block` allows, if any.
+effect fn splitCandidate(
+  owner: &mut MirFunction,
+  table: &UseTable,
+  block: usize,
+  at: usize,
+) -> Option<SplitPlan>
+  ! OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let function = &owner.*
+  let statements = List<Statement>.asSlice(&List<Block>.asSlice(&function.blocks)[block].statements)
+  let mut built = usize.MAX
+  let mut operands = List<usize>.make()
+  let mut indexes = List<usize>.make()
+  match &statements[at] {
+    Statement.Assign { destination, value: Rvalue.Aggregate { fields }, .. } => {
+      built = wholePlace(&destination)
+      let listed = List<AggregateField>.asSlice(&fields)
+      let mut k = usize.ZERO
+      while k < listed.length {
+        run List<usize>.append(&mut operands, wholeLocal(&listed[k].value))
+        run List<usize>.append(&mut indexes, listed[k].index)
+        k = k + usize.ONE
+      }
+    }
+    _ => {
+      return Option<SplitPlan>.none()
+    }
+  }
+  if built == usize.MAX || !isUserOrTemp(function, built)
+    || List<usize>.length(&operands) == usize.ZERO {
+    return Option<SplitPlan>.none()
+  }
+  let mut removed = List<usize>.make()
+  run List<usize>.append(&mut removed, at)
+
+  // `e = move t` right after the aggregate, with nothing naming `e` between, splits `e`.
+  let mut local = built
+  let builtUses = UseTable.uses(table, built)
+  if isTemp(function, built) && builtUses.named == 2 && !builtUses.borrowed && !builtUses.dropped
+    && !UseTable.flagged(table, built) {
+    let mut next = at + usize.ONE
+    while next < statements.length && statementNames(&statements[next], built) == usize.ZERO {
+      next = next + usize.ONE
+    }
+    if next < statements.length {
+      if let Statement.Assign {
+        destination,
+        value: Rvalue.Use { value: Operand.Move { place } },
+        ..
+      } = &statements[next] {
+        let target = wholePlace(&destination)
+        if wholePlace(&place) == built && target != usize.MAX && target != built
+          && isUserOrTemp(function, target) {
+          let mut between = at + usize.ONE
+          let mut clear = true
+          while between < next {
+            if statementNames(&statements[between], target) != usize.ZERO {
+              clear = false
+            }
+            between = between + usize.ONE
+          }
+          if clear {
+            local = target
+            run List<usize>.append(&mut removed, next)
+          }
+        }
+      }
+    }
+  }
+
+  // The source of each field.
+  let mut highest = usize.ZERO
+  let listed = List<usize>.asSlice(&indexes)
+  let mut k = usize.ZERO
+  while k < listed.length {
+    if listed[k] > highest {
+      highest = listed[k]
+    }
+    k = k + usize.ONE
+  }
+  let mut sources = List<usize>.make()
+  run List<usize>.appendRepeated(&mut sources, usize.MAX, highest + usize.ONE)
+  let mut earliest = at
+  let mut parameter = false
+  let fields = List<usize>.asSlice(&operands)
+  let locals = List<Local>.asSlice(&function.locals)
+  k = usize.ZERO
+  while k < fields.length {
+    let named = fields[k]
+    if named == usize.MAX || named == local {
+      return Option<SplitPlan>.none()
+    }
+    let mut source = usize.MAX
+    if isParameter(function, named) && splitSource(function, table, named, usize.ONE) {
+      source = named
+      parameter = true
+    } else if isTemp(function, named) && splitSource(function, table, named, 2) {
+      let mut definition = at
+      let mut found = false
+      while definition > usize.ZERO {
+        definition = definition - usize.ONE
+        if statementNames(&statements[definition], named) != usize.ZERO {
+          found = true
+          break
+        }
+      }
+      if !found {
+        return Option<SplitPlan>.none()
+      }
+      let mut snapshot = usize.MAX
+      match &statements[definition] {
+        Statement.Assign { destination, value, .. } => {
+          if wholePlace(&destination) != named || rvalueNames(&value, named) != usize.ZERO {
+            return Option<SplitPlan>.none()
+          }
+          match &value {
+            Rvalue.Use { value: Operand.Move { place } } => {
+              snapshot = wholePlace(&place)
+            }
+            Rvalue.Use { value: Operand.Copy { place } } => {
+              snapshot = wholePlace(&place)
+            }
+            _ => ()
+          }
+        }
+        _ => {
+          return Option<SplitPlan>.none()
+        }
+      }
+      if definition < earliest {
+        earliest = definition
+      }
+      source = named
+
+      // A snapshot of a parameter used nowhere else reads the parameter itself.
+      if snapshot != usize.MAX && isParameter(function, snapshot)
+        && splitSource(function, table, snapshot, usize.ONE)
+        && run Type.equalsShared(&locals[snapshot].ty, &locals[named].ty) {
+        source = snapshot
+        parameter = true
+        run List<usize>.append(&mut removed, definition)
+      }
+    } else {
+      return Option<SplitPlan>.none()
+    }
+    let mut slots = List<usize>.asMutSlice(&mut sources)
+    if slots[listed[k]] != usize.MAX {
+      return Option<SplitPlan>.none()
+    }
+    let mut other = usize.ZERO
+    while other < slots.length {
+      if slots[other] == source {
+        return Option<SplitPlan>.none()
+      }
+      other = other + usize.ONE
+    }
+    slots[listed[k]] = source
+    k = k + usize.ONE
+  }
+  let mut between = earliest
+  while between < at {
+    if statementNames(&statements[between], local) != usize.ZERO {
+      return Option<SplitPlan>.none()
+    }
+    between = between + usize.ONE
+  }
+  if parameter && run inCycle(function, block) {
+    return Option<SplitPlan>.none()
+  }
+  let variables = List<Variable>.asSlice(&function.variables)
+  k = usize.ZERO
+  while k < variables.length {
+    if variables[k].local == local {
+      return Option<SplitPlan>.none()
+    }
+    k = k + usize.ONE
+  }
+
+  // Drop flags of the local guard a field with a source.
+  let slotsRead = List<usize>.asSlice(&sources)
+  k = usize.ZERO
+  while k < locals.length {
+    if let LocalKind.DropFlag { local: guarded, path } = &locals[k].kind {
+      if guarded == local {
+        let steps = List<Projection>.asSlice(&path)
+        if steps.length == usize.ZERO {
+          return Option<SplitPlan>.none()
+        }
+        let field = match &steps[usize.ZERO] {
+          Projection.Field { index } => index
+          _ => usize.MAX
+        }
+        if field >= slotsRead.length || slotsRead[field] == usize.MAX {
+          return Option<SplitPlan>.none()
+        }
+      }
+      let steps = List<Projection>.asSlice(&path)
+      let mut step = usize.ZERO
+      while step < steps.length {
+        if let Projection.Index { local: index } = &steps[step] {
+          if index == local {
+            return Option<SplitPlan>.none()
+          }
+        }
+        step = step + usize.ONE
+      }
+    }
+    k = k + usize.ONE
+  }
+
+  // Every other name of the local is a field place: the walk sees all names the table counts
+  // but the removed definitions'.
+  let mut walk = SplitWalk {
+    local: local,
+    sources: run copyIndexes(&sources),
+    apply: false,
+    valid: true,
+    seen: usize.ZERO,
+  }
+  walkSplit(&mut owner.*, block, &removed, &mut walk)
+
+  // Its one whole definition, the aggregate or `e = move t`, names it once.
+  let mut expected = UseTable.uses(table, local).named
+  if expected < usize.ONE {
+    return Option<SplitPlan>.none()
+  }
+  expected = expected - usize.ONE
+  if !walk.valid || walk.seen != expected {
+    return Option<SplitPlan>.none()
+  }
+  return Option<SplitPlan>.some(
+    SplitPlan { local: local, sources: move sources, removed: move removed },
+  )
+}
+
+effect fn copyIndexes(values: &List<usize>) -> List<usize>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut copied = List<usize>.make()
+  run List<usize>.appendSlice(&mut copied, List<usize>.asSlice(values))
+  return move copied
+}
+
+effect fn applySplit(function: &mut MirFunction, block: usize, plan: SplitPlan) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let SplitPlan { local, sources, removed } = move plan
+  let mut walk = SplitWalk {
+    local: local,
+    sources: move sources,
+    apply: true,
+    valid: true,
+    seen: usize.ZERO,
+  }
+  walkSplit(&mut function.*, block, &removed, &mut walk)
+
+  // Drop flags move to the source of their field.
+  let slots = List<usize>.asSlice(&walk.sources)
+  let mut locals = List<Local>.asMutSlice(&mut function.locals)
+  let mut k = usize.ZERO
+  while k < locals.length {
+    if let LocalKind.DropFlag { local: guarded, path } = &mut locals[k].kind {
+      if guarded == local {
+        let field = match &List<Projection>.asSlice(&path)[usize.ZERO] {
+          Projection.Field { index } => index
+          _ => usize.ZERO
+        }
+        guarded = slots[field]
+        drop List<Projection>.remove(&mut path, usize.ZERO)
+      }
+    }
+    k = k + usize.ONE
+  }
+
+  // Later statements first, so earlier indexes stay valid.
+  let mut order = move removed
+  let mut ordered = List<usize>.asMutSlice(&mut order)
+  let mut i = usize.ZERO
+  while i < ordered.length {
+    let mut j = i + usize.ONE
+    while j < ordered.length {
+      if ordered[j] > ordered[i] {
+        let held = ordered[i]
+        ordered[i] = ordered[j]
+        ordered[j] = held
+      }
+      j = j + usize.ONE
+    }
+    i = i + usize.ONE
+  }
+  let mut blocks = List<Block>.asMutSlice(&mut function.blocks)
+  let listed = List<usize>.asSlice(&order)
+  i = usize.ZERO
+  while i < listed.length {
+    drop List<Statement>.remove(&mut blocks[block].statements, listed[i])
+    i = i + usize.ONE
+  }
+  return ()
 }
