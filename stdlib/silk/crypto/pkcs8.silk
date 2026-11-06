@@ -1,0 +1,731 @@
+//! Encrypt and decrypt private keys in the PKCS #8 `EncryptedPrivateKeyInfo` format with PBES2
+//! (RFC 8018, RFC 5958).
+//!
+//! # When to use
+//! Use [`EncryptedPkcs8`] for an `-----BEGIN ENCRYPTED PRIVATE KEY-----` block, such as the input
+//! of `createPrivateKey` with a passphrase in Node.js, or the output of `export` with `type:
+//! 'pkcs8'` and a cipher. Find and decode the PEM block with `silk.encoding.pem`, and read the
+//! decrypted `PrivateKeyInfo` with the key modules, such as `RsaPrivateKey.fromPkcs8Der`.
+//!
+//! # Details
+//! PBES2 derives the key from the password with PBKDF2 and encrypts the DER with a CBC cipher and
+//! PKCS #7 padding. The PRF is HMAC with SHA-1, SHA-224, SHA-256, SHA-384, SHA-512, SHA-512/224, or
+//! SHA-512/256 ([`Pbes2Prf`]), and the cipher is AES-128, AES-192, or AES-256 in CBC mode, or Triple
+//! DES in CBC mode ([`Pbes2Cipher`]). These are the choices of OpenSSL's `pkcs8` command. The
+//! caller gives the salt and IV of [`EncryptedPkcs8.encrypt`], so this module needs no random
+//! source. Nothing allocates.
+//!
+//! # Errors
+//! The functions return a [`Pkcs8Error`]. On an error the output does not change.
+//!
+//! # Gotchas
+//! A wrong password usually fails with `WrongPassword`, but about one wrong password in 256 passes
+//! the padding check and returns garbage, so check that the result parses as a key. PBES1, the
+//! PKCS #12 schemes, and scrypt in PBES2 fail with `UnsupportedAlgorithm`. The time grows with the
+//! iteration count, which comes from the input: limit it before decrypting a key from outside.
+//!
+//! # Examples
+//! ## Encrypt and decrypt a key
+//! ```silk
+//! import silk.crypto.pkcs8 { EncryptedPkcs8, Pbes2Cipher, Pbes2Parameters, Pbes2Prf, Pkcs8Error }
+//! import silk.core.result { Result }
+//! import silk.collections.slice { Slice }
+//!
+//! pub fn main() -> i32 {
+//!   let key: [u8; 5] = [48, 3, 2, 1, 0]
+//!   let parameters = Pbes2Parameters {
+//!     cipher: Pbes2Cipher.Aes256Cbc,
+//!     prf: Pbes2Prf.HmacSha256,
+//!     iterations: 2048,
+//!     salt: b"saltsalt",
+//!     iv: b"0123456789abcdef",
+//!   }
+//!   let mut sealed: [u8; 160] = [0; 160]
+//!   let length = match EncryptedPkcs8.encrypt(&key, b"secret", &parameters, &mut sealed) {
+//!     Result<usize, Pkcs8Error>.Success { value } => value
+//!     Result<usize, Pkcs8Error>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let mut opened: [u8; 160] = [0; 160]
+//!   let opened_length = match EncryptedPkcs8.decrypt(Slice.view<u8>(&sealed, 0, length), b"secret", &mut opened) {
+//!     Result<usize, Pkcs8Error>.Success { value } => value
+//!     Result<usize, Pkcs8Error>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   if opened_length != 5 || opened[0] != 48 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! @category Cryptography
+
+import silk.text.format { Debug, Format, Formatter }
+import silk.core.result { Result }
+import silk.collections.slice { Slice }
+import silk.crypto.aes { AesCbc, AesError }
+import silk.crypto.block_cipher { BlockCipherError, Cbc }
+import silk.crypto.des { TripleDes }
+import silk.crypto.pbkdf2 { Pbkdf2, Pbkdf2Error }
+import silk.crypto.sha1 { Sha1 }
+import silk.crypto.sha2 { Sha224, Sha256, Sha384, Sha512, Sha512_224, Sha512_256 }
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import silk.io.writer { Writer, WriterError }
+
+/// The reason that an [`EncryptedPkcs8`] function rejected a call. The output does not change.
+pub union Pkcs8Error {
+  /// The input is not strict DER of an `EncryptedPrivateKeyInfo` with PBES2 parameters.
+  InvalidEncoding,
+  /// The scheme, key derivation, PRF, or cipher is not one that this module supports.
+  UnsupportedAlgorithm,
+  /// The decrypted data does not end in valid padding: the password is wrong, or the data was
+  /// changed.
+  WrongPassword,
+  /// The salt is empty, the iteration count is 0, or the IV is not one cipher block.
+  InvalidParameters,
+  /// The output buffer is shorter than the bytes the call writes.
+  OutputTooSmall,
+}
+
+impl Debug for Pkcs8Error {
+  /// Writes the name of the variant, such as `WrongPassword`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return match &self.* {
+      Pkcs8Error.InvalidEncoding => run Format.write(&mut formatter, b"InvalidEncoding")
+      Pkcs8Error.UnsupportedAlgorithm => run Format.write(&mut formatter, b"UnsupportedAlgorithm")
+      Pkcs8Error.WrongPassword => run Format.write(&mut formatter, b"WrongPassword")
+      Pkcs8Error.InvalidParameters => run Format.write(&mut formatter, b"InvalidParameters")
+      Pkcs8Error.OutputTooSmall => run Format.write(&mut formatter, b"OutputTooSmall")
+    }
+  }
+}
+
+/// The CBC ciphers that PBES2 can use here.
+pub enum Pbes2Cipher {
+  /// AES-128 in CBC mode, `aes-128-cbc`.
+  Aes128Cbc,
+  /// AES-192 in CBC mode, `aes-192-cbc`.
+  Aes192Cbc,
+  /// AES-256 in CBC mode, `aes-256-cbc`.
+  Aes256Cbc,
+  /// Triple DES with a 24-byte key in CBC mode, `des-ede3-cbc`.
+  TripleDesCbc,
+}
+
+impl Pbes2Cipher {
+  /// Returns the key length in bytes: 16, 24, 32, or 24.
+  pub fn keyLength(self: &Self) -> usize {
+    return match &self.* {
+      Pbes2Cipher.Aes128Cbc => 16
+      Pbes2Cipher.Aes192Cbc => 24
+      Pbes2Cipher.Aes256Cbc => 32
+      Pbes2Cipher.TripleDesCbc => 24
+    }
+  }
+
+  /// Returns the block length in bytes, which is also the IV length: 16 for AES, 8 for Triple DES.
+  pub fn blockLength(self: &Self) -> usize {
+    return match &self.* {
+      Pbes2Cipher.TripleDesCbc => 8
+      Pbes2Cipher.Aes128Cbc => 16
+      Pbes2Cipher.Aes192Cbc => 16
+      Pbes2Cipher.Aes256Cbc => 16
+    }
+  }
+
+  // The DER of the object identifier, with its tag and length.
+  fn identifier(self: &Self) -> &'static [u8] {
+    return match &self.* {
+      Pbes2Cipher.Aes128Cbc => b"\x06\x09\x60\x86\x48\x01\x65\x03\x04\x01\x02"
+      Pbes2Cipher.Aes192Cbc => b"\x06\x09\x60\x86\x48\x01\x65\x03\x04\x01\x16"
+      Pbes2Cipher.Aes256Cbc => b"\x06\x09\x60\x86\x48\x01\x65\x03\x04\x01\x2a"
+      Pbes2Cipher.TripleDesCbc => b"\x06\x08\x2a\x86\x48\x86\xf7\x0d\x03\x07"
+    }
+  }
+}
+
+/// The HMAC functions that PBKDF2 can use as its PRF here.
+pub enum Pbes2Prf {
+  /// HMAC-SHA-1, the default when the parameters name no PRF.
+  HmacSha1,
+  /// HMAC-SHA-224.
+  HmacSha224,
+  /// HMAC-SHA-256, which OpenSSL writes by default.
+  HmacSha256,
+  /// HMAC-SHA-384.
+  HmacSha384,
+  /// HMAC-SHA-512.
+  HmacSha512,
+  /// HMAC-SHA-512/224.
+  HmacSha512_224,
+  /// HMAC-SHA-512/256.
+  HmacSha512_256,
+}
+
+impl Pbes2Prf {
+  // The last byte of the object identifier 1.2.840.113549.2.n.
+  fn arc(self: &Self) -> u8 {
+    return match &self.* {
+      Pbes2Prf.HmacSha1 => 7
+      Pbes2Prf.HmacSha224 => 8
+      Pbes2Prf.HmacSha256 => 9
+      Pbes2Prf.HmacSha384 => 10
+      Pbes2Prf.HmacSha512 => 11
+      Pbes2Prf.HmacSha512_224 => 12
+      Pbes2Prf.HmacSha512_256 => 13
+    }
+  }
+}
+
+/// The choices of [`EncryptedPkcs8.encrypt`].
+///
+/// # Details
+///
+/// `salt` should be at least 8 random bytes and `iv` one random cipher block. OpenSSL uses a
+/// 16-byte salt and 2048 iterations by default; more iterations make a guessed password cost more.
+pub struct Pbes2Parameters<'a> {
+  /// The cipher that encrypts the key.
+  pub cipher: Pbes2Cipher,
+  /// The PRF of PBKDF2.
+  pub prf: Pbes2Prf,
+  /// The PBKDF2 iteration count, at least 1.
+  pub iterations: u32,
+  /// The PBKDF2 salt, not empty.
+  pub salt: &'a [u8],
+  /// The CBC IV, one cipher block.
+  pub iv: &'a [u8],
+}
+
+/// Functions that encrypt and decrypt PKCS #8 private keys with PBES2.
+pub struct EncryptedPkcs8 {}
+
+impl EncryptedPkcs8 {
+  /// Decrypts the `EncryptedPrivateKeyInfo` DER `der` with `password` into `output` and returns
+  /// the length of the `PrivateKeyInfo` DER written.
+  ///
+  /// The result is at most [`EncryptedPkcs8.decryptedLength`] bytes.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidEncoding` if `der` is not strict DER of an `EncryptedPrivateKeyInfo` with PBES2
+  ///   parameters, or the PBKDF2 key length does not match the cipher.
+  /// - `UnsupportedAlgorithm` if the scheme is not PBES2 with PBKDF2, or the PRF or the cipher is
+  ///   not one of [`Pbes2Prf`] and [`Pbes2Cipher`].
+  /// - `InvalidParameters` if the iteration count is 0 or the IV is not one block.
+  /// - `WrongPassword` if the padding is wrong after decryption.
+  /// - `OutputTooSmall` if `output` is shorter than the encrypted data.
+  pub fn decrypt(der: &[u8], password: &[u8], output: &mut [u8]) -> Result<usize, Pkcs8Error> {
+    let parsed = match parse(der) {
+      Result<Parsed, Pkcs8Error>.Success { value } => move value
+      Result<Parsed, Pkcs8Error>.Failure { error } => {
+        return Result<usize, Pkcs8Error>.failResult(move error)
+      }
+    }
+    let data = Slice.view<u8>(der, parsed.dataStart, parsed.dataEnd - parsed.dataStart)
+    let block = parsed.cipher.blockLength()
+    if data.length == 0 || data.length % block != 0 {
+      return Result<usize, Pkcs8Error>.failResult(Pkcs8Error.InvalidEncoding)
+    }
+    if output.length < data.length {
+      return Result<usize, Pkcs8Error>.failResult(Pkcs8Error.OutputTooSmall)
+    }
+    let mut key: [u8; 32] = [0; 32]
+    let keyLength = parsed.cipher.keyLength()
+    derive(
+      &parsed.prf,
+      password,
+      Slice.view<u8>(der, parsed.saltStart, parsed.saltEnd - parsed.saltStart),
+      parsed.iterations,
+      Slice.viewMut<u8>(&mut key, 0, keyLength),
+    )
+    let iv = Slice.view<u8>(der, parsed.ivStart, parsed.ivEnd - parsed.ivStart)
+    let cipherKey = Slice.view<u8>(&key, 0, keyLength)
+    // Check the padding on the last block alone first, with the block before it as the IV, so
+    // that a wrong password writes nothing.
+    let mut chain = iv
+    if data.length > block {
+      chain = Slice.view<u8>(data, data.length - 2 * block, block)
+    }
+    let mut last: [u8; 16] = [0; 16]
+    if let Result.Failure { error } = cbc(&parsed.cipher, cipherKey, chain, Slice.view<u8>(data, data.length - block, block), true, &mut last) {
+      return Result<usize, Pkcs8Error>.failResult(move error)
+    }
+    return cbc(&parsed.cipher, cipherKey, iv, data, true, move output)
+  }
+
+  /// Returns the most bytes that [`EncryptedPkcs8.decrypt`] writes for `der`: the length of its
+  /// encrypted data, or 0 if `der` does not parse.
+  pub fn decryptedLength(der: &[u8]) -> usize {
+    return match parse(der) {
+      Result<Parsed, Pkcs8Error>.Success { value } => value.dataEnd - value.dataStart
+      Result<Parsed, Pkcs8Error>.Failure { error: _ } => 0
+    }
+  }
+
+  /// Returns the number of bytes that [`EncryptedPkcs8.encrypt`] writes for a `PrivateKeyInfo` of
+  /// `length` bytes with `parameters`.
+  pub fn encryptedLength(length: usize, parameters: &Pbes2Parameters) -> usize {
+    return layout(length, parameters).total
+  }
+
+  /// Encrypts the `PrivateKeyInfo` DER `der` with `password` and `parameters` into `output` as an
+  /// `EncryptedPrivateKeyInfo`, and returns the number of bytes written,
+  /// [`EncryptedPkcs8.encryptedLength`].
+  ///
+  /// The PRF is written even when it is HMAC-SHA-1, and the key length is left out, as OpenSSL
+  /// does. The function does not check that `der` is a key.
+  ///
+  /// # Errors
+  ///
+  /// - `InvalidParameters` if the salt is empty, the iteration count is 0, or the IV is not one
+  ///   block of the cipher.
+  /// - `OutputTooSmall` if `output` is shorter than [`EncryptedPkcs8.encryptedLength`].
+  pub fn encrypt(der: &[u8], password: &[u8], parameters: &Pbes2Parameters, output: &mut [u8]) -> Result<usize, Pkcs8Error> {
+    if parameters.salt.length == 0 || parameters.iterations == 0 || parameters.iv.length != parameters.cipher.blockLength() {
+      return Result<usize, Pkcs8Error>.failResult(Pkcs8Error.InvalidParameters)
+    }
+    let shape = layout(der.length, parameters)
+    if output.length < shape.total {
+      return Result<usize, Pkcs8Error>.failResult(Pkcs8Error.OutputTooSmall)
+    }
+    let identifier = parameters.cipher.identifier()
+    let mut at = header(&mut output, 0, 48, shape.outer)
+    at = header(&mut output, at, 48, shape.algorithm)
+    at = put(&mut output, at, b"\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x05\x0d")
+    at = header(&mut output, at, 48, shape.scheme)
+    at = header(&mut output, at, 48, shape.kdf)
+    at = put(&mut output, at, b"\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x05\x0c")
+    at = header(&mut output, at, 48, shape.kdfParameters)
+    at = header(&mut output, at, 4, parameters.salt.length)
+    at = put(&mut output, at, parameters.salt)
+    at = header(&mut output, at, 2, shape.iterationBytes)
+    let mut byte: usize = shape.iterationBytes
+    while byte > 0 {
+      byte = byte - 1
+      if byte < 4 {
+        output[at] = u32.toU8(u32.bitAnd(u32.shiftRight(parameters.iterations, usize.toU32(8 * byte)), 255))
+      } else {
+        output[at] = 0
+      }
+      at = at + 1
+    }
+    at = put(&mut output, at, b"\x30\x0c\x06\x08\x2a\x86\x48\x86\xf7\x0d\x02")
+    output[at] = parameters.prf.arc()
+    at = put(&mut output, at + 1, b"\x05\x00")
+    at = header(&mut output, at, 48, identifier.length + 2 + parameters.iv.length)
+    at = put(&mut output, at, identifier)
+    at = header(&mut output, at, 4, parameters.iv.length)
+    at = put(&mut output, at, parameters.iv)
+    at = header(&mut output, at, 4, shape.data)
+    let mut key: [u8; 32] = [0; 32]
+    let keyLength = parameters.cipher.keyLength()
+    derive(&parameters.prf, password, parameters.salt, parameters.iterations, Slice.viewMut<u8>(&mut key, 0, keyLength))
+    let start = at
+    let written = match cbc(&parameters.cipher, Slice.view<u8>(&key, 0, keyLength), parameters.iv, der, false, Slice.viewMut<u8>(&mut output, start, shape.data)) {
+      Result<usize, Pkcs8Error>.Success { value } => value
+      Result<usize, Pkcs8Error>.Failure { error: _ } => Intrinsic.trap("EncryptedPkcs8: the lengths were checked")
+    }
+    return Result<usize, Pkcs8Error>.succeed(start + written)
+  }
+}
+
+// The lengths of the nested DER of an EncryptedPrivateKeyInfo.
+struct Layout {
+  total: usize,
+  outer: usize,
+  algorithm: usize,
+  scheme: usize,
+  kdf: usize,
+  kdfParameters: usize,
+  iterationBytes: usize,
+  data: usize,
+}
+
+fn layout(length: usize, parameters: &Pbes2Parameters) -> Layout {
+  let block = parameters.cipher.blockLength()
+  let data = (length / block + 1) * block
+  // An INTEGER of the count, with a leading zero when the top bit is set.
+  let mut iterationBytes: usize = 1
+  while iterationBytes < 4 && u32.shiftRight(parameters.iterations, usize.toU32(8 * iterationBytes)) != 0 {
+    iterationBytes = iterationBytes + 1
+  }
+  if u32.shiftRight(parameters.iterations, usize.toU32(8 * iterationBytes - 1)) == 1 {
+    iterationBytes = iterationBytes + 1
+  }
+  let prf: usize = 14
+  let kdfParameters = element(parameters.salt.length) + 2 + iterationBytes + prf
+  let kdf = 11 + element(kdfParameters)
+  let cipher = parameters.cipher.identifier().length + element(parameters.iv.length)
+  let scheme = element(kdf) + element(cipher)
+  let algorithm = 11 + element(scheme)
+  let outer = element(algorithm) + element(data)
+  return Layout {
+    total: element(outer),
+    outer: outer,
+    algorithm: algorithm,
+    scheme: scheme,
+    kdf: kdf,
+    kdfParameters: kdfParameters,
+    iterationBytes: iterationBytes,
+    data: data,
+  }
+}
+
+// The length of an element with `length` bytes of content.
+fn element(length: usize) -> usize {
+  if length < 128 {
+    return 2 + length
+  }
+  if length < 256 {
+    return 3 + length
+  }
+  if length < 65536 {
+    return 4 + length
+  }
+  return 5 + length
+}
+
+fn header(output: &mut [u8], position: usize, tag: u8, length: usize) -> usize {
+  output[position] = tag
+  if length < 128 {
+    output[position + 1] = usize.toU8(length)
+    return position + 2
+  }
+  if length < 256 {
+    output[position + 1] = 129
+    output[position + 2] = usize.toU8(length)
+    return position + 3
+  }
+  if length < 65536 {
+    output[position + 1] = 130
+    output[position + 2] = usize.toU8(length / 256)
+    output[position + 3] = usize.toU8(length % 256)
+    return position + 4
+  }
+  output[position + 1] = 131
+  output[position + 2] = usize.toU8(length / 65536)
+  output[position + 3] = usize.toU8(length / 256 % 256)
+  output[position + 4] = usize.toU8(length % 256)
+  return position + 5
+}
+
+fn put(output: &mut [u8], position: usize, bytes: &[u8]) -> usize {
+  let mut index: usize = 0
+  while index < bytes.length {
+    output[position + index] = bytes[index]
+    index = index + 1
+  }
+  return position + bytes.length
+}
+
+fn derive(prf: &Pbes2Prf, password: &[u8], salt: &[u8], iterations: u32, key: &mut [u8]) -> () {
+  let result = match &prf.* {
+    Pbes2Prf.HmacSha1 => Pbkdf2.derive<Sha1>(password, salt, iterations, move key)
+    Pbes2Prf.HmacSha224 => Pbkdf2.derive<Sha224>(password, salt, iterations, move key)
+    Pbes2Prf.HmacSha256 => Pbkdf2.derive<Sha256>(password, salt, iterations, move key)
+    Pbes2Prf.HmacSha384 => Pbkdf2.derive<Sha384>(password, salt, iterations, move key)
+    Pbes2Prf.HmacSha512 => Pbkdf2.derive<Sha512>(password, salt, iterations, move key)
+    Pbes2Prf.HmacSha512_224 => Pbkdf2.derive<Sha512_224>(password, salt, iterations, move key)
+    Pbes2Prf.HmacSha512_256 => Pbkdf2.derive<Sha512_256>(password, salt, iterations, move key)
+  }
+  if let Result.Failure { error: _ } = move result {
+    Intrinsic.trap("EncryptedPkcs8: PBKDF2 inputs were checked")
+  }
+}
+
+// Encrypts or decrypts `input` with CBC and PKCS #7 padding into `output`, which holds at least
+// the padded length.
+fn cbc(cipher: &Pbes2Cipher, key: &[u8], iv: &[u8], input: &[u8], decrypting: bool, output: &mut [u8]) -> Result<usize, Pkcs8Error> {
+  if cipher.blockLength() == 8 {
+    let des = match TripleDes.make(key) {
+      Result<TripleDes, BlockCipherError>.Success { value } => move value
+      Result<TripleDes, BlockCipherError>.Failure { error: _ } => Intrinsic.trap("EncryptedPkcs8: the key length was checked")
+    }
+    let made = if decrypting { Cbc<TripleDes>.decryptor(move des, iv, true) } else { Cbc<TripleDes>.encryptor(move des, iv, true) }
+    let mut state = match move made {
+      Result<Cbc<TripleDes>, BlockCipherError>.Success { value } => move value
+      Result<Cbc<TripleDes>, BlockCipherError>.Failure { error: _ } => {
+        return Result<usize, Pkcs8Error>.failResult(Pkcs8Error.InvalidParameters)
+      }
+    }
+    let capacity = output.length
+    let first = match state.update(input, Slice.viewMut<u8>(&mut output, 0, capacity)) {
+      Result<usize, BlockCipherError>.Success { value } => value
+      Result<usize, BlockCipherError>.Failure { error: _ } => Intrinsic.trap("EncryptedPkcs8: the output length was checked")
+    }
+    let rest = capacity - first
+    return match state.finish(Slice.viewMut<u8>(&mut output, first, rest)) {
+      Result<usize, BlockCipherError>.Success { value } => Result<usize, Pkcs8Error>.succeed(first + value)
+      Result<usize, BlockCipherError>.Failure { error: _ } => Result<usize, Pkcs8Error>.failResult(Pkcs8Error.WrongPassword)
+    }
+  }
+  let made = if decrypting { AesCbc.decryptor(key, iv, true) } else { AesCbc.encryptor(key, iv, true) }
+  let mut state = match move made {
+    Result<AesCbc, AesError>.Success { value } => move value
+    Result<AesCbc, AesError>.Failure { error: _ } => {
+      return Result<usize, Pkcs8Error>.failResult(Pkcs8Error.InvalidParameters)
+    }
+  }
+  let capacity = output.length
+  let first = match state.update(input, Slice.viewMut<u8>(&mut output, 0, capacity)) {
+    Result<usize, AesError>.Success { value } => value
+    Result<usize, AesError>.Failure { error: _ } => Intrinsic.trap("EncryptedPkcs8: the output length was checked")
+  }
+  let rest = capacity - first
+  return match state.finish(Slice.viewMut<u8>(&mut output, first, rest)) {
+    Result<usize, AesError>.Success { value } => Result<usize, Pkcs8Error>.succeed(first + value)
+    Result<usize, AesError>.Failure { error: _ } => Result<usize, Pkcs8Error>.failResult(Pkcs8Error.WrongPassword)
+  }
+}
+
+// The parts of a parsed EncryptedPrivateKeyInfo, as offsets into the DER.
+struct Parsed {
+  cipher: Pbes2Cipher,
+  prf: Pbes2Prf,
+  iterations: u32,
+  saltStart: usize,
+  saltEnd: usize,
+  ivStart: usize,
+  ivEnd: usize,
+  dataStart: usize,
+  dataEnd: usize,
+}
+
+// One DER element: the tag, the content range, and whether it read.
+struct Element {
+  tag: u8,
+  start: usize,
+  end: usize,
+  valid: bool,
+}
+
+// Reads the element at `offset` that must end by `limit`, with lengths in the shortest form.
+fn read(bytes: &[u8], offset: usize, limit: usize) -> Element {
+  let invalid = Element { tag: 0, start: 0, end: 0, valid: false }
+  if limit > bytes.length || offset >= limit || limit - offset < 2 {
+    return move invalid
+  }
+  let first = bytes[offset + 1]
+  let mut start = offset + 2
+  let mut length = u8.toUsize(first)
+  if first >= 128 {
+    let count = u8.toUsize(first) - 128
+    if count == 0 || count > 3 || limit - start < count || bytes[start] == 0 {
+      return move invalid
+    }
+    length = 0
+    let mut index: usize = 0
+    while index < count {
+      length = length * 256 + u8.toUsize(bytes[start + index])
+      index = index + 1
+    }
+    if length < 128 {
+      return move invalid
+    }
+    start = start + count
+  }
+  if length > limit - start {
+    return move invalid
+  }
+  return Element { tag: bytes[offset], start: start, end: start + length, valid: true }
+}
+
+fn equals(bytes: &[u8], start: usize, end: usize, expected: &[u8]) -> bool {
+  if end - start != expected.length {
+    return false
+  }
+  let mut index: usize = 0
+  while index < expected.length {
+    if bytes[start + index] != expected[index] {
+      return false
+    }
+    index = index + 1
+  }
+  return true
+}
+
+fn invalid() -> Result<Parsed, Pkcs8Error> {
+  return Result<Parsed, Pkcs8Error>.failResult(Pkcs8Error.InvalidEncoding)
+}
+
+fn unsupported() -> Result<Parsed, Pkcs8Error> {
+  return Result<Parsed, Pkcs8Error>.failResult(Pkcs8Error.UnsupportedAlgorithm)
+}
+
+fn parse(der: &[u8]) -> Result<Parsed, Pkcs8Error> {
+  let outer = read(der, 0, der.length)
+  if outer.valid == false || outer.tag != 48 || outer.end != der.length {
+    return invalid()
+  }
+  let algorithm = read(der, outer.start, outer.end)
+  if algorithm.valid == false || algorithm.tag != 48 {
+    return invalid()
+  }
+  let data = read(der, algorithm.end, outer.end)
+  if data.valid == false || data.tag != 4 || data.end != outer.end {
+    return invalid()
+  }
+  let scheme = read(der, algorithm.start, algorithm.end)
+  if scheme.valid == false || scheme.tag != 6 {
+    return invalid()
+  }
+  if equals(der, scheme.start, scheme.end, b"\x2a\x86\x48\x86\xf7\x0d\x01\x05\x0d") == false {
+    return unsupported()
+  }
+  let pbes2 = read(der, scheme.end, algorithm.end)
+  if pbes2.valid == false || pbes2.tag != 48 || pbes2.end != algorithm.end {
+    return invalid()
+  }
+  let kdf = read(der, pbes2.start, pbes2.end)
+  if kdf.valid == false || kdf.tag != 48 {
+    return invalid()
+  }
+  let encryption = read(der, kdf.end, pbes2.end)
+  if encryption.valid == false || encryption.tag != 48 || encryption.end != pbes2.end {
+    return invalid()
+  }
+  let kdfName = read(der, kdf.start, kdf.end)
+  if kdfName.valid == false || kdfName.tag != 6 {
+    return invalid()
+  }
+  if equals(der, kdfName.start, kdfName.end, b"\x2a\x86\x48\x86\xf7\x0d\x01\x05\x0c") == false {
+    return unsupported()
+  }
+  let kdfParameters = read(der, kdfName.end, kdf.end)
+  if kdfParameters.valid == false || kdfParameters.tag != 48 || kdfParameters.end != kdf.end {
+    return invalid()
+  }
+  // PBKDF2-params: salt, iteration count, optional key length, optional PRF.
+  let salt = read(der, kdfParameters.start, kdfParameters.end)
+  if salt.valid == false || salt.tag != 4 {
+    return invalid()
+  }
+  let count = read(der, salt.end, kdfParameters.end)
+  if count.valid == false || count.tag != 2 {
+    return invalid()
+  }
+  let iterations = match unsigned(der, &count) {
+    Result<u32, Pkcs8Error>.Success { value } => value
+    Result<u32, Pkcs8Error>.Failure { error } => {
+      return Result<Parsed, Pkcs8Error>.failResult(move error)
+    }
+  }
+  let mut cursor = count.end
+  let mut keyLength: u32 = 0
+  if cursor < kdfParameters.end && der[cursor] == 2 {
+    let stated = read(der, cursor, kdfParameters.end)
+    if stated.valid == false {
+      return invalid()
+    }
+    keyLength = match unsigned(der, &stated) {
+      Result<u32, Pkcs8Error>.Success { value } => value
+      Result<u32, Pkcs8Error>.Failure { error } => {
+        return Result<Parsed, Pkcs8Error>.failResult(move error)
+      }
+    }
+    cursor = stated.end
+  }
+  let mut prf = Pbes2Prf.HmacSha1
+  if cursor < kdfParameters.end {
+    let prfSequence = read(der, cursor, kdfParameters.end)
+    if prfSequence.valid == false || prfSequence.tag != 48 || prfSequence.end != kdfParameters.end {
+      return invalid()
+    }
+    let prfName = read(der, prfSequence.start, prfSequence.end)
+    if prfName.valid == false || prfName.tag != 6 {
+      return invalid()
+    }
+    // The parameters are NULL or absent.
+    if prfName.end != prfSequence.end
+      && (prfSequence.end - prfName.end != 2 || der[prfName.end] != 5 || der[prfName.end + 1] != 0) {
+      return invalid()
+    }
+    if prfName.end - prfName.start != 8
+      || equals(der, prfName.start, prfName.start + 7, b"\x2a\x86\x48\x86\xf7\x0d\x02") == false {
+      return unsupported()
+    }
+    let arc = der[prfName.start + 7]
+    if arc == 7 {
+      prf = Pbes2Prf.HmacSha1
+    } else if arc == 8 {
+      prf = Pbes2Prf.HmacSha224
+    } else if arc == 9 {
+      prf = Pbes2Prf.HmacSha256
+    } else if arc == 10 {
+      prf = Pbes2Prf.HmacSha384
+    } else if arc == 11 {
+      prf = Pbes2Prf.HmacSha512
+    } else if arc == 12 {
+      prf = Pbes2Prf.HmacSha512_224
+    } else if arc == 13 {
+      prf = Pbes2Prf.HmacSha512_256
+    } else {
+      return unsupported()
+    }
+  }
+  let cipherName = read(der, encryption.start, encryption.end)
+  if cipherName.valid == false || cipherName.tag != 6 {
+    return invalid()
+  }
+  let mut cipher = Pbes2Cipher.Aes128Cbc
+  let name = Slice.view<u8>(der, cipherName.start - 2, cipherName.end - cipherName.start + 2)
+  if equals(name, 0, name.length, Pbes2Cipher.Aes128Cbc.identifier()) {
+    cipher = Pbes2Cipher.Aes128Cbc
+  } else if equals(name, 0, name.length, Pbes2Cipher.Aes192Cbc.identifier()) {
+    cipher = Pbes2Cipher.Aes192Cbc
+  } else if equals(name, 0, name.length, Pbes2Cipher.Aes256Cbc.identifier()) {
+    cipher = Pbes2Cipher.Aes256Cbc
+  } else if equals(name, 0, name.length, Pbes2Cipher.TripleDesCbc.identifier()) {
+    cipher = Pbes2Cipher.TripleDesCbc
+  } else {
+    return unsupported()
+  }
+  let iv = read(der, cipherName.end, encryption.end)
+  if iv.valid == false || iv.tag != 4 || iv.end != encryption.end {
+    return invalid()
+  }
+  if iterations == 0 || iv.end - iv.start != cipher.blockLength() {
+    return Result<Parsed, Pkcs8Error>.failResult(Pkcs8Error.InvalidParameters)
+  }
+  if keyLength != 0 && u32.toUsize(keyLength) != cipher.keyLength() {
+    return invalid()
+  }
+  return Result<Parsed, Pkcs8Error>.succeed(
+    Parsed {
+      cipher: cipher,
+      prf: prf,
+      iterations: iterations,
+      saltStart: salt.start,
+      saltEnd: salt.end,
+      ivStart: iv.start,
+      ivEnd: iv.end,
+      dataStart: data.start,
+      dataEnd: data.end,
+    },
+  )
+}
+
+// A non-negative DER INTEGER that fits in a u32.
+fn unsigned(der: &[u8], at: &Element) -> Result<u32, Pkcs8Error> {
+  let length = at.end - at.start
+  if length == 0 || length > 5 {
+    return Result<u32, Pkcs8Error>.failResult(Pkcs8Error.InvalidEncoding)
+  }
+  let first = der[at.start]
+  // Negative, or a leading zero that is not needed.
+  if first >= 128 || (length > 1 && first == 0 && der[at.start + 1] < 128) || (length == 5 && first != 0) {
+    return Result<u32, Pkcs8Error>.failResult(Pkcs8Error.InvalidEncoding)
+  }
+  let mut value: u32 = 0
+  let mut index = at.start
+  while index < at.end {
+    value = u32.bitOr(u32.shiftLeft(value, 8), u8.toU32(der[index]))
+    index = index + 1
+  }
+  return Result<u32, Pkcs8Error>.succeed(value)
+}
