@@ -509,6 +509,34 @@ struct ReadySlot {
   watches: [ReadyWatch; 16],
   count: usize,
   ready: usize,
+  // The generation of the armed registration that waits on this slot, or `u64.MAX` while no
+  // registration does. The driver reads it so that it need not look the task up on each poll.
+  armed: u64,
+}
+
+fn markArmed(slot: &mut ReadySlot, generation: u64) -> () {
+  slot.armed = generation
+  return ()
+}
+
+fn markIdle(slot: &mut ReadySlot) -> () {
+  slot.armed = u64.MAX
+  return ()
+}
+
+fn armedAs(slot: &ReadySlot, generation: u64) -> bool {
+  return slot.armed == generation
+}
+
+// Ends the readiness interest of a registration that is no longer armed.
+fn endReadyInterest(ready: NoReadyInterest | ReadyInterest) -> () {
+  return match move ready {
+    NoReadyInterest {} => ()
+    ReadyInterest { slot } => {
+      Shared.withMut(&slot, markIdle)
+      drop slot
+    }
+  }
 }
 
 struct ReadyWaitRegistration {
@@ -706,6 +734,7 @@ impl TaskClockClient {
         watches: [ReadyWatch.forRead(usize.ZERO); 16],
         count: usize.ZERO,
         ready: usize.ZERO,
+        armed: u64.MAX,
       }) |> Effect.provideMut<Allocator>(&mut allocator))
       let slot = match move made {
         Result<Shared<ReadySlot>, OutOfMemoryError>.Success {value} => move value
@@ -1062,11 +1091,9 @@ struct NoReadyInterest {}
 struct ReadyInterest { slot: Shared<ReadySlot> }
 struct EventInterests { timer: NoTimerInterest | TimerInterest, ready: NoReadyInterest | ReadyInterest }
 
-// A task parked in `waitReady`, by the generation of its registration. The driver drops an entry
-// once that registration is no longer armed.
-struct ReadyWaiter { identity: TaskId, generation: u64 }
-
-impl Copy for ReadyWaiter {}
+// A task parked in `waitReady`, by the generation of its registration and the slot it waits on.
+// The driver drops an entry once that registration is no longer armed, which the slot records.
+struct ReadyWaiter { identity: TaskId, generation: u64, slot: Shared<ReadySlot> }
 
 struct RegistrationIdle {}
 struct RegistrationArmed {
@@ -1507,7 +1534,7 @@ fn finishDisarm(
   wake: Wake,
 ) -> NoDisarmedWake | DisarmedWake {
   let EventInterests { timer, ready } = move interests
-  drop ready
+  endReadyInterest(move ready)
   return match move timer {
     NoTimerInterest {} => DisarmedWake { wake: move wake }
     TimerInterest { index } => finishDisarmTimer(
@@ -1595,7 +1622,7 @@ fn completeTimer(store: &mut TaskStore, timer: TimerEntry) -> () {
 fn completeClaimedTimer(interests: EventInterests, wake: Wake) -> () {
   let EventInterests { timer, ready } = move interests
   drop timer
-  drop ready
+  endReadyInterest(move ready)
   return Execution.wake(move wake)
 }
 
@@ -1666,6 +1693,7 @@ effect fn armReadyWait(
   until: Option<Instant>,
   wake: Wake,
 ) -> () {
+  let kept = Shared<ReadySlot>.clone(&slot)
   match move until {
     Option<Instant>.Some {value} => {
       run armTimerWith(&mut store.*, identity, move value, move wake, ReadyInterest { slot: move slot })
@@ -1676,6 +1704,7 @@ effect fn armReadyWait(
       if !found {
         drop slot
         drop wake
+        drop kept
         return ()
       }
       let GenerationOutput { phase } = move generation
@@ -1692,8 +1721,14 @@ effect fn armReadyWait(
     }
   }
   let generation = armedGeneration(&mut store.tasks, identity)
+  if generation == u64.MAX {
+    // The task was not found, so nothing was armed.
+    drop kept
+    return ()
+  }
+  Shared.withMut(&kept, markArmed(generation))
   let mut allocator = Allocator.systemAllocatorProvider()
-  let appended = List<ReadyWaiter>.append(&mut store.waiters, ReadyWaiter { identity: identity, generation: generation })
+  let appended = List<ReadyWaiter>.append(&mut store.waiters, ReadyWaiter { identity: identity, generation: generation, slot: move kept })
     |> Effect.provideMut<Allocator>(&mut allocator)
   let outcome = run Effect.result(move appended)
   return match move outcome {
@@ -2798,29 +2833,6 @@ fn snapshotSlot(slot: &ReadySlot) -> SlotSnapshot {
   return SlotSnapshot { watches: slot.watches, count: slot.count }
 }
 
-struct SlotLookup { slot: Option<Shared<ReadySlot>> }
-
-fn lookupSlot(entry: &mut TaskEntry, generation: u64, output: &mut SlotLookup) -> () {
-  match &entry.registration {
-    RegistrationArmed { generation: armed, interests, .. } => {
-      if armed != generation { return () }
-      match &interests.ready {
-        ReadyInterest { slot } => { output.slot = Option<Shared<ReadySlot>>.some(Shared<ReadySlot>.clone(&slot)) }
-        NoReadyInterest {} => {}
-      }
-    }
-    RegistrationIdle {} => {}
-  }
-  return ()
-}
-
-fn waiterSlot(store: &mut TaskStore, waiter: ReadyWaiter) -> Option<Shared<ReadySlot>> {
-  let mut lookup = SlotLookup { slot: Option<Shared<ReadySlot>>.none() }
-  let _found = HashMap.withMut(&mut store.tasks, waiter.identity, lookupSlot(waiter.generation, &mut lookup))
-  let SlotLookup { slot } = move lookup
-  return move slot
-}
-
 // Copies the handles of each live waiter into `store.watches`, and the start of each waiter's
 // handles into `store.spans`. A waiter whose wait ended is removed. Returns the live waiters.
 effect fn gatherWatches(store: &mut TaskStore) -> usize ! OutOfMemoryError {
@@ -2829,24 +2841,37 @@ effect fn gatherWatches(store: &mut TaskStore) -> usize ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut index = usize.ZERO
   while index < List<ReadyWaiter>.length(&store.waiters) {
-    let waiter = List<ReadyWaiter>.get(&store.waiters, index)
-    let found = waiterSlot(&mut store.*, waiter)
-    match move found {
-      Option<Shared<ReadySlot>>.None => {
-        let _removed = List<ReadyWaiter>.remove(&mut store.waiters, index)
-      }
-      Option<Shared<ReadySlot>>.Some {value: slot} => {
-        let snapshot = Shared<ReadySlot>.with<SlotSnapshot>(&slot, snapshotSlot)
-        drop slot
-        run List<usize>.append(&mut store.spans, List<ReadyWatch>.length(&store.watches))
-          |> Effect.provideMut<Allocator>(&mut allocator)
-        run List<ReadyWatch>.appendSlice(&mut store.watches, Slice.view<ReadyWatch>(&snapshot.watches, usize.ZERO, snapshot.count))
-          |> Effect.provideMut<Allocator>(&mut allocator)
-        index = index + usize.ONE
-      }
+    let slot = waiterSlotAt(&store.waiters, index)
+    if !Shared<ReadySlot>.with<bool>(&slot, armedAs(waiterGenerationAt(&store.waiters, index))) {
+      drop slot
+      let removed = List<ReadyWaiter>.remove(&mut store.waiters, index)
+      drop removed
+    } else {
+      let snapshot = Shared<ReadySlot>.with<SlotSnapshot>(&slot, snapshotSlot)
+      drop slot
+      run List<usize>.append(&mut store.spans, List<ReadyWatch>.length(&store.watches))
+        |> Effect.provideMut<Allocator>(&mut allocator)
+      run List<ReadyWatch>.appendSlice(&mut store.watches, Slice.view<ReadyWatch>(&snapshot.watches, usize.ZERO, snapshot.count))
+        |> Effect.provideMut<Allocator>(&mut allocator)
+      index = index + usize.ONE
     }
   }
   return List<ReadyWaiter>.length(&store.waiters)
+}
+
+fn waiterSlotAt(waiters: &List<ReadyWaiter>, index: usize) -> Shared<ReadySlot> {
+  let all = List<ReadyWaiter>.asSlice(&waiters.*)
+  return Shared<ReadySlot>.clone(&all[index].slot)
+}
+
+fn waiterGenerationAt(waiters: &List<ReadyWaiter>, index: usize) -> u64 {
+  let all = List<ReadyWaiter>.asSlice(&waiters.*)
+  return all[index].generation
+}
+
+fn waiterIdentityAt(waiters: &List<ReadyWaiter>, index: usize) -> TaskId {
+  let all = List<ReadyWaiter>.asSlice(&waiters.*)
+  return all[index].identity
 }
 
 fn storeEvents(slot: &mut ReadySlot, watches: &[ReadyWatch], ready: usize) -> () {
@@ -2865,7 +2890,6 @@ fn deliverReadiness(store: &mut TaskStore) -> () {
   let mut index = List<ReadyWaiter>.length(&store.waiters)
   while index > usize.ZERO {
     index = index - usize.ONE
-    let waiter = List<ReadyWaiter>.get(&store.waiters, index)
     let start = List<usize>.get(&store.spans, index)
     let mut end = List<ReadyWatch>.length(&store.watches)
     if index + usize.ONE < List<usize>.length(&store.spans) { end = List<usize>.get(&store.spans, index + usize.ONE) }
@@ -2878,20 +2902,19 @@ fn deliverReadiness(store: &mut TaskStore) -> () {
       at = at + usize.ONE
     }
     if ready > usize.ZERO {
-      let found = waiterSlot(&mut store.*, waiter)
-      match move found {
-        Option<Shared<ReadySlot>>.None => {}
-        Option<Shared<ReadySlot>>.Some {value: slot} => {
-          Shared.withMut(&slot, storeEvents(Slice.view<ReadyWatch>(&events.watches, usize.ZERO, events.count), ready))
-          drop slot
-          let disarmed = disarmRegistration(&mut store.*, waiter.identity)
-          match move disarmed {
-            NoDisarmedWake {} => {}
-            DisarmedWake { wake } => Execution.wake(move wake)
-          }
+      let slot = waiterSlotAt(&store.waiters, index)
+      if Shared<ReadySlot>.with<bool>(&slot, armedAs(waiterGenerationAt(&store.waiters, index))) {
+        Shared.withMut(&slot, storeEvents(Slice.view<ReadyWatch>(&events.watches, usize.ZERO, events.count), ready))
+        let identity = waiterIdentityAt(&store.waiters, index)
+        let disarmed = disarmRegistration(&mut store.*, identity)
+        match move disarmed {
+          NoDisarmedWake {} => {}
+          DisarmedWake { wake } => Execution.wake(move wake)
         }
       }
-      let _removed = List<ReadyWaiter>.remove(&mut store.waiters, index)
+      drop slot
+      let removed = List<ReadyWaiter>.remove(&mut store.waiters, index)
+      drop removed
     }
   }
   return ()
