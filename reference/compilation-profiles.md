@@ -458,11 +458,19 @@ arguments = true
 ```
 
 The entries are removed from the new manifest before they run, so they run once. They run in order
-in the project directory with the caller's environment plus `SILK_VERSION`, this compiler's release
-(such as `0.1.0-dev.50+e1a2bc7cec4a`), after every file is written. An entry gets only its own
-arguments unless it sets `arguments = true`: then `silk init app -t ui -- --dark` runs
-`scripts/post-init.sh --dark`. Arguments after `--` for a template with no such entry are refused
-before anything is written. A failing
+in the project directory after every file is written, in the sandbox `build.silk` tool steps use
+(Landlock on Linux 6.7 and later, `sandbox-exec` on macOS): an entry reads the system's programs
+and libraries and the new project, writes only the new project and a scratch `HOME`, and opens no
+TCP connection. Its environment is only `PATH` (`/usr/local/bin:/usr/bin:/bin`, where a bare
+program name is searched), `HOME` and `TMPDIR` (the scratch directory) and `SILK_VERSION`, this
+compiler's release (such as `0.1.0-dev.50+e1a2bc7cec4a`). A template therefore cannot read your
+files, reach the network or change anything outside the project it creates. A host with no
+sandbox refuses a template with entries unless `--unsandboxed-post-init` is given, which runs them
+with the caller's environment and full access after a warning.
+
+An entry gets only its own arguments unless it sets `arguments = true`: then
+`silk init app -t ui -- --dark` runs `scripts/post-init.sh --dark`. Arguments after `--` for a
+template with no such entry are refused before anything is written. A failing
 entry stops the rest, and `silk init` then removes every file and directory it created, restores a
 `.gitignore` it changed and exits 1. A template it cannot fetch or use also exits 1, and a failed fetch prints git's reason and
 suggests `-t minimal` for an offline project; a malformed
