@@ -153,6 +153,11 @@ compares the two by module, code and span. It writes one
 only one side reached, then `silk-check-roots modules=<count> rejections=<count>
 differences=<count>`, and fails the check when they differ.
 
+`SILK_VERIFY_MIR=1` enables the mechanical MIR checks used by CI. Use it when reproducing
+selfhost compilation failures: it checks compiler-placed drops before MIR compaction, independently
+of source borrow checking. Lifetime facts follow only feasible edges for literal or known Boolean
+conditions; unknown conditions retain both paths.
+
 ## Toolchains
 
 The compiler, `silkc` in a release, knows nothing about Silk versions: it runs itself. The
