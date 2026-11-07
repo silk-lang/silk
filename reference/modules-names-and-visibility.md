@@ -986,28 +986,40 @@ The source root is `[package].source`, `src` when the manifest omits it. The roo
 `[package].main` below the source root, by default `main.silk`, or `lib.silk` for a library kind.
 `[package].kind` is `executable` (the default), `library` (Silk source for other packages, which a
 build checks and makes no artifact for), `static-library`, `shared-library` or `object`. The version
-defaults to `0.0.0`. A name starts with a lowercase letter and holds lowercase letters, digits and
-`_`; `self`, `silk` and `silkc` are reserved.
+defaults to `0.0.0`. A name starts with a lowercase letter and holds lowercase letters, digits,
+`_` and `-`; `self`, `silk` and `silkc` are reserved.
 
-The earlier spellings `[package].root`, `[package].source-root`, `[build].artifact`,
-`[build].native-link-inputs`, `[build].platform-supply` and `[build].composition` are refused at
-their line, naming the field that replaced each. A name may still hold `-`, its earlier spelling.
+The canonical structural contract is
+[`compiler/manifest.schema.toml`](../compiler/manifest.schema.toml), a JSON Schema Draft 2020-12
+document written in TOML. The compiler embeds this schema and validates manifests before decoding
+them. Unknown fields are rejected outside `tool`.
 
 `[package]` also accepts publishing metadata that builds never read: `description`, `license`,
 `repository`, `homepage` and `readme` as strings, `authors` and `keywords` as arrays of strings.
 `[tool.<name>]` belongs to other tools and is never validated. `[release]` belongs to
-`silk change`. Tables and fields a later release will read are refused as not supported yet:
-`[dev-dependencies]`, `[target]`, `[lints]`, `[test]`, `[bench]`, `[bin]` and `[package].include`.
+`silk change`. Unsupported tables and fields, including `[dev-dependencies]`, `[target]`, `[lints]`,
+`[test]`, `[bench]`, `[bin]` and `[package].include`, are rejected.
+
+Validation maps TOML to the shared JSON value model without rounding numbers. TOML dates and times
+map to strings; mathematically integral floats satisfy JSON Schema's `integer` type. The compiler
+still checks TOML-specific value kinds, normalized path containment, target/profile compatibility,
+dependency resolution and other semantic constraints. The root `tool` value is omitted from schema
+validation, so even tool-owned non-finite numbers remain opaque.
+
+Run `integration/json-schema-conformance/check-json-schema --manifest-schema` to verify the schema
+against the official metaschema, all tracked manifests and valid/invalid boundary fixtures.
 
 **Boundary:** The identity is logical. Two checkouts of the same package at different host paths
 have the same identity, and a module's identity never contains a host path.
 
 **Diagnostics:** A manifest without a name, with a version that is not a semantic version, or with a
-root module outside its source root is an invalid-manifest error from the build, not a Silk source
-diagnostic.
+root module outside its source root is an invalid-manifest error from the build. The language server
+also reports TOML syntax and shared schema errors on unsaved `silk.toml` text, using `TOML` and
+`MANIFEST_SCHEMA` codes and source ranges. Build-only semantic checks are not schema diagnostics.
 
 **Evidence:** [native package sources](../compiler/src/driver/ModuleSources.silk),
-[native manifest decoding](../compiler/src/driver/Project.silk).
+[native manifest decoding](../compiler/src/driver/Project.silk),
+[shared schema diagnostics](../compiler/src/driver/ManifestSchema.silk).
 
 ### PACKAGE-002 — A dependency name is the first segment of its import paths
 

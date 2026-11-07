@@ -495,6 +495,19 @@ constructed.
 impl Json
 ```
 
+<a id="Json.impl.copy"></a>
+
+### Associated function `copy`
+
+```silk
+pub effect fn copy(value: &Value) -> Value ! OutOfMemoryError ? &mut Allocator
+```
+
+Copies a tree into independent owned storage, preserving object order and exact number text.
+
+#### Errors
+- `OutOfMemoryError` if the allocator cannot supply the copied tree.
+
 <a id="Json.impl.parse"></a>
 
 ### Associated function `parse`

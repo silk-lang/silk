@@ -16,22 +16,24 @@ arbitrary-precision numbers, or `SchemaValue.parseToml` for either side written 
 The ordinary `Json.parse` remains the machine-number parser.
 
 ```silk
-import silk.json.schema { Schema, Draft, Resource, SchemaError }
+import silk.json.schema { Schema, Draft, SchemaError }
+import silk.json.schema_resolver { SchemaResolver, SchemaRegistry, SchemaResolutionError }
 import silk.json.schema_value { SchemaValue, ValueError }
 import silk.toml.scanner { TomlError }
 import silk.text.regex { RegexError }
-import silk.collections.list { List }
+import silk.core.effect { Effect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 
 effect fn checkConfig(schemaToml: &[u8], configToml: &[u8]) -> bool
-  ! TomlError | ValueError | SchemaError | RegexError | OutOfMemoryError ? &mut Allocator {
+  ! TomlError | ValueError | SchemaError | SchemaResolutionError | RegexError | OutOfMemoryError
+  ? &mut Allocator {
   let schema = run SchemaValue.parseToml(schemaToml)
   let config = run SchemaValue.parseToml(configToml)
-  let resources = List<Resource>.make()
+  let mut registry = SchemaRegistry.make()
   let mut options = Schema.options(Draft.Draft202012)
   options.assertFormats = true
   let compiled = run Schema.compile(&schema, "https://example.com/config",
-    List<Resource>.asSlice(&resources), options)
+    options) |> Effect.provideMut<SchemaResolver>(&mut registry)
   let output = run Schema.validate(&compiled, &config)
   return output.valid
 }
@@ -42,11 +44,20 @@ their original text; base-prefixed integers become exact decimal numbers. NaN an
 are rejected. JSON Schema's boolean schemas and `null` cannot be expressed as TOML document
 roots; use JSON or construct the shared `Value` directly when those forms are needed.
 
-The compiled schema borrows its source trees and can validate multiple instances. Supply
-external `$ref` resources and custom metaschemas through `Resource`; no URI is fetched and
-no schema executes code. `SchemaMetas.documents` supplies the official metaschemas when they
-are explicitly referenced. `$dynamicRef`, `$recursiveRef`, vocabulary declarations, and
-unevaluated-property/item annotations follow the selected dialect.
+The compiled schema borrows its root and owns any resolved external documents. It can validate
+multiple instances after the resolver has gone out of scope. Compilation requires the replaceable
+`silk.json.schema_resolver.SchemaResolver` service; validation does not. Its `resolve` operation
+receives an absolute URI without a fragment and returns an owned optional `Value`. Missing
+resources become unresolved-reference errors; provider failures preserve `SchemaResolutionError`.
+Each retrieval URI is resolved at most once per compilation.
+
+`SchemaRegistry.make()` creates an explicit empty in-memory provider. Add owned JSON or
+TOML-derived schemas with `SchemaRegistry.add(&mut registry, uri, move schema)`. The registry is
+reusable; `SchemaMetas.documents` supplies official metaschemas to register when explicitly
+referenced. Applications can instead implement filesystem, HTTP, embedded-resource or other
+providers and bind them with `Effect.provideMut<SchemaResolver>`. The validator has no default
+filesystem or network access and never executes schema code. `$dynamicRef`, `$recursiveRef`,
+vocabulary declarations and unevaluated-property/item annotations follow the selected dialect.
 
 `format` is an annotation by default. Set `assertFormats` to check the standard formats;
 the 2020-12 format-assertion vocabulary also enables their assertions. Draft 7's optional

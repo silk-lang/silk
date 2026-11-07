@@ -6,14 +6,14 @@ Compile JSON Schema resources and validate immutable JSON or TOML-derived values
 
 ## Details
 
-Supports drafts 4, 6, 7, 2019-09, and 2020-12. Resources are supplied by the caller;
-compilation and validation never perform network or filesystem access. Parse source with
-`Json.parseExact` or `SchemaValue.parseToml`, then retain the trees while using the
-compiled schema. Formats are annotations unless assertion is explicitly enabled.
+Supports drafts 4, 6, 7, 2019-09, and 2020-12. Compilation requests external documents
+through the caller's `SchemaResolver`; this module performs no filesystem or network I/O.
+Parse the root with `Json.parseExact` or `SchemaValue.parseToml` and keep it alive while using
+the compiled schema. Formats are annotations unless assertion is explicitly enabled.
 
 Import as `Schema` with `import silk.json.schema { Schema }`.
 
-Public declarations: 9.
+Public declarations: 8.
 
 <a id="Draft"></a>
 
@@ -124,36 +124,6 @@ all content keywords remain annotations, regardless of this option.
 ```silk
 impl Copy for Options
 ```
-
-<a id="Resource"></a>
-
-## `Resource`
-
-```silk
-pub struct Resource<'a>
-```
-
-A caller-supplied schema and its absolute retrieval URI; the tree remains caller-owned.
-
-<a id="Resource.uri"></a>
-
-### Field `uri`
-
-```silk
-pub uri: string<'a>
-```
-
-Absolute retrieval URI, without a fragment.
-
-<a id="Resource.schema"></a>
-
-### Field `schema`
-
-```silk
-pub schema: &'a Value
-```
-
-Immutable schema tree to register.
 
 <a id="SchemaReason"></a>
 
@@ -383,12 +353,12 @@ Failed keyword evaluations; empty when `valid` is true.
 pub struct CompiledSchema<'a>
 ```
 
-An indexed schema whose references have been resolved. It borrows all input schema trees.
+An indexed schema that borrows its root and owns all resolved external document trees.
 
 ### Gotchas
 
-Keep the root and every registered schema tree alive and immutable for this value's lifetime.
-A compiled schema can validate multiple instances without recompiling its resource graph.
+Keep only the root tree alive and immutable for this value's lifetime. The resolver and
+its inputs may be dropped after compilation. Validation never requires a resolver.
 
 <a id="Schema"></a>
 
@@ -424,22 +394,25 @@ Returns options for `draft`, with format and content assertions disabled.
 
 ```silk
 pub effect fn compile<'a>(schema: &'a Value, baseUri: string,
-    resources: &[Resource<'a>], options: Options) -> CompiledSchema<'a>
-    ! SchemaError | RegexError | OutOfMemoryError ? &mut Allocator
+    options: Options) -> CompiledSchema<'a>
+    ! SchemaError | SchemaResolutionError | RegexError | OutOfMemoryError
+    ? &mut SchemaResolver | &mut Allocator
 ```
 
-Validates and indexes a root schema and supplied external resources.
+Validates and indexes a root schema, resolving external documents through `SchemaResolver`.
 
 #### Details
 
 `baseUri` is the absolute retrieval URI of the root. An empty URI gives the root an
-anonymous local base. `$schema` overrides `options.draft`. External resources and custom
-metaschemas must be supplied explicitly; no URI is fetched automatically.
+anonymous local base. `$schema` overrides `options.draft`. The caller must provide a
+`SchemaResolver`, including for custom metaschemas. Each retrieval URI is requested once;
+resolved trees are owned by the result, and the root remains borrowed.
 
 #### Errors
 
 - `SchemaError` for an invalid schema, dialect, vocabulary, identifier, or reference.
 - `RegexError` for an invalid regular expression in a schema.
+- `SchemaResolutionError` for operational resolver failures, propagated unchanged.
 - `OutOfMemoryError` if schema indexing cannot allocate storage.
 
 <a id="Schema.impl.validate"></a>

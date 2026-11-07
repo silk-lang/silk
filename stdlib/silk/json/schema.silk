@@ -2,15 +2,18 @@
 //!
 //! # Details
 //!
-//! Supports drafts 4, 6, 7, 2019-09, and 2020-12. Resources are supplied by the caller;
-//! compilation and validation never perform network or filesystem access. Parse source with
-//! `Json.parseExact` or `SchemaValue.parseToml`, then retain the trees while using the
-//! compiled schema. Formats are annotations unless assertion is explicitly enabled.
+//! Supports drafts 4, 6, 7, 2019-09, and 2020-12. Compilation requests external documents
+//! through the caller's `SchemaResolver`; this module performs no filesystem or network I/O.
+//! Parse the root with `Json.parseExact` or `SchemaValue.parseToml` and keep it alive while using
+//! the compiled schema. Formats are annotations unless assertion is explicitly enabled.
 //!
 //! @category Data formats
 
 import silk.json.value { Json, Value, JsonEntry, JsonNumber }
 import silk.json.schema_format { SchemaFormat }
+import silk.json.schema_resolver { SchemaResolver, SchemaResolutionError }
+import silk.mem.box { Box }
+import silk.mem.pointer { Pointer }
 import silk.json.scanner { JsonScanner, JsonToken, JsonError }
 import silk.encoding.base64 { Base64, Base64Error }
 import silk.text.regex { Regex, RegexError, Pattern }
@@ -56,13 +59,6 @@ pub struct Options {
 }
 impl Copy for Options {}
 
-/// A caller-supplied schema and its absolute retrieval URI; the tree remains caller-owned.
-pub struct Resource<'a> {
-  /// Absolute retrieval URI, without a fragment.
-  pub uri: string<'a>,
-  /// Immutable schema tree to register.
-  pub schema: &'a Value,
-}
 
 /// The kind of schema, dialect, or reference error; instance failures use `Output` instead.
 pub enum SchemaReason {
@@ -116,8 +112,8 @@ pub struct Output {
   pub errors: List<Diagnostic>,
 }
 
-struct Node<'a> {
-  value: &'a Value,
+struct Node {
+  value: *const Value,
   path: String,
   base: String,
   resource: usize,
@@ -139,15 +135,28 @@ struct Node<'a> {
   recursiveReference: usize,
 }
 struct Alias { uri: String, node: usize, dynamic: bool }
+struct Retrieved { uri: String, value: Option<*const Value> }
 
-/// An indexed schema whose references have been resolved. It borrows all input schema trees.
+// Nodes never escape their CompiledSchema. Their pointers address the immutable borrowed root
+// or immutable descendants of boxed resolved documents. Moving the compiled value, its lists,
+// or a Box handle never moves those trees. No document is removed or mutated after admission.
+// During compilation pointer-local anchors allow appending metadata/boxes without borrowing
+// the entire compiled index; the pointed-to tree remains alive and immutable throughout.
+fn nodeValue<'node>(node: &'node Node) -> &'node Value {
+  return unsafe Pointer.borrow<Node, Value>(node, node.value)
+}
+
+/// An indexed schema that borrows its root and owns all resolved external document trees.
 ///
 /// # Gotchas
 ///
-/// Keep the root and every registered schema tree alive and immutable for this value's lifetime.
-/// A compiled schema can validate multiple instances without recompiling its resource graph.
+/// Keep only the root tree alive and immutable for this value's lifetime. The resolver and
+/// its inputs may be dropped after compilation. Validation never requires a resolver.
 pub struct CompiledSchema<'a> {
-  nodes: List<Node<'a>>,
+  root: &'a Value,
+  documents: List<Box<Value>>,
+  retrieved: List<Retrieved>,
+  nodes: List<Node>,
   aliases: List<Alias>,
   options: Options,
 }
@@ -161,42 +170,46 @@ impl Schema {
     return Options { draft: draft, assertFormats: false, assertContent: false }
   }
 
-  /// Validates and indexes a root schema and supplied external resources.
+  /// Validates and indexes a root schema, resolving external documents through `SchemaResolver`.
   ///
   /// # Details
   ///
   /// `baseUri` is the absolute retrieval URI of the root. An empty URI gives the root an
-  /// anonymous local base. `$schema` overrides `options.draft`. External resources and custom
-  /// metaschemas must be supplied explicitly; no URI is fetched automatically.
+  /// anonymous local base. `$schema` overrides `options.draft`. The caller must provide a
+  /// `SchemaResolver`, including for custom metaschemas. Each retrieval URI is requested once;
+  /// resolved trees are owned by the result, and the root remains borrowed.
   ///
   /// # Errors
   ///
   /// - `SchemaError` for an invalid schema, dialect, vocabulary, identifier, or reference.
   /// - `RegexError` for an invalid regular expression in a schema.
+  /// - `SchemaResolutionError` for operational resolver failures, propagated unchanged.
   /// - `OutOfMemoryError` if schema indexing cannot allocate storage.
   pub effect fn compile<'a>(schema: &'a Value, baseUri: string,
-    resources: &[Resource<'a>], options: Options) -> CompiledSchema<'a>
-    ! SchemaError | RegexError | OutOfMemoryError ? &mut Allocator {
+    options: Options) -> CompiledSchema<'a>
+    ! SchemaError | SchemaResolutionError | RegexError | OutOfMemoryError
+    ? &mut SchemaResolver | &mut Allocator {
     let mut compiled = CompiledSchema<'a> {
-      nodes: List<Node<'a>>.make(), aliases: List<Alias>.make(), options: options,
+      root: schema, documents: List<Box<Value>>.make(), retrieved: List<Retrieved>.make(),
+      nodes: List<Node>.make(), aliases: List<Alias>.make(), options: options,
     }
     let mut base = baseUri
     if base == "" { base = "urn:silk:json-schema:root" }
     run checkAbsolute(base, "")
+    run List<Retrieved>.append(&mut compiled.retrieved, Retrieved {
+      uri: run String.copy(withoutFragment(base)),
+      value: Option<*const Value>.some(Pointer.fromRef<Value>(schema)),
+    })
     let root = run indexSchema(&mut compiled, schema, "", base, usize.MAX,
-      usize.MAX, options.draft, resources)
+      usize.MAX, options.draft)
     run addAlias(&mut compiled, base, root, false)
     let mut i = usize.ZERO
-    while i < resources.length {
-      run checkAbsolute(resources[i].uri, "")
-      i = i + usize.ONE
-    }
-    i = usize.ZERO
-    while i < List<Node<'a>>.length(&compiled.nodes) {
-      let source = List<Node<'a>>.asSlice(&compiled.nodes)[i].value
-      let baseCopy = run String.copy(String.view(&List<Node<'a>>.asSlice(&compiled.nodes)[i].base))
-      let pathCopy = run String.copy(String.view(&List<Node<'a>>.asSlice(&compiled.nodes)[i].path))
-      let draft = List<Node<'a>>.asSlice(&compiled.nodes)[i].draft
+    while i < List<Node>.length(&compiled.nodes) {
+      let sourcePointer = List<Node>.asSlice(&compiled.nodes)[i].value
+      let source = unsafe Pointer.borrow<*const Value, Value>(&sourcePointer, sourcePointer)
+      let baseCopy = run String.copy(String.view(&List<Node>.asSlice(&compiled.nodes)[i].base))
+      let pathCopy = run String.copy(String.view(&List<Node>.asSlice(&compiled.nodes)[i].path))
+      let draft = List<Node>.asSlice(&compiled.nodes)[i].draft
       let mut reference = usize.MAX
       let mut dynamicReference = usize.MAX
       let mut recursiveReference = usize.MAX
@@ -205,19 +218,19 @@ impl Schema {
       if hasField(source, "$ref") {
         let referencePath = run pointer(String.view(&pathCopy), "$ref")
         reference = run resolveReference(&mut compiled, String.view(&baseCopy), refText,
-          String.view(&referencePath), resources)
+          String.view(&referencePath))
       }
       if draft == Draft.Draft202012 && hasField(source, "$dynamicRef") {
         let referencePath = run pointer(String.view(&pathCopy), "$dynamicRef")
         dynamicReference = run resolveReference(&mut compiled, String.view(&baseCopy),
-          textField(source, "$dynamicRef"), String.view(&referencePath), resources)
+          textField(source, "$dynamicRef"), String.view(&referencePath))
         dynamicName = run decodeFragment(fragment(textField(source, "$dynamicRef")),
           String.view(&referencePath))
       }
       if draft == Draft.Draft201909 && hasField(source, "$recursiveRef") {
         let referencePath = run pointer(String.view(&pathCopy), "$recursiveRef")
         recursiveReference = run resolveReference(&mut compiled, String.view(&baseCopy),
-          textField(source, "$recursiveRef"), String.view(&referencePath), resources)
+          textField(source, "$recursiveRef"), String.view(&referencePath))
       }
       let mut meta = usize.MAX
       if hasField(source, "$schema") {
@@ -227,11 +240,11 @@ impl Schema {
           Option<Draft>.None => {
             let referencePath = run pointer(String.view(&pathCopy), "$schema")
             meta = run resolveReference(&mut compiled, String.view(&baseCopy), metaUri,
-              String.view(&referencePath), resources)
+              String.view(&referencePath))
           }
         }
       }
-      let node = &mut List<Node<'a>>.asMutSlice(&mut compiled.nodes)[i]
+      let node = &mut List<Node>.asMutSlice(&mut compiled.nodes)[i]
       node.reference = reference
       node.dynamicReference = dynamicReference
       node.dynamicName = move dynamicName
@@ -240,11 +253,11 @@ impl Schema {
       i = i + usize.ONE
     }
     i = usize.ZERO
-    while i < List<Node<'a>>.length(&compiled.nodes) {
-      let node = &List<Node<'a>>.asSlice(&compiled.nodes)[i]
+    while i < List<Node>.length(&compiled.nodes) {
+      let node = &List<Node>.asSlice(&compiled.nodes)[i]
       if node.meta != usize.MAX {
         let mut context = Context { active: List<Frame>.make(), scope: List<usize>.make() }
-        let checked = run evaluate(&compiled, node.meta, node.value, "", "", &mut context)
+        let checked = run evaluate(&compiled, node.meta, nodeValue(node), "", "", &mut context)
         if !checked.valid {
           fail run problem(SchemaReason.InvalidSchema, String.view(&node.path),
             "schema does not satisfy its declared metaschema")
@@ -252,6 +265,8 @@ impl Schema {
       }
       i = i + usize.ONE
     }
+    // Retrieval keys are compilation-only; the pinned documents remain owned for validation.
+    compiled.retrieved = List<Retrieved>.make()
     return move compiled
   }
 
@@ -467,41 +482,84 @@ fn builtinDialect(uri: string) -> Option<Draft> {
   return Option<Draft>.none()
 }
 
-fn registrySchema<'a>(resources: &[Resource<'a>], uri: string) -> Option<&'a Value> {
-  if uri == "" { return Option<&'a Value>.none() }
+effect fn retrieve(compiled: &mut CompiledSchema, uri: string, path: string)
+  -> Option<*const Value> ! SchemaError | SchemaResolutionError | OutOfMemoryError
+  ? &mut SchemaResolver | &mut Allocator {
+  if uri == "" { return Option<*const Value>.none() }
+  let documentUri = withoutFragment(uri)
+  run checkAbsolute(documentUri, path)
+  let indexed = aliasNode(&compiled.*, documentUri)
+  if indexed != usize.MAX {
+    return Option<*const Value>.some(List<Node>.asSlice(&compiled.nodes)[indexed].value)
+  }
+  let entries = List<Retrieved>.asSlice(&compiled.retrieved)
   let mut i = usize.ZERO
-  while i < resources.length {
-    if withoutFragment(resources[i].uri) == withoutFragment(uri) ||
-        withoutFragment(textField(resources[i].schema, "$id")) == withoutFragment(uri) ||
-        withoutFragment(textField(resources[i].schema, "id")) == withoutFragment(uri) {
-      return Option<&'a Value>.some(resources[i].schema)
+  while i < entries.length {
+    if String.view(&entries[i].uri) == documentUri { return entries[i].value }
+    i = i + usize.ONE
+  }
+  // A metaschema may be fetched to select a dialect before its graph is indexed. Recognize
+  // its absolute identifier here too, so a subsequent canonical-URI request reuses the tree.
+  i = usize.ZERO
+  while i < entries.length {
+    match entries[i].value {
+      Option<*const Value>.Some { value: address } => {
+        let tree = unsafe Pointer.borrow<*const Value, Value>(&address, address)
+        if withoutFragment(textField(tree, "$id")) == documentUri ||
+            withoutFragment(textField(tree, "id")) == documentUri {
+          return Option<*const Value>.some(address)
+        }
+      }
+      Option<*const Value>.None => {}
     }
     i = i + usize.ONE
   }
-  return Option<&'a Value>.none()
+  let fetched = run SchemaResolver.resolve(documentUri)
+  let resolved = match move fetched {
+    Option<Value>.Some { value } => {
+      let boxed = run Box<Value>.make(move value)
+      let address = Pointer.fromRef<Value>(&Box<Value>.get(&boxed)[0])
+      run List<Box<Value>>.append(&mut compiled.documents, move boxed)
+      Option<*const Value>.some(address)
+    }
+    Option<Value>.None => Option<*const Value>.none()
+  }
+  run List<Retrieved>.append(&mut compiled.retrieved, Retrieved {
+    uri: run String.copy(documentUri), value: resolved,
+  })
+  return resolved
 }
 
-effect fn dialect<'a>(schema: &'a Value, inherited: Draft, resources: &[Resource<'a>], path: string) -> Draft
-  ! SchemaError | OutOfMemoryError ? &mut Allocator {
+effect fn dialect(compiled: &mut CompiledSchema, schema: &Value, inherited: Draft,
+  base: string, path: string) -> Draft
+  ! SchemaError | SchemaResolutionError | OutOfMemoryError ? &mut SchemaResolver | &mut Allocator {
   if !hasField(schema, "$schema") { return inherited }
-  let mut uri = textField(schema, "$schema")
-  let mut hops = usize.ZERO
+  let mut uri = run resolveUri(base, textField(schema, "$schema"), path)
+  let mut visited = List<*const Value>.make()
   while true {
-    match move builtinDialect(uri) {
+    match move builtinDialect(String.view(&uri)) {
       Option<Draft>.Some { value } => { return value }
       Option<Draft>.None => {}
     }
-    if hops > resources.length {
-      fail run problem(SchemaReason.UnknownDialect, path, uri)
-    }
-    match move registrySchema(resources, uri) {
-      Option<&Value>.Some { value } => {
-        uri = textField(value, "$schema")
-        if uri == "" { fail run problem(SchemaReason.UnknownDialect, path, uri) }
+    let address = match move run retrieve(&mut compiled.*, String.view(&uri), path) {
+      Option<*const Value>.Some { value } => value
+      Option<*const Value>.None => {
+        fail run problem(SchemaReason.UnknownDialect, path, String.view(&uri))
       }
-      Option<&Value>.None => { fail run problem(SchemaReason.UnknownDialect, path, uri) }
     }
-    hops = hops + usize.ONE
+    let seen = List<*const Value>.asSlice(&visited)
+    let mut i = usize.ZERO
+    while i < seen.length {
+      if Pointer.address<Value>(seen[i]) == Pointer.address<Value>(address) {
+        fail run problem(SchemaReason.UnknownDialect, path, String.view(&uri))
+      }
+      i = i + usize.ONE
+    }
+    run List<*const Value>.append(&mut visited, address)
+    let meta = unsafe Pointer.borrow<*const Value, Value>(&address, address)
+    let next = textField(meta, "$schema")
+    if next == "" { fail run problem(SchemaReason.UnknownDialect, path, String.view(&uri)) }
+    uri = run resolveUri(String.view(&uri), next, path)
   }
 }
 
@@ -524,17 +582,24 @@ struct Vocabulary {
   formatEnabled: bool, metadata: bool, content: bool,
 }
 
-effect fn vocabularies(schema: &Value, draft: Draft, resources: &[Resource], path: string)
-  -> Vocabulary ! SchemaError | OutOfMemoryError ? &mut Allocator {
+effect fn vocabularies(compiled: &mut CompiledSchema, schema: &Value, draft: Draft,
+  base: string, path: string) -> Vocabulary
+  ! SchemaError | SchemaResolutionError | OutOfMemoryError ? &mut SchemaResolver | &mut Allocator {
   let mut result = Vocabulary {
     validation: true, applicator: true, unevaluated: true, format: false,
     formatEnabled: true, metadata: true, content: true,
   }
-  if !modern(draft) { return move result }
-  let meta = match move registrySchema(resources, textField(schema, "$schema")) {
-    Option<&Value>.Some { value } => value
-    Option<&Value>.None => { return move result }
+  if !modern(draft) || !hasField(schema, "$schema") { return move result }
+  let metaUri = run resolveUri(base, textField(schema, "$schema"), path)
+  match move builtinDialect(String.view(&metaUri)) {
+    Option<Draft>.Some { .. } => { return move result }
+    Option<Draft>.None => {}
   }
+  let address = match move run retrieve(&mut compiled.*, String.view(&metaUri), path) {
+    Option<*const Value>.Some { value } => value
+    Option<*const Value>.None => { return move result }
+  }
+  let meta = unsafe Pointer.borrow<*const Value, Value>(&address, address)
   let declaration = match move Json.field(meta, "$vocabulary") {
     Option<&Value>.Some { value } => value
     Option<&Value>.None => { return move result }
@@ -623,10 +688,11 @@ fn nodeAt(compiled: &CompiledSchema, document: usize, path: string) -> usize {
   return usize.MAX
 }
 
-effect fn indexSchema<'a>(compiled: &mut CompiledSchema<'a>, value: &'a Value,
+effect fn indexSchema(compiled: &mut CompiledSchema, value: &Value,
   path: string, inheritedBase: string, inheritedResource: usize, inheritedDocument: usize,
-  inheritedDraft: Draft, resources: &[Resource<'a>]) -> usize
-  ! SchemaError | RegexError | OutOfMemoryError ? &mut Allocator {
+  inheritedDraft: Draft) -> usize
+  ! SchemaError | SchemaResolutionError | RegexError | OutOfMemoryError
+  ? &mut SchemaResolver | &mut Allocator {
   if inheritedDocument == usize.MAX && !finiteTree(value) {
     fail run problem(SchemaReason.InvalidSchema, path, "schema contains a non-finite number")
   }
@@ -634,7 +700,7 @@ effect fn indexSchema<'a>(compiled: &mut CompiledSchema<'a>, value: &'a Value,
     let existing = nodeAt(&compiled.*, inheritedDocument, path)
     if existing != usize.MAX { return existing }
   }
-  let selected = run dialect(value, inheritedDraft, resources, path)
+  let selected = run dialect(&mut compiled.*, value, inheritedDraft, inheritedBase, path)
   // Draft 4 allows booleans only in the two "additional" keywords. Their parent validates
   // that position before indexing; root resources still require an object.
   let indexedBoolean = inheritedDocument != usize.MAX &&
@@ -642,7 +708,7 @@ effect fn indexSchema<'a>(compiled: &mut CompiledSchema<'a>, value: &'a Value,
   if !schemaShape(value, selected) && !indexedBoolean {
     fail run problem(SchemaReason.InvalidSchema, path, "expected a schema object or boolean")
   }
-  let index = List<Node<'a>>.length(&compiled.nodes)
+  let index = List<Node>.length(&compiled.nodes)
   let document = if inheritedDocument == usize.MAX { index } else { inheritedDocument }
   let mut resource = if inheritedResource == usize.MAX { index } else { inheritedResource }
   let idKey = if selected == Draft.Draft4 { "id" } else { "$id" }
@@ -661,9 +727,9 @@ effect fn indexSchema<'a>(compiled: &mut CompiledSchema<'a>, value: &'a Value,
     }
     if fragment(String.view(&base)) == "" { resource = index }
   }
-  let mut vocabulary = run vocabularies(value, selected, resources, path)
+  let mut vocabulary = run vocabularies(&mut compiled.*, value, selected, String.view(&base), path)
   if !hasField(value, "$schema") && inheritedResource != usize.MAX {
-    let ancestor = &List<Node<'a>>.asSlice(&compiled.nodes)[inheritedResource]
+    let ancestor = &List<Node>.asSlice(&compiled.nodes)[inheritedResource]
     vocabulary.validation = ancestor.validation
     vocabulary.applicator = ancestor.applicator
     vocabulary.unevaluated = ancestor.unevaluated
@@ -697,8 +763,8 @@ effect fn indexSchema<'a>(compiled: &mut CompiledSchema<'a>, value: &'a Value,
       }
     }
   }
-  run List<Node<'a>>.append(&mut compiled.nodes, Node<'a> {
-    value: value, path: run String.copy(path), base: run String.copy(String.view(&base)),
+  run List<Node>.append(&mut compiled.nodes, Node {
+    value: Pointer.fromRef<Value>(value), path: run String.copy(path), base: run String.copy(String.view(&base)),
     resource: resource, document: document, draft: selected,
     validation: vocabulary.validation, applicator: vocabulary.applicator,
     unevaluated: vocabulary.unevaluated, formatAssertion: vocabulary.format,
@@ -733,7 +799,7 @@ effect fn indexSchema<'a>(compiled: &mut CompiledSchema<'a>, value: &'a Value,
         let kind = schemaChildren(key, child, selected, &vocabulary)
         if kind == 1 {
           let ignored = run indexSchema(&mut compiled.*, child, String.view(&childPath),
-            String.view(&base), resource, document, selected, resources)
+            String.view(&base), resource, document, selected)
         } else if kind == 2 {
           match &child.* {
             Value.Object { entries: nested } => {
@@ -743,7 +809,7 @@ effect fn indexSchema<'a>(compiled: &mut CompiledSchema<'a>, value: &'a Value,
                 if key != "dependencies" || !isArray(&members[j].value) {
                   let memberPath = run pointer(String.view(&childPath), String.view(&members[j].key))
                   let ignored = run indexSchema(&mut compiled.*, &members[j].value, String.view(&memberPath),
-                    String.view(&base), resource, document, selected, resources)
+                    String.view(&base), resource, document, selected)
                 }
                 j = j + usize.ONE
               }
@@ -759,7 +825,7 @@ effect fn indexSchema<'a>(compiled: &mut CompiledSchema<'a>, value: &'a Value,
                 let token = run indexText(j)
                 let memberPath = run pointer(String.view(&childPath), String.view(&token))
                 let ignored = run indexSchema(&mut compiled.*, &members[j], String.view(&memberPath),
-                  String.view(&base), resource, document, selected, resources)
+                  String.view(&base), resource, document, selected)
                 j = j + usize.ONE
               }
             }
@@ -1088,9 +1154,10 @@ fn arrayIndex(token: string) -> usize {
   }
 }
 
-effect fn resolveReference<'a>(compiled: &mut CompiledSchema<'a>, base: string,
-  reference: string, path: string, resources: &[Resource<'a>]) -> usize
-  ! SchemaError | RegexError | OutOfMemoryError ? &mut Allocator {
+effect fn resolveReference(compiled: &mut CompiledSchema, base: string,
+  reference: string, path: string) -> usize
+  ! SchemaError | SchemaResolutionError | RegexError | OutOfMemoryError
+  ? &mut SchemaResolver | &mut Allocator {
   let resolved = run resolveUri(base, reference, path)
   let uri = String.view(&resolved)
   let existing = aliasNode(&compiled.*, uri)
@@ -1098,15 +1165,28 @@ effect fn resolveReference<'a>(compiled: &mut CompiledSchema<'a>, base: string,
   let documentUri = withoutFragment(uri)
   let mut root = aliasNode(&compiled.*, documentUri)
   if root == usize.MAX {
-    let external = match move registrySchema(resources, documentUri) {
-      Option<&Value>.Some { value } => value
-      Option<&Value>.None => {
+    let address = match move run retrieve(&mut compiled.*, documentUri, path) {
+      Option<*const Value>.Some { value } => value
+      Option<*const Value>.None => {
         fail run problem(SchemaReason.UnresolvedReference, path, uri)
       }
     }
-    let fallbackDraft = compiled.options.draft
-    root = run indexSchema(&mut compiled.*, external, "", documentUri, usize.MAX, usize.MAX,
-      fallbackDraft, resources)
+    // A cached document can already be indexed under its canonical identifier.
+    let indexed = List<Node>.asSlice(&compiled.nodes)
+    let mut i = usize.ZERO
+    while i < indexed.length {
+      if Pointer.address<Value>(indexed[i].value) == Pointer.address<Value>(address) {
+        root = i
+        break
+      }
+      i = i + usize.ONE
+    }
+    if root == usize.MAX {
+      let external = unsafe Pointer.borrow<*const Value, Value>(&address, address)
+      let fallbackDraft = compiled.options.draft
+      root = run indexSchema(&mut compiled.*, external, "", documentUri, usize.MAX, usize.MAX,
+        fallbackDraft)
+    }
     run addAlias(&mut compiled.*, documentUri, root, false)
   }
   let fragmentText = run decodeFragment(fragment(uri), path)
@@ -1120,10 +1200,11 @@ effect fn resolveReference<'a>(compiled: &mut CompiledSchema<'a>, base: string,
     if anchored != usize.MAX { return anchored }
     fail run problem(SchemaReason.UnresolvedReference, path, uri)
   }
-  let rootNode = &List<Node<'a>>.asSlice(&compiled.nodes)[root]
+  let rootNode = &List<Node>.asSlice(&compiled.nodes)[root]
   let document = rootNode.document
   let selected = rootNode.draft
-  let mut current = rootNode.value
+  let address = rootNode.value
+  let mut current = unsafe Pointer.borrow<*const Value, Value>(&address, address)
   let mut currentPath = run String.copy(String.view(&rootNode.path))
   let mut ancestor = root
   let bytes = String.utf8Bytes(pointerText)
@@ -1155,12 +1236,12 @@ effect fn resolveReference<'a>(compiled: &mut CompiledSchema<'a>, base: string,
   if !schemaShape(current, selected) {
     fail run problem(SchemaReason.InvalidReference, path, uri)
   }
-  let ancestorNode = &List<Node<'a>>.asSlice(&compiled.nodes)[ancestor]
+  let ancestorNode = &List<Node>.asSlice(&compiled.nodes)[ancestor]
   let inheritedBase = run String.copy(String.view(&ancestorNode.base))
   let inheritedResource = ancestorNode.resource
   let inheritedDraft = ancestorNode.draft
   return run indexSchema(&mut compiled.*, current, String.view(&currentPath),
-    String.view(&inheritedBase), inheritedResource, document, inheritedDraft, resources)
+    String.view(&inheritedBase), inheritedResource, document, inheritedDraft)
 }
 
 struct Evaluation {
@@ -1393,7 +1474,7 @@ effect fn assertions(compiled: &CompiledSchema, index: usize, instance: &Value,
   ! RegexError | OutOfMemoryError ? &mut Allocator {
   let node = &List<Node>.asSlice(&compiled.nodes)[index]
   if !node.validation { return }
-  let schema = node.value
+  let schema = nodeValue(node)
   if node.draft == Draft.Draft7 && compiled.options.assertContent {
     match &instance.* {
       Value.String { text } => {
@@ -1534,7 +1615,7 @@ fn dynamicTarget(compiled: &CompiledSchema, source: usize, target: usize, contex
   let nodes = List<Node>.asSlice(&compiled.nodes)
   let name = String.view(&nodes[source].dynamicName)
   if name == "" || String.startsWith(name, "/") ||
-      textField(nodes[target].value, "$dynamicAnchor") != name { return target }
+      textField(nodeValue(&nodes[target]), "$dynamicAnchor") != name { return target }
   let scope = List<usize>.asSlice(&context.scope)
   let aliases = List<Alias>.asSlice(&compiled.aliases)
   let mut i = usize.ZERO
@@ -1552,13 +1633,13 @@ fn dynamicTarget(compiled: &CompiledSchema, source: usize, target: usize, contex
 
 fn recursiveTarget(compiled: &CompiledSchema, target: usize, context: &Context) -> usize {
   let nodes = List<Node>.asSlice(&compiled.nodes)
-  if !flag(nodes[target].value, "$recursiveAnchor") { return target }
+  if !flag(nodeValue(&nodes[target]), "$recursiveAnchor") { return target }
   let scope = List<usize>.asSlice(&context.scope)
   let mut result = target
   let mut i = scope.length
   while i != usize.ZERO {
     i = i - usize.ONE
-    if !flag(nodes[scope[i]].value, "$recursiveAnchor") { break }
+    if !flag(nodeValue(&nodes[scope[i]]), "$recursiveAnchor") { break }
     result = scope[i]
   }
   return result
@@ -1587,7 +1668,7 @@ effect fn evaluate(compiled: &CompiledSchema, index: usize, instance: &Value,
     run List<usize>.append(&mut context.scope, node.resource)
   }
   let mut result = successful()
-  if !boolean(node.value, true) {
+  if !boolean(nodeValue(node), true) {
     run reject(&mut result, compiled, index, evaluationPath, instancePath, "",
       "boolean schema is false")
   }
@@ -1611,9 +1692,9 @@ effect fn evaluate(compiled: &CompiledSchema, index: usize, instance: &Value,
       run combine(&mut result, move reference, true)
     }
     run assertions(compiled, index, instance, instancePath, evaluationPath, &mut result)
-    if node.formatEnabled && hasField(node.value, "format") &&
+    if node.formatEnabled && hasField(nodeValue(node), "format") &&
         (compiled.options.assertFormats || node.formatAssertion) {
-      let name = textField(node.value, "format")
+      let name = textField(nodeValue(node), "format")
       if node.formatAssertion && !SchemaFormat.known(name) {
         run reject(&mut result, compiled, index, evaluationPath, instancePath,
           "format", "format-assertion vocabulary does not recognize the format")
@@ -1656,7 +1737,7 @@ effect fn branches(compiled: &CompiledSchema, index: usize, instance: &Value,
   let mut k = usize.ZERO
   while k < 3 {
     let keyword = keywords[k]
-    match move Json.field(node.value, keyword) {
+    match move Json.field(nodeValue(node), keyword) {
       Option<&Value>.Some { value } => match &value.* {
         Value.Array { values } => {
           let mut collected = successful()
@@ -1691,7 +1772,7 @@ effect fn branches(compiled: &CompiledSchema, index: usize, instance: &Value,
     }
     k = k + usize.ONE
   }
-  if hasField(node.value, "not") {
+  if hasField(nodeValue(node), "not") {
     let negated = run applyChild(compiled, index, "not", "", false, instance,
       instancePath, evaluationPath, &mut context.*)
     if negated.valid {
@@ -1699,12 +1780,12 @@ effect fn branches(compiled: &CompiledSchema, index: usize, instance: &Value,
         "negated subschema validates")
     }
   }
-  if node.draft != Draft.Draft4 && node.draft != Draft.Draft6 && hasField(node.value, "if") {
+  if node.draft != Draft.Draft4 && node.draft != Draft.Draft6 && hasField(nodeValue(node), "if") {
     let condition = run applyChild(compiled, index, "if", "", false, instance,
       instancePath, evaluationPath, &mut context.*)
     run annotations(&mut result.*, &condition)
     let keyword = if condition.valid { "then" } else { "else" }
-    if hasField(node.value, keyword) {
+    if hasField(nodeValue(node), keyword) {
       let branch = run applyChild(compiled, index, keyword, "", false, instance,
         instancePath, evaluationPath, &mut context.*)
       run combine(&mut result.*, move branch, true)
@@ -1714,7 +1795,7 @@ effect fn branches(compiled: &CompiledSchema, index: usize, instance: &Value,
 
 effect fn matchedProperty(node: &Node, name: string) -> bool
   ! RegexError | OutOfMemoryError ? &mut Allocator {
-  match move Json.field(node.value, "properties") {
+  match move Json.field(nodeValue(node), "properties") {
     Option<&Value>.Some { value } => { if hasField(value, name) { return true } }
     Option<&Value>.None => {}
   }
@@ -1735,7 +1816,7 @@ effect fn objectKeywords(compiled: &CompiledSchema, index: usize, instance: &Val
     _ => { return }
   }
   let node = &List<Node>.asSlice(&compiled.nodes)[index]
-  let schema = node.value
+  let schema = nodeValue(node)
   let keywords = ["properties", "patternProperties"]
   let mut k = usize.ZERO
   while k < 2 {
@@ -1808,7 +1889,7 @@ effect fn objectKeywords(compiled: &CompiledSchema, index: usize, instance: &Val
 effect fn dependencies(compiled: &CompiledSchema, index: usize, dependencyKeyword: string,
   instance: &Value, instancePath: string, evaluationPath: string, context: &mut Context,
   result: &mut Evaluation) -> () ! SchemaError | RegexError | OutOfMemoryError ? &mut Allocator {
-  let schema = List<Node>.asSlice(&compiled.nodes)[index].value
+  let schema = nodeValue(&List<Node>.asSlice(&compiled.nodes)[index])
   match move Json.field(schema, dependencyKeyword) {
     Option<&Value>.Some { value } => match &value.* {
       Value.Object { entries } => {
@@ -1845,7 +1926,7 @@ effect fn arrayKeywords(compiled: &CompiledSchema, index: usize, instance: &Valu
     _ => { return }
   }
   let node = &List<Node>.asSlice(&compiled.nodes)[index]
-  let schema = node.value
+  let schema = nodeValue(node)
   let tupleKeyword = if node.draft == Draft.Draft202012 { "prefixItems" } else { "items" }
   let mut tupleLength = usize.ZERO
   let mut tupleItems = false
@@ -1925,7 +2006,7 @@ effect fn arrayKeywords(compiled: &CompiledSchema, index: usize, instance: &Valu
 effect fn unevaluatedKeywords(compiled: &CompiledSchema, index: usize, instance: &Value,
   instancePath: string, evaluationPath: string, context: &mut Context, result: &mut Evaluation)
   -> () ! SchemaError | RegexError | OutOfMemoryError ? &mut Allocator {
-  let schema = List<Node>.asSlice(&compiled.nodes)[index].value
+  let schema = nodeValue(&List<Node>.asSlice(&compiled.nodes)[index])
   match &instance.* {
     Value.Object { entries } => {
       if !hasField(schema, "unevaluatedProperties") { return }

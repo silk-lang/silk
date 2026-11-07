@@ -1,0 +1,426 @@
+//! Structural manifest diagnostics from the embedded Draft 2020-12 schema.
+//! TOML syntax uses `TOML`; schema and JSON data-model failures use `MANIFEST_SCHEMA`.
+//! The root `tool` member is deliberately excluded before conversion: its TOML values are opaque.
+
+import CompilerBug
+import driver.ManifestText
+import lexer.Span { Span }
+import silk.build.source { Source }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.json.schema { Schema, Draft, Output, SchemaError, Diagnostic as SchemaDiagnostic }
+import silk.json.schema_resolver { SchemaResolver, SchemaRegistry, SchemaResolutionError }
+import silk.json.schema_value { SchemaValue, ValueError }
+import silk.json.value { Value, JsonEntry }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.box { Box }
+import silk.num.usize
+import silk.text.regex { RegexError }
+import silk.text.string { String }
+import silk.toml.scanner { TomlError, TomlScanner, TomlToken }
+import silk.toml.text { TomlText }
+import silk.toml.value { Toml, Value as TomlValue, TomlChild }
+
+/// One user-facing manifest refusal, with a half-open byte range in the original TOML.
+/// Existing instance values select their tokens; missing fields select the containing table.
+/// `propertyNames` failures select the containing object, as JSON Schema basic output does not
+/// identify the offending property. Syntax uses `TOML`, other user invalidity `MANIFEST_SCHEMA`.
+pub struct Diagnostic {
+  pub span: Span,
+  pub code: Bytes,
+  pub message: Bytes,
+}
+
+/// Parses once and diagnoses syntax or manifest structure. Only allocation failure escapes.
+pub effect fn diagnose(text: &[u8]) -> List<Diagnostic> ! OutOfMemoryError ? &mut Allocator {
+  let parsed = run Effect.result(Toml.parse(text))
+  return match move parsed {
+    Result<TomlValue, TomlError | OutOfMemoryError>.Success { value } => run validate(text, &value)
+    Result<TomlValue, TomlError | OutOfMemoryError>.Failure { error } => match move error {
+      TomlError problem => {
+        let mut diagnostics = List<Diagnostic>.make()
+        let mut message = Bytes.make()
+        run ManifestText.appendTomlReason(&mut message, text, &problem)
+        let mut end = problem.offset
+        if end < text.length { end = end + 1 }
+        run List<Diagnostic>.append(&mut diagnostics, Diagnostic {
+          span: Span { start: problem.offset, end: end }, code: run Bytes.copy(b"TOML"), message: move message,
+        })
+        move diagnostics
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+/// Validates the already parsed `document` corresponding to `text`, without reparsing TOML.
+/// Numbers retain their exact spelling and magnitude. Nonfinite numbers outside `tool` are
+/// diagnosed as JSON data-model incompatibilities; schema/evaluator faults are compiler bugs.
+pub effect fn validate(text: &[u8], document: &TomlValue) -> List<Diagnostic>
+  ! OutOfMemoryError ? &mut Allocator {
+  let converted = run Effect.result(instance(document))
+  let value = match move converted {
+    Result<Value, ValueError | OutOfMemoryError>.Success { value } => move value
+    Result<Value, ValueError | OutOfMemoryError>.Failure { error } => match move error {
+      OutOfMemoryError exhausted => { fail move exhausted }
+      ValueError problem => { return run conversionDiagnostics(text, problem) }
+    }
+  }
+  let evaluated = run Effect.result(evaluate(&value))
+  let output = match move evaluated {
+    Result<Output, TomlError | ValueError | SchemaError | SchemaResolutionError | RegexError | OutOfMemoryError>.Success { value: result } => move result
+    Result<Output, TomlError | ValueError | SchemaError | SchemaResolutionError | RegexError | OutOfMemoryError>.Failure { error } => match move error {
+      OutOfMemoryError exhausted => { fail move exhausted }
+      _ => CompilerBug.panic(b"embedded manifest schema compilation or evaluation failed")
+    }
+  }
+  let mut diagnostics = List<Diagnostic>.make()
+  if output.valid { return move diagnostics }
+  let locations = run sourceLocations(text)
+  let errors = List<SchemaDiagnostic>.asSlice(&output.errors)
+  let mut at: usize = 0
+  while at < errors.length {
+    let error = &errors[at]
+    let path = String.utf8Bytes(String.view(&error.instanceLocation))
+    let mut message = Bytes.make()
+    if path.length == 0 { run Bytes.append(&mut message, b"manifest") }
+    else { run Bytes.append(&mut message, path) }
+    run Bytes.append(&mut message, b": ")
+    run Bytes.append(&mut message, String.utf8Bytes(String.view(&error.error)))
+    run Bytes.append(&mut message, b" (constraint ")
+    run Bytes.append(&mut message, String.utf8Bytes(String.view(&error.keywordLocation)))
+    run Bytes.append(&mut message, b")")
+    run List<Diagnostic>.append(&mut diagnostics, Diagnostic {
+      span: location(List<Location>.asSlice(&locations), path, text.length),
+      code: run Bytes.copy(b"MANIFEST_SCHEMA"), message: move message,
+    })
+    at = at + 1
+  }
+  return move diagnostics
+}
+
+// The schema borrows its tree; keep it in this frame until evaluation has completed.
+effect fn evaluate(instance: &Value) -> Output
+  ! TomlError | ValueError | SchemaError | SchemaResolutionError | RegexError | OutOfMemoryError ? &mut Allocator {
+  let schema = run SchemaValue.parseToml(Source.read("manifest.schema.toml"))
+  let mut registry = SchemaRegistry.make()
+  let compiled = run Schema.compile(&schema, "https://silklang.org/schemas/manifest",
+    Schema.options(Draft.Draft202012)) |> Effect.provideMut<SchemaResolver>(&mut registry)
+  return run Schema.validate(&compiled, instance)
+}
+
+// Only the manifest-specific opaque member is projected away. All remaining conversion is owned
+// by SchemaValue, including exact integers, decimals, and TOML dates and times.
+effect fn instance(document: &TomlValue) -> Value ! ValueError | OutOfMemoryError ? &mut Allocator {
+  let mut members = List<JsonEntry>.make()
+  match &document.* {
+    TomlValue.Table { entries, .. } => {
+      let boxed = Box<List<TomlChild>>.get(&entries)
+      let children = List<TomlChild>.asSlice(&boxed[0])
+      let mut at: usize = 0
+      while at < children.length {
+        match &children[at] {
+          TomlChild.Member { entry } => {
+            if String.view(&entry.key) != "tool" {
+              let value = run SchemaValue.fromToml(&entry.value)
+              run List<JsonEntry>.append(&mut members, JsonEntry { key: run String.copy(String.view(&entry.key)), value: move value })
+            }
+          }
+          _ => { fail ValueError.InvalidTomlValue }
+        }
+        at = at + 1
+      }
+    }
+    _ => { fail ValueError.InvalidTomlValue }
+  }
+  return Value.Object { entries: move members }
+}
+
+struct Location { path: Bytes, span: Span }
+struct ArrayTable { path: Bytes, index: usize }
+struct Tokens<'a> { scanner: TomlScanner<'a>, token: TomlToken, start: usize, end: usize }
+
+fn next(tokens: &mut Tokens) -> () {
+  tokens.token = match move TomlScanner.next(&mut tokens.scanner) {
+    Result<TomlToken, TomlError>.Success { value } => value
+    Result<TomlToken, TomlError>.Failure {..} => CompilerBug.panic(b"validated TOML cannot be tokenized")
+  }
+  tokens.end = TomlScanner.offset(&tokens.scanner)
+  tokens.start = tokens.end
+  match tokens.token {
+    TomlToken.Text { span } => { tokens.start = span.offset }
+    TomlToken.String { span, .. } => { tokens.start = span.offset }
+    TomlToken.EndOfInput => {}
+    _ => { if tokens.start > 0 { tokens.start = tokens.start - 1 } }
+  }
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at: usize = 0
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + 1
+  }
+  return true
+}
+
+fn prefix(parent: &[u8], child: &[u8]) -> bool {
+  return parent.length <= child.length && same(parent, Slice.view<u8>(child, 0, parent.length))
+    && (parent.length == child.length || child[parent.length] == 47)
+}
+
+effect fn segment(path: &mut Bytes, key: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run Bytes.append(&mut path.*, b"/")
+  let mut at: usize = 0
+  while at < key.length {
+    if key[at] == 126 { run Bytes.append(&mut path.*, b"~0") }
+    else if key[at] == 47 { run Bytes.append(&mut path.*, b"~1") }
+    else { run Bytes.append(&mut path.*, Slice.view<u8>(key, at, 1)) }
+    at = at + 1
+  }
+}
+
+effect fn indexPath(path: &mut Bytes, index: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  run Bytes.append(&mut path.*, b"/")
+  run decimal(&mut path.*, index)
+}
+
+effect fn decimal(out: &mut Bytes, value: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value >= 10 { run decimal(&mut out.*, value / 10) }
+  let digit = [usize.toU8(value % 10) + 48]
+  run Bytes.append(&mut out.*, &digit)
+}
+
+// Consume key tokens, not values. The scanner keeps bare dotted keys in one Text token;
+// quoted components are decoded with the same TomlText implementation as the TOML parser.
+effect fn keys(tokens: &mut Tokens) -> List<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  let mut parts = List<Bytes>.make()
+  while true {
+    match tokens.token {
+      TomlToken.Text { span } => {
+        let text = TomlScanner.slice(&tokens.scanner, span)
+        let mut start: usize = 0
+        let mut at: usize = 0
+        while at <= text.length {
+          if at == text.length || text[at] == 46 {
+            if at > start { run List<Bytes>.append(&mut parts, run Bytes.copy(Slice.view<u8>(text, start, at - start))) }
+            start = at + 1
+          }
+          at = at + 1
+        }
+      }
+      TomlToken.String { span, literal, multiline } => {
+        run List<Bytes>.append(&mut parts, run TomlText.decode(TomlScanner.slice(&tokens.scanner, span), literal, multiline))
+      }
+      TomlToken.Dot => {}
+      _ => { return move parts }
+    }
+    next(&mut tokens.*)
+  }
+}
+
+effect fn remember(locations: &mut List<Location>, path: &[u8], span: Span) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  run List<Location>.append(&mut locations.*, Location { path: run Bytes.copy(path), span: span })
+}
+
+// A later dotted definition must not replace the source of an already explicit parent table.
+effect fn rememberParent(locations: &mut List<Location>, path: &[u8], span: Span) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let existing = List<Location>.asSlice(&locations.*)
+  let mut at: usize = 0
+  while at < existing.length {
+    if same(Bytes.asSlice(&existing[at].path), path) { return }
+    at = at + 1
+  }
+  run remember(&mut locations.*, path, span)
+}
+
+// Records delimiters and scalar token spans, without decoding or reparsing any TOML value.
+effect fn valueLocations(tokens: &mut Tokens, path: &[u8], locations: &mut List<Location>) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let start = tokens.start
+  let mut end = tokens.end
+  match tokens.token {
+    TomlToken.ArrayBegin => {
+      next(&mut tokens.*)
+      let mut index: usize = 0
+      while true {
+        match tokens.token {
+          TomlToken.ArrayEnd => {
+            end = tokens.end
+            next(&mut tokens.*)
+            break
+          }
+          TomlToken.Newline => { next(&mut tokens.*) }
+          TomlToken.Comma => { next(&mut tokens.*) }
+          TomlToken.EndOfInput => { CompilerBug.panic(b"validated TOML array has no closing bracket") }
+          _ => {
+            let mut child = run Bytes.copy(path)
+            run indexPath(&mut child, index)
+            run valueLocations(&mut tokens.*, Bytes.asSlice(&child), &mut locations.*)
+            index = index + 1
+          }
+        }
+      }
+    }
+    TomlToken.InlineBegin => {
+      next(&mut tokens.*)
+      while true {
+        match tokens.token {
+          TomlToken.InlineEnd => {
+            end = tokens.end
+            next(&mut tokens.*)
+            break
+          }
+          TomlToken.Newline => { next(&mut tokens.*) }
+          TomlToken.Comma => { next(&mut tokens.*) }
+          TomlToken.EndOfInput => { CompilerBug.panic(b"validated TOML inline table has no closing brace") }
+          _ => { run assignment(&mut tokens.*, path, &mut locations.*) }
+        }
+      }
+    }
+    _ => { next(&mut tokens.*) }
+  }
+  run remember(&mut locations.*, path, Span { start: start, end: end })
+}
+
+effect fn assignment(tokens: &mut Tokens, table: &[u8], locations: &mut List<Location>) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let start = tokens.start
+  let parts = run keys(&mut tokens.*)
+  let names = List<Bytes>.asSlice(&parts)
+  let keyEnd = tokens.start
+  let mut path = run Bytes.copy(table)
+  let mut at: usize = 0
+  while at < names.length {
+    run segment(&mut path, Bytes.asSlice(&names[at]))
+    if at + 1 < names.length { run rememberParent(&mut locations.*, Bytes.asSlice(&path), Span { start: start, end: keyEnd }) }
+    at = at + 1
+  }
+  match tokens.token {
+    TomlToken.Equals => {}
+    _ => { CompilerBug.panic(b"validated TOML assignment has no equals token") }
+  }
+  next(&mut tokens.*)
+  run valueLocations(&mut tokens.*, Bytes.asSlice(&path), &mut locations.*)
+}
+
+effect fn sourceLocations(text: &[u8]) -> List<Location> ! OutOfMemoryError ? &mut Allocator {
+  let mut tokens = Tokens { scanner: TomlScanner.make(text), token: TomlToken.EndOfInput, start: 0, end: 0 }
+  let mut locations = List<Location>.make()
+  let mut arrays = List<ArrayTable>.make()
+  let mut table = Bytes.make()
+  next(&mut tokens)
+  while true {
+    match tokens.token {
+      TomlToken.EndOfInput => { return move locations }
+      TomlToken.Newline => { next(&mut tokens) }
+      TomlToken.ArrayBegin => {
+        let start = tokens.start
+        next(&mut tokens)
+        let array = match tokens.token { TomlToken.ArrayBegin => true _ => false }
+        if array { next(&mut tokens) }
+        let parts = run keys(&mut tokens)
+        let mut end = tokens.end
+        next(&mut tokens)
+        if array {
+          end = tokens.end
+          next(&mut tokens)
+        }
+        table = Bytes.make()
+        let names = List<Bytes>.asSlice(&parts)
+        let mut at: usize = 0
+        while at < names.length {
+          run segment(&mut table, Bytes.asSlice(&names[at]))
+          if at + 1 == names.length {
+            run remember(&mut locations, Bytes.asSlice(&table), Span { start: start, end: end })
+          } else {
+            run rememberParent(&mut locations, Bytes.asSlice(&table), Span { start: start, end: end })
+          }
+          let mut found = usize.MAX
+          let known = List<ArrayTable>.asSlice(&arrays)
+          let mut i: usize = 0
+          while i < known.length {
+            if same(Bytes.asSlice(&known[i].path), Bytes.asSlice(&table)) {
+              found = i
+              break
+            }
+            i = i + 1
+          }
+          if array && at + 1 == names.length {
+            if found == usize.MAX {
+              found = List<ArrayTable>.length(&arrays)
+              run List<ArrayTable>.append(&mut arrays, ArrayTable { path: run Bytes.copy(Bytes.asSlice(&table)), index: 0 })
+            } else {
+              let stored = List<ArrayTable>.asMutSlice(&mut arrays)
+              stored[found].index = stored[found].index + 1
+            }
+          }
+          if found != usize.MAX {
+            let index = List<ArrayTable>.asSlice(&arrays)[found].index
+            run indexPath(&mut table, index)
+            if at + 1 == names.length {
+              run remember(&mut locations, Bytes.asSlice(&table), Span { start: start, end: end })
+            } else {
+              run rememberParent(&mut locations, Bytes.asSlice(&table), Span { start: start, end: end })
+            }
+          }
+          at = at + 1
+        }
+      }
+      _ => { run assignment(&mut tokens, Bytes.asSlice(&table), &mut locations) }
+    }
+  }
+}
+
+fn location(locations: &[Location], path: &[u8], length: usize) -> Span {
+  let mut best: usize = 0
+  let mut span = Span { start: 0, end: length }
+  let mut at: usize = 0
+  while at < locations.length {
+    let candidate = Bytes.asSlice(&locations[at].path)
+    if candidate.length >= best && prefix(candidate, path) {
+      best = candidate.length
+      span = locations[at].span
+    }
+    at = at + 1
+  }
+  return span
+}
+
+effect fn conversionDiagnostics(text: &[u8], error: ValueError) -> List<Diagnostic>
+  ! OutOfMemoryError ? &mut Allocator {
+  let locations = run sourceLocations(text)
+  let listed = List<Location>.asSlice(&locations)
+  let mut diagnostics = List<Diagnostic>.make()
+  let mut at: usize = 0
+  while at < listed.length {
+    let entry = &listed[at]
+    let path = Bytes.asSlice(&entry.path)
+    let raw = Slice.view<u8>(text, entry.span.start, entry.span.end - entry.span.start)
+    if !prefix(b"/tool", path) && (same(raw, b"inf") || same(raw, b"+inf") || same(raw, b"-inf")
+      || same(raw, b"nan") || same(raw, b"+nan") || same(raw, b"-nan")) {
+      let mut message = run Bytes.copy(path)
+      run Bytes.append(&mut message, b": nonfinite TOML numbers are outside the manifest schema's JSON data model")
+      run List<Diagnostic>.append(&mut diagnostics, Diagnostic {
+        span: entry.span, code: run Bytes.copy(b"MANIFEST_SCHEMA"), message: move message,
+      })
+    }
+    at = at + 1
+  }
+  if List<Diagnostic>.length(&diagnostics) == 0 {
+    let message = match error {
+      ValueError.NonFiniteNumber => b"manifest contains a number outside the schema's JSON data model"
+      ValueError.InvalidTomlValue => b"manifest TOML tree cannot be represented in the schema's JSON data model"
+    }
+    run List<Diagnostic>.append(&mut diagnostics, Diagnostic {
+      span: Span { start: 0, end: text.length }, code: run Bytes.copy(b"MANIFEST_SCHEMA"), message: run Bytes.copy(message),
+    })
+  }
+  return move diagnostics
+}
