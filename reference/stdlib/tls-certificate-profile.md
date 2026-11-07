@@ -1160,7 +1160,7 @@ Validates strict configured DNS/IP NameConstraints without allocating or retaini
 
 ```silk
 pub fn checkNameConstraints(
-    subject: &CertificateProfile,
+    subject: &CertificateProfile<'_>,
     constraintDer: &[u8],
     comparisons: &mut usize,
     maximumComparisons: usize,
@@ -1187,8 +1187,8 @@ inspection. The operation checks only one constraint source. Callers must apply 
 
 ```silk
 pub fn verifyIssuedBy(
-    subject: &CertificateProfile,
-    issuer: &CertificateProfile,
+    subject: &CertificateProfile<'_>,
+    issuer: &CertificateProfile<'_>,
   ) -> Result<(), ProfileError>
 ```
 

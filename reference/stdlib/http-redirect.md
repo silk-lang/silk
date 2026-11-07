@@ -2224,11 +2224,11 @@ pub effect<'env> fn writeBody<
   'env,
 >(
   exchange: &mut Exchange<'exchange, P>,
-  current: &Uri,
+  current: &Uri<'_>,
   expected: BodyMode,
   body: AttemptBody<'bytes, 'oneShot, 'replay, OneShot, ReplayProducer>,
   scratch: &mut [u8],
-  trailers: &Headers,
+  trailers: &Headers<'_>,
   hop: usize,
 ) -> BodyWriteOutcome
 ! RedirectError | OneShotError | ReplayError | ExchangeError | OutOfMemoryError
@@ -2573,7 +2573,7 @@ Returns the method and the body of the next request, by the rules of RFC 9110 an
 
 ```silk
 pub effect fn resolveLocation<'head>(
-  current: &Uri,
+  current: &Uri<'_>,
   headers: &Headers<'head>,
   limits: HistoryLimits,
   hop: usize,
@@ -2644,7 +2644,7 @@ Returns an empty history, and allocates all its memory before any network I/O.
 ### Method `insert`
 
 ```silk
-pub effect fn insert<'method>(self: &mut Self, method: Method<'method>, origin: Origin, uri: &Uri) -> Result<
+pub effect fn insert<'method>(self: &mut Self, method: Method<'method>, origin: Origin, uri: &Uri<'_>) -> Result<
     (),
     RedirectError,
   > ! OutOfMemoryError ? &mut Allocator

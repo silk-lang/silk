@@ -165,7 +165,7 @@ The caller must check that the document ends.
 ### Operation `decode`
 
 ```silk
-fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
+fn decode(scanner: &mut JsonScanner<'_>) -> Result<Self, JsonError>
 ```
 
 Reads one value from `scanner`. It leaves the next token unread.
@@ -198,7 +198,7 @@ caller. The caller must check that the document ends.
 ### Operation `deserialize`
 
 ```silk
-effect fn deserialize(scanner: &mut JsonScanner)
+effect fn deserialize(scanner: &mut JsonScanner<'_>)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
@@ -228,7 +228,7 @@ impl JsonCodec
 ### Associated function `decodeOne`
 
 ```silk
-pub fn decodeOne<T: Decode>(scanner: &mut JsonScanner) -> Result<T, JsonError>
+pub fn decodeOne<T: Decode>(scanner: &mut JsonScanner<'_>) -> Result<T, JsonError>
 ```
 
 Reads one value of type `T` from `scanner` with its `Decode` implementation. It leaves the
@@ -243,7 +243,7 @@ next token unread.
 ### Associated function `deserializeOne`
 
 ```silk
-pub effect fn deserializeOne<T: Deserialize>(scanner: &mut JsonScanner)
+pub effect fn deserializeOne<T: Deserialize>(scanner: &mut JsonScanner<'_>)
     -> T ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
@@ -305,7 +305,7 @@ impl Decode for bool
 ### Operation `decode`
 
 ```silk
-fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
+fn decode(scanner: &mut JsonScanner<'_>) -> Result<Self, JsonError>
 ```
 
 <a id="bool.impl.Deserialize"></a>
@@ -321,7 +321,7 @@ impl Deserialize for bool
 ### Operation `deserialize`
 
 ```silk
-effect fn deserialize(scanner: &mut JsonScanner)
+effect fn deserialize(scanner: &mut JsonScanner<'_>)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
@@ -355,7 +355,7 @@ impl Decode for u8
 ### Operation `decode`
 
 ```silk
-fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
+fn decode(scanner: &mut JsonScanner<'_>) -> Result<Self, JsonError>
 ```
 
 <a id="u8.impl.Deserialize"></a>
@@ -371,7 +371,7 @@ impl Deserialize for u8
 ### Operation `deserialize`
 
 ```silk
-effect fn deserialize(scanner: &mut JsonScanner)
+effect fn deserialize(scanner: &mut JsonScanner<'_>)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
@@ -405,7 +405,7 @@ impl Decode for u16
 ### Operation `decode`
 
 ```silk
-fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
+fn decode(scanner: &mut JsonScanner<'_>) -> Result<Self, JsonError>
 ```
 
 <a id="u16.impl.Deserialize"></a>
@@ -421,7 +421,7 @@ impl Deserialize for u16
 ### Operation `deserialize`
 
 ```silk
-effect fn deserialize(scanner: &mut JsonScanner)
+effect fn deserialize(scanner: &mut JsonScanner<'_>)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
@@ -455,7 +455,7 @@ impl Decode for u32
 ### Operation `decode`
 
 ```silk
-fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
+fn decode(scanner: &mut JsonScanner<'_>) -> Result<Self, JsonError>
 ```
 
 <a id="u32.impl.Deserialize"></a>
@@ -471,7 +471,7 @@ impl Deserialize for u32
 ### Operation `deserialize`
 
 ```silk
-effect fn deserialize(scanner: &mut JsonScanner)
+effect fn deserialize(scanner: &mut JsonScanner<'_>)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
@@ -505,7 +505,7 @@ impl Decode for u64
 ### Operation `decode`
 
 ```silk
-fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
+fn decode(scanner: &mut JsonScanner<'_>) -> Result<Self, JsonError>
 ```
 
 <a id="u64.impl.Deserialize"></a>
@@ -521,7 +521,7 @@ impl Deserialize for u64
 ### Operation `deserialize`
 
 ```silk
-effect fn deserialize(scanner: &mut JsonScanner)
+effect fn deserialize(scanner: &mut JsonScanner<'_>)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
@@ -555,7 +555,7 @@ impl Decode for usize
 ### Operation `decode`
 
 ```silk
-fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
+fn decode(scanner: &mut JsonScanner<'_>) -> Result<Self, JsonError>
 ```
 
 <a id="usize.impl.Deserialize"></a>
@@ -571,7 +571,7 @@ impl Deserialize for usize
 ### Operation `deserialize`
 
 ```silk
-effect fn deserialize(scanner: &mut JsonScanner)
+effect fn deserialize(scanner: &mut JsonScanner<'_>)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
@@ -605,7 +605,7 @@ impl Decode for i8
 ### Operation `decode`
 
 ```silk
-fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
+fn decode(scanner: &mut JsonScanner<'_>) -> Result<Self, JsonError>
 ```
 
 <a id="i8.impl.Deserialize"></a>
@@ -621,7 +621,7 @@ impl Deserialize for i8
 ### Operation `deserialize`
 
 ```silk
-effect fn deserialize(scanner: &mut JsonScanner)
+effect fn deserialize(scanner: &mut JsonScanner<'_>)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
@@ -655,7 +655,7 @@ impl Decode for i16
 ### Operation `decode`
 
 ```silk
-fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
+fn decode(scanner: &mut JsonScanner<'_>) -> Result<Self, JsonError>
 ```
 
 <a id="i16.impl.Deserialize"></a>
@@ -671,7 +671,7 @@ impl Deserialize for i16
 ### Operation `deserialize`
 
 ```silk
-effect fn deserialize(scanner: &mut JsonScanner)
+effect fn deserialize(scanner: &mut JsonScanner<'_>)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
@@ -705,7 +705,7 @@ impl Decode for i32
 ### Operation `decode`
 
 ```silk
-fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
+fn decode(scanner: &mut JsonScanner<'_>) -> Result<Self, JsonError>
 ```
 
 <a id="i32.impl.Deserialize"></a>
@@ -721,7 +721,7 @@ impl Deserialize for i32
 ### Operation `deserialize`
 
 ```silk
-effect fn deserialize(scanner: &mut JsonScanner)
+effect fn deserialize(scanner: &mut JsonScanner<'_>)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
@@ -755,7 +755,7 @@ impl Decode for i64
 ### Operation `decode`
 
 ```silk
-fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
+fn decode(scanner: &mut JsonScanner<'_>) -> Result<Self, JsonError>
 ```
 
 <a id="i64.impl.Deserialize"></a>
@@ -771,7 +771,7 @@ impl Deserialize for i64
 ### Operation `deserialize`
 
 ```silk
-effect fn deserialize(scanner: &mut JsonScanner)
+effect fn deserialize(scanner: &mut JsonScanner<'_>)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
@@ -805,7 +805,7 @@ impl Decode for isize
 ### Operation `decode`
 
 ```silk
-fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
+fn decode(scanner: &mut JsonScanner<'_>) -> Result<Self, JsonError>
 ```
 
 <a id="isize.impl.Deserialize"></a>
@@ -821,7 +821,7 @@ impl Deserialize for isize
 ### Operation `deserialize`
 
 ```silk
-effect fn deserialize(scanner: &mut JsonScanner)
+effect fn deserialize(scanner: &mut JsonScanner<'_>)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
@@ -838,7 +838,7 @@ impl Decode for f32
 ### Operation `decode`
 
 ```silk
-fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
+fn decode(scanner: &mut JsonScanner<'_>) -> Result<Self, JsonError>
 ```
 
 <a id="f32.impl.Deserialize"></a>
@@ -854,7 +854,7 @@ impl Deserialize for f32
 ### Operation `deserialize`
 
 ```silk
-effect fn deserialize(scanner: &mut JsonScanner)
+effect fn deserialize(scanner: &mut JsonScanner<'_>)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
@@ -888,7 +888,7 @@ impl Decode for f64
 ### Operation `decode`
 
 ```silk
-fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
+fn decode(scanner: &mut JsonScanner<'_>) -> Result<Self, JsonError>
 ```
 
 <a id="f64.impl.Deserialize"></a>
@@ -904,7 +904,7 @@ impl Deserialize for f64
 ### Operation `deserialize`
 
 ```silk
-effect fn deserialize(scanner: &mut JsonScanner)
+effect fn deserialize(scanner: &mut JsonScanner<'_>)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
@@ -972,7 +972,7 @@ impl Deserialize for String
 ### Operation `deserialize`
 
 ```silk
-effect fn deserialize(scanner: &mut JsonScanner)
+effect fn deserialize(scanner: &mut JsonScanner<'_>)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
@@ -1006,7 +1006,7 @@ impl<T: Decode> Decode for Option<T>
 ### Operation `decode`
 
 ```silk
-fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
+fn decode(scanner: &mut JsonScanner<'_>) -> Result<Self, JsonError>
 ```
 
 <a id="Option.impl.Deserialize"></a>
@@ -1022,7 +1022,7 @@ impl<T: Deserialize> Deserialize for Option<T>
 ### Operation `deserialize`
 
 ```silk
-effect fn deserialize(scanner: &mut JsonScanner)
+effect fn deserialize(scanner: &mut JsonScanner<'_>)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
@@ -1056,7 +1056,7 @@ impl<T: Deserialize> Deserialize for List<T>
 ### Operation `deserialize`
 
 ```silk
-effect fn deserialize(scanner: &mut JsonScanner)
+effect fn deserialize(scanner: &mut JsonScanner<'_>)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 

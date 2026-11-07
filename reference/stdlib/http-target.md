@@ -286,7 +286,7 @@ It checks nothing more, since `uri` is valid already: the target is what
 
 ```silk
 pub fn parse(
-    method: &Method,
+    method: &Method<'_>,
     text: string<'text>,
     maxBytes: usize,
   ) -> Result<RequestTarget<'text>, ValueError>
@@ -309,7 +309,7 @@ Parses a received target, and selects its form from the method and the text.
 
 ```silk
 pub fn validateForMethod(
-    method: &Method,
+    method: &Method<'_>,
     target: RequestTarget<'text>,
   ) -> Result<(), ValueError>
 ```
@@ -352,7 +352,7 @@ Returns `true` for authority form.
 
 ```silk
 pub fn fromUri(
-    uri: &Uri,
+    uri: &Uri<'_>,
     form: TargetForm,
     output: &mut [u8],
   ) -> Result<usize, ValueError>
@@ -374,7 +374,7 @@ The fragment is not written. An empty path is written as `/`.
 ```silk
 pub fn validateRequestHost<'value>(
   version: Version,
-  target: &RequestTarget,
+  target: &RequestTarget<'_>,
   headers: &Headers<'value>,
 ) -> Result<Option<HttpAuthority<'value>>, ValueError>
 ```

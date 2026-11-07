@@ -273,7 +273,7 @@ Use this function only for a field where [`Reflect.fieldKind`](#Reflect.impl.fie
 ### Associated function `borrowField`
 
 ```silk
-pub fn borrowField<Owner, Value>(owner: &Owner, static field: Intrinsic.Field<Owner, Value>) -> &Value
+pub fn borrowField<'o, Owner, Value>(owner: &'o Owner, static field: Intrinsic.Field<Owner, Value>) -> &'o Value
 ```
 
 Returns a shared borrow of the field of `owner` that `field` describes.

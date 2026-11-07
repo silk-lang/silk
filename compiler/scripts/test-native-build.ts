@@ -1519,7 +1519,7 @@ const program = Effect.gen(function* () {
     // Operands read through a reference print with their lifetime elided.
     {
       name: 'fieldoperator',
-      files: { 'main.silk': "struct W<'t> { text: string<'t>, }\n\nfn f(l: &W, r: &W) -> bool { return l.text < r.text }\n\npub fn main() -> i32 {\n  return 0\n}\n" },
+      files: { 'main.silk': "struct W<'t> { text: string<'t>, }\n\nfn f(l: &W<'_>, r: &W<'_>) -> bool { return l.text < r.text }\n\npub fn main() -> i32 {\n  return 0\n}\n" },
       pattern: /error\[SEM0135\] Operator < does not accept \(string, string\)/,
     },
     // The arm blocks of a match used as a statement yield nothing.

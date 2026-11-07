@@ -1192,7 +1192,7 @@ borrow a head from the parser.
 ### Method `load`
 
 ```silk
-pub fn load(self: &mut Self, head: RequestHead) -> Result<(), ParseError>
+pub fn load(self: &mut Self, head: RequestHead<'_>) -> Result<(), ParseError>
 ```
 
 Takes `head` as if its bytes had been fed, so the parser holds a copy of it. Use it for a head

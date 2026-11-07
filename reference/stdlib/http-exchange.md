@@ -1787,7 +1787,7 @@ progress.
 ## `finishRequest`
 
 ```silk
-pub effect fn finishRequest<'exchange, P>(exchange: &mut Exchange<'exchange, P>, trailers: &Headers) -> ()
+pub effect fn finishRequest<'exchange, P>(exchange: &mut Exchange<'exchange, P>, trailers: &Headers<'_>) -> ()
 ! ExchangeError | OutOfMemoryError
 ? &mut MonotonicClock | &mut Allocator | &mut Random
 where

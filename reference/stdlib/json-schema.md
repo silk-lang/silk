@@ -420,7 +420,7 @@ resolved trees are owned by the result, and the root remains borrowed.
 ### Associated function `validate`
 
 ```silk
-pub effect fn validate(compiled: &CompiledSchema, instance: &Value) -> Output
+pub effect fn validate(compiled: &CompiledSchema<'_>, instance: &Value) -> Output
     ! SchemaError | RegexError | OutOfMemoryError ? &mut Allocator
 ```
 

@@ -768,7 +768,7 @@ Returns the method text, spelled as given.
 ### Method `equals`
 
 ```silk
-pub fn equals(self: &Self, other: &Method) -> bool
+pub fn equals(self: &Self, other: &Method<'_>) -> bool
 ```
 
 Returns `true` if the two methods have the same spelling. Case matters.

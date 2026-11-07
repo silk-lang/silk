@@ -436,7 +436,7 @@ encrypted data, or 0 if `der` does not parse.
 ### Associated function `encryptedLength`
 
 ```silk
-pub fn encryptedLength(length: usize, parameters: &Pbes2Parameters) -> usize
+pub fn encryptedLength(length: usize, parameters: &Pbes2Parameters<'_>) -> usize
 ```
 
 Returns the number of bytes that [`EncryptedPkcs8.encrypt`](#EncryptedPkcs8.impl.encrypt) writes for a `PrivateKeyInfo` of
@@ -447,7 +447,7 @@ Returns the number of bytes that [`EncryptedPkcs8.encrypt`](#EncryptedPkcs8.impl
 ### Associated function `encrypt`
 
 ```silk
-pub fn encrypt(der: &[u8], password: &[u8], parameters: &Pbes2Parameters, output: &mut [u8]) -> Result<usize, Pkcs8Error>
+pub fn encrypt(der: &[u8], password: &[u8], parameters: &Pbes2Parameters<'_>, output: &mut [u8]) -> Result<usize, Pkcs8Error>
 ```
 
 Encrypts the `PrivateKeyInfo` DER `der` with `password` and `parameters` into `output` as an

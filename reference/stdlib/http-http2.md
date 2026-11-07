@@ -624,7 +624,7 @@ PROTOCOL_ERROR.
 ### Method `open`
 
 ```silk
-pub effect fn open(self: &mut Self, fields: &[Field], endStream: bool) -> u32
+pub effect fn open(self: &mut Self, fields: &[Field<'_>], endStream: bool) -> u32
     ! ProtocolError | OutOfMemoryError
     ? &mut Allocator
 ```
@@ -637,7 +637,7 @@ new streams.
 ### Method `sendHeaders`
 
 ```silk
-pub effect fn sendHeaders(self: &mut Self, id: u32, fields: &[Field], endStream: bool) -> ()
+pub effect fn sendHeaders(self: &mut Self, id: u32, fields: &[Field<'_>], endStream: bool) -> ()
     ! ProtocolError | OutOfMemoryError
     ? &mut Allocator
 ```
@@ -728,7 +728,7 @@ deadline.
 ### Method `push`
 
 ```silk
-pub effect fn push(self: &mut Self, associated: u32, fields: &[Field]) -> u32
+pub effect fn push(self: &mut Self, associated: u32, fields: &[Field<'_>]) -> u32
     ! ProtocolError | OutOfMemoryError
     ? &mut Allocator
 ```
