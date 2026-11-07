@@ -531,8 +531,6 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     Root,
     // The PEM bundle at this path.
     Bundle {path: Bytes},
-    // No trust: the request goes to a plain HTTP origin.
-    Unused,
   }
 
   effect fn trustPlan(client: &NativeHttp) -> TrustPlan ! OutOfMemoryError ? &mut Allocator {
@@ -547,6 +545,13 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     return TrustPlan.Bundle {path: move path}
   }
 
+  effect fn copyPlan(plan: &TrustPlan) -> TrustPlan ! OutOfMemoryError ? &mut Allocator {
+    return match & plan.* {
+      TrustPlan.Root => TrustPlan.Root
+      TrustPlan.Bundle {path} => TrustPlan.Bundle {path: run Bytes.copy(Bytes.asSlice(&path))}
+    }
+  }
+
   effect fn trustOf(plan: &TrustPlan) -> ConfiguredTrust ! HttpError | OutOfMemoryError ? &mut Allocator {
     let configured = match & plan.* {
       TrustPlan.Root => {
@@ -555,7 +560,6 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
         } else { fail HttpError.make(HttpErrorKind.Tls, "The platform trust store exists only on Windows.") }
       }
       TrustPlan.Bundle {path} => run Effect.result(trustAt(Bytes.asSlice(&path)))
-      TrustPlan.Unused => Intrinsic.trap("sendAll: a plain HTTP request loaded trust")
     }
     return match move configured {
       Result.Success {value} => {
@@ -1132,9 +1136,6 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       client.trust = Option<ConfiguredTrust>.some(move trust)
       drop deadline
       drop options
-      // A plain HTTP origin never loads trust, so it does not copy the trust path.
-      let mut plan = TrustPlan.Unused
-      if secure { plan = run trustPlan(&client.*) }
       // The calls come first, so the request moves straight into the job instead of through a
       // temporary that a failed call would have to drop.
       let copied = run Bytes.copy(payload)
@@ -1145,7 +1146,6 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
         timeoutNanoseconds: nanoseconds,
         maxBody: settings.maxBody,
         idempotent: idempotent,
-        trust: move plan,
       })}
     }
     // An idempotent request skips the check that the server has not closed the connection:
@@ -1354,7 +1354,6 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     timeoutNanoseconds: u64,
     maxBody: usize,
     idempotent: bool,
-    trust: TrustPlan,
   }
 
   // A job with the idle connection it reuses, if one was open to its origin. Jobs, connections,
@@ -1556,10 +1555,13 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     if List<Box<PendingJob>>.length(&jobs) == usize.ZERO {
       return List<Result<Received, HttpError | OutOfMemoryError>>.make()
     }
+    // Every job of a round comes from this client, so the round has one trust plan, and each
+    // worker copies it once rather than each job carrying its own copy of the path.
+    let plan = run trustPlan(&client.*)
     let idle = Intrinsic.replace(client.idle, List<Box<IdleConnection>>.make())
     let mut scheduler = LocalScheduler.make()
     let outcome = run Effect.result(scheduler.execute<Round, OutOfMemoryError | TaskIdExhaustedError | Cancelled>(
-      runJobs(move jobs, move idle, client.concurrencyValue),
+      runJobs(move jobs, move idle, client.concurrencyValue, move plan),
     ) |> Effect.provideMut<MonotonicClock>(&mut client.clock))
     let round = match move outcome {
       Result.Success {value} => move value
@@ -1581,11 +1583,11 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
 
   // The root task of a round. It keeps up to `limit` tasks running and collects them in job order.
   // A task that finishes gives its connection back, so a later job to the same origin reuses it.
-  effect fn runJobs(jobs: List<Box<PendingJob>>, idle: List<Box<IdleConnection>>, limit: usize) -> Round
+  effect fn runJobs(jobs: List<Box<PendingJob>>, idle: List<Box<IdleConnection>>, limit: usize, plan: TrustPlan) -> Round
   ! OutOfMemoryError | TaskIdExhaustedError | Cancelled
   ? &mut Scheduler | &mut MonotonicClock {
     let mut allocator = Allocator.systemAllocatorProvider()
-    return run collectJobs(move jobs, move idle, limit) |> Effect.provideMut<Allocator>(&mut allocator)
+    return run collectJobs(move jobs, move idle, limit, &plan) |> Effect.provideMut<Allocator>(&mut allocator)
   }
 
   // The work of one round, shared by its worker tasks on the round's thread.
@@ -1623,7 +1625,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   // Runs the jobs on at most `limit` worker tasks. Each worker takes the next job, and gives its
   // connection back when the job ends, so a later job to the same origin reuses it. A task per
   // worker, not per job, keeps the task setup out of the cost of each request.
-  effect fn collectJobs(jobs: List<Box<PendingJob>>, idle: List<Box<IdleConnection>>, limit: usize) -> Round
+  effect fn collectJobs(jobs: List<Box<PendingJob>>, idle: List<Box<IdleConnection>>, limit: usize, plan: &TrustPlan) -> Round
   ! OutOfMemoryError | TaskIdExhaustedError | Cancelled
   ? &mut Scheduler | &mut MonotonicClock | &mut Allocator {
     let count = List<Box<PendingJob>>.length(&jobs)
@@ -1656,7 +1658,8 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     let mut running = List<Fiber<(), never>>.make()
     run List<Fiber<(), never>>.reserveExact(&mut running, workers)
     while List<Fiber<(), never>>.length(&running) < workers {
-      let fiber = run Fiber<(), never>.forkChild(roundWorker(Shared<RoundState>.clone(&state)))
+      let copied = run copyPlan(plan)
+      let fiber = run Fiber<(), never>.forkChild(roundWorker(Shared<RoundState>.clone(&state), move copied))
       let _added = List<Fiber<(), never>>.appendWithinCapacity(&mut running, move fiber)
     }
     while true {
@@ -1685,19 +1688,19 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   }
 
   // One worker task of a round. Its clock parks only this task while the socket waits.
-  effect fn roundWorker(state: Shared<RoundState>) -> () ? &mut Scheduler | &mut MonotonicClock {
+  effect fn roundWorker(state: Shared<RoundState>, plan: TrustPlan) -> () ? &mut Scheduler | &mut MonotonicClock {
     // The services that do not depend on the request are given once for all the jobs of this
     // task, so a request does not pay for a provider layer of each.
     let mut allocator = Allocator.systemAllocatorProvider()
     let mut wall = OsSystemClock.make()
     let mut random = OsRandom.make()
-    return run workJobs(move state)
+    return run workJobs(move state, &plan)
       |> Effect.provideMut<Allocator>(&mut allocator)
       |> Effect.provideMut<SystemClock>(&mut wall)
       |> Effect.provideMut<Random>(&mut random)
   }
 
-  effect fn workJobs(state: Shared<RoundState>) -> ()
+  effect fn workJobs(state: Shared<RoundState>, plan: &TrustPlan) -> ()
   ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random {
     // A job holds its connection in this list while it runs, and the list keeps its memory for the
     // next job.
@@ -1712,7 +1715,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
       }
       let Taken {index, job, closing} = move taken
       if let Option.Some {value} = move closing { run closeIdle(move value) }
-      let outcome = run runJob(&mut idle, &mut trust, move job)
+      let outcome = run runJob(&mut idle, &mut trust, plan, move job)
       Shared<RoundState>.withMut<()>(&state, storeOutcome(index, move outcome))
     }
     return ()
@@ -1782,10 +1785,10 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
   }
 
   // One task of a round. Its clock parks only this task while the socket waits.
-  effect fn runJob(idle: &mut List<Box<IdleConnection>>, trust: &mut JobTrust, job: Job) -> JobOutcome
+  effect fn runJob(idle: &mut List<Box<IdleConnection>>, trust: &mut JobTrust, plan: &TrustPlan, job: Job) -> JobOutcome
   ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random {
     // `idle` is empty here, and holds at most the connection of this job after the exchange.
-    let received = run jobExchange(&mut idle.*, &mut trust.*, move job)
+    let received = run jobExchange(&mut idle.*, &mut trust.*, plan, move job)
     let kept = List<Box<IdleConnection>>.pop(&mut idle.*)
     return JobOutcome {received: move received, kept: move kept}
   }
@@ -1815,7 +1818,7 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
 
   // Puts the kept connection of a job in `idle`, and makes the trust source of a secure origin
   // unless `trust` already holds one.
-  effect fn setUpJob(idle: &mut List<Box<IdleConnection>>, trust: &mut JobTrust, job: Job) -> JobSetup
+  effect fn setUpJob(idle: &mut List<Box<IdleConnection>>, trust: &mut JobTrust, plan: &TrustPlan, job: Job) -> JobSetup
   ! HttpError | OutOfMemoryError
   ? &mut Allocator {
     let Job {pending, connection} = move job
@@ -1828,16 +1831,16 @@ static if (Intrinsic.targetOperatingSystem() == "windows" && Intrinsic.targetArc
     let secure = Origin.secure(&Box<PendingJob>.get(&pending)[usize.ZERO].request.origin())
     if secure {
       if let JobTrust.Plain = &trust.* {
-        trust.* = JobTrust.Configured {provider: run trustOf(&Box<PendingJob>.get(&pending)[usize.ZERO].trust)}
+        trust.* = JobTrust.Configured {provider: run trustOf(plan)}
       }
     }
     return JobSetup {pending: move pending, slot: slot}
   }
 
   // A failure is returned rather than raised, so that the job does not wrap this in a result.
-  effect fn jobExchange(idle: &mut List<Box<IdleConnection>>, trust: &mut JobTrust, job: Job) -> Result<Received, HttpError | OutOfMemoryError>
+  effect fn jobExchange(idle: &mut List<Box<IdleConnection>>, trust: &mut JobTrust, plan: &TrustPlan, job: Job) -> Result<Received, HttpError | OutOfMemoryError>
   ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random {
-    let JobSetup {pending, slot} = match move run Effect.result(setUpJob(&mut idle.*, &mut trust.*, move job)) {
+    let JobSetup {pending, slot} = match move run Effect.result(setUpJob(&mut idle.*, &mut trust.*, plan, move job)) {
       Result.Success {value} => move value
       Result.Failure {error} => { return Result<Received, HttpError | OutOfMemoryError>.failResult(move error) }
     }
